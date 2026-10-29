@@ -50,6 +50,9 @@ class Wire:
         self._work_dir = project
         self.backend = backend
         self._session_id = "native-conversation"
+        # Read by the startup effort push on a config-option harness (KAS); no
+        # model means no level resolves, so nothing is pushed.
+        self._model = ""
         self.process_instance = "process-one"
         self.messages = []
         self.events = [
@@ -271,10 +274,12 @@ async def test_optional_deletion_explicitly_replaces_old_source_set(env, source)
 
 
 @pytest.mark.asyncio
-async def test_missing_declared_source_still_refuses_on_warm_hit(env):
+async def test_unreadable_declared_source_still_refuses_on_warm_hit(env):
     target = provider(env.project)
     await send(target, build(env, target, fresh=True))
+    # Present but not a regular file: refused, unlike an absent one, which is skipped.
     (env.project / "declared-guide.md").unlink()
+    (env.project / "declared-guide.md").mkdir()
     with pytest.raises(MemberEssentialContextError, match="declared-guide"):
         build(env, target)
     assert len(target.client.messages) == 1
@@ -495,9 +500,14 @@ async def test_budget_and_source_tails_remain_complete_before_wire_dedup(env):
     assert body in target.client.messages[0]
     assert HEADER not in target.client.messages[1]
     path.write_text("x" * 64_001, encoding="utf-8")
-    with pytest.raises(MemberEssentialContextError, match="AGENTS.md"):
-        build(env, target, model_window=32_000)
-    assert len(target.client.messages) == 2
+    # The budget is still checked on the complete envelope before wire dedup;
+    # an over-budget guide now drops out whole and is named, instead of
+    # refusing the turn, and the changed snapshot is delivered again.
+    await send(target, build(env, target, model_window=32_000))
+    assert len(target.client.messages) == 3
+    assert "x" * 1_000 not in target.client.messages[2]
+    assert "[Essential source: essential-context#omitted]" in target.client.messages[2]
+    assert f"{path} (64,001 characters)" in target.client.messages[2]
 
 
 @pytest.mark.asyncio

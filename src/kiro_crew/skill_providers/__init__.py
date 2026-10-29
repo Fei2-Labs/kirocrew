@@ -13,6 +13,9 @@ provider inherits the trust boundary instead of restating it.
 from kiro_crew.skill_providers.base import (
     ProviderRegistry,
     SkillProvider,
+    SkillProviderError,
+    SkillProviderOutcome,
+    SkillSearchResponse,
     SkillSearchResult,
 )
 from kiro_crew.skill_providers.skillsh import SkillsShProvider
@@ -24,6 +27,9 @@ from kiro_crew.skill_providers.skillsh import SkillsShProvider
 #: ``kiro_crew.skill_providers.github`` directly.
 __all__ = [
     "SkillProvider",
+    "SkillProviderError",
+    "SkillProviderOutcome",
+    "SkillSearchResponse",
     "SkillSearchResult",
     "ProviderRegistry",
     "SkillsShProvider",

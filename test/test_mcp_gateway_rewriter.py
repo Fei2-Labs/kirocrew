@@ -18,7 +18,11 @@ import pytest
 
 from kiro_crew.mcp_cleanup import mcp_entry_is_muted, mcp_entry_is_registry_governed
 from kiro_crew.mcp_gateway import rewriter
-from kiro_crew.mcp_gateway.hashing import expand_stub_flags, is_secret_env_key
+from kiro_crew.mcp_gateway.hashing import (
+    expand_stub_flags,
+    hash_effective_env,
+    is_secret_env_key,
+)
 from kiro_crew.mcp_gateway.manager import is_credential_env_key
 from kiro_crew.mcp_gateway.rewriter import (
     _WRAPPER_MARKER,
@@ -147,6 +151,88 @@ class TestSettingsInjection:
         # No settings overlay is written, and the real settings file is intact.
         assert not (overlay_dir.parent / "settings").exists()
         assert (settings_dir / "mcp.json").read_bytes() == settings_before
+
+    def test_an_agent_that_opts_out_of_the_global_file_gets_only_its_own_servers(
+        self, tmp_path: Path
+    ) -> None:
+        """``includeMcpJson: false`` tells kiro-cli not to merge the global file,
+        so the overlay must not add the global servers back as stubs.
+
+        Every wrapped entry in an overlay is sent at ACP ``session/new``, so an
+        injected stub reaches the session even though the agent excluded the file
+        it came from. A server there that publishes a tool name the agent's own
+        server also publishes leaves one of them with no tools. The agent's own
+        servers are kept exactly: the remote one passes through and its own
+        rostered stdio server is still wrapped. An agent without the opt-out, in
+        the same pass, still gets the injected stub.
+        """
+        from kiro_crew.mcp_gateway.rewriter import rewrite_agents
+
+        source_dir = tmp_path / "agents"
+        source_dir.mkdir()
+        remote = {"url": "https://example.invalid/mcp"}
+        own = {"command": sys.executable, "args": ["-own"]}
+        (source_dir / "solo.json").write_text(
+            json.dumps(
+                {
+                    "name": "solo",
+                    "includeMcpJson": False,
+                    "mcpServers": {"remote": remote, "own-mcp": own},
+                    "tools": ["@remote", "@own-mcp"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (source_dir / "kirocrew.json").write_text(
+            json.dumps({"name": "kirocrew", "mcpServers": {}}), encoding="utf-8"
+        )
+        settings_dir = tmp_path / "settings"
+        settings_dir.mkdir()
+        (settings_dir / "mcp.json").write_text(json.dumps(self._spec()), encoding="utf-8")
+
+        overlay_dir = tmp_path / "overlay" / "agents"
+        rewrite_agents(
+            source_dir=source_dir,
+            overlay_dir=overlay_dir,
+            socket_path=tmp_path / "gw.sock",
+            work_dir=tmp_path / "wd",
+            stub_servers=frozenset(["beta-mcp", "own-mcp"]),
+        )
+
+        solo = json.loads((overlay_dir / "solo.json").read_text(encoding="utf-8"))
+        assert set(solo["mcpServers"]) == {"remote", "own-mcp"}
+        assert solo["mcpServers"]["remote"] == remote
+        assert solo["mcpServers"]["own-mcp"].get(_WRAPPER_MARKER) is True
+        assert solo["includeMcpJson"] is False
+        other = json.loads((overlay_dir / "kirocrew.json").read_text(encoding="utf-8"))
+        assert other["mcpServers"]["beta-mcp"].get(_WRAPPER_MARKER) is True
+
+    @pytest.mark.parametrize(
+        ("flag", "injected"),
+        [(None, True), (True, True), (False, False)],
+        ids=["absent", "true", "false"],
+    )
+    def test_injection_follows_the_include_mcp_json_flag(
+        self, tmp_path: Path, flag: bool | None, injected: bool
+    ) -> None:
+        """kiro-cli reads an absent ``includeMcpJson`` as true, so only a literal
+        ``false`` opts the agent out of the injected globals."""
+        spec: dict = {"name": "agent-a", "mcpServers": {}}
+        if flag is not None:
+            spec["includeMcpJson"] = flag
+        inject = _injectable_settings_servers(self._spec(), frozenset(["beta-mcp"]))
+        new_spec, wrapped = _rewrite_single_spec(
+            spec,
+            stubs_dir=tmp_path / "stubs",
+            socket_path=tmp_path / "gw.sock",
+            work_dir=tmp_path / "wd",
+            sandbox_mode="auto",
+            approval_mode="interactive",
+            stub_servers=frozenset(["beta-mcp"]),
+            inject_servers=inject,
+        )
+        assert ("beta-mcp" in new_spec["mcpServers"]) is injected
+        assert wrapped == (1 if injected else 0)
 
 
 def _rewrite(
@@ -1065,6 +1151,21 @@ def test_expand_env_placeholders_unresolved_stays_literal_without_prefix(monkeyp
     assert _expand_env_placeholders("${env:NOPE}") == "${NOPE}"
 
 
+def test_expand_env_unresolved_placeholder_is_warned_by_name(monkeypatch, caplog) -> None:
+    """An unset placeholder is logged, escaped, with its name and server; no value is."""
+    import logging
+
+    monkeypatch.delenv("NOPE", raising=False)
+    monkeypatch.setenv("MYVAR", "resolved-value")
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.rewriter"):
+        out = _expand_env_map({"A": "${env:NOPE}", "B": "${MYVAR}", "C": "${X\nY}"}, server="srv")
+    assert out == {"A": "${NOPE}", "B": "resolved-value", "C": "${X\nY}"}
+    msgs = [r.getMessage() for r in caplog.records if "is unset" in r.getMessage()]
+    assert len(msgs) == 2 and not any("\n" in m for m in msgs)
+    assert "'NOPE'" in msgs[0] and "'srv'" in msgs[0]
+    assert "resolved-value" not in caplog.text
+
+
 def test_expand_env_placeholders_empty_value_is_substituted(monkeypatch) -> None:
     """An env var set to empty resolves to empty (kiro-cli parity: std::env::var
     returns Ok("") not a miss)."""
@@ -1104,6 +1205,81 @@ def test_rewriter_writes_resolved_env_to_sidecar(tmp_path: Path, monkeypatch) ->
     written = json.loads(sidecar.read_text(encoding="utf-8"))
     assert written["AUTH"] == "s3cr3t-token"  # resolved
     assert written["OTHER"] == "${MISSING}"  # unresolved stays literal
+
+
+def test_two_agents_declaring_one_server_alike_share_its_sidecar(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Identical declarations get SEPARATE sidecars holding IDENTICAL bytes.
+
+    Sharing a backend does not mean sharing this file. The file holds the
+    declaration's full env, rotating secrets included, and it is read back
+    unfiltered for a connection-private backend -- so one file per declaration
+    is what keeps one agent's credentials out of another agent's backend. The
+    contents being equal here is what makes the separate files cost nothing:
+    whichever one is read, the backend sees the same env.
+    """
+    monkeypatch.setenv("MYVAR", "s3cr3t-token")
+    paths = []
+    for agent in ("gpu-dev", "kirocrew"):
+        spec = {
+            "name": agent,
+            "mcpServers": {
+                "srv": {"command": sys.executable, "env": {"AUTH": "${env:MYVAR}"}},
+            },
+        }
+        entry, _ = _rewrite(spec, tmp_path, stub_servers=frozenset({"srv"}), forward_env=True)
+        flags = expand_stub_flags(entry["mcpServers"]["srv"]["args"])
+        paths.append(flags[flags.index("--env-file") + 1])
+    assert paths[0] != paths[1], "two agents' declarations landed on one file name"
+    both = [json.loads(Path(p).read_text(encoding="utf-8")) for p in paths]
+    assert both[0] == both[1] == {"AUTH": "s3cr3t-token"}
+
+
+def test_a_rotating_secret_alone_still_splits_the_sidecars(tmp_path: Path, monkeypatch) -> None:
+    """The collision the agent in the name exists to prevent.
+
+    These two agents declare ``srv`` with the same non-secret env and DIFFERENT
+    ``OAUTH_TOKEN`` values. ``effective_env_hash`` excludes ``OAUTH``-prefixed
+    keys, so the two hash equal -- a name built from that hash would put both
+    declarations on one file and the second write would hand the first agent's
+    private backend the second agent's token. Each must keep its own file with
+    its own token.
+
+    ``pooling_enabled=False`` is what makes this reachable, and is the whole
+    hazard: with pooling ON the rewriter leaves a secret-declaring server
+    unwrapped (``_withheld_env_count``), so no sidecar carries a secret. With it
+    OFF every backend is connection-private, the full declared env IS written to
+    the sidecar, and ``_declared_env_for_private_backend`` hands it back
+    unfiltered.
+    """
+    seen = {}
+    for agent, token in (("gpu-dev", "token-a"), ("kirocrew", "token-b")):
+        spec = {
+            "name": agent,
+            "mcpServers": {
+                "srv": {
+                    "command": sys.executable,
+                    "env": {"TOOL": "on", "OAUTH_TOKEN": token},
+                },
+            },
+        }
+        entry, _ = _rewrite(
+            spec,
+            tmp_path,
+            stub_servers=frozenset({"srv"}),
+            pooling_enabled=False,
+            forward_env=True,
+        )
+        flags = expand_stub_flags(entry["mcpServers"]["srv"]["args"])
+        seen[agent] = Path(flags[flags.index("--env-file") + 1])
+    # Premise: the pool dimension really cannot tell these two apart.
+    assert hash_effective_env({"TOOL": "on", "OAUTH_TOKEN": "token-a"}) == hash_effective_env(
+        {"TOOL": "on", "OAUTH_TOKEN": "token-b"}
+    )
+    assert seen["gpu-dev"] != seen["kirocrew"]
+    assert json.loads(seen["gpu-dev"].read_text(encoding="utf-8"))["OAUTH_TOKEN"] == "token-a"
+    assert json.loads(seen["kirocrew"].read_text(encoding="utf-8"))["OAUTH_TOKEN"] == "token-b"
 
 
 @pytest.mark.parametrize(
@@ -1415,6 +1591,61 @@ def _unencoded_json_reads(source: str) -> list[int]:
     return found
 
 
+# Parsers fed straight from ``read_text``: the stdlib pair plus the module's
+# user-JSON reader used on the global settings file.
+_JSON_TEXT_PARSERS = ("json.loads", "json.load", "loads_user_json")
+
+# An ``except`` naming any of these catches ``UnicodeDecodeError``.
+_CATCHES_DECODE_ERROR = frozenset(
+    {"UnicodeDecodeError", "UnicodeError", "ValueError", "Exception", "BaseException"}
+)
+
+
+def _json_text_reads(source: str) -> list[tuple[int, bool]]:
+    """``(line, guarded)`` for each JSON parse of a ``<path>.read_text(...)``.
+
+    ``guarded`` is True when the call sits in the body of some enclosing
+    ``try`` whose handlers catch ``UnicodeDecodeError`` (by name or through a
+    base class). A handler or ``finally`` block does not count as guarded.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    parents: dict[ast.AST, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    def _catches(handler: ast.ExceptHandler) -> bool:
+        if handler.type is None:
+            return True
+        types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+        return any(ast.unparse(t).rsplit(".", 1)[-1] in _CATCHES_DECODE_ERROR for t in types)
+
+    def _guarded(node: ast.AST) -> bool:
+        child, parent = node, parents.get(node)
+        while parent is not None:
+            if isinstance(parent, ast.Try) and child in parent.body:
+                if any(_catches(h) for h in parent.handlers):
+                    return True
+            child, parent = parent, parents.get(parent)
+        return False
+
+    found: list[tuple[int, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if ast.unparse(node.func) not in _JSON_TEXT_PARSERS:
+            continue
+        inner = node.args[0]
+        if not isinstance(inner, ast.Call):
+            continue
+        if not ast.unparse(inner.func).endswith(".read_text"):
+            continue
+        found.append((inner.lineno, _guarded(node)))
+    return sorted(found)
+
+
 class TestRewriterDecodesJsonAsUtf8:
     """Agent specs and the global settings file are UTF-8 JSON written by
     somebody else -- a user, an editor, the Kiro IDE -- so the rewriter decodes
@@ -1550,9 +1781,15 @@ class TestRewriterDecodesJsonAsUtf8:
         reaching a release through a green Linux shard. It also covers the
         settings-file read, which has no cheap behavioural harness.
         """
+        import importlib
+
         from kiro_crew.mcp_gateway import rewriter as rw
 
-        source = Path(rw.__file__).read_text(encoding="utf-8")
+        # The facade joined with its owners, which hold most of the reads.
+        source = "".join(
+            Path(importlib.import_module(name).__file__ or "").read_text(encoding="utf-8")
+            for name in (rw.__name__, *rw._REWRITER_OWNERS)
+        )
         offenders = _unencoded_json_reads(source)
         assert offenders == [], (
             "rewriter.py decodes JSON with the host code page at line(s) "
@@ -1572,3 +1809,65 @@ class TestRewriterDecodesJsonAsUtf8:
             )
             == []
         )
+
+    def test_every_json_read_catches_a_decode_error(self) -> None:
+        """Pins the other half of the UTF-8 fix: the except arm.
+
+        ``encoding="utf-8"`` makes a non-UTF-8 file raise
+        ``UnicodeDecodeError``, a ``ValueError`` the old
+        ``(OSError, json.JSONDecodeError)`` tuples let through. The corrupt-file
+        behaviour test reaches the strict spec reader, not these arms, so
+        dropping ``UnicodeDecodeError`` from one of them would leave every other
+        test green. This scan fails instead.
+        """
+        import importlib
+
+        from kiro_crew.mcp_gateway import rewriter as rw
+
+        # The facade joined with its owners, which hold most of the reads.
+        source = "".join(
+            Path(importlib.import_module(name).__file__ or "").read_text(encoding="utf-8")
+            for name in (rw.__name__, *rw._REWRITER_OWNERS)
+        )
+        reads = _json_text_reads(source)
+        assert len(reads) >= 3, (
+            f"the scan found only {reads}; rewriter.py has at least three "
+            "JSON reads of a file, so the matcher has stopped seeing them"
+        )
+        unguarded = [line for line, guarded in reads if not guarded]
+        assert unguarded == [], (
+            "rewriter.py parses JSON from read_text at line(s) "
+            f"{unguarded} with no enclosing except that catches "
+            "UnicodeDecodeError; one non-UTF-8 file would then abort the "
+            "rewrite pass instead of being skipped"
+        )
+
+    def test_the_decode_error_ratchet_can_actually_fail(self) -> None:
+        """Each shape the scan must reject, and each it must accept."""
+        head = "import json\nfrom pathlib import Path\n"
+        read = "    x = json.loads(Path('a').read_text(encoding='utf-8'))\n"
+
+        def scan(body: str) -> list[tuple[int, bool]]:
+            return _json_text_reads(head + body)
+
+        assert scan("x = json.loads(Path('a').read_text(encoding='utf-8'))\n") == [(3, False)]
+        assert scan("try:\n" + read + "except (OSError, json.JSONDecodeError):\n    pass\n") == [
+            (4, False)
+        ]
+        assert scan("try:\n    pass\nexcept OSError:\n" + read) == [
+            (6, False)
+        ], "a read inside the handler is not guarded by it"
+        assert scan(
+            "try:\n"
+            + read
+            + "except (OSError, json.JSONDecodeError, UnicodeDecodeError):\n    pass\n"
+        ) == [(4, True)]
+        assert scan("try:\n" + read + "except Exception:\n    pass\n") == [(4, True)]
+        assert scan(
+            "try:\n    try:\n    " + read + "    except OSError:\n        pass\n"
+            "except ValueError:\n    pass\n"
+        ) == [(5, True)], "an outer try that catches it still guards the read"
+        assert scan(
+            "try:\n    y = loads_user_json(Path('a').read_text(encoding='utf-8'))\n"
+            "except OSError:\n    pass\n"
+        ) == [(4, False)]

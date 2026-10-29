@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import React from 'react'
@@ -14,12 +14,6 @@ import type { KiroCrewAgent } from '../components/AgentSelector'
 import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
-import { api } from '../api/client'
-
-// The nested ReasoningEffortDropdown persists slider picks over the wire
-// (#5120); these tests never touch the slider, but the stub keeps an
-// accidental future interaction from hitting a real fetch.
-vi.spyOn(api, 'chatSlotReasoningEffort').mockResolvedValue({ ok: true } as never)
 
 /**
  * A dropdown's filter box is CHROME. Its placeholder ("Type to filter…") is
@@ -40,6 +34,20 @@ vi.spyOn(api, 'chatSlotReasoningEffort').mockResolvedValue({ ok: true } as never
 
 const SRC = join(__dirname, '..')
 
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
+// so the pins read the page and those owners.
+function chatPageSource(): string {
+  const pages = join(SRC, 'pages')
+  const owners = join(pages, 'chat', 'page')
+  return [
+    readFileSync(join(pages, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(owners).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => readFileSync(join(owners, f), 'utf8')),
+    ...readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => readFileSync(join(pages, f), 'utf8')),
+  ].join('\n')
+}
+
 const baseProps = {
   anchorRect: { right: 400, top: 300 } as DOMRect,
   dropdownRef: React.createRef<HTMLDivElement>(),
@@ -50,9 +58,6 @@ const baseProps = {
   filter: '',
   setFilter: vi.fn(),
   onClose: vi.fn(),
-  hasEffort: false,
-  slot: 'dashboard:1',
-  currentEffort: '',
   onListKeyDown: vi.fn(),
 }
 
@@ -62,9 +67,7 @@ const agents: KiroCrewAgent[] = [
 
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  // The nested ReasoningEffortDropdown persists picks into the slot store
-  // (#5120), so the tree needs the redux context. A per-render store (not
-  // the app singleton) keeps one test's persist from leaking into the next.
+  // A per-render store keeps picker state from leaking between cases.
   const store = configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
   })
@@ -111,7 +114,7 @@ describe('dropdown filter inputs follow the Font Family setting', () => {
       // offenders while the input is still pinned to mono. Flattening also
       // makes the match a whole quoted run, so the assertion sees the complete
       // class list rather than one line of it.
-      const flat = readFileSync(join(SRC, rel), 'utf8').replace(/\s+/g, ' ')
+      const flat = (rel === 'pages/ChatPage.tsx' ? chatPageSource() : readFileSync(join(SRC, rel), 'utf8')).replace(/\s+/g, ' ')
       const runs = [...flat.matchAll(/["'`]([^"'`]*px-2 py-1 text-\[13px\][^"'`]*)["'`]/g)]
       // Per file, never summed. An aggregate floor sits exactly on the boundary
       // here (one match per file), so a refactor that inlines one filter box
@@ -127,7 +130,7 @@ describe('dropdown filter inputs follow the Font Family setting', () => {
   it('does not pin ChatPane\u2019s shared dropdown filter class to font-mono', () => {
     // Both of ChatPane's dropdowns read one `ddInputCls` constant, so the class
     // string is asserted where it is declared rather than where it is applied.
-    const src = readFileSync(join(SRC, 'components/ChatPane.tsx'), 'utf8')
+    const src = readFileSync(join(SRC, 'components/ChatPanePickerMenus.tsx'), 'utf8')
     const decl = src.split('\n').find(l => l.includes('ddInputCls ='))
     expect(decl).toBeDefined()
     expect(decl).not.toContain('font-mono')

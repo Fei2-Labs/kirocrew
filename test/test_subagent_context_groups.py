@@ -17,8 +17,10 @@ that group's gate fails exactly one test.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
+from kiro_crew import context as context_module
 from kiro_crew.config.loader import config_path
 from kiro_crew.context import (
     CONTEXT_GROUP_LESSONS,
@@ -32,6 +34,18 @@ from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
 
 ALL_GROUPS = frozenset(SWITCHABLE_CONTEXT_GROUPS)
+
+
+class _FrozenClock(datetime):
+    """A ``datetime`` whose ``now()`` does not advance.
+
+    The render carries a minute-resolution timestamp, so two renders that
+    straddle a minute boundary differ in that line alone.
+    """
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        return datetime(2026, 1, 1, 12, 0).replace(tzinfo=tz)
 
 
 def _builder(tmp_path) -> ContextBuilder:
@@ -63,8 +77,9 @@ def _builder(tmp_path) -> ContextBuilder:
 class TestDefaultIsUnchanged:
     """The all-on paths must not drift from the pre-feature builder."""
 
-    def test_none_and_all_groups_are_identical(self, tmp_path):
+    def test_none_and_all_groups_are_identical(self, tmp_path, monkeypatch):
         """A parent passing no flag (all groups) == every other caller (None)."""
+        monkeypatch.setattr(context_module, "datetime", _FrozenClock)
         b = _builder(tmp_path)
         assert b.build_session_context(context_groups=None) == b.build_session_context(
             context_groups=ALL_GROUPS
@@ -88,7 +103,8 @@ class TestMemoryGroup:
         ctx = _builder(tmp_path).build_session_context()
         assert "## User Preferences" in ctx
         assert "Prefers tabs over spaces" in ctx
-        assert "## Active Projects" not in ctx
+        # The activity half rides along as budgeted background.
+        assert "## Active Projects" in ctx
         assert "memory_recall" in ctx
 
     def test_absent_when_withheld(self, tmp_path):
@@ -167,27 +183,72 @@ class TestProjectGroup:
         assert "[PROJECT] Active project directory: /tmp/proj" in on
         assert "[PROJECT] Active project directory" not in off
 
+    def test_remote_session_names_the_guest_directory_not_the_gateway_project(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew import session_environment as se
+
+        se.remember_remote_workspace("s-remote", "Coder MicroVM", "/workspace/crew-session")
+        # Force the resource line on so its gateway qualifier is exercised too.
+        status = type(
+            "S",
+            (),
+            {
+                # The builder asks for the remote wording for a remote session.
+                "context_line": lambda self, remote=False: (
+                    "[RESOURCES] The gateway machine is tight (remote-scoped)."
+                    if remote
+                    else "[RESOURCES] Host memory is tight (~3 GB free)."
+                ),
+                "posture": "tight",
+                "available_gb": 3.0,
+            },
+        )()
+        monkeypatch.setattr("kiro_crew.resource_status.probe", lambda: status)
+        try:
+            b = _builder(tmp_path)
+            msg, _ = b.build_message("hi", True, "s-remote", project="/Users/me/repo")
+            off, _ = b.build_message(
+                "hi",
+                True,
+                "s-remote",
+                project="/Users/me/repo",
+                context_groups=ALL_GROUPS - {CONTEXT_GROUP_PROJECT},
+            )
+        finally:
+            se.forget_remote_workspace("s-remote")
+        assert "remote environment (Coder MicroVM)" in msg
+        assert "/workspace/crew-session" in msg
+        assert "[PROJECT] Active project directory: /Users/me/repo" not in msg
+        assert "[RESOURCES] The gateway machine is tight (remote-scoped)." in msg
+        assert "Host memory is tight" not in msg
+        assert "remote environment" not in off
+        # Forgotten (switched back to local): the plain line returns.
+        local, _ = b.build_message("hi", True, "s-remote", project="/Users/me/repo")
+        assert "[PROJECT] Active project directory: /Users/me/repo" in local
+
 
 class TestEpisodicMemoryGate:
-    """Activity is on demand; stable preference delivery still follows inheritance."""
+    """Episodes ride in the budgeted activity block; both halves follow inheritance."""
 
     def _builder_with_episodic(self, tmp_path):
         builder = _builder(tmp_path)
         store = builder.get_memory_for(None)
         store._vector_store = SimpleNamespace(
             get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "[PREFERENCE-SENTINEL]",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            get_semantic_context=lambda query_text, cap, facts_only=False: "",
+            get_preferences_context=lambda query_text="", cap=0: "[PREFERENCE-SENTINEL]",
+            get_lessons_context=lambda query_text, cap, project_dir=None, recall_query=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
+            startup_lesson_query=lambda query_text: None,
             has_any_lesson=lambda: True,
         )
         return builder
 
-    def test_activity_requires_explicit_reader(self, tmp_path):
+    def test_activity_rides_the_memory_group_once(self, tmp_path):
         builder = self._builder_with_episodic(tmp_path)
         msg, _ = builder.build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" not in msg
-        assert "[PREFERENCE-SENTINEL]" in msg
+        assert msg.count("[EPISODIC-SENTINEL]") == 1
+        assert msg.count("[PREFERENCE-SENTINEL]") == 1
         assert "[EPISODIC-SENTINEL]" in builder.memory.get_context(query="q")
 
     def test_withheld_with_the_memory_group(self, tmp_path):
@@ -202,7 +263,7 @@ class TestEpisodicMemoryGate:
         msg, _ = self._builder_with_episodic(tmp_path).build_message(
             "q", True, "s1", context_groups=ALL_GROUPS - {CONTEXT_GROUP_PROJECT}
         )
-        assert "[EPISODIC-SENTINEL]" not in msg
+        assert "[EPISODIC-SENTINEL]" in msg
         assert "[PREFERENCE-SENTINEL]" in msg
 
 

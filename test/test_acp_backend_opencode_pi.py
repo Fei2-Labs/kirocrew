@@ -89,7 +89,7 @@ class TestPiStaysPermissionRequest:
         )
 
     def test_enforce_succeeds_without_the_opt_out(self, tmp_path: Path) -> None:
-        tool_gate.enforce(ACP_BACKEND_PI, tmp_path, allow_ungated=False)
+        tool_gate.enforce(ACP_BACKEND_PI, tmp_path)
 
     def test_verdict_is_routed(self, tmp_path: Path) -> None:
         verdict, reason = tool_gate.resolve_verdict(ACP_BACKEND_PI, tmp_path)
@@ -105,7 +105,7 @@ class TestOpenCodeSeededSettings:
         )
 
     def test_unseeded_is_made_routed_by_writing_ask(self, tmp_path: Path) -> None:
-        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
         path = opencode.project_config_path(tmp_path)
         written = json.loads(path.read_text())
         assert written["permission"] == opencode.PERMISSION_ASK
@@ -118,7 +118,7 @@ class TestOpenCodeSeededSettings:
         path.write_text(json.dumps({"permission": "allow", "keep": 1}))
 
         with pytest.raises(ToolGateUnroutable):
-            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
 
         after = json.loads(path.read_text())
         assert after["permission"] == "allow"
@@ -127,7 +127,7 @@ class TestOpenCodeSeededSettings:
     def test_object_wildcard_ask_is_routed_and_left_alone(self, tmp_path: Path) -> None:
         path = tmp_path / "opencode.json"
         path.write_text(json.dumps({"permission": {"*": "ask"}, "keep": True}))
-        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
         after = json.loads(path.read_text())
         assert after["permission"] == {"*": "ask"}
         assert after["keep"] is True
@@ -138,7 +138,7 @@ class TestOpenCodeSeededSettings:
         path.write_text(raw)
 
         with pytest.raises(ToolGateUnroutable):
-            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
 
         assert path.read_text() == raw
 
@@ -157,7 +157,7 @@ class TestOpenCodeSeededSettings:
         with monkeypatch.context() as patcher:
             patcher.setattr(Path, "read_text", unreadable)
             with pytest.raises(ToolGateUnroutable):
-                tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+                tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
         assert path.read_text() == "operator-owned"
 
     @requires_symlinks
@@ -171,7 +171,7 @@ class TestOpenCodeSeededSettings:
         path.symlink_to(external)
 
         with pytest.raises(ToolGateUnroutable):
-            tool_gate.enforce(ACP_BACKEND_OPENCODE, project, allow_ungated=False)
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, project)
 
         assert external.read_text() == original
         assert path.is_symlink()
@@ -186,7 +186,7 @@ class TestOpenCodeSeededSettings:
         (external / "opencode.json").write_text(json.dumps({"model": "outside"}))
 
         with pytest.raises(ToolGateUnroutable):
-            tool_gate.enforce(ACP_BACKEND_OPENCODE, project, allow_ungated=False)
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, project)
 
         assert json.loads((external / "opencode.json").read_text()) == {"model": "outside"}
 
@@ -194,7 +194,7 @@ class TestOpenCodeSeededSettings:
         nested = tmp_path / ".opencode" / "opencode.json"
         nested.parent.mkdir()
         nested.write_text(json.dumps({"model": "already-here"}))
-        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+        tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
         assert not (tmp_path / "opencode.json").exists()
         after = json.loads(nested.read_text())
         assert after["permission"] == opencode.PERMISSION_ASK
@@ -207,17 +207,17 @@ class TestOpenCodeSeededSettings:
         global_cfg.write_text(json.dumps({"permission": "allow"}))
         work = tmp_path / "work"
         work.mkdir()
-        tool_gate.enforce(ACP_BACKEND_OPENCODE, work, allow_ungated=False)
+        tool_gate.enforce(ACP_BACKEND_OPENCODE, work)
         assert json.loads(global_cfg.read_text())["permission"] == "allow"
         assert json.loads((work / "opencode.json").read_text())["permission"] == "ask"
 
     def test_dispatch_does_not_call_claude_seed(self, tmp_path: Path) -> None:
         with patch.object(claude, "ensure_routed_settings") as claude_seed:
-            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path, allow_ungated=False)
+            tool_gate.enforce(ACP_BACKEND_OPENCODE, tmp_path)
         claude_seed.assert_not_called()
         assert (tmp_path / "opencode.json").is_file()
 
     def test_claude_dispatch_does_not_call_opencode_seed(self, tmp_path: Path) -> None:
         with patch.object(opencode, "ensure_routed_settings") as opencode_seed:
-            tool_gate.enforce(ACP_BACKEND_CLAUDE, tmp_path, allow_ungated=False)
+            tool_gate.enforce(ACP_BACKEND_CLAUDE, tmp_path)
         opencode_seed.assert_not_called()

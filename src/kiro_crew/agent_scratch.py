@@ -22,11 +22,15 @@ Reclamation is keyed on PROCESS liveness, never on file age:
   crash, gateway restart with survivors), and the positive liveness signal
   below covers every death path by construction.
 * The gateway sweeps hourly (first pass an hour after start -- never on the
-  boot path). A directory is removed only when its recorded owner's process
+  boot path). A directory is reclaimed only when its recorded owner's process
   GROUP is dead AND the whole tree has been idle past the grace window; a
   directory with a live owner is never touched (agent processes can outlive
   a gateway restart), an ownerless directory is never deleted, and a garbled
-  owner file is left for a human.
+  owner file is left for a human. A reclaimed directory that holds a git
+  repository is moved into the quarantine (:data:`QUARANTINE_DIRNAME`) rather
+  than deleted, stripped there of what tools rebuild (package installs,
+  virtual environments, caches, pytest basetemps), and deleted from there only
+  after :data:`QUARANTINE_TTL_SECONDS`.
 
 The WORK directory follows the session tree, not the process. The scratch
 root is masked for every sandboxed process and each spawn is handed back only
@@ -76,6 +80,7 @@ of by truncating a name the child can point somewhere else.
 
 from __future__ import annotations
 
+import calendar
 import logging
 import os
 import re
@@ -90,7 +95,13 @@ from typing import Literal
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import (
+    config_dir,
+    demote_scratch_root_override,
+    scratch_root_owner_refusal,
+    scratch_root_writer_refusal,
+    valid_scratch_root_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +122,40 @@ OwnerOutcome = Literal["recorded", "unwritable", "refused", "stale", "garbled"]
 #: orphan: allocation happens before the child pid exists. Anything older
 #: with no owner belongs to a spawn that never completed.
 _UNOWNED_GRACE_SECONDS = 3600.0
+
+#: The sweep's holding area, a directory of the managed root. A dead, idle tree
+#: that holds a git repository is moved here instead of being deleted: a dead
+#: owner says the PROCESS ended, not that the work in a clone is saved, and no
+#: check of a repository the agent wrote can prove that it is. Inside the root,
+#: the move is a rename on one filesystem (no copy that can fail halfway), and
+#: the quarantined tree stays as masked from sandboxed processes as the root is.
+#: No allocated name can collide with it: those all end in ``-<token>``.
+QUARANTINE_DIRNAME = ".quarantine"
+#: How long a quarantined tree is kept, counted from its move. Long enough for a
+#: user to notice the log line and recover the work; bounded so that kept trees
+#: do not fill the disk.
+QUARANTINE_TTL_SECONDS = 14 * 24 * 3600.0
+#: A quarantined tree is named ``<UTC move time>-<its scratch name>``; the time
+#: is what the expiry reads, and stripping it gives back the original name.
+_QUARANTINE_STAMP = "%Y%m%dT%H%M%SZ"
+_QUARANTINED_NAME = re.compile(r"(\d{8}T\d{6}Z)-(.+)")
+#: The entries git looks for in a git directory, plus the one a linked
+#: worktree's directory carries. Any two of them in one directory make it a
+#: repository for the sweep (:func:`holds_git_repository`).
+_GIT_DIR_ENTRIES = ("HEAD", "objects", "refs", "commondir")
+#: Directories a tool rebuilds from the work itself: package installs, bytecode
+#: and tool caches. The sweep neither looks for repositories inside them nor
+#: keeps them in the quarantine (:func:`_regenerable`).
+_REGENERABLE_DIRNAMES = frozenset(
+    {"node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox"}
+)
+#: The file every Python virtual environment holds at its top.
+_VENV_MARKER = "pyvenv.cfg"
+#: pytest's per-user basetemp, made directly under ``$TMPDIR`` -- which is the
+#: scratch directory. Test suites ``git init`` throwaway repositories there by
+#: the hundred, so it is judged only at the top of a scratch tree, where pytest
+#: puts it, and never as a name deeper down.
+_BASETEMP_PREFIX = "pytest-of-"
 
 _LABEL_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -177,7 +222,36 @@ class SharedScratchJoinError(ScratchBoundaryError):
 
 
 def scratch_root() -> Path:
-    """The managed root: ``<data home>/scratch``."""
+    """The managed root: ``KIROCREW_SCRATCH_ROOT`` if set and safe, else
+    ``<data home>/scratch``.
+
+    The override points the bulky, disposable scratch tree at an explicit
+    directory independent of ``KIROCREW_HOME`` -- its reason to exist is the
+    Windows case where staged self-update installers under scratch fill the
+    system drive. An override naming a filesystem/drive root or a known
+    system directory is refused by :func:`valid_scratch_root_override` and
+    logged once, falling back to ``config_dir()/scratch`` -- the same
+    ignore-and-fall-back contract :func:`config_dir` applies to an unsafe
+    ``KIROCREW_HOME``. ``KIROCREW_SCRATCH`` (no ``_ROOT``) is unrelated: it is an
+    OUTPUT written by :func:`scratch_env` to tell child processes where their
+    scratch is, and setting it changes nothing here.
+
+    The override is used AS the managed root, so the subdirectory the sweep and
+    allocator operate on is the overridden path itself. :func:`valid_scratch_root_override`
+    resolves and validates the override ONCE and pins it for the process lifetime, and it
+    is honoured on Windows ONLY (refused with a logged reason on every other platform,
+    falling back to ``config_dir()/scratch``). It also REJECTS a symlinked or junctioned
+    override name, a crew home, the workspace, a system directory, and an unresolvable path,
+    falling back the same way. The link/junction refusal in :func:`allocate_scratch` still
+    fires on a link planted at an allocation BELOW that resolved root, exactly as it does
+    under the default location.
+    """
+    override = valid_scratch_root_override()
+    if override is not None:
+        return override
+    # A set-but-refused override logs its reason once per distinct value when the override
+    # pin is computed (see ``config.paths._resolve_scratch_root_override``); here we only
+    # fall back to the guarded default root.
     return config_dir() / _SUBDIR
 
 
@@ -378,6 +452,16 @@ def allocate_scratch(label: str) -> Path:
     Raises :class:`ScratchBoundaryError` when the managed root is a link.
     """
     root = scratch_root()
+    # Decide whether THIS root is a relocated override from ``root`` ALONE -- a single read of
+    # the pin, inside ``scratch_root()`` -- never a second ``valid_scratch_root_override()``.
+    # A concurrent allocation that refuses its own owner re-check calls
+    # ``demote_scratch_root_override`` (clearing the pin); a second read here could then return
+    # ``None`` AFTER ``scratch_root()`` already handed us the override as ``root``, and the
+    # adoption checks would be skipped on a foreign-created directory. Comparing ``root`` to the
+    # guarded default (the same expression ``scratch_root()`` falls back to) is independent of
+    # the pin's later state: any non-default root -- which only a relocated override produces --
+    # always gets the owner/lock/writer checks, failing safe even if the pin changes again.
+    is_relocated_root = root != config_dir() / _SUBDIR
     # Twice around the mkdir, which is both the step a pre-planted link
     # subverts and the moment one could win the race with the first check:
     # ``mkdir(parents=True, exist_ok=True)`` SUCCEEDS on a link to a directory,
@@ -389,6 +473,71 @@ def allocate_scratch(label: str) -> Path:
     _refuse_linked(root, f"managed root {_SUBDIR!r}")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     _refuse_linked(root, f"managed root {_SUBDIR!r}")
+    # When the root is a relocated override (``KIROCREW_SCRATCH_ROOT``), lock it to the
+    # owner. The default root inherits the owner-only ACL ``ensure_data_home`` sets on the
+    # data home, but an override points at an arbitrary directory whose ACL is whatever its
+    # parent gives it -- and the ``mode=0o700`` above is ignored on Windows, so without this
+    # a relocated root on e.g. ``D:\`` keeps the drive's default ACL (Authenticated Users
+    # Modify) and another local user could read or replace this session's scratch.
+    #
+    # The validator refuses a relocated root the current user does not own, but it does so
+    # on the resolved value and CACHES the result (keyed on the raw env string). When the
+    # root does not exist yet at validation time -- the boot sweep calls ``scratch_root()``
+    # before any ``mkdir`` -- the validator has nothing to check and the cached accept pins.
+    # In the window before this allocation, another local user on a shared drive can create
+    # the override path and own it; the ``mkdir(exist_ok=True)`` above then adopts THEIR
+    # directory, and ``restrict_dir_to_owner`` only rewrites the access list -- it never
+    # changes the owner -- so tightening it would cement the foreign owner's control over
+    # every session's scratch. So re-run the owner decision HERE, on the created directory,
+    # before tightening: :func:`config.paths.scratch_root_owner_refusal` is the SAME helper
+    # the validator uses, so the two cannot drift. On refusal (foreign, or an owner that
+    # cannot be read) fall back fail-closed to the guarded default root
+    # (``config_dir()/scratch``), which carries the data home's owner-only ACL -- the same
+    # outcome the validator produces for an EXISTING foreign root.
+    if is_relocated_root:
+
+        def _fall_back_to_default(refusal: str) -> Path:
+            # Demote the pin so ``scratch_root()`` -- which the sweep (:func:`sweep_dead_scratch`),
+            # the log cap (:func:`cap_kiro_cli_logs`) and the shared-window join all read --
+            # returns the SAME guarded default this allocation now falls back to. The pin was
+            # computed while the root was absent (a cached accept), so without this it keeps
+            # returning the refused override and those readers operate on the foreign-owned
+            # directory while allocations land in the default. See
+            # :func:`config.paths.demote_scratch_root_override`.
+            demote_scratch_root_override(refusal)
+            fallback = config_dir() / _SUBDIR
+            _refuse_linked(fallback, f"managed root {_SUBDIR!r}")
+            fallback.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _refuse_linked(fallback, f"managed root {_SUBDIR!r}")
+            return fallback
+
+        # Two-step adoption of a relocated root. FIRST decide the OWNER only
+        # (:func:`scratch_root_owner_refusal`): accept the current user, or
+        # ``BUILTIN\Administrators`` when this token is itself an admin (an elevated creator);
+        # refuse SYSTEM, TrustedInstaller, any other owner, and an unreadable owner.
+        owner_refusal = scratch_root_owner_refusal(root)
+        if owner_refusal is not None:
+            root = _fall_back_to_default(owner_refusal)
+        else:
+            # THEN lock it owner-only. ``restrict_dir_to_owner`` is the same helper the data
+            # home uses; a no-op-shaped owner-only tighten on POSIX, an owner-only ACL on
+            # Windows -- which also removes the inherited ``Authenticated Users: Modify`` ACE a
+            # secondary-drive directory starts with. It is fail-loud (raises ``OSError`` when
+            # the ACL cannot be rewritten); a lock we cannot complete leaves the inherited
+            # replaceable-writer ACE in place, so treat it like the owner and writer refusals
+            # and fall back fail-closed to the guarded default rather than letting the error
+            # abort every spawn while the override is set.
+            try:
+                platform_compat.restrict_dir_to_owner(root)
+            except OSError as exc:
+                root = _fall_back_to_default(f"owner-only lock failed: {exc}")
+            else:
+                # FINALLY, AFTER the lock, run the writer check: the inherited replaceable-writer
+                # ACE is gone now, so the documented ``D:\kirocrew-scratch`` case passes; if a
+                # foreign writer somehow survives the lock, fall back fail-closed to the default.
+                writer_refusal = scratch_root_writer_refusal(root)
+                if writer_refusal is not None:
+                    root = _fall_back_to_default(writer_refusal)
     safe = _LABEL_SAFE.sub("-", label)[:40].strip("-") or "agent"
     path = root / f"{safe}-{secrets.token_hex(4)}"
     # No ``exist_ok``: ``mkdir`` never follows the final component, so this
@@ -638,6 +787,15 @@ def scratch_env(path: Path, *, shared: Path | None = None) -> dict[str, str]:
     set, it overrides any inherited value, because an inherited value names a
     path SHARED with other processes, which is the failure this exists to prevent.
 
+    Per-process is per RUNTIME and not per session: one process can serve several
+    sessions, so their conversations interleave in one log and
+    :func:`cap_kiro_cli_logs` truncating it drops records belonging to all of
+    them. Splitting the log per session is not reachable from here -- kiro-cli
+    reads this variable once at startup and holds the file open in append mode
+    for the life of the process, so a session that joins a running process cannot
+    be given a file of its own, and no value written here reaches it. Bounding
+    the loss, not dividing the log, is what this layer can do.
+
     *shared* is the session tree's work directory when this process is not
     the tree's first (see :func:`shared_scratch_window`): ``KIROCREW_SCRATCH``
     then names THAT directory, so a subagent and its parent -- or a recycled
@@ -671,7 +829,10 @@ def cap_kiro_cli_logs(
     is truncated to zero. ``O_APPEND`` makes the writer's next record land at
     the new end, so no hole is created. Records written between the tail copy
     and the truncate are lost; this is a diagnostic log, and losing a few
-    lines beats losing the disk.
+    lines beats losing the disk. One log can hold the conversations of every
+    session the process serves (see :func:`scratch_env`), so the loss is not
+    confined to one of them and the warning below can name none: raising the cap
+    is the only lever here that reduces it.
 
     Every scratch directory is OWNED by a sandboxed agent process while this
     runs unsandboxed, so nothing here trusts a name the agent controls: the
@@ -791,11 +952,16 @@ def _write_rotated(dir_fd: int, name: str, data: bytes) -> None:
 
 
 def _is_plain_dir(path: Path) -> bool:
+    """A real directory: not a symlink, not a Windows junction, not a file, not absent.
+
+    ``lstat`` reports a junction as a directory, so a name-surrogate reparse
+    tag is checked too (:func:`platform_compat.lstat_is_name_surrogate`).
+    """
     try:
         info = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISDIR(info.st_mode)
+    return stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info)
 
 
 def _pgroup_alive(pid: int) -> bool:
@@ -834,6 +1000,13 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
     (``asyncio.to_thread``) on an hourly cadence, and its size is bounded
     by what one runtime wrote into its OWN scratch dir, so a full metadata
     walk is the right trade (see ``mcp_gateway.backend_tmp``).
+
+    A Windows junction is not descended either. ``lstat`` reports a junction
+    as a plain directory, so testing ``S_ISDIR`` alone walks into its target:
+    a tree outside scratch, or, once a test deletes that target, nothing --
+    and the ``scandir`` of a dangling junction raises, which pinned every
+    tree holding one as active for good. The junction's own mtime still
+    counts, like a symlink's.
     """
     newest = 0.0
     try:
@@ -845,11 +1018,314 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
                 info = os.lstat(entry.path)
                 if info.st_mtime > newest:
                     newest = info.st_mtime
-                if stat.S_ISDIR(info.st_mode):  # lstat: symlinks never descend
+                # lstat: symlinks never descend, nor do Windows junctions.
+                if stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info):
                     stack.append(Path(entry.path))
     except OSError:
         return fallback
     return newest
+
+
+def _restore_owner_after_partial_delete(child: Path, pids: tuple[int, ...]) -> None:
+    """Put the owner marker back over a tree the sweep could not fully remove.
+
+    ``rmtree`` reaches the marker long before a file it cannot delete (a name
+    that sorts first, beside a file still held open), so a partial delete leaves
+    a tree with no marker -- and an ownerless tree is never deleted, so the
+    leftover would stay on disk for good. Writing back the same dead pids
+    restores exactly the evidence the sweep already judged. The rewrite and the
+    deletions refresh the tree's mtime, so the retry comes once the grace window
+    has passed again. Best effort: a failure here is logged, never raised.
+    """
+    logger.warning("agent-scratch: could not fully remove %r; will retry", child.name)
+    try:
+        if os.path.lexists(child):
+            _write_owner_marker(child, pids)
+    except (OSError, ScratchBoundaryError):
+        logger.warning("agent-scratch: could not restore the owner of %r", child.name)
+
+
+def quarantine_dir() -> Path:
+    """Where the sweep moves a dead, idle tree that holds a git repository."""
+    return scratch_root() / QUARANTINE_DIRNAME
+
+
+def holds_git_repository(tree: Path) -> bool:
+    """Whether *tree* holds a git repository anywhere in it, or might.
+
+    The answer decides whether the sweep may delete a dead, idle tree at once,
+    so every doubt answers True. A repository is:
+
+    * an entry named ``.git`` that is a file or a link (a separate git
+      directory, a submodule, a linked worktree), whatever it names;
+    * a ``.git`` directory holding anything but ``objects``;
+    * any other directory, *tree* included, holding at least two of
+      :data:`_GIT_DIR_ENTRIES`, each of any kind, so a bare repository counts
+      even when its object store or refs are a link.
+
+    A ``.git`` directory holding only ``objects`` is residue git does not open,
+    such as the read-only object files a partial delete strands on Windows.
+    A regenerable subtree (:func:`_regenerable`) is not searched: the
+    repositories test suites create in a pytest basetemp, or a package manager
+    leaves in ``node_modules``, are not work, and a tree whose only
+    repositories sit in such subtrees is deleted at once.
+    Entries are read with ``lstat``; no link is followed or descended into, no
+    file is opened and no git runs. A tree that cannot be listed answers True.
+    """
+    return _search(tree, basetemp_at_top=True)
+
+
+def _search(tree: Path, *, basetemp_at_top: bool) -> bool:
+    """Search once per directory; only a scratch root permits top-level basetemps."""
+    stack = [tree]
+    try:
+        while stack:
+            current = stack.pop()
+            if _is_git_directory(current):
+                return True
+            for entry in os.scandir(current):
+                path = current / entry.name  # name-composed: cannot escape the tree
+                is_dir = _is_plain_dir(path)
+                if entry.name == ".git":
+                    if not is_dir or any(name != "objects" for name in os.listdir(path)):
+                        return True
+                    continue
+                if not is_dir:
+                    continue
+                top_level = basetemp_at_top and current == tree
+                # Search venvs in place, without resetting the scratch root or
+                # searching nested venvs again through _regenerable.
+                if _searched_venv(path, top_level=top_level) or not _regenerable(
+                    path, top_level=top_level
+                ):
+                    stack.append(path)
+    except (OSError, ValueError):
+        return True
+    return False
+
+
+def _searched_venv(path: Path, *, top_level: bool) -> bool:
+    """Whether :func:`_regenerable` judges *path* by searching it: a venv that is not a repository.
+
+    A regenerable name wins over the venv marker, and a venv that is itself a
+    repository is never regenerable, so neither is searched as a venv.
+    """
+    if _regenerable_name(path.name, top_level=top_level):
+        return False
+    if not _is_regular_file(path / _VENV_MARKER):
+        return False
+    return not (os.path.lexists(path / ".git") or _is_git_directory(path))
+
+
+def _is_git_directory(path: Path) -> bool:
+    """Whether *path* holds at least two of :data:`_GIT_DIR_ENTRIES`, of any kind."""
+    return sum(os.path.lexists(path / name) for name in _GIT_DIR_ENTRIES) >= 2
+
+
+def _regenerable(path: Path, *, top_level: bool) -> bool:
+    """Whether the plain directory *path* holds only what a tool rebuilds.
+
+    That is a directory named in :data:`_REGENERABLE_DIRNAMES`, a Python
+    virtual environment (a directory holding a REGULAR file named
+    :data:`_VENV_MARKER`), or -- when *top_level*, a direct child of a scratch
+    tree -- a pytest basetemp named ``pytest-of-*``. A directory named
+    ``.venv`` that holds no such file is somebody's work, not a venv.
+
+    A directory that is itself a repository -- one holding a ``.git`` entry,
+    or a git directory -- is never regenerable, whatever its name: a clone
+    called ``node_modules`` holds work like any other. A venv is judged by
+    what it holds, not by a name a tool gave it, so it is regenerable only
+    when no repository sits anywhere below it either: a venv used as a
+    project folder, or the clones ``pip install -e git+...`` puts in its
+    ``src``, keep it whole.
+    """
+    named = _regenerable_name(path.name, top_level=top_level)
+    if not (named or _is_regular_file(path / _VENV_MARKER)):
+        return False
+    if os.path.lexists(path / ".git") or _is_git_directory(path):
+        return False
+    return named or not _search(path, basetemp_at_top=False)
+
+
+def _regenerable_name(name: str, *, top_level: bool) -> bool:
+    """Whether *name* alone marks a regenerable directory (see :func:`_regenerable`)."""
+    return name in _REGENERABLE_DIRNAMES or (top_level and name.startswith(_BASETEMP_PREFIX))
+
+
+def _is_regular_file(path: Path) -> bool:
+    """A regular file, read with ``lstat``: a link named like one is not."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _strip_regenerable(tree: Path) -> None:
+    """Delete the regenerable subtrees of the quarantined *tree*, in place.
+
+    The quarantine keeps a tree for the repositories in it; package installs,
+    virtual environments, caches and pytest basetemps beside them are rebuilt
+    from the work and can be most of its size. Only a tree the sweep moved
+    into the quarantine reaches here, so nothing else is using it. Running it
+    again on a stripped tree changes nothing.
+
+    The walk reads entries with ``lstat``, composes every path from names
+    under *tree*, and never enters a ``.git`` entry or a git directory. A
+    link or junction is neither removed nor followed, whatever its name: it
+    holds no bytes of its own. Each entry fails open: one that cannot be read or removed is
+    logged and skipped, and the next sweep tries again.
+    """
+    stripped = 0
+    stack = [tree]
+    while stack:
+        current = stack.pop()
+        try:
+            if _is_git_directory(current):
+                continue
+            names = [entry.name for entry in os.scandir(current)]
+        except OSError:
+            logger.debug("agent-scratch: could not list %s", current, exc_info=True)
+            continue
+        top_level = current == tree
+        for name in names:
+            if name == ".git":
+                continue
+            path = current / name  # name-composed: cannot escape the tree
+            try:
+                info = os.lstat(path)
+            except OSError:
+                continue
+            # A link (a junction too) holds no bytes of its own: kept, never followed.
+            if not stat.S_ISDIR(info.st_mode) or platform_compat.lstat_is_name_surrogate(info):
+                continue
+            if not _regenerable(path, top_level=top_level):
+                stack.append(path)
+            elif platform_compat.rmtree_force(path):
+                stripped += 1
+            else:
+                logger.warning("agent-scratch: could not fully remove %s; will retry", path)
+    if not stripped:
+        return
+    logger.info("agent-scratch: removed %d rebuildable dir(s) from %s", stripped, tree)
+
+
+def _quarantine(child: Path, now: float) -> bool:
+    """Move *child* into the quarantine instead of deleting it; False keeps it in place.
+
+    Called under :data:`_SWEEP_LOCK`, after the sweep's final look. The move is
+    one ``rename`` inside the managed root and never a copy: the tree is either
+    still where it was or whole in the quarantine, and its files keep their
+    contents, modes and times. Anything that stops the move -- a quarantine
+    that cannot be made, one that is not a plain directory, a name already
+    taken, a rename that fails (a quarantine on another filesystem included) --
+    leaves the tree where it is, logged, for the next sweep: a tree with a git
+    repository is never deleted from the root.
+
+    Each move logs one INFO line naming where the tree went and when it is
+    deleted from there. The same sweep's quarantine pass
+    (:func:`_expire_quarantine`) then strips the moved tree, outside the lock.
+    """
+    holding = quarantine_dir()
+    target = holding / f"{time.strftime(_QUARANTINE_STAMP, time.gmtime(now))}-{child.name}"
+    try:
+        os.mkdir(holding, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        logger.warning(
+            "agent-scratch: keeping %s in place: it holds a git repository and the "
+            "quarantine %s could not be created",
+            child,
+            holding,
+            exc_info=True,
+        )
+        return False
+    if not _is_plain_dir(holding) or os.path.lexists(target):
+        logger.warning(
+            "agent-scratch: keeping %s in place: it holds a git repository and %s "
+            "cannot receive it",
+            child,
+            target,
+        )
+        return False
+    try:
+        os.rename(child, target)
+    except OSError:
+        logger.warning(
+            "agent-scratch: keeping %s in place: it holds a git repository and could "
+            "not be moved to %s",
+            child,
+            target,
+            exc_info=True,
+        )
+        return False
+    expires = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(now + QUARANTINE_TTL_SECONDS))
+    logger.info(
+        "agent-scratch: moved %s to %s instead of deleting it, because it holds a git "
+        "repository; it is deleted after %s, so move it out of the quarantine before "
+        "then to keep it",
+        child.name,
+        target,
+        expires,
+    )
+    return True
+
+
+def _quarantined_at(name: str) -> float | None:
+    """The move time a quarantined tree's name records, or None for any other name."""
+    match = _QUARANTINED_NAME.fullmatch(name)
+    if match is None:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(match.group(1), _QUARANTINE_STAMP)))
+    except ValueError:
+        return None
+
+
+def _expire_quarantine(now: float) -> int:
+    """Delete quarantined trees older than :data:`QUARANTINE_TTL_SECONDS`.
+
+    A younger one is stripped of its regenerable subtrees instead
+    (:func:`_strip_regenerable`): a tree the sweep has just moved here, and on
+    every later sweep one whose strip was cut short or that was quarantined
+    before the strip existed. This runs outside :data:`_SWEEP_LOCK`, since
+    deleting a large install takes a while and no spawn joins a tree here.
+
+    Only a plain directory whose name this module wrote is judged, and one
+    that something wrote into within the grace window is kept until it has
+    been idle that long. Only a write defers the delete: reading or copying
+    files out of a tree leaves its mtimes alone, so the way to keep a tree
+    past its date is to move it out of the quarantine. Anything else in the
+    quarantine is left for a human. A partial delete is retried on a later
+    sweep.
+
+    Returns the number of trees deleted.
+    """
+    holding = quarantine_dir()
+    if not _is_plain_dir(holding):
+        return 0
+    try:
+        entries = list(os.scandir(holding))
+    except OSError:
+        logger.debug("agent-scratch: could not list %s", holding, exc_info=True)
+        return 0
+    expired = 0
+    for entry in entries:
+        path = holding / entry.name  # name-composed: cannot escape the quarantine
+        moved_at = _quarantined_at(entry.name)
+        if moved_at is None or not _is_plain_dir(path):
+            continue
+        if now - moved_at < QUARANTINE_TTL_SECONDS:
+            _strip_regenerable(path)
+            continue
+        if now - _tree_newest_mtime(path, fallback=now) < _UNOWNED_GRACE_SECONDS:
+            continue
+        if not platform_compat.rmtree_force(path):
+            logger.warning("agent-scratch: could not fully remove %s; will retry", path)
+            continue
+        logger.info("agent-scratch: deleted %s, whose quarantine expired", path)
+        expired += 1
+    return expired
 
 
 def sweep_dead_scratch(now: float | None = None) -> int:
@@ -871,8 +1347,20 @@ def sweep_dead_scratch(now: float | None = None) -> int:
       ownerless dir indicates a state this code did not produce -- deleting
       on absence of evidence is how live work gets lost.
     * A garbled owner file is left for a human.
+    * A dead, idle dir that holds a git repository is never deleted here: it
+      is moved into the quarantine (:func:`_quarantine`) and deleted from
+      there once :data:`QUARANTINE_TTL_SECONDS` have passed
+      (:func:`_expire_quarantine`). A dead owner says the PROCESS ended, not
+      that the work is saved: a session outlives its processes, a clone is
+      where an agent is told to work, and nothing the agent wrote can prove
+      its work is saved, so the sweep does not try to tell. What the
+      quarantine keeps is the work: the moved tree loses its package
+      installs, virtual environments, caches and pytest basetemps
+      (:func:`_strip_regenerable`), and repositories found only inside those
+      do not count (:func:`holds_git_repository`).
 
-    Returns the number of directories removed.
+    Returns the number of directories deleted, from the root or the quarantine;
+    a tree moved into the quarantine is not counted.
     """
     root = scratch_root()
     if platform_compat.is_link_or_junction(root):
@@ -892,6 +1380,8 @@ def sweep_dead_scratch(now: float | None = None) -> int:
     reference = time.time() if now is None else now
     removed = 0
     for entry in entries:
+        if entry.name == QUARANTINE_DIRNAME:
+            continue  # the sweep's own holding area: expired below, never swept
         child = root / entry.name  # name-composed: cannot escape the root
         if not _is_plain_dir(child):
             continue  # symlinks and stray files are never swept
@@ -926,6 +1416,10 @@ def sweep_dead_scratch(now: float | None = None) -> int:
             # A tree adopted by a successor names its predecessor too; either
             # one alive is a live user.
             continue
+        # Walked before the sweep lock is taken, because a large checkout
+        # takes a while to list; a spawn that marks the tree active meanwhile
+        # still wins at the final look under the lock.
+        holds_git = holds_git_repository(child)
         with _SWEEP_LOCK:
             # Final look under the lock a spawn's validate-and-touch also
             # takes: a spawn that marked this tree active since the idle
@@ -935,8 +1429,13 @@ def sweep_dead_scratch(now: float | None = None) -> int:
                     continue
             except OSError:
                 continue
-            shutil.rmtree(child, ignore_errors=True)
+            if holds_git:
+                _quarantine(child, reference)
+                continue
+            if not platform_compat.rmtree_force(child):
+                _restore_owner_after_partial_delete(child, pids)
+                continue
         removed += 1
     if removed:
         logger.info("agent-scratch: sweep removed %d dead idle scratch dir(s)", removed)
-    return removed
+    return removed + _expire_quarantine(reference)

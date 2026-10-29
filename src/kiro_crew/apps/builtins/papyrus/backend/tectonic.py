@@ -51,24 +51,23 @@ work on a daemon thread, and the ``no-blocking-call-on-event-loop`` rule.
 
 from __future__ import annotations
 
-import hashlib
-import http.client
+import contextlib
 import logging
 import os
 import platform
 import shutil
+import stat
 import sys
 import tarfile
+import tempfile
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kiro_crew import asset_downloader, platform_compat
+from kiro_crew import asset_downloader, pinned_fs, platform_compat
 from kiro_crew.apps.builtins.papyrus.backend import store
 from kiro_crew.sel import sel
 
@@ -534,64 +533,104 @@ def _locate_binary(tree: Path) -> Path | None:
     top-level directory does not need a code change to keep working.
     """
     wanted = binary_name()
+    root = tree.resolve()
+
+    def contained(candidate: Path) -> bool:
+        """True only when *candidate* is a file the extraction itself produced.
+
+        The walk below already refuses a candidate that IS a link, so refusing a
+        link-mediated escape is this function's own intent. But ``rglob``
+        DESCENDS through a directory link, and the executable on the far side is
+        an ordinary file -- ``is_file()`` true, ``is_symlink()`` false -- so it
+        passes that filter while resolving outside the tree. On Windows the link
+        is typically a junction, which ``is_symlink`` does not report at all.
+
+        Resolving is what makes the check hold for both: it follows every
+        reparse point on the way down and answers where the bytes actually live.
+
+        This is a NAME-level filter and deliberately not the containment
+        witness: it resolves a path, and whatever opens that path afterwards
+        resolves it again, so a link swapped in between is followed by the
+        second resolution and not the first. It exists to refuse the ordinary
+        case early and to name the right file in the failure message.
+        :func:`_open_inside` is what actually decides containment, on the
+        descriptor the install then reads.
+        """
+        try:
+            return candidate.resolve().is_relative_to(root)
+        except OSError:
+            return False
+
     direct = tree / wanted
-    if direct.is_file():
+    if direct.is_file() and contained(direct):
         return direct
     for candidate in sorted(tree.rglob(wanted)):
-        if candidate.is_file() and not candidate.is_symlink():
+        if candidate.is_file() and not candidate.is_symlink() and contained(candidate):
             return candidate
     return None
 
 
-# ── download ────────────────────────────────────────────────────────────────
+def _open_inside(candidate: Path, root_real: str) -> int | None:
+    """Open *candidate* and return a descriptor, but only if it lives in *root_real*.
 
+    This is the containment witness. Every by-name check in this module --
+    ``resolve()``, ``is_file()``, ``is_symlink()`` -- validates a path and then
+    hands that path to something that opens it again, so the inode that was
+    checked and the inode that is used are two separate lookups with a window
+    between them. Inside that window a local writer can retarget the
+    ``.provision.*`` tree the unpack ran into, and the second lookup follows
+    the new link.
 
-class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Refuse a redirect that leaves ``https``.
+    So the order is inverted: open FIRST, then ask the kernel where the thing
+    already held open actually is (:func:`pinned_fs.fd_real_path` --
+    ``/proc/self/fd``, ``F_GETPATH`` or ``GetFinalPathNameByHandleW``). A
+    descriptor cannot be re-pointed, so that answer stays true for as long as it
+    is held, and the caller installs FROM the descriptor rather than reopening
+    the name.
 
-    The release URL 302s to a CDN host, which is normal and expected. A redirect
-    to ``http://`` would be a silent transport downgrade. The sha256 pin means
-    such a hop could not change WHICH bytes are accepted, so this is defence in
-    depth rather than the integrity control — but a plaintext fetch of a 22MB
-    binary is worth refusing on its own.
-    """
+    *root_real* must be captured before the tree is filled, and by the caller --
+    resolving it here would re-open the same window one level up, since the
+    directory whose containment is being asserted is exactly the one an attacker
+    would swap.
 
-    def redirect_request(  # type: ignore[override]
-        self,
-        req: urllib.request.Request,
-        fp: object,
-        code: int,
-        msg: str,
-        headers: object,
-        newurl: str,
-    ) -> urllib.request.Request | None:
-        if urllib.parse.urlsplit(newurl).scheme.lower() != _HTTPS_SCHEME:
-            raise urllib.error.URLError(f"refusing non-https redirect to {redact_url(newurl)}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)  # type: ignore[arg-type]
-
-
-def redact_url(url: str) -> str:
-    """Return *url* safe for logs: scheme + host only.
-
-    A mirror override can carry a credential in ANY of three places — userinfo, a signed
-    query string, or a PATH SEGMENT (`/artifactory/api/npm/tok-9f3b2c/…`, a
-    presigned-style `/AKIA…/…`). The first two were dropped and the path was kept, so a
-    path-tokenised mirror had its token written to the log and shown on the dashboard.
-
-    The path is now dropped too. It cost the one diagnostic it carried — the artifact's
-    filename — and that is already known from :data:`_ASSETS`, so nothing is lost that
-    is not recoverable from the code. Host-only is also what makes this safe by
-    CONSTRUCTION rather than by enumerating token shapes: there is no fourth place left
-    for a secret to hide.
+    ``O_NOFOLLOW`` guards only the final component and does not exist on
+    Windows; it is passed where available as a cheap early refusal, and the
+    fd-path check is what closes the gap on every platform. ``O_BINARY`` keeps
+    the descriptor in binary mode on Windows, where ``os.open`` otherwise
+    translates CRLF and stops the install's copy at the first ``0x1A`` byte of a
+    PE file. Every failure route -- unreadable, not a regular file, unknowable
+    real path -- returns ``None``, never a fallback to the pathname.
     """
     try:
-        parts = urllib.parse.urlsplit(url)
-        host = parts.hostname or ""
-        if parts.port:
-            host = f"{host}:{parts.port}"
-        return urllib.parse.urlunsplit((parts.scheme, host, "", "", ""))
-    except ValueError:
-        return "<unparseable-url>"
+        fd = os.open(
+            candidate,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+        )
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        real = pinned_fs.fd_real_path(fd)
+        if real is None:
+            return None  # cannot witness containment -> fail closed
+        try:
+            if os.path.commonpath([real, root_real]) != root_real:
+                return None
+        except ValueError:  # different drives on Windows
+            return None
+    except OSError:
+        return None
+    else:
+        held, fd = fd, -1
+        return held
+    finally:
+        if fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
+# ── download ────────────────────────────────────────────────────────────────
 
 
 def resolve_url(asset: TectonicAsset) -> str:
@@ -614,101 +653,109 @@ def resolve_url(asset: TectonicAsset) -> str:
     return asset.url
 
 
-def _download_to(asset: TectonicAsset, staging: Path) -> tuple[bool, str]:
-    """Stream the artifact to *staging*, hashing as it goes. Verify before install.
+def _download_to(asset: TectonicAsset, archive: Path) -> tuple[bool, str]:
+    """Fetch the artifact to *archive* through the shared verified downloader.
 
-    Returns ``(ok, error)``. The digest is computed over the stream rather than
-    by re-reading the file, so a file swapped between write and check cannot be
-    what gets verified.
+    Returns ``(ok, error)``. :func:`asset_downloader.download_to` streams the
+    bytes into a staging file beside *archive*, hashes them as they arrive, and
+    renames them onto *archive* only once the digest matches ``asset.sha256``. So
+    a mismatch leaves nothing at *archive*, and :func:`_extract` never sees
+    unverified bytes.
+
+    The shared function never raises. Its error string carries the exception
+    TYPE and a host-only url, never the exception text: ``InvalidURL`` and
+    ``HTTPError`` embed the url verbatim, and a mirror override may hold a
+    credential. That string lands in the persisted install state and on the
+    dashboard, so it must stay redacted.
+
+    Cross-host redirects are allowed, but only to https. The pinned release url
+    is a constant in this file and 302s to GitHub's asset host; the override is
+    the operator's own environment. Both are shapes the shared module accepts
+    for ``allow_cross_host_redirects``, and the sha256 pin still decides.
     """
     url = resolve_url(asset)
-    # The SSL context rides on an HTTPSHandler, not on `open()`: OpenerDirector.open
-    # takes no `context=` (only the module-level urlopen does), so passing one there
-    # would be silently dropped along with the CA-discovery fallback it carries.
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=asset_downloader.make_ssl_context()),
-        _HttpsOnlyRedirectHandler,
+    _set_progress(0, 0)
+    ok, error = asset_downloader.download_to(
+        archive,
+        url,
+        sha256=asset.sha256,
+        timeout_secs=_HTTP_TIMEOUT_SECS,
+        chunk_bytes=_HTTP_CHUNK_BYTES,
+        progress_every_bytes=_PROGRESS_EVERY_BYTES,
+        on_progress=_set_progress,
+        on_verifying=lambda: _set_state(STATE_VERIFYING),
+        allow_cross_host_redirects=True,
+        label=f"Tectonic {asset.name}",
     )
-    request = urllib.request.Request(url, method="GET")
-    digest = hashlib.sha256()
-    downloaded = 0
-    try:
-        logger.info("papyrus: downloading Tectonic from %s", redact_url(url))
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- resolve_url enforces https:// and the payload is sha256-pinned
-        with opener.open(request, timeout=_HTTP_TIMEOUT_SECS) as resp:
-            total = int(resp.headers.get("Content-Length", 0) or 0)
-            _set_progress(0, total)
-            with staging.open("wb") as out:
-                while True:
-                    chunk = resp.read(_HTTP_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    digest.update(chunk)
-                    downloaded += len(chunk)
-                    if downloaded % _PROGRESS_EVERY_BYTES < _HTTP_CHUNK_BYTES:
-                        _set_progress(downloaded, total)
-        _set_progress(downloaded, downloaded)
-    # `http.client.HTTPException` is in the tuple deliberately: it is NOT an
-    # `OSError`, a `URLError` or a `ValueError`, so `InvalidURL` (a malformed mirror
-    # override — the credentialed case) would otherwise pass through this handler
-    # entirely and be reported by the outer catch-all as "provisioning crashed".
-    # Handling it here turns an unexplained crash into the accurate "download failed",
-    # and keeps
-    # the redaction and the retry loop that go with it.
-    except (
-        urllib.error.URLError,
-        http.client.HTTPException,
-        OSError,
-        TimeoutError,
-        ValueError,
-    ) as exc:
-        # The exception TEXT is not safe to return. Several of these carry the URL
-        # verbatim — `InvalidURL` and `HTTPError` both do — and a mirror override may
-        # put credentials in userinfo or a signed query string, which is precisely why
-        # `redact_url` exists and why the log line above already uses it. This return
-        # value goes further than a log: it lands in the persisted install state and
-        # is rendered on the dashboard.
-        #
-        # So the message is the exception's TYPE plus a redacted URL, never `{exc}`.
-        # The type is what actually aids diagnosis here (timeout vs. refused vs. DNS),
-        # and it cannot contain a credential.
-        # No `exc_info=True`: a traceback renders the exception's own `str()`, which is
-        # the very text being kept out of the message. The log is a sink too, so
-        # redacting the return value while dumping the traceback beside it would
-        # relocate the leak rather than close it.
-        logger.warning(
-            "papyrus: Tectonic download from %s failed: %s",
-            redact_url(url),
-            type(exc).__name__,
-        )
-        return False, f"download failed ({type(exc).__name__}) from {redact_url(url)}"
-    _set_state(STATE_VERIFYING)
-    actual = digest.hexdigest()
-    if actual != asset.sha256:
-        return False, (
-            f"sha256 mismatch for {asset.name}: got {actual[:16]}…, "
-            f"expected {asset.sha256[:16]}… — the download was refused"
-        )
+    if not ok:
+        logger.warning("papyrus: Tectonic download failed: %s", error)
+        return False, f"Tectonic {asset.name}: {error}"
+    size = archive.stat().st_size
+    _set_progress(size, size)
     return True, ""
 
 
-def _install_binary(extracted: Path, target: Path) -> None:
-    """Move *extracted* into place atomically and make it executable.
+def _install_binary(source_fd: int, target: Path) -> None:
+    """Install the bytes behind *source_fd* atomically and make them executable.
 
     Staged inside the TARGET directory so ``os.replace`` is a same-filesystem
     rename, and named per-process so two concurrent installs cannot interleave
     writes into one staging file. The mode is applied BEFORE the rename, so the
-    binary is never observable at its final path without its exec bit — a
+    binary is never observable at its final path without its exec bit -- a
     half-installed compiler that "looks valid" is exactly the state
     :func:`binary_installed` must never see.
+
+    The source is a DESCRIPTOR, not a path, and that is the whole point. Moving
+    the located path by name re-resolves it: the file that is validated and the
+    file that is installed are then two lookups of the same name, and a local
+    writer who retargets the unpack tree between them has an arbitrary file
+    promoted onto the path papyrus executes. A descriptor cannot be re-pointed,
+    so the bytes copied here are exactly the bytes :func:`_open_inside`
+    witnessed inside the tree. The cost is a copy instead of a rename, once, for
+    an artifact that was just downloaded over the network.
+
+    The staging write itself is the symmetric hazard: ``.{target}.<pid>.tmp`` is
+    a predictable name in a directory a local writer may reach, so a link
+    planted there before the write would send ~50MB of Tectonic bytes into an
+    arbitrary host file and then take its mode. The create therefore goes
+    through :func:`asset_downloader.open_staging_nofollow`, the downloader's
+    no-follow-create primitive: it removes whatever is at the name (a link AS a
+    link, never followed), creates it ``O_CREAT | O_EXCL | O_NOFOLLOW``, and
+    compares the descriptor to the name so a planted link is refused on Windows
+    too. The exec mode is applied with ``platform_compat.fchmod_safe`` THROUGH
+    that descriptor (a no-op on Windows, which has no POSIX perms), not ``chmod``
+    on the name, so the file that is marked executable is the file the bytes
+    were written to.
+
+    The rename is by name, so it goes through
+    :func:`asset_downloader.install_verified`: after the rename the installed
+    name is reopened no-follow and compared to the identity of the descriptor
+    the bytes were written through. A file swapped in at the staging name
+    between the write and the rename is removed and refused, never installed.
+    On POSIX the staging descriptor stays open across that check so its inode
+    cannot be reused; Windows will not rename a file with an open handle, so
+    there it is closed first (NTFS file ids carry a reuse sequence number).
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    staging = target.parent / f".{target.name}.{os.getpid()}.tmp"
+    staging_name = f".{target.name}.{os.getpid()}.tmp"
+    staging = target.parent / staging_name
+    where = asset_downloader.TargetDir(target.parent)
     try:
-        shutil.move(str(extracted), str(staging))
-        platform_compat.chmod_safe(staging, _BINARY_MODE)
-        os.replace(staging, target)
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        out = asset_downloader.open_staging_nofollow(where, staging_name)
+        try:
+            with os.fdopen(os.dup(source_fd), "rb", closefd=True) as source:
+                shutil.copyfileobj(source, out)
+            out.flush()
+            platform_compat.fchmod_safe(out.fileno(), _BINARY_MODE)
+            verified = asset_downloader.file_identity(os.fstat(out.fileno()))
+            if not platform_compat.IS_POSIX:
+                out.close()
+            asset_downloader.install_verified(
+                where, staging_name, target.name, verified=verified, restrict_to_owner=False
+            )
+        finally:
+            out.close()
     finally:
         if staging.exists():
             staging.unlink(missing_ok=True)
@@ -724,17 +771,32 @@ def _provision_once(root: Path | None) -> tuple[bool, str]:
             "or tectonic manually"
         )
     target = binary_path(root)
-    work = target.parent / f".provision.{os.getpid()}"
+    # A PRIVATE unpack tree: ``mkdtemp`` creates it ``0o700`` under an
+    # unpredictable name, so another account cannot plant links inside it or
+    # rewrite the extracted file in place. Swapping the whole tree by name is
+    # caught by the descriptor witness in :func:`_open_inside`. A writer who can
+    # overwrite the installed binary in the vendor directory itself is out of
+    # scope: no install-time check can stop that. Windows ignores the mode (the
+    # directory inherits the vendor dir's DACL).
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=".provision.", dir=target.parent))
+    except OSError as exc:
+        return False, f"install failed: {exc}"
     archive = work / asset.name
     try:
-        shutil.rmtree(work, ignore_errors=True)
-        work.mkdir(parents=True, exist_ok=True)
         ok, error = _download_to(asset, archive)
         if not ok:
             return False, error
         _set_state(STATE_INSTALLING)
         unpacked = work / "unpacked"
         unpacked.mkdir()
+        # Captured HERE, on a directory this process just created and before the
+        # archive is written into it, so it is the extraction's own tree that
+        # containment is asserted against. Resolving it later -- inside the
+        # locator, or after the walk -- would resolve whatever the name points at
+        # by then, which is precisely the thing an attacker would have swapped.
+        root_real = os.path.realpath(unpacked)
         try:
             _extract(archive, unpacked, is_zip=asset.is_zip)
         except (ArchiveRejected, tarfile.TarError, zipfile.BadZipFile, OSError) as exc:
@@ -742,12 +804,23 @@ def _provision_once(root: Path | None) -> tuple[bool, str]:
         binary = _locate_binary(unpacked)
         if binary is None:
             return False, f"no {binary_name()} found inside {asset.name}"
-        if binary.stat().st_size < _MIN_BINARY_BYTES:
-            return (
-                False,
-                f"extracted {binary_name()} is implausibly small ({binary.stat().st_size} bytes)",
+        source_fd = _open_inside(binary, root_real)
+        if source_fd is None:
+            return False, (
+                f"the {binary_name()} found inside {asset.name} does not live inside "
+                "the unpacked tree — refusing to install it"
             )
-        _install_binary(binary, target)
+        try:
+            # From the descriptor, not the path: a second stat() of the name is a
+            # second lookup, and the size that gates the install must be the size
+            # of the file that gets installed.
+            size = os.fstat(source_fd).st_size
+            if size < _MIN_BINARY_BYTES:
+                return False, f"extracted {binary_name()} is implausibly small ({size} bytes)"
+            _install_binary(source_fd, target)
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(source_fd)
         if not binary_installed(root):
             return False, "installed binary failed its post-install check"
         return True, ""
@@ -838,17 +911,17 @@ def _provision_job(root: Path | None) -> None:
         installed = provision_sync(root)
     except Exception as exc:  # noqa: BLE001 - a background job must report, not crash
         logger.warning("papyrus: Tectonic provisioning crashed", exc_info=True)
-        # TYPE only, not `{exc}`. This is the catch-all, so the URL-bearing
-        # exceptions the download path deliberately redacts arrive here whenever they
-        # are not one of the four types it handles — and `http.client.InvalidURL` is
-        # exactly that case: it derives from `HTTPException`, not from `OSError`,
-        # `URLError` or `ValueError`, so it passes straight through `_download_to`'s
-        # handler and `_install_binary`'s `except OSError` to land here.
+        # TYPE only, not `{exc}`. This is the catch-all: anything the install path
+        # does not handle lands here. The download itself never raises (the shared
+        # downloader reports every failure as a redacted string), but a URL-bearing
+        # exception such as `http.client.InvalidURL` raised anywhere else on this
+        # thread would. It derives from `HTTPException`, not from `OSError`, so it
+        # passes `_install_binary`'s `except OSError` too.
         #
         # Its message embeds the offending URL verbatim ("nonnumeric port:
-        # 'secretpw@…'"), so a credentialed mirror override put the credential into
-        # the persisted install state, the dashboard, AND the SEL audit record. Two
-        # sinks below, both of which needed it.
+        # 'secretpw@…'"), so a credentialed mirror override would put the credential
+        # into the persisted install state, the dashboard, AND the SEL audit record.
+        # Two sinks below, both of which need it.
         _set_state(STATE_ERROR, error=f"provisioning crashed ({type(exc).__name__})")
         _audit("failed", error=type(exc).__name__)
         return

@@ -42,7 +42,7 @@ import {
   COLLAPSED_TREE_WIDTH,
   PDF_WIDTH_KEY, MIN_PDF_WIDTH, maxPdfWidth, defaultPdfWidth,
   CHAT_WIDTH_KEY, DEFAULT_CHAT_WIDTH, MIN_CHAT_WIDTH, MAX_CHAT_WIDTH, CHAT_OPEN_KEY,
-  maxChatWidth,
+  maxChatWidth, projectQueryKey,
 } from './lib'
 import { loadColumnWidth, loadColumnCollapsed } from '../../lib/columnWidth'
 import { safeSetItem } from '../../utils/safeStorage'
@@ -220,6 +220,9 @@ export default function PapyrusPage() {
   const [slotKey, setSlotKey] = useState<string | null>(null)
   const [slotCreating, setSlotCreating] = useState(false)
   const [error, setError] = useState('')
+  // Separate from `error` because the two differ in SEVERITY, not just wording: `error`
+  // reports a failed user action, this reports a declined convenience the user can redo.
+  const [contextError, setContextError] = useState<string | null>(null)
   // The file whose on-disk copy diverged from an unsaved buffer (a co-author edit
   // arriving while the user was typing). Blocks saves until reconciled — see
   // `reloadOpenFile`'s no-flush branch and `resolveConflict`.
@@ -264,7 +267,7 @@ export default function PapyrusPage() {
   // ── Project metadata ──────────────────────────────────────────────────────
 
   const projectQuery = useQuery({
-    queryKey: ['papyrus', 'project', project],
+    queryKey: projectQueryKey(project as string),
     queryFn: () => papyrusApi.getProject(project as string),
     enabled: !!project,
     retry: false,
@@ -373,7 +376,7 @@ export default function PapyrusPage() {
   })
 
   const invalidateFiles = useCallback(
-    () => queryClient.invalidateQueries({ queryKey: ['papyrus', 'project', project] }),
+    () => queryClient.invalidateQueries({ queryKey: projectQueryKey(project as string) }),
     [queryClient, project],
   )
 
@@ -675,6 +678,28 @@ export default function PapyrusPage() {
     onError: (err: Error) => setError(err.message),
   })
 
+  // Routed through React Query like every other mutation on this page, so the request is
+  // retried, deduped and observable rather than a bare floating promise.
+  // Counts context pushes, so only the NEWEST one's result may set or clear the notice: a late
+  // success from a superseded session must not retract the current session's failure.
+  const contextRequestSeq = useRef(0)
+  const injectContextMut = useMutation({
+    mutationFn: (vars: { slotKey: string; seq: number }) =>
+      api.chatSlotContext(vars.slotKey, companionContext(), {
+        source: 'papyrus-co-author', ephemeral: true, maxAge: 3600,
+      }),
+    onSuccess: (_d: unknown, vars: { slotKey: string; seq: number }) => {
+      if (vars.seq === contextRequestSeq.current) setContextError(null)
+    },
+    // EVERY rejection reaches the user: silence left the session open with no document
+    // context and no way to know, and every cause shares the one actionable remedy.
+    onError: (_e: unknown, vars: { slotKey: string; seq: number }) => {
+      if (vars.seq !== contextRequestSeq.current) return
+      setContextError(i18nT('apps.papyrus.workspace.context_not_attached'))
+    },
+  })
+  const injectContext = injectContextMut.mutate
+
   // ── Git ───────────────────────────────────────────────────────────────────
 
   const gitQuery = useQuery({
@@ -741,6 +766,10 @@ export default function PapyrusPage() {
   // Adopt the remembered slot for this paper as soon as the project changes.
   useEffect(() => {
     setSlotKey(project ? loadSlot(project) : null)
+    // The notice names the paper it was raised on; a pending push for the old paper is
+    // superseded too, so its late result cannot raise or clear the next paper's notice.
+    contextRequestSeq.current += 1
+    setContextError(null)
   }, [project])
 
   /** Build the silent context that tells the agent which paper it is working on.
@@ -749,7 +778,6 @@ export default function PapyrusPage() {
   const companionContext = useCallback(() => {
     return companionContextLines(project ?? '', mainFile).join('\n')
   }, [project, mainFile])
-
   const startSession = useCallback(async () => {
     if (!project || slotCreating) return
     setSlotCreating(true)
@@ -759,6 +787,7 @@ export default function PapyrusPage() {
       const created = await api.createChatSlot(
         undefined, undefined, undefined, undefined, 'persistent',
         i18nT('apps.papyrus.workspace.session_title', { name: project }),
+        undefined, undefined, undefined, true,
       )
       const key = created.key as string
       dispatch(addSlotOptimistic({
@@ -767,9 +796,8 @@ export default function PapyrusPage() {
         messages: 0,
         running: false,
       } as ChatSlot))
-      api.chatSlotContext(key, companionContext(), {
-        source: 'papyrus-co-author', ephemeral: true,
-      }).catch(() => undefined)
+      contextRequestSeq.current += 1
+      injectContext({ slotKey: key, seq: contextRequestSeq.current })
       dispatch(fetchSlots())
       saveSlot(project, key)
       setSlotKey(key)
@@ -778,7 +806,7 @@ export default function PapyrusPage() {
     } finally {
       setSlotCreating(false)
     }
-  }, [project, slotCreating, dispatch, companionContext])
+  }, [project, slotCreating, dispatch, injectContext])
 
   const toggleChat = useCallback(() => {
     setChatOpen(open => {
@@ -823,6 +851,8 @@ export default function PapyrusPage() {
   // single answer to "is this session working" and already merges every signal
   // that decides it (stream state, sub-agents, the slots snapshot).
   const coAuthorBusy = useAppSelector(state => selectComposerBusy(state, slotKey))
+  // NO AUTO-RETRACTION ON A TURN. A turn does not attach the paper, so clearing on one told a
+  // user who typed anything at all that the co-author had it. The notice stands until dismissed.
   const prevBusyRef = useRef(false)
   useEffect(() => {
     const wasBusy = prevBusyRef.current
@@ -976,14 +1006,24 @@ export default function PapyrusPage() {
   }
 
   return (
-    <div className="flex flex-col flex-1 min-h-0" data-testid="papyrus-workspace">
+    <div
+      className={`flex flex-col flex-1 ${isMobile ? 'min-h-0' : ''}`}
+      data-testid="papyrus-workspace"
+    >
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-border bg-card shrink-0">
         <Btn onClick={closeProject}>
           <ArrowLeft className="lucide-inline" />
           {i18nT('apps.papyrus.workspace.papers')}
         </Btn>
-        <span className="text-[13px] font-medium text-text-strong truncate max-w-[12rem]">{project}</span>
+        {/* The paper's resolved title, matching the row that opened it — NOT the
+            directory name, which is the app's key and reads as an id for a
+            cloned paper. `||` rather than `??`: the fallback must also catch a
+            title that resolved to the empty string, and a header is not the
+            place to render `undefined`. */}
+        <span className="text-[13px] font-medium text-text-strong truncate max-w-[12rem]">
+          {detail?.title || project}
+        </span>
 
         {/* The picker is a `<button>` now, not a `<select>`, and HTML-AAM
             computes a button's accessible name from its own content — a
@@ -997,25 +1037,48 @@ export default function PapyrusPage() {
             `MAX_PROJECT_FILES`), so they are nested paths sharing a common
             prefix — a Radix Select's first-letter typeahead cannot separate
             `chapters/01.tex` from `chapters/02.tex`. */}
-        <span className="flex items-center gap-1.5 text-[12px] text-muted">
-          {i18nT('apps.papyrus.workspace.main_document')}
-          <SearchableSelect
-            options={mainOptions}
-            value={mainFile}
-            onChange={file => setMainMutation.mutate(file)}
-            disabled={setMainMutation.isPending || mainCandidates.length === 0}
-            aria-label={i18nT('apps.papyrus.workspace.main_document')}
-            // The trigger is `w-full`, so it needs a definite flex basis in this
-            // wrapping toolbar; a path too long for it truncates inside the span.
-            style={{ flex: '0 0 14rem' }}
-          />
+        {/* `max-w-full` + `flex-wrap`: on a narrow screen (320px leaves ~296px
+            inside the toolbar) the label and the 224px select do not fit side by
+            side, so the group is capped at the row and the select drops under
+            its label instead of pushing the row sideways. */}
+        <span className="flex flex-wrap items-center gap-1.5 shrink-0 max-w-full text-[12px] text-muted">
+          {/* `whitespace-nowrap`: the label is a flex item beside a select of
+              fixed width, so every bit of squeeze landed on the text — which
+              broke "Main document" across two lines and grew the whole toolbar
+              row. Refusing the break makes the toolbar wrap this group as a unit
+              instead, which is what `flex-wrap` is for. */}
+          <span className="whitespace-nowrap">
+            {i18nT('apps.papyrus.workspace.main_document')}
+          </span>
+          {/* The select's width lives HERE, as a definite `width` on a wrapper,
+              and NOT as a `flex-basis` on the trigger.
+
+              The trigger is `w-full`, so it needs its width from somewhere. When
+              that somewhere was `flex: 0 0 14rem` on the trigger itself, this
+              span sized to the trigger's TEXT (measured at 202px against 315px
+              of content) and the 224px trigger painted 113px past the span, over
+              the file status beside it — a percentage width is circular
+              while the parent is being measured, so the basis never reached the
+              parent's intrinsic size. A definite width on a plain wrapper is not
+              circular, so the span measures the full group. */}
+          <span className="flex w-56 max-w-full shrink-0">
+            <SearchableSelect
+              options={mainOptions}
+              value={mainFile}
+              onChange={file => setMainMutation.mutate(file)}
+              disabled={setMainMutation.isPending || mainCandidates.length === 0}
+              aria-label={i18nT('apps.papyrus.workspace.main_document')}
+            />
+          </span>
         </span>
 
-        <span className="text-[12px] text-muted truncate">
-          {dirty
-            ? i18nT('apps.papyrus.workspace.editing_unsaved', { file: currentFile })
-            : i18nT('apps.papyrus.workspace.editing', { file: currentFile })}
-        </span>
+        {currentFile && (dirty || currentFile !== mainFile) && (
+          <span className="text-[12px] text-muted truncate">
+            {dirty
+              ? i18nT('apps.papyrus.workspace.editing_unsaved', { file: currentFile })
+              : i18nT('apps.papyrus.workspace.editing', { file: currentFile })}
+          </span>
+        )}
 
         {hasConflict && (
           // The conflict has to be VISIBLE and have an exit. A silent read-only editor
@@ -1100,13 +1163,13 @@ export default function PapyrusPage() {
       <ErrorNotice className="mx-3 mt-2 animate-rise" message={error} onDismiss={() => setError('')} />
 
       {/* Workspace */}
-      <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
+      <div className={`flex flex-1 ${isMobile ? 'min-h-0 flex-col' : ''}`}>
         {/* Source column: file tree + editor + status bar (+ diagnostics).
             `flex-1` on desktop rather than a fixed share: the PDF and co-author
             columns own persisted widths, so the editor takes what is left and a
             wider window grows the text being written instead of rescaling a
             preview the user just sized. */}
-        <div className={`flex flex-col flex-1 min-h-0 min-w-0 ${narrowChat ? 'hidden' : ''}`}>
+        <div className={`flex flex-col flex-1 min-w-0 ${isMobile ? 'min-h-0' : ''} ${narrowChat ? 'hidden' : ''}`}>
           {/* Narrow: the tree is reached from the TOP, so it reserves no
               horizontal space and the editor gets the full width. */}
           {isMobile && (
@@ -1119,7 +1182,7 @@ export default function PapyrusPage() {
               {i18nT('apps.papyrus.fileTree.files')}
             </Btn>
           )}
-          <div className={`flex flex-1 min-h-0 ${isMobile ? 'flex-col' : ''}`}>
+          <div className={`flex flex-1 ${isMobile ? 'min-h-0 flex-col' : 'min-h-[180px] [contain:size]'}`}>
             {/* Height-bounded while stacked, or the tree pushes the editor off
                 the pane. `vh` rather than a percentage: no ancestor here has a
                 definite height, so a percentage max-height would not resolve. */}
@@ -1250,13 +1313,15 @@ export default function PapyrusPage() {
                 animate={{ height: 'auto', opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
                 transition={{ duration: 0.16 }}
-                className="border-t border-border bg-card overflow-hidden shrink-0 max-h-56"
+                className="border-t border-border bg-card overflow-hidden shrink-0"
               >
-                <DiagnosticsList
-                  diagnostics={diagnostics}
-                  log={compileLog}
-                  onJumpToLine={line => editorRef.current?.jumpToLine(line)}
-                />
+                <div className="max-h-56 overflow-x-hidden overflow-y-auto">
+                  <DiagnosticsList
+                    diagnostics={diagnostics}
+                    log={compileLog}
+                    onJumpToLine={line => editorRef.current?.jumpToLine(line)}
+                  />
+                </div>
               </motion.div>
             )}
           </AnimatePresence>
@@ -1313,20 +1378,38 @@ export default function PapyrusPage() {
               // drag reads as broken. It stays animated for the open/close it was
               // written for.
               transition={{ duration: chat.dragging ? 0 : 0.18 }}
-              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0'}`}
+              className={`min-h-0 overflow-hidden ${isMobile ? 'flex-1' : 'shrink-0 [contain:size]'}`}
             >
               {/* BOTH widths have to move together. This wrapper is animated and
                   content-sized, so a percentage on the child alone resolves
                   against a box that hugs its own content -- the panel would come
                   out narrower than the pixel width it replaced, not wider. */}
-              <div style={{ width: isMobile ? '100%' : chatWidth }} className="h-full min-h-0">
-                <CoAuthorPanel
-                  slotKey={slotKey}
-                  creating={slotCreating}
-                  onStartSession={startSession}
-                  onOpenFull={openFullChat}
-                  onClose={() => setChatOpen(false)}
+              <div
+                style={{ width: isMobile ? '100%' : chatWidth }}
+                className="flex h-full min-h-0 flex-col"
+              >
+                {/* IN THIS COLUMN: the action that fails is "Start a session" here, so a page-top
+                    banner puts the report a column away from the control that produced it.
+                    No hand-off: this page holds an editable buffer and `askAgent` navigates away,
+                    unmounting it, so the offer would risk unsaved edits to save nothing. */}
+                <ErrorNotice
+                  className="mb-2 animate-rise"
+                  message={contextError}
+                  title={i18nT('apps.papyrus.workspace.context_notice_title')}
+                  onDismiss={() => setContextError(null)}
                 />
+                {/* The panel sizes against THIS box, not the column: its own `h-full` measured the
+                    whole column, so the notice's height pushed the composer past a clipped edge --
+                    hiding the input the notice tells the reader to type into. */}
+                <div className="min-h-0 flex-1">
+                  <CoAuthorPanel
+                    slotKey={slotKey}
+                    creating={slotCreating}
+                    onStartSession={startSession}
+                    onOpenFull={openFullChat}
+                    onClose={() => setChatOpen(false)}
+                  />
+                </div>
               </div>
             </motion.div>
           )}

@@ -1,5 +1,7 @@
 import React from 'react'
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { closeCrewWindow, currentCrewWindow, markCrewWindowShown, openCrewWindow } from '../pages/chat/crew-window/crewWindowStore'
+import * as chatSlice from '../store/chatSlice'
 import { fireEvent, screen, act, render } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { Provider } from 'react-redux'
@@ -8,6 +10,8 @@ import { PANEL_TOGGLE_SHORTCUTS_KEY } from '../lib/panelToggleShortcuts'
 import { matchShortcutEvent, resolveShortcuts } from '../lib/shortcutRegistry'
 import { renderHookWithProviders, createTestStore, renderWithProviders } from './helpers'
 import { consumeComposerRelease } from '../pages/chat/composerFocus'
+import { recordRouteNavigation, _resetRouteHistoryPositionForTest } from '../lib/routeHistoryPosition'
+import { NavigationLeaveGuardProvider, useRegisterNavigationLeaveGuard } from '../components/NavigationLeaveGuard'
 import chatReducer from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import ShortcutsModal from '../components/ShortcutsModal'
@@ -101,6 +105,26 @@ describe('useKeyboardShortcuts — toggle behavior', () => {
     expect(onNewChat).not.toHaveBeenCalled()
   })
 
+  // Holding the chord sends one keydown and then auto-repeat keydowns with
+  // `repeat: true`. Only the first is a press; the repeats are still claimed
+  // so the browser's own binding does not run.
+  it('a held Alt+Shift+N creates one session, not one per auto-repeat', () => {
+    setup()
+    fireEvent.keyDown(document, { code: 'KeyN', altKey: true, shiftKey: true })
+    const repeats = Array.from({ length: 5 }, () => new KeyboardEvent('keydown', { code: 'KeyN', altKey: true, shiftKey: true, repeat: true, bubbles: true, cancelable: true }))
+    for (const ev of repeats) document.dispatchEvent(ev)
+    expect(onNewChat).toHaveBeenCalledTimes(1)
+    expect(repeats.every(ev => ev.defaultPrevented)).toBe(true)
+  })
+
+  it('two separate Alt+Shift+N presses create two sessions', () => {
+    setup()
+    fireEvent.keyDown(document, { code: 'KeyN', altKey: true, shiftKey: true })
+    fireEvent.keyUp(document, { code: 'KeyN', altKey: true, shiftKey: true })
+    fireEvent.keyDown(document, { code: 'KeyN', altKey: true, shiftKey: true })
+    expect(onNewChat).toHaveBeenCalledTimes(2)
+  })
+
   it('Alt+Shift+W closes the active session (handler matches, preventDefault called)', () => {
     const store = createTestStore({
       dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
@@ -113,6 +137,48 @@ describe('useKeyboardShortcuts — toggle behavior', () => {
     const event = new KeyboardEvent('keydown', { code: 'KeyW', altKey: true, shiftKey: true, cancelable: true, bubbles: true })
     const prevented = !document.dispatchEvent(event)
     expect(prevented).toBe(true)
+  })
+
+  it('Alt+Shift+W closes an open crew window, never the local session under it', async () => {
+    const store = createTestStore({
+      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
+      chat: { activeSlot: 'slot-1', slotHistory: [] } as unknown as RootState['chat'],
+    })
+    const spy = vi.spyOn(chatSlice, 'deleteSlot')
+    openCrewWindow({ instanceId: 'cd-1', key: 'k1' })
+    const unmark = markCrewWindowShown(closeCrewWindow)
+    try {
+      renderHookWithProviders(
+        () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }),
+        { store },
+      )
+      document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', altKey: true, shiftKey: true, cancelable: true, bubbles: true }))
+      expect(currentCrewWindow()).toBeNull()
+      expect(spy).not.toHaveBeenCalled()
+    } finally {
+      unmark()
+      closeCrewWindow()
+      spy.mockRestore()
+    }
+  })
+
+  it('Alt+Shift+W runs the shown window\'s own close (an embedded host navigates)', () => {
+    const store = createTestStore({
+      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
+      chat: { activeSlot: 'slot-1', slotHistory: [] } as unknown as RootState['chat'],
+    })
+    const hostClose = vi.fn()
+    const unmark = markCrewWindowShown(hostClose)
+    try {
+      renderHookWithProviders(
+        () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }),
+        { store },
+      )
+      document.dispatchEvent(new KeyboardEvent('keydown', { code: 'KeyW', altKey: true, shiftKey: true, cancelable: true, bubbles: true }))
+      expect(hostClose).toHaveBeenCalledTimes(1)
+    } finally {
+      unmark()
+    }
   })
 
   it('Alt+Shift+W is suppressed when shortcuts are disabled', () => {
@@ -160,23 +226,51 @@ describe('useKeyboardShortcuts — toggle behavior', () => {
     expect(prevented).toBe(true)
   })
 
-  it('Alt+` arms a one-shot beforeinput guard that cancels the macOS dead-key char', () => {
-    const store = createTestStore({
-      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 0, running: false }, { key: 'slot-2', title: 'Chat 2', messages: 0, running: false }] } as unknown as RootState['dashboard'],
-      chat: { activeSlot: 'slot-2', slotHistory: ['slot-1'] } as unknown as RootState['chat'],
+  describe('MRU walk chord', () => {
+    function setupMru(platform: string) {
+      Object.defineProperty(navigator, 'platform', { value: platform, configurable: true })
+      const store = createTestStore({
+        dashboard: { ...dashboardReducer(undefined, { type: '@@test/init' }), slots: [{ key: 'slot-1', title: 'Chat 1', messages: 0, running: false }, { key: 'slot-2', title: 'Chat 2', messages: 0, running: false }] } as unknown as RootState['dashboard'],
+        chat: { ...chatReducer(undefined, { type: '@@test/init' }), activeSlot: 'slot-2', slotHistory: ['slot-1'] } as unknown as RootState['chat'],
+      })
+      renderHookWithProviders(
+        () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }),
+        { store },
+      )
+      return store
+    }
+    const press = (mods: KeyboardEventInit) =>
+      !document.dispatchEvent(new KeyboardEvent('keydown', { code: 'Backquote', cancelable: true, bubbles: true, ...mods }))
+    let prevPlatform = ''
+    beforeEach(() => { prevPlatform = navigator.platform })
+    afterEach(() => { Object.defineProperty(navigator, 'platform', { value: prevPlatform, configurable: true }) })
+
+    it('macOS: ⌃⌥` jumps to the last visited session', () => {
+      const store = setupMru('MacIntel')
+      expect(press({ ctrlKey: true, altKey: true })).toBe(true)
+      expect(store.getState().chat.activeSlot).toBe('slot-1')
     })
-    renderHookWithProviders(
-      () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }),
-      { store },
-    )
-    // Alt+` (MRU toggle) fires while a text field is focused. On macOS Option+`
-    // is a dead key whose grave-accent char still arrives via beforeinput, which
-    // keydown.preventDefault() cannot cancel — the handler arms a one-shot guard.
-    document.dispatchEvent(new KeyboardEvent('keydown', { code: 'Backquote', altKey: true, cancelable: true, bubbles: true }))
-    // The stray composed character arrives via beforeinput → must be cancelled.
-    expect(!document.dispatchEvent(new Event('beforeinput', { cancelable: true, bubbles: true }))).toBe(true)
-    // One-shot: the next beforeinput is NOT cancelled.
-    expect(!document.dispatchEvent(new Event('beforeinput', { cancelable: true, bubbles: true }))).toBe(false)
+
+    it('macOS: ⌃⌥⇧` walks back the MRU history', () => {
+      const store = setupMru('MacIntel')
+      expect(press({ ctrlKey: true, altKey: true, shiftKey: true })).toBe(true)
+      expect(store.getState().chat.activeSlot).toBe('slot-1')
+    })
+
+    it('macOS: Option+` is left alone — it is the grave-accent dead key', () => {
+      const store = setupMru('MacIntel')
+      expect(press({ altKey: true })).toBe(false)
+      expect(press({ altKey: true, shiftKey: true })).toBe(false)
+      expect(store.getState().chat.activeSlot).toBe('slot-2')
+    })
+
+    it('Windows/Linux: Alt+` jumps to the last visited session; Ctrl+Alt+` (AltGr) does not', () => {
+      const store = setupMru('Win32')
+      expect(press({ ctrlKey: true, altKey: true })).toBe(false)
+      expect(store.getState().chat.activeSlot).toBe('slot-2')
+      expect(press({ altKey: true })).toBe(true)
+      expect(store.getState().chat.activeSlot).toBe('slot-1')
+    })
   })
 
   it('responds to SHORTCUTS_ENABLED_EVENT to re-enable', () => {
@@ -364,6 +458,97 @@ describe('useKeyboardShortcuts — route-history chord', () => {
     act(() => { document.dispatchEvent(event) })
     expect(event.defaultPrevented).toBe(true)
     expect(screen.getByTestId('hist-loc').textContent).toBe('/chat')
+  })
+
+  it('Ctrl+← arms the composer release, so the next press is not eaten by autofocus', () => {
+    // Non-Mac on purpose: the text-field unclaim is platform-wide, so the
+    // arming must be too.
+    consumeComposerRelease()
+    setupAt(['/chat', '/settings'])
+    window.history.replaceState({ idx: 1 }, '', '/settings')
+    const event = new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', ctrlKey: true, cancelable: true, bubbles: true })
+    act(() => { document.dispatchEvent(event) })
+    expect(screen.getByTestId('hist-loc').textContent).toBe('/chat')
+    expect(consumeComposerRelease()).toBe(true)
+  })
+
+  it('Ctrl+→ arms the composer release too', () => {
+    consumeComposerRelease()
+    try {
+      setupAt(['/chat', '/settings'])
+      // Seed a forward frontier: an entry at idx 1 was seen, we now stand at 0.
+      window.history.replaceState({ idx: 1 }, '', '/settings')
+      recordRouteNavigation('PUSH')
+      window.history.replaceState({ idx: 0 }, '', '/chat')
+      const event = new KeyboardEvent('keydown', { code: 'ArrowRight', key: 'ArrowRight', ctrlKey: true, cancelable: true, bubbles: true })
+      act(() => { document.dispatchEvent(event) })
+      expect(event.defaultPrevented).toBe(true)
+      expect(consumeComposerRelease()).toBe(true)
+    } finally {
+      _resetRouteHistoryPositionForTest()
+    }
+  })
+
+  describe('behind the draft ask', () => {
+    function GuardedProbe({ guard }: { guard: () => boolean }) {
+      useRegisterNavigationLeaveGuard(guard)
+      return <Probe />
+    }
+
+    const setupGuarded = (guard: () => boolean) => {
+      const store = createTestStore({
+        dashboard: { slots: [] } as unknown as RootState['dashboard'],
+        chat: { activeSlot: null, slotHistory: [] } as unknown as RootState['chat'],
+      })
+      render(
+        <Provider store={store}>
+          <NavigationLeaveGuardProvider>
+            <MemoryRouter initialEntries={['/chat', '/settings']} initialIndex={1}>
+              <GuardedProbe guard={guard} />
+            </MemoryRouter>
+          </NavigationLeaveGuardProvider>
+        </Provider>,
+      )
+      window.history.replaceState({ idx: 1 }, '', '/settings')
+    }
+
+    const pressBack = () => {
+      const event = new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', ctrlKey: true, cancelable: true, bubbles: true })
+      act(() => { document.dispatchEvent(event) })
+    }
+
+    it('a vetoed step leaves the release unarmed', () => {
+      consumeComposerRelease()
+      setupGuarded(() => false)
+      pressBack()
+      expect(screen.getByTestId('hist-loc').textContent).toBe('/settings')
+      expect(consumeComposerRelease()).toBe(false)
+    })
+
+    it('arms after the ask, so a slow confirm does not expire the one-shot', () => {
+      consumeComposerRelease()
+      const t0 = 1_000_000
+      const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+      try {
+        // The user takes longer than the one-shot's lifetime to answer.
+        setupGuarded(() => { now.mockReturnValue(t0 + 5000); return true })
+        pressBack()
+        expect(screen.getByTestId('hist-loc').textContent).toBe('/chat')
+        expect(consumeComposerRelease()).toBe(true)
+      } finally {
+        now.mockRestore()
+      }
+    })
+  })
+
+  it('does not arm the release when there is nowhere to go', () => {
+    consumeComposerRelease()
+    setupAt(['/chat'])
+    window.history.replaceState({ idx: 0 }, '', '/chat')
+    const event = new KeyboardEvent('keydown', { code: 'ArrowLeft', key: 'ArrowLeft', ctrlKey: true, cancelable: true, bubbles: true })
+    act(() => { document.dispatchEvent(event) })
+    expect(event.defaultPrevented).toBe(true)
+    expect(consumeComposerRelease()).toBe(false)
   })
 
   it('claims the chord even at the bottom of the stack, so the two affordances agree', () => {
@@ -1359,11 +1544,14 @@ describe('useKeyboardShortcuts — stop speaking (Escape)', () => {
   const onToggleShortcutsModal = vi.fn()
   const onNewChat = vi.fn()
 
-  function setup(opts: { voicePlaying?: boolean; enabled?: boolean; disabled?: boolean } = {}) {
+  function setup(opts: { voicePlaying?: boolean; voicePreparing?: boolean; enabled?: boolean; disabled?: boolean } = {}) {
     if (opts.enabled === false) localStorage.setItem(SHORTCUTS_ENABLED_KEY, '0')
     const store = createTestStore({
       dashboard: { slots: [] } as unknown as RootState['dashboard'],
-      chat: { activeSlot: null, slotHistory: [], voicePlaying: opts.voicePlaying ?? false } as unknown as RootState['chat'],
+      chat: {
+        activeSlot: null, slotHistory: [],
+        voicePlaying: opts.voicePlaying ?? false, voicePreparing: opts.voicePreparing ?? false,
+      } as unknown as RootState['chat'],
     })
     renderHookWithProviders(
       () => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, disabled: opts.disabled }),
@@ -1383,6 +1571,15 @@ describe('useKeyboardShortcuts — stop speaking (Escape)', () => {
     const spy = vi.fn()
     window.addEventListener('voice-stop', spy)
     setup({ voicePlaying: true })
+    pressEscape()
+    window.removeEventListener('voice-stop', spy)
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it('fires voice-stop on Escape while speech is still being prepared', () => {
+    const spy = vi.fn()
+    window.addEventListener('voice-stop', spy)
+    setup({ voicePreparing: true })
     pressEscape()
     window.removeEventListener('voice-stop', spy)
     expect(spy).toHaveBeenCalledTimes(1)
@@ -1541,6 +1738,21 @@ describe('useKeyboardShortcuts — registry chords (conventional defaults + alia
           },
         },
       } as unknown as RootState['chat'],
+    })
+    renderHookWithProviders(() => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }), { store })
+    press({ code: 'KeyW', ctrlKey: true })
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    expect(store.getState().dashboard.slots.find(s => s.key === 'slot-1')).toBeDefined() // declined → kept
+    confirmSpy.mockRestore()
+  })
+
+  it('Ctrl+W asks first for a session whose children are only queued (closing retires them)', () => {
+    // Queued children are not Working, so the lane reads idle; the gate must
+    // still confirm, because deleteSlot cancels the accepted spawns.
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const store = createTestStore({
+      dashboard: { slots: [{ key: 'slot-1', title: 'Chat 1', messages: 1, running: false }] } as unknown as RootState['dashboard'],
+      chat: { activeSlot: 'slot-1', slotHistory: [], subagentQueued: { 'slot-1': 2 } } as unknown as RootState['chat'],
     })
     renderHookWithProviders(() => useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat }), { store })
     press({ code: 'KeyW', ctrlKey: true })

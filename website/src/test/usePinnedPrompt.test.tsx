@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '../types'
 import type { DisplayItem } from '../pages/chat/types'
-import { usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
+import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
+import { DEFAULT_PINNED_CARD_H } from '../utils/pinnedPrompt'
 
 /**
  * chat-core P5-d: the pinned-prompt geometry extracted from the main chat's
@@ -232,6 +233,79 @@ describe('usePinnedPrompt (shared pinned-prompt geometry)', () => {
     expect(h.result.current.pinned).toBeNull()
   })
 
+  // The last turn's reply is taller than the viewport: once its top passes the
+  // fold no row is left below the line. The banner must keep the prompt that reply
+  // answers, not vanish while the reader is inside it.
+  it.each([false, true])('keeps the prompt pinned while reading a final reply taller than the viewport (requiresMountedHandoff=%s)', (requiresMountedHandoff) => {
+    const h = renderPin(requiresMountedHandoff)
+    const g = mountGeometry(2)
+    setRect(g.rows[0], -400, 380)
+    setRect(g.rows[1], 60, 1800)
+    wire(h, g, [single(0, 'user', 'long prompt'), single(1, 'assistant', 'long reply')])
+    expect(h.result.current.pinned?.idx).toBe(0)
+  })
+
+  // Message HTML can carry `data-display-index` (the sanitizer admits arbitrary
+  // `data-*`). A forged index inside the last MOUNTED row must not pass for the
+  // list end: rows 2 and 3 are unmounted below, so the boundary is unknown and
+  // nothing may be pinned. Counting the forged node would read the tail as the
+  // end of the list and pin the unmounted prompt at idx 2.
+  it.each([false, true])('ignores a data-display-index forged inside message content (requiresMountedHandoff=%s)', (requiresMountedHandoff) => {
+    const h = renderPin(requiresMountedHandoff)
+    const g = mountGeometry(2)
+    setRect(g.rows[0], -400, 380)
+    setRect(g.rows[1], 60, 1800)
+    const forged = document.createElement('span')
+    forged.dataset.displayIndex = '3'
+    setRect(forged, 80, 20)
+    g.rows[1].append(forged)
+    wire(h, g, [
+      single(0, 'user', 'first prompt'),
+      single(1, 'assistant', 'reply with forged attribute'),
+      single(2, 'user', 'later prompt'),
+      single(3, 'assistant', 'later reply'),
+    ])
+    expect(h.result.current.pinned).toBeNull()
+  })
+
+  // The last display row is a PROMPT taller than the space below the fold — just
+  // sent, no reply streamed yet. It must never become its own stand-in: the card
+  // would fold down to its head and the prompt's tail could not be read.
+  //
+  // With the final row treated as the straddling hand-off row, the candidate is
+  // the EARLIER prompt (idx 0) — and that card is then fully pushed out by the
+  // incoming prompt, whose top has already risen past the fold
+  // (`push >= pinPushTravel`), so nothing is pinned and the whole prompt stays
+  // on screen. The defect to pin here is the alternative: treating the index as
+  // one past the end makes the final row itself pinnable and reports idx 2.
+  it.each([false, true])('never pins a tall final prompt as its own stand-in (requiresMountedHandoff=%s)', (requiresMountedHandoff) => {
+    const h = renderPin(requiresMountedHandoff)
+    const g = mountGeometry(3)
+    setRect(g.rows[0], -900, 380)
+    setRect(g.rows[1], -500, 500)
+    setRect(g.rows[2], 40, 1200)
+    wire(h, g, [
+      single(0, 'user', 'first prompt'),
+      single(1, 'assistant', 'first reply'),
+      single(2, 'user', 'tall last prompt'),
+    ])
+    expect(h.result.current.pinned?.idx).not.toBe(2)
+    expect(h.result.current.pinned).toBeNull()
+  })
+
+  it('pins nothing when every mounted row is above the line but rows below are unmounted', () => {
+    const h = renderPin(true)
+    const g = mountGeometry(2)
+    setRect(g.rows[0], -400, 380)
+    setRect(g.rows[1], 60, 1800)
+    // Two more rows exist in the list but are not mounted: the boundary is unknown.
+    wire(h, g, [
+      single(0, 'user', 'long prompt'), single(1, 'assistant', 'long reply'),
+      single(2, 'user', 'later prompt'), single(3, 'assistant', 'later reply'),
+    ])
+    expect(h.result.current.pinned).toBeNull()
+  })
+
   it('glides the in-place jump to the target row minus the banner chrome, then converges', () => {
     const h = renderPin()
     const g = mountGeometry(5)
@@ -346,6 +420,415 @@ describe('usePinnedPrompt push geometry is resting-height-derived', () => {
     wire(h, g)
     expect(h.result.current.pinned).toMatchObject({ idx: 2, push: 24, bannerH: 60 })
   })
+
+  // The incoming-prompt lookup goes by index too. A forged `data-display-index`
+  // in an EARLIER row's message content comes first in document order, so a
+  // plain querySelector would measure it instead of the real row 4 (300px, clear
+  // of the travel) and push the card out by 24px.
+  it('measures the real incoming row, not a forged index earlier in the DOM', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    const forged = document.createElement('span')
+    forged.dataset.displayIndex = '4'
+    setRect(forged, 140, 40)
+    g.rows[1].append(forged)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, push: 0, bannerH: 60 })
+  })
+})
+
+/**
+ * The fold stands in for the BUBBLE, not the row. UserMessage draws an action
+ * strip (copy / copy link / pin / timestamp) under its bubble, and the hidden row
+ * re-shows that strip in place (index.css `[data-pinned-standin]`), so the card
+ * has to fold down to the bubble's bottom edge: a card reaching the ROW's bottom
+ * would sit exactly over the controls the hand-off leaves visible.
+ */
+/** UserMessage's tree under a row: a `div[data-role="user"]` root whose direct
+ *  children are the bubble and the `data-message-actions` strip. The hook scopes
+ *  its probes to that root, so the fixture has to have it. */
+function mountUserRow(row: HTMLElement) {
+  const root = document.createElement('div')
+  root.setAttribute('data-role', 'user')
+  const bubble = document.createElement('div')
+  bubble.className = 'message-bubble user-bubble'
+  const strip = document.createElement('div')
+  strip.setAttribute('data-message-actions', '')
+  root.append(bubble, strip)
+  row.append(root)
+  return { root, bubble, strip }
+}
+
+describe('usePinnedPrompt leaves a tall bubble in place, then pins it at rest', () => {
+  it('does not pin a tall prompt while its bubble still shows below the card', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The pinned row (index 2) is a tall prompt whose top has crossed the fold
+    // (fold at 100): row 60..460, bubble 64..430, then a 4px gap and the 26px
+    // action strip UserMessage renders under the bubble (434..460).
+    setRect(g.rows[2], 60, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, 64, 366)
+    setRect(strip, 434, 26)
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    setRect(g.scroller, 0, 600)
+    wire(h, g)
+    // Pinning here would hide the real bubble behind a card that shows only the
+    // prompt's first lines, so the reader could not scroll through its middle.
+    expect(h.result.current.pinned).toBeNull()
+    // Scrolled on until the bubble's bottom (140) is above the card's resting
+    // bottom (fold + 4 + 60 = 164): now the one-line card takes over.
+    setRect(g.rows[2], -230, 400)
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned?.liveH, 'the card never folds').toBeUndefined()
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+  })
+
+  it('keeps the strip uncovered once the card rests, while any of it is still below the card', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The same row scrolled 290px further: bubble bottom at fold + 40 (140),
+    // strip 144..170. The card has reached its 60px clamp — its resting bottom
+    // is fold + 4 + 60 = 164 — so no live height is reported, yet 6px of the
+    // strip still show below the card. Keyed on the fold, this is where copy /
+    // copy-link / pin vanished under the pointer and the band went blank.
+    setRect(g.rows[2], -230, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    // The card itself at its resting rect: the strip test reads the card's LIVE
+    // bottom (the fixture's default card is 10px taller than the resting height
+    // it reports, for the push tests above).
+    setRect(g.card, 104, 60)
+    wire(h, g)
+    expect(h.result.current.pinned?.liveH, 'the fold is over').toBeUndefined()
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+  })
+
+  // Prompt 2 is pinned first, and its card reports a two-line height — the
+  // image-only card shape. Then the reader scrolls on to prompt 4, whose card
+  // must be gated on the seed height, not on the 90px the previous card
+  // measured. Shared by the timestamped and the timestamp-less transcript below.
+  function expectSeedHeightGate(items: DisplayItem[]) {
+    const h = renderPin()
+    const g = mountGeometry(6)
+    wire(h, g, items)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    act(() => { h.result.current.onPinCollapsedHeight(90) })
+    // Scroll on: prompt 4 is now the candidate. Its bubble's bottom sits at
+    // 174, so 70px of it is left above the reply (174 - fold 100 - ROW_PAD_Y 4):
+    // more than a fresh one-line card, less than the previous card's 90.
+    setRect(g.rows[2], -400, 40)
+    setRect(g.rows[3], -300, 40)
+    setRect(g.rows[4], 60, 140)
+    const { bubble } = mountUserRow(g.rows[4])
+    setRect(bubble, 64, 110)
+    setRect(g.rows[5], 800, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toBeNull()
+    // Once only one line of it is left, its card takes over at the seed height.
+    setRect(g.rows[4], 20, 140)
+    setRect(bubble, 24, 110)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 4, bannerH: DEFAULT_PINNED_CARD_H })
+  }
+
+  it('gates a new prompt on the seed height, not the previous card\'s measured height', () => {
+    expectSeedHeightGate([...ITEMS, single(5, 'assistant', 'next reply')])
+  })
+
+  it('gates a new prompt on the seed height across a hand-off between prompts that carry no `ts`', () => {
+    // An import or a legacy log reads `ts` as '' on every message. The reset
+    // keys the candidate on its index as well, so the hand-off from prompt 2 to
+    // prompt 4 still brings the seed height back.
+    const noTs = [...ITEMS, single(5, 'assistant', 'next reply')]
+      .map(item => ({ ...item, msg: { ...item.msg, ts: '' } }))
+    expectSeedHeightGate(noTs)
+  })
+
+  it('drops the mark on a later frame of the same pin, once the strip has slid under the card', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], -230, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    setRect(g.card, 104, 60)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+    // 20px on: the strip's bottom (150) is above the card's resting bottom
+    // (164), so the whole strip is under the card. The same message is still
+    // pinned, so this is the same-message path of nextPinnedPromptState — the
+    // flag has to be carried there or the marker stays stuck at `folding`.
+    setRect(g.rows[2], -250, 400)
+    setRect(bubble, -246, 366)
+    setRect(strip, 124, 26)
+    setRect(g.rows[3], 150, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned?.liveH, 'still at rest').toBeUndefined()
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: false })
+  })
+
+  it('measures only the row\'s own strip and editing marker, never nodes inside the bubble', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // The strip test geometry above (real strip 144..170, 6px still uncovered),
+    // plus a message body that carries the hooks itself. The sanitizer strips
+    // them (MarkdownRenderer.reservedDataHooks.test.tsx), and the hook must not
+    // rely on that alone: the probes read the root's own attribute and its
+    // direct children, so a forged strip earlier in document order is not the
+    // one measured and a forged editing marker does not drop the pin.
+    setRect(g.rows[2], -230, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    const forgedEditing = document.createElement('span')
+    forgedEditing.setAttribute('data-message-editing', '')
+    const forgedStrip = document.createElement('div')
+    forgedStrip.setAttribute('data-message-actions', '')
+    bubble.append(forgedEditing, forgedStrip)
+    // Wholly above the card's resting bottom (164): measured, it would read as
+    // covered and hide the real strip's last pixels.
+    setRect(forgedStrip, 0, 20)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    setRect(g.card, 104, 60)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+  })
+
+  it('measures a steer bubble too, through the shared message-bubble hook', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    setRect(g.rows[2], 60, 400)
+    // A steer's bubble carries `message-bubble` but not `user-bubble`.
+    const bubble = document.createElement('div')
+    bubble.className = 'message-bubble'
+    g.rows[2].append(bubble)
+    setRect(bubble, 88, 300)
+    setRect(g.rows[3], 460, 40)
+    setRect(g.rows[4], 900, 40)
+    wire(h, g)
+    // Its bottom (388) is far below the card: the real bubble stays readable.
+    expect(h.result.current.pinned).toBeNull()
+    // Scrolled until its bottom (150) is inside the card's resting box.
+    setRect(g.rows[2], -178, 400)
+    setRect(bubble, -150, 300)
+    setRect(g.rows[3], 222, 40)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    expect(h.result.current.pinned?.liveH).toBeUndefined()
+  })
+
+  it('never takes a row that is being edited as the stand-in', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // UserMessage's editing render is a `data-role="user"` root carrying
+    // `data-message-editing`, with a textarea where the bubble was — no
+    // `.message-bubble` at all. The stand-in state would hide the whole row,
+    // editor and Send included, so the hook leaves the row visible and shows no
+    // card at all.
+    const editor = document.createElement('div')
+    editor.setAttribute('data-role', 'user')
+    editor.setAttribute('data-message-editing', '')
+    g.rows[2].append(editor)
+    wire(h, g)
+    expect(h.result.current.pinned).toBeNull()
+  })
+
+  it('reads the strip as covered from the card\'s own bottom once the card has grown over it', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    // At the clamp with 6px of strip still below the card's RESTING bottom (164)
+    // — the window where a pointer resting on the card opens the peek, or the
+    // chevron expands it, and the card grows down over those pixels. The row
+    // cannot show that growth; the card's own rect can. Peeked to three lines
+    // the card runs 104..209, past the strip's bottom (170).
+    setRect(g.rows[2], -230, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    setRect(g.card, 104, 105)
+    wire(h, g)
+    expect(h.result.current.pinned?.liveH, 'at rest').toBeUndefined()
+    // The live read serves the strip flag alone: the push geometry still sees
+    // the resting height (60), not the grown card.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, push: 0, bannerH: 60, stripUncovered: false })
+    // The peek closes: the same card back at its resting rect, and the 6px show.
+    setRect(g.card, 104, 60)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+  })
+
+  it('re-derives the flag when the card itself resizes, without waiting for a scroll', () => {
+    // The peek and the expansion grow the card with no scroll to run the
+    // recompute, so the hook observes the pinned card's size and re-runs it.
+    const observed: Element[] = []
+    let fire: (() => void) | null = null
+    class RecordingResizeObserver {
+      constructor(cb: ResizeObserverCallback) { fire = () => cb([], this as unknown as ResizeObserver) }
+      observe(el: Element) { observed.push(el) }
+      unobserve() {}
+      disconnect() { fire = null }
+    }
+    const scope = globalThis as unknown as { ResizeObserver: unknown }
+    const original = scope.ResizeObserver
+    scope.ResizeObserver = RecordingResizeObserver
+    try {
+      const h = renderPin()
+      const g = mountGeometry(5)
+      setRect(g.rows[2], -230, 400)
+      const { bubble, strip } = mountUserRow(g.rows[2])
+      setRect(bubble, -226, 366)
+      setRect(strip, 144, 26)
+      setRect(g.rows[3], 170, 40)
+      setRect(g.rows[4], 900, 40)
+      setRect(g.card, 104, 60)
+      wire(h, g)
+      expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: true })
+      // The scroller too: the card's ceiling is read off its box and padding,
+      // which move on a resize no scroll reports (see the floor tests below).
+      expect(observed, 'the pinned card and the scroller are what the hook observes').toEqual([g.card, g.scroller])
+      // The pointer rests on the card: the peek grows it to three lines, over
+      // the strip, and the observer's report is the only recompute there is.
+      setRect(g.card, 104, 105)
+      act(() => { fire?.() })
+      expect(h.result.current.pinned).toMatchObject({ idx: 2, stripUncovered: false })
+    } finally {
+      scope.ResizeObserver = original
+    }
+  })
+})
+
+/**
+ * The card lives in an overlay that is a sibling of the scroller and paints above
+ * everything after it — the composer dock the main chat floats over the scroller's
+ * bottom, a pane's in-flow composer — so nothing bounds it but this geometry. The
+ * fold held a 30-line prompt's card at its full height and the expansion grew it
+ * to 40vh plus an image strip; on a short pane both ran past the scroller and over
+ * the input box (the reported bug: "the bubble is in the composer"). The ceiling is
+ * the transcript FLOOR — the scroller's bottom less its bottom padding, which is
+ * each host's own statement of where readable rows stop (the main chat pads by the
+ * dock's height plus a clearance) — measured from the scroller rather than passed,
+ * so the two can never be set apart.
+ */
+describe('usePinnedPrompt caps the card at the transcript floor', () => {
+  /** A tall prompt scrolled until its bubble's bottom (140) sits inside the
+   *  card's resting box (fold + 4 + 60 = 164), so it is pinned at rest. */
+  function mountTallFold(g: ReturnType<typeof mountGeometry>) {
+    setRect(g.rows[2], -230, 400)
+    const { bubble, strip } = mountUserRow(g.rows[2])
+    setRect(bubble, -226, 366)
+    setRect(strip, 144, 26)
+    setRect(g.rows[3], 170, 40)
+    setRect(g.rows[4], 900, 40)
+    return { bubble, strip }
+  }
+
+  it('reports the ceiling: scroller bottom, less its bottom padding, less the card top', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    wire(h, g)
+    // Card top is fold + ROW_PAD_Y = 104; the scroller ends at 400 with no
+    // padding → the card may be 296px at most.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 296 })
+  })
+
+  it('never reports a fold height for a tall prompt', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+    expect(h.result.current.pinned?.liveH).toBeUndefined()
+  })
+
+  it('takes the host\'s bottom padding off the floor — the dock the main chat pads for', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    // ChatTranscriptView writes `paddingBottom: dockH + DOCK_CLEARANCE_PX` on the scroller;
+    // here a 120px dock plus 16px clearance.
+    g.scroller.style.paddingBottom = '136px'
+    wire(h, g)
+    // 400 − 136 = 264 floor, less the card top 104 → 160.
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 160 })
+  })
+
+  it('reports a taller ceiling on a taller pane', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    setRect(g.scroller, 0, 600)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 496 })
+  })
+
+  it('re-attaches the observers across a hand-off between prompts that carry no `ts`', () => {
+    // An import or a legacy log reads `ts` as '' on every message. Keyed on `ts`
+    // alone, a hand-off from one such prompt to the next changed nothing the
+    // observer effect was keyed on: the observer stayed on the previous card and
+    // the new one was never watched, so a pane shrink left it over the composer
+    // until the next scroll.
+    const observed: Element[] = []
+    class RecordingResizeObserver {
+      constructor(_cb: ResizeObserverCallback) {}
+      observe(el: Element) { observed.push(el) }
+      unobserve() {}
+      disconnect() {}
+    }
+    const scope = globalThis as unknown as { ResizeObserver: unknown }
+    const original = scope.ResizeObserver
+    scope.ResizeObserver = RecordingResizeObserver
+    try {
+      const h = renderPin()
+      const g = mountGeometry(7)
+      mountTallFold(g)
+      const noTs = [...ITEMS, single(5, 'assistant', 'next reply'), single(6, 'user', 'last prompt')]
+        .map(item => ({ ...item, msg: { ...item.msg, ts: '' } }))
+      wire(h, g, noTs)
+      expect(h.result.current.pinned).toMatchObject({ idx: 2 })
+      expect(observed).toEqual([g.card, g.scroller])
+      // The reader scrolls on: prompt 4 crosses the fold and row 5 is the first
+      // row below it, so the pin hands over from prompt 2 to prompt 4.
+      setRect(g.rows[2], -600, 400)
+      setRect(g.rows[3], -200, 40)
+      setRect(g.rows[4], 20, 40)
+      setRect(g.rows[5], 160, 40)
+      setRect(g.rows[6], 900, 40)
+      act(() => { h.result.current.updatePinnedPrompt() })
+      expect(h.result.current.pinned).toMatchObject({ idx: 4 })
+      expect(observed, 'the effect re-ran for the new pin').toEqual([g.card, g.scroller, g.card, g.scroller])
+    } finally {
+      scope.ResizeObserver = original
+    }
+  })
+
+  it('moves the ceiling with the scroller on the same message, with no scroll in between', () => {
+    const h = renderPin()
+    const g = mountGeometry(5)
+    mountTallFold(g)
+    setRect(g.scroller, 0, 600)
+    wire(h, g)
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 496 })
+    // The pane shrinks (a window resize, a dock growing a status bar). The
+    // same-message path of nextPinnedPromptState must carry the new ceiling, or
+    // the card keeps the old one until a different prompt pins.
+    setRect(g.scroller, 0, 400)
+    act(() => { h.result.current.updatePinnedPrompt() })
+    expect(h.result.current.pinned).toMatchObject({ idx: 2, maxH: 296 })
+  })
 })
 
 /**
@@ -411,5 +894,17 @@ describe('usePinnedPrompt in-place jump under reduced motion', () => {
     expect(frames).toHaveLength(1)
     flushFrame(2000)
     expect(frames).toHaveLength(0)
+  })
+})
+
+describe('pinCandidateKey (the identity the reset and the card\'s promptKey share)', () => {
+  it('changes with the index alone, so prompts with no ts and the same text are told apart', () => {
+    expect(pinCandidateKey(4, undefined)).not.toBe(pinCandidateKey(6, undefined))
+    expect(pinCandidateKey(4, undefined)).toBe(pinCandidateKey(4, ''))
+  })
+
+  it('changes with the ts alone, so a prompt replaced in place at one index is a new identity', () => {
+    expect(pinCandidateKey(4, 'a')).not.toBe(pinCandidateKey(4, 'b'))
+    expect(pinCandidateKey(4, 'a')).toBe(pinCandidateKey(4, 'a'))
   })
 })

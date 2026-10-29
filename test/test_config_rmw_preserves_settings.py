@@ -15,11 +15,24 @@ import inspect
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import ConfigReadError, read_config_for_update
+
+
+class _OwnerRequest(dict):
+    """The dashboard owner's request claims, for the owner-gated ``POST /api/update/auto``.
+
+    ``app == ""`` marks a dashboard-user token; with no ``owner_id`` configured the
+    signed local bootstrap subject ``local-app`` is the owner.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(app="", user="local-app")
+        self.app = {"state": SimpleNamespace(owner_id="")}
 
 
 def _inline_on_the_loop(fn, /, *args, **kwargs):
@@ -143,12 +156,18 @@ class TestNoFailOpenConfigWriters:
                     names.add(node.id)
             return bool(names) and names <= {"FileNotFoundError", "OSError"}
 
+        # config/loader.py is a facade over its config/loader_*.py owners, so the
+        # prefilter reads that family as one module.
+        loader_family = set((root / "config").glob("loader*.py"))
+        loader_text = "\n".join(
+            p.read_text(encoding="utf-8", errors="replace") for p in sorted(loader_family)
+        )
         offenders: list[str] = []
         for path in root.rglob("*.py"):
             if "_vendor" in path.parts:
                 continue
             src = path.read_text(encoding="utf-8", errors="replace")
-            if "config_path()" not in src:
+            if "config_path()" not in (loader_text if path in loader_family else src):
                 continue
             try:
                 tree = ast.parse(src)
@@ -210,9 +229,9 @@ class TestNoModeWideningConfigWriters:
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
-        # loader.py IS the implementation; cli_commands.py hand-rolls the same
+        # loader_document.py IS the implementation; cli_commands.py hand-rolls the same
         # contract (explicit mode= + restrict_to_owner) and predates the helper.
-        allowed_files = {"loader.py", "cli_commands.py"}
+        allowed_files = {"loader_document.py", "cli_commands.py"}
         raw_writers = {"write_text", "atomic_write"}
 
         offenders: list[str] = []
@@ -262,6 +281,129 @@ class TestNoModeWideningConfigWriters:
             "operator's 0600 is not widened to the umask default by tmp+rename.\n  "
             + "\n  ".join(sorted(set(offenders)))
         )
+
+
+class TestNoRawOpenWriteOfConfig:
+    """No module writes config.json / config.local.json through ``open(..., "w")``.
+
+    ``open(path, "w")`` TRUNCATES first and writes second, with no lock: a load
+    landing in between reads an empty or half-written file, degrades to defaults,
+    and anything that then writes back publishes them -- the torn read behind
+    "all my settings reset themselves". The voice-settings PUT wrote this way
+    (and swallowed its failures behind ``{"ok": true}``). The sibling ratchet
+    above sees ``write_text`` / ``atomic_write`` only, so this one matches the
+    ``open`` spelling: ``open(p, mode)`` and ``p.open(mode)`` with a writing mode,
+    where ``p`` is ``config_path()`` / ``config_local_path()`` or a name bound to
+    one in the same function. Baseline: empty.
+    """
+
+    _PATH_FNS = ("config_path", "config_local_path")
+
+    @classmethod
+    def _is_config_path_call(cls, node: ast.AST) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        fn = node.func
+        return (getattr(fn, "attr", None) or getattr(fn, "id", None)) in cls._PATH_FNS
+
+    @staticmethod
+    def _writing_mode(node: ast.Call, positional: int) -> bool:
+        mode = node.args[positional] if len(node.args) > positional else None
+        for kw in node.keywords:
+            if kw.arg == "mode":
+                mode = kw.value
+        return (
+            isinstance(mode, ast.Constant)
+            and isinstance(mode.value, str)
+            and any(c in mode.value for c in "wax+")
+        )
+
+    @classmethod
+    def _offenders_in(cls, tree: ast.AST, filename: str) -> list[str]:
+        offenders: list[str] = []
+        for func in [
+            n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]:
+            cfg_names = {
+                t.id
+                for node in ast.walk(func)
+                if isinstance(node, ast.Assign) and cls._is_config_path_call(node.value)
+                for t in node.targets
+                if isinstance(t, ast.Name)
+            }
+
+            def _is_cfg(expr: ast.AST, names: set[str] = cfg_names) -> bool:
+                return (isinstance(expr, ast.Name) and expr.id in names) or (
+                    cls._is_config_path_call(expr)
+                )
+
+            for node in ast.walk(func):
+                if not isinstance(node, ast.Call):
+                    continue
+                fn = node.func
+                if isinstance(fn, ast.Name) and fn.id == "open" and node.args:
+                    hit = _is_cfg(node.args[0]) and cls._writing_mode(node, 1)
+                elif isinstance(fn, ast.Attribute) and fn.attr == "open":
+                    hit = _is_cfg(fn.value) and cls._writing_mode(node, 0)
+                else:
+                    continue
+                if hit:
+                    offenders.append(f"{filename}:{node.lineno} ({func.name})")
+        return offenders
+
+    def test_no_module_opens_a_config_file_for_writing(self):
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        offenders: list[str] = []
+        for path in root.rglob("*.py"):
+            if "_vendor" in path.parts:
+                continue
+            src = path.read_text(encoding="utf-8", errors="replace")
+            if "config_path(" not in src and "config_local_path(" not in src:
+                continue
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                continue
+            offenders.extend(self._offenders_in(tree, path.name))
+        assert not offenders, (
+            "config.json must never be opened for writing: open(..., 'w') truncates "
+            "before it writes, so a concurrent load reads a torn file as defaults. "
+            "Use update_config_locked (run_config_write from a coroutine).\n  "
+            + "\n  ".join(sorted(set(offenders)))
+        )
+
+    def test_the_ratchet_catches_the_truncating_spellings(self):
+        source = (
+            "async def voice_put_shape():\n"
+            "    cfg_path = config_path()\n"
+            "    with open(cfg_path) as f:\n"
+            "        cfg = json.load(f)\n"
+            "    with open(cfg_path, 'w') as f:\n"
+            "        json.dump(cfg, f)\n"
+            "\n"
+            "def direct_call_and_keyword():\n"
+            "    with open(loader.config_local_path(), mode='a') as f:\n"
+            "        f.write('x')\n"
+            "\n"
+            "def path_method():\n"
+            "    p = config_path()\n"
+            "    with p.open('w+') as f:\n"
+            "        f.write('x')\n"
+            "\n"
+            "def read_only_is_fine():\n"
+            "    p = config_path()\n"
+            "    with open(p, 'r') as f, p.open() as g:\n"
+            "        return f.read() + g.read()\n"
+            "\n"
+            "def other_file_is_fine():\n"
+            "    with open(log_path, 'w') as f:\n"
+            "        f.write('x')\n"
+        )
+        offenders = self._offenders_in(ast.parse(source), "synthetic.py")
+        names = {o.rsplit("(", 1)[1].rstrip(")") for o in offenders}
+        assert names == {"voice_put_shape", "direct_call_and_keyword", "path_method"}, offenders
 
 
 class TestWriteConfigAtomically:
@@ -586,7 +728,7 @@ class TestAutoUpdateToggleKeepsSettings:
         path.write_text(json.dumps(_REAL_SETTINGS, indent=2), encoding="utf-8")
         monkeypatch.setattr(updates, "config_path", lambda: path)
 
-        class _Req:
+        class _Req(_OwnerRequest):
             async def json(self):
                 return {"enabled": False}
 
@@ -608,7 +750,7 @@ class TestAutoUpdateToggleKeepsSettings:
         path.write_text(torn, encoding="utf-8")
         monkeypatch.setattr(updates, "config_path", lambda: path)
 
-        class _Req:
+        class _Req(_OwnerRequest):
             async def json(self):
                 return {"enabled": False}
 
@@ -639,7 +781,7 @@ class TestEveryConfigWriterIsLocked:
     **What it does NOT cover.** Only calls to ``write_config_atomically``. A
     second family of writers reaches ``config.json`` through
     ``kiro_crew.agent._atomic_json_write`` (``messaging.py``'s channel savers,
-    ``core.py``'s STT PUT, ``mcp.py``'s gateway-enable) and still bypasses the
+    ``core_stt_settings.py``'s STT PUT, ``mcp.py``'s gateway-enable) and still bypasses the
     lock; that family has its own ratchet,
     :class:`TestTheAtomicJsonWriteConfigFamilyIsRatcheted` below, which holds it
     to a baseline that may only shrink. :meth:`KiroCrewConfig.save`
@@ -652,9 +794,9 @@ class TestEveryConfigWriterIsLocked:
 
     #: The primitive itself writes through ``write_config_atomically`` by
     #: definition, and ``KiroCrewConfig.save`` writes under the same sidecar
-    #: lock via ``_config_write_lock``. Both live here, so the module is
-    #: exempt as a whole.
-    _ALLOWED_FILES = {"loader.py"}
+    #: lock via ``_config_write_lock``. They live in ``config/loader_document.py``
+    #: and ``config/loader_config.py``, so those modules are exempt as a whole.
+    _ALLOWED_FILES = {"loader_config.py", "loader_document.py"}
 
     #: Resolvers whose return value IS a config document path.
     _CONFIG_PATH_FUNCS = {"config_path", "config_local_path"}
@@ -783,17 +925,16 @@ class TestEveryConfigWriterIsLocked:
 
 
 class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
-    """The second config-writer family may shrink but never grow.
+    """The second config-writer family is empty and may not regrow.
 
     ``TestEveryConfigWriterIsLocked`` above covers calls to
-    ``write_config_atomically``. A second family reaches ``config.json``
+    ``write_config_atomically``. A second family reached ``config.json``
     through ``kiro_crew.agent._atomic_json_write``, takes no advisory lock on
-    the ``<path>.lock`` sidecar, and is therefore invisible to that scan --
-    ``loader.py``'s own docstring names the set and calls converting it
-    follow-up work. Those writers hold only the in-process asyncio
+    the ``<path>.lock`` sidecar, and is therefore invisible to that scan. Such
+    a writer holds only the in-process asyncio
     ``_get_config_lock()``, which serializes callers on this event loop and
-    nothing else, so one of them can still land between a lock holder's read
-    and write and silently revert it.
+    nothing else, so it can land between a lock holder's read and write and
+    silently revert it.
 
     The shape matters for channels specifically. Each per-channel settings
     saver in ``messaging.py`` is a hand-copied credential-write skeleton, and
@@ -807,16 +948,17 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
     to record. Both directions are enforced, because a baseline that is allowed
     to rot stops describing the code and starts hiding it.
 
-    To clear an entry, route the write through ``update_config_locked`` (see
-    ``api_feishu_config_save`` and ``api_imessage_config_save`` for the shape:
-    stage the mutation in a closure, return ``None`` to skip a no-op write, and
-    map ``ConfigReadError`` to the handler's existing corrupt-config response),
-    then delete its line below.
+    The baseline is empty: every writer routes through ``update_config_locked``
+    (a channel saver through ``messaging._LockedSectionWrite``; see
+    ``api_feishu_config_save`` for the inline shape: stage the mutation in a
+    closure, return ``None`` to skip a no-op write, and map ``ConfigReadError``
+    to the handler's existing corrupt-config response). A new entry is a new
+    unlocked config writer and is refused, not recorded.
     """
 
-    #: ``loader.py`` only names this family in prose; it owns the locked
+    #: ``loader_document.py`` only names this family in prose; it owns the locked
     #: primitive itself and is exempt as a whole, matching the sibling class.
-    _ALLOWED_FILES = {"loader.py"}
+    _ALLOWED_FILES = {"loader_document.py"}
 
     #: Resolvers whose return value IS a config document path.
     _CONFIG_PATH_FUNCS = {"config_path", "config_local_path"}
@@ -826,18 +968,7 @@ class TestTheAtomicJsonWriteConfigFamilyIsRatcheted:
     #: ``file.py:function`` for every writer still on the unlocked path.
     #: Keyed by function rather than line so an unrelated edit above does not
     #: churn it. THIS LIST MAY ONLY SHRINK.
-    _BASELINE = frozenset(
-        {
-            "core.py:api_stt_config",
-            "mcp.py:api_mcp_gateway_enable",
-            "messaging.py:_discord_config_save_locked",
-            "messaging.py:_slack_config_save_locked",
-            "messaging.py:_telegram_config_save_locked",
-            "messaging.py:_wecom_config_save_locked",
-            "messaging.py:api_teams_config_save",
-            "messaging.py:api_webex_config_save",
-        }
-    )
+    _BASELINE: frozenset[str] = frozenset()
 
     @classmethod
     def _is_config_path_call(cls, node) -> bool:
@@ -1010,7 +1141,7 @@ class TestAutoUpdateToggleHoldsBothConfigLocks:
     ``config.json`` has two writer generations that do not exclude each other.
     ``update_config_locked`` takes the sidecar advisory flock, covering the CLI,
     the boot refresh and a second gateway process. The legacy dashboard handlers
-    -- ``core.py``'s theme/settings PUT, the agents endpoint, ``security.py``,
+    -- the core theme and settings PUTs, the agents endpoint, ``security.py``,
     ``messaging.py``, ``mcp.py``, ``computer_use.py`` -- do their own
     read-modify-write of the same file while holding ONLY the loop-side
     ``_get_config_lock`` asyncio lock, which the flock does not exclude.
@@ -1026,7 +1157,7 @@ class TestAutoUpdateToggleHoldsBothConfigLocks:
     dispatch.
     """
 
-    class _Req:
+    class _Req(_OwnerRequest):
         async def json(self):
             return {"enabled": False}
 
@@ -1110,7 +1241,11 @@ class TestAutoUpdateToggleHoldsBothConfigLocks:
         """
         from kiro_crew.dashboard.handlers import updates
 
-        source = Path(inspect.getsourcefile(updates)).read_text(encoding="utf-8")
+        home = Path(inspect.getsourcefile(updates)).parent
+        source = "\n".join(
+            (home / f"{name.rpartition('.')[2]}.py").read_text(encoding="utf-8")
+            for name in (updates.__name__, *updates._OWNERS)
+        )
         offenders = []
         for node in ast.walk(ast.parse(source)):
             if not isinstance(node, ast.Call):

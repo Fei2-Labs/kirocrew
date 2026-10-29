@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
+import itertools
+import json
 import os
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from aiohttp import web
 
-from kiro_crew.acp.types import ACP_BACKEND_KIRO
+from kiro_crew.dashboard.slot_ownership import slot_ownership_middleware
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
-from kiro_crew.messaging.link import ChannelLink
+from kiro_crew.messaging.link import ChannelLink, binding_token
 
 #: Draining is a LOOP because a drained task may register another -- not because any
 #: current one does (``chat_slack`` has a single ``create_task``, and the backfill
@@ -24,44 +24,38 @@ from kiro_crew.messaging.link import ChannelLink
 _DRAIN_ROUNDS = 20
 
 
-def acp_identity_flags(backend: str = ACP_BACKEND_KIRO) -> dict[str, bool]:
-    """Every ``AcpProvider.is_*`` flag that follows from a backend id, for *backend*.
+def pin_harness_choice(**choices: str) -> None:
+    """Store harness choices in this test's ``config.json``, the way a user does.
 
-    ``MagicMock(spec=AcpProvider)`` answers an unstubbed property with a truthy
-    Mock, so a double that stubs only the flags a test happens to care about
-    silently claims every OTHER harness identity at once. That is not a
-    hypothetical: dispatch keyed on ``is_spec_adapter`` took the adapter arm for
-    doubles meant to be kiro-cli, and the tests failed on the *result* of the
-    translation rather than on the wrong branch being taken.
-
-    Computed by running the real property getters against a stand-in exposing
-    nothing but ``_client.backend``, and DISCOVERED from the class rather than
-    listed here — an identity property added later is stubbed for free, in
-    agreement with production by construction. Membership-based flags
-    (``ACP_BACKENDS_*``) come along because they read the same attribute.
+    Keyword names are ``agent`` keys (``acp_backend``, ``member_acp_backend``);
+    values are RUNTIME ids and are written in the config-file spelling (Kiro CLI
+    is ``"kiro"``). ``save()`` writes these keys back from disk rather than from
+    memory, so setting them on a loaded config object does not persist them.
     """
-    from kiro_crew.providers.acp import AcpProvider
+    from kiro_crew.acp_backends import backend_to_stored
+    from kiro_crew.config.loader import _invalidate_config_cache, config_path
 
-    class _BackendOnly:
-        def __init__(self, value: str) -> None:
-            self._client = SimpleNamespace(backend=value)
-
-    stub = _BackendOnly(backend)
-    flags: dict[str, bool] = {}
-    for name, attr in vars(AcpProvider).items():
-        if not isinstance(attr, property) or not name.startswith("is_"):
-            continue
-        getter = attr.fget
-        if getter is None or "self._client.backend" not in inspect.getsource(getter):
-            continue
-        flags[name] = bool(getter(stub))
-    return flags
+    path = config_path()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    agent = data.setdefault("agent", {})
+    for key, backend in choices.items():
+        agent[key] = backend_to_stored(backend)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    _invalidate_config_cache()
 
 
-def stub_acp_identity(provider, backend: str = ACP_BACKEND_KIRO) -> None:
-    """Apply :func:`acp_identity_flags` to an ``AcpProvider`` double in place."""
-    for name, value in acp_identity_flags(backend).items():
-        setattr(provider, name, value)
+def pin_kiro_cli_harness() -> None:
+    """Record kiro-cli as the chosen harness in this test's data home.
+
+    A config with no ``agent.acp_backend`` resolves to KAS, which answers native
+    slash commands (``/tools``, ``/clear``, an in-turn agent switch) locally. A
+    test of the kiro-cli path through those commands states the choice the way a
+    user does, in ``config.json``, so every reader in the turn agrees on it.
+    """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
+
+    pin_harness_choice(acp_backend=ACP_BACKEND_KIRO)
 
 
 def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
@@ -77,6 +71,24 @@ def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
     """
     path = log._path(key)
     os.utime(path, (sig + 1, sig + 1))
+
+
+def close_before_resume(log: ConversationLog, key: str) -> None:
+    """Backdate a closed session's ``closed_at`` so it predates any resume that follows.
+
+    A resume clears ``closed`` only when ``closed_at`` is strictly earlier than the
+    moment the resume started (``clear_closed(only_if_closed_before=...)``); a tie
+    keeps the marker on purpose and the resume answers ``resume_conflict``. Both
+    values come from ``time.time()``, which moves every ~15.6 ms on Windows CPython
+    3.12, so a close followed at once by a resume ties there and not on Linux. The
+    precondition a close-then-resume test means is "closed BEFORE the resume
+    begins", so it is stated here rather than left to clock granularity, the way
+    ``session_control_revive_helpers._archive`` states it.
+    """
+    meta = log.get_metadata(key)
+    assert meta.get("closed"), f"{key} is not closed"
+    assert meta.get("closed_at") is not None, f"{key} is closed but carries no closed_at stamp"
+    log.update_metadata(key, {"closed_at": float(meta["closed_at"]) - 60.0})
 
 
 async def drain_background_tasks(state) -> None:
@@ -117,6 +129,35 @@ async def drain_background_tasks(state) -> None:
         f"background tasks still pending after {_DRAIN_ROUNDS} drain rounds: "
         f"{sorted(t.get_name() for t in state._background_tasks if not t.done())}"
     )
+
+
+def chat_done_frames(state) -> list:
+    """Every ``chat_done`` payload sent through a ``MagicMock`` ``broadcast_ws``."""
+    return [
+        c.args[1] for c in state.broadcast_ws.call_args_list if c.args and c.args[0] == "chat_done"
+    ]
+
+
+#: The bound on every turn a test awaits: a regression that hangs a hand-off then
+#: fails its own test by name instead of losing the worker (testing-conventions
+#: class 6).
+TURN_WAIT_SECS = 5
+
+
+async def run_as_slot_task(slot, coro) -> "asyncio.Task":
+    """Run *coro* as ``slot.task``, the way a dispatcher does, and await it."""
+    task = asyncio.ensure_future(coro)
+    slot.task = task
+    await asyncio.wait_for(task, timeout=TURN_WAIT_SECS)
+    return task
+
+
+async def await_successor(slot, predecessor) -> "asyncio.Task":
+    """Await the turn *predecessor*'s queue hand-off published in ``slot.task``."""
+    successor = slot.task
+    assert successor is not None and successor is not predecessor, "no successor dispatched"
+    await asyncio.wait_for(successor, timeout=TURN_WAIT_SECS)
+    return successor
 
 
 class _ReadyKiroPrerequisiteService(KiroPrerequisiteService):
@@ -184,22 +225,73 @@ def _make_state(tmp_path, **kwargs):
     # empty (ValueError on unpack) and is unconditionally truthy. Parity with
     # SessionStore: absent -> (None, None); clear -> True iff a link was there.
     _slack_links: dict[str, tuple[str, str]] = {}
+    # Per-binding nonces, with ``SessionMap``'s semantics: minted when a binding
+    # is created or its coordinates change, kept across an identical rewrite,
+    # dropped with the binding. The slots row digests them into its ``binding``
+    # token and the unlink endpoints read them for the compare, so a double
+    # without them would make every recreated binding read like the old row --
+    # the exact ABA the real map's nonce exists to refuse.
+    _slack_nonces: dict[str, str] = {}
+    _mirror_nonces: dict[str, str] = {}
+    _nonce_counter = itertools.count(1)
+
+    def _mint_nonce():
+        return f"nonce-{next(_nonce_counter):04d}"
 
     def _set_slack_link(key, thread_ts, channel_id):
         if thread_ts or channel_id:
+            if _slack_links.get(key) != (thread_ts, channel_id) or key not in _slack_nonces:
+                _slack_nonces[key] = _mint_nonce()
             _slack_links[key] = (thread_ts, channel_id)
         else:
             _slack_links.pop(key, None)
+            _slack_nonces.pop(key, None)
 
     def _get_slack_link(key):
         return _slack_links.get(key, (None, None))
 
     def _clear_slack_link(key):
+        _slack_nonces.pop(key, None)
         return _slack_links.pop(key, None) is not None
+
+    def _slack_link_nonce(key):
+        return _slack_nonces.get(key, "") if key in _slack_links else ""
+
+    def _clear_slack_link_if(key, channel_type, token):
+        # ``SessionMap.clear_slack_link_if``: compare the row's token against the
+        # link held (with its nonce) and clear only on equality -- both key
+        # spellings of a dashboard session, as the real map does.
+        thread_ts, channel_id = _get_slack_link(key)
+        if not thread_ts or channel_type != "slack":
+            return False
+        current = ChannelLink("slack", channel_id=channel_id, thread_id=thread_ts)
+        if binding_token(current, _slack_link_nonce(key)) != token:
+            return False
+        cleared = _clear_slack_link(key)
+        if key.startswith("dashboard:"):
+            cleared = _clear_slack_link(key[len("dashboard:") :]) or cleared
+        return cleared
 
     sessions.set_slack_link = MagicMock(side_effect=_set_slack_link)
     sessions.get_slack_link = MagicMock(side_effect=_get_slack_link)
     sessions.clear_slack_link = MagicMock(side_effect=_clear_slack_link)
+    sessions.slack_link_nonce = MagicMock(side_effect=_slack_link_nonce)
+    sessions.clear_slack_link_if = MagicMock(side_effect=_clear_slack_link_if)
+
+    # Real in-memory INBOUND channel-link store (``get_origin_link``/``set_origin_link``, the SessionManager surface), for
+    # the same reason: a bare MagicMock return is unconditionally truthy, so a
+    # reader asking "does this session have a channel link" would see one on
+    # every key. Parity with SessionStore: absent -> None.
+    _channel_links: dict[str, object] = {}
+
+    def _set_link(key, link):
+        _channel_links[key] = link
+
+    def _get_link(key):
+        return _channel_links.get(key)
+
+    sessions.set_origin_link = MagicMock(side_effect=_set_link)
+    sessions.get_origin_link = MagicMock(side_effect=_get_link)
 
     # Real in-memory mirror-link store, for the same reason as the Slack one and
     # with a sharper failure mode: callers branch on whether a mirror is PRESENT,
@@ -222,6 +314,11 @@ def _make_state(tmp_path, **kwargs):
         # arguments the channel-neutral link endpoint raises TypeError, which
         # surfaces as a 500 and hides whatever the test was actually asserting.
         if isinstance(channel_id, ChannelLink):
+            if _mirror_links.get(key) != channel_id or key not in _mirror_nonces:
+                _mirror_nonces[key] = _mint_nonce()
+            # Parity with ``SessionMap.set_mirror_link``: the link is stored as
+            # handed over, admission included when the caller signed it, and the
+            # store never mints one -- only the two authorized creation paths do.
             _mirror_links[key] = channel_id
             if accepts_inbound:
                 _inbound_keys.add(key)
@@ -229,11 +326,13 @@ def _make_state(tmp_path, **kwargs):
                 _inbound_keys.discard(key)
             return
         if channel_id or thread_ts:
-            _mirror_links[key] = ChannelLink(
-                channel_type="slack", channel_id=channel_id, thread_id=thread_ts
-            )
+            link = ChannelLink(channel_type="slack", channel_id=channel_id, thread_id=thread_ts)
+            if _mirror_links.get(key) != link or key not in _mirror_nonces:
+                _mirror_nonces[key] = _mint_nonce()
+            _mirror_links[key] = link
         else:
             _mirror_links.pop(key, None)
+            _mirror_nonces.pop(key, None)
             _inbound_keys.discard(key)
 
     def _get_mirror_link(key):
@@ -241,7 +340,21 @@ def _make_state(tmp_path, **kwargs):
 
     def _clear_mirror_link(key, *, reason=""):
         _inbound_keys.discard(key)
+        _mirror_nonces.pop(key, None)
         return _mirror_links.pop(key, None) is not None
+
+    def _mirror_link_nonce(key):
+        return _mirror_nonces.get(key, "") if key in _mirror_links else ""
+
+    def _clear_mirror_link_if(key, channel_type, token, *, reason=""):
+        # ``SessionMap.clear_mirror_link_if``: the compare and the clear as one
+        # step; False is a mismatch (or no binding) and nothing is touched.
+        current = _get_mirror_link(key)
+        if current is None or (current.channel_type or "").lower() != channel_type:
+            return False
+        if binding_token(current, _mirror_link_nonce(key)) != token:
+            return False
+        return _clear_mirror_link(key, reason=reason)
 
     def _find_mirror_sessions(link, *, inbound_only=False):
         return [
@@ -253,7 +366,10 @@ def _make_state(tmp_path, **kwargs):
     sessions.set_mirror_link = MagicMock(side_effect=_set_mirror_link)
     sessions.get_mirror_link = MagicMock(side_effect=_get_mirror_link)
     sessions.clear_mirror_link = MagicMock(side_effect=_clear_mirror_link)
+    sessions.mirror_link_nonce = MagicMock(side_effect=_mirror_link_nonce)
+    sessions.clear_mirror_link_if = MagicMock(side_effect=_clear_mirror_link_if)
     sessions.find_mirror_sessions = MagicMock(side_effect=_find_mirror_sessions)
+    sessions.mirror_accepts_inbound = MagicMock(side_effect=lambda key: key in _inbound_keys)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
@@ -271,7 +387,6 @@ def _make_app(state: DashboardState) -> web.Application:
     from kiro_crew.dashboard.chat import (
         api_chat,
         api_chat_mode,
-        api_chat_plan_action,
         api_chat_slot_approve,
         api_chat_slot_color,
         api_chat_slot_delete,
@@ -299,9 +414,21 @@ def _make_app(state: DashboardState) -> web.Application:
             request["app"] = ""  # dashboard user, not an app
         if "user" not in request:
             request["user"] = "local-app"  # recognized as owner
+        # Mirror token_auth_middleware's provenance markers (token_auth.py sets
+        # is_dashboard_user = not app). A route that gates on dashboard-user
+        # provenance (e.g. the user-only mute toggle) needs these present, and
+        # an app-isolation test that injected its own app identity gets the
+        # matching is_dashboard_user=False here.
+        if "is_dashboard_user" not in request:
+            request["is_dashboard_user"] = request["app"] == ""
+        if "internal_auth" not in request:
+            request["internal_auth"] = False
         return await handler(request)
 
-    app = web.Application(middlewares=[_test_auth_middleware])
+    # The per-slot app-ownership checkpoint runs inner to auth, as in the real
+    # server chain, so an app-identity test exercises the decision every
+    # /api/chat/slots/{slot}/* route takes before its handler.
+    app = web.Application(middlewares=[_test_auth_middleware, slot_ownership_middleware])
     app["state"] = state
     app.router.add_post("/api/chat", api_chat)
     app.router.add_get("/api/chat/slots", api_chat_slots)
@@ -318,7 +445,6 @@ def _make_app(state: DashboardState) -> web.Application:
     app.router.add_post("/api/chat/slots/{slot}/rewind", api_chat_slot_rewind)
     app.router.add_post("/api/chat/slots/{slot}/switch-variant", api_chat_slot_switch_variant)
     app.router.add_post("/api/chat/mode", api_chat_mode)
-    app.router.add_post("/api/chat/slots/{slot}/plan-action", api_chat_plan_action)
     return app
 
 
@@ -337,7 +463,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
         api_chat_slots,
     )
 
-    app = web.Application()
+    app = web.Application(middlewares=[slot_ownership_middleware])
     app["state"] = state
     app.router.add_get("/api/chat/slots", api_chat_slots)
     app.router.add_post("/api/chat/slots", api_chat_slot_create)
@@ -376,11 +502,29 @@ def _make_folder_app(state: DashboardState) -> web.Application:
     return app
 
 
-def _make_tags_app(state: DashboardState) -> web.Application:
+def _make_tags_app(
+    state: DashboardState, *, authenticate_owner: bool = True, booted_store: bool = True
+) -> web.Application:
     """Minimal aiohttp app with chat_tags endpoints (vocabulary, columns, drop, slot tags)."""
+    from kiro_crew.dashboard import chat_tag_grants
+
+    # A real boot always writes the grant store (``DashboardState.load_tags``
+    # seeds it, empty on an upgraded install), and an owner create refuses to
+    # mint into a MISSING one. Mirror that boot here unless the test has
+    # arranged a store condition of its own: an existing (even broken) file,
+    # a boot quarantine it is exercising, or ``booted_store=False`` for a
+    # test about the missing store itself.
+    if (
+        booted_store
+        and not chat_tag_grants._store_path().exists()
+        and not chat_tag_grants._quarantined_this_boot
+    ):
+        chat_tag_grants.seed_default_grants([])
+        chat_tag_grants.refresh_cache()
     from kiro_crew.dashboard.chat_tags import (
         api_chat_slot_drop,
         api_chat_slot_tags,
+        api_chat_tag_adopt,
         api_chat_tag_column_create,
         api_chat_tag_column_delete,
         api_chat_tag_column_update,
@@ -392,10 +536,21 @@ def _make_tags_app(state: DashboardState) -> web.Application:
         api_chat_tags,
     )
 
-    app = web.Application()
+    @web.middleware
+    async def _test_auth_middleware(request: web.Request, handler):
+        """Simulate owner claims installed by token_auth_middleware."""
+        if authenticate_owner:
+            if "app" not in request:
+                request["app"] = ""
+            if "user" not in request:
+                request["user"] = "local-app"
+        return await handler(request)
+
+    app = web.Application(middlewares=[_test_auth_middleware])
     app["state"] = state
     app.router.add_get("/api/chat/tags", api_chat_tags)
     app.router.add_post("/api/chat/tags", api_chat_tag_create)
+    app.router.add_post("/api/chat/tags/{id}/adopt", api_chat_tag_adopt)
     app.router.add_patch("/api/chat/tags/{id}", api_chat_tag_update)
     app.router.add_delete("/api/chat/tags/{id}", api_chat_tag_delete)
     app.router.add_put("/api/chat/slots/{slot}/tags", api_chat_slot_tags)

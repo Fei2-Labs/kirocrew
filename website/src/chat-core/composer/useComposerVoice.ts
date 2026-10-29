@@ -29,7 +29,7 @@
  * treatment `voiceTranscribeActive` already gives a transcription in flight
  * (which is global through the inbox, see voiceTranscriptInbox).
  */
-import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { i18nT } from '../../i18n/t'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../../api/client'
@@ -37,7 +37,9 @@ import { providerLabel } from '../../lib/sttProviders'
 import { dictationSeparator, spliceDictationText } from '../../lib/dictationText'
 import { useVoiceInput, voiceInputSupported, type TranscriptOrigin } from '../../hooks/useVoiceInput'
 import { usePushToTalk } from '../../hooks/usePushToTalk'
+import type { StopIntent } from '../../lib/pttSession'
 import { redeliverPending } from '../../hooks/voiceTranscriptInbox'
+import { haptic } from '../../lib/haptic'
 
 /** How long the "dictation added" cue stays after a held transcript lands. */
 const HELD_LANDED_MS = 4000
@@ -92,7 +94,41 @@ export interface ComposerVoiceHost {
   pendingCaretRef?: React.MutableRefObject<number | null>
 }
 
-export type SttConfig = { streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string; polish?: boolean }
+export type SttConfig = { streaming?: boolean; streaming_providers?: string[]; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string; polish?: boolean; submit_on_release?: boolean; code?: string; prereqs?: string[] }
+
+/**
+ * A deliberate finish (`StopIntent` 'finish') waiting for its transcript to
+ * settle before it sends, under `stt.submit_on_release`.
+ *
+ * Armed at the stop, consumed exactly once by the settle effect, and dropped by
+ * everything that ends the dictation's claim on the composer: a new capture, a
+ * cancel, a send from any route, a slot change, and a transcript delivered off
+ * screen.
+ */
+interface ReleaseSubmit {
+  /** The slot the capture was stopped in. The send goes nowhere else. */
+  session: string | null
+  /** `startGenRef` at the stop, so a later capture's settle cannot use it. */
+  capture: number
+  origin: TranscriptOrigin
+  /**
+   * The composer value this dictation last wrote, or the value at the stop
+   * before it wrote anything. Any other value at settle time means the person
+   * edited, and an edited draft is theirs to send.
+   */
+  expected: string
+  /** This dictation put words in the composer. Nothing written, nothing sent:
+   *  otherwise a silent recording would send text typed before it. */
+  delivered: boolean
+  /** The transport reported busy since the stop. A batch transcript arrives
+   *  only after the recorder's async stop, so "idle" right after the stop is
+   *  not settled yet. */
+  sawBusy: boolean
+  edited: boolean
+  /** The notice on screen at the stop. Only a NEW one says this capture
+   *  failed; an older notice (a kept recording from before) says nothing about it. */
+  errorAtStop: string | null
+}
 
 export function useComposerVoice(host: ComposerVoiceHost) {
   const { sessionId, inputRef, setInput } = host
@@ -114,10 +150,37 @@ export function useComposerVoice(host: ComposerVoiceHost) {
    * transcript, so tidying it is correct rather than corrupting.
    */
   const composerEpochRef = useRef(0)
+  /**
+   * A cleanup failure the user can see and dismiss.
+   *
+   * Kept SEPARATE from `useVoiceInput`'s own `error` and merged only at the
+   * boundary, so a feature-local failure does not need a setter on a hook several
+   * composers share. Both travel the same dismissible channel, which is what makes
+   * this safe to surface: the transcript is already in the composer, so the notice
+   * reports a correction that did not happen rather than words that were lost.
+   *
+   * Sharing that channel means sharing its LIFETIME, which is why this is declared
+   * beside the epoch rather than beside the request that raises it. `useVoiceInput`
+   * clears its own error at the top of every `start()`, so the composer's error has
+   * only ever described the capture on screen -- and `ChatInput` relies on exactly
+   * that: its `showDictation` gate blanks the live dictation panel whenever
+   * `voiceError` is set, on the premise that an error there means the microphone.
+   * A notice about a cleanup that did not run says nothing about the microphone, so
+   * it is cleared at each of the four moments the delivery it describes stops being
+   * the one in front of the user: a new capture, a new delivery, a send, and a slot
+   * change -- the epoch's own list, plus the capture start the engine already uses.
+   */
+  const [polishError, setPolishError] = useState<string | null>(null)
   const sessionIdRef = useRef(sessionId)
   // A slot change is also the end of a delivery's life. Bumped here rather than in an
   // effect so it lands BEFORE any reply can be applied in the new slot's render.
-  if (sessionIdRef.current !== sessionId) composerEpochRef.current += 1
+  if (sessionIdRef.current !== sessionId) {
+    composerEpochRef.current += 1
+    // Setting state during the render that observed the prop change is React's own
+    // pattern for it, and is what keeps the notice from arriving in a slot that
+    // never dictated. Re-entrant only once: the ref below falsifies the condition.
+    setPolishError(null)
+  }
   sessionIdRef.current = sessionId
   const isComposerForRef = useRef(host.isComposerFor); isComposerForRef.current = host.isComposerFor
   const deliverOffScreenRef = useRef(host.deliverOffScreen); deliverOffScreenRef.current = host.deliverOffScreen
@@ -129,7 +192,14 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     queryKey: ['sttConfig'],
     queryFn: () => api.sttConfig() as Promise<SttConfig>,
   })
-  const sttStreaming = !!sttCfg?.streaming
+  // The saved preference alone is not enough: a provider that cannot stream
+  // (an edition's batch-only provider) would be sent to /api/ws/stt and refused.
+  // Stream only when the served capability list names the selected provider; a
+  // gateway that serves no list keeps the preference as it was.
+  const sttStreaming = !!sttCfg?.streaming && (
+    !Array.isArray(sttCfg?.streaming_providers)
+    || (typeof sttCfg?.provider === 'string' && sttCfg.streaming_providers.includes(sttCfg.provider))
+  )
   const sttEnabled = !!sttCfg?.enabled
   // Whether a finished transcript is handed to a fast model for punctuation and
   // spacing. Read here rather than inside the replacement so the request is never
@@ -142,6 +212,36 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   // depends on it) on each config refetch, for a flag only read at delivery time.
   const sttPolishRef = useRef(sttPolish)
   sttPolishRef.current = sttPolish
+  // Read at the stop, so a change in Settings applies to the next recording
+  // without a reload; the config query refetches on its own.
+  const submitOnRelease = !!sttCfg?.submit_on_release
+  const submitOnReleaseRef = useRef(submitOnRelease)
+  submitOnReleaseRef.current = submitOnRelease
+  const releaseSubmitRef = useRef<ReleaseSubmit | null>(null)
+  // Polish requests in flight. A release waits for them, so it sends the
+  // cleaned-up text rather than racing the rewrite.
+  const polishPendingRef = useRef(0)
+  // Re-runs the settle effect when something it waits on changes outside
+  // render: a polish reply, or a delivery that wrote nothing new.
+  const [releaseTick, setReleaseTick] = useState(0)
+  /**
+   * Record a write this dictation is about to make to the composer, for the
+   * armed release. A composer that no longer holds what the dictation last
+   * wrote has been edited by hand, and that cancels the send.
+   */
+  const noteVoiceWrite = useCallback((next: string, text: string) => {
+    const r = releaseSubmitRef.current
+    if (!r) return
+    if ((inputRef.current ?? '') !== r.expected) r.edited = true
+    r.expected = next
+    // The dictation's OWN words, not the write. An empty partial retracts the
+    // hypothesis and puts the pre-dictation draft back, which is a write but
+    // dictated nothing; counting it would send text the person typed earlier.
+    r.delivered = text.trim() !== ''
+  }, [inputRef])
+  // The latest streaming hypothesis, so a stop can tell "a partial with words
+  // is in the composer" from "a partial was retracted to nothing".
+  const lastPartialTextRef = useRef('')
   // The backend probes for the provider's binary and reports `available`.
   // Default true so a not-yet-loaded config doesn't flash the modal; the
   // separate sttConfigLoaded guard already covers the pre-load case.
@@ -298,17 +398,6 @@ export function useComposerVoice(host: ComposerVoiceHost) {
    * this is a correction to a finished transcript, not a new dictation, and the
    * live-region bookkeeping belongs to the capture that produced it.
    */
-  /**
-   * A cleanup failure the user can see and dismiss.
-   *
-   * Kept SEPARATE from `useVoiceInput`'s own `error` and merged only at the
-   * boundary, so a feature-local failure does not need a setter on a hook several
-   * composers share. Both travel the same dismissible channel, which is what makes
-   * this safe to surface: the transcript is already in the composer, so the notice
-   * reports a correction that did not happen rather than words that were lost.
-   */
-  const [polishError, setPolishError] = useState<string | null>(null)
-
   const polishDictation = useCallback((raw: string, written: string, end: number) => {
     const start = end - raw.length
     // The span invariant, checked rather than assumed: `spliceDictationText` owns
@@ -323,6 +412,14 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     // to be checked as identity.
     const owner = sessionIdRef.current
     const epoch = composerEpochRef.current
+    // The capture generation too. `startVoice()` clears `polishError` and bumps
+    // `startGenRef` for the NEXT recording but does NOT bump `composerEpochRef`,
+    // so the owner/epoch pair alone cannot tell a reply for the finished capture
+    // from one the new capture would own. A late rejection (the server allows up
+    // to `_POLISH_TIMEOUT_SECS`, and a transport drop or gateway restart rejects
+    // after the clear ran) must not re-blank the waveform of a working mic.
+    const capture = startGenRef.current
+    polishPendingRef.current += 1
     void api.sttPolish(raw)
       .then(res => {
         if (!res?.changed || !res.text || res.text === raw) return
@@ -335,6 +432,11 @@ export function useComposerVoice(host: ComposerVoiceHost) {
         if (inputRef.current !== written) return
         const next = written.slice(0, start) + res.text + written.slice(end)
         if (next === written) return
+        // A reply for an earlier capture rewrites text that capture left in the
+        // composer. A release armed since belongs to a later capture and did not
+        // dictate this, so it must not send it: drop it and keep the draft.
+        if (startGenRef.current !== capture) releaseSubmitRef.current = null
+        else noteVoiceWrite(next, res.text)
         setInput(next)
         voicePendingCaretRef.current = start + res.text.length
       })
@@ -344,9 +446,23 @@ export function useComposerVoice(host: ComposerVoiceHost) {
       // worked. A dismissible notice is the honest signal, and because the words are
       // already delivered it costs them nothing to ignore.
       .catch(() => {
+        // Same guards the `.then` applies, for the same reason: a rejection that
+        // settles after a new capture, a send, or a slot change describes a
+        // delivery no longer in front of the user. Without this, that late
+        // failure re-shows the notice -- and in the new-capture case blanks the
+        // waveform of a microphone that is working, the exact bug this fix is for.
+        if (sessionIdRef.current !== owner) return
+        if (composerEpochRef.current !== epoch) return
+        if (startGenRef.current !== capture) return
         setPolishError(i18nT('hooks.useVoiceInput.polish_failed'))
       })
-  }, [inputRef, setInput, voicePendingCaretRef])
+      // Either way the cleanup is over, so an armed release may now send what
+      // the composer holds.
+      .finally(() => {
+        polishPendingRef.current -= 1
+        setReleaseTick(t => t + 1)
+      })
+  }, [inputRef, setInput, voicePendingCaretRef, noteVoiceWrite])
   // Deliver a finished transcript to the slot that INITIATED the recording,
   // using the session id useVoiceInput snapshotted at record-start (falling back
   // to this host's session for the ordinary same-slot case). Same-slot splices
@@ -384,6 +500,9 @@ export function useComposerVoice(host: ComposerVoiceHost) {
       // partial, so appending to the slot's draft is unambiguous. Keyed on the
       // text's origin rather than the live streaming setting, which is a proxy
       // that goes wrong for a batch transcript arriving after the mode changed.
+      // A release never sends into a chat that is not on screen: the person
+      // finds the transcript there as a draft instead.
+      releaseSubmitRef.current = null
       if (!target || origin === 'stream') return
       deliverOffScreenRef.current?.(target, append)
       return
@@ -399,6 +518,13 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     // final equals the last partial, setInput is a no-op and the restore effect
     // (keyed on `value`) never fires — leaving a stale pending caret that would
     // hijack the user's NEXT edit.
+    // A batch transcript is spliced into whatever the composer holds now, so
+    // text typed while it was transcribing is already in `inputRef` here and
+    // reads as an edit, which keeps the result a draft.
+    // A HELD transcript is an earlier capture's, delivered late on a slot
+    // switch: it was never this release's dictation, so it ends the release.
+    if (redeliveringRef.current) releaseSubmitRef.current = null
+    noteVoiceWrite(spliced.value, text)
     if (spliced.value !== inputRef.current) {
       setInput(spliced.value)
       voicePendingCaretRef.current = spliced.caret
@@ -419,8 +545,12 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     // A NEW delivery ends the previous one's lifetime, so two dictations in flight
     // cannot have the later one's reply land on the earlier one's span.
     composerEpochRef.current += 1
+    // And with it the notice describing that delivery's cleanup: this delivery is
+    // about to get its own answer, and a stale failure would sit on top of it.
+    setPolishError(null)
     if (sttPolishRef.current) polishDictation(text, spliced.value, spliced.caret)
-  }, [isComposerFor, spliceDictation, rebaseFrozenCaret, inputRef, setInput, voicePendingCaretRef, polishDictation])
+    if (releaseSubmitRef.current) setReleaseTick(t => t + 1)
+  }, [isComposerFor, spliceDictation, rebaseFrozenCaret, inputRef, setInput, voicePendingCaretRef, polishDictation, noteVoiceWrite])
   // Capture can end from a manual release or from the readiness-buffer ceiling.
   // Both release the composer for typing while the same socket still sends finals.
   const protectStoppedDictation = useCallback(() => {
@@ -532,13 +662,15 @@ export function useComposerVoice(host: ComposerVoiceHost) {
         caretTarget = null
       }
     }
+    lastPartialTextRef.current = text
     if (next !== inputRef.current) {
+      noteVoiceWrite(next, text)
       setInput(next)
       if (caretTarget !== null) voicePendingCaretRef.current = caretTarget
     }
     lastDictationAnchorRef.current = anchor
     lastDictationValueRef.current = next
-  }, [spliceDictation, rebaseFrozenCaret, inputRef, setInput, voiceCaretRef, voicePendingCaretRef])
+  }, [spliceDictation, rebaseFrozenCaret, inputRef, setInput, voiceCaretRef, voicePendingCaretRef, noteVoiceWrite])
   // Semantic endpointing (stt.endpointing) judged the utterance complete:
   // auto-submit. The composer already holds the streamed transcript via
   // onPartial, and the host's send reads its composer + stops the live capture
@@ -582,6 +714,18 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   const micOwnerSessionNow = useSyncExternalStore(subscribeMic, readMicOwnerSession, readMicOwnerSession)
   const micBusyElsewhere = micOwnerNow !== null && micOwnerNow !== instanceId
   const micBusyElsewhereSession = micBusyElsewhere ? micOwnerSessionNow : null
+  /* The kept recording's Retry is a transcription request, so it obeys the same
+     one-at-a-time rule as a start. While any composer holds the mic (starting,
+     capturing, or waiting on its own transcription), a retry would run beside
+     that recording's upload, and whichever failed last would take the held
+     audio slot from the other. Disabled on screen, and checked again at press
+     time, because the owner slot can change between a render and a click. */
+  const voiceKept = voice.keptRecording
+  const keptRecording = useMemo(() => voiceKept ? {
+    ...voiceKept,
+    retryDisabled: micOwnerNow !== null,
+    retry: () => { if (micOwner === null) voiceKept.retry() },
+  } : null, [voiceKept, micOwnerNow])
   // Latch across the async start: the engine flips `recording` only once the
   // stream is live, and a second composer's click inside that window must
   // already see the mic as taken. Generation-scoped: only the start that set
@@ -597,6 +741,24 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   useEffect(() => {
     if (micOwner === instanceId && !startingRef.current && !voice.recording && !voice.transcribing) setMicOwner(null)
   })
+  // Whether the capture that is starting or running was asked for by a HAND
+  // (the mic button) rather than a key. Set per start, read when the engine
+  // reports the mic open and when the session is stopped. The keyboard path
+  // is never tapped: a bare modifier keydown opens capture speculatively and a
+  // chord (⌥e → é) cancels it a beat later, so a tap there would announce
+  // recordings that never happen on every modifier press.
+  const tapThisSessionRef = useRef(false)
+  const wasRecordingRef = useRef(false)
+  // The open tap rides the engine's own `recording` flip, not the start call:
+  // a denied or revoked microphone fails inside `voice.start()` and never
+  // flips it, so a tap placed before the call would promise a mic that never
+  // opened. Nothing on screen has changed yet when the finger lifts off the
+  // button, which is why the hand is told at all.
+  useEffect(() => {
+    const opened = voice.recording && !wasRecordingRef.current
+    wasRecordingRef.current = voice.recording
+    if (opened && micOwner === instanceId && tapThisSessionRef.current) haptic('medium')
+  }, [voice.recording, instanceId])
   useEffect(() => () => { if (micOwner === instanceId) setMicOwner(null) }, [instanceId])
 
   /**
@@ -639,6 +801,10 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     sttDisarmedRef.current = false
     sttAppendDisarmedRef.current = false
     sttEndpointDisarmedRef.current = false
+    // A release still waiting on the previous capture ends here: its words are
+    // already in the composer, and this capture is about to add to them.
+    releaseSubmitRef.current = null
+    lastPartialTextRef.current = ''
     // Reset stale snapshot from a prior session that ended without
     // finals — otherwise onPartial sees a non-null ref, skips
     // re-snapshotting, and text typed between sessions is dropped.
@@ -647,6 +813,11 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     lastDictationValueRef.current = null
     postStopEditedRef.current = false
     frozenCaretRef.current = null
+    tapThisSessionRef.current = !opts?.silent
+    // Paired with `voice.start()`'s own `setError(null)` below: the two halves of the
+    // composer's error reach the user as one value, so a capture that clears one and
+    // not the other leaves the dictation panel blanked for a microphone that works.
+    setPolishError(null)
     setMicOwner(instanceId, sessionIdRef.current)
     startingRef.current = true
     const gen = ++startGenRef.current
@@ -659,13 +830,48 @@ export function useComposerVoice(host: ComposerVoiceHost) {
 
   /** Stop voice capture. Always allowed — only starting is gated. */
   const stopCapture = voice.stop
-  const stopVoice = useCallback(() => {
+  /**
+   * Stop capture. `intent` says whether the person chose to finish (see
+   * `StopIntent`); with `stt.submit_on_release` on, a 'finish' arms the send
+   * that the settle effect below fires once the transcript is complete.
+   *
+   * Armed only over a capture that is really running and that no send has
+   * already ended. A semantic endpoint can send mid-hold, and the finger that
+   * lets go afterwards must not send a second time.
+   */
+  const stopVoice = useCallback((intent?: StopIntent) => {
+    releaseSubmitRef.current = null
+    const live = voiceRef.current
+    if (intent === 'finish' && submitOnReleaseRef.current && live.recording && !sttDisarmedRef.current) {
+      releaseSubmitRef.current = {
+        session: sessionIdRef.current,
+        capture: startGenRef.current,
+        origin: live.transport ?? (streamEnabledRef.current ? 'stream' : 'batch'),
+        expected: inputRef.current ?? '',
+        // A streaming partial already in the composer is this dictation's text,
+        // but only while it still has words: an empty partial retracted it.
+        delivered: frozenInputRef.current !== null && lastPartialTextRef.current.trim() !== '',
+        sawBusy: false,
+        // Typing after the last partial and before the stop is an edit too:
+        // the composer no longer holds what the dictation wrote.
+        edited: frozenInputRef.current !== null && lastDictationValueRef.current !== null
+          && (inputRef.current ?? '') !== lastDictationValueRef.current,
+        errorAtStop: live.error,
+      }
+    }
     protectStoppedDictation()
+    // The stop is the finger's own act, so it is felt at once, not on settle.
+    if (tapThisSessionRef.current) haptic('medium')
     stopCapture()
-  }, [protectStoppedDictation, stopCapture])
+  }, [protectStoppedDictation, stopCapture, inputRef])
 
-  const toggleVoice = useCallback(() => {
-    if (voice.recording) stopVoice()
+  /**
+   * The mic button's click. A click carries `shiftKey`, so Shift-click stops
+   * and keeps a draft; any other caller (the Escape fallback calls this with
+   * no argument) gets a stop that never sends.
+   */
+  const toggleVoice = useCallback((e?: { shiftKey?: boolean }) => {
+    if (voice.recording) stopVoice(e && !e.shiftKey ? 'finish' : undefined)
     else startVoice()
     // Depends on the individual member actually read (`voice.recording`), not the
     // whole `voice` object — `[voice]` would recreate this callback every render
@@ -686,7 +892,25 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   // Uses voiceRef.current (not `voice`) so this prop stays referentially stable
   // and does not re-render the composer every render — matching toggleVoice.
   const cancelVoice = useCallback(() => {
-    if (streamEnabledRef.current) {
+    // A discard is never a send, including over a release already waiting on
+    // its drain (the strip's discard and Esc both reach the drain).
+    releaseSubmitRef.current = null
+    // Which utterance this discard is ending is answered by the SESSION in
+    // flight, `voice.transport`, and only then by the saved mode. The mode
+    // describes the utterance the user will start next, and the two come apart
+    // exactly where it costs the most: turning streaming off mid-capture is
+    // converted by the engine's own effect into a drain, so the socket is still
+    // the live session while the mode already reads batch. Gated on the mode
+    // alone, this discard closed that socket and left the words it had promised
+    // to take back sitting in the draft.
+    //
+    // The mode is kept as the second term rather than replaced, because a final
+    // can still be in transit in the instant after the engine clears its own
+    // flags, and then the mode is the only signal left that one is coming. Both
+    // terms only ever WIDEN what is disarmed, which costs nothing: a batch
+    // transcript is exempt from `sttDisarmedRef` by design, and the removal below
+    // verifies its own ground before touching a character.
+    if (voiceRef.current.transport === 'stream' || streamEnabledRef.current) {
       sttDisarmedRef.current = true
       // Remove the dictated region at the frozenInputRef boundary, preserving
       // the pre-dictation text EXACTLY (including its own trailing whitespace)
@@ -705,20 +929,96 @@ export function useComposerVoice(host: ComposerVoiceHost) {
         // and fell through to the leave-unchanged branch, stranding the partial
         // in the draft. spliceDictation reads the same frozen caret, so this
         // reproduces the write exactly for both the append and mid-caret shapes.
-        const written = spliceDictation(frozen, p).value
+        const region = spliceDictation(frozen, p)
+        const written = region.value
         if (cur.startsWith(written)) {
           // The composer still begins with exactly the region onPartial wrote.
           // Restore the pre-dictation text verbatim and keep any suffix the user
-          // typed after it.
-          setInput(frozen + cur.slice(written.length))
+          // typed after it -- re-deriving that one seam, because the separator the
+          // write put between the draft and the dictated words is inside the
+          // region being dropped. A draft that ended in whitespace keeps it and
+          // the rule adds nothing; one that did not would otherwise have the
+          // typed run abut its last word.
+          const typedSuffix = cur.slice(written.length)
+          setInput(frozen + dictationSeparator(frozen, typedSuffix) + typedSuffix)
+        } else {
+          // MID-DRAFT, which is the ordinary shape rather than an edge: the
+          // restored caret sits at the END of the dictated region, so typing
+          // during the drain lands BETWEEN that region and the tail which
+          // follows it. The composer then reads `head + typed + tail`, and the
+          // whole-value prefix check above cannot match it. Verify the two ends
+          // independently instead — the dictated region is still the prefix, the
+          // pre-existing tail is still the suffix — which identifies the typed
+          // run exactly and licenses rebuilding the pre-dictation text with only
+          // that run put back where they typed it.
+          //
+          // `head` is the anchor onPartial maintains, i.e. the region actually in
+          // the composer. `tail` has to come from this reconstruction and NOT
+          // from `lastDictationValueRef`: a drain-time correction folds the typed
+          // run into that value, so a tail read from there swallows the run,
+          // computes it as empty, and deletes the user's own words.
+          const head = lastDictationAnchorRef.current ?? written.slice(0, region.caret)
+          const tail = written.slice(region.caret)
+          const caret = frozenCaretRef.current ?? voiceCaretRef.current
+          // The insertion point `spliceDictationText` derives its own `before`
+          // from, read the same way so the two agree by construction.
+          const at = caret ? Math.min(caret.start, frozen.length) : frozen.length
+          // Where the replaced span ENDED in the pre-dictation draft. Dictating
+          // over a selection stands in place of `frozen[at..resumeAt)`, so the
+          // rollback owes two things that are easy to confuse: give that span
+          // back, and resume the typed run AFTER it, because the caret the user
+          // typed at was restored to the end of what replaced it. Rebuilding at
+          // `at` does the first and gets the second backwards, moving their typing
+          // in front of their own selected words. Identical to `at` for a
+          // collapsed caret, which is every case that has no selection.
+          const resumeAt = caret
+            ? Math.max(at, Math.min(caret.end, frozen.length))
+            : frozen.length
+          if (
+            cur.length >= head.length + tail.length &&
+            cur.startsWith(head) && cur.endsWith(tail) &&
+            // The span invariant, checked rather than assumed: the region's own
+            // prefix has to BE the pre-dictation text up to that insertion point.
+            // A caret that has moved on since the write fails here and the
+            // composer is left alone, rather than edited at the wrong offset.
+            head.slice(0, at) === frozen.slice(0, at)
+          ) {
+            const typed = cur.slice(head.length, cur.length - tail.length)
+            // Both seams are re-derived through `dictationSeparator`, the rule
+            // `spliceDictationText` itself applies. The separators it wrote live
+            // INSIDE `head` and `tail`, which are the two pieces being dropped,
+            // so splicing `typed` in raw hands back a draft with its words glued
+            // at the junction ("Hi team, " + "plus" + "see you").
+            //
+            // Not `spliceDictation(frozen, typed)`, which would apply the rule
+            // but drop the selection again: it takes its `after` from the caret's
+            // END on a draft that still HAS the selected span, so that span is
+            // deleted a second time by a rollback whose job is to restore it.
+            // Here the split point carries the span and only the separator rule
+            // is borrowed. An empty `typed` needs no branch -- the rule answers ''
+            // at both seams, leaving exactly `frozen`.
+            const before = frozen.slice(0, resumeAt)
+            const after = frozen.slice(resumeAt)
+            const lead = dictationSeparator(before, typed)
+            setInput(
+              before + lead + typed + dictationSeparator(typed, after) + after,
+            )
+            // Arm the caret at the end of what the USER typed, not at the end of
+            // the value. Leaving it unarmed is not "leaving it alone": React
+            // replaces the textarea value and the browser resets the DOM caret to
+            // the end, which after the discard hands focus back would drop them
+            // behind the draft's restored tail instead of where they were typing.
+            // The same compensation the delivery path above already makes.
+            voicePendingCaretRef.current = before.length + lead.length + typed.length
+          }
+          // else: the dictated region can't be verified exactly — the user edited
+          // or replaced it (e.g. deleted the separator, or typed their own text
+          // that merely ends in the same word as the partial). Leave the composer
+          // UNCHANGED: a suffix-match heuristic here would delete user-authored
+          // text ("say hello" -> "say"). The disarm above still drops the draining
+          // final, so no dictation is committed; at worst the visible partial
+          // lingers for the user to clear.
         }
-        // else: the dictated region can't be verified exactly — the user edited
-        // or replaced it (e.g. deleted the separator, or typed their own text
-        // that merely ends in the same word as the partial). Leave the composer
-        // UNCHANGED: a suffix-match heuristic here would delete user-authored
-        // text ("say hello" -> "say"). The disarm above still drops the draining
-        // final, so no dictation is committed; at worst the visible partial
-        // lingers for the user to clear.
       }
       // (frozen===null, or no current partial: nothing verifiably removable —
       // leave the composer as-is rather than risk clobbering user text.)
@@ -732,7 +1032,7 @@ export function useComposerVoice(host: ComposerVoiceHost) {
       frozenCaretRef.current = null
     }
     voiceRef.current.cancel()
-  }, [spliceDictation, inputRef, setInput])
+  }, [spliceDictation, inputRef, setInput, voiceCaretRef, voicePendingCaretRef])
 
   // Push-to-talk / tap-to-toggle keyboard binding (default: hold right ⌥ on
   // macOS, ⌥⇧Space elsewhere). Routed through startVoice/stopVoice rather than
@@ -755,7 +1055,7 @@ export function useComposerVoice(host: ComposerVoiceHost) {
       stop: stopVoice,
       cancel: cancelVoice,
     },
-    { disabled: !voiceInputSupported || !host.pushToTalk },
+    { disabled: !voiceInputSupported || !host.pushToTalk, shiftDraftStop: submitOnRelease },
   )
   // Stop any in-flight recording and clear the streaming prefix when the host's
   // session changes. The mic is a single shared device, so a recording can't
@@ -783,6 +1083,9 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     // applyVoiceText. (Cross-slot streaming delivery is a follow-up; streaming
     // is opt-in and off by default.)
     if (streamEnabledRef.current) sttDisarmedRef.current = true
+    // Leaving the chat ends a waiting release: the send must never land in the
+    // chat switched to, and coming back finds the transcript as a draft.
+    releaseSubmitRef.current = null
     if (voiceRef.current.recording) voiceRef.current.toggle()
     // A batch transcript that settled while no composer showed its session is
     // held by the inbox; this composer may be that session's now. Delivery is
@@ -795,6 +1098,41 @@ export function useComposerVoice(host: ComposerVoiceHost) {
   // Gates the recording/transcribing UI so a session transcribing in the
   // background never shows a busy/locked mic in the session the user switched to.
   const voiceOwned = voice.sessionOwner === sessionId
+
+  /**
+   * Send an armed release once its transcript has settled.
+   *
+   * Settled means capture is over, nothing is transcribing or draining, no
+   * polish is in flight, and (batch) the transcriber has answered. It runs
+   * after the commit that settled it, so the host's send reads the final
+   * composer value rather than the one from before the last write.
+   *
+   * Consumed before any check, so it fires at most once. Each check below then
+   * keeps the text as a draft rather than sending: a later capture, another
+   * chat, a failed transcription, an edit by hand, nothing dictated, or a
+   * blank composer.
+   */
+  const voiceError = voice.error
+  const sessionOwnerNow = voice.sessionOwner
+  useEffect(() => {
+    const r = releaseSubmitRef.current
+    if (!r) return
+    if (voice.recording || voice.transcribing) { r.sawBusy = true; return }
+    if (polishPendingRef.current > 0) return
+    // A batch transcript arrives only after the recorder's async stop, so idle
+    // right after the stop is not settled yet. The engine keeps `sessionOwner`
+    // until that stop resolves; once it clears with nothing transcribed (a
+    // recording too short to send), the release ends with nothing to send.
+    if (r.origin === 'batch' && !r.delivered && !r.sawBusy && sessionOwnerNow !== null) return
+    releaseSubmitRef.current = null
+    if (r.capture !== startGenRef.current) return
+    if (sessionIdRef.current !== r.session) return
+    if (voiceError && voiceError !== r.errorAtStop) return
+    if (!r.delivered || r.edited) return
+    const now = inputRef.current ?? ''
+    if (now !== r.expected || !now.trim()) return
+    onAutoSubmitRef.current?.()
+  }, [voice.recording, voice.transcribing, voiceError, sessionOwnerNow, releaseTick, inputRef])
 
   /**
    * Sending while STREAMING dictation is live ends the dictation. The panel
@@ -820,6 +1158,13 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     // delivery already in the composer, including one whose capture finished long ago
     // and whose polish is still in flight.
     composerEpochRef.current += 1
+    // The composer is empty after this, so a notice about what used to be in it has
+    // nothing left to point at.
+    setPolishError(null)
+    // Whatever sent (Enter, the send button, an endpoint verdict, or the
+    // release itself), nothing is left for a waiting release to send. This is
+    // what makes the release and the endpoint route send at most once between them.
+    releaseSubmitRef.current = null
     if (voiceRef.current.recording && streamEnabledRef.current) {
       sttDisarmedRef.current = true
       frozenInputRef.current = null
@@ -830,11 +1175,15 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     }
   }, [])
 
-  /** Clears both halves, so one dismissal means what the user thinks it means. */
+  /** Clears both halves, so one dismissal means what the user thinks it means.
+   *  Depends on the stable `voice.clearError`, not on `voice`: useVoiceInput
+   *  returns a fresh object every render, and this callback is the composer's
+   *  only inputProps key that would otherwise change on every stream tick. */
+  const voiceClearError = voice.clearError
   const clearVoiceError = useCallback(() => {
     setPolishError(null)
-    voice.clearError()
-  }, [voice])
+    voiceClearError()
+  }, [voiceClearError])
 
   return {
     voice,
@@ -850,6 +1199,8 @@ export function useComposerVoice(host: ComposerVoiceHost) {
     cancelVoice,
     disarmForSend,
     micBusyElsewhere,
+    /** The engine's kept recording, with Retry held to the one-mic rule. */
+    keptRecording,
     micBusyElsewhereSession,
     /** True for a moment after a HELD transcript landed in this composer. */
     heldLanded,
@@ -859,8 +1210,22 @@ export function useComposerVoice(host: ComposerVoiceHost) {
       setOpen: setVoiceSetupOpen,
       reason: (sttEnabled && !sttAvailable ? 'unavailable' : 'disabled') as 'unavailable' | 'disabled',
       provider: sttProvider,
+      /** Backend availability code, so the modal shows the same per-code reason
+       *  Settings → Voice does instead of the generic provider-named sentence. */
+      code: sttCfg?.code || '',
+      /** The pip command the backend computed for a missing voice extra, shown
+       *  verbatim so the user can self-serve the fix. ONLY the actionable pip
+       *  entry qualifies: `prereqs` can also carry an ffmpeg install command,
+       *  and surfacing that under the "install voice support" lead-in would tell
+       *  the user to run something that cannot fix a missing wheel / failed
+       *  import / absent model. No pip entry → empty string, and the modal hides
+       *  the command block. */
+      installCommand: sttCfg?.prereqs?.find(cmd => cmd.includes('pip install')) || '',
     },
     sttDictationPanel,
+    /** `stt.submit_on_release`: a deliberate finish sends. Drives the copy that
+     *  says what letting go will do, and the hold bar's draft zone. */
+    submitOnRelease,
   }
 }
 
@@ -876,6 +1241,11 @@ export function composerVoiceInputProps(cv: ComposerVoice) {
   return {
     voiceRecording: voiceOwned && voice.recording,
     voiceTranscribing: voiceOwned && voice.transcribing,
+    /* Whether the utterance in flight can still be called off, read from its own
+       transport rather than from the streaming setting — the setting describes
+       the next utterance, so it cannot carry a live obligation. Ownership-gated
+       like the rest: a composer answers for its own dictation only. */
+    voiceDrainCancellable: voiceOwned && voice.drainCancellable,
     /* Ungated: `startVoice` refuses on `voice.transcribing` outright, so the
        voice controls have to read the same global fact. */
     voiceTranscribeActive: voice.transcribing,
@@ -890,6 +1260,10 @@ export function composerVoiceInputProps(cv: ComposerVoice) {
     // The capture's own error wins: a microphone that never recorded outranks a
     // cleanup pass that did not run.
     voiceError: voice.error ?? polishError,
+    /* Retry, Save and Discard for the audio of a failed transcription. Ungated,
+       like the error it belongs to: every composer showing the notice offers
+       them, and a retried transcript still lands in the session that spoke. */
+    voiceKeptRecording: cv.keptRecording,
     voiceLevel: voiceOwned ? voice.level : 0,
     voiceDeviceLabel: voiceOwned ? voice.deviceLabel : '',
     voiceDeviceId: voiceOwned ? voice.deviceId : '',
@@ -897,6 +1271,7 @@ export function composerVoiceInputProps(cv: ComposerVoice) {
     voiceDeviceSwitchIsLive: voiceOwned && voice.deviceSwitchIsLive,
     onClearVoiceError: clearVoiceError,
     voiceDictationPanel: cv.sttDictationPanel,
+    voiceSubmitOnRelease: cv.submitOnRelease,
     voiceStreaming: voice.streamEnabled,
     voiceSampleRef: voice.sampleRef,
     voicePartial: voiceOwned ? voice.partial : '',

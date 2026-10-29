@@ -48,13 +48,20 @@ from kiro_crew.messaging.commands import (
     task_arg_reply,
     task_command_reply,
 )
+from kiro_crew.messaging.queue_drain import owner_token
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, receipt_text
 
 
 class _Surface:
-    """A receipt surface with its address already bound (what a channel supplies)."""
+    """A receipt surface with its address already bound (what a channel supplies).
+
+    ``address_key`` is part of that binding: the registry compares it to decide whether
+    a caller writes to the bubble's own conversation, so a fake without one addresses
+    nothing and every write is withheld.
+    """
 
     label = "fake"
+    address_key = "fake\x00chat"
 
     def __init__(self) -> None:
         self.sent: list[str] = []
@@ -100,10 +107,16 @@ class _Sessions:
     def get_provider(self, key: str) -> Any:
         return self._provider
 
-    def clear_queue(self, key: str) -> None:
+    def clear_queue(self, key: str, owned_by: Any = None) -> None:
         self.cleared.append(key)
         if self._queue is not None:
             self.locked_during_clear.append(self._queue.lock.locked())
+
+
+#: One caller's own principal, the token a channel builds for whoever typed the command.
+#: The helper below tags the receipt line with it AND stops under it, which is the live
+#: arrangement: an owner that matches nothing on the queue would clear nothing.
+_CALLER = owner_token("fake", ("u1", "c1"))
 
 
 def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
@@ -111,8 +124,15 @@ def _stop(sessions: _Sessions, queue: ReceiptQueue, surface: _Surface) -> str:
         # A live receipt so the finalize has a bubble to flip, exactly as a
         # mid-turn burst would have left one.
         async with queue.lock:
-            await queue.create_or_grow_locked("s", surface, "what time is it")
-        return await stop_running_turn(sessions, "s", queue=queue, surface=surface)
+            await queue.create_or_grow_locked("s", surface, "what time is it", _CALLER)
+        return await stop_running_turn(
+            sessions,
+            "s",
+            queue=queue,
+            surface=surface,
+            owner=_CALLER,
+            deliver=AsyncMock(),
+        )
 
     return asyncio.run(go())
 
@@ -493,6 +513,76 @@ class TestLayering:
                 offenders.append(f"{path.name}:{node.lineno} -> {module}")
         assert not offenders, offenders
 
+    #: The services the module docstring keeps duck-typed: each reaches
+    #: ``kiro_crew.slack`` transitively, so a RUNTIME import of either -- at any
+    #: nesting depth -- is the ``messaging -> slack`` edge in disguise. Typing-only
+    #: imports under ``if TYPE_CHECKING:`` are the sanctioned way to name them.
+    _DUCK_TYPED_SERVICES = (
+        "kiro_crew.subagent",
+        "kiro_crew.taskrunner",
+        "kiro_crew.taskrunner_parts",
+    )
+
+    def test_the_duck_typed_services_are_never_imported_at_runtime(self) -> None:
+        """A deferred in-function import is still an edge: the channel ``spawn``
+        reply once reached for ``kiro_crew.subagent`` inside its function body to
+        read the queued-reason kinds, which is why those live in the leaf module
+        ``kiro_crew.subagent_wait_reasons`` instead."""
+        pkg = Path(commands.__file__).resolve().parent
+        offenders: list[str] = []
+        for path in sorted(pkg.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            typing_only: set[int] = set()
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.If)
+                    and isinstance(node.test, ast.Name)
+                    and node.test.id == "TYPE_CHECKING"
+                ):
+                    for inner in ast.walk(node):
+                        typing_only.add(id(inner))
+            for node in ast.walk(tree):
+                if id(node) in typing_only:
+                    continue
+                if isinstance(node, ast.ImportFrom):
+                    modules = [node.module or ""]
+                elif isinstance(node, ast.Import):
+                    modules = [a.name for a in node.names]
+                else:
+                    continue
+                for module in modules:
+                    if any(
+                        module == svc or module.startswith(svc + ".")
+                        for svc in self._DUCK_TYPED_SERVICES
+                    ):
+                        offenders.append(f"{path.name}:{node.lineno} -> {module}")
+        assert not offenders, offenders
+
+    def test_the_wait_reason_kinds_come_from_a_leaf_module(self) -> None:
+        """The module the channel reply reads the kinds from imports nothing from
+        ``kiro_crew`` itself, so reading it can never grow into the edge above;
+        and it agrees with what ``kiro_crew.subagent`` re-exports."""
+        import importlib
+
+        leaf = importlib.import_module("kiro_crew.subagent_wait_reasons")
+        tree = ast.parse(Path(leaf.__file__).read_text(encoding="utf-8"))
+        edges = [
+            (node.module or "")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("kiro_crew")
+        ] + [
+            a.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for a in node.names
+            if a.name.startswith("kiro_crew")
+        ]
+        assert edges == [], edges
+        from kiro_crew import subagent as sub
+
+        assert sub.DEFERRED_QUEUED_REASONS is leaf.DEFERRED_QUEUED_REASONS
+        assert leaf.QUEUED_REASON_CONCURRENCY_LIMIT not in leaf.DEFERRED_QUEUED_REASONS
+
     def test_the_allowed_edge_list_has_no_stale_entries(self) -> None:
         """An exception that does not exist must be deleted, not left to rot.
 
@@ -592,6 +682,23 @@ class TestSpawn:
         assert "a9" in (await spawn_task_reply("do it", manager, "slack:C1:1") or "")
         manager.spawn.assert_not_called()
         assert manager.spawn_async.await_args.kwargs["parent_session_key"] == "slack:C1:1"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_spawn_is_reported_as_refused_not_spawned(self) -> None:
+        """A refusal comes back as a terminal record, not None; a non-batch one is
+        announced nowhere else, so the reply must say it never started."""
+        manager = MagicMock(max_concurrent=2)
+        manager.spawn.return_value = SimpleNamespace(
+            id="r1", done=True, error="spawn refused: gateway admission is closed"
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply.startswith("⚠️ Subagent `r1` was not started: gateway admission is closed")
+        assert "spawn refused" not in reply and "Spawned" not in reply
+        manager.spawn.return_value = SimpleNamespace(
+            id="r2", done=True, error="never started: waiting for memory (pressure)"
+        )
+        reply = await spawn_task_reply("do it", manager) or ""
+        assert reply.startswith("⚠️ Subagent `r2` was not started: waiting for memory")
 
     @pytest.mark.asyncio
     async def test_an_empty_argument_declines(self) -> None:
@@ -753,6 +860,21 @@ class TestCron:
 
 
 class TestTaskRunner:
+    @pytest.mark.asyncio
+    async def test_a_disabled_task_runner_app_refuses_the_start(self, tmp_path: Any) -> None:
+        spec = tmp_path / "plan.yaml"
+        spec.write_text("steps: []", encoding="utf-8")
+        runner = MagicMock(running=False)
+        runner.start_background = AsyncMock()
+        with patch(
+            "kiro_crew.apps.manager._read_installed",
+            return_value=SimpleNamespace(enabled=False),
+        ) as read:
+            out = await task_command_reply(f"task run {spec}", runner) or ""
+        assert "Task Runner is disabled" in out
+        read.assert_called_once_with("projects")
+        runner.start_background.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_project_run_is_accepted_as_an_alias(self, tmp_path: Any) -> None:
         spec = tmp_path / "plan.yaml"

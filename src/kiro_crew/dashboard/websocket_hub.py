@@ -6,10 +6,67 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
 from aiohttp import web
+
+from kiro_crew.write_buffer_level import level_is_progress_signal
+
+#: Capability a dashboard tab declares in the ``caps`` query parameter of
+#: ``/api/ws`` when its bundle applies ``slot_patch`` frames.
+SLOT_PATCH_CAPABILITY = "slot_patch"
+
+#: Socket attribute recording that declaration. Only a dashboard-user socket
+#: carries it; every other socket keeps receiving the full ``slots`` list.
+SLOT_PATCH_WS_FLAG = "_slot_patch"
+
+#: Unsent bytes above which the hub checks whether a tab still reads. A fan-out
+#: send writes its whole frame into the transport before it waits on drain, and
+#: each send is its own task, so a burst can take a tab that still reads past
+#: this. A tab that stays connected but stops reading passes it after about 70
+#: frames of 64 KiB.
+WS_MAX_BUFFERED_BYTES = 4 * 1024 * 1024
+
+#: Seconds a tab may stay over ``WS_MAX_BUFFERED_BYTES`` with its buffer not
+#: shrinking before the hub drops it. A tab that reads drains between sends; one
+#: that stopped reading never does. Dropping it makes the dashboard reconnect and
+#: resync from a fresh snapshot. Applied only where the level shows reading
+#: (``level_is_progress_signal``), so not on the proactor loop Windows runs.
+WS_STALL_SECONDS = 5.0
+
+#: Unsent bytes past which a tab is dropped at once, whatever its window, so the
+#: memory one tab can hold stays bounded.
+WS_HARD_MAX_BUFFERED_BYTES = 4 * WS_MAX_BUFFERED_BYTES
+
+#: Key on a tab's ``WebSocketResponse``: (when its window started, its buffer size
+#: at the last check), kept while the buffer is over ``WS_MAX_BUFFERED_BYTES``.
+_OVER_LIMIT_KEY = "_ws_over_limit"
+
+#: Seconds an awaited owner send (``deliver_ws_owners``) may wait while its tab's
+#: buffer does not shrink. The send returns once that buffer drains, so how long it
+#: takes is the tab's backlog over its link speed: a tab on a slow link that still
+#: reads keeps shrinking its buffer, and one that stopped reading never does. The
+#: same window as ``WS_STALL_SECONDS``, and like it applied only where the level
+#: shows reading (``level_is_progress_signal``).
+WS_OWNER_SEND_TIMEOUT_S = WS_STALL_SECONDS
+
+#: Seconds one awaited owner send may take in all, however its tab's buffer moves,
+#: so a tab that reads too slowly to finish cannot hold its caller past it. Where
+#: the level shows no reading (the proactor loop, or a transport that reports no
+#: level), this is the only limit on the send.
+WS_OWNER_SEND_MAX_S = 30.0
+
+#: Seconds between two reads of the buffer level of a tab an owner send waits on.
+_OWNER_SEND_POLL_S = 0.25
+
+
+def _write_buffer_size(ws: web.WebSocketResponse) -> int | None:
+    """Bytes the tab's transport still holds, or None when that is unknown."""
+    transport = getattr(getattr(ws, "_req", None), "transport", None)
+    size_of = getattr(transport, "get_write_buffer_size", None)
+    size = size_of() if callable(size_of) else None
+    return size if isinstance(size, int) else None
 
 
 class WebSocketHubOwner(Protocol):
@@ -29,7 +86,10 @@ class WebSocketHubOwner(Protocol):
     _flush_task: asyncio.Task[Any] | None
 
 
-Redactor = Callable[[str], tuple[str, Any]]
+#: The ``data`` of a fan-out frame. A mapping, not ``object``: an unawaited async
+#: payload builder hands the fan-out a coroutine ``json.dumps`` cannot serialize,
+#: and with ``object`` that mistake type-checked at every call site.
+WsPayload = Mapping[str, Any]
 
 
 class WebSocketHub:
@@ -46,16 +106,12 @@ class WebSocketHub:
         *,
         serving_loop_provider: Callable[[], asyncio.AbstractEventLoop | None],
         logger_provider: Callable[[], logging.Logger],
-        redact_credentials_provider: Callable[[], Redactor],
-        redact_exfiltration_urls_provider: Callable[[], Redactor],
         scope_state_provider: Callable[[], Any] | None = None,
         running_loop_provider: Callable[[], asyncio.AbstractEventLoop | None] | None = None,
     ) -> None:
         self._owner = owner
         self._serving_loop_provider = serving_loop_provider
         self._logger_provider = logger_provider
-        self._redact_credentials_provider = redact_credentials_provider
-        self._redact_exfiltration_urls_provider = redact_exfiltration_urls_provider
         self._scope_state_provider: Callable[[], Any] = (
             scope_state_provider if scope_state_provider is not None else lambda: owner
         )
@@ -116,10 +172,71 @@ class WebSocketHub:
         # Resolve the provider on-loop as well. DashboardState's provider latches
         # this loop only when startup has not already bound an authoritative one.
         self._serving_loop_provider()
+        if self._drop_if_stalled(ws):
+            return
         task = asyncio.ensure_future(ws.send_str(msg))
         self._owner._background_tasks.add(task)
         done = self._owner_method("_on_ws_send_done", self._on_ws_send_done)
         task.add_done_callback(done)
+
+    def _drop_if_stalled(self, ws: web.WebSocketResponse) -> bool:
+        """Drop a tab that stopped reading.
+
+        Runs on the serving loop, before a send. A tab that stays connected but
+        stops reading keeps every frame in its transport's write buffer, and that
+        buffer never shrinks. A tab that reads can pass ``WS_MAX_BUFFERED_BYTES``
+        after a burst, but its buffer shrinks as it reads. So a tab is dropped
+        when its buffer is over the limit and has not shrunk for
+        ``WS_STALL_SECONDS``, and at once when it passes
+        ``WS_HARD_MAX_BUFFERED_BYTES``. A shrink, or a buffer at or under the
+        limit, restarts the window.
+
+        The window needs a level that falls as the tab reads
+        (:func:`kiro_crew.write_buffer_level.level_is_progress_signal`). The
+        proactor loop Windows runs gives none: its level is the overlapped send in
+        flight plus the bytes queued behind it, flat while a tab that reads takes
+        one large send. There only the ceiling and the owner-send cap
+        (``WS_OWNER_SEND_MAX_S``) drop a tab.
+        """
+        size = _write_buffer_size(ws)
+        if size is None:
+            return False
+        if size <= WS_MAX_BUFFERED_BYTES:
+            ws.pop(_OVER_LIMIT_KEY, None)
+            return False
+        if size <= WS_HARD_MAX_BUFFERED_BYTES:
+            if not level_is_progress_signal():
+                return False
+            now = time.monotonic()
+            mark = ws.get(_OVER_LIMIT_KEY)
+            if not isinstance(mark, tuple) or size < mark[1]:
+                ws[_OVER_LIMIT_KEY] = (now, size)
+                return False
+            ws[_OVER_LIMIT_KEY] = (mark[0], size)
+            if now - mark[0] < WS_STALL_SECONDS:
+                return False
+        self._log.warning(
+            "WS client stopped reading: %d bytes buffered (limit %d, hard limit %d); dropping it",
+            size,
+            WS_MAX_BUFFERED_BYTES,
+            WS_HARD_MAX_BUFFERED_BYTES,
+        )
+        self._drop_ws(ws)
+        return True
+
+    def _drop_ws(self, ws: web.WebSocketResponse) -> None:
+        """Unregister a tab and abort its connection.
+
+        ``abort()`` discards the bytes buffered for the peer and fires
+        ``connection_lost``, which ends every send waiting on the buffer to
+        drain. A ``close()`` would wait for a peer that is not reading.
+        """
+        remove = self._owner_method("_remove_ws", self._remove_ws)
+        remove(ws)
+        transport = getattr(getattr(ws, "_req", None), "transport", None)
+        abort = getattr(transport, "abort", None)
+        if callable(abort):
+            abort()
 
     def _on_ws_send_done(self, task: asyncio.Task[Any]) -> None:
         """Release a completed send task and surface asynchronous failures."""
@@ -158,6 +275,55 @@ class WebSocketHub:
                     pending.add(slug)
                 return False
         if ws.get("_is_dashboard_user", False):
+            # The per-member event log is the owner's view of the crew, the
+            # boundary the ``/api/members`` reads apply. A non-owner dashboard
+            # session (a Telegram, Teams or Webex allowlist link) is a dashboard
+            # user too, so the owner set decides: ``register_ws`` fills it from
+            # ``is_owner_dashboard_request``.
+            from kiro_crew.dashboard.ws_event_scope import MEMBER_LOG_EVENTS
+
+            if msg_type in MEMBER_LOG_EVENTS and ws not in (
+                getattr(self._owner, "_owner_ws_clients", None) or set()
+            ):
+                try:
+                    from kiro_crew.dashboard.ws_event_scope import (
+                        DASHBOARD_USER_AUDITEE,
+                        _audit_deny,
+                    )
+
+                    _audit_deny(DASHBOARD_USER_AUDITEE, msg_type, "owner_only")
+                except Exception:
+                    self._log.debug(
+                        "state: SEL audit for non-owner deny %s failed",
+                        msg_type,
+                        exc_info=True,
+                    )
+                return False
+            # Granted, and the grant is a permission decision like any other:
+            # ``AUTOSDE.yaml`` wants an SEL record for it, not only for the
+            # refusals below. Recorded HERE, at the chokepoint every dashboard
+            # frame passes (live broadcast via ``_send_ws_all``, the log
+            # fan-out's per-send recheck, and the subagent reconnect replay in
+            # ``ws.py`` all funnel through this predicate), rather than at each
+            # sender, so a send path added later is covered by construction --
+            # the same reasoning ``ws_event_allowed`` gives for app tokens.
+            # Under a reserved auditee rather than the empty app claim, so the
+            # operator can tell their own socket's grants from an unnamed
+            # app's. Never raises: a failing audit sink must not withhold a
+            # frame the owner is entitled to.
+            try:
+                from kiro_crew.dashboard.ws_event_scope import (
+                    DASHBOARD_USER_AUDITEE,
+                    _audit_allow,
+                )
+
+                _audit_allow(DASHBOARD_USER_AUDITEE, msg_type)
+            except Exception:
+                self._log.debug(
+                    "state: SEL audit for dashboard-user grant %s failed",
+                    msg_type,
+                    exc_info=True,
+                )
             return True
         ws_app: str = ws.get("_app", "")
         snapshot: frozenset[str] = ws.get("_allowed_events", frozenset())
@@ -271,6 +437,11 @@ class WebSocketHub:
         """Send one typed frame through the per-client authorization chokepoint."""
         dead: list[web.WebSocketResponse] = []
         skip_owners = msg_type == "slots"
+        # A legacy-only slots frame repeats a change every patch-capable socket
+        # already applied from its ``slot_patch`` frame.
+        skip_patch_clients = (
+            skip_owners and isinstance(data, dict) and bool(data.get("_legacy_only", False))
+        )
         owners = getattr(self._owner, "_owner_ws_clients", None) or set()
         client_allowed = self._owner_method("_ws_client_allowed", self._ws_client_allowed)
         serialize = self._owner_method("_serialize_for_client", self._serialize_for_client)
@@ -281,6 +452,8 @@ class WebSocketHub:
                 dead.append(ws)
                 continue
             if skip_owners and ws in owners:
+                continue
+            if skip_patch_clients and ws.get(SLOT_PATCH_WS_FLAG, False):
                 continue
             if not client_allowed(ws, msg_type, data):
                 continue
@@ -303,7 +476,7 @@ class WebSocketHub:
         for ws in dead:
             remove(ws)
 
-    def _send_ws_owners(self, msg: str) -> None:
+    def _send_ws_owners(self, msg: str, *, skip_slot_patch_clients: bool = False) -> None:
         """Send a pre-serialized message only to owner-authenticated clients."""
         dead: list[web.WebSocketResponse] = []
         spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
@@ -312,6 +485,8 @@ class WebSocketHub:
             if ws.closed:
                 dead.append(ws)
                 continue
+            if skip_slot_patch_clients and ws.get(SLOT_PATCH_WS_FLAG, False):
+                continue
             try:
                 spawn(ws, msg)
             except Exception:
@@ -319,7 +494,34 @@ class WebSocketHub:
         for ws in dead:
             remove(ws)
 
-    def broadcast_ws(self, msg_type: str, data: object) -> None:
+    def send_ws_slot_patch(self, msg: str) -> int:
+        """Send a pre-serialized ``slot_patch`` frame to patch-capable sockets.
+
+        Returns how many sockets it was handed to. Only dashboard-user sockets
+        are ever flagged (see ``api_ws``), so no scope gate applies here: the
+        frame carries fields of the dashboard-user slot projection, which those
+        sockets already receive in full.
+        """
+        dead: list[web.WebSocketResponse] = []
+        sent = 0
+        spawn = self._owner_method("_spawn_ws_send", self._spawn_ws_send)
+        remove = self._owner_method("_remove_ws", self._remove_ws)
+        for ws in list(self._owner._ws_clients):
+            if ws.closed:
+                dead.append(ws)
+                continue
+            if not ws.get(SLOT_PATCH_WS_FLAG, False):
+                continue
+            try:
+                spawn(ws, msg)
+                sent += 1
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            remove(ws)
+        return sent
+
+    def broadcast_ws(self, msg_type: str, data: WsPayload) -> None:
         """Send a typed message to every authorized WS client."""
         if not self._owner._ws_clients:
             return
@@ -327,20 +529,74 @@ class WebSocketHub:
         send_all = self._owner_method("_send_ws_all", self._send_ws_all)
         send_all(msg_type, data, msg)
 
-    async def deliver_ws_owners(self, msg_type: str, data: object) -> int:
-        """Await owner-only sends and return the number that completed."""
-        targets = [ws for ws in list(self._owner._owner_ws_clients) if not ws.closed]
+    async def _await_owner_send(self, ws: web.WebSocketResponse, msg: str) -> None:
+        """Send ``msg`` to one owner tab and wait for as long as the tab reads.
+
+        The send returns once the tab's buffer drains, so how long it takes is the
+        tab's backlog over its link speed, not a sign that the tab stopped reading.
+        While it waits, the buffer level is read every ``_OWNER_SEND_POLL_S``. The
+        level rises only as frames are written and falls only as the tab reads, so
+        a fall between two reads is the tab reading, whenever this frame itself
+        reached the buffer. The wait raises ``TimeoutError`` once the level has not
+        fallen for ``WS_OWNER_SEND_TIMEOUT_S``, the signal ``_drop_if_stalled``
+        reads, or once the send has taken ``WS_OWNER_SEND_MAX_S`` in all. Where the
+        level shows no reading (``level_is_progress_signal``, or a transport that
+        reports no level), only ``WS_OWNER_SEND_MAX_S`` ends it.
+        """
+        send = asyncio.ensure_future(ws.send_str(msg))
+        try:
+            loop = asyncio.get_running_loop()
+            watch = level_is_progress_signal()
+            started = moved = loop.time()
+            last = _write_buffer_size(ws) if watch else None
+            while True:
+                done, _pending = await asyncio.wait({send}, timeout=_OWNER_SEND_POLL_S)
+                if done:
+                    send.result()
+                    return
+                now = loop.time()
+                size = _write_buffer_size(ws) if watch else None
+                if size is not None and last is not None and size < last:
+                    moved = now
+                last = size
+                if size is not None and now - moved >= WS_OWNER_SEND_TIMEOUT_S:
+                    raise TimeoutError(
+                        f"its buffer did not shrink for {WS_OWNER_SEND_TIMEOUT_S:g} s"
+                    )
+                if now - started >= WS_OWNER_SEND_MAX_S:
+                    raise TimeoutError(f"it did not complete in {WS_OWNER_SEND_MAX_S:g} s")
+        finally:
+            if not send.done():
+                send.cancel()
+
+    async def deliver_ws_owners(self, msg_type: str, data: WsPayload) -> int:
+        """Await owner-only sends and return the number that completed.
+
+        Each send waits under its own bound (``_await_owner_send``): a tab that
+        stays connected but stopped reading never completes a send that waits for
+        its buffer to drain. Such a tab counts as not delivered and is dropped, so
+        the call returns for every other tab. A tab that still reads keeps its
+        send however slow its link, up to ``WS_OWNER_SEND_MAX_S``.
+        """
+        targets = [
+            ws
+            for ws in list(self._owner._owner_ws_clients)
+            if not ws.closed and not self._drop_if_stalled(ws)
+        ]
         if not targets:
             return 0
         msg = json.dumps({"type": msg_type, "data": data})
         results = await asyncio.gather(
-            *(ws.send_str(msg) for ws in targets),
+            *(self._await_owner_send(ws, msg) for ws in targets),
             return_exceptions=True,
         )
         delivered = 0
         remove = self._owner_method("_remove_ws", self._remove_ws)
         for ws, result in zip(targets, results):
-            if isinstance(result, BaseException):
+            if isinstance(result, TimeoutError):
+                self._log.warning("Owner WS send ended: %s; dropping the client", result)
+                self._drop_ws(ws)
+            elif isinstance(result, BaseException):
                 self._log.debug("Owner WS send failed (client likely disconnected): %s", result)
                 remove(ws)
             else:
@@ -350,7 +606,7 @@ class WebSocketHub:
                 remove(ws)
         return delivered
 
-    def broadcast_ws_owners(self, msg_type: str, data: object) -> None:
+    def broadcast_ws_owners(self, msg_type: str, data: WsPayload) -> None:
         """Send a typed message only to owner-authorized clients."""
         if not getattr(self._owner, "_owner_ws_clients", None):
             return
@@ -382,13 +638,12 @@ class WebSocketHub:
 
     def broadcast_browser_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Redact and broadcast a browser activity event."""
-        redact_credentials = self._redact_credentials_provider()
-        redact_exfiltration_urls = self._redact_exfiltration_urls_provider()
         safe_data: dict[str, Any] = {}
         for key, value in data.items():
             if isinstance(value, str):
-                value, _ = redact_credentials(value)
-                value, _ = redact_exfiltration_urls(value)
+                from kiro_crew.security import redact
+
+                value = redact(value)
             safe_data[key] = value
         payload: dict[str, Any] = {
             "type": "browser_event",
@@ -444,8 +699,6 @@ class WebSocketHub:
         pending: set[str] = set()
         ws["_members_baseline_pending"] = pending
         try:
-            import asyncio
-
             from kiro_crew.eventlog.service import get_service
 
             # last_seqs() iterates and parses every uncached member log on first
@@ -488,11 +741,16 @@ class WebSocketHub:
         if not slugs:
             return
         try:
-            import asyncio
-
+            from kiro_crew.dashboard.ws_event_scope import DASHBOARD_USER_AUDITEE, _audit_allow
             from kiro_crew.eventlog import types as eventlog_types
             from kiro_crew.eventlog.service import get_service
 
+            # These frames bypass ``_ws_client_allowed``, which records the grant
+            # for broadcast frames, so the replay records its own.
+            try:
+                _audit_allow(DASHBOARD_USER_AUDITEE, eventlog_types.WS_MEMBER_PROJECTION)
+            except Exception:
+                self._log.debug("members_subscribed: replay grant audit failed", exc_info=True)
             service = get_service()
             for slug in sorted(slugs):
                 snap = await asyncio.to_thread(service.redacted_snapshot, slug)
@@ -534,7 +792,7 @@ class WebSocketHub:
     def unsubscribe_subagents(self, ws: web.WebSocketResponse) -> None:
         self._owner._ws_subagent_subscribers.discard(ws)
 
-    def broadcast_ws_subagent_subscribers(self, msg_type: str, data: object) -> None:
+    def broadcast_ws_subagent_subscribers(self, msg_type: str, data: WsPayload) -> None:
         """Fan out heavy subagent data only to subscribed, authorized clients."""
         if not self._owner._ws_subagent_subscribers:
             return

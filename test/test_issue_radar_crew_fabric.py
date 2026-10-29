@@ -41,6 +41,7 @@ from unittest import mock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from off_loop_helpers import off_loop
 
 from kiro_crew.apps.builtins.issue_radar.backend import (
     crew_routes,
@@ -72,13 +73,13 @@ def _isolate_crew_log(case: unittest.TestCase) -> None:
     env.start()
     case.addCleanup(env.stop)
     crew_log_emit.reset_caches()
-    crew_store._fold_cache.clear()
+    crew_log.forget_slot_folds()
     _UNITS.clear()
 
     def _teardown() -> None:
         crew_log_emit.drain_for_shutdown(timeout=2.0)
         crew_log_emit.reset_caches()
-        crew_store._fold_cache.clear()
+        crew_log.forget_slot_folds()
         _UNITS.clear()
 
     case.addCleanup(_teardown)
@@ -102,8 +103,10 @@ def _tick() -> None:
 
 def _work(root: Path, crew_id: str, number: int, patch: dict) -> dict:
     """Drive one update through the real write path so the entry carries the phase
-    exactly as production writes it -- no hand-built event dicts."""
-    return crew_store.commit_work_progress(
+    exactly as production writes it -- no hand-built event dicts. Off the event loop,
+    as production makes it (``off_loop`` says why)."""
+    return off_loop(
+        crew_store.commit_work_progress,
         OWNER,
         REPO,
         crew_id,

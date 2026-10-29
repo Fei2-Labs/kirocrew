@@ -1,6 +1,6 @@
 # Implementation Plan — Human-in-the-Loop Tool-Approval Layer
 
-Status: partially implemented in `src/kiro_crew/hooks.py` and the dashboard approval components; typed `ToolPreviewFrame` previews remain unimplemented because the App Builder Kit dependency did not ship.
+Status: partially implemented in `src/kiro_crew/hooks.py` and the dashboard approval components. Unimplemented: typed `ToolPreviewFrame` previews (the App Builder Kit dependency did not ship), batch multi-select approval of pending tool calls, and the show-raw-input control on the approval card.
 
 This plan enriches the render + resume steps of Kiro Crew's existing approval loop and
 documents the portable AI-SDK mapping. The backend enforcement gate (`on_tool_call`) is
@@ -17,7 +17,7 @@ Reqs 1/3/4/5/6 without the module; only the typed rich preview (Req 2.2) is gate
     fallback path may proceed for Reqs 1/3/4/5/6 without it (Req 8.4).
   - Define `PendingDecision` (`slot`, `approval: PendingApproval`, optional `toolCallId`,
     `invocation`) and the `ToolInvocationState` union in a shared types module. The model
-    WRAPS the existing `PendingApproval` wire type (`types/index.ts`) rather than re-spelling
+    WRAPS the existing `PendingApproval` wire type (`types/index.chat.ts`) rather than re-spelling
     its fields, so `tsc` pins it to the real event shape and it carries `request_id`.
     `ToolInvocationState` is non-generic with three reachable phases
     (`input-available` | `output-available` | `output-error`); `input-streaming` is omitted
@@ -25,7 +25,7 @@ Reqs 1/3/4/5/6 without the module; only the typed rich preview (Req 2.2) is gate
   - Confirmed (via reading `useWebSocket.ts` + `ChatInput.tsx`) that a `PendingDecision`
     assembles from the existing PreToolUse event with NO new backend wire field, and that the
     resume identifier is `approval.request_id`: plain approve/reject resolves through the
-    id-scoped `api.resolveApproval(request_id, action)` (`ChatInput.tsx`), NOT slot-scoped
+    id-scoped `api.resolveApproval(request_id, action)` (`chat-input/approval.ts`), NOT slot-scoped
     `approveChatSlot` (which is used only for trust grants, and downgrades to `resolveApproval`
     for unattended sources).
   - _Requirements: 3.3, 3.4, 5.1, 6.4, 8.1, 8.3_
@@ -46,7 +46,7 @@ Reqs 1/3/4/5/6 without the module; only the typed rich preview (Req 2.2) is gate
 - [ ] 3. Wire the resume path (approve / reject / pattern)
   - Route the decision through the existing `onApprove(decision, pattern?)`. Plain
     approve/reject resolves via the id-scoped `api.resolveApproval(request_id, action)`
-    (`ChatInput.tsx`); the slot-scoped `api.approveChatSlot(slot, …)` is reserved for trust
+    (`chat-input/approval.ts`); the slot-scoped `api.approveChatSlot(slot, …)` is reserved for trust
     grants (and downgrades to `resolveApproval` for unattended sources). Forward an approval
     `pattern` verbatim on the path that accepts it. Do NOT introduce a new approval API path.
   - Ensure resume targets the same invocation via `approval.request_id`; a stale/closed id is

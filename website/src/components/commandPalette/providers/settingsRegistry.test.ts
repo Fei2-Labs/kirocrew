@@ -2,7 +2,16 @@ import { describe, it, expect } from 'vitest'
 import * as fs from 'fs'
 import * as path from 'path'
 import { fileURLToPath } from 'url'
-import { extractAll, generateAgentRegistryJson } from '../../../../scripts/settingsExtract'
+import {
+  buildAgentRegistry,
+  extractAll,
+  extractFromSource,
+  generateAgentRegistryJson,
+  panelRoots,
+} from '../../../../scripts/settingsExtract'
+import { settingHelpText } from '../settingsTypes'
+import { settingsSubtitle } from '../settingsTabLabel'
+import { settingsRoute } from '../settingsRoute'
 import { SUBNAV_LEGACY_PARAMS, SUBNAV_PARAM } from '../../subNavParams'
 import { SETTINGS_REGISTRY } from '../settingsRegistry.gen'
 
@@ -23,7 +32,7 @@ import { SETTINGS_REGISTRY } from '../settingsRegistry.gen'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const SETTINGS_DIR = path.resolve(__dirname, '../../../pages/settings')
+const ROOTS = panelRoots(path.resolve(__dirname, '../../..'))
 /** Repo root is five levels up: providers → commandPalette → components → src → website. */
 const AGENT_REGISTRY_FILE = path.resolve(
   __dirname,
@@ -34,14 +43,14 @@ const AGENT_REGISTRY_FILE = path.resolve(
 // Valid tabs from SettingsPage.tsx (fork: KiroACP-only + de-Amazoned, so no
 // provider/secretary/sync/tasks tabs).
 const VALID_TABS = new Set([
-  'overview', 'chat', 'voice', 'display', 'browser', 'skills', 'computer-use',
+  'overview', 'imports', 'chat', 'voice', 'display', 'browser', 'skills', 'computer-use',
   'instances', 'security', 'secrets', 'notifications', 'channels', 'developer', 'about',
   'privacy', 'shortcuts', 'connections',
 ])
 
 describe('settingsRegistry.gen.ts — anti-stale guard', () => {
   it('checked-in registry matches live extraction (run `npm run gen:settings` if this fails)', () => {
-    const { entries } = extractAll(SETTINGS_DIR)
+    const { entries } = extractAll(ROOTS)
     expect(entries).toEqual(SETTINGS_REGISTRY)
   })
 
@@ -68,12 +77,39 @@ describe('settingsRegistry.gen.ts — anti-stale guard', () => {
   })
 })
 
+describe('Display and Notifications rail routing', () => {
+  // Both panels split into a SettingsSubNav rail, so every entry must open a
+  // named rail item (`/settings/<tab>/<sub>`) or the highlight lands on the
+  // tab with no pane mounted.
+  const routeFor = (id: string): string => {
+    const e = SETTINGS_REGISTRY.find(x => x.id === id)
+    expect(e, `registry entry ${id}`).toBeDefined()
+    return settingsRoute(e!).split('?')[0]
+  }
+
+  it('a Display entry opens its rail item', () => {
+    expect(routeFor('display.language')).toBe('/settings/display/view')
+  })
+
+  it('a Notifications entry opens its rail item', () => {
+    expect(routeFor('notifications.play-sound-on-new-notifications')).toBe('/settings/notifications/sound')
+  })
+
+  it('every Display and Notifications entry carries a rail sub-segment', () => {
+    for (const e of SETTINGS_REGISTRY) {
+      if (e.tab !== 'display' && e.tab !== 'notifications') continue
+      expect(settingsRoute(e).split('?')[0], e.id).toMatch(new RegExp(`^/settings/${e.tab}/[a-z-]+$`))
+    }
+  })
+})
+
 interface AgentEntry {
   id: string
   label: string
   tab: string
   route: string
   description?: string
+  hint?: string
   configKey?: string
 }
 
@@ -85,7 +121,7 @@ function agentEntries(): AgentEntry[] {
 
 describe('settings-registry.generated.json — bundled agent registry', () => {
   it('checked-in JSON matches live extraction (run `npm run gen:settings` if this fails)', () => {
-    const { entries } = extractAll(SETTINGS_DIR)
+    const { entries } = extractAll(ROOTS)
     expect(fs.readFileSync(AGENT_REGISTRY_FILE, 'utf-8')).toBe(generateAgentRegistryJson(entries))
   })
 
@@ -125,9 +161,52 @@ describe('settings-registry.generated.json — bundled agent registry', () => {
   it('exposes no field the frontend needs and the agent does not', () => {
     // A `labelKey` or `params` here invites a reader to rebuild the route itself
     // — the mistake the prebuilt `route` exists to remove.
-    const allowed = new Set(['id', 'label', 'tab', 'route', 'description', 'configKey'])
+    const allowed = new Set(['id', 'label', 'tab', 'route', 'description', 'hint', 'configKey'])
     for (const entry of agentEntries()) {
       expect(Object.keys(entry).filter(k => !allowed.has(k))).toEqual([])
     }
+  })
+})
+
+describe('tip prose stays apart from on-row description', () => {
+  const source = [
+    '<SettingsToggle label="Both" hint="Tip text." description="Row text." />',
+    '<SettingsToggle label="Tip only" hint="Only a tip." />',
+    '<SettingsToggle label="Row only" description="Only on the row." />',
+  ].join('\n')
+  const byLabel = new Map(
+    extractFromSource(source, 'AboutPanel.tsx').entries.map(e => [e.label, e]),
+  )
+
+  it('puts the hint prop in `hint` and only the description prop in `description`', () => {
+    expect(byLabel.get('Both')).toMatchObject({ hint: 'Tip text.', description: 'Row text.' })
+    expect(byLabel.get('Tip only')?.hint).toBe('Only a tip.')
+    expect(byLabel.get('Tip only')?.description).toBeUndefined()
+    expect(byLabel.get('Row only')?.description).toBe('Only on the row.')
+    expect(byLabel.get('Row only')).not.toHaveProperty('hint')
+  })
+
+  it('carries both fields, unmerged, into the agent registry', () => {
+    const agent = buildAgentRegistry([...byLabel.values()])
+    const both = agent.find(e => e.label === 'Both')
+    expect(both).toMatchObject({ hint: 'Tip text.', description: 'Row text.' })
+    expect(agent.find(e => e.label === 'Tip only')).not.toHaveProperty('description')
+  })
+
+  it('search and the palette subtitle still read all of a row\'s help, tip first', () => {
+    expect(settingHelpText(byLabel.get('Both')!)).toBe('Tip text. Row text.')
+    expect(settingHelpText(byLabel.get('Tip only')!)).toBe('Only a tip.')
+    expect(settingHelpText({})).toBeUndefined()
+    expect(settingsSubtitle(byLabel.get('Tip only')!)).toContain('Only a tip.')
+  })
+
+  it('no committed row quotes its tip as on-row copy', () => {
+    // A row's `description` never repeats (or starts with) its own hint: a tip
+    // folded into the on-row field would read as text the row displays.
+    for (const entry of SETTINGS_REGISTRY) {
+      if (!entry.hint || !entry.description) continue
+      expect(entry.description.startsWith(entry.hint), entry.id).toBe(false)
+    }
+    expect(SETTINGS_REGISTRY.some(e => e.hint)).toBe(true)
   })
 })

@@ -11,6 +11,8 @@
  */
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import i18next from 'i18next'
+import '../i18n/all'
 import CompactionCard, { SystemNoticeRow, isSystemNoticeRow, parseCompactionNotice } from '../pages/chat/CompactionCard'
 import { defaultMessageRenderers, mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
 import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
@@ -88,8 +90,35 @@ describe('parseCompactionNotice', () => {
       status: 'notice',
       text: 'This turn has produced nothing for 12 min.',
     })
+    // ⏹ leads the "ended by Stop" notice (#14841): a status, never a failure,
+    // so it must not fall into ErrorNotice's failure chrome.
+    expect(parseCompactionNotice('\u23F9 Your forced Stop ended the compaction that started at 87% of the context limit.')).toMatchObject({
+      status: 'notice',
+      text: 'Your forced Stop ended the compaction that started at 87% of the context limit.',
+      stopCaused: true,
+    })
+    // The app's own restart (♻) is not stop-caused: the two notices share a
+    // shape and must be told apart by the glyph.
+    expect(parseCompactionNotice('\u267B\uFE0F Compaction didn\u2019t succeed at 91%, so the session was restarted instead.').stopCaused).toBe(false)
     // Only a LEADING glyph is stripped; one inside the copy is content.
     expect(parseCompactionNotice('see the \u{1F504} marker').text).toBe('see the \u{1F504} marker')
+  })
+})
+
+describe('the stop-caused notice', () => {
+  it('renders with a stop-square glyph while the app-caused restart keeps the info glyph', () => {
+    const stop = render(
+      <CompactionCard content={'\u23F9 Your forced Stop ended the compaction that started at 87% of the context limit, so the session was restarted.'} />,
+    )
+    const stopIcon = stop.container.querySelector('[data-testid="notice-card"] svg')!
+    expect(stopIcon.classList.contains('lucide-square')).toBe(true)
+    expect(stop.container.querySelector('[data-testid="notice-card"]')!.getAttribute('data-tone')).toBe('info')
+    stop.unmount()
+    const app = render(
+      <CompactionCard content={'\u267B\uFE0F Compaction didn\u2019t succeed at 91%, so the session was restarted instead.'} />,
+    )
+    const appIcon = app.container.querySelector('[data-testid="notice-card"] svg')!
+    expect(appIcon.classList.contains('lucide-info')).toBe(true)
   })
 })
 
@@ -127,6 +156,7 @@ describe('CompactionCard', () => {
     const { container } = render(<CompactionCard content={COMPLETED} />)
     const toggle = screen.getByTestId('compaction-card-toggle')
     expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(toggle).toHaveClass('hover:bg-bg-hover')
     fireEvent.click(toggle)
     expect(toggle.getAttribute('aria-expanded')).toBe('true')
     const body = container.querySelector('[data-testid="compaction-card-body"]')!
@@ -182,6 +212,36 @@ describe('CompactionCard', () => {
     expect(container.querySelector('svg.lucide-info')).not.toBeNull()
     expect(container.querySelector('[role="alert"]')).toBeNull()
     expect(container.querySelector('[data-testid="compaction-card"]')).toBeNull()
+  })
+
+  it('reads the mid-turn "will compact after this turn" row as a notice carrying its percent', () => {
+    expect(parseCompactionNotice('\u{1F504} Context at 47% (limit 40%) \u2014 will compact after this turn.')).toMatchObject({
+      status: 'notice',
+      afterTurn: { pct: 47, limit: 40 },
+    })
+    // Any other 🔄 row keeps the plain notice shape, with no percent claimed.
+    expect(parseCompactionNotice('\u{1F504} Auto-compacted at 85%.').afterTurn).toBeUndefined()
+  })
+
+  it('renders the mid-turn row from the catalog, in the reader language', async () => {
+    const row = '\u{1F504} Context at 47% (limit 40%) \u2014 will compact after this turn.'
+    const { container, unmount } = render(<CompactionCard content={row} />)
+    const notice = container.querySelector('[data-testid="notice-card"]')!
+    expect(notice).not.toBeNull()
+    expect(notice.getAttribute('data-tone')).toBe('info')
+    expect(container.querySelector('svg.lucide-clock')).not.toBeNull()
+    expect(
+      screen.getByText('Context at 47%, past the 40% auto-compact threshold — the chat will be summarized when this turn ends'),
+    ).toBeInTheDocument()
+    expect(container.textContent).not.toContain('\u{1F504}')
+    unmount()
+    try {
+      await i18next.changeLanguage('zh-CN')
+      render(<CompactionCard content={row} />)
+      expect(screen.getByText('上下文已达 47%，超过 40% 自动压缩阈值，本轮次结束后将汇总对话')).toBeInTheDocument()
+    } finally {
+      await i18next.changeLanguage('en')
+    }
   })
 
   it('routes the ⚠-led threshold failure and the timeout to ErrorNotice too (origin decides, not the glyph)', () => {

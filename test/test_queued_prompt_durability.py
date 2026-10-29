@@ -53,6 +53,7 @@ from kiro_crew.history import (
     SLOT_OWNED_META_KEYS,
     ConversationLog,
 )
+from kiro_crew.testing.wait import async_wait_until, default_timeout
 
 #: The logger the durable-queue warning is emitted on, so a caplog assertion
 #: names the real emitter rather than the root logger.
@@ -85,6 +86,30 @@ def _busy_slot(state, name: str = "s1"):
 
 def _meta(state, name: str = "s1") -> dict:
     return state.conversation_log._read_metadata(f"dashboard:{name}")
+
+
+async def _queue_writer_settled(slot, never_released: list[int] | None = None) -> None:
+    """Wait until the immediate queue writer, and any follow-up it started, is done.
+
+    The single-flight flag is cleared by the writer's done callback, on the loop,
+    after the executor thread has returned, so the save's queue witness is already
+    recorded. A follow-up pass sets the flag again inside that same callback, so a
+    clear flag read from the loop means the whole chain has finished.
+
+    The file is not that barrier. The save commits the file and only then records
+    the witness, so a read of the file in between sees the new queue while
+    ``queue_persist_pending`` is still true.
+
+    A test that holds the writer passes its ``never_released`` record, so a
+    release that never comes is named here too if this wait expires first.
+    """
+    await async_wait_until(
+        lambda: not slot._queue_persist_inflight,
+        describe=lambda: (
+            f"inflight={slot._queue_persist_inflight} owed={slot._queue_persist_owed}"
+            f" never_released={never_released}"
+        ),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -662,8 +687,6 @@ class TestEnqueueStartsTheWriteImmediately:
 
     @pytest.mark.asyncio
     async def test_a_queued_prompt_reaches_disk_without_the_periodic_flush(self, tmp_path) -> None:
-        import asyncio as _asyncio
-
         from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
 
         state = _make_state(tmp_path)
@@ -672,16 +695,12 @@ class TestEnqueueStartsTheWriteImmediately:
 
         queue_for_next_turn(state, slot, "my follow-up", directive_user_origin=True)
         # Only the executor hand-off is awaited here; no flush loop is running.
-        for _ in range(50):
-            if _meta(state).get("queued_prompts"):
-                break
-            await _asyncio.sleep(0.02)
+        await _queue_writer_settled(slot)
 
         assert [e["content"] for e in _meta(state)["queued_prompts"]] == ["my follow-up"]
 
     @pytest.mark.asyncio
     async def test_the_write_never_runs_on_the_event_loop(self, tmp_path) -> None:
-        import asyncio as _asyncio
         import threading
 
         from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
@@ -700,10 +719,7 @@ class TestEnqueueStartsTheWriteImmediately:
         state.flush_slot_now = _record
 
         queue_for_next_turn(state, slot, "my follow-up", directive_user_origin=True)
-        for _ in range(50):
-            if seen:
-                break
-            await _asyncio.sleep(0.02)
+        await _queue_writer_settled(slot)
 
         assert seen and loop_thread not in seen
 
@@ -723,8 +739,6 @@ class TestEnqueueStartsTheWriteImmediately:
 
     @pytest.mark.asyncio
     async def test_a_failed_background_write_is_logged_not_raised(self, tmp_path, caplog) -> None:
-        import asyncio as _asyncio
-
         from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
 
         state = _make_state(tmp_path)
@@ -734,10 +748,8 @@ class TestEnqueueStartsTheWriteImmediately:
 
         with caplog.at_level("WARNING"):
             queue_for_next_turn(state, slot, "my follow-up", directive_user_origin=True)
-            for _ in range(50):
-                if any("Queued-prompt persist failed" in r.getMessage() for r in caplog.records):
-                    break
-                await _asyncio.sleep(0.02)
+            # The done callback releases the flag and logs the failure in one step.
+            await _queue_writer_settled(slot)
 
         assert any("Queued-prompt persist failed" in r.getMessage() for r in caplog.records)
         # Still owed, so the periodic flush retries it.
@@ -752,7 +764,6 @@ class TestOneWriterPerSlot:
 
     @pytest.mark.asyncio
     async def test_a_send_during_a_write_does_not_start_a_second_writer(self, tmp_path) -> None:
-        import asyncio as _asyncio
         import threading
 
         from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
@@ -762,7 +773,9 @@ class TestOneWriterPerSlot:
         slot = _busy_slot(state)
         release = threading.Event()
         entered = threading.Event()
+        started: list[int] = []
         concurrent: list[int] = []
+        never_released: list[int] = []
         live = 0
         guard = threading.Lock()
         real_flush = state.flush_slot_now
@@ -772,9 +785,17 @@ class TestOneWriterPerSlot:
             with guard:
                 live += 1
                 concurrent.append(live)
+                started.append(1)
             entered.set()
-            release.wait(5)
             try:
+                # Recorded, not raised: an exception here would only reach the
+                # done callback's warning log, not this test. Half the settle's
+                # budget, so the hold gives up first and the assertion below
+                # names it.
+                if not release.wait(default_timeout() / 2):
+                    never_released.append(1)
+                    release.set()  # a follow-up pass must not hold again
+                    return
                 real_flush(target)
             finally:
                 with guard:
@@ -782,28 +803,72 @@ class TestOneWriterPerSlot:
 
         state.flush_slot_now = _slow_flush
 
-        queue_for_next_turn(state, slot, "first", directive_user_origin=True)
-        await _asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
-        # Arrives while the first write holds the single-flight.
-        queue_for_next_turn(state, slot, "second", directive_user_origin=True)
-        assert slot._queue_persist_owed is True
-        release.set()
+        try:
+            queue_for_next_turn(state, slot, "first", directive_user_origin=True)
+            await async_wait_until(entered.is_set, describe=lambda: f"started={len(started)}")
+            # Arrives while the first write holds the single-flight.
+            queue_for_next_turn(state, slot, "second", directive_user_origin=True)
+            assert slot._queue_persist_owed is True
+        finally:
+            release.set()
+        await _queue_writer_settled(slot, never_released)
 
-        for _ in range(100):
-            if len(_meta(state).get("queued_prompts") or []) == 2:
-                break
-            await _asyncio.sleep(0.02)
-
-        # One writer at a time, and the prompt that arrived mid-write is still
-        # carried: the debt is settled by a follow-up pass, not dropped.
+        assert never_released == [], "the held write timed out waiting for release"
+        # One writer at a time. The held pass read the queue after the second
+        # send arrived, so it carried both prompts and the debt it settled on the
+        # way out needed no follow-up write. Counting starts, not overlap, keeps
+        # this true whatever the executor's width: a second writer queued behind
+        # the first never overlaps it, but it still starts.
         assert max(concurrent) == 1
+        assert len(started) == 1
+        assert [e["content"] for e in _meta(state)["queued_prompts"]] == ["first", "second"]
+        assert slot.queue_persist_pending is False
+
+    @pytest.mark.asyncio
+    async def test_a_send_after_the_snapshot_gets_a_follow_up_pass(self, tmp_path) -> None:
+        import threading
+
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _busy_slot(state)
+        release = threading.Event()
+        committed = threading.Event()
+        started: list[int] = []
+        never_released: list[int] = []
+        real_flush = state.flush_slot_now
+
+        def _commit_then_hold(target):  # noqa: ANN001 - test double
+            started.append(1)
+            # The pass reads and commits the queue first, so a send made while
+            # it is held is missing from what it wrote.
+            real_flush(target)
+            committed.set()
+            # Half the settle's budget, as in the test above.
+            if not release.wait(default_timeout() / 2):
+                never_released.append(1)
+                release.set()  # a follow-up pass must not hold again
+
+        state.flush_slot_now = _commit_then_hold
+
+        try:
+            queue_for_next_turn(state, slot, "first", directive_user_origin=True)
+            await async_wait_until(committed.is_set, describe=lambda: f"started={len(started)}")
+            queue_for_next_turn(state, slot, "second", directive_user_origin=True)
+            assert slot._queue_persist_owed is True
+        finally:
+            release.set()
+        await _queue_writer_settled(slot, never_released)
+
+        assert never_released == [], "the held write timed out waiting for release"
+        # Only the follow-up pass can land "second" before the periodic flush.
+        assert len(started) == 2
         assert [e["content"] for e in _meta(state)["queued_prompts"]] == ["first", "second"]
         assert slot.queue_persist_pending is False
 
     @pytest.mark.asyncio
     async def test_the_single_flight_is_released_after_a_failed_write(self, tmp_path) -> None:
-        import asyncio as _asyncio
-
         from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
 
         state = _make_state(tmp_path)
@@ -812,10 +877,7 @@ class TestOneWriterPerSlot:
         state.flush_slot_now = MagicMock(side_effect=OSError("disk gone"))
 
         queue_for_next_turn(state, slot, "mine", directive_user_origin=True)
-        for _ in range(50):
-            if not slot._queue_persist_inflight:
-                break
-            await _asyncio.sleep(0.02)
+        await _queue_writer_settled(slot)
 
         # A failure that left the flag set would silence every later immediate
         # write for this slot's whole lifetime.
@@ -824,8 +886,6 @@ class TestOneWriterPerSlot:
 
     @pytest.mark.asyncio
     async def test_a_settled_debt_does_not_start_an_endless_chain(self, tmp_path) -> None:
-        import asyncio as _asyncio
-
         from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
 
         state = _make_state(tmp_path)
@@ -841,16 +901,15 @@ class TestOneWriterPerSlot:
         state.flush_slot_now = _count
 
         queue_for_next_turn(state, slot, "mine", directive_user_origin=True)
-        for _ in range(50):
-            if _meta(state).get("queued_prompts"):
-                break
-            await _asyncio.sleep(0.02)
-        await _asyncio.sleep(0.1)
+        # A follow-up pass would set the flag again inside the done callback, so
+        # the settled flag is the end of the chain, not a moment inside it.
+        await _queue_writer_settled(slot)
 
         # The follow-up is conditional on the queue still differing from disk, so
         # one send is one write.
         assert len(calls) == 1
         assert slot._queue_persist_owed is False
+        assert [e["content"] for e in _meta(state)["queued_prompts"]] == ["mine"]
 
 
 class TestTheShortfallIsOneObservation:
@@ -1377,6 +1436,13 @@ class TestAnAcceptedButUnpersistedPromptIsReported:
 
         assert '"durable":' not in inspect.getsource(chat_delivery)
         assert '"durable":' not in inspect.getsource(chat_handlers)
+        # The chat_api owners composed into chat_handlers answer the same receipts.
+        from pathlib import Path
+
+        owners = sorted((Path(chat_handlers.__file__).parent / "chat_api").glob("[!_]*.py"))
+        assert owners, "no chat_api owner found beside chat_handlers.py"
+        for owner in owners:
+            assert '"durable":' not in owner.read_text(encoding="utf-8"), owner.name
 
     def test_an_ordinary_enqueue_emits_no_warning_and_reaches_disk(
         self, tmp_path, monkeypatch
@@ -1543,7 +1609,7 @@ class TestTheHoldBranchStartsTheWrite:
 
         # The branch is inside the send handler behind a sub-agent probe; pin the
         # call at the source so the receipt and the write cannot drift apart.
-        src = inspect.getsource(chat_handlers)
+        src = inspect.getsource(chat_handlers.api_chat)
         hold = src.split("warn_if_not_durable(slot._queue, qid, slot.key)", 1)[1]
         hold = hold.split("return web.json_response(", 1)[0]
         assert "start_queue_persist(state, slot)" in hold
@@ -1644,6 +1710,93 @@ class TestRestoredEntriesCarryNoAdmissionSnapshot:
             ]
         )
         assert newly_held_constraints(now, restored[0].get("meta")) == ["linked"]
+
+
+class TestRestoredEntriesCarryNoSenderStamp:
+    """A restored entry names no sender, so the drop notice has nowhere to go.
+
+    The stamp differs from the two keys above in what it DOES: those are read,
+    this one names a write target. The drop resolves the recipient of its notice
+    from the stamp alone and appends the entry's own text there, so a stamp
+    carried back off the metadata line would write attacker-chosen text into a
+    session the editor does not own. Stripping costs one notice and keeps the
+    delivery.
+    """
+
+    def test_the_sender_stamp_is_stripped_on_restore(self) -> None:
+        from kiro_crew.dashboard.session_control import SEND_ORIGIN_META_KEY
+
+        restored = sanitize_restored_queue(
+            [
+                {
+                    "id": "q1",
+                    "content": "write this into the victim transcript",
+                    "meta": {
+                        SEND_ORIGIN_META_KEY: {"slot": "victim-slot", "tab": "forged-tab"},
+                        "sendId": "s-1",
+                    },
+                }
+            ]
+        )
+        assert SEND_ORIGIN_META_KEY not in restored[0]["meta"]
+        assert restored[0]["meta"] == {"sendId": "s-1"}
+
+    def test_a_forged_stamp_resolves_to_no_recipient(self) -> None:
+        # The end of the chain the strip breaks: with the key carried, this reads
+        # "victim-slot" and the drop appends the entry's text there. The forged
+        # tab is included because an editor can write both fields, so the strip
+        # -- not the identity check -- is what has to stop this one.
+        from kiro_crew.dashboard.session_control import (
+            SEND_ORIGIN_META_KEY,
+            send_origin_slot,
+            send_origin_tab,
+        )
+
+        restored = sanitize_restored_queue(
+            [
+                {
+                    "id": "q1",
+                    "content": "hi",
+                    "meta": {SEND_ORIGIN_META_KEY: {"slot": "victim-slot", "tab": "forged-tab"}},
+                }
+            ]
+        )
+        assert send_origin_slot(restored[0].get("meta")) == ""
+        assert send_origin_tab(restored[0].get("meta")) == ""
+
+    def test_the_stamp_does_not_survive_the_real_round_trip(self, tmp_path) -> None:
+        from kiro_crew.dashboard.session_control import SEND_ORIGIN_META_KEY
+
+        state = _make_state(tmp_path)
+        slot = _busy_slot(state)
+        slot.queue_append(
+            "hi", meta={SEND_ORIGIN_META_KEY: {"slot": "victim-slot", "tab": "forged-tab"}}
+        )
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+
+        assert restored is not None
+        assert restored._queue[0]["content"] == "hi"
+        assert SEND_ORIGIN_META_KEY not in restored._queue[0].get("meta", {})
+
+    def test_an_in_process_stamp_still_reads(self, tmp_path) -> None:
+        # The strip bounds the RESTORE path only: a stamp this process admitted
+        # is what the notice is for, so removing it everywhere would delete the
+        # feature rather than bound it.
+        from kiro_crew.dashboard.session_control import (
+            send_origin_meta,
+            send_origin_slot,
+            send_origin_tab,
+        )
+
+        state = _make_state(tmp_path)
+        sender = state.get_or_create_slot("sender-slot")
+        stamp = send_origin_meta(state, "sender-slot")
+
+        assert send_origin_slot(stamp) == "sender-slot"
+        assert send_origin_tab(stamp) == sender._tab_id
 
 
 class TestAStaleQueueSnapshotIsNotCommitted:

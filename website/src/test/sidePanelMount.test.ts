@@ -4,14 +4,37 @@
  * null-origin iframe cannot survive a remount, so an unmount loses the drawing.
  */
 import { describe, it, expect } from 'vitest'
+import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { readSource } from './readSource'
-import { shouldMountSidePanel, isSidePanelHidden } from '../pages/chat/sidePanelMount'
+import { shouldMountSidePanel, isSidePanelHidden, SIDE_PANEL_DOCK_TRANSITION, SIDE_PANEL_MOTION_EASE, SIDE_PANEL_MOTION_MS, sidePanelDimTransition } from '../pages/chat/sidePanelMount'
+
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+const PAGES = join(__dirname, '..', 'pages')
+const chatPageHost = () => [
+  readSource(join(PAGES, 'ChatPage.tsx')),
+  ...readdirSync(join(PAGES, 'chat', 'page')).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readSource(join(PAGES, 'chat', 'page', f))),
+  ...readdirSync(PAGES).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readSource(join(PAGES, f))),
+].join('\n')
+// SidePanel.tsx composes sibling owners (SidePanelAddMenu.tsx, SidePanelTabChip.tsx,
+// SidePanelTabBodies.tsx, useSidePanelSize.ts), so a pin over the whole panel reads
+// the facade with every owner, and a pin on one construct reads the file it lives in.
+const CHAT = join(PAGES, 'chat')
+const sidePanelSource = () => readdirSync(CHAT)
+  .filter(f => /^(use)?SidePanel\w*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+  .map(f => readSource(join(CHAT, f))).join('\n')
 
 const S = (activityOpen: boolean, hasLiveAppTab: boolean, searchOpen = false, hasBrowserTab = false) =>
   ({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen })
 
 describe('side panel mount decision', () => {
+  it('keeps dashboard documents and answer drafts mounted when closed or searching', () => {
+    const input = { ...S(false, false, true), hasTaskDashboard: true }
+    expect(shouldMountSidePanel(input)).toBe(true)
+    expect(isSidePanelHidden(input)).toBe(true)
+  })
   it('mounts while open, with or without an app tab', () => {
     expect(shouldMountSidePanel(S(true, false))).toBe(true)
     expect(shouldMountSidePanel(S(true, true))).toBe(true)
@@ -48,7 +71,7 @@ describe('side panel mount decision', () => {
     expect(src).toContain('active={isActive && !panelHidden}')
     // ...and the flag has to reach the panel from its host, or the guard above
     // is dead code that always reads undefined.
-    const host = readSource(join(__dirname, '..', 'pages', 'ChatPage.tsx'))
+    const host = chatPageHost()
     expect(host.match(/panelHidden=\{isSidePanelHidden\(/g) ?? []).toHaveLength(2)
   })
 
@@ -63,7 +86,7 @@ describe('side panel mount decision', () => {
    * the panel is merely collapsed, or the `AppHost` would remount and lose its state.
    */
   it('composes the cross-slot app-tab body from BOTH selection and panel visibility', () => {
-    const src = readSource(join(__dirname, '..', 'pages', 'chat', 'SidePanel.tsx'))
+    const src = sidePanelSource()
     expect(src).toMatch(/<AppPanelTabBody kind=\{t\.kind\} active=\{shown && !panelHidden\}/)
     // The visibility style must NOT pick up the same flag, or a collapsed panel
     // remounts the host instead of merely hiding it.
@@ -78,15 +101,19 @@ describe('side panel mount decision', () => {
    * `FolderPanel` scope their handlers to their own elements, so they cannot.
    */
   it('passes the same visibility signal to the artifact body', () => {
-    const src = readSource(join(__dirname, '..', 'pages', 'chat', 'SidePanel.tsx'))
+    const src = readSource(join(__dirname, '..', 'pages', 'chat', 'SidePanelTabBodies.tsx'))
     expect(src).toMatch(/<ArtifactPanel\s+embedded\s+active=\{active\}/)
     const panel = readSource(join(__dirname, '..', 'components', 'ArtifactPanel.tsx'))
     // The guard, and the flag in the effect's deps so a switch re-binds it. The
     // prop is aliased to `visible` there because a local `active` in that file
     // already names the fullscreen icon.
     expect(panel).toContain('active: visible = true')
-    expect(panel).toContain('if (!visible) return')
-    expect(panel).toContain('}, [visible, fullscreen, onClose])')
+    // The same guard also stands down while a remote Crew fills the window: the
+    // whole local dashboard, this panel included, is then off screen.
+    expect(panel).toContain('if (!visible || crewHidden) return')
+    // Close and exit-fullscreen go through the comment-draft guard, so those
+    // guarded callbacks are the deps rather than `onClose` itself.
+    expect(panel).toContain('}, [visible, fullscreen, exitFullscreen, requestClose, active, crewHidden])')
   })
 
   describe('find pane claims the dock', () => {
@@ -133,5 +160,35 @@ describe('side panel mount decision', () => {
     it('is shown while the panel is open and unobstructed', () => {
       expect(isSidePanelHidden(S(true, false, false, true))).toBe(false)
     })
+  })
+})
+
+/**
+ * Opening the panel and switching to a chat with a different remembered width
+ * move the SAME edge, so they have to look like one motion. They cannot share a
+ * code path — one is a framer tween on the dock wrapper, the other a CSS
+ * transition on the panel — so they share constants, and these cases are what
+ * stops a later edit to one from silently desynchronising the other.
+ */
+describe('side panel motion timing is shared, not copied', () => {
+  it('expresses the same duration and curve through both mechanisms', () => {
+    // framer takes seconds and a bezier array…
+    expect(SIDE_PANEL_DOCK_TRANSITION.duration).toBe(SIDE_PANEL_MOTION_MS / 1000)
+    expect(SIDE_PANEL_DOCK_TRANSITION.ease).toEqual(SIDE_PANEL_MOTION_EASE)
+    // …CSS takes ms and a cubic-bezier() function. Same numbers either way.
+    expect(sidePanelDimTransition('width')).toEqual({ transition: 'width 180ms cubic-bezier(0.2, 0, 0, 1)' })
+    expect(sidePanelDimTransition('height')).toEqual({ transition: 'height 180ms cubic-bezier(0.2, 0, 0, 1)' })
+  })
+
+  it('derives the CSS curve from the constant rather than restating it', () => {
+    const src = readSource(join(__dirname, '..', 'pages', 'chat', 'sidePanelMount.ts'))
+    // One bezier literal in the module — the exported constant. A second one
+    // would mean the CSS builder had been given its own copy to drift from.
+    expect(src.match(/0\.2, 0, 0, 1/g)).toHaveLength(1)
+  })
+
+  it('is the shared constant that the dock wrapper actually uses', () => {
+    const host = chatPageHost()
+    expect(host).toContain('transition={SIDE_PANEL_DOCK_TRANSITION}')
   })
 })

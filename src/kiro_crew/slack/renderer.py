@@ -42,12 +42,13 @@ import os
 import time
 from typing import Any, Awaitable, Callable
 
-from kiro_crew.constants import strip_control_comments
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT, strip_control_comments
+from kiro_crew.dashboard.turn_dispatch import tool_approval_timeout_secs
+from kiro_crew.messaging.approval import adoptable_reservation
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.outbound_files import (
     OutboundFile,
     Rejection,
-    extract_local_refs_off_loop,
     hide_local_refs,
     protected_ref_spans,
 )
@@ -55,13 +56,18 @@ from kiro_crew.messaging.renderer import (
     Renderer,
     chunk_text,
     count_redaction_tags,
+    new_approval_nonce,
+    nonce_eq,
     redaction_notice,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import repaired_for_delivery, split_markdown_safe
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-from kiro_crew.sel import sel
-from kiro_crew.slack.files import UPLOAD_LIMITS, upload_outbound_files
+from kiro_crew.slack.files import (
+    extract_outbound_with_audit,
+    rejection_notes,
+    upload_outbound_files_reporting,
+)
 from kiro_crew.slack.format import (
     SLACK_MSG_LIMIT,
     TRUNCATION_NOTICE,
@@ -76,6 +82,7 @@ from kiro_crew.slack.handler import (
     _NO_RESPONSE,
     _STREAM_CONTINUED,
     _THINKING,
+    DELIVERY_DEBT_NOTICE,
     StatusReactionController,
     _append_footer_actions,
     _filter_options_brackets,
@@ -104,10 +111,6 @@ _STATUS_WORKING = "is working on your request"
 #: placement; this absorbs the ordinary case so no chunk reaches
 #: :data:`SLACK_MSG_LIMIT`, where ``_safe_update`` would truncate it.
 _SPLIT_HEADROOM = 100
-
-#: Refusal lines appended to a reply before they are summarized as a count. Three
-#: lines explain a reply; twelve bury it.
-_MAX_REJECTION_LINES = 3
 
 #: Appended to a partially-streamed assistant row that the dispatcher rescues when
 #: a turn dies mid-flight. Without it the retry reads a reply that simply stops
@@ -203,8 +206,39 @@ def _approval_registry_key(session_key: str, request_id: str | int) -> str:
     return f"{session_key}:{rid}" if session_key else rid
 
 
+#: Separates the registry key from the per-prompt nonce inside a button's token.
+#: ``|`` because a session key may contain ``:`` and the nonce is
+#: ``token_urlsafe``, whose alphabet is ``[A-Za-z0-9_-]`` -- so splitting on this
+#: from the right recovers both halves whatever either contains.
+_APPROVAL_TOKEN_SEP = "|"
+
+
+def build_approval_token(session_key: str, request_id: str | int, nonce: str) -> str:
+    """The value a button carries: the registry key plus this prompt's nonce.
+
+    The key alone identifies WHICH pending request a click is for; the nonce is
+    what says the click came from the buttons currently live for it. Both travel
+    together because the interaction handler has nothing else to go on.
+    """
+    key = _approval_registry_key(session_key, request_id)
+    return f"{key}{_APPROVAL_TOKEN_SEP}{nonce}" if nonce else key
+
+
+def split_approval_token(token: str) -> tuple[str, str]:
+    """Split a button's token back into ``(registry_key, nonce)``.
+
+    A token with no separator yields an EMPTY nonce rather than guessing, which
+    the decider then refuses -- so a button minted before this prompt carried a
+    nonce cannot resolve anything.
+    """
+    key, sep, nonce = str(token).rpartition(_APPROVAL_TOKEN_SEP)
+    if not sep:
+        return str(token), ""
+    return key, nonce
+
+
 def build_approval_blocks(
-    title: str, request_id: str | int, session_key: str = ""
+    title: str, request_id: str | int, session_key: str = "", nonce: str = ""
 ) -> list[dict[str, Any]]:
     """Build Block Kit approve/deny buttons for a tool-permission request.
 
@@ -212,8 +246,23 @@ def build_approval_blocks(
     (``session_key:request_id``) so the interaction handler correlates a click
     back to the awaiting decider WITHOUT colliding across concurrent sessions
     (kiro-cli request ids restart at 1 per session).
+
+    *nonce* is this prompt's own discriminator, minted by
+    :meth:`SlackApprovalDecider.reserve`. Without it the token names only a
+    session and a request id, both of which recur: a provider restart puts request
+    id ``1`` back in play, and buttons from a timed-out prompt stay clickable
+    because only a DECIDED click rewrites the message. A press on those would then
+    carry a token the registry accepts and would approve -- or Trust -- a request
+    nobody read. An empty *nonce* builds a token the decider refuses, so a caller
+    that armed no window cannot post buttons that authorize anything.
+
+    The nonce rides in each button's ``value`` and NOT in its ``action_id``: the
+    interaction handler falls back to the ``action_id`` suffix when a payload
+    carries no value, and that fallback splits on ``_``, which the nonce's own
+    alphabet contains. A nonce in the ``action_id`` would come back cut in half.
     """
-    token = _approval_registry_key(session_key, request_id)
+    key = _approval_registry_key(session_key, request_id)
+    token = build_approval_token(session_key, request_id, nonce)
     return [
         {
             "type": "section",
@@ -226,7 +275,7 @@ def build_approval_blocks(
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Approve"},
                     "style": "primary",
-                    "action_id": f"{TOOL_APPROVE_ACTION_PREFIX}{token}",
+                    "action_id": f"{TOOL_APPROVE_ACTION_PREFIX}{key}",
                     "value": token,
                 },
                 {
@@ -234,14 +283,14 @@ def build_approval_blocks(
                     # THIS session only (not global YOLO). Mirrors native.
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Trust session"},
-                    "action_id": f"{TOOL_TRUST_ACTION_PREFIX}{token}",
+                    "action_id": f"{TOOL_TRUST_ACTION_PREFIX}{key}",
                     "value": token,
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Deny"},
                     "style": "danger",
-                    "action_id": f"{TOOL_DENY_ACTION_PREFIX}{token}",
+                    "action_id": f"{TOOL_DENY_ACTION_PREFIX}{key}",
                     "value": token,
                 },
             ],
@@ -256,6 +305,13 @@ class SlackApprovalDecider:
     clicked; :meth:`__call__` (the ``TurnDriver`` decider) awaits that result.
     Registry is keyed by request id (stringified). ``session_key`` lets the
     interaction handler map a click back to its session (for per-session Trust).
+
+    The decision window opens when the prompt is rendered, not when the wait
+    starts: :meth:`reserve` opens it and ``__call__`` adopts it. So a click lands
+    inside the window from the moment the blocks are built, including across the
+    post that makes them visible. It closes at the decision, at the wait's
+    timeout, or at a :meth:`discard` / :meth:`discard_session` for a prompt that
+    never went out or was never awaited.
     """
 
     #: Process-global registry mapping request_id -> the decider currently
@@ -263,29 +319,179 @@ class SlackApprovalDecider:
     #: reference to the per-turn decider) resolves clicks through this.
     _REGISTRY: dict[str, "SlackApprovalDecider"] = {}
 
+    #: Registry keys a wait currently OWNS -- added when ``__call__`` takes the
+    #: future and discarded in the same ``finally`` that unregisters it.
+    #: :meth:`discard_session` reads this to leave an owned window alone, since a
+    #: wait under one session key need not belong to the turn running that sweep.
+    _AWAITED: set[str] = set()
+
+    #: Registry key -> the nonce minted for the buttons now showing for it. A
+    #: press whose nonce does not match is refused, which is what stops a button
+    #: left over from an earlier prompt at the same key from deciding this one.
+    #: Retired with the window, so a nonce never outlives the prompt it authorizes.
+    _NONCES: dict[str, str] = {}
+
     def __init__(self, session_key: str = "") -> None:
         self._futures: dict[str, asyncio.Future[bool]] = {}
         self.session_key = session_key
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
 
     async def __call__(self, event: Any) -> bool:
+        self.last_deny_cause = ""
         rid = str(getattr(event, "request_id", ""))
         key = _approval_registry_key(self.session_key, rid)
+        # Adopt the reservation opened when the prompt was rendered. The click may
+        # ALREADY have landed, in the gap between the blocks going out and this
+        # wait starting, in which case the reservation holds the user's decision
+        # and there is nothing left to await. Minting a fresh future here would
+        # discard that decision and deny when the window elapsed.
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[bool] = loop.create_future()
+        reserved = adoptable_reservation(self._futures.get(rid), loop)
+        if reserved is not None and reserved.done():
+            if reserved.cancelled() or reserved.exception() is not None:
+                # A torn-down reservation, not a decision. Open a fresh window
+                # rather than read it as consent or as a refusal.
+                reserved = None
+            else:
+                try:
+                    return bool(reserved.result())
+                finally:
+                    self._futures.pop(rid, None)
+                    if SlackApprovalDecider._REGISTRY.get(key) is self:
+                        SlackApprovalDecider._REGISTRY.pop(key, None)
+                        # Retire the nonce with the prompt: a button for a request
+                        # id the provider reuses later must match nothing.
+                        SlackApprovalDecider._NONCES.pop(key, None)
+        fut: asyncio.Future[bool] = reserved if reserved is not None else loop.create_future()
         # _futures is per-decider, so keying by the bare rid is unambiguous
         # here; the process-global _REGISTRY must use the session-namespaced
         # key to avoid cross-session collisions (kiro-cli rids restart at 1).
         self._futures[rid] = fut
         SlackApprovalDecider._REGISTRY[key] = self
+        # This wait now owns the key, so the end-of-turn sweep must leave it be.
+        SlackApprovalDecider._AWAITED.add(key)
         try:
             # Deny-by-default if the user never clicks within the window.
-            return await asyncio.wait_for(fut, timeout=_APPROVAL_TIMEOUT)
+            window = (
+                _APPROVAL_TIMEOUT if _APPROVAL_TIMEOUT is not None else tool_approval_timeout_secs()
+            )
+            return await asyncio.wait_for(fut, timeout=window)
         except asyncio.TimeoutError:
+            # Recorded for the driver, which steers the cause into the turn
+            # before it rejects, so the model hears "expired" not "denied".
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             return False
         finally:
+            SlackApprovalDecider._AWAITED.discard(key)
             self._futures.pop(rid, None)
             if SlackApprovalDecider._REGISTRY.get(key) is self:
                 SlackApprovalDecider._REGISTRY.pop(key, None)
+                SlackApprovalDecider._NONCES.pop(key, None)
+
+    def reserve(self, request_id: str | int) -> str:
+        """Open the decision window BEFORE the prompt is posted, and mint its nonce.
+
+        Called by the renderer as it renders the prompt, because ``TurnDriver``
+        dispatches ``PROMPT_CHOICE`` and only then awaits the decider: between the
+        blocks becoming visible in the thread and ``__call__`` registering, a click
+        that arrived found no decider in ``_REGISTRY``, so ``resolve_global``
+        reported it as already expired and the request denied itself when the
+        window elapsed. Reserving first means the window is open for the whole time
+        the buttons are clickable.
+
+        Registers the decider in the process-global registry too, since that is
+        what the interaction handler resolves and reads Trust's session through --
+        a reserved future nobody can reach would close no gap at all.
+
+        Returns the nonce the buttons must carry. The registry key recurs -- a
+        provider restart replays request id ``1`` -- so the key alone cannot tell
+        this prompt's buttons from an earlier prompt's still sitting in the thread.
+        The nonce is minted per prompt and retired with it, which is what makes a
+        stale press unusable instead of authoritative.
+
+        Never replaces a LIVE future, in either direction: a second reserve for one
+        request, or a reserve that follows the wait, keeps the object the waiter is
+        blocked on. Replacing it would leave that waiter on a future nobody
+        resolves. A DONE future IS replaced, so a decision left unawaited cannot be
+        adopted by the next request to reuse this id. The nonce is re-minted either
+        way, so the buttons going out now are the only ones that can decide.
+
+        Inert off the event loop: a reservation is a promise to a wait that runs on
+        THIS loop, so without one there is no waiter to hold a window open for, and
+        a caller that cannot await the decider cannot be raced by a click. Nothing
+        is armed and no nonce is returned, so such a caller's buttons resolve
+        nothing rather than carrying an authorization no wait will honour.
+        """
+        rid = str(request_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return ""
+        pending = adoptable_reservation(self._futures.get(rid), loop)
+        if pending is None or pending.done():
+            self._futures[rid] = loop.create_future()
+        key = _approval_registry_key(self.session_key, rid)
+        SlackApprovalDecider._REGISTRY[key] = self
+        nonce = new_approval_nonce()
+        SlackApprovalDecider._NONCES[key] = nonce
+        return nonce
+
+    def discard(self, request_id: str | int) -> None:
+        """Close a window whose prompt never went out (idempotent).
+
+        ``__call__`` clears its own entry in a ``finally``, but a renderer that
+        reserves and then fails to post has no wait to run it, and the driver
+        unwinds with the raise rather than reaching the decider. Without this the
+        reservation would outlive a prompt nobody saw, and a later click would
+        resolve a future nobody awaits while the user is told it worked.
+        """
+        rid = str(request_id)
+        self._futures.pop(rid, None)
+        key = _approval_registry_key(self.session_key, rid)
+        if SlackApprovalDecider._REGISTRY.get(key) is self:
+            SlackApprovalDecider._REGISTRY.pop(key, None)
+            SlackApprovalDecider._NONCES.pop(key, None)
+
+    @classmethod
+    def discard_session(cls, session_key: str) -> None:
+        """Drop *session_key*'s unawaited reservations at the end of its turn.
+
+        Covers the one case neither ``__call__`` nor :meth:`discard` can: the
+        prompt went out and the turn then ended before the driver reached the
+        decider -- a cancellation, or a failure between the two. No wait ever ran,
+        so nothing else closes that window, and a click landing in it would resolve
+        a future nobody awaits and be reported to the user as applied.
+
+        Drops every reservation no wait OWNS, whatever state its future is in, and
+        matches on the namespaced prefix with its own ``:`` so one session key
+        cannot match another that merely starts the same way. A completed future no
+        wait adopted has no reader -- ``__call__`` for that turn never ran, and
+        :meth:`reserve` replaces a done future rather than letting the next request
+        at this id inherit it -- so keeping it retains the future, its nonce and
+        this decider for the life of the process, once per request id. The retained
+        nonce is the worse half: the buttons stay in the thread, so a later press
+        still matches, and while :meth:`resolve_global` refuses it as already
+        answered, :meth:`session_for` would hand back the session and grant Trust.
+
+        Skips a key a wait OWNS, which keeps this a sweep of unawaited windows
+        rather than of every window a session holds. A wait under one session key
+        need not belong to the turn running the sweep, and popping a future an
+        operator is still deciding on would deny at its timeout on a refusal
+        nobody made. Ownership is the predicate rather than the shape of the
+        request id, so a wait added later is covered without being enumerated.
+        """
+        prefix = f"{session_key}:"
+        for key in [k for k in cls._REGISTRY if k.startswith(prefix) and k not in cls._AWAITED]:
+            dec = cls._REGISTRY.get(key)
+            if dec is None:
+                continue
+            rid = key.rsplit(":", 1)[-1]
+            dec._futures.pop(rid, None)
+            cls._REGISTRY.pop(key, None)
+            # The nonce is what authorizes a press, so a swept window must not
+            # leave one live: the buttons stay in the thread after the turn.
+            cls._NONCES.pop(key, None)
 
     def resolve(self, request_id: str | int, approved: bool) -> bool:
         """Resolve a pending approval. Returns True iff a future was waiting."""
@@ -296,15 +502,37 @@ class SlackApprovalDecider:
         return False
 
     @classmethod
-    def resolve_global(cls, registry_key: str | int, approved: bool) -> bool:
+    def nonce_matches(cls, registry_key: str | int, nonce: str) -> bool:
+        """Whether *nonce* is the one minted for the prompt currently at that key.
+
+        The registry key is ``session_key:request_id`` and BOTH halves recur: ids
+        restart at ``1`` in every provider process, and a session key outlives any
+        one prompt. So a button still sitting in the thread from an earlier prompt
+        names a key that can be live again for a different tool, and a press on it
+        would otherwise be indistinguishable from a press on the real one. Only an
+        unpredictable per-prompt value tells them apart.
+
+        Deny-by-default: no nonce armed, or none supplied, is a refusal rather than
+        a pass. Compared in constant time, since a mismatch is a security answer.
+        """
+        expected = cls._NONCES.get(str(registry_key))
+        if not expected or not nonce:
+            return False
+        return nonce_eq(expected, nonce)
+
+    @classmethod
+    def resolve_global(cls, registry_key: str | int, approved: bool, *, nonce: str = "") -> bool:
         """Resolve a pending approval via the process-global registry.
 
         *registry_key* is the session-namespaced token from the button
-        (``session_key:request_id``, or a bare id when no session). Used by the
-        Slack interaction handler, which has no direct reference to the per-turn
-        decider. Returns True iff a matching pending prompt was resolved (False
-        if it already expired / was answered).
+        (``session_key:request_id``, or a bare id when no session), and *nonce* is
+        that button's per-prompt discriminator. Used by the Slack interaction
+        handler, which has no direct reference to the per-turn decider. Returns
+        True iff a matching pending prompt was resolved (False if it already
+        expired, was answered, or the press came from a stale prompt's buttons).
         """
+        if not cls.nonce_matches(registry_key, nonce):
+            return False
         dec = cls._REGISTRY.get(str(registry_key))
         if dec is None:
             return False
@@ -314,15 +542,36 @@ class SlackApprovalDecider:
         return dec.resolve(rid, approved)
 
     @classmethod
-    def session_for(cls, registry_key: str | int) -> str:
+    def session_for(cls, registry_key: str | int, *, nonce: str = "") -> str:
         """Return the session_key of the decider awaiting *registry_key* (or "").
 
         Lets the interaction handler grant per-session Trust for a click without
         a direct decider reference. *registry_key* is the session-namespaced
         token from the button.
+
+        Gated on the nonce as well, because Trust is the wider grant of the two:
+        the handler escalates the session BEFORE resolving, so a stale press that
+        named a live key would auto-approve every later tool in that session even
+        if the resolve behind it then refused.
+
+        Answered only while a press could also DECIDE: the prompt's future must
+        exist and still be pending. The nonce alone is the weaker question, because
+        it is retired by the wait's ``finally`` rather than by the decision itself
+        -- so between a Deny resolving the future and that wait resuming, and for
+        any window a sweep left behind, the nonce still matches a prompt nothing can
+        answer. Trust granted there escalates the session for every later tool while
+        the handler reports the press as expired.
         """
+        if not cls.nonce_matches(registry_key, nonce):
+            return ""
         dec = cls._REGISTRY.get(str(registry_key))
-        return dec.session_key if dec is not None else ""
+        if dec is None:
+            return ""
+        rid = str(registry_key).rsplit(":", 1)[-1]
+        fut = dec._futures.get(rid)
+        if fut is None or fut.done():
+            return ""
+        return dec.session_key
 
 
 class SlackRenderer(Renderer):
@@ -404,6 +653,23 @@ class SlackRenderer(Renderer):
         # arrives, while a chunk only reaches Slack when the edit throttle opens,
         # so between flushes ``_accumulated`` holds text nobody has seen.
         self._delivered = ""
+        # Delivery debt: real answer text Slack refused for good -- the append
+        # failed AND its post-rotation retry failed, so those characters are on no
+        # message.
+        #
+        # Never cleared, including at a wait boundary. That boundary discards
+        # ``_accumulated`` and abandons the message, so text lost before it can no
+        # longer be restated from anything the turn still holds -- which is why the
+        # debt has to outlive it and be disclosed at the end.
+        #
+        # Only the streaming finalize reads it. A refused append always attempts a
+        # rotation, so a for-good loss leaves the turn in one of two states: the
+        # rotation succeeded and the answer now spans two messages, where the loss
+        # is disclosed because restating the whole text in the message the reader
+        # is watching would repeat the abandoned one; or the rotation failed and
+        # the stream was demoted, where the end-of-turn ``chat.update`` already
+        # re-sends that segment's complete text and there is nothing to disclose.
+        self._stream_debt = False
         # Held text from '[' until ']' to filter [OPTIONS:], or from a
         # line-leading '<' while it can still be the reply's control-tag tail
         # (see ``_filter_options_brackets`` / ``_resolve_comment_hold``).
@@ -419,6 +685,20 @@ class SlackRenderer(Renderer):
         self._task_counter = 0
         self._active_task_id = ""
         self._active_task_title = ""
+        #: ACP tool_call_id of the task card ``_active_task_id`` is showing, so a
+        #: ``tool_result`` can be matched to the card it finalizes. "" when no
+        #: card is open or the transport sent no id.
+        self._active_tool_call_id = ""
+        #: Terminal outcomes seen for THIS turn's tool calls, keyed by ACP
+        #: ``tool_call_id`` -> a ``TERMINAL_TOOL_STATUSES`` value. A call's card
+        #: is finalized against this: "completed" is the ✓ card, anything else is
+        #: an error card naming the exact outcome. Entries are consumed as their
+        #: card closes.
+        self._tool_outcomes: dict[str, str] = {}
+        #: Cards already finalized this turn, keyed by ACP ``tool_call_id`` ->
+        #: (task_id, final title), so a result that lands after its card closed
+        #: (out-of-order parallel tool use) can re-emit that exact card.
+        self._closed_task_ids: dict[str, tuple[str, str]] = {}
         self._tool_start_time = 0.0  # monotonic ts of current tool start
         self._tool_timer_task: asyncio.Task | None = None  # 30s elapsed updater
         self._controller: Any = None
@@ -436,6 +716,9 @@ class SlackRenderer(Renderer):
         # and uploads stay off until then: extraction reads files the model named,
         # and "anywhere" is not an approved root.
         self._upload_root = upload_root if os.path.isabs(upload_root) else ""
+        # The session's own scratch directory, set only by the dispatcher beside
+        # a valid root (``authorize_upload_root``).
+        self._scratch_root = ""
         self._uploads_allowed = uploads_allowed
         # Visible text withheld from the append-only stream because a local image
         # reference is in play; released (markup removed) at the seal.
@@ -480,18 +763,7 @@ class SlackRenderer(Renderer):
 
     async def _ensure_stream(self) -> str | None:
         if self._stream_ts is None:
-            # Best-effort: MUST NOT raise. The real client swallows and
-            # returns None, but a raising client/transport would escape into
-            # the transport catch-all and post a terminal error on a live
-            # turn. A raise is the same event as a None return — streaming
-            # unavailable — so map it onto the fallback below.
-            try:
-                ts = await self.slack.start_stream(
-                    self.channel, self.thread_ts or "", user_id=self._user_id or None
-                )
-            except Exception:
-                logger.warning("Slack start_stream failed — demoting to chat.update", exc_info=True)
-                ts = None
+            ts = await self._start_stream_if_threaded()
             if ts:
                 self._stream_ts = ts
                 self._use_slack_stream = True
@@ -513,6 +785,33 @@ class SlackRenderer(Renderer):
                     self._stream_ts = None
         return self._stream_ts
 
+    async def _start_stream_if_threaded(self, *, initial_text: str | None = None) -> str | None:
+        """Start a Slack stream, unless this reply has no thread to stream into.
+
+        ``chat.startStream`` streams into a thread. A flat reply (``thread_ts``
+        None, as a single-session DM posts at channel root) has none, so calling
+        it would fail and log a warning on every turn for no gain. Returning None
+        routes the caller to the chat.update fallback, which still renders the
+        answer progressively.
+
+        Best-effort: MUST NOT raise. The real client swallows and returns None,
+        but a raising client/transport would escape into the transport catch-all
+        and post a terminal error on a live turn. A raise is the same event as a
+        None return — streaming unavailable — so map it onto the fallback.
+        """
+        if not self.thread_ts:
+            return None
+        try:
+            return await self.slack.start_stream(
+                self.channel,
+                self.thread_ts,
+                initial_text=initial_text,
+                user_id=self._user_id or None,
+            )
+        except Exception:
+            logger.warning("Slack start_stream failed — demoting to chat.update", exc_info=True)
+            return None
+
     async def _rotate_stream(self) -> str | None:
         """Stop the dead stream and start a fresh one (native ``_rotate_stream``).
 
@@ -528,16 +827,7 @@ class SlackRenderer(Renderer):
                     "Slack stop_stream failed during rotation — abandoning old stream",
                     exc_info=True,
                 )
-        try:
-            new_ts = await self.slack.start_stream(
-                self.channel,
-                self.thread_ts or "",
-                initial_text=_STREAM_CONTINUED,
-                user_id=self._user_id or None,
-            )
-        except Exception:
-            logger.warning("Slack start_stream failed during rotation", exc_info=True)
-            new_ts = None
+        new_ts = await self._start_stream_if_threaded(initial_text=_STREAM_CONTINUED)
         if new_ts:
             self._stream_ts = new_ts
         else:
@@ -570,11 +860,10 @@ class SlackRenderer(Renderer):
                 except Exception:
                     logger.warning("Slack append_stream failed after rotation", exc_info=True)
                     ok = False
-        # A delta that failed both the append and the post-rotation retry is
-        # not re-delivered here: this matches the shipped client's refused-
-        # append outcome on this path. Confirmed-delivery recovery for the
-        # class is a designed subsystem tracked as its own issue (delivery
-        # debt), deliberately not grown inside this guard sweep.
+        # A delta that failed both the append and the post-rotation retry is on no
+        # message. Record the debt rather than dropping it silently, so finalize can
+        # tell the reader. The early returns above are not deliveries and never
+        # reach here, so withheld text does not count as lost.
         if ok:
             # Delivery ledger. This is the ONE sink every streamed assistant string
             # passes through, and it reports whether Slack accepted the append — so
@@ -583,7 +872,46 @@ class SlackRenderer(Renderer):
             # cumulative and final, so the ledger needs no reconciliation when
             # ``_accumulated`` is reset at a ``wait`` boundary.
             self._delivered += text
+        else:
+            self._stream_debt = True
         return ok
+
+    async def _settle_stream_debt(self, ts: str) -> None:
+        """Disclose answer text Slack refused for good, on the message that lost it.
+
+        Called at every point a stream is abandoned, so the notice goes out while
+        an append can still reach the message the hole is in. Clearing the debt is
+        part of settling it: a second notice on a later message would report a gap
+        the reader has already been shown.
+
+        Sent directly rather than through ``_append_stream``: the notice is not
+        answer text, so it must not enter the delivery ledger, which the rescue
+        replays to the next turn as text the reader already established.
+
+        ``append_stream`` reports a refusal by RETURNING False -- the client turns
+        every exception into that return -- so the return value is the whole
+        signal, and leaving it unread hides the very loss this notice exists to
+        disclose. The two refusals that takes fall inside one Slack rate-limit or
+        outage window, so they are correlated rather than independent. On refusal
+        post a separate message, which does not depend on the stream that just
+        refused and, sent directly, stays out of the ledger too.
+        """
+        if not self._stream_debt:
+            return
+        self._stream_debt = False
+        notice_ok = False
+        try:
+            notice_ok = await self.slack.append_stream(self.channel, ts, DELIVERY_DEBT_NOTICE)
+        except Exception:
+            logger.warning("Slack: appending the delivery-debt notice failed")
+        if not notice_ok:
+            try:
+                await self.slack.post_message(self.channel, DELIVERY_DEBT_NOTICE, self.thread_ts)
+            except Exception:
+                logger.warning(
+                    "Slack: the delivery-debt notice reached neither the "
+                    "stream nor a separate message"
+                )
 
     async def _flush_stream_buffer(self, *, final: bool = False) -> None:
         """Strip thinking tags and flush the buffered stream text (if any).
@@ -616,9 +944,18 @@ class SlackRenderer(Renderer):
         await self._append_stream(flush)
 
     # -- outbound local-image uploads ---------------------------------------
-    def authorize_upload_root(self, root: str) -> None:
-        """Authorize the provider's resolved cwd; an invalid root disables uploads."""
+    def authorize_upload_root(self, root: str, scratch_root: str = "") -> None:
+        """Authorize the provider's resolved cwd; an invalid root disables uploads.
+
+        *scratch_root* is the session's own ``$KIROCREW_SCRATCH`` directory. It
+        is admitted only beside a valid cwd, and extraction re-checks that it is
+        one allocation under the managed scratch root
+        (``outbound_files.session_scratch_root``) before it counts.
+        """
         self._upload_root = root if os.path.isabs(root) else ""
+        self._scratch_root = (
+            scratch_root if self._upload_root and os.path.isabs(scratch_root) else ""
+        )
 
     def _uploads_enabled(self) -> bool:
         """Require the transport capability, an unrestricted session, and a root."""
@@ -694,83 +1031,34 @@ class SlackRenderer(Renderer):
     async def _extract_uploads(self, text: str) -> tuple[str, list[OutboundFile], str]:
         """Pull local images out of the sealed reply; returns (body, files, notes).
 
-        ``notes`` is the refusal text, already folded into ``body``, and returned
-        separately because the streaming path cannot re-render ``body``: Slack's
-        ``chat.stopStream`` does not replace what was appended, so the notes have
-        to be appended there instead. Fail-soft: a reply must go out even when
-        extraction cannot decide anything about the files it mentions.
+        Thin wrapper over the shared Slack admission seal
+        (:func:`kiro_crew.slack.files.extract_outbound_with_audit`) so the chat
+        renderer and every other Slack posting site (the cron delivery leg) share
+        one implementation of extraction, the SEL audit of file egress, and the
+        refusal notes. ``notes`` is the refusal text, already folded into
+        ``body``, and returned separately because the streaming path cannot
+        re-render ``body``: Slack's ``chat.stopStream`` does not replace what was
+        appended, so the notes have to be appended there instead.
         """
-        try:
-            result = await extract_local_refs_off_loop(
-                text, within_root=self._upload_root, limits=UPLOAD_LIMITS
-            )
-        except Exception:
-            logger.warning("slack: outbound file extraction failed", exc_info=True)
-            return text, [], ""
-        body = result.rewritten_text.strip()
-        if not body and not result.files:
-            body = text
-        notes = ""
-        if result.rejections:
-            sel().log_api_access(
-                caller=self._audit_caller(),
-                operation="slack_renderer.upload_files",
-                outcome="denied",
-                source="slack",
-                resources=f"{len(result.rejections)} rejection(s)",
-                # Reason codes only: the destination is LLM-authored text.
-                error=",".join(sorted({item.reason for item in result.rejections})),
-            )
-            notes = self._rejection_notes(result.rejections)
-            body = f"{body}\n\n{notes}" if body else notes
-        if result.files:
-            sel().log_api_access(
-                caller=self._audit_caller(),
-                operation="slack_renderer.upload_files",
-                outcome="allowed",
-                source="slack",
-                resources=f"{len(result.files)} file(s)",
-            )
-        return body, result.files, notes
+        return await extract_outbound_with_audit(
+            text,
+            within_root=self._upload_root,
+            scratch_root=self._scratch_root,
+            audit_caller=self._audit_caller(),
+        )
 
     def _rejection_notes(self, rejections: list[Rejection]) -> str:
-        """Refusal lines for the thread. Never conditional on the answer's length.
-
-        The reason names the destination, so the user reads which picture is
-        missing and why rather than a reply that talks about one that never
-        arrived. A budget check belongs to no caller here: the text is split after
-        this, so an answer near the cap costs the reader a chunk boundary, where
-        dropping the note would cost them the explanation.
-        """
-        for rejection in rejections:
-            logger.info("slack: local image not uploaded (%s)", rejection.reason)
-        lines = [f"⚠️ _{rejection}_" for rejection in rejections[:_MAX_REJECTION_LINES]]
-        if len(rejections) > _MAX_REJECTION_LINES:
-            lines.append(f"⚠️ _…and {len(rejections) - _MAX_REJECTION_LINES} more_")
-        note = "\n".join(lines)
-        # The destination came from the model, so the line it appears in is
-        # scanned like any other outbound text before it can be posted -- in the
-        # DISPLAY form too, since a rejected path is echoed inside `_..._` italics
-        # that Slack renders away.
-        return _display_safe(note)
+        """Refusal lines for the thread (shared implementation)."""
+        return rejection_notes(rejections)
 
     async def _upload_files(self, files: list[OutboundFile]) -> None:
-        """Upload the extracted files, reporting any Slack would not take."""
-        try:
-            failures = await upload_outbound_files(
-                self.slack, self.channel, self.thread_ts or "", files
-            )
-        except Exception:
-            logger.warning("slack: uploading extracted images failed", exc_info=True)
-            return
-        if not failures:
-            return
-        try:
-            await self.slack.post_message(
-                self.channel, self._rejection_notes(failures), self.thread_ts
-            )
-        except Exception:
-            logger.warning("slack: reporting a failed image upload failed", exc_info=True)
+        """Upload the extracted files, reporting any Slack would not take.
+
+        Delegates to the shared
+        :func:`kiro_crew.slack.files.upload_outbound_files_reporting`, which
+        posts a redacted note into the thread for every upload Slack refuses.
+        """
+        await upload_outbound_files_reporting(self.slack, self.channel, self.thread_ts or "", files)
 
     def _audit_caller(self) -> str:
         """Identity for the SEL audit line: the session, else the conversation."""
@@ -799,15 +1087,37 @@ class SlackRenderer(Renderer):
         drops the synthetic closer with the content and leaves an unterminated
         code block. Blind slicing costs a boundary Markdown may render badly and
         keeps every authored character.
+
+        That slice lands AFTER the splitter graded its own boundaries, and each
+        piece is posted as its own message, so each chunk's own slices are graded
+        once more: a credential the scaffolding pushed across a slice would
+        otherwise be whole on screen. A chunk that repairs is the repair's subject,
+        because the concatenation of the slices is not the reply -- the seam
+        whitespace is trimmed out of it -- while the chunk is text this function
+        holds. The repair is safe to bound again, which is why one grade per chunk
+        is enough.
         """
         limit = self._limit()
         if len(text) + reserve <= limit:
             return [text]
-        chunks = await asyncio.to_thread(split_markdown_safe, text, limit, reserve=reserve)
-        bounded: list[str] = []
-        for chunk in chunks:
-            bounded.extend(chunk_text(chunk, SLACK_MSG_LIMIT - reserve) or [chunk])
-        return bounded or [text]
+
+        def _bounded() -> list[str]:
+            chunks = split_markdown_safe(text, limit, reserve=reserve, redactor=_redact_all)
+            cap = SLACK_MSG_LIMIT - reserve
+
+            def capped(chunk: str) -> list[str]:
+                return chunk_text(chunk, cap) or [chunk]
+
+            out: list[str] = []
+            for chunk in chunks:
+                pieces = capped(chunk)
+                repaired = repaired_for_delivery(chunk, pieces, _redact_all, capped)
+                if repaired is not None:
+                    pieces = capped(repaired)
+                out.extend(pieces)
+            return out
+
+        return await asyncio.to_thread(_bounded) or [text]
 
     async def _render_fallback(self, text: str) -> None:
         """Final no-stream render: the whole answer, not a truncated prefix.
@@ -844,6 +1154,11 @@ class SlackRenderer(Renderer):
                 await self.slack.post_message(self.channel, part, self.thread_ts)
             except Exception:
                 logger.debug("slack: posting a continuation chunk failed", exc_info=True)
+                continue
+            # Recorded like every other confirmed send: the ledger IS the subject
+            # the redaction notice counts, so a continuation left out of it makes an
+            # over-limit answer announce fewer placeholders than it shipped.
+            self._delivered += part
 
     async def _append_task(self, task_id: str, title: str, status: str, details: str = "") -> bool:
         """Append a task card. Never rotates (native ``_append_task``).
@@ -871,6 +1186,66 @@ class SlackRenderer(Renderer):
         except Exception:
             logger.warning("Slack append_task failed — skipping progress card", exc_info=True)
             return False
+
+    async def on_tool_result(self, tool_call_id: str, tool_status: str) -> None:
+        """Record a tool call's terminal outcome for its card.
+
+        The card for the ACTIVE call is finalized later (at the next
+        ``on_tool_call``, a ``wait`` boundary, or ``on_done``), where the
+        elapsed time is known — so the outcome is remembered for that finalize.
+        A result that arrives for a card ALREADY CLOSED (parallel / out-of-order
+        tool use, where the next call opened before this call's result landed)
+        is applied immediately: re-emitting that card's ``task_id`` with the
+        ``error`` status replaces it in place, so a late failure is not lost to
+        the ✓ its card was closed with. A terminal status other than
+        "completed" is a call that did not succeed.
+        """
+        if not tool_call_id:
+            return
+        self._tool_outcomes[tool_call_id] = tool_status
+        # Active card: leave it for the deferred finalize, which reads the
+        # outcome and adds elapsed time. An already-closed card: update it now.
+        if tool_call_id == self._active_tool_call_id or tool_call_id not in self._closed_task_ids:
+            return
+        if tool_status and tool_status != "completed":
+            task_id, title = self._closed_task_ids[tool_call_id]
+            self._tool_outcomes.pop(tool_call_id, None)
+            await self._append_task(task_id, title, "error", details=tool_status)
+
+    async def _finalize_active_task(self) -> None:
+        """Close the open task card against its recorded outcome, if any.
+
+        Replaces the three bare ``_append_task(..., "complete")`` calls that
+        marked EVERY tool card complete regardless of what the call did. A call
+        whose ``on_tool_result`` recorded a non-"completed" terminal status gets
+        an ``error`` card whose detail names the EXACT outcome (``failed`` /
+        ``cancelled`` / ``canceled`` / ``refused``), so a declined or cancelled
+        call is never relabelled as a failure; everything else (a success, or a
+        call whose transport sent no result event) keeps the ✓ card, so
+        behaviour is unchanged wherever no outcome was reported. The card's
+        ``task_id`` and final title are remembered under its ``tool_call_id`` so
+        a result that lands AFTER this close (out-of-order parallel use) can
+        re-emit the card. Idempotent: clears ``_active_task_id`` so a second
+        call is a no-op.
+        """
+        if not self._active_task_id:
+            return
+        elapsed = self._tool_elapsed_str()
+        title = f"{self._active_task_title}  {elapsed}" if elapsed else self._active_task_title
+        outcome = self._tool_outcomes.pop(self._active_tool_call_id, "") or ""
+        succeeded = not outcome or outcome == "completed"
+        if succeeded:
+            await self._append_task(self._active_task_id, title, "complete")
+        else:
+            # Slack's ``task_update`` status is one of error/pending/in_progress/
+            # complete — "error" is the non-✓ card. The detail carries the exact
+            # outcome string, so refused/cancelled read as themselves rather than
+            # as a failure.
+            await self._append_task(self._active_task_id, title, "error", details=outcome)
+        if self._active_tool_call_id:
+            self._closed_task_ids[self._active_tool_call_id] = (self._active_task_id, title)
+        self._active_task_id = ""
+        self._active_tool_call_id = ""
 
     def _tool_elapsed_str(self) -> str:
         """Formatted elapsed time for the active tool, or '' (native helper)."""
@@ -1151,12 +1526,11 @@ class SlackRenderer(Renderer):
         if self._use_slack_stream:
             await self._flush_stream_buffer(final=True)
         if self._active_task_id:
-            elapsed = self._tool_elapsed_str()
             self._cancel_tool_timer()
-            ct = f"{self._active_task_title}  {elapsed}" if elapsed else self._active_task_title
-            await self._append_task(self._active_task_id, ct, "complete")
+            await self._finalize_active_task()
         self._task_counter += 1
         self._active_task_id = f"tool_{self._task_counter}"
+        self._active_tool_call_id = tool_call_id or ""
         self._active_task_title = tool_purpose or tool_name
         await self._append_task(
             self._active_task_id, self._active_task_title, "in_progress", details=tool_name
@@ -1176,11 +1550,8 @@ class SlackRenderer(Renderer):
         )
         if is_wait and self._use_slack_stream and self._stream_ts:
             if self._active_task_id:
-                elapsed = self._tool_elapsed_str()
                 self._cancel_tool_timer()
-                ct = f"{self._active_task_title}  {elapsed}" if elapsed else self._active_task_title
-                await self._append_task(self._active_task_id, ct, "complete")
-                self._active_task_id = ""
+                await self._finalize_active_task()
             # This message ends here and its accumulated source is discarded, so
             # no seal will ever extract the withheld markup. Append it as written:
             # a visible path is the honest degradation, a dropped picture is not.
@@ -1202,6 +1573,13 @@ class SlackRenderer(Renderer):
             )
             if released:
                 await self._append_stream(released)
+            # Last chance to tell the reader: the seal below drops ``_stream_ts``
+            # and ``_accumulated``, so a turn that ends with no post-wait text
+            # opens no further stream and reaches no other disclosure point, while
+            # the lost characters are gone from the text a later message could
+            # restate. Settling here also puts the notice on the message the gap is
+            # in. Ordered after the holds so a refusal of any of them counts.
+            await self._settle_stream_debt(self._stream_ts)
             # Best-effort: MUST NOT raise. The stream is being abandoned
             # either way (``_stream_ts`` is cleared just below and the next
             # chunk opens a fresh one), so a raising ``stop_stream`` changes
@@ -1237,12 +1615,29 @@ class SlackRenderer(Renderer):
         # only resolve THIS session's pending tool (kiro-cli rids restart at 1
         # per session — a bare id would collide across concurrent threads).
         session_key = self.decider.session_key if self.decider else ""
-        await self.slack.post_blocks(
-            self.channel,
-            build_approval_blocks(title, request_id, session_key),
-            "Tool approval requested",
-            self.thread_ts,
-        )
+        # Open the decision window BEFORE the blocks go out. The driver awaits the
+        # decider only after this returns, and the post below suspends, so a click
+        # landing in that gap would otherwise find no decider registered and be
+        # reported as an approval that already expired. The same call mints the
+        # nonce the buttons carry, so the window and the token that opens it are
+        # armed together rather than one of them trailing the post.
+        nonce = self.decider.reserve(request_id) if self.decider is not None else ""
+        try:
+            await self.slack.post_blocks(
+                self.channel,
+                build_approval_blocks(title, request_id, session_key, nonce),
+                "Tool approval requested",
+                self.thread_ts,
+            )
+        except BaseException:
+            # The prompt never reached the thread, so nothing can be clicked and
+            # the driver unwinds with this raise rather than reaching the decider:
+            # no wait will run the ``finally`` that normally closes this window.
+            # Raised on, because swallowing it would leave the turn waiting out the
+            # whole window on an invisible prompt.
+            if self.decider is not None:
+                self.decider.discard(request_id)
+            raise
 
     async def on_compaction(self, context_usage_pct: float) -> None:
         # Best-effort: MUST NOT raise. Decoration only.
@@ -1269,11 +1664,8 @@ class SlackRenderer(Renderer):
         # the flag past the delivery, the answer-carrying send simply propagates
         # on failure and no call site has to reset a flag.
         if self._active_task_id and self._stream_ts is not None:
-            elapsed = self._tool_elapsed_str()
             self._cancel_tool_timer()
-            ct = f"{self._active_task_title}  {elapsed}" if elapsed else self._active_task_title
-            await self._append_task(self._active_task_id, ct, "complete")
-            self._active_task_id = ""
+            await self._finalize_active_task()
         self._cancel_tool_timer()
         # The stream is over, so a held comment is the reply's tail: drop it
         # when the tail grammar recognizes it on the whole reply, release it
@@ -1359,6 +1751,21 @@ class SlackRenderer(Renderer):
                     await self._append_stream(tail)
                 if upload_notes:
                     await self._append_stream(f"\n\n{upload_notes}")
+                # Delivery-debt settlement, after the appends above so a tail or
+                # note that was itself refused counts, and before the seal because
+                # an append past ``stop_stream`` would be refused.
+                #
+                # Reaching here with debt means a rotation succeeded, because a
+                # refused append always attempts one and a failed rotation leaves
+                # the ledger empty and takes the wholly-refused branch above. So
+                # the answer spans the abandoned message and this one: restating
+                # the whole text here would repeat what the reader already has
+                # above, and characters lost before a wait boundary are absent
+                # from ``clean_text`` to restate at all. Saying so is what a reader
+                # can act on -- they can ask again -- where a complete-looking
+                # answer with a hole in it gives them nothing to notice.
+                if self._stream_debt:
+                    await self._settle_stream_debt(self._stream_ts)
                 # stop_stream is a SEAL, not a delivery: the answer already
                 # reached the reader append by append (each confirmed into the
                 # delivery ledger), and chat.stopStream only closes the live
@@ -1415,7 +1822,9 @@ class SlackRenderer(Renderer):
         # display-safe body: the per-append stream scans run the same idempotent
         # redactors, so this is the form the reader is left with.
         if clean_text:
-            cred_count, url_count = count_redaction_tags(clean_text)
+            # The parts that SHIPPED, not the source they were cut from: a
+            # boundary repair can add a placeholder of its own.
+            cred_count, url_count = count_redaction_tags(self._delivered or clean_text)
             self._redacted_creds += cred_count
             self._redacted_urls += url_count
         # Clear thread status now that the turn is complete. Best-effort, and

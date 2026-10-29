@@ -608,7 +608,31 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         # Wrap in to_thread: revoke_chain does sync file I/O (mode=0o600
         # atomic-rename writes to refresh_chains.json) — must not block
         # the event loop.
-        await asyncio.to_thread(state.revoke_chain, chain_id, now + MAX_REFRESH_TTL_SECS)
+        revoked_durably = await asyncio.to_thread(
+            state.revoke_chain, chain_id, now + MAX_REFRESH_TTL_SECS
+        )
+        if not revoked_durably:
+            # The revocation is in memory and not on disk. Reporting the chain revoked here
+            # would be the one claim this endpoint must not make on a lost write: reuse
+            # detection is what turns a stolen refresh token into a dead chain, and a restart
+            # loads a store that never saw this record while the chain's current token is
+            # still valid. The presented token is refused either way -- the degraded mark makes
+            # every validation fail closed for the life of this process -- so the difference is
+            # only in what the caller is told, and an operator reading the audit trail must not
+            # see a revocation that did not happen.
+            _audit(user_id, "refresh_token_use", "reuse_revocation_not_persisted", chain_id)
+            resp = web.json_response(
+                {
+                    "error": "Refresh-token reuse was detected for this chain, but the "
+                    "revocation could not be stored, so it is not guaranteed to outlive a "
+                    "gateway restart. Repair the gateway's storage and restart, then treat "
+                    "every session on this chain as compromised.",
+                    "code": "refresh_state_unavailable",
+                },
+                status=503,
+            )
+            _clear_refresh_cookie(resp, request)
+            return resp
         _audit(user_id, "refresh_token_use", "reuse_detected", chain_id)
         resp = web.json_response({"error": "refresh_chain_revoked"}, status=401)
         _clear_refresh_cookie(resp, request)
@@ -678,7 +702,8 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # grace window can re-serve the same response without minting again.
     # Typed as ``dict[str, Any]`` because we deliberately mix float and str
     # values; the "_"-prefixed keys are filtered out before JSON
-    # serialization in the grace-replay path (see line ~280).
+    # serialization in the grace-replay path (the ``public = {...}`` filter in
+    # the ``state.grace_replacement`` branch above).
     grace_payload: dict[str, Any] = dict(public_payload)
     grace_payload["_access_token"] = new_access_token
     grace_payload["_refresh_token"] = new_refresh_token
@@ -686,7 +711,7 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # Wrap mark_consumed in to_thread: it does sync file I/O
     # (atomic-rename write to ~/.kiro/crew/refresh_chains.json) — must
     # not block the event loop.
-    await asyncio.to_thread(
+    persisted = await asyncio.to_thread(
         state.mark_consumed,
         jti,
         chain_id=chain_id,
@@ -700,6 +725,36 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         # blank -- absent must stay distinguishable from bound-but-lost.
         peer_key=bound_peer_key,
     )
+
+    if not persisted:
+        # The consumption is in memory only. Publishing the pair here would retire this jti
+        # for the running process while leaving it spendable on disk, so the next start --
+        # which is what the store's own warning tells the operator to do -- would accept the
+        # token this request was supposed to burn, with the replacement pair already in the
+        # client's hands. Refusing costs the client one retry; publishing costs the guarantee
+        # that a rotated refresh token is single-use.
+        logger.error(
+            "auth_refresh: refusing to publish a rotated pair for chain %s because the "
+            "consumption did not persist; the in-memory record is rolled back, so the "
+            "presented token is not burned -- but the store is now degraded and its reader "
+            "fails closed, so every refresh is refused until the storage fault is fixed and "
+            "the gateway restarted.",
+            chain_id[:8],
+        )
+        # Every other outcome of this endpoint writes a row, including the reuse path's
+        # own unpersisted case. Without one here an owner reading the audit trail sees
+        # nothing at all for a refused rotation -- the one outcome whose cause is a
+        # storage fault they have to go and fix.
+        _audit(user_id, "refresh_token_use", "rotation_not_persisted", chain_id)
+        return web.json_response(
+            {
+                "error": "The refresh state could not be persisted, so this token was not "
+                "rotated. Sessions cannot be refreshed until the gateway's storage is "
+                "repaired; retrying will not clear it.",
+                "code": "refresh_state_unavailable",
+            },
+            status=503,
+        )
 
     if require_peer:
         # The signed claim, not a second whois result, is authoritative. The
@@ -811,6 +866,7 @@ async def api_auth_logout(request: web.Request) -> web.Response:
 
     user_id = ""
     chain_id = ""
+    revocation_persisted = True
     if refresh_cookie:
         valid, user_id, _reason, chain_id, _jti, _exp = validate_refresh_token(refresh_cookie)
         if valid and chain_id:
@@ -819,14 +875,41 @@ async def api_auth_logout(request: web.Request) -> web.Response:
             # network truncation, attacker holds a copy already).
             # `revoke_chain` does sync file I/O — wrap in to_thread so it
             # doesn't block the event loop.
-            await asyncio.to_thread(
+            revocation_persisted = await asyncio.to_thread(
                 _get_state().revoke_chain,
                 chain_id,
                 time.time() + MAX_REFRESH_TTL_SECS,
             )
-            _audit(user_id, "refresh_token_logout", "ok", chain_id)
+            _audit(
+                user_id,
+                "refresh_token_logout",
+                "ok" if revocation_persisted else "not_persisted",
+                chain_id,
+            )
         else:
-            _audit(user_id or "", "refresh_token_logout", "invalid_refresh")
+            # A degraded store makes `validate_refresh_token` fail closed, and skipping the
+            # revocation on that arm revoked the chain neither on disk NOR in memory -- worse
+            # than before this change, where the in-memory revocation at least held for the
+            # life of the process. The endpoint then answered 200, and the next write to
+            # succeed cleared the degraded mark, after which the un-revoked cookie validated
+            # again for the rest of its TTL: exactly the replay this revocation exists to
+            # stop. The HMAC and every claim were verified BEFORE that early return, so the
+            # chain id here is authentic and revoking it cannot be driven by a forged token.
+            degraded = _get_state().degraded_reason()
+            if degraded and chain_id:
+                revocation_persisted = await asyncio.to_thread(
+                    _get_state().revoke_chain,
+                    chain_id,
+                    time.time() + MAX_REFRESH_TTL_SECS,
+                )
+                _audit(
+                    user_id or "",
+                    "refresh_token_logout",
+                    "ok" if revocation_persisted else "degraded_not_persisted",
+                    chain_id,
+                )
+            else:
+                _audit(user_id or "", "refresh_token_logout", "invalid_refresh")
     else:
         _audit("", "refresh_token_logout", "no_cookie")
 
@@ -845,7 +928,25 @@ async def api_auth_logout(request: web.Request) -> web.Response:
     # Always clear both cookies on the response, even when no refresh
     # cookie was present — the caller's intent is "log me out", and
     # leaving a stale access cookie behind would defeat that intent.
-    resp = web.json_response({"logged_out": True})
+    # The revocation record is a different matter: reporting success for one that never
+    # reached disk tells the caller its chain is dead when the next restart will accept it
+    # again, and the degraded mark this store sets gates the very writes that would
+    # re-persist it. The cookies are still cleared -- that part did happen -- and the body
+    # says what did not, so a client that discards the token anyway is not stranded while
+    # one that cares can see the chain is still live somewhere.
+    if revocation_persisted:
+        resp = web.json_response({"logged_out": True})
+    else:
+        resp = web.json_response(
+            {
+                "logged_out": False,
+                "error": "This session's cookies are cleared, but the revocation record "
+                "could not be stored, so the refresh token is not guaranteed dead after a "
+                "gateway restart. Repair the gateway's storage, then log out again.",
+                "code": "refresh_state_unavailable",
+            },
+            status=503,
+        )
     _clear_refresh_cookie(resp, request)
     # Mirror the access cookie name + path used in token_auth's middleware
     # so this clear actually overrides the existing cookie.

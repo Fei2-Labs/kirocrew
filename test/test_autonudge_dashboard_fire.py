@@ -25,9 +25,11 @@ import pytest
 
 from kiro_crew.autonudge import NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.monitoring.completion import MonitorCompletionHook
 from kiro_crew.monitoring.models import MonitorState
 from kiro_crew.slack import gateway as gw
+from kiro_crew.testing.wait import await_until
 
 
 def _loop(slot_key: str = "chat-1-1785") -> NudgeLoop:
@@ -41,19 +43,29 @@ def _loop(slot_key: str = "chat-1-1785") -> NudgeLoop:
     )
 
 
-def _slot(key: str = "chat-1-1785", *, running: bool = False, in_stage: bool = False) -> MagicMock:
+def _structured_loop() -> NudgeLoop:
+    """A loop whose structured monitor has an actionable wake in flight."""
+    loop = _loop()
+    loop.monitor = MonitorState(
+        kind="github_pull_request",
+        target="owner/repo#123",
+        objective="review_ready",
+        created_ts=1_000.0,
+        last_wake_fingerprint="failure-a",
+        wake_in_flight=True,
+    )
+    return loop
+
+
+def _slot(key: str = "chat-1-1785", *, running: bool = False) -> MagicMock:
     slot = MagicMock()
     slot.key = key
     slot.running = running
-    # Real _ChatSlot defaults this False; a bare MagicMock would return a truthy
-    # Mock and trip the busy guard, so model the default explicitly.
-    slot._in_stage_execution = in_stage
     slot.is_closing = False
     slot.mode = ""
     slot.memory_mode = "persistent"
     # Real _ChatSlot defaults this False; a bare MagicMock would return a truthy
-    # Mock and trip the structural-terminal guard, so model the default here as
-    # for running / _in_stage_execution above.
+    # Mock and trip the structural-terminal guard, so model the default here.
     slot._last_turn_structural_terminal = False
     slot._last_turn_structural_terminal_loop_id = ""
     slot._last_turn_structural_terminal_loop_gen = 0
@@ -95,6 +107,14 @@ def _fake_spawn():
 
     _spawn.calls = calls  # type: ignore[attr-defined]
     return _spawn
+
+
+async def _settle(*tasks: asyncio.Task) -> None:
+    """Cancel what still runs, then wait for every task to end under a lost-run bound."""
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+    await await_until(asyncio.gather(*tasks, return_exceptions=True), what="the test's tasks")
 
 
 async def _run_chat_through_monitor_boundary(*_args, **kwargs) -> None:
@@ -489,6 +509,110 @@ class TestDashboardNudgeSlotResolution:
         run_chat.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_monitor_wake_frame_names_the_wake_before_its_row_lands(self) -> None:
+        """The frame that first shows the slot running already says it is a wake.
+
+        The wake's ``nudge`` row is written only once the runner accepts the
+        turn, so every frame pushed before that would otherwise show a running
+        slot whose newest opener is an older row -- and the Crewmates page reads
+        that as a turn the user started. Each frame is the real projection,
+        taken at the push.
+        """
+        orch = _orchestrator()
+        live = _ChatSlot("chat-1-1785")
+        live.append("user", "how is it going?")
+        live.append("assistant", "Round 3 is in review.")
+        orch.dashboard_state.get_slot = MagicMock(return_value=live)
+        # Each push: the frame, and the transcript roles at that moment.
+        frames: list[tuple[dict, list[str]]] = []
+        orch.dashboard_state.push_slots_update = MagicMock(
+            side_effect=lambda: frames.append((live.to_dict(), [m["role"] for m in live.messages]))
+        )
+        setup_entered = asyncio.Event()
+        finish_setup = asyncio.Event()
+
+        async def _run_chat_at_real_boundary(*_args, **kwargs):
+            setup_entered.set()
+            await await_until(finish_setup, what="the test releasing the runner's setup")
+            hook = kwargs["monitor_completion"]
+            if not await hook.authorize():
+                return
+            hook.mark_accepted()
+
+        spawned: list[asyncio.Task] = []
+
+        def _spawn(_state, _slot, coro):
+            task = asyncio.create_task(coro)
+            spawned.append(task)
+            return task
+
+        with (
+            patch.object(gw, "spawn_guarded_turn", _spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=_run_chat_at_real_boundary),
+        ):
+            fire = asyncio.create_task(
+                orch._fire_dashboard_nudge(_structured_loop(), "[Monitor wake]")
+            )
+            try:
+                await await_until(setup_entered, what="the wake's runner setup")
+                assert [m["role"] for m in live.messages] == ["user", "assistant"]
+                assert frames and frames[0][0]["running"] is True
+                assert frames[0][0].get("wake_starting") is True
+                finish_setup.set()
+                result = await await_until(fire, what="the wake's admission")
+                await await_until(spawned[0], what="the wake's turn")
+            finally:
+                finish_setup.set()
+                await _settle(fire, *spawned)
+
+        assert result is gw.MonitorDispatchResult.DISPATCHED
+        assert [m["role"] for m in live.messages] == ["user", "assistant", "nudge"]
+        # Every frame that shows the slot running names the wake: by the flag
+        # until the row is written, by the row after.
+        for payload, roles in frames:
+            assert not payload["running"] or payload.get("wake_starting") or "nudge" in roles
+        assert frames[-1][0]["wake_starting"] is False
+        assert live.to_dict()["wake_starting"] is False
+
+    @pytest.mark.asyncio
+    async def test_refused_monitor_wake_leaves_no_starting_mark(self) -> None:
+        """A wake the runner never accepts writes no row and leaves no mark."""
+        orch = _orchestrator()
+        live = _ChatSlot("chat-1-1785")
+        orch.dashboard_state.get_slot = MagicMock(return_value=live)
+
+        async def _reject_at_capacity(_slot, coro):
+            coro.close()
+            raise TimeoutError("background queue remained full")
+
+        spawned: list[asyncio.Task] = []
+
+        def _spawn(_state, _slot, coro):
+            task = asyncio.create_task(coro)
+            spawned.append(task)
+            return task
+
+        orch.dashboard_state.run_background_turn = _reject_at_capacity
+        with (
+            patch.object(gw, "spawn_guarded_turn", _spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+        ):
+            fire = asyncio.create_task(
+                orch._fire_dashboard_nudge(_structured_loop(), "[Monitor wake]")
+            )
+            try:
+                result = await await_until(fire, what="the refused wake's fire")
+                await await_until(spawned[0], what="the refused wake's turn")
+            finally:
+                await _settle(fire, *spawned)
+
+        assert result is gw.MonitorDispatchResult.BUSY
+        assert live.messages == []
+        payload = live.to_dict()
+        assert payload["running"] is False
+        assert payload.get("wake_starting") is False
+
+    @pytest.mark.asyncio
     async def test_unreachable_session_retires_the_loop_once_with_a_reason(self, caplog) -> None:
         """A genuinely gone session (no history, or deleted) still retires.
 
@@ -505,7 +629,9 @@ class TestDashboardNudgeSlotResolution:
             caplog.at_level(logging.WARNING, logger=gw.logger.name),
         ):
             assert await orch._fire_dashboard_nudge(loop) is False
-        orch.autonudge_svc.remove.assert_awaited_once_with(loop.id)
+        orch.autonudge_svc.remove.assert_awaited_once_with(
+            loop.id, stop_reason="session_unreachable"
+        )
         assert spawn.calls == []
         assert loop.slot_key in caplog.text
         assert "unreachable" in caplog.text
@@ -517,29 +643,6 @@ class TestDashboardNudgeSlotResolution:
         loop = _loop()
         before = loop.cycle_count
         orch.dashboard_state.get_slot = MagicMock(return_value=_slot(running=True))
-        spawn = _fake_spawn()
-        with (
-            patch.object(gw, "spawn_guarded_turn", spawn),
-            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
-        ):
-            assert await orch._fire_dashboard_nudge(loop) is False
-        orch.autonudge_svc.remove.assert_not_awaited()
-        assert spawn.calls == []
-        assert loop.cycle_count == before
-
-    @pytest.mark.asyncio
-    async def test_stage_execution_slot_skips_without_retiring_the_loop(self) -> None:
-        """A multi-stage plan mid-flight defers the cycle; it must not clobber it.
-
-        Between stages the plan sets ``slot.task = None`` (chat_orchestrator), so
-        ``slot.running`` reads False even though the plan is still executing. The
-        nudge must still defer on ``_in_stage_execution`` — firing here would start
-        a concurrent turn that scatters the plan's output.
-        """
-        orch = _orchestrator()
-        loop = _loop()
-        before = loop.cycle_count
-        orch.dashboard_state.get_slot = MagicMock(return_value=_slot(running=False, in_stage=True))
         spawn = _fake_spawn()
         with (
             patch.object(gw, "spawn_guarded_turn", spawn),
@@ -749,6 +852,137 @@ class TestStructuralTerminalGuard:
         assert isinstance(result, gw.MonitorDispatchResult)
 
 
+class TestModelRefusedGuard:
+    """A message loop must STOP once its own cycle is declined by the model.
+
+    A content refusal is deterministic for one model, and the refusal fallback
+    never runs for an unattended cycle, so the next cycle would send the same
+    prompt to the same model and be declined again. The slot names the loop
+    whose cycle was refused; the fire path stops that loop with
+    ``model_refused`` and notifies the owner once instead of firing.
+    """
+
+    @staticmethod
+    def _refused_slot(loop: NudgeLoop, *, gen: int | None = None) -> MagicMock:
+        slot = _slot()
+        slot._last_turn_model_refused_loop_id = loop.id
+        slot._last_turn_model_refused_loop_gen = loop.config_generation if gen is None else gen
+        return slot
+
+    @pytest.mark.asyncio
+    async def test_a_refused_cycle_stops_the_loop_and_notifies_once(self) -> None:
+        orch = _orchestrator()
+        loop = _loop()
+        before = loop.cycle_count
+        stopped = _loop()
+        stopped.active = False
+        stopped.stopped_reason = gw.MODEL_REFUSED_REASON
+        orch.autonudge_svc.update = AsyncMock(return_value=stopped)
+        orch.dashboard_state.get_slot = MagicMock(return_value=self._refused_slot(loop))
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+            patch.object(orch, "_notify_nudge_expired") as notify,
+        ):
+            assert await orch._fire_dashboard_nudge(loop) is False
+        orch.autonudge_svc.update.assert_awaited_once_with(
+            loop.id,
+            active=False,
+            stopped_reason=gw.MODEL_REFUSED_REASON,
+            expected_generation=loop.config_generation,
+        )
+        notify.assert_called_once_with(stopped)
+        orch.autonudge_svc.remove.assert_not_awaited()
+        assert spawn.calls == [], "a refused prompt was fired into the same model again"
+        assert loop.cycle_count == before
+
+    @pytest.mark.asyncio
+    async def test_a_kept_manual_pause_is_not_announced_as_a_refusal(self) -> None:
+        """A pause the user landed first keeps its reason, so no refusal notice."""
+        orch = _orchestrator()
+        loop = _loop()
+        paused = _loop()
+        paused.active = False
+        paused.stopped_reason = "manual"
+        orch.autonudge_svc.update = AsyncMock(return_value=paused)
+        orch.dashboard_state.get_slot = MagicMock(return_value=self._refused_slot(loop))
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+            patch.object(orch, "_notify_nudge_expired") as notify,
+        ):
+            assert await orch._fire_dashboard_nudge(loop) is False
+        notify.assert_not_called()
+        assert spawn.calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_naming_another_loop_does_not_stop_this_one(self) -> None:
+        orch = _orchestrator()
+        orch.autonudge_svc.update = AsyncMock()
+        slot = _slot()
+        slot._last_turn_model_refused_loop_id = "old-loop"
+        slot._last_turn_model_refused_loop_gen = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+        ):
+            assert await orch._fire_dashboard_nudge(_loop()) is True
+        orch.autonudge_svc.update.assert_not_awaited()
+        assert spawn.calls == [slot]
+
+    @pytest.mark.asyncio
+    async def test_a_revised_instruction_is_not_stopped_by_a_stale_refusal(self) -> None:
+        orch = _orchestrator()
+        loop = _loop()
+        loop.config_generation = 3
+        # The fence refuses the stale verdict and returns the loop still active.
+        orch.autonudge_svc.update = AsyncMock(return_value=loop)
+        slot = self._refused_slot(loop, gen=1)
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+            patch.object(orch, "_notify_nudge_expired") as notify,
+        ):
+            assert await orch._fire_dashboard_nudge(loop) is True
+        orch.autonudge_svc.update.assert_awaited_once_with(
+            loop.id,
+            active=False,
+            stopped_reason=gw.MODEL_REFUSED_REASON,
+            expected_generation=1,
+        )
+        notify.assert_not_called()
+        assert spawn.calls == [slot]
+
+    def test_the_stop_is_system_imposed_and_re_armable(self) -> None:
+        """Kept over nothing the user did, and displaceable by a later arm."""
+        from kiro_crew.autonudge_service import model
+
+        assert gw.MODEL_REFUSED_REASON in model._KEPT_STOP_REASONS
+        assert gw.MODEL_REFUSED_REASON in model._REPLACEABLE_LOOP_STOP_REASONS
+
+    @pytest.mark.asyncio
+    async def test_a_slot_with_no_refusal_fires_normally(self) -> None:
+        """A bare mock slot's auto-attribute is not a loop id."""
+        orch = _orchestrator()
+        orch.autonudge_svc.update = AsyncMock()
+        slot = _slot()
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        spawn = _fake_spawn()
+        with (
+            patch.object(gw, "spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat._run_chat", new=AsyncMock()),
+        ):
+            assert await orch._fire_dashboard_nudge(_loop()) is True
+        orch.autonudge_svc.update.assert_not_awaited()
+        assert spawn.calls == [slot]
+
+
 class TestChannelStructuralTerminalHelper:
     """The channel-adapter counterpart: a channel loop runs its turn inline and
     holds the exception, so it stops the loop directly off the exception's
@@ -838,3 +1072,91 @@ class TestChannelStructuralTerminalHelper:
             stopped_reason=gw.STRUCTURAL_TERMINAL_REASON,
             expected_generation=1,
         )
+
+
+class TestFireScopesTheTurnToTheConfigGeneration:
+    """The fire path must hand ``_run_chat`` the loop's live ``config_generation``
+    for BOTH fire shapes, so the failed-cycle charge and the structural-terminal
+    verdict scope to the generation the turn actually fired under.
+
+    The gap this pins: the ``wake_message`` arm captured its own
+    ``_fired_generation = loop.config_generation`` beside the plain-nudge arm,
+    but nothing asserted the captured value reached the runner. Reverting that
+    arm to a literal ``0`` (``_directive_loop_gen = _fired_generation if ... else
+    0``) left every other test green -- a stale completion of a since-revised
+    loop fired this way would then match a generation no revised loop holds and
+    wrongly stop it. These two assert the real generation travels on each shape.
+    """
+
+    @staticmethod
+    def _running_spawn(spawned: list[asyncio.Task]):
+        """A ``spawn_guarded_turn`` stand-in that RUNS the dispatch coroutine (so
+        the real ``_run_chat`` call is reached), unlike ``_fake_spawn`` which
+        closes it. Mirrors the structured-monitor test's ``_spawn``."""
+
+        def _spawn(_state, _slot, coro, **_kw):
+            task = asyncio.create_task(coro)
+            spawned.append(task)
+            return task
+
+        return _spawn
+
+    @pytest.mark.asyncio
+    async def test_a_wake_message_fire_passes_the_live_config_generation(self) -> None:
+        orch = _orchestrator()
+        live = _slot()
+        orch.dashboard_state.get_slot = MagicMock(return_value=live)
+        # The wake_message shape is the structured-monitor wake (the arm whose
+        # generation capture was unpinned); build it exactly as the passing
+        # structured-monitor test does.
+        loop = _loop()
+        loop.config_generation = 9  # distinctive, non-zero, != the default 0
+        loop.monitor = MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            last_wake_fingerprint="failure-a",
+            wake_in_flight=True,
+        )
+        orch.autonudge_svc.monitor_dispatch_is_authorized.return_value = True
+        spawned: list[asyncio.Task] = []
+        run_chat = AsyncMock(side_effect=_run_chat_through_monitor_boundary)
+        with (
+            patch.object(gw, "spawn_guarded_turn", self._running_spawn(spawned)),
+            patch("kiro_crew.dashboard.chat._run_chat", new=run_chat),
+        ):
+            assert isinstance(
+                await orch._fire_dashboard_nudge(loop, "[Monitor wake]"),
+                gw.MonitorDispatchResult,
+            )
+            await asyncio.gather(*spawned)
+        run_chat.assert_awaited()
+        kwargs = run_chat.await_args.kwargs
+        assert kwargs["_directive_loop_id"] == loop.id
+        assert kwargs["_directive_loop_gen"] == 9, (
+            "the wake_message fire must pass loop.config_generation, not a literal "
+            "0 -- a stale completion would otherwise match a generation no revised "
+            "loop ever holds"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_plain_nudge_fire_passes_the_live_config_generation(self) -> None:
+        orch = _orchestrator()
+        live = _slot()
+        orch.dashboard_state.get_slot = MagicMock(return_value=live)
+        loop = _loop()
+        loop.config_generation = 4
+        spawned: list[asyncio.Task] = []
+        run_chat = AsyncMock()
+        with (
+            patch.object(gw, "spawn_guarded_turn", self._running_spawn(spawned)),
+            patch("kiro_crew.dashboard.chat._run_chat", new=run_chat),
+        ):
+            # The plain-nudge shape (wake_message is None).
+            assert await orch._fire_dashboard_nudge(loop) is True
+            await asyncio.gather(*spawned)
+        run_chat.assert_awaited()
+        kwargs = run_chat.await_args.kwargs
+        assert kwargs["_directive_loop_id"] == loop.id
+        assert kwargs["_directive_loop_gen"] == 4

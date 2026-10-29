@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import zipfile
 from contextlib import closing
@@ -12,7 +13,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from member_memory_helpers import MEMBERS, forget_declared_stores, write_member_home
+from member_memory_helpers import (
+    MEMBERS,
+    forget_declared_stores,
+    member_manifest,
+    write_member_home,
+)
 
 from kiro_crew import member_memory_backup as member_backup
 from kiro_crew import memory_backup, memory_stores
@@ -479,6 +485,19 @@ def test_private_zip_retention_is_per_store(env):
     assert memory_backup.list_backups(env.paths["bob"]) == [bob]
 
 
+def test_prune_leaves_member_backup_stages_alone(env):
+    """The V1 stale-stage sweep does not reach a member store's ZIP stages."""
+    path = env.paths["alice"]
+    memory_backup.backup_store(path, now=datetime(2026, 9, 7, tzinfo=timezone.utc))
+    out = memory_backup.backup_dir_for(path)
+    stage = out / f".memory.20260101T000000000000Z-{'a' * 32}.zip.{'b' * 32}.partial"
+    stage.write_bytes(b"x")
+    old = datetime.now(timezone.utc).timestamp() - memory_backup.STALE_STAGE_SECONDS - 60
+    os.utime(stage, (old, old))
+    memory_backup.prune_backups(path)
+    assert stage.exists()
+
+
 def test_pending_status_cancel_and_retry_preserve_live_memory_and_backup(env):
     path = env.paths["alice"]
     backup = memory_backup.backup_store(path)
@@ -650,3 +669,30 @@ def test_pending_activation_holds_namespace_while_publishing(env, monkeypatch, w
     activate(path)
     assert observed and all(held is not without_namespace for held in observed)
     assert not member_backup.pending_restore_status(path)["pending"]
+
+
+def _declare_member_without_creating_it(tmp_path, monkeypatch) -> Path:
+    """Declare ``member-alice`` in config only, leaving nothing on disk. Return its db path."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    config = {
+        "memory_stores": {"default": {}, "member-alice": member_manifest("alice")},
+        "agents": {"alice": {"memory_store": "member-alice", "member_id": "alice"}},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    forget_declared_stores(monkeypatch)
+    return tmp_path / "memory_stores" / "member-alice" / "memory.db"
+
+
+def test_member_store_declared_but_never_created_is_nothing_to_copy(tmp_path, monkeypatch):
+    database = _declare_member_without_creating_it(tmp_path, monkeypatch)
+    assert not database.parent.exists()
+
+    assert memory_backup.backup_store(database) is None
+
+
+def test_member_store_directory_without_a_database_is_still_a_backup_failure(tmp_path, monkeypatch):
+    database = _declare_member_without_creating_it(tmp_path, monkeypatch)
+    database.parent.mkdir(parents=True)
+
+    with pytest.raises(memory_backup.MemoryBackupFailed):
+        memory_backup.backup_store(database)

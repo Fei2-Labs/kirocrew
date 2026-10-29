@@ -105,7 +105,7 @@ def _make_request(
         """Mock delete_session returning canned values per key.
 
         The skip_pinned invariant (pinned/unreadable/raising -> None) is
-        already tested by 4 real-lock tests in test_history.py. Here we
+        already tested by 4 real-lock tests in test_history_retention.py. Here we
         just return canned values so api_sessions_clear's counting is
         exercised.
         """
@@ -130,6 +130,7 @@ def _make_request(
     state.crons = None
 
     request = MagicMock(spec=web.Request)
+    request.get = {}.get  # the dashboard user: no app claim
     request.app = {"state": state}
     return request, state, deleted_keys
 
@@ -233,6 +234,7 @@ async def test_returns_400_when_no_conversation_log() -> None:
     state = MagicMock()
     state.conversation_log = None
     request = MagicMock(spec=web.Request)
+    request.get = {}.get  # the dashboard user: no app claim
     request.app = {"state": state}
 
     resp = await api_sessions_clear(request)
@@ -270,7 +272,7 @@ async def test_none_metadata_does_not_crash() -> None:
 
     assert status == 200
     assert body == {
-        "ok": True,
+        "ok": False,
         "cleared": 1,
         "skipped": 0,
         "failed": 0,
@@ -335,7 +337,7 @@ async def test_skips_session_when_metadata_raises() -> None:
 
     assert status == 200
     assert body == {
-        "ok": True,
+        "ok": False,
         "cleared": 1,
         "skipped": 0,
         "failed": 0,
@@ -510,7 +512,7 @@ async def test_skips_session_with_transient_unreadable_metadata() -> None:
     assert k_pinned not in deleted, "Pinned session with unreadable metadata was deleted!"
     assert deleted == [k_normal]
     assert body == {
-        "ok": True,
+        "ok": False,
         "cleared": 1,
         "skipped": 0,
         "failed": 0,

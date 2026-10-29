@@ -15,8 +15,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from kiro_crew.acp import backends
-from kiro_crew.acp.backends import CAP_MID_TURN_STEER, CAP_SESSION_SHARING, Dialect
+from kiro_crew.acp.backends import CAP_SESSION_SHARING, Dialect
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.client_turn_control import _CLIENT_STEERING_REQUEST_METHODS
 from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeError
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -29,6 +30,8 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
+    ACP_BACKENDS_STEERING_REQUEST,
     METHOD_SESSION_STEER,
 )
 
@@ -79,19 +82,41 @@ def test_both_adapters_are_spec_dialect(tmp_path: Any) -> None:
 
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 def test_supports_steer_is_declared_not_inferred(backend: str, tmp_path: Any) -> None:
+    """Steer support answers from declared membership, never ``not _is_claude``.
+
+    The declared sets are ``ACP_BACKENDS_STEER`` (kiro's ``_session/steer``),
+    ``ACP_BACKENDS_STEER_CONCURRENT_PROMPT`` (a second ``session/prompt``), and
+    the ``ACP_BACKENDS_STEERING_REQUEST`` members this client speaks a request
+    for (``_CLIENT_STEERING_REQUEST_METHODS``). The other steering-request
+    members read False until the handshake advertises their capability, which a
+    fresh client has not seen — negotiated, but still not inferred.
+    """
     client = _client(backend, tmp_path)
-    assert client.supports_steer is backends.supports(backend, CAP_MID_TURN_STEER)
+    expected = (
+        backend in ACP_BACKENDS_STEER
+        or backend in ACP_BACKENDS_STEER_CONCURRENT_PROMPT
+        or (
+            backend in ACP_BACKENDS_STEERING_REQUEST
+            and backend in _CLIENT_STEERING_REQUEST_METHODS
+        )
+    )
+    assert client.supports_steer is expected
 
 
 def test_kas_steer_is_verified(tmp_path: Any) -> None:
-    """KAS shares kiro-cli's ``_session/steer``; spec adapters do not."""
+    """KAS shares kiro-cli's ``_session/steer``; spec adapters steer by other means."""
     assert _client(ACP_BACKEND_KIRO, tmp_path).supports_steer
     assert _client(ACP_BACKEND_KAS, tmp_path).supports_steer
     assert ACP_BACKEND_KAS in ACP_BACKENDS_STEER
+    # ``ACP_BACKENDS_STEER`` stays kiro-only: the adapters steer through other
+    # wire shapes instead — goose speaks its own steering request and opencode a
+    # second ``session/prompt`` — while claude, codex and pi's ``_session/steering``
+    # read False before the handshake advertises it.
     assert not _client(ACP_BACKEND_CLAUDE, tmp_path).supports_steer
-    assert not _client(ACP_BACKEND_GOOSE, tmp_path).supports_steer
-    assert not _client(ACP_BACKEND_OPENCODE, tmp_path).supports_steer
+    assert not _client(ACP_BACKEND_CODEX, tmp_path).supports_steer
     assert not _client(ACP_BACKEND_PI, tmp_path).supports_steer
+    assert _client(ACP_BACKEND_GOOSE, tmp_path).supports_steer
+    assert _client(ACP_BACKEND_OPENCODE, tmp_path).supports_steer
     for backend in (
         ACP_BACKEND_CLAUDE,
         ACP_BACKEND_CODEX,

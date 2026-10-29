@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 
 from kiro_crew.acp import session_handle
 from kiro_crew.acp.mcp_session_report import (
@@ -70,10 +71,14 @@ class TestBuckets:
         assert r.payload() == {
             "configured": [],
             "unresolved_refs": [],
+            "no_tools": [],
+            "no_tools_omitted": 0,
+            "pruned_omitted": 0,
             "ready": ["github-mcp"],
             "failed": [],
             "awaiting_auth": [],
             "failures": {},
+            "restart_to_load": [],
         }
 
     def test_failure_records_its_reason(self):
@@ -101,10 +106,14 @@ class TestBuckets:
         assert r.payload() == {
             "configured": [],
             "unresolved_refs": [],
+            "no_tools": [],
+            "no_tools_omitted": 0,
+            "pruned_omitted": 0,
             "ready": ["builder-mcp"],
             "failed": [],
             "awaiting_auth": [],
             "failures": {},
+            "restart_to_load": [],
         }
 
     def test_initialized_then_failure_moves_to_failed(self):
@@ -405,7 +414,11 @@ class TestEventOwnershipReachesTheReport:
     """
 
     def test_every_mcp_event_passes_the_frames_ownership_through(self):
-        src = inspect.getsource(session_handle)
+        # The facade and every owner its code moved to, as one text.
+        src = "\n".join(
+            inspect.getsource(sys.modules[name])
+            for name in (session_handle.__name__, *session_handle._SESSION_HANDLE_OWNERS)
+        )
         for kind in (
             "EVENT_MCP_OAUTH_REQUEST",
             "EVENT_MCP_SERVER_INITIALIZED",
@@ -413,22 +426,44 @@ class TestEventOwnershipReachesTheReport:
         ):
             marker = f"kind={kind},"
             assert marker in src, f"{kind} is no longer yielded — re-point this guard"
-            window = src[src.index(marker) : src.index(marker) + 400]
-            assert "runtime_global=not self._owns_mcp_frame(msg)" in window, (
-                f"{kind} is yielded without the frame's ownership provenance, so a "
-                "consumer gating on runtime_global would silently never fire"
-            )
-            assert "runtime_global=msg.fanout_no_owner" not in window, (
-                f"{kind} is back to deriving ownership from the runtime's fan-out "
-                "counter, which is only set once MORE THAN ONE queue is registered "
-                "— a lone session is handed a co-tenant's sessionless frame unmarked "
-                "and publishes that server as its own"
-            )
+            start = src.find(marker)
+            while start != -1:
+                window = src[start : start + 400]
+                # A sign-in completion is session-owned by construction: the
+                # sign-in tracker records only frames this session owns, so its
+                # yield states False instead of re-reading an unrelated frame.
+                before = src[max(0, start - 600) : start]
+                owned_completion = (
+                    "self._mcp_sign_in_completed.pop()" in before
+                    and "runtime_global=False" in window
+                )
+                assert (
+                    "runtime_global=not self._owns_mcp_frame(msg)" in window or owned_completion
+                ), (
+                    f"{kind} is yielded without the frame's ownership provenance, so a "
+                    "consumer gating on runtime_global would silently never fire"
+                )
+                assert "runtime_global=msg.fanout_no_owner" not in window, (
+                    f"{kind} is back to deriving ownership from the runtime's fan-out "
+                    "counter, which is only set once MORE THAN ONE queue is registered "
+                    "— a lone session is handed a co-tenant's sessionless frame unmarked "
+                    "and publishes that server as its own"
+                )
+                start = src.find(marker, start + 1)
 
     def test_every_runner_call_site_forwards_it_to_the_report(self):
+        from pathlib import Path
+
         from kiro_crew.dashboard import chat_runner
 
-        src = inspect.getsource(chat_runner)
+        src = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
         calls = src.count("_record_session_mcp_event(\n") - src.count(
             "def _record_session_mcp_event(\n"
         )
@@ -716,3 +751,33 @@ class TestKasStatusReport:
         report.include_configured(("kirocrew-core", "external"))
         assert report.payload()["configured"] == ["external", "kirocrew-core"]
         assert report.payload()["unresolved_refs"] == ["@missing/tool"]
+
+
+class TestRestartToLoad:
+    def test_a_credential_failure_names_the_server_to_restart_for(self):
+        r = McpSessionReport()
+        r.record_frame(_failed("aws-mcp", "No AWS credentials available"), owned=True)
+        r.record_frame(_failed("slack-mcp", "spawn ENOENT"), owned=True)
+        payload = r.payload()
+        assert payload is not None
+        assert payload["restart_to_load"] == ["aws-mcp"]
+        summary = r.problem_summary(include_reasons=False)
+        assert "once the credential works, start a new session to load it): aws-mcp" in summary
+        assert "No AWS credentials" not in summary
+
+    def test_the_hint_clears_once_the_server_connects(self):
+        r = McpSessionReport()
+        r.record_frame(_failed("aws-mcp", "No AWS credentials available"), owned=True)
+        r.record_frame(_ready("aws-mcp"), owned=True)
+        payload = r.payload()
+        assert payload is not None
+        assert payload["restart_to_load"] == []
+        assert "new session" not in r.problem_summary()
+
+    def test_a_server_still_re_attempted_is_not_named_until_its_budget_is_spent(self):
+        r = McpSessionReport()
+        r.record_frame(_failed("aws-mcp", "No AWS credentials available"), owned=True)
+        r.set_reattempting({"aws-mcp"})
+        assert r.restart_to_load() == []
+        r.set_reattempting(set())
+        assert r.restart_to_load() == ["aws-mcp"]

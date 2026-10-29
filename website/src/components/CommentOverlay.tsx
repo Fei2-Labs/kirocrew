@@ -1,9 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { MessageSquare, MessageSquarePlus, X, Pencil, Check, Send, Copy } from 'lucide-react'
+import { MessageSquare, MessageSquarePlus, X, Pencil, Check, Send } from 'lucide-react'
 import { SendBtn } from './ui'
-import ErrorNotice from './ErrorNotice'
 import { offlineProps } from '../utils/offline'
-import { copyToClipboard } from '../utils/clipboard'
 import { useImeGuard } from '../hooks/useImeGuard'
 
 import { i18nT } from '../i18n/t'
@@ -19,166 +17,16 @@ export interface InlineComment {
   column?: number
   /** Character offset of the anchor in the rendered text (textContent space). Used to disambiguate repeated occurrences of the same anchor text. */
   startOffset?: number
-}
-
-/** How long the copy button shows its checkmark before reverting to the glyph. */
-const COPIED_FEEDBACK_MS = 1500
-
-/**
- * Popover that appears when user selects text and clicks "Comment".
- *
- * `copyText` is the selection the popover was opened for. The artifact pages
- * open this box straight off mouseup, and focusing its textarea collapses the
- * document selection — so by the time the user reaches for ⌘/Ctrl+C there is
- * nothing selected and the shortcut copies nothing. The host therefore hands
- * over the text it captured BEFORE focus moved, and the popover offers it two
- * ways: a Copy button in its header, and the copy shortcut while the input is
- * still empty (once a draft exists, the shortcut is the textarea's own).
- */
-function CommentPopover({ x, y, onSubmit, onCancel, containerRef, scrollRef, copyText }: {
-  x: number; y: number; onSubmit: (text: string) => void; onCancel: () => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>
-  /** The selected text this comment annotates, offered for copying. Omit to hide the Copy button. */
-  copyText?: string
-}) {
-  const [text, setText] = useState('')
-  const [copied, setCopied] = useState(false)
-  const [copyFailed, setCopyFailed] = useState(false)
-  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
-  const popoverRef = useRef<HTMLDivElement>(null)
-  const ime = useImeGuard()
-  const onCancelRef = useRef(onCancel)
-  useEffect(() => { onCancelRef.current = onCancel }, [onCancel])
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => inputRef.current?.focus())
-    return () => cancelAnimationFrame(frame)
-  }, [])
-  // The "copied" reset timer must not outlive the popover: a late setState
-  // after unmount is a React warning at best and a post-teardown throw in jsdom.
-  useEffect(() => () => { if (copyTimerRef.current) clearTimeout(copyTimerRef.current) }, [])
-  // Dismiss on scroll — coordinates are stale after scrolling
-  useEffect(() => {
-    const target = scrollRef?.current ?? containerRef?.current ?? window
-    const handler = () => onCancelRef.current()
-    target.addEventListener('scroll', handler, { passive: true })
-    return () => target.removeEventListener('scroll', handler)
-  }, [scrollRef, containerRef])
-  // Dismiss on click outside
-  useEffect(() => {
-    const handler = (e: MouseEvent) => {
-      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
-        onCancelRef.current()
-      }
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-  const autoGrow = useCallback((el: HTMLTextAreaElement) => { el.style.height = 'auto'; const maxH = 160; el.style.height = Math.min(el.scrollHeight, maxH) + 'px'; el.style.overflowY = el.scrollHeight > maxH ? 'auto' : 'hidden' }, [])
-
-  // The checkmark is gated on the clipboard ACTUALLY taking the text (see
-  // `copyToClipboard`); a refusal is reported in place instead of flashed as
-  // success.
-  const copySelection = useCallback(async () => {
-    if (!copyText) return
-    const ok = await copyToClipboard(copyText)
-    if (!ok) { setCopyFailed(true); return }
-    setCopyFailed(false)
-    setCopied(true)
-    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
-    copyTimerRef.current = setTimeout(() => setCopied(false), COPIED_FEEDBACK_MS)
-  }, [copyText])
-
-  // When containerRef is provided, position absolute relative to that container
-  const container = containerRef?.current
-  const rect = container?.getBoundingClientRect()
-  const useAbsolute = !!(container && rect)
-  const posX = useAbsolute ? x - rect.left + container.scrollLeft : x
-  const posY = useAbsolute ? y - rect.top + container.scrollTop : y
-  const maxW = useAbsolute ? rect.width : window.innerWidth
-  // Flip check uses viewport-relative position (y - rect.top) so it works regardless of scroll
-  const viewportY = useAbsolute ? y - rect!.top : y
-  const viewportH = useAbsolute ? rect!.height : window.innerHeight
-  const flipped = viewportY + 8 + 200 > viewportH
-
-  const copyLabel = i18nT('components.selectionToolbar.copy')
-  const copyHint = i18nT('components.selectionToolbar.copy_selection_hint')
-
-  return (
-    <div
-      ref={popoverRef}
-      className={`${useAbsolute ? 'absolute' : 'fixed'} z-50 bg-card border border-border rounded-lg shadow-lg p-3 animate-scale-in`}
-      style={{ left: Math.min(posX, maxW - 320), top: flipped ? Math.max(0, posY - 60) : posY + 8, width: 300 }}
-    >
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-semibold text-text">{i18nT('components.commentOverlay.add_comment')}</span>
-        <div className="flex items-center gap-0.5">
-          {copyText && (
-            <button
-              type="button"
-              aria-label={copyLabel}
-              // The hint says WHAT is copied: next to a comment input, a bare
-              // copy glyph reads as "copy the comment".
-              title={copyHint}
-              // Keep focus (and the caret) in the textarea across the click.
-              onMouseDown={e => e.preventDefault()}
-              className="p-0.5 rounded text-muted hover:text-text cursor-pointer bg-transparent border-none transition-colors"
-              onClick={() => { void copySelection() }}
-            >{copied ? <Check size={14} className="text-ok" /> : <Copy size={14} />}</button>
-          )}
-          <button
-            aria-label={i18nT('components.commentOverlay.close')}
-            className="p-0.5 rounded text-muted hover:text-text cursor-pointer bg-transparent border-none transition-colors"
-            onClick={onCancel}
-          ><X size={14} /></button>
-        </div>
-      </div>
-      <div className="relative">
-        <textarea
-          ref={inputRef}
-          aria-label={i18nT('components.commentOverlay.add_a_comment')}
-          placeholder={i18nT('components.commentOverlay.write_a_comment')}
-          value={text}
-          rows={1}
-          onChange={e => { setText(e.target.value); autoGrow(e.target) }}
-          {...ime.bindComposition()}
-          onKeyDown={e => {
-            if (e.key === 'Enter' && !e.shiftKey && text.trim()) { if (ime.claimEnter(e)) { e.stopPropagation(); onSubmit(text.trim()) } }
-            if (e.key === 'Escape') { ime.reset(); e.preventDefault(); e.stopPropagation(); onCancel() }
-            // Only an EMPTY input hands Copy to the selection the box was opened
-            // for; once a draft exists the shortcut is the textarea's own.
-            if (copyText && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'c' && text.length === 0) {
-              e.preventDefault()
-              void copySelection()
-            }
-          }}
-          className="bg-bg-elevated border border-border rounded-md pl-3 pr-8 py-2 text-text text-sm font-body outline-hidden w-full transition-colors focus-ring resize-none leading-[21px] overflow-hidden"
-        />
-        <button
-          aria-label={i18nT('components.commentOverlay.add_comment')}
-          disabled={!text.trim()}
-          className="absolute right-2 top-2 p-0.5 rounded text-muted hover:text-accent cursor-pointer bg-transparent border-none transition-colors disabled:opacity-30 disabled:cursor-default"
-          onClick={() => text.trim() && onSubmit(text.trim())}
-        ><MessageSquarePlus size={14} /></button>
-      </div>
-      {/* No hand-off: the comment draft in this box's textarea is unsaved, and
-          the agent hand-off navigates away, which would discard it. A refused
-          clipboard write is recoverable in place (close the box, select and
-          copy again). */}
-      {copyFailed && (
-        <ErrorNotice
-          variant="inline"
-          className="mt-2"
-          message={i18nT('components.selectionToolbar.copy_failed')}
-          onDismiss={() => setCopyFailed(false)}
-        />
-      )}
-    </div>
-  )
+  /** The anchor was selected inside a code block, whose text is not in that space: no offset exists and the first match elsewhere would be the wrong passage. */
+  inCode?: boolean
+  /** For an `inCode` anchor: its block, source line and column, packed by `codePassagePosition`. Absent when it could not be packed. */
+  codePosition?: number
 }
 
 /** Single comment row with inline edit support. */
-function CommentRow({ comment, onEdit, onRemove }: {
+function CommentRow({ comment, onEdit, onRemove, onEditingChange }: {
   comment: InlineComment; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void
+  onEditingChange?: (id: string, editing: boolean) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(comment.text)
@@ -199,6 +47,13 @@ function CommentRow({ comment, onEdit, onRemove }: {
   const preventBlur = useCallback((e: React.MouseEvent) => e.preventDefault(), [])
 
   useEffect(() => { if (editing) { committedRef.current = false; inputRef.current?.focus() } }, [editing])
+  // Let the owner know a row holds typed text that is not saved yet, so a
+  // late send delivery does not remove the row out from under the edit.
+  useEffect(() => {
+    if (!editing || !onEditingChange) return
+    onEditingChange(comment.id, true)
+    return () => onEditingChange(comment.id, false)
+  }, [editing, comment.id, onEditingChange])
 
   return (
     <div data-comment-id={comment.id} className="flex items-start gap-2 text-[13px] bg-bg-elevated rounded-md px-2.5 py-1.5">
@@ -234,14 +89,16 @@ function CommentRow({ comment, onEdit, onRemove }: {
 }
 
 /** Pending comments list with batch submit.
- *  When `enableExtraPrompt` is set, an "Add instruction" toggle appears in the
+ *  When `enableExtraPrompt` is set, an "Add overall instruction" toggle appears in the
  *  header. The optional free-form textarea is hidden by default and only
  *  revealed when the user clicks that toggle, so the default view stays a
  *  single (comment) input box rather than two competing inputs. Its value is
  *  passed to `onSubmitAll` alongside the comments only when it was opened, and
  *  it collapses again after submit. */
-function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPrompt, connected = true }: {
+function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPrompt, connected = true, onEditingChange }: {
   comments: InlineComment[]; onEdit: (id: string, text: string) => void; onRemove: (id: string) => void; onSubmitAll: (extraPrompt?: string) => void; enableExtraPrompt?: boolean
+  /** Told when a row opens or closes an inline edit (typed, not yet saved). */
+  onEditingChange?: (id: string, editing: boolean) => void
   /** Gateway connection flag — mirrors ChatInput's Send gating so a batch
    *  submit can't fire (and clear pending comments) while the send path would
    *  silently refuse it. Defaults true for non-chat embeddings. */
@@ -262,6 +119,7 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
             <button
               type="button"
               aria-label={i18nT('components.commentOverlay.toggle_additional_prompt')}
+              title={i18nT('components.commentOverlay.overall_instruction_hint')}
               aria-pressed={showExtraPrompt}
               onClick={() => setShowExtraPrompt(v => !v)}
               className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-medium border cursor-pointer transition-all ${showExtraPrompt ? 'border-accent text-accent bg-accent-subtle' : 'border-border text-muted hover:text-text hover:border-border-strong'}`}
@@ -271,7 +129,7 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
         <SendBtn disabled={!connected} {...offlineProps(connected, i18nT('utils.offline.submit_comments'), i18nT('components.commentOverlay.submit_all'))} onClick={() => { onSubmitAll(enableExtraPrompt && showExtraPrompt ? extraPrompt : undefined); setExtraPrompt(''); setShowExtraPrompt(false) }}>{i18nT('components.commentOverlay.submit_all')} <Send className="lucide-inline" /></SendBtn>
       </div>
       <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
-        {comments.map(c => <CommentRow key={c.id} comment={c} onEdit={onEdit} onRemove={onRemove} />)}
+        {comments.map(c => <CommentRow key={c.id} comment={c} onEdit={onEdit} onRemove={onRemove} onEditingChange={onEditingChange} />)}
       </div>
       {enableExtraPrompt && showExtraPrompt && (
         <textarea
@@ -286,6 +144,25 @@ function CommentList({ comments, onEdit, onRemove, onSubmitAll, enableExtraPromp
       )}
     </div>
   )
+}
+
+const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff
+const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff
+
+/** `s.slice(start, end)` with both edges moved off a surrogate pair. A plain
+ *  UTF-16 slice through an astral character (an emoji) leaves a lone
+ *  surrogate in the text sent to the agent, which is not valid Unicode and
+ *  wedges the turn. Edges only ever move inward. */
+export function sliceCodePoints(s: string, start: number, end: number = s.length): string {
+  const from = snapOffPair(s, Math.max(0, start), 1)
+  const to = snapOffPair(s, Math.min(s.length, end), -1)
+  return from < to ? s.slice(from, to) : ''
+}
+
+/** Move UTF-16 index `i` off the middle of a surrogate pair: `dir` is +1 for
+ *  a start edge, -1 for an end edge, so the edge always moves inward. */
+function snapOffPair(s: string, i: number, dir: 1 | -1): number {
+  return i > 0 && i < s.length && isHighSurrogate(s.charCodeAt(i - 1)) && isLowSurrogate(s.charCodeAt(i)) ? i + dir : i
 }
 
 /** Format comments into a structured message for the agent.
@@ -322,13 +199,13 @@ export function formatCommentsMessage(filePath: string, comments: InlineComment[
   }
   lines.push('')
   comments.forEach((c, i) => {
-    const anchor = c.anchor.length > 80 ? c.anchor.slice(0, 80) + '…' : c.anchor
+    const anchor = c.anchor.length > 80 ? sliceCodePoints(c.anchor, 0, 80) + '…' : c.anchor
     const loc = c.line != null ? (c.column != null ? `line ${c.line}, col ${c.column}, ` : `line ${c.line}, `) : ''
     let ctx = ''
     if (srcLines && c.line != null && c.column != null && c.line >= 1 && c.line <= srcLines.length) {
       const src = srcLines[c.line - 1]
-      const start = Math.max(0, c.column - 1 - 20)
-      const end = Math.min(src.length, c.column - 1 + c.anchor.length + 20)
+      const start = snapOffPair(src, Math.max(0, c.column - 1 - 20), 1)
+      const end = snapOffPair(src, Math.min(src.length, c.column - 1 + c.anchor.length + 20), -1)
       const before = start > 0 ? '…' : ''
       const after = end < src.length ? '…' : ''
       ctx = ` in "${before}${esc(src.slice(start, end))}${after}"`
@@ -388,7 +265,7 @@ export function formatArtifactCommentsMessage(
   lines.push('')
   human.forEach((c, i) => {
     const quote = c.anchor?.quote ?? ''
-    const trimmed = quote.length > 80 ? quote.slice(0, 80) + '…' : quote
+    const trimmed = quote.length > 80 ? sliceCodePoints(quote, 0, 80) + '…' : quote
     const anchorPart = trimmed ? `"${esc(trimmed)}": ` : ''
     lines.push(`${i + 1}. ${anchorPart}"${esc(c.body)}"`)
   })
@@ -396,5 +273,5 @@ export function formatArtifactCommentsMessage(
   return lines.join('\n')
 }
 
-export { CommentPopover, CommentList }
+export { CommentList }
 export type { InlineComment as Comment }

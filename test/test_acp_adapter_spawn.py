@@ -192,24 +192,47 @@ class TestSpawnResolvesEachBackendsOwnArgv:
         via ``_script_runtime_is_supported`` (``client.py``, ``_MIN_ADAPTER_NODE_MAJOR``).
         So codex is asserted where it now lives, and the arms that DO run on this
         client keep being pinned by name here.
+
+        THE ARMS MOVED at the 2026-10-23 sync: upstream resolves every
+        client-served host through its own ``ProcessAdapter`` in
+        ``acp/harness/<host>.py``, looked up by ``process_adapter_for`` and
+        refused when no adapter claims the id -- the same no-fall-through
+        property this pin exists for, one level of indirection later. So the
+        positive-branch assertion is read off the adapter table: every host the
+        client spawns must resolve a non-None adapter, never inherit the kiro
+        arm by absence.
         """
         import inspect
 
         from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.harness import process_adapter_for
         from kiro_crew.acp.harness.codex import CodexHarness
+        from kiro_crew.acp.types import (
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_COPILOT,
+            ACP_BACKEND_DEEPSEEK,
+        )
 
         source = inspect.getsource(AcpClient._spawn)
-        # The client-served arms. Each must be its own POSITIVE branch: a backend
-        # absent from the chain is not refused, it falls to the registry arm.
-        assert "_is_claude" in source
-        assert "_is_opencode" in source
-        assert "_is_copilot" in source
-        assert "_is_goose" in source
-        assert "_is_pi" in source
-        assert "_is_deepseek" in source
+        # The dispatch is the registry lookup plus an explicit kiro arm --
+        # NOT a bare ``else:`` that serves kiro-cli by absence.
+        assert "process_adapter_for" in source
+        for backend in (
+            ACP_BACKEND_CLAUDE,
+            ACP_BACKEND_OPENCODE,
+            ACP_BACKEND_COPILOT,
+            ACP_BACKEND_GOOSE,
+            ACP_BACKEND_PI,
+            ACP_BACKEND_DEEPSEEK,
+        ):
+            adapter = process_adapter_for(backend)
+            assert adapter is not None, (
+                f"{backend!r} resolves no ProcessAdapter -- it would fall "
+                "through the client dispatch"
+            )
         # And kiro is a POSITIVE arm too, not the fall-through -- serving it by
         # absence is what let a known id exec kiro-cli under another label.
-        assert "ACP_BACKEND_KIRO" in source
+        assert "ACP_BACKENDS_KIRO_DIALECT" in source
 
         # Codex: its own harness, resolving through the ladder that carries the
         # Node floor. Not a bare ``"codex" in source``, which a comment satisfies.

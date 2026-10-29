@@ -15,9 +15,9 @@ Delivery reuses the two existing outbound paths rather than adding a third:
 * **every other channel** — the governed cross-surface ladder
   (``chat_runner._resolve_channel_target``), which vets the send against the
   ``channels`` governance scope, records a SEL decision for grant AND denial,
-  and checks ``supports_proactive_send`` before handing off to
-  ``Transport.send_message``. The target is the session's ``origin`` link,
-  recorded by the transport's inbound path.
+  and checks ``supports_proactive_send`` before handing the notice to the
+  shared unattended-egress leg (``messaging.egress``). The target is the
+  session's ``origin`` link, else its ``mirror`` link.
 
 Best-effort by construction: the compaction itself already succeeded and the
 session keeps running, so a failed or impossible delivery is logged and
@@ -30,13 +30,16 @@ import asyncio
 import logging
 from typing import Any
 
+from kiro_crew.messaging.egress import channel_egress_parts, send_channel_parts
 from kiro_crew.messaging.link import SLACK_NAMESPACE, channel_namespace_of
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance_profiles import vet_and_audit
 from kiro_crew.session_compaction import (
+    COMPACT_OUTCOME_CANCELLED,
     COMPACT_OUTCOME_COMPACTED,
     COMPACT_OUTCOME_RECYCLED,
     COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE,
+    COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,25 +54,44 @@ CHANNEL_COMPACT_NOTICE = (
     "Context reached {pct:.0f}% and was auto-compacted. Earlier turns are now a "
     "summary; this conversation continues where it left off."
 )
+CHANNEL_COMPACT_WAITING_NOTICE = (
+    "Context reached {pct:.0f}%. The session is waiting for its sub-agents to "
+    "finish before it restarts; your messages are kept."
+)
 CHANNEL_COMPACT_FAILED_NOTICE = (
     "Context reached {pct:.0f}% but auto-compact failed. It retries after a "
     "cooldown — send {cmd} to compact now, or {new_cmd} to start fresh."
+)
+#: Shared tail of both restart notices. The successor's first turn IS built from a
+#: recent excerpt of the transcript (``ContextBuilder`` thread history), so the
+#: notice names that excerpt: a user who believes the context is gone for good has
+#: no reason to ask the agent to pick the work back up.
+_CHANNEL_RESTART_MEMORY_TAIL = (
+    "The messages above are still here, and the agent's next reply starts from a "
+    "recent excerpt of them rather than the whole thing. Send {new_cmd} any time to "
+    "start fresh yourself."
+)
+#: A user Stop ended the compaction turn. The only Stop that reaches a compacting
+#: session is the FORCED one, and a forced stop restarts the session, so the
+#: notice uses the restart notices' verb and memory tail and leads with the actor.
+CHANNEL_COMPACT_CANCELLED_NOTICE = (
+    "Your forced stop ended the compaction (condensing the conversation to free space) "
+    "that started at {pct:.0f}% of the context limit, so this session was restarted. "
+    + _CHANNEL_RESTART_MEMORY_TAIL
 )
 #: The session was REPLACED after a compaction that could have worked failed. Says
 #: what happened rather than claiming a summary, and names the loss the user would
 #: otherwise discover by asking the agent something it cannot recall.
 CHANNEL_RESTART_NOTICE = (
     "Context reached {pct:.0f}% and compaction didn't succeed, so this session was "
-    "restarted. The messages above are still here; the agent no longer remembers "
-    "them. Send {new_cmd} any time to start fresh yourself."
+    "restarted. " + _CHANNEL_RESTART_MEMORY_TAIL
 )
 #: The same restart where NOTHING could have compacted it. Only this one names the
 #: missing capability: the notice above is reached by backends that have compaction
 #: and failed once, and telling those users their backend cannot compact is false.
 CHANNEL_RESTART_UNCOMPACTABLE_NOTICE = (
     "Context reached {pct:.0f}% and this backend cannot compact at all, so this "
-    "session was restarted. The messages above are still here; the agent no longer "
-    "remembers them. Send {new_cmd} any time to start fresh yourself."
+    "session was restarted. " + _CHANNEL_RESTART_MEMORY_TAIL
 )
 
 #: Manual fallbacks differ per channel: the bang-prefixed transports own their
@@ -103,6 +125,11 @@ def notice_text(
     ``new_cmd`` is threaded into both restart notices because it is the one action a
     user can take afterwards, and it is already per-namespace.
     """
+    if outcome == COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS:
+        return CHANNEL_COMPACT_WAITING_NOTICE.format(pct=pct)
+    if outcome == COMPACT_OUTCOME_CANCELLED:
+        _, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
+        return CHANNEL_COMPACT_CANCELLED_NOTICE.format(pct=pct, new_cmd=new_cmd)
     if not success:
         compact_cmd, new_cmd = _MANUAL_COMMANDS.get(namespace, _DEFAULT_COMMANDS)
         return CHANNEL_COMPACT_FAILED_NOTICE.format(pct=pct, cmd=compact_cmd, new_cmd=new_cmd)
@@ -250,8 +277,14 @@ async def _deliver_via_transport(
         return
     resolved, transport = target
     text = notice_text(resolved.channel_type, pct, success=success, outcome=outcome)
+    # Outside the best-effort ``try``: ``redact_via_context`` re-raises an invalid
+    # governance ceiling (``PlatformCompositionError``), which this module never
+    # degrades, the same as the gate above. Only the send itself is best-effort.
+    parts = await channel_egress_parts(text, transport.capabilities)
     try:
-        await transport.send_message(resolved.channel_id, text, thread_id=resolved.thread_id)
+        await send_channel_parts(
+            transport, resolved.channel_id, parts, thread_id=resolved.thread_id
+        )
     except Exception:
         logger.debug(
             "compact notice: %s delivery failed for %s",

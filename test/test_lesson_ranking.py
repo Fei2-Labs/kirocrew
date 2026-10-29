@@ -10,6 +10,10 @@ import pytest
 
 from kiro_crew import vector_memory
 from kiro_crew.vector_memory import VectorMemoryStore
+from kiro_crew.vector_memory_runtime.lessons import (
+    LESSON_TRUNCATION_MARKER,
+    truncate_explicit_lessons,
+)
 
 # Deliberately share no significant words, so write_lesson's topic-overlap
 # dedup keeps all of them and each test controls the ordering it exercises.
@@ -145,6 +149,159 @@ class TestCharacterBudget:
 
     def test_empty_store_yields_nothing(self, store: VectorMemoryStore) -> None:
         assert store.get_lessons_context(query_text="anything", cap=1000) == ""
+
+
+def long_lesson(length: int) -> str:
+    """A rule of *length* characters that ranks first for ``CERTIFICATE``.
+
+    Its filler words share nothing with the other constants, so dedup keeps it
+    beside them and lexical ranking puts it ahead of them for that query.
+    """
+    rule = CERTIFICATE + " " + " ".join(f"filler{index}" for index in range(length))
+    return rule[:length]
+
+
+# The share of ``VectorMemoryStore.recall``'s default cap that lessons get.
+RECALL_CAP = 3000
+LESSON_SHARE = RECALL_CAP // 3
+SHORT_RULES = (TABS, MIGRATION, DIGEST)
+
+
+class TestLongTopRankedLesson:
+    """A long lesson ranked FIRST must not crowd out the shorter ones behind it."""
+
+    @pytest.mark.parametrize("length", [900, 1200])
+    def test_shorter_lessons_behind_it_still_render(
+        self, store: VectorMemoryStore, length: int
+    ) -> None:
+        """900 fits the share alone but not with its frame; 1200 fits neither."""
+        long = long_lesson(length)
+        for rule in SHORT_RULES:
+            store.write_lesson(rule)
+        store.write_lesson(long)
+
+        block = store.get_lessons_context(query_text=CERTIFICATE, cap=LESSON_SHARE)
+
+        assert sorted(shown(block)) == sorted(SHORT_RULES)
+        assert len(block) <= LESSON_SHARE
+
+    def test_everything_that_fits_is_byte_identical_to_the_uncapped_render(
+        self, store: VectorMemoryStore
+    ) -> None:
+        for rule in ALL_RULES:
+            store.write_lesson(rule)
+
+        capped = store.get_lessons_context(query_text=CERTIFICATE, cap=LESSON_SHARE)
+
+        assert capped == store.get_lessons_context(query_text=CERTIFICATE)
+
+    def test_two_lessons_at_an_exact_fit_cap_both_render(self, store: VectorMemoryStore) -> None:
+        """A one-lesson render carries a counts line the full render does not.
+
+        So at a cap equal to the full render, every partial render is over the
+        cap and only the whole-block check keeps both lessons.
+        """
+        store.write_lesson(TABS)
+        store.write_lesson(CERTIFICATE)
+        uncapped = store.get_lessons_context(query_text=CERTIFICATE)
+
+        capped = store.get_lessons_context(query_text=CERTIFICATE, cap=len(uncapped))
+
+        assert capped == uncapped
+        assert sorted(shown(capped)) == sorted((TABS, CERTIFICATE))
+
+
+class TestRecallLessonShare:
+    """``recall`` returns the best lessons that fit its share.
+
+    A lone over-share lesson is cut behind a marker only while the share holds
+    the block's frame, the marker and one character of text.
+    """
+
+    def test_short_lessons_are_returned_when_the_top_match_is_too_long(
+        self, store: VectorMemoryStore
+    ) -> None:
+        for rule in SHORT_RULES:
+            store.write_lesson(rule)
+        store.write_lesson(long_lesson(900))
+
+        result = store.recall(CERTIFICATE, cap=RECALL_CAP)
+
+        assert sorted(shown(result["lessons_context"])) == sorted(SHORT_RULES)
+
+    def test_a_lone_oversized_lesson_is_truncated_with_a_marker(
+        self, store: VectorMemoryStore
+    ) -> None:
+        long = long_lesson(1200)
+        store.write_lesson(long)
+
+        result = store.recall(CERTIFICATE, cap=RECALL_CAP)
+
+        lessons = result["lessons_context"]
+        assert 0 < len(lessons) <= LESSON_SHARE
+        (body,) = shown(lessons)
+        assert body.endswith(LESSON_TRUNCATION_MARKER)
+        assert long.startswith(body[: -len(LESSON_TRUNCATION_MARKER)])
+        assert lessons.endswith("[End of learned corrections]\n")
+
+    def test_lessons_that_fit_are_returned_whole(self, store: VectorMemoryStore) -> None:
+        for rule in ALL_RULES:
+            store.write_lesson(rule)
+
+        result = store.recall(CERTIFICATE, cap=RECALL_CAP)
+
+        assert sorted(shown(result["lessons_context"])) == sorted(ALL_RULES)
+        assert "omitted" not in result["lessons_context"]
+        assert LESSON_TRUNCATION_MARKER not in result["lessons_context"]
+
+    @pytest.mark.parametrize(("cap", "kept"), [(483, True), (480, False)])
+    def test_a_lone_lesson_is_kept_only_from_the_stated_cap(
+        self, store: VectorMemoryStore, cap: int, kept: bool
+    ) -> None:
+        """The spec's 483 is the smallest cap whose share fits one in-scope lesson's frame."""
+        store.write_lesson(long_lesson(1200))
+
+        result = store.recall(CERTIFICATE, cap=cap)
+
+        assert bool(result["lessons_context"]) is kept
+
+    @pytest.mark.parametrize(
+        ("query", "order", "cap", "kept"),
+        [
+            (CERTIFICATE, "most relevant", 651, True),
+            (CERTIFICATE, "most relevant", 648, False),
+            ("what is the status of", "most recent", 645, True),
+            ("what is the status of", "most recent", 642, False),
+        ],
+    )
+    def test_with_a_second_lesson_counted_it_is_kept_only_from_the_stated_cap(
+        self, store: VectorMemoryStore, query: str, order: str, cap: int, kept: bool
+    ) -> None:
+        """The spec's 651, or 645 for a query with no recall terms, is the
+        smallest cap whose share also fits the counts line."""
+        store.write_lesson(long_lesson(1200))
+        other = TABS + " " + " ".join(f"padding{index}" for index in range(1200))
+        store.write_lesson(other[:1200])
+
+        result = store.recall(query, cap=cap)
+
+        lessons = result["lessons_context"]
+        assert bool(lessons) is kept
+        if kept:
+            assert f"Showing 1 of 2 lessons, {order} first" in lessons
+            assert len(lessons) <= cap // 3
+
+
+class TestTruncateExplicitLessons:
+    def test_a_block_within_the_cap_is_returned_unchanged(self) -> None:
+        block = "[Learned corrections]\n- rule\n[End of learned corrections]\n"
+
+        assert truncate_explicit_lessons(block, len(block)) == block
+
+    def test_a_cap_too_small_for_the_frame_yields_nothing(self) -> None:
+        block = "[Learned corrections]\n- " + "x" * 100 + "\n[End of learned corrections]\n"
+
+        assert truncate_explicit_lessons(block, 30) == ""
 
 
 class TestVectorScoring:

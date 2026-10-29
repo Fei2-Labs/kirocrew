@@ -11,14 +11,21 @@ a Kiro Crew source checkout (0.6.0), not inferred from a plausible
 name. ``config_dir()`` and ``data_home()`` resolve to the SAME directory, so a
 ``<home>/config/`` guess would land two of these where nothing reads them:
 
-* ``agent.json`` -> ``<kiro home>/agents/<crew_name>.json``.
+* ``agent.json`` -> ``<kiro home>/agents/crew-<crew_name>.json``, declaring the name
+  ``crew-<crew_name>``. The crew namespace is what keeps the install off the specs
+  Kiro Crew derives into the same directory; see ``common.crew_agent_id`` for why it
+  covers the declared name as well as the filename.
   ``agent_discovery.list_agents`` is THE reader of installed agent specs, keyed by
-  the spec's ``name``, and it reads and JSON-parses every ``~/.kiro/agents/*.json``
+  the spec's ``name``, and it reads and JSON-parses every ``<kiro home>/agents/*.json``
   on each call. The gateway resolves that directory as ``kiro_home() / "agents"``,
-  where ``kiro_home()`` is ``$KIRO_HOME`` or ``~/.kiro``. It is NOT under the data
-  home and NOT governed by ``KIROCREW_HOME``: the backend is launched with
-  ``KIROCREW_HOME=data_home`` but no ``KIRO_HOME`` (``supervisor/backend.py``),
-  so the spec lands under the process HOME. Resolved here the same way rather
+  where ``kiro_home()`` is ``$KIRO_HOME`` or ``~/.kiro``. It is NOT governed by
+  ``KIROCREW_HOME``. The supervisor exports ``KIRO_HOME=<data home>/kiro``
+  (``supervisor.__main__.export_kiro_home``) before calling this module, so the spec
+  lands in a directory the task owns, beside the default spec the backend writes
+  there. It must NOT land in the process HOME's shared ``~/.kiro/agents``: the
+  backend runs on a non-default data home and Kiro Crew refuses to write the shared
+  dir from one, so a spec landing there leaves the backend with no ``kirocrew.json``
+  and every turn dies. Resolved here from the environment the way kiro-cli does rather
   than imported, so this module needs no ``kiro_crew`` install (matching the
   supervisor's other minimal, import-free config reads).
 
@@ -32,13 +39,13 @@ name. ``config_dir()`` and ``data_home()`` resolve to the SAME directory, so a
 * ``mcp.json`` -> ``<data home>/mcp.json``. The Kiro Crew-scope MCP config is
   ``data_home()/"mcp.json"`` -- the highest-priority source in
   ``mcp_discovery._mcp_sources`` (``mcp_discovery.py:297``,
-  ``SCOPE_KIROCREW``) and what ``dashboard/handlers/mcp.py:1620``
+  ``SCOPE_KIROCREW``) and what ``dashboard/handlers/mcp_config_files.py``
   (``_kirocrew_mcp_json`` -> ``data_home()/"mcp.json"``) reads for its
-  ``mcpServers`` (``:704``).
+  ``mcpServers`` (``mcp_probe.py`` ``_kirocrew_mcp_servers``).
 
-* ``skills/`` -> ``<data home>/skills/``. ``skills.py:1422`` ``skills_dir()`` is
+* ``skills/`` -> ``<data home>/skills/``. ``skills_discovery.py`` ``skills_dir()`` is
   ``config_dir() / SKILLS_DIR_NAME`` and ``SKILLS_DIR_NAME == "skills"``
-  (``skills.py:49``); ``config_dir()`` (``config/paths.py:265``) honours
+  (``skills_discovery.py``); ``config_dir()`` (``config/paths.py:265``) honours
   ``KIROCREW_HOME``, so in the container this is ``<data home>/skills``.
 
 THE DIGEST is recomputed here byte-identically to the producer
@@ -82,12 +89,15 @@ INSTALLED_MARKER = ".smc-crew-installed.json"
 def default_kiro_agents_dir() -> Path:
     """Where kiro-cli reads agent specs: ``<kiro home>/agents``.
 
-    Mirrors ``kiro_crew.config.paths.kiro_home`` (``config/paths.py:510``):
-    ``$KIRO_HOME`` if set, else ``~/.kiro``, then ``/agents``. Deliberately NOT
-    under the data home -- see the module docstring. The one behaviour not
-    mirrored is ``kiro_home``'s rejection of a system-directory ``$KIRO_HOME``;
-    that guards a pathological override the container never sets, and copying it
-    would only widen this module's surface.
+    Mirrors ``kiro_crew.config.paths.kiro_home``: ``$KIRO_HOME`` if set, else
+    ``~/.kiro``, then ``/agents``. In the container ``$KIRO_HOME`` is always set, by
+    ``supervisor.__main__.export_kiro_home``, which also asserts that this function
+    answers the directory the task owns -- so a drift between the two spellings fails
+    at boot instead of installing the crew where nothing serves it.
+
+    The one behaviour not mirrored is ``kiro_home``'s rejection of a system-directory
+    ``$KIRO_HOME``; the value is derived from ``SMC_DATA_HOME`` rather than passed
+    through, and copying the check would only widen this module's surface.
     """
     override = os.environ.get("KIRO_HOME")
     home = Path(override).expanduser() if override else Path.home() / ".kiro"
@@ -404,7 +414,7 @@ def _unlink_within(dst: Path, rel: str) -> str:
     moment it is traversed, and the final ``unlink`` runs relative to the last
     descriptor. There is no window between deciding the path is inside *dst* and acting
     on it, because the path is never re-resolved by name: the directory verified is the
-    directory deleted from. ``crew/packaging/build.py`` uses the same shape for a
+    directory deleted from. ``crew/packaging/pipeline/staging.py`` uses the same shape for a
     different object.
 
     A resolved-containment check runs first as well. It is redundant against the walk
@@ -530,7 +540,7 @@ def install_bundle(settings: Settings, *, agents_dir: Path | None = None) -> dic
     """Verify the bundle, then lay it out where Kiro Crew reads it. Fail CLOSED.
 
     Called from ``run()`` before the backend starts, alongside ``verify_layout``
-    / ``require_api_key`` / ``verify_sandbox``. Every refusal names the
+    / ``require_model_identity`` / ``verify_sandbox``. Every refusal names the
     check that failed and both values, because a container that boots with the
     wrong crew is the exact failure this change exists to prevent.
 
@@ -588,8 +598,9 @@ def install_bundle(settings: Settings, *, agents_dir: Path | None = None) -> dic
         raise common.ConfigError(
             "bundle check failed [agent.json name == crew_name]: agent.json "
             f"name={agent_name!r} != manifest crew_name={manifest_crew!r}. The "
-            f"spec is installed at <agents>/{manifest_crew}.json and read back by "
-            "its own name, so a mismatch serves nothing."
+            f"spec is installed at <agents>/{common.crew_agent_id(manifest_crew)}.json "
+            "under that same crew name, so a bundle whose two halves name different "
+            "crews serves nothing."
         )
 
     # 4. The recomputed content digest must equal the manifest's. This is what
@@ -621,7 +632,7 @@ def install_bundle(settings: Settings, *, agents_dir: Path | None = None) -> dic
     # answer holds regardless of what set the value.
     #
     # The builder has the same guard for the same reason (``_validated_crew_name`` in
-    # ``packaging/build.py``). Duplicated rather than shared, like the no-follow opener:
+    # ``packaging/pipeline/crew.py``). Duplicated rather than shared, like the no-follow opener:
     # this tree is image source the gateway must not import.
     if (
         not manifest_crew
@@ -634,8 +645,25 @@ def install_bundle(settings: Settings, *, agents_dir: Path | None = None) -> dic
         raise common.ConfigError(
             f"bundle check failed [crew name is a name]: crew_name={manifest_crew!r} "
             "contains a path separator, is absolute, or is a directory reference. The "
-            "spec is installed at <agents>/<crew_name>.json, so a name that can leave "
-            "that directory would overwrite a file outside it."
+            "spec is installed at <agents>/crew-<crew_name>.json, so a name that can "
+            "leave that directory would overwrite a file outside it."
+        )
+    # The crew's agent id, which is BOTH the filename stem and the spec's declared name
+    # from here on (``common.crew_agent_id``). Refused now if it cannot name an agent at
+    # all: the id reaches Kiro Crew's own name grammar on the first turn, and a length
+    # that fails it there produces a 400 per request on a task that booted reporting a
+    # healthy install. A boot refusal naming the length is the same answer every other
+    # check here gives, and it is the only one an operator can act on.
+    agent_id = common.crew_agent_id(manifest_crew)
+    if len(agent_id) > common.MAX_CREW_AGENT_ID_LEN:
+        raise common.ConfigError(
+            f"bundle check failed [crew agent id fits the name grammar]: crew_name="
+            f"{manifest_crew!r} becomes the agent id {agent_id!r}, which is "
+            f"{len(agent_id)} characters and cannot name an agent (the limit is "
+            f"{common.MAX_CREW_AGENT_ID_LEN}). Every crew spec is installed inside the "
+            f"{common.CREW_AGENT_ID_PREFIX!r} namespace, so the crew name has "
+            f"{common.MAX_CREW_AGENT_ID_LEN - len(common.CREW_AGENT_ID_PREFIX)} "
+            "characters to fit in. Rename the crew."
         )
     # One guard, not two. A containment assertion on the resolved destination was here as
     # defence in depth and it is unreachable: with the shape check above in place, no name
@@ -643,11 +671,24 @@ def install_bundle(settings: Settings, *, agents_dir: Path | None = None) -> dic
     # test can fail is a comment claiming a property nobody verifies, so it is gone rather
     # than shipped. If the join ever changes shape, the check to add back is the one that
     # can be tested against the new shape.
-    agent_dst = agents / f"{manifest_crew}.json"
-    # Copy the validated bytes rather than re-serialising, so what kiro-cli reads
-    # is exactly what the digest covered -- through a no-follow open so a symlink
-    # pre-planted at the destination cannot redirect the write.
-    _write_nofollow(agent_dst, (bundle_dir / "agent.json").read_bytes())
+    agent_dst = agents / f"{agent_id}.json"
+    # The installed spec is the bundle's spec with its ``name`` moved into the crew
+    # namespace, and nothing else touched. It is the ONE place the bytes are not copied
+    # verbatim, and the reason is that the declared name is what dispatches: kiro-cli
+    # and Kiro Crew's dispatchable-agent snapshot both enumerate by it, so a spec still
+    # declaring the bare crew name is reachable under no id at all whenever Kiro Crew's
+    # own mirror declares that same name.
+    #
+    # The digest checked above still covers the bundle's own bytes in the image layer,
+    # which is what "the bytes that were reviewed" means; this file is a rendering of
+    # the object those bytes parsed to. Re-serialising loses what JSON itself loses on a
+    # round trip -- key order, duplicate keys, the exact spelling of a number -- and none
+    # of those carries meaning in an agent spec, which is read as a mapping.
+    installed_spec = {**agent_spec, "name": agent_id}
+    _write_nofollow(
+        agent_dst,
+        (json.dumps(installed_spec, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
 
     _mkdir_or_refuse(settings.data_home, what="the data home")
     mcp_dst = settings.data_home / "mcp.json"

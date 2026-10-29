@@ -365,14 +365,24 @@ class TestDelegationCarriesTheCrewsStore:
 class TestTheMembersRosterCarriesIdentity:
     def test_description_and_triggers_are_exposed(self, crew_config):
         """A roster that shows a crew's store but not what it is for cannot
-        answer "which of these should handle a ticket"."""
+        answer "which of these should handle a ticket".
+
+        Both values reach the row through ``_roster_mask``, which passes benign
+        text byte-identical and replaces a credential-shaped value with a
+        sentinel. That is a redaction of the VALUE, not a withdrawal of the
+        field, so the roster still carries a crew's identity.
+        """
+        import importlib
         import inspect
 
         from kiro_crew.dashboard.handlers import members as members_handler
 
         src = inspect.getsource(members_handler)
-        assert '"description": agent_cfg.description' in src
-        assert '"triggers": agent_cfg.triggers' in src
+        src += "".join(
+            inspect.getsource(importlib.import_module(o)) for o in members_handler._OWNERS
+        )
+        assert '"description": _roster_mask(agent_cfg.description)' in src
+        assert '"triggers": _roster_mask(agent_cfg.triggers)' in src
 
 
 class TestTheSpawnEndpointActuallyDelegates:
@@ -451,6 +461,42 @@ class TestTheSpawnEndpointActuallyDelegates:
         assert json.loads(resp.text)["code"] == "unknown_member"
         mgr.spawn.assert_not_called()
 
+    def test_a_crew_named_without_triggers_still_spawns_in_its_store(self, tmp_path, monkeypatch):
+        """Triggers steer automatic routing only; naming a member is enough.
+
+        Members added from an agent template, or synced from an installed agent package, start with
+        empty triggers. A named delegation to one must bind that member's store,
+        exactly as it does for a member that has triggers.
+        """
+        cfg = {
+            "default_agent": "kirocrew",
+            "agents": {
+                "kirocrew": {"kiro_agent": "kirocrew"},
+                "builder": {"kiro_agent": "kirocrew", "triggers": "  "},
+            },
+        }
+        resp, mgr = self._spawn_call({"task": "x", "crew": "builder"}, cfg, tmp_path, monkeypatch)
+        assert resp.status == 200, resp.text
+        mgr.spawn.assert_called_once()
+        config = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        store = config["agents"]["builder"]["memory_store"]
+        assert store and mgr.spawn.call_args.kwargs["memory_store"] == store
+
+    def test_the_crew_field_description_does_not_gate_on_triggers(self):
+        """The tool text is what an agent reads before it delegates."""
+        import importlib
+        import inspect
+
+        from kiro_crew.mcp_tools import spawn as spawn_tool
+
+        src = "".join(
+            inspect.getsource(importlib.import_module(name))
+            for name in (spawn_tool.__name__, *spawn_tool._OWNERS)
+        )
+        assert "Naming a member is enough" in src
+        assert "must have non-empty Triggers" not in src
+        assert "delegated tasks" not in src
+
     def test_the_mcp_tool_forwards_the_field_it_accepts(self):
         """A schema field the handler drops is a documented no-op. `select_crew`,
         `route_crew` and the conductor skill all instruct `spawn_run(crew=...)`,
@@ -482,15 +528,32 @@ class TestTheSpawnEndpointActuallyDelegates:
         guidance saying so is a leak the docs teach. The `select_crew` tool text
         is the copy that matters most: it is what the model reads at routing
         time now that the always-on conductor skill is gone."""
+        import re
         from pathlib import Path
 
         import kiro_crew
 
         root = Path(kiro_crew.__file__).parent
-        for rel in ("mcp_tools/control.py",):
+        for rel in (
+            "mcp_tools/control.py",
+            "mcp_tools/control_parts/schemas.py",
+            "mcp_tools/control_parts/directive.py",
+            "mcp_tools/control_parts/monitor.py",
+        ):
             text = (root / rel).read_text()
             assert 'spawn_run(agent="<name>"' not in text, rel
             assert "spawn_run(agent=<crew>" not in text, rel
+        # Packaged prompts, skills and docs are guidance too: one that routes with
+        # `select_crew` / `route_crew` must not then hand the pick to `agent=`.
+        pages = sorted(root.rglob("*.md"))
+        assert root / "builtin_skills" / "goal-conductor" / "SKILL.md" in pages
+        routing = re.compile(r"\b(select_crew|route_crew)\b")
+        offenders = [
+            str(p.relative_to(root))
+            for p in pages
+            if routing.search(text := p.read_text(encoding="utf-8")) and "spawn_run(agent=" in text
+        ]
+        assert not offenders, offenders
 
 
 class TestASymlinkCannotAliasTwoCrewsOntoOneSilo:

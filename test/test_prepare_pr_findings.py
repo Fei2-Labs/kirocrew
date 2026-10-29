@@ -24,7 +24,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-from skill_script_helpers import load_skill_script
+from skill_script_helpers import is_rollup_graphql_read, load_skill_script, rollup_graphql_response
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (
@@ -33,7 +33,7 @@ SCRIPT = (
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "scripts"
     / "pr_findings.py"
 )
@@ -138,8 +138,12 @@ class TestCredentialRedaction:
 STATUS_SCRIPT = SCRIPT.with_name("pr_status.py")
 REVIEW_CONTRACT_SCRIPT = SCRIPT.with_name("_review_contract.py")
 # pr_status.py imports this sibling too, so a bundle missing it is a bundle that
-# cannot start. The whole prepare-pr/ directory is the supported copy unit.
+# cannot start. The whole kirocrew-prepare-pr/ directory is the supported copy unit.
 GREEN_AGE_SCRIPT = SCRIPT.with_name("green_age.py")
+# The owner modules pr_status.py loads the same way.
+STATUS_OWNERS = tuple(
+    SCRIPT.with_name(n) for n in ("pr_status_issue_links.py", "pr_status_verdict.py")
+)
 
 _HEAD = "f" * 40
 _OLD = "a" * 40
@@ -156,7 +160,7 @@ def test_entrypoint_runs_from_an_arbitrary_cwd_without_pythonpath(
     """The installed skill bundle resolves its sibling without cwd or PYTHONPATH help."""
     scripts_dir = tmp_path / "installed-skill" / "scripts"
     scripts_dir.mkdir(parents=True)
-    for source in (SCRIPT, STATUS_SCRIPT, REVIEW_CONTRACT_SCRIPT, GREEN_AGE_SCRIPT):
+    for source in (SCRIPT, STATUS_SCRIPT, REVIEW_CONTRACT_SCRIPT, GREEN_AGE_SCRIPT, *STATUS_OWNERS):
         shutil.copy2(source, scripts_dir / source.name)
 
     target_repo = tmp_path / "target-repo"
@@ -194,7 +198,7 @@ def test_entrypoint_ignores_stale_review_contract_bytecode(
     """Existing bytecode beside the installed skill must not override source."""
     scripts_dir = tmp_path / "installed-skill" / "scripts"
     scripts_dir.mkdir(parents=True)
-    for source in (SCRIPT, STATUS_SCRIPT, GREEN_AGE_SCRIPT):
+    for source in (SCRIPT, STATUS_SCRIPT, GREEN_AGE_SCRIPT, *STATUS_OWNERS):
         shutil.copy2(source, scripts_dir / source.name)
     contract_path = scripts_dir / "_review_contract.py"
     contract_path.write_text(
@@ -406,7 +410,8 @@ class TestExtractFindings:
                 "body": (
                     "<!-- codex-ai-review -->\n"
                     "BLOCKING -- src/x.py:10 -- broken guard\n"
-                    "FINDING -- src/y.py:20 -- could be tighter -> Fix: tighten\n"
+                    "BLOCKING -- src/y.py:20 -- could be tighter -> Fix: tighten\n"
+                    "FINDING -- src/w.py:30 -- the retired soft tier is not an item\n"
                     f"[GPT-REVIEWED] {_HEAD}\n[BLOCK-MERGE] {_HEAD}"
                 ),
             },
@@ -421,7 +426,7 @@ class TestExtractFindings:
 
         assert [(f["kind"], f["path"], f["line"]) for f in found] == [
             ("BLOCKING", "src/x.py", 10),
-            ("FINDING", "src/y.py", 20),
+            ("BLOCKING", "src/y.py", 20),
         ]
         assert all(f["reviewer"] == "gpt" for f in found)
         assert all(f["block_merge"] for f in found)
@@ -492,12 +497,12 @@ class TestFindingLineFormats:
                 "user": {"type": "Bot"},
                 "body": (
                     "<!-- codex-ai-review -->\n"
-                    f"FINDING -- src/b.py:3 -- tighten -> Fix: x\n[GPT-REVIEWED] {_HEAD}"
+                    f"BLOCKING -- src/b.py:3 -- tighten -> Fix: x\n[GPT-REVIEWED] {_HEAD}"
                 ),
             },
         ]
         found = list(module.extract_findings(comments, _HEAD, bindings))
-        assert [(f["kind"], f["path"], f["line"]) for f in found] == [("FINDING", "src/b.py", 3)]
+        assert [(f["kind"], f["path"], f["line"]) for f in found] == [("BLOCKING", "src/b.py", 3)]
 
 
 class TestRollupHelperParity:
@@ -512,9 +517,48 @@ class TestRollupHelperParity:
         status = _load_status()
         assert findings.ROLLUP_UNAVAILABLE_NOTICE == status.ROLLUP_UNAVAILABLE_NOTICE
         assert findings.ROLLUP_HEAD_MOVED_NOTICE == status.ROLLUP_HEAD_MOVED_NOTICE
+        # The whole read path, not only its entry point: the selection decides
+        # which fields a row carries, the flattener decides the row shape, and
+        # the page cap decides when a board reads UNKNOWN.
+        assert findings.ROLLUP_QUERY == status.ROLLUP_QUERY
+        assert findings._MAX_ROLLUP_PAGES == status._MAX_ROLLUP_PAGES
+        assert inspect.getsource(findings.flatten_rollup_row) == inspect.getsource(
+            status.flatten_rollup_row
+        )
         assert inspect.getsource(findings.fetch_check_rollup) == inspect.getsource(
             status.fetch_check_rollup
         )
+
+    def test_the_findings_collector_lists_every_failing_row_it_fetched(self, capsys) -> None:
+        """Pins the one asymmetry between the two readers. `pr_status.py`
+        collapses displaced rows before counting; this collector does not, so a
+        round the concurrency group cancelled still lists its CANCELLED rows
+        beside the live run's. That direction only ever OVER-reports (a log
+        fetch for a dead attempt), never hides a live failure, which is why it
+        is pinned rather than changed."""
+        module = _load_script()
+        displaced = {
+            "name": "Backend Tests",
+            "status": "COMPLETED",
+            "conclusion": "CANCELLED",
+            "workflowRunId": 100,
+            "workflowRunEvent": "pull_request",
+            "workflowDefinitionId": 7,
+            "workflowRunConclusion": "CANCELLED",
+            "detailsUrl": "https://github.com/example/repo/actions/runs/100/job/1",
+        }
+        live = dict(
+            displaced, conclusion="FAILURE", workflowRunId=200, workflowRunConclusion="FAILURE"
+        )
+        live["detailsUrl"] = "https://github.com/example/repo/actions/runs/200/job/2"
+        _run_findings(module, [], checks=[displaced, live])
+        module.failing_jobs = lambda _run_id: []
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert out.count("--- Backend Tests") == 2
+        assert "actions/runs/100/job/1" in out and "actions/runs/200/job/2" in out
 
 
 class TestDegradedRollup:
@@ -538,9 +582,10 @@ class TestDegradedRollup:
                 return 0, "", ""
             if args[:3] == ["gh", "pr", "view"]:
                 fields = args[args.index("--json") + 1] if "--json" in args else ""
-                if "statusCheckRollup" in fields:
-                    return 1, "", "Resource not accessible by personal access token"
+                assert "statusCheckRollup" not in fields, "the core read must not name the rollup"
                 return 0, payload, ""
+            if is_rollup_graphql_read(args):
+                return 1, "", "Resource not accessible by personal access token"
             raise AssertionError("unexpected command: {}".format(args))
 
         module.run = fake_run
@@ -566,28 +611,25 @@ class TestDegradedRollup:
                 "headRefOid": _OLD,
             }
         )
-        moved_rollup = json.dumps(
-            {
-                "headRefOid": _HEAD,
-                "statusCheckRollup": [
-                    {
-                        "name": "CI",
-                        "status": "COMPLETED",
-                        "conclusion": "FAILURE",
-                        "detailsUrl": "https://github.com/example/repo/actions/runs/1",
-                    }
-                ],
-            }
+        moved_rollup = rollup_graphql_response(
+            [
+                {
+                    "name": "CI",
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                    "detailsUrl": "https://github.com/example/repo/actions/runs/1",
+                }
+            ],
+            _HEAD,
         )
 
         def fake_run(args: list[str]) -> tuple[int, str, str]:
             if args[:3] == ["gh", "auth", "status"]:
                 return 0, "", ""
             if args[:3] == ["gh", "pr", "view"]:
-                fields = args[args.index("--json") + 1] if "--json" in args else ""
-                if "statusCheckRollup" in fields:
-                    return 0, moved_rollup, ""
                 return 0, payload, ""
+            if is_rollup_graphql_read(args):
+                return 0, moved_rollup, ""
             raise AssertionError("unexpected command: {}".format(args))
 
         module.run = fake_run
@@ -622,7 +664,7 @@ class TestDispositionRecordParsing:
         claim, not a false multi-span violation."""
         module = _load_script()
         span_a = module.span_hash("a.py", "gpt/BLOCKING")
-        span_b = module.span_hash("b.py", "gpt/FINDING")
+        span_b = module.span_hash("b.py", "gpt/BLOCKING")
         body = (
             f"<!-- ai-review-disposition target=GPT head={_HEAD} -->\n"
             f"- **fixed** span={span_a}\n> reason\nspan={span_b} and again span={span_a}"
@@ -976,7 +1018,7 @@ class TestDispositionViolations:
         assert "claims no span=" in violations[0]
 
     def test_spanless_record_for_a_lane_without_parseable_findings_is_exempt(self) -> None:
-        """An advisory lane whose concerns never parse into FINDING lines has
+        """A whole-design lane whose items never parse into BLOCKING lines has
         no span identity to demand -- requiring one would block dispositioning
         a Design/UX prose concern at all."""
         module = _load_script()
@@ -1052,33 +1094,36 @@ class TestDispositionViolations:
 # ---------------------------------------------------------------------------
 # Whole-design lanes reach the drill-in with span ids of their own. FINDING_RE
 # reads the `BLOCKING -- path:line` shape only GPT and Opus emit, so a Design
-# or First Principles Watch item is invisible to FINDING_RE alone even though
+# or First Principles Blocker is invisible to FINDING_RE alone even though
 # SKILL.md ranks those lanes ABOVE the line-level ones in triage.
 # ---------------------------------------------------------------------------
 
 
-def _design_body(verdict: str = "CONCERNS", head: str = _HEAD) -> str:
+def _design_body(verdict: str = "BLOCK", head: str = _HEAD) -> str:
     return (
         "<!-- design-review -->\n"
         "Design-Verdict: {}\n\n"
         "**The win32 predicate depends on a macOS-only settings file.**\n\n"
-        "### Watch\n"
+        "### Blockers\n"
         "- Absent-file -> False raises SandboxUnavailableError at boot on a\n"
         "  default Windows install.\n"
+        "  Trigger: a default Windows install starts a session.\n"
+        "  Outcome: every classified spawn fails at boot.\n"
         "  Clears when: kiro-cli confirms the key is read on win32.\n\n"
-        "### Suggestions\n"
+        "### Notes\n"
         "1. Split the probe out of the predicate.\n\n"
         "[DESIGN-REVIEWED] {}".format(verdict, head)
     )
 
 
-def _run_findings(module: ModuleType, comments: list[dict]) -> None:
+def _run_findings(
+    module: ModuleType, comments: list[dict], checks: list[dict] | None = None
+) -> None:
     payload = json.dumps(
         {
             "number": 42,
             "url": "https://github.com/example/repo/pull/42",
             "headRefOid": _HEAD,
-            "statusCheckRollup": [],
         }
     )
 
@@ -1087,6 +1132,10 @@ def _run_findings(module: ModuleType, comments: list[dict]) -> None:
             return 0, "", ""
         if args[:3] == ["gh", "pr", "view"]:
             return 0, payload, ""
+        if is_rollup_graphql_read(args):
+            return 0, rollup_graphql_response(checks or [], _HEAD), ""
+        if args[:3] == ["gh", "run", "view"]:
+            return 1, "", ""  # no log archive; the drill-down degrades to annotations
         raise AssertionError("unexpected command: {}".format(args))
 
     module.run = fake_run
@@ -1101,7 +1150,7 @@ class TestWholeDesignItems:
             "user": {"type": "Bot", "login": "github-actions[bot]"},
             "body": (
                 "<!-- codex-ai-review -->\n"
-                "FINDING -- src/x.py:10 -- tighten -> Fix: x\n"
+                "BLOCKING -- src/x.py:10 -- tighten -> Fix: x\n"
                 "[GPT-REVIEWED] " + _HEAD
             ),
         }
@@ -1114,12 +1163,13 @@ class TestWholeDesignItems:
         items = list(
             module.extract_design_items([design], _HEAD, dict(module.DEFAULT_MARKER_BINDINGS))
         )
-        assert len(items) == 2
+        assert len(items) == 1
         design_at = out.index("span=" + items[0]["span"])
-        gpt_at = out.index("span=" + module.span_hash("src/x.py", "gpt/FINDING"))
+        gpt_at = out.index("span=" + module.span_hash("src/x.py", "gpt/BLOCKING"))
         assert design_at < gpt_at, "whole-design items must outrank line-level findings"
-        assert "DESIGN: verdict=CONCERNS" in out
-        assert "[WATCH]" in out and "[SUGGESTIONS]" in out
+        assert "DESIGN: verdict=BLOCK" in out
+        assert "[BLOCKERS]" in out and "[NOTES]" not in out
+        assert "Trigger: a default Windows install starts a session." in out
         assert "Clears when: kiro-cli confirms the key is read on win32." in out
 
     def test_an_item_without_a_clears_when_line_prints_no_empty_one(self, capsys) -> None:
@@ -1128,8 +1178,8 @@ class TestWholeDesignItems:
             "user": {"type": "Bot", "login": "github-actions[bot]"},
             "body": (
                 "<!-- design-review -->\n"
-                "Design-Verdict: CONCERNS\n\n"
-                "### Watch\n"
+                "Design-Verdict: BLOCK\n\n"
+                "### Blockers\n"
                 "- the deleted pin was the only regression guard\n\n"
                 "[DESIGN-REVIEWED] " + _HEAD
             ),
@@ -1154,7 +1204,7 @@ class TestWholeDesignItems:
 
         out = capsys.readouterr().out
         assert "no whole-design lane stamped for the current head" in out
-        assert "[WATCH]" not in out
+        assert "[BLOCKERS]" not in out
 
     def test_a_pass_lane_prints_its_verdict_with_no_items(self, capsys) -> None:
         module = _load_script()
@@ -1173,7 +1223,122 @@ class TestWholeDesignItems:
 
         out = capsys.readouterr().out
         assert "DESIGN: verdict=PASS" in out
-        assert "no Blockers/Watch/Subtraction/Suggestion items" in out
+        assert "no Blockers items in those bodies" in out
+
+    def test_a_pass_lane_prints_its_reason(self, capsys) -> None:
+        """No item section carries a PASS lane's reason, so without this line
+        the loop reads the lane as having nothing to say."""
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: PASS\n\n"
+                "**Check that a timed-out run still stops its kept servers.**\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        verdict_at = out.index("DESIGN: verdict=PASS")
+        punchline_at = out.index(
+            "    punchline: Check that a timed-out run still stops its kept servers."
+        )
+        assert verdict_at < punchline_at
+        assert "one ask" not in out
+
+    def test_a_block_reason_prints_under_its_verdict(self, capsys) -> None:
+        module = _load_script()
+        design = {"user": {"type": "Bot", "login": "github-actions[bot]"}, "body": _design_body()}
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "    punchline: The win32 predicate depends on a macOS-only settings file." in out
+        assert "one ask" not in out
+
+    def test_a_token_in_a_punchline_is_redacted(self, capsys) -> None:
+        module = _load_script()
+        token = "ghp_" + "a" * 30
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: PASS\n\n"
+                "**Check the sample that quotes " + token + " before merge.**\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "    punchline: Check the sample that quotes [REDACTED] before merge." in out
+        assert token not in out
+
+    def test_nothing_to_check_prints_no_punchline(self, capsys) -> None:
+        module = _load_script()
+        design = {
+            "user": {"type": "Bot", "login": "github-actions[bot]"},
+            "body": (
+                "<!-- design-review -->\n"
+                "Design-Verdict: PASS\n\n"
+                "**Nothing to check.**\n\n"
+                "[DESIGN-REVIEWED] " + _HEAD
+            ),
+        }
+        _run_findings(module, [design])
+
+        module.main(["pr_findings.py", "42"])
+
+        out = capsys.readouterr().out
+        assert "DESIGN: verdict=PASS" in out
+        assert "punchline:" not in out
+        assert "one ask" not in out
+
+    @pytest.mark.parametrize(
+        ("after_verdict", "expected"),
+        [
+            ("\n\n**One bold sentence.**\n\n### Blockers\n- an item", "One bold sentence."),
+            ("\n\nAn unbolded sentence.\n", "An unbolded sentence."),
+            ("\n\n**Wrapped over\ntwo lines.**\n\nNext paragraph.", "Wrapped over two lines."),
+            (
+                " (advisory)\n\n**The rest of the verdict line is skipped.**",
+                "The rest of the verdict line is skipped.",
+            ),
+            ("\n\n**Bold** then **bold**", "**Bold** then **bold**"),
+            ("\n\n### Blockers\n- an item, not a punchline", ""),
+            ("\n\n[DESIGN-REVIEWED] " + _HEAD, ""),
+            ("", ""),
+        ],
+    )
+    def test_lane_punchline_reads_the_paragraph_under_the_verdict(
+        self, after_verdict: str, expected: str
+    ) -> None:
+        module = _load_script()
+        body = "<!-- design-review -->\nDesign-Verdict: PASS" + after_verdict
+        assert module._review_contract.lane_punchline(body) == expected
+
+    def test_a_body_without_a_verdict_line_has_no_punchline(self) -> None:
+        module = _load_script()
+        assert module._review_contract.lane_punchline("**A bold line.**\n") == ""
+
+    def test_only_a_lane_stamped_for_the_head_contributes_a_punchline(self) -> None:
+        module = _load_script()
+        bindings = dict(module.DEFAULT_MARKER_BINDINGS)
+        bot = {"type": "Bot", "login": "github-actions[bot]"}
+        fresh = {"user": bot, "body": _design_body()}
+        stale = {"user": bot, "body": _design_body(head=_OLD)}
+
+        assert module.design_lane_punchlines([fresh], _HEAD, bindings) == {
+            "DESIGN": "The win32 predicate depends on a macOS-only settings file."
+        }
+        assert module.design_lane_punchlines([stale], _HEAD, bindings) == {}
 
     def test_control_characters_in_an_item_are_stripped(self, capsys) -> None:
         """Item text is untrusted, model-authored bytes printed to a terminal."""
@@ -1182,8 +1347,8 @@ class TestWholeDesignItems:
             "user": {"type": "Bot", "login": "github-actions[bot]"},
             "body": (
                 "<!-- design-review -->\n"
-                "Design-Verdict: CONCERNS\n\n"
-                "### Watch\n"
+                "Design-Verdict: BLOCK\n\n"
+                "### Blockers\n"
                 "- \x1b[31mred\x1b[0m item\n\n"
                 "[DESIGN-REVIEWED] " + _HEAD
             ),
@@ -1202,8 +1367,8 @@ class TestWholeDesignItems:
             "user": {"type": "Bot", "login": "github-actions[bot]"},
             "body": (
                 "<!-- design-review -->\n"
-                "Design-Verdict: CONCERNS\n\n"
-                "### Watch\n"
+                "Design-Verdict: BLOCK\n\n"
+                "### Blockers\n"
                 "- the sample uses ghp_" + "a" * 30 + " inline\n\n"
                 "[DESIGN-REVIEWED] " + _HEAD
             ),
@@ -1224,14 +1389,16 @@ class TestWholeDesignItems:
         for name in (
             "extract_design_items",
             "design_lane_verdicts",
+            "design_lane_punchlines",
+            "redact",
             "CLEARS_WHEN_RE",
         ):
             assert getattr(findings, name) is getattr(findings._review_contract, name), name
         for name in (
             "extract_design_items",
             "design_lane_verdicts",
-            "unanswered_concern_lanes",
-            "unanswered_concerns_reason",
+            "design_lane_punchlines",
+            "redact",
             "WHOLE_DESIGN_LANES",
             "VERDICT_LINE_RE",
         ):
@@ -1249,18 +1416,21 @@ class TestWholeDesignItems:
         assert list(module.extract_findings([design], _HEAD, bindings)) == []
         assert list(module.extract_design_items([design], _HEAD, bindings))
 
-    def test_the_not_justified_section_is_an_item_section(self) -> None:
-        """The section the prompts gained for the premise gate. Its items are
-        exactly the ones a PASS verdict would otherwise bury, so they must reach the loop with
-        span ids like any other."""
+    def test_a_notes_section_is_not_an_item_section(self) -> None:
+        """Notes never gate and need no reply, so they reach the loop with no
+        span: only `### Blockers` is an item-bearing section."""
         module = _load_script()
         comment = {
             "user": {"type": "Bot", "login": "github-actions[bot]"},
             "body": (
                 "<!-- first-principles-review -->\n"
-                "First-Principles-Verdict: CONCERNS\n\n"
-                "### Not justified as shipped\n"
-                "- the win32 probe rides along on the macOS twin's symmetry\n"
+                "First-Principles-Verdict: BLOCK\n\n"
+                "### Notes\n"
+                "- the win32 probe rides along on the macOS twin's symmetry\n\n"
+                "### Blockers\n"
+                "- the win32 probe has zero consumers\n"
+                "  Trigger: the probe is read by nobody.\n"
+                "  Outcome: dead surface ships.\n"
                 "  Clears when: kiro-cli confirms the key is read on win32.\n\n"
                 "[FIRST-PRINCIPLES-REVIEWED] " + _HEAD
             ),
@@ -1270,6 +1440,70 @@ class TestWholeDesignItems:
             module.extract_design_items([comment], _HEAD, dict(module.DEFAULT_MARKER_BINDINGS))
         )
 
-        assert [i["kind"] for i in items] == ["NOT JUSTIFIED AS SHIPPED"]
+        assert [i["kind"] for i in items] == ["BLOCKERS"]
         assert items[0]["reviewer"] == "first-principles"
         assert items[0]["clears_when"] == "kiro-cli confirms the key is read on win32."
+
+
+class TestTwoVerdictsAndOneKindOfItem:
+    """A lane says PASS or BLOCK, and a line reviewer has one kind of item."""
+
+    @pytest.mark.parametrize("word", ["PASS", "BLOCK", "pass", "Block"])
+    def test_the_verdict_line_reads_pass_and_block(self, word: str) -> None:
+        module = _load_script()._review_contract
+        match = module.VERDICT_LINE_RE.search("<!-- x -->\nUX-Verdict: {} - why\n".format(word))
+        assert match is not None
+        assert match.group(1).upper() == word.upper()
+
+    @pytest.mark.parametrize("word", ["CONCERNS", "MAYBE", ""])
+    def test_any_other_word_is_not_a_verdict(self, word: str) -> None:
+        module = _load_script()._review_contract
+        assert module.VERDICT_LINE_RE.search("UX-Verdict: {}\n".format(word)) is None
+
+    def test_only_blocking_lines_are_items(self) -> None:
+        module = _load_script()._review_contract
+        body = (
+            "BLOCKING -- src/a.py:3 -- the guard is gone\n"
+            "FINDING -- src/b.py:4 -- the retired soft tier\n"
+            "**BLOCKING** \u2014 src/c.py:5 \u2014 bold and dashed\n"
+        )
+        assert [(k, p, ln) for k, p, ln, _ in module.FINDING_RE.findall(body)] == [
+            ("BLOCKING", "src/a.py", "3"),
+            ("BLOCKING", "src/c.py", "5"),
+        ]
+
+    def test_the_markers_read_the_verdict_and_count_blocking_lines(self) -> None:
+        module = _load_status()
+        bindings = dict(module.DEFAULT_MARKER_BINDINGS)
+        bot = {"type": "Bot", "login": "github-actions[bot]"}
+        gpt = {
+            "user": bot,
+            "body": (
+                "<!-- codex-ai-review -->\n"
+                "BLOCKING -- src/a.py:3 -- the guard is gone\n"
+                "Trigger: a crafted ref.\nOutcome: the caller is admitted.\n"
+                "[BLOCK-MERGE] {0}\n[GPT-REVIEWED] {0}".format(_HEAD)
+            ),
+        }
+        design = {"user": bot, "body": _design_body(verdict="PASS")}
+        ux_retired = {
+            "user": bot,
+            "body": "<!-- ux-review -->\nUX-Verdict: CONCERNS\n\n[UX-REVIEWED] " + _HEAD,
+        }
+
+        evaluated = module.evaluate_reviewer_markers([gpt, design, ux_retired], _HEAD, bindings)
+
+        assert evaluated["blocking"] == ["GPT"]
+        assert evaluated["findings"]["GPT"] == 1
+        assert evaluated["verdicts"] == {"DESIGN": "PASS"}
+        assert "UX" not in evaluated["verdicts"]
+
+    def test_notes_are_not_an_item_section(self) -> None:
+        module = _load_script()._review_contract
+        body = (
+            "Design-Verdict: BLOCK\n\n**Reason.**\n\n"
+            "### Notes\n- a style point\n\n"
+            "### Blockers\n- the real one\n  Trigger: t\n  Outcome: o\n\n"
+            "[DESIGN-REVIEWED] " + _HEAD
+        )
+        assert [section for section, _ in module.design_section_items(body)] == ["Blockers"]

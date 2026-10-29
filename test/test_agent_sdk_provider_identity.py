@@ -46,6 +46,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 #: predicate and must not compare the literal.
 CONVERTED = (
     "cli_doctor.py",
+    "cli_doctor_parts/model_section.py",
     "knowledge/llm_pool.py",
     "dashboard/chat_handlers.py",
     "dashboard/chat_runner.py",
@@ -165,6 +166,35 @@ def test_importing_this_module_does_not_load_the_acp_package() -> None:
     assert loaded["drivers_acp"] is True
 
 
+#: A converted file whose functions live in owner modules it composes: the
+#: dashboard agents handlers run the functions ``dashboard/agent_admin`` defines on
+#: ``handlers/agents.py``'s globals, the chat handlers those ``dashboard/chat_api``
+#: defines on ``chat_handlers.py``'s, and the chat runner those ``dashboard/chat_turn``
+#: defines on its own, and the doctor those ``cli_doctor_parts`` defines on
+#: ``cli_doctor.py``'s, so the literal ratchet reads those owners as part of that file.
+_COMPOSED_OWNERS = {
+    "cli_doctor.py": "cli_doctor_parts",
+    "context.py": "context_assembly",
+    "dashboard/handlers/agents.py": "dashboard/agent_admin",
+    "dashboard/chat_handlers.py": "dashboard/chat_api",
+    "dashboard/chat_runner.py": "dashboard/chat_turn",
+}
+
+#: The doctor composes fewer owners than the floor the larger packages share.
+_MIN_COMPOSED_OWNERS = {"cli_doctor.py": 4}
+
+
+def _composed_owner_paths(rel: str) -> list[Path]:
+    """The owner modules *rel* composes, or ``[]`` for a self-contained file."""
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return []
+    owners = sorted((SRC / owner_dir).glob("[!_]*.py"))
+    floor = _MIN_COMPOSED_OWNERS.get(rel, 13)
+    assert len(owners) >= floor, f"{owner_dir}: the composed owners were not found"
+    return owners
+
+
 def _literal_comparisons(path: Path) -> list[int]:
     """Line numbers where code compares something against ``"claude_code"``."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -203,7 +233,10 @@ def test_no_converted_file_compares_the_literal(rel: str) -> None:
     the ``model_registry`` namespace arguments, which are call arguments rather
     than comparisons.
     """
-    hits = _literal_comparisons(SRC / rel)
+    hits: list[int | str] = list(_literal_comparisons(SRC / rel))
+    for owner in _composed_owner_paths(rel):
+        rel_owner = owner.relative_to(SRC).as_posix()
+        hits += [f"{rel_owner}:{line}" for line in _literal_comparisons(owner)]
     assert hits == [], (
         f'{rel} compares the raw "{PROVIDER_CLAUDE_CODE}" literal at line(s) '
         f"{hits}; ask is_claude_code() instead so provider-specific logic stays "

@@ -1,8 +1,10 @@
 import * as React from 'react'
+import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { X } from 'lucide-react'
 import { cn } from '../../lib/utils'
 import { i18nT } from '../../i18n/t'
+import { GlobalOverlayScope } from '../overlayRoot'
 
 /**
  * shadcn/ui `dialog` over Radix Dialog, themed to this repo's tokens the way
@@ -32,6 +34,12 @@ import { i18nT } from '../../i18n/t'
 
 const Dialog = DialogPrimitive.Root
 const DialogTrigger = DialogPrimitive.Trigger
+// Deliberately NOT in the local overlay root, and neither is anything opened
+// inside it (GlobalOverlayScope): a modal dialog holds the whole window while
+// open (pointer lock, the rest of the page aria-hidden), and that hold cannot be
+// lifted without remounting its content, which would lose what the user
+// entered. Hidden behind a remote Crew it would keep that hold invisibly, so it
+// stays on screen across a Crew switch instead. See components/overlayRoot.
 const DialogPortal = DialogPrimitive.Portal
 const DialogClose = DialogPrimitive.Close
 
@@ -58,16 +66,21 @@ interface DialogContentProps
   maxWidth?: number
   /** Hide the built-in close button when the caller renders its own. */
   hideClose?: boolean
+  /** Raise one dialog's overlay above a lower modal without changing every caller. */
+  overlayClassName?: string
 }
 
 const DialogContent = React.forwardRef<
   React.ComponentRef<typeof DialogPrimitive.Content>,
   DialogContentProps
->(({ className, children, maxWidth = 640, hideClose = false, style, onKeyDown, ...props }, ref) => (
+>(({ className, children, maxWidth = 640, hideClose = false, overlayClassName, style, onKeyDown, ...props }, ref) => {
+  const trustRoot = useGuideTrustRootAttrs()
+  return (
   <DialogPortal>
-    <DialogOverlay />
+    <DialogOverlay className={overlayClassName} />
     <DialogPrimitive.Content
       ref={ref}
+      {...trustRoot}
       // Radix warns when this points at an id that does not exist. Callers that
       // want a description render a DialogDescription and set it themselves.
       aria-describedby={undefined}
@@ -81,7 +94,8 @@ const DialogContent = React.forwardRef<
       // It does NOT cost us Escape: Radix's DismissableLayer listens with
       // `{ capture: true }`, and a capture-phase listener runs BEFORE the event
       // reaches this element, so stopping bubble propagation here cannot hide it.
-      // (Asserted end-to-end in scripts/verify-crews-dialog-select.mjs.)
+      // (Driven in a real browser by scripts/verify-crews-dialog-select.mjs, on
+      // demand only: no CI lane runs it.)
       onKeyDown={e => {
         onKeyDown?.(e)
         e.stopPropagation()
@@ -118,7 +132,7 @@ const DialogContent = React.forwardRef<
       // alone so the visible Title still names the dialog.
       {...(props['aria-label'] ? { 'aria-labelledby': undefined } : {})}
     >
-      {children}
+      <GlobalOverlayScope>{children}</GlobalOverlayScope>
       {!hideClose && (
         <DialogPrimitive.Close
           aria-label={i18nT('components.dialog.close')}
@@ -129,7 +143,8 @@ const DialogContent = React.forwardRef<
       )}
     </DialogPrimitive.Content>
   </DialogPortal>
-))
+  )
+})
 DialogContent.displayName = DialogPrimitive.Content.displayName
 
 /** Fixed-height header strip. `pr-12` keeps content clear of the close button. */

@@ -559,6 +559,7 @@ describe("seen-set persistence", () => {
       baselinedAt: null,
       baselined: false,
       attempts: {},
+      swept: new Set(),
     });
   });
 
@@ -1268,5 +1269,260 @@ describe("crashNoticeSummary", () => {
 
   it("is safe on a scan that never ran", () => {
     assert.deepEqual(crashNoticeSummary(null), { newCount: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The facade's surface. main.js and ipc-registrar.js destructure it at load,
+// so every name must be there, in this order, with no Electron at load time.
+// ---------------------------------------------------------------------------
+
+const nodeFs = require("node:fs");
+
+const CRASH_COLLECTOR_EXPORTS = [
+  "armCrashCollector",
+  "collectCrashReports",
+  "crashNoticeSummary",
+  "crashLogPath",
+  "crashStatePath",
+  "parseMinidump",
+  "classifyMinidump",
+  "parseIpsHead",
+  "ipsBelongsToApp",
+  "ipsTimestampToIso",
+  "isOwnModule",
+  "isElectronShaped",
+  "appendCrashLog",
+  "readSeenState",
+  "writeSeenState",
+  "CRASH_LOG_BASENAME",
+  "CRASH_STATE_BASENAME",
+  "MAX_CRASH_LOG_LINES",
+  "MAX_INSPECT_PER_RUN",
+  "MAX_PENDING_ATTEMPTS",
+];
+
+it("the crash collector exports its twenty names, in order, with their values", () => {
+  const collector = require("../crash-collector");
+  assert.deepStrictEqual(Object.keys(collector), CRASH_COLLECTOR_EXPORTS);
+  assert.strictEqual(collector.CRASH_LOG_BASENAME, "crashes.log");
+  assert.strictEqual(collector.CRASH_STATE_BASENAME, "crashes-seen.json");
+  assert.strictEqual(collector.MAX_CRASH_LOG_LINES, 500);
+  assert.strictEqual(collector.MAX_INSPECT_PER_RUN, 25);
+  assert.strictEqual(collector.MAX_PENDING_ATTEMPTS, 3);
+  assert.deepStrictEqual(collector.crashNoticeSummary({ newCrashes: [{}, {}] }), { newCount: 2 });
+  assert.deepStrictEqual(collector.crashNoticeSummary(null), { newCount: 0 });
+});
+
+it("the crash collector loads without Electron and touches no file at load", () => {
+  const NodeModule = require("node:module");
+  const electronDir = path.join(__dirname, "..");
+  const files = [path.join(electronDir, "crash-collector.js")];
+  const runtimeDir = path.join(electronDir, "runtime", "crash");
+  if (nodeFs.existsSync(runtimeDir)) {
+    for (const name of nodeFs.readdirSync(runtimeDir)) {
+      if (name.endsWith(".js")) files.push(path.join(runtimeDir, name));
+    }
+  }
+  const cached = new Map(files.map((file) => [file, require.cache[file]]));
+  for (const file of files) delete require.cache[file];
+  const originalLoad = NodeModule._load;
+  NodeModule._load = function load(request, ...rest) {
+    if (request === "electron" || request === "fs" || request === "node:fs") {
+      throw new Error(`${request} must not load at module scope`);
+    }
+    return originalLoad.call(this, request, ...rest);
+  };
+  try {
+    assert.deepStrictEqual(Object.keys(require("../crash-collector")), CRASH_COLLECTOR_EXPORTS);
+  } finally {
+    NodeModule._load = originalLoad;
+    for (const [file, entry] of cached) {
+      if (entry) require.cache[file] = entry;
+      else delete require.cache[file];
+    }
+  }
+});
+
+it("the facade re-exports each runtime owner's own function, not a copy", () => {
+  const collector = require("../crash-collector");
+  const runtimeDir = path.join(__dirname, "..", "runtime", "crash");
+  assert.deepStrictEqual(
+    nodeFs.readdirSync(runtimeDir).filter((name) => name.endsWith(".js")).sort(),
+    ["artifact-parsers.js", "candidates.js", "ownership.js", "persistence.js", "scan.js"],
+  );
+  const owners = {
+    ownership: ["isOwnModule", "isElectronShaped", "ipsBelongsToApp"],
+    "artifact-parsers": ["parseMinidump", "classifyMinidump", "parseIpsHead", "ipsTimestampToIso"],
+    persistence: [
+      "armCrashCollector", "crashLogPath", "crashStatePath", "appendCrashLog",
+      "readSeenState", "writeSeenState", "CRASH_LOG_BASENAME", "CRASH_STATE_BASENAME",
+      "MAX_CRASH_LOG_LINES",
+    ],
+    scan: ["collectCrashReports", "MAX_INSPECT_PER_RUN", "MAX_PENDING_ATTEMPTS"],
+  };
+  for (const [owner, names] of Object.entries(owners)) {
+    const module = require(path.join(runtimeDir, `${owner}.js`));
+    for (const name of names) {
+      assert.strictEqual(collector[name], module[name], `${name} is ${owner}.js's own`);
+    }
+  }
+  for (const owner of nodeFs.readdirSync(runtimeDir)) {
+    const source = nodeFs.readFileSync(path.join(runtimeDir, owner), "utf8");
+    assert.doesNotMatch(source, /require\(\s*["'](?:electron|fs|node:fs)["']\s*\)/, `${owner} takes fs from its caller`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The acknowledged backlog. A dump that reached `seen` without the foreign-dump
+// delete (the baseline writes them off unread) is opened once more, inside the
+// per-launch cap, and removed only on the same proof.
+// ---------------------------------------------------------------------------
+
+describe("collectCrashReports — the acknowledged backlog sweep", () => {
+  const RUBY = { moduleName: "/usr/bin/ruby", exceptionCode: 0 };
+  const DEV_ELECTRON = { moduleName: "/repo/node_modules/electron/dist/Electron", exceptionCode: 0x8000000b };
+
+  /** A state file whose `seen` already holds these dumps and that has no `swept` list. */
+  function alreadySeen(fs, filePaths) {
+    fs.files.set(STATE, Buffer.from(JSON.stringify({
+      version: 1,
+      activatedAt: new Date(0).toISOString(),
+      baselinedAt: new Date(0).toISOString(),
+      seen: filePaths.map((p) => `minidump:${path.basename(p)}`),
+    })));
+  }
+
+  /** Every file the scan opens from here on, so a test can say none was reopened. */
+  function recordOpens(fs) {
+    const opened = [];
+    const realOpen = fs.openSync;
+    fs.openSync = (p) => {
+      opened.push(p);
+      return realOpen(p);
+    };
+    return opened;
+  }
+
+  const scanOnce = (fs, extra = {}) =>
+    collectCrashReports({ logsDir: LOGS, crashDumpsDir: DUMPS, appName: APP, fs, ...extra });
+
+  it("drains 60 seen foreign dumps 25 a launch, oldest first, and never the two Electron-shaped ones", () => {
+    const files = {};
+    const mtimes = {};
+    // Listed first but newest, so only an oldest-first sweep leaves them for
+    // the third launch.
+    const electron = [path.join(PENDING, "dev.dmp"), path.join(COMPLETED, "dev-helper.dmp")];
+    files[electron[0]] = buildMinidump(DEV_ELECTRON);
+    files[electron[1]] = buildMinidump({ ...DEV_ELECTRON, moduleName: "/repo/node_modules/electron/dist/Electron Helper (GPU)" });
+    mtimes[electron[0]] = 5000;
+    mtimes[electron[1]] = 5001;
+    // Listed in the reverse of their age, so the sweep's own order decides
+    // which 25 go first.
+    const ruby = Array.from({ length: 60 }, (_, i) => path.join(PENDING, `ruby-${String(i).padStart(2, "0")}.dmp`));
+    ruby.forEach((p, i) => {
+      files[p] = buildMinidump(RUBY);
+      mtimes[p] = 1000 + (59 - i);
+    });
+    const fs = fakeFs(files);
+    fs.mtimes = mtimes;
+    alreadySeen(fs, [...electron, ...ruby]);
+
+    const messages = [];
+    const removedPerLaunch = [];
+    for (let launch = 0; launch < 3; launch += 1) {
+      const scan = scanOnce(fs, { log: (m) => messages.push(m) });
+      assert.equal(scan.inspected, 0, "nothing is fresh, so nothing is reported");
+      assert.deepEqual(scan.newCrashes, []);
+      removedPerLaunch.push(scan.removedFromBacklog);
+      if (launch === 0) assert.deepEqual(fs.unlinked, ruby.slice().reverse().slice(0, 25), "the oldest 25 go first");
+    }
+    assert.deepEqual(removedPerLaunch, [25, 25, 10]);
+    assert.match(messages.join("\n"), /removedFromBacklog=25 /);
+    assert.deepEqual(fs.unlinked.slice().sort(), ruby.slice().sort());
+    for (const p of electron) assert.equal(fs.files.has(p), true, `${path.basename(p)} is another build's crash`);
+
+    const opened = recordOpens(fs);
+    const fourth = scanOnce(fs);
+    assert.equal(fourth.removedFromBacklog, 0);
+    assert.deepEqual(opened, [], "a swept dump is never opened again");
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(STATE)).swept.sort(),
+      ["minidump:dev-helper.dmp", "minidump:dev.dmp"],
+      "only dumps still on disk stay listed as swept",
+    );
+  });
+
+  it("leaves the baseline run unread and sweeps what it wrote off on the next launch", () => {
+    const old = [path.join(PENDING, "old-1.dmp"), path.join(PENDING, "old-2.dmp")];
+    const fs = fakeFs(Object.fromEntries(old.map((p) => [p, buildMinidump(RUBY)])));
+    fs.mtimes = { [old[0]]: 500, [old[1]]: 600 };
+    armCrashCollector({ logsDir: LOGS, fs, now: () => new Date(1000) });
+    const opened = recordOpens(fs);
+
+    const baseline = scanOnce(fs);
+    assert.equal(baseline.baseline, true);
+    assert.equal(baseline.removedFromBacklog, 0);
+    assert.deepEqual(opened, [], "the baseline run reads none of what it writes off");
+
+    const next = scanOnce(fs);
+    assert.equal(next.removedFromBacklog, 2);
+    assert.deepEqual(fs.unlinked, old);
+  });
+
+  it("keeps the app's own crashes on every platform and an unreadable dump, and opens each once", () => {
+    const own = [
+      path.join(PENDING, "own-mac.dmp"),
+      path.join(PENDING, "own-linux.dmp"),
+      path.join(COMPLETED, "own-windows.dmp"),
+    ];
+    const torn = path.join(PENDING, "torn.dmp");
+    const unseen = path.join(PENDING, "unseen-dev.dmp");
+    const fs = fakeFs({
+      [own[0]]: buildMinidump(),
+      [own[1]]: buildMinidump({ moduleName: `/opt/${APP}/${EXEC}` }),
+      [own[2]]: buildMinidump({ moduleName: `C:\\Program Files\\${APP}\\${EXEC}.exe` }),
+      [torn]: buildMinidump().subarray(0, 40),
+      // Not seen yet: the fresh pass judges it, and keeps it as another build's crash.
+      [unseen]: buildMinidump(DEV_ELECTRON),
+    });
+    alreadySeen(fs, [...own, torn]);
+
+    const first = scanOnce(fs, { execName: EXEC });
+    assert.equal(first.inspected, 1, "only the unseen dump goes through the fresh pass");
+    assert.equal(first.removed, 0);
+    assert.equal(first.removedFromBacklog, 0);
+    assert.deepEqual(fs.unlinked, []);
+    for (const p of [...own, torn, unseen]) assert.equal(fs.files.has(p), true, `${path.basename(p)} is kept`);
+
+    const opened = recordOpens(fs);
+    scanOnce(fs, { execName: EXEC });
+    assert.deepEqual(opened, [], "neither a swept dump nor a fresh verdict is reopened");
+  });
+
+  it("leaves a fresh crash its slot: the sweep only gets what the cap has left", () => {
+    const fresh = path.join(PENDING, "new-crash.dmp");
+    const seenRuby = ["r1", "r2", "r3"].map((name) => path.join(PENDING, `${name}.dmp`));
+    const fs = fakeFs({
+      [fresh]: buildMinidump(),
+      ...Object.fromEntries(seenRuby.map((p) => [p, buildMinidump(RUBY)])),
+    });
+    fs.mtimes = { [seenRuby[0]]: 1001, [seenRuby[1]]: 1002, [seenRuby[2]]: 1003, [fresh]: 2000 };
+    alreadySeen(fs, seenRuby);
+    const opened = recordOpens(fs);
+
+    const scan = scanOnce(fs, { maxInspect: 2 });
+    assert.equal(scan.newCrashes.length, 1, "the fresh crash is still reported");
+    assert.equal(scan.removedFromBacklog, 1);
+    assert.deepEqual(fs.unlinked, [seenRuby[0]], "the oldest seen dump took the one slot left");
+    assert.equal(opened.length, 2, "two files in all, which is the cap");
+  });
+
+  it("keeps the swept list when arming rewrites a state file that has no cutoff yet", () => {
+    const fs = fakeFs({
+      [STATE]: JSON.stringify({ version: 1, seen: ["minidump:a.dmp"], swept: ["minidump:a.dmp"] }),
+    });
+    armCrashCollector({ logsDir: LOGS, fs, now: () => new Date(1000) });
+    assert.deepEqual(readSeenState(STATE, { fs }).swept, new Set(["minidump:a.dmp"]));
   });
 });

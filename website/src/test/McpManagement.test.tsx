@@ -10,11 +10,11 @@
 // - sharing cannot be enabled while nothing is stubbed (it would do nothing),
 //   but can always be disabled
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import { McpManagement } from '../pages/settings/McpManagement'
-import { api } from '../api/client'
+import { api, ApiError } from '../api/client'
 
 type Server = {
   name: string
@@ -40,6 +40,30 @@ function server(over: Partial<Server> = {}): Server {
     denylisted: false,
     ...over,
   }
+}
+
+/** What `GET /servers/launch` answers for a server being turned on. */
+function preview(name: string, over: Record<string, unknown> = {}) {
+  return {
+    name,
+    commands: [['npx', '-y', `${name}@1`]],
+    envs: [[]],
+    complete: true,
+    expected_launch: `${name}-cmd:${name}-env`,
+    ...over,
+  }
+}
+
+/**
+ * Turn a row's STUB switch on.
+ *
+ * One click, and that is the contract: the switch reads the launch and, if it can
+ * be approved, writes the stub straight away carrying its identity. No command is
+ * shown and there is no second press.
+ */
+async function approveStub(name: string) {
+  const sw = await screen.findByRole('switch', { name: `Put a stub in front of ${name}` })
+  sw.click()
 }
 
 function mount() {
@@ -82,6 +106,7 @@ describe('McpManagement', () => {
     vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
     vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({ servers: [server()] } as never)
     // The broker failed to start: the endpoint still answers 200.
+    vi.spyOn(api, 'mcpGatewayLaunchPreview').mockResolvedValue(preview('alpha-mcp') as never)
     vi.spyOn(api, 'mcpGatewaySetStub').mockResolvedValue({
       name: 'alpha-mcp',
       stub: true,
@@ -89,8 +114,7 @@ describe('McpManagement', () => {
     } as never)
 
     mount()
-    const row = await screen.findByRole('switch', { name: /alpha-mcp/i })
-    row.click()
+    await approveStub('alpha-mcp')
 
     await waitFor(() => {
       expect(screen.getByRole('alert')).toBeTruthy()
@@ -102,6 +126,7 @@ describe('McpManagement', () => {
     vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({ servers: [server()] } as never)
     // The normal outcome: the allowlist is stored and nothing was cycled, so the
     // change is pending a restart rather than broken.
+    vi.spyOn(api, 'mcpGatewayLaunchPreview').mockResolvedValue(preview('alpha-mcp') as never)
     vi.spyOn(api, 'mcpGatewaySetStub').mockResolvedValue({
       name: 'alpha-mcp',
       stub: true,
@@ -110,8 +135,7 @@ describe('McpManagement', () => {
     } as never)
 
     mount()
-    const row = await screen.findByRole('switch', { name: /alpha-mcp/i })
-    row.click()
+    await approveStub('alpha-mcp')
 
     // role=status, not role=alert: an operator who is told "restart to apply"
     // has nothing to fix, and an error banner sends them looking for a fault.
@@ -317,6 +341,15 @@ describe('sharing assessment', () => {
     // leave the selection half-applied); a bare `.click()` never synthesises it.
     fireEvent.mouseDown(tab)
   }
+
+  it('links "the MCP server list under Connections" to that list, not the Services gallery', async () => {
+    // #21303: the sentence names the MCP Servers sub-tab, which opens from `?view=`.
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({ servers: [withRec({ name: 'alpha-mcp' })] } as never)
+    await openAssessment()
+    const link = await screen.findByRole('link', { name: 'Connections' })
+    expect(link).toHaveAttribute('href', '/capabilities?tab=mcp&view=mcp-servers')
+  })
 
   it('shows the verdict and its reason instead of only a yes or no', async () => {
     vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
@@ -810,13 +843,12 @@ describe('stub every server the evidence allows', () => {
   }
   const idleProgress = { running: false, done: 0, total: 0, error: '' }
 
-  it('offers every stubbable row as a candidate and leaves the rest out', async () => {
+  it('lists every candidate by name and writes nothing until that is confirmed', async () => {
     // What the client still owns: WHICH rows are worth asking about. Eligibility
     // itself is the server's, so a row is a candidate whenever it has a stdio pipe
     // and is not already stubbed -- verdict strength is deliberately not consulted
     // here, because a second copy of that rule could disagree with the one the
     // write uses.
-    const { fireEvent } = await import('@testing-library/react')
     vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
     vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
     const start = vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue(idleProgress as never)
@@ -824,6 +856,9 @@ describe('stub every server the evidence allows', () => {
       servers: [
         { ...server({ name: 'good-mcp' }), recommendation: declared },
         { ...server({ name: 'measured-mcp' }), recommendation: measured },
+        // Its evidence argues against sharing, and it is a candidate anyway: the
+        // server resolves eligibility inside the lock hold that writes, so a
+        // second copy of that rule here could disagree with it.
         { ...server({ name: 'bad-mcp' }), recommendation: disqualified },
         // Already stubbed: nothing to ask for.
         { ...server({ name: 'done-mcp', stub: true, in_allowlist: true }), recommendation: declared },
@@ -831,35 +866,78 @@ describe('stub every server the evidence allows', () => {
         { ...server({ name: 'http-mcp', can_stub: false }), recommendation: declared },
       ],
     } as never)
-    const many = vi.spyOn(api, 'mcpGatewaySetStubMany').mockResolvedValue({
-      ok: true,
-      names: ['good-mcp', 'measured-mcp', 'bad-mcp'],
-      stub: true,
-      stubbed: ['good-mcp'],
-      skipped: [
-        { name: 'measured-mcp', reason: 'evidence_insufficient' },
-        { name: 'bad-mcp', reason: 'evidence_insufficient' },
-      ],
-      applied: true,
-    } as never)
+    const read = vi
+      .spyOn(api, 'mcpGatewayLaunchPreview')
+      .mockImplementation((async (name: string) => preview(name)) as never)
+    const setStub = vi.spyOn(api, 'mcpGatewaySetStub').mockImplementation(
+      (async (name: string) => ({
+        ok: true,
+        name,
+        stub: true,
+        stubbed: [name],
+        restart_required: true,
+      })) as never,
+    )
+    const many = vi.spyOn(api, 'mcpGatewaySetStubMany')
 
     mount()
     // Wait for the rows, not just the button: the control is correctly disabled
     // until rows are known, so clicking at first paint hits a dead button.
     await screen.findByText('good-mcp')
-    const btn = await screen.findByRole('button', { name: /evidence allows/i })
-    fireEvent.click(btn)
+    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
 
-    await waitFor(() => expect(many).toHaveBeenCalled())
-    // One request for the whole set — a per-row loop could land the allowlist
-    // half-flipped.
-    expect(many).toHaveBeenCalledTimes(1)
-    expect(many).toHaveBeenCalledWith(['good-mcp', 'measured-mcp', 'bad-mcp'], true, true)
+    // Every candidate is listed BY NAME before anything is written, and no
+    // command text appears: the page shows no launch commands.
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('good-mcp')).toBeTruthy()
+    expect(within(dialog).getByText('measured-mcp')).toBeTruthy()
+    expect(within(dialog).getByText('bad-mcp')).toBeTruthy()
+    expect(screen.queryByText('good-mcp@1')).toBeNull()
+    expect(screen.queryByText('measured-mcp@1')).toBeNull()
+    expect(screen.queryByText('bad-mcp@1')).toBeNull()
+    // The read still happens, to carry each server's launch identity on the write.
+    expect(read).toHaveBeenCalledTimes(3)
+    expect(setStub).not.toHaveBeenCalled()
     // Nothing was unmeasured, so no spawns were paid for.
     expect(start).not.toHaveBeenCalled()
-    // Counts come off the response: one written, two declined by the server.
-    await waitFor(() => expect(screen.getByText(/Stubbed 1\./)).toBeTruthy())
-    expect(screen.getByText(/Left 2 alone\./)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stub these servers' }))
+
+    // One request per server, each naming the launch that server showed: a single
+    // body cannot carry one launch identity per name, and the endpoint refuses a
+    // batch stub=true for that reason.
+    await waitFor(() => expect(setStub).toHaveBeenCalledTimes(3))
+    expect(setStub).toHaveBeenCalledWith('good-mcp', true, 'good-mcp-cmd:good-mcp-env', true)
+    expect(setStub).toHaveBeenCalledWith(
+      'measured-mcp',
+      true,
+      'measured-mcp-cmd:measured-mcp-env',
+      true,
+    )
+    expect(many).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.getByText(/Shared 3\./)).toBeTruthy())
+    expect(screen.queryByText(/Changed since you looked:/)).toBeNull()
+    expect(screen.queryByText(/Failed:/)).toBeNull()
+  })
+
+  it('writes nothing when the review is cancelled', async () => {
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [{ ...server({ name: 'good-mcp' }), recommendation: declared }],
+    } as never)
+    vi.spyOn(api, 'mcpGatewayLaunchPreview').mockImplementation(
+      (async (name: string) => preview(name)) as never,
+    )
+    const setStub = vi.spyOn(api, 'mcpGatewaySetStub')
+
+    mount()
+    await screen.findByText('good-mcp')
+    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+
+    await waitFor(() => expect(screen.queryByText('good-mcp@1')).toBeNull())
+    expect(setStub).not.toHaveBeenCalled()
   })
 
   it('re-reads the rows after the wait instead of trusting the click', async () => {
@@ -867,14 +945,13 @@ describe('stub every server the evidence allows', () => {
     // candidates at all -- a row absent at click time can exist by the end. The
     // sharing switch is deliberately NOT re-read here: that state belongs to the
     // server's decision now, taken inside the lock hold that writes.
-    const { fireEvent } = await import('@testing-library/react')
     vi.useFakeTimers()
     try {
       vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
       vi.spyOn(api, 'mcpMeasureStart').mockResolvedValue({ ...idleProgress, running: true } as never)
       vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
       // First paint shows one candidate; a second appears while the pass runs.
-      // Sending the click-time list would miss it.
+      // Reviewing the click-time list would miss it.
       const rows = vi
         .spyOn(api, 'mcpGatewayServers')
         .mockResolvedValueOnce({
@@ -886,13 +963,14 @@ describe('stub every server the evidence allows', () => {
             { ...server({ name: 'late-mcp' }), recommendation: declared },
           ],
         } as never)
-      const many = vi.spyOn(api, 'mcpGatewaySetStubMany').mockResolvedValue({
+      vi.spyOn(api, 'mcpGatewayLaunchPreview').mockImplementation(
+        (async (name: string) => preview(name)) as never,
+      )
+      const setStub = vi.spyOn(api, 'mcpGatewaySetStub').mockResolvedValue({
         ok: true,
-        names: ['fresh-mcp', 'late-mcp'],
+        name: 'late-mcp',
         stub: true,
         stubbed: ['late-mcp'],
-        skipped: [{ name: 'fresh-mcp', reason: 'evidence_insufficient' }],
-        applied: true,
       } as never)
 
       mount()
@@ -900,20 +978,29 @@ describe('stub every server the evidence allows', () => {
       fireEvent.click(screen.getByRole('button', { name: /evidence allows/i }))
       await vi.advanceTimersByTimeAsync(2 * 1000)
 
-      // The batch carries the row that only became visible after the wait.
-      await vi.waitFor(() =>
-        expect(many).toHaveBeenCalledWith(['fresh-mcp', 'late-mcp'], true, true),
-      )
+      // The confirm lists the row that only became visible after the wait.
+      await vi.waitFor(() => {
+        const dialog = screen.getByRole('dialog')
+        expect(within(dialog).getByText('late-mcp')).toBeTruthy()
+      })
       // Read more than once: the render's copy plus the post-wait re-read.
       expect(rows.mock.calls.length).toBeGreaterThan(1)
-      await vi.waitFor(() => screen.getByText(/Stubbed 1\./))
+
+      fireEvent.click(screen.getByRole('button', { name: 'Stub these servers' }))
+      await vi.waitFor(() =>
+        expect(setStub).toHaveBeenCalledWith(
+          'late-mcp',
+          true,
+          'late-mcp-cmd:late-mcp-env',
+          true,
+        ),
+      )
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('measures the unmeasured before deciding, then acts on the fresh verdicts', async () => {
-    const { fireEvent } = await import('@testing-library/react')
+  it('measures the unmeasured before asking, then reviews the fresh candidates', async () => {
     vi.useFakeTimers()
     try {
       vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
@@ -930,9 +1017,9 @@ describe('stub every server the evidence allows', () => {
         .mockResolvedValue({
           servers: [{ ...server({ name: 'fresh-mcp' }), recommendation: declared }],
         } as never)
-      const many = vi
-        .spyOn(api, 'mcpGatewaySetStubMany')
-        .mockResolvedValue({ ok: true, names: ['fresh-mcp'], stub: true, applied: true } as never)
+      const read = vi
+        .spyOn(api, 'mcpGatewayLaunchPreview')
+        .mockImplementation((async (name: string) => preview(name)) as never)
 
       mount()
       // The unmeasured row is what enables the button here — the eligible set is
@@ -942,12 +1029,125 @@ describe('stub every server the evidence allows', () => {
       // Past the first progress poll, which reports the pass already finished.
       await vi.advanceTimersByTimeAsync(2 * 1000)
 
-      await vi.waitFor(() => expect(many).toHaveBeenCalledWith(['fresh-mcp'], true, true))
+      await vi.waitFor(() => expect(read).toHaveBeenCalledWith('fresh-mcp'))
       expect(start).toHaveBeenCalledTimes(1)
       expect(servers.mock.calls.length).toBeGreaterThan(1)
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('counts what each write answered, not what the list asked for', async () => {
+    // Three outcomes that need different answers from the operator: written, left
+    // alone because there was nothing approvable to send, and refused because the
+    // command moved after it was shown. Folding the last into "left alone" hides
+    // the only one worth looking at again.
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        { ...server({ name: 'good-mcp' }), recommendation: declared },
+        { ...server({ name: 'moved-mcp' }), recommendation: declared },
+        { ...server({ name: 'failed-mcp' }), recommendation: declared },
+        { ...server({ name: 'ineligible-mcp' }), recommendation: disqualified },
+        { ...server({ name: 'huge-mcp' }), recommendation: declared },
+      ],
+    } as never)
+    const read = vi.spyOn(api, 'mcpGatewayLaunchPreview').mockImplementation((async (name: string) =>
+      name === 'huge-mcp'
+        ? preview(name, { complete: false, expected_launch: undefined })
+        : preview(name)) as never)
+    vi.spyOn(api, 'mcpGatewaySetStub').mockImplementation((async (name: string) => {
+      if (name === 'moved-mcp') {
+        throw new ApiError(
+          409,
+          'changed',
+          JSON.stringify({ error: 'changed', code: 'launch_changed_since_display' }),
+        )
+      }
+      if (name === 'failed-mcp') throw new Error('write failed')
+      if (name === 'ineligible-mcp') {
+        return {
+          ok: true,
+          name,
+          stub: true,
+          stubbed: [],
+          skipped: [{ name, reason: 'evidence_disqualified' }],
+        }
+      }
+      return { ok: true, name, stub: true, stubbed: [name], skipped: [] }
+    }) as never)
+
+    mount()
+    await screen.findByText('good-mcp')
+    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
+    // The candidate that cannot be approved stays in the list by name; the write
+    // skips it. No command text is shown.
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('huge-mcp')).toBeTruthy()
+    expect(screen.queryByText('huge-mcp@1')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stub these servers' }))
+
+    await waitFor(() => expect(screen.getByText(/Shared 1\./)).toBeTruthy())
+    expect(screen.getByText(/Left 2 alone\./)).toBeTruthy()
+    expect(api.mcpGatewaySetStub).toHaveBeenCalledWith(
+      'ineligible-mcp',
+      true,
+      'ineligible-mcp-cmd:ineligible-mcp-env',
+      true,
+    )
+    expect(screen.getByText(/Changed since you looked: 1\./)).toBeTruthy()
+    expect(screen.getByText(/Failed: 1\./)).toBeTruthy()
+    expect(screen.getByText('Changed: moved-mcp.')).toBeTruthy()
+    expect(screen.getByText('Failed: failed-mcp.')).toBeTruthy()
+    // Both outcomes read as errors, each saying what stopped that server. A
+    // changed launch is a refusal like any other -- the operator has to act on it
+    // before anything is shared -- so it gets the same notice, not a muted line.
+    const alerts = screen.getAllByRole('alert').map(alert => alert.textContent)
+    expect(alerts).toHaveLength(2)
+    expect(alerts.some(text => text?.includes('Could not apply the change'))).toBe(true)
+    expect(
+      alerts.some(text => text?.includes('moved-mcp: its command changed after it was read')),
+    ).toBe(true)
+    expect(screen.getAllByRole('button', { name: 'Ask the agent' })).toHaveLength(2)
+
+    // "Check again" re-reads that server's launch; one click then re-attempts the
+    // write with the fresh identity. No review panel opens -- the page shows no
+    // command to review.
+    fireEvent.click(screen.getByRole('button', { name: 'Check moved-mcp again' }))
+    await waitFor(() => expect(read).toHaveBeenLastCalledWith('moved-mcp'))
+    expect(screen.queryByRole('group', { name: 'Check what moved-mcp will run' })).toBeNull()
+  })
+
+  it('does not offer a confirmation that could only report zero', async () => {
+    // Nothing in the list can be approved, so the confirm button would write
+    // nothing and then claim a result. The per-row line already says why.
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [{ ...server({ name: 'other-mcp' }), recommendation: declared }],
+    } as never)
+    vi.spyOn(api, 'mcpGatewayLaunchPreview').mockRejectedValue(
+      new ApiError(
+        409,
+        'unresolved',
+        JSON.stringify({ error: 'unresolved', code: 'launch_unresolved' }),
+      ),
+    )
+    const setStub = vi.spyOn(api, 'mcpGatewaySetStub')
+
+    mount()
+    await screen.findByText('other-mcp')
+    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
+
+    // The candidate whose launch could not be read is listed by name, and the
+    // confirm is disabled because there is nothing approvable to send.
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText('other-mcp')).toBeTruthy()
+    const confirm = screen.getByRole('button', { name: 'Stub these servers' })
+    expect((confirm as HTMLButtonElement).disabled).toBe(true)
+    expect(setStub).not.toHaveBeenCalled()
   })
 
   it('shows the live pass position instead of a counter frozen at zero', async () => {
@@ -997,7 +1197,8 @@ describe('stub every server the evidence allows', () => {
       vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
         servers: [server({ name: 'fresh-mcp' })],
       } as never)
-      const many = vi.spyOn(api, 'mcpGatewaySetStubMany')
+      const read = vi.spyOn(api, 'mcpGatewayLaunchPreview')
+      const setStub = vi.spyOn(api, 'mcpGatewaySetStub')
 
       mount()
       await vi.waitFor(() => screen.getByText('fresh-mcp'))
@@ -1005,75 +1206,14 @@ describe('stub every server the evidence allows', () => {
       // Past the wait deadline.
       await vi.advanceTimersByTimeAsync(5 * 60 * 1000)
 
-      expect(many).not.toHaveBeenCalled()
+      // Not even a launch was read: acting on a half-measured fleet would put
+      // commands in front of the operator for servers the pass has not reached.
+      expect(read).not.toHaveBeenCalled()
+      expect(setStub).not.toHaveBeenCalled()
       await vi.waitFor(() => screen.getByText(/Still measuring/i))
     } finally {
       vi.useRealTimers()
     }
-  })
-
-  it('reports what the server decided, not what the request asked for', async () => {
-    // The client sends candidates and the server resolves eligibility inside the
-    // lock hold that writes them, so the two lists differ by design. Counting the
-    // request would claim stubs that were skipped.
-    const { fireEvent } = await import('@testing-library/react')
-    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
-    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
-    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
-      servers: [
-        { ...server({ name: 'good-mcp' }), recommendation: declared },
-        { ...server({ name: 'other-mcp' }), recommendation: declared },
-      ],
-    } as never)
-    const many = vi.spyOn(api, 'mcpGatewaySetStubMany').mockResolvedValue({
-      ok: true,
-      names: ['good-mcp', 'other-mcp'],
-      stub: true,
-      stubbed: ['good-mcp'],
-      skipped: [{ name: 'other-mcp', reason: 'evidence_insufficient' }],
-      applied: true,
-    } as never)
-
-    mount()
-    await screen.findByText('good-mcp')
-    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
-
-    // Every stubbable row is offered as a candidate; the server does the filtering.
-    await waitFor(() =>
-      expect(many).toHaveBeenCalledWith(['good-mcp', 'other-mcp'], true, true),
-    )
-    // One stubbed, one skipped -- both read off the RESPONSE.
-    await waitFor(() => expect(screen.getByText(/Stubbed 1\./)).toBeTruthy())
-    expect(screen.getByText(/Left 1 alone\./)).toBeTruthy()
-  })
-
-  it('does not claim the gateway failed when the server skipped every candidate', async () => {
-    // Nothing qualified, so the handler deliberately never calls the apply hook
-    // and answers `applied: false` with no `restart_required`. Reading that as
-    // "the gateway could not start" blames a failure for a write that was never
-    // attempted -- the "0 of N" notice is the whole story.
-    const { fireEvent } = await import('@testing-library/react')
-    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status({ enabled: true }) as never)
-    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue(idleProgress as never)
-    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
-      servers: [{ ...server({ name: 'other-mcp' }), recommendation: declared }],
-    } as never)
-    vi.spyOn(api, 'mcpGatewaySetStubMany').mockResolvedValue({
-      ok: true,
-      names: ['other-mcp'],
-      stub: true,
-      stubbed: [],
-      skipped: [{ name: 'other-mcp', reason: 'evidence_insufficient' }],
-      applied: false,
-    } as never)
-
-    mount()
-    await screen.findByText('other-mcp')
-    fireEvent.click(await screen.findByRole('button', { name: /evidence allows/i }))
-
-    await waitFor(() => expect(screen.getByText(/Left 1 alone\./)).toBeTruthy())
-    expect(screen.queryByRole('alert')).toBeNull()
-    expect(screen.queryByRole('status')).toBeNull()
   })
 
   it('renders the measured tier with its own label, not "not measured"', async () => {
@@ -1389,6 +1529,59 @@ describe('state chip honours the rewriter, not just the allowlist', () => {
     expect(screen.getByText('no stdio', { selector: 'span' })).toBeTruthy()
   })
 
+  it('counts the switches that read on, and names the rows still waiting', async () => {
+    // The header and the STUB column have to agree. A row waiting for re-approval
+    // keeps its opt-in in config while its switch reads off, so a header counting the
+    // config claims two opted in above a column showing one switch on, and leaves the
+    // operator to work out which of the two numbers is true.
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(
+      status({
+        enabled: true,
+        stub: ['alpha-mcp', 'beta-mcp'],
+        stub_count: 2,
+        running: true,
+        ping_ok: true,
+        launch_refused: {
+          'beta-mcp': {
+            reason: 'changed_needs_reapproval',
+            commands: [['npx', '-y', 'beta-mcp@2']],
+            envs: [[]],
+            expected_launch: 'b:b',
+          },
+        },
+      }) as never,
+    )
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        server({ name: 'alpha-mcp', stub: true, in_allowlist: true }),
+        server({ name: 'beta-mcp', stub: true, in_allowlist: true }),
+      ],
+    } as never)
+
+    mount()
+    expect(await screen.findByText('1 of 2 opted in to stubbing · 1 waiting for approval.')).toBeTruthy()
+    // The claim the counter has to agree with: one switch on, one off.
+    expect(
+      screen.getByRole('switch', { name: 'Put a stub in front of alpha-mcp' }),
+    ).toHaveAttribute('aria-checked', 'true')
+    expect(
+      screen.getByRole('switch', { name: 'Put a stub in front of beta-mcp' }),
+    ).toHaveAttribute('aria-checked', 'false')
+  })
+
+  it('drops the waiting clause when every switch reads on', async () => {
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(
+      status({ enabled: true, stub: ['alpha-mcp'], stub_count: 1, running: true, ping_ok: true }) as never,
+    )
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [server({ name: 'alpha-mcp', stub: true, in_allowlist: true })],
+    } as never)
+
+    mount()
+    expect(await screen.findByText('1 of 1 opted in to stubbing')).toBeTruthy()
+    expect(screen.queryByText(/waiting for approval/)).toBeNull()
+  })
+
   it('gaps the servers panel cards the same way the assessment view does', async () => {
     // The lede header, the two inline banners and the three cards are SIBLINGS
     // inside the servers tab panel. The `space-y-4` on the <Tabs> root only gaps
@@ -1404,5 +1597,72 @@ describe('state chip honours the rewriter, not just the allowlist', () => {
     // with role="tabpanel"; the inactive assessment panel is not in the DOM.
     const panel = await screen.findByRole('tabpanel')
     expect(panel.className).toContain('space-y-4')
+  })
+})
+
+
+describe('responsive layout', () => {
+  it('stacks setting cards and exposes table labels below md', async () => {
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({
+      servers: [
+        {
+          ...server({ name: 'alpha-mcp' }),
+          recommendation: {
+            strength: 'no_objection',
+            recommendShare: false,
+            reasons: [{ code: 'no_objection_found', detail: '' }],
+          },
+        },
+      ],
+    } as never)
+    vi.spyOn(api, 'mcpMeasureProgress').mockResolvedValue({
+      running: false,
+      done: 0,
+      total: 0,
+    } as never)
+
+    mount()
+
+    // happy-dom does not compute responsive geometry. Pin the narrow-first
+    // layout contract and the labels that replace hidden table headings.
+    const sharingTitle = await screen.findByText('Share backends across sessions')
+    const sharingLayout = sharingTitle.closest('section')?.firstElementChild as HTMLElement
+    expect(sharingLayout.className).toContain('flex-col')
+    expect(sharingLayout.className).toContain('md:flex-row')
+
+    await screen.findByText('alpha-mcp')
+    const count = screen.getByText('0 of 1 opted in to stubbing')
+    expect(count.className).toContain('break-words')
+    expect(count.className).toContain('[overflow-wrap:anywhere]')
+    expect(count.className).toContain('md:whitespace-nowrap')
+
+    const updateButton = screen.getByRole('button', { name: 'Update now' })
+    const resolveLayout = updateButton.closest('section')?.firstElementChild as HTMLElement
+    expect(resolveLayout.className).toContain('flex-col')
+    expect(resolveLayout.className).toContain('md:flex-row')
+
+    const serversTable = screen.getByText('alpha-mcp').closest('table') as HTMLTableElement
+    const serversRow = screen.getByText('alpha-mcp').closest('tr') as HTMLTableRowElement
+    expect(serversTable.className).toContain('block')
+    expect(serversTable.className).toContain('md:table')
+    expect(serversRow.className).toContain('grid')
+    expect(serversRow.className).toContain('md:table-row')
+    expect(screen.getAllByText('Used by')).toHaveLength(2)
+    expect(screen.getAllByText('State')).toHaveLength(2)
+    expect(screen.getAllByText('Stub')).toHaveLength(2)
+
+    fireEvent.mouseDown(screen.getByRole('tab', { name: /sharing assessment/i }))
+    await screen.findByRole('columnheader', { name: 'Assessment' })
+
+    const assessmentTable = screen.getByText('alpha-mcp').closest('table') as HTMLTableElement
+    const assessmentRow = screen.getByText('alpha-mcp').closest('tr') as HTMLTableRowElement
+    expect(assessmentTable.className).toContain('block')
+    expect(assessmentTable.className).toContain('md:table')
+    expect(assessmentRow.className).toContain('grid')
+    expect(assessmentRow.className).toContain('md:table-row')
+    expect(screen.getAllByText('Assessment')).toHaveLength(2)
+    expect(screen.getAllByText('Evidence')).toHaveLength(2)
+    expect(screen.getAllByText('Running as')).toHaveLength(2)
   })
 })

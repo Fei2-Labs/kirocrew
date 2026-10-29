@@ -201,9 +201,9 @@ def collect(surface: str) -> list[str]:
         # fails the Windows shards on any diff that takes the reduced scope.
         #
         # Rebuild the entries as `test/`-relative paths rather than matching on
-        # the bare filename. The list is consumed by `test/conftest.py`, and
-        # pytest resolves `collect_ignore` relative to the conftest's own
-        # directory -- so the exclusion covers `test/<name>` and nothing else.
+        # the bare filename. The list is consumed by `test/conftest.py`, whose
+        # `pytest_ignore_collect` hook matches a listed name only directly under
+        # `test/` -- so the exclusion covers `test/<name>` and nothing else.
         # A basename match would also drop a same-named suite under `transfer/`
         # or the apps-builtins tree, which no conftest excludes and Windows
         # collects fine: a silently skipped guard, the one outcome this

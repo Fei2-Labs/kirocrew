@@ -142,6 +142,206 @@ def test_aws_bin_fallback_hit_failing_provenance_returns_bare_name(monkeypatch, 
     assert engine.resolve_aws_bin() == "aws"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_aws_bin_refused_dir_does_not_shadow_a_good_later_dir(monkeypatch, tmp_path):
+    """A refusal ends that DIR, not the search.
+
+    Reported from a macOS host where Homebrew is managed by a second
+    unprivileged account (Workbrew): /opt/homebrew/bin/aws is owned by
+    ``workbrew`` and correctly refused, but it also sorts first, so stopping at
+    the refusal never reached the root-owned official-pkg /usr/local/bin/aws and
+    every SSM tunnel died at gateway start with "[Errno 2] ... 'aws'". Installing
+    the official pkg — the documented remedy — could not fix it.
+    """
+    bad_dir = tmp_path / "brew"
+    good_dir = tmp_path / "usrlocal"
+    empty_bin = tmp_path / "emptybin"
+    for d in (bad_dir, good_dir, empty_bin):
+        d.mkdir()
+    for d in (bad_dir, good_dir):
+        binary = d / "aws"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(bad_dir), str(good_dir)))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    def _refuse_only_bad(candidate):
+        if candidate.startswith(str(bad_dir)):
+            raise ValueError("owned by another unprivileged account")
+        return candidate
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse_only_bad)
+
+    assert engine.resolve_aws_bin() == str(good_dir / "aws")
+    # The refused dir is remembered so it stays off a credential-bearing
+    # child's PATH; the accepted one must not be recorded. Keyed by (name, dir).
+    assert engine._REFUSED_AWS_BIN_DIRS == {("aws", str(bad_dir))}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_aws_spawn_env_omits_a_refused_dir_while_widening_for_a_good_one(monkeypatch, tmp_path):
+    """Walking past a refusal must not smuggle the refused dir onto the child.
+
+    A resolved absolute head does not imply every install dir was clean, so
+    the widening has to drop the individual dirs that were refused — otherwise
+    the shim just rejected as the argv head becomes reachable again through the
+    CLI's own onward session-manager-plugin lookup, with AWS credentials.
+    """
+    bad_dir = tmp_path / "brew"
+    good_dir = tmp_path / "usrlocal"
+    empty_bin = tmp_path / "emptybin"
+    for d in (bad_dir, good_dir, empty_bin):
+        d.mkdir()
+    for d in (bad_dir, good_dir):
+        binary = d / "aws"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(bad_dir), str(good_dir)))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    def _refuse_only_bad(candidate):
+        if candidate.startswith(str(bad_dir)):
+            raise ValueError("owned by another unprivileged account")
+        return candidate
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse_only_bad)
+
+    aws_bin = engine.resolve_aws_bin()
+    child_path = engine.aws_spawn_env(aws_bin)["PATH"].split(os.pathsep)
+
+    assert str(good_dir) in child_path  # the plugin's real install dir
+    assert str(bad_dir) not in child_path  # refused: must stay unreachable
+    assert child_path.index(str(empty_bin)) < child_path.index(str(good_dir))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_aws_bin_every_dir_refused_still_returns_bare_name(monkeypatch, tmp_path):
+    """Exhausting the list is still fail-closed: no dir may be executed, and the
+    prior not-found/execvp error is what the caller gets."""
+    first = tmp_path / "brew"
+    second = tmp_path / "usrlocal"
+    empty_bin = tmp_path / "emptybin"
+    for d in (first, second, empty_bin):
+        d.mkdir()
+    for d in (first, second):
+        binary = d / "aws"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(first), str(second)))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    def _refuse(candidate):
+        raise ValueError("planted shim")
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse)
+
+    assert engine.resolve_aws_bin() == "aws"
+    # A bare head means the env stays unwidened, so neither dir is reachable.
+    assert engine.aws_spawn_env("aws").get("PATH", "") == str(empty_bin)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_aws_bin_repaired_dir_is_cleared_from_the_refused_set(monkeypatch, tmp_path):
+    """Fixing the install must take effect without a gateway restart: the
+    resolver re-validates on every call, so a dir that passes again is cleared
+    and its PATH entry comes back."""
+    install = tmp_path / "brew"
+    empty_bin = tmp_path / "emptybin"
+    for d in (install, empty_bin):
+        d.mkdir()
+    binary = install / "aws"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install),))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    ownership_fixed = {"yet": False}
+
+    def _validate(candidate):
+        if not ownership_fixed["yet"]:
+            raise ValueError("owned by another unprivileged account")
+        return candidate
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _validate)
+
+    assert engine.resolve_aws_bin() == "aws"
+    assert engine._REFUSED_AWS_BIN_DIRS == {("aws", str(install))}
+
+    ownership_fixed["yet"] = True
+
+    assert engine.resolve_aws_bin() == str(binary)
+    assert engine._REFUSED_AWS_BIN_DIRS == set()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_aws_pass_does_not_clear_a_refused_plugin_in_the_same_dir(monkeypatch, tmp_path):
+    """A passing resolve of one name must not re-admit a dir refused for another.
+
+    resolve_aws_tool_bin is generic over name: aws and session-manager-plugin
+    share one install dir. In a mixed-ownership dir a brew-owned
+    session-manager-plugin is refused while a root-owned aws passes. Keying the
+    refusal by (name, dir) means the aws pass cannot discard the plugin's refusal,
+    so aws_spawn_env still drops that dir and the refused plugin cannot be reached
+    through the CLI's by-name onward lookup with AWS credentials.
+    """
+    mixed = tmp_path / "brew"
+    good = tmp_path / "usrlocal"
+    empty_bin = tmp_path / "emptybin"
+    for d in (mixed, good, empty_bin):
+        d.mkdir()
+    # Both tools exist in the mixed dir; only aws also exists in the good dir.
+    for name in ("aws", "session-manager-plugin"):
+        b = mixed / name
+        b.write_text("#!/bin/sh\n")
+        b.chmod(0o755)
+    for name in ("aws", "session-manager-plugin"):
+        b = good / name
+        b.write_text("#!/bin/sh\n")
+        b.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(mixed), str(good)))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    def _refuse_mixed_plugin(candidate):
+        # Only the plugin in the mixed dir is refused; aws there passes.
+        if candidate == str(mixed / "session-manager-plugin"):
+            raise ValueError("plugin owned by another unprivileged account")
+        return candidate
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse_mixed_plugin)
+
+    # Resolve the plugin: refused in the mixed dir, accepted in the good dir.
+    assert engine.resolve_aws_tool_bin("session-manager-plugin") == str(
+        good / "session-manager-plugin"
+    )
+    assert ("session-manager-plugin", str(mixed)) in engine._REFUSED_AWS_BIN_DIRS
+
+    # Now resolve aws: it passes in the mixed dir (its own name is clean there).
+    assert engine.resolve_aws_bin() == str(mixed / "aws")
+    # The aws pass must NOT have cleared the plugin's refusal for the mixed dir.
+    assert ("session-manager-plugin", str(mixed)) in engine._REFUSED_AWS_BIN_DIRS
+
+    # So the credential-bearing child's PATH still excludes the mixed dir: the
+    # refused plugin cannot come back through the CLI's by-name onward lookup.
+    child_path = engine.aws_spawn_env(str(mixed / "aws"))["PATH"].split(os.pathsep)
+    assert str(mixed) not in child_path
+    assert str(good) in child_path
+
+
 def test_aws_bin_prefers_path_then_falls_back_to_bare_name(monkeypatch):
     """When the CLI is nowhere on PATH or the extra dirs, fall back to the bare
     'aws' so the prior 'not found' behaviour/error is preserved."""
@@ -213,6 +413,62 @@ def test_aws_tool_bin_refused_provenance_falls_back_to_that_tool_s_name(monkeypa
     monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse)
 
     assert engine.resolve_aws_tool_bin("session-manager-plugin") == "session-manager-plugin"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_resolver_reports_the_candidates_this_walk_refused(monkeypatch, tmp_path):
+    """The refusal list is what lets a caller say "found but refused" instead of
+    "not installed"; it reports the walk's own decision and changes none of it."""
+    refused_dir, good_dir, empty_bin = tmp_path / "brew", tmp_path / "pkg", tmp_path / "e"
+    for d in (refused_dir, good_dir, empty_bin):
+        d.mkdir()
+    refused = refused_dir / "session-manager-plugin"
+    refused.write_text("#!/bin/sh\n")
+    refused.chmod(0o755)
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(refused_dir), str(good_dir)))
+    monkeypatch.setattr(engine, "_REFUSED_AWS_BIN_DIRS", set())
+
+    from kiro_crew import github_runner
+
+    def _validate(candidate):
+        if candidate.startswith(str(refused_dir)):
+            raise ValueError("executable is owned by another user (uid 1501)")
+        return candidate
+
+    monkeypatch.setattr(github_runner, "validate_provider_executable", _validate)
+
+    resolved, refusals = engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin")
+    assert resolved == "session-manager-plugin"
+    assert refusals == (
+        engine.AwsToolRefusal(str(refused), "executable is owned by another user (uid 1501)"),
+    )
+    assert engine._REFUSED_AWS_BIN_DIRS == {("session-manager-plugin", str(refused_dir))}
+
+    accepted = good_dir / "session-manager-plugin"
+    accepted.write_text("#!/bin/sh\n")
+    accepted.chmod(0o755)
+    resolved, refusals = engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin")
+    assert resolved == str(accepted)
+    assert [r.path for r in refusals] == [str(refused)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fallback branch is dead on Windows")
+def test_resolver_refusals_come_from_this_walk_not_the_shared_set(monkeypatch, tmp_path):
+    """A candidate removed since an earlier refusal is not reported as refused."""
+    gone_dir, empty_bin = tmp_path / "brew", tmp_path / "e"
+    gone_dir.mkdir()
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(gone_dir),))
+    monkeypatch.setattr(
+        engine, "_REFUSED_AWS_BIN_DIRS", {("session-manager-plugin", str(gone_dir))}
+    )
+
+    assert engine.resolve_aws_tool_bin_with_refusals("session-manager-plugin") == (
+        "session-manager-plugin",
+        (),
+    )
 
 
 def test_aws_spawn_env_appends_install_dirs_after_inherited_path(monkeypatch, tmp_path):

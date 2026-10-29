@@ -225,14 +225,14 @@ def ensure_routed_settings(work_dir: Path | str) -> bool:
 
     - **Writes only when no permission is configured.** An explicit ``allow``,
       ``ask``, object map, or any other operator choice stays. A configured
-      bypass therefore remains, the verdict stays BYPASSED, and the session
-      refuses unless the named opt-out is on.
+      bypass therefore remains and the verdict stays BYPASSED. The route is not
+      treated as established in that state.
     - **Merges rather than replaces.** Other keys in the project file are
       preserved. Writes only under ``work_dir``, never ``~/.config/opencode``.
 
     Returns True when it wrote. Failures are reported, never swallowed: the
     caller's routing probe reads the file back, so a failed write surfaces as
-    INDETERMINATE and refuses the session rather than passing silently.
+    INDETERMINATE and the route cannot be treated as established.
     """
     path, data, exists = _read_project_config(work_dir)
     if data is not None and "permission" in data:

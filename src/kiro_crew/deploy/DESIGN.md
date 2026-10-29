@@ -7,7 +7,7 @@ removed and the feature was folded into core at `src/kiro_crew/deploy/`. The das
 [Artifact Deploy](../docs/deploy-web.md).
 
 The current implementation also differs from the proposal below in three important ways: the
-`deploy-web-aws` row is a core provider emitted by `src/kiro_crew/apps/routes.py`; profiles live in
+`deploy-web-aws` row is a core provider emitted by `src/kiro_crew/apps/routes_listing.py`; profiles live in
 the multi-profile registry at `~/.kiro/crew/deploy/profiles.json`; and the MCP `deploy_artifact`
 tool is preview-only, with execution confirmed by a human in the dashboard. Static artifact
 publishing uses per-site infrastructure, while the operator scripts for app artifacts use the
@@ -236,7 +236,7 @@ Two deterministic steps run in the Python module **before** assets are uploaded:
 
 **b) Pre-publish content scan (Q4)** — deploying makes content world-readable, so before
 upload the module runs the rendered output through Kiro Crew's **existing
-`redaction.py`/`security.py` secret regexes** + internal-data heuristics (employee aliases,
+`redaction_patterns.py`/`security.py` secret regexes** + internal-data heuristics (employee aliases,
 `*.internal-corp` hosts, AWS account ids/ARNs). On a match: **block-and-warn** — show what
 was flagged and where, require an explicit "publish anyway"; **never silently redact**.
 Always show a content summary in the approval. Best-effort detection, not a guarantee.

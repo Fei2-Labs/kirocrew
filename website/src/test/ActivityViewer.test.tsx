@@ -675,6 +675,91 @@ describe('ActivityViewer — Artifacts tab', () => {
     expect(cancel.className).toContain('shrink-0')
     expect(cancel.className).toContain('whitespace-nowrap')
   })
+
+  // #19930: the card's hand-rolled `m`/`s` string had no hours band, so a run
+  // past an hour read `69m 32s`. It now routes through the shared fmtElapsed.
+  it.each([
+    ['running', 'tool' as const, 4_172_000, 0, '1h 9m 32s', '69m 32s'],
+    ['settled', 'done' as const, 4_031_000, 4031, '1h 7m 11s', '67m 11s'],
+  ])('renders a %s card past an hour with an hours band', (_label, status, runMs, elapsed, shown, old) => {
+    // Pin the clock so the live 1 Hz figure cannot tick past the asserted value.
+    const t0 = 1_700_000_000_000
+    vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const timing = { status, startedAt: t0 - runMs, elapsed }
+    const store = configureStore({
+      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
+    })
+    store.dispatch(openActivityToTab('subagents'))
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <Provider store={store}>
+        <QueryClientProvider client={qc}>
+          <ActivityViewer
+            toolLog={[]}
+            open
+            onToggle={vi.fn()}
+            slot="test-slot"
+            subagents={{
+              s1: { id: 's1', task: 'long run', agent: 'kirocrew', streaming: '', lastTool: 'read', ...timing },
+            }}
+          />
+        </QueryClientProvider>
+      </Provider>,
+    )
+    try {
+      expect(screen.getAllByText(shown).length).toBeGreaterThan(0)
+      expect(screen.queryByText(old)).toBeNull()
+    } finally {
+      vi.mocked(Date.now).mockRestore()
+    }
+  })
+
+  it.each([0.25, 0, -1, Number.NaN, undefined])('shows credit summaries only for managed expanded cards (%s)', (credits) => {
+    const store = configureStore({
+      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
+    })
+    store.dispatch(openActivityToTab('subagents'))
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <Provider store={store}>
+        <QueryClientProvider client={qc}>
+          <ActivityViewer
+            toolLog={[]}
+            open
+            onToggle={vi.fn()}
+            slot="test-slot"
+            subagents={{
+              ok: {
+                id: 'ok', task: 'successful task', agent: 'kirocrew', status: 'done',
+                streaming: '', lastTool: '', startedAt: Date.now() - 12_000,
+                elapsed: 12, credits,
+              },
+              failed: {
+                id: 'failed', task: 'failed task', agent: 'kirocrew', status: 'error',
+                streaming: '', lastTool: '', startedAt: Date.now() - 65_000,
+                elapsed: 65, credits: 12.5, error: 'boom',
+              },
+              'native:child': {
+                id: 'native:child', task: 'native task', agent: 'kirocrew', status: 'done',
+                streaming: '', lastTool: '', startedAt: Date.now() - 12_000,
+                elapsed: 12, credits,
+              },
+            }}
+          />
+        </QueryClientProvider>
+      </Provider>,
+    )
+
+    const stats = screen.getAllByTestId('subagent-run-stats')
+    expect(stats.map(node => node.textContent)).toEqual(expect.arrayContaining(['12s', '1m 5s']))
+    expect(screen.queryByTestId('subagent-credit-usage')).not.toBeInTheDocument()
+    for (const node of stats) fireEvent.click(node.closest('[aria-expanded]')!)
+    const usage = screen.getAllByTestId('subagent-credit-usage').map(node => node.textContent)
+    expect(usage).toHaveLength(2)
+    expect(usage).toEqual(credits === 0.25
+      ? expect.arrayContaining(['Used 0.25 credits', 'Used 12.5 credits'])
+      : expect.arrayContaining(['Credit usage not reported', 'Used 12.5 credits']))
+  })
 })
 
 /**
@@ -687,13 +772,13 @@ describe('ActivityViewer — queued subagents', () => {
   const SLOT = 'test-slot'
   const baseProps = { subagents: {}, toolLog: [], open: true, onToggle: vi.fn(), slot: SLOT }
 
-  function queuedWrapper(queued: number) {
+  function queuedWrapper(queued: number, reason?: { reason: string; available_gb?: number; required_gb?: number; max_wait_secs?: number }) {
     return function Wrapper({ children }: { children: React.ReactNode }) {
       const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
       const store = configureStore({
         reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
       })
-      if (queued > 0) store.dispatch(sseSubagentQueued({ slot: SLOT, queued }))
+      if (queued > 0) store.dispatch(sseSubagentQueued({ slot: SLOT, queued, ...reason }))
       return (
         <Provider store={store}>
           <QueryClientProvider client={qc}>{children}</QueryClientProvider>
@@ -706,6 +791,125 @@ describe('ActivityViewer — queued subagents', () => {
     render(<ActivityViewer {...baseProps} view="subagents" />, { wrapper: queuedWrapper(3) })
     expect(screen.getByTestId('subagent-queued-banner').textContent).toContain('3 waiting to start')
     expect(screen.queryByText('No subagents running')).not.toBeInTheDocument()
+  })
+
+  it('keeps the concurrency text for a count with no reason (older gateway)', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, { wrapper: queuedWrapper(3) })
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('3 waiting to start — queued behind the concurrency limit')
+  })
+
+  it('says a memory-deferred wave waits for memory, with both figures', () => {
+    // The F20 report: cap 4, one queued, "queued behind the concurrency limit"
+    // forever -- the memory guard had parked it and the panel never said so.
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toContain('1 waiting to start')
+    expect(text).toMatch(/4\.5\s?GB/)
+    expect(text).toMatch(/3\.2\s?GB/)
+    expect(text).not.toContain('concurrency limit')
+  })
+
+  it('renders an older gateway\'s paused-cap label as the default text', () => {
+    // The execution cap is never paused any more, so the kind is not one the
+    // chip knows; it falls back to the text an unlabelled wait shows.
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(2, { reason: 'adaptive_cap_zero' }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toContain('2 waiting to start')
+    expect(text).not.toContain('low on memory or overloaded')
+  })
+
+  it('names macOS memory pressure without GB figures, even if an event carries them', () => {
+    // The kernel's pressure verdict holds a start whose free-memory figure
+    // cleared the floor, so a "needs M GB, N GB free" pair would contradict it.
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'memory_pressure', available_gb: 8, required_gb: 4.5 }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toBe(
+      '1 waiting to start — macOS reports memory pressure; close other apps to ease it',
+    )
+    expect(text).not.toMatch(/GB/)
+  })
+
+  it('names the live wait bound on a memory wait, plural-aware', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'memory_pressure', max_wait_secs: 1800 }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent).toBe(
+      '1 waiting to start — macOS reports memory pressure; close other apps to ease it; they never start if memory stays short for 30\u00A0minutes',
+    )
+  })
+
+  it('names a one-hour bound in the singular on a figure-less low-memory wait', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', max_wait_secs: 3600 }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent).toBe(
+      '1 waiting to start — not enough free memory; free up memory to continue; they never start if memory stays short for 1\u00A0hour',
+    )
+  })
+
+  it('adds the bound after both figures on a low-memory wait', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5, max_wait_secs: 90 }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toMatch(/4\.5\s?GB/)
+    expect(text).toContain('they never start if memory stays short for 1\u00A0minute 30\u00A0seconds')
+  })
+
+  it('says outright that a 0 bound waits with no time limit', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', max_wait_secs: 0 }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('1 waiting to start — not enough free memory; free up memory to continue; they wait with no time limit')
+  })
+
+  it('names no limit at all when an older gateway sends no bound', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'memory_pressure' }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).not.toContain('time limit')
+    expect(text).not.toContain('never start')
+  })
+
+  it('tells the user what to do about a memory wait', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent).toContain('free up memory to continue')
+  })
+
+  it('drops to the figure-less sentence when a memory event carries no numbers', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'low_memory' }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toBe('1 waiting to start — not enough free memory; free up memory to continue')
+    expect(text).not.toMatch(/needs .* of free memory/)
+  })
+
+  it('keeps the default text for the posture label an older gateway sent', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'posture_critical' }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('1 waiting to start — queued behind the concurrency limit')
+  })
+
+  it('keeps the concurrency text for the concurrency kind itself', () => {
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(2, { reason: 'concurrency_limit' }),
+    })
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('2 waiting to start — queued behind the concurrency limit')
   })
 
   it('keeps the honest empty state when nothing is queued or running', () => {

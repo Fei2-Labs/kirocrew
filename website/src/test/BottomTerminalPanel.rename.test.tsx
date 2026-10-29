@@ -21,6 +21,7 @@ vi.mock('../components/CliPanel', () => ({
 }))
 vi.mock('../utils/terminalRegistry', () => ({
   useTerminalTitle: () => terminal.title,
+  getTerminalTitle: () => terminal.title,
   disposeTerminalConnection: vi.fn(),
 }))
 vi.mock('../utils/terminalPopout', () => ({
@@ -634,5 +635,31 @@ describe('terminal Unicode name cold reload', () => {
       unmount()
       reloaded.__resetBottomTerminal()
     }
+  })
+})
+
+describe('terminal tab middle-button mousedown (autoscroll guard)', () => {
+  // Chromium on Windows starts autoscroll from the middle-button MOUSEDOWN when
+  // the strip is a scroll container, and then no auxclick ever fires, so the
+  // middle-click close never runs. jsdom has no autoscroll: these pin the
+  // cancellation, not autoscroll itself.
+  const mouseDown = (el: Element, button: number) => {
+    const ev = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button })
+    fireEvent(el, ev)
+    return ev
+  }
+
+  it('cancels a middle-button mousedown on a terminal tab and leaves the primary button alone', () => {
+    mount()
+    const tab = screen.getByRole('tab')
+    expect(mouseDown(tab, 1).defaultPrevented).toBe(true)
+    expect(mouseDown(tab, 0).defaultPrevented).toBe(false)
+  })
+
+  it('leaves the rename field its own middle-button behaviour while editing', async () => {
+    mount()
+    await userEvent.dblClick(screen.getByRole('tab', { name: 'workspace' }))
+    expect(editor()).toHaveFocus()
+    expect(mouseDown(editor(), 1).defaultPrevented).toBe(false)
   })
 })

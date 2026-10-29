@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -24,7 +24,17 @@ import { join } from 'node:path'
  * Source-scanned because these gates live in interval bodies and callbacks with
  * no exported seam.
  */
-const SRC = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+const PAGES_DIR = join(__dirname, '..', 'pages')
+const OWNER_DIR = join(PAGES_DIR, 'chat', 'page')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and
+// those owners, and the retired latch must not return through one of them.
+const OWNER_SRCS = [
+  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readFileSync(join(OWNER_DIR, f), 'utf8')),
+  ...readdirSync(PAGES_DIR).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readFileSync(join(PAGES_DIR, f), 'utf8')),
+]
+const SRC = [readFileSync(join(PAGES_DIR, 'ChatPage.tsx'), 'utf8'), ...OWNER_SRCS].join('\n')
 
 describe('real-gesture authorization', () => {
   it('refreshes the gesture stamp from gestures only, not from scroll', () => {
@@ -122,7 +132,7 @@ describe('top sentinel (handleTopReached)', () => {
     // Neither obvious signal can key this. A one-way input latch (one write, no
     // reset) left one touch of a scrollable transcript authorizing the automatic
     // doors for the rest of the mount; it no longer exists anywhere in the file.
-    expect(SRC).not.toMatch(/sawRealInputRef/)
+    for (const src of [SRC, ...OWNER_SRCS]) expect(src).not.toMatch(/sawRealInputRef/)
     // And `!follow` is the design shouldAutoFillOlder's own contract names as
     // falsified — follow is released with no reader input by an anchor restore and
     // at slot entry, where `lastWriteTop` resets to -1 so the idle branch's

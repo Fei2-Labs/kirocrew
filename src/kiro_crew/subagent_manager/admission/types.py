@@ -14,19 +14,113 @@ if TYPE_CHECKING:
 #: can tell "nothing was accepted, retry later" from a policy refusal.
 TASK_STORE_UNAVAILABLE_CODE = "task_store_unavailable"
 
+#: The shortest delay an admission re-check timer whose delay derives from
+#: ``admit_wait_secs`` or a row's wake is armed with: the pump's waiting-row
+#: wake and the retained-claim and boundary-cancel retries. A delay that reaches
+#: 0 would re-run the same pass on the next loop turn, which is a spin when that
+#: pass cannot make progress.
+MIN_RECHECK_DELAY_SECS = 0.05
 
-def tombstone_terminal_state(cause: str) -> str | None:
-    """The terminal task state a tombstone cause proves, loaded on first use."""
+#: The window entry key that marks an entry the refill hydrated from a
+#: ``recovering`` row: a run being rebuilt after its owner was lost, which the
+#: queue-depth chip does not count as waiting to start. It is also ``spawn``'s
+#: keyword of the same name, so the pump hands it on with the rest of the entry
+#: and a gate that re-queues the still-unclaimed row (stagger, cap, child
+#: reserve) puts the mark back on the entry it appends. Never persisted.
+WINDOW_ENTRY_RECOVERING = "_recovering_row"
+
+#: A ``_queue`` entry's monotonic not-before time: a start with no durable row
+#: that did not fit the memory floor waits in the in-memory window, and the
+#: pump skips it until then -- the in-memory twin of a durable row's
+#: ``next_run_at``. Popped with ``_lane`` before the entry reaches ``spawn``.
+MEMORY_WAIT_UNTIL_KEY = "_memory_wait_until"
+
+#: The memory cause the spawn gate records for a start the per-lane memory
+#: share holds back (``_MemoryWakeMixin.lane_share_holds``): another lane waits
+#: for memory and this start's lane already runs its share of dedicated
+#: children. A cause of its own, so the gate words the wait without a figure
+#: (no reading was taken) and the wake knows no host reading can release it.
+MEMORY_CAUSE_LANE_SHARE = "lane_share"
+
+#: How often the memory sampler runs a fit pass while a start waits for memory
+#: (seconds). It runs ONLY while one does (``_MemoryWakeMixin``), so a start
+#: held by memory another program frees is not left to its admit wait.
+MEMORY_SAMPLER_SECS = 5.0
+
+
+@dataclass
+class MemoryWait:
+    """One start this process holds back for memory, from its first deferral to its end.
+
+    ``start_gb`` is what the floor charges the start for itself (None: the
+    configured cost; 0 for a nested start that shares its parent's runtime),
+    ``price_gb`` what its row owes once admitted (None: the configured cost).
+    The fit pass rebuilds the start's bar from them. ``nested`` exempts it from
+    the per-lane share. ``since`` is monotonic. ``remote`` marks a remote session's
+    child, whose bar owes no gateway floor (only its engine runs here).
+    """
+
+    lane: str
+    parent_session_key: str
+    since: float
+    start_gb: float | None
+    price_gb: float | None
+    nested: bool
+    durable: bool
+    remote: bool = False
+
+
+def outcome_task_state(outcome: str) -> str | None:
+    """The terminal task state of a run's recorded outcome (``SubagentInfo.outcome``).
+
+    ONE table for the live settle (``taskq_settle``) and the boot probe, so the
+    two cannot disagree about the same ending. Its keys are the outcome
+    vocabulary (``subagent_persistence._PANEL_OUTCOMES``);
+    ``test_taskq_reconcile.py`` pins that every outcome maps.
+    """
     from kiro_crew import taskq
 
     return {
+        "completed": taskq.DONE,
+        "stopped": taskq.CANCELLED,
+        "failed": taskq.FAILED,
+    }.get(outcome)
+
+
+def tombstone_terminal_state(cause: str, outcome: str = "") -> str | None:
+    """The terminal task state a tombstone proves, loaded on first use.
+
+    The ending the writer recorded (``outcome``) decides first, exactly as the
+    live settle decided it (:func:`outcome_task_state`); the coarser ``cause``
+    answers for a tombstone that recorded none. ``gateway_restart`` proves
+    nothing by itself, and is the one cause missing here
+    (``test_every_tombstone_cause_has_a_terminal_state`` pins that).
+    """
+    from kiro_crew import taskq
+    from kiro_crew.subagent import _NEUTRAL_REAP_REASONS
+
+    recorded = outcome_task_state(outcome)
+    if recorded is not None:
+        return recorded
+    if cause in _NEUTRAL_REAP_REASONS:
+        # A user stop and a parent end are deliberate stops, written by the
+        # same reap: the row they leave behind is cancelled, not a run to
+        # recover on the next boot. Read from the set that makes the live record
+        # neutral (``SubagentInfo.stop_is_neutral``), so the two cannot drift.
+        return taskq.CANCELLED
+    return {
         "delivered": taskq.DONE,
-        "user_stop": taskq.CANCELLED,
+        # ``stage_cancel`` tombstones written by the retired chat Autopilot can
+        # still sit on disk, and they read as the deliberate stop they were.
+        "stage_cancel": taskq.CANCELLED,
         "cancelled": taskq.CANCELLED,
         "error": taskq.FAILED,
         "timeout": taskq.FAILED,
         "turn_limit": taskq.FAILED,
         "child_escalation_limit": taskq.FAILED,
+        "reaped": taskq.FAILED,
+        "startup_timeout": taskq.FAILED,
+        "start_queue_saturated": taskq.FAILED,
     }.get(cause)
 
 
@@ -83,6 +177,25 @@ class PreparedSpawn:
 
 
 @dataclass(frozen=True)
+class MemoryReadPoint:
+    """``spawn_impl(_stop_before_memory_read=True)``: every policy gate passed
+    and the memory floor's bar (*min_gb*: the floor plus this start's price
+    plus what warming starts still owe) is known, but the host has not been
+    read. The reading walks cgroup files, so an event-loop caller takes it on
+    a worker thread and re-enters ``spawn(**params, _memory_reading=...)``.
+    The re-entry recomputes the bar on the loop and decides against that, so a
+    start admitted while the read ran is charged. It re-runs the policy gates
+    (a governance change made during the read must hold), on a row
+    ``spawn_async`` already committed (``_store_accepted``) too, whose refusal
+    fails that row. NOTHING is reserved here: no slot
+    and no row write. A batch member's submission is counted by this pass, as
+    on any first entry, and the re-entry does not count it again."""
+
+    min_gb: float
+    params: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ClaimPoint:
     """``spawn_impl(_stop_before_claim=True)``: every gate passed and the row
     is about to be claimed. The SLOT IS RESERVED at this point -- the running
@@ -91,13 +204,10 @@ class ClaimPoint:
     event-loop dispatcher takes the claim on the store's writer thread and
     re-enters with ``_claimed``, which CONSUMES the reservation (registration
     does not count the run a second time); every non-start exit of that
-    re-entry releases it (:meth:`SpawnAdmissionCoordinator.release_reservation`).
-    Boundary identity crosses the await so cancellation can be revalidated
-    immediately before registration instead of trusting a stale claim result."""
+    re-entry releases it (:meth:`SpawnAdmissionCoordinator.release_reservation`)."""
 
     agent_id: str
     parent_session_key: str = ""
-    boundary_owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,6 +231,64 @@ class DeferPoint:
     batch_id: str
     queued: "SubagentInfo"
     refused: "SubagentInfo"
+    # The gate's label for the wait (``reason`` kind plus the memory figures),
+    # published on the ``subagent_queued`` emit that follows a SUCCESSFUL
+    # defer write -- never before it, so a refused row leaves no label behind.
+    wait: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class QueuedRun:
+    """An accepted spawn that has no run yet.
+
+    It waits in the dispatch window or only as a task-store row: deferred by the
+    memory gate, queued behind capacity, or claimed and not yet registered. The
+    registry (``SubagentManager.get`` / ``all_agents``) cannot name it, so this is
+    what ``GET /api/spawn/{id}`` and ``GET /api/spawn`` report for it instead of
+    "not found".
+
+    ``reason`` is the parent's current wait label (a ``QUEUED_REASON_*`` kind).
+    It is per parent, last writer wins, like the ``subagent_queued`` event it
+    comes from (``_emit_queue_depth``). ``reason_detail`` is the gate's own
+    sentence from the row's latest ``deferred`` event, present only while that
+    deferral is in force and newer than the row's last claim or transition.
+
+    ``resuming`` is set for a run that already STARTED and waits to go on: a
+    ``recovering`` row after a gateway restart (``RESUMING_AFTER_RESTART``) or a
+    ``retry_wait`` row that ran before (``RESUMING_RETRY``). It is not "not
+    started", and a reader must not call it that.
+    """
+
+    id: str
+    task: str
+    parent_session_key: str
+    agent: str = ""
+    app: str = ""
+    accepted_at: float = 0.0
+    reason: str = ""
+    reason_detail: str = ""
+    resuming: str = ""
+
+
+class QueuedReadUnavailable(Exception):
+    """The task store could not say whether an id is queued (an outage, or a
+    row this build cannot model). Distinct from "not queued": a reader answers
+    it as transient (503), never as a definitive "not found". Defined here, not
+    in ``taskq``, so a route can catch it without loading the task queue."""
+
+
+@dataclass(frozen=True)
+class QueuedRunListing:
+    """One read of the accepted spawns no run exists for yet, oldest first.
+
+    ``partial`` is True when the listing cannot be every such spawn: the store
+    held more rows than one listing returns (``taskq_bridge.QUEUED_LISTING_CAP``)
+    or could not be read at all. A reader then says the list is partial instead
+    of presenting it as every queued spawn.
+    """
+
+    runs: tuple[QueuedRun, ...]
+    partial: bool = False
 
 
 @dataclass(frozen=True)

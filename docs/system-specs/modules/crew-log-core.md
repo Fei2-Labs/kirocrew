@@ -1,16 +1,16 @@
 # Crew log Core
 
-Owners: `kiro_crew.crew_log` (`schema.py`, `store.py`, `errors.py`, `lease.py`, `entry_types.py`)
+Owners: `kiro_crew.crew_log` (`schema.py`, `store.py` with its owners `store_paths.py`, `store_segment_reads.py`, `store_cuts.py`, `store_segment_writes.py`, `store_tail_repair.py`, `store_results.py`, `store_units.py`, `store_removal.py`, `store_retention.py` and `store_handle.py`, `errors.py`, `lease.py`, `entry_types.py` with the field leaf `entry_types_fields.py` and the family owners `entry_types_lifecycle.py`, `entry_types_exchange.py`, `entry_types_delegated.py`, `entry_types_ledgers.py`, `entry_types_surfaces.py`)
 
 ## 1. Purpose
 
-`kiro_crew.crew_log` gives a crew, a session, or a member one durable, ordered, citable record of what happened. It is the storage layer only: it defines a file format, enforces who may write what into it, and reads it back. It carries no routes, no MCP tools, no dashboard surface and no migration.
+`kiro_crew.crew_log` gives a crew, a session, or a member one durable, ordered, citable record of what happened. It is the storage layer: it defines a file format, enforces who may write what into it, and reads it back. The storage layer itself carries no routes, no MCP tools, no dashboard surface and no migration; the read routes live in `dashboard/handlers/crew_log.py` and the agent-facing reads in the `kirocrew-crew-log` MCP server (`mcp_crew_log.py`).
 
 The problem it answers is that long-horizon work keeps its state in a context window, which harness-owned compaction summarizes lossily. Transcripts are not a substitute: rotation, compaction and consolidation rewrite the whole file, the grain is a message rather than an operation, and no field defines an order a consumer can fold on. An append-only file with a writer-assigned sequence inverts that -- the record is the authority, the context is a cache -- and lets one unit cite a segment of another's history instead of copying it.
 
 ## 2. One stream, not two
 
-There is one structured record of what happened, and it is this one. A parallel global lifecycle stream (`kiro_crew.events`, day-sharded under `events/`, joined by a correlation `key`) was retired unwritten: it had no emitter and no reader, no `events/` directory existed on any host, and each of its kinds names a fact this format already owns as a `type`. Two vocabularies for one fact is a choice every future emitter would have had to make, and the answer would have been "this one" every time.
+There is one structured record of what happened, and it is this one. There is no parallel global lifecycle stream (a day-sharded `events/` tree joined by a correlation `key`): each of its kinds would name a fact this format already owns as a `type`. Two vocabularies for one fact is a choice every future emitter would have had to make, and the answer would have been "this one" every time.
 
 `seq`, `thread` (a grouping key naming an earlier seq in the SAME file) and `ref` (a pointer into another file) are why. All three are defined relative to a single unit's crew log, so the scope question a global stream cannot answer for itself -- per writer? per key? global? -- is answered by the file. A day-sharded, multi-domain shard would need either a per-key sequencer inside a shared file or a `seq` whose meaning varies by kind.
 
@@ -36,6 +36,25 @@ Session crew logs do **not** live under the flat `sessions/<key>.jsonl` transcri
 
 The `crew-log` root is established EAGERLY, and that is what makes the mask non-vacuous. Both fences are stated per PATH, and the Linux bind-mask loop skips a leaf that does not exist -- so a root created lazily on the first write is unmasked in every sandbox spawned before it, one of which can then create the directory itself and fill it with entries a reader would take as the gateway's. Two mechanisms close that: `ensure_data_home()` creates it `0700` at startup, and `chmod`s it too, since `mkdir`'s mode is umask-masked on creation and a no-op on a directory that already exists; and `sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES` materialises it empty before every namespace spawn so the bind always has a name to cover. macOS needs neither: a Seatbelt deny is a path rule that holds for a name that does not exist yet.
 
+### 3a. Where the store's code lives
+
+`crew_log/store.py` is the module every caller imports, and every name it bound before its owners moved out is still reached there. It is a mirror facade (`kiro_crew._facade_mirror`): it binds each name an owner defines, so its namespace holds the definitions the unsplit module held, and it serves the names the owners import from the owner holding them. A patch through the facade reaches every owner holding the name, so the moved code reads its names as plain module globals. Owners never import the facade, each imports only the owners listed before it below, and new work goes to the owner of its responsibility rather than back into the facade. The store logs under the facade's name, `kiro_crew.crew_log.store`, whichever owner writes the record. `_slot_index` is the one owner name the facade serves instead of binding: `session_units_by_slot` rebinds it, so it lives in `crew_log/store_units.py` alone, where a copy on the facade would go stale.
+
+| Owner | Holds |
+|---|---|
+| `crew_log/store_paths.py` | the data-home root of each kind and its checked form, a unit's directory and file, segment naming and ordering (`segment_paths`, `oldest_segment`, `newest_segment`), the lock beside the log, `_mkdir_private`, `now_ms`, and the store's one logger with `log_exception_text` |
+| `crew_log/store_segment_reads.py` | reading one segment: the bounded tail window (`_scan_tail`, `_TAIL_WINDOW`), entry iteration, the header line, `read_head`, and `_anchor_exists` |
+| `crew_log/store_cuts.py` | the `.cuts` seqlock (`read_cuts`, `_open_cut`, `_close_cut`) and its durable writes |
+| `crew_log/store_segment_writes.py` | one durable append (`_append_line`, `_append_lines`), its rollback, and the one allowed truncation (`_truncate`) |
+| `crew_log/store_tail_repair.py` | the closers `open(repair=True)` appends to an interrupted tail (`_close_interrupted_tail`, `_open_tail`, `_closer_entries`) and the orphan chunk group it drops |
+| `crew_log/store_results.py` | what a read returns: `Page`, `Resolution` and its `STATUS_*` outcomes, `ReadCursor`, `ResumePoint`, and the page limits |
+| `crew_log/store_units.py` | proving a unit's header, the unit listings (`unit_ids`, `unit_dirs`, `unit_dir_for`), the header reads, and the slot index (`session_units_by_slot`, `session_units_for_slot`) |
+| `crew_log/store_removal.py` | `remove_unit` and its `REMOVE_*` outcomes, trash holds, and staging a unit out of and back into the live tree |
+| `crew_log/store_retention.py` | `sweep_expired`, and the session tree's reads of a unit's log: `read_last_tree_edge` (the tail window the sweep reads), `find_last_tree_edge` (every segment), `tree_edge_scan_identity` (when an earlier complete answer still holds) and `find_spawned_entries` (the whole log) |
+| `crew_log/store_handle.py` | `CrewLog`, the handle on one unit's log |
+
+`test/test_store_crew_log_facade.py` pins the owner set and its layer order, the names the facade binds and serves, the patch reach of every name the test trees patch through the facade, and the names served from outside the family.
+
 ## 4. Envelope
 
 Line 1 is the header; every later line is an entry. This section is the part that is the same for all three kinds -- the fields, the bounds, and what `ref` and `thread` mean. What belongs to one kind alone is in 4a through 4c.
@@ -48,10 +67,10 @@ Line 1 is the header; every later line is an entry. This section is the part tha
 
 | Field | Meaning |
 |---|---|
-| `type` | `domain/action`, or the one guest form `app:<name>/<action>`. A type carries the FACT; who wrote it is `src`. |
+| `type` | `domain/action`, or the one guest form `app:<name>/<action>`. Each name is anchored at `\Z`, so a name carrying a trailing newline is `bad_type` rather than an accepted plain name. A type carries the FACT; who wrote it is `src`. |
 | `seq` | Contiguous from 1 after the header. Writer-assigned. |
 | `time` | Epoch milliseconds. Writer-assigned. |
-| `src` | The emitter. Which names a kind accepts is per kind: 4a through 4c. |
+| `src` | The emitter. Which names a kind accepts is per kind: 4a through 4c. A guest's name is anchored at `\Z` too, so `crew:qa\n` is `bad_src`. |
 | `thread` | Optional. The seq of an earlier entry in this same file -- a grouping key, like a chat thread id. |
 | `ref` | Optional. `{unit, id, from, to?}`, a pointer to a segment of another (or the same) crew log. `to` absent means one line. |
 | `ignorable` | Optional, `true` only. The writer's promise that a reader which does not know this `type` may skip the line. Absent on every entry that does not set it. |
@@ -73,7 +92,7 @@ One session's own history: the ACP turn lifecycle, what was put in front of the 
 
 `thread` stays unset. A session entry's grouping key is its turn, which it carries in `data.turn` (and `data.step` where a step exists) and which is known at emit time, so threading would be a second spelling of a fact the entry already states.
 
-The type tables are section 5, which lists every session type, its `data` and whether an emitter writes it today.
+Section 5 lists the session types, their `data` and whether an emitter writes them today; the per-type reference is [session-types.md](../../reference/crew-log/session-types.md).
 
 A session header carries `owner`, `agent`, and the optional `task`, `pack`, `slot`, `thread` (`{crew, seq}`), `cwd` and `remote` -- the facts fixed for the session's whole life, which a reader needs before reading any entry. `owner` never changes. Among them, `thread {crew, seq}` is where a session's place in a crew's work lives: it points back at the crew entry that caused the session to exist, on line 1 rather than in an entry, because it is settled before the first turn.
 
@@ -98,7 +117,7 @@ The families, from the RFC:
 | knowledge | `crew/finding`, `crew/summary`, `crew/note-*`, `crew/link` | the segment covered |
 | memory | `memory/bound\|copied\|forgotten\|restored` | -- |
 
-Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` now declares and enforces the session kind only; these two crew-kind contracts remain held by review against this section until that module's `ENTRY_TYPES` registry gains crew declarations.
+Two of these families carry a contract with REQUIRED fields. **Required here is a contract on the writer, and what enforces it is a declaration rather than a branch:** a per-type `data` requirement belongs to the type registry, next to that type's own `data` shape, not to `check_ownership`, which answers who may write a type rather than what the type must contain. `kiro_crew.crew_log.entry_types` declares both kinds: `SESSION_ENTRY_TYPES` for the session families and `CREW_ENTRY_TYPES` for these two contracts, keyed into `ENTRY_TYPES` by kind, so `validate_data` answers for the unit the entry is being written into and a crew's `data` is checked on the same append path a session's is. What the registry cannot state stays a writer's obligation: a CONDITIONAL requirement has no spelling in a declaration, so `target`'s exclusive `slot`-or-`name` pairing and `crew/report`'s required `ref` are enforced where the entry is built, and a field one legitimate form omits is declared optional rather than refusing a valid entry.
 
 **`crew/dispatch`** -- a parent asking for an item to be worked.
 
@@ -126,15 +145,21 @@ Two of these families carry a contract with REQUIRED fields. **Required here is 
 | Field | Required | Meaning |
 |---|---|---|
 | `data.item` | yes | The item being reported on. |
-| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`. |
+| `data.status` | yes | One of `done`, `blocked`, `failed`, `progress`, `question`. The last is the work board's, and the enum is derived from that writer's own tuple so a status it gains cannot become a refused entry; [crew-types.md](../../reference/crew-log/crew-types.md#crewreport) states why `question` is not folded into `blocked`. |
 | `data.credits` | no | Credits the child spent. Absent is not zero. |
 | `data.summary` | no | One sentence. |
 | `ref` | yes | A segment of the child's crew log: the evidence. |
-| `thread` | when replying | The dispatch's `seq`. |
+| `thread` | when the anchor resolves | The dispatch's `seq`. |
 
 `ref` is required for the same reason `target` is. A report is a CLAIM about work that happened somewhere else, and `board` and `budget` fold status and credits straight off it without opening the child's crew log; the `ref` is what makes that fold checkable rather than trusted. A report with no `ref` is an unfalsifiable claim, permanently, since nothing later can attach the evidence to a line that is already written.
 
 `thread` is the dispatch's `seq` when the report answers one, which is what makes a dispatch and its replies one conversation inside the parent's file. A report volunteered with no dispatch behind it carries no `thread`.
+
+Those two are different facts wearing one shape, and the writer resolves the anchor rather than being told which case it is. A report whose anchor does not resolve is written **unthreaded**, not dropped. The reason is that the dispatch append is best effort, so the anchor can be missing two ways that are not equally recoverable: a transient read failure leaves the dispatch on disk and the item's next report threads normally, while a dispatch whose own append failed leaves no dispatch entry at all -- and refusing the reply then refuses every later report for that item too, so the log reads for good as though the item was never dispatched. An absent history is the worse record: it is unbounded in time and invisible, while an unthreaded report states that the work happened and is only missing its link.
+
+That choice has a real cost and this is where it is written down: an unthreaded report is indistinguishable from a volunteered one, so the ambiguity is one field rather than one item's whole history. The writer logs a warning when it happens, which is what lets a reader tell the two apart.
+
+The refusal that remains is the evidence one: a report with no citable unit is not written at all, because a claim nothing can check is not a record.
 
 Both of these are one type each, not one per writer. The child's identity is `src`, so two children reporting on one item write the same `type` into one file and are told apart by who signed them.
 
@@ -149,20 +174,14 @@ writers, projections, migration, and transport are owned by
 [member-event-log.md](member-event-log.md); this core owns only the shared
 envelope, storage, lease, and damage rules it uses.
 
-## 5. The session-log format, pre-release
+## 5. The session-log format and its compatibility rule
 
-**The shapes below are PRE-RELEASE and may change.** `KIROCREW_CREW_LOG` defaults off, so
-the session emitter creates no session-kind unit on a stock install. The shared `crew-log`
-root is still pre-created as a security boundary, and independent member-kind logs may exist;
-neither freezes the default-off session entry shapes. While that holds, a session type may be
-added, removed or reshaped in one commit.
-
-**The freeze point is the release that turns the flag on by default.** From then on there are
-files a reader may hold, so the compatibility strategy has to be decided rather than assumed: a
-type gains fields additively and an unknown type is skipped when its writer marked it
-`ignorable`, OR a shape change carries a migration. That choice belongs to the change that flips
-the default, which is the first one with data to migrate. `version` is the escape hatch it would
-spend.
+`KIROCREW_CREW_LOG` defaults on, so a stock install writes session-kind units and a later
+build may read files an earlier one wrote. The shapes below change under one rule. A type
+gains fields additively, and a reader ignores a key it does not know. A new type that an
+older reader may safely skip is written `ignorable` (see "An unknown type is the reader's
+rule" below). Any other change to an existing type's shape carries a migration and spends
+`version`, the header's escape hatch.
 
 Every type is `domain/<past participle>`, a fact that happened. Every turn-scoped entry carries
 `data.turn`, and `data.step` where a step exists. `thread` stays unset on session entries.
@@ -172,14 +191,37 @@ The **Emitter** column says what exists in this commit. `yes` means the gateway 
 emitter is kept only where the site that will write it is identified; the types with no honest
 source were removed (see the emitter spec's "Removed types").
 
+**Where a type is declared.** `crew_log/entry_types.py` is the registry callers import:
+it composes `SESSION_ENTRY_TYPES` from one owner per group of type prefixes, in the order
+below, and keeps the crew kind's `_CREW_TYPES`, `ENTRY_TYPES`, `declaration_for`,
+`validate_data` and `render_markdown`. `Field`, `EntryType` and the JSON field types live in
+`crew_log/entry_types_fields.py`, the one module every owner imports; an owner never imports
+the registry, and the registry re-exports every public name an owner defines other
+than its `TYPES`.
+
+| Owner | Prefixes |
+|---|---|
+| `crew_log/entry_types_lifecycle.py` | `session/`, `turn/`, `write/` |
+| `crew_log/entry_types_exchange.py` | `message/`, `request/`, `context/`, `step/`, `tool/`, `approval/`, `model/`, `compaction/`, `plan/` |
+| `crew_log/entry_types_delegated.py` | `subagent/`, `background/` |
+| `crew_log/entry_types_ledgers.py` | `ledger/`, `object/`, `radar/`, `work/` |
+| `crew_log/entry_types_surfaces.py` | `panel/`, `dashboard/`, `card/`, `guide/` |
+
+A new session type is declared in the owner of its prefix; a new prefix goes to the owner
+whose docstring describes it, or to a new owner listed in `_SESSION_OWNERS` at the position
+its types render.
+
 ### Session, turn
 | Type | `data` | Emitter |
 |---|---|---|
 | `session/opened` | header echo + `resumed`; `model_requested` when a tier resolved one; `previous {sid}` on a crew log created while its slot already had one; `parent {slot, sid?}` on a session another session made through `session_create` | yes |
 | `session/closed` | `{reason}` | yes |
+| `session/adopted` | `{parent, previous_parent?}` — the session was adopted under a new parent, replacing the `session/opened` parent edge | yes |
+| `session/released` | `{previous_parent?}` — the session was released from its parent, retracting the edge | yes |
+| `session/spawned` | `{child {slot}}` — written on the CREATOR's log when `session_create` or `session_fork` commits, so the creating edge is durable before the child's first turn opens its own log | yes |
 | `turn/started` | `{turn, actor, depth, message_seq?, attempt?}` | yes |
 | `turn/refused` | `{turn, actor, reason, depth}` | yes |
-| `turn/completed` | `{turn, depth, stop_reason, duration_ms, credits, model, provider, tokens{input,output,cache_read,cache_write}}`; `error?` and no `credits`/`tokens` on a turn that ended without its terminal event | yes |
+| `turn/completed` | `{turn, depth, stop_reason, duration_ms, credits, model, provider, tokens{input,output,cache_read,cache_write}, context?{used, window}}`; `error?` and no `credits`/`tokens` on a turn that ended without its terminal event | yes |
 | `write/dropped` | `{dropped_count, dropped_bytes}` — one durable account of writer losses before later entries resume | yes |
 
 `write/dropped` records a hole without creating one in `seq`: the run remains contiguous across the
@@ -187,7 +229,7 @@ loss because no line was appended for a rejected or exhausted job. The marker is
 facts are missing. The next drain for that session puts it ahead of every ordinary entry; more loss
 before it lands is merged into the same marker, and a marker that is itself dropped carries its
 counts into the next one. It carries no reason code: every loss marks, and the one site that knows a
-cause cannot separate them — `_permanent` collapses a malformed entry and an entry refused because
+cause cannot separate them — the writer's refusal check collapses a malformed entry and an entry refused because
 another process owns the log into a single boolean. What a reader can act on is that facts are
 missing and how many.
 
@@ -205,11 +247,11 @@ opposite handling. The pair `(turn, attempt)` is therefore the identity a fold g
 | Type | `data` | Emitter |
 |---|---|---|
 | `message/received` | `{turn, role, text, source, attachments:[ref]}` | yes |
-| `message/sent` | `{turn, step, text, usage, interrupted?, chunks:[seq]}` | yes |
+| `message/sent` | `{turn, step?, text?, interrupted?, chunks?:[seq], chars?}` — usage rides on `turn/completed` | yes |
 | `message/chunk` | `{turn, step, delta}` — an oversize body's slice | overflow only |
 | `message/queued` | `{source, bytes, queued_seq}` — arrived while a turn ran | yes |
 | `request/configured` | `{turn, model, provider, context_window, system?, system_bytes?}` — written on change only | yes |
-| `context/composed` | `{turn, step, sources:[{kind, chars, tokens}], chars, tokens, tokens_estimated}` | yes |
+| `context/composed` | `{turn, step?, sources:[{kind, chars, tokens}], chars, tokens, tokens_estimated, phase?}` — `phase` is `session_start` or `per_turn` | yes |
 | `step/started` | `{turn, step}` — one model call | yes |
 | `step/completed` | `{turn, step, ms}` | yes |
 
@@ -234,10 +276,9 @@ absent rather than zeroed when there is nothing to digest, since 0 is a real siz
 tri-state and absent when the caller did not say, because "nobody asserted this worked" is not the
 same claim as "it worked".
 
-Approvals ARE emitted. An earlier revision said they could not be, because "the approval coordinator
-carries a slot key, not a session id" -- true of that class, and false of the site that actually
-raises the prompt, which sits inside the runner's turn where the session id and the turn ordinal have
-been in scope since the turn began. `reason` is the redacted title the human is shown. `by` and
+Approvals ARE emitted. The approval coordinator carries a slot key rather than a session id, but the
+site that raises the prompt sits inside the runner's turn, where the session id and the turn ordinal
+have been in scope since the turn began. `reason` is the redacted title the human is shown. `by` and
 `cause` are written only for a decline the HOST made, which is the one decision this site can
 attribute: an answer that came back from a person could have arrived at the dashboard or in Slack,
 and naming a guess is worse than naming nobody.
@@ -282,15 +323,41 @@ trimmed silently. No `turn`: a probe runs without a model turn, so the observati
 belongs to no turn. The monitor's state document still holds no history of the
 subject -- this entry is that history (`monitor-architecture.md`).
 
+### Cards and guides
+
+| Type | `data` | Emitter |
+|---|---|---|
+| `card/proposed` | `{slot, card_id, kind, title, revision, risk?, turn?, mid?}` — The agent proposed a change card at this point of the conversation | yes |
+| `card/finished` | `{card_id, status, revision}` — `status` closed to the card store's finished statuses (`applied`, `partial`, `failed`, `cancelled`, `expired`, `undone`) | yes |
+| `guide/offered` | `{slot, guide_id, actions:[id], turn?, mid?}` — The agent offered a guide at this point of the conversation | yes |
+| `guide/started` | `{guide_id}` — the first claim after the person pressed Start | yes |
+| `guide/finished` | `{guide_id, status, reason?}` — `status` closed to `completed`, `cancelled`, `expired`; `reason` closed to `saved_without_guide` | yes |
+
+A proposal is part of the conversation, so it is recorded twice in one step: a
+`card` row in the slot's transcript (display-only, drawn where it was proposed) and
+the opener here. `mid` is that row's id and is what joins the two. Every outcome
+patches the row in place and appends a closer, so the conversation with each card in
+its final state is reconstructible from this log alone -- the openers say where and
+what, the newest closer per id says how it ended. Only names are recorded: no card
+parameter, no edited field and no typed value reaches either record. The live state
+-- revisions, apply steps, the tab driving a guide -- stays the card and guide
+stores', and a re-preview writes nothing here. `card/finished` may repeat for one id
+(`failed` is retryable; an applied card can be undone), so a reader takes the newest.
+
+None of these is `ignorable`. The marker is for an entry that samples a stream, and
+a skip reads as a seq gap to the class fold, so marking these would not let an older
+reader pass them cleanly anyway; they are declared like every other fact.
+
 ### Background and children
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `background/completed` | `{kind: title \| memory_consolidation \| summary, model?, provider?, tokens?, credits?, ms?}` | yes |
-| `subagent/spawned` | `{turn?, agent_id, agent?, model?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
+| `background/completed` | `{kind: title \| memory_consolidation \| summary \| dynamic_card, model?, provider?, tokens?, credits?, ms?}` | yes |
+| `subagent/spawned` | `{turn?, agent_id, agent?, model?, task?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
 | `subagent/steered` | `{agent_id, mode: interrupt \| follow_up}` | yes |
-| `subagent/completed` | `{agent_id, ms?}` — no `tokens`/`credits`, see below | yes |
-| `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped \| unknown, ms?}` — `unknown` is written only by the interrupted-tail repair | yes |
+| `subagent/dismissed` | `{agent_id}` — the user cleared that child's card; neither an opener nor a closer | yes |
+| `subagent/completed` | `{agent_id, ms?, credits?}` — no `tokens`, see below | yes |
+| `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped \| unknown, ms?, credits?}` — `unknown` is written only by the interrupted-tail repair | yes |
 
 These are the families a single-agent runtime never needs and a gateway does: every token spent on a
 session's behalf, whether a person asked for it or not, is a fact in that session's log attributed to
@@ -304,10 +371,9 @@ the PARENT's log, `subagent/spawned` carries no `ref`, and the pair above become
 the day subagent sessions get logs of their own. Citing a child file that does not exist would be
 indistinguishable, to a reader, from citing one that was deleted.
 
-The child's spend is likewise absent rather than zeroed. Nothing in the subagent runtime measures
-tokens or credits -- a run's record carries elapsed time and peak resource use, and the child never
-reports its spend back to the parent -- so `subagent/completed` writes neither. Background calls are
-the opposite case and DO carry both, because the two background entry points already measure them for
+The child's spend is recorded as credits when the run measured them, and never zeroed when it did
+not. Tokens are not recorded for a child: nothing reports a child's token counts back to the parent.
+Background calls DO carry both, because the two background entry points already measure them for
 the usage store. `digest` is not among their kinds: the design named it, and the digest path turned
 out to be a filesystem read with no model call in it.
 
@@ -326,7 +392,9 @@ not persisted at all. A child whose gateway restarted between mint and its first
 writes no `parent`. `sid` is a citation of the creator's unit, not the tree key -- a slot outlives its ACP
 session, so the fold that builds the session tree (`crew_log/session_tree.py`, `crew-log-projection.md` section 6)
 keys it by `slot`, reads the first `session/opened` of each crew log, takes the parent from any log of
-the slot that carries one, and never lets a log without one retract it.
+the slot that carries one, and never lets a log without one retract it. The edge can move later:
+`session/adopted` records a new parent, replacing the `session/opened` one, and `session/released`
+retracts it (`crew-log-projection.md` section 6).
 
 **The other edge is the SLOT's own succession.** A slot outliving its ACP session is not an edge case
 but the steady state: a restart whose `session/load` does not re-attach, a reset, an agent/model/effort
@@ -338,14 +406,42 @@ same slot was writing before. Same citation shape as `parent`, written once at c
 rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
 predecessor the gateway could not name, and one whose own header does not name this slot are all
 "nothing to follow". No `slot` is repeated inside it,
-because it is the slot in `data.slot`. The id comes from the persisted slot-to-session mapping, read
-without pruning before allocation publishes the successor over it. One limit is recorded rather than
-handled: an allocation whose replay is still pending does not publish its fresh id over the mapping,
-so for that window a mapping read can
-name the crew log BEFORE the newest one -- two successive crew logs then cite one predecessor
-and the crew log between them is cited by nobody, which is a chain gap tracked with the rest of the
-supersede work in #12148. A successful resume answers the same id and the emitter writes no edge,
+because it is the slot in `data.slot`. The id is resolved in three tiers. The store this slot
+last handed to a `session/opened`, recorded on the slot as that entry's edge is spent, is
+first: the create is queued to a writer thread, so it is the only source that can name a crew
+log whose unit is not on disk yet. The slot's own newest unit IN THE STORE -- the unit no other
+unit of that slot cites as `previous` -- is next, and it is the durable one: the record above
+dies with its process, and this does not. It answers UNDECIDED when the units cannot be listed
+or read, or do not say which is newest, and no edge is written then -- but the entry does record
+`previous_undecided`, and an entry the read proves is the slot's first records `previous_none`,
+because neither meaning may rest on a key being ABSENT. A log that merely omits every
+predecessor key is one written before these keys existed, and its silence is equally "I am
+first" and "I could not tell": without the two fields the state a later fold must refuse on is
+byte-identical to the state it may pass over, and passing over it elects the log before it.
+The persisted
+slot-to-session mapping,
+read without pruning, is last, for a slot the store says has no unit at all -- which includes a
+store that is not at the name, the ordinary launch of a crew log switched off, and a slot whose
+units all predate this edge and so record no succession to read. It cannot be
+higher, and inside the replay-pending window it is not cited at all: an allocation whose
+replay is still
+pending holds the prior resumable id in the mapping on purpose, so that a restart can still
+resume it, and the mapping is then a generation
+behind -- two successive crew logs would cite one predecessor
+and the crew log between them would be cited by nobody, the one chain gap a reader cannot see.
+Whether that window is open is asked where a SESSION EXISTS to answer, as the edge is handed to
+an entry, and not where the id is read: the marker belongs to a live session, the read runs
+before this turn's session is allocated, and asked from there it answers "no replay owed" both
+when none is owed and when there is nobody to ask -- the second being a cold start, which is the
+restart this whole tier exists to survive. So a mapped id is carried provisional and becomes a
+recorded break at that point instead; what this process itself recorded is never provisional.
+A successful resume answers the same id and the emitter writes no edge,
 since a crew log cannot be its own predecessor.
+
+An empty answer from that mapping is a FINDING only when the store holds no unit of the slot at
+all. When it holds units this read could not rank, the mapping having nothing to give says nothing
+about the slot, so the entry records no predecessor key rather than stating it has none -- which
+would let a later fold pass over a log whose siblings sit uncited beside it.
 
 The edge is a citation and nothing else. Recording it opens no store for writing but this session's
 own, and no writer here appends to the crew log it names. It does READ that crew log's header, because
@@ -353,10 +449,33 @@ own, and no writer here appends to the crew log it names. It does READ that crew
 wrote -- a mapping entry can be stale or recycled: the
 edge is recorded only when the named crew log's own header names this slot, and a candidate whose
 header cannot be read is not named at all. Closing that crew log's own dangling turn and tool calls
-is a separate change: a repair that must wait on the predecessor's outstanding writes has to be
-resumable rather than decided once, which a citation neither needs nor has. Tracked as #12148. Until
-then a superseded crew log keeps an open `turn/started`, which is the state every reader of this log
-already tolerates.
+is a SEPARATE job, and the separation is what makes the wait possible: the repair is queued under the
+PREDECESSOR's id, and the writer keeps a session's jobs in submission order, so it runs only after
+everything that crew log already owes has been attempted -- a real `turn/completed` still queued or
+retrying is written first, and one abandoned after its attempt budget is spent is dropped and admitted
+in a `write/dropped` marker first. So the superseded crew log's turn is closed as
+`turn/completed {stop_reason: "interrupted"}` and its open calls as `tool/completed {status: "unknown"}`,
+exactly once, with no create-time decision to stand down on and nothing left to re-run. The repair
+re-reads the candidate's header before writing, because it is the one place an outcome is authored into
+a unit that is not this session's own, and it closes no unmatched `subagent/spawned`: those children
+were dispatched by a session that is gone.
+
+A repair that lands goes on to the repaired crew log's OWN predecessor, read from that log's own
+`session/opened` entry, and queues the same repair for it, so the walk follows the whole durable chain
+rather than one hop. One hop is not enough: the edge is an append and the repair rides the in-memory
+buffer, so a crash between them loses only the repair, and a superseded log is never resumed to
+re-queue it. In A -> B -> C, a crash after B named A but before A was repaired leaves A open, and C's
+supersede names only B. A hop whose tail was already closed says nothing about the hop before it, so
+the walk does not stop there. Each hop is its own queued job with every guard the first hop has: the
+wait behind what that log still owes, the live-turn stand-down and the same-slot header re-check. A hop
+that stands down or refuses ends the walk. The walk also stops at four points: a log already on this
+walk (a loop, reachable only through a damaged or hand-edited entry, logged as a warning); a log this
+process already repaired, whose own walk went on from it (silent, so a long-lived slot's history is not
+rescanned on every supersede); a bound of 32 logs, logged with the log it stopped before, because
+every hop is a whole-file scan on the writer thread; and a hop whose header, read before it is queued,
+does not name this slot. That last stop is quiet when the log is gone or its header is unreadable,
+because retention removing the oldest logs is how an old chain normally ends, and logged as a warning
+when the header names another slot.
 
 The read side is `session/opened.data.previous` itself, folded into the `status` projection and served
 by the existing projection route. A reader that wants the SLOT rather than the session folds the newest
@@ -368,7 +487,7 @@ with the first fold that actually performs it rather than shipped ahead of any c
 
 Every refusal is a `CrewLogError` carrying a stable `code`; the codes are API surface and are additive-only.
 
-**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; member: `member` `activity` `slot` `patrol`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `ledger` `object` `message` `request` `context` `background` `subagent` `write` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in the crew and session registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
+**Ownership** answers whether a kind of unit has such events at all. `schema.TYPE_OWNERSHIP` maps kind to owned `type` domains -- crew: `member` `activity` `slot` `patrol` `message` `crew` `item` `memory`; member: `member` `activity` `slot` `patrol`; session: `session` `turn` `step` `tool` `approval` `model` `compaction` `plan` `ledger` `object` `message` `request` `context` `background` `subagent` `write` `radar` `work` `panel` `dashboard` `card` `guide` -- and anything else is `event_type_not_owned`. It is prefix-based, so a new action under an owned domain needs no change: `crew/dispatch` and `crew/report` are owned by the `crew` domain the registry already lists. `message` appears in the crew and session registries, which is what ownership means: a crew forwards messages and a session records its own bodies, so both kinds have such events and neither name is a collision.
 
 **Namespacing** answers whether an emitter may write it, and it is a rule about `src`. Two halves:
 
@@ -394,6 +513,8 @@ A line is never rewritten. Exactly one mutation exists: on `open`, trailing byte
 A failing write ROLLS ITSELF BACK. Bytes reach the file before the fsync runs, so a failure anywhere in the write-then-sync sequence leaves an outcome nobody knows: the entry may well be durable. That matters because the write-behind retains and retries a failure, and a retry against an unknown outcome appends the same fact a second time under a new seq -- a duplicate no reader can tell from a real repeat, in a file nothing rewrites. So the append truncates the file back to the size it had before the attempt and re-raises, which makes the failure definite: either the append is whole and synced, or it is gone and the retry writes it cleanly. A partial write is removed for the same reason, and one more -- leaving half a line behind would defer the cleanup to the next append's torn-tail check, so the file would carry a fragment until then.
 
 That truncation is not a second exception to the never-rewrite rule. The bytes removed are the caller's own failed append, so the file is restored to a state a reader could already have seen rather than edited; it is the torn-tail rule applied at the moment the tear happens instead of at the next open. It is safe against a concurrent writer because the append lock is held across the write and its rollback, so no other handle's entries can lie inside the range.
+
+Readers get the matching guarantee: an append still inside its fsync is never yielded. A read bounds the newest segment at its durable end, its size measured under the append lock (`CrewLog._durable_end`), so a line another handle is still writing, or may still roll back, lies past where the read stops; `open` re-reads the tail under the same lock (`_settle_tail`). `test_crew_log_core_damage.py::test_an_open_does_not_see_an_append_whose_fsync_has_not_returned` pins it.
 
 If the rollback ALSO fails -- likely, since whatever broke the write is often still broken -- the file may hold bytes no entry claims, and `IndeterminateAppend` reports exactly that. The residue is an unterminated or unparseable tail, which is the shape the next `open` truncates, so the recovery already exists; the distinct type is so a caller can tell "nothing happened" from "something may have".
 
@@ -435,7 +556,7 @@ This is still append-only -- nothing is rewritten and `seq` continues -- so a re
 
 **Retention and damage are never reported as each other.** Both look identical from the caller's side -- a short answer -- so the classification is made from the segment names rather than the result: a span starting below `segment_first_seqs()[0]` is `pruned` when the part of it at or above that seq reads back whole, and anything else that reads short is `corrupt`. The surviving part is checked separately because a partly pruned span is short for a legitimate reason -- so the count that would catch damage in it is already satisfied -- and a citation whose head retention removed can still hold a damaged line further up, in a segment that is still on disk. Reporting that as retention hides the damage behind a normal answer. Getting this backwards is worse than either error alone. A reader told `pruned` stops looking, because retention removing old lines is a normal answer; told `corrupt`, it knows the file it still has is not intact. Reporting damage as retention therefore converts a recoverable alarm into silence. Citing PAST the newest entry is `corrupt` too, and deliberately not `ok`: a `Ref` always names a definite span -- absent `to_seq` means the single line at `from_seq`, so there is no open-ended spelling -- which makes a span reaching beyond the newest entry a claim about lines that are not in the file. `ok` means every cited seq was read back, so a short answer is the citation failing whatever shortened the file. That also covers the case with no torn bytes to give it away: whole lines cleanly truncated lower both the walked entries and a reopened handle's tail together, and an expected count taken from the file rather than from the citation would shrink to match what survived and answer `ok` with the cited lines gone.
 
-This layer claims no authorization, so it has none to deny: a check defaulting to allow would make the shortest call shape the insecure one, and a check with no permission model behind it only looks like a boundary. Every caller today is in-process gateway code that can already read the file. A `forbidden` status arrives with the first caller that HAS a permission model -- the routes that mount this -- where the caller identity it must be derived from actually exists.
+This layer claims no authorization, so it has none to deny: a check defaulting to allow would make the shortest call shape the insecure one, and a check with no permission model behind it only looks like a boundary. Every caller of `store.resolve` is in-process gateway code that can already read the file, so `resolve` has no `forbidden` outcome. The permission model lives in the caller that has a caller identity: the crew-log read routes answer 403 `forbidden`.
 
 ### Write ownership
 
@@ -443,9 +564,13 @@ A resume's belief that the previous writer is gone is not verifiable from the fi
 
 Ownership is taken LAZILY, on a handle's first write, and never by `open` itself, because `open` also serves readers: `iter_from`, `page` and `resolve` need no ownership, and making a reader contend with the writer would buy nothing. `open(repair=True)` claims it before the closers, and that is the same rule rather than an exception -- the closers are appends. `create` claims nothing: it publishes a header for a unit that has none, and two processes racing it are already settled by `already_exists` under the per-append lock.
 
+`append_if` adds a THIRD append outcome beside written and refused: **declined**, reported as `None`. It takes `max_tail_seq`, the seq the caller's decision was made against, and writes the entry only while the tail read under ownership is still at or below it. The outcome exists because a decision that governs append ORDER cannot be made outside the hold that assigns the order: another process's entry committed between a caller's decision and its own write lands first, and for a reader that takes the last word per field that ordering is the whole result. Comparing the caller's seq here is what proves nothing was committed in between. A decline appends nothing; it is NOT byte-identical, because the torn-tail repair above it is unconditional and a decline can leave that repair behind.
+
+A seq rather than a callback, and that choice is load-bearing. The comparison runs while the lease and the per-append lock are both held, so anything done there is a window in which every other process's append to the unit is refused `already_owned` -- and a peer that exhausts its own retry budget loses its entry for good, since this file has no compaction and nothing replays it. An int cannot parse the file or write to it, so no caller can turn that window into a long one. A caller whose decision needs the log's contents reads it BEFORE calling and passes the tail that read reached.
+
 The lock is REFCOUNTED PER PROCESS, keyed by the lease file's path. That is a correctness requirement rather than an optimization: a POSIX lock belongs to an open file description rather than to a process, so a second `open()` of the lease path inside one process contends exactly as another process would -- and one process legitimately holds several handles for one unit, since the emitter's cached handle and the handle a session claim opens overlap while the cache entry is replaced. So the first writer in a process takes the kernel lock, every later handle shares it, and the last handle to be dropped gives it up. The path is the key rather than `(kind, id)` because the data home is repointable and the kernel locks a file, not a name. Acquire and release both run under one module lock, for the same reason the count exists: two threads reaching for one unit must share a descriptor rather than race two of them and have one refuse the other.
 
-Release is bound to the HANDLE being dropped rather than to an explicit call, and that timing closes the window from both sides. The emitter's eviction rule never drops a handle belonging to a live turn, so ownership can only end BETWEEN turns -- and between turns there is no live turn for a successor's repair to damage. A terminal event is queued rather than written, so "between turns" begins when that entry LANDS, not when it is handed over: the emitter marks the turn's record as owing a closer at handover, and a re-claim leaves such a record alone while still closing one whose terminal was never emitted, since nothing else will ever close that one. Meanwhile a queued write that still holds the handle keeps the ownership it is about to need, which an eager release at eviction would have taken out from under it.
+Release is bound to the HANDLE being dropped by default, and that timing closes the window from both sides. `CrewLog.release_ownership` is the one explicit, deterministic release, used when a service retires. The emitter's eviction rule never drops a handle belonging to a live turn, so ownership can only end BETWEEN turns -- and between turns there is no live turn for a successor's repair to damage. A terminal event is queued rather than written, so "between turns" begins when that entry LANDS, not when it is handed over: the emitter marks the turn's record as owing a closer at handover, and a re-claim leaves such a record alone while still closing one whose terminal was never emitted, since nothing else will ever close that one. Meanwhile a queued write that still holds the handle keeps the ownership it is about to need, which an eager release at eviction would have taken out from under it.
 
 There is deliberately NO expiry. The case ownership is for needs none: a crashed, killed or evicted owner has its lock dropped by the kernel when its descriptor closes, so a successor takes ownership at once and closes the turn its predecessor left open. What an expiry would add is the power to expropriate a writer that is merely SLOW, whose next append then lands after a successor has already closed its turn -- the exact damage this prevents, reintroduced as a timeout. A live but wedged owner therefore keeps ownership until its process exits, and the claim it blocks reports its own loss instead of taking the log.
 
@@ -455,6 +580,8 @@ After locking, the held inode is compared with the file now at the lease path, a
 
 A crew log is one or more SEGMENT files. `log.jsonl` is the segment beginning at seq 1; a later
 segment is `log.<first_seq>.jsonl`, with its first seq in the name so ordering needs no file read.
+The first seq is spelled canonically, in ASCII digits with no leading zero. Any other name
+(`log.².jsonl`, `log.١٢.jsonl`, `log.05.jsonl`) is a stray file, not a segment, and a reader ignores it.
 A reader walks segments in ascending first-seq order and requires seq to stay contiguous ACROSS each
 boundary (`segment_gap`), because two files are independent objects: a half-finished copy or a
 deleted middle segment is invisible unless it is checked. Inside one file a missing seq is a damaged
@@ -483,11 +610,29 @@ format change to land.
 ### Retention: whole units
 
 A unit's whole crew log is removed by `store.remove_unit(kind, id)`, and that is the ONE spelling of
-deletion in this module: the retention sweep and the session permanent-delete funnel both call it,
+deletion in this module: the retention sweep and the two permanent-delete funnels that call it -- a
+session's, and the dashboard's crew-member route -- all reach the same spelling,
 because two callers deleting one tree two ways is two chances to get the order wrong and the order is
 the entire correctness argument. It is not rotation and not a format change, and NOTHING is written
 to a crew log that is about to go -- no tombstone, no `pruned` entry. A reader holding a citation into
 it already has its answer: `resolve` reports `gone` for a pointer into a unit with no crew log at all.
+
+**A caller whose unit has a companion file OUTSIDE it passes `in_hold`.** Some of a unit's meaning
+lives elsewhere -- a crew member's pre-log activity source is the case -- and a caller that removed
+such a file after `remove_unit` RETURNED would do it in the window between the lease's release and its
+own next line, where another process can create the unit afresh and fold that file back in. Since the
+lease is `sole` and cannot be shared, the caller cannot hold it itself, so the step is handed inward
+instead. The parameter is optional and the sweep and the session funnel pass nothing, so the one
+spelling of deletion stays one spelling.
+
+**It runs FIRST, and a refusal stops the removal.** The gate that keeps such a companion from being
+read again can live INSIDE the unit -- a fold marker does -- so a unit destroyed while its companion
+survives has ARMED that gate rather than half-finished the job: the survivor becomes readable again
+with nothing left to say it was already read, and nothing revisits a unit afterwards. So the action
+answers whether the companion is really gone, an exception counts as a refusal, and a false answer
+returns `failed` with the unit, its marker and the companion all still in place for a later pass to
+aim at again. Taken in this order the partial path needs no special case: the companion is gone
+before the first segment is touched.
 
 **Removal goes through the lease, and the lease it takes is SOLE.** Ownership is what stands between
 a removal and unlinking the segments a live writer is appending to, so the removal claims it
@@ -511,7 +656,11 @@ first, and why there is no default that skips it. The sweep's guard re-derives t
 and requires the same unit id; a caller whose reason is not a property of the file passes an
 accept-all guard and says at its call site what does decide.
 
-Then order, with IDENTITY LAST. Segments carry the header, so they are the history and they go first;
+Then order, with IDENTITY LAST. A unit whose own NAME is a link is refused before any of this and
+answers `linked`, which is its own outcome rather than `absent`: absence says the name is free, and a
+caller acting on that does its own cleanup at the RESOLVED path, which is where the link points -- very
+likely another member's live unit. The two conditions invite opposite actions, so they cannot share a
+value. Segments carry the header, so they are the history and they go first;
 the per-append `.lock` next; then any other entry, none of them followed if it is a link. The
 `.lease` file is removed LAST and only by its holder, which is what keeps the inode check under
 "Write ownership" a fact about this code rather than an assumption: while the lease exists its path
@@ -549,7 +698,7 @@ running right now, and a rule that read the newest close would call it expired a
 conversation's log. Entries that are neither -- a turn, a tool, an in-flight closer the emitter writes
 after a teardown by design -- say nothing about the state and are skipped.
 
-Four things are skipped regardless of age, and each is a refusal rather than an oversight:
+Five things are skipped regardless of age, and each is a refusal rather than an oversight:
 
 - **An OPEN unit** -- one whose newest lifecycle entry is a `session/opened`, or which has no
   lifecycle entry in the window at all. The deciding entry is looked for in a bounded read of the
@@ -561,6 +710,8 @@ Four things are skipped regardless of age, and each is a refusal rather than an 
 - **A torn tail.** Unterminated trailing bytes are what `open(repair=True)` truncates, and the sweep
   cannot tell a dead writer's crash artifact from an append that has not reached its fsync -- the
   bytes are identical. Deleting the unit would destroy the history the repair exists to recover.
+- **A unit the session trash holds** (a `.trash-hold` file in its directory). Its session is
+  still in the trash or being restored, so the user can still get it back whole.
 - **A header whose id does not fold back to its own directory name.** The removal is aimed by id, so
   a directory carrying another unit's id would have the removal land on that other unit.
 - **A close whose reason does not END the ACP id's life.** A unit is collectable on exactly ONE reason:
@@ -589,8 +740,7 @@ Four things are skipped regardless of age, and each is a refusal rather than an 
   every way of making the id reachable again also makes the unit uncollectable.
 
   This reason is the WHOLE authorization for deleting a unit, and it is read from the crew log rather than
-  from anything outside it. Asking `session_map.json` which sessions are still mapped, and keeping those,
-  was implemented and then removed: that file is agent-WRITABLE while this tree is bind-masked, and a
+  from anything outside it, never from `session_map.json`'s list of mapped sessions: that file is agent-WRITABLE while this tree is bind-masked, and a
   VALID empty map is not a failed read -- it reads as "nothing is revivable" and hands the trusted sweep
   a positive answer that authorizes deleting a fenced unit the writer of that file cannot touch directly.
   Absence of protection must never be authorization, which is why the rule needs positive proof from
@@ -618,16 +768,19 @@ toward keeping the file. The LAST close in the file is the one read, because a r
 appends to the crew log it already had and only the newest close describes the life that ended.
 
 **Permanently deleting a session removes its crew log; closing a tab does not.** The dashboard's
-history-delete funnel calls `remove_unit` with the ACP session id it captured BEFORE the teardown,
-and only once that teardown SUCCEEDED. The gate is on success rather than on the attempt because
-`destroy_if` refuses when the session was replaced by a successor generation, is busy, or still has a
-live slot owner -- in each of those cases the session it names is preserved and may be writing right
-now. The write lease is not a substitute for that check: ownership ends between turns by design, so an
-idle-but-live session holds nothing for the removal to be refused by. Only an id the delete claim
-PROVED is used -- it is dropped on every path that disowns the slot, and a value that is not a
-non-empty string reads as absent -- so an unresolvable one removes nothing and the sweep collects that
-crew log on age instead. The removal is best-effort: the transcript row is already gone by then, so
-raising would ask a person to retry a delete against a row that is absent.
+history-delete funnel (`dashboard/handlers/sessions_parts/slot_teardown.py` `_remove_session_crew_logs`) runs only once
+the teardown SUCCEEDED, because `destroy_if` refuses when the session was replaced by a successor
+generation, is busy, or still has a live slot owner, and in each of those cases the session may be
+writing right now. It flushes the emitter first, so the teardown entry lands and releases the cached
+handle's lease. The candidates are the units `store.session_units_by_slot` lists for the deleted row's
+slots that are also in the set of ids the delete claim PROVED. A candidate is kept when it is
+protected (a live slot or a running session serves it), when another conversation's session-map key
+still maps it or the map cannot be read, when a writer holds its lease, or when a fresh read of what is
+running names it just before removal. Every unit taken is first excluded from its slot's ledger fold,
+so a later session on the same recycled slot key cannot read the deleted conversation's state out of a
+unit whose removal failed, and the removal claims the lease free of other holders. The removal is
+best-effort: the transcript row is already gone by then, so raising would ask a person to retry a
+delete against a row that is absent.
 
 **Every destroy records its teardown, and without that entry neither half collects the unit.**
 `session_lifecycle.destroy` writes `session/closed {destroyed}` through the emitter, beside the
@@ -642,17 +795,13 @@ pinned. The delete funnel therefore FLUSHES before it claims the lease, waiting 
 flush that times out is not a failure, because the entry stays owed and the sweep collects the unit
 once it lands.
 
-**The unit's own HEADER has to name the slot being deleted.** The id above arrives from
+**The unit's own HEADER has to name the slot being deleted.** The id arrives from
 `session_map.json`, which lives inside the agent-visible tree, so a mapping that named another
-conversation's session would aim this removal at that conversation's log. `store.unit_header_slot`
-is the independent answer: the header is written once at creation inside the FENCED crew log tree and is
-never rewritten, so it does not move when a mapping does, and a unit belonging to another slot fails the
-check. Slot recycling does not weaken it, because the id is what selects the unit and the slot only has
-to prove that unit belonged to the slot being deleted -- a successor in the same slot is selected by its
-own id and passes on its own header. The reader answers `None`, and the removal is refused, for every
-reason a caller must not proceed on: no directory, no segment, an unreadable header, a header whose own
-id does not fold back to its directory, or a header with no slot -- which is the case for a session that
-never ran on a dashboard slot, and those are left to the sweep rather than removed on a guess.
+conversation's session would aim this removal at that conversation's log. The header is the
+independent answer: it is written once at creation inside the FENCED crew log tree and never
+rewritten, so it does not move when a mapping does. `session_units_by_slot` groups units by that
+header, so a unit belonging to another slot is never a candidate, and a session that never ran on a
+dashboard slot has no slot in its header and is left to the sweep.
 
 That is the opposite of the rule for the WORK ledger, which the same funnel deliberately PRESERVES
 (`session-work-ledger.md`), and the difference is mechanical rather than a re-reading of that ruling.
@@ -664,8 +813,40 @@ all; and it holds a kernel-arbitrated lease, so a writer that IS still there ref
 rather than racing it. Neither property is available to the work ledger, which is why one is collected
 here and the other is not.
 
+**Deleting a crew member removes its crew log too, and the ROSTER is the whole authorization.** A
+member's unit is keyed by its slug, so the only question that makes the removal safe is whether a live
+member still derives that key -- not an age, not a size, and not a threshold anyone can tune, because a
+member log has no lifecycle-end entry for the sweep to age from. The crew-delete funnel resolves the
+slug through `member_slug` against the config it captured while the record still existed (a member
+carrying an explicit `member_id` keys its log by that id, so folding the name after the record is gone
+aims at a different unit), and the `guard` re-reads the roster inside the lease hold: a same-name
+member created in that window derives THIS unit, and its history is what an unguarded removal would
+take. That re-read is a snapshot on its own, so the funnel decides while it still holds
+`memory_store_namespace_lock` -- the one seam every allocator of a member id shares, and so the only
+thing that stops another PROCESS committing a same-slug record between the decision and the unlink,
+which nothing rebuilds. The predicate fails closed -- a config the loader marks degraded answers
+`claimed`, since a load
+that could not read the file returns defaults and an emptiness test alone would read that as proof the
+owner is gone -- and it is asked through `eventlog.service`, not from the handler, so the service's
+cached log for that slug is dropped in the same step as the files.
+
+**Exactly one member-delete path reclaims, and the others are named rather than implied.** The
+dashboard delete route is that path. `kirocrew agent delete`, the package-sync prune and the mate
+prune migration each remove a member record without collecting its unit, and a unit orphaned before
+this exists has no collector at all -- the first two already hold `memory_store_namespace_lock`, so
+reaching them is a call apiece, while the migration holds no such lock and reads a member's own
+activity to decide what to prune. A sweep that collected ANY unclaimed member unit would cover all of
+them, the crash window and the backlog together, but it would also ask the predicate about the whole
+tree instead of the one slug a delete is deciding, and that bound is what keeps a wrong answer's cost
+to a single already-deleted member. Widening it is a retention decision in its own right, not a
+follow-on to this one.
+
 ## 9. Scope
 
-The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. No crew-kind writer exists yet, so that ownership registry still describes the domains a future crew emitter may write rather than events produced today; a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
+The session-log emitter ([crew-log-emitter.md](crew-log-emitter.md)) writes the ACP turn lifecycle behind the `KIROCREW_CREW_LOG` flag. The member event log ([member-event-log.md](member-event-log.md)) independently writes the member kind through `kiro_crew.eventlog`. The crew kind has one writer, behind the same flag: `crew_log.emit.on_crew_dispatch` and `on_crew_report` record the dispatch family into a crew's own log, driven by the conductor work board's `bind` action and by a worker's report. It covers that family alone, so the ownership registry still describes what a crew MAY write rather than what is produced -- the other six domains have no writer, and a guest app needs no registry entry because its `app:<name>/` prefix is its permission.
 
-Read and write paths ship together deliberately: the guarantees this format makes -- contiguous seq under a lock, torn-tail repair, refusal before any byte is written -- are each a claim about what a reader sees after a writer acted, so neither half demonstrates them alone. `test/test_crew_log_core.py` exercises them against real files rather than against a mock.
+Those two entries are BEST EFFORT, and the asymmetry with the session emitter is deliberate. A work-ledger route refuses its own write when the `work/recorded` entry cannot be appended, because the board is a projection of that entry and a cache holding a mutation the log never saw is a divergence. The crew entry is the crew-side record of a fact the board already holds, so a crew log that cannot be written must not fail a ledger write that succeeded: the caller reads a zero seq as "not recorded" and proceeds. Neither entry is routed through the session emitter's write-behind queue, whose every structure is keyed by an ACP session id -- a crew store name handed to it would be looked up as a session unit and dropped as a policy no-op.
+
+Which unit a crew entry belongs to is the DISPATCHING crew, and it is resolved from the conductor slot's member slug. A board driven from an ordinary chat slot therefore records nothing here, which is a refusal rather than a gap: a slot key is not a crew name, and a unit whose header named one would attribute the work to a crew no reader can resolve.
+
+Read and write paths ship together deliberately: the guarantees this format makes -- contiguous seq under a lock, torn-tail repair, refusal before any byte is written -- are each a claim about what a reader sees after a writer acted, so neither half demonstrates them alone. `test/test_crew_log_core.py` and its parts `test/test_crew_log_core_damage.py`, `test/test_crew_log_core_segments.py` and `test/test_crew_log_core_groups.py` exercise them against real files rather than against a mock.

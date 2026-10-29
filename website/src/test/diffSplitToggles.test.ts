@@ -21,7 +21,23 @@ import { readFileSync } from 'fs'
 import { join } from 'path'
 
 const SIDE_PANEL = join(__dirname, '..', 'pages', 'chat', 'SidePanel.tsx')
+/** SidePanel's owner modules: the Turn Diff toolbar lives in SidePanelTabBodies.tsx. */
+const SIDE_PANEL_OWNERS = [
+  'SidePanelAddMenu.tsx',
+  'SidePanelTabBodies.tsx',
+  'SidePanelTabChip.tsx',
+  'useSidePanelSize.ts',
+].map(f => join(__dirname, '..', 'pages', 'chat', f))
 const MARKDOWN_PANEL = join(__dirname, '..', 'components', 'MarkdownPanel.tsx')
+/** MarkdownPanel's owner modules: the header button check reads them with the facade. */
+const MARKDOWN_PANEL_OWNERS = [
+  'MarkdownPanelBody.tsx',
+  'MarkdownPanelHeader.tsx',
+  'markdownPanelSourcePos.ts',
+  'useMarkdownPanelDisk.ts',
+  'useMarkdownPanelFileState.ts',
+  'useMarkdownPanelFind.ts',
+].map(f => join(__dirname, '..', 'components', f))
 const ACTIVE = "'text-accent bg-accent-subtle'"
 
 /** The single line declaring the button that calls the given setter. */
@@ -32,7 +48,7 @@ function buttonLine(src: string, setter: string, file: string): string {
 }
 
 describe('SidePanel diff view controls', () => {
-  const src = readFileSync(SIDE_PANEL, 'utf8')
+  const src = [SIDE_PANEL, ...SIDE_PANEL_OWNERS].map(f => readFileSync(f, 'utf8')).join('\n')
 
   it('lights the split button up in split mode, not unified mode', () => {
     const line = buttonLine(src, 'setDiffSideBySide', 'SidePanel.tsx')
@@ -49,6 +65,7 @@ describe('SidePanel diff view controls', () => {
 
 describe('MarkdownPanel diff view controls', () => {
   const src = readFileSync(MARKDOWN_PANEL, 'utf8')
+  const withOwners = [MARKDOWN_PANEL, ...MARKDOWN_PANEL_OWNERS].map(f => readFileSync(f, 'utf8')).join('\n')
 
   it('no longer carries a header split button to invert', () => {
     // The control moved into the ⋯ menu as a `menuitemcheckbox` row, so its
@@ -56,7 +73,7 @@ describe('MarkdownPanel diff view controls', () => {
     // behaviourally in MarkdownPanelCoverage.test.tsx ("offers split/unified as
     // a menu row only once a diff is on screen"), which beats a source grep.
     // This asserts only that the button did not come back unnoticed.
-    expect(src).not.toContain('barIconBtn(diffSplit)')
+    expect(withOwners).not.toContain('barIconBtn(diffSplit)')
     expect(src).toContain('onToggleDiffSplit')
   })
 })

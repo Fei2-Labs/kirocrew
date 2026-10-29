@@ -163,13 +163,51 @@ describe('composeMessage / attachmentsFrom', () => {
       { path: '/deep/dir/b.txt', name: 'b.txt', isImage: false },
     ])
   })
+
+  // The case above is POSIX-only and so cannot fail: the label rule used to
+  // split on '/' alone, which a POSIX path always has. The paths these chips
+  // label come from `/api/upload/file`, which returns `str(dest)` -- a NATIVE
+  // path. On a Windows host that is `C:\...\uploads\pic.png` with no forward
+  // slash in it at all, so the whole absolute path became the chip's text, its
+  // tooltip, the image `alt` and both of its aria-labels.
+  //
+  // `String.raw` throughout, so every backslash below is one backslash: written
+  // as an ordinary quoted string, `'C:\Users'` is JUST `C:Users` (JavaScript
+  // drops the backslash before an unknown escape), and the fixture would stop
+  // being a Windows path at all.
+  it('labels a chip by basename when the upload route returns a Windows path', () => {
+    const shot = String.raw`C:\Users\dev\AppData\Local\KiroCrew\uploads\shot.PNG`
+    const notes = String.raw`C:\Users\dev\AppData\Local\KiroCrew\uploads\notes.pdf`
+    // Guard the guard: these really are separator-free as far as the old rule
+    // was concerned, so nothing here can pass by accident.
+    expect(shot.includes('/')).toBe(false)
+
+    const out = attachmentsFrom({ images: [shot], files: [notes] })
+    expect(out.map(a => a.name)).toEqual(['shot.PNG', 'notes.pdf'])
+    // The staged path itself is untouched: `attachmentLines` runs it through
+    // `mdImageDest` at send time, and that is where normalization belongs.
+    expect(out[0].path).toBe(shot)
+  })
+
+  it('labels a chip by basename for a UNC upload path', () => {
+    const unc = String.raw`\\server\share\uploads\team.png`
+    const out = attachmentsFrom({ images: [unc], files: [] })
+    expect(out.map(a => a.name)).toEqual(['team.png'])
+  })
+
+  it('keeps a backslash that is part of a POSIX file name', () => {
+    // Not a separator: on POSIX a backslash is a legal character in a name, so
+    // a blanket rewrite would turn one real file into a nonexistent nested path.
+    const out = attachmentsFrom({ images: [], files: [String.raw`/u/weird\name.txt`] })
+    expect(out.map(a => a.name)).toEqual([String.raw`weird\name.txt`])
+  })
 })
 
 describe('cropToFile', () => {
   // The screen-capture crop reaches the composer as base64 and has to become a
   // File before it can be uploaded. This is pinned because the failure was
-  // invisible from the panel's side: ChatPanel imports lucide's `File` ICON,
-  // which shadows the DOM constructor for that whole module, so building the
+  // invisible from the panel's side: a panel file that imports lucide's `File`
+  // ICON shadows the DOM constructor for that whole module, so building the
   // File there threw "not a constructor" inside an async handler -- the crop
   // silently never became an attachment. Constructing it in THIS module is the
   // fix, and this test is what keeps it here.

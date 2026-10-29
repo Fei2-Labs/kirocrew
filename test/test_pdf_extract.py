@@ -13,6 +13,7 @@ import io
 import json
 import subprocess
 import sys
+import textwrap
 import time
 
 import pytest
@@ -80,7 +81,14 @@ class TestBound:
         out, _err = proc.communicate(bomb, timeout=_FAR)
         assert proc.returncode == pdf_extract_child.EXIT_FAILED
         lines = [json.loads(line) for line in out.decode().splitlines() if line]
-        assert lines == [{"error": "memory", "detail": "PdfminerException"}]
+        # WHICH ceiling refuses the inflate is a platform fact the child documents,
+        # not a behaviour this test picks: Linux enforces ``RLIMIT_AS``, so the
+        # refusal arrives as the ``MemoryError`` pdfplumber re-raises wrapped in
+        # ``PdfminerException``; macOS accepts ``RLIMIT_AS`` without enforcing it,
+        # so the child's own peak-RSS watchdog is the ceiling and names itself.
+        # The invariant either way is one ``error: memory`` line and EXIT_FAILED.
+        detail = "rss" if sys.platform == "darwin" else "PdfminerException"
+        assert lines == [{"error": "memory", "detail": detail}]
 
     def test_the_extractor_profile_is_a_fixed_address_space_ceiling(self):
         spec = sandbox._rlimit_spec(sandbox.RLIMIT_PROFILE_EXTRACTOR)
@@ -148,7 +156,8 @@ class TestCallerBudgets:
 
 
 class TestRssWatchdog:
-    """The child's own peak-RSS ceiling: the bound where the kernel has none (macOS)."""
+    """The child's own peak-RSS ceiling: the bound where the kernel has none (macOS),
+    sampled from the child's OWN footprint -- on Linux ``ru_maxrss`` is the parent's."""
 
     def test_watchdog_reports_memory_and_ends_the_process(self, capsys):
         samples = iter([100, 200, 2_000_000_001])
@@ -172,6 +181,116 @@ class TestRssWatchdog:
         assert peak is not None
         # This test process is at least a few MB resident; KiB misread as bytes would not be.
         assert peak > 4 * 1024 * 1024
+
+    def test_linux_samples_its_own_high_water_mark_never_getrusage(self, tmp_path, monkeypatch):
+        """On Linux ``execve`` hands the child the PARENT's ``ru_maxrss``, so the
+        sample comes from the child's own ``VmHWM`` and ``getrusage`` is not
+        consulted at all -- a gateway past the ceiling would otherwise lose every
+        child on the watchdog's first tick."""
+        status = tmp_path / "status"
+        status.write_text(
+            "Name:\tpython\nVmPeak:\t 1400000 kB\nVmHWM:\t   11432 kB\nVmRSS:\t   11432 kB\n",
+            encoding="utf-8",
+        )
+
+        class InheritedRusage:
+            @staticmethod
+            def getrusage(_who):
+                raise AssertionError("ru_maxrss consulted on linux: that is the parent's peak")
+
+            RUSAGE_SELF = 0
+
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(pdf_extract_child, "_resource", InheritedRusage)
+        monkeypatch.setattr(pdf_extract_child, "_LINUX_STATUS_PATH", str(status))
+        assert pdf_extract_child.peak_rss_bytes() == 11432 * 1024
+        # No /proc is unreadable, not a breach and not a fall-back to the inherited number.
+        monkeypatch.setattr(pdf_extract_child, "_LINUX_STATUS_PATH", str(tmp_path / "gone"))
+        assert pdf_extract_child.peak_rss_bytes() is None
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            "Name:\tpython\nVmRSS:\t   11432 kB\n",  # no high-water field at all
+            "VmHWM:\t   11432 MB\n",  # a unit the kernel never prints
+            "VmHWM:\t   lots kB\n",
+            "VmHWM:\n",
+            "",
+        ],
+    )
+    def test_an_unreadable_status_is_none_not_a_guess(self, status):
+        assert pdf_extract_child._peak_rss_from_status(status) is None
+
+    @pytest.mark.parametrize(
+        ("platform", "ru_maxrss", "expected"),
+        [("darwin", 123_456_789, 123_456_789), ("freebsd13", 11432, 11432 * 1024)],
+    )
+    def test_off_linux_getrusage_is_read_in_the_platforms_unit(
+        self, monkeypatch, platform, ru_maxrss, expected
+    ):
+        class Rusage:
+            RUSAGE_SELF = 0
+
+            @staticmethod
+            def getrusage(_who):
+                return type("Usage", (), {"ru_maxrss": ru_maxrss})()
+
+        monkeypatch.setattr(sys, "platform", platform)
+        monkeypatch.setattr(pdf_extract_child, "_resource", Rusage)
+        monkeypatch.setattr(pdf_extract_child, "_LINUX_STATUS_PATH", "/nonexistent/status")
+        assert pdf_extract_child.peak_rss_bytes() == expected
+
+    def test_a_child_of_a_parent_past_the_ceiling_still_extracts(self, tmp_path):
+        """The parent's peak is not the child's.
+
+        A parent that has touched twice the child's ``--max-rss`` spawns the real
+        extractor on a one-page PDF. Sampled from ``ru_maxrss``, the child's first
+        tick on Linux reads THAT parent's high-water mark (``execve`` inherits it)
+        and the page comes back as ``error: memory`` / ``rss``; the child's own
+        footprint is a fraction of the limit, so it must extract. The parent's
+        measured peak is asserted so the planted condition is proven, not assumed.
+        """
+        limit = 128 * 1024 * 1024
+        argv = [*pdf_extract._child_argv(4000, 10)[:-1], f"--max-rss={limit}"]
+        parent = textwrap.dedent(f"""
+            import json, resource, subprocess, sys
+            blob = bytearray({2 * limit})
+            for i in range(0, len(blob), 4096):
+                blob[i] = 1
+            del blob
+            peak_kib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # ``run`` with its own, SHORTER bound: on TimeoutExpired it kills the
+            # extractor and waits for it before raising, so the grandchild never
+            # outlives the outer bound this parent runs under.
+            proc = subprocess.run(
+                {argv!r}, cwd={str(tmp_path)!r}, input=sys.stdin.buffer.read(),
+                capture_output=True, timeout={_FAR},
+            )
+            json.dump(
+                {{"parent_peak": peak_kib * 1024, "rc": proc.returncode,
+                  "out": proc.stdout.decode(),
+                  "err": proc.stderr.decode(errors="replace")[-512:]}},
+                sys.stdout,
+            )
+            """)
+        # Outer bound strictly wider than the inner: a parent killed at the same
+        # instant its child hits the bound would leave that child running.
+        run = subprocess.run(
+            [sys.executable, "-c", parent],
+            input=text_pdf("from a fat parent"),
+            capture_output=True,
+            cwd=tmp_path,
+            timeout=_FAR * 2,
+            check=True,
+        )
+        report = json.loads(run.stdout)
+        assert report["parent_peak"] > limit, "the parent never crossed the child's ceiling"
+        assert report["rc"] == 0, report
+        lines = [json.loads(line) for line in report["out"].splitlines() if line]
+        assert lines == [
+            {"label": "page 1", "text": "from a fat parent"},
+            {"end": True, "truncated": False, "pages": 1},
+        ]
 
     def test_the_child_polices_its_own_rss_where_the_kernel_has_no_ceiling(self, bomb):
         """No rlimit at all (``none`` profile) and a 400 MB RSS ceiling: the inflate
@@ -204,6 +323,8 @@ class TestWindowsCeiling:
     @pytest.fixture
     def windows(self, monkeypatch):
         monkeypatch.setattr(pdf_extract.platform_compat, "IS_WINDOWS", True)
+        # An interpreter, not a venv redirector: the ceiling is exactly one process.
+        monkeypatch.setattr(pdf_extract.platform_compat, "python_launcher_hops", lambda: 0)
         calls: dict[str, list] = {"apply": [], "resume": []}
         monkeypatch.setattr(
             pdf_extract.platform_compat,
@@ -226,6 +347,20 @@ class TestWindowsCeiling:
         assert kw == {"max_procs": 1, "max_memory_bytes": sandbox._EXTRACTOR_MAX_AS_BYTES}
         assert windows["resume"] == [pid]
 
+    def test_a_venv_redirector_is_counted_in_the_process_ceiling(self, windows, monkeypatch):
+        """``Scripts\\python.exe`` in a venv is a redirector that spawns the real
+        interpreter as its child: two live processes, so a ceiling of one refused
+        the very spawn the ceiling was meant to bound and every document came back
+        ``protocol`` from a venv-hosted gateway (measured: exit 101, ``Unable to
+        create process using ...``)."""
+        monkeypatch.setattr(pdf_extract.platform_compat, "python_launcher_hops", lambda: 1)
+        outcome = pdf_extract.extract_pdf_segments(
+            text_pdf("through a redirector"), max_chars=100, deadline=_soon()
+        )
+        assert outcome.segments == (("page 1", "through a redirector"),)
+        [(_pid, kw)] = windows["apply"]
+        assert kw["max_procs"] == 2
+
     def test_no_ceiling_means_no_parse(self, windows):
         windows["apply_ok"] = False
         outcome = pdf_extract.extract_pdf_segments(
@@ -241,6 +376,32 @@ class TestWindowsCeiling:
             text_pdf("frozen"), max_chars=100, deadline=_soon()
         )
         assert outcome == pdf_extract.PdfExtraction((), True, "spawn", 0)
+
+    def test_a_timed_out_child_is_killed_as_a_tree(self, windows, monkeypatch):
+        """On Windows the pid may be a venv redirector whose interpreter is its
+        CHILD, and the Job carries no ``KILL_ON_JOB_CLOSE``: killing the redirector
+        alone leaves the interpreter parsing a slow document for as long as it
+        likes. The deadline path kills the tree, and does so while the redirector
+        is alive to name its children."""
+        trees: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            pdf_extract.platform_compat,
+            "kill_process_tree",
+            lambda pid, sig: trees.append((pid, sig)) or True,
+        )
+        monkeypatch.setattr(
+            pdf_extract,
+            "_child_argv",
+            lambda *_a: [sys.executable, "-c", "import time; time.sleep(30)"],
+        )
+        outcome = pdf_extract.extract_pdf_segments(
+            text_pdf("slow"), max_chars=10, deadline=time.monotonic() + 0.5
+        )
+        assert outcome == pdf_extract.PdfExtraction((), True, "timeout", 0)
+        [(pid, sig)] = trees
+        assert sig == pdf_extract.platform_compat.SIGKILL
+        [(applied_pid, _kw)] = windows["apply"]
+        assert pid == applied_pid
 
 
 _ARGV_100_5 = ["--max-chars=100", "--max-pages=5", "--max-rss=1000000000"]
@@ -369,10 +530,26 @@ class TestChildCaps:
     def _main(
         monkeypatch, capsys, argv: list[str], data: bytes, pdfplumber_module: object
     ) -> tuple[int, list[dict]]:
-        """Run the child's ``main`` in-process: stdin and the parser both faked."""
+        """Run the child's ``main`` in-process: stdin and the parser both faked.
+
+        ``main`` arms ``start_rss_watchdog`` first thing, and that watchdog
+        ends the PROCESS with ``os._exit`` when the process's peak RSS is over
+        ``--max-rss``. In-process here, "the process" is the pytest-xdist
+        worker, which has run thousands of tests by the time it reaches this
+        file and can well sit above the 1 GB the argv sets -- so the first
+        watchdog tick killed the worker (``worker 'gwN' crashed``). The
+        watchdog has its own tests in ``TestBound``; these tests are about the
+        caps, so the harness stubs it out and records that ``main`` asked for
+        it with the argv's limit.
+        """
+        armed: list[int] = []
+        monkeypatch.setattr(
+            pdf_extract_child, "start_rss_watchdog", lambda limit: armed.append(limit) or True
+        )
         monkeypatch.setattr(sys, "stdin", type("Stdin", (), {"buffer": io.BytesIO(data)})())
         monkeypatch.setitem(sys.modules, "pdfplumber", pdfplumber_module)
         rc = pdf_extract_child.main(argv)
+        assert armed, "main() must arm the RSS watchdog before reading anything"
         out = capsys.readouterr().out
         return rc, [json.loads(line) for line in out.splitlines() if line]
 

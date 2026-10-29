@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from aiohttp import web
@@ -25,6 +26,15 @@ from kiro_crew.apps.builtins.personal_shopper.backend import routes as routes_mo
 from kiro_crew.apps.builtins.personal_shopper.backend.store import PreferenceStore
 
 _PREFIX = "/api/apps/personal-shopper"
+_OWNER = "owner-user"
+
+
+@web.middleware
+async def _as_owner(request: web.Request, handler):
+    """Stamp the dashboard owner's identity, as the token middleware would."""
+    request["user"] = _OWNER
+    request["app"] = ""
+    return await handler(request)
 
 
 class RoutesTestCase(unittest.IsolatedAsyncioTestCase):
@@ -62,7 +72,8 @@ class RoutesTestCase(unittest.IsolatedAsyncioTestCase):
         enabled.start()
         self.addCleanup(enabled.stop)
 
-        app = web.Application()
+        app = web.Application(middlewares=[_as_owner])
+        app["state"] = SimpleNamespace(owner_id=_OWNER)
         routes_mod.register_routes(app)
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -224,6 +235,24 @@ class TestFeedbackIsConstrained(RoutesTestCase):
 
 
 class TestSitesShapeValidation(RoutesTestCase):
+    async def test_get_treats_a_vanished_sites_file_as_empty(self) -> None:
+        """Deleting sites.json during discovery must not turn GET into a 500."""
+        sites_file = routes_mod._sites_path()
+        sites_file.write_text('{"sites": []}', encoding="utf-8")
+        real_read_text = Path.read_text
+
+        def vanish_before_read(path, *args, **kwargs):
+            if path == sites_file:
+                path.unlink()
+                raise FileNotFoundError(path)
+            return real_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", vanish_before_read):
+            resp = await self.client.get(f"{_PREFIX}/sites")
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(await resp.json(), {"sites": []})
+
     async def test_sites_must_be_an_array_of_objects(self) -> None:
         resp = await self.client.put(f"{_PREFIX}/sites", json={"sites": ["amazon"]})
         self.assertEqual(resp.status, 400)

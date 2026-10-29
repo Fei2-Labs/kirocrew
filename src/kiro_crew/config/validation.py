@@ -14,7 +14,7 @@ What lives here:
   cache, with an explicit ``clear()`` (replacing the bare module globals that
   were impossible to reset/inject in tests).
 
-What deliberately stays in ``config/loader.py``:
+What deliberately stays in ``config/loader_document.py``:
 - ``_config_fingerprint()`` — it reads ``config_path()`` / ``config_local_path()``,
   which the test suite patches via ``kiro_crew.config.loader.config_path``; keeping
   it there preserves that monkeypatch seam. The loader computes the fingerprint
@@ -31,11 +31,18 @@ compatibility.
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import threading
+from typing import Iterable
 
-# Top-level config.json sections a BUILTIN APP owns and reads from the file
-# directly, with no modelled field in this core. Not in _KNOWN_CONFIG_SECTIONS
+from kiro_crew.config.fields import _coerce_bool
+
+# Top-level config.json sections an app owns and reads from the file directly,
+# with no modelled field in this core. Installed apps and companion plugins add
+# their manifest declarations at validation time. This literal remains the
+# compatibility fallback for keys that predate that manifest field. Not in
+# _KNOWN_CONFIG_SECTIONS
 # (no dataclass parses them) and not in CONFIG_RESERVED_TOP_KEYS (they must
 # survive save(), not be dropped by it): the loader already captures them into
 # _extra_sections and re-emits them like any other unmodelled section. The one
@@ -50,6 +57,35 @@ import threading
 #     and prescribed by the dashboard's "no checkout found" banner.
 _APP_OWNED_TOP_KEYS: frozenset = frozenset({"dev_fleet"})
 
+# Top-level config.json sections THIS CORE itself writes and reads, but does not
+# model as a dataclass field. The settings UI persists them into config.json and
+# a core module reads them back on startup -- so, exactly like the keys save()
+# stamps (CONFIG_RESERVED_TOP_KEYS), the product wrote them itself and warning
+# "unrecognized" about them is a false positive. They differ from the reserved
+# keys in that they carry live operator settings that must survive save(): the
+# loader captures them into _extra_sections and re-emits them via to_dict(), so
+# they are NOT reserved (reserved keys are dropped on save). They differ from
+# _APP_OWNED_TOP_KEYS only in who owns the reader -- core here, a builtin app
+# there -- which is why they are a separate set and the "second member becomes a
+# registration mechanism" note on the app-owned set does not govern this one:
+# a core-owned section has no manifest to declare itself through.
+# Excluded only in the shape the reader keeps -- a JSON object -- so a scalar
+# written by hand keeps the one warning that says it is being ignored.
+#   * voice_reply -- the dashboard/Slack voice settings block. Written by
+#     slack/interactions_modals.py (``data.setdefault("voice_reply", {})``) and
+#     dashboard/chat_voice.py (persisted with json.dump), and read back on
+#     startup by slack/handler_runtime/voice.py::load_voice_reply_config
+#     (``cfg.raw.get("voice_reply")``), and also by
+#     telegram/transport_dispatch.py (``raw.get("voice_reply")``). No
+#     SCHEMA_REGISTRY entry.
+#   * connections -- the Connections block. The Settings "OAuth Apps" form
+#     writes ``connections.oauth_clients.<slug>.client_id``
+#     (dashboard/handlers/connections.py::_write_oauth_client), read back by
+#     connections/oauth_clients.py::_config_client_id; the
+#     ``connections.tool_aliases`` gate is read by
+#     agent_materialization/mcp_aliases.py. No SCHEMA_REGISTRY entry.
+_CORE_OWNED_TOP_KEYS: frozenset = frozenset({"voice_reply", "connections"})
+
 try:
     import jsonschema
 
@@ -60,6 +96,12 @@ except ImportError:  # pragma: no cover
 # Config-validation warnings are part of the loader's observable contract, so
 # they are emitted on the loader's logger channel (see module docstring).
 logger = logging.getLogger("kiro_crew.config.loader")
+
+# Deprecated fields survive load and save, so repeated config reads cannot clear
+# their warning. A digest remembers each observed field value for this process
+# without retaining configured credentials in the warning registry.
+_REPORTED_DEPRECATED_FIELDS: set[tuple[str, bytes]] = set()
+_DEPRECATED_WARNING_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +162,16 @@ def _holds_nothing(value: object) -> bool:
     deprecation notice.
     """
     return value is None or (isinstance(value, (dict, list, str)) and not value)
+
+
+def _is_own_default(value: object, default: object) -> bool:
+    """True when a stored value is the field's own default.
+
+    Such a value behaves exactly as an absent key, so there is nothing for the
+    operator to migrate. A bool never equals a number here, so a deprecated
+    flag's ``False`` is not read as a numeric ``0`` default or the reverse.
+    """
+    return isinstance(value, bool) == isinstance(default, bool) and value == default
 
 
 def _get_help_text(schema: dict, dot_path: str) -> str:
@@ -200,6 +252,24 @@ def _actual_type_name(value: object) -> str:
 #:   unreadable section so the loader records its degradation and the creation
 #:   guard refuses instead of treating the operator's setting as absent.
 #:
+#: * ``hooks`` (the section) and ``hooks.confirm_tools``: the confirm list's
+#:   default is **open** (no call asks), so repairing a malformed list -- or a
+#:   non-object section that carried it, which an overlay can use to replace the
+#:   base file's -- to absent would let every static grant and
+#:   ``auto_approve_tools`` grant it was written to withhold through. Preserved,
+#:   the loader records a non-object section as degraded (``_coerced_section``)
+#:   and ``governance._confirm_tool_patterns`` reads it, or a present non-list
+#:   value, as an unknown list, so the writers and the gate withhold instead.
+#:
+#: * ``workspaces``: the table names WHERE the Global V1 memory workspaces
+#:   live, some possibly at absolute directories outside the data home, and the
+#:   folder-steering memory-store fence is built from it. Repairing a malformed
+#:   table to ``{}`` reads as "no workspaces configured", and a fence built
+#:   from that covers only the default directory -- so a steering root that
+#:   contains an operator's external workspace would be admitted and read.
+#:   Preserved, the loader records ``DEGRADED_WORKSPACES`` and the fence
+#:   refuses every root until the table is readable again.
+#:
 #: Exact-match only: this is a per-path judgment, not a subtree rule. The
 #: registry is only half of a fix — a preserved value changes nothing unless
 #: the loader RECORDS the degradation and a gate reads
@@ -212,8 +282,17 @@ _FAIL_CLOSED_PATHS = frozenset(
         "dashboard",
         "dashboard.tailscale",
         "memory",
+        "workspaces",
+        "hooks",
+        "hooks.confirm_tools",
     }
 )
+
+
+def _is_flat_workspace_string(dot_path: str, value: object) -> bool:
+    """Whether *value* is the flat ``workspaces.<name>: "<dir>"`` form."""
+    parts = dot_path.split(".")
+    return len(parts) == 2 and parts[0] == "workspaces" and isinstance(value, str)
 
 
 def _apply_field_default(data: dict, dot_path: str) -> bool:
@@ -314,8 +393,9 @@ class ConfigCache:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        # (fingerprint, deep-copyable validated data dict, opaque sidecar)
-        self._entry: tuple[tuple, dict, dict] | None = None
+        # (fingerprint, deep-copyable validated data dict, opaque sidecar,
+        #  digest of the bytes that read parsed)
+        self._entry: tuple[tuple, dict, dict, str | None] | None = None
         # Monotonic invalidation token. A loader captures this before disk I/O;
         # clear() advances it so that reader cannot publish a pre-write snapshot
         # afterward even when a coarse filesystem reports the same fingerprint.
@@ -339,8 +419,8 @@ class ConfigCache:
                 return copy.deepcopy(self._entry[1])
         return None
 
-    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict] | None:
-        """Return deep copies of ``(data, sidecar)`` from ONE lock hold, else None.
+    def get_with_sidecar(self, fingerprint: tuple) -> tuple[dict, dict, str | None] | None:
+        """Return ``(data, sidecar, content_digest)`` from ONE lock hold, else None.
 
         The sidecar carries facts about the SAME read that the merged dict cannot
         express — today, the pre-overlay base values the loader needs to round-trip
@@ -351,10 +431,23 @@ class ConfigCache:
         loader would then capture from as if no overlay existed, deleting shadowed
         base keys on the next save. There is deliberately no separate sidecar
         accessor: the lock makes the pair all-or-nothing.
+
+        ``content_digest`` is the third fact about that one read and leaves under the
+        same hold for the same reason: it says WHICH BYTES this entry was parsed
+        from, which the fingerprint cannot. A fingerprint is stat metadata, so a
+        replacement landing the same byte count can present an identical one, and a
+        caller would then pair this entry's data with a digest of different bytes.
+        ``None`` means the storing caller named none -- it did no disk read, or could
+        not read the files whole -- so a caller needing provenance must treat it as
+        unknown rather than as a match.
         """
         with self._lock:
             if self._entry is not None and self._entry[0] == fingerprint:
-                return copy.deepcopy(self._entry[1]), copy.deepcopy(self._entry[2])
+                return (
+                    copy.deepcopy(self._entry[1]),
+                    copy.deepcopy(self._entry[2]),
+                    self._entry[3],
+                )
         return None
 
     def store(
@@ -364,6 +457,7 @@ class ConfigCache:
         sidecar: dict | None = None,
         *,
         expected_generation: int | None = None,
+        content_digest: str | None = None,
     ) -> bool:
         """Cache *data* when no invalidation occurred since its disk read began.
 
@@ -374,6 +468,11 @@ class ConfigCache:
         closes that gap. ``clear()`` advances the token, and a reader holding an
         older token is refused rather than restoring stale data after the clear.
 
+        *content_digest* is the digest of the bytes this *data* was parsed from, so
+        the entry can answer which content it represents rather than only which stat
+        signature it was filed under. A caller that read no bytes has none to give
+        and passes nothing, which records the provenance as unknown.
+
         Returns whether the value was stored. Callers that do not perform disk
         I/O may omit *expected_generation* and retain the original unconditional
         cache-insertion behavior.
@@ -381,7 +480,12 @@ class ConfigCache:
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
                 return False
-            self._entry = (fingerprint, copy.deepcopy(data), copy.deepcopy(sidecar or {}))
+            self._entry = (
+                fingerprint,
+                copy.deepcopy(data),
+                copy.deepcopy(sidecar or {}),
+                content_digest,
+            )
             return True
 
     def clear(self) -> None:
@@ -398,6 +502,65 @@ _CONFIG_CACHE = ConfigCache()
 # all locking is internal to ConfigCache; the alias can be dropped once nothing
 # references that name.
 _CONFIG_CACHE_LOCK = _CONFIG_CACHE._lock
+
+
+# Top-level config keys declared by installed extension manifests, one immutable
+# snapshot per fixed discovery source. Each manifest parser bounds its own
+# declaration; validation reads only this in-memory union.
+_EXTENSION_CONFIG_KEY_SOURCES = ("apps", "plugins")
+_extension_config_keys_lock = threading.Lock()
+_extension_config_keys: dict[str, frozenset[str]] = {
+    source: frozenset() for source in _EXTENSION_CONFIG_KEY_SOURCES
+}
+
+
+def replace_extension_config_keys(source: str, keys: Iterable[str]) -> frozenset[str]:
+    """Atomically publish one fixed discovery source's key snapshot.
+
+    Discovery and lifecycle code call this after filesystem or distribution-
+    metadata work. Unknown source names are ignored so the process-global
+    registry cannot grow with caller-controlled identifiers. Returns the
+    snapshot now held for *source*.
+    """
+    if source not in _EXTENSION_CONFIG_KEY_SOURCES:
+        logger.debug("Ignoring unknown extension config-key source %r", source)
+        return frozenset()
+    snapshot = frozenset(keys)
+    with _extension_config_keys_lock:
+        _extension_config_keys[source] = snapshot
+    return snapshot
+
+
+def extension_config_keys(source: str) -> frozenset[str]:
+    """Return the published snapshot for one fixed discovery source."""
+    with _extension_config_keys_lock:
+        return _extension_config_keys.get(source, frozenset())
+
+
+def _installed_extension_config_keys() -> set[str]:
+    """Return the in-memory union of app and companion declarations.
+
+    Never raises, imports modules, reads files, or inspects distributions.
+    """
+    try:
+        with _extension_config_keys_lock:
+            return set().union(*_extension_config_keys.values())
+    except Exception:
+        logger.debug("Could not read extension config key registry", exc_info=True)
+        return set()
+
+
+def prime_extension_config_keys() -> None:
+    """Populate app and admitted-plugin key snapshots before first validation.
+
+    This is synchronous startup work. Callers invoke it before creating an
+    asyncio event loop; validation itself remains an in-memory-only consumer.
+    """
+    from kiro_crew.apps.manager import refresh_app_config_keys
+    from kiro_crew.platform.discovery import refresh_installed_plugin_config_keys
+
+    refresh_app_config_keys()
+    refresh_installed_plugin_config_keys()
 
 
 def validate_config_data(data: dict) -> dict:
@@ -426,17 +589,24 @@ def validate_config_data(data: dict) -> dict:
     # config's *sections*, so the keys save() stamps itself are not in it and
     # must be excluded — otherwise every load of a config Kiro Crew has ever
     # saved warns about Kiro Crew's own bookkeeping. A section a builtin app owns
-    # and reads from the file directly (_APP_OWNED_TOP_KEYS) is not in the
-    # registry either, and is excluded for the same reason: the product told the
-    # operator to write it. Excluded only in the shape the app reads -- a JSON
-    # object. The app's reader keeps only a dict (repository.py
-    # ``isinstance(raw.get("dev_fleet"), dict)``) and silently falls back to
-    # discovery on anything else, so a scalar ``dev_fleet: "/opt/kc"`` would
+    # and reads from the file directly (_APP_OWNED_TOP_KEYS), or that this core
+    # writes and reads without a dataclass model (_CORE_OWNED_TOP_KEYS), is not
+    # in the registry either and is excluded for the same reason: the product
+    # told the operator to write it, or wrote it itself. Excluded only in the
+    # shape the reader keeps -- a JSON object. A reader keeps only a dict and
+    # silently falls back on anything else, so a scalar written by hand would
     # otherwise lose the one warning that tells the operator it is being ignored.
     known_top_keys = {e.path for e in SCHEMA_REGISTRY if "." not in e.path and e.path != "*"}
-    app_owned_sections = {k for k in _APP_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
+    declared_app_keys = set(_APP_OWNED_TOP_KEYS)
+    declared_app_keys.update(_installed_extension_config_keys())
+    app_owned_sections = {k for k in declared_app_keys if isinstance(data.get(k), dict)}
+    core_owned_sections = {k for k in _CORE_OWNED_TOP_KEYS if isinstance(data.get(k), dict)}
     unknown = sorted(
-        set(data.keys()) - known_top_keys - CONFIG_RESERVED_TOP_KEYS - app_owned_sections
+        set(data.keys())
+        - known_top_keys
+        - CONFIG_RESERVED_TOP_KEYS
+        - app_owned_sections
+        - core_owned_sections
     )
     if unknown:
         logger.warning("Config: unrecognized top-level keys: %s", ", ".join(unknown))
@@ -445,7 +615,10 @@ def validate_config_data(data: dict) -> dict:
     # nothing (an empty map/list/string, or null) carries nothing for the
     # operator to migrate, so it is not announced: warning on bare presence would
     # scold an install whose earlier build materialized the key's empty default
-    # into every save, which the operator never wrote and cannot act on.
+    # into every save, which the operator never wrote and cannot act on. The
+    # same holds for a key holding the field's own default: the default-config
+    # writer serializes every field, so a config Kiro Crew has just created
+    # already carries it, and the loader would warn about its own write.
     for entry in SCHEMA_REGISTRY:
         if not entry.deprecated:
             continue
@@ -459,7 +632,13 @@ def validate_config_data(data: dict) -> dict:
             else:
                 found = False
                 break
-        if found and not _holds_nothing(node):
+        if found and not _holds_nothing(node) and not _is_own_default(node, entry.default_value):
+            value_digest = hashlib.sha256(repr(node).encode("utf-8")).digest()
+            warning_key = (entry.path, value_digest)
+            with _DEPRECATED_WARNING_LOCK:
+                if warning_key in _REPORTED_DEPRECATED_FIELDS:
+                    continue
+                _REPORTED_DEPRECATED_FIELDS.add(warning_key)
             logger.warning(
                 "Config: deprecated field '%s': %s",
                 entry.path,
@@ -481,6 +660,24 @@ def validate_config_data(data: dict) -> dict:
 
             agent["acp_backend"] = canonical_backend_id(agent["acp_backend"])
 
+    # 3b. ``auto_update`` decides whether an unattended installer runs, and its
+    # two wrong answers are not symmetric, so a type mismatch must not be
+    # "repaired" to this field's True default: a hand-edited ``"false"`` (or a
+    # ``0``) would then install on a host whose owner wrote the opposite. A
+    # recognized spelling becomes its bool here, before the type check sees it,
+    # and anything else unreadable becomes False. The loader applies the same
+    # rule (``fields._coerce_bool``) for a host without ``jsonschema``.
+    if "auto_update" in data and not isinstance(data["auto_update"], bool):
+        data["auto_update"] = _coerce_bool(data["auto_update"], False)
+
+    # 3c. A retired verbosity level is renamed, not rejected: the enum check
+    # would otherwise delete it and drop the user back to the verbose default.
+    dashboard = data.get("dashboard")
+    if isinstance(dashboard, dict) and "verbosity" in dashboard:
+        from kiro_crew.config.sections import normalize_verbosity
+
+        dashboard["verbosity"] = normalize_verbosity(dashboard["verbosity"])
+
     # 3a. Resolve the STT provider and model through the loader's own degradation
     # rules before the enum check can discard them. Both fields accept values that
     # are deliberately absent from their enum (a retired provider, and a model name
@@ -491,11 +688,57 @@ def validate_config_data(data: dict) -> dict:
     # makes the resolved value and the log identical whether or not ``jsonschema``
     # is installed, which is the whole point: this function is a no-op without it.
     stt = data.get("stt")
+    # An edition-registered provider passes the resolver above but is not in the
+    # schema's enum, which lists only the built-ins (the schema is built once at
+    # import, before any context exists). Held aside across the enum check and put
+    # back after it, so the check cannot delete a value the resolver accepted.
+    registered_stt_provider: str | None = None
     if isinstance(stt, dict):
         if "provider" in stt:
             stt["provider"] = _validated_stt_provider(stt["provider"])
+            from kiro_crew.config.sections_stt import _VALID_STT_PROVIDERS
+
+            if stt["provider"] not in _VALID_STT_PROVIDERS:
+                registered_stt_provider = stt.pop("provider")
         if "model" in stt:
-            stt["model"] = _validated_stt_model(stt["model"])
+            # The sibling pair travels with the name: ``custom`` is only a usable
+            # selection when both halves are set, and validating it without them
+            # rewrites a correctly configured custom model back to the default here,
+            # before the parse site ever sees it.
+            stt["model"] = _validated_stt_model(
+                stt["model"],
+                custom_path=stt.get("custom_model_path", ""),
+                custom_sha256=stt.get("custom_model_sha256", ""),
+            )
+        # `"auto"` is a documented spelling of 0, so it must become the int before
+        # the integer type check deletes it with a misleading "wrong type" notice.
+        if "threads" in stt:
+            from kiro_crew.config.sections import _validated_stt_threads
+
+            stt["threads"] = _validated_stt_threads(stt["threads"])
+
+    # 3d. The harness fields have a product default distinct from their safety
+    # floor. Absent or "" is "no choice" and takes the default, but a PRESENT
+    # malformed value must not be deleted into that same absence by jsonschema:
+    # it is an unusable explicit choice and resolves to the Kiro CLI floor,
+    # stored as ``"kiro"`` (harness-parity H3). Normalize it before type
+    # validation so jsonschema-backed loads keep that distinction. jsonschema is
+    # a pinned runtime dependency; the early no-jsonschema return is an
+    # import-failure survival path and keeps its field-default fallback.
+    if isinstance(agent, dict):
+        for harness_key in ("acp_backend", "member_acp_backend"):
+            if harness_key in agent and not isinstance(agent[harness_key], str):
+                from kiro_crew.acp_backends import (
+                    GOVERNANCE_FLOOR_BACKEND,
+                    backend_to_stored,
+                )
+
+                logger.warning(
+                    "Ignoring agent.%s %r (not a backend id); using the Kiro CLI floor",
+                    harness_key,
+                    agent[harness_key],
+                )
+                agent[harness_key] = backend_to_stored(GOVERNANCE_FLOOR_BACKEND)
 
     # 4. Preserve numeric values written by older config writers.
     _coerce_legacy_numeric_values(data, validation_schema)
@@ -535,6 +778,11 @@ def validate_config_data(data: dict) -> dict:
                     "using default" if removed else "value kept (validated by its consumer)",
                 )
             elif err.validator == "type":
+                if _is_flat_workspace_string(dot_path, value):
+                    # The loader migrates this form to {"dir": ...} and writes
+                    # it back, so the string stays for it to read.
+                    logger.info("Config: flat workspace string at '%s' is migrated", dot_path)
+                    continue
                 expected = err.schema.get("type", "unknown")
                 actual = _actual_type_name(value)
                 removed = _apply_field_default(data, dot_path)
@@ -555,5 +803,8 @@ def validate_config_data(data: dict) -> dict:
                     err.message,
                     "using default" if removed else "value kept (validated by its consumer)",
                 )
+
+    if registered_stt_provider is not None and isinstance(data.get("stt"), dict):
+        data["stt"]["provider"] = registered_stt_provider
 
     return data

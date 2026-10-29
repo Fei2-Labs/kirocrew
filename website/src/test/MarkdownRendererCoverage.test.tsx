@@ -12,6 +12,7 @@ import MarkdownRenderer, {
 } from '../components/MarkdownRenderer'
 import { ThemeProvider } from '../hooks/useTheme'
 import { __resetPathKindCache } from '../hooks/usePathKind'
+import { stubPathKinds } from './pathKindStub'
 import { resetExpandedDiffFences } from '../components/FoldableDiffBlock'
 import { api } from '../api/client'
 
@@ -295,6 +296,39 @@ describe('MarkdownRenderer structural elements', () => {
   })
 })
 
+describe('MarkdownRenderer mid-sentence ``` runs', () => {
+  const labels = (c: HTMLElement) => Array.from(c.querySelectorAll('.code-block')).map(b => b.querySelector('span')?.textContent)
+
+  it('renders the run and the prose after it as prose, beside a real code block', () => {
+    const content = [
+      'Use a ```diff block for file changes.',
+      'This line stays prose.',
+      '',
+      '```text',
+      'separator',
+      '```',
+    ].join('\n')
+    const { container } = render(<MarkdownRenderer content={content} />)
+    expect(labels(container)).toEqual(['text'])
+    expect(container.textContent).toContain('Use a ```diff block for file changes.')
+    expect(container.textContent).toContain('This line stays prose.')
+  })
+
+  it('still renders a streaming glued fence as a code block', () => {
+    const { container } = render(<MarkdownRenderer content={'Here is code:```python\nprint(1)'} streaming />)
+    expect(labels(container)).toEqual(['python'])
+    expect(container.querySelector('.code-block')!.textContent).toContain('print(1)')
+  })
+
+  it('renders an empty fence without the word "undefined"', () => {
+    // parseBlocks keeps the indented fence in the markdown block; the glue pass
+    // moves it to column 0, and it reaches the fenced-code override with no children.
+    const { container } = render(<MarkdownRenderer content={'  ```diff\n  ```'} />)
+    expect(labels(container)).toEqual(['diff'])
+    expect(container.querySelector('.code-block')!.textContent).not.toContain('undefined')
+  })
+})
+
 // ── block routing ──────────────────────────────────────────────────────────
 
 describe('MarkdownRenderer block routing', () => {
@@ -316,6 +350,43 @@ describe('MarkdownRenderer block routing', () => {
     })
     fireEvent.click(chip)
   }
+
+  it('shows the summary after a closing fence glued to it, outside the folded chip', async () => {
+    // The reported shape: the closer glued to bold prose. The summary must be
+    // in the DOM with the patch still folded.
+    const glued = '```diff\n--- /dev/null\n+++ /sample.txt\n@@ -0,0 +1 @@\n+sample\n```**Financial summary**\n\nTotals follow.'
+    const { container } = render(<MarkdownRenderer {...chatProps} content={glued} />)
+    await waitFor(() => expect(container.querySelector('[data-testid="prose-diff-chip"]')).not.toBeNull())
+    expect(container.textContent).toContain('Financial summary')
+    expect(container.textContent).toContain('Totals follow.')
+    expect(container.textContent).not.toContain('+sample')
+    expect(container.querySelector('[data-testid="unclosed-diff"]')).toBeNull()
+  })
+
+  it('opens an unclosed diff under a warning, keeping its chip', async () => {
+    const unclosed = 'Intro\n\n```diff\n@@ -1 +1 @@\n-old line\n+new line\nThe answer the user came for.'
+    const { container } = render(<MarkdownRenderer {...chatProps} content={unclosed} />)
+    await waitFor(() => expect(container.querySelector('[data-testid="unclosed-diff"]')).not.toBeNull())
+    expect(container.querySelector('[data-testid="prose-diff-chip"]')?.getAttribute('aria-expanded')).toBe('true')
+    expect(container.querySelector('[role="note"]')?.textContent).toContain('the rest of the reply may appear inside this diff')
+    expect(container.textContent).toContain('The answer the user came for.')
+  })
+
+  it('opens the same chip in place when a streaming unclosed diff is finalized', async () => {
+    const text = 'Intro\n\n```diff\n@@ -1 +1 @@\n-old line\n+new line'
+    const { container, rerender } = render(<MarkdownRenderer {...chatProps} content={text} streaming />)
+    await waitFor(() => expect(container.querySelector('[data-testid="prose-diff-chip"]')).not.toBeNull())
+    const chip = container.querySelector('[data-testid="prose-diff-chip"]')
+    expect(chip?.getAttribute('aria-expanded')).toBe('false')
+    expect(container.querySelector('[data-testid="unclosed-diff"]')).toBeNull()
+    rerender(<MarkdownRenderer {...chatProps} content={text} />)
+    await waitFor(() => expect(container.querySelector('[data-testid="unclosed-diff"]')).not.toBeNull())
+    // The chip the user was watching is the same element, now expanded: it was
+    // not unmounted and replaced by a different block.
+    expect(container.querySelector('[data-testid="prose-diff-chip"]')).toBe(chip)
+    expect(chip?.getAttribute('aria-expanded')).toBe('true')
+    expect(container.textContent).toContain('new line')
+  })
 
   it('collapses a prose diff to a chip until it is opened', async () => {
     const { container } = render(<MarkdownRenderer {...chatProps} content={`Here is the change:\n\n${diff}`} />)
@@ -403,6 +474,28 @@ describe('MarkdownRenderer block routing', () => {
     done.unmount()
     queryClient.clear()
   })
+
+  it('renders the reported glued reply as chip, visible summary and a widget frame', async () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    })
+    const glued = '```diff\n--- /dev/null\n+++ /sample.txt\n@@ -0,0 +1 @@\n+sample\n'
+      + '```**Financial summary**\n\n<mcwidget title="Summary"><div>Chart</div></mcwidget>'
+    const { container, unmount } = render(
+      <QueryClientProvider client={queryClient}>
+        <ThemeProvider>
+          <MarkdownRenderer {...chatProps} content={glued} messageTs={'2026-10-09T00:00:00Z'} />
+        </ThemeProvider>
+      </QueryClientProvider>,
+    )
+    await waitFor(() => expect(container.querySelector('iframe')).not.toBeNull())
+    expect(container.querySelector('[data-testid="prose-diff-chip"]')).not.toBeNull()
+    expect(container.textContent).toContain('Financial summary')
+    // The widget tag is a frame, not literal text inside the patch.
+    expect(container.textContent).not.toContain('<mcwidget')
+    unmount()
+    queryClient.clear()
+  })
 })
 
 // ── path chip activation fallback ──────────────────────────────────────────
@@ -413,9 +506,7 @@ describe('MarkdownRenderer path chip with no file handler', () => {
   afterEach(() => { globalThis.fetch = realFetch; vi.restoreAllMocks() })
 
   it('reveals the file in the OS file manager when no onFileOpen is wired', async () => {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response),
-    ) as unknown as typeof fetch
+    stubPathKinds(() => 'file')
     // Resolve the wire shape (the OS handled it, no copy path) so the shared
     // `revealOrOpen` can read `r.copy` without tripping over `undefined`.
     const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({} as never)
@@ -544,12 +635,23 @@ describe('Lightbox download', () => {
     window.dispatchEvent(new CustomEvent('lightbox', { detail: { images: [{ src, alt }], index: 0 } }))
   }
 
+  // The vitest harness provides a full Clipboard API, so Copy is offered and
+  // Download lives in the toolbar's overflow menu (the two-button cap, after
+  // Copy joined the row). Open the menu, then select Download — Radix opens and
+  // selects on the pointer gesture, not a bare click, in jsdom.
+  function clickDownload(container: HTMLElement) {
+    const trigger = container.querySelector('[data-testid="lightbox-actions-menu"]') as HTMLElement
+    act(() => { fireEvent.pointerDown(trigger, { button: 0 }); fireEvent.pointerUp(trigger); fireEvent.click(trigger) })
+    const item = document.body.querySelector('[data-testid="lightbox-download-image"]') as HTMLElement
+    act(() => { fireEvent.pointerDown(item, { button: 0 }); fireEvent.pointerUp(item); fireEvent.click(item) })
+  }
+
   it('downloads the served bytes, naming the file from the ?path= query', async () => {
     vi.useFakeTimers()
     try {
-      const { getByLabelText } = render(<Lightbox />)
+      const { container } = render(<Lightbox />)
       act(() => open('/api/file-raw?path=%2Ftmp%2Fshots%2Fpanel.png', 'panel'))
-      act(() => { fireEvent.click(getByLabelText('Download image')) })
+      clickDownload(container)
       await vi.waitFor(() => expect(clicks).toHaveLength(1))
       expect(clicks[0]).toEqual({ download: 'panel.png', href: 'blob:shot' })
       expect(fetchMock).toHaveBeenCalledWith('/api/file-raw?path=%2Ftmp%2Fshots%2Fpanel.png')
@@ -563,36 +665,36 @@ describe('Lightbox download', () => {
   })
 
   it('names a remote image from its URL basename', async () => {
-    const { getByLabelText } = render(<Lightbox />)
+    const { container } = render(<Lightbox />)
     act(() => open('https://example.invalid/media/diagram.svg', 'diagram'))
-    act(() => { fireEvent.click(getByLabelText('Download image')) })
+    clickDownload(container)
     await waitFor(() => expect(clicks).toHaveLength(1))
     expect(clicks[0].download).toBe('diagram.svg')
   })
 
   it('falls back to the alt text when the source carries no filename', async () => {
-    const { getByLabelText } = render(<Lightbox />)
+    const { container } = render(<Lightbox />)
     act(() => open('data:image/png;base64,iVBORw0KGgo=', 'Kiro Crew banner'))
-    act(() => { fireEvent.click(getByLabelText('Download image')) })
+    clickDownload(container)
     await waitFor(() => expect(clicks).toHaveLength(1))
     expect(clicks[0].download).toBe('Kiro_Crew_banner')
   })
 
   it('opens the image in a new tab when the fetch is refused', async () => {
     fetchMock.mockResolvedValue({ ok: false, status: 403 } as unknown as Response)
-    const { getByLabelText } = render(<Lightbox />)
+    const { container } = render(<Lightbox />)
     act(() => open('https://example.invalid/blocked.png', 'blocked'))
-    act(() => { fireEvent.click(getByLabelText('Download image')) })
+    clickDownload(container)
     await waitFor(() => expect(openMock).toHaveBeenCalled())
     expect(openMock).toHaveBeenCalledWith('https://example.invalid/blocked.png', '_blank', 'noopener,noreferrer')
     expect(clicks).toHaveLength(0)
   })
 
   it('downloads the current image on the "d" shortcut', async () => {
-    const { getByLabelText } = render(<Lightbox />)
+    render(<Lightbox />)
     act(() => open('/api/file-raw?path=%2Ftmp%2Fshot.png', 'shot'))
-    // The toolbar button is present, but this path is the keyboard one.
-    expect(getByLabelText('Download image')).not.toBeNull()
+    // The toolbar's download control now lives in the overflow menu; this path
+    // is the keyboard shortcut, which is unchanged and needs no open menu.
     act(() => { fireEvent.keyDown(window, { key: 'd' }) })
     await waitFor(() => expect(clicks).toHaveLength(1))
     expect(clicks[0].download).toBe('shot.png')

@@ -2,9 +2,10 @@
 
 The workflow replaces a PR comment that four maintainers' local crons each
 posted independently (the bug collected eight copies of one message) with a
-single check-run keyed on the head SHA. Its decisions live in shell inside
-`run:` blocks, so these tests extract each step and execute it for real, with
-`gh` replaced by a stub. Five properties are verified rather than assumed,
+single check-run keyed on the head SHA. Its rules live in
+`.github/scripts/pr-description-check.sh` (shared with PR Hygiene) and its
+publishing in a `run:` block, so these tests execute both for real, with `gh`
+replaced by a stub. Five properties are verified rather than assumed,
 because each has a failure mode that produces a plausible-looking wrong answer:
 
 * the heading match must accept a SUFFIXED heading -- the template itself ships
@@ -51,7 +52,10 @@ from pathlib import Path
 import pytest
 import yaml
 
-WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "fork-pr-description.yml"
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "fork-pr-description.yml"
+# The rules themselves: one script, shared with PR Hygiene in code-review.yml.
+SCRIPT = ROOT / ".github" / "scripts" / "pr-description-check.sh"
 
 pytestmark = pytest.mark.skipif(
     not WORKFLOW.exists() or os.name == "nt" or shutil.which("bash") is None,
@@ -61,11 +65,17 @@ pytestmark = pytest.mark.skipif(
 COMPLETE_BODY = """\
 ## Problem / Motivation
 
+**Goal:** the thing works again.
+
 Something is broken.
 
 ## Why it matters
 
 Users hit it daily.
+
+## Not a goal
+
+- Rewriting the thing.
 
 ## What changed (motivation -> approach -> change)
 
@@ -93,16 +103,6 @@ def _step(name_fragment: str, job: str = "describe") -> dict:
     raise AssertionError(f"no step in job {job!r} whose name contains {name_fragment!r}")
 
 
-def _static_env(step: dict) -> dict[str, str]:
-    """The step's `env:` entries that carry no `${{ }}` expression."""
-    out = {}
-    for key, value in (step.get("env") or {}).items():
-        text = str(value)
-        if "${{" not in text:
-            out[key] = text
-    return out
-
-
 def _parse_outputs(path: Path) -> dict[str, str]:
     """Parse a $GITHUB_OUTPUT file, including `key<<DELIM` heredoc blocks."""
     result: dict[str, str] = {}
@@ -125,12 +125,12 @@ def _parse_outputs(path: Path) -> dict[str, str]:
     return result
 
 
-def _evaluate(tmp_path: Path, body: str, draft: bool) -> dict[str, str]:
-    step = _step("Evaluate PR description")
+def _evaluate(
+    tmp_path: Path, body: str, draft: bool, extra_env: dict[str, str] | None = None
+) -> dict[str, str]:
     output = tmp_path / "github_output"
     output.write_text("", encoding="utf-8")
     env = dict(os.environ)
-    env.update(_static_env(step))
     env.update(
         {
             "PR_BODY": body,
@@ -139,8 +139,10 @@ def _evaluate(tmp_path: Path, body: str, draft: bool) -> dict[str, str]:
             "GITHUB_REPOSITORY": "kirodotdev/KiroCrew",
         }
     )
+    env.pop("PR_CALLER", None)
+    env.update(extra_env or {})
     proc = subprocess.run(
-        ["bash", "-c", step["run"]],
+        ["bash", str(SCRIPT)],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -169,9 +171,95 @@ def test_a_complete_description_passes_with_the_templates_suffixed_heading(
 def test_an_empty_description_reports_every_required_section(tmp_path: Path) -> None:
     outputs = _evaluate(tmp_path, "", False)
     assert outputs["conclusion"] == "failure"
-    assert outputs["title"] == "4 required description sections are missing"
-    for section in ("## Problem / Motivation", "## Why it matters", "## What changed", "## Tests"):
+    assert outputs["title"] == "5 required description sections are missing"
+    for section in (
+        "## Problem / Motivation",
+        "## Why it matters",
+        "## Not a goal",
+        "## What changed",
+        "## Tests",
+    ):
         assert section in outputs["summary"]
+    # The section is missing, so its Goal line is not reported separately.
+    assert "**Goal:**" not in outputs["summary"]
+    assert "https://github.com/kirodotdev/KiroCrew/blob/main/.github/PULL_REQUEST_TEMPLATE.md" in (
+        outputs["summary"]
+    )
+
+
+def test_the_annotation_names_the_missing_parts_and_the_fix(tmp_path: Path) -> None:
+    """The error annotation is what a coding agent reads first, so it must
+    carry the missing parts and the repair, not just a count."""
+    body = COMPLETE_BODY.replace("## Not a goal", "## Scope")
+    outputs = _evaluate(tmp_path, body, False)
+    annotation = outputs["annotation"]
+    assert annotation.startswith("Missing from the PR description: ## Not a goal.")
+    assert ".github/PULL_REQUEST_TEMPLATE.md" in annotation
+    assert "headings kept verbatim" in annotation and "no push needed" in annotation
+    assert "How to fix it:" in outputs["summary"]
+    assert "gh pr edit <number> --body-file <file>" in outputs["summary"]
+
+
+def test_a_missing_goal_line_is_named_in_the_annotation(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.", "")
+    assert body != COMPLETE_BODY
+    outputs = _evaluate(tmp_path, body, False)
+    assert outputs["annotation"].startswith("Missing from the PR description: **Goal:** line.")
+
+
+def test_the_annotation_counts_a_section_and_the_goal_line_together(tmp_path: Path) -> None:
+    """A missing section plus a missing Goal line must not read as '1 missing'."""
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.", "").replace(
+        "## Tests", "## Testing"
+    )
+    annotation = _evaluate(tmp_path, body, False)["annotation"]
+    assert annotation.startswith("Missing from the PR description: ## Tests, **Goal:** line.")
+    assert "1 required" not in annotation
+
+
+def test_the_printed_self_check_recipe_uses_a_fresh_private_file(tmp_path: Path) -> None:
+    """The recipe is re-run in a fix loop: a reused output file would keep the
+    old failure next to the new success, and a fixed /tmp path can be a
+    symlink someone else planted. A fresh mktemp file per run avoids both."""
+    printed = _evaluate(tmp_path, "", False)["summary"]
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    for text in (printed, agents):
+        assert 'out="$(mktemp)"; PR_BODY=' in text
+        assert "/tmp/pr-check.out" not in text
+
+
+def test_a_passing_description_has_an_empty_annotation(tmp_path: Path) -> None:
+    outputs = _evaluate(tmp_path, COMPLETE_BODY, False)
+    assert outputs["annotation"] == ""
+
+
+def test_only_the_fork_caller_mentions_fork_approval(tmp_path: Path) -> None:
+    """PR Hygiene runs for every PR; telling a same-repo author that fork
+    approval resumes is noise that reads like an instruction."""
+    fork = _evaluate(tmp_path, "", False)
+    assert "fork workflow runs" in fork["summary"]
+    hygiene = _evaluate(tmp_path, "", False, {"PR_CALLER": "pr-hygiene"})
+    assert "fork workflow runs" not in hygiene["summary"]
+    assert "How to fix it:" in hygiene["summary"]
+
+
+def test_the_template_link_survives_without_a_repository(tmp_path: Path) -> None:
+    """The local self-check runs without GITHUB_REPOSITORY; `set -u` must not
+    abort it before the summary is written."""
+    output = tmp_path / "out"
+    output.write_text("", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k != "GITHUB_REPOSITORY"}
+    env.update({"PR_BODY": "", "GITHUB_OUTPUT": str(output)})
+    proc = subprocess.run(
+        ["bash", str(SCRIPT)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert "unbound variable" not in proc.stderr
+    assert "PULL_REQUEST_TEMPLATE.md" in _parse_outputs(output)["summary"]
 
 
 def test_one_missing_section_is_named_in_the_singular(tmp_path: Path) -> None:
@@ -215,6 +303,52 @@ def test_a_crlf_fenced_template_is_still_excluded(tmp_path: Path) -> None:
     body = ("```\n" + COMPLETE_BODY + "\n```\n").replace("\n", "\r\n")
     outputs = _evaluate(tmp_path, body, False)
     assert outputs["conclusion"] == "failure"
+
+
+# ── The frozen Goal line ─────────────────────────────────────────────────────
+
+
+def test_a_missing_goal_line_fails_and_is_named(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.\n", "")
+    outputs = _evaluate(tmp_path, body, False)
+    assert outputs["conclusion"] == "failure"
+    assert outputs["title"] == "The Goal line is missing from Problem / Motivation"
+    assert "`**Goal:** <one sentence>` line under `## Problem / Motivation`" in outputs["summary"]
+
+
+def test_the_templates_empty_goal_scaffold_does_not_count(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.", "**Goal:**   ")
+    assert _evaluate(tmp_path, body, False)["conclusion"] == "failure"
+
+
+def test_a_goal_line_in_another_section_does_not_count(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace("**Goal:** the thing works again.\n", "").replace(
+        "Users hit it daily.", "**Goal:** misplaced."
+    )
+    assert _evaluate(tmp_path, body, False)["conclusion"] == "failure"
+
+
+def test_a_goal_line_inside_a_fence_or_indented_does_not_count(tmp_path: Path) -> None:
+    for goal in ("```\n**Goal:** fenced.\n```", "    **Goal:** indented."):
+        body = COMPLETE_BODY.replace("**Goal:** the thing works again.", goal)
+        assert _evaluate(tmp_path, body, False)["conclusion"] == "failure", goal
+
+
+def test_a_subheading_keeps_the_goal_inside_its_section(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace(
+        "**Goal:** the thing works again.", "### Context\n\n**Goal:** the thing works again."
+    )
+    assert _evaluate(tmp_path, body, False)["conclusion"] == "success"
+
+
+def test_the_shipped_template_itself_fails_until_filled_in(tmp_path: Path) -> None:
+    """The template's Goal scaffold is empty and its guidance sits in an
+    indented HTML comment, so a body left verbatim is reported, not passed."""
+    template = (ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8")
+    outputs = _evaluate(tmp_path, template, False)
+    assert outputs["title"] == "The Goal line is missing from Problem / Motivation"
+    filled = template.replace("**Goal:**\n", "**Goal:** a filled goal.\n", 1)
+    assert _evaluate(tmp_path, filled, False)["conclusion"] == "success"
 
 
 # ── Draft is a state, not a defect ───────────────────────────────────────────
@@ -265,7 +399,7 @@ def test_a_heading_inside_a_fenced_code_block_does_not_count(tmp_path: Path) -> 
     body = "Question about the template:\n\n```\n" + COMPLETE_BODY + "\n```\n"
     outputs = _evaluate(tmp_path, body, False)
     assert outputs["conclusion"] == "failure"
-    assert outputs["title"] == "4 required description sections are missing"
+    assert outputs["title"] == "5 required description sections are missing"
 
 
 def test_a_tilde_fence_is_honoured_too(tmp_path: Path) -> None:
@@ -291,7 +425,7 @@ def test_a_longer_fence_containing_shorter_ones_stays_closed(tmp_path: Path) -> 
     body = "````\n```\n" + COMPLETE_BODY + "\n```\n````\n"
     outputs = _evaluate(tmp_path, body, False)
     assert outputs["conclusion"] == "failure"
-    assert outputs["title"] == "4 required description sections are missing"
+    assert outputs["title"] == "5 required description sections are missing"
 
 
 def test_a_longer_closing_fence_does_close(tmp_path: Path) -> None:
@@ -321,6 +455,38 @@ def test_a_four_space_indented_heading_is_indented_code(tmp_path: Path) -> None:
 
 def test_up_to_three_leading_spaces_still_reads_as_a_heading(tmp_path: Path) -> None:
     body = "\n".join("   " + line for line in COMPLETE_BODY.splitlines())
+    outputs = _evaluate(tmp_path, body, False)
+    assert outputs["conclusion"] == "success"
+
+
+def test_a_required_heading_only_inside_a_comment_is_missing(tmp_path: Path) -> None:
+    """GitHub renders nothing inside `<!-- -->`, so a commented heading is absent."""
+    body = COMPLETE_BODY.replace("## Tests\n", "<!--\n## Tests\n") + "-->\n"
+    outputs = _evaluate(tmp_path, body, False)
+    assert outputs["conclusion"] == "failure"
+    assert outputs["title"] == "1 required description section is missing"
+    assert "`## Tests`" in outputs["summary"]
+
+
+def test_a_heading_inside_a_multi_line_comment_does_not_count(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace("## Not a goal\n", "<!-- draft notes\n## Not a goal\n-->\n")
+    outputs = _evaluate(tmp_path, body, False)
+    assert outputs["conclusion"] == "failure"
+    assert "`## Not a goal`" in outputs["summary"]
+
+
+def test_a_commented_heading_does_not_end_the_goal_section(tmp_path: Path) -> None:
+    body = COMPLETE_BODY.replace(
+        "## Problem / Motivation\n", "## Problem / Motivation\n\n<!--\n## Why it matters\n-->\n"
+    )
+    assert _evaluate(tmp_path, body, False)["conclusion"] == "success"
+
+
+def test_a_comment_opener_inside_a_fence_does_not_hide_later_headings(
+    tmp_path: Path,
+) -> None:
+    """Inside a fence `<!--` is code text; it must not open a comment."""
+    body = "```html\n<!-- unclosed example\n```\n\n" + COMPLETE_BODY
     outputs = _evaluate(tmp_path, body, False)
     assert outputs["conclusion"] == "success"
 
@@ -504,12 +670,43 @@ def test_the_edited_trigger_is_present() -> None:
 
 
 def test_it_never_checks_out_fork_code() -> None:
-    steps = _doc()["jobs"]["describe"]["steps"]
-    assert all("uses" not in step for step in steps)
+    """The only checkout is the base's copy of the rules script.
+
+    On `pull_request_target` checkout's default ref is the base; naming any ref
+    (the PR head above all) would run fork-controlled rules with a write token.
+    """
+    checkouts = [s for s in _doc()["jobs"]["describe"]["steps"] if "uses" in s]
+    assert len(checkouts) == 1
+    assert checkouts[0]["uses"].startswith("actions/checkout@")
+    # The whole `with` mapping, so neither `ref` nor `repository` can point it at the fork.
+    assert checkouts[0]["with"] == {
+        "persist-credentials": False,
+        "sparse-checkout": ".github/scripts/pr-description-check.sh",
+        "sparse-checkout-cone-mode": False,
+    }
+    assert _step("Evaluate PR description")["run"].strip() == (
+        "bash .github/scripts/pr-description-check.sh"
+    )
 
 
 def test_permissions_are_limited_to_writing_the_check() -> None:
-    assert _doc()["permissions"] == {"checks": "write"}
+    assert _doc()["permissions"] == {"checks": "write", "contents": "read"}
+
+
+def test_pr_hygiene_runs_the_same_rules_for_every_pr() -> None:
+    """Fork and same-repo PRs must follow one rule set, so PR Hygiene -- which
+    blocks PR Readiness -- runs the same script and fails on its verdict."""
+    doc = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "code-review.yml").read_text(encoding="utf-8")
+    )
+    steps = doc["jobs"]["pr-hygiene"]["steps"]
+    step = next(s for s in steps if s.get("name") == "Require the PR template sections")
+    assert "bash .github/scripts/pr-description-check.sh" in step["run"]
+    assert "conclusion=failure" in step["run"] and "exit 1" in step["run"]
+    assert "PR_CALLER=pr-hygiene" in step["run"]
+    assert "^annotation=" in step["run"], "the error annotation must carry the fix"
+    assert "GITHUB_STEP_SUMMARY" in step["run"]
+    assert "head.repo" not in str(step.get("if", "")), "must not be fork- or same-repo-only"
 
 
 def test_runs_are_serialised_rather_than_cancelled() -> None:
@@ -527,6 +724,8 @@ def test_the_required_sections_match_the_shipped_template() -> None:
     template = (
         Path(__file__).resolve().parents[1] / ".github" / "PULL_REQUEST_TEMPLATE.md"
     ).read_text(encoding="utf-8")
-    declared = _static_env(_step("Evaluate PR description"))["REQUIRED_SECTIONS"].split("\n")
+    script = SCRIPT.read_text(encoding="utf-8")
+    declared = script.split("REQUIRED_SECTIONS='", 1)[1].split("'", 1)[0].split("\n")
+    assert "## Not a goal" in declared
     for section in (s for s in declared if s.strip()):
         assert section in template, f"{section!r} is not a heading in the PR template"

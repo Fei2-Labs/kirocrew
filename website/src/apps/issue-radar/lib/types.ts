@@ -10,7 +10,7 @@ import type { SourceProvider } from '../api'
  * than on a self-managed instance. They are optional so a value persisted before
  * GitLab support still loads — absent means public GitHub.
  *
- * Structurally a `RepoRef` (see `api.ts`), so it can be passed straight to any
+ * Structurally a `RepoRef` (see `apiTypes.ts`), so it can be passed straight to any
  * API call without rebuilding it. */
 export interface ActiveRepo {
   owner: string
@@ -34,7 +34,7 @@ export type PrSortKey = 'number' | 'updated'
  * shared file needs to change, so views can be built by separate agents. The
  * list is exported so persisted state can be validated at runtime (a tab that
  * was removed since it was persisted must not survive a reload). */
-export const DASHBOARD_TABS = ['overview', 'graph', 'tagging', 'pipeline'] as const
+export const DASHBOARD_TABS = ['overview', 'graph', 'tagging', 'pipeline', 'ci-runs', 'reviews'] as const
 export type DashboardTab = (typeof DASHBOARD_TABS)[number]
 
 /** Main-area mode: a dashboard page, the issue list + detail split, the pull-
@@ -83,7 +83,7 @@ export const CREW_SORT_KEYS = ['status', 'name', 'created'] as const
 export type CrewSortKey = (typeof CREW_SORT_KEYS)[number]
 
 /** Sub-sections of the General settings page the rail nav can jump to. */
-export type GeneralAnchor = 'account' | 'repos'
+export type GeneralAnchor = 'account' | 'repos' | 'gitlabGroups'
 
 /** What the Settings main area is showing: the shared "General" page (account +
  * connected-repo list), or one specific repo's settings page. The rail's

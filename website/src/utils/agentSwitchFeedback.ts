@@ -62,3 +62,17 @@ export function agentSwitchFailureMessage(error: unknown): string {
   if (message.trim()) return message
   return i18nT('components.errorBoundary.something_went_wrong')
 }
+
+/**
+ * The one-line notice for a model pick the gateway answered `deferred: true`:
+ * a response was running, so the pick is committed and takes over from the
+ * next message while the running reply finishes on the model it started with.
+ * `model` is the stored id the response carries (`''` is Auto). Shown through
+ * the same transient notice as a refused switch, so every picker surface
+ * (menu, split pane, keyboard cycle) reports it the same way.
+ */
+export function modelSwitchDeferredMessage(model: string): string {
+  return i18nT('utils.agentSwitchFeedback.model_deferred', {
+    model: model || i18nT('components.jobForm.auto'),
+  })
+}

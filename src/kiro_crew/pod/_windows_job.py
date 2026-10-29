@@ -2,11 +2,14 @@
 
 The caller assigns its original Popen handle BEFORE resuming a CREATE_SUSPENDED
 child. Assignment cannot retroactively contain descendants of a running process.
-A named job survives its publisher while members remain; opening never creates
-an empty replacement. A successful drain covers job members, not outside launch
-brokers, and authorizes reclamation only after the caller retires the publisher
-and validates the durable run identity. The windows backend and _windows_run
-own that publication and retirement protocol; resource ceilings stay separate.
+The job object outlives its publisher while members remain, but its NAME does
+not: a job name is visible only while some handle to the job is open, and
+members hold none, so once the publisher exits `open_existing` reports the job
+absent even while the members still run. Opening never creates an empty
+replacement. A successful drain covers job members, not outside launch brokers,
+and authorizes reclamation only after the caller retires the publisher and
+validates the durable run identity. The windows backend and _windows_run own
+that publication and retirement protocol; resource ceilings stay separate.
 """
 
 from __future__ import annotations
@@ -87,6 +90,7 @@ def _load() -> tuple[Any, Any]:
         "TerminateProcess": ([_HANDLE, _DWORD], _BOOL),
         "CloseHandle": ([_HANDLE], _BOOL),
         "LocalFree": ([C.c_void_p], C.c_void_p),
+        "GetTickCount64": ([], C.c_uint64),
     }
     for name, (args, result) in signatures.items():
         function = getattr(kernel, name)
@@ -254,6 +258,20 @@ class PodJob:
         self.close()
 
 
+def uptime_ms() -> int:
+    """Milliseconds since this boot session began, from the kernel's tick counter.
+
+    The counter never runs backwards within a boot session: it keeps counting
+    through sleep, hibernation and a Fast Startup shutdown (which resumes the
+    hibernated kernel) and restarts from zero only at a full boot. A reading
+    LOWER than one taken earlier therefore proves a boot in between. A wall-clock
+    boot time derived from it (now minus uptime) is no such proof: it moves with
+    every clock correction, so two readings in the same boot session can differ.
+    """
+    kernel, _advapi = _load()
+    return int(kernel.GetTickCount64())
+
+
 def open_identity(pid: int, token: str) -> int | None:
     """Pin an identity or prove it gone/replaced; access and query errors raise."""
     if type(pid) is not int or pid <= 1 or not token.isascii() or not token.isdigit():
@@ -291,15 +309,41 @@ def retire_identity(handle: int, *, timeout: float) -> None:
         return
     if result != 258:  # WAIT_TIMEOUT is the only positive evidence of a live object.
         raise _error("query publisher exit")
+    refused = None
     if not kernel.TerminateProcess(native, 1):
-        # It can exit between wait and terminate. Only a signaled object clears that error.
-        if kernel.WaitForSingleObject(native, 0) != 0:
-            raise _error("terminate publisher")
+        refused = _error("terminate publisher")  # Captured before the next native call.
+        # It can start exiting between wait and terminate, and the kernel answers a
+        # terminate from the exit's rundown on with ERROR_ACCESS_DENIED (5) -- before
+        # the object signals. So that refusal is judged by the bounded wait below.
+        # Any other refusal stands unless the object has already signalled.
+        if refused.errno != 5 and kernel.WaitForSingleObject(native, 0) != 0:
+            raise refused
     result = kernel.WaitForSingleObject(native, min(int(timeout * 1000), 0xFFFFFFFE))
     if result == 258:
+        if refused is not None:
+            raise refused
         raise TimeoutError("Windows pod publisher did not retire")
     if result != 0:
         raise _error("wait for publisher retirement")
+
+
+def wait_identity(handle: int, *, timeout: float) -> bool:
+    """Whether the pinned process object signals within *timeout*; never terminates.
+
+    True means the process has exited, so no further write can come from it. A
+    wait error raises rather than reading as either answer.
+    """
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("identity wait timeout must be finite and non-negative")
+    kernel, _advapi = _load()
+    result = kernel.WaitForSingleObject(
+        _process_handle(handle), min(int(timeout * 1000), 0xFFFFFFFE)
+    )
+    if result == 0:
+        return True
+    if result == 258:  # WAIT_TIMEOUT: the object is still live.
+        return False
+    raise _error("wait for process identity")
 
 
 def close_identity(handle: int) -> None:

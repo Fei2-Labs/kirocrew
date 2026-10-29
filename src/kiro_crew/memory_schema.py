@@ -34,8 +34,9 @@ raises ``Cannot add a column to a view`` — loud, and before any write.
 
 The views are READ-ONLY, deliberately
 -------------------------------------
-``semantic_memory`` and ``episodic_memories`` survive as views so the 36 read
-statements in ``vector_memory.py`` run byte-identically, and so the four vector
+``semantic_memory`` and ``episodic_memories`` survive as views so the read statements in
+``vector_memory.py``, its ``vector_memory_*.py`` owners and ``vector_memory_runtime/`` run
+byte-identically, and so the four vector
 scorers stay partitioned by RELATION: episodic blobs are L2-normalized at write
 and semantic/lesson blobs are not, three scorers take a bare dot product, and one
 undivided ``embedding`` column would put un-normalized rows in front of them. The
@@ -67,6 +68,7 @@ from pathlib import Path
 from typing import Callable, Final
 
 from kiro_crew.memory_stores import named_store_of_db
+from kiro_crew.validation import clamp_query_offset
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +155,10 @@ _KIND_COLUMN: Final = "kind"
 # hold under the same name AND reach through the same statements: ``_log_event``,
 # ``get_events``, ``rotate_events`` and ``_read_meta``/``_write_meta`` name them
 # literally, with none of the per-lineage relation indirection the semantic and
-# episodic writes carry. So each has ONE definition here, composed into
-# ``vector_memory._SCHEMA_V1`` and into :data:`CREW_SCHEMA_SQL` alike.
+# episodic writes carry. So each has ONE definition here. :data:`CREW_SCHEMA_SQL`
+# composes both. On v1, ``memory_events`` is part of ``vector_memory._SCHEMA_V1``,
+# while ``memory_meta`` arrives through migration 3
+# (``vector_memory._MEMORY_META_TABLE``), not through ``_SCHEMA_V1``.
 #
 # Two hand copies is the shape that fails silently: ``MIGRATIONS_CREW`` is one
 # frozen entry, so a v1 migration adding a column to either table would reach every
@@ -262,7 +266,7 @@ CREATE INDEX IF NOT EXISTS idx_mi_crew         ON memory_items (crew, is_deleted
 CREATE INDEX IF NOT EXISTS idx_mi_surface      ON memory_items (surface, is_deleted);
 
 -- The v1 relation NAMES survive as READ-ONLY views, in the v1 COLUMN ORDER,
--- because ~36 read statements name them and `SELECT *` feeds `sqlite3.Row`.
+-- because the engine's read statements name them and `SELECT *` feeds `sqlite3.Row`.
 -- Splitting by `kind` is also what keeps the vector scorers sound, and omitting
 -- every facet column is what makes facets unreachable from every ranker.
 -- Never add an `INSTEAD OF` trigger here -- see the module docstring.
@@ -277,6 +281,8 @@ CREATE VIEW IF NOT EXISTS episodic_memories AS
       FROM memory_items WHERE kind = '{KIND_EPISODE}';
 {MEMORY_EVENTS_SQL}{MEMORY_META_SQL}"""
 
+# Like ``vector_memory_lifecycle._MIGRATIONS``: every step runs inside the store's
+# one setup transaction and must not commit (no ``executescript`` either).
 MIGRATIONS_CREW: Final[list[tuple[int, str, "Callable[[sqlite3.Connection], None] | None"]]] = [
     (CREW_SCHEMA_VERSION, CREW_SCHEMA_SQL, None),
 ]
@@ -336,9 +342,9 @@ def episodic_guard(lineage: str) -> str:
 
 # ── The four statements a relation swap cannot express ──
 #
-# Fifteen of the engine's nineteen write statements differ between the lineages
-# only in which relation they name, so they interpolate ``semantic_relation`` /
-# ``episodic_guard`` and render byte-identically on v1. These four differ in their
+# Every other write statement in the engine differs between the lineages only in
+# which v1 relation it names, so it interpolates ``semantic_relation`` /
+# ``episodic_guard`` and renders byte-identically on v1. These four differ in their
 # COLUMN LIST: ``memory_items`` requires ``id``, ``kind``, ``text`` and
 # ``updated_at``, none of which v1 supplies. Each therefore carries two spellings
 # and a param builder, kept side by side so a change to one is visibly a change to
@@ -753,9 +759,12 @@ def facet_page_query(
     """
     predicate, params = _facet_predicate(filters, kind)
     # Clamped HERE rather than at each surface, so the CLI and the HTTP route
-    # inherit one bound and neither can widen it.
+    # inherit one bound and neither can widen it. The offset ceiling is the
+    # shared one every SQLite-bound offset takes: the bind refuses an int past
+    # the signed 64-bit range, and past the live population every page is
+    # empty anyway.
     page = max(1, min(int(limit), MAX_FACET_PAGE))
-    skip = max(0, int(offset))
+    skip = clamp_query_offset(int(offset))
     sql = (
         f"SELECT {', '.join(FACET_PAGE_COLUMNS)} FROM memory_items "
         f"WHERE is_deleted = 0{predicate} "
@@ -798,6 +807,26 @@ def facet_count_query(
         f"GROUP BY {column} ORDER BY total DESC, value ASC LIMIT ?"
     )
     return sql, (*params, groups)
+
+
+def execute_script(db: sqlite3.Connection, sql: str) -> None:
+    """Run every statement of *sql* inside the caller's open transaction.
+
+    ``Connection.executescript`` COMMITs a pending transaction before it runs,
+    so it cannot be one step of a larger one. Statements end where SQLite's own
+    tokenizer says they do (:func:`sqlite3.complete_statement`), so a ``;``
+    inside a literal, a comment or a trigger body does not split a statement.
+    """
+    pending = ""
+    for piece in sql.split(";"):
+        pending += piece + ";"
+        if sqlite3.complete_statement(pending):
+            if pending.strip(" \t\r\n;"):
+                db.execute(pending)
+            pending = ""
+    tail = pending[:-1]  # the ";" appended after the last piece
+    if tail.strip():
+        db.execute(tail)
 
 
 def detect_lineage(db: sqlite3.Connection) -> str | None:

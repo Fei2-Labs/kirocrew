@@ -32,21 +32,60 @@ class TestDefaults:
         """The arm/impl/points vocabulary is retired, and ``enabled`` never lands
         here: config.json is agent-writable, so consent is the keystone's. Every
         field is a bound or an address -- nothing here opens a destination the
-        session does not already send to."""
+        session does not already send to.
+
+        ``nudge_wake`` is held to the same rule. Its fields are addresses (which
+        provider lane answers the wake judge, and the model id that lane runs on)
+        and a bound (how many quiet verdicts may pass before a tick fires anyway).
+        None of them arms anything: the Jev lane still needs the keystone switch AND
+        the ``nudge_evidence`` scope, checked by the seam, and the judge only runs at
+        all for a loop carrying its own brief.
+
+        ``model_route_derive`` is held to it too. It picks among the same models the
+        ``model_route`` map may already name -- ids the account advertises -- and it
+        sends nothing anywhere: the question it answers is only asked once the
+        keystone consents, so it chooses where a consented answer lands and arms
+        nothing."""
         from dataclasses import fields
 
         assert {f.name for f in fields(DecisionsConfig)} == {
             "bucket",
             "history_budget_chars",
             "model_route",
+            "model_route_derive",
             "nudge_wake",
             "provider",
         }
 
-    def test_no_prior_conversation_is_sent_by_default(self):
-        """Consent is recorded against the text the owner reviewed, which names the
-        message excerpt and the candidate descriptions. Prior turns are a choice."""
-        assert DecisionsConfig().history_budget_chars == DECISION_HISTORY_BUDGET_DEFAULT == 0
+    def test_the_shipped_budget_covers_a_few_prior_turns(self):
+        """The number asked for, not the number sent: the gate holds this against the
+        consent keystone's ceiling, which is 0 until the owner reviews one."""
+        assert DecisionsConfig().history_budget_chars == DECISION_HISTORY_BUDGET_DEFAULT == 2000
+
+    def test_no_nested_section_here_is_a_switch_either(self):
+        """The rule above has to hold one level down, or it guards nothing.
+
+        A subsection is where a switch would hide most easily, so the field names of
+        every nested section are pinned too. Adding one here is the same deliberate
+        act as adding a top-level field: name it, and say which of the two kinds it
+        is.
+        """
+        from dataclasses import fields, is_dataclass
+
+        # Resolved off an INSTANCE, not off ``f.type``: this module is compiled with
+        # ``from __future__ import annotations``, so a field's declared type is the
+        # string "NudgeWakeConfig" and ``is_dataclass`` on it is False -- which would
+        # make this assertion pass against an empty map and guard nothing.
+        config = DecisionsConfig()
+        nested = {
+            f.name: {sub.name for sub in fields(getattr(config, f.name))}
+            for f in fields(DecisionsConfig)
+            if is_dataclass(getattr(config, f.name))
+        }
+        assert nested == {
+            "provider": {"endpoint", "api_key", "model", "timeout_ms"},
+            "nudge_wake": {"provider", "llm_model", "quiet_streak_floor"},
+        }
 
     def test_the_provider_defaults_are_the_documented_ones(self):
         provider = DecisionsConfig().provider
@@ -113,6 +152,7 @@ class TestMigrationFromThePreviewSpelling:
             "bucket",
             "history_budget_chars",
             "model_route",
+            "model_route_derive",
             "nudge_wake",
             "provider",
         }
@@ -171,12 +211,13 @@ class TestTheHistoryBudget:
         )
 
     @pytest.mark.parametrize("raw", ["lots", None, True, 12.5, {"chars": 10}])
-    def test_an_unreadable_value_sends_no_prior_turns(self, raw):
+    def test_an_unreadable_value_reads_as_the_shipped_default(self, raw):
+        """Not a fail-open: the keystone ceiling still caps what the gate sends."""
         parsed = DecisionsConfig.from_raw({"history_budget_chars": raw})
-        assert parsed.history_budget_chars == DECISION_HISTORY_BUDGET_DEFAULT == 0
+        assert parsed.history_budget_chars == DECISION_HISTORY_BUDGET_DEFAULT == 2000
 
-    def test_an_absent_key_sends_no_prior_turns(self):
-        assert DecisionsConfig.from_raw({"bucket": 10}).history_budget_chars == 0
+    def test_an_absent_key_reads_as_the_shipped_default(self):
+        assert DecisionsConfig.from_raw({"bucket": 10}).history_budget_chars == 2000
 
     def test_a_negative_value_cannot_read_as_unbounded(self):
         assert DecisionsConfig.from_raw({"history_budget_chars": -5}).history_budget_chars == 0
@@ -230,7 +271,7 @@ class TestTheHistoryBudget:
         assert gate.history_budget_chars(_Cfg()) == 0
 
     def test_a_zero_config_asks_for_nothing_and_reads_no_keystone(self, monkeypatch):
-        """The shipped default costs no keystone read on the turn path."""
+        """An owner who lowers the budget to 0 costs no keystone read on the turn path."""
         from kiro_crew.decisions import consent as consent_mod
         from kiro_crew.decisions import gate
 
@@ -240,12 +281,14 @@ class TestTheHistoryBudget:
         )
 
         class _Cfg:
-            decisions = DecisionsConfig.from_raw({})
+            decisions = DecisionsConfig.from_raw({"history_budget_chars": 0})
 
         assert gate.history_budget_chars(_Cfg()) == 0
         assert reads == [], "nothing asked for, so nothing authorized to check"
 
-    def test_a_config_whose_reads_raise_gives_the_gate_zero(self):
+    def test_a_config_whose_reads_raise_falls_back_to_the_shipped_default(self, monkeypatch):
+        """And the keystone still decides: at a ceiling of 0 the gate sends nothing."""
+        from kiro_crew.decisions import consent as consent_mod
         from kiro_crew.decisions import gate
 
         class _Hostile:
@@ -253,7 +296,10 @@ class TestTheHistoryBudget:
             def decisions(self):
                 raise RuntimeError("no")
 
-        assert gate.history_budget_chars(_Hostile()) == DECISION_HISTORY_BUDGET_DEFAULT == 0
+        monkeypatch.setattr(consent_mod, "consented_history_budget", lambda *a, **k: 10_000)
+        assert gate.history_budget_chars(_Hostile()) == DECISION_HISTORY_BUDGET_DEFAULT == 2000
+        monkeypatch.setattr(consent_mod, "consented_history_budget", lambda *a, **k: 0)
+        assert gate.history_budget_chars(_Hostile()) == 0
 
     def test_the_retired_state_budget_is_gone(self):
         """It only fed a split the shipped menu ceiling made unreachable."""

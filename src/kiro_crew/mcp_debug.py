@@ -257,16 +257,29 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "name": "debug_processes",
             "description": (
                 "THE PROCESS TREE — every process in the gateway's family, including "
-                "the ones reparented to pid 1, which are the orphans. Per node: pid, "
-                "ppid, kind (gateway / chat / subagent / cron / mcp-server / pod / "
-                "browser / test), owning session, age, cpu %, run-queue wait, rss, "
-                "thread states, fds, cwd. The orphan verdict is computed by the SAME "
+                "the ones reparented to pid 1, which are the orphans. One snapshot, so "
+                "per node: pid, ppid, kind (gateway / gatewayd / chat / subagent / "
+                "cron / mcp-server / pod / browser / test / other), owner label, age, "
+                "state, rss, thread states, fds, cwd. On Linux every kind but "
+                "'subagent' is read from argv ('subagent' is told from 'chat' only by "
+                "an owner label this read has no source for, so a subagent runtime "
+                "appears as 'chat'); off Linux far fewer fields are measured — on "
+                "macOS the ps snapshot carries pid/ppid only, no kind is argv-derived "
+                "(every non-gateway node is 'other'), and state, threads, env, fds, "
+                "cwd, cmdline, rss and cpu are null. ALWAYS read 'roster.degraded': it "
+                "lists which fields this snapshot could not carry and why, and whether "
+                "orphan detection ran at all (where it did not, 'orphans: 0' means "
+                "UNMEASURED, not none). The orphan verdict, when measured, is computed "
+                "by the SAME "
                 "function the reaper uses, so this view and the reaper never "
-                "disagree. A process pinned near one core with several threads in "
-                "futex wait is flagged 'gil_saturated_hint' — a kernel-level hint, "
-                "labelled as one. Use it to find what is eating the host when "
-                "everything is slow. READ-ONLY: there is no kill here, and killing "
-                "stays with the reaper."
+                "disagree. 'cpu_pct' and 'runq_wait_pct' are deltas between two "
+                "rosters; the route keeps the previous one, so both are real from "
+                "the second read onward and null only on the first read or when the "
+                "read is degraded ('gil_saturated_hint' is false while they are "
+                "null). For thread contention ask debug_threads mode='now'. Use this "
+                "to see who exists, who owns them, and which are orphaned; where 'rss' "
+                "is measured it also shows how much memory each holds. READ-ONLY: "
+                "there is no kill here, and killing stays with the reaper."
             ),
             "inputSchema": {
                 "type": "object",
@@ -279,7 +292,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                     "kind": {"type": "string", "description": "Keep only this kind of process."},
                     "owner": {
                         "type": "string",
-                        "description": "Keep only processes owned by this session.",
+                        "description": (
+                            "Keep only processes carrying this owner label, as the "
+                            "result spells it."
+                        ),
                     },
                     "orphan_only": {
                         "type": "boolean",
@@ -608,7 +624,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
 #: :func:`~kiro_crew.mcp_core.require_strict_session_key`, whose first source is
 #: that block, and the route scopes every read on the key this server forwards.
 #:
-#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: Advertising is not cosmetic. ``mcp_gateway/backend_stubs.py`` strips any client-forged
 #: caller block from EVERY forwarded request and re-injects its own only when the
 #: backend advertised this capability — so without the advertisement the block
 #: never arrives and a pooled backend would resolve an empty identity for every

@@ -31,12 +31,21 @@ _DEFAULT_PORT = 5476
 _BIND_LOCAL = "127.0.0.1"
 _BIND_ALL = "0.0.0.0"
 
-# Loopback hostnames that all resolve to the same machine but are *distinct
+# Loopback host NAMES that all resolve to the same machine but are *distinct
 # browser origins* (origin = scheme://host:port). The dashboard SPA stores user
 # settings (theme, zoom, layout, ...) in per-origin localStorage, so a user who
 # reaches the dashboard on more than one of these names gets a separate, empty
 # settings bucket each time — settings appear to "reset". We canonicalize
 # navigations among this set onto a single host (see should_canonicalize_host).
+#
+# The literal addresses are here because this gateway holds BOTH loopback
+# families on its port (see _start_secondary_loopback_site): every name and
+# literal in this set therefore reaches the same listener, so converging them is
+# a spelling change and nothing more. The credential question is handled where it
+# actually arises -- a request CARRYING one is never redirected at all, whatever
+# it names, because a 302 preserves the query (see should_canonicalize_host). That
+# gate does not depend on which families are bound, which matters because the
+# second bind is best-effort and degrades.
 _CANONICALIZABLE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "kirocrew.localhost"})
 
 
@@ -220,6 +229,51 @@ def dashboard_origin(url: str) -> str:
     return f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
 
 
+def dashboard_link_origin(dashboard_url: str, tunnel_url: str = "") -> str:
+    """Browser-facing origin for a Slack->dashboard link, or ``""``.
+
+    The one place that decides tunnel-vs-dashboard for an outbound dashboard
+    link: the live *tunnel_url* when the caller opted into ``slack.use_tunnel_url``
+    and a tunnel is connected, otherwise the configured dashboard origin. Shared
+    by :func:`kiro_crew.dashboard.chat_backfill.session_deep_link` and
+    :func:`kiro_crew.slack.allowlist.send_dashboard_link` so the two cannot drift
+    on which origin a Slack->dashboard link points at.
+
+    *tunnel_url* is used as-is (only a trailing slash trimmed) rather than
+    re-parsed, because it is process-internal state set by the tunnel manager.
+    Returns ``""`` when neither yields a usable origin (``dashboard_origin``
+    already yields ``""`` for an empty, malformed, or non-HTTP URL); a caller
+    then omits the link or falls back to a host:port form of its own.
+    """
+    if tunnel_url:
+        return tunnel_url.rstrip("/")
+    return dashboard_origin(dashboard_url or "")
+
+
+def tunnel_origin_if_opted_in(use_tunnel_url: bool) -> str:
+    """The live tunnel URL when *use_tunnel_url* is set, otherwise ``""``.
+
+    Folds the ``slack.use_tunnel_url ? get_tunnel_url() : ""`` decision that each
+    Slack->dashboard link call site otherwise copy-pastes (``chat_mirror``,
+    ``chat_slack``, ``send_message``'s ``_resolve_session_link_url``), so the
+    "should this link point off-host?" choice lives in ONE place beside
+    :func:`dashboard_link_origin` instead of being re-spelled -- and re-risked --
+    at every site. The result feeds straight into ``dashboard_link_origin`` /
+    ``session_deep_link`` as their *tunnel_url* argument (``""`` there means "use
+    the configured dashboard origin"), so an opted-out caller, or an opted-in one
+    with no tunnel connected, both correctly fall back to the dashboard origin.
+
+    ``get_tunnel_url`` is imported lazily so this module (loaded at gateway boot)
+    does not pull in the tunnel manager, matching the deferred-import style the
+    call sites already use.
+    """
+    if not use_tunnel_url:
+        return ""
+    from kiro_crew.tunnel import get_tunnel_url
+
+    return get_tunnel_url()
+
+
 # ---------------------------------------------------------------------------
 # Remote-proxy detection (OSS: no managed proxy)
 # ---------------------------------------------------------------------------
@@ -369,19 +423,27 @@ def should_canonicalize_host(
     *,
     method: str,
     sec_fetch_dest: str | None,
+    carries_credential: bool = False,
 ) -> bool:
     """Return True if a request should be 302-redirected to *canonical_host*.
 
-    Converges loopback aliases (127.0.0.1 / localhost / kirocrew.localhost) onto
-    a single origin so the SPA's per-origin localStorage settings are not split
-    across hostnames (see _CANONICALIZABLE_LOOPBACK_HOSTS). Conservative on every
-    axis so it can never touch a request that isn't a same-machine top-level
-    page navigation:
+    Converges the loopback names AND literals (localhost / kirocrew.localhost /
+    127.0.0.1 / ::1) onto a single origin so the SPA's per-origin localStorage
+    settings are not split across spellings. Converging the literals is safe
+    because this gateway holds both loopback families on its port, so every
+    spelling in that set reaches the same listener (see
+    _CANONICALIZABLE_LOOPBACK_HOSTS). Conservative on every axis so it can never
+    touch a request that isn't a same-machine top-level page navigation:
 
     * only GET/HEAD (never a mutating request),
     * only true top-level document navigations (``Sec-Fetch-Dest: document`` —
       absent/empty/websocket/XHR are left alone, so APIs and WebSockets and
       sub-resource fetches are never redirected),
+    * only when the request carries no credential: a 302 preserves the query, so
+      redirecting a ``?token=`` navigation would hand that bearer to whatever
+      answers the canonical name. The caller decides what counts as a credential;
+      a request bearing one is served where it was sent, and the settings bucket
+      loses a redirect it was never entitled to at that price,
     * only when both the request host and the canonical host are in the
       canonicalizable loopback set (real hostnames / reverse-proxy vhosts are
       never redirected),
@@ -393,6 +455,8 @@ def should_canonicalize_host(
     if method not in ("GET", "HEAD"):
         return False
     if sec_fetch_dest != "document":
+        return False
+    if carries_credential:
         return False
     host = _host_without_port(request_host or "")
     if host not in _CANONICALIZABLE_LOOPBACK_HOSTS:

@@ -21,10 +21,13 @@ from typing import Any
 # compared by identity, never substituted.
 from kiro_crew import agent as agent_mod
 from kiro_crew import sandbox as sandbox_mod
+from kiro_crew.acp import managed_agent_shadow as managed_shadow_mod
+from kiro_crew.acp.child_env_defaults import apply_child_env_defaults
 from kiro_crew.acp.harness._common import (
     KIRO_FAMILY_ALIASES,
     MembershipHarness,
-    apply_mandatory_mcps_env,
+    apply_client_application_env,
+    pin_mandatory_mcps_env,
 )
 from kiro_crew.acp.harness.base import (
     NotificationAliases,
@@ -78,11 +81,12 @@ class KiroHarness(MembershipHarness):
         # search, and importing it at module scope would make this package part
         # of that module's import cycle.
         from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn, kiro_cli_not_found_message
+        from kiro_crew.acp.kiro_cli_missing import AcpKiroCliMissing
         from kiro_crew.acp.session_handle import AcpRuntimeError
 
         kiro_bin = await _resolve_kiro_bin_for_spawn(environ=dict(ctx.environ), home=ctx.home)
         if not kiro_bin:
-            raise AcpRuntimeError(
+            raise AcpKiroCliMissing(
                 await asyncio.to_thread(
                     kiro_cli_not_found_message, environ=dict(ctx.environ), home=ctx.home
                 )
@@ -109,6 +113,14 @@ class KiroHarness(MembershipHarness):
             await asyncio.to_thread(agent_mod.require_fork_governance, ctx.agent, ctx.work_dir)
         except ForkGovernanceUnresolved as exc:
             raise AcpRuntimeError(str(exc)) from exc
+        # kiro-cli resolves ``--agent`` against ``ctx.work_dir`` first, so a checkout
+        # that declares a managed agent name would run its own copy in place of the
+        # installed one. Off the loop: it scans the checkout's agents directory.
+        shadowed = await asyncio.to_thread(
+            managed_shadow_mod.managed_agent_shadow_refusal, ctx.agent, ctx.work_dir
+        )
+        if shadowed:
+            raise AcpRuntimeError(shadowed)
 
         overlap = await asyncio.to_thread(
             sandbox_mod.delegated_workspace_exposes_sealed_target, ctx.work_dir
@@ -135,41 +147,29 @@ class KiroHarness(MembershipHarness):
             )
         return SpawnPlan(argv=argv, native_context_documents=native_documents)
 
-    def apply_spawn_env(self, env: dict[str, str]) -> None:
-        """Hand kiro-cli the API key, and exempt Crew's own MCP servers from
-        Tool Search deferral.
+    def apply_spawn_env(
+        self,
+        env: dict[str, str],
+        *,
+        spawned_binary: str | None = None,
+        cli_owned_auth: bool = False,
+    ) -> None:
+        """Hand kiro-cli the API key from Crew's own configuration, and pin Tool
+        Search exemptions by operator override or engine version
+        (:func:`pin_mandatory_mcps_env`).
 
         Deferred import: the config loader pulls in the credential path, which the
         boot path must not touch at module scope.
 
-        **Why the exemption is here and not at a call site.** Loading a deferred
-        MCP spec REWRITES the request's ``tools`` array, and an extended-thinking
-        model's thinking blocks carry a signature bound to the array they were
-        minted under. Replay one across a load and the provider rejects the whole
-        request -- "The ``tools`` list differs from the one this block was created
-        with" -- and because it is rejecting the conversation's history, every later
-        turn fails identically. The session is bricked, not slowed.
-
-        Crew's own servers are the ones that churn it: they are the infrastructure
-        an agent reaches for in nearly every session, so deferring them bought very
-        little and rewrote the array constantly. Third-party servers keep deferring
-        -- they carry most of the spec weight and are reached rarely.
-
-        This hook is the only place both kiro spawn paths meet. A session-serving
-        child comes from ``AcpRuntime`` (kiro is in ``ACP_BACKENDS_ACP_RUNTIME``,
-        and ``_start_kiro_runtime_impl`` never spawns its ``AcpClient``), while the
-        auxiliary ``AcpClient`` children do not pass through here at all -- they run
-        tool-less agents, so deferral has nothing to defer for them. Setting it at
-        either call site would have missed the children that matter.
-
-        The exemption's own rules -- ambient value versus per-session overlay, and
-        why KAS gets it too -- live in :func:`apply_mandatory_mcps_env`, which both
-        kiro-family harnesses call so the two cannot drift.
+        Operator env defaults (``agent.child_env_defaults``) are filled in last,
+        only for keys the inherited environment does not already carry.
         """
         from kiro_crew.config.loader import inject_kiro_cli_api_key
 
         inject_kiro_cli_api_key(env)
-        apply_mandatory_mcps_env(env)
+        pin_mandatory_mcps_env(env, spawned_binary=spawned_binary)
+        apply_client_application_env(env)
+        apply_child_env_defaults(env)
 
     @property
     def verifies_agent_activation(self) -> bool:
@@ -199,6 +199,7 @@ class KiroHarness(MembershipHarness):
         work_dir: str | Path | None,
         mcp_gateway_overlay: Any = None,
         member_dispatch: bool = False,
+        crew_panel: bool = False,
         session_key: str = "",
     ) -> SessionExtras:
         """Nothing. kiro-cli already has the agent from its spawn flag.

@@ -1,7 +1,7 @@
 """Merge-on-write semantics for the agent-config PUT.
 
 ``PUT /api/agent/config`` persists a whole-file snapshot the client read earlier,
-and ``apps/bridges.py::_register_mcp_servers`` writes app MCP bridges into that
+and ``apps/bridges_mcp.py::_register_mcp_servers`` writes app MCP bridges into that
 same file under its own flock. A registration landing between the client's read
 and its PUT was therefore silently clobbered.
 
@@ -303,7 +303,7 @@ async def test_app_bridge_registered_during_the_lock_wait_survives_the_put(tmp_p
     @contextlib.asynccontextmanager
     async def _registering_lock():
         # An app enable lands here: whole-file RMW of the installed spec, the
-        # shape apps/bridges.py::_register_mcp_servers performs under its flock.
+        # shape apps/bridges_mcp.py::_register_mcp_servers performs under its flock.
         data = json.loads(installed.read_text(encoding="utf-8"))
         data.setdefault("mcpServers", {})["demo:notes"] = {"command": "notes-mcp"}
         installed.write_text(json.dumps(data), encoding="utf-8")
@@ -350,7 +350,7 @@ async def test_app_deregistered_during_the_put_is_not_resurrected(tmp_path):
     @contextlib.contextmanager
     def _deregistering_lock(*, exclusive: bool = True, target=None):  # noqa: ANN001
         # An app disable commits here: the same whole-file RMW
-        # apps/bridges.py::_deregister_mcp_servers performs under this flock.
+        # apps/bridges_mcp.py::_deregister_mcp_servers performs under this flock.
         data = json.loads(installed.read_text(encoding="utf-8"))
         data.get("mcpServers", {}).pop("demo:notes", None)
         installed.write_text(json.dumps(data), encoding="utf-8")
@@ -906,8 +906,8 @@ async def test_absent_enabled_field_counts_as_enabled(tmp_path):
     """A legacy record with no ``enabled`` field is ENABLED, matching the manager.
 
     ``InstalledApp.from_dict`` reads ``bool(data.get("enabled", True))``
-    (manager.py:170) over a dataclass defaulting to ``enabled: bool = True``
-    (manager.py:114), so every other reader in the tree treats such a record as
+    (manager_records.py) over a dataclass defaulting to ``enabled: bool = True``
+    (``InstalledApp.enabled``), so every other reader in the tree treats such a record as
     running. Disagreeing here would delete the live bridges of an app the rest of
     the system considers enabled.
 
@@ -1071,24 +1071,12 @@ async def test_an_apps_root_child_that_vanished_after_the_listing_still_skips(tm
 
 
 @requires_symlinks
-def test_both_app_root_walks_agree_a_dangling_link_is_not_absence(tmp_path):
-    """ONE tree, BOTH readers: neither walk may call a dangling app root absent.
+def test_a_dangling_app_root_link_is_not_absence(tmp_path):
+    """A dangling link at an app root is unreadable, never an absent app.
 
-    Two modules decide independently whether an entry in the apps root stands for
-    an installed app, and they feed different decisions -- ``apps.manager``'s read
-    gates whether an ``mcpServers`` GRANT may be pruned, this walk gates whether an
-    app's BRIDGES may be deleted. Nothing else makes them agree, so this row is
-    what fails when they stop agreeing.
-
-    They cannot share one function: this side must RAISE (its contract is
-    fail-loud, and a name it cannot read is not a name it may report as unowned),
-    while the manager side returns a listing plus a completeness bool. What they
-    must share is the RULE, so this pins the rule on a single on-disk tree --
-    a dangling link at ``apps/demo`` -- and asserts each reader's own spelling of
-    "not absence". A later edit to either module's screens fails here instead of
-    silently moving one answer.
+    This walk gates whether an app's BRIDGES may be deleted, so an entry it
+    cannot read must refuse rather than report the app's names as unowned.
     """
-    from kiro_crew.apps.manager import list_apps_with_skips
     from kiro_crew.dashboard.handlers.agents import (
         AppOwnershipUnreadable,
         _app_declared_server_names,
@@ -1097,14 +1085,6 @@ def test_both_app_root_walks_agree_a_dangling_link_is_not_absence(tmp_path):
     apps_root = tmp_path / "apps"
     apps_root.mkdir()
     (apps_root / "demo").symlink_to(apps_root / "no-such-app-root")
-
-    with patch("kiro_crew.apps.manager.apps_dir", return_value=apps_root):
-        listing = list_apps_with_skips()
-    assert listing.apps == [], "a dangling root carries no readable record"
-    assert listing.complete is False, (
-        "the manager counts a link-ish entry as an app the listing DROPPED, so an "
-        "app missing from `apps` there carries no information"
-    )
 
     with (
         patch("kiro_crew.dashboard.handlers.agents.apps_dir", return_value=apps_root),
@@ -1122,9 +1102,7 @@ async def test_an_app_root_link_to_a_file_fails_the_put(tmp_path):
     The sibling the dangling-link screen cannot reach. Here ``lstat`` succeeds AND
     ``stat`` succeeds -- the target is a real file -- so nothing raises and the only
     thing that is False is ``S_ISDIR``. A screen that skips every non-directory
-    therefore reports the name as free, while ``apps.manager`` reads the same entry
-    through ``entry.is_symlink() or is_link_or_junction(entry)`` and counts it as an
-    app the listing DROPPED. That split is the same cannot-read-becomes-not-owned
+    therefore reports the name as free. That is the cannot-read-becomes-not-owned
     defect one shape over, so the link-ish half must refuse.
     """
     await _assert_refused_and_intact(tmp_path, app_root_shape="link_to_file")
@@ -1134,11 +1112,10 @@ async def test_an_app_root_link_to_a_file_fails_the_put(tmp_path):
 async def test_a_plain_file_where_an_app_root_belongs_still_skips(tmp_path):
     """The overshoot guard: refusing link-ish non-directories must spare plain ones.
 
-    ``_entry_stands_for_a_dropped_app`` deliberately does NOT count a plain file,
-    because a file BESIDE the app directories is an ordinary member of a healthy
-    apps root. So the new screen must split on link-ness, not on "is not a
-    directory" -- refusing every non-directory would turn any stray file in the
-    apps root into a 500 and disagree with the manager in the other direction.
+    A file BESIDE the app directories is an ordinary member of a healthy apps
+    root. So the screen must split on link-ness, not on "is not a directory" --
+    refusing every non-directory would turn any stray file in the apps root into
+    a 500.
 
     ``mcpServers`` is submitted EMPTY on purpose: a submitted entry always wins, so
     resubmitting ``demo:notes`` would decide the verdict without ever consulting the
@@ -1159,16 +1136,13 @@ async def test_a_plain_file_where_an_app_root_belongs_still_skips(tmp_path):
 
 
 @requires_symlinks
-def test_both_app_root_walks_agree_a_link_to_a_file_is_not_absence(tmp_path):
-    """ONE tree, BOTH readers, for the shape where nothing raises.
+def test_an_app_root_link_to_a_file_is_not_absence(tmp_path):
+    """A link to a file at an app root is not absence, even though nothing raises.
 
-    The agreement row above pins a tree where ``stat`` RAISES, so it cannot fail if
-    a reader starts deciding link-ness by whether the resolution threw. This tree
-    resolves cleanly and differs from a real app root only in ``S_ISDIR``, which is
-    what makes it the discriminating case: each reader has to reach "not absence"
-    from the entry's own link-ness rather than from a raised error.
+    The tree resolves cleanly and differs from a real app root only in
+    ``S_ISDIR``, so the walk must reach "not absence" from the entry's own
+    link-ness rather than from a raised error.
     """
-    from kiro_crew.apps.manager import list_apps_with_skips
     from kiro_crew.dashboard.handlers.agents import (
         AppOwnershipUnreadable,
         _app_declared_server_names,
@@ -1179,13 +1153,6 @@ def test_both_app_root_walks_agree_a_link_to_a_file_is_not_absence(tmp_path):
     target = apps_root / "not-a-directory.txt"
     target.write_text("not an app root", encoding="utf-8")
     (apps_root / "demo").symlink_to(target)
-
-    with patch("kiro_crew.apps.manager.apps_dir", return_value=apps_root):
-        listing = list_apps_with_skips()
-    assert listing.apps == [], "a link to a file carries no readable record"
-    assert (
-        listing.complete is False
-    ), "the manager counts a link-ish non-directory as an app the listing DROPPED"
 
     with (
         patch("kiro_crew.dashboard.handlers.agents.apps_dir", return_value=apps_root),

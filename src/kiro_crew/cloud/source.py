@@ -12,15 +12,20 @@ reused; each launch uploads to ``<tag>/kirocrew-src.tar.gz``.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 import os
+import stat
 import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, NamedTuple, Optional
 
+from kiro_crew import github_runner, platform_compat
 from kiro_crew.cloud import aws
+from kiro_crew.config.loader import config_dir
 from kiro_crew.sel import sel
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -28,6 +33,24 @@ logger = logging.getLogger(__name__)
 
 SOURCE_KEY_NAME = "kirocrew-src.tar.gz"
 _BUCKET_PREFIX = "kirocrew-src-"
+
+
+class StagedSource(NamedTuple):
+    """A built source tarball plus the Base64 SHA256 of the bytes written to it.
+
+    The checksum travels with the path because the two must not be derived
+    independently: a digest taken from a later read of ``path`` would describe
+    whatever that name resolves to at read time, which is the substitution this
+    pins against.
+    """
+
+    path: Path
+    sha256: str
+
+
+#: Leaf, directly under the data home, that source tarballs are built in. Not a
+#: name under the stdlib temp root: see :func:`_staging_dir`.
+_STAGING_DIR_LEAF = "cloud-src-staging"
 
 # Directories never shipped to the box (rebuilt there, irrelevant, or SECRET).
 # The tarfile fallback (used when `git archive` is unavailable) filters by this
@@ -138,7 +161,442 @@ def _exclude_filter(ti: tarfile.TarInfo) -> Optional[tarfile.TarInfo]:
     return ti
 
 
-def _use_git_archive(root: Path) -> Optional[Path]:
+def _chain_the_launcher_owns(base: Path) -> list[Path]:
+    """The directories whose state this launcher is answerable for, root-first.
+
+    ``base`` and every directory up to and including the operator's own home, when
+    ``base`` sits inside it. A directory ABOVE that home belongs to the
+    administrator, or in a container to a uid not mapped into this namespace -- on a
+    sandboxed host even ``/`` reads as an unmapped owner. If one of those is hostile
+    then every program this account runs is already substituted and a check on one
+    tarball buys nothing, while refusing there would reject an ordinary container.
+
+    A data home the operator moved OUTSIDE their own home gets the whole chain
+    instead, because that premise does not cover it: a relocated home is exactly the
+    shared-host case where an ancestor can belong to a local peer.
+
+    ``base`` may still carry a link at or above the data home -- that is the
+    operator's own layout and :func:`_staging_dir` follows it -- so resolving here is
+    what puts the walk on the directories that really hold the tarball. Resolving
+    cannot hide a component: it replaces a link with its target, and the target's own
+    ancestors then enter the chain in its place.
+    """
+    resolved = base.resolve()
+    chain = list(reversed(resolved.parents)) + [resolved]
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return chain  # cannot place the account boundary, so check everything
+    if resolved == home or home in resolved.parents:
+        return [node for node in chain if node == home or home in node.parents]
+    return chain
+
+
+def _first_replaceable_windows(path: Path) -> Optional[tuple[Path, str]]:
+    """The Windows arm of :func:`_first_replaceable`, read from the ACL.
+
+    The same two questions the POSIX walk asks -- is an ancestor owned by a third
+    account, and can anything outside the trusted set replace what is inside it --
+    answered from each directory's SECURITY DESCRIPTOR because ``st_uid`` and the
+    mode bits carry no information on Windows (``os.stat`` reports ``st_uid == 0``
+    and ``st_mode == 0o777`` for every path).
+
+    The per-component decision is NOT re-implemented here: it is exactly the
+    relaxed-mode policy :func:`kiro_crew.github_runner.check_provider_path_component_windows`
+    already applies to each parent of a provider CLI -- owner and writers must be
+    the launcher, a well-known machine SID, or (here) Owner Rights -- reading the
+    descriptor through :func:`kiro_crew.windows_acl.describe`. Calling it keeps ONE
+    spelling of the policy, so the two walks cannot drift apart. This arm supplies
+    only what differs from that walk: the chain to visit, the first-failing-node
+    return shape (the function raises per component; this maps the raise to
+    ``(node, reason)``), and the one extra trusted principal below.
+
+    Without this ancestor walk, the only Windows protections on the staging path
+    are the link/junction screens and the inheritable owner-only DACL on the
+    staging leaf, and neither sees an ANCESTOR of the leaf renamed away and
+    replaced with a real directory. On a multi-user host whose data home sits
+    under a directory a local peer can write, that swap reaches the uploaded
+    tarball. The walk closes it.
+
+    ``S-1-3-4`` (Owner Rights) is trusted here where the provider-executable walk
+    does not trust it: this chain runs over the data home, and
+    ``ensure_data_home`` locks that home down with an inheritable owner-only DACL
+    whose grants are ``(S-1-3-4, me)`` -- so the Owner-Rights full-control ACE on
+    this chain is this account's OWN lockdown, not a foreign writer, and refusing
+    on it would reject the ordinary locked-down home on every launch.
+
+    Fails closed on an unverifiable launcher SID -- ``current_user_sid`` reads only
+    this process's access token and returns ``None`` on failure, so there is
+    nothing to compare an owner or writer against. The POSIX arm cannot reach that
+    (``geteuid`` always answers); the shared function needs a non-empty ``me_sid``,
+    so the guard also protects the call. Every other failure shape -- unreadable
+    descriptor, non-local volume, NULL DACL, unparsable ACE, foreign owner, foreign
+    writer -- is the shared function's and surfaces as its ``ValueError`` message;
+    any exception it does NOT raise as a ``ValueError`` (an ``OSError`` from the
+    volume probe, say) is still an uncleared descriptor and is caught and returned
+    as a fail-closed ``(node, reason)`` rather than propagated.
+
+    The volume ROOT is passed ``volume_root=True``: a drive root is not an entry
+    in any directory on this host, so a plain ``DELETE`` grant on it swaps nothing
+    and is not treated as a replaceability vector there, while
+    ``FILE_DELETE_CHILD`` (the actual child-swap right on a root) and the other
+    substitution rights still refuse. The stock ACL on a secondary NTFS volume
+    grants ``Authenticated Users`` Modify -- which carries ``DELETE`` but not
+    ``FILE_DELETE_CHILD`` -- on the drive root, and without this exemption a data
+    home relocated directly under such a root was refused although it is safe.
+
+    Only ancestors :func:`_chain_the_launcher_owns` returns are in scope, same as
+    POSIX: a directory above the operator's home belongs to the administrator, and a
+    relocated home is walked whole.
+    """
+    me_sid = platform_compat.current_user_sid()
+    if not me_sid:
+        return path, "runs under a user whose SID this host cannot verify"
+    for node in _chain_the_launcher_owns(path):
+        try:
+            github_runner.check_provider_path_component_windows(
+                node,
+                label=f"'{node}'",
+                me_sid=me_sid,
+                strict=False,
+                trust_owner_rights=True,
+                # A volume root cannot itself be renamed or deleted, so a plain
+                # DELETE grant on it is no swap vector -- let the shared check
+                # ignore a DELETE-only writer there while still refusing
+                # FILE_DELETE_CHILD / WRITE_DAC / WRITE_OWNER / GENERIC_ALL.
+                volume_root=node == Path(node.anchor),
+            )
+        except ValueError as exc:
+            # The function raises the first problem it finds on this node, label
+            # first; strip the label so the caller's sentence reads "'<node>'
+            # <reason>, so what it holds can be replaced...".
+            reason = str(exc)
+            prefix = f"'{node}' "
+            return node, reason[len(prefix) :] if reason.startswith(prefix) else reason
+        except Exception as exc:
+            # The shared check surfaces every policy failure as a ValueError; any
+            # OTHER exception (e.g. an OSError from the volume probe inside
+            # describe()) is still a descriptor we could not clear. Fail closed on
+            # the node with a readable reason rather than letting a raw exception
+            # propagate out of the launch prologue.
+            return node, f"could not be checked ({type(exc).__name__}: {exc})"
+    return None
+
+
+def _first_replaceable(path: Path) -> Optional[tuple[Path, str]]:
+    """The outermost directory the launcher owns that another account could replace into.
+
+    Returns that directory and why it is unsafe, or ``None`` when the chain is
+    sound. Includes ``path`` itself, because replacing a directory entry needs
+    permission on its PARENT rather than on the entry: the data home's own state is
+    what decides whether the staging leaf inside it can be renamed away, and the
+    home's ancestors decide the same for the home. Which directories are in scope is
+    :func:`_chain_the_launcher_owns`.
+
+    Two things make a directory unsafe, and its mode is only one of them.
+
+    OWNERSHIP, first: a directory's owner can replace what is inside it whatever
+    the mode says, so an ancestor owned by neither this process nor root is unsafe
+    at ``0755`` exactly as much as at ``0777``. Root is trusted because a root that
+    wanted to substitute the tarball does not need a directory to do it.
+
+    Then the WRITE BITS, with the sticky exemption they carry. Under the sticky bit
+    an entry may be renamed only by the entry's own owner, by the DIRECTORY's
+    owner, or by root -- so sticky makes a directory safe only once its owner is
+    already trusted, which is what the ownership test settles first. A sticky
+    ancestor whose owner were foreign would hand that owner the same swap, which is
+    why the two tests are ordered and not alternatives. WRITABLE is the mode test and
+    not readable: the swap needs the write bit, and keeping the tarball unreadable is
+    the leaf's own owner-only mode's job.
+
+    Others-writable refuses on the bit alone, because "others" is every account by
+    definition. GROUP-writable asks one more question first, because the bit cannot
+    answer it: the same bit means a foreign writer on a shared group and nobody at
+    all on a user-private one, where a group holds the operator alone.
+    :func:`platform_compat.group_write_admits_another_account` settles which from
+    the membership, and fails closed -- a group whose privacy cannot be PROVEN counts
+    as shared. With an extended POSIX ACL that bit is the ACL mask, so the same
+    question asks the named entries too.
+
+    Root-first, so the answer is the outermost problem rather than an inner symptom
+    of it. On Windows ``st_uid`` and the mode bits carry no information, so the walk
+    reads each ancestor's SECURITY DESCRIPTOR instead and asks the same two
+    questions from it -- see :func:`_first_replaceable_windows`.
+    """
+    if platform_compat.IS_WINDOWS:
+        return _first_replaceable_windows(path)
+    mine = os.geteuid()
+    for node in _chain_the_launcher_owns(path):
+        try:
+            info = node.stat()
+        except OSError:
+            # A directory this process cannot stat is one it cannot clear either,
+            # so it is the answer rather than something to walk past.
+            return node, "cannot be read, so it cannot be cleared"
+        if info.st_uid not in (mine, 0):
+            return node, f"is owned by another account (uid {info.st_uid})"
+        mode = stat.S_IMODE(info.st_mode)
+        if mode & stat.S_IWOTH and not mode & stat.S_ISVTX:
+            return node, f"is writable by any account and not sticky (mode {mode:04o})"
+        if mode & stat.S_IWGRP and not mode & stat.S_ISVTX:
+            shared = platform_compat.group_write_admits_another_account(node, info.st_gid)
+            if shared is not None:
+                return node, f"is writable by {shared} and not sticky (mode {mode:04o})"
+    return None
+
+
+def _lock_to_owner(path: Path, label: str) -> None:
+    """Make ``path`` owner-only and REFUSE unless it actually is.
+
+    Two steps, because the first cannot stand alone.
+
+    ``platform_compat.restrict_dir_to_owner`` is the owner-only lockdown for a
+    directory on both platforms and is fail-loud by contract, so a mount that
+    rejects the change raises here instead of warning and letting the build carry
+    on over a loose directory.
+
+    Applying a mode is still not the same as HAVING it: a filesystem with a fixed
+    permission mask -- FAT, exFAT, a CIFS mount with a permissive ``dir_mode`` --
+    accepts the call and keeps its own mode, reporting success. So the mode is
+    read back, and any group or other bit refuses the build. Windows mode bits
+    carry no ACL information, so there the lockdown's own success is the guarantee
+    and the read-back stands down rather than judging a meaningless number.
+
+    Only for a directory this module OWNS. The data home belongs to the operator
+    and is verified, never rewritten: see :func:`_staging_dir`.
+    """
+    try:
+        platform_compat.restrict_dir_to_owner(str(path))
+    except OSError as exc:
+        raise aws.AWSError(
+            f"cannot make the {label} '{path}' owner-only -- refusing to build the source "
+            "tarball where another account could replace it.",
+            action="source:PackageLocalCheckout",
+        ) from exc
+    if platform_compat.IS_WINDOWS:
+        return
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise aws.AWSError(
+            f"cannot read the mode of the {label} '{path}' -- refusing to build the source "
+            "tarball without confirming it is owner-only.",
+            action="source:PackageLocalCheckout",
+        ) from exc
+    if mode & 0o077:
+        raise aws.AWSError(
+            f"the {label} '{path}' is reachable by other accounts (mode {mode:04o}) -- "
+            "refusing to build the source tarball there, because the AWS CLI re-opens it "
+            "by name after this process closes it.",
+            action="source:PackageLocalCheckout",
+        )
+
+
+def _staging_dir() -> Path:
+    """The launcher-owned directory a source tarball is built in.
+
+    :func:`upload_source` hands the tarball to ``s3api put-object`` as
+    ``--body <path>``, so the AWS CLI re-opens it by name after this process has
+    written and closed it. The stdlib temp root is the wrong place to leave a file
+    across that window: ``tempfile`` resolves that root from the environment
+    (``TMPDIR`` / ``TEMP`` / ``TMP``), so the staging location is whatever the
+    launcher's environment says, with no guarantee it is owner-only or sticky. A
+    staging root another account can write makes the closed file swappable before
+    the CLI opens it, and the launch would ship a tree that was never packaged --
+    the tarball is the whole source of the box's code, so a swap there is
+    arbitrary code on the instance. Resolving the directory from the data home
+    keeps the environment out of it, and nothing else picks names inside it.
+
+    Checks run ROOT-FIRST, the order
+    :func:`platform_compat.first_linked_ancestor` uses and for its reason: each one
+    runs only after everything above it is known good. The whole chain is covered,
+    because the leaf's own mode settles nothing while an outer directory can replace
+    what holds it.
+
+    A link AT OR ABOVE the data home is the operator's own layout and is followed,
+    not refused. That is where this module's trust anchor sits, the same split
+    :func:`atomic_write._link_trust_anchor` draws and the one
+    ``docs/system-specs/modules/workflows.md`` records for the data home: a
+    symlinked ``$HOME`` (``/home/u -> /local/home/u``), a dotfile-managed
+    ``~/.kiro``, and a data home moved onto another disk are all supported layouts,
+    and the DEFAULT data home is lexical (``Path.home() / ".kiro" / "crew"``, see
+    :func:`config.paths._default_home`), so on such a host the link arrives here on
+    the path every user gets. Refusing it would refuse them a launch on grounds they
+    cannot satisfy without setting ``KIROCREW_HOME`` to a pre-resolved path.
+
+    Following it costs nothing, because what makes a link above the home dangerous
+    is not the link -- it is an ancestor of the REAL directory being swappable, and
+    :func:`_first_replaceable` already walks the RESOLVED chain
+    (:func:`_chain_the_launcher_owns` resolves ``base`` and places the account
+    boundary at the resolved home). So the ownership and mode tests land on the
+    directories that actually hold the tarball rather than on a lexical chain that
+    may not, which is strictly more of the real hazard than the lexical reading saw.
+    It also means a link at or above the home can only have been placed by the
+    operator or root: planting one needs write on its parent, and a parent another
+    account can write is what those tests refuse.
+
+    Below the anchor nothing is followed. The ``cloud-src-staging`` leaf is created
+    by this module and nothing else picks names inside it, so a link there was
+    planted by something else and is refused -- before the ``mkdir``, which would
+    otherwise build the tree under its target, and again after it, because
+    ``exist_ok=True`` accepts a pre-existing link.
+
+    The data home belongs to the operator, so it is VERIFIED and never rewritten,
+    and a refusal names the command that fixes it. Only the leaf, which this module
+    owns, is locked down.
+    """
+    base = config_dir()
+    replaceable = _first_replaceable(base)
+    if replaceable is not None:
+        node, reason = replaceable
+        # The path IS named: it is the operator's own layout, they chose it through
+        # the data-home setting, and the path is what makes the message actionable.
+        # The remedy is platform-specific: chmod/setfacl do not exist on Windows and
+        # cannot change a DACL, so a Windows refusal would otherwise point the
+        # operator at commands they cannot run.
+        if platform_compat.IS_WINDOWS:
+            # On these chains the offending grant is usually INHERITED from a
+            # parent, and 'icacls /remove:g' does not remove an inherited ACE --
+            # inheritance has to be converted to explicit ACEs first
+            # ('/inheritance:d'). Moving the data home under a directory only you
+            # can write avoids the ACL edit entirely.
+            remedy = (
+                f"Convert the directory's inherited ACL to explicit entries and remove "
+                f"the foreign grant (e.g. 'icacls \"{node}\" /inheritance:d' then "
+                f"'icacls \"{node}\" /remove:g <account>'), or move the data home "
+                "under a directory only you can write."
+            )
+        else:
+            remedy = (
+                f"Drop the write bit ('chmod go-w {node}'), remove the ACL "
+                f"('setfacl -b {node}'), or move the data home under a directory "
+                "only you can write."
+            )
+        raise aws.AWSError(
+            f"'{node}' {reason}, so what it holds can be replaced wholesale and the AWS CLI "
+            f"would re-open the staged name inside the replacement -- refusing to build the "
+            f"source tarball. {remedy}",
+            action="source:PackageLocalCheckout",
+        )
+    staging = base / _STAGING_DIR_LEAF
+    if platform_compat.is_link_or_junction(staging):
+        raise aws.AWSError(
+            f"the source staging directory '{staging}' is a link, not a real directory "
+            "-- refusing to build the source tarball outside the data home.",
+            action="source:PackageLocalCheckout",
+        )
+    # No parents=True: the leaf sits directly under the data home, which
+    # ``config_dir()`` resolves and creates. A missing parent is a real error
+    # here, not something to paper over with a freshly minted tree.
+    #
+    # ``exist_ok=True`` forgives an existing DIRECTORY and nothing else, so a
+    # regular file, a socket or a fifo sitting at the leaf raises here -- before
+    # the resolve check below ever runs. That refusal has to carry the staging
+    # message: ``cli_cloud`` only catches ``AWSError``/``ValidationError``/
+    # ``CloudActionDenied``, so a bare OSError reaches the operator as a
+    # traceback that names no remedy.
+    try:
+        staging.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise aws.AWSError(
+            f"the source staging directory '{staging}' could not be created ({exc.strerror or exc}) "
+            "-- refusing to build the source tarball. Remove whatever occupies that name, or move "
+            "the data home somewhere this directory can be created.",
+            action="source:PackageLocalCheckout",
+        ) from exc
+    # Re-check after mkdir: exist_ok=True happily accepts a pre-existing link,
+    # and resolving both sides is what catches a component swapped higher up.
+    if staging.resolve() != (base.resolve() / _STAGING_DIR_LEAF) or not staging.is_dir():
+        raise aws.AWSError(
+            f"the source staging directory '{staging}' does not resolve to a real directory "
+            "inside the data home -- refusing to build the source tarball there.",
+            action="source:PackageLocalCheckout",
+        )
+    _lock_to_owner(staging, "source staging directory")
+    return staging
+
+
+class _HashingWriter:
+    """A write-through wrapper that digests every byte on its way to *fh*.
+
+    The digest has to be taken from the bytes this process EMITS, not from a
+    read-back of the finished file. Hashing the file afterwards would only shrink
+    the substitution window from "our close until the AWS CLI's open" to "our
+    close until our own re-open" -- and a window one layer down is the same
+    time-of-check/time-of-use hole the ancestor walk kept losing to. Hashing at
+    the write means the digest describes what :mod:`tarfile` produced, wherever
+    those bytes landed, so there is no window at all.
+
+    Only ``write`` is intercepted; everything else (``flush``, ``tell``, the name
+    :mod:`gzip` reads off the underlying object) is delegated, so this stands in
+    for a real binary file object without reimplementing one.
+    """
+
+    def __init__(self, fh: Any, digest: "hashlib._Hash") -> None:
+        self._fh = fh
+        self._digest = digest
+
+    def write(self, data: Any) -> int:
+        self._digest.update(data)
+        return self._fh.write(data)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._fh, name)
+
+
+def _discard_staged(handle: Any) -> None:
+    """Close a staged temp *handle* and remove its name, in that order.
+
+    The order is load-bearing on Windows, which refuses to unlink a file while a
+    handle on it is open, so a name removed first would leave the handle dangling
+    and the file behind. ``unlink`` acts on the directory entry, so it removes a
+    link rather than whatever a link points at. A ``None`` handle is accepted so
+    callers can dispose of a temp that was never minted.
+    """
+    if handle is None:
+        return
+    handle.close()
+    Path(handle.name).unlink(missing_ok=True)
+
+
+def _write_tar_gz(
+    fh: Any, fill: Callable[[tarfile.TarFile], None], digest: Optional["hashlib._Hash"]
+) -> None:
+    """Write a gzip tarball through the open handle *fh* via *fill*, updating *digest*.
+
+    The single place a final source tarball's bytes are produced, so the checksum
+    :func:`upload_source` pins cannot drift from the file it describes.
+
+    *fh* is the OPEN handle its caller still holds on a temp minted by
+    :func:`tempfile.NamedTemporaryFile`, and the bytes go through that descriptor
+    rather than through a fresh ``open`` of its pathname. The descriptor is the
+    security boundary, not the name: the staging leaf sits under the data home,
+    which a same-uid process can write, so between a mint that closes its handle
+    and a write that reopens the name, that name can be made to resolve somewhere
+    else -- a link to a governance file such as ``security_policy.json``, or a
+    hard link to it, which a link check on the final component does not catch.
+    Tarball bytes written through either would land on the target while the launch
+    still reported success. ``mkstemp`` creates the temp with ``O_CREAT|O_EXCL``,
+    so the handle names an inode nothing else can substitute, and writing through
+    it keeps the owner-only mode the mint established.
+
+    The file is truncated first so the handle behaves like a fresh ``wb`` open for
+    a caller that reuses one, and flushed at the end so the size and the bytes are
+    on disk before the caller reads either.
+
+    *digest* is an accumulator the caller owns and reads afterwards, which is why
+    it is passed in rather than returned: the producers stay ``-> Path`` and a
+    caller that does not need a checksum passes ``None`` and pays nothing.
+    """
+    fh.seek(0)
+    fh.truncate()
+    sink: Any = fh if digest is None else _HashingWriter(fh, digest)
+    with tarfile.open(fileobj=sink, mode="w:gz") as tar:
+        fill(tar)
+    fh.flush()
+
+
+def _use_git_archive(root: Path, *, digest: Optional["hashlib._Hash"] = None) -> Optional[Path]:
     """Try ``git archive`` (fast, respects .gitignore). Returns the tarball or None.
 
     The archive is then re-filtered through the same exclusion rules as the
@@ -147,51 +605,74 @@ def _use_git_archive(root: Path) -> Optional[Path]:
     """
     out = None
     try:
-        out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to caller
-            prefix="kirocrew-src-", suffix=".tar.gz", delete=False
+        out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - held open, never reopened by name
+            prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
         )
-        out.close()
+        # `git archive` writes to the held descriptor through stdout rather than to
+        # `-o <path>`: a pathname handed to the child is a name it opens itself,
+        # which is the same substitutable name a reopen would be. stderr alone is
+        # piped, because stdout is spoken for.
         rc = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(root), "archive", "--format=tar.gz", "-o", out.name, "HEAD"],
-            capture_output=True,
+            ["git", "-C", str(root), "archive", "--format=tar.gz", "HEAD"],
+            stdout=out,
+            stderr=subprocess.PIPE,
             timeout=120,
             **UTF8_TEXT,
         )
-        if rc.returncode == 0 and Path(out.name).stat().st_size > 0:
-            return _refilter_archive(Path(out.name))
+        # fstat on the handle, not stat on the name, for the same reason.
+        if rc.returncode == 0 and os.fstat(out.fileno()).st_size > 0:
+            filtered = _refilter_archive(out, digest=digest)
+            _discard_staged(out)
+            return filtered
     except (OSError, subprocess.SubprocessError, tarfile.TarError):
         # Includes a corrupt archive from _refilter_archive — fall through to
         # the tarfile fallback rather than propagate, after cleaning up below.
         pass
+    except BaseException:
+        # An interrupt during the archive run is not a fallback case, so it takes
+        # the same cleanup the fallback path below does and then propagates: the
+        # staging dir lives under the data home, which no reboot clears, so a
+        # half-written copy of the whole checkout would stay there for good.
+        _discard_staged(out)
+        raise
     # git archive failed (or the re-filter raised) — remove the temp file so it
     # doesn't leak, then signal the caller to use the tarfile fallback.
-    if out is not None:
-        Path(out.name).unlink(missing_ok=True)
+    _discard_staged(out)
     return None
 
 
-def _refilter_archive(archive: Path) -> Path:
-    """Rewrite a tarball keeping only members that pass :func:`_exclude_filter`."""
+def _refilter_archive(archive: Any, *, digest: Optional["hashlib._Hash"] = None) -> Path:
+    """Rewrite a tarball keeping only members that pass :func:`_exclude_filter`.
+
+    *archive* is the open handle its caller holds on the unfiltered tarball, read
+    through that descriptor rather than reopened by name, for the reason
+    :func:`_write_tar_gz` records. The caller keeps ownership of *archive* and
+    disposes of it; this function owns only the filtered temp it mints.
+    """
     filtered = tempfile.NamedTemporaryFile(  # noqa: SIM115 - handed to caller
-        prefix="kirocrew-src-", suffix=".tar.gz", delete=False
+        prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
     )
-    filtered.close()
     try:
-        with tarfile.open(archive, "r:gz") as src, tarfile.open(filtered.name, "w:gz") as dst:
-            for member in src:
-                if _exclude_filter(member) is None:
-                    logger.info("excluding %s from source tarball", member.name)
-                    continue
-                fh = src.extractfile(member) if member.isreg() else None
-                dst.addfile(member, fh)
+        archive.seek(0)
+
+        def _fill(dst: tarfile.TarFile) -> None:
+            with tarfile.open(fileobj=archive, mode="r:gz") as src:
+                for member in src:
+                    if _exclude_filter(member) is None:
+                        logger.info("excluding %s from source tarball", member.name)
+                        continue
+                    fh = src.extractfile(member) if member.isreg() else None
+                    dst.addfile(member, fh)
+
+        _write_tar_gz(filtered, _fill, digest)
     except BaseException:
         # A corrupt source archive (TarError) or any failure must not leak the
         # half-written filtered temp — the caller (_use_git_archive) only cleans
         # up `archive`, not this file. Remove it, then re-raise for the caller's
         # fall-through-to-tarfile-fallback handling.
-        Path(filtered.name).unlink(missing_ok=True)
+        _discard_staged(filtered)
         raise
-    archive.unlink(missing_ok=True)
+    filtered.close()
     return Path(filtered.name)
 
 
@@ -265,7 +746,7 @@ def _tracked_tree_is_dirty(root: Path) -> bool:
     return bool(rc.stdout.strip())
 
 
-def _tar_fallback(root: Path) -> Path:
+def _tar_fallback(root: Path, *, digest: Optional["hashlib._Hash"] = None) -> Path:
     """Build a source tarball from the repo's TRACKED files (fail-closed).
 
     Uses ``git ls-files`` so untracked / gitignored files (arbitrarily-named
@@ -302,52 +783,92 @@ def _tar_fallback(root: Path) -> Path:
             return True
         return False
 
-    out = tempfile.NamedTemporaryFile(  # noqa: SIM115
-        prefix="kirocrew-src-", suffix=".tar.gz", delete=False
+    out = tempfile.NamedTemporaryFile(  # noqa: SIM115 - held open, never reopened by name
+        prefix="kirocrew-src-", suffix=".tar.gz", delete=False, dir=str(_staging_dir())
     )
+    try:
+
+        def _fill(tar: tarfile.TarFile) -> None:
+            for rel in sorted(tracked):
+                if _excluded(rel):
+                    continue
+                abs_path = root / rel
+                if not abs_path.exists():  # tracked-but-deleted-in-worktree edge case
+                    continue
+                # recursive=False is REQUIRED, not just an optimization: `git ls-files`
+                # lists a submodule as a single gitlink entry (its directory path).
+                # tar.add() on a directory recurses by default, which would package
+                # EVERY file under the submodule worktree — including untracked /
+                # gitignored ones (secrets), defeating the tracked-only guarantee.
+                # Each real tracked file is its own ls-files entry, so we never need
+                # tar to walk a directory for us; adding non-recursively packages
+                # exactly the tracked paths and skips submodule contents entirely.
+                if abs_path.is_dir():
+                    # A gitlink/submodule dir — don't add the directory node at all
+                    # (adding it recursively would leak; adding it non-recursively
+                    # just stores an empty dir entry we don't need).
+                    continue
+                tar.add(abs_path, arcname=rel, recursive=False)
+
+        _write_tar_gz(out, _fill, digest)
+    except BaseException:
+        # An unreadable tracked file or a full disk must not leave a half-written
+        # tarball behind: the staging dir lives under the data home, which no
+        # reboot clears, and only the caller that gets a path back knows to
+        # remove it. Drop it here, then re-raise for the caller's own handling.
+        _discard_staged(out)
+        raise
     out.close()
-    with tarfile.open(out.name, "w:gz") as tar:
-        for rel in sorted(tracked):
-            if _excluded(rel):
-                continue
-            abs_path = root / rel
-            if not abs_path.exists():  # tracked-but-deleted-in-worktree edge case
-                continue
-            # recursive=False is REQUIRED, not just an optimization: `git ls-files`
-            # lists a submodule as a single gitlink entry (its directory path).
-            # tar.add() on a directory recurses by default, which would package
-            # EVERY file under the submodule worktree — including untracked /
-            # gitignored ones (secrets), defeating the tracked-only guarantee.
-            # Each real tracked file is its own ls-files entry, so we never need
-            # tar to walk a directory for us; adding non-recursively packages
-            # exactly the tracked paths and skips submodule contents entirely.
-            if abs_path.is_dir():
-                # A gitlink/submodule dir — don't add the directory node at all
-                # (adding it recursively would leak; adding it non-recursively
-                # just stores an empty dir entry we don't need).
-                continue
-            tar.add(abs_path, arcname=rel, recursive=False)
     return Path(out.name)
 
 
-def build_source_tarball(root: Optional[Path] = None) -> Path:
-    """Package the local source tree into a gzip tarball; return its path.
+def build_source_tarball(root: Optional[Path] = None) -> StagedSource:
+    """Package the local source tree into a gzip tarball; return it and its checksum.
 
     Uses ``git archive HEAD`` (fast) for a clean checkout, but if the tracked
     working tree is DIRTY (uncommitted edits to tracked files) it uses the
     ``git ls-files`` tar path instead — otherwise the launch would silently ship
     stale last-commit code. Both paths ship only tracked files.
+
+    The returned ``sha256`` is taken from the bytes as they were written, not from
+    a read-back of the finished file, and :func:`upload_source` hands it to S3 as
+    ``--checksum-sha256``. That is what makes a substituted tarball a refused
+    upload rather than a shipped one: see that function for why the check has to
+    live at S3 rather than in a pre-flight inspection of this path. It describes
+    exactly ONE attempt's bytes -- each attempt below owns its own accumulator,
+    because an attempt that fails part way has already fed bytes to the one it
+    was given.
     """
     root = root or repo_root()
+
+    def _staged(path: Path, digest: "hashlib._Hash") -> StagedSource:
+        return StagedSource(path, base64.b64encode(digest.digest()).decode("ascii"))
+
+    # Every attempt below hashes into its OWN accumulator, and each digest is read
+    # only for the attempt that filled it. One shared accumulator would be wrong,
+    # not merely untidy: a producer that fails PART WAY through has already pushed
+    # bytes through _HashingWriter (see _write_tar_gz), and _use_git_archive
+    # SWALLOWS a mid-write _refilter_archive failure in order to fall through to
+    # the fallback here. Those discarded bytes would then be folded into the
+    # fallback's checksum, which would then describe bytes the named file does not
+    # contain -- and S3 would refuse a perfectly good tarball on a
+    # --checksum-sha256 mismatch.
     if _tracked_tree_is_dirty(root):
         logger.info("working tree has uncommitted tracked changes; packaging the working tree")
-        return _tar_fallback(root)
-    archive = _use_git_archive(root)
+        dirty_digest = hashlib.sha256()
+        packaged = _tar_fallback(root, digest=dirty_digest)
+        return _staged(packaged, dirty_digest)
+
+    archive_digest = hashlib.sha256()
+    archive = _use_git_archive(root, digest=archive_digest)
     if archive is not None:
         logger.info("packaged source via git archive: %s", archive)
-        return archive
+        return _staged(archive, archive_digest)
+
     logger.info("git archive unavailable; using tracked-file tarfile fallback")
-    return _tar_fallback(root)
+    fallback_digest = hashlib.sha256()
+    fallback = _tar_fallback(root, digest=fallback_digest)
+    return _staged(fallback, fallback_digest)
 
 
 def _account_id(profile: str, region: str) -> str:
@@ -510,6 +1031,40 @@ def ensure_instance_boundary(profile: str = "", region: str = "") -> str:
     )
 
 
+def ensure_instance_kms_boundary(profile: str = "", region: str = "", create: bool = False) -> str:
+    """Verify (and, for the admin step only, create) the OPT-IN KMS-session boundary.
+
+    Only a launch with ``--ssm-kms-key`` or ``kirocrew cloud iam-boundary --ssm-kms``
+    reaches this: a default launch never names, creates or reads
+    ``kirocrew-ec2-kms-boundary``. The content is the base instance boundary plus
+    the Session Manager KMS decrypt (:func:`iam.kms_boundary_policy_document`), and
+    it goes through the same verify-before-reuse :func:`_ensure_boundary`
+    sequence, so a drifted policy at this name is refused, never reused.
+
+    A launch passes ``create=False``. The launcher policy grants no
+    ``iam:CreatePolicy`` on this name, because in an account that never opts in the
+    name would stay unclaimed: a leaked launcher credential could create a
+    permissive policy there and then a role capped by it. So only an admin creates
+    it (``iam-boundary --ssm-kms`` passes ``create=True``), and a launch that finds
+    it absent names that step.
+    """
+    from kiro_crew.cloud import iam
+
+    account = _require_account(profile, region)
+    return _ensure_boundary(
+        name=iam.KMS_BOUNDARY_NAME,
+        arn=iam.kms_boundary_arn(account),
+        expected=iam.kms_boundary_policy_document(account),
+        description=(
+            "Kiro Crew EC2 instance permissions ceiling (SSM core + launcher source "
+            "read + KMS for encrypted Session Manager)."
+        ),
+        profile=profile,
+        region=region,
+        admin_step="" if create else "kirocrew cloud iam-boundary --ssm-kms",
+    )
+
+
 def ensure_crew_boundary(profile: str = "", region: str = "") -> str:
     """Create (once, idempotently) the shared Fargate crew boundary; return its ARN.
 
@@ -587,8 +1142,12 @@ def _ensure_boundary(
     description: str,
     profile: str,
     region: str,
+    admin_step: str = "",
 ) -> str:
     """Create-once-and-verify, shared by every permissions boundary this launcher owns.
+
+    ``admin_step`` set means this caller must NOT create the boundary: an absent
+    one is refused with that command named, and an existing one is still verified.
 
     ONE copy of the sequence rather than one per lane, because the ORDER here is
     the security property and not an implementation detail: an existing policy is
@@ -604,13 +1163,43 @@ def _ensure_boundary(
     # Already present? VERIFY its content matches our fixed document before reusing
     # it (a permissive boundary seeded at this name must NOT be trusted to cap
     # anything).
-    rc, _out, _err = aws.run_aws(["iam", "get-policy", "--policy-arn", arn], profile, region)
+    rc, _out, read_err = aws.run_aws(["iam", "get-policy", "--policy-arn", arn], profile, region)
     if rc == 0:
         _verify_boundary_content(arn, name, expected, profile, region)
         return arn
 
-    # Not present (or GetPolicy denied — CreatePolicy will surface the real
-    # error) → create it once from the content-fixed document.
+    # A DENIED read is not an absent boundary, and the two need different remedies.
+    # Continuing to create-policy here reports whatever THAT call is denied — the
+    # create verb — so an operator who lacks only the read grant is told to add
+    # `iam:CreatePolicy`, which neither fixes the launch nor is a grant they want.
+    # Name the verb actually missing instead. A boundary that genuinely does not
+    # exist answers NoSuchEntity rather than AccessDenied, so it still falls
+    # through to the create below.
+    if aws.is_access_denied(read_err):
+        read_missing = aws.map_missing_action(read_err) or "iam:GetPolicy"
+        raise aws.AWSError(
+            f"could not read the permissions boundary '{name}': "
+            f"{(read_err or '').strip()[:300]} — grant `{read_missing}` and retry",
+            action="iam:GetPolicy",
+            missing_action=read_missing,
+            returncode=rc,
+            stderr=read_err or "",
+        )
+
+    # Absent, and this caller may not create it: refuse with the admin step that
+    # can. The launcher policy grants no iam:CreatePolicy on such a name, so a
+    # create here would only be denied.
+    if admin_step:
+        raise aws.AWSError(
+            f"could not find the permissions boundary '{name}' (an AWS admin creates "
+            f"it once for this account with `{admin_step}`): "
+            f"{(read_err or '').strip()[:300]}",
+            action="iam:GetPolicy",
+            returncode=rc,
+            stderr=read_err or "",
+        )
+
+    # Not present → create it once from the content-fixed document.
     create = [
         "iam",
         "create-policy",
@@ -633,12 +1222,16 @@ def _ensure_boundary(
         _verify_boundary_content(arn, name, expected, profile, region)
         return arn
     # Any other failure (AccessDenied, throttling) is real — surface it with the
-    # precise missing action so the user knows what to grant.
+    # precise missing action so the user knows what to grant. The admin step is
+    # named BEFORE the raw AWS text: it is the remedy for a launcher whose policy
+    # has had iam:CreatePolicy removed, and a caller that keeps only the head of
+    # the message still shows it.
     missing = aws.map_missing_action(err)
     hint = f" — grant `{missing}` and retry" if missing else ""
     _audit_iam_policy_change("iam.create-policy", arn, "denied", error=(err or "").strip()[:300])
     raise aws.AWSError(
-        f"could not create the permissions boundary '{name}': "
+        f"could not create the permissions boundary '{name}' (an AWS admin can "
+        "create it once for this account with `kirocrew cloud iam-boundary`): "
         f"{(err or '').strip()[:300]}{hint}",
         action="iam:CreatePolicy",
         missing_action=missing,
@@ -757,7 +1350,7 @@ def upload_source(tag: str, profile: str = "", region: str = "") -> tuple[str, s
             "--expected-bucket-owner pin (anti-squat safety).",
             action="s3:PutObject",
         )
-    tarball = build_source_tarball()
+    staged = build_source_tarball()
     try:
         put = [
             "s3api",
@@ -767,7 +1360,23 @@ def upload_source(tag: str, profile: str = "", region: str = "") -> tuple[str, s
             "--key",
             key,
             "--body",
-            str(tarball),
+            str(staged.path),
+            # Pin the BYTES, not the path. The CLI re-opens --body by name after
+            # this process wrote and closed it, so between those two moments the
+            # name can come to mean a different file — and every check we could
+            # run lands BEFORE the CLI's open, which is the wrong side of the
+            # window. This digest was taken as the tarball was written
+            # (`_write_tar_gz`), so S3 compares it against what it actually
+            # received and returns an error instead of storing a tarball this
+            # launcher did not build. The check therefore sits downstream of the
+            # open, the one place a pre-flight inspection cannot reach.
+            #
+            # Deliberately NOT paired with --checksum-algorithm: that flag asks
+            # the CLI to compute the digest itself, which would hash whatever it
+            # re-opened and certify a substitution instead of catching it. S3
+            # infers SHA256 from the header name, so the value alone is the pin.
+            "--checksum-sha256",
+            staged.sha256,
             "--expected-bucket-owner",
             account,
         ]
@@ -780,7 +1389,7 @@ def upload_source(tag: str, profile: str = "", region: str = "") -> tuple[str, s
         )
     finally:
         try:
-            tarball.unlink()
+            staged.path.unlink()
         except OSError:
             pass
     return bucket, key

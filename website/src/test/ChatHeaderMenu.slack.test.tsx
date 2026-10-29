@@ -52,7 +52,7 @@ vi.mock('../api/client', () => ({
 import type { RootState } from '../store'
 import type { ChatSlot, SessionLink } from '../types'
 import { api } from '../api/client'
-import { ChatHeaderMenu } from '../pages/chat/ChatPageMessageContent'
+import { ChatHeaderMenu } from '../pages/chat/ChatHeaderMenu'
 
 const dashboardState = {
   status: {}, connected: true, slots: [], approvalMode: 'normal',
@@ -63,7 +63,14 @@ const dashboardState = {
 
 /** A wire link row, with the fields a caller does not care about defaulted. */
 function link(over: Partial<SessionLink> & { channel: string }): SessionLink {
-  return { label: over.channel, target: '…1234', direction: 'out', live: true, ...over }
+  const base: SessionLink = { label: over.channel, target: '…1234', direction: 'out', live: true, ...over }
+  // `drives_session` as the projection emits it: a Slack thread, a `both`
+  // mirror and the born-in conversation drive the session; a one-way mirror
+  // does not.
+  return {
+    drives_session: base.channel === 'slack' || base.direction === 'both' || base.direction === 'origin',
+    ...base,
+  }
 }
 
 function renderMenu(slot: Partial<ChatSlot> & { key: string }) {
@@ -94,33 +101,47 @@ const rowOf = (slot: { links?: SessionLink[] }, channel: string) => (
 beforeEach(() => vi.clearAllMocks())
 
 describe('Session menu — one row per channel, two states', () => {
-  it('a connected channel offers only Disconnect, and none of the old vocabulary', async () => {
+  it('a connected channel offers Disconnect and Unlink, and none of the old vocabulary', async () => {
     renderMenu({
       key: 'chat-1-100',
       slack_linked: true,
       links: [link({ channel: 'slack', label: 'Slack' })],
     })
 
-    expect(await screen.findByText('Disconnect from Slack')).toBeInTheDocument()
+    expect(await screen.findByText('Pause replies to Slack')).toBeInTheDocument()
     expect(screen.queryByText('Connect to Slack')).not.toBeInTheDocument()
-    // The whole point of the change: no badge, no header, no secondary action.
+    // The sever action is back on purpose (#14068): Disconnect only pauses, and
+    // a binding nobody can sever locks the session out of session control. The
+    // two items define each other under their labels so neither is read as the
+    // other: Pause replies keeps the connection, Unlink removes it and says,
+    // in its own sentence, that reconnecting is possible and where — the
+    // session menu. A Slack thread is two-way (a reply in it resumes this
+    // session), so its Unlink line is about driving, not about replies.
+    expect(screen.getByText('The connection stays.')).toBeInTheDocument()
+    expect(screen.getByText('Unlink from Slack')).toBeInTheDocument()
+    expect(screen.getByText('Removes the connection — Slack stops driving this session. Reconnect anytime from the session menu.')).toBeInTheDocument()
+    // The rest of #3006's cleanup holds: no badge, no header, no reminder, no
+    // machinery vocabulary.
     for (const gone of [
       /^Origin$/, /^Mirror$/, /^Two-way$/, /^Offline$/, /Connected:/,
-      /Post reminder/, /Unlink from Slack/, /Stop mirroring/, /^Release/,
+      /Post reminder/, /Stop mirroring/, /^Release/,
     ]) {
       expect(screen.queryByText(gone)).not.toBeInTheDocument()
     }
   })
 
-  it('a disconnected channel offers Connect on the same single row', async () => {
+  it('a disconnected channel offers Resume replies on the same single row', async () => {
     renderMenu({
       key: 'chat-1-100',
       slack_linked: true,
       links: [link({ channel: 'slack', label: 'Slack', paused: true })],
     })
 
-    expect(await screen.findByText('Connect to Slack')).toBeInTheDocument()
-    expect(screen.queryByText('Disconnect from Slack')).not.toBeInTheDocument()
+    // The verb names the state: the thread is still linked (its sub-line says
+    // so), so the click resumes replies rather than connecting anew.
+    expect(await screen.findByText('Resume replies to Slack')).toBeInTheDocument()
+    expect(screen.queryByText('Connect to Slack')).not.toBeInTheDocument()
+    expect(screen.queryByText('Pause replies to Slack')).not.toBeInTheDocument()
   })
 
   it('disconnecting sets delivery off and flips the row without closing the menu', async () => {
@@ -130,7 +151,7 @@ describe('Session menu — one row per channel, two states', () => {
       links: [link({ channel: 'slack', label: 'Slack' })],
     })
 
-    fireEvent.click(await screen.findByText('Disconnect from Slack'))
+    fireEvent.click(await screen.findByText('Pause replies to Slack'))
 
     await waitFor(() => expect(api.pauseSlack).toHaveBeenCalledWith('chat-1-100', true))
     // The row is patched in place — the binding is retained, never dropped.
@@ -140,7 +161,7 @@ describe('Session menu — one row per channel, two states', () => {
       expect(slot?.links).toHaveLength(1)
     })
     // Menu stays open so the verb flip is visible: the row IS the state display.
-    expect(await screen.findByText('Connect to Slack')).toBeInTheDocument()
+    expect(await screen.findByText('Resume replies to Slack')).toBeInTheDocument()
   })
 
   it('reconnecting a disconnected channel sets delivery back on', async () => {
@@ -150,7 +171,7 @@ describe('Session menu — one row per channel, two states', () => {
       links: [link({ channel: 'slack', label: 'Slack', paused: true })],
     })
 
-    fireEvent.click(await screen.findByText('Connect to Slack'))
+    fireEvent.click(await screen.findByText('Resume replies to Slack'))
 
     await waitFor(() => expect(api.pauseSlack).toHaveBeenCalledWith('chat-1-100', false))
     await waitFor(() => {
@@ -177,8 +198,8 @@ describe('Session menu — the conversation a session was born in', () => {
       ],
     })
 
-    expect(await screen.findByText('Disconnect from Discord')).toBeInTheDocument()
-    expect(screen.getAllByText('Disconnect from Discord')).toHaveLength(1)
+    expect(await screen.findByText('Pause replies to Discord DM')).toBeInTheDocument()
+    expect(screen.getAllByText('Pause replies to Discord DM')).toHaveLength(1)
   })
 
   it('acts on BOTH deliveries when one channel carries two', async () => {
@@ -195,7 +216,7 @@ describe('Session menu — the conversation a session was born in', () => {
       ],
     })
 
-    fireEvent.click(await screen.findByText('Disconnect from Discord'))
+    fireEvent.click(await screen.findByText('Pause replies to Discord DM'))
 
     await waitFor(() => expect(api.pauseMirror).toHaveBeenCalledTimes(2))
     const calls = vi.mocked(api.pauseMirror).mock.calls
@@ -218,8 +239,8 @@ describe('Session menu — the conversation a session was born in', () => {
       ],
     })
 
-    expect(await screen.findByText('Disconnect from Discord')).toBeInTheDocument()
-    expect(screen.queryByText('Connect to Discord')).not.toBeInTheDocument()
+    expect(await screen.findByText('Pause replies to Discord DM')).toBeInTheDocument()
+    expect(screen.queryByText('Connect to Discord DM')).not.toBeInTheDocument()
   })
 
   it('offers Disconnect for an origin channel, so it can stop syndicating there', async () => {
@@ -231,7 +252,7 @@ describe('Session menu — the conversation a session was born in', () => {
       links: [link({ channel: 'discord', label: 'Discord DM', direction: 'origin' })],
     })
 
-    expect(await screen.findByText('Disconnect from Discord')).toBeInTheDocument()
+    expect(await screen.findByText('Pause replies to Discord DM')).toBeInTheDocument()
     expect(screen.queryByText('Origin')).not.toBeInTheDocument()
     expect(screen.queryByText('Connected: Discord DM')).not.toBeInTheDocument()
   })
@@ -243,7 +264,7 @@ describe('Session menu — the conversation a session was born in', () => {
       links: [link({ channel: 'discord', label: 'Discord DM', direction: 'origin' })],
     })
 
-    fireEvent.click(await screen.findByText('Disconnect from Discord'))
+    fireEvent.click(await screen.findByText('Pause replies to Discord DM'))
     // The third argument marks this as the BORN-IN conversation rather than an
     // explicit mirror. They are separate flags on the backend; see the next test.
     await waitFor(() => expect(api.pauseMirror).toHaveBeenCalledWith('discord-session', true, true))
@@ -265,10 +286,10 @@ describe('Session menu — the conversation a session was born in', () => {
       ],
     })
 
-    fireEvent.click(await screen.findByText('Disconnect from Telegram'))
+    fireEvent.click(await screen.findByText('Pause replies to Telegram'))
     await waitFor(() => expect(api.pauseMirror).toHaveBeenCalledWith('discord-session', true, false))
 
-    fireEvent.click(await screen.findByText('Disconnect from Discord'))
+    fireEvent.click(await screen.findByText('Pause replies to Discord DM'))
     await waitFor(() => expect(api.pauseMirror).toHaveBeenCalledWith('discord-session', true, true))
 
     // Two distinct deliveries addressed, never the same one twice.
@@ -283,7 +304,7 @@ describe('Session menu — the conversation a session was born in', () => {
       links: [link({ channel: 'discord', label: 'Discord DM', direction: 'both' })],
     })
 
-    expect(await screen.findByText('Disconnect from Discord')).toBeInTheDocument()
+    expect(await screen.findByText('Pause replies to Discord DM')).toBeInTheDocument()
     expect(screen.queryByText('Two-way')).not.toBeInTheDocument()
   })
 })
@@ -306,11 +327,11 @@ describe('Session menu — independence and offers', () => {
       ],
     })
 
-    fireEvent.click(await screen.findByText('Disconnect from Slack'))
+    fireEvent.click(await screen.findByText('Pause replies to Slack'))
     await waitFor(() => expect(api.pauseSlack).toHaveBeenCalled())
 
     // Slack is still in flight; the Discord row must still accept a click.
-    fireEvent.click(screen.getByText('Disconnect from Discord'))
+    fireEvent.click(screen.getByText('Pause replies to Discord DM'))
     await waitFor(() => expect(api.pauseMirror).toHaveBeenCalledWith('both-session', true, false))
 
     releaseSlack?.({ ok: true, was_paused: false })
@@ -326,8 +347,12 @@ describe('Session menu — independence and offers', () => {
     }])
     renderMenu({ key: 'chat-1-100', slack_linked: false })
 
-    // Named by DESTINATION, not by brand — see the next test for why.
-    fireEvent.click(await screen.findByText('Connect to Discord DM · 42'))
+    // Named by DESTINATION, not by brand — see the next test for why. The
+    // discriminator sits in the row's sub-line, not in the verb: a raw id on a
+    // button read as broken ("I don't know whose number that is").
+    const verb = await screen.findByText('Connect to Discord DM')
+    expect(verb.closest('[role="menuitem"]')).toHaveTextContent('Direct message · 42')
+    fireEvent.click(verb)
 
     await waitFor(() => expect(api.linkMirror).toHaveBeenCalledWith(
       'chat-1-100', 'discord', 'user:42',
@@ -356,10 +381,14 @@ describe('Session menu — independence and offers', () => {
     ])
     renderMenu({ key: 'chat-1-100', slack_linked: false })
 
-    expect(await screen.findByText('Connect to Slack · #eng')).toBeInTheDocument()
-    expect(screen.getByText('Connect to Discord · Direct Message')).toBeInTheDocument()
-    // The bare brand label would hide which conversation is being offered.
-    expect(screen.queryByText('Connect to Slack')).not.toBeInTheDocument()
+    const slack = await screen.findByText('Connect to Slack')
+    const discord = screen.getByText('Connect to Discord')
+    // Each row still says WHICH conversation it would connect — in its sub-line,
+    // where the bound rows carry theirs, so the verb line stays the channel's
+    // name and the discriminator never reads as a raw id inside a button.
+    expect(slack.closest('[role="menuitem"]')).toHaveTextContent('#eng')
+    expect(discord.closest('[role="menuitem"]')).toHaveTextContent('Direct Message')
+    expect(screen.queryByText('Connect to Slack · #eng')).not.toBeInTheDocument()
   })
 
   it('does not offer a second conversation on a channel it already holds', async () => {
@@ -369,6 +398,14 @@ describe('Session menu — independence and offers', () => {
       label: 'Discord DM · 99',
       available: true,
       unavailable_reason: '',
+    }, {
+      // A sibling offer on another channel: its arrival proves the offers
+      // rendered before the Discord offer is asserted absent.
+      channel_type: 'telegram',
+      target_id: 'user:7',
+      label: 'Telegram DM · 7',
+      available: true,
+      unavailable_reason: '',
     }])
     renderMenu({
       key: 'chat-1-100',
@@ -376,9 +413,15 @@ describe('Session menu — independence and offers', () => {
       links: [link({ channel: 'discord', label: 'Discord DM' })],
     })
 
-    // One Discord row, and it is the binding's — not an offer for another.
-    await waitFor(() => expect(screen.getAllByText(/Discord/)).toHaveLength(1))
-    expect(screen.getByText('Disconnect from Discord')).toBeInTheDocument()
+    // One Discord row, and it is the binding's — not an offer for another. The
+    // binding's row is a Disconnect toggle plus its Unlink item; the offer for
+    // the held channel would read `Connect to Discord DM`, and never appears.
+    const telegram = await screen.findByText('Connect to Telegram DM')
+    expect(telegram.closest('[role="menuitem"]')).toHaveTextContent('Direct message · 7')
+    expect(screen.getByText('Pause replies to Discord DM')).toBeInTheDocument()
+    expect(screen.getByText('Unlink from Discord DM')).toBeInTheDocument()
+    expect(screen.queryByText(/Connect to Discord/)).not.toBeInTheDocument()
+    expect(screen.getAllByText(/^(Pause replies to|Connect to) Discord/)).toHaveLength(1)
   })
 
   it('keeps an unconnectable channel focusable and explains why, without a badge', async () => {
@@ -391,8 +434,9 @@ describe('Session menu — independence and offers', () => {
     }])
     renderMenu({ key: 'chat-1-100', slack_linked: false })
 
-    const row = await screen.findByText('Connect to WeCom · Configured account')
+    const row = await screen.findByText('Connect to WeCom')
     const item = row.closest('[role="menuitem"]')
+    expect(item).toHaveTextContent('Configured account')
     expect(item).toHaveAttribute('aria-disabled', 'true')
     expect(item).toHaveAttribute('title', 'WeCom can only reply to an inbound message.')
     // VISIBLE, not only in `title`. A keyboard or touch user never sees a tooltip,

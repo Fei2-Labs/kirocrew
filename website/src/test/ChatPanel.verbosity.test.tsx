@@ -1,3 +1,4 @@
+import { MemoryRouter } from 'react-router-dom'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -71,9 +72,9 @@ import { Provider } from 'react-redux'
 // not the app singleton: a shared store would carry `activeSlot` across suites.
 import { createTestStore } from './helpers'
 
-function wrap(ui: React.ReactElement) {
+function wrap(ui: React.ReactElement, sub = 'transcript') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider>)
+  return render(<MemoryRouter initialEntries={[`/settings?tab=chat&sub=${sub}`]}><Provider store={createTestStore()}><QueryClientProvider client={qc}>{ui}</QueryClientProvider></Provider></MemoryRouter>)
 }
 
 async function verbosityValueAfterLoad(persisted: unknown): Promise<unknown> {
@@ -101,10 +102,15 @@ describe('ChatPanel settings – Response Verbosity is narrowed before render', 
   it.each([
     ['default', 'default'],
     ['concise', 'concise'],
-    ['ultra', 'ultra'],
     ['answer_only', 'answer_only'],
   ])('passes through the known level %s', async (persisted, expected) => {
     expect(await verbosityValueAfterLoad(persisted)).toBe(expected)
+  })
+
+  // `ultra` was retired. An older backend can still hand it back; show it as
+  // the level it now means instead of falling all the way to `default`.
+  it('maps the retired ultra level to answer_only', async () => {
+    expect(await verbosityValueAfterLoad('ultra')).toBe('answer_only')
   })
 
   // Every level the backend enum accepts needs a row here, and a label for it —
@@ -117,8 +123,8 @@ describe('ChatPanel settings – Response Verbosity is narrowed before render', 
     await waitFor(() => expect(selectProps.some(p => p.label === 'Response Verbosity')).toBe(true))
     const seen = selectProps.filter(p => p.label === 'Response Verbosity')
     const row = seen[seen.length - 1]
-    expect(row.options).toEqual(['default', 'concise', 'ultra', 'answer_only'])
-    expect(row.optionLabels).toHaveLength(4)
+    expect(row.options).toEqual(['default', 'concise', 'answer_only'])
+    expect(row.optionLabels).toHaveLength(3)
     expect(row.optionLabels?.every(label => !!label && label.trim().length > 0)).toBe(true)
   })
 

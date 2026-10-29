@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import api_file_stream
 from kiro_crew.dashboard.handlers.files import (
@@ -27,7 +28,7 @@ from kiro_crew.dashboard.handlers.files import (
 def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/file-stream", api_file_stream)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture
@@ -100,6 +101,40 @@ async def test_full_body_200_with_accept_ranges(tmp_path, mock_sel):
             assert resp.headers["Content-Type"] == "video/mp4"
             assert resp.headers["X-Content-Type-Options"] == "nosniff"
             assert await resp.read() == _MP4_BYTES
+
+
+@pytest.mark.asyncio
+async def test_content_disposition_carries_real_filename(tmp_path, mock_sel):
+    """A player-initiated download (the native <video>/<audio> controls) reads
+    the save name from Content-Disposition; without it the browser falls back
+    to the URL's last segment and saves as "file-stream". The header names the
+    file and stays `inline` so playback is unaffected."""
+    f = tmp_path / "pcm-worklet-before.mp4"
+    f.write_bytes(_MP4_BYTES)
+    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-stream?path={f}")
+            assert resp.status == 200
+            assert (
+                resp.headers["Content-Disposition"]
+                == "inline; filename*=UTF-8''pcm-worklet-before.mp4"
+            )
+
+
+@pytest.mark.asyncio
+async def test_content_disposition_percent_encodes_the_name(tmp_path, mock_sel):
+    """A name with spaces/unicode must round-trip through RFC 5987 encoding,
+    not break the header."""
+    f = tmp_path / "my clip (v2).mp4"
+    f.write_bytes(_MP4_BYTES)
+    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-stream?path={f}")
+            assert resp.status == 200
+            assert (
+                resp.headers["Content-Disposition"]
+                == "inline; filename*=UTF-8''my%20clip%20%28v2%29.mp4"
+            )
 
 
 @pytest.mark.asyncio
@@ -234,16 +269,13 @@ async def test_text_credentials_behind_forged_magic_refused(tmp_path, mock_sel):
 @pytest.mark.asyncio
 async def test_invalid_utf8_magic_cannot_skip_the_scan(tmp_path, mock_sel):
     """The forged magic itself may be invalid UTF-8 (bare mp3 frame sync).
-    The probe decodes with errors=replace, so the credential scan still runs
-    and the file is refused -- a prepended byte is not a bypass."""
+    The probe then takes the shared binary scan, so the credential scan still
+    runs and the file is refused -- a prepended byte is not a bypass."""
     f = tmp_path / "secrets2.mp3"
-    f.write_bytes(b"\xff\xfb" + b"AKIA_FAKE_CREDENTIAL_TEXT\n" * 10)
+    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"  # built so no literal key sits here
+    f.write_bytes(b"\xff\xfb" + f"key {key_id}\n".encode() * 10)
 
-    def _flag_credentials(text: str) -> str:
-        return text.replace("AKIA_FAKE_CREDENTIAL_TEXT", "[REDACTED]")
-
-    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)), \
-         patch("kiro_crew.dashboard.handlers.files.redact", side_effect=_flag_credentials):
+    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-stream?path={f}")
             assert resp.status == 400
@@ -382,3 +414,20 @@ async def test_allow_decision_logged_before_prepare(tmp_path, mock_sel):
                 await client.get(f"/api/file-stream?path={f}")
     outcomes = [c.kwargs.get("outcome") for c in mock_sel.log_tool_invocation.call_args_list]
     assert "success" in outcomes
+
+
+@pytest.mark.asyncio
+async def test_mp3_with_jpeg_cover_art_streams(tmp_path, mock_sel):
+    """ID3 cover art is a JPEG, whose standard Huffman table reads as a bot token."""
+    import io
+
+    image = pytest.importorskip("PIL.Image")
+    art = io.BytesIO()
+    image.new("RGB", (64, 36), (120, 30, 200)).save(art, "JPEG")
+    f = tmp_path / "song.mp3"
+    f.write_bytes(b"ID3\x04\x00\x00\x00\x00\x00\x00" + art.getvalue() + b"\xff\xfb" * 32)
+    assert b"456789:CDEFGHIJ" in f.read_bytes()
+    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-stream?path={f}")
+            assert resp.status == 200

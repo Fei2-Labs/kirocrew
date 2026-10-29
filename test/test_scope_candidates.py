@@ -27,8 +27,10 @@ read, and what it proposes, a human can paste.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import itertools
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -1003,7 +1005,6 @@ class TestModelProseCannotForgeTheStateItIsJudgedBy:
         # cannot make an unattributed run attributable -- with the flag false the
         # conclusion is the fail-closed one whatever the model wrote.
         unmarked, why = scope.conclude_lane(
-            lane="fork",
             fold="clean",
             nothing_new=False,
             marker_present=False,
@@ -1039,7 +1040,7 @@ class TestModelProseCannotForgeTheStateItIsJudgedBy:
 # --------------------------------------------------------------------------- #
 
 _FOLDS = ("clean", "regression", "redacted", "unscrubbable", "error", "no-report")
-_MODELS = ("PASS", "CONCERNS", "BLOCK", "UNKNOWN")
+_MODELS = ("PASS", "BLOCK", "UNKNOWN")
 _BOOLS = (False, True)
 
 #: Blocking severity -- `pass` softest, the two reds hardest. Bound to the ONE
@@ -1064,27 +1065,21 @@ def _all_inputs():
 
 class TestConcludeTableIsOneTableForBothLanes:
     """One Python table decides both lanes, so for the SAME inputs a fork and a
-    same-repo run reach the SAME conclusion. These tests assert that property
-    across the whole input grid -- a per-lane implementation drifts on the
-    platform-gap source, which is the divergence the property forbids.
+    same-repo run reach the SAME conclusion. The table takes no lane, so that holds
+    by construction: a function that cannot see the lane cannot answer differently
+    for it, and a per-lane implementation is what drifts on the platform-gap source.
     """
 
-    def test_no_input_combination_differs_by_lane(self) -> None:
-        # (FOLDED x marker x model header x gap x lane), every combination the two
-        # shell blocks can reach. The ruling resolved the one asymmetry to the
-        # stricter side, so NO row deliberately differs by lane -- assert exactly
-        # that, across the whole grid.
-        diverged = []
-        for kwargs in _all_inputs():
-            fork = scope.conclude_lane(lane="fork", **kwargs)
-            same = scope.conclude_lane(lane="same-repo", **kwargs)
-            if fork[0] != same[0]:
-                diverged.append((kwargs, fork[0], same[0]))
-        assert not diverged, f"lane divergence in {len(diverged)} rows, e.g. {diverged[:3]}"
+    def test_the_table_takes_no_lane(self) -> None:
+        # The structural pin. A grid that compares the two lanes' answers stays green
+        # for as long as no row READS a lane parameter, so it cannot stop one from
+        # coming back; the signature can.
+        params = inspect.signature(scope.conclude_lane).parameters
+        assert not [name for name in params if "lane" in name], list(params)
 
     def test_the_conclusion_vocabulary_is_closed(self) -> None:
         for kwargs in _all_inputs():
-            conclusion, why = scope.conclude_lane(lane="fork", **kwargs)
+            conclusion, why = scope.conclude_lane(**kwargs)
             assert conclusion in _SEVERITY, (conclusion, kwargs)
             assert why and "\n" not in why
 
@@ -1097,29 +1092,30 @@ class TestConcludeStricterGapResolution:
     """
 
     def test_model_prose_gap_now_blocks_on_both_lanes(self) -> None:
-        for lane in ("fork", "same-repo"):
-            conclusion, _ = scope.conclude_lane(
-                lane=lane,
-                fold="clean",
-                model="BLOCK",
-                marker_present=True,
-                nothing_new=False,
-                gap_script=False,
-                gap_model=True,
-            )
-            assert conclusion == "block", lane
+        conclusion, _ = scope.conclude_lane(
+            fold="clean",
+            model="BLOCK",
+            marker_present=True,
+            nothing_new=False,
+            gap_script=False,
+            gap_model=True,
+        )
+        assert conclusion == "block"
 
-    def test_script_gap_blocks_and_no_gap_is_advisory(self) -> None:
+    def test_script_gap_blocks_and_no_gap_reads_as_pass(self) -> None:
         base = dict(fold="clean", model="BLOCK", marker_present=True, nothing_new=False)
-        for lane in ("fork", "same-repo"):
-            assert (
-                scope.conclude_lane(lane=lane, gap_script=True, gap_model=False, **base)[0]
-                == "block"
-            )
-            assert (
-                scope.conclude_lane(lane=lane, gap_script=False, gap_model=False, **base)[0]
-                == "concerns"
-            )
+        assert scope.conclude_lane(gap_script=True, gap_model=False, **base)[0] == "block"
+        # A BLOCK that names no confirmed regression and no demonstrated gap is
+        # unsubstantiated, and an unsubstantiated BLOCK is a PASS.
+        assert scope.conclude_lane(gap_script=False, gap_model=False, **base)[0] == "pass"
+
+    def test_the_retired_concerns_word_is_not_a_verdict(self) -> None:
+        # CONCERNS is not a Scope-Verdict any more: it folds to UNKNOWN, which the
+        # table treats as unsettled (the lane fails closed on a verdict it cannot
+        # parse), not as a soft pass.
+        assert scope._normalize_model("CONCERNS") == "UNKNOWN"
+        assert scope._normalize_model("pass") == "PASS"
+        assert scope._normalize_model("block") == "BLOCK"
 
     def test_the_model_gap_can_only_tighten_never_soften(self) -> None:
         # The untrusted signal is honoured ONLY where it makes the verdict
@@ -1128,8 +1124,8 @@ class TestConcludeStricterGapResolution:
         for kwargs in _all_inputs():
             if kwargs["gap_model"]:
                 continue
-            without = scope.conclude_lane(lane="fork", **kwargs)[0]
-            with_ = scope.conclude_lane(lane="fork", **{**kwargs, "gap_model": True})[0]
+            without = scope.conclude_lane(**kwargs)[0]
+            with_ = scope.conclude_lane(**{**kwargs, "gap_model": True})[0]
             assert _SEVERITY[with_] >= _SEVERITY[without], (kwargs, without, with_)
 
 
@@ -1142,7 +1138,6 @@ class TestConcludeFailsClosed:
     def test_a_confirmed_regression_always_blocks(self) -> None:
         for model, marker, gap_s, gap_m in itertools.product(_MODELS, _BOOLS, _BOOLS, _BOOLS):
             conclusion, _ = scope.conclude_lane(
-                lane="fork",
                 fold="regression",
                 model=model,
                 marker_present=marker,
@@ -1169,7 +1164,7 @@ class TestConcludeFailsClosed:
             kwargs.setdefault("nothing_new", False)
             kwargs.setdefault("gap_script", False)
             kwargs.setdefault("gap_model", False)
-            conclusion, _ = scope.conclude_lane(lane="same-repo", **kwargs)
+            conclusion, _ = scope.conclude_lane(**kwargs)
             assert conclusion == scope._UNSETTLED_CONCLUSION, kwargs
 
     def test_fail_closed_default_is_error_not_neutral(self) -> None:
@@ -1182,7 +1177,6 @@ class TestConcludeFailsClosed:
 class TestConcludeNothingNew:
     def test_nothing_new_is_green_only_with_a_marker(self) -> None:
         with_marker = scope.conclude_lane(
-            lane="fork",
             fold="no-report",
             model="UNKNOWN",
             marker_present=True,
@@ -1191,7 +1185,6 @@ class TestConcludeNothingNew:
             gap_model=False,
         )
         without = scope.conclude_lane(
-            lane="fork",
             fold="no-report",
             model="UNKNOWN",
             marker_present=False,
@@ -1203,13 +1196,161 @@ class TestConcludeNothingNew:
         assert without[0] == scope._UNSETTLED_CONCLUSION
 
 
+class TestConcludeNamesTheValidateRefusalCause:
+    """A `validate` refusal dispatches no leg, so the fold reads `no-report`. The
+    generic sentence for that row -- "no leg reported, and this was not the
+    nothing-to-adjudicate short circuit" -- is true of a broken lane and of a
+    regression in the author's own diff alike, and a refusal whose cause reaches a
+    reader only through a job annotation is four hops from the check they read.
+    These pin the cause and its remedy onto the lane's own verdict, without
+    relaxing the refusal.
+    """
+
+    #: What a check-run title costs before the table's `why` starts: GitHub caps
+    #: `output[title]` at 255 characters and 422s a longer one, which would turn a
+    #: more explanatory refusal into a check-run that never publishes at all.
+    _TITLE_CAP = 255
+    _TITLE_PREFIX = "[scope-floor:unsettled] Security Scope Review — "
+
+    @staticmethod
+    def _no_report(**over):
+        kwargs = dict(
+            fold="no-report",
+            model="UNKNOWN",
+            marker_present=False,
+            nothing_new=False,
+            gap_script=False,
+            gap_model=False,
+        )
+        kwargs.update(over)
+        return scope.conclude_lane(**kwargs)
+
+    def test_a_credential_shape_refusal_names_itself_and_its_remedy(self) -> None:
+        conclusion, why = self._no_report(refusal="corpus-credential")
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert "credential shape" in why
+        # The defect: the generic sentence is what this replaces.
+        assert "no leg reported" not in why
+        remedy = scope.validate_refusal_remedy("corpus-credential")
+        assert "Re-run this lane" in remedy
+        assert "without the embedded credential" in remedy
+
+    def test_an_uncheckable_corpus_refusal_names_itself_and_its_remedy(self) -> None:
+        conclusion, why = self._no_report(refusal="corpus-uncheckable")
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert "could not be checked" in why
+        assert "no leg reported" not in why
+        assert "Re-run this lane" in scope.validate_refusal_remedy("corpus-uncheckable")
+
+    def test_naming_the_cause_never_softens_the_verdict(self) -> None:
+        # The whole safety property: explaining a refusal must not publish a softer
+        # conclusion than the same unmeasured run got while it was unexplained.
+        generic = self._no_report()[0]
+        for refusal in scope._VALIDATE_REFUSALS:
+            assert self._no_report(refusal=refusal)[0] == generic
+
+    def test_a_refusal_outranks_the_green_nothing_new_row(self) -> None:
+        # Fail-closed ORDERING. `validate` refuses only on its rc=0 path, so it
+        # cannot also be the exit-3 short circuit -- but were both ever supplied,
+        # the green `nothing-new` reading would publish a pass for a corpus no leg
+        # ever saw. The refusal is the half that must win.
+        conclusion, why = self._no_report(
+            refusal="corpus-credential", nothing_new=True, marker_present=True
+        )
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert "credential shape" in why
+        assert "already a committed golden path" not in why
+
+    def test_an_unnamed_validate_code_falls_through_to_the_generic_sentence(self) -> None:
+        # `rc` also carries 1, 2, 3, `missing` and the empty string. None of those
+        # name a cause this table can explain, so each must read as no refusal
+        # rather than reaching an author as a half-matched sentence.
+        generic = self._no_report()
+        for code in ("", "0", "1", "2", "3", "missing", "corpus", "CORPUS-CREDENTIAL"):
+            assert self._no_report(refusal=code) == generic, code
+            assert scope.validate_refusal_remedy(code) == "", code
+        assert self._no_report(refusal=None) == generic
+
+    def test_both_halves_stay_publishable(self) -> None:
+        for refusal, (why, remedy) in scope._VALIDATE_REFUSALS.items():
+            # A `why` is written into `$GITHUB_OUTPUT` as one `key=value` line and
+            # then into a capped check-run title.
+            assert "\n" not in why and "\n" not in remedy, refusal
+            assert len(self._TITLE_PREFIX) + len(why) <= self._TITLE_CAP, (
+                refusal,
+                len(self._TITLE_PREFIX) + len(why),
+            )
+            # Names the SHAPE, never a value: this text is published on a public
+            # repository's check-run, which is the same reason the corpus itself is
+            # refused rather than scrubbed.
+            for shape in ("arn:", "aws_", "AKIA", "ASIA"):
+                assert shape not in why and shape not in remedy, (refusal, shape)
+            assert not re.search(r"\d{12}", why + remedy), refusal
+
+
+class TestConcludeNamesAnUnresolvedScope:
+    """A `generate` job that died before it resolved the review scope leaves an
+    unmeasured run. It stays red; the table only names why, instead of the generic
+    "no leg reported" sentence that points at the author's diff.
+    """
+
+    @staticmethod
+    def _no_report(**over):
+        kwargs = dict(
+            fold="no-report",
+            model="UNKNOWN",
+            marker_present=False,
+            nothing_new=False,
+            gap_script=False,
+            gap_model=False,
+        )
+        kwargs.update(over)
+        return scope.conclude_lane(**kwargs)
+
+    def test_an_unresolved_scope_is_unsettled_and_names_its_cause(self) -> None:
+        conclusion, why = self._no_report(scope_unresolved=True)
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert why == scope._SCOPE_UNRESOLVED_WHY
+        assert "no leg reported" not in why
+
+    def test_a_resolved_scope_with_no_leg_still_reads_the_generic_unsettled_row(self) -> None:
+        conclusion, why = self._no_report(scope_unresolved=False)
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert why == "no leg reported, and this was not the nothing-to-adjudicate short circuit"
+
+    def test_an_unresolved_scope_outranks_the_green_nothing_new_row(self) -> None:
+        conclusion, why = self._no_report(
+            scope_unresolved=True, nothing_new=True, marker_present=True
+        )
+        assert conclusion == scope._UNSETTLED_CONCLUSION
+        assert why == scope._SCOPE_UNRESOLVED_WHY
+
+    def test_naming_an_unresolved_scope_never_softens_any_verdict(self) -> None:
+        for kwargs in _all_inputs():
+            without = scope.conclude_lane(**kwargs)[0]
+            with_ = scope.conclude_lane(**kwargs, scope_unresolved=True)[0]
+            assert _SEVERITY[with_] >= _SEVERITY[without], (kwargs, without, with_)
+
+    def test_the_why_fits_a_check_run_title(self) -> None:
+        prefix = TestConcludeNamesTheValidateRefusalCause._TITLE_PREFIX
+        why = scope._SCOPE_UNRESOLVED_WHY
+        assert "\n" not in why
+        assert len(prefix) + len(why) <= TestConcludeNamesTheValidateRefusalCause._TITLE_CAP
+
+    def test_the_cli_carries_the_flag(self, capsys) -> None:
+        rc = scope.main(["conclude", "--fold", "no-report", "--scope-unresolved", "true"])
+        assert rc == 0
+        out = capsys.readouterr().out.splitlines()
+        assert f"conclusion={scope._UNSETTLED_CONCLUSION}" in out, out
+        assert f"why={scope._SCOPE_UNRESOLVED_WHY}" in out, out
+        assert "settled=no" in out, out
+
+
 class TestConcludeCli:
     def test_cli_prints_github_output_lines_and_exits_zero(self, capsys) -> None:
         rc = scope.main(
             [
                 "conclude",
-                "--lane",
-                "fork",
                 "--fold",
                 "clean",
                 "--model",
@@ -1230,7 +1371,7 @@ class TestConcludeCli:
         # The fork lane stamps its check-run from this line, and a stamped run sets
         # no per-head floor. A clean run must never carry it, or a confirmed
         # regression would stop flooring the head.
-        scope.main(["conclude", "--lane", "fork", "--fold", "error", "--marker", "present"])
+        scope.main(["conclude", "--fold", "error", "--marker", "present"])
         assert "settled=no" in capsys.readouterr().out.splitlines()
 
     def test_settled_follows_the_constant_not_a_token_spelling(self, capsys, monkeypatch) -> None:
@@ -1238,15 +1379,15 @@ class TestConcludeCli:
 
         The fork lane decides whether to stamp its check-run unsettled from this
         `settled=` line. Deriving it from the token spelling instead would break
-        that contract silently: flipped to `"concerns"`, an unsettled run would
+        that contract silently: flipped to `"nothing-new"`, an unsettled run would
         arrive as a token every caller treats as settled, and a flake would floor
         the head again with no other edit in sight. So the answer is computed
         against the constant.
         """
-        monkeypatch.setattr(scope, "_UNSETTLED_CONCLUSION", "concerns")
-        scope.main(["conclude", "--lane", "fork", "--fold", "error", "--marker", "present"])
+        monkeypatch.setattr(scope, "_UNSETTLED_CONCLUSION", "nothing-new")
+        scope.main(["conclude", "--fold", "error", "--marker", "present"])
         out = capsys.readouterr().out.splitlines()
-        assert "conclusion=concerns" in out, out
+        assert "conclusion=nothing-new" in out, out
         assert "settled=no" in out, out
 
     def test_cli_lowercases_and_normalizes_the_header(self, capsys) -> None:
@@ -1255,8 +1396,6 @@ class TestConcludeCli:
         scope.main(
             [
                 "conclude",
-                "--lane",
-                "same-repo",
                 "--fold",
                 "clean",
                 "--model",
@@ -1269,13 +1408,67 @@ class TestConcludeCli:
 
     def test_cli_rejects_an_unknown_fold_as_exit_two(self) -> None:
         with pytest.raises(SystemExit) as exc:
-            scope.main(["conclude", "--lane", "fork", "--fold", "bogus"])
+            scope.main(["conclude", "--fold", "bogus"])
         assert exc.value.code == 2
 
-    def test_cli_rejects_an_unknown_lane(self) -> None:
-        with pytest.raises(SystemExit) as exc:
-            scope.main(["conclude", "--lane", "sideways", "--fold", "clean"])
-        assert exc.value.code == 2
+    def test_cli_conclude_takes_no_lane(self) -> None:
+        # The CLI half of `test_the_table_takes_no_lane`: a `--lane` the parser
+        # accepted would be a value a caller passes and nothing reads. `monotonic`
+        # keeps its own, which selects the rows it reads.
+        for lane in ("fork", "same-repo"):
+            with pytest.raises(SystemExit) as exc:
+                scope.main(["conclude", "--lane", lane, "--fold", "clean"])
+            assert exc.value.code == 2, lane
+
+    def test_cli_carries_a_named_refusal_as_the_why_plus_a_remedy_line(self, capsys) -> None:
+        # The lane reads these back with `sed -n 's/^key=//p'`, so the remedy is a
+        # key of its own rather than appended to the why: the why becomes a check-run
+        # TITLE, which GitHub caps at 255 characters, and the remedy is the half that
+        # does not fit there.
+        rc = scope.main(
+            [
+                "conclude",
+                "--fold",
+                "no-report",
+                "--refusal",
+                "corpus-credential",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out.splitlines()
+        assert f"conclusion={scope._UNSETTLED_CONCLUSION}" in out, out
+        assert "settled=no" in out, out
+        why = [line for line in out if line.startswith("why=")]
+        remedy = [line for line in out if line.startswith("remedy=")]
+        assert why and "credential shape" in why[0], out
+        assert remedy and "Re-run this lane" in remedy[0], out
+
+    def test_cli_prints_no_remedy_key_without_a_named_refusal(self, capsys) -> None:
+        # Both lanes select keys rather than lines, so an extra key is inert -- but a
+        # run with nothing to remedy must not publish an empty one either.
+        scope.main(
+            [
+                "conclude",
+                "--fold",
+                "no-report",
+                "--refusal",
+                "1",
+            ]
+        )
+        out = capsys.readouterr().out.splitlines()
+        assert not [line for line in out if line.startswith("remedy=")], out
+        assert (
+            "why=no leg reported, and this was not the nothing-to-adjudicate short circuit" in out
+        )
+
+    def test_the_refusal_flag_is_optional(self, capsys) -> None:
+        scope.main(["conclude", "--fold", "clean", "--marker", "present"])
+        out = capsys.readouterr().out.splitlines()
+        assert out == [
+            "conclusion=error",
+            "why=no parseable Scope-Verdict header carrying a marker for this head",
+            "settled=no",
+        ], out
 
 
 class TestMonotonicConclusionFloor:

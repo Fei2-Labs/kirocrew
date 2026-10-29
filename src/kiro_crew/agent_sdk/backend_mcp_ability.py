@@ -137,31 +137,6 @@ OFF_CARD_CONCERNS: Mapping[str, str] = {
 }
 
 
-#: Per-tool deny reaches whose cost falls on a WHOLE server rather than one tool.
-#:
-#: Two of the three, and the second one is the reason this is a set rather than a
-#: comparison against ``whole-server``. ``whole-server`` has no per-call identity to
-#: match, so withholding the server entire is the only faithful answer -- Crew's own
-#: control plane included. ``per-call`` stays per tool on Crew's OWN servers and
-#: withholds any other server whole, so a reader with a third-party server meets the
-#: same accident. ``settings-file`` is the one reach that costs exactly the tool it
-#: names, everywhere, which is why it is not here.
-#:
-#: Named here rather than in each renderer: a consumer that spelled the comparison
-#: itself would author "which reaches are dangerous" for its own surface, and a reach
-#: added to the vocabulary would render as ordinary on one surface and prominent on
-#: another. Held against the vocabulary by the same completeness test that holds
-#: :data:`OFF_CARD_CONCERNS`, so a new member is a failing test rather than a value
-#: quietly classified as harmless.
-COSTS_WHOLE_SERVER: Tuple[str, ...] = ("whole-server", "per-call")
-
-#: Reaches whose cost is the single tool the restriction names, and nothing more.
-#:
-#: The other half of the classification, spelled out for the completeness test: a
-#: reach in NEITHER tuple is one nobody ruled on, which is the state the test fails.
-COSTS_ONE_TOOL: Tuple[str, ...] = ("settings-file",)
-
-
 @dataclass(frozen=True)
 class McpAbility:
     """What one harness's declaration says about Crew's MCP servers reaching it."""
@@ -232,12 +207,41 @@ class McpAbility:
     def costs_whole_server(self) -> bool:
         """Whether switching ONE tool off here can cost a whole server.
 
-        Derived from :attr:`per_tool_deny` against :data:`COSTS_WHOLE_SERVER`, so
-        every surface that gives this fact a prominent slot gives it to the same
-        reaches. ``False`` for a harness that declares no reach, which is the honest
-        answer: nothing is established about it.
+        Read off the reach's own declaration
+        (``registry.PerToolDeny.costs_whole_server``), so every surface that gives
+        this fact a prominent slot gives it to the same reaches, and a reach added
+        to the vocabulary carries its cost with it. ``False`` for a harness that
+        declares no reach, which is the honest answer: nothing is established.
         """
-        return self.per_tool_deny in COSTS_WHOLE_SERVER
+        try:
+            # circular import -- see :func:`_declaration`.
+            from kiro_crew.providers.mirrors import PerToolDeny
+        except Exception:
+            return False
+        return any(m.costs_whole_server for m in PerToolDeny if m.value == self.per_tool_deny)
+
+    @property
+    def spared_servers(self) -> Tuple[str, ...]:
+        """The servers that keep per-tool deny where a tool-off costs others whole.
+
+        Non-empty only on a reach that costs a whole server and spares Crew's own
+        control plane (today ``per-call``): there Crew refuses the call itself on its
+        own servers, by the per-call identity the codex and opencode mirrors attach to
+        exactly ``CONTROL_PLANE_SERVERS``. The names are that same tuple, read from
+        the ``mcp_cleanup`` leaf ``acp.session_mcp`` re-exports it from, so the page
+        never holds a list of its own that could drift from the mirrors.
+
+        Empty everywhere else, and that is two different truths: on ``settings-file``
+        no server is costed whole, and on ``whole-server`` none is spared.
+        """
+        if not self.costs_whole_server or self.costs_control_plane:
+            return ()
+        try:
+            # function-local for the same load-path reason as :func:`_declaration`.
+            from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS
+        except Exception:
+            return ()
+        return tuple(CONTROL_PLANE_SERVERS)
 
 
 def _declaration(backend: str) -> Any | None:
@@ -350,7 +354,8 @@ def ability_payload(backend: str) -> Dict[str, object]:
 
     * the per-tool deny reach and whether it can cost a whole server -- a RISK the
       reader meets by accident, since switching a tool off says nothing about
-      servers;
+      servers -- and the servers that cost spares, so the tool list words the
+      right one of the two facts on each server;
     * the spec settings that will not take effect here, as ONE list. The
       withheld/no-channel split is a maintainer's distinction between a settled
       ruling and an open gap; the reader's question is the same either way -- does
@@ -375,6 +380,9 @@ def ability_payload(backend: str) -> Dict[str, object]:
         # renderer comparing values itself would promote a new reach on one surface
         # and bury it on the next.
         "costs_whole_server": ability.costs_whole_server,
+        # Which servers that cost spares, so the MCP tool list can say the rule on
+        # every other server and the per-tool fact on these alone.
+        "spared_servers": list(ability.spared_servers),
         # Stated only where it HOLDS, so a harness that honours the whole file sends an
         # empty list and renders nothing: a reader never reads a row of "delivered"
         # marks that mean "as expected".

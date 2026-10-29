@@ -3,7 +3,15 @@ import { act, screen, waitFor, fireEvent, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ComponentType } from 'react'
 import ArtifactsPage from '../pages/ArtifactsPage'
-import { renderWithProviders } from './helpers'
+import { renderWithProviders, createTestStore } from './helpers'
+import { sseConnected } from '../store/dashboardSlice'
+
+/** The move submenu is gateway-gated, so these fixtures must be connected. */
+function connectedStore() {
+  const s = createTestStore()
+  s.dispatch(sseConnected())
+  return s
+}
 import { api } from '../api/client'
 import type { Artifact, ArtifactFolder, SessionDoc } from '../types'
 
@@ -305,6 +313,120 @@ describe('ArtifactsPage — folder cards in the gallery', () => {
     expect(within(card).queryByTitle('loose one')).not.toBeInTheDocument()
   })
 
+  it('renders markdown inside folder tiles as compact plain text', async () => {
+    const markdown = mkArtifact('long-report', {
+      folder_id: 'ops',
+      kind: 'markdown',
+    })
+    seed({
+      artifacts: [markdown],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: '# Huge report heading\n\n| A | B |\n|---|---|\n| one | two |' },
+    })
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+    const thumb = await within(folder).findByTestId('artifact-mini-text')
+
+    expect(thumb).toHaveTextContent('Huge report heading')
+    expect(thumb.className).toContain('line-clamp-5')
+    // Table syntax is not laid out in a five-line tile, so no pipe survives.
+    expect(thumb.textContent).not.toContain('|')
+    // ... and the cells stay separable: a bare space would read "A B one two".
+    expect(thumb).toHaveTextContent('A · B')
+    expect(thumb).toHaveTextContent('one · two')
+    expect(within(folder).queryByRole('heading')).not.toBeInTheDocument()
+    expect(within(folder).queryByRole('table')).not.toBeInTheDocument()
+  })
+
+  it('flattens a pathological delimiter line without stalling the render', async () => {
+    // The tile flattens the WHOLE content line by line, before the 240-char
+    // clamp, so one unbounded line reaches the delimiter check. A single
+    // anchored regex whose classes both match a space backtracks quadratically
+    // on this shape -- measured 14ms at 8k chars, 54ms at 16k, 346ms at 40k,
+    // and 9.2s for this render at 200k -- which freezes the gallery tab on
+    // content the library itself can hold. The per-cell test is linear, so the
+    // budget below is the assertion: it is met with room to spare, and missed
+    // by an order of magnitude if the whole-line regex comes back.
+    const pathological = `${' '.repeat(200000)}|x`
+    const markdown = mkArtifact('long-report', { folder_id: 'ops', kind: 'markdown' })
+    seed({
+      artifacts: [markdown],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: `# Report\n\n${pathological}\n` },
+    })
+    const started = Date.now()
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+    const thumb = await within(folder).findByTestId('artifact-mini-text')
+    const elapsed = Date.now() - started
+
+    expect(thumb).toHaveTextContent('Report')
+    expect(thumb.textContent).not.toContain('|')
+    expect(elapsed).toBeLessThan(2500)
+  })
+
+  it('bounds how much content the tile scans before flattening it', async () => {
+    // The tile shows 240 characters, but every pass that produces them -- the
+    // tag strip, the split, the per-line flatten, stripMd -- ran over the FULL
+    // artifact first, while the sibling non-mini markdown path clamps at 4000.
+    // The library provably holds large markdown (that sibling clamp is the
+    // proof), and the tag-strip regex is quadratic on `<` with no closing `>`,
+    // so an unclamped scan froze the whole folder tile with no recovery but
+    // leaving the page. Clamped, the cost is fixed at 4000 characters whatever
+    // the artifact's size, so the budget below is met with room to spare and
+    // missed by an order of magnitude without the clamp.
+    const wide = '<'.repeat(200000)
+    seed({
+      artifacts: [mkArtifact('long-report', { folder_id: 'ops', kind: 'markdown' })],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: `Report opens here\n\n${wide}` },
+    })
+    const started = Date.now()
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+    const thumb = await within(folder).findByTestId('artifact-mini-text')
+    const elapsed = Date.now() - started
+
+    expect(thumb).toHaveTextContent('Report opens here')
+    expect(elapsed).toBeLessThan(2500)
+  })
+
+  it('separates flattened table ROWS as strongly as the cells inside them', async () => {
+    // stripMd collapses the row-ending newline to a bare space, so joining rows
+    // with it put the weaker mark at the stronger boundary: the last cell of one
+    // row bound to the first of the next and "Check · Result Build · Passed"
+    // read "Result Build" as a pair. Rows carry the same separator as cells.
+    seed({
+      artifacts: [mkArtifact('long-report', { folder_id: 'ops', kind: 'markdown' })],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: '| Check | Result |\n|---|---|\n| Build | Passed |\n' },
+    })
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+    const thumb = await within(folder).findByTestId('artifact-mini-text')
+
+    expect(thumb).toHaveTextContent('Check · Result · Build · Passed')
+    expect(thumb.textContent).not.toContain('Result Build')
+  })
+
+
+  it('keeps SVG folder tiles on the kind-aware preview path', async () => {
+    // The artifact is built inline, as the other seeds in this file do: a
+    // separate binding used in the same call as the script-bearing fixture is
+    // what the SAST unknown-value-with-script-tag rule matches on.
+    seed({
+      artifacts: [mkArtifact('brand-mark', { folder_id: 'ops', kind: 'svg' })],
+      folders: [mkFolder('ops', 'Ops')],
+      full: { content: '<' + 'svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" /><script>window.x=1</script></svg>' },
+    })
+    renderWithProviders(<ArtifactsPage />)
+    const folder = await screen.findByRole('button', { name: 'Open folder Ops' })
+
+    await waitFor(() => expect(folder.querySelector('svg circle')).toBeTruthy())
+    expect(folder.querySelector('svg script')).toBeNull()
+    expect(within(folder).queryByTestId('artifact-mini-text')).not.toBeInTheDocument()
+  })
+
   it('renders the derived emoji badge on a closed folder glyph', async () => {
     seed({ artifacts: [], folders: [mkFolder('ops', 'Ops', { icon: '🛠', color: '#3b82f6' })] })
     renderWithProviders(<ArtifactsPage />)
@@ -356,7 +478,7 @@ describe('ArtifactsPage — folder cards in the gallery', () => {
 
   it('says an empty folder is empty rather than showing the library empty state', async () => {
     seed({ artifacts: [mkArtifact('outside-one')], folders: [mkFolder('ops', 'Ops')] })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() =>
       expect(screen.getByText(/This folder is empty\. Drag artifacts onto it to file them here\./)).toBeInTheDocument(),
     )
@@ -367,7 +489,7 @@ describe('ArtifactsPage — folder cards in the gallery', () => {
       artifacts: [],
       folders: [mkFolder('ops', 'Ops'), mkFolder('deep', 'Deep', { parent_id: 'ops' })],
     })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByText('No artifacts directly in this folder.')).toBeInTheDocument())
   })
 
@@ -385,7 +507,7 @@ describe('ArtifactsPage — creating a folder', () => {
   it('creates the folder inside the folder being browsed', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New folder/i }))
@@ -399,7 +521,7 @@ describe('ArtifactsPage — creating a folder', () => {
   it('commits the name when the inline field loses focus', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New folder/i }))
@@ -426,7 +548,7 @@ describe('ArtifactsPage — creating a folder', () => {
   it('abandons folder creation when the field is left empty', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New folder/i }))
@@ -445,7 +567,7 @@ describe('ArtifactsPage — creating a folder', () => {
   it('loses the pending folder when a color swatch is clicked before the name', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New folder/i }))
@@ -454,6 +576,25 @@ describe('ArtifactsPage — creating a folder', () => {
     await waitFor(() => expect(screen.queryByLabelText('New folder name')).not.toBeInTheDocument())
     expect(m.createArtifactFolder).not.toHaveBeenCalled()
   })
+
+  /** Creating a folder is a gateway write like the rest, and the name field is
+   *  shared with rename — so the offline commit refusal covers this path too, and
+   *  holds the typed name instead of spending it on a write that cannot land. */
+  it('offline the create is refused and the typed name is held, not dropped', async () => {
+    const user = userEvent.setup()
+    const m = seed({ artifacts: [], folders: [] })
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
+
+    await user.click(screen.getByRole('button', { name: /New folder/i }))
+    await user.type(screen.getByLabelText('New folder name'), 'Runbooks')
+    await user.click(screen.getByText('Your Artifacts'))
+
+    expect(m.createArtifactFolder).not.toHaveBeenCalled()
+    const held = screen.getByLabelText('New folder name') as HTMLInputElement
+    expect(held.value).toBe('Runbooks')
+    expect(held.getAttribute('title')).toMatch(/gateway offline/i)
+  })
 })
 
 // ── Folder menu: recolor / move / delete / rename ─────────────────────────
@@ -461,7 +602,7 @@ describe('ArtifactsPage — folder menu', () => {
   it('recolors a folder from the menu swatches, and skips a no-op recolor', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops', { color: '#ef4444' })] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -476,7 +617,7 @@ describe('ArtifactsPage — folder menu', () => {
   it('clears a folder color through the no-color swatch', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops', { color: '#ef4444' })] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -491,7 +632,7 @@ describe('ArtifactsPage — folder menu', () => {
       artifacts: [],
       folders: [mkFolder('ops', 'Ops'), mkFolder('deep', 'Deep', { parent_id: 'ops' })],
     })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Deep' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Deep'))
@@ -509,7 +650,7 @@ describe('ArtifactsPage — folder menu', () => {
       artifacts: [],
       folders: [mkFolder('ops', 'Ops'), mkFolder('deep', 'Deep', { parent_id: 'ops' })],
     })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -528,7 +669,7 @@ describe('ArtifactsPage — folder menu', () => {
       artifacts: [],
       folders: [mkFolder('ops', 'Ops'), mkFolder('deep', 'Deep', { parent_id: 'ops' })],
     })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Deep' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Deep'))
@@ -542,7 +683,7 @@ describe('ArtifactsPage — folder menu', () => {
   it('deletes an empty folder immediately, with no impact dialog', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops', { item_count: 0 })] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -555,7 +696,7 @@ describe('ArtifactsPage — folder menu', () => {
   it('asks before deleting a folder that has contents at stake', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops', { item_count: 4 })] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -569,7 +710,7 @@ describe('ArtifactsPage — folder menu', () => {
   it('closes the delete dialog without deleting when dismissed', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops', { item_count: 4 })] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -586,7 +727,7 @@ describe('ArtifactsPage — folder menu', () => {
       artifacts: [],
       folders: [mkFolder('ops', 'Ops'), mkFolder('deep', 'Deep', { parent_id: 'ops', item_count: 2 })],
     })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Deep' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Deep'))
@@ -605,7 +746,7 @@ describe('ArtifactsPage — folder menu', () => {
   it('drops out of rename mode as soon as the menu closes, writing nothing', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Open folder Ops' })).toBeInTheDocument())
 
     await user.click(folderMenuFor('Ops'))
@@ -734,11 +875,32 @@ describe('ArtifactsPage — folder tree table', () => {
       folders: [],
       docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
     })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
     expect(screen.getByText('/ws/research/FINDINGS.md')).toBeInTheDocument()
     expect(screen.getByText('markdown')).toBeInTheDocument()
     expect(screen.getByLabelText('Star document')).toBeInTheDocument()
+  })
+
+  it('gives session documents their own labelled lane, not the Unfiled one', async () => {
+    seed({
+      // Filed, so the tree renders a collapsed folder and NOTHING is unfiled:
+      // the lane below reads "Unfiled · 0" while a doc row follows it.
+      artifacts: [mkArtifact('filed-one', { folder_id: 'ops' })],
+      folders: [mkFolder('ops', 'Ops', { item_count: 1 })],
+      docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
+    })
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
+
+    const unfiledRow = screen.getByText(/Unfiled ·\s*0/).closest('tr')
+    const docsLane = screen.getByText(/From your chats ·\s*1/).closest('tr')
+    const docRow = screen.getByText('FINDINGS.md').closest('tr')
+    // The doc is announced by its own count, and is no longer the row the
+    // Unfiled lane appears to introduce.
+    expect(unfiledRow?.nextElementSibling).toBe(docsLane)
+    expect(unfiledRow?.nextElementSibling).not.toBe(docRow)
+    expect(docsLane?.nextElementSibling).toBe(docRow)
   })
 
   it('types a .rst session document as text, not markdown', async () => {
@@ -751,7 +913,7 @@ describe('ArtifactsPage — folder tree table', () => {
   it('creates a folder at the root from the table view', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New folder/i }))
@@ -797,10 +959,29 @@ describe('ArtifactsPage — artifact rows', () => {
     await waitFor(() => expect(screen.getByLabelText('Published (sync issue)')).toBeInTheDocument())
   })
 
-  it('stars an artifact from its row', async () => {
+  it('refuses the row star offline instead of dead-clicking it', async () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [mkArtifact('cr-queue', { pinned: false })] })
     renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
+    await user.click(screen.getByLabelText(/Star artifact.*gateway offline/i))
+    expect(m.setArtifactPinned).not.toHaveBeenCalled()
+  })
+
+  it('refuses the row delete offline instead of dead-clicking it', async () => {
+    const user = userEvent.setup()
+    const m = seed({ artifacts: [mkArtifact('cr-queue')] })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderWithProviders(<ArtifactsPage />)
+    await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
+    await user.click(screen.getByLabelText(/Remove from artifacts library.*gateway offline/i))
+    expect(m.deleteArtifact).not.toHaveBeenCalled()
+  })
+
+  it('stars an artifact from its row', async () => {
+    const user = userEvent.setup()
+    const m = seed({ artifacts: [mkArtifact('cr-queue', { pinned: false })] })
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
 
     await user.click(screen.getByLabelText('Star artifact'))
@@ -825,7 +1006,7 @@ describe('ArtifactsPage — artifact rows', () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [mkArtifact('cr-queue')] })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
 
     await user.click(screen.getByLabelText('Remove from artifacts library'))
@@ -851,7 +1032,7 @@ describe('ArtifactsPage — artifact rows', () => {
       artifacts: [mkArtifact('findings-report'), mkArtifact('cr-queue')],
       docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
     })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
     // A name filter flattens the table; matching doc rows come along with it.
@@ -923,7 +1104,7 @@ describe('ArtifactsPage — session document filters', () => {
       folders: [mkFolder('ops', 'Ops')],
       docs: [mkDoc('/ws/a/NOTES.md', 'NOTES.md')],
     })
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByText(/This folder is empty/)).toBeInTheDocument())
     // Documents are unfiled by definition, so the section would be misleading here.
     expect(screen.queryByText('NOTES.md')).not.toBeInTheDocument()
@@ -1003,7 +1184,7 @@ describe('ArtifactsPage — importing a file', () => {
   it('imports a markdown file and files it into the folder being browsed', async () => {
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
     m.createArtifact = vi.fn().mockResolvedValue(mkArtifact('runbook', { kind: 'markdown', content: '# Runbook' }))
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     pick(new File(['# Runbook'], 'runbook.md', { type: 'text/markdown' }))
@@ -1018,7 +1199,7 @@ describe('ArtifactsPage — importing a file', () => {
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
     m.createArtifact = vi.fn().mockResolvedValue(mkArtifact('runbook', { kind: 'markdown', content: '# Runbook' }))
     m.setArtifactFolder = vi.fn().mockRejectedValue(new Error('folder gone'))
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New folder/i })).toBeInTheDocument())
 
     pick(new File(['# Runbook'], 'runbook.md', { type: 'text/markdown' }))
@@ -1143,7 +1324,7 @@ describe('ArtifactsPage — new blank artifact', () => {
     const user = userEvent.setup()
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
     m.createArtifact = vi.fn().mockResolvedValue(mkArtifact('untitled', { kind: 'markdown' }))
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New artifact/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New artifact/i }))
@@ -1157,7 +1338,7 @@ describe('ArtifactsPage — new blank artifact', () => {
     const m = seed({ artifacts: [], folders: [mkFolder('ops', 'Ops')] })
     m.createArtifact = vi.fn().mockResolvedValue(mkArtifact('untitled', { kind: 'markdown' }))
     m.setArtifactFolder = vi.fn().mockRejectedValue(new Error('folder gone'))
-    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops' })
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts?folder=ops', store: connectedStore() })
     await waitFor(() => expect(screen.getByRole('button', { name: /New artifact/i })).toBeInTheDocument())
 
     await user.click(screen.getByRole('button', { name: /New artifact/i }))

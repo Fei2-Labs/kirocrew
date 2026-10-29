@@ -52,6 +52,10 @@ TASKDEF = td.TaskDefinitionSpec(
     secrets=[secret_ref(td.MODEL_CREDENTIAL_ENV), secret_ref(SECOND_SECRET)],
     cpu_architecture="ARM64",
     log=td.default_log_spec(REGION),
+    # A RunTask request carries no volume or mount point at all, so the store cannot
+    # change what this module produces. Stated as absent to say so, rather than to
+    # describe a launch anyone would make.
+    store=None,
 )
 
 PLACEMENT = rt.Placement(cluster="crews", subnets=("subnet-a",), security_groups=("sg-a",))
@@ -194,6 +198,7 @@ def test_the_emitted_family_follows_the_spec_for_every_crew(crew):
         secrets=[other_crew_ref(crew, td.MODEL_CREDENTIAL_ENV)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=None,
     )
     produced = request(taskdef=other, revision=3)
     assert produced["taskDefinition"] == f"{ident.task_family(binding)}:3"
@@ -242,6 +247,7 @@ def test_the_credential_is_refused_even_when_the_spec_does_not_deliver_it():
         secrets=[secret_ref(SECOND_SECRET)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=None,
     )
     assert td.MODEL_CREDENTIAL_ENV not in td.secret_destinations(without_credential)
     with pytest.raises(DocumentRefused, match="derives or refuses"):
@@ -296,6 +302,7 @@ CALLER_OWNED_ENV = {
     "SMC_ROUTE_PREFIX": "the path routes answer on; the caller reaching the task chose it",
     "SMC_BACKUP_BUCKET": "the spec says nothing about buckets, so a value cannot contradict it",
     "SMC_BACKUP_PREFIX": "as the bucket: outside anything the spec or the definition asserts",
+    "SMC_BACKUP_INTERVAL_SECS": "how often the task copies its own state; no assertion here names a cadence",
 }
 
 
@@ -379,14 +386,116 @@ def test_the_derived_values_win_over_nothing_because_a_collision_is_refused():
     assert set(rt.derived_environment(BINDING)) == rt.DERIVED_ENV
 
 
+def _emitted(produced: dict) -> dict[str, str]:
+    """The container override's environment, as a name -> value mapping."""
+    entries = produced["overrides"]["containerOverrides"][0]["environment"]
+    return {entry["name"]: entry["value"] for entry in entries}
+
+
+def test_the_boundary_is_absent_from_the_task_when_the_lane_does_not_claim_it():
+    """Written as "0", always present, never omitted.
+
+    Present-and-zero rather than absent for the reason the lifetime is: the container
+    must never have to tell a launcher that did not claim the boundary apart from one
+    that forgot the variable. The two would read identically, and the reading that
+    matters is a security posture.
+    """
+    emitted = _emitted(request())
+    assert emitted[rt.INTERNAL_ONLY_ENV] == "0"
+
+
+def test_the_boundary_is_carried_into_the_task_when_the_lane_claims_it():
+    """The one thing the claim has to do: reach the container that reads it."""
+    emitted = _emitted(request(internal_only=True))
+    assert emitted[rt.INTERNAL_ONLY_ENV] == "1"
+
+
+def test_a_caller_cannot_claim_the_boundary_the_lane_did_not():
+    """The sharpest reason this name is derived rather than accepted.
+
+    The other three derived names stop a caller CONTRADICTING the spec. This one stops a
+    caller GRANTING a posture: with it the container starts the model subprocess
+    unsandboxed, so a caller who could supply it could hand that to a lane whose operator
+    never claimed the boundary -- which is the entire property the setting carries.
+    """
+    assert rt.INTERNAL_ONLY_ENV in rt.DERIVED_ENV
+    with pytest.raises(DocumentRefused, match="derives or refuses"):
+        request(environment={rt.INTERNAL_ONLY_ENV: "1"})
+    # And the refusal holds when the lane HAS claimed it, so the caller can never be the
+    # one who decides -- agreeing with the lane is not the same as being permitted to say it.
+    with pytest.raises(DocumentRefused, match="derives or refuses"):
+        request(environment={rt.INTERNAL_ONLY_ENV: "1"}, internal_only=True)
+
+
+def test_the_boundary_stays_out_of_the_task_definition():
+    """It belongs in the OVERRIDE, like the lifetime and for the same reason.
+
+    The definition is keyed on its content, so a posture written there would mint a
+    revision per claim, and the digest-pinned document would have to widen to hold a
+    statement about who sends prompts rather than about what the image is.
+    """
+    definition = td.task_definition_document(TASKDEF)
+    assert rt.INTERNAL_ONLY_ENV not in set(strings(definition))
+
+
 def test_an_unrelated_environment_override_is_carried_as_a_sorted_list():
     produced = request(environment={"B": "2", "A": "1"})
     assert produced["overrides"]["containerOverrides"][0]["environment"] == [
         {"name": "A", "value": "1"},
         {"name": "B", "value": "2"},
         {"name": "SMC_CREW_NAME", "value": BINDING.crew},
+        {"name": rt.INTERNAL_ONLY_ENV, "value": "0"},
         {"name": "SMC_SINGLE_PRINCIPAL", "value": "1"},
+        {"name": rt.TASK_TTL_ENV, "value": "0"},
     ]
+
+
+def test_the_task_lifetime_is_carried_into_the_container_override():
+    """A bound the task holds itself is one no future launch has to arrive to apply."""
+    emitted = {
+        e["name"]: e["value"]
+        for e in request(ttl_seconds=3600)["overrides"]["containerOverrides"][0]["environment"]
+    }
+    assert emitted[rt.TASK_TTL_ENV] == "3600"
+
+
+def test_an_absent_lifetime_is_written_as_unbounded():
+    """No lifetime asked for is the behaviour of no lifetime at all, said out loud.
+
+    The variable is always present so the container never has to tell a launcher
+    that means "unbounded" apart from one that forgot to say anything, and ``"0"``
+    is what the container reads as no deadline.
+    """
+    for produced in (request(), request(ttl_seconds=0)):
+        emitted = {
+            e["name"]: e["value"]
+            for e in produced["overrides"]["containerOverrides"][0]["environment"]
+        }
+        assert emitted[rt.TASK_TTL_ENV] == "0"
+
+
+def test_a_caller_cannot_supply_the_task_lifetime():
+    """The bound is a cost cap, so the channel that could raise it stays closed.
+
+    A caller who could name this could name a lifetime longer than the sweep's and
+    keep a task past the bound the launcher enforces, which is opting out of the
+    cap rather than configuring it.
+    """
+    assert rt.TASK_TTL_ENV in rt.DERIVED_ENV
+    assert rt.TASK_TTL_ENV in rt.CLOSED_ENV
+    with pytest.raises(DocumentRefused, match="derives or refuses"):
+        request(environment={rt.TASK_TTL_ENV: "999999"})
+
+
+def test_a_negative_lifetime_is_refused_at_generation():
+    """A deadline already past would cost a task that never did any work.
+
+    Refused here rather than at the container's own startup check, for the reason
+    the whole module exists: a launch-time failure is harder to read than a
+    generation-time one, and this one would arrive as a container fault.
+    """
+    with pytest.raises(DocumentRefused, match="not a lifetime"):
+        request(ttl_seconds=-1)
 
 
 def test_the_container_override_addresses_the_crew_container_by_name():
@@ -409,12 +518,17 @@ def test_the_image_command_cannot_be_replaced():
 
 
 def test_the_derived_identity_is_emitted_even_with_no_caller_environment():
-    """The crew and the trust domain are written by this module, not requested."""
+    """The crew, the trust domain, the boundary and the lifetime are written, not requested."""
     produced = request()
     container_override = produced["overrides"]["containerOverrides"][0]
     assert set(container_override) == {"name", "environment"}
     emitted = {e["name"]: e["value"] for e in container_override["environment"]}
-    assert emitted == {"SMC_CREW_NAME": BINDING.crew, "SMC_SINGLE_PRINCIPAL": "1"}
+    assert emitted == {
+        "SMC_CREW_NAME": BINDING.crew,
+        "SMC_SINGLE_PRINCIPAL": "1",
+        rt.TASK_TTL_ENV: "0",
+        rt.INTERNAL_ONLY_ENV: "0",
+    }
     assert "ephemeralStorage" not in produced["overrides"]
 
 
@@ -461,6 +575,8 @@ INPUT_DISPOSITION = {
     ("run_task_request", "launch_tag"): "caller",
     ("run_task_request", "environment"): "closed",
     ("run_task_request", "started_by"): "caller",
+    ("run_task_request", "ttl_seconds"): "closed",
+    ("run_task_request", "internal_only"): "closed",
     # Placement fields
     ("Placement", "cluster"): "caller",
     ("Placement", "subnets"): "caller",
@@ -475,6 +591,10 @@ INPUT_DISPOSITION = {
     ("TaskDefinitionSpec", "secrets"): "closed",
     ("TaskDefinitionSpec", "cpu_architecture"): "closed",
     ("TaskDefinitionSpec", "log"): "closed",
+    ("TaskDefinitionSpec", "store"): "closed",
+    # StoreSpec fields
+    ("StoreSpec", "file_system_id"): "closed",
+    ("StoreSpec", "access_point_id"): "closed",
     # LogSpec fields
     ("LogSpec", "region"): "caller",
     ("LogSpec", "stream_prefix"): "caller",
@@ -498,6 +618,7 @@ DERIVED_IN_PAYLOAD = frozenset(
         "awslogs-group",
         "SMC_CREW_NAME",
         "SMC_SINGLE_PRINCIPAL",
+        rt.TASK_TTL_ENV,
         MANAGED_TAG_KEY,
         td.FINGERPRINT_TAG_KEY,
         td.CREW_TAG_KEY,
@@ -518,6 +639,7 @@ def test_every_caller_supplied_field_has_a_disposition():
         ("TaskSize", rt.TaskSize),
         ("TaskDefinitionSpec", td.TaskDefinitionSpec),
         ("LogSpec", td.LogSpec),
+        ("StoreSpec", td.StoreSpec),
     ):
         declared |= {(name, f.name) for f in dataclasses.fields(obj)}
     signature = inspect.signature(rt.run_task_request)
@@ -708,6 +830,7 @@ def test_a_request_built_from_a_definition_naming_two_crews_is_refused():
         ],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=None,
     )
     with pytest.raises(DocumentRefused):
         request(taskdef=crossed)

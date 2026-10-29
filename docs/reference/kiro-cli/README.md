@@ -1,17 +1,23 @@
 # Kiro CLI Documentation
 
 Offline mirror of the `kiro-cli` documentation. Nothing constrains the CLI to a
-particular line at runtime: `acp/client.py` launches whichever `kiro-cli` is on
-PATH, and `kiro_prerequisite.py`'s `KIRO_CLI_UPDATE_COMMAND` is an unversioned
-`kiro-cli update`. The only version number in the code is a feature floor —
-`mcp_hot_reload.py`'s `MCP_HOT_RELOAD_MIN_KIRO_CLI_VERSION` of 2.21.0, which
-decides whether MCP hot reload is available and which a 3.x CLI also satisfies.
+particular line at runtime. `acp/client_spawn_env.py` finds the binary with
+`kiro_cli.resolve_kiro_cli`: the `KIROCREW_KIRO_BIN` override first, then the
+desktop app's bundled directory, the known install directories, and the
+inherited `PATH`. Unattended spawns use `kiro_cli.pin_kiro_cli`, which drops the
+inherited `PATH` and accepts only an absolute path. `kiro_prerequisite_status.py`'s
+`KIRO_CLI_UPDATE_COMMAND` is an unversioned `kiro-cli update`. The version
+numbers in the code are feature floors, each a lowest probed release rather than
+a supported range, and a 3.x CLI satisfies all of them: `mcp_hot_reload.py`'s
+`MCP_HOT_RELOAD_MIN_KIRO_CLI_VERSION` (2.21.0, MCP hot reload) and
+`kiro_cli.py`'s `SPEC_PERMISSIONS_MIN_VERSION` (2.23.0, the agent-spec
+`permissions` block) and `MANDATORY_MCPS_DROP_MIN_VERSION` (2.27.0, deferring
+Crew's MCP servers under Tool Search).
 So these pages describe what upstream published on the fetch date recorded per
 row, not a supported-version contract.
 
-**Upstream is now on the CLI 3.0 line, and reorganised its information
-architecture again.** Feature pages that were CLI-scoped are now
-surface-agnostic: `/docs/cli/installation/` became
+**Upstream is on the CLI 3.0 line, whose information architecture is
+surface-agnostic.** The CLI-scoped paths feature pages once used redirect: `/docs/cli/installation/` became
 `/docs/getting-started/installation/`, `/docs/cli/custom-agents/**` became
 `/docs/custom-agents/**`, `/docs/cli/mcp/**` became `/docs/mcp/**`,
 `/docs/cli/reference/slash-commands/` became `/docs/reference/slash-commands/`,
@@ -49,7 +55,7 @@ content; each is marked in the page. A re-fetch must preserve them.
 | [chat/model-selection.md](chat/model-selection.md) | /docs/models/ and /docs/models/available-models/ — reasoning-effort behaviour is documented first-party and more precisely in [providers](../../system-specs/modules/providers.md) | 2026-09-06 |
 | [chat/session-management.md](chat/session-management.md) | /docs/cli/chat/session-management/ | 2026-09-06 |
 | [chat/subagents.md](chat/subagents.md) | /docs/custom-agents/subagents/ — describes **upstream's** subagent model, not Kiro Crew's; [subagent](../../system-specs/modules/subagent.md) owns the shipped `spawn_run` / `spawn_continue` contract | 2026-09-06 |
-| [chat/voice.md](chat/voice.md) | **Not a mirror**, and the one page here with no upstream source: Kiro Crew's own voice setup, speech-to-text in (local by default) and text-to-speech out (system by default, plus Piper or Amazon Polly), across the dashboard and supported messaging channels. Its behavioral contracts live in [stt-streaming](../../system-specs/modules/stt-streaming.md) and [voice-streaming](../../system-specs/modules/voice-streaming.md); its settings reference is [configuration](../../../src/kiro_crew/docs/configuration.md). | n/a |
+| [chat/voice.md](chat/voice.md) | **Not a mirror**, and the one page here with no upstream source: Kiro Crew's own voice setup, speech-to-text in (local by default) and text-to-speech out (system by default, or Amazon Polly), across the dashboard and supported messaging channels. Its behavioral contracts live in [stt-streaming](../../system-specs/modules/stt-streaming.md) and [voice-streaming](../../system-specs/modules/voice-streaming.md); its settings reference is [configuration](../../../src/kiro_crew/docs/configuration.md). | n/a |
 | [steering.md](steering.md) | /docs/steering/ — plus local measurement of what kiro-cli does with `inclusion` | 2026-09-06 |
 | [skills.md](skills.md) | /docs/skills/ | 2026-09-06 |
 | [hooks.md](hooks.md) | /docs/hooks/ and its `types` and `actions` subpages — plus Kiro Crew's fail-closed `PreToolUse` exit contract, which has no upstream counterpart | 2026-09-06 |

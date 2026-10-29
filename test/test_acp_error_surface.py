@@ -80,6 +80,35 @@ _MALFORMED_REQUEST = {
     "data": "Improperly formed request. (request_id: 863ae6fe-de1d-4149-b3ff-6ee02d8d58a2)",
 }
 
+# Exact user-facing shape captured from kiro-cli after a read_file image result
+# poisoned the retained native history. Later text-only turns returned the same
+# frame because the old image block was replayed on every request.
+_IMAGE_FORMAT_UNSUPPORTED = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": (
+        "Could not process image (Request ID: "
+        "acec2dfe-d396-4597-9621-16631c3474a9): "
+        "{'errorType': 'ImageValidationError', "
+        "'retryErrorType': 'CLIENT_ERROR'}"
+    ),
+}
+
+# kiro-cli's OWN refusal of an oversized request: the context overflowed and the
+# pending message cannot be shrunk (image blocks have no truncated form), so no
+# compaction round can make the request fit. Surfaced as an agent-loop error,
+# which the ACP server maps to `internal_error(text)` -- the sentence rides in
+# `data`, `message` is the -32603 boilerplate. Observed verbatim on a gateway
+# whose nudge loop re-inlined the same screenshot every cycle.
+_OVERSIZED_REQUEST = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": (
+        "This message is too large to send, and it contains no text that can "
+        "be shortened. Remove or reduce the attached content and try again."
+    ),
+}
+
 
 def _handle() -> AcpSessionHandle:
     rt = MagicMock()
@@ -112,6 +141,49 @@ async def _raise_via_dispatch(error: dict, models: list[dict] | None = None) -> 
         async for _ev in h._dispatch_events(7, timeout=5.0):
             pass
     return ei.value
+
+
+async def _raise_on_backend(error: dict, backend: str, driver) -> BaseException:
+    """Drive *error* through a handle whose runtime reports *backend*.
+
+    The shared handle is the path every dashboard chat takes, so this is where
+    the throttle wording's backend dependency has to be exercised: the two
+    raise sites must forward ``self._runtime.acp_backend``.
+    """
+    h = _handle()
+    h._runtime.acp_backend = backend
+    h._queue.put_nowait(JsonRpcMessage(id=7, error=error))
+    if driver is _raise_via_wait:
+        with pytest.raises(AcpError) as ei:
+            await h._wait_for_response(7, timeout=5.0)
+    else:
+        with pytest.raises(AcpError) as ei:
+            async for _ev in h._dispatch_events(7, timeout=5.0):
+                pass
+    return ei.value
+
+
+class TestThrottleWordingThroughTheSharedHandle:
+    """The throttle subject is chosen from the backend the handle forwards. A
+    Claude seat runs on the shared ``AcpSessionHandle``; if the raise sites drop
+    the backend, its throttle reads "Bedrock" (the empty-string kiro id is the
+    default) and the whole fix is undone on the path that matters most.
+    """
+
+    _THROTTLE = {"code": -32603, "message": "Internal error", "data": "ThrottlingException"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_non_kiro_runtime_says_the_model_provider(self, driver):
+        msg = str(await _raise_on_backend(self._THROTTLE, "claude", driver))
+        assert "Bedrock" not in msg
+        assert "The model provider is throttling requests" in msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_kiro_runtime_still_says_bedrock(self, driver):
+        msg = str(await _raise_on_backend(self._THROTTLE, "", driver))
+        assert "Bedrock is throttling requests" in msg
 
 
 class TestNoRawDictInUserFacingError:
@@ -271,7 +343,10 @@ class TestNamelessCapacityWording:
         """Providers flip between straight and curly quotes; both must match."""
         from kiro_crew.acp.client import _is_transient_raw_error
 
-        curly = dict(_MODEL_TEMP_UNAVAILABLE, data="The model you\u2019ve selected is temporarily unavailable.")
+        curly = dict(
+            _MODEL_TEMP_UNAVAILABLE,
+            data="The model you\u2019ve selected is temporarily unavailable.",
+        )
         assert _is_transient_raw_error(curly) is True
 
     def test_pre_rewrite_passthrough_still_classifies_via_marker(self):
@@ -283,6 +358,58 @@ class TestNamelessCapacityWording:
         from kiro_crew.llm_helpers import is_transient_backend_error
 
         assert is_transient_backend_error(str(_MODEL_TEMP_UNAVAILABLE["data"]))
+
+
+class TestImageFormatUnsupportedReachesTheHandlePath:
+    """Unsupported image data is structural, typed, and actionable."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_image_rejection_is_actionable_and_preserves_request_id(self, driver):
+        exc = await driver(_IMAGE_FORMAT_UNSUPPORTED)
+        msg = str(exc)
+
+        assert "could not process an image" in msg.lower()
+        assert "PNG or JPEG" in msg
+        assert "new conversation" in msg.lower()
+        assert "acec2dfe-d396-4597-9621-16631c3474a9" in msg
+        assert "'errorType'" not in msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_image_rejection_carries_terminal_structural_subtype(self, driver):
+        exc = await driver(_IMAGE_FORMAT_UNSUPPORTED)
+
+        assert exc.transient is False
+        assert exc.structural_terminal is True
+        assert exc.image_format_unsupported is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_image_rejection_outranks_cooccurring_transient_wrapper(self, driver):
+        error = dict(
+            _IMAGE_FORMAT_UNSUPPORTED,
+            data=_IMAGE_FORMAT_UNSUPPORTED["data"] + " InternalServerError; please try again",
+        )
+        exc = await driver(error)
+
+        assert exc.transient is False
+        assert exc.image_format_unsupported is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_message_only_echo_does_not_tag_image_rejection(self, driver):
+        exc = await driver(
+            {
+                "code": -32603,
+                "message": "ImageValidationError",
+                "data": "InternalServerError: temporary backend fault",
+            }
+        )
+
+        assert exc.transient is True
+        assert exc.structural_terminal is False
+        assert exc.image_format_unsupported is False
 
 
 class TestRunnerPromptBusyIsStructural:
@@ -415,7 +542,11 @@ class TestTransientMarkerCoupling:
         from kiro_crew.acp.client import _format_acp_error, _is_transient_raw_error
 
         served = ["gpt-5.6-sol", "glm-5"]
-        error = {"code": -32603, "message": "Internal error", "data": "ValidationException: Invalid model ID: auto"}
+        error = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "ValidationException: Invalid model ID: auto",
+        }
         formatted = _format_acp_error(error, served)
         assert "does not have access to model 'auto'" in formatted
         assert "not available on your account" in formatted
@@ -444,7 +575,9 @@ class TestTransientMarkerCoupling:
         # Unknown served list keeps the historical three-step advice.
         assert "set agent.model to 'auto'" in _format_acp_error(_MODEL_UNAVAILABLE, None)
 
-        unnamed = dict(_MODEL_UNAVAILABLE, data="The model you've selected is temporarily unavailable.")
+        unnamed = dict(
+            _MODEL_UNAVAILABLE, data="The model you've selected is temporarily unavailable."
+        )
         assert "set agent.model to 'auto'" not in _format_acp_error(unnamed, no_auto)
         assert "set agent.model to 'auto'" in _format_acp_error(unnamed, with_auto)
 
@@ -470,7 +603,9 @@ class TestTransientMarkerCoupling:
             # wording iff served ('claude-opus-4.8' is absent from both lists).
             formatted = _format_acp_error(_MODEL_UNAVAILABLE, advertised)
             assert "does not have access to model 'claude-opus-4.8'" in formatted
-            assert ("agent.model to 'auto' in ~/.kiro/crew/config.json to let" in formatted) is served
+            assert (
+                "agent.model to 'auto' in ~/.kiro/crew/config.json to let" in formatted
+            ) is served
 
 
 class TestConnectionErrorClassification:
@@ -557,7 +692,7 @@ class TestMalformedRequestReachesTheHandlePath:
 
         This error is TERMINAL, so a channel dispatcher hands the formatted
         string straight to the user (telegram's ``_user_safe_failure_reason``
-        only surfaces ``transient is False``). The formatter does not know which
+        surfaces a user-worded, non-retryable error). The formatter does not know which
         surface will render it, so it may name only commands spelled the same
         everywhere. ``/chat new`` was not one: it exists nowhere in the product
         (``/new`` on Telegram and Discord, a new tab on the dashboard), so the
@@ -629,3 +764,216 @@ class TestMalformedRequestReachesTheHandlePath:
         exc = await driver(usage)
         assert exc.transient is False
         assert exc.structural_terminal is False
+
+
+class TestOversizedRequestReachesTheHandlePath:
+    """kiro-cli's own oversized-request refusal is structural, like a malformed one.
+
+    The refusal is deterministic in the payload's SIZE: kiro-cli emits it only
+    after deciding no compaction round can make the request fit, without
+    compacting, and the failed message is never appended to the native history,
+    so the state after the failure is identical to the state before it. A
+    self-driving loop that re-sends the same context therefore reproduces it on
+    every cycle -- the exact property ``structural_terminal`` exists to name --
+    and before this class existed the sentence fell through to the unknown-shape
+    branch with an incidental terminal verdict and NO structural tag, so the
+    auto-nudge loop kept firing the doomed context until ``max_cycles``.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_oversized_request_is_tagged_structural_terminal(self, driver):
+        exc = await driver(_OVERSIZED_REQUEST)
+
+        assert exc.transient is False
+        assert exc.structural_terminal is True
+        # Not an image-validator rejection: that tag drives a different recovery
+        # (discarding the native conversation), which must not fire here.
+        assert exc.image_format_unsupported is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_oversized_request_surfaces_the_providers_own_sentence(self, driver):
+        """No curated copy: the refusal already names the remedy, so the user
+        sees kiro-cli's words, not the raw dict and not a retry suggestion."""
+        msg = str(await driver(_OVERSIZED_REQUEST))
+
+        assert "'code': -32603" not in msg
+        assert "Internal error" not in msg
+        assert "too large to send" in msg
+        assert "Remove or reduce the attached content" in msg
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_oversized_request_outranks_cooccurring_transient_wrapper(self, driver):
+        """The sentence ends in "try again"; a retry hint or a 5xx wrapper riding
+        along must not turn a size verdict into a momentary blip."""
+        error = dict(
+            _OVERSIZED_REQUEST,
+            data=_OVERSIZED_REQUEST["data"] + " InternalServerError; please try again",
+        )
+        exc = await driver(error)
+
+        assert exc.transient is False
+        assert exc.structural_terminal is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_message_only_echo_is_not_tagged_oversized(self, driver):
+        """Same ``data``-only scope as its siblings: the phrase carried only by
+        the JSON-RPC ``message`` beside a real transient fault stays transient."""
+        echo = {
+            "code": -32603,
+            "message": "This message is too large to send",
+            "data": "InternalServerError: the backend hiccupped",
+        }
+        exc = await driver(echo)
+
+        assert exc.structural_terminal is False
+        assert exc.transient is True
+
+
+# The frame a Claude-on-Bedrock backend answers with once the AWS credentials
+# its process cached cannot be loaded any more (the credential helper rotated
+# them underneath the long-lived process; a chat started fresh in the same
+# window works). The kind arrives STRUCTURALLY in ``data`` -- the formatter's
+# unknown-shape branch pastes the dict's repr onto the message, which is where
+# the ``: {'errorKind': ...}`` tail in the transcript comes from.
+_CLOUD_CREDENTIAL_ERROR = {
+    "code": -32603,
+    "message": (
+        "Internal error: API Error: Could not load AWS credentials · "
+        "Could not load credentials from any providers. Check or refresh "
+        "your AWS credentials and try again."
+    ),
+    "data": {"errorKind": "cloud_credential_error"},
+}
+
+
+class TestCloudCredentialErrorNamesAFreshProcess:
+    """A stale-credential answer must route the backend into a reload, not a retry.
+
+    The backend PROCESS answered, so nothing marks it dead and the dead-provider
+    eviction never fires -- but its credential cache is stale, so every retry on
+    this same process draws the identical answer while a fresh process loads
+    fresh credentials. ``_raise_acp_error`` therefore tags the frame
+    (``credential_reload``) from the structured ``data.errorKind``, and
+    ``acp_error_is_session_not_found`` routes the tag down the same
+    reset-and-reload-once path a dropped session takes. The tag is deliberately
+    NOT ``auth_required``: that tag offers the Kiro sign-in card, which would
+    sign in the wrong identity for a harness that loads its own credentials.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_credential_frame_is_tagged_for_a_process_reload(self, driver):
+        assert (await driver(_CLOUD_CREDENTIAL_ERROR)).credential_reload is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_credential_frame_verdict_is_terminal(self, driver):
+        """A retry on the stuck process cannot succeed, so the verdict is pinned.
+
+        Pinned rather than left to the classifier: the prose ends in "try
+        again", and a future rewording that trips a retry-hint pattern must not
+        point a retry ladder back at the process that cannot reload.
+        """
+        assert (await driver(_CLOUD_CREDENTIAL_ERROR)).transient is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_credential_frame_stays_terminal_when_the_prose_reads_as_a_retry(self, driver):
+        """The pin is what holds the verdict: wording that trips the retry hint
+        ("please try again") would read transient without it."""
+        reworded = dict(
+            _CLOUD_CREDENTIAL_ERROR,
+            message="Internal error: Could not load AWS credentials. Please try again.",
+        )
+        exc = await driver(reworded)
+
+        assert exc.credential_reload is True
+        assert exc.transient is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_credential_frame_does_not_offer_the_kiro_sign_in_card(self, driver):
+        """``auth_required`` stays unset: the Kiro sign-in card is not the fix.
+
+        The harness (claude) signs in through its own credential helper, so the
+        card would sign in the wrong thing (harness parity H6). The remedy this
+        error names is a fresh process, carried by ``credential_reload``.
+        """
+        exc = await driver(_CLOUD_CREDENTIAL_ERROR)
+
+        assert exc.auth_required is False
+        assert exc.credential_reload is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_credential_frame_carries_no_other_tag(self, driver):
+        """The answer is none of the other tagged families.
+
+        Not structural-terminal (a fresh process CAN succeed, so a new context
+        is not the problem) and not a connection failure (the network path
+        answered; the provider rejection came back on it).
+        """
+        exc = await driver(_CLOUD_CREDENTIAL_ERROR)
+
+        assert exc.structural_terminal is False
+        assert not exc.connection_failure
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_credential_frame_keeps_the_providers_remedy_prose(self, driver):
+        """The provider's own sentence survives formatting (redaction aside)."""
+        assert "Could not load AWS credentials" in str(await driver(_CLOUD_CREDENTIAL_ERROR))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_unknown_error_kind_is_not_tagged(self, driver):
+        """Only the named kind tags the error: the generic ``unknown`` kind the
+        adapter puts on a plain 500 (see the ``_RE_5XX_HINT`` note) must stay
+        untagged, or every opaquely-wrapped blip would recycle the backend."""
+        exc = await driver(
+            {"code": -32603, "message": "Internal error", "data": {"errorKind": "unknown"}}
+        )
+
+        assert exc.credential_reload is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", [_raise_via_wait, _raise_via_dispatch])
+    async def test_kind_name_in_prose_is_not_read(self, driver):
+        """The tag reads the STRUCTURED field, never the message or a stringified
+        ``data``: the formatter pastes a string ``data`` verbatim into the user
+        text, so a repr or prose mention there must not stamp the tag."""
+        as_prose = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "API Error: Could not load AWS credentials · Check or refresh "
+                "your AWS credentials and try again.: {'errorKind': "
+                "'cloud_credential_error'}"
+            ),
+        }
+        exc = await driver(as_prose)
+
+        assert exc.credential_reload is False
+
+    @pytest.mark.asyncio
+    async def test_no_data_field_at_all_is_not_tagged(self):
+        from kiro_crew.acp.client import AcpError
+        from kiro_crew.acp.transport_errors import _raise_acp_error
+
+        with pytest.raises(AcpError) as ei:
+            _raise_acp_error({"code": -32603, "message": "Internal error"})
+        assert ei.value.credential_reload is False
+
+    @pytest.mark.asyncio
+    async def test_non_dict_error_object_is_not_tagged(self):
+        """A raise site handed a bare string (no frame at all) stays untagged."""
+        from kiro_crew.acp.client import AcpError
+        from kiro_crew.acp.transport_errors import _raise_acp_error
+
+        with pytest.raises(AcpError) as ei:
+            _raise_acp_error("the transport died")
+        assert ei.value.credential_reload is False

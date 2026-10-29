@@ -10,67 +10,54 @@ watchdog, the backend acquire/respawn helpers, and the CLI entry points.
 Everything here is driven with in-memory doubles -- no socket is bound, no
 subprocess is spawned, and every filesystem write lands under ``tmp_path`` or
 the per-test ``KIROCREW_HOME`` that Kiro Crew's conftest pins.
+
+This file pins the CLI socket default, the periodic sweepers, the shutdown outstanding-work
+check, the credential-change drain and rewarm, the abort frame, the SEL audit emitters, the
+frame codec, the stub inbox drain, declared env and target resolution, the zombie-diagnostic
+watchdog and its probes, the CLI entry points, the metric emitters, and register-PID
+extraction with the connection index. Backend acquire and the respawn cases
+(``_acquire_backend``, ``_respawn_backend_for_stub``) live in
+``test_mcp_gatewayd_coverage_acquire_respawn.py``, and the shared doubles, ``_await_kwargs``,
+``_drain_task`` and the autouse registry reset in ``mcp_gatewayd_coverage_helpers.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
-import logging
 import os
 import sys
-import threading
-import time
 from pathlib import Path
 from typing import Any, Optional, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp_gatewayd_coverage_helpers import (  # noqa: F401 -- the autouse fixture registers by import
+    _await_kwargs,
+    _clean_gateway_globals,
+    _drain_task,
+    _fake_backend,
+    _FakeWriter,
+    _pool_key,
+)
 
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_gateway import gatewayd as gw
-from kiro_crew.mcp_gateway.backend import Backend, BackendGone
 from kiro_crew.mcp_gateway.hashing import hash_effective_env
-from kiro_crew.mcp_gateway.pool import BackendPool, BackendUnavailable, PoolKey
+from kiro_crew.mcp_gateway.pool import BackendPool, PoolKey
 from kiro_crew.mcp_gateway.rewriter import (
     env_sidecar_dir,
     env_sidecar_name,
     resolve_overlay_dir,
 )
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
 _POSIX_ONLY = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX-only fallback shape (Windows uses ctypes)"
 )
-
-
-# --- doubles -----------------------------------------------------------------
-
-
-class _FakeWriter:
-    """``asyncio.StreamWriter`` double recording writes, optionally failing."""
-
-    def __init__(
-        self, *, fail: Optional[BaseException] = None, hang: bool = False
-    ) -> None:
-        self.writes: list[bytes] = []
-        self.drains = 0
-        self._fail = fail
-        self._hang = hang
-
-    def write(self, payload: bytes) -> None:
-        self.writes.append(payload)
-
-    async def drain(self) -> None:
-        self.drains += 1
-        if self._hang:
-            await asyncio.sleep(3600)
-        if self._fail is not None:
-            raise self._fail
-
-    def frames(self) -> list[Any]:
-        return [json.loads(p.decode("utf-8")) for p in self.writes]
 
 
 class _FakeReader:
@@ -84,76 +71,6 @@ class _FakeReader:
         if self._exc is not None:
             raise self._exc
         return self._line
-
-
-def _pool_key(server: str = "demo-mcp", agent: str = "cov-agent", env_hash: str = "e" * 8) -> PoolKey:
-    return PoolKey(
-        server_name=server,
-        agent_name=agent,
-        command_args_hash="a" * 8,
-        effective_env_hash=env_hash,
-        work_dir="/tmp/cov",
-        binary_version="1.0",
-        os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="b" * 8,
-        approval_mode="reads",
-        trust_all_tools=False,
-        config_snapshot_hash="c" * 8,
-    )
-
-
-async def _noop_pump() -> None:
-    return None
-
-
-def _fake_backend(key: Optional[PoolKey] = None, pid: int = 4242) -> Backend:
-    """A ``Backend`` over mock pipes: alive, with an inert stdout pump."""
-    proc = MagicMock()
-    proc.returncode = None
-    proc.pid = pid
-    stdin = MagicMock()
-    stdin.write = MagicMock()
-    stdin.drain = AsyncMock()
-    now = time.monotonic()
-    backend = Backend(
-        pool_key=key or _pool_key(),
-        process=proc,
-        stdin=stdin,
-        stdout=MagicMock(),
-        created_at=now,
-        last_used_at=now,
-    )
-    # Never read the mock stdout: the acquire path starts the pump as a task.
-    backend.run_stdout_pump = _noop_pump  # type: ignore[method-assign]
-    return backend
-
-
-def _await_kwargs(mock: Any) -> dict[str, Any]:
-    """Keyword arguments of a mock's most recent await (fails loudly if none)."""
-    assert mock.await_args is not None, "expected the mock to have been awaited"
-    return dict(mock.await_args.kwargs)
-
-
-async def _drain_task(task: Optional[asyncio.Task[Any]]) -> None:
-    """Cancel and await a helper-created task so nothing outlives the test."""
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except (asyncio.CancelledError, Exception):
-        pass
-
-
-@pytest.fixture(autouse=True)
-def _clean_gateway_globals():
-    """gatewayd keeps process-global stub/PID registries; never leak between tests."""
-    gw._STUB_PROBES.clear()
-    gw._CONN_INDEX.clear()
-    yield
-    gw._STUB_PROBES.clear()
-    gw._CONN_INDEX.clear()
 
 
 # --- CLI socket default ------------------------------------------------------
@@ -182,15 +99,10 @@ class TestIdleSweeper:
         pool = MagicMock()
         pool.evict_idle = AsyncMock(return_value=2)
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._idle_sweeper(cast(Any, pool), 300, 0.01, stop)
-        )
-        for _ in range(200):
-            if pool.evict_idle.await_count:
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._idle_sweeper(cast(Any, pool), 300, 0.01, stop))
+        await async_wait_until(lambda: bool(pool.evict_idle.await_count))
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert pool.evict_idle.await_count >= 1
         pool.evict_idle.assert_awaited_with(300)
 
@@ -200,9 +112,7 @@ class TestIdleSweeper:
         pool.evict_idle = AsyncMock(return_value=0)
         stop = asyncio.Event()
         stop.set()
-        await asyncio.wait_for(
-            gw._idle_sweeper(cast(Any, pool), 300, 0.01, stop), timeout=5
-        )
+        await await_until(asyncio.create_task(gw._idle_sweeper(cast(Any, pool), 300, 0.01, stop)))
         pool.evict_idle.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -214,7 +124,7 @@ class TestIdleSweeper:
         await asyncio.sleep(0)
         task.cancel()
         # The sweeper absorbs CancelledError rather than propagating it.
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert task.done() and not task.cancelled()
 
     @pytest.mark.asyncio
@@ -226,7 +136,7 @@ class TestIdleSweeper:
         task = asyncio.create_task(gw._idle_sweeper(cast(Any, pool), 300, 30.0, stop))
         await asyncio.sleep(0.05)
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         pool.evict_idle.assert_not_awaited()
 
 
@@ -237,15 +147,10 @@ class TestHotKeysFlushSweeper:
         hot.flush = MagicMock(return_value=True)
         hot.path = "hot-keys.json"
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._hot_keys_flush_sweeper(cast(Any, hot), 0.01, stop)
-        )
-        for _ in range(200):
-            if hot.flush.call_count:
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._hot_keys_flush_sweeper(cast(Any, hot), 0.01, stop))
+        await async_wait_until(lambda: bool(hot.flush.call_count))
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert hot.flush.call_count >= 1
 
     @pytest.mark.asyncio
@@ -254,15 +159,10 @@ class TestHotKeysFlushSweeper:
         hot.flush = MagicMock(return_value=False)
         hot.path = "hot-keys.json"
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._hot_keys_flush_sweeper(cast(Any, hot), 0.01, stop)
-        )
-        for _ in range(200):
-            if hot.flush.call_count:
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._hot_keys_flush_sweeper(cast(Any, hot), 0.01, stop))
+        await async_wait_until(lambda: bool(hot.flush.call_count))
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert hot.flush.call_count >= 1
 
     @pytest.mark.asyncio
@@ -272,12 +172,10 @@ class TestHotKeysFlushSweeper:
         hot.flush = MagicMock(return_value=True)
         hot.path = "hot-keys.json"
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._hot_keys_flush_sweeper(cast(Any, hot), 30.0, stop)
-        )
+        task = asyncio.create_task(gw._hot_keys_flush_sweeper(cast(Any, hot), 30.0, stop))
         await asyncio.sleep(0.05)
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         hot.flush.assert_not_called()
 
     @pytest.mark.asyncio
@@ -285,12 +183,10 @@ class TestHotKeysFlushSweeper:
         hot = MagicMock()
         hot.flush = MagicMock(return_value=False)
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._hot_keys_flush_sweeper(cast(Any, hot), 30.0, stop)
-        )
+        task = asyncio.create_task(gw._hot_keys_flush_sweeper(cast(Any, hot), 30.0, stop))
         await asyncio.sleep(0)
         task.cancel()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert task.done() and not task.cancelled()
 
 
@@ -299,15 +195,10 @@ class TestPrewarmTopupSweeper:
     async def test_triggers_scheduler_each_interval(self):
         calls: list[int] = []
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._prewarm_topup_sweeper(lambda: calls.append(1), 0.01, stop)
-        )
-        for _ in range(200):
-            if calls:
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._prewarm_topup_sweeper(lambda: calls.append(1), 0.01, stop))
+        await async_wait_until(lambda: bool(calls))
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert calls
 
     @pytest.mark.asyncio
@@ -315,8 +206,8 @@ class TestPrewarmTopupSweeper:
         calls: list[int] = []
         stop = asyncio.Event()
         stop.set()
-        await asyncio.wait_for(
-            gw._prewarm_topup_sweeper(lambda: calls.append(1), 0.01, stop), timeout=5
+        await await_until(
+            asyncio.create_task(gw._prewarm_topup_sweeper(lambda: calls.append(1), 0.01, stop))
         )
         assert calls == []
 
@@ -324,23 +215,19 @@ class TestPrewarmTopupSweeper:
     async def test_stop_event_during_the_wait_skips_the_top_up(self):
         calls: list[int] = []
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._prewarm_topup_sweeper(lambda: calls.append(1), 30.0, stop)
-        )
+        task = asyncio.create_task(gw._prewarm_topup_sweeper(lambda: calls.append(1), 30.0, stop))
         await asyncio.sleep(0.05)
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert calls == []
 
     @pytest.mark.asyncio
     async def test_cancellation_is_swallowed(self):
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._prewarm_topup_sweeper(lambda: None, 30.0, stop)
-        )
+        task = asyncio.create_task(gw._prewarm_topup_sweeper(lambda: None, 30.0, stop))
         await asyncio.sleep(0)
         task.cancel()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert task.done() and not task.cancelled()
 
 
@@ -380,35 +267,46 @@ class _SweeperPool:
         self.reaped.extend(out)
         return out
 
-    def live_backend_pids(self) -> list[int]:
-        return list(self._pids)
+    def live_backend_identities(self) -> list[tuple[int, Optional[str]]]:
+        return [(pid, f"start-{pid}") for pid in self._pids]
 
 
 async def _run_one_heartbeat_sweep(pool: Any, pidfile: Optional[Path] = None) -> None:
     stop = asyncio.Event()
-    task = asyncio.create_task(
-        gw._heartbeat_sweeper(cast(Any, pool), 0.01, stop, pidfile)
+    task = asyncio.create_task(gw._heartbeat_sweeper(cast(Any, pool), 0.01, stop, pidfile))
+    await async_wait_until(
+        lambda: bool(
+            pool.deaths
+            or pool.healthy
+            or pool.evicted
+            or pool.reaped
+            or (pidfile is not None and pidfile.exists())
+        )
     )
-    for _ in range(300):
-        if pool.deaths or pool.healthy or pool.evicted or pool.reaped or (
-            pidfile is not None and pidfile.exists()
-        ):
-            break
-        await asyncio.sleep(0.01)
     stop.set()
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(task)
 
 
 class TestHeartbeatSweeper:
     @pytest.mark.asyncio
-    async def test_gone_backend_is_evicted_and_charged_to_the_breaker(self):
+    async def test_gone_backend_is_evicted_and_charged_to_the_breaker(self, caplog):
         key = _pool_key()
         backend = _fake_backend(key)
         backend._heartbeat_once = AsyncMock(return_value="gone")  # type: ignore[method-assign]
         backend.shutdown = AsyncMock()  # type: ignore[method-assign]
         pool = _SweeperPool([(key, backend)])
 
-        await _run_one_heartbeat_sweep(pool)
+        with caplog.at_level("WARNING"):
+            await _run_one_heartbeat_sweep(pool)
+
+        recycled = [
+            r.getMessage() for r in caplog.records if "heartbeat recycled" in r.getMessage()
+        ]
+        assert recycled and all(
+            # The fake process has not exited, so this "gone" is a broken pipe.
+            m.endswith(backend.lifecycle_fields("backend_gone", "transport_closed"))
+            for m in recycled
+        )
 
         # The sweeper may complete more than one pass before the test observes
         # it, so assert on the distinct decisions rather than the call count.
@@ -417,14 +315,22 @@ class TestHeartbeatSweeper:
         backend.shutdown.assert_awaited()
 
     @pytest.mark.asyncio
-    async def test_wedged_backend_takes_the_same_recycle_path(self):
+    async def test_wedged_backend_takes_the_same_recycle_path(self, caplog):
         key = _pool_key(server="wedged-mcp")
         backend = _fake_backend(key)
         backend._heartbeat_once = AsyncMock(return_value="wedged")  # type: ignore[method-assign]
         backend.shutdown = AsyncMock()  # type: ignore[method-assign]
         pool = _SweeperPool([(key, backend)])
 
-        await _run_one_heartbeat_sweep(pool)
+        with caplog.at_level("WARNING"):
+            await _run_one_heartbeat_sweep(pool)
+
+        recycled = [
+            r.getMessage() for r in caplog.records if "heartbeat recycled" in r.getMessage()
+        ]
+        assert recycled and all(
+            m.endswith(backend.lifecycle_fields("backend_gone", "deadline")) for m in recycled
+        )
 
         assert set(pool.deaths) == {key.stable_hash()}
         assert set(pool.evicted) == {key}
@@ -449,40 +355,39 @@ class TestHeartbeatSweeper:
         pool = _SweeperPool([(key, backend)], pids=[11, 12])
         pidfile = None
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._heartbeat_sweeper(cast(Any, pool), 0.01, stop, pidfile)
-        )
-        for _ in range(200):
-            if backend._heartbeat_once.await_count:  # type: ignore[attr-defined]
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._heartbeat_sweeper(cast(Any, pool), 0.01, stop, pidfile))
+        await async_wait_until(lambda: bool(backend._heartbeat_once.await_count))  # type: ignore[attr-defined]
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
 
         assert pool.healthy == []
         assert pool.deaths == []
         assert pool.evicted == []
 
     @pytest.mark.asyncio
-    async def test_live_backend_pids_are_persisted_out_of_band(self, tmp_path):
-        """The supervising manager reads this file to killpg a wedged daemon."""
+    async def test_live_backend_identities_are_persisted_out_of_band(self, tmp_path):
+        """The supervising manager and the next daemon read this file to reap a
+        dead generation, so each pid carries the start id its backend captured
+        at spawn -- never one re-read now, which could name a recycled pid."""
         pool = _SweeperPool([], pids=[101, 202])
         pidfile = tmp_path / "backends.pid"
 
-        await _run_one_heartbeat_sweep(pool, pidfile)
+        with patch(
+            "kiro_crew.platform_compat.get_process_start_id",
+            side_effect=AssertionError("the heartbeat must not re-read identities"),
+        ):
+            await _run_one_heartbeat_sweep(pool, pidfile)
 
-        assert pidfile.read_text().split() == ["101", "202"]
+        assert pidfile.read_text().splitlines() == ["101 start-101", "202 start-202"]
 
     @pytest.mark.asyncio
     async def test_cancellation_is_swallowed(self):
         pool = _SweeperPool([])
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._heartbeat_sweeper(cast(Any, pool), 30.0, stop, None)
-        )
+        task = asyncio.create_task(gw._heartbeat_sweeper(cast(Any, pool), 30.0, stop, None))
         await asyncio.sleep(0)
         task.cancel()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert task.done() and not task.cancelled()
 
     @pytest.mark.asyncio
@@ -505,12 +410,10 @@ class TestHeartbeatSweeper:
 
             pool = _SweeperPool([])
             stop = asyncio.Event()
-            task = asyncio.create_task(
-                gw._heartbeat_sweeper(cast(Any, pool), 30.0, stop, None)
-            )
+            task = asyncio.create_task(gw._heartbeat_sweeper(cast(Any, pool), 30.0, stop, None))
             await asyncio.sleep(0)
             task.cancel()
-            await asyncio.wait_for(task, timeout=5)
+            await await_until(task)
 
             assert hazards.load_ledger(tmp_path).codes_for_name("srv") == (
                 hazards.HAZARD_UNROUTABLE_SERVER_REQUEST,
@@ -535,18 +438,14 @@ class TestHeartbeatSweeper:
         backend._heartbeat_once = AsyncMock(return_value="alive")  # type: ignore[method-assign]
         pool = _SweeperPool([(key, backend)])
         stop = asyncio.Event()
-        task = asyncio.create_task(
-            gw._heartbeat_sweeper(cast(Any, pool), 30.0, stop, None)
-        )
+        task = asyncio.create_task(gw._heartbeat_sweeper(cast(Any, pool), 30.0, stop, None))
         await asyncio.sleep(0.05)
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         backend._heartbeat_once.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_a_crashing_transport_probe_does_not_stop_the_backend_sweep(
-        self, monkeypatch
-    ):
+    async def test_a_crashing_transport_probe_does_not_stop_the_backend_sweep(self, monkeypatch):
         key = _pool_key(server="probe-crash-mcp")
         backend = _fake_backend(key)
         backend._heartbeat_once = AsyncMock(return_value="alive")  # type: ignore[method-assign]
@@ -585,9 +484,7 @@ class TestDrainAndRewarmOnCredentialChange:
         pool.drain_all_to_bluegreen = AsyncMock(return_value=3)
         rewarms: list[int] = []
 
-        await gw._drain_and_rewarm_on_credential_change(
-            cast(Any, pool), lambda: rewarms.append(1)
-        )
+        await gw._drain_and_rewarm_on_credential_change(cast(Any, pool), lambda: rewarms.append(1))
 
         pool.evict_idle.assert_awaited_once_with(0.0, include_pinned=True)
         pool.drain_all_to_bluegreen.assert_awaited_once()
@@ -602,9 +499,7 @@ class TestDrainAndRewarmOnCredentialChange:
         pool.drain_all_to_bluegreen = AsyncMock(return_value=0)
         rewarms: list[int] = []
 
-        await gw._drain_and_rewarm_on_credential_change(
-            cast(Any, pool), lambda: rewarms.append(1)
-        )
+        await gw._drain_and_rewarm_on_credential_change(cast(Any, pool), lambda: rewarms.append(1))
 
         assert rewarms == []
 
@@ -624,9 +519,7 @@ class TestApplyAbort:
     @pytest.mark.asyncio
     async def test_missing_pids_is_rejected(self, monkeypatch):
         audits: list[tuple[Any, ...]] = []
-        monkeypatch.setattr(
-            gw, "_audit_abort_applied", lambda *a, **k: audits.append((a, k))
-        )
+        monkeypatch.setattr(gw, "_audit_abort_applied", lambda *a, **k: audits.append((a, k)))
         out = await gw._apply_abort({}, cast(Any, _AbortPool([])))
         assert out == {"type": "abort-rejected", "reason": "missing or invalid pids"}
         assert audits
@@ -677,7 +570,11 @@ class TestApplyAbort:
 _AUDIT_CASES = [
     ("_audit_abort_applied", ([1234], "hard-stop", "allowed"), "mcp-gateway.abort-in-flight"),
     ("_audit_pool_fallback", ("caller", "demo-mcp", "pool full"), "mcp-gateway.fallback"),
-    ("_audit_pool_rejected", ("caller", "demo-mcp", "unknown target"), "mcp-gateway.ensure_backend"),
+    (
+        "_audit_pool_rejected",
+        ("caller", "demo-mcp", "unknown target"),
+        "mcp-gateway.ensure_backend",
+    ),
     ("_audit_prewarm_spawn", ("demo-mcp",), "mcp-gateway.prewarm-spawn"),
     (
         "_audit_reserved_stub_prefix_denied",
@@ -697,9 +594,7 @@ class TestAuditEmitters:
 
     @pytest.mark.parametrize("fn_name,args,operation", _AUDIT_CASES)
     def test_audit_failure_never_breaks_the_caller(self, monkeypatch, fn_name, args, operation):
-        monkeypatch.setattr(
-            gw, "SecurityEventLog", MagicMock(side_effect=RuntimeError("sel down"))
-        )
+        monkeypatch.setattr(gw, "SecurityEventLog", MagicMock(side_effect=RuntimeError("sel down")))
         getattr(gw, fn_name)(*args)  # must not raise
 
     def test_denied_abort_reports_the_reason_as_the_error(self, monkeypatch):
@@ -771,6 +666,21 @@ class TestReadFirstFrame:
     async def test_non_object_json_is_refused(self, line):
         assert await gw._read_first_frame(cast(Any, _FakeReader(line=line))) is None
 
+    @pytest.mark.asyncio
+    async def test_a_frame_nested_past_the_decoder_is_refused_not_raised(self):
+        """``RecursionError`` is not a ``JSONDecodeError``: the frame closes one
+        connection cleanly instead of raising out of the connection handler."""
+        from stray_line_helpers import too_deep_line
+
+        assert await gw._read_first_frame(cast(Any, _FakeReader(line=too_deep_line()))) is None
+
+    def test_the_ping_probe_reads_every_stray_frame_as_not_a_ping(self):
+        from stray_line_helpers import STRAY_LINES
+
+        for make in STRAY_LINES.values():
+            assert gw._is_ping_frame(make()) is False
+        assert gw._is_ping_frame(b'{"type":"ping"}\n') is True
+
 
 class TestWriteJsonLine:
     @pytest.mark.asyncio
@@ -797,8 +707,8 @@ class TestWriteJsonLine:
     async def test_peer_that_stops_reading_cannot_pin_the_handler(self, monkeypatch):
         monkeypatch.setattr(gw, "_WRITE_REPLY_TIMEOUT_SECS", 0.01)
         writer = _FakeWriter(hang=True)
-        await asyncio.wait_for(
-            gw._write_json_line(cast(Any, writer), {"type": "registered"}), timeout=5
+        await await_until(
+            asyncio.create_task(gw._write_json_line(cast(Any, writer), {"type": "registered"}))
         )
 
 
@@ -853,13 +763,8 @@ class TestDrainInboxToStub:
         inbox: asyncio.Queue[bytes] = asyncio.Queue()
         await inbox.put(b'{"id":1}\n')
         writer = _FakeWriter()
-        task = asyncio.create_task(
-            gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-1")
-        )
-        for _ in range(200):
-            if writer.writes:
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-1"))
+        await async_wait_until(lambda: bool(writer.writes))
         await _drain_task(task)
         assert writer.writes == [b'{"id":1}\n']
 
@@ -868,8 +773,8 @@ class TestDrainInboxToStub:
         inbox: asyncio.Queue[bytes] = asyncio.Queue()
         await inbox.put(b'{"id":2}\n')
         writer = _FakeWriter(fail=BrokenPipeError("stub gone"))
-        await asyncio.wait_for(
-            gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-2"), timeout=5
+        await await_until(
+            asyncio.create_task(gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-2"))
         )
 
     @pytest.mark.asyncio
@@ -878,8 +783,8 @@ class TestDrainInboxToStub:
         inbox: asyncio.Queue[bytes] = asyncio.Queue()
         await inbox.put(b'{"id":3}\n')
         writer = _FakeWriter(hang=True)
-        await asyncio.wait_for(
-            gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-3"), timeout=5
+        await await_until(
+            asyncio.create_task(gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-3"))
         )
 
     @pytest.mark.asyncio
@@ -889,13 +794,8 @@ class TestDrainInboxToStub:
         await inbox.put(b'{"id":4}\n')
         writer = _FakeWriter()
         setattr(writer, "_mc_write_lock", asyncio.Lock())
-        task = asyncio.create_task(
-            gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-4")
-        )
-        for _ in range(200):
-            if writer.writes:
-                break
-            await asyncio.sleep(0.01)
+        task = asyncio.create_task(gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-4"))
+        await async_wait_until(lambda: bool(writer.writes))
         await _drain_task(task)
         assert gw._active_stub_writes == before
 
@@ -903,9 +803,7 @@ class TestDrainInboxToStub:
     async def test_cancellation_propagates(self):
         inbox: asyncio.Queue[bytes] = asyncio.Queue()
         writer = _FakeWriter()
-        task = asyncio.create_task(
-            gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-5")
-        )
+        task = asyncio.create_task(gw._drain_inbox_to_stub(inbox, cast(Any, writer), "stub-5"))
         await asyncio.sleep(0)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -915,12 +813,18 @@ class TestDrainInboxToStub:
 # --- declared env + target resolution ---------------------------------------
 
 
+#: The agent these sidecars are written for. The daemon reads it off the
+#: Register frame, not off the PoolKey, so a test writing a sidecar names it the
+#: same way the rewriter does.
+_DECLARING_AGENT = "demo-agent"
+
+
 class TestDeclaredNonSecretEnv:
     def _write_sidecar(self, key: PoolKey, payload: dict[str, str]) -> Path:
         overlay = resolve_overlay_dir()
         directory = env_sidecar_dir(overlay)
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / env_sidecar_name(key.agent_name, key.server_name)
+        path = directory / env_sidecar_name(_DECLARING_AGENT, key.server_name)
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
@@ -945,7 +849,7 @@ class TestDeclaredNonSecretEnv:
         overlay = resolve_overlay_dir()
         directory = env_sidecar_dir(overlay)
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / env_sidecar_name(key.agent_name, key.server_name)).write_text(
+        (directory / env_sidecar_name(_DECLARING_AGENT, key.server_name)).write_text(
             "{not json", encoding="utf-8"
         )
         assert gw._declared_non_secret_env(key) == {}
@@ -957,7 +861,9 @@ class TestDeclaredNonSecretEnv:
 
     def test_unreadable_config_falls_back_to_the_default_overlay_dir(self, monkeypatch):
         monkeypatch.setattr(
-            gw.KiroCrewConfig, "load", classmethod(lambda cls: (_ for _ in ()).throw(OSError("nope")))
+            gw.KiroCrewConfig,
+            "load",
+            classmethod(lambda cls: (_ for _ in ()).throw(OSError("nope"))),
         )
         assert gw._declared_non_secret_env(_pool_key(server="cfgless-mcp")) == {}
 
@@ -965,9 +871,7 @@ class TestDeclaredNonSecretEnv:
 class TestDeclaredEnvToForward:
     def test_flag_off_short_circuits_before_any_file_read(self, monkeypatch):
         monkeypatch.setattr(gw, "forward_declared_env_enabled", lambda: False)
-        monkeypatch.setattr(
-            gw, "_declared_non_secret_env", lambda k: {"SHOULD": "not-be-read"}
-        )
+        monkeypatch.setattr(gw, "_declared_non_secret_env", lambda k: {"SHOULD": "not-be-read"})
         assert gw._declared_env_to_forward(_pool_key()) == {}
 
     def test_flag_on_delegates_to_the_sidecar_read(self, monkeypatch):
@@ -1054,896 +958,6 @@ class TestEnvTargetResolver:
             assert env_key not in env
 
 
-# --- backend acquire / respawn ----------------------------------------------
-
-
-class TestAcquireBackend:
-    @pytest.mark.asyncio
-    async def test_unresolvable_server_is_a_clean_rejection(self):
-        pool = BackendPool(max_backends=2)
-        with pytest.raises(gw._TargetUnknown) as excinfo:
-            await gw._acquire_backend(pool, _pool_key(server="ghost-mcp"), lambda k: None)
-        assert "ghost-mcp" in str(excinfo.value)
-
-    @pytest.mark.asyncio
-    async def test_spawn_reports_was_spawned_and_starts_the_stdout_pump(self, monkeypatch):
-        pool = BackendPool(max_backends=2)
-        key = _pool_key(server="spawn-mcp")
-        backend = _fake_backend(key)
-        monkeypatch.setattr(gw, "spawn_backend", AsyncMock(return_value=backend))
-        monkeypatch.setattr(gw, "_declared_env_to_forward", lambda k: {})
-
-        got, was_spawned = await gw._acquire_backend(
-            pool, key, lambda k: ("demo-bin", ["--stdio"], {"A": "1"}, "/tmp/cov")
-        )
-
-        assert got is backend
-        assert was_spawned is True
-        assert backend._stdout_task is not None
-        await _drain_task(backend._stdout_task)
-        await pool.shutdown_all(timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_declared_env_is_merged_over_the_inherited_value(self, monkeypatch):
-        pool = BackendPool(max_backends=2)
-        key = _pool_key(server="declared-mcp")
-        backend = _fake_backend(key)
-        spawn = AsyncMock(return_value=backend)
-        monkeypatch.setattr(gw, "spawn_backend", spawn)
-        monkeypatch.setattr(gw, "_declared_env_to_forward", lambda k: {"A": "declared"})
-
-        await gw._acquire_backend(
-            pool, key, lambda k: ("demo-bin", [], {"A": "inherited"}, "/tmp/cov")
-        )
-
-        assert _await_kwargs(spawn)["env"]["A"] == "declared"
-        await _drain_task(backend._stdout_task)
-        await pool.shutdown_all(timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_secret_temp_skips_raw_precheck_and_reaches_spawn_backend(
-        self, monkeypatch, caplog
-    ) -> None:
-        from kiro_crew import sandbox as sandbox_mod
-
-        pool = BackendPool(max_backends=2)
-        key = _pool_key(server="secret-temp-mcp")
-        backend = _fake_backend(key)
-        captured: dict[str, Any] = {}
-
-        async def _spawn_backend(**kwargs: Any) -> Backend:
-            captured.update(kwargs)
-            captured["env"] = dict(kwargs["env"])
-            return backend
-
-        monkeypatch.setattr(gw, "spawn_backend", AsyncMock(side_effect=_spawn_backend))
-        raw_reference = "secret://../../../../run/x\nFORGED"
-        monkeypatch.setattr(
-            gw,
-            "_declared_env_to_forward",
-            lambda _key: {"TMPDIR": raw_reference},
-        )
-        classified: list[str] = []
-
-        def _sealed(path: str) -> str:
-            classified.append(path)
-            return "sealed"
-
-        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
-
-        def _resolve(env: dict[str, str], _config: Path):
-            if "TMPDIR" not in env:
-                return dict(env), set()
-            return {**env, "TMPDIR": "/resolved/secret"}, {"TMPDIR"}
-
-        monkeypatch.setattr(gw, "resolve_secret_uris", _resolve)
-
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.gatewayd"):
-            await gw._acquire_backend(
-                pool,
-                key,
-                lambda _key: ("demo-bin", [], {}, "/tmp/cov"),
-            )
-
-        assert classified == []
-        assert raw_reference not in caplog.text
-        assert captured["env"]["TMPDIR"] == "/resolved/secret"
-        assert captured["declared_temp_keys"] == ("TMPDIR",)
-        assert captured["secret_env_keys"] == ("TMPDIR",)
-        await _drain_task(backend._stdout_task)
-        await pool.shutdown_all(timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_sealed_declared_temp_is_removed_before_spawn(self, monkeypatch, caplog) -> None:
-        from kiro_crew import sandbox as sandbox_mod
-
-        pool = BackendPool(max_backends=2)
-        key = _pool_key(server="sealed-temp-mcp")
-        backend = _fake_backend(key)
-        spawn = AsyncMock(return_value=backend)
-        monkeypatch.setattr(gw, "spawn_backend", spawn)
-        declared = "/sealed/runtime/tmp\nFORGED"
-        monkeypatch.setattr(
-            gw,
-            "_declared_env_to_forward",
-            lambda _key: {"TMPDIR": declared, "A": "declared"},
-        )
-        loop_thread = threading.get_ident()
-        classifier_threads: list[int] = []
-
-        def _sealed(_path: str) -> str:
-            classifier_threads.append(threading.get_ident())
-            return "sealed"
-
-        monkeypatch.setattr(sandbox_mod, "classify_declared_temp_path", _sealed)
-
-        with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_gateway.gatewayd"):
-            await gw._acquire_backend(
-                pool,
-                key,
-                lambda _key: (
-                    "demo-bin",
-                    [],
-                    {"TMPDIR": "/ambient/tmp", "A": "inherited"},
-                    "/tmp/cov",
-                ),
-            )
-
-        kwargs = _await_kwargs(spawn)
-        assert declared not in kwargs["env"].values()
-        assert not [key for key in kwargs["env"] if key.upper() in ("TMPDIR", "TMP", "TEMP")]
-        assert kwargs["declared_temp_keys"] == ()
-        assert classifier_threads and all(thread != loop_thread for thread in classifier_threads)
-        warning = next(
-            record.getMessage()
-            for record in caplog.records
-            if "ignoring spec-declared" in record.getMessage()
-        )
-        assert f"TMPDIR={declared!r}" in warning
-        assert "\nFORGED" not in warning
-        assert "inside the sandbox-sealed runtime parent" in warning
-        await _drain_task(backend._stdout_task)
-        await pool.shutdown_all(timeout=0.1)
-
-    @pytest.mark.asyncio
-    async def test_pool_reuse_reports_was_spawned_false(self, monkeypatch):
-        pool = BackendPool(max_backends=2)
-        key = _pool_key(server="reuse-mcp")
-        backend = _fake_backend(key)
-        monkeypatch.setattr(gw, "spawn_backend", AsyncMock(return_value=backend))
-        monkeypatch.setattr(gw, "_declared_env_to_forward", lambda k: {})
-
-        first, spawned_first = await gw._acquire_backend(
-            pool, key, lambda k: ("demo-bin", [], {}, "/tmp/cov")
-        )
-        second, spawned_second = await gw._acquire_backend(
-            pool, key, lambda k: ("demo-bin", [], {}, "/tmp/cov")
-        )
-
-        assert (spawned_first, spawned_second) == (True, False)
-        assert first is second
-        await _drain_task(backend._stdout_task)
-        await pool.shutdown_all(timeout=0.1)
-
-
-class TestRespawnBackendForStub:
-    @pytest.mark.asyncio
-    async def test_no_captured_initialize_gives_up(self):
-        pool = BackendPool(max_backends=2)
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(),
-            lambda k: None,
-            "stub-r1",
-            cast(Any, _FakeWriter()),
-            None,
-            old,
-            None,
-            None,
-        )
-
-        assert out is None
-        old.detach_stub.assert_awaited_once_with("stub-r1")
-
-    @pytest.mark.asyncio
-    async def test_old_writer_task_is_cancelled_and_inbox_flushed(self):
-        """Late replies for the stub's OTHER in-flight ids must still reach it,
-        or kiro-cli hangs waiting on those ids forever."""
-        pool = BackendPool(max_backends=2)
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        old_inbox: asyncio.Queue[bytes] = asyncio.Queue()
-        await old_inbox.put(b'{"id":9,"error":{}}\n')
-        writer = _FakeWriter()
-        old_task = asyncio.create_task(asyncio.Event().wait())
-        await asyncio.sleep(0)
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(),
-            lambda k: None,
-            "stub-r2",
-            cast(Any, writer),
-            None,
-            old,
-            old_inbox,
-            cast(Any, old_task),
-        )
-
-        assert out is None
-        assert old_task.done()
-        assert writer.writes == [b'{"id":9,"error":{}}\n']
-
-    @pytest.mark.asyncio
-    async def test_acquire_rejection_gives_up_without_churning_spawns(self, monkeypatch):
-        pool = BackendPool(max_backends=2)
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        monkeypatch.setattr(
-            gw, "_acquire_backend", AsyncMock(side_effect=BackendUnavailable("breaker open"))
-        )
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(),
-            lambda k: None,
-            "stub-r3",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        assert out is None
-
-    @pytest.mark.asyncio
-    async def test_prime_failure_gives_up_and_releases_the_reservation(self, monkeypatch):
-        key = _pool_key(server="prime-fail-mcp")
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        fresh = _fake_backend(key, pid=5150)
-        fresh.prime_initialize = AsyncMock(  # type: ignore[method-assign]
-            side_effect=BackendGone("died during prime")
-        )
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            key,
-            lambda k: None,
-            "stub-r4",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        assert out is None
-        pool.unreserve.assert_called_once_with(key)
-
-    @pytest.mark.asyncio
-    async def test_successful_respawn_rebinds_the_stub_transparently(self, monkeypatch):
-        key = _pool_key(server="respawn-ok-mcp")
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        fresh = _fake_backend(key, pid=6161)
-        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
-        new_inbox: asyncio.Queue[bytes] = asyncio.Queue()
-        fresh.attach_stub = AsyncMock(return_value=new_inbox)  # type: ignore[method-assign]
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            key,
-            lambda k: None,
-            "stub-r5",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        assert out is not None
-        got_backend, got_inbox, got_task = out
-        assert got_backend is fresh
-        assert got_inbox is new_inbox
-        pool.unreserve.assert_called_once_with(key)
-        await _drain_task(got_task)
-
-    @pytest.mark.asyncio
-    async def test_a_recorded_hazard_makes_the_respawn_come_back_private(
-        self, monkeypatch, tmp_path
-    ):
-        """The retreat's hole if the respawn inherited the shared binding blindly.
-
-        The recycle that follows an unroutable server request comes straight back
-        here, so re-pooling would hand the SAME stubs a shared backend for the
-        server just observed misbehaving, and no new register happens to
-        re-decide it. Also pins that a now-private respawn releases NO
-        reservation: only ``pool.get_or_create`` reserves, so releasing on the
-        old backend's binding instead would decrement a digest this respawn never
-        reserved and drop a concurrent pooled connection's eviction protection.
-        """
-        from kiro_crew.mcp_gateway import hazards
-
-        key = _pool_key(server="respawn-hazard-mcp")
-        ledger = hazards.HazardLedger(tmp_path / hazards.HAZARDS_FILENAME)
-        ledger.record(
-            "respawn-hazard-mcp",
-            hazards.HAZARD_UNROUTABLE_SERVER_REQUEST,
-            hazards.launch_identity(
-                key.command_args_hash, key.effective_env_hash, key.binary_version
-            ),
-        )
-        monkeypatch.setattr(hazards, "_sink", ledger)
-
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        assert not old.exclusive_token, "old backend must be POOLED for this case"
-        fresh = _fake_backend(key, pid=6262)
-        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
-        new_inbox: asyncio.Queue[bytes] = asyncio.Queue()
-        fresh.attach_stub = AsyncMock(return_value=new_inbox)  # type: ignore[method-assign]
-        acquire = AsyncMock(return_value=(fresh, True))
-        monkeypatch.setattr(gw, "_acquire_backend", acquire)
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            key,
-            lambda k: None,
-            "stub-hz1",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        assert out is not None
-        assert acquire.await_args.kwargs["exclusive_stub_uuid"] == "stub-hz1"
-        pool.unreserve.assert_not_called()
-        await _drain_task(out[2])
-
-    @pytest.mark.asyncio
-    async def test_replay_skipped_when_owner_rekeyed_mid_respawn(self, monkeypatch):
-        """A ``claim`` frame can retarget this connection's identity during
-        the respawn's acquire/prime awaits. The captured URIs belong to the
-        OLD principal — replaying them would resubscribe the old owner's
-        resources onto the rekeyed stub, the exact leak
-        ``evict_stub_subscriptions`` exists to prevent. The replay gate must
-        recheck the live owner and skip when it changed."""
-        key = _pool_key(server="respawn-rekey-mcp")
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        old.resource_subscription_uris = MagicMock(  # type: ignore[method-assign]
-            return_value=["file:///old-owner.txt"]
-        )
-        fresh = _fake_backend(key, pid=7171)
-        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
-            return_value=asyncio.Queue()
-        )
-        fresh.replay_resource_subscriptions = AsyncMock()  # type: ignore[method-assign]
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        old_caller = CallerContext(session_key="dashboard:old")
-        conn = gw._StubConn("stub-r6", [], "pool", old_caller)
-        # The claim lands while prime_initialize is awaited: the connection
-        # identity names a NEW principal before the replay gate runs.
-        fresh.prime_initialize = AsyncMock(  # type: ignore[method-assign]
-            side_effect=lambda *_a, **_k: setattr(
-                conn, "caller", CallerContext(session_key="dashboard:new")
-            )
-        )
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            key,
-            lambda k: None,
-            "stub-r6",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-            caller=old_caller,
-            conn=conn,
-        )
-
-        assert out is not None  # the respawn itself still succeeds
-        fresh.replay_resource_subscriptions.assert_not_awaited()
-        _backend, _inbox, task = out
-        await _drain_task(task)
-
-    @pytest.mark.asyncio
-    async def test_replay_proceeds_when_owner_unchanged(self, monkeypatch):
-        """Control for the rekey gate: an unchanged owner still gets its
-        subscriptions replayed onto the fresh backend."""
-        key = _pool_key(server="respawn-stable-mcp")
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        old.resource_subscription_uris = MagicMock(  # type: ignore[method-assign]
-            return_value=["file:///same-owner.txt"]
-        )
-        fresh = _fake_backend(key, pid=7272)
-        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
-        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
-            return_value=asyncio.Queue()
-        )
-        fresh.replay_resource_subscriptions = AsyncMock()  # type: ignore[method-assign]
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        same_caller = CallerContext(session_key="dashboard:same")
-        conn = gw._StubConn("stub-r7", [], "pool", same_caller)
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            key,
-            lambda k: None,
-            "stub-r7",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-            caller=same_caller,
-            conn=conn,
-        )
-
-        assert out is not None
-        fresh.replay_resource_subscriptions.assert_awaited_once_with(
-            "stub-r7", ["file:///same-owner.txt"], caller=same_caller
-        )
-        _backend, _inbox, task = out
-        await _drain_task(task)
-
-    # --- validating the replacement's tool set ------------------------------
-
-    @staticmethod
-    def _surface_pair(*, served, published, stub="stub-r8"):
-        """An old backend that already served *served* TO ``stub``, and a fresh
-        one that publishes *published* — both as projected tool surfaces."""
-        old = _fake_backend()
-        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        if served is not None:
-            old._served_tool_surfaces[stub] = served
-        fresh = _fake_backend(_pool_key(server="respawn-surface-mcp"), pid=8383)
-        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
-        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
-            return_value=asyncio.Queue()
-        )
-        fresh.probe_tool_surface = AsyncMock(return_value=published)  # type: ignore[method-assign]
-        return old, fresh
-
-    @pytest.mark.asyncio
-    async def test_a_replacement_whose_tool_set_moved_is_not_adopted(
-        self, monkeypatch
-    ):
-        """The gap this closes: priming the captured handshake proves the fresh
-        process talks MCP, so without this check a server upgraded in place is
-        adopted under a session still holding the DEAD process's schema."""
-        key = _pool_key(server="respawn-surface-mcp")
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old, fresh = self._surface_pair(
-            served={"read_file": '{"type":"object"}'},
-            published={"readFile": '{"type":"object"}'},
-        )
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-        audits: list[tuple] = []
-        monkeypatch.setattr(gw, "_audit_replacement_validated", lambda *a: audits.append(a))
-
-        with pytest.raises(gw._ReplacementRefused) as excinfo:
-            await gw._respawn_backend_for_stub(
-                pool,
-                key,
-                lambda k: None,
-                "stub-r8",
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                old,
-                None,
-                None,
-                caller=CallerContext(session_key="dashboard:1"),
-            )
-
-        # The SESSION is told what changed, not just "backend gone".
-        assert "tool set changed" in str(excinfo.value)
-        assert "read_file" in str(excinfo.value)
-
-        # Refused BEFORE adoption: the stub is never bound to the replacement.
-        fresh.attach_stub.assert_not_awaited()
-        # And the give-up still releases the reservation it took, or the digest
-        # is skipped by evict_idle forever.
-        pool.unreserve.assert_called_once_with(key)
-        assert audits and audits[0][0] == "dashboard:1"
-        assert audits[0][2] == "denied"
-        assert "gone=read_file" in audits[0][3]
-
-    @pytest.mark.asyncio
-    async def test_an_unchanged_tool_set_is_adopted(self, monkeypatch):
-        """Control: the check must not cost the transparent recovery when the
-        replacement publishes what the session was already told."""
-        key = _pool_key(server="respawn-surface-mcp")
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        same = {"read_file": '{"type":"object"}'}
-        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r9")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            key,
-            lambda k: None,
-            "stub-r9",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        assert out is not None
-        fresh.attach_stub.assert_awaited_once_with("stub-r9")
-        await _drain_task(out[2])
-
-    @pytest.mark.asyncio
-    async def test_a_replacement_that_cannot_be_asked_is_not_adopted(
-        self, monkeypatch
-    ):
-        """A probe that establishes nothing is not agreement. The old backend
-        answered a listing projectably, so a replacement that will not is the
-        change — adopting on an unanswered probe would be the silent path again."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old, fresh = self._surface_pair(
-            served={"read_file": '{"type":"object"}'}, published=None, stub="stub-r10"
-        )
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        with pytest.raises(gw._ReplacementRefused):
-            await gw._respawn_backend_for_stub(
-                pool,
-                _pool_key(server="respawn-surface-mcp"),
-                lambda k: None,
-                "stub-r10",
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                old,
-                None,
-                None,
-            )
-
-        fresh.attach_stub.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_an_owner_rekeyed_mid_respawn_is_not_adopted(self, monkeypatch):
-        """A claim can retarget this connection during the probe. Both sides of
-        the comparison belong to the CAPTURED caller, so across a rekey it
-        describes a principal that does not own the stub — and re-probing would
-        race the same way."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        same = {"read_file": '{"type":"object"}'}
-        # The tool set AGREES; only the owner moved.
-        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r14")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-        audits: list[tuple] = []
-        monkeypatch.setattr(gw, "_audit_replacement_validated", lambda *a: audits.append(a))
-
-        captured = CallerContext(session_key="dashboard:old-owner")
-        conn = gw._StubConn(
-            "stub-r14", [], "pool", CallerContext(session_key="dashboard:new-owner")
-        )
-
-        with pytest.raises(gw._ReplacementRefused):
-            await gw._respawn_backend_for_stub(
-                pool,
-                _pool_key(server="respawn-surface-mcp"),
-                lambda k: None,
-                "stub-r14",
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                old,
-                None,
-                None,
-                caller=captured,
-                conn=conn,
-            )
-
-        fresh.attach_stub.assert_not_awaited()
-        assert audits and audits[0][2] == "denied"
-        assert "retargeted mid-respawn" in audits[0][3]
-
-    @pytest.mark.asyncio
-    async def test_a_rekey_landing_after_validation_still_refuses(self, monkeypatch):
-        """attach_stub and the subscription replay both await, so a claim can
-        land AFTER the check beside the comparison. The re-check before the
-        return is the one that closes that window; the earlier one only saves
-        the attach."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        same = {"read_file": '{"type":"object"}'}
-        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r18")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        owner = CallerContext(session_key="dashboard:old-owner")
-        conn = gw._StubConn("stub-r18", [], "pool", owner)
-
-        async def _attach_then_rekey(stub_uuid):
-            # The claim lands during the adoption await, past the early check.
-            conn.caller = CallerContext(session_key="dashboard:new-owner")
-            return asyncio.Queue()
-
-        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
-            side_effect=_attach_then_rekey
-        )
-        fresh.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-
-        with pytest.raises(gw._ReplacementRefused):
-            await gw._respawn_backend_for_stub(
-                pool,
-                _pool_key(server="respawn-surface-mcp"),
-                lambda k: None,
-                "stub-r18",
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                old,
-                None,
-                None,
-                caller=owner,
-                conn=conn,
-            )
-
-        # The stub it had just attached is released, or the refcount holds a stub
-        # that is about to be told the adoption failed.
-        fresh.attach_stub.assert_awaited_once_with("stub-r18")
-        fresh.detach_stub.assert_awaited_once_with("stub-r18")
-
-    @pytest.mark.asyncio
-    async def test_an_unchanged_owner_still_adopts(self, monkeypatch):
-        """Control for the rekey gate: the same owner is not a rekey, and a
-        connection that cannot answer the question is not one either."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        same = {"read_file": '{"type":"object"}'}
-        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r15")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        owner = CallerContext(session_key="dashboard:same")
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(server="respawn-surface-mcp"),
-            lambda k: None,
-            "stub-r15",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-            caller=owner,
-            conn=gw._StubConn("stub-r15", [], "pool", owner),
-        )
-
-        assert out is not None
-        fresh.attach_stub.assert_awaited_once_with("stub-r15")
-        await _drain_task(out[2])
-
-    @pytest.mark.asyncio
-    async def test_no_listing_ever_served_skips_the_probe_entirely(
-        self, monkeypatch
-    ):
-        """With no claim on record there is nothing a replacement can
-        contradict, so the recovery this path already performs must not become a
-        failure — and the extra round-trip must not be paid either."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old, fresh = self._surface_pair(served=None, published=None, stub="stub-r11")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(server="respawn-surface-mcp"),
-            lambda k: None,
-            "stub-r11",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        assert out is not None
-        fresh.probe_tool_surface.assert_not_awaited()
-        await _drain_task(out[2])
-
-    @pytest.mark.asyncio
-    async def test_an_adopted_replacement_is_audited_too(self, monkeypatch):
-        """Both outcomes are access decisions about which process may answer a
-        live session. Recording only refusals would leave the swap this guard
-        exists to make visible as a rotating log line and nothing more — and it
-        must be recorded in the no-anchor case especially, which is exactly where
-        nothing checked it."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        audits: list[tuple] = []
-        monkeypatch.setattr(gw, "_audit_replacement_validated", lambda *a: audits.append(a))
-        same = {"read_file": '{"type":"object"}'}
-
-        for stub, served, expected in (
-            ("stub-r16", same, "verified: 1 tool(s) unchanged"),
-            ("stub-r17", None, "not verified"),
-        ):
-            old, fresh = self._surface_pair(
-                served=served,
-                published=dict(same) if served is not None else None,
-                stub=stub,
-            )
-            monkeypatch.setattr(
-                gw, "_acquire_backend", AsyncMock(return_value=(fresh, True))
-            )
-
-            out = await gw._respawn_backend_for_stub(
-                pool,
-                _pool_key(server="respawn-surface-mcp"),
-                lambda k: None,
-                stub,
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                old,
-                None,
-                None,
-                caller=CallerContext(session_key=f"dashboard:{stub}"),
-            )
-
-            assert out is not None
-            await _drain_task(out[2])
-
-        assert [a[2] for a in audits] == ["allowed", "allowed"]
-        assert "verified: 1 tool(s) unchanged" in audits[0][3]
-        assert "not verified" in audits[1][3]
-
-    @pytest.mark.asyncio
-    async def test_the_validated_surface_survives_into_the_next_respawn(
-        self, monkeypatch
-    ):
-        """The claim follows the SESSION, not the process. Without carrying it
-        the replacement starts anchor-less, so a second respawn of the same stub
-        adopts blindly while the client's frozen tool set is still its original
-        listing — the guard would cover only the first swap in a session's life."""
-        pool = BackendPool(max_backends=3)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        same = {"read_file": '{"type":"object"}'}
-        old, first = self._surface_pair(served=same, published=dict(same), stub="stub-r19")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(first, True)))
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(server="respawn-surface-mcp"),
-            lambda k: None,
-            "stub-r19",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-        assert out is not None
-        await _drain_task(out[2])
-
-        # The adopted backend now holds the session's claim...
-        assert first.served_tool_surface("stub-r19") == same
-
-        # ...so when IT dies, the second replacement is validated too, and a
-        # drifted one is refused rather than adopted.
-        second = _fake_backend(_pool_key(server="respawn-surface-mcp"), pid=9494)
-        second.prime_initialize = AsyncMock()  # type: ignore[method-assign]
-        second.attach_stub = AsyncMock(return_value=asyncio.Queue())  # type: ignore[method-assign]
-        second.probe_tool_surface = AsyncMock(return_value={})  # type: ignore[method-assign]
-        first.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(second, True)))
-
-        with pytest.raises(gw._ReplacementRefused):
-            await gw._respawn_backend_for_stub(
-                pool,
-                _pool_key(server="respawn-surface-mcp"),
-                lambda k: None,
-                "stub-r19",
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                first,
-                None,
-                None,
-            )
-
-        second.attach_stub.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_co_pooled_stubs_listing_is_not_this_stubs_anchor(
-        self, monkeypatch
-    ):
-        """One backend serves several sessions. The comparison must be about the
-        session being recovered, not whichever tenant listed most recently — a
-        sibling's listing must neither supply nor suppress this stub's anchor."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        # Only the SIBLING was ever served a listing.
-        old, fresh = self._surface_pair(
-            served={"read_file": '{"type":"object"}'},
-            published={"totally": '{"type":"object"}'},
-            stub="stub-sibling",
-        )
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        out = await gw._respawn_backend_for_stub(
-            pool,
-            _pool_key(server="respawn-surface-mcp"),
-            lambda k: None,
-            "stub-r12",
-            cast(Any, _FakeWriter()),
-            {"id": 0, "method": "initialize"},
-            old,
-            None,
-            None,
-        )
-
-        # Adopted: stub-r12 holds no declaration, so the replacement's very
-        # different tool set contradicts nothing it was told.
-        assert out is not None
-        fresh.probe_tool_surface.assert_not_awaited()
-        await _drain_task(out[2])
-
-    @pytest.mark.asyncio
-    async def test_the_anchor_is_read_before_the_detach_that_prunes_it(
-        self, monkeypatch
-    ):
-        """Real ``detach_stub`` drops the stub's anchor. Reading it after the
-        detach would report "nothing was ever served" for a session that was
-        told plenty, and adopt a drifted replacement."""
-        pool = BackendPool(max_backends=2)
-        pool.unreserve = MagicMock()  # type: ignore[method-assign]
-        old, fresh = self._surface_pair(
-            served={"read_file": '{"type":"object"}'},
-            published={"readFile": '{"type":"object"}'},
-            stub="stub-r13",
-        )
-        # NOT mocked: the real detach prunes the per-stub anchor.
-        del old.detach_stub
-        await old.attach_stub("stub-r13")
-        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
-
-        with pytest.raises(gw._ReplacementRefused):
-            await gw._respawn_backend_for_stub(
-                pool,
-                _pool_key(server="respawn-surface-mcp"),
-                lambda k: None,
-                "stub-r13",
-                cast(Any, _FakeWriter()),
-                {"id": 0, "method": "initialize"},
-                old,
-                None,
-                None,
-            )
-
-        fresh.attach_stub.assert_not_awaited()
-
-
 # --- zombie diagnostic ------------------------------------------------------
 
 
@@ -1963,9 +977,7 @@ class TestCountOpenFds:
 
     @_POSIX_ONLY
     def test_returns_minus_one_when_no_source_is_available(self, monkeypatch):
-        monkeypatch.setattr(
-            os, "listdir", MagicMock(side_effect=OSError("no such directory"))
-        )
+        monkeypatch.setattr(os, "listdir", MagicMock(side_effect=OSError("no such directory")))
         assert gw._count_open_fds() == -1
 
 
@@ -2036,6 +1048,25 @@ class TestWriteDiagnostic:
         lines = path.read_text(encoding="utf-8").strip().splitlines()
         assert [json.loads(line)["n"] for line in lines] == [1, 2]
 
+    def test_rotates_once_past_the_size_cap(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(gw, "_ZOMBIE_DIAGNOSTIC_MAX_BYTES", 40)
+        path = tmp_path / "diag.jsonl"
+        for n in range(1, 7):
+            gw._write_diagnostic(path, {"tag": "probe", "n": n})
+        previous = tmp_path / "diag.jsonl.1"
+        # Each line is 22 bytes: a file holds two, so every third append rotates.
+        assert [json.loads(x)["n"] for x in path.read_text(encoding="utf-8").splitlines()] == [5, 6]
+        assert [json.loads(x)["n"] for x in previous.read_text(encoding="utf-8").splitlines()] == [
+            3,
+            4,
+        ]
+        # One previous generation only (``.lock`` is the rotation try-lock).
+        assert sorted(p.name for p in tmp_path.glob("diag.jsonl*")) == [
+            "diag.jsonl",
+            "diag.jsonl.1",
+            "diag.jsonl.lock",
+        ]
+
     def test_multiple_records_share_a_single_open(self, monkeypatch, tmp_path):
         # Records passed in one call MUST go through one open-append-close
         # cycle: a second append that lands while the first writer's handle is
@@ -2043,14 +1074,15 @@ class TestWriteDiagnostic:
         # never-raises contract would silently drop the record.
         path = tmp_path / "diag.jsonl"
         opens: list[str] = []
-        real_open = Path.open
+        real_open = builtins.open
 
-        def counting_open(self, *args, **kwargs):
-            if self == path:
+        def counting_open(file, *args, **kwargs):
+            if os.fspath(file) == os.fspath(path):
                 opens.append(str(args))
-            return real_open(self, *args, **kwargs)
+            return real_open(file, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "open", counting_open)
+        # The writer opens through builtins.open (it passes an owner-only opener).
+        monkeypatch.setattr(builtins, "open", counting_open)
         gw._write_diagnostic(path, {"tag": "probe", "n": 1}, {"tag": "zombie_detected", "n": 2})
         assert len(opens) == 1
         lines = path.read_text(encoding="utf-8").strip().splitlines()
@@ -2070,12 +1102,9 @@ class TestZombieDiagnostic:
         task = asyncio.create_task(
             gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop)
         )
-        for _ in range(300):
-            if diag.exists():
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(lambda: diag.exists(), off_loop=True)
         stop.set()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
 
         tags = {json.loads(line)["tag"] for line in diag.read_text().strip().splitlines()}
         assert tags == {"probe"}
@@ -2095,9 +1124,7 @@ class TestZombieDiagnostic:
         stop = asyncio.Event()
         monkeypatch.setattr(stop, "wait", AsyncMock(side_effect=asyncio.TimeoutError))
 
-        await gw._zombie_diagnostic(
-            cast(Any, server), BackendPool(max_backends=1), set(), stop
-        )
+        await gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop)
 
         assert len(writes) == 1
         written_path, records = writes[0]
@@ -2135,8 +1162,9 @@ class TestZombieDiagnostic:
                 opened.append(mode)
                 if len(opened) > 1:
                     raise PermissionError(
-                        13, "The process cannot access the file because it is "
-                        "being used by another process"
+                        13,
+                        "The process cannot access the file because it is "
+                        "being used by another process",
                     )
             return real_open(self, *args, **kwargs)
 
@@ -2182,11 +1210,12 @@ class TestZombieDiagnostic:
         monkeypatch.setattr(gw, "_ZOMBIE_PROBE_INTERVAL_SECS", 0.01)
         stop = asyncio.Event()
         stop.set()
-        await asyncio.wait_for(
-            gw._zombie_diagnostic(
-                cast(Any, MagicMock()), BackendPool(max_backends=1), set(), stop
-            ),
-            timeout=5,
+        await await_until(
+            asyncio.create_task(
+                gw._zombie_diagnostic(
+                    cast(Any, MagicMock()), BackendPool(max_backends=1), set(), stop
+                )
+            )
         )
         assert not diag.exists()
 
@@ -2195,13 +1224,11 @@ class TestZombieDiagnostic:
         monkeypatch.setattr(gw, "_zombie_diagnostic_path", lambda: tmp_path / "d.jsonl")
         stop = asyncio.Event()
         task = asyncio.create_task(
-            gw._zombie_diagnostic(
-                cast(Any, MagicMock()), BackendPool(max_backends=1), set(), stop
-            )
+            gw._zombie_diagnostic(cast(Any, MagicMock()), BackendPool(max_backends=1), set(), stop)
         )
         await asyncio.sleep(0)
         task.cancel()
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task)
         assert task.done() and not task.cancelled()
 
 
@@ -2266,7 +1293,9 @@ class TestAmain:
         assert _await_kwargs(run)["credential_watch_paths"] == [Path("creds.json")]
 
     @pytest.mark.asyncio
-    async def test_unhandled_exception_returns_one_instead_of_crashing(self, _quiet_amain, monkeypatch):
+    async def test_unhandled_exception_returns_one_instead_of_crashing(
+        self, _quiet_amain, monkeypatch
+    ):
         monkeypatch.setattr(gw, "run_gatewayd", AsyncMock(side_effect=RuntimeError("boom")))
         assert await gw._amain(_quiet_amain) == 1
 

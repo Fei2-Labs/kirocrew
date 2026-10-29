@@ -1,5 +1,6 @@
 ---
 name: papyrus-latex-comments
+app: papyrus
 description: Set up and use a non-destructive COMMENT layer in a LaTeX document — margin/inline notes tagged by type next to the author's text, without rewriting it. Use when asked to comment on, review or annotate a .tex file. For accept/reject replacement text, use papyrus-latex-suggestions.
 triggers: latex comment, annotate tex, todonotes, margin note, aicomment
 ---
@@ -14,9 +15,12 @@ taxonomy. To propose concrete replacement text (accept/reject), use
 
 ## Step 1 — Setup (idempotent)
 
-```bash
-kpsewhich todonotes.sty    # non-empty = installed (ships with TeX Live — usually no install)
-```
+`todonotes` ships with TeX Live, so normally nothing needs installing. Do not
+probe for it with `kpsewhich` and do not try to install it: the app may compile
+with Tectonic (its managed install, or a `~/texlive` not on PATH), where
+`kpsewhich` is absent and an empty answer proves nothing. Inject the preamble
+below; if the author's next compile reports `File 'todonotes.sty' not found`,
+handle it with `papyrus-diagnose-compilation`.
 
 If the document has no comment preamble yet, inject this once at the end of the
 preamble, after all existing \usepackage lines (never duplicate it if it is

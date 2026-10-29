@@ -1,7 +1,7 @@
 /**
  * The class recipes a conversation-list panel is made of, shared by the
  * Sessions sidebar (`pages/ChatSidebar.tsx`) and the Crew Members roster
- * (`pages/members/MembersPage.tsx`) so the two lists read as one surface:
+ * (`pages/members/MembersPageRoster.tsx`) so the two lists read as one surface:
  * same card, same header line, same row box, same type scale.
  *
  * They live here as whole class strings rather than as values copied between
@@ -28,8 +28,13 @@ export const LIST_HEADER_CLS = 'flex justify-between items-center px-2 mt-0.5 h-
  *  kiro themes retint (index.css). */
 export const LIST_TITLE_CLS = 'sessions-panel-title text-sm font-semibold text-text-strong tracking-[.04em] truncate'
 
-/** The scrolling list body. */
-export const LIST_BODY_CLS = 'flex-1 min-h-0 overflow-y-auto scrollbar-none p-2'
+/** The scrolling list body. Its top padding is the floating search dock's live
+ *  height plus a 4px rest gap (`--list-dock-h`, written by components/ListDock.tsx),
+ *  so the first row starts just below the glass at rest and slides under it on
+ *  scroll; the 8px fallback is the plain `p-2` for a body mounted with no dock.
+ *  The same value is the scroll-padding, so a row brought in by `scrollIntoView`
+ *  (a deep-linked crewmate, the open session) lands below the dock, not under it. */
+export const LIST_BODY_CLS = 'flex-1 min-h-0 overflow-y-auto scrollbar-none p-2 pt-[var(--list-dock-h,0.5rem)] scroll-pt-[var(--list-dock-h,0.5rem)]'
 
 /** A row's box: the rounded hover/selection surface. */
 export const ROW_BOX_CLS = 'pl-3.5 pr-3 py-2 rounded-md'

@@ -7,6 +7,7 @@ import importlib
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -15,6 +16,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard import handlers
+from kiro_crew.onboarding_sources import gemini as gemini_source
 
 
 class _AuditLog:
@@ -23,6 +25,11 @@ class _AuditLog:
 
     def log_api_access(self, **event: Any) -> None:
         self.events.append(event)
+
+
+# Keep apply_import's MCP sidecar lock off the real ~/.kiro/settings (see the
+# shared fixture in test/conftest.py).
+pytestmark = pytest.mark.usefixtures("isolate_mcp_host_paths")
 
 
 def _handler_module():
@@ -719,6 +726,42 @@ async def test_state_failure_is_generic_and_credential_free(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_state_names_an_unreadable_config(monkeypatch, tmp_path) -> None:
+    """A config.json the gateway cannot parse is the one failure the user can fix.
+
+    It is also self-perpetuating: the loader reads the same unparseable file as
+    defaults, so ``import_onboarded`` comes back false and first run reopens on
+    every load, while the fail-closed write behind every exit refuses. The
+    response has to say which of those it is, or the UI can only print a
+    generic retry message for a failure no retry clears.
+    """
+    module = _handler_module()
+    audit = _AuditLog()
+    config = tmp_path / "config.json"
+    # Cut off mid-document, as a torn hand edit leaves it: unreadable, not
+    # empty, so the fail-closed write must refuse rather than replace it.
+    original = b'{"dashboard": {"import_onboarded": fal'
+    config.write_bytes(original)
+    monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: config)
+    monkeypatch.setattr(module, "_sel", lambda: audit)
+
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.put(
+            "/api/onboarding/import/state",
+            json={"completed": True},
+            headers={"X-Test-User": "owner"},
+        )
+        response_body = await response.json()
+
+    assert response.status == 500
+    assert response_body == {"error": "request failed", "code": "config_unreadable"}
+    assert audit.events[-1]["error"] == "config_unreadable"
+    # Fail closed: the unreadable file is left exactly as it was.
+    assert config.read_bytes() == original
+    assert str(tmp_path) not in str(response_body)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "strategy",
     ["obliterate", "SKIP", "", 1, True],
@@ -906,6 +949,9 @@ async def test_scan_never_writes(monkeypatch, tmp_path) -> None:
     def refuse_write(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("preview wrote to a destination")
 
+    # The ``_write_json`` patch reaches the ledger, the JSON restore copies and
+    # ``mcp.json``, all through the apply owner's single binding, which the facade
+    # forwards it to. Refusing ``apply_import`` is what keeps every other writer out.
     monkeypatch.setattr(backend, "_write_json", refuse_write)
     monkeypatch.setattr(backend, "apply_import", refuse_write)
 
@@ -1143,7 +1189,7 @@ def test_handler_category_tables_match_the_backend() -> None:
     # rows, where a missing label silently falls back to "General". Pin every
     # category the unsupported-dirs table can emit to a real label.
     assert set(module._CATEGORY_NAMES) >= {
-        category for _, category in backend._GEMINI_UNSUPPORTED_DIRS
+        category for _, category in gemini_source._GEMINI_UNSUPPORTED_DIRS
     }
 
 
@@ -1271,3 +1317,79 @@ async def test_every_refusal_carries_a_code(monkeypatch) -> None:
             assert response.status >= 400, body
             assert isinstance(body.get("code"), str) and body["code"], body
             assert isinstance(body.get("error"), str) and body["error"], body
+
+
+def _mcp_only_backend():
+    def preview_import(source_ids=None):
+        return {
+            "sources": [
+                {
+                    "id": "codex",
+                    "categories": [{"id": "mcp_servers", "selected": True}],
+                }
+            ],
+            "selection": [{"source_id": "codex", "category_id": "mcp_servers"}],
+        }
+
+    def apply_import(plan, **kwargs):
+        return {"imported": {"mcp_servers": 1}, "imported_count": 1, "already_imported": 0}
+
+    return SimpleNamespace(preview_import=preview_import, apply_import=apply_import)
+
+
+async def _apply_mcp_import(module) -> dict:
+    async with TestClient(TestServer(_make_app(module))) as client:
+        response = await client.post(
+            "/api/onboarding/import/apply",
+            json={"sources": [{"id": "codex", "categories": ["mcp_servers"]}]},
+            headers={"X-Test-User": "owner"},
+        )
+        assert response.status == 200
+        return await response.json()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rebuild", "expected"),
+    [
+        pytest.param(
+            lambda **kw: (kw["_wrote_out"].append(True), Path("/dev/null"))[1],
+            True,
+            id="wrote",
+        ),
+        # The shared-home guard refused: the path comes back and nothing is written.
+        pytest.param(lambda **_: Path("/dev/null"), False, id="declined"),
+    ],
+)
+async def test_apply_reports_whether_the_agent_spec_was_rewritten(
+    monkeypatch, rebuild, expected
+) -> None:
+    import kiro_crew.agent as agent_mod
+
+    module = _handler_module()
+    monkeypatch.setattr(module, "_backend", _mcp_only_backend)
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", rebuild)
+
+    body = await _apply_mcp_import(module)
+
+    assert body["summary"]["imported"] == 1
+    assert body["agent_spec_rewritten"] is expected
+
+
+@pytest.mark.asyncio
+async def test_a_failed_rebuild_keeps_the_import_and_reports_it(monkeypatch) -> None:
+    """The MCP entries already landed, so a rebuild error is a report, not a 500."""
+    import kiro_crew.agent as agent_mod
+
+    def boom(**_):
+        raise RuntimeError("boom")
+
+    module = _handler_module()
+    monkeypatch.setattr(module, "_backend", _mcp_only_backend)
+    monkeypatch.setattr(module, "_sel", lambda: _AuditLog())
+    monkeypatch.setattr(agent_mod, "rebuild_agent_config", boom)
+
+    body = await _apply_mcp_import(module)
+
+    assert body["agent_spec_rewritten"] is False

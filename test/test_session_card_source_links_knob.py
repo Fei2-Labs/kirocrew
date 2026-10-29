@@ -27,6 +27,7 @@ import kiro_crew.dashboard.handlers.source_providers as sp
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_handlers import api_chat_slot_source_links
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+from kiro_crew.testing.wait import default_timeout
 
 PRS = [f"https://github.com/acme/widgets/pull/{n}" for n in (11, 12)]
 ISSUES = [f"https://github.com/acme/widgets/issues/{n}" for n in (21, 22)]
@@ -110,8 +111,13 @@ class TestSnapshotRead:
             "kiro_crew.config.loader.KiroCrewConfig.load",
             staticmethod(lambda *a, **k: (_ for _ in ()).throw(OSError("torn read"))),
         )
-        gitlab, jira, chips = sp._load_source_link_settings()
-        assert (gitlab, jira) == (frozenset(), frozenset())
+        gitlab, jira, chips, github, bitbucket_server = sp._load_source_link_settings()
+        assert (gitlab, jira, github, bitbucket_server) == (
+            frozenset(),
+            frozenset(),
+            frozenset(),
+            frozenset(),
+        )
         assert chips is True
 
     @pytest.mark.asyncio
@@ -135,12 +141,14 @@ class TestSnapshotRead:
         started = asyncio.Event()
         release = asyncio.Event()
 
-        def slow_load() -> tuple[frozenset[str], frozenset[str], bool]:
+        def slow_load() -> (
+            tuple[frozenset[str], frozenset[str], bool, frozenset[str], frozenset[str]]
+        ):
             # Runs in a worker thread: marshal the Event back onto the loop.
             loop.call_soon_threadsafe(started.set)
-            asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=5)
+            asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=default_timeout())
             # The reading this load is holding: chips still ON.
-            return frozenset(), frozenset(), True
+            return frozenset(), frozenset(), True, frozenset(), frozenset()
 
         monkeypatch.setattr(sp, "_load_source_link_settings", slow_load)
 
@@ -159,9 +167,11 @@ class TestSnapshotRead:
 class TestSlotPayload:
     def test_on_by_default_serializes_the_strip(self) -> None:
         payload = _slot().to_dict()
+        # Three chips in total, pull requests first: both PRs and the newest
+        # issue; the other issue is behind "+1".
         assert [link["url"] for link in payload["source_links"]] == [
             *reversed(PRS),
-            *reversed(ISSUES),
+            ISSUES[-1],
         ]
         assert payload["source_links_total"] == 4
 
@@ -191,7 +201,7 @@ class TestSerializeSlots:
         state._slots = {"s1": _slot("s1"), "s2": _slot("s2")}
 
         _set_config(monkeypatch, True)
-        assert [len(p["source_links"]) for p in state.serialize_slots()] == [4, 4]
+        assert [len(p["source_links"]) for p in state.serialize_slots()] == [3, 3]
 
         _set_config(monkeypatch, False)
         assert [p["source_links"] for p in state.serialize_slots()] == [[], []]
@@ -224,7 +234,9 @@ class TestSerializeSlots:
         _set_config(monkeypatch, False)
         assert state.serialize_slot(slot)["source_links"] == []
         _set_config(monkeypatch, True)
-        assert len(state.serialize_slot(slot)["source_links"]) == 4
+        # Two PRs and two issues: the shared three-chip budget keeps both PRs
+        # and the newest issue.
+        assert len(state.serialize_slot(slot)["source_links"]) == 3
 
 
 class TestCheckRefreshFeed:

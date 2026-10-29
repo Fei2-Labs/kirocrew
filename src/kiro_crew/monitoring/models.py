@@ -16,13 +16,20 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Protocol
 
+from kiro_crew.monitoring.limits import MAX_RUNTIME_CEILING_SECS
 from kiro_crew.monitoring.registry import PULL_REQUEST_MONITOR_KINDS
 
 logger = logging.getLogger(__name__)
 
 MONITOR_STATE_VERSION = 1
 DEFAULT_MONITOR_RUNTIME_SECS = 14_400
-DEFAULT_MONITOR_AGENT_TURNS = 8
+#: Wake ceiling a watch nobody configured carries. Zero is the unlimited
+#: sentinel, so the default watch is retired by its runtime, token and
+#: provider-error budgets rather than by a count of wakes. A ceiling on wakes
+#: bounds how many times the subject may need its owner, which is a property of
+#: the subject rather than of what the watch costs, so counting it is not what
+#: keeps a watch affordable -- ``DEFAULT_MONITOR_RUNTIME_SECS`` is.
+DEFAULT_MONITOR_AGENT_TURNS = 0
 DEFAULT_MONITOR_TOKENS = 250_000
 DEFAULT_MONITOR_PROVIDER_ERRORS = 3
 DEFAULT_MONITOR_CADENCE_SECS = 300
@@ -31,16 +38,19 @@ MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 MONITOR_STOP_INVALID_RECORD = "invalid_monitor_record"
 MIN_MONITOR_CADENCE_SECS = 15
 MAX_MONITOR_CADENCE_SECS = 86_400
-MAX_MONITOR_RUNTIME_SECS = 604_800
-MAX_MONITOR_AGENT_TURNS = 8
+MAX_MONITOR_RUNTIME_SECS = MAX_RUNTIME_CEILING_SECS
+#: Ceiling on an EXPLICIT positive wake budget. It binds only a caller who asked
+#: for a finite count; zero, the unlimited sentinel, passes it untouched. The
+#: value is the one the legacy prompt loop already publishes as its ``max_cycles``
+#: bound, so the two cycle caps a caller can reach agree on where "a runaway
+#: backstop" stops being a plausible number.
+MAX_MONITOR_AGENT_TURNS = 1_000
 MAX_MONITOR_TOKENS = 1_000_000
 MAX_MONITOR_PROVIDER_ERRORS = 20
 MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS = 1_000
 MAX_MONITOR_STOP_REASON_CHARS = 500
 MAX_MONITOR_CHECK_NAMES = 8
 MAX_MONITOR_PROVIDER_CONCURRENCY = 4
-MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET = 100
-MAX_MONITOR_CHECK_IDENTITY_CHARS = 200
 # The normal turn ceiling is two hours. One extra minute lets the raw completion
 # callback win the timeout race while keeping missing evidence restart-durable
 # and bounded.
@@ -119,6 +129,23 @@ PULL_REQUEST_OBSERVATION_FIELDS = (
     "unresolved_review_threads",
 )
 PULL_REQUEST_CHECK_FIELDS = ("failed", "passed", "pending", "unknown")
+#: The one canonical check bucket that is OPTIONAL. A row lands here when a newer
+#: run of its own identity displaced it, so the row is retained and reported while
+#: carrying no verdict: it is terminal and non-blocking, which means the readiness
+#: classifier must leave it out of BOTH actionable and pending, and the overflow
+#: marker must not count it -- a board whose live rows are all measured stays
+#: complete however many displaced rows sit beside them. The bucket is written only
+#: when it holds something, so a subject without displaced rows keeps the exact
+#: canonical shape every provider shares, which full-dict equality tests pin and
+#: the fingerprint hashes. Every other bucket name is required and always present.
+PULL_REQUEST_SUPERSEDED_CHECK_FIELD = "superseded"
+#: The identity that replaces the last entry when the displaced bucket is cut. It is
+#: spent inside the bucket rather than on ``checks_complete`` because a displaced row
+#: carries no verdict, so a cut there leaves the board fully measured. It is named here
+#: because two readers depend on the same spelling: the projection writes it, and the
+#: compact inspection reads it to keep its count off the sentinel and to say the cut
+#: out loud -- a compact reader never sees the list itself.
+PULL_REQUEST_SUPERSEDED_INCOMPLETE_IDENTITY = f"{PULL_REQUEST_SUPERSEDED_CHECK_FIELD}:incomplete"
 PULL_REQUEST_BLOCKING_REVIEWS = {
     "unknown",
     "changes_requested",
@@ -321,8 +348,10 @@ def monitor_frontend_contract() -> dict[str, object]:
                 "maximum": MAX_MONITOR_RUNTIME_SECS,
                 "defaultValue": DEFAULT_MONITOR_RUNTIME_SECS,
             },
+            # Zero is admitted as the unlimited sentinel, which is why this one
+            # field has a floor of 0 where its three siblings have 1.
             "maxAgentTurns": {
-                "minimum": 1,
+                "minimum": 0,
                 "maximum": MAX_MONITOR_AGENT_TURNS,
                 "defaultValue": DEFAULT_MONITOR_AGENT_TURNS,
             },
@@ -382,7 +411,10 @@ class MonitorActionCompletion:
 class MonitorBudgets:
     """Hard bounds for a structured monitor.
 
-    Unlike legacy AutoNudge values, zero never means unlimited here.
+    ``max_agent_turns`` is the one field where zero means unlimited, matching the
+    legacy prompt loop's ``max_cycles``. The other three reject it: a watch with
+    no runtime, token or provider-error bound is a watch with no cost ceiling at
+    all, which is what the unlimited wake count relies on to stay affordable.
     """
 
     max_runtime_secs: int = DEFAULT_MONITOR_RUNTIME_SECS
@@ -398,10 +430,18 @@ class MonitorBudgets:
             "max_provider_errors",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.max_agent_turns > DEFAULT_MONITOR_AGENT_TURNS:
-            raise ValueError(f"max_agent_turns must be at most {DEFAULT_MONITOR_AGENT_TURNS}")
+            floor = 0 if name == "max_agent_turns" else 1
+            if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+                requirement = (
+                    "a non-negative integer, where zero means unlimited"
+                    if floor == 0
+                    else "a positive integer"
+                )
+                raise ValueError(f"{name} must be {requirement}")
+        if self.max_runtime_secs > MAX_MONITOR_RUNTIME_SECS:
+            raise ValueError(f"max_runtime_secs must be at most {MAX_MONITOR_RUNTIME_SECS}")
+        if self.max_agent_turns > MAX_MONITOR_AGENT_TURNS:
+            raise ValueError(f"max_agent_turns must be at most {MAX_MONITOR_AGENT_TURNS}")
 
 
 class MonitorSeverity(str, Enum):
@@ -783,6 +823,13 @@ def resolve_probe_result(results: object, subject: str) -> MonitorProbeResult:
     return result
 
 
+#: Longest short-reading digest a loaded record may carry. The gate writes a
+#: 16-character hex digest; the bound is what holds when the record came off a store
+#: an agent shell can write. A longer value is dropped, which fails to match and so
+#: delivers.
+_MAX_SHORT_READING_DIGEST_CHARS = 64
+
+
 @dataclass
 class MonitorState:
     """Restart-durable state for one structured monitor."""
@@ -943,6 +990,51 @@ class MonitorState:
     #: anything was observed. Counted apart from wakes so the metering does not
     #: report a periodic delivery as a real signal.
     floor_ticks: int = 0
+    #: True from the tick that DECIDES a floor delivery until that delivery is
+    #: CONFIRMED.
+    #:
+    #: The decision publishes a reset ``quiet_streak`` durably, so the only record
+    #: that a turn was due is gone the moment the decision lands -- while the
+    #: in-process claim carrying the debt lives in memory. A gateway death in
+    #: between therefore keeps the half that suppresses and loses the half that
+    #: delivers: the next tick reads a subject that has not changed against a
+    #: baseline written for a turn nobody received, answers quiet, and the forced
+    #: delivery moves a whole floor away with nothing saying one was owed.
+    #: ``followup_ticks`` is not the backstop, because it answers a fire the slot
+    #: REFUSED and a process that stopped refuses nothing.
+    #:
+    #: So the debt is durable and outlives the fire. Finding it set on a later tick
+    #: means a floor delivery is still owed, and that tick fires WITHOUT observing:
+    #: re-observing would read the same unchanged subject and answer quiet again.
+    #: It is discharged at the one point delivery is confirmed -- the same point
+    #: that charges ``floor_ticks`` -- so a refusal and a death both leave it owed,
+    #: and a retried delivery is charged exactly once.
+    floor_fire_pending: bool = False
+    #: Pull-request watches only: the digest of the SHORT reading the last delivered
+    #: turn was decided on, and how many ticks since then have repeated exactly that
+    #: reading without a turn.
+    #:
+    #: A short reading (the fetch reached the subject and left part of it unread) can
+    #: never be screened quiet on the half that arrived, so without these every tick
+    #: of a degraded forge delivers a turn carrying nothing the last one did not. A
+    #: repeat of the reading a turn was already delivered on is HELD instead, up to
+    #: the gate's ceiling, and anything else -- a change in what was read, a different
+    #: reason it came back short, a whole reading -- delivers or ends the run.
+    #:
+    #: The digest is written only where a delivery is confirmed, so a refused fire or
+    #: a process that stops before its turn lands holds nothing. A whole reading and
+    #: an update that re-aims the loop clear both fields, and an unreadable value
+    #: loads as no baseline at all, which delivers the next short reading.
+    short_reading_digest: str = ""
+    short_reading_held: int = 0
+    #: Work-ledger watches only: the worker-report revision the probe read on its
+    #: newest successful observation, and the one it had read when the last turn
+    #: was DELIVERED. While the two are equal no worker has reported since the
+    #: conductor last looked, so the quiet floor waits four times longer. Empty
+    #: means "not known yet", which keeps the shipped floor: an unknown revision
+    #: resolves toward delivering, like every other doubt in the gate.
+    ledger_revision: str = ""
+    ledger_delivered_revision: str = ""
     #: True from just before a probe runs until its verdict has been consumed.
     #:
     #: The kernel commits its dedupe state BEFORE raising a wake, which is right
@@ -971,6 +1063,13 @@ class MonitorState:
     #: because no outcome is recorded in the meantime a restart in the window finds
     #: a plain live loop rather than one tagged as finished and refused revival.
     terminal_pending: str = ""
+    #: Non-empty once that owed turn LANDED but its settlement has not: the delivery
+    #: moves the outcome out of ``terminal_pending`` into this field, so a restart
+    #: in the window settles without repeating the channel turn. A separate field,
+    #: not a new value of ``terminal_pending``, so a gateway that predates it files
+    #: the key under ``extra_fields`` and writes it back untouched, reads nothing
+    #: owed, and keeps the monitor running at the same state version.
+    terminal_delivered: str = ""
     next_probe_at: float = 0.0
     outcome: MonitorOutcome | None = None
     stopped_reason: str = ""
@@ -1035,12 +1134,43 @@ class MonitorState:
         # unreadable value becomes True and costs at most one turn.
         if not isinstance(self.poll_in_flight, bool):
             self.poll_in_flight = True
+        # Normalised toward doubt for the same reason, and the fail-safe runs the
+        # same way: an unreadable value here means a forced turn may be owed, and
+        # ``bool("")`` would clear that and suppress it. One turn spent beats one
+        # lost, and the flag clears itself on the delivery it asks for.
+        if not isinstance(self.floor_fire_pending, bool):
+            self.floor_fire_pending = True
+        # Normalised toward delivering. An unreadable revision becomes "unknown",
+        # which keeps the shipped floor.
+        if not isinstance(self.ledger_revision, str):
+            self.ledger_revision = ""
+        if not isinstance(self.ledger_delivered_revision, str):
+            self.ledger_delivered_revision = ""
+        # Normalised toward delivering, as a pair. The digest is what lets a repeat be
+        # held, so an unreadable digest, or one longer than any digest this build
+        # writes, becomes "no baseline" and fails to match. An unreadable count says
+        # nothing about how long the hold has lasted, so it drops the baseline too
+        # rather than restarting a hold from zero.
+        if (
+            not isinstance(self.short_reading_digest, str)
+            or len(self.short_reading_digest) > _MAX_SHORT_READING_DIGEST_CHARS
+        ):
+            self.short_reading_digest = ""
+        if (
+            isinstance(self.short_reading_held, bool)
+            or not isinstance(self.short_reading_held, int)
+            or self.short_reading_held < 0
+        ):
+            self.short_reading_held = 0
+            self.short_reading_digest = ""
         # The marker carries an outcome name, so an unreadable value cannot be
         # guessed. Keep it PENDING and record the cautious classification: a
         # delivery still happens, and a subject wrongly called blocked prompts a
         # look rather than a false all-clear.
         if not isinstance(self.terminal_pending, str):
             self.terminal_pending = "blocked" if self.terminal_pending else ""
+        if not isinstance(self.terminal_delivered, str):
+            self.terminal_delivered = "blocked" if self.terminal_delivered else ""
         if not isinstance(self.budgets, MonitorBudgets):
             raise ValueError("budgets must be MonitorBudgets")
         if not isinstance(self.creation_surface, MonitorCreationSurface):
@@ -1271,6 +1401,9 @@ def quarantine_monitor_state(raw: object) -> MonitorState:
         target=_identity("target"),
         objective=_identity("objective"),
         created_ts=created_ts,
+        # An inert quarantine must be constructible even below the ordinary
+        # default runtime. The original invalid budget remains in _raw_payload.
+        budgets=MonitorBudgets(max_runtime_secs=1),
         outcome=MonitorOutcome.BLOCKED,
         stopped_reason=MONITOR_STOP_INVALID_RECORD,
         _raw_payload=raw_payload,
@@ -1288,6 +1421,18 @@ def monitor_state_to_dict(state: MonitorState) -> dict[str, object]:
         for key, value in extra.items():
             payload.setdefault(key, value)
     return payload
+
+
+def _bounded_check_identities(values: object) -> bool:
+    """Whether one canonical check bucket is a bounded list of bounded identities."""
+    return (
+        isinstance(values, list)
+        and len(values) <= MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET
+        and all(
+            isinstance(value, str) and value and len(value) <= MAX_MONITOR_CHECK_IDENTITY_CHARS
+            for value in values
+        )
+    )
 
 
 def _public_pull_request_observation(
@@ -1310,18 +1455,15 @@ def _public_pull_request_observation(
         if field_name not in projected:
             return {}
     for field_name in PULL_REQUEST_CHECK_FIELDS:
-        values = checks.get(field_name)
-        if (
-            not isinstance(values, list)
-            or any(
-                not isinstance(value, str)
-                or not value
-                or len(value) > MAX_MONITOR_CHECK_IDENTITY_CHARS
-                for value in values
-            )
-            or len(values) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET
-        ):
+        if not _bounded_check_identities(checks.get(field_name)):
             return {}
+    # The superseded bucket is the only projected one that may be absent, so it is
+    # validated exactly when it is there. A key outside the projected names is not
+    # copied at all, which is how provider diagnostics stay on the private side.
+    if PULL_REQUEST_SUPERSEDED_CHECK_FIELD in checks and not _bounded_check_identities(
+        checks[PULL_REQUEST_SUPERSEDED_CHECK_FIELD]
+    ):
+        return {}
     unresolved = projected.get("unresolved_review_threads")
     blocking_review = projected.get("blocking_review")
     mergeability = projected.get("mergeability")
@@ -1350,7 +1492,11 @@ def _public_pull_request_observation(
     ):
         return {}
     public = {key: deepcopy(projected[key]) for key in PULL_REQUEST_OBSERVATION_FIELDS}
-    public["checks"] = {key: deepcopy(checks[key]) for key in PULL_REQUEST_CHECK_FIELDS}
+    public["checks"] = {
+        key: deepcopy(checks[key])
+        for key in (*PULL_REQUEST_CHECK_FIELDS, PULL_REQUEST_SUPERSEDED_CHECK_FIELD)
+        if key in checks
+    }
     return public
 
 

@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import pytest
-from source_corpus import candidate_sources
+from source_corpus import parsed_candidates
 
 import kiro_crew
 from kiro_crew.config.loader import KiroCrewConfig
@@ -104,7 +104,7 @@ _CONTEXT_FACTORIES = frozenset(
 )
 
 # Local variable names that conventionally hold a ``PlatformContext``, for the
-# ``ctx = current_context(); ctx.jail`` two-step (used by ``cli.py`` and
+# ``ctx = current_context(); ctx.jail`` two-step (used by ``cli_jail.py`` and
 # ``cli_doctor.py``). Kept narrow on purpose: a broad name set would count
 # unrelated ``ctx.foo`` reads (e.g. an aiohttp request ctx) as seam wiring and
 # make this gate pass vacuously.
@@ -170,23 +170,22 @@ def _parsed_core_source_files() -> Iterator[Tuple[Path, ast.AST]]:
     consumer, :func:`_scan_seam_reads`, extracts what it needs from each tree and
     drops it before the next is parsed.
 
-    Narrowed through ``test/source_corpus.py``'s ``candidate_sources`` rather than a
+    Narrowed through ``test/source_corpus.py``'s ``parsed_candidates`` rather than a
     private ``rglob`` + ``read_text``: a seam read is an attribute on a call to one
     of ``_CONTEXT_FACTORIES`` or on a name in ``_CONTEXT_VAR_NAMES``, so a file whose
     text contains none of those identifiers cannot produce a match and is never a
     false negative to skip (the corpus NFKC-folds both sides, as CPython does for
-    identifiers). The ``platform``/``_vendor`` exclusion stays here, because which
-    files this gate polices is this gate's contract. A file that fails to parse is
-    skipped, matching the defensive behavior the previous per-scanner parses had.
+    identifiers). Streamed as well as narrowed: ``ctx`` is a substring of
+    ``context``, so the candidate set is most of the tree, and a tuple of every
+    candidate's text would be ~120 MiB live before the first parse. The
+    ``platform``/``_vendor`` exclusion stays here, because which files this gate
+    polices is this gate's contract. A file that fails to parse is skipped,
+    the same defensive behavior as a per-scanner parse.
     """
-    for path, text in candidate_sources(
+    for path, _text, tree in parsed_candidates(
         require_any=tuple(sorted(_CONTEXT_FACTORIES | _CONTEXT_VAR_NAMES))
     ):
         if _EXCLUDED_DIRS & set(path.relative_to(_SRC_ROOT).parts):
-            continue
-        try:
-            tree = ast.parse(text)
-        except SyntaxError:  # pragma: no cover - defensive
             continue
         yield path, tree
 
@@ -376,7 +375,7 @@ class TestScannerCoherence:
 
     def test_scanner_finds_two_step_ctx_var_shape(self, field_reads) -> None:
         """``ctx = current_context()`` then ``ctx.jail`` must be recognized."""
-        assert any("cli.py" in site for site in field_reads["jail"]), field_reads["jail"]
+        assert any("cli_jail.py" in site for site in field_reads["jail"]), field_reads["jail"]
 
     def test_scanner_finds_method_level_reads(self, method_reads) -> None:
         assert method_reads.get("identity.status_line"), "method-level scan found nothing"
@@ -687,7 +686,7 @@ class TestReservedSlotWarning:
         # The warning must be actionable: it names the offending adapter AND the
         # wired alternative, so the reader knows what to do instead.
         assert "_MyPackageManager" in caplog.text
-        assert "cli_doctor" in caplog.text
+        assert "doctor_checks/features.py" in caplog.text
 
     def test_non_empty_feature_apps_warns(self, caplog) -> None:
         """``feature_apps`` is a tuple, not an adapter — its default is ``()``."""

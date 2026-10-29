@@ -1,1053 +1,35 @@
-"""Tests for skills module."""
+"""Tests for skills module.
+
+This file pins near-duplicate detection, the ``auto/`` namespace check and
+``create_auto_skill``, and what reaches a turn's context: ``$skill`` resolution, the
+lazy-load skill index, skill search, the withholding of a disabled app's skills and
+frontmatter stripping. ``test_skills_loading.py`` pins the loader's read side,
+``test_skills_triggers.py`` which skills a message triggers, ``test_skills_authoring.py``
+manual create, update and delete and refining and listing auto skills, and
+``skills_helpers.py`` holds the fixtures and builders they share.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
+from skills_helpers import (  # noqa: F401 -- the autouse fixtures register by import
+    _close_skills_loaders,
+    _create_skill,
+    _isolate_extra_paths,
+    _settled,
+)
 
 from kiro_crew.config.loader import KiroCrewConfig, SkillsConfig
-from kiro_crew.skill_usage import SkillUsageLedger
-from kiro_crew.skills import _SHORT_DESC_CHARS, SkillsLoader
-
-
-@pytest.fixture(autouse=True)
-def _isolate_extra_paths(monkeypatch, tmp_path_factory):
-    """SkillsLoader.__init__ reads global config for ``skills.extra_paths`` and
-    edition-contributed skill roots via the ``extra_skills()`` seam; isolate both
-    so a developer's local ~/.kirocrew extra_paths / composed companion roots
-    don't bleed into these hermetic loader tests. Tests that need extra_paths
-    pass ``config=``; tests that need edition-root resolution monkeypatch
-    ``DefaultMcpToolingProvider.extra_skills``."""
-    from kiro_crew.platform.defaults import DefaultMcpToolingProvider
-
-    monkeypatch.setattr(
-        KiroCrewConfig,
-        "load",
-        classmethod(lambda cls: KiroCrewConfig(skills=SkillsConfig(extra_paths=[]))),
-    )
-    monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [])
-
-
-def _create_skill(skills_dir, name, content):
-    """Helper to create a skill directory with SKILL.md."""
-    skill_dir = skills_dir / name
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(content)
-
-
-class TestNoteToolRead:
-    """Only content-delivering reads credit the ledger."""
-
-    def _loader(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(skills_dir, "alpha", "---\nname: alpha\ndescription: A\n---\n# Alpha\n")
-        _create_skill(skills_dir, "beta", "---\nname: beta\ndescription: B\n---\n# Beta\n")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        loader._usage = SkillUsageLedger(tmp_path / "skill-usage.json")
-        return loader, skills_dir
-
-    def _read(self, loader, **kw):
-        """Resolve then credit, the way the ACP layer does across two events."""
-        keys = loader.resolve_tool_read_keys(**kw)
-        loader.credit_skill_reads(keys)
-        return keys
-
-    def test_read_tool_path_credits_a_hit(self, tmp_path):
-        loader, skills_dir = self._loader(tmp_path)
-        path = str(skills_dir / "alpha" / "SKILL.md")
-        assert self._read(loader, tool_name="fs_read", raw_params={"path": path}) == ["alpha"]
-        assert loader._usage.score("alpha")[0] == 1.0
-        assert loader._usage.score("beta")[0] == 0.0
-
-    def test_shell_cat_credits_a_hit(self, tmp_path):
-        loader, skills_dir = self._loader(tmp_path)
-        cmd = f"cat {skills_dir / 'beta' / 'SKILL.md'}"
-        assert self._read(loader, command=cmd) == ["beta"]
-        assert loader._usage.score("beta")[0] == 1.0
-
-    def test_resolution_alone_records_nothing(self, tmp_path):
-        # The ACP layer resolves at call time and credits only once the tool
-        # reports completion, so resolving must have no side effect.
-        loader, skills_dir = self._loader(tmp_path)
-        cmd = f"cat {skills_dir / 'alpha' / 'SKILL.md'}"
-        assert loader.resolve_tool_read_keys(command=cmd) == ["alpha"]
-        assert loader._usage.snapshot() == {}
-
-    def test_one_command_naming_a_file_twice_counts_once(self, tmp_path):
-        loader, skills_dir = self._loader(tmp_path)
-        p = skills_dir / "alpha" / "SKILL.md"
-        assert self._read(loader, command=f"cat {p} && cat {p}") == ["alpha"]
-        assert loader._usage.score("alpha")[0] == 1.0
-
-    def test_non_read_shell_verbs_are_not_credited(self, tmp_path):
-        # A tool call that merely NAMES a skill is not a delivery. Crediting it
-        # would be the same mention-as-use conflation the searches tally avoids:
-        # a maintenance session could push an unread skill up the ranking.
-        loader, skills_dir = self._loader(tmp_path)
-        p = skills_dir / "alpha" / "SKILL.md"
-        for cmd in (
-            f"rm {p}",
-            f"mv {p} /tmp/x",
-            f"wc -l {p}",
-            f"grep -l foo {p}",
-            f"chmod 600 {p}",
-            f"cp {p} /tmp/x",
-            f"stat {p}",
-        ):
-            assert loader.resolve_tool_read_keys(command=cmd) == [], cmd
-        assert loader._usage.snapshot() == {}
-
-    def test_a_read_verb_in_another_segment_does_not_launder_a_delete(self, tmp_path):
-        # `cat` applies to its OWN segment only; without per-segment verb
-        # attribution this would credit the deleted skill.
-        loader, skills_dir = self._loader(tmp_path)
-        p = skills_dir / "alpha" / "SKILL.md"
-        assert loader.resolve_tool_read_keys(command=f"cat /etc/hosts && rm {p}") == []
-
-    def test_read_verb_variants_are_credited(self, tmp_path):
-        loader, skills_dir = self._loader(tmp_path)
-        p = skills_dir / "beta" / "SKILL.md"
-        for cmd in (f"head -20 {p}", f"tail -5 {p}", f"/bin/cat {p}", f"LC_ALL=C cat {p}"):
-            assert loader.resolve_tool_read_keys(command=cmd) == ["beta"], cmd
-
-    def test_non_read_tool_name_is_not_credited(self, tmp_path):
-        # Structured tools are allowlisted: an edit/write tool carrying a path
-        # must not be mistaken for a delivery.
-        loader, skills_dir = self._loader(tmp_path)
-        path = str(skills_dir / "alpha" / "SKILL.md")
-        assert loader.resolve_tool_read_keys("fs_write", {"path": path}) == []
-        assert loader.resolve_tool_read_keys("grep", {"path": path}) == []
-        assert loader.resolve_tool_read_keys("fs_read", {"path": path}) == ["alpha"]
-
-    def test_unrelated_tool_call_records_nothing(self, tmp_path):
-        loader, _ = self._loader(tmp_path)
-        assert self._read(loader, tool_name="fs_read", raw_params={"path": "/etc/hosts"}) == []
-        assert self._read(loader, command="ls -la /tmp") == []
-        assert loader._usage.snapshot() == {}
-
-    def test_path_outside_the_skills_tree_is_not_credited(self, tmp_path):
-        # A file that merely shares the basename must not be attributed to a skill.
-        decoy = tmp_path / "elsewhere"
-        decoy.mkdir()
-        (decoy / "SKILL.md").write_text("---\nname: fake\n---\n")
-        loader, _ = self._loader(tmp_path)
-        assert loader.resolve_tool_read_keys("fs_read", {"path": str(decoy / "SKILL.md")}) == []
-
-    def test_malformed_params_do_not_raise(self, tmp_path):
-        loader, _ = self._loader(tmp_path)
-        assert loader.resolve_tool_read_keys("fs_read", {"path": 42}) == []
-        assert loader.resolve_tool_read_keys("fs_read", {"paths": [None, 7]}) == []
-        assert loader.resolve_tool_read_keys("fs_read", "not-a-dict") == []  # type: ignore[arg-type]
-
-    def test_read_without_a_ledger_is_a_noop(self, tmp_path):
-        loader, skills_dir = self._loader(tmp_path)
-        loader._usage = None
-        path = str(skills_dir / "alpha" / "SKILL.md")
-        assert loader.resolve_tool_read_keys("fs_read", {"path": path}) == []
-
-    def test_symlinked_skill_credits_the_canonical_key(self, tmp_path):
-        # Reading through a symlinked skill must credit the same key the budget
-        # screen shows, or one file's cost splits across two rows.
-        loader, skills_dir = self._loader(tmp_path)
-        link_dir = skills_dir / "alpha-alias"
-        link_dir.mkdir()
-        try:
-            (link_dir / "SKILL.md").symlink_to(skills_dir / "alpha" / "SKILL.md")
-        except (OSError, NotImplementedError):
-            pytest.skip("symlinks unavailable on this platform")
-        loader._invalidate_iter_cache()  # re-walk so the alias is served
-        recorded = self._read(
-            loader, tool_name="fs_read", raw_params={"path": str(link_dir / "SKILL.md")}
-        )
-        canonical = loader._served_key_by_realpath()[
-            str((skills_dir / "alpha" / "SKILL.md").resolve())
-        ]
-        assert recorded == [canonical] == ["alpha"]
-
-
-class TestBoundedSkillReads:
-    @pytest.mark.parametrize("extra", [False, True], ids=["local", "extra"])
-    def test_complete_body_fits_exact_byte_bound(self, tmp_path, extra):
-        root = tmp_path / "installed"
-        _create_skill(root, "alpha", "placeholder")
-        path = root / "alpha" / "SKILL.md"
-        raw = "Instructions café".encode("utf-8")
-        path.write_bytes(raw)
-        loader = SkillsLoader(
-            skills_path=tmp_path / "local" if extra else root,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(extra_paths=[str(root)] if extra else [])),
-        )
-
-        assert loader.load_skill("alpha", max_bytes=len(raw)) == raw.decode("utf-8")
-        assert loader.load_skill("alpha", max_bytes=len(raw) - 1) is None
-
-    def test_unbounded_global_read_keeps_strict_utf8(self, tmp_path):
-        root = tmp_path / "skills"
-        _create_skill(root, "alpha", "placeholder")
-        (root / "alpha" / "SKILL.md").write_bytes(b"instructions\xff")
-        loader = SkillsLoader(skills_path=root, install_builtins=False)
-
-        with pytest.raises(UnicodeDecodeError):
-            loader.load_skill("alpha")
-
-    def test_global_link_to_sensitive_directory_is_refused(self, tmp_path, monkeypatch):
-        from conftest import make_dir_link
-        from kiro_crew.hooks import validate_file_path
-
-        crew_home = tmp_path / "crew"
-        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
-        secret_dir = crew_home / ".vault"
-        secret_dir.mkdir(parents=True)
-        secret = secret_dir / "SKILL.md"
-        secret.write_text("credential sentinel", encoding="utf-8")
-        assert validate_file_path(str(secret)) is None
-        root = tmp_path / "skills"
-        root.mkdir()
-        make_dir_link(root / "alpha", secret_dir)
-        loader = SkillsLoader(skills_path=root, install_builtins=False)
-
-        assert loader.load_skill("alpha", max_bytes=100) is None
-
-    def test_extra_directory_swap_after_validation_is_refused(self, tmp_path, monkeypatch):
-        from conftest import make_dir_link
-        from kiro_crew import skills
-
-        crew_home = tmp_path / "crew"
-        monkeypatch.setenv("KIROCREW_HOME", str(crew_home))
-        secret_dir = crew_home / ".vault"
-        secret_dir.mkdir(parents=True)
-        (secret_dir / "SKILL.md").write_text("credential sentinel", encoding="utf-8")
-        extra = tmp_path / "extra"
-        _create_skill(extra, "alpha", "safe instructions")
-        loader = SkillsLoader(
-            skills_path=tmp_path / "local",
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(extra_paths=[str(extra)])),
-        )
-        original_validate = skills.validate_file_path
-        swapped = False
-
-        def validate_then_swap(raw):
-            nonlocal swapped
-            resolved = original_validate(raw)
-            assert resolved is not None
-            (extra / "alpha").rename(extra / "original")
-            make_dir_link(extra / "alpha", secret_dir)
-            swapped = True
-            return resolved
-
-        monkeypatch.setattr(skills, "validate_file_path", validate_then_swap)
-
-        assert loader.load_skill("alpha", max_bytes=100) is None
-        assert swapped
-
-    def test_hardlinked_body_is_refused(self, tmp_path):
-        root = tmp_path / "skills"
-        _create_skill(root, "alpha", "safe instructions")
-        (root / "alias.md").hardlink_to(root / "alpha" / "SKILL.md")
-        loader = SkillsLoader(skills_path=root, install_builtins=False)
-
-        assert loader.load_skill("alpha", max_bytes=100) is None
-
-    def test_validated_provider_directory_link_remains_readable(self, tmp_path):
-        from conftest import make_dir_link
-
-        provider = tmp_path / "provider"
-        _create_skill(provider, "alpha", "safe instructions")
-        root = tmp_path / "skills"
-        root.mkdir()
-        make_dir_link(root / "alpha", provider / "alpha")
-        loader = SkillsLoader(skills_path=root, install_builtins=False)
-
-        assert loader.load_skill("alpha", max_bytes=100) == "safe instructions"
-
-
-class TestSkillsLoader:
-    def test_list_empty(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        assert loader.list_skills() == []
-
-    def test_list_skills(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "weather",
-            "---\nname: weather\ndescription: Get weather info\n---\n# Weather\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        skills = loader.list_skills()
-        assert len(skills) == 1
-        assert skills[0]["name"] == "weather"
-        assert skills[0]["description"] == "Get weather info"
-
-    def test_load_skill(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(skills_dir, "test", "---\nname: test\n---\n# Test Skill\nDo stuff.")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        content = loader.load_skill("test")
-        assert content is not None
-        assert "Test Skill" in content
-
-    def test_load_missing_skill(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        assert loader.load_skill("nonexistent") is None
-
-    def test_always_skills(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "memory",
-            "---\nname: memory\ndescription: Memory system\nalways: true\n---\n# Memory\n",
-        )
-        _create_skill(
-            skills_dir,
-            "weather",
-            "---\nname: weather\ndescription: Weather\n---\n# Weather\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        always = loader.get_always_skills()
-        assert "memory" in always
-        assert "weather" not in always
-
-    def test_get_context(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "memory",
-            "---\nname: memory\ndescription: Memory system\nalways: true\n---\n# Memory\nUse it.",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        ctx = loader.get_context()
-        assert "[Skills:]" in ctx
-        assert "Memory" in ctx
-        assert "Use it." in ctx
-
-    def test_get_context_empty(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "empty", install_builtins=False)
-        assert loader.get_context() == ""
-
-    def test_mutators_invalidate_iter_cache(self, tmp_path):
-        """create/update/delete must invalidate the TTL'd _iter cache so a
-        subsequent list_skills() reflects the change immediately (not after the
-        TTL). Each step primes the cache via list_skills() first, mutates, then
-        re-lists in the same tick — without invalidation these would be stale."""
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        body = "---\nname: x\ndescription: X\n---\n# X\n"
-
-        # create: prime empty, create, must appear now
-        assert loader.list_skills() == []
-        assert loader.create_skill("alpha", body) is True
-        assert any(s["key"] == "alpha" for s in loader.list_skills())
-
-        # update: prime, overwrite, new description must appear now
-        assert loader.update_skill("alpha", body.replace("X", "Updated")) is True
-        assert any(s["description"] == "Updated" for s in loader.list_skills())
-
-        # delete: prime, remove, must disappear now
-        assert loader.delete_skill("alpha") is True
-        assert all(s["key"] != "alpha" for s in loader.list_skills())
-
-    def test_update_reflected_when_mtime_unchanged(self, tmp_path):
-        """Deterministic gate for the same-tick frontmatter-cache staleness the
-        mutators guard against. list_skills() primes the mtime-keyed frontmatter
-        cache; then update_skill overwrites the file and we PIN mtime back to the
-        pre-update value (simulating a coarse- or same-tick filesystem write).
-        Without _fm_cache invalidation the stale parse ('X') would survive even
-        though the file on disk now says 'Updated'. Unlike
-        test_mutators_invalidate_iter_cache, this does not depend on the host
-        filesystem's mtime granularity."""
-        import os
-
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        body = "---\nname: x\ndescription: X\n---\n# X\n"
-        assert loader.create_skill("alpha", body) is True
-        # Prime the frontmatter cache with description "X".
-        assert any(s["description"] == "X" for s in loader.list_skills())
-        skill_file = tmp_path / "skills" / "alpha" / "SKILL.md"
-        pinned = skill_file.stat().st_mtime_ns
-
-        assert loader.update_skill("alpha", body.replace("X", "Updated")) is True
-        # Force the mtime back so an mtime-keyed cache cannot tell the file changed.
-        os.utime(skill_file, ns=(pinned, pinned))
-        assert any(s["description"] == "Updated" for s in loader.list_skills())
-
-    def test_update_auto_skill_invalidates_cache_same_mtime(self, tmp_path):
-        """update_auto_skill (the auto-skill refine path) must invalidate cached
-        frontmatter too, or a refined skill's new triggers/description stay stale
-        when the rewrite lands in the same mtime tick as the priming read."""
-        import os
-
-        from kiro_crew.skills import AutoSkillProvenance
-
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        prov = AutoSkillProvenance(session_key="s1", created_at="2026-01-01T00:00:00Z")
-        name = loader.create_auto_skill(
-            slug="alpha",
-            description="Original",
-            triggers="one, two",
-            procedure_md="# Do it",
-            provenance=prov,
-        )
-        assert name is not None
-        # Prime the frontmatter cache with the original description.
-        assert any(s["description"] == "Original" for s in loader.list_skills())
-        skill_file = tmp_path / "skills" / name / "SKILL.md"
-        pinned = skill_file.stat().st_mtime_ns
-
-        assert (
-            loader.update_auto_skill(
-                name=name,
-                description="Refined",
-                triggers="three, four",
-                procedure_md="# Do it better",
-                provenance=prov,
-            )
-            is True
-        )
-        os.utime(skill_file, ns=(pinned, pinned))
-        assert any(s["description"] == "Refined" for s in loader.list_skills())
-
-
-class TestRepoScope:
-    """``repo_scope:`` frontmatter mechanically suppresses a skill unless the
-    SESSION's active project directory (or an ancestor) contains the named
-    relative path — the loader-enforced gate for repo-specific skills with
-    destructive instructions (prose scope guards are
-    probabilistic; containment must be mechanical before shipping to every
-    install).
-
-    The gate is keyed on the project, never on the process working directory:
-    this runs in the gateway while it assembles context, so ``Path.cwd()`` is
-    the gateway's own directory and answers by install shape rather than by the
-    work the session is doing."""
-
-    def _write_skill(self, root: Path, name: str, scope: str | None, always: bool = False) -> None:
-        d = root / name
-        d.mkdir(parents=True)
-        fm = f"---\nname: {name}\ntriggers: zebra quokka\n"
-        if scope:
-            fm += f"repo_scope: {scope}\n"
-        if always:
-            fm += "always: true\n"
-        (d / "SKILL.md").write_text(fm + "---\nbody")
-
-    def _repo(self, tmp_path: Path, name: str = "checkout") -> Path:
-        repo = tmp_path / name
-        (repo / "src" / "kiro_crew").mkdir(parents=True)
-        # A real checkout carries a .git entry, and the gate reads it as the
-        # boundary the ancestor walk stops at, so the fixture needs one to model a
-        # repository rather than a bare directory tree.
-        (repo / ".git").mkdir()
-        return repo
-
-    def _other_repo(self, tmp_path: Path, name: str) -> Path:
-        """A project that is some OTHER repository, wherever ``tmp_path`` lives.
-
-        The gate walks a project's ancestors up to the first ``.git``. A bare
-        directory under ``tmp_path`` has no boundary of its own, so whether the
-        walk finds ``src/kiro_crew`` above it is decided by the host: a harness that
-        pins ``TMPDIR`` under this checkout puts the real one in every ancestor
-        chain. Giving the project its own ``.git`` models what "outside the repo"
-        means to the gate -- a different repository -- and stops the walk there.
-        """
-        other = tmp_path / name
-        other.mkdir()
-        (other / ".git").mkdir()
-        return other
-
-    def test_scoped_skill_suppressed_without_a_project(self, tmp_path: Path) -> None:
-        # No project named at all -> fail closed. An un-scoped surface (eval
-        # harness, a session with no project set) never inherits repo rules.
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "repo-only", "src/kiro_crew")
-        loader = SkillsLoader(skills_path=skills, install_builtins=False)
-        assert loader.get_triggered_skills("zebra quokka") == []
-
-    def test_scoped_skill_suppressed_outside_repo(self, tmp_path: Path) -> None:
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "repo-only", "src/kiro_crew")
-        loader = SkillsLoader(skills_path=skills, install_builtins=False)
-        outside = self._other_repo(tmp_path, "elsewhere")
-        assert loader.get_triggered_skills("zebra quokka", project_dir=str(outside)) == []
-
-    def test_scoped_skill_eligible_inside_repo(self, tmp_path: Path) -> None:
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "repo-only", "src/kiro_crew")
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
-        subdir = self._repo(tmp_path) / "website"
-        subdir.mkdir()
-        # ancestor of the project dir contains src/kiro_crew
-        assert loader.get_triggered_skills("zebra quokka", project_dir=str(subdir)) == ["repo-only"]
-
-    def test_process_cwd_does_not_admit_the_skill(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The regression this gate had: a gateway whose OWN cwd sits inside a
-        # scoped checkout admitted the skill into every session, whatever the
-        # session was working on. Standing in the repo must decide nothing.
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "repo-only", "src/kiro_crew")
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
-        monkeypatch.chdir(self._repo(tmp_path))
-        other = self._other_repo(tmp_path, "some-rust-project")
-        assert loader.get_triggered_skills("zebra quokka") == []
-        assert loader.get_triggered_skills("zebra quokka", project_dir=str(other)) == []
-
-    def test_always_path_is_gated_identically(self, tmp_path: Path) -> None:
-        # Both injection paths share one helper; a pinned skill must not be a
-        # way around the gate.
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "repo-only", "src/kiro_crew", always=True)
-        loader = SkillsLoader(skills_path=skills, install_builtins=False)
-        other = self._other_repo(tmp_path, "some-rust-project")
-        assert loader.get_always_skills() == []
-        assert loader.get_always_skills(str(other)) == []
-        assert loader.get_always_skills(str(self._repo(tmp_path))) == ["repo-only"]
-
-    def test_unscoped_skill_unaffected(self, tmp_path: Path) -> None:
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "anywhere", None)
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
-        assert loader.get_triggered_skills("zebra quokka") == ["anywhere"]
-
-    def test_traversal_scope_fails_closed(self, tmp_path: Path) -> None:
-        # ".." in the scope must never widen the check — fails closed.
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "sneaky", "../..")
-        loader = SkillsLoader(skills_path=skills, install_builtins=False)
-        assert loader.get_triggered_skills("zebra quokka", project_dir=str(tmp_path)) == []
-
-    def test_scoped_skill_is_absent_from_the_index_too(self, tmp_path: Path) -> None:
-        # Dropping only the BODY leaves the summary line in the skill index, and
-        # the index tells the agent to read the full file for anything related -
-        # so the repo-specific procedure stays one `cat` away.
-        skills = tmp_path / "skills"
-        self._write_skill(skills, "repo-only", "src/kiro_crew")
-        self._write_skill(skills, "anywhere", None)
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills, install_builtins=False, config=cfg)
-        other = self._other_repo(tmp_path, "some-rust-project")
-        for block in (
-            loader.get_context(project_dir=str(other)),
-            loader.get_context(budget=100_000, project_dir=str(other)),
-            loader.get_context(),
-        ):
-            assert "repo-only" not in block
-            assert "anywhere" in block
-        # ...and present once the project is the scoped tree.
-        inside = loader.get_context(project_dir=str(self._repo(tmp_path)))
-        assert "repo-only" in inside
-
-    def test_pod_e2e_declares_a_repo_scope(self) -> None:
-        # pod-e2e drives this repo's pod tooling and its triggers are matched by
-        # word overlap, so it must carry the gate rather than rely on prose.
-        # The description carries the applicability statement as well: the gate
-        # covers the injection paths, and the description is what an agent reads
-        # on the paths it does not cover (an explicit `$name` load, a
-        # `skill_search` hit, or reading the file directly).
-        from kiro_crew import skills as skills_mod
-
-        skill_md = (
-            Path(skills_mod.__file__).parent
-            / "apps"
-            / "builtins"
-            / "dev_fleet"
-            / "skills"
-            / "pod-e2e"
-            / "SKILL.md"
-        )
-        head = skill_md.read_text(encoding="utf-8")[:2048]
-        assert "repo_scope: src/kiro_crew" in head
-        assert "ONLY for developing Kiro Crew itself" in head
-
-
-class TestRelocatedSkillCleanup:
-    """Skills moved into skills/kirocrew-dev/ must have their old FLAT copies
-    removed from loader discovery on existing installs — otherwise an upgrade
-    leaves two divergent copies matched nondeterministically by trigger overlap
-    (the dual-copy drift this prevents). The flat copy may carry
-    USER EDITS (the mtime-preserving sync deliberately protects those), so it
-    is never deleted: its SKILL.md is renamed to SKILL.md.pre-relocation —
-    undiscoverable, but every byte preserved. Quarantine only happens when the
-    nested replacement is verifiably present."""
-
-    def test_flat_copy_quarantined_when_nested_present(self, tmp_path: Path) -> None:
-        from kiro_crew.skills import _ensure_builtin_skills
-
-        base = tmp_path / "skills"
-        old = base / "prepare-pr"
-        old.mkdir(parents=True)
-        (old / "SKILL.md").write_text("---\nname: prepare-pr\n---\nUSER-EDITED flat copy")
-        (old / "scripts").mkdir()
-        (old / "scripts" / "helper.py").write_text("# user script")
-        new = base / "kirocrew-dev" / "prepare-pr"
-        new.mkdir(parents=True)
-        (new / "SKILL.md").write_text("---\nname: prepare-pr\n---\nnested copy")
-
-        _ensure_builtin_skills(base)
-
-        # Not discoverable as a skill...
-        assert not (old / "SKILL.md").exists()
-        # ...but nothing was deleted: user edits and scripts preserved on disk.
-        quarantined = old / "SKILL.md.pre-relocation"
-        assert quarantined.read_text(encoding="utf-8").endswith("USER-EDITED flat copy")
-        assert (old / "scripts" / "helper.py").exists()
-        assert (new / "SKILL.md").exists()
-
-    def test_repeated_migration_never_overwrites_prior_quarantine(self, tmp_path: Path) -> None:
-        # HIGH regression (GPT 5.6): a rollback/reinstall can recreate
-        # SKILL.md AFTER a prior migration quarantined a user-edited copy.
-        # The second migration must NOT os.replace over the first quarantine
-        # — both preserved copies must survive under distinct names.
-        from kiro_crew.skills import _ensure_builtin_skills
-
-        base = tmp_path / "skills"
-        old = base / "prepare-pr"
-        old.mkdir(parents=True)
-        new = base / "kirocrew-dev" / "prepare-pr"
-        new.mkdir(parents=True)
-        (new / "SKILL.md").write_text("---\nname: prepare-pr\n---\nnested copy")
-
-        # First migration quarantines the user's original edits.
-        (old / "SKILL.md").write_text("---\nname: prepare-pr\n---\nFIRST user edit")
-        _ensure_builtin_skills(base)
-        first = old / "SKILL.md.pre-relocation"
-        assert first.read_text(encoding="utf-8").endswith("FIRST user edit")
-
-        # Rollback recreates SKILL.md with different content; migration re-runs.
-        (old / "SKILL.md").write_text("---\nname: prepare-pr\n---\nSECOND rollback copy")
-        _ensure_builtin_skills(base)
-
-        # Both preserved copies survive; nothing was overwritten.
-        assert first.read_text(encoding="utf-8").endswith("FIRST user edit")
-        second = old / "SKILL.md.pre-relocation.2"
-        assert second.read_text(encoding="utf-8").endswith("SECOND rollback copy")
-        assert not (old / "SKILL.md").exists()
-
-    def test_flat_copy_untouched_when_nested_missing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Fail-safe: if the nested replacement never synced, the flat copy is
-        # the ONLY working copy — it must stay discoverable.
-        #
-        # The empty source dir is what makes "never synced" real. Relying on a
-        # relocated skill simply not being packaged would stop testing this the
-        # moment that skill ships.
-        from kiro_crew import skills as skills_mod
-        from kiro_crew.skills import _ensure_builtin_skills
-
-        monkeypatch.setattr(skills_mod, "_BUILTIN_SKILLS_DIR", tmp_path / "no-builtins")
-
-        base = tmp_path / "skills"
-        old = base / "babysit"
-        old.mkdir(parents=True)
-        (old / "SKILL.md").write_text("---\nname: babysit\n---\nonly copy")
-
-        _ensure_builtin_skills(base)
-
-        assert (old / "SKILL.md").exists(), "sole copy must stay discoverable"
-
-
-class TestTriggeredSkills:
-    """Tests for fuzzy trigger matching."""
-
-    def _loader_with_skill(self, tmp_path, triggers, monkeypatch=None):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            f"---\nname: tiny-url\ndescription: Shorten URLs\ntriggers: {triggers}\n---\n# Tiny URL\n",
-        )
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-        if monkeypatch is not None:
-            from unittest.mock import MagicMock
-
-            monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-        return loader
-
-    def test_exact_trigger_match(self, tmp_path, monkeypatch):
-        loader = self._loader_with_skill(tmp_path, "tiny url, shorten url", monkeypatch)
-        assert "tiny-url" in loader.get_triggered_skills("make a tiny url for me")
-
-    def test_reworded_query_matches(self, tmp_path, monkeypatch):
-        """Words present but not contiguous — should still match."""
-        loader = self._loader_with_skill(tmp_path, "shorten url", monkeypatch)
-        assert "tiny-url" in loader.get_triggered_skills("can you shorten this url please")
-
-    def test_fuzzy_partial_overlap(self, tmp_path, monkeypatch):
-        """≥70% word overlap triggers the skill."""
-        loader = self._loader_with_skill(tmp_path, "shorten this url", monkeypatch)
-        # 2 of 3 words = 66% → no match
-        assert "tiny-url" not in loader.get_triggered_skills("shorten this link")
-        # 3 of 3 words = 100% → match
-        assert "tiny-url" in loader.get_triggered_skills("shorten this url now")
-
-    def test_no_match_unrelated(self, tmp_path, monkeypatch):
-        loader = self._loader_with_skill(tmp_path, "tiny url, shorten url", monkeypatch)
-        assert loader.get_triggered_skills("check my pipeline health") == []
-
-    def test_always_skills_excluded(self, tmp_path, monkeypatch):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "always-on",
-            "---\nname: always-on\nalways: true\ntriggers: hello world\n---\n# Always\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        from unittest.mock import MagicMock
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-        assert loader.get_triggered_skills("hello world") == []
-
-    def test_case_insensitive(self, tmp_path, monkeypatch):
-        loader = self._loader_with_skill(tmp_path, "Tiny URL", monkeypatch)
-        assert "tiny-url" in loader.get_triggered_skills("Make a TINY url")
-
-    def test_multiple_triggers_first_wins(self, tmp_path, monkeypatch):
-        loader = self._loader_with_skill(tmp_path, "tiny url, shorten url", monkeypatch)
-        result = loader.get_triggered_skills("shorten this url for me")
-        assert result.count("tiny-url") == 1
-
-    def test_empty_triggers_no_crash(self, tmp_path, monkeypatch):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "no-trigger",
-            "---\nname: no-trigger\ndescription: No triggers\n---\n# No Trigger\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        from unittest.mock import MagicMock
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-        assert loader.get_triggered_skills("anything") == []
-
-    def test_trigger_match_does_not_record_usage(self, tmp_path, monkeypatch):
-        """A trigger match must not earn ranking weight in the ledger.
-
-        Only body delivery (the context builder calling _record_use after
-        load_skill succeeds) should update the hotness ranking. False-positive
-        trigger matches must not drift the top-K toward skills the agent never
-        reads.
-        """
-        loader = self._loader_with_skill(tmp_path, "tiny url", monkeypatch)
-
-        # Confirm the skill triggers on the message
-        triggered = loader.get_triggered_skills("make a tiny url for me")
-        assert "tiny-url" in triggered
-
-        # The ledger must still be at zero: a match alone is not a delivery
-        assert loader._usage is not None
-        assert loader._usage.score("tiny-url")[0] == 0.0
-
-        # Simulating body delivery (what context.py does after load_skill)
-        # must update the ledger
-        loader._record_use("tiny-url")
-        assert loader._usage.score("tiny-url")[0] == 1.0
-
-
-class TestSkillsCRUD:
-    def test_create_skill(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        ok = loader.create_skill("my-tool", "---\nname: my-tool\n---\n# My Tool\n")
-        assert ok is True
-        assert (skills_dir / "my-tool" / "SKILL.md").exists()
-        content = loader.load_skill("my-tool")
-        assert "My Tool" in content
-
-    def test_create_duplicate_fails(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(skills_dir, "existing", "# Existing\n")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        ok = loader.create_skill("existing", "# New\n")
-        assert ok is False
-
-    def test_update_skill(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(skills_dir, "updatable", "# Old\n")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        ok = loader.update_skill("updatable", "# Updated\nNew content.")
-        assert ok is True
-        content = loader.load_skill("updatable")
-        assert "Updated" in content
-
-    def test_update_missing_fails(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        ok = loader.update_skill("nonexistent", "# Nope\n")
-        assert ok is False
-
-    def test_delete_skill(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(skills_dir, "deletable", "# Delete me\n")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        assert loader.load_skill("deletable") is not None
-        ok = loader.delete_skill("deletable")
-        assert ok is True
-        assert loader.load_skill("deletable") is None
-        assert not (skills_dir / "deletable").exists()
-
-    def test_delete_missing_fails(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        ok = loader.delete_skill("nonexistent")
-        assert ok is False
-
-    def test_path_traversal_load(self, tmp_path):
-        """Path traversal in skill name must be rejected."""
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        assert loader.load_skill("../../etc/passwd") is None
-        assert loader.load_skill("../secret") is None
-        assert loader.load_skill("foo/bar") is None
-
-    def test_path_traversal_create(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        assert loader.create_skill("../escape", "# bad") is False
-        assert loader.create_skill("", "# bad") is False
-        # Nested paths are now allowed
-        assert loader.create_skill("foo/bar", "# nested") is True
-
-    def test_rooted_name_load(self, tmp_path):
-        """Rooted names must be rejected: a pathlib join with an absolute
-        segment discards the base directory, escaping the skills root."""
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        # POSIX-absolute (payload scoped under tmp_path so a guard regression
-        # is contained rather than acted on against the host)
-        assert loader.load_skill(str(tmp_path / "escape")) is None
-        assert loader.load_skill("/foo") is None
-        # Windows drive-qualified, forward-slash spelling
-        assert loader.load_skill("C:/Windows/System32") is None
-        # Windows drive-relative (no root, still re-anchors the join)
-        assert loader.load_skill("C:evil") is None
-        # Forward-slash UNC prefix
-        assert loader.load_skill("//server/share/skill") is None
-        # Backslash spellings stay rejected by the existing backslash rule
-        assert loader.load_skill("C:\\Windows\\evil") is None
-        assert loader.load_skill("\\\\server\\share\\skill") is None
-        # Dot-only spellings collapse the join back onto the skills root
-        assert loader.load_skill(".") is None
-        assert loader.load_skill("./") is None
-        assert loader.load_skill(".//.") is None
-
-    def test_rooted_name_create_update_delete(self, tmp_path):
-        """Skill CRUD must refuse rooted or dot-only names but accept
-        relative ones. Absolute payloads live under tmp_path so a guard
-        regression surfaces as a containment failure, not a host mutation."""
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        escape = tmp_path / "escape"
-        for rooted in (str(escape), "C:/abs", "C:abs", "//server/share/x", ".", "./"):
-            assert loader.create_skill(rooted, "# bad") is False
-            assert loader.update_skill(rooted, "# bad") is False
-            assert loader.delete_skill(rooted) is False
-        assert not escape.exists()
-        # delete_skill(".") must not have collapsed onto the skills root
-        assert skills_dir.is_dir()
-        # Normal relative names keep working: single-segment and nested
-        assert loader.create_skill("plain", "# ok") is True
-        assert loader.create_skill("nested/child", "# ok") is True
-
-    def test_create_then_list(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        skills_dir.mkdir()
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        loader.create_skill(
-            "alpha",
-            "---\nname: alpha\ndescription: Alpha skill\n---\n# Alpha\n",
-        )
-        loader.create_skill(
-            "beta",
-            "---\nname: beta\ndescription: Beta skill\n---\n# Beta\n",
-        )
-        skills = loader.list_skills()
-        names = [s["name"] for s in skills]
-        assert "alpha" in names
-        assert "beta" in names
-
-
-class TestTriggerMatching:
-    """Tests for word-overlap matching with negative keywords and max_triggered."""
-
-    def test_basic_trigger_match(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "weather",
-            "---\nname: weather\ndescription: Get weather info\ntriggers: weather forecast\n---\n",
-        )
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        result = loader.get_triggered_skills("what's the weather forecast today")
-        assert "weather" in result
-
-    def test_negative_trigger_excludes(self, tmp_path, monkeypatch):
-        """Negative trigger !keyword should exclude the skill."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "code-search",
-            "---\nname: code-search\ndescription: Search code\ntriggers: search code, !search examples\n---\n",
-        )
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        # Positive match without negative words
-        assert "code-search" in loader.get_triggered_skills("search code repositories")
-        # Negative trigger fires — "search" and "examples" both present
-        assert "code-search" not in loader.get_triggered_skills("search for code examples")
-
-    def test_max_triggered_limit(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        for i in range(5):
-            _create_skill(
-                skills_dir,
-                f"skill{i}",
-                f"---\nname: skill{i}\ndescription: Skill {i}\ntriggers: test\n---\n",
-            )
-        # max_triggered is snapshotted at construction, so inject via config=.
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=2))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        result = loader.get_triggered_skills("test")
-        assert len(result) == 2
-
-    def test_sort_by_overlap_score(self, tmp_path, monkeypatch):
-        """Higher overlap skills should appear first."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        # "good" trigger "alpha beta gamma delta" → 3/4 = 0.75 (above 0.7)
-        _create_skill(
-            skills_dir,
-            "good",
-            "---\nname: good\ndescription: Good\ntriggers: alpha beta gamma delta\n---\n",
-        )
-        # "better" trigger "alpha beta gamma" → 3/3 = 1.0
-        _create_skill(
-            skills_dir,
-            "better",
-            "---\nname: better\ndescription: Better\ntriggers: alpha beta gamma\n---\n",
-        )
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=5))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        result = loader.get_triggered_skills("alpha beta gamma")
-        assert len(result) == 2
-        assert result[0] == "better"  # higher overlap first
-        assert result[1] == "good"
-
-    def test_always_on_skills_skipped(self, tmp_path, monkeypatch):
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir, "always", "---\nname: always\nalways: true\ntriggers: test\n---\n"
-        )
-        _create_skill(skills_dir, "normal", "---\nname: normal\ntriggers: test\n---\n")
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=5))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        result = loader.get_triggered_skills("test")
-        assert "always" not in result
-        assert "normal" in result
-
-    def test_multi_word_trigger_phrase(self, tmp_path, monkeypatch):
-        """Multi-word trigger phrases should match as a unit."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: Shorten URLs\ntriggers: shorten url, create tiny link, make short url\n---\n",
-        )
-        cfg = KiroCrewConfig(skills=SkillsConfig(max_triggered=3))
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        assert "tiny-url" in loader.get_triggered_skills("please shorten this url")
-        assert "tiny-url" in loader.get_triggered_skills("create a tiny link for me")
-        # Single word "url" alone shouldn't trigger (1/2 = 50% < 70%)
-        assert "tiny-url" not in loader.get_triggered_skills("what is a url")
-
-
-class TestAutoSkillProvenance:
-    """Tests for the AutoSkillProvenance dataclass frontmatter serialization."""
-
-    def test_now_iso_is_utc(self):
-        from kiro_crew.skills import AutoSkillProvenance
-
-        stamp = AutoSkillProvenance.now_iso()
-        # ISO 8601 UTC ends with +00:00 when using timezone.utc
-        assert "+00:00" in stamp
-
-    def test_frontmatter_lines_minimum(self):
-        from kiro_crew.skills import AutoSkillProvenance
-
-        prov = AutoSkillProvenance(
-            session_key="dashboard:chat-1", created_at="2026-05-05T11:30:00+00:00"
-        )
-        lines = prov.to_frontmatter_lines()
-        assert "source: auto" in lines
-        assert "session_key: dashboard:chat-1" in lines
-        assert "created_at: 2026-05-05T11:30:00+00:00" in lines
-        # Optional fields omitted when unset
-        assert not any(line.startswith("refined_at:") for line in lines)
-        assert not any(line.startswith("reuse_count:") for line in lines)
-
-    def test_frontmatter_lines_with_refinement(self):
-        from kiro_crew.skills import AutoSkillProvenance
-
-        prov = AutoSkillProvenance(
-            session_key="dashboard:chat-2",
-            created_at="2026-05-05T11:30:00+00:00",
-            refined_at="2026-05-06T09:15:00+00:00",
-            reuse_count=3,
-        )
-        lines = prov.to_frontmatter_lines()
-        assert "refined_at: 2026-05-06T09:15:00+00:00" in lines
-        assert "reuse_count: 3" in lines
+from kiro_crew.skills import _NEW_SKILL_BOOST_WINDOW_SECS, _SHORT_DESC_CHARS, SkillsLoader
 
 
 class TestFindSimilar:
     """Tests for SkillsLoader.find_similar description overlap dedup."""
 
     def test_returns_none_when_no_skills(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
         assert loader.find_similar("anything") is None
 
     def test_returns_none_when_no_overlap(self, tmp_path):
@@ -1057,7 +39,7 @@ class TestFindSimilar:
             "weather",
             "---\nname: weather\ndescription: Get weather info for a city\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         assert loader.find_similar("deploy kubernetes service") is None
 
     def test_detects_near_duplicate(self, tmp_path):
@@ -1067,7 +49,7 @@ class TestFindSimilar:
             "ssh-timber",
             "---\nname: ssh-timber\ndescription: SSH chained log search on Timber production hosts\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         match = loader.find_similar(
             "SSH chained log search on Timber production hosts", threshold=0.8
         )
@@ -1080,7 +62,7 @@ class TestFindSimilar:
             "auto/foo",
             "---\nname: auto/foo\ndescription: One two three four five keywords\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         # Without exclude, we match ourselves
         assert loader.find_similar("one two three four five keywords") == "auto/foo"
         # With exclude, we don't
@@ -1093,7 +75,7 @@ class TestFindSimilar:
             "alpha",
             "---\nname: alpha\ndescription: one two three four five six seven\n---\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         # 3/10 = 0.3 overlap — below 0.85 threshold, rejected
         assert loader.find_similar("one two three eight nine ten eleven") is None
 
@@ -1237,625 +219,10 @@ class TestCreateAutoSkill:
         )
 
 
-class TestUpdateAutoSkill:
-    """Tests for SkillsLoader.update_auto_skill (refine path)."""
-
-    def _make_provenance(self, refined_at=""):
-        from kiro_crew.skills import AutoSkillProvenance
-
-        return AutoSkillProvenance(
-            session_key="dashboard:chat-2",
-            created_at="2026-05-05T11:30:00+00:00",
-            refined_at=refined_at,
-        )
-
-    def test_refuses_manual_skill(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "manual-skill",
-            "---\nname: manual-skill\ndescription: hand-crafted\n---\n# Manual\nHand-authored content.\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        # Refuse to update a hand-authored skill even if the caller asks
-        assert (
-            loader.update_auto_skill(
-                "manual-skill",
-                description="trying to overwrite",
-                triggers="",
-                procedure_md="new body",
-                provenance=self._make_provenance(),
-            )
-            is False
-        )
-        # Original content untouched
-        content = (skills_dir / "manual-skill" / "SKILL.md").read_text(encoding="utf-8")
-        assert "Hand-authored content" in content
-
-    def test_updates_auto_skill(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        # Create then refine
-        loader.create_auto_skill(
-            "refine-me",
-            description="original desc",
-            triggers="",
-            procedure_md="## Step 1\nrun X\n",
-            provenance=self._make_provenance(),
-        )
-        ok = loader.update_auto_skill(
-            "auto/refine-me",
-            description="refined desc",
-            triggers="refine, me",
-            procedure_md="## Step 1\nrun Y (better)\n",
-            provenance=self._make_provenance(refined_at="2026-05-06T09:00:00+00:00"),
-        )
-        assert ok is True
-        content = (tmp_path / "skills" / "auto" / "refine-me" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        assert "refined desc" in content
-        assert "run Y (better)" in content
-        assert "refined_at: 2026-05-06T09:00:00+00:00" in content
-
-    def test_returns_false_for_missing(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        assert (
-            loader.update_auto_skill(
-                "auto/does-not-exist",
-                description="x",
-                triggers="",
-                procedure_md="body",
-                provenance=self._make_provenance(),
-            )
-            is False
-        )
-
-
-class TestListAutoSkills:
-    """Tests for list_auto_skills filtering."""
-
-    def test_filters_to_auto_namespace_only(self, tmp_path):
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "manual/one",
-            "---\nname: manual/one\ndescription: manual\n---\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-        loader.create_auto_skill(
-            "generated-one",
-            description="auto",
-            triggers="",
-            procedure_md="body",
-            provenance=(
-                __import__(
-                    "kiro_crew.skills", fromlist=["AutoSkillProvenance"]
-                ).AutoSkillProvenance(
-                    session_key="x",
-                    created_at="2026-05-05T11:30:00+00:00",
-                )
-            ),
-        )
-        auto_only = loader.list_auto_skills()
-        assert len(auto_only) == 1
-        assert auto_only[0]["key"] == "auto/generated-one"
-
-
-class TestUpdateAutoSkillPreservesCreatedAt:
-    """Regression test for #5: refine must not clobber created_at."""
-
-    def test_created_at_preserved_across_refine(self, tmp_path):
-        from kiro_crew.skills import AutoSkillProvenance
-
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
-        original = AutoSkillProvenance(
-            session_key="dashboard:chat-1",
-            created_at="2026-05-05T11:00:00+00:00",
-        )
-        loader.create_auto_skill(
-            "preserved-ts",
-            description="initial",
-            triggers="",
-            procedure_md="v1",
-            provenance=original,
-        )
-        # Caller passes a fresh provenance with a new created_at — the
-        # update path should ignore that and preserve the original.
-        bogus_new = AutoSkillProvenance(
-            session_key="dashboard:chat-2",
-            created_at="2026-05-06T12:00:00+00:00",  # WRONG created_at
-            refined_at="2026-05-06T12:00:00+00:00",
-        )
-        ok = loader.update_auto_skill(
-            "auto/preserved-ts",
-            description="refined",
-            triggers="",
-            procedure_md="v2",
-            provenance=bogus_new,
-        )
-        assert ok is True
-        content = (tmp_path / "skills" / "auto" / "preserved-ts" / "SKILL.md").read_text(
-            encoding="utf-8"
-        )
-        # Original created_at must survive
-        assert "created_at: 2026-05-05T11:00:00+00:00" in content
-        # New refined_at was honored
-        assert "refined_at: 2026-05-06T12:00:00+00:00" in content
-        # Session key from the refine provenance was honored (provenance
-        # fields other than created_at update normally).
-        assert "session_key: dashboard:chat-2" in content
-
-
-def _cfg_with_extra(paths):
-    """Build a config with skills.extra_paths set (isolated, no disk read)."""
-    return KiroCrewConfig(skills=SkillsConfig(extra_paths=paths))
-
-
-class TestSkillsLoaderExtraPaths:
-    def test_extra_path_skill_listed(self, tmp_path):
-        local = tmp_path / "local"
-        local.mkdir()
-        extra = tmp_path / "extra"
-        _create_skill(
-            extra, "roaring", "---\nname: roaring\ndescription: Roaring ops\n---\n# Roaring\n"
-        )
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        names = {s["name"] for s in loader.list_skills()}
-        assert "roaring" in names
-
-    def test_local_takes_precedence(self, tmp_path):
-        local = tmp_path / "local"
-        extra = tmp_path / "extra"
-        _create_skill(local, "dup", "---\nname: dup\ndescription: LOCAL\n---\n# Local\n")
-        _create_skill(extra, "dup", "---\nname: dup\ndescription: EXTRA\n---\n# Extra\n")
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        dup = [s for s in loader.list_skills() if s["name"] == "dup"]
-        assert len(dup) == 1
-        assert dup[0]["description"] == "LOCAL"
-
-    def test_load_skill_from_extra_path(self, tmp_path):
-        local = tmp_path / "local"
-        local.mkdir()
-        extra = tmp_path / "extra"
-        _create_skill(extra, "contributing", "---\nname: contributing\n---\n# Contributing\nGuide.")
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        content = loader.load_skill("contributing")
-        assert content is not None
-        assert "Contributing" in content
-
-    def test_local_skill_shadows_extra_on_load(self, tmp_path):
-        local = tmp_path / "local"
-        extra = tmp_path / "extra"
-        _create_skill(local, "dup", "---\nname: dup\n---\n# LocalBody\n")
-        _create_skill(extra, "dup", "---\nname: dup\n---\n# ExtraBody\n")
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        assert "LocalBody" in loader.load_skill("dup")
-
-    def test_identical_copy_at_different_depth_deduped_in_context(self, tmp_path):
-        """A physical copy of a skill nested one level deeper in another root
-        (a package tree plus a flat mirror of it) yields ONE index line, not two.
-
-        The per-key shadowing in enumeration cannot catch this: the copies have
-        different dir-relative keys (``pkg/tool`` vs ``tool``), so both survive
-        to ``list_skills()`` and, before the fingerprint dedup, both rendered
-        identical summary lines differing only in path.
-        """
-        body = "---\nname: tool\ndescription: One tool\n---\n# Tool\nSame bytes.\n"
-        local = tmp_path / "local"
-        local.mkdir()
-        extra = tmp_path / "extra"
-        _create_skill(extra, "tool", body)
-        _create_skill(extra, "mirror-pkg/tool", body)
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        # Both copies are enumerated (different keys) ...
-        keys = {s["key"] for s in loader.list_skills()}
-        assert {"tool", "mirror-pkg/tool"} <= keys
-        # ... but the injected index carries exactly one line for the skill,
-        # on the legacy full-dump path and the budgeted lazy path alike.
-        legacy = loader.get_context()
-        assert legacy.count("**tool**") == 1
-        lazy = loader.get_context(budget=10_000)
-        assert lazy.count("**tool**") == 1
-
-    def test_same_name_different_content_not_deduped(self, tmp_path):
-        """Same frontmatter name with different content is a legitimate
-        collision, not a mirror copy — both index lines must survive."""
-        local = tmp_path / "local"
-        local.mkdir()
-        extra = tmp_path / "extra"
-        _create_skill(extra, "tool", "---\nname: tool\ndescription: Original\n---\n# A\n")
-        _create_skill(
-            extra, "fork-pkg/tool", "---\nname: tool\ndescription: Forked variant\n---\n# B\n"
-        )
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        legacy = loader.get_context()
-        assert legacy.count("**tool**") == 2
-        assert "Original" in legacy and "Forked variant" in legacy
-
-    def test_equal_metadata_different_bytes_not_deduped(self, tmp_path):
-        """Equal (name, description, size) with DIFFERENT bodies is a metadata
-        coincidence, not a copy — content verification must keep both.
-
-        The pinned path injects full bodies, so dropping a same-size row on
-        metadata alone would silently lose one skill's instructions. The two
-        bodies below are the same byte length but different procedures.
-        """
-        local = tmp_path / "local"
-        local.mkdir()
-        extra = tmp_path / "extra"
-        head = "---\nname: tool\ndescription: One tool\nalways: true\n---\n"
-        _create_skill(extra, "tool", head + "# Tool\nStep: run AAAA.\n")
-        _create_skill(extra, "mirror-pkg/tool", head + "# Tool\nStep: run BBBB.\n")
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        rows = [s for s in loader.list_skills() if s["name"] == "tool"]
-        assert rows[0]["size_bytes"] == rows[1]["size_bytes"]  # fingerprints collide
-        legacy = loader.get_context()
-        assert "run AAAA" in legacy and "run BBBB" in legacy  # both bodies survive
-
-    def test_nonexistent_extra_path_ignored(self, tmp_path):
-        local = tmp_path / "local"
-        local.mkdir()
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(tmp_path / "missing")]),
-        )
-        assert loader._extra_paths == []
-
-    def test_sensitive_extra_path_skipped(self, tmp_path, monkeypatch):
-        extra = tmp_path / "extra"
-        extra.mkdir()
-        monkeypatch.setattr("kiro_crew.skills.is_sensitive_path", lambda p: True)
-        loader = SkillsLoader(
-            skills_path=tmp_path / "local",
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        assert loader._extra_paths == []
-
-    def test_sensitive_skill_file_skipped(self, tmp_path, monkeypatch):
-        # Extra dir is allowed, but an individual SKILL.md is flagged sensitive:
-        # it must be excluded from listing AND refused on load.
-        local = tmp_path / "local"
-        local.mkdir()
-        extra = tmp_path / "extra"
-        _create_skill(extra, "x", "---\nname: x\n---\n# X\n")
-        # Both listing (_iter) and load_skill route extra-path reads through
-        # validate_file_path — flagging it there blocks both.
-        monkeypatch.setattr(
-            "kiro_crew.skills.validate_file_path",
-            lambda p: None if str(p).endswith("SKILL.md") else p,
-        )
-        loader = SkillsLoader(
-            skills_path=local,
-            install_builtins=False,
-            config=_cfg_with_extra([str(extra)]),
-        )
-        assert "x" not in {s["name"] for s in loader.list_skills()}
-        assert loader.load_skill("x") is None
-
-
-class TestTriggerPerformance:
-    """Per-message cost reductions in get_triggered_skills (perf)."""
-
-    def test_single_audit_event_for_triggered_set(self, tmp_path, monkeypatch):
-        """One SEL event per call (for the matched set), not one per skill."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        # Several skills; only one will match the query.
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        _create_skill(
-            skills_dir,
-            "weather",
-            "---\nname: weather\ndescription: d\ntriggers: weather forecast\n---\n# x\n",
-        )
-        _create_skill(
-            skills_dir,
-            "pipeline",
-            "---\nname: pipeline\ndescription: d\ntriggers: pipeline health\n---\n# x\n",
-        )
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
-        )
-
-        fake_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
-        triggered = loader.get_triggered_skills("please shorten this url")
-
-        assert "tiny-url" in triggered
-        # Exactly ONE audit event, regardless of how many skills were scanned.
-        assert fake_sel.log_tool_invocation.call_count == 1
-
-    def test_no_audit_event_when_nothing_triggers(self, tmp_path, monkeypatch):
-        """The common case (no match) writes zero SEL events."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
-
-        fake_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
-        assert loader.get_triggered_skills("hello there friend") == []
-        assert fake_sel.log_tool_invocation.call_count == 0
-
-    @pytest.mark.parametrize(
-        "triggers",
-        [
-            "shorten url, !test",  # positive first
-            "!test, shorten url",  # negative first — must be order-independent
-        ],
-    )
-    def test_negative_trigger_exclusion_is_audited(self, tmp_path, monkeypatch, triggers):
-        """A negative trigger that excludes an otherwise-matching skill is a
-        permission DENY and must still emit an audit event (with the negated
-        skill in metadata), regardless of trigger order in the frontmatter."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            f"---\nname: tiny-url\ndescription: d\ntriggers: {triggers}\n---\n# x\n",
-        )
-        # A positive cap: the denial is a DENY only where the match could have
-        # been a grant. At the shipped cap of 0 the same veto is not audited
-        # (see test_zero_cap_writes_no_denied_audit_row).
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
-        )
-
-        fake_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
-        # "shorten url" matches the positive trigger, but "test" fires the
-        # negative trigger → excluded.
-        triggered = loader.get_triggered_skills("shorten url for this test")
-
-        assert triggered == []  # excluded by negative trigger
-        # The denial is audited (one event), with the skill named in metadata —
-        # even when "!test" is listed before "shorten url".
-        assert fake_sel.log_tool_invocation.call_count == 1
-        _, kwargs = fake_sel.log_tool_invocation.call_args
-        assert kwargs["outcome"] == "denied"
-        assert "tiny-url" in kwargs["metadata"]["negated"]
-
-    def test_iter_result_is_cached(self, tmp_path, monkeypatch):
-        """The skill-file walk is cached, not re-run on every call."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        # A positive cap so the scan actually runs; at 0 there is no walk to cache.
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
-        )
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        calls = {"n": 0}
-        orig = loader._iter_uncached
-
-        def _counting(project_key=None):
-            calls["n"] += 1
-            return orig(project_key)
-
-        monkeypatch.setattr(loader, "_iter_uncached", _counting)
-        for _ in range(5):
-            loader.get_triggered_skills("shorten this url")
-        # 5 messages, but the underlying walk ran at most once (TTL cache).
-        assert calls["n"] <= 1
-
-    def test_config_not_loaded_per_message(self, tmp_path, monkeypatch):
-        """get_triggered_skills must not re-load config on every message — the
-        trigger cap is snapshotted at construction (max_triggered hoist)."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
-        )
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        calls = {"n": 0}
-        real_load = KiroCrewConfig.load
-
-        def _counting_load():
-            calls["n"] += 1
-            return real_load()
-
-        monkeypatch.setattr("kiro_crew.config.loader.KiroCrewConfig.load", _counting_load)
-        for _ in range(5):
-            loader.get_triggered_skills("shorten this url")
-        # Zero config loads across 5 messages — the cap was snapshotted in __init__.
-        assert calls["n"] == 0
-
-    def test_max_triggered_snapshot_caps_results(self, tmp_path, monkeypatch):
-        """The snapshotted max_triggered still bounds the result count."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        for i in range(5):
-            _create_skill(
-                skills_dir,
-                f"s{i}",
-                f"---\nname: s{i}\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-            )
-        cfg = KiroCrewConfig()
-        cfg.skills.max_triggered = 2
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, config=cfg)
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        triggered = loader.get_triggered_skills("shorten url")
-        assert len(triggered) == 2
-
-    def test_zero_cap_skips_the_scan_entirely(self, tmp_path, monkeypatch):
-        """At the shipped default (``max_triggered = 0``) the matcher is off: no
-        skill is walked, read or scored, because every score would be sliced away.
-        The per-message cost is one cap read, and the result is the same ``[]``."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
-        )
-        fake_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
-        walk = MagicMock(return_value=[])
-        monkeypatch.setattr(loader, "_iter_visible", walk)
-        read = MagicMock(return_value={})
-        monkeypatch.setattr(loader, "_cached_frontmatter", read)
-
-        assert loader.get_triggered_skills("shorten this url") == []
-        walk.assert_not_called()
-        read.assert_not_called()
-        assert fake_sel.log_tool_invocation.call_count == 0
-
-    def test_zero_cap_writes_no_denied_audit_row(self, tmp_path, monkeypatch):
-        """A ``!`` veto at cap 0 excludes nothing that could have been injected, so
-        it is not a permission DENY and writes no ``skill_trigger`` row -- unlike
-        the same veto under a positive cap (test_negative_trigger_exclusion_is_audited)."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url, !test\n---\n# x\n",
-        )
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
-        )
-        fake_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
-
-        assert loader.get_triggered_skills("shorten url for this test") == []
-        assert fake_sel.log_tool_invocation.call_count == 0
-
-    def test_zero_cap_still_consults_select(self, tmp_path, monkeypatch):
-        """The zero-cap skip belongs to the matcher, not to ``select``: a
-        selection point still runs, owns its own zero-cap refusal, and a pick it
-        returns is injected and audited as a selection."""
-        from unittest.mock import MagicMock
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
-        )
-        fake_sel = MagicMock()
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: fake_sel)
-        select = MagicMock(return_value=["tiny-url"])
-
-        assert loader.get_triggered_skills("hello there friend", select=select) == ["tiny-url"]
-        select.assert_called_once_with()
-        assert fake_sel.log_tool_invocation.call_count == 1
-        _, kwargs = fake_sel.log_tool_invocation.call_args
-        assert kwargs["outcome"] == "triggered"
-        assert kwargs["metadata"]["selected"] == "true"
-        assert kwargs["metadata"]["skills"] == "tiny-url"
-
-    def test_zero_cap_is_read_live_so_raising_it_turns_the_scan_back_on(
-        self, tmp_path, monkeypatch
-    ):
-        """The skip reads the cap from the live snapshot, so ``kirocrew config set
-        skills.max_triggered 3`` re-enables the scan for the very next message
-        without rebuilding the loader."""
-        from unittest.mock import MagicMock
-
-        from kiro_crew.config import live
-
-        skills_dir = tmp_path / "skills"
-        _create_skill(
-            skills_dir,
-            "tiny-url",
-            "---\nname: tiny-url\ndescription: d\ntriggers: shorten url\n---\n# x\n",
-        )
-        loader = SkillsLoader(
-            skills_path=skills_dir,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=0)),
-        )
-        monkeypatch.setattr("kiro_crew.skills.sel", lambda: MagicMock())
-
-        assert loader.get_triggered_skills("shorten this url") == []
-        cfg = KiroCrewConfig()
-        cfg.skills.max_triggered = 3
-        live.watch().prime(cfg)
-        assert loader.get_triggered_skills("shorten this url") == ["tiny-url"]
-
-
 class TestResolveDollarSkills:
     """$skillname inline trigger resolution (allowlist, all sources)."""
 
-    def _loader(self, tmp_path, **extra):
+    def _loader(self, tmp_path, opened=None, **extra):
         skills_dir = tmp_path / "skills"
         _create_skill(
             skills_dir,
@@ -1867,7 +234,11 @@ class TestResolveDollarSkills:
             "nested/ticket-pull",
             "---\nname: nested/ticket-pull\ndescription: Pull\n---\n# Pull\nBody B.",
         )
-        return SkillsLoader(skills_path=skills_dir, install_builtins=False, **extra)
+        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False, **extra)
+        if opened is not None:
+            # Registered before the settle, so a settle that raises still closes it.
+            opened(loader)
+        return _settled(loader)
 
     def test_basic_match_leaves_token_resolves_body(self, tmp_path):
         loader = self._loader(tmp_path)
@@ -1892,6 +263,159 @@ class TestResolveDollarSkills:
         names = [n for _t, n, _b in out]
         assert names == ["oncall-handover", "nested/ticket-pull"]
 
+    def test_nested_key_uses_forward_slash(self, tmp_path, opened):
+        """The enumerated key of a nested skill is forward-slash-separated.
+
+        Discriminator for a Windows-only failure of ``test_multiple_tokens_anywhere``
+        seen on a CodeBuild container: the resolver leaf-matches ``$ticket-pull``
+        against ``key.rsplit("/", 1)[-1]``, so a key built with the OS separator
+        (``nested\\ticket-pull`` on Windows) would leaf to the whole string and match
+        nothing — an identical-looking assertion failure, but with the bug in NAMING
+        rather than enumeration or the read gate. This pins the key exactly, so a CI
+        run answers which mechanism is at fault instead of leaving it a coin flip: if
+        BOTH this and ``test_multiple_tokens_anywhere`` fail, the key is misnamed; if
+        this passes while the other fails, naming is eliminated. The loader is
+        wrapped in ``opened`` so its catalog-refresh thread and SQLite descriptors
+        are released at teardown.
+        """
+        loader = self._loader(tmp_path, opened=opened)
+        keys = [s["key"] for s in loader.scoped_skills()]
+        assert "nested/ticket-pull" in keys
+        assert "nested\\ticket-pull" not in keys
+
+    def test_two_flat_siblings_both_enumerate_and_resolve(self, tmp_path, opened):
+        """Two flat sibling skills both enumerate and both resolve — a count pin.
+
+        Discriminator for a Windows-only second-token drop seen on a CodeBuild
+        container: resolving ``$one $two`` returns only one skill even though both
+        are flat, top-level, and carry no path separator. That rules out the
+        nested-key/separator theory (there is no separator here) and localizes the
+        drop to the count, not the name. This pins BOTH stages so a CI run says
+        which stage drops the sibling:
+
+        * If ``scoped_skills`` returns one key, the WALK (``_iter_skill_files``)
+          drops a distinct sibling on that filesystem — its only sibling-dropping
+          site is the ``seen_real`` dedup keyed on ``os.path.realpath``.
+        * If ``scoped_skills`` returns both keys but ``resolve_dollar_skills``
+          returns one, the drop is in the resolver's per-token loop.
+
+        Kept minimal and platform-neutral: the assertion holds on every platform,
+        so a red is a real defect on the host that produced it, not a POSIX-only
+        expectation. The loader is wrapped in ``opened`` so its catalog-refresh
+        thread and SQLite descriptors are closed at teardown — a measurement test
+        must not itself leak the resource that makes the suite flaky.
+        """
+        skills_dir = tmp_path / "skills"
+        _create_skill(skills_dir, "one", "---\nname: one\ndescription: A\n---\n# One\nBody one.")
+        _create_skill(skills_dir, "two", "---\nname: two\ndescription: B\n---\n# Two\nBody two.")
+        loader = _settled(opened(SkillsLoader(skills_path=skills_dir, install_builtins=False)))
+
+        keys = sorted(s["key"] for s in loader.scoped_skills())
+        assert keys == ["one", "two"]
+
+        out = loader.resolve_dollar_skills("use $one and $two")
+        assert [n for _t, n, _b in out] == ["one", "two"]
+
+    def test_nested_skill_enumerates_beside_flat_under_plain_and_symlinked_base(self, tmp_path):
+        """A nested skill enumerates alongside a flat one — even via a symlinked base.
+
+        Regression guard for the Windows-only report where the NESTED skill
+        (``nested/ticket-pull``) vanished from enumeration while the depth-1 flat
+        skill survived. The catalog walk resolves each node through
+        ``os.path.realpath`` and admits a SKILL.md whose resolved path lands
+        under the base; this pins that a nested descendant and a flat sibling
+        both enumerate, so a regression that drops the nested subtree is caught.
+
+        The symlinked-base half matters and a naive fix fails it: a lexical-only
+        containment shortcut would drop a skill reached through a symlinked base,
+        because the symlinked spelling is not lexically under the base's
+        realpath. Enumeration is deterministic here, so the assertion holds on
+        every platform; ``make_dir_link`` keeps the symlinked-base path exercised
+        on Windows (a junction) instead of skipping there.
+        """
+        from kiro_crew.skills import _iter_skill_files
+
+        real_base = tmp_path / "real_skills"
+        _create_skill(real_base, "flat-skill", "---\nname: flat-skill\n---\n# Flat")
+        _create_skill(real_base, "nested/deep-skill", "---\nname: nested/deep-skill\n---\n# Deep")
+
+        # Plain base: both enumerate, nested key is forward-slash separated.
+        names = sorted(name for name, _path in _iter_skill_files(real_base))
+        assert names == ["flat-skill", "nested/deep-skill"]
+
+        # Symlinked base: the nested skill must still enumerate. A lexical-only
+        # containment shortcut would drop it here because the symlinked spelling
+        # is not lexically under the base's realpath. make_dir_link (a junction
+        # on Windows, a dir symlink on POSIX) keeps this exercised on the
+        # platform the drop was found on, instead of skipping there.
+        from conftest import make_dir_link
+
+        link_base = tmp_path / "linked_skills"
+        make_dir_link(link_base, real_base)
+        via_link = sorted(name for name, _path in _iter_skill_files(link_base))
+        assert via_link == ["flat-skill", "nested/deep-skill"]
+
+    def test_skill_under_symlinked_intermediate_ancestor_is_resolved_fresh(self, tmp_path):
+        """A skill whose ancestor is a link enumerates with its resolved path under the tree.
+
+        The catalog walk resolves each node through ``os.path.realpath``, so a
+        link/junction ancestor is followed to its target and the node is admitted
+        only when the resolved SKILL.md lands under the base. Here an intermediate
+        directory in the tree is a symlink to a sibling holding the skill; the
+        skill must still be found and its resolved SKILL.md must land under the
+        tree — proving a link ancestor is resolved and contained, not dropped.
+        """
+        from kiro_crew.skills import _iter_skill_files
+
+        base = tmp_path / "skills"
+        base.mkdir(parents=True, exist_ok=True)
+        _create_skill(base, "plain", "---\nname: plain\n---\n# Plain")
+        # Target lives INSIDE the base tree (so it is contained), and an
+        # intermediate name links to it — the link node resolves to a path that
+        # still lands under the base.
+        _create_skill(base, "real/linked-child", "---\nname: linked-child\n---\n# Linked")
+        # make_dir_link: a junction on Windows, a dir symlink on POSIX — keeps
+        # the link-ancestor path exercised on Windows instead of skipping there.
+        from conftest import make_dir_link
+
+        make_dir_link(base / "via", base / "real")
+
+        names = sorted(name for name, _path in _iter_skill_files(base))
+        # The plain skill and the skill reached through the linked intermediate
+        # both enumerate; the link node resolves to a contained path.
+        assert "plain" in names
+        assert "real/linked-child" in names
+
+    def test_skill_under_ancestor_relocated_out_of_root_is_excluded(self, tmp_path):
+        """A skill reachable only through an out-of-root ancestor is excluded.
+
+        The catalog walk resolves each node through ``os.path.realpath`` and
+        admits a SKILL.md only when its resolved path is under the allowed roots.
+        An ancestor inside the base can link to a directory outside the roots;
+        a skill reached only through that out-of-root ancestor resolves outside
+        the roots and must not enumerate, while an in-tree sibling still does.
+        """
+        from conftest import make_dir_link
+        from kiro_crew.skills import _iter_skill_files
+
+        base = tmp_path / "skills"
+        base.mkdir(parents=True, exist_ok=True)
+        _create_skill(base, "plain", "---\nname: plain\n---\n# Plain")
+        # A skill lives under outside/real/leaf, entirely outside the base tree.
+        outside = tmp_path / "outside"
+        _create_skill(outside, "real/leaf", "---\nname: leaf\n---\n# Leaf")
+        # An ancestor name inside the base links to the out-of-root directory:
+        # the only path to the leaf runs through a link whose resolved target
+        # is outside the roots.
+        make_dir_link(base / "aliased", outside / "real")
+
+        names = sorted(name for name, _path in _iter_skill_files(base))
+        # The in-tree plain skill enumerates; the leaf reachable only through
+        # the out-of-root ancestor resolves outside the roots and is excluded.
+        assert "plain" in names
+        assert "leaf" not in names
+        assert "real/leaf" not in names
+
     def test_dedupe_repeated_token(self, tmp_path):
         loader = self._loader(tmp_path)
         out = loader.resolve_dollar_skills("$oncall-handover and again $oncall-handover")
@@ -1900,6 +424,48 @@ class TestResolveDollarSkills:
     def test_unknown_token_skipped(self, tmp_path):
         loader = self._loader(tmp_path)
         assert loader.resolve_dollar_skills("$does-not-exist hello") == []
+
+    def test_renamed_builtin_answers_to_its_old_name(self, tmp_path):
+        """A saved hook or AGENTS.md line still says `$prepare-pr` (or the old
+        nested key) after the skill became `kirocrew-dev/kirocrew-prepare-pr`."""
+        _create_skill(
+            tmp_path / "skills",
+            "kirocrew-dev/kirocrew-prepare-pr",
+            "---\nname: kirocrew-prepare-pr\ndescription: PR loop\n---\n# PR\nBody P.",
+        )
+        loader = self._loader(tmp_path)
+        for text in ("run $prepare-pr", "run $kirocrew-dev/prepare-pr"):
+            out = loader.resolve_dollar_skills(text)
+            assert [name for _, name, _ in out] == ["kirocrew-dev/kirocrew-prepare-pr"], text
+            assert "Body P." in out[0][2]
+
+    def test_installed_skill_keeps_its_name_over_a_relocation_alias(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        _create_skill(skills_dir, "prepare-pr", "---\nname: prepare-pr\n---\nUser's own.")
+        _create_skill(
+            skills_dir,
+            "kirocrew-dev/kirocrew-prepare-pr",
+            "---\nname: kirocrew-prepare-pr\n---\nBuilt-in.",
+        )
+        loader = self._loader(tmp_path)
+        assert [name for _, name, _ in loader.resolve_dollar_skills("$prepare-pr")] == [
+            "prepare-pr"
+        ]
+
+    def test_ambiguous_old_name_does_not_fall_through_to_the_relocation_alias(self, tmp_path):
+        """Two user skills share the `prepare-pr` leaf: the token stays
+        unresolved, as before the alias existed, instead of picking the
+        renamed built-in."""
+        skills_dir = tmp_path / "skills"
+        _create_skill(skills_dir, "team-a/prepare-pr", "---\nname: a\n---\nA.")
+        _create_skill(skills_dir, "team-b/prepare-pr", "---\nname: b\n---\nB.")
+        _create_skill(
+            skills_dir,
+            "kirocrew-dev/kirocrew-prepare-pr",
+            "---\nname: kirocrew-prepare-pr\n---\nBuilt-in.",
+        )
+        loader = self._loader(tmp_path)
+        assert loader.resolve_dollar_skills("$prepare-pr") == []
 
     def test_no_dollar_returns_empty(self, tmp_path):
         loader = self._loader(tmp_path)
@@ -1929,7 +495,7 @@ class TestResolveDollarSkills:
             "MyHandover",
             "---\nname: MyHandover\ndescription: d\n---\n# Body",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         out = loader.resolve_dollar_skills("$myhandover")
         assert len(out) == 1
         assert out[0][1].rsplit("/", 1)[-1].lower() == "myhandover"
@@ -1947,7 +513,7 @@ class TestResolveDollarSkills:
                 f"skill{i}",
                 f"---\nname: skill{i}\ndescription: d{i}\n---\n# S{i}\nbody{i}",
             )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         monkeypatch.setattr("kiro_crew.skills._MAX_DOLLAR_SKILLS", 5)
         msg = " ".join(f"$skill{i}" for i in range(8))
         out = loader.resolve_dollar_skills(msg)
@@ -1964,7 +530,7 @@ class TestResolveDollarSkills:
             "---\nname: WFE/oncall-handover\n---\nAIM",
         )
         cfg = KiroCrewConfig(skills=SkillsConfig(extra_paths=[str(aim)]))
-        loader = SkillsLoader(skills_path=local, install_builtins=False, config=cfg)
+        loader = _settled(SkillsLoader(skills_path=local, install_builtins=False, config=cfg))
         out = loader.resolve_dollar_skills("$oncall-handover")
         assert len(out) == 1
         assert "LOCAL" in out[0][2]
@@ -1977,7 +543,9 @@ class TestResolveDollarSkills:
             "---\nname: WFE/alarm-investigation\n---\nAIM ALARM",
         )
         cfg = KiroCrewConfig(skills=SkillsConfig(extra_paths=[str(aim)]))
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False, config=cfg)
+        loader = _settled(
+            SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False, config=cfg)
+        )
         out = loader.resolve_dollar_skills("check $alarm-investigation")
         assert len(out) == 1
         assert out[0][1] == "WorkforceEmploymentKnowledgeBase/alarm-investigation"
@@ -1998,7 +566,7 @@ class TestResolveDollarSkills:
         )
         monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [aim_root])
         # No extra_paths configured — resolution must come from the edition root.
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
         out = loader.resolve_dollar_skills("run $personal-kb-sync")
         assert len(out) == 1
         assert out[0][1] == "HoangvpPrivatePackage/personal-kb-sync"
@@ -2014,7 +582,7 @@ class TestResolveDollarSkills:
         monkeypatch.setattr(DefaultMcpToolingProvider, "extra_skills", lambda self: [aim_root])
         local = tmp_path / "skills"
         _create_skill(local, "grill", "---\nname: grill\n---\nLOCAL GRILL")
-        loader = SkillsLoader(skills_path=local, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=local, install_builtins=False))
         out = loader.resolve_dollar_skills("$grill")
         assert len(out) == 1
         assert "LOCAL GRILL" in out[0][2]
@@ -2054,7 +622,7 @@ class TestLazyLoadContext:
                 f"od{i}",
                 f"---\nname: od{i}\ndescription: {verbose}\n---\n# OD{i}\nBody {i}.",
             )
-        return SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        return _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
 
     def test_pinned_always_full_content(self, tmp_path):
         loader = self._make(tmp_path, n_on_demand=2, always=True)
@@ -2093,6 +661,140 @@ class TestLazyLoadContext:
         # budget shows all skills AND exercises the usage ordering.
         ctx = loader.get_context(budget=100_000)
         assert ctx.index("**od3**") < ctx.index("**od0**")
+
+    @staticmethod
+    def _shipped_and_user(tmp_path, n_shipped=12, n_user=1, hot=None, shipped_hits=1):
+        """A skills dir of *n_shipped* shipped skills plus *n_user* cold user skills.
+
+        Shipped is marked the way the builtin sync marks every copy it installs.
+        User skills are aged past the new-skill boost window and never used, so
+        rank alone puts every one of them last; each shipped skill carries
+        *shipped_hits* hits, and *hot* (a shipped index) carries several more.
+        """
+        import os
+        import time
+
+        skills_dir = tmp_path / "skills"
+        stale = time.time() - 2 * _NEW_SKILL_BOOST_WINDOW_SECS
+        for i in range(n_user):
+            _create_skill(
+                skills_dir,
+                f"zz-mine{i:02}",
+                f"---\nname: zz-mine{i:02}\ndescription: my own procedure {i}\n---\n# Mine\n",
+            )
+            os.utime(skills_dir / f"zz-mine{i:02}" / "SKILL.md", (stale, stale))
+        for i in range(n_shipped):
+            _create_skill(
+                skills_dir,
+                f"shipped{i:02}",
+                f"---\nname: shipped{i:02}\ndescription: shipped {i}\n---\n# S\n",
+            )
+            (skills_dir / f"shipped{i:02}" / ".builtin-skill-provenance").write_text("2:x")
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
+        for i in range(n_shipped):
+            for _ in range(shipped_hits):
+                loader._usage.record(f"shipped{i:02}")
+        for _ in range(5 if hot is not None else 0):
+            loader._usage.record(f"shipped{hot:02}")
+        return loader
+
+    @staticmethod
+    def _pointer_names(loader) -> list[str]:
+        text = loader.get_context(budget=100_000, discovery_only=True)
+        return [line[2:].split(":", 1)[0] for line in text.splitlines() if line.startswith("- ")]
+
+    def test_pointer_names_a_cold_user_skill_ahead_of_hot_shipped_ones(self, tmp_path):
+        # A new user has no usage history, so the eight pointer names went to
+        # shipped skills and the skill they wrote was never named at all.
+        loader = self._shipped_and_user(tmp_path)
+        names = self._pointer_names(loader)
+        assert names[0] == "zz-mine00"
+        # The cap is still eight names in total.
+        assert len(names) == 8
+
+    def test_pointer_names_every_user_skill_on_a_zero_usage_install(self, tmp_path):
+        # Three user skills, sixty-odd shipped ones, an empty ledger: all three
+        # user skills are named, and shipped skills fill the remaining slots.
+        loader = self._shipped_and_user(tmp_path, n_shipped=60, n_user=3, shipped_hits=0)
+        names = self._pointer_names(loader)
+        assert names[:3] == ["zz-mine00", "zz-mine01", "zz-mine02"]
+        assert len(names) == 8
+        assert all(n.startswith("shipped") for n in names[3:])
+
+    def test_pointer_keeps_a_hot_shipped_skill_under_a_large_user_tree(self, tmp_path):
+        # The mirror case: ten user skills must not evict a shipped skill the
+        # user actually relies on. At most six of the eight names are the user's
+        # on provenance alone; the rest go to rank, which the hot skill wins.
+        loader = self._shipped_and_user(tmp_path, n_shipped=12, n_user=10, hot=5)
+        names = self._pointer_names(loader)
+        assert len(names) == 8
+        assert "shipped05" in names
+        assert sum(n.startswith("zz-mine") for n in names) == 6
+
+    def test_user_first_order_is_quota_then_rank_then_user_tail(self, tmp_path):
+        loader = self._make(tmp_path, n_on_demand=0)
+        loader._is_user_authored = lambda s: s["user"]  # type: ignore[method-assign]
+
+        def row(name, user):
+            return {"key": name, "user": user}
+
+        # Rank order in: shipped and user rows interleaved, nine user rows.
+        ranked = [
+            row("s0", False),
+            row("u0", True),
+            row("u1", True),
+            row("s1", False),
+            *(row(f"u{i}", True) for i in range(2, 8)),
+            row("s2", False),
+            row("s3", False),
+            row("u8", True),
+        ]
+        out = [r["key"] for r in loader._user_first(ranked)]
+        # Six user rows lead; the two remaining head slots go to the best-ranked
+        # of what is left (s0, s1 outrank the overflow user rows u6, u7); after
+        # the head, the overflow user rows precede the shipped tail.
+        assert out == ["u0", "u1", "u2", "u3", "u4", "u5", "s0", "s1", "u6", "u7", "u8", "s2", "s3"]
+
+    def test_index_admits_a_cold_user_skill_before_hot_shipped_ones(self, tmp_path):
+        loader = self._shipped_and_user(tmp_path)
+        full = loader.get_context(budget=100_000)
+        assert full.index("**zz-mine00**") < full.index("**shipped00**")
+        # A budget with room for only a few rows still spends it on the user's
+        # skill first; the shipped tail goes to the omission footer.
+        tight = loader.get_context(budget=1200)
+        assert "**zz-mine00**" in tight
+        assert "more skill(s) not shown" in tight
+
+    def test_user_authored_classification(self, tmp_path, monkeypatch):
+        import kiro_crew.skills as skills_mod
+
+        skills_dir = tmp_path / "skills"
+        provider = tmp_path / "provider" / "app-skill"
+        provider.mkdir(parents=True)
+        (provider / "SKILL.md").write_text("---\nname: app-skill\ndescription: d\n---\n")
+        from conftest import make_dir_link
+
+        skills_dir.mkdir()
+        make_dir_link(skills_dir / "app-skill", provider)
+        _create_skill(skills_dir, "marked", "---\nname: marked\ndescription: d\n---\n")
+        (skills_dir / "marked" / ".builtin-skill-provenance").write_text("2:x")
+        _create_skill(skills_dir, "packaged", "---\nname: packaged\ndescription: d\n---\n")
+        _create_skill(skills_dir, "team/mine", "---\nname: mine\ndescription: d\n---\n")
+        monkeypatch.setattr(
+            skills_mod, "_trusted_skill_roots", lambda: (str((tmp_path / "provider").resolve()),)
+        )
+        monkeypatch.setattr(skills_mod, "_packaged_skill_names", lambda: frozenset({"packaged"}))
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
+        verdict = {str(r["key"]): loader._is_user_authored(r) for r in loader.scoped_skills()}
+        assert verdict == {
+            "app-skill": False,
+            "marked": False,
+            "packaged": False,
+            # A nested key is not an app namespace: the user's own tree.
+            "team/mine": True,
+        }
+        # A confined project row is the user's without touching its path.
+        assert loader._is_user_authored({"key": "x", "path": "/nonexistent", "confine_root": "/p"})
 
     def test_short_desc_truncated(self, tmp_path):
         loader = self._make(tmp_path, n_on_demand=1)
@@ -2147,7 +849,7 @@ class TestLazyLoadContext:
             "longdesc",
             f"---\nname: longdesc\ndescription: {long_desc}\n---\n# LD\nBody.",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         ctx = loader.get_context(budget=None)
         # The full description should NOT appear verbatim.
         assert long_desc not in ctx
@@ -2168,12 +870,12 @@ class TestSearchSkills:
             "weather",
             "---\nname: weather\ndescription: get the forecast\n---\n# W\n",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         hits = loader.search_skills("deployment")
         assert [h["key"] for h in hits] == ["deployer"]
 
     def test_search_empty_query(self, tmp_path):
-        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
         assert loader.search_skills("") == []
         assert loader.search_skills("   ") == []
 
@@ -2184,14 +886,14 @@ class TestSearchSkills:
             "hidden",
             "---\nname: hidden\ndescription: nothing relevant here\n---\n# H\nThis mentions kubernetes internally.",
         )
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         hits = loader.search_skills("kubernetes")
         assert [h["key"] for h in hits] == ["hidden"]
 
     def test_search_does_not_record_usage(self, tmp_path):
         skills_dir = tmp_path / "skills"
         _create_skill(skills_dir, "s1", "---\nname: s1\ndescription: alpha beta\n---\n# S1\n")
-        loader = SkillsLoader(skills_path=skills_dir, install_builtins=False)
+        loader = _settled(SkillsLoader(skills_path=skills_dir, install_builtins=False))
         loader.search_skills("alpha")
         assert loader._usage.score("s1")[0] == 0.0  # searching is not using
 
@@ -2229,10 +931,12 @@ class TestDisabledAppSkillsAreNotTriggered:
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._apps(monkeypatch, deploy_web=False)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("please deploy this") == []
@@ -2241,10 +945,12 @@ class TestDisabledAppSkillsAreNotTriggered:
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._apps(monkeypatch, deploy_web=True)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("please deploy this") == ["deploy_web/artifact-deploy"]
@@ -2255,10 +961,12 @@ class TestDisabledAppSkillsAreNotTriggered:
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._write_app_skill(skills, "ops_mc", "ops-mission-control", "deploy")
         self._apps(monkeypatch, deploy_web=False, ops_mc=True)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("please deploy this") == ["ops_mc/ops-mission-control"]
@@ -2272,10 +980,12 @@ class TestDisabledAppSkillsAreNotTriggered:
             "---\nname: my-notes\ndescription: d\ntriggers: deploy\n---\n\nb\n"
         )
         self._apps(monkeypatch, deploy_web=False)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("please deploy this") == ["my-notes"]
@@ -2292,10 +1002,12 @@ class TestDisabledAppSkillsAreNotTriggered:
             raise OSError("installed.json unreadable")
 
         monkeypatch.setattr(mgr, "list_apps", _boom)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("please deploy this") == ["deploy_web/artifact-deploy"]
@@ -2335,10 +1047,12 @@ class TestDisabledAppSkillsAreNotTriggered:
         skills = tmp_path / "skills"
         app = self._link_shipped_builtin_skill(skills)
         self._apps(monkeypatch, **{app: False})
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("find hotspots for me") == []
@@ -2348,13 +1062,52 @@ class TestDisabledAppSkillsAreNotTriggered:
         skills = tmp_path / "skills"
         app = self._link_shipped_builtin_skill(skills)
         self._apps(monkeypatch, **{app: True})
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_triggered_skills("find hotspots for me") == ["ai-discover"]
+
+    def test_a_flat_link_into_a_linked_apps_root_is_gated(self, tmp_path, monkeypatch):
+        """The default data home keeps ``$HOME``'s spelling, so ``apps_dir()`` can
+        reach the apps root through a link that the skill's real path has followed."""
+        import kiro_crew.apps.manager as mgr
+        from conftest import make_dir_link
+
+        real_home = tmp_path / "crew"
+        monkeypatch.setenv("KIROCREW_HOME", str(real_home))
+        skill_dir = real_home / "apps" / "deploy_web" / "skills" / "artifact-deploy"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: artifact-deploy\ndescription: d\ntriggers: deploy\n---\n\nb\n"
+        )
+        linked_home = tmp_path / "home"
+        make_dir_link(linked_home, real_home)
+        monkeypatch.setattr(mgr, "apps_dir", lambda: linked_home / "apps")
+        skills = tmp_path / "skills"
+        skills.mkdir()
+        make_dir_link(
+            skills / "artifact-deploy",
+            linked_home / "apps" / "deploy_web" / "skills" / "artifact-deploy",
+        )
+        self._apps(monkeypatch, deploy_web=False)
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
+        )
+
+        assert loader.get_triggered_skills("please deploy this") == []
+
+        loader._invalidate_iter_cache()
+        self._apps(monkeypatch, deploy_web=True)
+        assert _settled(loader).get_triggered_skills("please deploy this") == ["artifact-deploy"]
 
     def test_disabled_app_skills_excluded_from_list_skills_and_context(self, tmp_path, monkeypatch):
         """Disabled app skills must not appear in list_skills or get_context index."""
@@ -2362,10 +1115,12 @@ class TestDisabledAppSkillsAreNotTriggered:
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._write_app_skill(skills, "ops_mc", "ops-mission-control", "deploy")
         self._apps(monkeypatch, deploy_web=False, ops_mc=True)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         listed_keys = [s["key"] for s in loader.list_skills()]
@@ -2385,34 +1140,38 @@ class TestDisabledAppSkillsAreNotTriggered:
             "---\nname: always-helper\nalways: true\n---\n\nBody of always helper\n"
         )
         self._apps(monkeypatch, deploy_web=False)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.get_always_skills() == []
 
         loader._invalidate_iter_cache()
         self._apps(monkeypatch, deploy_web=True)
-        assert loader.get_always_skills() == ["deploy_web/always-helper"]
+        assert _settled(loader).get_always_skills() == ["deploy_web/always-helper"]
 
     def test_disabled_app_dollar_skill_is_not_resolved(self, tmp_path, monkeypatch):
         """Explicit $skill invocation must not resolve a disabled app's skill."""
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._apps(monkeypatch, deploy_web=False)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.resolve_dollar_skills("run $artifact-deploy please") == []
 
         loader._invalidate_iter_cache()
         self._apps(monkeypatch, deploy_web=True)
-        res = loader.resolve_dollar_skills("run $artifact-deploy please")
+        res = _settled(loader).resolve_dollar_skills("run $artifact-deploy please")
         assert len(res) == 1
         assert res[0][1] == "deploy_web/artifact-deploy"
 
@@ -2421,19 +1180,78 @@ class TestDisabledAppSkillsAreNotTriggered:
         skills = tmp_path / "skills"
         self._write_app_skill(skills, "deploy_web", "artifact-deploy", "deploy")
         self._apps(monkeypatch, deploy_web=False)
-        loader = SkillsLoader(
-            skills_path=skills,
-            install_builtins=False,
-            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
         )
 
         assert loader.search_skills("artifact-deploy") == []
 
         loader._invalidate_iter_cache()
         self._apps(monkeypatch, deploy_web=True)
-        results = loader.search_skills("artifact-deploy")
+        results = _settled(loader).search_skills("artifact-deploy")
         assert len(results) == 1
         assert results[0]["key"] == "deploy_web/artifact-deploy"
+
+    def test_a_skill_naming_its_app_is_gated_by_that_app(self, tmp_path, monkeypatch):
+        """The builtin sync COPIES an app skill shipped in ``builtin_skills/``
+        into the skills directory, so no path names its app: its ``app:`` line
+        has to."""
+        skills = tmp_path / "skills"
+        d = skills / "papyrus-writing"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: papyrus-writing\napp: papyrus\ndescription: d\ntriggers: latex\n---\n\nb\n"
+        )
+        self._apps(monkeypatch, papyrus=False)
+        loader = _settled(
+            SkillsLoader(
+                skills_path=skills,
+                install_builtins=False,
+                config=KiroCrewConfig(skills=SkillsConfig(max_triggered=3)),
+            )
+        )
+
+        assert loader.get_triggered_skills("fix my latex") == []
+
+        loader._invalidate_iter_cache()
+        self._apps(monkeypatch, papyrus=True)
+        assert _settled(loader).get_triggered_skills("fix my latex") == ["papyrus-writing"]
+
+    def test_every_packaged_app_skill_names_its_app(self):
+        """A packaged skill named for a builtin app (``<app>`` or ``<app>-...``, the
+        convention every app skill shipped in ``builtin_skills/`` follows) must carry
+        ``app: <app>``, and no ``app:`` line may name an app that does not exist.
+        Either mistake leaves the skill loading while its app is disabled, and
+        nothing else reports it."""
+        import json
+
+        import kiro_crew
+        from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
+
+        pkg = Path(kiro_crew.__file__).resolve().parent
+        apps = {
+            json.loads(p.read_text(encoding="utf-8"))["name"]
+            for p in (pkg / "apps" / "builtins").glob("*/app.json")
+        }
+        skill_files = sorted((pkg / "builtin_skills").glob("*/SKILL.md"))
+        assert apps and skill_files
+        wrong = {}
+        for skill_md in skill_files:
+            name = skill_md.parent.name
+            meta = parse_frontmatter(skill_md.read_text(encoding="utf-8"), SKILL_LOADER)
+            declared = meta.get("app", "")
+            named_for = max(
+                (a for a in apps if name == a or name.startswith(f"{a}-")), key=len, default=""
+            )
+            if declared and declared not in apps:
+                wrong[name] = declared
+            elif named_for and declared != named_for:
+                wrong[name] = declared
+        assert wrong == {}
 
 
 class TestStripFrontmatterCloserParity:

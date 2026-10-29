@@ -26,6 +26,7 @@ from typing import NamedTuple
 import pytest
 
 from kiro_crew.mcp_gateway import stub as stub_mod
+from kiro_crew.testing.wait import await_until, finished
 
 #: Small enough to keep these tests fast, and the drain takes it as a parameter
 #: for exactly that reason. Every timing assertion below is relative to it.
@@ -151,7 +152,7 @@ async def _drain_until(
     # production does not use.
     stop.set()
     with contextlib.suppress(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=5.0)
+        await await_until(task)
     return _DrainRun(reached=reached, ended_itself=ended_itself)
 
 
@@ -270,7 +271,7 @@ async def test_only_the_frames_past_grace_are_failed(answers: _Answers) -> None:
     while session._line_q.qsize():
         await asyncio.sleep(_GRACE / 5)
     stop.set()
-    await asyncio.wait_for(task, timeout=5.0)
+    await await_until(task)
 
     assert answers.ids == [1]
     assert _held(session) == [_request(2)]
@@ -360,6 +361,20 @@ async def test_an_unparseable_line_is_held_verbatim(answers: _Answers) -> None:
 
     assert answers.ids == []
     assert _held(session) == [junk]
+
+
+@pytest.mark.asyncio
+async def test_a_line_nested_past_the_decoder_is_held_verbatim(answers: _Answers) -> None:
+    """``RecursionError`` is not a ``ValueError``, and it must not end the drain."""
+    from stray_line_helpers import too_deep_line
+
+    deep = too_deep_line()
+    session = _session(deep, _request(3))
+
+    await _drain_until(session, lambda: session._line_q.qsize() == 0, grace_secs=60.0)
+
+    assert answers.ids == []
+    assert _held(session) == [deep, _request(3)]
 
 
 # --- (e) ordering and the handback ------------------------------------------
@@ -525,7 +540,7 @@ async def test_the_next_bridge_forwards_held_frames_before_newer_ones() -> None:
 
     gateway = _CaptureWriter()
     stdout_writer = _CaptureWriter()
-    await asyncio.wait_for(
+    await finished(
         stub_mod.run_bridge(
             asyncio.StreamReader(),
             gateway,  # type: ignore[arg-type]
@@ -533,11 +548,40 @@ async def test_the_next_bridge_forwards_held_frames_before_newer_ones() -> None:
             stdout_writer=stdout_writer,  # type: ignore[arg-type]
             session=session,
         ),
-        timeout=10,
+        "run bridge",
     )
 
     forwarded = [json.loads(b) for b in gateway.written if b.strip() and "id" in json.loads(b)]
     assert [f["id"] for f in forwarded] == [1, 2]
+    assert session.reason == "stdin_eof"
+
+
+@pytest.mark.asyncio
+async def test_the_bridge_forwards_a_stray_line_verbatim_and_goes_on() -> None:
+    """``stdin_pump`` parses only for bookkeeping: a line it cannot parse, one
+    nested past the decoder's ceiling included, is forwarded as it came. A
+    ``RecursionError`` out of it would end the bridge with no reason, which is
+    not reconnectable, and the session would lose every pooled server behind it."""
+    from stray_line_helpers import STRAY_LINES
+
+    strays = [make() for make in STRAY_LINES.values()]
+    session = _session(*strays, _request(2))
+    session._line_q.put_nowait(b"")
+
+    gateway = _CaptureWriter()
+    await finished(
+        stub_mod.run_bridge(
+            asyncio.StreamReader(),
+            gateway,  # type: ignore[arg-type]
+            asyncio.Event(),
+            stdout_writer=_CaptureWriter(),  # type: ignore[arg-type]
+            session=session,
+        ),
+        "run bridge",
+    )
+
+    assert all(line in gateway.written for line in strays)
+    assert _request(2) in gateway.written
     assert session.reason == "stdin_eof"
 
 
@@ -681,9 +725,9 @@ async def test_a_stop_arriving_during_an_answer_loses_nothing(monkeypatch) -> No
         )
     )
 
-    await asyncio.wait_for(started.wait(), timeout=5.0)
+    await await_until(started)
     stop.set()  # lands while the answer is mid-flight
-    await asyncio.wait_for(task, timeout=5.0)
+    await await_until(task)
 
     assert emitted == [41], "the answer must complete rather than be abandoned"
     assert _held(session) == [], "an answered id must not also be forwarded"
@@ -708,7 +752,7 @@ async def test_the_pairing_ends_the_drain_without_interrupting_an_answer(
         emitted.extend(req_ids)
 
     async def _reconnect_landing_mid_answer(*_args, **_kwargs):  # noqa: ANN202
-        await asyncio.wait_for(started.wait(), timeout=5.0)
+        await await_until(started)
         return None
 
     monkeypatch.setattr(stub_mod, "_emit_error_frames", _slow_emit)
@@ -802,9 +846,15 @@ def test_the_serve_loop_reconnects_only_through_the_paired_function() -> None:
     serve loop that called it directly would reconnect with nothing reading
     kiro-cli's stream, which is the defect this file exists for.
     """
+    import importlib
     import inspect
 
-    source = inspect.getsource(stub_mod)
+    # The facade joined with its owners: ``_reconnect_while_draining`` lives in
+    # ``stub_link``, which the facade imports.
+    source = "".join(
+        inspect.getsource(importlib.import_module(name))
+        for name in (stub_mod.__name__, *stub_mod._STUB_OWNERS)
+    )
     assert source.count("await _reconnect(") == 1
     assert "await _reconnect_while_draining(" in source
     assert "_drain_while_disconnected(" in inspect.getsource(stub_mod._reconnect_while_draining)

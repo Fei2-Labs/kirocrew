@@ -75,7 +75,16 @@ class TestTheCardsOfferAndTheSaveAllowlistAgree:
             "agent.acp_backend is missing from _EDITABLE_CONFIG, so the adapter "
             "card can offer a choice the API refuses to persist"
         )
-        assert set(spec["values_fn"]()) == set(backends.selectable_ids()), (
+        # The PATCH allowlist speaks the config-file vocabulary ("kiro" for the
+        # empty-string runtime id, "" for "no choice"); backend_from_stored
+        # folds both onto the runtime id the selectable set is spelled in.
+        from kiro_crew.agent_sdk.backends import backend_from_stored
+
+        writable = {
+            (backend_from_stored(v) if backend_from_stored(v) is not None else ACP_BACKEND_KIRO)
+            for v in spec["values_fn"]()
+        }
+        assert writable == set(backends.selectable_ids()), (
             "the writable set and selectable_backends() disagree; a value the "
             "card offers would be refused, or one it hides would be accepted"
         )
@@ -643,6 +652,17 @@ class TestActiveState:
             handler.acp_backends,
             "selectable_ids",
             lambda **_kwargs: frozenset({ACP_BACKEND_KIRO, "example-acp"}),
+        )
+        # Config normalization gates through agent_sdk.backends' own
+        # ``selectable_backends`` global — patching the endpoint's
+        # ``selectable_ids`` above never reaches it, so the check has to be
+        # told the same answer at the seam it actually reads.
+        from kiro_crew.agent_sdk import backends as sdk_backends
+
+        monkeypatch.setattr(
+            sdk_backends,
+            "selectable_backends",
+            lambda: frozenset({ACP_BACKEND_KIRO, "example-acp"}),
         )
         monkeypatch.setattr(handler, "_is_dashboard_owner", lambda _request: True)
         request = SimpleNamespace(query={})

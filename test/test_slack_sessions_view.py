@@ -35,6 +35,7 @@ from kiro_crew.slack.sessions_view import (
     _default_session_title,
     sessions_include_ended,
 )
+from kiro_crew.testing.wait import await_until
 
 
 def _write_jsonl(
@@ -1483,7 +1484,7 @@ class TestCollectorEventLoopOffload:
         # This line executing WHILE the collector blocks is only possible if
         # the handler offloaded the collector.
         release.set()
-        await asyncio.wait_for(task, timeout=10)
+        await await_until(task, timeout=10, what="the handler finishing after the release")
 
         assert outcome["released"] is True
         assert outcome["thread"] is not threading.current_thread()
@@ -1541,12 +1542,20 @@ class TestOffLoopStructuralRatchet:
         asyncio.to_thread, where read_text appears as an argument, not as
         the func of a Call node."""
         import ast
+        import importlib
 
         import kiro_crew.slack.interactions as interactions_mod
 
-        tree = ast.parse(Path(interactions_mod.__file__).read_text(encoding="utf-8"))
+        # The facade and every owner its handlers moved to.
+        trees = {
+            name: ast.parse(
+                Path(importlib.import_module(name).__file__).read_text(encoding="utf-8")
+            )
+            for name in (interactions_mod.__name__, *interactions_mod._OWNERS)
+        }
         direct_calls = [
-            node.lineno
+            f"{name}:{node.lineno}"
+            for name, tree in trees.items()
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)

@@ -14,6 +14,7 @@ from urllib.parse import quote
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import (
     _sanitize_blocks,
@@ -27,7 +28,9 @@ def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/file-read", api_file_read)
     app.router.add_post("/api/file-write", api_file_write)
-    return app
+    # /api/file-write is owner-gated; the identity is plumbing so these tests stay on
+    # the branch each one names (the gate itself: test_file_write_owner_gate.py).
+    return as_owner(app)
 
 
 @pytest.fixture
@@ -282,6 +285,73 @@ class TestFileRead:
             assert len(await resp.text()) == 512_000
 
     @pytest.mark.asyncio
+    async def test_read_announces_a_redacted_body_in_a_header(self, tmp_path, mock_sel, home_patch):
+        # The viewer keeps the last copy of a file deleted outside the dashboard
+        # and offers it for download; a body the credential pass rewrote is not
+        # the file as written, and only a header can say so -- a file may quote
+        # the redaction tag itself. A synthetic key shape, never a real secret.
+        import hashlib
+
+        key = "A" + "KIA" + hashlib.sha256(b"kc-file-read-header").hexdigest().upper()[:16]
+        f = tmp_path / "notes.txt"
+        f.write_text(f"token = {key}\n", encoding="utf-8")
+        plain = tmp_path / "plain.txt"
+        plain.write_text("nothing to hide here\n", encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            assert resp.status == 200
+            assert resp.headers["X-Redacted"] == "true"
+            assert key not in await resp.text()
+            resp = await client.get(f"/api/file-read?path={plain}")
+            assert resp.status == 200
+            assert "X-Redacted" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_read_announces_a_lossy_decode_in_a_header(self, tmp_path, mock_sel, home_patch):
+        # A Latin-1 text file passes the extension check and the NUL sniff and
+        # decodes with a replacement character: shown as text, but not the file
+        # as written -- which the viewer must know before offering the body as
+        # the last copy of a deleted file, or downloading it under its own name.
+        f = tmp_path / "latin1.txt"
+        f.write_bytes(b"caf\xe9 au lait\n")
+        plain = tmp_path / "utf8.txt"
+        plain.write_text("café au lait\n", encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            assert resp.status == 200
+            assert resp.headers["X-Lossy-Decode"] == "true"
+            assert "\ufffd" in await resp.text()
+            resp = await client.get(f"/api/file-read?path={plain}")
+            assert resp.status == 200
+            assert "X-Lossy-Decode" not in resp.headers
+            assert await resp.text() == "café au lait\n"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("ext", [".rem", ".ret"])
+    async def test_read_serves_cnab_rem_ret_as_viewable_text(
+        self, ext, tmp_path, mock_sel, home_patch
+    ):
+        # CNAB remittance/return files are fixed-width ASCII/Latin-1 banking
+        # records with no NUL bytes, so the viewer serves them as text/plain
+        # rather than a binary envelope. The accented detail-segment name is
+        # Latin-1, so the decode is lossy (errors="replace") and the viewer
+        # flags that in the header while still showing the body.
+        f = tmp_path / f"cobranca{ext}"
+        f.write_bytes(
+            b"02RETORNO01COBRANCA       EMPRESA EXEMPLO LTDA\n"
+            b"1 JOS\xc9 DA CONCEI\xc7\xc3O                 000012345\n"
+        )
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            assert resp.status == 200
+            assert resp.headers["Content-Type"].startswith("text/plain")
+            body = await resp.json() if resp.content_type == "application/json" else None
+            # Served as text, not the {"binary": True} envelope.
+            text = await resp.text() if body is None else body.get("content", "")
+            assert "RETORNO" in text
+            assert resp.headers.get("X-Lossy-Decode") == "true"
+
+    @pytest.mark.asyncio
     async def test_read_head_on_binary_still_answers_from_the_stat(
         self, tmp_path, mock_sel, home_patch
     ):
@@ -515,7 +585,7 @@ class TestFileReadReservedCharacterPaths:
         Only NUL is exercised here. The other unrepresentable shape -- a lone
         surrogate -- cannot be delivered through this transport, because URL
         decoding never yields one; it is covered against the seam itself in
-        test_hooks_coverage.py.
+        test_hooks_coverage_file_branches.py.
         """
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get("/api/file-read?path=" + encoded)
@@ -547,6 +617,40 @@ class TestFileWrite:
                 outcome="success",
                 resources=str(tmp_file),
             )
+
+    @pytest.mark.asyncio
+    async def test_write_numeric_content_is_rejected_not_coerced(
+        self, tmp_file, mock_sel, home_patch
+    ):
+        """The dashboard file-write endpoint keeps its ORIGINAL contract: a
+        non-string ``content`` is rejected by schema validation (HTTP 400) and
+        no file is written. The int->str repair for a numeric-looking string
+        argument lives ONLY at the MCP tool-call entry points, not in the shared
+        validator the dashboard HTTP endpoints go through, so this endpoint must
+        not silently coerce an int to "42"."""
+        before = tmp_file.read_text(encoding="utf-8")
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(tmp_file), "content": 42}
+            )
+            assert resp.status == 400
+            # The file is untouched: nothing was written on the rejected call.
+            assert tmp_file.read_text(encoding="utf-8") == before
+
+    @pytest.mark.asyncio
+    async def test_write_string_content_is_not_sanitized(self, tmp_file, mock_sel, home_patch):
+        """A string file save must write the author's bytes verbatim: no .strip()
+        of the final newline or leading indentation, no NFC renormalization, and
+        no removal of hidden Cf characters (BOM, soft hyphen). The dashboard
+        endpoint writes the raw request body, never the validator's normalized
+        value."""
+        content = "  indented\nbody \u00e9\ufeff x\u00ad\n\n"
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(tmp_file), "content": content}
+            )
+            assert resp.status == 200
+            assert tmp_file.read_text(encoding="utf-8") == content
 
     @pytest.mark.asyncio
     async def test_write_outside_home(self, mock_sel, home_patch):
@@ -735,7 +839,9 @@ class TestSendMessage:
             assert resp.status == 200
             data = await resp.json()
             assert data == {"ok": True, "slack": False, "session": False, "delivered_to": "notification"}
-            state.notify.assert_called_once_with("agent", "Agent Message", "hello")
+            state.notify.assert_called_once_with(
+                "agent", "Agent Message", "hello", meta=None, member=None, publisher_session=None
+            )
 
     @pytest.mark.asyncio
     async def test_send_message_with_slack(self):
@@ -751,14 +857,14 @@ class TestSendMessage:
             assert resp.status == 200
             data = await resp.json()
             assert data == {"ok": True, "slack": True, "session": False, "delivered_to": "slack", "ts": "1712793600.000001"}
-            state.notify.assert_called_once_with("agent", "Test", "hello")
+            state.notify.assert_called_once_with(
+                "agent", "Test", "hello", meta=None, member=None, publisher_session=None
+            )
             slack.open_dm.assert_called_once_with("U123")
             slack.post_message.assert_called_once_with(
                 "C123",
                 "hello",
                 thread_ts=None,
-                unfurl_links=None,
-                unfurl_media=None,
                 reply_broadcast=None,
             )
 
@@ -815,8 +921,6 @@ class TestSendMessage:
                 blocks,
                 "fallback",
                 thread_ts=None,
-                unfurl_links=None,
-                unfurl_media=None,
                 reply_broadcast=None,
             )
             slack.post_message.assert_not_called()
@@ -838,8 +942,6 @@ class TestSendMessage:
                 "C123",
                 "hello",
                 thread_ts=None,
-                unfurl_links=None,
-                unfurl_media=None,
                 reply_broadcast=None,
             )
             slack.post_blocks.assert_not_called()
@@ -870,10 +972,6 @@ class TestSendMessage:
         # Mock a slot that the cron originated from
         mock_slot = MagicMock()
         mock_slot.running = False
-        # Real _ChatSlot defaults this False; a bare MagicMock returns a truthy
-        # Mock and would trip the busy guard (running or _in_stage_execution),
-        # diverting origin-inject to the queue branch.
-        mock_slot._in_stage_execution = False
         mock_slot.task = None
         mock_slot.key = "chat-1-1712793600"
         state.get_slot = MagicMock(return_value=mock_slot)
@@ -979,10 +1077,6 @@ class TestSendMessage:
         # Rehydrate helper returns a slot reconstructed from persisted history.
         mock_slot = MagicMock()
         mock_slot.running = False
-        # Real _ChatSlot defaults this False; a bare MagicMock returns a truthy
-        # Mock and would trip the busy guard (running or _in_stage_execution),
-        # diverting origin-inject to the queue branch.
-        mock_slot._in_stage_execution = False
         mock_slot.task = None
         mock_slot.key = "chat-1-1712793600"
         state._background_tasks = set()
@@ -1048,7 +1142,7 @@ class TestSendMessage:
             seen.append(threading.get_ident())
             # messages=None means "nothing persisted", so the handler falls back to
             # the notification path -- keeping this test about the read's location.
-            return ({}, True, None, {}, None, None)
+            return ({}, True, None, {}, None, None, False)
 
         with patch.object(chat_persistence, "_prefetch_rehydrate_inputs", _prefetch):
             async with TestClient(TestServer(app)) as client:
@@ -1120,10 +1214,6 @@ class TestSendMessage:
         state = _mock_state()
         mock_slot = MagicMock()
         mock_slot.running = False
-        # Real _ChatSlot defaults this False; a bare MagicMock returns a truthy
-        # Mock and would trip the busy guard (running or _in_stage_execution),
-        # diverting origin-inject to the queue branch.
-        mock_slot._in_stage_execution = False
         mock_slot.task = None
         mock_slot.key = "chat-1-1712793600"
         state.get_slot = MagicMock(return_value=mock_slot)

@@ -38,16 +38,18 @@ import importlib
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
 # Module scope, not function-local: these are the only package imports this file
-# can safely make at import time. dep_sync imports the standard library only
-# (asserted by a test) and `__version__` needs nothing beyond the package
-# itself (`kiro_crew.__init__` imports only the standard library), so neither
-# can raise the ModuleNotFoundError this file exists to heal.
-from kiro_crew import __version__, dep_sync
+# can safely make at import time. dep_sync and stdlib_shadow import the standard
+# library only (each asserted by a test) and `version_line` needs nothing beyond
+# the package itself (`kiro_crew.__init__` imports only the standard library), so
+# none can raise the ModuleNotFoundError this file exists to heal.
+from kiro_crew import dep_sync, version_line
+from kiro_crew.stdlib_shadow import refuse_if_stdlib_shadowed
 
 _PIP_TIMEOUT_SECS = 300
+_T = TypeVar("_T")
 
 
 def _import_cli() -> Callable[[], None]:
@@ -109,16 +111,38 @@ def _self_heal(missing: str) -> bool:
 
 def main() -> None:
     """Import the real CLI, self-healing a stale editable install once."""
+    # A stdlib name resolving from the launch directory, PYTHONPATH or a
+    # site-packages tree is refused here, before `--version` and before the
+    # CLI import: the shadow is already loaded (`kiro_crew.__init__` imports
+    # asyncio), so nothing later can be trusted to fail in a readable way.
+    refuse_if_stdlib_shadowed()
     # Fast-path for bare `--version`: skip importing `kiro_crew.cli` (~250ms
     # of module-scope imports `--version` never uses) on the console-script
     # path. Mirrored by the `__main__` guard for `python -m`; only the bare
     # form fast-paths so `artifact show --version N` keeps its argparse
     # semantics.
     if len(sys.argv) == 2 and sys.argv[1] == "--version":
-        print(f"kirocrew {__version__}")
+        print(version_line())
         return
+    # The stdio MCP servers the gateway launches skip the full CLI import
+    # (kiro_crew.mcp_entry; its module scope is stdlib-only). slim_server
+    # returns None for any other argv, which then takes the CLI path below.
+    # It does every import before the server reads stdin, so a missing
+    # dependency heals and retries here exactly as the CLI import does.
+    from kiro_crew.mcp_entry import slim_server
+
+    server = _load_healing(lambda: slim_server(sys.argv[1:]))
+    if server is not None:
+        server()
+        return
+    cli_main = _load_healing(_import_cli)
+    cli_main()
+
+
+def _load_healing(load: Callable[[], _T]) -> _T:
+    """Run *load*; on a missing dependency heal the install once and retry."""
     try:
-        cli_main = _import_cli()
+        return load()
     except ModuleNotFoundError as exc:
         if not _self_heal(exc.name or str(exc)):
             print(
@@ -133,7 +157,7 @@ def main() -> None:
         # coarse-mtime filesystems without an explicit invalidation.
         importlib.invalidate_caches()
         try:
-            cli_main = _import_cli()
+            loaded = load()
         except ModuleNotFoundError as exc2:  # heal ran but did not cover it
             print(
                 f"kirocrew: still failing after reinstall - {exc2}. "
@@ -142,4 +166,4 @@ def main() -> None:
             )
             raise SystemExit(1) from exc2
         print("kirocrew: dependencies restored.", file=sys.stderr)
-    cli_main()
+        return loaded

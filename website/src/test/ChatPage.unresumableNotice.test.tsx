@@ -49,6 +49,7 @@ vi.mock('../api/client', () => ({
     chatSlots: vi.fn().mockResolvedValue([]),
     chatSlotDetail: vi.fn(async () => ({ messages: detail.messages, running: false, has_more: false, total: detail.messages.length })),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
+    dashboardConfig: vi.fn().mockResolvedValue({}),
     models: vi.fn().mockResolvedValue([]),
     agents: vi.fn().mockResolvedValue([]),
     agentDetail: vi.fn().mockResolvedValue({}),
@@ -91,7 +92,9 @@ function makeStore(unresumableResume: { key: string; title: string; surface: str
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
       dashboard: {
-        status: null,
+        // The slot list has landed, so a pane with no tab open shows the
+        // empty state rather than the loading placeholder (#21785).
+        status: null, slotsLoaded: true,
         slots: activeSlot ? [{ key: 'slot-a', messages: plainTurn.length, running: false, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }] : [],
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
@@ -192,6 +195,15 @@ describe('unresumable-resume notice on the chat pane (#5925)', () => {
     expect(notice.textContent).not.toContain('chat session')
   })
 
+  it('names an untitled session "Untitled session", never its key (#22049)', async () => {
+    // The resume payload carries `title || key`, so an untitled session's
+    // title IS its key here; the notice must not print it as the name.
+    await renderWith({ key: 'chat-9-1785440411', title: 'chat-9-1785440411', surface: '', reason: 'failed' })
+    const notice = await screen.findByTestId('unresumable-resume-error')
+    expect(notice.textContent).toContain('Untitled session')
+    expect(notice.textContent).not.toContain('chat-9-1785440411')
+  })
+
   it('an unregistered surface gets a surface-free sentence, not raw machine vocabulary', async () => {
     // The wire `surface` is a machine value. Interpolating it renders lowercase
     // machine words mid-sentence ("it's a subagent session"), and its empty case
@@ -209,7 +221,7 @@ describe('unresumable-resume notice on the chat pane (#5925)', () => {
     await renderWith({ key: 'member-ada', title: 'Ada', surface: 'member', reason: 'surface' })
 
     const notice = await screen.findByTestId('unresumable-resume-error')
-    expect(notice.textContent).toContain('Crew Members')
+    expect(notice.textContent).toContain('Mates')
     expect(notice.textContent).not.toContain('member session')
   })
 })

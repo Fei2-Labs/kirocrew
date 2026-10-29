@@ -30,52 +30,33 @@ The grammar is `spawn <task>` (or `bg <task>`) — there is no `run` subcommand;
 The `spawn_run` tool accepts:
 - `task` — single task description
 - `tasks` — array of tasks for parallel execution
-- `solo_reason` — `parent_parallel`, `bulk_data`, `fresh_context`, `specialist`, or `user_requested` (see below)
-- `solo_details` — concrete benefit and ownership; required for `parent_parallel`, `specialist`, and `user_requested`
 - `agent` / `agents` — optional agent name(s) for each task
 - `include_memory` / `include_lessons` / `include_project` — booleans (default `true`) switching off a context group the sub-agent would otherwise inherit
 - `max_turns` — per-spawn tool-call budget override (0 = unset, max 1000)
 - `model` — model override for this spawn (e.g. `deepseek-3.2`)
 - `reasoning_effort` — `low` / `medium` / `high` / `xhigh` / `max`, batch-wide
+- `backend` — the agent harness the run starts on instead of the gateway default (`kiro`, `claude`, `codex`, or any other backend installed and allowed on this gateway), batch-wide. A `tasks` entry can set its own `backend` (and `model`) so one wave can send each task to a different harness. A backend that is not allowed here, not installed on this machine, or installed only after the gateway started (restart the gateway to use it), is refused at spawn time with the list of backends that can start (and, for an allowed one that is missing, the command that installs it) rather than replaced by the default. Pass `model` as an id from that backend's own list. A `spawn_continue` follow-up, and a retry, ask for the same backend as the original run
 - `keep` — make the run a continuable conversation with guaranteed resumability and longer retention
 - `cwd` — absolute launch directory, which must be under a configured `subagent_cwd_allowed_roots` entry
 
-Setting `model` or `reasoning_effort`, or `keep: true`, forces the
+Setting `model`, `reasoning_effort` or `backend`, or `keep: true`, forces the
 dedicated-process path instead of session sharing.
 
-#### The solo gate
+#### When to delegate
 
-Do focused work directly. Delegate when separate ready work can progress in
-parallel, a large input needs distillation, independent verification adds value,
-a specialist capability is needed, or the user explicitly asks. A long task,
-empty slots or a different model name alone is not a reason to delegate.
+Do focused work directly: one task is faster done in the parent, even a
+multi-step one. Spawn when the work splits into two or more independent tasks,
+when a step would flood the parent's context with bulk output and only the
+distilled result is needed, when you need an independent review or reproduction
+whose result would be wrong if it saw this session's context, or when the user
+asks for delegation or the task needs a different agent, model or crew. A long task, empty slots or a different
+model name alone is not a reason to delegate. Guidance lives in the prompt; no
+runtime gate refuses a one-task call.
 
-One child is valid when the parent owns a separate useful workstream. For example:
-
-```python
-spawn_run(task="Update docs to the finalized API in api-v2.json; own docs/api.md; return the diff and link checks",
-          solo_reason="parent_parallel",
-          solo_details="I implement backend validation in server.py; docs inputs are finalized and disjoint")
-```
-
-`parent_parallel` needs asynchronous `spawn_run` and a dashboard-owned parent
-turn. Its receipt says whether bounded parent work is supported. When supported,
-finish at most one minute of ready non-overlapping work, then end the turn so
-queued results can arrive. Otherwise yield immediately. This guidance is not a
-timer enforced by the runtime. Blocking `spawn_sub_agents` cannot support
-parent-child parallel work; `spawn_continue` still requires immediate yield.
-
-For one child without separate parent work, use `bulk_data` for substantial
-inputs, `fresh_context` for blind review/clean reproduction, `specialist` with a
-concrete capability, or `user_requested` with the user's request quoted in
-`solo_details`. The last two require details; existing bulk/fresh payloads keep
-working. `fresh_context` alone does not turn off memory or project context.
-
-An unexplained equivalent-worker solo call is refused without spawning. Do it
-directly or give the real benefit; do not invent tasks or swap models to bypass
-the gate. Reasons/details are retained in the run record as model claims, not
-verified authorization. Existing direct SDK/API calls without the model solo
-marker remain compatible.
+The spawn receipt says whether bounded parent work is supported (a
+dashboard-owned parent turn). When supported, the parent may finish at most one
+minute of ready non-overlapping work, then end the turn so queued results can
+arrive. Otherwise it yields immediately. `spawn_continue` always yields.
 
 Wait through completion events when no useful independent work remains. Do not
 repeat a child's task to stay busy. Collect all outcomes in the batch, including
@@ -85,13 +66,13 @@ before retrying. Parallel writers need separate ownership; a worktree does not
 isolate shared databases, ports or external services.
 
 The other spawn tools:
-- `spawn_sub_agents` — same fan-out as `spawn_run`, but BLOCKS and returns the collected results; takes `agents` (array of `{agent_or_mode, prompt}`), `cwd`, and the same `include_*` switches
+- `spawn_sub_agents` — same fan-out as `spawn_run`, but BLOCKS and returns the collected results (a member the spawn gate deferred is reported with why it waits, and its result arrives later as a completion event); takes `agents` (array of `{agent_or_mode, prompt}`), `cwd`, and the same `include_*` switches
 - `spawn_continue` — dispatch a follow-up turn into a completed run's conversation (`conversation`, `task`, optional `agent` / `max_turns` / `model`); context scope is inherited, so the `include_*` flags are not accepted
-- `spawn_steer` — inject a message into a RUNNING subagent's in-flight turn (`agent_id`, `message`, `mode`: `interrupt` default or `follow_up`)
-- `spawn_release` — end a continuable conversation (`conversation`) so it can no longer be continued
-- `spawn_list` — list running and completed subagents
-- `spawn_status` — read a completed run's retained transcript (see below)
-- `resource_status` — advisory host headroom (available memory, CPU load, posture, and the current concurrent sub-agent cap)
+- `spawn_steer` — inject a message into a RUNNING subagent's in-flight turn (`agent_id`, `message`, `mode`: `interrupt` default or `follow_up`). A spawn that was accepted but has not started yet answers `queued — not started` (HTTP 409 `queued_not_started`)
+- `spawn_release` — end a continuable conversation (`conversation`) so it can no longer be continued. On a run of yours that is still queued (accepted, not started) it cancels the run instead, so it never starts
+- `spawn_list` — list running, queued (accepted, not yet started) and completed subagents
+- `spawn_status` — read a run's transcript: the live partial view while it runs, the retained full transcript once complete (see below). A spawn that was accepted but has not started yet answers `QUEUED` with the reason it waits; it starts on its own, so do not spawn it again
+- `resource_status` — advisory host headroom (available memory, CPU load, posture, the current concurrent sub-agent cap, and the agent slice's task count against its `pids.max` ceiling)
 
 ## How It Works
 
@@ -100,13 +81,19 @@ The other spawn tools:
 3. Results are automatically injected back as `[Subagent completion event]`
 4. Kiro Crew synthesizes the results into a final response
 
+After a gateway restart the dashboard's Subagents panel is rebuilt with recent
+finished runs: the newest 50 from the last day. Dismissing a card is recorded
+durably, so it stays dismissed after a restart. A dismissal that answers HTTP 503
+`dismissal_unwritable` could not be saved, and the card may come back.
+
 ## Limits
 
-- **Max concurrent**: auto-sized at startup by default (`agent.max_subagents = 0`; floor 3, ceiling `agent.subagent_auto_max` = 32); set a positive integer to pin a fixed cap
-- **Timeout**: 3 hours per subagent task (`agent.subagent_timeout_secs`, clamped to 60s..86400s at load; 0 means "use the default"), 20 minutes delivery (semaphore wait + injection), 15 minutes per injection attempt (`KIROCREW_INJECTION_TIMEOUT`, clamped to the delivery cap). A **blocking** `spawn_sub_agents` call collects for at most 2 hours regardless of that setting (`KIROCREW_SPAWN_SUB_AGENTS_MAX_WAIT`, itself capped at 7200s), so use `spawn_run` for work longer than 2 hours and read the results from its completion events
+- **Max concurrent**: free memory bounds how many start (each start must leave `agent.spawn_min_memory_gb` free); the count is a high ceiling, `agent.subagent_auto_max` = 32 by default (`agent.max_subagents = 0`); set a positive integer (3 or more) to pin a fixed cap. See [dynamic-subagent-sizing.md](dynamic-subagent-sizing.md)
+- **Timeout**: 3 hours per subagent task (`agent.subagent_timeout_secs`, clamped to 60s..86400s at load; 0 means "use the default"; a running subagent keeps the deadline it started with, so a changed value applies to the next run), 20 minutes delivery (semaphore wait + injection), 15 minutes per injection attempt (`KIROCREW_INJECTION_TIMEOUT`, clamped to the delivery cap). A **blocking** `spawn_sub_agents` call collects for at most 2 hours regardless of that setting (`KIROCREW_SPAWN_SUB_AGENTS_MAX_WAIT`, itself capped at 7200s), so use `spawn_run` for work longer than 2 hours and read the results from its completion events
 - **Turn limit**: 1000 tool calls per subagent by default (configurable via `agent.subagent_max_turns`, maximum 1000). A stored value, including 100, is preserved on upgrade; an unset key automatically uses the current default. Run `kirocrew config defaults` to inspect an older stored default, then use `kirocrew config defaults --adopt agent.subagent_max_turns` only if you want to replace that pin with the current default.
-- **Memory guard**: admission preserves a 4 GB available-memory floor plus estimated startup memory for the next worker and dedicated workers still warming up. Observed RSS replaces the startup reservation; confirmed shared sessions add no dedicated-process cost. Work waits in the durable queue when headroom is insufficient (legacy spawns are refused). Configure the floor with `agent.spawn_min_memory_gb`; set it to 0 to disable this guard.
+- **Memory guard**: a start is admitted only if at least 2 GB of memory stays available after it, counting what starts still warming up will take. A dedicated-process start (a `model`/`reasoning_effort` override, `keep`, `bare`, `allowed_tools`, or a role model pin) is priced at what such a runtime settles at: about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, and never less than `agent.subagent_cost_gb` (0.5 GB by default). A start that shares its parent's runtime is priced about 0.35 GB lower, since it still starts the agent's MCP servers. Each owes that price until two reaper sweeps have measured it (or, where they cannot, two sweep intervals after it first answered), then nothing. If a shared start has to fall back to its own process, the guard re-checks before that process starts. When headroom is insufficient the start waits in the queue rather than failing (an incognito or temporary spawn, or one with the task queue off, waits in memory) and is re-checked as soon as memory can have moved (a subagent finishing, or a free-memory reading taken every few seconds while something waits, which also notices a warming one settling), at the latest when `agent.admit_wait_secs` passes, for at most `agent.subagent_queue_max_wait_secs` (30 minutes by default) of being held back; past that the spawn ends without starting and its parent gets the result `never started: waiting for memory (not enough memory freed up in time); retry once memory frees up`. While it waits, the chip names that limit as the time after which the spawn gives up. Only this floor holds a spawn: the "critically low" memory posture (`agent.resource_critical_gb`) defers cron firings, not subagents. While another chat's subagents wait for memory, a chat that already runs its share of dedicated subagents waits for its next top-level start too, so the memory goes to the waiting chat first (shares follow `agent.lane_weights`); a nested subagent that shares its parent's runtime starts at the floor itself, since its parent already holds its memory. Configure the floor with `agent.spawn_min_memory_gb`; set it to 0 to disable this guard. An install still carrying the old 4.0 default moves to 2.0 once; a value set back afterwards is kept.
 - **Nesting**: a subagent can spawn its own subagents. A nested spawn is tracked apart from the parent's wave, so its children are not counted against that wave's completion total
+- **macOS memory pressure**: on macOS the memory guard also reads the kernel's memory-pressure level (the one Activity Monitor graphs). While it is WARN or CRITICAL and one of this gateway's dedicated subagents is running, a new start waits even when the free-memory figure is above the floor; the chip says "macOS reports memory pressure". Temporary and incognito spawns wait the same way. A held start is re-checked every 15 seconds and whenever a subagent finishes; if it has been held for `agent.subagent_queue_max_wait_secs` (30 minutes by default) with no other top-level start from the same chat beginning in that time (the starts ahead of it in that chat's queue, from any `spawn_run` batch; scheduled and background jobs share one queue, so a start from any of them counts for all of them), it is ended without starting ("never started: waiting for memory"), and the wave's results count it among those that never started, to resubmit once memory eases; and while an episode lasts longer than that, new starts it would hold end at once. With no dedicated subagent of ours running, the start is judged on the figure alone, and a subagent's own nested subagents are never held. `agent.spawn_min_memory_gb = 0` turns this off with the rest of the guard
 - **Redaction**: task strings in SubagentInfo are redacted (credentials + exfiltration URLs) before surfacing to Slack/dashboard
 
 ## Named Agents
@@ -167,14 +154,36 @@ Set via `kirocrew config set agent.completion_keep tail` or by editing
 
 ### Reading the full transcript on demand
 
-`spawn_status` reads the retained transcript by agent ID and supports
+`spawn_status` reads a run's transcript by agent ID and supports
 line-oriented paging (like reading code) for large results:
 
 - `spawn_status(agent_id, limit=200)` — first 200 lines
 - `spawn_status(agent_id, offset=200, limit=200)` — next page
 - `spawn_status(agent_id, grep="ERROR|FAIL")` — only lines matching the regex
 
+For newly completed runs, the response also reports cumulative credit usage and
+elapsed time. The credit total includes billed retry attempts, whether the run
+ultimately succeeds or fails. Older retained records remain readable without a
+usage line. When credit billing is not reported, only elapsed time is shown,
+not a zero-cost claim. The dashboard keeps elapsed time in each card header and
+shows a localized “Used … credits” summary when you expand a managed card with
+positive reported credits. When credits are not reported, the dashboard identifies
+that state in the expanded managed card body. Native subagents share their parent
+turn's billing and omit this summary. Elapsed time rounds to whole seconds before
+switching to minute-and-second formatting.
+
 A paged/filtered response is prefixed with a continuation header
 (`showing lines X-Y of N | more available — call again with offset=Y`). With no
-paging args it returns the full transcript. You can also point the generic
-`read` / `grep` tools straight at the `result_path` from the completion event.
+paging args it returns the full transcript of a completed run. You can also
+point the generic `read` / `grep` tools straight at the `result_path` from the
+completion event.
+
+While the run is still going, the same call returns its live status and the
+redacted partial transcript streamed so far, under a
+`[RUNNING · <elapsed>s · <N> turns · last tool: <X>]` header. A run still
+parked on the spawn-approval prompt has launched no process, so its header
+leads with `AWAITING-APPROVAL` instead of `RUNNING` and the body says to
+approve it in the dashboard (Approvals) to start it. The partial view grows
+as the run streams and, past the manager's bound, is truncated from the
+front, so line offsets can shift between polls: `offset`/`limit` paging is
+best-effort until completion. Completed-run output is unchanged.

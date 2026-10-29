@@ -1,39 +1,27 @@
-"""Agent tag-write grants — the protected policy source for ``chat_tag``.
+"""Agent tag-write grants — protected identity and policy for ``chat_tag``.
 
 A tag's agent-write policy (``add-remove`` | ``add-only`` | ``none``) decides
 whether the ``chat_tag`` session directive may mutate that tag on a session.
-Storing that policy as fields on the tag rows in ``tags.json`` left it
-agent-writable: ``tags.json`` is an ordinary data-home file, so an agent's own
-file tools could forge ``agent``/``status`` fields, restart-persistently
-granting itself write access to a human-reserved tag (forgeable-authorization hazard on the
-``chat_tag`` PR). Same class of control as ``computer_use.json``: the record IS
-the authorization, so it cannot live where the subject of the authorization can
-write it.
+``tags.json`` is agent-writable, so neither policy nor trusted tag identity can
+come from its rows. The authorization record lives instead in
+``<data home>/tag-grants/agent-tag-policy.json``, a dedicated leaf masked from
+sandboxed processes and fenced from agent file tools and shell. Only the
+gateway opens it directly.
 
-This module is the protected replacement. Grants live in
-``<data home>/tag-grants/agent-tag-policy.json`` — a dedicated leaf that is
-masked from sandboxed processes (``sandbox._CREW_HIDDEN_LEAVES``) AND fenced
-from the agent file tools and shell (``security._CREW_SECRET_LEAVES``), so
-neither a gated tool call nor a spawned script's plain ``open()`` can read or
-forge it; only the gateway opens the path, directly.
+Authenticated dashboard create records an identity row for every new tag:
+``none``/non-status for a plain label and ``add-remove``/status for a workflow
+state. PATCH may change policy or status only when that row already exists; the
+dashboard-owner adoption action records a ``none`` row for a legacy tag, and
+delete revokes it. Boot seeding reads only code-constant workflow-state ids,
+never ``tags.json``. A pre-existing custom tag without a row remains human-only
+until explicit dashboard-owner adoption.
 
-Writers are the authenticated dashboard tag CRUD handlers only (create/update/
-delete mint and revoke rows), plus a one-time boot seed that mints rows solely
-for the CODE-CONSTANT default workflow-state tag ids — never anything read
-from ``tags.json``, whose contents are agent-writable and therefore must not
-be promoted into this store. A pre-existing custom grant requires one
-authenticated dashboard PATCH after upgrade to re-mint.
-
-Each grant row also records the tag's STATUS bit (is this a workflow-state
-tag?). The applier's status semantics — set_state eligibility, the
-mutual-exclusivity peer strip, the "no status tags through add" rule — key on
-this recorded bit rather than the file's, because a forged ``status`` field
-on a granted tag would otherwise re-route those authorization decisions.
-
-The gate fails **closed** everywhere: an unreadable store, a malformed store,
-an unknown tag id, or a newer schema all resolve to ``("none", False)`` rather
-than a permissive default. Refusing a legitimate grant costs one dashboard
-click to re-mint; honoring a forged one hands the agent a human-reserved tag.
+Each row records the protected STATUS bit used by set_state eligibility,
+mutual-exclusivity stripping, and the no-status-tag-through-add rule. An absent,
+unreadable, malformed, or newer-schema store fails closed to
+``("none", False)``. A legitimate custom tag whose protected identity is lost
+requires explicit owner adoption; honoring a forged row hands the agent a
+human-reserved tag.
 """
 
 from __future__ import annotations
@@ -97,11 +85,11 @@ _MAX_STORE_KEY_BYTES = 4096
 #: module wrote and is read as malformed (quarantine) rather than parsed.
 _MAX_STORE_BYTES = 2 * 1024 * 1024
 
-#: The policies a store row may carry. ``none`` rows exist to preserve the
-#: STATUS bit for human-only workflow-state tags (revoking the row
-#: on an ``agent: "none"`` PATCH would erase status identity and let
-#: ``set_state`` persist two exclusive workflow states); absence of a row still
-#: resolves to ``("none", False)``, the maximally-closed state.
+#: The policies a store row may carry. ``none`` rows record protected
+#: dashboard-create identity without granting write authority; for workflow
+#: states they also preserve the STATUS bit used by exclusivity semantics.
+#: Absence of a row still resolves to ``("none", False)``, the maximally-closed
+#: state, but is not provenance for a later PATCH mint.
 _ROW_POLICIES = frozenset({"add-remove", "add-only", "none"})
 
 #: The closed grant grammar lives in the dependency-free
@@ -125,24 +113,146 @@ _cache: tuple[_StoreSignature, dict[str, tuple[str, bool]]] | None = None
 #: reads this so an agent's refusal says the store is unavailable instead of
 #: ``tag_policy_denied`` -- the latter reads as a deliberate human reservation
 #: and sends the operator debugging a "broken" feature from gateway logs. A
-#: quarantine sticks for the life of the process: the re-seeded store is
-#: healthy but every custom grant it held is gone until a human re-mints.
+#: quarantine REDUCES grants for the life of the process: the re-seeded store
+#: is healthy but every custom identity it held is gone until the tag is
+#: explicitly adopted, so a rowless refusal keeps naming the store.
 _degraded: str | None = None
 _quarantined_this_boot = False
+#: True once the reseed that followed a boot quarantine was written, read
+#: back from disk, and verified under the certified store key. Cleared by
+#: every quarantine. While a quarantine stands unrepaired the write gate stays
+#: closed: the quarantined rows are never trusted, and there is no verified
+#: store for an authenticated write to land in.
+_quarantine_repaired = False
 
 
 def store_degraded() -> str | None:
-    """Why grants are unavailable or reduced, or ``None`` when the store is healthy."""
+    """Why grants are unavailable or reduced, or ``None`` when the store is healthy.
+
+    Delegates to :func:`capture_grants_snapshot` so the verdict logic lives in
+    exactly one place (the ``grants_reduced`` axis) and cannot drift from the
+    atomic snapshot the slot-tags gate reads.
+    """
+    return capture_grants_snapshot().grants_reduced()
+
+
+def store_write_blocked() -> str | None:
+    """Why an authenticated write must refuse, or ``None`` when it may land.
+
+    Distinct from :func:`store_degraded`, which keeps naming a boot quarantine
+    for the whole process because the grants it REDUCED stay reduced. A write
+    asks a narrower question: does the CURRENT installed store verify? A
+    missing or unreadable snapshot fails closed, and so does a quarantine
+    whose reseed was never read back and verified. Once
+    :func:`seed_default_grants` has proven the replacement store on disk, the
+    quarantine is exactly what explicit dashboard-owner adoption repairs, and
+    refusing that adoption until a restart would leave the one recovery path
+    the quarantine points at closed.
+
+    Delegates to :func:`capture_grants_snapshot` so the ``write_blocked`` axis
+    is defined once.
+    """
+    return capture_grants_snapshot().write_blocked()
+
+
+class GrantsSnapshot:
+    """One immutable read of the grants cache: health plus the row map.
+
+    Taken under ``_cache_lock`` so the health verdict and the rows it is paired
+    with come from the SAME installed cache state — a concurrent refresh or
+    write cannot swap the cache between a health check and a row lookup
+    (the stale-health window a split read would open). Every method serves
+    only the captured values and touches neither the module globals nor the
+    filesystem, so an evaluation of a whole tag diff against one snapshot is
+    atomic with respect to cache installs. Create it with
+    :func:`capture_grants_snapshot`.
+
+    Two distinct health axes, because a reader must not conflate them:
+
+    * ``write_blocked`` — whether an authenticated WRITE may land (mirrors
+      :func:`store_write_blocked`); clears once a reseed verifies.
+    * ``grants_reduced`` — whether the installed rows are REDUCED from what the
+      operator established (mirrors :func:`store_degraded`), which stays true for
+      the life of a boot quarantine even after the reseed verifies. A caller
+      that must not treat a FORMERLY-reserved tag now missing from the rows as
+      an ordinary label reads THIS axis: after a quarantine a lost reservation
+      and a never-reserved label both read as rowless, so a tag-grants gate
+      fails a rowless tag closed while ``grants_reduced`` holds.
+    """
+
+    __slots__ = ("_write_blocked", "_grants_reduced", "_rows")
+
+    def __init__(
+        self,
+        write_blocked: str | None,
+        grants_reduced: str | None,
+        rows: dict[str, tuple[str, bool]],
+    ) -> None:
+        self._write_blocked = write_blocked
+        self._grants_reduced = grants_reduced
+        self._rows = rows
+
+    def write_blocked(self) -> str | None:
+        """Why an authenticated write must refuse against this snapshot, or ``None``."""
+        return self._write_blocked
+
+    def grants_reduced(self) -> str | None:
+        """Why the installed rows are reduced from the operator's set, or ``None``.
+
+        Stays set for the life of a boot quarantine even after the reseed
+        verifies and :meth:`write_blocked` clears, because the custom identities
+        the quarantine discarded are gone until the owner re-adopts them.
+        """
+        return self._grants_reduced
+
+    def grant_record(self, tag_id: str) -> tuple[str, bool, bool]:
+        """``(policy, status, row_exists)`` for ``tag_id`` from this snapshot."""
+        if not tag_id:
+            return ("none", False, False)
+        row = self._rows.get(tag_id)
+        if row is None:
+            return ("none", False, False)
+        return (row[0], row[1], True)
+
+    def grant(self, tag_id: str) -> tuple[str, bool]:
+        """``(policy, status)`` for ``tag_id`` from this snapshot."""
+        policy, status, _exists = self.grant_record(tag_id)
+        return (policy, status)
+
+    def has_row(self, tag_id: str) -> bool:
+        """Whether this snapshot carries a protected row for ``tag_id``."""
+        return self.grant_record(tag_id)[2]
+
+
+def capture_grants_snapshot() -> GrantsSnapshot:
+    """Atomically snapshot cache health (both axes) and the installed row map.
+
+    One critical section under ``_cache_lock``, mirroring both
+    :func:`store_write_blocked` (``write_blocked``) and :func:`store_degraded`
+    (``grants_reduced``), so a caller evaluating a tag diff reads health and
+    every grant row from a single consistent cache state. Call
+    :func:`refresh_cache` first (off the event loop) to install a fresh
+    snapshot; this accessor then only reads the installed one and never touches
+    the filesystem.
+    """
     with _cache_lock:
+        # write_blocked: can an authenticated write land? (clears on verified reseed)
+        if _degraded is not None:
+            write_blocked: str | None = _degraded
+        elif _quarantined_this_boot and not _quarantine_repaired:
+            write_blocked = "quarantined"
+        else:
+            write_blocked = None
+        # grants_reduced: are the rows reduced from the operator's set? A boot
+        # quarantine keeps this true for the whole process even after repair,
+        # because the discarded custom identities do not come back until the
+        # owner adopts them.
         if _quarantined_this_boot:
-            return "quarantined"
-        return _degraded
-
-
-def _set_degraded(reason: str | None) -> None:
-    global _degraded
-    with _cache_lock:
-        _degraded = reason
+            grants_reduced: str | None = "quarantined"
+        else:
+            grants_reduced = _degraded
+        rows = _cache[1] if _cache is not None else {}
+    return GrantsSnapshot(write_blocked, grants_reduced, rows)
 
 
 # Serializes snapshot installs (refresh vs authenticated write): see
@@ -215,9 +325,8 @@ def _key_cert(key: bytes) -> str:
     cannot mint this value. A token-key rotation therefore breaks the
     certificate and the boot pass quarantines the store: at that moment a
     legitimate store and a planted self-signed one are indistinguishable, so
-    the only safe answer is the fail-closed one. Grants are restored by
-    authenticated re-minting, the same recovery class as every other effect
-    of a token-key reset.
+    the only safe answer is the fail-closed one. Custom tag authority is
+    restored by explicit dashboard-owner adoption.
     """
     return hmac.new(token_secret._get_secret(), _KEY_CERT_DOMAIN + key, hashlib.sha256).hexdigest()
 
@@ -341,9 +450,13 @@ def _quarantine_store(path: Path, reason: str) -> None:
     if platform_compat.is_link_or_junction(path.parent):
         logger.error("agent-tag-policy store %s: %s; parent is a link, not renaming", path, reason)
         return
-    global _quarantined_this_boot
+    global _quarantined_this_boot, _quarantine_repaired
     with _cache_lock:
         _quarantined_this_boot = True
+        # A fresh quarantine reopens the question of whether a verified store
+        # exists: only ``seed_default_grants``' read-back of its reseed can
+        # answer it again.
+        _quarantine_repaired = False
     stamp = int(time.time())
     target = path.with_name(f"{path.name}.quarantined-{stamp}")
     # Never overwrite an earlier quarantine: the renamed bytes are the evidence
@@ -406,17 +519,19 @@ def _parse_rows(raw: Any, *, allow_oversized: bool = False) -> dict[str, tuple[s
 
 def _load_rows() -> dict[str, tuple[str, bool]]:
     """Read the store for the resolver: any failure yields ZERO grants."""
-    global _cache
+    global _cache, _degraded
     path = _store_path()
     sig = _stat_signature(path)
     if sig is None:
         # The store is GONE (deleted/renamed). The resolver is cache-only, so
         # leaving the old snapshot installed would keep authorizing revoked
         # grants until the next write — clear it so
-        # every resolve fails closed to ("none", False).
+        # every resolve fails closed to ("none", False). Clear the cache and
+        # set the health flag in ONE critical section so a reader cannot pair a
+        # healthy flag with the just-cleared cache.
         with _cache_lock:
             _cache = None
-        _set_degraded("missing")
+            _degraded = "missing"
         return {}
     with _cache_lock:
         if _cache is not None and _cache[0] == sig:
@@ -445,9 +560,36 @@ def _load_rows() -> dict[str, tuple[str, bool]]:
         # lock, so the orderings interleave safely: a writer that lands after
         # our re-stat blocks until our install completes and then installs
         # the fresh snapshot last.
-        if _stat_signature(path) == sig:
+        #
+        # The health flag is set in THIS SAME critical section as the row
+        # install, not a second one: a reader (``capture_grants_snapshot``)
+        # takes ``_cache`` and ``_degraded`` together under this lock, so a
+        # split install/flag would let it observe a healthy ``_degraded`` paired
+        # with our fail-closed empty rows — a reserved tag then reads as a
+        # healthy rowless label (a review finding). Only touch ``_degraded``
+        # when we actually install, so a newer concurrent write's health is not
+        # clobbered by this stale read.
+        #
+        # Three outcomes from the install-time re-stat, so a signature change
+        # between the opening stat and here cannot leave a stale HEALTHY cache
+        # authorizing writes against a store that has since vanished:
+        reinstall_sig = _stat_signature(path)
+        if reinstall_sig is None:
+            # The store vanished (deleted/renamed) mid-read. Clear the cache and
+            # mark it missing in this one section — do NOT keep the snapshot we
+            # just read, which may already be revoked. Fail closed.
+            _cache = None
+            _degraded = "missing"
+            return {}
+        if reinstall_sig == sig:
+            # Still the store we read: install our rows and the paired health.
             _cache = (sig, rows)
-    _set_degraded(None if healthy else "unreadable")
+            _degraded = None if healthy else "unreadable"
+        # Otherwise the signature DIFFERS but the store still exists: a
+        # concurrent authenticated write installed a NEWER snapshot (and set its
+        # own health) under this lock while we parsed. Leave it — clobbering it
+        # with this stale read would restore revoked authorization, the exact
+        # case the signature guard exists to prevent.
     return rows
 
 
@@ -464,6 +606,25 @@ def refresh_cache() -> None:
     _load_rows()
 
 
+def resolve_grant_record(tag_id: str) -> tuple[str, bool, bool]:
+    """Resolve ``(policy, status, row_exists)`` from one cached snapshot.
+
+    Policy and provenance are projected together so a writer installing a new
+    snapshot between separate lookups cannot combine values from two versions.
+    This function never touches the filesystem and fails closed when no row is
+    installed.
+    """
+    if not tag_id:
+        return ("none", False, False)
+    snapshot = _cache
+    if snapshot is None:
+        return ("none", False, False)
+    row = snapshot[1].get(tag_id)
+    if row is None:
+        return ("none", False, False)
+    return (row[0], row[1], True)
+
+
 def resolve_grant(tag_id: str) -> tuple[str, bool]:
     """Resolve ``(policy, status)`` for a tag id from the cached snapshot.
 
@@ -475,12 +636,8 @@ def resolve_grant(tag_id: str) -> tuple[str, bool]:
     (or write) installed, and staleness is bounded by the callers'
     refresh-before-resolve discipline. Fail-closed on a missing snapshot.
     """
-    if not tag_id:
-        return ("none", False)
-    snapshot = _cache
-    if snapshot is None:
-        return ("none", False)
-    return snapshot[1].get(tag_id, ("none", False))
+    policy, status, _row_exists = resolve_grant_record(tag_id)
+    return (policy, status)
 
 
 def has_grant_row(tag_id: str) -> bool:
@@ -488,19 +645,11 @@ def has_grant_row(tag_id: str) -> bool:
 
     Distinct from :func:`resolve_grant`, whose ``("none", False)`` default is
     deliberately indistinguishable from a minted none-row: policy resolution
-    must fail closed either way. Existence matters separately at the PATCH
-    seam — a tag WITH a protected row can inherit its recorded status bit,
-    while a tag WITHOUT one has no protected record to inherit from and the
-    caller must state the bit explicitly. Same snapshot discipline as the
-    resolver: cache-only, never touches the filesystem, fail-closed (no
-    snapshot reads as no row).
+    must fail closed either way. Existence identifies dashboard-minted tags at
+    the PATCH seam. Same snapshot discipline as the resolver: cache-only,
+    never touches the filesystem, fail-closed (no snapshot reads as no row).
     """
-    if not tag_id:
-        return False
-    snapshot = _cache
-    if snapshot is None:
-        return False
-    return tag_id in snapshot[1]
+    return resolve_grant_record(tag_id)[2]
 
 
 def _read_for_write(path: Path) -> dict[str, Any]:
@@ -548,9 +697,9 @@ def mint_grant(tag_id: str, *, policy: str, status: bool) -> None:
     """Record (or update) a grant row. Caller is an authenticated dashboard write.
 
     ``policy`` may be ``"none"``: such a row grants no write authority but
-    preserves the tag's recorded STATUS bit, which the applier's workflow
-    semantics key on. Use :func:`revoke_grant` only for tag deletion or
-    status removal, so a human-only workflow state never loses its identity.
+    records dashboard provenance and the protected STATUS bit. Use
+    :func:`revoke_grant` only for tag deletion; ordinary PATCH transitions keep
+    the identity row.
     """
     if policy not in _ROW_POLICIES:
         raise ValueError(f"not a recordable policy: {policy!r}")
@@ -587,14 +736,11 @@ def seed_default_grants(default_status_tag_ids: list[str]) -> bool:
 
     Runs at boot when the store file does not exist. Rows are minted solely
     for the ids passed in — the caller supplies the DEFAULT workflow-state tag
-    ids from the code-level seed vocabulary, never anything read from
-    ``tags.json``. An earlier revision derived rows from the live vocabulary's
-    legacy fields; that would amount to promoting
-    agent-controlled data into authorization (edit the file before the
-    upgrade, get a protected grant after it), so file-derived seeding is gone:
-    a pre-existing custom grant now requires one authenticated dashboard PATCH
-    to re-mint, which is the migration cost of not laundering the file's
-    contents into the trust store. Returns True when a store was written;
+    ids from the code-level seed vocabulary. ``tags.json`` is never an identity
+    source because promoting its rows would turn agent-controlled data into
+    authorization. A pre-existing custom tag therefore requires explicit
+    dashboard-owner adoption, which is the migration cost of not laundering the
+    file's contents into the trust store. Returns True when a store was written;
     never overwrites a store that verifies.
 
     This is also the store's RECOVERY AUTHORITY, run before any resolver
@@ -608,10 +754,15 @@ def seed_default_grants(default_status_tag_ids: list[str]) -> bool:
       trusted constants are reseeded. This covers a token-key rotation too:
       at that moment a legitimate store and a planted self-signed one are
       indistinguishable, so the fail-closed answer is the only safe one, and
-      grants are restored by authenticated re-minting.
+      custom tag identity is restored only by explicit dashboard-owner adoption.
     - A store whose rows fail verification under the certified key is
       quarantined and reseeded from trusted constants: forged rows stop
       resolving on the very boot that finds them, not when a human notices.
+    - The reseed is READ BACK and verified before authenticated writes may
+      land on it (:func:`_mark_reseed_verified`). The quarantine keeps
+      REDUCING grants for the process (:func:`store_degraded`), but the
+      dashboard-owner adoption that restores a custom tag's identity works on
+      this same boot rather than after a restart (:func:`store_write_blocked`).
     """
     _store_dir()  # link guard BEFORE any path read or rename
     path = _store_path()
@@ -620,7 +771,7 @@ def seed_default_grants(default_status_tag_ids: list[str]) -> bool:
     except GrantStoreTransientReadError:
         # Fail closed WITHOUT mutation: the key could not be read, which is
         # not evidence about its contents. Quarantining here would turn a
-        # transient I/O error into the permanent loss of every custom grant.
+        # transient I/O error into the permanent loss of every custom identity.
         logger.warning("agent-tag-policy store key unreadable at boot; leaving store untouched")
         return False
     if key is not None and not certified:
@@ -632,9 +783,8 @@ def seed_default_grants(default_status_tag_ids: list[str]) -> bool:
         # either certifies both, and a forged authorization blessed once
         # persists forever. The loss fails CLOSED (every tag resolves to
         # ``("none", False)``), default status ids re-seed below on this
-        # same boot, and a custom grant is restored by one authenticated
-        # dashboard PATCH — the same recovery class as every other effect of
-        # a token-key reset, which already invalidates all sessions.
+        # same boot. A custom tag whose identity was quarantined requires
+        # explicit dashboard-owner adoption; PATCH cannot recreate provenance.
         _quarantine_store(_store_key_path(), "store key not certified at boot")
         _quarantine_store(path, "store present with an uncertified key")
         key = None
@@ -677,7 +827,53 @@ def seed_default_grants(default_status_tag_ids: list[str]) -> bool:
         # dashboard write mints a row — closed, never open.
         logger.warning("agent-tag-policy seed failed; store not written", exc_info=True)
         return False
+    _mark_reseed_verified(path)
     return True
+
+
+def _mark_reseed_verified(path: Path) -> None:
+    """Reopen the write gate only for a reseed that verifies FROM DISK.
+
+    ``_write_document`` installs the snapshot from the document in memory; a
+    quarantine is repaired by what actually reached the file. The document is
+    read back through the same bounded reader, provenance chain and parser
+    the resolver trusts, and the installed snapshot must carry that file's
+    signature. A reseed that does not verify is uninstalled so the resolver
+    serves zero grants for it, and the quarantine stays unrepaired -- an
+    authenticated write then refuses instead of landing on bytes nobody has
+    checked.
+
+    Expected read-back failures are caught by type: ``OSError`` from the file
+    reads (including :class:`GrantStoreTransientReadError`), ``ValueError``
+    from the bounded reader and the JSON/UTF-8 decode, ``TypeError`` from
+    ``hmac.compare_digest`` on a non-ASCII MAC, and
+    :class:`GrantStoreUnreadable` from the checks here. Anything else is a
+    bug and propagates to the boot caller, but the ``finally`` still
+    uninstalls the snapshot first, so an unexpected error fails closed too.
+    """
+    global _cache, _degraded, _quarantine_repaired
+    verified = False
+    try:
+        raw = _read_bounded_json(path, _MAX_STORE_BYTES)
+        if not isinstance(raw, dict):
+            raise GrantStoreUnreadable("store document is not an object")
+        if not _provenance_valid(raw):
+            raise GrantStoreUnreadable("provenance MAC missing or invalid")
+        _parse_rows(raw)
+        sig = _stat_signature(path)
+        with _cache_lock:
+            if sig is None or _cache is None or _cache[0] != sig:
+                raise GrantStoreUnreadable("installed snapshot is not the written store")
+            _degraded = None
+            _quarantine_repaired = True
+        verified = True
+    except (OSError, ValueError, TypeError, GrantStoreUnreadable):
+        logger.error("agent-tag-policy reseed does not verify; store not trusted", exc_info=True)
+    finally:
+        if not verified:
+            with _cache_lock:
+                _cache = None
+                _degraded = "unreadable"
 
 
 def seed_status_identity_rows(default_status_tag_ids: list[str]) -> bool:

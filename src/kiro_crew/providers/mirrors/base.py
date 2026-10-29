@@ -107,7 +107,7 @@ class SessionProjection:
     for them. Kept beside the params rather than inside them because the params
     dict is sent to the adapter verbatim, and a Crew-private key on it is one
     strict-schema release away from failing the whole request. Empty for a backend
-    that honours the spec's per-tool restrictions itself or through a file Crew
+    that honours the spec's per-tool restrictions itself or through config Crew
     writes; the codex mirror is the one that fills it.
     """
 
@@ -140,6 +140,27 @@ class SessionProjection:
     that keeps a narrowed server MOUNTED because its transport honours the restriction
     another way -- claude re-expresses it as ``permissions.deny`` rules.
     """
+    unhonoured_servers: frozenset[str] = frozenset()
+    """Narrowed servers withheld because THIS session cannot honour their restriction.
+
+    On a backend that does carry a per-tool deny, a narrowed server normally stays
+    mounted. This names the ones that still were not: the per-tool rule for one of
+    their switched-off tools could not be put in force on this session. Nothing may
+    re-add one of these names, whatever the backend's ``PerToolDeny`` says, because
+    the second channel that would make re-adding safe is exactly what failed here.
+    Empty on a mirror that has no such case.
+    """
+    harness_deny_rules: tuple[str, ...] = ()
+    """Tool ids the HARNESS must be told to deny, in its own spelling.
+
+    A client obligation for a backend whose per-tool deny is a rule in harness
+    config Crew writes at spawn rather than a file of its own (opencode's
+    ``OPENCODE_CONFIG_CONTENT``). Carried beside the params, not inside them, for
+    the reason ``denied_tools`` is. Empty everywhere else.
+    """
+    agent_spec: dict[str, Any] | None = None
+    """The exact parsed spec this projection consumed; absent when withheld."""
+
     derived_spec_snapshot: Any = None
     """The ``agent.DerivedSpecSnapshot`` the ``mcpServers`` array was built from.
 
@@ -148,6 +169,14 @@ class SessionProjection:
     snapshot once the host has taken it (the ``session/new`` / ``session/load``
     response) and ends the session on a change. ``None`` for an agent that mirrors
     nothing, and for a mirror that built no array.
+    """
+    zero_tools: bool = False
+    """Whether the spec declares ``"tools": []`` -- a third client obligation the
+    wire must not carry, alongside ``denied_tools``. The MCP array and the
+    allowlist already answer "which servers mount"; this answers a broader
+    question the array has no opinion on: whether the agent's own native tools
+    (the harness's built-in Bash/Read/Write, not an MCP server) should be
+    callable at all. See ``AcpClient._spec_zero_tools`` for the refusal.
     """
 
 

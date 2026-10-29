@@ -249,7 +249,7 @@ def _snapshot_recording(
             # that — one ``openat`` per component, each ``O_NOFOLLOW`` — and
             # ``canonical`` is already resolved once by the shared file gate,
             # which is the resolution ``pin_parent`` requires its caller to have
-            # done. Same shape as the app-art reader in ``apps/routes.py``.
+            # done. Same shape as the app-art reader in ``apps/routes_art.py``.
             try:
                 dir_fd = pin_parent(os.path.dirname(canonical), what="import recording parent")
             except PinnedPathRefusal as exc:
@@ -278,7 +278,7 @@ def _snapshot_recording(
             # ancestor junction planted after any check, reaching a UNC target
             # and firing outbound SMB authentication as a side effect of the
             # open itself (GPT review r31, adjudicator-upheld). No after-open
-            # check can undo that. ``snapshot.py``'s notification copy records
+            # check can undo that. ``snapshot_merge_driver.py``'s notification copy records
             # the repo ruling for this exact shape: on a platform without the
             # race-free primitive, decline the hand-rolled ctypes walk and
             # refuse loudly. The route already answers 501 before any
@@ -488,7 +488,7 @@ async def handle_import_audio(request: web.Request) -> web.Response:
         # swap an ancestor for a junction between any sweep and the open, and on
         # Windows a junction to a UNC path makes ``os.open`` itself fire outbound
         # SMB authentication before any descriptor check can reject it (GPT
-        # review r31). ``snapshot.py``'s notification copy records the repo-wide
+        # review r31). ``snapshot_merge_driver.py``'s notification copy records the repo-wide
         # ruling for exactly this shape: decline the hand-rolled ctypes walk and
         # refuse loudly rather than narrow the window. 501, because the request
         # is well-formed and the capability is what this platform lacks.
@@ -685,9 +685,10 @@ async def handle_import_audio(request: web.Request) -> web.Response:
             # blocking filesystem call and must stay off the event loop.
             rm = asyncio.ensure_future(_remove_snapshot_dir(copy_task, snapshot_dir, snap_fd))
             await asyncio.shield(rm)
-        # None covers three different endings — provider failure, a disabled provider,
-        # and a transcript the hallucination filter emptied — and the client's move is
-        # the same for all of them, so they share one code.
+        # A falsy transcript intentionally maps to one route-level 502: provider or disabled
+        # provider failures return None; successful whole-file silence and a whole-file
+        # transcript emptied by the hallucination filter return ""; and the segmented
+        # over-cap helper returns None when any segment fails or is silent.
         if not transcript:
             audit("meetings.import_audio", f"{meeting_id} path:{canonical}", outcome="failed")
             raise BadRequest(

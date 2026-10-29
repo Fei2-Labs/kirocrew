@@ -12,6 +12,7 @@ import {
   HeightCache,
   HEIGHT_SCHEMA_VERSION,
   SCHEMA_VERSION_KEY,
+  TOUCHED_AT_KEY,
 } from '../hooks/virtualizer/HeightCache'
 
 /** A persisted blob carrying the CURRENT schema version, as `flush()` writes
@@ -525,9 +526,10 @@ describe('HeightCache: size-aware eviction cap', () => {
     // reclaimed blob out rather than treating it as a no-op.
     c.flush()
     const persisted = JSON.parse(window.localStorage.getItem(`vc_heights_${sid}`)!)
-    // 20000 heights plus the schema stamp.
+    // 20000 heights plus the schema stamp and the lastTouched stamp.
     expect(persisted[SCHEMA_VERSION_KEY]).toBe(HEIGHT_SCHEMA_VERSION)
-    expect(Object.keys(persisted).length).toBe(20001)
+    expect(typeof persisted[TOUCHED_AT_KEY]).toBe('string')
+    expect(Object.keys(persisted).length).toBe(20002)
     expect(persisted.k49).toBeUndefined()
     expect(persisted.k50).toBe(100)
   })

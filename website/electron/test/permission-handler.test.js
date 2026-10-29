@@ -52,6 +52,18 @@ describe("isAppOrigin — two sources", () => {
     assert.equal(isAppOrigin(null, "http://evil.example"), false);
   });
 
+  it("recognises ONLY the configured name, not any loopback spelling", () => {
+    // The dashboard document is always `http://localhost:<port>`, so the check
+    // stays an exact hostname match. Recognising other loopback spellings would
+    // widen an authorization surface for a document this app never opens: a
+    // scripted page served on a literal address by anything else on the machine
+    // would be treated as the app itself.
+    assert.equal(isAppOrigin(wcAt("http://localhost:5476/chat/x?token=abc"), undefined), true);
+    assert.equal(isAppOrigin(undefined, "http://localhost:5476/"), true);
+    assert.equal(isAppOrigin(wcAt("http://127.0.0.1:5476/chat"), undefined), false);
+    assert.equal(isAppOrigin(null, "http://[::1]:5476/"), false);
+  });
+
   it("compares hostname, never a substring (no localhost.evil bypass)", () => {
     assert.equal(isAppOrigin(null, "http://localhost.evil.example/"), false);
     assert.equal(isAppOrigin(wcAt("http://notlocalhost/"), undefined), false);
@@ -559,6 +571,69 @@ describe("notifications — the silent desktop-notification gap", () => {
       const deps = { ...quiet, isUntrusted };
       const fromRequest = grant(createPermissionRequestHandler(deps), APP, "notifications", MAIN);
       const fromCheck = createPermissionCheckHandler(deps)(APP, "notifications", ORIGIN, MAIN);
+      assert.equal(fromRequest, fromCheck);
+    }
+  });
+});
+
+describe("clipboard write — the dead Copy-link menu item", () => {
+  const WRITE = "clipboard-sanitized-write";
+
+  it("GRANTS clipboard write to the dashboard", () => {
+    const req = createPermissionRequestHandler(quiet);
+    assert.equal(grant(req, APP, WRITE, {}), true);
+    const check = createPermissionCheckHandler(quiet);
+    assert.equal(check(APP, WRITE, ORIGIN, {}), true);
+  });
+
+  it("still DENIES clipboard READ to the dashboard", () => {
+    const req = createPermissionRequestHandler(quiet);
+    assert.equal(grant(req, APP, "clipboard-read", {}), false);
+    const check = createPermissionCheckHandler(quiet);
+    assert.equal(check(APP, "clipboard-read", ORIGIN, {}), false);
+  });
+
+  it("DENIES clipboard write to the untrusted embedded browser view", () => {
+    const untrusted = { isUntrusted: (wc) => wc === APP, onDeny: () => {} };
+    const req = createPermissionRequestHandler(untrusted);
+    assert.equal(grant(req, APP, WRITE, {}), false);
+    const check = createPermissionCheckHandler(untrusted);
+    assert.equal(check(APP, WRITE, ORIGIN, {}), false);
+  });
+
+  it("DENIES clipboard write to a foreign origin", () => {
+    const foreign = wcAt("https://evil.example/");
+    assert.equal(grant(createPermissionRequestHandler(quiet), foreign, WRITE, {}), false);
+    assert.equal(
+      createPermissionCheckHandler(quiet)(foreign, WRITE, "https://evil.example", {}),
+      false,
+    );
+  });
+
+  it("answers clipboard write WITHOUT entering the macOS mic path", () => {
+    const boom = () => { throw new Error("TCC leg must not run for clipboard write"); };
+    const req = createPermissionRequestHandler({
+      ...quiet,
+      getMicAccessStatus: boom,
+      askForMicAccess: boom,
+      onMicBlocked: boom,
+    });
+    assert.equal(grant(req, APP, WRITE, {}), true);
+  });
+
+  it("stays FRAME-AGNOSTIC so the instance pane can copy", () => {
+    const sub = { isMainFrame: false };
+    const req = createPermissionRequestHandler(quiet);
+    assert.equal(grant(req, APP, WRITE, sub), true);
+    const check = createPermissionCheckHandler(quiet);
+    assert.equal(check(APP, WRITE, ORIGIN, sub), true);
+  });
+
+  it("request and check handlers AGREE on clipboard write", () => {
+    for (const isUntrusted of [() => false, () => true]) {
+      const deps = { ...quiet, isUntrusted };
+      const fromRequest = grant(createPermissionRequestHandler(deps), APP, WRITE, {});
+      const fromCheck = createPermissionCheckHandler(deps)(APP, WRITE, ORIGIN, {});
       assert.equal(fromRequest, fromCheck);
     }
   });

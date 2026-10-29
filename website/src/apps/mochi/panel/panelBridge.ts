@@ -24,6 +24,7 @@ import {
 import { approvalRoute } from './approvalActions'
 import { noteStaleOwnerResponse } from '../../../api/staleOwnerSignal'
 import { purposeFromToolArgs } from '../../../utils/toolPurpose'
+import { readSendReceipt } from '../../../utils/sendDelivery'
 import type { NotificationPayload, PetMood, PetState } from '../src/shared/types'
 import type { PackManifest, PackMeta } from '../src/shared/appearanceTypes'
 
@@ -150,6 +151,7 @@ export function reportStat(kind: 'message_sent' | 'message_received' | 'screensh
 export type PetEvent =
   | 'user_input' | 'task_start' | 'tool_call' | 'task_complete'
   | 'approval_required' | 'approval_granted' | 'approval_rejected' | 'error'
+  | 'delivery_uncertain'
 
 /**
  * Drive the backend pet state machine from the chat lifecycle.
@@ -382,6 +384,27 @@ function purposeFromToolInput(toolInput: string): string | undefined {
   }
 }
 
+/**
+ * The owner-bound target of one pending approval: the fields that name the exact
+ * request a card showed, so a decide cannot land on a later request that took the
+ * same id. A coordinator (state-level) request is named by its slot and instance;
+ * a native (slot-future) request by its permission row's `mid`.
+ */
+export type ApprovalTarget =
+  | { origin: 'coordinator'; slot: string; instance: string }
+  | { origin: 'native'; requestMid: string }
+
+/** The coordinator target carried by a pending `approval` record, or undefined. */
+export function coordinatorApprovalTarget(
+  rec: Record<string, unknown>,
+): ApprovalTarget | undefined {
+  const { slot, instance } = rec
+  if (typeof slot !== 'string' || !slot || typeof instance !== 'string' || !instance) {
+    return undefined
+  }
+  return { origin: 'coordinator', slot, instance }
+}
+
 export function permissionApprovalFromFrame(
   data: Record<string, unknown>,
 ): {
@@ -392,6 +415,7 @@ export function permissionApprovalFromFrame(
   baseCommand?: string
   trustGrantable?: boolean
   purpose?: string
+  target?: ApprovalTarget
 } | null {
   let meta: unknown
   try {
@@ -414,6 +438,7 @@ export function permissionApprovalFromFrame(
     baseCommand?: string
     trustGrantable?: boolean
     purpose?: string
+    target?: ApprovalTarget
   } = { id, tool }
   if (typeof m.tool_input === 'string' && m.tool_input) {
     req.toolInput = m.tool_input
@@ -425,6 +450,11 @@ export function permissionApprovalFromFrame(
   // Proof is server-authored on the pending card. Scope strings are display
   // values and their absence must never make the pet fall back to broad Trust.
   if (m.trust_grantable === '1') req.trustGrantable = true
+  // The row's delivery identity binds a decide to this exact request.
+  const rowMeta = data.meta
+  const mid =
+    rowMeta && typeof rowMeta === 'object' ? (rowMeta as Record<string, unknown>).mid : undefined
+  if (typeof mid === 'string' && mid) req.target = { origin: 'native', requestMid: mid }
   return req
 }
 
@@ -595,7 +625,9 @@ function connect(): void {
     if (msg.type === 'approval') {
       if (data.slot === MOCHI_SLOT) {
         reportPetEvent('approval_required')
-        for (const cb of approvalListeners) cb(data)
+        const target = coordinatorApprovalTarget(data)
+        const req = target ? { ...data, target } : data
+        for (const cb of approvalListeners) cb(req)
       }
       return
     }
@@ -654,6 +686,19 @@ function connect(): void {
         if (!isRenderableChatRole(data.role)) break
         for (const cb of messageListeners) cb(normaliseChatMessage(data))
         break
+      case 'chat_message_update': {
+        // New content for a row the panel already committed, named by its
+        // `mid`: the gateway holds the last run of text before a tool call or
+        // an approval prompt off that row until the text after it shows the run
+        // is not half of a credential, then gives it back as this patch. A
+        // frame keyed by `tool_call_id` patches a tool row, which the panel
+        // does not render.
+        const mid = data.mid
+        if (typeof mid === 'string' && mid && typeof data.content === 'string') {
+          for (const cb of messageListeners) cb({ _patch: mid, content: data.content })
+        }
+        break
+      }
       case 'chat_done':
         reportPetEvent('task_complete')
         for (const cb of doneListeners) cb()
@@ -750,37 +795,182 @@ export async function retryConnect(): Promise<{ ok: boolean; message?: string }>
  * — it waits for the frame. KiroCrew core does NOT echo a normal send over the
  * socket, so without this the panel showed only the replies.
  */
-function echoOwnMessage(text: string, screenshot?: string): void {
+function echoOwnMessage(text: string, screenshot?: string): string {
+  const id = `msg-${Date.now()}-${msgSeq++}`
   const msg: Record<string, unknown> = {
-    id: `msg-${Date.now()}-${msgSeq++}`,
+    id,
     role: 'user',
     content: text,
     timestamp: Date.now(),
+    // The echo is OPTIMISTIC — rendered before the gateway's receipt is known.
+    // It must NOT count `message_sent` here (a definite refusal retracts this
+    // row, but the durable backend counter has no decrement path, so a refused
+    // send would permanently inflate the stat). `sendMessage` counts the send
+    // itself, once the receipt classifies as non-refused.
+    _optimistic: true,
   }
   if (screenshot !== undefined) msg.screenshot = screenshot
   for (const cb of messageListeners) cb(msg)
+  return id
+}
+
+/**
+ * Retract an optimistic echo by the id `echoOwnMessage` returned, removing the
+ * bubble it added. Used on the ONE outcome that is a DEFINITE refusal (the
+ * gateway, or an intermediary standing in for it, said no — nothing was sent),
+ * so the only false bubble that can occur is undone at its source rather than
+ * waiting for the next-mount backfill to erase it with the text already gone.
+ * A `_retract` marker frame carries no renderable role, so an ordinary message
+ * consumer that does not understand it simply ignores it.
+ */
+function retractOwnMessage(id: string): void {
+  for (const cb of messageListeners) cb({ _retract: id })
+}
+
+/**
+ * A send the gateway REFUSED — a non-2xx answer whose JSON body explains why in
+ * its `error` string (`{"error": "slot agent mismatch"}` for a 409, see
+ * `chat_handlers.py`). Carries the `status` and the parsed `reason` so the panel
+ * can show the gateway's own words instead of the connection copy, exactly as
+ * `chat-core/transport/sendTurn.ts` reads `body.error` for the dashboard.
+ *
+ * Distinct from a rejected fetch (offline, DNS): that still throws the raw
+ * `TypeError` and reads as a connection problem, which is what it is.
+ */
+export class SendRefusedError extends Error {
+  readonly status: number
+  readonly reason?: string
+  constructor(status: number, reason?: string) {
+    super(reason ?? `send refused (${status})`)
+    this.name = 'SendRefusedError'
+    this.status = status
+    this.reason = reason
+  }
+}
+
+// A slot-binding refusal: the message IS the reason to show, but it is a
+// diagnostic throw string, so it stays a plain `new Error('…')` (the class the
+// i18n gate exempts) and is MARKED instead of subclassed — the literal sits
+// inside `new Error(...)` at each call site so the gate sees its exempt callee.
+// The panel reads the reason only off a tagged refusal or a `SendRefusedError`,
+// never off an arbitrary caught Error, so an unexpected internal throw cannot
+// leak its English message into every locale.
+const SLOT_REFUSAL = Symbol.for('mochi.slotRefusal')
+function slotRefusal(err: Error): Error {
+  ;(err as unknown as Record<symbol, true>)[SLOT_REFUSAL] = true
+  return err
+}
+export function slotRefusalReason(err: unknown): string | undefined {
+  if (err instanceof SendRefusedError) return err.reason
+  if (err instanceof Error && (err as unknown as Record<symbol, unknown>)[SLOT_REFUSAL]) {
+    return err.message
+  }
+  return undefined
+}
+
+// Whether `err` is a DEFINITE refusal — the gateway (or the slot bind) answered
+// "no", so nothing was sent. True for both a `SendRefusedError` (any non-2xx)
+// and a tagged `ensureSlot` refusal, INDEPENDENT of whether a human reason was
+// recoverable: a non-2xx with an unreadable body (an aiohttp 500 / proxy 502
+// HTML page) is still a definite refusal even though its `reason` is undefined.
+// Distinct from `slotRefusalReason`, which returns `undefined` for BOTH a
+// transport error AND a reason-less refusal and so cannot tell them apart — the
+// draft-restore guard needs exactly that distinction (restore on a definite
+// refusal, leave cleared on a transport-uncertain outcome).
+export function isDefiniteRefusal(err: unknown): boolean {
+  if (err instanceof SendRefusedError) return true
+  return err instanceof Error && (err as unknown as Record<symbol, unknown>)[SLOT_REFUSAL] === true
 }
 
 export async function sendMessage(text: string, screenshot?: string): Promise<void> {
-  echoOwnMessage(text, screenshot)
-  // Bind the slot to the mochi agent before the first turn (idempotent).
+  // Bind the slot to the mochi agent before the first turn (idempotent). A
+  // binding refusal is a DEFINITE refusal thrown before any echo, so a slot the
+  // pet never got leaves no optimistic bubble behind.
   await ensureSlot()
   // The pet must react to the SEND, not to the first token: `thinking` is
   // precisely the gap between the two. Reported after the bind so a turn that
   // never gets a slot does not leave the pet thinking about nothing.
   reportPetEvent('user_input')
+  // Echo the user's turn BEFORE the dispatch, exactly as on base. The bubble is
+  // the on-screen home of the typed text once the composer has cleared, so it
+  // must exist before we await anything: a 2xx whose HTTP response is lost (a
+  // proxy timeout while the WebSocket survives) still keeps its bubble, and a
+  // fast turn whose WS reply arrives before this fetch resolves cannot invert
+  // the transcript. The ONE outcome that must not keep it — a definite refusal
+  // (nothing was sent) — retracts it below by id.
+  const echoId = echoOwnMessage(text, screenshot)
   // `ws=1` tells the gateway to fan the turn out over the WebSocket instead of
   // holding an SSE response open (matching how the dashboard chat works).
-  await fetch('/api/chat?ws=1', {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      message: text,
-      slot: MOCHI_SLOT,
-      ...(screenshot ? { meta: { screenshot } } : {}),
-    }),
-  })
+  let resp: Response
+  try {
+    resp = await fetch('/api/chat?ws=1', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        slot: MOCHI_SLOT,
+        ...(screenshot ? { meta: { screenshot } } : {}),
+      }),
+    })
+  } catch (err) {
+    // A rejected fetch (offline, DNS) is a TRANSPORT failure, not a verdict: the
+    // request may well have reached the gateway, so we KEEP the optimistic echo
+    // (the WS reply, if the turn landed, appends under it) and surface the
+    // connection copy. The outcome is INDETERMINATE — the turn may still be
+    // running over a surviving socket — so we must NOT emit the terminal `error`
+    // event: `error` flushes deferred ambient pushes immediately, which would
+    // interleave them ahead of a reply that may yet arrive. Instead emit the
+    // non-terminal `delivery_uncertain`, which releases the `_chat_turn_active`
+    // latch (so the interleave gate does not wedge every push for the full
+    // 10-min turn window) WITHOUT flushing — the gateway's eventual terminal
+    // frame, or the time-based drain, delivers the backlog in order.
+    reportPetEvent('delivery_uncertain')
+    // Count the send on the uncertain path too. A rejected fetch commonly means
+    // the request DID reach the gateway and the turn ran (the response was lost
+    // in transit), so the echo-time suppression (`_optimistic`, added so a
+    // DEFINITE refusal never inflates the counter) would otherwise drop the
+    // count for a message that was in fact delivered. `messages.sent` /
+    // `longestChat` / `busiestDay` are a best-effort monotonic counter —
+    // `reportStat` already swallows its own network failures, so this path's
+    // imprecision (an over-count iff the turn truly never landed) is symmetric
+    // with the loss base already tolerates, and needs no per-send pending state
+    // or WS-confirmation ordering contract. Reported before the rethrow so the
+    // caller's recovery path is unchanged.
+    reportStat('message_sent')
+    throw err
+  }
+  // Classify the answer with the SHARED send-receipt contract rather than a raw
+  // `!resp.ok`: an expired SSO proxy answers a 2xx HTML login page in the
+  // endpoint's place, which `!resp.ok` would wave through as accepted (false
+  // bubble, lost draft). `readSendReceipt` folds that provenance case into
+  // `refused`, keeps a truncated-but-delivered 2xx as `unknown` (echo kept — the
+  // turn may have run), and reads the gateway's own `error` prose off the body.
+  const { body, outcome } = await readSendReceipt(resp)
+  if (outcome === 'refused') {
+    // A DEFINITE refusal — nothing was sent. Retract the optimistic echo (so no
+    // false bubble) and throw the gateway's reason as a typed refusal so the
+    // panel shows its words, not the "check your connection" copy. The
+    // `message_sent` stat was NOT counted at echo time (the echo is tagged
+    // `_optimistic`), so a refusal needs no stat correction — it simply never
+    // counts. A body that is not a readable JSON object (an intermediary's HTML
+    // page) leaves the reason undefined, so the panel falls back to the unframed
+    // refusal string.
+    retractOwnMessage(echoId)
+    // No turn is running after a definite refusal, so clear the pet's
+    // `_chat_turn_active` latch (set by `user_input` above) — otherwise it
+    // buffers every non-critical push for the full 10-min turn window.
+    reportPetEvent('error')
+    const reason = typeof body.error === 'string' && body.error ? body.error : undefined
+    throw new SendRefusedError(resp.status, reason)
+  }
+  // `accepted` or `unknown`: the turn is the gateway's problem now, or may well
+  // have been delivered, so the echo stays — no retraction, no re-echo. Count
+  // the send HERE, only once the receipt is classified non-refused, so a
+  // refused send never inflates the durable `message_sent` counter (which has
+  // no decrement path). An `unknown` 2xx counts: the turn may have run, and the
+  // panel keeps its bubble, so the stat must match the on-screen row.
+  reportStat('message_sent')
 }
 
 // Whether the slot is currently known to be bound to the mochi agent. NOT a
@@ -817,12 +1007,14 @@ export async function ensureSlot(): Promise<void> {
   try {
     bound = await resp.json()
   } catch {
-    throw new Error('mochi slot: could not verify the agent binding')
+    throw slotRefusal(new Error('mochi slot: could not verify the agent binding'))
   }
   if (bound.agent !== MOCHI_AGENT) {
-    throw new Error(
-      `mochi slot "${MOCHI_SLOT}" is bound to another agent ` +
-        `(${String(bound.agent) || 'none'}); refusing to send`,
+    throw slotRefusal(
+      new Error(
+        `mochi slot "${MOCHI_SLOT}" is bound to another agent ` +
+          `(${String(bound.agent) || 'none'}); refusing to send`,
+      ),
     )
   }
   // Second gate: the slot asks for `mochi` but something else answers it — the
@@ -838,9 +1030,11 @@ export async function ensureSlot(): Promise<void> {
   // refuse every send on a healthy install.
   const effective = bound.effective_agent
   if (typeof effective === 'string' && effective !== '' && effective !== MOCHI_AGENT) {
-    throw new Error(
-      `mochi slot "${MOCHI_SLOT}" resolves to a different agent ` +
-        `(${effective}); refusing to send`,
+    throw slotRefusal(
+      new Error(
+        `mochi slot "${MOCHI_SLOT}" resolves to a different agent ` +
+          `(${effective}); refusing to send`,
+      ),
     )
   }
   slotEnsured = true
@@ -1294,12 +1488,20 @@ export async function getPendingApprovals(): Promise<Record<string, unknown>[]> 
  * carry no pattern. `trustGrantable` is the gateway proof carried by this exact
  * pending card; every durable trust route fails locally without it, while the
  * server independently verifies the card again before changing policy.
+ *
+ * `target` is the owner-bound target of the card's own request. With it an
+ * approve or reject names that exact request: the coordinator route gets the
+ * slot and instance, a native request goes to the slot route with its
+ * `request_mid`, and a request that has since been replaced under the same id
+ * answers 404 instead of being decided. The durable trust actions keep the slot
+ * route's id form, which is the only form that route accepts for them.
  */
 export async function respondApproval(
   id: string,
   action: string,
   pattern?: string,
   trustGrantable = false,
+  target?: ApprovalTarget,
 ): Promise<{ ok: boolean; error?: string; staleOwnerSession?: boolean }> {
   const route = approvalRoute(action)
   if (
@@ -1314,14 +1516,39 @@ export async function respondApproval(
   }
   try {
     const res =
-      route.kind === 'approval'
-        ? await fetch(`/api/approvals/${encodeURIComponent(id)}/${route.action}`, {
+      route.kind === 'approval' && target?.origin === 'native'
+        ? await fetch(`/api/chat/slots/${MOCHI_SLOT}/approve`, {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
-            body: '{}',
+            body: JSON.stringify({
+              action: route.action === 'approve' ? 'approved' : 'rejected',
+              request_id: id,
+              origin: 'native',
+              request_mid: target.requestMid,
+            }),
           })
-        : await fetch(`/api/chat/slots/${MOCHI_SLOT}/approve`, {
+        : route.kind === 'approval'
+        ? await fetch(
+            `/api/approvals/${encodeURIComponent(id)}/${route.action}` +
+              (target?.origin === 'coordinator'
+                ? '?' +
+                  new URLSearchParams({
+                    origin: 'coordinator',
+                    slot: target.slot,
+                    instance: target.instance,
+                  }).toString()
+                : ''),
+            {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: '{}',
+            },
+          )
+        : // approval-target: trust-only. The slot route accepts a durable trust
+          // action only by request id, and re-verifies the card before granting.
+          await fetch(`/api/chat/slots/${MOCHI_SLOT}/approve`, {
             method: 'POST',
             credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' },
@@ -1420,12 +1647,14 @@ export async function getSlotModel(): Promise<string> {
 /**
  * Result of a slot-model switch. `ok: false` alone is a generic failure;
  * `code` carries the gateway's machine-readable refusal when the body names
- * one (`turn_in_flight`: a turn is running mid-switch, retry after it ends).
+ * one. A pick made while a response runs is `ok: true`: the gateway commits
+ * it and applies it from the next message (`deferred: true` in its body), so
+ * the pet's running reply finishes on the model it started with.
  *
- * This deliberately widens the original preload's bare-boolean signature: the
- * gateway refuses a mid-turn switch with a 409 whose only useful content is
- * the structured code, and a bare `false` collapsed that into "failed for no
- * stated reason". Truthiness call sites keep working (`{ ok: true }` vs
+ * This deliberately widens the original preload's bare-boolean signature: a
+ * gateway refusal (`turn_in_flight` from the route's last-instant busy
+ * re-check, for one) is a 409 whose only useful content is the structured
+ * code, and a bare `false` collapsed that into "failed for no stated reason". Truthiness call sites keep working (`{ ok: true }` vs
  * `{ ok: false }` is what the one caller reads).
  */
 export interface SetModelResult {
@@ -1528,6 +1757,7 @@ export interface CoreInstance {
     state?: 'disconnected' | 'connecting' | 'connected' | 'error'
     error?: string
     token_ttl_remaining?: number
+    token_ttl_total?: number
   }
 }
 

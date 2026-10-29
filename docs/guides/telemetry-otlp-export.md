@@ -121,11 +121,13 @@ setting is in full control:
 # Cumulative — the OpenTelemetry default. CloudWatch, Prometheus-style backends.
 OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=CUMULATIVE
 
-# Delta — what Datadog and most product-analytics ingests expect. Also the
-# default when the variable is unset, so setting it changes nothing.
+# Delta — what Datadog and most product-analytics ingests expect. Equivalent
+# to the unset default for every instrument Kiro Crew currently emits (the
+# unset default also maps up-down counters to delta; this value keeps them
+# cumulative, and Kiro Crew emits none).
 OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=DELTA
 
-# Delta for counters, cumulative for up-down counters.
+# Delta for counters and histograms, cumulative for up-down counters.
 OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=LOWMEMORY
 ```
 
@@ -146,8 +148,8 @@ Two things are unaffected by this setting, and knowing that saves debugging time
 
 ### If you already export these metrics
 
-Five instruments used to be exported as monotonic cumulative sums and are now
-gauges, under unchanged names:
+These five instruments are gauges that hold lifetime totals, under these
+names:
 
 - `kirocrew.process.cpu.seconds`
 - `kirocrew.process.gc.collections`
@@ -155,13 +157,10 @@ gauges, under unchanged names:
 - `kirocrew.process.gc.uncollectable`
 - `kirocrew.inventory.probe.failures`
 
-The reading did not change — each is still the total since the exporting process
-started — but the wire type did, so a backend that was applying a counter
-function (`rate()`, `increase()`, delta-from-cumulative) to them will need
-re-pointing: take the difference between consecutive samples instead. A backend
-that rejects a type change on an existing series may also need the old series
-dropped before the new shape lands, and during a staged rollout one backend can
-receive both shapes from different hosts.
+Each reading is the total since the exporting process started, carried as a
+gauge rather than a monotonic sum. Do not apply a counter function (`rate()`,
+`increase()`, delta-from-cumulative) to them: take the difference between
+consecutive samples instead.
 
 Handle a restart the way you would for any gauge you difference: **clamp negative
 increments to zero**. `service.instance.id` identifies the INSTALL, not the
@@ -290,11 +289,16 @@ collector at all rather than pointing the gateway straight at a vendor.
 
 ## What gets exported
 
-Two families of instruments, all under the `kirocrew.` namespace:
+The OTLP reader shares one meter provider with the local JSONL sink, so every
+`kirocrew.*` instrument the process records is exported — counters, histograms
+and gauges alike. The full roster lives under "Instrumented signals" in
+[`../system-specs/modules/metrics.md`](../system-specs/modules/metrics.md). The
+gauge families are these two:
 
 - **`kirocrew.process.*`** — this process's own resource behavior: Python and OS
   thread counts, open file descriptors, current and peak RSS, cumulative CPU
-  seconds, and per-generation GC counters.
+  seconds, and per-generation GC counters. This family also carries histograms
+  (sampled RSS and CPU utilization).
 - **`kirocrew.inventory.*`** — what this install has configured: active cron jobs,
   armed monitor loops, installed skills, whether memory has been migrated,
   knowledge-source and lesson counts, MCP server counts by class, and a
@@ -344,6 +348,16 @@ across those processes, so publishing them from each one would count a single ho
 once per process. If you see process metrics from a host but no inventory metrics,
 the gateway on that host is not running or not exporting — that is the signal, not
 a gap in collection.
+
+### Traces are not exported
+
+Kiro Crew emits the OpenTelemetry **metrics** signal only. There are no spans
+and no log records, so a trace-oriented backend (Langfuse, Jaeger, Tempo, or a
+vendor's trace view) receives nothing from it, and nothing in this page turns
+traces on. Pointing `otlp_endpoint` at a `/v1/traces` or `/v1/logs` URL does not
+change that: the collector rejects every metric batch. The gateway logs a
+warning naming the destination when the endpoint's path is one of those routes.
+Trace support is tracked in issue #1643.
 
 ### What is deliberately not exported
 
@@ -405,7 +419,8 @@ service:
 
 Then start the gateway with `otlp_endpoint` set to that collector, wait one export
 interval, and read what arrived. Expect the `kirocrew.process.*` and
-`kirocrew.inventory.*` families and the resource attributes described above.
+`kirocrew.inventory.*` gauges, any other `kirocrew.*` instruments the process has
+recorded since start, and the resource attributes described above.
 
 Some instruments are legitimately absent and their silence is not a failure: the
 Linux-only thread and file-descriptor gauges on macOS, and the knowledge, MCP, and
@@ -441,6 +456,7 @@ the collector, or temporality — not collection.
 | No `telemetry OTLP export active` line | `otlp_endpoint` empty, or the OTLP exporter package is not installed — check for the warning naming the missing package. |
 | `OTLP exporter init failed` warning | Malformed endpoint. The message deliberately omits the URL, since it can carry a credential. |
 | Local shards fill, nothing at the backend | Endpoint missing `/v1/metrics`, collector on 4317 (gRPC) instead of 4318 (HTTP), or the collector's `http` protocol not enabled. |
+| `points at an OTLP traces route` warning | The endpoint ends in `/v1/traces` (or `/v1/logs`). Kiro Crew exports metrics only, so a trace backend such as Langfuse receives nothing. See "Traces are not exported". |
 | Metrics arrive but counters look like resets | Temporality mismatch. See the temporality section. |
 | `unknown type: "awsemf"` at collector startup | Running the core `otelcol`; vendor exporters need `otelcol-contrib`. |
 | One expected series is absent | That probe could not read its source. Absence is a gap, never a zero. |

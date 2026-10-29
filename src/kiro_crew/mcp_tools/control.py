@@ -3,8 +3,12 @@
 ``schemas()`` returns the ADVERTISEMENT half of each tool -- its name, the
 model-facing description, and the JSON Schema a call is validated against.
 ``HANDLERS`` maps each of those names to the function that runs it. Both halves
-of a tool live here so its contract and its behavior are read together, and
-``test_mcp_tool_registry`` fails if one arrives without the other.
+of a tool are reached through this module, and ``test_mcp_tool_registry`` fails
+if one arrives without the other. The descriptors, the directive tools, the
+monitoring tools and the external-handoff tool live in the ``control_parts``
+owners (the map is at the foot of this module); the wait, task-runner,
+crew-routing, hook and question tools live
+here.
 
 Handlers reach this server's shared plumbing as attributes of ``mcp_core`` --
 ``mcp_core._post``, the identity resolvers, the governance vets. That is
@@ -16,45 +20,38 @@ every existing patch site.
 
 from __future__ import annotations
 
-import asyncio
+import importlib as _importlib
 import json
 import logging
 import os
+import sys as _sys
 import tempfile
-import time
 import uuid
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
-from kiro_crew import autonudge, mcp_core, platform_compat, session_directive
-from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
-from kiro_crew.mcp_tools._limits import (
-    _MONITOR_DEFAULT_MAX_CYCLES,
-    _MONITOR_DEFAULT_MAX_RUNTIME_SECS,
+from kiro_crew import _facade_mirror, mcp_core, platform_compat
+from kiro_crew.constants import WAIT_TOOL_MAX_SECS
+from kiro_crew.mcp_shared import DeferredTool
+from kiro_crew.mcp_tools.control_parts.directive import (
+    chat_tag,
+    nothing_to_do,
+    reset_conversation,
+    set_project,
+    suggest_followup,
 )
-from kiro_crew.monitoring.models import (
-    DEFAULT_MONITOR_AGENT_TURNS,
-    DEFAULT_MONITOR_CADENCE_SECS,
-    DEFAULT_MONITOR_PROVIDER_ERRORS,
-    DEFAULT_MONITOR_RUNTIME_SECS,
-    DEFAULT_MONITOR_TOKENS,
-    MAX_MONITOR_AGENT_TURNS,
-    MAX_MONITOR_CADENCE_SECS,
-    MAX_MONITOR_CHECK_NAMES,
-    MAX_MONITOR_PROVIDER_ERRORS,
-    MAX_MONITOR_RUNTIME_SECS,
-    MAX_MONITOR_TOKENS,
-    MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
-    MIN_MONITOR_CADENCE_SECS,
-    retained_outcome_blocks_rearm,
+from kiro_crew.mcp_tools.control_parts.handoff import (
+    session_handoff,
 )
-from kiro_crew.monitoring.registry import (
-    publicly_armable_kinds,
-    publicly_armable_objectives,
+from kiro_crew.mcp_tools.control_parts.monitor import (
+    autonudge_stop,
+    monitor_inspect,
+    monitor_start,
+    monitor_stop,
+    monitor_update,
+    monitor_watch,
 )
-from kiro_crew.monitoring.targets import normalize_pull_request_target
 from kiro_crew.security import (
     redact_and_truncate,
     redact_credentials,
@@ -63,938 +60,22 @@ from kiro_crew.security import (
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.validation import (
     ASK_QUESTION_SCHEMA,
-    AUTONUDGE_STOP_SCHEMA,
-    CHAT_TAG_SCHEMA,
-    MONITOR_INSPECT_SCHEMA,
-    MONITOR_START_SCHEMA,
-    MONITOR_STOP_SCHEMA,
-    MONITOR_UPDATE_SCHEMA,
-    MONITOR_WATCH_SCHEMA,
+    ASK_WAIT_SLICE_SECS,
     REGISTER_HOOK_SCHEMA,
-    RESET_CONVERSATION_SCHEMA,
     ROUTE_CREW_SCHEMA,
     SELECT_CREW_SCHEMA,
-    SESSION_HANDOFF_SCHEMA,
-    SET_PROJECT_SCHEMA,
-    SUGGEST_FOLLOWUP_SCHEMA,
     TASK_RUN_SCHEMA,
     WAIT_SCHEMA,
     ValidationError,
+    format_ask_answers,
     validate_ask_user_question,
     validate_tool_args,
 )
 
-logger = logging.getLogger(__name__)
-
-#: The sentences in the two monitoring descriptors that decide WHICH SIDE has to
-#: justify itself before a supported pull request is armed.
-#: ``monitoring.prefer_structured_arming`` picks one; nothing else in either
-#: description moves, and neither tool is refused.
-#:
-#: The two positions are NOT two different routes. Both send evidence the typed
-#: provider cannot observe -- comments, advisory review findings -- to the prompt
-#: loop. What moves is the burden: off, the structured path is admissible only
-#: once the caller has satisfied itself the objective is fully typed-decidable,
-#: which is a judgement that leans to the loop whenever the caller is unsure; on,
-#: a supported pull request is enough and the loop is the exception that needs its
-#: own reason. Describing this as a swap of two defaults would be false, and the
-#: help text does not.
-#:
-#: Both positions are spelled out in full rather than built from a shared stem.
-#: The off text has to make a positive claim of its own, because a test can tell
-#: "the flag was read and resolved off" from "the flag was never read" only when
-#: the two positions say different things -- an off position that merely OMITS
-#: the structured wording is indistinguishable from a read that never happened.
-_ARMING_STEER_STRUCTURED_ON_CONDITION = (
-    "Use monitor_watch for supported pull-request review readiness only when "
-    "the objective is fully determined by typed provider facts. Use the prompt "
-    "loop when comments or advisory review evidence must be interpreted. "
-)
-_ARMING_STEER_STRUCTURED_BY_DEFAULT = (
-    "On a supported pull request this installation arms monitor_watch by "
-    "default, and this prompt loop is the exception: take it when comments or "
-    "advisory review evidence must be interpreted, which the typed provider "
-    "cannot observe. "
-)
-#: Appended to ``monitor_watch``'s own description in the on position, so the
-#: preference is stated on the tool it points AT and not only on the one it
-#: points away from.
-_WATCH_STEER_STRUCTURED_DEFAULT = (
-    " This installation arms this path by default for a supported pull request."
-)
-
-
-def _prefers_structured_arming() -> bool:
-    """Whether this installation arms the structured monitor by default.
-
-    Read fresh on every descriptor build. That is what keeps a Settings change
-    from needing a gateway restart: ``mcp_tools.build_tool_list`` rebuilds the
-    descriptors per call and deliberately does not cache them. It does NOT
-    reach a session that is already open, because kiro-cli caches a session's
-    tool list for that session's life -- the same limitation
-    ``mcp_tools/browser.py`` records for ``dashboard.use_builtin_browser``.
-
-    Skipped entirely when an event loop is running, the same rule
-    ``mcp_tools/spawn.py::_agent_roster_hint`` applies for the same caller: a
-    running loop means this is NOT the stdio server but
-    ``mcp_discovery._managed_tools_in_process``, calling ``_list_tools()`` from
-    ``async def probe_server`` on the gateway's loop. That caller keeps only tool
-    NAMES -- it returns ``t.get("name")`` per entry and discards every
-    description -- so reading config there could not change anything it uses, and
-    the read is skipped rather than charged to the loop. The process that
-    actually serves ``tools/list`` to a model is ``mcp_shared.run_mcp_stdio_loop``,
-    a plain select/readline loop that never imports asyncio, so no loop is running
-    there and the preference IS read.
-
-    Fails to the OFF position on any error: off is the shipped behaviour, and a
-    config a gateway cannot parse must not silently re-point every arming
-    decision it is about to advise on. The catch stays broad because this runs
-    inside the tool-list build, where an escaping exception would withdraw EVERY
-    tool rather than one sentence -- so the failure is logged instead of
-    narrowed, which is what keeps a defect here discoverable rather than
-    concealed.
-    """
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        pass  # no loop: the stdio server, the one build whose text reaches a model
-    else:
-        return False
-    try:
-        return bool(KiroCrewConfig.load().monitoring.prefer_structured_arming)
-    except Exception:
-        logger.debug("monitoring.prefer_structured_arming unreadable; using off", exc_info=True)
-        return False
-
-
-def schemas() -> list[dict[str, Any]]:
-    """Descriptors for the control tools."""
-    prefer_structured = _prefers_structured_arming()
-    return [
-        {
-            "name": "task_run",
-            "description": (
-                "Start the autonomous task runner from a spec file or inline content. "
-                "Use when the user provides a task spec or says 'run this task', "
-                "'start a task', or 'run a task'. "
-                "For inline specs, prefix content with __inline__:"
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "spec": {
-                        "type": "string",
-                        "description": "Path to spec file, or inline content prefixed with __inline__:",
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Human-readable task name (auto-derived from spec if omitted)",
-                    },
-                },
-                "required": ["spec"],
-            },
-        },
-        {
-            "name": "wait",
-            "description": (
-                "Pause execution for a specified duration while preserving full session "
-                "context. Use when waiting for external systems (code review, CI "
-                "pipeline, deployment). Max 1800s (30 min)."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "seconds": {
-                        "type": "integer",
-                        "description": "Duration to wait in seconds (60-1800)",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Why we are waiting (shown to user)",
-                    },
-                },
-                "required": ["seconds", "reason"],
-            },
-        },
-        {
-            "name": "route_crew",
-            "description": (
-                "Rank the crews whose triggers match a task, best first, and return each "
-                "one's score, description and memory store. Use this when you want the "
-                "same task to reach the same crew every time; use select_crew when you "
-                "want the roster and intend to judge the fit yourself. Only when both "
-                "`matches` and `unavailable` are empty does no crew claim the task; "
-                "handle that case on the default crew. Report unavailable members and "
-                "their reasons without substituting Global memory. Acting on a match means "
-                "spawn_run(crew=<name>), which is what gives that run the crew's memory "
-                "and template and keeps another crew's memory out of it."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "task": {
-                        "type": "string",
-                        "description": "The task to route. Usually the user's own words.",
-                    },
-                },
-                "required": ["task"],
-            },
-        },
-        {
-            "name": "select_crew",
-            "description": (
-                "Orchestrator crew routing. Call with NO argument to get the roster of "
-                "selectable crews (name + triggers) so you can decide whether a specialist "
-                "crew fits the task better than handling it yourself. Call with `crew` set "
-                "to a roster name to bind it: returns the crew's resolved {workspace, "
-                "memory_store, kiro_agent, model}, which you then run via "
-                "spawn_run(crew=<name>) -- `crew=`, NOT `agent=`: `agent` names a "
-                "kiro-cli template, and passing a crew name there gives the run the "
-                "DEFAULT memory store, silently, which is how one crew's work ends up "
-                "in another's memory. Selection rules: (1) pick a crew ONLY when its "
-                "triggers clearly and specifically match the task with high confidence; "
-                "(2) if no crew is a strong match, do NOT route — fall back to the default "
-                "crew (default_agent); (3) crews without triggers are omitted from the "
-                "roster and are never auto-selected."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "crew": {
-                        "type": "string",
-                        "description": (
-                            "Crew name to bind. Omit or leave empty to list the roster instead."
-                        ),
-                    },
-                },
-                "required": [],
-            },
-        },
-        {
-            "name": "register_hook",
-            "description": (
-                "Register a webhook listener so an external system can inject a message "
-                "into a dedicated agent session later. Returns the webhook URL and session "
-                "key. Use this when you need to hand off to an external process (e.g. "
-                "submit a code review, then wait for the review bot to call back with results). "
-                "The external system POSTs to the returned URL with the results."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "hook_id": {
-                        "type": "string",
-                        "description": "Unique identifier for this hook (e.g. 'review:pr-123')",
-                    },
-                    "context_summary": {
-                        "type": "string",
-                        "description": "Summary of current work context for session resume",
-                    },
-                },
-                "required": ["hook_id", "context_summary"],
-            },
-        },
-        {
-            "name": "autonudge_stop",
-            "description": (
-                "Stop the auto-nudge loop driving your current session. Call this "
-                "when you determine the loop should halt (e.g. goal complete, "
-                "blocked on user input, or a STOP sentinel file indicates shutdown). "
-                "Legacy loops are removed. For a structured monitor, this compatibility "
-                "alias records a durable user-stop outcome and retains the record for "
-                "inspection. Safe to call even if no loop is active."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "reason": {
-                        "type": "string",
-                        "description": "Why the loop is being stopped (logged for audit)",
-                    },
-                },
-            },
-        },
-        {
-            "name": "ask_question",
-            "description": (
-                "Ask the dashboard user 1-4 multiple-choice questions by posting a "
-                "question card to the chat: the user clicks an option (or types a "
-                "custom answer in the card's free-text field). The tool is "
-                "NON-BLOCKING — it returns as soon as the card is requested, so END "
-                "YOUR TURN immediately after calling it. The answer arrives as the "
-                "user's next ordinary message, NOT as this tool's result, so do not "
-                "re-ask or guess in the meantime. Use it when a decision is genuinely "
-                "needed before the work can continue (which of these approaches, "
-                "which account, confirm before I refactor). When you are ending your "
-                "turn anyway a final [OPTIONS: a | b | c] tag is cheaper and renders "
-                "on every channel — the card's advantage is several questions at "
-                "once, multi-select and the free-text field, not saving a turn. "
-                "Dashboard sessions only: from another surface the call returns an "
-                "[OPTIONS:] steer instead of a card, and if no dashboard client is "
-                "attached the card is dropped."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "description": ("1-4 questions to show in one card, each with 1-6 options"),
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "question": {
-                                    "type": "string",
-                                    "description": "The question text (max 500 chars)",
-                                },
-                                "header": {
-                                    "type": "string",
-                                    "description": (
-                                        "Short category badge shown before the "
-                                        "question, e.g. 'SCOPE' (max 50 chars)"
-                                    ),
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "description": "The clickable choices",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {
-                                                "type": "string",
-                                                "description": "Option text (max 200)",
-                                            },
-                                            "description": {
-                                                "type": "string",
-                                                "description": (
-                                                    "Optional gloss shown next to "
-                                                    "the label (max 500)"
-                                                ),
-                                            },
-                                        },
-                                        "required": ["label"],
-                                    },
-                                },
-                                "multiSelect": {
-                                    "type": "boolean",
-                                    "description": (
-                                        "Allow selecting several options (default false)"
-                                    ),
-                                },
-                            },
-                            "required": ["question", "options"],
-                        },
-                    },
-                    # No timeout_secs: it would imply a wait this tool does not
-                    # perform. Still accepted for compatibility, never read.
-                },
-                "required": ["questions"],
-            },
-        },
-        {
-            "name": "monitor_watch",
-            "description": (
-                "Watch a supported pull request with cheap provider probes. The owning session "
-                "is woken only when a new revision needs action; unchanged, pending, retry, "
-                "and terminal probes use no agent turn. Available from dashboard, Slack, and "
-                "Discord sessions. One structured monitor per session."
-                + (_WATCH_STEER_STRUCTURED_DEFAULT if prefer_structured else "")
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "kind": {"type": "string", "enum": sorted(publicly_armable_kinds())},
-                    "target": {"type": "string", "description": "Canonical provider PR URL"},
-                    "objective": {"type": "string", "enum": sorted(publicly_armable_objectives())},
-                    "interval_secs": {
-                        "type": "integer",
-                        "minimum": MIN_MONITOR_CADENCE_SECS,
-                        "maximum": MAX_MONITOR_CADENCE_SECS,
-                    },
-                    "max_runtime_secs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_RUNTIME_SECS,
-                    },
-                    "max_agent_turns": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_AGENT_TURNS,
-                    },
-                    "max_tokens": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_TOKENS,
-                    },
-                    "max_provider_errors": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_PROVIDER_ERRORS,
-                    },
-                    "wake_instructions": {
-                        "type": "string",
-                        "maxLength": MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
-                        "description": "Compact instructions used only on an actionable wake",
-                    },
-                },
-                "required": ["kind", "target", "objective"],
-            },
-        },
-        {
-            "name": "monitor_inspect",
-            "description": (
-                "Inspect the monitor bound to your authenticated current session. "
-                "Reports a structured monitor's full record, or a legacy timer "
-                "loop's presence and cadence reading, whichever the session "
-                "holds. Takes no session key or monitor id."
-            ),
-            "inputSchema": {"type": "object", "properties": {}},
-        },
-        {
-            "name": "monitor_stop",
-            "description": (
-                "Durably stop the monitor on your current session. A structured "
-                "monitor is retained with its terminal outcome for inspection; a "
-                "legacy timer loop is stopped and leaves no record behind, so a "
-                "later monitor_inspect reports it as not armed."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {"reason": {"type": "string"}},
-            },
-        },
-        {
-            "name": "monitor_start",
-            "description": (
-                "Start a finite prompt loop for repeated work on YOUR CURRENT session, "
-                "including first-class self-session patrol by conductor agents. For "
-                "monitoring targets, this is also the legacy fallback for targets, "
-                "objectives, or required evidence unsupported by monitor_watch. "
-                + (
-                    _ARMING_STEER_STRUCTURED_BY_DEFAULT
-                    if prefer_structured
-                    else _ARMING_STEER_STRUCTURED_ON_CONDITION
-                )
-                + "Start a prompt loop on YOUR CURRENT session: every "
-                "interval_secs the given message is re-injected into this same "
-                "session as your next turn — same context, same tools, same "
-                "conversation. The countdown is deadline-preserving: user "
-                "messages defer a due fire until their turn ends but do NOT "
-                "restart the interval, so checks stay on schedule even in an "
-                "actively-used session. Works from dashboard chat, Slack "
-                "threads, Discord DMs, and Webex conversations. Put the check instructions and "
-                "the exit "
-                "condition in the message, then END YOUR TURN — the loop wakes you on the "
-                "interval. When the exit condition is met (or the user says "
-                "stop), call autonudge_stop — reaching max_cycles is a runaway "
-                "backstop, NOT a successful finish. From dashboard, Slack, or "
-                "Discord, use monitor_update to revise or re-arm the instruction "
-                "if what you are watching changes. On Webex, stop the loop and "
-                "create a new finite one instead. One automation may occupy a "
-                "session; monitor_start "
-                "is create-only and refuses while an ACTIVE one exists (a "
-                "system-stopped or expired automation — an approval stall, a "
-                "spent cap or budget, a finished subject — is replaced by the "
-                "new arm; manual pauses, user stops and retained tombstones "
-                "are preserved). "
-                "Survives gateway restarts. Every cycle appends a full turn to "
-                "this same session, so keep per-cycle output small and report "
-                "only real signals. "
-                "COST: naming exactly ONE GitHub pull request BY ITS FULL URL "
-                "(https://github.com/<owner>/<repo>/pull/<N>) makes the loop "
-                "observe it each interval and re-inject your message only when "
-                "it actually changed, so a cycle where nothing changed costs no "
-                "model turn and max_cycles then counts the turns actually "
-                "DELIVERED to you -- wakes, plus the periodic delivery that "
-                "breaks a long quiet streak and any tick that could not observe "
-                "the subject -- rather than intervals elapsed. If your loop must "
-                "run every "
-                "interval regardless -- it acts while the subject is quiet, e.g. "
-                "refreshing a heartbeat -- do not name a single pull request, or "
-                "pass gate=false."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": (
-                            "The recurring instruction to re-inject each cycle, "
-                            "including what to check and when to stop (max 8000 chars)"
-                        ),
-                    },
-                    "interval_secs": {
-                        "type": "integer",
-                        "description": (
-                            "Seconds between cycles, counted from the loop's "
-                            "last cycle (its own turn's end) toward a fixed "
-                            "deadline. User messages defer a due fire to their "
-                            "turn's end without restarting the countdown. A "
-                            "cycle whose own work runs long still pushes the "
-                            "next deadline out, so real cadence is at least "
-                            "interval_secs + turn time (15-86400, default 300)"
-                        ),
-                    },
-                    "gate": {
-                        "type": "boolean",
-                        "description": (
-                            "Default true. Pass false to opt this loop OUT of "
-                            "observation-gating, so it is re-injected every "
-                            "interval even when the pull request it names has "
-                            "not changed. Use it for a loop whose duty is to act "
-                            "WHILE the subject is quiet -- refresh a heartbeat "
-                            "file, chase a reviewer who still has not replied, "
-                            "keep a branch rebased on a moving base -- since the "
-                            "observation watches the pull request and continued "
-                            "silence is invisible to it. A gated loop is never "
-                            "starved (it is delivered anyway after enough quiet "
-                            "intervals) so reach for this only when every "
-                            "interval genuinely has work"
-                        ),
-                    },
-                    "max_cycles": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 1000,
-                        "description": (
-                            "Safety cap on delivered cycles (default "
-                            f"{_MONITOR_DEFAULT_MAX_CYCLES}). Use a larger finite "
-                            "value for a longer watch"
-                        ),
-                    },
-                    "max_runtime_secs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 604800,
-                        "description": (
-                            "Wall-clock budget in seconds, measured from when "
-                            "the loop is armed (default "
-                            f"{_MONITOR_DEFAULT_MAX_RUNTIME_SECS}; max 604800 = 7 days). "
-                            "Unlike max_cycles this "
-                            "bounds elapsed TIME, so a loop with slow turns or "
-                            "a long interval still stops on schedule. The "
-                            "budget gates when turns START and re-checks the "
-                            "moment a turn ends — an already-running turn is "
-                            "never cancelled, so the loop can overshoot by at "
-                            "most one turn (itself bounded by the per-turn "
-                            "transport timeout). When the budget is spent the "
-                            "loop deactivates and the user is notified"
-                        ),
-                    },
-                    "banner": {
-                        "type": "string",
-                        "description": (
-                            "Optional SHORT line shown in the transcript row "
-                            "instead of the full message (max 500 chars). The "
-                            "model still receives `message` whole every cycle — "
-                            "this changes only what is stored and displayed. Set "
-                            "it whenever `message` is long: a multi-KB "
-                            "instruction is otherwise re-stored and re-broadcast "
-                            "as a transcript row on every single cycle, which "
-                            "measured 51.8% of one long-running session's file. "
-                            'Something like "watching PR #123 for CI" is '
-                            "enough. Omit it for a short message, and omit it on "
-                            "a channel-bound loop (`slack:`/`discord:`/`webex:`) "
-                            "— a banner there is refused with a 400, since only "
-                            "the dashboard transcript renders it"
-                        ),
-                    },
-                },
-                "required": ["message"],
-            },
-        },
-        {
-            "name": "monitor_update",
-            "description": (
-                "Revise the monitoring loop already running on YOUR CURRENT "
-                "session — change the recurring instruction, the interval, or "
-                "the cycle cap without tearing the loop down and losing its "
-                "cycle count. Use when what you are watching has moved on and "
-                "the instruction you armed is now stale (the PR advanced past "
-                "the blocker you described, the check you were told to run "
-                "changed, the exit condition needs tightening). Only ever "
-                "touches your own session's loop. To stop the loop entirely, "
-                "use autonudge_stop instead."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": (
-                            "Replacement instruction for future cycles "
-                            "(max 8000 chars). Omit to leave it unchanged"
-                        ),
-                    },
-                    "interval_secs": {
-                        "type": "integer",
-                        "description": (
-                            "New IDLE gap between cycles, measured from when "
-                            "your turn ENDS (15-86400). Omit to leave unchanged"
-                        ),
-                    },
-                    "max_cycles": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 1000,
-                        "description": (
-                            "New cap on delivered cycles; raise it when a loop "
-                            "is close to its cap but the work is still live. "
-                            "Omit to leave unchanged"
-                        ),
-                    },
-                    "max_runtime_secs": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 604800,
-                        "description": (
-                            "New wall-clock budget in seconds, measured from "
-                            "when the loop was first armed (max 604800 = 7 days). "
-                            "Omit to leave unchanged"
-                        ),
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "New GitHub PR URL for a structured monitor",
-                    },
-                    "objective": {"type": "string", "enum": sorted(publicly_armable_objectives())},
-                    "max_agent_turns": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_AGENT_TURNS,
-                    },
-                    "max_tokens": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_TOKENS,
-                    },
-                    "max_provider_errors": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_MONITOR_PROVIDER_ERRORS,
-                    },
-                    "wake_instructions": {
-                        "type": "string",
-                        "maxLength": MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
-                        "description": "Replacement actionable-wake instructions",
-                    },
-                    "banner": {
-                        "type": "string",
-                        "description": (
-                            "Replacement SHORT transcript row for future cycles "
-                            "(max 500 chars); the model still receives `message` "
-                            'whole. Pass "" to CLEAR it and go back to showing '
-                            "the full message. Omit to leave it unchanged. A "
-                            "non-blank banner on a channel-bound loop "
-                            "(`slack:`/`discord:`/`webex:`) is refused with a 400"
-                        ),
-                    },
-                },
-            },
-        },
-        {
-            "name": "session_handoff",
-            "description": (
-                "Hand a piece of work over to Kiro Crew as a NEW trackable session. "
-                "Use when you are running OUTSIDE Kiro Crew (Claude Code, OpenClaw, "
-                "Codex) and the user wants the work continued there: the session "
-                "appears in the Kiro Crew sidebar labelled with where it came from, "
-                "keeps its own history, and can be resumed by hand. "
-                "\n\n"
-                "This does NOT move your conversation. It starts a fresh Kiro Crew "
-                "session whose first message is the prompt you pass, so state the "
-                "task completely — the new session cannot see anything you did not "
-                "put in `prompt`. Reference files by absolute path rather than "
-                "pasting them; the prompt is capped. "
-                "\n\n"
-                "By default the session STARTS its turn immediately and runs "
-                "unattended, and this returns without waiting for it — poll the "
-                "session, or tell the user to open the returned slot. Pass "
-                "start=false to create it parked instead. "
-                "\n\n"
-                "Authorization: the operator must have turned external handoff on "
-                "(Settings > Security > Rules); it is OFF by default and this tool "
-                "then refuses. A handed-over session gains NO approval authority — "
-                "it runs under the grants already in place and stops at the first "
-                "tool they do not cover, so do not promise the user it will finish "
-                "unattended."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "origin": {
-                        "type": "string",
-                        "enum": ["claude_code", "openclaw", "codex", "external"],
-                        "description": (
-                            "Which tool you are. Shown to the user as the session's "
-                            "source, so name yourself honestly; 'external' is the "
-                            "fallback for a tool with no id of its own."
-                        ),
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": (
-                            "The work item, stated completely and standalone. Max "
-                            "16000 characters."
-                        ),
-                    },
-                    "project": {
-                        "type": "string",
-                        "description": (
-                            "Absolute path the new session should work in. Vetted "
-                            "server-side; a sensitive path (~/.aws, ~/.ssh, the Kiro "
-                            "Crew trust root) is refused. Omit for no project."
-                        ),
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Short session title for the sidebar. Optional.",
-                    },
-                    "agent": {
-                        "type": "string",
-                        "description": "Kiro Crew agent to answer. Omit for the default.",
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Model id. Omit to inherit the session default.",
-                    },
-                    "start": {
-                        "type": "boolean",
-                        "description": (
-                            "Start the turn now (default true). false creates the "
-                            "session parked for the user to send by hand."
-                        ),
-                    },
-                },
-                "required": ["origin", "prompt"],
-            },
-        },
-        {
-            "name": "set_project",
-            "description": (
-                "Set the calling chat slot's project directory. The directory scopes "
-                "file search, @-mention auto-complete, the [PROJECT] context line, "
-                "and project-level .kiro/steering/**/*.md. "
-                "\n\n"
-                "Use after a skill scaffolds a new working tree (e.g. a new workspace) "
-                "so the agent retargets to the new source instead of the old one. "
-                "Also use when the user asks you to work on a specific repository or "
-                "project folder — calling set_project ensures the session's CWD is "
-                "updated and future tool calls (file reads, bash commands) default to "
-                "the correct location. "
-                'To clear the project, pass path="" with clear=true. '
-                "\n\n"
-                "Restrictions: headless callers (cron jobs, subagents, task "
-                "runners) are rejected — a cron turn can run on a user's "
-                "dashboard slot and a subagent shares its parent's slot, so "
-                "they must not retarget it. Sensitive paths (~/.aws, ~/.ssh, "
-                "etc.) are blocked by the underlying endpoint. "
-                "\n\n"
-                "The session is reset on the NEXT turn boundary (not inline) so this "
-                "tool returns cleanly without killing its own caller."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Absolute path to the new project directory. "
-                            "Must be non-empty unless clear=true."
-                        ),
-                    },
-                    "clear": {
-                        "type": "boolean",
-                        "description": "Set true to clear the project scope (path must be empty).",
-                    },
-                },
-                "required": ["path"],
-            },
-        },
-        {
-            "name": "reset_conversation",
-            "description": (
-                "Give the calling chat session a clean context: the next message "
-                "starts a fresh conversation with no memory of this one. The tab "
-                "stays open and the TRANSCRIPT IS NOT TOUCHED — earlier messages "
-                "remain visible and on disk, so this drops the model's memory, not "
-                "the user's record."
-                "\n\n"
-                "Use when a session walks a list of independent items one at a time "
-                "(reviewing a queue, triaging tickets) and carrying item N's context "
-                "into item N+1 buys nothing but tokens. Also use when a long-lived "
-                "conversation has drifted off the thing it was about."
-                "\n\n"
-                "Do NOT use to escape a context you still need: anything not written "
-                "down somewhere durable — a file, a ticket, a memory — is gone from "
-                "the model's view after the reset, even though the user can still "
-                "read it in the tab. Record what carries forward BEFORE calling this."
-                "\n\n"
-                "Restrictions: headless callers (cron jobs, subagents, task runners) "
-                "are rejected — a cron turn can run on a user's dashboard slot and a "
-                "subagent shares its parent's slot, so neither may wipe it."
-                "\n\n"
-                "The reset lands at a turn BOUNDARY, not inline, so this tool returns "
-                "cleanly without tearing down its own caller mid-write. Normally that "
-                "is the end of this turn, so the next message starts fresh. It waits, "
-                "however, for anything whose work the teardown would destroy: a turn "
-                "still in flight on the session, or sub-agents running, queued, or "
-                "delivering a result. So it can land a turn or more later than the "
-                "next message, and the rest of the current turn always still sees the "
-                "full conversation."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-            },
-        },
-        {
-            "name": "chat_tag",
-            "description": (
-                "Tag THIS chat session on the dashboard board so a human scanning "
-                "many sessions can see what each one needs. Use to move your own "
-                "conversation between workflow states (e.g. flip it to Review when "
-                "there is nothing left for you to do and it awaits the user), and to "
-                "add or remove non-state labels."
-                "\n\n"
-                "Arguments (at least one required): set_state=<state tag id> sets the "
-                "single mutually-exclusive workflow state (planned / todo / "
-                "implementation / review / done), replacing whichever state tag the "
-                "session currently carries; add=[ids] adds non-state labels; "
-                "remove=[ids] removes labels. Each entry may be a tag id or a "
-                "tag's display name; both resolve case-insensitively against "
-                "the board's vocabulary (an id wins when a name collides with "
-                "a different tag's id)."
-                "\n\n"
-                "PERMISSION: each tag carries an agent policy — a tag the human "
-                "reserved for themselves is refused (tag_policy_denied), an "
-                "add-only tag can be added but not removed, and workflow states "
-                "are agent-writable by default on a fresh install or when newly "
-                "created as status tags (an upgraded install starts with every "
-                "tag human-only until granted: a set_state that meets a custom "
-                "status tag with no protected record is refused "
-                "status_identity_unprotected, and the human restores it by "
-                "toggling that tag's status off and on in the dashboard tag "
-                "manager, or by a tag PATCH with an explicit status). "
-                "tag_grants_unavailable means the grants store itself is "
-                "unreadable or was quarantined at boot (for example after a "
-                "token-key rotation), not that a human reserved the tag: tell the "
-                "user, who re-grants it from the tag manager. The result reports the "
-                "session's RESULTING tag list, so this is also how you READ your own "
-                "current tags — call it with just the change you want (or a no-op "
-                "add of a tag already present) to see them."
-                "\n\n"
-                "Restrictions: slot-backed sessions only (a dashboard chat, or a "
-                "messaging thread bound to a dashboard slot) — a standalone channel "
-                "session with no slot is refused. Headless callers "
-                "(cron jobs, subagents) are refused — a cron turn can run on a user's "
-                "slot and a subagent shares its parent's, so neither may retag it. "
-                "The change applies when this turn's result is processed."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "set_state": {
-                        "type": "string",
-                        "description": (
-                            "A workflow-state tag id (planned / todo / implementation "
-                            "/ review / done). Replaces any state tag the session "
-                            "currently carries — the states are mutually exclusive."
-                        ),
-                    },
-                    "add": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Tag ids to add (non-state labels only; a workflow-state id is refused — use set_state).",
-                    },
-                    "remove": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Tag ids to remove.",
-                    },
-                },
-            },
-        },
-        {
-            "name": "suggest_followup",
-            "description": (
-                "Offer the user up to 3 follow-up items as a card below the chat "
-                "composer in the CURRENT dashboard session. Each item shows a title "
-                "and description with three buttons: 'Start in new worktree' (creates "
-                "a git worktree off the project's default branch, opens a new chat "
-                "session scoped to it, and pre-fills the composer with your prompt), "
-                "'Add to this session' (pre-fills this session's composer with your "
-                "prompt), and 'Skip'. Both non-skip buttons PRE-FILL the composer — "
-                "the user still presses send — so nothing runs without their consent. "
-                "The worktree button requires the session to have a project directory "
-                "and is disabled otherwise (the tool result tells you when that is "
-                "the case); 'Add to this session' always works."
-                "\n\n"
-                "Call this at the END of a turn when you have finished the requested "
-                "work and see concrete next steps worth doing. Do NOT call it to ask a "
-                "clarifying question you need answered to continue (just ask), and do "
-                "not call it every turn — silence is the correct default when there is "
-                "no substantive follow-up."
-                "\n\n"
-                "The 'prompt' field is the real payload: write a COMPLETE, standalone "
-                "handoff instruction for the next agent, which may have none of this "
-                "session's context. Name the files, paths, constraints, and acceptance "
-                "criteria explicitly. 'title'/'description' are only the human-facing "
-                "label. Prefer 'branch' + the worktree route for work that should not "
-                "share this session's working tree."
-                "\n\n"
-                "Restrictions: dashboard sessions only (Slack, cron, and subagent "
-                "contexts are rejected — they have no card surface). One card at a "
-                "time per slot: a new call replaces any card the user has not yet "
-                "acted on."
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "maxItems": 3,
-                        "description": "Follow-up suggestions, most valuable first.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "title": {
-                                    "type": "string",
-                                    "description": (
-                                        "Short imperative label, e.g. "
-                                        "'Add rate limiting to the upload endpoint'."
-                                    ),
-                                },
-                                "description": {
-                                    "type": "string",
-                                    "description": (
-                                        "One or two sentences on what this does and why "
-                                        "it is worth doing. Shown under the title."
-                                    ),
-                                },
-                                "prompt": {
-                                    "type": "string",
-                                    "description": (
-                                        "The expanded, self-contained instruction handed "
-                                        "to the next agent. Assume no shared context."
-                                    ),
-                                },
-                                "branch": {
-                                    "type": "string",
-                                    "description": (
-                                        "Optional git branch name for the worktree route "
-                                        "(e.g. 'feat/upload-rate-limit'). Derived from the "
-                                        "title when omitted."
-                                    ),
-                                },
-                            },
-                            "required": ["title", "description", "prompt"],
-                        },
-                    },
-                },
-                "required": ["items"],
-            },
-        },
-    ]
+#: Bound by the dotted name, not ``__name__``: ``control_parts.schemas`` logs through this
+#: same logger, and the mirror needs one object for it even when the module runs as
+#: ``__main__``.
+logger = logging.getLogger("kiro_crew.mcp_tools.control")
 
 
 def task_run(name: str, args: dict[str, Any]) -> str:
@@ -1017,34 +98,20 @@ def task_run(name: str, args: dict[str, Any]) -> str:
     return f"Task runner started: {safe_label}"
 
 
-def wait(name: str, args: dict[str, Any]) -> str:
+def wait(name: str, args: dict[str, Any]) -> "str | DeferredTool":
+    """Sleep for ``seconds`` without holding the MCP worker thread.
+
+    Everything that decides HOW to sleep runs here, on the worker; the sleep
+    itself is a :class:`_WaitStep` the dispatch loop times, so a thousand
+    parked sessions cost no thread (see ``mcp_shared.DeferredTool``). Each step
+    is one keepalive POST, at most once per ``_ping_secs``.
+    """
     args = validate_tool_args(args, WAIT_SCHEMA)
 
-    seconds = max(60, min(1800, int(args.get("seconds", 300))))
+    seconds = max(60, min(WAIT_TOOL_MAX_SECS, int(args.get("seconds", 300))))
     reason = str(args.get("reason", ""))
     reason_safe, _ = redact_exfiltration_urls(reason)
     reason_safe, _ = redact_credentials(reason_safe)
-    deadline = mcp_core.time.monotonic() + seconds
-    # Identity for THIS sleep. The dashboard's "end wait now" button echoes
-    # it back through the keepalive response, so a request left over from an
-    # earlier sleep can never terminate the next one in the same session. The
-    # same reply also ends the sleep when a mid-turn steer lands after it
-    # began: the backend can only inject a steer at a model-inference
-    # boundary, and this sleep is the absence of one (see _wait_end_reason).
-    wait_id = uuid.uuid4().hex
-    # Ping session-keepalive every WAIT_PING_SECS so the gateway's
-    # is_responsive() doesn't flag this session as stale and SIGTERM the ACP
-    # subprocess -- and so the reply can carry an early-end request back.
-    #
-    # This POST is the ONLY inbound channel a sleeping wait has: the MCP
-    # subprocess runs no listener, and the one path that can interrupt it
-    # (notifications/cancelled on stdin) is a session-teardown signal that
-    # suppresses the tool's response entirely, and does not exist at all on
-    # Windows. So the ping interval IS the button's worst-case latency,
-    # which is why it matches the sleep granularity rather than the 60s the
-    # staleness watchdog alone would need.
-    _next_ping = mcp_core.time.monotonic()
-    ended_early = False
     # Publish wait metadata ONLY under an authoritative identity, and refuse
     # to honour `end_wait` without one.
     #
@@ -1065,84 +132,162 @@ def wait(name: str, args: dict[str, Any]) -> str:
     # When it comes back empty the identity is a guess, so the ping degrades
     # to the original `{}` touch: the session still cannot be reaped
     # mid-sleep, and the countdown simply never appears.
-    _identified = bool(mcp_core.require_strict_session_key("the wait keepalive ping")[0])
-    # The 5s cadence exists ONLY to bound how long the button appears to do
-    # nothing. An unidentified sleep publishes nothing and honours no
-    # end_wait, so it has no button and would be paying a 12x request
-    # multiplier for a latency nobody can observe; it reverts to the 60s the
-    # staleness watchdog actually needs.
-    _ping_secs = mcp_core.WAIT_PING_SECS if _identified else mcp_core.WAIT_STALENESS_PING_SECS
-    while True:
+    identified = bool(mcp_core.require_strict_session_key("the wait keepalive ping")[0])
+    return _WaitStep(seconds=seconds, reason_safe=reason_safe, identified=identified)
+
+
+class _WaitStep(DeferredTool):
+    """The parked half of :func:`wait`: one keepalive POST per step."""
+
+    def __init__(self, *, seconds: int, reason_safe: str, identified: bool) -> None:
+        self.seconds = seconds
+        self.reason_safe = reason_safe
+        self.identified = identified
+        self.deadline = mcp_core.time.monotonic() + seconds
+        # Identity for THIS sleep. The dashboard's "end wait now" button echoes
+        # it back through the keepalive response, so a request left over from
+        # an earlier sleep can never terminate the next one in the same
+        # session. The same reply also ends the sleep when a mid-turn steer
+        # lands after it began: the backend can only inject a steer at a
+        # model-inference boundary, and this sleep is the absence of one (see
+        # _wait_end_reason).
+        self.wait_id = uuid.uuid4().hex
+        # Ping session-keepalive every WAIT_PING_SECS so the gateway's
+        # is_responsive() doesn't flag this session as stale and SIGTERM the
+        # ACP subprocess -- and so the reply can carry an early-end request
+        # back.
+        #
+        # This POST is the ONLY inbound channel a sleeping wait has: the MCP
+        # subprocess runs no listener, and the one path that can interrupt it
+        # (notifications/cancelled on stdin) is a session-teardown signal that
+        # suppresses the tool's response entirely, and does not exist at all
+        # on Windows. So the ping interval IS the button's worst-case latency,
+        # which is why it matches the sleep granularity rather than the 60s
+        # the staleness watchdog alone would need.
+        #
+        # The 5s cadence exists ONLY to bound how long the button appears to
+        # do nothing. An unidentified sleep publishes nothing and honours no
+        # end_wait, so it has no button and would be paying a 12x request
+        # multiplier for a latency nobody can observe; it reverts to the 60s
+        # the staleness watchdog actually needs.
+        self.ping_secs = (
+            mcp_core.WAIT_PING_SECS if identified else mcp_core.WAIT_STALENESS_PING_SECS
+        )
+        self.next_ping = mcp_core.time.monotonic()
+
+    def due_at(self) -> float:
+        return min(self.next_ping, self.deadline)
+
+    def step(self) -> str | None:
         now = mcp_core.time.monotonic()
-        remaining = deadline - now
+        remaining = self.deadline - now
         if remaining <= 0:
-            break
-        # Check for cancellation from notifications/cancelled handler
-        if is_tool_cancelled():
-            raise ToolCancelled(f"wait cancelled after {seconds - remaining:.0f}s")
-        if now >= _next_ping:
+            return self._finish(ended_early=False, ended_by="")
+        if now < self.next_ping:
+            return None
+        try:
+            reply = mcp_core._post(
+                "/api/session-keepalive",
+                (
+                    {
+                        "wait_id": self.wait_id,
+                        "seconds": self.seconds,
+                        "remaining": max(0, int(remaining)),
+                        # Lets the dashboard derive a liveness window for
+                        # this sleep without importing this module's
+                        # constant -- see _service_wait_ping's collision
+                        # guard, which needs to know how stale a ping has to
+                        # be before the sleep behind it is presumed gone.
+                        "interval": self.ping_secs,
+                    }
+                    if self.identified
+                    else {}
+                ),
+                # A step shares a small pool with every other parked call, so
+                # a gateway that stops answering must not hold it for the
+                # default 30s: the next ping retries anyway.
+                timeout=_WAIT_PING_TIMEOUT_SECS,
+            )
+        except Exception:
+            reply = {}  # keepalive is best-effort
+        # Only a request naming this wait ends it. `_post` returns
+        # {"error": ...} on a failed round-trip rather than raising, so
+        # the equality check doubles as the error guard. Gated on
+        # `identified` too: an unidentified sleep sends no wait_id, so a
+        # matching reply could only mean the backend is answering about
+        # somebody else's wait.
+        if self.identified and isinstance(reply, dict) and reply.get("end_wait") == self.wait_id:
+            # Slot key of the session that ended this sleep through
+            # session_end_wait, or "" for the End-wait button / a steer. Only
+            # read from a reply that named this wait, so it cannot describe
+            # someone else's sleep.
+            return self._finish(
+                ended_early=True, ended_by=str(reply.get("end_wait_by") or "")[:128]
+            )
+        self.next_ping = now + self.ping_secs
+        return None
+
+    def cancel(self) -> None:
+        # The call ends with no response; still retire the countdown card.
+        self._retire_card()
+
+    def _retire_card(self) -> None:
+        # Retire the countdown card. The tool result travels back through
+        # kiro-cli, which the dashboard cannot correlate to this wait_id, so
+        # the sleep has to announce its own end. Best-effort: a slot whose
+        # wait state is stale also clears at turn end (chat_runner) and
+        # renders nothing once the turn stops running. Skipped entirely when
+        # the identity was never authoritative -- nothing was ever published,
+        # so there is nothing to retire, and sending a wait_id under a guessed
+        # key could blank a countdown belonging to a different session.
+        if self.identified:
             try:
-                reply = mcp_core._post(
+                mcp_core._post(
                     "/api/session-keepalive",
-                    (
-                        {
-                            "wait_id": wait_id,
-                            "seconds": seconds,
-                            "remaining": max(0, int(remaining)),
-                            # Lets the dashboard derive a liveness window for
-                            # this sleep without importing this module's
-                            # constant -- see _service_wait_ping's collision
-                            # guard, which needs to know how stale a ping has to
-                            # be before the sleep behind it is presumed gone.
-                            "interval": _ping_secs,
-                        }
-                        if _identified
-                        else {}
-                    ),
+                    {"wait_id": self.wait_id, "wait_done": True},
+                    timeout=_WAIT_PING_TIMEOUT_SECS,
                 )
             except Exception:
-                reply = {}  # keepalive is best-effort
-            # Only a request naming this wait ends it. `_post` returns
-            # {"error": ...} on a failed round-trip rather than raising, so
-            # the equality check doubles as the error guard. Gated on
-            # `_identified` too: an unidentified sleep sends no wait_id, so a
-            # matching reply could only mean the backend is answering about
-            # somebody else's wait.
-            if _identified and isinstance(reply, dict) and reply.get("end_wait") == wait_id:
-                ended_early = True
-                break
-            _next_ping = now + _ping_secs
-        mcp_core.time.sleep(min(_ping_secs, remaining))
-    waited = max(0, int(seconds - max(0.0, deadline - mcp_core.time.monotonic())))
-    mcp_core.sel().log_tool_invocation(
-        session_key=mcp_core._resolve_session_key(),
-        source="mcp",
-        tool_name="wait",
-        outcome="success",
-    )
-    # Retire the countdown card. The tool result travels back through
-    # kiro-cli, which the dashboard cannot correlate to this wait_id, so the
-    # sleep has to announce its own end. Best-effort: a slot whose wait
-    # state is stale also clears at turn end (chat_runner) and renders
-    # nothing once the turn stops running. Skipped entirely when the identity
-    # was never authoritative -- nothing was ever published, so there is
-    # nothing to retire, and sending a wait_id under a guessed key could
-    # blank a countdown belonging to a different session.
-    if _identified:
-        try:
-            mcp_core._post("/api/session-keepalive", {"wait_id": wait_id, "wait_done": True})
-        except Exception:
-            pass
-    # Deliberately a normal return, NOT ToolCancelled: _run_tool suppresses
-    # the response of a cancelled call, so raising here would leave kiro-cli
-    # waiting on a tool result that never arrives until the 600s stall
-    # watchdog kills the session. Ending a wait early continues the turn.
-    if ended_early:
-        return (
-            f"Wait ended early by the user after {waited}s of {seconds}s. "
-            f"Resuming: {reason_safe}"
+                pass
+
+    def on_settled(self, text: str) -> None:
+        # The tool's own row, as the blocking tool wrote it at return. Written
+        # by the driver, not in ``step()``: a cancel landing while the final
+        # card retirement runs on the pool thread audits ``cancelled`` instead,
+        # and only the driver knows which. The audited wrapper then writes its
+        # generic ``completed`` row.
+        mcp_core.sel().log_tool_invocation(
+            session_key=mcp_core._resolve_session_key(),
+            source="mcp",
+            tool_name="wait",
+            outcome="success",
         )
-    return f"Waited {seconds}s. Resuming: {reason_safe}"
+
+    def _finish(self, *, ended_early: bool, ended_by: str) -> str:
+        seconds = self.seconds
+        waited = max(0, int(seconds - max(0.0, self.deadline - mcp_core.time.monotonic())))
+        self._retire_card()
+        # Deliberately a normal return, NOT ToolCancelled: the loop suppresses
+        # the response of a cancelled call, so raising here would leave kiro-cli
+        # waiting on a tool result that never arrives until the 600s stall
+        # watchdog kills the session. Ending a wait early continues the turn.
+        if ended_early and ended_by:
+            return (
+                f"Wait ended early by session `{ended_by}` (session_end_wait) after "
+                f"{waited}s of {seconds}s. Resuming: {self.reason_safe}"
+            )
+        if ended_early:
+            return (
+                f"Wait ended early by the user after {waited}s of {seconds}s. "
+                f"Resuming: {self.reason_safe}"
+            )
+        return f"Waited {seconds}s. Resuming: {self.reason_safe}"
+
+
+#: Bound on one keepalive POST from a parked ``wait``. Loopback normally
+#: answers in milliseconds; the bound only matters when the gateway is stalled,
+#: where the step pool must not be held for the helper's 30s default.
+_WAIT_PING_TIMEOUT_SECS = 5.0
 
 
 def route_crew(name: str, args: dict[str, Any]) -> str:
@@ -1248,6 +393,10 @@ def register_hook(name: str, args: dict[str, Any]) -> str:
         f"Auth: Authorization: Bearer <webhook token>. Tokens are created in the\n"
         f"dashboard under Webhooks (each one is shown once, then stored hashed);\n"
         f"with no token configured the endpoint refuses every call with 401.\n"
+        f"A token that requires signatures (the dashboard default) also needs\n"
+        f"X-KiroCrew-Timestamp (unix seconds, within 300s of now) and\n"
+        f"X-KiroCrew-Signature: sha256=<hex HMAC of '<timestamp>.<raw body>' keyed\n"
+        f"by the token's signing secret>; see the bundled inbound-webhooks.md doc.\n"
         f"The call returns 200 immediately and the agent's answer arrives via\n"
         f"notifications, not in the HTTP response.\n"
         f"Context summary saved for session resume (injected verbatim within 1h,\n"
@@ -1255,764 +404,213 @@ def register_hook(name: str, args: dict[str, Any]) -> str:
     )
 
 
-def _emit_directive(kind: str, args: dict[str, Any], human: str) -> str:
-    """Encode a validated directive AND publish it out of band; return the text.
-
-    Two delivery paths, one each way round:
-
-    * The MARKER in the returned text is the original path. A consumer that can
-      verify the call's ``_meta.kiro`` identity (kiro-cli) decodes and applies it
-      from there, exactly as before — this function changes nothing for that
-      backend.
-    * The out-of-band POST is the provider-neutral path. ``_post`` already carries
-      ``X-Session-Key`` (and the gateway kernel-verifies that claim on the unix
-      socket), so the gateway parks the payload for the RIGHT session without the
-      model's tool result being trusted for anything. What travels is the CALL
-      (tool name + raw arguments), never the payload: the gateway re-runs this
-      tool on those arguments to derive the payload and computes the claim key
-      itself, and the consumer recomputes that key from the ``tool_call``
-      frame — so neither the result body's shape nor a caller-authored payload
-      decides what lands. A backend that emits no ``_meta.kiro`` identity has
-      no other way to reach its own control plane.
-
-    Order matters: encode FIRST. ``encode`` refuses an oversized payload by
-    returning a marker-less error string, and a refused directive must NOT be
-    published — otherwise the model is told "nothing was applied" while a record
-    sits waiting to apply it.
-
-    Fail-soft on the POST, and SILENT by design. An older gateway with no such
-    route, or one that is simply down, must not turn a working tool call into an
-    error: the marker is already in hand and the kiro-cli path still works. There
-    is no log line because this module runs as a stdio MCP server, where the
-    process's own streams are the protocol channel — and because the failure that
-    matters is reported at the CONSUMER, which is the side that knows whether a
-    directive actually landed.
-    """
-    out = session_directive.encode(kind, args, human)
-    # STRUCTURAL test, not a content test: encode either produced a marker or it
-    # refused. Asking ``is_refusal(out)`` instead matched any payload that merely
-    # CONTAINED the refusal token — so a stop whose reason quoted that token was
-    # classified as a refusal, skipped the publish and the vouch, and had its real
-    # marker defanged downstream, losing the stop. That is the same
-    # "infer provenance from imitable content" mistake this gate exists to remove.
-    if not session_directive.has_marker(out):
-        return out
-    # Gateway-side derivation (mcp_core.derive_directive) re-runs this very
-    # handler and wants the validated payload, not a POST.
-    if mcp_core.capture_directive(kind, args):
-        return out
-    _tool = mcp_core.current_call_name()
-    if not _tool:
-        # Not inside a ``_call_tool`` dispatch (a direct handler call, e.g. from a
-        # test): there is no call to report, and an empty one would only be
-        # refused by the gateway as not derivable.
-        return out
-    try:
-        # The gateway is sent the CALL, not the payload: the tool's name and the
-        # raw arguments it was invoked with (recorded in _call_tool before
-        # validation). The gateway re-derives the payload by re-running the tool
-        # and computes the claim digest itself, so a caller who can reach the
-        # route controls only what the victim's own call would produce.
-        mcp_core._post(
-            "/api/session-directive",
-            {
-                "tool": _tool,
-                "raw_args": mcp_core.current_call_raw_args(),
-            },
-        )
-    except Exception:
-        pass
-    # POSITIVE PROVENANCE: this is the one place a real marker is produced, so it
-    # is the one place that can say so. Without it the outermost gate has to infer
-    # authenticity from the bytes, which a rejection echoing a model-chosen
-    # argument name can imitate.
-    return session_directive.vouch(out)
-
-
-def autonudge_stop(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, AUTONUDGE_STOP_SCHEMA)
-
-    # Resolve the current session's binding key and stop any loop on it.
-    # STRICT resolution via the shared gate (env-var only, no PID walk): this
-    # tool mutates another process's persistent loop state, and a subagent
-    # lives under the parent slot's process tree — a PID-walk would let it
-    # silently stop the PARENT session's loop (matches set_project's rule).
-    # Resolve-half only: an empty key deliberately does NOT refuse here — it
-    # falls through to the directive, whose consumer resolves its own session.
-    sk, _ = mcp_core.require_strict_session_key("autonudge_stop")
-    # Stateless: emit a directive; the session-aware consumer
-    # (chat_runner) resolves the loop by ITS OWN session and stops it. The
-    # tool carries no session identity — sk is used only to short-circuit a
-    # context where a directive can never be applied (cron/hook/subagent).
-    if mcp_core._autonudge_binding_key(sk) is None and sk:
-        return (
-            "No auto-nudge loop to stop: this tool only works from within "
-            "a dashboard, Slack, Discord, or Webex session "
-            f"(current session_key={sk!r})."
-        )
-    return _emit_directive(
-        "autonudge_stop",
-        {"reason": args.get("reason", "").strip()},
-        # NOT a confirmation, and worded so a model cannot read it as one: this
-        # tool resolves no session, so it cannot know whether a loop is bound
-        # here. The consumer applies the stop and records the real outcome —
-        # including "nothing was stopped" when the binding resolves no loop —
-        # onto the transcript, so a caller that reads this as success would be
-        # acting on an unverified claim.
-        "Stop REQUESTED for this session's auto-nudge loop. This is not "
-        "confirmation that a loop was found or stopped; the applied outcome is "
-        "recorded separately and may report that nothing was stopped.",
-    )
-
-
-def ask_question(name: str, args: dict[str, Any]) -> str:
+def ask_question(name: str, args: dict[str, Any]) -> "str | DeferredTool":
     args = validate_tool_args(args, ASK_QUESTION_SCHEMA)
-    # Stateless: return a directive. The session-aware consumer
-    # (chat_runner) broadcasts a NON-BLOCKING question card (no ask_id) to
-    # ITS OWN slot and the agent ends its turn; the user's answer arrives as
-    # an ordinary next message that resumes the session with full context.
-    # No server-side block, no identity resolved for the effect. A card needs
-    # a chat window, so the gate asks whether one is OPEN rather than where
-    # the session started — a channel-born session with its tab open can
-    # render it. Surfaces without a tab still get the [OPTIONS:] hint;
-    # an empty (default-install) key falls through to the directive.
-    # Resolve-half of the shared strict gate only: ask_question gates on the
-    # dashboard surface, not on identity, so an empty key is not a refusal.
+    # ALWAYS blocking. The tool opens a card on the calling session's own slot
+    # and waits for it, so the answers come back as this call's RESULT. There is
+    # deliberately no non-blocking fallback: that path sent the answers back as
+    # the user's next chat message, which hands agent-authored question text the
+    # user's authority. When no card can be shown the tool says so in its result
+    # and the agent asks in plain text instead.
     sk, _ = mcp_core.require_strict_session_key("ask_question")
-    if sk and not has_dashboard_surface(sk):
+    # Dashboard-born sessions only: a surfaced channel session is steered by its channel's members, not the owner.
+    if not sk or not sk.startswith("dashboard:") or not has_dashboard_surface(sk):
         return (
-            "ask_question only works from a dashboard chat session "
-            f"(current session_key={sk!r}). From other surfaces, end your "
-            "turn with an [OPTIONS: a | b | c] tag instead — it renders "
-            "clickable buttons on every channel that supports them."
+            "ask_question only works from a dashboard chat session with its tab "
+            "open. Ask in plain text instead, or end your turn with an "
+            "[OPTIONS: a | b | c] tag — it renders clickable buttons on every "
+            "channel that supports them."
         )
     # Deep per-question/option validation, AUTHORITATIVELY here rather than in
     # the shallow schema: a malformed nested question must be rejected before the
-    # model is told a card was posted, not surface later as a card-post failure.
-    # RETURNED, not raised: an escaped exception is turned into the same
-    # ``"Error: …"`` text by the JSON-RPC layer, but it escapes this server's own
-    # return path — so it is neither audited with the call's args nor tagged as a
-    # refusal, and the consumer reads a decline as a LOST DIRECTIVE MARKER.
-    # Returning keeps the model-facing text identical and keeps the
-    # "marker or refusal, nothing in between" invariant total.
+    # model is told a card was posted. Returned, not raised, so the refusal is
+    # audited with the call's args like any other result.
     try:
         questions = validate_ask_user_question(args)
     except ValidationError as exc:
         return f"Error: {exc}"
-    return _emit_directive(
-        "ask_question",
-        {"questions": questions},
-        "Question card requested for this session. End your turn now — if it "
-        "renders, the user's answer arrives as your next message (do NOT "
-        "re-ask or guess in the meantime). If no dashboard client is "
-        "attached the card is dropped, so ask in plain text instead.",
-    )
-
-
-def monitor_start(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, MONITOR_START_SCHEMA)
-    # STRICT resolution via the shared gate (env-var only, no PID walk):
-    # monitor_start creates a persistent unattended loop that repeatedly runs
-    # tools in the bound session. A subagent under the parent's process tree
-    # must NOT be able to PID-walk into the parent's identity and mint a loop
-    # the parent user never asked for (crosses the session authorization
-    # boundary). Resolve-half only: the short-circuit below is on context,
-    # not identity, so an empty key falls through to the directive.
-    sk, _ = mcp_core.require_strict_session_key("monitor_start")
-    # Stateless: only short-circuit contexts where a directive can
-    # never be applied (cron/hook/subagent). The session-aware consumer
-    # (chat_runner) supplies the binding key and arms the loop.
-    if mcp_core._autonudge_binding_key(sk) is None and sk:
-        return (
-            "monitor_start only works from within a dashboard, Slack, Discord, "
-            f"or Webex session (current session_key={sk!r}). For other "
-            "contexts use cron_add or a HEARTBEAT.md task."
-        )
-    message = args["message"].strip()
-    if not message:
-        return "monitor_start: message must not be empty."
-    interval_secs = int(args.get("interval_secs") or 300)
-    # Default to bounded cycle and runtime caps. A loop without either bound
-    # only ever stops when the model volunteers an autonudge_stop, and observed
-    # loop stores show that is not reliable.
-    raw_max = args.get("max_cycles")
-    max_cycles = _MONITOR_DEFAULT_MAX_CYCLES if raw_max is None else int(raw_max)
-    # The runtime budget is bounded by default alongside the cycle cap, so a
-    # quiet or slow loop cannot survive indefinitely without a fresh decision.
-    max_runtime_secs = int(args.get("max_runtime_secs") or _MONITOR_DEFAULT_MAX_RUNTIME_SECS)
-    # The one escape from gating, and deliberately an opt-OUT. An opt-IN is what
-    # An opt-out is used rather than opt-in: an opt-in default gates everything
-    # and releases nothing (every opt-in mechanism sees zero adoption because
-    # the default never moves), while this releases the minority of loops whose
-    # duty is to act WHILE the subject is quiet (refresh a heartbeat, chase a
-    # silent reviewer, rebase onto a moving base). Those loops otherwise have no
-    # control but the wording of their own instruction, which is a fragile
-    # thing to key a cadence on.
-    gate = args.get("gate")
-    gate = True if gate is None else bool(gate)
-    # Infer from the message AS IT WILL BE STORED. The authorizer redacts
-    # exfiltration URLs and credentials at its own chokepoint before persisting,
-    # so a subject named by a URL the redactor rewrites survives here but not
-    # there -- and the ack would then promise gating for a loop that is armed
-    # ungated. Applying the same transform first makes the disclosure describe
-    # the loop that will actually exist.
-    stored_message, _ = redact_exfiltration_urls(message)
-    stored_message, _ = redact_credentials(stored_message)
-    gated = autonudge.infer_monitor(stored_message, time.time()) if gate else None
-    # ``banner`` is CONDITIONAL, unlike the fields above: a caller that sets no
-    # banner must see the payload shape it saw before, because the tool's
-    # contract test asserts this dict by EXACT equality. The applier reads it
-    # with ``.get``, so absent and empty mean the same thing there.
-    banner = str(args.get("banner") or "").strip()
-    # Before the payload is built, so the emitted dict is byte-identical to what
-    # it was (its shape is asserted by exact equality in the contract test) and a
-    # certain refusal is reported instead of acknowledged.
-    retained_stop_refusal = _retained_stop_refusal("monitor_start", sk)
-    if retained_stop_refusal:
-        return retained_stop_refusal
-    payload: dict[str, Any] = {
-        "message": message,
-        "idle_secs": interval_secs,
-        "max_cycles": max_cycles,
-        "max_runtime_secs": max_runtime_secs,
-        "gate": gate,
-    }
-    if banner:
-        payload["banner"] = banner
-    # Say whether this loop will be GATED, in the ack, at the surface that armed
-    # it. This calls the SCHEDULER'S OWN decision function rather than
-    # re-deriving the answer from the target: a subject can infer cleanly and
-    # still fail to form a valid monitor, so a second evaluation could claim a
-    # gate the loop never got -- and a disclosure that can be wrong is worse than
-    # none. Without any disclosure the ack promises a plain re-injection "every
-    # {interval}s", which for a gated loop is untrue, and this whole change
-    # exists because a cadence change nobody could see had no effect.
-    return _emit_directive(
-        "monitor_start",
-        payload,
-        (
-            "Monitor loop requested on this session: "
-            + (
-                f"observing {gated.target} every {interval_secs}s and "
-                "re-injecting the message only when it changes, so quiet cycles "
-                "cost no turn"
-                + (f" and the {max_cycles} cap counts delivered turns" if max_cycles else "")
-                if gated is not None
-                else f"the message will re-inject every {interval_secs}s"
-            )
-            + " (user messages defer a due "
-            "fire to their turn's end without restarting the countdown)"
-            + (f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap")
-            + (f", wall-clock budget {max_runtime_secs}s" if max_runtime_secs else "")
-            + ". End your turn now. Arming happens when this turn's result is "
-            "processed, so this ack cannot confirm it; the outcome is reported "
-            'as a transcript notice on this session — "Automation loop armed: '
-            'loop <id> … next wake …" or "Automation loop NOT armed: <reason> '
-            "[status N]\" — and the applier's own result replaces this text in "
-            "the transcript. If the notice says NOT armed, read the reason "
-            "before trying again. Only a live dashboard/Slack/Discord/Webex "
-            "session can host a loop. Call autonudge_stop when "
-            "the exit condition is met; hitting the cap is a runaway backstop, "
-            "not a finish. From dashboard, Slack, or Discord, use monitor_update "
-            "if the instruction goes stale; on Webex, stop this loop and create "
-            "a new finite one instead."
-        ),
-    )
-
-
-def _monitor_context_refusal(
-    tool_name: str,
-    session_key: str,
-    message: str,
-    *,
-    error: str = "unsupported_session_binding",
-) -> str:
-    """Return a failed tool result and retain the security-relevant refusal."""
-    mcp_core.sel().log_tool_invocation(
-        session_key=session_key or "mcp_core",
-        source="mcp",
-        tool_name=tool_name,
-        outcome="denied",
-        error=error,
-    )
-    return f"Error: {message}"
-
-
-def _retained_stop_refusal(tool_name: str, session_key: str) -> str:
-    """Refuse IN BAND when a retained stop makes this call certain to be refused.
-
-    An arming tool answers the model over its own pipe DURING the turn, while
-    ``apply_session_directive`` runs after the turn's result is processed. A
-    refusal decided there cannot reach the model in the arming turn, so without a
-    preflight the model ends its turn holding a "requested" ack for a monitor that
-    does not exist. This is the only place that can say otherwise in time.
-
-    Reads the endpoint ``monitor_inspect`` already reads, so it grants no new
-    capability, and NEVER writes: clearing retained evidence stays owner-only.
-
-    SKIPPED ENTIRELY during gateway-side directive replay
-    (:func:`mcp_core.directive_capture_active`). That run discards this text, and
-    the read would be a blocking loopback request to the very gateway whose event
-    loop is synchronously waiting on this call -- it could not be answered, and
-    every co-hosted session would stall until the timeout. Nothing is lost: the
-    preflight exists to reach the MODEL in the arming turn, which only the MCP-side
-    run can do, and the turn boundary still refuses the arm on its own.
-
-    Fails OPEN -- an unreadable gateway returns ``""`` and the caller emits as
-    before, because failing closed would let one bad read block all arming. The
-    turn boundary remains the enforcement point, so both TOCTOU directions are
-    benign: a record cleared just after the read costs one retryable refusal, and
-    one written just after it is still caught authoritatively.
-
-    Scope is the STRUCTURED record, the only one the endpoint reports an outcome
-    for. A paused legacy timer loop reads as ``autonudge_loop`` with no outcome
-    and is left to the existing create-only refusal.
-    """
     if mcp_core.directive_capture_active():
+        # A gateway-side replay (``derive_directive``) runs this handler on the
+        # gateway's own event loop, where a blocking loopback POST back to the
+        # same gateway can never be serviced and freezes every session
+        # (reproduced: the loop-stall watchdog fired). This tool publishes no
+        # directive, so the replay has nothing to derive.
         return ""
+    return _ask_question_blocking(sk, questions)
+
+
+#: Consecutive failed wait round-trips (gateway restarting, transport error)
+#: before the tool gives up and reports the question withdrawn.
+ASK_WAIT_MAX_ERRORS = 6
+#: Tries for the open POST when its response is lost in transit.
+ASK_OPEN_ATTEMPTS = 3
+
+
+def _ask_question_blocking(sk: str, questions: list[dict]) -> "str | DeferredTool":
+    """Show a blocking card on *sk*'s slot and return the outcome as tool text.
+
+    Always returns the tool result: the user's answers, how the card ended, or
+    why no card could be shown. There is no fallback path. Blocking for the
+    CALLER: the wait for the answer is an :class:`_AskStep` the dispatch loop
+    times, so an unanswered card holds no worker thread (``DeferredTool``).
+    """
+    # Client-chosen id: a retried open is idempotent, so a lost response never
+    # leaves a card on screen that this call cannot collect.
+    ask_id = uuid.uuid4().hex
+    opened: Any = None
+    for attempt in range(ASK_OPEN_ATTEMPTS):
+        opened = mcp_core._post(
+            "/api/agent-ask/open", {"questions": questions, "ask_id": ask_id}, session_key=sk
+        )
+        if not (isinstance(opened, dict) and opened.get("transport_error")):
+            break
+        if attempt + 1 < ASK_OPEN_ATTEMPTS:
+            mcp_core.time.sleep(1)
+    if isinstance(opened, dict) and opened.get("transport_error"):
+        # Unknown whether the gateway took it: poll by our own id, which finds
+        # the card if it was shown and returns not-found if it never was.
+        return _await_ask_outcome(sk, ask_id, confirmed=False)
+    if not (isinstance(opened, dict) and opened.get("ask_id") == ask_id):
+        code = (opened.get("code") or "") if isinstance(opened, dict) else ""
+        if isinstance(opened, dict) and "clients" in opened and not opened.get("clients"):
+            why = "no dashboard window is open to show it"
+        elif code == "slot_not_found":
+            why = "this session has no open dashboard tab"
+        else:
+            why = f"the dashboard refused it ({code or 'unreachable'})"
+        logger.warning("ask_question: card not shown: %s", why)
+        return _not_shown(why)
+    return _await_ask_outcome(sk, ask_id, confirmed=True)
+
+
+def _not_shown(why: str) -> str:
+    return (
+        f"The question card could not be shown: {why}. Ask in plain text "
+        "instead, or end your turn with an [OPTIONS: a | b | c] tag."
+    )
+
+
+def _withdraw_ask(sk: str, ask_id: str) -> None:
+    """Best-effort withdraw of *ask_id*'s card.
+
+    Runs from the deferred's ``cancel()`` hook, which the dispatch loop calls on
+    its own thread, so the POST carries the short keepalive bound: a gateway
+    that is not answering must not hold pings and every other parked call for
+    ``_post``'s default timeout.
+    """
     try:
-        reading = mcp_core._get("/api/autonudge/session-monitor", session_key=session_key)
+        mcp_core._post(
+            f"/api/agent-ask/{ask_id}/withdraw",
+            {},
+            session_key=sk,
+            timeout=_WAIT_PING_TIMEOUT_SECS,
+        )
     except Exception:
-        return ""
-    if not isinstance(reading, dict) or reading.get("error") or reading.get("active"):
-        return ""
-    monitor = reading.get("monitor")
-    if not isinstance(monitor, dict):
-        return ""
-    outcome = monitor.get("outcome")
-    if not retained_outcome_blocks_rearm(outcome, monitor.get("stopped_reason")):
-        return ""
-    target = str(monitor.get("target") or "").strip()
-    return (
-        f"{tool_name}: NOT applied — this session's automation binding still holds a "
-        f"STOPPED monitor"
-        + (f" on {target}" if target else "")
-        + f" whose outcome ({outcome}) is retained as evidence, so a re-arm here is "
-        "refused and nothing would be watched. The record is deliberately not "
-        "replaceable by an agent: only the session's owner can clear it, from the "
-        "dashboard's goal/automation popover (Clear), after which this call will "
-        "succeed. Tell the user that is the one step needed, and do NOT report "
-        "monitoring as started. Use monitor_inspect to read the retained record."
-    )
+        pass
 
 
-def _parsed_pull_request_target(kind: Any, raw: Any) -> tuple[str, str]:
-    """Return ``(url, "")`` for a valid PR target, or ``("", "Error: …")``.
+def _await_ask_outcome(sk: str, ask_id: str, *, confirmed: bool) -> DeferredTool:
+    """Poll *ask_id* until it ends; *confirmed* is False when the open's reply was lost."""
+    return _AskStep(sk, ask_id, confirmed=confirmed)
 
-    Guard normalization before emitting a new monitor. Target normalization
-    raises, and a raise from a directive tool escapes this server's own return path: the
-    JSON-RPC layer turns it into the same ``"Error: …"`` text, but past the point
-    that tags a decline as a refusal, so the consumer reads it as a LOST directive
-    marker and fires the WARNING reserved for a transport regression. Guarding the
-    two sites separately would let a second site go unguarded; a
-    single seam makes the next caller correct by construction.
+
+class _AskStep(DeferredTool):
+    """The parked half of :func:`ask_question`: one wait slice per step.
+
+    The server's fixed ``ASK_WAIT_SLICE_SECS`` long-poll is short enough that
+    every admitted card is polled again within its retention grace even when
+    the step pool is full; the request carries no slice of its own.
     """
-    try:
+
+    def __init__(self, sk: str, ask_id: str, *, confirmed: bool) -> None:
+        self.sk = sk
+        self.ask_id = ask_id
+        self.confirmed = confirmed
+        self.errors = 0
+        self.next_due = mcp_core.time.monotonic()
+
+    def due_at(self) -> float:
+        return self.next_due
+
+    def cancel(self) -> None:
+        # The call ends with no response: a card the gateway still holds must
+        # not keep accepting answers nobody reads.
+        _withdraw_ask(self.sk, self.ask_id)
+
+    def step(self) -> str | None:
+        try:
+            # Resets the stall watchdog and the staleness reaper, exactly as the
+            # ``wait`` tool's ping does. Best-effort: a missed ping costs nothing
+            # the next slice does not repair.
+            mcp_core._post("/api/session-keepalive", {}, session_key=self.sk)
+        except Exception:
+            pass
+        reply = mcp_core._post(
+            f"/api/agent-ask/{self.ask_id}/wait",
+            {},
+            timeout=ASK_WAIT_SLICE_SECS + 15,
+            session_key=self.sk,
+        )
+        status = reply.get("status") if isinstance(reply, dict) else None
+        if status == "pending":
+            self.errors = 0
+            self.confirmed = True
+            self.next_due = mcp_core.time.monotonic()
+            return None
+        if status:
+            return _format_ask_outcome(reply)
+        # A transport error is retried up to ASK_WAIT_MAX_ERRORS slices; a 404 is terminal.
+        self.errors += 1
+        not_found = isinstance(reply, dict) and reply.get("code") == "question_not_found"
+        if not self.confirmed and not_found:
+            return _not_shown("the dashboard did not confirm it")
+        if self.errors >= ASK_WAIT_MAX_ERRORS or not_found:
+            # A card the gateway still holds must not keep accepting answers nobody reads.
+            _withdraw_ask(self.sk, self.ask_id)
+            return (
+                "The question card was withdrawn before the user answered "
+                "(the dashboard restarted or this session's tab was reset). "
+                "Ask again if you still need the answer."
+            )
+        self.next_due = mcp_core.time.monotonic() + 2
+        return None
+
+
+def _format_ask_outcome(reply: dict) -> str:
+    """The tool result for a finished ask. Stable wording: agents branch on it."""
+    status = reply.get("status")
+    if status == "answered":
+        answers = reply.get("answers") or {}
+        asked = [str(q.get("question") or "") for q in reply.get("questions") or []]
+        # An answer keyed by text the server did not ask is dropped rather than
+        # echoed: only the server's own copy of the question is quoted back.
+        return format_ask_answers((q, str(answers[q])) for q in asked if q in answers)
+    if status == "composer":
         return (
-            normalize_pull_request_target(
-                str(kind),
-                str(raw),
-                gitlab_hosts=KiroCrewConfig.load().dashboard.gitlab_hosts,
-            ),
-            "",
+            "The user replied in chat instead of answering the question card. "
+            "Their message follows as the next user message — read it before "
+            "continuing."
         )
-    except ValueError as exc:
-        return "", f"Error: {exc}"
-
-
-def monitor_watch(name: str, args: dict[str, Any]) -> str:
-    """Validate and emit a session-bound structured monitor directive."""
-    args = validate_tool_args(args, MONITOR_WATCH_SCHEMA)
-    sk, strict_err = mcp_core.require_strict_session_key(
-        "monitor_watch requires an authenticated strict session binding. "
-        "No process-ancestor fallback is used."
-    )
-    if not sk:
-        return _monitor_context_refusal("monitor_watch", sk, strict_err)
-    if mcp_core._structured_monitor_binding_key(sk) is None:
-        return _monitor_context_refusal(
-            "monitor_watch",
-            sk,
-            "monitor_watch only works from within a dashboard, Slack, or "
-            f"Discord session (current session_key={sk!r}).",
-        )
-    target, target_error = _parsed_pull_request_target(args["kind"], args["target"])
-    if target_error:
-        return target_error
-    # AFTER target validation so a malformed target keeps its own specific error,
-    # and before the directive is emitted so the model is never handed a
-    # success-shaped ack for an arm a retained stop guarantees will be refused.
-    retained_stop_refusal = _retained_stop_refusal("monitor_watch", sk)
-    if retained_stop_refusal:
-        return retained_stop_refusal
-    payload = {
-        "kind": args["kind"],
-        "target": target,
-        "objective": args["objective"],
-        "cadence_secs": int(args.get("interval_secs") or DEFAULT_MONITOR_CADENCE_SECS),
-        "max_runtime_secs": int(args.get("max_runtime_secs") or DEFAULT_MONITOR_RUNTIME_SECS),
-        "max_agent_turns": int(args.get("max_agent_turns") or DEFAULT_MONITOR_AGENT_TURNS),
-        "max_tokens": int(args.get("max_tokens") or DEFAULT_MONITOR_TOKENS),
-        "max_provider_errors": int(
-            args.get("max_provider_errors") or DEFAULT_MONITOR_PROVIDER_ERRORS
-        ),
-        "wake_instructions": str(args.get("wake_instructions") or "").strip(),
-    }
-    return _emit_directive(
-        "monitor_watch",
-        payload,
-        # Non-committal by construction: arming happens when this turn's result is
-        # processed, so no text produced here can confirm it. It must therefore name
-        # the NOT-armed notice, or a refused arm reads as monitoring started.
-        "Structured monitor requested for this session; application is still pending. "
-        "End your turn now. Arming happens when this turn's result is processed, so "
-        "this ack cannot confirm it; the outcome is reported as a transcript notice "
-        'on this session — "Automation loop armed: …" or "Automation loop NOT armed: '
-        '<reason> [status N]". If the notice says NOT armed, read the reason before '
-        "trying again — a monitor the user stopped is retained as evidence and only "
-        "its owner can clear it. Do NOT report monitoring as started on the strength "
-        "of this ack; verify with monitor_inspect at the start of a later turn or in "
-        "response to a later wake, and treat active=true with a matching target as "
-        "the only confirmation.",
-    )
-
-
-def monitor_inspect(name: str, args: dict[str, Any]) -> str:
-    """Read the monitor bound to a verified strict session identity.
-
-    Reports whichever shape the session's loop holds: a structured monitor's
-    full record, or a legacy timer loop's presence and cadence reading. The
-    session-monitor endpoint returns the legacy reading under ``autonudge_loop``,
-    so a widened gate here lets a caller verify a timer loop is armed and firing
-    rather than being told inspection is unavailable for its session type.
-    """
-    validate_tool_args(args, MONITOR_INSPECT_SCHEMA)
-    sk, strict_err = mcp_core.require_strict_session_key(
-        "Monitor inspection unavailable without an authenticated strict session binding. "
-        "No process-ancestor fallback is used."
-    )
-    if not sk:
-        return _monitor_context_refusal("monitor_inspect", sk, strict_err)
-    # The GENERAL binding, so a legacy timer loop resolves here too (this also
-    # admits a Webex session, which hosts a legacy loop but no structured
-    # monitor). The endpoint distinguishes the shapes.
-    if mcp_core._autonudge_binding_key(sk) is None:
-        return _monitor_context_refusal(
-            "monitor_inspect",
-            sk,
-            f"monitor_inspect is unavailable for this session type ({sk!r}).",
-        )
-    result = mcp_core._get("/api/autonudge/session-monitor", session_key=sk)
-    if result.get("error"):
-        return f"Error: Monitor inspection failed: {result['error']}"
-    return json.dumps(
-        _compact_monitor_inspection(result),
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
-
-
-def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
-    """Project the browser record into a bounded, agent-oriented status."""
-    compact = {key: result.get(key) for key in ("enabled", "active", "monitor_id") if key in result}
-    # Surface the auto-nudge loop reading so a caller can tell an armed
-    # auto-nudge loop from nothing armed. It is already a bounded, fixed-key dict
-    # from the handler, so it passes through as-is; absent on responses that
-    # predate the field, and None when no loop is armed.
-    if "autonudge_loop" in result:
-        compact["autonudge_loop"] = result.get("autonudge_loop")
-    raw = result.get("monitor")
-    if not isinstance(raw, dict):
-        compact["monitor"] = None
-        return compact
-    fields = (
-        "kind",
-        "target",
-        "objective",
-        "budgets",
-        "cadence_secs",
-        "last_observation_status",
-        "last_observation_reason_code",
-        "last_fingerprint",
-        "last_wake_fingerprint",
-        "wake_in_flight",
-        "wake_count",
-        "token_usage_known",
-        "agent_turns",
-        "input_tokens",
-        "output_tokens",
-        "probe_count",
-        "provider_error_count",
-        "consecutive_provider_errors",
-        "last_probe_at",
-        "created_ts",
-        "last_decision",
-        "last_wake_reason_code",
-        "last_provider_error",
-        "next_probe_at",
-        "outcome",
-        "stopped_reason",
-        "user_stop_reason",
-        "stopped_at",
-    )
-    monitor = {key: raw.get(key) for key in fields}
-    observation = raw.get("last_observation")
-    if isinstance(observation, dict):
-        observation_fields = (
-            "state",
-            "draft",
-            "head_revision",
-            "mergeability",
-            "review_decision",
-            "blocking_review",
-            "unresolved_review_threads",
-            "review_threads_complete",
-        )
-        summary = {key: observation.get(key) for key in observation_fields}
-        checks = observation.get("checks")
-        if isinstance(checks, dict):
-            check_summary: dict[str, Any] = {}
-            for status in ("failed", "pending", "unknown"):
-                values = checks.get(status)
-                if isinstance(values, list):
-                    check_summary[status] = values[:MAX_MONITOR_CHECK_NAMES]
-                    check_summary[f"{status}_count"] = len(values)
-            passed = checks.get("passed")
-            if isinstance(passed, list):
-                check_summary["passed_count"] = len(passed)
-            summary["checks"] = check_summary
-        monitor["observation"] = summary
-    compact["monitor"] = monitor
-    return compact
-
-
-def monitor_stop(name: str, args: dict[str, Any]) -> str:
-    """Emit a durable stop directive for this session's monitor, without caller identity."""
-    args = validate_tool_args(args, MONITOR_STOP_SCHEMA)
-    sk, strict_err = mcp_core.require_strict_session_key(
-        "monitor_stop requires an authenticated strict session binding. "
-        "No process-ancestor fallback is used."
-    )
-    if not sk:
-        return _monitor_context_refusal("monitor_stop", sk, strict_err)
-    # The GENERAL binding, so a legacy timer loop resolves here too (and a Webex
-    # session, which hosts a legacy loop but no structured monitor). A stop that
-    # answered only for a structured monitor is a silent no-op on the loop shape
-    # most sessions run: the caller believes the loop ended while it keeps
-    # firing. The applier routes by the resolved loop's shape.
-    if mcp_core._autonudge_binding_key(sk) is None:
-        return _monitor_context_refusal(
-            "monitor_stop",
-            sk,
-            "monitor_stop only works from within a dashboard, Slack, Discord, "
-            f"or Webex session (current session_key={sk!r}).",
-        )
-    return _emit_directive(
-        "monitor_stop",
-        {"reason": str(args.get("reason") or "").strip()},
-        "Monitor stop requested for this session.",
-    )
-
-
-def monitor_update(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, MONITOR_UPDATE_SCHEMA)
-    # STRICT resolution via the shared gate, same rationale as
-    # monitor_start/autonudge_stop: this mutates persistent loop state that
-    # drives unattended turns, so a subagent must not PID-walk into the
-    # parent's identity and rewrite the parent session's instruction.
-    sk, strict_err = mcp_core.require_strict_session_key(
-        "monitor_update requires an authenticated strict session binding. "
-        "No process-ancestor fallback is used."
-    )
-    # Stateless: short-circuit only un-appliable contexts; the
-    # consumer resolves the loop by its own session and patches it.
-    if not sk:
-        return _monitor_context_refusal("monitor_update", sk, strict_err)
-    if mcp_core._structured_monitor_binding_key(sk) is None:
-        return _monitor_context_refusal(
-            "monitor_update",
-            sk,
-            "monitor_update only works from within a dashboard, Slack, or "
-            f"Discord session (current session_key={sk!r}).",
-        )
-    patch: dict[str, Any] = {}
-    if args.get("message") is not None:
-        new_message = str(args["message"]).strip()
-        if not new_message:
-            return "monitor_update: message must not be empty (omit it to leave unchanged)."
-        patch["message"] = new_message
-    if args.get("interval_secs") is not None:
-        patch["idle_secs"] = int(args["interval_secs"])
-    if args.get("max_cycles") is not None:
-        patch["max_cycles"] = int(args["max_cycles"])
-    if args.get("max_runtime_secs") is not None:
-        patch["max_runtime_secs"] = int(args["max_runtime_secs"])
-    if args.get("target") is not None:
-        # The authoritative applier validates the target against the retained kind.
-        patch["target"] = str(args["target"])
-    if args.get("objective") is not None:
-        patch["objective"] = str(args["objective"])
-    for field in ("max_agent_turns", "max_tokens", "max_provider_errors"):
-        if args.get(field) is not None:
-            patch[field] = int(args[field])
-    if args.get("wake_instructions") is not None:
-        patch["wake_instructions"] = str(args["wake_instructions"]).strip()
-    # Blank is KEPT here, unlike ``message`` above which rejects it: a loop with
-    # no instruction cannot fire, but a loop with no banner is the default state,
-    # so "" has to round-trip as a request to CLEAR. Dropping it as "unchanged"
-    # would make a banner set once impossible to remove without tearing the loop
-    # down and losing its cycle count.
-    if args.get("banner") is not None:
-        patch["banner"] = str(args["banner"]).strip()
-    if not patch:
-        mcp_core.sel().log_tool_invocation(
-            session_key=sk, source="mcp", tool_name="monitor_update", outcome="noop"
-        )
+    if status == "queued":
         return (
-            "monitor_update: nothing to change — pass at least one of "
-            "message, interval_secs, max_cycles, max_runtime_secs."
+            "The user replied in chat instead of answering the question card. "
+            "Their message is queued and arrives once this turn ends — finish "
+            "what you can without the answer, then read it."
         )
-    # AFTER the empty-patch no-op so that more specific answer still wins. A
-    # retained stop cannot be updated either: ``update_monitor`` answers "not found
-    # or already terminal" at the turn boundary, and unlike the two arming
-    # directives a refused monitor_update gets no transcript notice at all — so
-    # without this the retarget failure is invisible to both the model and the user.
-    retained_stop_refusal = _retained_stop_refusal("monitor_update", sk)
-    if retained_stop_refusal:
-        return retained_stop_refusal
-    return _emit_directive(
-        "monitor_update",
-        {"patch": patch},
-        f"Monitor-loop update requested for this session "
-        f"({', '.join(sorted(patch))}); it applies only if a loop is active "
-        "here, so do not assume the change landed.",
-    )
-
-
-def session_handoff(name: str, args: dict[str, Any]) -> str:
-    """Start a trackable Kiro Crew session for work handed over from outside.
-
-    Stateless, and it must be: the caller is an EXTERNAL agent, so it has no
-    Kiro Crew session identity at all (no gateway-injected session key, no signed
-    host pid). Resolving one would either fail closed or — with the lenient
-    resolver — walk process ancestors and attach to whatever slot happens to be
-    up the tree. Creating a NEW session is what makes identity unnecessary here:
-    there is nothing to target and nothing to spoof, and the session that appears
-    belongs to the operator rather than to the caller.
-
-    Every decision lives behind ``POST /api/chat/handoff`` in
-    ``dashboard.handoff`` — the operator opt-in, the closed origin set, the
-    project vetting, the unattended wiring, the audit — so this tool and the HTTP
-    route cannot drift apart.
-    """
-    args = validate_tool_args(args, SESSION_HANDOFF_SCHEMA)
-    d = mcp_core._post(
-        "/api/chat/handoff",
-        {
-            "origin": args["origin"],
-            "prompt": args["prompt"],
-            "project": args.get("project", ""),
-            "title": args.get("title", ""),
-            "agent": args.get("agent", ""),
-            "model": args.get("model", ""),
-            "start": args.get("start", True),
-        },
-    )
-    if d.get("error"):
-        # The refusal text is operator-facing and already actionable (it names
-        # the setting to turn on), so it is surfaced verbatim rather than
-        # flattened into a generic failure the caller cannot act on.
-        return f"Error: {d['error']}"
-    slot = str(d.get("slot", ""))
-    if d.get("started"):
-        state = "running now"
-    elif d.get("queued"):
-        state = "queued behind the session's current turn"
-    else:
-        state = "created and parked (nothing sent)"
-    where = f" in {d['project']}" if d.get("project") else ""
+    if status == "dismissed":
+        return "The user dismissed the question card without answering."
+    if status == "expired":
+        return (
+            "The user did not answer the question card in time, so it was "
+            "withdrawn. Continue without the answer or ask again."
+        )
     return (
-        f"Handed over to Kiro Crew session {slot}{where} — {state}. "
-        "It runs under the approval grants already in place and will stop at any "
-        "tool they do not cover; tell the user to open that session in Kiro Crew "
-        "to watch or continue it."
+        "The question card was withdrawn before the user answered. "
+        "Ask again if you still need the answer."
     )
 
 
-def set_project(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, SET_PROJECT_SCHEMA)
-    # Stateless: the session-aware consumer (chat_runner) applies the
-    # project change to ITS OWN slot — no session identity resolved here.
-    return _emit_directive(
-        "set_project",
-        {"project": args.get("path", ""), "clear": bool(args.get("clear"))},
-        "Project change requested for this session; if the path is valid "
-        "and permitted it takes effect on the next message (cold-start with "
-        "the new CWD and project steering). An invalid or sensitive path is "
-        "rejected when this turn's result is processed.",
-    )
-
-
-def reset_conversation(name: str, args: dict[str, Any]) -> str:
-    validate_tool_args(args, RESET_CONVERSATION_SCHEMA)
-    # Stateless: the session-aware consumer (chat_runner) queues the discard
-    # against ITS OWN slot — no session identity resolved here. The payload is
-    # empty because there is nothing to choose: a caller asking for a clean
-    # context always wants a clean one, and the HTTP route carries a replay flag
-    # for the rare caller that does not.
-    return _emit_directive(
-        "reset_conversation",
-        {},
-        "Conversation reset requested for this session; if this turn is "
-        "user-facing it takes effect at a turn boundary, and the next message "
-        "starts with no memory of this conversation. The transcript is not "
-        "deleted — write down anything that must carry forward.",
-    )
-
-
-def chat_tag(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, CHAT_TAG_SCHEMA)
-    # Stateless: the session-aware consumer (chat_runner) applies the tag change
-    # to ITS OWN slot — no session identity resolved here. The payload carries
-    # only the requested change; the consumer resolves ids against the live
-    # vocabulary, enforces the per-tag agent policy, and returns the resulting
-    # tag list (which is also this tool's READ path for the session's tags).
-    payload: dict[str, Any] = {}
-    if args.get("set_state"):
-        payload["set_state"] = args["set_state"]
-    if args.get("add"):
-        payload["add"] = args["add"]
-    if args.get("remove"):
-        payload["remove"] = args["remove"]
-    return _emit_directive(
-        "chat_tag",
-        payload,
-        "Board tag change requested for this session; if the tags are "
-        "agent-writable it takes effect when this turn's result is processed, "
-        "and the result reports the session's resulting tags. A human-only tag, "
-        "an unknown tag, or a headless caller (cron/subagent) is refused.",
-    )
-
-
-def suggest_followup(name: str, args: dict[str, Any]) -> str:
-    args = validate_tool_args(args, SUGGEST_FOLLOWUP_SCHEMA)
-    items = args.get("items") or []
-    # Stateless: the session-aware consumer (chat_runner) broadcasts
-    # the card to ITS OWN slot; no session identity resolved here. The card
-    # is broadcast-only (dropped if no client attached), so the confirmation
-    # stays cautious — restate the follow-ups in reply text if they matter.
-    return _emit_directive(
-        "suggest_followup",
-        {"items": items},
-        "Follow-up card requested for this session. It is delivered to a "
-        "connected dashboard client only; if none is attached the card is "
-        "dropped, so restate the follow-ups in your reply text if they "
-        "must not be lost. End your turn now.",
-    )
-
-
-HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
+HANDLERS: dict[str, Callable[[str, dict[str, Any]], "str | DeferredTool"]] = {
     "task_run": task_run,
     "wait": wait,
     "route_crew": route_crew,
@@ -2020,6 +618,7 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "register_hook": register_hook,
     "autonudge_stop": autonudge_stop,
     "ask_question": ask_question,
+    "nothing_to_do": nothing_to_do,
     "monitor_start": monitor_start,
     "monitor_watch": monitor_watch,
     "monitor_inspect": monitor_inspect,
@@ -2031,3 +630,94 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "chat_tag": chat_tag,
     "suggest_followup": suggest_followup,
 }
+
+
+# The owner modules, lowest layer first: the first one that binds a name answers a read
+# of it. ``kiro_crew.mcp_tools.control.<name>`` stays the import path and the patch
+# surface for every name they define: a patch through this module reaches every owner
+# that binds the name (see :mod:`kiro_crew._facade_mirror`). Owners never import this
+# module. New work goes to the owner of its responsibility:
+#
+#   ``control_parts.schemas`` -- every control descriptor and the two config reads that shape one.
+#   ``control_parts.directive`` -- the directive emitter and the tools whose effect is one directive.
+#   ``control_parts.monitor`` -- the monitoring-loop tools: arm, inspect, update and stop a loop.
+#   ``control_parts.handoff`` -- the external-agent handoff tool (``session_handoff``).
+_OWNERS = (
+    "kiro_crew.mcp_tools.control_parts.schemas",
+    "kiro_crew.mcp_tools.control_parts.directive",
+    "kiro_crew.mcp_tools.control_parts.monitor",
+    "kiro_crew.mcp_tools.control_parts.handoff",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name this module serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.mcp_tools.control_parts.directive import _emit_directive  # noqa: F401
+    from kiro_crew.mcp_tools.control_parts.monitor import (  # noqa: F401
+        _arming_preflight_refusal,
+        _compact_monitor_inspection,
+        _monitor_context_refusal,
+        _parsed_pull_request_target,
+    )
+    from kiro_crew.mcp_tools.control_parts.schemas import (  # noqa: F401
+        _ARMING_STEER_STRUCTURED_BY_DEFAULT,
+        _ARMING_STEER_STRUCTURED_ON_CONDITION,
+        _WATCH_STEER_STRUCTURED_DEFAULT,
+        _WATCH_WORK_LEDGER,
+        _ending_clause,
+        _prefers_structured_arming,
+        schemas,
+    )
+if TYPE_CHECKING:  # names the owners import from elsewhere in kiro_crew, still served here
+    from kiro_crew import autonudge, session_directive  # noqa: F401
+    from kiro_crew.autonudge_judge import ending_phrase, screen_phrase  # noqa: F401
+    from kiro_crew.config.loader import KiroCrewConfig  # noqa: F401
+    from kiro_crew.mcp_tools._limits import (  # noqa: F401
+        _MONITOR_DEFAULT_MAX_CYCLES,
+        _MONITOR_DEFAULT_MAX_RUNTIME_SECS,
+    )
+    from kiro_crew.monitoring.limits import (  # noqa: F401
+        DEFAULT_RUNTIME_CEILING_SECS,
+        runtime_ceiling_secs,
+    )
+    from kiro_crew.monitoring.models import (  # noqa: F401
+        DEFAULT_MONITOR_AGENT_TURNS,
+        DEFAULT_MONITOR_CADENCE_SECS,
+        DEFAULT_MONITOR_PROVIDER_ERRORS,
+        DEFAULT_MONITOR_RUNTIME_SECS,
+        DEFAULT_MONITOR_TOKENS,
+        MAX_MONITOR_AGENT_TURNS,
+        MAX_MONITOR_CADENCE_SECS,
+        MAX_MONITOR_CHECK_NAMES,
+        MAX_MONITOR_PROVIDER_ERRORS,
+        MAX_MONITOR_TOKENS,
+        MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
+        MIN_MONITOR_CADENCE_SECS,
+        PULL_REQUEST_SUPERSEDED_INCOMPLETE_IDENTITY,
+        retained_outcome_blocks_rearm,
+    )
+    from kiro_crew.monitoring.registry import (  # noqa: F401
+        publicly_armable_kinds,
+        publicly_armable_objectives,
+    )
+    from kiro_crew.monitoring.targets import normalize_pull_request_target  # noqa: F401
+    from kiro_crew.validation import (  # noqa: F401
+        AUTONUDGE_STOP_SCHEMA,
+        CHAT_TAG_SCHEMA,
+        MONITOR_INSPECT_SCHEMA,
+        MONITOR_START_SCHEMA,
+        MONITOR_STOP_SCHEMA,
+        MONITOR_UPDATE_SCHEMA,
+        MONITOR_WATCH_SCHEMA,
+        NOTHING_TO_DO_SCHEMA,
+        RESET_CONVERSATION_SCHEMA,
+        SET_PROJECT_SCHEMA,
+        SUGGEST_FOLLOWUP_SCHEMA,
+        validate_judge_spec,
+    )

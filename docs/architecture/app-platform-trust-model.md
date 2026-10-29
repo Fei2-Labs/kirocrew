@@ -20,7 +20,9 @@ The `AppContext` capability permissions (`permissions.cron`,
 currently has no runtime call site and must not be treated as an execution
 boundary. Neither mechanism restricts imports, filesystem, network, or
 subprocess use by the loaded module. There is currently **no process-level
-sandbox** around app code itself.
+sandbox** around in-process app code (hooks and route handlers). An app's
+separate backend process is launched under the OS sandbox's `standard` mode
+where a sandbox backend applies, which does not bound the in-process modules.
 
 > **Admitting and enabling an app is therefore equivalent to running that code with the same privileges as Kiro Crew itself.** Only trust apps you trust.
 
@@ -45,15 +47,15 @@ sandbox** around app code itself.
     window. It reports what it could not stop rather than claiming success, and
     `agent.apps_allow_third_party` is excluded from the generic settings PATCH so
     no caller reaches the setting without that sequencing.
-  - `start_enabled_app_backends` revokes at boot: an app the ceiling no longer
-    admits has its agents, skills, and MCP entries deregistered and its backend
+  - `start_enabled_app_backends` revokes at boot: an app the ceiling does not
+    admit has its agents, skills, and MCP entries deregistered and its backend
     is not spawned. A policy tightened while the gateway was down therefore does
     not survive the restart.
   - the per-backend liveness watch re-reads the ceiling each sweep and stops a
-    backend that is no longer admitted. This is what closes the CLI and the
+    backend the ceiling does not admit. This is what closes the CLI and the
     hand-edited `config.json`: both reach the setting without passing the
-    endpoint, and before this a backend they un-trusted kept serving until the
-    next boot. Bound is one `_HEALTH_WATCH_INTERVAL`.
+    endpoint, and without the watch a backend they un-trust would keep serving
+    until the next boot. Bound is one `_HEALTH_WATCH_INTERVAL`.
 
   Scope is the executing surface. An app with its own `agent.apps_trusted` grant
   keeps running while that grant stands — the blanket flag does not govern it — and
@@ -91,12 +93,13 @@ sandbox** around app code itself.
   **An unreadable policy is a deny.** `third_party_execution_allowed` fails closed,
   and the config loader falls back to defaults when neither config file can be read,
   where the flag is `false` and the trusted set is empty. Because the liveness watch
-  re-reads the ceiling each sweep, that answer now stops running backends rather than
-  only refusing new admissions. This is deliberate: sparing a backend whenever the
+  re-reads the ceiling each sweep, that answer stops running backends as well as
+  refusing new admissions. This is deliberate: sparing a backend whenever the
   policy cannot be read would make deleting `config.json` the one operator action
-  guaranteed to stop nothing. It is the mirror of the `installed.json` rule above --
-  that file belongs to the app, so its absence must not spare it, and this file
-  belongs to the operator, so its absence is honoured as a withdrawal. The cost is
+  guaranteed to stop nothing. An app's `installed.json` is app-writable,
+  so it is consulted only to remove trust and never spares a backend from the
+  ceiling; `config.json` belongs to the operator, so its absence is honoured as a
+  withdrawal. The cost is
   availability and it is bounded: a genuine transient read fault stops third-party
   backends for that sweep, and they return at the next gateway start.
 
@@ -104,11 +107,11 @@ sandbox** around app code itself.
 
 App tokens (minted via the `X-App-Secret` exchange at `POST /api/apps/<name>/token`)
 are **deny-by-default** confined by the dashboard auth middleware
-(`token_auth.py` `_enforce_app_scope` / `app_token_path_allowed` / `_app_owns_path` /
+(`token_auth_app_scope.py` `_enforce_app_scope` / `app_token_path_allowed` / `_app_owns_path` /
 `_app_api_allowlist`) to the app's own namespace (`/apps/<name>/*` and
 `/api/apps/<name>/*`) plus the API path prefixes the app declares in its manifest
 `permissions.api` allowlist. Every other path returns `403`, and the
-`/apps/<name>/api` reverse proxy (`apps/routes.py` `handle_app_api_proxy`)
+`/apps/<name>/api` reverse proxy (`apps/routes_proxy.py` `handle_app_api_proxy`)
 independently re-checks that the caller's token app matches the target app, since
 the proxy signs requests with the target app's secret.
 
@@ -118,10 +121,36 @@ an existing local user-owned session, choose a generated response option,
 approve or deny a pending tool request, or change that session's approval mode.
 The app still needs the matching route in `permissions.api`. Cron, system,
 remote, member-mode, and other apps' sessions are denied; an app's existing
-access to its own slots is unchanged. Mode changes must name a live allowed
-slot, which prevents one app call from silently widening every session, and are
-limited to Normal, Reads and Trust. YOLO is a process-global override: an app
-token can neither arm it nor revoke it, so it stays a dashboard-only decision.
+access to its own slots is unchanged. A message the app sends runs as a turn: a
+send carrying a change to the session's agent binding, persona settings, or a
+harness slash command is refused before anything is written or queued
+(`chat_handlers._deny_app_session_settings`, pinned by
+`test_chat_mode_security_send`). The send cannot steer, its row is echoed to the
+user's open tabs, it neither starts nor names the session's auto-title (a
+queued send restored after a gateway restart has lost that attribution), and
+its SSE stream ends with the app's own turn. Mode changes must name a live allowed slot, which
+prevents one app call from silently widening every session, and are limited to
+Normal, Reads and Trust. YOLO is a process-global override: an app token can
+neither arm it nor revoke it, so it stays a dashboard-only decision.
+
+Every `/api/chat/slots/{slot}/*` route takes the same ownership decision before
+its handler runs (`dashboard/slot_ownership.py`). This holds because a
+`permissions.api` entry such as `/api/chat` matches that whole family. An app
+passes only on a slot it owns that still runs on its own session (a task-runner
+result tab's own session is the one minted for it). Approving or
+denying a pending tool request is the one per-slot action the `sessionApproval`
+grant also reaches on a local user session. Any other app, on any other slot,
+gets the same `404 slot_not_found` a missing slot gets, and a refusal for a slot
+that exists is recorded in the security-event log. The decision is keyed by the
+slot in the path. The `/api/approvals` and `/api/sessions` families and
+`POST /v1/chat/completions` are outside it. A request to `POST /api/chat`,
+`POST /api/chat/slots` or the resume route that names a slot to create is
+decided the same way before anything is created. A persisted transcript that
+records a different app, or none, counts as not owned, and so do member, cron and
+workflow keys and a key that matches a live slot's key or transcript only up to
+letter case. So an app cannot reopen a closed user session as
+its own, or hold a key a scheduled job's results are bound to. The full contract
+is in [App Kit platform contracts §13](../system-specs/modules/app-kit-platform.md).
 
 The guard reads the live manifest so that removing the flag revokes the grant at
 once. Live-read is not a grant path for this flag: `update_app` compares the old
@@ -140,16 +169,56 @@ The consent surface is the **detail page**: the update notice and the Permission
 card. The trust dialog opens only when repo trust is missing, so re-enabling an
 already-trusted app from a store card shows no dialog. At first install the
 dialog's session row comes from the catalog or registry projection, not from the
-cloned manifest, so a projection that omits the flag under-discloses. Two sibling
-grants are also live-enforced and are not re-gated on update today
-(`permissions.api`, `permissions.events`). A generic widened-permission check
-across install, update and enable, and a structured enable-route refusal that
-drives the dialog, are tracked in issue #11212.
+cloned manifest, so a projection that omits the flag under-discloses. The two
+sibling grants that are live-enforced, `permissions.api` and
+`permissions.events`, are held back on update instead of disabling the app: the
+app stores the set the owner approved in its own `approved-grants.json`, every enforcement point grants
+only declared entries in that set, and the owner approves added entries from
+the detail page (App Kit platform contracts §13). The first-install disclosure of those
+two lists, and a structured enable-route refusal that drives the dialog, are
+not covered.
+
+A `permissions.api` entry is a prefix match, so declaring `/api/approvals` or
+`/api/sessions` would otherwise reach every session on the instance. The
+following routes therefore decide an app caller (an app token, or an
+internal-secret caller whose calling session belongs to an app) by ownership:
+
+- `POST /api/approvals/{id}/{action}` applies the slot approve route's rule. An
+  app without `sessionApproval` is refused with the same 403 as
+  `POST /api/chat/slots/{slot}/approve`, even for its own slots. An app holding
+  the grant may resolve a request on its own slot or on a local user session,
+  and the id must name exactly one such pending request: request ids can recur
+  across sessions, so an ambiguous id is refused and the slot route, which names
+  the session, decides it. Background (state-level) approvals raised by cron,
+  autonudge, subagents or the task runner are never resolvable by an app, and
+  `GET /api/approvals`, which lists only those, is empty for an app.
+- `GET /api/sessions`, `GET /api/sessions/search`, `GET /api/sessions/{key}`,
+  `GET /api/sessions/{key}/meta`,
+  `DELETE /api/sessions/{key}` and `POST /api/sessions/summarize` reach only
+  transcripts whose metadata records the calling app as owner. A delete is also
+  refused when the live slot it would close is not the app's, because the slot
+  is the server-side record. The whole-history routes, `DELETE /api/sessions`
+  and `GET /api/sessions/clearable/count`, are refused to an app outright.
+- The metadata owner is recorded by the app's own slot, so an app cannot open a
+  new slot over a transcript it does not own: a named `POST /api/chat/slots`,
+  a `POST /api/chat` that would create its slot, and a resume answer the same
+  404 there. A new name or the app's own transcript is admitted.
+
+Apart from the missing-grant 403, every refusal is the same 404 a missing target
+returns, and the reason goes to the Security Event Log, as does every access
+the ownership rule allows. Ownership is judged again under the transcript lock
+at the read, summary or delete itself, so a transcript replaced after the first
+check is refused rather than served. Dashboard-user callers
+are unaffected. Other routes under the `/api/sessions` prefix are not
+ownership-judged yet: `/api/sessions/{id}/agents*` (subagent results),
+`POST /api/sessions/restart`, and the `usage`, `health` and `memory` reads. An
+app that declares `/api/sessions/*` still reaches them; narrowing them is a
+tracked follow-up.
 
 ### WebSocket event scope (CWE-269)
 
 `/api/ws` is a *third* surface reachable with the same app token, and it is scoped
-separately: connecting no longer grants the full event stream. On connect the socket
+separately: connecting does not grant the full event stream. On connect the socket
 records the caller's app identity and its manifest `permissions.events` declarations
 (`dashboard/ws.py`), and every fan-out is filtered per socket at a single chokepoint
 (`DashboardState._send_ws_all` → `_ws_client_allowed` → `dashboard/ws_event_scope.py`).
@@ -183,7 +252,7 @@ Widening does not work
 that way — a new scope reaches the app only on its next connection, so an edit can
 never hand a live session more than it opened with.
 
-Filtering a frame's payload is not always enough: the `slots` re-push is a full slot list,so it is re-filtered per app on the send path (`DashboardState._serialize_for_client`) —
+Filtering a frame's payload is not always enough: the `slots` re-push is a full slot list, so it is re-filtered per app on the send path (`DashboardState._serialize_for_client`) —
 but its *envelope* also carries global safety-posture booleans that no slot scope narrows.
 `yolo` (is the blanket approval override active) is therefore gated by the same `yolo`
 declaration that gates the `yolo_expired` event, and `channelTrusted` is withheld from app
@@ -213,11 +282,14 @@ because there the manifest being trusted is not the one being widened.
 Two payloads need more than a yes/no gate. The `slots` re-push carries every slot, so it
 is re-filtered per app in `_serialize_for_client` (failing closed to an empty list); and
 the log ring-buffer replay plus the subagent reconnect replay write to the socket
-directly, so `ws.py` gates those at the source.
+directly, so `ws.py` gates those at the source. A persisted subagent run is replayed
+or listed only when its recorded app equals the slot's current owner, failing closed
+both ways, because slot keys are not namespaced by app; see
+[subagent](../system-specs/modules/subagent.md).
 
 Dashboard-user sockets are exempt, identified by a **positive** `is_dashboard_user`
 claim set by the auth middleware — never by the absence of an app claim, which would
-fail *open* on any path that forgot to set it. Because the stream is now filtered,
+fail *open* on any path that forgot to set it. Because the stream is filtered,
 `/api/ws` is implicitly allowed for app tokens (`_APP_TOKEN_IMPLICIT_ALLOW`) rather
 than requiring every app to declare the transport; that grant is recorded in the
 Security Event Log. `/api/status` is **not** implicitly allowed — it has no
@@ -251,7 +323,7 @@ real session key; absence cannot identify the restricted session to the backend.
 
 This is an **HTTP-reach boundary distinct from the in-process module-loading
 privilege**: an app's loaded Python still runs with full gateway privileges (the
-warning above stands), but an app's own HTTP token can no longer reach arbitrary
+warning above stands), but an app's own HTTP token cannot reach arbitrary
 gateway or sibling-app endpoints. Dashboard-user tokens (empty app claim) are never
 subject to this gate.
 

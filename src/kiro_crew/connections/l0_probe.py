@@ -8,7 +8,7 @@ advertises against the ``l0_expectations`` baseline committed in the registry.
 
 It does NOT check challenge shape -- whether an unauthenticated request answers
 401 with a well-formed ``WWW-Authenticate: Bearer resource_metadata=...`` -- and
-a green run says nothing about it. Two of the seven registry providers fail that
+a green run says nothing about it. Some registry providers fail that
 today while serving perfectly good metadata (Stripe omits the parameter, Vercel
 answers HTTP 500), so it needs its own baseline of known exceptions and is
 deliberately a separate follow-up (L0b). Do not read this probe as covering it.
@@ -33,7 +33,7 @@ never reports drift, and without it the exit code reflects this run alone, which
 is what a human debugging a single provider locally wants. A FATAL error -- one
 that stops the probe before it reaches any provider -- always exits non-zero
 immediately and leaves the streak state untouched, because it is evidence about
-the probe, not about seven providers.
+the probe, not about the providers.
 """
 
 from __future__ import annotations
@@ -67,6 +67,11 @@ DEFAULT_CONCURRENCY = 4
 DEFAULT_TIMEOUT_SECONDS = 10.0
 _MAX_METADATA_BYTES = 16 * 1024
 _READ_CHUNK_BYTES = 4096
+# One response header line may be this long. aiohttp's default is 8190 bytes, and
+# Mixpanel's issuer sends a ~12 KB Content-Security-Policy on its metadata
+# document, so the default refused the response before the body was read. The
+# body keeps its own _MAX_METADATA_BYTES bound.
+_MAX_HEADER_FIELD_BYTES = 32 * 1024
 _REPORT_SCHEMA_VERSION = 3
 _PROBE_SCOPE = "static-metadata"
 _WELL_KNOWN_AUTHORIZATION = "/.well-known/oauth-authorization-server"
@@ -504,12 +509,21 @@ def build_report(
     return report
 
 
+def client_session() -> aiohttp.ClientSession:
+    """The HTTP client every probe and record run fetches through."""
+
+    return aiohttp.ClientSession(
+        auto_decompress=False,
+        max_field_size=_MAX_HEADER_FIELD_BYTES,
+    )
+
+
 async def run_probe(
     *, concurrency: int, timeout_seconds: float, record: bool = False
 ) -> list[ProbeResult]:
     """Probe every registry entry, launch-gated or not."""
 
-    async with aiohttp.ClientSession(auto_decompress=False) as session:
+    async with client_session() as session:
         return await probe_all(
             session,
             get_all_registry_providers(),
@@ -651,8 +665,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         results = asyncio.run(run_probe(concurrency=args.concurrency, timeout_seconds=args.timeout))
     except Exception as error:
         # A fatal error stopped the probe before it reached any provider, so it
-        # is evidence about the PROBE, not about the providers. Advancing seven
-        # streaks would spend two nights of the drift budget on a broken runner
+        # is evidence about the PROBE, not about the providers. Advancing every
+        # provider's streak would spend two nights of the drift budget on a broken runner
         # and then blame the providers; leave the state exactly as it was and
         # fail now, where it is legible.
         report = build_report([], fatal=error)

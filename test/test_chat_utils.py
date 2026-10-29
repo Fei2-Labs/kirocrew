@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import sys
 
 import pytest
 
 import kiro_crew.dashboard.chat_utils as chat_utils
+from kiro_crew.dashboard import display_battery
 from kiro_crew.dashboard.chat_utils import (
     _history_key_for,
     _normalize_model,
@@ -18,6 +22,7 @@ from kiro_crew.dashboard.chat_utils import (
     _validate_tool_name,
     is_deprecated_model,
 )
+from kiro_crew.security.exfil import scoped_exempt_hosts
 from kiro_crew.trust_patterns import extract_bash_command
 
 
@@ -226,6 +231,304 @@ class TestRedactForDisplay:
     def test_redacts_credentials(self):
         result = _redact_for_display("key AKIAIOSFODNN7EXAMPLE here")
         assert "AKIAIOSFODNN7EXAMPLE" not in result
+
+    def test_content_cache_misses_when_exempt_host_set_changes(self, monkeypatch):
+        """The exempt-host set is an input to the battery, so it is part of the key."""
+        chat_utils._clear_display_redaction_cache()
+        calls = {"n": 0}
+        real = chat_utils.redact_exfiltration_urls
+
+        def counted(value, **kwargs):
+            calls["n"] += 1
+            return real(value, **kwargs)
+
+        monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted)
+        exempt = {"hosts": frozenset()}
+        monkeypatch.setattr(chat_utils, "_exempt_exact_hosts", lambda: exempt["hosts"])
+
+        text = (
+            "see https://docs.contoso.sharepoint.com/x?token=abcdefghijklmnopqrstuvwxyz0123456789"
+        )
+        chat_utils._redact_for_display(text)
+        chat_utils._redact_for_display(text)
+        assert calls["n"] == 1, "same text under the same exempt set is a hit"
+
+        exempt["hosts"] = frozenset({"docs.contoso.sharepoint.com"})
+        chat_utils._redact_for_display(text)
+        assert calls["n"] == 2, "a changed exempt set must miss the cache"
+        chat_utils._redact_for_display(text)
+        assert calls["n"] == 2
+
+    def test_content_cache_reuses_byte_identical_real_redactions(self, monkeypatch):
+        chat_utils._clear_display_redaction_cache()
+        real_exfiltration = chat_utils.redact_exfiltration_urls
+        real_credentials = chat_utils.redact_credentials
+        calls = {"exfiltration": 0, "credentials": 0}
+
+        def counted_exfiltration(value, **kwargs):
+            calls["exfiltration"] += 1
+            return real_exfiltration(value, **kwargs)
+
+        def counted_credentials(value):
+            calls["credentials"] += 1
+            return real_credentials(value)
+
+        monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(chat_utils, "redact_credentials", counted_credentials)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted_credentials)
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        messages = [
+            {
+                "role": "assistant",
+                "content": f"reply {i} contains {secret}",
+                "cls": "msg msg-a",
+                "ts": f"2026-09-23T22:00:{i % 60:02d}Z",
+                "meta": {"mid": "same-mid", "tool_input": f"input {i} {secret}"},
+                "variants": [{"content": f"variant {i} {secret}"}],
+            }
+            for i in range(128)
+        ]
+
+        cold = _prepare_messages(messages, running=False, live_child="")
+        cold_calls = dict(calls)
+        warm = _prepare_messages(messages, running=False, live_child="")
+        cold_wire = json.dumps(cold, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        warm_wire = json.dumps(warm, sort_keys=True, ensure_ascii=False).encode("utf-8")
+
+        assert warm_wire == cold_wire
+        assert sum(cold_calls.values()) > 0
+        assert calls == cold_calls, "warm render must run zero underlying redactors"
+        assert cold[0]["content"] != cold[1]["content"], "content, not mid, keys the cache"
+        entries, accounted_bytes = chat_utils._display_redaction_cache_info()
+        assert entries <= chat_utils._DISPLAY_REDACTION_CACHE_MAX_ENTRIES
+        assert accounted_bytes <= chat_utils._DISPLAY_REDACTION_CACHE_MAX_BYTES
+
+    def test_content_cache_key_is_fixed_size_and_fully_accounted(self, monkeypatch):
+        """Every byte an entry retains is counted, and the key never carries a container.
+
+        The exempt-host set is an INPUT to the digest, not a component of the key: a
+        key that held the set itself would retain one container per entry outside
+        the byte cap. So the key footprint must not move with the size of that set,
+        and the accounted bytes must cover the digest and the redacted output.
+        """
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        texts = [f"row {i} carries {secret}" for i in range(64)]
+
+        def key_footprint(hosts: frozenset[str]) -> int:
+            chat_utils._clear_display_redaction_cache()
+            monkeypatch.setattr(chat_utils, "_exempt_exact_hosts", lambda: hosts)
+            for text in texts:
+                chat_utils._redact_for_display(text)
+            entries, accounted_bytes = chat_utils._display_redaction_cache_info()
+            assert entries == len(texts)
+            summed = 0
+            footprint = 0
+            for key, (redacted, entry_bytes) in chat_utils._display_redaction_cache.items():
+                digest, length = key
+                assert isinstance(digest, bytes) and len(digest) == 32
+                assert isinstance(length, int)
+                for part in key:
+                    assert not isinstance(part, (frozenset, set, list, dict, tuple))
+                assert hosts not in key
+                retained = len(digest) + len(redacted.encode("utf-8", errors="surrogatepass"))
+                assert entry_bytes >= retained, "an entry must count what it retains"
+                summed += entry_bytes
+                footprint += sys.getsizeof(key) + sum(sys.getsizeof(part) for part in key)
+            assert accounted_bytes == summed, "the cache total is the sum of its entries"
+            return footprint
+
+        small = key_footprint(frozenset())
+        large = key_footprint(frozenset(f"tenant-{i}.example.com" for i in range(2000)))
+        assert large == small, "the key footprint is independent of the exempt-host set"
+
+    def test_content_cache_holds_one_full_page_of_rows(self, monkeypatch):
+        """A page at the backend row ceiling renders warm with zero underlying redactions.
+
+        Each row costs several entries (content, every meta string, every variant),
+        so an entry cap sized below one full page evicts the page's own head before
+        the next render reaches it and every render runs cold.
+        """
+        chat_utils._clear_display_redaction_cache()
+        real_exfiltration = chat_utils.redact_exfiltration_urls
+        real_credentials = chat_utils.redact_credentials
+        calls = {"exfiltration": 0, "credentials": 0}
+
+        def counted_exfiltration(value, **kwargs):
+            calls["exfiltration"] += 1
+            return real_exfiltration(value, **kwargs)
+
+        def counted_credentials(value):
+            calls["credentials"] += 1
+            return real_credentials(value)
+
+        monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(chat_utils, "redact_credentials", counted_credentials)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted_credentials)
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        rows = chat_utils.SLOT_DETAIL_MAX_LIMIT
+        messages = [
+            {
+                "role": "assistant",
+                "content": f"reply {i} contains {secret}",
+                "cls": "msg msg-a",
+                "ts": f"2026-09-23T22:{(i // 60) % 60:02d}:{i % 60:02d}Z",
+                "meta": {
+                    "mid": f"mid-{i}",
+                    "tool_name": f"tool-{i}",
+                    "tool_input": f"input {i} {secret}",
+                    "tool_output": f"output {i} {secret}",
+                },
+                "variants": [{"content": f"variant {i} {secret}"}],
+            }
+            for i in range(rows)
+        ]
+
+        cold = _prepare_messages(messages, running=False, live_child="")
+        cold_calls = dict(calls)
+        warm = _prepare_messages(messages, running=False, live_child="")
+
+        assert warm == cold
+        assert sum(cold_calls.values()) >= rows * 6
+        assert calls == cold_calls, "a full page must render warm with zero redactor calls"
+        entries, accounted_bytes = chat_utils._display_redaction_cache_info()
+        # Strings the battery left unchanged (mid, tool_name) are held as clean
+        # verdicts; the ones it changed are held as outputs. Every one is cached.
+        verdicts = len(chat_utils._display_clean_young) + len(chat_utils._display_clean_old)
+        assert entries + verdicts >= rows * 6, "six distinct strings per row, every one cached"
+        assert entries <= chat_utils._DISPLAY_REDACTION_CACHE_MAX_ENTRIES
+        assert accounted_bytes <= chat_utils._DISPLAY_REDACTION_CACHE_MAX_BYTES
+
+    def test_long_session_renders_warm_with_zero_redactions(self, monkeypatch):
+        """A whole long session (the unlimited slot-detail read) renders warm.
+
+        Real long sessions hold hundreds of thousands of strings, almost all of
+        which the battery leaves unchanged. When only the output cache held them,
+        its entry cap evicted the session's head before the next render reached
+        it, so every view of a long session ran the full battery again.
+        """
+        chat_utils._clear_display_redaction_cache()
+        real_exfiltration = chat_utils.redact_exfiltration_urls
+        real_credentials = chat_utils.redact_credentials
+        calls = {"n": 0}
+
+        def counted_exfiltration(value, **kwargs):
+            calls["n"] += 1
+            return real_exfiltration(value, **kwargs)
+
+        def counted_credentials(value):
+            calls["n"] += 1
+            return real_credentials(value)
+
+        monkeypatch.setattr(chat_utils, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(chat_utils, "redact_credentials", counted_credentials)
+        monkeypatch.setattr(display_battery, "redact_exfiltration_urls", counted_exfiltration)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted_credentials)
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        rows = 12_000
+        messages = [
+            {
+                "role": "assistant",
+                "content": f"reply {i}" + (f" leaks {secret}" if i % 50 == 0 else " is plain"),
+                "cls": "msg msg-a",
+                "ts": f"2026-09-23T22:{(i // 60) % 60:02d}:{i % 60:02d}Z",
+                "meta": {"mid": f"mid-{i}", "tool_name": f"tool-{i}"},
+            }
+            for i in range(rows)
+        ]
+
+        cold = _prepare_messages(messages, running=False, live_child="")
+        cold_calls = calls["n"]
+        warm = _prepare_messages(messages, running=False, live_child="")
+
+        assert json.dumps(warm) == json.dumps(cold)
+        assert cold_calls >= rows * 3
+        assert calls["n"] == cold_calls, "a repeat render of the session must not redact again"
+        assert secret not in json.dumps(warm), "a hit still serves the redacted output"
+
+        # Content that changes is a different key: it is redacted again.
+        messages[1] = {**messages[1], "content": f"edited {secret}"}
+        again = _prepare_messages(messages, running=False, live_child="")
+        assert calls["n"] > cold_calls
+        assert secret not in again[1]["content"]
+
+    def test_clean_verdicts_are_bounded_by_two_generations(self, monkeypatch):
+        chat_utils._clear_display_redaction_cache()
+        monkeypatch.setattr(chat_utils, "_DISPLAY_CLEAN_GENERATION", 100)
+        for i in range(1_000):
+            assert chat_utils._redact_for_display(f"plain text {i}") == f"plain text {i}"
+            assert len(chat_utils._display_clean_young) <= 100
+            assert len(chat_utils._display_clean_old) <= 100
+        # The oldest verdicts are gone, so their text is checked by the battery again.
+        calls = {"n": 0}
+        real = chat_utils.redact_credentials
+
+        def counted(value):
+            calls["n"] += 1
+            return real(value)
+
+        monkeypatch.setattr(chat_utils, "redact_credentials", counted)
+        monkeypatch.setattr(display_battery, "redact_credentials", counted)
+        chat_utils._redact_for_display("plain text 0")
+        chat_utils._redact_for_display("plain text 999")
+        assert calls["n"] == 1
+
+    def test_clean_verdict_does_not_carry_over_a_narrowed_host_set(self, monkeypatch):
+        """A text ending in NUL + host under fewer hosts is not the clean text it mimics.
+
+        The MAC input is ``text + NUL + hosts``, so ``T`` under ``{a, b}`` and
+        ``T + NUL + a`` under ``{b}`` digest the same bytes. Only the input length
+        tells them apart; a verdict without it would serve the second one, whose
+        URL is not exempt, unredacted.
+        """
+        chat_utils._clear_display_redaction_cache()
+        monkeypatch.setattr(chat_utils, "_exempt_exact_hosts", lambda: frozenset())
+        text = (
+            "See https://a.example.com/x?q=" + "abcdefghijklmnopqrstuvwxyz0123456789" * 4 + " end"
+        )
+        with scoped_exempt_hosts(frozenset({"a.example.com", "b.example.com"})):
+            assert chat_utils._redact_for_display(text) == text, "exempt host stays as written"
+
+        mimic = text + "\0a.example.com"
+        with scoped_exempt_hosts(frozenset({"b.example.com"})):
+            first = chat_utils._redact_for_display(mimic)
+            chat_utils._clear_display_redaction_cache()
+            cold = chat_utils._redact_for_display(mimic)
+        assert cold != mimic, "a.example.com is not exempt here, so its URL is redacted"
+        assert first == cold, "a cached verdict must not change what is shown"
+
+    def test_content_cache_key_is_a_keyed_mac_over_text_and_hosts(self, monkeypatch):
+        """The retained digest is keyed on a per-process secret, not a bare hash.
+
+        The digested text is the credential-bearing input the battery redacts, so a
+        bare content hash retained in memory is checkable offline against a guessed
+        plaintext. Under the MAC the same text and host set digest differently under
+        a different key, and the key stays fixed-size with the host set still inside
+        the MAC input.
+        """
+        hosts = frozenset({"docs.contoso.sharepoint.com"})
+        monkeypatch.setattr(chat_utils, "_exempt_exact_hosts", lambda: hosts)
+        text = "key AKIAIOSFODNN7EXAMPLE here"
+        raw = text.encode("utf-8")
+        hosts_bytes = "\0".join(sorted(hosts)).encode("utf-8")
+        (digest, length), input_bytes = chat_utils._display_redaction_cache_key(text)
+        assert len(digest) == 32 and length == len(raw) == input_bytes
+        assert digest != hashlib.sha256(raw + b"\0" + hosts_bytes).digest()
+        assert (
+            digest
+            == hmac.new(
+                chat_utils._DISPLAY_REDACTION_SALT, raw + b"\0" + hosts_bytes, hashlib.sha256
+            ).digest()
+        )
+        assert isinstance(chat_utils._DISPLAY_REDACTION_SALT, bytes)
+        assert len(chat_utils._DISPLAY_REDACTION_SALT) == 32
+
+        monkeypatch.setattr(chat_utils, "_DISPLAY_REDACTION_SALT", b"\x01" * 32)
+        (rekeyed, relength), _ = chat_utils._display_redaction_cache_key(text)
+        assert rekeyed != digest, "a different process key yields a different digest"
+        assert relength == length
 
 
 class TestRedactToolField:

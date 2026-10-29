@@ -69,6 +69,22 @@ function offsetToEditorPosition(contents: string, offset: number): { line: numbe
   }
 }
 
+/** The line ending most of `text`'s line breaks use: CRLF, a lone CR, or LF,
+ *  which is also the answer on a tie and for text with no line break. */
+function dominantLineEnding(text: string): '\n' | '\r\n' | '\r' {
+  let lf = 0, crlf = 0, cr = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    if (c === 10) lf++
+    else if (c === 13) {
+      if (text.charCodeAt(i + 1) === 10) { crlf++; i++ } else cr++
+    }
+  }
+  if (crlf > lf && crlf >= cr) return '\r\n'
+  if (cr > lf && cr > crlf) return '\r'
+  return '\n'
+}
+
 function applyMarkers(editor: Editor<undefined>, markers: EditorMarker[] | undefined): void {
   if (markers == null) return
   editor.setMarkers(
@@ -126,12 +142,27 @@ export const PierreEditorImpl = forwardRef<PierreEditorHandle, {
   const fallbackSelectionRef = useRef<{ start: number; end: number; direction: 'forward' | 'backward' | 'none' } | null>(null)
   const propContentsRef = useRef(file.contents)
   const latestContentsRef = useRef(file.contents)
+  const seedContentsRef = useRef(file.contents)
+  const seedKeyRef = useRef(contentCacheKey(file.name, file.contents))
+  const reseedCountRef = useRef(0)
   const remountDraftRef = useRef<string | null>(null)
   const previousPierreActiveRef = useRef(pierreActive)
   const [fallbackDraft, setFallbackDraft] = useState(file.contents)
   const propChanged = propContentsRef.current !== file.contents
-  if (propChanged) {
-    propContentsRef.current = file.contents
+  if (propChanged) propContentsRef.current = file.contents
+  // A prop equal to the buffer this editor last emitted is the caller echoing
+  // its own edit, and leaves the session alone; only a change from outside
+  // (a disk read, Cancel, Refresh) reseeds it.
+  if (propChanged && file.contents !== latestContentsRef.current) {
+    seedContentsRef.current = file.contents
+    // Cancel can put back exactly the text Pierre is showing (the seed, or a
+    // recovery remount's draft); the key must still move so Pierre drops the
+    // edited document and shows the restored one.
+    const nextKey = contentCacheKey(file.name, file.contents)
+    const renderedKey = remountDraftRef.current === null
+      ? seedKeyRef.current
+      : contentCacheKey(file.name, remountDraftRef.current)
+    seedKeyRef.current = nextKey === renderedKey ? `${nextKey}#${++reseedCountRef.current}` : nextKey
     latestContentsRef.current = file.contents
     remountDraftRef.current = null
     if (fallbackDraft !== file.contents) setFallbackDraft(file.contents)
@@ -162,28 +193,83 @@ export const PierreEditorImpl = forwardRef<PierreEditorHandle, {
   // that changed on every keystroke would clear Pierre's dirty render cache
   // mid-edit. Later edits live in `latestContentsRef`, which the next
   // recovery snapshot reads, so nothing typed after a remount is lost.
-  const editorContents = remountDraftRef.current ?? file.contents
-  // The seam owns Pierre's cacheKey contract so no caller has to. Pierre's
-  // `isLineCacheForFile` trusts `cacheKey` alone and never re-reads contents, so
-  // a caller that hands a stable session key (to hold the caret across keystrokes)
-  // would leave a grown buffer reusing a stale N-row highlight array — Return then
-  // indexes past it and throws "Line doesnt exist". Deriving the key from the live
-  // contents here fixes that for every caller at once (CodeEditor, PapyrusEditor,
-  // and any future one). It also does NOT churn the remount: contentCacheKey is
-  // per-contents but the mounted editor generation keys off options identity, not
-  // this cacheKey, so the dirty render cache and caret survive typing.
-  const editorFile = useMemo<FileContents>(
-    () => ({ ...file, contents: editorContents, cacheKey: contentCacheKey(file.name, editorContents) }),
-    [file, editorContents],
+  const remountDraft = remountDraftRef.current
+  const editorContents = remountDraft ?? seedContentsRef.current
+  const editorKey = remountDraft === null ? seedKeyRef.current : contentCacheKey(file.name, remountDraft)
+  // The seam owns Pierre's `file` contract so no caller has to. While an edit
+  // session is live, Pierre's own document owns the text, and the `file` handed
+  // to it is ONE object per session, keyed by the seed:
+  //  - a new `cacheKey` makes the editor rebuild its document and reset its
+  //    selections, so a key that moved with each keystroke would drop focus and
+  //    put the caret at line 1 every time;
+  //  - a new object under the same key cannot be sequenced against the render
+  //    Pierre schedules for the object it still holds, so that render reads the
+  //    old object's text, and once the document has grown past it Return throws
+  //    "Line doesnt exist".
+  // A new object appears, with a content-derived key, only on an external source
+  // change or a worker-recovery remount.
+  //
+  // The object's `contents`, though, mirror the buffer: the editor's `onChange`
+  // writes each new text into this same object. Pierre reads a file's `contents`
+  // again whenever it renders one without a grammar, which it does for a
+  // plain-text file on every line added or removed (an untagged chat fence is
+  // `snippet.txt`, and a fence tag that is not a file extension -- `python`,
+  // `typescript` -- also resolves to plain text), and for any file whose grammar
+  // is still loading. From a frozen seed that render puts the removed line back
+  // on screen while the document keeps the edit, so the next keystroke lands on
+  // the line that moved into that row. A highlighted file reads its rows from
+  // the editor's render cache instead and never looks at `contents` again, so
+  // the mirror costs it nothing. Pierre treats the held file's `contents` as the
+  // session's text as well: it writes the edited lines back into that object
+  // whenever it drops the render cache. `name`, `lang` and `header` are read
+  // when the object is created: every caller changes them only by remounting.
+  const sessionFileRef = useRef<FileContents | null>(null)
+  let editorFile = sessionFileRef.current
+  if (editorFile === null || editorFile.cacheKey !== editorKey) {
+    editorFile = {
+      name: file.name,
+      contents: editorContents,
+      ...(file.lang === undefined ? {} : { lang: file.lang }),
+      ...(file.header === undefined ? {} : { header: file.header }),
+      cacheKey: editorKey,
+    }
+  }
+  sessionFileRef.current = editorFile
+  // The live-diff surface keeps the opening text, as before: its renderer
+  // re-parses the pair whenever the baseline changes, and the premise above
+  // (the renderer re-reads the held file and writes edits back into it) is
+  // the single-file renderer's.
+  const diffNewFile = useMemo<FileContents>(
+    () => ({
+      name: file.name,
+      contents: editorContents,
+      ...(file.lang === undefined ? {} : { lang: file.lang }),
+      ...(file.header === undefined ? {} : { header: file.header }),
+      cacheKey: editorKey,
+    }),
+    [file.name, file.lang, file.header, editorContents, editorKey],
+  )
+  // A baseline with LF line endings only (the file panel's HEAD body, read
+  // with universal newlines) marks every line of a CRLF document changed, so
+  // the baseline takes the line ending most of the opening text uses. From
+  // the opening text, never the live buffer: a new baseline makes Pierre
+  // rebuild the document from the opening text, so a baseline that followed
+  // the buffer (an edit that removes every line break would flip it) would
+  // throw the session's edits away. The opening text changes only on a reseed
+  // or a recovery remount, which rebuild the document anyway.
+  const baseEol = useMemo(() => dominantLineEnding(editorContents), [editorContents])
+  const baseContents = useMemo(
+    () => (diffBase == null || baseEol === '\n' ? diffBase : diffBase.replace(/\r\n?|\n/g, baseEol)),
+    [diffBase, baseEol],
   )
   const baseFile = useMemo<FileContents | null>(
-    () => (diffBase == null
+    () => (baseContents == null
       ? null
-      : { name: file.name, contents: diffBase, cacheKey: contentCacheKey(file.name, diffBase, surfaceId + ':edit-base') }),
-    [diffBase, file.name, surfaceId],
+      : { name: file.name, contents: baseContents, cacheKey: contentCacheKey(file.name, baseContents, surfaceId + ':edit-base') }),
+    [baseContents, file.name, surfaceId],
   )
   const renderLiveDiff = diffBase !== undefined
-    && isPierreFilePairWithinBudget(baseFile, editorFile)
+    && isPierreFilePairWithinBudget(baseFile, diffNewFile)
   const editorRef = useRef<Editor<undefined> | null>(null)
   /** A jump requested before Pierre bound its editor, replayed on attach. */
   const pendingJumpRef = useRef<{ line: number; endLine?: number } | null>(null)
@@ -250,8 +336,15 @@ export const PierreEditorImpl = forwardRef<PierreEditorHandle, {
         }
       },
       onChange(changed) {
-        latestContentsRef.current = changed.contents
-        onChangeRef.current(changed.contents)
+        // `contents` is a getter that joins the whole document: read it once.
+        const contents = changed.contents
+        latestContentsRef.current = contents
+        // The editor reports the change before it re-renders, so the held
+        // file carries the new text for every render this change triggers,
+        // Pierre's own included.
+        const session = sessionFileRef.current
+        if (session !== null) session.contents = contents
+        onChangeRef.current(contents)
         reportCursor()
       },
     }),
@@ -325,7 +418,7 @@ export const PierreEditorImpl = forwardRef<PierreEditorHandle, {
             <MultiFileDiff
               key="diff"
               oldFile={baseFile}
-              newFile={editorFile}
+              newFile={diffNewFile}
               edit
               editorOptions={editorOptions}
               options={resolvedDiff}
@@ -337,7 +430,9 @@ export const PierreEditorImpl = forwardRef<PierreEditorHandle, {
         </Virtualizer>
         </PierreShell>
       ) : (
-        <div className="grid h-full w-full grid-rows-[auto_minmax(0,1fr)]">
+        // Same `className` as the Virtualizer branch: the caller's size cap
+        // must hold whichever surface is on screen.
+        <div className={`grid h-full w-full grid-rows-[auto_minmax(0,1fr)] ${className ?? ''}`}>
           <textarea
             ref={fallbackRef}
             aria-label={file.name}

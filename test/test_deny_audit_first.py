@@ -1,11 +1,13 @@
 """Audit-first ordering on deny paths (SEL write precedes wire I/O).
 
 Every deny path answers the permission request over the ACP stdin pipe and
-records the decision to SEL. The pipe write is unbounded: a backend that stops
-reading stdin blocks ``reject_tool`` -> ``_send_response`` -> ``stdin.drain()``
-until the turn deadline cancels the coroutine. When the SEL write is sequenced
-AFTER that await, cancellation destroys the audit record: the permission
-decision was made, acted on locally, and never audited.
+records the decision to SEL. The pipe write can fail or stall: a backend that
+stops reading stdin parks ``reject_tool`` -> ``_send_response`` ->
+``stdin.drain()`` until either the write bound raises ``AcpProcessDied``
+(test_deny_bounded_write.py) or, on a build without that bound, the turn
+deadline cancels the coroutine. When the SEL write is sequenced AFTER that
+await, cancellation destroys the audit record: the permission decision was
+made, acted on locally, and never audited.
 
 The invariant these tests pin: **the SEL audit write must
 precede any wire I/O for that decision** — record the decision first, then
@@ -37,6 +39,7 @@ from unittest import mock
 import pytest
 
 import kiro_crew.dashboard.chat_runner as chat_runner
+from kiro_crew.acp.client import AcpProcessDied
 from kiro_crew.dashboard.chat_runner import (
     _reject_hook_blocked,
     _reject_hook_error,
@@ -66,6 +69,8 @@ class _StalledRejectClient:
     """A backend that answered nothing since the decision: reject stalls."""
 
     supports_steer = True
+    # The deny path reads the refusal answer, which a kiro-family client shares.
+    supports_refusal_steer = True
 
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -200,6 +205,75 @@ class TestAuditSurvivesStalledPipe:
             )
 
 
+class _RaisingRejectClient(_StalledRejectClient):
+    """The bounded write gave up: reject raises instead of parking forever."""
+
+    async def reject_tool(self, request_id) -> None:
+        self.calls.append("reject")
+        raise AcpProcessDied(f"ACP stdin stalled while delivering response to req={request_id!r}")
+
+
+class TestAuditSurvivesBoundedWriteFailure:
+    """With the rejection write bounded, the stall surfaces as AcpProcessDied
+    instead of a hang. The audit record must still exist, and the exception must
+    propagate untouched so the runner's session-reset recovery engages."""
+
+    @pytest.mark.asyncio
+    async def test_hook_blocked_audit_exists_and_the_stall_propagates(self):
+        with mock.patch.object(chat_runner, "sel") as sel_factory:
+            audit = sel_factory.return_value
+            client = _RaisingRejectClient()
+            with pytest.raises(AcpProcessDied, match="stdin stalled"):
+                await _reject_hook_blocked(
+                    client,
+                    _Slot(),
+                    _Event(),
+                    session_key="s",
+                    pre_hook_results=["BLOCKED: unsafe shell pattern"],
+                    refusal_reasons=[],
+                    refusal_notices=None,
+                )
+            assert client.calls == ["reject"]
+            assert audit.log_tool_invocation.called
+            kwargs = audit.log_tool_invocation.call_args.kwargs
+            assert kwargs["outcome"] == "hook_blocked"
+            assert kwargs["request_id"] == "req-1"
+
+    @pytest.mark.asyncio
+    async def test_invalid_tool_audit_exists_and_the_stall_propagates(self):
+        with mock.patch.object(chat_runner, "sel") as sel_factory:
+            audit = sel_factory.return_value
+            with pytest.raises(AcpProcessDied):
+                await _reject_invalid_tool(
+                    _RaisingRejectClient(),
+                    _Slot(),
+                    _Event(),
+                    session_key="s",
+                    error=ValueError("tool name failed validation"),
+                    refusal_reasons=[],
+                    refusal_notices=None,
+                )
+            assert audit.log_tool_invocation.called
+            assert audit.log_tool_invocation.call_args.kwargs["outcome"] == "denied"
+
+    @pytest.mark.asyncio
+    async def test_hook_error_audit_exists_and_the_stall_propagates(self):
+        with mock.patch.object(chat_runner, "sel") as sel_factory:
+            audit = sel_factory.return_value
+            with pytest.raises(AcpProcessDied):
+                await _reject_hook_error(
+                    _RaisingRejectClient(),
+                    _Slot(),
+                    _Event(),
+                    session_key="s",
+                    error="hook raised",
+                    refusal_reasons=[],
+                    refusal_notices=None,
+                )
+            assert audit.log_tool_invocation.called
+            assert audit.log_tool_invocation.call_args.kwargs["outcome"] == "hook_error"
+
+
 class TestHealthyPathUnchanged:
     """Control: with a live pipe the reorder changes ordering only, not effects."""
 
@@ -259,30 +333,43 @@ class TestEveryDenySiteAuditsBeforeTheWire:
     inline (hook TOOL_DENY, batch cascade, interactive rejection) inside the
     turn coroutine where a unit test cannot reach. Same doctrine as
     TestEveryHostDenyCallSiteIsWired: the coverage claim must be checkable.
-    For each ``await client.reject_tool(`` site, its decision's
+    For each answer site -- ``await client.reject_tool(`` or the
+    ``await _reject_attributed(`` chokepoint call -- its decision's
     ``sel().log_tool_invocation(`` must appear BEFORE it within the site's own
     window (bounded by the nearest preceding wire answer or function def, so
     one site's audit cannot vouch for another's).
     """
 
     RUNNER = pathlib.Path(__file__).resolve().parents[1] / "src/kiro_crew/dashboard/chat_runner.py"
-    REJECT = re.compile(r"^\s*await client\.reject_tool\(")
-    BOUNDARY = re.compile(
-        r"^\s*(?:await client\.approve_tool\(|await client\.reject_tool\(|async def )"
-    )
+    WIRE = r"await (?:client\.reject_tool|_reject_attributed)\("
+    REJECT = re.compile(r"^\s*" + WIRE)
+    BOUNDARY = re.compile(r"^\s*(?:await client\.approve_tool\(|%s|async def )" % WIRE)
+    #: The chokepoint's own reject: it audits nothing because each caller does.
+    CHOKEPOINT = "async def _reject_attributed("
     AUDIT = "log_tool_invocation("
 
     def _lines(self) -> list[str]:
-        return self.RUNNER.read_text(encoding="utf-8").splitlines()
+        return "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(self.RUNNER.with_name("chat_turn").glob("*.py")), self.RUNNER]
+            if turn_file.name != "__init__.py"
+        ).splitlines()
 
     def _reject_sites(self, lines: list[str]) -> list[int]:
-        return [i for i, line in enumerate(lines) if self.REJECT.match(line)]
+        sites, owner = [], ""
+        for i, line in enumerate(lines):
+            if line.startswith("async def ") or line.startswith("def "):
+                owner = line
+            if self.REJECT.match(line) and not owner.startswith(self.CHOKEPOINT):
+                sites.append(i)
+        return sites
 
     def test_the_scan_finds_every_reject_site(self):
         # Count-matched against a plain textual count so a call-shape drift
         # cannot silently drop a site out of the ordering assertion below.
         lines = self._lines()
-        textual = sum("await client.reject_tool(" in line for line in lines)
+        # Minus one: the chokepoint's own reject is excluded by design.
+        textual = sum(len(re.findall(self.WIRE, line)) for line in lines) - 1
         found = len(self._reject_sites(lines))
         assert found == textual, (
             f"the site scan found {found} of {textual} reject sites -- its regex "

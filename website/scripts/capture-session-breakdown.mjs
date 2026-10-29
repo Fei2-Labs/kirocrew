@@ -44,8 +44,7 @@ mkdirSync(OUT, { recursive: true })
 // ---------------------------------------------------------------------------
 // ContextTrace fixtures — one per session key. Shapes match the ContextTrace
 // interface in ContextBreakdownPanel.tsx EXACTLY (slot, turns[], totals,
-// injected_chars, user_chars, estimated_other_chars, peak_context_used,
-// context_window, window_days). Block sizes are CHARS; the composition is what
+// injected_chars, user_chars, peak_context_used, context_window, window_days). Block sizes are CHARS; the composition is what
 // the tree renders, so the per-key mixes are deliberately, visibly different.
 // ---------------------------------------------------------------------------
 
@@ -81,8 +80,6 @@ function makeTrace(slot, turnBlocks, peakFrac) {
     totals,
     injected_chars: injected,
     user_chars: userChars,
-    // The model context Kiro Crew did NOT inject (kiro-cli prompt + tool catalog).
-    estimated_other_chars: Math.round(injected * 0.35),
     peak_context_used: Math.round(window * peakFrac),
     context_window: window,
     window_days: 14,

@@ -4,7 +4,7 @@ import { i18nT } from '../../i18n/t'
  * Shared types for the Apps page (Discover + Library) surfaces.
  *
  * ``RegistryApp`` mirrors the backend ``app-registry.json`` schema (core file
- * or federated external registry index) after ``registry.py`` enrichment:
+ * or federated external registry index) after ``registry_pipeline/`` enrichment:
  *  - ``_registry``: source registry name tagged by ``_load_external_registries``
  *    (absent for core-file entries and for built-ins merged client-side).
  *  - ``featured``: curator flag carried on registry INDEX entries (not
@@ -46,10 +46,10 @@ export type RegistryApp = {
   _registry?: string
   /**
    * Server-computed trust fields — the API trust boundary of
-   * ``/api/apps/registry`` (``_apply_trust_fields`` in ``registry.py``).
-   * Optional only because rows from an older gateway lack them; when
-   * present they are authoritative and the client must not re-derive
-   * trust from ``_registry`` absence.
+   * ``/api/apps/registry`` (``_apply_trust_fields`` in
+   * ``registry_pipeline/catalog.py``). Optional only because rows from an
+   * older gateway lack them; when present they are authoritative and the
+   * client must not re-derive trust from ``_registry`` absence.
    */
   // 'core' is the pre-migration spelling of 'official'; both mean "an app WE
   // list", the bundled index being the offline seed of that list.
@@ -79,6 +79,8 @@ export type InstalledApp = {
   displayName: string
   enabled: boolean
   sessionApprovalConsentPending?: boolean
+  /** Approved api/events entries, present only while an update's new ones await approval. */
+  approvedGrants?: { api?: string[]; events?: string[] }
   installedAt: string
   source?: string
   origin?: string     // "builtin" | "registry" | "local" | "external"
@@ -183,9 +185,9 @@ export function sourceRowKey(row: { name: string; builtin: boolean }): string {
  * Human label for the registry an app came from (trust provenance).
  *
  * The server-computed ``provenance`` field is authoritative
- * (``_apply_trust_fields`` in ``registry.py`` computes it where the
- * ``_registry`` tag is applied and overwrites anything an index publishes).
- * The ``_registry`` tag is still checked FIRST: it is equally
+ * (``_apply_trust_fields`` in ``registry_pipeline/catalog.py`` computes it
+ * where the ``_registry`` tag is applied and overwrites anything an index
+ * publishes). The ``_registry`` tag is still checked FIRST: it is equally
  * server-attached, and a row carrying it is external by construction — so
  * a ``provenance`` value smuggled through an OLDER gateway (which copies
  * index keys verbatim and computes nothing) can never relabel an external
@@ -214,15 +216,15 @@ export function sourceLabel(app: Pick<RegistryApp, '_registry' | 'origin' | 'pro
  * button that runs setup code with gateway privileges.
  *
  * The server-computed ``verified`` field is authoritative when present
- * (``_apply_trust_fields`` in ``registry.py`` overwrites anything an index
- * publishes). ``_registry`` is still rejected BEFORE it: the tag is equally
- * server-attached and the server never emits ``verified: true`` on a tagged
- * row, so this order only differs for a ``verified`` smuggled through an
- * OLDER gateway that copies index keys verbatim — exactly the case that must
- * lose. The ``origin``/``author`` derivation below is the legacy fallback
- * for rows from older gateways that emit neither field; genuine built-ins
- * merged client-side set ``verified: true`` directly and never carry
- * ``_registry``.
+ * (``_apply_trust_fields`` in ``registry_pipeline/catalog.py`` overwrites
+ * anything an index publishes). ``_registry`` is still rejected BEFORE it:
+ * the tag is equally server-attached and the server never emits
+ * ``verified: true`` on a tagged row, so this order only differs for a
+ * ``verified`` smuggled through an OLDER gateway that copies index keys
+ * verbatim — exactly the case that must lose. The ``origin``/``author``
+ * derivation below is the legacy fallback for rows from older gateways that
+ * emit neither field; genuine built-ins merged client-side set
+ * ``verified: true`` directly and never carry ``_registry``.
  */
 export function isVerified(app: Pick<RegistryApp, 'origin' | 'author' | '_registry' | 'verified'>): boolean {
   if (app._registry) return false
@@ -250,8 +252,8 @@ const REGISTRY_SOURCE_PREFIX = 'registry:'
  * the same secondary signal ``manager.py`` accepts for the same question. It is
  * also the fallback when ``source`` is present but not a string: the detail page
  * spreads a CATALOG row into its app object when the installed-record fetch
- * fails, and ``registry.py`` copies index keys verbatim for a row it has not
- * installed, so an external index can publish ``source: {type: "git"}``. The
+ * fails, and ``registry_pipeline/`` copies index keys verbatim for a row it has
+ * not installed, so an external index can publish ``source: {type: "git"}``. The
  * declared type says ``string``, but the payload is untrusted and this runs
  * inside the ``autoAction`` effect — an unguarded ``startsWith`` throws there and
  * Sync never dispatches at all.
@@ -265,27 +267,27 @@ export function isRegistrySourced(app: Pick<InstalledApp, 'source' | 'origin'>):
 /**
  * Sanitize a self-reported GitHub star count for display.
  *
- * Shared by every path that turns a registry payload into a rendered row:
- * `normalizeRegistryApp` (the Discover query boundary) AND `AppDetailPage`'s
- * own row builds, which spread the raw `listRegistry()` payload without going
- * through normalize. An older gateway does not sanitize this field
+ * Internal to `normalizeRegistryApp`: every surface that renders a registry
+ * row (Discover and `AppDetailPage`) normalizes the `listRegistry()` payload
+ * where it is fetched, so this has exactly one caller. An older gateway does not sanitize this field
  * server-side and external indexes are user-supplied JSON, so the client must
  * hold the line alone: only a safe non-negative integer renders (`1e308` is
  * finite but compact-formats into hundreds of digits; `NaN`/`-1`/`3.5` are
  * `typeof number` and would pass a bare typeof gate).
  */
-export function sanitizeStargazersCount(v: unknown): number | undefined {
+function sanitizeStargazersCount(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? v : undefined
 }
 
 /**
  * Normalize a registry row for rendering.
  *
- * ``registry.py`` intentionally yields a MINIMAL index row when an app's
- * ``app.json`` fetch fails (name/repo only, no display fields), and external
- * registries are user-supplied JSON — so display fields can be missing or the
- * wrong type. Every consumer sorts, lowercases, and renders these, so coerce
- * once at the query boundary instead of defending at each call site.
+ * ``registry_pipeline/manifests.py`` intentionally yields a MINIMAL index row
+ * when an app's ``app.json`` fetch fails (name/repo only, no display fields),
+ * and external registries are user-supplied JSON — so display fields can be
+ * missing or the wrong type. Every consumer sorts, lowercases, and renders
+ * these, so coerce once at the query boundary instead of defending at each
+ * call site.
  */
 export function normalizeRegistryApp(raw: RegistryApp): RegistryApp {
   const str = (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback)

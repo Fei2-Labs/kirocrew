@@ -30,6 +30,7 @@ import GithubLogo from './icons/GithubLogo'
 import { Btn } from './ui'
 import ErrorNotice from './ErrorNotice'
 import { copyToClipboard } from '../utils/clipboard'
+import { providerLabel, type KasLoginProvider } from './kasProviderLabel'
 
 import { i18nT } from '../i18n/t'
 
@@ -82,48 +83,9 @@ function openAuthTab(url: string): void {
   }
 }
 
-/**
- * Wire identifiers for the sign-in providers the gateway accepts. Sent verbatim
- * in the POST body — never catalog values, because a translated identifier is
- * not a protocol token.
- */
-export type KasLoginProvider = 'google' | 'github' | 'builder_id' | 'idc'
-
 // Extra begin-device fields the `idc` provider needs (the company's IAM Identity
 // Center access-portal URL, plus an optional region); other providers send none.
 export type KasLoginExtra = { start_url?: string; region?: string }
-
-// Display name for the provider a sign-in is running under (the device view's
-// eyebrow interpolates it). Routed through the catalog like every other label
-// so locales that transliterate brand names can.
-function providerLabel(provider: KasLoginProvider): string {
-  switch (provider) {
-    case 'google':
-      return i18nT('components.kasLogin.provider_google')
-    case 'github':
-      return i18nT('components.kasLogin.provider_github')
-    case 'builder_id':
-      return i18nT('components.kasLogin.provider_builder_id')
-    case 'idc':
-      return i18nT('components.kasLogin.provider_company_sso')
-  }
-}
-
-/**
- * Display name for the provider a STORED sign-in reports. The gateway spells
- * it as the governance classification the token carries ('Google' | 'Github' |
- * 'BuilderId' | 'Enterprise' | 'ExternalIdp'), not as the chooser's wire
- * identifiers, so the mapping is by loose match; anything unrecognised is shown
- * verbatim rather than mislabelled as a provider it is not.
- */
-export function providerLabelFromWire(stored: string | null | undefined): string {
-  const key = (stored ?? '').toLowerCase()
-  if (key === 'google') return providerLabel('google')
-  if (key === 'github') return providerLabel('github')
-  if (key === 'builderid' || key === 'builder_id') return providerLabel('builder_id')
-  if (key === 'enterprise' || key === 'idc' || key === 'externalidp') return providerLabel('idc')
-  return stored ?? ''
-}
 
 /**
  * Which chrome the flow renders in. `gate` is the full-screen door (scrim +
@@ -239,7 +201,14 @@ function CopyField({ value }: { value: string }) {
   )
 }
 
-/** One full-width sign-in choice. `primary` renders the accent-filled variant. */
+/**
+ * One sign-in choice. `primary` renders the accent-filled variant — on the
+ * gate only. In card chrome every choice is the outlined, shorter form and the
+ * four sit in a two-column grid: the card lives inside a Settings detail whose
+ * own primary button is "Use {{name}}", and a second accent-filled button the
+ * full width of the panel read as the page's main action rather than as one of
+ * four equal ways to sign in.
+ */
 function ProviderButton({
   icon,
   label,
@@ -253,9 +222,11 @@ function ProviderButton({
   disabled?: boolean
   onClick: () => void
 }) {
-  const base =
-    'flex h-11 w-full cursor-pointer items-center justify-center gap-2.5 rounded-lg text-sm transition-all focus-ring active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40'
-  const variant = primary
+  const { card } = useChrome()
+  const base = card
+    ? 'flex min-h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-lg px-3 text-[13px] transition-all focus-ring active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40'
+    : 'flex h-11 w-full cursor-pointer items-center justify-center gap-2.5 rounded-lg text-sm transition-all focus-ring active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40'
+  const variant = primary && !card
     ? 'btn-sweep border-none bg-accent font-semibold text-accent-fg hover:bg-accent-hover hover:shadow-[0_0_20px_var(--accent-glow)]'
     : 'border border-border bg-transparent font-medium text-text hover:border-border-strong hover:bg-bg-hover'
   return (
@@ -297,7 +268,7 @@ function Chooser({
         // chooser needs is one sentence saying WHICH backend the identity is
         // for -- it sits under a switch that also lists Kiro CLI, whose own
         // kiro-cli login this sign-in never touches.
-        <p className="text-sm leading-relaxed text-muted" data-testid="kas-login-card-intro">
+        <p className="text-[13px] leading-relaxed text-muted" data-testid="kas-login-card-intro">
           {i18nT('components.kasLogin.card_intro')}
         </p>
       ) : (
@@ -306,7 +277,13 @@ function Chooser({
           <h1 className={chrome.h1}>{i18nT('components.kasLogin.sign_in_to_kiro')}</h1>
         </>
       )}
-      <div className={`${chrome.card ? 'mt-4' : 'mt-7'} flex w-full max-w-md flex-col gap-3`}>
+      <div
+        className={
+          chrome.card
+            ? 'mt-3 grid w-full max-w-lg grid-cols-1 gap-2 sm:grid-cols-2'
+            : 'mt-7 flex w-full max-w-md flex-col gap-3'
+        }
+      >
         <ProviderButton
           icon={<Globe className="lucide-inline" />}
           label={i18nT('components.kasLogin.continue_with_google')}
@@ -328,7 +305,7 @@ function Chooser({
         />
         {ssoOpen ? (
           <form
-            className="rounded-lg border border-border bg-bg-elevated p-3"
+            className="rounded-lg border border-border bg-bg-elevated p-3 sm:col-span-full"
             data-testid="kas-login-sso-form"
             onSubmit={(e) => {
               e.preventDefault()
@@ -402,13 +379,19 @@ function Chooser({
           one click away and there is no draft unless the SSO form is open, so
           the agent is offered exactly when nothing would be lost. */}
       <ErrorNotice
-        className="mt-4 max-w-md"
+        className={chrome.card ? 'mt-3 max-w-lg' : 'mt-4 max-w-md'}
         askAgent={chrome.card && !ssoOpen}
         title={i18nT('components.kasLogin.could_not_start_sign_in')}
         message={beginError || null}
         testId="kas-login-begin-error"
       />
-      <p className="mt-5 max-w-md text-[13px] leading-relaxed text-muted">
+      <p
+        className={
+          chrome.card
+            ? 'mt-3 max-w-lg text-[12px] leading-relaxed text-muted'
+            : 'mt-5 max-w-md text-[13px] leading-relaxed text-muted'
+        }
+      >
         {i18nT('components.kasLogin.browser_note')}
       </p>
     </ViewShell>
@@ -634,7 +617,7 @@ function SignInProblem({
         panelFootnote: i18nT('components.kasLogin.aside_footnote'),
       }}
     >
-      <div className={`${chrome.tile} bg-danger/10 text-danger`}>
+      <div className={`${chrome.tile} bg-danger/10 text-danger-text`}>
         <AlertTriangle className="lucide-inline" />
       </div>
       <p className={`${chrome.afterTile} ${chrome.eyebrow.replace('text-accent', 'text-danger')}`}>
@@ -701,8 +684,8 @@ export interface KasLoginFlowSlots {
  * authorization, and on a remote gateway — where the OAuth callback cannot
  * reach the user's browser — it switches to the device-code flow and shows the
  * code to approve. Not mounted at the app root: the flow's product entry point
- * is the embedded variant on the Developer page (`KasLoginEmbedded`, rendered by
- * `KiroSignInCard` under the Agent Backend switch); this full-screen form stays
+ * is the embedded variant on Settings → Agent Harness (`KasLoginEmbedded`,
+ * rendered by `KiroSignInCard` under the harness switch); this full-screen form stays
  * available for a future app-root mount as a sibling of KiroPrerequisiteGate.
  */
 export default function KasLoginGate({ children }: { children?: ReactNode }) {
@@ -945,7 +928,7 @@ function KasLoginFlow({
           panelFootnote: i18nT('components.kasLogin.aside_footnote'),
         }}
       >
-        <div className={`${chrome.tile} bg-danger/10 text-danger`}>
+        <div className={`${chrome.tile} bg-danger/10 text-danger-text`}>
           <AlertTriangle className="lucide-inline" />
         </div>
         <h1 className={`${chrome.afterTile} ${chrome.headline}`}>

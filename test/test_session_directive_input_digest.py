@@ -43,6 +43,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.dashboard import directive_queue
 from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.session_directive_apply import DirectiveOutcome
 
 # The raw arguments the model sent. Long enough to matter, quoted enough to have
 # defeated the naive repair, and carrying the ``_meta`` block KAS attaches to
@@ -165,8 +166,8 @@ async def _drive(state, slot, events, monkeypatch, *, park=True, park_input=None
     client.context_usage_pct = MagicMock(return_value=1.0)
     client.client = None
     state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-    spy = AsyncMock(return_value="[applied]")
-    monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+    spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+    monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
     await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
     task = getattr(slot, "task", None)
     if task is not None:
@@ -180,7 +181,7 @@ def _opencode_events(
     result_text: str = "Monitor loop requested.",
     tool_call_id: str = "tc-oc",
 ):
-    """An opencode turn, in the shape CAPTURED off 1.18.30
+    """An opencode turn, in the shape CAPTURED off 1.18.30 and again off 1.19.1
     (``test/fixtures/acp_frames/opencode/mcp-directive-call-live.jsonl``): no
     ``_meta.kiro`` identity anywhere, the tool named ONLY by a single-underscore
     ``<server>_<tool>`` wire title, ``rawInput`` EMPTY on the ``tool_call`` and
@@ -569,8 +570,8 @@ class TestEmptyArgumentDirectives:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_called_once()
         assert spy.call_args.args[3] == "reset_conversation"
@@ -626,8 +627,8 @@ class TestPlantedRecordIsNotClaimedByADifferentTool:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_not_called()
         assert directive_queue.depth(effective_session_key(slot)) == 1, "record left parked"
@@ -735,14 +736,197 @@ class TestNativeSubagentCannotReachTheParentThroughASharedDigest:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         with caplog.at_level("WARNING"):
             await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_not_called()
         assert "provenance is ambiguous" in caplog.text
         # The child's own frame retired the record on the isolation path.
         assert directive_queue.depth(effective_session_key(slot)) == 0
+
+
+def _sel_spy(monkeypatch) -> list[dict]:
+    calls: list[dict] = []
+
+    class _Spy:
+        def log_tool_invocation(self, **kw):
+            calls.append(kw)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner.sel", lambda: _Spy())
+    return calls
+
+
+def _tool_result_outputs(state) -> list[str]:
+    return [
+        c.args[1].get("output", "")
+        for c in state.broadcast_ws.call_args_list
+        if c.args and c.args[0] == "tool_result"
+    ]
+
+
+class TestOneRefusalPerFrame:
+    """A frame the out-of-band entry has already refused is settled there: the
+    identity-gated marker path must not process the same frame a second time."""
+
+    @pytest.mark.asyncio
+    async def test_native_subagent_capped_result_is_refused_once(self, tmp_path, monkeypatch):
+        """An identified call from a native sub-agent whose result lost its
+        marker: one denied audit row and one not-applied note, not two of each."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("native-capped")
+        slot._titled = True
+        calls = _sel_spy(monkeypatch)
+        events = [
+            AcpEvent(
+                kind=EVENT_SUBAGENT_LIST,
+                subagents=[
+                    {
+                        "sessionId": "sub-1",
+                        "role": "tester",
+                        "initialQuery": "do the work",
+                        "status": {"type": "working"},
+                    }
+                ],
+            ),
+            AcpEvent(kind=EVENT_SUBAGENT_ACTIVITY, sub_session_id="sub-1", tool_call_id="tc-nat"),
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-nat",
+                title="@kirocrew-core/monitor_start",
+                wire_title="@kirocrew-core/monitor_start",
+                tool_kind="other",
+                tool_name="monitor_start",
+                mcp_server_name=session_directive.CORE_MCP_SERVER,
+                raw_tool_params=FRAME_INPUT,
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-nat",
+                tool_output=_kas_capped(_tool_text()),
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        spy = await _drive(state, slot, events, monkeypatch)
+        spy.assert_not_called()
+        denied = [c for c in calls if c.get("source") == "mcp-directive"]
+        assert [c["outcome"] for c in denied] == ["denied"]
+        # The identity gate records an identified call in _pending_dir_tool, not
+        # _seen_tool_identity, so the denied row must name the directive tool.
+        assert denied[0]["tool_name"] == "monitor_start", denied
+        notes = [o for o in _tool_result_outputs(state) if "[Not applied:" in o]
+        assert len(notes) == 1, notes
+        assert notes[0].count("[Not applied:") == 1, notes[0]
+        assert not any(session_directive.SENTINEL in o for o in _tool_result_outputs(state))
+        assert directive_queue.depth(effective_session_key(slot)) == 0
+
+    @pytest.mark.asyncio
+    async def test_native_subagent_garbled_marker_is_refused_once(self, tmp_path, monkeypatch):
+        """The same isolation refusal when the child's result still carries a
+        marker that does not decode: one denied row, one not-applied note, and
+        the sentinel stripped from the transcript."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("native-garbled")
+        slot._titled = True
+        calls = _sel_spy(monkeypatch)
+        garbled = "Monitor loop requested.\n\n" + session_directive.SENTINEL + "{not json"
+        events = [
+            AcpEvent(
+                kind=EVENT_SUBAGENT_LIST,
+                subagents=[
+                    {
+                        "sessionId": "sub-1",
+                        "role": "tester",
+                        "initialQuery": "do the work",
+                        "status": {"type": "working"},
+                    }
+                ],
+            ),
+            AcpEvent(kind=EVENT_SUBAGENT_ACTIVITY, sub_session_id="sub-1", tool_call_id="tc-nat"),
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-nat",
+                title="@kirocrew-core/monitor_start",
+                wire_title="@kirocrew-core/monitor_start",
+                tool_kind="other",
+                tool_name="monitor_start",
+                mcp_server_name=session_directive.CORE_MCP_SERVER,
+                raw_tool_params=FRAME_INPUT,
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-nat",
+                tool_output=garbled,
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        spy = await _drive(state, slot, events, monkeypatch)
+        spy.assert_not_called()
+        denied = [c for c in calls if c.get("source") == "mcp-directive"]
+        assert [c["outcome"] for c in denied] == ["denied"]
+        outputs = _tool_result_outputs(state)
+        notes = [o for o in outputs if "[Not applied:" in o]
+        assert len(notes) == 1 and notes[0].count("[Not applied:") == 1, notes
+        assert not any(session_directive.SENTINEL in o for o in outputs), outputs
+        notices = [r.get("content", "") for r in slot.messages if r.get("role") == "notice"]
+        assert not any("could not be verified" in n for n in notices)
+        assert directive_queue.depth(effective_session_key(slot)) == 0
+
+    @pytest.mark.asyncio
+    async def test_unclaimable_marker_on_an_identified_call_is_refused_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """An identified call whose marker does not decode and whose record was
+        never parked: the entry branch writes the ONE denied audit row, and the
+        authenticated decode-failure path still surfaces the ONE lost-marker
+        notice and strips the sentinel from the transcript."""
+        state = _stub_state(tmp_path)
+        slot = state.get_or_create_slot("garbled-marker")
+        slot._titled = True
+        calls = _sel_spy(monkeypatch)
+        garbled = "Monitor loop requested.\n\n" + session_directive.SENTINEL + "{not json"
+        assert session_directive.has_marker(garbled)
+        assert session_directive.decode(garbled, "monitor_start") is None
+        events = [
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-garbled",
+                title="@kirocrew-core/monitor_start",
+                wire_title="@kirocrew-core/monitor_start",
+                tool_kind="other",
+                tool_name="monitor_start",
+                mcp_server_name=session_directive.CORE_MCP_SERVER,
+                raw_tool_params=FRAME_INPUT,
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT,
+                tool_call_id="tc-garbled",
+                tool_output=garbled,
+                tool_final=True,
+            ),
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+            AcpEvent(kind=EVENT_COMPLETE),
+        ]
+        with caplog.at_level("WARNING"):
+            spy = await _drive(state, slot, events, monkeypatch, park=False)
+        spy.assert_not_called()
+        denied = [c for c in calls if c.get("source") == "mcp-directive"]
+        assert [c["outcome"] for c in denied] == ["denied"]
+        assert "session-directive NOT APPLIED: marker present" in caplog.text
+        assert "session-directive decode FAILED" in caplog.text
+        notices = [r.get("content", "") for r in slot.messages if r.get("role") == "notice"]
+        assert notices == ["Monitor was not set up."], notices
+        outputs = _tool_result_outputs(state)
+        assert outputs and outputs[-1].startswith("Monitor loop requested.")
+        assert outputs[-1].count("could not be verified") == 1, outputs[-1]
+        assert not any(session_directive.SENTINEL in o for o in outputs), outputs
 
 
 class TestTheDisplayTitleCannotForgeTheTool:
@@ -833,8 +1017,8 @@ class TestTheDisplayTitleCannotForgeTheTool:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
         spy.assert_not_called()
         assert directive_queue.depth(effective_session_key(slot)) == 1
@@ -1003,7 +1187,7 @@ class TestClaudeBackendResolvesTheTool:
 
 class TestKasWireTitleCarriesTheBackendPrefix:
     """A recorded KAS ``tool_call`` frame titled the MCP call
-    ``Running: @kirocrew-core/ask_question`` -- the backend's own ``Running: ``
+    ``Running: @kirocrew-core/suggest_followup`` -- the backend's own ``Running: ``
     prefix in front of the wrapper's ``@<server>/<tool>``. Matching the bare
     spelling only left that frame with no digest, so on a KAS session that emits
     no ``_meta.kiro`` the record parked and nothing claimed it: the tool answered
@@ -1012,12 +1196,12 @@ class TestKasWireTitleCarriesTheBackendPrefix:
     @pytest.mark.parametrize(
         "title,expected",
         [
-            ("Running: @kirocrew-core/ask_question", "ask_question"),
+            ("Running: @kirocrew-core/suggest_followup", "suggest_followup"),
             ("Running: @kirocrew-core/monitor_start", "monitor_start"),
             ("@kirocrew-core/monitor_start", "monitor_start"),
             ("Running: @other-server/monitor_start", ""),
             ("Running: Running: @kirocrew-core/monitor_start", ""),  # one prefix, not a loop
-            ("Loading tool: kirocrew-core::ask_question", ""),  # tool_search, not the call
+            ("Loading tool: kirocrew-core::suggest_followup", ""),  # tool_search, not the call
             ("Running: echo @kirocrew-core/monitor_start", ""),
         ],
     )
@@ -1065,8 +1249,8 @@ class TestDisplayStripKeepsAnEnvelopeReadable:
         [
             ("monitor_update", {"patch": {"message": 'say "hi" {twice}', "banner": "b"}}),
             (
-                "ask_question",
-                {"questions": [{"question": "pick {one}", "options": [{"label": "a"}]}]},
+                "suggest_followup",
+                {"items": [{"title": "pick {one}", "description": "d", "prompt": 'say "a"'}]},
             ),
             (
                 "suggest_followup",
@@ -1230,7 +1414,7 @@ class TestConcurrentDirectivesInOneSession:
         slot._titled = True
         a_args = {"message": "loop A", "interval_secs": 300}
         b_args = {"message": "loop B", "interval_secs": 600}
-        q_args = {"questions": [{"question": "which?", "options": [{"label": "x"}]}]}
+        q_args = {"items": [{"title": "which?", "description": "d", "prompt": "x"}]}
         child_args: dict = {}
 
         def call(tcid, tool, args):
@@ -1267,14 +1451,14 @@ class TestConcurrentDirectivesInOneSession:
             ),
             AcpEvent(kind=EVENT_SUBAGENT_ACTIVITY, sub_session_id="sub-1", tool_call_id="tc-child"),
             call("tc-a", "monitor_start", a_args),
-            call("tc-q", "ask_question", q_args),
+            call("tc-q", "suggest_followup", q_args),
             call("tc-child", "reset_conversation", child_args),
             call("tc-b", "monitor_start", b_args),
             # Results arrive out of call order.
             result("tc-b", "monitor_start", b_args),
             result("tc-child", "reset_conversation", child_args),
             result("tc-a", "monitor_start", a_args),
-            result("tc-q", "ask_question", q_args),
+            result("tc-q", "suggest_followup", q_args),
             AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
             AcpEvent(kind=EVENT_COMPLETE),
         ]
@@ -1288,7 +1472,7 @@ class TestConcurrentDirectivesInOneSession:
                 sk = effective_session_key(slot)
                 for tool, args in (
                     ("monitor_start", a_args),
-                    ("ask_question", q_args),
+                    ("suggest_followup", q_args),
                     ("reset_conversation", child_args),  # the child's, under the parent key
                     ("monitor_start", b_args),
                 ):
@@ -1305,17 +1489,17 @@ class TestConcurrentDirectivesInOneSession:
         client.context_usage_pct = MagicMock(return_value=1.0)
         client.client = None
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
-        spy = AsyncMock(return_value="[applied]")
-        monkeypatch.setattr(chat_runner, "apply_session_directive", spy)
+        spy = AsyncMock(return_value=DirectiveOutcome("[applied]"))
+        monkeypatch.setattr(chat_runner, "apply_session_directive_outcome", spy)
         await chat_runner._run_chat(state, slot, "go", _directive_user_origin=True)
 
         applied = [
-            (c.args[3], c.args[4].get("message") or c.args[4].get("questions"))
+            (c.args[3], c.args[4].get("message") or c.args[4].get("items"))
             for c in spy.call_args_list
         ]
         assert ("monitor_start", "loop A") in applied
         assert ("monitor_start", "loop B") in applied
-        assert any(k == "ask_question" for k, _ in applied)
+        assert any(k == "suggest_followup" for k, _ in applied)
         assert all(k != "reset_conversation" for k, _ in applied), "child never reaches parent"
         assert len(applied) == 3
         assert directive_queue.depth(effective_session_key(slot)) == 0, "child record retired"
@@ -1438,3 +1622,210 @@ class TestOpenCodeBackendResolvesTheTool:
         spy.assert_not_called()
         assert directive_queue.depth(effective_session_key(slot)) == 0
         assert "UNCLAIMED_AT_TURN_END" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_codex_identified_call_can_claim_its_parked_result(tmp_path, monkeypatch):
+    state = _stub_state(tmp_path)
+    slot = state.get_or_create_slot("codex-claim")
+    slot._titled = True
+    events = [
+        AcpEvent(
+            kind=EVENT_TOOL_CALL,
+            tool_call_id="exec-native-mcp",
+            mcp_server_name="kirocrew-core",
+            tool_name="monitor_start",
+            raw_tool_params={
+                "server": "kirocrew-core",
+                "tool": "monitor_start",
+                "arguments": CALL_ARGS,
+            },
+        ),
+        AcpEvent(
+            kind=EVENT_TOOL_RESULT,
+            tool_call_id="exec-native-mcp",
+            tool_output="Result offloaded by adapter",
+            tool_final=True,
+        ),
+        AcpEvent(kind=EVENT_COMPLETE),
+    ]
+    spy = await _drive(state, slot, events, monkeypatch)
+    spy.assert_called_once()
+    assert spy.call_args.args[4] == VALIDATED_ARGS
+    assert directive_queue.depth(effective_session_key(slot)) == 0
+
+
+@pytest.mark.asyncio
+async def test_unmatched_native_result_reports_application_failure(tmp_path, monkeypatch):
+    state = _stub_state(tmp_path)
+    slot = state.get_or_create_slot("chat-failed")
+    events = [
+        AcpEvent(
+            kind=EVENT_TOOL_CALL,
+            tool_call_id="native-failure",
+            tool_name="monitor_start",
+            mcp_server_name="kirocrew-core",
+            raw_tool_params=CALL_ARGS,
+        ),
+        AcpEvent(
+            kind=EVENT_TOOL_RESULT,
+            tool_call_id="native-failure",
+            tool_output="Monitor loop requested.",
+            tool_final=True,
+        ),
+        AcpEvent(kind=EVENT_COMPLETE),
+    ]
+    spy = await _drive(state, slot, events, monkeypatch, park=False)
+    spy.assert_not_awaited()
+    notices = [row.get("content", "") for row in slot.messages if row.get("role") == "notice"]
+    assert "Monitor was not set up." in notices
+    # The row a person reads is the outcome alone; the agent instruction rides
+    # only on the tool result below.
+    assert not any("Agent:" in text or "monitor_inspect" in text for text in notices)
+    # The agent receives the tool's own text WITH the notice appended, not the
+    # notice in place of it.
+    results = [
+        call.args[1]["output"]
+        for call in state.broadcast_ws.call_args_list
+        if call.args and call.args[0] == "tool_result"
+    ]
+    assert results and results[-1].startswith("Monitor loop requested.")
+    assert "Monitor was not set up." in results[-1] and "monitor_inspect" in results[-1]
+
+
+@pytest.mark.asyncio
+async def test_unmatched_non_monitor_result_gets_no_monitor_advice(tmp_path, monkeypatch):
+    """A lost ``reset_conversation`` result is about the session, not a monitor:
+    the human line names that tool, and the agent instruction never sends it to
+    ``monitor_inspect``."""
+    state = _stub_state(tmp_path)
+    slot = state.get_or_create_slot("chat-reset-failed")
+    events = [
+        AcpEvent(
+            kind=EVENT_TOOL_CALL,
+            tool_call_id="native-reset",
+            tool_name="reset_conversation",
+            mcp_server_name="kirocrew-core",
+            raw_tool_params={},
+        ),
+        AcpEvent(
+            kind=EVENT_TOOL_RESULT,
+            tool_call_id="native-reset",
+            tool_output="Conversation reset requested.",
+            tool_final=True,
+        ),
+        AcpEvent(kind=EVENT_COMPLETE),
+    ]
+    spy = await _drive(state, slot, events, monkeypatch, park=False)
+    spy.assert_not_awaited()
+    notices = [row.get("content", "") for row in slot.messages if row.get("role") == "notice"]
+    assert "The conversation was not reset." in notices
+    assert not any("Agent:" in text or "monitor" in text.lower() for text in notices)
+    results = [
+        call.args[1]["output"]
+        for call in state.broadcast_ws.call_args_list
+        if call.args and call.args[0] == "tool_result"
+    ]
+    assert results and results[-1].startswith("Conversation reset requested.")
+    assert (
+        "The conversation was not reset. Agent: the reset_conversation result could not be verified"
+        in results[-1]
+    )
+    assert "monitor" not in results[-1].lower()
+
+
+def test_unverified_notice_leads_with_a_human_outcome_for_every_directive_tool():
+    """The line a person reads is the outcome alone, in words; the tool
+    identifier is confined to the agent instruction the tool result carries."""
+    from kiro_crew.dashboard.chat_runner import (
+        unverified_directive_notice,
+        unverified_directive_outcome,
+    )
+
+    for tool in sorted(session_directive.DIRECTIVE_TOOLS):
+        notice = unverified_directive_notice(tool)
+        outcome, _, instruction = notice.partition(" Agent: ")
+        assert outcome == unverified_directive_outcome(tool), (tool, outcome)
+        assert outcome.startswith(("The ", "Monitor ")), (tool, outcome)
+        assert "_" not in outcome and "Agent" not in outcome, (tool, outcome)
+        assert f"the {tool} result could not be verified" in instruction, (tool, notice)
+        if tool.startswith(("monitor_", "autonudge_")):
+            assert "monitor_inspect" in instruction, (tool, notice)
+        else:
+            assert "monitor" not in notice.lower(), (tool, notice)
+
+    unknown = unverified_directive_notice("some_other_tool")
+    assert unknown.startswith("The request was not applied. Agent: the some_other_tool result")
+    assert "monitor" not in unknown.lower()
+
+
+def test_unclaimed_turn_end_notice_is_tool_neutral():
+    """Any directive tool can park a record, so the notice for a record no call
+    claimed cannot send the agent to one tool's inspector."""
+    from kiro_crew.dashboard.chat_runner import UNCLAIMED_DIRECTIVE_NOTICE
+
+    assert UNCLAIMED_DIRECTIVE_NOTICE == (
+        "A request from this turn was not applied. Check that your last request took effect."
+    )
+    assert "monitor" not in UNCLAIMED_DIRECTIVE_NOTICE.lower()
+
+
+def test_codex_digest_does_not_unwrap_conflicting_identity():
+    raw = {"server": "kirocrew-core", "tool": "monitor_start", "arguments": CALL_ARGS}
+    expected = session_directive.call_input_digest("monitor_start", CALL_ARGS)
+    assert (
+        session_directive.event_input_digest("monitor_start", raw, "untrusted", "monitor_start")
+        != expected
+    )
+    assert (
+        session_directive.event_input_digest("monitor_start", raw, "kirocrew-core", "monitor_stop")
+        != expected
+    )
+
+
+# ── Tool Search deferred calls: the frame wraps the arguments in tool_call ───
+
+# What the frame's rawInput carries when the backend defers kirocrew-core under
+# Tool Search: the model calls the ``tool_call`` meta-tool, which forwards only
+# ``arguments`` to the MCP server.
+DEFERRED_FRAME_INPUT = {"tool_id": "kirocrew-core::monitor_start", "arguments": CALL_ARGS}
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_tool_call_frame_claims_its_parked_record(tmp_path, monkeypatch):
+    state = _stub_state(tmp_path)
+    slot = state.get_or_create_slot("kas-deferred")
+    slot._titled = True
+    events = _kas_events(
+        "Monitor loop requested.", raw_input=DEFERRED_FRAME_INPUT, tool_call_id="tc-deferred"
+    )
+    spy = await _drive(state, slot, events, monkeypatch)
+    spy.assert_called_once()
+    assert spy.call_args.args[3] == "monitor_start"
+    assert spy.call_args.args[4] == VALIDATED_ARGS
+    assert directive_queue.depth(effective_session_key(slot)) == 0
+
+
+def test_deferred_digest_matches_the_servers_digest_without_frame_identity():
+    expected = session_directive.call_input_digest("monitor_start", CALL_ARGS)
+    assert session_directive.event_input_digest("monitor_start", DEFERRED_FRAME_INPUT, "", "") == (
+        expected
+    )
+    with_meta = {**DEFERRED_FRAME_INPUT, "_meta": {"_isValid": True}}
+    assert session_directive.event_input_digest("monitor_start", with_meta, "", "") == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"tool_id": "kirocrew-core::monitor_update", "arguments": CALL_ARGS},
+        {"tool_id": "other-server::monitor_start", "arguments": CALL_ARGS},
+        {"tool_id": "monitor_start", "arguments": CALL_ARGS},
+        {"tool_id": "kirocrew-core::monitor_start", "arguments": CALL_ARGS, "extra": 1},
+        {"tool_id": "kirocrew-core::monitor_start", "arguments": json.dumps(CALL_ARGS)},
+    ],
+    ids=["other-tool", "other-server", "bare-id", "extra-key", "non-dict-args"],
+)
+def test_deferred_digest_does_not_unwrap_a_mismatched_envelope(raw):
+    expected = session_directive.call_input_digest("monitor_start", CALL_ARGS)
+    assert session_directive.event_input_digest("monitor_start", raw, "", "") != expected

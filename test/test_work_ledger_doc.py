@@ -106,10 +106,12 @@ def test_the_doc_pins_the_item_states(doc_text: str) -> None:
 
 
 def test_the_doc_quotes_the_real_caps(doc_text: str) -> None:
-    """The two numbers the page states are read off the store's own constants."""
+    """The three numbers the page states are read off the store's own constants."""
     from kiro_crew.work_ledger import MAX_DEPTH, MAX_ITEMS_PER_CONDUCTOR
+    from kiro_crew.work_vocab import WORK_CLOSED_WINDOW
 
-    assert f"{MAX_ITEMS_PER_CONDUCTOR} items per conductor" in doc_text
+    assert f"{MAX_ITEMS_PER_CONDUCTOR} open items per conductor" in doc_text
+    assert f"the {WORK_CLOSED_WINDOW} most recently closed items" in doc_text
     assert f"depth is capped at {MAX_DEPTH}" in doc_text
 
 
@@ -125,15 +127,18 @@ def _cap(tool: str, field: str) -> int:
 def test_the_doc_quotes_the_real_summary_cap(doc_text: str) -> None:
     """``summary``'s advertised cap matches the schema the tool validates against.
 
-    The refusal wording is pinned beside the number: the schema deliberately does not
-    clamp, and a page that said "truncated" would tell a worker its long summary
-    landed when the call was rejected.
+    The clamp wording is pinned beside the number. The schema cuts an over-cap
+    summary instead of rejecting it, and the page has to say so: a worker told its
+    long summary was refused would spend a round-trip rewriting a report that
+    already landed. The page also has to say the cut is reported, since that is
+    what keeps the clamp from being a silent loss.
     """
     cap = _cap("work_report", "summary")
     assert (
         f"capped at {cap} characters" in doc_text
     ), f"work_report's summary cap is {cap}; the doc states a different number"
-    assert "refused rather than truncated" in doc_text
+    assert "cut to the cap, not refused" in doc_text
+    assert "how many characters were" in doc_text
 
 
 def test_the_doc_quotes_the_real_title_cap(doc_text: str) -> None:

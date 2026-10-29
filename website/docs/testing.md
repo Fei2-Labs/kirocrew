@@ -83,7 +83,8 @@ handler rather than a change to the component: add the endpoint to the mock serv
 
 `isolate: true` clears each worker's module registry between files, so vitest
 re-fetches `integration/setup.ts` and its whole module graph **once per test
-FILE** — ~1,400 of them. The total can exceed the cost of running the tests.
+FILE**, and there are thousands of test files. The total can exceed the cost of
+running the tests.
 Reaching all 14 locale catalogs from it cost more in setup than the whole suite
 spent running tests; owning them elsewhere is where the numbers below come from.
 
@@ -109,21 +110,22 @@ making the same modules cheaper to parse buys nothing, which is why Vite's
 `json.stringify` (on by default above 10 KB) does not help. Count modules, not
 kilobytes, when you judge a setup import.
 
-The test path is also heavier than the production bundle: `en-XA.json` is 1.89 MiB
-and DEV-only, and `import.meta.env.DEV` is true under vitest, so it loads here and
+The test path is also heavier than the production bundle: `en-XA.json` is a
+multi-MiB generated catalog, regenerated on every English edit, and DEV-only, and `import.meta.env.DEV` is true under vitest, so it loads here and
 is dropped from a release build.
 
-That is why `src/i18n/index.ts` imports **English only** (1,027,227 bytes, 5.9% of the
-17,508,449 authored bytes), `src/i18n/catalogs.ts` owns every catalog import, and
-`src/i18n/all.ts` is the entry that registers them. Three rules hold that split in
-place:
+That is why `src/i18n/index.ts` imports **English only** (a small fraction of the
+authored catalog bytes), `src/i18n/catalogs.ts` owns every catalog import, and
+`src/i18n/all.ts` is the entry that registers them all. The browser boots through
+`src/i18n/lazy.ts` instead, which fetches one non-English catalog on demand. Three
+rules hold that split in place:
 
 - **No non-English catalog import in `src/i18n/index.ts`** — that is the module
   `integration/setup.ts` and ~600 components import.
 - **No all-catalogs import in `integration/setup.ts`**: neither `src/i18n/all` nor
   `src/i18n/catalogs`, and not transitively through a helper it pulls in.
-- **A page entry point imports `initI18n` from `src/i18n/all`**, never from
-  `src/i18n/index`. Both export the same signature so `tsc` accepts either, but
+- **A page entry point imports `initI18n` from `src/i18n/lazy` or `src/i18n/all`**,
+  never from `src/i18n/index`. Both export the same signature so `tsc` accepts either, but
   through the English-only module the dashboard renders English to a user who
   picked Japanese: i18next falls back, nothing throws, no key renders raw.
 
@@ -132,8 +134,8 @@ import graph, because none of them changes a test result on its own.
 
 A test that needs a language other than English imports `src/i18n/all`; a test that
 audits the whole catalog set imports `CATALOGS` from `src/i18n/catalogs`. Either way
-a single file pays the load. None of this defers a load — `t()` is synchronous on
-every path — it only settles which module owns the import.
+a single file pays the load. `t()` is synchronous on every path: the lazy entry
+registers a catalog before anything renders in its language.
 
 Weigh anything else you put in the setup graph the same way: multiply it by the
 file count first.
@@ -154,7 +156,10 @@ fails on connection refused.
 **In CI these specs run through the backend gate, not through npm.**
 `python setup.py test_e2e` boots a real gateway wired to a packaged fake ACP
 backend and shells this suite against it, entirely offline. That is the harness to
-match when you are debugging a CI-only failure.
+match when you are debugging a CI-only failure. Offline includes the app store:
+the harness gateway runs with `KIROCREW_SKIP_APP_STORE_FETCH=1`, so Discover
+renders the bundled seed, not the live catalog, and a spec's verdict never waits
+on the CDN. A gateway you start by hand for a local run does not set it.
 
 ## CI gates
 
@@ -174,6 +179,25 @@ are in
 The short version holds here too: never fix a flake with a rerun, a longer timeout,
 or a weakened assertion. Poll for the condition you actually care about.
 
+### Two front-end gates scan the WHOLE tree, so a diff-relevance run misses them
+
+`website/electron/test/port-owner-self-asserted-identity.test.js` requires every call
+site of the two port probes, and every use of the port-verdict vocabulary, to be
+declared in one of its lists; an unclassifiable site fails rather than passing. The
+i18n style tests under `website/src/i18n/style/` scan the whole catalog the same way.
+
+Neither is selected by a test run scoped to your diff, so a new probe call or a new
+catalog value passes locally and reds **every open pull request** on the round after
+it merges. If your change adds a port verdict, run that electron test explicitly; if
+it adds a catalog value, run the style tests with `I18N_BASE_REF` set so their
+diff-scoped halves actually evaluate. Registering a site is one line and the failure
+message names the list it belongs in.
+
+The general shape of this mistake, and the two other ways a deterministic gate ends
+up billing a stranger, are in
+[the testing spec](../../docs/system-specs/common/testing-conventions.md) under "A
+gate that reds on someone else's pull request".
+
 ## Determinism: establish the state you assert on
 
 Reset owned API mocks before reseeding per-test defaults. `vi.clearAllMocks()`
@@ -185,8 +209,8 @@ shared setup mocks.
 
 Every CI-only failure this suite has produced so far reduces to one mistake: **the
 test asserted against a state it did not establish**, and got away with it locally
-because the component happened to be slower than the assertion. The shard runs four
-workers under coverage, so "happened to be" stops holding. Two concrete shapes to
+because the component happened to be slower than the assertion. Each shard runs three
+workers under coverage (`maxWorkers: 3`), so "happened to be" stops holding. Two concrete shapes to
 recognize — both have shipped as red shards.
 
 **A mounted element is not a settled state.** `findBy*` proves a node rendered, not
@@ -245,6 +269,94 @@ into a deterministic local failure. Keep the forced delay in place while you ver
 the fix, then remove it: a fix that only passes once the delay is gone has not been
 shown to fix anything.
 
+**A fresh test store is offline.** `createTestStore()` starts where the real
+dashboard boots: `dashboard.connected` is `false` until the SSE stream opens. A
+component gated on `useConnected()` therefore renders its offline branch unless the
+test connects it, and a regression in its connected path stays green. Name the
+branch you test: use `createConnectedTestStore()` for the connected path (it lays
+any `dashboard` fields you pass over the reducer's initial state), and plain
+`createTestStore()` for the offline one. A gated component worth testing needs
+both.
+
+```tsx
+// WRONG: the menu is gated on `connected`, so this asserts the dimmed row.
+renderWithProviders(<FolderMenu />)
+
+// RIGHT: say which branch the test is about.
+renderWithProviders(<FolderMenu />, { store: createConnectedTestStore() })
+```
+
+### Rules every test keeps
+
+The cases below are where these rules came from. Each one is a rule for every new or
+changed test, and `AUTOSDE.yaml`'s `frontend-tests-are-deterministic` holds review to
+them. The SAST job's `semgrep/test-determinism.yaml` refuses a new promise-sleep in the
+TypeScript under `src`, `integration` and `playwright`, and a new `waitForTimeout` in
+`playwright`; a deliberate one says why with `// nosemgrep: <rule id>`. The backend's `test/test_flake_pattern_ratchet.py` counts per file the
+shapes no semgrep rule reads (promise-sleeps in the Electron tests, unpinned `Date`, `isVisible` branches,
+elapsed-time upper bounds, unrestored fake timers) and fails a change that raises a
+file's count above its count at the change's merge-base; a line that keeps one on
+purpose carries `// flake-ok: <reason>` with a reason of ten characters or more. The
+ratchet is a local, pre-push gate (the
+[Determinism contract](../../docs/system-specs/common/testing-conventions.md#determinism-contract-read-this-first)
+says why): run `python -m pytest -n0 test/test_flake_pattern_ratchet.py` before pushing.
+
+- **Time.** A test whose output reads the clock pins it with `vi.setSystemTime(...)`,
+  set after the last real-timer wait (with fake timers, see the fake-timer rule below).
+  Restore it with `vi.useRealTimers()` where a timed-out test still reaches it: an
+  `afterEach` or `onTestFinished`, or a `finally` only when the pinned section awaits
+  nothing a fake clock can stall (no `waitFor` or `findBy*`), because a timed-out test
+  never reaches its `finally`. Without fake timers `setSystemTime` still mocks `Date`
+  for the rest of the file until that call. An Electron `node:test` file pins `Date`
+  with `mock.timers.enable({ apis: ['Date'] })` and resets a top-level `mock.timers` the
+  same way; a test-context `t.mock.timers` is reset by the runner. A relative age ("3
+  minutes ago") is computed from the pinned instant, never from the real `Date.now()`.
+- **Locale and zone.** An expectation built with `toLocale*String()` names its locale:
+  vitest pins `TZ=UTC` but not the locale, and the Electron suite pins neither, so an
+  Electron test names the zone too.
+- **Barriers.** No promise-sleep (`await new Promise(r => setTimeout(r, N))`, N > 0) as
+  a barrier before an assertion. Wait for the state with `findBy*`, `waitFor` or an
+  awaited mock call. The forced delay in *Reproduce before you fix* is a probe, removed
+  before the change lands.
+- **Randomness.** Stub `Math.random` and `crypto.randomUUID`
+  (`vi.spyOn(...).mockReturnValue(...)`) whenever the asserted output depends on them.
+- **A `findBy*` on one element does not settle a sibling query** whose content comes
+  from a different async source (another query, an effect, a timer or a fetch). Wait
+  for every such value the assertion reads, in the file's `…Ready()` helper.
+- **An `act()` warning is a finding.** "not wrapped in act(...)" means a state update
+  landed after the test's last barrier. Fix the barrier; never add the warning to a
+  filter. `integration/setup.ts` counts these warnings per file. A file listed in
+  `integration/act-warning-baseline.json` still emits them; there they are kept out of
+  the log, and a run of all its tests that emits none prints an
+  `[act-warnings] ... emitted none` line so you can remove it from the list. Any other
+  file prints its warnings as usual plus an `[act-warnings] <file>: N act() warning(s)`
+  line on stderr at its end. `KIROCREW_ACT_STRICT=1` also fails the test that emitted
+  it. The list only shrinks: never add a file to quiet a new warning.
+- **Each test undoes the fake timers and storage writes it leaves.** `integration/setup.ts`
+  undoes them when the test finishes: fake timers the test installed go back to real
+  ones, and `localStorage` / `sessionStorage` go back to what the test inherited. A
+  `beforeAll` that installs fake timers or seeds storage keeps it for the whole file;
+  a test that turns such inherited fake timers OFF leaves them off for the tests after
+  it, so restore them yourself.
+  `unstubEnvs` resets every `vi.stubEnv` before each test, a `beforeAll` one included,
+  so stub env in `beforeEach` or the test. Globals are not restored, so undo your own
+  `vi.stubGlobal`. A test that reads storage an earlier test wrote fails here; the one
+  file that still does is listed in `STORAGE_CARRYOVER_FILES` until it is fixed.
+- **No absolute time budget under `--coverage`.** Instrumentation multiplies every
+  executed line, so `expect(elapsed).toBeLessThan(N)` measures the instrumentation and
+  the host. Assert the work (calls, items, frames) instead.
+- **Playwright.**
+  - Use web-first assertions (`await expect(locator).toBeVisible()`), `expect.poll` for
+    backend state and `waitForResponse` for a request; never a `page.waitForTimeout`
+    barrier.
+  - `locator.isVisible({ timeout })` ignores its timeout and samples once, so never
+    branch on it.
+  - Keep the count of flaky specs at zero. CI's `retries` let a flaky spec pass its
+    retry, and the gate's `MAX_FLAKY_SPECS` ceiling then fails the run naming it: it
+    gets fixed, never given more retries ([e2e-gate](../../docs/ci/e2e-gate.md)).
+  - A spec cleans up only the ids it created. A global reset races every other spec
+    sharing the gateway.
+
 ### What five full runs under load found
 
 Five back-to-back `vitest run --coverage` passes on a Windows host that was also
@@ -294,7 +406,10 @@ one is a rule:
   attempted until the first has polled up to 300 x 10ms for its seed. Each is up to
   several seconds of legitimate work that a default `findBy*` / `waitFor` was asserting
   on before the code had reached it. Pass `{ timeout: 5000 }` **and name the chain**
-  in a comment — that is what separates a bounded wait from a sleep. Never add a
+  in a comment — that is what separates a bounded wait from a sleep. To make a wait
+  that runs out fail by that name and report how long it really waited, pass
+  `namedCeiling('PANE_READY', 5000)` from `src/test/namedCeiling.ts` as the
+  options (a `findBy*`'s THIRD argument) instead of copying the helper into a suite. Never add a
   forced delay to production code to "prove" it and leave the probe behind.
 - **Fake timers go on after the render settles, and off in `afterEach`.** The
   push-to-talk discard test arms a real 500ms timer on keydown, so under load the
@@ -314,7 +429,7 @@ one is a rule:
   `testTimeout` alone for everything else.
 
 A later audit ran the Electron `node:test` suite five times on Node 22 — the declared
-floor (`engines.node >=22`), while CI runs 24 — and added two rules:
+floor (`engines.node >=22.12.0`), while CI runs 24 — and added two rules:
 
 - **A backstop timer the caller awaits must keep the loop alive.**
   `stopGatewayGracefully` raced a never-settling tree kill against
@@ -364,6 +479,22 @@ argument configures matching and does not change the wait timeout.
 The remaining case was pure CPU (201 real sidebar rows in one synchronous render,
 4–18 s across the four runs) and got its own `it(name, { timeout }, fn)` ceiling.
 
+### What eight dashboard suites found
+
+Six more CI reds (#17237) added two shapes to the ones above:
+
+- **A key sent before the listener exists.** A dialog's Escape handler, a focus
+  trap's window `keydown`, or a tab's re-armed listener is installed in a PASSIVE
+  effect, which runs after the render a `findBy*` already observed. A key sent in
+  that gap reaches no listener, or the previous render's. Wait for a signal the
+  install itself produces (focus inside the trap, the stream the same flush opens),
+  then send the key.
+- **Real time stepped by a copied number.** A test that advances a fake clock past a
+  retry, poll or bound uses the component's own exported constant
+  (`MISSING_FILE_RETRY_MS`, `RUNTIME_POLL_MS`, `CACHE_WARM_BOUND_MS`), never a literal
+  that silently stops matching when the value changes. Every case starts from reset
+  mocks and restored window stubs, so a file never passes only in file order.
+
 ## Manual procedures
 
 A few flows are deliberately not automated. They are documented rather than
@@ -381,7 +512,7 @@ change the notification buttons or the slot-linking logic:
 1. Start a gateway and open the dashboard.
 2. Add a one-shot cron job that produces output, and wait for it to fire.
 3. From the notification, confirm **View last result** opens the result.
-4. Repeat with a recurring job and confirm **Continue session** resumes the linked
+4. Repeat with a recurring job and confirm **Go to Chat** resumes the linked
    slot on subsequent fires.
 5. Repeat with a non-persistent job and confirm it always offers **View last
    result** rather than a session to continue.

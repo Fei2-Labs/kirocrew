@@ -1,6 +1,6 @@
 """The layering: what is the envelope, what belongs to one kind, who may write it.
 
-``test_crew_log_core.py`` covers the format. This file covers the SPLIT -- the
+``test_crew_log_core*.py`` cover the format. This file covers the SPLIT -- the
 matrix of which ``src`` each kind accepts, the guest rules that authorization
 hangs off ``src``, and the two crew contracts' envelope half. It is a matrix
 rather than a set of examples because the hole it closes is a shared source list
@@ -9,9 +9,9 @@ visible, a missing example is not.
 
 The `data` half of the crew contracts -- ``crew/dispatch`` requiring ``target``,
 ``crew/report`` requiring ``ref`` -- is per-type validation, which lives in the
-type registry rather than here. Until that module exists, those requirements are
-spec text (``docs/system-specs/modules/crew-log-core.md`` section 4b) and this file
-asserts only what the envelope itself can hold.
+type registry rather than here: ``entry_types.CREW_ENTRY_TYPES`` declares both,
+and ``test_crew_log_crew_types.py`` covers them. This file asserts only what the
+envelope itself can hold.
 """
 
 from __future__ import annotations

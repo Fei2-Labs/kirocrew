@@ -191,7 +191,7 @@ class TestImportSafety:
         """The one permitted spawn carries nothing agent-supplied.
 
         Asserted structurally: the argv builder must be exactly
-        ``platform_compat.isolated_python_argv("-m", OVERLAY_MODULE)``. The only
+        ``platform_compat.isolated_python_argv("-P", "-m", OVERLAY_MODULE)``. The only
         agent-influenced values in the whole overlay subsystem are numeric
         coordinates, and they travel as JSON on the child's stdin — a spawn that
         started interpolating anything into its argv would be a new, unreviewed
@@ -204,7 +204,7 @@ class TestImportSafety:
             if isinstance(node, ast.Assign)
             and any(getattr(t, "id", None) == "argv" for t in node.targets)
         ]
-        assert argvs == ["platform_compat.isolated_python_argv('-m', OVERLAY_MODULE)"], argvs
+        assert argvs == ["platform_compat.isolated_python_argv('-P', '-m', OVERLAY_MODULE)"], argvs
 
 
 # ──────────────────────────────────────────────────────────────────────────

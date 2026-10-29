@@ -4,7 +4,7 @@ Building each row with ``{**dataclasses.asdict(agent_cfg)}`` would make its
 response contract "every field ``KiroCrewAgentConfig`` has, plus every field
 anyone adds later", automatically — a field added by someone who never looked
 at this endpoint would ship to the browser by omission. Both row sources use an
-explicit allowlist instead, mirroring the rule ``handlers/members.py`` already
+explicit allowlist instead, mirroring the rule ``handlers/members_roster.py`` already
 documents for ``GET /api/members``.
 
 These tests are the half that keeps it converted. The key set is pinned as a
@@ -50,6 +50,7 @@ ROSTER_ROW_KEYS = frozenset(
         "memory_store",
         "model",
         "reasoning_effort",
+        "display_name",
         "description",
         "triggers",
         "source",
@@ -59,8 +60,9 @@ ROSTER_ROW_KEYS = frozenset(
 )
 
 # Record fields deliberately withheld, each verified to have no consumer in
-# ``website/src``: the two watchdog windows are backend scheduling knobs the
-# roster does not render, ``telegram_account`` is deprecated and inert, and
+# ``website/src``: the two watchdog windows and the compaction default are
+# backend session knobs the roster does not render, ``telegram_account`` is
+# deprecated and inert, and
 # ``starred`` is a Crew Members roster preference that only ``GET /api/members``
 # renders (the crew manager has no star affordance).
 # ``member_id`` is execution attribution, not a template-picker field.
@@ -69,8 +71,18 @@ WITHHELD_RECORD_FIELDS = frozenset(
         "member_id",
         "watchdog_tool_stall_suspect_secs",
         "watchdog_tool_stall_hard_cap_secs",
+        # Per-agent compaction default: read by the session manager and shown
+        # through the per-slot autocompact endpoint, not the roster.
+        "autocompact_pct",
         "telegram_account",
         "starred",
+        # Shipped on GET /api/members (the profile card's own read), not here:
+        # the crew editor echoes this row back, and must not round-trip it.
+        "approval_mode",
+        # Same home and same reason: the profile card's dispatched-worker pair,
+        # read by `session_create`, which the crew editor never shows.
+        "worker_model",
+        "worker_reasoning_effort",
     }
 )
 
@@ -109,6 +121,8 @@ def _seed_config_with_every_field_set() -> dict:
                 "watchdog_tool_stall_suspect_secs": 111.0,
                 "watchdog_tool_stall_hard_cap_secs": 222.0,
                 "telegram_account": "probe-telegram-binding",
+                "worker_model": "probe-worker-model",
+                "worker_reasoning_effort": "low",
             },
         },
         "default_agent": "roster-probe",
@@ -146,6 +160,7 @@ class TestRosterRowKeySet:
         # to distinctive non-default values.
         assert not (set(row) & WITHHELD_RECORD_FIELDS)
         assert "probe-telegram-binding" not in json.dumps(row)
+        assert "probe-worker-model" not in json.dumps(row)
 
     @pytest.mark.asyncio
     async def test_project_row_ships_the_same_key_set(self, monkeypatch, tmp_path: Path) -> None:
@@ -191,7 +206,7 @@ class TestRosterRowKeySet:
         The row-level tests cover ``redact=`` directly; this one covers the
         WIRING -- that the handler reads the caller class off the request at all.
         A middleware sets ``request["app"]``, which is what ``token_auth`` does
-        for a verified app token and what ``members.py::_deny_app_caller`` reads.
+        for a verified app token and what ``members_access.py::_deny_app_caller`` reads.
         """
         probe = "AKIAIOSFODNN7EXAMPLE"
         seed = _seed_config_with_every_field_set()
@@ -283,7 +298,12 @@ class TestUnshowableValuesAreMasked:
     """The read half: nothing that cannot be shown verbatim leaves as content."""
 
     PROBE = "AKIAIOSFODNN7EXAMPLE"
-    UNCOERCED_BY_LOADER = ("kiro_agent", "workspace", "memory_store", "description", "source")
+    # The five declared-``str`` record fields a roster row ships besides the
+    # ones with their own inline guard. The loader now pins all of them to
+    # their default on a non-string (``_safe_str``), so the mask below is
+    # defence in depth for a record built some other way, which is why the
+    # test plants the object with ``object.__setattr__`` rather than a load.
+    MASKED_STR_FIELDS = ("kiro_agent", "workspace", "memory_store", "description", "source")
     # ``avatar`` is the ONE structured value a row ships, so the uniform
     # string sweeps below do not apply to it: it is shape-allowlisted by
     # ``_safe_avatar`` with masking confined to user-authored ``traits``
@@ -302,6 +322,7 @@ class TestUnshowableValuesAreMasked:
             model=self.PROBE,
             reasoning_effort=self.PROBE,
             session_color=self.PROBE,
+            display_name=f"label {self.PROBE}",
             description=f"see {self.PROBE}",
             source=self.PROBE,
         )
@@ -317,9 +338,9 @@ class TestUnshowableValuesAreMasked:
             assert _carries_mask(row[field]), f"{field} should be the sentinel"
 
     @pytest.mark.parametrize("redact", [False, True])
-    @pytest.mark.parametrize("field", UNCOERCED_BY_LOADER)
+    @pytest.mark.parametrize("field", MASKED_STR_FIELDS)
     def test_a_non_string_is_masked_not_emptied(self, field: str, redact: bool) -> None:
-        """The loader lets an object through five declared-`str` fields.
+        """A non-string that reaches a row is masked, whatever put it there.
 
         Masking rather than coercing to `""` is what lets the write-side rule
         PRESERVE it: an echoed `""` would read as a genuine edit and overwrite the
@@ -623,6 +644,44 @@ class TestCredentialShapedNamesAreRefusedAtCreation:
         for benign in ("oncall", "kirocrew", "crew-7", "release manager"):
             assert _name_would_be_masked(benign) is False
             assert _roster_mask(benign) == benign
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad",
+        [" Issue Radar", "radar ", "ra\tdar", "ra\ndar", "ra\u200bdar", "a" * 501],
+    )
+    async def test_creation_refuses_a_name_the_roster_would_skip(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        """``GET /api/members`` drops any row failing ``members.validate_member_name``
+        (edge whitespace, a tab or line break, a hidden character, over the cap);
+        a name that fails it must never be persisted, or the crew exists and no
+        roster can show or open it. Refused at the source, for every client of
+        this route. Spaces, periods, non-ASCII letters and ``/`` inside a name
+        are display text and pass -- ``dr. eggbot`` is a valid crew."""
+        seed = _seed_config_with_every_field_set()
+        tmp = tmp_path / "config.json"
+        tmp.write_text(json.dumps(seed), encoding="utf-8")
+        with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+            from kiro_crew.dashboard.handlers import api_kirocrew_agents_create
+
+            @web.middleware
+            async def _owner(request: web.Request, handler):  # type: ignore[no-untyped-def]
+                request["app"] = ""
+                request["user"] = "owner-1"
+                return await handler(request)
+
+            app = web.Application(middlewares=[_owner])
+            app["state"] = types.SimpleNamespace(owner_id="owner-1", conversation_log=None)
+            app.router.add_post("/api/agents", api_kirocrew_agents_create)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/agents", json={"name": bad, "kiro_agent": "kirocrew"}
+                )
+                assert resp.status == 400, await resp.text()
+                payload = await resp.json()
+                assert payload["code"] == "invalid_member_name"
+                assert bad not in json.loads(tmp.read_text(encoding="utf-8")).get("agents", {})
 
     @pytest.mark.asyncio
     async def test_creation_refuses_a_credential_shaped_name(self, tmp_path: Path) -> None:

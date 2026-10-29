@@ -271,6 +271,75 @@ def test_cli_publication_failure_keeps_legacy_binding_and_preserves_new_store(
     assert require_member_memory_store(KiroCrewConfig.load(), "legacy") == "default"
 
 
+def test_every_create_purges_the_name_inside_the_locked_mutation(owner_gateway, monkeypatch):
+    """The crew-teams purge is part of publication itself, not a caller's
+    option: it runs for the created name after the concurrency checks and
+    BEFORE the record lands, and a store that cannot purge aborts the write
+    with the config untouched."""
+    from kiro_crew import crew_teams
+    from kiro_crew.config import loader
+
+    cfg = owner_gateway
+    cfg.agents["new-member"] = KiroCrewAgentConfig()
+    provision_member_memory(cfg, "new-member")
+    seen: list[tuple[str, bool]] = []
+
+    def purge(name: str) -> None:
+        # Observed from inside the mutation: the record is not on disk yet.
+        on_disk = json.loads(loader.config_path().read_text(encoding="utf-8"))
+        seen.append((name, name in on_disk.get("agents", {})))
+
+    monkeypatch.setattr(crew_teams, "release_for_create", purge)
+    persist_member_config(cfg, "new-member", create=True)
+    assert seen == [("new-member", False)]
+    assert require_member_memory_store(KiroCrewConfig.load(), "new-member") != "default"
+    # An update publishes without purging: only a create can inherit.
+    persist_member_config(cfg, "legacy", create=False, expected_store="default")
+    assert seen == [("new-member", False)]
+
+    cfg.agents["second"] = KiroCrewAgentConfig()
+    provision_member_memory(cfg, "second")
+
+    def refuse(name: str) -> None:
+        raise crew_teams.TeamsUnavailable("teams store unavailable")
+
+    monkeypatch.setattr(crew_teams, "release_for_create", refuse)
+    with pytest.raises(crew_teams.TeamsUnavailable):
+        persist_member_config(cfg, "second", create=True)
+    assert "second" not in KiroCrewConfig.load().agents
+
+
+def test_after_write_runs_only_once_the_registry_write_committed(owner_gateway, monkeypatch):
+    """The hook the crew-teams drop rides: never before the rename, never when
+    the mutation changed nothing, and a failed write never reaches it."""
+    from kiro_crew.config import loader
+
+    calls: list[bool] = []
+
+    def observe() -> None:
+        on_disk = json.loads(loader.config_path().read_text(encoding="utf-8"))
+        calls.append("legacy" not in on_disk.get("agents", {}))
+
+    def remove_legacy(doc: dict) -> dict:
+        del doc["agents"]["legacy"]
+        return doc
+
+    update_config_locked(loader.config_path(), mutate=remove_legacy, after_write=observe)
+    assert calls == [True]  # observed AFTER the delete landed on disk
+    update_config_locked(loader.config_path(), mutate=lambda doc: None, after_write=observe)
+    assert calls == [True]  # nothing committed, hook not run
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(loader, "write_config_atomically", boom)
+    with pytest.raises(OSError):
+        update_config_locked(
+            loader.config_path(), mutate=lambda doc: {**doc, "x": 1}, after_write=observe
+        )
+    assert calls == [True]  # failed write, hook not run
+
+
 def test_retire_keeps_a_store_the_disk_config_still_references(owner_gateway):
     # Direct contract of the retire helper: a store that config.json names is
     # never removed, and the in-memory binding is still restored for a retry.

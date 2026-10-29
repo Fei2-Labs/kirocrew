@@ -133,6 +133,14 @@ def write_spool(payload: dict) -> str:
         "server": payload.get("server", ""),
         "tool": payload.get("tool", ""),
         "session_key": payload.get("session_key", ""),
+        # The agent the PRODUCING stub declared, stamped by gatewayd at
+        # interception. The governance identity of every callback this render
+        # makes (``app_call._agent_for_call``): per call rather than per
+        # session, so a backend shared by several agents attributes each one
+        # correctly, and written here rather than read from a session-side store
+        # the governed agent could edit. Empty on a record an older gateway
+        # wrote or when the stub declared none, which the reader REFUSES.
+        "agent": payload.get("agent", ""),
         # Callback capability secret: split from the render id so the
         # model-visible marker (which carries only ``spool_id``) authorizes
         # NOTHING. This high-entropy secret is delivered ONLY over the
@@ -415,7 +423,7 @@ def append_marker(result: dict, spool_id: str) -> dict:
 
     The marker sits at offset 0 of the first text block so it survives the
     downstream ACP per-part 4000-char truncation in
-    ``acp/_dispatch.py::_build_tool_result_event`` before the dashboard marker
+    ``acp/_dispatch_parts/tool_result_events.py::_build_tool_result_event`` before the dashboard marker
     detector (``mcp_apps_render.find_marker``) runs; an end-appended marker on a
     long first block (real cases run to tens of thousands of chars) is sliced
     off and the app never mounts. Both consumers (``find_marker`` search,

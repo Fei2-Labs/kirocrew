@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import { readIndexCss } from './indexCssSource'
 
 /**
  * Safe-area regression guard.
@@ -62,6 +63,32 @@ const ALLOWLIST: ReadonlyArray<{ file: string; classes: string; reason: string }
     file: 'src/apps/command-bar/CommandBarOverlay.tsx',
     classes: 'fixed left-0 right-0 z-[9999] flex items-start justify-center',
     reason: 'Same full-bleed backdrop as CommandPalette — the bar it centres carries no edge pin.',
+  },
+  {
+    file: 'src/pages/members/MembersPage.tsx',
+    classes: 'fixed left-0 top-0 z-[60] pointer-events-none origin-top-left will-change-transform',
+    reason:
+      'The mate face in flight between the identity pill and the Profile card (CrewFaceFlight). '
+      + 'left-0 top-0 is only the transform origin: every frame translates it onto a viewport box '
+      + 'measured from a face that already sits inside the p-safe shell, so it never hugs an edge.',
+  },
+  {
+    file: 'src/shell/nav/featureNewTagFlight.tsx',
+    classes: 'fixed left-0 top-0 z-[65] rounded-full pointer-events-none shadow-md',
+    reason:
+      'The Mates intro\'s avatar in flight from the dialog to the rail row\'s "New" tag '
+      + '(FeatureNewTagFlyer). Same shape as CrewFaceFlight: left-0 top-0 is only the transform '
+      + 'origin, and every frame translates it between two boxes measured inside the p-safe shell '
+      + '(the dialog\'s avatar and the rail pill), so it never hugs an edge.',
+  },
+  {
+    file: 'src/pages/members/MateEntrance.tsx',
+    classes: 'fixed left-0 top-0 origin-top-left will-change-transform',
+    reason:
+      'The first Mate\'s face in flight from centre stage to the header pill (MateEntrance). '
+      + 'Same shape as CrewFaceFlight: left-0 top-0 is only the transform origin, and the inline '
+      + 'left/top place it on a box measured from the thread area and the pill slot, both inside '
+      + 'the p-safe shell, so it never hugs an edge.',
   },
 ]
 
@@ -347,7 +374,7 @@ describe('fixed surfaces inset themselves from the safe area', () => {
         .toContain('var(--safe-area-top, env(safe-area-inset-top))')
     }
 
-    const indexCss = readFileSync(join(SRC, 'index.css'), 'utf8')
+    const indexCss = readIndexCss()
     // The stylesheet half: 0 by default, env() re-enabled only when the app is
     // the window. Both declarations must survive for the gate to mean anything.
     expect(indexCss).toMatch(/--safe-area-top:\s*0px/)

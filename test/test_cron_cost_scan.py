@@ -223,7 +223,7 @@ class TestMinimalContextBlockers(unittest.TestCase):
         self.assertTrue(any("skill" in b for b in f.blockers))
 
     def test_skill_named_in_prose_blocks_minimal_context(self) -> None:
-        job = _job(message="Load the prepare-pr skill and drive the branch to green.")
+        job = _job(message="Load the kirocrew-prepare-pr skill and drive the branch to green.")
         self.assertEqual(_classify(job).verdict, "leave-as-is")
 
     def test_memory_dependence_blocks_minimal_context(self) -> None:
@@ -496,7 +496,7 @@ class TestPayloadReading(unittest.TestCase):
     def test_empty_input_is_reported_not_raised(self) -> None:
         with self.assertRaises(LookupError) as ctx:
             mod.load_payload("   \n")
-        self.assertIn("pipe", str(ctx.exception))
+        self.assertIn("--input", str(ctx.exception))
 
     def test_a_plain_sentence_from_the_tool_is_relayed_verbatim(self) -> None:
         """cron_list answers prose for an empty or out-of-scope registry."""

@@ -203,7 +203,25 @@ vi.mock('../store', () => ({
   useAppSelector: (sel: (s: unknown) => unknown) => sel(H.storeState),
 }))
 
+/**
+ * A contributed overlay whose chunk import is pending until the test settles
+ * `promise`, then rejects, the way a chunk hash removed by a deploy does. Stable
+ * identity, so a re-render does not remount it.
+ */
+const failingChunk = vi.hoisted(() => {
+  const state = { promise: Promise.resolve() as Promise<void>, settled: false }
+  const Overlay = () => {
+    if (!state.settled) throw state.promise.then(() => { state.settled = true })
+    throw new Error('chunk gone')
+  }
+  return { state, Overlay }
+})
+vi.mock('../apps/overlayRegistry', () => ({
+  getBuiltinOverlay: () => failingChunk.Overlay,
+}))
+
 import CommandPalette from './CommandPalette'
+import QuickSearchSurface from './QuickSearchSurface'
 import { useCommandPalette, DOUBLE_SHIFT_WINDOW_MS } from '../hooks/useCommandPalette'
 import { SHORTCUTS_ENABLED_KEY } from '../hooks/useKeyboardShortcuts'
 import { QUICK_SEARCH_SHORTCUT_KEY } from '../lib/quickSearchShortcut'
@@ -456,6 +474,25 @@ describe('useCommandPalette — configurable activation', () => {
     expect(result.current.open).toBe(true)
   })
 
+  it('double-shift mode: Ctrl+K/⌘K does NOT open the palette (issue #20363)', () => {
+    // Switching to double-Shift is how users reclaim Ctrl+K (the terminal
+    // "clear to end of line" and many inputs' own binding). The alias must not
+    // keep firing, or the setting is useless — the reported bug. Ctrl+K and ⌘K
+    // both fall through to the focused input.
+    localStorage.setItem(QUICK_SEARCH_SHORTCUT_KEY, JSON.stringify({ mode: 'double-shift' }))
+    const { result } = renderHook(() => useCommandPalette())
+    act(() => { fireEvent.keyDown(window, { key: 'k', ctrlKey: true }) })
+    expect(result.current.open).toBe(false)
+    act(() => { fireEvent.keyDown(window, { key: 'k', metaKey: true }) })
+    expect(result.current.open).toBe(false)
+    // The chosen double-Shift gesture still works.
+    act(() => {
+      fireEvent.keyDown(window, { key: 'Shift' })
+      fireEvent.keyDown(window, { key: 'Shift' })
+    })
+    expect(result.current.open).toBe(true)
+  })
+
   it('mod-k mode: ⌘K/Ctrl+K toggles, but double-Shift no longer opens', () => {
     localStorage.setItem(QUICK_SEARCH_SHORTCUT_KEY, JSON.stringify({ mode: 'mod-k' }))
     const { result } = renderHook(() => useCommandPalette())
@@ -548,6 +585,32 @@ describe('CommandPalette — render', () => {
     }
     rerender(<CommandPalette open onClose={vi.fn()} />)
     await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(4))
+  })
+
+  it('refreshes recents when last_ts advances beyond a nonempty activity timestamp', async () => {
+    H.storeState.dashboard.slots = [
+      {
+        key: 'chat-1',
+        title: 'Live session',
+        running: false,
+        messages: 2,
+        last_activity_ts: '2026-07-19T10:00:00Z',
+        last_ts: '2026-07-21T10:00:00Z',
+      },
+    ]
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    expect(H.recentsProvider.search).toHaveBeenCalledTimes(1)
+
+    H.storeState.dashboard.slots = [
+      {
+        ...H.storeState.dashboard.slots[0],
+        last_ts: '2026-07-22T10:00:00Z',
+      },
+    ]
+    rerender(<CommandPalette open onClose={vi.fn()} />)
+
+    await waitFor(() => expect(H.recentsProvider.search).toHaveBeenCalledTimes(2))
   })
 
   it('refreshes recents when the simplified-tool-names preference changes', async () => {
@@ -1178,5 +1241,116 @@ describe('CommandPalette — sub-threshold min-query empty state (issue #1830)',
 
     expect(await screen.findByText('No matches', {}, { timeout: 2000 })).toBeInTheDocument()
     expect(screen.queryByText(KEEP_TYPING)).toBeNull()
+  })
+})
+
+/**
+ * Dismissing the palette gives focus back to whatever held it when
+ * the palette opened (falling back to the chat composer when that element is
+ * gone). Choosing a row does NOT restore: the chosen action owns focus.
+ */
+describe('CommandPalette — focus restore on close', () => {
+  function outside(tag: 'button' | 'textarea', attrs: Record<string, string> = {}) {
+    const el = document.createElement(tag)
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v)
+    document.body.appendChild(el)
+    return el
+  }
+  afterEach(() => {
+    document.body.querySelectorAll('[data-test-outside]').forEach(el => el.remove())
+  })
+
+  it('refocuses the element that was focused before the palette opened', async () => {
+    const prev = outside('button', { 'data-test-outside': '' })
+    prev.focus()
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    // The palette's input takes focus on the next frame.
+    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('input')))
+
+    rerender(<CommandPalette open={false} onClose={vi.fn()} />)
+
+    expect(document.activeElement).toBe(prev)
+  })
+
+  it('falls back to the chat composer when the previous element is gone', async () => {
+    const composer = outside('textarea', { 'data-test-outside': '', 'data-composer-input': '' })
+    const prev = outside('button', { 'data-test-outside': '' })
+    prev.focus()
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+    prev.remove()
+
+    rerender(<CommandPalette open={false} onClose={vi.fn()} />)
+
+    expect(document.activeElement).toBe(composer)
+  })
+
+  it('leaves focus alone when nothing was focused before opening', async () => {
+    const composer = outside('textarea', { 'data-test-outside': '', 'data-composer-input': '' })
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    const { rerender } = render(<CommandPalette open onClose={vi.fn()} />, { wrapper })
+    await screen.findByText('Recent Session')
+
+    rerender(<CommandPalette open={false} onClose={vi.fn()} />)
+
+    expect(document.activeElement).not.toBe(composer)
+  })
+
+  it('does not restore after a row is chosen (its action owns focus)', async () => {
+    const prev = outside('button', { 'data-test-outside': '' })
+    prev.focus()
+    const onClose = vi.fn()
+    const { rerender } = render(<CommandPalette open onClose={onClose} />, { wrapper })
+    await screen.findByText('Recent Session')
+    await waitFor(() => expect(document.activeElement).toBe(document.querySelector('input')))
+
+    act(() => H.nav.current?.onChoose?.(0, false))
+    expect(onClose).toHaveBeenCalledTimes(1)
+    rerender(<CommandPalette open={false} onClose={onClose} />)
+
+    expect(document.activeElement).not.toBe(prev)
+  })
+})
+
+describe('CommandPalette — fallback for a failed overlay chunk', () => {
+  it('opens on the keys typed before the chunk failed, and Enter acts on them', async () => {
+    // QuickSearchSurface falls back to this palette when the overlay's import rejects.
+    // Keys typed while the import was pending must arrive here: opening on an empty
+    // query shows the recents list, and Enter would switch to the newest session.
+    let release: () => void = () => {}
+    failingChunk.state.settled = false
+    failingChunk.state.promise = new Promise<void>(r => { release = r })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const onClose = vi.fn()
+      render(
+        <QuickSearchSurface
+          owners={{ 'quick-search': { app: 'command-bar', overlayId: 'command-bar' } }}
+          open
+          onClose={onClose}
+        />,
+        { wrapper },
+      )
+      const catcher = document.activeElement as HTMLInputElement
+      expect(catcher.tagName).toBe('INPUT')
+      fireEvent.change(catcher, { target: { value: 'alice' } })
+      await act(async () => { release(); await failingChunk.state.promise })
+
+      const input = await screen.findByRole('textbox', { name: 'Search everywhere' })
+      expect(input).toHaveValue('alice')
+      expect(await screen.findByText('All Result')).toBeInTheDocument()
+      expect(H.allProvider.search).toHaveBeenCalledWith('alice')
+      expect(screen.queryByText('Recent Session')).toBeNull()
+
+      act(() => H.nav.current?.onChoose?.(0, false))
+      expect(H.onActivateAll).toHaveBeenCalledTimes(1)
+      expect(H.onActivateRecent).not.toHaveBeenCalled()
+      expect(onClose).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+      error.mockRestore()
+    }
   })
 })

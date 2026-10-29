@@ -5,9 +5,10 @@ import { useQuickSearchShortcut } from '../../hooks/useQuickSearchShortcut'
 import { usePanelToggleShortcuts } from '../../hooks/usePanelToggleShortcuts'
 import { useGlobalHotkey } from '../../hooks/useGlobalHotkey'
 import { formatChordKeys, type QuickSearchMode } from '../../lib/quickSearchShortcut'
-import { PANEL_TOGGLE_IDS, PANEL_TOGGLES_SKIPPING_SHELL } from '../../lib/panelToggleShortcuts'
+import { PANEL_TOGGLE_IDS, PANEL_TOGGLES_SKIPPING_SHELL, TERMINAL_PANEL_TOGGLE_IDS } from '../../lib/panelToggleShortcuts'
 import { useTerminalEnabled } from '../../utils/terminalRegistry'
 import { Btn } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 
 import { i18nT } from '../../i18n/t'
 /**
@@ -73,7 +74,7 @@ function PanelToggleConfig() {
   const terminalEnabled = useTerminalEnabled()
   return (
     <>
-      {PANEL_TOGGLE_IDS.filter(id => id !== 'terminal' || terminalEnabled).map(id => {
+      {PANEL_TOGGLE_IDS.filter(id => !TERMINAL_PANEL_TOGGLE_IDS.has(id) || terminalEnabled).map(id => {
         const chord = bindings[id]
         const recording = recordingId === id
         const caps = chord ? formatChordKeys(chord) : []
@@ -134,7 +135,7 @@ function PanelToggleConfig() {
  * discoverable, permanent home in Settings.
  */
 export function ShortcutsPanel() {
-  const { enabled, macCtrl, toggle, toggleMacCtrl } = useShortcutPrefs()
+  const { enabled, macCtrl, toggle, toggleMacCtrl, saveError } = useShortcutPrefs()
   const globalHotkey = useGlobalHotkey()
 
   return (
@@ -150,10 +151,13 @@ export function ShortcutsPanel() {
         {IS_MAC && (
           <SettingsToggle
             label={i18nT('pages.settings.shortcutsPanel.use_ctrl_not_option_for_chat_1_9')}
-            description={i18nT('pages.settings.shortcutsPanel.bind_chat_tab_switching_to_ctrl_digit_instead_of')}
+            hint={i18nT('pages.settings.shortcutsPanel.bind_chat_tab_switching_to_ctrl_digit_instead_of')}
             checked={macCtrl}
             onChange={toggleMacCtrl}
           />
+        )}
+        {saveError && (
+          <ErrorNotice variant="inline" message={saveError} askAgent testId="shortcut-pref-save-error" className="px-2 pb-2" />
         )}
       </SettingsCard>
       {SHORTCUT_GROUPS.map((group, gi) => {
@@ -185,7 +189,7 @@ export function ShortcutsPanel() {
           <SettingsSection title={i18nT('components.shortcutsModal.desktop_app')} />
           <SettingsCard>
             <GlobalHotkeyRow />
-            <div className="text-[12px] text-muted px-2 pb-1">{i18nT('components.shortcutsModal.global_hotkey_hint')}</div>
+            <div className="text-[12px] text-muted px-2 pb-1">{i18nT(globalHotkey.accelerator ? 'components.shortcutsModal.global_hotkey_hint' : 'components.shortcutsModal.global_hotkey_hint_off')}</div>
           </SettingsCard>
         </div>
       )}

@@ -135,6 +135,23 @@ def _probe_credential(
     return mtime, _content_digest(cred_path)
 
 
+async def _fire_on_change(on_change: OnChange, logger: logging.Logger) -> None:
+    """Invoke ``on_change``, awaiting it when it returns an awaitable.
+
+    Every ``Exception`` is logged and swallowed: one bad handler must not kill
+    the poll loop, because nothing retries it and a dead watcher silently stops
+    noticing rotations and revocations. ``BaseException`` still propagates, so a
+    cancel landing while the handler is awaiting unwinds the loop as usual; the
+    ordinary exit is ``stop_event``, which raises nothing and never reaches here.
+    """
+    try:
+        result = on_change()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception("credential watcher: on_change handler failed; continuing")
+
+
 async def watch_credential(
     cred_path: Path,
     interval_secs: float,
@@ -155,8 +172,8 @@ async def watch_credential(
         on_change: Sync or async no-arg callable invoked after every
             detected content change (not on the baseline observation, and
             not on an mtime-only no-op rewrite).
-        logger: ``logging.Logger`` used for state-change INFO and
-            handler-error WARNING messages.
+        logger: ``logging.Logger`` used for state-change INFO, probe-failure
+            WARNING and handler-error ERROR messages.
         on_probe_complete: Test seam, ``None`` in production. Optional
             no-arg callable invoked after every probe cycle finishes,
             including cycles that fire nothing. It lets a caller await
@@ -235,16 +252,9 @@ async def watch_credential(
                         )
                         baseline_mtime = None
                         baseline_digest = None
-                        try:
-                            result = on_change()
-                            if inspect.isawaitable(result):
-                                await result
-                        except Exception:
-                            logger.exception(
-                                "credential watcher: on_change handler failed; continuing"
-                            )
-                    # Already absent (baseline_digest is None) — nothing to compare;
-                    # wait for it to (re)appear.
+                        await _fire_on_change(on_change, logger)
+                    # Otherwise the file was already absent at the previous poll —
+                    # nothing to compare; wait for it to (re)appear.
                     continue
 
                 if not baseline_established:
@@ -274,12 +284,7 @@ async def watch_credential(
                     )
                     baseline_mtime = mtime
                     baseline_digest = digest
-                    try:
-                        result = on_change()
-                        if inspect.isawaitable(result):
-                            await result
-                    except Exception:
-                        logger.exception("credential watcher: on_change handler failed; continuing")
+                    await _fire_on_change(on_change, logger)
                     continue
 
                 if digest == baseline_digest:
@@ -307,12 +312,7 @@ async def watch_credential(
                 )
                 baseline_mtime = mtime
                 baseline_digest = digest
-                try:
-                    result = on_change()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception:
-                    logger.exception("credential watcher: on_change handler failed; continuing")
+                await _fire_on_change(on_change, logger)
             finally:
                 # Fire on EVERY path out of the body, including the six
                 # ``continue`` branches. A caller that awaits this seam to

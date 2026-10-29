@@ -55,7 +55,10 @@ notification_channel_settings IS attributable -- its channel is `<app>.<id>` or
 `system.<kind>` -- so own-channel settings ride `notification`, system channels
 ride `notification:system`, and foreign channels need `notification:all`.
 notification:all        All notifications regardless of source (broad).
-sessions                sessions_restarting
+sessions                sessions_restarting, session_health_changed
+                        (``session_health_changed`` is a bare ``{"ts": ...}``
+                        refresh signal -- it reports THAT the health verdict
+                        moved, never what it says)
 yolo                    yolo_expired
 artifacts               artifact_update ({slug, version, deleted}; metadata only)
 workflow_run_event      Declared by its own literal name -- already the correct
@@ -91,10 +94,10 @@ from typing import TYPE_CHECKING, Any
 # circular import: apps.manager imports config helpers that transitively pull
 # in ``kiro_crew.dashboard.state``; keeping ``get_app_manifest`` at module
 # scope requires it to load after this module's own definitions are visible,
-# which the current import order satisfies (state.py imports us lazily inside
+# which the current import order satisfies (state_parts/slots_push.py imports us lazily inside
 # broadcast_ws, and ws.py imports us before apps.manager). Kept top-level per
 # the top-level-imports guideline.
-from kiro_crew.apps.manager import get_app_manifest, is_app_enabled
+from kiro_crew.apps.manager import get_app_manifest, is_app_enabled, staged_app_grants
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState, _ChatSlot
@@ -117,6 +120,18 @@ logger = logging.getLogger(__name__)
 _SEL_DEDUP_WINDOW_SECS = 300.0  # 5 minutes
 #: (app, event_type, reason) -> (last emitted monotonic ts, denies suppressed since)
 _sel_last_audit: dict[tuple[str, str, str], tuple[float, int]] = {}
+
+#: SEL ``caller`` for a grant made to a socket authenticated as the dashboard
+#: user. Such a socket carries an EMPTY app claim (``ws["_app"] == ""``), so
+#: keyed by app its grants would land in the ``<unknown>`` bucket next to an
+#: unnamed app token's and the operator could not tell the two apart -- which
+#: is the one thing the record exists to tell them. Angle brackets keep the
+#: label outside the app-id namespace (``manifest.KEBAB_RE`` admits only
+#: ``[a-z0-9-]``), so no manifest can claim it. Also the dedup key, so all
+#: dashboard sockets share one window per event type; the per-frame decision
+#: is the highest-volume class in the trail and one record per window is what
+#: ``_audit_decision``'s contract already promises for grants.
+DASHBOARD_USER_AUDITEE = "<dashboard-user>"
 
 
 def _audit_decision(app: str, event_type: str, outcome: str, dedup_reason: str) -> None:
@@ -205,6 +220,8 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "chat_segment", "chat_append", "chat_message_update", "chat_variant_switch",
     # Side-conversation channel (``broadcast_side_result``); carries ``slot``.
     "chat.side_result",
+    # Reply-thread channel (``broadcast_thread_reply``); carries ``slot``.
+    "chat.thread_reply",
     "heartbeat", "context_usage",
     # Tool / queue
     "tool_call", "tool_result",
@@ -223,9 +240,10 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "approval", "approval_resolved", "question_card",
     # Subagent lifecycle. Every one of these is fired through
     # ``SubagentManager._fire_event`` and reaches the wire via
-    # ``broadcast_ws(etype, ...)`` with a VARIABLE etype (slack/gateway.py's
-    # ``_subagent_event``), so a guard that scans broadcast call sites for string
-    # literals cannot see them -- ``TestFireEventNamesAreClassified`` reads the
+    # ``broadcast_ws(etype, ...)`` with a VARIABLE etype (the ``_subagent_event``
+    # closure in slack/gateway_runtime/subagent_wiring.py), so a guard that scans
+    # broadcast call sites for string literals cannot see them --
+    # ``TestFireEventNamesAreClassified`` reads the
     # emitter's own literals instead. Each payload carries id + slot.
     "subagent_spawn", "subagent_done", "subagent_tool", "subagent_chunk",
     "subagent_snapshot", "subagent_status", "subagent_queued",
@@ -266,18 +284,43 @@ _SUBAGENT_BATCH_ITEM_KEY = {
 }
 
 # ---------------------------------------------------------------------------
-# Owner-only event types: the dashboard USER receives them (dashboard-user
-# tokens bypass this gate entirely), but an app token never does. The
-# per-member event log's frames belong here — they carry the operator's crew
+# Owner-only event types: an app token never receives them. The per-member
+# event log's frames (``MEMBER_LOG_EVENTS``) go further and reach only the
+# OWNER's dashboard socket: a non-owner dashboard session is refused them in
+# ``WebSocketHub._ws_client_allowed``, the same boundary the ``/api/members``
+# reads apply. The per-member event log's frames belong here — they carry the operator's crew
 # roster/activity/patrol state, which is not an app's business (the same
 # posture the whole ``handlers/members.py`` surface takes: app tokens are
 # denied outright). Classified here rather than left to the unknown-event
 # floor so the denial is INTENTIONAL and audited with its own reason instead
 # of reading as a misconfiguration, and so a future literal broadcast of one
 # of these names cannot silently start reaching app tokens.
-_OWNER_ONLY_EVENTS = frozenset({
+MEMBER_LOG_EVENTS = frozenset({
     "member_projection",   # types.WS_MEMBER_PROJECTION
     "members_subscribed",  # types.WS_MEMBERS_SUBSCRIBED
+})
+
+_OWNER_ONLY_EVENTS = MEMBER_LOG_EVENTS | frozenset({
+    # Per-row slot metadata edits. Sent only to dashboard-user sockets that
+    # declared the capability; an app token gets its filtered full list.
+    "slot_patch",
+    # UI-guide state (``handlers/guide.py``, ``deliver_ws_owners``). The guide is
+    # the operator's own dashboard being steered; no app token may watch it.
+    "guide_update",
+    # A live-observation request to one owner tab (``handlers/guide.py``): ids
+    # only, but which controls the agent is asking about is the operator's own.
+    "guide_observe",
+    # One crewmate's dashboard field values
+    # (``handlers/member_dashboard_fields.FIELD_FRAME``). Sent through
+    # ``broadcast_ws_owners``, so an app token is already outside the socket set
+    # it reaches, and the classification guard does not scan that fan-out --
+    # classified anyway, for the reason the comment above this set gives: the
+    # frame carries work-ledger and crew-log values, which is what the whole
+    # ``/api/members`` surface withholds from an app, so the denial should be the
+    # intentional one with its own audit reason rather than the unknown-event
+    # floor, and a later literal broadcast of this name must not silently start
+    # reaching an app token.
+    "dashboard_fields",
 })
 
 
@@ -361,6 +404,14 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
     # the notification events themselves, so it rides the same declaration.
     "notification_channel_settings": "notification",
     "sessions_restarting": "sessions",
+    # A bare {"ts": ...} refresh signal -- no slot, no session key, no counts.
+    # It says the session-health verdict moved and nothing about what it says, so
+    # it rides the declaration that already governs the session domain rather
+    # than inventing a scope. `events` and `api` are independent manifest fields,
+    # so a holder of `sessions` is NOT thereby a reader of
+    # `GET /api/sessions/health`; the frame discloses nothing that endpoint
+    # would, and a holder of nothing still gets neither.
+    "session_health_changed": "sessions",
     "yolo_expired": "yolo",
     # Artifact metadata only ({slug, version, deleted}) -- no content, no slot.
     "artifact_update": "artifacts",
@@ -379,6 +430,21 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
     # (the ownership digest is withheld), and a client that acts on it re-reads
     # through the panel route, which re-applies the ownership check.
     "panel_published": "panels",
+    # Metadata only ({slug}) and no slot, and it rides `panels` for exactly the
+    # reason `panel_published` above does: the slug names a crewmate's own
+    # dashboard, so an app has no business learning that roster from a refresh
+    # ping. The frame says a value moved and nothing about the value; a client
+    # that acts on it re-reads through the panel route, which re-applies the
+    # ownership check.
+    "dashboard_value_written": "panels",
+    # Metadata only ({slug}) and no slot, on `panels` for its sibling's reasons
+    # above. It says a crewmate's PAGE changed -- a template applied or a version
+    # rolled back -- and nothing about which page or what is on it, so a client that
+    # acts on it re-reads through the dashboard route, which is owner-gated and
+    # re-applies that check. Declared rather than left to a tier for the same
+    # reason: an app has no business learning the crewmate roster from a refresh
+    # ping, and an unclassified event silently never reaches an app token at all.
+    "dashboard_instance_changed": "panels",
     # Privileged
     "log": "log",
     "browser_event": "browser",
@@ -401,6 +467,29 @@ _GLOBAL_EVENT_DECLARATIONS: dict[str, str] = {
 #: SDK reads it, so it is withheld from app tokens outright instead of growing
 #: the grant surface for a field with no consumer.
 _YOLO_SCOPE = _GLOBAL_EVENT_DECLARATIONS["yolo_expired"]
+
+
+def global_event_declared(event_type: str, allowed_events: frozenset[str]) -> bool:
+    """Does *allowed_events* carry the declaration that governs *event_type*?
+
+    A work-avoidance predicate, NOT the security gate: it lets a caller skip
+    producing an event no connection can receive. The gate stays
+    :func:`ws_event_allowed`, which every broadcast still passes through, so a
+    True here never admits a frame on its own -- and it deliberately does not
+    audit, because answering "would this connection ever want the event" is not a
+    grant and recording it as one would bury the real decisions.
+
+    Reads the same table and accepts the same ``<decl>`` / ``<decl>:all`` spelling
+    as the global-declaration branch of :func:`_decide_ws_event`, so the two
+    cannot drift. An unknown event is False, matching that branch's
+    deny-by-default. A dashboard user is also False: its socket carries no
+    declaration set at all (it is not gated by declarations), so a caller that
+    means "someone asked for this" must not read an empty set as consent.
+    """
+    required_decl = _GLOBAL_EVENT_DECLARATIONS.get(event_type)
+    if required_decl is None:
+        return False
+    return required_decl in allowed_events or f"{required_decl}:all" in allowed_events
 
 
 def slots_envelope_extras(
@@ -695,7 +784,7 @@ def _slot_visible(
     state: DashboardState,
 ) -> bool:
     """Return True if *app* may receive slot-scoped events for *slot*."""
-    # circular import: state.py's broadcast_ws imports ws_event_allowed from
+    # circular import: state_parts/slots_push.py's broadcast_ws imports ws_event_allowed from
     # this module at runtime; importing SlotOrigin at module scope would
     # create a bootstrap cycle during state.py initialisation.
     from kiro_crew.dashboard.state import SlotOrigin
@@ -725,6 +814,178 @@ def _slot_visible(
             return True
 
     return False
+
+
+def persisted_replay_denial_reason(state: Any, slot_key: str, record: dict) -> str:
+    """``""`` when a persisted run may be replayed into *slot_key*, else the reason.
+
+    Companion to :func:`_subagent_visible` below, and it lives here for that
+    reason: that gate answers "may this app receive subagent events for this
+    slot" from the slot's CURRENT owner, which is the right question for a live
+    run and the wrong one for a run read back off disk. Slot keys are
+    caller-supplied and are not namespaced by app, so the key an app's run was
+    recorded under can later be created by a DIFFERENT app -- and the gate would
+    then admit the old run to the new owner. The run's own recorded app is the
+    missing half of the decision, so it is compared here.
+
+    Two refusals, not one, because they mean different things and an operator
+    reads the reason: ``slot_missing`` is the same reason the live gate gives when
+    no slot answers the key, which on a lazily hydrated slot is ordinary rather
+    than adversarial; ``persisted_owner_mismatch`` is a real cross-owner refusal.
+    Collapsing them would file every cold-start reconnect as a security event and
+    dilute the stream the real one has to be visible in.
+
+    Equality both ways, and fail closed. A run no app owns carries ``""``, which
+    matches only a slot no app owns, so an app never receives a person's run and
+    a person never receives an app's. ``get_slot`` is deliberate over a raw
+    ``_slots`` read: it also answers ``None`` for a slot still under
+    construction, and an admission decision must not be made against a
+    not-yet-finalized session.
+    """
+    if not slot_key:
+        return "slot_missing"
+    getter = getattr(state, "get_slot", None)
+    if callable(getter):
+        slot = getter(slot_key)
+    else:
+        slot = getattr(state, "_slots", {}).get(slot_key)
+    if slot is None:
+        return "slot_missing"
+    if str(getattr(slot, "_app", "") or "") != str(record.get("app") or ""):
+        return "persisted_owner_mismatch"
+    return ""
+
+
+def slot_owner_snapshot(state: object) -> dict[str, str]:
+    """Every live slot's current owning app, as a plain mapping.
+
+    Taken on the EVENT LOOP so an off-loop scan can size its row cap over the
+    records a socket may actually see, without that scan reading live state from
+    a worker thread. It is a snapshot and nothing more: the decision to deliver a
+    record is taken again on the loop by ``persisted_replay_denial_reason``,
+    because a slot's owner can be reclaimed while the scan runs.
+    """
+    slots = dict(getattr(state, "_slots", {}) or {})
+    return {key: str(getattr(slot, "_app", "") or "") for key, slot in slots.items()}
+
+
+def persisted_snapshot_denial_reason(
+    snapshot: dict[str, str], slot_key: str, record: object
+) -> str:
+    """``""`` when a snapshot of slot owners would admit this record, else the reason.
+
+    The same answer shape as :func:`persisted_replay_denial_reason`, deliberately:
+    these are the two halves of ONE decision -- this one sizes the cap off-loop,
+    that one decides delivery on the loop -- and a bool here could not name which
+    refusal happened, so a caller would have to withhold the record silently.
+    Withholding IS the permission decision, so it carries the same two reasons the
+    authoritative half gives, and the same fail-closed default: a slot the
+    snapshot does not hold is refused rather than assumed absent-and-harmless.
+
+    Its answer governs only the cap: admitting a foreign record here would spend a
+    slot the caller's own runs need, and counting one would disclose how many
+    foreign runs exist.
+    """
+    if not slot_key or slot_key not in snapshot:
+        return "slot_missing"
+    getter = getattr(record, "get", None)
+    if not callable(getter):
+        return "slot_missing"
+    if snapshot[slot_key] != str(getter("app") or ""):
+        return "persisted_owner_mismatch"
+    return ""
+
+
+def visible_subagent_slot_keys(
+    state: Any,
+    app: str,
+    allowed_events: frozenset[str],
+    *,
+    dashboard_user: bool,
+) -> set[str]:
+    """Slot keys this client may receive subagent events for, as a plain set.
+
+    Taken on the EVENT LOOP for the same reason as :func:`slot_owner_snapshot`,
+    and for the same consumer: an off-loop scan needs to size its row cap over
+    the records this client may actually SEE, and visibility is a live-state
+    question. Without it the cap is spent on records the per-frame gate will drop
+    afterwards, so a burst of invisible newer runs hides the client's own older
+    visible ones -- and the cut count, computed over the wrong set, reports
+    nothing was lost.
+
+    Ownership and visibility are INDEPENDENT bounds and both are needed: a record
+    may name a slot this client owns yet carry an event the client never declared,
+    and it may be visible under a declaration while belonging to another app. The
+    authoritative per-frame gate still runs afterwards; this only decides the cap.
+
+    Safe to use BEFORE the cap even though the answer can move between the two
+    evaluations, because of which way it moves. ``app_events_revoked`` reports NOT
+    revoked on a cold cache and schedules the refresh, so the cold answer is the
+    OPEN one and warming can only narrow it -- pre-cap open then post-cap closed
+    costs a cap slot, which the authoritative gate then correctly reclaims. The
+    losing direction needs the opposite move, closed here and open there, which
+    takes an app being re-enabled mid-scan; that costs one run one replay and the
+    next reconnect carries it. A record whose slot is not live at all is not this
+    predicate's case: the ownership half answers ``slot_missing`` for it.
+    """
+    slots = dict(getattr(state, "_slots", {}) or {})
+    if dashboard_user:
+        # The dashboard user passes the per-frame gate unconditionally, so every
+        # live slot is visible and the cap is already sized over the right set.
+        return set(slots)
+    if not app:
+        return set()
+    return {
+        key
+        for key, slot in slots.items()
+        if _subagent_visible(slot, app, allowed_events, state)
+    }
+
+
+def persisted_precap_readings(
+    state: Any,
+    app: str,
+    allowed_events: frozenset[str],
+    *,
+    dashboard_user: bool,
+) -> tuple[dict[str, str], set[str]]:
+    """The two loop-taken readings :func:`persisted_precap_denial_reason` consumes.
+
+    Built here, as one named unit, so the pairing is a tested thing rather than two
+    inline calls at a call site no test can reach. The order matters to nobody but
+    the type checker; what matters is that BOTH are taken, from the same state, at
+    the same instant, before the off-loop scan starts.
+    """
+    return (
+        slot_owner_snapshot(state),
+        visible_subagent_slot_keys(state, app, allowed_events, dashboard_user=dashboard_user),
+    )
+
+
+def persisted_precap_denial_reason(
+    owners: dict[str, str],
+    visible_keys: set[str],
+    slot_key: str,
+    record: object,
+) -> str:
+    """``""`` when the pre-cap bounds admit this record, else the reason.
+
+    The WHOLE pre-cap decision, in one place, because it has two independent
+    halves and splitting them across a caller invites one of them to be forgotten
+    on the next read path: visibility answers whether this client may receive the
+    record at all, ownership answers whether the run belongs to the slot's present
+    owner. Both are live-state questions, so both arrive as loop-taken readings --
+    ``visible_subagent_slot_keys`` and ``slot_owner_snapshot`` -- and both decide
+    the cap only, with the authoritative per-frame gate still running afterwards.
+
+    Visibility is checked FIRST because it is the broader refusal: a record this
+    client cannot see is not its business whoever owns the slot, and reporting it
+    as an ownership mismatch would put a declaration gap into the stream an
+    operator reads for cross-app breaches.
+    """
+    if slot_key not in visible_keys:
+        return "persisted_not_visible"
+    return persisted_snapshot_denial_reason(owners, slot_key, record)
 
 
 def _subagent_visible(
@@ -952,10 +1213,14 @@ def _read_declared_events(app: str) -> tuple[bool, frozenset[str]]:
     if not enabled:
         return (False, frozenset())
     try:
-        manifest = get_app_manifest(app)
-        if manifest is None:
-            return (True, frozenset())
-        return (True, build_allowed_event_set(list(manifest.permissions.events)))
+
+        def _declared() -> list[str] | None:
+            manifest = get_app_manifest(app)
+            return None if manifest is None else list(manifest.permissions.events)
+
+        # An update's added entries stay out until the owner approves them.
+        approved = staged_app_grants(app, "events", _declared)
+        return (True, build_allowed_event_set(approved))
     except Exception:
         logger.debug("ws_event_scope: could not reload declarations for %r", app)
         return (True, frozenset())
@@ -1143,7 +1408,7 @@ def filter_slots_for_app(
         if slot is None:
             continue
         if _slot_visible(slot, app, allowed_events, state):
-            result.append(_strip_source_link_status(slot_dict))
+            result.append(_strip_pin_rank(_strip_source_link_status(slot_dict)))
             _audit_allow(app, "slots_item")
         else:
             _audit_deny(app, "slots_item", "slot_scope_denied")
@@ -1155,7 +1420,21 @@ def filter_slots_for_app(
 # an app token must never receive provider status — its scope is slot metadata,
 # not the operator's credential-backed view of a repository. Stripped here so
 # widening the general list for dashboard users cannot leak into an app frame.
-_SOURCE_LINK_STATUS_KEYS = ("ci", "state", "mergeable", "mergeStateStatus")
+_SOURCE_LINK_STATUS_KEYS = ("ci", "ciPending", "state", "mergeable", "mergeStateStatus")
+
+
+def _strip_pin_rank(slot_dict: dict[str, Any]) -> dict[str, Any]:
+    """Return *slot_dict* without its pinned-order fields.
+
+    A rank is a position in the person's whole pinned order, so in a filtered
+    view the gaps between the ranks left would count the pinned sessions the
+    caller cannot see. The order is the person's; scoped callers get none of it.
+    """
+    from kiro_crew.dashboard.pinned_session_order import PIN_ORDER_FIELDS
+
+    if PIN_ORDER_FIELDS.isdisjoint(slot_dict):
+        return slot_dict
+    return {k: v for k, v in slot_dict.items() if k not in PIN_ORDER_FIELDS}
 
 
 def _strip_source_link_status(slot_dict: dict[str, Any]) -> dict[str, Any]:

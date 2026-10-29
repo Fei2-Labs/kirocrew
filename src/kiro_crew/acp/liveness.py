@@ -4,14 +4,16 @@ A timeout is a poor death detector: a stale-turn window (90s) or a tool-stall
 window (600s) kills healthy-but-slow work — a silent 30-minute redirected
 build, a ``wait(1800)`` poll, or a long non-streamed reasoning stretch. This
 module inverts that shape: an EFFECTIVE per-session oracle returns a verdict
-with evidence, so the watchdog in ``session_handle.py`` acts FASTER on real
+with evidence, so the watchdog in ``session_handle_dispatch.py`` acts FASTER on real
 deaths and never on healthy work.
 
     verdict = oracle(session) -> WORKING | DEAD | STUCK_INPUT | UNKNOWN
 
-Policy (enforced by the caller in ``session_handle._dispatch_events``):
+Policy (enforced by the caller in ``session_handle_dispatch._dispatch_events``):
 
-- ``WORKING``     -> never act (log once per interval at most).
+- ``WORKING``     -> never act (log once per interval at most), except an
+  opaque MCP tool's ``mcp subtree active`` reading, which the tool branch
+  bounds by ``watchdog.tool_stall_hard_cap_secs``.
 - ``DEAD``        -> act immediately: recovery lands seconds after actual death
                      instead of at a blanket 90s/600s timeout.
 - ``STUCK_INPUT`` -> act immediately, with a cause the recovery nudge can name
@@ -37,7 +39,11 @@ macOS, no new dependencies):
 - **MCP ``wait`` tool**: declared-duration contract — WORKING until the parsed
   ``seconds`` (+ slack) elapse, then UNKNOWN.
 - **Other MCP tools**: sample the descendant tree's CPU/IO movement across
-  successive checks; moving -> WORKING, flat -> UNKNOWN.
+  successive checks; moving -> WORKING, flat -> UNKNOWN. A flat tree in which
+  the in-flight tool's OWN MCP server (or a process below it) holds an
+  established TCP connection carries the :data:`EVIDENCE_REMOTE_FLAT` tag (a
+  tool blocked on its own remote call), read from ``/proc`` on Linux and from
+  libproc's socket fd info on macOS.
 - **Model-wait (no tool in flight)**: sample the tree's IO/CPU counters across
   checks (token/keepalive receipt moves them) and its established TCP sockets.
   Flat counters with NO established backend socket is the done-but-lost-frame
@@ -54,13 +60,14 @@ cmdline the SAME matching rules run against, and ``PROC_PIDTASKINFO`` sums the
 subtree's CPU time. That gives macOS the shell-child match / exit detection /
 absence narrowing and the MCP-subtree movement probe, with movement being
 CPU-only (the evidence string says so — there is no per-process IO counter to
-read). What has no libproc equivalent stays exactly as absent: no socket
-evidence (so a flat model wait is UNKNOWN, never DEAD, and never tagged
-``established_flat``), no wchan / blocked-fd evidence (so STUCK_INPUT is never
-claimed — a live tracked child whose subtree is flat is UNKNOWN tagged
-``platform_limited`` instead of WORKING, so it is bounded rather than deferred
-forever). The backend is injectable (``darwin_backend`` ctor arg), and the
-Linux path is untouched by its presence.
+read). libproc's socket fd info feeds only the ``remote_flat`` scan of the
+in-flight tool's own server. What has no libproc equivalent stays exactly as
+absent: no model-wait socket evidence (so a flat model wait is UNKNOWN, never
+DEAD, and never tagged ``established_flat``), no wchan / blocked-fd evidence (so
+STUCK_INPUT is never claimed — a live tracked child whose subtree is flat is
+UNKNOWN tagged ``platform_limited`` instead of WORKING, so it is bounded rather
+than deferred forever). The backend is injectable (``darwin_backend`` ctor arg),
+and the Linux path is untouched by its presence.
 
 Every probe is wrapped: any error degrades the verdict to UNKNOWN — never to a
 kill. Each check is cheap (<10ms of file reads); two-sample deltas are computed
@@ -103,8 +110,27 @@ flat on macOS/Windows is classified as waiting for input at the (narrowed)
 budget rather than as an opaque stall.
 
 Attribution on a shared runtime: each handle probes only ITS OWN runtime pid,
-and the cmdline match keys shell evidence to THIS session's in-flight command.
-Where attribution is impossible the verdict degrades to UNKNOWN.
+but a runtime can host several sessions, and then that pid's process tree is not
+one session's. Which probes survive that is not uniform, so it is stated per
+probe rather than claimed for the module:
+
+- the cmdline match keys shell evidence to THIS session's in-flight command, so
+  the shell branch attributes;
+- the ``remote_flat`` socket scan reads only the subtree of the process that
+  was launched as the in-flight tool's own MCP server, and declines when that
+  process is not found exactly once (a second copy of the server is another
+  session's or a subagent's), so it attributes too;
+- the movement and model-wait socket probes read the WHOLE tree, so a
+  co-tenant's build reads as this session's progress and a co-tenant's backend
+  connection suppresses this session's wedge signature. Both of those err
+  toward forbearance, which costs detection latency and no work;
+- the one reading that is acted on at once, the model-wait DEAD, is therefore
+  gated on declared tenancy: with co-tenants it degrades to UNKNOWN tagged
+  :data:`EVIDENCE_SHARED_TREE` and the caller's stale window governs instead.
+  Pass ``tenancy`` to declare it; a caller that declares nothing gets the
+  historical single-tenant reading.
+
+Where attribution is impossible the verdict degrades to UNKNOWN, never to a kill.
 
 Unit-testable against a fake ``/proc`` tree via the ``proc_root`` ctor arg and
 an injectable ``now`` clock.
@@ -113,946 +139,125 @@ an injectable ``now`` clock.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import re
-import sys
+import sys  # noqa: F401 - re-exported: tests patch sys.platform through it
 import time
+from collections.abc import Mapping
 from concurrent.futures import Executor
-from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Protocol
 
 from kiro_crew import platform_compat
+from kiro_crew.acp.liveness_command import (  # noqa: F401 - re-exported for existing importers
+    _COMMAND_ELISION,
+    MAX_RETAINED_COMMAND_CHARS,
+    MAX_RETAINED_COMMAND_TAIL_CHARS,
+    MAX_RETAINED_NAME_CHARS,
+    MAX_RETAINED_TITLE_CHARS,
+    LaunchRoster,
+    _command_text,
+    bounded_command_text,
+    first_program,
+    launch_matches,
+    match_fragment,
+    parse_wait_seconds,
+)
+from kiro_crew.acp.liveness_evidence import (  # noqa: F401 - re-exported for existing importers
+    _DISPATCH_START_TOLERANCE_SECS,
+    _GENERIC_PROGRAMS,
+    _KEEPALIVE_TOOL_NAMES,
+    _MCP_SEPARATOR_RE,
+    _MIN_MATCH_FRAGMENT,
+    _MODEL_WRAPPING_TOOLS,
+    _PORTABLE_CPU_KEY,
+    _READ_SYSCALL_NRS,
+    _STUCK_INPUT_WCHANS,
+    _WAIT_SECONDS_RE,
+    _WAIT_TOOL_NAME,
+    CHILD_EXIT_GRACE_SECS,
+    EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_MCP_SUBTREE_ACTIVE,
+    EVIDENCE_PLATFORM_LIMITED,
+    EVIDENCE_REMOTE_FLAT,
+    EVIDENCE_SAMPLING,
+    EVIDENCE_SHARED_TREE,
+    EVIDENCE_SHELL_CHILD_ABSENT,
+    VERDICT_DEAD,
+    VERDICT_STUCK_INPUT,
+    VERDICT_UNKNOWN,
+    VERDICT_WORKING,
+    WAIT_TOOL_SLACK_SECS,
+)
+from kiro_crew.acp.liveness_interactive import (  # noqa: F401 - re-exported for existing importers
+    _CONFIRM_TABLE,
+    _EDITOR_PROGRAMS,
+    _GIT_CONTINUE_EDITS,
+    _GIT_PAGED_SUBCOMMANDS,
+    _GIT_REVERT_KEEPS_MESSAGE,
+    _GIT_VALUE_OPTIONS,
+    _NON_INTERACTIVE_EDITORS,
+    _PAGER_PROGRAMS,
+    _PROMPT_SUBCOMMAND,
+    _PROMPT_TABLE,
+    _REPL_NONINTERACTIVE_OPTS,
+    _REPL_PROGRAMS,
+    _SEGMENT_SPLIT_RE,
+    _SSH_BATCH_FLAGS,
+    _SSH_NONINTERACTIVE_OPTIONS,
+    _WRAPPER_PROGRAMS,
+    INTERACTIVE_CONFIRM,
+    INTERACTIVE_EDITOR,
+    INTERACTIVE_NARROWING_RISKS,
+    INTERACTIVE_NONE,
+    INTERACTIVE_PAGER,
+    INTERACTIVE_PROMPT,
+    INTERACTIVE_REPL,
+    NOT_INTERACTIVE,
+    InteractiveClassification,
+    _classify_segment,
+    _git_editor_settings,
+    _has_flag,
+    _segment_program,
+    classify_interactive_command,
+    non_interactive_hint,
+)
+from kiro_crew.acp.liveness_proc import (  # noqa: F401 - re-exported for existing importers
+    _DARWIN_CPU_KEY,
+    _DARWIN_CPU_LABEL,
+    DarwinProcessBackend,
+    LibprocBackend,
+    ProcessRow,
+    _is_loopback_hex,
+    _read_text,
+    blocked_read_fd,
+    children_interface_readable,
+    direct_children,
+    established_inodes,
+    fd_target,
+    iter_descendants,
+    pipe_writer_pid,
+    read_cmdline,
+    read_io_bytes,
+    read_pid_stat,
+    read_wchan,
+    remote_established_inodes,
+    select_darwin_backend,
+    socket_inodes,
+    steady_now,
+)
+from kiro_crew.acp.liveness_tool_state import (  # noqa: F401 - re-exported for existing importers
+    InFlightToolTracker,
+    ToolCallState,
+    wait_tool_verdict,
+)
+from kiro_crew.constants import WAIT_TOOL_MAX_SECS  # noqa: F401 - re-exported
+from kiro_crew.platform_compat import (  # noqa: F401 - re-exported for existing importers
+    boottime_now,
+    process_start_boot_secs,
+)
+from kiro_crew.session_directive import CORE_MCP_SERVER  # noqa: F401 - re-exported
 
 logger = logging.getLogger(__name__)
-
-# ── Verdicts ──
-
-VERDICT_WORKING = "working"
-VERDICT_DEAD = "dead"
-VERDICT_UNKNOWN = "unknown"
-VERDICT_STUCK_INPUT = "stuck_input"
-
-# Evidence prefix for the model-wait "established backend socket but flat
-# counters" shape. The caller extends the UNKNOWN probe window for this tag
-# (probably a non-streamed server-side think) instead of probing at the
-# ordinary stale window.
-EVIDENCE_ESTABLISHED_FLAT = "established_flat"
-
-# Evidence prefix for a shell tool in flight whose command CANNOT be running:
-# the runtime's tree is readable, holds live descendants, and not one of them is
-# young enough to have been started by this dispatch. The caller narrows the
-# UNKNOWN window on this tag (see the shell branch of
-# ``session_handle._dispatch_events``) instead of spending the build-scale
-# suspect window on a command that already exited — the sub-second shell tool
-# whose result frame was lost is never observed alive, so the plain
-# "no matching shell child" evidence must not buy it the full forbearance.
-#
-# Deliberately NOT a DEAD verdict: absence is inferred from process start times,
-# and a live command that exec'd into something the cmdline heuristic misses is
-# still covered by the "young descendant exists" test below, so the narrowing
-# only shortens a non-lethal cancel, never skips straight to one.
-EVIDENCE_SHELL_CHILD_ABSENT = "shell_child_absent"
-
-# Evidence for a movement probe that stored a BASELINE and has nothing to
-# compare it against yet. Structurally non-informative: it says "ask me again",
-# never "this process is idle". A caller whose non-WORKING branch destroys work
-# must therefore defer on it rather than treat it as a negative verdict — see
-# ``client._prompt_loop``'s stale-turn gate, which reaped a live turn on its
-# first silent read because the priming answer landed past the cutoff.
-EVIDENCE_SAMPLING = "sampling"
-
-# Evidence prefix for a verdict the oracle could NOT sharpen because the
-# platform does not expose the evidence that would sharpen it: a live shell
-# child whose subtree is flat on darwin (libproc has no ``wchan`` / blocked-fd
-# view, so stdin-blocked and merely quiet are indistinguishable), or a shell /
-# MCP tool on a host with neither procfs nor a tree backend (Windows). The
-# verdict is UNKNOWN — never WORKING, because "the process is alive" is not
-# sufficient for an indefinite deferral, and never DEAD or STUCK_INPUT,
-# because the evidence for those is exactly what is absent. The caller keeps
-# the STANDARD no-progress budget on this tag (build-scale forbearance), and
-# narrows only when the dispatched command was classified interactive-risk
-# (see :func:`classify_interactive_command`), because that is the one case the
-# missing evidence would have answered. A tag, not a verdict: the declared
-# degradation must be visible in the evidence, the metric bucket and the spec —
-# a silent plain UNKNOWN would hide which platform limit produced it.
-EVIDENCE_PLATFORM_LIMITED = "platform_limited"
-
-# Tool names that are known to wrap a model call (e.g. kiro-cli's use_subagent
-# which starts a sub-agent turn inside the current tool call). The
-# established_flat narrowing is ONLY applied when the in-flight tool's trusted
-# ``tool_name`` (from ``_meta.kiro.toolName``) is in this set. Without
-# positive attribution the socket may be a persistent keepalive for an
-# unrelated backend connection (e.g. model-service keep-alive) while an
-# ordinary quiet MCP tool is running — narrowing the build-scale suspect window to 15
-# minutes in that case would incorrectly penalise long-running ordinary tools.
-#
-# COUPLING: these are kiro-cli TOOL NAMES, matched verbatim against the ACP
-# tool-call frame. If kiro-cli renames use_subagent or ships another
-# model-wrapping tool, narrowing silently stops applying and those stalls
-# fall back to the build-scale window (fail-safe direction: too patient,
-# never a surprise cancel — but the fast-detection this list exists for is
-# lost). No handshake advertises the model-wrapping property today, so a
-# name list is the only attribution available; update it alongside any
-# kiro-cli subagent-tool surface change.
-_MODEL_WRAPPING_TOOLS: frozenset[str] = frozenset({"use_subagent"})
-
-# ── Tunables (contract constants, not config — config governs the caller) ──
-
-# A tracked shell child that exited gets this long for its tool result frame to
-# arrive on the session queue before the verdict flips to DEAD.
-CHILD_EXIT_GRACE_SECS = 15.0
-# Declared-duration slack for the MCP wait tool: WORKING until seconds + this.
-WAIT_TOOL_SLACK_SECS = 120.0
-# Minimum cmdline fragment length for a definite shell-child match.
-_MIN_MATCH_FRAGMENT = 8
-# How much a process may predate its tool's dispatch and still count as started
-# BY that dispatch. Both timestamps come from the boot clock (see
-# :func:`boottime_now`), so this covers only the dispatch-to-spawn gap, not clock
-# skew.
-_DISPATCH_START_TOLERANCE_SECS = 10.0
-# wchan values that indicate a process blocked reading interactive input.
-_STUCK_INPUT_WCHANS = frozenset({"n_tty_read", "pipe_read", "wait_woken"})
-# read(2) syscall numbers: x86_64 = 0, aarch64 = 63.
-_READ_SYSCALL_NRS = frozenset({0, 63})
-# Shell wrappers whose bare program name is too generic to count as a match.
-_GENERIC_PROGRAMS = frozenset({"bash", "sh", "zsh", "env", "sudo", "nohup", "timeout"})
-
-# Sample key for the portable (no-procfs) CPU probe. Deliberately not one of the
-# ``/proc`` walk's keys: that counter is jiffies and this one is nanoseconds, so
-# a host whose procfs became readable mid-turn must not diff one against the
-# other.
-_PORTABLE_CPU_KEY = "portable_cpu"
-
-_WAIT_SECONDS_RE = re.compile(r"[\"']?seconds[\"']?\s*[:=]\s*(\d+)")
-
-
-# ── /proc helpers (pure, best-effort — return None/empty on any error) ──
-
-
-def _read_text(path: str) -> str | None:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except OSError:
-        return None
-
-
-def read_pid_stat(proc_root: str, pid: int) -> tuple[str, float, int] | None:
-    """Return ``(state, starttime_ticks, cpu_ticks)`` from ``/proc/<pid>/stat``.
-
-    ``comm`` may contain spaces/parens, so fields are parsed after the LAST
-    ``)``. Returns None when the process is gone or the line is malformed.
-    """
-    raw = _read_text(f"{proc_root}/{pid}/stat")
-    if not raw:
-        return None
-    rparen = raw.rfind(")")
-    if rparen < 0:
-        return None
-    fields = raw[rparen + 1 :].split()
-    # fields[0] is stat field 3 (state); utime=14, stime=15, starttime=22
-    # (1-based stat numbering) -> indexes 11, 12, 19 here.
-    try:
-        state = fields[0]
-        cpu = int(fields[11]) + int(fields[12])
-        starttime = float(fields[19])
-    except (IndexError, ValueError):
-        return None
-    return state, starttime, cpu
-
-
-def iter_descendants(proc_root: str, pid: int) -> list[int]:
-    """Return ``[pid, *descendants]`` via ``/proc/<p>/task/<tid>/children``.
-
-    Best-effort BFS (mirrors runtime._iter_descendant_pids, parameterized on
-    ``proc_root`` so the oracle stays a leaf module and tests can fake the
-    tree). Returns ``[pid]`` when the children interface is unavailable.
-    """
-    order: list[int] = []
-    visited: set[int] = set()
-    stack = [pid]
-    while stack:
-        p = stack.pop()
-        if p in visited:
-            continue
-        visited.add(p)
-        order.append(p)
-        try:
-            entries = os.listdir(f"{proc_root}/{p}/task")
-        except OSError:
-            continue
-        for tid in entries:
-            tokens = (_read_text(f"{proc_root}/{p}/task/{tid}/children") or "").split()
-            for tok in tokens:
-                try:
-                    cpid = int(tok)
-                except ValueError:
-                    continue
-                if cpid not in visited:
-                    stack.append(cpid)
-    return order
-
-
-def children_interface_readable(proc_root: str, pid: int) -> bool:
-    """Whether *pid*'s child list can be read at all.
-
-    ``iter_descendants`` walks ``/proc/<p>/task/<tid>/children`` and returns just
-    ``[pid]`` both for a genuinely childless process and for a host where that
-    interface does not exist (no procfs, a kernel built without
-    CONFIG_PROC_CHILDREN, a sandbox that hides the subtree). Only the first case
-    is evidence about the tree, so the absent-shell-child claim requires this to
-    be True — the file reading as EMPTY is the proof, its content is not.
-    """
-    try:
-        tids = os.listdir(f"{proc_root}/{pid}/task")
-    except OSError:
-        return False
-    return any(_read_text(f"{proc_root}/{pid}/task/{tid}/children") is not None for tid in tids)
-
-
-def read_cmdline(proc_root: str, pid: int) -> str:
-    raw = _read_text(f"{proc_root}/{pid}/cmdline")
-    if not raw:
-        return ""
-    return raw.replace("\0", " ").strip()
-
-
-def read_io_bytes(proc_root: str, pid: int) -> int | None:
-    """Sum of rchar+wchar from ``/proc/<pid>/io`` (any byte movement counts)."""
-    raw = _read_text(f"{proc_root}/{pid}/io")
-    if not raw:
-        return None
-    total = 0
-    seen = False
-    for line in raw.splitlines():
-        if line.startswith(("rchar:", "wchar:")):
-            try:
-                total += int(line.split(":", 1)[1])
-                seen = True
-            except (IndexError, ValueError):
-                continue
-    return total if seen else None
-
-
-def read_wchan(proc_root: str, pid: int) -> str:
-    return (_read_text(f"{proc_root}/{pid}/wchan") or "").strip()
-
-
-def blocked_read_fd(proc_root: str, pid: int) -> int | None:
-    """The fd a process is blocked in read(2) on, from ``/proc/<pid>/syscall``.
-
-    Returns None when the process is not blocked in a read syscall (or the
-    interface is unavailable). Accepts the x86_64 and aarch64 read numbers.
-    """
-    raw = _read_text(f"{proc_root}/{pid}/syscall")
-    if not raw:
-        return None
-    parts = raw.split()
-    if len(parts) < 2:
-        return None
-    try:
-        nr = int(parts[0])
-        fd = int(parts[1], 16)
-    except ValueError:
-        return None
-    if nr not in _READ_SYSCALL_NRS:
-        return None
-    return fd
-
-
-def fd_target(proc_root: str, pid: int, fd: int) -> str:
-    try:
-        return os.readlink(f"{proc_root}/{pid}/fd/{fd}")
-    except OSError:
-        return ""
-
-
-def socket_inodes(proc_root: str, pid: int) -> set[str]:
-    """Socket inode numbers held open by *pid* (from ``/proc/<pid>/fd``)."""
-    inodes: set[str] = set()
-    try:
-        fds = os.listdir(f"{proc_root}/{pid}/fd")
-    except OSError:
-        return inodes
-    for fd in fds:
-        try:
-            target = os.readlink(f"{proc_root}/{pid}/fd/{fd}")
-        except OSError:
-            continue
-        if target.startswith("socket:["):
-            inodes.add(target[len("socket:[") : -1])
-    return inodes
-
-
-def established_inodes(proc_root: str, pid: int) -> set[str]:
-    """Inodes of ESTABLISHED TCP sockets in *pid*'s network namespace.
-
-    Reads ``/proc/<pid>/net/tcp{,6}`` (namespace-correct — the sandboxed
-    runtime may not share the host's net view). State ``01`` = ESTABLISHED.
-    """
-    inodes: set[str] = set()
-    for name in ("tcp", "tcp6"):
-        raw = _read_text(f"{proc_root}/{pid}/net/{name}")
-        if not raw:
-            continue
-        for line in raw.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) > 9 and parts[3] == "01":
-                inodes.add(parts[9])
-    return inodes
-
-
-def boottime_now() -> float | None:
-    """Now, on the clock this host dates process starts against.
-
-    Linux: ``CLOCK_BOOTTIME`` counts time spent suspended, exactly as
-    ``/proc/uptime`` and the ``starttime`` field of ``/proc/<pid>/stat`` do.
-    ``time.monotonic()`` (``CLOCK_MONOTONIC``) does not, so the two MUST NOT be
-    mixed in one comparison: after a suspend of S seconds, a boot-clock age minus
-    a monotonic stamp places a process S seconds EARLIER than it really started,
-    which is how a live shell child comes to look like it predates its own
-    dispatch.
-
-    macOS: ``libproc`` reports a process's start as an absolute wall-clock
-    instant (``pbi_start_tvsec``), so the stamp is ``time.time()`` — the same
-    clock, suspend included. That clock can STEP (NTP correction after a VM
-    resume, an admin reset), and a backward step between the stamp and the
-    runtime's fork dates a live child before its own dispatch. The oracle pairs
-    this stamp with :func:`steady_now` and refuses to attribute by start time
-    once the two disagree (see :meth:`LivenessOracle._started_after_dispatch`);
-    the stamp alone cannot tell a step from a slow spawn.
-
-    Returns None where no such clock is available, which every caller must read
-    as "cannot attribute" rather than as a time.
-    """
-    try:
-        return time.clock_gettime(time.CLOCK_BOOTTIME)
-    except (AttributeError, OSError):  # pragma: no cover - platform dependent
-        if sys.platform == "darwin":
-            return time.time()
-        return None
-
-
-def steady_now() -> float | None:
-    """A step-immune reading paired with :func:`boottime_now` on darwin.
-
-    ``CLOCK_MONOTONIC`` there keeps counting through sleep (unlike
-    ``time.monotonic()``, which is ``mach_absolute_time`` and stops), so the pair
-    (wall stamp, steady stamp) taken at dispatch lets a later probe check whether
-    the wall clock has since moved by anything other than elapsed time. None on
-    a platform whose process-start clock cannot step (Linux dates processes on
-    ``CLOCK_BOOTTIME``), and wherever the clock is unavailable — a consumer
-    reads None as "cannot validate the wall clock", never as a time.
-    """
-    if sys.platform != "darwin":
-        return None
-    try:
-        return time.clock_gettime(time.CLOCK_MONOTONIC)
-    except (AttributeError, OSError):  # pragma: no cover - platform dependent
-        return None
-
-
-def process_start_boot_secs(starttime_ticks: float) -> float | None:
-    """A process's ``starttime`` ticks as seconds on the :func:`boottime_now` clock.
-
-    None when the tick rate cannot be read — including on a platform with no
-    ``os.sysconf`` at all (Windows raises AttributeError, not OSError), where
-    there is no ``/proc`` to date processes against either. Callers read None as
-    "cannot attribute", never as a time.
-    """
-    try:
-        hz = os.sysconf("SC_CLK_TCK")
-    except (AttributeError, OSError, ValueError):
-        return None
-    if hz <= 0:  # pragma: no cover - defensive
-        return None
-    return starttime_ticks / hz
-
-
-# ── Darwin process backend (a host without procfs) ──
-
-# Sample key for the darwin subtree CPU probe. Distinct from the ``/proc``
-# walk's jiffies keys and from the portable root-only nanosecond key: three
-# counters in three units, and a host must never diff one against another.
-_DARWIN_CPU_KEY = "darwin_cpu"
-# Evidence label naming what the darwin movement probe can and cannot see: CPU
-# time across the subtree, no IO — libproc has no per-process byte counter.
-_DARWIN_CPU_LABEL = "darwin cpu-only"
-
-
-@dataclass(frozen=True)
-class ProcessRow:
-    """One live, non-zombie process in the shape the shell-child matcher reads.
-
-    ``started`` is the process's start on the :func:`boottime_now` clock (None
-    when it cannot be dated, which the matcher reads as possibly-this-tool's).
-    ``cmdline`` is argv joined by single spaces — the executable path alone when
-    argv is unreadable, "" when nothing is — so the fragment match and the
-    program-basename match run unchanged against it.
-    """
-
-    pid: int
-    started: float | None
-    cmdline: str
-
-
-class DarwinProcessBackend(Protocol):
-    """What the oracle asks of a host that has no ``/proc``.
-
-    ``descendants`` answers the whole live subtree under ``root_pid`` (the root
-    itself excluded, any order, zombies may be included) or None when the tree
-    cannot be enumerated. The two are kept apart because only an enumerated
-    tree supports the absent-shell-child claim. ``row`` describes one live
-    process, or answers None for one that is gone, a zombie, or unreadable —
-    the shapes the ``/proc`` walk skips as ``stat is None or state == "Z"``.
-    ``cpu_nanos`` is the process's total CPU time, None when unreadable.
-    """
-
-    def descendants(self, root_pid: int) -> list[int] | None: ...
-
-    def row(self, pid: int) -> ProcessRow | None: ...
-
-    def cpu_nanos(self, pid: int) -> int | None: ...
-
-
-class LibprocBackend:
-    """The production darwin backend, over ``platform_compat``'s libproc probes.
-
-    Every call is an in-process syscall on a same-uid process: no fork, no
-    ``ps``, so it holds up on the oracle's cadence and inside the offloaded
-    consult's timeout. Matching fidelity is argv when ``KERN_PROCARGS2`` reads
-    (the normal case for the runtime's own children) and the executable path
-    otherwise, where only the program-basename rule can match.
-    """
-
-    def descendants(self, root_pid: int) -> list[int] | None:
-        # A root that cannot be read has no observable tree: proc_listchildpids
-        # answers 0 for an unknown pid exactly as for a childless one, so the
-        # root's own facts are what separate "empty" from "gone".
-        if platform_compat.darwin_process_facts(root_pid) is None:
-            return None
-        order: list[int] = []
-        visited = {root_pid}
-        stack = [root_pid]
-        while stack:
-            parent = stack.pop()
-            children = platform_compat.darwin_child_pids(parent)
-            if children is None:
-                # One unreadable branch makes the whole tree unobservable — a
-                # partial list would ground an absence claim on missing data.
-                return None
-            for child in children:
-                if child not in visited:
-                    visited.add(child)
-                    order.append(child)
-                    stack.append(child)
-        return order
-
-    def row(self, pid: int) -> ProcessRow | None:
-        facts = platform_compat.darwin_process_facts(pid)
-        if facts is None or facts.zombie:
-            return None
-        argv = platform_compat.darwin_process_argv(pid)
-        if argv:
-            cmdline = " ".join(argv)
-        else:
-            cmdline = platform_compat.darwin_process_path(pid) or ""
-        return ProcessRow(pid=pid, started=facts.start_secs, cmdline=cmdline)
-
-    def cpu_nanos(self, pid: int) -> int | None:
-        return platform_compat.proc_cpu_nanos_for_pid(pid)
-
-
-def select_darwin_backend(proc_root: str) -> DarwinProcessBackend | None:
-    """The backend an oracle uses for *proc_root*, or None to walk ``/proc``.
-
-    Selected on the platform AND on ``proc_root`` being absent, so a fake
-    ``/proc`` tree handed to the oracle under test keeps the ``/proc`` walk on
-    any host, and a Linux host with procfs never sees libproc.
-    """
-    if sys.platform == "darwin" and not os.path.exists(proc_root):
-        return LibprocBackend()
-    return None
-
-
-# ── Command matching ──
-
-
-def match_fragment(command: str) -> str:
-    """Extract the most distinctive fragment of a cached tool command.
-
-    The cached input is the redacted rendering of the shell tool's input —
-    usually the command text itself (possibly JSON-wrapped). kiro-cli runs
-    shell tools via ``bash -c <command>``, so the child's cmdline contains the
-    command text near-verbatim; a long contiguous fragment is a strong match
-    key. Redaction markers and shell metacharacters split the text into
-    fragments; the longest one wins. Returns "" when nothing distinctive
-    survives (caller degrades to the weaker program-name match).
-    """
-    text = command or ""
-    m = re.search(r"[\"']command[\"']\s*:\s*\"((?:[^\"\\]|\\.)*)\"", text)
-    if m:
-        text = m.group(1)
-    # Split on redaction markers and quoting/control chars that differ between
-    # the cached rendering and the real argv.
-    fragments = re.split(r"\*{3,}|\[REDACTED[^\]]*\]|[\"'\\\n\r]", text)
-    best = max((f.strip() for f in fragments), key=len, default="")
-    return best if len(best) >= _MIN_MATCH_FRAGMENT else ""
-
-
-def first_program(command: str) -> str:
-    """First non-generic program token of a command ("" when too generic)."""
-    for token in re.split(r"[\s;|&]+", (command or "").strip()):
-        base = token.rsplit("/", 1)[-1]
-        if not base or "=" in base:
-            continue  # env assignments
-        if base in _GENERIC_PROGRAMS or base == "-c":
-            continue
-        return base if len(base) >= 3 else ""
-    return ""
-
-
-def parse_wait_seconds(command: str) -> int | None:
-    """Parse the declared ``seconds`` from a cached MCP wait-tool input."""
-    m = _WAIT_SECONDS_RE.search(command or "")
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
-
-
-def is_wait_tool(title: str) -> bool:
-    """True when a tool title names the kirocrew-core ``wait`` tool.
-
-    Titles vary by transport ("wait", "kirocrew-core___wait", "wait (mcp)");
-    match on the last alphanumeric token equalling "wait".
-    """
-    tokens = re.split(r"[^a-zA-Z0-9]+", (title or "").strip().lower())
-    return "wait" in [t for t in tokens if t]
-
-
-# ── Interactive-command classification (tool layer, pre-dispatch) ──
-#
-# The tool layer says BEFORE a shell command runs whether it is expected to
-# want a terminal: a pager, an editor, a REPL reading stdin, a package
-# manager's confirmation, a credential prompt. The classification is a
-# TABLE of known programs, not a rewrite of arbitrary flags, and it produces
-# three things and nothing else: a risk class, a non-interactive HINT for the
-# recovery nudge, and whether a replay could repeat side effects. It never
-# rewrites the command (the repo has no env layer on the ACP tool path — the
-# hook gate can only allow or deny), never answers a prompt, and is
-# deliberately conservative about ``side_effecting``: only a pager over a
-# read-only viewer is a safe replay; everything else is assumed to have
-# possibly acted (fail-closed, SPEC-ADDENDUM §6 / RFC §14.6).
-#
-# What the classification feeds: the watchdog narrows the platform-limited
-# UNKNOWN window to the ordinary silence budget when the command was
-# ``narrowing_eligible`` (a prompt-shaped program that the missing stdin
-# evidence would have caught), and a stall on such a command is classified
-# ``waiting_input`` instead of an opaque tool stall. A pager is advisory only:
-# under the tool the stdout is a pipe, so a pager degrades to ``cat`` on its
-# own, and the risk exists to name the hint, not to shorten anything.
-
-INTERACTIVE_NONE = "none"
-INTERACTIVE_PAGER = "pager"
-INTERACTIVE_EDITOR = "editor"
-INTERACTIVE_REPL = "repl"
-INTERACTIVE_CONFIRM = "confirm"
-INTERACTIVE_PROMPT = "prompt"
-
-#: Risk classes whose blocked read the STUCK_INPUT evidence would have caught
-#: on Linux; on a platform without that evidence they justify narrowing the
-#: no-progress window. A pager is excluded on purpose (see above).
-INTERACTIVE_NARROWING_RISKS: frozenset[str] = frozenset(
-    {INTERACTIVE_EDITOR, INTERACTIVE_REPL, INTERACTIVE_CONFIRM, INTERACTIVE_PROMPT}
-)
-
-_PAGER_PROGRAMS = frozenset({"less", "more", "most", "man"})
-_EDITOR_PROGRAMS = frozenset({"vi", "vim", "nvim", "nano", "pico", "emacs", "ed"})
-# Programs that read a script from stdin when given no file, expression or
-# command argument — an open, never-closed stdin pipe hangs them forever.
-_REPL_PROGRAMS = frozenset(
-    {
-        "python",
-        "python3",
-        "python2",
-        "node",
-        "irb",
-        "ruby",
-        "perl",
-        "psql",
-        "mysql",
-        "sqlite3",
-        "redis-cli",
-        "cat",
-        "read",
-    }
-)
-# Option prefixes that give a REPL program something to run other than stdin.
-_REPL_NONINTERACTIVE_OPTS = ("-c", "-e", "-f", "--command", "--eval", "--file", "-m", "-p")
-# Git subcommands that page when stdout is a terminal.
-_GIT_PAGED_SUBCOMMANDS = frozenset(
-    {"log", "diff", "show", "blame", "reflog", "branch", "tag", "grep", "stash", "shortlog"}
-)
-# Package-manager confirmations: program -> (subcommands that confirm, flags that skip it).
-_CONFIRM_TABLE: dict[str, tuple[frozenset[str], tuple[str, ...], str]] = {
-    "apt": (
-        frozenset({"install", "remove", "purge", "upgrade", "dist-upgrade", "autoremove"}),
-        ("-y", "--yes", "--assume-yes"),
-        "apt-get -y … (or DEBIAN_FRONTEND=noninteractive)",
-    ),
-    "apt-get": (
-        frozenset({"install", "remove", "purge", "upgrade", "dist-upgrade", "autoremove"}),
-        ("-y", "--yes", "--assume-yes"),
-        "apt-get -y … (or DEBIAN_FRONTEND=noninteractive)",
-    ),
-    "yum": (
-        frozenset({"install", "remove", "erase", "update", "upgrade"}),
-        ("-y", "--assumeyes"),
-        "yum -y …",
-    ),
-    "dnf": (
-        frozenset({"install", "remove", "erase", "update", "upgrade"}),
-        ("-y", "--assumeyes"),
-        "dnf -y …",
-    ),
-    "pacman": (frozenset({"-S", "-R", "-Syu", "-Su"}), ("--noconfirm",), "pacman --noconfirm …"),
-    "pip": (frozenset({"uninstall"}), ("-y", "--yes"), "pip uninstall -y …"),
-    "pip3": (frozenset({"uninstall"}), ("-y", "--yes"), "pip3 uninstall -y …"),
-    "conda": (frozenset({"install", "remove", "update", "create"}), ("-y", "--yes"), "conda -y …"),
-    "npm": (frozenset({"init", "create"}), ("-y", "--yes"), "npm init -y …"),
-    "yarn": (frozenset({"init", "create"}), ("-y", "--yes"), "yarn init -y …"),
-}
-# Credential / terminal prompts: program -> (flags that make it non-interactive, hint).
-_PROMPT_TABLE: dict[str, tuple[tuple[str, ...], str]] = {
-    "sudo": (
-        ("-n", "--non-interactive", "-S", "--stdin"),
-        "sudo -n … (fails instead of prompting)",
-    ),
-    "ssh": (("-o BatchMode=yes", "-oBatchMode=yes"), "ssh -o BatchMode=yes …"),
-    "scp": (("-o BatchMode=yes", "-oBatchMode=yes", "-B"), "scp -B …"),
-    "sftp": (("-o BatchMode=yes", "-oBatchMode=yes", "-b"), "sftp -b <batchfile> …"),
-    "gpg": (("--batch",), "gpg --batch …"),
-    "passwd": ((), "passwd cannot run non-interactively under the tool"),
-    "su": ((), "su cannot run non-interactively under the tool"),
-    "docker": (("--password-stdin", "-p", "--password"), "docker login --password-stdin"),
-    "gh": (("--with-token",), "gh auth login --with-token < token-file"),
-    "aws": ((), "set AWS_* env or --profile instead of `aws configure`"),
-}
-# Prompt-table programs whose prompt is bound to ONE subcommand.
-_PROMPT_SUBCOMMAND: dict[str, str] = {"docker": "login", "gh": "auth", "aws": "configure"}
-# Shell wrappers to skip when finding the program a segment runs.
-_WRAPPER_PROGRAMS = frozenset(
-    {"env", "nohup", "nice", "ionice", "time", "command", "exec", "stdbuf"}
-)
-_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[|;]|\n")
-
-
-@dataclass(frozen=True)
-class InteractiveClassification:
-    """What the tool layer expects a shell command to want from a terminal.
-
-    ``risk`` is one of the ``INTERACTIVE_*`` classes (``none`` when nothing in
-    the table matched). ``program`` names the matched program, ``reason`` says
-    which rule fired, ``hint`` is the non-interactive form the recovery nudge
-    may PROPOSE (never applied; retries stay inside the granted approval scope
-    and the original parameters). ``side_effecting`` is True unless the match
-    is a read-only viewer: a replay of anything else could repeat an effect.
-    """
-
-    risk: str = INTERACTIVE_NONE
-    program: str = ""
-    reason: str = ""
-    hint: str = ""
-    side_effecting: bool = True
-
-    @property
-    def narrowing_eligible(self) -> bool:
-        return self.risk in INTERACTIVE_NARROWING_RISKS
-
-    @property
-    def replay_safe(self) -> bool:
-        """A non-interactive retry cannot repeat a side effect of THIS command.
-
-        Only the classifier's own read-only verdict counts; the caller must
-        additionally confirm no output/exit was recorded for the call (a command
-        that already produced output may have already acted).
-        """
-        return self.risk != INTERACTIVE_NONE and not self.side_effecting
-
-
-NOT_INTERACTIVE = InteractiveClassification()
-
-
-def _command_text(command: str) -> str:
-    """The shell text of a cached tool input (JSON ``command`` field or raw)."""
-    text = command or ""
-    m = re.search(r"[\"']command[\"']\s*:\s*\"((?:[^\"\\]|\\.)*)\"", text)
-    if m:
-        try:
-            return str(json.loads(f'"{m.group(1)}"'))
-        except ValueError:
-            return m.group(1)
-    return text
-
-
-def _segment_program(tokens: list[str]) -> tuple[str, list[str]]:
-    """``(program, args)`` of one pipeline segment, skipping env and wrappers.
-
-    ``sudo`` is NOT skipped: it is itself a prompt-shaped program (returned as
-    the program so the prompt table sees it), unless it carries a flag that
-    makes it non-interactive, in which case the wrapped program is classified.
-    """
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        base = tok.rsplit("/", 1)[-1]
-        if "=" in base and not base.startswith("-"):
-            i += 1
-            continue
-        if base in _WRAPPER_PROGRAMS or base == "timeout":
-            # Skip the wrapper's own flags and any numeric argument
-            # (``nice -n 10``, ``timeout 30``, ``stdbuf -oL``).
-            i += 1
-            while i < len(tokens) and (tokens[i].startswith("-") or tokens[i][:1].isdigit()):
-                i += 1
-            continue
-        if base == "sudo":
-            rest = tokens[i + 1 :]
-            if any(_has_flag(rest, f) for f in _PROMPT_TABLE["sudo"][0]):
-                # Non-interactive sudo: classify what it wraps, skipping its flags.
-                j = i + 1
-                while j < len(tokens) and tokens[j].startswith("-"):
-                    j += 1
-                i = j
-                continue
-            return "sudo", rest
-        return base, tokens[i + 1 :]
-    return "", []
-
-
-def _has_flag(args: list[str], flag: str) -> bool:
-    if " " in flag:
-        joined = " ".join(args)
-        return flag in joined
-    for a in args:
-        if a == flag or a.startswith(flag + "="):
-            return True
-        # Bundled short flags: ``-ny`` contains ``-y``.
-        if len(flag) == 2 and flag.startswith("-") and a.startswith("-") and not a.startswith("--"):
-            if flag[1] in a[1:]:
-                return True
-    return False
-
-
-def _classify_segment(segment: str, *, last: bool) -> InteractiveClassification:
-    stripped = segment.strip()
-    if not stripped:
-        return NOT_INTERACTIVE
-    stdin_redirected = "<" in stripped
-    stdout_redirected = ">" in stripped or not last
-    tokens = [t for t in re.split(r"\s+", stripped) if t]
-    program, args = _segment_program(tokens)
-    if not program:
-        return NOT_INTERACTIVE
-    positional = [a for a in args if not a.startswith("-") and not a.startswith("<")]
-
-    if program in _EDITOR_PROGRAMS:
-        if program == "emacs" and (_has_flag(args, "--batch") or _has_flag(args, "-batch")):
-            return NOT_INTERACTIVE
-        return InteractiveClassification(
-            INTERACTIVE_EDITOR,
-            program,
-            "editor needs a terminal",
-            "write the file directly (heredoc / file tool) instead of opening an editor",
-            side_effecting=True,
-        )
-    if program in _PAGER_PROGRAMS:
-        if stdout_redirected:
-            return NOT_INTERACTIVE
-        return InteractiveClassification(
-            INTERACTIVE_PAGER,
-            program,
-            "pager on a terminal stdout",
-            f"{program} … | cat  (or PAGER=cat)",
-            side_effecting=False,
-        )
-    if program == "git" and args:
-        sub_i = 0
-        while sub_i < len(args) and args[sub_i].startswith("-"):
-            if args[sub_i] in ("-P", "--no-pager"):
-                return NOT_INTERACTIVE
-            sub_i += 1
-        sub = args[sub_i] if sub_i < len(args) else ""
-        rest = args[sub_i + 1 :]
-        if sub == "commit" and not any(
-            _has_flag(rest, f) for f in ("-m", "--message", "-F", "--file", "--no-edit", "-C", "-c")
-        ):
-            return InteractiveClassification(
-                INTERACTIVE_EDITOR,
-                "git commit",
-                "git commit without -m opens an editor",
-                "git commit -m '<message>' (or GIT_EDITOR=true)",
-                side_effecting=True,
-            )
-        if sub == "rebase" and (_has_flag(rest, "-i") or _has_flag(rest, "--interactive")):
-            return InteractiveClassification(
-                INTERACTIVE_EDITOR,
-                "git rebase -i",
-                "interactive rebase opens an editor",
-                "non-interactive rebase (no -i), or GIT_SEQUENCE_EDITOR=true with a scripted todo",
-                side_effecting=True,
-            )
-        if sub == "add" and (
-            _has_flag(rest, "-p") or _has_flag(rest, "--patch") or _has_flag(rest, "-i")
-        ):
-            return InteractiveClassification(
-                INTERACTIVE_PROMPT,
-                "git add -p",
-                "patch-mode add prompts per hunk",
-                "git add <paths> (no -p / -i)",
-                side_effecting=True,
-            )
-        if sub in _GIT_PAGED_SUBCOMMANDS and not stdout_redirected:
-            if sub == "stash" and rest[:1] != ["list"]:
-                return NOT_INTERACTIVE
-            return InteractiveClassification(
-                INTERACTIVE_PAGER,
-                f"git {sub}",
-                "git pages this subcommand on a terminal stdout",
-                f"git -P {sub} …  (or GIT_PAGER=cat)",
-                side_effecting=False,
-            )
-        return NOT_INTERACTIVE
-    if program in _CONFIRM_TABLE:
-        subs, skip_flags, hint = _CONFIRM_TABLE[program]
-        sub = next((a for a in args if not a.startswith("-") or program == "pacman"), "")
-        if sub in subs and not any(_has_flag(args, f) for f in skip_flags):
-            return InteractiveClassification(
-                INTERACTIVE_CONFIRM,
-                program,
-                f"{program} {sub} asks for confirmation",
-                hint,
-                side_effecting=True,
-            )
-        return NOT_INTERACTIVE
-    if program in _PROMPT_TABLE:
-        flags, hint = _PROMPT_TABLE[program]
-        bound_sub = _PROMPT_SUBCOMMAND.get(program)
-        if bound_sub is not None and (not positional or positional[0] != bound_sub):
-            return NOT_INTERACTIVE
-        if any(_has_flag(args, f) for f in flags):
-            return NOT_INTERACTIVE
-        # ``ssh host <remote command>`` is still prompt-shaped without
-        # BatchMode: the risk is the host-key / password prompt, not the
-        # remote work, and only BatchMode removes it.
-        return InteractiveClassification(
-            INTERACTIVE_PROMPT,
-            program,
-            f"{program} may prompt for a credential or confirmation",
-            hint,
-            side_effecting=True,
-        )
-    if program in _REPL_PROGRAMS:
-        if stdin_redirected or positional:
-            return NOT_INTERACTIVE
-        if any(a.startswith(_REPL_NONINTERACTIVE_OPTS) for a in args):
-            return NOT_INTERACTIVE
-        if program in ("cat", "read"):
-            hint = f"{program} <file>  (or </dev/null)"
-        else:
-            hint = f"{program} -c '<code>' or {program} <file>  (or </dev/null)"
-        return InteractiveClassification(
-            INTERACTIVE_REPL,
-            program,
-            f"{program} with no script reads stdin",
-            hint,
-            side_effecting=program not in ("cat", "read"),
-        )
-    return NOT_INTERACTIVE
-
-
-def classify_interactive_command(command: str) -> InteractiveClassification:
-    """Classify a cached shell-tool input against the interactive table.
-
-    The command is split into pipeline segments (``|``, ``;``, ``&&``,
-    ``||``, newline) and the FIRST segment with a non-``none`` risk wins,
-    except that a narrowing-eligible class outranks a pager found earlier: the
-    pager is advisory, the prompt is what would hang. Never raises — any
-    parse failure is ``NOT_INTERACTIVE`` (fail toward the standard window).
-    """
-    try:
-        text = _command_text(command)
-        segments = [s for s in _SEGMENT_SPLIT_RE.split(text) if s.strip()]
-        best = NOT_INTERACTIVE
-        for idx, seg in enumerate(segments):
-            found = _classify_segment(seg, last=idx == len(segments) - 1)
-            if found.risk == INTERACTIVE_NONE:
-                continue
-            if best.risk == INTERACTIVE_NONE or (
-                found.narrowing_eligible and not best.narrowing_eligible
-            ):
-                best = found
-        return best
-    except Exception:
-        logger.debug("interactive classification failed", exc_info=True)
-        return NOT_INTERACTIVE
-
-
-def non_interactive_hint(command: str) -> str:
-    """The recovery nudge's suggestion for *command*, or "" when none applies."""
-    return classify_interactive_command(command).hint
-
-
-@dataclass
-class ToolCallState:
-    """Snapshot of the in-flight tool call the oracle reasons about."""
-
-    title: str = ""
-    command: str = ""  # redacted cached tool input
-    dispatch_ts: float = 0.0  # time.monotonic() at EVENT_TOOL_CALL
-    is_shell: bool = False
-    # ``boottime_now()`` at EVENT_TOOL_CALL — the SAME clock /proc dates process
-    # start times against, so a child's start can be compared to its dispatch
-    # without mixing clocks (see :func:`boottime_now`). Separate from
-    # ``dispatch_ts``, which stays monotonic because it measures ELAPSED time (the
-    # wait tool's declared duration), where excluding suspend is correct. None
-    # when the clock is unavailable; every consumer must then decline to attribute
-    # a process to this dispatch rather than guess.
-    dispatch_boot_ts: float | None = None
-    # ``steady_now()`` taken alongside ``dispatch_boot_ts``. On darwin that stamp
-    # is the wall clock, which can step; this one cannot, so the pair lets the
-    # oracle detect a step since dispatch before it grounds an absence claim on
-    # start-time attribution. None where the platform needs no check (Linux) or
-    # the caller took no such stamp — on darwin the oracle then declines to
-    # attribute at all rather than trust an unvalidated wall clock.
-    dispatch_steady_ts: float | None = None
-    # Consumer parking banked in THIS TURN before the stamp above was taken
-    # (``AcpSessionHandle._parked_total``, which is per-turn and includes the whole
-    # of a human approval wait). The stamp is taken when the tool_call frame is
-    # PROCESSED, and the dispatch loop is suspended at its yield for every
-    # consumer-side await — an approval, an IM send, a hook — so a tool whose
-    # frame queued behind one of those was already spawned by the time its stamp
-    # is taken. The child cannot predate the turn, so parking-so-far bounds that
-    # lag and widens the attribution window by exactly as much as the loop itself
-    # measured. Left 0.0 by a dispatch path with no consumer parking.
-    dispatch_parked_secs: float = 0.0
-    # Trusted tool name from ``_meta.kiro.toolName`` (empty when the backend
-    # does not emit ``_meta``; fail-closed). Required for established_flat
-    # attribution: the narrowing applies ONLY when this matches a known
-    # model-wrapping tool (see ``_MODEL_WRAPPING_TOOLS``).
-    tool_name: str = ""
-    # Pre-dispatch verdict of :func:`classify_interactive_command` for a shell
-    # tool (one of the ``INTERACTIVE_*`` classes; ``none`` for a non-shell tool
-    # or an unmatched command). The oracle itself does not read it — it is
-    # carried here so the caller's window policy and its post-stall
-    # classification see the same value the dispatch computed, and so a
-    # detached consult never re-derives it from a different command string.
-    interactive_risk: str = INTERACTIVE_NONE
 
 
 class LivenessOracle:
@@ -1080,6 +285,8 @@ class LivenessOracle:
         darwin_backend: DarwinProcessBackend | None = None,
         wall_now=time.time,
         steady_now_fn=steady_now,
+        tenancy: Callable[[], int | None] | None = None,
+        server_launches: Callable[[], LaunchRoster | None] | None = None,
     ) -> None:
         self._proc = str(proc_root)
         self._now = now
@@ -1097,6 +304,24 @@ class LivenessOracle:
         )
         self._tracked_child: int | None = None
         self._child_gone_ts: float | None = None
+        # How many sessions the probed runtime hosts, asked at verdict time
+        # because a runtime gains and loses tenants while a turn runs. Only the
+        # DEAD branch of the model wait reads it — see
+        # :data:`EVIDENCE_SHARED_TREE` for why that branch and not the others.
+        #
+        # ``None`` means the caller declares NOTHING, and the module then reads
+        # the tree as one session's, which is the 1:1 premise this refactor is
+        # removing. It is the default so that a caller which has not been taught
+        # about tenancy keeps today's verdicts exactly; a caller whose runtime
+        # CAN host a second session is the one that must pass this.
+        self._tenancy = tenancy
+        # How this session launched its MCP servers (see :data:`LaunchRoster`),
+        # read ONLY by the socket scan behind the ``remote_flat`` tag, which
+        # uses it to find the in-flight tool's own server process. Asked at
+        # verdict time because a resumed session re-declares its servers.
+        # ``None`` -- undeclared, or the callable answering None -- keeps the
+        # tag off.
+        self._server_launches = server_launches
         # sample key -> (ts, counter). Keys: "io", "cpu".
         self._samples: dict[str, tuple[float, int]] = {}
 
@@ -1134,6 +359,8 @@ class LivenessOracle:
             darwin_backend=self._darwin,
             wall_now=self._wall_now,
             steady_now_fn=self._steady_now,
+            tenancy=self._tenancy,
+            server_launches=self._server_launches,
         )
 
     # ── Public checks ──
@@ -1170,16 +397,9 @@ class LivenessOracle:
         if not runtime_pid:
             return VERDICT_UNKNOWN, "no runtime pid"
 
-        # Declared-duration contract for the kirocrew-core wait tool: the
-        # session is WORKING by definition until the declared sleep elapses.
-        if not tool.is_shell and is_wait_tool(tool.title):
-            secs = parse_wait_seconds(tool.command)
-            if secs is not None:
-                elapsed = self._now() - tool.dispatch_ts
-                if elapsed < secs + WAIT_TOOL_SLACK_SECS:
-                    return VERDICT_WORKING, f"wait tool declared {secs}s ({elapsed:.0f}s elapsed)"
-                return VERDICT_UNKNOWN, f"wait tool declared {secs}s elapsed"
-            return VERDICT_UNKNOWN, "wait tool without parseable seconds"
+        wait = wait_tool_verdict(tool, self._now())
+        if wait is not None:
+            return wait
 
         if tool.is_shell:
             return self._check_shell_child(runtime_pid, tool)
@@ -1188,7 +408,7 @@ class LivenessOracle:
         # tree (which contains the serving MCP server process) reads WORKING.
         moved, evidence = self._tree_movement(runtime_pid)
         if moved:
-            return VERDICT_WORKING, f"mcp subtree active ({evidence})"
+            return VERDICT_WORKING, f"{EVIDENCE_MCP_SUBTREE_ACTIVE} ({evidence})"
         if evidence == "no readable counters" and not self._tree_observable():
             # No tree at all on this platform: the flat reading is absence of
             # evidence, and the caller's budget is the only bound. Tagged so
@@ -1208,8 +428,9 @@ class LivenessOracle:
         # action. Deliberately NARROWER than the model-wait branch's full-tree
         # ``_any_established``: here the descendants include the tool's own
         # workers, and an MCP server blocked on ITS remote socket (a long
-        # remote call, zero CPU/IO while in recv) must keep the full tool
-        # windows — only kiro-cli's own backend connection is LLM-wait
+        # remote call, zero CPU/IO while in recv) is not a model wait: it is
+        # the remote_flat shape handled below, never this tag. Only
+        # kiro-cli's own backend connection is LLM-wait
         # evidence. Shell-child evidence never reaches this branch (it returns
         # from _check_shell_child above), and a flat subtree without the
         # runtime-held socket keeps the plain evidence. Under the OS sandbox
@@ -1234,7 +455,136 @@ class LivenessOracle:
                     VERDICT_UNKNOWN,
                     f"{EVIDENCE_ESTABLISHED_FLAT}: mcp subtree flat ({evidence})",
                 )
+        if (
+            evidence
+            not in (
+                EVIDENCE_SAMPLING,
+                "no readable counters",
+            )
+            and tool.mcp_server_name
+        ):
+            located = self._own_server_remote_holder(runtime_pid, tool.mcp_server_name)
+            if located is not None:
+                root, holder = located
+                return (
+                    VERDICT_UNKNOWN,
+                    f"{EVIDENCE_REMOTE_FLAT}: mcp subtree flat, pid {holder} of the tool's "
+                    f"own server (pid {root}) holds an established TCP connection ({evidence})",
+                )
         return VERDICT_UNKNOWN, f"mcp subtree flat ({evidence})"
+
+    def _launch_roster(self) -> LaunchRoster | None:
+        """The declared :data:`LaunchRoster`, or None when none is declared.
+
+        Undeclared, raising, or anything but a mapping all read as None, which
+        keeps the ``remote_flat`` tag off.
+        """
+        if self._server_launches is None:
+            return None
+        try:
+            roster = self._server_launches()
+        except Exception:
+            logger.debug("liveness: launch roster probe failed", exc_info=True)
+            return None
+        return roster if isinstance(roster, Mapping) else None
+
+    def _own_server_remote_holder(self, runtime_pid: int, server: str) -> tuple[int, int] | None:
+        """``(server root pid, holder pid)`` when *server*'s own subtree holds an
+        ESTABLISHED TCP connection to a non-loopback peer, else None.
+
+        Only the subtree of the process that IS the named server counts, so a
+        sibling server's persistent connection (a keepalive, ``mcp-remote``) or a
+        shell tool's background tunnel elsewhere in the tree never tags this
+        call. The server root is found by :meth:`_own_server_root`; a server that
+        cannot be found exactly once answers None. A loopback peer is a local
+        service (Kiro Crew's gateway above all), not a remote call.
+
+        On darwin a backend without ``established_tcp``, and a host with neither
+        backend (Windows), answer None.
+        """
+        roster = self._launch_roster()
+        if roster is None or not roster.get(server):
+            return None
+        if self._darwin is not None:
+            probe = getattr(self._darwin, "established_tcp", None)
+            if probe is None:
+                return None
+            root = self._own_server_root(runtime_pid, server, roster)
+            if root is None:
+                return None
+            for pid in (root, *(self._darwin.descendants(root) or ())):
+                if probe(pid):
+                    return root, pid
+            return None
+        if not os.path.isdir(self._proc):
+            return None
+        root = self._own_server_root(runtime_pid, server, roster)
+        if root is None:
+            return None
+        for pid in iter_descendants(self._proc, root):
+            held = socket_inodes(self._proc, pid)
+            if held and held & remote_established_inodes(self._proc, pid):
+                return root, pid
+        return None
+
+    def _own_server_root(self, runtime_pid: int, server: str, roster: LaunchRoster) -> int | None:
+        """The one process below the runtime that was launched as *server*.
+
+        A process is the server when its argv matches one of the server's launch
+        vectors (:func:`launch_matches`). A launcher that starts a versioned copy
+        of itself as its child matches twice; the topmost match is the server
+        and the rest sit in its subtree. Anything other than exactly ONE topmost
+        match answers None, and so does a match that also reads as another
+        declared server:
+
+        - two matches is a second copy -- another session's server on a shared
+          runtime, or a subagent's -- and which copy serves this call is
+          unknowable from the tree;
+        - a process that fits two names cannot be attributed to either.
+
+        The runtime pid itself is never a server. On ``/proc`` a root that holds
+        no socket at all is the namespace sandbox's launcher parent, and its
+        direct children (the real kiro-cli) are excluded too, so kiro-cli's own
+        model connection can never stand in for a server's. On darwin the
+        runtime pid IS kiro-cli, so only the root is excluded.
+        """
+        launches = roster.get(server) or ()
+        if self._darwin is not None:
+            listed = self._darwin.descendants(runtime_pid)
+            if not listed:
+                return None
+            rows: list[tuple[int, str]] = []
+            for pid in listed:
+                row = self._darwin.row(pid)
+                if row is not None:
+                    rows.append((pid, row.cmdline))
+        else:
+            excluded = {runtime_pid}
+            if not socket_inodes(self._proc, runtime_pid):
+                excluded.update(direct_children(self._proc, runtime_pid))
+            rows = [
+                (pid, read_cmdline(self._proc, pid))
+                for pid in iter_descendants(self._proc, runtime_pid)
+                if pid not in excluded
+            ]
+        matches = [pid for pid, cmd in rows if any(launch_matches(cmd, la) for la in launches)]
+        if not matches:
+            return None
+        nested: set[int] = set()
+        for pid in matches:
+            if self._darwin is not None:
+                nested.update(self._darwin.descendants(pid) or ())
+            else:
+                nested.update(p for p in iter_descendants(self._proc, pid) if p != pid)
+        topmost = [pid for pid in matches if pid not in nested]
+        if len(topmost) != 1:
+            return None
+        root = topmost[0]
+        cmdline = next(cmd for pid, cmd in rows if pid == root)
+        for other, other_launches in roster.items():
+            if other != server and any(launch_matches(cmdline, la) for la in other_launches):
+                return None
+        return root
 
     def _check_shell_child(self, runtime_pid: int, tool: ToolCallState) -> tuple[str, str]:
         if self._darwin is not None:
@@ -1537,6 +887,12 @@ class LivenessOracle:
             if target.startswith(("/dev/tty", "/dev/pts")) or (
                 fd == 0 and target.startswith("pipe:")
             ):
+                # A live writer in the subtree (``producer | consumer``) means this
+                # reader waits on a producer; keep scanning (the producer may be on a
+                # tty). No procfs: keep the old verdict.
+                if target.startswith("pipe:") and os.path.isdir(self._proc):
+                    if pipe_writer_pid(self._proc, subtree, target, p) is not None:
+                        continue
                 blocked = (p, target)
                 break
         if blocked is None:
@@ -1574,7 +930,42 @@ class LivenessOracle:
         established = self._any_established(runtime_pid)
         if established:
             return VERDICT_UNKNOWN, f"{EVIDENCE_ESTABLISHED_FLAT}: {evidence}"
+        sharing = self._shared_tree_reason()
+        if sharing:
+            return VERDICT_UNKNOWN, f"{EVIDENCE_SHARED_TREE}: {sharing} ({evidence})"
         return VERDICT_DEAD, f"no established backend socket and flat counters ({evidence})"
+
+    def _shared_tree_reason(self) -> str:
+        """Why tree-wide evidence is not this session's, or "" when it is.
+
+        Asked immediately before the one verdict that is acted on at once. Three
+        answers, and only the first clears the fast path:
+
+        - a declared tenancy of 1 — the tree is this session's, evidence
+          attributable, "" ;
+        - a declared tenancy above 1 — co-tenants, so the reading names no
+          session in particular;
+        - a probe that cannot answer (it raised, or returned a non-count) —
+          ABSENT evidence, which is not a declaration of exclusivity. An
+          exception here means the runtime is being torn down or swapped under
+          the probe, which is the least safe moment to authorise an immediate
+          cancel, so it reads the same as sharing.
+
+        No probe at all is the caller declaring nothing, which keeps the module's
+        historical 1:1 reading — see the ``tenancy`` note in ``__init__``.
+        """
+        if self._tenancy is None:
+            return ""
+        try:
+            count = self._tenancy()
+        except Exception:
+            logger.debug("liveness: tenancy probe failed", exc_info=True)
+            return "tenancy unreadable"
+        if not isinstance(count, int) or count < 1:
+            return "tenancy unreadable"
+        if count == 1:
+            return ""
+        return f"{count} sessions on this runtime"
 
     def _portable_model_wait(self, runtime_pid: int) -> tuple[str, str]:
         """Model-wait verdict from platform-neutral evidence.

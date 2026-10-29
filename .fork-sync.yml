@@ -103,6 +103,15 @@ conflict_policy:
       opencode/copilot spawn+handshake wiring. Adopt upstream's structure where
       it does not touch those two things.
 
+  - glob: "src/kiro_crew/acp/tool_gate.py"
+    policy: fork_wins
+    keystone: true
+    note: |
+      No local ACP backend opt-out exists. Keep every enforced route refusal
+      unconditional, including the enforcement-routing set and runtime checks;
+      adapt it to upstream descriptor changes without restoring config-controlled
+      bypasses.
+
   # ── operator-local config: the fork's own values, not upstream's ──
   - glob: ".kiro/settings/cli.json"
     policy: fork_wins
@@ -118,6 +127,12 @@ conflict_policy:
   - glob: ".github/workflows/sync-upstream.yml"
     policy: fork_wins
     note: "Fork-only: upstream has no such workflow."
+  - glob: "scripts/stamp-distribution.sh"
+    policy: union
+    note: |
+      Preserve both provenance stamps: upstream's WEBSITE_TREE freshness marker
+      and the fork's FORK_STAMPED/FORK_REVISION/FORK_DIRTY identity. Derive both
+      from the script's repository root so staged package copies work.
 
   # ── fork-only exemption lists: both sides append entries ──
   - glob: "website/.jscpd.json"
@@ -192,11 +207,13 @@ conflict_policy:
     policy: union
     note: |
       `en.json` is REGENERATED wholesale by the i18n codemod, so upstream's copy
-      carries none of the fork's namespaces -- taking it drops
+      carries none of the fork's live namespaces -- taking it drops
       `pages.overview.acpBackend.*` and the workflow-policy and multi-repo keys
-      at once, and every affected string renders as its raw key. Union per key in
-      all 13 locales, and re-check `catalogParity` (plural VARIANTS are separate
-      keys: a base key restored without its `_one`/`_other` siblings still fails).
+      at once, and every affected string renders as its raw key. Union live keys
+      per locale, then remove keys whose owning surface was deliberately replaced
+      and which have no remaining literal reader. Re-check `catalogParity` and
+      `deadKeys` (plural VARIANTS are separate keys: a base key restored without
+      its `_one`/`_other` siblings still fails).
 
   - glob: "website/src/**"
     policy: upstream_wins
@@ -360,6 +377,23 @@ conflict_policy:
       guards nothing.
 
 divergences:
+  - id: acp-tool-gate-no-local-opt-out
+    what: |
+      `acp/tool_gate.enforce_runtime_routing` refuses a backend whose route to
+      Kiro Crew's PreToolUse gate is not established whenever its routing
+      mechanism is enforced. No agent config field can waive that refusal.
+      Goose's safe route is seeded as `GOOSE_MODE=approve` on its session
+      environment and verified from the session response.
+    why: |
+      A local opt-out lets user configuration disable a security control that
+      central policy is expected to guarantee. An adapter whose calls skip the
+      gate also skips denied-command rules, sensitive-path checks and the
+      governance ceiling, so uncertainty must remain a startup refusal.
+      Goose's default `auto` mode skips permission requests; the child seed and
+      response check establish the required route without a runtime mode switch.
+    pinned_by: "test/test_acp_tool_gate.py::test_no_local_opt_out_exists, test/test_acp_tool_gate.py::test_enforced_harness_always_refuses, test/test_acp_backend_goose_mode.py::TestGooseRoutingVerification"
+    decided: 2026-10-28
+
   - id: seatbelt-window-ancestor-metadata
     what: |
       `sandbox._window_ancestors` plus a literal `file-read-metadata` allow on
@@ -534,6 +568,8 @@ divergences:
       `__version__` stays UPSTREAM's bare literal. The fork half rides a PEP 440
       LOCAL segment (`+fork.g<sha>[.dirty]`), derived from git and composed by
       `kiro_crew.fork_version.full_version()` for display surfaces only.
+      `scripts/stamp-distribution.sh` must stamp FORK_STAMPED, FORK_REVISION and
+      FORK_DIRTY alongside upstream's WEBSITE_TREE marker.
     why: |
       A fork build was indistinguishable from the upstream build it forked, and
       an upstream install one minor ahead read as NEWER. Rewriting `__version__`
@@ -543,7 +579,7 @@ divergences:
       parsers ignore. Every classifier and comparator strips the local segment
       first (`fork_version.strip_local`), and the release feed does not offer a
       fork build an upstream artifact, because applying one REPLACES the fork.
-    pinned_by: "test/test_fork_version.py, test/test_fork_update_suppression.py"
+    pinned_by: "test/test_fork_version.py, test/test_fork_update_suppression.py, test/test_beacon.py::TestDistributionStamp::test_real_stamped_module_is_read"
     decided: 2026-09-04
 
   - id: fork-electron-updater-suppression
@@ -630,8 +666,17 @@ divergences:
       follows: read the truth off the payload rather than a cache, and never let
       a waiver turn a hard deny into an auto-approve. That PR does NOT fix this
       case, and no upstream issue covers it.
-    pinned_by: "test/test_permission_argument_race.py"
+
+      2026-10-23 sync addition: the refinement/release path writes the trusted
+      params caches, so upstream's deferral predicate is mirrored on the cache
+      writes too, on two axes -- session-origin for all trusted caches, and
+      output-free (`rawOutput`/`content` absent) for the command-bearing ones.
+      Without the guards a foreign-session or already-executed update rewrites
+      the pending call's arguments between park and rebuild and the release
+      reasons over the wrong tool call.
+    pinned_by: "test/test_permission_argument_race.py, test/test_acp_opencode_backend.py (foreign-session/rawOutput cache-poison cases)"
     decided: 2026-09-07
+    revised: 2026-10-29
 
   - id: upstream-owned-harnesses
     what: |
@@ -759,6 +804,77 @@ divergences:
     pinned_by: "test/test_acp_backend_kas.py::test_exactly_one_predicate_holds_for_every_known_backend, test/test_acp_backend_labels.py::TestManagedAgentMarkers"
     decided: 2026-08-31
 
+  - id: copilot-permission-request-row
+    what: |
+      Upstream's re-verified `agent_sdk/backends_routing.py` vocabulary has no
+      "the adapter asks natively" member, so its table carries no copilot row.
+      The fork restores the `PERMISSION_REQUEST` member (upstream's OWN old
+      `acp.backends.Routing` vocabulary still ships it for exactly this claim)
+      plus the row `ACP_BACKEND_COPILOT: Routing.PERMISSION_REQUEST` and the
+      matching `tool_gate.routing_verdict` branch, so the new gate answers
+      ROUTED the way the mirrored old-gate verdict already did. Copilot's
+      mechanism is its native `session/request_permission` -- Crew establishes
+      nothing at spawn, so SEEDED_SETTINGS would overstate the claim.
+    why: |
+      Without the row `routing_for(copilot)` answers UNVERIFIED and
+      `register_selectable_backend` refuses a backend the fork ships as
+      selectable; with SEEDED_SETTINGS instead, the gate would claim a Crew-seeded
+      mode that does not exist. The row is what keeps copilot selectable with an
+      honest routing claim after any sync that rewrites the routing table.
+    pinned_by: "test/test_acp_deepseek_backend_enforcement.py (the `ACP_BACKEND_ROUTING >= ACP_BACKENDS_KNOWN` exhaustiveness pin fails without the row)"
+    decided: 2026-10-29
+
+  - id: session-pid-files-under-run
+    what: |
+      `session_pid_tracking._pid_file_path` / `_session_pid_file_path` return
+      `config_dir() / "run" / ...`. Upstream's split of the pid monolith placed
+      both files directly under `config_dir()`; the fork keeps them in the
+      `run/` subdirectory (created on demand by `ensure_directory(path.parent)`).
+      Every reader and writer goes through the two accessors, so the layout
+      lives in exactly those two lines.
+    why: |
+      The fork's spawn-offload shield/append contract and its run-dir hygiene
+      expect the files under `run/`; a future upstream sync of
+      `session_pid_tracking.py` silently flattens the layout again and the
+      shield tests start failing with FileNotFoundError on the file they just
+      registered into.
+    pinned_by: "test/test_acp_spawn_offload.py (TestRuntimeShieldSurvivesAFailedAppend et al. assert run/kiro_pids.txt and run/kiro_session_pids.txt)"
+    decided: 2026-10-29
+
+  - id: session-mcp-exclusion-path-is-proven
+    what: |
+      `_spec_session_mcp_delivery` (client_mcp_array.py) treats
+      `self._claude_session_excludes_local()` as a PROVEN route and delivers
+      Crew MCP servers, where the plain file verdict of a project-owned
+      `.claude/settings.local.json` lacking `permissions.defaultMode` would
+      withhold them. A file excluded from the session's setting sources is not
+      loaded by the child, so its bytes cannot be the verdict; the live proof is
+      the admission + `_pin_claude_starting_mode` pin-or-kill route. Authored
+      and shared settings surfaces keep the file verdict and stay fail-closed.
+    why: |
+      Gating the exclusion path on the excluded file's verdict withholds every
+      Crew MCP server in any project that owns a settings.local.json without a
+      defaultMode -- the majority of real projects -- while the session's actual
+      routing is already established by the pin. A sync that reverts the seam to
+      pure file-verdict gating reintroduces that silent withholding.
+    pinned_by: "test/test_acp_session_mcp_client_seam.py (the project-owned delivery cases), test/test_client_bindings.py::test_post_session_route_withholds_pooled_stubs_too (the withholding half)"
+    decided: 2026-10-29
+
+  - id: spawn-env-hops-exact-kiro
+    what: |
+      In `AcpClient._spawn` the environment-default hops gate on EXACT kiro
+      (`self.backend == ACP_BACKEND_KIRO`), not on `_is_kiro` (which is dialect:
+      kiro OR kas). kas is a plain fall-through on the client path; its defaults
+      come from `KasHarness.apply_spawn_env` on the runtime path. `_is_kiro`
+      stays dialect everywhere else (a pin asserts `_is_kiro(kas)`).
+    why: |
+      Conflating the two silently hands kiro-cli's env defaults to a kas spawn on
+      the client path -- exactly what the 2026-10-23 merge did, breaking the kas
+      launch golden. A sync that adopts upstream's `_is_kiro` arms wholesale must
+      keep the env hops exact.
+    pinned_by: "test/test_acp_launch_goldens.py (the kas case), test/test_acp_adapter_spawn.py (dialect `_is_kiro` pin)"
+    decided: 2026-10-29
+
   - id: fork-adapters-without-corpus
     what: |
       copilot, goose and pi have no recorded frame corpus under
@@ -874,15 +990,15 @@ divergences:
       (15/70/9/9 passing). Deleting those too would drop coverage of code that is
       still importable.
 
-      ONE LIVE CONSUMER remains: `dashboard/handlers/messaging.py`'s keyed-command
-      paths (spawn/steer/cancel/lookup). They now resolve the authority through
-      `_command_authority_or_none` and answer 503 `coordinator_unavailable` when it
-      is absent, because reaching for the attribute directly raises
-      `AttributeError` inside the handler and turns an UNSUPPORTED request into a
-      500. Watch this at the next sync: `test_run_coordinator_admission.py` injects
-      a `MagicMock` manager, so it passes whether or not the real attribute exists
-      -- it cannot catch the regression, and the degrade path is what makes the
-      absence safe.
+      THREE LIVE KEYED-COMMAND PATHS remain: spawn, steer and cancel, now owned by
+      `dashboard/messaging_api/{spawn,run_control}.py`. They resolve authority
+      through `_command_authority_or_none` and answer 503
+      `coordinator_unavailable` when it is absent. Keep that degradation: direct
+      access raises `AttributeError` and turns an unsupported request into a 500.
+      The old lookup route had zero callers and consumers and is removed; do not
+      restore it without a live caller. `test_run_coordinator_admission.py` uses a
+      MagicMock manager, so it cannot prove real authority exists; the no-authority
+      503 case is the pin that keeps absence safe.
 
     superseded_what: |
       `src/kiro_crew/run_coordinator/` (models, sqlite, shadow, delivery, recovery,

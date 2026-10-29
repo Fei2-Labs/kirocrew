@@ -1,6 +1,6 @@
 """Behavioural tests for the ctypes layer, driven by FAKE frameworks.
 
-Exercises the REAL bodies in ``computer_use/macos_ffi.py`` — the bind pass, the
+Exercises the REAL bodies in ``computer_use/macos_ffi.py`` and its owners — the bind pass, the
 CFString lifetime discipline, the type-checked AX reads, the private-event-source
 key posting, the non-variadic scroll and the in-process ImageIO encode — against
 in-Python stand-ins for CoreFoundation / ApplicationServices / CoreGraphics /
@@ -53,6 +53,10 @@ import pytest
 from kiro_crew import platform_compat
 from kiro_crew.computer_use import macos_ffi, snapshot_macos
 from kiro_crew.computer_use.types import ComputerUseUnsupported, SnapshotRequest
+
+# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+# so the shared macOS handle caches are put back after each one (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
 
 # Sentinel handle values. Distinct and non-zero so a truthiness bug (treating a
 # valid handle as NULL) shows up as a wrong branch rather than passing by luck.

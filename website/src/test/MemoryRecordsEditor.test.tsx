@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useNavigate, Routes, Route } from 'react-router-dom'
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import MemoryRecordsEditor from '../pages/overview/MemoryRecordsEditor'
@@ -12,6 +13,7 @@ const record = (index: number, extra: Partial<MemoryRecord> = {}): MemoryRecord 
 let records: MemoryRecord[]
 beforeEach(() => {
   vi.clearAllMocks()
+  sessionStorage.clear()
   for (const mock of Object.values(api)) mock.mockReset()
   viewport.mobile = false
   records = Array.from({ length: 65 }, (_, index) => record(index))
@@ -346,6 +348,25 @@ it.each([
   await waitFor(() => expect(within(detail).getByText(label, { exact: true })).toBeVisible())
 })
 
+it('keeps a raw source tag from setting the record card’s minimum width', async () => {
+  const source = 'consolidation:dashboard:member-kiro-crew-rust.memory'
+  records = [record(0, { source })]
+  mount('member-review')
+  const body = await screen.findByText(records[0].text)
+  // jsdom has no layout, so pin the CSS that lets a phone-width column shrink.
+  const card = body.closest('[data-testid="memory-records-editor"] > .grid > *') as HTMLElement
+  expect(card).toHaveClass('min-w-0')
+  expect(card.parentElement).toHaveClass('grid-cols-1')
+  const badge = within(card).getByText(source, { exact: true })
+  expect(badge).toHaveClass('block', 'truncate', 'max-w-full')
+  expect(badge).toHaveAttribute('title', source)
+  fireEvent.click(within(card).getByRole('button', { name: 'View details' }))
+  const detail = screen.getByRole('dialog', { name: 'Memory details' })
+  const full = await within(detail).findByText(source, { exact: true })
+  expect(full).toHaveClass('whitespace-normal', 'max-w-full')
+  expect(full).not.toHaveClass('truncate')
+})
+
 it.each([
   { extra: { metadata: { source_ref: 'user_explicit' } }, reference: 'You' },
   { extra: { metadata: { source_ref: 'consolidation' } }, reference: 'Conversation' },
@@ -670,4 +691,73 @@ it.each(['default', 'member-review'])('preserves %s query, cross-page selection 
   expect(api.memoryEditPreview).toHaveBeenCalledTimes(1)
   fireEvent.click(within(dialog).getByRole('button', { name: 'Apply changes (65)' }))
   await waitFor(() => expect(api.memoryEditApply).toHaveBeenCalledWith(store, 'signed-preview'))
+})
+
+it('keeps the search text and kind filter after leaving Settings and coming back by the rail link', async () => {
+  records = [record(0), record(1, { kind: 'directive', id: 'rule:1', key: undefined, value_json: JSON.stringify('Rule one'), text: 'Rule one' })]
+  // The rail returns to a bare `/settings`: no query string survives the trip.
+  const Nav = () => { const go = useNavigate(); return <><button onClick={() => go('/chat')}>to chat</button><button onClick={() => go('/settings')}>to settings</button></> }
+  renderWithProviders(<><Nav /><Routes>
+    <Route path="/settings/*" element={<MemoryRecordsEditor store="default" />} />
+    <Route path="/chat" element={<p>chat</p>} />
+  </Routes></>, { route: '/settings/overview?view=memory' })
+  await screen.findByText('Contact 0: old@example.com')
+  fireEvent.change(screen.getByRole('textbox', { name: 'Search memory' }), { target: { value: 'Rule' } })
+  fireEvent.click(screen.getByRole('radio', { name: 'Lessons' }))
+  await waitFor(() => expect(api.memoryRecords).toHaveBeenLastCalledWith('default', { q: 'Rule', kind: 'directive' }, 0, 50))
+  fireEvent.click(screen.getByRole('button', { name: 'to chat' }))
+  expect(await screen.findByText('chat')).toBeVisible()
+  expect(screen.queryByRole('textbox', { name: 'Search memory' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'to settings' }))
+  expect(screen.getByRole('textbox', { name: 'Search memory' })).toHaveValue('Rule')
+  expect(screen.getByRole('radio', { name: 'Lessons' })).toBeChecked()
+  await waitFor(() => expect(api.memoryRecords).toHaveBeenLastCalledWith('default', { q: 'Rule', kind: 'directive' }, 0, 50))
+  expect(await screen.findByText('Rule one')).toBeVisible()
+})
+
+it('does not carry one store\'s saved filter into another store', async () => {
+  const first = mount('default')
+  await screen.findByText('Contact 0: old@example.com')
+  fireEvent.change(screen.getByRole('textbox', { name: 'Search memory' }), { target: { value: 'Contact 1' } })
+  await waitFor(() => expect(api.memoryRecords).toHaveBeenLastCalledWith('default', { q: 'Contact 1', kind: 'all' }, 0, 50))
+  first.unmount()
+  mount('member-review')
+  expect(screen.getByRole('textbox', { name: 'Search memory' })).toHaveValue('')
+  await waitFor(() => expect(api.memoryRecords).toHaveBeenLastCalledWith('member-review', { q: '', kind: 'all' }, 0, 50))
+})
+
+it.each(['default', 'member-review'])('restores an earlier %s version through a server-side preview', async store => {
+  const current = record(0, { value_json: JSON.stringify('Seattle'), text: 'Seattle', metadata: { revision: 4 } })
+  records = [current]
+  const version = (id: number, before: string | null, after: string, operation = 'correct') => ({ id, revision: id, base_revision: id - 1, status: 'accepted', operation, source: 'user_explicit', before_json: before && JSON.stringify({ value_json: JSON.stringify(before) }), after_json: JSON.stringify({ value_json: JSON.stringify(after) }), metadata_json: '{}', created_at: '2026-09-07T12:00:00Z' })
+  api.memoryRecordHistory.mockResolvedValue({ current_revision: 4, has_more: false, entries: [version(4, 'Boston', 'Seattle', 'restore'), version(3, 'Portland', 'Boston'), version(2, 'Seattle', 'Portland'), version(1, null, 'Seattle', 'create')] })
+  api.memoryEditPreview.mockResolvedValue({ preview_id: 'restore-preview', expires_at: '2026-12-31T12:00:00Z', matched_count: 1, changed_count: 1, unchanged_count: 0, entries: [{ before: current, after: record(0, { value_json: JSON.stringify('Portland') }), operation: 'restore' }], preview_offset: 0, preview_limit: 25, preview_has_more: false, warnings: [] })
+  api.memoryEditApply.mockResolvedValue({ ok: true, changed_count: 1 })
+  mount(store)
+  fireEvent.click(await screen.findByRole('button', { name: 'View details' }))
+  const detail = screen.getByRole('dialog', { name: 'Memory details' })
+  const newest = (await within(detail).findByText('Restored version')).closest('details')!
+  // The current version, and any older one holding the same value, has nothing to restore.
+  expect(within(newest).getByText('Current version')).toBeVisible()
+  expect(within(newest).queryByRole('button', { name: /^Restore/ })).toBeNull()
+  expect(within(detail).getAllByRole('button', { name: /^Restore “/, hidden: true }).map(button => button.textContent)).toEqual(['Restore “Boston”', 'Restore “Portland”'])
+  const older = within(detail).getAllByText('Recorded change')[1].closest('details')!
+  fireEvent.click(within(older).getByText('Recorded change').closest('summary')!)
+  fireEvent.click(within(older).getByRole('button', { name: 'Restore “Portland”' }))
+  const dialog = screen.getByRole('dialog', { name: 'Restore an earlier version' })
+  await waitFor(() => expect(api.memoryEditPreview).toHaveBeenCalledWith(store, { items: [{ kind: 'fact', id: current.id, revision: current.revision }] }, { type: 'restore', revision_id: 2 }))
+  expect(within(dialog).getByText('Restoring saves this value as a new version. Earlier versions stay in the history.')).toBeVisible()
+  // One record and nothing to adjust: the batch counters and the edit step stay hidden.
+  const confirm = await within(dialog).findByRole('button', { name: 'Restore “Portland”' })
+  // The dialog compares the live value with the restored one, not the history card's before/after.
+  expect(within(dialog).getByText('Now')).toBeVisible()
+  expect(within(dialog).getByText('After restoring')).toBeVisible()
+  expect(within(dialog).queryByText('Before')).toBeNull()
+  expect(within(dialog).queryByRole('button', { name: 'Adjust edit' })).toBeNull()
+  expect(within(dialog).queryByText('Will change: 1')).toBeNull()
+  // A restore has no "preview again" step, and Cancel backs out without guessing at the X.
+  expect(within(dialog).queryByText(/Preview expires/)).toBeNull()
+  expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeVisible()
+  fireEvent.click(confirm)
+  await waitFor(() => expect(api.memoryEditApply).toHaveBeenCalledWith(store, 'restore-preview'))
 })

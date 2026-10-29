@@ -88,6 +88,18 @@ self.addEventListener('fetch', e => {
   // ── Skip rules (let the browser handle these natively) ──────────────
   // Cross-origin (CDN scripts, analytics, RUM)
   if (url.origin !== self.location.origin) return
+  // A URL carrying a `token` query parameter is a sign-in link (the owner's
+  // `kirocrew token` link, `/?token=...`). Only the gateway's auth middleware can
+  // honour it: it exchanges the link token for a session cookie and redirects. If
+  // the worker answers instead, the exchange never happens — the cached shell
+  // boots with no session, /api/status answers 403 and the page reads "Session
+  // expired". That is exactly what a phone did when the network-first fetch below
+  // failed and fell back to the cached shell. So the worker never answers such a
+  // request (navigation or otherwise) and, being skipped here, never caches its
+  // response either. Placed before every other rule so no later prefix can
+  // re-claim it. The name is checked by presence, not value: an empty or stale
+  // token is still the gateway's to judge.
+  if (url.searchParams.has('token')) return
   // Core API
   if (url.pathname.startsWith('/api')) return
   // Single-use sandboxed documents for artifact/widget iframes. Two reasons this
@@ -97,6 +109,12 @@ self.addEventListener('fetch', e => {
   // mode === 'navigate', so the offline fallback would serve the SPA shell
   // (/index.html) INTO the widget frame instead of the document.
   if (url.pathname.startsWith('/sandbox-doc/')) return
+  // Standalone app-window documents. These are full top-level applications,
+  // not SPA routes: serving the cached dashboard shell into a frameless overlay
+  // can create an always-on-top, full-display dashboard with no close controls.
+  // Leave navigation and failures to the browser. Electron app-window hosts
+  // already fail closed on 4xx/5xx and transport errors.
+  if (url.pathname.startsWith('/app-windows/')) return
   // App backends (e.g. /apps/dev-fleet/api/*)
   if (url.pathname.startsWith('/apps/')) return
   // Vite content-hashed assets — the immutable HTTP cache still owns them, so
@@ -133,6 +151,23 @@ self.addEventListener('fetch', e => {
   // as a broken image until the tab reloads. Let the browser fetch them natively.
   if (url.pathname === '/logo.png') return
   if (url.pathname.startsWith('/static/')) return
+  // The AudioContext worklet module for dictation / streaming STT, fetched by
+  // `audioWorklet.addModule('/pcm-worklet.js')` when a voice session mounts (a new
+  // chat, meetings transcription). It gets the SAME retry as hashed assets and
+  // /vendor/ stubs, and for the same reason: `addModule` is called ONCE with no
+  // retry of its own, and a voice session cannot start without this module, so a
+  // single transient 5xx there is a boot-critical failure fetchAssetWithRetry
+  // exists to prevent — the same proxy-capacity 5xx (the tailscale case above)
+  // that dead-pages /assets/ and /vendor/. Without this branch the path was not
+  // skipped: it fell through to the network-first shell handler below, which
+  // already intercepted it but fetched it ONCE with no retry, so a transient 5xx
+  // rejected the one-shot addModule. Routing it through fetchAssetWithRetry adds
+  // the retry (two extra tries with jitter) without changing anything else; the
+  // response is still never cached.
+  if (url.pathname === '/pcm-worklet.js') {
+    e.respondWith(fetchAssetWithRetry(e.request))
+    return
+  }
 
   // ── Shell navigation: network-first, fall back to cached shell ──────
   e.respondWith(

@@ -1,7 +1,6 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import { SESSION_LANES, inferLane, type LaneSlotFields } from '../pages/chat/sessionLane'
+import { readIndexCss } from './indexCssSource'
 
 /** The two properties the board depends on, asserted directly rather than
  *  inferred from the rule list: a card that matches no lane vanishes, and a card
@@ -9,12 +8,12 @@ import { SESSION_LANES, inferLane, type LaneSlotFields } from '../pages/chat/ses
 describe('inferLane exhaustiveness and exclusivity', () => {
   const FIELDS: (keyof LaneSlotFields)[] = [
     'pending_approval', 'needs_input', 'has_options', 'interrupted',
-    'running', 'orchestrating', 'subagents_running',
+    'running', 'subagents_running',
   ]
 
   it('assigns every combination of state flags to exactly one known lane', () => {
     const keys = SESSION_LANES.map(l => l.key)
-    // 2^7 flag combinations × sub-agent-approval present/absent.
+    // 2^6 flag combinations × sub-agent-approval present/absent.
     for (let mask = 0; mask < 1 << FIELDS.length; mask++) {
       for (const subagentAwaiting of [0, 2]) {
         const slot: LaneSlotFields = {}
@@ -81,8 +80,9 @@ describe('inferLane working signals', () => {
     expect(inferLane({ running: true })).toBe('working')
   })
 
-  it('counts autopilot stage execution', () => {
-    expect(inferLane({ orchestrating: true })).toBe('working')
+  it('ignores a legacy orchestrating flag on the payload', () => {
+    const legacy: LaneSlotFields & { orchestrating?: boolean } = { orchestrating: true }
+    expect(inferLane(legacy)).toBe('idle')
   })
 
   it('counts sub-agents running under an idle parent', () => {
@@ -111,7 +111,6 @@ describe('inferLane working signals', () => {
   })
 
   it.each([
-    ['orchestration', { orchestrating: true }, {}],
     ['queued work', { queue_depth: 1 }, {}],
     ['dynamic workflow', {}, { workflowActive: true }],
     ['detailed subagents', {}, { detailedSubagentsRunning: true }],
@@ -151,9 +150,7 @@ describe('SESSION_LANES', () => {
     // accent dot renders transparent and its label silently inherits. That is
     // invisible to a type-check and to every behavioural test, and it shipped
     // once -- the idle lane used `--text-muted`, which is defined nowhere.
-    // Resolved from the vitest root (website/), since import.meta.url is not a
-    // file: URL under this config.
-    const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+    const css = readIndexCss()
     const defined = new Set(
       [...css.matchAll(/(--[a-z0-9-]+)\s*:/gi)].map(m => m[1].toLowerCase()),
     )

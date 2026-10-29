@@ -15,7 +15,7 @@ worker of its own:
   started ``run_in_executor`` future cannot be cancelled, so a wedged model load
   would otherwise hold a general-purpose worker for the life of the process. What
   is NOT needed is the dedicated inference thread and priority queue
-  ``embeddings.py`` carries, because every request here is interactive: there is
+  ``embeddings_llama.py`` carries, because every request here is interactive: there is
   no bulk class that could starve one.
 - **It writes nothing to stdout.** ``print_progress=False`` and
   ``print_realtime=False`` suppress the progress writers; with both set, a load and
@@ -44,44 +44,75 @@ without it starts normally and reports voice as unavailable with a reason.
 from __future__ import annotations
 
 import asyncio
-import functools
 import importlib.util
 import logging
+import math
 import os
 import platform
 import time
+import weakref
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from kiro_crew import extras
+from kiro_crew.cpu_affinity import affinity_cpu_count
 from kiro_crew.executors import stt_executor
 from kiro_crew.stt import capabilities as caps_mod
-from kiro_crew.stt import models, telemetry
+from kiro_crew.stt import models, preflight, telemetry
 from kiro_crew.stt.limits import (
     DECODE_ABORT_GRACE_SECS,
     DEFAULT_IDLE_EVICT_SECS,
     DEFAULT_TIMEOUT_SECS,
+    THREADS_AUTO,
+    THREADS_ENV,
+    parse_threads,
+    resolve_thread_count,
 )
 from kiro_crew.stt.vad import SAMPLE_RATE_HZ
 
 logger = logging.getLogger(__name__)
-
-#: Ceiling on the derived thread count. The count itself is host-derived; this
-#: only bounds EXTRAPOLATION above the widths that were measured. Decode-heavy
-#: models stop benefiting early (in-process ``base``, an 11s clip: 8 threads
-#: 0.96s, 16 1.13s, 24 1.18s, i.e. flat-to-worse), while encoder-heavy
-#: ``large-v3-turbo`` keeps gaining to 24 (6.26s / 5.13s / 4.81s). 16 is where
-#: both model shapes sit within 7% of their own best, so a 64- or 128-core host
-#: gets 16 rather than an untested 32+.
-THREAD_CEILING = 16
 
 #: Audio handed to a prewarm decode. whisper.cpp refuses a buffer shorter than
 #: 1000 ms, and the point of prewarming is to pay the graph allocation (measured
 #: at 154-528 ms on the first decode after a load) before a user is waiting on
 #: it. Silence is fine: the cost is in building the graph, not in the content.
 _PREWARM_SECS = 1.0
+
+#: whisper.cpp's encoder window, in frames: 1500 frames hold 30 s of audio, so one
+#: second of audio is 50 frames. ``audio_ctx = 0`` asks for the whole window, and
+#: whisper.cpp encodes all of it however short the audio is -- the fixed floor that
+#: dominates a short decode's cost.
+FULL_AUDIO_CTX = 1500
+_ENCODER_FRAMES_PER_SEC = 50
+
+#: Bounds on the window a display-only decode (a partial, a phrase commit) is sized
+#: to. Measured with ``base`` on four voices and every phrase length from 1 s to 8 s:
+#: a window under 448 frames sent some short clips into whisper.cpp's temperature
+#: fallback (a 1 s clip at 320 frames took 2.5 s against 0.36 s at the full window),
+#: and one shorter than the audio truncates it. At the floor with a 2 s margin no
+#: clip fell back, and the 57-clip sweep spent 2.5x less CPU than the full window.
+#: The floor is in encoder frames, so it holds for every catalog model.
+PREVIEW_AUDIO_CTX_FLOOR = 512
+_PREVIEW_AUDIO_CTX_MARGIN_SECS = 2.0
+_PREVIEW_AUDIO_CTX_STEP = 64
+
+#: Consecutive sized decodes that took more than :data:`PREVIEW_WINDOW_SLOWDOWN`
+#: times the full-window reference before the engine stops sizing for the rest of
+#: the loaded model's life. Consecutive, because the first sized decode after a full
+#: one re-reserves the encoder graph and costs about what a full decode does.
+PREVIEW_WINDOW_MAX_STRIKES = 3
+
+#: How much slower than the full-window reference a sized decode must be to count
+#: as a strike. The failure the breaker exists for is whisper.cpp's temperature
+#: fallback, which re-decodes up to five times: measured with ``base``, a looping
+#: sized decode took 7-21x the full-window decode of the same clip. Ordinary
+#: variation is far smaller -- a sized preview runs at 170-260 ms, and the first one
+#: after a full decode at about 300 ms, against a 387 ms prewarm reference -- so a
+#: strict 1x threshold leaves no margin for a busy host, and once tripped it keeps
+#: every later preview at full-window cost.
+PREVIEW_WINDOW_SLOWDOWN = 2.0
 
 #: How long a timed-out decode is given to honour its abort callback before the
 #: decode lock is released anyway. whisper.cpp polls the callback inside its decode
@@ -104,27 +135,37 @@ def _consume_future_exception(future: asyncio.Future) -> None:
 
 
 def available_cpus() -> int:
-    """Return the core count this process may actually run on.
+    """Return the core count this process may actually run on, at least one.
 
-    ``os.sched_getaffinity`` rather than ``os.cpu_count``: under a CPU-set
-    restriction (containers, cgroups, ``taskset``) the latter reports the whole
-    machine, which is exactly the environment that over-threads worst. Falls back
-    to ``os.cpu_count`` where affinity is unavailable (macOS, Windows).
+    The platform read lives in :func:`kiro_crew.cpu_affinity.affinity_cpu_count`,
+    which prefers the CPU-set-aware count; a host that cannot answer reads as one
+    core here.
     """
-    if hasattr(os, "sched_getaffinity"):
-        try:
-            return len(os.sched_getaffinity(0)) or 1
-        except OSError:
-            pass
-    return os.cpu_count() or 1
+    return affinity_cpu_count() or 1
 
 
-def thread_count() -> int:
-    """Derive the recogniser's intra-op thread count from the host.
+#: Unusable ``KIROCREW_STT_THREADS`` values already logged, so a bad variable is
+#: reported once per process rather than on every session that asks for a count.
+_warned_thread_env: set[str] = set()
 
-    Half the available cores, bounded by :data:`THREAD_CEILING`.
 
-    Whisper decoding is autoregressive: thousands of tiny parallel regions, each
+def thread_count(configured: int = THREADS_AUTO, environ: Mapping[str, str] | None = None) -> int:
+    """The recogniser's intra-op thread count.
+
+    *configured* is ``stt.threads``. :data:`~kiro_crew.stt.limits.THREADS_ENV` in
+    *environ* (the process environment by default) outranks it when it parses; an
+    unusable value is logged once and ignored. A positive request is used as given,
+    clamped to ``[1, available_cpus()]``. :data:`~kiro_crew.stt.limits.THREADS_AUTO`
+    derives the count from the host: half the available cores, bounded by
+    :data:`~kiro_crew.stt.limits.THREAD_CEILING`.
+
+    An explicit count is not capped by :data:`~kiro_crew.stt.limits.THREAD_CEILING`. The ceiling bounds
+    extrapolation on hosts nobody measured; an operator who sets a count has
+    measured their own host. On a 128-core host, ``large-v3-turbo`` on an 11 s clip
+    took 3.7-4.2 s at 16 threads, 2.0 s at 32, 1.25 s at 64 and 1.1 s at 96.
+
+    The derived count stays conservative because whisper decoding is
+    autoregressive: thousands of tiny parallel regions, each
     ending in a barrier that completes only when its slowest worker arrives. Wide
     pools therefore cost latency per step rather than buying throughput, and on a
     host with other work (a Kiro Crew host runs the gateway and agent sessions
@@ -139,7 +180,36 @@ def thread_count() -> int:
     ranged 8.1-68.4s depending on background load. The headroom buys
     predictability first and mean latency second.
     """
-    return max(1, min(THREAD_CEILING, available_cpus() // 2))
+    requested = configured
+    source = os.environ if environ is None else environ
+    raw = source.get(THREADS_ENV, "")
+    if raw.strip():
+        parsed = parse_threads(raw)
+        if parsed is not None:
+            requested = parsed
+        elif raw not in _warned_thread_env:
+            _warned_thread_env.add(raw)
+            logger.warning(
+                "Ignoring %s=%r: expected 'auto' or a whole number of threads; using stt.threads",
+                THREADS_ENV,
+                raw,
+            )
+    cpus = available_cpus()
+    return resolve_thread_count(requested, cpus)
+
+
+def preview_audio_ctx(samples: int) -> int:
+    """The encoder window, in frames, for a display-only decode of *samples*.
+
+    The audio's own length plus :data:`_PREVIEW_AUDIO_CTX_MARGIN_SECS`, rounded up
+    to :data:`_PREVIEW_AUDIO_CTX_STEP` and never under
+    :data:`PREVIEW_AUDIO_CTX_FLOOR`. ``0`` -- the full window -- once that reaches
+    :data:`FULL_AUDIO_CTX`, since a window that large saves nothing.
+    """
+    secs = samples / SAMPLE_RATE_HZ + _PREVIEW_AUDIO_CTX_MARGIN_SECS
+    steps = math.ceil(secs * _ENCODER_FRAMES_PER_SEC / _PREVIEW_AUDIO_CTX_STEP)
+    frames = max(PREVIEW_AUDIO_CTX_FLOOR, steps * _PREVIEW_AUDIO_CTX_STEP)
+    return 0 if frames >= FULL_AUDIO_CTX else frames
 
 
 # ── Availability ──
@@ -157,6 +227,13 @@ CODE_MODEL_MISSING = "stt_model_missing"
 #: answered ``""``, the session read that as silence, the transport dropped the empty
 #: final, and the user's dictation disappeared with nothing on screen to say why.
 CODE_DECODE_FAILED = "stt_decode_failed"
+#: Three more come from :mod:`kiro_crew.stt.preflight`, which decides BEFORE the
+#: native library is touched whether touching it would take the process down.
+#: Re-exported here because a code is a code wherever it was minted: the browser
+#: keys its message off the string, not off the module that produced it.
+CODE_UNSUPPORTED_CPU = preflight.CODE_UNSUPPORTED_CPU
+CODE_LOAD_CRASHED = preflight.CODE_LOAD_CRASHED
+CODE_NATIVE_PROBE_CRASHED = preflight.CODE_NATIVE_PROBE_CRASHED
 
 
 class DecodeFailed(RuntimeError):
@@ -200,10 +277,36 @@ def _whisper_binding() -> Any | None:
     return binding
 
 
+def _decode_handed_over(
+    handoff: list[Any],
+    pcm: np.ndarray,
+    should_abort: Callable[[], bool],
+    audio_ctx: int,
+) -> list[Any]:
+    """:func:`_decode_segments` on the one model in *handoff*, taken out of it first.
+
+    **The pool never holds the model: not in a work item's arguments, not in its
+    result.** ``ThreadPoolExecutor`` keeps each work item -- callable, arguments
+    and the future carrying the result -- until its thread gets around to dropping
+    it, which is strictly AFTER the result has reached the awaiting coroutine. A
+    model bound into the item, or returned as its bare result, therefore outlives
+    the ``await`` by one scheduler slice, and a ``close()`` or idle eviction that
+    follows at once finds the weights still resident. So the model crosses the
+    thread boundary in a one-element list the receiving side empties: here, the
+    worker pops it and this frame's local is the only reference the pool thread
+    holds, gone when the call returns; for a load,
+    :meth:`WhisperEngine._build_model_handed_over` returns it in a list the loop
+    thread pops. :meth:`WhisperEngine._unload_locked` relies on both.
+    """
+    model = handoff.pop()
+    return _decode_segments(model, pcm, should_abort, audio_ctx)
+
+
 def _decode_segments(
     model: Any,
     pcm: np.ndarray,
     should_abort: Callable[[], bool],
+    audio_ctx: int = 0,
 ) -> list[Any]:
     """Run one whisper.cpp decode, raising :class:`DecodeFailed` on a native failure.
 
@@ -230,6 +333,14 @@ def _decode_segments(
     expected -- a renamed member in a later release, or an unreachable extension
     module. That path loses only the status; the failures :meth:`WhisperEngine.decode`
     raises on regardless (an exception out of the call, and a timeout) are unaffected.
+
+    ``audio_ctx`` (encoder frames, ``0`` = the full window) applies to this call only.
+    It is set on the shared params object and restored before returning, so the
+    next decode -- a final among them -- gets the window it asks for. The fallback
+    path decodes at the full window: ``Model.transcribe`` stores any parameter it
+    is passed on the params object for good. So does a binding whose params carry
+    no ``audio_ctx``: setting it there would fail every preview, and the breaker
+    only reacts to slow decodes, so it would never restore them.
     """
     ctx = getattr(model, "_ctx", None)
     params = getattr(model, "_params", None)
@@ -242,7 +353,15 @@ def _decode_segments(
     # new-segment callback from some other caller would otherwise still fire.
     binding.assign_new_segment_callback(params, None)
     binding.assign_abort_callback(params, should_abort)
-    status = binding.whisper_full(ctx, params, pcm, pcm.size)
+    if audio_ctx and hasattr(params, "audio_ctx"):
+        full_ctx = params.audio_ctx
+        params.audio_ctx = audio_ctx
+        try:
+            status = binding.whisper_full(ctx, params, pcm, pcm.size)
+        finally:
+            params.audio_ctx = full_ctx
+    else:
+        status = binding.whisper_full(ctx, params, pcm, pcm.size)
     if status != _WHISPER_OK:
         if should_abort():
             return []
@@ -338,6 +457,26 @@ def probe() -> Availability:
             CODE_EXTRA_MISSING,
             f"speech recognition needs its voice dependencies: {extras.install_hint('voice')}",
         )
+    # BEFORE the in-process import, because that import IS a native call: it
+    # dlopens the extension and runs its static initialisers, and on a build
+    # compiled for a CPU this is not, the first instruction the CPU rejects can
+    # sit in those initialisers as easily as in `ggml_cpu_init` or the model load.
+    # A SIGILL there ends the PROCESS, not the call. So both questions the import
+    # cannot survive are answered without touching the library in this process:
+    # a child interpreter runs the build's own feature report (cached per binary,
+    # and it is the child that performs the import), and a marker left by a
+    # previous load that never returned refuses a second attempt with the same
+    # build. Both answers are `Availability` values like every other, so the boot
+    # prewarm, a live session, the status endpoint and `doctor` all say the same
+    # thing and none of them loads anything first. A child that could not import
+    # at all is an INCONCLUSIVE verdict, and the in-process import below then
+    # reports the loader's own message, which is the more useful one.
+    checked = preflight.verdict()
+    if not checked.ok:
+        return Availability(False, checked.code, checked.detail)
+    fused = preflight.previous_load_crashed(models.models_dir())
+    if not fused.ok:
+        return Availability(False, fused.code, fused.detail)
     try:
         import pywhispercpp.model  # noqa: F401
     except Exception as exc:  # pragma: no cover (host-specific loader failures)
@@ -374,9 +513,11 @@ class WhisperEngine:
         self,
         idle_evict_secs: int = DEFAULT_IDLE_EVICT_SECS,
         timeout_secs: int = DEFAULT_TIMEOUT_SECS,
+        threads: int = THREADS_AUTO,
     ) -> None:
         self._idle_evict_secs = idle_evict_secs
         self._timeout_secs = timeout_secs
+        self._threads = threads
         self._model: Any | None = None
         self._key: LoadedKey | None = None
         self._warmed_key: LoadedKey | None = None
@@ -394,9 +535,21 @@ class WhisperEngine:
         #: 148 MB at the default and 1.6 GB at the largest, so two at once is what
         #: exhausts a host sized for one.
         self._load_future: "asyncio.Future[Any] | None" = None
+        #: Usage-marker writes in flight. Detached so a stalled filesystem never
+        #: holds a finished transcript; kept here so the loop cannot collect one.
+        self._stamp_tasks: set[asyncio.Task[None]] = set()
         # A native call can outlive its abort grace. Keep its future so retries
         # cannot allocate another large model while the retired one still runs.
         self._retired_decode: asyncio.Future | None = None
+        # Whether sizing the encoder window still pays, judged per loaded model
+        # (`_window_model`), so every load, reload and retirement starts afresh
+        # without each of those paths having to remember to reset it. A WEAK
+        # reference: dropping the last strong one is what frees a context (see
+        # `_unload_locked`), so a strong one here would keep unloaded weights alive.
+        self._window_model: "weakref.ReferenceType[Any] | None" = None
+        self._full_window_ms: float | None = None
+        self._sized_window_strikes = 0
+        self._sized_window_off = False
 
     @property
     def loaded(self) -> bool:
@@ -410,6 +563,19 @@ class WhisperEngine:
         """
         self._idle_evict_secs = idle_evict_secs
         self._timeout_secs = timeout_secs
+
+    def set_threads(self, threads: int) -> None:
+        """Record ``stt.threads`` from current config.
+
+        Takes effect at the next :meth:`ensure_loaded`, not mid-decode: the count is
+        part of :class:`LoadedKey`, so a resident context built with another count no
+        longer matches and is rebuilt on the next request.
+        """
+        self._threads = threads
+
+    def thread_count(self) -> int:
+        """The thread count the next load would use, from this engine's setting."""
+        return thread_count(self._threads)
 
     def _locks(self) -> tuple[asyncio.Lock, asyncio.Lock]:
         if self._load_lock is None:
@@ -434,7 +600,14 @@ class WhisperEngine:
         if not probed.ok:
             return probed
 
-        model = models.resolve(model_name)
+        # Off the loop for the same reason as `probe` above: resolving the CUSTOM
+        # selection reads and validates `config.json` (see `models.resolve`), which is
+        # a synchronous stat + read on the gateway's single event loop, and this runs
+        # on the websocket handler's task. Offloaded unconditionally rather than only
+        # for the custom name -- the executor hop is microseconds beside the model
+        # load this precedes, and duplicating `resolve`'s own dispatch at every async
+        # call site is how one of them ends up keeping the blocking read.
+        model = await asyncio.to_thread(models.resolve, model_name)
         # The key is built from the path the model WOULD have, so residency can be
         # decided before the store is asked for it. That ordering is what makes the
         # store's digest check affordable: `ensure` verifies the file against its pin
@@ -442,7 +615,9 @@ class WhisperEngine:
         # largest) on the path this feature exists to make fast. Asked only when a
         # load is actually about to happen, the cost lands once per load -- which is
         # also exactly when an unverified file would take effect.
-        key = LoadedKey(str(models.model_path(model)), language, thread_count())
+        # Off the loop: for a custom model `model_path` resolves the path on disk.
+        key_path = await asyncio.to_thread(models.model_path, model)
+        key = LoadedKey(str(key_path), language, self.thread_count())
         load_lock, decode_lock = self._locks()
         # The LOAD lock spans the whole episode; the DECODE lock is taken only around
         # the context swap, and that narrower scope is load-bearing. `ensure` below
@@ -492,11 +667,21 @@ class WhisperEngine:
                     model.name, (time.monotonic() - hash_started) * 1000.0
                 )
             if path is None:
+                status = getattr(models.store(), "status", None) or {}
+                if status.get("refused") and status.get("model") == model.name:
+                    # Not "not downloaded": the bytes are present and pinned, and a
+                    # download would not help. The detail names the file and the remedy.
+                    return Availability(False, CODE_IMPORT_FAILED, str(status.get("error", "")))
                 return Availability(
                     False,
                     CODE_MODEL_MISSING,
                     f"speech model {model.name} is not downloaded",
                 )
+            # Load the file `ensure` vetted, not the one the key was built from
+            # before it ran: for a custom model the two can differ if the folder
+            # changed in between, and only the vetted one passed the hash.
+            if model.name == models.CUSTOM_MODEL and str(path) != key.model_path:
+                key = LoadedKey(str(path), key.language, key.n_threads)
             if self._load_future is not None and not self._load_future.done():
                 # A previous load timed out, released this lock and is STILL building
                 # its context. Starting a second one is how a host sized for one model
@@ -520,11 +705,29 @@ class WhisperEngine:
                     # rather than two.
                     self._unload_locked()
                 loop = asyncio.get_running_loop()
+                # The fuse is armed and disarmed inside `_build_model_fused`, on the
+                # WORKER THREAD: written immediately before the native call and cleared
+                # in a `finally` around it, so it is cleared on success, on a Python
+                # exception and on a load that outlived its caller's timeout -- every
+                # outcome in which the call RETURNED. Not from here or from the future's
+                # done-callback: both run on the event loop, the marker is filesystem
+                # I/O the loop must not wait on, and a shutdown that cancels the boot
+                # prewarm mid-load closes the loop before the executor future can chain
+                # back into it, which would leave the marker behind after a routine
+                # restart and trip the fuse on a gateway that never crashed. The one
+                # outcome that leaves it behind is the process dying inside the call,
+                # which is the one this exists to remember: the next process finds it in
+                # `probe` and refuses to load the same build.
+                marker_dir = models.models_dir()
                 # `asyncio.wait` on a kept reference, not `wait_for`: a load has no abort
                 # hook, so a timeout cannot stop the native allocation. `wait_for` would
                 # cancel the wrapper and let this lock go while a 1.6 GB context was still
                 # being built, and the caller's retry would start a SECOND one.
-                future = loop.run_in_executor(stt_executor(), self._build_model, key)
+                # Returned in a list this thread empties, never bare: see
+                # `_decode_handed_over`.
+                future = loop.run_in_executor(
+                    stt_executor(), self._build_model_handed_over, key, marker_dir
+                )
                 self._load_future = future
                 load_started = time.monotonic()
                 done, _pending = await asyncio.wait({future}, timeout=self._timeout_secs)
@@ -539,7 +742,7 @@ class WhisperEngine:
                         # build a second context for the same weights.
                         self._load_future = None
                         try:
-                            self._model = future.result()
+                            self._model = future.result().pop()
                             self._key = key
                             self._last_used = time.monotonic()
                             telemetry.recorder().record_load(
@@ -565,7 +768,7 @@ class WhisperEngine:
                     return Availability(False, CODE_IMPORT_FAILED, "model load timed out")
                 self._load_future = None
                 try:
-                    self._model = future.result()
+                    self._model = future.result().pop()
                 except Exception as exc:
                     logger.warning("Failed to load whisper model from %s: %s", path, exc)
                     return Availability(False, CODE_IMPORT_FAILED, f"model load failed: {exc}")
@@ -578,13 +781,16 @@ class WhisperEngine:
                 # report that voice input is slow. Read from the build rather than
                 # requested: `whisper_context_default_params()` asks for `use_gpu`
                 # and gets it granted on a CPU-only wheel, so the request is not
-                # evidence. See `kiro_crew.stt.capabilities`.
+                # evidence. See `kiro_crew.stt.capabilities`. Off the loop: reading
+                # the build is a native call, and its preflight gate can spawn the
+                # probe child if the wheel was replaced since `probe` ran.
+                backend = (await asyncio.to_thread(self.capabilities)).backend
                 logger.info(
                     "Whisper model loaded: %s (language=%s, threads=%d, backend=%s)",
                     model.name,
                     language or "auto",
                     key.n_threads,
-                    self.capabilities().backend,
+                    backend,
                 )
         return Availability(True)
 
@@ -620,6 +826,34 @@ class WhisperEngine:
             suppress_nst=True,
         )
 
+    @classmethod
+    def _build_model_fused(cls, key: LoadedKey, marker_dir: Any) -> Any:
+        """:meth:`_build_model` with the load marker written and cleared on this thread.
+
+        A ``classmethod`` calling through ``cls`` so a test that substitutes
+        ``_build_model`` on the class substitutes what runs here too. The write is
+        the fuse's arm and the ``finally`` its disarm: the disarm runs for a return
+        and for a raise, and is skipped only when the process itself is gone. The
+        arm sits OUTSIDE the ``try`` on purpose: a marker that cannot be written
+        raises before the native call, so the load never runs unguarded and
+        ``ensure_loaded`` reports the reason like any other failed load.
+        """
+        preflight.write_load_marker(marker_dir, key.model_path)
+        try:
+            return cls._build_model(key)
+        finally:
+            preflight.clear_load_marker(marker_dir)
+
+    @classmethod
+    def _build_model_handed_over(cls, key: LoadedKey, marker_dir: Any) -> list[Any]:
+        """:meth:`_build_model_fused`, its model returned inside a one-element list.
+
+        The load's half of the hand-over :func:`_decode_handed_over` describes: the
+        loop thread pops the model out, so the future the pool keeps carries an
+        empty list rather than the weights.
+        """
+        return [cls._build_model_fused(key, marker_dir)]
+
     @staticmethod
     def capabilities() -> caps_mod.Capabilities:
         """What the native build links, read from the build on every call.
@@ -629,7 +863,16 @@ class WhisperEngine:
         Uncached for the reason :func:`kiro_crew.stt.capabilities.detect` gives --
         a reinstall can replace the wheel under a running gateway, and that is the
         moment a stale answer misleads most.
+
+        Gated on the preflight verdict first, because reading the build IS a native
+        call: ``whisper_print_system_info`` runs ``ggml_cpu_init``, the first code an
+        incompatible build faults in. On a refused host the answer comes from the
+        child probe's copy of the same string, or is simply "unknown"; the process
+        never asks the library itself.
         """
+        checked = preflight.verdict()
+        if not checked.ok:
+            return caps_mod.Capabilities(raw=checked.raw, detail=checked.detail)
         return caps_mod.detect()
 
     @property
@@ -650,6 +893,7 @@ class WhisperEngine:
         expect: LoadedKey | None = None,
         abort_if: Callable[[], bool] | None = None,
         kind: str = telemetry.KIND_FINAL,
+        sized_window: bool = False,
     ) -> str:
         """Transcribe mono float32 16 kHz audio, returning cleaned text.
 
@@ -674,6 +918,15 @@ class WhisperEngine:
         :class:`~kiro_crew.stt.telemetry.DecodeSample` so a diagnostic can tell a
         cosmetic partial's cost apart from the final the user waits on. It never
         changes what is decoded.
+
+        ``sized_window`` encodes only :func:`preview_audio_ctx` frames instead of the
+        full 30 s window. It is for DISPLAY-ONLY decodes (a partial, a phrase
+        commit): the text can differ from a full-window decode in punctuation or
+        an unsettled word, which a preview the final replaces can afford and the
+        text the user keeps cannot. The engine stops honouring it for the loaded
+        model once :data:`PREVIEW_WINDOW_MAX_STRIKES` sized decodes in a row took
+        more than :data:`PREVIEW_WINDOW_SLOWDOWN` times the full window
+        (:meth:`_note_window_cost`).
 
         Raises :class:`DecodeFailed` when the decode FAILED: the native call raised,
         the native call reported a non-zero status, or the wait expired and the work
@@ -730,6 +983,14 @@ class WhisperEngine:
                     self._key.model_path if self._key else "nothing",
                 )
                 return ""
+            if self._window_model is None or self._window_model() is not model:
+                self._window_model = weakref.ref(model)
+                self._full_window_ms = None
+                self._sized_window_strikes = 0
+                self._sized_window_off = False
+            audio_ctx = (
+                preview_audio_ctx(pcm.size) if sized_window and not self._sized_window_off else 0
+            )
             loop = asyncio.get_running_loop()
             decode_started = time.monotonic()
             # `complete` means the native call produced segments for the WHOLE of
@@ -739,9 +1000,11 @@ class WhisperEngine:
             # is a true reading and is the best input the partial budget can get.
             complete = False
             try:
+                # In a list the worker empties, never as a bound argument: see
+                # `_decode_handed_over`. The worker's own frame holds the model while
+                # the native call runs, which is the reference `_retire_decode` counts on.
                 future = loop.run_in_executor(
-                    stt_executor(),
-                    functools.partial(_decode_segments, model, pcm, should_abort),
+                    stt_executor(), _decode_handed_over, [model], pcm, should_abort, audio_ctx
                 )
                 # `asyncio.wait` rather than `wait_for`, because a timeout here must NOT
                 # abandon the future: `wait_for` cancels the wrapper and leaves the
@@ -823,8 +1086,21 @@ class WhisperEngine:
                 self._last_used = time.monotonic()
                 self._warmed_key = self._key
                 complete = True
+                if kind != telemetry.KIND_PREWARM and models.claim_usage_stamp():
+                    # Read by the boot prewarm gate (stt_hooks): a host that never
+                    # decodes does not pay for resident weights on every launch.
+                    # The claim is a clock read; the write is file I/O, so it runs
+                    # in a thread, once an hour per process, and is NOT awaited: a
+                    # stalled filesystem must not cost the transcript in hand.
+                    stamp = asyncio.create_task(asyncio.to_thread(models.write_usage_marker))
+                    self._stamp_tasks.add(stamp)
+                    stamp.add_done_callback(self._stamp_tasks.discard)
                 if should_abort():
                     return ""
+                # Only after the abort check: an aborted decode unwinds early, and its
+                # short time taken as the full-window reference would make every
+                # sized decode after it look slow.
+                self._note_window_cost(audio_ctx, (self._last_used - decode_started) * 1000.0)
             finally:
                 # In a `finally` rather than at each exit: this region has six
                 # ways out (two cancellations, two timeout branches, a native
@@ -834,6 +1110,36 @@ class WhisperEngine:
 
         parts = [str(getattr(seg, "text", "")).strip() for seg in segments]
         return " ".join(p for p in parts if p).strip()
+
+    def _note_window_cost(self, audio_ctx: int, wall_ms: float) -> None:
+        """Record a completed decode's time, and stop sizing when it does not pay.
+
+        A full-window decode sets the reference. A sized one counts a strike when it
+        took more than :data:`PREVIEW_WINDOW_SLOWDOWN` times that reference and clears
+        the count when it did not, so only a run of
+        :data:`PREVIEW_WINDOW_MAX_STRIKES` such decodes in a row turns sizing off. A
+        sized decode before any full one has nothing to compare against.
+        """
+        if not audio_ctx:
+            self._full_window_ms = wall_ms
+            return
+        if self._full_window_ms is None or self._sized_window_off:
+            return
+        if wall_ms <= self._full_window_ms * PREVIEW_WINDOW_SLOWDOWN:
+            self._sized_window_strikes = 0
+            return
+        self._sized_window_strikes += 1
+        if self._sized_window_strikes >= PREVIEW_WINDOW_MAX_STRIKES:
+            self._sized_window_off = True
+            logger.warning(
+                "%d sized-window whisper decodes in a row took over %.0fx the full "
+                "window (last %.0f ms against %.0f ms); decoding previews at the full "
+                "window until the model is reloaded",
+                self._sized_window_strikes,
+                PREVIEW_WINDOW_SLOWDOWN,
+                wall_ms,
+                self._full_window_ms,
+            )
 
     def _retire_decode(self, future: asyncio.Future) -> None:
         """Detach a non-cooperating context without allocating a second one."""
@@ -920,7 +1226,8 @@ class WhisperEngine:
         under CPython's refcounting that happens here rather than at some later
         collection. Which is why the reference is cleared and nothing else is
         held onto: keeping the object alive in a worker thread to "free it
-        properly" would do the opposite.
+        properly" would do the opposite. It holds only because the pool never
+        kept a reference of its own (:func:`_decode_handed_over`).
         """
         self._model = None
         self._key = None
@@ -933,6 +1240,7 @@ _engine: WhisperEngine | None = None
 def shared_engine(
     idle_evict_secs: int | None = None,
     timeout_secs: int | None = None,
+    threads: int | None = None,
 ) -> WhisperEngine:
     """The process-wide recogniser.
 
@@ -945,7 +1253,8 @@ def shared_engine(
     module defaults: defaulting to the constants would make every zero-argument
     caller silently a WRITER -- :func:`prewarm` and :func:`close` ask for the
     engine without opinions about its configuration, and would reset an operator's
-    configured window back to 600 s.
+    configured window back to 600 s. *threads* (``stt.threads``) follows the same
+    rule on its own, so a caller that knows only the thread setting can pass it.
     """
     global _engine
     if _engine is None:
@@ -954,8 +1263,12 @@ def shared_engine(
                 DEFAULT_IDLE_EVICT_SECS if idle_evict_secs is None else idle_evict_secs
             ),
             timeout_secs=DEFAULT_TIMEOUT_SECS if timeout_secs is None else timeout_secs,
+            threads=THREADS_AUTO if threads is None else threads,
         )
-    elif idle_evict_secs is not None and timeout_secs is not None:
+        return _engine
+    if threads is not None:
+        _engine.set_threads(threads)
+    if idle_evict_secs is not None and timeout_secs is not None:
         # The window comes from config, which is read live. Without this the value
         # the FIRST caller happened to pass would stick for the life of the
         # process, so editing the setting would appear to do nothing until a

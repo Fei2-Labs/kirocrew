@@ -8,13 +8,26 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from kiro_crew.subagent import SubagentDelivery
 
 logger = logging.getLogger(__name__)
 
 # This is well above the slot queue's legitimate in-flight set.  Eviction only
 # bounds orphaned bookkeeping; an evicted agent remains recoverable on restart.
 MAX_PENDING_SUBAGENT_DELIVERIES = 128
+
+#: Cap on a slot's LIVE in-memory queue, shared by every producer that guards
+#: an append against a full queue. One named constant because two bare
+#: literals bounding the same population drift: the cron origin-injection path
+#: (handlers/messaging.py) evicts the OLDEST entry at this cap, while the
+#: MCP-App message path (handlers/mcp_apps.py) refuses the NEWEST — different
+#: overflow semantics on purpose (a cron notification is periodic and
+#: regenerates; an app message is a one-shot user action whose producer can be
+#: told 429) — but the SIZE they guard is the same queue.
+MAX_LIVE_QUEUE_ENTRIES = 50
 
 #: How many queued user prompts one session's metadata line carries, and how
 #: many a restore admits back. Front-first, because the front is what runs
@@ -315,7 +328,11 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     # Local import: session_control reaches this module through state, so taking
     # the key at module level would close an import cycle.
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
-    from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
+    from kiro_crew.dashboard.session_control import (
+        CHANNEL_RECIPIENT_META_KEY,
+        QUEUED_CONTAINMENT_META_KEY,
+        SEND_ORIGIN_META_KEY,
+    )
 
     entries: list[dict[str, Any]] = []
     budget = MAX_DURABLE_QUEUE_BYTES
@@ -379,10 +396,36 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # the drain re-derives what it can from the entry's `kind`, which the
             # writer never emits either. A restored app entry therefore carries no
             # actor at all -- the same fail-closed baseline the flags above get.
+            #
+            # The SENDING SLOT goes with them, and it is the sharpest of the
+            # first three because the value is not merely read, it names a WRITE
+            # TARGET: the drain resolves the recipient of its drop notice from
+            # this key alone and appends the entry's own text there
+            # (`session_control.notify_send_origin_dropped`). Carried back off
+            # the line verbatim, an edited stamp turns a file write into a
+            # transcript row in a session the editor does not own, with the
+            # entry's content as its body. Nothing in the entry can attest to
+            # who sent it, so the key is worth exactly what the file is worth
+            # and is dropped. The cost is one notice: a relay that outlives a
+            # restart and is then dropped reports to nobody, while the RELAY
+            # itself still survives -- which is what putting the stamp in
+            # ``meta`` rather than a consumption callback buys, since a
+            # callback-carrying entry is not persisted at all.
+            #
+            # The CHANNEL RECIPIENT stamp goes for the same reason with a wider
+            # blast radius: it names a conversation on a network surface and the
+            # drop notice would carry the entry's text there, so an edited stamp
+            # would turn a file write into an outbound channel message.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
-                if k not in (QUEUED_CONTAINMENT_META_KEY, TURN_ACTOR_META_KEY)
+                if k
+                not in (
+                    QUEUED_CONTAINMENT_META_KEY,
+                    TURN_ACTOR_META_KEY,
+                    SEND_ORIGIN_META_KEY,
+                    CHANNEL_RECIPIENT_META_KEY,
+                )
             }
         try:
             # Costed against the same key projection the WRITER admits
@@ -454,6 +497,47 @@ def _renumber_marker(content: str, marker: str, old: int, new: int, path: str) -
     for at, end in reversed(_marker_spans(content, marker, old, path)):
         content = content[:at] + replacement + content[end:]
     return content
+
+
+_QUOTE_ATTRIBUTION = {
+    "user": "— quoting an earlier message from the user",
+    "assistant": "— quoting an earlier message from the assistant",
+}
+
+
+def quote_block(quote: Any) -> str | None:
+    """The blockquote a ``meta.quote`` record serializes to, or ``None``.
+
+    Mirrors the dashboard's ``quoteBlock`` (``chat-core/composer/messageQuote.ts``)
+    byte for byte: the card the client draws strips exactly this block from
+    the head of the row, so a record whose block is absent from the text has
+    nothing to point at.
+    """
+    if not isinstance(quote, dict):
+        return None
+    text, role = quote.get("text"), quote.get("role")
+    # ``role`` is type-gated before the dict lookup: a restored queue file is an
+    # untrusted boundary, and an unhashable role must refuse the record, not
+    # raise out of the edit that reads it.
+    if not isinstance(text, str) or not isinstance(role, str) or role not in _QUOTE_ATTRIBUTION:
+        return None
+    return "\n".join("> " + line for line in [*text.split("\n"), _QUOTE_ATTRIBUTION[role]])
+
+
+def prune_quote_meta(meta: Any, content: str) -> None:
+    """Drop an entry's ``meta.quote`` when an edit took its block out of *content*.
+
+    The drained row's card is drawn from the record and the record's block is
+    stripped from the text; a record whose block the edit removed or changed
+    would draw a card over text that does not open with it -- a stale card
+    beside raw ``>`` lines. The edit keeps whatever the user wrote; only the
+    card's claim is withdrawn.
+    """
+    if not isinstance(meta, dict) or "quote" not in meta:
+        return
+    block = quote_block(meta.get("quote"))
+    if block is None or not content.startswith(block):
+        meta.pop("quote", None)
 
 
 def prune_attachment_meta(meta: Any, content: str, previous: str) -> str:
@@ -610,14 +694,18 @@ class SlotQueueRepository:
         self,
         owner: Any,
         content: str,
-        agent_ids: list[str],
+        deliveries: list[SubagentDelivery],
     ) -> None:
         """Remember which agents a queued completion still owes delivery."""
-        if not content or not agent_ids:
+        if not content or not deliveries:
             return
         key = self._delivery_key(content)
         owed = owner._subagent_delivery_pending.setdefault(key, [])
-        owed.extend(agent_id for agent_id in agent_ids if agent_id not in owed)
+        known = {delivery.agent_id for delivery in owed}
+        for delivery in deliveries:
+            if delivery.agent_id not in known:
+                owed.append(delivery)
+                known.add(delivery.agent_id)
         # Only the consuming row may settle an entry.  A turn tail can dequeue
         # its successor before the current settlement callback runs, so sweeping
         # merely because content left the queue would lose the successor's debt.
@@ -630,9 +718,11 @@ class SlotQueueRepository:
             self._delivery_key(content) in owner._subagent_delivery_pending for content in contents
         )
 
-    def take_pending_subagent_deliveries(self, owner: Any, contents: list[str]) -> list[str]:
+    def take_pending_subagent_deliveries(
+        self, owner: Any, contents: list[str]
+    ) -> list[SubagentDelivery]:
         """Claim delivery marks in consumed-row order and forget only those rows."""
-        claimed: list[str] = []
+        claimed: list[SubagentDelivery] = []
         for content in contents:
             claimed.extend(owner._subagent_delivery_pending.pop(self._delivery_key(content), []))
         return claimed
@@ -662,14 +752,47 @@ class SlotQueueRepository:
             # moving them to replacement text would acknowledge the wrong work.
             if "_on_consumed" in item or "_on_irreversibly_consumed" in item:
                 return False
+            # A system-injection entry's kind decides how the drain writes the
+            # row (role, provenance meta, mirror suppression) — rewriting only
+            # its content would drain the USER'S OWN replacement words as
+            # machine-authored: an edited MCP-App entry, for example, would
+            # land as an `inject` row labelled with the app, actor `app`, and
+            # the linked-thread mirror suppressed, so a human on the mirrored
+            # channel never sees what the user typed. Refused, not re-kinded:
+            # the entry is not a user prompt to begin with. Scoped to the app
+            # kind alone: other system kinds (queued cron text among them)
+            # were editable before this endpoint existed, and taking that
+            # away is not this feature's call. The frontend pencil gate
+            # (`isAppMessageQueued`) withholds exactly this same set.
+            from kiro_crew.dashboard.chat_utils import MCP_APP_MESSAGE_KIND
+            from kiro_crew.dashboard.chat_utils_injected_rows import AUTOMATION_STEER_META
+
+            if item.get("kind") == MCP_APP_MESSAGE_KIND:
+                return False
             # The lists index the OLD text's markers; drop only what this edit
             # removed (named before, unnamed now) and renumber the survivors
             # (prune_attachment_meta). An entry the old text never named is
             # not the edit's to drop.
             previous = item.get("content")
-            item["content"] = prune_attachment_meta(
-                item.get("meta"), content, previous if isinstance(previous, str) else ""
-            )
+            previous = previous if isinstance(previous, str) else ""
+            # The quoted block is another message's words: a marker inside it
+            # is not one of this entry's attachments, so it is neither counted
+            # as removed nor renumbered. The block comes off both texts for the
+            # pruning and goes back unchanged -- an edit that kept it keeps the
+            # card; one that changed it falls through to `prune_quote_meta`.
+            block = quote_block((item.get("meta") or {}).get("quote"))
+            if block and content.startswith(block) and previous.startswith(block):
+                body = prune_attachment_meta(
+                    item.get("meta"), content[len(block) :], previous[len(block) :]
+                )
+                item["content"] = block + body
+            else:
+                item["content"] = prune_attachment_meta(item.get("meta"), content, previous)
+            prune_quote_meta(item.get("meta"), item["content"])
+            # Replacement words belong to the editor, not the automation that queued them.
+            meta = item.get("meta")
+            if isinstance(meta, dict):
+                meta.pop(AUTOMATION_STEER_META, None)
             if directive_user_origin:
                 item["_directive_user_origin"] = True
             else:

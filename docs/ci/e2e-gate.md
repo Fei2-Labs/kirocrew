@@ -78,9 +78,9 @@ order:
    gateway spawns the fake instead of a real `kiro-cli`. The fake speaks the
    minimal ACP subset the client drives (`initialize`, `session/new`,
    `session/set_mode`, `session/set_model`, `session/prompt`) and switches
-   behavior on bracket markers in the prompt (`[[TOOL]]`, `[[PERMISSION]]`,
-   `[[GATED]]`, `[[SLOW]]`, `[[SLOW_NOACK]]`, `[[ERROR]]`), which is what makes
-   agent-driven specs deterministic offline. Spawned as the KAS relay (the
+   behavior on bracket markers in the prompt (the full marker set, such as
+   `[[TOOL]]` and `[[SLOW]]`, is documented in the `fake_acp_backend.py` module
+   docstring), which is what makes agent-driven specs deterministic offline. Spawned as the KAS relay (the
    `acp --agent-engine v3` argv, which is how crew-member DMs run by default) it
    also reports every managed MCP server the session declared as `connected`
    through `_kiro/mcp/status` / `_kiro/tools/didChange`, so the KAS harness's
@@ -114,7 +114,7 @@ Config facts worth knowing before you touch a spec:
 | `baseURL` | `process.env.PLAYWRIGHT_BASE_URL` or `http://localhost:5476` | 5476 is the default dashboard port, so an ad-hoc local run against a normal gateway works. |
 | `locale` | `en-US` | Most specs assert English prose. The app resolves language from `navigator.languages` when nothing is stored, and the harness storage state carries no `mc-lang`, so a `zh-*` runner would render the zh-CN catalog and fail those assertions. Pinning makes that an explicit dependency. |
 | `workers` | 1 under `CI` | The harness sets `CI=1`, so the browser leg is serial. |
-| `retries` | 2 under `CI` | Absorbs gateway-load timeout flakes. |
+| `retries` | 2 under `CI` | A detector, not a fix. A spec that passes only on a retry is counted under `flaky` in the JSON report (the HTML report lists it too), and `MAX_FLAKY_SPECS` then fails the run: fix the spec, never raise `retries`. |
 | `timeout` | 30s per test | Assertion (`expect`/`poll`) timeout stays at Playwright's 5s default so a genuine slowdown surfaces instead of passing inside a wide window. |
 | `grepInvert` | excludes `@needs-agent` unless `PLAYWRIGHT_RUN_AGENT_SPECS` | The default run is the credential-less green set. The harness wires the fake backend, so it opts the agent specs back in. `@needs-live-agent` stays excluded either way and currently tags nothing. |
 | browser | Playwright's own bundled Chromium | This fork vends no browser binary; CI installs it with `npx playwright install chromium`, restored from an `actions/cache` entry keyed on the exact `@playwright/test` version. `--with-deps` is deliberately NOT used — see [what CI does](#what-ci-does-around-the-command). |
@@ -123,9 +123,9 @@ Config facts worth knowing before you touch a spec:
 
 Playwright runs two projects. The `setup` project (`playwright/auth.setup.ts`)
 navigates once to `/?token=<PLAYWRIGHT_TOKEN>`, lets the gateway exchange the
-token for a session cookie, sets the `mc-onboarded` localStorage flag so the
-first-run theme overlay cannot intercept clicks, and persists the whole storage
-state. The `chromium` project declares `dependencies: ['setup']` and loads that
+token for a session cookie, sets the `mc-onboarded` localStorage flag, and
+persists the whole storage state. `mc-onboarded` keeps the first-run theme
+overlay from intercepting clicks. The `chromium` project declares `dependencies: ['setup']` and loads that
 state, so raw tokens never appear in test-level traces or videos.
 
 The state path is `PLAYWRIGHT_STORAGE_STATE` or `playwright/.auth/state.json`,
@@ -161,7 +161,7 @@ and never reported as a skip, so a mis-tagged suite reports green while a third
 of it does not run. Every dark spec that was later re-enabled had also rotted:
 stale selectors for UI that had moved, because nothing exercised them.
 
-So `_assert_suite_not_darkened()` reads Playwright's JSON report and asserts two
+So `_assert_suite_not_darkened()` reads Playwright's JSON report and asserts three
 numbers, **even when the run failed** (a red run plus a collapsed count points at
 darkening rather than at the reported failure):
 
@@ -171,6 +171,22 @@ darkening rather than at the reported failure):
   written reason in the commit body, because a drop means specs stopped running.
 - `MAX_SKIPPED_SPECS` is 0. A skip is a silent pass, so a spec should seed its
   preconditions in a fixture rather than skip when they are absent.
+- `MAX_FLAKY_SPECS` is 0 and only shrinks. A spec that passed only on a retry fails
+  the gate with its title; this ceiling is the one place the flaky policy lives, so
+  Playwright itself is not told to fail on one. The counts line and every flaky title
+  are in the log and the assertion message, and also go to `$GITHUB_STEP_SUMMARY`
+  where that file is writable. When a
+  spec your change does not touch fails your run this way, it is someone else's
+  flake: record it in the flake ledger (the open `Flaky: <test name>` issue, labelled
+  `area: tests`, as the `kirocrew-prepare-pr` skill describes) and rerun the job once.
+  Never raise the ceiling or `retries` for it.
+
+The run itself is bounded by `PLAYWRIGHT_RUN_CEILING_SECS` (17 min, so the stop, the
+report and the summary fit inside the job's 25), and the harness stops Playwright as
+soon as the gateway it drives exits, quoting the gateway's own output, so a dead
+gateway is reported as one, not as every remaining spec timing out on retries. A
+stopped run first gets SIGINT so it writes its report, and the failure quotes
+whatever counts that report salvaged.
 
 A missing or unparseable report is a hard `pytest.fail`, not a pass for lack of
 evidence. The floor helper has its own unit tests in the same file, deliberately
@@ -182,22 +198,28 @@ silent darkening is no guard.
 `ci.yml`'s `e2e` job (`E2E (stub ACP backend, offline)`) installs the backend
 with `--group dev`, runs `npm ci` and `npm run build` in `website/`, stages
 `website/dist` into `src/kiro_crew/static/dist` so the specs render the real
-bundled dashboard rather than a 404, installs Chromium, resolves the i18n base,
-then runs `python scripts/ci_e2e_parallel.py`. The separate
-`e2e-private-namespace` job owns the real private-workflow MCP test and does not
-serialize the browser job. The CI-only helper overlaps the unchanged
-`python setup.py test_e2e` command, dedicated Memory UI pytest command and
-`npm --prefix website run i18n:render`. All three outcomes are awaited; no
-failure cancels or hides another lane. All three helper outcomes remain mandatory,
-with the same 25-minute browser-job ceiling. The private namespace coverage is a
-separate mandatory CI job instead of a serial prerequisite, so neither it nor the
-head+base render gate consumes the browser lane's critical path.
+bundled dashboard rather than a 404, installs Chromium, then runs
+`python scripts/ci_e2e_parallel.py`. The separate `e2e-private-namespace` job
+owns the real private-workflow MCP test and does not serialize the browser job.
+The CI-only helper overlaps the unchanged `python setup.py test_e2e` command and
+the dedicated Memory UI pytest command. Both outcomes are awaited; no failure
+cancels or hides the other lane. Both helper outcomes remain mandatory, with the
+same 25-minute browser-job ceiling. The private namespace coverage is a separate
+mandatory CI job instead of a serial prerequisite, so it does not consume the
+browser lane's critical path.
+
+The head+base i18n render gate is its own `i18n-render` job rather than a third
+lane here, for the same reason: it needs no gateway, and on the hosted 4-vCPU
+runner a fork PR gets, its two DEV builds plus a two-tree Chromium render ran
+about 13 minutes alongside the suite and pushed `test_dashboard_playwright_suite`
+past its 1020 s ceiling on 27% of fork-PR runs (2.5% on the fleet's large
+instance, where the same overlap fit). The suite's ceiling is sized for this step
+to hold two browser lanes, not three. [i18n-gates.md](i18n-gates.md) describes
+that job.
 
 The staged production bundle, Python packages, Node modules and Chromium
-install remain read-only inputs. i18n builds its own `website/dist-dev` and a
-separate temporary base tree, retaining the complete locale/surface and vs-base
-checks. Each lane has its own `TMPDIR` under `runner.temp/e2e-s` (smoke),
-`runner.temp/e2e-u` (UI), or `runner.temp/e2e-i` (i18n), with
+install remain read-only inputs. Each lane has its own `TMPDIR` under
+`runner.temp/e2e-s` (smoke) or `runner.temp/e2e-u` (UI), with
 short names to leave room for Unix socket paths; the harness continues to create a
 fresh data home, agent-spec home and random port per gateway. The dedicated UI
 process owns its environment changes, per-scenario authentication files, JSON
@@ -301,10 +323,20 @@ intentional unavailable and mismatched bindings seeded only in the disposable
 gateway's configuration, verifies a healthy member can still be created, and
 performs a real identity-list Retry without claiming it repairs those bindings.
 No healthy peer store is implied by the deliberately mismatched declaration;
-the attempt manifest records that fixture limitation. These seven added capture
-points are authored and pending CI execution. Only a completed CI run can supply these recordings; source authoring
-alone is not rendered evidence.
+the attempt manifest records that fixture limitation. Only a completed CI run
+supplies these recordings; source authoring alone is not rendered evidence.
 Its retention is seven days, and it does not fail when setup produced no images.
+
+`website/playwright/dashboard-preview-link.spec.ts` opens the link
+`dashboard_preview` hands a mate and asserts that it resolves: the Members page
+draws the staged page under its **Preview, not applied** label, and the dashboard read accepts the
+mate the link names. Before the browser starts, the harness
+(`test_playwright_e2e._stage_dashboard_preview`) seeds one mate in the disposable
+config, stages the `standup` template for it with the production store, and passes
+the link that store's `wire()` returns in `KIROCREW_E2E_DASHBOARD_PREVIEW`. The spec
+never builds the link itself. `standup` is not the default page, so a tab still
+showing the live page fails. The spec guards against a person being asked to approve
+a page they could not open.
 
 When the job fails, a final `if: failure()` step uploads
 `website/test-results/` and `website/playwright-report/` as the
@@ -319,11 +351,6 @@ The job's log alone is not enough to triage a spec failure: it names
 previous session rendering for a few hundred ms after the first send) was
 narrowed for hours from that one line before a local run produced the snapshot.
 Download the artifact first; bisect second.
-
-The app-detail scenario also captures the compact Design Critique description
-at desktop and 390px widths. The separate `gallery-copy-ui-evidence` artifact
-retains those PNGs for seven days. Capture code alone is not rendered evidence;
-the current run must reach and pass that scenario before its images are used.
 
 `if-no-files-found: ignore`, deliberately: a run that fails before the specs
 start (a stalled browser install) has neither directory, and the upload must not
@@ -401,6 +428,11 @@ scenario costs about three minutes; the CI helper enforces a 12-minute ceiling
 for the dedicated UI lane, without imposing that ceiling on the shared suite.
 `harness_environment()` is unit-tested in `test/test_harness.py`: the default
 skip, the drop, and that `KIROCREW_HOME`/`KIRO_HOME` stay pinned either way.
+It also pins `KIROCREW_SKIP_APP_STORE_FETCH=1`, which no caller can drop: the
+app store answers from the bundled seed, so `GET /api/apps/registry` never pays
+the live catalog's uncached HTTPS round trip (bounded by `FETCH_TIMEOUT`, the
+same 10 s the Discover specs wait for their ready signal) or a per-row manifest
+clone. `kiro_crew.apps.official_catalog.SKIP_FETCH_ENV` owns the name.
 The supervisor restart test also verifies that only the download switch changes:
 all other environment values retain the initial launch snapshot. The failed
 mirror port stays bound without listening until teardown, and loopback hosts
@@ -491,13 +523,16 @@ process instead, which is the path
 [windows-install.md](../guides/windows-install.md) describes and the one the
 managed-server invocation resolves.
 
-### `build.yml`'s installer job boots the gateway it installed, on every PR
+### `build.yml`'s installer job boots the gateway it installed, on every qualifying PR
 
 `build.yml`'s `build-windows-installer` job compiles an NSIS installer on every
-qualifying PR, installs it silently, and runs
+qualifying PR (one that changed a Windows-packaging input, per `desktop-matrix`'s
+`windows_installer` filter; a merge group always qualifies, and so does a push
+to main unless `MERGE_QUEUE_ENABLED` is `'true'`),
+installs it silently, and runs
 `.github/scripts/test-windows-installer.ps1` with NO `-SkipGatewayValidation`.
 The script starts the just-installed bundled interpreter against an isolated data
-home and requires `/api/ready` within 30 seconds, so an artifact that installs
+home and requires `/api/ready` within 50 seconds, so an artifact that installs
 but cannot boot fails at review time.
 
 Its backend payload is a real python-build-standalone runtime carrying the wheel
@@ -512,12 +547,11 @@ pywhispercpp and numpy download for a code path a gateway boot never reaches.
 `KIROCREW_KIRO_BIN` points at a `.cmd` shim running
 `kiro_crew.testing.fake_acp_backend` out of the INSTALLED payload through the
 INSTALLED interpreter, so readiness needs no model, no network and no sign-in.
-`KIROCREW_SKIP_MODEL_DOWNLOAD=1` keeps the embedding model out of a 30-second
+`KIROCREW_SKIP_MODEL_DOWNLOAD=1` keeps the embedding model out of a 50-second
 ceiling.
 
-Two ceilings became load-bearing with that change and were not before. The
-install-duration ceiling (120 s) previously measured the extraction of a 40-byte
-batch file, so it proved nothing about a real install; it now measures one.
+Two ceilings are load-bearing. The install-duration ceiling measures a real
+install, at 200 s, about twice the slowest measured green install.
 `MinStartupPycs` is passed as 750 rather than the script's 1000 default, because
 the default describes the full release bundle and this job omits the voice
 extras: the core closure of `kiro_crew.cli_server` measures about 990 sources, so
@@ -525,18 +559,13 @@ extras: the core closure of `kiro_crew.cli_server` measures about 990 sources, s
 assertion exists for, which is bytecode filtered out of the artifact or a
 launcher redirecting imports into an empty user cache. Both land near zero.
 
-Before this the job staged a two-line `@echo off` batch file as its entire
-backend payload and therefore had to pass `-SkipGatewayValidation`, since there
-was no interpreter for the gateway leg to launch. The whole class of defect that
-leaves an installable-but-unbootable artifact had no PR gate at all.
-
 `build-windows.yml`'s nightly smoke job remains the broader one: it exercises the
 SIGNED installer, the Start Menu shortcut's target, the bundled CLI and a silent
 uninstall, none of which the PR lane covers.
 
-Related: [i18n-gates.md](i18n-gates.md) for the render-time gate that shares this
-job, and [ci-and-reviews.md](ci-and-reviews.md) for where `e2e` sits among the
-other PR gates.
+Related: [i18n-gates.md](i18n-gates.md) for the render-time gate (`i18n-render`,
+its own job), and [ci-and-reviews.md](ci-and-reviews.md) for where `e2e` sits
+among the other PR gates.
 
 The private member memory specs use the real gateway and database. They cover
 explicit V1-to-member copying with provenance, correction/reload/forgetting,
@@ -545,9 +574,7 @@ member's exact conversation binding across reload. Desktop and
 390px captures accompany the first flow. Their write guard requires
 `KIROCREW_E2E_EPHEMERAL=1`, which the isolated gateway harness sets; it must never
 be set for an operator gateway. The strict reporter enforces the executed-test
-floor and refuses skips or flaky retries. The same `e2e` job must also pass its
-parallel i18n render lane before the job is green; the render lane does not
-precede these browser scenarios.
+floor and refuses skips or flaky retries.
 
 ## The cross-OS gateway boot matrix
 
@@ -555,30 +582,36 @@ The browser and private-namespace lanes above are Linux-only.
 `test/e2e/test_gateway_boot_matrix.py` is the one asset that boots a real gateway
 on **macOS and Windows too**, and `ci.yml`'s
 `e2e-boot-matrix` job is what runs it: `fail-fast: false`,
-`needs: [changes, await-fast-gate]`, 20 minutes, and `strategy.matrix.os` of `ubuntu-latest`
-and `windows-latest` on a pull request, plus `macos-15` on the push-to-main path.
-The mac leg is event-conditional for the queue, not the runtime: it waited ~200
-minutes for a `macos-15` runner on every pull request and was the only leg that did,
-while on main the wait costs nobody a merge. The real-Darwin boot stays covered
-twice — that leg, and `nightly.yml`'s `pod-scenarios`, which boots a real
-service-managed pod on `macos-15`.
+`needs: [changes, await-fast-gate, lint-gate]`, 20 minutes. `strategy.matrix.os` has three
+states:
+
+| Event | OS legs | `needs` |
+|---|---|---|
+| `pull_request`, `merge_group` | `ubuntu-latest`, `windows-latest` | must succeed (`lint-gate` too) |
+| push to `main`, `MERGE_QUEUE_ENABLED == 'true'` | `macos-15` alone | skipped (including `lint-gate`); the condition admits the push |
+| push to `main`, variable not `'true'` | `ubuntu-latest`, `macos-15`, `windows-latest` | must succeed (`lint-gate` too) |
+
+The mac leg is event-conditional for the queue, not the runtime: a `macos-15`
+runner waits about 200 minutes, so a mac leg on every pull request would hold
+every PR behind it, while on main the wait costs nobody a merge. With the queue
+on, the merge group already booted Linux and Windows on the same tree, so the
+push runs mac alone. The real-Darwin boot is covered twice: that leg, and
+`nightly.yml`'s `pod-scenarios`, which boots a real service-managed pod on
+`macos-15`.
 
 ### Why it exists
 
-Before it, no job on either of those runners started a gateway at all: the whole
-E2E surface is gated on `KIROCREW_E2E`, which only `setup.py test_e2e` sets, and
-only the Linux `e2e` job runs that. That is one of the two holes
-[#8117](https://github.com/kirodotdev/KiroCrew/pull/8117) fell through, reverted
-in
-[56f67aa43](https://github.com/kirodotdev/KiroCrew/commit/56f67aa43f00f9484c346a8d1669b39102a63c78).
-It added a settings-file probe to `sandbox.wrap_argv`'s Windows delegation
-branch, so on a fresh Windows host -- where that file does not exist -- the Kiro
-ACP spawn stopped delegating to Kiro CLI's own sandbox, fell through to the
-no-backend fail-closed path, and the gateway never became usable. The unit test
-that pinned that branch, `test/test_sandbox_argv.py`, is in
-`test/windows-collect-ignore.txt`, and the PR changed its mock to hardcode the
-one answer a fresh Windows host cannot give. No second unit test closes that;
-only a real boot on the real platform does.
+Outside this job, no macOS or Windows job starts a gateway: the whole E2E
+surface is gated on `KIROCREW_E2E`, which only `setup.py test_e2e` sets, and
+only the Linux `e2e` job runs that. A unit test cannot close that gap.
+[#8117](https://github.com/kirodotdev/KiroCrew/pull/8117) is the defining case:
+a settings-file probe in `sandbox.wrap_argv`'s Windows delegation branch made
+the Kiro ACP spawn on a fresh Windows host (where that file does not exist) fall
+through to the no-backend fail-closed path, so the gateway never became usable.
+The unit test that pins that branch, `test/test_sandbox_argv.py`, is in
+`test/windows-collect-ignore.txt`, and its mock can hardcode the one answer a
+fresh Windows host cannot give. Only a real boot on the real platform catches
+that.
 
 ### What it asserts
 
@@ -655,12 +688,12 @@ which is why `backend-test-sandbox` has to clear a sysctl to get one. On Windows
 the expectation is unconditionally the first, so a #8117-style regression cannot
 hide in the fail-closed branch.
 
-### `KIROCREW_E2E_MATRIX_REQUIRE=1`: the second marker
+### `KIROCREW_E2E_REQUIRE=1` on the boot matrix
 
-Same mechanism as `KIROCREW_E2E_REQUIRE` above, for a different module. An unmet
-PRECONDITION (the packaged fake ACP backend missing, `kiro_crew.testing` not
-importable) is a graceful `pytest.skip` on a local run and a `pytest.fail` on the
-job. Set it wherever you expect gateways to actually boot.
+The boot-matrix module reads the same `KIROCREW_E2E_REQUIRE` marker described
+above, and the `e2e-boot-matrix` job sets it. An unmet PRECONDITION (the packaged
+fake ACP backend missing, `kiro_crew.testing` not importable) is a graceful
+`pytest.skip` on a local run and a `pytest.fail` on the job.
 
 ## Real-`kiro-cli` opt-in smoke
 
@@ -804,6 +837,54 @@ any run made under it.
 (`ci.yml` -> `CI`), never by job name, so every job inside `ci.yml` is already
 part of the required `CI` verdict.
 
+## WebKit opt-in lane: `webkit-mobile`
+
+`website/playwright/*.webkit.spec.ts` run on Playwright's WebKit engine with
+iPhone emulation, for behaviour that only mobile Safari exhibits (today: the
+transcript's hide/return re-placement in
+`chat-visibility-replace.webkit.spec.ts`). The engine is not installed by the
+gate above (`npx playwright install chromium`), so the specs live under an
+opt-in project: `PLAYWRIGHT_RUN_WEBKIT=1` adds the `webkit-mobile` project
+(`devices['iPhone 13']`, `testMatch: /\.webkit\.spec\.ts$/`) and the
+`chromium` project `testIgnore`s the same files, so a default run never
+collects them and cannot skip-pass them under the darkening floor. Specs that
+drive turns carry `@needs-agent` like every other turn-driving spec, so they
+only run against the fake-ACP harness.
+
+WebKit needs a set of shared libraries the gate's runner image does not
+carry and this repository's Linux dev hosts often lack, so the supported way
+to run the lane is Microsoft's Playwright image against a harness gateway on
+the host:
+
+```bash
+# host: boot a --test-mode harness gateway serving this checkout (see
+# test/test_playwright_e2e.py for the spawn_feature_gateway rig), note PORT/TOKEN
+cd website
+docker run --rm --network host -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD":/work -w /work \
+  -e PLAYWRIGHT_BASE_URL="http://localhost:$PORT" -e PLAYWRIGHT_TOKEN="$TOKEN" \
+  -e PLAYWRIGHT_RUN_WEBKIT=1 -e PLAYWRIGHT_RUN_AGENT_SPECS=1 -e KIROCREW_E2E_EPHEMERAL=1 \
+  mcr.microsoft.com/playwright:v1.58.2-noble \
+  npx playwright test playwright/chat-visibility-replace.webkit.spec.ts \
+    --project=webkit-mobile --reporter=list --workers=1
+```
+
+### Who runs the WebKit lane, and when
+
+No workflow runs it: a fork pull request cannot add a browser install to the
+gate, and the engine download is not budgeted there. Until a maintainer-owned
+job picks it up, the lane is run by hand at two named moments:
+
+| Owner | When | Mode |
+|---|---|---|
+| The PR author | before requesting review on a change to the transcript follow/pin path (anything under `website/src/hooks/virtualizer/`: the `useVirtualChat.ts` facade and the owners it composes, `FollowController.ts` among them) or to any `*.webkit.spec.ts` | required |
+| The release verifier | before a release that bumps `@playwright/test`, since the image tag above must match the installed version | required |
+
+A pass is recorded in the PR body's Manual verification section with the
+observed values the spec prints (`[webkit-visibility]` lines and the attached
+`webkit-observations.json`), so the evidence is quotable rather than a bare
+"passed".
+
 ## The pod scenario suite (nightly on every OS; per-PR Windows is boot-only unless labelled)
 
 A second E2E lane, orthogonal to the browser gate above. `test/e2e/scenarios/`
@@ -912,7 +993,7 @@ unavailable. A pod pins `agent.sandbox=auto` with the unsandboxed opt-in off
 since a gateway whose every agent turn fails while `/health` answers 200 is the
 exact condition it exists to catch. The job runs
 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, the same step
-`ci.yml`'s `e2e` and `backend-test-sandbox` jobs run, and then PROVES it with
+`ci.yml`'s `e2e-private-namespace` and `backend-test-sandbox` jobs run, and then PROVES it with
 `unshare --mount --map-root-user true` so a runner image that stops allowing it
 fails by name rather than six scenarios deep. Seeding
 `sandbox_allow_unsandboxed_exec` into the pod instead is deliberately not the
@@ -1006,8 +1087,9 @@ and the plane's `a/**` artifacts and `h/**/*.log` pod logs from under that
 basetemp; on a default run the scenario globs simply match nothing.
 
 Three facts about WHEN the label takes effect, all consequences of `ci.yml`
-listening only for `push` and `pull_request` (`opened`, `synchronize`,
-`reopened`) and deliberately not for `labeled` -- the same choice `ci-full-run`
+listening only for `push`, `pull_request` (`opened`, `synchronize`,
+`reopened`) and `merge_group` -- on which a run has no PR labels, so the suite
+stays off -- and deliberately not for `labeled` -- the same choice `ci-full-run`
 makes, because a `labeled` trigger re-runs the whole workflow on every bot label:
 
 - The label must be on the PR BEFORE the `opened` or `synchronize` event that
@@ -1026,29 +1108,39 @@ fails there.
 
 #### The hosted evidence on record
 
-The nightly matrix entry rests on one completed hosted run, made while a
-temporary unconditional version of that step existed on this branch:
-[run 34744065942, job 103688668718](https://github.com/kirodotdev/KiroCrew/actions/runs/34744065942/job/103688668718)
-on `windows-latest`, at revision `c56028aa9`, against the real Vite-built SPA.
-Its raw log reports the boot canary at `3 passed` in 76.26s and the full
-scenario suite at `55 passed` in 204.76s, exit code 0. That is the evidence
-behind removing `windows-latest` from `test/test_pod_scenario_matrix.py`'s
-`PENDING_VALIDATION` table. It is evidence for THAT revision. A later revision
-that changes a scenario body or the pod code it drives gets its own hosted
-Windows evidence either from a labelled PR run or from the nightly; this
-document records a run only after it has completed, never in advance.
-
-A subsequent **label-gated PR run** also completed successfully:
-[run 34759199939, job 103728957225](https://github.com/kirodotdev/KiroCrew/actions/runs/34759199939/job/103728957225),
-at revision `c2f7e39b224c9ab1ddbd2ca970a5b78a947f220e`. The PR label was verified
-before the push. The parent review session checked the raw logs: boot canary
-`3 passed` in 72.84s at 06:18:13 PDT on 2026-09-13, full scenario suite
-`55 passed` in 214.45s at 06:21:49 PDT, and job SUCCESS at 06:22:00 PDT.
-This is completed evidence for the labelled path, not merely the historical
-unconditional step. It does not root-cause the earlier unavailable-handle
-refusal at `312eaca3`, and it does not validate later, unpushed stop repairs.
-The strict `55 passed` assertion remains unchanged.
+`windows-latest` is out of `test/test_pod_scenario_matrix.py`'s
+`PENDING_VALIDATION` table on the strength of one completed hosted run of the full
+suite:
+[run 34744065942](https://github.com/kirodotdev/KiroCrew/actions/runs/34744065942/job/103688668718).
+That run is evidence for its own revision only. A revision that changes a
+scenario body or the pod code it drives gets its own hosted Windows evidence from
+a labelled PR run or from the nightly. The strict `55 passed` assertion holds on
+every path.
 
 The fixture-level Windows contracts that do run on every PR live in the sharded
 unit tests (`test/test_pod_windows*.py`, `test/test_pod_scenario_windows_client.py`)
 and in the boot canary above.
+
+## The nightly process-leak invariant
+
+`nightly.yml`'s `process-leak-invariant` job (`Process Leak Invariant + Chaos
+(Linux)`) runs `test/e2e/test_process_leak_invariant.py` and
+`test/e2e/test_process_chaos.py` on `ubuntu-latest`. It is not a PR gate.
+
+- **A real `systemd --user` session.** The suites need a usable `systemd --user`
+  scope backend. The job creates one the same way `pod-scenarios` does
+  (`sudo loginctl enable-linger "$USER"`, then exports `XDG_RUNTIME_DIR` and
+  `DBUS_SESSION_BUS_ADDRESS`), and proves it in the log by creating a transient
+  `systemd-run --user --scope`.
+- **The namespace sandbox.** It runs the same
+  `kernel.apparmor_restrict_unprivileged_userns=0` sysctl and
+  `unshare --mount --map-root-user true` proof as the pod and private-namespace
+  jobs, so the gateway's boot probe admits agent spawns.
+- **No silent skip.** `KIROCREW_E2E=1` and `KIROCREW_E2E_REQUIRE=1` turn each
+  unmet precondition into a failure, and an anchored `3 passed` grep over the log
+  fails the job when the suite reports any other count. Raise that count when a
+  test is added to either module.
+
+On failure the job uploads `process-leak.log` as the
+`process-leak-invariant-log` artifact; the reconciliation dump an assertion
+prints is the only place a surviving process is named.

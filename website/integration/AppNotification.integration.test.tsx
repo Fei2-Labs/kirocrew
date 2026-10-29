@@ -125,7 +125,7 @@ describe('useNativeNotification', () => {
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [title, opts] = notificationCtor.mock.calls[0]
     expect(title).toBe(BOT_NAME)
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 new notification')
     expect(opts.tag).toBe('job-xyz')
   })
 
@@ -168,7 +168,7 @@ describe('useNativeNotification', () => {
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [, opts] = notificationCtor.mock.calls[0]
     // Regression: old code used notifCount (4), new code uses delta (1).
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 new notification')
     expect(opts.body).not.toMatch(/4 new/)
   })
 
@@ -237,7 +237,7 @@ describe('useNativeNotification', () => {
 
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [, opts] = notificationCtor.mock.calls[0]
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 new notification')
   })
 
   it('falls back to the generic body when a persisted body is not a string', () => {
@@ -256,7 +256,7 @@ describe('useNativeNotification', () => {
 
     expect(notificationCtor).toHaveBeenCalledTimes(1)
     const [, opts] = notificationCtor.mock.calls[0]
-    expect(opts.body).toBe('New notification')
+    expect(opts.body).toBe('1 new notification')
   })
 
   it('uses a per-event tag so rapid updates replace instead of stack', () => {

@@ -9,9 +9,9 @@ itself. For everyone else it is a dead reference, and for an agent it is worse
 than dead: a confident pointer at a path that does not exist, which the agent
 will try.
 
-``prepare-pr`` already solved this properly and is the pattern this gate keeps:
+``kirocrew-prepare-pr`` already solved this properly and is the pattern this gate keeps:
 repository specifics live in a PROFILE keyed by repository
-(``prepare-pr/profiles/``, resolved by ``resolve_profile.py``), so the skill body
+(``kirocrew-prepare-pr/profiles/``, resolved by ``resolve_profile.py``), so the skill body
 says "run the gate floor" and the profile says what that means here. Anything
 repository-shaped that a skill needs either resolves from the repository being
 acted on, or belongs in a profile, or the skill is not a builtin.
@@ -53,7 +53,7 @@ it could not read ships the one file nobody scanned.
 ## Known limit, on purpose
 
 Repository paths OUTSIDE the four classes are not caught -- ``website/src/
-index.css`` and ``docs/system-specs/...`` are as checkout-only as
+styles/theme-palettes.css`` and ``docs/system-specs/...`` are as checkout-only as
 ``src/kiro_crew/``, and ``theme-pack-authoring`` legitimately cites the first one
 today. Widening the set means fixing those references in the same breath, which is
 a content change with its own argument to make; this gate covers the four shapes
@@ -63,11 +63,10 @@ that were actually leaking. Read it as "these four shapes are extinct", not as
 ## The kirocrew-dev family is exempt, structurally
 
 ``builtin_skills/kirocrew-dev/`` is the family FOR developing this repository --
-``prepare-pr``, ``babysit``, ``writing-tests``, ``kirocrew-worktree-dev``, and
-``kirocrew-codebase-refactor``. A
-Kiro Crew path there is the subject matter, not a leak, and 26 of the tree's 28
-markers live in it. That exemption is a directory rule rather than 26 recorded
-lines on purpose: it is a property of what the family IS, so it stays true as
+``kirocrew-prepare-pr``, ``babysit``, ``writing-tests``, ``kirocrew-worktree-dev`` and
+``dashboard-template``. A Kiro Crew path there is the subject matter, not a leak.
+That exemption is a directory rule rather than a list of recorded lines on
+purpose: it is a property of what the family IS, so it stays true as
 those skills are edited, where a per-line list would just record today's bytes
 and demand churn on every edit.
 
@@ -135,7 +134,7 @@ MARKER_CLASSES: tuple[tuple[str, str, str], ...] = (
 
 REMEDY = (
     "Resolve it from the repository being acted on, move it into a profile the\n"
-    "way prepare-pr/profiles does, or move the skill under builtin_skills/\n"
+    "way kirocrew-prepare-pr/profiles does, or move the skill under builtin_skills/\n"
     "kirocrew-dev/ if it is genuinely a skill for developing this repository."
 )
 
@@ -314,8 +313,8 @@ def self_test() -> int:
         root = Path(tmp)
         leak = "Edit `src/kiro_crew/x.py`.\n"
         for rel in (
-            f"{EXEMPT_FAMILY}/prepare-pr/SKILL.md",
-            f"{EXEMPT_FAMILY}/prepare-pr/references/notes.md",
+            f"{EXEMPT_FAMILY}/kirocrew-prepare-pr/SKILL.md",
+            f"{EXEMPT_FAMILY}/kirocrew-prepare-pr/references/notes.md",
             "widgets/SKILL.md",
             f"widgets/{EXEMPT_FAMILY}/SKILL.md",
             "kirocrew-devtools/SKILL.md",
@@ -332,7 +331,7 @@ def self_test() -> int:
         #
         # Creating one can be UNAVAILABLE rather than merely awkward: on Windows
         # it needs SeCreateSymbolicLinkPrivilege, which an ordinary account does
-        # not hold, and this self-test runs from the prepare-pr gate floor on
+        # not hold, and this self-test runs from the kirocrew-prepare-pr gate floor on
         # contributor machines as well as on ubuntu in CI. Letting the OSError
         # escape would abort the gate with a crash instead of a verdict, so the
         # probe is skipped where the privilege is missing and says so -- the same
@@ -349,11 +348,12 @@ def self_test() -> int:
         cases = (
             (
                 f"{EXEMPT_FAMILY}/ body is exempt",
-                f"{SKILL_ROOT.as_posix()}/{EXEMPT_FAMILY}/prepare-pr/SKILL.md" not in flagged,
+                f"{SKILL_ROOT.as_posix()}/{EXEMPT_FAMILY}/kirocrew-prepare-pr/SKILL.md"
+                not in flagged,
             ),
             (
                 f"nested {EXEMPT_FAMILY}/ reference file is exempt",
-                f"{SKILL_ROOT.as_posix()}/{EXEMPT_FAMILY}/prepare-pr/references/notes.md"
+                f"{SKILL_ROOT.as_posix()}/{EXEMPT_FAMILY}/kirocrew-prepare-pr/references/notes.md"
                 not in flagged,
             ),
             (

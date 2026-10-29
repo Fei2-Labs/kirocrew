@@ -34,6 +34,7 @@ from kiro_crew.dashboard.listener_guard import (
     listener_guard_exit_code,
     probe_target,
 )
+from kiro_crew.testing.wait import async_wait_until
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -93,11 +94,7 @@ def _listening_socket(site: web.TCPSite) -> socket.socket:
 
 
 async def _wait_until(pred: Any, *, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not pred():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("condition not met in time")
-        await asyncio.sleep(0.01)
+    await async_wait_until(pred, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -750,3 +747,108 @@ async def test_guard_is_armed_on_windows_only(monkeypatch: Any) -> None:
             assert guard.port == served.port
         finally:
             guard.stop()
+
+
+@pytest.mark.asyncio
+async def test_arming_an_inert_site_double_is_a_no_op(monkeypatch: Any) -> None:
+    """A site with no live listener gets no guard, even on Windows.
+
+    The guard captures its rebind name from the live LISTEN socket at
+    construction, so a site that never grew an asyncio server — the inert
+    ``SockSite`` doubles the startup wiring tests hand ``start_dashboard``,
+    or any site whose ``start()`` was faked out — gives it nothing to guard.
+    Arming declines cleanly on the missing ``_server`` rather than raising
+    (only Windows arms the guard, so POSIX shards never reach this path).
+    """
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard import server as srv
+
+    class _InertSite:
+        """web.SockSite-shaped double: no _server, serves nothing."""
+
+        def __init__(self) -> None:
+            self._runner = None
+
+    monkeypatch.setattr(srv.platform_compat, "IS_WINDOWS", True)
+    state: Any = SimpleNamespace()
+    srv._arm_listener_guard(state, None, _InertSite())  # type: ignore[arg-type]
+    assert getattr(state, "_listener_guard", None) is None
+
+
+# ---------------------------------------------------------------------------
+# Reserved-socket (SockSite) recovery keeps the exclusive option set
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reserved_socket_guard_requires_bind_factory() -> None:
+    """A guard over a SockSite refuses to construct without a bind factory.
+
+    Recovery of the reserved socket must go through the reservation's own
+    bind primitive: a plain ``TCPSite`` with ``reuse_address=None`` sets
+    neither ``SO_REUSEADDR`` nor Windows ``SO_EXCLUSIVEADDRUSE``, so a
+    recovered listener would hold the port more weakly than the socket it
+    replaces and a co-resident overlap-bind could capture credential-carrying
+    loopback callbacks. Refusing at construction beats arming a guard whose
+    recovery weakens the port.
+    """
+    from kiro_crew.dashboard.server import _bind_once
+
+    app = web.Application()
+    app.router.add_get("/api/live", _live)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    sock = _bind_once("127.0.0.1", 0)
+    site = web.SockSite(runner, sock)
+    await site.start()
+    try:
+        with pytest.raises(ValueError, match="bind_factory"):
+            ListenerGuard(runner, site, asyncio.Event())
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_reserved_socket_recovery_rebinds_through_the_factory() -> None:
+    """SockSite recovery rebinds via the factory and serves on the same port.
+
+    The recovered site is a ``SockSite`` wrapping the factory's socket — the
+    boot shape — so the rebound listener carries the reservation's full
+    option set by construction rather than a ``TCPSite`` approximation.
+    """
+    from kiro_crew.dashboard.server import _bind_once
+
+    factory_calls: list[tuple[str, int]] = []
+
+    def counting_factory(host: str, port: int) -> socket.socket:
+        factory_calls.append((host, port))
+        return _bind_once(host, port)
+
+    app = web.Application()
+    app.router.add_get("/api/live", _live)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    sock = _bind_once("127.0.0.1", 0)
+    site = web.SockSite(runner, sock)
+    await site.start()
+    guard = ListenerGuard(
+        runner,
+        site,
+        asyncio.Event(),
+        interval=3600,
+        bind_factory=counting_factory,
+    )
+    try:
+        port = guard.port
+        assert await _get_live(port) == 200
+        assert await guard._recover("test") is True
+        assert factory_calls == [("127.0.0.1", port)]
+        assert isinstance(guard.site, web.SockSite)
+        assert guard.site is not site
+        assert guard.port == port
+        assert guard.recoveries == 1
+        assert await _get_live(port) == 200
+    finally:
+        guard.stop()
+        await runner.cleanup()

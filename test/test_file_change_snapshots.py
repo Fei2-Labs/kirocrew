@@ -3,7 +3,8 @@
 Covers:
   * ``_truncate_snapshot`` — caps content at 200KB.
   * ``_safe_read_snapshot`` — reads through the descriptor gate; rejects sensitive
-    paths and hardlink/symlink aliases of them.
+    paths, hardlink/symlink aliases of them, and a protected directory that is
+    itself a symlink.
   * ``_snapshot_write_target`` — captures before-content for write tools only.
   * ``_flush_file_changes`` — dedups, scrubs credentials, attaches to last assistant message
     or creates a synthetic one when the turn aborts before any assistant text.
@@ -11,47 +12,48 @@ Covers:
 These tests target the file-chips feature added. They drive
 new-line coverage on chat_runner.py from ~0% to a substantial fraction without
 touching the live ACP runtime — every test stays in pure-Python land.
+
+The per-turn snapshot budget and the files a persisted snapshot omits are in
+``test_file_change_snapshots_turn_budget.py``, pending ``strReplace`` resolution,
+large-file edits, the bounded line diff and failed writes in
+``test_file_change_snapshots_edits.py``, and the fixture and helpers the three
+modules share in ``file_change_snapshots_helpers.py``.
 """
 
 from __future__ import annotations
 
+import ast
+import inspect
+import json
 import os
-import shutil
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
+from file_change_snapshots_helpers import short_tmp_dir_fixture  # noqa: F401
+from file_change_snapshots_helpers import _make_slot_with_assistant_message
+from turn_harness import SlotSpec, TurnScript, run_turn
 
 from conftest import requires_symlinks
+from kiro_crew.acp.types import (
+    EVENT_CLEAR_STATUS,
+    EVENT_COMPLETE,
+    EVENT_TEXT_CHUNK,
+    STOP_REASON_END_TURN,
+    AcpEvent,
+)
+from kiro_crew.dashboard.chat_persistence import _build_message_entry
 from kiro_crew.dashboard.chat_runner import (
     _MAX_SNAPSHOT,
     _flush_file_changes,
+    _note_reply_row,
+    _on_clear_status,
+    _record_turn_snapshot,
     _safe_read_snapshot,
     _snapshot_write_target,
     _truncate_snapshot,
 )
-from kiro_crew.dashboard.state import _ChatSlot
-
-
-@pytest.fixture
-def short_tmp_dir():
-    """A short-path temp dir under ``/tmp``, removed on teardown.
-
-    These tests assert on a file's PATH as it appears in message metadata, and a
-    macOS ``tmp_path`` carries high-entropy directory ids that trip
-    ``redact_credentials()`` on that field -- so the path has to come from ``/tmp``
-    rather than from ``tmp_path``. ``mkdtemp`` registers no finalizer, though, so
-    the nine inline calls this replaces each leaked a directory that survived the
-    run; ``/tmp`` is not swept per-run the way pytest's own basetemp is.
-    """
-    base = Path(tempfile.mkdtemp(prefix=SHORT_TMP_PREFIX + "snap-", dir=short_tmp_base()))
-    try:
-        yield base
-    finally:
-        shutil.rmtree(base, ignore_errors=True)
-
+from kiro_crew.dashboard.state import _ChatSlot, row_mid
 
 # ── _truncate_snapshot ──────────────────────────────────────────────────────
 
@@ -236,6 +238,24 @@ class TestSnapshotWriteTarget:
     def test_returns_none_for_empty_path(self):
         assert _snapshot_write_target({"command": "create", "path": ""}) is None
 
+    @pytest.mark.parametrize(
+        "path",
+        [1, True, ["file.py"], {"path": "file.py"}],
+        ids=["integer", "boolean", "list", "dict"],
+    )
+    def test_returns_none_for_non_string_path(self, path):
+        assert _snapshot_write_target({"command": "create", "path": path}) is None
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [["npm", "test"], {"a": 1}, None, 1],
+        ids=["list", "dict", "none", "integer"],
+    )
+    def test_returns_none_for_non_string_command(self, cmd):
+        # ``command`` rides in off the wire unvalidated; a non-string value,
+        # hashable or not, yields None rather than raising.
+        assert _snapshot_write_target({"command": cmd, "path": "/repo/x.txt"}) is None
+
     def test_returns_none_for_sensitive_path(self):
         # validate_file_path rejects ~/.aws/credentials → no snapshot taken.
         assert (
@@ -246,7 +266,12 @@ class TestSnapshotWriteTarget:
         # File doesn't exist yet — chip should still surface with empty before.
         target = tmp_path / "new.txt"
         out = _snapshot_write_target({"command": "create", "path": str(target)})
-        assert out == {"path": str(target), "content": "", "truncated": False}
+        assert out == {
+            "path": str(target),
+            "canonical_path": os.path.realpath(str(target)),
+            "content": "",
+            "truncated": False,
+        }
 
     def test_str_replace_on_existing_file_captures_content(self, tmp_path: Path):
         f = tmp_path / "code.py"
@@ -265,13 +290,6 @@ class TestSnapshotWriteTarget:
 
 
 # ── _flush_file_changes ────────────────────────────────────────────────────
-
-
-def _make_slot_with_assistant_message() -> _ChatSlot:
-    """Build a _ChatSlot with one assistant message ready to receive file_changes."""
-    slot = _ChatSlot("test-flush")
-    slot.append("assistant", "done.", "msg msg-a", broadcast=False)
-    return slot
 
 
 class TestFlushFileChanges:
@@ -309,6 +327,132 @@ class TestFlushFileChanges:
         assert meta["file_changes"][0]["after"] == "after\n"
         # Slot's accumulator is reset for the next turn.
         assert slot._file_changes == []
+
+    def test_turn_boundary_keeps_chips_off_the_previous_turns_answer(self, short_tmp_dir: Path):
+        # Turn 1 answered; turn 2 changed a file and ended without an assistant
+        # row (error-only exit). The chips belong to turn 2, so the flush must
+        # add a synthetic anchor after the boundary, not annotate turn 1's row.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _make_slot_with_assistant_message()
+        boundary = len(slot.messages)
+        start_mid = row_mid(slot.messages[-1])
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary, turn_start_mid=start_mid)
+        assert "file_changes" not in slot.messages[0].get("meta", {})
+        assert slot.messages[-1]["role"] == "assistant"
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_trimmed_window_still_finds_this_turns_rows_by_identity(self, short_tmp_dir: Path):
+        # At the row cap every append front-trims one row and the length stays
+        # pinned, so the index captured at turn start names the wrong row. The
+        # identity of the turn-start tail row does not move with the trim.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-cap")
+        slot.append("assistant", "old answer", "msg msg-a", broadcast=False)
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)  # 2, the cap
+        start_mid = row_mid(slot.messages[-1])
+        _note_reply_row(slot, slot.append("assistant", "new answer", "msg msg-a", broadcast=False))
+        del slot.messages[:1]  # what _ChatSlot.append does at the cap
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary, turn_start_mid=start_mid)
+        assert [m["content"] for m in slot.messages] == ["change x.py", "new answer"]
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_trimmed_window_with_no_answer_never_reaches_an_earlier_turn(self, short_tmp_dir: Path):
+        # Same trim, but this turn aborted before any assistant row. The
+        # previous answer must stay clean even though the index says otherwise.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-cap-abort")
+        slot.append("assistant", "old answer", "msg msg-a", broadcast=False)
+        slot.append("user", "first", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        start_mid = row_mid(slot.messages[-1])
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        del slot.messages[:1]
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary, turn_start_mid=start_mid)
+        assert slot.messages[0]["content"] == "first"
+        assert "file_changes" not in slot.messages[0].get("meta", {})
+        assert slot.messages[-1]["content"] == ""
+
+    def test_evicted_start_row_means_every_row_is_this_turns(self, short_tmp_dir: Path):
+        # The turn-start tail row itself was trimmed away: everything left in
+        # the window arrived after it, so the newest assistant row is the anchor.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-evicted")
+        slot.append("user", "hi", "msg msg-u", broadcast=False)
+        start_mid = row_mid(slot.messages[-1])
+        _note_reply_row(slot, slot.append("assistant", "new answer", "msg msg-a", broadcast=False))
+        del slot.messages[:1]
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=1, turn_start_mid=start_mid)
+        assert [m["content"] for m in slot.messages] == ["new answer"]
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_idless_start_row_falls_back_to_the_clamped_index(self, short_tmp_dir: Path):
+        # A transcript restored from a pre-id disk format has no identity to
+        # match, so the index is the only signal. Past the end it yields no
+        # rows, which means a synthetic anchor, never an earlier turn's row.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-idless")
+        slot.append("assistant", "old answer", "msg msg-a", broadcast=False, mint_mid=False)
+        assert row_mid(slot.messages[-1]) is None
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=5, turn_start_mid=None)
+        assert "file_changes" not in slot.messages[0].get("meta", {})
+        assert slot.messages[-1]["content"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_mid_turn_clear_drops_the_text_streamed_before_it(self):
+        """Through the real ``_run_chat``: a confirmed ``/clear`` mid-turn restarts
+        the turn's text, so the reply that lands is only what streamed after it --
+        never the pre-clear draft re-appended and persisted over what the user just
+        deleted."""
+        record = await run_turn(
+            TurnScript(
+                events=[
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="PRE-CLEAR draft "),
+                    AcpEvent(kind=EVENT_CLEAR_STATUS),
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="post"),
+                    AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+                ]
+            ),
+            slot=SlotSpec(rows=[("user", "earlier"), ("assistant", "earlier answer")]),
+        )
+        assert record.stop_reason == STOP_REASON_END_TURN
+        assert not any("PRE-CLEAR" in str(row.get("content")) for row in record.history_rows)
+        assert [row["content"] for row in record.rows("assistant")][-1] == "post"
+
+    def test_the_mid_turn_clear_restarts_the_turns_start_row_id(self):
+        """Kept as a source pin: the reset it guards changes nothing observable.
+
+        The clear arm resets ``_turn_start_mid`` beside the text. Without it the
+        flush would look for the pre-clear tail row's id in a window that no
+        longer holds it -- and fall back to the whole window, exactly as the reset
+        value does, so every turn renders the same chips either way (an
+        equivalent mutant; ``test_a_mid_turn_clear_drops_the_text_streamed_before_it``
+        covers the reset that IS observable). What is left is code intent, so it
+        stays a narrow AST check, counted in ``test_source_pin_budget.py``.
+        """
+        # The EVENT_CLEAR_STATUS arm's body is the clear phase's, ``_on_clear_status``.
+        [clear] = ast.parse(inspect.getsource(_on_clear_status)).body
+        resets = {
+            target.id
+            for stmt in clear.body
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value == ""
+            for target in stmt.targets
+            if isinstance(target, ast.Name)
+        }
+        assert "_turn_start_mid" in resets, resets
 
     @pytest.mark.parametrize(
         ("before_length", "after_length"),
@@ -471,8 +615,101 @@ class TestFlushFileChanges:
         # New synthetic message appended at the end.
         last = slot.messages[-1]
         assert last["role"] == "assistant"
-        assert "stopped" in last["content"].lower()
+        # Content-less: the anchor lands after the turn's error row, and a
+        # row with text there would read as the turn's reply.
+        assert last["content"] == ""
         assert last["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_aborted_turn_with_chips_still_reads_as_interrupted(self, short_tmp_dir: Path):
+        # The runner appends the error row in its ``except`` branch and flushes
+        # in ``finally``, so the synthetic anchor follows the error row. The
+        # transcript must still read as interrupted: the anchor is looked
+        # through, the trailing error decides. On the old anchor text this
+        # returned False and the composer lost its Resume control.
+        from kiro_crew.dashboard.state import is_turn_interrupted
+
+        f = short_tmp_dir / "edit.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("aborted-turn-interrupted")
+        slot.append("user", "hi", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        slot.append("error", "⟳ Connection lost — please retry.", "msg msg-err", broadcast=False)
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary)
+        assert [m["role"] for m in slot.messages] == ["user", "error", "assistant"]
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+        assert is_turn_interrupted(slot.messages) is True
+
+    def test_injected_assistant_row_is_never_the_anchor(self, short_tmp_dir: Path):
+        # workflow_inject.py appends a workflow completion into the LIVE window
+        # as an assistant row with no in-flight guard. Landing after this turn's
+        # last append and before the flush, it is the newest assistant row in
+        # the turn, and position alone would hand it the chips. It was not
+        # recorded as this runner's reply, so a synthetic anchor is added and
+        # the injected row's meta stays exactly as written.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-injected")
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        injected = slot.append(
+            "assistant",
+            "[Workflow completion event]\nWorkflow `w` (wf_1) → **ok**",
+            "msg msg-a",
+            broadcast=False,
+            meta={"kind": "workflow_result"},
+        )
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary)
+        assert set(injected["meta"]) == {"kind", "mid"}
+        assert slot.messages[-1] is not injected
+        assert slot.messages[-1]["content"] == ""
+        assert slot.messages[-1]["meta"]["file_changes"][0]["path"] == str(f)
+
+    def test_own_reply_wins_over_a_later_injected_row(self, short_tmp_dir: Path):
+        # The reply this runner appended is the anchor even when an injected
+        # assistant row arrived after it.
+        f = short_tmp_dir / "x.py"
+        f.write_text("after\n")
+        slot = _ChatSlot("test-flush-injected-after-reply")
+        slot.append("user", "change x.py", "msg msg-u", broadcast=False)
+        boundary = len(slot.messages)
+        reply = slot.append("assistant", "done", "msg msg-a", broadcast=False)
+        _note_reply_row(slot, reply)
+        injected = slot.append(
+            "assistant", "Agent `a` ✅ ok", "msg msg-a", broadcast=False, meta={"kind": "x"}
+        )
+        slot._file_changes = [{"path": str(f), "content": "before\n"}]
+        _flush_file_changes(slot, turn_boundary=boundary)
+        assert reply["meta"]["file_changes"][0]["path"] == str(f)
+        assert "file_changes" not in injected["meta"]
+        assert len(slot.messages) == 3
+        # The flush consumed the turn's identities along with its snapshots.
+        assert slot._turn_reply_mids == []
+
+    def test_flush_segment_records_the_reply_identity(self, monkeypatch):
+        # The production reply path registers its row, so the flush can tell it
+        # from an injected one without any caller threading a list through.
+        from kiro_crew.dashboard import chat_runner as cr
+
+        slot = _ChatSlot("test-flush-segment-identity")
+        slot.append("user", "hi", "msg msg-u", broadcast=False)
+        monkeypatch.setattr(cr.crew_log_emit, "on_message_sent", lambda *a, **k: None)
+        cr._flush_segment(MagicMock(), slot, "the reply", broadcast=False)
+        assert slot.messages[-1]["content"] == "the reply"
+        assert slot._turn_reply_mids == [row_mid(slot.messages[-1])]
+
+    def test_reply_identities_are_bounded_at_the_window_cap(self, monkeypatch):
+        # A row older than the window cap has been trimmed away and cannot be an
+        # anchor, so its id leaves the list; the newest ids stay.
+        from kiro_crew.dashboard import chat_runner as cr
+
+        monkeypatch.setattr(cr, "_MAX_SLOT_MESSAGES", 2)
+        slot = _ChatSlot("test-reply-ids-bounded")
+        rows = [slot.append("assistant", str(i), "msg msg-a", broadcast=False) for i in range(3)]
+        for r in rows:
+            _note_reply_row(slot, r)
+        assert slot._turn_reply_mids == [row_mid(rows[1]), row_mid(rows[2])]
 
 
 # ── Regression tests: real event ordering & content-block paths ────────────
@@ -987,3 +1224,77 @@ class TestContentBlockRedactionAndTruncation:
         # If redact_exfiltration_urls masks the URL, it should differ from raw
         # The entry should still exist (before != after)
         assert "file_changes" in meta
+
+
+# ── a protected directory that is itself a symlink ─────────────────────────
+
+#: An ordinary line no credential pattern recognises, so redaction cannot be what
+#: keeps it out of a chip: only the path refusal can.
+_PRIVATE_NOTE = "private-note-marker-7f3a"
+
+
+@pytest.fixture(params=[(".aws", "credentials"), (".ssh", "id_ed25519")], ids=["aws", "ssh"])
+def symlinked_secret(request, tmp_path: Path, monkeypatch) -> list[str]:
+    """Spellings of a dummy secret reached through a protected dir that is a SYMLINK.
+
+    ``<home>/.aws`` points at a directory OUTSIDE the home, so the store sits
+    outside every lexical anchor: only the target that protected entry resolves
+    to, which the target set carries, fences it by its real path. Returns the
+    absolute, ``~`` and real-path spellings.
+    """
+    protected_dir, leaf = request.param
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / leaf).write_text(f"[default]\n# {_PRIVATE_NOTE}\n", encoding="utf-8")
+    (home / protected_dir).symlink_to(outside, target_is_directory=True)
+    # Path.home() reads USERPROFILE on Windows and never HOME; pin both.
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    spelled = home / protected_dir / leaf
+    assert not spelled.resolve().is_relative_to(home), "precondition: the target is outside"
+    return [str(spelled), f"~/{protected_dir}/{leaf}", os.path.realpath(spelled)]
+
+
+@requires_symlinks
+class TestSymlinkedProtectedDirectory:
+    """``~/.aws`` may itself be a symlink to a directory outside the home. The
+    store is refused on every surface that feeds a file chip, through its
+    protected spelling and through its real path alike."""
+
+    def test_write_target_refuses_the_protected_spelling(self, symlinked_secret):
+        for spelling in symlinked_secret:
+            for command in ("create", "strReplace", "insert"):
+                assert _snapshot_write_target({"command": command, "path": spelling}) is None
+            # The content block's own before-text does not get past the refusal.
+            assert (
+                _snapshot_write_target(
+                    {"command": "strReplace", "path": spelling},
+                    diff_old_text="[default]\n",
+                    diff_path=spelling,
+                )
+                is None
+            )
+
+    def test_snapshot_read_refuses_the_protected_spelling(self, symlinked_secret):
+        for spelling in symlinked_secret:
+            assert _safe_read_snapshot(spelling) is None
+
+    def test_flush_keeps_the_contents_out_of_live_meta_and_history(self, symlinked_secret):
+        """The write chain records nothing for the protected spelling, and the flush
+        reads each AFTER through the same gate, so an entry that reached the
+        accumulator anyway adds nothing either -- not even the line redaction cannot
+        recognise -- to the live meta or to the history entry built from it."""
+        slot = _make_slot_with_assistant_message()
+        for spelling in symlinked_secret:
+            snapshot = _snapshot_write_target({"command": "strReplace", "path": spelling})
+            if snapshot is not None:
+                _record_turn_snapshot(slot, snapshot)
+        # Hand-built, so the flush's own after-read is under test as well.
+        for spelling in symlinked_secret:
+            slot._file_changes.append({"path": spelling, "content": ""})
+        _flush_file_changes(slot)
+        message = slot.messages[-1]
+        assert _PRIVATE_NOTE not in json.dumps(message.get("meta", {}))
+        assert _PRIVATE_NOTE not in json.dumps(_build_message_entry(message))

@@ -35,7 +35,15 @@ from aiohttp import web
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import CRED_WEIXIN_TOKEN, KiroCrewConfig, config_path, env_path
+from kiro_crew.config.loader import (
+    CRED_WEIXIN_TOKEN,
+    KiroCrewConfig,
+    config_path,
+    env_bom_prefix,
+    env_path,
+    read_config_text,
+    read_env_text,
+)
 from kiro_crew.dashboard.channel_folders import (
     channel_restart_required,
     clean_session_folder,
@@ -45,6 +53,7 @@ from kiro_crew.dashboard.channel_folders import (
 from kiro_crew.dashboard.handlers.agents import _get_config_lock
 from kiro_crew.dashboard.handlers.core import _hot_apply_after_write
 from kiro_crew.dashboard.handlers.messaging import is_direct_local_request
+from kiro_crew.hidden_leaf_staging import EnvStagingRefused, publish_env
 from kiro_crew.weixin.client import ILINK_BASE_URL, WeixinClient
 
 logger = logging.getLogger(__name__)
@@ -90,14 +99,15 @@ def _atomic_write(path: Path, text: str, *, secret: bool = False) -> None:
     with ``mkstemp`` so concurrent writers to the same target cannot collide on a
     deterministic ``.tmp`` name (an ENOENT race).
 
-    Permissions are never weakened. ``secret=True`` passes
-    ``restrict_to_owner=True`` to the shared helper, which locks the unique
-    temp file down to its owner BEFORE any content byte is written — POSIX mode
-    bits are meaningless against NTFS ACLs, so a lockdown applied to the final
-    path after the write would leave the credential readable under the
-    directory-inherited DACL for the whole write. ``restrict_on_error="warn"``
-    keeps this writer's contract: a host where the lockdown cannot be applied
-    must not abort a credential save that already succeeded. For a non-secret
+    Permissions are never weakened. ``secret=True`` is the ``.env`` write: it
+    goes through :func:`kiro_crew.hidden_leaf_staging.publish_env`, which stages
+    the temp inside the masked staging directory rather than beside ``.env``
+    and locks it down to its owner BEFORE any content byte is written — POSIX
+    mode bits are meaningless against NTFS ACLs, so a lockdown applied to the
+    final path after the write would leave the credential readable under the
+    directory-inherited DACL for the whole write. A refused lockdown warns: a
+    host where it cannot be applied must not abort a credential save that
+    already succeeded. For a non-secret
     file the EXISTING mode is carried over, because the replacement would
     otherwise adopt the umask default and silently downgrade an
     already-restricted file — ``config.json`` can hold inline fallback
@@ -105,7 +115,7 @@ def _atomic_write(path: Path, text: str, *, secret: bool = False) -> None:
     local users.
     """
     if secret:
-        atomic_write(path, text, restrict_to_owner=True, restrict_on_error="warn")
+        publish_env(path, text)
         return
     preserved: Optional[int] = None
     try:
@@ -121,7 +131,7 @@ def _write_env_secret(key: str, value: str) -> None:
     lines: list[str] = []
     found = False
     if ep.exists():
-        for line in ep.read_text(encoding="utf-8").splitlines():
+        for line in read_env_text(ep, encoding="utf-8").splitlines():
             stripped = line.strip()
             if stripped and not stripped.startswith("#") and "=" in stripped:
                 k = stripped.split("=", 1)[0].strip()
@@ -132,7 +142,7 @@ def _write_env_secret(key: str, value: str) -> None:
             lines.append(line)
     if not found:
         lines.append(f"{key}={value}")
-    _atomic_write(ep, "\n".join(lines) + "\n", secret=True)
+    _atomic_write(ep, env_bom_prefix(ep) + "\n".join(lines) + "\n", secret=True)
 
 
 def _read_env_value(key: str) -> Optional[str]:
@@ -144,7 +154,7 @@ def _read_env_value(key: str) -> Optional[str]:
     ep = env_path()
     if not ep.exists():
         return None
-    for line in ep.read_text(encoding="utf-8").splitlines():
+    for line in read_env_text(ep, encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             k, _, value = stripped.partition("=")
@@ -159,13 +169,13 @@ def _delete_env_key(key: str) -> None:
     if not ep.exists():
         return
     kept: list[str] = []
-    for line in ep.read_text(encoding="utf-8").splitlines():
+    for line in read_env_text(ep, encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped and not stripped.startswith("#") and "=" in stripped:
             if stripped.split("=", 1)[0].strip() == key:
                 continue
         kept.append(line)
-    _atomic_write(ep, "\n".join(kept) + "\n", secret=True)
+    _atomic_write(ep, env_bom_prefix(ep) + "\n".join(kept) + "\n", secret=True)
 
 
 def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None:
@@ -222,6 +232,12 @@ def _commit_credential_and_config(cp: Path, serialized: str, token: str) -> None
                     exc_info=True,
                 )
             raise
+        # ``load_credentials()`` lets ``os.environ`` win over ``.env``, and boot
+        # copied the previous token there: left alone, the channel restart and
+        # an in-app re-exec would both keep the replaced token. A scrubbed
+        # environ holds no credential to go stale and must not regain one.
+        if not os.environ.get("_KIROCREW_CREDS_SCRUBBED"):
+            os.environ[CRED_WEIXIN_TOKEN] = token
     finally:
         platform_compat.release_lock(lock_fd)
         os.close(lock_fd)
@@ -242,7 +258,7 @@ def _stage_weixin_config(*, account_id: str, base_url: str) -> tuple[Path, str]:
     cp = config_path()
     data: Dict[str, Any] = {}
     if cp.exists():
-        data = json.loads(cp.read_text(encoding="utf-8"))
+        data = json.loads(read_config_text(cp))
         if not isinstance(data, dict):
             raise ValueError("config.json is not a JSON object")
     weixin = data.get("weixin")
@@ -357,6 +373,11 @@ async def weixin_qr_status(request: web.Request) -> web.Response:
         # the owner-only DACL restrict_to_owner() applies.
         async with _get_config_lock():
             await asyncio.to_thread(_persist)
+    except EnvStagingRefused as exc:
+        # The .env's staging directory is unusable: nothing was written, and the
+        # message names the directory and its fix.
+        logger.warning("weixin: QR sign-in not saved: %s", exc)
+        return web.json_response({"error": str(exc), "code": "env_staging_refused"}, status=409)
     except Exception as exc:
         # A corrupt config.json or an un-restrictable credential file must NOT be
         # reported as a successful sign-in.
@@ -444,7 +465,7 @@ async def weixin_config_save(request: web.Request) -> web.Response:
         cp = config_path()
 
         def _read_config() -> Dict[str, Any]:
-            return json.loads(cp.read_text(encoding="utf-8")) if cp.exists() else {}
+            return json.loads(read_config_text(cp)) if cp.exists() else {}
 
         # Off-loop read: a large or slow config.json must not stall the gateway
         # event loop. Reading under the lock keeps the snapshot current relative

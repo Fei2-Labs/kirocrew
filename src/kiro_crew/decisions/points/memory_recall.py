@@ -122,7 +122,7 @@ from typing import Any, Callable, Mapping, Sequence, TypeVar
 
 from kiro_crew import decisions as core
 from kiro_crew.decisions import log as _log
-from kiro_crew.decisions.points import MAX_KEY_CHARS
+from kiro_crew.decisions.points import MAX_KEY_CHARS, as_text
 from kiro_crew.decisions.types import Answer, Choice, Question
 
 logger = logging.getLogger(__name__)
@@ -155,9 +155,9 @@ MAX_MESSAGE_CHARS = 2000
 #: fragment is what answers it. Applied AFTER redaction — see :func:`scrubbed`.
 MAX_SNIPPET_CHARS = 200
 
-#: The two answers one candidate may carry. A Choice rather than a score because
-#: ``Choice`` is the only question type ``impl_jev`` speaks; the probability the
-#: threshold is applied to is the one the provider reports for the chosen option.
+#: The two answers one candidate may carry, as one two-option ``Choice``; the
+#: probability the threshold is applied to is the one the provider reports for
+#: the chosen option.
 KEEP_OPTION = "keep"
 DROP_OPTION = "drop"
 KEEP_OPTIONS = [KEEP_OPTION, DROP_OPTION]
@@ -479,14 +479,13 @@ def scrubbed(text: object, limit: int) -> str:
     Never raises: a redactor that fails yields nothing rather than unredacted
     text, which is the only safe direction for text about to leave the machine.
     """
-    raw = text if isinstance(text, str) else ("" if text is None else str(text))
+    raw = as_text(text)
     if not raw or limit <= 0:
         return ""
     try:
-        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+        from kiro_crew.security import redact
 
-        cleaned, _ = redact_credentials(raw)
-        cleaned, _ = redact_exfiltration_urls(cleaned)
+        cleaned = redact(raw)
     except Exception:
         # A scan that did not complete cannot clear text for the wire. Dropping
         # the snippet is a worse question, not a worse outcome: the gate would

@@ -16,6 +16,7 @@ import pytest
 from kiro_crew import mcp_grant
 from kiro_crew.connections import get_provider, l1_smoke
 from kiro_crew.mcp_discovery import McpServerInfo
+from kiro_crew.testing.wait import wait_until
 
 MCP_URL = "https://mcp.example.com/mcp"
 SESSION_ID = "sess-abc123"
@@ -256,6 +257,44 @@ async def test_pass_echoes_the_session_id_on_every_later_request(granted):
     ids = [call[1]["headers"].get("Mcp-Session-Id") for call in session.calls]
     assert ids == [None] + [SESSION_ID] * 2
     assert session.calls[-1][1]["json"]["method"] == "tools/list"
+
+
+def version_refusal(supported):
+    """A server that dropped our offered revision answers -32602 listing what it speaks."""
+    data = {"supported": supported, "requested": l1_smoke.MCP_CLIENT_PROTOCOL_VERSION}
+    error = {"code": -32602, "message": "Unsupported protocol version", "data": data}
+    return FakeResponse(200, {"jsonrpc": "2.0", "id": 1, "error": error})
+
+
+def offered_versions(session):
+    inits = [c[1]["json"] for c in session.calls if c[1]["json"]["method"] == "initialize"]
+    return [body["params"]["protocolVersion"] for body in inits]
+
+
+@pytest.mark.asyncio
+async def test_initialize_offers_the_newest_version_and_later_requests_carry_the_answer(granted):
+    session = FakeSession(happy_path())
+    await run_one(session, cache_dir=granted)
+    assert offered_versions(session) == ["2025-06-18"]
+    versions = [call[1]["headers"].get("MCP-Protocol-Version") for call in session.calls]
+    answered = json.loads(initialize_ok().raw)["result"]["protocolVersion"]
+    assert versions == [None, answered, answered]
+
+
+@pytest.mark.asyncio
+async def test_a_version_refusal_is_retried_once_with_the_newest_supported(granted):
+    session = FakeSession([version_refusal(["2024-11-05", "2025-03-26"]), *happy_path()])
+    result = await run_one(session, cache_dir=granted)
+    assert result["verdict"] == "PASS"
+    assert offered_versions(session) == ["2025-06-18", "2025-03-26"]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_initialize_error_is_not_retried(granted):
+    session = FakeSession([jsonrpc_error("boom", request_id=1)])
+    result = await run_one(session, cache_dir=granted)
+    assert result["verdict"] == "FAIL"
+    assert session.methods == ["initialize"]
 
 
 @pytest.mark.asyncio
@@ -732,9 +771,7 @@ def test_the_report_is_written_before_the_loop_joins_leaked_workers(tmp_path, mo
     )
     worker.start()
     try:
-        deadline = time.monotonic() + 5
-        while not report_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        wait_until(report_path.exists, describe=lambda: "the report was never written")
         # main is still blocked joining the worker, yet the report is on disk.
         assert worker.is_alive() and report_path.exists()
     finally:

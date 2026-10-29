@@ -9,6 +9,7 @@ put it.
 
 from __future__ import annotations
 
+import os
 import threading
 import time as _time
 from unittest.mock import patch
@@ -58,8 +59,9 @@ class _Clock:
         """True when the immediate caller of sleep/monotonic is the core server.
 
         Matches the whole server rather than one file: the ``wait`` handler lives
-        in ``mcp_tools/control.py`` while the plumbing it calls stays in
-        ``mcp_core.py``. Keying on a single module name would silently stop
+        in ``mcp_tools/control.py``, the plumbing it calls stays in
+        ``mcp_core.py``, and the sleep between its steps is ``drive_deferred``
+        in ``mcp_shared_calls.py``. Keying on a single module name would silently stop
         advancing the fake timeline and leave the loop sleeping for real.
         """
         import sys
@@ -67,7 +69,7 @@ class _Clock:
         # frame 0 = this method, frame 1 = sleep/monotonic, frame 2 = actual caller
         frame = sys._getframe(2)
         filename = frame.f_code.co_filename
-        return "mcp_core" in filename or "mcp_tools" in filename
+        return "mcp_core" in filename or "mcp_tools" in filename or "mcp_shared" in filename
 
     def monotonic(self) -> float:
         if threading.current_thread() is not self._owner or not self._caller_is_code_under_test():
@@ -142,6 +144,37 @@ class TestWaitLoopEarlyEnd:
         assert f"after {int(2 * WAIT_PING_SECS)}s of {MIN_WAIT}s" in result
         assert result.endswith("Resuming: test")
         assert len(_countdown_posts(posts)) == 3
+
+    def test_an_end_by_another_session_names_that_session(self):
+        """session_end_wait: the result tells the woken agent a peer ended it,
+        not the person, so it can go and read that peer's instruction."""
+
+        def replies(n, body):
+            if n == 2:
+                return {
+                    "ok": True,
+                    "end_wait": body["wait_id"],
+                    "end_wait_by": "chat-644-1790695288",
+                }
+            return {"ok": True}
+
+        result, _, _ = _run_wait(replies)
+
+        assert result.startswith(
+            "Wait ended early by session `chat-644-1790695288` (session_end_wait) after"
+        )
+        assert result.endswith("Resuming: test")
+
+    def test_a_requester_on_a_reply_for_another_wait_is_ignored(self):
+        """``end_wait_by`` is read only from a reply whose ``end_wait`` names
+        this sleep, so it cannot describe someone else's."""
+
+        def replies(n, body):
+            return {"ok": True, "end_wait": "other-wait", "end_wait_by": "chat-9"}
+
+        result, _, _ = _run_wait(replies)
+
+        assert result == f"Waited {MIN_WAIT}s. Resuming: test"
 
     def test_end_wait_for_a_different_id_is_ignored(self):
         """K(ii). Only a request naming this sleep ends it; anything else lets
@@ -225,7 +258,7 @@ class TestWaitLoopEarlyEnd:
             """Simulates pytest-xdist or any other background thread."""
             leaked.set()
             while not stop.is_set():
-                _time.sleep(0.001)
+                _time.sleep(0.001)  # flake-ok: stimulus; this thread's real sleeps are the subject
 
         bg = threading.Thread(target=_background_sleeper, daemon=True)
         bg.start()
@@ -407,3 +440,95 @@ class TestWaitPingShape:
         assert "ghp_1234567890abcdefghij1234567890abcdef" not in early
         assert "[REDACTED: credential]" in normal
         assert "[REDACTED: credential]" in early
+
+
+class TestWaitSettlementAudit:
+    @pytest.mark.parametrize("ended_early", [False, True])
+    def test_the_two_completion_rows_are_written_only_when_settled(
+        self, monkeypatch, manual_clock, ended_early
+    ):
+        from unittest.mock import MagicMock
+
+        from kiro_crew import mcp_core, mcp_shared
+
+        audit = MagicMock()
+        monkeypatch.setattr(mcp_core, "sel", lambda: audit)
+        monkeypatch.setattr(mcp_shared, "sel", lambda: audit)
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:wait-audit")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:wait-audit")
+        manual_clock.install(monkeypatch, mcp_core)
+        monkeypatch.setattr(
+            mcp_core,
+            "_post",
+            lambda path, body, **kw: {"end_wait": body.get("wait_id")} if ended_early else {},
+        )
+        deferred = mcp_core._call_tool_deferrable("wait", {"seconds": MIN_WAIT, "reason": "test"})
+        assert isinstance(deferred, mcp_shared.DeferredTool)
+        if not ended_early:
+            manual_clock.advance(MIN_WAIT)
+        text = deferred.step()
+        assert isinstance(text, str)
+        audit.log_tool_invocation.assert_not_called()
+        deferred.on_settled(text)
+        # The tool's own ``success`` row, then the audited wrapper's generic
+        # ``completed`` row -- the two rows the blocking tool wrote at return.
+        rows = [c.kwargs for c in audit.log_tool_invocation.call_args_list]
+        assert [(r["tool_name"], r["outcome"]) for r in rows] == [
+            ("wait", "success"),
+            ("wait", "completed"),
+        ]
+        assert {r["session_key"] for r in rows} == {"dashboard:wait-audit"}
+
+    @pytest.mark.skipif(
+        os.name != "posix", reason="mid-step cancellation uses the POSIX stdio loop"
+    )
+    def test_cancel_during_final_card_retirement_writes_only_cancelled(
+        self, monkeypatch, manual_clock
+    ):
+        from test_mcp_shared import _LoopHarness, _tools_call
+
+        from kiro_crew import mcp_core
+
+        retiring = threading.Event()
+        release = threading.Event()
+        manual_clock.install(monkeypatch, mcp_core)
+        monkeypatch.setattr(mcp_core, "_resolve_session_key", lambda: "dashboard:wait-audit")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:wait-audit")
+
+        def post(path, body, **kw):
+            if body.get("wait_done"):
+                retiring.set()
+                assert release.wait(timeout=5.0), "card retirement was never released"
+                return {}
+            return {"end_wait": body["wait_id"]}
+
+        monkeypatch.setattr(mcp_core, "_post", post)
+        harness = _LoopHarness(monkeypatch, mcp_core._call_tool_deferrable)
+        monkeypatch.setattr(mcp_core, "sel", lambda: harness.sel_mock)
+        try:
+            call = _tools_call(1, "wait")
+            call["params"]["arguments"] = {"seconds": MIN_WAIT, "reason": "test"}
+            harness.send(call)
+            assert retiring.wait(timeout=5.0), "wait never reached final card retirement"
+            harness.sel_mock.log_tool_invocation.assert_not_called()
+            harness.send(
+                {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
+            )
+            harness.send({"jsonrpc": "2.0", "id": 9, "method": "ping"})
+            assert harness.wait_for(lambda: any(r[0] == 9 for r in harness.responses))
+            release.set()
+
+            def cancelled_rows():
+                return [
+                    c
+                    for c in harness.sel_mock.log_tool_invocation.call_args_list
+                    if c.kwargs.get("request_id") == "1" and c.kwargs.get("outcome") == "cancelled"
+                ]
+
+            assert harness.wait_for(lambda: len(cancelled_rows()) == 1)
+            assert not any(r[0] == 1 for r in harness.responses)
+            harness.sel_mock.log_tool_invocation.assert_called_once()
+            assert cancelled_rows()[0].kwargs["tool_name"] == "wait"
+        finally:
+            release.set()
+            harness.close()

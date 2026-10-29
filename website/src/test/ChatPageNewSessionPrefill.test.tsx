@@ -23,10 +23,11 @@ import { render, act, waitFor, screen, fireEvent } from '@testing-library/react'
 import { store as singletonStore, type RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Middleware } from '@reduxjs/toolkit'
+import { flushSync } from 'react-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
-import chatReducer, { switchSlot, endLocalTurn, setQuestionCard, setQuestionDraft, setFolderSuggestion, pendingQuestionFor } from '../store/chatSlice'
+import chatReducer, { createSlot, switchSlot, endLocalTurn, setQuestionCard, setQuestionDraft, setFolderSuggestion, pendingQuestionFor, resolveQuestionCard } from '../store/chatSlice'
 import dashboardReducer, { updateSlot } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { PREFILL_STORAGE_KEY } from '../utils/navIntent'
@@ -67,6 +68,7 @@ vi.mock('../api/client', () => ({
     chatSlotDetail: (...a: unknown[]) => chatSlotDetail(...a),
     sendChat: (...a: unknown[]) => sendChat(...a),
     chatHistory: vi.fn().mockResolvedValue({ sessions: [] }),
+    dashboardConfig: vi.fn().mockResolvedValue({}),
     models: vi.fn().mockResolvedValue([]),
     agents: vi.fn().mockResolvedValue([]),
     agentDetail: vi.fn().mockResolvedValue({}),
@@ -107,9 +109,10 @@ const NEW_SLOT = 'chat-new-1'
 
 /** `activeSlot: null` with one known session — the state a cold `/chat?new=1`
  *  load lands in, and the one where a spurious create would be visible. */
-function makeStore(targetTitle?: string, activeSlot: string | null = null) {
+function makeStore(targetTitle?: string, activeSlot: string | null = null, middleware: Middleware[] = []) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+    middleware: getDefault => getDefault().concat(middleware),
     preloadedState: {
       dashboard: {
         status: null, connected: true, slotsLoaded: true,
@@ -143,8 +146,8 @@ function NavigationProbe() {
   return null
 }
 
-async function renderAt(route: string, targetTitle?: string, activeSlot?: string) {
-  const store = makeStore(targetTitle, activeSlot)
+async function renderAt(route: string, targetTitle?: string, activeSlot?: string, middleware?: Middleware[]) {
+  const store = makeStore(targetTitle, activeSlot, middleware)
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
   await act(async () => {
     render(
@@ -191,6 +194,49 @@ describe('ChatPage — /chat?new=1&prefill= seeds a fresh session', { timeout: 2
     await waitFor(() => expect(composer().value).toBe(PROMPT))
     // The staged value is consumed, not left behind for the next slot switch.
     expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+  })
+
+  it('seeds the composer when the activation commit runs before the create caller resumes', async () => {
+    // In a browser the create's activation renders, and the slot-restore effect
+    // reads the staged prefill, before the code awaiting the create runs again.
+    // jsdom under act() runs that caller first, so a prompt staged by the caller
+    // would still reach the composer there. Committing the activation inside the
+    // dispatch reproduces the browser order.
+    const stagedAtActivation: (string | null)[] = []
+    const commitActivationNow: Middleware = () => next => action => {
+      if (!createSlot.fulfilled.match(action)) return next(action)
+      stagedAtActivation.push(sessionStorage.getItem(PREFILL_STORAGE_KEY))
+      const result = next(action)
+      flushSync(() => {})
+      return result
+    }
+    const store = await renderAt(`/chat?new=1&prefill=${encodeURIComponent(PROMPT)}`, undefined, undefined, [commitActivationNow])
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    // The seed was staged before the activation that reads it, not after.
+    expect(stagedAtActivation).toHaveLength(1)
+    expect(JSON.parse(stagedAtActivation[0] ?? 'null')).toMatchObject({ slotKey: NEW_SLOT, prompt: PROMPT })
+    expect(sessionStorage.getItem(PREFILL_STORAGE_KEY)).toBeNull()
+    expect(sendChat).not.toHaveBeenCalled()
+  })
+
+  it('still seeds the composer when sessionStorage refuses the staged prompt', async () => {
+    const setItem = Storage.prototype.setItem
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+      if (key === PREFILL_STORAGE_KEY) throw new DOMException('full', 'QuotaExceededError')
+      return setItem.call(this, key, value)
+    })
+    const commitActivationNow: Middleware = () => next => action => {
+      const result = next(action)
+      if (createSlot.fulfilled.match(action)) flushSync(() => {})
+      return result
+    }
+    const store = await renderAt(`/chat?new=1&prefill=${encodeURIComponent(PROMPT)}`, undefined, undefined, [commitActivationNow])
+
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe(NEW_SLOT))
+    await waitFor(() => expect(composer().value).toBe(PROMPT))
+    expect(sendChat).not.toHaveBeenCalled()
   })
 
   it('sends nothing — the prompt waits for a human Enter', async () => {
@@ -302,6 +348,19 @@ describe('App SDK chat launch intent', () => {
     expect(createChatSlot).not.toHaveBeenCalled()
   })
 
+  it('shows a restored-answer notice on the session page after its question is gone', async () => {
+    const slot = 'chat-old'
+    const store = await renderAt(`/chat?sid=${slot}`)
+    await waitFor(() => expect(store.getState().chat.slotLoading).toBe(false))
+    const questions = [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }]
+    await act(async () => {
+      store.dispatch(setQuestionCard({ slot, questions, ask_id: 'ask-gone' }))
+      store.dispatch(resolveQuestionCard({ ask_id: 'ask-gone', restored_notice: 'Your answers were not sent.' }))
+    })
+    expect(pendingQuestionFor(store.getState().chat.pendingQuestions, slot)).toBeNull()
+    expect(await screen.findByText('Your answers were not sent.')).toBeInTheDocument()
+  })
+
   it.each([
     { kind: 'blocking', queued: false },
     { kind: 'blocking', queued: true },
@@ -314,9 +373,9 @@ describe('App SDK chat launch intent', () => {
     vi.spyOn(singletonStore, 'getState').mockImplementation(store.getState)
     const questions = [{ question: 'Which task should run?', options: [{ label: 'Keep waiting' }] }]
     await act(async () => {
-      store.dispatch(setQuestionCard({ slot, questions, ...(kind === 'blocking' ? { ask_id: 'ask-human' } : {}) }))
+      store.dispatch(setQuestionCard({ slot, questions, ...(kind === 'blocking' ? { ask_id: 'ask-human' } : { card_id: 'card-human' }) }))
       store.dispatch(setFolderSuggestion({ slot, folderId: 'folder-notes', folderName: 'Notes', breadcrumb: 'Notes', ts: 100 }))
-      if (kind === 'stateless-draft') store.dispatch(setQuestionDraft({ slot, active: true }))
+      if (kind === 'stateless-draft') store.dispatch(setQuestionDraft({ slot, answers: { 'Which?': 'draft' } }))
     })
     const card = pendingQuestionFor(store.getState().chat.pendingQuestions, slot)
     const folder = store.getState().chat.folderSuggestions[slot]
@@ -334,8 +393,20 @@ describe('App SDK chat launch intent', () => {
       expect(answerQuestion).not.toHaveBeenCalled()
       expect(pendingQuestionFor(store.getState().chat.pendingQuestions, slot)).toEqual(card)
       expect(store.getState().chat.folderSuggestions[slot]).toEqual(folder)
+    } else if (kind === 'blocking') {
+      expect(answerQuestion).toHaveBeenCalledWith('ask-human', undefined, queued ? 'queued' : 'composer')
+      expect(pendingQuestionFor(store.getState().chat.pendingQuestions, slot)).toBeNull()
+      expect(store.getState().chat.folderSuggestions[slot]?.turns).toBe(queued ? 0 : 1)
     } else {
-      if (kind === 'blocking') expect(answerQuestion).toHaveBeenCalledWith('ask-human')
+      // A stateless card is server-owned: the send itself does not
+      // retire it. The server retires the record when the user row lands and
+      // announces it with `question_card_resolved`, which is what takes the
+      // card off screen (the mounted card reports no typed answer here, so the
+      // draft flag set above was already cleared on mount; draft sparing is
+      // pinned in chatSlice.questionCard.test.ts).
+      expect(answerQuestion).not.toHaveBeenCalled()
+      expect(pendingQuestionFor(store.getState().chat.pendingQuestions, slot)).toEqual(card)
+      await act(async () => { store.dispatch(resolveQuestionCard({ card_id: 'card-human' })) })
       expect(pendingQuestionFor(store.getState().chat.pendingQuestions, slot)).toBeNull()
       expect(store.getState().chat.folderSuggestions[slot]?.turns).toBe(queued ? 0 : 1)
     }
@@ -347,7 +418,7 @@ describe('App SDK chat launch intent', () => {
     vi.spyOn(singletonStore, 'getState').mockImplementation(store.getState)
     const questions = [{ question: 'Which task?', options: [{ label: 'Wait' }] }]
     await act(async () => {
-      store.dispatch(setQuestionCard({ slot: 'chat-old', questions, ...(kind === 'blocking' ? { ask_id: 'ask-old' } : {}) }))
+      store.dispatch(setQuestionCard({ slot: 'chat-old', questions, ...(kind === 'blocking' ? { ask_id: 'ask-old' } : { card_id: 'card-old' }) }))
     })
     let settle!: (response: unknown) => void
     sendChat.mockImplementationOnce(() => new Promise(resolve => { settle = resolve }))
@@ -355,7 +426,7 @@ describe('App SDK chat launch intent', () => {
     await act(async () => { navigateInTest('/chat?sid=chat-old') })
     await waitFor(() => expect(sendChat).toHaveBeenCalledTimes(1))
     await act(async () => {
-      store.dispatch(setQuestionCard({ slot: 'chat-old', questions, fresh: true, ...(kind === 'blocking' ? { ask_id: 'ask-replacement' } : {}) }))
+      store.dispatch(setQuestionCard({ slot: 'chat-old', questions, ...(kind === 'blocking' ? { ask_id: 'ask-replacement' } : { card_id: 'card-replacement' }) }))
       await store.dispatch(switchSlot('chat-other'))
       store.dispatch(setQuestionCard({ slot: 'chat-other', questions, ask_id: 'ask-other' }))
     })

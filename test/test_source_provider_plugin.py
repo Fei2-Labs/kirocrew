@@ -9,6 +9,7 @@ plugin's own label.
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -238,6 +239,60 @@ async def test_chip_status_projects_only_ci_and_state(plugin) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reply", "expected"),
+    [
+        # A plugin is not a provider whose chip read computes the marker, and
+        # the write-through drops it for one too, so the chip read drops it.
+        ({"ci": "failed", "ciPending": "1"}, {"ci": "failed"}),
+        ({"ci": "passed", "ciPending": "1"}, {"ci": "passed"}),
+        ({"ci": "failed", "ciPending": "yes"}, {"ci": "failed"}),
+    ],
+)
+async def test_chip_status_drops_the_still_running_marker_for_a_plugin(
+    plugin, monkeypatch, reply, expected
+) -> None:
+    async def fetch_check_status(_ref):
+        return reply
+
+    monkeypatch.setattr(plugin, "fetch_check_status", fetch_check_status)
+    assert await source._fetch_check_status(CR_URL) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_plugin_returning_only_ci_and_state_stays_steady_while_checks_run(
+    plugin, monkeypatch
+) -> None:
+    """A failed check beside a running one must not make the chip flap.
+
+    The full fetch writes the chip entry through ``status_from_full_payload``;
+    the next chip read must match it, or every refresh reads a change, drops
+    the full payload and refetches it.
+    """
+    from kiro_crew.dashboard.source_providers import chip_status
+
+    monkeypatch.setattr(chip_status, "_check_cache", {})
+    monkeypatch.setattr(chip_status, "_status_delta_sinks", [])
+    monkeypatch.setattr(chip_status, "schedule_visibility_refresh", lambda *a, **k: None)
+    full = await plugin.fetch_full(plugin.parse(CR_URL))
+
+    async def fetch_full(ref, *, refresh: bool = False):
+        return {**full, "checks": [{"bucket": "failed"}, {"bucket": "pending"}]}
+
+    async def fetch_check_status(_ref):
+        return {"ci": "failed", "state": "open"}
+
+    monkeypatch.setattr(plugin, "fetch_full", fetch_full)
+    monkeypatch.setattr(plugin, "fetch_check_status", fetch_check_status)
+
+    await source.fetch_pull_request(CR_URL)
+    written = chip_status._check_cache[CR_URL][1]
+
+    assert written == {"ci": "failed", "state": "open"}
+    assert await source._fetch_check_status(CR_URL) == written
+
+
+@pytest.mark.asyncio
 async def test_plugin_error_text_is_redacted_before_it_reaches_the_client(plugin) -> None:
     """A plugin's EXCEPTION goes through the scrubber its payload goes through.
 
@@ -443,8 +498,88 @@ def test_sidebar_source_links_include_the_plugin_chip(plugin) -> None:
             "url": CR_URL,
             "kind": "change",
             "label": "CR-123",
+            "identity": '["acme","review.acme.example","","acme",123,"","change",""]',
         }
     ]
+
+
+def _parse_with_revision_pin(raw_url: str) -> source.SourceRef | None:
+    """A grammar that keeps an optional ``/revisions/N`` pin in the canonical URL."""
+    prefix = "https://review.acme.example/cr/"
+    if not raw_url.startswith(prefix):
+        return None
+    tail = raw_url[len(prefix) :].rstrip("/")
+    number, _, pin = tail.partition("/")
+    if not number.isdigit():
+        return None
+    if pin and not (pin.startswith("revisions/") and pin[len("revisions/") :].isdigit()):
+        return None
+    canonical = f"{prefix}{number}/{pin}" if pin else f"{prefix}{number}"
+    return source.SourceRef(
+        "acme",
+        canonical,
+        "review.acme.example",
+        "",
+        "acme",
+        int(number),
+        kind="change",
+    )
+
+
+def _revision_slot(*contents: str) -> Any:
+    from kiro_crew.dashboard import state as state_mod
+
+    slot = object.__new__(state_mod._ChatSlot)
+    slot.messages = [{"role": "assistant", "content": text} for text in contents]
+    slot._source_links_revision = 1
+    slot._source_links_cache = None
+    slot._dismissed_source_links = set()
+    slot._dismissed_txn_pending = set()
+    slot._projection = SlotProjection()
+    return slot
+
+
+@pytest.fixture
+def per_revision_status(plugin, monkeypatch):
+    """Chip status as a per-revision provider reports it: rev 1 OPEN, rev 2 SHIPPED."""
+    from kiro_crew.dashboard import state as state_mod
+
+    plugin.parse = _parse_with_revision_pin  # type: ignore[attr-defined]
+    statuses = {
+        f"{CR_URL}/revisions/1": {"state": "open", "ci": "passed"},
+        f"{CR_URL}/revisions/2": {"state": "merged", "ci": "passed"},
+    }
+    # Patched through the facade, which routes the name to every module that binds it.
+    monkeypatch.setattr(state_mod, "_cached_check_status", statuses.get)
+    return statuses
+
+
+def test_chip_status_comes_from_the_latest_revision(per_revision_status) -> None:
+    """A review whose revision 2 shipped reads merged, not revision 1's open."""
+    from kiro_crew.dashboard import state as state_mod
+
+    slot = _revision_slot(
+        f"Published {CR_URL}/revisions/1 for review.",
+        f"Published {CR_URL}/revisions/2; it shipped.",
+    )
+    payload = state_mod._ChatSlot.source_links_payload(slot, include_check_status=True)
+
+    assert payload["total"] == 1
+    [link] = payload["links"]
+    assert link["url"] == f"{CR_URL}/revisions/2"
+    assert link["state"] == "merged"
+
+
+def test_a_review_mentioned_at_one_revision_keeps_that_status(per_revision_status) -> None:
+    """Older single-revision transcripts are read exactly as before."""
+    from kiro_crew.dashboard import state as state_mod
+
+    slot = _revision_slot(f"Published {CR_URL}/revisions/1 for review.")
+    payload = state_mod._ChatSlot.source_links_payload(slot, include_check_status=True)
+
+    [link] = payload["links"]
+    assert link["url"] == f"{CR_URL}/revisions/1"
+    assert link["state"] == "open"
 
 
 def test_sidebar_dedups_on_ref_identity_not_canonical_url(plugin) -> None:
@@ -458,29 +593,7 @@ def test_sidebar_dedups_on_ref_identity_not_canonical_url(plugin) -> None:
     """
     from kiro_crew.dashboard import state as state_mod
 
-    prefix = "https://review.acme.example/cr/"
-
-    def parse_with_revision_pin(raw_url: str) -> source.SourceRef | None:
-        if not raw_url.startswith(prefix):
-            return None
-        tail = raw_url[len(prefix) :].rstrip("/")
-        number, _, pin = tail.partition("/")
-        if not number.isdigit():
-            return None
-        if pin and not (pin.startswith("revisions/") and pin[len("revisions/") :].isdigit()):
-            return None
-        canonical = f"{prefix}{number}/{pin}" if pin else f"{prefix}{number}"
-        return source.SourceRef(
-            "acme",
-            canonical,
-            "review.acme.example",
-            "",
-            "acme",
-            int(number),
-            kind="change",
-        )
-
-    plugin.parse = parse_with_revision_pin  # type: ignore[attr-defined]
+    plugin.parse = _parse_with_revision_pin  # type: ignore[attr-defined]
 
     slot = object.__new__(state_mod._ChatSlot)
     slot.messages = [
@@ -501,6 +614,7 @@ def test_sidebar_dedups_on_ref_identity_not_canonical_url(plugin) -> None:
             "url": f"{CR_URL}/revisions/2",
             "kind": "change",
             "label": "CR-123",
+            "identity": '["acme","review.acme.example","","acme",123,"","change",""]',
         }
     ]
 
@@ -714,6 +828,10 @@ def test_core_bounds_the_spellings_one_provider_can_contribute(plugin, monkeypat
     assert normalized is not None
     assert len(normalized[1]) == history_search._MAX_SEARCH_REF_SPELLINGS
     assert not hasattr(source, "_MAX_SEARCH_SPELLINGS_PER_PROVIDER")
+    # The handler answers only its exported names, so also ask the module that
+    # defines the collector.
+    collector = inspect.getmodule(source.source_search_ref)
+    assert not hasattr(collector, "_MAX_SEARCH_SPELLINGS_PER_PROVIDER")
 
 
 def test_the_seam_finds_a_transcript_that_cited_the_item_only_by_url(plugin, tmp_path) -> None:

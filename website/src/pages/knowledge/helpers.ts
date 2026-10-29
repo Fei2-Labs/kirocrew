@@ -56,9 +56,10 @@ export const DEFAULT_STATUS_FILTER = 'active'
 // test/test_knowledge_formats_parity.py holds this list identical to
 // `sorted(FileReader.SUPPORTED - {''})`, so it cannot silently drift.
 export const FALLBACK_SUPPORTED_FORMATS = [
+  '.adoc', '.asciidoc',
   '.c', '.cpp', '.cs', '.csv', '.docx', '.go', '.h', '.htm', '.html', '.java',
   '.js', '.json', '.jsonl', '.kt', '.kts', '.log', '.md', '.ndjson', '.org',
-  '.pdf', '.ps1', '.psd1', '.psm1', '.py', '.rb', '.rs', '.scala', '.sh',
+  '.pdf', '.php', '.phtml', '.ps1', '.psd1', '.psm1', '.py', '.rb', '.rs', '.scala', '.sh',
   '.swift', '.ts', '.txt', '.yaml', '.yml',
 ]
 

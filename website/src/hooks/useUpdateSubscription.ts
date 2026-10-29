@@ -2,8 +2,21 @@ import { useEffect } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
 import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
+import { updateInfoQuery } from '../api/updateInfoQuery'
 
 export type UpdateState = globalThis.UpdateState
+
+/**
+ * The stop command an install refused with `gateway-still-running` names, or
+ * null for any other state. Both refusal surfaces (UpdateModal and the About
+ * card) render it verbatim after the catalog sentence that points at it, and
+ * fall back to their generic install-failure copy when no command came with
+ * the refusal.
+ */
+export function gatewayStopCommand(st: UpdateState | null | undefined): string | null {
+  if (st?.state !== 'error' || st.code !== 'gateway-still-running') return null
+  return typeof st.stopCommand === 'string' && st.stopCommand.trim() ? st.stopCommand : null
+}
 
 /**
  * The update lifecycle payload pushed by the Electron main process.
@@ -17,7 +30,7 @@ export type UpdateState = globalThis.UpdateState
  * Subscribes to the Electron main process's update lifecycle events and mirrors
  * each one into the shared ['update-state'] React Query cache.
  *
- * Must be mounted exactly once at the app root (App.tsx) so update events are
+ * Must be mounted exactly once at the app root (shell/appShell.tsx) so update events are
  * captured regardless of which page is visible. Both UpdateModal and the
  * Settings > About panel read from this cache — if the subscription lived only
  * inside About, the modal would never fire unless the user opened About first.
@@ -62,7 +75,9 @@ export function useUpdateSubscription() {
     let disposed = false
     // Best-effort replay: a failure here (old preload, IPC teardown) just
     // leaves the pre-replay behaviour, so it must never throw out of the hook.
-    api.getInfo?.().then(info => {
+    // Through the shared query, so this one IPC also serves every later
+    // ['update-info'] reader (About, the What's-new modal, settings search).
+    queryClient.fetchQuery({ ...updateInfoQuery, retry: false }).then(info => {
       if (disposed) return
       const last = info?.lastState
       if (!last) return

@@ -12,7 +12,12 @@
  *       reverts the optimistic title to the server truth, or — when the
  *       recovery re-read fails too (#10203 double failure) — locally to the
  *       last confirmed title, while a stale attempt never overwrites a newer
- *       one.
+ *       one;
+ *   (e) closing the editor never strands focus on `document.body`: Enter and
+ *       Escape return focus to the title trigger, the composer never gains
+ *       focus from the committing Enter (its Enter SENDS), a pointer blur
+ *       moves nothing, and a confirmed rename is announced through a polite
+ *       status region.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
@@ -32,10 +37,14 @@ vi.mock('../api/client', () => ({
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { MOVE_UNDO_MS } from '../components/MoveUndoBar'
 import { api } from '../api/client'
+import { sseSlotTitle, updateSlotPin } from '../store/dashboardSlice'
 
 const SLOT = 'pane-a'
 const TITLE = 'Alpha session'
 const REGEN = 'Regenerate title with LLM — the current name can be restored with Undo'
+// The trigger's accessible name carries the ACTION and the title (WCAG 2.5.3
+// keeps the visible title inside the name).
+const RENAME = `${TITLE} (rename session)`
 
 function makeStore(memoryMode?: string) {
   return createTestStore({
@@ -51,19 +60,25 @@ function makeStore(memoryMode?: string) {
   })
 }
 
-function renderControl(opts: { onError?: (m: string, t: string) => void; memoryMode?: string } = {}) {
+function renderControl(opts: { onError?: (m: string, t: string) => void; memoryMode?: string; compact?: boolean } = {}) {
   const store = makeStore(opts.memoryMode)
   // Mirrors the real hosts: the title prop follows the store. `slot` is a
   // prop so a test can re-target the same instance like the main header does.
+  // `compact` (the pane header's typography) is the default here; the main
+  // header's variant is opted into where a contract must hold for both hosts.
   const Host = ({ slot }: { slot: string }) => {
     const title = useSelector((s: RootState) => s.dashboard.slots.find((x) => x.key === slot)?.title ?? slot)
-    return <SessionTitleControl slotKey={slot} title={title} compact onError={opts.onError} />
+    return <SessionTitleControl slotKey={slot} title={title} compact={opts.compact ?? true} onError={opts.onError} />
   }
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const tree = (slot: string) => (
     <QueryClientProvider client={qc}>
       <Provider store={store}>
         <div className="group/header"><Host slot={slot} /></div>
+        {/* The page's composer, with the `data-composer-input` hook production
+            probes: the (e) tests assert it never gains focus from a rename. */}
+        <textarea data-composer-input aria-label="Message input" />
+        <button type="button" data-testid="elsewhere">Elsewhere</button>
       </Provider>
     </QueryClientProvider>
   )
@@ -97,7 +112,7 @@ beforeEach(() => {
 describe('SessionTitleControl', () => {
   it('renders the title as a button with the regenerate action beside it', () => {
     renderControl()
-    expect(screen.getByRole('button', { name: TITLE })).toBeTruthy()
+    expect(screen.getByRole('button', { name: RENAME })).toBeTruthy()
     expect(screen.getByRole('button', { name: REGEN })).toBeTruthy()
   })
 
@@ -114,19 +129,91 @@ describe('SessionTitleControl', () => {
     await waitFor(() => expect(screen.queryByDisplayValue('  Renamed alpha  ')).toBeNull())
   })
 
-  it('opens with the whole title selected, so a long name shows its start rather than a scrolled tail', () => {
+  // Three nightly GUI testers read the open editor as "highlighted, not
+  // editable" (#13050, #12772, #13325): the input used to strip every piece of the
+  // shared Input chrome and sit inside the same hover pill as the read-only
+  // title, with the whole name selected -- and a range selection paints no
+  // caret in any engine. These pin the affordance the fix adds. Static
+  // contracts on the class strings: happy-dom lays nothing out and computes
+  // no `:focus-visible`, so the measured heights live in the PR's captures.
+  const READ_ONLY_PILL = 'cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover focus-within:bg-bg-hover transition-colors'
+  const INPUT_CHROME = ['border', 'border-accent', 'bg-bg-elevated', 'focus-ring']
+  // The overrides that used to strip the Input's chrome at this call site.
+  const STRIPPED_CHROME = ['bg-transparent', 'border-0', 'rounded-none', 'p-0', 'focus:!shadow-none', 'focus-visible:border-b', 'focus-visible:border-accent']
+  const classes = (el: Element) => el.className.split(/\s+/).filter(Boolean)
+
+  it('opens as an unmistakable text input: the shared Input border, background and focus ring, with a caret at the end', () => {
     renderControl()
     const input = openEditor()
-    // Caret parked at the end, as autofocus leaves it; the focus the browser
-    // delivers on open is what the control selects on.
-    act(() => { input.setSelectionRange(TITLE.length, TITLE.length) })
+    // Some engines leave a programmatic focus with the selection at the
+    // start (and the field scrolled); the focus the browser delivers on open
+    // is what the control places the caret on.
+    act(() => { input.setSelectionRange(0, 0); input.scrollLeft = 40 })
     act(() => { fireEvent.focus(input) })
-    expect(input.selectionStart).toBe(0)
+    // A collapsed selection at the end: a caret the user can see, nothing
+    // selected. (Select-all would replace the title on the first keystroke,
+    // but a range selection suppresses the caret everywhere, and the caret is
+    // the cue the testers missed.) The field itself opens scrolled to its
+    // start, so a name wider than the box still shows its beginning.
+    expect(input.selectionStart).toBe(TITLE.length)
     expect(input.selectionEnd).toBe(TITLE.length)
-    // Anchored backward: the selection FOCUS is at the start, which is what
-    // makes the browser scroll the input to show the beginning of a long name.
-    expect(input.selectionDirection).toBe('backward')
     expect(input.scrollLeft).toBe(0)
+    for (const c of INPUT_CHROME) expect(classes(input)).toContain(c)
+    for (const c of STRIPPED_CHROME) expect(classes(input)).not.toContain(c)
+    // The editor IS the box: no hover pill painted behind it any more.
+    expect(classes(input.parentElement!)).not.toContain('bg-bg-hover')
+  })
+
+  it.each([
+    ['split-view pane header (compact)', true],
+    ['single-session header', false],
+  ])('%s: the open editor says which keys save and cancel, and is described by it (#15808)', (_host, compact) => {
+    renderControl({ compact })
+    // The read-only title shows no key legend.
+    expect(screen.queryByText('Enter saves · Esc cancels')).toBeNull()
+    const input = openEditor()
+    const hint = screen.getByText('Enter saves · Esc cancels')
+    expect(hint.id).not.toBe('')
+    expect(input.getAttribute('aria-describedby')).toBe(hint.id)
+    expect(input).toHaveAccessibleDescription('Enter saves · Esc cancels')
+    // Beside the box, in the same row, never squeezing the box's own padding.
+    expect(hint.parentElement).toBe(input.parentElement)
+    // Touch-only devices have no Escape key, so the legend is hidden there.
+    expect(classes(hint)).toContain('[@media(hover:none)]:hidden')
+    // In a narrow pane the hint gives way instead of squeezing the box: the
+    // row it sits in is the container it hides against, and above that width
+    // it truncates.
+    // A pane's row fills the pane and is the container; the main header sizes
+    // to its content, so a container there would collapse it, and the hint
+    // keys off the viewport instead.
+    expect(classes(input.parentElement!).includes('@container')).toBe(compact)
+    expect(classes(hint)).toEqual(expect.arrayContaining(['min-w-0', 'truncate', compact ? '@max-[420px]:hidden' : 'md:block']))
+    expect(classes(hint)).not.toContain('shrink-0')
+    act(() => { fireEvent.keyDown(input, { key: 'Escape' }) })
+    expect(screen.queryByText('Enter saves · Esc cancels')).toBeNull()
+  })
+
+  it.each([
+    ['split-view pane header (compact)', true],
+    ['single-session header', false],
+  ])('%s: the editor keeps the read-only title\'s type and box, so the header does not move when editing starts or ends', (_host, compact) => {
+    renderControl({ compact })
+    const pill = screen.getByRole('button', { name: RENAME }).parentElement!
+    expect(pill.className).toBe(READ_ONLY_PILL)
+    const label = screen.getByText(TITLE)
+    const typeClasses = classes(label).filter((c) => /^(text-|font-|session-header-title)/.test(c))
+    // Coherence check: the read-only title's size, weight and colour are what gets mirrored.
+    expect(typeClasses).toEqual(expect.arrayContaining(['font-semibold', compact ? 'text-[13px]' : 'text-sm']))
+    const input = openEditor()
+    for (const c of typeClasses) expect(classes(input)).toContain(c)
+    for (const c of INPUT_CHROME) expect(classes(input)).toContain(c)
+    // The pill's padding (py-0.5 = 2px, px-1.5 = 6px) becomes the editor's
+    // 1px border + 1px / 5px padding, and the editing wrapper adds none of
+    // its own -- the box the title sits in keeps its size in both states.
+    expect(classes(input)).toEqual(expect.arrayContaining(['py-px', 'px-[5px]', 'rounded-l-[2px]', 'rounded-r-md']))
+    expect(classes(input.parentElement!).some((c) => /^-?p[xytrbl]?-/.test(c))).toBe(false)
+    // Same width rule as the read-only title on the main header.
+    expect(classes(input).includes('md:max-w-[50vw]')).toBe(!compact)
   })
 
   it('caps the draft at the 200 characters the rename route keeps, so no typed tail is cut server-side', () => {
@@ -178,7 +265,7 @@ describe('SessionTitleControl', () => {
     await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
     // Spinner gone; the Auto-title button's place is taken by the Undo offer.
     await waitFor(() => expect(screen.getByRole('button', { name: `Undo: ${TITLE}` })).toBeTruthy())
-    expect(screen.queryByRole('status')).toBeNull()
+    expect(screen.queryByText('Generating title…')).toBeNull()
   })
 
   it('offers a one-shot Undo after a generated title lands, which restores the previous name through the rename path', async () => {
@@ -195,6 +282,30 @@ describe('SessionTitleControl', () => {
     expect(api.renameSlot).toHaveBeenCalledWith(SLOT, TITLE)
     // One shot: used, it is gone.
     expect(screen.queryByRole('button', { name: /^Undo/ })).toBeNull()
+  })
+
+  it('names the Undo for an untitled session "Untitled session", never its key, and still restores the raw value (#20871)', async () => {
+    const { store } = renderControl()
+    act(() => { store.dispatch(sseSlotTitle({ key: SLOT, title: SLOT })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
+    const undo = await screen.findByRole('button', { name: 'Undo: Untitled session' })
+    expect(undo.getAttribute('title')).toBe('Untitled session')
+    await act(async () => { fireEvent.click(undo) })
+    expect(storeTitle(store)).toBe(SLOT)
+  })
+
+  it('types out a generated title that replaces the "Untitled session" label (#20871)', async () => {
+    const { store } = renderControl()
+    act(() => { store.dispatch(sseSlotTitle({ key: SLOT, title: SLOT })) })
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(storeTitle(store)).toBe('Generated title'))
+    const trigger = screen.getByRole('button', { name: 'Generated title (rename session)' })
+    // Still typing: a strict prefix of the generated title is on screen.
+    const typed = trigger.textContent ?? ''
+    expect(typed.length).toBeLessThan('Generated title'.length)
+    expect('Generated title'.startsWith(typed)).toBe(true)
+    await waitFor(() => expect(trigger.textContent).toBe('Generated title'))
   })
 
   it('the Undo offer ends when the title moves on or the user starts another attempt', async () => {
@@ -269,6 +380,11 @@ describe('SessionTitleControl', () => {
     expect(screen.queryByRole('button', { name: /^Undo/ })).toBeNull()
     act(() => { fireEvent.keyDown(input, { key: 'Escape' }) })
     expect(storeTitle(store)).toBe('Generated title')
+    // Escape hands focus back to the title trigger, which is INSIDE the row and
+    // so holds the window open (the focus hold below). Move focus out first, as
+    // a user who has moved on would, so the timed close is what is measured.
+    await act(async () => { await new Promise(requestAnimationFrame) })
+    act(() => { (document.activeElement as HTMLElement | null)?.blur() })
     // Time-based close.
     vi.useFakeTimers()
     try {
@@ -327,7 +443,7 @@ describe('SessionTitleControl', () => {
   it('keyboard focus reveals what hover reveals: the Pen on a focus-visible title, the Auto-title button on its own focus', () => {
     renderControl()
     // Static contract on the class strings -- happy-dom does not compute :focus-visible.
-    const titleBtn = screen.getByRole('button', { name: TITLE })
+    const titleBtn = screen.getByRole('button', { name: RENAME })
     expect(titleBtn.className).toContain('group/title')
     const pen = titleBtn.querySelector('svg.lucide-pen') as SVGElement
     expect(pen.getAttribute('class')).toContain('group-focus-visible/title:opacity-60')
@@ -336,6 +452,16 @@ describe('SessionTitleControl', () => {
     // Both are reachable by Tab (not tabIndex -1).
     expect(titleBtn.getAttribute('tabindex')).toBe('0')
     expect(regen.getAttribute('tabindex')).not.toBe('-1')
+  })
+
+  it('the regenerate button names its action with a verb, not a state noun (#14443)', () => {
+    renderControl()
+    const regen = screen.getByRole('button', { name: REGEN })
+    // A noun label ("Auto-title") read as "this title is automatic" once Enter
+    // returned focus to the header and revealed it; the verb says what a press does.
+    expect(regen.textContent).toBe('Regenerate title')
+    expect(regen.getAttribute('aria-label')).toMatch(/^Regenerate title/)
+    expect(screen.queryByText(/Auto-title/)).toBeNull()
   })
 
   it('no Undo is offered when the generated title equals the current one', async () => {
@@ -353,10 +479,12 @@ describe('SessionTitleControl', () => {
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
     expect(screen.queryByRole('button', { name: REGEN })).toBeNull()
     // The busy state is named, not just drawn: the label stays beside the spinner.
-    expect(screen.getByRole('status').textContent).toBe('Auto-title…')
+    expect(screen.getByText('Generating title…').closest('[role="status"]')).not.toBeNull()
+    // The busy label is a progress phrase, never the button's imperative verb.
+    expect(screen.queryByText(/Regenerate title/)).toBeNull()
     await act(async () => { resolve({ title: 'Done' }) })
-    // Settled: the status region is gone and the Undo offer stands in the button's place.
-    await waitFor(() => expect(screen.queryByRole('status')).toBeNull())
+    // Settled: the busy status is gone and the Undo offer stands in the button's place.
+    await waitFor(() => expect(screen.queryByText('Generating title…')).toBeNull())
     expect(screen.getByRole('button', { name: `Undo: ${TITLE}` })).toBeTruthy()
   })
 
@@ -490,8 +618,271 @@ describe('SessionTitleControl', () => {
     expect(screen.getByText(TITLE)).toBeTruthy()
   })
 
-  it('keeps the memory-mode glyph in front of the title', () => {
+  // (e) Closing the editor never leaves focus on document.body.
+  const nextFrame = () => act(async () => { await new Promise(requestAnimationFrame) })
+  // A real, single Enter press: keydown commits (the input blurs), then the
+  // key is released.
+  const pressEnter = (input: HTMLElement) => {
+    act(() => { fireEvent.keyDown(input, { key: 'Enter' }) })
+    act(() => { fireEvent.blur(input) })
+    act(() => { fireEvent.keyUp(window, { key: 'Enter' }) })
+  }
+  const composer = () => screen.getByLabelText('Message input') as HTMLTextAreaElement
+  const status = () => screen.getByTestId('rename-status')
+  const triggerNamed = (title: string) => screen.getByRole('button', { name: `${title} (rename session)` })
+
+  it('(e) the title trigger is a tabbable button whose name says it renames and carries the title', () => {
+    renderControl()
+    const trigger = screen.getByRole('button', { name: RENAME })
+    expect(trigger.getAttribute('tabindex')).toBe('0')
+    expect(trigger.getAttribute('aria-label')).toMatch(/rename/i)
+    expect(trigger.getAttribute('aria-label')).toContain(TITLE)
+    // The polite region is mounted BEFORE any rename, empty, so its later text
+    // change is what gets announced.
+    expect(status().getAttribute('role')).toBe('status')
+    expect(status().getAttribute('aria-live')).toBe('polite')
+    expect(status().textContent).toBe('')
+  })
+
+  it('(e) activating the trigger opens the editor with focus in the input', async () => {
+    renderControl()
+    act(() => { fireEvent.keyDown(screen.getByRole('button', { name: RENAME }), { key: 'Enter' }) })
+    const input = screen.getByDisplayValue(TITLE) as HTMLInputElement
+    await waitFor(() => expect(document.activeElement).toBe(input))
+  })
+
+  it('(e) Enter commits, returns focus to the title trigger (now named for the new title), and announces the confirmed rename', async () => {
+    renderControl()
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: '  Renamed alpha  ' } }) })
+    pressEnter(input)
+    expect(api.renameSlot).toHaveBeenCalledWith(SLOT, 'Renamed alpha')
+    // The status region survived the editor's unmount (same element, not a remount).
+    const region = status()
+    await nextFrame()
+    await nextFrame()
+    expect(document.activeElement).toBe(triggerNamed('Renamed alpha'))
+    expect(document.activeElement).not.toBe(document.body)
+    expect(document.activeElement).not.toBe(composer())
+    await waitFor(() => expect(status().textContent).toBe('Session renamed to Renamed alpha'))
+    expect(status()).toBe(region)
+  })
+
+  it('(e) an unchanged draft closed with Enter still returns focus to the trigger, and announces nothing', async () => {
+    renderControl()
+    const input = openEditor()
+    pressEnter(input)
+    expect(api.renameSlot).not.toHaveBeenCalled()
+    await nextFrame()
+    await nextFrame()
+    expect(document.activeElement).toBe(triggerNamed(TITLE))
+    expect(status().textContent).toBe('')
+  })
+
+  it('(e) a refused rename never announces success', async () => {
+    vi.mocked(api.renameSlot).mockRejectedValueOnce(new Error('nope'))
+    const onError = vi.fn()
+    renderControl({ onError })
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Refused' } }) })
+    pressEnter(input)
+    await waitFor(() => expect(onError).toHaveBeenCalled())
+    await nextFrame()
+    expect(status().textContent).toBe('')
+  })
+
+  it('(e) Escape returns focus to the title trigger with the unchanged title in its name', async () => {
+    renderControl()
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Abandoned' } }) })
+    act(() => { fireEvent.keyDown(input, { key: 'Escape' }) })
+    act(() => { fireEvent.blur(input) })
+    expect(api.renameSlot).not.toHaveBeenCalled()
+    await nextFrame()
+    await nextFrame()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: RENAME }))
+    expect(document.activeElement).not.toBe(composer())
+  })
+
+  it('(e) a pointer blur commits but redirects focus nowhere', async () => {
+    renderControl()
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Tapped away' } }) })
+    // The user clicked another control: focus is theirs, on that target.
+    const target = screen.getByTestId('elsewhere')
+    act(() => { target.focus() })
+    act(() => { fireEvent.blur(input) })
+    expect(api.renameSlot).toHaveBeenCalledWith(SLOT, 'Tapped away')
+    await nextFrame()
+    await nextFrame()
+    expect(document.activeElement).not.toBe(composer())
+    expect(document.activeElement).toBe(target)
+  })
+
+  it('(e) the composer never gains focus or sees a key from the Enter that committed the rename', async () => {
+    // The composer sends on a plain Enter keydown and a posted turn has no
+    // undo. Whatever the user does with the Enter key around the commit (holds
+    // it, taps it twice, pauses), the composer must not become the target.
+    renderControl()
+    const composerKeys = vi.fn()
+    composer().addEventListener('keydown', composerKeys)
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Twice' } }) })
+    pressEnter(input)
+    await nextFrame()
+    const trigger = triggerNamed('Twice')
+    expect(document.activeElement).toBe(trigger)
+    // Second tap.
+    act(() => { fireEvent.keyDown(document.activeElement as Element, { key: 'Enter' }) })
+    act(() => { fireEvent.keyUp(window, { key: 'Enter' }) })
+    await act(async () => { await new Promise((r) => setTimeout(r, 50)) })
+    expect(document.activeElement).not.toBe(composer())
+    expect(composerKeys).not.toHaveBeenCalled()
+  })
+
+  it('(e) while Enter is still held, auto-repeat on the newly focused trigger does not reopen the editor', async () => {
+    // OS auto-repeat: more keydowns before any keyup. The trigger activates on
+    // Enter keydown, so without the guard the rename would reopen at once.
+    renderControl()
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Held' } }) })
+    act(() => { fireEvent.keyDown(input, { key: 'Enter' }) })
+    act(() => { fireEvent.blur(input) })
+    await nextFrame()
+    const trigger = triggerNamed('Held')
+    expect(document.activeElement).toBe(trigger)
+    act(() => { fireEvent.keyDown(trigger, { key: 'Enter', repeat: true }) })
+    act(() => { fireEvent.keyDown(trigger, { key: 'Enter', repeat: true }) })
+    expect(screen.queryByDisplayValue('Held')).toBeNull()
+    expect(document.activeElement).toBe(trigger)
+    // Released: a fresh Enter is a real request to rename again.
+    act(() => { fireEvent.keyUp(window, { key: 'Enter' }) })
+    act(() => { fireEvent.keyDown(trigger, { key: 'Enter' }) })
+    expect(screen.getByDisplayValue('Held')).toBeTruthy()
+  })
+
+  it('(e) a hold longer than any grace period still does not reopen the editor, and a fresh press does', async () => {
+    // The guard reads e.repeat, not a clock: an Enter held for seconds after
+    // the commit keeps arriving as repeat keydowns and none of them count.
+    vi.useFakeTimers()
+    try {
+      renderControl()
+      const input = openEditor()
+      act(() => { fireEvent.change(input, { target: { value: 'Lost' } }) })
+      act(() => { fireEvent.keyDown(input, { key: 'Enter' }) })
+      act(() => { fireEvent.blur(input) })
+      act(() => { vi.advanceTimersByTime(20) })
+      await act(async () => { await Promise.resolve() })
+      const trigger = triggerNamed('Lost')
+      expect(document.activeElement).toBe(trigger)
+      for (let i = 0; i < 5; i++) {
+        act(() => { vi.advanceTimersByTime(1000) })
+        act(() => { fireEvent.keyDown(trigger, { key: 'Enter', repeat: true }) })
+        expect(screen.queryByDisplayValue('Lost')).toBeNull()
+      }
+      // Released and pressed again: a fresh (non-repeat) Enter reopens.
+      act(() => { fireEvent.keyUp(trigger, { key: 'Enter' }) })
+      act(() => { fireEvent.keyDown(trigger, { key: 'Enter' }) })
+      expect(screen.getByDisplayValue('Lost')).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('(e) a pointer click on the trigger right after the commit still opens the editor', async () => {
+    // The held-key guard is about KEYBOARD activation only; a mouse user who
+    // commits with Enter and clicks the title again gets the editor.
+    renderControl()
+    const input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Clicked' } }) })
+    act(() => { fireEvent.keyDown(input, { key: 'Enter' }) })
+    act(() => { fireEvent.blur(input) })
+    await nextFrame()
+    act(() => { fireEvent.click(triggerNamed('Clicked')) })
+    expect(screen.getByDisplayValue('Clicked')).toBeTruthy()
+  })
+
+  it('(e) Auto-title announces the generated name through the same region, and only once it lands', async () => {
+    let resolve: (v: { title: string }) => void = () => {}
+    vi.mocked(api.generateTitle).mockReturnValueOnce(new Promise((r) => { resolve = r }))
+    renderControl()
+    act(() => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    expect(status().textContent).toBe('')
+    await act(async () => { resolve({ title: 'Generated title' }) })
+    await waitFor(() => expect(status().textContent).toBe('Session renamed to Generated title'))
+  })
+
+  it('(e) an Auto-title that comes back identical to the current name announces nothing', async () => {
+    vi.mocked(api.generateTitle).mockResolvedValueOnce({ title: TITLE })
+    renderControl()
+    act(() => { fireEvent.click(screen.getByRole('button', { name: REGEN })) })
+    await waitFor(() => expect(api.generateTitle).toHaveBeenCalled())
+    await nextFrame()
+    expect(status().textContent).toBe('')
+  })
+
+  it('(e) a confirmed rename back to an already-announced name is announced again', async () => {
+    // A live region announces text CHANGES only, so the region is emptied when
+    // an attempt starts; otherwise Alpha -> Beta, Auto-title, Undo (Beta again)
+    // would write the identical string and say nothing.
+    renderControl()
+    let input = openEditor()
+    act(() => { fireEvent.change(input, { target: { value: 'Beta' } }) })
+    await pressEnter(input)
+    await waitFor(() => expect(status().textContent).toBe('Session renamed to Beta'))
+    input = openEditorFor('Beta')
+    act(() => { fireEvent.change(input, { target: { value: 'Gamma' } }) })
+    await pressEnter(input)
+    await waitFor(() => expect(status().textContent).toBe('Session renamed to Gamma'))
+    let released: (v: unknown) => void = () => {}
+    vi.mocked(api.renameSlot).mockReturnValueOnce(new Promise((r) => { released = r }))
+    input = openEditorFor('Gamma')
+    act(() => { fireEvent.change(input, { target: { value: 'Beta' } }) })
+    await pressEnter(input)
+    // Emptied while the write is in flight, so the confirmation is a change.
+    await waitFor(() => expect(status().textContent).toBe(''))
+    await act(async () => { released({}) })
+    await waitFor(() => expect(status().textContent).toBe('Session renamed to Beta'))
+  })
+
+  it('keeps the memory-mode glyph inside the trigger, its text in the name, and clickable to rename', () => {
     renderControl({ memoryMode: 'incognito' })
-    expect(screen.getByTitle('Incognito — memory writes disabled')).toBeTruthy()
+    const glyph = screen.getByTestId('memory-mode-glyph')
+    // The trigger's `aria-label` prunes its subtree from the accessible name,
+    // so the glyph's tooltip is folded into that label after the title (WCAG
+    // 2.5.3 keeps the visible text first) instead of being lost.
+    const trigger = screen.getByRole('button', { name: `${RENAME}, Incognito — memory writes disabled` })
+    expect(trigger.contains(glyph)).toBe(true)
+    expect(glyph.getAttribute('title')).toBe('Incognito — memory writes disabled')
+    // A click on the glyph itself opens the editor, as it did before the label.
+    fireEvent.click(glyph)
+    expect(screen.getByDisplayValue(TITLE)).toBeTruthy()
+    // Beside the editor the glyph names itself.
+    expect(screen.getByRole('img', { name: 'Incognito — memory writes disabled' })).toBeTruthy()
+  })
+
+  it('marks a pinned session beside the title and follows a pin toggled elsewhere', () => {
+    // The header menu's Pin moves the sidebar row into the pinned group, often
+    // out of view, so the header is where the user sees whether it took.
+    const { store } = renderControl()
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    const glyph = screen.getByTestId('session-pinned-glyph')
+    expect(glyph.getAttribute('title')).toBe('Pinned')
+    const trigger = screen.getByRole('button', { name: `${RENAME}, Pinned` })
+    expect(trigger.contains(glyph)).toBe(true)
+    // Beside the editor it names itself, as the memory glyph does.
+    fireEvent.click(glyph)
+    expect(screen.getByRole('img', { name: 'Pinned' })).toBeTruthy()
+    act(() => { fireEvent.keyDown(screen.getByDisplayValue(TITLE), { key: 'Escape' }) })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: false })) })
+    expect(screen.queryByTestId('session-pinned-glyph')).toBeNull()
+    expect(screen.getByRole('button', { name: RENAME })).toBeTruthy()
+  })
+
+  it('orders the pin before the memory-mode glyph in the trigger name', () => {
+    const { store } = renderControl({ memoryMode: 'incognito' })
+    act(() => { store.dispatch(updateSlotPin({ key: SLOT, pinned: true })) })
+    expect(screen.getByRole('button', { name: `${RENAME}, Pinned, Incognito — memory writes disabled` })).toBeTruthy()
   })
 })

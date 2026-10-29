@@ -1,6 +1,6 @@
 /**
  * `artifact_update` WebSocket frame -> react-query cache, through the real
- * dispatch adapter in `useWebSocket.ts`.
+ * dispatch adapter (`hooks/websocket/serverState.ts`, routed by `useWebSocket.ts`).
  *
  * This is the live-refresh half of the artifact companion chat: the backend
  * broadcasts from its artifact mutation funnel, and the client must turn that
@@ -10,11 +10,13 @@
  * emit a window event so a detail page can navigate away rather than serve
  * content that no longer exists.
  */
-import { renderHook, act } from '@testing-library/react'
+import { renderHook, act, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import { Provider } from 'react-redux'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient, QueryClientProvider, QueryObserver } from '@tanstack/react-query'
 import { createTestStore } from './helpers'
+import { sseSlots } from '../store/dashboardSlice'
+import { store } from '../store'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { setArtifactEditing, __resetArtifactEditing } from '../utils/artifactEditGuard'
 
@@ -25,6 +27,7 @@ vi.mock('../api/client', () => ({
     approvals: vi.fn().mockResolvedValue([]),
     notifications: vi.fn().mockResolvedValue({ notifications: [], unread: 0 }),
     chatSlotDetail: vi.fn().mockResolvedValue({ messages: [], running: false, has_more: false, total: 0, queue: [] }),
+    workflowRuns: vi.fn().mockResolvedValue({ runs: [] }),
   },
 }))
 
@@ -90,6 +93,167 @@ describe('useWebSocket artifact_update frame', () => {
     expect(keys).toContain(JSON.stringify(['artifact-comments', 'cr-queue']))
     // The library list ordering is driven by updated_at, so it refreshes too.
     expect(keys).toContain(JSON.stringify(['artifacts']))
+  })
+
+  it('refreshes the task-dashboard inventory the idle dock does not poll', () => {
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    send({ slug: 'release-map', version: 1, deleted: false })
+    expect(spy.mock.calls.map(c => JSON.stringify(c[0]?.queryKey))).toContain(JSON.stringify(['command-center', 'artifacts']))
+  })
+
+  it('re-reads exactly the grown slot\'s board and its ancestors\' boards, never cancelling a read in flight', async () => {
+    const team = [
+      { key: 'root', messages: 1, running: false }, { key: 'worker', messages: 1, running: false, created_by: 'root' },
+      { key: 'other', messages: 1, running: false },
+    ]
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    // Let the open's own slot refresh settle before seeding the team over it.
+    await act(async () => { ws.simulateOpen(); await new Promise(resolve => setTimeout(resolve, 0)) })
+    // The hook reads the app's module store, as its other handlers do.
+    act(() => { store.dispatch(sseSlots(team)) })
+    spy.mockClear()
+    act(() => { ws.simulateMessage({ type: 'slot_projection', data: { slot: 'dashboard:worker' } }) })
+    const work = spy.mock.calls.filter(c => (c[0]?.queryKey as unknown[] | undefined)?.[2] === 'work')
+    expect(work.map(c => c[0]?.queryKey)).toEqual([['command-center', 'worker', 'work'], ['command-center', 'root', 'work']])
+    expect(work.every(c => c[0]?.exact === true && c[1]?.cancelRefetch === false)).toBe(true)
+    spy.mockClear()
+    act(() => { ws.simulateMessage({ type: 'slot_projection', data: {} }) })
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  it('seeds only the frame\'s own board and re-reads its ancestors\' boards', async () => {
+    const team = [
+      { key: 'root', messages: 1, running: false }, { key: 'worker', messages: 1, running: false, created_by: 'root' },
+    ]
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    await act(async () => { ws.simulateOpen(); await new Promise(resolve => setTimeout(resolve, 0)) })
+    act(() => { store.dispatch(sseSlots(team)) })
+    qc.setQueryData(['command-center', 'root', 'work'], { value: { items: [{ item_id: 'root-own' }] } })
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    act(() => {
+      ws.simulateMessage({
+        type: 'slot_projection',
+        data: { slot: 'dashboard:worker', fold: 'work', revision: 3, value: { items: [{ item_id: 'worker-own' }] } },
+      })
+    })
+    // The worker's board took the pushed value; the root kept ITS OWN board and is re-read.
+    expect(qc.getQueryData<{ value: { items: { item_id: string }[] } }>(['command-center', 'worker', 'work'])?.value.items)
+      .toEqual([{ item_id: 'worker-own' }])
+    expect(qc.getQueryData<{ value: { items: { item_id: string }[] } }>(['command-center', 'root', 'work'])?.value.items)
+      .toEqual([{ item_id: 'root-own' }])
+    const keys = spy.mock.calls.map(c => JSON.stringify(c[0]?.queryKey))
+    expect(keys).toContain(JSON.stringify(['command-center', 'root', 'work']))
+    expect(keys).not.toContain(JSON.stringify(['command-center', 'worker', 'work']))
+  })
+
+  it('takes no floor from the subscribe frame, so the frame that delivers 5 still lands', async () => {
+    // A revision the server merely ANNOUNCES is not a number this tab may judge
+    // anything by: it has not received that value. Recorded as a floor, it both
+    // held a cached board hostage and dropped the very frame carrying 5.
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    await act(async () => { ws.simulateOpen(); await new Promise(resolve => setTimeout(resolve, 0)) })
+    qc.setQueryData(['command-center', 'root', 'work'], { value: { items: [{ item_id: 'cached' }] }, revision: 4 })
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    act(() => {
+      ws.simulateMessage({
+        type: 'slot_projection/subscribed',
+        data: { revisions: { 'dashboard:root': { work: 5 } } },
+      })
+    })
+    // Nothing is re-read and nothing is dropped: the frame carries no instruction.
+    expect(spy.mock.calls.filter(c => (c[0]?.queryKey as unknown[] | undefined)?.[2] === 'work')).toEqual([])
+    expect(qc.getQueryData<{ revision: number }>(['command-center', 'root', 'work'])?.revision).toBe(4)
+    // And the announced revision is still free to arrive as a value.
+    act(() => {
+      ws.simulateMessage({
+        type: 'slot_projection',
+        data: { slot: 'dashboard:root', fold: 'work', revision: 5, value: { items: [{ item_id: 'delivered' }] } },
+      })
+    })
+    expect(qc.getQueryData<{ value: { items: { item_id: string }[] } }>(['command-center', 'root', 'work'])?.value.items)
+      .toEqual([{ item_id: 'delivered' }])
+  })
+
+  it('a pushed frame above a cached board replaces it', async () => {
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    await act(async () => { ws.simulateOpen(); await new Promise(resolve => setTimeout(resolve, 0)) })
+    qc.setQueryData(['command-center', 'root', 'work'], { value: { items: [{ item_id: 'old' }] }, revision: 4 })
+    act(() => {
+      ws.simulateMessage({
+        type: 'slot_projection',
+        data: { slot: 'dashboard:root', fold: 'work', revision: 6, value: { items: [{ item_id: 'new' }] } },
+      })
+    })
+    expect(qc.getQueryData<{ revision: number }>(['command-center', 'root', 'work'])?.revision).toBe(6)
+  })
+
+  it('follows a work read that was in flight with one more read once it settles', async () => {
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+    let release!: (value: { value: { items: never[] } }) => void
+    let reads = 0
+    const queryFn = () => { reads += 1; return reads === 1 ? new Promise<{ value: { items: never[] } }>(resolve => { release = resolve }) : Promise.resolve({ value: { items: [] } }) }
+    const observer = new QueryObserver(qc, { queryKey: ['command-center', 'root', 'work'], queryFn })
+    const unsubscribe = observer.subscribe(() => undefined)
+    await waitFor(() => expect(reads).toBe(1))
+    act(() => { ws.simulateMessage({ type: 'slot_projection', data: { slot: 'root' } }) })
+    expect(reads).toBe(1) // not cancelled and restarted
+    await act(async () => { release({ value: { items: [] } }) })
+    await waitFor(() => expect(reads).toBe(2))
+    unsubscribe()
+  })
+
+  it('re-reads the crew-log panel on every (re)connect, re-basing it on the process now serving', () => {
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+    const prefix = JSON.stringify(['crew-log-projections'])
+    expect(spy.mock.calls.filter(c => JSON.stringify(c[0]?.queryKey) === prefix)).toHaveLength(1)
+    act(() => { ws.onclose?.(new CloseEvent('close')) })
+    spy.mockClear()
+    act(() => { WS_INSTANCES[WS_INSTANCES.length - 1].simulateOpen() })
+    expect(spy.mock.calls.filter(c => JSON.stringify(c[0]?.queryKey) === prefix)).toHaveLength(1)
+  })
+
+  it('re-reads the shared approvals inventory on reconnect', () => {
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+    act(() => { ws.onclose?.(new CloseEvent('close')) })
+    spy.mockClear()
+    const next = WS_INSTANCES[WS_INSTANCES.length - 1]
+    act(() => { next.simulateOpen() })
+    expect(spy.mock.calls.map(c => JSON.stringify(c[0]?.queryKey))).toContain(JSON.stringify(['global-approvals']))
+  })
+
+  it('hands the connect-time workflow read to the command center snapshot', async () => {
+    const { api } = await import('../api/client')
+    const out = { runs: [{ run_id: 'r9', status: 'finished', session_key: 'root' }] }
+    vi.mocked(api.workflowRuns).mockResolvedValueOnce(out)
+    renderHook(() => useWebSocket(), { wrapper })
+    await act(async () => { WS_INSTANCES[0].simulateOpen(); await new Promise(resolve => setTimeout(resolve, 0)) })
+    expect(qc.getQueryData(['command-center', 'workflows'])).toEqual(out)
+  })
+
+  it.each(['run_finished', 'run_failed', 'run_cancelled'])('re-reads the workflow snapshot on %s, not on progress', type => {
+    const spy = vi.spyOn(qc, 'invalidateQueries')
+    renderHook(() => useWebSocket(), { wrapper })
+    const ws = WS_INSTANCES[0]
+    act(() => { ws.simulateOpen() })
+    spy.mockClear()
+    const workflows = () => spy.mock.calls.filter(c => JSON.stringify(c[0]?.queryKey) === JSON.stringify(['command-center', 'workflows'])).length
+    act(() => { ws.simulateMessage({ type: 'workflow_run_event', data: { run_id: 'r1', type: 'step_started', data: {} } }) })
+    expect(workflows()).toBe(0)
+    act(() => { ws.simulateMessage({ type: 'workflow_run_event', data: { run_id: 'r1', type, data: {} } }) })
+    expect(workflows()).toBe(1)
   })
 
   it('emits a window event on delete WITHOUT evicting the artifact query', () => {

@@ -82,7 +82,7 @@ def _state(**overrides: object) -> MonitorState:
         "target": "owner/repo/pull/1",
         "objective": "review_ready",
         "created_ts": 0.0,
-        "budgets": MonitorBudgets(max_runtime_secs=10_000_000),
+        "budgets": MonitorBudgets(max_runtime_secs=2_592_000),
     }
     values.update(overrides)
     return MonitorState(**values)  # type: ignore[arg-type]

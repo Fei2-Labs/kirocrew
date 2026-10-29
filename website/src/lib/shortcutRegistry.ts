@@ -133,8 +133,22 @@ export const SHORTCUT_REGISTRY: readonly ShortcutEntry[] = [
   { id: 'chat-next', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: 'ArrowRight', alt: true }) },
   { id: 'chat-prev-bracket', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: '[', mod: true }) },
   { id: 'chat-next-bracket', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: ']', mod: true }) },
-  { id: 'chat-mru', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: '`', alt: true }) },
-  { id: 'chat-mru-back', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: '`', alt: true, shift: true }) },
+  // MRU walk. On macOS Option+` is the grave-accent dead key: it composes è
+  // instead of reaching the handler as a clean chord, and claiming it would
+  // eat the accent for anyone typing one. Holding Control takes the key out of
+  // the layout's dead-key map. ⌃` alone is the terminal toggle
+  // (panelToggleShortcuts), and ⌘` is the OS window cycler, so the Mac chord
+  // is ⌃⌥`. Alt+` stays the chord on Windows/Linux.
+  { id: 'chat-mru', group: 'chat-navigation', dispatch: 'code',
+    defaults: mac({ key: '`', ctrl: true, alt: true }, { key: '`', alt: true }) },
+  { id: 'chat-mru-back', group: 'chat-navigation', dispatch: 'code',
+    defaults: mac({ key: '`', ctrl: true, alt: true, shift: true }, { key: '`', alt: true, shift: true }) },
+  // Previous/next turn of the open chat — the pinned-prompt jump, stepped from
+  // the keyboard (pages/chat/turnStep). Alt+↑/↓ on both platforms, the vertical
+  // twin of Alt+←/→ above, and like it kept out of text fields, where
+  // Option+↑/↓ is paragraph movement on macOS.
+  { id: 'turn-prev', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: 'ArrowUp', alt: true }) },
+  { id: 'turn-next', group: 'chat-navigation', dispatch: 'code', defaults: both({ key: 'ArrowDown', alt: true }) },
   // ---- Panel navigation (code-driven: CORE_PANEL_MAP + the extension seam) ---
   { id: 'nav-chat', group: 'panel-navigation', dispatch: 'code', defaults: both({ key: 'c', alt: true }) },
   { id: 'nav-notifications', group: 'panel-navigation', dispatch: 'code', defaults: both({ key: 'n', alt: true }) },
@@ -205,11 +219,20 @@ export const SHORTCUT_REGISTRY: readonly ShortcutEntry[] = [
   { id: 'toggle-focus-mode', group: 'actions', dispatch: 'registry', defaults: both({ key: 'm', alt: true, shift: true }) },
   // Dispatched by ChatInput, not the global handler; listed for the reference.
   { id: 'optimize-prompt', group: 'actions', dispatch: 'code', defaults: both({ key: 'Enter', mod: true, shift: true }) },
+  // ⌘↑ on macOS / Ctrl+↑ elsewhere — edit the last user message.
+  // Dispatched by the composer (both the Lexical editor and the textarea
+  // fallback), not the global handler; listed for the reference so the
+  // shortcuts modal advertises it alongside the other composer bindings.
+  { id: 'edit-last-message', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowUp', mod: true }) },
   // Literal Ctrl on every platform — see isAgentMonitorChord for why this one
   // does NOT follow the ⌘-on-Mac convention (`ctrl`, not `mod`, on both).
   { id: 'agent-monitor', group: 'actions', dispatch: 'code', defaults: both({ key: 'g', ctrl: true }) },
   // Bare Escape, handled by a capture-phase listener; listed for the reference.
   { id: 'stop-speaking', group: 'actions', dispatch: 'code', defaults: both({ key: 'Escape' }) },
+  // Bare Up/Down, handled by NotificationFeed while one of its rows has focus
+  // (inbox page and bell sheet); listed for the reference.
+  { id: 'notification-prev', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowUp' }) },
+  { id: 'notification-next', group: 'actions', dispatch: 'code', defaults: both({ key: 'ArrowDown' }) },
   // ---- Remote instances (useInstanceShortcuts, Electron only) ---------------
   // 1 = Local, 2..6 = the 1st..5th remote instance, matching the InstanceTabBar
   // left-to-right order.
@@ -290,7 +313,10 @@ export function loadShortcutOverrides(): ShortcutOverrides {
 // cannot be tested against a real one. That PR adds the writer beside its form;
 // the contract it must honour is the reader above (registry ids only, `null` =
 // unbound, valid chords normalized, broadcast SHORTCUT_OVERRIDES_EVENT after
-// writing SHORTCUT_OVERRIDES_KEY).
+// writing SHORTCUT_OVERRIDES_KEY). The same change must also list
+// SHORTCUT_OVERRIDES_KEY in `DURABLE_PREF_KEYS` (lib/uiPrefs.ts), so a rebound
+// shortcut survives an upgrade like the other Settings → Shortcuts choices. A
+// key joins that allowlist together with its writer.
 
 // ---- Resolution -------------------------------------------------------------
 
@@ -333,9 +359,11 @@ export function resolveShortcuts(overrides: ShortcutOverrides, platform: Shortcu
  * AltGr) the physical US-QWERTY key still works, matching how every chord in
  * `useKeyboardShortcuts` has always been matched. Not mapped: `NumpadEnter`
  * (the handler has always compared `code === 'Enter'`, so the numpad key is not
- * the same chord) and the numpad digits.
+ * the same chord) and the numpad digits. Shared with the panel-toggle /
+ * quick-search recorder (`quickSearchShortcut.eventKeyToken`) so both chord
+ * families read punctuation the same way.
  */
-const CODE_TOKENS: Readonly<Record<string, string>> = {
+export const CODE_TOKENS: Readonly<Record<string, string>> = {
   Comma: ',', Period: '.', Slash: '/', Backslash: '\\', BracketLeft: '[', BracketRight: ']',
   Backquote: '`', Minus: '-', Equal: '=', Semicolon: ';', Quote: "'",
 }

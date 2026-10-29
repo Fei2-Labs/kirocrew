@@ -46,6 +46,7 @@ from kiro_crew.memory_stores import (
 )
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.snapshot import restore_main
+from kiro_crew.testing.wait import wait_until
 
 STORE = "acme"
 ROOT = MEMORY_STORES_DIR_NAME
@@ -912,16 +913,36 @@ class TestThePortabilityRoutesAreOwnerOnly:
     async def test_a_non_owner_cannot_export(self, handlers):
         ph, events = handlers
         called = []
-        with patch.object(ph, "create_export_zip", lambda: called.append(1) or (b"x", {})):
+        with patch.object(ph, "plan_export", lambda **_kw: called.append(1) or object()):
             resp = await ph.api_portability_export(
                 self._request("GET", "/api/portability/export", user="slack-participant")
             )
         assert resp.status == 403
-        assert called == [], "the archive must not even be built for a non-owner"
+        assert called == [], "the archive must not even be planned for a non-owner"
 
     async def test_the_owner_can_export(self, handlers):
         ph, _ = handlers
-        with patch.object(ph, "create_export_zip", lambda: (b"zip", {"created_at": "t"})):
+
+        class _Plan:
+            prefix = "kirocrew-export-t"
+            created_at = "2026-01-01T00:00:00Z"
+            include_sessions = False
+            memory_only = False
+            include_agent_templates = False
+            bundled_templates: list[str] = []
+            agent_templates_past_cap = 0
+            session_plan = None
+            sessions_skipped = 0
+
+        def _stream(write, _plan):
+            write(b"zip")
+            return {"created_at": "t", "contents": {}}
+
+        with (
+            patch.object(ph, "plan_export", lambda **_kw: _Plan()),
+            patch.object(ph, "stream_export_zip", _stream),
+            patch.object(ph, "unbundled_agent_templates", lambda *a, **k: ([], 0)),
+        ):
             resp = await ph.api_portability_export(
                 self._request("GET", "/api/portability/export", user="local-app")
             )
@@ -930,7 +951,7 @@ class TestThePortabilityRoutesAreOwnerOnly:
     async def test_a_non_owner_cannot_import(self, handlers, tmp_path):
         ph, _ = handlers
         applied = []
-        with patch.object(ph, "apply_import_zip", lambda p, m: applied.append(1)):
+        with patch.object(ph, "apply_import_zip", lambda p, m, **_kw: applied.append(1)):
             resp = await ph.api_portability_import(
                 self._request("POST", "/api/portability/import?mode=merge", user="guest")
             )
@@ -945,7 +966,7 @@ class TestThePortabilityRoutesAreOwnerOnly:
         async def _fake_read_upload(request):
             return upload, None
 
-        def _refuse(p, m):
+        def _refuse(p, m, **_kw):
             raise snap.SourceComponentUnsound("memory_stores/acme/memory.db is torn")
 
         with (
@@ -1288,7 +1309,8 @@ def test_provisioning_waits_for_replace_and_rollback(
             future = worker.submit(create)
             futures.append(future)
             if without_namespace:
-                future.result(timeout=10)
+                wait_until(future.done)
+                future.result()
             else:
                 assert pending.wait(timeout=10), "creator must reach namespace admission"
             mutate(*args, **kwargs)
@@ -1301,7 +1323,8 @@ def test_provisioning_waits_for_replace_and_rollback(
                 snap._do_replace(src, destination, ["memory"], allow_unpinned=True)
         else:
             snap._do_replace(src, destination, ["memory"], allow_unpinned=True)
-        name = futures[0].result(timeout=10)
+        wait_until(futures[0].done)
+        name = futures[0].result()
     store = destination / ROOT / name
     assert store.exists() is not without_namespace
     if not without_namespace:
@@ -1409,7 +1432,8 @@ def test_file_only_writes_serialize_with_replace(
             future = worker.submit(getattr(target, method), *args)
             futures.append(future)
             if without_admission:
-                future.result(timeout=10)
+                wait_until(future.done)
+                future.result()
             else:
                 assert pending.wait(timeout=10)
             mutate(*call_args, **kwargs)
@@ -1422,7 +1446,8 @@ def test_file_only_writes_serialize_with_replace(
                 snap._do_replace(source, destination, ["memory"], allow_unpinned=True)
         else:
             snap._do_replace(source, destination, ["memory"], allow_unpinned=True)
-        futures[0].result(timeout=10)
+        wait_until(futures[0].done)
+        futures[0].result()
     files = list((destination / ROOT / STORE).rglob("*.md"))
     files += list((destination / ROOT / STORE).glob("*.jsonl"))
     survived = any("acknowledged" in path.read_text(encoding="utf-8") for path in files)
@@ -1645,7 +1670,8 @@ def test_cold_vector_open_waits_until_replace_or_rollback_finishes(
                 future = worker.submit(open_and_write)
                 futures.append(future)
                 if without_namespace:
-                    future.result(timeout=10)
+                    wait_until(future.done)
+                    future.result()
                 else:
                     assert started.wait(timeout=10)
                     assert not database.parent.exists()
@@ -1659,7 +1685,8 @@ def test_cold_vector_open_waits_until_replace_or_rollback_finishes(
                     snap._do_replace(src, destination, ["memory"], allow_unpinned=True)
             else:
                 snap._do_replace(src, destination, ["memory"], allow_unpinned=True)
-            futures[0].result(timeout=10)
+            wait_until(futures[0].done)
+            futures[0].result()
         assert database.exists() is not without_namespace
     finally:
         store.close()

@@ -193,6 +193,17 @@ describe('send() when creating the session fails', { timeout: 20_000 }, () => {
     expect(errs[0].content).toContain('Could not start a new session')
   })
 
+  it('does not ask for the default sidebar folder on an auto-send launch', async () => {
+    // Projects / Dev Fleet / Prompts launch through ?autoSend=1&newSession=1.
+    // That chat is the page's, not a New the person pressed, so it stays
+    // unfiled instead of taking the default folder's project and agent.
+    createChatSlot.mockRejectedValue(new Error('gateway unavailable'))
+    await renderPage(makeStore())
+    await waitFor(() => expect(createChatSlot).toHaveBeenCalled())
+    // The 12th argument is `defaultFolder` (see api.createChatSlot).
+    for (const call of createChatSlot.mock.calls) expect(call[11]).toBeFalsy()
+  })
+
   it('merges into an existing composer draft instead of overwriting it', async () => {
     // The reachable forceNew path passes the prompt as optionText, so send()
     // never clears the composer: the user's own draft is still sitting there.
@@ -300,6 +311,34 @@ describe('send() when creating the session fails', { timeout: 20_000 }, () => {
     expect(createChatSlot).not.toHaveBeenCalled()
     await waitFor(() => expect(sendChat).toHaveBeenCalled())
     expect(sendChat.mock.calls[0][1]).toBe('slot-b')
+  })
+
+  it('puts the bubble in the new session when the user went away and back during the create', async () => {
+    // A->B->A while the create is in flight: `forkMayOpen` refuses the
+    // activation, so slot-a stays on screen. The bubble belongs to slot-c,
+    // the session the turn is posted to, never to slot-a's transcript.
+    let resolveCreate: (v: unknown) => void = () => {}
+    createChatSlot.mockImplementation(() => new Promise(res => { resolveCreate = res }))
+    const store = makeStore()
+    await renderPage(store)
+    await waitFor(() => expect(createChatSlot).toHaveBeenCalled())
+
+    await act(async () => {
+      store.dispatch(setActiveSlot('slot-b'))
+      store.dispatch(setActiveSlot('slot-a'))
+      await Promise.resolve()
+    })
+    await act(async () => {
+      resolveCreate({ key: 'slot-c', title: 'slot-c', messages: 0, running: false })
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(sendChat).toHaveBeenCalled())
+    expect(sendChat.mock.calls[0][1]).toBe('slot-c')
+    const chat = store.getState().chat
+    expect(chat.activeSlot).toBe('slot-a')
+    expect(chat.messages.filter(m => m.role === 'user')).toHaveLength(0)
+    expect((chat.slotMessages['slot-c'] ?? []).map(m => m.content)).toContain('do not lose me')
   })
 
   it('does not double the payload when the composer already holds it', async () => {

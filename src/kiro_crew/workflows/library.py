@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slugs import slug_hash_fallback
 from kiro_crew.workflows.store import default_workflow_library_dir
@@ -136,7 +137,7 @@ class WorkflowDefinitionLibrary:
         try:
             temp_path.write_text(payload, encoding="utf-8")
             platform_compat.restrict_to_owner(temp_path)
-            os.replace(temp_path, path)
+            replace_with_retry(temp_path, path)
         except Exception:
             try:
                 temp_path.unlink(missing_ok=True)
@@ -212,6 +213,35 @@ class WorkflowDefinitionLibrary:
         slug: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Append a revision, or return ``None`` on missing/stale definitions."""
+        # Each service has its own in-process lock.  The definition library is
+        # shared by gateway and adapted harness processes, so the read, revision
+        # check, and replacement must also share a cross-process lock.
+        platform_compat.make_owner_only_dir(self._library_dir)
+        lock_path = self._library_dir / ".revisions.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            with platform_compat.file_lock(fd, exclusive=True, wait=True):
+                return self._update_unlocked(
+                    workflow_id,
+                    source=source,
+                    expected_revision=expected_revision,
+                    name=name,
+                    description=description,
+                    slug=slug,
+                )
+        finally:
+            os.close(fd)
+
+    def _update_unlocked(
+        self,
+        workflow_id: str,
+        *,
+        source: str,
+        expected_revision: int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        slug: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
         current = self.get(workflow_id)
         if current is None or current.get("revision") != expected_revision:
             return None

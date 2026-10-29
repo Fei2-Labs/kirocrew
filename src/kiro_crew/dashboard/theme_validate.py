@@ -341,6 +341,8 @@ _THEME_FILE_CAPS = {
     "logo": 100 * 1024,
     "favicon": 50 * 1024,
     "wordmark": 100 * 1024,
+    # Loader-art headroom: the welcome image may be an animated WebP/GIF.
+    "welcome": 256 * 1024,
     "preview": 512 * 1024,
     "overlay": 200 * 1024,
     "topbar": 100 * 1024,
@@ -424,6 +426,10 @@ _THEME_OVERLAY_DEFAULT_ZINDEX = 40
 _THEME_OVERLAY_MAX_ZINDEX = 9999
 _THEME_OVERLAY_DEFAULT_ANIMATION = "continuous"
 _THEME_OVERLAY_DEFAULT_TRIGGER = "continuous"
+# "behind" paints under the nav/chat/panels; it must be click-through because
+# the content above covers it everywhere, so its clicks could never arrive.
+_THEME_OVERLAY_LAYERS = frozenset({"above", "behind"})
+_THEME_OVERLAY_DEFAULT_LAYER = "above"
 # A pack HTML ``src`` names a single ``.html`` file, optionally prefixed with its
 # subdir (``overlays/foo.html`` or ``foo.html``); resolved under that subdir.
 _THEME_PACK_HTML_SRC_RE = re.compile(r"^(?:(overlays|topbar)/)?([a-z0-9_-]{1,64})\.html$")
@@ -538,6 +544,8 @@ def _classify_theme_file(rel: str) -> tuple[str | None, int]:
             return "favicon", 1
         if stem == "wordmark" and ext in ("svg", "png"):
             return "wordmark", 1
+        if stem == "welcome" and ext in ("svg", "png", "webp", "gif"):
+            return "welcome", 1
         if stem == "preview" and ext in ("png", "webp"):
             return "preview", 1
     if top == "overlays" and len(parts) == 2 and ext == "html":
@@ -557,7 +565,6 @@ def _classify_theme_file(rel: str) -> tuple[str | None, int]:
 # elements are exempt from the interaction/viewport-cover rejections — this is
 # the decorative-scanline idiom (``body::before,body::after{position:fixed;
 # inset:0;pointer-events:none}``), inert decoration that MUST still validate.
-_CSS_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _THEME_DECORATIVE_PSEUDO = frozenset(
     {"body::before", "body::after", "body:before", "body:after"}
 )
@@ -1026,6 +1033,11 @@ def _validate_overlay_decls(manifest: dict[str, Any], theme_dir: Path) -> str | 
         pe = entry.get("pointerEvents", False)
         if not isinstance(pe, bool):
             return f"overlay '{oid}' pointerEvents must be a boolean"
+        layer = entry.get("layer", _THEME_OVERLAY_DEFAULT_LAYER)
+        if not isinstance(layer, str) or layer not in _THEME_OVERLAY_LAYERS:
+            return f"overlay '{oid}' has invalid layer: {layer!r}"
+        if layer == "behind" and pe:
+            return f"overlay '{oid}' on the behind layer must not set pointerEvents"
         anim = entry.get("animation", _THEME_OVERLAY_DEFAULT_ANIMATION)
         if anim not in _THEME_OVERLAY_ANIMATIONS:
             return f"overlay '{oid}' has invalid animation: {anim!r}"
@@ -1472,7 +1484,7 @@ def _theme_asset_descriptor(
     if level < 1:
         return desc
 
-    # Branding — bot name (plain text) + logo/favicon/wordmark by file presence.
+    # Branding — bot name (plain text) + logo/favicon/wordmark/welcome by file presence.
     branding = manifest.get("branding")
     branding = branding if isinstance(branding, dict) else {}
     bres: dict[str, str] = {}
@@ -1485,6 +1497,7 @@ def _theme_asset_descriptor(
         ("logo", ("svg", "png")),
         ("favicon", ("ico", "png", "svg")),
         ("wordmark", ("svg", "png")),
+        ("welcome", ("svg", "png", "webp", "gif")),
     ):
         for ext in exts:
             rel = f"branding/{role}.{ext}"
@@ -1593,6 +1606,11 @@ def _theme_asset_descriptor(
                             else _THEME_OVERLAY_DEFAULT_ZINDEX
                         ),
                         "pointerEvents": bool(entry.get("pointerEvents", False)),
+                        "layer": (
+                            "behind" if entry.get("layer") == "behind"
+                            and not entry.get("pointerEvents", False)
+                            else _THEME_OVERLAY_DEFAULT_LAYER
+                        ),
                         "animation": (
                             anim if anim in _THEME_OVERLAY_ANIMATIONS
                             else _THEME_OVERLAY_DEFAULT_ANIMATION
@@ -1619,6 +1637,7 @@ def _theme_asset_descriptor(
                         "position": _THEME_OVERLAY_DEFAULT_POSITION,
                         "zIndex": _THEME_OVERLAY_DEFAULT_ZINDEX,
                         "pointerEvents": False,
+                        "layer": _THEME_OVERLAY_DEFAULT_LAYER,
                         "animation": _THEME_OVERLAY_DEFAULT_ANIMATION,
                         "trigger": _THEME_OVERLAY_DEFAULT_TRIGGER,
                     }

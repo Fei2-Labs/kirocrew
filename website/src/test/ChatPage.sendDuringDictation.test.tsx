@@ -84,7 +84,10 @@ vi.mock('../hooks/useVoiceInput', () => ({
     level: 0,
     deviceLabel: '',
     clearError: vi.fn(),
-    partial: voice.partial,
+    // Live, like the real engine's state: a partial arrives with the engine's own
+    // re-render. A per-render snapshot would go stale, because a composer
+    // keystroke does not re-render the page or the voice atom.
+    get partial() { return voice.partial },
     sampleRef: { current: { level: 0, centroid: 0.5, onset: 0 } },
     })
   },
@@ -403,7 +406,7 @@ describe('ChatPage — sending while dictating', () => {
     // fake timers, and the `afterEach` below restores real timers even if an
     // assertion in the guarded region throws.
     setStt(true)
-    savePttConfig({ mode: 'ptt', binding: { code: 'AltRight' }, holdMs: 500 })
+    savePttConfig({ enabled: true, mode: 'ptt', binding: { code: 'AltRight' }, holdMs: 500 })
     const store = makeStore('chat-main', [{ key: 'chat-main' }])
     await renderAndWaitForInput(store)
     const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
@@ -444,7 +447,7 @@ describe('ChatPage — sending while dictating', () => {
     // mid-sentence hits exactly this path, so the stranded text is something the
     // user never asked to dictate.
     setStt(true)
-    savePttConfig({ mode: 'ptt', binding: { code: 'AltRight' }, holdMs: 500 })
+    savePttConfig({ enabled: true, mode: 'ptt', binding: { code: 'AltRight' }, holdMs: 500 })
     const store = makeStore('chat-main', [{ key: 'chat-main' }])
     await renderAndWaitForInput(store)
     const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement

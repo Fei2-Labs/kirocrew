@@ -21,11 +21,16 @@ vi.mock('../hooks/useUptime', () => ({
 vi.mock('../api/client', () => ({
   api: {
     memorySettings: vi.fn().mockResolvedValue({ history_idle_hours: 3, history_max_days: 90, migrated: false }),
+    wakatimeStats: vi.fn().mockResolvedValue({
+      configured: true,
+      range: 'last_7_days',
+      stats: { total_seconds: 1800, total_seconds_including_other_language: 7200 },
+    }),
     // Present only to be asserted NEVER called: the landing page must not read
     // the Kiro sign-in status, let alone render its chooser.
     kasLoginStatus: vi.fn().mockResolvedValue({ authenticated: false }),
     // The selected backend decides whether the sign-in signpost renders.
-    kirocrewConfig: vi.fn().mockResolvedValue({ agent: { acp_backend: '' } }),
+    kirocrewConfig: vi.fn().mockResolvedValue({ agent: { acp_backend: 'kiro' } }),
   },
 }))
 
@@ -123,6 +128,14 @@ describe('OverviewPage — mission control', () => {
     expect(screen.queryByTestId('usage-tab')).not.toBeInTheDocument()
   })
 
+  it('shows the WakaTime summary total from the include-other field, not the classified-only total', async () => {
+    renderWithProviders(<OverviewPage />, { store: statusStore() })
+    // Fixture: classified total_seconds=1800 (30m), include-other=7200 (2h).
+    // The card must read the include-other total so it matches the drill-in.
+    expect(await screen.findByText('2h')).toBeInTheDocument()
+    expect(screen.queryByText('30m')).not.toBeInTheDocument()
+  })
+
   it('drills into WakaTime and back', () => {
     renderWithProviders(<OverviewPage />, { store: statusStore() })
     fireEvent.click(screen.getAllByRole('button', { name: /View details/ })[1])
@@ -158,8 +171,8 @@ describe('OverviewPage — mission control', () => {
     expect(screen.getByTestId('edition-panel')).toBeInTheDocument()
   })
 
-  // The Kiro sign-in card serves the KAS backend only, a Developer Mode
-  // preview, so it lives under Developer > Agent Backend. On the landing page
+  // The Kiro sign-in card serves the KAS backend only, so it lives under the
+  // switch that picks KAS, on Settings > Agent Harness. On the landing page
   // its provider chooser read as a required step to every user, first-run
   // installs included. Asserted so it is not re-added: neither the card nor a
   // read of its status belongs here.
@@ -184,7 +197,7 @@ describe('OverviewPage — mission control', () => {
     vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: KIRO_SIGN_IN_BACKEND } })
     renderWithProviders(<OverviewPage />, { store: statusStore() })
     const pointer = await screen.findByTestId('kiro-sign-in-moved')
-    expect(pointer).toHaveTextContent('Kiro sign-in moved to Developer > Agent Backend')
+    expect(pointer).toHaveTextContent('Kiro sign-in moved to Settings > Agent Harness')
     // Same destination as the chat error row, so the two doors cannot drift.
     expect(pointer).toHaveAttribute('href', KIRO_SIGN_IN_PATH)
     expect(api.kasLoginStatus).not.toHaveBeenCalled()

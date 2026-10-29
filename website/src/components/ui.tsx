@@ -2,7 +2,10 @@ import React from 'react'
 import { twMerge } from 'tailwind-merge'
 import { motion, useMotionValue, useSpring, useMotionTemplate, useReducedMotion } from 'framer-motion'
 import InfoTip from './InfoTip'
+import { useLabelTip } from './InstantTip'
 import { i18nT } from '../i18n/t'
+import { haptic } from '../lib/haptic'
+import { autoSiteRef } from '../uiLocations/targetRegistry'
 
 /* ── Shared UI primitives ── */
 
@@ -65,12 +68,12 @@ export function CardTitle({ children, className, ...rest }: Omit<React.Component
 export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HTMLButtonElement> & { danger?: boolean; primary?: boolean }>(
   ({ children, danger, primary, className, ...rest }, ref) => (
     <button
-      ref={ref}
+      ref={autoSiteRef((rest as Record<string, unknown>)['data-ui-auto'], ref)}
       className={twMerge(`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border text-[13px] cursor-pointer font-body transition-all active:scale-[0.97] active:duration-75 disabled:opacity-30 disabled:cursor-not-allowed ${
         primary
           ? 'bg-accent text-accent-fg border-accent hover:bg-accent-hover hover:shadow-[0_0_12px_var(--accent-glow)]'
           : danger
-            ? 'border-border bg-transparent text-danger hover:border-danger hover:bg-danger-subtle'
+            ? 'border-border bg-transparent text-danger hover:text-danger-text hover:border-danger hover:bg-danger-subtle'
             : 'border-border bg-transparent text-text hover:border-border-strong hover:bg-bg-hover'
       }`, className)}
       {...rest}
@@ -80,9 +83,10 @@ export const Btn = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttribute
   )
 )
 
-export function SendBtn({ children, onClick, disabled, style, className, ...rest }: { children: React.ReactNode } & Omit<React.ComponentPropsWithoutRef<'button'>, 'children' | 'dangerouslySetInnerHTML'>) {
+export const SendBtn = React.forwardRef<HTMLButtonElement, { children: React.ReactNode } & Omit<React.ComponentPropsWithoutRef<'button'>, 'children' | 'dangerouslySetInnerHTML'>>(function SendBtn({ children, onClick, disabled, style, className, ...rest }, ref) {
   return (
     <button
+      ref={autoSiteRef((rest as Record<string, unknown>)['data-ui-auto'], ref)}
       // `min-h-9`, not `h-9`. A fixed height around inline content clips the
       // label instead of growing for it: at a narrow width a two-line label
       // needs ~40px and `h-9` gives it 36, so 12px of text is cut off — and the
@@ -99,45 +103,55 @@ export function SendBtn({ children, onClick, disabled, style, className, ...rest
       {children}
     </button>
   )
-}
+})
 
 /* ── Icon button group ──
  * The hover-revealed capsule of small square icon buttons used in chat session
  * rows, the widget header, and other row/card affordances. `IconButtonGroup`
  * is the bordered `bg-card` capsule; pass `reveal` to fade it in on the parent's
  * :hover / focus-within (the parent element must carry the `group` class).
- * `IconButton` is a single square icon button; `variant` sets the hover color. */
+ * `IconButton` is a single square icon button; `variant` sets the hover color.
+ * With no `title`, hovering or focusing it shows its `aria-label` in an
+ * `InstantTip` (`useLabelTip`). A caller that passes `title` keeps that native
+ * tooltip instead, since several use it to say more than the label does. */
 const ICON_BUTTON_VARIANTS: Record<'default' | 'accent' | 'danger' | 'active', string> = {
   default: 'text-muted hover:text-text hover:bg-bg-hover',
   accent: 'text-muted hover:text-accent hover:bg-bg-hover',
-  danger: 'text-muted hover:text-danger hover:bg-danger-subtle',
+  danger: 'text-muted hover:text-danger-text hover:bg-danger-subtle',
   active: 'text-accent hover:bg-bg-hover',
 }
 
 export const IconButton = React.forwardRef<
   HTMLButtonElement,
   Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'aria-label'> & { variant?: keyof typeof ICON_BUTTON_VARIANTS; 'aria-label': string }
->(({ variant = 'default', className, children, ...rest }, ref) => (
-  <button
-    ref={ref}
-    type="button"
-    className={twMerge(
-      'p-[4px] rounded transition-all active:scale-[0.97] active:duration-75 cursor-pointer bg-transparent border-none disabled:opacity-30 disabled:cursor-not-allowed',
-      ICON_BUTTON_VARIANTS[variant],
-      className,
-    )}
-    {...rest}
-  >
-    {children}
-  </button>
-))
+>(({ variant = 'default', className, children, onPointerEnter, onPointerDown, onPointerUp, onMouseEnter, onMouseLeave, onFocus, onBlur, ...rest }, ref) => {
+  const { handlers, bubble } = useLabelTip(rest.title === undefined ? rest['aria-label'] : undefined, {
+    onPointerEnter, onPointerDown, onPointerUp, onMouseEnter, onMouseLeave, onFocus, onBlur,
+  })
+  return (
+    <button
+      ref={autoSiteRef((rest as Record<string, unknown>)['data-ui-auto'], ref)}
+      type="button"
+      className={twMerge(
+        'p-[4px] rounded transition-all active:scale-[0.97] active:duration-75 cursor-pointer bg-transparent border-none disabled:opacity-30 disabled:cursor-not-allowed',
+        ICON_BUTTON_VARIANTS[variant],
+        className,
+      )}
+      {...rest}
+      {...handlers}
+    >
+      {children}
+      {bubble}
+    </button>
+  )
+})
 
 export function IconButtonGroup({ reveal, className, children }: { reveal?: boolean; className?: string; children: React.ReactNode }) {
   return (
     <div
       className={twMerge(
         'flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm transition-all',
-        reveal ? 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100' : '',
+        reveal ? 'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100' : '',
         className,
       )}
     >
@@ -170,11 +184,11 @@ export function SearchInput({ className = '', ...props }: React.InputHTMLAttribu
 
 export function Badge({ variant, children, className, ...rest }: { variant: 'ok' | 'err' | 'warn' | 'aim' | 'muted' } & Omit<React.ComponentPropsWithoutRef<'span'>, 'children' | 'dangerouslySetInnerHTML'> & { children: React.ReactNode }) {
   const cls =
-    variant === 'ok' ? 'bg-ok-subtle text-ok'
-    : variant === 'err' ? 'bg-danger-subtle text-danger'
+    variant === 'ok' ? 'bg-ok-subtle text-ok-text'
+    : variant === 'err' ? 'bg-danger-subtle text-danger-text'
     : variant === 'aim' ? 'bg-aim-subtle text-aim'
     : variant === 'muted' ? 'bg-[var(--bg-hover)] text-[var(--muted)]'
-    : 'bg-warn-subtle text-warn'
+    : 'bg-warn-subtle text-warn-text'
   return (
     // No hover transform: a Badge is a non-interactive status label, so growing
     // it under the cursor announced an affordance that isn't there.
@@ -189,7 +203,7 @@ export function Badge({ variant, children, className, ...rest }: { variant: 'ok'
  *  `tone="neutral"` forces the grey style for every source — used where several
  *  of these sit together (the template list) and one coloured chip among grey
  *  peers reads as "why is this one different?" rather than as a category. */
-export function SourceBadge({ source, children, tone = 'auto' }: { source: string; children?: React.ReactNode; tone?: 'auto' | 'neutral' }) {
+export function SourceBadge({ source, children, tone = 'auto', title }: { source: string; children?: React.ReactNode; tone?: 'auto' | 'neutral'; title?: string }) {
   const neutral = 'bg-bg-elevated text-muted border-border'
   const cls =
     tone === 'neutral' ? neutral
@@ -197,7 +211,7 @@ export function SourceBadge({ source, children, tone = 'auto' }: { source: strin
     : source === 'kirocrew' ? neutral
     : source === 'project' ? 'text-ok border-ok/30'
     : neutral
-  return <span className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{children ?? source}</span>
+  return <span title={title} className={`px-1.5 py-[2px] rounded-full text-[11px] font-bold border shrink-0 ${cls}`}>{children ?? source}</span>
 }
 
 export function StatCard({ label, value, accent, colorClass, delay, onClick, active, title, className, ...rest }: { label: string; value?: string | number | null; accent?: boolean; colorClass?: string; delay?: number; onClick?: () => void; active?: boolean; title?: string } & Omit<React.ComponentPropsWithoutRef<'div'>, 'title' | 'onClick' | 'dangerouslySetInnerHTML'>) {
@@ -421,10 +435,12 @@ export function PageHeader({ title, subtitle, actions }: { title: React.ReactNod
   )
 }
 
-export function Toggle({ checked, onChange, disabled, label, describedBy, tone = 'accent' }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted' }) {
+export function Toggle({ checked, onChange, disabled, label, describedBy, tone = 'accent', 'data-ui-auto': uiAuto }: { checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; label?: string; describedBy?: string; tone?: 'accent' | 'muted'; /** The build's auto-tier marker (scripts/lib/ui-auto-stamp.mjs), put on the switch a guide points at. */ 'data-ui-auto'?: string }) {
   return (
     <div
       role="switch"
+      data-ui-auto={uiAuto}
+      ref={autoSiteRef<HTMLDivElement>(uiAuto)}
       aria-checked={checked}
       // Without this a screen reader announces a disabled switch as actionable:
       // the disabled state was carried only by `tabIndex={-1}` and an opacity
@@ -436,8 +452,10 @@ export function Toggle({ checked, onChange, disabled, label, describedBy, tone =
       // user hears it before acting rather than discovering it by exploring.
       aria-describedby={describedBy}
       tabIndex={disabled ? -1 : 0}
-      onClick={() => !disabled && onChange(!checked)}
-      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); onChange(!checked) } }}
+      // A switch is the one control whose physical twin clicks under the thumb, so
+      // it gets a tap where the device can give one (phones); elsewhere no-op.
+      onClick={() => { if (!disabled) { haptic(); onChange(!checked) } }}
+      onKeyDown={e => { if (!disabled && (e.key === ' ' || e.key === 'Enter')) { e.preventDefault(); haptic(); onChange(!checked) } }}
       // `muted` is for a LIST of switches, where an accent fill on every row
       // shouts and duplicates a state the row's own grouping already carries.
       // The knob position still reads the state, so nothing is lost by dropping
@@ -475,6 +493,9 @@ export interface SliderProps {
   markerLabel?: string
   className?: string
   'aria-label'?: string
+  /** Id of a description the slider reads out after its name, such as why it
+   *  is disabled -- a `title` on a wrapper reaches only a hovering pointer. */
+  'aria-describedby'?: string
 }
 
 /** macOS-style range slider: accent fill, circular knob, optional step ticks.
@@ -484,6 +505,7 @@ export interface SliderProps {
 export function Slider({
   value, onChange, min = 0, max = 100, step = 1, disabled,
   label, showValue, formatValue, ticks, emphasizeMax, markerValue, markerLabel, className = '', 'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
 }: SliderProps) {
   const trackRef = React.useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = React.useState(false)
@@ -546,6 +568,27 @@ export function Slider({
     if (next !== value) onChange(next)
   }
 
+  // Armed only when setPointerCapture is missing or throws on pointer-down:
+  // window-level up/cancel listeners for that specific pointerId, so an
+  // uncaptured drag can always terminate — the same acquisition-side
+  // fallback the shared usePointerDrag hook arms.
+  const fallbackRef = React.useRef<{ pointerId: number; dispose: () => void } | null>(null)
+  const disarmFallback = React.useCallback(() => {
+    fallbackRef.current?.dispose()
+    fallbackRef.current = null
+  }, [])
+  // Single-fire end path shared by the element handlers, the capture-loss
+  // handler and the window fallback below.
+  const terminateDrag = React.useCallback(() => {
+    if (!pointerDown.current) return
+    pointerDown.current = false
+    disarmFallback()
+    setDragging(false)
+  }, [disarmFallback])
+  // If the component unmounts mid-uncaptured-drag, the window listeners must
+  // not outlive it.
+  React.useEffect(() => disarmFallback, [disarmFallback])
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (disabled) return
     e.preventDefault()
@@ -553,7 +596,30 @@ export function Slider({
     // focus the track explicitly — otherwise arrow keys after a click-to-seek go
     // to whatever had focus before instead of the slider.
     trackRef.current?.focus()
-    ;(e.target as Element).setPointerCapture?.(e.pointerId)
+    // A new press replaces whatever gesture was in flight, so a fallback armed
+    // for the outgoing pointer goes with it.
+    disarmFallback()
+    // Capture is best-effort (missing or throwing): the seek below still runs.
+    // But an uncaptured drag gets no retargeting, so without a fallback a
+    // release outside the track strands `pointerDown` with the slider pressed.
+    let captured = true
+    try { (e.target as Element).setPointerCapture(e.pointerId) } catch { captured = false }
+    if (!captured) {
+      const pointerId = e.pointerId
+      const onWindowEnd = (ev: PointerEvent) => {
+        if (ev.pointerId !== pointerId) return
+        terminateDrag()
+      }
+      window.addEventListener('pointerup', onWindowEnd)
+      window.addEventListener('pointercancel', onWindowEnd)
+      fallbackRef.current = {
+        pointerId,
+        dispose: () => {
+          window.removeEventListener('pointerup', onWindowEnd)
+          window.removeEventListener('pointercancel', onWindowEnd)
+        },
+      }
+    }
     pointerDown.current = true
     // A click (down without move) is a discrete seek — leave `dragging` false
     // so the knob springs to the new spot. Movement below flips into drag mode.
@@ -576,9 +642,8 @@ export function Slider({
   const onPointerLeave = () => { if (!pointerDown.current) setHoverVal(null) }
   const endDrag = (e: React.PointerEvent) => {
     if (!pointerDown.current) return
-    pointerDown.current = false
-    ;(e.target as Element).releasePointerCapture?.(e.pointerId)
-    setDragging(false)
+    try { (e.target as Element).releasePointerCapture(e.pointerId) } catch { /* best-effort */ }
+    terminateDrag()
   }
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -615,6 +680,7 @@ export function Slider({
         ref={trackRef}
         role="slider"
         aria-label={ariaLabel || label}
+        aria-describedby={ariaDescribedBy}
         aria-valuemin={min}
         aria-valuemax={max}
         aria-valuenow={current}
@@ -627,6 +693,10 @@ export function Slider({
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        // A capture steal (another element capturing mid-drag) stops
+        // retargeting pointerup here with no further event: end the drag on
+        // the loss itself, as the shared usePointerDrag hook does.
+        onLostPointerCapture={endDrag}
         onPointerLeave={onPointerLeave}
         // outline-hidden is CORRECT here and must stay: the knob below already
         // carries the replacement cue (`group-focus-visible:ring-2`), which
@@ -658,17 +728,6 @@ export function Slider({
             style={{ left: center(f) }}
           />
         ))}
-        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
-          <span
-            role="img"
-            aria-label={markerLabel}
-            data-slider-marker
-            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-accent"
-            style={{ left: center(markerFrac), transform: markerTransform }}
-          >
-            {markerLabel}
-          </span>
-        )}
         {/* hover/drag tooltip — value of the step under the cursor */}
         {hoverVal !== null && (
           <div
@@ -698,6 +757,21 @@ export function Slider({
             transition={reduceMotion ? { duration: 0 } : { type: 'spring', stiffness: 500, damping: 26 }}
           />
         </motion.div>
+        {/* Rendered AFTER the knob on purpose: the focus-cue gate looks for the
+            knob's `group-focus-visible:` ring within a fixed window below the
+            track's opening tag, and this block would push it out. z-10 keeps the
+            label above the knob regardless of DOM order. */}
+        {markerFrac !== null && markerLabel && markerValue === markerCurrent && (
+          <span
+            role="img"
+            aria-label={markerLabel}
+            data-slider-marker
+            className="absolute bottom-[calc(100%+4px)] z-10 whitespace-nowrap text-[10px] font-medium text-muted"
+            style={{ left: center(markerFrac), transform: markerTransform }}
+          >
+            {markerLabel}
+          </span>
+        )}
       </div>
 
       {/* discrete tick marks under the groove (static reference; the hover

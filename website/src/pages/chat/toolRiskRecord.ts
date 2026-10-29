@@ -24,7 +24,7 @@
  */
 import type { ChatMessage } from '../../types'
 
-/** The tiers that earn a badge, in increasing severity. Mirrors `tool_risk.FLAGGED_TIERS`. */
+/** The tiers `tool_risk.earns_badge` prices, in increasing severity; `safe` never reaches the card. */
 export const TOOL_RISK_TIERS = ['caution', 'risky'] as const
 
 export type ToolRiskTier = typeof TOOL_RISK_TIERS[number]

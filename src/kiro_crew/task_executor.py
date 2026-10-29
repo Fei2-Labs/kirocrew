@@ -7,13 +7,19 @@ approval gates, self-review, test verification, and context compaction.
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import logging
+import os
+import re
+import shutil
 import time as _time
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
 
-from kiro_crew import git_coord, name_grant, platform_compat, shutdown_event
+from kiro_crew import git_coord, platform_compat, runtime_death, shutdown_event, tool_permission
 from kiro_crew.acp.client import AcpProcessDied
+from kiro_crew.agent_sdk import CONTEXT_EVENT_COMPACTION
 from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_CLASS_CANCELLED,
     STOP_CLASS_FAILED,
@@ -22,19 +28,36 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_RECOVERY_MAX_RETRIES,
     classify_stop_reason,
 )
+from kiro_crew.agent_sdk.mcp_problems import session_mcp_problems
+from kiro_crew.agent_sdk.spec_hooks import (
+    invalidate_stale_kas_session,
+    refuse_stale_switch,
+    reproject_claimed_session,
+    running_agent,
+    turn_spec_hooks,
+)
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import (
-    TOOL_AUTO_APPROVE,
-    TOOL_DENY,
     fire_tool_hooks,
     get_global_hook_store,
     hook_gate_kwargs,
+    permission_pre_tool_block,
 )
-from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
-from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
+from kiro_crew.llm_helpers import (
+    provider_last_turn_usage,
+    stream_and_collect_json,
+)
+from kiro_crew.messaging.commands import compact_unsupported_backend
+from kiro_crew.messaging.dispatch import (
+    consume_reinjection,
+    rearm_reinjection,
+    rollback_skill_bodies,
+)
 from kiro_crew.messaging.link import telemetry_channel_of
 from kiro_crew.providers.base import (
+    EVENT_AGENT_SWITCHED,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -44,6 +67,7 @@ from kiro_crew.providers.base import (
 from kiro_crew.recovery.ladder import L3_ACP_RUNTIME, default_ladder
 from kiro_crew.safety_override import safety_override
 from kiro_crew.sandbox import (
+    _resolve_spawn_target,
     create_subprocess_limited,
     sandboxed_spawn_argv,
     sandboxed_spawn_argv_async,
@@ -53,18 +77,31 @@ from kiro_crew.sel import sel
 from kiro_crew.task_models import (
     MAX_RECOVERIES,
     MAX_RETRIES,
+    RESUME_HINT,
     SESSION_PREFIX,
     TEST_TIMEOUT,
     Project,
     Task,
     TaskStatus,
+    VerificationStatus,
 )
 from kiro_crew.task_planner import group_parallel_tasks
 
 if TYPE_CHECKING:
+    from kiro_crew.name_grant import Refusal as NameRefusal
     from kiro_crew.taskq.adapters.runner import Admitted
 
 _MID_STREAM_COMPACT_PCT = 90.0
+
+#: What the model is told when an unattended task run refuses a tool call it has
+#: no positive authorization for. Says what the surface permits (the
+#: surface-policy notice tells the model to read exactly that) and nothing
+#: about the call itself, which was never judged.
+_HEADLESS_DENY_REASON = (
+    "this task run is unattended: no approval handler is attached and no hook "
+    "auto-approve trusts this tool, so only tools listed in hooks.auto_approve_tools "
+    "can run here"
+)
 
 
 class _ContextOverflow(Exception):
@@ -111,6 +148,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Prefix of ``task.error`` when self-review could not judge the step at all.
+_REVIEW_UNVERIFIED = "Self-review could not verify the step"
+
 
 async def _reset_session_quietly(sessions: "SessionManager", session_key: str) -> None:
     """Reset the ACP session for the next turn; a reset that fails is not fatal.
@@ -144,6 +184,117 @@ async def _end_stalled_step(
     task.status = TaskStatus.FAILED
     task.error = f"{stop.stop_class} ({stop.stop_reason}) — {why} — partial result preserved"
     return False
+
+
+#: Bound for the loop-detection fingerprint when the text is not a test run.
+_ERROR_FINGERPRINT_LINES = 20
+#: A normalized identity longer than this is stored as its digest: two
+#: summaries that share a long prefix but name different failing tests must
+#: still compare unequal, so the whole text counts, not its head.
+_ERROR_FINGERPRINT_LEN = 1000
+#: pytest's short summary names the failing tests. ``run_tests`` trims a failing
+#: run to its last 2000 chars, so the head of the text is not the stable part --
+#: these lines are.
+_TEST_SUMMARY_RE = re.compile(r"^[ \t]*(?:FAILED|ERROR)[ \t]+\S+.*$", re.MULTILINE)
+#: The short-summary names the failing test, but on a non-tty pytest truncates
+#: its ``FAILED <id> - <msg>`` line to the terminal width, so the assertion
+#: message is often cut off. Then a test that FAILS IN A DIFFERENT PLACE each
+#: attempt -- the agent fixes one assertion and the next one fails -- would share
+#: one summary line and read as a loop, the exact misfire this feature exists to
+#: avoid. So the failing LOCATION is folded into the identity too: pytest's
+#: traceback shows ``<path>:<line>: <ExcType>`` for each failure, and the ``E``
+#: assertion lines carry the failing expression. Both sit in the tail
+#: ``run_tests`` keeps, so a different failing line or assertion yields a
+#: different fingerprint while a genuinely stuck test (same location, same
+#: assertion) still collapses to one.
+_TEST_LOCATION_RE = re.compile(
+    r"^(?:[ \t]*E[ \t].*|\S.*?:\d+: \S.*)$",
+    re.MULTILINE,
+)
+#: Only a test-run error (see the ``task.error`` assignment after ``run_tests``)
+#: is reduced to its summary lines; a generic exception that happens to carry
+#: ``ERROR ...`` log lines keeps its own first lines as identity.
+_TEST_FAILURE_PREFIX = "Tests failed:"
+#: Volatile runs that legitimately differ between two attempts at the *same*
+#: failure. Bare digit runs and short hex literals are deliberately NOT masked:
+#: ``error variant 1`` vs ``error variant 2`` and ``case[0x1]`` vs ``case[0x2]``
+#: are the next parametrized case, and ``assert 3 == 0`` vs ``assert 1 == 0`` is
+#: a different assertion. Masking those makes steady progress look like a stuck
+#: loop; only address-length hex (6+ digits) is volatile.
+_VOLATILE_PATTERNS = (
+    re.compile(r"0x[0-9a-fA-F]{6,}"),
+    re.compile(r"\b\d+(?:\.\d+)?(?:ms|us|ns|s|m|h)\b"),
+    re.compile(r"\b(?i:port|pid)[ \t:=]+\d+\b"),
+    re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b"),
+)
+_VOLATILE_WS_RE = re.compile(r"\s+")
+#: pytest parametrize ids are bracketed node-id spans (``test_x[2s]``,
+#: ``test_x[1h-cold]``). They are identity, not noise: ``[1s]`` and ``[2s]`` are
+#: the next case of a steadily-advancing run, and a duration/port/hex volatile
+#: pattern would otherwise collapse them so the third failure trips loop
+#: detection and overwrites the real error with "Loop detected". A node-id span
+#: is a ``[...]`` that is ATTACHED to an identifier (``(?<=\w)``); a bracketed
+#: log prefix like ``[2026-09-29T05:00:00Z]`` or ``[pid 9912]`` stands on its
+#: own and is NOT protected, so its volatile contents are still masked.
+#:
+#: One alternation masks volatile runs AND protects node-id spans in a single
+#: ``re.sub`` pass: the first branch is the node-id span (named ``nodeid``), the
+#: rest are the volatile patterns above. ``_mask`` returns a matched node-id span
+#: verbatim and replaces every other match with ``#``. The node-id branch is
+#: first, so an identifier-attached ``[...]`` wins the alternation and is never
+#: masked, while a volatile form outside a node id is. One pass with no
+#: lift/restore means nothing is ever rewritten into a sentinel, so there is no
+#: placeholder collision and no restore step to make total.
+_FINGERPRINT_MASK_RE = re.compile(
+    "|".join([r"(?P<nodeid>(?<=\w)\[[^\[\]]*\])", *(p.pattern for p in _VOLATILE_PATTERNS)])
+)
+
+
+def _error_fingerprint(error: str) -> str:
+    """Normalize *error* so a repeated failure compares equal across retries.
+
+    Exact equality misses real loops (timestamps, durations, ports, PIDs, temp
+    paths change every attempt) and never fires on test failures (the full
+    output is embedded). For a test run the identity is the ``FAILED`` /
+    ``ERROR`` summary lines PLUS each failure's location -- the ``E`` assertion
+    lines and the ``<path>:<line>: <ExcType>`` traceback lines -- so a test that
+    fails in a DIFFERENT place each attempt (the agent fixes one assertion and
+    the next fails) does not collapse into a false loop; otherwise it is the
+    first lines. Only genuinely volatile forms are masked, and whitespace is
+    collapsed. Distinct failures (different missing modules, different test
+    names, a different parametrized case, a different failing line) still differ;
+    only the volatile runs vary. Comparison-only: ``task.error`` keeps the raw
+    text.
+    """
+    if error.startswith(_TEST_FAILURE_PREFIX):
+        # The failing-test identity is its FAILED/ERROR summary lines (which name
+        # the test) together with its failure LOCATION (E lines + file:line
+        # traceback lines). The summary alone is width-truncated on a non-tty, so
+        # a test failing at two different assertions would otherwise share one
+        # fingerprint and read as a loop while the agent is still converging.
+        identity = _TEST_SUMMARY_RE.findall(error) + _TEST_LOCATION_RE.findall(error)
+    else:
+        identity = []
+    if identity:
+        text = "\n".join(identity)
+    else:
+        text = "\n".join(error.splitlines()[:_ERROR_FINGERPRINT_LINES])
+
+    # One pass masks volatile runs and leaves identifier-attached node-id spans
+    # (``test_x[1s]``) alone, so a volatile pattern cannot collapse the
+    # successive cases of a ``pytest -x`` run that steps through ``[1s]``,
+    # ``[2s]``, ``[30m]`` into one fingerprint. A bracketed log prefix that is
+    # NOT attached to an identifier (``[2026-09-29T05:00:00Z] ...``, ``[pid
+    # 9912]``, ``[120ms]``) is not a node id, so its volatile contents are still
+    # masked and the fingerprint stays equal across retries.
+    def _mask(match: re.Match[str]) -> str:
+        return match.group(0) if match.lastgroup == "nodeid" else "#"
+
+    text = _FINGERPRINT_MASK_RE.sub(_mask, text)
+    text = _VOLATILE_WS_RE.sub(" ", text).strip()
+    if len(text) > _ERROR_FINGERPRINT_LEN:
+        return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    return text
 
 
 async def _check_error_loop(
@@ -183,6 +334,7 @@ async def execute_single_task(
     extract_lesson_fn: Callable,
     session_key: str = "",
     taskq: "Admitted | None" = None,
+    require_verification: bool = False,
 ) -> bool:
     """Execute one task with approval gate, self-review, and memory update.
 
@@ -193,7 +345,9 @@ async def execute_single_task(
     """
     if not session_key:
         session_key = f"{SESSION_PREFIX}:{run.task_id}:task{task.index}"
-    _exec_kw = {"taskq": taskq} if taskq is not None else {}
+    _exec_kw: dict[str, Any] = {"taskq": taskq} if taskq is not None else {}
+    if require_verification:
+        _exec_kw["require_verification"] = True
 
     task.status = TaskStatus.IN_PROGRESS
     now = _time.time()
@@ -301,17 +455,32 @@ async def execute_single_task(
     run.last_task_time = _time.time()
 
     if success:
-        committed = False
+        committed = commit_failed = False
         if run.branch_name:
             try:
                 sha = await git_coord.commit_step(run, task)
                 committed = bool(sha)
             except Exception:
+                commit_failed = True
                 logger.debug("Git commit failed for task %d", task.index, exc_info=True)
 
         task.status = TaskStatus.REVIEWING
-        review_ok = await self_review(run, task, sessions, agent, session_key, ctx=ctx)
-        if not review_ok:
+        # Passed only when set, so the common call keeps its existing shape.
+        _review_kw = {"commit_failed": True} if commit_failed else {}
+        review_ok = await self_review(
+            run, task, sessions, agent, session_key, ctx=ctx, **_review_kw
+        )
+        if not review_ok and task.error.startswith(_REVIEW_UNVERIFIED):
+            # Nothing to judge the step by: fail it. A re-run would repeat any
+            # push or CR the step made and pass without a review.
+            task.status = TaskStatus.FAILED
+            success = False
+            await on_notify(
+                f"❌ Task {task.index}/{len(run.tasks)} failed",
+                f"{task.title}\n{task.error}",
+                run=run,
+            )
+        elif not review_ok:
             if committed and run.branch_name:
                 try:
                     await git_coord.revert_step(run)
@@ -359,18 +528,164 @@ async def execute_single_task(
     return success
 
 
-async def _reject_and_log(client, history, session_key, agent, event, *, metadata=None):
-    """Reject a tool call and log the rejection."""
-    await client.reject_tool(event.request_id)
-    history.log_tool_invocation(
-        session_key=session_key,
-        agent=agent or "kirocrew",
-        source="taskrunner",
-        tool_name=event.title,
-        tool_kind=event.tool_kind,
-        outcome="rejected",
-        request_id=event.request_id,
-        **({"metadata": metadata} if metadata else {}),
+class _RunTrust:
+    """The run's own trust grant, re-checked on every request no earlier grant approved.
+
+    The user explicitly opted THIS run into unattended execution via the dashboard.
+    It is NOT the global SafetyOverride singleton (which would leak trust to every
+    session); the authoritative grant is a task-scoped SafetyOverride grant (scope
+    ``taskrunner:{task_id}:autoapprove``) activated through the singleton's
+    fail-closed audited ``activate_scoped()`` and TTL-bounded there (dashboard
+    window, <=24h ceiling) -- so no independent approval state lives on the run, and
+    it satisfies the backend-security-controls expiry rule. ``run.auto_approve`` is
+    only the UI intent flag; the live decision is ``is_scope_active()``, and the
+    grant is revoked the moment it lapses. It is deny-by-default (only a literal
+    ``true`` enables it), dashboard source-gated, SEL-audited as
+    ``run_auto_approve``, and reset on crash-recovery. Compensating controls stay
+    intact: the hook deny-lists / sensitive-path blocks rank above it in the
+    ladder, and force_approval / requires_approval task gates (a separate
+    task-level path) still pause for approval.
+    """
+
+    def __init__(self, run: Project, task: Task) -> None:
+        self._run = run
+        self._task = task
+
+    async def offer(self, ask: tool_permission.Ask) -> tool_permission.Hit | None:
+        if not getattr(self._run, "auto_approve", False):
+            return None
+        scope = f"{SESSION_PREFIX}:{self._run.task_id}:autoapprove"
+        if safety_override().is_scope_active(scope):
+            # Slide the grant forward on activity so an actively progressing run
+            # does not lose trust at the base TTL; still hard-capped at the 24h
+            # ceiling from first grant, so an abandoned (idle) run lapses as
+            # intended.
+            safety_override().renew_scoped(scope, source="dashboard")
+            return tool_permission.Hit("run_auto_approve", tool_permission.Evidence.NONE)
+        # Grant lapsed / absent -- clear BOTH trust representations together
+        # (intent flag + scoped grant, idempotent) and fall through to interactive /
+        # deny-by-default. Bounds unattended tool execution to the grant window.
+        self._run.auto_approve = False
+        safety_override().deactivate_scope(scope)
+        sel().log_api_access(
+            caller="taskrunner",
+            operation="task.auto_approve_expired",
+            outcome="expired",
+            source="taskrunner",
+            resources=f"task-{self._task.index}",
+        )
+        return None
+
+
+class _StepPrompt:
+    """An interactive approval wait: the watchdog's activity stamp before it."""
+
+    def __init__(self, run: Project) -> None:
+        self._run = run
+
+    def opened(self, ask: tool_permission.Ask) -> None:
+        self._run.last_task_time = _time.time()
+
+    def closed(self, token: object, decision: str, by: str) -> None:
+        return None
+
+
+class _StepNarrator(tool_permission.Narrator):
+    """The task runner's bookkeeping around an answer: its log lines and the
+    watchdog's activity stamp on an approval that reached the agent."""
+
+    def __init__(self, run: Project) -> None:
+        self._run = run
+
+    def refusing(self, ask: tool_permission.Ask, refusal: tool_permission.Refusal) -> None:
+        if refusal.rung == "spec_hook":
+            logger.warning("task step PreToolUse hook blocked a tool: %s", refusal.reason)
+
+    def declined(self, ask: tool_permission.Ask, refusal: NameRefusal) -> None:
+        logger.warning(
+            "declining a hook auto-approve: %s; the request "
+            "falls through to the task runner's normal "
+            "approval path",
+            refusal.log_text,
+        )
+
+    def allowed(self, ask: tool_permission.Ask, sent: bool) -> None:
+        if sent:
+            self._run.last_task_time = _time.time()
+
+
+def _step_permission_policy(
+    *,
+    client: object,
+    ctx: "ContextBuilder | None",
+    spec: object,
+    run: Project,
+    task: Task,
+    agent: str,
+    session_key: str,
+    on_tool_approval: Callable | None,
+) -> tool_permission.Policy:
+    """The task runner's permission ladder for one step attempt and its current agent.
+
+    In order: the agent spec's PreToolUse hooks (when its backend never receives
+    them); the hook gate's deny, then its auto-approve (a grant by program NAME is
+    honoured only while each name still resolves to the program it names, else it
+    DOWNGRADES); the run's own trust grant; the mid-stream context check, which
+    runs BEFORE authorization resolves because context management is orthogonal to
+    approval and must fire even on the headless deny path, or overflow recovery
+    would be skipped whenever a tool is about to be rejected; then the interactive
+    handler; and with none, deny-by-default. Raw config is never read here -- it
+    would bypass the SafetyOverride 24h TTL, and honouring the global override would
+    reintroduce the global-YOLO dependency per-run trust avoids. A refusal row that
+    cannot be written raises before the wire.
+    """
+
+    # The gate consult stays in this module: it is this surface's attribution of
+    # the caller. Bound to a name because test_hooks' extraction scan recognises
+    # the assignment shape.
+    def _consult_gate(event: LLMEvent) -> object:
+        assert ctx is not None
+        verdict = ctx.hooks.on_tool_call(
+            event.title,
+            session_key=session_key,
+            agent=agent,
+            **hook_gate_kwargs(event),
+        )
+        return verdict
+
+    return tool_permission.Policy(
+        gate=tool_permission.HookGate(_consult_gate) if ctx else tool_permission.NO_GATE,
+        audit=tool_permission.SelAudit(
+            tool_permission.TaskrunnerRows(agent or "kirocrew", run, task),
+            on_refusal_failure="withhold",
+            # Read per row and per request, as this module's patch seams expect.
+            sel=lambda: sel(),
+            log=logger,
+        ),
+        otherwise=tool_permission.Refusal.host(
+            "headless", _HEADLESS_DENY_REASON, DENY_CAUSE_SURFACE_POLICY
+        ),
+        floors=(
+            tool_permission.SpecHooks(
+                spec,
+                store=lambda: get_global_hook_store(),
+                pre_tool=lambda *a, **kw: permission_pre_tool_block(*a, **kw),
+                parent_session_key=session_key or None,
+                agent_role=(agent or "kirocrew"),
+            ),
+        ),
+        grants=(tool_permission.GATE_GRANT, _RunTrust(run, task)),
+        interject=tool_permission.ContextOverflow(client, threshold=_MID_STREAM_COMPACT_PCT),
+        responders=(
+            tool_permission.CallbackResponder(
+                # Asked only while attended, i.e. while a handler is attached.
+                lambda: cast(Callable[[Any], Awaitable[object]], on_tool_approval),
+                attended=lambda: bool(on_tool_approval),
+                name="responder",
+                watch=_StepPrompt(run),
+            ),
+        ),
+        narrator=_StepNarrator(run),
     )
 
 
@@ -387,6 +702,7 @@ async def execute_task(
     on_notify: Callable,
     session_key: str = "",
     taskq: "Admitted | None" = None,
+    require_verification: bool = False,
 ) -> bool:
     """Execute a single task with retries and process recovery.
 
@@ -410,6 +726,12 @@ async def execute_task(
     stop_recoveries = 0
     dependency_waits = 0
     attempt = 0
+    # The agent a mid-step mode switch moved the session to, carried across
+    # attempts so a retry on that same session is gated by ITS hooks. Only the
+    # hook lookup reads it; the claim still asks for the step's own agent.
+    switched_agent = ""
+    # Stores _error_fingerprint(task.error), not the raw text, so retries that
+    # differ only in volatile runs still compare equal.
     previous_error = ""
     consecutive_same_error = 0
     result_prefix = ""
@@ -437,6 +759,10 @@ async def execute_task(
             applied_answers.append("recovered")
             task.description = f"{task.description}\n\n## Operator input\n{recorded}\n"
 
+    # The MCP problem line this step already told the operator about, so a retry
+    # on the same broken servers does not repeat the notice every attempt.
+    mcp_noticed = ""
+
     # ``attempt`` is the TURN ordinal (the re-run prompt reads it), and
     # ``MAX_RETRIES`` bounds the LOGIC failures only: an in-place stall recovery
     # the ladder approved raises this ceiling by its own turn instead of
@@ -458,9 +784,26 @@ async def execute_task(
 
         _acquired = False
         # Post-compaction re-injection bookkeeping for the finally: whether this
-        # turn consumed the one-shot flag, and whether it landed (recorded success).
+        # turn consumed the one-shot flag, whether it landed (recorded success),
+        # and whether the backend reported that it compacted the session.
         _needs_reinjection = False
         _turn_landed = False
+        _turn_compacted = False
+        # Whether this attempt's stream produced output or a tool call: a death
+        # after either may have left work done, so its retry resumes rather than
+        # restates the step (the chat runner's ``turn_emitted``).
+        _attempt_emitted = False
+        # The provider THIS attempt ran on, for the death handler's attribution
+        # question. Reset per attempt and set only once the session is open, so a
+        # death before the open asks about nothing (and is charged, as before)
+        # rather than about the previous attempt's provider -- ``client`` itself
+        # survives the loop, so reading it directly would attribute this
+        # attempt's death to a runtime it never used.
+        _turn_provider: object | None = None
+        # This attempt's MCP problem line as read when its session opened. The
+        # failure handlers reset the session before the finally runs, and a
+        # reset replaces the provider's report with an empty one.
+        _mcp_at_open = ""
         try:
             from kiro_crew.context import inherit_session_memory
 
@@ -468,13 +811,27 @@ async def execute_task(
                 ctx, f"{SESSION_PREFIX}:{run.task_id}:runtime", session_key
             )
             await check_context(session_key, sessions)
-            client, is_new, _resumed = await sessions.open_task_session(
-                f"{SESSION_PREFIX}:{run.task_id}:runtime",
-                session_key,
-                agent=agent or None,
-                cwd=str(work_dir) if work_dir else None,
-            )
+            # A reused KAS session whose registered batch auto-approves what a
+            # PreToolUse hook now covers is reset, so the claim re-projects it.
+            await invalidate_stale_kas_session(sessions, session_key, agent or "kirocrew")
+
+            def _claim():
+                return sessions.open_task_session(
+                    f"{SESSION_PREFIX}:{run.task_id}:runtime",
+                    session_key,
+                    agent=agent or None,
+                    cwd=str(work_dir) if work_dir else None,
+                )
+
+            client, is_new, _resumed = await _claim()
             _acquired = True
+            # Decided again under the lease: the pre-claim reset is declined for a
+            # session another turn holds, and this claim may have waited for it.
+            client, is_new, _resumed = await reproject_claimed_session(
+                sessions, session_key, agent or "kirocrew", (client, is_new, _resumed), _claim
+            )
+            _turn_provider = client
+            _mcp_at_open = session_mcp_problems(client)
 
             task_prompt = await build_task_prompt(run, task, attempt, work_dir)
             if ctx:
@@ -501,6 +858,31 @@ async def execute_task(
             else:
                 full_prompt = task_prompt
 
+            # The step's agent spec hooks, when its backend never receives them
+            # (none on kiro-cli, whose harness runs the field itself). On such a
+            # backend PreToolUse hooks gate each permission request; the KAS
+            # projection turns every call they cover into one.
+            # A step with no agent runs the runtime's default one, and that is
+            # the spec the session's projection gated.
+            # The agent this session runs NOW: a retry on a session an earlier
+            # attempt switched runs the switched-to agent, so its hooks gate.
+            _spec = await turn_spec_hooks(
+                client, running_agent(client, switched_agent or agent or "kirocrew")
+            )
+            # The step's permission ladder, rebuilt when a mode switch changes
+            # whose spec hooks gate the requests that follow.
+            _policy_for = functools.partial(
+                _step_permission_policy,
+                client=client,
+                ctx=ctx,
+                run=run,
+                task=task,
+                agent=agent,
+                session_key=session_key,
+                on_tool_approval=on_tool_approval,
+            )
+            _policy = _policy_for(spec=_spec)
+
             result_text = ""
             _chunk_count = 0
             _complete_event: LLMEvent | None = None
@@ -512,6 +894,7 @@ async def execute_task(
             _turn_t0 = _time.monotonic()
             async for event in client.stream(full_prompt):
                 if event.kind == EVENT_TEXT_CHUNK:
+                    _attempt_emitted = True
                     result_text += event.text
                     _chunk_count += 1
                     if _chunk_count % 50 == 0:
@@ -521,190 +904,51 @@ async def execute_task(
                     run.last_task_time = _time.time()
                     run.tokens_used += max(1, len(event.text) // 4)
                 elif event.kind == EVENT_PERMISSION_REQUEST:
-                    # Honor the user-configured auto-approve trust (hook
-                    # TOOL_AUTO_APPROVE from hooks.auto_approve_tools) before the
-                    # interactive prompt, so explicit trust is respected instead
-                    # of always prompting.
-                    _auto_approved = False
-                    _auto_reason = ""
-                    if ctx:
-                        tool_result = ctx.hooks.on_tool_call(
-                            event.title,
-                            session_key=session_key,
-                            agent=agent,
-                            **hook_gate_kwargs(event),
-                        )
-                        if tool_result.action == TOOL_DENY:
-                            await client.reject_tool(event.request_id)
-                            sel().log_tool_invocation(
-                                session_key=session_key,
-                                agent=agent or "kirocrew",
-                                source="taskrunner",
-                                tool_name=event.title,
-                                tool_kind=event.tool_kind,
-                                outcome="denied",
-                                request_id=event.request_id,
-                                error="hook_deny",
-                            )
-                            continue
-                        if tool_result.action == TOOL_AUTO_APPROVE:
-                            # The hook granted this by NAME (its
-                            # `auto_approve_tools` globs, or the read-only
-                            # allowlist). Honour it only while each program name
-                            # in the command still resolves to the program it
-                            # appears to name; a shadowed, agent-tree or
-                            # unidentified resolution DOWNGRADES to this
-                            # surface's normal path below (interactive approval
-                            # when a handler is present, deny-by-default when
-                            # headless) — never a hard block.
-                            _ng_refusal = await name_grant.refusal_for_event(event)
-                            if _ng_refusal is None:
-                                _auto_approved = True
-                                _auto_reason = "hook_auto_approve"
-                            else:
-                                logger.warning(
-                                    "declining a hook auto-approve: %s; the request "
-                                    "falls through to the task runner's normal "
-                                    "approval path",
-                                    _ng_refusal.log_text,
-                                )
-                                name_grant.log_decline(
-                                    source="taskrunner",
-                                    session_key=session_key,
-                                    agent=agent or "kirocrew",
-                                    event=event,
-                                    refusal=_ng_refusal,
-                                    tier="hook_auto_approve",
-                                    sel_factory=sel,
-                                )
-
-                    # Per-run trust toggle: the user explicitly opted THIS run into
-                    # unattended execution via the dashboard. It is NOT the global
-                    # SafetyOverride singleton (which would leak trust to every
-                    # session); instead the authoritative grant is a task-scoped
-                    # SafetyOverride grant (scope `taskrunner:{task_id}:autoapprove`)
-                    # activated through the singleton's fail-closed audited
-                    # `activate_scoped()` and TTL-bounded there (dashboard window,
-                    # ≤24h ceiling) — so no independent approval state lives on the
-                    # run, and it satisfies the backend-security-controls expiry rule.
-                    # `run.auto_approve` is only the UI intent flag; the live decision
-                    # is `is_scope_active()`, re-checked before EVERY approval and
-                    # revoked the moment the grant lapses. It is deny-by-default (only a
-                    # literal `true` enables it), dashboard source-gated, SEL-audited as
-                    # `run_auto_approve`, and reset on crash-recovery. Compensating
-                    # controls stay intact: hook deny-lists / sensitive-path blocks
-                    # (handled above) still reject, and force_approval / requires_approval
-                    # task gates (separate task-level path) still pause for approval.
-                    if not _auto_approved and getattr(run, "auto_approve", False):
-                        _scope = f"{SESSION_PREFIX}:{run.task_id}:autoapprove"
-                        if safety_override().is_scope_active(_scope):
-                            _auto_approved = True
-                            _auto_reason = "run_auto_approve"
-                            # Slide the grant forward on activity so an actively
-                            # progressing run does not lose trust at the base TTL;
-                            # still hard-capped at the 24h ceiling from first grant,
-                            # so an abandoned (idle) run lapses as intended.
-                            safety_override().renew_scoped(_scope, source="dashboard")
-                        else:
-                            # Grant lapsed / absent — clear BOTH trust representations
-                            # together (intent flag + scoped grant, idempotent) and fall
-                            # through to interactive / deny-by-default. Bounds unattended
-                            # tool execution to the grant window.
-                            run.auto_approve = False
-                            safety_override().deactivate_scope(_scope)
-                            sel().log_api_access(
-                                caller="taskrunner",
-                                operation="task.auto_approve_expired",
-                                outcome="expired",
-                                source="taskrunner",
-                                resources=f"task-{task.index}",
-                            )
-
-                    # Mid-stream context check runs BEFORE authorization resolution:
-                    # context management is orthogonal to approval and must fire even
-                    # on the headless deny path, or overflow recovery (compact/reset)
-                    # would be skipped whenever a tool is about to be rejected.
-                    pct = client.context_usage_pct()
-                    if pct >= _MID_STREAM_COMPACT_PCT:
-                        await _reject_and_log(
-                            client,
-                            sel(),
-                            session_key,
-                            agent,
-                            event,
-                            metadata={"reason": "context_overflow", "pct": pct},
-                        )
-                        raise _ContextOverflow(pct)
-
-                    # Positive-authorization resolution (deny-by-default shape):
-                    # each path is explicit — no falsy-guard fall-through.
-                    if _auto_approved:
-                        approve_reason = _auto_reason or "hook_auto_approve"
-                    elif on_tool_approval:
-                        run.last_task_time = _time.time()
-                        approved = await on_tool_approval(event)
-                        if not approved:
-                            await _reject_and_log(client, sel(), session_key, agent, event)
-                            continue
-                        approve_reason = "interactive_approved"
-                    else:
-                        # No interactive handler and no explicit hook auto-approve:
-                        # the task runner is running headless (autonomous project /
-                        # cron) with no positive authorization for THIS tool.
-                        # Deny-by-default — reject. Tools the user explicitly trusts
-                        # via hooks.auto_approve_tools still pass (handled above as
-                        # TOOL_AUTO_APPROVE, independent of handler presence). We do
-                        # NOT read approval_mode or safety_override here: raw config
-                        # would bypass the SafetyOverride 24h TTL, and honoring the
-                        # override would reintroduce the global-YOLO dependency this
-                        # change deliberately avoids.
-                        await _reject_and_log(
-                            client,
-                            sel(),
-                            session_key,
-                            agent,
-                            event,
-                            metadata={"reason": "headless_no_authorization"},
-                        )
-                        continue
-
-                    await client.approve_tool(event.request_id)
-                    run.last_task_time = _time.time()
-                    sel().log_tool_invocation(
-                        session_key=session_key,
-                        agent=agent or "kirocrew",
-                        source="taskrunner",
-                        tool_name=event.title,
-                        tool_kind=event.tool_kind,
-                        outcome="approved",
-                        request_id=event.request_id,
-                        metadata={
-                            "task": task.index,
-                            "task_id": run.task_id,
-                            "reason": approve_reason,
-                            # Trust provenance: which launch surface granted this run.
-                            # run_auto_approve is dashboard-gated at the API boundary.
-                            "source": run.source,
-                        },
+                    settled = await tool_permission.settle(
+                        tool_permission.Ask(event, tool_permission.AcpWire(client), session_key),
+                        _policy,
                     )
+                    if settled.outcome == "bailed":
+                        # Not a verdict on the call: the turn is abandoned and
+                        # re-run after compaction.
+                        raise _ContextOverflow(settled.meta["pct"])
+                elif event.kind == EVENT_AGENT_SWITCHED:
+                    # A mid-run mode switch runs a different agent, so ITS spec hooks gate
+                    # the permission requests that follow, not the previous agent's. An
+                    # unnamed switch falls back to the agent the session recorded for it.
+                    switched_agent = event.text or switched_agent
+                    _spec = await turn_spec_hooks(client, event.text or "")
+                    _policy = _policy_for(spec=_spec)
+                    await refuse_stale_switch(client, event.text or "")
+                elif event.kind == CONTEXT_EVENT_COMPACTION:
+                    # The backend compacted the session on its own: the
+                    # session-start context is gone from its window, and the
+                    # finally arms the flag.
+                    if event.text == "completed":
+                        _turn_compacted = True
                 elif event.kind == EVENT_TOOL_CALL:
-                    # Fire PreToolUse hooks for auto-approved tools (informational only)
+                    _attempt_emitted = True
+                    # Fire PreToolUse hooks for auto-approved tools (informational only).
+                    # On a gated turn this frame precedes the call's permission request,
+                    # so nothing has approved it yet.
                     sel().log_tool_invocation(
                         session_key=session_key,
                         agent=agent or "kirocrew",
                         source="taskrunner",
                         tool_name=event.title,
                         tool_kind=event.tool_kind,
-                        outcome="auto_approved",
+                        outcome="invoked" if _spec.gated else "auto_approved",
                         metadata={"task": task.index, "task_id": run.task_id},
                     )
-                    await fire_tool_hooks(
-                        get_global_hook_store(),
-                        event.title,
-                        event.tool_input,
-                        parent_session_key=session_key or None,
-                        agent_role=(agent or "kirocrew"),
-                    )
+                    # A gated turn runs them on the permission request instead.
+                    if not _spec.gated:
+                        await fire_tool_hooks(
+                            get_global_hook_store(),
+                            event.title,
+                            event.tool_input,
+                            parent_session_key=session_key or None,
+                            agent_role=(agent or "kirocrew"),
+                        )
                 elif event.kind == EVENT_COMPLETE:
                     _complete_event = event
                     break
@@ -722,7 +966,7 @@ async def execute_task(
                 )
             # EVENT_COMPLETE only says the stream ended: a watchdog stall, a
             # runtime cancel or a transport death must not become a PASSED
-            # step. Same mapping as chat_runner / subagent run.py.
+            # step. Same mapping as chat_runner / subagent run_turn.py.
             _stop = classify_stop_reason(str(getattr(_complete_event, "stop_reason", "") or ""))
             if not _stop.is_success:
                 raise _TurnNotCompleted(
@@ -738,12 +982,19 @@ async def execute_task(
             # completion, never gets here: the raises above hand those to the
             # retry ladder, and the finally re-arms.
             _turn_landed = True
+            # The ONE place the resume hint is cleared: an attempt completed
+            # normally, so nothing it steered is left undone. See Task.resume_hint.
+            task.resume_hint = ""
+            # A landed turn proves recovery worked, so the next shared death
+            # starts its own count instead of inheriting one -- the same reason
+            # the chat runner clears it on a landed turn.
+            runtime_death.clear_shared_deaths(session_key)
             sessions.check_context_usage(session_key, client)
 
             # ── Per-turn usage row: attribute task-runner spend. ──
             try:
                 # circular import: reached while kiro_crew.slack.handler is still
-                # initialising (dashboard/handlers/files.py imports is_tracked_channel
+                # initialising (dashboard/file_api/channel_upload.py imports is_tracked_channel
                 # from it), so a module-scope import raises ImportError under the
                 # suite's import order.
                 from kiro_crew.dashboard.handlers.usage import (
@@ -773,22 +1024,65 @@ async def execute_task(
             except Exception:
                 logger.debug("usage row (taskrunner) persist failed", exc_info=True)
 
-        except AcpProcessDied:
-            recoveries += 1
+        except AcpProcessDied as _died_exc:
+            # Whose failure was this? A task runs its sub-agents on its own
+            # runtime, so a death here can be a process event several accounts
+            # witnessed rather than this task's fault -- and MAX_RECOVERIES then
+            # fails a task that did nothing wrong. The death was classified once
+            # where it was detected; this reads that record. A single-tenant
+            # runtime, and a death before the session opened, are charged exactly
+            # as before.
+            _own_fault = runtime_death.caused_by_this_session(_turn_provider)
+            if _own_fault:
+                recoveries += 1
+            else:
+                runtime_death.note_shared_death(session_key)
+            # ``recoveries`` stays MONOTONIC. Assigning the shared streak into it
+            # would refund budget already spent: two own-fault deaths followed by
+            # one shared death would read as 1, and the third own-fault death
+            # would still be under the limit -- replaying task work that is not
+            # idempotent. So the two counts run side by side and the LIMIT is
+            # tested against whichever is further along, exactly as the chat
+            # runner does with its own `_death_attempts`.
+            _death_attempts = max(recoveries, runtime_death.shared_deaths(session_key))
+            if not _own_fault:
+                logger.warning(
+                    "Task %d lost a turn to a SHARED runtime's death (%d running) — "
+                    "not charging this task's recovery budget",
+                    task.index,
+                    runtime_death.shared_deaths(session_key),
+                )
             partial = task.result or ""
-            task.error = f"Process died (recovery {recoveries}/{MAX_RECOVERIES})"
+            task.error = f"Process died (recovery {_death_attempts}/{MAX_RECOVERIES})"
             logger.warning(
                 "Task %d: process died (recovery %d/%d), partial: %.200s",
                 task.index,
-                recoveries,
+                _death_attempts,
                 MAX_RECOVERIES,
                 partial,
             )
+            if getattr(_died_exc, "ambiguous_delivery", False) or _attempt_emitted:
+                # The step's prompt may already have run: the death followed a
+                # stdin stall the live child may still read past
+                # (``ambiguous_delivery``), or the attempt had produced output or
+                # a tool call. Re-stating the task verbatim would re-run its
+                # (possibly non-idempotent) tools, so every later attempt --
+                # including a Resume or retry of a run that gives up below --
+                # opens by inspecting current state. Carried in resume_hint, not
+                # task.error, because a death keeps the attempt number and
+                # task.error renders only at attempt > 1. Set before the reset's
+                # await, so a cancel landing there cannot drop it. See
+                # Task.resume_hint.
+                task.resume_hint = RESUME_HINT
             await sessions.reset(session_key)
 
-            if recoveries > MAX_RECOVERIES:
+            if _death_attempts > MAX_RECOVERIES:
                 task.status = TaskStatus.FAILED
-                task.error = f"Process died {recoveries} times — giving up"
+                task.error = (
+                    f"Process died {_death_attempts} times — giving up"
+                    if _own_fault
+                    else f"The runtime this task shares died {_death_attempts} times — giving up"
+                )
                 return False
 
             if partial:
@@ -798,7 +1092,7 @@ async def execute_task(
                 )
             await on_notify(
                 f"💀 Task {task.index}: process died",
-                f"Recovering ({recoveries}/{MAX_RECOVERIES})…",
+                f"Recovering ({_death_attempts}/{MAX_RECOVERIES})…",
                 run=run,
             )
             run.last_task_time = _time.time()
@@ -806,6 +1100,11 @@ async def execute_task(
             continue
 
         except _ContextOverflow as cof:
+            if _attempt_emitted:
+                # The compaction can end in a session reset, after which the step
+                # prompt is restated on a fresh session: the same hazard as a
+                # death after output or a tool call.
+                task.resume_hint = RESUME_HINT
             compactions += 1
             pct = cof.args[0] if cof.args else 0
             logger.warning("Task %d: context at %.0f%%, compacting mid-stream", task.index, pct)
@@ -817,21 +1116,35 @@ async def execute_task(
                 f"⚠️ Context window {pct:.0f}% full — compressing conversation history. "
                 "Accuracy may degrade due to summarized context.\n\n"
             )
-            try:
-                await client.compact()
-                compact_result = await client.wait_for_compaction()
-                if compact_result.get("type") == "completed":
-                    logger.info("Task %d: compaction succeeded", task.index)
-                else:
-                    logger.warning(
-                        "Task %d: compaction %s, resetting session",
-                        task.index,
-                        compact_result.get("type", "unknown"),
-                    )
-                    await sessions.reset(session_key)
-            except Exception:
-                logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
+            unsupported = compact_unsupported_backend(client)
+            if unsupported:
+                # This backend never answers /compact, so the wait would only
+                # run out its budget before ending in this same reset.
+                logger.info(
+                    "Task %d: %s cannot compact, resetting session", task.index, unsupported
+                )
                 await sessions.reset(session_key)
+            else:
+                try:
+                    await client.compact()
+                    # The manager's budget, the one resolver every caller uses; it
+                    # holds in a standalone `kirocrew run`, which arms no
+                    # live-config watcher.
+                    compact_result = await client.wait_for_compaction(
+                        timeout=sessions.compact_wait_budget_secs()
+                    )
+                    if compact_result.get("type") == "completed":
+                        logger.info("Task %d: compaction succeeded", task.index)
+                    else:
+                        logger.warning(
+                            "Task %d: compaction %s, resetting session",
+                            task.index,
+                            compact_result.get("type", "unknown"),
+                        )
+                        await sessions.reset(session_key)
+                except Exception:
+                    logger.debug("Mid-stream compaction failed, resetting", exc_info=True)
+                    await sessions.reset(session_key)
             await on_notify(
                 f"🗜️ Task {task.index}: context compressed",
                 f"Context was {pct:.0f}% full — compacted to continue.",
@@ -960,13 +1273,14 @@ async def execute_task(
                 await sessions.reset(session_key)
             except Exception:
                 logger.debug("Session reset between retries failed", exc_info=True)
-            if previous_error and task.error == previous_error:
+            error_fp = _error_fingerprint(task.error)
+            if previous_error and error_fp == previous_error:
                 consecutive_same_error += 1
                 if await _check_error_loop(task, consecutive_same_error, on_notify, run):
                     return False
             else:
                 consecutive_same_error = 0
-            previous_error = task.error
+            previous_error = error_fp
             run.last_task_time = _time.time()
             if attempt < MAX_RETRIES + stop_recoveries:
                 continue
@@ -1030,7 +1344,8 @@ async def execute_task(
             except Exception:
                 logger.debug("Session reset between retries failed", exc_info=True)
 
-            if previous_error and task.error == previous_error:
+            error_fp = _error_fingerprint(task.error)
+            if previous_error and error_fp == previous_error:
                 consecutive_same_error += 1
                 should_fail = await _check_error_loop(
                     task,
@@ -1042,29 +1357,80 @@ async def execute_task(
                     return False
             else:
                 consecutive_same_error = 0
-            previous_error = task.error
+            previous_error = error_fp
             if attempt < MAX_RETRIES + stop_recoveries:
                 continue
             task.status = TaskStatus.FAILED
             return False
         finally:
             # A turn that consumed the post-compaction flag but never landed
-            # discarded the prompt carrying the re-injected context; put the
-            # flag back so the next attempt re-injects it.
+            # discarded the prompt carrying the re-injected context, and a
+            # backend that compacted the session during the turn dropped it;
+            # either way the flag is set so the next attempt re-injects it.
             rearm_reinjection(
-                sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed
+                sessions,
+                session_key,
+                consumed=_needs_reinjection,
+                landed=_turn_landed,
+                compacted=_turn_compacted,
             )
+            rollback_skill_bodies(ctx, session_key, landed=_turn_landed)
+            # Read before release: the report lives on this attempt's session,
+            # and a frame that landed mid-turn makes this reading the fuller
+            # one. A failure handler that already reset the session leaves it
+            # empty, so the reading taken at open stands in. Operator-only (log
+            # + dashboard notification), never fed back into a prompt.
+            mcp_problems = session_mcp_problems(_turn_provider) or _mcp_at_open
             if _acquired:
                 sessions.release(session_key)
+            if mcp_problems and mcp_problems != mcp_noticed:
+                mcp_noticed = mcp_problems
+                logger.warning(
+                    "Task %d: MCP servers unusable in this step — %s",
+                    task.index,
+                    mcp_problems,
+                )
+                try:
+                    await on_notify(
+                        f"\u26a0\ufe0f Task {task.index}: MCP servers unusable",
+                        f"MCP servers unusable in this step: {mcp_problems}",
+                        run=run,
+                    )
+                except Exception:
+                    logger.debug("MCP problem notice failed", exc_info=True)
 
-        # Run tests if configured
-        if auto_test and test_cmd:
+        # Only an exit-0 run of the configured command is PASSED (verified).
+        if not auto_test:
+            verdict, test_output = VerificationStatus.SKIPPED, "tests turned off"
+        elif not test_cmd:
+            verdict, test_output = VerificationStatus.NOT_CONFIGURED, "no test command"
+        else:
             test_ok, test_output = await run_tests(test_cmd, work_dir)
-            if not test_ok:
+            if test_ok is None:
+                verdict = VerificationStatus.SKIPPED
+            elif test_ok:
+                verdict = VerificationStatus.PASSED
+            else:
+                verdict = VerificationStatus.FAILED
+        task.verification = verdict
+        if verdict != VerificationStatus.PASSED:
+            if require_verification and verdict != VerificationStatus.FAILED:
+                # The verifier did not run, so the step fails on this attempt, without
+                # a retry. With tests off or no command, no agent turn can change
+                # that. A command that could not start is a fault in the configured
+                # command or its environment, not in the step's work. A path-style
+                # program resolves from the work directory, so a turn could create
+                # it, but the verdict would then come from a program the agent wrote.
+                verdict_text = verdict.replace("_", " ")
+                task.error = f"Verification is required but was {verdict_text}: {test_output}"
+                task.status = TaskStatus.FAILED
+                return False
+            if verdict == VerificationStatus.FAILED:
                 task.error = f"Tests failed:\n{test_output}"
                 logger.warning("Task %d tests failed (attempt %d)", task.index, attempt)
                 # Same retry logic as main task failure above
-                if previous_error and task.error == previous_error:
+                error_fp = _error_fingerprint(task.error)
+                if previous_error and error_fp == previous_error:
                     consecutive_same_error += 1
                     should_fail = await _check_error_loop(
                         task, consecutive_same_error, on_notify, run
@@ -1073,7 +1439,7 @@ async def execute_task(
                         return False
                 else:
                     consecutive_same_error = 0
-                previous_error = task.error
+                previous_error = error_fp
                 if attempt < MAX_RETRIES + stop_recoveries:
                     continue
                 task.status = TaskStatus.FAILED
@@ -1165,6 +1531,12 @@ async def build_task_prompt(run: Project, task: Task, attempt: int, work_dir: Pa
             f"Error: {task.error}\n\nFix the error and try again.\n"
         )
 
+    # Rendered regardless of attempt count: a process death keeps the attempt
+    # number, so this cannot ride on the attempt > 1 guard above. Never cleared
+    # here; see Task.resume_hint for the one rule.
+    if task.resume_hint:
+        parts.append(f"\n## Resume (do not restart)\n{task.resume_hint}\n")
+
     wd = run.work_dir or str(work_dir)
     if run.branch_name:
         parts.append(
@@ -1216,8 +1588,15 @@ async def self_review(
     session_key: str = "",
     *,
     ctx: "ContextBuilder | None" = None,
+    commit_failed: bool = False,
 ) -> bool:
-    """Review task using a separate session that reads the actual git diff."""
+    """Review task using a separate session that reads the actual git diff.
+
+    Fails closed: a review error, or a git run whose step has no diff to show,
+    returns False with ``task.error`` starting ``_REVIEW_UNVERIFIED``. A step
+    whose commit failed (non-fatal by design) has no diff for that reason, so it
+    keeps the generic review instead.
+    """
     review_key = f"{SESSION_PREFIX}:{run.task_id}:review"
     from kiro_crew.context import inherit_session_memory
 
@@ -1230,6 +1609,10 @@ async def self_review(
             except Exception:
                 pass
 
+        if run.branch_name and not commit_failed and not diff.strip():
+            task.error = f"{_REVIEW_UNVERIFIED}: the step left no diff to review"
+            logger.warning("Task %d unverified: no diff on a git run", task.index)
+            return False
         if diff.strip():
             prompt = (
                 "You are an independent review agent. You did NOT write this code.\n"
@@ -1270,7 +1653,7 @@ async def self_review(
         # ── Per-turn usage row: self-review is a separate model turn. ──
         try:
             # circular import: reached while kiro_crew.slack.handler is still
-            # initialising (dashboard/handlers/files.py imports is_tracked_channel
+            # initialising (dashboard/file_api/channel_upload.py imports is_tracked_channel
             # from it), so a module-scope import raises ImportError under the
             # suite's import order.
             from kiro_crew.dashboard.handlers.usage import (
@@ -1305,8 +1688,9 @@ async def self_review(
             return False
         return True
     except Exception:
-        logger.debug("Self-review failed", exc_info=True)
-        return True  # don't block on review failure
+        logger.warning("Self-review errored for task %d", task.index, exc_info=True)
+        task.error = f"{_REVIEW_UNVERIFIED}: the review itself failed"
+        return False
     finally:
         sessions.release(review_key)
         await sessions.reset(review_key)
@@ -1368,8 +1752,35 @@ def _close_proc_pipes(proc: asyncio.subprocess.Process) -> None:
             logger.debug("run_tests: closing proc transport failed", exc_info=True)
 
 
-async def run_tests(test_cmd: list[str], work_dir: Path) -> tuple[bool, str]:
-    """Run the configured test command. Returns (success, output)."""
+def _test_command_start_problem(test_cmd: list[str], work_dir: Path, env: dict[str, str]) -> str:
+    """Why *test_cmd* cannot start in *work_dir*, or "" when nothing says so.
+
+    On POSIX the program is exec'd in the child, by the spawn shim or by a
+    sandbox wrapper, where a missing one is only an exit status (the shim's 127).
+    So it is resolved here first, the way the child resolves it: a bare name on
+    the child's PATH with the spawn's own resolver, a path from the work
+    directory. On Windows CreateProcess resolves the program in the parent and
+    raises FileNotFoundError itself.
+    """
+    if not os.path.isdir(work_dir):
+        return f"working directory {work_dir} is not a directory"
+    if not platform_compat.IS_POSIX:
+        return ""
+    program = test_cmd[0]
+    try:
+        _resolve_spawn_target(test_cmd, env, work_dir)  # a bare name; a path comes back as is
+    except FileNotFoundError:
+        return f"{program!r} is not on PATH"
+    if os.sep in program and shutil.which(os.path.join(work_dir, program)) is None:
+        return f"{program!r} is not an executable file"
+    return ""
+
+
+async def run_tests(test_cmd: list[str], work_dir: Path) -> tuple[bool | None, str]:
+    """Run the configured test command. Returns (success, output).
+
+    ``success`` is None when the command could not start: nothing was verified.
+    """
     # The test command and its working directory are both agent-influenced, so
     # route the spawn through the sandbox chokepoint: OS-level isolation plus a
     # credential-scrubbed environment.
@@ -1378,6 +1789,13 @@ async def run_tests(test_cmd: list[str], work_dir: Path) -> tuple[bool, str]:
     )
     proc: asyncio.subprocess.Process | None = None
     try:
+        # Stats the working directory and PATH entries, so it runs off the loop.
+        problem = await asyncio.to_thread(_test_command_start_problem, test_cmd, work_dir, env)
+        if problem:
+            logger.warning(
+                "TaskRunner: test command could not start (%s); step not verified", problem
+            )
+            return None, f"test command could not start: {problem} (not verified)"
         proc = await create_subprocess_limited(
             *argv,
             cwd=str(work_dir),
@@ -1405,8 +1823,8 @@ async def run_tests(test_cmd: list[str], work_dir: Path) -> tuple[bool, str]:
         logger.warning("TaskRunner: tests timed out after %ds", TEST_TIMEOUT)
         return False, f"Test timed out after {TEST_TIMEOUT}s"
     except FileNotFoundError:
-        logger.debug("Test command not found, skipping tests")
-        return True, "test command not found (skipped)"
+        logger.warning("TaskRunner: test command could not start; step not verified")
+        return None, "test command could not start (not verified)"
     finally:
         # Reap the process group on EVERY exit path (timeout, crash, or normal
         # return where communicate() left the child alive) so orphaned test

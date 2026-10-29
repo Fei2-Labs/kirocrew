@@ -401,8 +401,61 @@ async def test_fork_suffixes_past_reserved_windows_basename(tmp_path):
     assert set(after) == set(before) | {"con-2.json"}
     assert {name: after[name] for name in before} == before
     expected = {**json.loads(before["mytemplate.json"]), "name": "con-2"}
-    assert json.loads(after["con-2.json"]) == expected
+    # The fork refresh that follows the copy runs the governed-write tail: it pins
+    # the global mcp.json merge off and seeds a KAS block when the installed
+    # kiro-cli accepts one, so those two keys are what differ from the copy.
+    written = json.loads(after["con-2.json"])
+    written.pop("permissions", None)
+    assert written == {**expected, "includeMcpJson": False}
     writer.assert_called_once_with(agents_dir / "con-2.json", expected)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "crew", ["default", "vibe", "spec", "quick-spec", "bug-fix", "plan", "autonomous"]
+)
+async def test_fork_suffixes_past_the_kas_reserved_ids(tmp_path, crew):
+    """The seeded first crewmate is named ``default``, and the KAS engine keeps
+    that id and its built-in mode ids for itself -- a client agent under one is
+    dropped or shadowed by the built-in without an error -- so a copy on that
+    stem would bind the crew to a mode KAS never runs as the crew's own. The
+    generated name suffixes past it, whether or not ``<crew>.json`` exists."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "kirocrew")
+    _seed_config(crew, "kirocrew")
+    assert not (agents_dir / f"{crew}.json").exists()
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("kirocrew", {"crew": crew}))
+
+    assert resp.status == 200
+    body = json.loads(resp.text)
+    assert body["template"] == f"{crew}-2"
+    assert not (agents_dir / f"{crew}.json").exists()
+    assert json.loads((agents_dir / f"{crew}-2.json").read_text())["name"] == f"{crew}-2"
+    assert agent_state.get_fork_info(f"{crew}-2") == {
+        "forked_from": "kirocrew",
+        "private_to": crew,
+    }
+    assert KiroCrewConfig.load().agents[crew].kiro_agent == f"{crew}-2"
+
+
+@pytest.mark.asyncio
+async def test_fork_reserved_id_match_is_case_sensitive(tmp_path):
+    """``Default`` registers on KAS as an ordinary client agent (measured), so a
+    crew of that name keeps its own stem."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "kirocrew")
+    _seed_config("Default", "kirocrew")
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("kirocrew", {"crew": "Default"}))
+
+    assert resp.status == 200
+    assert json.loads(resp.text)["template"] == "Default"
+    assert (agents_dir / "Default.json").exists()
 
 
 @pytest.mark.asyncio
@@ -521,3 +574,28 @@ async def test_fork_clears_a_stale_refresh_failure(tmp_path, monkeypatch):
         # now corroborating the fork — the spawn gate passes.
         assert "design-crew" not in agent_mod._fork_refresh_failed
         agent_mod.require_fork_governance("design-crew")
+
+
+@pytest.mark.asyncio
+async def test_fork_ambiguous_refusal_names_the_claimant_files(tmp_path):
+    """Two files claiming the name: the 409 names both by file name inside
+    ~/.kiro/agents/, never the absolute path, and keeps its code."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    _write_template(agents_dir, "mytemplate")
+    (agents_dir / "SomePkg-mytemplate.json").write_text(
+        json.dumps({"name": "mytemplate", "model": "claude-x"}), encoding="utf-8"
+    )
+    _seed_config("design-crew", "mytemplate")
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir):
+        resp = await api_agent_fork(_fork_request("mytemplate", {"crew": "design-crew"}))
+
+    assert resp.status == 409
+    body = json.loads(resp.text)
+    assert body == {
+        "error": "'mytemplate' matches more than one template file in ~/.kiro/agents/ "
+        "(SomePkg-mytemplate.json, mytemplate.json); rename one first.",
+        "code": "ambiguous_template_name",
+    }
+    assert not (agents_dir / "design-crew.json").exists()

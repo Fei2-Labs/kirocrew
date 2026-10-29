@@ -38,42 +38,36 @@ esac
 if [ -z "$PKG_DIR" ]; then
   PKG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/kiro_crew"
 fi
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ ! -d "$PKG_DIR" ]; then
   echo "ERROR: package dir not found: $PKG_DIR" >&2
   exit 1
 fi
 
-# Fork revision, derived from the repository this script lives in -- NOT from
-# the CWD, which for a packaging run is wherever the build was invoked. Every
-# failure (no git, not a repository, a shallow export) degrades to an empty
-# revision, which fork_version.py reads as "not a fork build" and renders as the
-# plain base version. Never fatal: a version string must not fail a build.
+# Fork revision and website tree are derived from this script's repository,
+# not PKG_DIR: packaging tests and some build jobs stamp a staged package copy.
 FORK_REVISION=""
 FORK_DIRTY="False"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if command -v git >/dev/null 2>&1 && git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1; then
-  # --short=8 matches fork_version.REVISION_WIDTH. `|| true` so `set -e` cannot
-  # abort the packaging run on an unborn HEAD.
   FORK_REVISION="$(git -C "$REPO_DIR" rev-parse --short=8 HEAD 2>/dev/null || true)"
-  # Untracked entries count only under the paths that SHIP, matching
-  # fork_version.SHIPPED_SOURCE_PATHS. A bare `status --porcelain` reads every
-  # untracked entry as dirtiness, and a working checkout permanently carries
-  # operator scratch (.kiro/, .trellis/, .playwright-mcp/) that is untracked
-  # without being ignored -- so every packaged build got stamped dirty, and a
-  # marker that never clears carries no signal. A tracked modification anywhere
-  # still counts.
-  if [ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
-    FORK_DIRTY="True"
-  elif [ -n "$(git -C "$REPO_DIR" status --porcelain -- src/kiro_crew website/src 2>/dev/null || true)" ]; then
+  if [ -n "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)" ] ||
+     [ -n "$(git -C "$REPO_DIR" status --porcelain -- src/kiro_crew website/src 2>/dev/null || true)" ]; then
     FORK_DIRTY="True"
   fi
 fi
-# Reject anything that is not a lowercase-hex object name before it reaches a
-# generated Python literal.
 case "$FORK_REVISION" in
   *[!0-9a-f]*|"") FORK_REVISION="" ;;
 esac
+
+# git tree id of website/ in the tree being packaged. Baked alongside
+# DISTRIBUTION so the dashboard bundle-freshness guard can compare it against
+# the website/ tree the served dist was built from (see
+# src/kiro_crew/dashboard/stale_bundle_guard.py). A tree id, not HEAD: a
+# backend-only commit must not make a correct bundle look stale. Empty-safe:
+# git may be unavailable in some packaging sandboxes (a staged copy is not a
+# git repo), in which case WEBSITE_TREE stays "" and the guard skips silently.
+WEBSITE_TREE="$(git -C "$REPO_DIR" rev-parse HEAD:website 2>/dev/null || true)"
 
 cat > "$PKG_DIR/_build_info.py" <<EOF
 """Build-time provenance. GENERATED - do not edit and do not commit.
@@ -86,6 +80,7 @@ normal case and reports "source".
 from __future__ import annotations
 
 DISTRIBUTION = "$DIST"
+WEBSITE_TREE = "$WEBSITE_TREE"
 
 #: True whenever this file was written by stamp-distribution.sh, so an EMPTY
 #: FORK_REVISION is an authoritative "no fork revision" rather than "not asked".
@@ -99,4 +94,4 @@ FORK_REVISION = "$FORK_REVISION"
 FORK_DIRTY = $FORK_DIRTY
 EOF
 
-echo "Stamped distribution=$DIST fork=${FORK_REVISION:-none} dirty=$FORK_DIRTY -> $PKG_DIR/_build_info.py"
+echo "Stamped distribution=$DIST fork=${FORK_REVISION:-none} dirty=$FORK_DIRTY website_tree=${WEBSITE_TREE:-<none>} -> $PKG_DIR/_build_info.py"

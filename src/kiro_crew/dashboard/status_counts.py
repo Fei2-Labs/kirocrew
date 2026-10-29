@@ -224,11 +224,19 @@ async def cached_status_snapshot(state: DashboardState) -> dict[str, Any]:
     skeleton) rather than an authoritative false 0. ``ws._status_frame`` was the
     only emitter with this shape before; now all three go through here.
     """
-    # Lazy import: handlers/updates.py imports this module at module level, so
+    # Lazy import: handlers/updates_streams.py imports this module at module level, so
     # a module-level import here would form a cycle.
-    from kiro_crew.dashboard.handlers.updates import status_update_fields
+    from kiro_crew.dashboard.handlers.updates import (
+        prime_status_auto_update_effect,
+        status_update_fields,
+    )
 
     crons, lessons = await _refresh_status_counts(state)
+    # The reader below runs on the loop; the effect it may need is derived here,
+    # off it, once per process.
+    await prime_status_auto_update_effect()
+    # stat + read of the served index.html: one worker hop, never on the loop.
+    bundle_id = await asyncio.to_thread(DashboardState.served_bundle_id)
     # ``status_update_fields()`` is typed ``dict[str, object]``; spreading it
     # into the keyword-only ``status_snapshot`` signature is sound at runtime
     # (every key is a real parameter —
@@ -237,5 +245,6 @@ async def cached_status_snapshot(state: DashboardState) -> dict[str, Any]:
     return state.status_snapshot(
         cron_jobs=crons,
         lessons=lessons,
+        bundle_id=bundle_id,
         **status_update_fields(),  # type: ignore[arg-type]
     )

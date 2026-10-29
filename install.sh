@@ -11,6 +11,11 @@
 #
 # Options:
 #   --voice   Install optional voice extras (pip install -e .[voice])
+#   --kas     Download the KAS engine this release pins (kirocrew kas install)
+#             so the built-in engine route can be turned on later with no
+#             download. The switch (agent.kas_bundle) is NOT turned on: the
+#             route is in shadow testing on every platform, so the default
+#             stays kiro-cli until you flip it yourself.
 #   --mise    Use mise (https://mise.jdx.dev) for Python and Node.js
 #             instead of system package managers. Does not modify your
 #             global mise config.
@@ -33,10 +38,12 @@ unset PYTHONPATH PYTHONHOME
 # ── Parse arguments ──
 USE_MISE=0
 WITH_VOICE=0
+WITH_KAS=0
 for _arg in "$@"; do
     case "$_arg" in
         --mise)  USE_MISE=1 ;;
         --voice) WITH_VOICE=1 ;;
+        --kas)   WITH_KAS=1 ;;
         *) echo "Error: unknown argument '$_arg'" >&2; exit 1 ;;
     esac
 done
@@ -48,10 +55,14 @@ KIROCREW_APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 # pre-move ~/.kirocrew, which is not the data home).
 KIROCREW_DATA_DIR="${KIROCREW_HOME:-$HOME/.kiro/crew}"
 NODE_VERSION="24"
-# Minimum Node major the frontend build actually supports. Defined here
-# (not just at the post-install check) because DETECTION consults it: a
-# pre-existing but too-old node must not short-circuit the install ladder.
-NODE_MIN_MAJOR=22
+# Minimum Node version (major.minor.patch) Kiro Crew supports -- the same
+# floor as MIN_NODE_VERSION in src/kiro_crew/constants.py and ensure-node.sh.
+# A full version, not a major: an early 22.x lacks APIs the code needs
+# (worker_threads.markAsUncloneable landed in 22.10.0) and is below the
+# bundler's declared ">=22.12.0". Defined here (not just at the post-install
+# check) because DETECTION consults it: a pre-existing but too-old node must
+# not short-circuit the install ladder.
+NODE_MIN_VERSION="22.12.0"
 PYTHON_VERSION="3.12"
 KIROCREW_PORT="${KIROCREW_PORT:-5476}"
 ACP_NPM_PKG="@agentclientprotocol/claude-agent-acp"
@@ -135,8 +146,18 @@ has() { command -v "$1" >/dev/null 2>&1; }
 # fails the comparison, which is the intended answer.
 node_supported() {
     has node || return 1
-    _n="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//' | cut -d. -f1)"
-    [ -n "$_n" ] && [ "$_n" -ge "$NODE_MIN_MAJOR" ] 2>/dev/null
+    _nv="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//')"
+    _maj="$(printf '%s' "$_nv" | cut -d. -f1)"
+    _min="$(printf '%s.0' "$_nv" | cut -d. -f2)"
+    _pat="$(printf '%s.0.0' "$_nv" | cut -d. -f3)"
+    _fmaj="$(printf '%s' "$NODE_MIN_VERSION" | cut -d. -f1)"
+    _fmin="$(printf '%s' "$NODE_MIN_VERSION" | cut -d. -f2)"
+    _fpat="$(printf '%s' "$NODE_MIN_VERSION" | cut -d. -f3)"
+    [ "$_maj" -gt "$_fmaj" ] 2>/dev/null && return 0
+    [ "$_maj" -eq "$_fmaj" ] 2>/dev/null || return 1
+    [ "$_min" -gt "$_fmin" ] 2>/dev/null && return 0
+    [ "$_min" -eq "$_fmin" ] 2>/dev/null || return 1
+    [ "$_pat" -ge "$_fpat" ] 2>/dev/null
 }
 
 # ── Pre-flight ──
@@ -316,7 +337,7 @@ if node_supported; then
 elif has node; then
     # Present but below the floor: say so, then fall through to the install
     # ladder below rather than building against it.
-    info "Node.js $(node --version 2>/dev/null || echo v0) is below the supported floor (>= $NODE_MIN_MAJOR) — installing a supported Node…"
+    info "Node.js $(node --version 2>/dev/null || echo v0) is below the supported floor (>= v$NODE_MIN_VERSION) — installing a supported Node…"
     if has apt-get; then
         sudo apt-get install -y nodejs npm >/dev/null 2>&1 || true
     elif has dnf; then
@@ -339,7 +360,7 @@ elif has node; then
     fi
     node_supported \
         && ok "Node.js $(node --version) now active" \
-        || warn "Node.js is still below v$NODE_MIN_MAJOR — the frontend build will fail"
+        || warn "Node.js is still below v$NODE_MIN_VERSION — the frontend build will fail"
 elif has apt-get; then
     info "Installing nodejs via apt…"
     sudo apt-get install -y nodejs npm >/dev/null 2>&1
@@ -377,9 +398,8 @@ fi # USE_MISE -eq 0 (Node.js)
 if has node; then
     # `|| echo v0` keeps a broken node binary (loader error) from killing the
     # installer under `set -e`; v0 then trips the floor warning below.
-    _node_major="$( { node --version 2>/dev/null || echo v0; } | sed 's/^v//' | cut -d. -f1)"
-    if [ -n "$_node_major" ] && [ "$_node_major" -lt "$NODE_MIN_MAJOR" ] 2>/dev/null; then
-        warn "Node.js v$_node_major is below the supported floor (>= $NODE_MIN_MAJOR) — the frontend build will fail"
+    if ! node_supported; then
+        warn "Node.js $( { node --version 2>/dev/null || echo v0; } ) is below the supported floor (>= v$NODE_MIN_VERSION) — the frontend build will fail"
         detail "Install Node.js $NODE_VERSION (LTS): https://nodejs.org or 'nvm install $NODE_VERSION'"
     fi
 fi
@@ -405,8 +425,13 @@ else
     warn "npm not available — install the agent backend later:"
     detail "npm i -g $ACP_NPM_PKG"
 fi
-warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
-detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
+if [ "$WITH_KAS" -eq 1 ]; then
+    info "The built-in KAS engine will be downloaded (--kas); the switch stays off until you turn it on."
+else
+    warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
+    detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
+    detail "Or re-run with --kas to download the built-in engine instead (no kiro-cli)."
+fi
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 3: Build
@@ -423,16 +448,60 @@ if has node && [ -d "$KIROCREW_APP_DIR/website" ]; then
     _fe_log="$(mktemp)"
     (
         cd "$KIROCREW_APP_DIR/website" &&
+        # Raise V8's heap ceiling for the bundle build. The default (~2 GB on
+        # 64-bit) is not enough for this app's 6k+ module graph, and the OOM
+        # surfaces as a build that dies without a clear cause -- leaving no
+        # dist/ and a "Dashboard HTML not found" page at first launch.
+        _fe_build() { NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}" npm run build 2>>"$_fe_log"; }
+
+        # Install the exact platform-specific rolldown native binding the
+        # bundler needs, keyed off the resolved rolldown version. Last-resort
+        # repair for npm/cli#4828 when even a clean reinstall omits it.
+        _fe_install_binding() {
+            _rd_ver="$(node -p "require('./node_modules/rolldown/package.json').version" 2>/dev/null)" || return 1
+            [ -n "$_rd_ver" ] || return 1
+            case "$(uname -s)" in
+                Linux)  _rd_os="linux" ;;
+                Darwin) _rd_os="darwin" ;;
+                *) return 1 ;;
+            esac
+            case "$(uname -m)" in
+                x86_64|amd64)  _rd_arch="x64" ;;
+                aarch64|arm64) _rd_arch="arm64" ;;
+                *) return 1 ;;
+            esac
+            _rd_abi=""
+            if [ "$_rd_os" = "linux" ]; then
+                if ldd --version 2>&1 | grep -qi musl; then _rd_abi="-musl"; else _rd_abi="-gnu"; fi
+            fi
+            echo "installing @rolldown/binding-${_rd_os}-${_rd_arch}${_rd_abi}@${_rd_ver} explicitly (npm/cli#4828)" >>"$_fe_log"
+            npm install --no-audit --no-fund --no-save --loglevel=error \
+                "@rolldown/binding-${_rd_os}-${_rd_arch}${_rd_abi}@${_rd_ver}" 2>>"$_fe_log"
+        }
+
         if [ -f package-lock.json ]; then
             npm ci --no-audit --no-fund --loglevel=error 2>"$_fe_log"
         else
             npm install --no-audit --no-fund --loglevel=error 2>"$_fe_log"
         fi &&
-        # Raise V8's heap ceiling for the bundle build. The default (~2 GB on
-        # 64-bit) is not enough for this app's 6k+ module graph, and the OOM
-        # surfaces as a build that dies without a clear cause -- leaving no
-        # dist/ and a "Dashboard HTML not found" page at first launch.
-        NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}" npm run build 2>>"$_fe_log"
+        # npm's optional-dependencies bug (npm/cli#4828) can leave `npm ci`
+        # without the platform-specific native binding the bundler needs
+        # (e.g. @rolldown/binding-<os>-<arch>), so the build aborts with
+        # "Cannot find native binding". `npm ci` replays a lockfile resolved
+        # on another OS/arch and drops the entry for THIS platform. Recover in
+        # two escalating steps: drop node_modules and let `npm install`
+        # re-evaluate optional deps for the current platform (the tracked
+        # package-lock.json is left in place), then, if that still omits it,
+        # install the exact binding explicitly. Each step rebuilds; the first
+        # that produces a bundle wins.
+        if ! _fe_build; then
+            echo "npm run build failed; re-resolving optional native deps (npm/cli#4828) and retrying" >>"$_fe_log"
+            rm -rf node_modules
+            npm install --no-audit --no-fund --loglevel=error 2>>"$_fe_log"
+            if ! _fe_build; then
+                _fe_install_binding && _fe_build
+            fi
+        fi
     ) &
     spinner $! "Installing npm packages & building React app…"
     _fe_ok=0
@@ -471,7 +540,7 @@ if has node && [ -d "$KIROCREW_APP_DIR/website" ]; then
     fi
 else
     warn "Skipping frontend build (Node.js or website/ not available)"
-    detail "Install Node.js 22+ (24 LTS recommended) for the full React dashboard experience"
+    detail "Install Node.js 22.12+ (24 LTS recommended) for the full React dashboard experience"
 fi
 
 # ── Python virtual environment & package ──
@@ -722,6 +791,19 @@ if [ -n "$_kirocrew" ]; then
     KIROCREW_PROJECT_DIR="$KIROCREW_APP_DIR" "$_kirocrew" setup --agent-only \
         && ok "Agent config installed" \
         || warn "kirocrew setup --agent-only failed (run manually after install)"
+    if [ "$WITH_KAS" -eq 1 ]; then
+        # The engine this release pins, fetched from the project's CDN and
+        # verified against the pin baked into this checkout. The switch is left
+        # alone on purpose: the route is in shadow testing, so turning it on is
+        # the user's own step (Settings → Agent Harness, or `kirocrew config set
+        # agent.kas_bundle true`), never the installer's.
+        info "Downloading the built-in KAS engine (kirocrew kas install)…"
+        if "$_kirocrew" kas install; then
+            ok "Built-in KAS engine installed (switch it on: kirocrew config set agent.kas_bundle true)"
+        else
+            warn "kirocrew kas install failed — run it again after install"
+        fi
+    fi
 fi
 
 ok "Run ${CYAN}kirocrew setup${RESET} to configure agent, workspace, and integrations"
@@ -753,6 +835,10 @@ echo ""
 echo "    ${CYAN}2.${RESET} Set up the default Kiro agent (skip if you selected another ACP backend):"
 echo "       ${GREEN}Install Kiro CLI from https://kiro.dev/cli/${RESET}"
 echo "       ${GREEN}kiro-cli login${RESET}"
+if [ "$WITH_KAS" -eq 1 ]; then
+echo "       To try the built-in KAS engine instead (shadow testing, off by default):"
+echo "       ${GREEN}kirocrew config set agent.kas_bundle true${RESET}  then sign in from the dashboard"
+fi
 echo ""
 echo "    ${CYAN}3.${RESET} Run the setup wizard:"
 echo "       ${GREEN}kirocrew setup${RESET}"

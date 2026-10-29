@@ -138,6 +138,48 @@ describe("electron-builder files list", () => {
     assert.deepStrictEqual(missing, [], `Missing from build.files: ${missing.join(", ")}`);
   });
 
+  it("reaches every runtime owner from main.js through requires the packaging scans read", () => {
+    // shell-contract.test.js checks that every double-quoted relative require
+    // resolves to a listed file. That check is blind to a single-quoted or
+    // template require, and to an owner no facade composes (listed, shipped and
+    // dead). Walk the closure from the entry point to close both gaps.
+    const closure = new Set();
+    const pending = ["main.js"];
+    while (pending.length) {
+      const file = pending.pop();
+      if (closure.has(file)) continue;
+      closure.add(file);
+      const source = fs.readFileSync(path.join(ROOT, file), "utf8");
+      assert.doesNotMatch(
+        source,
+        /require\(\s*(?:'\.|`\.)/,
+        `${file} has a relative require the packaging scans cannot read; use double quotes`,
+      );
+      for (const match of source.matchAll(/require\(\s*"(\.{1,2}\/[^"]+)"\s*\)/g)) {
+        const target = path.posix.normalize(path.posix.join(path.posix.dirname(file), match[1]));
+        const resolved = target.endsWith(".js") ? target : `${target}.js`;
+        if (!fs.existsSync(path.join(ROOT, resolved))) continue;
+        pending.push(resolved);
+      }
+    }
+    // Every runtime owner on disk is reached from main.js and packaged: none is
+    // an orphan that only a test loads.
+    const runtimeOwners = [];
+    for (const area of fs.readdirSync(path.join(ROOT, "runtime"))) {
+      for (const name of fs.readdirSync(path.join(ROOT, "runtime", area))) {
+        if (name.endsWith(".js")) runtimeOwners.push(`runtime/${area}/${name}`);
+      }
+    }
+    assert.deepStrictEqual(
+      runtimeOwners.filter((f) => !closure.has(f)).sort(),
+      [],
+      "every runtime owner is composed by a facade main.js reaches",
+    );
+    for (const facade of ["gateway-supervisor.js", "window-lifecycle.js", "auto-update.js", "crash-collector.js"]) {
+      assert.ok(closure.has(facade), `${facade} stays the entry the shell loads`);
+    }
+  });
+
   it("does not reference files that no longer exist", () => {
     // Every entry is checked-in source EXCEPT the build-time inputs a build
     // places here on demand (BUILD_TIME_INPUTS, shared with shell-contract.test.js):
@@ -304,8 +346,15 @@ describe("first-download installer design contract", () => {
       "customFinishPage may diverge from the locked StartApp contract ONLY in its launch target"
     );
     assert.match(buildWorkflow, /test-windows-installer\.ps1/);
-    assert.match(runtimeScript, /^\$MaxInstallSeconds = 120$/m);
-    assert.match(runtimeScript, /^\$MaxGatewayReadySeconds = 30$/m);
+    assert.match(runtimeScript, /^\$MaxInstallSeconds = 200$/m);
+    // The PR gate is the performance ceiling: tighter than the release smoke, never looser.
+    const releaseSmoke = fs.readFileSync(
+      path.join(REPO_ROOT, "scripts", "smoke-windows-install.ps1"),
+      "utf8"
+    );
+    const ceiling = (text) => Number(text.match(/^\$MaxInstallSeconds = (\d+)$/m)[1]);
+    assert.ok(ceiling(runtimeScript) <= ceiling(releaseSmoke));
+    assert.match(runtimeScript, /^\$MaxGatewayReadySeconds = 50$/m);
     assert.match(runtimeScript, /silent-install-seconds=/);
     assert.match(runtimeScript, /gateway-ready-seconds=/);
     // The pyc floor is a parameter now (build.yml passes a lower value for the
@@ -342,14 +391,26 @@ describe("first-download installer design contract", () => {
       /LangString KiroCliPrerequisiteLink 1033 "Open the Kiro CLI setup guide"/,
     );
 
+    // The fresh-install default is KAS, which still launches through Kiro CLI's
+    // own ACP relay and accepts its `kiro-cli login`. The copy above stays true
+    // only while that default is a Kiro CLI–hosted agent, so pin it here.
+    const backends = fs.readFileSync(
+      path.join(REPO_ROOT, "src", "kiro_crew", "agent_sdk", "backends.py"),
+      "utf8",
+    );
+    assert.match(
+      backends,
+      /^DEFAULT_ACP_BACKEND = ACP_BACKEND_(KAS|KIRO)$/m,
+      "installer copy must change if a fresh configuration stops defaulting to a Kiro CLI-hosted agent",
+    );
     const configSections = fs.readFileSync(
-      path.join(REPO_ROOT, "src", "kiro_crew", "config", "sections.py"),
+      path.join(REPO_ROOT, "src", "kiro_crew", "config", "sections_agent.py"),
       "utf8",
     );
     assert.match(
       configSections,
-      /acp_backend: str = field\(\s*default=""/,
-      "installer copy must change if a fresh configuration stops defaulting to Kiro",
+      /acp_backend: str = field\(\s*default=DEFAULT_ACP_BACKEND/,
+      "the field default must read DEFAULT_ACP_BACKEND, the value pinned above",
     );
 
     const updateLocales = [
@@ -383,6 +444,42 @@ describe("first-download installer design contract", () => {
       installer,
       /!macro customPublishAppPackage SOURCE DESTINATION[\s\S]*?Rename "\$\{SOURCE\}\\resources" "\$\{DESTINATION\}\\resources"[\s\S]*?Rename "\$\{SOURCE\}\\locales" "\$\{DESTINATION\}\\locales"[\s\S]*?CopyFiles \/SILENT "\$\{SOURCE\}\\\*" "\$\{DESTINATION\}"/
     );
+  });
+
+  it("ships no kiro-cli unless BUNDLE_KIRO_CLI=1 opts the build in", () => {
+    // The shipped app detects the user's own kiro-cli; the first-run gate
+    // tells them to install one. A bundled copy ranks above every system
+    // install, which hides that step and freezes the runtime at the pin, so
+    // the default is off and the install smokes refuse an unasked-for payload.
+    const buildScript = fs.readFileSync(
+      path.join(REPO_ROOT, "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    assert.match(buildScript, /if \[ "\$\{BUNDLE_KIRO_CLI:-0\}" = "1" \]; then\n\s*fetch_kiro_cli/);
+    for (const smoke of ["smoke-macos-install.sh", "smoke-windows-install.ps1"]) {
+      const text = fs.readFileSync(path.join(REPO_ROOT, "scripts", smoke), "utf8");
+      assert.doesNotMatch(text, /BUNDLE_KIRO_CLI:-1|BUNDLE_KIRO_CLI -ne "0"|BUNDLE_KIRO_CLI -eq "0"/, smoke);
+    }
+    for (const workflow of ["build-desktop.yml", "build-windows.yml"]) {
+      // Non-comment lines only: a comment may NAME the opt-in while explaining
+      // the default; what must not appear is a step that sets or logs it.
+      const text = fs.readFileSync(path.join(REPO_ROOT, ".github", "workflows", workflow), "utf8")
+        .split("\n").filter(line => !/^\s*#/.test(line)).join("\n");
+      assert.doesNotMatch(text, /Bundling kiro-cli|BUNDLE_KIRO_CLI/, workflow);
+    }
+  });
+
+  it("stages the pinned Windows kiro-cli without installing the MSI when opted in", () => {
+    const buildScript = fs.readFileSync(
+      path.join(REPO_ROOT, "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    assert.match(buildScript, /kiro-cli-x86_64-pc-windows-msvc\.msi/);
+    assert.match(buildScript, /msiexec\.exe \/a/);
+    assert.match(buildScript, /cp -a "\$extracted" "\$dest\/\$entry"/);
+    assert.match(buildScript, /threading\.Thread\(target=read_stdout/);
+    assert.doesNotMatch(buildScript, /select\.select/);
+    assert.doesNotMatch(buildScript, /\[ "\$OS" != "windows" \]/);
   });
 
   it("ships the Windows startup caches generated after the platform prune", () => {
@@ -463,7 +560,9 @@ describe("first-download installer design contract", () => {
     // The recogniser, compressed-audio decoder, and every Python/runtime
     // dependency are installer payload. The gate executes a hash-authenticated,
     // immutable view of the decoder, so pip metadata alone cannot make a release pass.
-    assert.match(buildScript, /imageio-ffmpeg==0\.6\.0/);
+    assert.match(buildScript, /-m kiro_crew\.stt\.decoder \\\n\s+--install-into "\$2\/kirocrew_ffmpeg\/bin"/);
+    assert.match(windowsBuilder, /install_desktop_decoder "\$out\/python\.exe" "\$sp"/);
+    assert.doesNotMatch(buildScript, /imageio-ffmpeg/);
     assert.match(buildScript, /ERROR: no prebuilt speech recogniser for supported target/);
     assert.match(buildScript, /macOS Intel[^\n]+legacy backend unsupported/);
     assert.doesNotMatch(buildScript, /bundling without it/);

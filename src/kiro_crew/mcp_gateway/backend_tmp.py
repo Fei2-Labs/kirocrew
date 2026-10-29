@@ -79,7 +79,13 @@ def allocate_backend_tmp(pool_digest: str) -> Path:
     path.mkdir(mode=0o700)
     platform_compat.restrict_dir_to_owner(path)
     try:
-        (path / OWNER_FILENAME).write_text(str(os.getpid()), encoding="utf-8")
+        # An explicit ``0600``, not ``write_text``: that takes the umask default
+        # (``0644`` under the usual ``022``). The directory above is ``0700``, so
+        # the bits do not widen what another account can read today; they are
+        # kept owner-only so the tree holds the data home's policy at every
+        # instant, not only after the startup sweep has visited it -- a probe
+        # that is still allocating while the sweep runs is exactly the case.
+        atomic_write(path / OWNER_FILENAME, str(os.getpid()), mode=0o600)
     except OSError:
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -132,17 +138,19 @@ def tmp_env(path: Path) -> dict[str, str]:
 
 
 def _is_plain_dir(path: Path) -> bool:
-    """A real directory -- not a symlink, not a file, not absent.
+    """A real directory -- not a symlink, not a junction, not a file, not absent.
 
     ``os.lstat``, never ``stat``: a symlink planted where a directory is
     expected must classify as a symlink so the sweep skips it instead of
-    following it out of the managed root.
+    following it out of the managed root. ``lstat`` reports a Windows junction
+    as a directory, so a name-surrogate reparse tag is checked too
+    (:func:`platform_compat.lstat_is_name_surrogate`).
     """
     try:
         info = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISDIR(info.st_mode)
+    return stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info)
 
 
 #: Owner-pid marker written right after the backend process spawns.
@@ -314,6 +322,10 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
     The walk runs off the event loop (``asyncio.to_thread`` / daemon thread)
     on an hourly cadence, and its size is bounded by what one backend wrote
     into its OWN temp dir, so a full metadata walk is the right trade.
+
+    A Windows junction is not descended either: ``lstat`` reports it as a plain
+    directory, and a dangling one makes ``scandir`` raise, which would read the
+    whole tree as active for good. Its own mtime still counts.
     """
     newest = 0.0
     try:
@@ -325,7 +337,8 @@ def _tree_newest_mtime(root: Path, fallback: float) -> float:
                 info = os.lstat(entry.path)
                 if info.st_mtime > newest:
                     newest = info.st_mtime
-                if stat.S_ISDIR(info.st_mode):  # lstat: symlinks never descend
+                # lstat: symlinks never descend, nor do Windows junctions.
+                if stat.S_ISDIR(info.st_mode) and not platform_compat.lstat_is_name_surrogate(info):
                     stack.append(Path(entry.path))
     except OSError:
         return fallback
@@ -402,7 +415,15 @@ def sweep_all_backend_tmp() -> int:
             continue
         if _pgroup_alive(pid):
             continue
-        shutil.rmtree(child, ignore_errors=True)
+        if not platform_compat.rmtree_force(child):
+            # rmtree reaches ``.owner`` before a file it cannot delete, and an
+            # ownerless dir is never swept: put the judged pid back so a later
+            # sweep retries once the grace window has passed again (the rewrite
+            # refreshes the tree's mtime) instead of leaving the remainder forever.
+            logger.warning("backend-tmp: could not fully remove %r; will retry", entry.name)
+            if os.path.lexists(child):
+                record_owner(child, pid)
+            continue
         removed += 1
     if removed:
         logger.info("backend-tmp: sweep removed %d dead idle dir(s)", removed)

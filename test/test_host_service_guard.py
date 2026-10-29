@@ -99,7 +99,7 @@ _DELIBERATELY_UNGUARDED = {
     "sudo": "privilege prefix; the wrapped command carries the action",
     # The BSD-family equivalent of `sudo`, and excluded for the identical reason.
     # Its only appearance in src/ is as a KEY in the auto-improvement app's
-    # `_COMMAND_WRAPPERS` table (`spine/agent_runner.py`), which exists to STRIP
+    # `_COMMAND_WRAPPERS` table (`spine/agent_runner_gate.py`), which exists to STRIP
     # privilege/wrapper prefixes so the shell denylist inspects the real command
     # behind them — a detector of `doas`, not a spawn of it. `doas systemctl
     # restart` is still caught on the inner `systemctl` token.
@@ -190,8 +190,8 @@ class TestRatchet:
         assert not unaccounted, (
             "src/ names service-control tools the host-mutation guard neither "
             "covers nor explicitly excludes. Either add each to _SERVICE_MANAGERS "
-            "(with its mutating verbs in _MUTATING_VERBS) / _ALWAYS_REFUSED in the "
-            "root conftest.py, or add it to _DELIBERATELY_UNGUARDED here with a "
+            "(with its mutating verbs in _MUTATING_VERBS) / _ALWAYS_REFUSED in "
+            "test/conftest_floor_services.py, or add it to _DELIBERATELY_UNGUARDED here with a "
             f"reason:\n{unaccounted}"
         )
 
@@ -447,7 +447,9 @@ class TestGuardIsArmed:
         Without this the whole fixture could be a blanket refusal and the suite
         above would still pass.
         """
-        res = subprocess.run([sys.executable, "-c", "print('ok')"], capture_output=True, text=True)
+        res = subprocess.run(
+            [sys.executable, "-c", "print('ok')"], capture_output=True, text=True, encoding="utf-8"
+        )
         assert res.returncode == 0
         assert res.stdout.strip() == "ok"
 

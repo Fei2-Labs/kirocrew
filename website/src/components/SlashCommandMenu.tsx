@@ -1,22 +1,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { createPortal } from 'react-dom'
-import { api } from '../api/client'
+import { OverlayPortal } from './overlayRoot'
+import { usePickerSource } from './dashboardPickerSource'
+import { pickerQueryKey, type SlashCommand } from '../chat-core/composer/pickerSource'
 import { i18nT } from '../i18n/t'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
 import { menuGeometry, bottomUpOrder } from '../lib/pickerMenu'
 import type { SendMode } from '../pages/chat/ChatSettings'
-
-interface SlashCommand {
-  name: string
-  /**
-   * Description as the SERVER sent it (English). Only a fallback for display —
-   * {@link commandDescription} prefers the catalog. Optional because the local
-   * command lists below carry no copy of their own; the backend itself also
-   * sends `""` for a command missing from its description map.
-   */
-  description?: string
-}
 
 /**
  * Catalog KEY for each command's description, keyed by the command's TRIGGER
@@ -125,6 +115,8 @@ interface Props {
    * Enter is a newline, so the announcement must name Ctrl+Enter instead.
    */
   sendOnEnter?: SendMode
+  /** Commands the host refuses; left out of the list. */
+  hidden?: readonly string[]
 }
 
 /**
@@ -147,16 +139,22 @@ const FRONTEND_COMMAND_NAMES = ['/btw', '/kb', '/onboarding', '/plain'] as const
 
 const FRONTEND_COMMANDS: SlashCommand[] = FRONTEND_COMMAND_NAMES.map(name => ({ name }))
 
-export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter' }: Props) {
+export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, open = true, sendOnEnter = 'enter', hidden }: Props) {
+  const source = usePickerSource()
+  const load = source.slashCommands
   const { data: apiCommands = FALLBACK_COMMANDS, isFetching, isError } = useQuery<SlashCommand[]>({
-    queryKey: ['slash-commands'],
-    queryFn: ({ signal }) => api.slashCommands(signal),
-    enabled: typeof api.slashCommands === 'function',
+    queryKey: pickerQueryKey(source, ['slash-commands']),
+    queryFn: ({ signal }) => load!(signal),
+    enabled: typeof load === 'function',
   })
-  const commands = useMemo(() => {
+  const allCommands = useMemo(() => {
     const names = new Set(apiCommands.map(c => c.name))
     return [...apiCommands, ...FRONTEND_COMMANDS.filter(c => !names.has(c.name))].sort((a, b) => a.name.localeCompare(b.name))
   }, [apiCommands])
+  const commands = useMemo(
+    () => (hidden?.length ? allCommands.filter(c => !hidden.includes(c.name)) : allCommands),
+    [allCommands, hidden],
+  )
 
   const match = input.match(/^\/([a-z]*)$/)
   const visible = open && !!match
@@ -250,7 +248,7 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
     ? 'components.slashCommandMenu.loading_commands_ctrl_enter_held'
     : 'components.slashCommandMenu.loading_commands_enter_held'
 
-  return createPortal(
+  return <OverlayPortal>
     <div
       className="fixed z-[9999] bg-card border border-border rounded-lg shadow-lg overflow-y-auto py-1 animate-slide-up"
       role="listbox"
@@ -280,7 +278,6 @@ export default function SlashCommandMenu({ input, anchorRef, onSelect, onClose, 
           <span className="text-[12px] truncate">{commandDescription(cmd)}</span>
         </button>
       ))}
-    </div>,
-    document.body
-  )
+    </div>
+  </OverlayPortal>
 }

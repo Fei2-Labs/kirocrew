@@ -38,7 +38,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew import mcp_discovery
-from kiro_crew.dashboard import handlers_instances
+from kiro_crew.dashboard import handlers_instances, handlers_instances_peer
 from kiro_crew.dashboard.handlers import _shared as shared_handlers
 from kiro_crew.dashboard.handlers import mcp as mcp_handlers
 from kiro_crew.dashboard.routes import agent_config as agent_config_routes
@@ -54,15 +54,27 @@ _LOCAL_SUBJECT = "local-app"
 
 _MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-#: The five modules whose mutating routes carry the gate.
+#: The five modules whose mutating routes carry the gate. ``handlers/security.py``,
+#: ``handlers/hooks.py`` and ``handlers/mcp.py`` are facades, so their owners --
+#: where their routes' functions live -- are listed too; the instances control plane
+#: is its facade and the owner its peer-reading routes live in.
 _GATED_MODULES = frozenset(
     {
         "kiro_crew.dashboard.handlers.hooks",
+        "kiro_crew.dashboard.handlers.hooks_scripts",
+        "kiro_crew.dashboard.handlers.hooks_webhooks",
         "kiro_crew.dashboard.handlers.mcp_custom",
         "kiro_crew.dashboard.handlers.mcp",
         "kiro_crew.dashboard.handlers.security",
+        "kiro_crew.dashboard.handlers.security_audit",
+        "kiro_crew.dashboard.handlers.security_trusted_apps",
+        "kiro_crew.dashboard.handlers.security_governance_policy",
+        "kiro_crew.dashboard.handlers.security_trusted_registries",
         "kiro_crew.dashboard.handlers_instances",
+        "kiro_crew.dashboard.handlers_instances_peer",
     }
+    # ``handlers/mcp.py`` and every owner its ``_OWNERS`` names, routes or not yet.
+    | {mcp_handlers.__name__, *mcp_handlers._OWNERS}
 )
 
 #: The inbound agent webhook authenticates itself and must not acquire the gate.
@@ -97,10 +109,13 @@ _REFUSAL = {"error": "owner authorization required", "code": "owner_only"}
 
 
 #: The four modules that reach the gate through
-#: ``_shared.require_owner_dashboard_request``. ``handlers_instances`` is absent on
-#: purpose: it gates inside ``_guard``, which is a pure function covered directly
-#: below, so it needs no route drive at all.
-_SHARED_GATE_MODULES = frozenset(_GATED_MODULES - {"kiro_crew.dashboard.handlers_instances"})
+#: ``_shared.require_owner_dashboard_request``. ``handlers_instances`` (with its peer
+#: owner) is absent on purpose: it gates inside ``_guard``, which is a pure function
+#: covered directly below, so it needs no route drive at all.
+_SHARED_GATE_MODULES = frozenset(
+    _GATED_MODULES
+    - {"kiro_crew.dashboard.handlers_instances", "kiro_crew.dashboard.handlers_instances_peer"}
+)
 
 #: Status the stand-in gate answers with. Outside every status any handler body
 #: produces, so "the gate ran and stopped here" cannot be confused with a body.
@@ -514,8 +529,8 @@ async def test_every_instances_route_runs_the_guard() -> None:
     """A route added to the instances module later must not skip the seam.
 
     The count is read off the real registrar and compared with the number of
-    ``_guard`` call sites in the module, so a fourteenth-plus route that forgets
-    the gate fails here rather than shipping open.
+    ``_guard`` call sites in the module and its peer owner, so a fourteenth-plus
+    route that forgets the gate fails here rather than shipping open.
     """
     import inspect
 
@@ -528,13 +543,14 @@ async def test_every_instances_route_runs_the_guard() -> None:
     routes = {
         (r.method, r.resource.canonical)
         for r in app.router.routes()
-        if getattr(r.handler, "__module__", "") == "kiro_crew.dashboard.handlers_instances"
+        if getattr(r.handler, "__module__", "")
+        in {"kiro_crew.dashboard.handlers_instances", "kiro_crew.dashboard.handlers_instances_peer"}
         and r.resource is not None
         and r.method != "HEAD"
     }
     assert len(routes) >= 14, f"the instances walk found only {len(routes)} routes"
 
-    source = inspect.getsource(handlers_instances)
+    source = inspect.getsource(handlers_instances) + inspect.getsource(handlers_instances_peer)
     assert source.count("= _guard(request,") == len(routes), (
         f"{len(routes)} instances routes but "
         f"{source.count('= _guard(request,')} _guard call sites"
@@ -604,7 +620,9 @@ async def test_no_other_gated_route_belongs_to_the_strict_internal_set() -> None
 
     from kiro_crew.dashboard import server as server_mod
 
-    with open(server_mod.__file__, encoding="utf-8") as fh:
+    with open(
+        Path(server_mod.__file__).parent / "server_internal_paths.py", encoding="utf-8"
+    ) as fh:
         source = fh.read()
     start = source.index("_STRICT_INTERNAL_API_PATHS = frozenset(")
     end = source.index("\n)\n", start)

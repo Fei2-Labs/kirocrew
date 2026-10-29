@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import errno
 import inspect
 import json
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -42,11 +44,14 @@ from unittest import mock
 
 import pytest
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.test_utils import make_mocked_request
 
 import kiro_crew.dashboard.handlers as _HANDLERS_PKG
 from kiro_crew import executors
+from kiro_crew.dashboard import file_api
 from kiro_crew.dashboard.handlers import files as f
+from kiro_crew.testing.wait import async_wait_until, await_until, finished
 
 #: The shared open-and-check prefix resolves the validator through the
 #: ``handlers`` package at call time -- a documented monkey-patch seam kept for
@@ -134,9 +139,22 @@ _BLOCKING_HELPERS = frozenset(
 )
 
 
+def _owner_files() -> list[Path]:
+    """The ``file_api`` owners composed into the handlers module."""
+    return sorted(Path(inspect.getsourcefile(file_api)).parent.glob("[!_]*.py"))
+
+
 def _module_tree() -> ast.Module:
+    """The handlers module and its ``file_api`` owners, read as one module.
+
+    The endpoints' bodies live in the owners, and ``files`` is their import path
+    and patch surface, so the ratchet reads every one of those files.
+    """
     src = Path(inspect.getsourcefile(f)).read_text(encoding="utf-8")
-    return ast.parse(src)
+    tree = ast.parse(src)
+    for path in _owner_files():
+        tree.body.extend(ast.parse(path.read_text(encoding="utf-8")).body)
+    return tree
 
 
 def _is_to_thread(fn: ast.expr) -> bool:
@@ -207,6 +225,15 @@ class TestStaticRatchet:
             f"{sorted(guarded)} -- a rename likely moved the handlers out of the "
             "guarded families, which would silently empty this ratchet"
         )
+        served = {
+            name
+            for name, value in vars(f).items()
+            if name.startswith(_GUARDED_PREFIXES) and inspect.iscoroutinefunction(value)
+        }
+        assert served <= set(guarded), (
+            "these endpoints are served from a file the scan does not read: "
+            f"{sorted(served - set(guarded))}"
+        )
         violations: list[str] = []
         for node in guarded.values():
             violations.extend(_scan_own_body(node))
@@ -259,7 +286,10 @@ def _app() -> web.Application:
 
 def _req(path: str, query: str = "", method: str = "GET") -> web.Request:
     req = make_mocked_request(method, f"{path}?{query}" if query else path, app=_app())
-    req["user"] = "test-user"
+    # The owner: the file readers are owner-gated, and these tests are about
+    # the probe, not the gate.
+    req["user"] = "local-app"
+    req["app"] = ""
     return req
 
 
@@ -270,7 +300,10 @@ def _body(resp: web.Response) -> Any:
 async def _grep_req(query: str, root: Path | str) -> web.Response:
     """One ``POST /api/file-grep`` with the body the handler reads."""
     req = make_mocked_request("POST", "/api/file-grep", app=_app())
-    req["user"] = "test-user"
+    # The owner: the file readers are owner-gated, and these tests are about
+    # the probe, not the gate.
+    req["user"] = "local-app"
+    req["app"] = ""
     with mock.patch.object(
         f, "read_bounded_json", mock.AsyncMock(return_value=({"q": query, "root": str(root)}, None))
     ):
@@ -500,7 +533,10 @@ class TestFileWrite:
     async def test_validation_runs_off_the_event_loop(self, a_file: Path, spy: _ThreadSpy):
         spy.watch(a_file)
         req = make_mocked_request("POST", "/api/file-write", app=_app())
-        req["user"] = "test-user"
+        # The owner: /api/file-write is owner-gated, and this test is about the
+        # probe, not the gate.
+        req["user"] = "local-app"
+        req["app"] = ""
         with mock.patch.object(
             f,
             "read_bounded_json",
@@ -696,6 +732,17 @@ class TestBrowseAndReveal:
 
         assert resp.status == 400
         assert _body(resp)["error"] == "Not a directory"
+        # The UI keys per-cause copy on `code`: a permanent path refusal must
+        # not degrade to the recoverable arm that offers a Refresh.
+        assert _body(resp)["code"] == "not_a_directory"
+
+    @pytest.mark.asyncio
+    async def test_browse_files_non_directory_root_carries_the_same_code(self, a_file: Path):
+        resp = await f.api_browse_files(_req("/api/browse-files", f"path={a_file}"))
+
+        assert resp.status == 400
+        assert _body(resp)["error"] == "Not a directory"
+        assert _body(resp)["code"] == "not_a_directory"
 
     @pytest.mark.asyncio
     async def test_an_unnamed_root_still_falls_back_to_home(
@@ -887,7 +934,7 @@ class TestBoundedProbePool:
 
         # Unrelated work on the DEFAULT executor is untouched: it completes well
         # inside the admission window while every probe worker is gone.
-        unrelated = await asyncio.wait_for(asyncio.to_thread(lambda: 42), timeout=1.0)
+        unrelated = await finished(asyncio.to_thread(lambda: 42), "unrelated default-executor work")
         assert unrelated == 42
 
         # A real endpoint request is refused, not queued behind the wedge.
@@ -942,7 +989,9 @@ class TestBoundedProbePool:
 
         async def post(handler, body: dict) -> web.Response:
             req = make_mocked_request("POST", "/api/x", app=_app())
-            req["user"] = "test-user"
+            # The owner, so the owner-gated file_write reaches its probe.
+            req["user"] = "local-app"
+            req["app"] = ""
             with mock.patch.object(
                 f, "read_bounded_json", mock.AsyncMock(return_value=(body, None))
             ):
@@ -976,6 +1025,404 @@ class TestBoundedProbePool:
         await asyncio.gather(*wedged)
 
 
+def _wedge_on(path: str, entered: threading.Event, release: threading.Event) -> str:
+    """A probe of *path* whose mount never answers: says it started, then parks."""
+    entered.set()
+    release.wait()
+    return path
+
+
+async def _until_entered(entered: threading.Event) -> None:
+    """Wait for a worker to be inside :func:`_wedge_on`, without a fixed sleep."""
+    await async_wait_until(entered.is_set, describe=lambda: "no worker entered the probe")
+
+
+class TestWedgedPrefixRefusal:
+    """The pool learns which mount is dead, so one dead mount stops taking workers."""
+
+    @pytest.mark.asyncio
+    async def test_a_wedged_prefix_is_refused_and_other_prefixes_still_run(
+        self, a_file: Path, small_pool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A stuck prefix refuses the next probe there before it takes a worker,
+        leaves the pool's other worker to paths elsewhere, and stops refusing the
+        moment the stuck thread returns. The threshold is lowered to one so the
+        two-worker pool keeps a worker free to show the other prefix is served."""
+        _pool, release = small_pool
+        monkeypatch.setattr(f, "_PATH_PROBE_STALL_SECS", 0.0)  # any running probe is stuck
+        monkeypatch.setattr(f, "_PATH_PROBE_STUCK_TO_REFUSE", 1)
+        entered = threading.Event()
+        same_prefix = str(a_file.parent / "on-the-dead-mount")
+        wedged = asyncio.ensure_future(f._run_path_probe(_wedge_on, same_prefix, entered, release))
+        await _until_entered(entered)
+
+        # A GET file-read is a transfer call; it is refused under the stuck prefix too.
+        resp = await f.api_file_read(_req("/api/file-read", f"path={a_file}"))
+        assert resp.status == 503
+        assert _body(resp)["code"] == "path_probe_busy"
+        # And a probe-pool endpoint (file-diff validates on the probe pool).
+        resp = await f.api_file_diff(_req("/api/file-diff", f"path={a_file}"))
+        assert resp.status == 503
+        assert _body(resp)["code"] == "path_probe_busy"
+
+        # The second worker is still free, and a path under another prefix uses it.
+        other = os.path.join(os.sep, "kc-other-mount", "share", "x")
+        assert f._stall_prefix(other) != f._stall_prefix(str(a_file))
+        assert await f._run_path_probe(lambda p: p, other) == other
+
+        release.set()
+        assert await wedged == same_prefix
+        assert f._path_probe_inflight == {}
+        resp = await f.api_file_read(_req("/api/file-read", f"path={a_file}"))
+        assert resp.status == 200
+        assert resp.text == "hello"
+
+    @pytest.mark.asyncio
+    async def test_one_stuck_probe_refuses_nothing_and_a_second_refuses_the_prefix(
+        self, tmp_path: Path, small_pool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """One stray request to a dead share costs one worker and nothing more; a
+        second stuck probe under the same prefix is what turns refusal on."""
+        _pool, release = small_pool
+        monkeypatch.setattr(f, "_PATH_PROBE_STALL_SECS", 0.0)
+        key = f._path_probe_stall_key((str(tmp_path / "a"),))
+        first_in, second_in = threading.Event(), threading.Event()
+        first = asyncio.ensure_future(
+            f._run_path_probe(_wedge_on, str(tmp_path / "a"), first_in, release)
+        )
+        await _until_entered(first_in)
+
+        assert not f._path_probe_prefix_wedged(key)
+        second = asyncio.ensure_future(
+            f._run_path_probe(_wedge_on, str(tmp_path / "b"), second_in, release)
+        )
+        await _until_entered(second_in)
+        assert f._path_probe_prefix_wedged(key)
+
+        release.set()
+        await asyncio.gather(first, second)
+        assert not f._path_probe_prefix_wedged(key)
+
+    @pytest.mark.asyncio
+    async def test_a_probe_inside_its_budget_does_not_refuse_its_prefix(
+        self, tmp_path: Path, small_pool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The refusal is about a STUCK probe, not a concurrent one: two healthy probes
+        under one prefix both run."""
+        _pool, release = small_pool
+        monkeypatch.setattr(f, "_PATH_PROBE_STALL_SECS", 3600.0)
+        entered = threading.Event()
+        path = str(tmp_path / "a")
+        running = asyncio.ensure_future(f._run_path_probe(_wedge_on, path, entered, release))
+        await _until_entered(entered)
+
+        assert await f._run_path_probe(lambda p: p, str(tmp_path / "b")) == str(tmp_path / "b")
+
+        release.set()
+        assert await running == path
+
+    @pytest.mark.asyncio
+    async def test_a_long_transfer_never_marks_its_prefix_stuck(
+        self, tmp_path: Path, small_pool, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A transfer legitimately holds its worker for a long time, so however long it
+        runs, probes under its prefix are still served."""
+        _pool, release = small_pool
+        monkeypatch.setattr(f, "_PATH_PROBE_STALL_SECS", 0.0)
+        entered = threading.Event()
+        path = str(tmp_path / "big")
+        running = asyncio.ensure_future(
+            f._run_path_probe(_wedge_on, path, entered, release, transfer=True)
+        )
+        await _until_entered(entered)
+
+        assert f._path_probe_inflight == {}
+        assert await f._run_path_probe(lambda p: p, path) == path
+
+        release.set()
+        assert await running == path
+
+    @pytest.mark.asyncio
+    async def test_a_probe_that_raises_leaves_no_entry(self, tmp_path: Path, small_pool):
+        """The in-flight entry goes with the thread, whatever the probe returns."""
+
+        def boom(_path: str) -> None:
+            raise ValueError("embedded null byte")
+
+        with pytest.raises(ValueError):
+            await f._run_path_probe(boom, str(tmp_path / "x"))
+        assert f._path_probe_inflight == {}
+
+    def test_only_a_leading_absolute_path_string_is_a_key(self, tmp_path: Path):
+        """Callers that do not lead with an absolute path keep the plain pool
+        behaviour. A relative path is resolved against a project directory the key
+        cannot see, so charging it to the gateway's working directory would name
+        the wrong mount."""
+        # Lexical only, and outside any home, so the key is the plain stall prefix
+        # on every platform (a Windows temp dir sits under C:\Users\<user>).
+        plain = os.path.join(tmp_path.anchor, "kc-not-a-home", "share", "x")
+        assert f._path_probe_stall_key((plain,)) == f._stall_prefix(plain)
+        assert f._path_probe_stall_key(()) == ""
+        assert f._path_probe_stall_key(("",)) == ""
+        assert f._path_probe_stall_key(("src/foo.py",)) == ""
+        assert f._path_probe_stall_key(([str(tmp_path)],)) == ""
+        assert f._path_probe_stall_key((object(), str(tmp_path))) == ""
+
+    def test_a_home_path_is_keyed_from_the_environment_and_never_by_user_lookup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The key is computed on the event loop, so ``~name`` (a password-database
+        lookup that can block on a directory service) gets no key, and ``~/...`` is
+        expanded from the home variable alone."""
+        # Not under a home container, so the expected key is the plain stall prefix.
+        home = os.path.join(tmp_path.anchor, "kc-env-home", "u")
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("USERPROFILE", home)
+
+        def no_user_lookup(*_a: object) -> None:
+            raise AssertionError("the stall key asked the password database")
+
+        monkeypatch.setattr(os.path, "expanduser", no_user_lookup)
+        assert f._path_probe_stall_key(("~/x",)) == f._stall_prefix(os.path.join(home, "x"))
+        assert f._path_probe_stall_key(("~",)) == f._stall_prefix(home)
+        assert f._path_probe_stall_key(("~someone/x",)) == ""
+        monkeypatch.delenv("HOME")
+        monkeypatch.delenv("USERPROFILE")
+        assert f._path_probe_stall_key(("~/x",)) == ""
+
+    @pytest.mark.parametrize("container", ["home", "Users"])
+    def test_a_path_under_a_home_is_keyed_one_component_below_the_home(
+        self, tmp_path: Path, container: str
+    ):
+        """A mount inside a home (``~/mnt/nas``) gets its own key, so it cannot refuse
+        the workspace beside it. Lexical: none of these paths exists."""
+        home = os.path.join(tmp_path.anchor, container, "kc-user")
+        assert f._stall_prefix(os.path.join(home, "mnt", "x")) == home
+
+        mnt = f._path_probe_stall_key((os.path.join(home, "mnt", "x"),))
+        assert mnt == os.path.join(home, "mnt")
+        assert f._path_probe_stall_key((os.path.join(home, "workspace", "f"),)) == os.path.join(
+            home, "workspace"
+        )
+        assert f._path_probe_stall_key((os.path.join(home, "mnt", "a"),)) == mnt
+        assert f._path_probe_stall_key((os.path.join(home, "mnt", "b", "c"),)) == mnt
+        assert f._path_probe_stall_key((home,)) == home
+        assert f._path_probe_stall_key((home + os.sep,)) == home
+
+        nested = os.path.join(tmp_path.anchor, "local", "home", "kc-user")
+        assert f._path_probe_stall_key((os.path.join(nested, "mnt", "x"),)) == os.path.join(
+            nested, "mnt"
+        )
+        plain = os.path.join(tmp_path.anchor, "kc-not-a-home", "share", "x")
+        assert f._path_probe_stall_key((plain,)) == f._stall_prefix(plain)
+        container_only = os.path.join(tmp_path.anchor, container)
+        assert f._path_probe_stall_key((container_only,)) == f._stall_prefix(container_only)
+
+    @pytest.mark.asyncio
+    async def test_two_wedged_probes_inside_a_home_leave_the_workspace_served(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Two probes stuck on ``<home>/mnt`` refuse that mount and nothing else under
+        the home. A real file has to live in ``tmp_path``, so ``_stall_prefix`` is
+        stood in for to report ``<tmp>/home/<user>`` as the home, the key it returns
+        for a real ``/home/<user>``. Three workers, so after two are wedged the read
+        is answered by the gate and not by pool capacity."""
+        home = tmp_path / "home" / "kc-user"
+        workspace_file = home / "workspace" / "f.txt"
+        workspace_file.parent.mkdir(parents=True)
+        workspace_file.write_text("hello", encoding="utf-8")
+        real_stall_prefix = f._stall_prefix
+
+        def stall_prefix(expanded: str) -> str:
+            if expanded == str(home) or expanded.startswith(str(home) + os.sep):
+                return str(home)
+            return real_stall_prefix(expanded)
+
+        pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix=_PROBE_THREAD_PREFIX)
+        monkeypatch.setattr(f, "_stall_prefix", stall_prefix)
+        monkeypatch.setattr(f, "_PATH_PROBE_ADMIT_TIMEOUT_SECS", 0.2)
+        monkeypatch.setattr(f, "_PATH_PROBE_STALL_SECS", 0.0)
+        monkeypatch.setattr(executors, "path_probe_executor", lambda: pool)
+        monkeypatch.setattr(executors, "path_transfer_executor", lambda: pool)
+        release = threading.Event()
+        try:
+            dead_a, dead_b = str(home / "mnt" / "nas" / "a"), str(home / "mnt" / "nas" / "b")
+            mnt_key = f._path_probe_stall_key((dead_a,))
+            assert mnt_key == str(home / "mnt")
+            assert f._path_probe_stall_key((str(workspace_file),)) == str(home / "workspace")
+            a_in, b_in = threading.Event(), threading.Event()
+            wedged = [
+                asyncio.ensure_future(f._run_path_probe(_wedge_on, dead_a, a_in, release)),
+                asyncio.ensure_future(f._run_path_probe(_wedge_on, dead_b, b_in, release)),
+            ]
+            await _until_entered(a_in)
+            await _until_entered(b_in)
+            assert f._path_probe_prefix_wedged(mnt_key)
+
+            with pytest.raises(f._PathProbeBusy):
+                await f._run_path_probe(lambda p: p, str(home / "mnt" / "nas" / "c"))
+            resp = await f.api_file_read(_req("/api/file-read", f"path={workspace_file}"))
+            assert resp.status == 200, resp.text
+            assert resp.text == "hello"
+
+            release.set()
+            assert await asyncio.gather(*wedged) == [dead_a, dead_b]
+            assert not f._path_probe_prefix_wedged(mnt_key)
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
+
+@contextlib.asynccontextmanager
+async def _stuck_under(monkeypatch: pytest.MonkeyPatch, path: str):
+    """Park two probes under the stall key of *path*, on a three-worker pool.
+
+    Every running probe counts as stuck (``_PATH_PROBE_STALL_SECS`` is zero), so
+    the stall is set by the test, not by a clock. The third worker stays free, so
+    a refusal that follows is the stall gate's and not the pool's capacity. An
+    ``async with`` helper, not a fixture, so the exit can await the parked
+    probes under a named bound before the pool is shut down.
+    """
+    pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix=_PROBE_THREAD_PREFIX)
+    monkeypatch.setattr(f, "_PATH_PROBE_ADMIT_TIMEOUT_SECS", 0.2)
+    monkeypatch.setattr(f, "_PATH_PROBE_STALL_SECS", 0.0)
+    monkeypatch.setattr(executors, "path_probe_executor", lambda: pool)
+    monkeypatch.setattr(executors, "path_transfer_executor", lambda: pool)
+    release = threading.Event()
+    wedged: list[asyncio.Future] = []
+    try:
+        key = f._path_probe_stall_key((path,))
+        assert key, path
+        for name in ("a", "b"):
+            entered = threading.Event()
+            wedged.append(
+                asyncio.ensure_future(
+                    f._run_path_probe(_wedge_on, os.path.join(path, name), entered, release)
+                )
+            )
+            await _until_entered(entered)
+        assert f._path_probe_prefix_wedged(key)
+        yield key
+    finally:
+        release.set()
+        if wedged:
+            await await_until(asyncio.gather(*wedged), what="the parked probes settling")
+        pool.shutdown(wait=True)  # every worker has returned: the join is immediate
+
+
+async def _third_worker_is_free() -> None:
+    """The pool still serves a call under no stuck key, so the refusal was the gate."""
+    assert await f._run_path_probe(lambda: "free") == "free"
+
+
+class TestStallKeyForCallersThatDoNotLeadWithThePath:
+    """Callers that hand the probe a closure, a list or a config first name their
+    path with ``stall_path``, so two probes stuck under it refuse the third."""
+
+    @pytest.mark.asyncio
+    async def test_reveal_open_is_refused_under_its_stuck_path(
+        self, a_file: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        launch = mock.MagicMock(return_value=False)
+        monkeypatch.setattr(f.platform_compat, "open_with_default_app", launch)
+        monkeypatch.setattr(f, "is_direct_local_request", lambda request: True)
+        req = make_mocked_request("POST", "/api/reveal", app=_app())
+        req["user"] = "test-user"
+        body = {"path": str(a_file), "action": "open"}
+        async with _stuck_under(monkeypatch, str(a_file.parent)):
+            with mock.patch.object(
+                f, "read_bounded_json", mock.AsyncMock(return_value=(body, None))
+            ):
+                resp = await f.api_reveal_path(req)
+
+            assert resp.status == 503, resp.text
+            assert _body(resp)["code"] == "path_probe_busy"
+            launch.assert_not_called()
+            await _third_worker_is_free()
+
+    @pytest.mark.asyncio
+    async def test_fallback_search_is_refused_under_its_stuck_roots(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path / "proj"))
+        monkeypatch.setattr(f, "data_home", lambda: tmp_path)
+        async with _stuck_under(monkeypatch, str(tmp_path)):
+            resp = await f.api_file_search(_req("/api/file-search", "q=note"))
+
+            assert resp.status == 503, resp.text
+            assert _body(resp)["code"] == "path_probe_busy"
+            await _third_worker_is_free()
+
+    @pytest.mark.asyncio
+    async def test_file_kinds_is_refused_when_its_batch_is_under_a_stuck_key(
+        self, a_file: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(a_file.parent))
+        req = make_mocked_request("POST", "/api/file-kinds", app=_app())
+        req["user"] = "local-app"
+        req["app"] = ""
+        body = {"paths": [str(a_file), "note.md"]}
+        async with _stuck_under(monkeypatch, str(a_file.parent)):
+            with mock.patch.object(
+                f, "read_bounded_json", mock.AsyncMock(return_value=(body, None))
+            ):
+                resp = await f.api_file_kinds(req)
+
+            assert resp.status == 503, resp.text
+            assert _body(resp)["code"] == "path_probe_busy"
+            await _third_worker_is_free()
+
+    @pytest.mark.asyncio
+    async def test_a_relative_path_is_refused_under_its_stuck_project_dir(
+        self, a_file: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The resolve itself is refused, before it realpaths inside the dead project."""
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(a_file.parent))
+        resolve = mock.MagicMock(side_effect=f._resolve_project_relative)
+        monkeypatch.setattr(f, "_resolve_project_relative", resolve)
+        async with _stuck_under(monkeypatch, str(a_file.parent)):
+            resp = await f.api_file_read(_req("/api/file-read", "path=note.md&resolve=1"))
+
+            assert resp.status == 503, resp.text
+            assert _body(resp)["code"] == "path_probe_busy"
+            resolve.assert_not_called()
+            await _third_worker_is_free()
+
+    @pytest.mark.parametrize(
+        "route",
+        ["file_raw", "file_download", "file_office_preview", "file_sheet"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_transfer_that_opens_the_path_itself_is_refused_under_its_key(
+        self, a_file: Path, monkeypatch: pytest.MonkeyPatch, route: str
+    ):
+        """These routes validate and open inside ONE transfer closure, with no keyed
+        probe before it, so the transfer carries the path's key itself."""
+        handler = getattr(f, f"api_{route}")
+        async with _stuck_under(monkeypatch, str(a_file.parent)):
+            resp = await handler(_req(f"/api/{route.replace('_', '-')}", f"path={a_file}"))
+
+            assert resp.status == 503, (route, resp.status, resp.text)
+            assert _body(resp)["code"] == "path_probe_busy"
+            await _third_worker_is_free()
+
+    def test_a_batch_is_keyed_only_when_every_path_shares_one_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A batch across mounts gets no key: keyed on one path, two batches stuck on
+        a dead mount listed later would refuse the healthy mount listed first."""
+        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
+        here = str(tmp_path / "x")
+        other = os.path.join(os.sep, "kc-other-mount", "share", "y")
+        assert f._path_probe_stall_key((here,)) != f._path_probe_stall_key((other,))
+        assert f._batch_stall_path([here, "rel.md"]) == here
+        assert f._batch_stall_path([here, other]) == ""
+        assert f._batch_stall_path(["rel.md"]) == str(tmp_path)
+        monkeypatch.delenv("KIROCREW_PROJECT_DIR")
+        assert f._project_relative_stall_path("rel.md") == ""
+        assert f._project_relative_stall_path(here) == here
+
+
 class TestExecutorPools:
     def test_probe_and_transfer_pools_are_distinct_bounded_and_named(self):
         """Two pools, not one: a burst of large transfers must queue behind
@@ -1000,6 +1447,28 @@ class TestExecutorPools:
 
 
 class TestFileWatch:
+    @pytest.mark.asyncio
+    async def test_a_client_disconnect_during_prepare_is_quiet(
+        self,
+        a_file: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        async def _disconnect(self, request):  # noqa: ANN001 - stub mirrors aiohttp
+            raise ClientConnectionResetError("Cannot write to closing transport")
+
+        monkeypatch.setattr(web.StreamResponse, "prepare", _disconnect)
+
+        with caplog.at_level(logging.ERROR, logger=f.logger.name):
+            resp = await f.api_file_watch(_req("/api/file-watch", f"path={a_file}"))
+
+        assert isinstance(resp, web.StreamResponse)
+        assert not [
+            record
+            for record in caplog.records
+            if record.name == f.logger.name and record.levelno >= logging.ERROR
+        ]
+
     @pytest.mark.asyncio
     async def test_a_refused_path_is_still_refused(self, a_file: Path):
         with mock.patch.object(f, "_validate_dashboard_path", return_value=None):

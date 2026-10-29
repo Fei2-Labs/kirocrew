@@ -12,12 +12,33 @@ const {
   classifyPortOwner,
   isKirocrewCommand,
 } = require("../gateway-stop");
+const { listenerSecretPath } = require("../local-token");
+
+// The gateway supervisor's source: the runtime/gateway/ owners that define code
+// these pins read, then the facade, as one text because the pins hold over all of
+// it.
+const SUPERVISOR_FILES = [
+  "runtime/gateway/home-lock.js",
+  "runtime/gateway/successor-handoff.js",
+  "runtime/gateway/failure-dialog.js",
+  "runtime/gateway/holder-decision.js",
+  "runtime/gateway/shutdown.js",
+  "runtime/gateway/reconnect.js",
+  "gateway-supervisor.js",
+];
 
 // Helper: temp KIROCREW_HOME containing a .local_secret file.
 function tmpHomeWithSecret(secret) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gw-stop-"));
   if (secret !== null) fs.writeFileSync(path.join(dir, ".local_secret"), secret);
   return dir;
+}
+
+// Helper: publish a listener entry the way a gateway does for `address`:`port`.
+function writeListenerSecret(home, port, address, secret) {
+  const file = listenerSecretPath(home, String(port), address, path);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, secret);
 }
 
 // Helper: a long-lived child. ignoreSigterm=true => only SIGKILL can stop it.
@@ -45,8 +66,10 @@ function waitReady(proc) {
 // Helper: local server implementing the /api/shutdown contract.
 // onShutdown(req) lets a test simulate the gateway exiting itself on 200.
 function startServer({ secret, status = 200, onShutdown }) {
+  const seen = [];
   const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/api/shutdown") {
+      seen.push(req.headers["x-local-secret"]);
       const ok = req.headers["x-local-secret"] === secret;
       if (!ok) { res.writeHead(403); return res.end('{"error":"invalid secret"}'); }
       res.writeHead(status); res.end(status === 200 ? '{"ok":true}' : "{}");
@@ -57,73 +80,141 @@ function startServer({ secret, status = 200, onShutdown }) {
   });
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
-      resolve({ server, port: server.address().port });
+      resolve({ server, port: server.address().port, seen });
     });
   });
 }
 
-test("postShutdown returns true on 200 with correct secret", async () => {
-  const home = tmpHomeWithSecret("s3cr3t");
-  const { server, port } = await startServer({ secret: "s3cr3t", status: 200 });
+test("postShutdown sends the listener entry for the dialed address", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "listener", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "listener");
   try {
     const ok = await postShutdown({ backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home });
     assert.strictEqual(ok, true);
+    assert.deepStrictEqual(seen, ["listener"], "the home-wide secret must not be sent");
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("postShutdown returns false on 403 (wrong secret)", async () => {
-  const home = tmpHomeWithSecret("wrong");
-  const { server, port } = await startServer({ secret: "right", status: 200 });
+test("postShutdown never sends .local_secret when no listener entry is published", async () => {
+  // An older gateway publishes no entry. Nothing the app can observe proves the
+  // port reaches only its own child (an unprivileged lsof hides another user's
+  // sockets), so the home-wide secret stays home and the caller uses signals.
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
+  try {
+    for (const backendUrl of [`http://127.0.0.1:${port}`, `http://localhost:${port}`]) {
+      const ok = await postShutdown({ backendUrl, kirocrewHome: home });
+      assert.strictEqual(ok, false, backendUrl);
+    }
+    assert.deepStrictEqual(seen, [], "no request may carry a secret");
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("postShutdown does not reach for .local_secret when listener entries are refused", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "stale");
   try {
     const ok = await postShutdown({ backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home });
     assert.strictEqual(ok, false);
+    assert.deepStrictEqual(seen, ["stale"]);
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("postShutdown returns false when no secret file exists", async () => {
+test("postShutdown sends nothing to localhost when the entries cover one family only", async () => {
+  // v4 is published but not v6 (another process holds [::1]:<port>), so
+  // `localhost` may reach that other process.
+  const home = tmpHomeWithSecret("home-wide");
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "v4-only");
+  try {
+    const ok = await postShutdown({ backendUrl: `http://localhost:${port}`, kirocrewHome: home });
+    assert.strictEqual(ok, false);
+    assert.deepStrictEqual(seen, []);
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("postShutdown refuses a target that is not an http loopback origin", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const requests = [];
+  const httpMod = { request: (opts) => { requests.push(opts); throw new Error("must not dial"); } };
+  try {
+    for (const backendUrl of ["http://192.0.2.1:5476", "https://127.0.0.1:5476", "not a url", ""]) {
+      const ok = await postShutdown({ backendUrl, kirocrewHome: home, httpMod });
+      assert.strictEqual(ok, false, backendUrl);
+    }
+    assert.deepStrictEqual(requests, []);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("postShutdown returns false when no secret is published at all", async () => {
   const home = tmpHomeWithSecret(null);
   const ok = await postShutdown({ backendUrl: "http://127.0.0.1:1", kirocrewHome: home });
   assert.strictEqual(ok, false);
   fs.rmSync(home, { recursive: true, force: true });
 });
 
-test("postShutdown tries each candidate secret — a stale first secret does not block the live one", async () => {
-  // The gateway is authenticated by whichever secret it actually loaded, so a
-  // stale first candidate must not stop postShutdown from POSTing the live one.
-  const { server, port } = await startServer({ secret: "live-secret", status: 200 });
+test("postShutdown tries each listener entry -- a stale exact entry does not block the live wildcard", async () => {
+  // A crashed generation leaves its entry behind, so a stale first candidate must
+  // not stop postShutdown from POSTing the live one beside it.
+  const home = tmpHomeWithSecret(null);
+  const { server, port, seen } = await startServer({ secret: "live-secret", status: 200 });
+  writeListenerSecret(home, port, "127.0.0.1", "stale-secret");
+  writeListenerSecret(home, port, "0.0.0.0", "live-secret");
   try {
-    const ok = await postShutdown({
-      backendUrl: `http://127.0.0.1:${port}`,
-      secrets: ["stale-secret", "live-secret"],
-    });
+    const ok = await postShutdown({ backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home });
     assert.strictEqual(ok, true);
-  } finally { server.close(); }
+    assert.deepStrictEqual(seen, ["stale-secret", "live-secret"]);
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test("postShutdown returns false only after every candidate secret is rejected", async () => {
-  const { server, port } = await startServer({ secret: "the-real-one", status: 200 });
-  try {
-    const ok = await postShutdown({
-      backendUrl: `http://127.0.0.1:${port}`,
-      secrets: ["nope-1", "nope-2"],
-    });
-    assert.strictEqual(ok, false);
-  } finally { server.close(); }
-});
-
-test("stopGatewayGracefully: happy path — endpoint exits process, no signal needed", async () => {
-  const home = tmpHomeWithSecret("s3cr3t");
-  const proc = spawnDummy({ ignoreSigterm: true }); // proves SIGTERM was NOT used
+test("stopGatewayGracefully hands postShutdown no caller-supplied secret", async () => {
+  const proc = spawnDummy();
   await waitReady(proc);
-  // Server kills the child on 200, simulating the gateway exiting itself.
-  const { server, port } = await startServer({
-    secret: "s3cr3t", status: 200, onShutdown: () => proc.kill("SIGKILL"),
-  });
+  const calls = [];
+  try {
+    await stopGatewayGracefully(proc, {
+      backendUrl: "http://127.0.0.1:1",
+      kirocrewHome: "/unused",
+      timeoutMs: 5000,
+      postShutdownFn: async (opts) => { calls.push(opts); return false; },
+    });
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual("secrets" in calls[0], false, "no caller-supplied secret list");
+  } finally { if (proc.exitCode === null) proc.kill("SIGKILL"); }
+});
+
+test("stopGatewayGracefully: a gateway with no listener entry is stopped by signal, never sent .local_secret", async () => {
+  // The GPT 6.1 case on #20026: a listener the lsof probe cannot see answers the
+  // port. The home-wide secret must not reach it; SIGTERM stops our child.
+  const home = tmpHomeWithSecret("home-wide");
+  const proc = spawnDummy();
+  await waitReady(proc);
+  const { server, port, seen } = await startServer({ secret: "home-wide", status: 200 });
   try {
     await stopGatewayGracefully(proc, {
       backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 10000,
     });
     assert.notStrictEqual(proc.exitCode === null && proc.signalCode === null, true, "process should be gone");
+    assert.deepStrictEqual(seen, [], "the home-wide secret must not be sent");
+  } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test("stopGatewayGracefully: happy path through the child's own listener entry", async () => {
+  const home = tmpHomeWithSecret("home-wide");
+  const proc = spawnDummy({ ignoreSigterm: true }); // proves SIGTERM was NOT used
+  await waitReady(proc);
+  const { server, port, seen } = await startServer({
+    secret: "listener", status: 200, onShutdown: () => proc.kill("SIGKILL"),
+  });
+  writeListenerSecret(home, port, "127.0.0.1", "listener");
+  try {
+    await stopGatewayGracefully(proc, {
+      backendUrl: `http://127.0.0.1:${port}`, kirocrewHome: home, timeoutMs: 10000,
+    });
+    assert.notStrictEqual(proc.exitCode === null && proc.signalCode === null, true, "process should be gone");
+    assert.deepStrictEqual(seen, ["listener"]);
   } finally { server.close(); fs.rmSync(home, { recursive: true, force: true }); }
 });
 
@@ -363,10 +454,9 @@ test("wedge recovery kills the gateway TREE, not just the wedged pid", () => {
   // Source-asserted at the supervisor ownership boundary. The requirement is
   // that the wedge kill go through a tree-scoped path on win32, not that it use
   // any particular helper name.
-  const supervisor = fs.readFileSync(
-    path.join(__dirname, "..", "gateway-supervisor.js"),
-    "utf8",
-  );
+  const supervisor = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
   const marker = "liveness: backend unresponsive — force-killing wedged gateway";
   const at = supervisor.indexOf(marker);
   assert.notStrictEqual(
@@ -413,10 +503,9 @@ test("the gateway supervisor bounds the shutdown tree kill to the hard deadline"
   // Rather than pre-empting the kill (which would defeat its purpose by killing
   // the parent alone and orphaning the tree it exists to reap), the call site
   // passes TIGHTER timeouts so the whole tree kill provably completes first.
-  const supervisor = fs.readFileSync(
-    path.join(__dirname, "..", "gateway-supervisor.js"),
-    "utf8",
-  );
+  const supervisor = SUPERVISOR_FILES
+    .map((file) => fs.readFileSync(path.join(__dirname, "..", file), "utf8"))
+    .join("\n");
   const start = supervisor.indexOf("function killGatewayTreeOnWindowsBounded");
   assert.notStrictEqual(
     start,
@@ -750,6 +839,14 @@ test("classifyPortOwner: ours wins when a mixed set holds the port", async () =>
   assert.strictEqual(owner, "kirocrew");
 });
 
+test("classifyPortOwner: a composed edition's gateway classifies as ours, not foreign", async () => {
+  const owner = await classifyPortOwner(5476, {
+    getListenPids: async () => [4242],
+    getCommand: async () => "/opt/edition/bin/python3.12 -s -P -m kirocrew_enterprise gateway --port 5476",
+  });
+  assert.strictEqual(owner, "kirocrew");
+});
+
 test("classifyPortOwner and forceStopPort share one KiroCrew matcher", async () => {
   // Drift between the two would let one mis-target a stranger's process.
   assert.ok(isKirocrewCommand("python -m kiro_crew gateway"));
@@ -788,4 +885,45 @@ test("classifyPortOwner and forceStopPort share one KiroCrew matcher", async () 
   assert.ok(!isKirocrewCommand("C:\\Temp\\kirocrew.exe gateway", {
     trustedExecutablePaths: [trustedCli],
   }));
+});
+
+test("isKirocrewCommand: a composed edition's `-m kirocrew_<edition>` gateway is ours", () => {
+  // A companion package boots the gateway from its own top-level module so its
+  // composition root runs instead of the core CLI. Hardcoding `kiro_crew` made
+  // every such gateway a "foreign holder" the launcher refused to reuse. The
+  // core must not learn any edition's name, so the match is the naming
+  // convention `kirocrew_<edition>`, mirroring the Python side's
+  // `_gateway_module_roots()`.
+  assert.ok(isKirocrewCommand("python -m kirocrew_enterprise gateway"));
+  assert.ok(isKirocrewCommand("/opt/edition/bin/python3.12 -s -P -m kirocrew_acme2 gateway --port 5476"));
+  assert.ok(isKirocrewCommand("/Users/Jane Doe/venv/bin/python -m kirocrew_enterprise gateway"));
+  const trustedPython = "C:\\Program Files\\KiroCrew\\python.exe";
+  assert.ok(isKirocrewCommand(`"${trustedPython}" -m kirocrew_enterprise gateway`, {
+    trustedExecutablePaths: [trustedPython],
+  }));
+  // Still only the FIRST execution selector: `-m` later in argv is an argument.
+  assert.ok(!isKirocrewCommand("python app.py -m kirocrew_enterprise"));
+  assert.ok(!isKirocrewCommand("python -c 'import x' -m kirocrew_enterprise"));
+  // Exact top-level module only. A dotted submodule, a bare prefix, a
+  // look-alike, mixed case or a hyphen never authorize a kill.
+  assert.ok(!isKirocrewCommand("python -m kirocrew_enterprise.tools gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_ gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew-enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m Kirocrew_Enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew_enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m mykirocrew_enterprise gateway"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew.dashboard gateway"));
+  assert.ok(!isKirocrewCommand("python -m"));
+  // The module alone never authorizes a kill: the first positional after it
+  // must be a server subcommand, mirroring `_KIROCREW_SERVER_SUBCOMMANDS`. A
+  // process that merely imports a `kirocrew_*` module on our port stays foreign.
+  assert.ok(isKirocrewCommand("python -m kirocrew_enterprise dashboard --port 5476"));
+  assert.ok(isKirocrewCommand("python -m kirocrew_enterprise start"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_backup"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_backup serve --port 5476"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_enterprise run gateway"));
+  assert.ok(!isKirocrewCommand("python -m kirocrew_enterprise --port 5476 gateway"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew"));
+  assert.ok(!isKirocrewCommand("python -m kiro_crew run /tmp/spec.md"));
 });

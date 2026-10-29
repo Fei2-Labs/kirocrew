@@ -33,6 +33,7 @@ class FakeProvider:
         self.approved: list = []
         self.rejected: list = []
         self.compacted = False
+        self.compact_result: dict = {"type": "completed", "summary": ""}
         self.steered: list = []
         self.active_turn = True
 
@@ -57,7 +58,7 @@ class FakeProvider:
         self.compacted = True
 
     async def wait_for_compaction(self, timeout: float = 0.0) -> dict:
-        return {"type": "completed", "summary": ""}
+        return self.compact_result
 
 
 class FakeSessions:
@@ -90,7 +91,7 @@ class FakeSessions:
         self.closing = False
         self.begin_turns = 0
 
-    async def get_or_create(self, key, *, agent, channel_id):
+    async def get_or_create(self, key, *, agent, channel_id, start_priority=None):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
@@ -138,6 +139,10 @@ class FakeSessions:
 
     def max_generation(self, bucket: str) -> int:
         return self._max_gen.get(bucket, -1)
+
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs`` (unset: 300 s)."""
+        return 300.0
 
 
 class _GateResult:
@@ -645,6 +650,27 @@ class TestTurn:
         assert provider.compacted is True
         assert any("自动压缩" in content for _, content in client.replies)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["failed", "timeout"])
+    async def test_hard_threshold_unsuccessful_compaction_posts_no_notice(self, kind) -> None:
+        # wait_for_compaction() reports these as a returned type, not an
+        # exception: announcing an automatic compaction would be false.
+        provider = FakeProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ]
+        )
+        provider.compact_result = {"type": kind, "summary": ""}
+        sessions = FakeSessions(provider, ctx_pct=96.0)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert provider.compacted is True
+        assert not any("自动压缩" in content for _, content in client.replies)
+
 
 # ------------------------------------------------------------------
 # Tests: commands (/new, /reset, /compact)
@@ -833,6 +859,24 @@ class TestCommands:
         assert sessions.acquired == [key]
         assert sessions.released == [key]
         assert client.replies == [("msg1", "🗜️ 已压缩上下文。")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "reply"),
+        [("failed", "⚠️ 压缩失败，请重试。"), ("timeout", "⚠️ 压缩超时。")],
+    )
+    async def test_compact_command_reports_an_unsuccessful_result(self, kind, reply) -> None:
+        provider = FakeProvider([])
+        provider.compact_result = {"type": kind, "summary": ""}
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        key = d._session_key(d._route(_inbound("/compact")))
+        assert sessions.released == [key]
+        assert client.replies == [("msg1", reply)]
 
     @pytest.mark.asyncio
     async def test_compact_refused_while_turn_busy(self) -> None:
@@ -1152,3 +1196,54 @@ class TestCompactCapabilityGate:
         await d.handle_message(_inbound("two", message_id="m2"))
         assert not any("已自动压缩" in c for _, c in client.replies)
         assert not any("对话上下文已较长" in c for _, c in client.replies)
+
+
+# ── /agent (show and switch the conversation's agent) ──
+
+
+def _agent_roster():
+    from kiro_crew.agent_discovery import AgentInfo
+
+    return [
+        AgentInfo(name="beta", filename="beta.json", description="", model=""),
+        AgentInfo(
+            name="kirocrew-worker",
+            filename="kirocrew-worker.json",
+            description="",
+            model="",
+            kirocrew_owned=True,
+        ),
+    ]
+
+
+class TestAgentCommand:
+    @pytest.mark.asyncio
+    async def test_agent_name_switches_the_next_turn(self, monkeypatch) -> None:
+        monkeypatch.setattr("kiro_crew.telegram.transport_dispatch.list_agents", _agent_roster)
+        sessions = FakeSessions(FakeProvider([AcpEvent(kind=EVENT_COMPLETE)]))
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client, cfg=_cfg(default_agent=""))
+        await d.handle_message(_inbound("/agent beta"))
+        assert "Agent set to `beta`" in client.replies[-1][1]
+        await d.handle_message(_inbound("hi", message_id="m2"))
+        assert sessions.last_agent == "beta"
+
+    @pytest.mark.asyncio
+    async def test_internal_agent_is_refused(self, monkeypatch) -> None:
+        monkeypatch.setattr("kiro_crew.telegram.transport_dispatch.list_agents", _agent_roster)
+        sessions = FakeSessions(FakeProvider([AcpEvent(kind=EVENT_COMPLETE)]))
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client, cfg=_cfg(default_agent=""))
+        await d.handle_message(_inbound("/agent kirocrew-worker"))
+        assert "No agent named" in client.replies[-1][1]
+        await d.handle_message(_inbound("hi", message_id="m2"))
+        assert sessions.last_agent == "kirocrew"
+
+    @pytest.mark.asyncio
+    async def test_bare_agent_shows_the_current_agent(self, monkeypatch) -> None:
+        monkeypatch.setattr("kiro_crew.telegram.transport_dispatch.list_agents", _agent_roster)
+        client = FakeClient()
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), client)
+        await d.handle_message(_inbound("/agent"))
+        reply = client.replies[-1][1]
+        assert "`beta`" in reply and "kirocrew-worker" not in reply

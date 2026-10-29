@@ -20,6 +20,7 @@ where the process has that capability, including privileged Windows CI runners.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import threading
@@ -34,6 +35,7 @@ from aiohttp.test_utils import make_mocked_request
 import kiro_crew.platform.governance_profiles as gov_mod
 from conftest import requires_symlinks
 from kiro_crew import platform_compat
+from kiro_crew.dashboard.conditional_get import bare_etag_value, weak_content_etag
 from kiro_crew.dashboard.handlers import themes as th
 
 # _validate_theme_data only *requires* --bg/--text/--accent per mode.
@@ -63,14 +65,19 @@ def _body(response: web.Response) -> Any:
 
 
 def _request(
-    method: str, path: str, *, body: object = ..., match_info: dict | None = None
+    method: str,
+    path: str,
+    *,
+    body: object = ...,
+    match_info: dict | None = None,
+    headers: dict[str, str] | None = None,
 ) -> web.Request:
     """A real (mocked) aiohttp request.
 
     ``body=None`` models a malformed payload: ``request.json()`` raising is what
     the handlers' ``except Exception -> 400`` branches are written for.
     """
-    req = make_mocked_request(method, path, match_info=match_info or {})
+    req = make_mocked_request(method, path, match_info=match_info or {}, headers=headers or {})
     if body is None:
         req.json = AsyncMock(side_effect=ValueError("not json"))  # type: ignore[method-assign]
     elif body is not ...:
@@ -1221,19 +1228,12 @@ class TestApiThemeDetailGet:
 # ── asset / overlay / topbar serving ───────────────────────────────────────
 
 
-class TestThemeHtmlResponse:
-    def test_carries_the_sandbox_csp_and_nosniff(self) -> None:
-        resp = th._theme_html_response("<div>hi</div>")
-        assert resp.content_type == "text/html"
-        assert resp.headers["X-Content-Type-Options"] == "nosniff"
-        assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
-
-
-def _asset_request(slug: str, path: str) -> web.Request:
-    return _request(
+def _asset_request(slug: str, path: str, *, headers: dict[str, str] | None = None) -> web.Request:
+    return make_mocked_request(
         "GET",
         f"/api/theme/{slug}/assets/{path}",
         match_info={"slug": slug, "path": path},
+        headers=headers or {},
     )
 
 
@@ -1283,12 +1283,98 @@ class TestApiThemeAsset:
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
         assert resp.headers["Content-Security-Policy"] == th._THEME_ASSET_CSP
 
+    @pytest.mark.asyncio
+    async def test_200_carries_a_weak_etag_and_revalidating_cache_control(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        resp = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        assert resp.status == 200
+        assert resp.headers["ETag"].startswith('W/"')
+        assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
 
-def _overlay_request(slug: str, oid: str) -> web.Request:
+    @pytest.mark.asyncio
+    async def test_matching_if_none_match_is_a_304_with_the_same_guard_headers(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        etag = first.headers["ETag"]
+        again = await th.api_theme_asset(
+            _asset_request("lcars", "styles/overrides.css", headers={"If-None-Match": etag})
+        )
+        assert again.status == 304
+        assert again.body is None
+        assert again.headers["ETag"] == etag
+        assert again.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+        assert again.headers["X-Content-Type-Options"] == "nosniff"
+        assert again.headers["Content-Security-Policy"] == th._THEME_ASSET_CSP
+
+    @pytest.mark.asyncio
+    async def test_changed_file_invalidates_the_etag(self, themes_dir: Path) -> None:
+        _make_pack(themes_dir / "lcars")
+        css = themes_dir / "lcars" / "styles" / "overrides.css"
+        _write_text(css, "a{}")
+        first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        stale = first.headers["ETag"]
+        # A reinstall under the same slug replaces the pack in place.
+        _write_text(css, "a{color:red}")
+        again = await th.api_theme_asset(
+            _asset_request("lcars", "styles/overrides.css", headers={"If-None-Match": stale})
+        )
+        assert again.status == 200
+        assert again.body == b"a{color:red}"
+        assert again.headers["ETag"] != stale
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "*",
+            '"{tag}"',  # strong form of the same value: weak comparison matches
+            '"zzz", W/"{tag}"',  # a list, our tag not first
+        ],
+    )
+    async def test_if_none_match_star_strong_and_list_forms_are_304(
+        self, header: str, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        first = await th.api_theme_asset(_asset_request("lcars", "styles/overrides.css"))
+        tag = bare_etag_value(weak_content_etag(b"a{}"))
+        assert first.headers["ETag"] == f'W/"{tag}"'
+        again = await th.api_theme_asset(
+            _asset_request(
+                "lcars",
+                "styles/overrides.css",
+                headers={"If-None-Match": header.format(tag=tag)},
+            )
+        )
+        assert again.status == 304
+
+    @pytest.mark.asyncio
+    async def test_non_matching_if_none_match_is_a_full_200(self, themes_dir: Path) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "styles" / "overrides.css", "a{}")
+        resp = await th.api_theme_asset(
+            _asset_request(
+                "lcars", "styles/overrides.css", headers={"If-None-Match": 'W/"abd"'}
+            )
+        )
+        assert resp.status == 200
+        assert resp.body == b"a{}"
+
+
+def _overlay_request(
+    slug: str, oid: str, *, headers: dict[str, str] | None = None
+) -> web.Request:
     return _request(
         "GET",
         f"/api/theme/{slug}/overlay/{oid}",
         match_info={"slug": slug, "id": oid},
+        headers=headers,
     )
 
 
@@ -1335,14 +1421,42 @@ class TestApiThemeOverlay:
         resp = await th.api_theme_overlay(_overlay_request("lcars", "SCANNER"))
         assert resp.status == 200
         assert resp.text == "<div>scan</div>"
+        assert resp.content_type == "text/html"
+        assert resp.charset == "utf-8"
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
         assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
+        assert resp.headers["ETag"] == weak_content_etag(b"<div>scan</div>")
+        assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+
+    @pytest.mark.asyncio
+    async def test_matching_if_none_match_is_a_304_with_the_sandbox_csp(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(
+            themes_dir / "lcars" / "overlays" / "scanner.html", "<div>scan</div>"
+        )
+        first = await th.api_theme_overlay(_overlay_request("lcars", "scanner"))
+        etag = first.headers["ETag"]
+        again = await th.api_theme_overlay(
+            _overlay_request("lcars", "scanner", headers={"If-None-Match": etag})
+        )
+        assert again.status == 304
+        assert again.body is None
+        assert again.headers["ETag"] == etag
+        assert again.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+        assert again.headers["X-Content-Type-Options"] == "nosniff"
+        assert again.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
 
 
-def _topbar_request(slug: str, mode: str) -> web.Request:
+def _topbar_request(
+    slug: str, mode: str, *, headers: dict[str, str] | None = None
+) -> web.Request:
     return _request(
         "GET",
         f"/api/theme/{slug}/topbar/{mode}",
         match_info={"slug": slug, "mode": mode},
+        headers=headers,
     )
 
 
@@ -1387,7 +1501,30 @@ class TestApiThemeTopbar:
         resp = await th.api_theme_topbar(_topbar_request("lcars", "dark"))
         assert resp.status == 200
         assert resp.text == "<div>bar</div>"
+        assert resp.content_type == "text/html"
+        assert resp.charset == "utf-8"
         assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
+        assert resp.headers["ETag"] == weak_content_etag(b"<div>bar</div>")
+        assert resp.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+
+    @pytest.mark.asyncio
+    async def test_matching_if_none_match_is_a_304_with_the_sandbox_csp(
+        self, themes_dir: Path
+    ) -> None:
+        _make_pack(themes_dir / "lcars")
+        _write_text(themes_dir / "lcars" / "topbar" / "dark.html", "<div>bar</div>")
+        first = await th.api_theme_topbar(_topbar_request("lcars", "dark"))
+        etag = first.headers["ETag"]
+        again = await th.api_theme_topbar(
+            _topbar_request("lcars", "dark", headers={"If-None-Match": etag})
+        )
+        assert again.status == 304
+        assert again.body is None
+        assert again.headers["ETag"] == etag
+        assert again.headers["Cache-Control"] == th._THEME_ASSET_CACHE_CONTROL
+        assert again.headers["X-Content-Type-Options"] == "nosniff"
+        assert again.headers["Content-Security-Policy"] == th._THEME_OVERLAY_CSP
 
 
 class TestResolveLocalSourceAncestorLinks:
@@ -1399,11 +1536,18 @@ class TestResolveLocalSourceAncestorLinks:
     `is_link_or_junction` check tests only the final component. The first
     `is_dir()` is what resolves the chain -- and on Windows resolving it is
     what authenticates to the attacker's host. These tests pin the ancestor
-    screen that has to run before that call.
+    screen that has to run before that call. The link's own reparse target is
+    stubbed to a UNC share so the refusal is the same on every host: a LOCAL
+    target is admitted on Windows (see ``TestRealLocalJunctionAncestor``).
     """
 
+    @staticmethod
+    def _aim_links_at_unc(monkeypatch):
+        """Every readlink answers a UNC share; set AFTER the links exist."""
+        monkeypatch.setattr(os, "readlink", lambda _p: r"\\evil-host\share")
+
     @requires_symlinks
-    def test_a_local_path_beneath_a_linked_ancestor_is_refused(
+    def test_a_local_path_beneath_an_ancestor_aimed_at_unc_is_refused(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setattr(th, "IS_WINDOWS", True)
@@ -1412,6 +1556,7 @@ class TestResolveLocalSourceAncestorLinks:
         (real / "theme").mkdir()
         link = tmp_path / "via"
         link.symlink_to(real, target_is_directory=True)
+        self._aim_links_at_unc(monkeypatch)
 
         # Entirely local-looking, and the LEAF is a real directory: neither the
         # UNC screen nor the leaf link check fires. Only the ancestor walk does.
@@ -1430,6 +1575,7 @@ class TestResolveLocalSourceAncestorLinks:
         (real / "theme").mkdir()
         link = tmp_path / "secretname"
         link.symlink_to(real, target_is_directory=True)
+        self._aim_links_at_unc(monkeypatch)
 
         _src, err = th._resolve_local_source(str(link / "theme"))
 
@@ -1451,13 +1597,14 @@ class TestResolveLocalSourceAncestorLinks:
         (real / "theme").mkdir()
         link = tmp_path / "via"
         link.symlink_to(real, target_is_directory=True)
+        self._aim_links_at_unc(monkeypatch)
 
         monkeypatch.setattr(th, "IS_WINDOWS", True)
 
         def _boom(_path):
             raise AssertionError("leaf probe ran before the ancestor walk")
 
-        # Patches themes' own binding only; `first_linked_ancestor` resolves the
+        # Patches themes' own binding only; the shared screen resolves the
         # predicate through platform_compat, so the walk itself still works.
         monkeypatch.setattr(th, "is_link_or_junction", _boom)
 
@@ -1502,6 +1649,39 @@ class TestResolveLocalSourceAncestorLinks:
 
         assert err is None
         assert src == nested.resolve()
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("_winapi") is None, reason="directory junctions are Windows-only"
+)
+class TestRealLocalJunctionAncestor:
+    """No stubs: a junction made with ``_winapi.CreateJunction`` on this host."""
+
+    def test_a_pack_below_a_local_junction_is_accepted(self, tmp_path):
+        import _winapi
+
+        target = tmp_path / "workflow-takeover-themes"
+        (target / "theme").mkdir(parents=True)
+        junction = tmp_path / "Themes"
+        _winapi.CreateJunction(str(target), str(junction))
+
+        src, err = th._resolve_local_source(str(junction / "theme"))
+
+        assert err is None
+        assert src == (target / "theme").resolve()
+
+    def test_a_junction_as_the_pack_root_is_still_refused(self, tmp_path):
+        import _winapi
+
+        target = tmp_path / "theme-real"
+        target.mkdir()
+        junction = tmp_path / "theme"
+        _winapi.CreateJunction(str(target), str(junction))
+
+        src, err = th._resolve_local_source(str(junction))
+
+        assert src is None
+        assert err == "local path must not be a symlink"
 
 
 class TestFirstLinkedAncestor:

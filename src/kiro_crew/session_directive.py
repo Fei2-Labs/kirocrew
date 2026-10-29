@@ -12,8 +12,8 @@ confirmation line plus a machine-readable marker carrying the validated payload
 (and NO session key). A session-aware consumer that processes the tool result
 decodes the marker and applies the effect against ITS OWN session, then keeps
 the marker out of what it stores or renders. There are TWO consumers, one per
-turn loop: :func:`dashboard.chat_runner._run_chat`'s ``EVENT_TOOL_RESULT``
-handler (the dashboard-driven surfaces, which own ``slot.key``), and
+turn loop: :func:`dashboard.chat_turn.tool_results._on_tool_result`, the ``EVENT_TOOL_RESULT``
+phase (the dashboard-driven surfaces, which own ``slot.key``), and
 :class:`messaging.driver.TurnDriver` (the standalone channel transports —
 Telegram, Discord, standalone Slack, iMessage, Teams, Webex, WeCom, Weixin —
 whose dispatchers inject a consumer bound to the turn's session key via
@@ -48,12 +48,14 @@ import json
 import re
 from typing import Any
 
-# The stateless, session-bound tools. ``ask_question`` joins
-# them as a NON-BLOCKING card: the consumer broadcasts a question card (with no
-# ``ask_id``) to its own slot and the agent ends its turn; the user's answer
-# arrives as an ordinary next message that resumes the session (the full
-# transcript/context reloads), rather than blocking the turn on a server-side
-# wait. This drops only the mid-turn pause — never a capability.
+# The stateless, session-bound tools. ``ask_question`` is NOT one of them: it
+# blocks on the ``/api/agent-ask/*`` routes and returns the user's answers as its
+# own tool result, so the turn that asked continues with them.
+# ``nothing_to_do`` is the one TERMINAL directive: a turn that ran tools and
+# has nothing the user needs to read ends on it instead of on a closing reply
+# (the turn-end contract: text, or ``nothing_to_do``, never a bare tool stop).
+# The consumer records the applied directive as ending the turn so the
+# empty-response recovery stays out of a deliberately quiet turn.
 DIRECTIVE_TOOLS: frozenset[str] = frozenset(
     {
         "monitor_start",
@@ -63,7 +65,7 @@ DIRECTIVE_TOOLS: frozenset[str] = frozenset(
         "autonudge_stop",
         "set_project",
         "suggest_followup",
-        "ask_question",
+        "nothing_to_do",
         "reset_conversation",
         "chat_tag",
     }
@@ -95,14 +97,14 @@ _SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE]]"
 SENTINEL = _SENTINEL
 
 # The ACP tool-result parser truncates each output part at 4000 chars
-# (``acp/_dispatch.py`` ``str(text)[:4000]``). The marker is the TAIL of the
+# (``acp/_dispatch_parts/tool_result_events.py`` ``str(text)[:4000]``). The marker is the TAIL of the
 # result, so an oversized payload loses the marker entirely — the effect would be
 # silently dropped after the model was told the request was made. Encode refuses
 # above this bound instead, leaving headroom under the transport cap.
 MAX_DIRECTIVE_CHARS = 3800
 
 # The ACP layer truncates a joined tool result to this many characters before the
-# consumer sees it (``acp/_dispatch.py``, which imports this constant so the two
+# consumer sees it (``acp/_dispatch_parts/tool_result_events.py``, which imports this constant so the two
 # cannot drift). It lives HERE because both markers are tail-anchored and so must
 # survive it: :data:`MAX_DIRECTIVE_CHARS` is deliberately far below it, and
 # :func:`tag_refusal` bounds its text against it. An unbounded refusal is
@@ -281,6 +283,62 @@ def is_vouched(text: str) -> bool:
     return bool(_VOUCHED) and _VOUCHED[0] == content_free_digest(text)
 
 
+def _bounded_marker_payload(full: str, probe: int) -> str | None:
+    """The marker LINE starting at *probe* (sentinel included), or ``None`` when
+    the line is too long to be a marker.
+
+    The bound is :data:`MAX_TOOL_RESULT_CHARS`, and it is a semantic bar, not a
+    shortcut, for three independent reasons: :func:`encode` refuses any directive
+    over :data:`MAX_DIRECTIVE_CHARS` (far below it), a tail this long fails
+    :func:`preserve_tail_marker`'s own room check so it could never be
+    re-attached, and the transport cuts every frame to the same budget so no
+    consumer ever reads a marker line past it. A longer line is model-authored
+    bytes wearing the sentinel, and treating it as bytes is what keeps this walk
+    O(occurrences): the frame is unbounded, so per-occurrence work must not
+    scale with the frame.
+    """
+    limit = probe + MAX_TOOL_RESULT_CHARS
+    end = full.find("\n", probe, limit)
+    if end < 0:
+        if len(full) > limit:
+            return None
+        end = len(full)
+    return full[probe:end]
+
+
+def _reads_as_marker(line: str) -> bool:
+    """True iff *line* (sentinel-prefixed) parses as a genuine directive marker.
+
+    A SELECTOR test with NO identity check: it answers "is this occurrence a real
+    marker or model-authored bytes wearing the sentinel?", which is all the walk
+    in :func:`preserve_tail_marker` needs to skip an embedded look-alike and land
+    on the true tail. The JSON after the sentinel must be an object whose ``kind``
+    is a known directive tool -- the same shape :func:`decode` requires before it
+    will honour a marker, minus the trusted-identity match, because provenance is
+    established out of band (:func:`call_input_digest`) and never from this text.
+    """
+    idx = line.find(_SENTINEL)
+    if idx < 0:
+        return False
+    payload = line[idx + len(_SENTINEL) :].split("\n", 1)[0]
+    try:
+        block = json.loads(payload)
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError (a RuntimeError, not caught by the value/type pair)
+        # is reachable: model-authored output can nest brackets thousands deep,
+        # and json.loads recurses per level. A frame that cannot be parsed is
+        # not a marker, whatever made it unparseable.
+        return False
+    if not isinstance(block, dict):
+        return False
+    kind = block.get("kind")
+    # ``kind`` must be a string before the membership test: it is read straight
+    # from model-authored bytes, and an unhashable value (``{"kind": []}``) would
+    # raise ``TypeError`` from ``in`` against the ``frozenset``. A non-string kind
+    # can match no directive tool anyway, so rejecting it here is also correct.
+    return isinstance(kind, str) and kind in DIRECTIVE_TOOLS
+
+
 def preserve_tail_marker(full: str, truncated: str) -> str:
     """Re-attach a tail-anchored marker that truncating *full* into *truncated* cut.
 
@@ -293,9 +351,49 @@ def preserve_tail_marker(full: str, truncated: str) -> str:
     Mirrors the MCP App render marker's re-injection at the same seam, for the
     same reason: a control token that decides how a frame is interpreted must not
     be a casualty of a length cut applied to the frame's prose.
+
+    The marker is located by scanning sentinel occurrences left to right and
+    keeping the RIGHTMOST whose own line actually reads (:func:`_reads_as_marker`
+    for the directive sentinel; exact tail anchoring for the refusal tag, which
+    :func:`tag_refusal` appends as the final line). A plain rightmost-substring
+    search is not enough: the payload is model-authored, JSON string escaping
+    leaves ``[`` alone, so a directive whose own arguments carry the sentinel
+    bytes embeds a later occurrence inside the payload, and re-attaching from
+    there yields a tail that begins mid-payload and reads to no consumer. Each
+    occurrence is judged on a BOUNDED line (:func:`_bounded_marker_payload`),
+    never on a suffix of the frame: ``full`` is unbounded, so per-occurrence
+    suffix slices are O(N*L) -- an event-loop stall reachable by one command
+    that repeats the sentinel bytes.
+    Occurrences reading as genuinely DIFFERENT markers are refused outright, so
+    a length cut cannot launder a two-marker frame into a clean single-marker
+    one. The refusal is fail-safe: :func:`encode` cannot produce two different
+    readable markers, so a frame carrying them was not built here, and surfacing
+    it as the lost-marker case is safer than picking one. When nothing
+    reads, nothing is re-attached: a garbage tail protects no consumer and costs
+    the prose the cut had kept.
     """
     for sentinel in (_SENTINEL, _REFUSAL_SENTINEL):
-        idx = full.rfind(sentinel)
+        if sentinel is _SENTINEL:
+            idx, kept_line = -1, None
+            probe = full.find(sentinel)
+            while probe >= 0:
+                line = _bounded_marker_payload(full, probe)
+                if line is not None and _reads_as_marker(line):
+                    if kept_line is not None and line != kept_line:
+                        # Two genuinely different readable markers: refuse the
+                        # whole frame rather than pick one. Return on the first
+                        # divergence so the retained state is one bounded line,
+                        # never a set that grows with the occurrence count.
+                        return truncated
+                    idx = probe
+                    kept_line = line
+                probe = full.find(sentinel, probe + 1)
+        else:
+            # The refusal tag carries no payload and grants nothing, so it needs
+            # no exactness bar: take the rightmost occurrence, which also re-attaches
+            # a tag embedded in a backend-serialised envelope (the mid-string shape
+            # strip_marker handles) rather than only a strictly tail-anchored one.
+            idx = full.rfind(sentinel)
         if idx < 0:
             continue
         tail = full[idx:]
@@ -391,6 +489,46 @@ def decode(text: str, expected_tool: str) -> dict[str, Any] | None:
         return None
     args = block.get("args")
     return args if isinstance(args, dict) else {}
+
+
+def event_input_digest(tool: str, raw_args: Any, server: str, name: str) -> str:
+    """Select call arguments from an attributed ACP MCP envelope.
+
+    The MCP server hashes its arguments directly, so the consumer must hash the
+    same inner arguments whatever envelope the frame wraps them in:
+
+    - Codex wraps them beside the adapter-resolved server and tool; unwrap only
+      when both match the independently attributed call.
+    - A Tool Search deferred call reaches the server through the backend's
+      ``tool_call`` meta-tool, so the frame's input is
+      ``{"tool_id": "<server>::<tool>", "arguments": {...}}`` while the server
+      receives only ``{...}``. Unwrap only when ``tool_id`` names the core server
+      and the very directive *tool* this call already resolved to, and the
+      envelope carries nothing else besides ``_meta``. Measured on KAS
+      (kiro-cli 2.27.1), whose frame carries no ``_meta.kiro`` identity, so
+      this branch is keyed on the envelope and *tool*, not on *server*/*name*,
+      and holds for any provider that emits the same envelope.
+
+    Never derive identity from this input: the resolved *tool* is the gate, and
+    the envelope only selects which arguments to hash.
+    """
+    if (
+        server == CORE_MCP_SERVER
+        and name == tool
+        and isinstance(raw_args, dict)
+        and raw_args.get("server") == server
+        and raw_args.get("tool") == name
+        and isinstance(raw_args.get("arguments"), dict)
+    ):
+        raw_args = raw_args["arguments"]
+    elif (
+        isinstance(raw_args, dict)
+        and set(raw_args) - {"_meta"} == {"tool_id", "arguments"}
+        and raw_args.get("tool_id") == f"{CORE_MCP_SERVER}::{tool}"
+        and isinstance(raw_args.get("arguments"), dict)
+    ):
+        raw_args = raw_args["arguments"]
+    return call_input_digest(tool, raw_args)
 
 
 def call_input_digest(tool: str, raw_args: Any) -> str:

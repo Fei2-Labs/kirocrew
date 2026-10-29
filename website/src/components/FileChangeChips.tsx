@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { FileDiff, ChevronDown, ChevronUp, ChevronRight, Columns2 } from 'lucide-react'
+import { AlertTriangle, FileDiff, ChevronDown, ChevronUp, ChevronRight, Columns2 } from 'lucide-react'
 import type { FileChipStyle } from '../pages/chat/ChatSettings'
 import { useRowDisclosure } from '../pages/chat/rowDisclosure'
 import { PierreFilePair } from '../pierre'
@@ -10,7 +10,9 @@ import {
   ROW_CSS_CLOSING,
   ROW_CSS_OPEN,
 } from './fileChangeChipsCss'
+import ErrorNotice from './ErrorNotice'
 import { countLines } from '../utils/diffLineCounts'
+import { normalizeWindowsPath } from '../utils/fileTokens'
 import { useDiffSplit } from '../hooks/useDiffSplit'
 
 import { i18nT } from '../i18n/t'
@@ -22,13 +24,140 @@ export interface FileChangeEntry {
   after: string
   truncated?: boolean
   snapshot_limit_chars?: number
+  /** Content dropped because the whole turn outgrew its snapshot budget, not
+   *  because this one file did. The path is still recorded, so the row opens
+   *  the real file. */
+  content_omitted?: boolean
+  turn_budget_chars?: number
+  /** Why `content_omitted` holds. `older_turn`: the chat keeps copies only for
+   *  its most recent file-changing turns, and this turn is older
+   *  (`transcript_merge.py::FILE_CHANGES_OLDER_TURN`). `unverified_write`: the
+   *  write failed and the file before it is unknown, so no diff is proven.
+   *  Absent: the turn budget. */
+  omitted_reason?: string
 }
 
 const LEGACY_SNAPSHOT_LIMIT_CHARS = 200_000
 
+const OLDER_TURN = 'older_turn'
+/** A write tool reported `failed` and nothing recorded the file before it, so
+ *  no diff can be proven (`file_changes.py::_failed_write_entries`). */
+const UNVERIFIED_WRITE = 'unverified_write'
+
+const omittedContentSentence = (fc: FileChangeEntry) =>
+  fc.omitted_reason === OLDER_TURN
+    ? i18nT('components.fileChangeChips.diff_unavailable_older_turn')
+    : fc.omitted_reason === UNVERIFIED_WRITE
+      ? i18nT('components.fileChangeChips.diff_unavailable_unverified_write')
+      : i18nT('components.fileChangeChips.diff_unavailable_turn_snapshot_budget', {
+          limit: fmtNumber(fc.turn_budget_chars ?? LEGACY_SNAPSHOT_LIMIT_CHARS * 2),
+        })
+
+/** One entry per reason the card's notice states. An older turn's sentence
+ *  covers every row the turn budget had already left without content, so it
+ *  replaces the budget sentence. A failed write is an error, not a size limit,
+ *  so its notice stays beside either one; each reason is said once. */
+const noticeEntries = (fileChanges: FileChangeEntry[]): FileChangeEntry[] => {
+  const unverified = fileChanges.find(fc => fc.omitted_reason === UNVERIFIED_WRITE)
+  const older = fileChanges.find(fc => fc.omitted_reason === OLDER_TURN)
+  // A failed write is an error whatever the turn's age, so it keeps its own
+  // notice; the older-turn sentence replaces only the turn-budget one.
+  if (older) return [unverified, older].filter((fc): fc is FileChangeEntry => fc !== undefined)
+  const budget = fileChanges.find(fc => fc.content_omitted && fc.omitted_reason !== UNVERIFIED_WRITE)
+  return [unverified, budget].filter((fc): fc is FileChangeEntry => fc !== undefined)
+}
+
+/* Three reasons a row carries no diff, and they are NOT the same sentence: one
+ * file outgrew the per-file cap, the turn as a whole outgrew its budget and
+ * this file's content was dropped to keep the newest changes complete, or the
+ * turn is older than the chat keeps copies for (`older_turn`). Telling
+ * a small file's owner it was "too large to compare" sends them looking for a
+ * size problem that is not theirs.
+ *
+ * This notice is the per-file one, so it stays beside its file in both styles.
+ * The turn-budget sentence describes the turn and is said ONCE per surface
+ * (`TurnBudgetNotice`): a demoted card row wears only `DemotedTag`, and a
+ * demoted pill wears its filename plus the same marker at a muted size,
+ * because repeating the sentence per row squeezes each row's filename — the
+ * one fact that differs between rows — into an ellipsis to make room.
+ *
+ * Two states, two vocabularies. A demoted row is still a file the reader can
+ * open, so its marker names what the row offers (`file_only`). A file the
+ * turn left out of the list is not here at all, so the card-level line says
+ * exactly that (`omitted_files_notice`: not listed) and offers nothing. Neither
+ * borrows the other's word, so a reader can tell a file that is here without
+ * its diff from a file that is not here. */
 function TruncatedNotice({ fc }: { fc: FileChangeEntry }) {
   const limit = fmtNumber(fc.snapshot_limit_chars ?? LEGACY_SNAPSHOT_LIMIT_CHARS)
   return <span className="text-muted text-[11px] italic">{i18nT('components.fileChangeChips.diff_unavailable_file_exceeds_snapshot_limit', { limit })}</span>
+}
+
+/** Same pill as the artifact badge, so a demoted row gains a tag in a shape
+ *  the row already uses rather than a second style of caption — including the
+ *  badge's `title`, so hovering the tag restates the turn-budget reason the
+ *  card's notice row gives once. */
+function DemotedTag({ fc }: { fc: FileChangeEntry }) {
+  // A failed write's row wears the failure's colour and icon, so the red
+  // notice above can be traced to its file among other "File only" rows.
+  if (fc.omitted_reason === UNVERIFIED_WRITE) {
+    return <span data-fcc-demoted-tag data-fcc-unverified-write title={omittedContentSentence(fc)} className="shrink-0 inline-flex items-center gap-1 text-[10px] leading-none px-1.5 py-0.5 rounded-full border border-danger/40 text-danger font-medium"><AlertTriangle size={10} aria-hidden="true" />{i18nT('components.fileChangeChips.file_only')}</span>
+  }
+  return <span data-fcc-demoted-tag title={omittedContentSentence(fc)} className="shrink-0 text-[10px] leading-none px-1.5 py-0.5 rounded-full border border-border text-muted font-medium">{i18nT('components.fileChangeChips.file_only')}</span>
+}
+
+/** The omitted-files count as a positive integer, or 0 for an absent, zero or
+ *  malformed field — an older message carries no field at all. The gateway
+ *  sends a plain count with no ceiling, so none is applied here. */
+const omittedFilesOf = (raw: unknown): number =>
+  typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0
+
+/* Files the turn's snapshot limits left out of the list altogether: entries
+ * past the row cap and entries the character budget dropped, in one number.
+ * It counts FILES, the same unit as the "N files
+ * changed" header, so the two numbers add up for the reader. The sentence
+ * says the files are not listed — the one fact the reader can check against
+ * the card — and promises no way to see them: nothing anywhere can show a
+ * file the turn did not keep. It is a fact about the turn, so the card says
+ * it once beneath the header exactly as `TurnBudgetNotice` does, and a
+ * minimal pill row says it once after the pills. Plain text, not an
+ * ErrorNotice: nothing failed and there is nothing to retry. `count` picks
+ * the plural form; `files` is the locale-formatted digits. */
+function OmittedFilesNotice({ count, className }: { count: number; className: string }) {
+  return (
+    <div data-fcc-omitted-notice className={className}>
+      {i18nT('components.fileChangeChips.omitted_files_notice', { count, files: fmtNumber(count) })}
+    </div>
+  )
+}
+
+/* One notice per surface: a row directly beneath the card header in the
+ * header's face, or a full-width line after the minimal pills. The open hint
+ * renders only when a file-open handler exists: a demoted row's filename is a
+ * button exactly then, and the hint must not promise a click that does
+ * nothing. It is status about a turn, not the outcome of a failed request, so
+ * it is plain text and not an ErrorNotice. */
+const NOTICE_ROW_CLASS = 'px-[10px] py-1.5 border-b border-border font-mono text-[11px] leading-[18px] text-muted italic'
+const PILL_ROW_NOTICE_CLASS = 'basis-full text-muted text-[11px] italic'
+
+function TurnBudgetNotice({ fc, canOpen, className }: { fc: FileChangeEntry; canOpen: boolean; className: string }) {
+  if (fc.omitted_reason === UNVERIFIED_WRITE) {
+    // A write that FAILED is an error, so it renders through the shared error
+    // surface (`errors-use-error-notice`). The card sits in a persisted
+    // transcript and holds no draft of its own, so the hand-off loses nothing.
+    return (
+      <div data-fcc-turn-notice className={className}>
+        <ErrorNotice variant="inline" askAgent testId="fcc-unverified-write-notice" message={omittedContentSentence(fc)} />
+        {/* Its own line: run on after the hand-off link it reads as part of it. */}
+        {canOpen && <div>{i18nT('components.fileChangeChips.turn_snapshot_budget_open_hint')}</div>}
+      </div>
+    )
+  }
+  return (
+    <div data-fcc-turn-notice className={className}>
+      {omittedContentSentence(fc)}
+      {canOpen && <> {i18nT('components.fileChangeChips.turn_snapshot_budget_open_hint')}</>}
+    </div>
+  )
 }
 
 /** Re-exported for this component's existing importers; defined in
@@ -36,7 +165,13 @@ function TruncatedNotice({ fc }: { fc: FileChangeEntry }) {
  *  it the Pierre diff runtime). */
 export { countLines }
 
-const basename = (p: string) => p.split('/').pop() || p
+/* The last segment of the path, which is what every row surface shows while the
+ * full path stays on the tooltip and the control labels. A Windows gateway
+ * sends `C:\…` and UNC `\\srv\…` paths with backslashes, so those are folded to
+ * `/` first (`normalizeWindowsPath` rewrites only drive-letter and UNC shapes);
+ * a POSIX name is left alone, because there `\` is an ordinary filename
+ * character and a blanket split would invent a nested path (#14557). */
+const basename = (p: string) => normalizeWindowsPath(p).split('/').pop() || p
 const FALLBACK_CONTENT_STYLE = { maxHeight: ROW_BODY_MAX_H, overflowY: 'auto' } as const
 
 /* Removals first, additions second — the order Pierre's own file headers use
@@ -96,9 +231,15 @@ function RowMetadata({ added, removed, isArtifact }: {
   isArtifact?: boolean
 }) {
   return (
+    /* `shrink-0`, and no reserved basis. Everything in here is fixed-size (the
+       badge, five 7px cells), so a rail allowed to shrink below that did not
+       free space for the filename — it drew its cells over the count beside
+       it (#14557). A reserved basis is the other wrong answer: a 124px floor
+       crushed the filename at the 320px viewport (#8316). Sized to content, the
+       filename's `min-w-0 truncate` is the only part of the row that gives. */
     <span
       data-testid="fcc-metadata"
-      className="ml-auto flex min-w-0 items-center gap-2"
+      className="ml-auto flex shrink-0 items-center gap-2"
     >
       <span className="flex items-center gap-2">
         {isArtifact && (
@@ -164,7 +305,11 @@ function CollapsedRowHeader({ fc, added, removed, isArtifact, onFileOpen, onTogg
         <span className="min-w-0 truncate" title={fc.path} data-fcc-filename>{name}</span>
       )}
       <RowMetadata added={added} removed={removed} isArtifact={isArtifact} />
-      <span className="flex min-w-[8ch] items-center justify-end gap-1">
+      {/* `min-w-[8ch]` replaces flex's `min-width:auto`, so without `shrink-0`
+          a count wider than 8ch ("-965 +1032") was squeezed to 8ch and, being
+          `justify-end`, spilled LEFT under the diffstat cells (#14557). The
+          floor stays so short counts right-align in one column. */}
+      <span data-fcc-count className="flex min-w-[8ch] shrink-0 items-center justify-end gap-1">
         <Stats added={added} removed={removed} />
       </span>
     </div>
@@ -187,7 +332,7 @@ function TruncatedRow({ fc, isArtifact, onFileOpen }: {
           <span className="min-w-0 truncate" title={fc.path} data-fcc-filename>{name}</span>
         )}
         {isArtifact && <span data-fcc-artifact-badge className="shrink-0 text-[10px] leading-none px-1.5 py-0.5 rounded-full border border-border text-muted font-medium">{i18nT('components.fileChangeChips.artifact')}</span>}
-        <span className="ml-auto"><TruncatedNotice fc={fc} /></span>
+        <span className="ml-auto shrink-0">{fc.content_omitted ? <DemotedTag fc={fc} /> : <TruncatedNotice fc={fc} />}</span>
       </div>
     </div>
   )
@@ -402,6 +547,7 @@ function ExpandedRow({ fc, added, removed, isArtifact, onFileOpen, disclosureKey
           renderHeaderPrefix={prefix}
           renderHeaderFilenameSuffix={filenameSuffix}
           renderHeaderMetadata={metadata}
+          titleClickable={clickableTitle}
         />
       ) : (
         <CollapsedRowHeader
@@ -428,8 +574,10 @@ function ExpandedRow({ fc, added, removed, isArtifact, onFileOpen, disclosureKey
  *   shows the true total + aggregate stats while collapsed).                */
 const COLLAPSED_COUNT = 8
 
-function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }: {
+function ExpandedList({ fileChanges, omittedFiles, onFileOpen, artifactPaths, disclosureKey }: {
   fileChanges: FileChangeEntry[]
+  /** Already validated by `omittedFilesOf`; 0 renders no notice. */
+  omittedFiles: number
   onFileOpen?: (path: string) => void
   artifactPaths?: Set<string>
   disclosureKey?: string
@@ -444,6 +592,8 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
   const stats = fileChanges.map(fc => fc.truncated ? { added: 0, removed: 0 } : countLines(fc.before, fc.after))
   const hasTruncatedSnapshot = fileChanges.some(fc => fc.truncated)
   const hasCompleteDiff = fileChanges.some(fc => !fc.truncated)
+  // The card says each reason once, for every row without content.
+  const demoted = noticeEntries(fileChanges)
   const totalAdded = stats.reduce((s, x) => s + x.added, 0)
   const totalRemoved = stats.reduce((s, x) => s + x.removed, 0)
   const overflow = n > COLLAPSED_COUNT
@@ -480,6 +630,10 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
             has no hover reveal, unlike DiffBlock's slotted controls. */}
         {hasCompleteDiff && <button onClick={() => setSideBySide(v => !v)} className={`ml-auto flex items-center justify-center w-[22px] h-[22px] rounded-md cursor-pointer transition-colors border-none shrink-0 ${sideBySide ? 'text-accent bg-accent-subtle' : 'text-muted hover:text-text hover:bg-bg-hover bg-transparent'}`} title={sideBySide ? i18nT('components.fileChangeChips.switch_to_unified_view') : i18nT('components.fileChangeChips.switch_to_split_view')} aria-label={sideBySide ? i18nT('components.fileChangeChips.switch_to_unified_view') : i18nT('components.fileChangeChips.switch_to_split_view')}><Columns2 size={13} /></button>}
       </div>
+      {demoted.map((fc, i) => (
+        <TurnBudgetNotice key={fc.omitted_reason ?? 'budget'} fc={fc} canOpen={!!onFileOpen && i === demoted.length - 1} className={NOTICE_ROW_CLASS} />
+      ))}
+      {omittedFiles > 0 && <OmittedFilesNotice count={omittedFiles} className={NOTICE_ROW_CLASS} />}
       <div className="flex flex-col">
         {fileChanges.slice(0, visibleCount).map((fc, i) => (
           fc.truncated ? (
@@ -520,20 +674,48 @@ function ExpandedList({ fileChanges, onFileOpen, artifactPaths, disclosureKey }:
   )
 }
 
-/* ── Minimal: stats-only liquid-glass pill, filename hovers above on hover ── */
-function MinimalChip({ fc, onClick }: { fc: FileChangeEntry; onClick: () => void }) {
+/* ── Minimal: stats-only liquid-glass pill, filename hovers above on hover ──
+ *
+ * `named` is true for a row that holds a demoted pill. A demoted pill has no
+ * numbers, so its face is its filename plus a muted `file_only` marker; the
+ * stats pill beside it then names its file too, because a row where some
+ * pills say which file they are about and one does not leaves the reader
+ * unsure whether the anonymous pill stands for the missing file or for the
+ * whole set. A row with no demoted pill keeps the stats-only face, filename
+ * on hover. */
+function MinimalChip({ fc, named, onClick }: { fc: FileChangeEntry; named: boolean; onClick: () => void }) {
   const { added, removed } = fc.truncated ? { added: 0, removed: 0 } : countLines(fc.before, fc.after)
   return (
     <span className="relative inline-flex group/tip">
       <span className="glass-surface absolute bottom-full left-0 mb-1 px-2 py-0.5 rounded-md text-[11px] font-medium text-text whitespace-nowrap font-mono z-10 pointer-events-none opacity-0 translate-y-1 group-hover/tip:opacity-100 group-hover/tip:translate-y-0 transition-all duration-150">
         {basename(fc.path)}
       </span>
-      {fc.truncated ? (
+      {fc.content_omitted ? (
+        /* A demoted pill shows its filename and the `file_only` marker, muted
+           and a size down so it never competes with the name: without it a
+           demoted pill is a bare filename that reads as a healthy, complete one.
+           The turn-budget sentence is about the turn and the pill row says it
+           once (`TurnBudgetNotice`), so three demoted pills read as three files
+           rather than one repeated line. The pill wraps, so `text-left` keeps a
+           basename that breaks at a hyphen starting under the left edge like
+           every other pill. */
+        <button type="button" onClick={onClick} className="glass-surface file-chip inline-flex max-w-full min-w-0 min-h-[22px] h-auto items-center gap-1 px-2.5 py-1 whitespace-normal text-left rounded-full text-[11px] font-medium cursor-pointer" aria-label={fc.path}>
+          <span data-fcc-pill-filename className="font-mono text-text">{basename(fc.path)}</span>
+          {fc.omitted_reason === UNVERIFIED_WRITE ? (
+            // The failed write's pill takes the failure's colour and icon, so
+            // the red line under the pills points at it.
+            <span data-fcc-pill-marker data-fcc-unverified-write title={omittedContentSentence(fc)} className="shrink-0 inline-flex items-center gap-0.5 text-[10px] leading-none text-danger"><AlertTriangle size={10} aria-hidden="true" />{i18nT('components.fileChangeChips.file_only')}</span>
+          ) : (
+            <span data-fcc-pill-marker className="shrink-0 text-[10px] leading-none text-muted">{i18nT('components.fileChangeChips.file_only')}</span>
+          )}
+        </button>
+      ) : fc.truncated ? (
         <button type="button" onClick={onClick} className="glass-surface file-chip inline-flex max-w-full min-w-0 min-h-[22px] h-auto items-center gap-1 px-2.5 py-1 whitespace-normal rounded-full text-[11px] font-medium cursor-pointer" aria-label={fc.path}>
           <TruncatedNotice fc={fc} />
         </button>
       ) : (
         <button type="button" onClick={onClick} className="glass-surface file-chip inline-flex items-center gap-1 h-[22px] px-2.5 rounded-full text-[11px] font-medium cursor-pointer" aria-label={fc.path}>
+          {named && <span data-fcc-pill-filename className="font-mono text-text">{basename(fc.path)}</span>}
           <Stats added={added} removed={removed} />
         </button>
       )}
@@ -551,9 +733,16 @@ function MinimalChip({ fc, onClick }: { fc: FileChangeEntry; onClick: () => void
  * - `minimal`: stats-only glass pills that wrap, filename on hover. A complete
  *   snapshot opens its standalone diff via `onOpenDiff`; a truncated snapshot
  *   opens the actual file via `onFileOpen` because no trustworthy diff exists.
+ *   A turn's notices (budget, omitted files) follow the pills, once each.
+ *
+ * No entries renders nothing, whatever `omittedFiles` says: the gateway
+ * attaches the count only alongside a non-empty list, and the budget always
+ * retains at least one entry, so a notice with no rows has no producer.
  */
-const FileChangeChips = memo(function FileChangeChips({ fileChanges, onOpenDiff, onFileOpen, style = 'expanded', artifactPaths, disclosureKey }: {
+const FileChangeChips = memo(function FileChangeChips({ fileChanges, omittedFiles, onOpenDiff, onFileOpen, style = 'expanded', artifactPaths, disclosureKey }: {
   fileChanges: FileChangeEntry[]
+  /** `meta.file_changes_omitted_files` as the gateway sent it; absent is 0. */
+  omittedFiles?: unknown
   /** Minimal style only — the expanded card diffs in place instead. */
   onOpenDiff?: (path: string, modified: string, original: string) => void
   /** Opens the file as a side-panel tab from a row's Open button. */
@@ -566,23 +755,31 @@ const FileChangeChips = memo(function FileChangeChips({ fileChanges, onOpenDiff,
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!fileChanges?.length) return null
+  const omitted = omittedFilesOf(omittedFiles)
   // Minimal keeps the wrapping pill row; anything else uses the grouped card.
   if (style === 'minimal') {
+    // The pill row says each reason once, for every pill without content.
+    const demoted = noticeEntries(fileChanges)
     return (
       <div className="ft-block-reveal flex flex-wrap items-center gap-1.5 mt-2 mb-1.5">
         {fileChanges.map(fc => (
           <MinimalChip
             key={fc.path}
             fc={fc}
+            named={demoted.length > 0}
             onClick={fc.truncated
               ? () => onFileOpen?.(fc.path)
               : () => onOpenDiff?.(fc.path, fc.after, fc.before)}
           />
         ))}
+        {demoted.map((fc, i) => (
+          <TurnBudgetNotice key={fc.omitted_reason ?? 'budget'} fc={fc} canOpen={!!onFileOpen && i === demoted.length - 1} className={PILL_ROW_NOTICE_CLASS} />
+        ))}
+        {omitted > 0 && <OmittedFilesNotice count={omitted} className={PILL_ROW_NOTICE_CLASS} />}
       </div>
     )
   }
-  return <ExpandedList fileChanges={fileChanges} onFileOpen={onFileOpen} artifactPaths={artifactPaths} disclosureKey={disclosureKey} />
+  return <ExpandedList fileChanges={fileChanges} omittedFiles={omitted} onFileOpen={onFileOpen} artifactPaths={artifactPaths} disclosureKey={disclosureKey} />
 })
 
 export default FileChangeChips

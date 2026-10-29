@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from kiro_crew.config import live
@@ -36,9 +37,13 @@ from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import (
+    COMPACT_TIMED_OUT_REPLY_ZH,
     compact_unsupported_backend,
     compact_unsupported_reply_zh,
+    context_recycle_warning_zh,
     note_user_stop,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
@@ -61,7 +66,17 @@ from kiro_crew.messaging.link import (
     release_conversation_location,
     seed_generation,
 )
+from kiro_crew.messaging.queue_drain import entries_queued_by, owner_token
+from kiro_crew.mirror_admission import sign_mirror_admission
 from kiro_crew.safety_override import safety_override
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+    force_stop_keeping_others,
+)
+from kiro_crew.start_priority import person_priority
 from kiro_crew.wecom.attachments import process_wecom_attachments
 from kiro_crew.wecom.commands import (
     ConversationState,
@@ -73,6 +88,13 @@ from kiro_crew.wecom.commands import (
 )
 from kiro_crew.wecom.renderer import WeComRenderer
 from kiro_crew.wecom.transport import WECOM_CAPABILITIES
+
+#: The stop command's two replies (pre-existing wording, hoisted so both call
+#: sites share one literal).
+_STOPPED_TEXT = "\U0001f6d1 \u5df2\u505c\u6b62\u672c\u6b21\u56de\u590d\u3002"
+_STOP_FAILED_TEXT = (
+    "\u26a0\ufe0f \u505c\u6b62\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002"
+)
 
 if TYPE_CHECKING:
     from kiro_crew.config.loader import KiroCrewConfig
@@ -320,6 +342,7 @@ class WeComDispatcher:
             await self._bind_origin_mirror(session_key, inbound)
             await drive_turn(
                 ChannelTurn(
+                    start_priority=person_priority(inbound.person_origin),
                     channel_type="wecom",
                     session_key=session_key,
                     inbound_route=inbound_route,
@@ -347,6 +370,7 @@ class WeComDispatcher:
                     notice=lambda sk, provider: self._maybe_notice(inbound, sk, provider),
                     audit_caller=f"wecom:{userid}",
                     after_persist=_surface_new_session,
+                    user_display_name=self._display_name(userid),
                 ),
                 sessions=self.sessions,
                 ctx_builder=self.ctx_builder,
@@ -420,6 +444,26 @@ class WeComDispatcher:
 
     def _resolve_agent(self) -> str:
         return self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
+
+    def _display_name(self, userid: str) -> str:
+        """Sender's name from ``wecom.allowed_users``, else the raw userid.
+
+        WeCom's inbound frame carries only an opaque userid, so resolve the
+        operator-set name for ``[CURRENT USER]``, mirroring Slack's name fallback.
+        """
+        for u in getattr(self.cfg.wecom, "allowed_users", []):
+            if u.get("userid") == userid:
+                # Return the operator-set name ONLY when it is a non-empty
+                # string. A truthy non-string (e.g. YAML ``name: 123`` coerced
+                # to int) would otherwise flow into ``[CURRENT USER]`` marker
+                # scrubbing, which assumes ``str`` and raises — crashing every
+                # turn for that user. The loader type-checks ``userid`` but not
+                # ``name``, so guard it here.
+                name = u.get("name")
+                if isinstance(name, str) and name:
+                    return name
+                return userid
+        return userid
 
     def _session_key(self, userid: str) -> str:
         gen = self._conv.current_gen(userid)
@@ -496,6 +540,12 @@ class WeComDispatcher:
         userid = inbound.userid
         pct = self.sessions.check_context_usage(session_key, provider)
         soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(self.sessions, self._conv, userid, session_key, pct):
+                await self._notice_bubble(inbound, context_recycle_warning_zh())
+            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -508,8 +558,15 @@ class WeComDispatcher:
             self._conv.clear_awaiting(userid)
             try:
                 await provider.compact()
-                await provider.wait_for_compaction()
-                await self._notice_bubble(inbound, "🗜️ 上下文接近上限，已自动压缩。")
+                # A failed or timed-out compaction is a RETURNED result, not an
+                # exception, so the notice is posted only for a completed one.
+                cr = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
+                if cr["type"] == "completed":
+                    await self._notice_bubble(inbound, "🗜️ 上下文接近上限，已自动压缩。")
+                else:
+                    logger.warning("WeCom hard-threshold compaction reported %s", cr["type"])
             except Exception:
                 logger.debug("WeCom hard-threshold compaction failed", exc_info=True)
         elif pct >= soft and not self._conv.is_awaiting(userid):
@@ -635,10 +692,14 @@ class WeComDispatcher:
         # whose loop-aware branch marks the map dirty and schedules ONE debounced
         # flush that itself writes in a worker thread. Wrapping THOSE in a batch
         # would reintroduce the inline write this line exists to avoid.
+        # The conversation's own authorized peer is binding the chat it writes
+        # from, so this link MINTS the row's admission (``kiro_crew.mirror_admission``).
+        location = self._origin_mirror_link(inbound)
+        location = replace(location, admission=sign_mirror_admission(key, location) or None)
         await asyncio.to_thread(self.sessions.set_mirror_opt_out, key, False)
         self.sessions.set_mirror_link(
             key,
-            self._origin_mirror_link(inbound),
+            location,
             reason=UNBIND_REASON_ORIGIN_REBIND,
         )
         # Drop any pre-unification row so a stale binding cannot outlive the rebind.
@@ -682,6 +743,41 @@ class WeComDispatcher:
         """
         assert self.client is not None
         session_key = self._session_key(inbound.userid)
+        # Before the Stop record: a Stop the session's own automatic compaction
+        # declines ends nothing and must record nothing.
+        if compaction_in_flight(self.sessions, session_key):
+            # A repeat within the window is the second press and forces. Keyed
+            # by the presser too: under a unified ``dm_scope`` one session key
+            # is every user's, and another user's declined Stop must not arm
+            # this user's first press.
+            if not consume_stop_declined(session_key, inbound.userid):
+                # Sent before the marker is armed: an undelivered warning plus an
+                # armed escalation is a retry that hard-resets the session with
+                # this user never told that it would.
+                client = self.client
+                await decline_stop(
+                    session_key,
+                    inbound.userid,
+                    lambda: client.say(inbound, STOP_DECLINED_COMPACTING_TEXT),
+                )
+                return
+            note_user_stop(self.sessions, session_key)
+            try:
+                # Through the queue-keeping helper: this channel queues nothing
+                # itself, but under a unified ``dm_scope`` the key is shared
+                # with channels that do, and the hard reset would pop their
+                # queued messages and unlink their attachments. The presser's
+                # own token matches none of those entries, so all are carried.
+                forced = await force_stop_keeping_others(
+                    self.sessions,
+                    session_key,
+                    entries_queued_by(owner_token("wecom", (inbound.userid,))),
+                )
+            except Exception:
+                logger.warning("wecom /stop: force stop failed for %s", session_key, exc_info=True)
+                forced = False
+            await self.client.say(inbound, _STOPPED_TEXT if forced else _STOP_FAILED_TEXT)
+            return
         # Recorded before the busy check, so a Stop landing while the session is
         # between an abandoned attempt and its replay still counts (see
         # ``note_user_stop``).
@@ -698,9 +794,9 @@ class WeComDispatcher:
             await cancel(wait_ack_timeout=0)
         except Exception:
             logger.warning("WeCom /stop: cancel failed for %s", session_key, exc_info=True)
-            await self.client.say(inbound, "⚠️ 停止失败，请稍后重试。")
+            await self.client.say(inbound, _STOP_FAILED_TEXT)
             return
-        await self.client.say(inbound, "🛑 已停止本次回复。")
+        await self.client.say(inbound, _STOPPED_TEXT)
 
     async def _handle_compact(self, inbound: "WeComInbound") -> None:
         """In-place ACP ``/compact`` on the user's current session."""
@@ -736,8 +832,17 @@ class WeComDispatcher:
                 )
                 return
             await provider.compact()
-            await provider.wait_for_compaction()
-            await self.client.say(inbound, "🗜️ 已压缩上下文。")
+            # Failure and timeout come back as the result's ``type``, not as an
+            # exception, so the receipt is read off it rather than assumed.
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
+            if cr["type"] == "completed":
+                await self.client.say(inbound, "🗜️ 已压缩上下文。")
+            elif cr["type"] == "failed":
+                await self.client.say(inbound, "⚠️ 压缩失败，请重试。")
+            else:
+                await self.client.say(inbound, COMPACT_TIMED_OUT_REPLY_ZH)
         except Exception:
             logger.exception("WeCom /compact failed for %s", session_key)
             await self.client.say(inbound, "⚠️ 压缩失败，请重试。")

@@ -30,13 +30,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from off_loop_helpers import off_loop
 
 from kiro_crew.apps.builtins.issue_radar.backend import crew_runtime as cr
 from kiro_crew.apps.builtins.issue_radar.backend import crew_store as cs
 from kiro_crew.apps.builtins.issue_radar.backend import github_client as gh
 from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
+from kiro_crew.crew_log import projection as crew_log_projection
 
 OWNER, REPO = "o", "r"
 
@@ -1340,23 +1343,35 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
     """End-to-end through ``sweep_repo``: the last blocker closing wakes the crew
     exactly once, and a still-open blocker does not."""
 
+    @pytest.fixture(autouse=True)
+    def _per_test_dirs(self, tmp_path):
+        """Hand ``setUp`` pytest's per-test directory for the radar store root.
+
+        Neither directory this class writes is one it creates and removes itself. Its
+        background writers (the crew-log eager fold, the radar store's ``mkdir`` on
+        every read) can still touch a directory after the test's own cleanup has
+        removed it, which re-creates it as temp residue. pytest owns ``tmp_path`` and
+        the conftest stops the fold worker before its pins lift.
+        """
+        self._tmp_path = tmp_path
+
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name)
+        self.root = self._tmp_path / "radar-root"
+        self.root.mkdir()
         self.key = provider.key_from_parts(OWNER, REPO)
         # A crew's ledger is the fold of its own crew log, so seeding a work item
         # records into the unit its slot runs on, as the write route does.
         from kiro_crew.crew_log import emit as crew_log_emit
 
-        home = tempfile.TemporaryDirectory()
-        self.addCleanup(home.cleanup)
-        env = mock.patch.dict(os.environ, {"KIROCREW_HOME": home.name, "KIROCREW_CREW_LOG": "1"})
+        # The crew log lands in the rootdir conftest's per-test KIROCREW_HOME pin, not
+        # in a home of this test's own. The eager fold worker resolves the home when it
+        # folds, and the conftest stops that worker before its pin lifts.
+        env = mock.patch.dict(os.environ, {"KIROCREW_CREW_LOG": "1"})
         env.start()
         self.addCleanup(env.stop)
         crew_log_emit.reset_caches()
-        cs._fold_cache.clear()
-        self.addCleanup(cs._fold_cache.clear)
+        crew_log_projection.forget_slot_folds()
+        self.addCleanup(crew_log_projection.forget_slot_folds)
         self.addCleanup(crew_log_emit.reset_caches)
         self.addCleanup(crew_log_emit.drain_for_shutdown, 2.0)
 
@@ -1368,7 +1383,9 @@ class SweepDepUnblockTest(unittest.IsolatedAsyncioTestCase):
         CrewLog.create(
             KIND_SESSION, sid, owner="owner", agent="kirocrew", slot=cs.slot_key_for(crew_id)
         )
-        cs.commit_work_progress(
+        # Off the event loop, as production makes it (``off_loop`` says why).
+        off_loop(
+            cs.commit_work_progress,
             OWNER,
             REPO,
             crew_id,

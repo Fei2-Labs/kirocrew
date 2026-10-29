@@ -242,3 +242,45 @@ describe('PrPickList error + noop surfaces', () => {
     expect(sage.refreshPrs).toHaveBeenCalled()
   })
 })
+
+describe('PrPickList fed by the review queue', () => {
+  const queued = [
+    pr({ number: 1, url: 'https://github.com/zzzacme/widgets/pull/1', title: 'zzz one', repo: 'zzzacme/widgets' }),
+    pr({ number: 2, url: 'https://github.com/zzzother/tools/pull/2', title: 'zzz two', repo: 'zzzother/tools' }),
+  ]
+
+  it('needs no active repo, filters by repo, and drops the repo-wide actions', async () => {
+    sage.activeRepo = null
+    const refresh = vi.fn()
+    render(<PrPickList source={{ prs: queued, loading: false, error: null, refresh, note: 'zzz note', emptyTitle: 'zzz empty' }} />)
+    expect(screen.queryByRole('button', { name: /Review all/i })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Paste PR links instead/i)).not.toBeInTheDocument()
+    expect(screen.getByText('zzz note')).toBeInTheDocument()
+    // Queue rows have no review history, so no row may claim to be "new".
+    expect(screen.queryByText('new')).not.toBeInTheDocument()
+
+    await userEvent.type(screen.getByLabelText(/Filter pull requests/i), 'zzzacme')
+    expect(screen.queryByText('zzz two')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('checkbox'))
+    await userEvent.click(screen.getByRole('button', { name: /Review 1 selected/i }))
+    expect((sage.startReview as { mutate: ReturnType<typeof vi.fn> }).mutate)
+      .toHaveBeenCalledWith(['https://github.com/zzzacme/widgets/pull/1'])
+
+    await userEvent.click(screen.getByRole('button', { name: /Refresh pull requests/i }))
+    expect(refresh).toHaveBeenCalled()
+  })
+
+  it('shows the source error, not the context one', () => {
+    sage.prsError = new Error('zzz context error')
+    render(<PrPickList source={{ prs: [], loading: false, error: new Error('zzz queue error'), refresh: vi.fn(), note: 'zzz note', emptyTitle: 'zzz empty' }} />)
+    expect(screen.getByText(/zzz queue error/)).toBeInTheDocument()
+    expect(screen.queryByText(/zzz context error/)).not.toBeInTheDocument()
+    // A queue that never loaded must not also claim to be empty.
+    expect(screen.queryByText('zzz empty')).not.toBeInTheDocument()
+  })
+
+  it('says the queue is empty when it loaded with no rows', () => {
+    render(<PrPickList source={{ prs: [], loading: false, error: null, refresh: vi.fn(), note: 'zzz note', emptyTitle: 'zzz empty' }} />)
+    expect(screen.getByText('zzz empty')).toBeInTheDocument()
+  })
+})

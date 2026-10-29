@@ -11,6 +11,7 @@ files that don't yet exist for this surface).
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import json
 import os
 import time
@@ -507,6 +508,348 @@ def test_tr_u_16_persistence_roundtrip(tmp_path: Path):
     mgr2 = RefreshStateManager(state_path=state_file)
     assert mgr2.is_consumed("jti1") is True
     assert mgr2.is_chain_revoked("c2") is True
+
+
+def test_tr_u_16b_unusable_staging_dir_degrades_the_store(tmp_path, monkeypatch):
+    """A refused staging directory must neither publish unmasked nor fail silently.
+
+    Publishing through the state file's own directory would put a full copy of the chain
+    state at a sandbox-visible name for the length of the write, which is the exposure the
+    staging directory exists to close. Dropping the write silently is no better: the caller
+    has already reported a successful rotation or logout, so the next start would load a
+    store missing that revocation and read it as nothing revoked.
+
+    Degrading is both answers at once, and the existing reader fails closed on it -- so a
+    spent token is REFUSED rather than accepted.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    def _refused(_home):
+        raise OSError(errno.ENOTDIR, "staging directory is not usable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+    mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    assert not state_file.exists(), (
+        "the state file was published through its own unmasked directory; that is the write "
+        "window the staging directory exists to close"
+    )
+    reason = mgr.degraded_reason()
+    assert reason, (
+        "the record was dropped with the store still reporting itself trustworthy, so the "
+        "next start would read the missing revocation as nothing revoked"
+    )
+    assert "not persisted" in reason
+
+
+def test_tr_u_16d_a_dropped_consumption_is_REPORTED_to_its_caller(tmp_path, monkeypatch):
+    """Degrading the store is not enough: the caller about to publish must learn it failed.
+
+    ``degraded_reason`` gates validation in THIS process only. The record that retires the
+    presented jti is in memory, so the restart the store's own warning asks for loads a file
+    that never saw it and clears the degradation along with it -- and the token this call was
+    meant to burn authenticates again, with its replacement pair already delivered. So the
+    return value has to carry the failure, or no caller can decline to publish.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    def _refused(_home):
+        raise OSError(errno.ENOTDIR, "staging directory is not usable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    mgr = RefreshStateManager(state_path=tmp_path / "rt.json")
+    persisted = mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    assert persisted is False, (
+        "the consumption was reported as successful while it existed only in memory, so a "
+        "caller would publish a replacement pair and leave the presented token spendable "
+        "after the next start"
+    )
+
+
+def test_tr_u_16f_a_dropped_consumption_is_ROLLED_BACK_in_memory(tmp_path, monkeypatch):
+    """Reporting the failure is not enough on its own: memory must not keep the rotation.
+
+    The caller answers False by refusing to publish and telling the client its token was not
+    rotated. Leaving the jti marked spent and this rotation's payload installed as the chain's
+    grace authenticator contradicts that inside the process: the client still holds the
+    presented token, and the replacement the grace entry names was never delivered. A prior
+    entry for the same chain must be RESTORED rather than dropped, since this rotation had no
+    grounds to retire it.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    mgr = RefreshStateManager(state_path=tmp_path / "rt.json")
+    earlier = mgr.mark_consumed(
+        "first-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement='{"a": 1}'
+    )
+    assert earlier is True, "the fixture's own first rotation did not persist"
+    prior_grace = mgr._grace_replacements["c1"]
+
+    def _refused(_home):
+        raise OSError(errno.EACCES, "staging directory is not writable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    persisted = mgr.mark_consumed(
+        "second-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement='{"b": 2}'
+    )
+
+    assert persisted is False, "the fixture did not reach the persistence failure"
+    assert "second-jti" not in mgr._consumed_jtis, (
+        "the jti stayed marked spent although the caller told the client its token was not "
+        "rotated, so memory and the answer the client received disagree"
+    )
+    assert mgr._grace_replacements["c1"] == prior_grace, (
+        "the chain's grace authenticator was left pointing at a replacement pair that was "
+        "never delivered, which retires a record this rotation had no grounds to touch"
+    )
+    assert "first-jti" in mgr._consumed_jtis, (
+        "the rollback removed a consumption that HAD persisted, which would let an already "
+        "rotated token authenticate again"
+    )
+
+
+def test_tr_u_16g_another_threads_failure_does_NOT_roll_back_a_write_that_landed(tmp_path):
+    """The rollback decision reads THIS call's result, never the store-wide degraded mark.
+
+    Rotations run concurrently under ``asyncio.to_thread``, and ``_persist_failure`` is shared
+    store state. A call that reads the shared field sees a sibling's failure, rolls back, and
+    answers False -- so the handler returns 503 for a consumption that is durably on disk, and
+    the rollback strips the grace entry while the disk record still carries the jti. The next
+    start then reads that as a reuse and revokes the whole chain.
+
+    The interleaving is reproduced at the only point where it can happen: this call's own write
+    succeeds (clearing the field), and the sibling's failing write lands immediately afterwards
+    (setting it again), which is what the sibling's own ``_persist`` does. Setting the field
+    BEFORE the call proves nothing -- a successful write clears it on the way past.
+    """
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+    real = mgr._persist
+
+    def _persist_then_a_sibling_fails() -> str:
+        mine = real()
+        mgr._persist_failure = "the last record was not persisted (another thread's write)"
+        return mine
+
+    mgr._persist = _persist_then_a_sibling_fails  # type: ignore[method-assign]
+
+    persisted = mgr.mark_consumed(
+        "mine", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement='{"a": 1}'
+    )
+
+    assert persisted is True, (
+        "a write that reached disk was reported as failed because another thread's failure was "
+        "on the shared field; the caller then answers 503 for a durable consumption"
+    )
+    assert "mine" in mgr._consumed_jtis, (
+        "the consumption was rolled back although its own write landed, so memory disagrees "
+        "with the file"
+    )
+    assert "c1" in mgr._grace_replacements, (
+        "the grace entry was stripped for a jti that IS on disk, which is the state the next "
+        "start reads as a reuse and revokes the chain for"
+    )
+    assert state_file.exists(), "nothing was written, so the True above measures nothing"
+    assert "mine" in state_file.read_text(encoding="utf-8"), (
+        "the jti is not in the file, so this test is not measuring a write that landed"
+    )
+    assert mgr.degraded_reason(), (
+        "the sibling's failure vanished from the degraded mark, so this test is no longer "
+        "reproducing the state the shared field would have been read in"
+    )
+
+
+def test_tr_u_16h_the_write_sequence_is_serialized_against_other_writers(tmp_path):
+    """Mutate, write and roll back must be ONE sequence, not three separately-locked steps.
+
+    With three steps a concurrent rotation can persist a snapshot that already holds this
+    call's mutation. If this call's own write then fails and it rolls memory back, the jti it
+    retired is on disk with no grace entry beside it -- the same harm the per-invocation result
+    prevents, arriving from the other direction. So the lock must be held across the write, and
+    that is asserted from inside ``_persist`` where the sequence is supposedly live.
+    """
+    mgr = RefreshStateManager(state_path=tmp_path / "rt.json")
+    held: list[bool] = []
+    real = mgr._persist
+
+    def _spy() -> str:
+        held.append(mgr._write_sequence_lock.locked())
+        return real()
+
+    mgr._persist = _spy  # type: ignore[method-assign]
+
+    assert mgr.mark_consumed(
+        "j", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+    mgr.revoke_chain("c2", exp=time.time() + 86400)
+
+    assert held == [True, True], (
+        "a writer persisted without holding the sequence lock, so another writer can snapshot "
+        f"its half-applied mutation (observed {held})"
+    )
+
+
+def test_tr_u_16l_EVERY_revoke_chain_call_site_consumes_the_result(tmp_path):
+    """The second invariant, also stated over every site rather than checked one at a time.
+
+    ``revoke_chain`` reports whether the revocation reached disk, and a caller that announces a
+    revoked chain on the strength of it must read that. Two rounds of review found this wired
+    into one endpoint and not the next, so the check enumerates the call sites from the SOURCE:
+    a bare expression statement calling it is a discarded result.
+    """
+    import ast
+    import inspect
+
+    from kiro_crew.dashboard.handlers import auth_refresh as ar
+
+    tree = ast.parse(inspect.getsource(ar))
+    discarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr):
+            continue
+        call = node.value
+        if isinstance(call, ast.Await):
+            call = call.value
+        if not isinstance(call, ast.Call):
+            continue
+        text = ast.unparse(call)
+        if "revoke_chain" in text:
+            discarded.append((getattr(node, "lineno", 0), text[:80]))
+
+    assert discarded == [], (
+        "these call sites discard whether the revocation reached disk, so the endpoint can "
+        f"report a revoked chain that the next restart accepts again: {discarded}"
+    )
+
+
+def test_tr_u_16k_EVERY_writer_holds_the_write_sequence_lock(tmp_path):
+    """The invariant, stated over every writer rather than checked one site at a time.
+
+    Three rounds of review found this module's rules applied at some call sites and not others.
+    The rule here is that a method which mutates in-memory state and then persists holds
+    ``_write_sequence_lock`` across both, so no other writer can snapshot a half-applied
+    mutation. This test enumerates the writers from the SOURCE, so a method added later is
+    covered without anybody remembering to extend a list.
+    """
+    import ast
+    import inspect
+
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    tree = ast.parse(inspect.getsource(rt))
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        body = ast.unparse(node)
+        persists = any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_persist"
+            for n in ast.walk(node)
+        )
+        if persists and node.name != "_persist" and "_write_sequence_lock" not in body:
+            offenders.append(node.name)
+
+    assert offenders == [], (
+        "these writers mutate and persist without the sequence lock, so a concurrent writer "
+        f"can publish their half-applied mutation: {offenders}"
+    )
+
+
+def test_tr_u_16i_a_revocation_that_does_NOT_persist_is_reported_to_its_caller(
+    tmp_path, monkeypatch
+):
+    """Logout is the one place a silent lost write is never looked at again.
+
+    The degraded mark this sets gates validation in THIS process only, and it gates the very
+    writes that would re-persist the record, so the restart an operator is told to perform loads
+    a store that never saw the revocation and accepts the chain again. The caller has to be able
+    to withhold its success, which it cannot do if this reports success either way.
+
+    The revocation stays in memory on failure -- unlike a rotation there is no rollback, because
+    undoing it would reopen the chain the caller asked to close.
+    """
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    def _refused(_home):
+        raise OSError(errno.EACCES, "staging directory is not writable")
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _refused)
+
+    mgr = RefreshStateManager(state_path=tmp_path / "rt.json")
+    persisted = mgr.revoke_chain("c1", exp=time.time() + 86400)
+
+    assert persisted is False, (
+        "the revocation was reported as stored while it existed only in memory, so logout "
+        "answers success and the next start accepts the chain again"
+    )
+    assert mgr.is_chain_revoked("c1"), (
+        "the revocation was dropped from memory as well, which reopens the chain the caller "
+        "asked to close for the life of this process"
+    )
+    assert mgr.degraded_reason(), "the store did not degrade, so nothing fails closed either"
+
+
+def test_tr_u_16j_a_revocation_that_lands_reports_success(tmp_path):
+    """The other direction, so the flag measures persistence and not merely 'was called'."""
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+
+    assert mgr.revoke_chain("c1", exp=time.time() + 86400) is True
+    assert state_file.exists(), "nothing was written, so the True above measures nothing"
+    assert "c1" in state_file.read_text(encoding="utf-8")
+
+
+def test_tr_u_16e_a_consumption_that_lands_reports_success(tmp_path):
+    """The other direction, so the flag measures persistence and not merely 'was called'."""
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+
+    persisted = mgr.mark_consumed(
+        "spent-jti", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+
+    assert persisted is True
+    assert state_file.exists(), "nothing was written, so the True above measures nothing"
+
+
+def test_tr_u_16c_a_later_successful_write_clears_the_degraded_mark(tmp_path, monkeypatch):
+    """Degraded is a statement about the last write, not a latch."""
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    calls = {"n": 0}
+    real = rt.auth_store_staging_dir
+
+    def _first_call_fails(home):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(errno.ENOTDIR, "staging directory is not usable")
+        return real(home)
+
+    monkeypatch.setattr(rt, "auth_store_staging_dir", _first_call_fails)
+
+    state_file = tmp_path / "rt.json"
+    mgr = RefreshStateManager(state_path=state_file)
+    mgr.mark_consumed("a", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}")
+    assert mgr.degraded_reason(), "the first, failed write did not degrade the store"
+
+    mgr.mark_consumed("b", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}")
+    assert mgr.degraded_reason() == "", (
+        "the store stayed degraded after a write landed, so one transient failure would "
+        "reject every refresh until a restart"
+    )
+    assert state_file.exists()
 
 
 def test_tr_u_17_persistence_file_mode_0600(tmp_path: Path):
@@ -1522,3 +1865,106 @@ def test_tr_u_37_bump_persists_atomically(tmp_path: Path, monkeypatch):
     assert p.read_text(encoding="utf-8") == "2"
     leftovers = [f.name for f in tmp_path.iterdir() if f.name != rg._REVOCATION_FILE]
     assert leftovers == []
+
+
+def test_tr_u_16m_a_record_is_not_reported_persisted_until_its_NAME_is_durable(
+    tmp_path: Path, monkeypatch
+):
+    """A rotation is published on this return, so it must mean the record survives a crash.
+
+    ``atomic_write`` forces the file's DATA; the name that reaches it lives in the parent
+    directory, and until that is synced ``os.replace`` can return and still be lost. The
+    caller has already handed the client a replacement pair by then, so a store that reports
+    success here without the directory sync leaves the burned refresh token spendable again
+    after an unclean shutdown -- the exact single-use guarantee this module exists to hold.
+    """
+    import kiro_crew.dashboard.refresh_tokens as rt
+
+    state_file = tmp_path / "rt.json"
+    mgr = rt.RefreshStateManager(state_path=state_file)
+
+    # The positive half first: a healthy write reports success AND is durable.
+    synced: list[str] = []
+    monkeypatch.setattr(rt, "fsync_dir", lambda p, **kw: synced.append(str(p)))
+    assert mgr.mark_consumed(
+        "jti-ok", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    ), "a healthy write must still report success"
+    assert mgr.degraded_reason() == "", "a healthy write must not degrade the store"
+    assert synced == [str(state_file.parent)], (
+        "the state file's own parent directory was not synced after the rename, so the "
+        f"record's name is not durable; synced={synced}"
+    )
+
+    # And the discriminating half: the sync fails, so this call must NOT report success.
+    def _boom(path, **kw):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(rt, "fsync_dir", _boom)
+    ok = mgr.mark_consumed(
+        "jti-lost", chain_id="c1", exp=time.time() + 86400, ip="1.2.3.4", replacement="{}"
+    )
+    assert not ok, (
+        "the directory sync failed, so the record may not survive a crash -- reporting "
+        "success here publishes a rotated pair against a token that stays spendable"
+    )
+    assert mgr.degraded_reason(), (
+        "an unsyncable directory left the store undegraded, so its reader keeps accepting "
+        "tokens whose consumption may be lost"
+    )
+
+
+def test_tr_u_16n_the_degraded_warnings_do_not_promise_a_recovery_that_cannot_happen(
+    tmp_path,
+):
+    """Both degraded paths must tell the operator the truth: repair, then RESTART.
+
+    Nothing in this process can clear ``_persist_failure``: every writer that does sits
+    behind ``validate_refresh_token``, which returns early on ``degraded_reason()``, and the
+    one ungated writer leaves early without a tailnet peer claim. A message that says the
+    store recovers "until a later write lands" therefore sends the operator away to wait for
+    an event that never arrives. This is the same defect an earlier round fixed in the 503
+    and in one of these two warnings; the pin covers both so a third site cannot drift.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from kiro_crew.dashboard import refresh_tokens as rt
+
+    # Read the message CONSTANTS, not the source text. Adjacent string literals are folded
+    # by the parser, so a message split across two source lines still arrives here whole --
+    # which a substring search over the source misses, and did.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rt.RefreshStateManager._persist)))
+    messages = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+    blob = "\n".join(messages)
+
+    assert "until a later write lands" not in blob, (
+        "a degraded-store warning still promises that a later write clears the mark; no "
+        "in-process writer can land one, so the operator is told to wait forever. "
+        f"messages={[m for m in messages if 'later write' in m]}"
+    )
+    # The positive requirement, so this pin cannot pass by the sentence merely being deleted.
+    assert blob.count("restart the gateway") >= 3, (
+        "each degraded path must name the restart that actually clears the mark; found "
+        f"{blob.count('restart the gateway')} of the 3 expected (staging unusable, "
+        "unsyncable directory, ordinary write fault)"
+    )
+
+
+# -- A non-ASCII signature is a wrong signature, never a crash ----------------
+#
+# The refresh cookie is request-controlled, and hmac.compare_digest raises
+# TypeError on a str holding a non-ASCII character. "\udcff" is what a raw
+# non-UTF-8 header byte decodes to; "\ud800" is any lone surrogate.
+
+
+@pytest.mark.parametrize("bad", ["é", "\udcff", "\ud800"])
+def test_non_ascii_signature_is_a_bad_signature_not_a_crash(bad: str) -> None:
+    token, _chain, _jti, _exp = generate_refresh_token("alice")
+    payload = token.split(".", 1)[0]
+    valid, _user, reason, _c, _j, _e = validate_refresh_token(f"{payload}.{bad}")
+    assert (valid, reason) == (False, "bad signature")

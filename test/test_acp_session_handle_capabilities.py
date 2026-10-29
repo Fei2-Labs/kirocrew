@@ -317,6 +317,8 @@ async def test_kiro_still_uses_the_set_model_request():
     handle = _make_handle(ACP_BACKEND_KIRO)
     writes = _Writes()
     handle.set_config_option = writes  # type: ignore[method-assign]
+    # The request is awaited, so the double answers it the way kiro-cli does.
+    handle._queue.put_nowait(JsonRpcMessage(id=1, result={}))
 
     await handle.set_model("some-model")
 
@@ -512,11 +514,15 @@ def test_both_drivers_classify_a_config_option_rejection_alike():
     handle_src = inspect.getsource(AcpSessionHandle._push_model_config_option)
     for shared in (
         "unknown config option",
-        "_is_config_value_rejection(exc, MODEL_CONFIG_ID)",
+        "_is_config_value_rejection(",
         "_push_model_via_effort_split(",
     ):
         assert shared in client_src, f"client lost {shared!r}"
         assert shared in handle_src, f"handle lost {shared!r}"
+    # Both hand the classifier their OWN backend, so a harness's declared refusal
+    # text (``model_refusal_phrase``) is read on the pooled path as on the direct one.
+    assert "_is_config_value_rejection(exc, MODEL_CONFIG_ID, self.backend)" in client_src
+    assert "exc, MODEL_CONFIG_ID, self._runtime.acp_backend" in handle_src
 
     # Neither copy may grow a branch the other lacks: an extra `in lowered` test on
     # one side is a rejection the other still re-raises on.

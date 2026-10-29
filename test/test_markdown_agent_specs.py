@@ -53,6 +53,9 @@ from kiro_crew.agent_spec_format import (
     is_agent_spec_name,
     is_markdown_spec,
     iter_agent_spec_files,
+    iter_agent_spec_files_strict,
+    markdown_head_is_fenceless,
+    opens_frontmatter_fence,
     parse_agent_spec_text,
     parse_markdown_spec,
     shadowed_markdown_specs,
@@ -152,6 +155,52 @@ class TestParser:
         assert split_markdown_spec("# README\n\nnotes\n") is None
         with pytest.raises(ValueError):
             parse_markdown_spec("# README\n\nnotes\n")
+
+    @pytest.mark.parametrize(
+        ("text", "opens"),
+        [
+            ("---\nname: a\n", True),
+            ("\ufeff---\r\nname: a\r\n", True),
+            ("---\nname: a\nno close\n", True),
+            ("# README\n", False),
+            ("---junk\n", False),
+            ("", False),
+        ],
+        ids=["lf", "bom-crlf", "unclosed", "prose", "dashed-junk", "empty"],
+    )
+    def test_the_opening_fence_rule(self, text: str, opens: bool) -> None:
+        """An unclosed fence still OPENS: only the split refuses it."""
+        assert opens_frontmatter_fence(text) is opens
+
+    @pytest.mark.parametrize(
+        ("head", "complete", "fenceless"),
+        [
+            (b"# README\n", True, True),
+            (b"\xef\xbb\xbf# README\n", True, True),
+            (b"---\nname: a\n", True, False),
+            (b"\xef\xbb\xbf---\r\n", False, False),
+            (b"\xff\xfe-\x00-\x00-\x00\n\x00", True, False),
+            (b"# prose \x00\n", True, False),
+            (b"# pr\xe9se\n", True, False),
+            (b"# README with a cut " + "\u00e9".encode()[:1], False, True),
+            (b"# README ends mid " + "\u00e9".encode()[:1], True, False),
+        ],
+        ids=[
+            "prose",
+            "bom-prose",
+            "fenced",
+            "bom-crlf-fence",
+            "utf16",
+            "nul",
+            "latin1",
+            "cut-multibyte",
+            "eof-multibyte",
+        ],
+    )
+    def test_the_head_predicate_is_true_only_when_proven_fenceless(
+        self, head: bytes, complete: bool, fenceless: bool
+    ) -> None:
+        assert markdown_head_is_fenceless(head, complete=complete) is fenceless
 
     def test_non_mapping_frontmatter_is_refused(self) -> None:
         with pytest.raises(ValueError):
@@ -291,6 +340,30 @@ class TestParser:
         assert sorted(p.name for p in iter_agent_spec_files(tmp_path)) == ["Foo.json", "foo.md"]
         assert shadowed_markdown_specs(tmp_path) == []
 
+    def test_the_strict_listing_selects_what_the_glob_does(self, tmp_path: Path) -> None:
+        for name in ("b.md", "a.json", "a.md", "README.txt", "c.json.bak", "UPPER.JSON", ".h.json"):
+            (tmp_path / name).write_text("x", encoding="utf-8")
+        (tmp_path / "dir.json").mkdir()
+        assert iter_agent_spec_files_strict(tmp_path) == iter_agent_spec_files(tmp_path)
+
+    def test_the_strict_listing_raises_where_the_glob_reads_an_empty_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "a.json").write_text("x", encoding="utf-8")
+        real_scandir = os.scandir
+
+        def failing(path: Any = ".") -> Any:
+            if isinstance(path, (str, os.PathLike)) and os.fspath(path) == os.fspath(tmp_path):
+                raise OSError(5, "input/output error")
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", failing)
+        assert iter_agent_spec_files(tmp_path) == []
+        with pytest.raises(OSError, match="input/output error"):
+            iter_agent_spec_files_strict(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            iter_agent_spec_files_strict(tmp_path / "absent")
+
 
 # ── the roster and its cache ────────────────────────────────────────────────
 
@@ -371,11 +444,108 @@ class TestRoster:
         assert [(a.name, a.description) for a in rows] == [("bot", "json twin")]
         assert any("bot.md is shadowed" in r.getMessage() for r in caplog.records)
 
-    def test_two_markdown_specs_declaring_one_name_are_ambiguous(self, agents_dir: Path) -> None:
-        (agents_dir / "a.md").write_text(_md("bot"), encoding="utf-8")
-        (agents_dir / "b.md").write_text(_md("bot"), encoding="utf-8")
+    # ── markdown_only: the roster's answer to "can kiro-cli run this?" ──
+    # Same rule as ``agent.markdown_spec_for_agent`` (the activation guard's
+    # refusal branch): only a name no JSON spec claims in either scope is
+    # markdown-only. Each test pins the roster to that helper's answer.
+
+    def test_a_markdown_only_agent_is_flagged_and_a_json_one_is_not(self, agents_dir: Path) -> None:
+        (agents_dir / "mdbot.md").write_text(_md("mdbot"), encoding="utf-8")
+        (agents_dir / "plain.json").write_text(json.dumps({"name": "plain"}), encoding="utf-8")
+
+        rows = {a.name: a for a in list_agents(agents_dir=agents_dir)}
+
+        assert rows["mdbot"].markdown_only is True
+        assert rows["plain"].markdown_only is False
+        assert rows["mdbot"].to_dict()["markdown_only"] is True
+        assert agent_mod.markdown_spec_for_agent("mdbot") == agents_dir / "mdbot.md"
+        assert agent_mod.markdown_spec_for_agent("plain") is None
+
+    def test_a_json_twin_is_not_markdown_only(self, agents_dir: Path) -> None:
+        (agents_dir / "bot.json").write_text(json.dumps({"name": "bot"}), encoding="utf-8")
+        (agents_dir / "bot.md").write_text(_md("bot"), encoding="utf-8")
+
+        [row] = list_agents(agents_dir=agents_dir)
+
+        assert row.markdown_only is False
+
+    def test_a_differently_named_json_declaring_the_name_is_not_markdown_only(
+        self, agents_dir: Path
+    ) -> None:
+        """kiro-cli matches ``--agent`` on the declared name, so ``other.json``
+        declaring ``bot`` runs even though ``bot.md`` is the row's file."""
+        (agents_dir / "bot.md").write_text(_md("bot"), encoding="utf-8")
+        (agents_dir / "other.json").write_text(json.dumps({"name": "bot"}), encoding="utf-8")
+
+        assert [a.markdown_only for a in list_agents(agents_dir=agents_dir)] == [False]
+
+    def test_a_project_markdown_over_a_user_json_is_not_markdown_only(
+        self, agents_dir: Path, tmp_path: Path
+    ) -> None:
+        """The project ``.md`` row shadows in the roster, but kiro-cli skips
+        markdown and runs the user-level JSON, so the row is runnable."""
+        (agents_dir / "bot.json").write_text(json.dumps({"name": "bot"}), encoding="utf-8")
+        proj = tmp_path / "repo"
+        d = proj / ".kiro" / "agents"
+        d.mkdir(parents=True)
+        (d / "bot.md").write_text(_md("bot"), encoding="utf-8")
+
+        [row] = list_agents(agents_dir=agents_dir, project_dir=str(proj))
+
+        assert (row.scope, row.filename, row.markdown_only) == ("project", "bot.md", False)
+        assert agent_mod.markdown_spec_for_agent("bot", proj) is None
+
+    def test_a_user_markdown_under_a_project_json_is_not_markdown_only(
+        self, agents_dir: Path, tmp_path: Path
+    ) -> None:
+        (agents_dir / "bot.md").write_text(_md("bot"), encoding="utf-8")
+        proj = tmp_path / "repo"
+        d = proj / ".kiro" / "agents"
+        d.mkdir(parents=True)
+        (d / "bot.json").write_text(json.dumps({"name": "bot"}), encoding="utf-8")
+
+        [row] = list_agents(agents_dir=agents_dir, project_dir=str(proj))
+
+        assert (row.scope, row.filename, row.markdown_only) == ("project", "bot.json", False)
+
+    def test_markdown_in_both_scopes_is_markdown_only(
+        self, agents_dir: Path, tmp_path: Path
+    ) -> None:
+        (agents_dir / "bot.md").write_text(_md("bot"), encoding="utf-8")
+        proj = tmp_path / "repo"
+        d = proj / ".kiro" / "agents"
+        d.mkdir(parents=True)
+        (d / "bot.md").write_text(_md("bot"), encoding="utf-8")
+
+        [row] = list_agents(agents_dir=agents_dir, project_dir=str(proj))
+
+        assert (row.scope, row.markdown_only) == ("project", True)
+        assert agent_mod.markdown_spec_for_agent("bot", proj) == d / "bot.md"
+
+    def test_markdown_only_is_a_real_bool(self) -> None:
+        """An edition row passing a truthy non-bool must not read as a claim."""
+        info = agent_discovery.AgentInfo(
+            name="a", filename="a.md", description="", model="", markdown_only="yes"  # type: ignore[arg-type]
+        )
+        assert info.markdown_only is False
+
+    def test_two_differing_markdown_specs_declaring_one_name_are_ambiguous(
+        self, agents_dir: Path
+    ) -> None:
+        (agents_dir / "a.md").write_text(_md("bot", description="a"), encoding="utf-8")
+        (agents_dir / "b.md").write_text(_md("bot", description="b"), encoding="utf-8")
         with pytest.raises(AmbiguousAgentSpecError):
             spec_by_declared_name(agents_dir, "bot", operation="t", source="unknown")
+
+    def test_two_identical_markdown_specs_declaring_one_name_resolve(
+        self, agents_dir: Path
+    ) -> None:
+        """The content-equal rule reads the parse, so it holds for the markdown
+        form too: frontmatter and body alike must agree."""
+        (agents_dir / "a.md").write_text(_md("bot", description="same"), encoding="utf-8")
+        (agents_dir / "b.md").write_text(_md("bot", description="same"), encoding="utf-8")
+        found = spec_by_declared_name(agents_dir, "bot", operation="t", source="unknown")
+        assert found is not None and found["description"] == "same"
 
 
 # ── the KAS projection ──────────────────────────────────────────────────────
@@ -406,8 +576,29 @@ class TestKasProjection:
         (tmp_path / "other.md").write_text(_md("y"), encoding="utf-8")
         assert kas_agents.load_agent_spec(tmp_path, "other")["name"] == "x"
 
-    def test_a_broken_markdown_file_is_a_translation_error(self, tmp_path: Path) -> None:
-        (tmp_path / "bot.md").write_text("# no fence\n", encoding="utf-8")
+    def test_a_fence_less_markdown_file_is_skipped_not_read_as_a_broken_spec(
+        self, tmp_path: Path
+    ) -> None:
+        """``<id>.md`` with no opening fence is a prose document, not a spec:
+        the agent has no spec, the same answer as no file, and the error says
+        so instead of reporting a spec that does not parse."""
+        (tmp_path / "bot.md").write_text("# notes\n\nno fence here\n", encoding="utf-8")
+        with pytest.raises(KasAgentTranslationError, match="has no spec") as info:
+            kas_agents.load_agent_spec(tmp_path, "bot")
+        assert "not a valid spec" not in str(info.value)
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "---\nname: [unclosed\n---\nbody\n",
+            "---\nname: bot\nno closing fence\n",
+        ],
+        ids=["bad-yaml", "unclosed-fence"],
+    )
+    def test_a_fenced_markdown_file_that_fails_to_parse_still_raises(
+        self, tmp_path: Path, content: str
+    ) -> None:
+        (tmp_path / "bot.md").write_text(content, encoding="utf-8")
         with pytest.raises(KasAgentTranslationError, match="not a valid spec"):
             kas_agents.load_agent_spec(tmp_path, "bot")
 
@@ -783,6 +974,32 @@ def test_a_markdown_sharer_is_counted_by_the_census(
     assert specs.get("agent:README.md", {}) == {}
 
 
+def test_an_unclosed_fence_leaves_the_census_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A document that OPENS a fence announced itself as a spec: when it does
+    not parse, what it declares is unknown, so the census is incomplete rather
+    than treating it as a README."""
+    from kiro_crew import mcp_discovery
+    from kiro_crew.config import paths as connections_paths
+    from kiro_crew.connections import ownership
+    from kiro_crew.dashboard.handlers import mcp as mcp_handlers
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    monkeypatch.setattr(mcp_discovery, "_MCP_SOURCES", ((tmp_path / "mcp.json", "kirocrew"),))
+    monkeypatch.setattr(mcp_discovery, "_extra_scope_sources", list)
+    monkeypatch.setattr(connections_paths, "kiro_agents_dir", lambda: agents)
+    monkeypatch.setattr(mcp_handlers, "_extra_mcp_scopes", list)
+    (agents / "research.md").write_text(
+        "---\nname: research\nmcpServers:\n  notion: {}\n", encoding="utf-8"
+    )
+
+    _specs, unreadable = ownership.spec_census()
+
+    assert unreadable == ("agent:research.md",)
+
+
 # ── the kiro-cli harness ────────────────────────────────────────────────────
 
 
@@ -844,8 +1061,10 @@ _ONE_FORM_SCAN_RE = re.compile(
 )
 
 # The writers that are JSON-only BY DESIGN: a markdown spec is never rewritten by
-# Kiro Crew, so a bookkeeping migration that reads-then-writes must not see it.
-_ONE_FORM_SCANS_ALLOWED: dict[str, int] = {"kiro_crew/agent.py": 1}
+# Kiro Crew, so a migration that reads-then-writes must not see it.
+# agent_parts/spec_upgrades.py has two: migrate_agent_specs (bookkeeping keys) and
+# migrate_relocated_skill_uris (skill:// paths of a moved builtin skill).
+_ONE_FORM_SCANS_ALLOWED: dict[str, int] = {"kiro_crew/agent_parts/spec_upgrades.py": 2}
 
 
 def test_no_agents_dir_scan_sees_one_form_only() -> None:

@@ -1,3 +1,11 @@
+/**
+ * uiPrefs — the durable-preference sync: the allowlist, hydrate, flush, the
+ * sync loop and the reconcile pass for newly durable keys.
+ *
+ * The per-field `mc-chat-config` merge lives in `uiPrefs.chatConfigFields.test.ts`
+ * and pausing / adopting a restored host copy in `uiPrefs.pauseAndAdopt.test.ts`;
+ * the fixtures the three files share live in `uiPrefsTestUtils.tsx`.
+ */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   DURABLE_PREF_KEYS,
@@ -7,36 +15,26 @@ import {
   startUiPrefsSync,
   hasUnreconciledKeys,
   reconcileNewDurableKeys,
+  adoptHostUiPrefsOnNextLoad,
+  savePrefExplicitly,
   __resetUiPrefsSyncForTests,
 } from '../lib/uiPrefs'
+import { loadBoardFolderCollapse, persistBoardOverride } from '../utils/boardFolderCollapse'
+import {
+  SYNCED_KEYS_KEY,
+  ROSTER_ENTRY,
+  storedRoster,
+  mockFetch,
+  okJson,
+  lastPatch,
+} from './uiPrefsTestUtils'
+import { MAC_CTRL_DIGITS_KEY, SHORTCUTS_ENABLED_KEY } from '../hooks/useKeyboardShortcuts'
+import { QUICK_SEARCH_SHORTCUT_KEY } from '../lib/quickSearchShortcut'
+import { PANEL_TOGGLE_SHORTCUTS_KEY } from '../lib/panelToggleShortcuts'
+import { PTT_STORAGE_KEY, savePttConfig } from '../lib/pushToTalk'
+import { SHORTCUT_OVERRIDES_KEY } from '../lib/shortcutRegistry'
 
-const SYNCED_KEYS_KEY = 'mc-ui-prefs-synced'
-const ROSTER_ENTRY = 'mc:ui-prefs:roster'
-
-/** The reconciled roster stored inside the synced document, or null. */
-function storedRoster(): string[] | null {
-  const raw = localStorage.getItem(SYNCED_KEYS_KEY)
-  if (raw === null) return null
-  const entry = (JSON.parse(raw) as Record<string, string>)[ROSTER_ENTRY]
-  return typeof entry === 'string' ? (JSON.parse(entry) as string[]) : null
-}
-
-function mockFetch(impl: (url: string, init?: RequestInit) => unknown) {
-  const spy = vi.fn((url: string, init?: RequestInit) => Promise.resolve(impl(url, init)))
-  vi.stubGlobal('fetch', spy as unknown as typeof fetch)
-  return spy
-}
-
-function okJson(body: unknown) {
-  return { ok: true, status: 200, json: () => Promise.resolve(body) }
-}
-
-/** The last PUT body the spy saw, parsed. */
-function lastPatch(spy: ReturnType<typeof mockFetch>): Record<string, string | null> {
-  const puts = spy.mock.calls.filter((c) => (c[1] as RequestInit | undefined)?.method === 'PUT')
-  const body = (puts.at(-1)?.[1] as RequestInit).body as string
-  return JSON.parse(body).prefs
-}
+const PLAIN_DIRTY = 'mc-ui-prefs-plain-dirty'
 
 describe('uiPrefs', () => {
   beforeEach(() => {
@@ -124,6 +122,35 @@ describe('uiPrefs', () => {
         expect(DURABLE_PREF_KEYS).toContain(key)
       }
     })
+
+    it('holds the Settings > Shortcuts choices and the push-to-talk key (issue #16237)', () => {
+      // The on/off switch, the macOS digit modifier, the Search everywhere
+      // chord, the panel toggle chords, and the push-to-talk key on Settings >
+      // Voice are written only by an explicit user action. A fresh origin must
+      // restore them like every other setting. The constants are the writers'
+      // own. A renamed key fails here.
+      for (const key of [
+        SHORTCUTS_ENABLED_KEY,
+        MAC_CTRL_DIGITS_KEY,
+        QUICK_SEARCH_SHORTCUT_KEY,
+        PANEL_TOGGLE_SHORTCUTS_KEY,
+        PTT_STORAGE_KEY,
+      ]) {
+        expect(DURABLE_PREF_KEYS).toContain(key)
+      }
+    })
+
+    it('excludes the microphone choice', () => {
+      // The browser issues the microphone id for the devices on that machine.
+      // A restored id names no device on another one.
+      expect(DURABLE_PREF_KEYS).not.toContain('mc-mic-device-id')
+    })
+
+    it('excludes the rebound-shortcut overrides until their writer exists', () => {
+      // shortcutRegistry.ts ships the reader only. A key with no writer is a
+      // backup of nothing. The change that adds the writer adds the key.
+      expect(DURABLE_PREF_KEYS).not.toContain(SHORTCUT_OVERRIDES_KEY)
+    })
   })
 
   describe('needsHydrate', () => {
@@ -147,16 +174,16 @@ describe('uiPrefs', () => {
 
   describe('hydrateUiPrefs', () => {
     it('restores keys that are missing locally', async () => {
-      mockFetch(() => okJson({ prefs: { 'mc-chat-config': '{"sendOnEnter":"ctrl-enter"}' } }))
+      mockFetch(() => okJson({ prefs: { 'mc-font-family': 'serif' } }))
       expect(await hydrateUiPrefs()).toBe(1)
-      expect(localStorage.getItem('mc-chat-config')).toBe('{"sendOnEnter":"ctrl-enter"}')
+      expect(localStorage.getItem('mc-font-family')).toBe('serif')
     })
 
     it('never overwrites a value this profile already has', async () => {
-      localStorage.setItem('mc-chat-config', 'local-wins')
-      mockFetch(() => okJson({ prefs: { 'mc-chat-config': 'server-copy' } }))
+      localStorage.setItem('mc-font-family', 'local-wins')
+      mockFetch(() => okJson({ prefs: { 'mc-font-family': 'server-copy' } }))
       expect(await hydrateUiPrefs()).toBe(0)
-      expect(localStorage.getItem('mc-chat-config')).toBe('local-wins')
+      expect(localStorage.getItem('mc-font-family')).toBe('local-wins')
     })
 
     it('ignores keys outside the allowlist', async () => {
@@ -356,6 +383,138 @@ describe('uiPrefs', () => {
       const spy = mockFetch(() => okJson({ prefs: {} }))
       await flushUiPrefs()
       expect(lastPatch(spy)).toEqual({ 'mc-font-family': '1.25' })
+    })
+
+    it('sends the sessions sidebar width keys as stored and the board collapse family as one projected key', async () => {
+      localStorage.setItem('mc-sidebar-width', '920')
+      localStorage.setItem('mc-sidebar-width-pre-board', '260')
+      localStorage.setItem('kc-board-folder-collapsed:col-b:f1', '0')
+      localStorage.setItem('kc-board-folder-collapsed:col-a:f1', '1')
+      // A key added to the allowlist is withheld until a reconcile has read
+      // the host's copy. The host holds none, so the local values seed it.
+      mockFetch(() => okJson({ prefs: {} }))
+      expect(await reconcileNewDurableKeys()).toBe(0)
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(lastPatch(spy)).toEqual({
+        'mc-sidebar-width': '920',
+        'mc-sidebar-width-pre-board': '260',
+        'kc-board-folder-collapsed': '{"col-a:f1":true,"col-b:f1":false}',
+      })
+      // The projection exists only on the wire. Nothing is stored under it.
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+    })
+
+    it('deletes the host copy of the board collapse family once the last override is gone', async () => {
+      localStorage.setItem('kc-board-folder-collapsed:col-a:f1', '1')
+      mockFetch(() => okJson({ prefs: {} }))
+      expect(await reconcileNewDurableKeys()).toBe(0)
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      localStorage.removeItem('kc-board-folder-collapsed:col-a:f1')
+      await flushUiPrefs()
+      expect(lastPatch(spy)).toEqual({ 'kc-board-folder-collapsed': null })
+    })
+
+    it('a cold restore writes the board collapse family as per-key entries', async () => {
+      mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true}' } }))
+      expect(await hydrateUiPrefs()).toBe(1)
+      expect(localStorage.getItem('kc-board-folder-collapsed:col-a:f1')).toBe('1')
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+      expect(loadBoardFolderCollapse().get('col-a:f1')).toBe(true)
+      // Hydrate baselines the adopted family as this profile's local value.
+      // The next flush therefore has nothing to send.
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy).not.toHaveBeenCalled()
+    })
+
+    it('a toggle after a cold restore uploads the toggled family and survives the next load', async () => {
+      // The restored family is adopted whole. One toggle changes one pair. The
+      // flush uploads the whole family with that pair changed. A later load
+      // reads the toggled value. No restored copy remains to re-adopt over it.
+      mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true,"col-b:f2":false}' } }))
+      expect(await hydrateUiPrefs()).toBe(1)
+      persistBoardOverride('col-a', 'f1', false)
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(lastPatch(spy)).toEqual({ 'kc-board-folder-collapsed': '{"col-a:f1":false,"col-b:f2":false}' })
+      __resetUiPrefsSyncForTests()
+      expect(Object.fromEntries(loadBoardFolderCollapse())).toEqual({ 'col-a:f1': false, 'col-b:f2': false })
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+      const after = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(after).not.toHaveBeenCalled()
+    })
+
+    it('a cold restore whose board collapse write is refused counts nothing and keeps the host copy', async () => {
+      const realSet = Storage.prototype.setItem
+      const setSpy = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementation(function (this: Storage, k: string, v: string) {
+          if (k.startsWith('kc-board-folder-collapsed:')) throw new DOMException('full', 'QuotaExceededError')
+          return realSet.call(this, k, v)
+        })
+      try {
+        mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true}' } }))
+        expect(await hydrateUiPrefs()).toBe(0)
+      } finally {
+        setSpy.mockRestore()
+      }
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+      expect(loadBoardFolderCollapse().size).toBe(0)
+      // The dropped key has no baseline and no local value. The first flush
+      // neither re-sends it nor deletes the host's copy.
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy).not.toHaveBeenCalled()
+    })
+
+    it('a cold restore never overrides a board collapse family this profile already holds', async () => {
+      localStorage.setItem('kc-board-folder-collapsed:col-a:f1', '0')
+      mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true}' } }))
+      expect(await hydrateUiPrefs()).toBe(0)
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+      expect(loadBoardFolderCollapse().get('col-a:f1')).toBe(false)
+    })
+
+    it('a settings import replaces the board collapse family with the imported one', async () => {
+      // Scenario: a Replace import rewrote the host copy of a synced profile
+      // that holds its own overrides. The imported family must win whole.
+      localStorage.setItem('kc-board-folder-collapsed:col-a:f1', '0')
+      localStorage.setItem('kc-board-folder-collapsed:col-c:f3', '1')
+      mockFetch(() => okJson({ prefs: {} }))
+      await hydrateUiPrefs()
+      expect(await adoptHostUiPrefsOnNextLoad()).toBe(true)
+
+      __resetUiPrefsSyncForTests()
+      mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true,"col-b:f2":true}' } }))
+      expect(await hydrateUiPrefs()).toBe(1)
+      expect(Object.fromEntries(loadBoardFolderCollapse())).toEqual({ 'col-a:f1': true, 'col-b:f2': true })
+      expect(localStorage.getItem('kc-board-folder-collapsed:col-c:f3')).toBeNull()
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+      // The adopted family equals the baseline, so nothing re-uploads over the
+      // imported copy.
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy).not.toHaveBeenCalled()
+    })
+
+    it('a warm profile adopts a board collapse family another origin already backed up', async () => {
+      // Scenario: this profile synced before the key joined the allowlist and
+      // holds no override. Another origin on the same host uploaded its family.
+      localStorage.setItem('mc-crews-view', 'list')
+      mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      __resetUiPrefsSyncForTests()
+      mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true}' } }))
+      expect(await reconcileNewDurableKeys()).toBe(1)
+      expect(localStorage.getItem('kc-board-folder-collapsed:col-a:f1')).toBe('1')
+      expect(localStorage.getItem('kc-board-folder-collapsed')).toBeNull()
+      expect(loadBoardFolderCollapse().get('col-a:f1')).toBe(true)
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy).not.toHaveBeenCalled()
     })
 
     it('sends only what changed since the last successful flush', async () => {
@@ -679,6 +838,181 @@ describe('uiPrefs', () => {
       expect(lastPatch(spy2)).toEqual({ 'mc-ui': 'cli' })
     })
 
+    it('a cold origin restores the Shortcuts and push-to-talk keys and keeps the one it already holds (issue #16237)', async () => {
+      localStorage.setItem(SHORTCUTS_ENABLED_KEY, '0')
+      mockFetch(() =>
+        okJson({
+          prefs: {
+            [SHORTCUTS_ENABLED_KEY]: '1',
+            [MAC_CTRL_DIGITS_KEY]: '0',
+            [QUICK_SEARCH_SHORTCUT_KEY]: '{"mode":"custom","custom":{"key":"j","mod":true}}',
+            [PANEL_TOGGLE_SHORTCUTS_KEY]: '{"terminal":{"key":"t","mod":true,"shift":true}}',
+            [PTT_STORAGE_KEY]: '{"enabled":true,"mode":"hybrid","binding":{"code":"ShiftRight"},"holdMs":500}',
+          },
+        }),
+      )
+      expect(await hydrateUiPrefs()).toBe(4)
+      expect(localStorage.getItem(SHORTCUTS_ENABLED_KEY)).toBe('0')
+      expect(localStorage.getItem(MAC_CTRL_DIGITS_KEY)).toBe('0')
+      expect(localStorage.getItem(QUICK_SEARCH_SHORTCUT_KEY)).toBe(
+        '{"mode":"custom","custom":{"key":"j","mod":true}}',
+      )
+      expect(localStorage.getItem(PANEL_TOGGLE_SHORTCUTS_KEY)).toBe(
+        '{"terminal":{"key":"t","mod":true,"shift":true}}',
+      )
+      expect(localStorage.getItem(PTT_STORAGE_KEY)).toBe(
+        '{"enabled":true,"mode":"hybrid","binding":{"code":"ShiftRight"},"holdMs":500}',
+      )
+      expect(hasUnreconciledKeys()).toBe(false)
+    })
+
+    /** Each Shortcuts key and the push-to-talk key, with a local value and a
+     *  different host value. */
+    const SHORTCUT_LOCAL_VS_HOST: ReadonlyArray<readonly [string, string, string]> = [
+      [SHORTCUTS_ENABLED_KEY, '0', '1'],
+      [MAC_CTRL_DIGITS_KEY, '0', '1'],
+      [QUICK_SEARCH_SHORTCUT_KEY, '{"mode":"double-shift"}', '{"mode":"custom","custom":{"key":"j","mod":true}}'],
+      [
+        PANEL_TOGGLE_SHORTCUTS_KEY,
+        '{"terminal":{"key":"t","mod":true,"shift":true}}',
+        '{"terminal":{"key":"`","ctrl":true},"left-sidebar":{"key":"[","mod":true}}',
+      ],
+      [
+        PTT_STORAGE_KEY,
+        '{"enabled":true,"mode":"hybrid","binding":{"code":"AltRight"},"holdMs":500}',
+        '{"enabled":true,"mode":"ptt","binding":{"code":"Space","alt":true,"shift":true},"holdMs":500}',
+      ],
+    ]
+
+    /** Build a warm profile from a roster-aware build that predates the
+     *  Shortcuts and push-to-talk keys. It holds a fingerprint for an old key
+     *  and a stored roster of every durable key except the five. */
+    async function warmRosterProfileWithoutShortcutKeys() {
+      await warmLegacyProfile()
+      const shortcutKeys = new Set(SHORTCUT_LOCAL_VS_HOST.map(([key]) => key))
+      const doc = JSON.parse(localStorage.getItem(SYNCED_KEYS_KEY)!) as Record<string, string>
+      doc[ROSTER_ENTRY] = JSON.stringify(DURABLE_PREF_KEYS.filter((k) => !shortcutKeys.has(k)))
+      localStorage.setItem(SYNCED_KEYS_KEY, JSON.stringify(doc))
+      expect(storedRoster()).not.toContain(PANEL_TOGGLE_SHORTCUTS_KEY)
+    }
+
+    /** The common upgrade path for an install that already holds the keys.
+     *  The local value stays. The first flush uploads nothing. The user's next
+     *  change goes up. A never-synced install cold-hydrates instead. An
+     *  install with a pending failed-restore marker lets the host win. */
+    async function expectWarmProfileKeepsItsShortcutChoices() {
+      const hostPrefs: Record<string, string> = {}
+      for (const [key, local, host] of SHORTCUT_LOCAL_VS_HOST) {
+        localStorage.setItem(key, local)
+        hostPrefs[key] = host
+      }
+      mockFetch(() => okJson({ prefs: hostPrefs }))
+      expect(await reconcileNewDurableKeys()).toBe(0)
+
+      for (const [key, local] of SHORTCUT_LOCAL_VS_HOST) {
+        expect(localStorage.getItem(key)).toBe(local)
+      }
+      expect(hasUnreconciledKeys()).toBe(false)
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy).not.toHaveBeenCalled()
+
+      const next: Record<string, string> = {}
+      for (const [key, , host] of SHORTCUT_LOCAL_VS_HOST) {
+        next[key] = host
+        localStorage.setItem(key, host)
+      }
+      const spy2 = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(lastPatch(spy2)).toEqual(next)
+    }
+
+    it('a warm pre-roster origin keeps its own Shortcuts choices and does not upload them over the host copy (issue #16237)', async () => {
+      await warmLegacyProfile()
+      await expectWarmProfileKeepsItsShortcutChoices()
+    })
+
+    it('a warm origin whose stored roster predates the Shortcuts keys keeps its own choices too (issue #16237)', async () => {
+      await warmRosterProfileWithoutShortcutKeys()
+      await expectWarmProfileKeepsItsShortcutChoices()
+    })
+
+    it('keeps a push-to-talk key saved after a failed reconcile and uploads it on the retry', async () => {
+      await warmRosterProfileWithoutShortcutKeys()
+      mockFetch(() => ({ ok: false, status: 503, json: () => Promise.resolve({}) }))
+      expect(await reconcileNewDurableKeys()).toBe(-1)
+
+      // The user picks a key on Settings > Voice while the sync is off.
+      const chosen = '{"enabled":true,"mode":"hybrid","binding":{"code":"ControlRight"},"holdMs":500}'
+      savePttConfig(JSON.parse(chosen) as Parameters<typeof savePttConfig>[0])
+      expect(localStorage.getItem(PTT_STORAGE_KEY)).toBe(chosen)
+
+      const host = '{"enabled":true,"mode":"hybrid","binding":{"code":"ShiftRight"},"holdMs":500}'
+      mockFetch(() => okJson({ prefs: { [PTT_STORAGE_KEY]: host } }))
+      expect(await reconcileNewDurableKeys()).toBe(0)
+      expect(localStorage.getItem(PTT_STORAGE_KEY)).toBe(chosen)
+
+      // The choice goes up once, then the mark is spent.
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(lastPatch(spy)).toEqual({ [PTT_STORAGE_KEY]: chosen })
+      const spy2 = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy2).not.toHaveBeenCalled()
+    })
+
+    it('a value set without the save seam after a failed reconcile still lets the host win', async () => {
+      await warmRosterProfileWithoutShortcutKeys()
+      mockFetch(() => ({ ok: false, status: 503, json: () => Promise.resolve({}) }))
+      expect(await reconcileNewDurableKeys()).toBe(-1)
+      localStorage.setItem(SHORTCUTS_ENABLED_KEY, '0')
+      mockFetch(() => okJson({ prefs: { [SHORTCUTS_ENABLED_KEY]: '1' } }))
+      expect(await reconcileNewDurableKeys()).toBe(1)
+      expect(localStorage.getItem(SHORTCUTS_ENABLED_KEY)).toBe('1')
+    })
+
+    it('a settings import drops the explicit-save marks so the imported host copy wins', async () => {
+      startUiPrefsSync()
+      expect(savePrefExplicitly(PTT_STORAGE_KEY, '{}')).toBe(true)
+      expect(localStorage.getItem(PLAIN_DIRTY)).not.toBeNull()
+      mockFetch(() => okJson({ prefs: {} }))
+      expect(await adoptHostUiPrefsOnNextLoad()).toBe(true)
+      expect(localStorage.getItem(PLAIN_DIRTY)).toBeNull()
+    })
+
+    it('stores a key outside the allowlist without a mark', () => {
+      expect(savePrefExplicitly('mc-mic-device-id', 'abc')).toBe(true)
+      expect(localStorage.getItem('mc-mic-device-id')).toBe('abc')
+      expect(localStorage.getItem(PLAIN_DIRTY)).toBeNull()
+    })
+
+    it('stores nothing when the mark is refused', () => {
+      localStorage.setItem(PTT_STORAGE_KEY, 'OLD')
+      const realSet = Storage.prototype.setItem
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, k, v) {
+        if (k === PLAIN_DIRTY) throw new DOMException('full', 'QuotaExceededError')
+        return realSet.call(this, k, v)
+      })
+      expect(savePrefExplicitly(PTT_STORAGE_KEY, 'NEW')).toBe(false)
+      vi.restoreAllMocks()
+      expect(localStorage.getItem(PTT_STORAGE_KEY)).toBe('OLD')
+      expect(localStorage.getItem(PLAIN_DIRTY)).toBeNull()
+    })
+
+    it('rolls the mark back when the value is refused', () => {
+      expect(savePrefExplicitly(SHORTCUTS_ENABLED_KEY, '0')).toBe(true)
+      const marks = localStorage.getItem(PLAIN_DIRTY)
+      const realSet = Storage.prototype.setItem
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, k, v) {
+        if (k === PTT_STORAGE_KEY) throw new DOMException('full', 'QuotaExceededError')
+        return realSet.call(this, k, v)
+      })
+      expect(savePrefExplicitly(PTT_STORAGE_KEY, 'NEW')).toBe(false)
+      vi.restoreAllMocks()
+      expect(localStorage.getItem(PTT_STORAGE_KEY)).toBeNull()
+      expect(localStorage.getItem(PLAIN_DIRTY)).toBe(marks)
+    })
+
     it('a warm origin adopts the host value for a new key it never held', async () => {
       await warmLegacyProfile()
       mockFetch(() => okJson({ prefs: { 'mc-reading-width': 'full' } }))
@@ -867,6 +1201,40 @@ describe('uiPrefs', () => {
       const spy = mockFetch(() => okJson({ prefs: {} }))
       await flushUiPrefs()
       expect(spy).not.toHaveBeenCalled()
+    })
+
+    it('a refused host-wins adoption on the retry baselines the toggled pair instead of uploading it', async () => {
+      // The reconcile failed while the profile held no override. The family is
+      // therefore not owned. One pair was toggled after the failure. On the
+      // retry the host wins. Quota refuses the adoption and it rolls back. The
+      // pair stays in use. The first flush must not replace the host's family.
+      await warmLegacyProfile()
+      vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new Error('ECONNREFUSED'))))
+      expect(await reconcileNewDurableKeys()).toBe(-1)
+      persistBoardOverride('col-a', 'f1', false)
+      const refused = 'kc-board-folder-collapsed:col-b:f2'
+      const realSet = Storage.prototype.setItem
+      const setSpy = vi
+        .spyOn(Storage.prototype, 'setItem')
+        .mockImplementation(function (this: Storage, k: string, v: string) {
+          if (k === refused) throw new DOMException('full', 'QuotaExceededError')
+          realSet.call(this, k, v)
+        })
+      try {
+        mockFetch(() => okJson({ prefs: { 'kc-board-folder-collapsed': '{"col-a:f1":true,"col-b:f2":true,"col-c:f3":true}' } }))
+        expect(await reconcileNewDurableKeys()).toBe(0)
+      } finally {
+        setSpy.mockRestore()
+      }
+      expect(Object.fromEntries(loadBoardFolderCollapse())).toEqual({ 'col-a:f1': false })
+      expect(localStorage.getItem('mc-ui-prefs-hydrate-pending')).toBeNull()
+      const spy = mockFetch(() => okJson({ prefs: {} }))
+      await flushUiPrefs()
+      expect(spy).not.toHaveBeenCalled()
+      // A kept local value goes up on the next change the user makes to it.
+      persistBoardOverride('col-a', 'f1', true)
+      await flushUiPrefs()
+      expect(lastPatch(spy)).toEqual({ 'kc-board-folder-collapsed': '{"col-a:f1":true}' })
     })
 
     it('fails the whole reconcile when the baseline+roster commit write is dropped', async () => {

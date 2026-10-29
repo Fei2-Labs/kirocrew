@@ -46,7 +46,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
+from kiro_crew.owner_only_files import mkdirs_owner_only
 from kiro_crew.platform_compat import pid_exists
 
 logger = logging.getLogger(__name__)
@@ -122,11 +124,14 @@ class DumpFile:
         pass
 
     if sys.platform == "win32":
+
         @property
         def name(self) -> str:
             """Provide the file path as ``name`` for diagnostics."""
             return str(self._path)
+
     else:
+
         @property
         def name(self) -> str:
             return str(self._path)
@@ -139,7 +144,7 @@ def get_dumps_dir() -> Path:
     set), so dumps land in ``<data home>/logs/crash-dumps/``.
     """
     d = config_dir() / "logs" / _DUMP_DIR_NAME
-    d.mkdir(parents=True, exist_ok=True)
+    mkdirs_owner_only(d)  # logs/ and crash-dumps/ are born 0700
     return d
 
 
@@ -370,6 +375,28 @@ def _dump_owner(dump_path: Path) -> tuple[int, str | None, str | None] | None:
     return pid, m.group(2), m.group(3)
 
 
+def _is_this_gateways_exec_supervisor(pid: int) -> bool:
+    """True when *pid* is the supervisor an in-app restart left as this process's ancestor.
+
+    An in-app restart ``os.execv``s the launcher, and a launcher that runs the
+    gateway as a supervised CHILD (``toolbox-exec``) leaves the old pid alive as
+    the new gateway's ancestor with its start identity unchanged -- so a dump or
+    marker the old image wrote names a PID that is live AND matches its recorded
+    start id, and both readers here would call its owner alive for as long as the
+    supervisor lives. That owner is this gateway's own previous image, and what
+    it held is gone: the dump fd was opened with ``os.open`` and is therefore
+    non-inheritable, so the exec closed it, and no cron run survives an exec
+    either. The file is a leftover of this gateway's own history, not a live
+    process's evidence.
+
+    The proof is :func:`platform_compat.is_exec_supervisor_of_this_process`: a
+    live ancestor whose image is not a Python interpreter, with no Python process
+    between. A live gateway ancestor still runs Python and keeps its files; an
+    unreadable image keeps the conservative verdict both readers already give.
+    """
+    return platform_compat.is_exec_supervisor_of_this_process(pid)
+
+
 def _owner_alive(dump_path: Path, is_pid_alive: Callable[[int], bool]) -> bool | None:
     """Best-effort liveness of the gateway that owns *dump_path*.
 
@@ -392,6 +419,10 @@ def _owner_alive(dump_path: Path, is_pid_alive: Callable[[int], bool]) -> bool |
     ``ps``-rendered token that can never equal what is read now, and treating
     that as a mismatch would unlink the dump of a gateway that is still alive
     across the upgrade. See :func:`_start_ids_comparable`.
+
+    One live, identity-matching PID is NOT a live owner: the supervisor an
+    in-app restart through a supervising launcher leaves behind. See
+    :func:`_is_this_gateways_exec_supervisor`.
     """
     owner = _dump_owner(dump_path)
     if owner is None:
@@ -402,6 +433,8 @@ def _owner_alive(dump_path: Path, is_pid_alive: Callable[[int], bool]) -> bool |
     if pid == os.getpid():
         return True
     if not is_pid_alive(pid):
+        return False
+    if _is_this_gateways_exec_supervisor(pid):
         return False
     if recorded_start is not None:
         current_start = _pid_start_id(pid)
@@ -577,7 +610,7 @@ def open_dump_file(dumps_dir: Path | None = None) -> DumpFile:
         flags |= os.O_NOINHERIT | os.O_BINARY
     else:
         flags |= os.O_CLOEXEC
-    fd = os.open(str(path), flags, 0o644)
+    fd = os.open(str(path), flags, 0o600)  # a dump holds stacks and paths: owner-only
 
     f = DumpFile(fd, path)
     # Write a header so the file is identifiable even before a dump fires.
@@ -834,6 +867,10 @@ def pid_identity_alive(pid: int, pid_domain: str | None, start_id: str | None) -
     identity as the one read now — a marker written before this build carries
     a ``ps``-rendered token, and calling that a mismatch would report a run
     that is still executing as abandoned. See :func:`_start_ids_comparable`.
+
+    The supervisor an in-app restart left as this process's ancestor is ``False``
+    too: the run it recorded ended with the exec. See
+    :func:`_is_this_gateways_exec_supervisor`.
     """
     if pid_domain is not None and pid_domain != _pid_domain():
         return None
@@ -841,15 +878,13 @@ def pid_identity_alive(pid: int, pid_domain: str | None, start_id: str | None) -
         # Before the own-PID shortcut: a restarted gateway can be handed the
         # crashed one's PID, and then "this process" is NOT the writer.
         current = _pid_start_id(pid)
-        if (
-            current is not None
-            and _start_ids_comparable(start_id, current)
-            and current != start_id
-        ):
+        if current is not None and _start_ids_comparable(start_id, current) and current != start_id:
             return False
     if pid == os.getpid():
         return True
-    return pid_exists(pid)
+    if not pid_exists(pid):
+        return False
+    return not _is_this_gateways_exec_supervisor(pid)
 
 
 def dump_wedged_frames(dump_path: Path) -> list[str]:
@@ -905,3 +940,104 @@ def dump_replay_lines(
         result.append(ln)
         total += len(ln)
     return result, False
+
+
+#: Marker recording the identity of the gateway process that last completed
+#: startup. Lives beside the dumps because it answers a question only a dump
+#: reader asks, and it is swept by the same data-home lifecycle.
+HEALTHY_MARKER_NAME = "last-healthy-boot"
+
+#: The marker is one short line. Bounding the read keeps a marker that grew
+#: -- or was replaced by something large -- from being pulled into memory on
+#: the boot path.
+_HEALTHY_MARKER_MAX_BYTES = 256
+
+
+def _healthy_marker_path(dumps_dir: Path | None = None) -> Path:
+    return (dumps_dir or get_dumps_dir()) / HEALTHY_MARKER_NAME
+
+
+def _read_healthy_marker(dumps_dir: Path | None = None) -> str:
+    """Read the marker without letting its path decide how long this takes.
+
+    The marker sits in the data home's dumps directory, which the agent can
+    write to. ``read_text`` would FOLLOW a symlink planted at that name and
+    BLOCK opening a FIFO, and the caller's ``except`` cannot catch a hang --
+    cautious boot would wait forever on a file whose whole purpose is to make
+    boots faster, on the boot path, with no recovery.
+
+    ``O_NOFOLLOW`` refuses the link and ``O_NONBLOCK`` refuses the FIFO. Both
+    are POSIX-only, so the ``S_ISREG`` check is what carries the guarantee
+    everywhere: anything that is not a regular file reads as absent, which is
+    the same conservative answer a missing marker gives.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(_healthy_marker_path(dumps_dir), flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, _HEALTHY_MARKER_MAX_BYTES).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def record_healthy_boot(dumps_dir: Path | None = None) -> None:
+    """Record that THIS process reached a serving state.
+
+    Written once, when the dashboard publishes ``DashboardState.ready``. The
+    content is this process's own ``(pid, domain, start_id)`` — the same
+    identity triple a dump header carries — so a later boot can ask whether
+    the instance that wrote a given dump had ever finished starting up.
+
+    Never raises: the marker is an optimisation for the NEXT boot, and a data
+    home that cannot take the write must not fail a gateway that is otherwise
+    healthy. A missing marker reads as "did not reach healthy", which is the
+    conservative answer.
+    """
+    try:
+        pid = os.getpid()
+        line = f"{pid} {_pid_domain()} {_pid_start_id(pid) or '-'}" + chr(10)
+        # Through atomic_write for its UNIQUE O_EXCL temp file, not just for
+        # the rename. A temp name derived from the PID is fully predictable and
+        # this directory is agent-writable, so a symlink planted at that name
+        # would be FOLLOWED by a plain write and would truncate whatever it
+        # points at, with no recovery -- the same reasoning as the O_NOFOLLOW
+        # on the read side. newline= keeps the byte on disk the one the reader
+        # splits on.
+        atomic_write(_healthy_marker_path(dumps_dir), line, newline="")
+    except Exception:  # noqa: BLE001 - never fail a healthy boot over a hint
+        logger.debug("could not record healthy-boot marker", exc_info=True)
+
+
+def dump_owner_reached_healthy(dump_path: Path, dumps_dir: Path | None = None) -> bool:
+    """Did the gateway that wrote *dump_path* ever finish starting up?
+
+    True only when the marker names the SAME process as the dump header: same
+    PID, same PID domain, and a start identity present and equal on both
+    sides. Anything less is False.
+
+    The asymmetry is deliberate. A false True says "the startup battery is
+    exonerated" and removes the stagger, which is exactly how a host that
+    wedges during startup re-wedges; a false False only costs a slower boot,
+    which is the behaviour that exists today. So a missing marker, a missing
+    start identity on either side (a platform
+    :func:`platform_compat.get_process_start_id` does not cover), a recycled
+    PID, or a marker from another host all answer False.
+    """
+    try:
+        owner = _dump_owner(dump_path)
+        if owner is None:
+            return False
+        pid, domain, start_id = owner
+        if domain is None or start_id is None:
+            return False
+        raw = _read_healthy_marker(dumps_dir).strip()
+        parts = raw.split()
+        if len(parts) != 3:
+            return False
+        m_pid, m_domain, m_start = parts
+        if m_start == "-":
+            return False
+        return m_pid == str(pid) and m_domain == domain and m_start == start_id
+    except Exception:  # noqa: BLE001 - unreadable marker means "not healthy"
+        return False

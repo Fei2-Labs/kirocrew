@@ -1,4 +1,6 @@
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { flushSync } from 'react-dom'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import SessionAutomationPopover from '../components/SessionAutomationPopover'
@@ -21,6 +23,7 @@ vi.mock('framer-motion', async (importOriginal) => {
 vi.mock('../api/client', async importOriginal => ({
   ...await importOriginal<typeof import('../api/client')>(),
   api: {
+    monitorForSlot: vi.fn(),
     monitorCreate: vi.fn(),
     monitorUpdate: vi.fn(),
     monitorStop: vi.fn(),
@@ -95,6 +98,13 @@ describe('SessionAutomationPopover', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     framerMocks.reducedMotion = false
+    /* The bounded view reads the live runtime ceiling off the per-slot monitor
+       read. Default it to the contract's absolute maximum so the existing
+       bound assertions keep describing the contract; the ceiling tests below
+       override it per case. */
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: 2_592_000,
+    })
   })
 
   afterEach(() => {
@@ -118,7 +128,7 @@ describe('SessionAutomationPopover', () => {
       target: 'https://github.com/kirodotdev/KiroCrew/pull/42',
       cadence_secs: 300,
       max_runtime_secs: 14_400,
-      max_agent_turns: 8,
+      max_agent_turns: 0,
       max_tokens: 250_000,
       max_provider_errors: 3,
       wake_instructions: '',
@@ -162,16 +172,16 @@ describe('SessionAutomationPopover', () => {
   })
 
   it.each(['crew', 'member'])(
-    'keeps legacy Stop available but disables legacy writes in %s mode',
+    'disables the goal fields, Pause and Play in %s mode and writes nothing',
     sessionMode => {
       const fetchMock = vi.fn()
       vi.stubGlobal('fetch', fetchMock)
       renderPopover(activeLegacyLoop, vi.fn(), true, vi.fn(), sessionMode)
 
       expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeDisabled()
-      expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
-      expect(screen.getByRole('button', { name: 'Stop loop' })).toBeEnabled()
-      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      expect(screen.getByRole('button', { name: 'Pause loop' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'Nudge now' })).toBeDisabled()
+      fireEvent.click(screen.getByRole('button', { name: 'Nudge now' }))
       expect(fetchMock).not.toHaveBeenCalled()
     },
   )
@@ -194,6 +204,43 @@ describe('SessionAutomationPopover', () => {
 
     expect(screen.queryByText('Next cycle not yet scheduled')).toBeNull()
     expect(screen.getByText(/Next cycle in/)).toBeInTheDocument()
+  })
+
+  it.each([
+    ['manual', 'Paused · you paused it'],
+    ['cycle_cap', /^Paused · cycle limit reached \(2 of 24\)\./],
+  ])('carries stopped_reason %s through the compatibility bridge, so the paused line names it and Play stays live', (reason, line) => {
+    // A bridge that drops the field renders every inactive loop, a fresh pause
+    // included, as a bare "Paused".
+    renderPopover({ ...activeLegacyLoop, active: false, nextDueAt: 0, stoppedReason: reason })
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent(line)
+    expect(screen.getByRole('button', { name: 'Resume loop and nudge now' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Clear stopped goal' })).toBeInTheDocument()
+  })
+
+  it('carries a held loop through the compatibility bridge: it reads paused and Play resumes it', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_899_999_880_000)
+    // A bridge that drops approval_stalled shows "next cycle due" and disables
+    // Play, which leaves the popover no way to end the hold.
+    renderPopover({ ...activeLegacyLoop, nextDueAt: 1_899_999_000, approvalStalled: true })
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent(/^Paused · an approval in this chat timed out\./)
+    expect(screen.getByRole('button', { name: 'Resume loop and nudge now' })).toBeEnabled()
+  })
+
+  it('carries a person-wait hold through the compatibility bridge', () => {
+    renderPopover({ ...activeLegacyLoop, waitingOnPerson: true })
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent(/^Waiting on you · /)
+  })
+
+  it('clears a paused legacy loop through the bridge: the record is handed up as null and the popover closes', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const { onChange, onOpenChange } = renderPopover({ ...activeLegacyLoop, active: false, nextDueAt: 0, stoppedReason: 'manual' })
+    fireEvent.click(screen.getByRole('button', { name: 'Clear stopped goal' }))
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Clear' })) })
+    expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1?intent=clear', { method: 'DELETE' })
+    expect(onChange).toHaveBeenCalledWith(null)
+    expect(onOpenChange).toHaveBeenCalledWith(false)
   })
 
   it('centres the radar glyph and its count in the composer trigger', () => {
@@ -443,8 +490,8 @@ describe('SessionAutomationPopover', () => {
 
   it.each([
     ['Probe cadence in seconds', '86401', 'Enter a whole number from 15 to 86,400.'],
-    ['Maximum runtime in seconds', '604801', 'Enter a whole number from 1 to 604,800.'],
-    ['Maximum agent turns', '9', 'Enter a whole number from 1 to 8.'],
+    ['Maximum runtime in seconds', '604801', 'Enter a whole number from 1 to 604,800 (7 days).'],
+    ['Maximum agent turns', '1001', 'Enter a whole number from 0 to 1,000.'],
     ['Maximum tokens', '1000001', 'Enter a whole number from 1 to 1,000,000.'],
     ['Maximum provider errors', '21', 'Enter a whole number from 1 to 20.'],
   ])('shows an inline backend-bound error for %s', async (name, value, message) => {
@@ -459,6 +506,153 @@ describe('SessionAutomationPopover', () => {
     expect(api.monitorCreate).not.toHaveBeenCalled()
   })
 
+  it('bounds the runtime input by the live operator ceiling, not the contract maximum', async () => {
+    /* A default install's server enforces `monitoring.max_runtime_secs`
+       (seven days) while contract.json advertises the 30-day absolute maximum.
+       Validating against the contract alone lets a value through that can only
+       fail after submit as an HTTP 400; the popover must refuse it inline. */
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: 604_800,
+    })
+    renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', '604800'))
+    expect(api.monitorForSlot).toHaveBeenCalledWith('chat-1')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.change(runtime, { target: { value: '604801' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    expect(await screen.findByText('Enter a whole number from 1 to 604,800 (7 days).')).toBeInTheDocument()
+    expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('accepts a runtime the raised operator ceiling permits', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: 2_592_000,
+    })
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true, monitor: {} })
+    renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', '2592000'))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.change(runtime, { target: { value: '2592000' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ max_runtime_secs: 2_592_000 }),
+    ))
+  })
+
+  it.each([
+    [2_592_000, '2592001', 'Enter a whole number from 1 to 2,592,000 (30 days).'],
+    [5_400, '5401', 'Enter a whole number from 1 to 5,400 (90 minutes).'],
+    [90, '91', 'Enter a whole number from 1 to 90 (90 seconds).'],
+  ])('glosses the runtime ceiling %s with the largest unit that divides it exactly', async (ceiling, value, message) => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      enabled: true, monitor: null, max_runtime_ceiling_secs: ceiling,
+    })
+    renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', String(ceiling)))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.change(runtime, { target: { value } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('uses the shipped runtime ceiling while the live ceiling read is pending', () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockReturnValue(new Promise(() => {}))
+    renderPopover(null)
+
+    expect(screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' }))
+      .toHaveAttribute('max', '604800')
+  })
+
+  it('keeps the shipped runtime ceiling and renders the read failure', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('offline'))
+    renderPopover(null)
+
+    const notice = await screen.findByTestId('monitor-read-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent(
+      "Couldn't load this session's monitor state. Retry loading before starting a monitor.",
+    )
+    expect(screen.queryByRole('button', { name: /ask.*agent/i })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Retry loading' })).toBeEnabled()
+    expect(screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' }))
+      .toHaveAttribute('max', '604800')
+  })
+
+  it('does not stack the ceiling read failure under a rejected request', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('offline'))
+    vi.mocked(api.monitorCreate).mockRejectedValueOnce(new Error('offline'))
+    renderPopover(null)
+    expect(await screen.findByTestId('monitor-read-error')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/acme/widgets/pull/42' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+
+    await waitFor(() => {
+      const alerts = screen.getAllByRole('alert')
+      expect(alerts).toHaveLength(1)
+      expect(alerts[0]).toHaveTextContent('The monitor request failed. Try again.')
+    })
+    expect(screen.queryByTestId('monitor-read-error')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Retry loading' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Start monitor' })).toBeEnabled()
+  })
+
+  it('renders one notice when the snapshot and the ceiling read fail together and retries both', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue({ enabled: true, monitor: null, max_runtime_ceiling_secs: 604_800 })
+    const readSnapshot = vi.fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValue(null)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    function SnapshotEditor() {
+      const snapshot = useQuery({ queryKey: ['session-automation', 'chat-1'], queryFn: readSnapshot })
+      return <SessionAutomationPopover
+        slotKey="chat-1" automation={null} open onOpenChange={() => {}} onChange={() => {}}
+        creationReady={snapshot.isSuccess && !snapshot.isFetching} snapshotFailed={snapshot.isError}
+      />
+    }
+    const view = render(<QueryClientProvider client={client}><SnapshotEditor /></QueryClientProvider>)
+    enterBoundedView()
+
+    await waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(api.monitorForSlot).toHaveBeenCalledTimes(1))
+    const retry = await screen.findByRole('button', { name: 'Retry loading' })
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Retry loading' })).toHaveLength(1)
+
+    fireEvent.click(retry)
+    await waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(api.monitorForSlot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+    expect(screen.queryByRole('button', { name: 'Retry loading' })).toBeNull()
+    view.unmount()
+    client.clear()
+  })
+
+  it('does not read the runtime ceiling for the goal-loop view', () => {
+    renderPopover(activeLegacyLoop)
+    expect(api.monitorForSlot).not.toHaveBeenCalled()
+  })
+
   it('exposes exact input bounds and rejects oversized wake instructions inline', async () => {
     renderPopover(null)
 
@@ -467,7 +661,10 @@ describe('SessionAutomationPopover', () => {
     expect(screen.getByRole('spinbutton', { name: 'Probe cadence in seconds' }))
       .toHaveAttribute('max', '86400')
     expect(screen.getByRole('spinbutton', { name: 'Maximum agent turns' }))
-      .toHaveAttribute('max', '8')
+      .toHaveAttribute('max', '1000')
+    // Floor 0: this budget's unlimited sentinel.
+    expect(screen.getByRole('spinbutton', { name: 'Maximum agent turns' }))
+      .toHaveAttribute('min', '0')
     const wake = screen.getByRole('textbox', { name: 'Instructions for the agent when it wakes' })
     expect(wake).toHaveAttribute('maxlength', '1000')
 
@@ -479,6 +676,35 @@ describe('SessionAutomationPopover', () => {
 
     expect(await screen.findByText('Enter no more than 1,000 characters.')).toBeInTheDocument()
     expect(api.monitorCreate).not.toHaveBeenCalled()
+  })
+
+  it('renders an unlimited wake budget as a word, not as 0', () => {
+    // 0 is the sentinel, so the digit says the opposite of the meaning: read under
+    // a "Maximum agent turns" label it claims no wake is allowed.
+    renderPopover({
+      ...activeMonitor,
+      budgets: { ...activeMonitor.budgets, maxAgentTurns: 0 },
+    })
+
+    expect(screen.getByText('Unlimited')).toBeInTheDocument()
+  })
+
+  it('keeps rendering a finite wake budget as its number', () => {
+    renderPopover({
+      ...activeMonitor,
+      budgets: { ...activeMonitor.budgets, maxAgentTurns: 6 },
+    })
+
+    expect(screen.getByText('6')).toBeInTheDocument()
+    expect(screen.queryByText('Unlimited')).not.toBeInTheDocument()
+  })
+
+  it('tells the create form what a wake budget of 0 means', () => {
+    // Entering 0 on a "maximum" reads as "no turns allowed" without this hint,
+    // so the sentinel's meaning is spelled out beside the field.
+    renderPopover(null)
+
+    expect(screen.getByText('0 = no wake ceiling')).toBeInTheDocument()
   })
 
   it('shows monitor evidence and requires confirmation before stopping', async () => {
@@ -664,7 +890,8 @@ describe('SessionAutomationPopover', () => {
     })))
     const { onChange, rerenderAutomation } = renderPopover(activeLegacyLoop)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' }))
     await waitFor(() => expect(fetch).toHaveBeenCalled())
 
     rerenderAutomation(activeMonitor)
@@ -705,14 +932,389 @@ describe('SessionAutomationPopover', () => {
     expect(screen.getByRole('spinbutton', { name: 'Seconds between nudges' })).toHaveValue(300)
     expect(screen.getByRole('spinbutton', { name: 'Max cycles (0 = infinite)' })).toHaveValue(24)
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    // Edit one field, then Play: the write goes to the LEGACY loop's id and
+    // carries the edited field only, never `active` on a running loop.
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), {
+      target: { value: 'Keep checking, closely.' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' }))
     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: 'Keep checking.', idle_secs: 300, max_cycles: 24, active: true,
-      }),
+      body: JSON.stringify({ message: 'Keep checking, closely.' }),
     }))
+  })
+
+  it('a two-leg press (write, then fire) reaches the parent twice, each leg with only what it owns: the written record at the write, then the armed deadline on the record the parent holds', async () => {
+    // ChatPage re-identifies `automation` on every hand-off
+    // (`dispatch(sseAutomation(next))`), so the record the parent holds moves
+    // under a press that has two legs. The write leg hands its record up the
+    // moment the write lands -- the same hand-off Save and Pause make -- and
+    // the fire leg hands up NO record at all: it reports the fire (`onFired`)
+    // and this bridge arms the deadline on whatever record the parent holds
+    // NOW (`armedNow`). The bridge applies the write's record only while the
+    // parent's record has not moved since the press (and re-reads the slot
+    // otherwise), so nothing a press hands up can be older than the parent's
+    // record, and the schedule reads due on the parent's own record.
+    // `flushSync` stands in for the store notification, which re-renders the
+    // parent before the next leg's response can arrive.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 0, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const answers = init?.method === 'PATCH' || /\/fire$/.test(String(url))
+      return Promise.resolve(new Response(JSON.stringify(answers ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const received: (AutomationRecord | null)[] = []
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    function Parent() {
+      const [automation, setAutomation] = useState<AutomationRecord | null>(activeLegacyLoop)
+      return (
+        <QueryClientProvider client={client}>
+          <SessionAutomationPopover
+            slotKey="chat-1"
+            automation={automation}
+            open={true}
+            onOpenChange={() => {}}
+            onChange={next => { received.push(next); flushSync(() => setAutomation(next)) }}
+            creationReady={true}
+            sessionMode=""
+          />
+        </QueryClientProvider>
+      )
+    }
+    render(<Parent />)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    await waitFor(() => expect(received).toHaveLength(2))
+    // The write leg's own record, as the server returned it: the saved goal
+    // on a fresh full countdown.
+    const saved = received[0] as LegacyGoalLoop
+    expect(saved.kind).toBe('legacy_goal_loop')
+    expect(saved.message).toBe('edited')
+    expect(saved.nextDueAt).toBe(1_900_000_300)
+    // The fire leg: the record the parent holds (the saved one), with the
+    // deadline armed to now -- not the fire response, which the server
+    // returns unchanged.
+    const armed = received[1] as LegacyGoalLoop
+    expect(armed.kind).toBe('legacy_goal_loop')
+    expect(armed.message).toBe('edited')
+    expect(Math.abs((armed.nextDueAt ?? 0) - Date.now() / 1000)).toBeLessThan(5)
+  })
+
+  /** A parent that holds `automation` as state, with a `frame` hook the fetch
+   *  mock can pull to re-identify the record mid-press -- the way the write
+   *  leg's `autonudge_state` frame reaches the store (and this bridge's prop)
+   *  before the fire leg's response does. */
+  function interleavedParent(fetchMock: ReturnType<typeof vi.fn>) {
+    const received: (AutomationRecord | null)[] = []
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    const frame: { current: ((record: AutomationRecord) => void) | null } = { current: null }
+    function Parent() {
+      const [automation, setAutomation] = useState<AutomationRecord | null>(activeLegacyLoop)
+      frame.current = record => flushSync(() => setAutomation(record))
+      return (
+        <QueryClientProvider client={client}>
+          <SessionAutomationPopover
+            slotKey="chat-1"
+            automation={automation}
+            open={true}
+            onOpenChange={() => {}}
+            onChange={next => { received.push(next); flushSync(() => setAutomation(next)) }}
+            creationReady={true}
+            sessionMode=""
+          />
+        </QueryClientProvider>
+      )
+    }
+    vi.stubGlobal('fetch', fetchMock)
+    render(<Parent />)
+    return { received, frame }
+  }
+
+  it('a frame that re-identifies the SAME loop between the write leg and the fire leg is what the fire arms: the deadline lands on the frame\'s record', async () => {
+    // The write leg's PATCH makes the service emit `updated`, which the gateway
+    // broadcasts as an `autonudge_state` frame; the store dispatch hands this
+    // bridge a NEW `automation` object for the same loop before the fire leg's
+    // response arrives. A guard on object identity once dropped the press's
+    // hand-off there, so the parent kept the frame's full countdown over a
+    // cycle armed to run now, with Nudge now still enabled (GPT, head
+    // 5b284e13c7). Now the fire arms the deadline on the record the parent
+    // holds -- the frame's -- so the frame costs the press nothing and the
+    // parent never receives a record older than the frame.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 1_899_999_700, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const fromFrame = { ...written, message: 'edited, as the frame carries it' }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (/\/fire$/.test(String(url))) frame.current?.(normalizeAutomationRecord({ ...fromFrame }) as AutomationRecord)
+      const answers = init?.method === 'PATCH' || /\/fire$/.test(String(url))
+      return Promise.resolve(new Response(JSON.stringify(answers ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    const { received, frame } = interleavedParent(fetchMock)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    await waitFor(() => expect(received).toHaveLength(2))
+    // The write's own hand-off came first, before the frame.
+    expect((received[0] as LegacyGoalLoop).message).toBe('edited')
+    // The fire armed the FRAME's record, not the response's: its fields, the
+    // armed deadline.
+    const armed = received[1] as LegacyGoalLoop
+    expect(armed.kind).toBe('legacy_goal_loop')
+    expect(armed.id).toBe('legacy-1')
+    expect(armed.message).toBe('edited, as the frame carries it')
+    expect(Math.abs((armed.nextDueAt ?? 0) - Date.now() / 1000)).toBeLessThan(5)
+  })
+
+  it('a fire the frame already delivered has nothing left to arm: the parent keeps the delivered record', async () => {
+    // The opposite interleaving: the service fired and its `fired` frame landed
+    // (count up, deadline a full interval away) before the fire leg's response
+    // was handled. Arming "now" on that record would roll the count's deadline
+    // back and read "Next cycle due" for a cycle already delivered, until the
+    // following frame a whole interval later. A loop that fired since the
+    // press keeps the frame; only the write's own hand-off reaches the parent.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 1_899_999_700, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const nowTs = Math.floor(Date.now() / 1000)
+    const delivered = { ...written, cycle_count: 3, last_fire_ts: nowTs, next_due_ts: nowTs + 300 }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (/\/fire$/.test(String(url))) frame.current?.(normalizeAutomationRecord({ ...delivered }) as AutomationRecord)
+      const answers = init?.method === 'PATCH' || /\/fire$/.test(String(url))
+      return Promise.resolve(new Response(JSON.stringify(answers ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    const { received, frame } = interleavedParent(fetchMock)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    // Let the fire leg settle: only the write's hand-off may have reached the parent.
+    await act(async () => { await Promise.resolve() })
+    expect(received).toHaveLength(1)
+    expect((received[0] as LegacyGoalLoop).nextDueAt).toBe(1_900_000_300)
+    // The delivered frame's reading stands: cycle 3 of 24 in the trigger's name.
+    expect(screen.getByRole('button', { name: /Goal active \(cycle 3\/24\)/ })).toBeTruthy()
+  })
+
+  it('a fire whose answer is serialized AFTER the delivery -- its last_fire_ts equal to the fired frame\'s -- has nothing left to arm either: the record the press was made on is the baseline, not the answer', async () => {
+    // GPT, head cd2c53e472 (:170): `fire_now` arms a zero-delay timer and
+    // returns the LIVE loop object, and the route serializes it only after
+    // its audit await -- so a delivery that completes inside that window makes
+    // the answer post-delivery, its `last_fire_ts` EQUAL to the `fired`
+    // frame's. A guard that compared the parent's record against the answer
+    // read the two as the same fire, armed "now" on the delivered record, and
+    // the schedule read due for a whole interval. The press reports the record
+    // it was made on -- the written record here, pre-request by construction
+    // -- and a parent record that has fired since it leaves nothing to arm.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 1_899_999_700, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const nowTs = Math.floor(Date.now() / 1000)
+    const delivered = { ...written, cycle_count: 3, last_fire_ts: nowTs, next_due_ts: nowTs + 300 }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (/\/fire$/.test(String(url))) {
+        frame.current?.(normalizeAutomationRecord({ ...delivered }) as AutomationRecord)
+        // The answer, serialized after the delivery: the live loop as delivered.
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, loop: delivered }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      return Promise.resolve(new Response(JSON.stringify(init?.method === 'PATCH' ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    const { received, frame } = interleavedParent(fetchMock)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    await act(async () => { await Promise.resolve() })
+    // Only the write's hand-off reached the parent; the delivered record was
+    // not rolled back to due.
+    expect(received).toHaveLength(1)
+    expect((received[0] as LegacyGoalLoop).nextDueAt).toBe(1_900_000_300)
+    expect(screen.getByRole('button', { name: /Goal active \(cycle 3\/24\)/ })).toBeTruthy()
+  })
+
+  it('a pause another writer landed between the write leg and the fire leg stands: the refused fire hands nothing up, the parent keeps the paused record', async () => {
+    // GPT, head 02b38a4edc (:685): a second tab pauses the loop after this
+    // tab's PATCH committed; the pause's inactive `autonudge_state` frame lands
+    // in this tab's store, then `fire_now` answers 409 ("loop is not active").
+    // The refusal path used to hand the WRITTEN record up -- active, read
+    // moments before the pause -- and that stale snapshot overwrote the paused
+    // frame, so the popover showed the paused loop as running until the next
+    // frame or a reload. Now the write leg hands its record up when the write
+    // lands, and a fire -- refused or not -- hands no record up at all, so the
+    // pause is the last word.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 1_899_999_700, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const paused = { ...written, active: false, next_due_ts: 0, stopped_reason: 'manual' }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (/\/fire$/.test(String(url))) {
+        frame.current?.(normalizeAutomationRecord({ ...paused }) as AutomationRecord)
+        return Promise.resolve(new Response(JSON.stringify({ error: 'loop is not active' }), {
+          status: 409, headers: { 'Content-Type': 'application/json' },
+        }))
+      }
+      return Promise.resolve(new Response(JSON.stringify(init?.method === 'PATCH' ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    const { received, frame } = interleavedParent(fetchMock)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    await act(async () => { await Promise.resolve() })
+    // The write's own hand-off, made before the pause landed, and nothing after it.
+    expect(received).toHaveLength(1)
+    expect((received[0] as LegacyGoalLoop).active).toBe(true)
+    expect((received[0] as LegacyGoalLoop).message).toBe('edited')
+    // The parent holds the pause: the trigger no longer reads active, the
+    // popover shows the paused row, and the refusal landed in its notice.
+    expect(screen.queryByRole('button', { name: /Goal active/ })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Set a goal' })).toBeTruthy()
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent('Paused · you paused it')
+    expect(screen.getByText('loop is not active')).toBeTruthy()
+  })
+
+  it('a pause that lands before an accepted fire\'s answer leaves nothing to arm: the parent keeps the paused record, no deadline is set on it', async () => {
+    // Same interleaving, other side of the server's active check: the pause
+    // lands after `fire_now` already answered 200, so the timer body skips the
+    // cycle on its own re-check. The fire response is the record as it stood
+    // BEFORE the pause (active, pre-delivery), and handing it up -- or arming a
+    // deadline on a paused record -- would show a paused loop as running or
+    // due. Nothing a press reports may outrank the parent's record.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 1_899_999_700, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const paused = { ...written, active: false, next_due_ts: 0, stopped_reason: 'manual' }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (/\/fire$/.test(String(url))) frame.current?.(normalizeAutomationRecord({ ...paused }) as AutomationRecord)
+      const answers = init?.method === 'PATCH' || /\/fire$/.test(String(url))
+      return Promise.resolve(new Response(JSON.stringify(answers ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    const { received, frame } = interleavedParent(fetchMock)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    await act(async () => { await Promise.resolve() })
+    expect(received).toHaveLength(1)
+    expect((received[0] as LegacyGoalLoop).active).toBe(true)
+    expect(screen.queryByRole('button', { name: /Goal active/ })).toBeNull()
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent('Paused · you paused it')
+  })
+
+  it('does not overwrite a newer frame of the SAME loop with a delayed write response: a pause another tab landed between this tab\'s save and its answer stands, and the slot is re-read', async () => {
+    // GPT, head 9b921e2fa2 (:154): the record carries no revision, and the
+    // parent writes whatever it is handed straight into the per-slot cache and
+    // Redux. A guard that passed any response for the same loop id let a PATCH
+    // answered BEFORE another tab's pause, but delivered after the pause's
+    // `autonudge_state` frame, put the active record back over the paused one
+    // -- and frames fire on change, so nothing corrected it until a reconnect.
+    // The one thing this bridge can know is whether the parent's record moved
+    // since the press was rendered: if it did, a frame landed, frames arrive in
+    // the server's order and the write's own `updated` frame is among them or
+    // follows, so the response is dropped and the slot's cold read is
+    // invalidated instead -- the rule the bounded monitor's writes already
+    // follow here.
+    let resolveFetch!: (value: Response) => void
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => {
+      resolveFetch = resolve
+    })))
+    const { client, onChange, rerenderAutomation } = renderPopover(activeLegacyLoop)
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalled())
+
+    // The other tab's pause reaches the store first: same loop, inactive.
+    rerenderAutomation({ ...activeLegacyLoop, active: false, nextDueAt: 0, stoppedReason: 'manual' })
+    await act(async () => {
+      resolveFetch(new Response(JSON.stringify({
+        ok: true,
+        loop: {
+          id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+          cycle_count: 2, active: true, last_fire_ts: 0, next_due_ts: 1_900_000_300, stopped_reason: '',
+        },
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      await Promise.resolve()
+    })
+
+    // The stale active record never reaches the parent; the slot is re-read.
+    // (Every write's success invalidates the shared loops query, so the first
+    // wait is for the mutation to have settled at all; the assertions that
+    // matter come after it.)
+    await waitFor(() => expect(invalidate).toHaveBeenCalled())
+    expect(onChange).not.toHaveBeenCalled()
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session-automation', 'chat-1'] })
+    // The pause is what the surface shows: the paused line, no active count.
+    expect(screen.queryByRole('button', { name: /Goal active/ })).toBeNull()
+    expect(screen.getByTestId('auto-nudge-status')).toHaveTextContent('Paused · you paused it')
+  })
+
+  it('the write leg\'s own frame landing before its response costs a two-leg press nothing: the response is dropped, and the fire still arms the frame\'s record', async () => {
+    // The common ordering: the service broadcasts the write's `updated` frame
+    // before the PATCH response is read, so the parent's record has moved --
+    // to the written state -- by the time the write leg reports. The report is
+    // dropped (the frame already carried it) and the fire leg arms the deadline
+    // on the frame's record, so the parent receives exactly one record, never
+    // one older than the frame, and the press still reads due.
+    const written = {
+      id: 'legacy-1', slot_key: 'chat-1', message: 'edited', idle_secs: 300, max_cycles: 24,
+      cycle_count: 2, active: true, last_fire_ts: 1_899_999_700, next_due_ts: 1_900_000_300, stopped_reason: '',
+    }
+    const fromFrame = { ...written, message: 'edited, as the frame carries it' }
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (init?.method === 'PATCH') frame.current?.(normalizeAutomationRecord({ ...fromFrame }) as AutomationRecord)
+      const answers = init?.method === 'PATCH' || /\/fire$/.test(String(url))
+      return Promise.resolve(new Response(JSON.stringify(answers ? { ok: true, loop: written } : { loop: null }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }))
+    })
+    const { received, frame } = interleavedParent(fetchMock)
+    fireEvent.change(screen.getByRole('textbox', { name: 'Goal description' }), { target: { value: 'edited' } })
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Save edits and nudge now' })) })
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/autonudge/legacy-1/fire', expect.objectContaining({ method: 'POST' })))
+    await waitFor(() => expect(received).toHaveLength(1))
+    await act(async () => { await Promise.resolve() })
+    // One hand-off: the fire's, on the frame's record -- the written response
+    // itself never reached the parent.
+    expect(received).toHaveLength(1)
+    const armed = received[0] as LegacyGoalLoop
+    expect(armed.kind).toBe('legacy_goal_loop')
+    expect(armed.message).toBe('edited, as the frame carries it')
+    expect(Math.abs((armed.nextDueAt ?? 0) - Date.now() / 1000)).toBeLessThan(5)
   })
 
   it('applies a mutation response when the captured automation is still current', async () => {
@@ -970,8 +1572,11 @@ describe('SessionAutomationPopover', () => {
     /* Warn-coloured, as it was when this form was opt-in. On the view every
        reader now lands on, this sentence is the only cost cue the surface
        carries, so muting it would have weakened that cue in the same change
-       that made the surface the default. */
-    expect(notice).toHaveClass('border-warn/30', 'bg-warn-subtle', 'text-warn-fg')
+       that made the surface the default. It wears `text-warn-text` -- the
+       warn hue that keeps 4.5:1 on the `bg-warn-subtle` tint in both modes --
+       not `text-warn-fg`, which is the on-solid-`--warn` black that read as
+       dark-on-dark here in the dark theme. */
+    expect(notice).toHaveClass('border-warn/30', 'bg-warn-subtle', 'text-warn-text')
     expect(panel).toHaveClass(
       'w-[min(calc(100vw-1rem),26.25rem)]',
       'max-h-[min(80vh,42rem)]',
@@ -1046,5 +1651,122 @@ describe('SessionAutomationPopover', () => {
 
     expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Watch a pull request instead' })).not.toBeInTheDocument()
+  })
+
+  /* THE JUDGE LINE, mounted the way the dashboard mounts it.
+     The row below is `GET /api/autonudge` output in the wire's own spelling, and it
+     is parsed by the real normalizer rather than written as a record, because the
+     three hops between the endpoint and the line each name their fields: the
+     publisher's keys, this record's, and the adapter's. A test that hands the
+     popover a loop object directly agrees with the reader about every name and
+     still passes while a middle hop carries none of them -- and a dropped judge is
+     silent on screen, because "this loop has no judge" is the honest reading for
+     most loops and renders nothing. So the assertion has to start at the wire. */
+  const judgeLoopRow = (judge: Record<string, unknown>) => ({
+    id: 'legacy-judge', slot_key: 'chat-1', message: 'Keep checking.',
+    idle_secs: 300, max_cycles: 24, cycle_count: 2, active: true,
+    last_fire_ts: 1_800_000_000, next_due_ts: 1_900_000_000, stopped_reason: '',
+    ...judge,
+  })
+
+  it('renders the judge line from a GET row, criterion and verdict both', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 'a reviewer asks for changes', quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 2, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('Judge: wake when a reviewer asks for changes')
+    expect(line).toHaveTextContent('quiet')
+    expect(line).toHaveTextContent('2 items')
+  })
+
+  it('renders the judge line with no verdict yet when the judge has not answered', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: '', quiet_when: 'the build is still running', targets: [] },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    // The LABEL as well as the criterion. A quiet-only brief under the wake label
+    // states the inverse of what the owner armed, and an assertion on the criterion
+    // alone passes either way, because the criterion travels either way.
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('Judge: stay quiet while the build is still running')
+    expect(line).not.toHaveTextContent('wake when')
+    expect(line).toHaveTextContent('no verdict yet')
+  })
+
+  it('renders a verdict with no timestamp without a dangling separator', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 'a reviewer asks for changes', quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 2, at: 0 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line).toHaveTextContent('2 items')
+    expect(line.textContent?.trimEnd().endsWith('·')).toBe(false)
+  })
+
+  it('carries a criterion at the arming bound in full, styled as its sibling rows', () => {
+    // The arming surface refuses anything past MAX_JUDGE_CRITERION_CHARS (500), so a
+    // criterion this long is the widest the render can ever be handed. It is shown
+    // whole rather than clipped: the owner reads back exactly the prose they armed,
+    // and the row carries its siblings' type contract so a long brief grows the
+    // popover the way every other wrapping row in it does.
+    const criterion = 'w'.repeat(500)
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: criterion, quiet_when: '', targets: [] },
+      judge_last_verdict: { outcome: 'quiet', evidence_items: 1, at: 1_800_000_500 },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    const line = screen.getByTestId('judge-line')
+    expect(line.textContent).toContain(criterion)
+    expect(line).toHaveTextContent('quiet')
+    expect(line.className).toContain('text-[11px]')
+    // This criterion is 500 characters with NO space in it, which is the input that
+    // makes the difference between wrapping and overflowing: without a break rule the
+    // row runs off the popover horizontally instead of growing it. A rendered capture
+    // of this exact case is attached to the pull request.
+    expect(line.className).toContain('break-words')
+  })
+
+  it('draws no judge line for a loop whose row carries a cleared brief', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({ judge: {} }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
+    expect(screen.queryByTestId('judge-line')).not.toBeInTheDocument()
+  })
+
+  it('keeps a malformed judge inert rather than throwing inside the render', () => {
+    const record = normalizeAutomationRecord(judgeLoopRow({
+      judge: { wake_when: 42, quiet_when: null, targets: ['ok', 7] },
+      judge_last_verdict: { outcome: {}, evidence_items: -1, at: 'now' },
+    }))
+    renderPopover(record, vi.fn(), true, vi.fn(), '', { enterBounded: false })
+
+    expect(screen.getByRole('textbox', { name: 'Goal description' })).toBeInTheDocument()
+    expect(screen.queryByTestId('judge-line')).not.toBeInTheDocument()
+  })
+
+  it('falls back to the shipped ceiling when a refetch fails after a raised ceiling', async () => {
+    ;(api.monitorForSlot as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        enabled: true, monitor: null, max_runtime_ceiling_secs: 2_592_000,
+      })
+      .mockRejectedValueOnce(new Error('offline'))
+    const { client } = renderPopover(null)
+    const runtime = screen.getByRole('spinbutton', { name: 'Maximum runtime in seconds' })
+    await waitFor(() => expect(runtime).toHaveAttribute('max', '2592000'))
+
+    await act(async () => {
+      await client.refetchQueries({ queryKey: ['monitor-runtime-ceiling', 'chat-1'] })
+    })
+
+    expect(await screen.findByTestId('monitor-read-error')).toHaveAttribute('role', 'alert')
+    expect(runtime).toHaveAttribute('max', '604800')
   })
 })

@@ -76,7 +76,7 @@ every group. Measured at `e6b06685e`, the situation is worse than "hard to
 customize":
 
 - **There is no overview surface.** `/overview` is a redirect to
-  `/settings?tab=overview` (`website/src/App.tsx:2712`). Overview is a settings
+  `/settings?tab=overview` (the `/overview` route in `website/src/App.tsx`). Overview is a settings
   tab reached through `website/src/pages/settings/OverviewPanel.tsx:1-4`.
 - **It is one fixed layout for everyone.** The six stat tiles are a hardcoded
   literal with no conditional (`website/src/pages/OverviewPage.tsx:193-198`).
@@ -109,8 +109,8 @@ definitions — returns eleven, at `e6b06685e`:
 | Field | Declared | Status |
 |---|---|---|
 | `jobFamilies` | `src/kiro_crew/apps/manifest.py:1010` | Parsed, serialized, echoed to the client. No consumer. |
-| `sops` | `manifest.py:976` | `bridges.register_app` (`bridges.py:2324-2410`) registers MCP servers, agents, skills, crons. There is no `_register_sops`. Declaring `sops` copies nothing. |
-| `backend.routes` | `manifest.py:386` | No reader. `apps/routes.py:2336` still carries a comment describing it. The prefix is hardcoded at `apps/route_registry.py:122`. |
+| `sops` | `manifest.py:976` | `bridges.register_app` (`apps/bridges_register.py`) registers MCP servers, agents, skills, crons. There is no `_register_sops`. Declaring `sops` copies nothing. |
+| `backend.routes` | `manifest.py:386` | No reader. `_resolve_app_backend_url` (`apps/routes_proxy.py`) still carries a comment describing it. The prefix is hardcoded at `apps/route_registry.py:122`. |
 | `permissions.mcpTools` | `manifest.py:442` | Declarative only. `check_tool_permission` (`apps/permissions.py:71`) has no non-test caller. |
 | `permissions.network` | `manifest.py:444` | Not enforced. An app makes outbound calls regardless. |
 | `permissions.memory` | `manifest.py:445` | Not enforced. There is no `ctx.memory` on `AppContext` (`apps/context.py:51-67`). |
@@ -124,8 +124,8 @@ The whole of `src/kiro_crew/apps/permissions.py` is dead in production:
 `validate_permissions` (`:34`), `check_tool_permission` (`:71`) and
 `format_permissions_summary` (`:82`) have zero non-test callers, so the
 install-time permission warnings and the permission summary are never shown.
-`governance.register_matcher` (`platform/governance.py:599`) and
-`register_scope` (`:1119`) likewise have zero call sites repository-wide.
+`governance.register_matcher` (in `platform/governance_parts/matching.py`) and
+`register_scope` (in `platform/governance_parts/catalog.py`) likewise have zero call sites repository-wide.
 Separately, `lifecycle`, `resources`, `openCommand` and `heroImage*` are
 documented as first-class in
 [`../app-kit/manifest-reference.md`](../app-kit/manifest-reference.md) but are not
@@ -161,7 +161,7 @@ Consequences, each grep-verified rather than demonstrated:
   (`src/kiro_crew/security.py:4436`), not frozen. In-process code can read and
   write the keystone files directly, `security_policy.json` included.
 - The SEL chain's integrity rests on the HMAC key living outside the log
-  directory (`src/kiro_crew/sel.py:58-63`). That defeats an actor with
+  directory (`src/kiro_crew/sel_trust_root.py`, `_TRUST_SUBDIR`). That defeats an actor with
   log-directory write access, which is narrower access than an app has.
 - Audit failure never changes a decision, by explicit policy
   (`apps/execution.py:459-460`, `admission.py:154-156`), so suppressing the record
@@ -173,10 +173,10 @@ Consequences, each grep-verified rather than demonstrated:
 Meanwhile the *declarative* surface is strictly add-only. An app cannot take a
 position in any core flow: `HookManager` is constructed solely from the `hooks`
 section of `config.json` (`src/kiro_crew/hooks.py:931`, callers at
-`cli_server.py:1507`, `slack/gateway.py:653`) and has no registration path; the
+`_run_task` in `cli_server.py`, `slack/gateway.py:653`) and has no registration path; the
 app `EventBus` is publish-only, with no `subscribe` anywhere in
 `apps/event_bus.py`; notification **routing** transports register through
-`DashboardState.register_channel_transport` (`dashboard/state.py:3200`) whose only
+`DashboardState.register_channel_transport` (in `dashboard/state_parts/session_events.py`) whose only
 callers are first-party gateways; HTTP routes are confined to
 `/api/apps/<own-name>/*` by a hardcoded prefix (`apps/route_registry.py:122`).
 
@@ -290,7 +290,8 @@ argument, which is the point. It does not make the argument disappear.
 ### 5.5 Selecting a surface per group
 
 `jobFamilies` already exists as a manifest field with no reader
-(`apps/manifest.py:1010`). Whether it is the right selector is open (§10), but the
+(`apps/manifest.py`, `AppManifest.jobFamilies`). Whether it is the right selector is
+open (§10), but the
 shape it implies — an app declares which job families it serves, and the host
 resolves one owner per surface — is the mechanism this RFC needs, and it was
 declared before it was needed.
@@ -409,14 +410,14 @@ Phase 0 is documentation and a test. Phase 1 removes manifest fields, which is
 breaking for any manifest that declares them even though none of them does
 anything today; the parser must keep accepting an unknown field, which
 `AppManifest.from_dict`'s `extra` handling already guarantees
-(`apps/manifest.py:1214-1215`), so a stale manifest degrades to a warning rather
+(`apps/manifest.py`, `_KNOWN_FIELDS`), so a stale manifest degrades to a warning rather
 than a failed install. Phase 2 changes where the overview renders and must keep
 `/settings?tab=overview` resolving. Phase 3 changes no existing app's behavior.
 
 One gap is worth naming because this RFC makes it load-bearing: the compatibility
 contract is one-directional. `minKiroCrewVersion` is a floor an app declares about
-the gateway, checked only at install and update (`apps/manager.py:281`,
-`apps/routes.py:503`, `apps/registry.py:4053`) and never at enable or boot, and it
+the gateway, checked only at install and update (`_check_min_version` in `apps/manager_tree.py`,
+`handle_install_app` (`apps/routes.py`), `install_from_registry` (`apps/registry_pipeline/install.py`)) and never at enable or boot, and it
 fails **open** on a malformed value (`apps/version.py:32-33`). The platform
 declares no version for its own app-facing surface, so withdrawing a seam carries
 no signal in the other direction. Phase 1 removes seams. If that ordering feels
@@ -439,8 +440,9 @@ blocked phase.
   supply-chain question first and a UI question second.
 - Two pre-existing weaknesses are relevant enough to name: a governance policy
   cannot deny by omission, since an absent scope key permits
-  (`platform/governance.py:955-963`), and policy signature verification is off
-  when the trust root is absent or unreadable (`platform/governance.py:1803-1807`).
+  (`resolve` in `platform/governance_parts/evaluator.py`), and policy signature verification is off
+  when the trust root is absent or unreadable (`_policy_signature_required` in
+  `platform/governance_parts/signature.py`).
   Neither is created by this RFC; both bound what Phase 3 can promise.
 
 ## 10. Alternatives considered

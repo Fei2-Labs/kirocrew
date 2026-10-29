@@ -16,7 +16,9 @@
  *
  * @module hooks/useSessionControls
  */
+import { useRef } from 'react'
 import { useQueries, useQuery } from '@tanstack/react-query'
+import { shallowEqual } from 'react-redux'
 import { api } from '../api/client'
 import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
 
@@ -29,6 +31,24 @@ import { SESSION_CONTROL_STATUS_PATH_RE } from '../lib/sessionControlStatusPath'
  * composer that cannot be typed in.
  */
 export const MAX_INLINE_SESSION_CONTROLS = 2
+
+/** Query-key root shared by every status probe. */
+export const SESSION_CONTROL_STATUS_KEY = 'session-control-status'
+
+/**
+ * The session identity a dashboard chat's controls are keyed on. The rest of
+ * the system stores session-scoped state under `dashboard:<slot>`, not the bare
+ * slot id, and the composer and the turn-end refresh must build it the same way.
+ *
+ * @param slot Dashboard slot id (`chat-2`), or null when no chat is open
+ * @returns `dashboard:<slot>`, or `''` for no slot
+ *
+ * @example
+ * dashboardSessionKey('chat-2')  // 'dashboard:chat-2'
+ */
+export function dashboardSessionKey(slot: string | null | undefined): string {
+  return slot ? `dashboard:${slot}` : ''
+}
 
 export interface ResolvedSessionControl {
   /** Composite key, unique across apps: `${appName}:${control.id}`. */
@@ -66,6 +86,8 @@ export interface SessionControlStatus {
   state: SessionControlState
   /** Replaces the chip tooltip when present, so the state can explain itself. */
   tooltip: string
+  /** Short per-session text shown after the manifest label, or ''. */
+  detail: string
 }
 
 /**
@@ -225,10 +247,7 @@ export function useSessionControls(): SessionControlsResult {
     // trimmed api surface) mock `api` partially, and a missing method would
     // throw synchronously — taking the whole composer down with it.
     queryFn: () => (typeof api?.listApps === 'function' ? api.listApps() : []),
-    select: (d: unknown): ResolvedSessionControl[] => {
-      const apps = Array.isArray(d) ? d : (d as { apps?: unknown[] })?.apps
-      return resolveSessionControls((apps as AppLike[]) || [])
-    },
+    select: selectSessionControls,
   })
   // The controls still fail closed — an error leaves `data` undefined, so the
   // composer renders without chips rather than breaking. But the error is
@@ -236,8 +255,16 @@ export function useSessionControls(): SessionControlsResult {
   // from "no app declares a control" unless the failure is surfaced, so the
   // caller owes the user an error surface. `errors-use-error-notice` names a
   // `useQuery` error as an error for exactly this reason.
-  return { controls: data ?? [], error: (error as Error | null) ?? null }
+  return { controls: data ?? NO_CONTROLS, error: (error as Error | null) ?? null }
 }
+/** Module-level, so React Query re-runs it only when the app list changes: an
+ *  inline `select` is a new function per render and re-resolves every time. */
+function selectSessionControls(d: unknown): ResolvedSessionControl[] {
+  const apps = Array.isArray(d) ? d : (d as { apps?: unknown[] })?.apps
+  return resolveSessionControls((apps as AppLike[]) || [])
+}
+/** Shared so a failed or pending app list keeps one identity across renders. */
+const NO_CONTROLS: ResolvedSessionControl[] = []
 
 /**
  * Normalize one status payload into a chip state.
@@ -249,11 +276,20 @@ export function normalizeStatus(raw: unknown): SessionControlStatus {
   // `unknown` rather than `any`: this is a third party's payload, so the
   // narrowing below is the contract and the compiler should enforce that every
   // field is checked before use.
-  const r = (raw ?? {}) as { state?: unknown; tooltip?: unknown }
+  const r = (raw ?? {}) as { state?: unknown; tooltip?: unknown; detail?: unknown }
   const state =
     typeof r.state === 'string' && KNOWN_STATES.has(r.state) ? (r.state as SessionControlState) : 'none'
   const tooltip = typeof r.tooltip === 'string' ? r.tooltip.slice(0, 200) : ''
-  return { state, tooltip }
+  // `detail` is drawn on the chip itself, so the whole Unicode C category
+  // (control, format incl. bidi and zero-width, surrogate, private-use,
+  // unassigned) and the line/paragraph separators are removed: none of them can
+  // reorder or hide the label. The cap counts code points, so it never splits
+  // a surrogate pair.
+  const detail =
+    typeof r.detail === 'string'
+      ? Array.from(r.detail.replace(/[\p{C}\p{Zl}\p{Zp}]/gu, '').trim()).slice(0, 40).join('')
+      : ''
+  return { state, tooltip, detail }
 }
 
 /** What {@link useSessionControlStatuses} returns. */
@@ -321,7 +357,9 @@ export function useSessionControlStatuses(
       // identical — React Query would dedupe them into one query whose result
       // names only one control, leaving the sibling chip permanently stateless.
       // The pre-React-Query probe string keyed on c.key for this reason.
-      queryKey: ['session-control-status', c.key, c.appName, c.statusPath, sessionKey, folderId, folderName],
+      // sessionKey second, so [SESSION_CONTROL_STATUS_KEY, sessionKey] is a
+      // prefix selecting one session's probes (the turn-end refresh).
+      queryKey: [SESSION_CONTROL_STATUS_KEY, sessionKey, c.key, c.appName, c.statusPath, folderId, folderName],
       queryFn: async () => {
         if (typeof api?.appSessionStatus !== 'function') return null
         const params: Record<string, string> = { session_key: sessionKey }
@@ -344,14 +382,21 @@ export function useSessionControlStatuses(
   const statuses: Record<string, SessionControlStatus> = {}
   for (const r of results) {
     const d = r.data
-    // `none` is dropped rather than stored, so the map reads as "has state"
-    // and a caller never has to check the value as well as the key.
-    if (d && d.status.state !== 'none') statuses[d.key] = d.status
+    // A status with neither a state nor a detail is dropped rather than
+    // stored, so the map reads as "has something to show" and a caller never
+    // has to check the values as well as the key.
+    if (d && (d.status.state !== 'none' || d.status.detail)) statuses[d.key] = d.status
   }
   // One error stands for all of them: the chips are a group, and a per-chip
   // banner would be noise on a surface that competes with the message input for
   // one row. Statuses still fail closed — a chip whose probe failed is simply
   // stateless — but the failure is reported rather than hidden.
   const failed = results.find(r => !!r.error)
-  return { statuses, error: (failed?.error as Error | undefined) ?? null }
+  // Same identity while no status changed: the map is rebuilt every render, and
+  // a fresh `{}` each time kept every memo downstream of it (the composer's
+  // chip list) from ever holding. Each entry is react-query data, which keeps
+  // its identity until the probe's answer changes.
+  const stableRef = useRef(statuses)
+  if (!shallowEqual(stableRef.current, statuses)) stableRef.current = statuses
+  return { statuses: stableRef.current, error: (failed?.error as Error | undefined) ?? null }
 }

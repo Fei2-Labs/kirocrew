@@ -633,6 +633,16 @@ class TestPodPidAttestation:
         """
         monkeypatch.setattr(rt, "IS_WINDOWS", True)
         monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
+        # Both facts the proof consults are pinned for BOTH calls. Left real, the
+        # first call asked this host's service manager about a pod named "demo"
+        # (``launchctl print`` here, ``systemctl show`` on Linux) and the second
+        # read the real start time of whatever process holds pid 4242 -- so the
+        # verdicts depended on the host's launchd and its pid table, not on the
+        # rule under test (a five-run sweep saw four real ``launchctl`` spawns).
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda c, n, p: None)
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: None)
+        monkeypatch.setattr(rt, "process_start_time", lambda pid: "start-token")
+        monkeypatch.setattr(rt, "attributed_descendants", lambda pid, token: set())
         cfg = PodConfig.load()
         assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
         monkeypatch.setattr(rt, "_pod_recorded_pid", lambda c, n, p: 4242)
@@ -903,8 +913,8 @@ class TestPodApiUnixTransport:
     ) -> None:
         """Refuse before minting: an undeliverable credential is still a credential.
 
-        ``mint_token`` sends the pod's ``.local_secret`` to get one back, so a
-        request that cannot be delivered must not pay for a token first.
+        ``mint_token`` sends the pod's own internal-API credential to get one back,
+        so a request that cannot be delivered must not pay for a token first.
         """
         monkeypatch.setattr(
             rt, "mint_token", lambda *args, **kwargs: pytest.fail("minted before refusing")

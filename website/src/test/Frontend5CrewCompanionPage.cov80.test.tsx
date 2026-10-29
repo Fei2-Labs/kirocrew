@@ -187,15 +187,16 @@ describe('crew-companion/CrewCompanionPage — writes', () => {
   it('skips a recurring reminder, and announces a failed skip', async () => {
     render(<CrewCompanionPage />)
     await waitFor(() => expect(document.querySelector('.cc-icon-btn.is-remove')).not.toBeNull())
-    const skip = Array.from(document.querySelectorAll('.cc-icon-btn')).find(
-      (b) => !b.classList.contains('is-remove'),
-    ) as HTMLButtonElement
-    fireEvent.click(skip)
+    const skip = async () => {
+      fireEvent.keyDown(screen.getByRole('button', { name: 'More actions' }), { key: 'Enter' })
+      fireEvent.click(await screen.findByRole('menuitem', { name: 'Skip just the next one' }))
+    }
+    await skip()
     await waitFor(() => expect(apiPost).toHaveBeenCalledWith(`${REMINDERS_PATH}/skip`, { id: 'zz1' }))
     expect(notice()).toBe('')
 
     apiPost.mockRejectedValue(new Error('zz-skip-broke'))
-    fireEvent.click(skip)
+    await skip()
     await waitFor(() => expect(notice()).toContain('zz-skip-broke'))
   })
 

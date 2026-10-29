@@ -35,13 +35,14 @@ from collections import deque
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Callable, Optional
 
+from kiro_crew import resource_status
 from kiro_crew.acp.runtime import _get_rss_tree_mb, _iter_descendant_pids
 from kiro_crew.dashboard.handlers_system import _get_static_system_info
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.mcp_gateway import STUB_MODULE
 from kiro_crew.messaging.link import telemetry_channel_of
-from kiro_crew.platform_compat import proc_child_map
+from kiro_crew.platform_compat import proc_child_map, process_matches
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session import BACKGROUND_KEY
 from kiro_crew.subagent import _CLK_TCK, _subtree_cpu_jiffies
@@ -64,15 +65,6 @@ _HISTORY_LEN = 60
 # servers is this session carrying" signal. Imported rather than spelled out so
 # it cannot drift from the launch line the rewriter emits.
 _STUB_MARKER = STUB_MODULE
-
-
-def _read_cmdline(pid: int) -> str:
-    """Return ``/proc/<pid>/cmdline`` as a string, or "" when unreadable."""
-    try:
-        with open(f"/proc/{pid}/cmdline", encoding="utf-8", errors="replace") as fh:
-            return fh.read().replace("\0", " ")
-    except OSError:
-        return ""
 
 
 def _spend_for_session(
@@ -156,13 +148,23 @@ def lineage_parents(
     recover from: neither view says which is right.
 
     The join is by SLOT, never by pid or title, and a row is reachable under
-    three spellings of its slot because three writers spell it differently. A
-    crew log names a slot the way ``session_create`` attributed it -- the bare
-    ``slot.key`` for a dashboard session -- while the row's key is the full
-    ``dashboard:`` session key. A slot bound to a channel or cron conversation
-    runs its turns under ``linked_session_key`` while its log still carries the
-    dashboard slot key, so *spend_slot_by_session* (the alias
-    :func:`_spend_for_session` already bridges for credits) is the third.
+    every spelling its own writers use, because they do not agree on one. A
+    crew log names a slot the way ``session_create`` attributed it -- the key the
+    creating caller authenticated as -- while the row's key is whatever its own
+    payload is keyed by: the full ``dashboard:`` session key on the Sessions
+    table, the bare ``slot.key`` on the slots payload. A slot bound to a channel
+    or cron conversation runs its turns under ``linked_session_key``, so its
+    session key and its slot key are unrelated strings and only one of them is in
+    any given payload.
+
+    *spend_slot_by_session* is that correspondence -- session key to slot key,
+    the alias :func:`_spend_for_session` already bridges for credits -- and it is
+    read in BOTH directions here, which is what lets one call serve both
+    payloads. A Sessions-table row keyed by session finds its slot spelling
+    through the map; a slots row keyed by slot finds its session spelling through
+    the same map inverted. Each caller therefore passes the SAME map and gets the
+    same edges, where a one-directional read left a channel-born conductor
+    nesting its workers on one surface and orphaning them on the other.
 
     *nodes* is the projection's fold, and each caller passes the one it reads: the
     memory payload takes :meth:`SessionMemorySampler._lineage` (whose companion flag
@@ -171,21 +173,78 @@ def lineage_parents(
     it takes the nodes alone rather than a whole reading -- which is also what keeps it
     from deciding a question that belongs to its caller.
 
-    An empty *nodes* means no row has a creator (the crew log is off, or nothing
-    on disk cites one), and the storage package stays UNIMPORTED on that path:
-    ``parent_payload`` is imported below the early return, so a flag-off boot
-    never loads it. Existing tests pin that.
+    A row the fold holds NO NODE for falls back to the row's OWN ``created_by``, and
+    that is the whole of how a just-dispatched session nests. Such a row is a child
+    between ``session_create`` and its first turn: its crew log needs an ACP session id
+    that arrives with that turn, so nothing in *nodes* can speak for it, and the fold
+    alone leaves it at the top level for as long as runtime and MCP startup take.
+
+    GATED on the row's ``lineage_minted``, which is the load-bearing half.
+    ``created_by`` is written at birth and REHYDRATED from a metadata line an agent's
+    file tools can edit, so alone it is a claim: a fenced agent that wrote a lead's key
+    into an archived transcript would otherwise have that tab nested under the lead the
+    moment it was revived. ``lineage_minted`` says this gateway process stamped the
+    pair at mint -- the same witness the crew log requires before it will record a
+    creator in ``session/opened.parent``. A restored slot answers false and nests
+    nowhere, which is what base already did.
+
+    A node, once it exists, WINS -- including a node whose ``parent_slot`` is ``None``.
+    That absence is not a gap to fill: it is either a session nobody created or one a
+    ``session/released`` deliberately let go, and reading ``created_by`` over it would
+    put back an edge somebody took away, in the one view a person would look at to
+    confirm the release. So the fallback is keyed on the node's EXISTENCE and never on
+    the value inside it.
+
+    The edge becomes a payload through the same :func:`parent_payload` a folded node
+    goes through, on a node built here, so the two cannot nest the same gateway
+    differently: one join, one rule for when the creator's live key is followed.
+
+    *nodes* is handed to :func:`parent_payload` as well, which is what lets a row whose
+    own creator is CLOSED nest under the nearest ancestor still open rather than drop to
+    the top level -- the lead that owns a run stays the row its conductor's workers hang
+    from after the conductor is closed. Such a row carries ``ancestor: True`` and keeps
+    ``slot`` on the closed creator, so a surface reads the nesting off ``key`` and the
+    citation off ``slot``. Both payloads get it from this one call, so neither view can
+    place those workers where the other does not.
+
+    Only the slots payload carries these two fields (``slot_projection.serialize_slot``
+    writes them). The Sessions table's rows come from the session manager's runtime
+    map, so they have neither and this fallback is not reached there -- that view keeps
+    the folded answer alone, which is the behaviour it had before.
+
+    An empty *nodes* means the crew log is off, or nothing on disk cites a creator,
+    and the storage package stays UNIMPORTED on that path: ``parent_payload`` is
+    imported below the early return, so a flag-off boot never loads it. Existing tests
+    pin that. The mint fallback is not reached there either, and that is the right
+    answer rather than a gap: with no folded node anywhere, a creator row would have
+    nothing for the child to nest UNDER.
     """
     if not nodes:
         return {}
     from kiro_crew.crew_log.session_tree import parent_payload
 
+    # Session key -> slot key as given, and slot key -> session key inverted. Built
+    # once per call rather than per row: the map is the whole live registry, and the
+    # inverse is read for every row.
+    #
+    # Last writer wins in the inverse, matching the forward map's own documented rule
+    # for two slots claiming one session identity. A slot has exactly one effective
+    # session key, so the collision this can produce is the same one the forward map
+    # already carries rather than a new one.
+    forward: dict[str, str] = {}
+    inverse: dict[str, str] = {}
+    if isinstance(spend_slot_by_session, dict):
+        for session_key, slot_key in spend_slot_by_session.items():
+            if isinstance(session_key, str) and isinstance(slot_key, str):
+                if session_key and slot_key:
+                    forward[session_key] = slot_key
+                    inverse[slot_key] = session_key
+
     def slot_spellings(row_key: str) -> list[str]:
         spellings = [row_key, _bare_slot_key(row_key)]
-        if isinstance(spend_slot_by_session, dict):
-            aliased = spend_slot_by_session.get(row_key)
-            if isinstance(aliased, str) and aliased:
-                spellings.append(aliased)
+        for extra in (forward.get(row_key), inverse.get(row_key)):
+            if isinstance(extra, str) and extra:
+                spellings.append(extra)
         return spellings
 
     live_key_of: dict[str, str] = {}
@@ -201,8 +260,36 @@ def lineage_parents(
         if not isinstance(key, str) or not key:
             continue
         node = next((nodes[s] for s in slot_spellings(key) if s in nodes), None)
-        out[key] = parent_payload(node, live_key_of, key)
+        if node is None:
+            node = _minted_node(row, key)
+        out[key] = parent_payload(node, live_key_of, key, nodes)
     return out
+
+
+def _minted_node(row: dict[str, object], key: str) -> "TreeNode | None":
+    """A stand-in node from the row's own mint witness, or ``None``.
+
+    Reached only when no spelling of the row's key is in the fold, which is a child
+    that has not opened a log yet.
+
+    Both fields are required and both are judged HERE rather than at the call site, so
+    one place decides what counts as a witnessed creator. ``lineage_minted`` false
+    covers every row that is not one: a person's own tab, a fork, and -- the case that
+    matters -- a slot restored after a restart, whose ``created_by`` came back from an
+    agent-editable transcript and is therefore a claim rather than this gateway's own
+    record.
+    """
+    if not row.get("lineage_minted"):
+        return None
+    creator = row.get("created_by")
+    if not isinstance(creator, str) or not creator or creator == key:
+        # A blank names nobody, and a row naming itself is not an edge.
+        return None
+    from kiro_crew.crew_log.session_tree import TreeNode as _TreeNode
+
+    # ``cycle`` is false because a slot with no log of its own is cited by nothing, so
+    # it can lie on no cycle of citations.
+    return _TreeNode(slot=key, parent_slot=creator, cycle=False)
 
 
 def session_title(key: str, get_slot: Callable[[str], object]) -> dict[str, object]:
@@ -210,7 +297,7 @@ def session_title(key: str, get_slot: Callable[[str], object]) -> dict[str, obje
 
     A session key is opaque (``dashboard:chat-69-1785905004``); the chat it belongs
     to already has an LLM-generated title, and a list keyed by the raw id is
-    unreadable. The mapping is exact — ``state.py`` documents that a slot key
+    unreadable. The mapping is exact — ``state_parts/slot_directory.py`` documents that a slot key
     *becomes* the session key as ``dashboard:{slot.key}``.
 
     Reads ``slot.display_title`` rather than the persisted value, and redacts here.
@@ -244,6 +331,63 @@ def session_title(key: str, get_slot: Callable[[str], object]) -> dict[str, obje
     return {"title": title, "slot_key": slot_key, "untitled": untitled}
 
 
+#: Consecutive faulted samples before the ownership SLI calls a fault confirmed.
+#: TWO, not one: the claim set is read on the event loop and the slice is walked
+#: in the executor, so the two halves describe different instants and ordinary
+#: churn produces a one-sample fault -- a session spawning between them is in the
+#: slice and not in the claims, one exiting between them is claimed and not alive.
+#: Neither is a leak. A real leak does not heal, so it survives the next poll,
+#: while churn does not; two samples is the smallest window that tells them apart.
+#: At the page's 5s poll that is about ten seconds to a confirmed alarm.
+_OWNERSHIP_CONFIRM_SAMPLES = 2
+
+#: The manager accessors whose pids count as claimed, beyond the session rows
+#: themselves. Named rather than inlined so a test can pin this list against
+#: ``session_cleanup._active_pids``: a claim source present there and missing
+#: here turns a well-owned runtime into a reported leak.
+_CLAIM_SOURCES = ("_pool_pids", "_in_flight_pids", "_companion_runtime_pids")
+
+
+def _claimed_pids(sessions: "SessionManager", rows: Iterable[Mapping[str, object]]) -> set[int]:
+    """Every pid something claims as a runtime it owns.
+
+    The SAME union the periodic sweep protects with
+    (``session_cleanup._active_pids``): the session rows themselves, plus the
+    warm pool, plus runtimes whose spawn is still in flight, plus companion
+    (sub-agent) runtimes. Assembled from the manager's own accessors rather than
+    by calling the sweep's private helper, so the two readers stay independent --
+    but the sources must stay the same four, because a source missing HERE shows
+    up as a leaked process that is in fact perfectly well owned.
+    ``test_the_claim_union_matches_the_sweeps_own_sources`` pins the two equal.
+
+    In-memory only: every accessor reads a dict the manager already holds, so
+    this is safe on the event loop. The FILESYSTEM half of the ownership
+    question (enumerating the slice, testing each pid) is deliberately not here
+    -- it runs in :meth:`SessionMemorySampler._blocking_sample`.
+
+    An accessor that is absent or raises is skipped rather than fatal: a claim
+    source this cannot read would otherwise turn into a false leak report, which
+    is the one way an SLI whose whole purpose is "non-zero means investigate"
+    becomes noise. A partial claim set can still over-report, so the skip is
+    logged.
+    """
+    claimed: set[int] = set()
+    for row in rows:
+        pid = row.get("pid")
+        if isinstance(pid, int):
+            claimed.add(pid)
+    for accessor in _CLAIM_SOURCES:
+        probe = getattr(sessions, accessor, None)
+        if probe is None:
+            logger.debug("slice ownership: claim source %s absent", accessor)
+            continue
+        try:
+            claimed.update(int(pid) for pid in probe())
+        except Exception:
+            logger.debug("slice ownership: claim source %s failed", accessor, exc_info=True)
+    return claimed
+
+
 class SessionMemorySampler:
     """Samples per-session memory, holding only the state a single observation
     cannot provide (CPU baseline + load history)."""
@@ -257,6 +401,11 @@ class SessionMemorySampler:
         # that is allowed to run (see ``_lineage``). Owned here so the cache lives
         # as long as the sampler does, one per gateway.
         self._tree: Optional["SessionTree"] = None
+        # Consecutive polls whose ownership reading was faulted. Lives on the
+        # sampler because confirmation needs memory the probe itself must not
+        # have: ``slice_ownership`` is a pure function of one instant, and one
+        # instant cannot tell a leak from churn.
+        self._ownership_faults = 0
 
     def _lineage(self, rows: list[dict[str, object]]) -> "tuple[dict[str, TreeNode], bool, int]":
         """Who opened whom; whether the store held more session logs than a scan
@@ -283,7 +432,7 @@ class SessionMemorySampler:
         the dashboard's boot path, so the projection is imported here, lazily, and
         only once the flag says there is a store to read -- the same split the
         emitter and the crew-log routes keep, pinned by the tests that launch with
-        the flag unset and assert the package never loaded. Asking the emitter is
+        the flag off and assert the package never loaded. Asking the emitter is
         the one import that is safe: it is pure glue and loads nothing until a write
         or a read reaches storage.
         """
@@ -356,6 +505,24 @@ class SessionMemorySampler:
         its meaning. What changes is that they now describe one set of processes
         observed once, which is what the shared walker's own docstring says a
         single frontier is for.
+
+        A command line is matched through ``platform_compat.process_matches``,
+        which is the helper the cross-platform table names for that question, so
+        the stub count asks it the one way this repository asks it.
+
+        **Every figure here is UNCAPPED, and that is the ruling, not an
+        oversight.** The shared walker bounds its own frontier at
+        ``platform_compat._SUBTREE_MAX_PROCS``; that ceiling guards a looping or
+        pathological ``/proc`` graph, which this walk is already immune to for a
+        different reason -- it visits each pid at most once. Adopting the number
+        here would therefore bound the FIGURE rather than the work, and a bounded
+        figure is the worse of the two failures: a truncated count reaches the
+        card as a plain integer no consumer can tell from a complete one, so the
+        surface presents it as exact, while ``None`` is this payload's way of
+        saying UNMEASURABLE. A count that is slow is recoverable; a count that is
+        wrong and looks authoritative is not. Should the walk's cost ever need a
+        bound, the bound that keeps that meaning intact is a work or time budget
+        that yields ``None`` on exhaustion -- never a ceiling that truncates.
         """
         procs: Optional[int] = None
         stubs: Optional[int] = None
@@ -363,7 +530,7 @@ class SessionMemorySampler:
             tree = _iter_descendant_pids(pid, children=children)
             rss_mb = _get_rss_tree_mb(pid, pids=tree)
             procs = len(tree)
-            stubs = sum(1 for p in tree if _STUB_MARKER in _read_cmdline(p))
+            stubs = sum(1 for p in tree if process_matches(p, (_STUB_MARKER,)))
             cpu = self._cpu_cores(pid, now, pids=tree)
         else:
             # No descendant set to reuse: the other platforms reach the total
@@ -377,7 +544,11 @@ class SessionMemorySampler:
             "cpu_cores": cpu,
         }
 
-    def _blocking_sample(self, rows: list[dict[str, object]]) -> dict[str, object]:
+    def _blocking_sample(
+        self,
+        rows: list[dict[str, object]],
+        claimed_pids: Iterable[int] = (),
+    ) -> dict[str, object]:
         """Sample every distinct pid ONCE, then the machine-wide extras.
 
         One descendant pass per distinct pid, for the RSS total and the process
@@ -430,6 +601,14 @@ class SessionMemorySampler:
         lineage_started = time.perf_counter()
         lineage = self._lineage(rows)
         lineage_ms = (time.perf_counter() - lineage_started) * 1000.0
+        # The ownership SLI's filesystem half: enumerating the slice walks every
+        # descendant cgroup's ``cgroup.procs``, and each claimed pid is tested for
+        # liveness. Both belong on this side of the executor hop for the reason
+        # the whole function exists -- the coroutine that calls it runs on the
+        # gateway's event loop, on a 5s browser poll.
+        ownership_started = time.perf_counter()
+        slice_ownership = resource_status.slice_ownership(claimed_pids).as_dict()
+        ownership_ms = (time.perf_counter() - ownership_started) * 1000.0
 
         return {
             "per_pid": out,
@@ -439,19 +618,58 @@ class SessionMemorySampler:
             # for the same reason as the two above: it lists and stats every
             # session log's directory.
             "lineage": lineage,
+            "slice_ownership": slice_ownership,
             # Where this call's wall time went, per phase, so a latency complaint
             # about this page can be attributed instead of guessed at. Measured
-            # around the three blocking phases individually because they have
+            # around the blocking phases individually because they have
             # different costs and different fixes: a /proc walk per session tree, a
-            # shard-window read, and a directory listing plus a stat per session
-            # log. ``perf_counter`` rather than ``monotonic``: this measures short
-            # durations, which is the counter's stated purpose.
+            # shard-window read, a directory listing plus a stat per session
+            # log, and a cgroup subtree walk. ``perf_counter`` rather than
+            # ``monotonic``: this measures short durations, which is the
+            # counter's stated purpose.
             "timings_ms": {
                 "proc": round(proc_ms, 1),
                 "spend": round(spend_ms, 1),
                 "lineage": round(lineage_ms, 1),
+                "slice_ownership": round(ownership_ms, 1),
             },
         }
+
+    def _confirm_ownership(self, reading: object) -> dict[str, object]:
+        """Add ``confirmed`` to an ownership reading, and gate ``healthy`` on it.
+
+        The counts pass through as measured -- they are what the probe saw. What
+        this decides is whether they have been seen for long enough to mean
+        anything, because the reading's two halves describe different instants
+        (see :data:`_OWNERSHIP_CONFIRM_SAMPLES`) and a single faulted sample is
+        as likely to be a session starting or stopping mid-poll as a real leak.
+
+        ``confirmed`` is the field a UI or an alert should read. A clean sample
+        resets the streak, so churn's one-off faults cannot accumulate across
+        unrelated polls into a confirmation they never earned.
+
+        An UNREADABLE slice is neither: it accumulates nothing, and reports
+        ``confirmed`` false with ``healthy`` false, because a host whose slice
+        cannot be enumerated has not been shown clean and has not been shown
+        faulted either.
+        """
+        if not isinstance(reading, dict):  # pragma: no cover - defensive
+            return {"readable": False, "confirmed": False, "healthy": False}
+        out = dict(reading)
+        if not out.get("readable"):
+            self._ownership_faults = 0
+            out["confirmed"] = False
+            out["healthy"] = False
+            return out
+        faulted = bool(out.get("unowned_alive")) or bool(out.get("owned_dead"))
+        self._ownership_faults = self._ownership_faults + 1 if faulted else 0
+        confirmed = self._ownership_faults >= _OWNERSHIP_CONFIRM_SAMPLES
+        out["confirmed"] = confirmed
+        # A suspected fault reads healthy: the alarm is ``confirmed``, and saying
+        # "unhealthy" on a reading this module itself calls transient is the cry
+        # of wolf the streak exists to prevent.
+        out["healthy"] = not confirmed
+        return out
 
     def _prune_cpu_baselines(self, live_pids: set[object]) -> None:
         """Drop baselines for pids that are gone, so the dict cannot grow without
@@ -488,8 +706,12 @@ class SessionMemorySampler:
         """
         total_started = time.perf_counter()
         rows = sessions.runtime_pids()
+        # The claim union is assembled HERE because every source is an in-memory
+        # dict on the manager; the ownership probe's filesystem half (enumerating
+        # the slice, testing each pid) rides the executor hop below.
+        claimed_pids = _claimed_pids(sessions, rows)
         samples = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), self._blocking_sample, rows
+            subprocess_executor(), self._blocking_sample, rows, claimed_pids
         )
         per_pid = samples["per_pid"]
         assert isinstance(per_pid, dict)
@@ -560,8 +782,21 @@ class SessionMemorySampler:
                     "channel": telemetry_channel_of(key if isinstance(key, str) else None),
                     "pid": pid,
                     "owns_runtime": row.get("owns_runtime"),
+                    # How many live sessions this runtime serves, 1 when
+                    # exclusive. Published because ``owns_runtime`` answers a
+                    # different question -- it is false only on the JOINERS, so a
+                    # consumer reading it as "shared?" misses the founder -- and
+                    # because an aggregate over rows needs a per-runtime key to
+                    # add ``procs``/``mcp`` once instead of once per co-tenant.
+                    "sharers": share,
                     "prompts": row.get("prompts"),
                     "rss_mb": rss_row,
+                    # NOT divided, unlike rss/cpu two lines away. These count
+                    # real objects on the runtime -- descendant processes and MCP
+                    # stubs -- and a third of three processes is not a third of a
+                    # measurement, it is a number that describes nothing. Each
+                    # row states the runtime's true figure; ``sharers`` is what
+                    # lets a consumer add it once per runtime.
                     "procs": (sample or {}).get("procs"),
                     "mcp": (sample or {}).get("mcp"),
                     "cpu_cores": cpu_row,
@@ -603,6 +838,13 @@ class SessionMemorySampler:
                 # Surfaced so the UI can label the number as a ceiling rather
                 # than implying exact attribution.
                 "rss_is_upper_bound": True,
+                # Ownership health of the agent slice: agent processes nothing
+                # claims, and claims on pids that are not running. Either above
+                # zero is an alarm; see ``resource_status.SliceOwnership``.
+                # Published here because this payload is already the page's one
+                # per-poll read of live runtime state, so the SLI costs no second
+                # poll and lands beside the rows it is about.
+                "slice_ownership": self._confirm_ownership(samples["slice_ownership"]),
                 # Whether the store held more session logs than the lineage
                 # scan admits (TREE_UNIT_CAP, sent beside it so the page can
                 # say "N+"). Live rows' logs are admitted first, so what went

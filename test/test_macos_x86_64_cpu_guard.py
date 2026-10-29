@@ -6,6 +6,10 @@ import sys
 
 import pytest
 
+# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+# so the shared macOS handle caches are put back after each one (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
+
 
 @pytest.mark.skipif(
     sys.platform != "darwin" or __import__("platform").machine() != "x86_64",
@@ -99,6 +103,13 @@ def test_load_llama_proceeds_past_guard_when_macos_x86_64_capable(monkeypatch, t
         # All flags present — guard must NOT block
         monkeypatch.setattr(emb, "_macos_x86_64_missing_cpu_flags", lambda: [])
 
+        # The loader itself sets this key once the guard passes
+        # (``os.environ.setdefault(_LIB_PATH_ENV, ...)``), and a ``delenv`` of a key
+        # that is ABSENT records nothing to undo -- so the fake libs path outlived
+        # the test on every worker that ran it (the sweep's ``env_leak`` row for
+        # this file). Plant the key first: that undo entry is what removes whatever
+        # the loader leaves behind.
+        monkeypatch.setenv("LLAMA_CPP_LIB_PATH", "")
         monkeypatch.delenv("LLAMA_CPP_LIB_PATH", raising=False)
 
         # The import of llama_cpp will fail (fake libs), but the guard must not

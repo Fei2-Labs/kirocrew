@@ -45,6 +45,25 @@ what gets sent for something no gate here ever saw.
 upload, and each one exists because the reply text is not trustworthy input -- a
 prompt-injected agent chooses what it writes:
 
+* a containment check against the approved roots (:func:`approved_roots`):
+  the provider's working directory the channel authorized, plus the browser
+  CLI's own output directory. Anywhere else -- ``![x](~/Pictures/id.png)`` --
+  is refused before a single metadata probe, because "any readable raster on
+  the host" is not what the reader of a chat channel agreed to receive. The
+  browser directory is admitted because it holds only what ``playwright-cli``
+  wrote while the agent drove it, and because the gateway pins that directory
+  under its data home (:func:`kiro_crew.browser_cli.snapshots.snapshot_dir`)
+  rather than under any working directory, so a screenshot the agent was asked
+  to send could otherwise never be sent inline -- and admitting it grants
+  nothing the explicit ``file_send`` tool does not already deliver from that
+  same directory. The read below is pinned to whichever root admitted the
+  path, so a linked ancestor inside one root cannot reach outside it -- and the
+  browser root is pinned by its CANONICAL spelling (real data home, literal
+  leaf), so replacing the snapshot directory itself with a link admits nothing.
+  A channel that passes it also admits the session's own ``$KIROCREW_SCRATCH``
+  directory (:func:`session_scratch_root`), where the agent is told to stage
+  screenshots: one allocation under the managed scratch root, pinned the same
+  canonical way, never the managed root or another runtime's allocation
 * a denylist check (:func:`kiro_crew.security.is_sensitive_path`), so
   ``![x](~/.aws/credentials)`` cannot be turned into an upload
 * a refusal to follow a symlink, so the bytes come from the inode the written
@@ -74,21 +93,27 @@ All filesystem work here is blocking, so async callers MUST use
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kiro_crew.agent_scratch import scratch_root as managed_scratch_root
+from kiro_crew.browser_cli.snapshots import snapshot_dir
 from kiro_crew.hooks import (
     FileTooLargeError,
     is_unc_shape,
     safe_read_file_bytes_nolink,
+    screen_windows_linked_ancestors,
     unc_probe_allowed,
 )
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.messaging.split import iter_fence_spans
-from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
+from kiro_crew.platform import binary_content_is_flagged
+from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -110,6 +135,79 @@ logger = logging.getLogger(__name__)
 #: match, and the image is never seen at all.
 IMAGE_MD_RE = re.compile(r"!\[((?:[^\]\\]|\\.)*)\]\(")
 
+
+@dataclass(frozen=True)
+class ImageOpener:
+    """One ``![alt](`` opener, as :data:`IMAGE_MD_RE` would match it."""
+
+    #: Offset of the ``!``.
+    start: int
+    #: Offset just past the ``(``, where the destination begins.
+    end: int
+    #: The alt text as written, escapes intact (the pattern's group 1).
+    alt: str
+
+
+def _label_run_end(text: str, start: int) -> int:
+    r"""Where the label run of the opener at *start* stops.
+
+    The run is :data:`IMAGE_MD_RE`'s ``(?:[^\]\\]|\\.)*`` read by hand: any
+    character but ``]`` and a backslash, or a backslash followed by any character
+    except a line break. Scanned here rather than by the pattern so that no regex
+    is ever retried over the text.
+    """
+    i = start + 2
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "]":
+            break
+        if ch == "\\":
+            if i + 1 < n and text[i + 1] != "\n":
+                i += 2
+                continue
+            break
+        i += 1
+    return i
+
+
+def _image_label(text: str, start: int) -> tuple[ImageOpener | None, int]:
+    """The opener at *start* if its label closes with ``](``, and where its run stops.
+
+    The label run is tokenised the same way from every opener inside it: an
+    inner ``![`` is either an escaped ``\\!`` or a plain ``!`` followed by a plain
+    ``[``, so the token after it starts at the same offset in both runs. Every
+    opener inside the run therefore stops where this one stops and closes (or
+    fails to close) exactly as this one does, which is what lets a caller skip
+    the whole run after one attempt instead of rescanning it from each opener.
+    """
+    run_end = _label_run_end(text, start)
+    if text.startswith("](", run_end):
+        return ImageOpener(start, run_end + 2, text[start + 2 : run_end]), run_end
+    return None, run_end
+
+
+def iter_image_matches(text: str) -> Iterator[ImageOpener]:
+    """Yield the openers ``IMAGE_MD_RE.finditer(text)`` matches, in linear time.
+
+    ``finditer`` retries the pattern from every ``![``, and each failed attempt
+    scans the rest of the label run, so text made of many unclosed openers costs
+    quadratic time. Here a failed attempt skips its whole run (see
+    :func:`_image_label`), so each character is scanned a bounded number of times.
+    """
+    pos = 0
+    while True:
+        start = text.find("![", pos)
+        if start < 0:
+            return
+        opener, run_end = _image_label(text, start)
+        if opener is not None:
+            yield opener
+            pos = opener.end
+        else:
+            pos = max(run_end, start + 2)
+
+
 #: Unwraps a markdown backslash escape to the character it escaped.
 _MD_ESCAPE_RE = re.compile(r"\\(.)")
 
@@ -117,6 +215,13 @@ _MD_ESCAPE_RE = re.compile(r"\\(.)")
 #: backslash before anything else is a literal -- most importantly a Windows path
 #: separator (``C:\Users\me\shot.png``).
 _MD_ESCAPABLE = frozenset("()[]\\<>\"'")
+
+#: Deepest parenthesis nesting a destination may hold, its own opening ``(``
+#: counted as the first level, so 32 nested pairs inside it are allowed as in
+#: cmark. A ``(`` past it makes the destination unclosable. No real path nests
+#: that deep, and the bound is what keeps a text of nested images linear: a
+#: character can then sit inside at most this many destinations that are walked.
+_MAX_DESTINATION_PAREN_DEPTH = 33
 
 #: Prefixes of destinations that are not a local file. NOT the classifier: `//`
 #: is ambiguous, so this tuple is a necessary condition and not a sufficient
@@ -302,40 +407,87 @@ def _walk_destination(rest: str) -> tuple[str | None, int]:
     (:data:`_MD_ESCAPABLE`): a native Windows path is ``C:\\Users\\me\\shot.png``,
     and treating every backslash as an escape strips the separators and leaves a
     path that cannot resolve.
+
+    :func:`kiro_crew.constants.md_link_destination` is the parenthesis grammar of
+    this walk as a regex unit, bounded to one nesting level with escaped
+    parentheses and a ``[`` that opens a nested ``[label](`` refused, for the channel
+    renderers and the display-safety screen that compose it into one ``re.sub``
+    pass. Wherever it matches it closes at the
+    same ``)`` as this walk; only the text can differ, because this walk drops the
+    backslash of an escaped non-parenthesis character and :func:`_finish_destination`
+    rewrites or rejects what it collected once the close is found. Neither moves the end.
+    ``test/test_markdown_link_parentheses.py`` pins the shared end.
     """
     depth = 1
     out: list[str] = []
+    # Indices into `out` of characters that arrived escaped, so the finish can
+    # tell a `\>` in the path from the `>` that closes a `<...>` wrap.
+    escaped: set[int] = set()
     i = 0
     while i < len(rest):
         ch = rest[i]
         if ch == "\\" and i + 1 < len(rest) and rest[i + 1] in _MD_ESCAPABLE:
             # A real markdown escape: keep the escapee, and never let it move the
             # paren depth.
+            escaped.add(len(out))
             out.append(rest[i + 1])
             i += 2
             continue
         if ch == "(":
             depth += 1
+            if depth > _MAX_DESTINATION_PAREN_DEPTH:
+                return None, 0
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return _finish_destination("".join(out)), i + 1
+                return _finish_destination("".join(out), escaped), i + 1
         out.append(ch)
         i += 1
     return None, 0
 
 
-def _finish_destination(raw: str) -> str | None:
-    """Strip the optional ``<...>`` wrapper or trailing ``"title"`` from *raw*."""
+def angle_wrap_close(markup: str, start: int, limit: int) -> int:
+    """Index of the first unescaped ``>`` in ``markup[start:limit]``, or ``-1``.
+
+    *markup* is RAW markdown and *start* is just past a destination's opening
+    ``<``. A backslash before a character in :data:`_MD_ESCAPABLE` makes the pair
+    one token, so the ``\\>`` the composer writes for a ``>`` in a path never
+    closes the wrap -- the same tokenisation :func:`_walk_destination` uses, so a
+    caller that cuts the raw markup closes the wrap where the scanner did.
+    """
+    i = start
+    while i < limit:
+        ch = markup[i]
+        if ch == "\\" and i + 1 < limit and markup[i + 1] in _MD_ESCAPABLE:
+            i += 2
+            continue
+        if ch == ">":
+            return i
+        i += 1
+    return -1
+
+
+def _finish_destination(raw: str, escaped: set[int] | frozenset[int] = frozenset()) -> str | None:
+    """Strip the optional ``<...>`` wrapper or trailing ``"title"`` from *raw*.
+
+    *escaped* holds the indices of *raw* whose character arrived backslash-escaped;
+    an escaped ``>`` is part of the path, never the close of a ``<...>`` wrap.
+    """
     if "\r" in raw or "\n" in raw:
         return None
     dest = raw.strip()
+    lead = len(raw) - len(raw.lstrip())
     # `<...>` is markdown's explicit way to write a destination containing spaces
     # (`![c](</tmp/generated images/c.png>)`). Unwrap it and DON'T split on
     # whitespace: inside the brackets a space is part of the path, not the
     # separator before a `"title"`.
     if dest.startswith("<"):
-        end = dest.find(">")
+        # The wrap closes at the first UNESCAPED `>`, as in CommonMark: the
+        # composer writes a `>` in the path as `\>` (a POSIX data home `a>b`).
+        end = next(
+            (j for j, ch in enumerate(dest) if ch == ">" and j + lead not in escaped),
+            -1,
+        )
         if end == -1:
             return None  # unterminated -- don't guess at the path
         dest = dest[1:end].strip()
@@ -357,25 +509,246 @@ def md_destination(rest: str) -> str | None:
     return _walk_destination(rest)[0]
 
 
+class _ParenIndex:
+    """The ``)`` that closes each ``(`` of one text, under :func:`_walk_destination`'s rules.
+
+    Built in one pass, so finding where a destination ends is a lookup rather
+    than a walk to the end of the text from every image. The tokenisation is the
+    walk's: a backslash before a character in :data:`_MD_ESCAPABLE` makes the pair
+    one token that never moves the depth. A ``(`` maps to nothing when no ``)``
+    closes it before the next line break -- a destination holding a line break is
+    refused by :func:`_finish_destination` however it closes -- or when the walk
+    from it would pass :data:`_MAX_DESTINATION_PAREN_DEPTH` first. Each character
+    then lies inside at most that many destinations that are walked, so walking
+    every image's destination stays linear in the text.
+
+    The index is exact for a destination that starts right after the ``(`` of an
+    :data:`IMAGE_MD_RE` opener: that ``(`` follows a ``]``, never a backslash, so
+    it is a token of its own here exactly as it is for a walk started after it.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._close: dict[int, int] = {}
+        stack: list[int] = []
+        # Positions whose walk stops on the depth cap before it closes: a ``(`` at
+        # stack index ``s`` is that deep once the stack holds
+        # ``s + _MAX_DESTINATION_PAREN_DEPTH + 1`` entries.
+        capped: set[int] = set()
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\\" and i + 1 < n and text[i + 1] in _MD_ESCAPABLE:
+                i += 2
+                continue
+            if ch == "(":
+                stack.append(i)
+                deep = len(stack) - _MAX_DESTINATION_PAREN_DEPTH - 1
+                if deep >= 0:
+                    capped.add(stack[deep])
+            elif ch == ")":
+                if stack:
+                    opened = stack.pop()
+                    if opened not in capped:
+                        self._close[opened] = i
+            elif ch in "\r\n":
+                stack.clear()
+            i += 1
+
+    def walk(self, text: str, start: int) -> tuple[str | None, int]:
+        """:func:`_walk_destination` of ``text[start:]``, where ``text[start - 1]`` is ``(``."""
+        close = self._close.get(start - 1)
+        if close is None:
+            return None, 0
+        return _walk_destination(text[start : close + 1])
+
+
+def iter_image_destinations(text: str) -> Iterator[tuple[ImageOpener, str | None, int]]:
+    """Each :func:`iter_image_matches` match with its walked destination and length.
+
+    The destination is ``md_destination(text[opener.end:])``. The length is
+    what that walk consumed when the destination is set; callers read it only
+    then, and it may be ``0`` when the destination is ``None``. Both come
+    through :class:`_ParenIndex`, so many images in one text do not each re-walk
+    the rest of it.
+    """
+    index: _ParenIndex | None = None
+    for opener in iter_image_matches(text):
+        if index is None:
+            index = _ParenIndex(text)
+        dest, consumed = index.walk(text, opener.end)
+        yield opener, dest, consumed
+
+
 def _inside(offset: int, spans: list[tuple[int, int]]) -> bool:
     return any(start <= offset < end for start, end in spans)
 
 
+def seam_carries_markup_debt(source_head: str, tail: str) -> bool:
+    r"""True when sealing *source_head* away changes how the extraction reader
+    classifies the literalness of the point where *tail* resumes.
+
+    This is the ONE seam check for a stream splitter that seals a prefix chunk
+    and continues a live tail (Discord's ``_rotate_on_length``). The tail is
+    later scanned ALONE by :func:`iter_local_refs`, and a marker ANYWHERE in it
+    is judged by :func:`_literal_image_marker` reading the tail with the sealed
+    prefix gone. In the full source that same marker is judged with the prefix
+    still present. A LEAK is exactly a disagreement between the two readings:
+
+      * the full text reads a marker LITERAL (an unclosed inline-code run, an
+        odd backslash escape, an open fence, or a four-wide indent opened in the
+        sealed prefix still covers it) but the tail alone reads it REAL -- the
+        semantic seal then uploads a file the author wrote as literal text; or
+      * the full text reads a marker REAL but the tail alone reads it LITERAL
+        (a mid-line cut left the tail beginning tab-led, so the tail reads as
+        indented code while the source line was not indented) -- the seal drops
+        it and ships the raw local path as display text.
+
+    Rather than enumerate opener families (backtick, backslash, fence, indent)
+    and re-derive each at the seam -- the losing game that drew one review block
+    per family -- this asks two questions, both answered by the extraction
+    reader's own primitives:
+
+      1. Does the sealed prefix END INSIDE an open inline-code span? The tail is
+         sealed later WITHOUT the prefix, possibly across more than one further
+         seal, so any inline-code span the prefix opens and never closes is lost
+         the instant the prefix is sealed away. A marker the full text keeps
+         literal because that span still covers it (``\`\`example ... \`![a]\`
+         and ![b]() ... \`\``) then reads REAL once the tail is scanned alone.
+         The ref-set at the rotation seam cannot see this -- the tail still
+         carries the closing delimiter AT THAT INSTANT -- so it must be caught as
+         an open opener in the prefix. ``mask_inline_code`` masks only balanced
+         inline-code pairs, so a surviving backtick in the masked prefix is
+         exactly an opener with no closer before the seam. The mask is bounded to
+         the seam's own blank-line block via :func:`_block_bounds`, the SAME
+         segmentation the reader uses -- masking the whole prefix instead would
+         pair two unmatched backticks in separate paragraphs and miss a still-open
+         opener in the seam's own block.
+      2. Does a synthetic marker at the tail's own resume point (first line, past
+         leading whitespace) classify differently with the prefix present than
+         without it? This covers escape debt, a four-wide indent flip in either
+         direction (including the tab-led tail, where the reader keys its indent
+         verdict off the marker's column), and any fence/inline opener that
+         changes the FIRST line's reading -- present or arriving later.
+
+    Any disagreement degrades. ``_literal_image_marker`` folds all four contexts
+    with the block segmentation the real reader uses. Empty inputs return False.
+    """
+    if not source_head or not tail:
+        return False
+    # Check 1: an inline-code opener in the sealed prefix with no closer before
+    # the seam. A backtick INSIDE a fenced span is the fence's own delimiter, not
+    # an inline opener, and the fence-aware per-chunk span scan owns that case --
+    # so a seam sitting inside an open fence is literal in both readings and
+    # skipped here. Otherwise the mask must be BLOCK-BOUNDED exactly as the
+    # extraction reader bounds it: a surviving backtick is only debt when it
+    # opened in the SAME blank-line-bounded block the seam ends in. Masking the
+    # whole post-fence prefix instead crossed blank-line boundaries the reader
+    # treats as block breaks, so two unmatched backticks in separate paragraphs
+    # cancelled each other and a still-open opener in the seam's own block went
+    # unseen. ``_block_bounds`` is the reader's own segmentation, shared so the
+    # two cannot drift; the block that HOLDS the seam is the one ending at it, so
+    # the last character of the sealed prefix (offset ``seam - 1``) selects it.
+    seam = len(source_head)
+    fenced = list(iter_fence_spans(source_head))
+    if any(start < seam <= end for start, end in fenced):
+        pass  # seam inside an open fence: owned by the per-chunk span scan
+    else:
+        block_start, _block_end = _block_bounds(source_head, seam - 1, fenced)
+        if "`" in mask_inline_code(source_head[block_start:seam]):
+            return True
+    # Check 2: a synthetic probe at the tail's first-line resume point. Placed
+    # past leading newlines and the first line's own indentation, because the
+    # reader keys its indent/inline verdict off the marker's column within its
+    # line; a probe at raw column 0 would erase the tab-led-tail indentation
+    # debt this must catch.
+    probe = "![]("
+    base = len(source_head)
+    newlines = len(tail) - len(tail.lstrip("\n"))
+    first_line = tail[newlines:].split("\n", 1)[0]
+    indent = len(first_line) - len(first_line.lstrip(" \t"))
+    at = newlines + indent
+    tail_probe = tail[:at] + probe + tail[at:]
+    full_probe = source_head + tail_probe
+    tail_verdict = _literal_image_marker(tail_probe, at, list(iter_fence_spans(tail_probe)))
+    full_verdict = _literal_image_marker(full_probe, base + at, list(iter_fence_spans(full_probe)))
+    return tail_verdict != full_verdict
+
+
+#: Blank-line block divider -- a lone paragraph break, the same boundary the
+#: upload extraction reader uses to bound an inline-code block.
+_BLANK_LINE_RE = re.compile(r"\n[ \t]*\r?\n")
+
+
+def _block_bounds(text: str, offset: int, fenced: list[tuple[int, int]]) -> tuple[int, int]:
+    """The ``[start, end)`` of the inline-code block that holds *offset*.
+
+    A block is bounded by fenced spans and blank lines -- the segmentation the
+    extraction reader keys its inline-code verdict off. Shared by
+    :func:`_literal_image_marker` (which masks the block that holds a marker) and
+    :func:`seam_carries_markup_debt` (which masks the block a sealed prefix ends
+    in) so the two cannot drift into disagreeing about where a block begins.
+    """
+    return _MarkerReader(text, fenced).block_bounds(offset)
+
+
 def _literal_image_marker(text: str, offset: int, fenced: list[tuple[int, int]]) -> bool:
-    prefix = text[:offset]
-    escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2 == 1
-    line_start = text.rfind("\n", 0, offset) + 1
-    line = text[line_start:].split("\n", 1)[0]
-    column = offset - line_start
-    boundaries = [*fenced, *(m.span() for m in re.finditer(r"\n[ \t]*\r?\n", text))]
-    block_start = max((end for start, end in boundaries if end <= offset), default=0)
-    block_end = min((start for start, end in boundaries if start > offset), default=len(text))
-    return (
-        escaped
-        or _inside(offset, fenced)
-        or line[:column].expandtabs(4).startswith("    ")
-        or mask_inline_code(text[block_start:block_end])[offset - block_start] == " "
-    )
+    return _MarkerReader(text, fenced).literal(offset)
+
+
+class _MarkerReader:
+    """Whether a marker in one text is literal, in O(log n) per marker after one linear pass.
+
+    The verdict is :func:`_literal_image_marker`'s: an odd backslash run before
+    the marker, a fenced span, a four-wide indent, or an inline-code span in the
+    marker's block. The whole-text work behind it -- block boundaries, line
+    starts, the inline-code mask of each block -- is done once per text and
+    reused, so a scan that asks about every marker in a long text stays linear
+    instead of re-reading the text once per marker.
+    """
+
+    def __init__(self, text: str, fenced: list[tuple[int, int]]) -> None:
+        self._text = text
+        self._fenced_starts = [start for start, _end in fenced]
+        self._fenced_ends = [end for _start, end in fenced]
+        boundaries = [*fenced, *(m.span() for m in _BLANK_LINE_RE.finditer(text))]
+        self._boundary_starts = sorted(start for start, _end in boundaries)
+        self._boundary_ends = sorted(end for _start, end in boundaries)
+        self._newlines = [m.start() for m in re.finditer("\n", text)]
+        self._masks: dict[tuple[int, int], str] = {}
+
+    def block_bounds(self, offset: int) -> tuple[int, int]:
+        # Latest boundary end at or before *offset*; earliest boundary start after it.
+        i = bisect.bisect_right(self._boundary_ends, offset)
+        start = self._boundary_ends[i - 1] if i else 0
+        j = bisect.bisect_right(self._boundary_starts, offset)
+        end = self._boundary_starts[j] if j < len(self._boundary_starts) else len(self._text)
+        return start, end
+
+    def _fenced(self, offset: int) -> bool:
+        # Fenced spans are ordered and never overlap, so only the last one
+        # starting at or before *offset* can hold it.
+        i = bisect.bisect_right(self._fenced_starts, offset) - 1
+        return i >= 0 and offset < self._fenced_ends[i]
+
+    def literal(self, offset: int) -> bool:
+        text = self._text
+        backslashes = 0
+        while offset - backslashes > 0 and text[offset - backslashes - 1] == "\\":
+            backslashes += 1
+        if backslashes % 2 == 1 or self._fenced(offset):
+            return True
+        i = bisect.bisect_left(self._newlines, offset)
+        line_start = self._newlines[i - 1] + 1 if i else 0
+        # Four columns of indent depend on at most the first four characters,
+        # since every character expands to at least one column.
+        if text[line_start : min(offset, line_start + 4)].expandtabs(4).startswith("    "):
+            return True
+        bounds = self.block_bounds(offset)
+        mask = self._masks.get(bounds)
+        if mask is None:
+            mask = self._masks[bounds] = mask_inline_code(text[bounds[0] : bounds[1]])
+        return mask[offset - bounds[0]] == " "
 
 
 #: Windows extended-length path prefix (``\\?\``). ``os.readlink`` returns a
@@ -436,16 +809,152 @@ def local_destination(raw_dest: str) -> Path | None:
     return path
 
 
-def _payload_passes_redaction(data: bytes) -> bool:
-    """Whether the exact outbound bytes pass both mandatory egress scanners."""
+def _payload_is_flagged(data: bytes) -> bool:
+    """Whether the shared binary egress scan flags the exact outbound bytes.
+
+    Delegates the whole decision to ``platform.binary_content_is_flagged`` -- the
+    one binary-content scan every file-delivery gate shares -- so this leg and
+    those gates give one answer to one question. Two things follow from the
+    delegation rather than from anything written here: a credential at UTF-16 or
+    UTF-32 spacing is seen, because that scan ends in
+    ``platform.wide_content_is_flagged``, and a container's own standard symbol
+    table does not count as a credential, because that scan re-asks its positive
+    with those tables masked. Both are properties of the shared scan, which is
+    exactly why the decision belongs there and not here.
+
+    This function holds no detector and no decode. All it adds is the refusal
+    conversion this leg's contract needs: :func:`extract_local_refs` must never
+    raise, since a reply has to go out even when nothing about its attachments can
+    be decided, so a scan that cannot answer becomes a flagged verdict here rather
+    than an exception. Flagged is the fail-closed direction: the caller turns it
+    into a rejection and the bytes stay on the host. A composed host whose
+    credential policy fails to load therefore refuses the upload, which is the
+    same answer it gives the owner-facing gates by raising.
+
+    Synchronous, like the scan it calls: the module's async callers reach it
+    through :func:`extract_local_refs_off_loop`, which already runs this whole
+    path in a thread, so the CPU work stays off the event loop.
+    """
     try:
-        source = data.decode("latin-1")
-        checked, _ = redact_exfiltration_urls(source)
-        checked, _ = redact_credentials(checked)
+        return binary_content_is_flagged(data)
     except Exception:
         logger.warning("outbound file payload scan failed", exc_info=True)
-        return False
-    return checked == source
+        return True
+
+
+@dataclass(frozen=True)
+class ApprovedRoot:
+    """One directory an outbound reference may name, and how its read is pinned.
+
+    ``lexical`` is the spelling a destination is compared against, as the agent
+    sees it. ``read_root`` is what the descriptor-pinned read must contain the
+    opened file in, and ``read_root_is_canonical`` says whether that spelling is
+    handed over literally (already resolved here) or resolved by the read.
+    """
+
+    lexical: str
+    read_root: str
+    read_root_is_canonical: bool = False
+
+
+def session_scratch_root(scratch_root: str) -> ApprovedRoot | None:
+    """The session's own ``$KIROCREW_SCRATCH`` directory as a root, or ``None``.
+
+    *scratch_root* is the directory the runtime serving the session exposes as
+    ``$KIROCREW_SCRATCH`` (``providers.base.Provider.work_scratch_dir``), handed
+    over by the channel dispatcher. The agent is told to stage screenshots there,
+    and it is never inside a working directory, so without this root no image the
+    agent staged as instructed could travel inline.
+
+    Admitted only when it is ONE allocation: an absolute, existing directory that
+    is not itself a link or junction, whose parent resolves to the managed scratch
+    root (``agent_scratch.scratch_root``). Anything wider -- the managed root
+    itself, the data home, ``/`` -- or anything elsewhere answers ``None``, so a
+    wrong value can only lose this root, never widen it to another runtime's
+    scratch.
+
+    The read pin is CANONICAL, like the browser root's: the parent resolved, the
+    allocation's leaf kept literal, so a link swapped in at the leaf after this
+    check resolves the opened file outside the pin instead of moving the pin.
+    """
+    if not scratch_root or not os.path.isabs(scratch_root):
+        return None
+    lexical = os.path.abspath(scratch_root)
+    path = Path(lexical)
+    try:
+        if is_link_or_junction(path) or not path.is_dir():
+            return None
+        parent = os.path.realpath(path.parent)
+        if parent != os.path.realpath(managed_scratch_root()):
+            return None
+    except (OSError, ValueError):
+        return None
+    return ApprovedRoot(
+        lexical=lexical,
+        read_root=os.path.join(parent, path.name),
+        read_root_is_canonical=True,
+    )
+
+
+def approved_roots(within_root: str, scratch_root: str = "") -> tuple[ApprovedRoot, ...]:
+    """The directories an outbound reference may name, authorized first.
+
+    *within_root* is the provider's resolved working directory, handed over by
+    the channel dispatcher once the provider is acquired; its read pin is
+    unchanged from before the browser root existed. The browser CLI's output
+    directory comes second: the gateway forces every ``playwright-cli``
+    invocation to write there (``PLAYWRIGHT_MCP_OUTPUT_DIR``), so it is the one
+    place a screenshot the agent just took can be, and it is never inside a
+    working directory by construction.
+
+    The browser root's read pin is CANONICAL: the data home around it resolved
+    (a ``/home`` alias or a dotfile manager's link to the data home is an
+    ordinary layout), the ``playwright-snapshots`` leaf kept literal and never
+    followed. The read compares the opened descriptor's real path against that
+    literal spelling, so a snapshot directory replaced by a link -- at rest or
+    swapped in after this call -- resolves the file somewhere else and fails the
+    comparison instead of moving the boundary there with it. The cwd keeps its
+    resolved-by-the-read pin because a linked working directory is the layout
+    it was authorized with.
+
+    The session's own scratch directory comes last, and only when
+    *scratch_root* passes :func:`session_scratch_root`.
+
+    An empty *within_root* contributes nothing, so neither the browser root nor
+    the scratch root ever stands in for an authorization the dispatcher withheld.
+    """
+    if not within_root:
+        return ()
+    snap = snapshot_dir()
+    roots = (
+        ApprovedRoot(lexical=os.path.abspath(within_root), read_root=within_root),
+        ApprovedRoot(
+            lexical=os.path.abspath(snap),
+            read_root=os.path.join(os.path.realpath(snap.parent), snap.name),
+            read_root_is_canonical=True,
+        ),
+    )
+    scratch = session_scratch_root(scratch_root)
+    return roots if scratch is None else (*roots, scratch)
+
+
+def containing_root(path: Path, within_root: str, scratch_root: str = "") -> ApprovedRoot | None:
+    """The approved root that lexically contains *path*, or ``None``.
+
+    Lexical on purpose: ``abspath`` collapses ``..`` so a traversal spelling
+    cannot land inside a root it names, and nothing here follows a link. The
+    link cases belong to the read that follows, which is pinned to the root
+    returned here and rechecks the opened descriptor's real path against it.
+    """
+    target = os.path.abspath(path)
+    for root in approved_roots(within_root, scratch_root):
+        try:
+            if os.path.commonpath((target, root.lexical)) == root.lexical:
+                return root
+        except ValueError:
+            # Different drives on Windows: not inside this root.
+            continue
+    return None
 
 
 def _inspect(
@@ -455,6 +964,7 @@ def _inspect(
     budget: int,
     max_file_bytes: int | None,
     within_root: str | None,
+    scratch_root: str = "",
 ) -> OutboundFile | Rejection:
     """Decide whether *path* can be uploaded; return the file OR a rejection.
 
@@ -476,12 +986,13 @@ def _inspect(
         read_cap = max_file_bytes
         over_reason = REASON_OVER_FILE_BYTES
         over_detail = f"larger than this channel's {max_file_bytes}-byte per-file limit"
+    root: ApprovedRoot | None = None
     if within_root is not None:
         try:
-            root = os.path.abspath(within_root)
-            if not within_root or os.path.commonpath((os.path.abspath(path), root)) != root:
-                return Rejection(dest, REASON_SENSITIVE, "outside the approved workspace")
+            root = containing_root(path, within_root, scratch_root)
         except (OSError, ValueError):
+            root = None
+        if root is None:
             return Rejection(dest, REASON_SENSITIVE, "outside the approved workspace")
     try:
         # A linked ANCESTOR defeats local_destination's lexical UNC screen:
@@ -492,31 +1003,49 @@ def _inspect(
         # before the is_symlink() lstat. Lives here, not in local_destination,
         # to keep that function's documented lexical-only contract intact.
         # Windows-only for the same reason as the UNC gate: on POSIX stat-ing
-        # through a symlink is harmless. The reply matches the leaf case on
-        # purpose -- which ancestor is a link is filesystem layout the caller
-        # supplied a path to guess at. Reference wiring:
-        # dashboard/handlers/themes.py::_resolve_local_source.
-        if os.name == "nt" and first_linked_ancestor(path) is not None:
-            return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
+        # through a symlink is harmless. The shared screen rewrites a local
+        # linked prefix to its vetted target and refuses UNC, device,
+        # drive-relative and `..`-climbing targets. Every check below runs on
+        # the REWRITTEN ``probe``, never through the link; ``path`` stays the
+        # provenance the caller wrote. The pinned read still holds the bytes
+        # to the approved root, so a junction leading out of it is refused
+        # there. The reply matches the leaf case on purpose -- which ancestor
+        # is a link is filesystem layout the caller supplied a path to guess
+        # at.
+        probe = path
+        if os.name == "nt":
+            screened = screen_windows_linked_ancestors(path)
+            if screened is None:
+                return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
+            probe = screened
         # The LEAF gets the junction-aware check the walk deliberately
         # excludes. The all-platform is_symlink() refusal below is lstat-only
         # (junction-blind) and runs after is_sensitive_path, whose candidate
         # forms resolve the leaf too -- so on Windows the leaf must be
         # screened here, before the first resolving call. lstat-based, never
         # follows.
-        if os.name == "nt" and is_link_or_junction(path):
+        if os.name == "nt" and is_link_or_junction(probe):
             return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
-        if is_sensitive_path(str(path)):
+        if is_sensitive_path(str(probe)):
             return Rejection(dest, REASON_SENSITIVE, "reading this location is blocked")
-        if path.is_symlink():
+        if probe.is_symlink():
             # Refused rather than resolved: the bytes below must come from the
             # inode this path names, not from wherever a link points now.
             return Rejection(dest, REASON_SYMLINK, "symlinks are not uploaded")
-        if not path.is_file():
+        if not probe.is_file():
             return Rejection(dest, REASON_MISSING, "no such file")
         try:
+            # Pinned to the root that admitted the path, not to the authorized
+            # cwd alone: a screenshot under the browser root must be contained
+            # by THAT root at the descriptor, or a linked ancestor inside it
+            # could hand over bytes from anywhere. The browser root's pin is
+            # its canonical spelling, so the snapshot directory itself being a
+            # link moves the file out of the pin rather than the pin to it.
             data = safe_read_file_bytes_nolink(
-                str(path), within_root=within_root, max_bytes=read_cap
+                str(probe),
+                within_root=root.read_root if root is not None else None,
+                within_root_is_canonical=root.read_root_is_canonical if root is not None else False,
+                max_bytes=read_cap,
             )
         except FileTooLargeError:
             return Rejection(dest, over_reason, over_detail)
@@ -527,7 +1056,7 @@ def _inspect(
         mime = sniff_raster_mime(data[:SNIFF_BYTES])
         if mime is None:
             return Rejection(dest, REASON_NOT_RASTER, "not a PNG, JPEG, GIF, WebP or BMP image")
-        if not _payload_passes_redaction(data):
+        if _payload_is_flagged(data):
             return Rejection(
                 dest, REASON_SENSITIVE, "the file failed outbound content security checks"
             )
@@ -561,25 +1090,24 @@ def iter_local_refs(text: str) -> list[LocalRef]:
     """Complete local image references not escaped or fenced, in order."""
     if not text:
         return []
-    matches = list(IMAGE_MD_RE.finditer(text))
+    matches = list(iter_image_destinations(text))
     if not matches:
         return []
-    fenced = list(iter_fence_spans(text))
+    reader = _MarkerReader(text, list(iter_fence_spans(text)))
     refs: list[LocalRef] = []
-    for match in matches:
-        if _literal_image_marker(text, match.start(), fenced):
+    for match, dest, consumed in matches:
+        if reader.literal(match.start):
             continue  # escaped or fenced: literal text, not markup
-        dest, consumed = _walk_destination(text[match.end() :])
         if not dest:
             continue  # malformed markup, or a `(` that belongs to prose
         if is_remote_destination(dest):
             continue  # remote or data URI: nothing local to upload
         refs.append(
             LocalRef(
-                start=match.start(),
-                end=match.end() + consumed,
+                start=match.start,
+                end=match.end + consumed,
                 dest=dest,
-                alt=unescape_md(match.group(1) or "").strip(),
+                alt=unescape_md(match.alt).strip(),
             )
         )
     return refs
@@ -589,16 +1117,28 @@ def open_ref_start(text: str) -> int | None:
     """Earliest unclosed image marker not escaped or fenced, else ``None``."""
     if not text:
         return None
-    fenced = list(iter_fence_spans(text))
+    reader = _MarkerReader(text, list(iter_fence_spans(text)))
+    parens: _ParenIndex | None = None
+    # Every opener inside one label run closes where that run's first opener
+    # closes (see _image_label), so the run is scanned once and its answer reused.
+    run_end = -1
+    close_end: int | None = None
+    walked: tuple[int, str | None] | None = None
     for opener in re.finditer(r"!\[", text):
-        if _literal_image_marker(text, opener.start(), fenced):
+        start = opener.start()
+        if start >= run_end:
+            closed, run_end = _image_label(text, start)
+            close_end = closed.end if closed is not None else None
+        if reader.literal(start):
             continue  # escaped or fenced: literal text, not markup
-        closed = IMAGE_MD_RE.match(text, opener.start())
-        if closed is None:
-            return opener.start()  # label still arriving: no "](" landed yet
-        dest, _consumed = _walk_destination(text[closed.end() :])
-        if dest is None:
-            return opener.start()
+        if close_end is None:
+            return start  # label still arriving: no "](" landed yet
+        if walked is None or walked[0] != close_end:
+            if parens is None:
+                parens = _ParenIndex(text)
+            walked = (close_end, parens.walk(text, close_end)[0])
+        if walked[1] is None:
+            return start
     return None
 
 
@@ -672,13 +1212,21 @@ def upload_filename(file: "OutboundFile", index: int = 0) -> str:
 
 
 def extract_local_refs(
-    text: str, *, limits: ExtractLimits | None = None, within_root: str | None = None
+    text: str,
+    *,
+    limits: ExtractLimits | None = None,
+    within_root: str | None = None,
+    scratch_root: str = "",
 ) -> ExtractResult:
     """Pull local raster references out of *text* for a transport to upload.
 
     Returns the text to send, the files to send with it, and a reason for every
     reference that could not be sent. Never raises: the reply must go out even if
     every reference in it turns out to be unusable.
+
+    *scratch_root* is the session's own ``$KIROCREW_SCRATCH`` directory, admitted
+    beside *within_root* only as :func:`session_scratch_root` allows; empty adds
+    nothing.
     """
     lim = limits or ExtractLimits()
     refs = iter_local_refs(text)
@@ -711,6 +1259,7 @@ def extract_local_refs(
             lim.max_total_bytes - total_bytes,
             lim.max_file_bytes,
             within_root,
+            scratch_root,
         )
         if isinstance(outcome, Rejection):
             # A rejected reference keeps its markup, so the path stays visible.
@@ -749,6 +1298,15 @@ def _apply_cuts(text: str, cuts: list[tuple[int, int]]) -> str:
     """
     if not cuts:
         return text
+    # The union of the cuts as disjoint ordered spans, walked with one pointer, so
+    # each line visits only the spans that reach it.
+    merged: list[list[int]] = []
+    for cut_start, cut_end in sorted(cuts):
+        if merged and cut_start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], cut_end)
+        else:
+            merged.append([cut_start, cut_end])
+    first = 0
     kept: list[str] = []
     squeeze = False
     pos = 0
@@ -759,8 +1317,13 @@ def _apply_cuts(text: str, cuts: list[tuple[int, int]]) -> str:
         pieces: list[str] = []
         cursor = start
         touched = False
-        for cut_start, cut_end in cuts:
-            if cut_end <= start or cut_start >= end:
+        while first < len(merged) and merged[first][1] <= start:
+            first += 1
+        k = first
+        while k < len(merged) and merged[k][0] < end:
+            cut_start, cut_end = merged[k]
+            k += 1
+            if cut_end <= start:
                 continue
             touched = True
             if cut_start > cursor:
@@ -783,7 +1346,11 @@ def _apply_cuts(text: str, cuts: list[tuple[int, int]]) -> str:
 
 
 async def extract_local_refs_off_loop(
-    text: str, *, within_root: str, limits: ExtractLimits | None = None
+    text: str,
+    *,
+    within_root: str,
+    limits: ExtractLimits | None = None,
+    scratch_root: str = "",
 ) -> ExtractResult:
     """Async form of :func:`extract_local_refs`, run off the event loop.
 
@@ -798,4 +1365,10 @@ async def extract_local_refs_off_loop(
     recover a wedged kernel resource, and this work is short and
     filesystem-bound with no reason to queue behind it.
     """
-    return await asyncio.to_thread(extract_local_refs, text, limits=limits, within_root=within_root)
+    return await asyncio.to_thread(
+        extract_local_refs,
+        text,
+        limits=limits,
+        within_root=within_root,
+        scratch_root=scratch_root,
+    )

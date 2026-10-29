@@ -26,7 +26,7 @@ from kiro_crew.dashboard.handlers.taskrunner import (
     api_taskrunner_execute_plan,
     api_taskrunner_start,
 )
-from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import TOOL_AUTO_APPROVE, TOOL_DENY, ToolHookResult
 from kiro_crew.providers.base import LLMEvent
 from kiro_crew.safety_override import reset_singleton, safety_override
 from kiro_crew.task_models import Project
@@ -50,7 +50,7 @@ def _mock_sessions() -> MagicMock:
     s._sessions = {}
     s.get_or_create = AsyncMock()
 
-    async def _open_task_session(_pk, session_key, *, agent=None, cwd=None, approval_policy=""):
+    async def _open_task_session(_pk, session_key, *, agent=None, cwd=None, approval_policy="", start_priority=None):
         return await s.get_or_create(session_key, agent=agent, cwd=cwd)
 
     s.open_task_session = _open_task_session
@@ -332,7 +332,9 @@ class TestAutoApproveRespectsHookDeny:
         ctx.conversation_log.get_metadata_status.return_value = ({}, True)
         ctx.memory_mode_for_session = AsyncMock(return_value="persistent")
         ctx.build_message = MagicMock(return_value=("prompt", {}))
-        ctx.hooks.on_tool_call = MagicMock(return_value=MagicMock(action=TOOL_DENY))
+        # A real ToolHookResult: the deny path now steers the hook's reason
+        # (a str) into the turn, which a bare MagicMock double cannot stand in for.
+        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_DENY))
 
         runner = TaskRunner(
             sessions=sessions, context_builder=ctx, auto_test=False, work_dir=tmp_path
@@ -471,9 +473,11 @@ class TestAutoApproveProvenanceGating:
         }
         req = make_mocked_request(
             "POST", "/api/taskrunner", app=app,
+            headers={"Content-Type": "application/json"},
             payload=BodyStreamPayload(json.dumps(start_body).encode()),
         )
         req["app"] = request_app  # set by token_auth_middleware; "" == dashboard itself
+        req["user"] = "local-app"  # owner subject: no owner_id configured
         # Kept alive: ``api_taskrunner_start`` reads uncapped (``max_bytes=None``)
         # and consumes ``request.json()``.
         req.json = AsyncMock(return_value=start_body)
@@ -506,9 +510,11 @@ class TestAutoApproveProvenanceGating:
         raw = json.dumps(exec_body).encode()
         req = make_mocked_request(
             "POST", "/api/taskrunner/t1/execute", app=app, match_info={"task_id": "t1"},
-            headers={"Content-Length": str(len(raw))}, payload=BodyStreamPayload(raw),
+            headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
+            payload=BodyStreamPayload(raw),
         )
         req["app"] = request_app
+        req["user"] = "local-app"  # owner subject: no owner_id configured
         await api_taskrunner_execute_plan(req)
         return runner.execute_plan.call_args.kwargs["auto_approve"]
 
@@ -539,9 +545,11 @@ class TestAutoApproveProvenanceGating:
         raw = json.dumps({"auto_approve": True}).encode()
         req = make_mocked_request(
             "POST", "/api/taskrunner/t1/execute", app=app, match_info={"task_id": "t1"},
-            headers={"Content-Length": str(len(raw))}, payload=BodyStreamPayload(raw),
+            headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
+            payload=BodyStreamPayload(raw),
         )
         req["app"] = ""  # dashboard context → requested trust is honored, so the gate audits
+        req["user"] = "local-app"  # owner subject: no owner_id configured
 
         boom = MagicMock()
         boom.log_tool_invocation.side_effect = RuntimeError("sel backend down: SECRET-INTERNAL-DETAIL")
@@ -587,9 +595,11 @@ class TestInlineSpecCleanup:
         app["state"] = SimpleNamespace(task_runner=runner)
         req = make_mocked_request(
             "POST", "/api/taskrunner", app=app,
+            headers={"Content-Type": "application/json"},
             payload=BodyStreamPayload(json.dumps(body).encode()),
         )
         req["app"] = ""
+        req["user"] = "local-app"  # owner subject: no owner_id configured
         # Kept alive: ``api_taskrunner_start`` reads uncapped (``max_bytes=None``)
         # and consumes ``request.json()``.
         req.json = AsyncMock(return_value=body)

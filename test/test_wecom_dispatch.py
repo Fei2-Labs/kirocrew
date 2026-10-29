@@ -26,6 +26,7 @@ class FakeProvider:
         self.approved: list = []
         self.rejected: list = []
         self.compacted = False
+        self.compact_result: dict = {"type": "completed", "summary": ""}
         self.steered: list = []
         self.active_turn = True
 
@@ -50,7 +51,7 @@ class FakeProvider:
         self.compacted = True
 
     async def wait_for_compaction(self, timeout: float = 0.0) -> dict:
-        return {"type": "completed", "summary": ""}
+        return self.compact_result
 
 
 class FakeSessions:
@@ -119,7 +120,7 @@ class FakeSessions:
     def is_mirror_paused(self, key, *, origin=False) -> bool:
         return False
 
-    async def get_or_create(self, key, *, agent, channel_id):
+    async def get_or_create(self, key, *, agent, channel_id, start_priority=None):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
@@ -167,6 +168,10 @@ class FakeSessions:
 
     def max_generation(self, bucket: str) -> int:
         return -1
+
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs`` (unset: 300 s)."""
+        return 300.0
 
 
 class _GateResult:
@@ -247,7 +252,7 @@ class FakeConvLog:
 def _cfg(default_agent: str = "", approval_mode: str = "interactive"):
     return SimpleNamespace(
         agent=SimpleNamespace(default_agent=default_agent, approval_mode=approval_mode),
-        wecom=SimpleNamespace(hard_threshold_pct=95.0, soft_threshold_pct=80.0),
+        wecom=SimpleNamespace(hard_threshold_pct=95.0, soft_threshold_pct=80.0, allowed_users=[]),
         messaging=SimpleNamespace(
             dm_scope="per-channel-peer",
             idle_reset_minutes=0,
@@ -422,6 +427,23 @@ class TestCommands:
         assert client.said == ["🗜️ 已压缩上下文。"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "reply"),
+        [("failed", "⚠️ 压缩失败，请重试。"), ("timeout", "⚠️ 压缩超时。")],
+    )
+    async def test_compact_command_reports_an_unsuccessful_result(self, kind, reply) -> None:
+        provider = FakeProvider([])
+        provider.compact_result = {"type": kind, "summary": ""}
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert sessions.released == [d._session_key("Wei")]
+        assert client.said == [reply]
+
+    @pytest.mark.asyncio
     async def test_compact_declined_on_auto_managed_backend(self) -> None:
         # A backend that cannot serve /compact gets the informational reply and
         # compact() is NEVER dispatched.
@@ -467,6 +489,28 @@ class TestCommands:
 
         assert provider.compacted is False
         assert not any("已自动压缩" in c for _chat, c in client.pushed)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "announced"), [("completed", True), ("failed", False), ("timeout", False)]
+    )
+    async def test_hard_threshold_notice_follows_the_compaction_result(
+        self, kind, announced
+    ) -> None:
+        # wait_for_compaction() reports failure and timeout as a returned type,
+        # not an exception: only a completed compaction is announced.
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.compact_result = {"type": kind, "summary": ""}
+        sessions = FakeSessions(provider, ctx_pct=96.0)  # >= hard (95)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert provider.compacted is True
+        assert any("已自动压缩" in c for _chat, c in client.pushed) is announced
 
     @pytest.mark.asyncio
     async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
@@ -725,3 +769,48 @@ class TestWeComMidTurn:
         assert not any("合并" in content for content in client.said)
         assert any("重发" in content for content in client.said)
         assert sessions.successes == []
+
+
+class TestWeComDisplayName:
+    """``_display_name`` resolves the ``[CURRENT USER]`` label from the allow-list."""
+
+    @staticmethod
+    def _cfg_with_users(users):
+        cfg = _cfg()
+        cfg.wecom.allowed_users = users
+        return cfg
+
+    def test_resolves_name_from_allowed_users(self) -> None:
+        cfg = self._cfg_with_users(
+            [{"userid": "ZhuQiang", "name": "朱强"}, {"userid": "chrishe", "name": "小碗"}]
+        )
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        assert d._display_name("ZhuQiang") == "朱强"
+        assert d._display_name("chrishe") == "小碗"
+
+    def test_falls_back_to_userid_when_unknown(self) -> None:
+        cfg = self._cfg_with_users([{"userid": "ZhuQiang", "name": "朱强"}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        # Not in the allow-list -> the raw userid, never an empty label.
+        assert d._display_name("stranger") == "stranger"
+
+    def test_falls_back_to_userid_when_name_missing(self) -> None:
+        cfg = self._cfg_with_users([{"userid": "NoName"}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        # No name on the entry -> the raw userid, never an empty label.
+        assert d._display_name("NoName") == "NoName"
+
+    def test_falls_back_to_userid_when_name_not_a_string(self) -> None:
+        # YAML ``name: 123`` loads as an int; the loader type-checks only
+        # ``userid``, so a non-string name reaches here. It must NOT be returned
+        # (it would crash [CURRENT USER] marker scrubbing, which assumes str) --
+        # fall back to the userid instead.
+        cfg = self._cfg_with_users([{"userid": "IntName", "name": 123}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        assert d._display_name("IntName") == "IntName"
+
+    def test_falls_back_to_userid_when_name_is_empty_string(self) -> None:
+        cfg = self._cfg_with_users([{"userid": "Blank", "name": ""}])
+        d = _dispatcher(FakeSessions(FakeProvider([])), FakeCtx(), FakeClient(), cfg=cfg)
+        # Empty string is not a usable label -> the raw userid.
+        assert d._display_name("Blank") == "Blank"

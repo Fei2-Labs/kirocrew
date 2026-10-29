@@ -1,6 +1,6 @@
 name: First Principles Review
 
-# ADVISORY premise-level AI review using the "Fable 5" model via Amazon Bedrock.
+# ADVISORY premise-level AI review using the "Opus 5.5" model via Amazon Bedrock.
 # Fifth reviewer lane. The other four all accept the change's REASON FOR
 # EXISTING and argue about the change: the two line reviewers ask "is this code
 # correct", Design Review asks "given the stated problem, is this the right
@@ -28,7 +28,7 @@ name: First Principles Review
 # genuine BLOCK verdict, which fails this check and blocks PR readiness
 # (override-able by a human via `/ai-review override`). Same auth path as
 # design-review.yml: OIDC ->
-# Amazon Bedrock; Fable 5 runs through anthropics/claude-code-action with
+# Amazon Bedrock; Opus 5.5 runs through anthropics/claude-code-action with
 # use_bedrock.
 
 on:
@@ -69,25 +69,52 @@ jobs:
     # skipped job's `name:` expression, so while the guard was a job-level `if:`
     # every fork PR published the raw expression source as its check name.
     # Letting the job start with all steps gated costs seconds of runner time and
-    # reports the intended name instead. `test_ai_review_workflows.py` asserts
+    # reports the intended name instead. `test_ai_review_workflows_fork_stage2.py` asserts
     # the guard is on every step, so a step added later cannot quietly run
     # against fork content.
     name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'First Principles Review' || 'First Principles Review (same-repo lane, not applicable to forks)' }}"
     runs-on: ubuntu-latest  # Agentic reviewer reading untrusted PR diff content -- never gets fleet credentials, same isolation as claude-review.yml/codex-review.yml.
     # Consumer counting is grep-heavy, so this lane runs more turns than the
-    # other advisory lanes; keep headroom for the model-latency fat tail.
+    # other whole-design lanes; keep headroom for the model-latency fat tail.
     timeout-minutes: 60
     steps:
       # persist-credentials:false stops actions/checkout from writing the
       # GITHUB_TOKEN into .git/config, where the agentic reviewer -- which reads
       # untrusted PR diff content -- could otherwise read and leak it. `git diff`
-      # still works (history is fetched via depth 0); the posting step uses its
-      # own scoped GH_TOKEN. Mirrors design-review.yml.
+      # still works (the next step fetches the merge-base it diffs from); the
+      # posting step uses its own scoped GH_TOKEN. Mirrors design-review.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event.pull_request.head.repo.full_name == github.repository
         with:
-          fetch-depth: 0
+          # The merge ref plus its two parents (the base tip and the PR head),
+          # not the whole history.
+          fetch-depth: 2
           persist-credentials: false
+
+      # The checkout is shallow, so a three-dot `base...HEAD` range has no
+      # history to find its merge-base in. GitHub's compare API names the
+      # merge-base; that one commit is fetched at depth 1, and every diff below
+      # is the two-dot `<merge-base>..HEAD`. A two-dot diff compares two trees
+      # and needs no history, and it is the same diff the three-dot range gave
+      # on a full clone. Runs before the base-ref contract read, which would
+      # otherwise read a missing base as "no contract".
+      - name: Fetch the merge-base commit (shallow history)
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        id: merge_base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # need SHA / merge_base X Y -- see the script's header.
+          . "$GITHUB_WORKSPACE/.github/scripts/review-merge-base.sh"
+          need "$BASE_SHA"
+          tip="$(git rev-parse HEAD)"
+          tree="$(merge_base "$BASE_SHA" "$tip")"
+          need "$tree"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          echo "merge-base of $BASE_SHA and the checkout $tip: $tree"
 
       # Scope gate. The lane needs at least one capability to inventory, so it
       # runs whenever the diff touches product or CI surface -- INCLUDING a plain
@@ -99,10 +126,10 @@ jobs:
         if: github.event.pull_request.head.repo.full_name == github.repository
         id: scope
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.tree }}
         run: |
           set -euo pipefail
-          touched="$(git diff --name-only "$BASE_SHA"...HEAD)"
+          touched="$(git diff --name-only "$MERGE_BASE"..HEAD)"
           # Product and CI surface this lane can interrogate. Test paths are
           # subtracted because a test ships no capability, so a tests-only diff has
           # no feature to inventory; docs, screenshots and generated files fall out
@@ -178,6 +205,7 @@ jobs:
       # instruction injected into the diff could redirect over the extracted
       # contract and forge a clean verdict against a rewritten rubric.
       - name: Prefetch the change as data files
+        id: intent
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -189,72 +217,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.tree }}
           PATCH: ${{ runner.temp }}/authentic.patch
           INTENT: ${{ runner.temp }}/pr-intent.txt
         run: |
           set -uo pipefail
-          git diff --no-color "$BASE_SHA"...HEAD > "$PATCH"
+          git diff --no-color "$MERGE_BASE"..HEAD > "$PATCH"
           if [ ! -s "$PATCH" ]; then
-            echo "::error::empty diff for $BASE_SHA...HEAD; failing closed."
+            echo "::error::empty diff for $MERGE_BASE..HEAD; failing closed."
             exit 1
           fi
-          # A title/description this step could not READ is not a PR without
-          # stated intent. `2>/dev/null || true` discarded both the error text
-          # and the exit status, so a transient API failure handed the reviewer
-          # an empty intent file and the lane judged a PR that appeared to
-          # state nothing -- blaming the author for a description the workflow
-          # never read. The common case is transient, so absorb it here rather
-          # than spending the author's re-run on it: up to three attempts with
-          # a short backoff. A read that never succeeds fails closed while
-          # naming the read as the cause; a genuinely empty description reads
-          # successfully on the first attempt and is judged as written, which
-          # is correct.
-          raw=""
-          read_ok=""
-          for attempt in 1 2 3; do
-            if raw="$(gh api "repos/$REPO/pulls/$PR" --jq '"Title: \(.title)\n\nDescription:\n\(.body // "")"')"; then
-              read_ok=1
-              break
-            fi
-            echo "Reading the PR title and description failed on attempt $attempt."
-            if [ "$attempt" -lt 3 ]; then
-              sleep "$attempt"
-            fi
-          done
-          if [ -z "$read_ok" ]; then
-            echo "::error::Could not read this PR's title and description from the API after 3 attempts, so the review would judge a PR that appears to state no intent. This is a read failure, not a missing description -- re-run this job."
-            exit 1
-          fi
-          # Strip embedded media: a screenshot-heavy body is pure cost to a
-          # reviewer that judges prose, and an attachment URL is not intent.
-          stripped="$(printf '%s' "$raw" | perl -0777 -pe 's/!\[[^\]]*\]\([^)]*\)/[image removed]/g; s{<img\b[^>]*>}{[image removed]}gi; s{<video\b.*?</video>}{[video removed]}gsi; s{<source\b[^>]*>}{[media removed]}gi; s{https?://\S*user-attachments\S*}{[media removed]}g' 2>/dev/null || printf '%s' "$raw")"
-          # Cap at 8000 bytes, dropping a trailing split multibyte character so the
-          # file stays well-formed UTF-8. Mark an over-cap body rather than
-          # truncating it silently.
-          #
-          # One perl read does the cap, because the two obvious shell spellings both
-          # break on precisely the over-cap input the cap exists for. `printf |
-          # head -c` gives the writer SIGPIPE once `head` has its bytes, and under
-          # `pipefail` that 141 fails the step -- a race below the ~64 KiB pipe
-          # buffer (a 30 KB body lost it) and certain above. And `iconv -c` drops
-          # INVALID bytes but still exits 1 on an INCOMPLETE sequence at EOF, so a
-          # `|| <raw fallback>` appended a second copy to the partial output already
-          # captured: 15,998 bytes of malformed UTF-8 from an 8000-byte cap.
-          full="$(mktemp)"
-          printf '%s' "$stripped" > "$full"
-          perl -e '
-            open(my $fh, "<:raw", $ARGV[0]) or die; read($fh, my $b, 8000);
-            # A lead byte with fewer continuation bytes than it declares is the
-            # tail the cap split; anything else invalid was already in the body.
-            $b =~ s/(?:[\xC2-\xDF]|[\xE0-\xEF][\x80-\xBF]?|[\xF0-\xF4][\x80-\xBF]{0,2})\z//;
-            print $b, "\n";
-          ' "$full" > "$INTENT"
-          if [ "$(wc -c < "$full")" -gt 8000 ]; then
-            printf '\n[description TRUNCATED at 8000 bytes]\n' >> "$INTENT"
-          fi
-          rm -f "$full"
-          echo "Wrote the diff ($(wc -c < "$PATCH") bytes) and the PR intent ($(wc -c < "$INTENT") bytes) as data files."
+          # The title and description come from ONE shared capture, sourced by
+          # every lane whose model judges the author's stated intent. It is one
+          # file rather than a copy per lane because the digest each lane stamps
+          # into its published verdict names the bytes that capture produced: two
+          # implementations of the cap or the media strip would make the same
+          # digest mean two different things, and a reader recomputing it would
+          # get a mismatch from a description nobody had touched.
+          . "$GITHUB_WORKSPACE/.github/scripts/pr-description-capture.sh"
+          echo "Wrote the diff ($(wc -c < "$PATCH") bytes) as a data file."
 
       - name: Resolve human override
         if: github.event.pull_request.head.repo.full_name == github.repository
@@ -314,7 +295,7 @@ jobs:
       # other reviewer lanes. github.actor is set by GitHub and cannot be spoofed
       # by PR content. Also skip when a human override is recorded, so an OIDC
       # failure can never keep the override from clearing the lane.
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
           && (
@@ -324,7 +305,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: us-west-2
 
-      - name: First-principles review (Fable 5)
+      - name: First-principles review (Opus 5.5)
         id: review
         # No continue-on-error: if the model call fails, this step fails and the
         # check goes RED -- an honest signal the review did not run. It stays
@@ -339,13 +320,13 @@ jobs:
           && steps.contract.outputs.available == 'true'
           && steps.human_override.outputs.active != 'true'
           )
-        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636 # v1
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1.0.247
         with:
           # Inference via Amazon Bedrock. Model id form (bare, regional `us.`
           # inference profile, no `[1m]` tag) is load-bearing -- see the
           # explanation in design-review.yml; identical here.
           #
-          # --max-turns is HIGHER than the sibling advisory lanes on purpose:
+          # --max-turns is HIGHER than the sibling whole-design lanes on purpose:
           # inventorying a change and counting consumers is one Grep per item, and
           # a turn-starved run silently degrades into the taste-based "this feels
           # over-built" review this lane exists to replace.
@@ -358,8 +339,8 @@ jobs:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: |
-            --model us.anthropic.claude-fable-5
-            --fallback-model us.anthropic.claude-opus-4-8
+            --model us.anthropic.claude-opus-5-5
+            --fallback-model us.anthropic.claude-sonnet-5-5
             --max-turns 120
             --allowedTools "Read,Grep,Glob"
           prompt: |
@@ -393,6 +374,33 @@ jobs:
             list is workflow-computed from the base and is the only source for
             lens 9.
 
+      # The outbound scrub is `scripts/scope_redact.py`, staged from the BASE
+      # commit. A redactor taken from the change under review could
+      # rewrite the scrub of its own published output. Every model step after
+      # this one is read-only, so nothing can rewrite the staged copy.
+      - name: Stage the base-owned redactor
+        id: redactor
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          )
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          dir="${RUNNER_TEMP:-/tmp}/scope-redact"
+          # Remove before creating: a symlink at this path would redirect the write.
+          rm -rf "$dir"
+          mkdir -p "$dir"
+          dest="$dir/scope_redact.py"
+          git show "$BASE_SHA:scripts/scope_redact.py" > "$dest" 2>/dev/null || true
+          if [ ! -s "$dest" ]; then
+            echo "::error::scripts/scope_redact.py is missing or empty on the base commit ($BASE_SHA). Refusing to publish text no base-owned scrubber could redact."
+            exit 1
+          fi
+          echo "redactor=$dest" >> "$GITHUB_OUTPUT"
+
       # Post the verdict for humans (best-effort, NON-gating). Reads the summary
       # from the action's execution_file -- not a model-posted comment -- so it
       # works even if the model never calls a posting tool. UPSERT a single
@@ -409,6 +417,7 @@ jobs:
           always()
           )
         env:
+          REDACTOR: ${{ steps.redactor.outputs.redactor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
@@ -420,33 +429,134 @@ jobs:
           SURFACE: ${{ steps.scope.outputs.surface }}
           CONTRACT: ${{ steps.contract.outputs.available }}
           REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          DESCRIPTION_DIGEST: ${{ steps.intent.outputs.description_digest }}
         run: |
+          # ONE marker for this lane, declared before the first branch that
+          # writes a comment, so every write in this step reads the same slot.
+          MARKER="<!-- first-principles-review -->"
+          # Whether this lane's slot is already taken GATES every comment write
+          # below, so the read that answers it carries the same six-attempt, 5s
+          # linear-backoff budget as the reads that gate a verdict. A single
+          # attempt that swallows its own error answers "the slot is empty" for
+          # an ordinary flake. On an update that loses a notice. On a CREATE it
+          # is worse: the write puts a SECOND comment into a slot that already
+          # holds one, and nothing takes it back out -- a later lookup patches
+          # whichever id it picks, the other keeps whatever line it carries, and
+          # no run reconciles them.
+          #
+          # Two variables rather than one captured string, because "the read
+          # never answered" and "the read answered and the slot is empty" are
+          # different facts, and only the second licenses a create.
+          lookup_ok=0
+          existing=""
+          find_existing() {
+            local attempt matches
+            lookup_ok=0
+            existing=""
+            for attempt in 1 2 3 4 5 6; do
+              if matches="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" 2>/dev/null)"; then
+                lookup_ok=1
+                existing="$(printf '%s\n' "$matches" | awk 'NR == 1')"
+                return 0
+              fi
+              echo "Reading this PR's comments before writing this lane's notice failed on attempt $attempt."
+              if [ "$attempt" -lt 6 ]; then
+                sleep "$(( attempt * 5 ))"
+              fi
+            done
+            return 0
+          }
+          # A notice carries no verdict, so withholding one costs a stale line
+          # in this lane's slot while writing one over a newer revision's
+          # verdict costs that verdict, with nothing to restore it. Every
+          # notice write below therefore confirms this PR's head is still the
+          # head the notice is about, and treats an unreadable answer the same
+          # as a moved head, because writing is the destructive direction.
+          #
+          # The verdict path deliberately does not share this gate: there,
+          # withholding is the expensive direction, so retry_comment_write
+          # confirms the head only before a REPEAT, whose first write may
+          # already have landed.
+          head_unchanged=0
+          confirm_head() {
+            local attempt head_now
+            head_unchanged=0
+            # Budgeted like the slot read above it, and for the same reason: the two
+            # reads run in the same exhaustion window, so a single blip is the
+            # expected outcome rather than the rare one. A moved head is a definite
+            # answer and returns at once; only an unreadable one is retried.
+            for attempt in 1 2 3 4 5 6; do
+              if head_now="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" \
+                && [ -n "$head_now" ]; then
+                if [ "$head_now" != "$HEAD" ]; then
+                  echo "::warning::This PR's head is now $head_now, not $HEAD, so this lane's notice was not written: the run for that head owns this lane's slot, and writing would replace its verdict with a superseded revision's notice."
+                  return 0
+                fi
+                head_unchanged=1
+                return 0
+              fi
+              echo "Reading this PR's current head before writing this lane's notice failed on attempt $attempt."
+              if [ "$attempt" -lt 6 ]; then
+                sleep "$(( attempt * 5 ))"
+              fi
+            done
+            echo "::warning::Whether $HEAD is still this PR's head is unreadable after 6 attempts, so this lane's notice was not written. If the head has moved, withholding is what protects the newer revision's verdict, which nothing would restore; if it has not moved, this lane's slot keeps whatever earlier outcome it already held. Re-run this lane to record the notice."
+            return 0
+          }
           if [ "$HUMAN_OVERRIDE" = "true" ]; then
-            OV_MARKER="<!-- first-principles-review -->"
             {
-              echo "$OV_MARKER"
-              echo "## First Principles Review (Fable 5) — ✅ human override accepted"
+              echo "$MARKER"
+              echo "## First Principles Review (Opus 5.5) — ✅ human override accepted"
               echo
               echo "_@$OVERRIDE_ACTOR overrode this lane for \`$HEAD\` via \`/ai-review override\` (this commit only)._"
-            } > /tmp/ai-override-note.md
-            ov_existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$OV_MARKER\"))) | .id" 2>/dev/null | head -n1 || true)"
-            if [ -n "$ov_existing" ] && [ "$ov_existing" != "null" ]; then
-              gh api --method PATCH "repos/$REPO/issues/comments/$ov_existing" --field body="$(cat /tmp/ai-override-note.md)" >/dev/null || true
-            else
-              gh pr comment "$PR" --body-file /tmp/ai-override-note.md || true
+            } > "${RUNNER_TEMP:-/tmp}/ai-override-note.md"
+            confirm_head
+            # The slot read comes last, immediately before the write: this arm creates when
+            # the slot is empty, and the head check above can spend over a minute on
+            # backoff. Reading the slot first would decide CREATE from a minute-old answer,
+            # and another run on this same head can fill the slot inside that gap.
+            find_existing
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              gh api --method PATCH "repos/$REPO/issues/comments/$existing" --field body="$(cat "${RUNNER_TEMP:-/tmp}/ai-override-note.md")" >/dev/null || true
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
+              gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/ai-override-note.md" || true
+            elif [ "$lookup_ok" -eq 0 ]; then
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the override note for $HEAD was not posted. Creating one here can leave two comments in the slot, and the one a later lookup does not pick keeps whatever line it carries. Re-run this lane to record the override."
             fi
             echo "verdict=OVERRIDE" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          MARKER="<!-- first-principles-review -->"
-          find_existing() {
-            gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" 2>/dev/null \
-              | head -n1 || true
-          }
+          # #13595: a skip arm must leave a keyed slot for THIS head even on a
+          # first-time skip, so an absent slot on a `success` conclusion means
+          # the lane could not publish rather than chose not to review. The body
+          # names `$HEAD` in prose, which is the per-head marker readiness scopes
+          # the skip exemption on (pr_status.py `slots_naming_head`). Head FIRST,
+          # slot read LAST, mirroring the human-override and no-contract arms.
           if [ "$ACTOR" = "dependabot[bot]" ]; then
             echo "Dependabot PR: first-principles review skipped (no Bedrock secrets/OIDC)."
             echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
+            {
+              echo "$MARKER"
+              echo "## First Principles Review (Opus 5.5) — ⏭️ skipped"
+              echo
+              echo "_Revision \`$HEAD\` is a Dependabot pull request, which runs with no Bedrock secrets/OIDC, so the first-principles review was skipped. Does not block merge._"
+            } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
+            confirm_head
+            find_existing
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              confirm_head
+              if [ "$head_unchanged" -eq 1 ]; then
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "${RUNNER_TEMP:-/tmp}/fp-comment.md")" >/dev/null || true
+                echo "Updated existing first-principles-review comment #$existing to skip notice"
+              fi
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
+              gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/fp-comment.md" || true
+              echo "Created first-principles-review skip notice for $HEAD"
+            elif [ "$lookup_ok" -eq 0 ]; then
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the first-principles skip notice for $HEAD was not written. Re-run this lane to record the notice."
+            fi
             exit 0
           fi
           if [ "$SURFACE" = "true" ] && [ "$CONTRACT" = "false" ]; then
@@ -463,33 +573,52 @@ jobs:
             echo "verdict=NO_CONTRACT" >> "$GITHUB_OUTPUT"
             {
               echo "$MARKER"
-              echo "## First Principles Review (Fable 5) — ⏭️ no contract on the base commit"
+              echo "## First Principles Review (Opus 5.5) — ⏭️ no contract on the base commit"
               echo
-              echo "_\`.github/review-prompts/first-principles.md\` does not exist on this PR's base commit, so there is no trusted contract to review \`$HEAD\` against. The contract is deliberately read from the base and never from the head, so a change cannot edit the reviewer that judges it — which also means this lane cannot review the pull request that introduces or moves the contract. Advisory — does not block merge._"
+              echo "_\`.github/review-prompts/first-principles.md\` does not exist on this PR's base commit, so there is no trusted contract to review \`$HEAD\` against. The contract is deliberately read from the base and never from the head, so a change cannot edit the reviewer that judges it — which also means this lane cannot review the pull request that introduces or moves the contract. Does not block merge._"
             } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
-            existing="$(find_existing)"
-            if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-              gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
-                --field body="$(cat "${RUNNER_TEMP:-/tmp}/fp-comment.md")" >/dev/null || true
-            else
+            confirm_head
+            # The slot read comes last, immediately before the write: this arm creates when
+            # the slot is empty, and the head check above can spend over a minute on
+            # backoff. Reading the slot first would decide CREATE from a minute-old answer,
+            # and another run on this same head can fill the slot inside that gap.
+            find_existing
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              confirm_head
+              if [ "$head_unchanged" -eq 1 ]; then
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "${RUNNER_TEMP:-/tmp}/fp-comment.md")" >/dev/null || true
+              fi
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
               gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/fp-comment.md" || true
+            elif [ "$lookup_ok" -eq 0 ]; then
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the no-contract notice for $HEAD was not posted. Creating one here can leave two comments in the slot, and the one a later lookup does not pick keeps whatever line it carries. Re-run this lane to record the notice."
             fi
             exit 0
           fi
           if [ "$SURFACE" != "true" ]; then
             echo "No added surface: first-principles review skipped."
             echo "verdict=SKIPPED" >> "$GITHUB_OUTPUT"
-            existing="$(find_existing)"
-            if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-              {
-                echo "$MARKER"
-                echo "## First Principles Review (Fable 5) — ⏭️ skipped"
-                echo
-                echo "_Revision \`$HEAD\` ships no reviewable capability (docs, tests or generated files only), so there is nothing to inventory. Advisory — does not block merge._"
-              } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
-              gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
-                --field body="$(cat "${RUNNER_TEMP:-/tmp}/fp-comment.md")" >/dev/null || true
-              echo "Updated existing first-principles-review comment #$existing to skip notice"
+            {
+              echo "$MARKER"
+              echo "## First Principles Review (Opus 5.5) — ⏭️ skipped"
+              echo
+              echo "_Revision \`$HEAD\` ships no reviewable capability (docs, tests or generated files only), so there is nothing to inventory. Does not block merge._"
+            } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
+            confirm_head
+            find_existing
+            if [ "$head_unchanged" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              confirm_head
+              if [ "$head_unchanged" -eq 1 ]; then
+                gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                  --field body="$(cat "${RUNNER_TEMP:-/tmp}/fp-comment.md")" >/dev/null || true
+                echo "Updated existing first-principles-review comment #$existing to skip notice"
+              fi
+            elif [ "$head_unchanged" -eq 1 ] && [ "$lookup_ok" -eq 1 ]; then
+              gh pr comment "$PR" --body-file "${RUNNER_TEMP:-/tmp}/fp-comment.md" || true
+              echo "Created first-principles-review skip notice for $HEAD"
+            elif [ "$lookup_ok" -eq 0 ]; then
+              echo "::warning::This lane's slot was unreadable after 6 attempts, so the first-principles skip notice for $HEAD was not written. Re-run this lane to record the notice."
             fi
             exit 0
           fi
@@ -539,10 +668,48 @@ jobs:
               echo "::warning title=First Principles Review over length::$words words outside the inventory; the contract caps the review at ~180. Findings past the cap are the ones nobody reads."
             fi
           fi
+          # Two verdicts exist. Any other word (the retired CONCERNS included) is
+          # not a verdict, and a BLOCK that states no Trigger and no Outcome cannot
+          # block: both read as the "could not complete" / PASS paths below, which
+          # never fail the gate.
+          unsubstantiated=""
+          case "$verdict" in
+            PASS|BLOCK|UNKNOWN) ;;
+            *) echo "verdict word $verdict is not PASS or BLOCK; treating as UNKNOWN"; verdict="UNKNOWN" ;;
+          esac
+          if [ "$verdict" = "BLOCK" ]; then
+            # --- block substantiation (copied into every lane; pinned by test_block_substantiation.py) ---
+            block_substantiated() {
+              local text
+              text="$(cat)"
+              grep -Eiq '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Trigger:(\*\*)?[[:space:]]*[^[:space:]*]' <<< "$text" \
+                && grep -Eiq '^[[:space:]]*([-*][[:space:]]+)?(\*\*)?Outcome:(\*\*)?[[:space:]]*[^[:space:]*]' <<< "$text"
+            }
+            demote_block_verdict() {
+              awk -v prefix="$1" '
+                !done && tolower(substr($0, 1, length(prefix))) == tolower(prefix) {
+                  print substr($0, 1, length(prefix)) " PASS"
+                  done = 1
+                  next
+                }
+                { print }
+              '
+            }
+            # --- end block substantiation ---
+            if ! block_substantiated <<< "$summary"; then
+              verdict="PASS"
+              unsubstantiated=1
+              summary="$(demote_block_verdict "First-Principles-Verdict:" <<< "$summary")"
+              echo "::warning title=Unsubstantiated BLOCK::The BLOCK for $HEAD states no Trigger: line and no Outcome: line, so it is treated as PASS."
+            fi
+          fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           case "$verdict" in
-            PASS) badge="✅ PASS" ;;
-            CONCERNS) badge="🟡 CONCERNS" ;;
+            PASS)
+              badge="✅ PASS"
+              if [ -n "$unsubstantiated" ]; then
+                badge="✅ PASS (a BLOCK with no Trigger and no Outcome does not block)"
+              fi ;;
             BLOCK) badge="🔴 BLOCK" ;;
             *) badge="" ;;
           esac
@@ -550,9 +717,9 @@ jobs:
             # Valid verdict → post the review body (redacted below).
             {
               echo "$MARKER"
-              echo "## First Principles Review (Fable 5) — $badge"
+              echo "## First Principles Review (Opus 5.5) — $badge"
               echo
-              echo "_Premise-level review of \`$HEAD\` — why this exists and whether the shipped surface is the smallest honest version. Updated in place on each push. **A BLOCK verdict blocks PR readiness**; PASS/CONCERNS are advisory._"
+              echo "_Premise-level review of \`$HEAD\` — why this exists and whether the shipped surface is the smallest honest version. Updated in place on each push. **A BLOCK verdict blocks PR readiness**; PASS does not._"
               echo
               printf '%s\n' "$summary"
             } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
@@ -575,9 +742,9 @@ jobs:
             esac
             {
               echo "$MARKER"
-              echo "## First Principles Review (Fable 5) — ⚠️ could not complete"
+              echo "## First Principles Review (Opus 5.5) — ⚠️ could not complete"
               echo
-              echo "_The first-principles review did not produce a verdict for \`$HEAD\` ($why). See the First Principles Review job logs. Advisory — does not block merge._"
+              echo "_The first-principles review did not produce a verdict for \`$HEAD\` ($why). See the First Principles Review job logs. Does not block merge._"
             } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
           fi
           # Defense-in-depth: scrub credential shapes AND AWS account ids / ARNs
@@ -585,7 +752,37 @@ jobs:
           # parsed" gate above, this keeps internal detail out of the public PR
           # comment. Mirrors design-review.yml's redaction step, plus GitHub token
           # shapes, which the sibling lanes do not cover.
-          perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g; s/\bgh[pousr]_[A-Za-z0-9]{20,}\b/[REDACTED-GH-TOKEN]/g; s/\bgithub_pat_[A-Za-z0-9_]{20,}\b/[REDACTED-GH-TOKEN]/g' "${RUNNER_TEMP:-/tmp}/fp-comment.md"
+          # No redactor, or a scrub that fails, is a refusal: the file is removed so
+          # no later `always()` step can publish it raw.
+          if [ -z "${REDACTOR:-}" ] || [ ! -s "$REDACTOR" ] \
+            || ! python3 "$REDACTOR" --mode text "${RUNNER_TEMP:-/tmp}/fp-comment.md"; then
+            echo "::error::the base-owned redactor could not scrub ${RUNNER_TEMP:-/tmp}/fp-comment.md. Refusing to publish it raw."
+            rm -f "${RUNNER_TEMP:-/tmp}/fp-comment.md"
+            exit 1
+          fi
+          # Name the description revision this verdict read, so staleness is
+          # readable without comparing timestamps: `created_at` is frozen at the
+          # comment's first revision and `updated_at` moves on every in-place
+          # edit, so neither can date a verdict. Stamped by the workflow from the
+          # capture step's own digest, never by the model, and appended AFTER the
+          # redaction pass so that pass cannot rewrite the digest. Only a real
+          # verdict is stamped -- a "could not complete" notice read no
+          # description and would be claiming one.
+          #
+          # Placed BEFORE the withhold gate below, which rebuilds this file from
+          # scratch: a withheld body therefore drops the stamp along with the
+          # verdict it belonged to, rather than carrying a description claim on a
+          # notice that reports no verdict at all.
+          if [ -n "$badge" ] && [ -n "${DESCRIPTION_DIGEST:-}" ]; then
+            {
+              echo
+              echo "### Description read"
+              echo
+              echo "[DESCRIPTION-READ] $DESCRIPTION_DIGEST"
+              echo
+              echo "_That sha256 names the PR description this verdict read. Recompute it with \`.github/scripts/pr-description-capture.sh\`; if it differs, the description changed after this verdict was formed and any finding drawn from the description is unproven._"
+            } >> "${RUNNER_TEMP:-/tmp}/fp-comment.md"
+          fi
           # WITHHOLD GATE. The reviewer runs with read-only tools and no shell or
           # network, so the review text is its ONLY channel to a public audience --
           # which means this boundary, not the prompt's "never output secrets"
@@ -600,61 +797,470 @@ jobs:
             echo "verdict=UNKNOWN" >> "$GITHUB_OUTPUT"
             {
               echo "$MARKER"
-              echo "## First Principles Review (Fable 5) — ⚠️ output withheld"
+              echo "## First Principles Review (Opus 5.5) — ⚠️ output withheld"
               echo
-              echo "_The review of \`$HEAD\` produced text that still matched a credential shape after redaction, so the body was withheld and no verdict is reported. See the job logs. Advisory — does not block merge._"
+              echo "_The review of \`$HEAD\` produced text that still matched a credential shape after redaction, so the body was withheld and no verdict is reported. See the job logs. Does not block merge._"
             } > "${RUNNER_TEMP:-/tmp}/fp-comment.md"
           fi
-          # CONCERNS is where a design/premise/UX risk actually lives, and today
-          # it is invisible: the check reports green and 31 of 57 CONCERNS drew
-          # no human reply at all. Distil the punchline and the Watch section so
-          # the Checks UI itself can carry them -- no new command, no convention
-          # to learn. Reads the ALREADY-REDACTED body, so the redaction and
-          # withhold gates upstream stay the only publish boundary. Caps with a
-          # Bash substring rather than a pipe into `head`: a piped cap SIGPIPEs
-          # the writer, and `pipefail` turns that into a step failure on exactly
-          # the long body the cap exists for.
-          concerns_digest() {
-            local file="$1" header="$2" marker="$3" digest=""
-            [ -f "$file" ] || return 0
-            digest="$(awk -v header="^$header" -v marker="$marker" '
-              index($0, marker) == 1 { exit }
-              !seen && $0 ~ header { seen = 1; next }
-              !seen { next }
-              seen == 1 && NF { print; seen = 2; next }
-              /^### / { watch = ($0 ~ /^### (Watch|Not justified as shipped)[[:space:]]*$/) }
-              watch { print }
-            ' "$file")"
-            printf '%s' "${digest:0:2000}"
-          }
-          # A same-repo job cannot report itself `neutral` the way the fork
-          # lanes' check-runs can, so hand the digest to the status step, which
-          # turns it into a job annotation and a run summary. Multi-line output
-          # uses a random delimiter: the value is model text, so a fixed one
-          # could be closed early by the body itself.
-          if [ "$verdict" = "CONCERNS" ]; then
-            concerns_body="$(concerns_digest "${RUNNER_TEMP:-/tmp}/fp-comment.md" "First-Principles-Verdict:" "[FIRST-PRINCIPLES-REVIEWED]")"
-            if [ -n "$concerns_body" ]; then
-              # Here-string, not `printf | awk`: awk exits on the first line, so a
-              # pipe would SIGPIPE the writer and `pipefail` would read 141 as a
-              # step failure on exactly the long body this exists to summarise.
-              concerns_punchline="$(awk 'NF { print; exit }' <<< "$concerns_body")"
-              printf 'concerns_punchline=%s\n' "$concerns_punchline" >> "$GITHUB_OUTPUT"
-              delim="CONCERNS_DIGEST_${RANDOM}${RANDOM}_EOF"
-              {
-                printf 'concerns_digest<<%s\n' "$delim"
-                printf '%s\n' "$concerns_body"
-                printf '%s\n' "$delim"
-              } >> "$GITHUB_OUTPUT"
+          # ONE publication primitive for every marker-comment write in this
+          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
+          # of them, the way it already pins guarded_comment_upsert, so neither
+          # the budget nor the honesty below can drift lane by lane.
+          #
+          # A marker comment is the ONLY thing a freshness verifier reads. A
+          # write that does not land therefore leaves the PR indistinguishable
+          # from one no lane ever reviewed: kirocrew-prepare-pr's pr_status.py refuses a
+          # PR whose check-runs, readiness status and mergeable state all pass,
+          # and the only way out is manufacturing a new head -- which re-rolls
+          # the non-deterministic review lanes and discards the verdicts they
+          # already earned (#12952).
+          #
+          # Two properties, both previously absent. The write is RETRIED on the
+          # same budget as this lane's gating reads, because the API exhaustion
+          # that makes those reads fail is the same exhaustion that makes this
+          # write fail, and it lasts minutes rather than the single attempt the
+          # write used to get. And the outcome is RETURNED instead of
+          # swallowed: the write ran under `|| true` with its "Updated" or
+          # "Created" line printed unconditionally afterwards, so a lost write
+          # announced itself as a published one. The caller owns the wording,
+          # because only the caller knows which body it was publishing.
+          #
+          # Redirects the command's own stdout: `gh api` echoes the whole
+          # comment object and nothing here reads it, while this function's own
+          # attempt lines stay on stdout where the job log shows them.
+          # First argument is the CONFIRM NEEDLE and the second is the body
+          # file being published. Together they decide whether a failed write
+          # may be repeated.
+          #
+          # A PATCH is idempotent -- same URL, same body -- so it passes "" ""
+          # and every attempt simply repeats. A create is a POST and is NOT
+          # idempotent: GitHub can ACCEPT it and still lose the ack, so a blind
+          # second attempt plants a SECOND marker comment. Every id lookup in
+          # these lanes selects exactly one comment, so a later human override
+          # patches only that one while the duplicate keeps its own
+          # [BLOCK-MERGE] line, and pr_status.py stays blocked until somebody
+          # finds and deletes the extra comment by hand.
+          #
+          # So a create may only repeat once it can RECOGNISE its own work, and
+          # the needle is the current head's stamp. Only a run for this head
+          # writes `<stamp> <sha>`, so a comment left by an older head cannot
+          # satisfy it. Marker presence cannot be the needle: every body these
+          # lanes write starts with the lane marker, so a stale comment would
+          # answer "landed" for a verdict that was never published, and the
+          # retry that would have published it would be abandoned -- which is
+          # this whole defect class arriving from the other side.
+          #
+          # A body with no such stamp (a review-failure notice) has nothing a
+          # later query can recognise, so it gets ONE attempt: a lost ack and a
+          # rejection are indistinguishable for it, and repeating could
+          # duplicate it undetectably.
+          #
+          # An unreadable confirmation also stops the create rather than
+          # repeating it. The two outcomes are not symmetric: a duplicate
+          # strands the gate with no automatic recovery, while an unpublished
+          # verdict is annotated, leaves the gate honestly red, and a re-run
+          # fixes it. That is the rule the head-confirmation read above
+          # follows -- the destructive half must not proceed on an unknown.
+
+          # A guarded comment read that exhausts its budget reports the fact and
+          # not the cause, and the causes do not share a remedy: installation
+          # throttling is cured by the re-run this step's annotation recommends,
+          # while an expired or rotated credential and a permissions change on this
+          # lane's token each spend another full model review to land in the same
+          # place. So the LAST attempt's exit status and error text are kept and
+          # reported once, inside the annotation a failed publish already writes.
+          # The per-attempt lines are left alone: a read that later succeeds says
+          # nothing new, so an ordinary flake does not fill the log with six copies
+          # of one sentence.
+          #
+          # What the note carries is an API error body, which can echo a token
+          # prefix, an Authorization or Cookie header, the request URL with its
+          # query string, an account id, or a path on the runner. So it is scrubbed
+          # before it is printed and then bounded to one short line. A URL and a
+          # path are each dropped WHOLE rather than trimmed, because the query
+          # string is the part that carries a credential and neither is needed to
+          # tell these causes apart.
+          #
+          # This reports; it does not decide. Whether anything reached the slot is
+          # still answered by the write path alone, so a read that failed cannot
+          # turn an unpublished verdict into a published one.
+          READ_ERR_FILE="${RUNNER_TEMP:-/tmp}/comment-read-stderr.txt"
+          READ_FAILURE_NOTE=""
+          note_read_failure() {
+            local rc="$1" subject="$2" errfile="$3" text=""
+            if [ -s "$errfile" ]; then
+              text="$(perl -0777 -pe '
+                s{\bhttps?://\S*}{[REDACTED-URL]}g;
+                s/\bgh[pousr]_[A-Za-z0-9]{16,}\b/[REDACTED-GH-TOKEN]/g;
+                s/\bgithub_pat_[A-Za-z0-9_]{16,}\b/[REDACTED-GH-TOKEN]/g;
+                s/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g;
+                s{arn:aws\S*}{[REDACTED-ARN]}g;
+                s/(?i)\bbearer\s+\S+/Bearer [REDACTED]/g;
+                s/(?i)\b(authorization|cookie|set-cookie|x-api-key|private-token)\b\s*:[^\r\n]*/$1: [REDACTED]/g;
+                s/(?i)\b(token|secret|password|passwd|api_key|apikey)\b\s*[:=]\s*\S+/$1=[REDACTED]/g;
+                s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g;
+                s/\b[0-9]{12}\b/[REDACTED-ACCT]/g;
+                s{(?:/[A-Za-z0-9._@+-]+){2,}/?}{[REDACTED-PATH]}g;
+                s/[^[:print:]]+/ /g;
+                s/\s+/ /g;
+                s/\A //;
+                s/ \z//;
+              ' "$errfile" | cut -c1-240)"
             fi
-          fi
+            READ_FAILURE_NOTE="$subject exited $rc and reported: ${text:-(nothing on stderr)}"
+          }
+          # A verdict this run computed and did NOT publish exists only inside this
+          # job. Nothing on the board retains it, because both carriers the board
+          # has are REPLACED rather than appended: the lane's marker comment is
+          # updated in place, so a later run's body takes this one's slot, and a
+          # check-run's conclusion and annotations are superseded by the next
+          # attempt's. A workflow artifact is neither -- it is written once under a
+          # name unique to this run and attempt, and no later run can rewrite it --
+          # so that is where a withheld verdict is kept.
+          #
+          # What this retains is the difference between "a verdict exists and did
+          # not reach its slot" and "no verdict was reached". Those two are
+          # indistinguishable on the board: an annotation can read like a published
+          # verdict while the write was refused, and a slot can be occupied by
+          # ANOTHER revision's verdict. So the receipt records the outcome and the
+          # head the verdict was computed for, beside the verdict text itself.
+          #
+          # The text comes from `body_file` when the caller named one, and otherwise
+          # off the write command this function was handed: a PATCH carries its body
+          # as a `body=` argument instead of a file, and a verdict retained without
+          # its text answers nothing a reader needs.
+          #
+          # This never changes what the caller sees. It runs only on the arms that
+          # already return a withheld status, returns 0 whatever it manages to
+          # write, and a retention that fails leaves the withhold reported exactly
+          # as it is reported today.
+          retain_unpublished_verdict() {
+            local outcome="$1" rc="$2" needle="$3" body_file="$4" arg
+            local dir name now candidate note
+            shift 4
+            # The body is resolved FIRST, because whether there is anything to
+            # retain is a question about the body and not about which arm was
+            # reached. It comes from `body_file` when the caller named one, and
+            # otherwise off the write command this function was handed: a PATCH
+            # carries its body as a `body=` argument instead of a file.
+            candidate="${RUNNER_TEMP:-/tmp}/withheld-verdict-candidate.md"
+            if [ -n "$body_file" ] && [ -f "$body_file" ]; then
+              cat "$body_file" > "$candidate" || return 0
+            else
+              : > "$candidate"
+              for arg in "$@"; do
+                case "$arg" in
+                  body=*)
+                    printf '%s\n' "${arg#body=}" > "$candidate"
+                    break
+                    ;;
+                esac
+              done
+            fi
+            # A WITHHELD ARM IS NOT A WITHHELD VERDICT, and conflating them
+            # inverts the whole point of retaining anything. Several of these
+            # arms are reached with a body that is not a verdict at all: a
+            # skip notice, a staleness notice, or the failure notice an
+            # incomplete review writes when it reached no verdict. Two of them
+            # run before the caller's own stamp check, and the no-stamp arm is
+            # reached precisely BECAUSE the body carries no stamp. Recording any
+            # of those would assert that a verdict exists for this revision when
+            # none was ever reached -- and because the record is unique per run
+            # and attempt, no later run can contradict it.
+            #
+            # So retention is gated on the body PROVING it carries a verdict for
+            # this head. The caller's needle is that proof where it supplied one,
+            # since it is the exact stamp it requires for a landing. Where it did
+            # not -- the replace path names a comment id instead -- the proof is
+            # the same head-scoped stamp read off the text. Both directions fail
+            # CLOSED: an unprovable body is not retained, which leaves the arm
+            # reported exactly as it is reported without this mechanism.
+            if [ -n "$needle" ]; then
+              if ! grep -Fq "$needle" "$candidate"; then
+                echo "Nothing is retained for $HEAD: the body this run could not write carries no $needle stamp, so this run reached no verdict, and a record of one would assert a verdict that never existed."
+                rm -f "$candidate"
+                return 0
+              fi
+            elif ! grep -Eq -- "-(REVIEWED|OVERRIDE)\] $HEAD" "$candidate"; then
+              echo "Nothing is retained for $HEAD: the body this run could not write carries no head-scoped review stamp, so this run reached no verdict, and a record of one would assert a verdict that never existed."
+              rm -f "$candidate"
+              return 0
+            fi
+            # And WHAT the record claims is the caller's to state, because only
+            # the caller knows what its arm established. `withheld` is reserved
+            # for KNOWN non-publication: no write was attempted, or a successful
+            # read confirmed this run's write is not in the slot. Every other arm
+            # attempted a write whose absence was never confirmed, and a write
+            # that returned non-zero may still have landed -- the API can commit
+            # a POST and lose the acknowledgement, and the read that would settle
+            # it can fail in the same degradation. Those record
+            # `publication_unknown`, which is the honest answer and the one a
+            # reader can act on; claiming non-publication there would be the same
+            # fault as claiming a verdict that never existed, pointing the other
+            # way.
+            dir="${RUNNER_TEMP:-/tmp}/withheld-review-verdict"
+            # The head SHA leads the name so every record for one revision is
+            # reachable from the revision alone -- the pointer that cannot dangle,
+            # because it is derived rather than announced. Run id and attempt follow
+            # and make it unique, which is what lets a SECOND run on the same head
+            # add a record BESIDE the first instead of replacing it.
+            name="withheld-verdict-${HEAD}-${GITHUB_JOB:-job}-r${GITHUB_RUN_ID:-0}-a${GITHUB_RUN_ATTEMPT:-1}"
+            mkdir -p "$dir" || return 0
+            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
+            {
+              echo "outcome=$outcome"
+              echo "head=$HEAD"
+              echo "write_rc=$rc"
+              echo "withheld_at=$now"
+              echo "repo=${REPO:-}"
+              echo "pr=${PR:-}"
+              echo "workflow=${GITHUB_WORKFLOW:-}"
+              echo "job=${GITHUB_JOB:-}"
+              echo "run_id=${GITHUB_RUN_ID:-}"
+              echo "run_attempt=${GITHUB_RUN_ATTEMPT:-}"
+              echo "artifact=$name"
+            } > "$dir/receipt.txt" || return 0
+            mv "$candidate" "$dir/verdict.md" || return 0
+            printf 'retained_verdict_artifact=%s\n' "$name" >> "${GITHUB_OUTPUT:-/dev/null}"
+            if [ "$outcome" = "withheld" ]; then
+              note="did NOT publish it"
+            else
+              note="could not confirm whether it published it -- a write was attempted and its absence from the slot was never confirmed, so this record says UNKNOWN rather than claiming non-publication"
+            fi
+            echo "::notice::This run computed a verdict for $HEAD and $note (write status $rc). The verdict text is retained in workflow artifact $name, on run ${GITHUB_RUN_ID:-} attempt ${GITHUB_RUN_ATTEMPT:-}. An artifact named withheld-verdict-$HEAD... holds a verdict that EXISTS for this revision, and its receipt's outcome field says whether it reached the comment slot -- neither of which is the same as this revision having no verdict."
+          }
+          retry_comment_write() {
+            local slot="$1" needle="$2" body_file="$3" target="$4"
+            local attempt landed head_now ov_body
+            local occupied slot_ok slot_id mine_id slot_rc ov_rc
+            shift 4
+            # Two reads here answer two DIFFERENT questions, which is why they
+            # match on two different needles.
+            #
+            # Before writing: is the lane's slot occupied? The slot is every
+            # comment STARTING WITH the lane marker, whatever head it carries,
+            # because that is what each lane's own id lookup selects. A caller
+            # reaches a create whenever its own lookup could not answer, so an
+            # occupant it could not see is exactly when a POST puts a second
+            # comment in a slot that holds one: a later override patches
+            # whichever id the lookup picks, the other keeps its own
+            # [BLOCK-MERGE] line, and no run undoes it. A create therefore
+            # proceeds only once the slot is CONFIRMED empty -- an occupant and
+            # an unreadable answer both stop it. That trade runs the opposite
+            # way from how it reads: a withheld verdict is published by
+            # re-running the lane, while a duplicated one does not come back out
+            # without a human deleting a comment.
+            #
+            # After writing: did THIS write land? That is the current head's
+            # stamp, below. The slot marker cannot answer it, because an older
+            # head's comment carries the marker too and would report a verdict
+            # published that never was. So the slot read carries the stamp as
+            # well, and answers with BOTH facts: which comment holds the slot,
+            # and whether that comment is a verdict for this head. An occupant
+            # that is stops this run with success, because the PR does hold a
+            # current verdict. An occupant that is not stops it too, and the
+            # caller says so with an ::error:: while its step stays green: these
+            # lanes are advisory, and the readiness aggregator turns a FAILED one
+            # into a blocking verdict on the required check, so failing here
+            # would invent a BLOCK nobody judged out of an infrastructure fault.
+            # The annotation is what says so: the required readiness status reads
+            # check-run CONCLUSIONS and has no stamp-freshness read, so the reader
+            # that catches a head with no verdict is kirocrew-prepare-pr's own marker
+            # evaluation, run before a PR is called ready.
+            if [ -n "$slot" ]; then
+              occupied=""
+              slot_ok=""
+              slot_rc=0
+              for attempt in 1 2 3 4 5 6; do
+                slot_rc=0
+                occupied="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                  --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$slot\"))) | \"\(.id) \(if (.body | contains(\"$needle\")) then \"mine\" else \"other\" end)\"" 2>"$READ_ERR_FILE")" || slot_rc=$?
+                if [ "$slot_rc" -eq 0 ]; then
+                  slot_ok=1
+                  break
+                fi
+                occupied=""
+                echo "Reading this PR's comments to find this lane's slot failed on attempt $attempt."
+                if [ "$attempt" -lt 6 ]; then
+                  sleep "$(( attempt * 5 ))"
+                fi
+              done
+              if [ -z "$slot_ok" ]; then
+                note_read_failure "$slot_rc" "reading this PR's comments to find this lane's slot" "$READ_ERR_FILE"
+                echo "Whether this lane's slot is already taken is unreadable after 6 attempts, so nothing was posted: re-running this lane publishes the verdict, and a second comment in the slot does not come back out without a human."
+                retain_unpublished_verdict withheld 1 "$needle" "$body_file" "$@"
+                return 1
+              fi
+              if [ -n "$occupied" ]; then
+                slot_id="$(printf '%s\n' "$occupied" | awk 'NR == 1 { print $1 }')"
+                # A slot already holding a verdict for THIS head is its own
+                # answer: an earlier run for this same head got there first, the
+                # stamp readers find the head they are looking for, and this run
+                # wrote nothing. What that costs is not the same in both lane
+                # classes, so it is reported rather than judged here. An advisory
+                # lane loses nothing it can act on. A fail-closed lane loses the
+                # fresh sample a re-run was asked for, and the earlier verdict it
+                # supersedes keeps whatever it said -- a blocking line included.
+                # Status 3 is that case and only that case, so each caller can
+                # treat it on its own terms without this function replacing a
+                # comment it has no standing to replace.
+                mine_id="$(printf '%s\n' "$occupied" | awk '$2 == "mine" { print $1; exit }')"
+                if [ -n "$mine_id" ]; then
+                  echo "Comment #$mine_id already carries a verdict for this head, written by an earlier run; this run wrote nothing."
+                  return 3
+                fi
+                # An occupied slot is not written, whatever head the occupant
+                # names and whatever this body is. One comment answers for this
+                # lane, so every alternative loses something a run cannot get
+                # back: a second comment beside it is the one a later human
+                # override cannot reach, and overwriting it can discard a
+                # verdict that belongs to a head this run has no
+                # standing to judge -- a concurrent run's for the same head, or
+                # the CURRENT head's when this run's own head is already
+                # superseded.
+                #
+                # What is lost by refusing is recoverable and loud: this run's
+                # verdict is not published, the caller says so, and re-running
+                # the lane publishes it once the slot is current. Status 2 is
+                # that case specifically, so no caller can read it as a write.
+                echo "Comment #$slot_id already holds this lane's slot, so this run wrote NOTHING: a second comment beside it is the one a later override cannot reach, and overwriting it can discard a verdict for a head this run cannot judge. Re-run this lane once that comment is no longer current."
+                retain_unpublished_verdict withheld 2 "$needle" "$body_file" "$@"
+                return 2
+              fi
+            fi
+            if [ -n "$needle" ] && ! grep -Fq "$needle" "$body_file"; then
+              if "$@" >/dev/null; then
+                return 0
+              fi
+              echo "This body carries no current-head stamp, so a lost write cannot be told from a rejected one; not posting again."
+              retain_unpublished_verdict publication_unknown 1 "$needle" "$body_file" "$@"
+              return 1
+            fi
+            for attempt in 1 2 3 4 5 6; do
+              if [ "$attempt" -gt 1 ] && [ -n "$needle" ]; then
+                # Re-read the whole SLOT, not only bodies carrying this needle.
+                # The slot was confirmed empty before the first write, so anything
+                # in it now arrived during the backoff: either this run's own
+                # write, whose ack was lost, or a run for a DIFFERENT head that
+                # published while this one waited. Reading only this needle made
+                # the second case invisible, and the retry then posted beside that
+                # verdict or overwrote it.
+                slot_rc=0
+                landed="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                  --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$slot\"))) | \"\(.id) \(if (.body | contains(\"$needle\")) then \"mine\" else \"other\" end)\"" 2>"$READ_ERR_FILE")" || slot_rc=$?
+                if [ "$slot_rc" -ne 0 ]; then
+                  note_read_failure "$slot_rc" "re-reading this PR's comments to confirm whether the previous write landed" "$READ_ERR_FILE"
+                  echo "Cannot confirm whether the previous attempt landed, so not posting again."
+                  retain_unpublished_verdict publication_unknown 1 "$needle" "$body_file" "$@"
+                  return 1
+                fi
+                if [ -n "$landed" ]; then
+                  mine_id="$(printf '%s\n' "$landed" | awk '$2 == "mine" { print $1; exit }')"
+                  if [ -n "$mine_id" ]; then
+                    echo "Comment #$mine_id carries this stamp and the slot was confirmed empty before this run wrote, so the previous attempt landed; not posting again."
+                    return 0
+                  fi
+                  echo "Comment #$(printf '%s\n' "$landed" | awk 'NR == 1 { print $1 }') took this lane's slot while this run was retrying, and it is not this run's write, so this run wrote NOTHING: overwriting it would discard a verdict for another head, and posting beside it leaves a comment a later override cannot reach."
+                  retain_unpublished_verdict withheld 2 "$needle" "$body_file" "$@"
+                  return 2
+                fi
+              fi
+              # Before REPEATING a write, re-confirm this run's head is
+              # still the PR's. The read above covers a create: the slot is
+              # re-read, so a comment another run put there during the backoff
+              # is seen. A replace has no such evidence -- the caller names the
+              # id and this function never reads that comment's body -- so a
+              # repeat is blind, and a newer head's verdict written between two
+              # attempts is restored away by the second one. The head is the
+              # standing the write rests on, so it is re-checked on the same
+              # terms as the write it gates: an answer that says the head moved
+              # stops the repeat, and an unreadable answer stops it too, because
+              # repeating is the destructive half and must not proceed on an
+              # unknown. Stopping costs the recoverable side: this run's verdict
+              # is unpublished, the caller says so, and a re-run publishes it.
+              #
+              # RESIDUAL, which cannot be closed from here: two runs on the SAME
+              # head are alike to this check, so a same-head run that replaces
+              # the comment between two attempts has its body overwritten by the
+              # repeat. Both bodies are verdicts for that head, so every stamp
+              # reader finds the head it looks for and no gate is stranded; what
+              # is lost is which sample is displayed. Telling the two apart needs
+              # a body pre-image or a conditional write, and this API offers
+              # neither an If-Match nor an edit history.
+              if [ "$attempt" -gt 1 ]; then
+                if ! head_now="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/dev/null)" \
+                  || [ -z "$head_now" ]; then
+                  echo "Whether $HEAD is still this PR's head is unreadable, so this write was not repeated: a repeat can replace a newer head's verdict with a superseded one. Re-run this lane to publish this verdict."
+                  retain_unpublished_verdict publication_unknown 1 "$needle" "$body_file" "$@"
+                  return 1
+                fi
+                if [ "$head_now" != "$HEAD" ]; then
+                  echo "This PR's head is now $head_now, not $HEAD, so this write was not repeated: the run for that head owns this lane's slot, and repeating would replace its verdict with a superseded one."
+                  return 4
+                fi
+                # A replace names ONE comment, and the head check above cannot
+                # see a same-head writer. The one same-head body this repeat
+                # must never restore over is a human decision: an accepted
+                # override replaces this slot's comment, and putting a verdict
+                # back on top of it leaves the block the override cleared,
+                # which no later run undoes. So a repeat re-reads the comment
+                # it is about to write and stops when that comment says a human
+                # overrode this lane.
+                #
+                # This is ONE bounded read, not a compare-and-set. It matches
+                # nothing but the override note, so it does not need a body
+                # pre-image, and a same-head rival's ordinary verdict is still
+                # overwritten -- the residual stated at the top of this
+                # function. An unreadable answer stops the repeat on the same
+                # terms as an unreadable head, because repeating is the
+                # destructive half.
+                if [ -n "$target" ]; then
+                  ov_rc=0
+                  ov_body="$(gh api "repos/$REPO/issues/comments/$target" --jq '.body' 2>"$READ_ERR_FILE")" || ov_rc=$?
+                  if [ "$ov_rc" -ne 0 ]; then
+                    note_read_failure "$ov_rc" "reading the comment this repeat would overwrite, to check for an accepted human override" "$READ_ERR_FILE"
+                    echo "Comment #$target could not be read, so this write was not repeated: a repeat can restore a body over a human decision. Re-run this lane to publish this verdict."
+                    retain_unpublished_verdict publication_unknown 1 "$needle" "$body_file" "$@"
+                    return 1
+                  fi
+                  case "$ov_body" in
+                    *"human override accepted"*)
+                      echo "Comment #$target now carries an accepted human override, so this write was not repeated: the override stands, and this run's verdict is not what the PR presents because a human decided so."
+                      return 5
+                      ;;
+                  esac
+                fi
+              fi
+              if "$@" >/dev/null; then
+                return 0
+              fi
+              echo "Writing this lane's marker comment failed on attempt $attempt."
+              if [ "$attempt" -lt 6 ]; then
+                sleep "$(( attempt * 5 ))"
+              fi
+            done
+            retain_unpublished_verdict publication_unknown 1 "$needle" "$body_file" "$@"
+            return 1
+          }
           # Guarded upsert (#8292, #8344): the shared function below is defined
-          # byte-identically in every review lane; test_ai_review_workflows.py
+          # byte-identically in every review lane; test_ai_review_workflows_comment_writes.py
           # pins all copies to one canonical body so the invariant cannot
           # drift lane by lane.
           guarded_comment_upsert() {
             local marker="$1" stamp="$2" lane="$3" out_file="$4"
-            local matches existing lookup_ok pr_head="" attempt withhold=""
+            local matches existing lookup_ok pr_head="" attempt withhold="" write_rc
+            # What reached the slot is recorded as the step output `publication`,
+            # because every arm below returns 0 and the write status would
+            # otherwise end with this function. The fork Opus and GPT finalize
+            # steps read it: a verdict computed for this head is a pass there only
+            # once it is in the slot. `published` is this run's body in the slot,
+            # `superseded` a head this PR has moved past, and `not_published` every
+            # other arm. That includes an earlier run's sample for this head, which
+            # the PR then shows instead of this run's verdict, and an override note
+            # a repeat stopped at: that note names no head the repeat can check, and
+            # an override for THIS head is answered by the finalize step's own
+            # override input.
+            local verdict_read_rc superseded="" publication="not_published"
             # Find the bot's existing marker comment (first match wins) and
             # capture its id. Author filter: only a github-actions[bot]
             # comment can match, so a PR commenter cannot plant the marker and
@@ -666,20 +1272,32 @@ jobs:
             # pipeline lets head's early exit SIGPIPE the api call and misread
             # a successful lookup as a failure under pipefail (#8350).
             # Retry a transient failure: whether a comment exists is a gating
-            # input here, and one blip is not evidence that none does.
+            # input here, and one blip is not evidence that none does. The
+            # budget is six attempts with a 5s linear backoff, ~75s, because
+            # the failure this exists for is App-wide API exhaustion and the
+            # observed window lasted minutes -- the previous 1s/2s pair gave
+            # up after ~3 seconds and withheld a verdict that had already been
+            # earned (#12952). Costing runner time on a failure path is the
+            # cheap side of that trade: giving up costs a whole new head.
             lookup_ok=0
-            for attempt in 1 2 3; do
-              if matches="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" 2>/dev/null)"; then
+            verdict_read_rc=0
+            for attempt in 1 2 3 4 5 6; do
+              verdict_read_rc=0
+              matches="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" 2>"$READ_ERR_FILE")" || verdict_read_rc=$?
+              if [ "$verdict_read_rc" -eq 0 ]; then
                 lookup_ok=1
                 break
               fi
               matches=""
               echo "Reading this PR's comments failed on attempt $attempt."
-              if [ "$attempt" -lt 3 ]; then
-                sleep "$attempt"
+              if [ "$attempt" -lt 6 ]; then
+                sleep "$(( attempt * 5 ))"
               fi
             done
+            if [ "$verdict_read_rc" -ne 0 ]; then
+              note_read_failure "$verdict_read_rc" "reading this PR's comments to find this lane's comment" "$READ_ERR_FILE"
+            fi
             existing="$(printf '%s\n' "$matches" | awk 'NR == 1')"
             # This lane's marker comment is ONE slot shared by every run on the
             # PR, and the REST comments API has no If-Match, so a write to it
@@ -704,70 +1322,198 @@ jobs:
               # keyed per head so they are not cancelled -- while a cancelled
               # same-repo run still executes this if:always() step. So confirm
               # this run is still the PR's head before claiming the slot.
-              # Retry a transient read the way this lane's other gating reads
-              # do, then treat an unreadable head as NOT confirmed: writing is
+              # Retry a transient read on the same widened budget as the
+              # comment lookup above -- one exhaustion window fails both --
+              # then treat an unreadable head as NOT confirmed: writing is
               # the destructive half, so it must not proceed on an unknown.
-              for attempt in 1 2 3; do
+              for attempt in 1 2 3 4 5 6; do
                 if pr_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')" \
                   && [ -n "$pr_head" ]; then
                   break
                 fi
                 pr_head=""
                 echo "Reading this PR's head sha failed on attempt $attempt."
-                if [ "$attempt" -lt 3 ]; then
-                  sleep "$attempt"
+                if [ "$attempt" -lt 6 ]; then
+                  sleep "$(( attempt * 5 ))"
                 fi
               done
               if [ -z "$pr_head" ]; then
-                withhold="this PR's head was unreadable after 3 attempts, so $HEAD cannot be confirmed current"
+                withhold="this PR's head was unreadable after 6 attempts, so $HEAD cannot be confirmed current"
               elif [ "$pr_head" != "$HEAD" ]; then
+                # A verdict for a head this PR has MOVED PAST is not worth
+                # retaining, and the write primitive already says so by not
+                # retaining on its own status 4: the run for the current head
+                # publishes the verdict that counts, so a record here would
+                # point a reader at a revision nobody is reviewing.
+                superseded=1
+                publication="superseded"
                 withhold="$HEAD is no longer this PR's head ($pr_head)"
               fi
             fi
             if [ -n "$withhold" ]; then
+              # BOTH arms below withhold BEFORE any write is attempted, so
+              # neither reaches the retention the write primitive performs on
+              # its own withheld arms -- and a verdict that never got as far as
+              # a write is exactly as lost as one whose write failed. So they
+              # retain here, on the primitive's own terms: `withheld`, because
+              # no write was attempted at all and that is the strongest form of
+              # KNOWN non-publication, and the caller's `$stamp $HEAD` as the
+              # proof the body is a verdict for THIS head.
+              #
+              # That proof is also what keeps the no-verdict arm out without a
+              # second condition here: a run that reached no verdict withholds
+              # a failure notice carrying no stamp, so retention declines it
+              # and no record claims a verdict nobody reached. The one case the
+              # proof cannot decide is a head this PR has moved past, whose
+              # body does carry a stamp -- `superseded` is that case, and it is
+              # excluded for the same reason status 4 retains nothing.
+              #
+              # The write status is `none`, not a number: no write was
+              # attempted, and every numeric value would name one that returned
+              # it.
+              #
               # A lookup that ERRORED is not "no comment exists": taking the
               # create path there plants a second marker comment over a
               # possibly-live verdict, which no later run undoes.
               if [ "$lookup_ok" -eq 0 ]; then
-                echo "Withholding $lane comment for $HEAD ($withhold); the comment lookup also failed, so nothing was posted"
+                echo "::warning::Withholding $lane comment for $HEAD ($withhold); the comment lookup also failed, so nothing was posted${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+                if [ -z "$superseded" ]; then
+                  retain_unpublished_verdict withheld none "$stamp $HEAD" "$out_file"
+                fi
+                printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
                 return 0
               fi
               if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-                echo "Withholding $lane comment for $HEAD ($withhold); left existing comment #$existing untouched"
+                echo "::warning::Withholding $lane comment for $HEAD ($withhold); left existing comment #$existing untouched"
+                if [ -z "$superseded" ]; then
+                  retain_unpublished_verdict withheld none "$stamp $HEAD" "$out_file"
+                fi
+                printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
                 return 0
               fi
               # The lookup SUCCEEDED and found nothing, so there is no verdict
               # to lose: posting the body as a NEW comment buries nothing.
-              gh pr comment "$PR" --body-file "$out_file" || true
-              echo "Created new $lane comment"
+              write_rc=0
+              retry_comment_write "$marker" "$stamp $HEAD" "$out_file" "" \
+                gh pr comment "$PR" --body-file "$out_file" || write_rc=$?
+              if [ "$write_rc" -eq 0 ]; then
+                echo "Published $lane comment for $HEAD"
+              elif [ "$write_rc" -eq 3 ]; then
+                echo "$lane verdict for $HEAD is already in this lane's slot, published by a concurrent run; this run wrote nothing and the PR is not missing a verdict."
+              elif [ "$write_rc" -eq 4 ]; then
+                echo "$lane stopped publishing its $HEAD body because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
+              elif [ "$write_rc" -eq 2 ]; then
+                echo "::warning::$lane wrote no $HEAD notice because this lane's slot is already taken; nothing was overwritten.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              else
+                echo "::error::$lane could not post its $HEAD notice, so this PR carries no $stamp comment at all.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              fi
+              case "$write_rc" in
+                0) publication="published" ;;
+                4) publication="superseded" ;;
+              esac
+              printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
               return 0
             fi
             if [ "$lookup_ok" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
-              gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
-                --field body="$(cat "$out_file")" >/dev/null || true
-              echo "Updated existing $lane comment #$existing"
+              write_rc=0
+              retry_comment_write "" "" "" "$existing" gh api --method PATCH \
+                "repos/$REPO/issues/comments/$existing" \
+                --field body="$(cat "$out_file")" || write_rc=$?
+              if [ "$write_rc" -eq 0 ]; then
+                echo "Updated existing $lane comment #$existing"
+              elif [ "$write_rc" -eq 4 ]; then
+                echo "$lane stopped publishing its $HEAD verdict to comment #$existing because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
+              elif [ "$write_rc" -eq 5 ]; then
+                echo "$lane left comment #$existing alone because it carries an accepted human override for this lane; the override stands and this run's verdict is not published."
+              else
+                echo "::error::$lane produced a verdict for $HEAD but could not publish it to comment #$existing. That comment still carries an older head, so every marker-freshness check reads this PR as unreviewed for $HEAD.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              fi
             else
               # No existing comment -- or a lookup that could not confirm one
-              # -- falls through to CREATE either way: a completed verdict for
-              # the confirmed current head must never be dropped because the
-              # comment lookup failed, since a duplicate comment is
-              # recoverable and an unposted verdict is not (#8350).
-              gh pr comment "$PR" --body-file "$out_file" || true
-              echo "Created new $lane comment"
+              # -- falls through to CREATE either way, because a completed
+              # verdict for the confirmed current head must not be dropped
+              # merely because THIS lookup failed. The write re-reads the slot
+              # first and refuses whenever ANY comment holds it, or the answer
+              # cannot be read, so an unconfirmed lookup does not become a
+              # second comment in the slot (#8350).
+              write_rc=0
+              retry_comment_write "$marker" "$stamp $HEAD" "$out_file" "" \
+                gh pr comment "$PR" --body-file "$out_file" || write_rc=$?
+              if [ "$write_rc" -eq 0 ]; then
+                echo "Published $lane comment for $HEAD"
+              elif [ "$write_rc" -eq 3 ]; then
+                echo "$lane verdict for $HEAD is already in this lane's slot, published by a concurrent run; this run wrote nothing and the PR is not missing a verdict."
+              elif [ "$write_rc" -eq 4 ]; then
+                echo "$lane stopped publishing its $HEAD body because this PR has moved to a newer head; the run for that head publishes the verdict that counts, so nothing is missing for it."
+              elif [ "$write_rc" -eq 2 ]; then
+                echo "::error::$lane produced a verdict for $HEAD but this lane's slot is already taken, so nothing was written and nothing was overwritten. The PR carries no verdict for this head; re-run this lane once that comment is not the current one.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              else
+                echo "::error::$lane produced a verdict for $HEAD but could not publish it, so this run's verdict is not in the slot.${READ_FAILURE_NOTE:+ Cause of the failed comment read: $READ_FAILURE_NOTE}"
+              fi
             fi
+            case "$write_rc" in
+              0) publication="published" ;;
+              4) publication="superseded" ;;
+            esac
+            printf 'publication=%s\n' "$publication" >> "${GITHUB_OUTPUT:-/dev/null}"
           }
           guarded_comment_upsert "$MARKER" "[FIRST-PRINCIPLES-REVIEWED]" "First Principles Review" "${RUNNER_TEMP:-/tmp}/fp-comment.md"
 
       # Converts the verdict into the "First Principles Review" check status. A
       # real BLOCK verdict FAILS the check (emits ::error:: and exits 1) -- the
       # one case where the change's reason for existing is judged not to hold.
-      # Every other outcome stays NON-BLOCKING and exits 0: PASS/CONCERNS, the
+      # Every other outcome stays NON-BLOCKING and exits 0: PASS, the
       # Dependabot skip, the surface-scope skip, and -- critically -- any run
       # that DID NOT COMPLETE (Bedrock overload / throttle / 403 / action error →
       # UNKNOWN or empty verdict). An errored review must NEVER fail this gate;
       # only a genuine BLOCK does. Failing here only turns the check red -- it
       # gates merge only if added to required status checks (a repo setting, out
       # of scope). Do NOT widen the failing branch beyond BLOCK.
+      # Where a withheld verdict goes, so that it outlives the job that computed
+      # it. The step above reports a withheld verdict in an annotation, and an
+      # annotation is replaced by the next attempt's -- as is the marker comment
+      # it could not write into. An artifact is replaced by neither.
+      #
+      # It runs only when that step actually withheld one. The output it reads is
+      # written at the moment of withholding and nowhere else, so a published
+      # verdict uploads nothing, and a lane that reached no verdict at all leaves
+      # no record that could be mistaken for one. That is the distinction this
+      # exists to keep: a verdict that EXISTS and never reached its slot is not
+      # the same as no verdict, and on the board the two look alike.
+      #
+      # `error` rather than `ignore` on missing files: the output is set by the
+      # same code that writes the files, so an empty directory here is a fault in
+      # this mechanism and must be loud rather than silently produce no record.
+      - name: Retain this run's unpublished verdict
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          && steps.post.outputs.retained_verdict_artifact != ''
+          )
+        # NEVER fatal. A lane's conclusion is read by pr-readiness.yml, and for
+        # the three whole-design labels ANY non-success conclusion is reported as
+        # `<label> (BLOCK)` -- a judged-wrong verdict. So a transport flake here,
+        # or an `if-no-files-found: error` on a directory that did not survive,
+        # would invent a verdict nobody reached. Retention is evidence ABOUT a
+        # verdict and never part of one: it may be loud, and a failed step is
+        # still annotated, but it may not change what the lane concluded.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Named by the publish step: the head SHA leads, so every record for
+          # one revision is reachable from the revision alone, and the run and
+          # attempt follow, so a SECOND run on the same head adds its record
+          # beside the first instead of overwriting it.
+          name: ${{ steps.post.outputs.retained_verdict_artifact }}
+          path: ${{ runner.temp }}/withheld-review-verdict
+          if-no-files-found: error
+          # 90, not the 7 the sibling uploads use. Those are TRANSFER
+          # artifacts, alive only long enough to cross a job boundary; this
+          # one is the record itself, and a record that expires while its
+          # pull request is still open restores exactly the ambiguity it was
+          # added to remove -- and leaves the republisher nothing to read.
+          retention-days: 90
       - name: First-principles review status (gates on BLOCK)
         if: >-
           github.event.pull_request.head.repo.full_name == github.repository
@@ -780,8 +1526,6 @@ jobs:
           VERDICT: ${{ steps.post.outputs.verdict }}
           HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
-          CONCERNS_PUNCHLINE: ${{ steps.post.outputs.concerns_punchline }}
-          CONCERNS_DIGEST: ${{ steps.post.outputs.concerns_digest }}
         run: |
           if [ "$HUMAN_OVERRIDE" = "true" ]; then
             echo "Human judgment by $OVERRIDE_ACTOR overrides First Principles Review for $HEAD. Passing gate."
@@ -798,25 +1542,7 @@ jobs:
             NO_CONTRACT)
               echo "::warning::First-principles review could not run for $HEAD: .github/review-prompts/first-principles.md is absent from the base commit, so there is no trusted contract to review against (this is expected on the PR that introduces or moves it). NOT blocking."
               exit 0 ;;
-            PASS|CONCERNS)
-              # The exit contract is untouched: CONCERNS still exits 0. What
-              # changes is that it stops being SILENT -- a green tick told a
-              # reader nothing was worth reading, and 31 of 57 CONCERNS drew no
-              # reply. A job cannot report itself `neutral` the way the fork
-              # lanes' check-runs can, so the punchline goes on the job as an
-              # annotation and the Watch items go to the run summary, where the
-              # local prepare-pr loop and a human read the same text.
-              if [ "$VERDICT" = "CONCERNS" ]; then
-                punchline="${CONCERNS_PUNCHLINE:-read the Watch items in the First Principles Review comment on this PR}"
-                echo "::warning title=First Principles Review CONCERNS::$punchline"
-                if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-                  {
-                    echo "## First Principles Review — 🟡 CONCERNS (advisory)"
-                    echo
-                    printf '%s\n' "${CONCERNS_DIGEST:-$punchline}"
-                  } >> "$GITHUB_STEP_SUMMARY"
-                fi
-              fi
+            PASS)
               echo "First-principles review verdict for $HEAD: $VERDICT (non-blocking)."
               exit 0 ;;
             BLOCK)

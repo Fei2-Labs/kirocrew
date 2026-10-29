@@ -1,14 +1,16 @@
-import { memo, useRef, useState, useEffect, useCallback } from 'react'
+import { memo, useRef, useState, useEffect, useLayoutEffect, useCallback } from 'react'
 import { useScrollEdges } from '../hooks/useScrollEdges'
-import { ChevronLeft, ChevronRight, ArrowUp } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ArrowUp, Loader2 } from 'lucide-react'
 import { InstantTip, useInstantTip as useSharedInstantTip } from './InstantTip'
+import ErrorNotice from './ErrorNotice'
+import { Glass } from './Glass'
 
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 export type FollowUpLayout = 'multiline' | 'scroll'
 
 interface FollowUpBarProps {
-  options: string[]
+  options: readonly string[]
   picked: ReadonlySet<string>
   /**
    * Third argument is `sourceKey` AS IT WAS AT CLICK TIME (see `sourceKey`
@@ -24,6 +26,13 @@ interface FollowUpBarProps {
    */
   onSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   quickSend?: boolean
+  /**
+   * `false` for a single-select `[OPTION:]` row, where a new pick replaces the
+   * previous one; the chip tooltip then says "add to the message without
+   * sending" / "replace selection"
+   * instead of promising multi-select. Defaults to `true` (`[OPTIONS:]`).
+   */
+  multi?: boolean
   /** 'multiline' (default) wraps onto multiple rows; 'scroll' is a single-line horizontally-scrollable view. */
   layout?: FollowUpLayout
   /**
@@ -33,11 +42,31 @@ interface FollowUpBarProps {
    * (`FOLLOWUP_CHIP_DEBOUNCE_MS`) and the row can advance inside that window:
    * a byte-identical replacement footer re-renders the same chips WITHOUT
    * remounting them, so the pending timer survives and fires against a row the
-   * user never saw. A caller that acts on the click (e.g. the orchestrator
-   * plan dispatch) compares the snapshot with its current key and refuses the
-   * mismatch — see `usePlanActionMutation`.
+   * user never saw. A caller that acts on the click compares the snapshot
+   * with its current key and refuses the mismatch.
    */
   sourceKey?: string | null
+  /**
+   * Labels whose dispatch is outstanding: each spins and stops taking clicks,
+   * every other chip dims. Held while the action is UNACKNOWLEDGED, which
+   * outlasts the request — the plan latch survives the HTTP response. A set, not
+   * one label: Cancel is never blocked by a pending Go, so both can be
+   * outstanding and a single label would un-spin whichever came first. A surface
+   * that dispatches nothing (SideChat, ChatEmbed) passes neither prop.
+   */
+  pendingOptions?: ReadonlySet<string> | null
+  /**
+   * Labels whose click would be REFUSED — this is what `dim` means. Not "a sibling
+   * is busy", which put the disabled look on a live `Cancel` and had a cold reader
+   * conclude the stop control was locked. Wider than `pendingOptions` because the
+   * single-flight is per class: a held `Go` refuses `Go All`, while `Cancel` keeps
+   * its own latch and stays at full strength.
+   */
+  refusedOptions?: ReadonlySet<string> | null
+  /** Detail of the last failed dispatch, `null` when none failed. Any non-null
+   *  value draws ONE error row, `''` included — a rejection carrying no readable
+   *  message is still a failure to show. */
+  error?: string | null
 }
 
 /**
@@ -64,6 +93,23 @@ const CHIP_MAX_WIDTH = 'followup-chip'
  * `FollowUpBar.test.tsx` pins the two together.
  */
 const CHIP_ROW_GAP = 'gap-1.5'
+
+/** The blank at the trailing end of a scrolling chip row. With the row's own
+ *  gap before it (6px) it spans the arrow's 2px inset plus its 24px width and a
+ *  little air, so at the end of the scroll no chip sits under the arrow's spot. */
+const ARROW_GUTTER_CLASS = 'shrink-0 w-6 self-stretch'
+
+/**
+ * How long the left arrow's spot keeps swallowing clicks after the arrow
+ * unmounts at the start of the scroll. The start is where the first chip has
+ * to sit flush with the composer, so it cannot carry a blank the way the far
+ * end does; instead the arrow's footprint stays clickable-but-inert long
+ * enough to absorb the second click of a double click on the arrow, which
+ * would otherwise land on the first chip and send it. Above the 220ms
+ * single-click debounce so a pending chip timer cannot be armed through it.
+ * Exported so the test advances fake timers against this value.
+ */
+export const LEFT_ARROW_CLICK_SHIELD_MS = 400
 
 /**
  * Gap between consecutive chips' entrance animations. The whole option set is
@@ -140,14 +186,33 @@ function chipEntrance(index: number, animating: boolean): { className: string, s
 // Shape/typography shared by every chip body; the rounding and the flex sizing
 // (cap + shrink vs grow) are the only things that differ between a standalone
 // chip and the main button of a split-button, so they are supplied per-call
-// rather than baked in — see `splitMainChipClassName`.
-const CHIP_BASE = 'px-3 py-1.5 text-[13px] text-left leading-snug cursor-pointer transition-all border'
+// rather than baked in — see `splitMainChipClassName`. The size follows the
+// message font setting (`mc-message-font-chip`, styles/message-font-size.css):
+// a chip is conversation text the user reads, not chrome.
+// No `cursor-*` here on purpose: the cursor is state-dependent and every chip
+// body takes exactly one from `chipStateClass`/`chipCursorClass`. Baking
+// `cursor-pointer` in and appending `cursor-default` would decide nothing —
+// at equal specificity Tailwind's emission order wins, not attribute order
+// (`src/test/narrowFirstBaseline.test.ts`), and `cursor-default` is emitted
+// first, so the pointer hand would survive the whole pending state.
+// `border-transparent`: the chip keeps its 1px box (the split chip's seam and the
+// picked / unpicked swap stay layout-stable) but the glass draws no outline of its
+// own — the material has none, the tint and the light bands are the boundary.
+const CHIP_BASE = 'px-3 py-1.5 mc-message-font-chip text-left leading-snug transition-all border border-transparent'
 
+// Every chip is its own Liquid Glass pill — the SAME primitive as the composer
+// (components/Glass.tsx, `chip` variant), rendered AS the button (`as`), so the
+// transcript blurs and bends through the chips the way it does through the box
+// beneath them. A picked chip mixes the accent INTO the glass (`glass-accent`)
+// instead of swapping to an opaque wash, so it stays the same material; an
+// unpicked one brightens a step on hover (`glass-hover`).
 function chipColors(isPicked: boolean) {
   return isPicked
-    ? 'border-solid border-accent/50 text-accent bg-accent-subtle'
-    : 'border-border text-muted hover:text-text hover:border-accent/40 bg-bg-elevated'
+    ? 'glass-accent text-accent'
+    : 'glass-hover text-muted hover:text-text'
 }
+/** Every chip pill is rounded 8px (`rounded-lg`); the pane's radius says the same. */
+const CHIP_RADIUS = 8
 
 /** Standalone chip: the flex item itself, so it owns the width cap (and, in the
  *  scroll layout, `shrink-0` so it does not collapse). Fully rounded. */
@@ -164,7 +229,12 @@ function chipClassName(isPicked: boolean, { shrink0 = false }: { shrink0?: boole
  *  future utility whose name merely contains `shrink-0`/`followup-chip`/`rounded-lg`
  *  cannot silently rewrite the wrong token and reintroduce the overlap. */
 function splitMainChipClassName(isPicked: boolean) {
-  return `flex-1 min-w-0 ${CHIP_BASE} rounded-l-lg ${chipColors(isPicked)}`
+  return `flex-1 min-w-0 ${CHIP_BASE} rounded-l-lg border-transparent bg-transparent ${isPicked ? 'text-accent' : 'text-muted hover:text-text'}`
+}
+
+/** The split-button wrapper is the glass pill; its two buttons sit on it. */
+function splitWrapperClassName(isPicked: boolean) {
+  return `rounded-lg transition-all ${chipColors(isPicked)}`
 }
 
 /**
@@ -182,8 +252,61 @@ function splitMainChipClassName(isPicked: boolean) {
  * is recoverable. One line keeps every chip the same height by construction
  * rather than by an alignment rule.
  */
-function ChipLabel({ option }: { option: string }) {
-  return <span className="block truncate">{option}</span>
+function ChipLabel({ option, busy }: { option: string, busy?: boolean }) {
+  const label = <span className="block truncate">{option}</span>
+  if (!busy) return label
+  // Beside the label, not instead of it: the label is WHICH action is running.
+  return (
+    <span className="flex items-center gap-1.5 min-w-0">
+      <Loader2 size={13} aria-hidden="true" className="lucide-inline animate-spin shrink-0" />
+      {label}
+    </span>
+  )
+}
+
+/** Dimmed, never `disabled`, and `opacity-70` rather than the 30-50 band this repo
+ *  dims DISABLED controls to: a user who clicked Go and needs Cancel must not read
+ *  a live chip as locked. Only the busy chip is disabled — a second click on that
+ *  one is what the dispatch's own single-flight refuses anyway. */
+function chipStateClass(pending: boolean, dimmed: boolean): string {
+  if (pending) return ' cursor-default'
+  return dimmed ? ' cursor-default opacity-70' : ' cursor-pointer'
+}
+
+/** `aria-disabled` follows REFUSAL, not just the spinner: a refused sibling has its
+ *  activation dropped by the class latch, so announcing it enabled would leave the
+ *  dead button intact for assistive tech while the dim removed it only for sighted
+ *  users. It never becomes `disabled` — that would kill the tooltip's dismissal.
+ */
+
+/** The pointer half of the above, alone. A split chip's WRAPPER owns the dim, so
+ *  the inner button must take only this: applying the full state class to both
+ *  compounds the opacity (0.7 x 0.7 = 0.49) straight back into the disabled band
+ *  this rule exists to stay out of. */
+function chipCursorClass(pending: boolean): string {
+  return pending ? ' cursor-default' : ' cursor-pointer'
+}
+
+/**
+ * Retired by the next dispatch, not by a timer (which races the reading) or a
+ * dismiss button. The detail goes in `message` UNPREFIXED, because that is the
+ * key `ErrorNotice` looks the structured context up by; a detail-less rejection
+ * has nothing to look up, so the sentence becomes the message rather than
+ * rendering nothing. `askAgent` ON: a wedged dispatch is the agent's to act on,
+ * and the hand-off loses no draft — both hosts park the composer in their
+ * slot-draft store.
+ */
+function ChipError({ error }: { error: string }) {
+  const sentence = i18nT('components.followUpBar.plan_action_failed')
+  return (
+    <ErrorNotice
+      variant="inline"
+      className="pt-1"
+      title={error ? sentence : undefined}
+      message={error || sentence}
+      askAgent
+    />
+  )
 }
 
 /**
@@ -218,24 +341,45 @@ function useInstantTip(option: string, hint: string) {
   return { tipHandlers, tipNode }
 }
 /** Right-hand "send now" segment class — same palette as the chip body, divided by a border. */
-function sendSegmentClassName(isPicked: boolean) {
+function sendSegmentClassName(isPicked: boolean, pending: boolean) {
   // inline-flex + items-center keeps the arrow centred against whatever height
   // the chip body resolves to, so it does not need to know the clamp.
-  return `inline-flex items-center shrink-0 px-1.5 py-1.5 rounded-r-lg cursor-pointer transition-all border border-l-0 ${
+  // The cursor follows refusal for the same reason the chip body's does, and by
+  // the same exclusive rule rather than by appending: `handleImmediateSend`
+  // opens with `if (pending) return`, so a pointer hand here promises a click
+  // that is already dropped. The hover accent below is still live while
+  // pending — see the disposition on this span.
+  return `inline-flex items-center shrink-0 px-1.5 py-1.5 rounded-r-lg ${pending ? 'cursor-default' : 'cursor-pointer'} transition-all border border-transparent border-l-[color:var(--glass-edge)] bg-transparent ${
     isPicked
-      ? 'border-solid border-accent/50 text-accent bg-accent-subtle hover:bg-accent/20'
-      : 'border-border text-muted hover:text-accent hover:border-accent/40 bg-bg-elevated'
+      ? 'text-accent hover:bg-accent/20'
+      : 'text-muted hover:text-accent'
   }`
 }
 
-function chipTitle(isPicked: boolean, quickSend: boolean | undefined, picked: ReadonlySet<string>, hasOnSend: boolean) {
+function chipTitle(isPicked: boolean, quickSend: boolean | undefined, picked: ReadonlySet<string>, hasOnSend: boolean, multi: boolean) {
   if (isPicked) {
     return hasOnSend
       ? i18nT('components.followUpBar.click_to_remove_from_input_double_click_to_send')
       : i18nT('components.followUpBar.click_to_remove_from_input')
   }
-  if (quickSend && picked.size === 0) return i18nT('components.followUpBar.click_to_send_instantly_shift_click_to_select_mu')
-  if (quickSend) return i18nT('components.followUpBar.click_to_add_to_selection')
+  // Single-select ([OPTION:]) rows: a new pick REPLACES the previous one, so
+  // the hint must not promise multi-select (see followUpChips.ts). With Quick
+  // Send off the same replace applies once a chip is picked, so "add" is wrong.
+  if (quickSend && picked.size === 0) {
+    return multi
+      ? i18nT('components.followUpBar.click_to_send_instantly_shift_click_to_select_mu')
+      : i18nT('components.followUpBar.click_to_send_instantly_shift_click_to_add_without_sending')
+  }
+  if (quickSend) {
+    return multi
+      ? i18nT('components.followUpBar.click_to_add_to_selection')
+      : i18nT('components.followUpBar.click_to_replace_selection')
+  }
+  if (!multi && picked.size > 0) {
+    return hasOnSend
+      ? i18nT('components.followUpBar.click_to_replace_selection_double_click_to_send')
+      : i18nT('components.followUpBar.click_to_replace_selection')
+  }
   return hasOnSend
     ? i18nT('components.followUpBar.click_to_add_to_input_double_click_to_select_and')
     : i18nT('components.followUpBar.click_to_add_to_input_editable_before_sending')
@@ -246,6 +390,8 @@ interface ChipProps {
   isPicked: boolean
   picked: ReadonlySet<string>
   quickSend: boolean | undefined
+  /** Multi-select row (`[OPTIONS:]`) vs single-select (`[OPTION:]`); drives the tooltip wording. */
+  multi: boolean
   onSelect: (option: string, event: React.MouseEvent, sourceKeyAtClick?: string | null) => void
   onSend?: (text?: string, sourceKeyAtClick?: string | null) => void
   className: string
@@ -255,6 +401,13 @@ interface ChipProps {
   animating: boolean
   /** Current source-row identity, snapshotted at click time (see FollowUpBarProps). */
   sourceKey?: string | null
+  /** THIS chip's dispatch is outstanding (spinner, no clicks) vs another chip's (dim).
+   *  Refused in the handlers behind `aria-disabled`, never `disabled`: a disabled
+   *  control fires no mouse or focus events, so the tooltip would never get the
+   *  `onMouseLeave`/`onBlur` that are its only dismissals, and a focused chip
+   *  being disabled drops focus to `<body>`. */
+  pending?: boolean
+  dimmed?: boolean
 }
 
 /**
@@ -266,7 +419,7 @@ interface ChipProps {
  *   double-click to fire `onSend(text)` directly without going through setInput (which would
  *   race with the React state update and cause send() to read a stale inputRef.current).
  */
-function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className, index, animating, sourceKey }: ChipProps) {
+function Chip({ option, isPicked, picked, quickSend, multi, onSelect, onSend, className, index, animating, sourceKey, pending, dimmed }: ChipProps) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // First-click row identity for the in-flight gesture. A double-click is
   // click(detail=1) then dblclick; the footer can be replaced on the reused
@@ -281,7 +434,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   // "could not tell where the safe click ends and the send click begins". The
   // fragment exists only when the segment does (same condition, see
   // showSendSegment below).
-  const hint = chipTitle(isPicked, quickSend, picked, !!onSend)
+  const hint = chipTitle(isPicked, quickSend, picked, !!onSend, multi)
     + (useDebouncedClick ? ` · ${i18nT('components.followUpBar.tooltip_arrow_sends_now')}` : '')
   const { tipHandlers, tipNode } = useInstantTip(option, hint)
   // The entrance belongs on whichever element is this chip's flex item — the
@@ -295,12 +448,19 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   // sends — so it's suppressed there to avoid two controls doing the same
   // thing side by side.
   const showSendSegment = useDebouncedClick
+  const stateClass = chipStateClass(!!pending, !!dimmed)
 
   if (!useDebouncedClick) {
     return (
       <>
-        <button
+        {/* The chip IS the glass pane here too (see the standalone chip below). */}
+        <Glass
+          as="button"
+          variant="chip"
+          radius={CHIP_RADIUS}
           type="button"
+          aria-disabled={pending || dimmed || undefined}
+          aria-busy={pending || undefined}
           onMouseDown={(e) => e.preventDefault()}
           // No third argument here on purpose: this path calls onSelect
           // SYNCHRONOUSLY from the click, so there is no window in which the row
@@ -308,19 +468,26 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
           // `undefined` (i.e. "no key supplied") keeps this path's behaviour
           // exactly as it was — see `sourceKeyAtClick` in the debounced handler,
           // which is where the race actually lives.
-          onClick={(e) => onSelect(option, e)}
-          className={`${className} ${entrance.className}`}
+          onClick={(e) => { if (pending || dimmed) return; onSelect(option, e) }}
+          className={`${className} ${entrance.className}${stateClass}`}
           style={entrance.style}
           {...tipHandlers}
         >
-          <ChipLabel option={option} />
-        </button>
+          <ChipLabel option={option} busy={pending} />
+        </Glass>
         {tipNode}
       </>
     )
   }
 
   const handleClick = (e: React.MouseEvent) => {
+    // `dimmed` as well as `pending`, and this is the path where it MATTERS: the
+    // click below is debounced, so the dispatch happens after the timer, not at
+    // the click. A chip dimmed by a sibling's latch could therefore arm a timer,
+    // have that latch released inside the window (a definitive 4xx frees it for
+    // retry), and dispatch on a chip the user was shown as refused. The hook's
+    // `latch.has(vars.slot)` guard cannot catch it — by then the latch is gone.
+    if (pending || dimmed) return
     // detail >= 2 means this click is part of a double-click sequence — let
     // onDoubleClick handle it so we don't start a timer that races with it.
     if (e.detail >= 2) return
@@ -345,6 +512,7 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   }
 
   const handleImmediateSend = () => {
+    if (pending || dimmed) return
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
     const clickedKey = armedSourceKeyRef.current !== undefined ? armedSourceKeyRef.current : sourceKey
     armedSourceKeyRef.current = undefined
@@ -357,24 +525,35 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
   // flex item; the button flexes to fill it (see splitMainChipClassName). The
   // plain-button path (no send segment) is the standalone chip, so it keeps the
   // passed-in `className` (cap + rounding + per-layout shrink) unchanged.
-  const mainChipClassName = showSendSegment ? splitMainChipClassName(isPicked) : `${className} ${entrance.className}`
+  const mainChipClassName = showSendSegment ? `${splitMainChipClassName(isPicked)}${chipCursorClass(!!pending || !!dimmed)}` : `${className} ${entrance.className}${stateClass}`
 
-  const mainChip = (
-    <button
-      type="button"
-      // Keep keyboard focus in the textarea on click. Without this the chip
-      // takes focus, and a follow-up Enter re-activates this (now picked) chip,
-      // running the toggle-off branch that deletes the composed input ("the
-      // prompt clears"). Deliberate keyboard (tab) activation still toggles.
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={handleClick}
-      onDoubleClick={handleImmediateSend}
-      className={mainChipClassName}
-      style={showSendSegment ? undefined : entrance.style}
-      {...tipHandlers}
-    >
-      <ChipLabel option={option} />
-    </button>
+  const chipProps = {
+    type: 'button' as const,
+    // Keep keyboard focus in the textarea on click. Without this the chip
+    // takes focus, and a follow-up Enter re-activates this (now picked) chip,
+    // running the toggle-off branch that deletes the composed input ("the
+    // prompt clears"). Deliberate keyboard (tab) activation still toggles.
+    'aria-disabled': pending || dimmed || undefined,
+    'aria-busy': pending || undefined,
+    onMouseDown: (e: React.MouseEvent) => e.preventDefault(),
+    onClick: handleClick,
+    onDoubleClick: handleImmediateSend,
+    className: mainChipClassName,
+    ...tipHandlers,
+  }
+  const label = <ChipLabel option={option} busy={pending} />
+
+  // The standalone chip IS the glass pane (`Glass as="button"`): one element is
+  // the flex item, the width cap, the entrance animation and the control, and
+  // the pane's layers sit inside it under the label. Inside a split chip the
+  // WRAPPER is the pane and this button sits on it transparent, so it is a plain
+  // button there.
+  const mainChip = showSendSegment ? (
+    <button {...chipProps}>{label}</button>
+  ) : (
+    <Glass as="button" variant="chip" radius={CHIP_RADIUS} {...chipProps} style={entrance.style}>
+      {label}
+    </Glass>
   )
 
   if (!showSendSegment) return <>{mainChip}{tipNode}</>
@@ -386,37 +565,85 @@ function Chip({ option, isPicked, picked, quickSend, onSelect, onSend, className
     // cannot resolve against an indefinite wrapper), leaving a wide empty gap
     // before the next chip. On the flex item the percentage resolves against
     // the strip's definite width.
-    <span className={`inline-flex items-stretch shrink-0 ${CHIP_MAX_WIDTH} ${entrance.className}`} style={entrance.style}>
+    // The wrapper is the glass pane here: the two buttons on it stay transparent.
+    <Glass as="span" variant="chip" radius={CHIP_RADIUS} className={`inline-flex items-stretch shrink-0 ${CHIP_MAX_WIDTH} ${splitWrapperClassName(isPicked)} ${entrance.className}${stateClass}`} style={entrance.style}>
       {mainChip}
       <button
         type="button"
         aria-label={i18nT('components.followUpBar.send_now_2', { option })}
         title={i18nT('components.followUpBar.send_now')}
+        aria-disabled={pending || dimmed || undefined}
         onMouseDown={(e) => e.preventDefault()}
         onClick={(e) => { e.stopPropagation(); handleImmediateSend() }}
-        className={sendSegmentClassName(isPicked)}
+        className={sendSegmentClassName(isPicked, !!pending || !!dimmed)}
       >
         <ArrowUp size={13} />
       </button>
       {tipNode}
-    </span>
+    </Glass>
   )
 }
 
 /** Both layouts render the same chips; `animating` is owned by the parent so a
  *  layout switch cannot restart an entrance that already played. */
-type LayoutProps = Omit<FollowUpBarProps, 'layout'> & { animating: boolean }
+type LayoutProps = Omit<FollowUpBarProps, 'layout' | 'multi'> & { animating: boolean, multi: boolean }
 
-function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey }: LayoutProps) {
+function ScrollLayout({ options, picked, onSelect, onSend, quickSend, multi, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const [attachEdges, edges, remeasure] = useScrollEdges<HTMLDivElement>()
+  // Whether the CHIPS overflow, measured without the gutters: the gutters are
+  // part of `scrollWidth` while they are mounted, so deciding from the hook's
+  // edges would let them keep the row overflowing after the chips alone fit.
+  const [overflows, setOverflows] = useState(false)
+  const measureOverflow = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    let gutterSpan = 0
+    const gutters = el.querySelectorAll<HTMLElement>('[data-arrow-gutter]')
+    if (gutters.length) {
+      const gap = parseFloat(getComputedStyle(el).columnGap) || 0
+      gutters.forEach(g => { gutterSpan += g.offsetWidth + gap })
+    }
+    const next = el.scrollWidth - el.clientWidth - gutterSpan > 1
+    setOverflows(prev => (prev === next ? prev : next))
+  }, [])
+  const overflowRoRef = useRef<ResizeObserver | null>(null)
 
   // The hook owns the node's edge measurement; this keeps a plain handle to the
   // same node for the row's own scroll and wheel behaviour.
   const setScroller = useCallback((node: HTMLDivElement | null) => {
     scrollRef.current = node
     attachEdges(node)
-  }, [attachEdges])
+    overflowRoRef.current?.disconnect()
+    overflowRoRef.current = null
+    if (!node) return
+    measureOverflow()
+    if (typeof ResizeObserver !== 'undefined') {
+      overflowRoRef.current = new ResizeObserver(measureOverflow)
+      overflowRoRef.current.observe(node)
+    }
+  }, [attachEdges, measureOverflow])
+
+  // The left arrow's footprint outlives the arrow by LEFT_ARROW_CLICK_SHIELD_MS
+  // (see that constant). Set on the true -> false edge only, so a row that
+  // never scrolled shows no shield at all.
+  const [leftShield, setLeftShield] = useState(false)
+  const prevLeftRef = useRef(edges.left)
+  useLayoutEffect(() => {
+    const was = prevLeftRef.current
+    prevLeftRef.current = edges.left
+    if (was && !edges.left) setLeftShield(true)
+    else if (edges.left) setLeftShield(false)
+  }, [edges.left])
+  useEffect(() => {
+    if (!leftShield) return
+    const timer = setTimeout(() => setLeftShield(false), LEFT_ARROW_CLICK_SHIELD_MS)
+    return () => clearTimeout(timer)
+  }, [leftShield])
+
+  // Mounting or dropping the gutters changes the content width without
+  // changing the row's box, so no observer reports it: re-read the edges.
+  useLayoutEffect(() => { remeasure() }, [overflows, remeasure])
 
   // A mount effect is enough here: this scroller renders unconditionally with
   // ScrollLayout, so its node exists by the time effects run — unlike the tab
@@ -438,7 +665,7 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
   }, [])
 
   // Chips changing keeps the row's own box, so no observer reports it.
-  useEffect(() => { remeasure() }, [options, remeasure])
+  useEffect(() => { remeasure(); measureOverflow() }, [options, remeasure, measureOverflow])
 
   // Scroll by ~80% of the visible width in the given direction, so a click
   // reveals the next set of chips while keeping one in view for continuity.
@@ -470,6 +697,18 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
           <ChevronLeft size={16} />
         </button>
       )}
+      {!edges.left && leftShield && (
+        // Same box and position as the left arrow, invisible and inert: it eats
+        // the click that would otherwise reach the first chip under it.
+        <span
+          aria-hidden="true"
+          data-arrow-click-shield=""
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={(e) => { e.preventDefault(); e.stopPropagation() }}
+          onDoubleClick={(e) => { e.preventDefault(); e.stopPropagation() }}
+          className="absolute top-1/2 -translate-y-1/2 z-20 h-6 w-6 left-0.5"
+        />
+      )}
       {edges.right && (
         <button
           type="button"
@@ -486,10 +725,15 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
           only decides where a chip would sit if one ever became taller (an
           icon, a badge, a second line). Bottom, not centre: the strip sits
           directly above the composer, so that is the edge the row is read
-          against. */}
-      <div ref={setScroller} data-tip-boundary className={`flex ${CHIP_ROW_GAP} overflow-x-auto items-end`} style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
+          against.
+          `py-px -my-px`: overflow-x:auto forces overflow-y to auto as well, and
+          the glass hairline is drawn 0.5px OUTSIDE each chip's box, so a row
+          exactly one chip tall clips it. One pixel of padding, cancelled by the
+          negative margin, lets the line through without changing row height. */}
+      <div ref={setScroller} data-tip-boundary className={`flex ${CHIP_ROW_GAP} overflow-x-auto items-end py-px -my-px`} style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
         {options.map((o, i) => {
           const isPicked = picked.has(o)
+          const chipPending = !!pendingOptions?.has(o)
           return (
             <Chip
               key={o}
@@ -497,22 +741,36 @@ function ScrollLayout({ options, picked, onSelect, onSend, quickSend, animating,
               isPicked={isPicked}
               picked={picked}
               quickSend={quickSend}
+              multi={multi}
               onSelect={onSelect}
               onSend={onSend}
               className={chipClassName(isPicked, { shrink0: true })}
               index={i}
               animating={animating}
               sourceKey={sourceKey}
+              pending={chipPending}
+              dimmed={!!refusedOptions?.has(o) && !chipPending}
             />
           )
         })}
+        {/* While the row scrolls, the far end carries a blank as wide as an
+            arrow. The right arrow disappears the moment nothing is left to
+            show, so the spot it sat on must be empty then: without the blank
+            it is the last chip, and the next click — or the second click of a
+            double click, which sends — lands on that chip. Only the trailing
+            end: a leading blank is also there at rest, before any scroll, and
+            pushes the first chip off the composer's left edge, so the start
+            is guarded by the left arrow's click shield instead. Gated on
+            overflow so a row that fits ends on its last chip. */}
+        {overflows && <span aria-hidden="true" data-arrow-gutter="" className={ARROW_GUTTER_CLASS} />}
       </div>
       </div>
+      {error != null && <ChipError error={error} />}
     </div>
   )
 }
 
-function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animating, sourceKey }: LayoutProps) {
+function MultilineLayout({ options, picked, onSelect, onSend, quickSend, multi, animating, sourceKey, pendingOptions, refusedOptions, error }: LayoutProps) {
   return (
     // Bottom-aligned for the same reason as the scroll layout: with the
     // one-line clamp every chip is already the same height, so this only
@@ -521,9 +779,12 @@ function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animati
     // data-tip-boundary: the tooltip lifts above this whole wrap, so hovering
     // a chip in row 2+ never hides the row above it (the rows are exactly
     // what the user is scanning; the message area above is transient-safe).
+    // A fragment, not a wrapper: with no error the rendered tree is unchanged.
+    <>
     <div data-tip-boundary className={`flex ${CHIP_ROW_GAP} flex-wrap pt-1 items-end`}>
       {options.map((o, i) => {
         const isPicked = picked.has(o)
+        const chipPending = !!pendingOptions?.has(o)
         return (
           <Chip
             key={o}
@@ -531,29 +792,34 @@ function MultilineLayout({ options, picked, onSelect, onSend, quickSend, animati
             isPicked={isPicked}
             picked={picked}
             quickSend={quickSend}
+            multi={multi}
             onSelect={onSelect}
             onSend={onSend}
             className={chipClassName(isPicked)}
             index={i}
             animating={animating}
             sourceKey={sourceKey}
+            pending={chipPending}
+            dimmed={!!refusedOptions?.has(o) && !chipPending}
           />
         )
       })}
     </div>
+    {error != null && <ChipError error={error} />}
+    </>
   )
 }
 
-function FollowUpBar({ options, picked, onSelect, onSend, quickSend, layout = 'multiline', sourceKey }: FollowUpBarProps) {
+function FollowUpBar({ options, picked, onSelect, onSend, quickSend, multi = true, layout = 'multiline', sourceKey, pendingOptions, refusedOptions, error }: FollowUpBarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Content-keyed, not identity-keyed: the caller rebuilds the array on every
   // render, so an identity comparison would restart the entrance constantly.
   // \u0000 cannot occur inside an option label.
   const animating = useChipEntrance(options.join('\u0000'))
   if (layout === 'scroll') {
-    return <ScrollLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} />
+    return <ScrollLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} multi={multi} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} refusedOptions={refusedOptions} error={error} />
   }
-  return <MultilineLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} animating={animating} sourceKey={sourceKey} />
+  return <MultilineLayout options={options} picked={picked} onSelect={onSelect} onSend={onSend} quickSend={quickSend} multi={multi} animating={animating} sourceKey={sourceKey} pendingOptions={pendingOptions} refusedOptions={refusedOptions} error={error} />
 }
 
 export default memo(FollowUpBar)

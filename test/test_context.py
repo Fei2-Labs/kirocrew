@@ -1,14 +1,23 @@
-"""Tests for context builder."""
+"""Tests for context builder.
+
+This module pins the turn shape ``ContextBuilder`` assembles: the memory-store override
+property, the critical-rules and dashboard-nudge contracts, compaction re-injection,
+folder breadcrumbs, hooks, thread-history budgets and compression, vector-store sharing,
+the docs section, agent prompts and runtime identity. The memory and lesson blocks a
+session start reads, with the ``build_message`` call-site ratchet, live in
+``test_context_memory_lessons.py``; the prompt-text blocks outside memory in
+``test_context_prompt_text.py``.
+"""
 
 from __future__ import annotations
 
-import re
 from unittest.mock import Mock, patch
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from kiro_crew.config.loader import config_path
 from kiro_crew.context import ContextBuilder, _neutralize_structural_markers
 from kiro_crew.hooks import ContextRule, HookManager, HooksConfig
 from kiro_crew.learn import LessonStore
@@ -16,11 +25,18 @@ from kiro_crew.memory import MemoryStore
 from kiro_crew.memory_stores import memory_store_name_defect
 from kiro_crew.skills import SkillsLoader
 
-# One xdist worker for the whole module: every test here derives from ONE module-cached
-# scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
-# spread across workers and each worker re-pays that scan -- measured at 5 workers x 40-75s
-# per full run for this file alone. Grouping keeps the cache single-copy per run.
+# Each context-builder file keeps this xdist group; ``test_context_memory_lessons``'s ratchet
+# walks the package through the shared ``source_corpus`` (one memoised file list per
+# process, texts streamed and parsed only for the files that can match), so its cost is
+# now a second rather than the ~30s full-tree ``ast.parse`` this group was first added
+# for; the group stays so the file-list cache is paid once per run, not once per worker.
 pytestmark = pytest.mark.xdist_group(name="tree_scan_test_context")
+
+
+@pytest.fixture(autouse=True)
+def _close_skills_loaders(close_skills_loaders):
+    """Every test here builds a ``ContextBuilder``: close its ``SkillsLoader`` (``test/conftest.py``)."""
+
 
 # ---------------------------------------------------------------------------
 # Strategies
@@ -264,12 +280,11 @@ class TestContextBuilder:
             "done", is_new_session=False, interactive=True, session_key="dashboard:chat-1"
         )
         assert "ask_question" in dash, "dashboard session must get the question nudge"
-        # Pin the CONTRACT, not a keyword. The wording this replaces ("BEFORE you
-        # can continue the current turn") described a blocking round-trip the tool
-        # does not perform, so the nudge has to say the card does not block, that
-        # the agent ends its turn, and that [OPTIONS:] is the end-of-turn choice.
-        assert "END YOUR TURN" in dash
-        assert "NON-BLOCKING" in dash
+        # The nudge must say ask_question blocks and returns the answers as its result.
+        assert "BLOCKS until the" in dash
+        assert "tool result" in dash
+        assert "END YOUR TURN" not in dash
+        assert "NON-BLOCKING" not in dash
         assert "[OPTIONS:]" in dash
         # A card is an interruption, so the nudge must also carry the restraint
         # contract: silence is the default and only a human-only decision that
@@ -284,6 +299,178 @@ class TestContextBuilder:
             )
             assert "ask_question" not in other, f"{sk!r} must NOT get the question nudge"
             assert "suggest_followup" not in other, f"{sk!r} must NOT get the follow-up nudge"
+
+    @pytest.mark.parametrize("provider_type", ["acp", "claude_code"])
+    @pytest.mark.parametrize(
+        "lifecycle",
+        [
+            {"is_new_session": True},
+            {"is_new_session": False},
+            {"is_new_session": True, "resumed": True},
+            {"is_new_session": False, "needs_reinjection": True},
+        ],
+    )
+    def test_dashboard_capability_survives_context_lifecycle(
+        self, tmp_path, lifecycle, provider_type
+    ):
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        request = "Verify the release"
+        with patch.object(builder, "build_session_context", return_value="Session context\n\n"):
+            msg, _ = builder.build_message(
+                request, session_key="dashboard:card-hint", provider_type=provider_type, **lifecycle
+            )
+        assert "Dynamic Dashboard:" not in msg
+        assert msg.endswith(request)
+        assert "load the artifacts skill on demand" not in msg
+        assert "Automatic cards:" not in msg
+
+    @pytest.mark.parametrize("density", ["more", "less"])
+    def test_dashboard_artifacts_discovery_uses_existing_system_pointer(self, density, monkeypatch):
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.dashboard.widget_density = density
+        monkeypatch.setattr(KiroCrewConfig, "load", lambda: cfg)
+        prompt = ContextBuilder._resolve_prompt_templates("{{WIDGET_BLOCK}}", "dashboard:card-hint")
+        assert "Load the `artifacts` skill" in prompt
+        assert "{{WIDGET_BLOCK}}" not in prompt
+
+    def test_dashboard_capability_tracks_a_channel_tabs_presence(self, tmp_path, monkeypatch):
+        from kiro_crew import session_surface
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.dashboard.dynamic_dashboard_cards = True
+        monkeypatch.setattr(live, "snapshot", lambda: cfg)
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        monkeypatch.setattr(session_surface, "_dashboard_surfaced", frozenset({"slack:thread"}))
+        opened, _ = builder.build_message(
+            "Continue", is_new_session=False, session_key="slack:thread"
+        )
+        assert opened.count("Automatic cards:") == 1
+        monkeypatch.setattr(session_surface, "_dashboard_surfaced", frozenset())
+        closed, _ = builder.build_message(
+            "Continue", is_new_session=False, session_key="slack:thread"
+        )
+        assert "Automatic cards:" not in closed
+
+    @pytest.mark.parametrize("memory_mode", ["persistent", "incognito", "temporary"])
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_dashboard_hint_is_not_a_generation_or_persistence_grant(
+        self, tmp_path, memory_mode, enabled
+    ):
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig.load()
+        cfg.dashboard.dynamic_dashboard_cards = enabled
+        cfg.save()
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        builder._session_memory_modes["dashboard:card-hint"] = memory_mode
+        msg, _ = builder.build_message(
+            "Continue", is_new_session=False, session_key="dashboard:card-hint"
+        )
+        assert "Dynamic Dashboard:" not in msg
+        assert ("Automatic cards:" in msg) is enabled
+        if enabled:
+            hint = msg.split("Automatic cards:", 1)[1].split("\n\n", 1)[0]
+            assert len(hint) < 400
+            assert "Do not enable generation, spawn a builder" in hint
+        assert KiroCrewConfig.load().dashboard.dynamic_dashboard_cards is enabled
+
+    @pytest.mark.parametrize(
+        "lifecycle",
+        [
+            {"is_new_session": False},
+            {"is_new_session": True, "resumed": True},
+            {"is_new_session": False, "needs_reinjection": True},
+        ],
+    )
+    def test_dashboard_milestone_guidance_reads_current_live_toggle(
+        self, tmp_path, monkeypatch, lifecycle
+    ):
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        monkeypatch.setattr(live, "snapshot", lambda: cfg)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        for enabled in [False, True, False]:
+            cfg.dashboard.dynamic_dashboard_cards = enabled
+            with patch.object(builder, "build_session_context", return_value="Context\n\n"):
+                msg, _ = builder.build_message(
+                    "Continue", session_key="dashboard:toggle", **lifecycle
+                )
+            assert "Dynamic Dashboard:" not in msg
+            assert ("Automatic cards:" in msg) is enabled
+            if enabled:
+                assert "evidence, result and next step" in msg
+                assert "Do not enable generation" in msg
+                assert "duplicate" in msg
+            assert msg.endswith("Continue")
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"session_key": "subagent:worker"},
+            {"session_key": "slack:unattached"},
+            {"session_key": "dashboard:card-hint", "interactive": False},
+            {"session_key": "dashboard:card-hint", "minimal_context": True},
+        ],
+    )
+    def test_dashboard_capability_does_not_expand_other_surfaces(
+        self, tmp_path, kwargs, monkeypatch
+    ):
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.dashboard.dynamic_dashboard_cards = True
+        monkeypatch.setattr(live, "snapshot", lambda: cfg)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        msg, _ = builder.build_message("Continue", is_new_session=False, **kwargs)
+        assert "Dynamic Dashboard:" not in msg
+        assert "Automatic cards:" not in msg
+
+    def test_dashboard_capability_respects_custom_agent_opt_out(self, tmp_path, monkeypatch):
+        from kiro_crew.config import live
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.dashboard.dynamic_dashboard_cards = True
+        monkeypatch.setattr(live, "snapshot", lambda: cfg)
+        monkeypatch.setattr("kiro_crew.context._agent_includes_crew_context", lambda _: False)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        msg, _ = builder.build_message(
+            "Continue", is_new_session=False, session_key="dashboard:card-hint", agent="custom"
+        )
+        assert "Dynamic Dashboard:" not in msg
+        assert "Automatic cards:" not in msg
 
     def test_interactive_guidance_precedes_current_request(self, tmp_path):
         """The request, not generic UI guidance, owns the prompt's recency edge.
@@ -426,6 +613,40 @@ class TestContextBuilder:
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
 
+    def test_request_prefix_without_trailing_newline_does_not_swallow_the_next_block(
+        self, tmp_path
+    ):
+        """A ``$skill`` body arrives ``.strip()``ed (no trailing newline). The
+        assembly must still open the next block on its own line, or the context
+        breakdown books that block's bytes to the skill."""
+        from kiro_crew.context_blocks import split_blocks
+
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        request = "hi"
+        generated = "\n\n[Skill: demo]\n\nloaded procedure with no newline at the end"
+        span: list[int] = []
+        msg, _ = builder.build_message(
+            request,
+            is_new_session=False,
+            interactive=True,
+            session_key="dashboard:chat-1",
+            project="/workspace/example",
+            request_prefix_context=generated,
+            user_text_range=(0, len(request)),
+            user_span_out=span,
+        )
+        assert "\n[REPLY FORMAT RULES]" in msg
+        out = split_blocks(msg, user_span=(span[0], span[1]))
+        assert "reply_format_rules" in out
+        assert out["loaded_skill"] == len(
+            "[Skill: demo]\n\nloaded procedure with no newline at the end\n"
+        )
+        assert sum(out.values()) == len(msg)
+
     def test_dashboard_tool_nudges_require_interactive(self, tmp_path):
         """A non-interactive turn (e.g. automation) gets neither the OPTIONS
         reminder nor either dashboard-card tool nudge."""
@@ -491,11 +712,210 @@ class TestContextBuilder:
             s["name"] == "widget-maker" for s in builder.skills.search_skills("widget-maker")
         )
 
+    def test_reinjection_restores_agent_contract_after_compaction(self, tmp_path):
+        """The managed spec prompt only points at this block, so compaction must restore it."""
+        from kiro_crew.agent import _NATIVE_PROMPT_STUB
+
+        builder = self._reinject_builder(tmp_path)
+        fresh, _ = builder.build_message("first turn", is_new_session=True)
+        msg, _ = builder.build_message("carry on", is_new_session=False, needs_reinjection=True)
+
+        def contract(m: str) -> str:
+            start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+            return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+        assert msg.count("[AGENT SYSTEM PROMPT]\n") == 1
+        reinjected = contract(msg)
+        assert reinjected.strip()
+        assert "follow it as your authoritative contract" not in reinjected
+        assert _NATIVE_PROMPT_STUB not in reinjected
+        assert reinjected == contract(fresh)
+
+    def test_minimal_reinjection_withholds_operator_context(self, tmp_path):
+        """A minimal warm turn restores the contract without private discovery blocks."""
+        builder = self._reinject_builder(tmp_path)
+        builder.memory.write_projects("# Active Projects\n\n- Private project marker\n")
+        config = config_path()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('{"dashboard":{"user_role":"developer"}}', encoding="utf-8")
+        full, _ = builder.build_message(
+            "carry on",
+            is_new_session=False,
+            needs_reinjection=True,
+            session_key="dashboard:full-reinjection",
+        )
+        minimal, _ = builder.build_message(
+            "carry on",
+            is_new_session=False,
+            needs_reinjection=True,
+            minimal_context=True,
+            session_key="dashboard:minimal-reinjection",
+        )
+
+        for message in (full, minimal):
+            assert message.count("[AGENT SYSTEM PROMPT]\n") == 1
+            assert self._contract(message).strip()
+        for private_block in (
+            "[Memory activity index -- reference data",
+            "[Memory tools]",
+            "[REINJECTED AFTER COMPACTION -- skills index",
+        ):
+            assert private_block in full
+            assert private_block not in minimal
+
+    @staticmethod
+    def _contract(m: str) -> str:
+        """The text inside the ``[AGENT SYSTEM PROMPT]`` block."""
+        start = m.index("[AGENT SYSTEM PROMPT]\n") + len("[AGENT SYSTEM PROMPT]\n")
+        return m[start : m.index("\n[END AGENT SYSTEM PROMPT]", start)]
+
+    def test_the_restored_contract_carries_the_session_start_cap(self, tmp_path):
+        """The delegation cap in the contract is a live host reading, so a
+        reading that moves between two assemblies would make the restored
+        contract differ from the one the session was given. The figure is a
+        per-session snapshot, and re-injection reuses it."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            fresh, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            msg, _ = builder.build_message(
+                "carry on",
+                is_new_session=False,
+                needs_reinjection=True,
+                session_key="dashboard:chat-cap-a",
+            )
+        # Equality alone is also satisfied by a rendering that dropped the
+        # token, so the substitution is asserted on its own.
+        assert "{{MAX_SUBAGENTS}}" not in self._contract(fresh)
+        assert "4242" in self._contract(fresh)
+        assert self._contract(msg) == self._contract(fresh)
+
+    def test_each_session_start_takes_its_own_cap_reading(self, tmp_path):
+        """The snapshot is per session, not per process: a session starting
+        reads the cap in force for it, so the figure still tracks the host."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            first, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            second, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+        assert "4242" in self._contract(first)
+        assert "4343" in self._contract(second)
+
+    def test_another_session_start_leaves_this_contract_alone(self, tmp_path):
+        """One builder assembles every session in the gateway, so a sibling
+        session starting between the two assemblies must not change what
+        compaction restores here."""
+        builder = self._reinject_builder(tmp_path)
+        with patch(
+            "kiro_crew.resource_status.adaptive_exec_cap",
+            side_effect=[4242, 4343, 4444],
+        ):
+            fresh, _ = builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-a"
+            )
+            builder.build_message(
+                "first turn", is_new_session=True, session_key="dashboard:chat-cap-b"
+            )
+            msg, _ = builder.build_message(
+                "carry on",
+                is_new_session=False,
+                needs_reinjection=True,
+                session_key="dashboard:chat-cap-a",
+            )
+        assert "4242" in self._contract(fresh)
+        assert self._contract(msg) == self._contract(fresh)
+
+    def test_an_eviction_during_the_reading_cannot_break_the_caller(self, tmp_path):
+        """One builder serves every session, so a sibling thread's eviction can
+        land on this key in the gap after this call stores it. Eviction takes the
+        oldest entry and the restoring render of the oldest session is the caller
+        that would read it back, so the figure is handed over as a local rather
+        than fetched from the memo a second time."""
+
+        class EvictsRightAfterStoring(dict):
+            """The memo as the losing interleaving leaves it: the entry is gone
+            the instant after it is stored, which is where a sibling thread's
+            eviction lands."""
+
+            def __setitem__(self, key, value):
+                super().__setitem__(key, value)
+                super().pop(key, None)
+
+        builder = self._reinject_builder(tmp_path)
+        builder._cap_figures = EvictsRightAfterStoring()
+
+        with patch.object(builder, "_live_cap_figure", return_value="7171"):
+            figure = builder._session_cap_figure("dashboard:chat-evicted", refresh=True)
+
+        assert figure == "7171"
+        assert ContextBuilder._cap_memo_key("dashboard:chat-evicted") not in builder._cap_figures
+
+    def test_an_oversized_session_key_is_not_what_the_memo_retains(self, tmp_path):
+        """The cap counts entries, and counting bounds memory only if each entry
+        is bounded. A session key arrives from the caller at any length and an
+        entry leaves only by eviction, so the key is digested before it is kept."""
+        builder = self._reinject_builder(tmp_path)
+        huge = "dashboard:" + "k" * 100_000
+
+        with patch.object(builder, "_live_cap_figure", return_value="5151"):
+            assert builder._session_cap_figure(huge, refresh=True) == "5151"
+            # The same session still finds its own reading.
+            assert builder._session_cap_figure(huge, refresh=False) == "5151"
+
+        assert huge not in builder._cap_figures
+        assert [len(k) for k in builder._cap_figures] == [64]
+
+    def test_the_cap_memo_transaction_is_serialized(self, tmp_path):
+        """The reading, the eviction and the insertion are one transaction: a
+        second thread must not observe the memo between them."""
+        builder = self._reinject_builder(tmp_path)
+        held: list[bool] = []
+
+        def observe_lock() -> str:
+            held.append(builder._cap_figures_lock.locked())
+            return "3131"
+
+        with patch.object(builder, "_live_cap_figure", side_effect=observe_lock):
+            builder._session_cap_figure("dashboard:chat-locked", refresh=True)
+
+        assert held == [True]
+        assert not builder._cap_figures_lock.locked()
+
+    def test_a_rendering_session_stops_being_the_next_one_evicted(self, tmp_path):
+        """Evicting the oldest ENTRY picks the longest-lived session, which is
+        the one most likely to still be restored -- so the reading this exists to
+        preserve would be the first dropped. A hit moves its key to the end, and
+        eviction takes the least recently used instead."""
+        builder = self._reinject_builder(tmp_path)
+        with (
+            patch.object(ContextBuilder, "_CAP_FIGURE_SESSIONS", 3),
+            patch.object(builder, "_live_cap_figure", side_effect=["1", "2", "3", "4"]),
+        ):
+            for key in ("dashboard:s-a", "dashboard:s-b", "dashboard:s-c"):
+                builder._session_cap_figure(key, refresh=True)
+            # s-a restores its contract, so it is the most recently used.
+            assert builder._session_cap_figure("dashboard:s-a", refresh=False) == "1"
+            builder._session_cap_figure("dashboard:s-d", refresh=True)
+
+        assert ContextBuilder._cap_memo_key("dashboard:s-a") in builder._cap_figures
+        assert ContextBuilder._cap_memo_key("dashboard:s-b") not in builder._cap_figures
+
     def test_no_reinjection_when_the_flag_is_absent(self, tmp_path):
         """The default path is unchanged — no marker, no index re-injection."""
         builder = self._reinject_builder(tmp_path)
         msg, _ = builder.build_message("carry on", is_new_session=False)
         assert "[REINJECTED AFTER COMPACTION" not in msg
+        assert "[AGENT SYSTEM PROMPT]\n" not in msg
 
     def test_no_reinjection_on_a_new_session(self, tmp_path):
         """A new session already gets the index from the session context;
@@ -504,13 +924,19 @@ class TestContextBuilder:
         msg, _ = builder.build_message("first turn", is_new_session=True, needs_reinjection=True)
         assert "[REINJECTED AFTER COMPACTION" not in msg
 
-    def test_no_reinjection_for_an_unmapped_custom_agent(self, tmp_path):
+    def test_no_reinjection_for_an_unmapped_custom_agent(self, tmp_path, monkeypatch):
         """Mirrors the session-start gate (`inject_skills = ... not is_custom`).
 
         A custom agent's session-start context deliberately carries no skills
         block, so re-injecting one would ADD context rather than restore what
         compaction dropped.
         """
+        # This test counts the skills reinjection only; keep the reply-style
+        # block (on by default, answer_only) out of the count.
+        monkeypatch.setattr(
+            "kiro_crew.context_assembly.sections._response_preferences_apply",
+            lambda *a, **k: False,
+        )
         builder = self._reinject_builder(tmp_path)
         msg, _ = builder.build_message(
             "carry on",
@@ -886,92 +1312,75 @@ class TestDocsSection:
         ctx = builder.build_session_context(agent="code-reviewer")
         assert "[DOCUMENTATION]" not in ctx
 
+    def test_docs_still_injected_for_the_mate_conductor(self, tmp_path, monkeypatch):
+        """The mate conductor is a Crew-owned spec a crewmate's chat runs on, not
+        a user's custom agent -- ``is_kirocrew_default_agent`` keeps it off the
+        ``is_custom`` path the test above pins, so it gets the docs pointer and
+        workspace identity block exactly like the plain ``kirocrew`` agent does."""
+        from kiro_crew import context as ctx_mod
 
-class TestCompressThreadHistory:
-    @pytest.mark.asyncio
-    async def test_returns_none_when_no_history(self, tmp_path):
-        from kiro_crew.context import compress_thread_history
-        from kiro_crew.history import ConversationLog
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir()
+        (docs_dir / "getting-started.md").write_text("# Getting Started\n")
+        monkeypatch.setattr(ctx_mod, "_BUNDLED_DOCS_DIR", docs_dir)
 
-        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
-        conv_log.init()
-        sessions = Mock(spec=[])  # unused — no messages to compress
-        result = await compress_thread_history(conv_log, "no-thread", "hi", sessions)
-        assert result is None
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        ctx = builder.build_session_context(agent="kirocrew-mate-conductor", workspace="default")
+        assert "[DOCUMENTATION]" in ctx
+        assert "[WORKSPACE IDENTITY]" in ctx
 
-    @pytest.mark.asyncio
-    async def test_short_transcript_returned_without_llm(self, tmp_path):
-        from kiro_crew.context import compress_thread_history
-        from kiro_crew.history import ConversationLog
 
-        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
-        conv_log.init()
-        conv_log.append("t1", "user", "hello")
-        conv_log.append("t1", "assistant", "hi there")
-        sessions = Mock(spec=[])  # unused — transcript is short
-        result = await compress_thread_history(conv_log, "t1", "hello", sessions)
-        assert result is not None
-        assert "hello" in result
-        assert "hi there" in result
+class TestCustomAgentSkillLog:
+    """The 'injecting memory/lessons/rules, ...' log reports the real skill decision.
 
-    @pytest.mark.asyncio
-    async def test_long_transcript_calls_llm(self, tmp_path, monkeypatch):
-        from unittest.mock import AsyncMock, MagicMock
+    ``_skills_injection_plan`` is the single source of truth for whether an
+    agent receives skills: a custom agent that maps skills via ``skill://``
+    (or, on kiro-cli, inherits the default skill trees) gets a skill directory,
+    while a custom agent the plan gives no globs gets none. The session-start
+    log must read that decision, not assume every custom agent skips skills.
+    """
 
-        from kiro_crew.context import compress_thread_history
-        from kiro_crew.history import ConversationLog
-
-        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
-        conv_log.init()
-        for i in range(50):
-            conv_log.append("t1", "user", f"msg {i} " + "x" * 1400)
-            conv_log.append("t1", "assistant", f"reply {i} " + "y" * 1400)
-
-        mock_client = MagicMock()
-        mock_sessions = MagicMock()
-        mock_sessions.get_pid = MagicMock(return_value=None)
-        mock_sessions.get_or_create = AsyncMock(return_value=(mock_client, True, False))
-        mock_sessions.release = MagicMock()
-        mock_sessions.recycle_background = AsyncMock()
-
-        monkeypatch.setattr(
-            "kiro_crew.llm_helpers.stream_and_collect",
-            AsyncMock(return_value="compressed summary here"),
+    def _builder(self, tmp_path):
+        return ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
         )
 
-        result = await compress_thread_history(conv_log, "t1", "latest q", mock_sessions)
-        assert result is not None
-        assert "compressed summary here" in result
-        assert "Thread start (verbatim)" in result
-        assert "Compressed history" in result
-        assert "Recent exchanges (verbatim)" in result
-        mock_sessions.release.assert_called_once()
-        mock_sessions.recycle_background.assert_awaited_once()
+    def test_custom_agent_with_skills_logs_injecting_not_skipping(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A custom agent the plan gives skill globs logs that skills are injected."""
+        from kiro_crew import context as ctx_mod
 
-    @pytest.mark.asyncio
-    async def test_llm_failure_returns_none(self, tmp_path, monkeypatch):
-        from unittest.mock import AsyncMock, MagicMock
+        monkeypatch.setattr(
+            ctx_mod, "_skills_injection_plan", lambda *a, **k: (True, ["some-skill/**"])
+        )
+        builder = self._builder(tmp_path)
+        with caplog.at_level("INFO", logger="kiro_crew.context"):
+            builder.build_session_context(agent="code-reviewer")
 
-        from kiro_crew.context import compress_thread_history
-        from kiro_crew.history import ConversationLog
+        line = next(r.getMessage() for r in caplog.records if "code-reviewer" in r.getMessage())
+        assert "injecting skills" in line
+        assert "skipping skills" not in line
 
-        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
-        conv_log.init()
-        for i in range(50):
-            conv_log.append("t1", "user", f"msg {i} " + "x" * 1400)
-            conv_log.append("t1", "assistant", f"reply {i} " + "y" * 1400)
+    def test_unmapped_custom_agent_logs_skipping(self, tmp_path, monkeypatch, caplog):
+        """A custom agent with no skill globs still logs that skills are skipped."""
+        from kiro_crew import context as ctx_mod
 
-        mock_sessions = MagicMock()
-        mock_sessions.get_pid = MagicMock(return_value=None)
-        mock_sessions.get_or_create = AsyncMock(side_effect=RuntimeError("boom"))
-        mock_sessions.release = MagicMock()
-        mock_sessions.recycle_background = AsyncMock()
+        monkeypatch.setattr(ctx_mod, "_skills_injection_plan", lambda *a, **k: (False, []))
+        builder = self._builder(tmp_path)
+        with caplog.at_level("INFO", logger="kiro_crew.context"):
+            builder.build_session_context(agent="code-reviewer")
 
-        result = await compress_thread_history(conv_log, "t1", "q", mock_sessions)
-        assert result is None
-        mock_sessions.release.assert_not_called()
-        mock_sessions.recycle_background.assert_not_awaited()
+        line = next(r.getMessage() for r in caplog.records if "code-reviewer" in r.getMessage())
+        assert "skipping skills" in line
+        assert "injecting skills" not in line
 
+
+class TestCompressedHistory:
     def test_build_session_context_uses_compressed_history(self, tmp_path):
         """When compressed_history is passed, it replaces naive truncation."""
         from kiro_crew.history import ConversationLog
@@ -1018,36 +1427,6 @@ class TestCompressThreadHistory:
 
         assert "OPENING CONTEXT LINE" in ctx
         assert "[Older thread history omitted]" not in ctx
-
-    @pytest.mark.asyncio
-    async def test_compressed_output_redacts_credentials(self, tmp_path, monkeypatch):
-        """Credentials in LLM compression output must be scrubbed."""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from kiro_crew.context import compress_thread_history
-        from kiro_crew.history import ConversationLog
-
-        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
-        conv_log.init()
-        for i in range(50):
-            conv_log.append("t1", "user", f"msg {i} " + "x" * 500)
-            conv_log.append("t1", "assistant", f"reply {i} " + "y" * 500)
-
-        mock_sessions = MagicMock()
-        mock_sessions.get_pid = MagicMock(return_value=None)
-        mock_sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
-        mock_sessions.release = MagicMock()
-        mock_sessions.recycle_background = AsyncMock()
-
-        fake_key = "AKIAIOSFODNN7EXAMPLE"
-        monkeypatch.setattr(
-            "kiro_crew.llm_helpers.stream_and_collect",
-            AsyncMock(return_value=f"summary with {fake_key} leaked"),
-        )
-
-        result = await compress_thread_history(conv_log, "t1", "q", mock_sessions)
-        assert result is not None
-        assert fake_key not in result
 
 
 class TestLoadAgentPrompt:
@@ -1112,23 +1491,94 @@ class TestLoadAgentPrompt:
         monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
         assert ContextBuilder._load_agent_prompt("test") == ""
 
-    def test_project_agent_shadows_global_prompt(self, tmp_path, monkeypatch):
+    @staticmethod
+    def _write_spec(tmp_path, monkeypatch, prompt: str) -> None:
         import json
 
-        global_dir = tmp_path / "home" / ".kiro" / "agents"
-        global_dir.mkdir(parents=True)
-        (global_dir / "reviewer.json").write_text(
-            json.dumps({"name": "reviewer", "prompt": "GLOBAL_PROMPT"}), encoding="utf-8"
+        agents_dir = tmp_path / ".kiro" / "agents"
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        (agents_dir / "test.json").write_text(
+            json.dumps({"name": "test", "prompt": prompt}), encoding="utf-8"
         )
-        project = tmp_path / "project"
-        project_dir = project / ".kiro" / "agents"
-        project_dir.mkdir(parents=True)
-        (project_dir / "reviewer.json").write_text(
-            json.dumps({"name": "reviewer", "prompt": "PROJECT_PROMPT"}), encoding="utf-8"
-        )
-        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "home")
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", agents_dir)
+        monkeypatch.setattr("kiro_crew.agent_discovery._KIRO_AGENTS_DIR", agents_dir)
 
-        assert ContextBuilder._load_agent_prompt("reviewer", str(project)) == "PROJECT_PROMPT"
+    @staticmethod
+    def _managed_contract(tmp_path, monkeypatch):
+        from kiro_crew import agent
+
+        package = tmp_path / "installed-package" / "config"
+        package.mkdir(parents=True)
+        contract = package / "prompt.md"
+        contract.write_text("RESOLVED_CONTRACT", encoding="utf-8")
+        monkeypatch.setattr(agent, "_BUNDLED_CFG_DIR", package)
+        monkeypatch.setattr(agent, "_project_dir", lambda: None)
+        assert agent._prompt_path() == contract
+        return contract
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_stub_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        """The stub is the managed contract whatever spec carries it: a fork or
+        template copy inherits it verbatim and must not receive the stub TEXT as
+        its persona."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    @pytest.mark.parametrize("owner_template", ["", "test"], ids=["fork-or-copy", "owner"])
+    def test_managed_pointer_resolves_to_contract(self, tmp_path, monkeypatch, owner_template):
+        contract = self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, f"file://{contract}")
+        loaded = ContextBuilder._load_agent_prompt("test", owner_template=owner_template)
+        assert loaded == "RESOLVED_CONTRACT"
+
+    def test_owner_template_custom_prompt_omitted(self, tmp_path, monkeypatch):
+        """An owner template's own (non-managed) prompt reaches the model through
+        member essentials, so the session-start load omits it."""
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, "You are a bespoke reviewer.")
+        assert ContextBuilder._load_agent_prompt("test", owner_template="test") == ""
+        assert ContextBuilder._load_agent_prompt("test") == "You are a bespoke reviewer."
+
+    def test_template_copy_with_stub_delivers_contract_once_at_session_start(
+        self, tmp_path, monkeypatch
+    ):
+        """End to end: a plain (non-member) session on a template copy of the
+        managed default, whose spec inherited the stub verbatim, gets the resolved
+        contract as its [AGENT SYSTEM PROMPT] exactly once, and never the stub text."""
+        from kiro_crew import agent
+
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, agent._NATIVE_PROMPT_STUB)
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        msg, _ = builder.build_message("hello", is_new_session=True, agent="test")
+        assert msg.count("RESOLVED_CONTRACT") == 1
+        assert "[AGENT SYSTEM PROMPT]\nRESOLVED_CONTRACT\n[END AGENT SYSTEM PROMPT]" in msg
+        assert "follow it as your authoritative contract" not in msg
+
+    def test_custom_agent_gets_own_prompt_under_claude_code(self, tmp_path, monkeypatch):
+        """Under claude_code a custom agent without a private owner gets its own
+        prompt as its [AGENT SYSTEM PROMPT], not the Kiro Crew persona."""
+        self._managed_contract(tmp_path, monkeypatch)
+        self._write_spec(tmp_path, monkeypatch, "You are a bespoke reviewer.")
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        )
+        msg, _ = builder.build_message(
+            "hello", is_new_session=True, agent="test", provider_type="claude_code"
+        )
+        assert (
+            "[AGENT SYSTEM PROMPT]\nYou are a bespoke reviewer.\n[END AGENT SYSTEM PROMPT]" in msg
+        )
+        assert "RESOLVED_CONTRACT" not in msg
 
 
 class TestRuntimeDisplayName:
@@ -1232,783 +1682,3 @@ class TestRuntimeDisplayName:
             runtime_source="dashboard",
         )
         assert "this surface renders no tool cards" not in dash_msg
-
-
-class TestMultibyteSanitization:
-    """Tests for multi-byte UTF-8 sanitization (kiro-cli panic workaround)."""
-
-    def test_build_message_strips_multibyte(self, tmp_path):
-        """build_message replaces multi-byte punctuation with ASCII equivalents."""
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-        )
-        msg, _ = builder.build_message(
-            "Check the pipeline \u2014 it\u2019s failing\u2026",
-            is_new_session=False,
-        )
-        assert "\u2014" not in msg
-        assert "\u2019" not in msg
-        assert "\u2026" not in msg
-        assert "--" in msg
-        assert "'" in msg
-        assert "..." in msg
-
-    def test_build_message_new_session_strips_multibyte(self, tmp_path):
-        """Multi-byte chars in memory/skills context are also sanitized."""
-        ws = tmp_path / "ws"
-        store = MemoryStore(workspace=ws)
-        store.write(
-            "# Memory\n\nUser prefers \u201csmart quotes\u201d and em dashes \u2014 always."
-        )
-        builder = ContextBuilder(
-            memory=store,
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-        )
-        msg, _ = builder.build_message("hello", is_new_session=True)
-        assert "\u201c" not in msg
-        assert "\u201d" not in msg
-        assert "\u2014" not in msg
-
-    def test_multibyte_table_covers_all_chars(self):
-        """Translation table handles all listed multi-byte chars."""
-        from kiro_crew.context import _MULTIBYTE_TABLE
-
-        sample = "\u2014 \u2013 \u2018 \u2019 \u201c \u201d \u2026 \u00a0 \u2022"
-        result = sample.translate(_MULTIBYTE_TABLE)
-        assert result == "-- - ' ' \" \" ...   -"
-
-    @pytest.mark.asyncio
-    async def test_compress_thread_history_strips_multibyte(self, tmp_path):
-        """Short transcript with multi-byte chars gets sanitized."""
-        from kiro_crew.context import compress_thread_history
-        from kiro_crew.history import ConversationLog
-
-        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
-        conv_log.init()
-        conv_log.append("t1", "user", "what\u2019s the status \u2014 any update?")
-        conv_log.append("t1", "assistant", "All good \u2026 no issues.")
-        sessions = Mock(spec=[])
-        result = await compress_thread_history(conv_log, "t1", "hello", sessions)
-        assert result is not None
-        assert "\u2019" not in result
-        assert "\u2014" not in result
-        assert "\u2026" not in result
-
-
-class TestCurrentDateTimezone:
-    """[CURRENT DATE] injection must honour KiroCrewConfig.timezone, so LLMs
-    see the user's local time rather than the gateway host TZ (often UTC)."""
-
-    def _make_builder(self, tmp_path):
-        return ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-            hooks=HookManager(HooksConfig()),
-        )
-
-    def test_current_date_uses_configured_timezone(self, tmp_path):
-        builder = self._make_builder(tmp_path)
-        # The PUBLISHED default, not a config load: get_local_tz reads the
-        # snapshot so prompt assembly does no config I/O on the event loop.
-        with patch("kiro_crew.cron.published_config_timezone", return_value="Asia/Tokyo"):
-            ctx = builder.build_session_context()
-        # Tokyo is JST/UTC+9; %Z renders "JST"
-        assert "[CURRENT DATE]" in ctx
-        date_line = [ln for ln in ctx.splitlines() if ln.startswith("[CURRENT DATE]")][0]
-        assert "JST" in date_line
-
-    def test_current_date_falls_back_to_utc_when_config_empty(self, tmp_path):
-        builder = self._make_builder(tmp_path)
-        with patch("kiro_crew.cron.published_config_timezone", return_value=""):
-            ctx = builder.build_session_context()
-        date_line = [ln for ln in ctx.splitlines() if ln.startswith("[CURRENT DATE]")][0]
-        assert "UTC" in date_line
-
-
-class TestLoadSteeringResources:
-    """Tests for _load_steering_resources."""
-
-    def test_loads_md_files_from_resources(self, tmp_path):
-        from kiro_crew.context import _load_steering_resources
-
-        # Create steering file
-        steering_dir = tmp_path / ".kiro" / "steering"
-        steering_dir.mkdir(parents=True)
-        (steering_dir / "rules.md").write_text("# My Rules\nAlways be nice.")
-
-        # Create agent config with resources
-        agents_dir = tmp_path / ".kiro" / "agents"
-        agents_dir.mkdir(parents=True)
-        import json
-
-        (agents_dir / "kirocrew.json").write_text(
-            json.dumps({"resources": ["file://.kiro/steering/**/*.md"]})
-        )
-
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            result = _load_steering_resources()
-
-        assert "My Rules" in result
-        assert "Always be nice." in result
-
-    def test_returns_empty_when_no_config(self, tmp_path):
-        from kiro_crew.context import _load_steering_resources
-
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            result = _load_steering_resources()
-
-        assert result == ""
-
-    def test_skips_sensitive_paths(self, tmp_path):
-        from kiro_crew.context import _load_steering_resources
-
-        # Create a .md file in a sensitive location
-        ssh_dir = tmp_path / ".ssh"
-        ssh_dir.mkdir()
-        (ssh_dir / "keys.md").write_text("SECRET")
-
-        agents_dir = tmp_path / ".kiro" / "agents"
-        agents_dir.mkdir(parents=True)
-        import json
-
-        (agents_dir / "kirocrew.json").write_text(json.dumps({"resources": ["file://.ssh/*.md"]}))
-
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            result = _load_steering_resources()
-
-        assert "SECRET" not in result
-
-    def test_steering_injected_for_cc_but_not_acp(self, tmp_path):
-        """kiro-cli loads an agent's ``resources`` natively when spawned with
-        ``--agent`` (acp/client.py ``_spawn``), so build_session_context must
-        NOT re-inject steering on the ACP backend — that would duplicate what
-        kiro already loaded. The CC backend (claude-agent-acp) does not read
-        agent ``resources``, so it still needs the explicit load.
-        """
-        import json
-
-        steering_dir = tmp_path / ".kiro" / "steering"
-        steering_dir.mkdir(parents=True)
-        (steering_dir / "rules.md").write_text("# My Rules\nSTEERING_MARKER_XYZ")
-        agents_dir = tmp_path / ".kiro" / "agents"
-        agents_dir.mkdir(parents=True)
-        (agents_dir / "kirocrew.json").write_text(
-            json.dumps({"resources": ["file://.kiro/steering/**/*.md"]})
-        )
-
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            cc_ctx = builder.build_session_context(provider_type="claude_code")
-            acp_ctx = builder.build_session_context(provider_type="acp")
-
-        assert "STEERING_MARKER_XYZ" in cc_ctx, "CC backend must get explicit steering load"
-        assert "STEERING_MARKER_XYZ" not in acp_ctx, (
-            "ACP backend must NOT re-inject steering — kiro-cli loads agent "
-            "resources natively via --agent"
-        )
-
-    def test_custom_agent_file_resources_are_injected_for_spec_adapter(self, tmp_path):
-        import json
-
-        resource_dir = tmp_path / "agent-notes"
-        resource_dir.mkdir()
-        (resource_dir / "rules.md").write_text("CUSTOM_RESOURCE_MARKER")
-        agents_dir = tmp_path / ".kiro" / "agents"
-        agents_dir.mkdir(parents=True)
-        (agents_dir / "reviewer.json").write_text(
-            json.dumps(
-                {
-                    "name": "reviewer",
-                    "prompt": "Review carefully.",
-                    "resources": ["file://agent-notes/*.md"],
-                }
-            )
-        )
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            spec_ctx = builder.build_session_context(agent="reviewer", provider_type="codex")
-            kiro_ctx = builder.build_session_context(agent="reviewer", provider_type="acp")
-
-        assert "CUSTOM_RESOURCE_MARKER" in spec_ctx
-        assert "CUSTOM_RESOURCE_MARKER" not in kiro_ctx
-
-    def test_oversized_agent_spec_is_not_read_for_adapter_resources(self, tmp_path, monkeypatch):
-        import json
-
-        from kiro_crew import hooks
-        from kiro_crew.context import _load_agent_file_resources
-
-        resource = tmp_path / "resource.md"
-        resource.write_text("OVERSIZED_AGENT_RESOURCE")
-        spec = tmp_path / "reviewer.json"
-        spec.write_text(json.dumps({"name": "reviewer", "resources": ["file://resource.md"]}))
-        monkeypatch.setattr(hooks, "MAX_FILE_BYTES", 8)
-        monkeypatch.setattr(
-            "kiro_crew.context._agent_spec_candidates", lambda _agent, _project=None: [spec]
-        )
-
-        with patch("pathlib.Path.home", return_value=tmp_path):
-            assert _load_agent_file_resources("reviewer") == ""
-
-    def test_project_agent_resources_shadow_global_for_spec_adapter(self, tmp_path):
-        import json
-
-        global_home = tmp_path / "home"
-        global_agents = global_home / ".kiro" / "agents"
-        global_agents.mkdir(parents=True)
-        global_notes = global_home / "global-notes"
-        global_notes.mkdir()
-        (global_notes / "rules.md").write_text("GLOBAL_RESOURCE")
-        (global_agents / "reviewer.json").write_text(
-            json.dumps({"name": "reviewer", "resources": ["file://global-notes/*.md"]})
-        )
-        project = tmp_path / "project"
-        project_agents = project / ".kiro" / "agents"
-        project_agents.mkdir(parents=True)
-        project_notes = global_home / "project-notes"
-        project_notes.mkdir()
-        (project_notes / "rules.md").write_text("PROJECT_RESOURCE")
-        (project_agents / "reviewer.json").write_text(
-            json.dumps(
-                {
-                    "name": "reviewer",
-                    "prompt": "PROJECT_AGENT_PROMPT",
-                    "resources": ["file://project-notes/*.md"],
-                }
-            )
-        )
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-        with patch("pathlib.Path.home", return_value=global_home):
-            message, _ = builder.build_message(
-                "hello",
-                True,
-                agent="reviewer",
-                project=str(project),
-                provider_type="claude_code",
-            )
-
-        assert "PROJECT_AGENT_PROMPT" in message
-        assert "PROJECT_RESOURCE" in message
-        assert "GLOBAL_RESOURCE" not in message
-
-
-class TestLessonsCap:
-    def test_over_cap_preserves_complete_explicit_rules(self, tmp_path):
-        from kiro_crew.context import _LESSONS_STARTUP_CAP
-        from kiro_crew.learn import Lesson
-
-        lessons = LessonStore(base_dir=tmp_path)
-        # Save enough long lessons that the formatted context exceeds the cap.
-        # The budget that BINDS the startup rule tier is ``_LESSONS_STARTUP_CAP``
-        # (the window-independent authored-tier allowance passed as the startup
-        # renderers' ``directive_budget``), not the ordinary ``_LESSONS_CAP``, so
-        # the fixture is sized to overflow that one.
-        rule = "x" * 1000
-        for i in range(_LESSONS_STARTUP_CAP // 1000 + 5):
-            lessons.save(Lesson(ts=str(i), rule=f"{i}-{rule}", category="knowledge"))
-
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=lessons,
-        )
-        ctx = builder.build_session_context()
-
-        assert "CRITICAL ERROR — LESSONS FILE TOO LARGE" not in ctx
-        assert "[lessons truncated]" not in ctx
-        # The rule budget BINDS on the startup path. What it must never do is emit
-        # a partial rule: trimming is by whole entry, so every rule that appears
-        # appears in full, and the ones that did not fit are reported with exact
-        # counts instead of vanishing.
-        total = _LESSONS_STARTUP_CAP // 1000 + 5
-        # Match the whole rendered entry, not the rule text: these fixture rules
-        # are prefix-ambiguous ("0-xxx…" is a substring of "10-xxx…"), so a bare
-        # ``in`` reports a rule as present that was never emitted. Anchoring on the
-        # "- " bullet and the terminating newline both disambiguates the index AND
-        # proves the entry is complete rather than a truncated prefix.
-        entries = {i: f"- {i}-{rule}\n" for i in range(total)}
-        present = [i for i, entry in entries.items() if entry in ctx]
-        assert present, "the rule budget must still admit rules"
-        assert len(present) < total, "this fixture is sized to overflow the rule budget"
-        # FULL ACCOUNTING, which is the invariant a subset check does not carry: a
-        # subset assertion holds even if rules vanish, so the count the prompt
-        # reports as omitted must exactly equal the count missing from the prompt.
-        # Every rule is then either rendered in full or named in the notice, and a
-        # rule cannot disappear unaccounted for.
-        notice = re.search(r"omitted (\d+) of (\d+) retained rules", ctx)
-        assert notice, "an overflow must report itself"
-        omitted, reported_total = int(notice.group(1)), int(notice.group(2))
-        assert reported_total == total
-        assert len(present) + omitted == total
-        assert "read them with learn_list" in ctx
-        # And the block stays inside the budget it names.
-        start = ctx.index("[Learned corrections")
-        end = ctx.index("[End of learned corrections]", start)
-        assert end - start <= _LESSONS_STARTUP_CAP
-
-    def test_under_cap_no_error_block(self, tmp_path):
-        from kiro_crew.learn import Lesson
-
-        lessons = LessonStore(base_dir=tmp_path)
-        lessons.save(Lesson(ts="1", rule="always run the formatter", category="knowledge"))
-        lessons.save(Lesson(ts="2", rule="never force push to mainline", category="knowledge"))
-
-        builder = ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=lessons,
-        )
-        ctx = builder.build_session_context()
-
-        # Under the cap: no error block, and ALL lessons preserved verbatim.
-        assert "CRITICAL ERROR — LESSONS FILE TOO LARGE" not in ctx
-        assert "always run the formatter" in ctx
-        assert "never force push to mainline" in ctx
-        assert "[lessons truncated]" not in ctx
-
-
-class TestBuildMessageOffloadedAtCallSites:
-    """build_message embeds the episodic query via a blocking urllib call to
-    Ollama on new sessions. Async callers (gateway loop coroutines) wrap the
-    whole call in run_in_embed_pool — enforced statically by
-    TestAsyncCallSitesUseToThread below. These tests cover the skip branches
-    (follow-up / minimal-context must never embed) and that build_message
-    remains sync-callable (CLI, 25+ existing tests, and MagicMock-based test
-    doubles all rely on the sync signature).
-    """
-
-    def _builder(self, tmp_path):
-        return ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-    def test_follow_up_skips_episodic_entirely(self, tmp_path):
-        from unittest.mock import MagicMock
-
-        vector_store = MagicMock()
-        builder = self._builder(tmp_path)
-        fake_memory = MagicMock()
-        fake_memory.vector_store = vector_store
-        fake_memory.get_context.return_value = ""
-        fake_memory.activity_index.return_value = ""
-        vector_store.get_lessons.return_value = []
-
-        with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
-            builder.build_message("follow up message", False, "sess-1")
-
-        vector_store.get_episodic_context.assert_not_called()
-
-    def test_minimal_context_skips_episodic(self, tmp_path):
-        from unittest.mock import MagicMock
-
-        vector_store = MagicMock()
-        builder = self._builder(tmp_path)
-        fake_memory = MagicMock()
-        fake_memory.vector_store = vector_store
-        fake_memory.get_context.return_value = ""
-        fake_memory.activity_index.return_value = ""
-        vector_store.get_lessons.return_value = []
-        vector_store.get_semantic_context.return_value = ""
-
-        with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
-            builder.build_message("message", True, "sess-1", minimal_context=True)
-
-        vector_store.get_episodic_context.assert_not_called()
-
-
-class TestAsyncCallSitesUseToThread:
-    """Static guard: no async coroutine may call build_message inline.
-
-    Every production call site of ``build_message`` inside an ``async def``
-    must go through ``run_in_embed_pool`` / an executor offload (the episodic
-    query embed blocks). This walks the AST of all gateway-process modules so
-    a future call site reintroducing the inline pattern fails CI rather than
-    shipping a fourth loop-stall bug (22475ceb, _save_lessons, build_message
-    were the first three).
-
-    Scope rules mirror test_no_blocking_call_on_loop.py: a nested ``def`` /
-    ``async def`` / ``lambda`` is a separate frame (a sync helper, a thread
-    target, an offloaded callable such as ``run_in_executor(None, lambda:
-    ctx.build_message(...))``) and is NOT scanned as part of the enclosing
-    coroutine — so both sanctioned offload shapes pass. A ``# loop-ok:
-    <reason>`` trailing comment suppresses a finding.
-    """
-
-    def test_no_inline_build_message_in_async_functions(self):
-        import ast
-        from pathlib import Path
-
-        nested_scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
-        src_root = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
-        offenders: list[str] = []
-
-        def _iter_frame_calls(fn: ast.AsyncFunctionDef):
-            """Yield Call nodes lexically in *fn*'s own frame — skip nested scopes."""
-            stack: list[ast.AST] = list(ast.iter_child_nodes(fn))
-            while stack:
-                node = stack.pop()
-                if isinstance(node, nested_scopes):
-                    continue  # separate frame: sync helper / thread target / lambda
-                if isinstance(node, ast.Call):
-                    yield node
-                stack.extend(ast.iter_child_nodes(node))
-
-        for py in src_root.rglob("*.py"):
-            try:
-                text = py.read_text(encoding="utf-8")
-                tree = ast.parse(text)
-            except SyntaxError:
-                continue
-            lines = text.splitlines()
-            for fn in ast.walk(tree):
-                if not isinstance(fn, ast.AsyncFunctionDef):
-                    continue
-                for call in _iter_frame_calls(fn):
-                    func = call.func
-                    # Inline call: the Call's func IS .build_message. The
-                    # sanctioned run_in_embed_pool(x.build_message, ...) form
-                    # passes the method as an ARG, so its Call func is
-                    # to_thread and never matches here.
-                    if not (isinstance(func, ast.Attribute) and func.attr == "build_message"):
-                        continue
-                    src_line = lines[call.lineno - 1] if call.lineno <= len(lines) else ""
-                    if "# loop-ok" in src_line:
-                        continue
-                    offenders.append(f"{py.relative_to(src_root)}:{call.lineno} in async {fn.name}")
-
-        assert not offenders, (
-            "build_message called inline from async coroutine(s) — the episodic "
-            "query embed blocks the event loop; wrap in run_in_embed_pool (or "
-            "add '# loop-ok: <reason>' if genuinely safe):\n  " + "\n  ".join(offenders)
-        )
-
-
-class TestMemoryGetContextQueryWiring:
-    """Startup passes the request but disables activity; explicit readers retain it."""
-
-    def _builder(self, tmp_path):
-        return ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-    def test_new_session_passes_query_to_get_context(self, tmp_path):
-        from unittest.mock import MagicMock
-
-        builder = self._builder(tmp_path)
-        fake_memory = MagicMock()
-        fake_memory.get_context.return_value = ""
-        fake_memory.activity_index.return_value = ""
-        fake_memory.vector_store = None
-
-        with patch.object(ContextBuilder, "get_memory_for", return_value=fake_memory):
-            builder.build_message("what did we decide about paris", True, "sess-1")
-
-        assert fake_memory.get_context.call_count == 1
-        kwargs = fake_memory.get_context.call_args.kwargs
-        assert kwargs["query"] == "what did we decide about paris"
-        assert kwargs["include_activity"] is False
-
-    def test_an_empty_scoped_lesson_result_does_not_fall_back_to_jsonl(self, tmp_path):
-        # A POPULATED vector store whose rows are all out of scope has already
-        # answered. Falling through would let the JSONL store speak for it and
-        # re-inject rows deleted from it.
-        from types import SimpleNamespace
-
-        from kiro_crew.learn import Lesson
-
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: True,
-        )
-        builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-        msg, _ = builder.build_message("q", True, "s1")
-        assert "JSONL-SENTINEL" not in msg
-
-    def test_an_unpopulated_vector_store_still_yields_jsonl_lessons(self, tmp_path):
-        # The opposite failure: while a first-boot migration is still filling the
-        # vector store it exists but holds nothing, and saved corrections must not
-        # vanish from the prompt in the meantime.
-        from types import SimpleNamespace
-
-        from kiro_crew.learn import Lesson
-
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: False,
-        )
-        builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-        msg, _ = builder.build_message("q", True, "s1")
-        assert "JSONL-SENTINEL" in msg
-
-    def test_withheld_only_vector_store_still_yields_jsonl_lessons(self, tmp_path):
-        from kiro_crew.learn import Lesson
-        from kiro_crew.vector_memory import VectorMemoryStore
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "vectors.db", embedding_dim=4)
-        vector_store.init()
-        try:
-            memory._vector_store = vector_store
-            vector_store.set_semantic(
-                "lesson.legacyvolatile",
-                {
-                    "rule": "The current model identity is gpt-5.6-sol.",
-                    "category": "preference",
-                    "negative": None,
-                },
-                1.0,
-                "user_explicit",
-            )
-            builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-
-            msg, _ = builder.build_message("q", True, "s1")
-
-            assert "JSONL-SENTINEL" in msg
-            assert "gpt-5.6-sol" not in msg
-        finally:
-            vector_store.close()
-
-    def test_episodic_is_only_included_by_explicit_memory_reader(self, tmp_path):
-        from types import SimpleNamespace
-
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "[EPISODIC-SENTINEL]",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: True,
-        )
-        msg, _ = builder.build_message("q", True, "s1")
-        assert "[EPISODIC-SENTINEL]" not in msg
-        assert store.get_context(query="q").count("[EPISODIC-SENTINEL]") == 1
-
-    def test_episodic_query_is_the_user_message(self, tmp_path):
-        from types import SimpleNamespace
-
-        seen: list[str] = []
-        builder = self._builder(tmp_path)
-        store = builder.get_memory_for(None)
-
-        def _episodic(query_text, cap):
-            seen.append(query_text)
-            return ""
-
-        store._vector_store = SimpleNamespace(
-            get_episodic_context=_episodic,
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: True,
-        )
-        builder.build_message("find my tokyo notes", True, "s2")
-        assert seen == []
-        store.get_context(query="find my tokyo notes")
-        assert seen == ["find my tokyo notes"]
-
-
-class TestDurableModelVersionLessonContext:
-    RULE = "the Python 3.12 wheel needs claude-opus-4.8 pinned in role_models"
-    NEGATIVE = "assume gpt-5.6-sol supports the streaming flag"
-    MODEL_TOOLING_RULES = (
-        ("Always use the tokenizer shipped with gpt-5.6-sol", "tool"),
-        ("Prefer the retry wrapper when calling opus-4.8 endpoints", "preference"),
-        ("Never use the streaming flag with gpt-5.6-sol", "tool"),
-        ("Always use the gpt-5-compatible tokenizer", "tool"),
-        ("Always use the gpt-5 compatible tokenizer", "tool"),
-        ("Never use gpt-5.6-sol endpoints without the retry wrapper", "tool"),
-    )
-    BACKEND_PROCESS_RULES = (
-        ("Never run as the backend service account", "tool"),
-        ("The service is running as the backend worker", "preference"),
-        ("The service is running as the active backend service account", "tool"),
-        ("The service is running as the current backend worker", "preference"),
-        ("Restart the backend after config changes", "tool"),
-        ("Run the worker as the backend user, never as root", "preference"),
-    )
-    TOOLING_RULES = MODEL_TOOLING_RULES + BACKEND_PROCESS_RULES
-
-    def _builder(self, tmp_path):
-        return ContextBuilder(
-            memory=MemoryStore(workspace=tmp_path / "ws"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
-            lessons=LessonStore(base_dir=tmp_path),
-        )
-
-    def test_jsonl_context_renders_durable_model_version_references(self, tmp_path):
-        from types import SimpleNamespace
-
-        from kiro_crew.learn import Lesson
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        memory._vector_store = SimpleNamespace(
-            get_episodic_context=lambda query_text, cap: "",
-            get_semantic_context=lambda query_text, cap: "",
-            get_preferences_context=lambda: "",
-            get_lessons_context=lambda query_text, cap, project_dir=None, background=False, hard_cap=0, directive_budget=0, experience_budget=0: "",
-            has_any_lesson=lambda: False,
-        )
-        assert builder.lessons.save(Lesson(ts="t", rule=self.RULE, category="tool")) == "inserted"
-        assert (
-            builder.lessons.save(
-                Lesson(
-                    ts="t",
-                    rule="check streaming compatibility before release",
-                    category="preference",
-                    negative=self.NEGATIVE,
-                )
-            )
-            == "inserted"
-        )
-        for rule, category in self.TOOLING_RULES:
-            assert builder.lessons.save(Lesson(ts="t", rule=rule, category=category)) == "inserted"
-
-        message, _ = builder.build_message("check wheel compatibility", True, "s-version-jsonl")
-
-        assert self.RULE in message
-        assert self.NEGATIVE in message
-        for rule, _category in self.TOOLING_RULES:
-            assert rule in message
-
-    def test_vector_context_renders_durable_model_version_references(self, tmp_path):
-        from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "vectors.db", embedding_dim=4)
-        vector_store.init()
-        try:
-            memory._vector_store = vector_store
-            first = vector_store.write_lesson(self.RULE, "tool")
-            second = vector_store.write_lesson(
-                "check streaming compatibility before release",
-                "preference",
-                negative=self.NEGATIVE,
-            )
-
-            assert first.outcome is LessonWriteOutcome.INSERTED
-            assert second.outcome is LessonWriteOutcome.INSERTED
-            assert vector_store.has_any_lesson() is True
-            rendered = vector_store.get_lessons_context("wheel compatibility")
-            assert self.RULE in rendered
-            assert self.NEGATIVE in rendered
-
-            message, _ = builder.build_message(
-                "check wheel compatibility",
-                True,
-                "s-version-vector",
-            )
-            assert self.RULE in message
-            assert self.NEGATIVE in message
-        finally:
-            vector_store.close()
-
-    @pytest.mark.parametrize("rule,category", TOOLING_RULES)
-    def test_vector_context_renders_model_qualified_tooling(
-        self, tmp_path, rule: str, category: str
-    ) -> None:
-        from kiro_crew.vector_memory import LessonWriteOutcome, VectorMemoryStore
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "tooling.db", embedding_dim=4)
-        vector_store.init()
-        try:
-            memory._vector_store = vector_store
-            result = vector_store.write_lesson(rule, category)
-
-            assert result.outcome is LessonWriteOutcome.INSERTED
-            assert vector_store.has_any_lesson() is True
-            assert rule in vector_store.get_lessons_context(rule)
-
-            message, _ = builder.build_message(rule, True, "s-version-tooling")
-            assert rule in message
-        finally:
-            vector_store.close()
-
-    def test_key_confirmed_legacy_negative_pin_yields_jsonl_fallback(self, tmp_path):
-        from kiro_crew.learn import Lesson
-        from kiro_crew.vector_memory import (
-            _LESSON_NEGATIVE_SEP,
-            VectorMemoryStore,
-            _lesson_key,
-        )
-
-        builder = self._builder(tmp_path)
-        memory = builder.get_memory_for(None)
-        vector_store = VectorMemoryStore(db_path=tmp_path / "legacy-vectors.db", embedding_dim=4)
-        vector_store.init()
-        rule = "automatic selection is safest"
-        try:
-            memory._vector_store = vector_store
-            vector_store.set_semantic(
-                _lesson_key(rule),
-                f"{rule}{_LESSON_NEGATIVE_SEP}Select gpt-5.6-sol for reviews",
-                1.0,
-                "user_explicit",
-            )
-            assert vector_store.has_any_lesson() is False
-            assert vector_store.get_lessons_context() == ""
-            assert (
-                builder.lessons.save(Lesson(ts="t", rule="JSONL-SENTINEL", category="tool"))
-                == "inserted"
-            )
-
-            message, _ = builder.build_message(
-                "check fallback",
-                True,
-                "s-legacy-negative-fallback",
-            )
-
-            assert "JSONL-SENTINEL" in message
-            assert "gpt-5.6-sol" not in message
-        finally:
-            vector_store.close()
-
-
-class TestKeepVisibleMarkerRule:
-    """The keep-visible collapse exemption must be documented in the DASHBOARD
-    critical rules (collapse-all is a dashboard-transcript feature and rehype-raw
-    is what renders the marker invisible), and must NOT ship in the channel
-    variant -- Slack/Discord outbound formatters never strip HTML comments, so a
-    channel agent following the rule would show users the literal marker text."""
-
-    def test_marker_documented_in_dashboard_rules_only(self):
-        from kiro_crew.context import _CRITICAL_RULES, _CRITICAL_RULES_CHANNEL
-
-        assert "<!-- keep-visible -->" in _CRITICAL_RULES
-        assert "<!-- keep-visible -->" not in _CRITICAL_RULES_CHANNEL

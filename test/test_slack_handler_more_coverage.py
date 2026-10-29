@@ -33,6 +33,7 @@ import kiro_crew.voice_reply as voice_reply
 from conftest import MockSlackClient
 from kiro_crew.acp.client import AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import (
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -102,7 +103,7 @@ class FakeSessions:
         self.policies: dict[str, str] = {}
         self._session_map = None
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         self.keys_seen.append(key)
         was_new = self._is_new
         self._is_new = False
@@ -178,7 +179,7 @@ class FakeSessions:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
 
     async def stop_turn(self, key, *, force=False, on_soft=None, on_hard=None):
@@ -275,19 +276,6 @@ class TestAddPhaseReaction:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# privacy modifiers
-# ──────────────────────────────────────────────────────────────────────
-class TestIncognitoModifierIdempotence:
-    @pytest.mark.asyncio
-    async def test_second_apply_is_a_no_op(self):
-        """``!incognito`` twice in one thread must not re-notify the user."""
-        h._mark_incognito("slack:t1")
-        slack = MockSlackClient()
-        await h._apply_incognito_modifier("slack:t1", "U1", "C1", slack, FakeSessions(), "t1")
-        assert slack.actions == []
-
-
-# ──────────────────────────────────────────────────────────────────────
 # set_orch_cfg — voice_reply provider validation
 # ──────────────────────────────────────────────────────────────────────
 class _Cfg:
@@ -311,8 +299,8 @@ class TestSetOrchCfgProviderValidation:
     def test_valid_provider_is_kept_and_enabled_implies_auto_reply(self, monkeypatch):
         monkeypatch.setattr(h, "_vc", h._VoiceConfig())
         monkeypatch.setattr(h, "_orch_cfg", None, raising=False)
-        h.set_orch_cfg(_Cfg({"enabled": True, "provider": "piper", "voice_id": "Amy"}))
-        assert h._vc.provider == "piper"
+        h.set_orch_cfg(_Cfg({"enabled": True, "provider": "polly", "voice_id": "Amy"}))
+        assert h._vc.provider == "polly"
         assert h._vc.global_enabled is True
         # auto_reply_to_voice defaults to the value of `enabled`.
         assert h._vc.auto_reply_to_voice is True
@@ -1109,6 +1097,57 @@ class TestCompactionReinjection:
         assert sessions.failures, "the turn was recorded a failure"
         assert ledger["marks"] == 1 and ledger["armed"] is True
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "marks"), [("completed", 1), ("failed", 0)])
+    async def test_a_backend_compaction_arms_the_flag_for_the_next_turn(self, status, marks):
+        # The backend compacted its own window mid-turn: the session-start context
+        # is gone even though this turn landed, so the next turn must send it.
+        sessions = FakeSessions(
+            FakeProvider(
+                [
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+                    AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status),
+                ]
+            )
+        )
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+        await handle_message(
+            MockSlackClient(),
+            sessions,
+            "C1",
+            "go",
+            None,
+            "m1",
+            "U1",
+            context_builder=_RecordingBuilder(),
+        )
+        assert sessions.failures == [], "the turn landed"
+        assert ledger["marks"] == marks and ledger["armed"] is bool(marks)
+
+    @pytest.mark.asyncio
+    async def test_a_backend_compaction_arms_the_flag_when_the_turn_then_dies(self):
+        sessions = FakeSessions(
+            FakeProvider(
+                [AcpEvent(kind=EVENT_COMPACTION_STATUS, text="completed")],
+                raises=AcpProcessDied("agent died"),
+            )
+        )
+        ledger = _arm_reinjection(sessions)
+        ledger["armed"] = False
+        await handle_message(
+            MockSlackClient(),
+            sessions,
+            "C1",
+            "go",
+            None,
+            "m1",
+            "U1",
+            context_builder=_RecordingBuilder(),
+        )
+        assert sessions.failures, "the turn was recorded a failure"
+        assert ledger["marks"] == 1 and ledger["armed"] is True
+
 
 class TestToolHookVerdicts:
     @pytest.mark.asyncio
@@ -1305,7 +1344,7 @@ class TestVoiceReply:
 
     @pytest.mark.asyncio
     async def test_missing_tts_backend_warns_the_opted_in_user(self, monkeypatch):
-        _voice_on(monkeypatch, global_enabled=True, provider="piper")
+        _voice_on(monkeypatch, global_enabled=True, provider="system")
         monkeypatch.setattr(h, "_tts_available", lambda **kw: False)
         slack = MockSlackClient()
         provider = FakeProvider([AcpEvent(kind=EVENT_TEXT_CHUNK, text=_LONG_ANSWER)])
@@ -1313,9 +1352,9 @@ class TestVoiceReply:
 
         eph = [a[1]["text"] for a in slack.actions if a[0] == "ephemeral"]
         assert len(eph) == 1
-        assert "provider=piper" in eph[0]
-        # piper-specific remediation, not the Polly one.
-        assert "piper_model" in eph[0]
+        assert "provider=system" in eph[0]
+        # The host-engine remediation, not the Polly one.
+        assert "espeak-ng" in eph[0]
         assert "ada credentials" not in eph[0]
 
     @pytest.mark.asyncio

@@ -35,9 +35,6 @@ class _Sessions:
 
 
 class TestConvFlagPersistence:
-    def test_conv_state_map_none_without_session_map(self, patched):
-        assert h._conv_state_map(object()) is None  # test double -> in-memory only
-
     def test_hydrate_restores_temporary_from_session_map(self, patched):
         sm = SessionMap()
         sm.set_flag("slack:1.2", "temporary", True)

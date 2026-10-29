@@ -6,6 +6,13 @@
 Kiro Crew. It runs from the first-run onboarding flow (after the Kiro CLI
 prerequisite gate, before the theme tour) and from Settings on demand.
 
+When the scan finds nothing to import, the first-run chapter ends by itself and
+the flow moves on. A replay of the importer from Settings stays open on the
+"No supported setup found" result, so the click is answered. `/onboarding`
+replays all of first run, and its empty import step still ends by itself. The
+host chooses in `website/src/shell/boot/firstRun.tsx` (`keepEmptyImport`) and
+passes it to `AgentImportFlow` as `keepOpenWhenEmpty`.
+
 The module is a **projection**, not a mirror: it reads a foreign layout and
 writes only into Kiro Crew's own containers through Kiro Crew's own APIs. It never
 invents a storage format, never writes a file Kiro Crew does not otherwise read,
@@ -28,6 +35,133 @@ Antigravity CLI reuses `~/.gemini` rather than claiming a directory of its own.
 Gemini CLI stopped serving Pro/Ultra/free individual accounts on 2026-06-18 and
 Antigravity replaced it, so that one root holds both a displaced Gemini CLI
 user's config and a current Antigravity install.
+
+## Structure and ownership
+
+The engine is four owners behind one facade. Each module imports only the
+modules listed above it in this table, so there is no cycle and any module can be
+the first one a process imports.
+
+| Module | Owns |
+|--------|------|
+| `onboarding_scan.py` | The scan accumulator (`_Scan`), the candidate item (`_Item`, whose `fingerprint` is the identity the ledger and outcomes key on) and `CATEGORY_IDS`. Also: the never-raising probes (`_exists_safe`, `_is_link_like`, `_stat_kind`); bounded, symlink-safe reads (`_safe_regular_file`, `_walk_files`, `_read_bytes`); the parsers (JSON, JSON5, TOML through the `_toml` tomllib/tomli ladder, and YAML through `_load_no_alias_yaml`); the SQLite snapshot helpers, including the hardlink refusal in `_sqlite_database_is_safe`; and the shared content screens: `_sanitize_text`, `_count_secret_fields`, `_decoded_value_is_unsafe`, and the skill activation screen (`_frontmatter`, `_column0_activation_declared`, `_skill_package`, which refuses `triggers`). It is the only module that calls the credential redactor, so it is the "Onboarding import" row of `security_posture._REDACTION_SINKS`. Category-specific refusals (the MCP field allowlist and URL/argument secret checks, the persona identity guard, schedule semantics) sit with their projection in `onboarding_plan.py`. |
+| `onboarding_plan.py` | The normalized plan. It holds the category projections that turn parsed foreign data into `_Item` payloads through those screens (instructions and the identity guard, memories, database directives, MCP specs, skills, schedules, workspaces, settings). It also holds in-scan dedup (`_deduplicate_items`), the per-source summary, the plan document (`_plan_from_scans`), and the readers `apply_import` uses (`_selected_pairs`, `_plan_roots`, …). |
+| `onboarding_sources/` | The package's `__init__.py` is the registry: the builtin descriptors, `_normalize_source`, the per-context cache behind `_sources()`, root and context resolution (`_source_roots`, `_source_context`), failure-isolated dispatch (`_scan_source`), and the managed / superseded MCP name sets. Each adapter module (`codex`, `claude_code`, `gemini`, `openclaw`, `hermes`, `lineage`) knows one layout. It reads file and database content only through the bounded readers in `onboarding_scan.py` and projects it through `onboarding_plan.py`; path probes (`exists`, `is_file`, `is_dir`, `iterdir`, `glob`) and the `is_sensitive_path` / `contains_injection` screens are called directly. OpenClaw's bespoke root and context rules and the Hermes `%LOCALAPPDATA%` root live in their adapters. |
+| `onboarding_apply.py` | The file-backed half of apply: the ledger (`_load_ledger`, `_record_ledger`, `_write_json`), the conflict strategies and restore copies, and the writers whose destination is a Kiro Crew file (`_write_workspace`, `_write_settings`, `_write_mcp`, `_write_skill`). |
+| `onboarding_import.py` | The facade and the run-level orchestration: `detect_sources`, `preview_import` / `_preview`, `apply_import` (the rescan, the per-item dispatch loop and the ledger flush discipline), `_source_exists`, and the writers into Kiro Crew's own stores: `_write_instruction`, `_write_memory`, `_write_schedule`. |
+
+Placement rules that are load-bearing:
+
+- **The store writers stay in the facade.** The persistence-switch inventory
+  (`test_persistence_writer_inventory.py`) and the cron probe inventory
+  (`test_cron_store_unreadable_boundaries.py`) name them as
+  `onboarding_import.py::<function>`. The dispatch loop stays beside them rather
+  than behind a writer table.
+- **The Claude Code presence probe stays in the facade.** `_source_exists`
+  accepts a `claude_code` root that is absent when `~/.claude.json` sits beside
+  it; the adapter reads that same file for its configs.
+  `test_agent_sdk_provider_identity.py` pins the `"claude_code"` source-id literal
+  to `onboarding_import.py`, and this probe is where the facade uses it.
+- **Code outside the engine reaches names through the facade.** The dashboard
+  handler, `mcp_cleanup`, the managed-MCP registration tests and the frontmatter
+  tests import them; specs and comments cite others by their
+  `onboarding_import.<name>` path. The facade re-exports each as the owner's own
+  object. `test_onboarding_import_refactor_contract.py` pins the list, pins that
+  each re-export is the owner's object, and pins that the entry points and store
+  writers are defined in the facade itself. The facade also keeps every public
+  project name the module bound before it was split into owners (`platform_compat`,
+  `atomic_write`, `ConfigReadError`, `update_config_locked`, `config_dir`,
+  `make_sync_embed_fn`, `ONBOARDING_IMPORT`, `parse_block_scalar_header`,
+  `split_frontmatter`, `FileTooLargeError`, `safe_read_file_bytes_nolink`,
+  `Lesson`, `LessonStore`, `contains_volatile_lesson_fact`, `mcp_server_alias`,
+  `current_context`, `safe_context_call`, `contains_injection`,
+  `is_sensitive_path`, `redact_with_findings`, `VectorMemoryStore`), each bound to its defining module's own object, so code
+  written against the single module still resolves. Standard-library, typing and
+  third-party imports (`yaml`, `croniter`) and private helpers are not part of
+  that surface. The contract test pins the list.
+- **A patch on the facade reaches every call site.** The caps
+  (`_MAX_FILES`, `_MAX_WALK_ENTRIES`, `_MAX_DB_ROWS`, `_MAX_DB_BYTES`,
+  `_MAX_SKILL_BYTES`, `_MAX_SKILL_PACKAGE_BYTES`, `_MAX_MCP_SERVERS`,
+  `_MAX_IMPORTED_LESSONS`) and the helpers `_has_symlink_component`,
+  `_install_skill_tree`, `_sqlite_columns`, `_scan_lineage_install`,
+  `_preserve_replaced_tree`, `_preserve_replaced_json`, `_toml`, `url2pathname`,
+  `_is_link_like` and `_write_json` are mirrored the same way as the
+  `kiro_crew.security` facade: `onboarding_import._EXPORTS` maps each name to the
+  dotted name of the one module that holds it (the Gemini adapter for the
+  standard library's `url2pathname`, since that is where its call site looks it
+  up), and that module's namespace is the only place the value lives. The facade
+  binds none of the 18 names. A read resolves the owner through `sys.modules` on
+  each access (PEP 562 `__getattr__`, defined under `if not TYPE_CHECKING:` so a
+  type checker resolves a name read through the facade from its real bindings and
+  its `TYPE_CHECKING` imports, and reports one that is neither), and the facade's
+  module class forwards a set or a delete to the owner, so `monkeypatch.setattr`, its undo,
+  `mock.patch` and `mock.patch.object` on `onboarding_import.<name>` land in the
+  owner and restore the owner's own original. Every reader outside the owner --
+  the facade's `_source_exists`, `_preview` and ledger flush, and the apply
+  owner, the registry and the adapters -- reads the name off the owner module at
+  call time instead of holding its own `from ... import` copy, so the patch
+  reaches it too. `mock.patch` with a truthy `create` through the facade is the
+  one spelling this cannot serve: its exit deletes the name, which reaches the
+  owner, and then skips the restore. An AST guard in
+  `test_onboarding_import_refactor_contract_patch_guards.py` reads every file under `test/`
+  and every `tests/` package under `src/` whose text contains
+  `onboarding_import`. It fails on a `patch`, `patch.object`, `patch.dict` or
+  `patch.multiple` call or decorator whose target resolves to a mirrored name on
+  the facade and whose `create` -- keyword, positional or a splat -- is anything
+  but the literal `False`. `patch` is recognised when reached through
+  `unittest.mock` or `mock` bound by an import (aliased or not), an assignment,
+  an `import_module` result or a `sys.modules` entry, and when `patch` or one of
+  its three methods is itself bound by a `from ... import` or an assignment. A
+  target resolves to the facade through a dotted string (literals, module-level
+  string constants and the facade's `__name__`, joined by an f-string or `+`) or
+  through a name bound to the facade by an import, an assignment, an
+  `import_module` result, a `sys.modules` entry, or a call to a function in the
+  same file that returns one of these. Assignment chains are followed to a fixed
+  point, file-wide. It does not resolve a facade or `patch` received as a fixture
+  or parameter or fetched with `getattr`, nor read a file whose only spelling of
+  the module name is split across string literals. Once the target is the
+  facade, a name only computed at runtime is a hit too. The one exemption is an
+  explicit allowlist keyed on (path, test); the scan must equal it exactly, and
+  it is empty. Each rule is pinned on a synthetic source it must flag and one it
+  must ignore. `test_onboarding_import_refactor_contract.py` pins that the owner is the only engine module
+  binding each seam, that the facade's own code reads no mirrored name as a bare
+  global, that the facade's `TYPE_CHECKING` block imports every mirrored name
+  from its owner, that `__getattr__` stays hidden from type checkers while every
+  name production imports from the facade still resolves, that an owner already
+  in `sys.modules` is read, written and restored without a call to `importlib.import_module`, and drives a behavioral
+  scenario through every cross-module reader it finds in the source. `__all__` is derived from the
+  facade's bindings plus the table, so a star import carries `url2pathname` too.
+  `_MAX_LESSONS_TOTAL` and `make_sync_embed_fn` are read by the facade itself
+  and are not mirrored. The facade also keeps `shutil` and
+  `platform_compat` as attributes, the same module objects the owners use.
+- **A by-name copy on the facade is not a seam.** Besides the mirrored names, the
+  facade binds by-name copies of owner names: the apply owner's strategy
+  constants (`CONFLICT_STRATEGIES`, `STRATEGY_SKIP`, `STRATEGY_RENAME`,
+  `STRATEGY_OVERWRITE`), `CATEGORY_IDS`, the registry's `_sources`,
+  `_managed_mcp_names`, `_SOURCE_ID_RE` and `_CORE_MANAGED_MCP_NAMES`, the scan
+  owner's `_frontmatter`, `_column0_activation_declared` and
+  `_load_no_alias_yaml`, and the pre-split public names. No owner reads the
+  facade's copy, so a facade patch of one reaches the facade's own code at most.
+  A second guard in `test_onboarding_import_refactor_contract_patch_guards.py` reads the same
+  test files and collects every name a test rebinds on the facade (`setattr` or
+  `delattr` on any receiver, `patch`, `patch.object`, `patch.multiple`; not
+  `patch.dict`, which mutates the shared object in place). It fails when an engine
+  module other than the facade and the name's `_EXPORTS` owner also binds that
+  name: mirror the name in `_EXPORTS`, or patch the module that reads it. The
+  guard is pinned on a planted source, and it must see the names the engine's own
+  suites rebind (`_is_link_like`, `_write_json`, `_MAX_LESSONS_TOTAL`,
+  `make_sync_embed_fn`), so an empty scan cannot pass.
+- **One logger.** Every owner logs through `kiro_crew.onboarding_import`, the
+  name operators and tests filter import warnings on.
+- **Managed MCP names are read from the live registry.** `_scan_source` wires the
+  registry's own `_managed_mcp_names` into `_Scan.managed_mcp_names`. The MCP
+  projection calls it exactly where and as often as it always has, so no
+  projection module imports the registry. A scan built any other way refuses
+  instead of guessing.
+- **Deferred imports stay deferred.** The dashboard MCP sidecar lock,
+  `configured_mcp_aliases` and `CronService` are imported at their one call
+  site. Importing the engine never loads the dashboard, MCP discovery or cron.
+  `mcp_cleanup` in turn imports the facade lazily.
 
 ## Scope: what is migrated
 
@@ -54,7 +188,7 @@ looks like a gap — reopen the decision in this spec first.
 
 | Excluded | Why |
 |----------|-----|
-| **Sessions / conversation transcripts** | Not industry practice — no surveyed agent migrates transcripts. A transcript is a record of a conversation with a *different* model under a *different* system prompt; replayed into Kiro Crew it is misleading context, not useful memory. Reading it also requires hard-coding each source's private JSONL/SQLite schema, which fails **silently** when upstream drifts. Removing it deletes the module's largest and most fragile surface. See "Session-import removal". |
+| **Sessions / conversation transcripts** | Not industry practice — no surveyed agent migrates transcripts. A transcript is a record of a conversation with a *different* model under a *different* system prompt; replayed into Kiro Crew it is misleading context, not useful memory. Reading it also requires hard-coding each source's private JSONL/SQLite schema, which fails **silently** when upstream drifts. Removing it deletes the module's largest and most fragile surface. See [No session import](#no-session-import). |
 | **Persona / `SOUL.md` as a persona** | Kiro Crew's persona surface is theme-pack persona, governed by `capabilities.theme_persona`. Importing a foreign persona document *as a persona* would inject third-party text into the agent's identity through a path that bypasses that gate. The **directive content** of such a file is still migrated — as memory (below) — but its persona role is dropped. |
 | **Credentials of any kind** | `~/.claude/.credentials.json`, `~/.codex/auth.json`, `.env`, `auth-profiles.json`, gateway tokens, provider API keys. Never read. MCP `env`/`headers` keys matching the secret patterns are stripped and counted into `secret_count`. |
 | **Runtime state** | Subagent records, tool results, checkpoints, hook state, in-flight task state. Not user data. |
@@ -66,7 +200,7 @@ looks like a gap — reopen the decision in this spec first.
 
 Imported instruction/knowledge content is rewritten into Kiro Crew's existing
 memory tiers. Tier choice is driven by two properties — **context priority**
-(`context.py` per-section caps) and **durability**.
+(`context_assembly/budget.py` per-section caps) and **durability**.
 
 ### Durability constraint (read before choosing a tier)
 
@@ -79,7 +213,7 @@ Durable tiers only:
 
 | Tier | Context cap | Durability |
 |------|-------------|------------|
-| `lessons.jsonl` (`LessonStore`) | 22.6% — highest of any tier | Append-only; pruned oldest-first at `_MAX_LESSONS_TOTAL` (200) |
+| `lessons.jsonl` (`LessonStore`) | protected startup block, window-independent: `_LESSONS_STARTUP_CAP` for standing rules plus `_LESSON_EXPERIENCE_CAP` for past findings (`context_assembly/budget.py`; see [memory-skills-hooks](memory-skills-hooks.md#lessons-learnpy--vector_memorypy)) | Append-only; pruned oldest-first at `_MAX_LESSONS_TOTAL` (200) |
 | Semantic memory (`VectorMemoryStore`) | 7.7% | Durable; key-addressed, confidence-gated |
 | Episodic memory (`VectorMemoryStore`) | 7.7% | Durable; append-only |
 | `.kiro/steering/*.md` | 10% | Durable, but **workspace-scoped** — a tier the system has, never an import destination (rule 4) |
@@ -96,7 +230,8 @@ Durable tiers only:
    never falls back to the JSONL when they exist, so a JSONL-only write would be
    recorded as imported yet stay invisible to the agent.
    The destination is the highest-priority durable
-   always-injected tier (22.6% of the context budget). Applies to the
+   always-injected tier (the protected startup lesson block, bounded by
+   `_LESSONS_STARTUP_CAP`). Applies to the
    *directive* content of a source's instruction documents — `CLAUDE.md`,
    `AGENTS.md`, `~/.claude/rules/*.md`, each workspace's own `CLAUDE.md`, and
    the directive body of a persona document (`SOUL.md`). `_instruction_paragraphs`
@@ -119,9 +254,10 @@ Durable tiers only:
    path"), and importing the former into an always-injected lesson would make
    foreign text act as the agent's persona through a path that bypasses
    `capabilities.theme_persona` — exactly what excluding the persona role is meant
-   to prevent. The guard checks **every non-heading line** of a paragraph (one
+   to prevent. The guard checks **every line** of a paragraph, headings included (one
    identity line taints the whole paragraph, because a paragraph is imported
-   whole) after stripping Markdown list/quote/emphasis markers, and covers both
+   whole) after stripping Markdown heading/list/quote/emphasis markers, so
+   `# You are Aria` taints its paragraph too, and covers both
    statements ("You are Aria") and subjectless imperatives ("Act as Aria",
    "Assume the role of…"). It does NOT reject an ordinary directive that merely
    mentions "you" or opens with the same verb ("Act on review feedback").
@@ -207,8 +343,8 @@ Why deferral and not batching: embedding cost grows steeply with text length
 inline embed held the apply request for minutes. **`embed_batch()` is not the
 fix** — measured on real import text it is ~25% *slower* than looping `embed()`.
 That measured workload result, rather than the physical micro-batch size, is the
-reason imports defer the work: llama.cpp now decodes each input in bounded
-512-token physical batches while retaining the full 2,048-token logical batch
+reason imports defer the work: llama.cpp decodes each input in bounded
+256-token physical batches while retaining the full 2,048-token logical batch
 and context.
 
 `backfill_missing_embeddings()` requires numpy but **not faiss**. Faiss is an
@@ -247,7 +383,7 @@ Applicability and rename derivation per category:
 
 | Category | Strategies | Rename form |
 |----------|-----------|-------------|
-| `skills` | skip · rename · overwrite | `<name>-imported-<source>`, then `<name>-<fingerprint[:8]>` |
+| `skills` | skip · rename · overwrite | `<name>-<source>`, then `<name>-<fingerprint[:8]>` |
 | `mcp_servers` | skip · rename · overwrite | `<name>-<source>`, then `<name>-<fingerprint[:8]>` |
 | `workspaces` | skip · rename | `base-<source>`, then `base-<fp[:8]>`. `skip` reports a collision; suffix derivation occurs only under `rename`. |
 | `instructions`, `memories` | n/a — merge-only, never collide destructively | — |
@@ -458,7 +594,8 @@ rather than defaulting to the user's home root — `base_home / ""` is the entir
 home, and scanning it would walk every file the user owns. Callers treat an absent
 root as "not installed".
 
-A scanner that raises is reported as a `scanner_failed` diagnostic and its partial
+A scanner that raises is reported as a `source_unreadable` diagnostic (an
+unsupported one) and its partial
 findings are discarded: one unreadable source must not deny the user the others,
 and half of a source we now know we cannot read correctly must not be offered as
 importable data.
@@ -537,7 +674,7 @@ The engine owns source identity. `_sources()` resolves and normalizes the regist
 |----------|-------|------|
 | `GET /api/onboarding/import/scan` | detect + dry run | — |
 | `POST /api/onboarding/import/apply` | apply | `{sources: [{id, categories: [...]}], conflict_strategy?}` — `conflict_strategy` is one of `skip`/`rename`/`overwrite`; absent = `skip`, unrecognized = 400 |
-| `PUT /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}` |
+| `PUT /api/onboarding/import/state` | onboarding bookkeeping | `{completed: bool}`. Failures: `invalid_request` (400), `config_unreadable` (500 — `config.json` cannot be parsed, so no retry clears it), `state_failed` (500). On a completion error the first-run Import step offers a local "leave without saving" exit |
 
 Each endpoint is owner-only: the handlers call `require_owner_dashboard_request`
 after authentication. With no `owner_id` configured the gate accepts the signed
@@ -566,7 +703,7 @@ browser (the HTTP `summary` does not carry it).
 **Session and transcript import does not exist, and must not be added back.**
 `sessions` is not a member of `CATEGORY_IDS`; there is no session scanner, no
 session writer, no session provenance classifier, no per-session read inside
-`_scan_hermes_db` or `_scan_lineage_memory_db`, no transcript-hash branch in
+`_scan_hermes_projects_db` or `_scan_lineage_memory_db`, no transcript-hash branch in
 `_deduplicate_items`, and no `conversation_log` plumbing through `apply_import`
 or the handler. A reader looking for the deleted symbol names will find them in
 git history, not here.
@@ -593,7 +730,8 @@ These are load-bearing. Changing any of them requires a security review.
 2. **Credentials are never read.** Known credential files are not opened;
    secret-shaped MCP `env`/`headers` keys and URL-embedded secrets are stripped
    and counted, never stored.
-3. **YAML aliases are rejected.** `_NoAliasSafeLoader` refuses anchors/aliases —
+3. **YAML aliases are rejected.** `_NoAliasSafeLoader`, a subclass of the shared
+   `NoAliasSafeLoader` in `src/kiro_crew/yaml_safe.py`, refuses aliases —
    `yaml.safe_load` alone still expands them, which is a billion-laughs vector
    on untrusted input.
 3a. **Content screens run on the value that will actually be written**, after any

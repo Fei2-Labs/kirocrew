@@ -24,6 +24,7 @@ from kiro_crew import cron_inflight
 from kiro_crew.cron import CronJob, CronService, CronStoreUnreadable
 from kiro_crew.dashboard import crash_dump_store
 from kiro_crew.stall_attribution import attribute_dump, describe
+from kiro_crew.testing.wait import finished
 
 pytestmark = pytest.mark.asyncio
 
@@ -343,7 +344,7 @@ class TestRunMarker:
         svc = await CronService.create(base_dir=tmp_path, on_job=on_job)
         job = svc.add_job(name="probe", message="m", every_secs=3600, strict_schedule=True)
         svc._running = True
-        await svc._run_job_isolated(job)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         assert len(seen) == 1
         (marker,) = seen[0]
         assert marker.job_id == job.id and marker.name == "probe" and marker.pid == os.getpid()
@@ -356,7 +357,7 @@ class TestRunMarker:
         svc = await CronService.create(base_dir=tmp_path, on_job=on_job)
         job = svc.add_job(name="raiser", message="m", every_secs=3600, strict_schedule=True)
         svc._running = True
-        await svc._run_job_isolated(job)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
         assert cron_inflight.read_markers(tmp_path) == []
         assert svc.get_job(job.id).last_status == "error"  # type: ignore[union-attr]
 
@@ -391,7 +392,10 @@ class TestMarkerIoRefusesWhatItDidNotWrite:
         d.mkdir(parents=True, exist_ok=True)
         os.mkfifo(d / "cafebabe.json")
         assert (
-            await asyncio.wait_for(asyncio.to_thread(cron_inflight.read_markers, tmp_path), 10)
+            await finished(
+                asyncio.to_thread(cron_inflight.read_markers, tmp_path),
+                "read_markers returning past a FIFO marker",
+            )
             == []
         )
 
@@ -409,7 +413,7 @@ class TestMarkerIoRefusesWhatItDidNotWrite:
         target = tmp_path / "attacker"
         target.mkdir()
         cron_inflight.running_dir(tmp_path).symlink_to(target, target_is_directory=True)
-        cron_inflight.write_marker(tmp_path, "0badc0de", "victim")
+        cron_inflight.write_marker(tmp_path, "0badc0de", "victim", run="aaaa")
         cron_inflight.write_claim(tmp_path, "loopstall-20260101T000000Z.txt")
         assert list(target.iterdir()) == []
 

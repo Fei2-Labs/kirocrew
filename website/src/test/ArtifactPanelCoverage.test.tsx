@@ -56,10 +56,20 @@ interface LayerArgs {
   sidebarDefaultOpen?: boolean
   sidebarClassName?: string
   sidebarStyle?: CSSProperties
+  confirmDiscardDraft?: () => Promise<boolean>
+  submitSentIds?: ReadonlySet<string>
 }
 const layerArgs: LayerArgs[] = []
-const anchorRequests: string[] = []
+/** Which layer's composer received each submit (`stacked` / `full`), with the text. */
+const composerSubmits: Array<{ which: string; comment: string; text: string }> = []
 let stubComments: ArtifactComment[] = []
+/** The in-iframe selection the stub layers hand the toolbar, when a test sets one. */
+let stubIframeSelection: { text: string; x: number; y: number } | null = null
+/** Whether the stub layers report an open comment draft. */
+let stubHasDraft = false
+/** Whether the stub layers report the comment box open at all. */
+let stubComposerOpen = false
+const draftSlotClears: string[] = []
 
 // A stateful stand-in: real `sidebarOpen` state (so the toggle is exercised for
 // real) over a comment list the test controls. The two instances are told apart
@@ -67,6 +77,7 @@ let stubComments: ArtifactComment[] = []
 // sizing — so each renders a distinguishable marker.
 vi.mock('../components/FileArtifactComments', async () => {
   const { useState } = await import('react')
+  const { pendingSubmitComments } = await import('../lib/commentFilter')
   function useFileArtifactComments(args: LayerArgs) {
     layerArgs.push(args)
     const [sidebarOpen, setSidebarOpen] = useState(args.sidebarDefaultOpen ?? true)
@@ -75,11 +86,25 @@ vi.mock('../components/FileArtifactComments', async () => {
       overlay: null,
       popovers: <div data-testid={`popovers-${which}`} />,
       sidebar: <div data-testid={`sidebar-${which}`} />,
-      requestAnchoredComment: () => { anchorRequests.push(which) },
+      selectionComposer: { onSubmit: (comment: string, text: string) => { composerSubmits.push({ which, comment, text }) } },
+      isComposerOpen: () => stubComposerOpen,
+      // The layer's own guard, as the real hook shapes it: ask through the
+      // host's prompt only while a draft is open; a confirmed discard clears
+      // that layer's slot.
+      guardCommentDraft: async (proceed: () => void) => {
+        if (stubHasDraft) {
+          if (!(await args.confirmDiscardDraft?.())) return
+          draftSlotClears.push(which)
+        }
+        proceed()
+      },
+      iframeSelection: stubIframeSelection,
       toggleSidebar: () => setSidebarOpen((v: boolean) => !v),
       sidebarOpen,
       commentCount: stubComments.length,
       comments: stubComments,
+      // The real hook's batch rule, so the panel's count runs it for real.
+      pendingSubmit: args.submitSentIds ? pendingSubmitComments(stubComments, args.submitSentIds) : [],
       activeCommentId: null,
       scrollNonce: 0,
       unreadRootIds: new Set<string>(),
@@ -99,9 +124,21 @@ interface StubAction {
   label: string
   onClick: (text: string, rect: DOMRect) => void
 }
+interface StubComposer {
+  onSubmit: (comment: string, text: string) => void
+}
+// The stub exposes what the panel wires into the toolbar: the host actions,
+// the layer's composer (a submit button drives it), and the bridge selection
+// it is handed as `externalSelection`.
+const toolbarContainers: React.RefObject<HTMLElement>[] = []
 vi.mock('../components/SelectionToolbar', () => ({
-  default: ({ actions }: { actions: StubAction[] }) => (
-    <div data-testid="selection-toolbar">
+  default: ({ actions, composer, externalSelection, containerRef }: { actions: StubAction[]; composer?: StubComposer; externalSelection?: { text: string } | null; containerRef: React.RefObject<HTMLElement> }) => {
+    toolbarContainers.push(containerRef)
+    return (
+    <div data-testid="selection-toolbar" data-external-selection={externalSelection?.text ?? ''} data-has-composer={String(!!composer)}>
+      {composer && (
+        <button type="button" aria-label="composer submit" onClick={() => composer.onSubmit('a note', SELECTED_TEXT)}>submit</button>
+      )}
       {actions.map((a) => (
         <span key={a.id}>
           <button type="button" aria-label={`selection ${a.id}`} onClick={() => a.onClick(SELECTED_TEXT, makeRect())}>
@@ -113,7 +150,8 @@ vi.mock('../components/SelectionToolbar', () => ({
         </span>
       ))}
     </div>
-  ),
+    )
+  },
 }))
 
 vi.mock('../components/ArtifactBody', () => ({
@@ -214,8 +252,12 @@ describe('ArtifactPanel', () => {
     // reuses SLUG, so a submit in one test must not mark comments sent for the next.
     localStorage.clear()
     layerArgs.length = 0
-    anchorRequests.length = 0
+    composerSubmits.length = 0
     stubComments = []
+    stubIframeSelection = null
+    stubHasDraft = false
+    stubComposerOpen = false
+    draftSlotClears.length = 0
     vi.mocked(api.artifact).mockResolvedValue(mkArtifact())
     // The provider tree's own boot query rides along on the automocked client;
     // resolving it keeps React Query's "data cannot be undefined" out of stderr.
@@ -279,15 +321,70 @@ describe('ArtifactPanel', () => {
       expect(body.getAttribute('data-kind')).toBe('image')
     })
 
-    it('renders the iframe body for a widget and drops the selection toolbar', async () => {
+    it('gives a json body a Copy-only toolbar and no composer, since no anchor resolver can map its selections', async () => {
+      // The artifact page allows anchored comments on markdown and text only and
+      // the panel draws the same line — but on a pointer device the Copy row
+      // the panel shipped before the composer stays.
+      vi.mocked(api.artifact).mockResolvedValue(mkArtifact({ kind: 'json', content: '{"a":1}' }))
+      renderPanel({ kind: 'json', content: '{"a":1}' })
+      await screen.findByTestId('body-native')
+      const toolbar = screen.getByTestId('selection-toolbar')
+      expect(toolbar.getAttribute('data-has-composer')).toBe('false')
+      fireEvent.click(screen.getByRole('button', { name: 'selection copy' }))
+      expect(copyToClipboard).toHaveBeenCalledWith(SELECTED_TEXT)
+      expect(screen.queryByRole('button', { name: 'composer submit' })).toBeNull()
+    })
+
+    describe('on a touch device', () => {
+      // The platform draws its own handles and Copy callout around a touch
+      // selection, so a copy-only row floated there would take their taps.
+      beforeEach(() => {
+        vi.spyOn(window, 'matchMedia').mockImplementation((query: string) => ({
+          matches: query === '(pointer: coarse)' || query === '(hover: none)',
+          media: query, onchange: null,
+          addListener: () => {}, removeListener: () => {},
+          addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false,
+        }) as MediaQueryList)
+      })
+      afterEach(() => { vi.mocked(window.matchMedia).mockRestore() })
+
+      it('mounts no copy-only toolbar over a json body, inline or fullscreen', async () => {
+        vi.mocked(api.artifact).mockResolvedValue(mkArtifact({ kind: 'json', content: '{"a":1}' }))
+        renderPanel({ kind: 'json', content: '{"a":1}' })
+        await screen.findByTestId('body-native')
+        expect(screen.queryByTestId('selection-toolbar')).toBeNull()
+        const dialog = await enterFullscreen()
+        expect(within(dialog).getAllByTestId('body-native').length).toBeGreaterThan(0)
+        expect(screen.queryByTestId('selection-toolbar')).toBeNull()
+      })
+
+      it('keeps the comment toolbar on a markdown body', async () => {
+        renderPanel()
+        await screen.findByTestId('body-native')
+        expect(screen.getByTestId('selection-toolbar').getAttribute('data-has-composer')).toBe('true')
+      })
+    })
+
+    it('renders the iframe body for a widget and keeps the toolbar for bridge selections', async () => {
       vi.mocked(api.artifact).mockResolvedValue(mkArtifact({ kind: 'widget' }))
+      stubIframeSelection = { text: 'from the frame', x: 20, y: 40 }
+      toolbarContainers.length = 0
       renderPanel({ kind: 'widget' })
       const body = await screen.findByTestId('body-iframe')
       expect(body.getAttribute('data-slug')).toBe(SLUG)
-      // Text selection is an in-iframe concern, so the DOM toolbar is not mounted.
-      expect(screen.queryByTestId('selection-toolbar')).toBeNull()
+      // Text selection happens inside the frame and reaches the layer through
+      // the bridge; the toolbar stays mounted and is handed that selection so
+      // it can open the same composer the native body gets.
+      expect(screen.getByTestId('selection-toolbar').getAttribute('data-external-selection')).toBe('from the frame')
       // Both comment layers are told the body is an iframe.
       expect(layerArgs.every((a) => a.usesIframe === true)).toBe(true)
+      // The preview ref is never attached on the iframe branch, so the toolbar
+      // gets the scroll box instead: the box's placement clamps to that
+      // container's right edge, and an unattached ref would let a right-half
+      // bridge selection open the box over the comments sidebar.
+      const container = toolbarContainers.at(-1)?.current
+      expect(container).not.toBeNull()
+      expect(container).toContainElement(body)
     })
   })
 
@@ -329,22 +426,44 @@ describe('ArtifactPanel', () => {
       expect(screen.getByRole('button', { name: 'Show comments' }).textContent).toBe('')
     })
 
-    it('routes the selection comment action to the active layer', async () => {
+    it('wires the active layer\'s composer into the toolbar, with no Comment action', async () => {
       renderPanel()
       await screen.findByText(NAME)
-      fireEvent.click(screen.getByRole('button', { name: 'selection comment' }))
-      expect(anchorRequests).toEqual(['stacked'])
+      // Selecting text opens the composer directly; there is no button to find first.
+      expect(screen.queryByRole('button', { name: 'selection comment' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'composer submit' }))
+      expect(composerSubmits).toEqual([{ which: 'stacked', comment: 'a note', text: SELECTED_TEXT }])
     })
 
-    it('copies selected text, and ignores a blank selection', async () => {
+    it('going full screen over a typed comment draft asks first; cancelling stays put', async () => {
+      // Full screen unmounts the docked toolbar, and the draft with it.
+      stubHasDraft = true
       renderPanel()
       await screen.findByText(NAME)
-      fireEvent.click(screen.getByRole('button', { name: 'selection copy' }))
-      expect(copyToClipboard).toHaveBeenCalledWith(SELECTED_TEXT)
+      fireEvent.click(screen.getByRole('button', { name: /full screen/i }))
+      const dialog = await screen.findByRole('dialog')
+      expect(within(dialog).getByText('Discard your unsaved comment?')).toBeInTheDocument()
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      expect(screen.queryByRole('dialog', { name: /full screen artifact preview/i })).toBeNull()
 
-      vi.mocked(copyToClipboard).mockClear()
-      fireEvent.click(screen.getByRole('button', { name: 'selection copy blank' }))
-      expect(copyToClipboard).not.toHaveBeenCalled()
+      expect(draftSlotClears).toEqual([])
+
+      fireEvent.click(screen.getByRole('button', { name: /full screen/i }))
+      const again = await screen.findByRole('dialog')
+      fireEvent.click(within(again).getByRole('button', { name: 'Discard comment' }))
+      await screen.findByRole('dialog', { name: /full screen artifact preview/i })
+      // A confirmed discard drops the persisted copy of that passage's draft.
+      expect(draftSlotClears).toEqual(['stacked'])
+    })
+
+    it('passes the toolbar no row actions — the composer alone (Add comment, Close) is the row', async () => {
+      // A third control beside the box would break the two-per-row cap; copying
+      // the selection is the composer's own Cmd/Ctrl+C.
+      renderPanel()
+      await screen.findByText(NAME)
+      expect(screen.queryByRole('button', { name: 'selection copy' })).toBeNull()
+      expect(screen.queryByRole('button', { name: /^selection / })).toBeNull()
     })
   })
 
@@ -378,6 +497,20 @@ describe('ArtifactPanel', () => {
       expect(onClose).toHaveBeenCalledTimes(1)
     })
 
+    it('leaves Escape to an open comment box even when the box does not hold focus', async () => {
+      // A touch or Shift+Arrow open leaves the caret elsewhere; the toolbar
+      // closes its own box on Escape, and the panel must not close underneath.
+      stubComposerOpen = true
+      const { onClose } = renderPanel()
+      await screen.findByText(NAME)
+      fireEvent.keyDown(document.body, { key: 'Escape' })
+      expect(onClose).not.toHaveBeenCalled()
+      expect(screen.queryByRole('dialog')).toBeNull()
+      stubComposerOpen = false
+      fireEvent.keyDown(document.body, { key: 'Escape' })
+      expect(onClose).toHaveBeenCalledTimes(1)
+    })
+
     it('ignores keys other than Escape', async () => {
       const { onClose } = renderPanel()
       await screen.findByText(NAME)
@@ -390,8 +523,8 @@ describe('ArtifactPanel', () => {
       stubComments = [mkComment()]
       const { onClose } = renderPanel({ onSubmitComments })
       await screen.findByText(NAME)
-      fireEvent.click(screen.getByRole('button', { name: 'Toggle additional instruction' }))
-      const field = await screen.findByLabelText('Additional instruction')
+      fireEvent.click(screen.getByRole('button', { name: 'Add overall instruction' }))
+      const field = await screen.findByLabelText('Overall instruction')
       fireEvent.keyDown(field, { key: 'Escape' })
       expect(onClose).not.toHaveBeenCalled()
     })
@@ -450,6 +583,22 @@ describe('ArtifactPanel', () => {
       await enterFullscreen()
       expect(screen.queryByTestId('popovers-stacked')).toBeNull()
       expect(screen.getByTestId('popovers-full')).toBeInTheDocument()
+    })
+
+    it('Exit full screen over a typed draft raises the prompt ABOVE the full-screen shell', async () => {
+      // The shell is an opaque body portal at z-[9999]; a prompt on the plain
+      // modal layer sits under it, unreachable, and the button looks dead.
+      renderPanel()
+      await screen.findByText(NAME)
+      fireEvent.click(screen.getByRole('button', { name: /full screen/i }))
+      await screen.findByRole('dialog', { name: /full screen artifact preview/i })
+      stubHasDraft = true
+      fireEvent.click(screen.getByRole('button', { name: /exit full screen/i }))
+      const prompt = await screen.findByText('Discard your unsaved comment?')
+      expect(prompt.closest('.fixed.inset-0.z-\\[10001\\]')).not.toBeNull()
+      fireEvent.click(within(prompt.closest('[role="dialog"]') as HTMLElement).getByRole('button', { name: 'Discard comment' }))
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: /full screen artifact preview/i })).toBeNull())
+      expect(draftSlotClears).toEqual(['full'])
     })
 
     it('exits fullscreen on Escape before closing the panel', async () => {
@@ -544,6 +693,29 @@ describe('ArtifactPanel', () => {
       expect(screen.queryByRole('button', { name: 'Submit' })).toBeNull()
     })
 
+    it('hands no sent-id set to the comment layers without a submit channel', async () => {
+      // No Submit bar means nothing for a row marker to answer to.
+      stubComments = [mkComment()]
+      renderPanel()
+      await screen.findByText(NAME)
+      expect(layerArgs.length).toBeGreaterThan(0)
+      expect(layerArgs.every(a => a.submitSentIds === undefined)).toBe(true)
+    })
+
+    it('hands both comment layers the sent-id set the count is filtered by', async () => {
+      // The layers mark rows from this set, so after a submit it must carry the
+      // batch: a row still marked after its comment went would contradict the bar.
+      const onSubmitComments = vi.fn()
+      stubComments = [mkComment()]
+      renderPanel({ onSubmitComments })
+      await screen.findByText(NAME)
+      const latest = () => layerArgs.slice(-2)
+      expect(latest().map(a => a.sidebarClassName ? 'stacked' : 'full').sort()).toEqual(['full', 'stacked'])
+      expect(latest().every(a => a.submitSentIds instanceof Set && a.submitSentIds.size === 0)).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+      await waitFor(() => expect(latest().every(a => a.submitSentIds?.has(mkComment().id))).toBe(true))
+    })
+
     it('hides the submit bar when every comment is agent-authored', async () => {
       stubComments = [mkComment({ id: 'a1', thread_id: 'a1', is_agent: true, author: 'kiro' })]
       renderPanel({ onSubmitComments: vi.fn() })
@@ -568,6 +740,9 @@ describe('ArtifactPanel', () => {
       expect(message).toContain(`${NAME} (${SLUG})`)
       expect(message).toContain('tighten this heading')
       expect(message).not.toContain('agent note')
+      // The count (second arg) is the number of human comments in the batch,
+      // so the "N comments sent" info banner can show the right number.
+      expect(onSubmitComments.mock.calls[0][1]).toBe(1)
 
       // The batch is marked sent, so the bar clears instead of re-offering the
       // same comments on the next Submit.
@@ -652,6 +827,28 @@ describe('ArtifactPanel', () => {
       expect(screen.getByText('1 comment to send to this chat')).toBeInTheDocument()
     })
 
+    it('hands back the typed instruction on a refused send, leaving the notice to the chat host', async () => {
+      // Before #12320 the typed instruction was cleared with no way back. The
+      // chat host reports its own send failure, so the bar adds no second
+      // notice that could disagree with it.
+      const onSubmitComments = vi.fn().mockResolvedValue(false)
+      stubComments = [mkComment()]
+      renderPanel({ onSubmitComments })
+      await screen.findByText(NAME)
+      fireEvent.click(screen.getByRole('button', { name: 'Add overall instruction' }))
+      fireEvent.change(await screen.findByLabelText('Overall instruction'), { target: { value: 'keep it short' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+      await act(async () => {})
+      expect(screen.getByLabelText('Overall instruction')).toHaveValue('keep it short')
+      expect(screen.queryByRole('alert')).toBeNull()
+
+      // A delivered retry carries the instruction.
+      onSubmitComments.mockResolvedValue(undefined)
+      await act(async () => { vi.advanceTimersByTime(SUBMIT_GUARD_MS) })
+      fireEvent.click(screen.getByRole('button', { name: 'Submit' }))
+      expect(onSubmitComments.mock.calls[1][0]).toContain('keep it short')
+    })
+
     it('threads an extra instruction through the message and clears it after submit', async () => {
       const onSubmitComments = vi.fn()
       const instruction = 'apply all of these in one pass'
@@ -659,10 +856,10 @@ describe('ArtifactPanel', () => {
       renderPanel({ onSubmitComments })
       await screen.findByText(NAME)
 
-      const toggle = screen.getByRole('button', { name: 'Toggle additional instruction' })
+      const toggle = screen.getByRole('button', { name: 'Add overall instruction' })
       expect(toggle.getAttribute('aria-pressed')).toBe('false')
       fireEvent.click(toggle)
-      const field = await screen.findByLabelText('Additional instruction')
+      const field = await screen.findByLabelText('Overall instruction')
       expect(field).toHaveFocus()
       fireEvent.change(field, { target: { value: instruction } })
 
@@ -671,7 +868,7 @@ describe('ArtifactPanel', () => {
       expect(message).toContain('OVERALL INSTRUCTION')
       expect(message).toContain(instruction)
       // Submitting collapses the affordance and drops the note.
-      await waitFor(() => expect(screen.queryByLabelText('Additional instruction')).toBeNull())
+      await waitFor(() => expect(screen.queryByLabelText('Overall instruction')).toBeNull())
     })
 
     it('omits the instruction block when the toggle was never opened', async () => {

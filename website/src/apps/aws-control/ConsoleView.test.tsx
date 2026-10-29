@@ -360,41 +360,39 @@ describe('UsagePane', () => {
     expect(within(receipts).queryByTestId('aws-consent-s3')).toBeNull()
   })
 
-  it('keeps the host-built costs key byte-identical to the hand-written one beside it', async () => {
-    // This pane is the first consumer of `useAppQuery`, and it is deliberately a
-    // MIXED site: the costs query is built by the host
-    // (`useAppQuery(['costs', id])`) while `refetchGated` still writes
-    // `['aws-control', 'costs', id]` by hand. If the host's prefix were anything
-    // other than the appId itself, those two would address different cache
-    // entries and a consent grant would stop refreshing the bill — the failure
-    // that would let the rest of this app be converted only in one sweep.
+  it('resolves the costs key to the app prefix, byte for byte', async () => {
+    // The host builds this pane's keys, and the prefix it adds has to be the
+    // appId itself. Retention is registered for the `['aws-control']` prefix, and
+    // every other reader of this bill addresses that same key. A prefix of any
+    // other shape puts the query where nothing else looks, and a consent grant
+    // stops refreshing the figure on screen.
     vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
     vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
 
     const { queryClient } = renderPane(<UsagePane account={ACCOUNT} />)
     await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
 
-    // The literal is what this file wrote before the conversion.
-    const handWritten = ['aws-control', 'costs', ACCOUNT.account]
-    expect(queryClient.getQueryData(handWritten)).toEqual(costsFresh)
-    // And the app retains only ONE costs entry, not a namespaced one plus a
-    // hand-written one that nothing keeps in step.
+    // The key the rest of the product addresses.
+    const productKey = ['aws-control', 'costs', ACCOUNT.account]
+    expect(queryClient.getQueryData(productKey)).toEqual(costsFresh)
+    // And the app holds ONE costs entry, not a namespaced one beside a bare one
+    // that nothing keeps in step.
     const costsEntries = queryClient
       .getQueryCache()
       .findAll({ queryKey: ['aws-control', 'costs'] })
     expect(costsEntries).toHaveLength(1)
   })
 
-  it('reaches a hand-written query key from the host-built invalidation', async () => {
-    // The REVERSE direction of the same agreement, and the one that catches a
-    // prefix mistake the other case cannot: `drive` is queried by a hand-written
-    // literal and invalidated through the host's key builder (`refetchGated`). If
-    // the builder resolved to anything but that literal, the invalidation would
-    // silently hit nothing and a consent grant would leave the storage meter on
-    // its cached refusal.
+  it('reaches the mounted query from the key the builder returns', async () => {
+    // The other direction of the same agreement, and the one a prefix mistake
+    // survives in the first case: the invalidation goes through the BUILDER's
+    // output, and it has to land on the entry the pane's own query created. If
+    // the builder resolved to anything else the invalidation would silently hit
+    // nothing, and a consent grant would leave the storage meter on its cached
+    // refusal.
     //
-    // The invalidation goes through the BUILDER's output, not through the literal
-    // — invalidating the literal would be trivially true and prove nothing.
+    // Invalidating the product key directly would be trivially true and prove
+    // nothing, so the probe reports what the builder actually returns.
     vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
     vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
     stubConsent({ s3: notGranted, ce: notGranted })
@@ -415,7 +413,8 @@ describe('UsagePane', () => {
     await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
     await waitFor(() => expect(awsControlApi.drive).toHaveBeenCalledTimes(1))
 
-    // It addresses the entry the hand-written query created.
+    // It addresses the key the rest of the product uses, and the entry the
+    // pane's own query created.
     expect(built).toEqual(['aws-control', 'drive', ACCOUNT.account])
     expect(queryClient.getQueryData(built)).toEqual(driveExists)
 

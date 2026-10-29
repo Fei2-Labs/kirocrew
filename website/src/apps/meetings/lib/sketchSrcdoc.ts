@@ -85,7 +85,10 @@
 //     Replacing `'unsafe-inline'` with a build-time hash of that literal would
 //     retire even that, and is the natural follow-up.
 
-import { MERMAID_RUNTIME_PATH } from '../../../lib/vendorPaths'
+import { MERMAID_RUNTIME_PATH as MERMAID_RUNTIME_PATH_ROOT } from '../../../lib/vendorPaths'
+import { withBase } from '../../../lib/basePath'
+/** The runtime's served path under this build's base (the bare path in the stock build). */
+const MERMAID_RUNTIME_PATH = withBase(MERMAID_RUNTIME_PATH_ROOT)
 
 /**
  * CSP for the sketch frame. `scriptOrigin` is the dashboard's own origin
@@ -168,7 +171,8 @@ const BASE_CSS =
  *   injects a temp `<div id="dmermaid-*">` into `document.body` that render()
  *   only cleans up on SUCCESS, so failing blocks accumulate orphaned 512px error
  *   SVGs (see src/test/MarkdownRenderer.mermaid.test.tsx — this is a real
- *   regression, kept in sync with MarkdownRenderer's `initMermaid`). Being
+ *   regression, kept in sync with `initMermaid` in
+ *   src/components/markdown/MermaidBlock.tsx). Being
  *   explicit is the only way to guarantee that setting is applied.
  * - `suppressErrors: true` on `run()` because `run()` rethrows the first error
  *   otherwise, so one malformed diagram would abort every later one. Combined

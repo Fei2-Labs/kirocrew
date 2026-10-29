@@ -54,6 +54,46 @@ export function mergeIntoDraft(draft: string | null | undefined, prompt: string)
   return existing.replace(TRAILING_NEWLINES, '') + PARAGRAPH_BREAK + prompt
 }
 
+/** Join text the user typed during a create onto what the new session's
+ *  composer already holds (its stored draft, or a launcher prefill).
+ *
+ *  Unlike `mergeIntoDraft`, the typed text is never dropped, even when it is
+ *  whitespace only: the old session gets its pre-create draft back, so any
+ *  character left out here belongs to no draft. */
+export function appendTypedText(existing: string, typed: string): string {
+  if (!existing.trim()) return existing + typed
+  return existing.replace(TRAILING_NEWLINES, '') + PARAGRAPH_BREAK + typed
+}
+
+/**
+ * Should the dashboard ChatPage's single-session composer consume a Side Chat
+ * hand-off staged in `chat.mainComposerAppend`?
+ *
+ * A hand-off names the slot it belongs to. ChatPage consumes it only when the
+ * staged slot is the one it is showing — a Crew Member hand-off (consumed by
+ * that member's ChatPane) is left alone rather than leaking into the dashboard
+ * composer.
+ *
+ * The `splitMode` guard is the important one. In split view ChatPage unmounts
+ * its single composer and the SessionGridView renders a ChatPane per cell; the
+ * anchor pane's `slotKey` IS `activeSlot`, so the slot match alone is true for
+ * BOTH this consumer and that pane. Both would then merge the same hand-off in
+ * one flush — the pane shows it while ChatPage also persists it into the hidden
+ * single-session draft, resurfacing as a duplicate when split view collapses.
+ * While split view is active the grid pane is the sole consumer, so ChatPage
+ * must skip. See website/src/pages/chat/page/composerHost.ts (the mainComposerAppend effect).
+ */
+export function chatPageShouldConsumeHandoff(
+  splitMode: boolean,
+  activeSlot: string | null | undefined,
+  staged: { slot: string } | null | undefined,
+): boolean {
+  if (splitMode) return false
+  if (!staged) return false
+  if (!activeSlot || staged.slot !== activeSlot) return false
+  return true
+}
+
 /**
  * Put the payload of a send the server never accepted back into the composer.
  *
@@ -78,6 +118,27 @@ export function mergeRecoveredDraft(keep: string | null | undefined, payload: st
   const existing = keep ?? ''
   if (existing.trim() && existing.trim() === payload.trim()) return existing
   return mergeIntoDraft(existing, payload)
+}
+
+/**
+ * The text the user typed while a new session was being created, or null.
+ *
+ * The composer stays bound to the old session until the create resolves, so
+ * those keystrokes land in the old session's draft. `baseline` is what the
+ * composer held when the create started; `current` is what it holds when the new
+ * session activates. Only text APPENDED to the baseline counts as typed for the
+ * new session. Any other change (the user edited the old draft itself) returns
+ * null and stays with the old session, which is what happened before this carry
+ * existed, so the rule can move text but never lose it.
+ *
+ * The appended text moves verbatim, whitespace included. Trimming a leading
+ * separator would also eat indentation or blank lines the user meant, and the
+ * old session gets its baseline back, so any character dropped here would
+ * belong to no draft.
+ */
+export function typedDuringCreate(baseline: string, current: string): string | null {
+  if (current === baseline || !current.startsWith(baseline)) return null
+  return current.slice(baseline.length)
 }
 
 const isNonEmptyString = (v: unknown): string | null => (typeof v === 'string' && v ? v : null)

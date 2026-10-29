@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 
 import pytest
 
@@ -21,6 +22,11 @@ from kiro_crew.autonudge import (
     SESSION_START_FAILURE_REASON,
     AutoNudgeService,
     NudgeLoop,
+)
+from kiro_crew.autonudge_service.model import (
+    STRUCTURAL_TERMINAL_REASON,
+    budget_elapsed,
+    cap_reached,
 )
 
 SLOT = "chat-1-987"
@@ -377,12 +383,19 @@ async def test_the_streak_survives_a_restart(svc, store_dir, _nosleep):
         await _stop_and_drain(reloaded)
 
 
+@pytest.mark.parametrize("field", ["consecutive_start_failures", "cycle_count", "created_ts"])
 @pytest.mark.parametrize("stored", ["3", None, -5, 2.9, float("nan"), 10**400])
 @pytest.mark.asyncio
-async def test_a_malformed_persisted_streak_is_normalised_at_load(svc, store_dir, stored, _nosleep):
-    """The store is agent-writable and the streak is compared with ``>=`` on every
-    wake, so a string or ``null`` would raise TypeError inside ``_timer`` and the
-    automation would silently never fire again -- surviving every reload."""
+async def test_a_malformed_persisted_counter_is_normalised_at_load(
+    svc, store_dir, field, stored, _nosleep
+):
+    """The store is agent-writable and every one of these meets ``>=`` or a
+    subtraction on every wake (the streak and ``cycle_count`` against their caps,
+    ``created_ts`` against the clock), so a string or ``null`` would raise
+    TypeError inside ``_timer`` and the automation would silently never fire
+    again -- surviving every reload. The user's resume preserves the breakpoint
+    rather than overwriting the counters, so the load boundary is the one repair
+    point. The two bounds have their own rule, pinned by the bound tests below."""
     loop = await _armed(svc)
     await svc._persist_locked()
     await _stop_and_drain(svc)
@@ -390,17 +403,194 @@ async def test_a_malformed_persisted_streak_is_normalised_at_load(svc, store_dir
 
     raw = json.loads((store_dir / "autonudge.json").read_text(encoding="utf-8"))
     for row in raw["loops"]:
-        row["consecutive_start_failures"] = stored
+        row[field] = stored
     (store_dir / "autonudge.json").write_text(json.dumps(raw), encoding="utf-8")
 
     reloaded = AutoNudgeService(base_dir=store_dir)
     await reloaded.start()
     try:
-        value = reloaded._loops[loop.id].consecutive_start_failures
-        assert isinstance(value, int) and value >= 0
+        value = getattr(reloaded._loops[loop.id], field)
+        assert isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
         # The comparison the finding named must not raise.
         reloaded._cancel_timer(loop.id)
         await reloaded._timer(reloaded._loops[loop.id])
+    finally:
+        await _stop_and_drain(reloaded)
+
+
+async def _reloaded_with_bound(
+    store_dir, field: str, stored: object, *, row: dict | None = None, **arm
+) -> tuple[AutoNudgeService, str]:
+    """A loop armed with *arm*, reloaded from a store whose *field* holds *stored*.
+
+    The timer ``start()`` armed is cancelled, so each test drives ``_timer`` itself.
+    """
+    svc = AutoNudgeService(base_dir=store_dir)
+    loop = await _armed(svc, **arm)
+    await svc._persist_locked()
+    await _stop_and_drain(svc)
+    _an._INSTANCE = None
+    path = store_dir / "autonudge.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    for stored_row in raw["loops"]:
+        stored_row[field] = stored
+        stored_row["cycle_count"] = 0
+        stored_row.update(row or {})
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    reloaded = AutoNudgeService(base_dir=store_dir)
+    await reloaded.start()
+    reloaded._cancel_timer(loop.id)
+    return reloaded, loop.id
+
+
+#: The bound a loop is armed with before its stored value is rewritten. The
+#: runtime budget is wall-clock, so it must outlast the whole arm-to-reload round
+#: trip on the slowest runner: a budget that runs out first stops the loop as
+#: ``runtime_budget`` before the unreadable value is read at load.
+_ARMED_BOUND = {"max_cycles": 2, "max_runtime_secs": 3600}
+
+
+def _recording(svc: AutoNudgeService) -> list[str]:
+    fired: list[str] = []
+
+    async def on_fire(loop, *_args, **_kwargs):
+        fired.append(loop.id)
+        return True
+
+    svc._on_fire = on_fire
+    return fired
+
+
+@pytest.mark.parametrize(
+    ("field", "stored", "expected"),
+    [
+        ("max_cycles", "24", 24),
+        ("max_cycles", " 24 ", 24),
+        ("max_cycles", 24.0, 24),
+        ("max_runtime_secs", "3600", 3600),
+        ("max_runtime_secs", "3600.0", 3600),
+        # Read exactly: a float reading drops the last digit (9007199254740992).
+        ("max_cycles", "9007199254740993.0", 9007199254740993),
+        ("max_runtime_secs", "3.6e3", 3600),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_bound_stored_in_a_lossless_form_keeps_its_limit(
+    store_dir, field, stored, expected, _nosleep
+):
+    """A migrated or hand-edited store can hold a bound as a string or a whole float.
+    That is still the user's limit, readable without loss, so it loads as the int it
+    names, and the timer's comparison against it cannot raise."""
+    reloaded, loop_id = await _reloaded_with_bound(store_dir, field, stored, **{field: expected})
+    try:
+        loop = reloaded._loops[loop_id]
+        value = getattr(loop, field)
+        assert value == expected and type(value) is int
+        assert loop.active is True
+        if field == "max_runtime_secs":
+            assert budget_elapsed(loop, now=loop.created_ts + expected) is True
+        await reloaded._timer(loop)
+    finally:
+        await _stop_and_drain(reloaded)
+
+
+@pytest.mark.asyncio
+async def test_a_cycle_cap_stored_as_a_string_fires_and_stops_at_its_cap(store_dir, _nosleep):
+    reloaded, loop_id = await _reloaded_with_bound(store_dir, "max_cycles", "2", max_cycles=2)
+    fired = _recording(reloaded)
+    try:
+        for _ in range(4):
+            if not reloaded._loops[loop_id].active:
+                break
+            reloaded._cancel_timer(loop_id)
+            await reloaded._timer(reloaded._loops[loop_id])
+        loop = reloaded._loops[loop_id]
+        assert len(fired) == 2
+        assert (loop.active, loop.stopped_reason) == (False, "cycle_cap")
+        assert cap_reached(loop) is True, "the resume reader agrees the cap is spent"
+    finally:
+        await _stop_and_drain(reloaded)
+
+
+@pytest.mark.parametrize(
+    ("field", "stored"),
+    [
+        ("max_cycles", "abc"),
+        ("max_cycles", None),
+        ("max_cycles", -5),
+        ("max_cycles", 2.9),
+        ("max_cycles", True),
+        ("max_cycles", []),
+        ("max_runtime_secs", "abc"),
+        ("max_runtime_secs", None),
+        ("max_runtime_secs", float("nan")),
+        # No exact whole reading, though a float reads them as 0 and 24.
+        ("max_cycles", "1e-400"),
+        ("max_runtime_secs", "24.0000000000000001"),
+        # Past the largest float, refused as a float reading refused it.
+        ("max_cycles", "1e400"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_unreadable_bound_stops_the_loop_at_load_and_keeps_the_value(
+    store_dir, field, stored, _nosleep, caplog
+):
+    """A bound with no lossless integer reading is a limit nobody can read. Reading
+    it as 0 would run the loop with no limit, so it fails closed instead: the loop
+    is deactivated at load under ``structural_terminal`` with its schedule cleared,
+    the value stays as stored, and the WARNING names the field and the value."""
+    caplog.set_level("WARNING", logger="kiro_crew.autonudge")
+    reloaded, loop_id = await _reloaded_with_bound(
+        store_dir, field, stored, **{field: _ARMED_BOUND[field]}
+    )
+    try:
+        loop = reloaded._loops[loop_id]
+        assert (loop.active, loop.stopped_reason, loop.next_due_ts) == (
+            False,
+            STRUCTURAL_TERMINAL_REASON,
+            0.0,
+        )
+        assert repr(getattr(loop, field)) == repr(stored), "the stored value is kept"
+        assert f"unreadable {field} ({stored!r})" in caplog.text
+    finally:
+        await _stop_and_drain(reloaded)
+
+
+@pytest.mark.parametrize("field", ["max_cycles", "max_runtime_secs"])
+@pytest.mark.asyncio
+async def test_resume_does_not_revive_a_loop_with_an_unreadable_bound(store_dir, field, _nosleep):
+    """Play, a reconciler and ``monitor_update`` all revive through ``update``. While
+    the stored bound is unreadable the revival is declined, so the loop never runs
+    without its limit; a revival that brings a fresh bound runs under that bound."""
+    reloaded, loop_id = await _reloaded_with_bound(
+        store_dir, field, "abc", **{field: _ARMED_BOUND[field]}
+    )
+    fired = _recording(reloaded)
+    try:
+        await reloaded.update(loop_id, active=True)
+        await reloaded.update(loop_id, active=True, fresh_run=True)
+        loop = reloaded._loops[loop_id]
+        assert (loop.active, getattr(loop, field), fired) == (False, "abc", [])
+
+        await reloaded.update(loop_id, active=True, **{field: 5})
+        loop = reloaded._loops[loop_id]
+        assert (loop.active, getattr(loop, field)) == (True, 5)
+    finally:
+        await _stop_and_drain(reloaded)
+
+
+@pytest.mark.asyncio
+async def test_a_numeric_bound_loads_unchanged(store_dir, _nosleep, caplog):
+    """Control: an int bound, the only form the gateway writes, is left as it is."""
+    caplog.set_level("WARNING", logger="kiro_crew.autonudge")
+    reloaded, loop_id = await _reloaded_with_bound(
+        store_dir, "max_cycles", 24, row={"max_runtime_secs": 3600}, max_cycles=24
+    )
+    try:
+        loop = reloaded._loops[loop_id]
+        assert (loop.max_cycles, loop.max_runtime_secs, loop.active) == (24, 3600, True)
+        assert type(loop.max_cycles) is int and type(loop.max_runtime_secs) is int
+        assert "unreadable" not in caplog.text
     finally:
         await _stop_and_drain(reloaded)
 

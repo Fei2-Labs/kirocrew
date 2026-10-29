@@ -45,10 +45,10 @@ def _reset_adapter_caches() -> None:
     pi._argv_cache = pi._UNRESOLVED
 
 
-def _run(backend: str, work_dir: Path, allow: bool = False) -> tuple[str, list[str]]:
+def _run(backend: str, work_dir: Path) -> tuple[str, list[str]]:
     lines: list[str] = []
     issues: list[str] = []
-    doctor.report(backend, work_dir, allow_ungated=allow, emit=lines.append, issues=issues)
+    doctor.report(backend, work_dir, emit=lines.append, issues=issues)
     return ("\n".join(lines), issues)
 
 
@@ -196,24 +196,6 @@ class TestSessionConfigGateRow:
         text, issues = _run(ACP_BACKEND_CODEX, tmp_path)
         assert "read" in text
         assert not any("bypass" in i for i in issues)
-
-
-class TestOptOutRow:
-    def test_the_opt_out_is_an_issue_even_when_routed(
-        self, codex_home: Path, tmp_path: Path
-    ) -> None:
-        """It disarms the refusal for every FUTURE session too.
-
-        So the operator should learn it is on regardless of today's config.
-        """
-        (codex_home / "config.toml").write_text('approval_policy = "untrusted"')
-        text, issues = _run(ACP_BACKEND_CODEX, tmp_path, allow=True)
-        assert "ENABLED" in text
-        assert any("allow_ungated_tools" in i for i in issues)
-
-    def test_absent_when_off(self, codex_home: Path, tmp_path: Path) -> None:
-        text, _ = _run(ACP_BACKEND_CODEX, tmp_path, allow=False)
-        assert "opt-out" not in text
 
 
 class TestClaudeRows:

@@ -472,7 +472,7 @@ docker stats kirocrew --no-stream
 
 The embedding model downloads on first use into `~/.kiro/crew/models/`
 inside the volume (a flat directory — that is the only tree
-`embeddings.py` writes models to). Downloads stage into that same
+`embeddings_download.py` writes models to). Downloads stage into that same
 directory as `.<model-file>.<pid>.tmp` and are unlinked in a `finally`, so a
 retry does not accumulate files — only a hard kill mid-download (OOM,
 `docker kill`) can strand one. Check before clearing anything:
@@ -525,7 +525,7 @@ gateway's own process environment has no trace of the token you passed in.
 `docker/entrypoint.sh` moves every credential it finds in the environment into
 the data home's `.env` (written mode 600), unsets it, and exports
 `_KIROCREW_CREDS_SCRUBBED=1`. `KiroCrewConfig.load_credentials`
-(`src/kiro_crew/config/loader.py`) reads that marker and refuses to re-inject
+(`src/kiro_crew/config/loader_config.py`) reads that marker and refuses to re-inject
 those keys into `os.environ`, so they never sit in the long-lived gateway's
 `/proc/<pid>/environ`.
 

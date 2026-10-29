@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from sage_lib import learning as L  # noqa: N812
 from sage_lib import store
@@ -98,6 +99,62 @@ class TestConsolidate(unittest.TestCase):
         self.assertFalse(res["ok"])
         # candidate preserved (not wiped) on refusal
         self.assertEqual(L.candidate_count(self.root), 1)
+
+    def test_duplicate_merge_preserves_rules_candidates_and_audit(self):
+        L.seed_common(self.root)
+        L.stage_learning(_pattern("Pending"), "human_comment", self.root)
+        common = L.common_file(self.root)
+        candidate = L.candidate_file(self.root)
+        before = (common.read_bytes(), candidate.read_bytes())
+        merged = (L.render_pattern(_pattern("Repeated", guidance="first"))
+                  + L.render_pattern(_pattern(" repeated ", guidance="second")))
+        res = L.consolidate_apply(merged, self.root)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["duplicate_ids"], [L.pattern_id("Repeated", "common")])
+        self.assertEqual(res["duplicate_titles"], ["Repeated", "repeated"])
+        self.assertEqual((common.read_bytes(), candidate.read_bytes()), before)
+        self.assertFalse(common.with_name(common.name + ".pre-consolidation").exists())
+        self.assertFalse((store.data_dir(self.root) / "learnings" / "consolidations.jsonl").exists())
+
+    def test_secret_in_a_heading_is_redacted_without_refusing_the_merge(self):
+        # The shape check reads the worker's text as written, so scrubbing a
+        # credential out of a heading cannot turn a valid merge into a refusal.
+        token = "ghp_" + "A" * 40
+        merged = L.render_pattern(_pattern("Rotate " + token))
+        res = L.consolidate_apply(merged, self.root)
+        self.assertTrue(res["ok"])
+        stored = L.common_file(self.root).read_text()
+        self.assertNotIn(token, stored)
+        self.assertEqual(len(L.parse_patterns(stored)), 1)
+
+    def test_redaction_collapsing_two_titles_into_one_is_refused(self):
+        # Two distinct credentials become the same redaction tag, so the titles are
+        # identical only in the text that would be stored. Uniqueness must be judged
+        # there, not on the worker's pre-redaction text.
+        merged = (L.render_pattern(_pattern("Rotate ghp_" + "A" * 40))
+                  + L.render_pattern(_pattern("Rotate ghp_" + "B" * 40)))
+        res = L.consolidate_apply(merged, self.root)
+        self.assertFalse(res["ok"])
+        redacted = "Rotate [REDACTED: credential]"
+        self.assertEqual(res["duplicate_ids"], [L.pattern_id(redacted, "common")])
+        self.assertEqual(res["duplicate_titles"], [redacted])
+
+    def test_redaction_that_leaves_no_pattern_is_refused(self):
+        L.seed_common(self.root)
+        before = L.common_file(self.root).read_bytes()
+        merged = L.render_pattern(_pattern("Keep this"))
+        with mock.patch.object(L, "_redact", return_value=""):
+            res = L.consolidate_apply(merged, self.root)
+        self.assertFalse(res["ok"])
+        self.assertIn("redaction left no recognizable patterns", res["error"])
+        self.assertEqual(L.common_file(self.root).read_bytes(), before)
+
+    def test_same_title_in_distinct_scopes_is_accepted(self):
+        merged = (L.render_pattern(_pattern("Repeated", scope="common"))
+                  + L.render_pattern(_pattern("Repeated", scope="repo")))
+        res = L.consolidate_apply(merged, self.root)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["patterns_now"], 2)
 
     def test_consolidate_records_audit(self):
         L.stage_learning(_pattern("S"), "fix_introduce", self.root)
@@ -223,8 +280,9 @@ class TestCandidateLockSpansProcesses(unittest.TestCase):
         import subprocess
         import sys
 
-        # Each child stages one learning; a process-local lock would let the two
-        # read the same "before" text and the last atomic write would drop one.
+        # Each child stages one learning of its own and one shared lesson. A
+        # process-local lock would let two read the same "before" text and the
+        # last atomic write would drop an entry or a sighting of the shared one.
         prog = (
             "import sys; sys.path.insert(0, %r)\n"
             "from pathlib import Path\n"
@@ -232,20 +290,35 @@ class TestCandidateLockSpansProcesses(unittest.TestCase):
             "L.stage_learning({'id': sys.argv[2], 'title': sys.argv[2],\n"
             "                  'body': 'b', 'multiplicity': 1},\n"
             "                 'fix_introduce', Path(sys.argv[1]))\n"
+            "L.stage_learning({'title': 'Shared lesson', 'impact': 'high',\n"
+            "                  'guidance': 'g'}, 'fix_introduce', Path(sys.argv[1]))\n"
         ) % str(Path(L.__file__).parent.parent)
 
-        procs = [
-            subprocess.Popen([sys.executable, "-c", prog, str(self.root), f"L{i}"],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            for i in range(6)
-        ]
+        procs: list[subprocess.Popen] = []
+
+        def _reap():
+            # Registered before the first spawn, so a timeout, a failed assertion
+            # or a launch error never leaves a child writing into the temp root.
+            for pr in procs:
+                if pr.poll() is None:
+                    pr.kill()
+                pr.communicate(timeout=30)
+
+        self.addCleanup(_reap)
+        for i in range(6):
+            procs.append(subprocess.Popen(
+                [sys.executable, "-c", prog, str(self.root), f"L{i}"], cwd=self.root,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE))
         for pr in procs:
             out, err = pr.communicate(timeout=60)
             self.assertEqual(pr.returncode, 0, err.decode()[-400:])
 
-        staged = {str(e.get("title")) for e in L.list_candidate(self.root)}
-        self.assertEqual(staged, {f"L{i}" for i in range(6)},
+        entries = L.list_candidate(self.root)
+        staged = {str(e.get("title")) for e in entries}
+        self.assertEqual(staged, {f"L{i}" for i in range(6)} | {"Shared lesson"},
                          "every process's learning must survive")
+        shared = [e["seen"] for e in entries if e["title"] == "Shared lesson"]
+        self.assertEqual(shared, [6], "every process's sighting must be counted")
 
 
 class TestGuardedCandidateReads(unittest.TestCase):

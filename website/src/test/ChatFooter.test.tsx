@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
-import { render, screen, act } from '@testing-library/react'
+import { render, screen, act, fireEvent } from '@testing-library/react'
 import ChatFooter, { pickDistinct, resolveLoader, resolveLoaderIcons, SwapCarousel, STREAM_IDLE_MS } from '../pages/chat/ChatFooter'
 import { GHOST_POSE_ICONS, GHOST_POSE_URLS } from '../components/GhostPoses'
 import { registerThemeBranding } from '../themeBranding'
@@ -80,6 +80,48 @@ describe('ChatFooter', () => {
   it('shows compacting indicator', () => {
     render(<ChatFooter {...base} running={true} state="compacting" lastRole="user" />)
     expect(screen.getByText(/Compacting…/)).toBeInTheDocument()
+  })
+
+  // #13779 / #19377: the plain running state must be readable — to assistive
+  // tech AND to a sighted first-time user. The ghosts animate; a visible
+  // "Thinking…" label sits beside them so the row is never bare glyphs with no
+  // text.
+  it('shows a visible localized "Thinking…" label beside the ghosts', () => {
+    const { container } = render(<ChatFooter {...base} running={true} lastRole="user" />)
+    expect(container.querySelector('.csb4')).toBeInTheDocument()
+    const label = screen.getByText('Thinking…')
+    expect(label).toBeInTheDocument()
+    expect(label).not.toHaveClass('sr-only')
+  })
+
+  it('exposes the running indicator as an accessible status with a single spoken name', () => {
+    render(<ChatFooter {...base} running={true} lastRole="user" />)
+    // role=status takes its accessible name from its aria-label; the visible
+    // "Thinking…" text duplicates that label for sighted users and is
+    // aria-hidden so a screen reader announces it once, not twice. The pose art
+    // is aria-hidden too.
+    expect(screen.getByRole('status')).toHaveAccessibleName('Thinking…')
+  })
+
+  it('keeps the visible label when a pose image fails to load', () => {
+    const { container } = render(<ChatFooter {...base} running={true} lastRole="user" />)
+    const img = container.querySelector('.csb4 img')!
+    act(() => { fireEvent.error(img) })
+    expect(container.querySelector('.csb4')).toBeNull()
+    expect(screen.getByText('Thinking…')).not.toHaveClass('sr-only')
+    expect(screen.getByRole('status')).toHaveAccessibleName('Thinking…')
+  })
+
+  // A throwing theme loader renders nothing; the label alone then carries the
+  // indicator, and it is always visible.
+  it('keeps the visible label when the theme artwork fails closed', () => {
+    const Boom = () => { throw new Error('theme loader exploded') }
+    registerThemeBranding({ 'seam-13779-boom': { loader: Boom } })
+    document.documentElement.setAttribute('data-theme', 'seam-13779-boom-dark')
+    render(<ChatFooter {...base} running={true} lastRole="user" />)
+    const label = screen.getByText('Thinking…')
+    expect(label).not.toHaveClass('sr-only')
+    expect(screen.getByRole('status')).toHaveAccessibleName('Thinking…')
   })
 
   it('renders 4 slots, each with both cross-fade layers', () => {

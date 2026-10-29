@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+from kiro_crew import cron_history as cron_history_mod
 from kiro_crew.cron_history import _SUMMARY_CAP, CronHistoryStore, CronRunRecord
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -171,6 +172,47 @@ async def test_get_all_history_no_index(store: CronHistoryStore) -> None:
     assert total == 0
 
 
+@pytest.mark.asyncio
+async def test_non_object_jsonl_rows_do_not_break_history_reads_or_delete(
+    store: CronHistoryStore, tmp_path: Path
+) -> None:
+    await store.append(_record(job_id="job1", run_id="r1", trace="private"))
+    await store.append(_record(job_id="keep", run_id="r2"))
+    history_dir = tmp_path / "cron-history"
+    job_file = history_dir / "job1.jsonl"
+    index_file = history_dir / "_index.jsonl"
+    invalid = 'null\n[]\n123\n"foo"\ntrue\n{broken\n'
+    retained = index_file.read_text(encoding="utf-8").splitlines()[1]
+    job_file.write_text(job_file.read_text(encoding="utf-8") + invalid, encoding="utf-8")
+    index_file.write_text(invalid + index_file.read_text(encoding="utf-8"), encoding="utf-8")
+
+    job_rows, job_total = await store.get_job_history("job1")
+    assert job_total == 1
+    assert [row["run_id"] for row in job_rows] == ["r1"]
+    assert "trace" not in job_rows[0]
+    assert (await store.get_run_detail("job1", "r1"))["trace"] == "private"
+    assert await store.get_run_detail("job1", "missing") is None
+
+    all_rows, all_total = await store.get_all_history()
+    assert all_total == 2
+    assert [row["run_id"] for row in all_rows] == ["r2", "r1"]
+    page, page_total = await store.get_all_history(offset=1, limit=1)
+    assert page_total == 2
+    assert [row["run_id"] for row in page] == ["r1"]
+    empty_page, job_total = await store.get_job_history("job1", offset=1, limit=1)
+    assert job_total == 1
+    assert empty_page == []
+    filtered_rows, filtered_total = await store.get_all_history(job_id="job1")
+    assert filtered_total == 1
+    assert [row["run_id"] for row in filtered_rows] == ["r1"]
+
+    assert await store.delete_job_history("job1") is True
+    remaining, total = await store.get_all_history()
+    assert total == 1
+    assert [row["run_id"] for row in remaining] == ["r2"]
+    assert index_file.read_text(encoding="utf-8") == retained + "\n"
+
+
 # ── rotate ───────────────────────────────────────────────────────────────
 
 
@@ -297,18 +339,17 @@ def test_record_from_dict_ignores_extra_keys() -> None:
     assert rec.job_id == "y"
 
 
-# ── cron.py: concurrent guard & _job_run_meta ────────────────────────────
+# ── cron.py: concurrent guard & run claim ────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_run_job_returns_false_when_already_executing() -> None:
-    from kiro_crew.cron import CronJob, CronService
+    from kiro_crew.cron import CronJob, CronService, RunClaims, _RunClaim
 
     svc = CronService.__new__(CronService)
     svc._jobs = [CronJob(id="j1", name="test", schedule="* * * * *", message="hi")]
-    svc._executing = {"j1"}
-    svc._job_run_meta = {}
-    svc._running_tasks = {}
+    svc._runs = RunClaims()
+    svc._claims = {"j1": _RunClaim(trigger="scheduled", claimed_at=0.0)}
     svc._loop = None
     svc._file = None
 
@@ -319,26 +360,28 @@ async def test_run_job_returns_false_when_already_executing() -> None:
 
 @pytest.mark.asyncio
 async def test_run_job_stores_manual_trigger_meta() -> None:
-    from kiro_crew.cron import CronJob, CronService
+    from kiro_crew.cron import CronJob, CronService, RunClaims
 
     svc = CronService.__new__(CronService)
     svc._jobs = [CronJob(id="j1", name="test", schedule="* * * * *", message="hi")]
-    svc._executing = set()
-    svc._job_run_meta = {}
-    svc._running_tasks = {}
+    svc._runs = RunClaims()
     svc._loop = None
     svc._file = None
 
-    async def fake_run(job):
-        pass
+    seen: list[object] = []
+
+    async def fake_run(job, claim=None):
+        seen.append(claim)
 
     with patch.object(svc, "_run_job_isolated", side_effect=fake_run), patch.object(
         svc, "_synced_snapshot", lambda include_disabled=True: list(svc._jobs)
     ):
         await svc.run_job("j1")
 
-    assert "j1" in svc._job_run_meta
-    assert svc._job_run_meta["j1"][1] == "manual"
+    (claim,) = seen
+    assert claim.trigger == "manual"
+    # The wrapper's backstop releases the whole claim once the run task is done.
+    assert "j1" not in svc._claims
 
 
 # ── Run-result freshness (stale-summary fabrication regression) ──────────
@@ -389,7 +432,7 @@ class TestRunResultFreshness:
         with patch.object(svc, "_execute", side_effect=_hang), patch(
             "kiro_crew.cron._JOB_TIMEOUT_SECS", 0.05
         ):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "failure"
@@ -418,7 +461,7 @@ class TestRunResultFreshness:
         with patch.object(svc, "_execute", side_effect=_hang), patch(
             "kiro_crew.cron._JOB_TIMEOUT_SECS", 0.05
         ):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "failure"
@@ -431,7 +474,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result("new run output")
             job.last_status = "ok"
             job.last_error = None
@@ -441,7 +484,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -461,7 +504,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _script_ok(job):
+        async def _script_ok(job, meta=None):
             job.set_run_result("ok")  # interned literal, same object every run
             job.last_status = "ok"
             job.last_error = None
@@ -471,7 +514,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_script_ok):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -489,7 +532,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _one_char(job):
+        async def _one_char(job, meta=None):
             job.set_run_result("y")
             job.last_status = "ok"
             job.last_error = None
@@ -499,7 +542,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_one_char):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -515,7 +558,7 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _no_output(job):
+        async def _no_output(job, meta=None):
             job.last_status = "ok"
             job.last_error = None
 
@@ -524,7 +567,7 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_no_output):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _read_history_rows(tmp_path, job.id)
         assert row["status"] == "success"
@@ -540,12 +583,12 @@ class TestRunResultFreshness:
 
         from kiro_crew.cron import CronService
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result("run one output")
             job.last_status = "ok"
             job.last_error = None
 
-        async def _no_output(job):
+        async def _no_output(job, meta=None):
             job.last_status = "ok"
             job.last_error = None
 
@@ -554,9 +597,9 @@ class TestRunResultFreshness:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
         with patch.object(svc, "_execute", side_effect=_no_output):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         row1, row2 = _read_history_rows(tmp_path, job.id)
         assert row1["summary"] == "run one output"
@@ -812,3 +855,143 @@ def test_deferred_store_reads_as_disabled_until_prepared(tmp_path: Path) -> None
     # Idempotent: a second prepare neither re-probes nor flips the verdict.
     store.prepare()
     assert store.enabled is True
+
+
+# ── append enforces the caps (not only an explicit rotate) ───────────────
+
+
+@pytest.fixture
+def small_store(tmp_path: Path) -> CronHistoryStore:
+    """Store with tiny caps so the bound is reachable without thousands of writes."""
+    return CronHistoryStore(
+        base_dir=tmp_path,
+        cron_max_records_per_job=5,
+        cron_max_index_records=8,
+    )
+
+
+@pytest.mark.asyncio
+async def test_append_bounds_the_job_file_without_an_explicit_rotate(
+    small_store: CronHistoryStore,
+) -> None:
+    """The per-job cap must hold continuously, not just after a rotate call.
+
+    ``rotate_all`` runs once, from ``CronService.start``. A gateway that stays up
+    keeps appending, so a cap enforced only at startup does not bound anything
+    for the lifetime of the process — which is exactly when the history grows.
+    """
+    for i in range(12):
+        await small_store.append(_record(run_id=f"r{i}"))
+
+    records, total = await small_store.get_job_history("job1", limit=50)
+    assert total == 5, "job file grew past cron_max_records_per_job"
+    # Newest kept, oldest dropped — same end state an explicit rotate produces.
+    assert [r["run_id"] for r in records] == ["r11", "r10", "r9", "r8", "r7"]
+
+
+@pytest.mark.asyncio
+async def test_append_bounds_the_global_index(
+    small_store: CronHistoryStore, tmp_path: Path
+) -> None:
+    """The index is read whole on every dashboard history request, so it is
+    the file whose unbounded growth costs the most."""
+    for i in range(20):
+        await small_store.append(_record(job_id=f"job{i % 3}", run_id=f"r{i}"))
+
+    index_path = tmp_path / "cron-history" / "_index.jsonl"
+    index_lines = index_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(index_lines) == 8, "index grew past cron_max_index_records"
+    # Newest-first retention across jobs, matching rotate_all's behaviour.
+    assert [json.loads(ln)["run_id"] for ln in index_lines] == [f"r{i}" for i in range(12, 20)]
+
+
+@pytest.mark.asyncio
+async def test_append_under_the_cap_keeps_every_record(
+    small_store: CronHistoryStore,
+) -> None:
+    """Negative control: the trim must not fire AT or below the cap.
+
+    Asserting the retained rows alone would stay green if the no-rewrite guard
+    were loosened, so this also spies ``replace_with_retry`` and requires that
+    no append writes through the cap rewrite it. Appending exactly
+    ``cron_max_records_per_job`` (5) records sits the file ON the cap, the
+    boundary a ``<=`` -> ``<`` mutation would rewrite; a smaller count would let
+    that mutation stay green.
+    """
+    with patch.object(cron_history_mod, "replace_with_retry") as replace_spy:
+        for i in range(5):
+            await small_store.append(_record(run_id=f"r{i}"))
+        replace_spy.assert_not_called()
+
+    records, total = await small_store.get_job_history("job1", limit=50)
+    assert total == 5
+    assert [r["run_id"] for r in records] == ["r4", "r3", "r2", "r1", "r0"]
+
+
+@pytest.mark.asyncio
+async def test_append_trim_preserves_the_full_trace_of_kept_records(
+    small_store: CronHistoryStore,
+) -> None:
+    """Trimming rewrites the job file; the surviving records must stay intact,
+    including the trace that only ``get_run_detail`` returns."""
+    for i in range(9):
+        await small_store.append(_record(run_id=f"r{i}", trace=f"trace-{i}"))
+
+    detail = await small_store.get_run_detail("job1", "r8")
+    assert detail is not None
+    assert detail["trace"] == "trace-8"
+    assert await small_store.get_run_detail("job1", "r0") is None
+
+
+@pytest.mark.asyncio
+async def test_append_for_a_job_named_index_does_not_truncate_the_global_index(
+    small_store: CronHistoryStore, tmp_path: Path
+) -> None:
+    """A job whose id is ``_index`` must not trim the shared index at the
+    smaller per-job cap.
+
+    ``_job_path('_index')`` resolves onto ``_index.jsonl``, so an unguarded
+    per-job trim would truncate the global index (cap 8 here) to the per-job
+    cap (5), silently dropping cross-job history. An imported or hand-edited
+    ``crons.json`` is the only way such an id reaches the store, but the store
+    must not corrupt the index when it does.
+    """
+    for i in range(12):
+        await small_store.append(_record(job_id="_index", run_id=f"r{i}"))
+
+    index_path = tmp_path / "cron-history" / "_index.jsonl"
+    index_lines = index_path.read_text(encoding="utf-8").strip().splitlines()
+    # Bounded by the INDEX cap (8), not the per-job cap (5).
+    assert len(index_lines) == 8
+
+
+# ── append-time trim is safe against a lock-free reader (Windows) ─────────
+
+
+@pytest.mark.asyncio
+async def test_append_trim_replaces_through_the_retrying_helper(
+    small_store: CronHistoryStore,
+) -> None:
+    """The append-time trim must replace through ``replace_with_retry``.
+
+    A lock-free dashboard read can hold the destination open, which on Windows
+    makes a bare ``os.replace`` raise a sharing violation (EACCES); that would
+    reach ``_degrade`` and disable history for a transient reader overlap. The
+    trim therefore routes its replace through the helper that retries the
+    Windows window.
+    """
+    replaced: list[str] = []
+    real = cron_history_mod.replace_with_retry
+
+    def _spy(src, dst):
+        replaced.append(os.path.basename(str(dst)))
+        return real(src, dst)
+
+    with patch.object(cron_history_mod, "replace_with_retry", _spy):
+        for i in range(12):  # crosses the per-job (5) and index (8) caps
+            await small_store.append(_record(run_id=f"r{i}"))
+
+    # Both files were trimmed, and every trim went through the retrying helper,
+    # so neither replace can raise a bare Windows sharing violation.
+    assert "job1.jsonl" in replaced
+    assert "_index.jsonl" in replaced

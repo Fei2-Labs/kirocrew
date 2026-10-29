@@ -1,7 +1,7 @@
 """Shared test harness for the messaging-transport Slack tests.
 
 Provides the recording Slack client, scripted provider, and fake session
-manager reused by ``test_slack_transport_dispatch`` and
+manager reused by ``slack_transport_dispatch_helpers`` and
 ``test_slack_transport_integration`` (imported via ``importlib``).
 
 NOTE: the upstream project also shipped a set of golden
@@ -43,15 +43,11 @@ class RecordingSlackClient(SlackClientOps):
         self.transcript.append((method, kw))
 
     # -- abstract methods --
-    async def post_message(
-        self, channel, text, thread_ts=None, unfurl_links=None, unfurl_media=None
-    ) -> str:
+    async def post_message(self, channel, text, thread_ts=None) -> str:
         self._rec("post_message", channel=channel, text=text, thread_ts=thread_ts)
         return self._next_ts()
 
-    async def post_blocks(
-        self, channel, blocks, text, thread_ts=None, unfurl_links=None, unfurl_media=None
-    ) -> str:
+    async def post_blocks(self, channel, blocks, text, thread_ts=None) -> str:
         self._rec(
             "post_blocks", channel=channel, text=text, thread_ts=thread_ts, n_blocks=len(blocks)
         )
@@ -117,7 +113,7 @@ class RecordingSlackClient(SlackClientOps):
         return None
 
     async def fetch_thread_replies(
-        self, channel, thread_ts, limit=200, warn_on_pagination=True
+        self, channel, thread_ts, limit=200, warn_on_pagination=True, **_bounds
     ) -> list[dict]:
         self._rec("fetch_thread_replies", channel=channel, thread_ts=thread_ts)
         return []
@@ -167,7 +163,7 @@ class FakeSessions:
     def get_session_for_thread(self, thread_ts: str):
         return None
 
-    async def get_or_create(self, session_key, agent=None, channel_id=None):
+    async def get_or_create(self, session_key, agent=None, channel_id=None, start_priority=None):
         return self._provider, False, False  # (client, is_new, resumed)
 
     async def set_channel(self, session_key, channel):

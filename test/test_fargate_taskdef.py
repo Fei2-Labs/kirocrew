@@ -23,6 +23,7 @@ OTHER_ACCOUNT = "210987654321"
 REGION = "us-east-1"
 DIGEST = "sha256:" + "b" * 64
 IMAGE = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/kirocrew-crew@{DIGEST}"
+FILE_SYSTEM_ID = "fs-0123456789abcdef0"
 
 BINDING = CrewBinding(partition="aws", account=ACCOUNT, crew="frontdesk")
 OTHER_BINDING = CrewBinding(partition="aws", account=ACCOUNT, crew="backoffice")
@@ -43,6 +44,7 @@ def spec(**overrides) -> td.TaskDefinitionSpec:
         secrets=[secret_ref("frontdesk", td.MODEL_CREDENTIAL_ENV)],
         cpu_architecture="ARM64",
         log=td.default_log_spec(REGION),
+        store=td.StoreSpec(file_system_id=FILE_SYSTEM_ID),
     )
     base.update(overrides)
     return td.TaskDefinitionSpec(**base)  # type: ignore[arg-type]
@@ -67,6 +69,11 @@ FIELD_MUTATIONS = {
     ),
     "cpu_architecture": dict(cpu_architecture="X86_64"),
     "log": dict(log=td.LogSpec(region="eu-west-1", stream_prefix="p")),
+    # In the key: volumes and mountPoints are task-definition fields RunTask
+    # cannot override, and the store varies. The mutation is the ephemeral answer,
+    # which is the pair most expensive to confuse -- one revision serving both a
+    # persistent and a non-persistent data home.
+    "store": dict(store=None),
 }
 
 # What RunTask can override, mapped to the spec field name each would carry if
@@ -302,9 +309,10 @@ def test_a_log_configuration_region_is_refused_by_the_same_rule_as_an_arn_region
 
 
 def test_the_credential_env_name_matches_the_container_that_reads_it():
-    """A drift here delivers the secret under a name the backend does not read."""
+    """A drift here delivers the secret under a name the supervisor does not read."""
     constants = _env_constants(_container_module(_CREW_BACKEND_SOURCE))
-    assert td.MODEL_CREDENTIAL_ENV == constants["ENV_KIRO_API_KEY"]
+    assert td.MODEL_CREDENTIAL_ENV == constants["ENV_KIRO_IDENTITY"]
+    assert td.API_KEY_ENV == constants["ENV_KIRO_API_KEY"]
     assert td.CONTROL_SECRET_ENV == constants["ENV_CONTROL_SECRET"]
 
 
@@ -317,8 +325,10 @@ def _container_credential_env() -> set[str]:
     * ``build_backend_env`` POPS it from the model worker's environment. That
       worker auto-approves every tool it calls, so a name deliberately withheld
       from it is a name whose value must not be readable by prompt content.
-    * ``require_api_key`` refuses to start without it, which is the model
-      credential the task injects from Secrets Manager.
+    * ``seed_model_identity`` CONSUMES it from the supervisor's own environment, which
+      is how the model identity is delivered into the crew's vault. That name carries a
+      credential before it is withheld, so reading this function as well as the pop
+      keeps the DELIVERED name declared by the code that delivers it.
 
     Variables merely mentioned in ``build_backend_env`` do not qualify: it also
     sets the home, port, bind address and telemetry flag, none of which are
@@ -337,12 +347,12 @@ def _container_credential_env() -> set[str]:
         and isinstance(call.args[0], ast.Name)
         and call.args[0].id.startswith("ENV_")
     }
-    gated = {
+    delivered = {
         node.id
-        for node in ast.walk(_function(tree, "require_api_key"))
+        for node in ast.walk(_function(tree, "seed_model_identity"))
         if isinstance(node, ast.Name) and node.id.startswith("ENV_")
     }
-    return {constants[name] for name in popped | gated}
+    return {constants[name] for name in popped | delivered}
 
 
 def test_every_credential_the_container_reads_is_refused_here():
@@ -562,14 +572,17 @@ def test_the_init_process_is_on_the_definition_because_runtask_cannot_override_i
 def test_the_revision_scheme_was_bumped_when_the_document_gained_a_field():
     """A key computed under the old scheme must not describe the new document.
 
-    The hashed FIELDS did not change when ``initProcessEnabled`` was added, so
-    without a scheme bump a revision registered before the change carries an
-    IDENTICAL key while running a DIFFERENT document -- and a caller confirming
-    "revision N holds the content this spec describes" would accept a task with no
-    init process. The new field is a constant and so could never have
-    discriminated the two by being hashed; the scheme is the only thing that can.
+    Two separate reasons, and the scheme covers both. The hashed FIELDS did not
+    change when ``initProcessEnabled`` was added, so without a bump a revision
+    registered before it carries an IDENTICAL key while running a DIFFERENT
+    document, and a caller confirming "revision N holds the content this spec
+    describes" would accept a task with no init process. A constant could never
+    discriminate by being hashed. The store is the other case: the hashed fields DO
+    change, and the bump says so out loud rather than leaving a reader to notice
+    that every key moved. ``stopTimeout`` is the newest such constant: it is in the
+    document but not the payload, so scheme 4 records that it was added.
     """
-    assert td.FINGERPRINT_SCHEME == 2
+    assert td.FINGERPRINT_SCHEME == 4
 
 
 def test_the_scheme_actually_participates_in_the_key(monkeypatch):
@@ -578,3 +591,101 @@ def test_the_scheme_actually_participates_in_the_key(monkeypatch):
     monkeypatch.setattr(td, "FINGERPRINT_SCHEME", 1)
     under_old_scheme = td.revision_fingerprint(spec())
     assert current != under_old_scheme
+
+
+# --- the stop timeout is the platform half of the supervisor's drain contract ------
+
+#: The image's own drain constants, read as DATA. Importing that tree from here would
+#: mirror the import the spawn audit forbids in gateway code, and the tree assumes an
+#: installed layout where ``kiro_crew`` is absent, so it may not be importable at all.
+_CONTAINER_CONFIG = (
+    pathlib.Path(td.__file__).parents[2]
+    / "apps"
+    / "builtins"
+    / "aws_control"
+    / "crew"
+    / "runtime"
+    / "container"
+    / "common"
+    / "config.py"
+)
+
+
+def _container_constants() -> dict[str, float]:
+    """Every module-level numeric constant in the image's config, by name."""
+    tree = ast.parse(_CONTAINER_CONFIG.read_text(encoding="utf-8"))
+    found: dict[str, float] = {}
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target = node.target.id
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            if isinstance(node.targets[0], ast.Name):
+                target = node.targets[0].id
+        if target is None or node.value is None:
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except ValueError:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            found[target] = value
+    return found
+
+
+def _expected_stop_timeout(c: dict[str, float]) -> float:
+    """The total the image asks the platform for: the three windows plus the reap margin.
+
+    Reproduced from the parts rather than read by name, because the image derives its own
+    total and a derived name is not a literal `ast` can evaluate. Pinning against the
+    windows ALONE is what let the gateway's copy sit ten seconds short of the contract.
+    """
+    return (
+        c["FRONT_DRAIN_SECS"]
+        + c["BACKEND_DRAIN_SECS"]
+        + c["SIDECAR_DRAIN_SECS"]
+        + c["TEARDOWN_REAP_MARGIN_SECS"]
+    )
+
+
+def test_the_crew_container_declares_a_stop_timeout_covering_the_whole_drain():
+    """Fargate's 30s default cuts the backup writer's final cycle before it starts.
+
+    The supervisor drains front, backend, then the writer, in that order, and then reaps.
+    The writer's cycle carries the only copy of the turns the backend flushed on the way
+    out, so a stop timeout shorter than all of that kills it, kills the supervisor with it,
+    and the non-zero exit meant to report the loss is never delivered.
+    """
+    expected = _expected_stop_timeout(_container_constants())
+
+    assert container(td.task_definition_document(spec()))["stopTimeout"] >= expected
+
+
+def test_the_stop_timeout_matches_the_total_the_image_declares():
+    """Two copies of one contract, pinned equal by reading the image tree as data.
+
+    The gateway cannot import that tree, so the copies are deliberate and this is what
+    stops them drifting: change a drain window or the reap margin without changing the
+    gateway's copy, and this reds.
+    """
+    assert td.CREW_STOP_TIMEOUT_SECS == int(_expected_stop_timeout(_container_constants()))
+
+
+def test_the_stop_timeout_stays_inside_the_limit_fargate_accepts():
+    """A value above the cap is rejected at registration, so the drains have a ceiling."""
+    c = _container_constants()
+
+    assert 0 < td.CREW_STOP_TIMEOUT_SECS <= c["MAX_TASK_STOP_TIMEOUT_SECS"]
+
+
+def test_the_constants_the_pin_reads_are_actually_there():
+    """A typo in a name would make every pin above vacuous rather than red."""
+    missing = {
+        "FRONT_DRAIN_SECS",
+        "BACKEND_DRAIN_SECS",
+        "SIDECAR_DRAIN_SECS",
+        "TEARDOWN_REAP_MARGIN_SECS",
+        "MAX_TASK_STOP_TIMEOUT_SECS",
+    } - set(_container_constants())
+
+    assert not missing, f"the image's config no longer declares: {sorted(missing)}"

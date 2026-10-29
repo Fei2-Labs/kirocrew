@@ -30,6 +30,7 @@ from kiro_crew.cloud.login_target import (
 )
 from kiro_crew.deploy.engine import resolve_aws_bin
 from kiro_crew.sandbox import SandboxCeilingUnsealable
+from kiro_crew.terminal_safe import safe_terminal_line
 from kiro_crew.validation import ValidationError
 
 
@@ -126,6 +127,17 @@ def _cloud_launch(args: argparse.Namespace) -> int:
     except LoginTargetError as exc:
         ui.fail(f"Kiro identity target rejected: {exc}")
         return 2
+    ami_id = getattr(args, "ami", "") or ""
+    try:
+        if ami_id:
+            ami_id = ec2.validate_ami_id(ami_id)
+        extra_packages = ec2.normalize_extra_packages(getattr(args, "extra_packages", "") or "")
+        ssm_kms_key_arn = getattr(args, "ssm_kms_key", "") or ""
+        if ssm_kms_key_arn:
+            ssm_kms_key_arn = ec2.validate_ssm_kms_key_arn(ssm_kms_key_arn)
+    except ValidationError as exc:
+        ui.fail(f"Invalid launch option: {exc}")
+        return 2
     return wizard.launch(
         profile=profile,
         region=region,
@@ -136,6 +148,9 @@ def _cloud_launch(args: argparse.Namespace) -> int:
         keep_on_failure=getattr(args, "keep_on_failure", False),
         hold_tunnel=getattr(args, "hold_tunnel", True),
         login_target=login_target,
+        ami_id=ami_id,
+        extra_packages=extra_packages,
+        ssm_kms_key_arn=ssm_kms_key_arn,
     )
 
 
@@ -179,6 +194,14 @@ def _cloud_connect(args: argparse.Namespace) -> int:
     st = ec2.describe(tag, profile, region)
     if not st.get("exists") or not st.get("instance_id"):
         ui.fail(f"No running instance for tag '{tag}'.")
+        # This verb addresses an EC2 crew, by tag, and a Fargate crew has no EC2
+        # instance to find -- so this lookup is also how an operator holding a
+        # Fargate crew arrives here. Name the surface that does reach one, rather
+        # than leaving a correct but terminal answer.
+        ui.detail(
+            "This reaches an EC2 crew. A Fargate crew is reached from Settings > Remote Crew: "
+            "its card opens the forward and shows the task's turn API URL."
+        )
         return 1
     open_browser = not getattr(args, "no_browser", False)
     local_port = getattr(args, "local_port", 0) or connect_mod.DEFAULT_LOCAL_PORT
@@ -456,32 +479,96 @@ def _cloud_iam_policy(_args: argparse.Namespace) -> int:
 
 
 def _cloud_iam_boundary(args: argparse.Namespace) -> int:
-    """Pre-create the shared, immutable instance permissions boundary (admin step).
+    """Pre-create the shared, immutable permissions boundaries (admin step).
 
-    Normally the first ``launch`` auto-creates this (the launcher policy grants
-    only ``iam:CreatePolicy`` on the fixed boundary name). Operators who want to
-    eliminate the first-write race entirely run this ONCE as an admin, then drop
-    the ``IamInstanceBoundaryCreateOnce`` statement from the applied launcher
-    policy — the launcher then only *references* the boundary ARN, never creates
-    it. Idempotent: an existing boundary is left untouched (immutability).
+    Creates all three boundaries the launcher policy's
+    ``IamInstanceBoundaryCreateOnce`` statement names: the EC2 instance ceiling
+    (``kirocrew-ec2-boundary``) and the two Fargate crew ceilings
+    (``kirocrew-crew-boundary`` for the task role, ``kirocrew-crew-exec-boundary``
+    for the execution role). Normally a launch auto-creates the boundary it needs
+    (the statement grants ``iam:CreatePolicy`` plus the two read verbs,
+    ``iam:GetPolicy`` and ``iam:GetPolicyVersion``, on those exact names).
+    Operators who want to eliminate the first-write race entirely run this ONCE as
+    an admin, then remove the ``iam:CreatePolicy`` action from that statement —
+    the launcher then only *references* the boundary ARNs, never creates them.
+    That removal is safe only once ALL three exist, because the one statement
+    covers all three names; a boundary still missing when the action goes would
+    have no principal left that may create it. The statement's ``iam:GetPolicy``
+    and ``iam:GetPolicyVersion`` grants stay: every launch reads its boundary to
+    verify the content before reusing it.
+
+    Each boundary goes through the same create-once-and-verify sequence a launch
+    uses, so the step is idempotent (an existing boundary whose content matches is
+    left untouched, never re-versioned) and refuses a drifted one the same way. The
+    three are attempted independently, so one refusal still reports the state of
+    the other two; the exit status is non-zero when any of them is not ready.
     """
     from kiro_crew.cloud import source as source_mod
 
     profile, region = _resolve(args)
-    try:
-        arn = source_mod.ensure_instance_boundary(profile, region)
-    except AWSError as exc:
-        ui.fail(str(exc))
-        if exc.missing_action:
-            ui.detail(f"Grant `{exc.missing_action}` and retry.")
+    boundaries = [
+        ("Instance permissions boundary", source_mod.ensure_instance_boundary),
+        ("Fargate crew task-role boundary", source_mod.ensure_crew_boundary),
+        ("Fargate crew execution-role boundary", source_mod.ensure_crew_exec_boundary),
+    ]
+    # Opt-in only: without --ssm-kms this step creates exactly the three
+    # boundaries above. This admin step is the one caller that may create the
+    # KMS-session boundary; a launch only verifies it.
+    if getattr(args, "ssm_kms", False):
+
+        def _ensure_kms(profile: str = "", region: str = "") -> str:
+            return source_mod.ensure_instance_kms_boundary(profile, region, create=True)
+
+        boundaries.append(("KMS-session instance boundary", _ensure_kms))
+    failed = False
+    for label, ensure in boundaries:
+        try:
+            arn = ensure(profile, region)
+        except AWSError as exc:
+            failed = True
+            ui.fail(str(exc))
+            if exc.missing_action:
+                ui.detail(f"Grant `{exc.missing_action}` and retry.")
+            # Every boundary ARN embeds the account id, so a failure to resolve it
+            # fails the remaining boundaries identically; say it once.
+            if exc.action == "sts:GetCallerIdentity":
+                break
+            continue
+        ui.ok(f"{label} ready: {arn}")
+    if failed:
+        ui.detail(
+            "Keep the iam:CreatePolicy action in the IamInstanceBoundaryCreateOnce "
+            "statement until every boundary above is ready, then re-run this step."
+        )
         return 1
-    ui.ok(f"Instance permissions boundary ready: {arn}")
     ui.detail(
-        "It is immutable and shared by every launch. To fully close the "
-        "first-write race, remove the IamInstanceBoundaryCreateOnce statement "
-        "from the applied launcher policy now that the boundary exists."
+        "They are immutable and shared by every launch. To fully close the "
+        "first-write race, remove the iam:CreatePolicy action from the "
+        "IamInstanceBoundaryCreateOnce statement in the applied launcher policy "
+        "now that all three boundaries exist. Keep the statement's read verbs — "
+        "every launch reads its boundary to verify it."
     )
     return 0
+
+
+#: The doctor's next step for a refused ``aws`` CLI or plugin with no fix command,
+#: by ``ssm`` refusal code. A root gateway and the strict policy are not cleared
+#: by an ownership change, and another account's file must not be made trusted:
+#: the step for it is a copy from AWS, in folders only root or this account own.
+_REFUSAL_NEXT_STEP = {
+    "other_owner": (
+        "Install a copy with AWS's own installer, then rerun. That copy runs only if "
+        "it and every folder above it belong to root or to the account the gateway "
+        "runs as. If a folder such as /usr/local/bin belongs to the other account, an "
+        "administrator must make root its owner first (see the Remote Crew on EC2 guide)."
+    ),
+    "root_gateway": "Start the gateway from a regular account instead of root, then rerun.",
+    "strict_policy": (
+        "Install it where only root can change the file and its folders, at a path "
+        "with no symbolic links, then rerun."
+    ),
+    "": "Fix the file's ownership or permissions so the check passes, then rerun.",
+}
 
 
 def _cloud_doctor(args: argparse.Namespace) -> int:
@@ -494,12 +581,31 @@ def _cloud_doctor(args: argparse.Namespace) -> int:
     # (the shared deploy-engine resolver), so the doctor's verdict agrees with
     # what `kirocrew cloud` commands actually run under a GUI-launched
     # gateway's minimal PATH.
+    cli_refusal = None
     if shutil.which(resolve_aws_bin()):
         ui.ok("aws CLI found")
+    elif (cli_refusal := ssm.aws_cli_refusal()) is not None:
+        # Found but refused: the install link would put the same refused file back.
+        ui.fail(f"aws CLI found at {cli_refusal.path} but refused: {cli_refusal.reason}")
+        ui.detail(_REFUSAL_NEXT_STEP.get(cli_refusal.code, _REFUSAL_NEXT_STEP[""]))
     else:
         ui.fail("aws CLI not found — install it (https://aws.amazon.com/cli/)")
     if ssm.session_manager_plugin_installed():
         ui.ok("session-manager-plugin found")
+    elif (refusal := ssm.session_manager_plugin_refusal()) is not None:
+        ui.warn(f"session-manager-plugin found at {refusal.path} but refused: {refusal.reason}")
+        if refusal.remedy_command:
+            # Making the tree root-owned turns whatever binary is in it into an
+            # accepted credential receiver, so the user confirms it is AWS's first.
+            ui.detail(
+                "If you did not install it from AWS yourself, or are not sure, reinstall "
+                "it from AWS first."
+            )
+            ui.detail(
+                f"Then make its install directory root-owned and rerun: {refusal.remedy_command}"
+            )
+        else:
+            ui.detail(_REFUSAL_NEXT_STEP.get(refusal.code, _REFUSAL_NEXT_STEP[""]))
     else:
         ui.warn("session-manager-plugin not found — needed to connect over SSM")
         ui.detail(ssm.session_manager_plugin_install_hint())
@@ -514,7 +620,13 @@ def _cloud_doctor(args: argparse.Namespace) -> int:
             )
     else:
         ui.fail("AWS not reachable")
-        ui.detail(reach.get("note", ""))
+        # With the CLI refused, the profile was never checked: the note's
+        # credential or helper advice would send the user to the wrong fix.
+        ui.detail(
+            "The aws CLI above was refused, so the profile was not checked."
+            if cli_refusal is not None
+            else reach.get("note", "")
+        )
     return 0
 
 
@@ -572,7 +684,7 @@ def handle_cloud(args: argparse.Namespace) -> int:
         ui.detail("stop|start  Pause / resume (save cost)")
         ui.detail("destroy     Remove everything from AWS")
         ui.detail("iam-policy  Print the least-privilege IAM policy to apply")
-        ui.detail("iam-boundary Pre-create the immutable instance permissions boundary (admin)")
+        ui.detail("iam-boundary Pre-create the EC2 + Fargate permissions boundaries (admin)")
         ui.detail("doctor      Check cloud prerequisites + AWS reachability")
         return 0
     fn = _DISPATCH.get(action)
@@ -589,7 +701,11 @@ def handle_cloud(args: argparse.Namespace) -> int:
         # Caught for the whole dispatch table rather than per verb: every verb resolves the
         # tag or the region through that read, ``launch`` re-attaches through it too, and a
         # verb added later would otherwise print a traceback until someone noticed.
-        ui.fail(str(exc))
+        # Escaped here as well as in the builders, exactly as ``cli_chat`` does: this
+        # handler prints ANY builder of the exception, including ones in modules it does
+        # not own, and ``ui.fail`` writes straight to the terminal. Escaping at each
+        # builder keeps a new SINK safe; escaping at the sink keeps a new BUILDER safe.
+        ui.fail(safe_terminal_line(str(exc)))
         return 1
     except CloudActionDenied as exc:
         # A mutating cloud verb was reached from an agent session (the in-layer

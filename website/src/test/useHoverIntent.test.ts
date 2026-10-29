@@ -16,10 +16,16 @@
  *      Pointerdown inside the trigger or the surface does not close.
  *  (6) Disabling mid-hover retracts the surface instead of freezing it.
  *  (7) Pending timers do not fire after unmount.
+ *  (8) With `dismissOnWindowExit`, a surface revealed at a window edge hides
+ *      once the user stops looking: the cursor is reported far enough outside
+ *      the window (Electron, or relayed to an embedded pane), or the window blurs, or the tab is hidden.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { useHoverIntent, HOVER_OPEN_MS, HOVER_CLOSE_MS } from '../hooks/useHoverIntent'
+import { useHoverIntent, HOVER_OPEN_MS, HOVER_CLOSE_MS, HOVER_MIN_VISIBLE_MS } from '../hooks/useHoverIntent'
+
+/** Far longer than any grace the hook has. */
+const LONG_MS = 10_000
 
 /** The synthetic ArrowDown `arrowDown()` hands the hook: a keyboard event whose
  *  `preventDefault` is observable, so a test can assert the hook called it. */
@@ -56,6 +62,9 @@ describe('useHoverIntent', () => {
     // land inside it while closed — the focus ring would be invisible. Focused
     // chrome must be visible chrome. Contrast (4): focus on the TRIGGER still
     // never opens; only focus already inside the surface does.
+    // Focus mode's own top bar and nav rail do NOT take this path: they are
+    // `inert` while hidden (App.focusMode.test.tsx), so Tab never lands in
+    // them. This pins the hook's contract for a surface that is not inert.
     const { result } = renderHook(() => useHoverIntent())
     act(() => { result.current.surfaceProps.onFocus() })
     expect(result.current.open).toBe(true)
@@ -396,5 +405,332 @@ describe('useHoverIntent — departWhen (positional close for window-drag surfac
     act(() => { result.current.surfaceProps.onMouseLeave() })
     advance(HOVER_CLOSE_MS)
     expect(result.current.open).toBe(false)
+  })
+})
+
+describe('useHoverIntent — dismissOnWindowExit (the user stopped looking)', () => {
+  beforeEach(() => { vi.useFakeTimers() })
+  afterEach(() => {
+    vi.useRealTimers()
+    delete (window as Window & { electronAPI?: unknown }).electronAPI
+  })
+
+  const advance = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+  // Same territory as the focus-mode header, so positional close is in play too.
+  const opts = { departWhen: (e: MouseEvent) => e.clientY > 48, dismissOnWindowExit: true }
+  /** The pointer crossing the window boundary: relatedTarget null, last sample
+   *  in the edge band. */
+  const leaveWindow = (x = 4, y = 4) => act(() => {
+    document.dispatchEvent(new MouseEvent('mouseout', {
+      bubbles: true, relatedTarget: null, clientX: x, clientY: y,
+    }))
+  })
+  const reenterWindow = () => act(() => {
+    document.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, relatedTarget: null }))
+  })
+  const openByHover = (result: { current: ReturnType<typeof useHoverIntent> }) => {
+    act(() => { result.current.triggerProps.onMouseEnter() })
+    advance(HOVER_OPEN_MS)
+    expect(result.current.open).toBe(true)
+  }
+
+  /** Stand in for the Electron main process: the hook asks how far the cursor
+   *  went, and the test decides when (and whether) an answer arrives. */
+  function installCursorBridge() {
+    const bridge = {
+      /** One entry per watch armed. */
+      watches: 0,
+      stops: 0,
+      reply: null as ((away: boolean) => void) | null,
+      /** Deliver main's verdict for the live watch. */
+      answer(away: boolean) {
+        const reply = bridge.reply
+        if (!reply) throw new Error('no cursor watch is armed')
+        act(() => { reply(away) })
+      },
+    }
+    ;(window as Window & { electronAPI?: unknown }).electronAPI = {
+      watchCursorAway: (cb: (away: boolean) => void) => {
+        bridge.watches += 1
+        bridge.reply = cb
+        return () => { bridge.stops += 1; bridge.reply = null }
+      },
+    }
+    return bridge
+  }
+
+  it('keeps the surface open on exit until the cursor is reported far away', () => {
+    // Only the distance answer decides this. The pointer may be parked an
+    // inch outside the surface it just summoned, and it stays up.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+
+    leaveWindow()
+    expect(bridge.watches).toBe(1)
+    advance(LONG_MS)
+    expect(result.current.open).toBe(true)
+
+    bridge.answer(true)
+    expect(result.current.open).toBe(false)
+  })
+
+  it('stays open when the cursor is reported back inside instead', () => {
+    // Main answers re-entry itself because the band the pointer comes back
+    // through can be a drag region the page never sees a mouseover from.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+
+    leaveWindow()
+    bridge.answer(false)
+    advance(LONG_MS)
+    expect(result.current.open).toBe(true)
+
+    // And the surface is hoverable again: the off-window latch was cleared, so a
+    // hover after a re-entry is not swallowed.
+    act(() => { result.current.close() })
+    act(() => { result.current.triggerProps.onMouseEnter() })
+    advance(HOVER_OPEN_MS)
+    expect(result.current.open).toBe(true)
+  })
+
+  it('arms one watch per exit, not one per event', () => {
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+
+    leaveWindow()
+    leaveWindow(6, 2)
+    leaveWindow(2, 9)
+    expect(bridge.watches).toBe(1)
+    expect(result.current.open).toBe(true)
+  })
+
+  it('keeps the watch when the same edge exit ALSO re-reveals the surface', () => {
+    // The two handlers race on one native event: this hook arms the watch in the
+    // capture phase, and the caller's edge-slam reveal calls openNow in the
+    // bubble phase. openNow cancels pending transitions, so it used to throw that
+    // watch away — and nothing re-armed it, because `open` never changed. The
+    // re-revealed surface then had nobody watching it at all, which is the exact
+    // bug this option exists to fix.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+
+    leaveWindow()
+    act(() => { result.current.openNow() })
+    expect(result.current.open).toBe(true)
+
+    bridge.answer(true)
+    advance(HOVER_MIN_VISIBLE_MS)
+    expect(result.current.open).toBe(false)
+  })
+
+  it('lets a just-opened surface finish revealing before a fast swipe retracts it', () => {
+    // A fast swipe reveals the surface and crosses the away distance within a few
+    // frames. Retracting mid slide-in reads as a jitter, so the dismissal waits
+    // out the minimum visible time.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    leaveWindow()
+    act(() => { result.current.openNow() })
+    expect(bridge.watches).toBe(1)
+
+    bridge.answer(true)
+    expect(result.current.open).toBe(true)
+    advance(HOVER_MIN_VISIBLE_MS - 1)
+    expect(result.current.open).toBe(true)
+    advance(1)
+    expect(result.current.open).toBe(false)
+  })
+
+  it('closes at once when the away answer comes after the minimum visible time', () => {
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+    advance(HOVER_MIN_VISIBLE_MS)
+    leaveWindow()
+    bridge.answer(true)
+    expect(result.current.open).toBe(false)
+  })
+
+  it('keeps the surface when the pointer comes back during the hold', () => {
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    leaveWindow()
+    act(() => { result.current.openNow() })
+    bridge.answer(true)
+    reenterWindow()
+    advance(HOVER_MIN_VISIBLE_MS * 4)
+    expect(result.current.open).toBe(true)
+  })
+
+  it('releases the watch when the pointer re-enters the window', () => {
+    // The renderer's own mouseover is the fast path; it must disarm the poll so
+    // nothing keeps sampling the cursor for an answer no longer wanted.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+
+    leaveWindow()
+    reenterWindow()
+    expect(bridge.stops).toBe(1)
+    advance(LONG_MS)
+    expect(result.current.open).toBe(true)
+  })
+
+  it('releases the watch when the surface closes for another reason', () => {
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+    leaveWindow()
+    expect(bridge.watches).toBe(1)
+
+    act(() => { result.current.close() })
+    expect(bridge.stops).toBe(1)
+  })
+
+  it('arms the watch when the surface is opened with the pointer ALREADY outside', () => {
+    // The edge-slam reveal: the overshoot out of the window is what opens the
+    // overlay, so the exit event precedes the open and there is no second one.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    leaveWindow()
+    act(() => { result.current.openNow() })
+    expect(result.current.open).toBe(true)
+    expect(bridge.watches).toBe(1)
+
+    bridge.answer(true)
+    advance(HOVER_MIN_VISIBLE_MS)
+    expect(result.current.open).toBe(false)
+  })
+
+  it('does not let a hover reopen it while the pointer is still off-window', () => {
+    // A stationary pointer over a region that stopped answering hover would
+    // otherwise oscillate: dismiss → the strip becomes hoverable → reopen → …
+    installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    leaveWindow()
+    act(() => { result.current.triggerProps.onMouseEnter() })
+    advance(HOVER_OPEN_MS * 2)
+    expect(result.current.open).toBe(false)
+
+    reenterWindow()
+    act(() => { result.current.triggerProps.onMouseEnter() })
+    advance(HOVER_OPEN_MS)
+    expect(result.current.open).toBe(true)
+  })
+
+  it('closes when the window loses focus, without waiting for a distance', () => {
+    // Switching apps is not a distance question: the user is demonstrably
+    // elsewhere, so this stays immediate.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+    leaveWindow()
+    act(() => { window.dispatchEvent(new Event('blur')) })
+    expect(result.current.open).toBe(false)
+    expect(bridge.stops).toBe(1)
+  })
+
+  it('closes when the tab is hidden', () => {
+    installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
+    try {
+      act(() => { document.dispatchEvent(new Event('visibilitychange')) })
+      expect(result.current.open).toBe(false)
+    } finally {
+      visibility.mockRestore()
+    }
+  })
+
+  it('keeps it open, and asks nothing, when focus is inside the surface', () => {
+    // A focused input or an open menu inside the surface means the user is still
+    // working in it; blur and visibility still cover leaving for real.
+    const bridge = installCursorBridge()
+    const trigger = document.createElement('button')
+    const surface = document.createElement('div')
+    const field = document.createElement('input')
+    surface.appendChild(field)
+    document.body.append(trigger, surface)
+    const { result } = renderHook(() => useHoverIntent({
+      ...opts, triggerRef: { current: trigger }, surfaceRef: { current: surface },
+    }))
+    openByHover(result)
+    field.focus()
+
+    leaveWindow()
+    expect(bridge.watches).toBe(0)
+    advance(LONG_MS)
+    expect(result.current.open).toBe(true)
+
+    act(() => { window.dispatchEvent(new Event('blur')) })
+    expect(result.current.open).toBe(false)
+    trigger.remove(); surface.remove()
+  })
+
+  it('ignores a relatedTarget-null mouseout sampled mid-window', () => {
+    // A mid-window element that stops answering hover (an Electron window-drag
+    // region) reports the same event shape as a real exit; only the edge band is
+    // an exit, or resting on the revealed header would dismiss it.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent(opts))
+    openByHover(result)
+    leaveWindow(Math.round(window.innerWidth / 2), Math.round(window.innerHeight / 2))
+    expect(bridge.watches).toBe(0)
+    advance(LONG_MS)
+    expect(result.current.open).toBe(true)
+  })
+
+  it('leaves the window alone when the option is off', () => {
+    // Opt-in: the hook's other consumers keep the old contract, where an exit
+    // is silence and silence changes nothing.
+    const bridge = installCursorBridge()
+    const { result } = renderHook(() => useHoverIntent({ departWhen: opts.departWhen }))
+    openByHover(result)
+    leaveWindow()
+    expect(bridge.watches).toBe(0)
+    advance(LONG_MS)
+    expect(result.current.open).toBe(true)
+    act(() => { window.dispatchEvent(new Event('blur')) })
+    expect(result.current.open).toBe(true)
+  })
+
+  describe('no Electron bridge', () => {
+    // A browser tab cannot see the cursor once it is off-window. It dismisses on
+    // nothing then: a clock would turn every slight overshoot into a countdown on
+    // the surface the user may be looking at.
+
+    it('stays open however long the pointer stays out', () => {
+      const { result } = renderHook(() => useHoverIntent(opts))
+      openByHover(result)
+      leaveWindow()
+      advance(LONG_MS)
+      expect(result.current.open).toBe(true)
+    })
+
+    it('stays open when the bridge throws', () => {
+      ;(window as Window & { electronAPI?: unknown }).electronAPI = {
+        watchCursorAway: () => { throw new Error('no window for this sender') },
+      }
+      const { result } = renderHook(() => useHoverIntent(opts))
+      openByHover(result)
+      leaveWindow()
+      advance(LONG_MS)
+      expect(result.current.open).toBe(true)
+    })
+
+    it('still closes on blur, the app-switch signal', () => {
+      const { result } = renderHook(() => useHoverIntent(opts))
+      leaveWindow()
+      act(() => { result.current.openNow() })
+      advance(LONG_MS)
+      expect(result.current.open).toBe(true)
+      act(() => { window.dispatchEvent(new Event('blur')) })
+      expect(result.current.open).toBe(false)
+    })
   })
 })

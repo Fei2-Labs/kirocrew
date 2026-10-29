@@ -20,11 +20,11 @@ from aiohttp import web
 
 from kiro_crew.apps.backend import spawned_backend_names, stop_app_backend
 from kiro_crew.apps.bridges import (
+    deregister_app_crons_reporting_failures,
     disarm_app_crons_for_execution,
     register_app_crons_with_service,
 )
-from kiro_crew.apps.context import AppContext, build_app_context
-from kiro_crew.apps.cron_sdk import CronSDK
+from kiro_crew.apps.context import AppContext, build_app_context, http_app_for_manifest
 from kiro_crew.apps.execution import (
     app_execution_denied,
     shipped_builtin_app_root,
@@ -32,7 +32,7 @@ from kiro_crew.apps.execution import (
 from kiro_crew.apps.job_routes import register_job_routes
 from kiro_crew.apps.job_sdk import forget_sdk, get_sdk, reconcile_all, register_sdk
 from kiro_crew.apps.lifecycle import LifecycleDispatcher
-from kiro_crew.apps.manager import app_dir, list_apps
+from kiro_crew.apps.manager import app_dir, approved_manifest_permissions, list_apps
 from kiro_crew.apps.module_loader import clear_all_shutdown_callables
 from kiro_crew.apps.route_registry import RouteRegistry
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
@@ -78,8 +78,10 @@ def hook_signature(app_info: dict[str, Any]) -> tuple[Any, ...]:
 
     Folds ONLY hook-relevant inputs so a metadata write that does not touch hook
     code never forces a reload: the app version, a digest of the declared hook
-    source files' (path, mtime, size), and the ``.app_secret`` mtime (a reinstall
-    rotates it, and the live module must pick up the new secret). Deliberately
+    source files' (path, mtime, size), the ``.app_secret`` mtime (a reinstall
+    rotates it, and the live module must pick up the new secret), and the
+    approved events in ``approvedGrants`` (approving them changes what the hook context's
+    event bus may publish, and the bus is built once per load). Deliberately
     EXCLUDES two things:
 
     * ``installed.json`` mtime -- a dashboard permissions/config edit rewrites
@@ -130,6 +132,21 @@ def hook_signature(app_info: dict[str, Any]) -> tuple[Any, ...]:
         str(app_info.get("version", "")),
         digest,
         secret_mtime,
+        # The approved event set the hook context's EventBus is built from: an
+        # owner approving held-back events (``installed.json`` only, no code
+        # change) must reload the hooks, or the bus keeps refusing them.
+        _approved_events_marker(app_info),
+    )
+
+
+def _approved_events_marker(app_info: dict[str, Any]) -> tuple[str, ...] | None:
+    """``None`` for a record without an approved set, else its events, sorted."""
+    record = app_info.get("approvedGrants")
+    if record is None:
+        return None
+    events = record.get("events") if isinstance(record, dict) else None
+    return (
+        tuple(sorted(e for e in events if isinstance(e, str))) if isinstance(events, list) else ()
     )
 
 
@@ -287,6 +304,7 @@ def init_hooks_system(
         cron_service=cron_service,
         broadcast_fn=broadcast_fn,
         spawn_impl=spawn_impl,
+        http_app=app,
     )
 
     logger.info("Hooks system initialized")
@@ -327,9 +345,22 @@ def _build_app_context_from_info(
     """Build an AppContext from app info dict — shared helper for consistent context."""
     name = app_info.get("name", "")
     manifest = app_info.get("manifest", {})
-    permissions = manifest.get("permissions", {})
+    permissions = approved_manifest_permissions(app_info)
     data_path = app_dir(name) / "data"
     data_path.mkdir(parents=True, exist_ok=True)
+    # Only an app that declares a ``routes`` hook is handed the gateway's
+    # Application, and only because it already has it: the registry dispatches
+    # the real ``web.Request`` into that app's handlers, so ``request.app`` is
+    # this same object on every call. Reading it from the registry rather than a
+    # parameter keeps the two in step by construction -- the object an app can
+    # reach through its requests is the object it is given here, or nothing.
+    #
+    # The gate itself lives in ``http_app_for_manifest`` and is shared with the
+    # lifecycle dispatcher's builder, so a startup context and a shutdown context
+    # for the same app cannot disagree about whether the handle is present.
+    http_app = http_app_for_manifest(
+        manifest, _route_registry.http_app if _route_registry else None
+    )
     ctx = build_app_context(
         app_name=name,
         data_dir=data_path,
@@ -338,6 +369,8 @@ def _build_app_context_from_info(
         broadcast_fn=broadcast_fn,
         spawn_impl=spawn_impl,
         app_config=manifest.get("extra", {}),
+        http_app=http_app,
+        crewmate_host=_route_registry.http_app if _route_registry else None,
     )
     # The shared _jobs routes are mounted once for every app and resolve the app
     # from the URL, so they need a name -> SDK lookup. Publishing happens here,
@@ -551,6 +584,34 @@ async def stop_app_startup_hooks(app_name: str, *, bounded: bool = False) -> boo
     return await _lifecycle_dispatcher.stop_detached_startup_hooks(app_name, bounded=bounded)
 
 
+async def _cleanup_app_crons(app_name: str, result: dict[str, Any]) -> None:
+    """Remove the cron jobs this app owns, keyed off the running cron SERVICE
+    rather than the manifest's ``cron`` grant -- a revoked grant must not make
+    the jobs it authorized unreachable. Owner-scoped. A STORE failure is
+    REPORTED rather than crashing the disable; an unexpected one propagates,
+    exactly as an error outside ``OSError`` does on the jobs path.
+    """
+    # The cron service is the lifecycle dispatcher's; no service, no jobs.
+    if not _lifecycle_dispatcher or not _lifecycle_dispatcher._cron_service:
+        return
+    # The bridges helper owns the removal, its logging and its SEL audit, and
+    # raises both store classes so the note below can name which one happened.
+    try:
+        removed = await deregister_app_crons_reporting_failures(
+            app_name, _lifecycle_dispatcher._cron_service
+        )
+    except CronStoreUnreadable:
+        # Reported rather than retried: an unreadable store does not heal on
+        # its own, and crashing the disable is the one outcome forbidden here.
+        result["cron_cleanup"] = "failed: cron store unreadable — jobs may still be enabled"
+        return
+    except CronStoreBusy:
+        result["cron_cleanup"] = "failed: cron store busy — jobs may still be enabled"
+        return
+    if removed:
+        result["cron_cleanup"] = f"removed {removed} job(s)"
+
+
 async def _cleanup_app_jobs(app_name: str, result: dict[str, Any]) -> None:
     """Stop and drop an app's durable job runs, mirroring the cron contract:
     idempotent, and a failure is REPORTED rather than crashing the disable.
@@ -667,7 +728,7 @@ async def on_app_disable(
         success = await _lifecycle_dispatcher._invoke(
             app_name,
             shutdown_hook,
-            _lifecycle_dispatcher._build_context(app_info),
+            _lifecycle_dispatcher._build_context(app_info, phase="shutdown"),
             phase="shutdown",
         )
         result["hooks_shutdown"] = "ok" if success else "failed"
@@ -687,56 +748,9 @@ async def on_app_disable(
     # app as unloaded.
     clear_loaded_hook_signature(app_name)
 
-    # Clean up cron jobs owned by this app
-    permissions = manifest.get("permissions", {})
-    if permissions.get("cron"):
-        # We need the cron_service — get it from the lifecycle dispatcher
-        if _lifecycle_dispatcher and _lifecycle_dispatcher._cron_service:
-            cron_service = _lifecycle_dispatcher._cron_service
-            sdk = CronSDK(app_name, cron_service)
-            # remove_all_async removes every owned job in ONE atomic
-            # CronService.remove_jobs transaction (store-lock spin offloaded to
-            # a worker thread; timer arming owned by CronService) — all-or-
-            # nothing, never a partial removal that orphans still-enabled jobs.
-            # A contended store raises CronStoreBusy; REPORT it (rather than
-            # crash the disable or claim a false success) so the caller sees the
-            # cleanup did not complete and the app's jobs may still be enabled.
-            try:
-                removed = await sdk.remove_all_async()
-                if removed:
-                    result["cron_cleanup"] = f"removed {removed} job(s)"
-            except CronStoreUnreadable as exc:
-                # Sibling class of CronStoreBusy, so it escaped the arm below
-                # entirely and would CRASH the disable — the outcome the comment
-                # above forbids. Reported rather than retried: an unreadable store
-                # does not heal on its own.
-                logger.warning(
-                    "App %s: cron cleanup could not complete on disable — " "store unreadable: %s",
-                    app_name,
-                    exc,
-                )
-                result["cron_cleanup"] = "failed: cron store unreadable — jobs may still be enabled"
-                sel().log_api_access(
-                    caller="gateway",
-                    operation="app_crons_deregister",
-                    outcome="failed",
-                    resources=app_name,
-                    error=str(exc),
-                )
-            except CronStoreBusy as exc:
-                logger.warning(
-                    "App %s: cron cleanup could not complete on disable — " "store busy: %s",
-                    app_name,
-                    exc,
-                )
-                result["cron_cleanup"] = "failed: cron store busy — jobs may still be enabled"
-                sel().log_api_access(
-                    caller="gateway",
-                    operation="app_crons_deregister",
-                    outcome="failed",
-                    resources=app_name,
-                    error=str(exc),
-                )
+    # Clean up cron jobs owned by this app. Keyed off the running cron
+    # service, not the manifest grant -- see _cleanup_app_crons.
+    await _cleanup_app_crons(app_name, result)
 
     # Stop and drop this app's durable job runs. Keyed off the registry, not
     # the manifest grant -- see _cleanup_app_jobs for why that distinction is
@@ -788,7 +802,17 @@ async def on_gateway_startup(
                 denied,
             )
             if cron_service is not None:
-                await disarm_app_crons_for_execution(name, cron_service)
+                try:
+                    await disarm_app_crons_for_execution(name, cron_service)
+                except (CronStoreUnreadable, CronStoreBusy, OSError) as exc:
+                    # The gateway's boot reconcile already disarmed this app's
+                    # jobs, or failed on the same store and left the scheduler
+                    # unarmed. Raising here would abort the dashboard startup.
+                    logger.warning(
+                        "Startup: could not disarm crons for denied app %s (%s)",
+                        name,
+                        type(exc).__name__,
+                    )
             if _route_registry:
                 _route_registry.deregister_app_routes(name)
             # Same anti-churn record as on_app_enable's denied path: a hook-
@@ -934,11 +958,14 @@ async def on_gateway_shutdown() -> None:
     retained prior-generation orphan record stays recoverable by the next
     boot's stale-reap.
     """
-    # list_apps() walks the apps dir (two file reads per app) — off the loop.
-    installed = await asyncio.to_thread(list_apps)
-    enabled = [a for a in installed if a.get("enabled")]
-
     try:
+        # list_apps() walks the apps dir (two file reads per app) — off the
+        # loop. Inside the try: the sweep in the finally block must run even
+        # when this walk raises, or a filesystem failure during shutdown would
+        # skip stopping the backends this gateway spawned.
+        installed = await asyncio.to_thread(list_apps)
+        enabled = [a for a in installed if a.get("enabled")]
+
         if _lifecycle_dispatcher and enabled:
             invoked = await _lifecycle_dispatcher.dispatch_shutdown(enabled)
             if invoked:

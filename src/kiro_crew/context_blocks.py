@@ -48,6 +48,7 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("context_scope", r"\[CONTEXT SCOPE\]"),
     ("recovery", r"\[(?:SESSION RESUMED|REINJECTED AFTER COMPACTION)"),
     ("semantic_memory", r"\[Semantic Memory"),
+    ("task_facts", r"\[Task facts"),
     ("skill_index", r"\[Skills:\]"),
     ("lessons", r"\[Learned corrections"),
     ("episodic_memory", r"\[Episodic Memory"),
@@ -70,11 +71,41 @@ _MARKERS: Final[tuple[tuple[str, str], ...]] = (
     ("incognito", r"\[INCOGNITO SESSION\]"),
     ("temporary_session", r"\[TEMPORARY SESSION\]"),
     ("cancelled_turn", r"\[PREVIOUS TURN WAS CANCELLED"),
+    ("interrupted_turn", r"\[INTERRUPTED TURN"),
+    ("change_card_results", r"\[CHANGE CARD RESULTS"),
     (REPLY_FORMAT_LABEL, r"\[REPLY FORMAT RULES\]"),
     ("request_header", r"\[CURRENT USER REQUEST"),
 )
 
-_COMPILED: Final = tuple((label, re.compile(pat)) for label, pat in _MARKERS)
+# Every opener above is emitted by the assembly at the START of a line: each
+# block ends its own text with a newline before the next one is appended. The
+# same bracketed phrases also appear MID-LINE as prose — the agent prompt
+# (``config/prompt.md``) explains ``[RESOURCES]``, ``[Hook context:]``,
+# ``[INCOGNITO SESSION]`` and nine more to the model, in backticks — and an
+# unanchored scan took each mention for a real block start. Measured on one
+# real session: the 38,236-char agent prompt was reported as 438, and its
+# remaining 37.8K was booked to ``resource_advisory`` (12,348), ``hook_context``
+# (10,374), ``surface``, ``working_folder`` and two session modes that were
+# not even on. Anchoring to line start is what makes "the assembly emitted
+# this marker" and "the marker matched" the same statement.
+#
+# ``request_header`` is the one exception: the interactive-guidance paragraphs
+# before it end with ``)`` and no newline, so the header legitimately follows
+# them on the same line. The hyphenated form the assembly emits is scrubbed out
+# of every untrusted source before assembly; a bare ``[CURRENT USER REQUEST]``
+# is not, and can still count as a header hit here. That is a pre-existing
+# breakdown-only concern (the span the panel trusts comes from the assembly,
+# not from this scan), not a boundary-forgery one.
+#
+# The one seam whose text the assembly does not shape itself -- the caller's
+# ``request_prefix_context`` (a ``$skill`` body arrives ``.strip()``ed) -- is
+# newline-terminated by the assembly for exactly this reason.
+_LINE_START_EXEMPT: Final[frozenset[str]] = frozenset({"request_header"})
+
+_COMPILED: Final = tuple(
+    (label, re.compile(pat if label in _LINE_START_EXEMPT else r"^" + pat, re.MULTILINE))
+    for label, pat in _MARKERS
+)
 
 # Closing markers, by label. A block that has one owns only up to its OWN
 # closer; the characters between that closer and the next opening marker belong
@@ -106,12 +137,17 @@ _CLOSERS: Final[dict[str, re.Pattern[str]]] = {
         ("session_wrapper", r"\[END OF SESSION CONTEXT\]"),
         ("workspace_identity", r"\[End of workspace identity\]"),
         ("docs_pointer", r"\[END DOCUMENTATION\]"),
-        ("memory", r"\[End of memory(?: activity index)?\]"),
+        # Three memory blocks share this opener: the protected `[Memory —` read,
+        # the `[Memory activity index —` hints and the budgeted `[Memory activity
+        # —` block. Each closes with its own spelling, so one alternation covers
+        # them; a closer left out here lets that block absorb what follows it.
+        ("memory", r"\[End of memory(?: activity(?: index)?)?\]"),
         ("memory_tools", r"\[End of memory tools\]"),
         ("steering", r"\[End of steering resources\]"),
         ("thread_history", r"\[End of thread history\]"),
         ("recovery", r"\[END REINJECTED\]"),
         ("semantic_memory", r"\[End of semantic memory\]"),
+        ("task_facts", r"\[End of task facts\]"),
         ("skill_index", r"\[End of skills\]"),
         ("lessons", r"\[End of learned corrections\]"),
         ("episodic_memory", r"\[End of episodic memory\]"),
@@ -122,9 +158,9 @@ _CLOSERS: Final[dict[str, re.Pattern[str]]] = {
         ("skill_hint", r"\[End of relevant skills\]"),
         ("channel_context", r"\[END SLACK THREAD CONTEXT\]"),
         ("conversation_replay", r"\[END CONVERSATION HISTORY\]"),
-        # Two spellings reach this opener: `context.py` emits
-        # `[End of hook context]` and `chat_runner.py` emits `[End hook
-        # context]`. Both are real emit sites, so one alternation covers them
+        # Two spellings reach this opener: `context_assembly/turn_message.py` emits
+        # `[End of hook context]` and `dashboard/chat_turn/turn_dispatch_gates.py` emits
+        # `[End hook context]`. Both are real emit sites, so one alternation covers them
         # rather than picking whichever the assembly happened to use last.
         ("hook_context", r"\[End (?:of )?hook context\]"),
         ("history_prefix", r"\[End of history\]"),
@@ -133,6 +169,8 @@ _CLOSERS: Final[dict[str, re.Pattern[str]]] = {
         ("ui_language", r"\[End of UI language\]"),
         ("response_preferences", r"\[END RESPONSE PREFERENCES\]"),
         ("cancelled_turn", r"\[END PREVIOUS TURN\]"),
+        ("interrupted_turn", r"\[END INTERRUPTED TURN\]"),
+        ("change_card_results", r"\[END CHANGE CARD RESULTS\]"),
     )
 }
 
@@ -364,6 +402,31 @@ def split_blocks(
     return {label: size for label, size in out.items() if size > 0}
 
 
+def _block_domain(label: str) -> str:
+    """Group one assembled block by what the provider is being asked to do with it.
+
+    Five domains: the user's own turn is a ``request``, the two instruction
+    blocks are a ``contract``, the three replayed-turn blocks are ``replay``,
+    and the reply-format rules are a ``following_interaction``. Everything else
+    is ``background`` — that is most of ``_MARKERS``, plus the
+    ``UNCLASSIFIED_LABEL`` remainder ``split_blocks`` emits for bytes it could
+    not attribute, so a growing ``background`` share says nothing on its own
+    about which block grew.
+
+    The four named cases are mutually exclusive, so the check order is for
+    reading only and carries no precedence.
+    """
+    if label == USER_LABEL:
+        return "request"
+    if label in {"agent_instructions", "critical_rules"}:
+        return "contract"
+    if label in {"conversation_replay", "thread_history", "history_prefix"}:
+        return "replay"
+    if label == REPLY_FORMAT_LABEL:
+        return "following_interaction"
+    return "background"
+
+
 def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -> dict:
     """Exact Crew-assembled extents, not provider input or token estimates.
 
@@ -382,26 +445,78 @@ def measure_prompt(prompt: str, *, user_span: tuple[int, int], lifecycle: str) -
             label: {
                 "chars": count,
                 "bytes": byte_counts[label],
-                "domain": (
-                    "request"
-                    if label == USER_LABEL
-                    else (
-                        "contract"
-                        if label in {"agent_instructions", "critical_rules"}
-                        else (
-                            "replay"
-                            if label in {"conversation_replay", "thread_history", "history_prefix"}
-                            else (
-                                "following_interaction"
-                                if label == REPLY_FORMAT_LABEL
-                                else "background"
-                            )
-                        )
-                    )
-                ),
+                "domain": _block_domain(label),
             }
             for label, count in chars.items()
         },
         "native": "UNKNOWN",
         "external_mcp": "UNKNOWN",
     }
+
+
+_CARD_TEXT_MAX: Final = 200
+_CARD_RESULTS_MAX: Final = 12
+
+
+def _card_text(value: object) -> str:
+    """One line of card-supplied text, with every bracket marker defused."""
+    text = " ".join(str(value or "").split())
+    text = text.replace("[", "(").replace("]", ")")
+    return text if len(text) <= _CARD_TEXT_MAX else text[: _CARD_TEXT_MAX - 1] + "…"
+
+
+def render_self_change_undos(undos: list[dict]) -> str:
+    """The block telling a crewmate the user took back a change it made to itself.
+
+    Reference data for the next turn, never a request: built from the gateway's
+    own undo record (which fields went back), with no values quoted -- the
+    crewmate reads its own record from its identity block, which already shows
+    the restored name, description and face. Empty input renders nothing.
+    """
+    if not undos:
+        return ""
+    lines = [
+        "[YOUR RECORD -- the user pressed Undo on a change you made to yourself since "
+        "your last turn. Reference data, not a request from the user.]"
+    ]
+    for item in undos[:_CARD_RESULTS_MAX]:
+        fields = ", ".join(_card_text(f) for f in item.get("changed") or [])
+        lines.append(f"- your {fields or 'record'}: back to what it was before your change")
+    lines.append(
+        "Your name, description and face as they stand now are in your identity block "
+        "above; speak of those, not of the change you made."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
+def render_change_card_results(outcomes: list[dict]) -> str:
+    """The block telling a proposing agent how its change cards ended.
+
+    Reference data for the next turn, never a request: it is built from the
+    gateway's own record (kind, product-written title, status, summary) and
+    carries no secret value, since a card never holds one. Text from the card is
+    flattened to one line and its brackets defused, so a title cannot forge a
+    block boundary. Empty input renders nothing.
+    """
+    if not outcomes:
+        return ""
+    lines = [
+        "[CHANGE CARD RESULTS -- how the change cards you proposed ended since your "
+        "last turn. Reference data, not a request from the user.]"
+    ]
+    for item in outcomes[:_CARD_RESULTS_MAX]:
+        line = (
+            f"- {_card_text(item.get('kind'))} “{_card_text(item.get('title'))}”: "
+            f"{_card_text(item.get('status'))}"
+        )
+        summary = _card_text(item.get("summary"))
+        if summary:
+            line += f" — {summary}"
+        error = _card_text(item.get("error"))
+        if error and item.get("status") in ("failed", "partial"):
+            line += f" (error: {error})"
+        lines.append(line)
+    if len(outcomes) > _CARD_RESULTS_MAX:
+        lines.append(f"- … and {len(outcomes) - _CARD_RESULTS_MAX} more (get_change_status)")
+    lines.append("[END CHANGE CARD RESULTS]")
+    return "\n".join(lines) + "\n\n"

@@ -96,6 +96,25 @@ TASK_OVERRIDE_KEYS = frozenset({"cpu", "memory", "ephemeralStorage", "containerO
 #: agreement. Not offering the parameter needs no agreement.
 CONTAINER_OVERRIDE_KEYS = frozenset({"name", "environment"})
 
+#: The container variable carrying how many seconds the task may run.
+#:
+#: Derived, not accepted, and that is the whole point of it: the value has to be
+#: the SAME bound the launch-time sweep enforces, and a caller-supplied number
+#: could only disagree with it. A caller who could raise this could opt out of the
+#: bound entirely, which is the one thing a cost cap may not allow.
+TASK_TTL_ENV = "SMC_TASK_TTL_SECONDS"
+
+#: The container variable carrying the internal-only trust boundary.
+#:
+#: Derived from the lane's own ``cloud.json`` block, never accepted from a caller. It
+#: is the one derived name that LOOSENS a posture -- with it the container starts the
+#: model subprocess unsandboxed on a host with no user namespace -- so a caller who
+#: could supply it could grant that posture to a lane whose operator never claimed the
+#: boundary, which is the whole property the setting carries. It sits on the
+#: "who may reach it" limb of :data:`CLOSED_ENV`: the claim is precisely that nobody
+#: outside the operator does.
+INTERNAL_ONLY_ENV = "SMC_INTERNAL_ONLY"
+
 #: Container variables whose value this module DERIVES and writes itself. A
 #: caller cannot supply them, so a request cannot contradict the spec it was
 #: built from. ``SMC_CREW_NAME`` comes from the crew the spec's secrets name, and
@@ -103,15 +122,36 @@ CONTAINER_OVERRIDE_KEYS = frozenset({"name", "environment"})
 #: ``manifest crew_name == SMC_CREW_NAME`` check by naming both crews.
 #: ``SMC_SINGLE_PRINCIPAL`` is forced true because this backend exists for one
 #: owner; leaving it to the caller made a task that exits at startup
-#: constructible, which is not a posture worth offering.
-DERIVED_ENV: frozenset[str] = frozenset({"SMC_CREW_NAME", "SMC_SINGLE_PRINCIPAL"})
+#: constructible, which is not a posture worth offering. The task's lifetime is
+#: here because it is a cost bound: see :data:`TASK_TTL_ENV`. The trust boundary is
+#: here because it is a claim only the lane's operator can make: see
+#: :data:`INTERNAL_ONLY_ENV`.
+DERIVED_ENV: frozenset[str] = frozenset(
+    {"SMC_CREW_NAME", "SMC_SINGLE_PRINCIPAL", TASK_TTL_ENV, INTERNAL_ONLY_ENV}
+)
 
 #: Container variables this module neither writes nor accepts. Each is either a
 #: credential (so it belongs in the task definition's ``secrets`` or nowhere), or
 #: a value that would defeat something the definition already asserts:
 #: ``SMC_BUNDLE_DIR`` redirects which bundle the crew-name check reads, and
 #: ``SMC_FRONT_PORT`` moves the listener away from the declared ``portMappings``.
-REFUSED_ENV: frozenset[str] = frozenset({"SMC_BUNDLE_DIR", "SMC_FRONT_PORT"} | set(CREDENTIAL_ENV))
+#: ``SMC_FRONT_BIND`` and ``SMC_REQUIRE_AUTH_ALL_ROUTES`` are refused on one
+#: ground: each decides how the crew's listener is reached, and on this lane the
+#: task's network placement -- the operator's own subnets behind their own security
+#: groups -- has already decided who can reach the port. A caller may not override
+#: either, in either direction: a supplied bind can leave the declared
+#: ``portMappings`` answering nothing, and a supplied auth posture can only
+#: disagree with the placement this request itself asserts. A lane that needs
+#: another answer sets it on the image it builds, where its placement is known.
+REFUSED_ENV: frozenset[str] = frozenset(
+    {
+        "SMC_BUNDLE_DIR",
+        "SMC_FRONT_PORT",
+        "SMC_FRONT_BIND",
+        "SMC_REQUIRE_AUTH_ALL_ROUTES",
+    }
+    | set(CREDENTIAL_ENV)
+)
 
 #: The closed set a caller may not name. Everything outside it is the caller's:
 #: a bucket, a route prefix, a log level, whatever the deploy track passes.
@@ -222,8 +262,10 @@ def _refuse_unusable_size(size: TaskSize) -> None:
         )
 
 
-def derived_environment(binding: CrewBinding) -> dict[str, str]:
-    """The identity and trust-domain variables this module writes, not accepts.
+def derived_environment(
+    binding: CrewBinding, *, ttl_seconds: int = 0, internal_only: bool = False
+) -> dict[str, str]:
+    """The identity, trust-domain and lifetime variables this module writes, not accepts.
 
     ``SMC_CREW_NAME`` is the crew the spec's secrets name. Writing it here is what
     makes the container's own ``manifest crew_name == SMC_CREW_NAME`` refusal do
@@ -236,8 +278,27 @@ def derived_environment(binding: CrewBinding) -> dict[str, str]:
     a task that refuses to start. Enforcement belongs to the front app's startup
     check, which is where the reasoning about caller identity lives; writing the
     value here makes the unset case unconstructible rather than merely unlikely.
+
+    ``SMC_TASK_TTL_SECONDS`` is the cost bound, carried into the task so it holds
+    when nothing outside is left to enforce it. ``ttl_seconds`` of zero is written
+    as ``"0"``, which the container reads as unbounded: the variable is always
+    present so its absence never has to be told apart from a launcher that forgot
+    it, and a caller who wants no bound gets the behaviour they already have.
+
+    ``SMC_INTERNAL_ONLY`` is the lane operator's own claim, read from their
+    ``cloud.json`` block and passed down by the engine. Unlike the three above it
+    LOOSENS a posture, so it is written from the lane's configuration and refused from
+    a caller: see :data:`INTERNAL_ONLY_ENV`. It is always present, ``"0"`` or ``"1"``,
+    for the reason the lifetime is -- so a container never has to tell a launcher that
+    did not claim the boundary apart from one that forgot the variable, and the safe
+    reading is the one a missing value would have had anyway.
     """
-    return {"SMC_CREW_NAME": binding.crew, "SMC_SINGLE_PRINCIPAL": "1"}
+    return {
+        "SMC_CREW_NAME": binding.crew,
+        "SMC_SINGLE_PRINCIPAL": "1",
+        TASK_TTL_ENV: str(ttl_seconds),
+        INTERNAL_ONLY_ENV: "1" if internal_only else "0",
+    }
 
 
 def _refuse_closed_environment(environment: Mapping[str, str], delivered: Collection[str]) -> None:
@@ -323,6 +384,8 @@ def run_task_request(
     launch_tag: str,
     environment: Mapping[str, str] | None = None,
     started_by: str = "",
+    ttl_seconds: int = 0,
+    internal_only: bool = False,
 ) -> dict[str, Any]:
     """The ``RunTask`` request body for one crew task, or refuse.
 
@@ -347,10 +410,32 @@ def run_task_request(
     secrets name and written into the override, so a caller cannot contradict the
     spec by declaring a different crew or a weaker trust domain. Everything
     outside that set is passed through untouched.
+
+    ``ttl_seconds`` is how long the task may run, carried to the container as
+    :data:`TASK_TTL_ENV` so the bound travels with the task rather than living only
+    where a launch can reach it. Zero means unbounded. It belongs in the OVERRIDE
+    and not in the task definition on purpose: the definition is keyed on its
+    content, so a lifetime written there would mint a revision per distinct bound,
+    and the digest-pinned document would have to widen to hold a number that is
+    not part of what the image is.
+
+    ``internal_only`` is the lane operator's trust-boundary claim, carried to the
+    container as :data:`INTERNAL_ONLY_ENV`. It is in the OVERRIDE rather than the
+    definition for the reason ``ttl_seconds`` is: the definition is keyed on its
+    content, so a claim written there would mint a revision per posture, and a
+    digest-pinned document should not have to change shape to hold a statement about
+    who sends prompts. Defaults to ``False``, so a caller that says nothing produces a
+    task that keeps the sandboxed-only refusal.
     """
     if revision < 1:
         raise DocumentRefused(
             f"revision {revision!r} is not a task-definition revision; ECS numbers them from 1"
+        )
+    if ttl_seconds < 0:
+        raise DocumentRefused(
+            f"ttl_seconds={ttl_seconds!r} is not a lifetime. Zero means unbounded, and a "
+            "negative deadline is already past, so the task would be refused by its own "
+            "container at startup and the launch would cost a task that never worked"
         )
     _refuse_unusable_size(size)
     _refuse_empty_placement(placement)
@@ -380,7 +465,9 @@ def run_task_request(
     binding = spec_binding(taskdef)
     container_override: dict[str, Any] = {"name": CREW_CONTAINER_NAME}
     emitted = dict(environment)
-    emitted.update(derived_environment(binding))
+    emitted.update(
+        derived_environment(binding, ttl_seconds=ttl_seconds, internal_only=internal_only)
+    )
     container_override["environment"] = [
         {"name": name, "value": emitted[name]} for name in sorted(emitted)
     ]

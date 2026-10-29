@@ -25,10 +25,10 @@ Four parts, in the order you will need them:
   with launchd instead of systemd.
 - **Python**: 3.12 or newer (`setup.cfg` sets `python_requires = >=3.12`).
 - **Node.js**: needed to build the dashboard bundle. `website/package.json`
-  declares `"node": ">=22"`; `kirocrew doctor` warns below Node 22.
+  declares `"node": ">=22.12.0"`; `kirocrew doctor` fails below Node 22.12.0, and startup logs a warning.
 - **RAM**: there is no single published floor, because the footprint scales with
   concurrent sessions, spawned subagents, and MCP servers. Two figures from the
-  code give you the shape of it: `acp/runtime.py` recycles a long-lived
+  code give you the shape of it: `acp/runtime_liveness.py` recycles a long-lived
   multiplexed backend once it passes 500 MiB RSS
   (`_DEFAULT_MAX_RSS_MB = 500.0`), and the embedding model is loaded in-process
   from a ~610MB GGUF file. Measure your own steady state, then leave headroom:
@@ -107,7 +107,7 @@ cd KiroCrew
 
 # Build the frontend bundle and stage it into the package
 cd website && npm install && npm run build && cd ..
-cp -R website/dist src/kiro_crew/static/dist
+PYTHONPATH=src python3 -m kiro_crew.frontend stage .
 
 # Install the backend (ships the bundled dashboard)
 pip install .
@@ -138,7 +138,7 @@ tmux survives an SSH disconnect but does **not** auto-restart on crash or
 auto-start on reboot. Move to [a real service](#3-keep-it-alive-as-a-service)
 once the smoke test passes, and **kill the tmux session first**: only one
 gateway can own the dashboard port, which defaults to `5476`
-(`config/loader.py` `_DEFAULT_PORT`, overridable with the `KIROCREW_PORT`
+(`config/loader_credentials.py` `_DEFAULT_PORT`, overridable with the `KIROCREW_PORT`
 environment variable). Two gateways on one port means the second one fails to
 bind.
 
@@ -188,10 +188,13 @@ What matters, and where it lives:
 | Structured memory | `~/.kiro/crew/workspace/memory/` | `preferences.md`, `projects.md`, daily `history/` |
 | Vector + FTS databases | `~/.kiro/crew/memory.db`, `memory_index.db` | Semantic/episodic memory (`vector_memory.py`) and the FTS5 index (`memory.py`) |
 | Lessons | `~/.kiro/crew/memory.db`; legacy `lessons.jsonl` | Native lesson writes live in the vector store; copy a legacy JSONL separately |
-| Config | `~/.kiro/crew/config.json` | Model preferences, dashboard settings, and integration config; inspect it for legacy inline credentials before copying |
+| Workspace content | `~/.kiro/crew/workspace/knowledge/`, `kb-strategy/`, `kb-docs/`, `kiro-agents/`, `scripts/`, top-level `*.md`/`*.yaml`/`*.json` | Knowledge files, agent definitions and workspace scripts |
+| Config | `~/.kiro/crew/config.json` | Model preferences, dashboard settings, and integration config. The sync overwrites the remote copy, then patches `dashboard.url`; inspect it for legacy inline credentials before copying |
 | Skills | `~/.kiro/crew/skills/` | Custom skill definitions |
-| Webhook hooks | `~/.kiro/crew/hooks.json` | Script-hook definitions (`hooks.py` `ScriptHookStore`) |
-| Cron jobs | `~/.kiro/crew/crons.json` | Scheduled recurring jobs (`cron.py`) |
+| Tasks | `~/.kiro/crew/tasks/` | Task runner state |
+| Webhook hooks | `~/.kiro/crew/hooks.json`, `hooks/` | Script-hook definitions (`hook_runtime/script_hooks.py` `ScriptHookStore`) and their scripts |
+| Cron jobs | `~/.kiro/crew/crons.json` | Scheduled recurring jobs (`cron.py`). Once copied, the jobs run on both hosts unless you pause them on one |
+| Dashboard metadata | `~/.kiro/crew/folders.json`, `tags.json`, `tag_boards.json`, `autonudge.json` | Sidebar folders, tag vocabulary, kanban columns and auto-nudge state |
 
 > **Where lessons actually live.** Both stores exist and the vector store wins
 > when it holds anything. Current `learn` writes go through
@@ -209,7 +212,7 @@ What NOT to carry over:
 
 - `~/.kiro/crew/kiro_pids.txt`, `kiro_session_pids.txt`, and the
   `session_pid_<pid>.txt` / `.sig` sidecars: live PID tracking
-  (`session_pid.py`), meaningless on another host and actively misleading if
+  (`session_pid_tracking.py`), meaningless on another host and actively misleading if
   copied.
 - `~/.kiro/crew/security_events.jsonl`: the tamper-evident SEL audit chain
   (`sel.py`); it belongs to the host that wrote it.
@@ -261,7 +264,7 @@ ssh -fN -L 7779:localhost:7779 user@your-host.example.com   # background
 
 Pass `-C` to enable SSH transport compression. A hand-rolled tunnel gets no
 compression by default, while Kiro Crew's own tunnel manager turns it on for
-exactly this traffic (`src/kiro_crew/instances/ssh_tunnel_manager.py`): the
+exactly this traffic (`src/kiro_crew/instances/ssh_tunnel_manager_child_text.py`): the
 forwarded stream carries the dashboard SPA bundle plus all API/WS payloads,
 which are highly compressible, and the gateway does not gzip at the HTTP layer.
 
@@ -274,6 +277,13 @@ Host your-host.example.com
 
 Works on macOS, Linux, and Windows (OpenSSH ships with Windows 10+; the config
 file is at `%USERPROFILE%\.ssh\config`).
+
+A hand-rolled tunnel dies whenever the laptop sleeps. The desktop app can hold
+it for you instead: tick **Keep an SSH tunnel to this crew open** in the
+**Add/Edit Remote Crew** form the "no gateway is answering" dialog opens, or in
+**Set Remote Host…** on the app's own launch tab (where you can also turn it off
+later), and the app keeps the forward up and rebuilds it after sleep
+(macOS and Linux; see `website/electron/README.md`).
 
 If your browser reaches the dashboard on a *different* local port than the
 remote one (`ssh -L 8777:localhost:5476`), the browser sends Origin
@@ -387,6 +397,15 @@ the same and the difference is the whole security story:
   permissions cannot be silently escalated by the dashboard. If the publish is
   refused, the card and command print what Tailscale itself said rather than a
   generic failure.
+
+  The Tailscale CLI is run only from its standard install locations, and only
+  when the binary and its folder need administrator rights to change, so no
+  other program can swap in a fake one. A Homebrew install on macOS usually
+  belongs to your own account, so it is refused: the card says Tailscale is
+  installed but will not be run, and `tailnet up` and `tailnet status` name the
+  refused binary. For that setup, publish the dashboard with `tailscale serve`
+  yourself, set `dashboard.url` to the exact address your browser opens, and
+  restart Kiro Crew.
 
   `kirocrew tailnet status` shows the three things that are independently
   required — whether the setting is on, whether a MagicDNS name resolves right
@@ -503,7 +522,7 @@ service installer such as `cloudflared service install`).
 > tunnel, for the life of the session — up to 20 hours per access cookie, and
 > indefinitely if the browser keeps rotating its refresh cookie. For the same
 > reason the audit trail records the caller as `127.0.0.1` rather than a client
-> address. Security Posture → Dashboard token auth reports which of the two states
+> address. **Settings → Security → Live Security Posture → Dashboard Token Auth** reports which of the two states
 > you are actually in. The one exception is `tailscale serve` **with
 > `trust_identity` configured** (see above): there the pin binds to the
 > daemon-verified peer identity and is per-client again. For cloudflared, ngrok,
@@ -527,10 +546,65 @@ service installer such as `cloudflared service install`).
 > unchanged. **To cut off remote access entirely, also revoke at the provider's
 > auth layer or tear the tunnel down** — logout ends Kiro Crew's sessions, not
 > the tunnel itself.
-> Note also that config-write and secret-reveal endpoints refuse tunnelled requests:
-> `is_direct_local_request()` treats any request carrying `Forwarded` /
-> `X-Forwarded-*` / `X-Real-IP` as remote, and every standard tunnel and reverse
-> proxy attaches those.
+> Note also that config-write and secret-reveal endpoints refuse requests that
+> carry forwarding headers: `is_direct_local_request()` treats any request
+> carrying `Forwarded` / `X-Forwarded-*` / `X-Real-IP` as remote, and cloudflared,
+> ngrok, `tailscale serve` and standard reverse proxies attach those. An SSH `-L`
+> forward or a socat relay adds no such header, so it looks local and is not
+> refused.
+
+### Behind a reverse proxy
+
+Your own nginx, Caddy or similar works the same way as a tunnel: it terminates
+TLS on a public name and forwards to the loopback port.
+
+1. Serve the whole dashboard (page, API and WebSocket) from one host name, at
+   the root path. The dashboard's Content-Security-Policy admits `'self'` for
+   `connect-src`, so the browser accepts `wss://<that name>` sockets. It admits
+   no other public host, and no setting adds one. A split setup, with the
+   socket on a second host, is refused by the browser.
+2. Set `dashboard.url` to that public URL, as shown above, and restart. This
+   adds the origin to the allowed-origin set, so the CSRF check, the
+   WebSocket handshake and the DNS-rebinding `Host` barrier accept it.
+3. Pass these headers to the gateway:
+   - `Host`: the public name (or `localhost:<port>`). Any other value is
+     refused by the `Host` barrier.
+   - `X-Forwarded-Proto: https`. Without it the auth cookie is set without
+     `Secure`, and mobile browsers drop it from the `wss://` upgrade.
+   - `Upgrade` and `Connection`, so WebSocket upgrades pass through.
+
+nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name kirocrew.example.com;
+    # ssl_certificate / ssl_certificate_key ...
+
+    location / {
+        proxy_pass http://127.0.0.1:5476;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1h;
+        proxy_buffering off;
+    }
+}
+```
+
+Caddy forwards `Host`, `X-Forwarded-Proto` and WebSocket upgrades by default:
+
+```
+kirocrew.example.com {
+    reverse_proxy 127.0.0.1:5476
+}
+```
+
+The public-internet notes above apply here too: put an auth layer in front of
+the proxy, and change settings over SSH, since proxied requests stay
+read-only.
 
 ### Getting a link on your phone
 
@@ -551,7 +625,7 @@ desktop-style command menu first.
 ### Session duration
 
 Three clocks. The first two are signed into the access token payload
-(`dashboard/token_auth.py`), the third into the refresh cookie
+(`dashboard/token_auth_tokens.py`), the third into the refresh cookie
 (`dashboard/refresh_tokens.py`):
 
 | Clock | Value | What it governs |
@@ -579,7 +653,7 @@ expiry**: open the dashboard at least once a month and you need never mint
 another link.
 
 The access-session numbers still govern the initial mint. The chat-command
-default is 1 hour (`ttl = 3600` in `slack/events.py` and `slack/handler.py`);
+default is 1 hour (`ttl = 3600` in `slack/events_slash.py` and `slack/handler_runtime/commands.py`);
 pass a duration to raise it (`/kirocrew dashboard 6h`,
 `/kirocrew dashboard 20h`). `parse_duration` accepts `<N>h` or `<N>m` and clamps
 to the 20-hour ceiling, so asking for more silently gets you 20 hours rather than
@@ -628,7 +702,9 @@ the device binding above — so they survive a gateway restart. On a gateway old
 The dashboard ships a web app manifest
 ([`website/public/manifest.json`](../../website/public/manifest.json)) and
 registers a service worker, so a phone can install it to the home screen and
-launch it without browser chrome. Nothing needs enabling.
+launch it without browser chrome. Nothing needs enabling. The manifest link sets
+`crossorigin="use-credentials"`, so the manifest fetch carries cookies and the
+install also works behind a cookie-gated tunnel or auth proxy.
 
 **HTTPS is what the service worker needs** — the install itself is looser.
 Service workers only register in a secure context, so over a plain
@@ -647,22 +723,36 @@ Safari's address bar.
 
 **The service worker provides a limited offline shell.**
 [`website/public/sw.js`](../../website/public/sw.js) caches exactly `/` and
-`/index.html`. Every other same-origin `GET` is either passed straight to the
-browser or handled network-first; no other response is cached:
+`/index.html`. Every other same-origin `GET` falls into one of two buckets: a
+small set of **boot-critical assets** the worker takes over only so a transient
+`5xx` can be retried (never cached — the HTTP immutable cache still owns them),
+and the paths it **declines** and hands straight to the network. Only the shell is
+ever cached.
 
-| Path | Service-worker behavior |
+Retried (intercepted so one transient `5xx` cannot dead-page the boot):
+
+| Path | Why it earns a retry |
 |---|---|
-| `/api`, `/sandbox-doc/`, `/apps/` | Declines to intercept API, one-shot document, and app-backend responses |
-| `/assets/`, `/vendor/` | Retries network errors and 5xx responses twice with jitter, but never caches the response |
-| `/fonts/`, `/sprites/` | Declines to intercept non-critical static resources |
-| `/logo.png`, `/static/` | Declines to intercept gateway-served brand assets |
+| `/assets/` | Vite content-hashed bundles a document cannot boot without; one 502 leaves a dark skeleton no reload clears |
+| `/vendor/` | Bare-specifier module stubs the import map depends on; boot-critical on standalone app-window documents |
+| `/pcm-worklet.js` | The dictation/STT worklet, fetched once by `addModule` with no retry of its own; the fetch handler routes it through `fetchAssetWithRetry`, giving it the same bounded retry as `/assets/` and `/vendor/` so one transient `5xx` cannot reject `addModule`, and the response is never cached |
 
-Every other same-origin `GET` is network-first, with the cached shell used only
-for failed navigation requests. So offline you get the shell and its reconnecting
-state — and only while the browser's own HTTP cache still holds the hashed
-`/assets/` bundles, which the worker never caches. After a build that changes
-those hashes, the cached shell references bundle URLs nothing has downloaded yet.
-Sessions, history, and notifications are never served from disk.
+Declined (handed straight to the network, never intercepted):
+
+| Path | Why it is not intercepted |
+|---|---|
+| any URL with a `token` query parameter (the `/?token=...` sign-in link) | Never answers from the cached shell and never caches it, so the gateway's token exchange always runs |
+| `/api`, `/apps/` | Gateway and app-backend responses must never be served stale |
+| `/fonts/`, `/sprites/` | Cost looks, not boot — a failed font or sprite does not stop the page running, so it earns no retry |
+| `/logo.png`, `/static/` | Gateway-served brand assets; intercepting them strands a broken image across a gateway restart |
+| `/sandbox-doc/`, `/app-windows/`, navigations into a widget frame | One-shot credentialed URLs, standalone app-window documents, and the shell fallback must not render into a widget frame |
+
+Everything not listed above is intercepted network-first, but only the shell is
+ever cached. So offline you get the shell and its reconnecting state — and only
+while the browser's own HTTP cache still holds the hashed `/assets/` bundles, which
+the worker never caches. After a build that changes those hashes, the cached shell
+references bundle URLs nothing has downloaded yet. Sessions, history, and
+notifications are never served from disk.
 
 **Two current limits**, documented here so they read as boundaries rather than
 bugs:
@@ -727,7 +817,7 @@ curl -s http://localhost:5476/api/health     # {"ok": true, ...}
 Manage it:
 
 ```bash
-tail -f /tmp/kirocrew-tunnel.log
+tail -f /tmp/kirocrew-tunnel.log /tmp/kirocrew-tunnel.err   # ssh writes connection errors to .err
 launchctl kickstart -k gui/$(id -u)/com.kirocrew.tunnel                            # restart
 launchctl bootout gui/$(id -u)/com.kirocrew.tunnel                                 # stop
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.kirocrew.tunnel.plist  # start
@@ -775,6 +865,28 @@ fi
 open "$URL"
 ```
 
+### Behind a reverse proxy at a sub-path
+
+The stock dashboard expects to sit at the root of its origin. To serve it under
+a prefix such as `https://gateway.example.com/proxy/kirocrew/`, build the
+frontend for that prefix:
+
+```bash
+cd website
+KIROCREW_BASE_PATH=/proxy/kirocrew npm run build
+cd .. && PYTHONPATH=src python -m kiro_crew.frontend stage .
+```
+
+`KIROCREW_BASE_PATH` is read only at build time. It becomes the prefix of every
+asset URL, the router base, and the path of the dashboard's own API, stream and
+WebSocket calls. The gateway serves the built page unchanged and does not read
+the variable, so a sub-path deployment is its own build. Unset, or `/`, builds
+the stock root dashboard. A value with a scheme, a host, a query, or a `.`/`..`
+segment stops the build.
+
+The proxy strips the prefix before forwarding, relays cookies, and rewrites
+`Location` headers on redirects. It no longer needs to rewrite the JavaScript.
+
 ---
 
 ## 3. Keep it alive as a service
@@ -809,6 +921,13 @@ gateway runs as `User=$USER Group=$(id -gn)`, not root. The unit also caps
 crash-looping with `StartLimitBurst=3` / `StartLimitIntervalSec=300` and pins
 `LimitNOFILE=65536`, because a stock 1024 FD limit fails the frontend
 production build with `EMFILE`.
+
+The install also seeds `/etc/kirocrew/kirocrew.env`, which the unit reads as its
+`EnvironmentFile=`, so a port or environment change needs no reinstall (see
+[Setting the service port](install.md#setting-the-service-port)). On an
+SELinux-enforcing host whose kirocrew lives under `$HOME`, the install refuses
+before writing anything and prints a per-user unit to use instead (see
+[SELinux-enforcing hosts](install.md#selinux-enforcing-hosts-with-kirocrew-under-home)).
 
 **Why system-level rather than `systemctl --user`:** older distros (systemd 219
 era) have no working per-user manager, and `systemctl --user` there fails with
@@ -961,7 +1080,7 @@ servers and tool calls fail with ENOENT.
 | Link opens to "token expired" | The presigned URL must be opened within 5 minutes. Request a fresh link |
 | Session drops sooner than you expect | You should be refreshed silently for 30 sliding days. If you are re-minting every ~20 hours instead, the refresh cookie is not reaching `/api/auth/refresh` — confirm the browser is sending an `mc_refresh_<port>` cookie whose port suffix matches the port the gateway resolved for the request, and check the browser console for `[refresh]` warnings. Raising the initial mint (`/kirocrew dashboard 20h`) only widens the access cookie; it does not repair a broken refresh |
 | Phone cannot reach the tunnel URL | Verify the tunnel process is running and connected on the gateway host |
-| Settings will not save over the tunnel | By design. Config-write and secret-reveal endpoints require a direct-local request, and forwarding headers mark a tunnelled request as remote. Change these over an SSH session on the host |
+| Settings will not save over the tunnel | By design. Config-write and secret-reveal endpoints require a direct-local request, and the forwarding headers a tunnel or reverse proxy adds mark the request as remote. Change these over an SSH session on the host, or through an `ssh -L` forward, which adds no forwarding header |
 | "Embeddings not ready" in the dashboard | The ~610MB model downloads in the background over HTTPS on gateway start. `kirocrew doctor` probes the resolved URL; set `KIROCREW_EMBED_MODEL_URL` for a mirror. Memory falls back to keyword search until it lands, and the agent keeps working |
 
 ## See also

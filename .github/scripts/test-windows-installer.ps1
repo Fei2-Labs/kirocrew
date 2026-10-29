@@ -11,8 +11,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
-$MaxInstallSeconds = 120
-$MaxGatewayReadySeconds = 30
+# A performance ceiling, deliberately tighter than the 300 s release smoke in
+# scripts/smoke-windows-install.ps1. 45 green main runs (2026-10-03..04) installed
+# in 39-98 s, median 60 s; 200 s is about twice the slowest, so a slow hosted
+# runner alone does not fail it while a real installer slowdown still does.
+$MaxInstallSeconds = 200
+# Healthy boot on the runner is ~12-24 s (observed 2026-09-29). /api/ready does not await
+# the Kiro CLI probe, but a tolerated probe timeout (_PROBE_TIMEOUT_SECS = 10 s in
+# src/kiro_crew/kiro_prerequisite.py) still slowed one boot from 12.8 s to 30.1 s on the
+# same sha (issue #11810). 24 s plus that ~17 s is ~41 s, rounded up to 50.
+$MaxGatewayReadySeconds = 50
 
 # `Stop-GatewayTree`, shared with `scripts/smoke-windows-install.ps1`. Both boot a
 # gateway out of an installed tree and then uninstall it, so the teardown that makes
@@ -34,17 +42,49 @@ public static class KiroInstallerCapture {
     public int Bottom;
   }
 
-  [DllImport("user32.dll")]
+  [DllImport("user32.dll", SetLastError = true)]
   public static extern bool GetWindowRect(IntPtr handle, out Rect rect);
+
+  [DllImport("user32.dll")]
+  public static extern bool IsWindow(IntPtr handle);
+
+  [DllImport("user32.dll")]
+  public static extern bool IsWindowVisible(IntPtr handle);
+
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetDlgItem(IntPtr dialog, int id);
 }
 "@
+
+# The NSIS wizard's Cancel button (IDCANCEL), a direct child of the wizard
+# window; installer.nsh reaches the same control as `GetDlgItem $HWNDPARENT 2`.
+$NsisWizardCancelId = 2
+
+# Whether a handle is the NSIS wizard rather than the short-lived window NSIS
+# shows before it. When the CRC pass over the exe takes longer than a second,
+# NSIS shows an unowned "Verifying installer: N%" dialog (IDD_VERIFY, a single
+# static text control) and destroys it once the pass ends. Process.MainWindowHandle
+# reports that dialog as the main window while it exists, so a capture that takes
+# the first non-zero handle can be handed a window that is already gone.
+function Test-InstallerWizardWindow {
+  param([IntPtr]$Handle)
+
+  if ($Handle -eq [IntPtr]::Zero) {
+    return $false
+  }
+  if (-not [KiroInstallerCapture]::IsWindowVisible($Handle)) {
+    return $false
+  }
+  return [KiroInstallerCapture]::GetDlgItem($Handle, $NsisWizardCancelId) -ne [IntPtr]::Zero
+}
 
 function Save-InstallerWindow {
   param([IntPtr]$Handle, [string]$Path)
 
   $rect = New-Object KiroInstallerCapture+Rect
   if (-not [KiroInstallerCapture]::GetWindowRect($Handle, [ref]$rect)) {
-    throw "Could not read the native installer bounds."
+    $win32Error = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    throw "Could not read the native installer bounds (Win32 error $win32Error)."
   }
   $width = $rect.Right - $rect.Left
   $height = $rect.Bottom - $rect.Top
@@ -176,15 +216,25 @@ function Assert-PreExistingTreeIntact {
 # is closed before installation and is outside the performance measurement.
 $preview = Start-Process -FilePath $installer.FullName -PassThru
 $previewDeadline = [DateTime]::UtcNow.AddSeconds(30)
+$wizardHandle = [IntPtr]::Zero
 do {
   Start-Sleep -Milliseconds 250
   $preview.Refresh()
-} while (-not $preview.HasExited -and $preview.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $previewDeadline)
-if ($preview.HasExited -or $preview.MainWindowHandle -eq 0) {
+  if (-not $preview.HasExited -and (Test-InstallerWizardWindow $preview.MainWindowHandle)) {
+    $wizardHandle = $preview.MainWindowHandle
+  }
+} while (-not $preview.HasExited -and $wizardHandle -eq [IntPtr]::Zero -and [DateTime]::UtcNow -lt $previewDeadline)
+if ($preview.HasExited -or $wizardHandle -eq [IntPtr]::Zero) {
   throw "The native installer did not show its install-mode page."
 }
+# Let the page's fade-in finish, then confirm the wizard is still the window
+# being captured: it is created once and lives until the installer exits, so a
+# handle that no longer names a window here is a real failure, not a race.
 Start-Sleep -Milliseconds 750
-Save-InstallerWindow $preview.MainWindowHandle (Join-Path $evidence "native-install-mode.png")
+if (-not [KiroInstallerCapture]::IsWindow($wizardHandle)) {
+  throw "The native installer closed its install-mode page before it could be captured."
+}
+Save-InstallerWindow $wizardHandle (Join-Path $evidence "native-install-mode.png")
 Stop-Process -Id $preview.Id -Force
 $preview.WaitForExit()
 
@@ -337,7 +387,7 @@ try {
   # Marks this as a test rig. It grants no launch privilege: the shim above is
   # exec'd by the ordinary in-place path like any other runnable file.
   $env:KIROCREW_FAKE_ACP_TEST_MODE = "1"
-  # Embeddings are default-on; a ~610MB download inside a 30-second readiness
+  # Embeddings are default-on; a ~610MB download inside a 50-second readiness
   # ceiling would fail the gate for a reason unrelated to the artifact.
   $env:KIROCREW_SKIP_MODEL_DOWNLOAD = "1"
   # Bytecode this boot compiles goes OUTSIDE the installed tree, which is what the
@@ -356,7 +406,7 @@ try {
   $env:PYTHONUTF8 = "1"
   $env:PYTHONIOENCODING = "utf-8:backslashreplace"
   $gatewayProcess = Start-Process -FilePath $bundledPython -ArgumentList @(
-    "-s", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
+    "-s", "-P", "-m", "kiro_crew", "gateway", "--no-open", "--port", "$gatewayPort"
   ) -WorkingDirectory $installLocation -RedirectStandardOutput $gatewayStdout `
     -RedirectStandardError $gatewayStderr -WindowStyle Hidden -PassThru
 
@@ -406,12 +456,147 @@ if (-not $gatewayReady) {
   Get-Content -LiteralPath $gatewayStdout -Tail 30 -ErrorAction SilentlyContinue
   Write-Host "Gateway stderr tail:"
   Get-Content -LiteralPath $gatewayStderr -Tail 30 -ErrorAction SilentlyContinue
-  throw "Installed gateway was not ready within $MaxGatewayReadySeconds seconds."
+  $probeTimedOut = [bool](Select-String -LiteralPath $gatewayStderr -Pattern 'probe timed out' `
+    -SimpleMatch -Quiet -ErrorAction SilentlyContinue)
+  throw "Installed gateway was not ready within $MaxGatewayReadySeconds seconds (Kiro CLI probe timed out: $probeTimedOut)."
 }
 Write-Host "Installed gateway became ready in $gatewayElapsed seconds ($startupPycCount pycs)."
 if ($env:GITHUB_STEP_SUMMARY) {
   Add-Content -Path $env:GITHUB_STEP_SUMMARY `
     -Value "Windows installed gateway ready: **$gatewayElapsed seconds** (ceiling: $MaxGatewayReadySeconds seconds)."
+}
+
+# The commands Settings shows for a file-only setting must run AS PASTED in each shell
+# a Windows user has, against the INSTALLED launcher. Three things are proved here, none
+# of them by a unit test: the gateway's own resolver names the bundle's `.cmd` shim, the
+# production formatter turns that launcher into prefixes with the right quoting, and
+# Windows PowerShell 5.1, PowerShell 7 and cmd.exe each deliver a padded Unicode token to
+# the CLI as ONE argument (5.1 drops a separate empty argument before a `.cmd` shim, which
+# is why the value rides attached as `--value-base64=<token>`).
+$expectedLauncher = Join-Path $installLocation "resources\backend-dist\kirocrew-backend\bin\kirocrew.cmd"
+if (-not (Test-Path -LiteralPath $expectedLauncher -PathType Leaf)) {
+  throw "The installed kirocrew launcher is missing: $expectedLauncher"
+}
+foreach ($shellName in @("powershell.exe", "pwsh.exe")) {
+  if (-not (Get-Command $shellName -CommandType Application -ErrorAction SilentlyContinue)) {
+    throw "$shellName is not available; the config-set proof needs Windows PowerShell 5.1 and PowerShell 7."
+  }
+}
+$windowsPowerShellMajor = (& powershell.exe -NoProfile -Command '$PSVersionTable.PSVersion.Major' | Select-Object -Last 1).Trim()
+if ($windowsPowerShellMajor -ne "5") {
+  throw "powershell.exe reported major version $windowsPowerShellMajor; the proof needs Windows PowerShell 5.1."
+}
+
+$savedConfigProofEnv = @{
+  KIROCREW_HOME = $env:KIROCREW_HOME
+  PYTHONNOUSERSITE = $env:PYTHONNOUSERSITE
+  PYTHONUTF8 = $env:PYTHONUTF8
+  PYTHONPYCACHEPREFIX = $env:PYTHONPYCACHEPREFIX
+}
+$cmdDriver = Join-Path $gatewayHome "config-set-proof.cmd"
+try {
+  $env:KIROCREW_HOME = $gatewayHome
+  $env:PYTHONNOUSERSITE = "1"
+  $env:PYTHONUTF8 = "1"
+  $env:PYTHONPYCACHEPREFIX = Join-Path $gatewayHome "pycache"
+
+  # Ask the gateway's resolver, from the bundled interpreter, which launcher it hands out.
+  $resolverCode = "from kiro_crew.agent import _resolve_kirocrew_bin; print(_resolve_kirocrew_bin())"
+  $resolvedLauncher = (& $bundledPython -s -P -c $resolverCode | Select-Object -Last 1).Trim()
+  if ($LASTEXITCODE -ne 0) {
+    throw "The bundled launcher resolver exited with code $LASTEXITCODE."
+  }
+  if ($resolvedLauncher -ine $expectedLauncher) {
+    throw "The gateway resolves the launcher '$resolvedLauncher'; expected the bundled shim '$expectedLauncher'."
+  }
+
+  # Feed that same resolved value to the production formatter.
+  $helperCode = "import json, sys; from kiro_crew.kiro_prerequisite_status import config_set_hints_for_launcher as hints; print(json.dumps(hints(sys.argv[1], sys.argv[2])))"
+  $hintJson = (& $bundledPython -s -P -c $helperCode $resolvedLauncher win32 | Select-Object -Last 1)
+  if ($LASTEXITCODE -ne 0) {
+    throw "The config-set hint formatter exited with code $LASTEXITCODE."
+  }
+  $hints = $hintJson | ConvertFrom-Json
+  if ($hints.version -ne 1 -or $hints.encoding -ne "utf-8-base64") {
+    throw "Unexpected config-set hint envelope: $hintJson"
+  }
+  $shellRows = @($hints.shells)
+  if ($shellRows.Count -ne 2 -or $shellRows[0].id -ne "powershell" -or $shellRows[1].id -ne "cmd") {
+    throw "Expected the powershell and cmd rows in order; got: $hintJson"
+  }
+  $powershellPrefix = $shellRows[0].prefix
+  $cmdPrefix = $shellRows[1].prefix
+  $expectedPowershellPrefix = "& '" + $expectedLauncher.Replace("'", "''") + "'"
+  $expectedCmdPrefix = '"' + $expectedLauncher + '"'
+  if ($powershellPrefix -cne $expectedPowershellPrefix) {
+    throw "PowerShell prefix was '$powershellPrefix'; expected '$expectedPowershellPrefix'."
+  }
+  if ($cmdPrefix -cne $expectedCmdPrefix) {
+    throw "cmd prefix was '$cmdPrefix'; expected '$expectedCmdPrefix'."
+  }
+
+  # `["C:/my skills/a&b's/é"]`: a space, an ampersand, an apostrophe and a non-ASCII letter,
+  # padded with `==`. The accent is built from its code point so this file's encoding
+  # cannot change what is being proved.
+  $token = "WyJDOi9teSBza2lsbHMvYSZiJ3Mvw6kiXQ=="
+  $expectedPath = "C:/my skills/a&b's/" + [char]0x00E9
+  $configFile = Join-Path $gatewayHome "config.json"
+
+  function Reset-ExtraPaths {
+    # Directly through the bundled CLI, before EACH shell: a value left by an earlier
+    # shell must not let a later, broken shell look green.
+    & $bundledPython -s -P -m kiro_crew config set skills.extra_paths --value-base64=W10= | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "Resetting skills.extra_paths exited with code $LASTEXITCODE."
+    }
+    $afterReset = @((Get-Content -LiteralPath $configFile -Raw -Encoding utf8 | ConvertFrom-Json).skills.extra_paths)
+    if ($afterReset.Count -ne 0) {
+      throw "skills.extra_paths was not empty after the reset: $($afterReset -join ', ')"
+    }
+  }
+
+  function Assert-ExtraPathsPersisted {
+    param([string]$Shell, [int]$ExitCode)
+
+    if ($ExitCode -ne 0) {
+      throw "The $Shell command exited with code $ExitCode."
+    }
+    $stored = @((Get-Content -LiteralPath $configFile -Raw -Encoding utf8 | ConvertFrom-Json).skills.extra_paths)
+    if ($stored.Count -ne 1 -or $stored[0] -cne $expectedPath) {
+      throw "$Shell persisted skills.extra_paths = [$($stored -join ' | ')]; expected exactly [$expectedPath]."
+    }
+  }
+
+  $setCommand = "config set skills.extra_paths --value-base64=$token"
+
+  Reset-ExtraPaths
+  & powershell.exe -NoProfile -Command "$powershellPrefix $setCommand" | Out-Null
+  Assert-ExtraPathsPersisted "Windows PowerShell 5.1" $LASTEXITCODE
+
+  Reset-ExtraPaths
+  & pwsh.exe -NoProfile -Command "$powershellPrefix $setCommand" | Out-Null
+  Assert-ExtraPathsPersisted "PowerShell 7" $LASTEXITCODE
+
+  Reset-ExtraPaths
+  # `call`: a batch file that runs another one without it never comes back.
+  Set-Content -Encoding ascii -LiteralPath $cmdDriver -Value @(
+    "@echo off",
+    "call $cmdPrefix $setCommand",
+    "exit /b %ERRORLEVEL%"
+  )
+  $cmdRun = Start-Process -FilePath "cmd.exe" -ArgumentList "/s /c `"`"$cmdDriver`"`"" `
+    -Wait -PassThru -NoNewWindow
+  Assert-ExtraPathsPersisted "cmd.exe" $cmdRun.ExitCode
+  Write-Host "Config-set commands persisted the padded Unicode list from Windows PowerShell 5.1, PowerShell 7 and cmd.exe."
+} finally {
+  Remove-Item -LiteralPath $cmdDriver -Force -ErrorAction SilentlyContinue
+  foreach ($name in $savedConfigProofEnv.Keys) {
+    if ($null -eq $savedConfigProofEnv[$name]) {
+      Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    } else {
+      Set-Item -Path "Env:$name" -Value $savedConfigProofEnv[$name]
+    }
+  }
 }
 }
 
@@ -431,6 +616,16 @@ if ($uninstallProcess.ExitCode -ne 0) {
   throw "Silent uninstall exited with code $($uninstallProcess.ExitCode)."
 }
 
+# An NSIS uninstaller started without `_?=` copies itself to %TEMP% (Au_.exe /
+# Un_A.exe) and relaunches, so the process waited on above can exit while the
+# real uninstall is still running. Wait for that relaunched copy too (bounded at
+# 120 s), so the 30 s registration poll starts when the uninstall is done. A copy
+# that never exits still ends in the named failure below.
+$relaunchDeadline = [DateTime]::UtcNow.AddSeconds(120)
+while ([DateTime]::UtcNow -lt $relaunchDeadline -and @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^(Au_|Un_A)$' }).Count -ne 0) {
+  Start-Sleep -Milliseconds 250
+}
 $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(30)
 do {
   $remainingRegistrations = @(Find-InstallerRegistrations $expectedDisplayName)
@@ -442,7 +637,7 @@ do {
   [DateTime]::UtcNow -lt $uninstallDeadline
 )
 if ($remainingRegistrations.Count -ne 0) {
-  throw "Silent uninstall left a $productName registration behind."
+  throw "Silent uninstall left a $productName registration behind: $(($remainingRegistrations | ForEach-Object { $_.PSPath }) -join '; ')"
 }
 if (Test-Path -LiteralPath $installLocation) {
   # NAME the residue. "The directory is still there" is not actionable: the

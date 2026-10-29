@@ -18,20 +18,28 @@ import multiprocessing
 import os
 import shutil
 import time
+from pathlib import Path
 
 import pytest
 from crew_log_type_helpers import minimal_data
+from off_loop_helpers import off_loop
 
 from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog, store
 from kiro_crew.crew_log.lease import LEASE_FILE
 from kiro_crew.session_ledger import _store_name
+from kiro_crew.testing.wait import wait_until
 
 SESSION = "s-retain"
 CREW = "qa"
 DAY_MS = 86_400_000
 #: The teardown marker, spelled here so a planted line matches what the sweep reads.
 _CLOSED = "session/closed"
+#: How long ``emit.flush`` may take to drain the writer. A lost-run bound, not the
+#: barrier: ``flush`` returns the moment the writer is quiet, so a passing run never
+#: waits it out. A unit's first append also creates the unit, and on a loaded Windows
+#: runner that drain takes longer than 5 s.
+_EMIT_DRAIN_SECS = 30.0
 
 
 def _opened(*, resumed: bool) -> dict:
@@ -351,7 +359,7 @@ def test_remove_unit_never_follows_a_unit_directory_linked_to_another_unit():
     except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
         pytest.skip("symlinks unavailable")
 
-    assert _remove("s-attacker") == store.REMOVE_ABSENT
+    assert _remove("s-attacker") == store.REMOVE_LINKED
     assert (victim_dir / "log.jsonl").exists()
     assert CrewLog.exists(lg.KIND_SESSION, "s-victim")
 
@@ -369,7 +377,7 @@ def test_a_unit_directory_linked_outside_the_root_is_refused_by_containment(tmp_
     except (OSError, NotImplementedError):  # pragma: no cover - platform without symlinks
         pytest.skip("symlinks unavailable")
 
-    assert _remove("s-outside") == store.REMOVE_ABSENT
+    assert _remove("s-outside") == store.REMOVE_LINKED
     assert (elsewhere / "keep.txt").read_text(encoding="utf-8") == "intact"
 
 
@@ -400,7 +408,7 @@ def test_a_linked_unit_directory_never_causes_the_target_to_be_removed():
 
     assert store.sweep_expired(30) == (0, 0)
     assert (stash / "log.jsonl").exists()
-    assert _remove("s-hidden") == store.REMOVE_ABSENT
+    assert _remove("s-hidden") == store.REMOVE_LINKED
     assert (stash / "log.jsonl").exists()
 
 
@@ -913,14 +921,22 @@ def test_a_partial_removal_keeps_lineage_whose_opening_record_still_reads(monkey
     the opening entry in it -- readable, and dropping the edge then would lose a valid
     citation until the process re-seeds. The disk is asked rather than assumed, so this
     pins the answer for the case where it still yields a record.
+
+    The citation is only the FIRST segment's contribution. A decision is appended later, so
+    the segments this pass did take can be the ones holding it -- which is why a record
+    surviving intact still owes a re-read of the decision.
     """
     from kiro_crew.crew_log import session_tree
     from kiro_crew.crew_log import session_tree_projection as stp
 
     forgotten: list[str] = []
     retracted: list[str] = []
+    reconciled: list[tuple[str, str]] = []
     monkeypatch.setattr(stp, "forget_unit", lambda sid: forgotten.append(sid))
     monkeypatch.setattr(stp, "retract_unit_parent", lambda sid: retracted.append(sid))
+    monkeypatch.setattr(
+        stp, "reconcile_unit_edge", lambda sid, slot: reconciled.append((sid, slot))
+    )
 
     log = _closed_session()
     del log
@@ -947,6 +963,9 @@ def test_a_partial_removal_keeps_lineage_whose_opening_record_still_reads(monkey
     assert _remove() == store.REMOVE_FAILED
     assert forgotten == [], "a still-readable opening record was forgotten"
     assert retracted == [], "a citation the log still carries was retracted"
+    assert reconciled == [
+        (SESSION, "slot-a")
+    ], "a surviving record's DECISION was never re-read from the segments that are left"
 
 
 def test_a_partial_removal_downgrades_to_parentless_when_the_creating_segment_went(
@@ -1063,7 +1082,7 @@ def _provider_factory_reporting(session_id: str):
         provider.context_usage_pct = lambda: 0.0
         provider.context_window_tokens = lambda: 0
         provider.has_active_turn = lambda: False
-        provider.runtime_info = lambda: (None, None)
+        provider.runtime_abort_target = lambda: None
         provider.session_id = session_id
         return provider
 
@@ -1084,8 +1103,38 @@ def _newest_lifecycle_type(unit_id: str) -> str:
     return newest
 
 
+@pytest.fixture
+def drained_emitter(monkeypatch):
+    """The live crew-log emitter for a test that drives a real ``SessionManager``.
+
+    Fresh writer caches and a fresh session tree on the way in. On the way out the
+    writer is drained and retired, and the session tree's debounced checkpoint is
+    cancelled and waited out. Every lifecycle entry that lands arms that checkpoint
+    on the shared maintenance pool, where its worker sleeps out the debounce; left
+    alone, it outlives the test and runs during the next one.
+    """
+    from kiro_crew.crew_log import emit
+    from kiro_crew.crew_log import session_tree_projection as stp
+
+    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+    emit.reset_caches()
+    stp.reset_for_tests()
+    try:
+        yield
+    finally:
+        emit.flush(timeout=_EMIT_DRAIN_SECS)
+        emit.reset_caches()
+        tree = stp.projection()
+        stp.reset_for_tests()
+        wait_until(
+            lambda: not tree._write_scheduled,
+            describe=lambda: "the session tree's debounced checkpoint is still sleeping",
+        )
+
+
 @pytest.mark.asyncio
-async def test_destroying_a_session_records_the_teardown_in_its_log(monkeypatch):
+@pytest.mark.usefixtures("drained_emitter")
+async def test_destroying_a_session_records_the_teardown_in_its_log():
     """Without this entry NEITHER half of retention can ever collect the unit.
 
     The emitter holds a destroyed session's cached handle, and the write lease
@@ -1104,30 +1153,26 @@ async def test_destroying_a_session_records_the_teardown_in_its_log(monkeypatch)
     from kiro_crew.crew_log import emit
     from kiro_crew.session import SessionManager
 
-    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
-    emit.reset_caches()
-    try:
-        cfg = KiroCrewConfig()
-        cfg.session.timeout_secs = 2
-        manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-torn-down"))
-        await manager.get_or_create("thread-doomed")
+    cfg = KiroCrewConfig()
+    cfg.session.timeout_secs = 2
+    manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-torn-down"))
+    await manager.get_or_create("thread-doomed")
 
-        emit.on_session_opened("acp-torn-down", agent="kirocrew", slot="thread-doomed")
-        assert emit.flush(timeout=5.0)
-        assert _newest_lifecycle_type("acp-torn-down") == "session/opened"
+    emit.on_session_opened("acp-torn-down", agent="kirocrew", slot="thread-doomed")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
+    assert _newest_lifecycle_type("acp-torn-down") == "session/opened"
 
-        # ``SessionManager.destroy`` returns None -- it awaits the lifecycle's own
-        # destroy and discards its bool -- so the effect is what is asserted.
-        await manager.destroy("thread-doomed")
-        assert emit.flush(timeout=5.0)
+    # ``SessionManager.destroy`` returns None -- it awaits the lifecycle's own
+    # destroy and discards its bool -- so the effect is what is asserted.
+    await manager.destroy("thread-doomed")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
 
-        assert _newest_lifecycle_type("acp-torn-down") == _CLOSED
-    finally:
-        emit.reset_caches()
+    assert _newest_lifecycle_type("acp-torn-down") == _CLOSED
 
 
 @pytest.mark.asyncio
-async def test_a_destroyed_sessions_log_is_then_collectable_by_the_sweep(monkeypatch):
+@pytest.mark.usefixtures("drained_emitter")
+async def test_a_destroyed_sessions_log_is_then_collectable_by_the_sweep():
     """The end the teardown entry buys: an aged destroyed unit is collected.
 
     Pinned end to end rather than trusting the entry alone, because the two
@@ -1139,41 +1184,41 @@ async def test_a_destroyed_sessions_log_is_then_collectable_by_the_sweep(monkeyp
     from kiro_crew.crew_log import emit
     from kiro_crew.session import SessionManager
 
-    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
-    emit.reset_caches()
-    try:
-        cfg = KiroCrewConfig()
-        cfg.session.timeout_secs = 2
-        manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-aged"))
-        await manager.get_or_create("thread-aged")
-        emit.on_session_opened("acp-aged", agent="kirocrew", slot="thread-aged")
-        assert emit.flush(timeout=5.0)
-        assert await manager.destroy("thread-aged") is None
-        assert emit.flush(timeout=5.0)
+    cfg = KiroCrewConfig()
+    cfg.session.timeout_secs = 2
+    manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-aged"))
+    await manager.get_or_create("thread-aged")
+    emit.on_session_opened("acp-aged", agent="kirocrew", slot="thread-aged")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
+    assert await manager.destroy("thread-aged") is None
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
 
-        # Age the close the sweep reads, the same way the fixtures above do.
-        path = _unit_dir(lg.KIND_SESSION, "acp-aged") / "log.jsonl"
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for index in range(len(lines) - 1, -1, -1):
-            entry = json.loads(lines[index])
-            if entry.get("type") == _CLOSED:
-                entry["time"] = store.now_ms() - 90 * DAY_MS
-                lines[index] = json.dumps(entry, separators=(",", ":"), sort_keys=True)
-                break
-        else:  # pragma: no cover - the assertion above already proved it is there
-            raise AssertionError("destroy wrote no close to age")
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Age the close the sweep reads, the same way the fixtures above do.
+    path = _unit_dir(lg.KIND_SESSION, "acp-aged") / "log.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        entry = json.loads(lines[index])
+        if entry.get("type") == _CLOSED:
+            entry["time"] = store.now_ms() - 90 * DAY_MS
+            lines[index] = json.dumps(entry, separators=(",", ":"), sort_keys=True)
+            break
+    else:  # pragma: no cover - the assertion above already proved it is there
+        raise AssertionError("destroy wrote no close to age")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-        # No ``reset_caches`` between the close and this sweep, deliberately. The
-        # close entry is what RELEASES the emitter's handle -- ``on_session_closed``
-        # drops it once no turn of that session is pinned -- so by the time the
-        # entry has landed the lease is already free and the ordinary sweep can
-        # claim it. That is the same release the delete funnel's flush waits for,
-        # observed from the other caller.
-        assert store.sweep_expired(30) == (1, 0)
-        assert not CrewLog.exists(lg.KIND_SESSION, "acp-aged")
-    finally:
-        emit.reset_caches()
+    # No ``reset_caches`` between the close and this sweep, deliberately. The
+    # close entry is what RELEASES the emitter's handle -- ``on_session_closed``
+    # drops it once no turn of that session is pinned -- so by the time the
+    # entry has landed the lease is already free and the ordinary sweep can
+    # claim it. That is the same release the delete funnel's flush waits for,
+    # observed from the other caller.
+    #
+    # Off the loop, as ``history`` calls it. Landing the close also wakes the eager
+    # folder, which reads this unit on its own thread; the removal waits for that
+    # batch only off the event-loop thread, and on Windows an unlink of the segment
+    # the fold holds open is refused and the unit reported not removed.
+    assert off_loop(store.sweep_expired, 30) == (1, 0)
+    assert not CrewLog.exists(lg.KIND_SESSION, "acp-aged")
 
 
 def test_the_header_slot_reader_refuses_a_unit_whose_id_does_not_fold_back():
@@ -1343,6 +1388,7 @@ def _newest_close_reason(unit_id: str) -> str:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("drained_emitter")
 async def test_a_destroy_that_leaves_another_mapping_writes_a_NON_terminal_reason(monkeypatch):
     """One map key is deleted, so a second key on the same sid still resolves it.
 
@@ -1355,62 +1401,54 @@ async def test_a_destroy_that_leaves_another_mapping_writes_a_NON_terminal_reaso
     from kiro_crew.crew_log import emit
     from kiro_crew.session import SessionManager
 
-    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
-    emit.reset_caches()
-    try:
-        cfg = KiroCrewConfig()
-        cfg.session.timeout_secs = 2
-        manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-shared"))
-        await manager.get_or_create("thread-shared")
-        emit.on_session_opened("acp-shared", agent="kirocrew", slot="thread-shared")
-        assert emit.flush(timeout=5.0)
+    cfg = KiroCrewConfig()
+    cfg.session.timeout_secs = 2
+    manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-shared"))
+    await manager.get_or_create("thread-shared")
+    emit.on_session_opened("acp-shared", agent="kirocrew", slot="thread-shared")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
 
-        # A surviving holder of the same sid, exactly as a repeated transfer import
-        # produces: a different key, the same session id.
-        monkeypatch.setattr(
-            manager._session_map, "find_key_by_sid", lambda _sid: "dashboard_chat-9-900"
-        )
-        await manager.destroy("thread-shared")
-        assert emit.flush(timeout=5.0)
+    # A surviving holder of the same sid, exactly as a repeated transfer import
+    # produces: a different key, the same session id.
+    monkeypatch.setattr(
+        manager._session_map, "find_key_by_sid", lambda _sid: "dashboard_chat-9-900"
+    )
+    await manager.destroy("thread-shared")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
 
-        assert _newest_close_reason("acp-shared") == "destroyed_sid_retained"
-        _age_close_entry("acp-shared", days=400)
-        assert store.sweep_expired(30) == (0, 0)
-        assert CrewLog.exists(lg.KIND_SESSION, "acp-shared")
-    finally:
-        emit.reset_caches()
+    assert _newest_close_reason("acp-shared") == "destroyed_sid_retained"
+    _age_close_entry("acp-shared", days=400)
+    assert off_loop(store.sweep_expired, 30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "acp-shared")
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("drained_emitter")
 async def test_an_unreadable_map_also_withholds_the_terminal_reason(monkeypatch):
     """An unreadable map is not evidence of revocation, so the claim is withheld."""
     from kiro_crew.config import KiroCrewConfig
     from kiro_crew.crew_log import emit
     from kiro_crew.session import SessionManager
 
-    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
-    emit.reset_caches()
-    try:
-        cfg = KiroCrewConfig()
-        cfg.session.timeout_secs = 2
-        manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-nomap"))
-        await manager.get_or_create("thread-nomap")
-        emit.on_session_opened("acp-nomap", agent="kirocrew", slot="thread-nomap")
-        assert emit.flush(timeout=5.0)
+    cfg = KiroCrewConfig()
+    cfg.session.timeout_secs = 2
+    manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-nomap"))
+    await manager.get_or_create("thread-nomap")
+    emit.on_session_opened("acp-nomap", agent="kirocrew", slot="thread-nomap")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
 
-        def _raise(_sid):
-            raise RuntimeError("map unreadable")
+    def _raise(_sid):
+        raise RuntimeError("map unreadable")
 
-        monkeypatch.setattr(manager._session_map, "find_key_by_sid", _raise)
-        await manager.destroy("thread-nomap")
-        assert emit.flush(timeout=5.0)
+    monkeypatch.setattr(manager._session_map, "find_key_by_sid", _raise)
+    await manager.destroy("thread-nomap")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
 
-        assert _newest_close_reason("acp-nomap") == "destroyed_sid_retained"
-    finally:
-        emit.reset_caches()
+    assert _newest_close_reason("acp-nomap") == "destroyed_sid_retained"
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("drained_emitter")
 async def test_a_session_opened_after_a_destroy_makes_the_unit_uncollectable_again(monkeypatch):
     """Even a forged mapping's resume puts the unit back out of reach.
 
@@ -1422,26 +1460,96 @@ async def test_a_session_opened_after_a_destroy_makes_the_unit_uncollectable_aga
     from kiro_crew.crew_log import emit
     from kiro_crew.session import SessionManager
 
-    monkeypatch.setenv(emit.CREW_LOG_ENV, "1")
+    cfg = KiroCrewConfig()
+    cfg.session.timeout_secs = 2
+    manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-revived"))
+    await manager.get_or_create("thread-revived")
+    emit.on_session_opened("acp-revived", agent="kirocrew", slot="thread-revived")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
+    monkeypatch.setattr(manager._session_map, "find_key_by_sid", lambda _sid: None)
+    await manager.destroy("thread-revived")
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
+    assert _newest_close_reason("acp-revived") == "destroyed"
+
+    _age_close_entry("acp-revived", days=400)
+    emit.on_session_opened("acp-revived", agent="kirocrew", slot="thread-revived", resumed=True)
+    assert emit.flush(timeout=_EMIT_DRAIN_SECS)
     emit.reset_caches()
-    try:
-        cfg = KiroCrewConfig()
-        cfg.session.timeout_secs = 2
-        manager = SessionManager(cfg, provider_factory=_provider_factory_reporting("acp-revived"))
-        await manager.get_or_create("thread-revived")
-        emit.on_session_opened("acp-revived", agent="kirocrew", slot="thread-revived")
-        assert emit.flush(timeout=5.0)
-        monkeypatch.setattr(manager._session_map, "find_key_by_sid", lambda _sid: None)
-        await manager.destroy("thread-revived")
-        assert emit.flush(timeout=5.0)
-        assert _newest_close_reason("acp-revived") == "destroyed"
 
-        _age_close_entry("acp-revived", days=400)
-        emit.on_session_opened("acp-revived", agent="kirocrew", slot="thread-revived", resumed=True)
-        assert emit.flush(timeout=5.0)
-        emit.reset_caches()
+    assert off_loop(store.sweep_expired, 30) == (0, 0)
+    assert CrewLog.exists(lg.KIND_SESSION, "acp-revived")
 
-        assert store.sweep_expired(30) == (0, 0)
-        assert CrewLog.exists(lg.KIND_SESSION, "acp-revived")
-    finally:
-        emit.reset_caches()
+
+def _stage_target(unit_id: str):
+    return (
+        store.crew_log_trash_root() / "batch-1" / "uid-1" / _unit_dir(lg.KIND_SESSION, unit_id).name
+    )
+
+
+def test_staging_syncs_both_parents_after_the_rename(monkeypatch):
+    """A rename is not a move until both directories are on disk."""
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-stage")
+    del log
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-stage").parent
+    target = _stage_target("s-stage")
+    synced: list = []
+    monkeypatch.setattr(atomic_write, "fsync_dir", lambda path, **_k: synced.append(Path(path)))
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-stage", target) == store.REMOVE_REMOVED
+
+    assert target.is_dir()
+    assert target.parent in synced
+    assert source_parent in synced
+
+
+def test_a_sync_that_fails_after_the_rename_puts_the_unit_back(monkeypatch):
+    from kiro_crew import atomic_write
+
+    log = _closed_session(unit_id="s-unsynced")
+    del log
+    target = _stage_target("s-unsynced")
+    calls = {"n": 0}
+    real_rename = os.rename
+
+    def _rename(src, dst):
+        calls["n"] += 1
+        real_rename(src, dst)
+
+    after_rollback: list = []
+
+    def _fsync(path, **_k):
+        if calls["n"] == 1:
+            raise OSError("sync failed")
+        if calls["n"] == 2:
+            after_rollback.append(Path(path))
+
+    monkeypatch.setattr(os, "rename", _rename)
+    monkeypatch.setattr(atomic_write, "fsync_dir", _fsync)
+    source_parent = _unit_dir(lg.KIND_SESSION, "s-unsynced").parent
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-unsynced", target) == store.REMOVE_FAILED
+
+    assert CrewLog.exists(lg.KIND_SESSION, "s-unsynced")
+    assert not target.exists()
+    assert source_parent in after_rollback, "the rollback was not made durable"
+
+
+def test_the_windows_branch_stages_an_idle_unit_and_refuses_a_held_one(monkeypatch):
+    """Windows renames only after releasing the lease; the lease still refuses a holder."""
+    monkeypatch.setattr(store, "_RENAME_UNDER_LEASE", False)
+    idle = _closed_session(unit_id="s-idle")
+    del idle
+    held = _closed_session(unit_id="s-held")
+    held.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="gateway")
+
+    assert store.stage_unit(lg.KIND_SESSION, "s-idle", _stage_target("s-idle")) == (
+        store.REMOVE_REMOVED
+    )
+    assert store.stage_unit(lg.KIND_SESSION, "s-held", _stage_target("s-held")) == (
+        store.REMOVE_OWNED
+    )
+    assert not CrewLog.exists(lg.KIND_SESSION, "s-idle")
+    assert CrewLog.exists(lg.KIND_SESSION, "s-held")
+    del held

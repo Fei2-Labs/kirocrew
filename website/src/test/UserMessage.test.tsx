@@ -103,6 +103,39 @@ describe('UserMessage', () => {
     expect(screen.getByText('Cancel')).toBeInTheDocument()
   })
 
+  it('does not enter edit mode on double-click of the bubble by default', () => {
+    // Regression guard (#7908): without the opt-in, a double-click on the
+    // read-only bubble keeps native word selection and never opens the editor,
+    // even when editing is enabled. The pencil button is the edit path.
+    const { container } = render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => {}} />)
+    const bubble = container.querySelector('.msg-content') as HTMLElement
+    fireEvent.doubleClick(bubble)
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+    expect(screen.getByTestId('content')).toBeInTheDocument()
+  })
+
+  it('enters edit mode on double-click of the bubble when doubleClickToEdit is on', () => {
+    const { container } = render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => {}} doubleClickToEdit />)
+    const bubble = container.querySelector('.msg-content') as HTMLElement
+    fireEvent.doubleClick(bubble)
+    expect(screen.getByRole('textbox')).toHaveValue('original')
+    expect(screen.getByText('Send')).toBeInTheDocument()
+  })
+
+  it('does not enter edit mode on double-click when doubleClickToEdit is on but onEditResend is not provided', () => {
+    const { container } = render(<UserMessage content="original" renderContent={renderContent} canEdit doubleClickToEdit />)
+    const bubble = container.querySelector('.msg-content') as HTMLElement
+    fireEvent.doubleClick(bubble)
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+  })
+
+  it('does not enter edit mode on double-click when doubleClickToEdit is on but canEdit is false', () => {
+    const { container } = render(<UserMessage content="original" renderContent={renderContent} onEditResend={() => {}} doubleClickToEdit />)
+    const bubble = container.querySelector('.msg-content') as HTMLElement
+    fireEvent.doubleClick(bubble)
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
+  })
+
   it('cancels edit on Cancel click', () => {
     render(<UserMessage content="original" renderContent={renderContent} canEdit onEditResend={() => {}} />)
     fireEvent.click(screen.getByTitle('Edit & Resend'))
@@ -537,5 +570,70 @@ describe('action footer on touch devices', () => {
     )
     const pinned = screen.getByTitle('Unpin message')
     expect(pinned).toHaveAttribute('aria-pressed', 'true')
+  })
+})
+
+// A plain send whose receipt never came. The bubble is minted with
+// `meta.optimistic`; when the transport deadline fires with no echo,
+// `markSendUnconfirmed` stamps `meta.deliveryUnconfirmed` on it, and the
+// receipt or echo that finally proves delivery clears both. The pending line
+// follows the MARK, never the flag alone: `optimistic` also survives a refused
+// or connection-failed send and a queued receipt, none of which is a wait. It
+// has no running-turn gate: the mark is never persisted, so a row re-read from
+// history cannot carry it, and the send that most needs the line is one whose
+// local turn has already ended.
+describe('unconfirmed send treatment', () => {
+  const DELIVERY_PENDING = 'Delivery pending…'
+  const marked = { optimistic: true, sendId: 's-1', deliveryUnconfirmed: true }
+
+  it('renders the pending line for a bubble the deadline marked', () => {
+    render(<UserMessage content="ship it" meta={marked} messageTs="send-marked" renderContent={renderContent} />)
+    expect(screen.getByText(DELIVERY_PENDING)).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(DELIVERY_PENDING)
+  })
+
+  it('keeps the line with no running-turn gate', () => {
+    render(<UserMessage content="ship it" meta={marked} messageTs="send-marked-idle" slotRunning={false} renderContent={renderContent} />)
+    expect(screen.getByText(DELIVERY_PENDING)).toBeInTheDocument()
+  })
+
+  it('draws nothing for an in-flight optimistic bubble the deadline has not reached', () => {
+    render(<UserMessage content="ship it" meta={{ optimistic: true, sendId: 's-1' }} messageTs="send-in-flight" renderContent={renderContent} />)
+    expect(screen.queryByText(DELIVERY_PENDING)).not.toBeInTheDocument()
+  })
+
+  it('drops the line once a receipt or echo clears the mark', () => {
+    const { rerender } = render(<UserMessage content="ship it" meta={marked} messageTs="send-confirmed" renderContent={renderContent} />)
+    expect(screen.getByText(DELIVERY_PENDING)).toBeInTheDocument()
+    // confirmOptimisticSend and the echo reconcile keep sendId, stamp the mid,
+    // and delete both `optimistic` and `deliveryUnconfirmed`.
+    rerender(<UserMessage content="ship it" meta={{ sendId: 's-1', mid: 'm-1' }} messageTs="send-confirmed" renderContent={renderContent} />)
+    expect(screen.queryByText(DELIVERY_PENDING)).not.toBeInTheDocument()
+  })
+
+  it('renders nothing of it on a confirmed row or a row with no send identity', () => {
+    for (const [meta, ts] of [
+      [{ sendId: 's-1', mid: 'm-1' }, 'no-pending-confirmed'],
+      [undefined, 'no-pending-plain'],
+    ] as const) {
+      const { unmount } = render(<UserMessage content="ship it" meta={meta as Record<string, unknown> | undefined} messageTs={ts} renderContent={renderContent} />)
+      expect(screen.queryByText(DELIVERY_PENDING)).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('leaves a steer bubble to its own pending treatment', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true, sendId: 's-steer' }} messageTs="steer-not-send" slotRunning renderContent={renderContent} />)
+    expect(screen.queryByText(DELIVERY_PENDING)).not.toBeInTheDocument()
+    expect(screen.getByText('Steering…')).toBeInTheDocument()
+  })
+
+  it('keeps the line muted and carries no explainer of its own (the notice row under the bubble does)', () => {
+    render(<UserMessage content="ship it" meta={marked} messageTs="send-marked-muted" renderContent={renderContent} />)
+    const line = screen.getByText(DELIVERY_PENDING).closest('div') as HTMLElement
+    expect(line.className).toContain('text-muted')
+    expect(line.className).not.toContain('text-accent')
+    expect(line.className).not.toContain('font-semibold')
+    expect(line.querySelector('button')).toBeNull()
   })
 })

@@ -1,4 +1,4 @@
-"""Tests for Response Verbosity (``default`` / ``concise`` / ``ultra`` / ``answer_only``).
+"""Tests for Response Verbosity (``default`` / ``concise`` / ``answer_only``; retired ``ultra``).
 
 Lives under ``test/`` (the collected root per setup.cfg ``testpaths``) so these
 run in CI. Covers four layers: the [RESPONSE PREFERENCES] block built from the
@@ -21,6 +21,7 @@ from dashboard_owner_helpers import as_owner
 
 import kiro_crew
 from kiro_crew.config.loader import KiroCrewConfig, config_path
+from kiro_crew.config.sections import VERBOSITY_LEVELS, normalize_verbosity
 from kiro_crew.context import (
     _MULTIBYTE_TABLE,
     _RESPONSE_PREFERENCES_FOOTER,
@@ -89,7 +90,7 @@ class TestResponsePreferencesSection:
     def test_the_frame_is_identical_across_levels(self):
         """Only the rules differ; the wrapper the model learns to spot does not."""
         heads = set()
-        for level in ("concise", "ultra", "answer_only"):
+        for level in ("concise", "answer_only"):
             block = _section(verbosity=level)
             heads.add(block.split("## Reply style:", 1)[0])
         assert len(heads) == 1
@@ -141,141 +142,66 @@ class TestResponsePreferencesSection:
         assert _build_response_preferences_section(fake_cfg) == ""
 
 
-class TestUltraConciseBlock:
-    """``ultra`` is a distinct, stricter level — not an alias of ``concise``."""
+class TestConciseBlock:
+    """``concise`` was measured against the three-check register and kept as is.
 
-    def test_ultra_emits_its_own_block(self):
-        result = _section(verbosity="ultra")
-        assert "## Reply style: Ultra-Brief (ADHD reader)" in result
-        assert "simulate the reader" in result
-        # The concise block must NOT leak in — the branches are exclusive.
-        assert "Concise mode is on" not in result
+    The model copies the register of its instructions, which is why the
+    ``answer_only`` essay became three checks. The same seven asks, run on
+    ``concise`` as shipped, halved the prose of a reply with no block at all
+    and read at the same grade, so its list form holds. What is pinned is
+    what that measurement depends on: a short list, and its own contract --
+    shorter replies that keep their substance, not the answer-only register.
+    The measurements live in the PR that pinned them.
+    """
 
-    def test_ultra_constrains_the_whole_response_not_just_the_opening(self):
-        """Regression: the ORIGINAL ultra prompt capped only the opening, then
-        said "supporting detail is welcome" and "length after it is fine" —
-        which the model read as a licence to expand. Measured output averaged
-        1,407 chars, LONGER than default and 76% longer than concise, defeating
-        the whole point of the mode. The rewrite removes that licence: the
-        suppression must apply to the entire reply, not a lede budget.
-        """
-        result = _section(verbosity="ultra")
-        assert "Open with THE answer in 1–2 sentences" in result
-        # The expansion licences that caused the bug must be GONE.
-        assert "supporting detail is welcome" not in result
-        assert "governs the OPENING, not the whole response" not in result
-        assert "Length after it is fine" not in result
+    def _rules(self) -> str:
+        return _reply_style_rules("concise")
 
-    def test_ultra_overrides_the_completionist_bias(self):
-        """The mechanism that actually shortens output: naming and opposing the
-        model's own drive toward completeness, so it stops volunteering detail.
-        """
-        result = _section(verbosity="ultra")
-        assert "strong bias toward completeness. Override it" in result
-        assert "80% complete in 2 lines beats 100% complete in 20 lines" in result
+    def test_the_block_stays_a_short_list_not_an_essay(self):
+        """A block that grows into prose is how ``answer_only`` reached 1,300
+        words; the length of this one is pinned for the same reason."""
+        words = len(self._rules().split())
+        assert words < 300, f"concise rules grew to {words} words"
 
-    def test_ultra_models_the_reader_who_stops_reading(self):
-        """Ultra is written for a reader who will not scroll — the prompt must
-        say so explicitly, because that framing is what drives prioritization.
-        """
-        result = _section(verbosity="ultra")
-        assert "first 2 sentences" in result
-        assert "close the tab" in result
-        assert "wasted tokens" in result
+    def test_the_rules_are_bullets(self):
+        bullets = [ln for ln in self._rules().splitlines() if ln.startswith("- ")]
+        assert 5 <= len(bullets) <= 8, f"concise carries {len(bullets)} bullets"
 
-    def test_ultra_bans_the_structures_that_inflate_output(self):
-        """Regression: the original prompt ENCOURAGED tables and structure as
-        "signposts", which added tokens instead of removing them. Structure is
-        now a banned expansion vector, not an endorsed navigation aid.
-        """
-        result = _section(verbosity="ultra")
-        assert "Do NOT add: tables, headers" in result
-        assert "would the reader be stuck without this line?" in result
-        # The old "structure is not padding" endorsement must be gone.
-        assert "it is not padding" not in result
+    def test_concise_cuts_length_not_substance(self):
+        """The level's own contract: a short explanation survives. It must not
+        borrow the answer-only register, or the two levels become one."""
+        rules = self._rules()
+        assert "Reduce length without losing substance" in rules
+        assert "Say only the answer" not in rules
+        assert "five-year-old" not in rules
 
-    def test_ultra_caps_supporting_bullets(self):
-        """Detail is permitted only when its absence blocks the reader, and is
-        bounded — an unbounded bullet list is how the old prompt leaked length.
-        """
-        result = _section(verbosity="ultra")
-        assert "only if the reader would be STUCK without them" in result
-        assert "Max 3" in result
 
-    def test_ultra_takes_a_position(self):
-        result = _section(verbosity="ultra")
-        assert "Take a position. Name your pick" in result
-        assert 'Resolve "it depends" immediately' in result
+class TestRetiredUltraLevel:
+    """``ultra`` was retired; a config that still names it reads as ``answer_only``."""
 
-    def test_ultra_marks_the_critical_point_for_scanners(self):
-        """The reader scans for emphasis before reading — exactly one anchor."""
-        result = _section(verbosity="ultra")
-        assert "Bold the single most critical point" in result
+    def test_ultra_renders_the_answer_only_block(self):
+        assert _section(verbosity="ultra") == _section(verbosity="answer_only")
 
-    def test_ultra_never_cuts_a_required_output_format(self):
-        """Regression guard: the brevity rules must not eat a surface-required
-        element (an options line, a diff block, a PR URL), which renders the
-        response broken rather than terse.
-        """
-        result = _section(verbosity="ultra")
-        assert "Required output formats are sacred and never cut" in result
-        assert "[OPTIONS:] lines" in result
-        assert "diff blocks for file changes" in result
-        assert "full PR/MR URLs" in result
+    def test_the_old_ultra_rules_are_gone(self):
+        for level in ("default", "concise", "ultra", "answer_only"):
+            assert "Ultra-Brief" not in _section(verbosity=level)
 
-    def test_ultra_exempts_explicitly_requested_long_output(self):
-        """Brevity constrains UNSOLICITED verbosity — never requested depth."""
-        result = _section(verbosity="ultra")
-        assert "When the user ASKS for something long" in result
-        assert "deliver what was asked" in result
+    def test_ultra_is_no_longer_an_advertised_level(self):
+        assert "ultra" not in VERBOSITY_LEVELS
+        assert normalize_verbosity("ultra") == "answer_only"
 
-    def test_ultra_is_stricter_than_concise(self):
-        ultra = _section(verbosity="ultra")
-        concise = _section(verbosity="concise")
-        assert ultra != concise
-        # concise explicitly ALLOWS a brief progress note; ultra does not.
-        assert "Keep progress signal brief, not absent" in concise
-        assert "Keep progress signal brief, not absent" not in ultra
-        # ultra carries the anti-completionist override; concise does not.
-        assert "Override it" in ultra
-        assert "Override it" not in concise
+    def test_normalize_leaves_other_values_alone(self):
+        for raw in ("default", "concise", "answer_only", "bogus", None, ["ultra"]):
+            assert normalize_verbosity(raw) == raw
 
-    def test_ultra_keeps_safety_carveout(self):
-        """The brevity floor: a terse reply must never OMIT a security
-        warning, a destructive-action confirmation, or a step in an ordered
-        procedure — those failures cause mistakes, not just terseness.
-        """
-        result = _section(verbosity="ultra")
-        assert "security warnings" in result
-        assert "irreversible" in result
-        assert "multi-step" in result
-        # Correctness carve-out: code/errors are never compressed.
-        assert "verbatim" in result
+    def test_load_maps_a_stored_ultra_to_answer_only(self, tmp_path):
+        p = tmp_path / "config.json"
+        p.write_text(json.dumps({"dashboard": {"verbosity": "ultra"}}), encoding="utf-8")
+        with patch("kiro_crew.config.loader.config_path", return_value=p):
+            assert KiroCrewConfig.load().dashboard.verbosity == "answer_only"
 
-    def test_ultra_bounds_the_stakes_carveout_to_omission_not_length(self):
-        """The old carve-out ("Never compress for brevity: security warnings,
-        ...") was an unbounded length licence: it authorised the model to stay
-        verbose exactly at high stakes, the one place ultra's whole framing
-        (the reader closes the tab) makes a wall of text most costly. Recast on
-        the same single axis answer_only uses — stakes govern what may not be
-        OMITTED, never how long the reply is — the warning is mandatory but
-        one line; an ordered procedure keeps its full length because a dropped
-        step IS an omission, and payload (code, commands, errors) was already
-        exempt as correctness, not stakes.
-        """
-        result = " ".join(_section(verbosity="ultra").split())
-        # The unbounded length licence is gone — including its echo in the
-        # required-formats bullet, which listed security warnings as a
-        # never-cut format ("regardless of brevity").
-        assert "Never compress for brevity" not in result
-        assert "URLs, security warnings" not in result
-        # The bounded, omission-focused form is in: the warning must APPEAR,
-        # and it is one line.
-        assert "Stakes change what you must not omit, never the length" in result
-        assert "always appear, each as one line naming the call, the risk" in result
-        assert "whether it can be undone" in result
-        assert "the mechanism and the failure modes are not required" in result
 
+class TestUnknownLevel:
     def test_unknown_level_falls_back_to_empty(self):
         result = _section(verbosity="bogus")
         assert result == ""
@@ -347,10 +273,9 @@ class TestAnswerOnlyBlock:
     def test_shape_check_draws_the_shape_in_the_form_the_surface_renders(self):
         """The old rule lived in the fourteenth paragraph as "prefer" and was
         never reached. Now it is the first check and imperative. The form is
-        gated on the surface, and on a widget-capable one it is a single
-        mandate rather than a menu: a "richest form" list of alternatives let a
-        model reach past the widget for the adjacent plain-table fallback and
-        ship a one-column table of sentences as its "picture". Elsewhere the
+        gated on the surface and on the content: a grid of labels and numbers
+        is a markdown table, and a picture needing color, layout or motion is
+        a widget. A table of sentences is never the picture. Elsewhere the
         table IS the picture -- an unconditional "emit a widget" would land raw
         ``<mcwidget>`` markup in a Slack or CLI reply.
         """
@@ -358,17 +283,21 @@ class TestAnswerOnlyBlock:
         assert "Does the answer have a shape" in block
         assert "steps, before/after, cases and verdicts, sizes" in block
         assert (
-            "When your instructions carry an Inline Widgets section, the picture "
-            "IS an inline widget (an HTML artifact when it is large)" in block
+            "With an Inline Widgets section, a picture needing color, layout or "
+            "motion IS an inline widget (an HTML artifact when large)" in block
         )
+        # A grid of words and numbers gains nothing from an iframe, so it stays
+        # a markdown table. The criterion (color, layout, motion) is a test,
+        # not a menu of forms.
+        assert "Plain labels and numbers: a markdown table" in block
         # The one form the observed failure took is named, so the mandate rules
         # out a table of prose without re-opening a menu of allowed forms.
-        assert "never a plain table of sentences" in block
+        assert "never a table of sentences" in block
         # The fallback names the surfaces that cannot render them and says
         # what the markup becomes there, so the model has a reason, not a rule.
         assert (
-            "On any other surface (a chat channel, a CLI) a plain table — widget "
-            "or HTML markup lands there as raw text" in block
+            "Elsewhere (a chat channel, a CLI) a plain table: widget markup "
+            "lands there as raw text" in block
         )
         # The Inline Widgets section already says to load the `widgets` skill;
         # repeating it here would be a second spelling of the same instruction.
@@ -408,7 +337,17 @@ class TestAnswerOnlyBlock:
         block = self._block()
         assert "Each sentence: at most 12 words" in block
         assert "one the user has used, or one a child knows" in block
-        assert "replaced, or defined in three words" in block
+        assert "A word that fails both is swapped" in block
+
+    def test_word_check_keeps_the_real_name_of_a_part(self):
+        """Swapping every hard word for a small one broke the reader's map: the
+        reply said "the helper" and the log, the code and the next reply said
+        "gateway", so nothing lined up. A name the answer is ABOUT survives the
+        word check, glossed once, so the reader can find the same thing again.
+        """
+        block = self._block()
+        assert "unless it names a real part: keep that name" in block
+        assert "glossed in three words once" in block
 
     def test_cut_check_names_what_goes_and_what_stays(self):
         """Enumerated bans, not a vague "be brief" -- each named category is a
@@ -446,46 +385,56 @@ class TestAnswerOnlyBlock:
         """
         assert "one risk line for anything touching security, data or spend" in self._block()
 
-    def test_asking_why_teaches_with_one_picture_not_a_list_of_verdicts(self):
-        """The word check alone is half of Age 5. A child knows every word in
-        "the path was read as a key" and still learns nothing from it; the same
-        child follows a dog that hides the wrong thing. So a "why" reply keeps
-        the small words and swaps the shape: one everyday picture carried to
-        the end, the objection as a character in it, then the reasons in the
-        picture's own words. "Teach it, do not state it" names the mode; the
-        picture is bounded to ONE so it cannot sprawl into a parade of
-        metaphors.
+    def test_asking_why_shows_the_real_parts_and_how_they_connect(self):
+        """A "why" told as one daily-life story (a dog hides the wrong bone)
+        read well and taught little: the reader could not tell which story
+        thing was which real part, so the lesson did not carry back. The reply
+        now draws the real parts by name and the links between them, and puts
+        the objection ON that chain, where it breaks.
         """
         block = self._block()
-        assert "Asked why? Teach it, do not state it." in block
-        assert "One picture from daily life" in block
-        assert "Keep it to the end" in block
-        assert "An objection is a character in it" in block
-        assert "The reasons, numbered, one short line each, in the picture's words" in block
+        assert "Asked why? Show the real parts by name and how they connect" in block
+        assert "a chain (A -> B -> C) or a part-and-job table" in block
+        assert "The objection is the step where it breaks" in block
+        assert "The reasons, numbered, one short line each, naming the parts" in block
         # The story ends on the literal answer, so a reader who skipped the
-        # picture still gets the fact.
+        # chain still gets the fact.
         assert "End: what it is, one line" in block
+        # The old story-first rule is gone, not merely joined.
+        assert "One picture from daily life" not in block
+
+    def test_an_everyday_picture_never_comes_without_its_map(self):
+        """A picture is still allowed -- sometimes it is the fastest way in --
+        but a picture with no map is exactly the failure being fixed. Each
+        picture thing must be set beside the real part it stands for.
+        """
+        block = self._block()
+        assert "An everyday picture needs a map" in block
+        assert "each picture thing beside its real part" in block
 
     def test_asking_why_keeps_the_word_check_and_narrows_the_cut_check(self):
-        """The picture is what the cut check would otherwise delete ("why",
+        """The chain is what the cut check would otherwise delete ("why",
         "options you rejected"). The carve-out is explicit and named -- the
-        picture and the reasons -- so the rest of the cut list still applies
+        chain, the map and the reasons -- so the rest of the cut list still applies
         (no preamble, no "what I did", no offers). The word check is restated
-        because a story invites long sentences and the register is the point.
+        because a "why" invites long sentences and the register is the point.
         """
         block = self._block()
         assert "Word check still runs" in block
-        assert "Cut check spares the picture and the reasons" in block
+        assert "Cut check spares the chain, the map and the reasons" in block
         # "may" -- permission, not a target. The default reply stays short.
         assert "This reply may run long" in block
         assert "Same three checks, plus the reason as one line per point" not in block
 
-    def test_the_reason_stays_discoverable_by_a_three_word_offer(self):
-        """The delete-list drops offers to help, not the one offer that tells
-        the user the reasoning exists. Bounded to three words so it cannot
-        grow back into the explanation it points at.
+    def test_no_standing_offer_is_appended_to_every_reply(self):
+        """The mode must not carry a trailing invite. A literal three-word
+        offer ("say why") read as a tag to append, so every reply in this mode
+        ended with it -- and the cut check already deletes offers to help.
         """
-        assert 'Not asked? Offer it in three words: "say why".' in self._block()
+        block = self._block()
+        assert "say why" not in block
+        assert "Offer it in three words" not in block
+        assert "offers to help" in block
 
     def test_answer_only_turns_itself_off_when_depth_is_requested(self):
         block = self._block()
@@ -496,19 +445,10 @@ class TestAnswerOnlyBlock:
         assert "Reply in the user's language." in self._block()
 
     def test_the_three_checks_are_unique_to_answer_only(self):
-        for level in ("concise", "ultra"):
+        for level in ("concise",):
             other = _section(verbosity=level)
             assert "Shape check" not in other
             assert "at most 12 words" not in other
-
-    def test_answer_only_is_stricter_than_ultra(self):
-        answer_only = self._block()
-        ultra = _section(verbosity="ultra")
-        assert answer_only != ultra
-        # ultra budgets an explanation (bullets); answer_only grants none.
-        assert "Max 3" in ultra
-        assert "Max 3" not in answer_only
-        assert "Say only the answer" not in ultra
 
 
 class TestTokenRetired:
@@ -521,7 +461,7 @@ class TestTokenRetired:
 
     def test_no_shipped_prompt_file_carries_the_token(self):
         cfg_dir = Path(kiro_crew.__file__).parent / "config"
-        for name in ("prompt.md", "prompt-orchestrator.md"):
+        for name in ("prompt.md",):
             assert "{{VERBOSITY_BLOCK}}" not in (cfg_dir / name).read_text(encoding="utf-8"), name
 
     def test_no_builtin_agent_prompt_carries_the_token(self):
@@ -588,21 +528,21 @@ class TestSessionContextCarriesPreferences:
 
     @pytest.mark.parametrize("session_key", ("dashboard:abc", "slack:C1:1.2", "cli:local"))
     def test_injected_on_every_transport(self, tmp_path, session_key):
-        _seed_verbosity("ultra")
+        _seed_verbosity("answer_only")
         msg, _ = _builder(tmp_path).build_message(
             "first turn", is_new_session=True, session_key=session_key
         )
         assert _folded(_RESPONSE_PREFERENCES_HEADER) in msg
 
     def test_withheld_from_a_subagent_session(self, tmp_path):
-        _seed_verbosity("ultra")
+        _seed_verbosity("answer_only")
         msg, _ = _builder(tmp_path).build_message(
             "first turn", is_new_session=True, session_key="subagent:abc123"
         )
         assert _folded(_RESPONSE_PREFERENCES_HEADER) not in msg
 
     def test_the_trusted_runtime_source_decides_not_the_key(self, tmp_path):
-        _seed_verbosity("ultra")
+        _seed_verbosity("answer_only")
         builder = _builder(tmp_path)
         msg, _ = builder.build_message(
             "first turn",
@@ -693,6 +633,18 @@ class TestReinjectedAfterCompaction:
         assert _folded(_RESPONSE_PREFERENCES_HEADER) in msg
         assert "## Reply style: Concise" in msg
 
+    def test_reinjected_on_a_minimal_continuing_session(self, tmp_path):
+        _seed_verbosity("concise")
+        msg, _ = _builder(tmp_path).build_message(
+            "carry on",
+            is_new_session=False,
+            needs_reinjection=True,
+            minimal_context=True,
+        )
+        assert _folded("[REINJECTED AFTER COMPACTION — response preferences]") in msg
+        assert _folded(_RESPONSE_PREFERENCES_HEADER) in msg
+        assert "## Reply style: Concise" in msg
+
     def test_not_reinjected_without_the_flag(self, tmp_path):
         _seed_verbosity("concise")
         msg, _ = _builder(tmp_path).build_message("carry on", is_new_session=False)
@@ -732,9 +684,9 @@ class TestReinjectedAfterCompaction:
         _seed_verbosity("concise")
         b = _builder(tmp_path)
         b.build_session_context(session_key="dashboard:main")
-        _seed_verbosity("ultra")
+        _seed_verbosity("answer_only")
         msg, _ = b.build_message("carry on", is_new_session=False, needs_reinjection=True)
-        assert "## Reply style: Ultra-Brief (ADHD reader)" in msg
+        assert "## Reply style: Answer Only" in msg
         assert "## Reply style: Concise" not in msg
 
 
@@ -748,15 +700,30 @@ class TestVerbosityRoundTrip:
         with patch("kiro_crew.config.loader.config_path", return_value=p):
             yield p
 
-    def test_defaults_to_default(self):
-        assert KiroCrewConfig().dashboard.verbosity == "default"
+    def test_fresh_install_defaults_to_answer_only(self):
+        assert KiroCrewConfig().dashboard.verbosity == "answer_only"
+
+    def test_config_without_the_key_loads_answer_only(self, cfg_file):
+        assert KiroCrewConfig.load().dashboard.verbosity == "answer_only"
+
+    def test_a_stored_default_is_kept(self, cfg_file):
+        """Every full save writes the key, so an existing install keeps its level."""
+        cfg_file.write_text(json.dumps({"dashboard": {"verbosity": "default"}}), encoding="utf-8")
+        assert KiroCrewConfig.load().dashboard.verbosity == "default"
+        cfg = KiroCrewConfig.load()
+        cfg.save()
+        assert json.loads(cfg_file.read_text())["dashboard"]["verbosity"] == "default"
+
+    def test_first_save_materializes_answer_only(self, cfg_file):
+        KiroCrewConfig.load().save()
+        assert json.loads(cfg_file.read_text())["dashboard"]["verbosity"] == "answer_only"
 
     def test_answer_only_is_an_advertised_enum_value(self):
         """The Settings UI and the config-patch validator both read this enum;
         a level missing here is a level the user cannot select.
         """
         field = KiroCrewConfig().dashboard.__dataclass_fields__["verbosity"]
-        assert field.metadata["enum"] == ["default", "concise", "ultra", "answer_only"]
+        assert field.metadata["enum"] == ["default", "concise", "answer_only"]
 
     def test_answer_only_round_trips(self, cfg_file):
         cfg = KiroCrewConfig()
@@ -815,11 +782,12 @@ async def test_handler_put_verbosity_concise(handler_app, cfg_file):
 
 
 @pytest.mark.asyncio
-async def test_handler_put_verbosity_ultra(handler_app, cfg_file):
+async def test_handler_put_retired_ultra_stores_answer_only(handler_app, cfg_file):
+    """An older client that still sends ``ultra`` is not rejected."""
     async with TestClient(TestServer(handler_app)) as client:
         resp = await client.put("/api/dashboard/config", json={"verbosity": "ultra"})
         assert resp.status == 200
-    assert KiroCrewConfig.load().dashboard.verbosity == "ultra"
+    assert KiroCrewConfig.load().dashboard.verbosity == "answer_only"
 
 
 @pytest.mark.asyncio
@@ -837,8 +805,9 @@ async def test_handler_rejection_names_every_accepted_level(handler_app, cfg_fil
         resp = await client.put("/api/dashboard/config", json={"verbosity": "aggressive"})
         assert resp.status == 400
         message = (await resp.json())["error"]
-    for level in ("default", "concise", "ultra", "answer_only"):
+    for level in ("default", "concise", "answer_only"):
         assert level in message, level
+    assert "ultra" not in message
 
 
 @pytest.mark.asyncio
@@ -847,7 +816,7 @@ async def test_handler_put_verbosity_rejects_invalid(handler_app, cfg_file):
         resp = await client.put("/api/dashboard/config", json={"verbosity": "aggressive"})
         assert resp.status == 400
     # bad value must not be persisted
-    assert KiroCrewConfig.load().dashboard.verbosity == "default"
+    assert KiroCrewConfig.load().dashboard.verbosity == "answer_only"
 
 
 @pytest.mark.asyncio

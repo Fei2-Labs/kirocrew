@@ -291,7 +291,7 @@ class TestEnableGate:
     def test_default_off_when_the_config_field_is_absent(self, monkeypatch):
         """A build whose dataclass predates the field must not start drawing.
 
-        The field is owned by ``config/loader.py``, so this module reads it through
+        The field is owned by ``config/integration_sections.py``, so this module reads it through
         ``getattr``; a missing field can only ever mean "no decoration".
         """
 
@@ -417,8 +417,8 @@ class TestSupervisorLifecycle:
         overlay = CursorOverlay()
         await overlay.move_to(1.0, 1.0)
         argv = spawned["argv"][0]
-        assert argv[1:] == ("-s", "-m", OVERLAY_MODULE)
-        assert "kiro_crew.computer_use" in argv[3]
+        assert argv[1:] == ("-s", "-P", "-m", OVERLAY_MODULE)
+        assert "kiro_crew.computer_use" in argv[4]
 
     @pytest.mark.asyncio
     async def test_spawn_uses_the_platform_compat_isolation_flags(self, enabled, spawned):
@@ -1333,6 +1333,10 @@ class TestStructuralGuarantees:
                 modules.add(node.module)
         forbidden = {
             "kiro_crew.computer_use.macos_ffi",
+            "kiro_crew.computer_use.macos_ffi_bind",
+            "kiro_crew.computer_use.macos_ffi_cf",
+            "kiro_crew.computer_use.macos_ffi_ax",
+            "kiro_crew.computer_use.macos_ffi_window",
             "kiro_crew.computer_use.snapshot_macos",
             "kiro_crew.computer_use.capture_macos",
             "kiro_crew.computer_use.apps_macos",

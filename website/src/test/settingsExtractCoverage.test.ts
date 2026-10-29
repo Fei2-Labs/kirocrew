@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest'
 
 import { extractFromSource, mergeManualEntries } from '../../scripts/settingsExtract'
-import type { ManualSettingEntry, SettingEntry } from '../components/commandPalette/settingsTypes'
+import { settingHelpText, type ManualSettingEntry, type SettingEntry } from '../components/commandPalette/settingsTypes'
 
 /**
  * Guards the two coverage mechanisms of the settings extractor beyond plain
@@ -84,6 +84,46 @@ describe('settingsExtract — multi-target panels', () => {
     expect(entries).toHaveLength(3)
     expect(new Set(entries.map(e => e.label))).toEqual(new Set(['Bot token']))
     expect(entries.every(e => e.labelSuffix === undefined)).toBe(true)
+  })
+})
+
+describe('settingsExtract — description and hint indexing', () => {
+  // SecurityPanel is a plain single-target panel, so one primitive yields one
+  // entry and the description under test is read straight off it.
+  const FILE = 'SecurityPanel.tsx'
+
+  it('keeps hint and description in their own fields, joined hint first, when a row keeps both', () => {
+    // The tip states what the row is and the description states the
+    // consequence, so the joined help text reads definition-then-consequence.
+    const { entries } = extractFromSource(
+      `<SettingsInput label="Default shell" description="Leave empty to use the system default." hint="The shell the built-in terminal launches." value={x} onChange={f} />`,
+      FILE,
+    )
+    expect(entries).toHaveLength(1)
+    expect(entries[0].hint).toBe('The shell the built-in terminal launches.')
+    expect(entries[0].description).toBe('Leave empty to use the system default.')
+    expect(settingHelpText(entries[0])).toBe('The shell the built-in terminal launches. Leave empty to use the system default.')
+  })
+
+  it('keeps the hint, and no description, when a row has only a tip', () => {
+    const { entries } = extractFromSource(
+      `<SettingsToggle label="Session summaries" hint="Uses tokens on turns that change the session." checked={x} onChange={f} />`,
+      FILE,
+    )
+    expect(entries).toHaveLength(1)
+    expect(entries[0].hint).toBe('Uses tokens on turns that change the session.')
+    expect(entries[0].description).toBeUndefined()
+    expect(settingHelpText(entries[0])).toBe('Uses tokens on turns that change the session.')
+  })
+
+  it('leaves description undefined when a row has neither', () => {
+    const { entries } = extractFromSource(
+      `<SettingsToggle label="Bare row" checked={x} onChange={f} />`,
+      FILE,
+    )
+    expect(entries).toHaveLength(1)
+    expect(entries[0].description).toBeUndefined()
+    expect(entries[0]).not.toHaveProperty('hint')
   })
 })
 

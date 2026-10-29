@@ -16,6 +16,7 @@ Three jobs:
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import shutil
 import socket
@@ -27,8 +28,33 @@ from typing import Any, Iterator
 import pytest
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
+from kiro_crew import code_fingerprint as cf
 from kiro_crew import platform_compat as pc
 from kiro_crew.mcp_gateway import transport
+from kiro_crew.testing.wait import await_until, finished
+
+
+@pytest.fixture(autouse=True)
+def _no_git_fingerprint(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``code_fingerprint()`` without a git spawn, per test, cache isolated.
+
+    ``GatewayManager._start_locked`` and ``run_gatewayd`` both warm
+    ``code_fingerprint()`` before ``prepare_dir``, and the cached fingerprint is
+    of ``_PACKAGE_ROOT`` -- THIS checkout -- so a cold read runs
+    ``git -C <checkout> rev-parse HEAD`` and ``git diff HEAD`` on the developer's
+    own repository from a pool thread with the worker's cwd inherited; which test
+    pays depends on run order (whoever reads first after a ``cache_clear``).
+    Nothing in this module reads the value, so the trusted-git resolver is pinned
+    to "absent" -- the product's own no-spawn arm, the mtime rule -- exactly as
+    ``test_mcp_gateway_daemon_lifecycle.py`` does. The cache is cleared on both
+    sides so the pinned value neither reuses a real one nor leaks to a module
+    that must match a child daemon's real fingerprint.
+    """
+    monkeypatch.setattr(cf, "trusted_git_bin", lambda: None)
+    cf.code_fingerprint.cache_clear()
+    yield
+    cf.code_fingerprint.cache_clear()
+
 
 # --- Address resolution ------------------------------------------------------
 
@@ -72,7 +98,7 @@ def test_windows_address_is_a_pipe_name(monkeypatch: pytest.MonkeyPatch) -> None
     addr = transport.resolve_address("/some/home/mcp-gateway/gateway.sock")
     assert addr.startswith(r"\\.\pipe\kirocrew-mcp-")
     # No path separators survive into the name: a pipe name is a flat namespace.
-    assert "/" not in addr[len(r"\\.\pipe\\"):]
+    assert "/" not in addr[len(r"\\.\pipe\\") :]
 
 
 def test_windows_address_is_deterministic_and_path_scoped(
@@ -186,9 +212,7 @@ def test_singleton_lock_file_is_created_beside_the_endpoint(tmp_path: Path) -> N
 # --- POSIX serve / connect ---------------------------------------------------
 
 
-def _close_immediately(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-) -> None:
+def _close_immediately(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     """Accept-and-drop callback for tests that only need a bound endpoint.
 
     Not a no-op: ``probe_live`` really connects, and since Python 3.12
@@ -266,12 +290,12 @@ async def test_serve_and_connect_round_trip_preserves_newline_framing(
         try:
             writer.write(b'{"id":1}\n{"id":2}\n')
             await writer.drain()
-            assert await asyncio.wait_for(reader.readuntil(b"\n"), timeout=5) == (
+            assert await finished(reader.readuntil(b"\n"), "reader.readuntil", timeout=5) == (
                 b'{"type":"pong"}\n'
             )
         finally:
             writer.close()
-        await asyncio.wait_for(done.wait(), timeout=5)
+        await await_until(done, timeout=5)
     finally:
         server.close()
         await server.wait_closed()
@@ -476,9 +500,7 @@ def test_asyncio_pipe_server_still_exposes_the_seams_we_wrap() -> None:
     # _server_pipe_handle(True) immediately, so an address without the
     # \\.\pipe\ prefix makes CreateNamedPipe fail and the constructor raise
     # before the attribute can be inspected.
-    server = windows_events.PipeServer(
-        transport._PIPE_NAME_PREFIX + f"seamprobe-{os.getpid()}"
-    )
+    server = windows_events.PipeServer(transport._PIPE_NAME_PREFIX + f"seamprobe-{os.getpid()}")
     try:
         assert hasattr(server, "_free_instances")
     finally:
@@ -760,7 +782,7 @@ async def test_wait_closed_returns_once_connections_are_cancelled(
 
     server = await transport.serve(sock, on_connect, limit=1 << 16)
     reader, writer = await transport.connect(sock)
-    await asyncio.wait_for(started.wait(), timeout=5)
+    await await_until(started, timeout=5)
 
     server.close()
     # Awaiting here first is the bug: prove it would block. CPython 3.12.0 made
@@ -775,7 +797,7 @@ async def test_wait_closed_returns_once_connections_are_cancelled(
     writer.close()
     # With the connections gone it returns promptly, which is why the daemon
     # drains and cancels before awaiting.
-    await asyncio.wait_for(server.wait_closed(), timeout=5)
+    await finished(server.wait_closed(), "server.wait_closed", timeout=5)
 
 
 def test_invalid_handle_constant_is_the_unsigned_pointer_form() -> None:
@@ -841,6 +863,91 @@ def test_probe_live_reports_an_unknown_error_as_dead(
         transport, "_winapi", type("W", (), {"WaitNamedPipe": staticmethod(_other)})
     )
     assert transport.probe_live("C:/state/gateway.sock") is False
+
+
+# --- POSIX probe reachable from Windows --------------------------------------
+
+
+class _ScriptedConnectSocket:
+    """Stub socket whose ``connect`` raises a scripted exception (or nothing)."""
+
+    def __init__(self, connect_exc: BaseException | None) -> None:
+        self._connect_exc = connect_exc
+
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def connect(self, _address: str) -> None:
+        if self._connect_exc is not None:
+            raise self._connect_exc
+
+    def close(self) -> None:
+        pass
+
+
+def _force_posix_probe_branch(
+    monkeypatch: pytest.MonkeyPatch, connect_exc: BaseException | None
+) -> None:
+    """Route ``probe_live`` into its POSIX branch with a stub socket factory."""
+    monkeypatch.setattr(pc, "IS_WINDOWS", False)
+    monkeypatch.setattr(
+        transport,
+        "_socket",
+        type(
+            "FakeSocketModule",
+            (),
+            {
+                "AF_UNIX": 1,
+                "SOCK_STREAM": 2,
+                "timeout": socket.timeout,
+                "socket": staticmethod(lambda *args: _ScriptedConnectSocket(connect_exc)),
+            },
+        ),
+    )
+
+
+def test_probe_live_treats_a_connect_timeout_as_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connect that times out is an inconclusive probe, not a dead endpoint.
+
+    A real timeout is only one of the inconclusive shapes a loaded daemon can
+    produce; whichever it is, the endpoint must not be taken away. Reporting a
+    timeout as dead would let ``remove_stale`` unlink a live daemon's socket.
+    """
+    _force_posix_probe_branch(monkeypatch, socket.timeout("timed out"))
+    assert transport.probe_live("/state/gateway.sock") is True
+
+
+def test_probe_live_treats_a_full_backlog_eagain_as_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real Linux full-backlog case: a non-blocking connect fails EAGAIN.
+
+    ``settimeout`` makes the socket non-blocking, so on Linux a ``connect()``
+    against a full accept backlog fails at once with ``EAGAIN``
+    (``BlockingIOError``) rather than raising ``socket.timeout``. That is the
+    exact condition the fix protects -- a healthy but overloaded daemon -- so
+    it must report live, not dead.
+    """
+    _force_posix_probe_branch(monkeypatch, BlockingIOError(errno.EAGAIN, "try again"))
+    assert transport.probe_live("/state/gateway.sock") is True
+
+
+def test_probe_live_treats_a_refused_connect_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The true negative stays negative: a refused connect means no listener."""
+    _force_posix_probe_branch(monkeypatch, ConnectionRefusedError(111, "refused"))
+    assert transport.probe_live("/state/gateway.sock") is False
+
+
+def test_probe_live_treats_a_missing_socket_as_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other conclusive negative: the socket name does not exist."""
+    _force_posix_probe_branch(monkeypatch, FileNotFoundError(errno.ENOENT, "no such file"))
+    assert transport.probe_live("/state/gateway.sock") is False
 
 
 @pytest.mark.asyncio
@@ -940,9 +1047,7 @@ async def test_manager_offloads_prepare_dir_from_the_event_loop(
     # False return.
     monkeypatch.setattr(manager, "_ping_once", AsyncMock(return_value=False))
     monkeypatch.setattr(manager, "_clear_stale_socket", AsyncMock(return_value=None))
-    monkeypatch.setattr(
-        manager, "_spawn_once", AsyncMock(side_effect=RuntimeError("stop here"))
-    )
+    monkeypatch.setattr(manager, "_spawn_once", AsyncMock(side_effect=RuntimeError("stop here")))
 
     assert await manager._start_locked() is False
     assert probe.calls == 1
@@ -1017,15 +1122,11 @@ def _install_fake_windows_connect(monkeypatch: pytest.MonkeyPatch) -> _FakeTrans
     """
     transport_obj = _FakeTransport()
 
-    async def _fake_create_pipe_connection(
-        protocol_factory: Any, _address: str
-    ) -> tuple[Any, Any]:
+    async def _fake_create_pipe_connection(protocol_factory: Any, _address: str) -> tuple[Any, Any]:
         return transport_obj, protocol_factory()
 
     loop = asyncio.get_running_loop()
-    monkeypatch.setattr(
-        loop, "create_pipe_connection", _fake_create_pipe_connection, raising=False
-    )
+    monkeypatch.setattr(loop, "create_pipe_connection", _fake_create_pipe_connection, raising=False)
     monkeypatch.setattr(pc, "IS_WINDOWS", True)
     # The Windows-only import block binds these to None off Windows. Restore the
     # real ones -- asyncio.streams is cross-platform, and SetNamedPipeHandleState

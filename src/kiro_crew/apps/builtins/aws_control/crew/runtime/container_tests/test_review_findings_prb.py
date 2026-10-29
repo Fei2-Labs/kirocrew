@@ -49,7 +49,7 @@ def test_a_bucket_without_a_declared_trust_domain_refuses_to_start(tmp_path) -> 
     """The refusal is at START, not per turn.
 
     A container that answers its port while silently declining to restore history looks
-    healthy and is not, which is why ``require_api_key`` refuses at startup too. The
+    healthy and is not, which is why ``require_model_identity`` refuses at startup too. The
     message has to name the setting, because the operator's next action is to decide
     whether their deployment really is single-principal.
     """
@@ -178,7 +178,9 @@ def test_an_ordinary_crew_name_still_installs(tmp_path) -> None:
     agents = tmp_path / "kiro" / "agents"
     settings = _bundle_for(tmp_path, "frontdesk")
     bundle_mod.install_bundle(settings, agents_dir=agents)
-    assert (agents / "frontdesk.json").is_file()
+    # Inside the crew namespace, where every installed crew spec lands -- see
+    # ``test_supervisor_bundle_crew_namespace.py``.
+    assert (agents / "crew-frontdesk.json").is_file()
 
 
 def test_the_equality_checks_alone_would_have_let_it_through(tmp_path) -> None:

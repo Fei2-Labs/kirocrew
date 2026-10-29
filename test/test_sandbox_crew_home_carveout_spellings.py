@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 
 import pytest
 
@@ -39,11 +38,20 @@ pytestmark = pytest.mark.skipif(
 _STAGING_LEAF = "aws-control-staging"
 
 
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """The namespace plan asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every test here reads the planned mask list; none is about that probe, and a
+    real ssh spawned from the test process is a host dependency the plan must not
+    vary with. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sb, "_ssh_supports_accept_new", lambda: True)
+
+
 def _hidden_dirs(mode: str = "standard", **kwargs) -> set[str]:
-    script = sb._build_launcher_script(mode, **kwargs)
-    match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
-    assert match, "SENSITIVE_DIRS not found in the generated launcher script"
-    return set(json.loads(match.group(1)))
+    """The directories the Linux launcher bind-masks for one spawn: the plan's masks."""
+    return set(sb._spawn_plan("namespace", mode, **kwargs).sensitive_dirs)
 
 
 @pytest.fixture()

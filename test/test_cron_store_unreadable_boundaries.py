@@ -979,6 +979,9 @@ def test_a_corrupt_store_does_not_discard_a_queued_one_shot_removal(tmp_path: Pa
 # The next `apply_tiers`-shaped caller inherits the rule by going red.
 _PROBE = "raise_if_store_unreadable"
 
+#: The one module the scan skips: the store service itself (see the scan below).
+_STORE_MODULE = "src/kiro_crew/cron.py"
+
 #: Public reads. A read never raises on an unreadable store -- that IS the hazard.
 _CRON_READS = frozenset(
     {
@@ -999,6 +1002,7 @@ _CRON_WRITES = frozenset(
         "add_job_async",
         "add_job_if_absent",
         "add_job_if_absent_async",
+        "add_managed_job",
         "enable_job",
         "enable_job_async",
         "remove_job",
@@ -1018,7 +1022,7 @@ _CRON_WRITES = frozenset(
 #: structural reason. An exemption is a visible, reviewable line on purpose --
 #: adding one should feel like a claim someone can check, because it is.
 _EXEMPT_READ_DECIDE_WRITE: dict[tuple[str, str], str] = {
-    ("src/kiro_crew/apps/bridges.py", "register_app_crons_with_service"): (
+    ("src/kiro_crew/apps/bridges_crons.py", "register_app_crons_with_service"): (
         "An empty read makes every definition look ABSENT, so the add is still "
         "attempted and refuses at the write. The degraded read biases TOWARD the "
         "write rather than around it, so the refusal cannot be skipped."
@@ -1027,14 +1031,14 @@ _EXEMPT_READ_DECIDE_WRITE: dict[tuple[str, str], str] = {
         "Same shape: no matching job means it falls through to `add_job`, which "
         "refuses. Absence routes INTO the write, so the store cannot stay silent."
     ),
-    ("src/kiro_crew/dashboard/state.py", "delete_cron_folder"): (
+    ("src/kiro_crew/dashboard/state_parts/sidebar_stores.py", "delete_cron_folder"): (
         "The authoritative write is `save_cron_folders()` on a DIFFERENT store and "
         "happens BEFORE the read. The job loop that follows is documented "
         "best-effort cleanup whose per-job failure is benign (an unknown folder_id "
         "renders as ungrouped and self-heals), so the outcome this reports does not "
         "depend on the cron read at all."
     ),
-    ("src/kiro_crew/cli_commands.py", "_cron_dispatch"): (
+    ("src/kiro_crew/cli_commands_cron.py", "_cron_dispatch"): (
         "A verb dispatcher: the read and the writes are ALTERNATIVE branches of one "
         "request, never a read that decides a write. Its own dispatch-boundary "
         "wrapper already translates the refusal for every verb, including ones "
@@ -1129,7 +1133,7 @@ def _read_decide_write_callers() -> tuple[tuple[str, str, int, bool], ...]:
         # -- reporting every exempt caller as unprobed and every exemption as stale at
         # once. POSIX is the portable spelling and the one the table is keyed in.
         posix = path.as_posix()
-        if path.name == "cron.py" or "__pycache__" in posix:
+        if "__pycache__" in posix:
             continue
         if "/tests/" in posix or path.name.startswith("test_"):
             continue
@@ -1137,6 +1141,11 @@ def _read_decide_write_callers() -> tuple[tuple[str, str, int, bool], ...]:
         # so the exemption keys resolve identically for an editable and an installed
         # package layout.
         rel = "src/kiro_crew/" + path.relative_to(root).as_posix()
+        # Only the store module itself is the service. Matched on the full package
+        # path, not the bare name: a name match also hid the dashboard's own
+        # `handlers/cron.py` and the grant handlers split out of it.
+        if rel == _STORE_MODULE:
+            continue
         callers.extend(_scan_module_for_read_decide_write(text, rel))
     return tuple(callers)
 

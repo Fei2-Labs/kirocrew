@@ -53,19 +53,6 @@ def _state_with_job(*, slot, session_key="dashboard:chat-2-origin"):
 def _live_running_slot():
     slot = MagicMock()
     slot.running = True
-    slot._in_stage_execution = False
-    slot._queue = []
-    slot.queue_append.return_value = "q1"
-    return slot
-
-
-def _mid_plan_slot():
-    """A slot whose plan is executing but is BETWEEN stages: the orchestrator
-    has set slot.task = None (so slot.running is False) while _in_stage_execution
-    stays True. slot.running alone would misread this as idle."""
-    slot = MagicMock()
-    slot.running = False
-    slot._in_stage_execution = True
     slot._queue = []
     slot.queue_append.return_value = "q1"
     return slot
@@ -111,35 +98,6 @@ async def test_caller_session_resolves_and_injects(mock_sel):
     state.notify.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_mid_plan_stage_window_queues_not_concurrent_turn(mock_sel):
-    """Regression: an origin injection landing in a plan's between-stages window
-    must QUEUE, not start a concurrent turn.
-
-    During multi-stage execution the orchestrator nulls slot.task between stages,
-    so slot.running reads False even though the plan is still running. Guarding on
-    slot.running alone let the cron injection start a second turn that scattered
-    the plan's output. The guard now also checks _in_stage_execution.
-    """
-    slot = _mid_plan_slot()
-    state = _state_with_job(slot=slot)
-    with (
-        patch("kiro_crew.dashboard.chat_runner._run_chat") as run_chat,
-        patch("kiro_crew.dashboard.turn_dispatch.spawn_guarded_turn") as spawn,
-    ):
-        async with TestClient(TestServer(_make_app(state))) as c:
-            resp = await c.post(
-                "/api/send-message",
-                json={"text": "comments!", "session": "origin", "caller_session": f"cron:{JOB_ID}"},
-            )
-            data = await resp.json()
-    assert data["session"] is True
-    slot.queue_append.assert_called_once()  # queued, not run
-    spawn.assert_not_called()
-    run_chat.assert_not_called()
-    state.notify.assert_not_called()
-
-
 # ── slot lookup ──
 
 
@@ -182,3 +140,32 @@ def test_notify_caller_session_cannot_be_overridden():
     ctx.notify("hello", session="origin", caller_session="cron:evil")
     _path, payload = ctx._post.call_args.args
     assert payload["caller_session"] == f"cron:{JOB_ID}"
+
+
+# ── the session-side entry point ──
+
+
+@pytest.mark.asyncio
+async def test_a_cron_send_message_is_delivered_as_cron_with_eviction(mock_sel):
+    """The handler names its `cron` origin and leaves idle vs running to the
+    session, asking a full live queue to drop its oldest entry."""
+    from unittest.mock import AsyncMock
+
+    from kiro_crew.dashboard import session_deliver
+
+    slot = _live_running_slot()
+    state = _state_with_job(slot=slot)
+    deliver = AsyncMock(return_value=session_deliver.DELIVERED_QUEUED)
+    with patch.object(session_deliver, "deliver", deliver):
+        async with TestClient(TestServer(_make_app(state))) as c:
+            resp = await c.post(
+                "/api/send-message",
+                json={"text": "comments!", "session": "origin", "caller_session": f"cron:{JOB_ID}"},
+            )
+            data = await resp.json()
+    assert data["session"] is True
+    origin = deliver.await_args.args[3]
+    assert origin.kind == session_deliver.ORIGIN_CRON
+    assert origin.label == "autosde-Z"
+    assert deliver.await_args.args[1] is slot
+    assert deliver.await_args.kwargs["evict_oldest"] is True

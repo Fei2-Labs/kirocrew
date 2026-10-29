@@ -1,8 +1,16 @@
+/**
+ * MarkdownRenderer's core suite: list indentation, the streaming caret, currency
+ * dollars versus math, XSS sanitization, task lists, the path-chip pre-filter and
+ * chips, and Lightbox keyboard navigation. The mcwidget and <tool_use> strips and
+ * softBreaks are pinned in MarkdownRenderer.textPasses.test.tsx, and the
+ * LaTeX-native delimiters in MarkdownRenderer.latexDelimiters.test.tsx.
+ */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import MarkdownRenderer, { Lightbox, dispatchLightbox, isPathCandidate, splitLineRef } from '../components/MarkdownRenderer'
 import { __resetPathKindCache } from '../hooks/usePathKind'
+import { kindsRequestCount, kindsRequestPaths, kindsResponse, probedPaths, stubPathKinds } from './pathKindStub'
 import { api } from '../api/client'
 
 // The chip's reveal hint is now gated on branding.directLocal: a remote session
@@ -111,7 +119,7 @@ describe('MarkdownRenderer XSS sanitization', () => {
 
   it('strips event handler attributes', () => {
     const { container } = render(
-      <MarkdownRenderer content={'<img src="x" onerror="alert(1)">'} />
+      <MarkdownRenderer content={'<img src="/api/file-raw?path=x" onerror="alert(1)">'} />
     )
     const img = container.querySelector('img')
     expect(img?.getAttribute('onerror')).toBeNull()
@@ -128,6 +136,78 @@ describe('MarkdownRenderer XSS sanitization', () => {
     }
     // Verify no javascript: anywhere in the output
     expect(container.innerHTML).not.toContain('javascript:')
+  })
+
+  // Issue #9925: urlTransform rejects a destination by returning '' (react-
+  // markdown's defaultUrlTransform sentinel). '' is not nullish, so the plain-
+  // anchor branch rendered `<a href="">` — an ordinary-looking link whose
+  // address the browser resolves against the CURRENT PAGE, so "copy link
+  // address" yielded the dashboard's own session URL. A rejected destination
+  // must not be an anchor at all.
+  describe('rejected link destinations (#9925)', () => {
+    it('renders a non-allowlisted custom scheme as inert text, not an empty anchor', () => {
+      const { container } = render(
+        <MarkdownRenderer content={'[obsidian://open?vault=Notes](obsidian://open?vault=Notes)'} />
+      )
+      // The label survives as visible text…
+      expect(container.textContent).toContain('obsidian://open?vault=Notes')
+      // …but there is no anchor, and specifically nothing carrying href="".
+      expect(container.querySelector('a')).toBeNull()
+      expect(container.querySelector('[href=""]')).toBeNull()
+    })
+
+    it('renders an empty markdown destination as inert text', () => {
+      const { container } = render(<MarkdownRenderer content={'[label]()'} />)
+      expect(container.textContent).toContain('label')
+      expect(container.querySelector('a')).toBeNull()
+      expect(container.querySelector('[href=""]')).toBeNull()
+    })
+
+    // The ABSENT case is a distinct input value from the '' sentinel reaching
+    // the same `!href` predicate: raw-HTML `<a>bare</a>` is sanitizer-allowed
+    // and arrives with href === undefined. Pinned so a future narrowing of the
+    // guard to the sentinel alone (href === '') cannot silently restore a
+    // styled non-navigating anchor for the absent case.
+    it('renders a raw-HTML anchor with no href attribute as inert text', () => {
+      const { container } = render(<MarkdownRenderer content={'<a>bare</a>'} />)
+      expect(container.textContent).toContain('bare')
+      expect(container.querySelector('a')).toBeNull()
+    })
+
+    it('keeps inline markdown inside the inert label', () => {
+      const { container } = render(<MarkdownRenderer content={'[a `code` label](obsidian://x)'} />)
+      const code = container.querySelector('code')
+      expect(code).not.toBeNull()
+      expect(code!.textContent).toBe('code')
+      expect(container.querySelector('a')).toBeNull()
+      // With no anchor, InsideLinkCtx is deliberately not provided: the label
+      // is ordinary prose, so its code span re-enters the normal inline-code
+      // ladder and regains the click-to-copy affordance an in-link span is
+      // denied (contrast MarkdownRenderer.inlineCodeInLink.test.tsx).
+      expect(code).toHaveAttribute('role', 'button')
+    })
+
+    // Control: the guard must be scoped to the rejection sentinel — a plain
+    // https:// destination passes defaultUrlTransform unchanged and must keep
+    // rendering a real anchor with its exact href.
+    it('control: an https:// link still renders a real anchor with its exact href', () => {
+      const { container } = render(
+        <MarkdownRenderer content={'[docs](https://example.com/docs?q=1)'} />
+      )
+      const a = container.querySelector('a')
+      expect(a).not.toBeNull()
+      expect(a!.getAttribute('href')).toBe('https://example.com/docs?q=1')
+    })
+
+    // Control: an allowlisted editor scheme is rescued by urlTransform, so it
+    // must also keep its anchor.
+    it('control: a vscode:// link keeps its anchor and href', () => {
+      const url = 'vscode://file/home/user/project'
+      const { container } = render(<MarkdownRenderer content={`[open](${url})`} />)
+      const a = container.querySelector('a')
+      expect(a).not.toBeNull()
+      expect(a!.getAttribute('href')).toBe(url)
+    })
   })
 
   it('preserves safe HTML elements like details/summary', () => {
@@ -218,6 +298,35 @@ describe('isPathCandidate — path chip pre-filter', () => {
     expect(isPathCandidate('C:/Users/me/')).toBe(true) // drive-rooted, trailing forward slash
   })
 
+  it('rejects a command line that carries a path argument or a flag', () => {
+    // A space then a second root or a flag means several shell words, not one
+    // path; the probe could never confirm the whole span.
+    expect(isPathCandidate('sudo xcode-select -s /Applications/Xcode.app')).toBe(false)
+    expect(isPathCandidate('open ~/Downloads/report.pdf')).toBe(false)
+    expect(isPathCandidate('python ./scripts/run.py')).toBe(false)
+    expect(isPathCandidate('cp a.txt ../backup/a.txt')).toBe(false)
+    expect(isPathCandidate('type C:\\Users\\me\\notes.md')).toBe(false)
+    expect(isPathCandidate('tail --follow logs/app.log')).toBe(false)
+  })
+
+  it('still accepts paths whose names contain spaces and dashes', () => {
+    expect(isPathCandidate('/Users/me/Library/Application Support/x.json')).toBe(true)
+    expect(isPathCandidate('docs/Report - final.md')).toBe(true)
+    expect(isPathCandidate('My Docs/notes.md')).toBe(true)
+    expect(isPathCandidate('C:\\Program Files (x86)\\app.txt')).toBe(true)
+    // A dash glued to more of the name is not a flag: the word after it runs
+    // into a dot or a separator instead of ending at a space.
+    expect(isPathCandidate('docs/Report -final.md')).toBe(true)
+    expect(isPathCandidate('~/Music/Artist -Live.mp3')).toBe(true)
+    expect(isPathCandidate('Backup -old/x.md')).toBe(true)
+  })
+
+  it('refuses a name with a space right before a separator, by design', () => {
+    // A space then a root reads the same as a command and its path argument
+    // (`cat /draft.md`); losing the rare real name is the accepted cost.
+    expect(isPathCandidate('notes /draft.md')).toBe(false)
+  })
+
   it('a trailing separator does not rescue a non-path -- no widening (issue #9409)', () => {
     // The strip re-tests the same rules, so a trailing slash classifies only a
     // string whose slash-less form is already a candidate. These stay rejected
@@ -257,6 +366,20 @@ describe('isPathCandidate — path chip pre-filter', () => {
     expect(isPathCandidate('/home/user/notes/cafe\u0301-menu\u0308')).toBe(true)
     expect(isPathCandidate('~/दस्तावेज़/रिपोर्ट.md')).toBe(true) // Devanagari (virama/matra/nukta)
   })
+  it('accepts emoji segments — pictographs, flags and ZWJ sequences', () => {
+    // Emoji are filename-legal but are neither \p{L}, \p{M} nor \p{N}.
+    // Escapes keep the exact code points visible in review.
+    expect(isPathCandidate('notes/\u{1F389} plan.md')).toBe(true) // pictograph, relative + ext
+    expect(isPathCandidate('~/trips/\u{1F1EF}\u{1F1F5} Japan')).toBe(true) // flag = two regional indicators
+    expect(isPathCandidate('/home/me/\u{1F469}\u200D\u{1F4BB} work/todo.txt')).toBe(true) // ZWJ sequence
+    expect(isPathCandidate('/home/me/party \u{1F389}')).toBe(true) // emoji as the LAST character
+    expect(isPathCandidate('C:\\Users\\me\\\u{1F389}\\plan.md')).toBe(true) // drive-rooted shape
+    // No root and no extension is still prose, emoji or not.
+    expect(isPathCandidate('\u{1F389}/\u{1F38A}')).toBe(false)
+    expect(isPathCandidate('party')).toBe(false)
+    expect(isPathCandidate('\u{1F389}')).toBe(false)
+  })
+
 
   it('accepts a bare relative path whose Unicode basename has an ASCII extension', () => {
     // The extension positive-signal must not require the whole basename to be
@@ -516,13 +639,9 @@ describe('splitLineRef — file:line references', () => {
 describe('MarkdownRenderer path chips — stat gate', () => {
   const realFetch = globalThis.fetch
 
-  /** Stub the HEAD probe with a real Headers instance, so header lookup behaves
-   *  exactly as it does against the live endpoint. */
-  function stubKind(kind: 'file' | 'dir' | null, ok = true) {
-    const headers = new Headers(kind ? { 'X-Path-Kind': kind } : {})
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok, status: ok ? 200 : 404, headers } as Response),
-    ) as unknown as typeof fetch
+  /** Answer the batched kind probe with `kind` for every path. */
+  function stubKind(kind: 'file' | 'dir' | null, _ok = true) {
+    stubPathKinds(() => kind)
   }
 
   beforeEach(() => { __resetPathKindCache() })
@@ -543,28 +662,26 @@ describe('MarkdownRenderer path chips — stat gate', () => {
   })
 
   it('opens a confirmed Markdown file link in the file viewer instead of navigating to the chat route', async () => {
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const hit = asked === '/home/user/a.md'
-      return Promise.resolve({
-        ok: hit,
-        status: hit ? 200 : 404,
-        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    const fn = stubPathKinds(asked => (asked === '/home/user/a.md' ? 'file' : null))
     const onFileOpen = vi.fn()
     const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md:12)'} onFileOpen={onFileOpen} />)
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(probedPaths(fn)).toHaveLength(2))
 
     const anchor = container.querySelector('a[href="/home/user/a.md:12"]')
     expect(anchor).not.toBeNull()
-    fireEvent.click(anchor!)
-    expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+    await waitFor(() => {
+      fireEvent.click(anchor!)
+      expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+    })
   })
 
   it('swallows a plain Markdown file-link click while its path probe is pending', async () => {
     let resolveProbe: ((response: Response) => void) | undefined
-    globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveProbe = resolve })) as unknown as typeof fetch
+    let probeInit: RequestInit | undefined
+    globalThis.fetch = vi.fn((_url: unknown, init?: RequestInit) => {
+      probeInit = init
+      return new Promise<Response>((resolve) => { resolveProbe = resolve })
+    }) as unknown as typeof fetch
     const onFileOpen = vi.fn()
     const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md)'} onFileOpen={onFileOpen} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
@@ -574,7 +691,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     expect(fireEvent.click(anchor!)).toBe(false)
     expect(onFileOpen).not.toHaveBeenCalled()
 
-    resolveProbe?.({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
+    resolveProbe?.(kindsResponse(kindsRequestPaths(probeInit), () => 'file'))
   })
 
   it('does not probe a decoded root-relative UNC path', async () => {
@@ -587,23 +704,16 @@ describe('MarkdownRenderer path chips — stat gate', () => {
   })
 
   it('prefers a literal Markdown link filename over its line-reference sibling', async () => {
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const hit = asked === '/tmp/report.md' || asked === '/tmp/report.md:12'
-      return Promise.resolve({
-        ok: hit,
-        status: hit ? 200 : 404,
-        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    const fn = stubPathKinds(asked => (asked === '/tmp/report.md' || asked === '/tmp/report.md:12' ? 'file' : null))
     const onFileOpen = vi.fn()
     const { getByRole } = render(
       <MarkdownRenderer content={'[open](/tmp/report.md%3A12)'} onFileOpen={onFileOpen} />,
     )
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
-
-    fireEvent.click(getByRole('link', { name: 'open' }))
-    expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.md:12')
+    await waitFor(() => expect(probedPaths(fn)).toHaveLength(2))
+    await waitFor(() => {
+      fireEvent.click(getByRole('link', { name: 'open' }))
+      expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.md:12')
+    })
   })
 
   it('leaves an unconfirmed root-relative application link to navigate normally', async () => {
@@ -629,8 +739,10 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     // invisible icon carries no affordance, so what this guards is unchanged —
     // a real glyph must never reach a chip the backend did not confirm.
     expect(code.querySelector('svg:not([class*="opacity-0"])')).toBeNull()
-    // Non-path chips now have cursor-pointer for click-to-copy, but no file glyph.
-    expect(code.className).toContain('cursor-pointer')
+    // A non-path chip copies, so it wears the copy cursor — not the pointer hand
+    // and glyph that mark a chip whose click opens something.
+    expect(code.className).toContain('cursor-copy')
+    expect(code.className).not.toContain('cursor-pointer')
   })
 
   it('renders a confirmed directory as a folder chip, not a broken file link', async () => {
@@ -646,12 +758,12 @@ describe('MarkdownRenderer path chips — stat gate', () => {
   })
 
   it('leaves a path that is not on disk as plain text', async () => {
-    stubKind(null, false) // 404 + X-Path-Kind: missing (header absent here)
+    stubKind(null, false) // the batch answers `missing`
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    // Non-path chips now have cursor-pointer for click-to-copy.
-    expect(code.className).toContain('cursor-pointer')
+    // Not a path, so it is the copy chip: copy cursor, no path data.
+    expect(code.className).toContain('cursor-copy')
     expect(code.dataset.pathKind).toBeUndefined()
   })
 
@@ -697,7 +809,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     )
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
-      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl+click to copy`)
+      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl/Cmd+click to copy`)
     })
   })
 
@@ -710,7 +822,7 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     await waitFor(() => {
       const code = container.querySelector('code[data-path-kind]')!
       expect(code.getAttribute('title')).toBe(
-        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl+click to copy',
+        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl/Cmd+click to copy',
       )
     })
   })
@@ -739,20 +851,19 @@ describe('MarkdownRenderer path chips — stat gate', () => {
   })
 
   it('probes each distinct path once however many chips mention it', async () => {
-    stubKind('file')
+    const fn = stubPathKinds(() => 'file')
     render(<MarkdownRenderer content={'`/home/user/a.md` and again `/home/user/a.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
-    expect((globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1)
+    expect(kindsRequestCount(fn)).toBe(1)
+    expect(probedPaths(fn)).toEqual(['/home/user/a.md'])
   })
 })
 
 describe('MarkdownRenderer path chips — activation routing', () => {
   const realFetch = globalThis.fetch
 
-  function stubKind(kind: 'file' | 'dir', ok: boolean) {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok, status: ok ? 200 : 404, headers: new Headers({ 'X-Path-Kind': kind }) } as Response),
-    ) as unknown as typeof fetch
+  function stubKind(kind: 'file' | 'dir', _ok: boolean) {
+    stubPathKinds(() => kind)
   }
 
   beforeEach(() => { __resetPathKindCache() })
@@ -853,15 +964,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
    *  Needed here because the whole point is that ONE of two candidate spellings
    *  resolves and the other does not. */
   function stubPaths(known: string[]) {
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const hit = known.includes(asked)
-      return Promise.resolve({
-        ok: hit,
-        status: hit ? 200 : 404,
-        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    return stubPathKinds(asked => (known.includes(asked) ? 'file' : null))
   }
 
   const chipOf = (container: HTMLElement) => waitFor(() => {
@@ -940,15 +1043,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
     // hides the `.py`. Testing the raw text directly therefore left relative
     // citations — the majority form — with one probe and NO sibling precedence, so
     // this opened `src/report.py` even though `src/report.py:12` also exists.
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const known = asked === 'src/report.py' || asked === 'src/report.py:12'
-      return Promise.resolve({
-        ok: known,
-        status: known ? 200 : 404,
-        headers: new Headers(known ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    stubPathKinds(asked => (asked === 'src/report.py' || asked === 'src/report.py:12' ? 'file' : null))
     const onFileOpen = vi.fn()
     const { container } = render(
       <MarkdownRenderer content={'`src/report.py:12`'} onFileOpen={onFileOpen} />,
@@ -963,11 +1058,10 @@ describe('MarkdownRenderer path chips — file:line references', () => {
   it('charges the second probe only where there are two spellings to compare', async () => {
     // The extra request buys unambiguous precedence, so it must not be spent on a
     // chip that carries no line reference.
-    stubPaths(['/a/b.md'])
+    const fn = stubPaths(['/a/b.md'])
     const { container } = render(<MarkdownRenderer content={'`/a/b.md`'} />)
     await chipOf(container)
-    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls
-    expect(calls).toHaveLength(1)
+    expect(probedPaths(fn)).toEqual(['/a/b.md'])
   })
 
   it('picks the per-extension glyph from the stripped path', async () => {
@@ -1000,16 +1094,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
     // `/tmp/report` at line 12 — in an editor, so a later save would write to a
     // file the reader never named. The literal text they clicked has to win, and
     // here that means the folder route, not the file route.
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      if (asked === '/tmp/report') {
-        return Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
-      }
-      if (asked === '/tmp/report:12') {
-        return Promise.resolve({ ok: false, status: 404, headers: new Headers({ 'X-Path-Kind': 'dir' }) } as Response)
-      }
-      return Promise.resolve({ ok: false, status: 404, headers: new Headers() } as Response)
-    }) as unknown as typeof fetch
+    stubPathKinds(asked => (asked === '/tmp/report' ? 'file' : asked === '/tmp/report:12' ? 'dir' : null))
     const onFileOpen = vi.fn()
     const onFolderOpen = vi.fn()
     const { container } = render(
@@ -1029,24 +1114,27 @@ describe('MarkdownRenderer path chips — file:line references', () => {
   })
 
   it('stays inert until every probe in flight has reported', async () => {
-    // Both probes are concurrent, and the split one can land first. Rendering the
-    // affordance on that verdict alone leaves a window where a click opens the
-    // split path even though the literal name exists.
+    // The split verdict can be known before the literal one: here an earlier
+    // mention already resolved the split path, so it answers from cache while the
+    // literal path's request is still out. Rendering the affordance on that
+    // verdict alone leaves a window where a click opens the split path even
+    // though the literal name exists.
+    stubPaths(['/tmp/report'])
+    const warm = render(<MarkdownRenderer content={'`/tmp/report`'} />)
+    await chipOf(warm.container)
+    warm.unmount()
     let releaseRaw: (() => void) | undefined
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      if (asked === '/tmp/report') {
-        return Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
-      }
-      // Hold the literal-path verdict open so the split one lands first.
+    globalThis.fetch = vi.fn((_url: unknown, init?: RequestInit) => {
+      // Hold the literal-path verdict open.
       return new Promise<Response>(res => {
-        releaseRaw = () => res({ ok: false, status: 404, headers: new Headers() } as Response)
+        releaseRaw = () => res(kindsResponse(kindsRequestPaths(init), () => null))
       })
     }) as unknown as typeof fetch
     const { container } = render(<MarkdownRenderer content={'`/tmp/report:12`'} />)
-    // The split path has resolved as a file by now, but the chip must not offer
-    // itself while the literal path is unknown.
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+    // The split path is a known file, but the chip must not offer itself while
+    // the literal path is unknown.
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+    expect(probedPaths(globalThis.fetch as unknown as { mock: { calls: unknown[][] } })).toEqual(['/tmp/report:12'])
     expect(container.querySelector('code[data-path-kind]')).toBeNull()
     await act(async () => { releaseRaw?.(); await Promise.resolve() })
     const chip = await chipOf(container)
@@ -1057,15 +1145,7 @@ describe('MarkdownRenderer path chips — file:line references', () => {
   it('drops the line when the target turns out to be a directory', async () => {
     // Only the split path exists, and it is a directory. `/Users/me/ws:12` is not
     // a real name here, so the literal probe misses and the split path is used.
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
-      const isDir = asked === '/Users/me/ws'
-      return Promise.resolve({
-        ok: false,
-        status: 404,
-        headers: new Headers(isDir ? { 'X-Path-Kind': 'dir' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+    stubPathKinds(asked => (asked === '/Users/me/ws' ? 'dir' : null))
     const onFolderOpen = vi.fn()
     const onFileOpen = vi.fn()
     const { container } = render(
@@ -1124,16 +1204,10 @@ describe('MarkdownRenderer path chips — Windows paths', () => {
    *  pre-fix symptom, so the call list is itself an assertion target. */
   function stubPaths(known: string[]): string[] {
     const asked: string[] = []
-    globalThis.fetch = vi.fn((url: unknown) => {
-      const p = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+    stubPathKinds(p => {
       asked.push(p)
-      const hit = known.includes(p)
-      return Promise.resolve({
-        ok: hit,
-        status: hit ? 200 : 404,
-        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
-      } as Response)
-    }) as unknown as typeof fetch
+      return known.includes(p) ? 'file' : null
+    })
     return asked
   }
 
@@ -1257,9 +1331,7 @@ describe('MarkdownRenderer path chips — forgery resistance', () => {
    * always opened what they saw).
    */
   it('ignores a chip forged via raw HTML with a hidden path', async () => {
-    globalThis.fetch = vi.fn(() =>
-      Promise.resolve({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response),
-    ) as unknown as typeof fetch
+    stubPathKinds(() => 'file')
     const onFileOpen = vi.fn()
     const reveal = vi.spyOn(api, 'revealPath').mockResolvedValue({ ok: true } as never)
     const { container } = render(
@@ -1487,600 +1559,5 @@ describe('Lightbox keyboard navigation', () => {
     // A click after the drag must not change zoom (stays 2x) or close anything.
     act(() => { fireEvent.click(imgEl()) })
     expect(imgEl().getAttribute('style')).toContain('scale(2)')
-  })
-})
-
-describe('MarkdownRenderer mcwidget strip is inline-code-aware', () => {
-  it('preserves prose when an unclosed widget tag appears inside an inline-code span', () => {
-    // The `<mcwidget[\s\S]*$` alternative must not eat from the literal opening
-    // tag (inside backticks) to end-of-block, or it drops the rest of the prose.
-    const content = 'In a chat: ask the agent to emit any `<mcwidget>` (e.g. "render a CR queue widget"), then click Bookmark.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('emit any')
-    expect(text).toContain('render a CR queue widget')
-    expect(text).toContain('click Bookmark')
-  })
-
-  it('preserves a balanced inline-code mention of a widget tag pair', () => {
-    const content = 'Use `<mcwidget>hello</mcwidget>` to embed HTML.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('to embed HTML')
-  })
-
-  it('preserves real prose AFTER a backtick-wrapped tag mention earlier in the block', () => {
-    const content = [
-      '- Sidebar shows Artifacts',
-      '- In a chat: ask the agent to emit any `<mcwidget>` (e.g. "render a CR queue widget")',
-      '- Navigate to /artifacts',
-    ].join('\n')
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('Sidebar shows Artifacts')
-    expect(text).toContain('render a CR queue widget')
-    expect(text).toContain('Navigate to /artifacts')
-  })
-})
-
-describe('MarkdownRenderer strips leaked <tool_use> protocol markup', () => {
-  it('strips a complete <tool_use>...</tool_use> block and renders surrounding markdown', () => {
-    // When the agent leaks the full Anthropic tool_use wrapper as text, the
-    // unknown <tool_use> element would otherwise trap the JSON body (including
-    // escaped \n literals) into a single paragraph, dropping all the headers and
-    // rating callouts. The strip pass removes the wrapper and its body so the
-    // surrounding prose renders normally.
-    const content = [
-      "I'll generate the review.",
-      '',
-      '<tool_use> {"tool_calls": [{"tool_name": "write_file", "parameters": {"file_path": "/tmp/x.md", "content": "### Heading\\n\\n**Rating:** Mixed"}}]} </tool_use>',
-      '',
-      'Review saved.',
-    ].join('\n')
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain("I'll generate the review.")
-    expect(text).toContain('Review saved.')
-    // Tag itself and its JSON body must NOT leak through
-    expect(text).not.toContain('tool_calls')
-    expect(text).not.toContain('write_file')
-    expect(text).not.toContain('<tool_use>')
-    // getElementsByTagName (not querySelector('tool_use')): happy-dom parses the
-    // arg as a CSS selector and rejects the bare `tool_use` tag name as invalid,
-    // whereas getElementsByTagName takes a literal tag name on every engine.
-    expect(container.getElementsByTagName('tool_use')).toHaveLength(0)
-  })
-
-  it('strips an unclosed <tool_use> opener (mid-stream)', () => {
-    // During streaming the closing tag may not have arrived yet. The strip
-    // regex falls through to the `<tool_use[\s\S]*$` alternative and removes
-    // everything from the opener to end of block.
-    const content = 'Working on it…\n\n<tool_use> {"tool_calls": [{"tool_name": "write_'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('Working on it')
-    expect(text).not.toContain('tool_calls')
-    expect(text).not.toContain('write_')
-  })
-
-  it('strips multiple <tool_use> blocks in the same message', () => {
-    const content = [
-      'First action:',
-      '<tool_use>{"a": 1}</tool_use>',
-      'Second action:',
-      '<tool_use>{"b": 2}</tool_use>',
-      'Done.',
-    ].join('\n')
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('First action:')
-    expect(text).toContain('Second action:')
-    expect(text).toContain('Done.')
-    expect(text).not.toContain('"a"')
-    expect(text).not.toContain('"b"')
-  })
-
-  it('preserves <tool_use> mentions inside inline-code spans', () => {
-    // Author documenting the protocol in prose: e.g. `<tool_use>` should
-    // remain visible. The strip pass uses the same maskInlineCode helper as
-    // the widget strip, so backtick-wrapped tag mentions are not removed.
-    const content = 'When the agent emits a literal `<tool_use>` tag, the dashboard now strips it.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('<tool_use>')
-    expect(text).toContain('the dashboard now strips it.')
-  })
-
-  it('does NOT strip <tool_use> mentions inside fenced code blocks', () => {
-    // When the agent is documenting the protocol in a code block, the tags
-    // are real content — the fence makes the markdown renderer treat them
-    // as literal text and the strip pass operates on markdown blocks only,
-    // not extracted code blocks. Regression guard for documentation messages.
-    const content = '```\n<tool_use>{"x": 1}</tool_use>\n```'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const text = container.textContent || ''
-    expect(text).toContain('<tool_use>')
-    expect(text).toContain('"x"')
-  })
-})
-
-describe('MarkdownRenderer softBreaks', () => {
-  it('converts a soft line break to <br> when softBreaks is set', () => {
-    const { container } = render(<MarkdownRenderer content={'line one\nline two'} softBreaks />)
-    expect(container.querySelectorAll('br').length).toBe(1)
-    expect(container.textContent).toContain('line one')
-    expect(container.textContent).toContain('line two')
-  })
-
-  it('drops the redundant <br> between two attached images (blocks already break)', () => {
-    // Each image renders as its own block (span.block.my-2); a <br> between
-    // them adds an empty line box and blocks margin collapse, inflating the
-    // gap between two attached screenshots from ~8px to ~37px.
-    const { container } = render(<MarkdownRenderer
-      content={'shots\n\n![a](https://x.test/a.png)\n![b](https://x.test/b.png)'} softBreaks />)
-    expect(container.querySelectorAll('img').length).toBe(2)
-    expect(container.querySelectorAll('br').length).toBe(0)
-  })
-
-  it('keeps the <br> between an image and following TEXT (only image-adjacent breaks drop)', () => {
-    const { container } = render(<MarkdownRenderer
-      content={'line one\nline two\n\n![a](https://x.test/a.png)'} softBreaks />)
-    // the text-to-text break survives; none render adjacent to the image
-    expect(container.querySelectorAll('br').length).toBe(1)
-  })
-
-  it('collapses a soft line break by default (no softBreaks, no <br>)', () => {
-    const { container } = render(<MarkdownRenderer content={'line one\nline two'} />)
-    expect(container.querySelector('br')).toBeNull()
-  })
-
-  it('does not inject <br> between loose list items — block spacing stays normal', () => {
-    // A blank line between items makes a "loose" list. The soft-break plugin
-    // must only touch soft breaks inside text; block separators (parsed as
-    // distinct blocks) stay untouched, so list items keep normal spacing and
-    // no literal blank line is rendered between them.
-    const { container } = render(<MarkdownRenderer content={'1. first\n\n2. second'} softBreaks />)
-    expect(container.querySelectorAll('ol > li').length).toBe(2)
-    expect(container.querySelector('br')).toBeNull()
-  })
-
-  it('preserves multiple soft breaks in a paragraph as multiple <br> when softBreaks is set', () => {
-    const { container } = render(<MarkdownRenderer content={'a\nb\nc'} softBreaks />)
-    expect(container.querySelectorAll('br').length).toBe(2)
-  })
-})
-
-describe('MarkdownRenderer LaTeX-native delimiters (#7803)', () => {
-  it('renders \\[ ... \\] display math via KaTeX', () => {
-    const content = '\\[\n\\text{Incremental value} = V(a) - V(b)\n\\]'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('.katex, .katex-display')).not.toBeNull()
-    expect(container.textContent).not.toContain('\\[')
-  })
-
-  it('renders \\( ... \\) inline math via KaTeX', () => {
-    const { container } = render(
-      <MarkdownRenderer content={'The value \\(a^2 + b^2\\) grows.'} />
-    )
-    expect(container.querySelector('.katex')).not.toBeNull()
-    expect(container.textContent).toContain('grows.')
-  })
-
-  it('does not promote \\[ ... \\] to a display block when an inline sibling shares its line', () => {
-    // `**bold**` becomes a `strong` sibling, so the text node's raw slice
-    // BEGINS at `\[` and a slice-local "owns its line" check would say yes.
-    // The source line does not begin there; the math stays inline.
-    const { container } = render(<MarkdownRenderer content={'**bold** \\[ x \\] more'} />)
-    expect(container.querySelector('.katex-display')).toBeNull()
-    expect(container.querySelectorAll('p').length).toBe(1)
-    const p = container.querySelector('p')!
-    expect(p.querySelector('strong')).not.toBeNull()
-    expect(p.textContent).toContain('more')
-    // Mirror image: the sibling AFTER the delimiter shares the line.
-    const { container: c2 } = render(<MarkdownRenderer content={'\\[ x \\] **bold**'} />)
-    expect(c2.querySelector('.katex-display')).toBeNull()
-    expect(c2.querySelectorAll('p').length).toBe(1)
-  })
-
-  it('never places a display block inside a heading or table cell', () => {
-    // Display math is flow content; a heading cannot be split around it, and
-    // `\[ \]` has no inline form -- so it renders as the escaped literal
-    // `[ x ]` (the ADF/Jira shape), never as a centered block inside <h2>/<td>.
-    const { container } = render(<MarkdownRenderer content={'## \\[ x \\]'} />)
-    expect(container.querySelector('.katex-display')).toBeNull()
-    expect(container.querySelector('h2')!.textContent).toContain('[ x ]')
-    const { container: t } = render(
-      <MarkdownRenderer content={'| a |\n| - |\n| \\[ x \\] |'} />
-    )
-    expect(t.querySelector('.katex-display')).toBeNull()
-    expect(t.querySelector('td')!.textContent).toContain('[ x ]')
-  })
-
-  it('still lifts a display block that owns its own line after a bold line', () => {
-    const { container } = render(
-      <MarkdownRenderer content={'**bold**\n\\[\nx\n\\]\nafter'} />
-    )
-    expect(container.querySelector('.katex-display')).not.toBeNull()
-    expect(container.textContent).toContain('after')
-  })
-
-  it('keeps the soft line breaks around inline math as prose whitespace', () => {
-    // Wrapped prose puts a soft break right before or after inline math. That
-    // break is a space to the reader; only a DISPLAY block owns its line.
-    const content = 'first\n\\(x\\)\nsecond and \\(y\\)\nthird'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const p = container.querySelector('p')!
-    expect(p.querySelectorAll('.katex').length).toBe(2)
-    const text = Array.from(p.childNodes)
-      .filter(n => n.nodeType === Node.TEXT_NODE)
-      .map(n => n.textContent)
-    // Each prose piece still carries the break on its math-facing side.
-    expect(text[0]).toBe('first\n')
-    expect(text[1]).toBe('\nsecond and ')
-    expect(text[2]).toBe('\nthird')
-    // The display trim is unchanged: the line break between prose and a
-    // display block is layout and is dropped.
-    const { container: display } = render(
-      <MarkdownRenderer content={'before\n\\[\nx\n\\]\nafter'} />
-    )
-    for (const p2 of Array.from(display.querySelectorAll('p'))) {
-      expect(p2.textContent).not.toMatch(/^\n|\n$/)
-    }
-  })
-
-  it('leaves \\[ inside fenced code blocks literal', () => {
-    const content = '```sh\ngrep "\\[x\\]" file\n```'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('.katex')).toBeNull()
-    expect(container.textContent).toContain('\\[x\\]')
-  })
-
-  it('leaves \\[ inside inline code literal', () => {
-    const { container } = render(
-      <MarkdownRenderer content={'Use `\\[escape\\]` in the pattern.'} />
-    )
-    expect(container.querySelector('.katex')).toBeNull()
-    expect(container.textContent).toContain('\\[escape\\]')
-  })
-
-  it('leaves an unmatched \\[ opener alone', () => {
-    const { container } = render(<MarkdownRenderer content={'A lone \\[ bracket here'} />)
-    expect(container.querySelector('.katex')).toBeNull()
-  })
-
-  it('does not defeat markdown bracket-escapes (ADF safety shapes)', () => {
-    // Escaped literal brackets HUG their text — converting them to math
-    // would defeat the escape the ADF converter emits for security.
-    const image = render(<MarkdownRenderer content={'!\\[a\\](http://example.com/i.png)'} />)
-    expect(image.container.querySelector('.katex')).toBeNull()
-    expect(image.container.textContent).toContain('![a](http://example.com/i.png)')
-    const redacted = render(<MarkdownRenderer content={'\\[REDACTED: credential\\]'} />)
-    expect(redacted.container.querySelector('.katex')).toBeNull()
-    expect(redacted.container.textContent).toContain('[REDACTED: credential]')
-  })
-
-  it('converts whitespace-padded single-line display math', () => {
-    const { container } = render(<MarkdownRenderer content={'\\[ a^2 + b^2 = c^2 \\]'} />)
-    expect(container.querySelector('.katex, .katex-display')).not.toBeNull()
-  })
-
-  it('leaves mid-sentence escaped brackets literal even when padded (Jira/ADF shape)', () => {
-    const { container } = render(
-      <MarkdownRenderer content={'have you seen \\[ x \\] in the board column?'} />
-    )
-    expect(container.querySelector('.katex')).toBeNull()
-    expect(container.textContent).toContain('[ x ]')
-  })
-
-  it('does not let an unmatched opener consume a closer inside inline code', () => {
-    const { container } = render(
-      <MarkdownRenderer content={'A lone \\( here, then code `f\\(x\\)` stays code.'} />
-    )
-    expect(container.textContent).toContain('f\\(x\\)')
-  })
-
-  it('does not treat a non-closing fence-like line as ending code protection', () => {
-    const content = '~~~\ncontent\n~~~not-close\n\\[ still in fence \\]\n~~~'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('.katex')).toBeNull()
-    expect(container.textContent).toContain('still in fence')
-  })
-
-  it('renders math from ELIGIBLE TEXT NODES only: never inside link destinations', () => {
-    const content = 'see [the page](https://example.com/wiki/Name_\\(disambiguation\\)) for more'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('.katex')).toBeNull()
-    const a = container.querySelector('a')
-    expect(a?.getAttribute('href')).toContain('disambiguation')
-  })
-
-  it('never rewrites raw HTML attributes (the transform sees an html node, not text)', () => {
-    // A source scanner cannot tell an attribute value from prose; the remark
-    // transform never visits `html` nodes, so an escaped paren in an href
-    // survives to rehype-raw intact instead of becoming `$$`.
-    const content = 'Try <a href="https://example.com/a_\\(b\\)">here</a> and \\(x\\) now.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    const a = container.querySelector('a')
-    expect(a?.getAttribute('href')).toContain('a_\\(b\\)')
-    // …while the prose math beside it still converts: the guard is per node.
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-  })
-
-  it('handles pathological unmatched-opener input in linear time', () => {
-    // 50k unmatched openers = 100k chars; a quadratic per-opener rescan would
-    // trip vitest's 5s test timeout. This test IS the regression guard.
-    const pathological = '\\('.repeat(50000)
-    const { container } = render(<MarkdownRenderer content={pathological} />)
-    expect(container.querySelector('.katex')).toBeNull()
-  })
-
-  // Timing guards below assert RATIOS of medians, never a single sample: one
-  // GC pause or a noisy neighbour on a shared runner can double a lone
-  // measurement, and the median of three interleaved samples per shape is
-  // immune to any one of them. Interleaving (a, b, a, b, ...) means drift
-  // during the run lands on both shapes alike.
-  const medianRatio = (numerator: () => number, denominator: () => number, samples = 3) => {
-    const num: number[] = []
-    const den: number[] = []
-    for (let i = 0; i < samples; i++) {
-      den.push(denominator())
-      num.push(numerator())
-    }
-    const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]
-    return median(num) / median(den)
-  }
-
-  it('handles a flood of empty display pairs in linear time (no per-closer slice)', { timeout: 300000 }, () => {
-    // `\[ \] ` x150k: every closer reaches the display-eligibility gate and
-    // nothing converts (the body trims empty). The first/last-line checks used
-    // to slice the raw text per closer -- O(offset) each, quadratic overall.
-    // Measured against an equal-size (900 KB) flood of unmatched openers, which
-    // is known-linear and pays the same remark parse: ratio 2.55 on the
-    // previous head, 1.01 now. A RATIO is asserted, not a wall-clock bound, so
-    // the guard reads the same on a slow CI runner as on a fast workstation.
-    // V8's SIMD `includes` hides the quadratic term below ~100k chars, so the
-    // size is chosen where the shapes separate; this is a gross-regression
-    // guard, not a proof of linearity. Each shape is rendered three times and
-    // the medians are compared (see medianRatio), which is why the timeout is
-    // generous: six 900 KB renders, not two.
-    const time = (s: string) => {
-      const t0 = performance.now()
-      render(<MarkdownRenderer content={s} />)
-      return performance.now() - t0
-    }
-    const ratio = medianRatio(
-      () => time('\\[ \\] '.repeat(150000)),
-      () => time('\\[ '.repeat(300000)),
-    )
-    expect(ratio).toBeLessThan(1.8)
-  })
-
-  it('pairs thousands of unclosed verbatim openers in linear time (one pass, not a scan per opener)', () => {
-    // 6000 unclosed `<customblock>` openers before one math delimiter. Both the
-    // renderer's verbatim-unknown-tags pass and the plugin's verbatim context
-    // used to run a full-suffix close scan per opener -- O(n²): 3x the input
-    // cost 7.5x the time (1.1 s -> 8.0 s). With the shared single-pass pairing
-    // map, 3x the input costs ~2.5x. A scaling RATIO is asserted, not a
-    // wall-clock bound, so the guard reads the same on any runner. A warm-up
-    // render absorbs JIT and module-load cost from the first measurement, and
-    // the ratio is of medians over three interleaved samples per size.
-    const time = (n: number) => {
-      const t0 = performance.now()
-      render(<MarkdownRenderer content={'<customblock> '.repeat(n) + '\\(x\\)'} />)
-      return performance.now() - t0
-    }
-    time(2000)
-    const ratio = medianRatio(
-      () => time(6000),
-      () => time(2000),
-    )
-    expect(ratio).toBeLessThan(5)
-    const { container } = render(<MarkdownRenderer content={'<customblock> '.repeat(6000) + '\\(x\\)'} />)
-    // Unclosed openers are lone tags shown as source; the math after them is prose math.
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-    expect(container.textContent).toContain('<customblock>')
-  })
-
-  it('handles a pathological backslash run in linear time (escape parity is tracked forward)', () => {
-    // 100k backslashes ending in `\(`: a per-position backward run scan would
-    // be O(n²) (~5e9 steps) and trip the test timeout; the forward parity
-    // counter makes it one visit per character. Even-length run → the final
-    // `\(` is an escaped backslash + a plain paren, so nothing converts.
-    const run = '\\'.repeat(100000)
-    const { container } = render(<MarkdownRenderer content={run + '( x \\) end'} />)
-    expect(container.querySelector('.katex')).toBeNull()
-    // Odd-length run → a real opener; it pairs and converts.
-    const odd = render(<MarkdownRenderer content={'\\'.repeat(100001) + '( x \\) end'} />)
-    expect(odd.container.querySelector('.katex')).not.toBeNull()
-  })
-
-  it('handles pathological repeated ]( junk in linear time', () => {
-    // The transform's own cost on `](` junk is one visit per character. The
-    // PARSE that precedes it is remark's and is super-linear on this input
-    // (measured ~7s/100kB on a laptop, worse on CI), so the size here is what
-    // exercises the transform without paying for remark's parse: 2k junk
-    // tokens, both maths convert, and the render stays well inside the
-    // timeout. The transform-level linearity is pinned by the backslash-run
-    // test above, which does not go through remark's slow path.
-    const junk = ']('.repeat(2000)
-    const { container } = render(<MarkdownRenderer content={junk + ' \\( x \\)\n\n\\( y \\)'} />)
-    expect(container.querySelectorAll('.katex').length).toBe(2)
-  })
-
-  it('leaves math delimiters inside indented code blocks literal', () => {
-    // A 4-space-indented code block is a `code` node to the parser even
-    // with no fence; the transform never visits it.
-    const content = 'Example:\n\n    result = \\(x\\) + 1\n\nDone.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('.katex')).toBeNull()
-    expect(container.textContent).toContain('\\(x\\)')
-  })
-
-  it('leaves double-escaped delimiters literal (escape parity)', () => {
-    // `\\(x\\)` is an escaped backslash followed by a plain paren — the shape
-    // Jira's inline escaper emits for a literal backslash-paren.
-    const literal = render(<MarkdownRenderer content={'literal \\\\(x\\\\) stays'} />)
-    expect(literal.container.querySelector('.katex')).toBeNull()
-    expect(literal.container.textContent).toContain('\\(x\\)')
-    // Parity, not blanket suppression: `\\\(` is an escaped backslash THEN a
-    // real opener, so a triple-backslash pair still converts.
-    const triple = render(<MarkdownRenderer content={'\\\\\\( x \\\\\\)'} />)
-    expect(triple.container.querySelector('.katex')).not.toBeNull()
-  })
-
-  it('leaves math delimiters inside blockquoted fenced code literal', () => {
-    const content = '> ```\n> \\(x\\)\n> ```\n\n\\( y \\)'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.textContent).toContain('\\(x\\)') // fenced inside blockquote: untouched
-    expect(container.querySelectorAll('.katex').length).toBe(1) // prose after: converts
-  })
-
-  it('leaves reference-link definition destinations untouched', () => {
-    // `[label]: url` is a `definition` node whose destination is a URL —
-    // escaped parens there are literal path characters, never math.
-    const content = '[fn]: https://example.test/Name_\\(detail\\)\n\n[link][fn] and \\( y \\)'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('a')?.getAttribute('href')).toContain('Name_')
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-  })
-
-  it('splits a paragraph around display math so the block is valid flow content', () => {
-    const content = 'Before\n\\[\na = b\n\\]\nAfter'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelector('.katex-display')).not.toBeNull()
-    // Neither the display block nor its <pre> lives inside a <p>.
-    expect(container.querySelector('p .katex-display, p pre')).toBeNull()
-    expect(container.textContent).toContain('Before')
-    expect(container.textContent).toContain('After')
-  })
-
-  it('keeps blockquote prose intact around math (prose comes from the parsed value, not a raw slice)', () => {
-    // Inside a blockquote the text node's raw source spans the interior `> `
-    // continuation markers. Prose must come from remark's decoded value; only
-    // the math span is read from raw (so its backslashes survive).
-    const content = '> first line \\(a\\) more\n> second line \\(b\\) done'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelectorAll('.katex').length).toBe(2)
-    const text = container.querySelector('blockquote')?.textContent ?? ''
-    expect(text).not.toContain('>')
-    expect(text).toContain('first line')
-    expect(text).toContain('second line')
-    expect(text).toContain('done')
-  })
-
-  it('keeps an entity it does not know by name exactly as remark decoded it', () => {
-    // `&Omega;` is not in the transform's small named table. Prose must still
-    // read "Ω" because it comes from the parser's value, not a re-decode.
-    const { container } = render(<MarkdownRenderer content={'Resistance in &Omega; is \\(R\\) here'} />)
-    expect(container.querySelector('.katex')).not.toBeNull()
-    expect(container.textContent).toContain('Ω')
-    expect(container.textContent).not.toContain('&Omega;')
-  })
-
-  it('leaves text inside paired raw <code> HTML verbatim', () => {
-    // Raw inline `<code>…</code>` parses as two `html` nodes around a plain
-    // `text` node; that text is verbatim even though remark typed it text.
-    const content = 'Use <code>f\\(x\\)</code> literally, but \\(y\\) renders.'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-    // remark itself decodes the escapes inside the raw element's text (that is
-    // CommonMark); what must NOT happen is a KaTeX node inside the <code>.
-    const code = container.querySelector('code')
-    expect(code?.textContent).toBe('f(x)')
-    expect(code?.querySelector('.katex')).toBeNull()
-  })
-
-  it('gives synthesized paragraphs and display math real source positions (sourcePos mode)', () => {
-    const content = 'Line one\n\\[\na = b\n\\]\nLine five'
-    const { container } = render(<MarkdownRenderer content={content} sourcePos />)
-    const ps = Array.from(container.querySelectorAll('p'))
-    expect(ps.length).toBe(2)
-    // The paragraph AFTER the display block must anchor to line 5, not be
-    // position-less (which rehypeSourcepos would skip, mis-anchoring comments).
-    const after = ps.find((p) => p.textContent?.includes('Line five'))
-    expect(after?.getAttribute('data-sourcepos')).toMatch(/^5:1-5:/)
-    const before = ps.find((p) => p.textContent?.includes('Line one'))
-    expect(before?.getAttribute('data-sourcepos')).toMatch(/^1:1-1:/)
-    // The display block itself carries no data-sourcepos — rehype-katex replaces
-    // the positioned element — exactly as remark-math's own `$$` blocks behave;
-    // the mdast `math` node does carry the 2:1-4:3 span for any consumer that
-    // reads positions before KaTeX runs.
-    expect(container.querySelector('.katex-display')).not.toBeNull()
-  })
-
-  it('handles an ampersand flood beside math in linear time (the reference scan is bounded)', () => {
-    // Gross-regression guard only: V8's vectorised indexOf hides the old
-    // quadratic below ~1M chars, so a CI-sized input cannot distinguish the
-    // bounded scan from the unbounded one by timing (measured 3x at 250k).
-    // The bound is what the code review verifies; this asserts no blow-up.
-    // The measure is a ratio of medians against the same flood with the math
-    // replaced by plain parens, which pays the same remark parse and none of
-    // the reference scan, so it reads the same on any runner: ~1.1 today.
-    const amp = '&'.repeat(100_000)
-    const time = (s: string) => {
-      const t0 = performance.now()
-      render(<MarkdownRenderer content={s} />)
-      return performance.now() - t0
-    }
-    const ratio = medianRatio(
-      () => time('x \\(a\\) ' + amp),
-      () => time('x (a) ' + amp),
-    )
-    expect(ratio).toBeLessThan(3)
-    const { container } = render(<MarkdownRenderer content={'x \\(a\\) ' + amp} />)
-    expect(container.querySelector('.katex')).not.toBeNull()
-    expect(container.textContent).toContain('&'.repeat(100))
-  })
-
-  it('leaves text inside an unknown paired container as source, like the tags around it', () => {
-    // The verbatim-unknown-tags pass shows `<customBlock>…</customBlock>` as
-    // literal source; a KaTeX span in the middle of that source would be wrong.
-    const { container } = render(<MarkdownRenderer content={'<customBlock>\\(x\\)</customBlock> then \\(y\\)'} />)
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-    expect(container.textContent).toContain('<customBlock>')
-  })
-
-  it('agrees with the verbatim pass on a tag whose quoted attribute contains ">"', () => {
-    // Both passes now share one tag grammar (htmlTagGrammar). A `>` inside a
-    // quoted attribute value is part of the tag to the renderer's verbatim pass,
-    // so it must open the plugin's verbatim context too -- otherwise the source
-    // the renderer shows literally would carry a KaTeX span in its middle.
-    const { container } = render(
-      <MarkdownRenderer content={'<customBlock title="a>b">\\(x\\)</customBlock> then \\(y\\)'} />
-    )
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-    expect(container.textContent).toContain('title="a>b"')
-    // The inner math stayed source (remark decodes the `\(` escape in text).
-    expect(container.textContent).toContain('>(x)<')
-  })
-
-  it('keeps the verbatim context correct after an earlier text node in the paragraph was rewritten', () => {
-    // The first container builds the pairing map on the ORIGINAL indices. The
-    // text between the containers is rewritten into three nodes, shifting the
-    // second container by two. A map consulted after that splice has no entry
-    // at the shifted index, so no verbatim context opens and the math inside
-    // `<customBlock>` converts. Decisions are made on a frozen snapshot now.
-    const content = '<code>\\(a\\)</code> then \\(x\\) then <customBlock>\\(z\\)</customBlock>'
-    const { container } = render(<MarkdownRenderer content={content} />)
-    // Only x renders; a (in <code>) and z (in the unknown container) stay source.
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-    expect(container.textContent).toContain('<customBlock>(z)</customBlock>')
-  })
-
-  it('still converts math inside an allowlisted paired prose tag', () => {
-    const { container } = render(<MarkdownRenderer content={'<b>bold \\(x\\) here</b>'} />)
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-  })
-
-  it('treats text after an UNCLOSED unknown tag as prose', () => {
-    const { container } = render(<MarkdownRenderer content={'<customBlock> lone tag then \\(x\\)'} />)
-    expect(container.querySelectorAll('.katex').length).toBe(1)
-  })
-
-  it('keeps character references in prose next to converted math', () => {
-    const { container } = render(<MarkdownRenderer content={'Tom &amp; Jerry \\(x\\) &copy; 2026'} />)
-    expect(container.querySelector('.katex')).not.toBeNull()
-    expect(container.textContent).toContain('Tom & Jerry')
-    expect(container.textContent).toContain('© 2026')
   })
 })

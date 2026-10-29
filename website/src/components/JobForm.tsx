@@ -1,19 +1,22 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Zap } from 'lucide-react'
 import { api } from '../api/client'
 import { ApiError } from '../api/apiError'
 import { Btn, Input, SendBtn } from './ui'
 import { SettingsToggle } from './settings'
-import AgentSelector, { type KiroCrewAgent } from './AgentSelector'
+import AgentSelector, { crewDisplayName, type KiroCrewAgent } from './AgentSelector'
+import SegmentedControl from './SegmentedControl'
 import SimpleSelect from './SimpleSelect'
 import type { ChatFolder, CronJob } from '../types'
 import { orderFoldersWithPaths } from '../utils/folderTree'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import type { CronPrefill } from '../utils/schedulePresets'
 import { SaveCreateLabel, expandDow } from '../utils/cronUtils'
 import { adviseCronMode } from '../utils/cronModeAdvice'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { fmtWeekday } from '../i18n/format'
 import ErrorNotice from './ErrorNotice'
 export const TIMEZONES = ['America/Los_Angeles','America/Phoenix','America/Denver','America/Chicago','America/New_York','America/Sao_Paulo','Europe/London','Europe/Berlin','Europe/Paris','Asia/Kolkata','Asia/Shanghai','Asia/Tokyo','Australia/Sydney','Pacific/Auckland','UTC']
@@ -24,18 +27,23 @@ const dayNames = () => [1, 2, 3, 4, 5, 6, 7].map((iso) => fmtWeekday(iso))
 const GRID_TO_CRON_DOW = [0, 1, 2, 3, 4, 5, 6, 0] // grid 1-7 → cron dow
 const CRON_DOW_TO_GRID: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 0: 7, 7: 7 }
 
+/** What a job runs as: a custom agent (template) or a crewmate. */
+type RunsAs = 'template' | 'member'
+/** A roster row's kind, read the way AgentSelector groups it. */
+const runsAsOf = (a: KiroCrewAgent): RunsAs => a.selection_kind ?? 'member'
 
 
 /** The pinned crew, rendered as a fact rather than a disabled selector — a
  * greyed-out control asks to be re-enabled; a value does not. Shrink-wrapped
  * so it cannot read as an editable input among the real ones, and the hint
  * says WHY it is fixed, replacing the picker's own hint line. */
-function LockedAgentValue({ name, member }: { name: string; member?: boolean }) {
+function LockedAgentValue({ name, member, hint: hostHint }: { name: string; member?: boolean; hint?: string }) {
   // The hint names the thing the HOST calls it. A member surface says "member"
   // throughout, so a hint saying "crew" there made one binding read as two — the
   // blind reader could not tell whether member, crew and agent were one thing or
-  // three. Same sentence, the noun the reader already has.
-  const hint = i18nT(member
+  // three. Same sentence, the noun the reader already has. A host with a third
+  // noun (the crewmate Profile card) hands the whole sentence in.
+  const hint = hostHint || i18nT(member
     ? 'components.jobForm.member_pinned_hint'
     : 'components.jobForm.agent_pinned_hint')
   return (
@@ -62,6 +70,9 @@ export function jobKindOf(job?: CronJob): JobKind {
   if (job?.command) return 'command'
   return 'message'
 }
+
+/** Highest auto-pause limit the backend accepts (`_AUTO_PAUSE_MAX`). */
+const AUTO_PAUSE_MAX = 10000
 
 /** Parse a CronJob into initial form state */
 function parseJobDefaults(job?: CronJob) {
@@ -219,6 +230,10 @@ interface Props {
    *  from `memberId`: every crew passes `memberId` for identity, so deriving
    *  flipped the crew editor's wording to "member" for plain agents. */
   memberNoun?: boolean
+  /** The pinned-value hint, written by the host, for a surface whose noun is
+   *  neither "crew" nor "member" — the crewmate Profile card's pushed New
+   *  schedule page says "crewmate" throughout. Wins over `memberNoun`. */
+  lockedAgentHint?: string
   providerAgent?: string
   onSaved: () => void
   /** Vertical layout for side panel, horizontal for inline create */
@@ -256,7 +271,7 @@ interface Props {
   onDirtyChange?: (dirty: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, memberId, memberNoun, providerAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onSubmitError, onDirtyChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, memberId, memberNoun, lockedAgentHint, providerAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onSubmitError, onDirtyChange }: Props) {
   // "" and undefined both mean unlocked, so render and submit share one truth.
   const boundMember = job?.member_id || memberId
   const privateMember = !!boundMember && boundMember !== 'default'
@@ -281,6 +296,45 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const [name, setName] = useState(init.name)
   const [msg, setMsg] = useState(init.message)
   const [agent, setAgent] = useState(defaults.agent)
+  // "Runs as" (#18772): a job either opens a new session on a custom agent (a
+  // template) or is a crewmate's own schedule. The Schedule page's roster holds
+  // both kinds, so the switch picks the kind and the picker lists only that
+  // kind. A crewmate pick still goes out as `agent`; the create endpoint turns
+  // it into `member_id`. Hidden where the host pins the agent, and on a roster
+  // that does not say which row is which. A job never changes kind, and a
+  // crewmate job carries `member_id`, which pins it above (`locked`), so a job
+  // that reaches the switch in edit mode is a custom-agent job: the switch is
+  // held there. The kind is read from `member_id`, never from `agent`, which
+  // the backend empties for a crewmate job.
+  const showRunsAs = !locked && agents.some(a => a.selection_kind)
+  // Only a crewmate with its own memory: `split_cron_agent_member` makes a
+  // crewmate job only for a name with a `member_id`, which exists only with
+  // member memory. The stock `default` crew (shared memory) would be saved as
+  // a custom-agent job, so it is not offered here.
+  const crewmates = useMemo(
+    () => agents.filter(a => runsAsOf(a) === 'member' && a.memory_store !== 'default'),
+    [agents],
+  )
+  const templates = useMemo(() => agents.filter(a => runsAsOf(a) === 'template'), [agents])
+  const [pickedRunsAs, setPickedRunsAs] = useState<RunsAs>('template')
+  const runsAs: RunsAs = job ? 'template' : pickedRunsAs
+  // An older job can name a crewmate in `agent` with no `member_id`; it runs as
+  // a template, so it edits here, and its own row stays pickable.
+  const templatesWithStored = useMemo(() => {
+    const stored = job && !templates.some(a => a.name === defaults.agent)
+      ? agents.find(a => a.name === defaults.agent)
+      : undefined
+    return stored ? [...templates, stored] : templates
+  }, [job, templates, agents, defaults.agent])
+  const changeRunsAs = (next: RunsAs) => {
+    // SegmentedControl reports a click on the selected option too; that is no
+    // change, so it must not reset the pick.
+    if (next === runsAs) return
+    setPickedRunsAs(next)
+    // '' means the default custom agent; a crewmate job always names one.
+    setAgent(next === 'member' ? (crewmates[0]?.name ?? '') : '')
+  }
+  const runsAsLayoutId = useId()
   const [model, setModel] = useState(defaults.model)
   const { data: modelList = [] } = useQuery<{ name: string; description?: string }[]>({
     queryKey: ['models'],
@@ -304,6 +358,20 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   const [hideInChat, setHideInChat] = useState(defaults.hideInChat)
   const [minimalContext, setMinimalContext] = useState(defaults.minimalContext)
   const [chatFolderId, setChatFolderId] = useState(defaults.chatFolderId)
+  // Edit-only, and only when the gateway reports the job's limit: without the
+  // stored value the field would show a guess, and saving it would write that
+  // guess back. Held as the typed text so the input can be emptied mid-edit.
+  const showAutoPause = !!job && typeof job.auto_pause_after_failures === 'number'
+  // The baseline is captured once, when the form opens. A crons refresh can
+  // hand this same mounted form a newer `job` (another tab saved a new limit);
+  // recomputing the baseline from it would make the untouched field look
+  // changed and send the stale value back over the saved one.
+  const [initialAutoPause] = useState(() => (showAutoPause ? String(job?.auto_pause_after_failures) : ''))
+  const [autoPause, setAutoPause] = useState(initialAutoPause)
+  // A validation hint, not an error: nothing failed, the form's own check
+  // stopped the save. Kept apart from `error` so it is never shown through
+  // ErrorNotice (errors-use-error-notice).
+  const [autoPauseHint, setAutoPauseHint] = useState('')
   const [schedMode, setSchedMode] = useState(init.schedMode)
   const [intVal, setIntVal] = useState(init.intVal)
   const [intUnit, setIntUnit] = useState(init.intUnit)
@@ -326,6 +394,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
     hideInChat !== defaults.hideInChat || schedMode !== init.schedMode ||
     minimalContext !== defaults.minimalContext ||
     chatFolderId !== defaults.chatFolderId ||
+    autoPause !== initialAutoPause ||
     intVal !== init.intVal || intUnit !== init.intUnit ||
     weekTime !== init.weekTime || cronExpr !== init.cronExpr ||
     weekDays.length !== init.weekDays.length || weekDays.some((d, i) => d !== init.weekDays[i])
@@ -401,10 +470,11 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
    *  folders in the order and with the ancestry labels the reader already knows --
    *  and a fix to either (a cycle guard, a non-string name off disk) reaches all
    *  of them at once. */
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortMode()
   const folderOptions = useMemo(() => {
-    const ordered = orderFoldersWithPaths(chatFolders)
+    const ordered = orderFoldersWithPaths(chatFolders, folderSortMode)
     return { values: ordered.map(f => f.folder.id), labels: ordered.map(f => f.path) }
-  }, [chatFolders])
+  }, [chatFolders, folderSortMode])
   /** `hide_in_chat` is the explicit "this job gets no tab" opt-out, and a run with
    *  no tab has nothing to file -- so with it on the picker cannot do anything.
    *  Saying that and refusing input beats accepting a setting whose only
@@ -458,6 +528,17 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
     const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, minimalContext, chatFolderId: submittedChatFolderId, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
     const body = buildBody(f, tz, setError, !!job, job ? undefined : prefill)
     if (!body) { setSaving(false); return }
+    // Sent only when changed, so an unrelated edit never rewrites the limit
+    // (and never writes an audit row for a value nobody touched).
+    if (showAutoPause && autoPause.trim() !== initialAutoPause) {
+      const limit = Number(autoPause.trim())
+      if (autoPause.trim() === '' || !Number.isInteger(limit) || limit < 0 || limit > AUTO_PAUSE_MAX) {
+        setAutoPauseHint(i18nT('components.jobForm.auto_pause_after_failures_invalid'))
+        setSaving(false)
+        return
+      }
+      if (limit !== job?.auto_pause_after_failures) body.auto_pause_after_failures = limit
+    }
     if (privateMember && !isLlmless) {
       // Keyed on `privateMember`, not on `boundMember`, and BOTH lines depend on
       // it. The backend refuses `member_id: "default"` as a V1 identity, so the
@@ -516,6 +597,47 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
   if (submitRef) submitRef.current = submit
 
   const vertical = layout === 'vertical'
+  const pickedCrewmate = crewmates.find(a => a.name === agent)
+  const runsAsField = showRunsAs ? (
+    <div className="flex flex-col gap-1">
+      <SegmentedControl<RunsAs>
+        segments={[
+          {
+            key: 'template',
+            label: i18nT('components.jobForm.runs_as_custom_agent'),
+          },
+          {
+            key: 'member',
+            label: i18nT('components.jobForm.runs_as_crewmate'),
+            disabled: !!job || crewmates.length === 0,
+          },
+        ]}
+        value={runsAs}
+        onChange={changeRunsAs}
+        ariaLabel={i18nT('components.jobForm.runs_as')}
+        layoutId={runsAsLayoutId}
+        collapse={false}
+        wrap="hug"
+      />
+      <span className="text-[11px] text-muted/70">
+        {runsAs === 'member'
+          ? i18nT('components.jobForm.runs_as_crewmate_hint', { name: pickedCrewmate ? crewDisplayName(pickedCrewmate) : agent })
+          : i18nT('components.jobForm.runs_as_custom_agent_hint')}
+      </span>
+      {/* Why an option is greyed out, said as text rather than a hover tooltip. */}
+      {job
+        ? <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.runs_as_fixed')}</span>
+        : crewmates.length === 0 && <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.runs_as_no_crewmates')}</span>}
+      <AgentSelector
+        agents={runsAs === 'member' ? crewmates : templatesWithStored}
+        defaultAgent={runsAs === 'member' ? '' : defaultAgent}
+        value={agent}
+        onChange={(name) => setAgent(name)}
+        rosterFailure={rosterFailure}
+        modal
+      />
+    </div>
+  ) : null
 
   /** The job's timezone picker, rendered identically by the weekly and the
    *  cron-expression branch (it was the same markup twice).
@@ -568,8 +690,8 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           <Input placeholder={i18nT('components.jobForm.job_name')} value={name} onChange={e => setName(e.target.value)} />
           <Input placeholder={i18nT('components.jobForm.message_task')} style={{ flex: 2 }} value={msg} onChange={e => setMsg(e.target.value)} />
           {locked
-            ? <LockedAgentValue name={locked} member={memberNoun} />
-            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />}
+            ? <LockedAgentValue name={locked} member={memberNoun} hint={lockedAgentHint} />
+            : runsAsField ?? <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />}
           <SimpleSelect
             options={modelOptions.values}
             optionLabels={modelOptions.labels}
@@ -600,6 +722,28 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
             clearLabel={i18nT('components.jobForm.chat_folder_none')}
             aria-label={i18nT('components.jobForm.chat_folder')}
           />
+          {/* The picker lists folders in the sidebar's folder order
+              (dashboard.folder_sort). When that read failed with no body to draw
+              from, the list is the stored order, and the reader is told why it is
+              not the order they chose and that nothing is asked of them (the read
+              retries on its own) -- there is no sidebar on this page to say it.
+              No hand-off: the notice sits beside unsaved form input (the job's
+              name, message and schedule), and the hand-off navigates away, which
+              would discard what the reader typed -- so the line names the chat
+              sidebar as where the hand-off lives. A picker: "listed", not the
+              sidebar's "arrangement". */}
+          {folderSortError && !chatFolderUnavailable && (
+            <div className="flex flex-col gap-0.5">
+              <ErrorNotice
+                variant="inline"
+                title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+                message={folderSortError}
+                messagePlacement="below"
+                testId="job-folder-order-unavailable"
+              />
+              <span className="text-[11px] text-muted/70">{i18nT('pages.chatSidebar.folder_order_unavailable_detail_picker_ask')}</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -612,6 +756,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
           value={schedMode}
           onChange={v => setSchedMode(v as 'interval' | 'weekly' | 'cron')}
           aria-label={i18nT('components.jobForm.schedule')}
+          {...uiLocation('schedule.edit-when')}
         />
         {schedMode === 'interval' ? (<>
           <Input type="number" min={1} style={{ flex: '0 0 70px' }} value={intVal} onChange={e => setIntVal(Math.max(1, parseInt(e.target.value) || 1))} />
@@ -642,10 +787,10 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
             run no LLM, so hide them (consistent with the LLM-less create surface). */}
         {!isLlmless && (<>
         <div className="flex flex-col gap-1">
-          <span className="text-[12px] text-muted font-medium">{i18nT('components.jobForm.agent')}</span>
+          <span className="text-[12px] text-muted font-medium">{runsAsField ? i18nT('components.jobForm.runs_as') : i18nT('components.jobForm.agent')}</span>
           {locked
-            ? <LockedAgentValue name={locked} member={memberNoun} />
-            : (<>
+            ? <LockedAgentValue name={locked} member={memberNoun} hint={lockedAgentHint} />
+            : runsAsField ?? (<>
               <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
               <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />
             </>)}
@@ -749,6 +894,28 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
               </Btn>
             </div>
           )}
+          {/* The picker lists folders in the sidebar's folder order
+              (dashboard.folder_sort). When that read failed with no body to draw
+              from, the list is the stored order, and the reader is told why it is
+              not the order they chose and that nothing is asked of them (the read
+              retries on its own) -- there is no sidebar on this page to say it.
+              No hand-off: the notice sits beside unsaved form input (the job's
+              name, message and schedule), and the hand-off navigates away, which
+              would discard what the reader typed -- the folder-list notice above
+              keeps its Retry in place for the same reason; the line under this
+              one names the chat sidebar as where the hand-off lives. */}
+          {folderSortError && !chatFolderUnavailable && (
+            <div className="flex flex-col gap-0.5">
+              <ErrorNotice
+                variant="inline"
+                title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+                message={folderSortError}
+                messagePlacement="below"
+                testId="job-folder-order-unavailable"
+              />
+              <span className="text-[11px] text-muted/70">{i18nT('pages.chatSidebar.folder_order_unavailable_detail_picker_ask')}</span>
+            </div>
+          )}
           {/* A genuinely empty tree is not an error, but it IS a dead end without
               this: the picker offers nothing and says nothing about where folders
               come from. */}
@@ -797,6 +964,30 @@ export default function JobForm({ job, prefill, agents, defaultAgent, rosterFail
               checked={minimalContext}
               onChange={setMinimalContext}
             />
+          </div>
+        )}
+        {/* Every job kind fails the same way, so this is not gated on the agent kind. */}
+        {showAutoPause && (
+          <div className="flex flex-col gap-1">
+            <label htmlFor="jobform-auto-pause" className="text-[12px] text-muted font-medium">{i18nT('components.jobForm.auto_pause_after_failures')}</label>
+            <span id="jobform-auto-pause-help" className="text-[11px] text-muted/70">{i18nT('components.jobForm.auto_pause_after_failures_description')}</span>
+            <Input
+              id="jobform-auto-pause"
+              type="number"
+              inputMode="numeric"
+              min={0}
+              max={AUTO_PAUSE_MAX}
+              step={1}
+              aria-describedby={autoPauseHint ? 'jobform-auto-pause-help jobform-auto-pause-hint' : 'jobform-auto-pause-help'}
+              aria-invalid={autoPauseHint ? true : undefined}
+              className="w-full sm:w-32 flex-none"
+              value={autoPause}
+              onChange={e => { setAutoPause(e.target.value); setAutoPauseHint('') }}
+            />
+            {/* Plain text, not an ErrorNotice: see `autoPauseHint`. */}
+            {autoPauseHint && (
+              <span id="jobform-auto-pause-hint" className="text-[11px] text-text">{autoPauseHint}</span>
+            )}
           </div>
         )}
         {vertical && !externalSubmit && (

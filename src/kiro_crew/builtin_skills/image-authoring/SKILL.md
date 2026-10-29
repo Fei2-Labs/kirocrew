@@ -98,13 +98,14 @@ deliberately, it is not a convention a reader will know from elsewhere.
 
 Emit scene JSON: `{"type":"excalidraw","version":2,"elements":[…],"appState":{…}}`.
 The inline fence is a **viewer, not the editor**, so author around these
-differences. The composer's pencil button opens a real Excalidraw editor (Sketch
-pad): when a user sketches there, the attachment arrives as a PNG plus a
-`.excalidraw` JSON sidecar — read the JSON, not the pixels, since element
-geometry and labels are what you can reason about. You can hand a scene back the
-same way by emitting the fence. A rendered fence is click-to-enlarge in a
-lightbox, so a dense diagram stays readable — do not shrink content to fit the
-chat column.
+differences. The **Sketch** item in the composer's attach (`+`) menu opens a
+real Excalidraw editor (Sketch pad): when a user sketches there, the attachment
+arrives as a PNG plus a `.excalidraw` JSON sidecar — read the JSON, not the
+pixels, since element geometry and labels are what you can reason about. You can
+hand a scene back the same way by emitting the fence. A rendered fence has no
+enlarge view — it scales down to the chat column width — so keep a dense
+diagram readable at that width (split it, or save it as an `.excalidraw` file
+the user can open in the file panel).
 
 - **Fonts are not bundled.** `fontFamily` 1/5/8 (the hand-drawn ids) resolve to
   whatever the *viewer's* machine aliases to CSS `cursive`, which varies per box
@@ -135,5 +136,4 @@ reader the picture but never the content.
 
 Author sequentially, or -- for 2+ images -- fan out with `spawn_run(tasks=[...])`
 (one task per image; each task gets the full brief + exact output path). A
-single image is authored inline: a one-task `spawn_run` is refused without a
-`solo_reason`, and "one image" is not one.
+single image is authored inline, not through a one-task `spawn_run`.

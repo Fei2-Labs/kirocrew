@@ -32,7 +32,7 @@ def _req(body: object) -> web.Request:
         "POST",
         "/api/mcp/toggle",
         app=app,
-        headers={"Content-Length": str(len(raw))},
+        headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
         payload=BodyStreamPayload(raw),
     )
     # The route is owner-gated

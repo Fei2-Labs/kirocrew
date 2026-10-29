@@ -32,9 +32,11 @@ vi.mock('../api/client', () => ({
       const end = before !== undefined ? Math.max(0, Math.min(before, TOTAL)) : TOTAL
       const start = Math.max(0, end - lim)
       const body = { messages: HISTORY.slice(start, end), has_more: start > 0, total: TOTAL, next_before: start }
-      // switchSlot's fetch is unpaginated and normally must not block; only the
-      // older page is held open, because that is the request under test.
-      if (before === undefined) {
+      // switchSlot's legs normally must not block; only the user's older page is
+      // held open, because that is the request under test. A switch leg is the
+      // window itself (no cursor) or a step of its coverage walk (a cursor but no
+      // abort signal -- `loadOlderMessages` is the caller that passes one).
+      if (before === undefined || signal === undefined) {
         if (!holdSwitchDetail) return Promise.resolve(body)
         return new Promise((resolve) => { releaseSwitch.push(() => resolve(body)) })
       }
@@ -188,6 +190,22 @@ describe('older-history fetch is cancelled when the user switches chat', () => {
   })
 })
 
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
+// so the pins read the page and those owners.
+async function readChatPageSource(): Promise<string> {
+  const fs = await import('node:fs')
+  const path = await import('node:path')
+  const pages = path.resolve(__dirname, '..', 'pages')
+  const ownerDir = path.join(pages, 'chat', 'page')
+  return [
+    fs.readFileSync(path.join(pages, 'ChatPage.tsx'), 'utf8'),
+    ...fs.readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => fs.readFileSync(path.join(ownerDir, f), 'utf8')),
+    ...fs.readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => fs.readFileSync(path.join(pages, f), 'utf8')),
+  ].join('\n')
+}
+
 // The pin-jump effect turns any rejection into a "message unavailable" notice,
 // so a chat switch would now show it for a pin that is perfectly reachable.
 describe('an abort is distinguishable from a real failure', () => {
@@ -229,9 +247,7 @@ describe('an abort is distinguishable from a real failure', () => {
   })
 
   it('is guarded at the pin-jump call site before the unavailable notice', async () => {
-    const fs = await import('node:fs')
-    const path = await import('node:path')
-    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = await readChatPageSource()
 
     // The catch must return on an abort BEFORE reaching the notice. A failed
     // page load is an ERROR (it renders through ErrorNotice via
@@ -243,9 +259,7 @@ describe('an abort is distinguishable from a real failure', () => {
   })
 
   it('picks the notice from the entry point, so the earlier-messages row avoids pin copy', async () => {
-    const fs = await import('node:fs')
-    const path = await import('node:path')
-    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = await readChatPageSource()
 
     // Both entry points must tag themselves; `origin` is a required field, so a
     // future caller that forgets cannot silently inherit pin wording.
@@ -268,9 +282,7 @@ describe('an abort is distinguishable from a real failure', () => {
   })
 
   it('keeps the pin entry point on its own copy, so the transient string cannot regress it', async () => {
-    const fs = await import('node:fs')
-    const path = await import('node:path')
-    const src = fs.readFileSync(path.resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
+    const src = await readChatPageSource()
 
     // The transient string is scoped to the earlier-messages origin; the pin
     // origin has no paging-error string, so it falls back to its own wording.
@@ -457,13 +469,13 @@ describe('a background refresh must not re-validate a cursor a pending switch in
 
     // The second switch's own settle does not end it either, because this slot
     // carries cached rows with no previously-known server total: a bounded window
-    // cannot be proven to cover the gap, so the switch retries UNBOUNDED. Its
+    // cannot be proven to cover the gap, so the switch walks the window older. Its
     // claim has to outlive the bounded leg for the same reason the first release
     // must not clear it — releasing between the two legs reopens the window.
     releaseSwitch[1]()
     await flush()
     await flush()
-    // A retry WAS issued (the count is not pinned: a superseded leg may retry too,
+    // A walk leg WAS issued (the count is not pinned: a superseded leg may walk too,
     // and its answer is discarded rather than being this test's business).
     expect(releaseSwitch.length).toBeGreaterThan(2)
     expect(store.getState().chat.slotSwitchRequestId).not.toBeNull()
@@ -530,9 +542,10 @@ describe('a slot activated during a switch keeps its own cursor', () => {
     store.dispatch({ type: switchSlot.pending.type, meta: { requestId: 'r1', arg: 'A' } })
     expect(store.getState().chat.slotCursorKey).toBeNull()
 
+    // The create started on A with no move since, so it carries A's move count.
     store.dispatch({
       type: 'chat/createSlot/fulfilled',
-      meta: { requestId: 'c1', activate: true, originActiveSlot: 'A' },
+      meta: { requestId: 'c1', activate: true, originActiveSlot: 'A', originActiveSlotMoves: store.getState().chat.activeSlotMoves },
       payload: { key: 'NEW' },
     })
     expect(store.getState().chat.activeSlot).toBe('NEW')

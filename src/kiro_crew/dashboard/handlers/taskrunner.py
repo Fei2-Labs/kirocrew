@@ -4,18 +4,34 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from aiohttp import web
 
-from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
+from kiro_crew.constants import DENY_CAUSE_SURFACE_POLICY
+from kiro_crew.dashboard.handlers._shared import (
+    read_bounded_json,
+    require_owner_dashboard_request,
+)
+from kiro_crew.dashboard.request_priority import owner_start_priority
+from kiro_crew.dashboard.slot_ownership import TASK_REVIEW_SLOT_PREFIX, task_review_session_key
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.execution_context import ExecutionContext, bind_session_execution
-from kiro_crew.hooks import FileTooLargeError
-from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.hooks import FileTooLargeError, validate_file_path
+from kiro_crew.llm_helpers import _steer_host_deny, unfinished_turn_error
+from kiro_crew.security import (
+    is_sensitive_path,
+    is_sensitive_resolved_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.task_planner import plan_to_yaml
 from kiro_crew.taskrunner import WorkflowInitializing
 from kiro_crew.workflow_memory import capture_admission_execution
@@ -41,17 +57,43 @@ def _canonical_task_reference(runner: TaskRunner, reference: str, *, first: bool
     return matches[0 if first else -1].task_id if matches else reference
 
 
-async def _task_result_slot(request: web.Request, state: DashboardState, task_id: str):
-    """Continue the owning project's exact execution in a fresh chat session."""
-    run = state.task_runner._runs.get(task_id) if state.task_runner else None
-    execution = run.execution_context if run else None
+#: ``DashboardState`` attribute mapping a run completion to the key of the chat slot
+#: opened for it, or to an ``asyncio.Event`` while that slot is being opened.
+_RESULT_SLOTS_ATTR = "_task_result_slots"
+_RESULT_SLOTS_MAX = 512
+
+
+#: Statuses a run passes through on its way to the one it settles on during cleanup.
+_SETTLING_STATUS = {"cancelling": "cancelled", "pausing": "paused"}
+
+
+def _completion_identity(run, branch: str) -> tuple[str, float, str, str]:
+    """One run attempt in one state: executing, resuming and retrying each stamp a new start.
+
+    The status separates a click while the run is still going from a click on its
+    outcome, so the outcome's results and prompt reach a chat of their own. A
+    status the run settles out of during cleanup counts as the one it settles on.
+    The finish time is not part of it: the runner announces a completion and then
+    stamps the finish time again once its sessions are cleaned up, so a click on
+    either side of that cleanup is still the same attempt.
+    """
+    status = _SETTLING_STATUS.get(run.status, run.status)
+    return (run.task_id, run.started_at, status, branch)
+
+
+async def _open_result_slot(state: DashboardState, task_id: str, execution):
+    """A new slot continuing the run's exact execution, or a plain chat without one."""
     if execution is None:
         return state.get_or_create_slot()
     token = uuid.uuid4().hex
-    session_key = f"taskrunner:{task_id}:chat:{token}"
+    # Minted together: the slot ownership checkpoint reads this link as the tab's
+    # own session (``slot_ownership.own_session_key``), so its owner app keeps it.
+    session_key = task_review_session_key(task_id, token)
     await asyncio.to_thread(bind_session_execution, session_key, execution)
     slot = state.get_or_create_slot(
-        f"task-review-{token}", linked_session_key=session_key, memory_mode=execution.memory_mode
+        f"{TASK_REVIEW_SLOT_PREFIX}{token}",
+        linked_session_key=session_key,
+        memory_mode=execution.memory_mode,
     )
     slot.memory_store = execution.store.legacy_name
     slot.memory_mode = execution.memory_mode
@@ -60,11 +102,67 @@ async def _task_result_slot(request: web.Request, state: DashboardState, task_id
     return slot
 
 
+async def _task_result_slot(request: web.Request, state: DashboardState, task_id: str, branch: str):
+    """The chat slot continuing one completion of *task_id*, and whether it is new.
+
+    A run attempt in one state (the run's start time and status) opens one slot per
+    *branch*, ``plan`` or ``review``. While that slot is open every call returns it
+    with ``False``, so a repeated click lands on the conversation already working in
+    the run's directory instead of starting a second agent there. A retry's or a
+    resume's new start time opens a new slot, as does the run reaching its outcome
+    after a click while it was going, and a call after the slot was closed.
+    """
+    run = state.task_runner._runs.get(task_id) if state.task_runner else None
+    if run is None:
+        return state.get_or_create_slot(), True
+    slots = getattr(state, _RESULT_SLOTS_ATTR, None)
+    if slots is None:
+        slots = OrderedDict()
+        setattr(state, _RESULT_SLOTS_ATTR, slots)
+    identity = _completion_identity(run, branch)
+    while isinstance(entry := slots.get(identity), asyncio.Event):
+        # Another call is opening this completion's slot; its outcome decides this one.
+        await entry.wait()
+    live = state.get_slot(entry) if entry else None
+    if live is not None:
+        return live, False
+    opening = asyncio.Event()
+    slots[identity] = opening
+    try:
+        slot = await _open_result_slot(state, task_id, run.execution_context)
+        slots[identity] = slot.key
+    except BaseException:
+        slots.pop(identity, None)
+        raise
+    finally:
+        opening.set()
+    slots.move_to_end(identity)
+    while len(slots) > _RESULT_SLOTS_MAX:
+        slots.popitem(last=False)
+    return slot, True
+
+
 def _sel():
     """Late-binding _sel() for test monkeypatch compatibility."""
     import kiro_crew.dashboard.handlers as _pkg  # noqa: F811
 
     return _pkg.sel()
+
+
+async def _require_taskrunner_owner(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate for the mutating task-runner routes, or ``None`` to proceed.
+
+    Owner identity is a property of a dashboard-user request: ``app == ""`` is
+    the class ``is_owner_dashboard_request`` can rule on at all. The other two
+    caller classes keep the control that already governs them -- an
+    ``X-Internal-Secret`` loopback process (the ``task_run`` MCP tool) reaches
+    here with ``app`` ABSENT, and an app token (the Projects app declares
+    ``/api/taskrunner``) is confined to its manifest's declared paths by
+    ``_enforce_app_scope``.
+    """
+    if request.get("app") != "":
+        return None
+    return await require_owner_dashboard_request(request, operation)
 
 
 async def _gate_auto_approve(
@@ -147,6 +245,7 @@ async def api_taskrunner_status(request: web.Request) -> web.Response:
         return refusal
     visible_sources = {"text", "spec", "file", "chat", "dashboard", "mcp", "yaml"}
     data["runs"] = [r for r in data["runs"] if r.get("source") in visible_sources]
+    data["running"] = any(row.get("running") for row in data["runs"])
     for run in data["runs"]:
         if run.get("error"):
             run["error"] = redact_exfiltration_urls(run["error"])[0]
@@ -172,12 +271,160 @@ async def api_taskrunner_status(request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+def _validate_spec_path(raw: str) -> tuple[str | None, str]:
+    """Resolve and validate a caller-supplied spec path off the event loop.
+
+    Returns ``(resolved_path, "")`` on success, or ``(None, code)`` where
+    ``code`` is the machine-readable failure identifier the handler maps to
+    its error response (``invalid_spec_path`` or ``access_denied``).
+
+    Canonicalization goes through :func:`hooks.validate_file_path`, the same
+    gate the dashboard's file I/O uses: it screens a Windows UNC path AND a
+    local reparse point whose target is a UNC share (a link that launders the
+    probe past a lexical UNC check) BEFORE any ``realpath``/``stat`` follows it,
+    so a caller-supplied spec can never make the gateway authenticate outbound
+    to an attacker-named SMB host.
+
+    ``validate_file_path`` folds every rejection -- unrepresentable, UNC/link
+    laundered, and sensitive -- into ``None``.  A sensitive credential path must
+    keep answering ``access_denied`` (403) rather than ``invalid_spec_path``
+    (400), so a rejection is re-classified against a LINK-FREE lexical
+    sensitivity check on the anchored spelling: it never resolves a link, so it
+    cannot itself open the SMB connection the screen just refused, and a
+    non-sensitive rejection (the laundered/UNC case) stays ``invalid_spec_path``.
+    """
+    canonical = validate_file_path(raw)
+    if canonical is None:
+        anchored = os.path.abspath(os.path.expanduser(raw))
+        if is_sensitive_resolved_path(anchored):
+            return None, "access_denied"
+        return None, "invalid_spec_path"
+    if ".." in Path(raw).parts or not Path(canonical).is_file():
+        return None, "invalid_spec_path"
+    if is_sensitive_path(canonical):
+        return None, "access_denied"
+    return canonical, ""
+
+
+def _write_inline_spec(work_dir: str | Path, content: str) -> Path:
+    """Materialize an inline spec. Blocking; call from a worker thread."""
+    fpath = Path(work_dir) / f"TASK_{uuid.uuid4().hex[:8]}.md"
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    fpath.write_text(content, encoding="utf-8")
+    return fpath
+
+
+def _make_plan_dir(work_dir: Path) -> tuple[str, Path]:
+    """Claim a fresh plan directory. Blocking; call from a worker thread."""
+    while True:
+        new_id = f"plan_{uuid.uuid4().hex[:8]}"
+        task_dir = work_dir / new_id
+        try:
+            task_dir.mkdir(parents=True, exist_ok=False)
+            return new_id, task_dir
+        except FileExistsError:
+            continue
+
+
+async def _drain_worker(worker: asyncio.Task) -> None:
+    """Wait for an already-dispatched worker across repeated cancellation.
+
+    Cancelling ``asyncio.to_thread`` never stops its thread.  An owned file or
+    directory could otherwise appear after the handler has lost the path needed
+    to remove it.  Callers drain first, inspect the worker result, clean up, and
+    only then propagate cancellation.
+    """
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+
+
+async def _remove_owned_path(path: Path, *, directory: bool = False) -> None:
+    """Remove a handler-owned path off-loop and settle the worker on cancel."""
+    operation = path.rmdir if directory else lambda: path.unlink(missing_ok=True)
+    worker = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        await _drain_worker(worker)
+        raise
+
+
+async def _materialize_inline_spec(work_dir: str | Path, content: str) -> Path:
+    """Write an inline spec without letting cancellation orphan the result."""
+    worker = asyncio.create_task(asyncio.to_thread(_write_inline_spec, work_dir, content))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        await _drain_worker(worker)
+        try:
+            fpath = worker.result()
+        except Exception:
+            pass
+        else:
+            try:
+                await _remove_owned_path(fpath)
+            except asyncio.CancelledError:
+                pass
+            except OSError:
+                logger.warning("failed to remove cancelled inline spec %s", fpath, exc_info=True)
+        raise cancelled
+
+
+def _spec_retained_by_run(state: DashboardState, spec_path: Path) -> bool:
+    """True when a registered run still references *spec_path* as its spec.
+
+    ``start_background`` can be cancelled AFTER it registered the run
+    placeholder (its internal rollback covers only the persistence hop), in
+    which case the run — and the dashboard surface reading it — legitimately
+    owns the spec file now: deleting it would corrupt a retained run. Ownership
+    of a handler-created spec transfers the moment any run records its path.
+    """
+    runner = state.task_runner
+    if runner is None:
+        return False
+    target = str(spec_path)
+    return any(run.spec_path == target for run in runner._runs.values())
+
+
+async def _claim_plan_dir(work_dir: Path) -> tuple[str, Path]:
+    """Claim a plan directory without letting cancellation orphan the result."""
+    worker = asyncio.create_task(asyncio.to_thread(_make_plan_dir, work_dir))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        await _drain_worker(worker)
+        try:
+            _new_id, task_dir = worker.result()
+        except Exception:
+            pass
+        else:
+            try:
+                await _remove_owned_path(task_dir, directory=True)
+            except asyncio.CancelledError:
+                pass
+            except OSError:
+                logger.warning(
+                    "failed to remove cancelled chat plan directory %s",
+                    task_dir,
+                    exc_info=True,
+                )
+        raise cancelled
+
+
 async def api_taskrunner_start(request: web.Request) -> web.Response:
     """POST /api/taskrunner — start a task from a spec file path or inline content.
 
     Body: ``{"spec": "path/to/file.md"}`` or ``{"spec": "__inline__:# Task content..."}``
     Inline specs are written to a temp file in the work directory.
     """
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.start")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -200,16 +447,24 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
     # use share one value — no gap where spec_path could differ from what was
     # checked, and the containment guard is visible to static analysis.
     if not spec_path.startswith("__inline__:"):
-        resolved = Path(spec_path).resolve()
-        if ".." in Path(spec_path).parts or not resolved.is_file():
+        validated, failure = await asyncio.to_thread(_validate_spec_path, spec_path)
+        if validated is None:
+            if failure == "access_denied":
+                return web.json_response(
+                    {"error": "access denied", "code": "access_denied"}, status=403
+                )
             return web.json_response(
                 {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
             )
-        if is_sensitive_path(str(resolved)):
-            return web.json_response(
-                {"error": "access denied", "code": "access_denied"}, status=403
-            )
-        spec_path = str(resolved)
+        spec_path = validated
+
+    # Checked before the inline spec is written, so a refusal leaves nothing behind.
+    # Disabled in Library means no new runs: the run would have no page to
+    # watch or stop it from.
+    if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
+        return web.json_response(
+            {"error": TASK_RUNNER_DISABLED_MESSAGE, "code": "app_disabled"}, status=409
+        )
 
     # Handle inline spec content
     created_spec: Path | None = None
@@ -219,14 +474,17 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
         if not content.strip():
             return web.json_response({"error": "empty spec content"}, status=400)
         work_dir = state.task_runner._work_dir
-        fname = f"TASK_{uuid.uuid4().hex[:8]}.md"
-        fpath = Path(work_dir) / fname
         if execution.memory_mode == "persistent":
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            fpath.write_text(content, encoding="utf-8")
-            created_spec = fpath
+            # The write goes through the shielded helper so a cancelled request
+            # cannot orphan a half-written spec in the work dir.
+            created_spec = await _materialize_inline_spec(work_dir, content)
+            fpath = created_spec
         else:
+            # A restricted run keeps the body in memory and must leave no
+            # TASK_*.md behind, so this name is never written -- it only gives
+            # ``spec_path`` below a value, as it had before the off-loop move.
             inline_content = content
+            fpath = Path(work_dir) / f"TASK_{uuid.uuid4().hex[:8]}.md"
         spec_path = str(fpath)
 
     try:
@@ -251,21 +509,35 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
             execution_context=execution,
             **({"input_content": inline_content} if inline_content is not None else {}),
         )
-    except Exception as exc:
-        # The handler owns the temp file ONLY when it created it: a rejected
-        # start must not strand TASK_*.md orphans in the work dir, and an
-        # external spec the caller passed by path must never be deleted.
+    except BaseException as exc:
+        # The handler owns the temp file ONLY when it created it AND no run
+        # retains it: a rejected start must not strand TASK_*.md orphans in
+        # the work dir, an external spec the caller passed by path must never
+        # be deleted, and a spec a registered run still references must never
+        # be deleted either — ``start_background`` cancelled after admission
+        # retains the run placeholder (its rollback covers only the
+        # persistence hop), so ownership has transferred to the run.
+        # ``BaseException`` (mirroring the from_chat rollback below) so a
+        # request cancelled during ``start_background`` also cleans up — the
+        # spec-write hop is shielded, so the very next await is the one that
+        # can leak, and this cleanup covers it.
         # Cleanup is best-effort — its failure must not replace the startup
         # error the client is about to receive.
-        if created_spec is not None:
+        if created_spec is not None and not _spec_retained_by_run(state, created_spec):
             try:
-                created_spec.unlink(missing_ok=True)
+                await _remove_owned_path(created_spec)
+            except asyncio.CancelledError:
+                # The removal worker was drained to completion; the pending
+                # cancellation is re-delivered by the raise below / next await.
+                pass
             except OSError:
                 logger.warning(
                     "failed to remove inline spec %s after a rejected start",
                     created_spec,
                     exc_info=True,
                 )
+        if not isinstance(exc, Exception):
+            raise  # CancelledError and friends: propagate after cleanup.
         if isinstance(exc, WorkflowInitializing):
             return web.json_response({"error": str(exc), "code": exc.code}, status=503)
         return web.json_response({"error": str(exc)}, status=400)
@@ -274,6 +546,9 @@ async def api_taskrunner_start(request: web.Request) -> web.Response:
 
 async def api_taskrunner_cancel(request: web.Request) -> web.Response:
     """POST /api/taskrunner/cancel — cancel a specific or all running tasks."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.cancel")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -307,6 +582,9 @@ async def api_taskrunner_cancel(request: web.Request) -> web.Response:
 
 async def api_taskrunner_pause(request: web.Request) -> web.Response:
     """POST /api/taskrunner/{task_id}/pause — pause a running task (resumable via execute)."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.pause")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -351,6 +629,9 @@ async def api_taskrunner_pause(request: web.Request) -> web.Response:
 
 async def api_taskrunner_delete(request: web.Request) -> web.Response:
     """DELETE /api/taskrunner/{task_id} — remove a finished run."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.delete")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -369,6 +650,9 @@ async def api_taskrunner_delete(request: web.Request) -> web.Response:
 
 async def api_taskrunner_rename(request: web.Request) -> web.Response:
     """PATCH /api/taskrunner/{task_id}/name — rename a task run."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.rename")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -390,6 +674,9 @@ async def api_taskrunner_rename(request: web.Request) -> web.Response:
 
 async def api_taskrunner_update_task(request: web.Request) -> web.Response:
     """PATCH /api/taskrunner/{task_id}/tasks/{index} — edit a pending task in-place."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.update_task")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -432,6 +719,9 @@ async def api_taskrunner_update_task(request: web.Request) -> web.Response:
 
 async def api_taskrunner_retry(request: web.Request) -> web.Response:
     """POST /api/taskrunner/{task_id}/retry — retry from a specific step."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.retry")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -512,6 +802,9 @@ async def api_taskrunner_export_yaml(request: web.Request) -> web.Response:
 
 async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
     """POST /api/taskrunner/{task_id}/to-chat — open task results in a chat slot."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.to_chat")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -523,7 +816,9 @@ async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
     # Handle planned runs — send to chat for optimization
     if run.status == "planned":
         summary = state.task_runner.plan_to_chat_context(task_id)
-        slot = await _task_result_slot(request, state, task_id)
+        slot, fresh = await _task_result_slot(request, state, task_id, "plan")
+        if not fresh:
+            return web.json_response({"ok": True, "slot": slot.key, "task_id": task_id})
         slot.title = f"Plan: {run.task_id}"
         slot.append("user", summary, "msg msg-u")
         from kiro_crew.dashboard.chat import _run_chat  # noqa: F811
@@ -596,7 +891,10 @@ async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
         )
     summary = "\n".join(lines)
 
-    slot = await _task_result_slot(request, state, task_id)
+    slot, fresh = await _task_result_slot(request, state, task_id, "review")
+    if not fresh:
+        # The open review tab already holds this summary and its turn.
+        return web.json_response({"ok": True, "slot": slot.key})
     slot.title = f"Review: {spec_name}"
     slot.append("user", summary, "msg msg-u")
 
@@ -617,6 +915,9 @@ async def api_taskrunner_to_chat(request: web.Request) -> web.Response:
 
 async def api_taskrunner_plan(request: web.Request) -> web.Response:
     """POST /api/taskrunner/plan — decompose input into a plan without executing."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.plan")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -636,16 +937,16 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
     agent = body.get("agent", "")
     workspace_dir = body.get("workspace_dir", "")
     if source == "file":
-        resolved = Path(spec_path).resolve()
-        if ".." in Path(spec_path).parts or not resolved.is_file():
+        validated, failure = await asyncio.to_thread(_validate_spec_path, spec_path)
+        if validated is None:
+            if failure == "access_denied":
+                return web.json_response(
+                    {"error": "access denied", "code": "access_denied"}, status=403
+                )
             return web.json_response(
                 {"error": "invalid spec path", "code": "invalid_spec_path"}, status=400
             )
-        if is_sensitive_path(str(resolved)):
-            return web.json_response(
-                {"error": "access denied", "code": "access_denied"}, status=403
-            )
-        spec_path = str(resolved)
+        spec_path = validated
     try:
         plan_coro = state.task_runner.plan(
             input_text=input_text,
@@ -655,6 +956,8 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
             workspace_dir=workspace_dir,
             session_key=origin,
             execution_context=execution,
+            # The owner pressed Plan and watches the banner; an app token does not.
+            start_priority=owner_start_priority(request),
         )
         state.task_runner._plan_task = asyncio.current_task()
         run = await plan_coro
@@ -695,6 +998,9 @@ async def api_taskrunner_plan(request: web.Request) -> web.Response:
 
 async def api_taskrunner_plan_cancel(request: web.Request) -> web.Response:
     """POST /api/taskrunner/plan/cancel — cancel running plan decomposition."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.plan_cancel")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if request.get("internal_auth") is True:
         _, refusal = await _taskrunner_request_origin(request)
@@ -714,6 +1020,9 @@ async def api_taskrunner_plan_cancel(request: web.Request) -> web.Response:
 
 async def api_taskrunner_update_plan(request: web.Request) -> web.Response:
     """PUT /api/taskrunner/{task_id}/plan — update steps on a planned run."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.update_plan")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -755,6 +1064,9 @@ async def api_taskrunner_update_plan(request: web.Request) -> web.Response:
 
 async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
     """POST /api/taskrunner/{task_id}/execute — execute a planned run."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.execute")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if not state.task_runner:
         return web.json_response({"error": "task runner not available"}, status=400)
@@ -792,6 +1104,9 @@ async def api_taskrunner_execute_plan(request: web.Request) -> web.Response:
 
 async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
     """POST /api/taskrunner/from-chat — create or update a plan from chat-provided steps."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.from_chat")
+    if owner_denied is not None:
+        return owner_denied
     from kiro_crew.taskrunner import Project  # noqa: F811
 
     state: DashboardState = request.app["state"]
@@ -817,14 +1132,7 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
         if task_id:
             run = await state.task_runner.update_plan(task_id, steps)
         else:
-            while True:
-                new_id = f"plan_{uuid.uuid4().hex[:8]}"
-                task_dir = state.task_runner._work_dir / new_id
-                try:
-                    task_dir.mkdir(parents=True, exist_ok=False)
-                    break
-                except FileExistsError:
-                    continue
+            new_id, task_dir = await _claim_plan_dir(state.task_runner._work_dir)
             original_input = str(body.get("original_input", ""))
             run = Project(
                 spec_path="",
@@ -852,7 +1160,7 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
                     await asyncio.shield(cleanup_task)
                 finally:
                     try:
-                        task_dir.rmdir()
+                        await _remove_owned_path(task_dir, directory=True)
                     except OSError:
                         logger.warning("Failed to remove rejected chat plan directory %s", task_dir)
                 raise
@@ -885,6 +1193,16 @@ async def api_taskrunner_from_chat(request: web.Request) -> web.Response:
     )
 
 
+#: What the model is told when the task-refine turn refuses a tool call. The
+#: refine SURFACE runs no tools -- it drafts the task spec from the request and
+#: answers the user's questions with text -- so nothing about the call was
+#: judged, and the reason says what this surface permits (nothing), which is
+#: what the surface-policy notice tells the model to read.
+_REFINE_DENY_REASON = (
+    "the task refine turn runs no tools: it only drafts the task spec from the "
+    "request and answers with text, so every tool call is refused here"
+)
+
 _REFINE_PROMPT = (
     "You are a task spec writer. Rewrite the user's request into a clear, structured task specification.\n\n"
     "Output ONLY the spec in this format — no preamble, no commentary:\n\n"
@@ -901,7 +1219,10 @@ _REFINE_PROMPT = (
 
 
 async def _run_refine(
-    state: DashboardState, user_input: str, execution: ExecutionContext | None = None
+    state: DashboardState,
+    user_input: str,
+    execution: ExecutionContext | None = None,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> None:
     """Background task: multi-turn LLM refine with tool access and Q&A."""
     import time as _time  # noqa: F811
@@ -931,7 +1252,9 @@ async def _run_refine(
         prompt = _REFINE_PROMPT.format(input=user_input)
         state._refine_text = ""
         _push()
-        client, _is_new, _resumed = await state.sessions.get_or_create(session_key)
+        client, _is_new, _resumed = await state.sessions.get_or_create(
+            session_key, start_priority=start_priority
+        )
 
         async for event in client.stream(prompt):
             if event.kind == EVENT_TEXT_CHUNK:
@@ -941,8 +1264,32 @@ async def _run_refine(
                     _last_push = now
                     _push()
             elif event.kind == EVENT_PERMISSION_REQUEST:
+                # Audit FIRST (backend-security-controls: every denied tool
+                # attempt is a Security Event Log row, and the steer and the
+                # reject both await the ACP pipe, so a row sequenced after them
+                # can be cancelled away), then tell the model in-band that the
+                # HOST refused this (a rejected permission reaches it as
+                # kiro-cli's "User denied tool execution"), then answer the
+                # wire. The SURFACE refuses every call, so the notice says what
+                # the refine turn permits, not a sanctioned alternative.
+                _sel().log_tool_invocation(
+                    session_key=session_key,
+                    tool_name=getattr(event, "title", "") or "unknown",
+                    outcome="denied",
+                    source="taskrunner_refine",
+                    request_id=str(event.request_id),
+                )
+                await _steer_host_deny(
+                    client, event, _REFINE_DENY_REASON, cause=DENY_CAUSE_SURFACE_POLICY
+                )
                 await client.reject_tool(event.request_id)
             elif event.kind == EVENT_COMPLETE:
+                # A refine the backend never finished is not a finished spec: the
+                # error branch below sets status "error", and the partial text is
+                # still broadcast with it, so it reads as cut off.
+                unfinished = unfinished_turn_error(event, state._refine_text)
+                if unfinished is not None:
+                    raise unfinished
                 break
 
         _push()
@@ -980,6 +1327,9 @@ async def _run_refine(
 
 async def api_taskrunner_refine(request: web.Request) -> web.Response:
     """POST /api/taskrunner/refine — start background spec generation from user input."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.refine")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     origin, _ = await _taskrunner_request_origin(request)
     execution = (
@@ -1005,7 +1355,10 @@ async def api_taskrunner_refine(request: web.Request) -> web.Response:
     state._refine_error = ""
     state._refine_status = "running"
     state._refine_input = user_input
-    task = asyncio.create_task(_run_refine(state, user_input, execution))
+    # The owner pressed Refine and watches it stream; an app token does not.
+    task = asyncio.create_task(
+        _run_refine(state, user_input, execution, owner_start_priority(request))
+    )
     state._refine_task = task
     state._background_tasks.add(task)
     task.add_done_callback(state._background_tasks.discard)
@@ -1028,6 +1381,9 @@ async def api_taskrunner_refine_status(request: web.Request) -> web.Response:
 
 async def api_taskrunner_refine_cancel(request: web.Request) -> web.Response:
     """POST /api/taskrunner/refine/cancel — cancel running refine."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.refine_cancel")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     if state._refine_task and not state._refine_task.done():
         state._refine_task.cancel()
@@ -1036,6 +1392,9 @@ async def api_taskrunner_refine_cancel(request: web.Request) -> web.Response:
 
 async def api_taskrunner_refine_answer(request: web.Request) -> web.Response:
     """POST /api/taskrunner/refine/answer — answer a clarifying question."""
+    owner_denied = await _require_taskrunner_owner(request, "taskrunner.refine_answer")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:

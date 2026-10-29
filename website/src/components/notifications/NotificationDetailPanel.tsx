@@ -1,10 +1,10 @@
-import { useMemo, useState } from 'react'
-import { X, MailOpen, Check, MessageSquare, CheckCircle, Ban, Clock, ClipboardList, ArrowUpRight } from 'lucide-react'
+import { useMemo, useState, useSyncExternalStore } from 'react'
+import { X, MailOpen, Check, MessageSquare, CheckCircle, Ban, Clock, ClipboardList, ArrowUpRight, Sparkles } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { useGuardedLeave } from '../NavigationLeaveGuard'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { deleteNotification, ackNotification, unackNotification } from '../../store/notificationsSlice'
-import { switchSlot, resumeFromHistory } from '../../store/chatSlice'
+import { switchSlot, resumeFromHistory, openCreatedSlot } from '../../store/chatSlice'
 import { Badge } from '../ui'
 import MarkdownRenderer from '../MarkdownRenderer'
 import MessageErrorBoundary from '../MessageErrorBoundary'
@@ -13,13 +13,36 @@ import { CronAckBar } from '../../pages/chat'
 import { api } from '../../api/client'
 import type { Notification } from '../../types'
 import { KIND_META, DEFAULT_META, fmtFull, safeInternalUrl } from './notifMeta'
+import { CrewmateNoteFace, CrewmateNoteName, CrewmateRosterError, noteMember } from './CrewmateNoteFace'
 import { safeHttpUrl } from '../../lib/safeUrl'
+import { isGatewayConnected, sendErrorToChat, subscribeGatewayConnected } from '../../utils/errorReport'
+import { buildNotificationPrompt } from './notificationHandoff.prompt'
+import { isMemberThreadSlot } from '../../hooks/unreadOnAttention'
 
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
 /** Intentional failure diagnostic for the navigation/approval actions below. */
 function logError(msg: string, err: unknown): void {
   // eslint-disable-next-line no-console -- intentional failure diagnostic
   console.error(msg, err)
+}
+
+/** The Members page that shows a note's mate thread, or null for a note from any
+ *  other session. The chat page does not render a mate's DM thread, so both of the
+ *  note's buttons open the page its sidebar row opens: the open slot's `agent`
+ *  names the mate, and an open thread without one opens the bare Members page.
+ *  Once the thread has closed, the note's `member` names the mate, and a note
+ *  without one returns null so Resume chat resumes it from history. */
+function memberThreadPage(
+  slotKey: string | undefined,
+  openSlot: { agent?: string } | null | undefined,
+  member: { name: string } | null,
+  slots: ReadonlyArray<{ key: string; mode?: string }>,
+): string | null {
+  if (!slotKey || !isMemberThreadSlot(slotKey, slots)) return null
+  const name = openSlot ? openSlot.agent : member?.name
+  if (name) return `/members?member=${encodeURIComponent(name)}`
+  return openSlot ? '/members' : null
 }
 
 /**
@@ -44,7 +67,17 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
   const [handoffError, setHandoffError] = useState<string | null>(null)
   const handoffFailed = handoffError === n.ts
   const km = KIND_META[n.kind] || DEFAULT_META
+  const member = noteMember(n)
   const slots = useAppSelector(s => s.dashboard.slots)
+  // "Fix with Crew" stages a NEW chat whose composer is pre-filled with this
+  // notification, through the same channel "Ask the agent" uses. Hidden while the
+  // gateway is down: the composer it lands in could not send.
+  const gatewayConnected = useSyncExternalStore(subscribeGatewayConnected, isGatewayConnected)
+  const fixWithCrew = () => leave(() => {
+    const prompt = buildNotificationPrompt(n, i18nT('components.notifications.notificationDetailPanel.fix_with_crew_ask'))
+    // `leaveGranted`: the guard above already asked the host page.
+    if (sendErrorToChat(prompt, { leaveGranted: true })) onClose()
+  })
 
   // The sentence names the button BY ITS OWN LABEL, interpolated rather than
   // written into each catalog, so it cannot drift from the control it points at.
@@ -79,6 +112,7 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
 
   // Direct slot link from notification meta
   const directSlot = n.slot ? slots.find(s => s.key === n.slot) : null
+  const memberPage = memberThreadPage(n.slot, directSlot, member, slots)
 
   // Fuzzy match: try to find a related chat slot from the body/title
   const relatedSlot = useMemo(() => {
@@ -98,7 +132,9 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
       {/* Header */}
       <div className="px-5 py-3 border-b border-border flex items-center justify-between bg-chrome shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-[16px]">{km.icon}</span>
+          {member
+            ? <CrewmateNoteFace member={member} size={22} fallback={<span className="text-[16px]">{km.icon}</span>} />
+            : <span className="text-[16px]">{km.icon}</span>}
           <span className="text-sm font-semibold text-text-strong truncate">{n.title}</span>
         </div>
         <button className="text-muted text-[13px] cursor-pointer hover:text-text bg-transparent border-none font-body shrink-0 ml-2" onClick={onClose}><X className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.close')}</button>
@@ -107,15 +143,17 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
       {/* Meta bar */}
       <div className="px-5 py-3 border-b border-border flex items-center gap-3 flex-wrap bg-bg-elevated shrink-0">
         <span className={`px-2 py-[3px] rounded-full text-[12px] font-bold ${km.color} border border-[color-mix(in_srgb,currentColor_20%,transparent)]`}>{km.label}</span>
+        {member && <CrewmateNoteName member={member} className="text-[13px] font-semibold text-text" />}
         <span className="text-[13px] text-muted font-mono">{fmtFull(n.ts)}</span>
         {n.acked
           ? <Badge variant="ok">{i18nT('components.notifications.notificationDetailPanel.read')}</Badge>
           : <Badge variant="warn">{i18nT('components.notifications.notificationDetailPanel.unread')}</Badge>
         }
         {n.acked
-          ? <button className="text-[13px] text-muted cursor-pointer hover:text-text bg-transparent border-none font-body" onClick={() => dispatch(unackNotification(n.ts))}><MailOpen className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.mark_unread')}</button>
+          ? <button className="text-[13px] text-muted cursor-pointer hover:text-text bg-transparent border-none font-body" onClick={() => dispatch(unackNotification(n.ts))} {...uiLocation('notifications.detail.mark-unread')}><MailOpen className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.mark_unread')}</button>
           : <button className="text-[13px] text-ok cursor-pointer hover:text-text bg-transparent border-none font-body" onClick={() => dispatch(ackNotification(n.ts))}><Check className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.mark_read')}</button>
         }
+        {member && <CrewmateRosterError className="basis-full" />}
       </div>
 
       {/* Kind & navigation. The row prints the note's KIND (`km.label`, the same
@@ -138,15 +176,15 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
               sentence invites a retry, and `/to-chat` is not idempotent -- it
               mints a fresh task-review slot and spawns another agent told to edit
               the run's work_dir directly. So the notice may only appear where the
-              hand-off did NOT succeed; a slot fetch that fails after it did stays
-              with the plain-site convention, explained at /chat. */}
-          <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(async () => { setHandoffError(null); try { const res = await api.cronToChat(n.job_id!); if (res.error || !res.slot) { logError('cronToChat failed', res.error); setHandoffError(n.ts); return } dispatch(switchSlot(res.slot)); navigate('/chat') } catch (e) { logError('cronToChat failed', e); setHandoffError(n.ts) } })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.view_last_result')}</button>
+              hand-off did NOT succeed; a slot fetch that fails after it did is
+              left to /chat, which explains it. */}
+          <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(async () => { setHandoffError(null); try { const res = await api.cronToChat(n.job_id!); if (res.error || !res.slot) { logError('cronToChat failed', res.error); setHandoffError(n.ts); return } openCreatedSlot(dispatch, res.slot); navigate('/chat') } catch (e) { logError('cronToChat failed', e); setHandoffError(n.ts) } })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.view_last_result')}</button>
           {/* `inline`, not `block`: this row is a flex line of buttons, and a
               bordered banner dropped into one breaks the row. */}
           {handoffNotice}
         </>)}
         {directSlot && !(n.kind === 'cron' && n.job_id && n.slot) && (
-          <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(() => { dispatch(switchSlot({ key: directSlot.key, announceOnMissing: true })); navigate('/chat') })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.go_to_chat')}</button>
+          <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(() => { if (memberPage) { navigate(memberPage); return } dispatch(switchSlot({ key: directSlot.key, announceOnMissing: true })); navigate('/chat') })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.go_to_chat')}</button>
         )}
         {!directSlot && n.slot && !(n.kind === 'cron' && n.job_id && n.slot) && (
           /* `.unwrap()` is load-bearing for the diagnostic: a thunk dispatch
@@ -156,7 +194,7 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
              renders, so a resume that failed OR landed on a surface the chat
              page cannot display is EXPLAINED there. Staying put would leave the
              button looking dead, which is the defect this touches (#5925). */
-          <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(async () => { try { await dispatch(resumeFromHistory({ key: n.slot!, title: n.title })).unwrap() } catch (e) { logError('Resume failed', e) } navigate('/chat') })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.resume_chat')}</button>
+          <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(async () => { if (memberPage) { navigate(memberPage); return } try { await dispatch(resumeFromHistory({ key: n.history_key ?? n.slot!, title: n.title })).unwrap() } catch (e) { logError('Resume failed', e) } navigate('/chat') })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.resume_chat')}</button>
         )}
         {!directSlot && !n.slot && relatedSlot && (
           <button className="px-3 py-1.5 rounded-md bg-accent text-accent-fg text-[13px] font-medium cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(() => { dispatch(switchSlot({ key: relatedSlot.key, announceOnMissing: true })); navigate('/chat') })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.go_to_chat')}</button>
@@ -180,6 +218,13 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
             <MarkdownRenderer content={typeof n.body === 'string' ? n.body : ''} readOnlyCode />
           </MessageErrorBoundary>
         </div>
+
+        {/* Approvals are excluded: Approve / Reject below already are the response. */}
+        {n.kind !== 'approval' && gatewayConnected && (
+          <div className="flex gap-3 mt-4">
+            <button type="button" className="px-4 py-2 rounded-lg border border-accent/40 bg-transparent text-accent text-[13px] font-medium cursor-pointer hover:bg-accent-subtle transition-all font-body" data-testid="notif-fix-with-crew" onClick={fixWithCrew}><Sparkles className="lucide-inline" aria-hidden="true" /> {i18nT('components.notifications.notificationDetailPanel.fix_with_crew')}</button>
+          </div>
+        )}
 
         {/* Kind-specific actions */}
         {n.kind === 'approval' && (
@@ -208,7 +253,7 @@ export default function NotificationDetailPanel({ n, onClose }: { n: Notificatio
         )}
         {n.kind === 'taskrunner' && n.task_id && (
           <div className="flex flex-wrap items-center gap-3 mt-4">
-            <button className="px-4 py-2 rounded-lg bg-accent text-accent-fg text-[13px] font-semibold cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(async () => { setHandoffError(null); try { const res = await api.taskRunToChat(n.task_id!); if (res.error || !res.slot) { logError('Task nav failed', res.error); setHandoffError(n.ts); return } dispatch(switchSlot(res.slot)); navigate('/chat') } catch (e) { logError('Task nav failed', e); setHandoffError(n.ts) } })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.continue_in_chat')}</button>
+            <button className="px-4 py-2 rounded-lg bg-accent text-accent-fg text-[13px] font-semibold cursor-pointer border-none hover:brightness-110 transition-all" onClick={() => leave(async () => { setHandoffError(null); try { const res = await api.taskRunToChat(n.task_id!); if (res.error || !res.slot) { logError('Task nav failed', res.error); setHandoffError(n.ts); return } openCreatedSlot(dispatch, res.slot); navigate('/chat') } catch (e) { logError('Task nav failed', e); setHandoffError(n.ts) } })}><MessageSquare className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.continue_in_chat')}</button>
             <button className="px-3 py-1.5 rounded-md border border-border text-[13px] font-medium cursor-pointer bg-transparent text-muted hover:text-text hover:border-border-strong transition-all font-body" onClick={() => leave(() => navigate('/projects'))}><ClipboardList className="lucide-inline" /> {i18nT('components.notifications.notificationDetailPanel.view_project')}</button>
             {handoffNotice}
           </div>

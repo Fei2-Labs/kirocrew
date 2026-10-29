@@ -160,7 +160,7 @@ describe('MarkdownPanel binary gate', () => {
     await userEvent.click(screen.getByRole('menuitem', { name: /refresh/i }))
     await waitFor(() => expect(onDiskContent).toHaveBeenCalled())
     // Empty buffer, not the envelope JSON, AND the verdict alongside it.
-    expect(onDiskContent).toHaveBeenCalledWith('', true)
+    expect(onDiskContent).toHaveBeenCalledWith('', true, false)
   })
 
   it('reports a text refresh as not-binary, so a stale true cannot stick', async () => {
@@ -186,7 +186,7 @@ describe('MarkdownPanel binary gate', () => {
     await userEvent.click(screen.getByTestId('markdown-panel-more-options'))
     await userEvent.click(screen.getByRole('menuitem', { name: /refresh/i }))
     await waitFor(() => expect(onDiskContent).toHaveBeenCalled())
-    expect(onDiskContent).toHaveBeenCalledWith('# now text', false)
+    expect(onDiskContent).toHaveBeenCalledWith('# now text', false, false)
   })
 
   it('reports a failed Refresh instead of doing nothing visible', async () => {
@@ -293,6 +293,29 @@ describe('MarkdownPanel binary gate', () => {
 
     expect(onDiskContent).not.toHaveBeenCalled()
     expect(signal?.aborted).toBe(true)
+  })
+
+  it('restores the editor for a .py whose bytes decode on a later read', () => {
+    // A code file's default view IS the editor, and `canPreview` is false for it,
+    // so nothing renders an Edit toggle to undo the card's forced read-only state.
+    const view = renderPanel({ filePath: '/home/user/tool.py', content: '', binary: true })
+    expect(screen.getByTestId('binary-file-card')).toBeInTheDocument()
+    expect(screen.queryByTestId('pierre-editor')).toBeNull()
+
+    view.rerenderPanel({ filePath: '/home/user/tool.py', content: 'print(1)', binary: false })
+    expect(screen.queryByTestId('binary-file-card')).toBeNull()
+    expect(screen.getByTestId('pierre-editor')).toBeInTheDocument()
+  })
+
+  it('keeps markdown in its viewer when the bytes decode on a later read', () => {
+    // The control for the rule above: markdown's default is the PREVIEW, so the
+    // same flip must not push it into an editor the user never asked for.
+    const view = renderPanel({ filePath: '/home/user/notes.md', content: '', binary: true })
+    expect(screen.getByTestId('binary-file-card')).toBeInTheDocument()
+
+    view.rerenderPanel({ filePath: '/home/user/notes.md', content: '# hi', binary: false })
+    expect(screen.queryByTestId('binary-file-card')).toBeNull()
+    expect(screen.queryByTestId('pierre-editor')).toBeNull()
   })
 
   it('still opens the editor for a same-extension-family TEXT file', () => {

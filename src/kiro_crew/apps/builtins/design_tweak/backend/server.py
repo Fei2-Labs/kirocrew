@@ -8,7 +8,6 @@ mutable runtime state, compatibility names, and process lifecycle.
 from __future__ import annotations
 
 import atexit
-import glob
 import html as _html
 import http.client
 import json
@@ -17,6 +16,7 @@ import re
 import selectors
 import shutil
 import socket
+import socketserver
 import subprocess
 import sys as _sys
 import tempfile
@@ -37,7 +37,9 @@ from kiro_crew.apps.builtins.design_tweak.backend import (
     request_state,
 )
 from kiro_crew.apps.proxy_auth import verify_proxy_request
+from kiro_crew.env import nvm_version_bin_dirs
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import (
     CREATE_NEW_PROCESS_GROUP,
     IS_MACOS,
@@ -75,7 +77,6 @@ _RUNTIME_COMPAT_IMPORTS = (
     cast,
     get_credential_patterns,
     get_ppid,
-    glob,
     http.client,
     is_link_or_junction,
     is_sensitive_path,
@@ -264,7 +265,7 @@ _PEM_BODY_RE = preview_files.PEM_BODY_RE
 _STATIC_SRV: dict[str, dict[str, Any]] = {}
 
 _NODE_BIN_DIRS = dev_preview.NODE_BIN_DIRS
-_NVM_GLOB = dev_preview.NVM_GLOB
+_nvm_version_bin_dirs = nvm_version_bin_dirs
 _CHILD_ENV_STRIP = dev_preview.CHILD_ENV_STRIP
 _CHILD_ENV_STRIP_PREFIXES = dev_preview.CHILD_ENV_STRIP_PREFIXES
 _LOCKFILES = dev_preview.LOCKFILES
@@ -279,6 +280,26 @@ _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _LSOF_TIMEOUT = 4
 _PROBE_TIMEOUT = 1.5
 _START_TIMEOUT = 45
+_DEV_LOG_TAIL_CHARS = 800
+# Read at most this many bytes from the END of the log into one buffer, then
+# redact that whole buffer in a single pass. The window bounds memory yet is far
+# wider than the retained tail, so a credential whose opening anchor (e.g. a PEM
+# ``-----BEGIN ... PRIVATE KEY-----`` header) sits above the tail is still in the
+# buffer the redactor sees. A single-pass redaction has no chunk seam a secret
+# could straddle to escape scrubbing.
+_DEV_LOG_READ_WINDOW = 64 * 1024
+# PEM private-key END marker: any "-----END ... PRIVATE KEY-----", the same
+# spelling the redaction floor's PEM branch matches through from its BEGIN
+# anchor. `_drop_truncated_window_head` masks a mid-file window through the
+# first one it finds, since the region before it may be the body of a key whose
+# BEGIN header sat above the window start, which the floor's BEGIN-anchored PEM
+# branch cannot match.
+_PEM_END_RE = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
+# A line that is nothing but PEM/base64 key-body material: the base64 charset
+# ([A-Za-z0-9+/=]) with no spaces. Matches the anchorless body of a key whose
+# BEGIN header sat above a mid-file window start, when no END marker falls
+# inside the window for the END-masking to catch.
+_PEM_BODY_LINE_RE = re.compile(r"[A-Za-z0-9+/=]+")
 _STOP_GRACE = 3
 _RELAY_TIMEOUT = 30
 _WS_IDLE = 3600
@@ -433,14 +454,10 @@ def _sanitize_selection_sources(sel_obj: Any, root: str) -> None:
 
 
 def _read_request(fp: Path) -> dict | None:
-    """Read only after the MAX_RECORD_BYTES st_size gate, before read_text."""
-
     return request_state.read_request(runtime, fp)
 
 
 def _write_request(fp: Path, req: dict) -> None:
-    """Publish through the shared chokepoint with max_bytes=MAX_RECORD_BYTES."""
-
     return request_state.write_request(runtime, fp, req)
 
 
@@ -535,8 +552,6 @@ def _static_response(
     base: str,
     script: str = INJECT_PUBLIC,
 ) -> tuple[int, str, bytes]:
-    """Serve only after containment and the _is_kirocrew_internal policy floor."""
-
     return preview_files.static_response(runtime, root_str, rel, base, script)
 
 
@@ -665,7 +680,6 @@ def _start_inject_proxy(dev_url: str) -> tuple[object | None, str]:
 
 
 def _front_with_proxy(project_id: str, dev_url: str) -> str:
-    # The boundary's bind-failure result is `return ""`; never expose upstream.
     return dev_preview.front_with_proxy(runtime, project_id, dev_url)
 
 
@@ -688,6 +702,109 @@ def _in_proc_tree(pid: int, root_pid: int, pgid: int | None) -> bool:
 class _DevProxyHandler(dev_preview.DevProxyHandlerBase):
     runtime = runtime
     timeout = _CLIENT_READ_TIMEOUT
+
+
+def _read_dev_log_tail(log: Path) -> str:
+    """Return the bounded, redacted diagnostic tail of a failed dev-server launch.
+
+    Read at most ``_DEV_LOG_READ_WINDOW`` bytes from the END of the log into one
+    buffer, redact that whole buffer in a single ``redact_via_context`` pass so a
+    loaded companion's credential policy applies, then keep the last
+    ``_DEV_LOG_TAIL_CHARS`` characters. The window bounds memory while
+    staying far wider than the retained tail.
+
+    When the log is larger than the window the read starts mid-file, so the
+    window's own start is UNTRUSTED: it can slice through a credential, orphaning
+    a secret's body from the opening anchor the redactor keys on. A ``-----BEGIN
+    ... PRIVATE KEY-----`` header that sat before the window leaves an anchorless
+    key body at the window start that the header-anchored redactor would miss.
+    So on a truncated read ``_drop_truncated_window_head`` drops through the
+    first newline (the partial first line) and any leading run of two or more
+    base64-only lines, then masks everything up to and including the first
+    ``-----END ... PRIVATE KEY-----`` marker left in the window, whether or not
+    a ``BEGIN`` precedes it, all before redaction. Redacting in one pass over
+    what remains leaves no boundary a secret could straddle to escape scrubbing.
+    """
+
+    try:
+        with log.open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            start = max(0, size - _DEV_LOG_READ_WINDOW)
+            handle.seek(start)
+            # Cap the read LENGTH, not just its start: a descendant that
+            # inherited the log fd can keep appending after the parent exits, so
+            # an unsized read() would follow the file to its live EOF and defeat
+            # the bound. Reading at most _DEV_LOG_READ_WINDOW bytes keeps memory
+            # bounded regardless.
+            window = handle.read(_DEV_LOG_READ_WINDOW).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    if start > 0:
+        window = _drop_truncated_window_head(window)
+    return redact_via_context(window)[-_DEV_LOG_TAIL_CHARS:]
+
+
+def _drop_truncated_window_head(window: str) -> str:
+    """Discard the untrusted head of a window that began mid-file.
+
+    The first line is partial (the read cut into it). Beyond it, a key whose
+    ``BEGIN`` header sat above the window start leaves an anchorless body the
+    header-anchored redactor cannot scrub. Two guards remove it: drop through
+    the first newline and a leading run of two or more PEM/base64 body lines,
+    then mask through the first ``-----END ... PRIVATE KEY-----`` marker. The
+    leading-body drop is the only guard when NO END marker falls inside the
+    window (so the END-mask never fires); the END-mask additionally covers a
+    later full PEM. Between them they remove a bisected key body that ends at an
+    END marker inside the window, or that opens the window, after the partial
+    first line, as one unbroken run of two or more base64-only lines.
+    """
+
+    # Drop the whole first line unconditionally. On a mid-file read the first
+    # line is normally a fragment the seek bisected, so it is discarded. When the
+    # seek happens to land exactly on a line boundary this drops one intact line
+    # too — that is deliberate and cheap: at worst one non-secret diagnostic line
+    # is lost from a bounded tail, and paying it always keeps this guard simple
+    # rather than reconstructing whether the preceding byte was a newline.
+    newline = window.find("\n")
+    if newline != -1:
+        window = window[newline + 1 :]
+    # Then drop the LEADING run of PEM/base64 key-body lines — only the base64
+    # charset ([A-Za-z0-9+/=]), no spaces — but ONLY when that run is TWO OR MORE
+    # consecutive such lines. A wrapped PEM key body is always multi-line (PEM
+    # wraps base64 at 64 chars), so a run of ≥2 base64-only lines at the head of a
+    # mid-file window is the anchorless body of a key whose ``BEGIN`` header sat
+    # above the window start — and when NO ``-----END ... PRIVATE KEY-----`` marker
+    # falls inside the window the END-masking below never fires, so those body
+    # lines would otherwise reach the redactor and a later labeled secret shrinking
+    # under redaction could leave them in the retained tail. Requiring ≥2 lines is
+    # what keeps a single legitimate base64-charset diagnostic line (a hash, an id,
+    # a long token) from being discarded. Dropping the run covers the no-END case
+    # when the body opens the window as one unbroken run, regardless of any END;
+    # it costs at most a run of non-secret base64-shaped diagnostic lines from a
+    # bounded tail.
+    lines = window.split("\n")
+    run = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped and _PEM_BODY_LINE_RE.fullmatch(stripped):
+            run += 1
+            continue
+        break
+    if run >= 2:
+        window = "\n".join(lines[run:])
+    # Mask through the first END marker in the window. On a mid-file read the
+    # region before that END is untrusted: it may hold the anchorless body of a
+    # key whose BEGIN header sat above the window start. Discarding it costs at
+    # most the diagnostic text before that END, including any on the END's own
+    # line (a self-contained PEM in it the redactor would scrub anyway), while
+    # keeping it can leak an orphaned key body. Masking through the FIRST END
+    # unconditionally is why a later ``BEGIN`` cannot re-expose the bisected
+    # body: a preceding-BEGIN test would skip the mask exactly when an orphan
+    # body with no END of its own in the window is followed by a fresh full PEM.
+    end = _PEM_END_RE.search(window)
+    if end is not None:
+        window = window[end.end() :]
+    return window
 
 
 def _start_dev_proc(project_id: str, root: Path) -> dict:
@@ -770,11 +887,7 @@ def _start_dev_proc(project_id: str, root: Path) -> dict:
     deadline = time.time() + _START_TIMEOUT
     while time.time() < deadline:
         if proc.poll() is not None:
-            tail = ""
-            try:
-                tail = log.read_text("utf-8", errors="replace")[-800:]
-            except OSError:
-                pass
+            tail = _read_dev_log_tail(log)
             _DEV_PROCS.pop(project_id, None)
             return {
                 "ok": False,
@@ -890,6 +1003,19 @@ class _Server(ThreadingHTTPServer):
     """
 
     allow_reuse_address = IS_POSIX
+
+    def server_bind(self) -> None:
+        # ``http.server.HTTPServer.server_bind`` resolves ``socket.getfqdn(host)``
+        # between ``bind()`` and ``listen()``. That system-resolver lookup can
+        # stall on some macOS hosts while the socket sits bound but refuses every
+        # connect, which reads to a waiting parent as a server that never came up.
+        # This loopback listener is reached by address, never by name, so the
+        # lookup buys nothing -- skip it by binding through ``TCPServer`` and
+        # recording the address directly (mirrors plumb_cpu.LoopbackServer).
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
 
 
 def main() -> int:

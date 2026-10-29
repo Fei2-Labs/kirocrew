@@ -1,14 +1,17 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import DiffBlock, { extractFilePath } from '../components/DiffBlock'
+import { __resetPathKindCache } from '../hooks/usePathKind'
+import { pathKindsFetch, probedPaths } from './pathKindStub'
 
-// These assertions exercise controls rendered by the lazy Pierre implementation,
-// not the Suspense fallback. Warm that chunk once so a saturated full-suite worker
-// cannot make Testing Library's default query timeout race module loading.
+// The block's controls live in its own header row, but Pierre's lazy chunk still
+// mounts beneath that row in every highlighted-mode case below. Warm it once so
+// a saturated full-suite worker does not pay the module load inside a test.
 beforeAll(() => import('../pierre/PierreImpl'))
 
 beforeEach(() => {
-  globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true })) as unknown as typeof fetch
+  __resetPathKindCache()
+  globalThis.fetch = pathKindsFetch(() => 'file') as unknown as typeof fetch
   // The split/unified layout persists app-wide (`mc-diff-split`); start each
   // test from the unseeded default so no test inherits another's toggle.
   localStorage.clear()
@@ -23,25 +26,49 @@ const simpleDiff = `--- a/file.ts
 +const c = 4
  const d = 5`
 
-/* Pierre owns the diff surface: the rows, the gutters, the hunk folding and the
- * file header — filename and ± counts included — are painted inside a shadow
- * root, behind a lazy chunk that only resolves once a test awaits. What is left
- * in the light DOM is what DiffBlock itself contributes: the controls it slots
- * into Pierre's header-metadata area, the path it resolves for Open, and the
- * generating indicator. So every query for one of those awaits, and appearance
- * assertions belong in Playwright instead of here. A patch Pierre cannot parse
- * renders as plain monospace text with no header at all, so no slotted control
- * appears for one.
- *
- * A NEGATIVE assertion about a slotted control therefore has to await the
- * header too, and assert the guard's own observable. Until the chunk resolves
- * Suspense is showing PlainCodeFallback — a plain `<pre>` where no slotted
- * control can exist — so a synchronous `queryByTitle(...)).not.toBeInTheDocument()`
- * passes for the wrong reason and keeps passing with the guard deleted. Each
- * one below waits for `headerMounted()` and then asserts that no existence
- * probe fired, which is the effect's early return made visible. */
+const multiFileDiff = `diff --git a/alpha.ts b/alpha.ts
+--- a/alpha.ts
++++ b/alpha.ts
+@@ -1 +1 @@
+-old alpha
++new alpha
+diff --git a/beta.ts b/beta.ts
+--- a/beta.ts
++++ b/beta.ts
+@@ -1 +1 @@
+-old beta
++new beta`
 
-/** Resolves once Pierre's file header is live: `Copy patch` is slotted
+function expectMarkedSections(container: HTMLElement, bodySelector: string): HTMLElement[] {
+  const sections = [...container.querySelectorAll<HTMLElement>('[data-diff-section]')]
+  expect(sections).toHaveLength(2)
+  expect(sections.map(section => section.dataset.diffSection)).toEqual(['0', '1'])
+  expect(sections.every(section => section.classList.contains('contents'))).toBe(true)
+  expect(sections.map(section => section.querySelectorAll('[data-diffs-header]').length)).toEqual([1, 1])
+  expect(sections.map(section => section.querySelectorAll(bodySelector).length)).toEqual([1, 1])
+  expect(sections[0]).toHaveTextContent('alpha.ts')
+  expect(sections[0]).not.toHaveTextContent('beta.ts')
+  expect(sections[1]).toHaveTextContent('beta.ts')
+  expect(sections[1]).not.toHaveTextContent('alpha.ts')
+  return sections
+}
+
+/* Pierre owns the diff BODY: the rows, the gutters and the hunk folding are
+ * painted inside a shadow root, behind a lazy chunk that only resolves once a
+ * test awaits. The block's title row — filename, ± counts, and the Open /
+ * layout / Copy controls — is DiffBlock's own light-DOM row, present from the
+ * first render whatever Pierre is doing, so it is what these assertions read;
+ * appearance assertions belong in Playwright instead of here.
+ *
+ * A NEGATIVE assertion about the Open control waits for the header row first
+ * and then asserts the guard's own observable: with the `isSafePath(probePath)`
+ * term removed from the effect, fetch is called for the unsafe path and the
+ * button appears — a bare `queryByTitle(...)).not.toBeInTheDocument()` alone
+ * would also pass for a path that was merely never probed. Each one below
+ * waits for `headerMounted()` and then asserts that no existence probe fired,
+ * which is the effect's early return made visible. */
+
+/** Resolves once the block's header row is live: `Copy patch` is rendered
  *  unconditionally, so its arrival means the Open slot is real and empty
  *  rather than merely unrendered. */
 const headerMounted = () => screen.findByTitle('Copy patch')
@@ -55,6 +82,45 @@ describe('DiffBlock', () => {
   it('hides generating indicator when complete', () => {
     render(<DiffBlock code={simpleDiff} complete={true} />)
     expect(screen.queryByText('generating diff…')).not.toBeInTheDocument()
+  })
+
+  it('marks each file section around its header and streaming body', () => {
+    const { container } = render(<DiffBlock code={multiFileDiff} complete={false} />)
+    const sections = expectMarkedSections(container, '.pierre-plain')
+    expect(sections[0]).toHaveTextContent('-old alpha')
+    expect(sections[0]).not.toHaveTextContent('-old beta')
+    expect(sections[1]).toHaveTextContent('-old beta')
+    expect(sections[1]).not.toHaveTextContent('-old alpha')
+  })
+
+  it('marks each file section around its header and plain-mode body', () => {
+    localStorage.setItem('mc-diff-plain', '1')
+    const { container } = render(<DiffBlock code={multiFileDiff} complete={true} />)
+    const sections = expectMarkedSections(container, '.pierre-plain')
+    expect(sections[0]).toHaveTextContent('-old alpha')
+    expect(sections[0]).not.toHaveTextContent('-old beta')
+    expect(sections[1]).toHaveTextContent('-old beta')
+    expect(sections[1]).not.toHaveTextContent('-old alpha')
+  })
+
+  it('marks each file section around its header and normal Pierre body', async () => {
+    const { container } = render(<DiffBlock code={multiFileDiff} complete={true} />)
+    // Wait for the lazy Pierre chunk to replace both per-file stand-ins.
+    await waitFor(
+      () => expect(container.querySelectorAll('[data-diff-section] diffs-container')).toHaveLength(2),
+      { timeout: 5000 },
+    )
+    expectMarkedSections(container, 'diffs-container')
+  })
+
+  it('marks a one-file patch as one diff section', () => {
+    const { container } = render(<DiffBlock code={simpleDiff} complete={false} />)
+    const sections = [...container.querySelectorAll<HTMLElement>('[data-diff-section]')]
+    expect(sections).toHaveLength(1)
+    expect(sections[0].dataset.diffSection).toBe('0')
+    expect(sections[0]).toHaveClass('contents')
+    expect(sections[0].querySelectorAll('[data-diffs-header]')).toHaveLength(1)
+    expect(sections[0].querySelectorAll('.pierre-plain')).toHaveLength(1)
   })
 
   it('has copy button on hover', async () => {
@@ -99,16 +165,17 @@ describe('DiffBlock', () => {
     expect(onFileOpen).toHaveBeenCalledWith('file.ts')
   })
 
-  /* Pierre builds its file header from the `---`/`+++` lines; hunks alone give
-     it nothing to title, so it renders the body and NO metadata slot at all.
-     Asserting only that Open is absent would therefore pass even with the path
-     guard deleted — the assertion has to be that NOTHING is slotted, which is
-     also the pin on this known limitation (a headerless patch loses Open,
-     Split and Copy together). */
-  it('slots no controls at all for a headerless patch', async () => {
+  /* Pierre builds its file title from the `---`/`+++` lines; hunks alone give
+     it nothing to name. The block's own header does not depend on that: Copy
+     is there for a headerless patch too, and the filename is simply empty.
+     Open is the one control that needs a path — with none extracted there is
+     nothing to probe and nothing to open, and asserting that the probe never
+     fired is the guard's own observable. */
+  it('keeps Copy but offers no Open for a headerless patch', async () => {
     const noPathDiff = `@@ -1,2 +1,2 @@\n-old\n+new`
     render(<DiffBlock code={noPathDiff} complete={true} onFileOpen={() => {}} />)
-    await expect(screen.findByTitle('Copy patch', undefined, { timeout: 1500 })).rejects.toThrow()
+    expect(await headerMounted()).toBeInTheDocument()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
     expect(screen.queryByTitle(/^Open .* in side panel$/)).not.toBeInTheDocument()
   })
 
@@ -179,7 +246,7 @@ describe('DiffBlock', () => {
   })
 
   it('hides View file button when file does not exist', async () => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: false, status: 404 })) as unknown as typeof fetch
+    globalThis.fetch = pathKindsFetch(() => null) as unknown as typeof fetch
     render(<DiffBlock code={simpleDiff} complete={true} onFileOpen={() => {}} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     expect(screen.queryByTitle(/^Open .* in side panel$/)).not.toBeInTheDocument()
@@ -189,23 +256,21 @@ describe('DiffBlock', () => {
     // All three actions (side-by-side / copy / Open) are hover-gated together.
     // Open uses a plain text label rather than an icon since the diff header
     // already prefixes the file name.
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as unknown as typeof fetch
+    globalThis.fetch = pathKindsFetch(() => 'file') as unknown as typeof fetch
     render(<DiffBlock code={simpleDiff} complete={true} onFileOpen={() => {}} />)
     await waitFor(() => expect(screen.getByText('Open')).toBeInTheDocument())
     // No labeled icon variant.
     expect(screen.queryByText('Open file')).toBeNull()
     // Sits inside the same opacity-0 hover-reveal container as the
-    // side-by-side / copy buttons. That container is the <span> DiffBlock
-    // slots into Pierre's header-metadata area — Pierre wraps the slot
-    // content in a bare <div> of its own, so the span is the element that
-    // carries the gate.
+    // side-by-side / copy buttons: the <span> DiffBlock renders as the actions
+    // cluster of its own header row, which is the element that carries the gate.
     const actions = screen.getByText('Open').closest('span')!
     expect(actions.className).toMatch(/opacity-0/)
     expect(actions.className).toMatch(/group-hover\/diff:opacity-100/)
   })
 
   it('headers in diff content win over pathHint', async () => {
-    globalThis.fetch = vi.fn(() => Promise.resolve({ ok: true, status: 200 })) as unknown as typeof fetch
+    globalThis.fetch = pathKindsFetch(() => 'file') as unknown as typeof fetch
     // simpleDiff has a real +++ b/<path> header — that should win.
     render(<DiffBlock code={simpleDiff} complete={true} onFileOpen={() => {}} pathHint="/wrong/path" />)
     await waitFor(() => expect(screen.getByText('Open')).toBeInTheDocument())
@@ -225,14 +290,11 @@ describe('DiffBlock', () => {
     // backend 400s every relative path, so absence is not evidence.
     const noIndexDiff = `diff --git a/home/user/src/app.ts b/home/user/src/app.ts\n--- a/home/user/src/app.ts\n+++ b/home/user/src/app.ts\n@@ -1,2 +1,2 @@\n-old\n+new`
 
-    const probedPaths = (mock: ReturnType<typeof vi.fn>) =>
-      mock.mock.calls.map(c => decodeURIComponent(String(c[0]).match(/path=([^&]*)/)?.[1] ?? ''))
-
     it('suppresses the probe entirely for an uncorroborated ambiguous header', async () => {
       // THE captured bug: no pathHint, `+++ b/home/user/…` header. The old
       // code fired `path=home/user/…&resolve=1` (the 400); the fix sends
       // nothing at all and offers no button.
-      const fetchMock = vi.fn(() => Promise.resolve({ ok: true }))
+      const fetchMock = pathKindsFetch(() => 'file')
       globalThis.fetch = fetchMock as unknown as typeof fetch
       render(<DiffBlock code={noIndexDiff} complete={true} onFileOpen={() => {}} />)
       await new Promise(r => setTimeout(r, 20))
@@ -241,20 +303,20 @@ describe('DiffBlock', () => {
     })
 
     it('probes only the rooted spelling when the chat text corroborates it, and opens it', async () => {
-      const fetchMock = vi.fn(() => Promise.resolve({ ok: true }))
+      const fetchMock = pathKindsFetch(() => 'file')
       globalThis.fetch = fetchMock as unknown as typeof fetch
       const onFileOpen = vi.fn()
       render(<DiffBlock code={noIndexDiff} complete={true} onFileOpen={onFileOpen} pathHint="/home/user/src/app.ts" />)
       await waitFor(() => expect(screen.getByTitle(/^Open .* in side panel$/)).toBeInTheDocument())
-      // Exactly one request, for the rooted spelling, with no resolve=1.
+      // Exactly one request, for the rooted spelling only.
+      expect(fetchMock).toHaveBeenCalledTimes(1)
       expect(probedPaths(fetchMock)).toEqual(['/home/user/src/app.ts'])
-      expect(String(fetchMock.mock.calls[0][0])).not.toContain('resolve=1')
       fireEvent.click(screen.getByTitle(/^Open .* in side panel$/))
       expect(onFileOpen).toHaveBeenCalledWith('/home/user/src/app.ts')
     })
 
     it('shows no button when the corroborated rooted spelling does not exist', async () => {
-      const fetchMock = vi.fn(() => Promise.resolve({ ok: false, status: 404 }))
+      const fetchMock = pathKindsFetch(() => null)
       globalThis.fetch = fetchMock as unknown as typeof fetch
       render(<DiffBlock code={noIndexDiff} complete={true} onFileOpen={() => {}} pathHint="/home/user/src/app.ts" />)
       await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
@@ -262,7 +324,7 @@ describe('DiffBlock', () => {
     })
 
     it('a pathHint naming a DIFFERENT file does not corroborate — header stays suppressed', async () => {
-      const fetchMock = vi.fn(() => Promise.resolve({ ok: true }))
+      const fetchMock = pathKindsFetch(() => 'file')
       globalThis.fetch = fetchMock as unknown as typeof fetch
       render(<DiffBlock code={noIndexDiff} complete={true} onFileOpen={() => {}} pathHint="/somewhere/else.ts" />)
       await new Promise(r => setTimeout(r, 20))
@@ -271,7 +333,7 @@ describe('DiffBlock', () => {
     })
 
     it('does not treat an ordinary repo-relative header as ambiguous', async () => {
-      const fetchMock = vi.fn(() => Promise.resolve({ ok: true }))
+      const fetchMock = pathKindsFetch(() => 'file')
       globalThis.fetch = fetchMock as unknown as typeof fetch
       render(<DiffBlock code={simpleDiff} complete={true} onFileOpen={() => {}} />)
       await waitFor(() => expect(fetchMock).toHaveBeenCalled())
@@ -282,7 +344,7 @@ describe('DiffBlock', () => {
       // `+++ home/user/x` with NO `b/` prefix carries no evidence of a join —
       // treating it as absolute would be a guess, so it stays relative.
       const plainDiff = `--- home/user/notes.md\n+++ home/user/notes.md\n@@ -1,2 +1,2 @@\n-old\n+new`
-      const fetchMock = vi.fn(() => Promise.resolve({ ok: true }))
+      const fetchMock = pathKindsFetch(() => 'file')
       globalThis.fetch = fetchMock as unknown as typeof fetch
       render(<DiffBlock code={plainDiff} complete={true} onFileOpen={() => {}} />)
       await waitFor(() => expect(fetchMock).toHaveBeenCalled())
@@ -294,8 +356,7 @@ describe('DiffBlock', () => {
       // Open button targeting the OLD header's path once the diff content
       // (e.g. a streaming header) changes. The resolved state is keyed to the
       // header it was measured for; a mismatch renders no button.
-      const fetchMock = vi.fn((url: string) =>
-        Promise.resolve({ ok: String(url).includes(encodeURIComponent('/home/user/src/app.ts')) }))
+      const fetchMock = pathKindsFetch(p => (p === '/home/user/src/app.ts' ? 'file' : null))
       globalThis.fetch = fetchMock as unknown as typeof fetch
       const onFileOpen = vi.fn()
       const { rerender } = render(<DiffBlock code={noIndexDiff} complete={true} onFileOpen={onFileOpen} pathHint="/home/user/src/app.ts" />)
@@ -320,27 +381,23 @@ describe('DiffBlock', () => {
       localStorage.setItem('mc-diff-plain', '1')
       render(<DiffBlock code={simpleDiff} complete={true} />)
       // The patch text is in the light DOM (Pierre would have put its rows in a
-      // shadow root), and DiffBlock's own header row stands in for Pierre's —
-      // so the filename and Copy survive the switch.
+      // shadow root), and the block's own header row is the same row as in
+      // highlighted mode — so the filename and Copy survive the switch.
       expect(screen.getByText(/-const b = 2/)).toBeInTheDocument()
       expect(screen.getByText('file.ts')).toBeInTheDocument()
       expect(screen.getByTitle('Copy patch')).toBeInTheDocument()
     })
 
-    /* Review finding (gpt, `website/src/pierre/index.tsx:236`): the patch handed
-       to Pierre has its `---`/`+++` paths shortened to basenames, because Pierre
-       consumes those lines to draw its file header and never shows them as text.
-       The plain render prints the patch VERBATIM, so reusing that copy would put
-       `a/file.ts` where the reader — and anyone copying the patch out of the page
-       to apply it — expects the original path. Plain mode must render `code`. */
-    it('keeps the original header paths, which the highlighted render shortens', () => {
+    /* The plain render prints the patch VERBATIM: a shortened copy would put
+       `a/file.ts` where the reader — and anyone copying the patch out of the
+       page to apply it — expects the original path. The header row shows the
+       basename by shortening `headerPath`, never the patch body. */
+    it('keeps the original header paths and shows the basename in its own row', () => {
       localStorage.setItem('mc-diff-plain', '1')
       const deep = `--- a/src/deep/nested/file.ts\n+++ b/src/deep/nested/file.ts\n@@ -1,1 +1,1 @@\n-old\n+new`
       render(<DiffBlock code={deep} complete={true} />)
       expect(screen.getByText(/--- a\/src\/deep\/nested\/file\.ts/)).toBeInTheDocument()
       expect(screen.getByText(/\+\+\+ b\/src\/deep\/nested\/file\.ts/)).toBeInTheDocument()
-      // The stand-in header still shows the basename alone; it shortens
-      // `headerPath` itself rather than the patch body.
       expect(screen.getByText('file.ts')).toBeInTheDocument()
     })
 
@@ -356,7 +413,8 @@ describe('DiffBlock', () => {
 
     it('is off unless the preference is set — the highlighted diff stays the default', async () => {
       render(<DiffBlock code={simpleDiff} complete={true} />)
-      // Pierre's header arriving is the observable that the chunk was requested.
+      // The layout toggle renders only while colour is on, so its presence is
+      // the block reading the preference as off.
       expect(await headerMounted()).toBeInTheDocument()
       expect(await screen.findByTitle('Unified view')).toBeInTheDocument()
     })

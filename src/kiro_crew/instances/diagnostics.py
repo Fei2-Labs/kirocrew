@@ -27,7 +27,7 @@ from kiro_crew.cloud import ssm as cloud_ssm
 # cannot drift from the mint path's on the inner/outer timeout pair -- the same
 # reason `_build_ssh_argv` is shared with the SSH rung rather than rebuilt here.
 from kiro_crew.instances.ssm_token_mint import _send_over_ssm
-from kiro_crew.instances.token_mint import _build_ssh_argv
+from kiro_crew.instances.token_mint import _build_ssh_argv, ssh_spawn_argv_env
 from kiro_crew.instances.validation import (
     SshValidationError,
     SsmValidationError,
@@ -203,12 +203,20 @@ async def _probe_local_forward(local_port: int) -> bool:
 
 
 async def _run_ok(argv: list[str], timeout: float) -> bool:
-    """Run *argv*, return True iff it exits 0 within *timeout*."""
+    """Run the ssh *argv*, return True iff it exits 0 within *timeout*.
+
+    Spawned through :func:`ssh_spawn_argv_env` like every other ssh child, so a
+    ``ProxyCommand`` host probes the same under a GUI-launched gateway as the
+    tunnel it is diagnosing.
+    """
+    argv, env = await asyncio.to_thread(ssh_spawn_argv_env, argv)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except OSError:
         return False
@@ -222,12 +230,18 @@ async def _run_ok(argv: list[str], timeout: float) -> bool:
 
 
 async def _run_stdout(argv: list[str], timeout: float) -> str | None:
-    """Run *argv*, return decoded stdout on exit 0, else None."""
+    """Run the ssh *argv*, return decoded stdout on exit 0, else None.
+
+    Same spawn env as :func:`_run_ok`.
+    """
+    argv, env = await asyncio.to_thread(ssh_spawn_argv_env, argv)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            env=env,
         )
     except OSError:
         return None
@@ -397,9 +411,11 @@ async def _probe_task_exec_ready(
 ) -> tuple[bool, str]:
     """``(ready, reason)`` from the shared exec-readiness preflight, off the loop.
 
-    The preflight is a synchronous ``aws ecs describe-tasks``; it is the same
-    call ``connect_fargate`` makes before opening anything, so the ladder cannot
-    disagree with the connect path about what "ready" means.
+    The preflight is a synchronous ``aws ecs describe-tasks``, and this ladder is
+    where its answer reaches an operator: the ``fargate`` forward opens without
+    consulting it, so a task whose execute-command channel was never enabled, or
+    whose in-task agent cannot reach ``ssmmessages``, surfaces here as the broken
+    link rather than as a forward that just does not come up.
     """
     readiness = await asyncio.to_thread(
         cloud_ssm.task_exec_readiness, cluster, task_id, profile, region

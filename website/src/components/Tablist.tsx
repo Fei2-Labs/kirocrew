@@ -28,6 +28,8 @@
  */
 import { useRef, type ReactNode } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
+import { usePressActivation } from '../hooks/usePressActivation'
+import { forwardUiLocation, UI_LOCATION_ATTR } from '../uiLocations/uiLocation'
 
 import {
   TABS_COUNT_BASE_CLASS,
@@ -55,6 +57,16 @@ export interface TablistTab<T extends string = string> {
   count?: number
 }
 
+/** A tab that is a registered UI location; its marker lands on that tab. Named
+ *  in `segments` at the call site (`{ key, label, ...uiLocation(id) }`, the
+ *  shape SegmentedControl and CrewEditorNextRail take), so the generator reads
+ *  the marker from one array literal and the tab's `label` as the label. */
+export interface TablistSegment<T extends string> {
+  key: T
+  label: string
+  'data-ui-location'?: string
+}
+
 interface Props<T extends string = string> {
   tabs: Array<TablistTab<T>>
   value: T
@@ -65,6 +77,13 @@ interface Props<T extends string = string> {
   /** Distinguishes this rail's sliding indicator from another one on the same
    *  page — two rails sharing an id animate into each other. */
   layoutId?: string
+  /** `active`: only the SELECTED tab shows its label; the others are their icon
+   *  alone (the label stays in the tooltip and the accessible name). For a rail
+   *  in a narrow column whose tabs all carry icons — the crewmate profile card.
+   *  Default `always`. */
+  labels?: 'always' | 'active'
+  /** The tabs that are registered UI locations (see `TablistSegment`). */
+  segments?: readonly TablistSegment<T>[]
 }
 
 /** Next enabled index in `dir`, wrapping. Disabled tabs are skipped rather than
@@ -100,9 +119,15 @@ export default function Tablist<T extends string = string>({
   onChange,
   ariaLabel,
   layoutId = 'tablist-indicator',
+  labels = 'always',
+  segments,
 }: Props<T>) {
   const reduceMotion = useReducedMotion()
   const refs = useRef<Array<HTMLButtonElement | null>>([])
+  const bindPress = usePressActivation()
+  // The tab's find_ui marker (if it is one), merged with the roving-focus ref.
+  const markerOf = (key: T, i: number) =>
+    forwardUiLocation<HTMLButtonElement>(segments?.find(seg => seg.key === key)?.[UI_LOCATION_ATTR], el => { refs.current[i] = el })
 
   const move = (to: number) => {
     const tab = tabs[to]
@@ -121,9 +146,7 @@ export default function Tablist<T extends string = string>({
         return (
           <button
             key={tab.key}
-            ref={el => {
-              refs.current[i] = el
-            }}
+            {...markerOf(tab.key, i)}
             type="button"
             role="tab"
             aria-selected={isActive}
@@ -132,9 +155,11 @@ export default function Tablist<T extends string = string>({
             // rail costs one Tab press instead of one per plane.
             tabIndex={isActive ? 0 : -1}
             title={tab.tooltip || tab.label}
-            onClick={() => {
+            // Select on the mouse press, like the Radix tabs in ui/tabs;
+            // keyboard and touch select on click.
+            {...bindPress(() => {
               if (!isDisabled) onChange(tab.key)
-            }}
+            })}
             onKeyDown={e => {
               if (e.key === 'ArrowRight') {
                 e.preventDefault()
@@ -165,7 +190,11 @@ export default function Tablist<T extends string = string>({
               />
             )}
             {tab.icon}
-            <span className="whitespace-nowrap">{tab.label}</span>
+            {labels === 'always' || isActive ? (
+              <span className="whitespace-nowrap">{tab.label}</span>
+            ) : (
+              <span className="sr-only">{tab.label}</span>
+            )}
             {(tab.count ?? 0) > 0 && (
               <span
                 className={`${TABS_COUNT_BASE_CLASS} ${isActive ? 'text-accent/60' : 'text-muted/40'}`}

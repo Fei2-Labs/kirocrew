@@ -1,13 +1,16 @@
 import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from 'react'
+import { Trans } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
-import { XCircle, AlertTriangle, CheckCircle, RefreshCw, Hourglass, Check, BookOpen, SlidersHorizontal } from 'lucide-react'
+import { XCircle, CheckCircle, RefreshCw, Hourglass, Check, BookOpen, SlidersHorizontal, X } from 'lucide-react'
 import { api } from '../../api/client'
-import { Card, CardTitle, Btn, SendBtn, Input, Badge, EmptyState, Skeleton } from '../../components/ui'
+import { Card, CardTitle, Btn, SendBtn, Input, Badge, EmptyState, Skeleton, IconButton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import SimpleSelect from '../../components/SimpleSelect'
 import { esc } from '../../api/helpers'
-import VectorMemoryCard from './VectorMemoryCard'
+import { findReport, parseErrorCode, parseErrorField } from '../../utils/errorReport'
+import { sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
+import VectorMemoryCard, { SEMANTIC_CARD_ID } from './VectorMemoryCard'
 import EmbeddingModelCard from './EmbeddingModelCard'
 import MemoryStoreCard, {
   MEMORY_QUERY_PREFIXES,
@@ -32,6 +35,38 @@ import SortableHeader from '../../components/SortableHeader'
 import { i18nT } from '../../i18n/t'
 import { compareText, fmtDateTimeNumeric } from '../../i18n/format'
 
+/** `POST /api/memory/consolidate`'s code for a target the memory modes promise
+ *  leaves no durable trace (a Temporary or Incognito session). "Summarize now"
+ *  posts every stem `api.sessions` lists, those sessions included, and a row's
+ *  `memory_mode` cannot pre-filter them all: a channel thread flagged before its
+ *  transcript header carried the mode holds the flag in the session map alone,
+ *  which the list is not built from. So the tally sorts the refusals after the
+ *  fact -- a skip the user asked for by choosing the mode, counted apart from a
+ *  request that failed. */
+const RESTRICTED_TARGET_CODE = 'restricted_target_session'
+
+/** Machine-readable fields of a rejected consolidate call's JSON body: the
+ *  backend `code`, and for a refused target the `mode` it was in -- both read
+ *  through the error journal's own body parser (`parseErrorCode` /
+ *  `parseErrorField`), the one parse of a backend error envelope. Duck-typed
+ *  on `body` rather than `instanceof ApiError` (the `MobileConnectModal`
+ *  shape), so it keeps working under a mocked `api/client`. */
+const consolidateRefusal = (reason: unknown): { code?: string; mode?: string } => {
+  const body = typeof reason === 'object' && reason !== null && 'body' in reason && typeof reason.body === 'string'
+    ? reason.body
+    : undefined
+  return { code: parseErrorCode(body), mode: parseErrorField(body, 'mode') }
+}
+
+/** The mode a skipped session was in, as the tally names it when every skipped
+ *  session shares one ("1 skipped: incognito session"): the reader could not tell
+ *  whether "temporary or incognito" was two kinds of private chat or one thing
+ *  with two names. A literal map, indexed, so every key stays greppable. */
+const SKIPPED_MODE_KEYS = {
+  incognito: 'pages.overview.memoryTab.skipped_incognito_session',
+  temporary: 'pages.overview.memoryTab.skipped_temporary_session',
+} as const
+
 /** The Scope cell. The three values are the three delete selectors the list
  *  reports, and each must read differently: a fragment is that scope's row;
  *  `""` is the global row, labelled rather than left blank so it does not read
@@ -52,7 +87,26 @@ function scopeCell(lesson: Lesson) {
   return <>{repo}<span className="block text-[12px] text-muted">{i18nT('pages.overview.memoryTab.scope_workspace', { name: lesson.workspace })}</span></>
 }
 
-export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNavigate }: { refreshTrigger: number; selectedStore?: string; onStoreNavigate?: (store: string) => void }) {
+/** The Source cell: the store's write origin in plain words. `user_explicit`
+ *  covers every deliberate save (`learn_add`, the dashboard, the CLI), whoever
+ *  made it, so its label names both the user and the agent. An origin with no
+ *  label shows its stored code; a row with none reads "Unknown". */
+function sourceCell(lesson: Lesson) {
+  switch (lesson.source || '') {
+    case '': return <span className="text-muted italic">{i18nT('pages.overview.memoryTab.source_unknown')}</span>
+    case 'user_explicit': return i18nT('pages.overview.memoryTab.source_user_explicit')
+    case 'consolidation': return i18nT('pages.overview.memoryTab.source_consolidation')
+    case 'taskrunner': return i18nT('pages.overview.memoryTab.source_taskrunner')
+    default: return <span className="font-mono">{esc(lesson.source ?? '')}</span>
+  }
+}
+
+/** `?focus=` value that lands the global Memory view on its lessons. */
+export const MEMORY_FOCUS_LESSONS = 'lessons'
+/** The Lessons card, the landing spot for that focus when vector memory is off. */
+export const LESSONS_CARD_ID = 'memory-lessons-card'
+
+export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNavigate, focus }: { refreshTrigger: number; selectedStore?: string; onStoreNavigate?: (store: string) => void; focus?: string | null }) {
   const stores = useMemoryStores()
   const navigate = useNavigate()
   const leave = useGuardedLeave()
@@ -122,7 +176,7 @@ export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNaviga
           }}>{i18nT('pages.kiroCrewAgentsPage.open_crew_manager')}</Btn>
         </div>
       </>}
-    </Card> : <GlobalMemoryTab refreshTrigger={refreshTrigger} onDirtyChange={setDirty} />}
+    </Card> : <GlobalMemoryTab refreshTrigger={refreshTrigger} onDirtyChange={setDirty} focusLessons={focus === MEMORY_FOCUS_LESSONS} />}
     {pendingStore !== null && <Modal open title={i18nT('memoryV2.discard_title')} onClose={() => setPendingStore(null)}><div className="flex flex-col gap-3">
       <p className="text-[13px]">{i18nT('memoryV2.discard_explanation')}</p>
       <div className="flex flex-wrap gap-2">
@@ -133,8 +187,12 @@ export default function MemoryTab({ refreshTrigger, selectedStore, onStoreNaviga
   </>
 }
 
-function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: number; onDirtyChange?: (dirty: boolean) => void }) {
+function GlobalMemoryTab({ refreshTrigger, onDirtyChange, focusLessons = false }: { refreshTrigger: number; onDirtyChange?: (dirty: boolean) => void; focusLessons?: boolean }) {
   const queryClient = useQueryClient()
+  // The failed-session link leaves this tab; through the same guard as the
+  // outer tab's exits, since the drafts held here are what the guard protects.
+  const navigate = useNavigate()
+  const leave = useGuardedLeave()
   const [recordDirty, setRecordDirty] = useState(false)
   const [recordsOpen, setRecordsOpen] = useState(false)
   const [docDirty, setDocDirty] = useState<Record<string, boolean>>({})
@@ -168,9 +226,33 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
   const [idleHours, setIdleHours] = useState(3); const [maxDays, setMaxDays] = useState(90); const [settingsSaved, setSettingsSaved] = useState(false)
   const [migrated, setMigrated] = useState(false)
   const [vectorActive, setVectorActive] = useState(false)
+  // `vectorActive` reads false until the vector card's status answers, so the
+  // lessons landing spot is chosen only once it has: before that the Lessons
+  // card can render and then vanish under a store that keeps lessons as
+  // `lesson.*` rows in the Semantic browser instead.
+  const [vectorSettled, setVectorSettled] = useState(false)
+  const lessonsFocused = useRef(false)
+  useEffect(() => {
+    if (!focusLessons || !vectorSettled || lessonsFocused.current) return
+    const target = document.getElementById(vectorActive ? SEMANTIC_CARD_ID : LESSONS_CARD_ID)
+    if (!target) return
+    lessonsFocused.current = true
+    target.scrollIntoView({ block: 'start' })
+  }, [focusLessons, vectorSettled, vectorActive])
   const [consolidating, setConsolidating] = useState(false)
   const [consolidateMsg, setConsolidateMsg] = useState<ReactNode>('')
   const [consolidateOk, setConsolidateOk] = useState(false)
+  // A tally with skips (and no failure) is not on the clear timer, so it gets
+  // its own dismiss control; this says whether the shown tally is that one.
+  const [consolidateStanding, setConsolidateStanding] = useState(false)
+  // A failed press, apart from the status message: it reports rejected
+  // requests, so it renders through ErrorNotice like every other failure.
+  // `session` is the first failed request's session key, `count` how many failed.
+  // One failure notice for the press's two request kinds: the session LIST
+  // (no session, no tally -- `session` absent) and a per-session request (the
+  // first failed one named, `count` failed in all). `summary` is the plain-words
+  // line for that kind; `raw` is the server's own reply, kept verbatim.
+  const [consolidateFailure, setConsolidateFailure] = useState<{ title: string; summary: string; raw: string; session?: { key: string; title?: string }; count: number } | null>(null)
   // Track all "Saved" / "consolidate-msg-clear" timeout ids so they can be
   // cleared on unmount — otherwise a pending setTimeout fires after the
   // component is gone and (in vitest) shows up as an unhandled error from
@@ -186,7 +268,11 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
       fn()
     }, ms)
     timeoutsRef.current.push(id)
+    return id
   }, [])
+  // The tally's own clear timer, so a press that lands within four seconds of
+  // the previous one cancels that one's clear instead of losing its tally to it.
+  const consolidateClearRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const loadLessons = useCallback(async () => { const d = await api.lessons(); setLessons(d.lessons || []) }, [])
   const { confirm, confirmDialog } = useConfirm()
   // Which step of a delete failed decides the banner's title: the request
@@ -233,6 +319,7 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
     rule: (a: Lesson, b: Lesson) => a.rule.localeCompare(b.rule),
     category: (a: Lesson, b: Lesson) => a.category.localeCompare(b.category),
     repo_scope: (a: Lesson, b: Lesson) => compareText(a.repo_scope ?? '', b.repo_scope ?? ''),
+    source: (a: Lesson, b: Lesson) => compareText(a.source ?? '', b.source ?? ''),
     ts: (a: Lesson, b: Lesson) => new Date(a.ts).getTime() - new Date(b.ts).getTime(),
   }), [])
   const recentLessons = useMemo(() => lessons.slice(-20), [lessons])
@@ -251,17 +338,127 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
     }
   }, [refreshTrigger, loadLessons, queryClient])
   const consolidate = async () => {
-    setConsolidating(true); setConsolidateMsg(''); setConsolidateOk(false)
-    const sessions = await api.sessions(200).catch(() => ({ sessions: [] }))
-    const keys = sessions?.sessions?.map((s: SessionInfo) => s.key).filter(Boolean) || []
+    if (consolidateClearRef.current !== null) {
+      clearTimeout(consolidateClearRef.current)
+      timeoutsRef.current = timeoutsRef.current.filter(t => t !== consolidateClearRef.current)
+      consolidateClearRef.current = null
+    }
+    setConsolidating(true); setConsolidateMsg(''); setConsolidateOk(false); setConsolidateFailure(null); setConsolidateStanding(false)
+    // The list is the press's first request. A gateway that is down or answers
+    // 500 is a FAILURE of the press, not an empty list: it renders through the
+    // same notice as a failed per-session request, with the server's reply as
+    // the detail -- swallowed into `sessions: []`, it read as "start a chat
+    // first" with no error surface at all. That message is for a list that
+    // succeeded with nothing in it.
+    let sessions: { sessions?: SessionInfo[] } | undefined
+    try {
+      sessions = await api.sessions(200)
+    } catch (err) {
+      setConsolidateFailure({
+        title: i18nT('pages.overview.memoryTab.consolidate_list_failed'),
+        summary: i18nT('pages.overview.memoryTab.consolidate_list_failed_summary'),
+        raw: err instanceof Error ? err.message : String(err),
+        count: 0,
+      })
+      setConsolidating(false)
+      return
+    }
+    const listed = sessions?.sessions?.filter((s: SessionInfo) => Boolean(s.key)) || []
+    const keys = listed.map((s: SessionInfo) => s.key)
     if (keys.length === 0) { setConsolidateMsg(<><XCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.no_sessions_to_consolidate_start_a_chat_first')}</>); setConsolidating(false); return }
     const results = await Promise.allSettled(keys.map((k: string) => api.consolidateMemory(k, true)))
     const succeeded = results.filter(r => r.status === 'fulfilled').length
-    const failed = results.filter(r => r.status === 'rejected').length
-    if (failed > 0) setConsolidateMsg(<><AlertTriangle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated_sessions_failed', { succeeded, total: keys.length, failed })}</>)
-    else { setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated')} {i18nT('pages.overview.memoryTab.session', { count: succeeded })}</>); setConsolidateOk(true) }
+    // Sort every rejection: a refusal the route names by its code is a skip the
+    // user asked for by choosing the mode, counted apart from a request that
+    // failed -- and BY MODE, so the tally can name the one mode every skip
+    // shares, or count each mode when they differ.
+    const byMode = { temporary: 0, incognito: 0 }
+    let unnamed = 0
+    let skipped = 0
+    let failed = 0
+    results.forEach(r => {
+      if (r.status !== 'rejected') return
+      const refusal = consolidateRefusal(r.reason)
+      if (refusal.code !== RESTRICTED_TARGET_CODE) { failed += 1; return }
+      skipped += 1
+      if (refusal.mode === 'temporary' || refusal.mode === 'incognito') byMode[refusal.mode] += 1
+      else unnamed += 1
+    })
+    // The one mode every skipped session was in, or nothing.
+    const onlyMode = skipped > 0 && byMode.temporary === skipped ? 'temporary'
+      : skipped > 0 && byMode.incognito === skipped ? 'incognito'
+        : undefined
+    const mode = onlyMode ? i18nT(SKIPPED_MODE_KEYS[onlyMode], { count: skipped }) : undefined
+    // The parenthetical of the mixed tally: the count of each mode ("1
+    // temporary, 1 incognito" -- the reader could not tell what made a session
+    // one or the other, or which of theirs were which; the counts at least say
+    // how many of each), or the either/or wording when a body named no mode.
+    const modes = unnamed === 0
+      ? i18nT('pages.overview.memoryTab.skipped_modes_breakdown', {
+        temporary: i18nT('pages.overview.memoryTab.skipped_temporary_count', { count: byMode.temporary }),
+        incognito: i18nT('pages.overview.memoryTab.skipped_incognito_count', { count: byMode.incognito }),
+      })
+      : i18nT('pages.overview.memoryTab.skipped_modes_unknown')
+    // `count` drives the mixed keys' plural ("1 private session skipped").
+    const tally = { succeeded, total: keys.length, failed, skipped, mode, modes, count: skipped }
+    // The skip fragment as it reads on its own: the mode when every skip shares
+    // one, "N private sessions skipped (1 temporary, 1 incognito)" otherwise --
+    // the category leads and the per-mode counts are the parenthetical.
+    const skippedFragment = skipped > 0
+      ? (mode
+        ? i18nT('pages.overview.memoryTab.skipped_sessions_mode', tally)
+        : i18nT('pages.overview.memoryTab.skipped_sessions', tally))
+      : undefined
+    // The two mode names the tally uses are defined nowhere else on this panel
+    // (the lane's reader: "I cannot tell what makes them different from each
+    // other"), so the skip fragment carries an InfoTip: one line per mode, in
+    // the words the Default Memory Mode setting already uses for them. The
+    // inline-flex wrapper keeps the tip's flex button on the tally's line, and
+    // the bubble opens ABOVE that line (below it when there is no room above)
+    // rather than beside the button, where it lay over the tally it explains
+    // (the lane's reader: "I can't read both at once").
+    const skipTip = skipped > 0
+      ? <span className="inline-flex align-middle ml-1" data-testid="consolidate-skipped-help"><InfoTip text={i18nT('pages.overview.memoryTab.skipped_modes_help')} placement="top" /></span>
+      : null
+    if (failed > 0) {
+      // A failed request is an error, so it renders through ErrorNotice: the
+      // tally is the lead, a plain-words line says what happened and what to
+      // do (press the button again), and the footer names the FIRST failed
+      // request's session key beside that request's own string -- kept raw
+      // rather than localized, as the rule asks (the string is the journal key,
+      // should the hand-off ever be turned on here); with several failures the
+      // count is in the lead and this is the first of them. The skip fragment
+      // is NOT part of the notice: it is the other, successful half of the
+      // press, so it renders as the success-tone tally BESIDE the notice --
+      // inside the danger box, even in its own colour, the reader could not
+      // tell whether the skip was part of the problem. Both persist until the
+      // notice is dismissed: a failure the user has to act on must not vanish
+      // on the success tally's timer, and the skip belongs to the same press.
+      const firstIndex = results.findIndex(r => r.status === 'rejected' && consolidateRefusal(r.reason).code !== RESTRICTED_TARGET_CODE)
+      const first = results[firstIndex]
+      const reason = first && first.status === 'rejected' ? first.reason : undefined
+      setConsolidateFailure({
+        title: i18nT('pages.overview.memoryTab.consolidated_sessions_failed', tally),
+        summary: i18nT('pages.overview.memoryTab.consolidate_failed_summary'),
+        raw: reason instanceof Error ? reason.message : String(reason),
+        session: { key: keys[firstIndex] ?? '', title: listed[firstIndex]?.title },
+        count: failed,
+      })
+      if (skippedFragment) { setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {skippedFragment}{skipTip}</>); setConsolidateOk(true) }
+    } else if (skipped > 0) {
+      setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {mode
+        ? i18nT('pages.overview.memoryTab.consolidated_sessions_skipped_mode', tally)
+        : i18nT('pages.overview.memoryTab.consolidated_sessions_skipped', tally)}{skipTip}</>); setConsolidateOk(true)
+    } else {
+      setConsolidateMsg(<><CheckCircle className="lucide-inline" /> {i18nT('pages.overview.memoryTab.consolidated')} {i18nT('pages.overview.memoryTab.session', { count: succeeded })}</>); setConsolidateOk(true)
+    }
     setConsolidating(false)
-    scheduleClear(() => setConsolidateMsg(''), 4000)
+    // Only the plain all-success tally clears itself. A tally with skips is a
+    // ~12-word line plus a "?" tip the reader opens, which four seconds does not
+    // cover, so it stands until the next press or its own dismiss control; a
+    // failure stands until the notice is dismissed.
+    setConsolidateStanding(failed === 0 && skipped > 0)
+    if (failed === 0 && skipped === 0) consolidateClearRef.current = scheduleClear(() => { consolidateClearRef.current = null; setConsolidateMsg('') }, 4000)
   }
   const addLesson = async () => {
     if (!rule) return
@@ -311,12 +508,86 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
         )}
         <Btn onClick={async () => { await api.saveMemorySettings({ history_idle_hours: idleHours, history_max_days: maxDays }); setSettingsSaved(true); scheduleClear(() => setSettingsSaved(false), 2000) }}>{settingsSaved ? <><Check className="lucide-inline" /> {i18nT('pages.overview.memoryTab.saved')}</> : i18nT('pages.overview.memoryTab.save')}</Btn>
         <Btn onClick={consolidate} disabled={consolidating}>{consolidating ? <><Hourglass className="lucide-inline" /> {i18nT('pages.overview.memoryTab.running')}</> : <><RefreshCw className="lucide-inline" /> {i18nT('pages.overview.memoryTab.summarize_now')}</>}</Btn>
-        {consolidateMsg && <span className={`text-[13px] ${consolidateOk ? 'text-ok' : 'text-danger'}`}>{consolidateMsg}</span>}
+        {/* What the button does, under it on its own line: the blind reader
+            hesitated over "summarize WHAT" without it and pressed with it (the
+            UX lane's read of two heads). Names the button rather than saying
+            "it", since the line sits under the whole row. */}
+        <p className="basis-full m-0 text-[12px] text-muted" data-testid="summarize-now-help">{i18nT('pages.overview.memoryTab.summarize_now_help')}</p>
+        {/* No hand-off: the tab holds unsaved drafts -- the lesson rule being
+            typed below and the store text in the editors -- that the hand-off's
+            navigation would discard. The block variant on its own flex line
+            (`basis-full`) so the button row stays a row. */}
+        {consolidateFailure && (
+          <ErrorNotice
+            className="basis-full"
+            title={consolidateFailure.title}
+            /* Plain words a person can act on -- what happened, and that pressing
+               the button again retries it; the server's raw string is the journal
+               key the structured report is looked up by, so it rides as `report`
+               and, verbatim, as the footer's secondary detail under the failed
+               session's key. The detail carries a visible label ("Server's
+               reply:") so the message's "shown below" unambiguously points at it
+               and marks it as foreign text -- the backend still says
+               "consolidat*" where every label here says "Summarize", and unlabelled
+               the reader doubted it concerned the button they pressed. */
+            message={consolidateFailure.summary}
+            report={findReport(consolidateFailure.raw)}
+            footer={<>
+              {consolidateFailure.session !== undefined && (
+                /* The session by its TITLE, as the sidebar names it ("Untitled session"
+                   when it has none), and a way to act on it: the same guarded navigation as
+                   the tab's other exits, since a click leaves the drafts this tab holds. */
+                <span className="block text-[12px]" data-testid="consolidate-failed-session">
+                  <Trans
+                    i18nKey="pages.overview.memoryTab.consolidate_failed_session"
+                    count={consolidateFailure.count}
+                    values={{ session: sessionDisplayTitle(consolidateFailure.session) }}
+                    // eslint-disable-next-line jsx-a11y/control-has-associated-label -- the control's label is the session title `Trans` renders inside it
+                    components={{ session: <button
+                      type="button"
+                      className="p-0 border-none bg-transparent font-body text-[12px] text-inherit underline underline-offset-2 cursor-pointer hover:text-accent"
+                      data-testid="consolidate-failed-session-link"
+                      onClick={() => {
+                        const destination = `/chat?sid=${encodeURIComponent(consolidateFailure.session?.key ?? '')}`
+                        leave(() => navigate(destination), destination)
+                      }}
+                    /> }}
+                  />
+                </span>
+              )}
+              <span className="block text-[12px] text-muted" data-testid="consolidate-failed-reply">
+                <Trans
+                  i18nKey="pages.overview.memoryTab.consolidate_failed_reply"
+                  values={{ reply: consolidateFailure.raw }}
+                  components={{ reply: <span className="font-mono" data-testid="consolidate-failed-detail" /> }}
+                />
+              </span>
+            </>}
+            onDismiss={() => { setConsolidateFailure(null); setConsolidateMsg('') }}
+            askAgent={false}
+            testId="consolidate-failed"
+          />
+        )}
+        {consolidateMsg && <span className={`text-[13px] ${consolidateOk ? 'text-ok' : 'text-danger'}`} data-testid="consolidate-msg">{consolidateMsg}</span>}
+        {consolidateMsg && consolidateStanding && (
+          <IconButton
+            aria-label={i18nT('pages.overview.memoryTab.dismiss_summary_result')}
+            title={i18nT('pages.overview.memoryTab.dismiss_summary_result')}
+            onClick={() => { setConsolidateMsg(''); setConsolidateStanding(false) }}
+          >
+            <X size={13} aria-hidden="true" />
+          </IconButton>
+        )}
 
         {migrated && <span className="text-[12px] text-muted ml-2">{i18nT('pages.overview.memoryTab.semantic_memory_active_text_files_are_read_only')}</span>}
       </div>
     </Card>
-    <VectorMemoryCard onActiveChange={setVectorActive} onMigratedChange={setMigrated} />
+    <VectorMemoryCard
+      onActiveChange={setVectorActive}
+      onMigratedChange={setMigrated}
+      onSettledChange={setVectorSettled}
+      initialSemanticFilter={focusLessons ? 'lesson.' : undefined}
+    />
     <EmbeddingModelCard />
     <details onToggle={event => setRecordsOpen(event.currentTarget.open)}>
       <summary className="min-h-11 cursor-pointer rounded-lg border border-border p-3 text-[13px] text-muted">
@@ -387,7 +658,7 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
     {storeReadable && <MemoryRetiredCard key={`retired-${store}`} store={store} />}
     <MemoryBackupsCard key={`backups-${store}`} store={store} />
     {!vectorActive && (
-      <Card><CardTitle>{i18nT('pages.overview.memoryTab.lessons')} <InfoTip text={i18nT('pages.overview.memoryTab.persistent_lessons_injected_into_every_session_a')} /></CardTitle>
+      <Card id={LESSONS_CARD_ID}><CardTitle>{i18nT('pages.overview.memoryTab.lessons')} <InfoTip text={i18nT('pages.overview.memoryTab.persistent_lessons_injected_into_every_session_a')} /></CardTitle>
       <div className="flex gap-2 items-center flex-wrap mb-3">
         <Input placeholder={i18nT('pages.overview.memoryTab.rule_e_g_always_use_tabs_not_spaces')} style={{ flex: 2 }} value={rule} onChange={e => setRule(e.target.value)} />
         <SimpleSelect
@@ -425,13 +696,13 @@ function GlobalMemoryTab({ refreshTrigger, onDirtyChange }: { refreshTrigger: nu
       />
       {/* Scrolls sideways rather than clipping: five columns plus a long path
           fragment overrun a narrow viewport, and the card hides overflow. */}
-      <div className="overflow-x-auto"><table className="w-full border-collapse table-striped"><thead><tr><SortableHeader label={i18nT('pages.overview.memoryTab.rule')} sortKey="rule" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.category')} sortKey="category" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.scope')} sortKey="repo_scope" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.when')} sortKey="ts" sort={lessonSort} onToggle={toggleLessonSort} /><th aria-label={i18nT('pages.overview.memoryTab.actions')} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium"></th></tr></thead>
-        <tbody>{lessons.length === 0 ? <tr><td colSpan={5}><EmptyState icon={<BookOpen className="lucide-inline" />} title={i18nT('pages.overview.memoryTab.no_lessons_yet')} subtitle={i18nT('pages.overview.memoryTab.lessons_empty_subtitle')} /></td></tr> : sortedLessons.map((l) => (
+      <div className="overflow-x-auto"><table className="w-full border-collapse table-striped"><thead><tr><SortableHeader label={i18nT('pages.overview.memoryTab.rule')} sortKey="rule" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.category')} sortKey="category" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.scope')} sortKey="repo_scope" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.source')} sortKey="source" sort={lessonSort} onToggle={toggleLessonSort} /><SortableHeader label={i18nT('pages.overview.memoryTab.when')} sortKey="ts" sort={lessonSort} onToggle={toggleLessonSort} /><th aria-label={i18nT('pages.overview.memoryTab.actions')} className="text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium"></th></tr></thead>
+        <tbody>{lessons.length === 0 ? <tr><td colSpan={6}><EmptyState icon={<BookOpen className="lucide-inline" />} title={i18nT('pages.overview.memoryTab.no_lessons_yet')} subtitle={i18nT('pages.overview.memoryTab.lessons_empty_subtitle')} /></td></tr> : sortedLessons.map((l) => (
           // Scope is part of the key: a scoped and a global row sharing rule text
           // are two lessons, and can share a timestamp. String() keeps the null
           // (unusable-scope) row distinct from the "" (global) one; the JSONL tier
           // keeps a workspace row distinct from a global one.
-          <tr key={`${l.rule}-${String(l.repo_scope)}-${l.workspace ?? ''}-${l.ts}`} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm">{esc(l.rule)}</td><td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="ok">{l.category}</Badge></td><td className="px-2.5 py-2 border-b border-border text-sm">{scopeCell(l)}</td><td className="px-2.5 py-2 border-b border-border text-sm">{fmtDateTimeNumeric(l.ts)}</td>
+          <tr key={`${l.rule}-${String(l.repo_scope)}-${l.workspace ?? ''}-${l.ts}`} className="hover:bg-bg-hover transition-colors"><td className="px-2.5 py-2 border-b border-border text-sm">{esc(l.rule)}</td><td className="px-2.5 py-2 border-b border-border text-sm"><Badge variant="ok">{l.category}</Badge></td><td className="px-2.5 py-2 border-b border-border text-sm">{scopeCell(l)}</td><td className="px-2.5 py-2 border-b border-border text-sm">{sourceCell(l)}</td><td className="px-2.5 py-2 border-b border-border text-sm whitespace-nowrap">{fmtDateTimeNumeric(l.ts)}</td>
             <td className="px-2.5 py-2 border-b border-border text-sm"><Btn danger onClick={() => deleteLesson(l)}>{i18nT('pages.overview.memoryTab.delete')}</Btn></td></tr>
         ))}</tbody></table></div></Card>
     )}

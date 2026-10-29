@@ -10,7 +10,7 @@
  * change is "the chip's appearance is decided by the backend, not by a regex".
  * So instead of mocking the component, this stubs `fetch` at the same seam the
  * real hook uses and answers with the same `X-Path-Kind` header the real
- * endpoint sends (see api_file_read in dashboard/handlers/files.py) — the chips
+ * endpoint sends (see api_file_read in dashboard/file_api/editor.py) — the chips
  * then classify themselves exactly as they do in production.
  *
  * Scene + theme come from the query string: ?scene=chips&theme=dark
@@ -115,6 +115,34 @@ api.projectTree = (async () => ({
   repo: false,
 })) as typeof api.projectTree
 api.projectGitStatus = (async () => ({ repo: false, files: [] })) as typeof api.projectGitStatus
+
+// The truncated-tree scene: the server capped the listing, so the tree holds only
+// the rows inside the cap and the search box hands its query to the server-side
+// search. The search answers after a pause so the frame between "typed" and
+// "answered" can be captured.
+if (scene === 'folder-truncated') {
+  api.projectTree = (async () => ({
+    root: PROJECT,
+    paths: ['README.md', 'docs/getting-started.md', 'src/overview.md'],
+    directories: ['data', 'docs', 'src'],
+    truncatedDirectories: ['', 'data'],
+    hiddenOnlyDirectories: [],
+    unreadableDirectories: [],
+    linkedDirectories: [],
+    truncated: true,
+    repo: false,
+  })) as typeof api.projectTree
+  api.fileSearch = (async (query: string) => {
+    await new Promise(resolve => setTimeout(resolve, 1500))
+    return {
+      root: PROJECT,
+      results: [
+        { path: `${PROJECT}/data/2024/q3/readme.txt`, name: 'readme.txt', size: 1, mtime: 0, kind: 'file' },
+        { path: `${PROJECT}/data/archive/README.md`, name: 'README.md', size: 1, mtime: 0, kind: 'file' },
+      ].filter(r => r.name.toLowerCase().includes(query.toLowerCase())),
+    }
+  }) as typeof api.fileSearch
+}
 
 // The reveal scene mounts the real MarkdownPanel, which asks whether this path is
 // already tracked as an artifact. Answer "no" rather than let it hit the dev
@@ -320,7 +348,7 @@ function Scene() {
       </div>
     )
   }
-  if (scene === 'folder') {
+  if (scene === 'folder' || scene === 'folder-truncated') {
     return (
       <div data-capture-root style={{ width: 420, height: 340 }} className="bg-bg">
         <FolderPanel

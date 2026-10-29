@@ -47,6 +47,10 @@ export const WidgetFrame: React.FC<WidgetFrameProps> = ({ html, title = 'Widget'
       themeVars: readThemeVars(),
       mode: currentMode(),
       includeHeightReporter: true,
+      // This frame (and the popout window that reuses this document) is
+      // sandbox="allow-scripts" with no allow-popups, so a target="_blank"
+      // rewrite would be a blocked popup, not an external open.
+      rewriteBareLinks: false,
     }),
     [html],
   )

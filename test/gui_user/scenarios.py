@@ -13,6 +13,7 @@
       seed: rich                         # KIROCREW_HOME fixture the target boots from
       members: []                        # crew member slugs boot.sh adds to config.agents
       start_url: /settings               # path the browser opens (token is appended)
+      fresh_target: false                # true: reads the target as boot left it (runs first)
     steps:                               # what a human tester would be told, in order
       - Open Settings and find the appearance / theme control.
     expectations:                        # what must be TRUE on screen at the end
@@ -57,7 +58,7 @@ FEATURES: dict[str, str] = {
     "topbar": "Top bar",
     "search": "Search everywhere & command palette",
     "members": "Crew Members",
-    "capabilities": "Agent capabilities (crews, templates, skills, prompts, steering, hooks, workflows)",
+    "capabilities": "Customize (crews, templates, skills, prompts, steering, hooks, workflows)",
     "connections": "Connections (MCP servers & services)",
     "memory": "Memory, lessons & usage",
     "knowledge": "Knowledge library",
@@ -132,6 +133,20 @@ PERSONAS: dict[str, str] = {
 DEFAULT_PERSONA = "new-user"
 
 
+#: Placeholder a scenario's ``summary``, ``steps`` and ``expectations`` may carry.
+#: The target boots once per run, so a retry meets whatever its first attempt
+#: created: a scenario that creates a named thing ("Radar") would have its
+#: retry refused as a duplicate, and the refused form would stay open, dirty,
+#: for the next scenario to land on. Writing the name as
+#: ``Radar{attempt_suffix}`` gives attempt 1 "Radar" and attempt N "Radar N".
+ATTEMPT_SUFFIX = "{attempt_suffix}"
+
+
+def attempt_suffix(attempt_no: int) -> str:
+    """What :data:`ATTEMPT_SUFFIX` reads on ``attempt_no`` (1-based): '' then ' 2', ' 3'..."""
+    return "" if attempt_no <= 1 else f" {attempt_no}"
+
+
 class ScenarioError(ValueError):
     """A scenario file is malformed."""
 
@@ -151,6 +166,10 @@ class Scenario:
     seed: str = "rich"
     members: tuple[str, ...] = ()
     start_url: str = "/"
+    #: The scenario reads the target exactly as ``boot.sh`` left it, so it must run
+    #: before any scenario that may write (see :func:`select` and
+    #: :func:`check_run_order`). It must not write anything itself.
+    fresh_target: bool = False
     persona: str = DEFAULT_PERSONA
     path: Path | None = field(default=None, compare=False)
 
@@ -163,16 +182,25 @@ class Scenario:
     def reports_friction(self) -> bool:
         return bool(self.persona_prompt)
 
-    def task_prompt(self) -> str:
-        """The user-turn text handed to the model, built only from the YAML."""
+    def task_prompt(self, attempt_no: int = 1) -> str:
+        """The user-turn text handed to the model, built only from the YAML.
+
+        ``attempt_no`` fills :data:`ATTEMPT_SUFFIX` (see :func:`attempt_suffix`),
+        so a scenario that creates a named thing asks its retry for a new name.
+        """
+        suffix = attempt_suffix(attempt_no)
+
+        def fill(text: str) -> str:
+            return text.replace(ATTEMPT_SUFFIX, suffix)
+
         lines = [
-            f"TASK: {self.summary}",
+            f"TASK: {fill(self.summary)}",
             "",
             "Do these steps in order, like a person at the keyboard:",
         ]
-        lines += [f"{i}. {s}" for i, s in enumerate(self.steps, 1)]
+        lines += [f"{i}. {fill(s)}" for i, s in enumerate(self.steps, 1)]
         lines += ["", "When you are done, ALL of these must be true and visible on screen:"]
-        lines += [f"- {e}" for e in self.expectations]
+        lines += [f"- {fill(e)}" for e in self.expectations]
         lines += [
             "",
             f"You have at most {self.max_steps} actions and about {self.max_seconds // 60} minutes.",
@@ -267,7 +295,7 @@ def parse_scenario(doc: Any, path: Path) -> Scenario:
     pre = doc.get("preconditions") or {}
     if not isinstance(pre, dict):
         raise ScenarioError(f"{path}: 'preconditions' must be a mapping")
-    unknown_pre = set(pre) - {"seed", "members", "start_url"}
+    unknown_pre = set(pre) - {"seed", "members", "start_url", "fresh_target"}
     if unknown_pre:
         raise ScenarioError(f"{path}: unknown preconditions {sorted(unknown_pre)}")
     seed = pre.get("seed", "rich")
@@ -286,6 +314,9 @@ def parse_scenario(doc: Any, path: Path) -> Scenario:
         raise ScenarioError(
             f"{path}: preconditions.start_url must be an absolute path without a query"
         )
+    fresh_target = pre.get("fresh_target", False)
+    if not isinstance(fresh_target, bool):
+        raise ScenarioError(f"{path}: preconditions.fresh_target must be true or false")
 
     return Scenario(
         name=name,
@@ -303,6 +334,7 @@ def parse_scenario(doc: Any, path: Path) -> Scenario:
         seed=seed,
         members=tuple(members),
         start_url=start_url,
+        fresh_target=fresh_target,
         persona=persona,
         path=path,
     )
@@ -330,6 +362,13 @@ def select(
 
     ``nightly`` includes the smoke tier (nightly is the full run); ``smoke`` is
     the PR subset. An explicit name list bypasses the tier filter.
+
+    The result is in RUN order: every ``fresh_target`` scenario first, then the
+    rest, each part keeping its input (file-name) order. The target boots once
+    per run and nothing resets it between scenarios, so a scenario that reads
+    the boot state must run before any scenario that may write -- by file name,
+    ``members-*`` crewmate chats (which post notifications and add crewmates)
+    would otherwise run before ``notifications-*``.
     """
     wanted = set(names)
     out: list[Scenario] = []
@@ -343,7 +382,25 @@ def select(
     missing = wanted - {s.name for s in out}
     if missing:
         raise ScenarioError(f"unknown scenario name(s): {sorted(missing)}")
-    return out
+    return [s for s in out if s.fresh_target] + [s for s in out if not s.fresh_target]
+
+
+def check_run_order(scenarios: Iterable[Scenario]) -> None:
+    """Refuse a run order that puts a ``fresh_target`` scenario after any other.
+
+    :func:`select` already orders a run this way; this is the runner's own check,
+    so a caller that builds or reorders the list itself cannot silently hand a
+    fresh-target scenario a target an earlier scenario has written to.
+    """
+    seen_other = ""
+    for s in scenarios:
+        if not s.fresh_target:
+            seen_other = seen_other or s.name
+        elif seen_other:
+            raise ScenarioError(
+                f"{s.name} needs a fresh target but runs after {seen_other}; "
+                "run every fresh_target scenario first (scenarios.select does)"
+            )
 
 
 def by_feature(scenarios: Iterable[Scenario]) -> dict[str, list[Scenario]]:

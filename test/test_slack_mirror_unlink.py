@@ -24,8 +24,8 @@ def _make_context_builder():
     """A context_builder whose build_message echoes the user message back.
 
     The mirror gate only captures _user_msg_for_mirror inside the
-    `elif state.context_builder:` branch (chat_runner.py), so a truthy
-    context_builder is required for the turn-start mirror path to run.
+    `elif state.context_builder:` branch (_turn_build_prompt, chat_turn/prompt_assembly.py),
+    so a truthy context_builder is required for the turn-start mirror path to run.
     """
     cb = MagicMock()
     cb.build_message.side_effect = lambda message, *a, **k: (message, None)
@@ -43,6 +43,8 @@ def _make_state(tmp_path, session_map):
     sessions.set_slack_link = session_map.set_slack_link
     sessions.clear_slack_link = session_map.clear_slack_link
     sessions.get_session_for_thread = session_map.get_session_for_thread
+    # The unlink route lands the cleared link on disk before it answers.
+    sessions.aflush = session_map.aflush
     sessions.set_approval_policy = MagicMock()
     state = DashboardState(
         sessions=sessions,

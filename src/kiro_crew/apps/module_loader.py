@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -37,6 +38,19 @@ _warned_third_party_apps: set[str] = set()
 #: touching disk. Cleared by ``clear_shutdown_callable`` on teardown/unload.
 _shutdown_callables: dict[str, tuple[int, Callable[..., Any]]] = {}
 
+#: Per-app record of whether ENABLE-time wiring handed this app the gateway
+#: ``Application`` (``AppContext.http_app``). Teardown must NOT recompute that from
+#: the current on-disk manifest, which the app itself can rewrite: one that drops
+#: its ``routes`` hook while keeping ``on_shutdown`` would hand ``None`` to the hook
+#: the shipped guidance tells it to early-return on, so the worker ``on_startup``
+#: spawned outlives disable with no recovery short of a gateway restart. Recording
+#: the enable-time answer closes the mirror case too -- a manifest that ADDS
+#: ``routes`` afterwards must not reach a shutdown hook whose startup never held
+#: the object. Kept beside ``_shutdown_callables`` and cleared by the same two
+#: functions on purpose: both describe ONE enable, and a teardown reading the
+#: callable from this enable and the grant from an earlier one would read two.
+_http_app_grants: dict[str, tuple[int, bool]] = {}
+
 #: Per-app load generation. Bumped every time an app's modules are unloaded (a
 #: disable, or the gateway teardown sweep), so a shutdown callable captured under
 #: one generation can be told apart from the code loaded by a LATER enable. A
@@ -44,6 +58,21 @@ _shutdown_callables: dict[str, tuple[int, Callable[..., Any]]] = {}
 #: an unload+re-enable, the stale v1 callable is ignored rather than applied to
 #: tear down the freshly loaded v2 worker (it would leave v2 running).
 _app_load_generation: dict[str, int] = {}
+
+#: Per-app install directories this process loaded third-party hook code from,
+#: as normalized absolute path strings (both the path as given and its resolved
+#: form, since a module's ``__file__`` may carry either). ``unload_app_modules``
+#: uses them to find modules the app registered under its REAL import name, which
+#: the synthetic-namespace sweep cannot see (see ``_app_real_name_keys``). Kept
+#: across unloads on purpose: an ``on_shutdown`` hook runs before the unload and
+#: may import a sibling again, and the unload that follows must still find it.
+#: One small entry per app name, and app directories are name-bound.
+_app_source_roots: dict[str, frozenset[str]] = {}
+
+#: Source and bytecode suffixes. A module loaded from anything else under an app
+#: directory (a native extension) is left resident: most cannot be initialised a
+#: second time in one process, so evicting one would break the next import.
+_RELOADABLE_SUFFIXES = (".py", ".pyc")
 
 
 def _current_generation(app_name: str) -> int:
@@ -62,6 +91,33 @@ def cache_shutdown_callable(app_name: str, func: Callable[..., Any]) -> None:
 def clear_shutdown_callable(app_name: str) -> None:
     """Drop the cached ``on_shutdown`` callable (teardown complete / module unloaded)."""
     _shutdown_callables.pop(app_name, None)
+    _http_app_grants.pop(app_name, None)
+
+
+def cache_http_app_grant(app_name: str, granted: bool) -> None:
+    """Record whether enable-time wiring gave this app the gateway ``Application``.
+
+    Generation tagged exactly like the shutdown callable, so an unload + re-enable
+    invalidates it rather than letting one enable's answer describe another's.
+    """
+    _http_app_grants[app_name] = (_current_generation(app_name), granted)
+
+
+def cached_http_app_grant(app_name: str) -> bool | None:
+    """The enable-time grant for *app_name*, or ``None`` when none was recorded.
+
+    ``None`` means "no answer from this load generation" and is deliberately NOT
+    ``False``: the caller must then fall back to reading the manifest, which is the
+    pre-existing behaviour, rather than silently withhold a handle the app holds.
+    """
+    cached = _http_app_grants.get(app_name)
+    if cached is None:
+        return None
+    generation, granted = cached
+    if generation != _current_generation(app_name):
+        _http_app_grants.pop(app_name, None)
+        return None
+    return granted
 
 
 def clear_all_shutdown_callables() -> None:
@@ -72,6 +128,7 @@ def clear_all_shutdown_callables() -> None:
     selected to stop a v2 worker. Clearing wholesale on teardown closes that.
     """
     _shutdown_callables.clear()
+    _http_app_grants.clear()
 
 
 def _is_builtin_app(app_name: str, app_resolved: Path) -> bool:
@@ -103,7 +160,7 @@ def _app_namespace_root(app_name: str) -> str:
     """Build the synthetic top-level package name that owns one app's modules.
 
     Per-app isolation rests on the app-name grammar: ``KEBAB_RE`` in
-    ``apps/manifest.py`` admits only ``[a-z0-9]`` and ``-``, so a name can never
+    ``apps/manifest_names.py`` admits only ``[a-z0-9]`` and ``-``, so a name can never
     contain a dot. That is what keeps one app's root from becoming a dotted
     prefix of another's -- ``_kirocrew_app_foo`` and ``_kirocrew_app_foo-bar``
     are separated by ``-``, so neither is under the other's ``root + "."``
@@ -123,6 +180,110 @@ def _app_module_keys(app_name: str) -> list[str]:
     root = _app_namespace_root(app_name)
     prefix = f"{root}."
     return [k for k in sys.modules if k == root or k.startswith(prefix)]
+
+
+def _normalized_dir(path: str | os.PathLike[str]) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _record_app_source_root(app_name: str, app_dir: Path, app_resolved: Path) -> None:
+    """Remember that third-party hook code for *app_name* was loaded from *app_dir*."""
+    roots = set(_app_source_roots.get(app_name, ()))
+    roots.add(_normalized_dir(app_dir))
+    roots.add(_normalized_dir(app_resolved))
+    _app_source_roots[app_name] = frozenset(roots)
+
+
+def _is_under(path: str, roots: frozenset[str]) -> bool:
+    normalized = _normalized_dir(path)
+    return any(normalized.startswith(root + os.sep) for root in roots)
+
+
+def _loaded_from_roots(module: object, roots: frozenset[str]) -> bool:
+    """True when *module* was loaded from Python source inside one of *roots*.
+
+    Reads the module's own ``__dict__`` rather than ``getattr`` so a module object
+    with a custom ``__getattr__`` (a lazy or facade module) runs no code here. A
+    package created with ``submodule_search_locations`` has ``__file__`` set to
+    its ``__init__.py``; a namespace package has only ``__path__``, and counts
+    when every entry is inside the roots.
+    """
+    try:
+        namespace = vars(module)
+    except TypeError:
+        return False
+    file = namespace.get("__file__")
+    if isinstance(file, str):
+        return file.endswith(_RELOADABLE_SUFFIXES) and _is_under(file, roots)
+    search = namespace.get("__path__")
+    if search is None:
+        return False
+    try:
+        entries = [entry for entry in search if isinstance(entry, str)]
+    except TypeError:
+        return False
+    return bool(entries) and all(_is_under(entry, roots) for entry in entries)
+
+
+def _is_resident_extension(module: object, roots: frozenset[str]) -> bool:
+    """True when *module* is a non-source module (a native extension) inside *roots*."""
+    try:
+        file = vars(module).get("__file__")
+    except TypeError:
+        return False
+    if not isinstance(file, str) or file.endswith(_RELOADABLE_SUFFIXES):
+        return False
+    return _is_under(file, roots)
+
+
+def _package_ancestors(key: str) -> set[str]:
+    """Every dotted parent of *key*: ``a.b.c`` -> ``{"a", "a.b"}``."""
+    parts = key.split(".")[:-1]
+    return {".".join(parts[: i + 1]) for i in range(len(parts))}
+
+
+def _app_real_name_keys(app_name: str) -> list[str]:
+    """sys.modules keys an app registered under real import names from its own files.
+
+    A hook entry module is loaded under the synthetic namespace, but its body may
+    register the app's package under its real name (``kiro_crew_<x>_app``) so its
+    siblings can use ordinary absolute imports without touching ``sys.path``.
+    Those keys sit outside ``_app_module_keys``. Left resident across an unload,
+    they make an in-place update import the new hook against the PREVIOUS
+    version's siblings: a function added in the new version does not exist and
+    route registration fails until the gateway restarts.
+
+    Ownership is decided by where the module's code came from: only modules
+    loaded from Python source inside a directory this process loaded the app's
+    hook code from. Core's own namespace and every synthetic app namespace
+    (this app's is swept by ``_app_module_keys``; another app's is never this
+    app's) are excluded outright, whatever their files say. Builtin apps record no
+    root (they are Core code), so they are never swept here.
+
+    A native extension stays resident (see ``_RELOADABLE_SUFFIXES``), and so does
+    every package above it. CPython binds a submodule to its parent only when it
+    actually imports it, so ``import pkg.native`` on a recreated ``pkg`` finds the
+    cached extension in ``sys.modules`` and never attaches it: ``pkg.native``
+    then raises ``AttributeError`` and the app's routes fail to register. Keeping
+    the ancestors keeps that binding; their source submodules are still evicted
+    and re-read from the package's unchanged ``__path__``.
+    """
+    roots = _app_source_roots.get(app_name)
+    if not roots:
+        return []
+    synthetic_prefix = _app_namespace_root("")
+    owned: list[str] = []
+    pinned: set[str] = set()
+    for key, module in list(sys.modules.items()):
+        if module is None or key.startswith(synthetic_prefix):
+            continue
+        if key == "kiro_crew" or key.startswith("kiro_crew."):
+            continue
+        if _loaded_from_roots(module, roots):
+            owned.append(key)
+        elif _is_resident_extension(module, roots):
+            pinned |= _package_ancestors(key)
+    return [key for key in owned if key not in pinned]
 
 
 def _ensure_namespace_packages(app_name: str, dotted_path: str, app_dir: Path) -> None:
@@ -286,6 +447,9 @@ def load_app_module(app_name: str, app_dir: Path, module_path: str) -> Callable[
                 "full gateway privileges."
             )
         _warn_third_party_execution(app_name)
+        # Recorded before the body runs: a body that registers its real package
+        # name and then raises still leaves modules the next unload must find.
+        _record_app_source_root(app_name, app_dir, app_resolved)
 
     spec = importlib.util.spec_from_file_location(unique_name, str(file_path))
     if spec is None or spec.loader is None:
@@ -392,15 +556,31 @@ def resolve_loaded_callable(app_name: str, module_path: str) -> Callable[..., An
 def unload_app_modules(app_name: str) -> int:
     """Remove all cached modules for an app from sys.modules.
 
-    Called on app disable to ensure re-enable loads fresh code. This covers the
-    synthetic ancestor packages too — leaving one behind would pin a stale
-    ``__path__`` at the app's old location across an uninstall/reinstall.
+    Called on app disable, and by every update / reinstall path (the hook
+    reconciler and the dashboard tear an app down through here before loading it
+    again), to ensure the next load reads fresh code. This covers the synthetic
+    ancestor packages too — leaving one behind would pin a stale ``__path__`` at
+    the app's old location across an uninstall/reinstall — and any module the
+    app registered under its real import name from its own files
+    (``_app_real_name_keys``). Nothing outside the app's own modules is touched.
 
     Returns the number of sys.modules entries removed.
     """
-    to_remove = _app_module_keys(app_name)
-    for k in to_remove:
+    synthetic = _app_module_keys(app_name)
+    real_name = _app_real_name_keys(app_name)
+    for k in synthetic:
         del sys.modules[k]
+    for k in real_name:
+        module = sys.modules.pop(k, None)
+        # A surviving parent package would still hand the stale submodule to
+        # ``from parent import leaf``; unbind it, identity-checked so an
+        # unrelated attribute of the same name is never touched.
+        parent_name, _, leaf_name = k.rpartition(".")
+        parent = sys.modules.get(parent_name) if parent_name else None
+        if parent is not None and module is not None:
+            if getattr(parent, leaf_name, None) is module:
+                delattr(parent, leaf_name)
+    to_remove = [*synthetic, *real_name]
     clear_shutdown_callable(app_name)
     # Bump the load generation so a NEXT enable's cache entry is distinguishable
     # from this one -- any callable still cached under the old generation (e.g.

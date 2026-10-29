@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import importlib.util
 import io
 import os
@@ -141,6 +142,12 @@ def test_gate_preserves_scope_workers_and_baseline_on_black_result(
     monkeypatch.setattr(gate, "ROOT", tmp_path)
     for target in gate.DEFAULT_TARGETS:
         (tmp_path / target).mkdir()
+    # The prune path refuses unless the running black matches the `black==` pin it
+    # reads from ROOT. This fake tree needs one, pinned to what is installed, so
+    # the test still reaches the black-exit assertion it is about.
+    (tmp_path / "pyproject.toml").write_text(
+        f'"black=={importlib.metadata.version("black")}"\n', encoding="utf-8"
+    )
     baseline = tmp_path / "baseline.txt"
     original = "# unchanged\nsrc/known.py\n"
     baseline.write_text(original, encoding="utf-8")
@@ -149,14 +156,12 @@ def test_gate_preserves_scope_workers_and_baseline_on_black_result(
 
     def black_run(argv, **kwargs):
         calls.append(argv)
-        launcher = (
-            ["-m", "black"]
-            if runner == "github-hosted"
-            else [str(ROOT / "scripts" / "bounded_black.py")]
-        )
+        # Every runner value, github-hosted included, goes through the recycling
+        # wrapper: native black's compiled workers retain enough memory to take
+        # down an uncapped hosted VM, and the hosted path has no cgroup guard.
         assert argv == [
             sys.executable,
-            *launcher,
+            str(ROOT / "scripts" / "bounded_black.py"),
             "--check",
             "--target-version",
             "py310",
@@ -261,7 +266,10 @@ def test_executor_bounds_process_lifetime_and_parallelism(monkeypatch):
 def test_floor_runs_the_exact_ci_black_command_and_worker_budget():
     import json
 
-    profile = ROOT / "src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/profiles/kirocrew.json"
+    profile = (
+        ROOT
+        / "src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/profiles/kirocrew.json"
+    )
     gates = json.loads(profile.read_text(encoding="utf-8"))["gates"]
     step = _step()
     assert "BLACK_NUM_WORKERS" not in step.get("env", {})

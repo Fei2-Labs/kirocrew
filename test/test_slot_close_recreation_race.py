@@ -36,108 +36,38 @@ transcript one, both directions fail quietly: reading a divergent pair as shared
 loses an archive nothing else will make, and reading a folded pair as divergent
 stamps ``closed`` on a file a live slot is writing. The two ``ordinary`` tests below
 and the three predicate tests are that pin.
+
+What the hand-over owes a shared transcript's privacy line lives in
+``test_slot_close_recreation_race_privacy_ratchet.py``; what it leaves to the
+metadata line's own writer, and the close whose replacement shares no transcript,
+in ``test_slot_close_recreation_race_handover_metadata.py``; the shared fakes in
+``slot_close_recreation_race_helpers.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 
 import pytest
 from chat_test_helpers import _make_state
+from slot_close_recreation_race_helpers import _no_nudge_service  # noqa: F401
+from slot_close_recreation_race_helpers import (
+    HKEY,
+    NAME,
+    RKEY,
+    _arm_running_turn,
+    _disk_contents,
+    _json,
+    _make_stale,
+    _reached,
+    _Req,
+    _slot_with_committed_and_uncommitted_rows,
+)
 
 from kiro_crew import autonudge
-from kiro_crew import members as members_mod
 from kiro_crew.autonudge import AutoNudgeService
 from kiro_crew.dashboard import chat_handlers as handlers
-from kiro_crew.dashboard.state import SlotOrigin
-
-NAME = "chat-1-1785"
-
-
-@pytest.fixture(autouse=True)
-def _no_nudge_service(monkeypatch):
-    """No auto-nudge service: these tests isolate the teardown-race guard.
-
-    The nudge-loop retirement and its rollbacks are pinned by
-    test_slot_close_nudge_race.py; here the close path must find nothing to
-    retire so the only variable is the post-pop identity re-check.
-    """
-    monkeypatch.setattr(autonudge, "_INSTANCE", None)
-
-
-class _Stream:
-    """The ``request.content`` half of the fake: a one-shot chunked reader.
-
-    ``read_bounded_json`` reads the body off the stream rather than calling
-    ``request.json()`` whenever a byte cap is in force, so a double that only
-    stubs ``json`` reads an EMPTY body on the capped path. Chunking at the
-    helper's own 8 KiB step keeps the fake honest for a body large enough to
-    arrive in several iterations.
-    """
-
-    def __init__(self, raw: bytes) -> None:
-        self._raw = raw
-
-    async def iter_chunked(self, n: int):
-        for i in range(0, len(self._raw), n):
-            yield self._raw[i : i + n]
-
-
-class _Req:
-    """Minimal stand-in for the aiohttp request the handlers read.
-
-    The race tests drive the handlers directly rather than through a client: the
-    interleaving of the concurrent recreate has to be scheduled deterministically
-    inside the teardown window, and a client's own awaits would let it run before
-    the handler even reached the pop.
-
-    The body surface mirrors what ``read_bounded_json`` actually touches --
-    ``can_read_body`` first, then ``content_length``/``content``/``charset`` on the
-    capped path -- not just ``json()``. ``api_chat_slots_cleanup`` moved onto that
-    helper, and a double missing ``can_read_body`` does not merely fail: the
-    handler raises before it reaches the seam the race tests park on, so the
-    ``entered`` event never fires and every interleaved test reports the park
-    rather than the attribute error underneath it. ``_reached`` is what keeps that
-    shape a named failure instead of a run-length timeout.
-    """
-
-    def __init__(self, state, slot: str = NAME, body: dict | None = None) -> None:
-        self.app = {"state": state}
-        self.match_info = {"slot": slot}
-        self._has_body = body is not None
-        self._body = body if body is not None else {}
-        # ``body is None`` is NO body, which is what every call site here sends and
-        # what ``can_read_body`` must read as False. An explicitly-passed ``{}`` is a
-        # body that is PRESENT and empty, so keying off truthiness instead would make
-        # the double answer False for a request aiohttp reports as readable.
-        self._raw = b"" if body is None else json.dumps(self._body).encode()
-        self.charset = "utf-8"
-        self.content = _Stream(self._raw)
-
-    @property
-    def content_length(self) -> int | None:
-        return len(self._raw) or None
-
-    def get(self, key: str, default: str = "") -> str:
-        del key
-        return default
-
-    @property
-    def can_read_body(self) -> bool:
-        """Mirror ``aiohttp.web.BaseRequest.can_read_body``: unread body pending.
-
-        Every caller in this file omits ``body``, so the double must report the
-        same "nothing to read" outcome the real request would for a bodyless
-        request — that is what lets ``read_bounded_json(..., allow_absent=True)``
-        take its empty-object path instead of raising on a stand-in that never
-        modeled this property.
-        """
-        return self._has_body
-
-    async def json(self) -> dict:
-        return self._body
 
 
 def _state_with_slot(tmp_path, name: str = NAME):
@@ -147,76 +77,6 @@ def _state_with_slot(tmp_path, name: str = NAME):
     slot.append("assistant", "watching")
     slot.drain()
     return state
-
-
-def _arm_running_turn(slot, entered: asyncio.Event, release: asyncio.Event):
-    """Give ``slot`` a live, parkable turn so its task-cancel await blocks.
-
-    The close pops the slot and then, if ``slot.running``, cancels ``slot.task``
-    and waits on ``asyncio.wait_for(asyncio.shield(slot.task), 2.0)``. To land a
-    recreate in THAT await (the window the first pre-save guard protects) the
-    task has to still be pending when the recreate is minted. This turn swallows
-    the handler's cancel, signals ``entered`` so the test can mint the
-    replacement, then parks on ``release`` before returning — so the handler's
-    shielded wait is still blocked at the exact instant the key changes owner.
-    ``slot.running`` is ``self.task is not None and not self.task.done()``, so
-    assigning this task is all it takes to make the slot look busy.
-    """
-
-    async def _turn() -> None:
-        try:
-            await asyncio.Event().wait()  # block until cancelled
-        except asyncio.CancelledError:
-            entered.set()
-            await release.wait()
-
-    slot.task = asyncio.create_task(_turn())
-    return slot.task
-
-
-async def _reached(
-    entered: asyncio.Event,
-    close: asyncio.Task[object],
-    *,
-    seam: str = "save_slot_off_loop",
-) -> None:
-    """Wait for the close to reach its interleave seam, BOUNDED so a miss names itself.
-
-    Every interleaving test below opens the recreate's window by parking on an
-    event only the close's own progress can set — the monkeypatched
-    ``save_slot_off_loop``, or the cancelled turn ``_arm_running_turn`` armed. The
-    whole premise is that the close REACHES that seam, and a close that returns,
-    raises or blocks short of it never sets the event: a teardown that stops
-    cancelling the live turn (``slot.running`` read through a renamed field, say)
-    leaves every ``_arm_running_turn`` case unarmed, and a preamble that raises or
-    answers 404 before the pop — the ``can_read_body`` shape ``_Req`` documents —
-    leaves every ``_persist`` case unentered.
-
-    Unbounded, such a regression does not FAIL these tests, it PARKS them until the
-    repo-wide ``--timeout``: on Linux and macOS a Timeout traceback and minutes of
-    shard time per test instead of the one line below, and on Windows — no SIGALRM,
-    so pytest-timeout kills the xdist worker, and CI runs
-    ``--max-worker-restart=0`` — an aborted run whose unreached results do not
-    exist at all (testing-conventions flake class 6). 5.0s is orders of magnitude
-    more than the single loop hop this needs and far under that ceiling, so the
-    deadline stays on the await whose property is under test and the failure is
-    attributed to this test rather than to the run.
-
-    Only the TEST side is bounded. The ``release.wait()`` calls inside the
-    ``_persist`` stubs and ``_arm_running_turn`` run on the ``close`` task, which
-    pytest tears down with the loop; bounding those would change what the close
-    parks on, which is the interleave itself. The pending ``close`` is cancelled on
-    the timeout path so the named assertion is not followed by a task destroyed at
-    loop teardown and blamed on whichever test runs next.
-    """
-    try:
-        await asyncio.wait_for(entered.wait(), 5.0)
-    except asyncio.TimeoutError:
-        close.cancel()
-        raise AssertionError(
-            f"the close never reached {seam}: it returned or blocked short of the "
-            "interleave window, so the recreate could never be minted inside it"
-        ) from None
 
 
 # --------------------------------------------------------------------------- #
@@ -684,15 +544,6 @@ async def test_delete_ordinary_close_still_saves_and_removes(tmp_path, monkeypat
 # --------------------------------------------------------------------------- #
 
 
-def _make_stale(state, name: str = NAME):
-    """Age the slot's last activity past the 3-day cleanup cutoff."""
-    slot = state._slots[name]
-    slot.created_at = "2000-01-01T00:00:00+00:00"
-    for m in slot.messages:
-        m["ts"] = "2000-01-01T00:00:00+00:00"
-    return slot
-
-
 @pytest.mark.asyncio
 async def test_cleanup_recreate_during_save_preserves_replacement(tmp_path, monkeypatch) -> None:
     """(d) The bulk path: a recreate inside the archive save must survive.
@@ -863,8 +714,6 @@ async def test_cleanup_ordinary_archive_still_saves_and_removes(tmp_path, monkey
 # replacement KEEPS the marker, so a blanket discard is not a legal fix).
 # --------------------------------------------------------------------------- #
 
-RKEY = f"dashboard:{NAME}"
-
 
 def _state_with_restricted_slot(tmp_path, mode: str = "temporary"):
     """A state whose only slot is a guest/incognito tab, so its key is marked."""
@@ -903,10 +752,12 @@ def test_resettle_reads_the_current_owner_not_the_popped_slot(tmp_path) -> None:
 async def test_delete_first_guard_hands_the_marker_to_the_replacement(
     tmp_path, monkeypatch
 ) -> None:
-    """(h) The pre-save early return must not leave the original's marker behind.
+    """(h) The pre-save early return must settle the marker from the NEW owner.
 
-    It returns before the discard that follows the save, so without the hand-over
-    the persistent replacement inherits the guest tab's 403.
+    It returns before the discard that follows the save, so the hand-over has to
+    re-derive the marker itself. The guest tab's unsaved row is drained into the
+    file the replacement writes, which tightens the replacement to the guest mode;
+    the marker then describes that tightened owner, not the popped slot.
     """
     state = _state_with_restricted_slot(tmp_path)
     original = state._slots[NAME]
@@ -937,7 +788,10 @@ async def test_delete_first_guard_hands_the_marker_to_the_replacement(
     assert resp.status == 200
     assert state._slots.get(NAME) is replacement
     assert saved == [(False, True)], "the closed=True save ran past the first guard"
-    assert RKEY not in state._restricted_keys, "the replacement inherited the guest tab's marker"
+    # The guest tab's row was handed to the file the replacement writes, so the
+    # replacement itself is tightened to the guest mode and the marker follows it.
+    assert replacement.memory_mode == "temporary", "the replacement kept a looser mode"
+    assert RKEY in state._restricted_keys, "the marker was not re-derived from the tightened owner"
 
 
 @pytest.mark.asyncio
@@ -985,7 +839,7 @@ async def test_delete_first_guard_keeps_the_marker_for_a_restricted_replacement(
 async def test_delete_failure_arm_hands_the_marker_to_the_replacement(
     tmp_path, monkeypatch
 ) -> None:
-    """(h3) The save-failure arm skips the restore, so it must settle the marker."""
+    """(h3) A failed drain restores a replacement when its line stayed persistent."""
     state = _state_with_restricted_slot(tmp_path)
     original = state._slots[NAME]
 
@@ -1008,7 +862,10 @@ async def test_delete_failure_arm_hands_the_marker_to_the_replacement(
 
     assert resp.status == 500
     assert state._slots.get(NAME) is replacement
-    assert RKEY not in state._restricted_keys, "the replacement inherited the guest tab's marker"
+    assert (
+        replacement.memory_mode == "persistent"
+    ), "the failed drain left the replacement restricted"
+    assert RKEY not in state._restricted_keys, "the failed drain kept the guest tab's marker"
 
 
 @pytest.mark.asyncio
@@ -1067,7 +924,10 @@ async def test_cleanup_first_guard_hands_the_marker_to_the_replacement(
     assert NAME not in payload["keys"]
     assert payload["failed"] == [], "the hand-over drain did not commit"
     assert saved == [(False, True)], "the closed=True save ran past the first guard"
-    assert RKEY not in state._restricted_keys, "the replacement inherited the guest tab's marker"
+    # The guest tab's row was handed to the file the replacement writes, so the
+    # replacement itself is tightened to the guest mode and the marker follows it.
+    assert replacement.memory_mode == "temporary", "the replacement kept a looser mode"
+    assert RKEY in state._restricted_keys, "the marker was not re-derived from the tightened owner"
 
 
 @pytest.mark.asyncio
@@ -1098,14 +958,10 @@ async def test_cleanup_failure_arm_hands_the_marker_to_the_replacement(
     assert resp.status == 200
     assert NAME in _json(resp)["failed"]
     assert state._slots.get(NAME) is replacement
-    assert RKEY not in state._restricted_keys, "the replacement inherited the guest tab's marker"
-
-
-def _json(resp) -> dict:
-    """Decode an aiohttp json_response body to a dict."""
-    import json
-
-    return json.loads(resp.body)
+    assert (
+        replacement.memory_mode == "persistent"
+    ), "the failed drain left the replacement restricted"
+    assert RKEY not in state._restricted_keys, "the failed drain kept the guest tab's marker"
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,33 +975,6 @@ def _json(resp) -> dict:
 # BOTH halves at once — the replacement survives AND every row survives — because
 # either alone is satisfiable by a change that breaks the other: skipping the write
 # loses the tail, and doing the original write takes the replacement down with it.
-
-
-HKEY = f"dashboard:{NAME}"
-
-
-def _disk_contents(state) -> list[str]:
-    """The transcript's message contents, in file order, read back from disk."""
-    return [m.get("content", "") for m in state.conversation_log.read_messages(HKEY)]
-
-
-async def _slot_with_committed_and_uncommitted_rows(state, name: str = NAME):
-    """A slot with two rows on disk and two rows that have never been written.
-
-    ``_disk_window_len`` is what the last committed save covered, so this is the
-    shape that makes "the tail was lost" observable: a hand-over that writes
-    nothing leaves the file holding only the first two.
-    """
-    slot = state.get_or_create_slot(name)
-    slot.append("user", "PERSISTED-1")
-    slot.append("assistant", "PERSISTED-2")
-    slot.drain()
-    assert await handlers.save_slot_off_loop(state, slot, best_effort=False)
-    assert slot._disk_window_len == 2, "the seed save did not commit the first window"
-    slot.append("user", "TAIL-3")
-    slot.append("assistant", "TAIL-4")
-    slot.drain()
-    return slot
 
 
 @pytest.mark.asyncio
@@ -1409,768 +1238,3 @@ async def test_cleanup_handover_persists_the_tail_and_the_held_notes(tmp_path) -
     ], "cleanup's hand-over dropped the original's unpersisted rows or its held note"
     assert not state.conversation_log.get_metadata(HKEY).get("closed")
     assert not original._deferred_notes, "the held note was left in memory on a dropped slot"
-
-
-# --------------------------------------------------------------------------- #
-# what the hand-over must NOT cost: the replacement's own metadata
-# --------------------------------------------------------------------------- #
-#
-# The rows and the metadata line have different owners on a shared transcript.
-# ``_save_slot_to_history`` is otherwise authoritative for SLOT_OWNED_META_KEYS and
-# REBUILDS that line from whichever slot it is handed, so a default save here would
-# revert a title, folder, tag set or pin the REPLACEMENT already published — and for
-# a tab nobody types in again, revert it for good, so the next restart resurrects the
-# dismissed tab's name and filing. The drain therefore writes ``rows_only``: it moves
-# the rows and keeps the on-disk value for every slot-owned field, retaining only the
-# close flags so the open-shaped erase still happens.
-#
-# The deferral is wider than the owned set, because the rebuild also writes fields
-# that DESCRIBE an owned one without being owned themselves. A title's provenance and
-# refresh budget travel WITH the title, so deferring the title while keeping those
-# commits a line matching neither slot — separately valid halves, undetectable
-# downstream — which is why the pairing is asserted below and not just the title.
-
-
-async def _publish_metadata(
-    state, slot, *, title: str, folder: str, origin: str = "auto", refresh_mark: int = 0
-) -> None:
-    """Commit ``slot``'s title and folder the way every metadata route does.
-
-    A forced save is what the tag / folder / pin / recreate-PATCH routes use, and
-    for a message-less slot it is the empty-window ``update_metadata_if`` merge —
-    the exact shape a replacement born from ``POST /api/chat/slots`` with a folder
-    or a pinned title takes.
-
-    ``origin`` sets the title's provenance the way the titling paths do — ``"auto"``
-    for a generated name, ``"user"`` for a manual rename — and ``refresh_mark`` the
-    background-refresh budget already spent, because the save persists BOTH
-    alongside the title. A pairing test that left these at their defaults would read
-    a consistent line no matter which slot each half came from.
-    """
-    slot.title = title
-    slot.folder_id = folder
-    slot._titled = True
-    slot._title_origin = origin
-    slot._title_refresh_mark = refresh_mark
-    assert await handlers.save_slot_off_loop(state, slot, force=True, best_effort=False)
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_keeps_the_replacement_published_metadata(tmp_path) -> None:
-    """A newborn replacement's published title and folder survive the drain.
-
-    The replacement here has no window of its own, which is the shape that
-    publishes at birth. Its line is on disk and nothing else will rewrite it until
-    the tab is used, so a rebuilding drain would leave the transcript filed and
-    named as the tab the user dismissed for as long as the replacement stays idle.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(
-        state,
-        original,
-        title="ORIGINAL TITLE",
-        folder="folder-original",
-        origin="auto",
-        refresh_mark=8,
-    )
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    await _publish_metadata(
-        state,
-        replacement,
-        title="REPLACEMENT TITLE",
-        folder="folder-replacement",
-        origin="user",
-        refresh_mark=24,
-    )
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    assert state._slots.get(NAME) is replacement, "the replacement was clobbered by the close"
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "REPLACEMENT TITLE", "the drain reverted the replacement's title"
-    assert (
-        meta.get("folder_id") == "folder-replacement"
-    ), "the drain re-filed the transcript under the closed tab's folder"
-    # The provenance travels WITH the title. Committing the replacement's name beside
-    # the original's origin is a worse line than either slot's own: read back as
-    # "auto" it unlocks the background refresh on a name the user typed, and read
-    # back as "user" it locks a generated name out of refresh for good.
-    assert (
-        meta.get("title_origin") == "user"
-    ), "the drain kept the closed tab's title provenance beside the replacement's title"
-    # The spent-budget mark travels with the title too: rewinding it to the closed
-    # tab's would hand the replacement's title a refresh milestone it already spent.
-    assert (
-        meta.get("title_refresh_mark") == 24
-    ), "the drain rewound the replacement's spent refresh budget to the closed tab's"
-    # The close flags stay owned by the write, so the open-shaped erase still runs.
-    assert not meta.get("closed")
-    # ...and none of that cost the rows the drain existed for.
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ], "the rows-only write dropped the handed-over slot's rows"
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_keeps_the_original_metadata_when_nobody_replaced_it(
-    tmp_path,
-) -> None:
-    """Deferring to disk must not become erasing: a blank replacement inherits.
-
-    A recreate that has published nothing has no metadata to protect, and the line
-    on disk is the ORIGINAL's own — a real title and filing for the conversation
-    both slots now share. Re-deriving the line from the blank replacement would
-    clear them, which is the opposite failure and just as silent. Writing rows
-    while leaving the line alone is what gets both cases right at once.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    assert not replacement.folder_id, "the replacement must be blank for this case"
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "ORIGINAL TITLE", "a blank replacement erased the shared title"
-    assert meta.get("folder_id") == "folder-original", "a blank replacement unfiled the transcript"
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-def _leave_an_acknowledged_edit(slot, *, title: str, folder: str) -> None:
-    """Apply a metadata edit the way every mutation route leaves it: in memory only.
-
-    ``PATCH .../color``, the tag and pin routes and the auto-titler all mutate the
-    slot, mark it ``_dirty`` and answer the caller; the durable write is the next
-    periodic flush's. That flush iterates ``state._slots``, so this shape is exactly
-    what a pop makes unreachable — the user has been told the rename landed and the
-    only object that knows it is about to be dropped.
-    """
-    slot.title = title
-    slot._titled = True
-    slot.folder_id = folder
-    slot.pinned = True
-    slot._dirty = True
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_persists_the_original_uncommitted_metadata(tmp_path) -> None:
-    """Deferring to disk must not become discarding the drain's own pending edit.
-
-    The line on disk here is the ORIGINAL's own, so there is nobody else's state on
-    it to protect, and the edit the original is carrying has no other route to disk:
-    the periodic flush walks ``state._slots`` and this slot is out of it for good.
-    Deferring to disk on that line would answer 200 while silently discarding a
-    rename, re-file and pin the user watched land.
-
-    Metadata-only on purpose — the publish above commits the window, so ``_dirty``
-    is the sole reason the drain runs at all. That keeps this test about the
-    metadata half rather than riding on the row half's write.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-    assert original._disk_window_len == len(original.messages), "the publish left rows uncommitted"
-    _leave_an_acknowledged_edit(original, title="RENAMED BY HAND", folder="folder-renamed")
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    assert not replacement._titled, "the replacement must have published nothing for this case"
-    assert not replacement.folder_id
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "RENAMED BY HAND", "the drain discarded an acknowledged rename"
-    assert meta.get("folder_id") == "folder-renamed", "the drain discarded an acknowledged re-file"
-    assert meta.get("pinned") is True, "the drain discarded an acknowledged pin"
-    # Still an open-shaped write: the key has a live holder.
-    assert not meta.get("closed")
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_prefers_the_replacement_line_over_its_own_pending_edit(
-    tmp_path,
-) -> None:
-    """The polarity: a line ANOTHER slot published still outranks the drain's edit.
-
-    The two losses are not symmetric, so the tie is not broken in the drain's
-    favour. The original's edit was never committed; the replacement's WAS, and for
-    a tab nobody types in again nothing rewrites it — so rebuilding here would
-    revert a published title and filing for good, while deferring costs an
-    uncommitted one. Pinned beside the test above because a fix that simply stopped
-    deferring would satisfy that one and silently undo the restraint.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-    _leave_an_acknowledged_edit(original, title="RENAMED BY HAND", folder="folder-renamed")
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    await _publish_metadata(
-        state, replacement, title="REPLACEMENT TITLE", folder="folder-replacement"
-    )
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "REPLACEMENT TITLE", "the drain reverted a published title"
-    assert meta.get("folder_id") == "folder-replacement", "the drain re-filed a live transcript"
-    assert not meta.get("pinned"), "the drain pinned a live tab from the dismissed one's edit"
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_keeps_the_replacement_authorization_attribution(
-    tmp_path,
-) -> None:
-    """The drain must not re-attribute a live holder's session to the dismissed tab.
-
-    ``created_by`` and ``origin`` are not facts about the conversation, they are
-    attributes of the SLOT, and each is meaningless apart from a field the drain
-    already defers: session-control's member ownership boundary reads ``created_by``
-    beside ``mode``, and ``origin`` decides ``slots:user`` visibility and the
-    unattended approval window beside ``app``. Carrying the original's forward would
-    commit a line naming an owner who never opened this session and a slot kind its
-    holder never had — and for a replacement nobody types in again, no later save
-    corrects it, so the next restart hands that pairing to the authorization checks.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    original.mode = members_mod.DM_SLOT_MODE
-    original._created_by = "member-alice"
-    original._origin = SlotOrigin.CRON
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-    assert state.conversation_log.get_metadata(HKEY).get("created_by") == "member-alice"
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    replacement._created_by = "member-bob"
-    replacement._origin = SlotOrigin.USER
-    await _publish_metadata(
-        state, replacement, title="REPLACEMENT TITLE", folder="folder-replacement"
-    )
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert (
-        meta.get("created_by") == "member-bob"
-    ), "the drain re-attributed a live session to the dismissed tab's creator"
-    assert (
-        meta.get("origin") == SlotOrigin.USER
-    ), "the drain gave a live session the dismissed tab's slot kind"
-    # The field each describes is deferred, so the pair has to agree: a member
-    # ``mode`` beside the wrong ``created_by`` is the line matching neither slot.
-    assert meta.get("mode") != members_mod.DM_SLOT_MODE
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_rows_only_defers_by_the_line_tab_id_not_by_the_flag_alone(tmp_path) -> None:
-    """``rows_only`` is scoped at the save, by the one per-writer mark the line has.
-
-    ``tab_id`` is minted per slot OBJECT and stamped by every save, so it is what
-    separates "this line is somebody else's" from "this line is mine". Driven
-    directly rather than through a race so the discriminator is the only variable:
-    the same call, the same slot and the same flag, answered two ways by the id on
-    the line. It is itself deferred, so a deferring write leaves the other writer's
-    id in place and the next drain defers again rather than flipping.
-    """
-    state = _make_state(tmp_path)
-    slot = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, slot, title="COMMITTED TITLE", folder="folder-committed")
-
-    # The line is this slot's own: nobody to defer to, so the pending edit commits.
-    _leave_an_acknowledged_edit(slot, title="MINE", folder="folder-mine")
-    assert await handlers.save_slot_off_loop(
-        state, slot, force=True, best_effort=False, rows_only=True
-    )
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "MINE", "a rows-only write deferred to the slot's own line"
-    assert meta.get("folder_id") == "folder-mine"
-    assert meta.get("tab_id") == slot._tab_id
-
-    # Re-stamp the line as another writer's and the identical call defers instead.
-    state.conversation_log.update_metadata(
-        HKEY, {"tab_id": "0123456789ab", "title": "THEIRS", "folder_id": "folder-theirs"}
-    )
-    _leave_an_acknowledged_edit(slot, title="MINE AGAIN", folder="folder-mine-again")
-    assert await handlers.save_slot_off_loop(
-        state, slot, force=True, best_effort=False, rows_only=True
-    )
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "THEIRS", "a rows-only write rebuilt over another writer's line"
-    assert meta.get("folder_id") == "folder-theirs"
-    assert meta.get("tab_id") == "0123456789ab", "the deferring write claimed the line's identity"
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_handover_rows_only_write_still_creates_a_first_metadata_line(tmp_path) -> None:
-    """With no line on disk yet there is nobody to defer to, so the slot's own wins.
-
-    ``rows_only`` protects ANOTHER writer's fields; a transcript with no metadata
-    line has none, and preserving an absent line would publish a row-bearing
-    transcript with no title, folder or memory mode at all. So the flag is ignored
-    in that case and the drain writes the original's own line — pinned because the
-    hand-over is reachable before a slot's first committed save.
-    """
-    state = _make_state(tmp_path)
-    original = state.get_or_create_slot(NAME)
-    original.title = "NEVER SAVED"
-    original.folder_id = "folder-original"
-    original.append("user", "TAIL-1")
-    original.drain()
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "NEVER SAVED", "the first line was written without the slot's state"
-    assert meta.get("folder_id") == "folder-original"
-    assert _disk_contents(state) == ["TAIL-1"]
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_rows_only_keeps_both_windows(tmp_path) -> None:
-    """A replacement that HAS a window keeps its rows, its line, and the drain's.
-
-    The two slots hold different windows over one file, so the drain re-serializes
-    the original's and the foreign-append scan carries the replacement's committed
-    rows through. Pinned alongside the metadata because a rows-only write that
-    protected the line by dropping rows would satisfy every other assertion here.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    replacement.append("user", "REPLACEMENT-5")
-    replacement.drain()
-    await _publish_metadata(
-        state, replacement, title="REPLACEMENT TITLE", folder="folder-replacement"
-    )
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "REPLACEMENT TITLE", "the drain reverted the replacement's title"
-    assert meta.get("folder_id") == "folder-replacement"
-    # Sorted, not positional: two windows over one file interleave by ``ts``, and a
-    # position would pin a tiebreak this test is not about. Sorted still catches the
-    # two failures that matter — a dropped row and a duplicated one.
-    assert sorted(_disk_contents(state)) == sorted(
-        [
-            "PERSISTED-1",
-            "PERSISTED-2",
-            "TAIL-3",
-            "TAIL-4",
-            "REPLACEMENT-5",
-        ]
-    ), "the rows-only write dropped or duplicated a row from either window"
-
-
-@pytest.mark.asyncio
-async def test_cleanup_handover_keeps_the_replacement_published_metadata(tmp_path) -> None:
-    """The bulk path's hand-over owes the same restraint as the single-tab close.
-
-    Both exits drain through ``_persist_handover_tail``, so ``rows_only`` rides with
-    the write rather than being restated per call site — this pins that the bulk
-    path really does inherit it.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-    _make_stale(state)
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slots_cleanup(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    await _publish_metadata(
-        state, replacement, title="REPLACEMENT TITLE", folder="folder-replacement"
-    )
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    assert NAME not in _json(resp)["keys"], "a live replacement was reported archived-over"
-    assert state._slots.get(NAME) is replacement
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "REPLACEMENT TITLE", "cleanup's drain reverted the replacement"
-    assert meta.get("folder_id") == "folder-replacement"
-    assert not meta.get("closed")
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_failure_arm_handover_keeps_the_replacement_metadata(
-    tmp_path, monkeypatch
-) -> None:
-    """The failure arm's drain carries the same restraint.
-
-    That arm reaches the drain after its archive save already failed, so the write
-    it performs is the one that would revert the replacement — and it is the arm
-    whose caller sees a 500, where a silently reverted title is the last thing
-    anyone would look for.
-    """
-    state = _make_state(tmp_path)
-    original = await _slot_with_committed_and_uncommitted_rows(state)
-    await _publish_metadata(state, original, title="ORIGINAL TITLE", folder="folder-original")
-
-    real_save = handlers.save_slot_off_loop
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def _persist(_state, _slot, *a, **kw):
-        if kw.get("closed"):
-            entered.set()
-            await release.wait()
-            raise OSError("disk wedged")
-        return await real_save(_state, _slot, *a, **kw)
-
-    monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close)
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    await _publish_metadata(
-        state, replacement, title="REPLACEMENT TITLE", folder="folder-replacement"
-    )
-    release.set()
-    resp = await close
-
-    assert resp.status == 500
-    assert state._slots.get(NAME) is replacement
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("title") == "REPLACEMENT TITLE", "the failure arm's drain reverted the title"
-    assert meta.get("folder_id") == "folder-replacement"
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-async def _original_with_a_published_line_and_an_uncommitted_tail(state):
-    """The original, its metadata line on disk, and two rows that never reached it.
-
-    Ordering is the whole point: the tail is appended AFTER the last commit, so the
-    drain has both rows to write and a metadata line to decide about. Publishing
-    after the tail instead would commit it and reduce the drain to a no-op, which
-    every assertion about the line would then pass vacuously.
-    """
-    slot = state.get_or_create_slot(NAME)
-    slot.append("user", "PERSISTED-1")
-    slot.append("assistant", "PERSISTED-2")
-    slot.drain()
-    assert await handlers.save_slot_off_loop(state, slot, best_effort=False)
-    await _publish_metadata(state, slot, title="ORIGINAL TITLE", folder="folder-original")
-    slot.append("user", "TAIL-3")
-    slot.append("assistant", "TAIL-4")
-    slot.drain()
-    assert slot._disk_window_len == 2, "the tail was already committed, so no drain will run"
-    return slot
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_keeps_a_dismissal_the_replacement_committed(tmp_path) -> None:
-    """``closed`` on the replacement's line is ITS dismissal, so the drain defers it.
-
-    Open-shaped is not the same as un-closing. The drain and the replacement's own
-    close race for the transcript lock, so the dismissal can land first — and both
-    slots are popped by then, so erasing it resurfaces a tab the user put away with
-    nothing left to re-archive it. This is the mistake the resume route's
-    ``only_if_closed_before`` boundary exists to avoid one layer down, and a
-    rows-only save has no such boundary to reason with.
-    """
-    state = _make_state(tmp_path)
-    original = await _original_with_a_published_line_and_an_uncommitted_tail(state)
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    await _publish_metadata(
-        state, replacement, title="REPLACEMENT TITLE", folder="folder-replacement"
-    )
-    # The user dismisses the REPLACEMENT while the original's drain is still owed, and
-    # its close reaches the lock first: the flag on the line is now the replacement's
-    # own, stamped at its own instant.
-    assert await handlers.save_slot_off_loop(
-        state, replacement, closed=True, closed_at=1234.0, force=True, best_effort=False
-    )
-    assert state.conversation_log.get_metadata(HKEY).get("closed") is True
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert meta.get("closed") is True, "the drain erased a dismissal the replacement committed"
-    assert meta.get("closed_at") == 1234.0, "the dismissal lost the instant it was stamped at"
-    assert meta.get("title") == "REPLACEMENT TITLE"
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_delete_handover_erases_a_stale_closed_flag_on_its_own_line(tmp_path) -> None:
-    """On a line THIS slot published, the open-shaped drain still clears ``closed``.
-
-    The deferral is scoped by the line's ``tab_id``, so a replacement that has
-    published nothing leaves the ORIGINAL's own line on disk — where there is no
-    other holder's dismissal to lose. The ordinary rebuild runs there, and a key that
-    now has a live holder reads open instead of staying archived under a tab the user
-    is looking at.
-    """
-    state = _make_state(tmp_path)
-    slot = state.get_or_create_slot(NAME)
-    slot.append("user", "PERSISTED-1")
-    slot.append("assistant", "PERSISTED-2")
-    slot.drain()
-    assert await handlers.save_slot_off_loop(state, slot, best_effort=False)
-    await _publish_metadata(state, slot, title="ORIGINAL TITLE", folder="folder-original")
-    # A prior close of this reused key left the archive flag on the original's line.
-    assert await handlers.save_slot_off_loop(
-        state, slot, closed=True, closed_at=1.0, force=True, best_effort=False
-    )
-    assert state.conversation_log.get_metadata(HKEY).get("closed") is True
-    slot.append("user", "TAIL-3")
-    slot.append("assistant", "TAIL-4")
-    slot.drain()
-    assert slot._disk_window_len == 2, "the tail was already committed, so no drain will run"
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(slot, entered, release)
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    # The replacement publishes NOTHING, so the line the drain meets is still the
-    # original's — the branch where the full ownership claim applies.
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not slot
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    meta = state.conversation_log.get_metadata(HKEY)
-    assert not meta.get("closed"), "a key with a live holder stayed stamped closed"
-    assert not meta.get("closed_at"), "closed_at outlived the flag it timestamps"
-    assert meta.get("title") == "ORIGINAL TITLE"
-    assert _disk_contents(state) == [
-        "PERSISTED-1",
-        "PERSISTED-2",
-        "TAIL-3",
-        "TAIL-4",
-    ]
-
-
-# --------------------------------------------------------------------------- #
-# a replacement that shares NO transcript takes no archive
-# --------------------------------------------------------------------------- #
-#
-# Slot identity is not transcript ownership. A channel-, cron- or workflow-born tab
-# keeps its conversation under its ``linked_session_key``, while a replacement minted
-# by a plain ``get_or_create_slot(name)`` — the shape POST /api/chat and the
-# session_close verb take — is unbound and keeps its own under ``dashboard:{name}``.
-# Yielding the archive on that pair costs the user their dismissal: the linked
-# transcript keeps no ``closed`` flag, ``channel_slots._close_stands`` reads an absent
-# flag as "never dismissed", and the reconcile pass surfaces the tab again.
-#
-# So the archive is gated on the FILE and only the key-scoped steps yield: the save
-# runs on the original's own transcript, while the replacement keeps its slot and its
-# session.
-
-
-async def _linked_slot_with_a_tail(state, linked: str, name: str = NAME):
-    """A slot whose conversation lives on *linked*, with one row past its last save."""
-    slot = state.get_or_create_slot(name, linked_session_key=linked)
-    slot.append("user", "PERSISTED-1")
-    slot.drain()
-    assert await handlers.save_slot_off_loop(state, slot, best_effort=False)
-    assert slot._disk_window_len == 1, "the seed save did not commit the first window"
-    slot.append("assistant", "TAIL-2")
-    slot.drain()
-    return slot
-
-
-@pytest.mark.asyncio
-async def test_delete_divergent_transcript_still_archives_the_original(tmp_path) -> None:
-    """An unbound recreate over a linked tab must not carry off its archive."""
-    state = _make_state(tmp_path)
-    linked = "cron:job7"
-    original = await _linked_slot_with_a_tail(state, linked)
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-    assert original.running, "the turn must be live so the cancel-wait actually blocks"
-
-    close = asyncio.create_task(handlers.api_chat_slot_delete(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    assert not replacement.linked_session_key, "the replacement must be unbound for this case"
-    release.set()
-    resp = await close
-
-    assert resp.status == 200
-    # The archive the user asked for happened, on the file only the original writes.
-    meta = state.conversation_log.get_metadata(linked)
-    assert meta.get("closed"), "the dismissed linked transcript was left open to resurface"
-    assert meta.get("closed_at"), "an archived transcript with no close instant keeps no close"
-    assert [m.get("content", "") for m in state.conversation_log.read_messages(linked)] == [
-        "PERSISTED-1",
-        "TAIL-2",
-    ], "archiving the original's own transcript dropped its tail"
-    # ...and the key-scoped steps still yielded: the fix holds.
-    assert state._slots.get(NAME) is replacement, "the replacement was clobbered by the close"
-    assert state.sessions.remove.await_count == 0, "the replacement's session was torn down"
-    assert _disk_contents(state) == [], "rows landed on a transcript this slot never used"
-
-
-@pytest.mark.asyncio
-async def test_cleanup_divergent_transcript_still_archives_the_original(tmp_path) -> None:
-    """The bulk path splits the same way: archive the file, yield the key.
-
-    ``keys`` stays key-scoped and so still omits ``NAME`` — it names slot keys, and
-    this one has a live holder — but the transcript is archived, which is what the
-    idle sweep was for.
-    """
-    state = _make_state(tmp_path)
-    linked = "cron:job7"
-    original = await _linked_slot_with_a_tail(state, linked)
-    _make_stale(state)
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    _arm_running_turn(original, entered, release)
-    assert original.running, "the turn must be live so the cancel-wait actually blocks"
-
-    close = asyncio.create_task(handlers.api_chat_slots_cleanup(_Req(state, NAME)))
-    await _reached(entered, close, seam="the shielded task-cancel wait")
-    replacement = state.get_or_create_slot(NAME)
-    assert replacement is not original
-    release.set()
-    resp = await close
-
-    payload = _json(resp)
-    assert resp.status == 200
-    assert payload["failed"] == [], "the archive of the original's own transcript failed"
-    assert NAME not in payload["keys"], "a key with a live holder was reported swept"
-    meta = state.conversation_log.get_metadata(linked)
-    assert meta.get("closed"), "the stale linked transcript was left open to resurface"
-    assert [m.get("content", "") for m in state.conversation_log.read_messages(linked)] == [
-        "PERSISTED-1",
-        "TAIL-2",
-    ], "archiving the original's own transcript dropped its tail"
-    assert state._slots.get(NAME) is replacement, "the replacement was clobbered by cleanup"
-    assert state.sessions.remove.await_count == 0, "the replacement's session was torn down"

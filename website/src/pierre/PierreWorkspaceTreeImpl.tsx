@@ -9,9 +9,9 @@
  * Like the diff/code surfaces, the heavy `@pierre/trees` runtime loads behind
  * a lazy boundary (see `./tree.tsx`) so the eager bundle stays clean.
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
-import { useQuery } from '@tanstack/react-query'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { OverlayPortal } from '../components/overlayRoot'
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { GitStatus, GitStatusEntry } from '@pierre/trees'
 // The package root re-exports the tree's context-menu types under shorter
 // names; alias them back to the render-signature names for local clarity.
@@ -20,31 +20,103 @@ import type {
   ContextMenuOpenContext as FileTreeContextMenuOpenContext,
 } from '@pierre/trees'
 import { FileTree, useFileTree } from '@pierre/trees/react'
-import { AtSign, Download, FileDiff, FolderOpen } from 'lucide-react'
+import { AtSign, Download, FileDiff, FolderDot, FolderLock, FolderOpen, Undo2 } from 'lucide-react'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
 import ErrorNotice from '../components/ErrorNotice'
+import { MOVE_UNDO_MS } from '../components/MoveUndoBar'
+import useHeldWindow from '../hooks/useHeldWindow'
 import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
 import { i18nT } from '../i18n/t'
 import { useFileMenuItems, visibleFileMenuItems, invokeFileMenuItem, FileMenuItemIcon, FileMenuItemLabel, type ContributedFileMenuItem, type ReportFileMenuError } from '../apps/fileMenuContributions'
 import { downloadFileToDisk } from '../utils/fileReadUrl'
-import { findReport } from '../utils/errorReport'
+import { findReport, reportForError, type ErrorReport } from '../utils/errorReport'
 import {
   gitFilterRefusalCause,
   gitFilterRefusalCopyKey,
   isGitFilterRefusal,
 } from '../utils/gitStatusError'
 import { normalizeWindowsPath } from '../utils/fileTokens'
+import { treeEntryFromComposedPath, writeTreeEntry } from '../lib/treeEntryDrag'
+import { isUntokenizableDirPath } from '../utils/dropClassify'
 import { errMessage } from '../utils/thunkError'
+import { PIERRE_TREE_STATE_ROW_CSS } from './config'
 import { recallExpandedPaths, rememberExpandedPaths } from './treeExpansionMemory'
-import { TreeSkeleton } from './tree'
+import { planTreeStateRows, stateRowsMatchingFilter, STATE_ROW_ACTION_DECORATION, STATE_ROW_DECORATION, type TreeStateRowLabels } from './treeStateRows'
+import { recallDismissedUnreadable, rememberDismissedUnreadable } from './treeUnreadableDismissals'
+import { TreeSkeleton, type TreeReveal } from './tree'
+import { foldersOverRowBudget, mergeFolderListings, withFolder, type FolderListing } from './treeFolderListings'
 
 /** The kind vocabulary the composer's `@`-mention plumbing speaks: a file is
  *  staged + tokenized, a folder becomes a bare `@rel/` reference. Narrower than
  *  Pierre's `'directory' | 'file'`, so map at the boundary. */
 type TreeEntryKind = 'file' | 'dir'
 
+/** What the state-row readers see while a mode has no state rows (changed
+ *  mode, or the listing not yet answered). */
+const NO_STATE_ROWS: ReadonlySet<string> = new Set()
+
+/** How long the "Notice dismissed — Undo" line stays where the dismissed
+ *  not-readable notice stood: the session-move undo bar's horizon, so the
+ *  product has one undo window. */
+const UNREADABLE_UNDO_MS = MOVE_UNDO_MS
+
+/** A mouse or trackpad is the primary pointer (not touch). */
+function finePointer(): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    && window.matchMedia('(pointer: fine)').matches
+}
+
+/** A path for DISPLAY in a narrow notice: a zero-width space after every `/`
+ *  gives the line breaker a point at each segment boundary, so a path that does
+ *  not fit wraps at a slash instead of mid-word. A Windows-shaped root
+ *  (`C:\Users\…`, a UNC share) is shown in its forward-slash form first --
+ *  `normalizeWindowsPath` leaves any other path untouched -- since its
+ *  backslash segments would otherwise get no break point at all. Display only
+ *  -- the hints are characters and the slashes are rewritten, so the hand-off
+ *  and any copy of the value must use the real path. */
+export function breakAtSlashes(path: string): string {
+  return normalizeWindowsPath(path).replace(/\//g, '/\u200b')
+}
+
+/** The report the root-unreadable notice hands to the agent: the sentence and
+ *  the REAL path (the displayed one carries break hints), as a `system` report
+ *  -- no request failed, the listing answered 200 and named its own root as
+ *  unreadable -- on the current route. */
+function rootUnreadableReport(sentence: string, path: string): ErrorReport {
+  return {
+    id: 'workspace-tree-root-unreadable',
+    at: Date.now(),
+    source: 'system',
+    message: `${sentence} ${path}`,
+    route: window.location.pathname,
+  }
+}
+
+/** The directories of `paths` the model currently holds expanded, as the
+ *  `initialExpandedPaths` a `resetPaths` needs to keep them open. Read through
+ *  the item handles (the render model's only expansion reader) and
+ *  feature-detected, since a handle for a missing path is null and a file
+ *  handle has no `isExpanded`. */
+function expandedDirectoriesOf(
+  model: { getItem: (path: string) => unknown },
+  paths: readonly string[],
+): string[] {
+  const dirs = new Set<string>()
+  for (const p of paths) {
+    const segments = p.split('/')
+    for (let i = 1; i < segments.length; i++) dirs.add(segments.slice(0, i).join('/'))
+  }
+  const expanded: string[] = []
+  for (const dir of dirs) {
+    const item = model.getItem(dir) as { isExpanded?: () => boolean } | null
+    if (item && typeof item.isExpanded === 'function' && item.isExpanded()) expanded.push(dir)
+  }
+  return expanded
+}
+
 /** Row-level right-click menu for Pierre's `context-menu` slot -- rendered via a
- *  `document.body` PORTAL rather than into the slot itself. Pierre owns the
+ *  body-level PORTAL (the overlay root) rather than into the slot itself. Pierre owns the
  *  anchor, the outside-click wash, and open/close (the portal root's
  *  `data-file-tree-context-menu-root` marker is the library's documented way to
  *  keep a portaled surface counting as "inside"); this renders only the item
@@ -82,6 +154,13 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   // root-relative-looking path instead of project-relative).
   const abs = `${normalizeWindowsPath(root).replace(/\/$/, '')}/${item.path}`
   const rows = visibleFileMenuItems(contribItems, { path: abs, kind: isDir ? 'dir' : 'file' })
+  // "Add to chat" on a folder writes an `@path/` folder reference, which cannot
+  // carry whitespace or `@`; for such a folder the row is shown disabled with
+  // the reason rather than inserting a reference that never reaches the send
+  // (the drag refuses the same folders with the same note).
+  const folderRefused = !!onAddToContext && isDir && isUntokenizableDirPath(item.path.replace(/\/+$/, ''))
+  const addToChat = folderRefused ? undefined : onAddToContext
+  const hasBuiltinChatRow = !!addToChat || folderRefused
   // role="menuitem" divs (an interactive ARIA role) with a keyboard handler:
   // the correct menu semantics inside the role="menu" container, and the role
   // is what makes an onClick div compliant rather than a static-element one.
@@ -127,7 +206,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   // content); letting the hook also focus would be a redundant second move.
   const menuRef = useRef<HTMLDivElement>(null)
   useMenuKeyboard({ enabled: true, containerRef: menuRef, focusFirstOnOpen: false })
-  // PORTALED to document.body, positioned from the open context's anchorRect
+  // PORTALED to the body-level overlay root, positioned from the open context's anchorRect
   // (#10100). Pierre's default slot placement puts the menu in a width-0 slot
   // hung at the row's trailing edge, inside the tree root -- and that root is
   // `overflow: hidden`, so with this app's `--trees-padding-inline-override:
@@ -208,8 +287,8 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   // machine running the browser). Directories do not: the ask is file rows
   // only, and /api/file-download serves a single file, not a folder.
   const canDownload = !isDir
-  if (!onAddToContext && !canDownload && rows.length === 0) return null
-  return createPortal(
+  if (!hasBuiltinChatRow && !canDownload && rows.length === 0) return null
+  return <OverlayPortal>
     <div
       ref={menuRef}
       role="menu"
@@ -217,17 +296,33 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
       style={pos ? { top: pos.top, left: pos.left } : { top: context.anchorRect.bottom + 2, left: context.anchorRect.left, visibility: 'hidden' }}
       className="fixed z-50 min-w-[176px] max-w-[min(420px,calc(100vw-2rem))] rounded-lg border border-border bg-bg-elevated p-1 shadow-lg"
     >
-      {onAddToContext && (
+      {addToChat && (
         <div
           ref={firstItemRef}
           role="menuitem"
           tabIndex={-1}
           className={itemCls}
-          onClick={activate(() => onAddToContext(abs, isDir ? 'dir' : 'file'))}
-          onKeyDown={activate(() => onAddToContext(abs, isDir ? 'dir' : 'file'))}
+          onClick={activate(() => addToChat(abs, isDir ? 'dir' : 'file'))}
+          onKeyDown={activate(() => addToChat(abs, isDir ? 'dir' : 'file'))}
         >
           <AtSign className="lucide-inline text-muted" />
           {i18nT('pages.chat.fileBrowserRail.ctx_add_to_chat')}
+        </div>
+      )}
+      {folderRefused && (
+        <div
+          ref={firstItemRef}
+          role="menuitem"
+          tabIndex={-1}
+          aria-disabled="true"
+          data-testid="file-tree-add-to-chat-refused"
+          className="flex items-start gap-2 rounded-md px-2.5 py-1.5 text-[12.5px] text-muted cursor-default focus:bg-bg-hover outline-hidden"
+        >
+          <AtSign className="lucide-inline mt-0.5" aria-hidden="true" />
+          <span className="flex flex-col">
+            <span>{i18nT('pages.chat.fileBrowserRail.ctx_add_to_chat')}</span>
+            <span className="text-[11.5px]">{i18nT('components.chatInput.tree_drop_folder_refused')}</span>
+          </span>
         </div>
       )}
       {/* Built-in Download for a file row. Streams the raw bytes through the
@@ -238,7 +333,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
           it to own focus entry. */}
       {canDownload && (
         <div
-          ref={onAddToContext ? undefined : firstItemRef}
+          ref={hasBuiltinChatRow ? undefined : firstItemRef}
           role="menuitem"
           tabIndex={-1}
           className={itemCls}
@@ -269,7 +364,7 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
         return (
           <div
             key={`${mi.app}:${mi.id}`}
-            ref={!onAddToContext && !canDownload && idx === 0 ? firstItemRef : undefined}
+            ref={!hasBuiltinChatRow && !canDownload && idx === 0 ? firstItemRef : undefined}
             role="menuitem"
             tabIndex={-1}
             className={itemCls}
@@ -281,9 +376,8 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
           </div>
         )
       })}
-    </div>,
-    document.body,
-  )
+    </div>
+  </OverlayPortal>
 }
 
 /** Map a porcelain status letter to Pierre's git-status lane vocabulary. */function gitStatusFor(letter: string): GitStatus | null {
@@ -298,7 +392,37 @@ function TreeContextMenu({ item, context, root, onAddToContext, contribItems, on
   }
 }
 
-export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, searchQuery, mode = 'all', selectedPath, persistExpansion = false }: {
+/**
+ * Collapse a path list into something `@pierre/trees` will accept.
+ *
+ * Two hazards, both reachable after egress redaction flattens differing
+ * segments to one `[REDACTED: ...]` string:
+ *  - identical strings: `appendPresortedPaths` throws 'Duplicate path';
+ *  - a FILE whose path is also a DIRECTORY (an explicit `dir/` entry or the
+ *    implied parent of another path): the tree indexes a directory's children
+ *    by name, so `createFileChild` throws 'Path collides with an existing
+ *    entry'. Both throws are uncaught inside the resetPaths layout effect and
+ *    take down the whole Files route.
+ *
+ * Order and first occurrence are preserved. The directory wins a collision so
+ * its subtree still renders; the shadowed file degrades to a missing row.
+ */
+function dedupeTreePaths(paths: string[]): string[] {
+  const unique = Array.from(new Set(paths))
+  const directories = new Set<string>()
+  for (const path of unique) {
+    const bare = path.endsWith('/') ? path.slice(0, -1) : path
+    if (path.endsWith('/')) directories.add(bare)
+    const segments = bare.split('/')
+    for (let i = 1; i < segments.length; i++) directories.add(segments.slice(0, i).join('/'))
+  }
+  return unique.filter(path => path.endsWith('/') || !directories.has(path))
+}
+
+/** Open loaded folders one whole-tree poll re-reads, at most. */
+const FOLDER_REREADS_PER_POLL = 3
+
+export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext, searchQuery, mode = 'all', selectedPath, persistExpansion = false, onOpenFolder, reveal, onRevealed }: {
   projectDir: string
   onFileOpen?: (absPath: string) => void
   /** Right-click "Add to context" on a row: hands the host the ABSOLUTE path
@@ -322,6 +446,14 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
    *  hosts of this shared tree keep their collapsed-by-default behavior.
    *  Applies to `all` mode only: `changed` mode starts fully open by design. */
   persistExpansion?: boolean
+  /** Activating the "not shown: limit reached" row under a folder hands that
+   *  project-relative folder to the host, which opens it in a folder tab. */
+  onOpenFolder?: (folder: string) => void
+  /** Load (if it is past the row cap) and expand one project-relative folder. */
+  reveal?: TreeReveal | null
+  /** Called once a reveal has been acted on, so the host can clear it: a
+   *  remount (a mode toggle) must not replay it over the user's later collapse. */
+  onRevealed?: () => void
 }) {
   // Whether any app contributes a 'tree-context' row at all — gates whether the
   // tree wires a context menu (per-node `when` filtering happens in the menu).
@@ -330,26 +462,351 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // than in the context menu because activating a row closes that menu, so a notice
   // inside it would unmount with the thing that raised it.
   const [actionError, setActionError] = useState<string | null>(null)
-  const { data: tree } = useQuery({
+  const qc = useQueryClient()
+  const { data: baseTree, dataUpdatedAt: baseTreeUpdatedAt } = useQuery({
     queryKey: ['project-tree', projectDir],
     queryFn: () => api.projectTree(projectDir),
     enabled: !!projectDir,
-    refetchInterval: 10_000,
+    // No poll while the read is failing: `api.projectTree` runs under a deadline, so a
+    // wedged gateway would otherwise be re-walked every interval for as long as the tree
+    // is mounted, each pass rejecting on the same deadline. A failed read recovers through
+    // the host's Refresh (it refetches this key), and the poll resumes once that succeeds.
+    refetchInterval: q => (q.state.error ? false : 10_000),
     refetchOnWindowFocus: true,
   })
+  // The Refresh under the not-readable root state (below). The listing is the
+  // one query whose answer decides that state, so it is the one re-asked; the
+  // status query is off there (the git probe fails closed on an unreadable
+  // cwd, so `repo` is false). Same seam the Files tab's own Refresh uses.
+  const refetchTree = () => {
+    void qc.invalidateQueries({ queryKey: ['project-tree', projectDir] })
+  }
   const { data: status, error: statusError } = useQuery({
     queryKey: ['git-status', projectDir],
     queryFn: () => api.projectGitStatus(projectDir),
-    enabled: !!projectDir && (mode === 'changed' || !!tree?.repo),
+    enabled: !!projectDir && (mode === 'changed' || !!baseTree?.repo),
     refetchInterval: 5_000,
     refetchOnWindowFocus: true,
   })
+  // Folders past the whole listing's row cap that this mount has asked for on
+  // their own (`?dir=`): a cut folder the user expands, or one a host
+  // reveals. Keyed under the tree's own key, so the host's Refresh -- which
+  // refetches `['project-tree', projectDir]` -- re-reads them too. Not polled:
+  // the whole tree's 10 s poll is the one background walk the cap bounds, and
+  // twenty more would multiply it. Bounded (`withFolder`).
+  // Folders whose listing the bound dropped while they were still open. A
+  // dropped folder is cut again and still expanded (the remembered expansion
+  // survives the reset), so reloading it on sight would drop the next oldest,
+  // and so on without end. It waits until the user closes it; a reveal, an
+  // explicit request, still loads it.
+  const evictedRef = useRef<Set<string>>(new Set())
+  // Evicting also drops the folder's cached listing: the host's Refresh
+  // refetches every `['project-tree', projectDir]` query, inactive ones too,
+  // and would otherwise re-walk folders the tree no longer shows.
+  const evict = useCallback((folder: string) => {
+    evictedRef.current.add(folder)
+    qc.removeQueries({ queryKey: ['project-tree', projectDir, 'dir', folder], exact: true })
+  }, [qc, projectDir])
+  const [loadedFolders, setLoadedFolders] = useState<string[]>([])
+  const folderQueries = useQueries({
+    queries: (mode === 'all' ? loadedFolders : []).map(folder => ({
+      queryKey: ['project-tree', projectDir, 'dir', folder],
+      queryFn: () => api.projectTree(projectDir, folder) as Promise<FolderListing>,
+      enabled: !!projectDir,
+      retry: false,
+      staleTime: 10_000,
+    })),
+  })
+  const folderListings = folderQueries.flatMap(q => (q.data ? [q.data] : []))
+  // Folders whose own listing's latest read failed, for the notice above the
+  // tree. A refresh that fails after a good read keeps the cached rows on
+  // screen; a first read that fails leaves the folder with the cut it had.
+  // Either way the notice names the folder and offers its own retry.
+  const failedFolders = mode === 'all'
+    ? loadedFolders.filter((_folder, i) => folderQueries[i]?.isError)
+    : []
+  const folderListingsKey = folderQueries.map(q => q.dataUpdatedAt).join(',')
+  // A loaded folder that cannot be listed on its own -- gone (404
+  // `dir_not_found`, e.g. the agent deleted it) or refused (403 `dir_refused`,
+  // e.g. a link) -- is dropped, so its cached rows stop being merged and its
+  // failure notice does not come back on every Refresh: no retry can change it.
+  // Folders dropped because their own listing was refused or gone, with the
+  // error that said so, for the notice (see the effect below).
+  const [refusedFolders, setRefusedFolders] = useState<Array<{ folder: string; error: unknown }>>([])
+  const unlistable = (error: unknown) => error instanceof ApiError && (error.status === 404 || error.status === 403)
+  const goneKey = folderQueries.map(q => (unlistable(q.error) ? 1 : 0)).join('')
+  useEffect(() => {
+    const gone = loadedFolders.filter((_folder, i) => {
+      return unlistable(folderQueries[i]?.error)
+    })
+    if (gone.length === 0) return
+    // The refusal outlives the listing: its notice stays until the user
+    // dismisses it or a later load of that folder succeeds.
+    setRefusedFolders(prev => [
+      ...prev.filter(entry => !gone.includes(entry.folder)),
+      ...gone.map(folder => ({ folder, error: folderQueries[loadedFolders.indexOf(folder)]?.error })),
+    ])
+    // Evicted too: the whole listing can keep naming a folder git's index still
+    // holds, and an expanded gone folder would otherwise be loaded again on
+    // every store event. It waits until the user closes it, as a dropped one does.
+    for (const folder of gone) evict(folder)
+    // A 404 means the whole listing that still shows the folder is stale:
+    // re-read it once now, so the notice and the rows agree without waiting
+    // for the next poll. Exact key, so no folder listing is re-read with it.
+    if (gone.some(folder => folderQueries[loadedFolders.indexOf(folder)]?.error instanceof ApiError
+      && (folderQueries[loadedFolders.indexOf(folder)]?.error as ApiError).status === 404)) {
+      void qc.invalidateQueries({ queryKey: ['project-tree', projectDir], exact: true })
+    }
+    setLoadedFolders(prev => prev.filter(folder => !gone.includes(folder)))
+    setPendingExpand(prev => prev.filter(folder => !gone.includes(folder)))
+    setPendingReveal(prev => (prev && gone.includes(prev) ? null : prev))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [goneKey])
+
+  // Past the row budget the oldest listings are dropped, exactly like the
+  // count bound: marked evicted, so an open dropped folder waits to be closed.
+  useEffect(() => {
+    const over = foldersOverRowBudget(folderListings)
+    if (over.length === 0) return
+    for (const folder of over) evict(folder)
+    setLoadedFolders(prev => prev.filter(folder => !over.includes(folder)))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [folderListingsKey])
+  const tree = useMemo(
+    () => (baseTree ? mergeFolderListings(baseTree, folderListings) : baseTree),
+    // `folderListings` is rebuilt every render; its update stamps are its identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [baseTree, folderListingsKey],
+  )
+  const loadFolder = useCallback((folder: string) => {
+    if (!folder) return
+    evictedRef.current.delete(folder)
+    setRefusedFolders(prev => (prev.some(entry => entry.folder === folder) ? prev.filter(entry => entry.folder !== folder) : prev))
+    setLoadedFolders(prev => {
+      if (prev.includes(folder)) return prev
+      const next = withFolder(prev, folder)
+      for (const dropped of prev) if (!next.includes(dropped)) evict(dropped)
+      return next
+    })
+  }, [evict])
+  // Child folder rows of each CUT folder, for the lazy load below: a chain row
+  // reports the expansion of its last folder only. Built for the cut folders
+  // alone, so it stays small however large the listing is.
+  const childDirectoriesRef = useRef<Map<string, string[]>>(new Map())
+  childDirectoriesRef.current = useMemo(() => {
+    const cut = new Set((tree?.truncatedDirectories ?? []).filter(Boolean))
+    const map = new Map<string, string[]>()
+    if (cut.size === 0) return map
+    for (const raw of tree?.directories ?? []) {
+      const dir = raw.replace(/\/$/, '')
+      const parent = dir.slice(0, Math.max(0, dir.lastIndexOf('/')))
+      if (cut.has(parent)) map.set(parent, [...(map.get(parent) ?? []), dir])
+    }
+    return map
+  }, [tree])
   const truncatedDirectoriesRef = useRef<Set<string>>(new Set())
   truncatedDirectoriesRef.current = new Set(tree?.truncatedDirectories ?? [])
   const truncatedDirectoriesKey = (tree?.truncatedDirectories ?? []).join('\n')
+  // The folders the server could not read, for the notice above the tree and
+  // the marker on each such folder's row. The root's own marker (`.`) is not a
+  // folder of the listing and has its whole-panel state; every other entry is a
+  // directory row of the payload. One list feeds both surfaces, so the row
+  // marker can never point at a notice that does not name it.
+  const unreadableFolders = useMemo(
+    () => (tree?.unreadableDirectories ?? []).filter(path => path !== '.'),
+    [tree],
+  )
+  const unreadableFoldersRef = useRef<Set<string>>(new Set())
+  unreadableFoldersRef.current = new Set(unreadableFolders)
+  const unreadableFoldersKey = unreadableFolders.join('\n')
+  // Folders whose not-readable notice the user has DISMISSED for this project
+  // (`./treeUnreadableDismissals`). A folder that stays unreadable by design
+  // would otherwise keep the notice red on every visit; while every folder the
+  // payload names is remembered as dismissed the notice is not rendered, and a
+  // folder the set does not hold brings it back with the whole list. Recalled
+  // per project dir, so switching projects never carries one project's
+  // dismissal to another.
+  const [dismissedUnreadable, setDismissedUnreadable] = useState<readonly string[]>(() =>
+    recallDismissedUnreadable(projectDir),
+  )
+  const dismissedProjectRef = useRef(projectDir)
+  if (dismissedProjectRef.current !== projectDir) {
+    dismissedProjectRef.current = projectDir
+    setDismissedUnreadable(recallDismissedUnreadable(projectDir))
+  }
+  const unreadableDismissed = useMemo(() => {
+    if (unreadableFolders.length === 0) return false
+    const dismissed = new Set(dismissedUnreadable)
+    return unreadableFolders.every(folder => dismissed.has(folder))
+  }, [unreadableFolders, dismissedUnreadable])
+  const unreadableDismissedRef = useRef(unreadableDismissed)
+  unreadableDismissedRef.current = unreadableDismissed
+  // Dismissing leaves a way back where the notice stood: a one-line "Notice
+  // dismissed — Undo" status for the product's one undo window
+  // (`UNREADABLE_UNDO_MS`), held open while the pointer is over that spot or
+  // focus is inside it (`useHeldWindow`, the clock every undo offer runs on).
+  // The ✕ sits beside "Ask the agent" at the same weight, so a mis-click, or a
+  // click by a reader who did not take in the tooltip, would otherwise record a
+  // per-project dismissal that survives reloads with no manual way back (UX
+  // round on `738908fb54`). Undo restores the notice and CLEARS the remembered
+  // set. The offer is transient by construction: React state, so a remount
+  // shows the remembered dismissal and no offer; keyed per dismissal, so
+  // dismissing again starts a full window; and retired the moment the notice
+  // returns on its own (a folder outside the set appeared), so a stale offer
+  // cannot come back once the payload settles again. The hold flags are reset
+  // whenever the spot unmounts -- a pointer parked on the ✕ or on Undo gets no
+  // leave event when the element under it goes -- so a later offer never
+  // inherits a hold nothing is holding.
+  const [undoOffer, setUndoOffer] = useState<number | null>(null)
+  // The next offer's key. A counter of its own, never derived from
+  // `undoOffer`: that state is `null` between offers (expiry, Undo, the
+  // notice returning), so a key computed from it would come out the same
+  // every time and `useHeldWindow` -- which tells a NEW offer from the old one
+  // by its key alone -- would read the previous offer's spent remainder or
+  // deadline onto the new one (Opus lane on `9f52681b54`). Same shape as the
+  // session-move offers' `nextOfferId`.
+  const nextUndoOfferRef = useRef(0)
+  const [undoHovered, setUndoHovered] = useState(false)
+  const [undoFocused, setUndoFocused] = useState(false)
+  const undoStatusId = useId()
+  const undoSpotRef = useRef<HTMLDivElement>(null)
+  useHeldWindow(undoOffer, UNREADABLE_UNDO_MS, undoHovered || undoFocused, () => setUndoOffer(null))
+  useEffect(() => {
+    if (!unreadableDismissed) setUndoOffer(null)
+  }, [unreadableDismissed])
+  const showUnreadableSpot = mode === 'all' && unreadableFolders.length > 0 && (!unreadableDismissed || undoOffer != null)
+  useEffect(() => {
+    if (showUnreadableSpot) return
+    setUndoHovered(false)
+    setUndoFocused(false)
+  }, [showUnreadableSpot])
+  // The two actions swap the spot's whole content: the ✕ for the Undo line,
+  // Undo for the notice. The control that was activated had focus (Enter on
+  // it; a click, in the browsers that focus a pressed button), so the spot's
+  // focus capture had set the hold -- and then the element unmounts, and a
+  // REMOVED element fires no focusout, so nothing would ever clear it: the
+  // offer would stay held for the life of the mount, the Undo line above the
+  // tree for as long, and every later offer born held (GPT and Opus lanes on
+  // `44dceb4514`). The hold is therefore cleared at the swap itself, below, and
+  // re-set only by a focus that actually lands. The pointer hold is left
+  // alone: the spot it tracks is the div that persists across the swap, so
+  // its enter/leave stays truthful. And the focus the swap destroyed is
+  // handed to the counterpart -- Undo after the ✕, the ✕ after Undo -- as the
+  // Auto-title Undo does by construction (there the pressed button's DOM node
+  // is reused for the offer): a keyboard user who dismissed is ON the way
+  // back, not at <body> with the window running while they tab back to it
+  // (UX lane), and pressing Undo lands them on the control that reverses it.
+  // Only when the activated control HAD focus: a click in a browser that does
+  // not focus buttons moves no focus, and this moves none either.
+  const handFocusRef = useRef(false)
+  const dismissUnreadable = useCallback(() => {
+    handFocusRef.current = undoSpotRef.current?.contains(document.activeElement) ?? false
+    rememberDismissedUnreadable(projectDir, unreadableFolders)
+    setDismissedUnreadable(unreadableFolders)
+    nextUndoOfferRef.current += 1
+    setUndoOffer(nextUndoOfferRef.current)
+  }, [projectDir, unreadableFolders])
+  const undoDismissUnreadable = useCallback(() => {
+    handFocusRef.current = undoSpotRef.current?.contains(document.activeElement) ?? false
+    rememberDismissedUnreadable(projectDir, [])
+    setDismissedUnreadable([])
+    setUndoOffer(null)
+  }, [projectDir])
+  useEffect(() => {
+    // Every child of the spot was just replaced (or this is the mount): the
+    // element the focus hold described is gone. Clear first; the hand-off
+    // below re-sets it through the spot's own focus capture if it lands.
+    setUndoFocused(false)
+    if (!handFocusRef.current) return
+    handFocusRef.current = false
+    const spot = undoSpotRef.current
+    if (!spot) return
+    // Dismissed: Undo is the line's one control. Shown: the ✕ is the notice's
+    // one control named by `aria-label` (Ask the agent carries a title).
+    const counterpart = unreadableDismissed
+      ? spot.querySelector<HTMLElement>('button')
+      : spot.querySelector<HTMLElement>('button[aria-label]')
+    counterpart?.focus()
+  }, [unreadableDismissed])
+  // A dismissal covers the folder's CURRENT failure, not the folder forever:
+  // once a remembered folder drops out of the payload (it reads again), it is
+  // forgotten, so the same folder failing anew alerts again instead of
+  // inheriting its old dismissal. Pruned against a landed payload only -- a
+  // mount that has not heard from the server yet knows nothing about the
+  // folders and must not forget them, or a reload would re-alert every visit.
+  // A TRUNCATED payload is partial knowledge too, but only where it was cut: a
+  // remembered folder absent from it is kept while the cut could be what hid
+  // it -- its parent is itself absent, or is named in `truncatedDirectories` --
+  // and forgotten when its parent is listed whole, which says the folder is
+  // gone, so a folder recreated unreadable later alerts again.
+  useEffect(() => {
+    if (tree == null) return
+    const current = unreadableFoldersRef.current
+    const listed = new Set((tree.directories ?? []).map(path => path.replace(/\/$/, '')))
+    const cut = new Set(tree.truncatedDirectories ?? [])
+    const hiddenByCut = (folder: string) => {
+      if (tree.truncated !== true || listed.has(folder)) return false
+      const slash = folder.lastIndexOf('/')
+      const parent = slash < 0 ? '' : folder.slice(0, slash)
+      return cut.has(parent) || (parent !== '' && !listed.has(parent))
+    }
+    const kept = dismissedUnreadable.filter(folder => current.has(folder) || hiddenByCut(folder))
+    if (kept.length === dismissedUnreadable.length) return
+    rememberDismissedUnreadable(projectDir, kept)
+    setDismissedUnreadable(kept)
+  }, [tree, projectDir, dismissedUnreadable])
+
+  // The state row under a childless folder (see `./treeStateRows`). A language
+  // switch re-renders this component without remounting it (LanguageProvider
+  // repaints with `cloneElement`), so the labels are read every render and the
+  // memo is keyed on the strings: a new object only when a label changes, which
+  // is what re-plans the rows -- and nothing else, since the `paths` memo below
+  // feeds `resetPaths`. The stylesheet does not depend on them (`./config`).
+  const rowEmpty = i18nT('components.workspaceTree.row_empty')
+  const rowHiddenOnly = i18nT('components.workspaceTree.row_hidden_only')
+  const rowLinked = i18nT('components.workspaceTree.row_linked')
+  const rowTruncated = i18nT(onOpenFolder ? 'components.workspaceTree.row_truncated_open' : 'components.workspaceTree.row_truncated')
+  const stateRowLabels = useMemo<TreeStateRowLabels>(
+    () => ({
+      empty: rowEmpty,
+      'hidden-only': rowHiddenOnly,
+      linked: rowLinked,
+      truncated: rowTruncated,
+    }),
+    [rowEmpty, rowHiddenOnly, rowLinked, rowTruncated],
+  )
+  // Which model paths are state rows, for the selection and context-menu
+  // guards, and which folders carry one, for the truncation badge. Refs because
+  // all three read them from callbacks Pierre holds.
+  const stateRowsRef = useRef<ReadonlySet<string>>(NO_STATE_ROWS)
+  const stateRowFoldersRef = useRef<ReadonlySet<string>>(NO_STATE_ROWS)
+  // The folder a `truncated` state row's activation opens, or null for a row
+  // that is not that action: the planner names a childless folder truncated
+  // whenever the payload cuts it, and the row is an action only where the host
+  // can open a folder tab (`onOpenFolder`). Read from Pierre callbacks, so refs.
+  const onOpenFolderRef = useRef(onOpenFolder)
+  onOpenFolderRef.current = onOpenFolder
+  const actionableStateRow = (rowPath: string): string | null => {
+    if (!onOpenFolderRef.current) return null
+    const folder = rowPath.slice(0, Math.max(0, rowPath.lastIndexOf('/')))
+    return folder && truncatedDirectoriesRef.current.has(folder) ? folder : null
+  }
+
+  // Rows can be dragged into the composer only where the host can take a
+  // mention (it wires "Add to chat") and on a fine pointer: a touch long-press
+  // would otherwise start a drag instead of the long-press it does today.
+  // Fixed at mount, like every other `useFileTree` option.
+  const [dragToComposer] = useState(() => !!onAddToContext && finePointer())
+  // True while a row is being dragged out of the tree (see the drag effect).
+  const rowDragRef = useRef(false)
 
   const { model } = useFileTree({
     paths: [],
+    // Drag is for carrying a row OUT of the tree. `canDrop` refuses every
+    // in-tree target, so a drag never moves or renames anything here.
+    dragAndDrop: dragToComposer
+      ? { canDrag: paths => !paths.some(p => stateRowsRef.current.has(p)), canDrop: () => false }
+      : false,
     // Changed mode holds a handful of paths — show them all; the full
     // workspace starts collapsed.
     initialExpansion: mode === 'changed' ? 'open' : 'closed',
@@ -364,9 +821,58 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     // for keyboards), the affordance shown only when the row is hovered/focused
     // so a narrow rail stays uncluttered.
     composition: { contextMenu: { triggerMode: 'both', buttonVisibility: 'when-needed' } },
-    renderRowDecoration: ({ item }) => {
+    // State rows read as a status line, not a file (see `./config`).
+    unsafeCSS: PIERRE_TREE_STATE_ROW_CSS,
+    renderRowDecoration: ({ item, row }) => {
+      // A planned state row carries the decoration the stylesheet keys on
+      // (`./config`). Decided by the plan, the same Set the selection and
+      // context-menu guards read -- never by the path's marker suffix, which a
+      // real file can share: that file keeps its icon, its pointer and its open.
+      if (item.kind !== 'directory' && stateRowsRef.current.has(item.path)) {
+        return actionableStateRow(item.path) ? STATE_ROW_ACTION_DECORATION : STATE_ROW_DECORATION
+      }
+      if (item.kind !== 'directory') return null
       const path = item.path.replace(/\/$/, '')
-      if (item.kind !== 'directory' || !truncatedDirectoriesRef.current.has(path)) return null
+      // A folder the server could not read: the failure behind
+      // `unreadableDirectories` is an error, and an error is REPORTED only
+      // through the `ErrorNotice` above the tree (no status row, no label of its
+      // own -- `./treeStateRows`). Its row still needs a signal, or the reader
+      // cannot tell which of the folders that show nothing is the one the notice
+      // names. This marker is that signal and nothing more: a lock glyph whose
+      // accessible label points AT the notice ("see the notice above") rather
+      // than stating the failure, fed by the same list the notice renders, so it
+      // can never name a folder the notice does not. Once the user has dismissed
+      // the notice the label says so instead, so it never sends the reader to a
+      // notice that is not there. The label is Pierre's decoration `title`: the
+      // tooltip, and the accessible name of the decoration span (the glyph
+      // itself is `aria-hidden`).
+      if (unreadableFoldersRef.current.has(path)) {
+        const label = i18nT(unreadableDismissedRef.current
+          ? 'components.workspaceTree.row_unreadable_marker_dismissed'
+          : 'components.workspaceTree.row_unreadable_marker')
+        return { icon: { name: 'file-tree-icon-lock' }, title: label }
+      }
+      // `flattenEmptyDirectories` folds a folder holding one subfolder and no
+      // listed file into a single chain row (`p/a`), and `item.path` names only
+      // its LAST folder -- a truncated `p` above it would lose its badge. Every
+      // folder in the chain is asked.
+      const chain = row.flattenedSegments?.length
+        ? row.flattenedSegments.map(segment => segment.path.replace(/\/$/, ''))
+        : [path]
+      const truncated = chain.filter(folder => truncatedDirectoriesRef.current.has(folder))
+      if (truncated.length === 0) return null
+      // A truncated folder the cap left childless carries the state row that
+      // says so beneath it; while that row is showing (the folder is expanded)
+      // the badge would say it twice, so it yields until the folder is closed.
+      // The row speaks only for the chain's last folder, so the badge yields
+      // only when that is the one truncated folder in the chain. Pierre
+      // re-renders the row on every toggle, so this reads the live state.
+      // Where the row is the open-in-folder-tab action instead, it says nothing about
+      // the cut, so the badge stays and keeps saying why the folder looks short.
+      if (truncated.length === 1 && truncated[0] === path && row.isExpanded && stateRowFoldersRef.current.has(path)
+        && !onOpenFolderRef.current) {
+        return null
+      }
       const label = i18nT('pages.chat.activityViewer.workspace_directory_truncated')
       return { text: label, title: label }
     },
@@ -411,35 +917,75 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // The rendered path set: the whole workspace, or just the changed files —
   // the SAME tree component either way, so both modes share look, keyboard
   // model, search, and git-status lanes.
-  const paths = useMemo<string[]>(
-    () =>
-      mode === 'changed'
-        ? statusEntries.map(e => e.path)
-        : // The full-workspace list can still carry a duplicate — e.g. two
-          // genuinely different paths that collapse to the same string once
-          // egress redaction flattens a differing segment. @pierre/trees
-          // `appendPresortedPaths` throws 'Duplicate path' on adjacent
-          // identical entries, and that throw is uncaught inside the
-          // resetPaths useLayoutEffect below, taking down the whole route.
-          // De-dup here (preserving order + first occurrence, mirroring the
-          // `changed` branch's statusEntries seen-Set) so a duplicate degrades
-          // to a single (missing) row instead of a render crash. Explicit
-          // trailing-slash paths keep directory rows even when every direct
-          // file in that directory fell beyond the file budget.
-          Array.from(new Set([
-            ...(tree?.paths ?? []),
-            ...(tree?.directories ?? []).map(path => `${path.replace(/\/$/, '')}/`),
-          ])),
-    [mode, statusEntries, tree],
+  //
+  // In `all` mode a folder with nothing beneath it gets ONE state row
+  // (`./treeStateRows`): expanding it must never show a down-chevron over
+  // nothing, and the row must say which kind of nothing it is. Changed mode
+  // needs none — every folder there is the parent of a changed file.
+  const stateRows = useMemo(
+    () => (mode === 'changed' || !tree ? null : planTreeStateRows(tree, stateRowLabels)),
+    [mode, tree, stateRowLabels],
   )
+  // A state row is a status line, not a name, and must never come up as a
+  // search result in its own right (typing "empty" would list every empty
+  // folder's row). But Pierre force-expands every folder the query matches --
+  // `hide-non-matches` re-applies that expansion on every store event, so the
+  // folder cannot be kept closed -- and a childless folder open over nothing
+  // is exactly the down-chevron-over-nothing the row exists to prevent. So
+  // while the filter is active only the rows whose FOLDER matches are fed
+  // (`stateRowsMatchingFilter`): each rides along under its open folder, and a
+  // label-only match feeds nothing. The guards and the badge follow what is
+  // fed, so a truncated folder the query does not match keeps its badge while
+  // its row is withheld. Filter on and filter off are each a path reset; the
+  // reset below carries the expansion.
+  const searching = !!searchQuery
+  const fedStateRows = useMemo(
+    () => (stateRows && searchQuery ? stateRowsMatchingFilter(stateRows, searchQuery) : stateRows),
+    [stateRows, searchQuery],
+  )
+  stateRowsRef.current = fedStateRows?.paths ?? NO_STATE_ROWS
+  stateRowFoldersRef.current = fedStateRows?.folders ?? NO_STATE_ROWS
+  const paths = useMemo<string[]>(() => {
+    if (mode === 'changed') return dedupeTreePaths(statusEntries.map(e => e.path))
+    // The full-workspace list can still carry a duplicate — e.g. two
+    // genuinely different paths that collapse to the same string once
+    // egress redaction flattens a differing segment. @pierre/trees
+    // `appendPresortedPaths` throws 'Duplicate path' on adjacent
+    // identical entries, and that throw is uncaught inside the
+    // resetPaths useLayoutEffect below, taking down the whole route.
+    // De-dup here (preserving order + first occurrence) so a duplicate
+    // degrades to a single (missing) row instead of a render crash; see
+    // `dedupeTreePaths` for the file-vs-directory collision it also drops. Explicit
+    // trailing-slash paths keep directory rows even when every direct
+    // file in that directory fell beyond the row budget.
+    const listed = dedupeTreePaths([
+      ...(tree?.paths ?? []),
+      ...(tree?.directories ?? []).map(path => `${path.replace(/\/$/, '')}/`),
+    ])
+    return fedStateRows ? [...listed, ...fedStateRows.paths] : listed
+  }, [mode, statusEntries, tree, fedStateRows])
   const ready = mode === 'changed' ? status != null : tree != null
+  // Separate notices, because the cases have different remedies: a failed
+  // read can answer differently on a retry, a gone (404) or refused (403)
+  // folder cannot, and the status says which of those two it is.
+  const retryFolders = failedFolders.filter(folder => !unlistable(folderQueries[loadedFolders.indexOf(folder)]?.error))
+  const settledRefusals = mode === 'all' ? refusedFolders.filter(entry => !retryFolders.includes(entry.folder)) : []
+  const isGone = (error: unknown) => error instanceof ApiError && error.status === 404
+  const goneFolders = settledRefusals.filter(entry => isGone(entry.error))
+  const deniedFolders = settledRefusals.filter(entry => !isGone(entry.error))
+  const retryFailedFolders = () => {
+    for (const folder of retryFolders) {
+      void qc.refetchQueries({ queryKey: ['project-tree', projectDir, 'dir', folder], exact: true })
+    }
+  }
 
-  // The row-decoration callback reads a ref because Pierre creates the model
-  // once. Re-render its view when only the truncation set changes and the path
-  // set therefore does not reset the model.
+  // The row-decoration callback reads refs because Pierre creates the model
+  // once. Re-render its view when only the truncation or unreadable set, or
+  // the dismissed state the unreadable marker's label follows, changes and the
+  // path set therefore does not reset the model.
   useEffect(() => {
     model.setComposition(model.getComposition())
-  }, [model, truncatedDirectoriesKey])
+  }, [model, truncatedDirectoriesKey, unreadableFoldersKey, unreadableDismissed])
 
   // Feed data into the model imperatively (the model is created once; path
   // resets and git-status patches are the supported update API). Layout
@@ -457,12 +1003,28 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // another branch checked out) and must survive a snapshot rather than be
   // erased by it.
   const payloadDirsRef = useRef<Set<string> | null>(null)
+  const lastSearching = useRef(searching)
   useLayoutEffect(() => {
     if (!ready) return
     if (lastPathsKey.current === pathsKey) return
     lastPathsKey.current = pathsKey
+    const searchToggled = lastSearching.current !== searching
+    lastSearching.current = searching
     if (!remembersExpansion) {
-      model.resetPaths(paths)
+      // The filter toggling on or off re-feeds the model without or with the
+      // state rows (see `paths`), and a plain reset would collapse everything
+      // in this host. Worse, Pierre snapshots the expansion when the filter
+      // opens and restores it when it closes -- the search effect below runs
+      // after this one -- so a collapsed tree would be snapshotted and then
+      // restored as the "pre-filter" state. Carry the model's current
+      // expansion across exactly these two resets; a payload change keeps
+      // this host's existing behaviour.
+      const carried = searchToggled ? expandedDirectoriesOf(model, paths) : []
+      if (carried.length > 0) {
+        model.resetPaths(paths, { initialExpandedPaths: carried })
+      } else {
+        model.resetPaths(paths)
+      }
       return
     }
     const dirs = new Set<string>()
@@ -484,7 +1046,7 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     } else {
       model.resetPaths(paths)
     }
-  }, [ready, paths, pathsKey, model, remembersExpansion, projectDir])
+  }, [ready, paths, pathsKey, model, remembersExpansion, projectDir, searching])
   useEffect(() => {
     model.setGitStatus(statusEntries)
   }, [statusEntries, model])
@@ -559,8 +1121,18 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   }, [remembersExpansion, model, projectDir])
 
   // Forward the panel's shared search box into the tree's search session.
+  // Pierre then focuses the first match, and a state row fed for a matched
+  // folder (see `paths`) sorts right under that folder, so it can be the first
+  // match: a focus ring on an inert status line reads as a selectable result.
+  // Hand that focus to the folder the row qualifies. `focusPath` moves the
+  // focus without a store event, so Pierre does not re-derive it here.
   useLayoutEffect(() => {
     model.setSearch(searchQuery || null)
+    if (!searchQuery) return
+    const focused = model.getFocusedItem()
+    if (!focused) return
+    const path = focused.getPath()
+    if (stateRowsRef.current.has(path)) model.focusPath(`${path.slice(0, path.lastIndexOf('/'))}/`)
   }, [searchQuery, model])
 
   // Echo the host's open file as the tree selection. The ref lets the
@@ -593,10 +1165,25 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   onFileOpenRef.current = onFileOpen
   useEffect(() => {
     const unsubscribe = model.subscribe(() => {
+      // A row carried toward the composer is selected by the drag itself;
+      // that is not an open.
+      if (rowDragRef.current) return
       const focused = model.getFocusedItem()
       if (!focused || focused.isDirectory()) return
       const selected = model.getSelectedPaths()
       if (selected.length !== 1 || selected[0] !== focused.getPath()) return
+      // A state row is a status line the model holds as a file: nothing to
+      // open, and it must not keep the selected wash of a row that reads as
+      // chosen. Deselecting notifies again; that turn finds no selection and
+      // returns above.
+      if (stateRowsRef.current.has(focused.getPath())) {
+        // The `truncated` row under a folder the cap still cuts is the one
+        // state row with a job: it hands that folder to the host to open.
+        const folder = actionableStateRow(focused.getPath())
+        focused.deselect()
+        if (folder) onOpenFolderRef.current?.(folder)
+        return
+      }
       const abs = `${root}/${focused.getPath()}`
       // The host's own open file: this selection is the echo effect above (or
       // a click on the file already open) — not a new open.
@@ -606,6 +1193,132 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
     return unsubscribe
   }, [model, root])
 
+  // Lazy per-folder loading. The whole listing stops at its row cap
+  // and names the folders the cut reached; expanding one of those asks for its
+  // own listing, which the merge above folds into the rendered tree. The root
+  // (`""`) is never a row to expand -- the host's search reaches past it.
+  useEffect(() => {
+    if (mode !== 'all') return
+    // Nothing to watch on a whole listing: no subscription at all.
+    if (![...truncatedDirectoriesRef.current].some(Boolean)) return
+    const isOpen = (path: string) => {
+      const item = model.getItem(path) as { isExpanded?: () => boolean } | null
+      return !!item && typeof item.isExpanded === 'function' && item.isExpanded()
+    }
+    const check = () => {
+      // `flattenEmptyDirectories` folds a cut folder holding one listed subfolder
+      // into a chain row (`packages / core`) whose expansion is its LAST folder's,
+      // so a cut folder also counts as open when a folder beneath it is.
+      const children = childDirectoriesRef.current
+      const evicted = evictedRef.current
+      for (const folder of truncatedDirectoriesRef.current) {
+        if (!folder) continue
+        const open = isOpen(folder)
+        const chainOpen = !open && (children.get(folder) ?? []).some(isOpen)
+        if (evicted.has(folder)) {
+          // Closed again: the next opening is the user's, so it may load.
+          if (!open && !chainOpen) evicted.delete(folder)
+          continue
+        }
+        if (open) loadFolder(folder)
+        else if (chainOpen) {
+          // Opened through its chain row: once its own listing splits the
+          // chain, the folder itself must stay open, or the rows it brought
+          // land under a collapsed folder.
+          loadFolder(folder)
+          setPendingExpand(prev => (prev.includes(folder) ? prev : [...prev, folder]))
+        }
+      }
+    }
+    check()
+    return model.subscribe(check)
+  }, [model, mode, loadFolder, truncatedDirectoriesKey])
+
+  // Each whole-tree poll that lands also re-reads the loaded folders that are
+  // OPEN: inside a folder past the cap the whole listing cannot see a file the
+  // agent adds or deletes, so without this an open folder's rows go stale. A
+  // closed loaded folder is not re-read until it is opened, so the extra walks
+  // are bounded by what is on screen as well as by the listing bounds.
+  // At most `FOLDER_REREADS_PER_POLL` per poll, taken in turn, so a poll's
+  // extra walks stay a small constant however many folders are open.
+  const lastPollRef = useRef(baseTreeUpdatedAt)
+  const rereadTurnRef = useRef(0)
+  useEffect(() => {
+    if (lastPollRef.current === baseTreeUpdatedAt) return
+    lastPollRef.current = baseTreeUpdatedAt
+    const open = loadedFolders.filter(folder => {
+      const item = model.getItem(folder) as { isExpanded?: () => boolean } | null
+      return !!item && typeof item.isExpanded === 'function' && item.isExpanded()
+    })
+    if (open.length === 0) return
+    const start = rereadTurnRef.current % open.length
+    const take = Math.min(FOLDER_REREADS_PER_POLL, open.length)
+    rereadTurnRef.current = start + take
+    for (let i = 0; i < take; i++) {
+      const folder = open[(start + i) % open.length]
+      void qc.invalidateQueries({ queryKey: ['project-tree', projectDir, 'dir', folder], exact: true })
+    }
+  }, [baseTreeUpdatedAt, loadedFolders, model, qc, projectDir])
+
+  // A host's reveal: load the folder (a folder past the cap is no row until its
+  // own listing lands -- the listing's paths then imply it and its ancestors)
+  // and, once it is a row, expand the chain down to it and focus it.
+  const [pendingReveal, setPendingReveal] = useState<string | null>(null)
+  const onRevealedRef = useRef(onRevealed)
+  onRevealedRef.current = onRevealed
+  const [pendingExpand, setPendingExpand] = useState<string[]>([])
+  useLayoutEffect(() => {
+    if (pendingExpand.length === 0 || !ready) return
+    const loaded = new Set(folderListings.map(listing => listing.dir))
+    const waiting: string[] = []
+    for (const folder of pendingExpand) {
+      if (!loaded.has(folder)) { waiting.push(folder); continue }
+      const dir = model.getItem(folder)
+      if (dir && 'expand' in dir && typeof dir.expand === 'function') dir.expand()
+    }
+    if (waiting.length !== pendingExpand.length) setPendingExpand(waiting)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingExpand, ready, pathsKey, model, folderListingsKey])
+  useEffect(() => {
+    if (!reveal?.path || mode !== 'all') return
+    const folder = reveal.path.replace(/\/$/, '')
+    loadFolder(folder)
+    setPendingReveal(folder)
+    onRevealedRef.current?.()
+  }, [reveal, mode, loadFolder])
+  useLayoutEffect(() => {
+    if (!pendingReveal || !ready) return
+    let target = pendingReveal
+    if (!model.getItem(target)) {
+      // The folder's own listing can settle without giving it a row (git
+      // lists an empty or ignored folder as nothing, or the read failed).
+      // Then the reveal lands on its nearest ancestor that has a row, and
+      // ends, instead of waiting for a row that never comes.
+      // (A refused or gone folder is ended by the drop effect above.)
+      const settled = folderListings.some(listing => listing.dir === pendingReveal)
+        || retryFolders.includes(pendingReveal)
+      if (!settled) return
+      const segments = pendingReveal.split('/')
+      target = ''
+      for (let i = segments.length - 1; i >= 1; i--) {
+        const ancestor = segments.slice(0, i).join('/')
+        if (model.getItem(ancestor)) { target = ancestor; break }
+      }
+      if (!target) { setPendingReveal(null); return }
+    }
+    const segments = target.split('/')
+    for (let i = 1; i <= segments.length; i++) {
+      const dir = model.getItem(segments.slice(0, i).join('/'))
+      if (dir && 'expand' in dir && typeof dir.expand === 'function') dir.expand()
+    }
+    model.focusPath(`${target}/`)
+    // Selected too, so the folder the search hit named is the marked row.
+    for (const p of model.getSelectedPaths()) model.getItem(p)?.deselect()
+    model.getItem(target)?.select()
+    setPendingReveal(null)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingReveal, ready, pathsKey, model, folderListingsKey, retryFolders.join('\n')])
+
   // Row context menu. Ref-backed so the callback identity stays stable across
   // handler/prop changes (Pierre re-reads it only when the menu opens) while
   // still calling the latest handlers. `root` is captured live off the tree
@@ -614,28 +1327,144 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   onAddToContextRef.current = onAddToContext
   const rootRef = useRef(root)
   rootRef.current = root
+
+  // Tag every row drag with the dashboard's tree-entry payload so the composer
+  // can tell it from an OS file drag or a text drag. Native listener: the rows
+  // live in Pierre's shadow root, and `dragstart` is composed, so it reaches
+  // this container with the row still on its composed path. State, not a ref:
+  // the container mounts only once the tree has loaded, after the first effect.
+  const [dragHost, setDragHost] = useState<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const host = dragHost
+    if (!host || !dragToComposer) return
+    const onDragStart = (event: DragEvent) => {
+      if (!event.dataTransfer) return
+      const found = treeEntryFromComposedPath(event.composedPath(), rootRef.current)
+      if (found) writeTreeEntry(event.dataTransfer, found.entry, { mentionable: found.mentionable })
+    }
+    host.addEventListener('dragstart', onDragStart)
+    // Starting a row drag makes Pierre select that row, and a selection is an
+    // open (see the subscription above). Carrying a row to the composer must
+    // not swap the viewer, so opens are held for the length of the drag and
+    // the selection the drag added is dropped again afterwards. Capture phase:
+    // the flag is up before Pierre's own row handler selects.
+    let heldSelection: readonly string[] = []
+    let release: ReturnType<typeof setTimeout> | undefined
+    const onDragStartCapture = () => {
+      clearTimeout(release)
+      rowDragRef.current = true
+      heldSelection = model.getSelectedPaths()
+    }
+    const onDragEndCapture = () => {
+      if (!rowDragRef.current) return
+      // After Pierre's own dragend handler, which emits once more.
+      release = setTimeout(() => {
+        for (const p of model.getSelectedPaths()) if (!heldSelection.includes(p)) model.getItem(p)?.deselect()
+        rowDragRef.current = false
+      }, 0)
+    }
+    host.addEventListener('dragstart', onDragStartCapture, true)
+    host.addEventListener('dragend', onDragEndCapture, true)
+    // A row scrolled out of the virtualized list mid-drag sends its dragend
+    // from a detached node that never reaches the host; the drop (or the next
+    // press anywhere) releases the hold instead.
+    window.addEventListener('drop', onDragEndCapture, true)
+    window.addEventListener('mousedown', onDragEndCapture, true)
+    return () => {
+      host.removeEventListener('dragstart', onDragStart)
+      host.removeEventListener('dragstart', onDragStartCapture, true)
+      host.removeEventListener('dragend', onDragEndCapture, true)
+      window.removeEventListener('drop', onDragEndCapture, true)
+      window.removeEventListener('mousedown', onDragEndCapture, true)
+      clearTimeout(release)
+      rowDragRef.current = false
+    }
+  }, [dragHost, dragToComposer, model])
   // Ref'd like the two above so this callback stays identity-stable: Pierre takes
   // `renderContextMenu` as a prop, and a new function each render would remount the
   // slotted menu mid-interaction.
   const treeItemsRef = useRef(treeItems)
   treeItemsRef.current = treeItems
   const renderContextMenu = useCallback(
-    (item: FileTreeContextMenuItem, ctx: FileTreeContextMenuOpenContext) => (
-      <TreeContextMenu
-        item={item}
-        context={ctx}
-        root={rootRef.current}
-        onAddToContext={onAddToContextRef.current}
-        contribItems={treeItemsRef.current}
-        onError={setActionError}
-      />
-    ),
+    (item: FileTreeContextMenuItem, ctx: FileTreeContextMenuOpenContext) => {
+      // A state row has no path to act on: render nothing, the same way a
+      // directory with no action renders none (see the FileTree prop below).
+      // Reached from the keyboard trigger only -- the stylesheet already keeps
+      // the pointer off the row. Rendering nothing is not enough on its own:
+      // Pierre enters its menu-open state BEFORE it asks for the content, and
+      // while that state holds it swallows every key but Escape, so a null
+      // render alone would strand a Shift+F10 user behind an invisible menu.
+      // Close the request too -- deferred, because the React `<FileTree>`
+      // binding calls this renderer while rendering its own slotted children
+      // (it strips Pierre's `composition.render` and hands the result over as a
+      // child), and `close` sets state on Pierre's tree view, a different
+      // component: synchronous, that is a setState during another render.
+      if (stateRowsRef.current.has(item.path)) {
+        queueMicrotask(() => ctx.close())
+        return null
+      }
+      return (
+        <TreeContextMenu
+          item={item}
+          context={ctx}
+          root={rootRef.current}
+          onAddToContext={onAddToContextRef.current}
+          contribItems={treeItemsRef.current}
+          onError={setActionError}
+        />
+      )
+    },
     [],
   )
 
   // A failed status request is terminal for this load. Changed mode has no
   // other payload that can make the tree ready, so reuse the Git panel's
   // unavailable notice instead of leaving the loading shimmer on screen.
+  // Shown whatever the body renders -- the tree, or an empty or root state --
+  // so a retained failure is never hidden by the tree emptying under it.
+  const folderNotice = retryFolders.length > 0 || settledRefusals.length > 0 ? (
+    <div className="px-2 pt-1.5 flex flex-col gap-1" data-testid="workspace-tree-folder-listing-error">
+      {retryFolders.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <ErrorNotice
+            variant="inline"
+            className="whitespace-normal"
+            message={i18nT('components.workspaceTree.folder_listing_failed', { paths: retryFolders.join(', ') })}
+            report={reportForError(folderQueries[loadedFolders.indexOf(retryFolders[0])]?.error)}
+            askAgent
+            testId="workspace-tree-folder-listing-retry"
+          />
+          {/* The notice's own retry, so the remedy is the button beside it
+              and not a control somewhere else on the rail. */}
+          <button
+            type="button"
+            onClick={retryFailedFolders}
+            className="text-[12px] px-2.5 h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border border-border"
+          >
+            {i18nT('components.workspaceTree.folder_listing_retry')}
+          </button>
+        </div>
+      )}
+      {/* No retry can change either, so each notice is the user's to dismiss;
+          a later good load of the folder also clears it. */}
+      {([
+        [goneFolders, 'workspace-tree-folder-gone', (paths: string) => i18nT('components.workspaceTree.folder_gone', { paths })],
+        [deniedFolders, 'workspace-tree-folder-refused', (paths: string) => i18nT('components.workspaceTree.folder_refused', { paths })],
+      ] as const).map(([entries, testId, sentence]) => entries.length > 0 && (
+        <ErrorNotice
+          key={testId}
+          variant="inline"
+          className="whitespace-normal"
+          message={sentence(entries.map(entry => entry.folder).join(', '))}
+          report={reportForError(entries[0].error)}
+          askAgent
+          onDismiss={() => setRefusedFolders(prev => prev.filter(entry => !entries.includes(entry)))}
+          testId={testId}
+        />
+      ))}
+    </div>
+  ) : null
+
   if (mode === 'changed' && statusError) {
     return (
       <div className="h-full p-2">
@@ -663,6 +1492,9 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
 
   // Data still in flight: an empty tree is indistinguishable from an empty
   // workspace, so show shimmer rows until the first payload decides which.
+  // A FAILED listing never reaches this component: every host gates it on
+  // `useTreeState` (FileBrowserRail), which reads the same query and renders
+  // its own "Couldn't load the file tree" + Refresh in the tree's place.
   if (!ready) {
     return <TreeSkeleton />
   }
@@ -673,20 +1505,98 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
   // loading flag would suppress the notice while `changed` mode is already
   // decided, leaving an empty FileTree in its place.
   if (ready && paths.length === 0) {
-    const [Icon, message] =
+    // Only `all` mode reads the tree payload's root markers; `changed` mode's
+    // emptiness is the status query's.
+    const markers = mode === 'all' ? tree : undefined
+    // The server names the project root itself as `.` in `unreadableDirectories`
+    // when it could not read it: nothing beneath it is KNOWN, which is not the
+    // same as nothing being there. One level down the row sits under the folder
+    // it qualifies; here there is no folder row, so the notice names the folder
+    // itself and its cause -- "No permission to read the workspace folder", so
+    // it cannot be read as the host's own "Couldn't load the file tree" (a
+    // failed request; this listing answered). Permission is the failure a root
+    // that passed the server's directory check produces; a root removed between
+    // that check and the walk shows this for one refresh. The notice is
+    // actionable the way the host's failed-listing notice is
+    // (`FilesHomePanel`): Refresh re-asks the listing once the permissions are
+    // fixed, the hand-off carries the sentence -- path included -- to the agent.
+    if ((markers?.unreadableDirectories ?? []).includes('.')) {
+      const sentence = i18nT('components.workspaceTree.root_unreadable')
+      return (
+        <div
+          className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center"
+          data-testid="workspace-tree-root-unreadable"
+        >
+          {folderNotice}
+          <FolderLock size={20} className="opacity-50" />
+          {/* The sentence is the notice's lead and the path its message, so the
+              path is a span of its own; the break hints after each `/` make the
+              segment boundaries the line-break points (a bare path has none, and
+              would otherwise wrap mid-word), and the wrapped inline row puts the
+              hand-off AFTER sentence and path rather than between them. The
+              hand-off gets the report with the real path: the hints are display
+              only and must not reach the agent. */}
+          <ErrorNotice
+            variant="inline"
+            className="whitespace-normal flex-wrap justify-center"
+            title={sentence}
+            message={breakAtSlashes(root)}
+            messageClassName="font-mono"
+            report={rootUnreadableReport(sentence, root)}
+            askAgent
+          />
+          <button
+            type="button"
+            onClick={refetchTree}
+            className="text-[12px] px-2.5 h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border border-border"
+          >
+            {i18nT('pages.chat.filesHome.refresh')}
+          </button>
+        </div>
+      )
+    }
+    // `.` in `hiddenOnlyDirectories`: the root's top level holds only items the
+    // listing hides, so a whole-panel notice stands in for the empty-workspace
+    // one. Its own sentence, not the per-folder row's: with no folder row above
+    // it, the row's wording read as "you are inside that folder". Nothing to act
+    // on -- the items are there, this listing does not show them -- so no
+    // action row.
+    const rootHiddenOnly = (markers?.hiddenOnlyDirectories ?? []).includes('.')
+    // A truncated payload with no row at all: the server stopped reading before
+    // it reached anything it lists (a root whose first entries are all hidden
+    // folders, say). Nothing here is known to be empty, so the panel says what
+    // the payload does -- the limit was reached -- rather than "no files".
+    const rootTruncated = markers?.truncated === true
+    const [Icon, message, testId] =
       mode === 'changed'
-        ? ([FileDiff, i18nT('pages.chat.folderPanel.no_changes')] as const)
-        : ([FolderOpen, i18nT('pages.chat.activityViewer.workspace_empty')] as const)
+        ? ([FileDiff, i18nT('pages.chat.folderPanel.no_changes'), undefined] as const)
+        : rootTruncated
+          ? ([FolderOpen, i18nT('components.workspaceTree.root_truncated'), 'workspace-tree-root-truncated'] as const)
+          : rootHiddenOnly
+            ? ([FolderDot, i18nT('components.workspaceTree.root_hidden_only'), 'workspace-tree-root-hidden-only'] as const)
+            : ([FolderOpen, i18nT('pages.chat.activityViewer.workspace_empty'), undefined] as const)
     return (
-      <div className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center">
+      <div
+        className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center"
+        data-testid={testId}
+      >
+        {folderNotice}
         <Icon size={20} className="opacity-50" />
         <span className="text-[12.5px]">{message}</span>
+        {/* The next step. Both hosts (FolderPanel, FileBrowserRail) put a box
+            above this tree whose name query goes past the cap, so the line is
+            true on each; a new host without one must not mount this state. */}
+        {mode !== 'changed' && rootTruncated && (
+          <span className="text-[12px] text-balance" data-testid="workspace-tree-root-truncated-hint">
+            {i18nT('components.workspaceTree.root_truncated_search_hint')}
+          </span>
+        )}
       </div>
     )
   }
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col">
+    <div ref={setDragHost} className="flex-1 min-h-0 flex flex-col">
       {/* A contributed row's endpoint refused or never answered. askAgent on: this
           subtree holds no editable draft, only the tree's own selection. */}
       {actionError && (
@@ -701,6 +1611,79 @@ export function PierreWorkspaceTreeImpl({ projectDir, onFileOpen, onAddToContext
           />
         </div>
       )}
+      {/* Folders the server could not read (`unreadableDirectories`, minus the
+          root's own `.`, which has its whole-panel state above). The value
+          behind each is a failed `scandir` -- an error the agent can often fix
+          (permissions) -- and this notice is the one place it is reported: a
+          row inside Pierre's shadow root can hold no button, so the folder's
+          row carries only the lock marker whose label points here
+          (`renderRowDecoration`). askAgent on: the listing holds no draft. It
+          follows the payload and goes when the folders read again -- and the
+          row markers, fed by the same list, go with it. A folder that stays
+          unreadable by design would keep it red on every visit, so the notice
+          can be DISMISSED: the control remembers the folders it names for this
+          project (`./treeUnreadableDismissals`) and the notice is not rendered
+          while every folder the payload names is remembered -- the markers
+          then say the notice was dismissed -- until a folder outside that set
+          appears, or a remembered one reads again and later fails anew. The
+          notice itself is always the alert in the danger tone: an error is
+          never toned down, only shown or, at the user's word, not shown --
+          and for the undo window after that word, the spot it stood on holds
+          a one-line "Notice dismissed — Undo" status (`undoOffer`): the
+          user's action named, never the error's text, and the way back. */}
+      {showUnreadableSpot && (
+        // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- the handlers hold the Undo window open and perform no action a role could announce; the pointer pair is the hover hold, the focus pair its keyboard parity (any focus inside the spot holds the same clock), as on the session-move undo bar and the Auto-title Undo
+        <div
+          ref={undoSpotRef}
+          className="px-2 pt-1.5"
+          onMouseEnter={() => setUndoHovered(true)}
+          onMouseLeave={() => setUndoHovered(false)}
+          onFocusCapture={() => setUndoFocused(true)}
+          onBlurCapture={() => setUndoFocused(false)}
+        >
+          {unreadableDismissed ? (
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex items-center gap-2 px-1 text-[11px] text-muted"
+              data-testid="workspace-tree-unreadable-dismissed"
+            >
+              {/* Says what the ✕ did and did not do: the notice is hidden, the
+                  folders are still unreadable (how many, never which -- the
+                  count is not a toned-down copy of the error, `errors-use-
+                  error-notice`), and the notice returns when they change (UX
+                  lane on `66bdcc2bf8`: after a dismissal the reader could not
+                  tell whether the problem was fixed or hidden). */}
+              <span id={undoStatusId}>
+                {i18nT('components.workspaceTree.unreadable_dismissed', { count: unreadableFolders.length })}
+              </span>
+              {/* Face reads "Undo" and nothing else; the status text beside it is
+                  its description, so a reader landing on the button alone still
+                  hears what it undoes. */}
+              <button
+                type="button"
+                aria-describedby={undoStatusId}
+                onClick={undoDismissUnreadable}
+                className="flex items-center gap-1 cursor-pointer bg-transparent border-none p-0 text-[11px] leading-none text-accent hover:underline focus-ring"
+              >
+                <Undo2 size={12} aria-hidden />
+                {i18nT('components.workspaceTree.undo_dismiss_unreadable')}
+              </button>
+            </div>
+          ) : (
+            <ErrorNotice
+              variant="inline"
+              className="whitespace-normal"
+              message={i18nT('components.workspaceTree.unreadable_folders', { paths: unreadableFolders.join(', ') })}
+              askAgent
+              onDismiss={dismissUnreadable}
+              dismissLabel={i18nT('components.workspaceTree.dismiss_unreadable')}
+              testId="workspace-tree-unreadable-notice"
+            />
+          )}
+        </div>
+      )}
+      {folderNotice}
       {mode === 'all' && tree?.truncated && (
         <div className="px-3 py-1 text-[11px] text-muted">
           {i18nT('pages.chat.activityViewer.workspace_truncated')}

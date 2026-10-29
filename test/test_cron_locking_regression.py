@@ -279,7 +279,7 @@ class TestReadPathsLocked:
         assert all(t != loop_thread for t in sync_threads), (
             "the tick's _sync() must run in a worker thread, never on the event loop"
         )
-        assert not svc._executing and not svc._running_tasks, "premise: nothing due"
+        assert not svc._claims, "premise: nothing due"
 
         svc._running = False
         if svc._timer_task and not svc._timer_task.done():
@@ -864,7 +864,7 @@ class TestMutatorContract:
             async def ticker() -> None:
                 nonlocal ticks
                 while True:
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.02)  # flake-ok: measures free-loop time per tick to prove the loop is not parked, not a wait for a signal
                     ticks += 1
 
             tick_task = asyncio.create_task(ticker())
@@ -971,17 +971,16 @@ class TestMergeResultOffLoop:
         async def ticker() -> None:
             nonlocal ticks
             while True:
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.02)  # flake-ok: measures free-loop time per tick to prove the loop is not parked, not a wait for a signal
                 ticks += 1
 
         tick_task = asyncio.create_task(ticker())
         try:
-            svc._executing.add(job.id)
-            svc._job_run_meta[job.id] = (time.time(), "scheduled")
+            claim = svc._claim_run(job.id, "scheduled")
             # The merge will raise CronStoreBusy inside to_thread (contended);
             # _run_job_isolated swallows it (best-effort) and completes without
             # ever parking the loop.
-            await svc._run_job_isolated(job)
+            await svc._run_job_isolated(job, claim)
             # Sampled before the ticker is stopped: counting ticks that ran after
             # the merge returned would hold even for a merge that parked the loop.
             ticks_during_merge = ticks
@@ -1007,9 +1006,8 @@ class TestMergeResultOffLoop:
 
         svc._on_job = on_job
         job = svc.add_job(name="j", message="m", every_secs=60)
-        svc._executing.add(job.id)
-        svc._job_run_meta[job.id] = (time.time(), "scheduled")
-        await svc._run_job_isolated(job)
+        claim = svc._claim_run(job.id, "scheduled")
+        await svc._run_job_isolated(job, claim)
 
         # A fresh service reading the same store sees the persisted last_run_ts.
         reloaded = CronService(base_dir=tmp_path)
@@ -1070,11 +1068,10 @@ class TestDeferredRemoval:
             assert not svc._pending_removals
             assert CronService(base_dir=tmp_path).get_job(job.id) is None
             # Never re-fired: no run task spawned, nothing marked executing.
-            assert job.id not in svc._executing
-            assert job.id not in svc._running_tasks
+            assert job.id not in svc._claims
         finally:
             svc._running = False
-            for t in list(svc._running_tasks.values()):
+            for t in [c.task for c in svc._claims.values() if c.task is not None]:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
@@ -1099,10 +1096,10 @@ class TestDeferredRemoval:
         try:
             await svc._on_timer()
             assert svc.get_job(job.id) is None
-            assert job.id not in svc._executing
+            assert job.id not in svc._claims
         finally:
             svc._running = False
-            for t in list(svc._running_tasks.values()):
+            for t in [c.task for c in svc._claims.values() if c.task is not None]:
                 t.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await t
@@ -1197,9 +1194,8 @@ class TestTerminalStateMergeLocked:
         assert {j.id for j in svc._jobs} == {running.id}, "premise: snapshot is stale"
 
         # Reap the running job.
-        svc._executing.add(running.id)
-        svc._job_run_meta[running.id] = (time.time(), "scheduled")
-        await svc._force_reap(running.id, 5.0, 1)
+        claim = svc._claim_run(running.id, "scheduled")
+        await svc._force_reap(running.id, 5.0, 1, claim=claim)
 
         # A fresh reader must see BOTH jobs; the reap recorded its error state.
         reloaded = CronService(base_dir=tmp_path)
@@ -1223,8 +1219,7 @@ class TestTerminalStateMergeLocked:
             added = other.add_job(name="added-by-worker", message="m", every_secs=60)
             assert {j.id for j in svc._jobs} == {running.id}
 
-            svc._executing.add(running.id)
-            svc._job_run_meta[running.id] = (time.time(), "scheduled")
+            svc._claim_run(running.id, "scheduled")
             ok = await svc.cancel(running.id)
             assert ok is True
 
@@ -1235,6 +1230,42 @@ class TestTerminalStateMergeLocked:
         cancelled = reloaded.get_job(running.id)
         assert cancelled is not None and cancelled.last_status == "error"
         assert cancelled.last_error and "Cancelled" in cancelled.last_error
+
+    @pytest.mark.asyncio
+    async def test_cancel_clears_a_command_jobs_previous_result(self, tmp_path: Path) -> None:
+        """A cancelled command run that produced nothing must not persist the last
+        run's output beside its error, even when that run left its produced marker
+        set. Output a started run did produce is kept, and an agent job keeps its
+        result as dedup context.
+        """
+        with patch("kiro_crew.cron.cron_script.kill_running_process", return_value=False):
+            svc = CronService(base_dir=tmp_path)
+            cmd = svc.add_job(name="cmd-job", message="", command="echo hi", every_secs=60)
+            produced = svc.add_job(name="produced", message="", command="echo hi", every_secs=60)
+            agent = svc.add_job(name="agent-job", message="m", every_secs=60)
+            for job in (cmd, produced, agent):
+                job.last_status = "ok"
+                job.last_result = "previous run output"
+            svc._save()
+            cmd.result_produced = True  # left over from the previous run
+            produced.set_run_result("this run output")
+
+            for job in (cmd, produced, agent):
+                claim = svc._claim_run(job.id, "scheduled")
+                if job is produced:
+                    claim.started_monotonic = time.monotonic()
+                assert await svc.cancel(job.id) is True
+
+        reloaded = CronService(base_dir=tmp_path)
+        cancelled_cmd = reloaded.get_job(cmd.id)
+        assert cancelled_cmd is not None and cancelled_cmd.last_status == "error"
+        assert cancelled_cmd.last_result == ""
+        cancelled_produced = reloaded.get_job(produced.id)
+        assert cancelled_produced is not None
+        assert cancelled_produced.last_result == "this run output"
+        cancelled_agent = reloaded.get_job(agent.id)
+        assert cancelled_agent is not None
+        assert cancelled_agent.last_result == "previous run output"
 
     @pytest.mark.asyncio
     async def test_terminal_merge_is_offloaded_and_keeps_loop_ticking(
@@ -1274,16 +1305,15 @@ class TestTerminalStateMergeLocked:
         async def ticker() -> None:
             nonlocal ticks
             while True:
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.02)  # flake-ok: measures free-loop time per tick to prove the loop is not parked, not a wait for a signal
                 ticks += 1
 
         tick_task = asyncio.create_task(ticker())
         try:
-            svc._executing.add(job.id)
-            svc._job_run_meta[job.id] = (time.time(), "scheduled")
+            claim = svc._claim_run(job.id, "scheduled")
             # The merge raises CronStoreBusy inside to_thread (store contended);
             # _force_reap swallows it (best-effort) and never parks the loop.
-            await svc._force_reap(job.id, 5.0, 1)
+            await svc._force_reap(job.id, 5.0, 1, claim=claim)
             # Sampled before the ticker is stopped: counting ticks that ran after
             # the reap returned would hold even for a reap that parked the loop.
             ticks_during_merge = ticks

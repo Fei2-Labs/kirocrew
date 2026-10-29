@@ -36,7 +36,7 @@ def store(tmp_path, monkeypatch):
         d.mkdir(parents=True, exist_ok=True)
         shard = d / "shard.jsonl"
         shard.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days: [shard])
+        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days, until=None: [shard])
         # The 30s memo would otherwise serve a previous test's answer.
         monkeypatch.setattr(usage_mod, "_COST_CACHE", None)
         monkeypatch.setattr(usage_mod, "_COST_CACHE_KEY", None)
@@ -343,11 +343,13 @@ class TestNonFiniteCredits:
 
     def test_a_clean_record_is_written_quietly(self, tmp_path, monkeypatch, caplog):
         # The warning has to mean something when it appears, so the ordinary
-        # path must not emit one.
+        # path must not emit one. Ordinary means attributed: a billed row with
+        # no model is its own failure and is reported by the write site.
         monkeypatch.setattr(usage_mod, "_token_usage_dir", lambda: tmp_path)
         with caplog.at_level(logging.WARNING, logger=usage_mod.__name__):
             usage_mod._write_token_record(
-                {"_type": "tokens", "credits": 12.5}, datetime.now(timezone.utc)
+                {"_type": "tokens", "model": "claude-opus-5", "credits": 12.5},
+                datetime.now(timezone.utc),
             )
         assert caplog.records == []
 
@@ -385,7 +387,7 @@ class TestDegenerateInputs:
             + json.dumps(_row(slot="chat-1-1", credits=2.0)) + "\n",
             encoding="utf-8",
         )
-        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days: [shard])
+        monkeypatch.setattr(usage_mod, "_shards_in_window", lambda days, until=None: [shard])
         monkeypatch.setattr(usage_mod, "_COST_CACHE", None)
         monkeypatch.setattr(usage_mod, "_COST_CACHE_KEY", None)
         assert usage_mod.cost_breakdown(7)["credits"] == 2.0

@@ -8,8 +8,9 @@ already owns them for the ``crew`` and ``session`` kinds::
 
 A member's log is a third KIND there rather than a second mechanism beside it.
 That is the whole point of this file being thin: the ``crew-log`` root is masked
-from the sandbox and fenced against the agent file tools (``security/paths.py``,
-``sandbox.py``), named at the root so every kind inherits it. A per-member log
+from the sandbox and fenced against the agent file tools (``security/paths_lists.py``,
+``sandbox_leaves.py``, ``sandbox_precreate.py``), named at the root so every kind
+inherits it. A per-member log
 stored anywhere else would need its own fence entry, and the next log added would
 miss it the same way -- an append-only record the agent can rewrite is not an
 append-only record, and that property has to hold by WHERE THE FILE LIVES rather
@@ -31,8 +32,14 @@ import time
 from collections import deque
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from kiro_crew.crew_log.checkpoint import (
+    PrefixWitness,
+    prefix_admit,
+    prefix_unchanged,
+    prefix_witness,
+)
 from kiro_crew.crew_log.errors import (
     CODE_ALREADY_EXISTS,
     CODE_ALREADY_OWNED,
@@ -47,6 +54,9 @@ from kiro_crew.eventlog.types import (
     is_contributed_event_type,
     is_known_event_type,
 )
+
+if TYPE_CHECKING:
+    from kiro_crew.projection import Admit
 
 #: The fixed emitter for every built-in event. These facts are observed BY the
 #: gateway about the member, never written by the member itself, which is why the
@@ -177,6 +187,26 @@ class MemberLog:
     def load(self) -> None:
         self._loaded = False
         self._ensure_loaded()
+
+    def close(self) -> None:
+        """Release the write ownership this instance's handle holds, NOW.
+
+        A ``MemberLog`` caches its :class:`CrewLog` in :attr:`_crew_log`, and that
+        handle owns the member's write lease from its first append until it is
+        dropped -- which, for an instance reachable only through a reference cycle,
+        waits for the cyclic collector rather than happening at refcount zero. This
+        makes the release deterministic for a caller retiring the instance (the
+        event-log service dropping a cached log, a test boundary), so the descriptor
+        does not linger under a directory being torn down. Harmless on a handle that
+        never wrote (no lease was taken) and idempotent. The instance is left
+        unloaded so a later read re-opens rather than serving a released handle.
+        """
+        handle = self._crew_log
+        if handle is not None:
+            handle.release_ownership()
+        self._crew_log = None
+        self._loaded = False
+        self._loaded_stat = None
 
     def _stat(self) -> tuple[int, int] | None:
         """``(size, mtime_ns)`` of the log file, or None when it is absent."""
@@ -309,8 +339,46 @@ class MemberLog:
         self._ensure_loaded()
         return event
 
+    def append_if(
+        self, type: str, data: dict, *, max_tail_seq: int, deadline: float | None = None
+    ) -> Event | None:
+        """:meth:`append`, written only while the file's tail is still *max_tail_seq*.
+
+        The tail is read while this process owns the log and holds the per-append
+        lock, so the comparison is made against the state the event will actually
+        land on rather than a state that was current when the caller decided.
+        ``None`` means it declined and nothing was written.
+
+        The reload still happens on a decline, because a decline means the tail is
+        newer than the cached list -- another writer got there first, which is
+        exactly the case a decline reports.
+
+        *deadline* is a ``time.monotonic()`` instant shared with the caller's other
+        attempts. A caller that retries a declined append must pass it, or each
+        attempt starts its own contention budget and the total wait multiplies by the
+        number of attempts -- while any lock the caller holds across them is held for
+        all of it. Omitted, this append takes a budget of its own, which is right for
+        a caller that makes exactly one.
+        """
+        if not is_known_event_type(type):
+            raise ValueError(f"unknown event type {type!r}")
+        self._ensure_loaded()
+        if self._crew_log is None:
+            raise LogCorrupt(self.path, 0, "cannot append to a log with no header")
+        stored = _stored_type(type)
+        entry = self._append_through_contention(stored, data, max_tail_seq, deadline)
+        self._loaded = False
+        self._ensure_loaded()
+        return None if entry is None else _as_event(entry)
+
     # ---- read -------------------------------------------------------------
-    def _append_through_contention(self, stored: str, data: dict):
+    def _append_through_contention(
+        self,
+        stored: str,
+        data: dict,
+        max_tail_seq: int | None = None,
+        deadline: float | None = None,
+    ):
         """Append, waiting out a CONTENTION refusal instead of losing the event.
 
         ``crew_log.lease`` takes write ownership non-blocking, so two processes
@@ -339,11 +407,15 @@ class MemberLog:
         reporting in place rather than swallowing the loss quietly.
         """
         assert self._crew_log is not None
-        deadline = time.monotonic() + APPEND_CONTENTION_SECONDS
+        deadline = time.monotonic() + APPEND_CONTENTION_SECONDS if deadline is None else deadline
         delay = APPEND_CONTENTION_FIRST_DELAY
         while True:
             try:
-                return self._crew_log.append(stored, data, src=_src_for(stored))
+                if max_tail_seq is None:
+                    return self._crew_log.append(stored, data, src=_src_for(stored))
+                return self._crew_log.append_if(
+                    stored, data, src=_src_for(stored), max_tail_seq=max_tail_seq
+                )
             except CrewLogError as exc:
                 code = getattr(exc, "code", "")
                 # A refused PAYLOAD keeps this surface's ValueError, the same type
@@ -471,3 +543,67 @@ class MemberLog:
         if not firsts:
             return None
         return {"origin": origin, "first_seq": firsts[0]}
+
+    def checkpoint_admit(self, first_seq: int) -> Admit | None:
+        """The live-log condition a savepoint of this log must satisfy, or None.
+
+        :meth:`checkpoint_identity` covers what is fixed once the fold is done, and
+        equality is all it can do. This covers the one fact equality cannot hold: the
+        bytes a savepoint's state was folded from are still the bytes in the file.
+        :meth:`last_seq` records why this log needs it -- a damaged committed line is
+        skipped on load, so a reader loses that line and not the file. A cold fold
+        then omits what that line contributed while a savepoint written before the
+        damage keeps it, and because a resumed fold never revisits the region below
+        its watermark, the two reads disagree for the life of the member rather than
+        for one load. A savepoint may LAG; it may not hold a value no later read
+        reproduces.
+
+        The predicate is the crew log's own, not a second copy: it reads the digest
+        helpers that live on ``CrewLog`` precisely so one mechanism serves both
+        clients, and two spellings of this question would drift.
+
+        *first_seq* is the value :meth:`checkpoint_identity` reported, which bounds how
+        few raw records a prefix can hold.
+
+        ``None`` means "do not take the shortcut", the same answer and for the same
+        reason as an absent identity.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return None
+        return prefix_admit(handle, first_seq)
+
+    def checkpoint_witness(self, seq: int) -> PrefixWitness | None:
+        """The digest of this log's raw records through *seq*, or None.
+
+        Read this BEFORE the fold that consumes the file, and confirm it with
+        :meth:`checkpoint_prefix_unchanged` after the pass. A digest read only
+        afterwards can certify bytes the pass never saw: a consumed record that
+        changed in between is hashed together with state folded from its earlier
+        value, and every later resume recomputes the digest from those same changed
+        bytes, so the comparison passes and the state is served for the life of the
+        member while disagreeing with a cold fold.
+
+        ``None`` when *seq* is not a boundary this file resolves, which costs a
+        savepoint rather than recording one nothing can check.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return None
+        return prefix_witness(handle, seq)
+
+    def checkpoint_prefix_unchanged(self, witness: PrefixWitness) -> bool:
+        """Whether the records *witness* covers still hash to what it recorded.
+
+        Decode-free, and growth above the boundary is not a change: the walk stops at
+        the record count the witness names. This is what a stat cannot answer -- a
+        size and an mtime say the file moved, never whether the bytes already
+        consumed are the same bytes.
+        """
+        self._ensure_loaded()
+        handle = self._crew_log
+        if handle is None:
+            return False
+        return prefix_unchanged(handle, witness)

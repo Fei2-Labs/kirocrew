@@ -5,6 +5,12 @@ import jsxA11y from 'eslint-plugin-jsx-a11y'
 import approvalOneShotDecision from './eslint-rules/approval-one-shot-decision.js'
 import { plugin as shadcn } from '@shadcn/lint'
 
+const HLJS_IMPORT_RULE = {
+  name: 'highlight.js',
+  message: "Import the core build instead: `import hljs from '<relative>/utils/hljs'`. The full barrel pulls every bundled grammar into the eager bundle.",
+  allowTypeImports: true,
+}
+
 export default [
   {
     ignores: ['src/vite-env.d.ts'],
@@ -59,10 +65,14 @@ export default [
       // go through it. Type-only imports are exempt: they erase at compile time and
       // carry no runtime weight (`utils/hljsLanguages.ts` needs `HLJSApi`).
       '@typescript-eslint/no-restricted-imports': ['error', {
-        paths: [{
-          name: 'highlight.js',
-          message: "Import the core build instead: `import hljs from '<relative>/utils/hljs'`. The full barrel pulls every bundled grammar into the eager bundle.",
-          allowTypeImports: true,
+        paths: [HLJS_IMPORT_RULE],
+        // Radix primitives portal to document.body unless told otherwise; the
+        // shared wrappers in components/ui/ route them through the owning
+        // pane's overlay root and close them on a Crew switch
+        // (src/components/overlayRoot.tsx). Import the wrapper, not the primitive.
+        patterns: [{
+          group: ['@radix-ui/react-*'],
+          message: 'Use the shared wrapper in src/components/ui/: it portals into the owning pane\'s overlay root and closes on a Crew switch (src/components/overlayRoot.tsx).',
         }],
       }],
       'no-console': 'warn',
@@ -73,6 +83,32 @@ export default [
       // 'warn' riding the ratchet. The one deliberate eval lives in the .mjs
       // generator block below, guarded by its own reviewed directive.
       'no-eval': 'error',
+      // A browser-native confirm()/alert()/prompt() opens an OS-drawn dialog
+      // that ignores every theme token and blocks the whole renderer thread.
+      // The dashboard owns these decisions in-app: destructive choices go
+      // through useConfirm() / ConfirmDialog, errors and acknowledgements
+      // through the in-app notice and status surfaces. The window-qualified
+      // forms (`window.confirm`) reach the same globals, so no-restricted-
+      // properties pairs with no-restricted-globals to cover both spellings.
+      //
+      // 'error', not 'warn': like the native-<select> gate above this is a gate
+      // on a set that only shrinks, so it stays out of the --max-warnings budget
+      // where a real regression would be indistinguishable from unrelated noise.
+      // The 35 modules that still call these globals are exempted by name in the
+      // allowlist block below (see issue #15662); every other renderer file is
+      // refused a new call. Electron main-process dialogs live outside src/ and
+      // are untouched. Tests drive these globals through the harness and are
+      // exempted alongside the native-<select> rule in the test blocks below.
+      'no-restricted-globals': ['error',
+        { name: 'confirm', message: 'No browser-native confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
+        { name: 'alert', message: 'No browser-native alert() — route through the in-app notice or status surface. See issue #15662.' },
+        { name: 'prompt', message: 'No browser-native prompt() — use the native text-entry dialog. See issue #15662.' },
+      ],
+      'no-restricted-properties': ['error',
+        { object: 'window', property: 'confirm', message: 'No window.confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
+        { object: 'window', property: 'alert', message: 'No window.alert() — route through the in-app notice or status surface. See issue #15662.' },
+        { object: 'window', property: 'prompt', message: 'No window.prompt() — use the native text-entry dialog. See issue #15662.' },
+      ],
       // A native <select> renders an OS-drawn popup: it ignores every theme
       // token, cannot be styled per row, and looks nothing like the rest of the
       // dashboard. Every dropdown goes through the shared Radix components —
@@ -83,10 +119,67 @@ export default [
       // hard-zero gate rather than a stored count, and it stays out of the
       // --max-warnings budget where a real regression would be indistinguishable
       // from an unrelated no-explicit-any.
+      //
+      // A floating layer portalled straight to `document.body` escapes the local
+      // pane a remote Crew hides, so it stays painted over the other Crew.
+      // OverlayPortal / useOverlayRoot resolve the owning pane's overlay root
+      // instead (see src/components/overlayRoot.tsx).
       'no-restricted-syntax': ['error', {
         selector: "JSXOpeningElement[name.name='select']",
         message: 'No native <select> — its popup is drawn by the OS and ignores the theme. Use SimpleSelect, SearchableSelect, SettingsSelect, or DropdownMenu. See website/docs/page-layout.md.',
+      }, {
+        selector: "CallExpression[callee.name='createPortal'][arguments.1.object.name='document'][arguments.1.property.name='body']",
+        message: 'Portal through <OverlayPortal> or useOverlayRoot() (src/components/overlayRoot.tsx), not document.body: a layer on document.body stays on screen over a remote Crew.',
       }],
+    },
+  },
+  {
+    // Allowlist for no-restricted-globals / no-restricted-properties: the
+    // renderer modules that still call a browser-native confirm/alert/prompt
+    // today (issue #15662). The gate above is 'error' for every OTHER renderer
+    // file, so a NEW native dialog anywhere else is refused; these 35 are the
+    // standing inventory, migrated to useConfirm() / in-app surfaces in later
+    // PRs. This list only SHRINKS: delete a path the moment its last native
+    // dialog is gone, never add one. Keep it sorted.
+    files: [
+      'src/apps/auto-improvement/AutoImprovementPage.tsx',
+      'src/apps/auto-research/ResearchLabPage.tsx',
+      'src/apps/crew-companion/GalleryPanel.tsx',
+      'src/apps/design-tweak/DesignTweakPage.tsx',
+      'src/apps/meetings/MeetingView.tsx',
+      'src/apps/meetings/MeetingsPage.tsx',
+      'src/apps/mochi/src/renderer/GalleryPanel.tsx',
+      'src/apps/papyrus/PapyrusPage.tsx',
+      'src/apps/papyrus/ProjectList.tsx',
+      'src/components/RestartButton.tsx',
+      'src/components/TagManagerList.tsx',
+      'src/components/WebAppArtifactCard.tsx',
+      'src/components/themeEditor.tsx',
+      'src/hooks/useKeyboardShortcuts.ts',
+      'src/hooks/useSessionActions.ts',
+      'src/pages/ArtifactDetailPage.tsx',
+      'src/pages/ArtifactsPage.tsx',
+      'src/pages/ChannelPage.tsx',
+      'src/pages/ChatSidebar.tsx',
+      'src/pages/ProjectsPage.tsx',
+      'src/pages/knowledge/DetailView.tsx',
+      'src/pages/knowledge/SourcesList.tsx',
+      'src/pages/knowledge/index.tsx',
+      'src/pages/members/MembersPage.tsx',
+      'src/pages/members/NewCrewmateDialog.tsx',
+      'src/pages/overview/AgentCfgTab.tsx',
+      'src/pages/overview/AgentTemplatesTab.tsx',
+      'src/pages/overview/KiroCrewCfgTab.tsx',
+      'src/pages/overview/MemoryTab.tsx',
+      'src/pages/overview/PortabilityTab.tsx',
+      'src/pages/overview/PromptsTab.tsx',
+      'src/pages/overview/SkillsTab.tsx',
+      'src/pages/overview/SteeringTab.tsx',
+      'src/utils/popoutController.ts',
+    ],
+    rules: {
+      'no-restricted-globals': 'off',
+      'no-restricted-properties': 'off',
     },
   },
   {
@@ -145,14 +238,25 @@ export default [
     },
   },
   {
+    // The shared Radix wrappers are the one place a primitive is imported, and
+    // tests may mock a primitive directly (src/test/__mocks__/@radix-ui).
+    files: ['src/components/ui/**/*.{ts,tsx}', 'src/**/*.test.{ts,tsx}', 'src/test/**/*.{ts,tsx}'],
+    rules: {
+      '@typescript-eslint/no-restricted-imports': ['error', { paths: [HLJS_IMPORT_RULE] }],
+    },
+  },
+  {
     // Test doubles are exempt: a `vi.mock` that swaps a portalled Radix dropdown
     // for a plain <select> is the ESTABLISHED way to make one driveable in jsdom
     // (Radix commits discrete events through flushSync, which throws inside
     // Testing Library's act() — see src/test/CrewEditorSelect.test.tsx). Nothing
-    // here renders to a user.
+    // here renders to a user. The native-dialog gate is off here for the same
+    // reason: a test that stubs window.confirm to drive a flow is harness code.
     files: ['src/**/*.test.{ts,tsx}', 'src/test/**/*.{ts,tsx}'],
     rules: {
       'no-restricted-syntax': 'off',
+      'no-restricted-globals': 'off',
+      'no-restricted-properties': 'off',
     },
   },
   {
@@ -211,7 +315,21 @@ export default [
           // hooks/useMessageSearch.ts locate these elements by class.
           'message-bubble', 'input-area', 'chat-container', 'session-agent-label', 'primary',
           'pierre-editor-fallback',
-          'mc-message-font-scope', // styles/message-font-size.css (imported in main.tsx, outside index.css's @source graph)
+          // styles/message-font-size.css (imported in main.tsx, outside index.css's
+          // @source graph): the bubble scope, the chip/text size classes, and the
+          // marker MarkdownRenderer's link chips carry.
+          'mc-message-font-*', 'mc-md-ref-chip',
+          // styles/crew-notes.css (imported in main.tsx, outside index.css's
+          // @source graph): the crewmate Notes-panel readability scope.
+          'crew-notes',
+          // components/crew/layout/layoutEditor.css (imported by LayoutEditor.tsx,
+          // outside index.css's @source graph): the layout editor's Neo-Frame
+          // "Bench" build-mode classes and their drag/drop/target state hooks,
+          // all le-prefixed so no generic state name is exempted repo-wide.
+          'le-*',
+          // pages/chat/pinnedViews.css (imported by usePinnedViews.ts, outside
+          // index.css's @source graph): the side panel strip's Pin Summary scope.
+          'side-panel-strip-summary-pinned',
         ],
       }],
       'shadcn/require-static-classes': 'error',

@@ -29,6 +29,7 @@ const setup = (onAdd: (t: string, f: string, e?: number) => Promise<boolean>) =>
       onAdd={onAdd}
       onSkip={vi.fn()}
       onRemove={vi.fn()}
+      onEdit={vi.fn()}
     />,
   )
   // The add box is the only textbox in this section.

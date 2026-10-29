@@ -14,6 +14,7 @@ from chat_test_helpers import _make_app, _make_state
 from kiro_crew.dashboard import revocation_gen, token_auth, ws_event_scope
 from kiro_crew.dashboard.handlers import updates
 from kiro_crew.dashboard.state import SlotOrigin
+from kiro_crew.testing.wait import finished
 
 _SLOT = "echo-scope-slot"
 _APP = "echo-scope-observer"
@@ -117,8 +118,8 @@ async def test_user_echo_reaches_only_authorized_ws_clients(
         )
         # The upgrade precedes asynchronous warm-up and scope loading. The
         # initial slots frames prove both connections are registered for echoes.
-        initial_ws = await asyncio.wait_for(
-            asyncio.gather(owner.receive_json(), observer.receive_json()), timeout=5
+        initial_ws = await finished(
+            asyncio.gather(owner.receive_json(), observer.receive_json()), "initial_ws", timeout=5
         )
         assert all(frame["type"] == "slots" for frame in initial_ws)
         stream = await client.get(
@@ -127,7 +128,7 @@ async def test_user_echo_reaches_only_authorized_ws_clients(
         assert stream.status == 200
         # The first status frame proves registration before the send; an open
         # response alone only proves prepare() ran, which precedes register_sse().
-        initial = await asyncio.wait_for(stream.content.readuntil(b"\n\n"), timeout=5)
+        initial = await finished(stream.content.readuntil(b"\n\n"), "readuntil", timeout=5)
         assert initial.startswith(b"event: dashboard")
         response = await client.post(
             "/api/chat?ws=1",
@@ -140,10 +141,11 @@ async def test_user_echo_reaches_only_authorized_ws_clients(
         # An allowed event on both transports is a FIFO fence. Negative checks
         # inspect everything before it, rather than hoping an echo arrives in N ms.
         echo_state._broadcast({"_type": "refresh", "kinds": _FENCE})
-        owner_frames, app_frames, sse_frames = await asyncio.wait_for(
+        owner_frames, app_frames, sse_frames = await finished(
             asyncio.gather(
                 _ws_until_fence(owner), _ws_until_fence(observer), _sse_until_fence(stream)
             ),
+            "gather frames",
             timeout=5,
         )
         stream.close()
@@ -176,8 +178,7 @@ async def test_user_echo_reaches_only_authorized_ws_clients(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("relay", [False, True])
-async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monkeypatch, relay):
+async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monkeypatch):
     published = []
     original_broadcast = echo_state.broadcast_ws
 
@@ -190,12 +191,12 @@ async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monke
     app.middlewares.insert(0, token_auth.token_auth_middleware())
     async with TestClient(TestServer(app)) as client:
         response = await client.post(
-            "/api/chat?relay=1" if relay else "/api/chat",
+            "/api/chat",
             params={"token": token_auth.generate_token("local-app")},
             json={"slot": _SLOT, "message": "in-band message", "meta": {"sendId": "s-in-band"}},
         )
         assert response.status == 200
-        body = await asyncio.wait_for(response.text(), timeout=5)
+        body = await finished(response.text(), "response.text", timeout=5)
         rows = [
             json.loads(line[6:])
             for line in body.splitlines()
@@ -203,10 +204,7 @@ async def test_in_band_send_keeps_its_existing_stream_contract(echo_state, monke
         ]
         assert [row["type"] for row in rows] == ["assistant"]
         assert rows[0]["content"] == "reply"
-        if relay:
-            assert rows[0]["meta"]["mid"]
-        else:
-            assert "meta" not in rows[0]
+        assert "meta" not in rows[0]
         users = [row for row in echo_state.get_slot(_SLOT).messages if row["role"] == "user"]
         assert len(users) == 1
         assert users[0]["content"] == "in-band message"

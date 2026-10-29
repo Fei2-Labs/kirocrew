@@ -174,6 +174,25 @@ const SCENES = [
     },
   },
   {
+    name: 'root-only-label',
+    query: 'scan=ok-newroot',
+    drive: async (page) => {
+      await scan(page)
+      await page.getByTestId('preview-group').waitFor()
+      // Untick everything on a root that has no folder yet: the click would
+      // create the root folder and nothing else, so the action must say that
+      // instead of promising folders plural.
+      await page.getByTestId('nested-toggle').click()
+      await page.getByTestId('nested-list').waitFor()
+      await page.getByTestId('nested-suggestions').getByRole('button', { name: 'Select none inside' }).click()
+      await page.getByTestId('preview-group').getByRole('button', { name: 'Select none' }).click()
+      const btn = page.getByRole('button', { name: 'Create the root folder only' })
+      await btn.waitFor()
+      const count = (await page.getByTestId('selected-count').textContent()) ?? ''
+      return count.includes('0 selected') && (await btn.isEnabled())
+    },
+  },
+  {
     name: 'scanning',
     query: 'scan=ok-then-slow',
     drive: async (page) => {

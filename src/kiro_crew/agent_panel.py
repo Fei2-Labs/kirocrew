@@ -62,6 +62,22 @@ writes it, and the drawer reaches it through a cookie-authed route that checks t
 record's stored owner. See :func:`_real_dir_under_data_home` for the invariant all
 of that rests on -- one name, one inode, every disposition attached to it.
 
+What a template carries
+-----------------------
+A template is an HTML body fragment. It must carry :data:`DATA_MARKER`
+(``<!--kirocrew:panel-data-->``), which :func:`compose` replaces with the inert
+JSON data island (``<script type="application/json" id="kirocrew-panel-data">``);
+the template reads it with ``JSON.parse`` and renders through DOM text APIs.
+
+It MAY also carry ``<!--kirocrew:docked-->`` or ``<!--kirocrew:docked height=N-->``
+(:data:`DOCKED_MARKER_RE`) to be shown IN the Members drawer's docked card rather
+than only after Expand. The drawer then mints a second copy of the document with
+``<meta name="kirocrew-view" content="docked">`` prepended, renders it in the same
+``allow-scripts`` sandbox at a fixed height of N px (clamped to
+:data:`DOCKED_HEIGHT_RANGE`, default :data:`DOCKED_DEFAULT_HEIGHT`), and the
+template uses that meta to switch to a compact layout. A template without the
+marker keeps the native docked summary, which mints nothing until Expand.
+
 Deliberately generic
 --------------------
 Nothing here knows what a "worker" or a "pull request" is. The store holds an
@@ -73,6 +89,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -83,12 +100,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from kiro_crew import platform_compat
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew import conductor_board_contract, pipeline_board_contract, platform_compat
+from kiro_crew.atomic_write import atomic_write, read_json_or
 from kiro_crew.config.paths import data_home
 from kiro_crew.platform_compat import release_lock, try_acquire_lock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import sanitize_string
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
@@ -116,6 +135,25 @@ DEFAULT_TEMPLATE_ID = "default"
 DATA_MARKER = "<!--kirocrew:panel-data-->"
 
 _DATA_ELEMENT_ID = "kirocrew-panel-data"
+
+#: The opt-in a template carries to be shown IN the docked drawer card, not only
+#: after Expand. Written ``<!--kirocrew:docked-->`` or
+#: ``<!--kirocrew:docked height=180-->``; the height is the fixed pixel height of
+#: the compact frame and is clamped to :data:`DOCKED_HEIGHT_RANGE`.
+#:
+#: Read from the COMPOSED document rather than the template file, so the answer
+#: comes from the same snapshot as the document it describes. That is safe
+#: because a crew cannot write this comment: the only crew-supplied bytes in the
+#: document are the data island, and :func:`escape_json_for_html` turns every
+#: ``<`` in it into ``\u003c``.
+DOCKED_MARKER_RE = re.compile(r"<!--kirocrew:docked(?:\s+height=(\d{1,4}))?\s*-->")
+
+#: Bounds for a docked frame's height. The floor keeps a frame from collapsing to
+#: an invisible strip; the ceiling keeps a template from turning the drawer card
+#: into a second dashboard, which is what Expand is for.
+DOCKED_HEIGHT_RANGE = (64, 320)
+
+DOCKED_DEFAULT_HEIGHT = 160
 
 _MAX_TITLE = 200
 #: Data, not layout. A panel carries a few dozen rows of state, so this is two
@@ -557,7 +595,7 @@ def _locked(lock_path: Path) -> Iterator[None]:
     behind every other crew's.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    fd = platform_compat.open_create_or_existing(lock_path, os.O_RDWR, 0o600)
     try:
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECS
         while not try_acquire_lock(fd, exclusive=True):
@@ -763,6 +801,32 @@ def publish(
     if not isinstance(data, dict):
         raise PanelError("data_not_object", "panel data must be a JSON object")
     _check_depth(data, _MAX_DATA_DEPTH)
+    # A CONTRACT template validates its payload; every other template keeps the free
+    # shape. Only one template's fields are declared, so only that one can be checked
+    # -- and binding the generic template to a contract would deny every other crew
+    # its own vocabulary, which is the same mistake as having no vocabulary at all,
+    # pointed the other way.
+    #
+    # Refused at PUBLISH, where the caller is still present to fix the call. The
+    # reader cannot refuse anything useful: by then the payload is on disk, the author
+    # is gone, and the only remaining choices are to render a wrong panel or a blank
+    # one.
+    if template == pipeline_board_contract.BOARD_TEMPLATE_ID:
+        try:
+            pipeline_board_contract.validate_judgment(data)
+        except pipeline_board_contract.JudgmentError as exc:
+            raise PanelError("judgment_rejected", f"panel data rejected -- {exc}") from exc
+    # The conductor board reads a fixed set of fields. Data naming none of them would
+    # be stored and render an empty board while the tool said "Published", so it is
+    # refused here, with the fields the board reads.
+    if template == conductor_board_contract.BOARD_TEMPLATE_ID:
+        board_keys = tuple(conductor_board_contract.ConductorBoardPanel.__annotations__)
+        if not any(key in board_keys for key in data):
+            raise PanelError(
+                "no_known_keys",
+                f"template {template!r} reads none of the published fields, so the panel "
+                f"would render empty; it reads: {', '.join(board_keys)}",
+            )
     data_json = _validate_data(_scrub_published(data))
     template_html = resolve_template(template)
     # Composed eagerly and thrown away: this is the validation that the pair
@@ -871,15 +935,32 @@ def read(slug: str) -> dict[str, Any] | None:
         path = panel_path(slug)
         if path.stat().st_size > _MAX_RECORD_BYTES:
             return None
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    # ``MemberSlugError`` is a ``ValueError``, so a bad slug is caught here too.
+    # ``MemberSlugError`` is a ``ValueError``, so a bad slug is caught here too;
+    # a stat that fails (absent file) reads as "no panel published".
     except (OSError, ValueError):
         return None
+    raw = read_json_or(path, None, logger=logger, what="crew panel record")
     if not isinstance(raw, dict) or not isinstance(raw.get("data"), dict):
         return None
     if not TEMPLATE_ID_RE.match(str(raw.get("template", ""))):
         return None
     return raw
+
+
+def docked_height(document: str | None) -> int | None:
+    """The docked frame height a composed document opts in to, or ``None``.
+
+    ``None`` means the template did not opt in, and the drawer keeps its native
+    docked summary with no frame and no mint. See :data:`DOCKED_MARKER_RE`.
+    """
+    if not document:
+        return None
+    match = DOCKED_MARKER_RE.search(document)
+    if match is None:
+        return None
+    low, high = DOCKED_HEIGHT_RANGE
+    height = int(match.group(1)) if match.group(1) else DOCKED_DEFAULT_HEIGHT
+    return max(low, min(high, height))
 
 
 def render_record(record: dict[str, Any] | None) -> str | None:
@@ -898,5 +979,13 @@ def render_record(record: dict[str, Any] | None) -> str | None:
     if record is None:
         return None
     template_html = resolve_template(str(record["template"]))
-    data_json = json.dumps(record["data"], ensure_ascii=False, allow_nan=False)
+    # ``board`` when a provider derived one, else ``data`` as published. The two keys
+    # serve the two surfaces: the DOCUMENT renders whatever the provider computed, while
+    # the drawer's native docked card walks ``data`` and prints its leading keys, so a
+    # derived board placed there would headline the reader's least useful numbers. A
+    # record with no ``board`` is every other crew's, and composes exactly as before.
+    island = record.get("board")
+    if not isinstance(island, dict):
+        island = record["data"]
+    data_json = json.dumps(island, ensure_ascii=False, allow_nan=False)
     return compose(template_html, data_json)

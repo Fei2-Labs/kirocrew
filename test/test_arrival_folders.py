@@ -2,7 +2,7 @@
 
 Unit-level cover for :mod:`kiro_crew.dashboard.arrival_folders`. The handler's own
 use of it (both arrival routes, the late resolution, the mid-import repair) is
-pinned in ``test/test_session_transfer.py``; what is pinned HERE is the resolution
+pinned in ``test/test_session_transfer_landing.py``; what is pinned HERE is the resolution
 itself, and specifically the five folder-lifecycle constraints
 ``docs/request-for-change/rfc-arrival-provenance-filing.md`` §5 records. Each of
 those constraints is a real defect class in the folder lifecycle rather than in
@@ -790,7 +790,7 @@ async def test_a_refused_placement_records_nothing(tmp_path, monkeypatch):
     assert folder_ids_filed_into(state) == set(), "a refused placement claims no row"
 
 
-async def _refuse_unhide(state, folder_id):
+async def _refuse_unhide(state, folder_id, *, claim_for_person=False):
     """Stand in for a folder deleted between the unlocked check and the locked one."""
     return False
 

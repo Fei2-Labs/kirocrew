@@ -30,6 +30,7 @@ from kiro_crew.config.loader import (
     SttConfig,
     _validated_stt_provider,
 )
+from kiro_crew.testing.wait import await_until, finished
 
 _IS_MACOS = platform.system() == "Darwin"
 
@@ -38,10 +39,13 @@ class TestProviderRegistration:
     def test_apple_is_a_valid_provider(self):
         assert _validated_stt_provider("apple") == "apple"
 
-    def test_unknown_provider_falls_back_to_local(self):
-        """An unusable stored provider degrades to the one with no precondition, so
-        voice input keeps working instead of the load failing on it."""
-        assert _validated_stt_provider("nope") == STT_PROVIDER_LOCAL
+    def test_unknown_provider_falls_back_to_off(self):
+        """An unusable stored provider degrades to ``off``, never to a recogniser:
+        a value nobody can account for must not select the one provider that links
+        a native library into the gateway (``test_stt_provider_off`` has the
+        incident). Retired names are the exception and keep landing on ``local``."""
+        assert _validated_stt_provider("nope") == "off"
+        assert _validated_stt_provider("whisper") == STT_PROVIDER_LOCAL
 
     def test_default_provider_is_local(self):
         """Adding a provider must not move the default off the one that needs
@@ -382,7 +386,7 @@ class TestHelperBuild:
         binary = cache / apple_speech._HELPER_NAME
         binary.write_text("#!/bin/sh\ntrue\n")
         # Owner-only is correct for an executable; semgrep's 0o644 suggestion would
-        # strip the execute bit. Same rationale as `sandbox.py::_ensure_run_dir`.
+        # strip the execute bit. Same rationale as `sandbox_argv.py::_ensure_run_dir`.
         os.chmod(binary, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # noqa: E501  # fmt: skip
         stamp = cache / f"{apple_speech._HELPER_NAME}.stamp"
         stamp.write_text(
@@ -730,6 +734,30 @@ class TestTranscribePlumbing:
             text, meta = await apple_speech.transcribe("/tmp/x.wav")
         assert text is None
         assert "no output" in meta["error"]
+
+    @pytest.mark.asyncio
+    async def test_empty_text_payload_is_an_empty_transcript_not_a_failure(self):
+        """A helper that exits cleanly with ``"text": ""`` heard silence. That is
+        a transcript of nothing, not a failure: ``""`` with no ``error`` key, so
+        the batch seam (and the endpoint's 200/500 split behind it) can tell a
+        quiet recording from a broken helper."""
+        payload = {"text": "", "locale": "en-US", "audio_secs": 2.0, "transcribe_secs": 0.1}
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(json.dumps(payload).encode(), b""))
+        proc.returncode = 0
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            _passthrough_sandbox(),
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav")
+        assert text == ""
+        assert text is not None
+        assert "error" not in meta
+        assert meta["audio_secs"] == 2.0
 
     @pytest.mark.asyncio
     async def test_successful_payload_returns_text_and_metrics(self):
@@ -1107,6 +1135,33 @@ class TestStreamingSession:
         session = apple_speech.StreamingSession()
         await session.close()
         await session.close()
+
+    @pytest.mark.asyncio
+    async def test_a_helper_line_that_is_not_an_object_is_skipped_mid_utterance(self):
+        """``RecursionError`` (a line nested past the decoder) and the plain
+        ``ValueError`` of an over-long integer are not ``JSONDecodeError``s:
+        unlisted, either ended the reader and dictation with it."""
+        from types import SimpleNamespace
+
+        from stray_line_helpers import STRAY_LINES
+
+        stdout = asyncio.StreamReader(limit=1 << 20)
+        for line in (
+            b'{"type": "partial", "text": "hel"}\n',
+            *(make() for make in STRAY_LINES.values()),
+            b'{"type": "final", "text": "hello"}\n',
+        ):
+            stdout.feed_data(line)
+        stdout.feed_eof()
+        session = apple_speech.StreamingSession()
+        session._proc = SimpleNamespace(stdout=stdout)  # type: ignore[assignment]
+
+        await finished(session._read_events(), "reader drains stdout to EOF")
+
+        kinds = []
+        while (event := session._queue.get_nowait()) is not None:
+            kinds.append(event["type"])
+        assert kinds == ["partial", "final"]
 
 
 class TestHelperArgvPinsFast:
@@ -1580,8 +1635,8 @@ class TestStreamingEndpointGate:
         assert "transcribe" in stt_stream._STREAMING_PROVIDERS
 
     def test_the_gate_offers_exactly_the_selectable_providers(self):
-        """Every provider the loader can store produces partial results, so the gate
-        and the selectable set are the same set.
+        """Every RECOGNISER the loader can store produces partial results, so the
+        gate and the selectable set are the same set once ``off`` is set aside.
 
         Pinned as an equality in both directions because each direction fails
         differently and neither is visible from the endpoint: a selectable provider
@@ -1589,10 +1644,18 @@ class TestStreamingEndpointGate:
         from, and a name in the tuple that the loader can never store (a retired
         whole-file CLI with no partial-result channel) is a live path that would hang
         a client until end of audio. Adding a provider without a partial channel has
-        to be a decision made here rather than inherited."""
+        to be a decision made here rather than inherited.
+
+        ``off`` is the one selectable value that is NOT a recogniser: it exists so
+        that "no speech" has a spelling, and the 503 it draws from this gate is the
+        intended answer. ``test_stt_provider_off`` pins that it never joins the tuple.
+        """
+        from kiro_crew.config.sections import STT_PROVIDER_OFF
         from kiro_crew.dashboard import stt_stream
 
-        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS)
+        assert set(stt_stream._STREAMING_PROVIDERS) == set(_VALID_STT_PROVIDERS) - {
+            STT_PROVIDER_OFF
+        }
 
 
 class TestNoBlockingCallOnEventLoop:
@@ -1719,6 +1782,70 @@ class TestNoBlockingCallOnEventLoop:
         assert "_swiftc()" in inspect.getsource(apple_speech._build_helper)
 
 
+_PREFERRED_SAY_VOICE = "Samantha"
+
+
+def _en_us_say_voice(listing: str) -> str | None:
+    """Pick an installed en_US voice from ``say -v '?'`` output.
+
+    Each line reads ``<name>  <locale>  # <sample>``. A name can hold spaces and
+    parentheses, so the locale is the last field before the ``#``. Samantha wins
+    when present; otherwise the first en_US voice listed is used.
+    """
+    voices = []
+    for line in listing.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) >= 2 and fields[-1] == "en_US":
+            voices.append(" ".join(fields[:-1]))
+    if _PREFERRED_SAY_VOICE in voices:
+        return _PREFERRED_SAY_VOICE
+    return voices[0] if voices else None
+
+
+async def _say_voice_args() -> list[str]:
+    """``say`` flags that pin an installed en_US voice, or none at all.
+
+    With no en_US voice installed the fixture uses the host's default voice.
+    """
+    import asyncio
+
+    proc = await asyncio.create_subprocess_exec("say", "-v", "?", stdout=asyncio.subprocess.PIPE)
+    out, _ = await proc.communicate()
+    voice = _en_us_say_voice(out.decode("utf-8", "replace"))
+    return ["-v", voice] if voice else []
+
+
+class TestEnUsSayVoice:
+    """The e2e fixtures synthesize English, so the voice must speak en_US.
+
+    The host's default voice can be non-English or mis-speak the phrase, while
+    the recognizer is pinned to en-US.
+    """
+
+    LISTING = (
+        "Albert              en_US    # Hello! My name is Albert.\n"
+        "Anna                de_DE    # Hallo! Ich heiße Anna.\n"
+        "Eddy (English (US)) en_US    # Hello! My name is Eddy.\n"
+        "Samantha            en_US    # Hello! My name is Samantha.\n"
+    )
+
+    def test_prefers_samantha(self):
+        assert _en_us_say_voice(self.LISTING) == "Samantha"
+
+    def test_falls_back_to_first_en_us_voice(self):
+        listing = self.LISTING.replace("Samantha ", "Zoe      ")
+        assert _en_us_say_voice(listing) == "Albert"
+
+    def test_keeps_a_name_with_spaces(self):
+        listing = "Anna   de_DE  # Hallo\nEddy (English (US)) en_US # Hi\n"
+        assert _en_us_say_voice(listing) == "Eddy (English (US))"
+
+    def test_none_when_no_en_us_voice(self):
+        listing = "Anna   de_DE  # Hallo\nDaniel en_GB # Hello\n"
+        assert _en_us_say_voice(listing) is None
+        assert _en_us_say_voice("") is None
+
+
 @pytest.mark.skipif(
     not _IS_MACOS or sys.platform != "darwin",
     reason="Apple on-device speech is macOS-only",
@@ -1741,14 +1868,17 @@ class TestEndToEndMacOS:
             pytest.skip("no Swift toolchain on this host")
         if not shutil.which("say"):
             pytest.skip("no `say` to synthesize a fixture")
+        voice_args = await _say_voice_args()
 
         audio = tmp_path / "sample.aiff"
+        # ``-v`` pins an en_US voice, when one is installed, to match the en-US
+        # recognizer below.
         # ``-o`` makes ``say`` write the AIFF instead of playing it through the
         # sound output, so the fixture is silent on the developer's machine. The
         # child runs from tmp_path so any file it creates lands there, not in
         # the checkout it would otherwise inherit as CWD.
         proc = await asyncio.create_subprocess_exec(
-            "say", "-o", str(audio), "the build is green", cwd=tmp_path
+            "say", *voice_args, "-o", str(audio), "the build is green", cwd=tmp_path
         )
         await proc.wait()
         assert audio.is_file()
@@ -1778,12 +1908,14 @@ class TestEndToEndMacOS:
         for tool in ("say", "afconvert"):
             if not shutil.which(tool):
                 pytest.skip(f"no `{tool}` to build a 16 kHz fixture")
+        voice_args = await _say_voice_args()
 
         aiff = tmp_path / "s.aiff"
         # ``-o`` writes the AIFF instead of playing it; cwd=tmp_path keeps any
         # stray output out of the checkout (see test_round_trip).
         proc = await asyncio.create_subprocess_exec(
             "say",
+            *voice_args,
             "-o",
             str(aiff),
             "the continuous integration build is green and the tests all pass",
@@ -1836,7 +1968,7 @@ class TestEndToEndMacOS:
                     await asyncio.sleep(target - now)
             last_audio_at = time.perf_counter()
             text = await session.finish()
-            await asyncio.wait_for(reader, timeout=5)
+            await await_until(reader, what="partial-result reader")
         finally:
             await session.close()
 

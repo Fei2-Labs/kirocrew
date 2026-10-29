@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { compareVersions, isNewSection } from './releaseVersion'
+import { baseRelease, compareVersions, isNewSection, notesPredateRunningRelease } from './releaseVersion'
 
 describe('compareVersions', () => {
   it('orders release cores numerically, not lexically', () => {
@@ -87,7 +87,89 @@ describe('isNewSection', () => {
     expect(isNewSection('0.6.0', '0.6.0rc2', '0.6.0')).toBe(true)
   })
 
+  it('keeps the release section on a build that is a prerelease of it', () => {
+    // Reported defect (#14705): running 0.8.0-insider.1 after 0.7.1-insider, the
+    // [0.8.0] section was SUPPRESSED because a release outranks its own
+    // prerelease (0.8.0 > 0.8.0-insider.1), leaving [0.7.1] as the newest
+    // qualifying section. The relaxed upper bound admits the same-core release.
+    expect(isNewSection('0.8.0', '0.7.1-insider.1', '0.8.0-insider.1')).toBe(true)
+    // Generalised, and with the wheel spelling of the prerelease tail.
+    expect(isNewSection('0.2.0', '0.1.0insider2', '0.2.0insider1')).toBe(true)
+  })
+
+  it('still refuses a FUTURE release on a prerelease build', () => {
+    // The relaxation is scoped to the SAME core: a genuinely newer release the
+    // build has not reached differs in core, so section <= running still governs.
+    expect(isNewSection('0.9.0', '0.7.1', '0.8.0-insider.1')).toBe(false)
+    expect(isNewSection('0.9.0-insider.1', '0.7.1', '0.8.0-insider.1')).toBe(false)
+  })
+
+  it('refuses a NEWER prerelease of the same release on a prerelease build', () => {
+    // Only the release itself (no tail) is admitted above the running build; a
+    // later draft of the same line is still a build the reader does not have.
+    expect(isNewSection('0.8.0-insider.3', '0.7.0', '0.8.0-insider.1')).toBe(false)
+    expect(isNewSection('0.2.0rc9', '0.1.0', '0.2.0rc8')).toBe(false)
+  })
+
+  it('opens the release section once per line, not on every prerelease step', () => {
+    // insider.1 -> insider.2: the reader was already on 0.8.0 and has had its
+    // notes, so stepping within the line does not re-open them.
+    expect(isNewSection('0.8.0', '0.8.0-insider.1', '0.8.0-insider.2')).toBe(false)
+    expect(isNewSection('0.2.0', '0.2.0rc1', '0.2.0rc2')).toBe(false)
+    // Stepping in from an earlier line still opens them.
+    expect(isNewSection('0.8.0', '0.7.1', '0.8.0-insider.2')).toBe(true)
+    // And reaching the release itself is unaffected (section <= running path).
+    expect(isNewSection('0.8.0', '0.8.0-insider.2', '0.8.0')).toBe(true)
+  })
+
   it('refuses an unorderable heading instead of guessing', () => {
     expect(isNewSection('Unreleased', '0.5.0', '0.6.0')).toBe(false)
+  })
+})
+
+describe('baseRelease', () => {
+  it('drops every prerelease, dev and build spelling the pipeline emits', () => {
+    expect(baseRelease('0.8.0')).toBe('0.8.0')
+    expect(baseRelease('0.8.0-insider.1')).toBe('0.8.0')
+    expect(baseRelease('0.8.0-rc.2')).toBe('0.8.0')
+    expect(baseRelease('0.8.0rc4')).toBe('0.8.0')
+    expect(baseRelease('0.8.0.dev20260806065257')).toBe('0.8.0')
+    expect(baseRelease('0.8.0-nightly.20260806t065257')).toBe('0.8.0')
+    expect(baseRelease('0.8.0+abc123')).toBe('0.8.0')
+    expect(baseRelease(' 0.10.1 ')).toBe('0.10.1')
+  })
+
+  it('folds a fourth numeric segment, a build number within the release', () => {
+    expect(baseRelease('0.7.1.5')).toBe('0.7.1')
+    expect(baseRelease('0.7.1.5-insider.1')).toBe('0.7.1')
+  })
+
+  it('returns null when there is no numeric core', () => {
+    expect(baseRelease('Unreleased')).toBeNull()
+    expect(baseRelease('')).toBeNull()
+  })
+})
+
+describe('notesPredateRunningRelease', () => {
+  it('flags an older release\'s notes shown to a prerelease of the next one', () => {
+    // The reported case: 0.8.0-insider.1 shown the 0.7.1 section.
+    expect(notesPredateRunningRelease('0.7.1', '0.8.0-insider.1')).toBe(true)
+    expect(notesPredateRunningRelease('0.7.1', '0.8.0.dev20260806065257')).toBe(true)
+    expect(notesPredateRunningRelease('0.7.1', '0.8.0')).toBe(true)
+  })
+
+  it('does not flag notes that belong to the running release', () => {
+    expect(notesPredateRunningRelease('0.7.1', '0.7.1')).toBe(false)
+    expect(notesPredateRunningRelease('0.7.1', '0.7.1+local')).toBe(false)
+    // A prerelease section of the running line is this release's own notes.
+    expect(notesPredateRunningRelease('0.8.0rc2', '0.8.0-rc.3')).toBe(false)
+    expect(notesPredateRunningRelease('0.8.0', '0.8.0rc2')).toBe(false)
+    // A four-segment build is still its three-segment release.
+    expect(notesPredateRunningRelease('0.7.1', '0.7.1.5')).toBe(false)
+  })
+
+  it('makes no claim about versions it cannot place', () => {
+    expect(notesPredateRunningRelease('Unreleased', '0.8.0')).toBe(false)
+    expect(notesPredateRunningRelease('0.7.1', '—')).toBe(false)
   })
 })

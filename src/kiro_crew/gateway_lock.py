@@ -61,6 +61,36 @@ capability is indeterminate and fails closed. Windows does not need the anchor
 at all, because a Windows gateway's open lock file cannot be deleted out from
 under it.
 
+The lock file is a regular file, never a link
+---------------------------------------------
+Every open of the lock path declines to follow a link at its final component --
+``O_NOFOLLOW`` on POSIX, ``FILE_FLAG_OPEN_REPARSE_POINT`` on Windows
+(:func:`platform_compat.open_create_no_reparse`,
+:func:`platform_compat.open_file_no_reparse`) -- and judges what it opened by that
+descriptor's own ``fstat``; a look at the name only words a refusal that is coming
+anyway. That leaves two dispositions. A regular file is locked as described above;
+on Windows that includes one carrying a reparse tag that is not a link (a
+cloud-files placeholder), since it holds its own data. Anything else at the name
+-- a symbolic link, a junction, a directory, a FIFO, a socket -- is refused with
+:class:`LockPathError`, whose message names the path and says to remove it:
+nothing is created, locked or written through it, and :func:`lock_holder` reports
+it as indeterminate (:class:`LockPathProbeError`) rather than as nobody. Within
+the first disposition, a regular file that also has another hard link (a backup
+taken with ``cp -al``) is locked, but its pid stamp is not written, since that
+would change the other name too. The stamp left in it is therefore not this
+holder's, and the reader distrusts a stamp exactly while the file has another
+link. Removing that link makes the stamp trusted again, including one an
+earlier acquirer left while the current holder skipped stamping; the next
+acquire that stamps replaces it. While the extra link exists the holder is
+named only where the kernel names it (on Windows, which has no such surface,
+the stale-pid reclaim below does not run for a file with another link either).
+Inode times are not consulted: a ``chmod``, ``chown``, xattr or ACL change moves
+the change time exactly as a link does, and on a host whose kernel names no
+lock owner the stamp is the only name the holder has. The
+owner lookups behind a refusal are keyed by the probed descriptor's ``(st_dev,
+st_ino)`` for the same reason. This keeps the lock from acting on an entry it did
+not create; it is not an access-control boundary.
+
 Isolated homes (``--test-mode``/``--seed`` with a distinct ``KIROCREW_HOME``)
 resolve to a different lock file and are unaffected.
 """
@@ -68,9 +98,11 @@ resolve to a different lock file and are unaffected.
 from __future__ import annotations
 
 import errno
+import ipaddress
 import logging
 import os
 import socket
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -83,9 +115,55 @@ logger = logging.getLogger(__name__)
 
 LOCK_FILENAME = "gateway.lock"
 
+#: Process exit status for the one lock refusal a restart cannot heal: the
+#: lock is held by a running process, positively identified as its acquirer,
+#: that holds the configured dashboard port with its OWN socket at the
+#: address this gateway is configured to bind and answers HTTP there -- the
+#: serving-holder predicate ``GatewayLock._serving_verdict`` answering True,
+#: carried as ``GatewayLockError.live_holder`` -- a sibling gateway serving
+#: this home.
+#: That condition stands for as long as the sibling serves, so a supervised
+#: relaunch meets the identical refusal every time while the sibling keeps
+#: serving; there is nothing for a second gateway to do here.
+#: ``service/linux.py`` feeds this value into the unit's
+#: ``RestartPreventExitStatus`` so a ``Restart=always`` unit goes ``failed``
+#: once, with the refusal line in the journal, instead of relaunching every
+#: ``RestartSec`` against a home that is already served. Every other refusal
+#: keeps exit 1 and IS relaunched, because a later attempt can find it cleared
+#: or because the evidence for standing down is not there: a lock file
+#: replaced faster than it can be locked, a lock path that is not a regular
+#: file (:class:`LockPathError`), a home that cannot be opened or
+#: measured for directory locks, an flock whose acquirer is gone (a wedged
+#: inheritor holds it until that process dies), a live acquirer that does not
+#: hold the port (a sibling still starting, or one shutting down that has
+#: closed its listener and will release the lock next), a live acquirer whose
+#: own socket at the probed address is silent (a wedged gateway: a hung
+#: process keeps its listening socket, and the relaunch is what takes the home
+#: over once it dies), a live acquirer that holds the port only at another
+#: address than this one would bind or at one the platform did not report (the
+#: residual row this design leaves unasserted on purpose, so a stranger
+#: answering at the probed address is never credited to it), and a holder no
+#: surface could identify -- no ``/proc/locks`` (macOS, Windows), or a Linux
+#: filesystem whose device numbers never match the lock table (btrfs
+#: subvolumes, overlayfs) -- where the recorded pid may be alive and on the
+#: port and still be a reused number rather than the process that holds the
+#: lock.
+#:
+#: 78 is ``EX_CONFIG`` from ``sysexits.h`` ("unconfigured or misconfigured
+#: state"): two supervisors pointed at one home is a host configuration, and
+#: the remedy is to change it -- stop the sibling or isolate ``KIROCREW_HOME``
+#: -- never to try again. Distinct from the two statuses the RUNNING gateway
+#: exits with on purpose to be relaunched, 69 (``EX_UNAVAILABLE``, listener
+#: lost) and 75 (``EX_TEMPFAIL``, stale assets), so a journal histogram tells
+#: the three apart.
+#:
+#: Lives here rather than in ``cli`` because ``cli`` returns the value while
+#: ``service/linux`` exempts it, and both import this module -- one
+#: definition, so the code that exits and the unit that exempts cannot drift.
+LIVE_HOLDER_EXIT_CODE = 78
+
 # How many times ``acquire`` re-opens the lock path and re-takes the home
-# anchor, and how many times :func:`_anchor_holder_or_nobody` re-probes an
-# anchor that read as held. It bounds two transient causes: the inode
+# anchor. It bounds two transient causes: the inode
 # ``acquire`` locked differing from the inode the path names, and the home
 # anchor being held for the two syscalls :func:`_home_is_anchored` needs for
 # its non-destructive probe. Either clearing takes microseconds, while a real
@@ -125,12 +203,48 @@ _NO_DIRECTORY_LOCK_ERRNOS = frozenset(
 
 
 class GatewayLockError(RuntimeError):
-    """Raised when another process already owns this ``KIROCREW_HOME``."""
+    """Raised when another process already owns this ``KIROCREW_HOME``.
 
-    def __init__(self, home: Path, holder_pid: int | None, diagnosis: str | None = None) -> None:
+    The subclass :class:`LockFileError` is the exception: the lock file itself
+    could not be opened, created or measured, so no other owner is implied.
+
+    ``live_holder`` is the serving-holder predicate's answer,
+    :attr:`_ServingVerdict.serving` from :meth:`GatewayLock._serving_verdict`:
+    True only when the refusal rests on a POSITIVELY identified acquirer -- the
+    process ``/proc/locks`` names as holding the flock (on the lock file, or on
+    the home directory when the file has been deleted or replaced) -- that is
+    running, holds the configured dashboard port with its OWN socket at the
+    address this gateway is configured to bind, AND answers HTTP there: a
+    gateway serving this home, which this one can displace on neither front
+    while it lives. It is the structured form of that verdict, so a caller
+    deciding how to exit reads it rather than the message text. Every other
+    refusal leaves it False: a transient identity race, an indeterminate home
+    anchor, an flock whose acquirer is gone, a live acquirer that does not hold
+    the port (a sibling still starting or already shutting down -- a later
+    attempt resolves either), a live acquirer whose own socket at the probed
+    address is silent (a wedged gateway: a hung process keeps its socket bound,
+    and the retry is what takes the home over once it dies), a live acquirer
+    that holds the port only at another address than this one would bind, or
+    at one the platform did not report (the residual row, kept unasserted by
+    design, so a stranger answering at the probed address is never credited to
+    it), and every refusal in which no surface names the acquirer (no
+    ``/proc/locks``, or a filesystem it never matches), where the recorded pid
+    may be alive and on the port yet proves nothing about who holds the lock,
+    so the predicate is never asked.
+    """
+
+    def __init__(
+        self,
+        home: Path,
+        holder_pid: int | None,
+        diagnosis: str | None = None,
+        *,
+        live_holder: bool = False,
+    ) -> None:
         self.home = home
         self.holder_pid = holder_pid
         self.diagnosis = diagnosis
+        self.live_holder = live_holder
         if diagnosis:
             super().__init__(diagnosis)
             return
@@ -139,6 +253,200 @@ class GatewayLockError(RuntimeError):
         else:
             detail = f"another gateway already owns {home}"
         super().__init__(f"{detail}; stop it first or set KIROCREW_HOME to an isolated directory")
+
+
+#: The address the serving-holder predicate probes when the configured bind is
+#: absent or the IPv4 wildcard: loopback is what an unconfigured gateway binds,
+#: and a ``0.0.0.0`` listener receives a connect to it.
+_LOOPBACK_PROBE_HOST = "127.0.0.1"
+#: The address probed for an IPv6-wildcard bind. The dashboard binds ``::`` with
+#: ``IPV6_V6ONLY`` (``dashboard/server.py::_bind_once``), so that listener never
+#: receives an IPv4 connect: probing 127.0.0.1 would call a healthy IPv6
+#: sibling silent. ``::1`` is what a ``::`` listener does answer.
+_V6_LOOPBACK_PROBE_HOST = "::1"
+
+# Bind values that mean "every interface" of one family, keyed by the address the
+# probe reaches them at. Family is load-bearing (see above): the two wildcards
+# are probed at different loopbacks.
+_WILDCARD_PROBE_HOSTS = {
+    "": _LOOPBACK_PROBE_HOST,
+    "0.0.0.0": _LOOPBACK_PROBE_HOST,
+    "::": _V6_LOOPBACK_PROBE_HOST,
+}
+
+
+def probe_host_for_bind(bind_address: str | None) -> str:
+    """The address at which to ask a holder of the port whether it serves HTTP.
+
+    The serving-holder predicate (:meth:`GatewayLock._serving_verdict`) probes
+    the address THIS gateway is configured to bind (``KIROCREW_BIND``, resolved
+    by the caller), never one it guesses. An absent configuration or the IPv4
+    wildcard ``0.0.0.0`` is probed at ``127.0.0.1``; the IPv6 wildcard ``::`` at
+    ``::1``, because the dashboard binds it ``IPV6_V6ONLY`` and a v4 connect
+    would never reach it; a specific address is probed as given (brackets
+    stripped, so an IPv6 literal such as ``[::1]`` connects). The residual this
+    leaves -- a holder bound to some OTHER address is not reached here and is
+    therefore not asserted as serving -- is deliberate: the assertion stays as
+    narrow as the evidence, and mapping the probe to the holder's own listener
+    address is tracked as a follow-up rather than guessed at.
+    """
+    host = (bind_address or "").strip().strip("[]")
+    return _WILDCARD_PROBE_HOSTS.get(host, host)
+
+
+def _listener_reaches(listener: platform_compat.PortListener, host: str) -> bool:
+    """Would a connect to *host* on the listener's port land on THIS socket?
+
+    The address-bound half of the port conjunct. *host* is the probe address
+    (:func:`probe_host_for_bind`), so this answers whether the identified
+    owner's own LISTEN socket is the one the HTTP probe reaches -- without it,
+    port ownership (address-agnostic) and HTTP health (measured at one address)
+    could belong to two different processes sharing a port on different local
+    addresses, and a stranger's health would be attributed to the lock owner.
+
+    A specific bind reaches only its own address (a v4-mapped spelling of a v4
+    address counts as that address). The IPv4 wildcard reaches every v4 host.
+    The IPv6 wildcard reaches every v6 host and NOT a v4 one: the dashboard
+    binds it ``IPV6_V6ONLY``, and whether some other process's ``::`` socket
+    accepts v4-mapped connects cannot be observed from here, so it is not
+    assumed. lsof spells either family's wildcard ``*`` and reports the family
+    separately; with the family unreported, and whenever the source gave no
+    address at all, the answer is unknowable and therefore False -- the
+    conjunct is never asserted on a fact the platform did not supply.
+    """
+    try:
+        target = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    v6_host = target.version == 6
+    address = listener.address.strip().strip("[]").lower()
+    if address.startswith("::ffff:"):
+        address = address[len("::ffff:") :]
+    if not address:
+        return False
+    if address == "*":
+        if listener.family == "4":
+            return not v6_host
+        if listener.family == "6":
+            return v6_host
+        return False
+    if address == "0.0.0.0":
+        return not v6_host
+    if address == "::":
+        return v6_host
+    try:
+        bound = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return bound == target
+
+
+class LockFileError(GatewayLockError):
+    """Raised when the lock file could not be used at all, whoever else is running.
+
+    A local failure to create the home, or to open or ``fstat`` the lock file
+    (a permission gap, a read-only or full filesystem), and the typed
+    :class:`LockPathError`. Nothing implies that another process owns the home,
+    so a caller must not tell the operator to stop a gateway: ``live_holder``
+    stays False and the message carries the cause.
+    """
+
+    def __init__(self, home: Path, message: str) -> None:
+        super().__init__(home, None, message)
+
+
+class LockPathError(LockFileError):
+    """Raised when the lock path holds something other than a regular file.
+
+    See the module docstring, *The lock file is a regular file, never a link*.
+    No lock is taken and nothing is written; ``live_holder`` stays False, because
+    the remedy the message gives is to remove the entry at the path, not to stop
+    a gateway.
+    """
+
+    def __init__(self, home: Path, path: Path) -> None:
+        self.path = path
+        super().__init__(home, _lock_path_refusal(path))
+
+
+def _lock_path_refusal(path: Path) -> str:
+    """The one sentence every refusal of a non-regular lock path carries."""
+    return (
+        f"{path} is not a regular file, so no gateway lock can be taken on it; remove it, "
+        "then start the gateway again"
+    )
+
+
+#: ``errno`` values with which a no-follow open of the lock path reports that
+#: the entry is not a regular file: a link (``O_NOFOLLOW``, or a Windows reparse
+#: point), a directory, a socket.
+_NOT_REGULAR_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO})
+
+
+@dataclass(frozen=True)
+class _ServingVerdict:
+    """The serving-holder predicate's answer about ONE positively identified acquirer.
+
+    Produced only by :meth:`GatewayLock._serving_verdict`, and only for the pid
+    ``/proc/locks`` names as the flock's ACQUIRER (of the lock file, or of the
+    home directory when the file has been deleted or replaced) -- never for the
+    pid the lock file merely records. Each fact is measured once and the message
+    and the exit status both read this record, so they cannot disagree.
+
+    ``serving`` is the conjunction a supervisor may act on: the acquirer is
+    alive, holds the CONFIGURED dashboard port, holds it AT the address this
+    gateway is configured to bind (``probe_host``; wildcards covering it by
+    family, see :func:`_listener_reaches`), and answers HTTP there.
+    ``holds_port`` is False when no port was supplied to measure (``--port
+    auto``, ``--slack-only``); ``listens_at_probe_host`` is False when the
+    platform reported no address for the owner's sockets (unknowable, so not
+    asserted); ``answers_http`` is probed only when the owner's own socket is
+    the one the probe would reach, so one predicate call spends at most one
+    HTTP probe and never attributes another process's answer to the owner. The
+    identified-acquirer diagnoses call it exactly once; the orphaned-lock
+    diagnosis (a dead acquirer, candidate openers) is a separate path with its
+    own per-candidate facts.
+    ``bound_addresses`` are the owner's listener addresses, for the message.
+    """
+
+    pid: int
+    alive: bool
+    holds_port: bool
+    listens_at_probe_host: bool
+    answers_http: bool
+    probe_host: str
+    bound_addresses: tuple[str, ...] = ()
+
+    @property
+    def serving(self) -> bool:
+        """True iff every conjunct holds -- the one shape that exits terminally."""
+        return self.alive and self.holds_port and self.listens_at_probe_host and self.answers_http
+
+    @property
+    def silent_listener(self) -> bool:
+        """Alive, on the port at the probed address, yet nothing answered there.
+
+        A wedged gateway: a hung process keeps its listening socket bound, so
+        the socket the probe reaches is the owner's and still nothing answers.
+        Not asserted -- the retry is what takes the home over once it dies, and
+        a terminal exit would leave the unit ``failed`` with nothing to relaunch.
+        """
+        return (
+            self.alive and self.holds_port and self.listens_at_probe_host and not self.answers_http
+        )
+
+    @property
+    def bound_elsewhere(self) -> bool:
+        """The RESIDUAL row: alive and on the port, but not at the probed address.
+
+        The owner holds port N only on some other local address (or the
+        platform could not say where), so the probe never reaches its socket
+        and whatever answers at ``probe_host`` is not evidence about it. Not
+        asserted, by design: ``live_holder`` False, exit 1, the pre-PR
+        behaviour bounded by the unit's ``StartLimit*``. Probing the holder's
+        own address instead is the tracked follow-up, not a guess made here.
+        """
+        return self.alive and self.holds_port and not self.listens_at_probe_host
 
 
 class LockProbeError(RuntimeError):
@@ -155,13 +463,40 @@ class LockProbeError(RuntimeError):
     the pid recorded in the file -- a number ``release`` never clears and the
     kernel reuses -- would let a caller signal an unrelated live process.
     Callers that act on the answer (``kirocrew stop``/``restart``) report this
-    and exit without signalling anything.
+    and exit without signalling anything. A lock path that is not a regular file
+    is the typed subclass :class:`LockPathProbeError`.
+
+    ``held`` tells the two cases apart for a caller that can act on them
+    differently. It is True only when the probe POSITIVELY established the lock
+    is held and the stamped pid is unreadable: a draining gateway hiding its own
+    pid under a Windows mandatory lock. A gateway IS alive and its exit releases
+    the lock, so a caller may wait for that rather than give up. It is False
+    whenever waiting has no end: the probe could not establish whether the lock
+    is held (an unopenable lock file, an unmeasurable filesystem), or a
+    forked-inheritor wedge holds it (a dead kernel-named acquirer, a dead
+    recorded pid, a home anchor the lock file does not name), which an
+    orphaned child can keep alive indefinitely. ``stop``/``restart`` ignore it
+    and refuse either way; it exists for ``gateway-pid`` and the desktop
+    recovery that polls on it.
     """
 
-    def __init__(self, path: Path, cause: OSError) -> None:
+    def __init__(self, path: Path, cause: OSError, *, held: bool = False) -> None:
         self.path = path
         self.cause = cause
+        self.held = held
         super().__init__(f"could not determine whether a gateway holds the lock at {path}: {cause}")
+
+
+class LockPathProbeError(LockProbeError):
+    """:func:`lock_holder`'s answer for a lock path that is not a regular file.
+
+    Indeterminate like every :class:`LockProbeError`, so ``stop`` and ``restart``
+    signal nothing and spawn nothing; the message carries
+    :class:`LockPathError`'s remedy, because ``acquire`` refuses on the same entry.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, OSError(_lock_path_refusal(path)))
 
 
 class GatewayLock:
@@ -177,10 +512,16 @@ class GatewayLock:
     separates a running gateway from a wedged fork squatting on an inherited fd.
     """
 
-    def __init__(self, home: Path, port: int | None = None) -> None:
+    def __init__(
+        self, home: Path, port: int | None = None, bind_address: str | None = None
+    ) -> None:
         self._home = home
         self._path = home / LOCK_FILENAME
         self._port = port
+        # The address the serving-holder predicate probes: the one THIS gateway
+        # is configured to bind, a wildcard mapped to loopback. Fixed at
+        # construction so every fact in one diagnosis is measured at one address.
+        self._probe_host = probe_host_for_bind(bind_address)
         self._fd: int | None = None
         self._home_fd: int | None = None
 
@@ -197,18 +538,43 @@ class GatewayLock:
         Windows path, and the home directory, which stays reachable by name
         after the lock file is deleted (see the module docstring).
         """
-        self._home.mkdir(parents=True, exist_ok=True)
+        try:
+            self._home.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise LockFileError(
+                self._home, f"could not create {self._home}: {exc.strerror or exc}"
+            ) from exc
         for attempt in range(_IDENTITY_ATTEMPTS):
             if attempt:
                 time.sleep(_RETRY_BACKOFF_SECS)
-            fd = self._open_lock_file()
+            try:
+                fd = self._open_lock_file()
+            except FileNotFoundError:
+                # The name was there and gone again before it could be opened
+                # (a sibling unlinked it): the same lost race as a replaced
+                # inode, so it takes the same bounded retry.
+                continue
             # platform_compat.try_acquire_lock: fcntl.flock LOCK_EX|LOCK_NB on
             # POSIX; msvcrt.locking LK_NBLCK on Windows. Returns True iff acquired.
             if not platform_compat.try_acquire_lock(fd, exclusive=True):
                 recorded = _read_pid(fd)
+                held = _fstat_or_none(fd)
                 os.close(fd)
-                holder, diagnosis = self._diagnose(recorded)
-                raise GatewayLockError(self._home, holder, diagnosis)
+                if (
+                    not platform_compat.IS_WINDOWS
+                    and attempt + 1 < _IDENTITY_ATTEMPTS
+                    and recorded is not None
+                    and platform_compat.pid_liveness(recorded) == platform_compat.PID_DEAD
+                ):
+                    # POSIX releases flock when the final inherited descriptor
+                    # closes, but a desktop relaunch can race that teardown.
+                    # Retry only when the stamp's process is confirmed dead: a
+                    # live incumbent must still be refused immediately. A true
+                    # orphaned-flock wedge remains held through every bounded
+                    # attempt and receives the existing diagnosis below.
+                    continue
+                holder, diagnosis, live = self._diagnose(recorded, held)
+                raise GatewayLockError(self._home, holder, diagnosis, live_holder=live)
             if not _is_same_file(fd, self._path):
                 # The path was unlinked or replaced between the open and the
                 # lock, so the inode we hold is not the one the next gateway
@@ -252,9 +618,7 @@ class GatewayLock:
 
     def _open_lock_file(self) -> int:
         """Open (creating if absent) the lock file, reclaiming a stale Windows one."""
-        # O_RDWR | O_CREAT without truncation: a failed acquire must leave the
-        # incumbent holder's pid intact so we can name it in the error.
-        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = self._open_regular_lock_file()
 
         # Windows stale-PID reclaim: on Windows, msvcrt.locking may leave a
         # lock file that cannot be re-locked after a crash (the OS does not
@@ -277,12 +641,59 @@ class GatewayLock:
                     os.unlink(self._path)
                 except OSError:
                     pass
-                fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+                fd = self._open_regular_lock_file()
+        return fd
+
+    def _open_regular_lock_file(self) -> int:
+        """Open the lock file read-write, creating it if absent; refuse anything else.
+
+        See the module docstring, *The lock file is a regular file, never a
+        link*. No truncation: a failed acquire must leave the incumbent holder's
+        pid intact so the refusal can name it. Every ``OSError`` leaves as a
+        :class:`LockFileError` except ``FileNotFoundError``, the lost race
+        ``acquire`` retries.
+        """
+        try:
+            fd = platform_compat.open_create_no_reparse(self._path, 0o600)
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            # The errno decides; a look at the name only picks the wording of a
+            # refusal that is coming either way (a directory on Windows opens
+            # with a plain access error).
+            if exc.errno in _NOT_REGULAR_ERRNOS or _names_non_regular_entry(self._path):
+                raise LockPathError(self._home, self._path) from exc
+            raise LockFileError(
+                self._home, f"could not open {self._path}: {exc.strerror or exc}"
+            ) from exc
+        try:
+            regular = stat.S_ISREG(os.fstat(fd).st_mode)
+        except OSError as exc:
+            os.close(fd)
+            raise LockFileError(
+                self._home, f"could not stat {self._path}: {exc.strerror or exc}"
+            ) from exc
+        if not regular:
+            os.close(fd)
+            raise LockPathError(self._home, self._path)
         return fd
 
     def _stamp_pid(self, fd: int) -> None:
-        """Record this pid in the lock file so it names the most recent acquirer."""
+        """Record this pid in the lock file so it names the most recent acquirer.
+
+        Not written into a file that has another hard link, because that would
+        change the other name too. The lock is still held; the stale bytes stay,
+        and :func:`_read_pid` does not trust them while the extra link exists
+        (see the module docstring).
+        """
         try:
+            if os.fstat(fd).st_nlink > 1:
+                logger.warning(
+                    "acquired gateway lock on %s but did not record pid: %s has another hard link",
+                    self._home,
+                    self._path,
+                )
+                return
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
             os.write(fd, f"{os.getpid()}\n".encode())
@@ -325,8 +736,8 @@ class GatewayLock:
                 None,
                 _indeterminate_anchor_message(self._home, probe_error),
             ) from probe_error
-        holder, diagnosis = self._diagnose_replaced_lock_file()
-        raise GatewayLockError(self._home, holder, diagnosis)
+        holder, diagnosis, live = self._diagnose_replaced_lock_file()
+        raise GatewayLockError(self._home, holder, diagnosis, live_holder=live)
 
     def __enter__(self) -> "GatewayLock":
         return self.acquire()
@@ -336,7 +747,9 @@ class GatewayLock:
 
     # -- diagnostics ------------------------------------------------------
 
-    def _diagnose(self, recorded_pid: int | None) -> tuple[int | None, str | None]:
+    def _diagnose(
+        self, recorded_pid: int | None, held: os.stat_result | None
+    ) -> tuple[int | None, str | None, bool]:
         """Resolve who holds the lock, distinguishing owner from mere opener.
 
         ``/proc/locks`` names the pid that ACQUIRED the flock, authoritatively.
@@ -345,38 +758,84 @@ class GatewayLock:
         dead acquirer. In that case no ``/proc`` surface names the inheritor, so
         we list the current openers as CANDIDATES and never as the owner.
 
-        Returns ``(pid, message)``. ``message`` is ``None`` when we learned
-        nothing, which leaves :class:`GatewayLockError` on its generic wording.
+        Returns ``(pid, message, live_holder)``. ``message`` is ``None`` when we
+        learned nothing, which leaves :class:`GatewayLockError` on its generic
+        wording. ``live_holder`` is :attr:`_ServingVerdict.serving` from ONE
+        call of the serving-holder predicate, :meth:`_serving_verdict`, on the
+        acquirer ``/proc/locks`` names: True only when that process is running,
+        holds the configured dashboard port with its own socket at the address
+        this gateway is configured to bind, and answers HTTP there. It is False
+        on every other row: a dead acquirer (its inheritor may yet exit and
+        free the home), a live acquirer without the port, a live acquirer whose
+        own socket at the probed address is silent (a wedged gateway), a live
+        acquirer that holds the port only at another address or at one the
+        platform did not report (the residual row, kept unasserted by design),
+        and every shape in which no surface names the acquirer at all -- there
+        the recorded pid is a number
+        that may be reused, so the predicate is never asked about it and even
+        alive-and-on-the-port is a strong hint, not the verdict (see
+        :meth:`_describe_unidentified_owner`).
+
+        *held* is the ``fstat`` of the descriptor whose lock attempt failed (``None``
+        when even that failed); the owner lookups match it rather than re-resolving
+        the name.
         """
-        owner = platform_compat.flock_owner_pid(self._path)
-        openers = platform_compat.pids_holding_file(self._path)
+        target: Path | os.stat_result = held if held is not None else self._path
+        owner = platform_compat.flock_owner_pid(target)
+        openers = platform_compat.pids_holding_file(target)
         if openers is not None:
             openers = [pid for pid in openers if pid != os.getpid()]
 
-        if owner is not None and platform_compat.pid_exists(owner):
-            return owner, self._describe_live_owner(owner, recorded_pid)
         if owner is not None:
-            return owner, self._describe_orphaned_lock(owner, openers)
-        # No /proc/locks (non-Linux, or unreadable): the recorded pid is all we
-        # have, so weigh its own facts rather than presenting it as the holder.
+            verdict = self._serving_verdict(owner)
+            if verdict.alive:
+                return (
+                    owner,
+                    self._describe_live_owner(owner, recorded_pid, verdict),
+                    verdict.serving,
+                )
+            return owner, self._describe_orphaned_lock(owner, openers), False
+        # No /proc/locks (non-Linux, or unreadable) or no entry that matches
+        # this file: the recorded pid is all we have, so weigh its own facts
+        # rather than presenting it as the holder -- and never as a LIVE holder,
+        # since nothing here shows that pid acquired the lock. The predicate is
+        # not consulted: there is no identified owner to ask it about.
         if recorded_pid is None:
-            return None, None
-        return recorded_pid, self._describe_unidentified_owner(recorded_pid)
+            return None, None, False
+        return recorded_pid, self._describe_unidentified_owner(recorded_pid), False
 
     def _describe_unidentified_owner(self, recorded_pid: int) -> str:
         """No surface names the flock owner, so report what the recorded pid proves.
 
-        macOS and Windows cannot identify an flock owner at all: ``F_GETLK``
-        reports ``l_pid = -1`` for a conflicting flock and ``lsof`` leaves the
-        lock field blank. Naming the owner is not what the operator needs,
-        though. Liveness and port ownership work on every platform, and between
-        them they separate the three states that lead to different actions:
-        the recorded pid is gone (an inherited descriptor holds the lock, and
-        nothing here can name the inheritor); it is running and holds the
-        dashboard port (a gateway, to be stopped); or it is running without the
+        Reached without ``/proc/locks`` -- macOS and Windows cannot identify an
+        flock owner at all (``F_GETLK`` reports ``l_pid = -1`` for a conflicting
+        flock and ``lsof`` leaves the lock field blank), and an unreadable
+        ``/proc`` is the same -- and on a Linux home whose filesystem reports a
+        device the lock table never matches (btrfs subvolumes, overlayfs; see
+        :func:`platform_compat.flock_owner_pid`). Naming the owner is not what
+        the operator needs, though. Liveness and port ownership work on every
+        platform, and between them they separate the three states that lead to
+        different actions: the recorded pid is gone (an inherited descriptor
+        holds the lock, and nothing here can name the inheritor); it is running
+        and holds the dashboard port (what a gateway serving this home looks
+        like, so ``kirocrew stop`` comes first); or it is running without the
         port, where the number may belong to an unrelated process that reused
-        it. Only the last one, and the case where no port was supplied to
-        measure, keep a hedge.
+        it. Every state keeps a hedge on WHO holds the lock, because that is the
+        one thing none of them establishes.
+
+        Never a live holder, whatever the port says -- which is why this
+        returns only the message and :meth:`_diagnose` hands
+        :class:`GatewayLockError` a fixed ``False`` for this branch. The
+        recorded pid is a number stamped by whoever locked the file LAST, and
+        pid numbers are reused; that the process now wearing it listens on the
+        port is consistent with a serving gateway, but nothing shows that
+        process ACQUIRED the lock. Treating it as one would exit
+        :data:`LIVE_HOLDER_EXIT_CODE` and stand a supervised unit down for good
+        on no evidence that anyone holds the lock. The verdict therefore needs
+        the acquirer positively identified, which only the ``/proc/locks``
+        surface can do, so the serving-holder predicate
+        (:meth:`_serving_verdict`) is asked about that acquirer alone and never
+        about the recorded pid.
         """
         if not platform_compat.pid_exists(recorded_pid):
             return (
@@ -392,11 +851,14 @@ class GatewayLock:
                 f"The file records pid {recorded_pid}, which may be stale. "
                 "Stop the running gateway, or set KIROCREW_HOME to an isolated directory."
             )
-        if recorded_pid in platform_compat.find_listening_pids(self._port):
+        if self._holds_port(recorded_pid):
             return (
-                f"{self._path} is held by pid {recorded_pid}, which is running and holds port "
-                f"{self._port} -- another gateway already owns {self._home}; stop it first "
-                "(kirocrew stop) or set KIROCREW_HOME to an isolated directory"
+                f"{self._path} is locked and the pid it records ({recorded_pid}) is running and "
+                f"holds port {self._port} -- most likely another gateway already owns "
+                f"{self._home}; stop it first (kirocrew stop) or set KIROCREW_HOME to an "
+                "isolated directory. This platform or filesystem cannot confirm which process "
+                "holds the lock, so this refusal is not treated as permanent; a supervisor, if "
+                "one manages this gateway, will retry it."
             )
         return (
             f"{self._path} is locked and the pid it records ({recorded_pid}) is running, but "
@@ -405,7 +867,7 @@ class GatewayLock:
             "KIROCREW_HOME to an isolated directory."
         )
 
-    def _diagnose_replaced_lock_file(self) -> tuple[int | None, str]:
+    def _diagnose_replaced_lock_file(self) -> tuple[int | None, str, bool]:
         """The home is still held, but its lock file does not name the holder.
 
         Reached when the lock file could be locked -- because it was deleted and
@@ -414,34 +876,106 @@ class GatewayLock:
         this process just created the file, or whatever is in it predates the
         deletion. The directory's own owner is the only thing worth reading, and
         only Linux can name it.
+
+        Returns ``(pid, message, live_holder)``; ``live_holder`` is
+        :attr:`_ServingVerdict.serving` from one call of the serving-holder
+        predicate (:meth:`_serving_verdict`) on the directory's acquirer -- the
+        same three conjuncts the lock file's own owner must show
+        (:meth:`_describe_live_owner`), measured once.
         """
         owner = platform_compat.flock_owner_pid(self._home)
-        if owner is not None and platform_compat.pid_exists(owner):
-            facts = self._port_facts(owner)
+        verdict = self._serving_verdict(owner) if owner is not None else None
+        live = False
+        unasserted = ""
+        if owner is not None and verdict is not None and verdict.alive:
+            live = verdict.serving
+            facts = self._port_facts(owner, verdict)
             who = f"pid {owner}" + (f" ({', '.join(facts)})" if facts else "")
+            clause = self._unasserted_clause(verdict)
+            if clause:
+                unasserted = " That process " + clause
         else:
             owner = None
             who = "a running gateway"
-        return owner, (
-            f"{self._home} is still held by {who}, but {self._path} no longer names it -- the "
-            "lock file was deleted or replaced while that gateway was running. Deleting the "
-            "lock file neither stops a gateway nor releases its lock; stop it first (kirocrew "
-            "stop) or set KIROCREW_HOME to an isolated directory."
+        return (
+            owner,
+            (
+                f"{self._home} is still held by {who}, but {self._path} no longer names it -- "
+                "the lock file was deleted or replaced while that gateway was running. Deleting "
+                "the lock file neither stops a gateway nor releases its lock; stop it first "
+                "(kirocrew stop) or set KIROCREW_HOME to an isolated directory." + unasserted
+            ),
+            live,
         )
 
-    def _describe_live_owner(self, pid: int, recorded_pid: int | None) -> str:
-        """The ordinary case: a live process holds the lock, so name it."""
+    def _unasserted_clause(self, verdict: _ServingVerdict) -> str | None:
+        """Words for a live acquirer on the port that the predicate does NOT assert.
+
+        ``None`` for a serving holder and for an acquirer without the port (the
+        facts already say ``does not hold port N``). Two rows get a sentence:
+        the wedged gateway (the owner's own socket at the probed address, yet
+        nothing answered) and the residual row (the owner holds the port only
+        at another address, or at one the platform did not report). Both end
+        the same way, because both stay restartable.
+        """
+        if verdict.silent_listener:
+            shape = (
+                f"is listening on port {self._port} but not answering HTTP at "
+                f"{verdict.probe_host} (the address this gateway would bind), so it looks like a "
+                "wedged gateway rather than one serving this home"
+            )
+        elif verdict.bound_elsewhere:
+            where = ", ".join(verdict.bound_addresses) or "an address this platform did not report"
+            shape = (
+                f"holds port {self._port} at {where}, not at {verdict.probe_host} (the address "
+                "this gateway would bind), so whether it serves this home cannot be told from "
+                "here"
+            )
+        else:
+            return None
+        return (
+            shape + "; this refusal is not treated as permanent, and a supervisor, if one "
+            "manages this gateway, will retry it."
+        )
+
+    def _describe_live_owner(
+        self, pid: int, recorded_pid: int | None, verdict: _ServingVerdict
+    ) -> str:
+        """The ordinary case: a live process holds the lock, so name it.
+
+        *verdict* is the serving-holder predicate's answer for *pid*
+        (:meth:`_serving_verdict`), which the caller also reads for
+        ``live_holder``; this method only puts its facts into words. Only the
+        serving shape -- on the configured port and answering HTTP at the
+        address this gateway would bind -- is terminal. Two live-acquirer shapes
+        stay restartable and say so: WITHOUT the port it is a gateway still
+        starting (the next attempt sees the port held) or shutting down (the
+        next attempt takes the lock); on the port but SILENT at the probed
+        address it is a wedged gateway (a hung process keeps its listening
+        socket bound) or one bound to another address, and a terminal exit
+        there would park a supervised unit ``failed`` for good while a wedged
+        incumbent dies on its own or is killed, leaving the home unserved with
+        nothing left to relaunch.
+        """
         facts: list[str] = []
         threads = platform_compat.process_thread_count(pid)
         if threads is not None:
             facts.append(f"{threads} thread{'s' if threads != 1 else ''}")
-        facts.extend(self._port_facts(pid))
+        facts.extend(self._port_facts(pid, verdict))
         detail = f" ({', '.join(facts)})" if facts else ""
-        message = (
-            f"{self._path} is held by pid {pid}{detail} -- another gateway already owns "
-            f"{self._home}; stop it first (kirocrew stop) or set KIROCREW_HOME to an "
-            "isolated directory"
-        )
+        clause = self._unasserted_clause(verdict)
+        if clause:
+            message = (
+                f"{self._path} is held by pid {pid}{detail} -- it "
+                + clause
+                + " Stop it first (kirocrew stop) or set KIROCREW_HOME to an isolated directory"
+            )
+        else:
+            message = (
+                f"{self._path} is held by pid {pid}{detail} -- another gateway already owns "
+                f"{self._home}; stop it first (kirocrew stop) or set KIROCREW_HOME to an "
+                "isolated directory"
+            )
         if recorded_pid is not None and recorded_pid != pid:
             message += f" (the lock file records pid {recorded_pid} -- stale)"
         return message
@@ -495,7 +1029,7 @@ class GatewayLock:
         candidate = openers[0]
         ppid = platform_compat.parent_pid(candidate)
         orphaned = ppid is not None and (ppid == 1 or not platform_compat.pid_exists(ppid))
-        serving = self._port is not None and _port_answers_http(self._port)
+        serving = self._port is not None and _port_answers_http(self._port, host=self._probe_host)
         if orphaned and not serving:
             lines.append(
                 f"Its parent (pid {ppid}) is gone too and it is not serving HTTP, so it is "
@@ -515,14 +1049,87 @@ class GatewayLock:
             )
         return " ".join(lines)
 
-    def _port_facts(self, pid: int) -> list[str]:
-        """Port ownership facts for *pid*, empty when no port was supplied."""
+    def _holds_port(self, pid: int) -> bool:
+        """Whether *pid* listens on the dashboard port; False when none was supplied."""
+        return self._port is not None and pid in platform_compat.find_listening_pids(self._port)
+
+    def _serving_verdict(self, owner: int) -> _ServingVerdict:
+        """THE serving-holder predicate: is the identified acquirer *owner* serving this home?
+
+        *owner* MUST be the pid ``/proc/locks`` names as the flock's acquirer --
+        of the lock file (:meth:`_diagnose`) or of the home directory
+        (:meth:`_diagnose_replaced_lock_file`). The pid the lock file merely
+        records is never passed here: with no identified owner there is nothing
+        to assert, and :meth:`_describe_unidentified_owner` stays False without
+        asking (identity unknowable = never assert).
+
+        Four conjuncts, measured once each and in order, each skipped once an
+        earlier one fails: the acquirer is ALIVE; it HOLDS the configured
+        dashboard port (one listener enumeration,
+        :func:`platform_compat.find_port_listeners`, filtered to the owner's
+        own sockets; False when no port was supplied); it holds it AT THE
+        ADDRESS the probe reaches -- the address this gateway is configured to
+        bind, :attr:`_probe_host`, with wildcards covering it by family
+        (:func:`_listener_reaches`); and it ANSWERS HTTP there (one
+        :func:`_port_answers_http` call, its own 1.5 s budget). Only all four
+        make :attr:`_ServingVerdict.serving` True -- the one refusal a restart
+        cannot heal, so the one that exits :data:`LIVE_HOLDER_EXIT_CODE`. The
+        address conjunct is what keeps port ownership and HTTP health tied to
+        ONE process: without it a stranger answering at the probe address on
+        the same port would be credited to a lock owner bound elsewhere.
+
+        The RESIDUAL ROW, by design: a holder that is alive and holds the port
+        only on some OTHER address than the one this gateway would bind -- or
+        one whose socket addresses the platform could not report -- is NOT
+        asserted: ``live_holder`` False, exit 1, the pre-PR behaviour bounded
+        by the unit's ``StartLimit*``. The assertion stays as narrow as the
+        evidence; probing the holder's own listener address instead is the
+        follow-up tracked in the PR's deferred-finding issue, not a guess made
+        here.
+        """
+        alive = platform_compat.pid_exists(owner)
+        own: list[platform_compat.PortListener] = []
+        if alive and self._port is not None:
+            own = [
+                entry
+                for entry in platform_compat.find_port_listeners(self._port)
+                if entry.pid == owner
+            ]
+        holds_port = bool(own)
+        listens_at_probe_host = any(_listener_reaches(entry, self._probe_host) for entry in own)
+        answers_http = (
+            listens_at_probe_host
+            and self._port is not None
+            and _port_answers_http(self._port, host=self._probe_host)
+        )
+        return _ServingVerdict(
+            owner,
+            alive,
+            holds_port,
+            listens_at_probe_host,
+            answers_http,
+            self._probe_host,
+            tuple(dict.fromkeys(entry.address or "?" for entry in own)),
+        )
+
+    def _port_facts(self, pid: int, verdict: _ServingVerdict | None = None) -> list[str]:
+        """Port ownership facts for *pid*, empty when no port was supplied.
+
+        *verdict* is the predicate's answer a caller already holds, so the words
+        come from the same measurement as the exit status; a caller without one
+        (an orphaned lock's candidate openers) asks the predicate here.
+        """
         if self._port is None:
             return []
-        if pid not in platform_compat.find_listening_pids(self._port):
+        if verdict is None:
+            verdict = self._serving_verdict(pid)
+        if not verdict.holds_port:
             return [f"does not hold port {self._port}"]
-        answering = "answering" if _port_answers_http(self._port) else "not answering"
-        return [f"holds port {self._port}, {answering} HTTP"]
+        if not verdict.listens_at_probe_host:
+            where = ", ".join(verdict.bound_addresses) or "an unreported address"
+            return [f"holds port {self._port} at {where}, not at {verdict.probe_host}"]
+        answering = "answering" if verdict.answers_http else "not answering"
+        return [f"holds port {self._port}, {answering} HTTP at {verdict.probe_host}"]
 
 
 @dataclass(frozen=True)
@@ -559,7 +1166,10 @@ def lock_holder(home: Path) -> LockHolder:
     without releasing anything -- so both cases fall through to the home anchor
     (:func:`_anchor_holder_or_nobody`) before ``nobody`` is reported. A file
     that exists but cannot be read is still probed, since being unable to read
-    it is not evidence that nobody holds it.
+    it is not evidence that nobody holds it. An entry that is not a regular file
+    is not a lock file at all (see the module docstring) and raises
+    :class:`LockPathProbeError`: ``acquire`` refuses on it, so "nobody" would let
+    ``restart`` spawn a replacement that cannot start.
 
     The file's contents are NOT evidence on their own. ``acquire`` stamps the
     holder's pid but ``release`` never clears it, so after a clean stop the file
@@ -597,37 +1207,54 @@ def lock_holder(home: Path) -> LockHolder:
     stretched by an extra round trip.
     """
     path = home / LOCK_FILENAME
-    if not path.exists():
+    try:
+        entry = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
         return _anchor_holder_or_nobody(home, path)
-    recorded: int | None = None
+    except OSError as exc:
+        raise LockProbeError(path, exc) from exc
+    if not stat.S_ISREG(entry.st_mode):
+        raise LockPathProbeError(path)
     try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        # A file that exists but cannot be opened for reading (a Windows
-        # mandatory lock held by the gateway, a permission gap) is not
-        # evidence of "nobody": the probe below still decides held or free,
-        # and a held lock with no readable pid is reported as indeterminate.
-        pass
-    else:
-        try:
-            recorded = _read_pid(fd)
-        finally:
-            os.close(fd)
-
-    try:
-        held = _lock_is_held(path)
-    except LockProbeError:
-        # The probe could not answer. The one thing that still counts as
-        # positive ownership is the kernel naming a LIVE acquirer.
-        owner = platform_compat.flock_owner_pid(path)
+        fd = _open_probe_descriptor(path)
+    except FileNotFoundError:
+        return _anchor_holder_or_nobody(home, path)
+    except OSError as exc:
+        if exc.errno in _NOT_REGULAR_ERRNOS:
+            raise LockPathProbeError(path) from exc
+        # The probe cannot answer without a descriptor. The one thing that
+        # still counts as positive ownership is the kernel naming a LIVE
+        # acquirer of the regular file classified above.
+        owner = platform_compat.flock_owner_pid(entry)
         if owner is not None and platform_compat.pid_exists(owner):
             return LockHolder(pid=owner, alive=True, source="flock_owner")
-        raise
+        raise LockProbeError(path, exc) from exc
+    try:
+        probed = os.fstat(fd)
+        if not stat.S_ISREG(probed.st_mode):
+            raise LockPathProbeError(path)
+        # A file the gateway holds under a Windows mandatory lock reads as
+        # nothing: not evidence of "nobody", so the probe below still decides
+        # held or free, and a held lock with no readable pid is indeterminate.
+        recorded = _read_pid(fd)
+        try:
+            held = _lock_is_held(fd, path)
+        except LockProbeError:
+            # The probe could not answer. The one thing that still counts as
+            # positive ownership is the kernel naming a LIVE acquirer.
+            owner = platform_compat.flock_owner_pid(probed)
+            if owner is not None and platform_compat.pid_exists(owner):
+                return LockHolder(pid=owner, alive=True, source="flock_owner")
+            raise
+    except OSError as exc:
+        raise LockProbeError(path, exc) from exc
+    finally:
+        os.close(fd)
 
     if not held:
         return _anchor_holder_or_nobody(home, path)
 
-    owner = platform_compat.flock_owner_pid(path)
+    owner = platform_compat.flock_owner_pid(probed)
     if owner is not None:
         if platform_compat.pid_exists(owner):
             return LockHolder(pid=owner, alive=True, source="flock_owner")
@@ -635,7 +1262,9 @@ def lock_holder(home: Path) -> LockHolder:
         # on in a process that inherited the descriptor (a forked child), which
         # nothing here can name. Reporting the dead pid as "not alive" reads to
         # stop and restart as nobody running, and restart then spawns a
-        # replacement straight into the held lock. Indeterminate instead.
+        # replacement straight into the held lock. Indeterminate instead, and
+        # not ``held``: an orphaned inheritor need never exit, so waiting for
+        # this lock to be released has no end.
         raise LockProbeError(
             path,
             OSError(f"the lock is held but its recorded acquirer (pid {owner}) is gone"),
@@ -648,8 +1277,13 @@ def lock_holder(home: Path) -> LockHolder:
     # is a running holder this process cannot identify, so it is indeterminate
     # rather than "nobody": "nobody" would make stop and restart report nothing
     # running while `kirocrew gateway` refuses to start on the very same lock.
+    # Only an unreadable stamp is ``held``: that is a live gateway hiding its
+    # own pid under a Windows mandatory lock, which the lock's release ends. A
+    # readable stamp naming a dead pid is an inheritor, which nothing ends.
     raise LockProbeError(
-        path, OSError("the lock is held but no live holder pid can be established")
+        path,
+        OSError("the lock is held but no live holder pid can be established"),
+        held=recorded is None,
     )
 
 
@@ -666,27 +1300,18 @@ def _anchor_holder_or_nobody(home: Path, path: Path) -> LockHolder:
     cannot be measured, the same indeterminate answer the lock file's own
     unnameable-holder case produces.
 
-    An anchored reading is a candidate, not a verdict. Another non-destructive
-    reader (a ``stop`` beside a ``cli_perf`` probe) holds the anchor for two
-    syscalls, and two such readers on an idle home can each see the other's
-    hold. The anchor is therefore re-probed up to ``_IDENTITY_ATTEMPTS`` times,
-    ``_RETRY_BACKOFF_SECS`` apart, and only a home that reads anchored on every
-    attempt goes on to the owner lookup: a passing reader has released within
-    one backoff, an incumbent never does. A single free reading is positive
-    evidence and returns ``nobody`` at once. A :class:`LockProbeError` from the
-    probe itself (an unopenable home, an unmeasurable filesystem) is a different
-    fact and propagates on the attempt that raised it.
+    The anchor is read once. :func:`_home_is_anchored` probes it shared, so
+    another non-destructive reader (a ``stop`` beside a ``cli_perf`` probe)
+    never reads as a holder, and an anchored reading is an exclusive hold: the
+    one a gateway takes in ``acquire`` and keeps until it releases.
 
     Probing the anchor can create and remove one throwaway directory inside
     *home* to tell an unsupported directory lock from a held one. That is a
     write, but it disturbs no holder, which is the sense in which this oracle
     is non-destructive.
     """
-    for attempt in range(_IDENTITY_ATTEMPTS):
-        if attempt:
-            time.sleep(_RETRY_BACKOFF_SECS)
-        if not _home_is_anchored(home, path):
-            return _NO_HOLDER
+    if not _home_is_anchored(home, path):
+        return _NO_HOLDER
     owner = platform_compat.flock_owner_pid(home)
     if owner is not None and platform_compat.pid_exists(owner):
         return LockHolder(pid=owner, alive=True, source="home_anchor")
@@ -696,39 +1321,91 @@ def _anchor_holder_or_nobody(home: Path, path: Path) -> LockHolder:
     )
 
 
-def _lock_is_held(path: Path) -> bool:
-    """True when something holds the lock at *path* (i.e. a gateway is running).
+def _lock_is_held(fd: int, path: Path) -> bool:
+    """True when something holds the lock on *fd*, open on *path* (a gateway is running).
 
     Non-destructive: the acquire is only a probe and is released at once, so a
-    real holder is never disturbed. An ``OSError`` from OPENING the file raises
+    real holder is never disturbed. An ``OSError`` from the probe raises
     :class:`LockProbeError` instead of being folded into either answer: the
     callers of :func:`lock_holder` act on the answer (refuse naming the pid,
     profile it), so a false "free" would let them spawn a second writer. A
     failure inside the lock call itself is folded by
     ``platform_compat.try_acquire_lock`` into ``False``, which reads here as
     "held": the conservative answer, since every caller treats a held lock as
-    a reason to refuse rather than to act on the recorded pid.
+    a reason to refuse rather than to act on the recorded pid. *fd* is the
+    caller's no-follow descriptor (see the module docstring), so the inode
+    probed is the one classified, and the caller closes it.
+
+    POSIX takes the lock shared, which only an exclusive hold refuses: the
+    gateway holds ``gateway.lock`` exclusive for its whole life, so a held lock
+    still reads as held, while two readers probing an idle home at once (a
+    ``stop`` beside a ``cli_perf`` probe) both get it and neither reads the
+    other as a holder. ``msvcrt`` has no shared lock, so Windows still probes
+    exclusive. There two colliding readers can still see each other: the
+    second reads held and, with no owner surface, falls to the stamp. An
+    unreadable or empty stamp (the first reader's lock hides it) is
+    :class:`LockProbeError` with ``held=True``, which that reader's release
+    ends two syscalls later; a stamp is believed only for a live pid, the
+    same trust a held lock already gives it. Nothing is retried for this.
 
     The probe window itself is the one this process could win a race against a
     gateway acquiring at the same instant; it is microseconds wide and the
     gateway's own refusal names this pid, which is the same exposure the
     ``cli_perf`` probe carries.
     """
-    fd: int | None = None
     try:
-        fd = os.open(path, os.O_RDWR)
-        if platform_compat.try_acquire_lock(fd, exclusive=True):
+        if platform_compat.try_acquire_lock(fd, exclusive=False):
             platform_compat.release_lock(fd)
             return False
         return True
     except OSError as exc:
         raise LockProbeError(path, exc) from exc
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+
+
+#: ``errno`` values with which a read-write open of an existing lock file is
+#: refused for its permissions or its filesystem, not for what it is.
+_WRITE_DENIED_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EROFS})
+
+
+def _open_probe_descriptor(path: Path) -> int:
+    """Open the existing lock file for :func:`lock_holder`'s probe, never through a link.
+
+    POSIX opens read-write with ``O_NOFOLLOW``. The lock does not need it: the
+    probe is shared, and where ``flock`` is emulated with record locks (Linux
+    NFS without ``local_lock``) a shared record lock needs only a descriptor
+    open for reading. The open does: a FIFO swapped in after the ``lstat``
+    never blocks a read-write open, so it needs no ``O_NONBLOCK``, which would
+    fail a lease break at once instead of waiting it out. No ``O_CREAT``: the
+    probe never makes the file. A file this user cannot open for writing
+    (``EACCES``, ``EPERM`` or ``EROFS``: a ``0400`` lock left by another
+    account, a read-only filesystem) is probed through a non-blocking
+    read-only descriptor instead, which the shared probe locks as well. Windows opens read-only through
+    ``open_file_no_reparse(links_only=True)``, refusing only a reparse point
+    that is a link. The caller still classifies the descriptor with ``fstat``.
+    """
+    if platform_compat.IS_POSIX:
+        try:
+            return os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as exc:
+            if exc.errno not in _WRITE_DENIED_ERRNOS:
+                raise
+    return platform_compat.open_file_no_reparse(path, nonblocking=True, links_only=True)
+
+
+def _names_non_regular_entry(path: Path) -> bool:
+    """True iff something other than a regular file is AT *path*; a link counts as itself."""
+    try:
+        return not stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _fstat_or_none(fd: int) -> os.stat_result | None:
+    """``os.fstat`` of *fd*, or ``None`` when even that fails."""
+    try:
+        return os.fstat(fd)
+    except OSError:
+        return None
 
 
 def _is_same_file(fd: int, path: Path) -> bool:
@@ -736,11 +1413,12 @@ def _is_same_file(fd: int, path: Path) -> bool:
 
     False also when *path* has no inode at all (it is unlinked), because both
     answers mean the same thing to a lock: the descriptor we hold is not what
-    another process opening that name would get.
+    another process opening that name would get. The name is read without
+    following a link, as every open of it is (see the module docstring).
     """
     try:
         held = os.fstat(fd)
-        named = os.stat(path)
+        named = os.lstat(path)
     except OSError:
         return False
     return (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
@@ -786,10 +1464,13 @@ def _directory_locks_supported(
 def _home_is_anchored(home: Path, path: Path) -> bool:
     """True iff something holds the exclusive ``flock`` on *home* itself.
 
-    Non-destructive: a free directory is unlocked again immediately. Windows,
-    an absent home, or positively unsupported directory locks report False.
-    Other failures to open or measure the home raise :class:`LockProbeError`,
-    because callers must not read missing evidence as nobody running.
+    The probe takes the anchor shared, which only an exclusive hold refuses:
+    two readers probing at once both get it, so neither reads the other as a
+    holder. Non-destructive: a free directory is unlocked again immediately.
+    Windows, an absent home, or positively unsupported directory locks report
+    False. Other failures to open or measure the home raise
+    :class:`LockProbeError`, because callers must not read missing evidence as
+    nobody running.
     """
     if platform_compat.IS_WINDOWS:
         return False
@@ -800,7 +1481,7 @@ def _home_is_anchored(home: Path, path: Path) -> bool:
     except OSError as exc:
         raise LockProbeError(path, exc) from exc
     try:
-        if platform_compat.try_acquire_lock(fd, exclusive=True):
+        if platform_compat.try_acquire_lock(fd, exclusive=False):
             platform_compat.release_lock(fd)
             return False
     finally:
@@ -832,27 +1513,44 @@ def _release_fd(fd: int) -> None:
         pass
 
 
-def _port_answers_http(port: int, timeout: float = 1.5) -> bool:
-    """True iff ``127.0.0.1:port`` returns an HTTP status line within *timeout*.
+def _port_answers_http(
+    port: int, timeout: float = 1.5, *, host: str = _LOOPBACK_PROBE_HOST
+) -> bool:
+    """True iff ``host:port`` returns an HTTP status line within *timeout*.
 
-    A plain connect is not enough: a wedged holder's kernel still completes the
-    handshake into the listen backlog even though nothing will ever ``accept()``,
-    so connect-success would misclassify an orphan as a live gateway. This
-    mirrors :func:`kiro_crew.dashboard.port_reclaim._probe_gateway_healthy` in a
+    *host* is the address the caller is configured to bind, a wildcard already
+    mapped to loopback (:func:`probe_host_for_bind`); an IPv6 literal connects as
+    given and is bracketed in the ``Host`` header. A plain connect is not
+    enough: a wedged holder's kernel still completes the handshake into the
+    listen backlog even though nothing will ever ``accept()``, so
+    connect-success would misclassify an orphan as a live gateway. This mirrors
+    :func:`kiro_crew.dashboard.port_reclaim._probe_gateway_healthy` in a
     synchronous form, because the lock is taken before the event loop exists.
     """
+    header_host = f"[{host}]" if ":" in host else host
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.settimeout(timeout)
-            sock.sendall(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            sock.sendall(
+                b"GET / HTTP/1.0\r\nHost: "
+                + header_host.encode("ascii", "replace")
+                + b"\r\nConnection: close\r\n\r\n"
+            )
             return sock.recv(5) == b"HTTP/"
     except OSError:
         return False
 
 
 def _read_pid(fd: int) -> int | None:
-    """Best-effort read of the holder pid recorded in the lock file."""
+    """Best-effort read of the holder pid recorded in the lock file.
+
+    ``None`` for a stamp that may not be the holder's: a file with another hard
+    link, into which no stamp is written (see the module docstring). Once that
+    link is gone the stamp is read again.
+    """
     try:
+        if os.fstat(fd).st_nlink > 1:
+            return None
         os.lseek(fd, 0, os.SEEK_SET)
         raw = os.read(fd, 64).decode(errors="replace").strip()
     except OSError:

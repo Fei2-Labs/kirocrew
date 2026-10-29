@@ -24,6 +24,7 @@ import pytest
 
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import socketsec
+from kiro_crew.testing.wait import finished
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
@@ -96,7 +97,7 @@ class _FakeBackend:
         self.callers: list[Any] = []
         self._pending_requests: dict = {}
 
-    async def attach_stub(self, _uuid: str) -> "asyncio.Queue[bytes]":
+    async def attach_stub(self, _uuid: str, *, agent: str = "") -> "asyncio.Queue[bytes]":
         return asyncio.Queue()
 
     async def detach_stub(self, _uuid: str) -> int:
@@ -160,7 +161,7 @@ async def _run(
     monkeypatch.setattr(gw, "_acquire_backend", _fake_acquire)
     monkeypatch.setattr(gw, "_drain_inbox_to_stub", _fake_drain)
 
-    await asyncio.wait_for(
+    await finished(
         gw._handle_connection(
             _FakeReader(frames),
             writer or _FakeWriter(),
@@ -169,7 +170,7 @@ async def _run(
             socket_path=Path("/tmp/rc.sock"),
             hot_keys=None,
         ),
-        timeout=5.0,
+        "the gateway connection handler draining the fake reader",
     )
     return fake_backend, sel_calls
 

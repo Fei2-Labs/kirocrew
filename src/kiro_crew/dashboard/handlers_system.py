@@ -20,6 +20,7 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
@@ -44,12 +45,20 @@ from kiro_crew.stats import Stats
 
 logger = logging.getLogger(__name__)
 
-# Absolute paths for macOS system commands — shutil.which may fail when PATH
-# is minimal (e.g. launched as a background service), so fall back to known
-# locations.
-_SYSCTL = shutil.which("sysctl") or "/usr/sbin/sysctl"
-_VM_STAT = shutil.which("vm_stat") or "/usr/bin/vm_stat"
-_NETSTAT = shutil.which("netstat") or "/usr/sbin/netstat"
+
+def _resolve_tool(name: str, fallback: str) -> str:
+    """The absolute path to run the system command *name* with.
+
+    ``shutil.which`` may fail when PATH is minimal (e.g. launched as a background
+    service), so the command's known location stands in when it finds nothing.
+    """
+    return shutil.which(name) or fallback
+
+
+# Absolute paths for macOS system commands, resolved once at import.
+_SYSCTL = _resolve_tool("sysctl", "/usr/sbin/sysctl")
+_VM_STAT = _resolve_tool("vm_stat", "/usr/bin/vm_stat")
+_NETSTAT = _resolve_tool("netstat", "/usr/sbin/netstat")
 
 # Server-side network speed tracking (survives page refresh)
 _prev_net: dict[str, float] = {"rx": 0.0, "tx": 0.0, "ts": 0.0}
@@ -66,6 +75,34 @@ _sys_cpu_pct: float = 0.0
 # Last-known Windows system CPU % (GetSystemTimes delta returns None on the
 # first sample; reuse the previous value so the header doesn't flash to 0).
 _last_win_cpu_pct: float = 0.0
+
+#: Whether this process has already WARNED that the live system-wide memory
+#: probe in :func:`_collect_system_metrics` came up empty.
+_live_mem_probe_reported: bool = False
+
+
+def _live_mem_probe_unavailable(reason: str, *, exc_info: bool = False) -> None:
+    """Say that the live system-wide memory probe produced no figures.
+
+    One WARNING per process, DEBUG after that: the probe re-runs every time
+    the :data:`_METRICS_CACHE_TTL` window lapses while a dashboard polls
+    ``/api/system``, so a host whose ``/proc/meminfo`` stays unreadable would
+    otherwise warn on every collection. Every failure still leaves one record,
+    so the gap stays diagnosable from the product's own logs. The static probe
+    in :func:`_get_static_system_info` is a separate path with its own policy.
+    """
+    global _live_mem_probe_reported
+    level = logging.DEBUG if _live_mem_probe_reported else logging.WARNING
+    _live_mem_probe_reported = True
+    # Phrased as what the LIVE probe did not publish: the payload may still
+    # carry a mem_total_gb the static probe read once at startup.
+    logger.log(
+        level,
+        "%s; the live probe published no mem_total_gb/mem_used_gb/mem_free_gb",
+        reason,
+        exc_info=exc_info or None,
+    )
+
 
 # Cached static system info (computed once)
 _STATIC_SYSTEM_INFO: dict[str, object] | None = None
@@ -250,7 +287,11 @@ async def api_status(request: web.Request) -> web.Response:
             "os_type": static_info.get("os", ""),
             "arch": static_info.get("arch", ""),
             "cpu_count": static_info.get("cpu_count", 0),
-            "mem_total_gb": static_info.get("mem_total_gb", 0),
+            # ``None`` (JSON ``null``) when the static probe could not measure
+            # the host's memory — the same "unknown, never a fake 0" signal
+            # ``cron_jobs``/``lessons`` use — so a reader can tell a failed
+            # probe apart from a host that genuinely reports 0 GB.
+            "mem_total_gb": static_info.get("mem_total_gb"),
         }
     )
     # Frontend RUM config blob (PlatformContext telemetry).  The Default
@@ -296,13 +337,19 @@ def _get_static_system_info() -> dict[str, object]:
         "cwd": os.getcwd(),
     }
 
-    # Total memory (static) — cross-platform
+    # Total memory (static) — cross-platform. A probe that comes up empty leaves
+    # ``mem_total_gb`` OUT of the dict (readers use ``.get`` and ``/api/status``
+    # projects the gap as ``null``) and says so once: this dict is cached for
+    # the life of the process, so a silent miss here would otherwise be served
+    # as an unexplained "unknown" until restart.
     if sys.platform == "darwin":
         try:
             out = subprocess.check_output([_SYSCTL, "-n", "hw.memsize"], timeout=2).decode().strip()
             info["mem_total_gb"] = round(int(out) / (1024**3), 1)
         except Exception:
-            pass
+            logger.warning(
+                "could not read sysctl hw.memsize; mem_total_gb unavailable", exc_info=True
+            )
     elif sys.platform == "linux":
         try:
             with open("/proc/meminfo") as f:
@@ -311,12 +358,18 @@ def _get_static_system_info() -> dict[str, object]:
                         kb = int(line.split()[1])
                         info["mem_total_gb"] = round(kb / (1024**2), 1)
                         break
+                else:
+                    logger.warning("/proc/meminfo has no MemTotal line; mem_total_gb unavailable")
         except Exception:
-            pass
+            logger.warning("could not read /proc/meminfo; mem_total_gb unavailable", exc_info=True)
     elif sys.platform == "win32":
         mem = platform_compat.system_memory()
         if mem:
             info["mem_total_gb"] = round(mem[0] / (1024**3), 1)
+        else:
+            # system_memory() folds every failure into None, so there is no
+            # exception to attach here.
+            logger.warning("GlobalMemoryStatusEx returned nothing; mem_total_gb unavailable")
 
     _STATIC_SYSTEM_INFO = info
     return info
@@ -551,9 +604,12 @@ def _collect_system_metrics() -> dict[str, object]:
         if sys.platform == "darwin":
             out = subprocess.check_output([_SYSCTL, "-n", "hw.memsize"], timeout=2).decode().strip()
             total_bytes = int(out)
-            data["mem_total_gb"] = round(total_bytes / (1024**3), 1)
             vm = subprocess.check_output([_VM_STAT], timeout=2).decode()
             mem_used, mem_free = _macos_memory_gb(total_bytes, vm)
+            # Published only once BOTH reads succeeded: a sysctl that answers
+            # and a vm_stat that then fails must not leave a live total beside
+            # a log line saying the live figures are unavailable.
+            data["mem_total_gb"] = round(total_bytes / (1024**3), 1)
             data["mem_used_gb"] = mem_used
             data["mem_free_gb"] = mem_free
         elif sys.platform == "win32":
@@ -565,13 +621,16 @@ def _collect_system_metrics() -> dict[str, object]:
                 data["mem_total_gb"] = mem_total
                 data["mem_free_gb"] = mem_free
                 data["mem_used_gb"] = round(mem_total - mem_free, 1)
+            else:
+                # system_memory() folds every failure into None, so there is
+                # no exception to attach here.
+                _live_mem_probe_unavailable("GlobalMemoryStatusEx returned nothing")
         else:
             with open("/proc/meminfo") as f:
                 meminfo: dict[str, int] = {}
                 for line in f:
                     parts = line.split()
                     meminfo[parts[0].rstrip(":")] = int(parts[1])
-                mem_total = round(meminfo.get("MemTotal", 0) / (1024**2), 1)
                 # Prefer the kernel's own MemAvailable (Linux 3.14+): it already
                 # accounts for reclaimable page cache AND reclaimable slab
                 # (SReclaimable), so "used" matches `free`'s accounting. The old
@@ -592,11 +651,21 @@ def _collect_system_metrics() -> dict[str, object]:
                         / (1024**2),
                         1,
                     )
-                data["mem_total_gb"] = mem_total
-                data["mem_free_gb"] = mem_free
-                data["mem_used_gb"] = round(mem_total - mem_free, 1)
+                # A /proc/meminfo with no MemTotal line is a probe that read
+                # nothing usable, not a 0 GB host, and a total defaulted to 0
+                # makes mem_used_gb = 0 - MemAvailable, a negative figure.
+                # Leave the three keys out instead (every reader already
+                # tolerates the absent shape) and say so.
+                total_kb = meminfo.get("MemTotal", 0)
+                if total_kb > 0:
+                    mem_total = round(total_kb / (1024**2), 1)
+                    data["mem_total_gb"] = mem_total
+                    data["mem_free_gb"] = mem_free
+                    data["mem_used_gb"] = round(mem_total - mem_free, 1)
+                else:
+                    _live_mem_probe_unavailable("/proc/meminfo has no usable MemTotal line")
     except Exception:
-        pass
+        _live_mem_probe_unavailable("system-wide memory probe failed", exc_info=True)
 
     # CPU usage
     cores = os.cpu_count() or 1
@@ -728,10 +797,13 @@ def _collect_system_metrics() -> dict[str, object]:
         data["ollama_running"] = False
 
     # Resource posture — advisory probe from the same cgroup-aware memory reader
-    # that drives the dynamic sub-agent cap and the injected [RESOURCES] line.
+    # that drives the spawn memory floor and the injected [RESOURCES] line.
+    # ``subagent_cap`` is the count ceiling in force (an explicit
+    # ``max_subagents`` pin, or the ``subagent_auto_max`` auto ceiling); memory
+    # bounds starts beneath it.
     try:
         from kiro_crew.resource_status import probe as _resource_probe
-        from kiro_crew.subagent import compute_max_subagents
+        from kiro_crew.subagent import resolve_max_subagents
 
         status = _resource_probe()
         data["resource_posture"] = status.posture
@@ -740,13 +812,9 @@ def _collect_system_metrics() -> dict[str, object]:
         data["resource_critical_gb"] = status.critical_gb
         try:
             cfg = KiroCrewConfig.load()
-            data["subagent_cap"] = compute_max_subagents(cfg)
+            data["subagent_cap"] = resolve_max_subagents(cfg)
         except Exception:
-            # Fallback: derive from available memory directly
-            if status.available_gb > 0:
-                data["subagent_cap"] = min(11, max(1, int(status.available_gb / 0.5)))
-            else:
-                data["subagent_cap"] = 3
+            data["subagent_cap"] = 3
     except Exception:
         data["resource_posture"] = "unknown"
         data["resource_available_gb"] = -1.0
@@ -798,6 +866,66 @@ async def api_system(request: web.Request) -> web.Response:
         _metrics_cache = data
         _metrics_cache_ts = time.monotonic()
     return web.json_response(data)
+
+
+async def _require_owner(request: web.Request, operation: str) -> web.Response | None:
+    """The shared owner gate, imported late: ``handlers`` imports this module."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    return await require_owner_dashboard_request(request, operation)
+
+
+def _reconciler(request: web.Request) -> Any:
+    sessions = getattr(request.app["state"], "sessions", None)
+    return sessions.runtime_reconciler() if sessions is not None else None
+
+
+async def api_leaked_runtimes(request: web.Request) -> web.Response:
+    """Leaked agent runtimes from the reconciler's last reading: count and total RSS."""
+    reconciler = _reconciler(request)
+    reading = reconciler.last_reading if reconciler is not None else None
+    from kiro_crew.runtime_reconcile import RECLAIM_PLATFORM
+
+    # Off Linux the report cannot look at all, which must not read as "none leaked".
+    if reading is None or not reading.supported or not RECLAIM_PLATFORM:
+        return web.json_response({"supported": False, "count": 0, "rss_bytes": 0, "runtimes": []})
+    return web.json_response(
+        {
+            "supported": True,
+            "count": reading.leaked_untracked,
+            "rss_bytes": reading.leaked_rss_bytes,
+            "runtimes": [{"pid": pid, "rss_bytes": rss} for pid, rss in reading.leaked],
+        }
+    )
+
+
+async def api_leaked_runtimes_reclaim(request: web.Request) -> web.Response:
+    """Owner-only, confirm-required: end the leaked runtimes once through the gated kill path."""
+    denied = await _require_owner(request, "leaked_runtimes.reclaim")
+    if denied is not None:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return web.json_response(
+            {"error": "confirm required", "code": "confirm_required"}, status=400
+        )
+    reconciler = _reconciler(request)
+    if reconciler is None:
+        return web.json_response(
+            {"error": "no reconcile pass has run yet", "code": "not_ready"}, status=409
+        )
+    result = await asyncio.to_thread(reconciler.reclaim_untracked)
+    if not result.supported:
+        return web.json_response({"error": result.reason, "code": "unsupported"}, status=409)
+    return web.json_response(
+        {
+            "killed": list(result.killed),
+            "refused": [{"pid": pid, "reason": why} for pid, why in result.refused],
+        }
+    )
 
 
 async def api_sso_ttl(request: web.Request) -> web.Response:

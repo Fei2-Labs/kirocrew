@@ -95,7 +95,7 @@ beforeEach(() => {
 describe('ChatPane — model switch updates the pane label without a slot-list round trip (#4523)', () => {
   it('writes the store on API success so the chip follows the pick', async () => {
     const { store } = renderPane('pane-1')
-    const chip = await waitFor(() => screen.getByTitle('Model: claude-opus-5'))
+    const chip = await waitFor(() => screen.getByTitle(/^Model: claude-opus-5(?: ·|$)/))
     const slotsFetchesBeforePick = vi.mocked(api.chatSlots).mock.calls.length
 
     await act(async () => { fireEvent.click(chip) })
@@ -107,13 +107,13 @@ describe('ChatPane — model switch updates the pane label without a slot-list r
     // The label moved because the store was written, not because anything
     // re-fetched the slot list (and no websocket exists in this harness).
     expect(vi.mocked(api.chatSlots).mock.calls.length).toBe(slotsFetchesBeforePick)
-    expect(await waitFor(() => screen.getByTitle('Model: claude-sonnet-5'))).toBeTruthy()
+    expect(await waitFor(() => screen.getByTitle(/^Model: claude-sonnet-5(?: ·|$)/))).toBeTruthy()
   })
 
   it('keeps the pre-switch model when the call fails', async () => {
     vi.mocked(api.chatSlotModel).mockRejectedValueOnce(new Error('boom'))
     const { store } = renderPane('pane-2')
-    const chip = await waitFor(() => screen.getByTitle('Model: claude-opus-5'))
+    const chip = await waitFor(() => screen.getByTitle(/^Model: claude-opus-5(?: ·|$)/))
     await act(async () => { fireEvent.click(chip) })
     const option = await waitFor(() => screen.getByRole('option', { name: /claude-sonnet-5/ }))
     await act(async () => { fireEvent.click(option) })
@@ -124,7 +124,7 @@ describe('ChatPane — model switch updates the pane label without a slot-list r
 
   it('agent pick writes agent AND workspace to the store on API success (#5120)', async () => {
     const { store } = renderPane('pane-3')
-    const chip = await waitFor(() => screen.getByTitle('Agent: default'))
+    const chip = await waitFor(() => screen.getByTitle(/^Agent: default(?:\s|$)/))
     const slotsFetchesBeforePick = vi.mocked(api.chatSlots).mock.calls.length
     await act(async () => { fireEvent.click(chip) })
     const option = await waitFor(() => screen.getByRole('option', { name: /writer/ }))
@@ -143,7 +143,7 @@ describe('ChatPane — model switch updates the pane label without a slot-list r
   it('keeps the pre-switch agent when the agent switch fails (#5120)', async () => {
     vi.mocked(api.chatSlotAgent).mockRejectedValueOnce(new Error('boom'))
     const { store } = renderPane('pane-4')
-    const chip = await waitFor(() => screen.getByTitle('Agent: default'))
+    const chip = await waitFor(() => screen.getByTitle(/^Agent: default(?:\s|$)/))
     await act(async () => { fireEvent.click(chip) })
     const option = await waitFor(() => screen.getByRole('option', { name: /writer/ }))
     await act(async () => { fireEvent.click(option) })

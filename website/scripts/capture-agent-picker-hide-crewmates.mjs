@@ -1,6 +1,6 @@
 /**
- * Screenshot harness for the chat agent picker while `HIDE_CREWMATE_CHOICES` is
- * on: the pop-up lists templates only, with no group header and no templates
+ * Screenshot harness for the chat agent picker while crewmates are hidden
+ * (`dashboard.crewmates_in_agent_picker` is not `true`): the pop-up lists templates only, with no group header and no templates
  * hint.
  *
  * Runs the REAL built SPA (website/dist) behind the shared `serveDist` server and
@@ -94,10 +94,10 @@ for (const theme of ['light', 'dark']) {
   if (JSON.stringify(names) !== JSON.stringify(expected)) {
     throw new Error(`picker rows ${JSON.stringify(names)} != templates ${JSON.stringify(expected)}`)
   }
-  if (await picker.getByText('Agent templates', { exact: true }).count()) throw new Error('group header still rendered')
-  if (await picker.getByText('Crewmates', { exact: true }).count()) throw new Error('crewmates header still rendered')
-  if (await picker.getByText(/runs the shared template on shared memory/i).count()) throw new Error('templates hint still rendered')
-  if (await picker.locator('img').count()) throw new Error('a crewmate avatar is rendered, so a member row leaked')
+  if (await picker.getByText('Custom agents', { exact: true }).count()) throw new Error('group header still rendered')
+  if (await picker.getByText('Mates', { exact: true }).count()) throw new Error('mates header still rendered')
+  if (await picker.getByText(/nothing new is created/i).count()) throw new Error('templates hint still rendered')
+  if (await picker.locator('img').count()) throw new Error('a mate avatar is rendered, so a member row leaked')
 
   const out = join(OUT, `picker-templates-only-${theme}.png`)
   await picker.screenshot({ path: out })

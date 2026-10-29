@@ -9,8 +9,8 @@ name: Sign and Notarize macOS (reusable)
 #   sign      -- flatten build artifacts, attest provenance, upload unsigned
 #                artifacts to pre-signed/ in the PRIVATE signing bucket,
 #                submit the .app to the signing service. Nothing here is public-facing.
-#                (This job was historically duplicated in nightly.yml and
-#                release.yml under the misleading name "publish".)
+#                nightly.yml and release.yml call this workflow rather than
+#                carrying their own copy of the job.
 #   notarize  -- everything macOS-bound: Apple notarization, staple, the
 #                spctl fail-closed gate. The Apple credential is confined
 #                to this job. Ends by attaching the GATED artifact
@@ -28,15 +28,45 @@ name: Sign and Notarize macOS (reusable)
 # in this trust chain. It ships from publish-linux.yml, its own lane
 # called directly by nightly.yml / release.yml beside publish-cli.yml.)
 #
-# DMG history (2026-07-21): the DMG was briefly withdrawn after a field
-# defect -- hdiutil-created DMGs carry an ADHOC signature, which the Apple
-# notary service Accepts but Gatekeeper treats as "no usable signature",
-# showing "app is damaged" when a user drags the app out of the quarantined
-# mount (syspolicy_check: app passed, DMG failed). It is reinstated with a
-# proper Developer ID signature: a SECOND CDSigner task (manifest type:
-# dmg, see packaging/signing/sign-dmg.sh) signs the rebuilt DMG before its
-# notarization -- which also makes the DMG STAPLE-able (stapler fails with
-# Error 73 on unsigned DMGs), so first-install verification now works
+# Single-arch legs (mac_variant: arm64 | x64). The same three jobs run once
+# more per single-arch DMG that build-desktop.yml's mac_single_arch job
+# produced, each as its OWN workflow_call from the caller (nightly.yml, and
+# release.yml on both of its channels). One input changes five names and
+# nothing else:
+#   - the run downloads ONLY `mac_artifact` (unsigned-build-darwin-<arch>)
+#     instead of every artifact on the run, so the wheel/sdist/AppImage
+#     provenance step is the universal leg's alone (`if` below);
+#   - every bucket key that the .app name alone used to derive gets a
+#     "-<arch>" suffix (SIGN_KEY_SUFFIX -> packaging/signing/sign.sh,
+#     ARTIFACT_BASENAME -> notarized/, desktop/ and the latest-DMG alias), so
+#     three legs signing the same channel+version cannot overwrite each
+#     other's request or read back another leg's bytes;
+#   - the gated artifact is KiroCrew-notarized-<channel>-<version>-<arch>, and
+#     the zip INSIDE it is notarized-<arch>.zip (NOTARIZED_ZIP): the stable
+#     promotion bundle holds all three legs' files in ONE directory, so the
+#     zip has to carry its arch in its own name, and a promote-mode leg then
+#     reads the same name out of the bundle that a fresh leg wrote into its
+#     gated artifact -- one spelling, both modes;
+#   - the channel file lands at feed/<channel>/<arch>/latest-mac.yml
+#     (FEED_PREFIX), one directory below the universal one, which is how
+#     website/electron/auto-update.js's `variant` already separates the two
+#     Linux package formats: electron-updater derives the file NAME from the
+#     platform with no arch suffix on macOS, so the DIRECTORY is the only
+#     seam. A single-arch app reads `desktopDistArch` from its own
+#     package.json (stamped by packaging/build-desktop.sh) and resolves that
+#     directory; the universal app has no stamp and keeps resolving
+#     feed/<channel>/latest-mac.yml, whose bytes this change never touches.
+# With mac_variant empty, every expression below collapses to the exact
+# string it was before, so the universal leg is byte-for-byte unchanged.
+#
+# DMG signing: hdiutil-created DMGs carry an ADHOC signature, which the
+# Apple notary service Accepts but Gatekeeper treats as "no usable
+# signature", showing "app is damaged" when a user drags the app out of the
+# quarantined mount (syspolicy_check: app passed, DMG failed). So the DMG
+# gets its own Developer ID signature: a SECOND CDSigner task (manifest
+# type: dmg, see packaging/signing/sign-dmg.sh) signs the rebuilt DMG before
+# its notarization -- which also makes the DMG STAPLE-able (stapler fails
+# with Error 73 on unsigned DMGs), so first-install verification works
 # fully offline. A fail-closed spctl gate below enforces the end state.
 #
 # Key properties:
@@ -70,10 +100,28 @@ on:
         required: true
         type: string
       write_feed:
-        description: "Publish to the distribution bucket and write feed/<channel>/latest-mac.yml"
+        description: "Publish to the distribution bucket and write feed/<channel>[/<mac_variant>]/latest-mac.yml. Runs only when vars.CLI_DIST_BUCKET is set; the feed (latest-mac.yml/.json) and the latest-DMG alias move only when the feed guard returns advance -- on hold, versioned assets still publish"
         required: false
         type: boolean
         default: true
+      mac_variant:
+        description: >-
+          Single-arch leg: arm64 | x64, or empty for the universal DMG.
+          Suffixes every bucket key and the gated artifact with -<arch> and
+          writes the channel file one directory down
+          (feed/<channel>/<arch>/latest-mac.yml). See the header note.
+        required: false
+        type: string
+        default: ""
+      mac_artifact:
+        description: >-
+          Name of the ONE build artifact to download (the single-arch legs
+          pass unsigned-build-darwin-<arch>). Empty downloads every artifact
+          on the run, which is what the universal leg needs for the
+          wheel/sdist/AppImage provenance it also attests.
+        required: false
+        type: string
+        default: ""
       promote:
         description: "Publish an already notarized candidate bundle without rebuilding"
         required: false
@@ -120,7 +168,9 @@ jobs:
     name: Sign with signing service (${{ inputs.channel }})
     if: ${{ !inputs.promote }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Upload of a ~1 GB zip plus sign.sh's 45-minute poll window (MAX_WAIT)
+    # must both fit; the notarize job keeps its own budget.
+    timeout-minutes: 60
     # OIDC subject alignment: tag-triggered callers (release.yml) present
     # ref:refs/tags/<tag>, which the signing role does not trust. The prod
     # environment switches the subject to environment:prod, which it does.
@@ -135,25 +185,55 @@ jobs:
       HAS_CDSIGNER: ${{ secrets.CDSIGNER_API_ENDPOINT != '' && 'true' || '' }}
       CHANNEL: ${{ inputs.channel }}
       VERSION: ${{ inputs.version }}
+      # "-<arch>" on a single-arch leg, empty on the universal one. Read by
+      # packaging/signing/sign.sh (bucket keys) and mirrored into
+      # signed_zip_key below, which must name the same object.
+      SIGN_KEY_SUFFIX: ${{ inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: packaging/signing
           persist-credentials: false
 
+      # An empty `name` is "not given" to download-artifact, which then
+      # downloads every artifact on the run into artifacts/<name>/ -- the
+      # universal leg. A single-arch leg names its one build artifact, whose
+      # files land directly under artifacts/.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: ${{ inputs.mac_artifact }}
           path: artifacts
 
       - name: Flatten artifacts
+        # On the universal leg every artifact of the run lands under
+        # artifacts/<artifact-name>/, and this lane signs and feeds ONE DMG:
+        # the "*-mac.zip | head -1" pick and the exactly-one-DMG assertion
+        # below both assume the universal build is the only mac artifact in
+        # release/. So the two single-arch build artifacts (build-desktop.yml's
+        # `build-desktop-mac-single-arch` job) stay OUT, and so does any gated
+        # artifact a single-arch leg running IN PARALLEL may already have
+        # attached to this run (KiroCrew-notarized-<channel>-<version>-<arch>,
+        # holding a notarized.zip and a second DMG). Excluding by artifact
+        # name, not by file name, keeps the universal path byte-identical.
+        # On a single-arch leg the one named artifact lands directly under
+        # artifacts/, so none of these paths match and the find copies its
+        # zip and DMG alone.
         run: |
           mkdir -p release
-          find artifacts -type f \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" \) -exec cp {} release/ \;
+          find artifacts -type f \
+            -not -path "artifacts/unsigned-build-darwin-arm64/*" \
+            -not -path "artifacts/unsigned-build-darwin-x64/*" \
+            -not -path "artifacts/KiroCrew-notarized-*/*" \
+            \( -name "*.whl" -o -name "*.tar.gz" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" \) -exec cp {} release/ \;
           ls -la release/
 
       - name: Attest build provenance
         # Signed SLSA provenance for the wheel/sdist/AppImage (CWE-1104).
         # Runs right after flatten, before anything leaves the runner.
+        # Universal leg only: a single-arch leg downloaded nothing but its
+        # mac zip and DMG, neither of which is attested here (see below), and
+        # the action fails on an empty subject set.
+        if: ${{ inputs.mac_variant == '' }}
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           # Attest only artifacts whose bytes are final here. The macOS .zip is
@@ -185,7 +265,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: env.HAS_SIGNING_SECRETS
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
           aws-region: us-west-2
@@ -231,7 +311,8 @@ jobs:
           # slug of the bundle name ("KiroCrew Nightly" -> "KiroCrew-Nightly").
           APP_SLUG="$(basename "$APP_PATH" .app)"
           APP_SLUG="${APP_SLUG// /-}"
-          echo "signed_zip_key=signed/${CHANNEL}/${VERSION}/${APP_SLUG}.zip" >> "$GITHUB_OUTPUT"
+          # Same key sign.sh wrote: slug + SIGN_KEY_SUFFIX (empty on universal).
+          echo "signed_zip_key=signed/${CHANNEL}/${VERSION}/${APP_SLUG}${SIGN_KEY_SUFFIX}.zip" >> "$GITHUB_OUTPUT"
           shopt -s nullglob
           UNSIGNED_DMGS=(release/*.dmg)
           shopt -u nullglob
@@ -260,14 +341,21 @@ jobs:
     if: needs.sign.outputs.signed_zip_key != ''
     runs-on: macos-15
     # Worst-case wait budget: two notarizations (app, then DMG) at up to
-    # 30m each -- packaging/signing/notarize.sh enforces that 30m as a hard
-    # ceiling over submit + poll INCLUDING any transient-error retries and
-    # backoff, so it cannot grow past the old `--wait --timeout 30m` -- plus
-    # the CDSigner DMG sign task poll at up to 15m = 75m of pure waiting.
-    # The budget must also cover checkout, installs, downloads, DMG build,
-    # staple, attestation, and uploads, or GitHub cancels the job
+    # NOTARIZE_BUDGET_SECS (60m, set in env below) each --
+    # packaging/signing/notarize.sh enforces that as a hard ceiling over
+    # submit + poll INCLUDING any transient-error retries and backoff --
+    # plus the CDSigner DMG sign task poll at up to 15m = 135m of pure
+    # waiting. The budget must also cover checkout, installs, downloads, DMG
+    # build, staple, attestation, and uploads, or GitHub cancels the job
     # mid-publication on a legitimately slow day.
-    timeout-minutes: 90
+    #
+    # Why 60m and not the script's 30m default: the universal app zip is
+    # about 1 GB, twice a single-arch one, and Apple kept it "In Progress"
+    # past 30m on four release attempts in a row (0.9.0-insider.1 and
+    # 0.9.0-insider.2, each with a rerun) while the single-arch legs of the
+    # same runs passed. The budget is a ceiling, so a healthy run is not
+    # slowed by it.
+    timeout-minutes: 150
     # OIDC subject alignment: tag-triggered callers (release.yml) present
     # ref:refs/tags/<tag>, which the signing role does not trust. The prod
     # environment switches the subject to environment:prod, which it does.
@@ -286,12 +374,26 @@ jobs:
       VERSION: ${{ inputs.version }}
       SIGNED_ZIP_KEY: ${{ needs.sign.outputs.signed_zip_key }}
       UNSIGNED_DMG_KEY: ${{ needs.sign.outputs.unsigned_dmg_key }}
+      # Read by packaging/signing/notarize.sh for both submissions (app zip
+      # and DMG). See the timeout-minutes note above for why it is 60m.
+      NOTARIZE_BUDGET_SECS: "3600"
       # Published FILENAMES are pinned to this basename on every channel even
       # though the nightly BUNDLE is "KiroCrew Nightly.app": CDN keys and the
       # latest-DMG permalink (desktop/<channel>/latest/KiroCrew.dmg) are a
       # public contract, and deriving filenames from the bundle name would
-      # silently rename the keys and break the permalink.
-      ARTIFACT_BASENAME: KiroCrew
+      # silently rename the keys and break the permalink. A single-arch leg
+      # appends its arch (KiroCrew-arm64 / KiroCrew-x64): the stem of the
+      # notarized/ and desktop/ keys, the shipping DMG and the latest-DMG
+      # alias, so three legs of one channel+version never share a key.
+      ARTIFACT_BASENAME: ${{ format('KiroCrew{0}', inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '') }} # brand-ok
+      # The stapled app zip as it travels in the gated artifact and in the
+      # stable promotion bundle: notarized.zip on the universal leg,
+      # notarized-<arch>.zip on a single-arch one. The bundle holds every
+      # leg's files in one flat directory, so the arch has to live in the
+      # file name; naming it the same way on the fresh path means the publish
+      # job below reads one spelling whether its input is this leg's own
+      # gated artifact or the promoted bundle.
+      NOTARIZED_ZIP: ${{ format('notarized{0}.zip', inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -312,7 +414,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: env.HAS_SIGNING_SECRETS
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
           aws-region: us-west-2
@@ -344,7 +446,7 @@ jobs:
 
           # Submit + poll with transient-error retry (a single timed-out
           # status request must not fail the job); fail-closed on
-          # Invalid/Rejected with the itemized Apple log. 30m budget.
+          # Invalid/Rejected with the itemized Apple log. Budget: NOTARIZE_BUDGET_SECS.
           bash packaging/signing/notarize.sh work/signed.zip
 
       - name: Staple and verify
@@ -357,8 +459,49 @@ jobs:
           APP=$(find . -maxdepth 1 -name "*.app" | head -1)
           [ -n "$APP" ] || { echo "No .app found in signed zip"; exit 1; }
 
-          xcrun stapler staple "$APP"
-          xcrun stapler validate "$APP"
+          # staple and validate each fetch the ticket from Apple's CloudKit
+          # endpoint, and that lookup can drop mid-call (NSURLError -1005,
+          # "The network connection was lost", stapler Error 68). Retry both.
+          # A staple that fails on the lookup writes nothing to the bundle,
+          # and a staple on an already stapled bundle rewrites the same
+          # ticket, so a retry is safe. Validate only re-asks CloudKit whether
+          # the ticket that staple just embedded exists, so once staple has
+          # succeeded a validate that still cannot reach CloudKit is a
+          # warning, not a failure: the spctl gate below is the authoritative
+          # Gatekeeper check and stays fail-closed. Any other validate error
+          # still fails the step.
+          stapled=0
+          staple_out=""
+          for attempt in 1 2 3 4 5; do
+            if staple_out=$(xcrun stapler staple "$APP" 2>&1); then
+              echo "$staple_out"
+              stapled=1
+              break
+            fi
+            echo "$staple_out"
+            echo "stapler staple attempt $attempt/5 failed"
+            if [ "$attempt" -lt 5 ]; then sleep $(( 5 << (attempt - 1) )); fi
+          done
+          [ "$stapled" -eq 1 ] || { echo "stapler staple failed after 5 attempts"; exit 1; }
+          validated=0
+          validate_out=""
+          for attempt in 1 2 3 4 5; do
+            if validate_out=$(xcrun stapler validate "$APP" 2>&1); then
+              echo "$validate_out"
+              validated=1
+              break
+            fi
+            echo "$validate_out"
+            echo "stapler validate attempt $attempt/5 failed"
+            if [ "$attempt" -lt 5 ]; then sleep $(( 5 << (attempt - 1) )); fi
+          done
+          if [ "$validated" -ne 1 ]; then
+            if echo "$validate_out" | grep -qE 'NSURLErrorDomain|network connection was lost|-1005'; then
+              echo "::warning::stapler validate failed after 5 attempts on a CloudKit network error; the ticket is already stapled, so deferring to the spctl gate below"
+            else
+              echo "stapler validate failed after 5 attempts"; exit 1
+            fi
+          fi
 
           ASSESS=$(spctl --assess --type execute --verbose "$APP" 2>&1)
           echo "$ASSESS"
@@ -368,14 +511,14 @@ jobs:
           }
 
           # ditto preserves the resource fork carrying the stapled ticket.
-          /usr/bin/ditto -c -k --keepParent "$APP" ../notarized.zip
+          /usr/bin/ditto -c -k --keepParent "$APP" "../${NOTARIZED_ZIP}"
           echo "APP_NAME=$(basename "$APP" .app)" >> "$GITHUB_ENV"
 
       - name: Upload notarized artifact to S3
         if: env.HAS_SIGNING_SECRETS
         run: |
           KEY="notarized/${CHANNEL}/${VERSION}/${ARTIFACT_BASENAME}.zip"
-          aws s3 cp work/notarized.zip "s3://${{ secrets.AWS_SIGNING_BUCKET }}/${KEY}" --only-show-errors
+          aws s3 cp "work/${NOTARIZED_ZIP}" "s3://${{ secrets.AWS_SIGNING_BUCKET }}/${KEY}" --only-show-errors
           echo "NOTARIZED_KEY=${KEY}" >> "$GITHUB_ENV"
           echo "Notarized artifact: s3://${{ secrets.AWS_SIGNING_BUCKET }}/${KEY}"
 
@@ -439,8 +582,39 @@ jobs:
         if: env.HAS_SIGNING_SECRETS
         run: |
           set -euo pipefail
-          xcrun stapler staple "work/${ARTIFACT_BASENAME}.dmg"
-          xcrun stapler validate "work/${ARTIFACT_BASENAME}.dmg"
+          # Same CloudKit lookup and the same safe retry as the app above.
+          stapled=0
+          staple_out=""
+          for attempt in 1 2 3 4 5; do
+            if staple_out=$(xcrun stapler staple "work/${ARTIFACT_BASENAME}.dmg" 2>&1); then
+              echo "$staple_out"
+              stapled=1
+              break
+            fi
+            echo "$staple_out"
+            echo "stapler staple attempt $attempt/5 failed"
+            if [ "$attempt" -lt 5 ]; then sleep $(( 5 << (attempt - 1) )); fi
+          done
+          [ "$stapled" -eq 1 ] || { echo "stapler staple failed after 5 attempts"; exit 1; }
+          validated=0
+          validate_out=""
+          for attempt in 1 2 3 4 5; do
+            if validate_out=$(xcrun stapler validate "work/${ARTIFACT_BASENAME}.dmg" 2>&1); then
+              echo "$validate_out"
+              validated=1
+              break
+            fi
+            echo "$validate_out"
+            echo "stapler validate attempt $attempt/5 failed"
+            if [ "$attempt" -lt 5 ]; then sleep $(( 5 << (attempt - 1) )); fi
+          done
+          if [ "$validated" -ne 1 ]; then
+            if echo "$validate_out" | grep -qE 'NSURLErrorDomain|network connection was lost|-1005'; then
+              echo "::warning::stapler validate failed after 5 attempts on a CloudKit network error; the ticket is already stapled, so deferring to the spctl gate below"
+            else
+              echo "stapler validate failed after 5 attempts"; exit 1
+            fi
+          fi
           ASSESS=$(spctl --assess --type install --verbose "work/${ARTIFACT_BASENAME}.dmg" 2>&1)
           echo "$ASSESS"
           echo "$ASSESS" | grep -q "Notarized Developer ID" || {
@@ -455,7 +629,7 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            work/notarized.zip
+            work/${{ env.NOTARIZED_ZIP }}
             work/*.dmg
 
       # The GATED artifact: attached only after the spctl gate above. This
@@ -465,9 +639,9 @@ jobs:
         if: env.HAS_SIGNING_SECRETS
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: KiroCrew-notarized-${{ inputs.channel }}-${{ inputs.version }}
+          name: ${{ format('KiroCrew-notarized-{0}-{1}{2}', inputs.channel, inputs.version, inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '') }}
           path: |
-            work/notarized.zip
+            work/${{ env.NOTARIZED_ZIP }}
             work/*.dmg
           if-no-files-found: error
           retention-days: 14
@@ -506,7 +680,21 @@ jobs:
       CHANNEL: ${{ inputs.channel }}
       VERSION: ${{ inputs.version }}
       # Pinned published basename -- see the notarize job's env comment.
-      ARTIFACT_BASENAME: KiroCrew
+      ARTIFACT_BASENAME: ${{ format('KiroCrew{0}', inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '') }} # brand-ok
+      # Directory the channel file lives in: feed/<channel> for the universal
+      # DMG, feed/<channel>/<arch> for a single-arch one. The file name inside
+      # it is always latest-mac.yml -- electron-updater derives that from the
+      # platform alone, so a per-arch feed can only differ by directory, the
+      # same seam auto-update.js's `variant` already uses for Linux formats.
+      # The legacy latest-mac.json bridge follows the same directory: no
+      # pre-electron-updater client ever ran a single-arch build, so under an
+      # arch directory it is inert, and keeping it lets every pointer step
+      # carry one gate (test_feed_chain_steps_share_one_skip_gate).
+      FEED_PREFIX: ${{ inputs.mac_variant != '' && format('feed/{0}/{1}', inputs.channel, inputs.mac_variant) || format('feed/{0}', inputs.channel) }}
+      # Same spelling the notarize job wrote (see its env comment). On the
+      # promotion path work/ is the whole stable bundle, in which every leg's
+      # zip sits beside the others -- this is the name that picks this leg's.
+      NOTARIZED_ZIP: ${{ format('notarized{0}.zip', inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '') }}
     steps:
       # UNCONDITIONAL, and it has to stay that way. This used to be gated on
       # `inputs.promote` because only the promotion path read repo files
@@ -523,7 +711,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: env.HAS_SIGNING_SECRETS
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
           aws-region: us-west-2
@@ -532,7 +720,7 @@ jobs:
         if: env.HAS_SIGNING_SECRETS
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ${{ inputs.promote && inputs.promotion_artifact || format('KiroCrew-notarized-{0}-{1}', inputs.channel, inputs.version) }}
+          name: ${{ inputs.promote && inputs.promotion_artifact || format('KiroCrew-notarized-{0}-{1}{2}', inputs.channel, inputs.version, inputs.mac_variant != '' && format('-{0}', inputs.mac_variant) || '') }}
           path: work
 
       - name: Verify immutable promotion bundle
@@ -548,7 +736,7 @@ jobs:
       - name: Verify promoted macOS provenance
         if: env.HAS_SIGNING_SECRETS && inputs.promote
         run: |
-          gh attestation verify work/notarized.zip \
+          gh attestation verify "work/${NOTARIZED_ZIP}" \
             --repo "${{ github.repository }}" \
             --signer-workflow "${{ github.repository }}/.github/workflows/sign-and-notarize.yml"
           gh attestation verify "work/${ARTIFACT_BASENAME}.dmg" \
@@ -560,7 +748,7 @@ jobs:
         run: |
           set -euo pipefail
           ls -la work/
-          [ -f "work/notarized.zip" ] || { echo "notarized.zip missing from gated artifact"; exit 1; }
+          [ -f "work/${NOTARIZED_ZIP}" ] || { echo "${NOTARIZED_ZIP} missing from gated artifact"; exit 1; }
           [ -f "work/${ARTIFACT_BASENAME}.dmg" ] || { echo "${ARTIFACT_BASENAME}.dmg missing from gated artifact"; exit 1; }
 
       # The versioned zip key is immutable-cached by CloudFront, so it must
@@ -578,7 +766,7 @@ jobs:
           PUT_OUT=$(aws s3api put-object \
             --bucket "${{ vars.CLI_DIST_BUCKET }}" \
             --key "${DESKTOP_KEY}" \
-            --body work/notarized.zip \
+            --body "work/${NOTARIZED_ZIP}" \
             --if-none-match '*' \
             --content-type application/zip \
             --cache-control "public, max-age=31536000, immutable" 2>&1)
@@ -636,17 +824,16 @@ jobs:
       # injects one either. A feed written without it therefore reaches
       # clients with no freshness metadata at all, and CFNetwork applies
       # HEURISTIC caching (~10% of the object's age, so a day-old feed earns
-      # itself hours of "fresh"). That is the #709 incident: a header-less
-      # feed made the desktop app re-resolve a stale entry for hours,
-      # offering to "update" to the version already installed.
+      # itself hours of "fresh"). A header-less feed makes the desktop app
+      # re-resolve a stale entry for hours, offering to "update" to the
+      # version already installed.
       #
-      # NOTE ON WHAT CHANGED: that incident was specifically Squirrel.Mac's
-      # OWN feed request, which went through NSURLCache. Since the
-      # electron-updater migration, Squirrel.Mac never fetches this feed --
-      # MacUpdater downloads the artifact itself and serves it to Squirrel
-      # from a loopback proxy (127.0.0.1). So the NSURLCache hazard now
-      # applies to the LEGACY bridge below, whose readers are exactly the
-      # pre-migration clients that still fetch through it. The header stays
+      # WHICH CLIENTS: the NSURLCache hazard is Squirrel.Mac's OWN feed
+      # request. Squirrel.Mac never fetches this feed under electron-updater
+      # -- MacUpdater downloads the artifact itself and serves it to Squirrel
+      # from a loopback proxy (127.0.0.1). So the NSURLCache hazard applies
+      # to the LEGACY bridge below, whose readers are exactly the
+      # pre-electron-updater clients that still fetch through it. The header stays
       # mandatory on BOTH: electron-updater's own fetch goes through
       # Chromium's cache (it also appends its own noCache query), and a build
       # already in the field cannot be given a header fix retroactively.
@@ -690,8 +877,8 @@ jobs:
         id: feed
         run: |
           set -euo pipefail
-          ZIP_SHA512=$(openssl dgst -sha512 -binary work/notarized.zip | base64 -w 0)
-          ZIP_SIZE=$(stat -c%s work/notarized.zip)
+          ZIP_SHA512=$(openssl dgst -sha512 -binary "work/${NOTARIZED_ZIP}" | base64 -w 0)
+          ZIP_SIZE=$(stat -c%s "work/${NOTARIZED_ZIP}")
           DMG_SHA512=$(openssl dgst -sha512 -binary "work/${ARTIFACT_BASENAME}.dmg" | base64 -w 0)
           DMG_SIZE=$(stat -c%s "work/${ARTIFACT_BASENAME}.dmg")
 
@@ -706,7 +893,8 @@ jobs:
           # bridge, which carries no checksum, would happily install the old
           # one. That split is worse than a failed publish, so abort instead.
           # (This also catches CloudFront edge divergence on a republished
-          # immutable key -- the #62 hazard.)
+          # immutable key: a versioned key is never republished with
+          # different bytes.)
           verify_published() {  # $1=url  $2=expected base64 sha512  $3=label
             local got
             got=$(curl -fsS --retry 3 --retry-delay 2 "$1" | openssl dgst -sha512 -binary | base64 -w 0)
@@ -735,7 +923,7 @@ jobs:
           # degraded evidence -- the exact rollback this guard prevents.
           FEED_HTTP=$(curl -sS --retry 3 --retry-delay 2 \
             -o /tmp/current-feed.yml -w '%{http_code}' \
-            "${{ vars.CLI_CDN_BASE }}/feed/${CHANNEL}/latest-mac.yml") \
+            "${{ vars.CLI_CDN_BASE }}/${FEED_PREFIX}/latest-mac.yml") \
             || { echo "::error::channel feed fetch failed (transport)"; exit 1; }
           case "$FEED_HTTP" in
             200) ;;
@@ -752,7 +940,7 @@ jobs:
             --tags-file /tmp/repo-tags.txt --self "${GITHUB_REF_NAME}" || true)
           if [ "$VERDICT" = "hold" ]; then
             echo "advance=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::feed/${CHANNEL}/latest-mac.yml already serves a newer version; pointer NOT moved (hotfix on an old line). Versioned assets are published."
+            echo "::notice::${FEED_PREFIX}/latest-mac.yml already serves a newer version; pointer NOT moved (hotfix on an old line). Versioned assets are published."
             exit 0
           elif [ "$VERDICT" != "advance" ]; then
             echo "::error::feed guard returned neither advance nor hold (got: '${VERDICT}')"
@@ -773,14 +961,14 @@ jobs:
           releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%SZ)'
           EOF
           aws s3 cp /tmp/latest-mac.yml \
-            "s3://${{ vars.CLI_DIST_BUCKET }}/feed/${CHANNEL}/latest-mac.yml" \
+            "s3://${{ vars.CLI_DIST_BUCKET }}/${FEED_PREFIX}/latest-mac.yml" \
             --content-type text/yaml \
             --cache-control "public, max-age=300"
-          echo "Feed written: feed/${CHANNEL}/latest-mac.yml -> ${{ vars.CLI_CDN_BASE }}/${DESKTOP_KEY}"
+          echo "Feed written: ${FEED_PREFIX}/latest-mac.yml -> ${{ vars.CLI_CDN_BASE }}/${DESKTOP_KEY}"
           # Verify the header CLIENTS actually receive, through the public CDN.
-          # Carried over from #709, which fixed a real incident: a feed served
-          # WITHOUT Cache-Control got heuristically cached and the updater
-          # resolved an already-installed version. electron-updater also appends
+          # A feed served WITHOUT Cache-Control gets heuristically cached and
+          # the updater resolves an already-installed version, so the feed
+          # must carry an explicit max-age. electron-updater also appends
           # its own noCache query (isAddNoCacheQuery), but that is the client
           # belt -- this is the origin-side braces, and a build already in the
           # field cannot be given a header fix retroactively.
@@ -792,7 +980,7 @@ jobs:
           # a guard that fails on permissions instead of on the condition it
           # guards.
           FEED_CC=$(curl -fsS --retry 3 --retry-delay 2 \
-            -I "${{ vars.CLI_CDN_BASE }}/feed/${CHANNEL}/latest-mac.yml" \
+            -I "${{ vars.CLI_CDN_BASE }}/${FEED_PREFIX}/latest-mac.yml" \
             | tr -d '\r' | awk -F': ' 'tolower($1)=="cache-control"{print $2}')
           echo "Feed Cache-Control as served: ${FEED_CC:-<none>}"
           case "$FEED_CC" in
@@ -834,10 +1022,10 @@ jobs:
           }
           EOF
           aws s3 cp /tmp/latest-mac.json \
-            "s3://${{ vars.CLI_DIST_BUCKET }}/feed/${CHANNEL}/latest-mac.json" \
+            "s3://${{ vars.CLI_DIST_BUCKET }}/${FEED_PREFIX}/latest-mac.json" \
             --content-type application/json \
             --cache-control "public, max-age=300"
-          echo "Legacy feed written: feed/${CHANNEL}/latest-mac.json (transition bridge)"
+          echo "Legacy feed written: ${FEED_PREFIX}/latest-mac.json (transition bridge)"
           # Verify the header CLIENTS actually receive, through the public CDN.
           # NOT `s3api head-object`: the publish role is Put-only on feed/*
           # (KiroCrewPublishCDK distribution-stack.ts grants s3:GetObject on
@@ -850,7 +1038,7 @@ jobs:
           # distribution, and feed/* is CACHING_DISABLED, so this response
           # comes from origin and reflects the object just written.
           FEED_CC=$(curl -fsS --retry 3 --retry-delay 2 \
-            -I "${{ vars.CLI_CDN_BASE }}/feed/${CHANNEL}/latest-mac.json" \
+            -I "${{ vars.CLI_CDN_BASE }}/${FEED_PREFIX}/latest-mac.json" \
             | tr -d '\r' | sed -n 's/^[Cc]ache-[Cc]ontrol: //p' | head -1)
           if [ "${FEED_CC}" != "public, max-age=300" ]; then
             echo "::error::feed Cache-Control is '${FEED_CC}', expected 'public, max-age=300' -- a feed served without explicit freshness lets clients heuristically cache a stale pointer"
@@ -898,7 +1086,7 @@ jobs:
             echo "- Public DMG: ${{ vars.CLI_CDN_BASE }}/${DMG_KEY}"
             if [ "${{ steps.feed.outputs.advance }}" = "true" ]; then
               echo "- Latest DMG alias: ${{ vars.CLI_CDN_BASE }}/${LATEST_DMG_KEY}"
-              echo "- Feed: \`feed/${CHANNEL}/latest-mac.yml\`"
+              echo "- Feed: \`${FEED_PREFIX}/latest-mac.yml\`"
             else
               echo "- Feed: not moved (channel already serves a newer version)"
             fi

@@ -44,6 +44,7 @@ import kiro_crew
 from kiro_crew import link_unfurl, platform_compat, sandbox
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.config.paths import config_dir
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.security import (
     DENIED_ROOT_PARTS,
     is_sensitive_path,
@@ -329,6 +330,16 @@ def _served_signature(build_dir: Path) -> _ServedToken | None:
     symlinked directory nor a symlinked file as one, and skips dot-entries, so none
     of those is ever reachable over the preview server — and none is signed here.
 
+    Matching that test needs ``is_link_or_junction``, not ``os.path.islink``. Node's
+    Dirent reports a Windows junction as a symbolic link and therefore serves nothing
+    behind it, while ``os.path.islink`` calls the same junction a plain directory —
+    so the bare check descended into it and signed bytes the server will not serve.
+    Nothing outside ``build_dir`` is disclosed by that (the token is a digest, and it
+    is never served), but it is exactly the "false mismatches and needless
+    re-captures" this paragraph rules out, it lets an unserved tree raise
+    ``newest_mtime_ns`` for the mid-capture check, and its files count against
+    ``_SIGNATURE_MAX_FILES``.
+
     Returns ``None`` whenever the served set cannot be read in full: missing,
     unreadable, or larger than ``_SIGNATURE_MAX_FILES``. A caller MUST treat ``None``
     as "unknown" rather than "unchanged" and refuse reuse — a token over part of a
@@ -352,7 +363,8 @@ def _served_signature(build_dir: Path) -> _ServedToken | None:
             dirs[:] = sorted(
                 d
                 for d in dirs
-                if not d.startswith(".") and not os.path.islink(os.path.join(root, d))
+                if not d.startswith(".")
+                and not platform_compat.is_link_or_junction(os.path.join(root, d))
             )
             # Each directory's own mtime feeds ``newest_mtime_ns`` but NOT the digest.
             # It has to feed the former because a DELETION leaves no file behind to
@@ -365,7 +377,7 @@ def _served_signature(build_dir: Path) -> _ServedToken | None:
             rel_root = os.path.relpath(root, build_dir)
             for name in sorted(files):
                 path = os.path.join(root, name)
-                if name.startswith(".") or os.path.islink(path):
+                if name.startswith(".") or platform_compat.is_link_or_junction(path):
                     continue
                 seen += 1
                 if seen > _SIGNATURE_MAX_FILES:
@@ -460,7 +472,9 @@ def _sweep_clones() -> None:
     for child in victims:
         try:
             if now - child.stat().st_mtime > _CLONE_TTL_SEC:
-                shutil.rmtree(child, ignore_errors=True)
+                # Counted as swept even if a file survives: the probe-cache purge below
+                # keys on this list, and a half-removed directory must not stay served.
+                platform_compat.rmtree_force(child)
                 removed.append(str(child))
         except OSError:
             continue
@@ -625,6 +639,22 @@ def _require_enabled(handler):
         return await handler(request)
 
     return _wrapped
+
+
+async def _owner_gate(request: web.Request, operation: str) -> web.Response | None:
+    """Owner gate for the host-touching POSTs (discover, render).
+
+    Both start host work: a git clone, a route scan over a host directory, a
+    headless Chromium run, PNGs written under the owner's data home. So a
+    dashboard caller must be the owner, and gets the shared 403 ``owner_only``
+    otherwise. A request with no app claim is judged the same way, so a
+    missing claim fails closed. An app token passes here: the token
+    middleware has already confirmed it holds this path, as its own namespace
+    or through a manifest ``permissions.api`` grant.
+    """
+    if not request.get("app"):
+        return await require_owner_dashboard_request(request, operation)
+    return None
 
 
 async def _json_object(
@@ -1062,7 +1092,7 @@ async def _discover_repo_job(value: str, vetted: list[str], git_bin: str) -> dic
         # now instead of waiting for the TTL sweep, so repeated failures cannot
         # accumulate and exhaust disk (ENOSPC). This does not change the success
         # path — a good clone is kept and rendered as before.
-        await asyncio.to_thread(shutil.rmtree, target, ignore_errors=True)
+        await asyncio.to_thread(platform_compat.rmtree_force, target)
         # GitHub says "Repository not found" for both a missing repo and a private
         # one you cannot read; do not guess which.
         return {
@@ -1082,6 +1112,9 @@ async def _discover_repo_job(value: str, vetted: list[str], git_bin: str) -> dic
 
 
 async def _handle_discover(request: web.Request) -> web.Response:
+    owner_denied = await _owner_gate(request, "design_critique.discover")
+    if owner_denied is not None:
+        return owner_denied
     body, err = await _json_object(request)
     if body is None:
         return err or _bad_request("invalid JSON", "invalid_json")
@@ -1362,6 +1395,9 @@ async def _render_capture_job(
 
 
 async def _handle_render(request: web.Request) -> web.Response:
+    owner_denied = await _owner_gate(request, "design_critique.render")
+    if owner_denied is not None:
+        return owner_denied
     body, err = await _json_object(request)
     if body is None:
         return err or _bad_request("invalid JSON", "invalid_json")

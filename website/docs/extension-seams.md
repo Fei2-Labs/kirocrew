@@ -22,7 +22,7 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 
 | Seam | Module | Registrar to reader |
 |------|--------|---------------------|
-| Builtin page routes | `apps/builtinRegistry.ts` | `registerBuiltinComponents()` to `getBuiltinComponent()` |
+| Builtin page routes | `apps/builtinRegistry.ts` | `registerBuiltinComponents()` to `getBuiltinApp(route)` (returns `{ component, appId }`) |
 | Nav icons | `apps/builtinIcons.tsx` | `registerBuiltinIcons()` to `getBuiltinIcon()` |
 | Theme branding | `themeBranding.tsx` | `registerThemeBranding()` to `getThemeBranding()` |
 | Theme picker options | `hooks/useTheme.tsx` | `registerTheme()` to `getRegisteredThemes()` |
@@ -38,13 +38,15 @@ POSTs the file context to the app's endpoint — see the App Kit publishing guid
 | Remote-instance provisioner forms | `components/remoteProvisionerRenderers.tsx` | `registerRemoteProvisionerRenderer()` to `getRemoteProvisionerRenderer()` / `canRenderRemoteProvisionerKind()` |
 | Bare-token autolink rules | `utils/autolinkRules.ts` | `registerAutolinkRules()` to `getAutolinkRules()` |
 
-Plus one **exported-transport** seam for edition-owned API methods. It is not a
-registry; see "API methods" below.
+Plus two **exported-setter** seams for a value the core consumes itself (the
+product name and the feedback tracker), one **exported-transport** seam for
+edition-owned API methods and one **data-module** seam for syntax-highlighting
+languages. None is a registry; see "Product name", "Feedback tracker", "API
+methods" and "Highlighting languages" below.
 
 Other `register*()` functions in `src/` (built-in surfaces, command-palette
-providers, tool pills, terminal sockets, highlight.js languages) are core-internal
-wiring, not edition seams. Only the fifteen above are called from the composition
-root.
+providers, tool pills, terminal sockets) are core-internal wiring, not edition
+seams. Only the fifteen above are called from the composition root.
 
 Fourteen of the fifteen are **additive** — the edition contributes a surface. The
 remaining one is **subtractive**: `suppressOverviewBuiltin()` removes a built-in
@@ -170,10 +172,10 @@ or the edition's hooks bind to a second instance. The symptoms are
 `Invalid hook call` (React), `No QueryClient set`, a null router context, or
 silently empty data, and they appear only at runtime, only in the edition build.
 
-`resolve.dedupe` in `vite.config.ts` covers seven packages: `react`, `react-dom`,
+`resolve.dedupe` in `vite.config.ts` reads `CONTEXT_SINGLETON_DEDUPE` from `website/vite.shared.ts`, which covers seven packages: `react`, `react-dom`,
 `react-redux`, `react-router`, `react-router-dom`, `@tanstack/react-query`,
 `framer-motion`. **When the core adds a new global-context provider, add its
-package to that list**, and the edition should declare these as peer deps. The
+package to `CONTEXT_SINGLETON_DEDUPE`**, and the edition should declare these as peer deps. The
 dedupe is harmless in the stock single-`node_modules` build.
 
 ## Authoring an edition: the build pitfalls
@@ -196,8 +198,9 @@ loads later wins — today that is the core, and every variable its default bloc
 also sets silently overrides the edition's. Nothing errors: the picker shows
 the theme, the palette stays stock.
 
-The built-in themes never hit this because their blocks live in `index.css`
-itself, after the default block — same sheet, later, wins.
+The built-in themes never hit this because their blocks live in
+`src/styles/theme-palettes.css`, which `index.css` imports after the default
+block in `src/styles/design-tokens.css` — same sheet, later, wins.
 
 Prescription: prefix the edition's theme selectors with `html`, which wins on
 specificity regardless of load order:
@@ -290,6 +293,31 @@ already-registered one) is resolved core-wins, and `reportSeamCollision`:
 - **degrades safe in production** (warn and ignore), so a shipped app never
   white-screens over a duplicate.
 
+Degrading safe is not the same as degrading **silently**, and closing that gap is
+not this module's job. An edition compiles its own bundle, so the dev/test throw
+never runs over its registrations: the first anyone hears of a refused one is a
+`console.warn` in a shipped app, which is how one edition shipped ten builtin
+pages that all clicked straight through to chat with no signal a user could see.
+The refusal is still not thrown at registration — that runs before `App` mounts,
+so a throw takes the whole dashboard down over one bad entry, which is worse than
+the entry being missing.
+
+**Remembering a refusal belongs to the seam that has somewhere to show it.**
+Today that is the builtin-page seam alone, because a refused route is a URL the
+user can still navigate to and find nothing at, so `builtinRegistry.ts` keeps its
+own `Map` of reasons and `builtinRefusalReason(route)` as the reader; nothing
+about it is in `seamCollision.ts`, which stays the shared fail-loud/degrade-safe
+policy and nothing more. Every other rejection leaves the core's own surface
+rendered rather than a blank the user can address — a rejected theme is absent
+from the picker, a rejected autolink rule leaves a token unlinked, a rejected
+renderer's row is filtered out before it can open an empty dialog — so a store
+there would be a generalisation with one consumer. A **duplicate** is not
+recorded either, at any seam: the key still resolves to the winning registration,
+so there is no empty space to explain and a record would only describe a
+registration that lost a race. A seam that later grows a user-reachable hole can
+keep its own record next to the miss path that reads it, which is where this one
+lives.
+
 The subtractive seam is deliberately **exempt**. `suppressOverviewBuiltin()` is a
 set, and a repeat is not a conflict: two owners cannot share one render slot, but
 two parties that both want a surface gone agree. So re-entrant registration (HMR,
@@ -303,10 +331,66 @@ an error.
 top-level path segment, `/^\/[A-Za-z0-9][A-Za-z0-9._~-]*$/`. `BuiltinAppRoute`
 resolves the catch-all `/:builtinApp` from one path parameter and matches only
 `location.pathname`, never the query or hash. So a multi-segment (`/reports/daily`),
-query (`/reports?daily`), hash (`/reports#x`), whitespace, or `.`/`..` route would
-register but never resolve, and navigation would redirect to chat. The mandatory
-alphanumeric first character is what excludes `.` and `..`. A non-conforming route
-routes through `reportSeamCollision`.
+query (`/reports?daily`), hash (`/reports#x`), dot-segment (`/../reports`),
+whitespace, or `.`/`..` route could
+never resolve as written. The mandatory alphanumeric first character is what
+excludes `.` and `..`. A non-conforming route routes through
+`reportSeamCollision`, as does an entry whose `appId` is missing or outside
+`[a-z0-9-]`.
+
+Both refusals are **recorded**, under the leading segment the router would have
+asked for rather than the string the entry was registered with — `/reports` for all
+four spellings above. That difference is the whole point: nothing can ask for
+`/reports/daily`, so a reason filed under it would be unreadable and the route
+would still vanish into chat. The record is written BEFORE `reportSeamCollision`,
+whose dev/test branch throws, so a dev/test run leaves the same record a
+production run leaves; and the first refusal for a key wins, since a second report
+describes a retry rather than the reason the key is empty. A route with no leading
+`/` is the one case that gets no synthesised key: no URL produces that spelling, so
+there is no empty page to explain, and inventing one would let a refusal for
+`reports` answer for the different key `/reports`.
+
+`BuiltinAppRoute` splits its miss path on that record. A path nobody registered is
+a typo or a stale link and still redirects to chat; a path whose registration was
+REFUSED renders instead, through the route's own `ErrorBoundary` so the failure is
+journaled to `recordError` and the RUM `react_error` event. What it renders is an
+explicit `fallback`, not the boundary's default card, for three reasons specific to
+a refusal: the default card's **"Try Again" cannot succeed** (the refusal is
+decided once at startup and immutable for the page load, so clearing the boundary
+re-throws the same reason), it **names no page** (nothing in the sidebar is active
+on a refused route, so the route goes in the heading), and it shows **only the
+registration diagnostic** — charsets and storage keys, addressed to whoever built
+the bundle. So a plain sentence leads, the diagnostic is kept below it under a
+label saying who it is for, and the only action offered is the agent hand-off,
+which carries that diagnostic into a chat that can act on it. What that hand-off
+does is stated in the page rather than in the button's `title`: a tooltip reaches
+neither keyboard nor touch, and on a page with one affordance a reader who cannot
+tell a context-carrying hand-off from a plain new chat is guessing at the only
+thing left to try. Supplying a
+`fallback` changes what RENDERS, never what is journaled: `componentDidCatch` runs
+either way, which is why the refusal is still thrown rather than rendered directly.
+
+Deriving that key is **normalisation plus percent-decoding, not string slicing**.
+The route is first run through `URL`, the normaliser the browser itself applies
+before the router sees anything: that cuts the query and hash on a LITERAL `?`/`#`
+and removes dot segments in every spelling, so `/../reports`, `/./reports` and
+`/%2e%2e/reports` are all asked for as `/reports`. Then the two passes
+react-router performs on what survives, worth mirroring exactly, because `%` is
+outside the route pattern and so every escaped route is refused — the class the
+record exists for. `decodePath` decodes every segment of the pathname under ONE
+try/catch, then `matchPath` turns `%2F` back into `/` on the captured parameter.
+So `/reports%2Ddaily` is asked for as `/reports-daily`, `/reports%2Fdaily`
+as `/reports/daily` — a `/` that stays INSIDE the one parameter, so the key is read
+to its end rather than cut there — and a double-encoded `%252F` resolves all the way
+to `/`. Three consequences a plain `decodeURIComponent` would get wrong: an encoded
+`%3F`/`%23` is still in the pathname and decodes inside the parameter, which is why
+the cut is on a literal one; one malformed escape anywhere leaves the
+WHOLE pathname undecoded, so `/x%2Dy/z%ZZ` keeps its `%2D`; and the decode cannot be
+allowed to throw, which would abandon every entry after the offending one in the
+same batch. Two spellings get no local key at all: a route with no leading `/`
+(above), and an **authority-relative** one — `//host/path`, plus the `/\host/path`
+and tab-smuggled forms the URL parser treats identically — which opens with a `/`
+but addresses another origin, where this build has no empty page to explain.
 
 **Panel shortcuts.** `registerPanelShortcut({ code, path, label })` identifies the
 chord solely by `KeyboardEvent.code`, and the displayed key is derived from that
@@ -326,7 +410,8 @@ ships in the edition's own overlay: this seam contributes only the picker entry.
 (core wins).
 
 **Theme branding reaches three consumers.** `getThemeBranding(colorTheme)` drives
-the `App.tsx` shell chrome, `WelcomeView.tsx` (the new-session brand mark), and
+the shell chrome (resolved once in `shell/branding.ts`, which the shell's header
+and rail read), `WelcomeView.tsx` (the new-session brand mark), and
 `pages/chat/ChatFooter.tsx` (the turn-running loader). A registered theme's `logo`
 shows in the first two, falling back to the stock ghost mark when the theme
 registers none. The loader contract is documented in
@@ -334,8 +419,8 @@ registers none. The loader contract is documented in
 
 A branding's optional `onActivate` side-effect fires on each transition into that
 theme, including the first render for the initially-active theme, because the
-"previous theme" ref starts empty. Keep it idempotent and cheap. `App.tsx` wraps
-the call in a `try`/`catch` so an edition-owned effect that throws cannot take
+"previous theme" ref starts empty. Keep it idempotent and cheap. `shell/branding.ts`
+wraps the call in a `try`/`catch` so an edition-owned effect that throws cannot take
 down the shell, but it still logs. `favicon` is handled the same generic way: the
 core has no per-theme favicon and falls back to `/logo.png`.
 
@@ -343,19 +428,23 @@ core has no per-theme favicon and falls back to `/logo.png`.
 mounts a status segment INSIDE the header's readout capsule, sharing its border,
 `|` dividers, and offline tint, rather than as a standalone sibling pill. Choose
 this over `registerTopBarWidgets` when the readout must join that grouping (a
-credential-TTL or spend segment, say). `App.tsx` splices registered segments after
+credential-TTL or spend segment, say). `shell/topbar/shellHeader.tsx` splices registered segments after
 the core segments in ascending `order`; each renders with an `offline` prop and is
-isolated in its own `ErrorBoundary` with `fallback={null}`.
+isolated in its own `ErrorBoundary` with `fallback={null}`. A segment must not
+change its size in response to the header's collapse classes (`tbl-N` / `tbr-N`)
+or level: the desktop bar picks the level by measuring its contents, so a
+segment that resizes with it re-lays the bar out without ever settling.
 
 **Top-bar widgets.** `registerTopBarWidgets([{ id, component }])` mounts a
 standalone pill in the header's right-hand actions area, next to the capsule.
 Widgets render in insertion order, take no props (each reads its own state or
-queries), and are each `ErrorBoundary`-isolated.
+queries), and are each `ErrorBoundary`-isolated. The same rule as for capsule
+segments applies: a widget's size must not depend on the collapse classes or
+level.
 
-**Theme centre decoration is a backdrop, not a cell.** `branding.topBar` used to
-render as a sized flow cell between the search and the actions group
-(`flex-1 min-w-0 h-full`). Under the three-track grid it renders as a full-header
-background layer instead: `absolute inset-0`, `pointer-events-none`,
+**Theme centre decoration is a backdrop, not a cell.** Under the three-track grid
+`branding.topBar` renders as a full-header background layer, not as a sized flow
+cell between the search and the actions group: `absolute inset-0`, `pointer-events-none`,
 `aria-hidden`. A fourth in-flow child would land in an implicit column and shift
 the search off centre, and a sweep or scanline is visually a backdrop anyway. The
 narrowed contract: a registered decoration **cannot receive pointer events** and
@@ -364,48 +453,46 @@ is **not announced**, so an interactive or gap-sized decoration degrades silentl
 through `registerTopBarWidgets` instead.
 
 **Rung thresholds are locale-measured.** The container-query breakpoints in
-`.topbar`'s ladder (`src/index.css`) are the measured content width of each
+`.topbar`'s ladder (`src/styles/shell-chrome.css`) are the measured content width of each
 readout tier plus a margin, taken through
 `website/capture/topbar-search-variants.tsx`. The base rungs are measured in one
 locale; the update-pill shift (below) is measured across every shipped locale. A
 wider-than-measured tier squeezes or truncates its text before the rung fires —
 graceful, but it means the constants are an approximation, not a guarantee.
 Re-measure with that harness when readout content or the catalogs change
-materially.
+materially. On desktop the measured ladder also counts registered components and
+folds built-ins wherever the container rungs still leave the group overflowing.
 
 
 **Width budget for both top-bar seams.** The header is a three-track grid whose
 side groups are pure remainder (`minmax(0,1fr)`, no floor) — see `.topbar` in
-`src/index.css`. The actions group therefore does NOT grow to fit its contents;
+`src/styles/shell-chrome.css`. The actions group therefore does NOT grow to fit its contents;
 it gets what the window leaves after the centred search, and its built-in
-readouts give that space back through container-query rungs. Registered segments
-and widgets do not participate in those rungs, so a registered component must
+readouts give that space back through container-query rungs. Registered widgets do
+not participate in those rungs, and registered capsule segments only in the
+last, dot-only one, so a registered component must
 stay inside a budget: **keep the collapsed form under ~40px** and drop your own
 labels with your own `@container` rule keyed off `.tb-right` if you render text.
+On desktop the measured ladder counts the component too and folds built-ins to
+make room, while the component itself never collapses with the measured level.
 The narrowest desktop width leaves the group about 206px, of which the built-in
-dot, metric icon, credit icon and bell already claim roughly 139px. A component
-wider than the remainder is clipped from the group's leading edge (the group
-clips deliberately rather than pushing the notifications bell out of the
-header), and at the terminal rung the capsule is reduced to its connection dot,
-which hides registered segments along with the core readouts.
+dot, metric icon, credit icon and bell already claim roughly 139px. At the last
+rungs the capsule is reduced to its connection glyph, which hides registered
+segments along with the core readouts, and the measured ladder folds the update
+pill to its icon. A group that still overflows clips instead of overflowing the
+header: on desktop from its far end, the bell first and the connection glyph last;
+on phones from its leading edge.
 
-**The budget has TWO bases.** While an update is pending, the top bar mounts the
-update pill — a non-shrinking sibling of the ladder — and the actions group
-carries `tb-has-update`, which shifts the rungs by the pill's footprint (see the
-rung comments in `src/index.css`). The footprint follows the pill's own label
-gate (`hidden sm:inline`, 640px viewport): at ≥640px it is the widest
-shipped-locale label form plus the group gap (201.7px + 6px = 208) and every
-rung shifts, terminal included (408px instead of 200px); below 640px the pill
-is icon-only (34px + 6px gap = 40) and only the terminal rung shifts (240px).
-The ≥640 shift is a deliberate over-reservation for every narrower-label
-locale — static CSS cannot key a rung on the active language, so an English
-pill (~134px) gives up readouts ~68px earlier than its own width requires, in
-exchange for no locale ever re-entering the squeeze band. For a registered
-segment that means the ~40px collapsed-form budget above holds only in the
-no-update state; with an update pending the same window width leaves up to
-208px less, and at the narrowest desktop widths the remainder for registered
-content is zero. Treat the update-pending state as one of the widths your own
-`@container` rule must survive.
+**An update pending takes room from the readouts.** While an update is pending,
+the top bar mounts the update pill — a non-shrinking sibling of the ladder — and
+the actions group carries `tb-has-update`, which shifts the container rungs by
+the pill's footprint at ≥640px (up to 208px for the widest shipped-locale label,
+including the group gap). The desktop measured ladder also counts the pill and
+its last rung folds the label to its icon. A registered component's ~40px budget
+therefore holds only in the no-update state; with an update pending the same
+window width leaves that much less. Below 640px the pill is icon-only and the
+container ladder takes no shift; a phone renders no readouts to give back, so its
+actions group clips from the leading edge.
 
 **Overview status cards.** `registerOverviewStatCards([{ id, order?, component }])`
 adds a self-contained `StatCard` (owning its own query and state, like the core
@@ -452,8 +539,9 @@ seam whose registration is HALF a provider: the descriptor covers parsing and
 rendering (`parse`, `chipLabel`, `refLabel`, an optional `icon` glyph, and the
 `capabilities` flags gating each write affordance), while fetching and every
 mutation are served by a backend plugin the edition registers with
-`register_source_provider()` in
-`src/kiro_crew/dashboard/handlers/source_providers.py`, under the same id. The
+`register_source_provider()`, defined in
+`src/kiro_crew/dashboard/source_providers/plugins.py` (still importable from
+`dashboard/handlers/source_providers.py`), under the same id. The
 two registries validate the same id grammar (`/^[a-z][a-z0-9_-]{0,31}$/`) and
 both refuse the built-in ids (`github`, `gitlab`, `jira`), so a descriptor can
 never restyle a core provider and a payload provider id round-trips through both
@@ -473,7 +561,8 @@ logo, no write affordances. The backend plugin contract — payload schema
 (`SourceChangePayload`), shared caches, redaction, byte caps, the optional
 mutation hooks, and the optional DISCOVERY hooks `path_markers()` and
 `search_ref()` — is documented on `SourceProviderPlugin` in
-`source_providers.py`. The discovery hooks exist because a built-in-only
+`dashboard/source_providers/contract.py` (also re-exported by
+`handlers/source_providers.py`). The discovery hooks exist because a built-in-only
 recogniser is blind to an edition's own id and URL shapes: `path_markers()`
 contributes the URL substrings worth parsing, so an edition's chips appear at
 all, and `search_ref()` contributes the spellings of one item, so a transcript
@@ -499,7 +588,7 @@ the core audits, so registering over one would be an override that silently
 redirects a credential mint, not a contribution.
 
 The registry is also the **single** definition of the renderable set, read by two
-consumers that used to carry it as matching literals: `canRenderMobileConnectKind()`
+consumers that would otherwise each carry it as matching literals: `canRenderMobileConnectKind()`
 gates the nav rail's row and `getMobileConnectRenderers()` supplies the dialog's
 sections. A kind neither drawn nor registered is still filtered out at the rail, so
 the row stays hidden rather than opening a dialog with an empty body — the seam adds
@@ -530,7 +619,7 @@ kind the gateway does not list draws nothing, and a listed kind nothing can draw
 is never offered. When more than one renderable row survives, the tab shows a
 selector above the form (the choice persists in `mc-cloud-provisioner`); with a
 single row, or while the query is loading, failed, or empty, the tab renders the
-built-in EC2 form exactly as it did before this seam existed. The registered form
+built-in EC2 form unchanged. The registered form
 is mounted in its own `ErrorBoundary`, and the launch-progress card and status
 notice stay core-owned below whichever form shows, so a launch already in flight
 survives a throwing renderer.
@@ -552,7 +641,8 @@ to one deployment.
 
 `getAutolinkRules()` is the reader, returning rules in **registration order**;
 where two rules match overlapping spans the earlier-registered one wins.
-`remarkAutolinkRules` is the consumer, ordered last in `REMARK_PLUGINS`.
+`remarkAutolinkRules` is the consumer, ordered after `remarkGfm` and immediately
+before `remarkVerbatimUnknownTags`, second-to-last in `REMARK_PLUGINS`.
 
 Everything is validated at **registration**, so a bad rule fails once and loudly
 instead of on one unlucky message: a sticky pattern is refused, an empty-matching
@@ -591,10 +681,56 @@ itself, there is nothing to enumerate, and a whole-catalog transform hook would
 hand an edition the power to break any string for what is a one-variable
 substitution.
 
-Scope: catalog strings only. The `apps.<id>.manifest.*` keys mirror the
-Python-side `app.json` prose byte-for-byte and keep the literal name; the
-shell logo and welcome mark are the theme-branding seam's job; the chat bot
-display name stays `dashboard.bot_name`.
+Scope: catalog strings only, and which catalog keys keep the literal name is
+[i18n-catalog](i18n-catalog.md#the-product-name-is-an-interpolation-variable)'s
+rule. The shell logo and welcome mark are the theme-branding seam's job; the chat
+bot display name stays `dashboard.bot_name`.
+
+## Feedback tracker: exported setter, not a registry
+
+Three surfaces send a user to the project's issue tracker, and the stock build
+points every one of them at the public GitHub repository: the top bar's **Request
+a Feature** (the hidden prompt it seeds, which tells the agent to search, label
+and file with `gh`; the copy/paste route that prompt offers; and the
+non-inference form link the `usage_limit` row shows when the plan is spent,
+#13342), the prerelease **report it** link in Settings › About, and the
+false-positive report a redaction card offers. On an edition where that
+repository is unreachable each of them dead-ends, and the agent, handed `gh`
+instructions it cannot follow, improvises a fallback nobody designed.
+
+`setFeedbackTracker({ prompt, issueUrl? })` (exported from
+`src/feedbackTracker.ts`) retargets them in one call from the composition root.
+The readers go through `feedbackTracker()`, which answers `{ prompt, issueUrl,
+formUrl }`; the public values stay as constants in `src/prompts/featureRequest.ts`,
+so the stock build is byte-identical. The seam seals on its first read: a later
+call throws in dev and is ignored in production, because a set that landed after
+one surface had rendered would retarget some surfaces and not others.
+
+Two rules a caller must know:
+
+- **The prompt is the fix, and it is replaced wholesale, never templated.** The
+  public prompt already carries its own tracker URL and its own filing steps
+  (`gh issue list` for duplicates, `gh label list` for the live taxonomy, `gh
+  issue create`, the 200-character pre-filled-URL rule), all GitHub's; an
+  edition's tracker has its own, so the edition writes the whole prompt, URL
+  included, in the agent's language. `featureRequestLabels.test.ts` pins the
+  PUBLIC prompt's label rules only.
+- **`issueUrl` is optional** and only moves the three links that do not go
+  through a prompt: the About link, the redaction report, and the spent-plan exit
+  (`formUrl`, which becomes `issueUrl` since an edition tracker has no public-repo
+  template form). Without it those links keep the public tracker.
+
+Validation runs through `reportSeamCollision`: `prompt` must be non-empty and
+`issueUrl`, when given, an absolute `http(s)` URL (a relative path or a
+`javascript:` URL is refused). A refused call leaves the stock tracker in place,
+so the surfaces keep working. `src/test/feedbackTrackerSeam.test.ts` exercises
+the seam on a fresh module per test, since the seal is a module singleton.
+
+Out of scope: the **Report a Problem** flow's issue link is built by the
+gateway (`diagnostics.github_issue_url`), so the backend `feedback` Composed
+Platform Provider retargets it
+([platform-context](../../docs/system-specs/modules/platform-context.md)), not
+this seam. An edition sets both.
 
 ## API methods: exported transport, not a registry
 
@@ -605,8 +741,8 @@ composition benefit.
 
 So `api/apiTransport.ts` **exports** the blessed `apiTransport`, the same
 `get`/`post`/`put`/`del`/`patch` plus `j`/`jNullable` the core methods use
-(`client.ts` installs them via `installApiTransport` at its module load). An
-edition builds its OWN fully-typed API module on it:
+(`client.ts` defines them and installs them via `installApiTransport` at its
+module load). An edition builds its OWN fully-typed API module on it:
 
 ```ts
 import { apiTransport as t } from '../api/apiTransport'
@@ -632,5 +768,57 @@ Each `apiTransport` method is a stable wrapper that resolves the installed helpe
 at call time, so an edition may import and even destructure it at module init
 without an ordering hazard against `extensions.ts`.
 
+The core's own methods sit on the same helpers. They are defined by domain in
+`api/client/*.ts`, one module per product area (chat, memory, security, …), each
+a `create*Endpoints` factory that `client.ts` hands the transport it owns
+(`ClientTransport`, `api/client/transport.ts`): the five helpers, the three
+parsers, the shared `X-Session-Key` header, the session-expiry hooks a
+method that reads its own response calls, and `withJournaledDeadline` (a
+deadline that also records a timed-out read in the error journal). The third parser
+(`jInstancesDisabled`) is core-only and deliberately absent from `ApiTransport`
+above: it opts one specific benign denial on one core route out of the error
+journal, which is not an edition's decision to make. None of them imports a
+runtime value
+from `client.ts` (the telemetry module takes the Kiro usage types defined there
+as types only), so the transport and its recovery keep one definition.
+`client.ts` spreads their
+segments into the one `api` object, in its original key order, and re-exports
+their wire types. That split is core-internal: the seam is still
+`apiTransport`, and an edition never imports a domain module.
+
+Two tests ratchet the split. A new method goes in its domain's `create*Endpoints`
+segment and joins `API_KEY_ORDER` in `ApiClient.refactor.surface.test.ts` where
+the facade spreads it; it joins `NO_SESSION_KEY` there only when it deliberately
+bypasses the request helpers. A method defined inline on the facade instead of in
+a segment joins `INLINE` in `ApiClient.refactor.facade.test.ts`.
+
 Trust boundary: the transport carries the session key. It is for the edition
 composition root, **never** for app or plugin-contributed frontend code.
+
+## Highlighting languages: a data module, not a registrar
+
+An edition adds a syntax-highlighting language with
+`$KIROCREW_EDITION_DIR/languages.ts`, whose default export is a
+`HighlightLanguageContribution[]` (`utils/highlightLanguages.ts`): an `id`, optional
+fence `aliases` and file `extensions`, and an `hljs` grammar, a `textmate` loader,
+or both. `editionLanguagesPlugin` in `vite.config.ts` resolves
+`virtual:kirocrew-edition-languages` to that file when the edition seam is armed,
+and to an empty list otherwise, for the main bundle and the worker bundles.
+
+It is a data module rather than a `register*()` call because a highlight.js grammar
+is a function: it cannot be posted to the highlight Web Worker, and the worker never
+imports the composition root. Keep the module worker-safe (no React, no DOM), and
+load TextMate grammars with a dynamic `import()` so they stay out of the worker.
+
+The export is untrusted data. `validateHighlightLanguages` copies it into a plain
+array and copies each entry's known fields into a fresh object, checking their
+runtime types; an entry or array that throws while being read counts as malformed.
+Every refusal goes through `reportSeamCollision`, so a malformed module can drop a
+language but cannot stop the dashboard from mounting.
+
+Core wins every collision, and **each consumer owns its conflict table**:
+`registerHljsLanguages` checks the highlight.js set, and
+`registerEditionShikiLanguages` checks Pierre's grammar names, extension tokens and
+reserved `text` / `ansi` ids. A new consumer of `HIGHLIGHT_LANGUAGES` must check
+its own core table the same way; `validateHighlightLanguages` only rejects entries
+that are malformed or collide with each other.

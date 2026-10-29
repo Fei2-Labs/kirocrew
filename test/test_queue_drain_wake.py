@@ -637,10 +637,16 @@ class TestTheContractCoversEveryDrainingChannel:
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+        # A dispatcher composed from owners in its channel's ``dispatch`` package drains
+        # from one of them (Telegram's turn queue), so each is read with its owners.
         draining_modules = {
             f"kiro_crew.{p.relative_to(root).with_suffix('').as_posix().replace('/', '.')}"
             for p in root.rglob("transport_dispatch.py")
-            if "async def _drain_queue" in p.read_text(encoding="utf-8")
+            if "async def _drain_queue"
+            in "".join(
+                q.read_text(encoding="utf-8")
+                for q in [p, *sorted((p.parent / "dispatch").glob("*.py"))]
+            )
         }
         assert draining_modules == set(self._MODULES.values())
 
@@ -704,7 +710,7 @@ class TestTheContractCoversEveryDrainingChannel:
             for other in readers:
                 if other == owner:
                     continue
-                assert read(tag_entry({}, other)) is None, f"{owner} claimed {other}'s entry"
+                assert read(tag_entry({}, other, "")) is None, f"{owner} claimed {other}'s entry"
 
 
 def _tg_origin_for(user: int, chat: int) -> Any:

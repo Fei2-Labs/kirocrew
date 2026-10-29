@@ -101,7 +101,7 @@ function waitForGateway({
  * carries the Gatekeeper hint because an unsigned/quarantined nested executable
  * being killed on launch is the most common "works for me, not my friend" mode.
  *
- * @param {{code?: number|null, signal?: string|null, error?: string, disabled?: boolean, port?: number, remoteHost?: string, remotePort?: string}|null} failure
+ * @param {{code?: number|null, signal?: string|null, error?: string, disabled?: boolean, port?: number, remoteHost?: string, remotePort?: string, canStartHere?: boolean, localStartFailed?: boolean, localStartPortBusy?: number}|null} failure
  * @returns {string}
  */
 function describeGatewayFailure(failure) {
@@ -110,12 +110,18 @@ function describeGatewayFailure(failure) {
   // was silent and this app is set not to start a gateway here. Naming both
   // halves matters because either one alone is a normal, working state.
   //
-  // Deliberately does NOT send the user to Settings: the page holding that
-  // switch is served by a gateway, which is the thing not running. The error
-  // dialog carries a button instead -- except on a remote crew's port, where
-  // starting one here would shadow that crew, so this names the host to check
-  // and withholds the offer the dialog is also hiding.
-  if (failure.disabled) {
+  // Deliberately does not send the user to Settings for the fix: the page
+  // holding that switch is served by a gateway, which is the thing not running.
+  // The error dialog carries a button instead. Settings is named only as the way
+  // back afterwards, which is reachable precisely because a gateway is serving
+  // by then. On a remote crew's port that button cannot start a gateway in
+  // place, so it restarts the app and lets port selection pick a local port;
+  // this message names the host to check first, because reaching the crew is
+  // what the user asked for.
+  // `localStartBlocked` joins this family rather than overloading `disabled`:
+  // the setting is ON in that state and nothing was launched anyway, because
+  // the port this launch targets is not one a new gateway may bind.
+  if (failure.disabled || failure.localStartBlocked) {
     if (failure.remoteHost) {
       // The crew binds its own port on its own machine; this app only holds the
       // local end of the link. Naming the local port here would send the user to
@@ -123,23 +129,147 @@ function describeGatewayFailure(failure) {
       const target = failure.remotePort
         ? `${failure.remoteHost}:${failure.remotePort}, reached through local port ${failure.port},`
         : `${failure.remoteHost} on port ${failure.port},`;
-      // The last sentence is the only exit this state has. The dialog withholds
-      // its start-a-gateway button here (that spawn would bind the crew's own
-      // port and shadow it), and the settings page that owns the choice is
-      // served by a gateway -- so without naming this the user is left with a
-      // Retry that cannot succeed. Both steps are named: an explicit port
-      // outranks stored config, but the opt-out is still in force, so that
-      // launch stops at this same state on a port where the button comes back.
-      return `Nothing is answering at ${target} and Kiro Crew is set not to `
-        + `start a gateway on this machine. Start the gateway on `
+      // One exit per message, not a conditional the reader has to resolve. The
+      // composer knows whether it is rendering the button and says so on the
+      // record, so this names the route that is actually open. The two ways the
+      // button closes get their own wording: one never offered the restart, the
+      // other ran it and it did not finish, and a user who just watched that
+      // restart must not be told restarting is unavailable.
+      //
+      // The clause about the setting has to follow it. Using the button turns the
+      // setting on, so after that "set not to start a gateway" is false, and a
+      // paragraph asserting both that and "the setting stays on" cannot be
+      // reconciled by the reader. Both post-click states describe the launch
+      // instead, which stays true either way.
+      const startedHere = failure.localStartPortBusy || failure.localStartFailed
+        || failure.localStartBlocked || failure.localStartUnverifiable
+        ? "this launch did not start one here"
+        : "Kiro Crew is set not to start a gateway on this machine";
+      const reachTheCrew = `Nothing is answering at ${target} and ${startedHere}. `
+        + `Start the gateway on `
         + `${failure.remoteHost}, or re-establish the tunnel or port-forward that `
-        + "reaches it, and retry. To run one on this machine instead, relaunch "
-        + "with KIROCREW_PORT set to a port that has no remote host configured, "
-        + "then choose Start Local Gateway when prompted.";
+        + `reaches it, then retry to reach ${failure.remoteHost} again. If that `
+        + "address is wrong, choose Edit Remote Crew to correct it.";
+      if (failure.localStartUnverifiable) {
+        // Ahead of every other post-click branch, because it is the only one that
+        // must not offer the button. The restart ran and its gateway answered;
+        // what this app could not do is establish which process holds the port,
+        // and that outcome is a property of the host, so the same click reaches
+        // the same place. Saying "never served one" would deny what the user
+        // watched.
+        //
+        // The route named is the explicit one, not "quit and reopen". This branch
+        // is only reachable with a crew configured on the port this launch
+        // targets, and the launch targets that port on purpose, so a plain reopen
+        // lands on the crew-configured refusal and starts nothing -- the same
+        // route that branch names is the one that works here too.
+        return `Starting a local gateway here got as far as answering on port `
+          + `${failure.localStartUnverifiable}, but this app could not check which `
+          + "program holds that port, so it stopped the one it had started rather "
+          + "than hand over to something it could not identify. Choosing Start "
+          + "Local Gateway again reaches the same check."
+          + "\n\nTo run one here, quit Kiro Crew and start it from a terminal with "
+          + "the environment variable KIROCREW_PORT set to a port number that has "
+          + `no remote host configured.\n\n${reachTheCrew}`;
+      }
+      if (failure.localStartFailed) {
+        // A reopened dialog whose opening sentences are identical reads as
+        // nothing having happened, so the branch that exists to acknowledge the
+        // attempt leads with it and the unchanged crew advice follows.
+        //
+        // Ahead of the busy-port branch deliberately: a record survives every
+        // attempt, so a run that reached a restart and lost it is the newer fact
+        // and must win over a port that was busy on an earlier click. The
+        // supervisor clears the earlier field as well, and this ordering means a
+        // path that forgets to still cannot describe a withdrawn button.
+        return "Starting a local gateway here did not finish: the restarted app "
+          + "never served one. The \"Run a local gateway\" setting stays on, so "
+          + "choose Start Local Gateway to try again. It will pick a free port."
+          + `\n\n${reachTheCrew}`;
+      }
+      if (failure.localStartPortBusy) {
+        // Nothing was restarted: the port the restart would have used is already
+        // served by something else, so this names that port instead of reporting
+        // an attempt. It leads with what happened for the same reason the failed
+        // attempt does. The button is still rendered, because freeing that port
+        // is outside this app and makes the same click work.
+        //
+        // "on this computer" because the title names the crew's port and these two
+        // numbers are easy to read as one.
+        return `Starting a local gateway here did not begin: port `
+          + `${failure.localStartPortBusy} on this computer is already served by `
+          + "something else, so restarting would not have produced a gateway this "
+          + `app can tell apart from it. That is usually another Kiro Crew `
+          + `started from a terminal, so quit that one. Then choose Start Local `
+          + `Gateway again. `
+          + `The "Run a local gateway" setting stays on.\n\n${reachTheCrew}`;
+      }
+      if (failure.localStartBlocked === "crew-configured") {
+        // The port is not busy and nothing failed: it belongs to the crew, so a
+        // gateway bound there could not be told apart from it. Only a fresh
+        // process can take a different port, which is what the button does, so
+        // the remedy is the button rather than an instruction carried out by hand.
+        //
+        // Worded as a reservation rather than as the mechanism. A cold reader of
+        // the mechanism ("would be taken for that crew") reported not following
+        // it, and what they need is which port is unavailable and what to press;
+        // the mechanism belongs in the code and the description.
+        // Two states share this title and only one renders the button, so the one
+        // that withholds it says why -- the sibling branch below already does, and
+        // without the clause the screen gives a reader no way to tell the two
+        // apart. It leads the remedy, because "why not" has to come before "so
+        // instead".
+        // Each remedy is a whole sentence, because the two do not share a
+        // lead-in: one names a button, the other has to say first that the button
+        // is unavailable. "To run one here instead, restarting the app is not
+        // available" was the dangling result of sharing one.
+        const remedy = failure.canStartHere
+          ? "To run one here instead, choose Start Local Gateway, which starts "
+            + "one on a free port."
+          : "Restarting the app to pick a free port is not available here, so to "
+            + "run one here instead, quit Kiro Crew and start it from a terminal "
+            + "with the environment variable KIROCREW_PORT set to a port number "
+            + "that has no remote host configured.";
+        return `${reachTheCrew}\n\nPort ${failure.port} is reserved for reaching `
+          + `${failure.remoteHost}, so Kiro Crew did not start a local gateway on `
+          + `it. ${remedy} Your sessions on ${failure.remoteHost} stay there. `
+          + `The "Run a local gateway" setting stays on.`;
+      }
+      if (failure.canStartHere) {
+        return `${reachTheCrew}\n\nTo run one on this machine instead, choose Start `
+          + "Local Gateway: it turns the setting back on and restarts the app so it "
+          + `picks a free port on this computer. Your sessions on ${failure.remoteHost} `
+          + "stay there; the local gateway is a separate one. Once it is running you "
+          + "can turn that setting back off in Settings.";
+      }
+      return `${reachTheCrew}\n\nRestarting the app to pick a local port is not `
+        + "available here, so to run one on this machine instead, quit Kiro Crew "
+        + "and start it from a terminal with the environment variable "
+        + "KIROCREW_PORT set to a port number that has no remote host configured.";
+    }
+    if (failure.localStartBlocked === "foreign-holder") {
+      // Something answers there and this app can attribute it neither to itself
+      // nor to a crew recorded on that port. Adopting it would post this
+      // machine's local secret to it, because the mint only requires a literal
+      // loopback origin and a tunnel's local end is one.
+      //
+      // Worded as what this app knows rather than as what the holder is: it may
+      // well BE a Kiro Crew gateway, reached over a tunnel from another machine.
+      // That is why recording it as a crew is the first remedy -- doing so makes
+      // the same port adoptable on the next launch -- and quitting the program is
+      // the other. Both controls are in this dialog.
+      return `Port ${failure.port} on this computer is served by a program this `
+        + "app did not start, and Kiro Crew has no remote crew saved for that "
+        + "port, so this launch did not use it.\n\nIf that program is how you "
+        + "reach one of your crews, choose Add Remote Crew and fill in its "
+        + "address: that saves the address so this port can be used next time, "
+        + "and you can change or clear it later. If it is unrelated software, "
+        + "quit it and then retry.";
     }
     return `No gateway is answering on port ${failure.port}, and Kiro Crew is set `
       + "not to start one on this machine. Start the gateway you connect to (or "
-      + "the connection that reaches it) and retry, or start one here.";
+      + "the connection that reaches it) and retry, or start one here. If your "
+      + "crew runs on another machine, choose Add Remote Crew to name it.";
   }
   // An incomplete bundle is not a launch failure — the installer is still writing
   // the backend. That message already explains the state and names Retry, so pass

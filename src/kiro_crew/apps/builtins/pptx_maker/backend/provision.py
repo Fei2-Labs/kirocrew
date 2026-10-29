@@ -42,7 +42,10 @@ from pathlib import Path
 from kiro_crew.apps.builtins.pptx_maker.backend import engine, engine_source, paths
 from kiro_crew.apps.manager import app_dir
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.sandbox import cgroup_scope_argv, run_limited, sandboxed_spawn_argv
+from kiro_crew.env import resolve_uv as _shared_resolve_uv
+from kiro_crew.platform_compat import ensure_owner_rwx_dirs, rmtree_force
+from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger("kirocrew.app.pptx-maker")
 
@@ -110,22 +113,10 @@ _uv_path_resolved = False
 def resolve_uv() -> str | None:
     """Absolute path to a usable ``uv``, or ``None`` when genuinely absent.
 
-    ``uv`` is a DECLARED Python dependency (``setup.cfg``), so a stock
-    ``pip install kirocrew`` always has the binary — but not necessarily on
-    ``PATH``: a wheel install puts it in the venv's scripts dir, and the gateway
-    may run with a minimal ``PATH`` (an installed launchd/systemd service). So it
-    is resolved through the INSTALLED PACKAGE rather than looked up by name.
-
-    Order, widest-trust first:
-
-    1. ``uv.find_uv_bin()`` — the wheel's own locator, the normal pip case. It
-       raises ``UvNotFound`` (a ``FileNotFoundError`` subclass) when the binary
-       is missing, e.g. an odd repackaging;
-    2. ``shutil.which("uv")`` — a user's own, possibly newer, uv still works;
-    3. ``None``.
-
-    Never raises: an absent uv is a reportable condition, so the caller can fail
-    with an actionable message instead of a traceback in a background job.
+    The ladder itself — ``uv.find_uv_bin()`` from the declared wheel, then
+    ``shutil.which("uv")``, never raising — is :func:`kiro_crew.env.resolve_uv`,
+    shared with pod provisioning so the minimal-``PATH`` case (an installed
+    launchd/systemd gateway) is handled in exactly one place.
 
     Cached process-wide: this runs on every provision and the answer cannot
     change within a process (the interpreter's own site-packages are fixed at
@@ -134,27 +125,9 @@ def resolve_uv() -> str | None:
     global _uv_path_cache, _uv_path_resolved
     if _uv_path_resolved:
         return _uv_path_cache
-    _uv_path_cache = _resolve_uv_uncached()
+    _uv_path_cache = _shared_resolve_uv()
     _uv_path_resolved = True
     return _uv_path_cache
-
-
-def _resolve_uv_uncached() -> str | None:
-    """The resolution ladder itself. See :func:`resolve_uv`."""
-    try:
-        # Optional-dependency import (the `top-level-imports` carve-out): `uv` is a
-        # declared dependency, but this must still answer on an install where the
-        # wheel is absent or repackaged without its binary — a missing uv is a
-        # reported "engine unavailable", never an ImportError at module load.
-        import uv as uv_package
-
-        found = uv_package.find_uv_bin()
-        if found and os.path.isfile(found):
-            return found
-    except (ImportError, FileNotFoundError, OSError) as exc:
-        logger.debug("pptx-maker: uv.find_uv_bin() did not resolve: %s", exc)
-
-    return shutil.which(_UV_BASENAME)
 
 
 def mcp_tools_path() -> str:
@@ -225,15 +198,17 @@ def _run(argv: list[str], *, cwd: str, timeout: int) -> tuple[int, str]:
     # git-over-SSH. Provisioning runs a build backend over a freshly-downloaded
     # third-party tree, which is exactly the code least entitled to either. No
     # sandbox mode restricts network, so uv still reaches the index.
+    # The chokepoint already applies the cgroup scope as its outermost layer.
+    # Wrapping again nests a second ``systemd-run --scope`` that inherits the
+    # first one's PID and collides on its auto-named unit.
     wrapped, env, cleanup = sandboxed_spawn_argv(argv, mode="strict", strip_python_env=True)
-    wrapped = cgroup_scope_argv(wrapped)  # cgroup DoS ceiling
     try:
         proc = run_limited(  # noqa: S603 - fixed argv, no request-derived values
             wrapped,
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=timeout,
             check=False,
         )
@@ -449,11 +424,16 @@ def _render_agents(install_dir: Path, log: list[str]) -> int:
 
 
 def _copy_tree(source: Path, target: Path) -> None:
-    """Replace *target* with a copy of *source*, following no symlinks."""
+    """Replace the staged copy, repairing modes inherited from packaged sources."""
     if target.exists():
-        shutil.rmtree(target)
+        # POSIX unlink needs writable parent directories; forced removal also
+        # clears the entry read-only attributes Windows checks.
+        ensure_owner_rwx_dirs(target)
+        if not rmtree_force(target):
+            raise OSError(f"could not remove the staged copy at {target}")
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target, symlinks=False)
+    ensure_owner_rwx_dirs(target)
 
 
 def _stage_static(install_dir: Path, log: list[str]) -> None:

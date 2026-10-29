@@ -26,12 +26,14 @@ from kiro_crew.platform.context import (
     PlatformCompositionError,
     PlatformContext,
     async_safe_context_call,
+    binary_content_is_flagged,
     current_context,
     redact_log_via_context,
     redact_via_context,
     reset_context,
     safe_context_call,
     set_context,
+    wide_content_is_flagged,
 )
 from kiro_crew.platform.discovery import PLUGIN_GROUP, PluginAdmissionError
 from kiro_crew.platform.profile import resolve_profile
@@ -58,6 +60,8 @@ __all__ = [
     "current_context",
     "redact_via_context",
     "redact_log_via_context",
+    "binary_content_is_flagged",
+    "wide_content_is_flagged",
     "safe_context_call",
     "async_safe_context_call",
     "set_context",

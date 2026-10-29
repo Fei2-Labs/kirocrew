@@ -106,7 +106,7 @@ const STEPS_REGISTERED = [
     key: 'connect',
     label: 'Connect',
     state: 'done' as const,
-    detail: 'Added to Your crews. Finish the Kiro sign-in before connecting.',
+    detail: 'Added to Your crews. Sign in to Kiro on the crew after you connect.',
   },
 ]
 const UNSIGNED_JOB = {
@@ -190,7 +190,7 @@ describe('a crew created without a Kiro sign-in — the progress card', () => {
   })
 
   it('marks the held connect step as waiting rather than done', async () => {
-    // A green tick beside "Finish the Kiro sign-in before connecting" reads as
+    // A green tick beside "Sign in to Kiro on the crew" reads as
     // done and not-done at the same time.
     const u = userEvent.setup()
     renderWithProviders(<RemoteCrewPanel />)
@@ -489,12 +489,12 @@ describe('Your crews — an unsigned cloud crew', () => {
     )
   })
 
-  it('holds Connect back and says why', async () => {
-    // Connecting opens a remote dashboard whose chats all fail, and whose fix
-    // needs a terminal it does not have.
+  it('still offers Connect, and flags the missing sign-in', async () => {
+    // The user can sign in on the crew itself once connected, so the missing
+    // sign-in is shown but never holds Connect back.
     renderWithProviders(<RemoteCrewPanel />)
-    expect(await screen.findByRole('button', { name: /Connect after sign-in/i })).toBeDisabled()
-    expect(screen.queryByRole('button', { name: /^Connect$/i })).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /^Connect$/i })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: /Connect after sign-in/i })).not.toBeInTheDocument()
     expect(screen.getByText(/Needs sign-in/i)).toBeInTheDocument()
   })
 
@@ -641,6 +641,68 @@ describe('round 4 — the surfaces the reviewers could not tell apart', () => {
 
     const prompt = await screen.findByTestId('signin-prompt')
     expect(prompt).not.toHaveTextContent(/company account/i)
+  })
+
+  // A device code stops working after a few minutes. Nothing on the card said
+  // so, and a reader who stepped away came back to a code that silently failed.
+  it('says the shown code expires, on the plain path', async () => {
+    const awaitingPersonal = {
+      ...UNSIGNED_JOB,
+      status: 'awaiting_signin' as const,
+      login_target: null,
+      signin: { url: 'https://example/?user_code=LIVE', code: 'LIVE' },
+    }
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [awaitingPersonal] } as never)
+    vi.mocked(api.cloudLaunchStatus).mockResolvedValue(awaitingPersonal as never)
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await openSetup(u)
+
+    expect(await screen.findByTestId('signin-prompt')).toHaveTextContent(/code expires after a few minutes/i)
+  })
+
+  it('says the shown code expires, on the company SSO path', async () => {
+    const awaitingSso = {
+      ...UNSIGNED_JOB,
+      status: 'awaiting_signin' as const,
+      login_target: SSO_TARGET,
+      signin: { url: 'https://amzn.awsapps.com/start/#/device?user_code=LIVE', code: 'LIVE' },
+    }
+    vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [awaitingSso] } as never)
+    vi.mocked(api.cloudLaunchStatus).mockResolvedValue(awaitingSso as never)
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await openSetup(u)
+
+    expect(await screen.findByTestId('signin-prompt')).toHaveTextContent(/code expires after a few minutes/i)
+  })
+
+  it('tells the reader of an unconfirmed code what to do if it has expired', async () => {
+    useJob(withCode('OLD-CODE'))
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await openSetup(u)
+
+    const prompt = await screen.findByTestId('signin-prompt')
+    expect(prompt).toHaveTextContent(/If it has expired, start over with a new code/i)
+    expect(screen.getByRole('button', { name: /Start over with a new code/i })).toBeInTheDocument()
+  })
+
+  it('does not tell the reader to start over where there is no start-over link', async () => {
+    // A launch that failed before the crew registered keeps its code but offers
+    // no restart: the sentence would name an action the card does not have.
+    useJob(withCode('OLD-CODE', {
+      status: 'failed' as const,
+      steps: STEPS_REGISTERED.map(st => st.key === 'connect' ? { ...st, state: 'failed' as const } : st),
+    }))
+    const u = userEvent.setup()
+    renderWithProviders(<RemoteCrewPanel />)
+    await openSetup(u)
+
+    const prompt = await screen.findByTestId('signin-prompt')
+    expect(prompt).toHaveTextContent(/could not confirm the sign-in/i)
+    expect(prompt).not.toHaveTextContent(/start over/i)
+    expect(screen.queryByRole('button', { name: /Start over with a new code/i })).not.toBeInTheDocument()
   })
 })
 

@@ -207,16 +207,24 @@ def _windows_ceiling(proc: subprocess.Popen[bytes]) -> str | None:
     """Attach the Job-object memory ceiling to a suspended child, then resume it.
 
     The Windows stand-in for the profile's ``RLIMIT_AS``: ``JobMemoryLimit`` at
-    the same byte count, ``ActiveProcessLimit`` of one (this child spawns
-    nothing). FAILS CLOSED, unlike the agent-host spawns, which log and run on:
-    an extractor with no ceiling is the exposure this module exists to remove,
-    and a document that cannot be bounded is a document that is not read. The
-    child is killed before it executes an instruction, so nothing was parsed.
-    Returns the failure kind, or ``None`` once the child is running under the
-    ceiling.
+    the same byte count, ``ActiveProcessLimit`` of the extractor and nothing
+    else. "The extractor" is one process when ``sys.executable`` is an
+    interpreter and two when it is a venv's ``Scripts\\python.exe``: that file is
+    the venv redirector, which ``CreateProcess``-es the base interpreter as its
+    own child and stays alive as its parent, so a limit of exactly one refuses
+    the redirector's spawn (``Unable to create process using ...``, exit 101) and
+    no document is ever read from a venv-hosted gateway. The hop is counted by
+    :func:`platform_compat.python_launcher_hops`. FAILS CLOSED, unlike the
+    agent-host spawns, which log and run on: an extractor with no ceiling is the
+    exposure this module exists to remove, and a document that cannot be bounded
+    is a document that is not read. The child is killed before it executes an
+    instruction, so nothing was parsed. Returns the failure kind, or ``None``
+    once the child is running under the ceiling.
     """
     if not platform_compat.apply_job_limits(
-        proc.pid, max_procs=1, max_memory_bytes=_EXTRACTOR_MAX_AS_BYTES
+        proc.pid,
+        max_procs=1 + platform_compat.python_launcher_hops(),
+        max_memory_bytes=_EXTRACTOR_MAX_AS_BYTES,
     ):
         logger.warning("pdf_extract: no memory ceiling could be attached; document skipped")
         _kill(proc)
@@ -229,6 +237,20 @@ def _windows_ceiling(proc: subprocess.Popen[bytes]) -> str | None:
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
+    # The pid is the redirector when the gateway runs from a venv on Windows,
+    # and the interpreter parsing the document is its CHILD. Terminating the
+    # redirector alone orphans that child mid-parse with nothing left to reap
+    # it: the Job carries no ``KILL_ON_JOB_CLOSE`` by design (see
+    # ``platform_compat.apply_job_limits``), so the ceiling caps its memory but
+    # nothing ends it, and a slow document keeps its CPU for as long as it
+    # likes. So the tree goes first, while the redirector is still alive to
+    # name its children; ``proc.kill()`` then covers a tree kill that found no
+    # process, and the reap below collects the redirector either way.
+    if platform_compat.IS_WINDOWS:
+        try:
+            platform_compat.kill_process_tree(proc.pid, platform_compat.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
     proc.kill()
     try:
         proc.communicate(timeout=_KILL_WAIT_SECS)

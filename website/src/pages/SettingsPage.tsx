@@ -1,6 +1,6 @@
-import { useEffect } from 'react'
+import { lazy, Suspense, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Bell, Code, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Plug, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
+import { Bell, Code, Cpu, Fingerprint, Globe, History, Import, Info, Keyboard, KeyRound, Link2, MessageSquare, Mic, Palette, PanelsTopLeft, Plug, Server, ShieldCheck, Sparkles, SquareMousePointer, Webhook } from 'lucide-react'
 import { useAppSelector } from '../store'
 import SidePanelLayout from '../components/SidePanelLayout'
 import { SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS, deleteSubSelection, toPathSegment, parsePathSegments } from '../components/subNavParams'
@@ -27,10 +27,25 @@ import { PrivacyPanel } from './settings/PrivacyPanel'
 import { SecretsPanel } from './settings/SecretsPanel'
 import { ConnectionsPanel } from './settings/ConnectionsPanel'
 import SettingsSearch from './settings/SettingsSearch'
+import { ContentSkeleton } from '../components/ui'
+
+/**
+ * Lazy: the coding-agent switch pulls in the Kiro sign-in card and its OIDC
+ * chooser, which no other Settings tab needs, so the chunk is fetched when the
+ * Agent Harness tab is first opened rather than on every Settings visit.
+ */
+const AgentBackendTab = lazy(() =>
+  import('./developer/AgentBackendTab').then(m => ({ default: m.AgentBackendTab })),
+)
+/** Subagent Settings + Warm Pool, beside the backend picker: both govern how agents run. */
+const AgentRunSettings = lazy(() =>
+  import('./overview/KiroCrewCfgTab').then(m => ({ default: m.AgentRunSettings })),
+)
 
 import { i18nT } from '../i18n/t'
 import { usePreviewFlag } from '../hooks/usePreviewFlag'
 import { PREVIEW_WEBHOOKS } from '../utils/previewFlags'
+import { GuideTrustRootRegion } from '../guide/trustRoot'
 // Group headers double as the grouping KEY (SidePanelLayout starts a new header
 // whenever this string changes), so they are resolved inside `buildTabs()` —
 // which runs per render — rather than at module load. Translating them at module
@@ -51,24 +66,30 @@ function buildTabs() {
   const GROUP_PREFERENCES = i18nT('settings.groups.preferences')
   const GROUP_SYSTEM = i18nT('settings.groups.system')
   return [
-    { key: 'overview', label: i18nT('settings.tabs.overview.label'), icon: <PanelsTopLeft size={16} />, description: i18nT('settings.tabs.overview.description') },
-    { key: 'imports', label: i18nT('settings.tabs.imports.label'), icon: <Import size={16} />, description: i18nT('settings.tabs.imports.description') },
-    { key: 'chat', label: i18nT('settings.tabs.chat.label'), icon: <MessageSquare size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.chat.description') },
-    { key: 'display', label: i18nT('settings.tabs.display.label'), icon: <Palette size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.display.description') },
-    { key: 'voice', label: i18nT('settings.tabs.voice.label'), icon: <Mic size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.voice.description') },
-    { key: 'notifications', label: i18nT('settings.tabs.notifications.label'), icon: <Bell size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.notifications.description') },
-    { key: 'shortcuts', label: i18nT('settings.tabs.shortcuts.label'), icon: <Keyboard size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.shortcuts.description') },
-    { key: 'skills', label: i18nT('settings.tabs.skills.label'), icon: <Sparkles size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.skills.description') },
-    { key: 'channels', label: i18nT('settings.tabs.channels.label'), icon: <Link2 size={16} />, description: i18nT('settings.tabs.channels.description'), hostsSubNav: true },
-    { key: 'browser', label: i18nT('settings.tabs.browser.label'), icon: <Globe size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.browser.description') },
-    { key: 'computer-use', label: i18nT('settings.tabs.computerUse.label'), icon: <SquareMousePointer className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.computerUse.description') },
-    { key: 'webhooks', label: i18nT('settings.tabs.webhooks.label'), icon: <Webhook size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.webhooks.description') },
-    { key: 'instances', label: i18nT('settings.tabs.instances.label'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.instances.description') },
-    { key: 'privacy', label: i18nT('privacyDisclosure.settingsLabel'), icon: <Fingerprint className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('privacyDisclosure.settingsDescription') },
-    { key: 'security', label: i18nT('settings.tabs.security.label'), icon: <ShieldCheck size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.security.description'), hostsSubNav: true },
-    { key: 'connections', label: i18nT('settings.tabs.connections.label'), icon: <Plug size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.connections.description') },
-    { key: 'secrets', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },
-    { key: 'developer', label: i18nT('settings.tabs.developer.label'), icon: <Code size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.developer.description') },
+    { key: 'overview', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.overview.label'), icon: <PanelsTopLeft size={16} />, description: i18nT('settings.tabs.overview.description') },
+    { key: 'imports', tile: 'var(--tile-blue)', label: i18nT('settings.tabs.imports.label'), icon: <Import size={16} />, description: i18nT('settings.tabs.imports.description') },
+    // The coding-agent switch (and the Kiro sign-in card under it) used to be a
+    // Developer-page tab, which the sidebar only shows in Developer Mode. First-run
+    // setup now lets a user pick Claude Code, Codex and the rest, so switching
+    // agents is an ordinary preference and has to be reachable without that mode.
+    // Old `/developer?tab=agent-backend` links are forwarded here by DeveloperPage.
+    { key: 'agent', tile: 'var(--tile-teal)', label: i18nT('settings.tabs.agent.label'), icon: <Cpu size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.agent.description') },
+    { key: 'chat', tile: 'var(--tile-green)', label: i18nT('settings.tabs.chat.label'), icon: <MessageSquare size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.chat.description'), hostsSubNav: true },
+    { key: 'display', tile: 'var(--tile-indigo)', label: i18nT('settings.tabs.display.label'), icon: <Palette size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.display.description'), hostsSubNav: true },
+    { key: 'voice', tile: 'var(--tile-pink)', label: i18nT('settings.tabs.voice.label'), icon: <Mic size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.voice.description') },
+    { key: 'notifications', tile: 'var(--tile-red)', label: i18nT('settings.tabs.notifications.label'), icon: <Bell size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.notifications.description'), hostsSubNav: true },
+    { key: 'shortcuts', tile: 'var(--tile-purple)', label: i18nT('settings.tabs.shortcuts.label'), icon: <Keyboard size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.shortcuts.description') },
+    { key: 'skills', tile: 'var(--tile-orange)', label: i18nT('settings.tabs.skills.label'), icon: <Sparkles size={16} />, group: GROUP_PREFERENCES, description: i18nT('settings.tabs.skills.description') },
+    { key: 'channels', tile: 'var(--tile-teal)', label: i18nT('settings.tabs.channels.label'), icon: <Link2 size={16} />, description: i18nT('settings.tabs.channels.description'), hostsSubNav: true },
+    { key: 'browser', tile: 'var(--tile-blue)', label: i18nT('settings.tabs.browser.label'), icon: <Globe size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.browser.description') },
+    { key: 'computer-use', tile: 'var(--tile-indigo)', label: i18nT('settings.tabs.computerUse.label'), icon: <SquareMousePointer className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.computerUse.description') },
+    { key: 'webhooks', tile: 'var(--tile-orange)', label: i18nT('settings.tabs.webhooks.label'), icon: <Webhook size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.webhooks.description') },
+    { key: 'instances', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.instances.label'), icon: <Server size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.instances.description') },
+    { key: 'privacy', tile: 'var(--tile-blue)', label: i18nT('privacyDisclosure.settingsLabel'), icon: <Fingerprint className="lucide-inline" />, group: GROUP_SYSTEM, description: i18nT('privacyDisclosure.settingsDescription') },
+    { key: 'security', tile: 'var(--tile-red)', label: i18nT('settings.tabs.security.label'), icon: <ShieldCheck size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.security.description'), hostsSubNav: true },
+    { key: 'connections', tile: 'var(--tile-green)', label: i18nT('settings.tabs.connections.label'), icon: <Plug size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.connections.description') },
+    { key: 'secrets', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.secrets.label'), icon: <KeyRound size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.secrets.description') },
+    { key: 'developer', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.developer.label'), icon: <Code size={16} />, group: GROUP_SYSTEM, description: i18nT('settings.tabs.developer.description') },
     // The trailing divider fences off the entries that are not settings at all.
     // About was its only occupant; the release archive is the same kind of thing
     // (a document about the product, not a preference), so it joins the fence
@@ -80,8 +101,8 @@ function buildTabs() {
     // its own version rail beside the notes, and letting the page grow scrolled
     // the rail and the "Releases" heading off the top while the reader was
     // still inside one release's notes.
-    { key: 'releases', label: i18nT('settings.tabs.releases.label'), icon: <History size={16} />, dividerBefore: true, fixedContent: true, description: i18nT('settings.tabs.releases.description') },
-    { key: 'about', label: i18nT('settings.tabs.about.label'), icon: <Info size={16} />, description: i18nT('settings.tabs.about.description') },
+    { key: 'releases', tile: 'var(--tile-purple)', label: i18nT('settings.tabs.releases.label'), icon: <History size={16} />, dividerBefore: true, fixedContent: true, description: i18nT('settings.tabs.releases.description') },
+    { key: 'about', tile: 'var(--tile-gray)', label: i18nT('settings.tabs.about.label'), icon: <Info size={16} />, description: i18nT('settings.tabs.about.description') },
   ]
 }
 
@@ -179,8 +200,12 @@ export default function SettingsPage() {
     navigate({ pathname: target, search: rest ? `?${rest}` : '' }, { replace: true })
   }, [search, pathname, navigate])
 
-  // An embedded instance pane can't manage remote crews (single-level by
-  // design) — hide the Remote Crew tab so a pane can't connect onward.
+  // Remote Crew is reachable inside an embedded pane: a pane may connect a
+  // further crew, and the gateway showing this dashboard adds it as a top-level
+  // tab of its own (the chain is flat in the tab bar, a tree in the switcher).
+  // A connect that would go too deep, or close a loop, is refused SERVER-SIDE
+  // with a reason the panel shows — which is why the tab stays visible rather
+  // than disappearing and reading as a missing feature or a stale build.
   const embedded = isEmbeddedPane()
   // Update nudge: dot on the About entry while an update is available. Two
   // independent sources, because they cover different installs: the Electron
@@ -202,8 +227,7 @@ export default function SettingsPage() {
   // rail without a reload.
   const webhooksPreview = usePreviewFlag(PREVIEW_WEBHOOKS)
   const allTabs = buildTabs().filter(t => t.key !== 'webhooks' || webhooksPreview)
-  const baseTabs = embedded ? allTabs.filter(t => t.key !== 'instances') : allTabs
-  const tabs = updateAvailable ? baseTabs.map(t => (t.key === 'about' ? { ...t, dot: true } : t)) : baseTabs
+  const tabs = updateAvailable ? allTabs.map(t => (t.key === 'about' ? { ...t, dot: true } : t)) : allTabs
 
   const memorySelection = new URLSearchParams(search)
   const memberMemoryView = pathname.replace(/\/$/, '') === '/settings/overview'
@@ -217,30 +241,46 @@ export default function SettingsPage() {
       paneOwnsHeader={memberMemoryView}
       basePath={SETTINGS_BASE_PATH}
       headerRightDock="bottom-float"
-      // Keyed apart from the main window: an embedded pane has a different tab
-      // roster (no Instances), so the two must not restore each other's tab.
+      // Keyed apart from the main window: a pane and the window that holds it
+      // are two places the user navigates independently, so opening Remote Crew
+      // inside a pane must not move the window's own Settings tab under them.
       rememberKey={embedded ? 'settings-embedded' : 'settings'}
+      // Desktop: search lives at the top of the sidebar rail (navTop), pinned
+      // while the tab list scrolls. Mobile: the same field is the floating
+      // bottom capsule (headerRight + bottom-float). Only one mounts per
+      // viewport, so passing both is not a double render.
+      navTop={<SettingsSearch />}
       headerRight={<SettingsSearch />}
       footer={<span className="text-[12px] text-muted">{i18nT('pages.settingsPage.kirocrew_v')}{version}</span>}
     >
       {tab => <>
         {tab === 'overview' && <OverviewPanel />}
         {tab === 'imports' && <ImportPanel />}
-        {tab === 'chat' && <ChatPanel />}
-        {tab === 'display' && <DisplayPanel />}
+        {tab === 'agent' && (
+          <Suspense fallback={<ContentSkeleton rows={6} />}>
+            <AgentBackendTab />
+          </Suspense>
+        )}
+        {tab === 'agent' && (
+          <Suspense fallback={<ContentSkeleton rows={4} />}>
+            <div className="mt-4"><AgentRunSettings /></div>
+          </Suspense>
+        )}
+        {tab === 'chat' && <ChatPanel basePath={SETTINGS_BASE_PATH} />}
+        {tab === 'display' && <DisplayPanel basePath={SETTINGS_BASE_PATH} />}
         {tab === 'voice' && <VoicePanel />}
-        {tab === 'notifications' && <NotificationsPanel />}
+        {tab === 'notifications' && <NotificationsPanel basePath={SETTINGS_BASE_PATH} />}
         {tab === 'shortcuts' && <ShortcutsPanel />}
         {tab === 'skills' && <SkillsPanel />}
         {tab === 'channels' && <ChannelsPanel basePath={SETTINGS_BASE_PATH} />}
         {tab === 'browser' && <BrowserPanel />}
-        {tab === 'computer-use' && <ComputerUsePanel />}
+        {tab === 'computer-use' && <GuideTrustRootRegion><ComputerUsePanel /></GuideTrustRootRegion>}
         {tab === 'webhooks' && <WebhooksPanel />}
-        {tab === 'instances' && !embedded && <RemoteCrewPanel />}
+        {tab === 'instances' && <RemoteCrewPanel />}
         {tab === 'privacy' && <PrivacyPanel />}
-        {tab === 'security' && <SecurityPanel basePath={SETTINGS_BASE_PATH} />}
+        {tab === 'security' && <GuideTrustRootRegion><SecurityPanel basePath={SETTINGS_BASE_PATH} /></GuideTrustRootRegion>}
         {tab === 'connections' && <ConnectionsPanel />}
-        {tab === 'secrets' && <SecretsPanel />}
+        {tab === 'secrets' && <GuideTrustRootRegion><SecretsPanel /></GuideTrustRootRegion>}
         {tab === 'developer' && <DeveloperPanel />}
         {tab === 'releases' && <ReleasesPanel />}
         {tab === 'about' && <AboutPanel />}

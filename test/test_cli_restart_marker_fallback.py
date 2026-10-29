@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew.service.common import RestartReport
+
 
 def test_authenticated_shutdown_request_uses_fixed_loopback_endpoint() -> None:
     from kiro_crew import cli_server
@@ -19,7 +21,9 @@ def test_authenticated_shutdown_request_uses_fixed_loopback_endpoint() -> None:
 
     with (
         patch("kiro_crew.cli_server.run_marker.read_secret", return_value="local-secret"),
-        patch("kiro_crew.cli_server.loopback_urlopen", return_value=context) as mock_open,
+        patch(
+            "kiro_crew.cli_server._owner_verified_secret_urlopen", return_value=context
+        ) as mock_open,
     ):
         assert _request_gateway_shutdown(7777) is True
 
@@ -37,7 +41,7 @@ def test_authenticated_shutdown_request_fails_closed_without_secret() -> None:
 
     with (
         patch("kiro_crew.cli_server.run_marker.read_secret", return_value=""),
-        patch("kiro_crew.cli_server.loopback_urlopen") as mock_open,
+        patch("kiro_crew.cli_server._owner_verified_secret_urlopen") as mock_open,
     ):
         assert _request_gateway_shutdown(7777) is False
     mock_open.assert_not_called()
@@ -56,7 +60,7 @@ def test_authenticated_shutdown_request_rejects_non_object_response() -> None:
 
     with (
         patch("kiro_crew.cli_server.run_marker.read_secret", return_value="local-secret"),
-        patch("kiro_crew.cli_server.loopback_urlopen", return_value=context),
+        patch("kiro_crew.cli_server._owner_verified_secret_urlopen", return_value=context),
     ):
         assert _request_gateway_shutdown(7777) is False
 
@@ -99,7 +103,7 @@ def test_authenticated_shutdown_request_rejects_oversized_response() -> None:
 
     with (
         patch("kiro_crew.cli_server.run_marker.read_secret", return_value="local-secret"),
-        patch("kiro_crew.cli_server.loopback_urlopen", return_value=context),
+        patch("kiro_crew.cli_server._owner_verified_secret_urlopen", return_value=context),
     ):
         assert cli_server._request_gateway_shutdown(7777) is False
 
@@ -116,7 +120,7 @@ def test_authenticated_shutdown_request_rejects_recursive_json() -> None:
 
     with (
         patch("kiro_crew.cli_server.run_marker.read_secret", return_value="local-secret"),
-        patch("kiro_crew.cli_server.loopback_urlopen", return_value=context),
+        patch("kiro_crew.cli_server._owner_verified_secret_urlopen", return_value=context),
     ):
         assert cli_server._request_gateway_shutdown(7777) is False
 
@@ -132,7 +136,7 @@ def test_restart_refuses_spawn_after_blind_authenticated_shutdown(
         patch("kiro_crew.cli_server.resolve_client_port", return_value=7777),
         patch(
             "kiro_crew.cli_server.service_controller.restart_service",
-            return_value=False,
+            return_value=RestartReport(),
         ),
         patch(
             "kiro_crew.cli_server.service_controller.is_service_active",
@@ -174,7 +178,9 @@ def test_restart_refuses_spawn_when_the_lock_is_still_held_after_the_incumbent_e
     mock_sel = MagicMock()
     with (
         patch("kiro_crew.cli_server.resolve_client_port", return_value=7777),
-        patch("kiro_crew.cli_server.service_controller.restart_service", return_value=False),
+        patch(
+            "kiro_crew.cli_server.service_controller.restart_service", return_value=RestartReport()
+        ),
         patch("kiro_crew.cli_server.service_controller.is_service_active", return_value=False),
         patch("kiro_crew.cli_server.run_marker.read_pid", return_value=4242),
         patch("kiro_crew.cli_server.platform_compat.find_listening_pids", return_value=[4242]),
@@ -211,7 +217,9 @@ def test_restart_refuses_spawn_when_the_lock_probe_is_indeterminate_after_the_wa
     mock_sel = MagicMock()
     with (
         patch("kiro_crew.cli_server.resolve_client_port", return_value=7777),
-        patch("kiro_crew.cli_server.service_controller.restart_service", return_value=False),
+        patch(
+            "kiro_crew.cli_server.service_controller.restart_service", return_value=RestartReport()
+        ),
         patch("kiro_crew.cli_server.service_controller.is_service_active", return_value=False),
         patch("kiro_crew.cli_server.run_marker.read_pid", return_value=4242),
         patch("kiro_crew.cli_server.platform_compat.find_listening_pids", return_value=[4242]),

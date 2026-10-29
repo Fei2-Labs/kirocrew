@@ -17,13 +17,21 @@ compatibility or egress claims rather than "the feature works":
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import contextlib
+import functools
 import gzip
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
+from chat_test_helpers import _make_state
 
 from kiro_crew.dashboard import session_export as se
+from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.session_transfer import (
     _SUPPORTED_BUNDLE_VERSIONS,
     BUNDLE_VERSION,
@@ -31,14 +39,59 @@ from kiro_crew.dashboard.session_transfer import (
     build_source_record,
     build_transfer_bundle_async,
 )
+from kiro_crew.history import (
+    ConversationLog,
+    TranscriptBusy,
+    TranscriptWithheld,
+    is_incognito_transcript,
+)
+
+
+def _export_bytes(resp) -> bytes:
+    """The body a successful export sends: it is served from its staged file."""
+    assert isinstance(resp, se._StagedExport), resp
+    return resp._path.read_bytes()
+
+
+def _staged_bytes(document) -> bytes:
+    """What :func:`se._stage_export` writes for *document*, read and removed."""
+    path = se._stage_export(document)
+    try:
+        return path.read_bytes()
+    finally:
+        path.unlink()
 
 
 class _FakeLog:
-    def __init__(self, messages):
+    def __init__(self, messages, *, metadata=None, readable=True):
         self._messages = messages
+        # The on-disk metadata line the export's file-level privacy gate reads.
+        # ``None`` metadata models an absent file; ``readable=False`` a line that
+        # exists but cannot be read.
+        self.metadata = {} if metadata is None else dict(metadata)
+        self.readable = readable
 
     def read_messages_chained(self, _key):
         return list(self._messages)
+
+    def get_metadata_status(self, _key):
+        return dict(self.metadata), self.readable
+
+    def derive_messages_chained(self, key):
+        """The derivation seam, as the real log implements it: line, then rows."""
+        meta, readable = self.get_metadata_status(key)
+        if not readable or is_incognito_transcript(meta.get("memory_mode")):
+            raise TranscriptWithheld("fake: restricted or unreadable")
+        return self.read_messages_chained(key)
+
+    @contextlib.contextmanager
+    def publication_hold(self, key, *, expected_keys=None):
+        meta, readable = self.get_metadata_status(key)
+        if not readable:
+            raise TranscriptBusy("fake: unreadable at publication")
+        if is_incognito_transcript(meta.get("memory_mode")):
+            raise TranscriptWithheld("fake: restricted at publication")
+        yield
 
 
 def _slot(messages, *, title="My session", memory_mode="persistent", app="", **over):
@@ -50,7 +103,7 @@ def _slot(messages, *, title="My session", memory_mode="persistent", app="", **o
         agent="",
         model="claude-opus-5",
         reasoning_effort="high",
-        mode="orchestrator",
+        mode="design-critique",
         autocompact_pct=75.0,
         workspace="default",
         project="/home/me/checkout",
@@ -63,7 +116,6 @@ def _slot(messages, *, title="My session", memory_mode="persistent", app="", **o
         _dirty_gen=0,
         memory_mode=memory_mode,
         running=False,
-        _in_stage_execution=False,
         _app=app,
     )
     for k, v in over.items():
@@ -378,13 +430,136 @@ async def test_export_streams_a_gzipped_bundle():
     assert resp.headers["Content-Disposition"].startswith("attachment; filename*=UTF-8''")
     assert resp.headers["Content-Disposition"].endswith(".kcsession.json.gz")
 
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
     assert document["bundle_version"] == 2
     assert [m["content"] for m in document["messages"]] == [
         "how does the tunnel work?",
         "it forwards loopback",
     ]
     assert document["source"]["approval_policy"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_export_revalidates_the_line_at_response_commit():
+    class _TightensAtCommit(_FakeLog):
+        @contextlib.contextmanager
+        def publication_hold(self, _key, *, expected_keys=None):
+            raise TranscriptWithheld("fake: tightened before response commit")
+            yield
+
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log = _TightensAtCommit(MSGS)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+class _BusyAtCommit(_FakeLog):
+    """A log whose publication hold is busy, so the response commit is refused."""
+
+    @contextlib.contextmanager
+    def publication_hold(self, _key, *, expected_keys=None):
+        raise TranscriptBusy("fake: held at response commit")
+        yield
+
+
+def _capture_audit(monkeypatch) -> list[dict]:
+    events: list[dict] = []
+
+    class _Audit:
+        def log_api_access(self, **fields):
+            events.append(fields)
+
+    monkeypatch.setattr(se, "sel", lambda: _Audit())
+    return events
+
+
+@pytest.mark.asyncio
+async def test_export_refuses_if_assembled_chain_loses_a_member(tmp_path, monkeypatch):
+    tab_id = "aaaabbbbcccc"
+    sibling = "dashboard:chat-export-sibling"
+    root = "dashboard:chat-export-root"
+    log = ConversationLog(base_dir=tmp_path / "sessions")
+    await asyncio.to_thread(log.append, root, "user", "root", tab_id=tab_id)
+    await asyncio.to_thread(log.append, sibling, "user", "sibling", tab_id=tab_id)
+    root_messages = [{"role": "user", "content": "root", "ts": ""}]
+    slot = _slot(root_messages)
+    slot.key = "chat-export-root"
+    state = _state(root_messages, slots={"slot-1": slot})
+    state.conversation_log = log
+    build = se.build_transfer_bundle_async
+
+    async def _build_then_delete(*args, **kwargs):
+        bundle = await build(*args, **kwargs)
+        assert await asyncio.to_thread(log.delete_session, sibling)
+        return bundle
+
+    monkeypatch.setattr(se, "build_transfer_bundle_async", _build_then_delete)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 503
+    assert json.loads(resp.body)["code"] == "export_snapshot_unstable"
+
+
+@pytest.mark.asyncio
+async def test_a_line_tightened_at_commit_leaves_only_the_denied_audit(monkeypatch):
+    """No ``allowed`` record may name bytes that were never transmitted: the
+    allowed line is written only once the commit has taken the response."""
+    events = _capture_audit(monkeypatch)
+
+    class _TightensAtCommit(_FakeLog):
+        @contextlib.contextmanager
+        def publication_hold(self, _key, *, expected_keys=None):
+            raise TranscriptWithheld("fake: tightened before response commit")
+            yield
+
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log = _TightensAtCommit(MSGS)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert [e["outcome"] for e in events] == ["denied"]
+    assert events[0]["error"].startswith("on-disk line at response commit")
+
+
+@pytest.mark.asyncio
+async def test_a_busy_commit_leaves_only_the_failure_audit(monkeypatch, tmp_path):
+    import kiro_crew.dashboard.session_transfer as st
+
+    out = tmp_path / "egress"
+    out.mkdir()
+    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    events = _capture_audit(monkeypatch)
+
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log = _BusyAtCommit(MSGS)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 503
+    assert [e["outcome"] for e in events] == ["failure"]
+    assert list(out.iterdir()) == [], "a refused commit removes the staged body"
+
+
+@pytest.mark.asyncio
+async def test_a_committed_export_records_exactly_one_allowed_audit(monkeypatch):
+    events = _capture_audit(monkeypatch)
+    slot = _slot(MSGS)
+    state = _state(MSGS, sessions=_FakeSessions({SESSION_KEY: "auto"}), slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 200
+    assert [e["outcome"] for e in events] == ["allowed"]
+    assert f"bytes={len(_export_bytes(resp))}" in events[0]["resources"]
+    assert f"messages={len(MSGS)}" in events[0]["resources"]
 
 
 @pytest.mark.asyncio
@@ -420,7 +595,7 @@ async def test_export_carries_no_host_or_login_provenance():
     state = _state(MSGS, sessions=_FakeSessions({SESSION_KEY: "auto"}), slots={"slot-1": slot})
 
     resp = await se.api_chat_slot_export(_request(state))
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
 
     # No host identity at the top level.
     assert document["origin"] == ""
@@ -448,6 +623,77 @@ async def test_incognito_and_temporary_sessions_are_refused():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("line_mode", ["incognito", "temporary", "Incognito"])
+async def test_a_restricted_on_disk_line_refuses_a_slot_that_still_reads_persistent(line_mode):
+    """The bundle is built from DISK, so the file's own contract gates it.
+
+    Another writer -- a second gateway on this data home, a same-key hand-over, a
+    subagent appending -- can tighten the line while this slot still reads
+    persistent in memory. The live-slot gate above passes; the file must not.
+    """
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log.metadata = {"memory_mode": line_mode}
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_on_disk_line_refuses_the_export():
+    """Fail closed: a reader that cannot see the contract does not ship the rows."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log.readable = False
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_a_line_tightened_while_the_bundle_was_built_is_refused(monkeypatch):
+    """The gate is asked again AFTER the build, so a tightening in between is caught."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    log = state.conversation_log
+    real_derive = log.derive_messages_chained
+
+    def _tighten_then_derive(key):
+        # The writer that tightens the line takes the transcript lock the seam
+        # holds, so it lands either before the seam's hold (this) or after it.
+        log.metadata = {"memory_mode": "incognito"}
+        return real_derive(key)
+
+    monkeypatch.setattr(log, "derive_messages_chained", _tighten_then_derive)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_a_busy_transcript_is_a_retryable_503_not_a_privacy_refusal(monkeypatch):
+    """The seam could not take the lock: nothing is wrong with the session, retry."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+
+    def _busy(_key):
+        raise TranscriptBusy("held by another writer")
+
+    monkeypatch.setattr(state.conversation_log, "derive_messages_chained", _busy)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 503
+    assert json.loads(resp.body)["code"] == "export_snapshot_unstable"
+
+
+@pytest.mark.asyncio
 async def test_an_unknown_slot_is_a_404():
     resp = await se.api_chat_slot_export(_request(_state(MSGS), slot_key="nope"))
     assert resp.status == 404
@@ -469,7 +715,8 @@ async def test_an_app_cannot_export_a_slot_it_does_not_own():
     resp = await se.api_chat_slot_export(_request(state, app="my-app"))
 
     assert resp.status == 404
-    assert json.loads(resp.body)["code"] == "export_slot_not_found"
+    # The per-slot checkpoint's body, so the handler and the checkpoint agree.
+    assert json.loads(resp.body) == {"error": "not found", "code": "slot_not_found"}
 
 
 @pytest.mark.asyncio
@@ -570,7 +817,7 @@ async def test_the_export_withholds_layer_b_by_default(monkeypatch):
     resp = await se.api_chat_slot_export(_request(state))
     assert resp.status == 200
 
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
     assert "layer_b" not in document, "the export must withhold context by default"
     assert document["layer_b_skipped"] is True
     assert "a-real-sid" not in json.dumps(document)
@@ -609,7 +856,7 @@ async def test_an_export_carries_layer_b_on_explicit_opt_in(monkeypatch):
     resp = await se.api_chat_slot_export(_request(state, query={"include_layer_b": "true"}))
     assert resp.status == 200
 
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
     assert "layer_b" in document, "an explicit opt-in must carry the context window"
     # ``_assemble_bundle`` keeps only the envelope + events on the wire; the sid is
     # resolved locally and never rides along.
@@ -639,7 +886,7 @@ async def test_an_export_withholds_layer_b_for_a_non_operator_caller(monkeypatch
     )
     assert resp.status == 200
 
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
     assert "layer_b" not in document
     assert document["layer_b_skipped"] is True
 
@@ -671,7 +918,7 @@ async def test_an_export_withholds_when_permitted_but_not_requested(monkeypatch)
     resp = await se.api_chat_slot_export(_request(state))  # no query flag
     assert resp.status == 200
 
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
     assert "layer_b" not in document, "permission alone must not carry without a per-export ask"
     assert document["layer_b_skipped"] is True
 
@@ -765,7 +1012,7 @@ async def test_a_session_that_never_had_context_is_not_flagged_as_degraded():
     resp = await se.api_chat_slot_export(_request(state))
     assert resp.status == 200
 
-    document = json.loads(gzip.decompress(resp.body))
+    document = json.loads(gzip.decompress(_export_bytes(resp)))
     assert "layer_b" not in document
     assert "layer_b_skipped" not in document
 
@@ -786,19 +1033,22 @@ def test_the_free_text_provenance_fields_are_redacted():
 
 
 @pytest.mark.asyncio
-async def test_a_bundle_the_importer_would_reject_is_not_handed_over(monkeypatch):
-    """A producer must not emit a document its own reader refuses.
+async def test_an_oversized_session_exports_rather_than_being_refused(monkeypatch):
+    """Export is never blocked by size — no producer-side reject preflight.
 
-    Past the importer's bounds the file would download cleanly, cost the user a
-    download, and then be rejected wherever they took it. The bounds are consulted
-    through the validator itself rather than restated, so the two cannot drift.
+    A bundle far past every OLD importer bound (5,000 messages / 20 MB content)
+    exports successfully: the file is handed over, gzipped, with all its messages,
+    because a transfer must never be blocked by size (the owner's decision). The
+    old ``export_bundle_rejected`` refusal is gone.
     """
+    import gzip
+
     oversized = {
         "bundle_version": 2,
         "origin": "mac",
         "title": "huge",
         "agent": "",
-        "messages": [{"role": "user", "content": "x", "ts": ""} for _ in range(5001)],
+        "messages": [{"role": "user", "content": "x" * 4000, "ts": ""} for _ in range(6000)],
     }
 
     async def _huge(*_a, **_k):
@@ -809,27 +1059,10 @@ async def test_a_bundle_the_importer_would_reject_is_not_handed_over(monkeypatch
 
     resp = await se.api_chat_slot_export(_request(state))
 
-    assert resp.status == 400
-    body = json.loads(resp.body)
-    assert body["code"] == "export_bundle_rejected"
-    # Which bound was hit is carried in prose and in the audit record, not as a
-    # separate machine-readable field: nothing reads one off the wire.
-    assert "too many messages" in body["error"]
-    assert "importer_code" not in body
-
-
-def test_the_rejection_reason_comes_from_the_importer_itself():
-    from kiro_crew.dashboard.session_transfer import bundle_rejection_reason
-
-    ok = {
-        "bundle_version": 2,
-        "messages": [{"role": "user", "content": "hi", "ts": ""}],
-    }
-    assert bundle_rejection_reason(ok) == ("", "")
-
-    reason, code = bundle_rejection_reason({"bundle_version": 2, "messages": []})
-    assert code == "transfer_bundle_empty"
-    assert reason
+    assert resp.status == 200
+    assert resp.content_type == "application/gzip"
+    round_tripped = json.loads(gzip.decompress(_export_bytes(resp)))
+    assert len(round_tripped["messages"]) == 6000
 
 
 @pytest.mark.asyncio
@@ -849,9 +1082,9 @@ async def test_an_app_cannot_export_a_channel_linked_slot_it_owns():
     resp = await se.api_chat_slot_export(_request(state, app="my-app"))
 
     assert resp.status == 404
-    # Indistinguishable from an unknown slot: a separate code would let an app
+    # Indistinguishable from an unknown slot: a separate body would let an app
     # learn which of its slots carry a channel link.
-    assert json.loads(resp.body)["code"] == "export_slot_not_found"
+    assert json.loads(resp.body) == {"error": "not found", "code": "slot_not_found"}
 
 
 @pytest.mark.asyncio
@@ -881,7 +1114,7 @@ def test_a_lone_surrogate_does_not_crash_serialisation():
         "messages": [{"role": "user", "content": lone, "ts": ""}],
     }
 
-    raw = se.gzip_bundle(document)
+    raw = _staged_bytes(document)
 
     assert json.loads(gzip.decompress(raw))["messages"][0]["content"] == lone
 
@@ -890,5 +1123,479 @@ def test_gzip_is_deterministic_for_one_document():
     """``mtime=0``: the export instant is already inside the document, so a
     second copy in the gzip header would only make identical exports differ."""
     document = {"bundle_version": 2, "messages": [{"role": "user", "content": "hi", "ts": ""}]}
-    assert se.gzip_bundle(document) == se.gzip_bundle(document)
-    assert json.loads(gzip.decompress(se.gzip_bundle(document))) == document
+    assert _staged_bytes(document) == _staged_bytes(document)
+    assert json.loads(gzip.decompress(_staged_bytes(document))) == document
+
+
+@pytest.mark.asyncio
+async def test_a_pending_line_tightening_is_applied_before_export(tmp_path, monkeypatch):
+    events = []
+
+    class _Audit:
+        def log_api_access(self, **fields):
+            events.append(fields)
+
+    monkeypatch.setattr(se, "sel", lambda: _Audit())
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("slot-1")
+    slot.append("user", "restricted row")
+    slot.drain()
+    assert await save_slot_off_loop(state, slot, best_effort=False)
+    await asyncio.to_thread(
+        state.conversation_log.update_metadata,
+        slot_history_key(slot),
+        {"memory_mode": "incognito"},
+    )
+    slot.append("assistant", "restricted reply")
+    slot.drain()
+
+    assert await save_slot_off_loop(state, slot, best_effort=False)
+    assert slot.memory_mode == "incognito"
+    response = await se.api_chat_slot_export(_request(state))
+
+    assert response.status == 400
+    assert json.loads(response.body)["code"] == "export_slot_not_persistent"
+    assert events[-1]["outcome"] == "denied"
+    assert events[-1]["error"] == "memory_mode=incognito"
+
+
+@pytest.mark.asyncio
+async def test_an_export_streams_layer_b_from_its_snapshot_and_removes_it(monkeypatch, tmp_path):
+    """Layer B rides out of its snapshot file, never read whole, and the
+    snapshot is gone once the response is built."""
+    import kiro_crew.dashboard.session_transfer as st
+
+    out = tmp_path / "egress"
+    out.mkdir()
+    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    snap = out / "snap.jsonl"
+    snap.write_bytes('{"k":"中"}\n'.encode())
+    monkeypatch.setattr(st, "_resolve_layer_b_sid", lambda *_a, **_k: "a-real-sid")
+    monkeypatch.setattr(
+        st,
+        "_read_layer_b",
+        lambda sid: {"sid": sid, "envelope": {}, "events": st.LayerBEvents(snap)} if sid else None,
+    )
+    monkeypatch.setattr(se, "is_owner_dashboard_request", lambda *_a, **_k: True)
+    monkeypatch.setattr(se, "_export_layer_b_permitted", lambda: True)
+
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    resp = await se.api_chat_slot_export(_request(state, query={"include_layer_b": "true"}))
+
+    assert resp.status == 200
+    assert json.loads(gzip.decompress(_export_bytes(resp)))["layer_b"]["events"] == '{"k":"中"}\n'
+    # The snapshot is gone once the response is built; the staged body stays
+    # until the response is sent, which removes it.
+    assert list(out.iterdir()) == [resp._path]
+
+
+@pytest.mark.asyncio
+async def test_a_sent_export_streams_its_staged_file_and_removes_it(tmp_path, monkeypatch):
+    """The body goes out of the staged file, a chunk at a time, and the file is
+    removed once the send ends. Nothing reads it whole into memory. The wait is on
+    the cleanup handshake, not a sleep."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import kiro_crew.dashboard.session_transfer as st
+
+    out = tmp_path / "egress"
+    out.mkdir()
+    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    document = {"bundle_version": 2, "messages": [{"role": "user", "content": "hi", "ts": ""}]}
+    staged = se._stage_export(document)
+    real_rm = se._rm_import_temps
+    removed = threading.Event()
+
+    def wrapper(*paths):
+        try:
+            return real_rm(*paths)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(se, "_rm_import_temps", wrapper)
+
+    def _no_whole_read(self, *a, **k):
+        raise AssertionError("the staged export was read whole")
+
+    monkeypatch.setattr(type(staged), "read_bytes", _no_whole_read)
+
+    async def _handler(_request):
+        return se._StagedExport(staged, headers={"Content-Type": "application/gzip"})
+
+    app = web.Application()
+    app.router.add_get("/x", _handler)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/x")
+        assert resp.status == 200
+        assert json.loads(gzip.decompress(await resp.read())) == document
+    assert await asyncio.to_thread(removed.wait, 10), "staged export cleanup never ran"
+    assert not staged.exists()
+
+
+class _HeldExecutor(concurrent.futures.ThreadPoolExecutor):
+    """A default executor that queues the jobs *held* picks out without starting
+    them, until :meth:`release`. A held job is a submitted job no worker has
+    picked up yet, the state a loaded runner leaves a cleanup in."""
+
+    def __init__(self, held) -> None:
+        super().__init__(max_workers=4)
+        self._is_held = held
+        self.queued: list[tuple[concurrent.futures.Future, object, tuple]] = []
+        self.submitted = threading.Event()
+
+    def submit(self, fn, /, *args, **kwargs):
+        target = fn.args[0] if isinstance(fn, functools.partial) and fn.args else fn
+        if not self._is_held(target):
+            return super().submit(fn, *args, **kwargs)
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self.queued.append((future, fn, args))
+        self.submitted.set()
+        return future
+
+    def release(self) -> None:
+        for future, fn, args in self.queued:
+            if future.set_running_or_notify_cancel():
+                future.set_result(fn(*args))
+
+
+@pytest.mark.asyncio
+async def test_a_send_cancelled_while_its_cleanup_waits_for_a_worker_still_removes_it(
+    tmp_path, monkeypatch
+):
+    """A client that goes away cancels the send. When that lands while the
+    removal is queued but not yet started, the removal still runs."""
+    from aiohttp import web
+
+    async def _sent(self, *_a, **_k):
+        return None
+
+    for name in ("prepare", "write", "write_eof"):
+        monkeypatch.setattr(web.StreamResponse, name, _sent)
+    staged = tmp_path / "staged.kcsession.json.gz"
+    staged.write_bytes(gzip.compress(b"{}"))
+    removals = {"_close_and_remove", "_rm_import_temps"}
+    pool = _HeldExecutor(lambda target: getattr(target, "__name__", "") in removals)
+    asyncio.get_running_loop().set_default_executor(pool)
+    try:
+        response = se._StagedExport(staged, headers={})
+        send = asyncio.ensure_future(response.prepare(SimpleNamespace(method="GET")))
+        assert await asyncio.to_thread(pool.submitted.wait, 10), "the removal was never queued"
+        send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await send
+        pool.release()
+        await asyncio.gather(*getattr(se, "_PENDING_RELEASES", ()))
+        assert not staged.exists(), "a cancelled send withdrew its queued removal"
+    finally:
+        pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_commit_cancelled_while_its_cleanup_waits_still_removes_it(
+    tmp_path, monkeypatch
+):
+    """A commit that never hands the staged file to a response removes it
+    itself. When the handler is cancelled while that removal is queued but not
+    yet started, the removal still runs."""
+    import kiro_crew.dashboard.session_transfer as st
+
+    out = tmp_path / "egress"
+    out.mkdir()
+    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    _capture_audit(monkeypatch)
+
+    state = _state(MSGS, slots={"slot-1": _slot(MSGS)})
+    state.conversation_log = _BusyAtCommit(MSGS)
+    pool = _HeldExecutor(lambda target: getattr(target, "__name__", "") == "_rm_import_temps")
+    asyncio.get_running_loop().set_default_executor(pool)
+    try:
+        handler = asyncio.ensure_future(se.api_chat_slot_export(_request(state)))
+        assert await asyncio.to_thread(pool.submitted.wait, 10), "the removal was never queued"
+        assert list(out.iterdir()), "the staged body was removed before the cancel"
+        handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+        pool.release()
+        await asyncio.gather(*se._PENDING_RELEASES)
+        assert list(out.iterdir()) == [], "a cancelled commit withdrew its queued removal"
+    finally:
+        pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_a_sent_export_closes_its_handle_before_removing_the_file(tmp_path, monkeypatch):
+    """The removal starts only once the send's own handle is closed: Windows
+    refuses to delete a file any handle still holds open."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    staged = tmp_path / "staged.kcsession.json.gz"
+    staged.write_bytes(gzip.compress(b'{"k": 1}'))
+    handles = []
+    real_open = se._open_staged
+
+    def _tracked_open(path):
+        fobj, size = real_open(path)
+        handles.append(fobj)
+        return fobj, size
+
+    monkeypatch.setattr(se, "_open_staged", _tracked_open)
+    seen_open: list[bool] = []
+    removed = threading.Event()
+    real_rm = se._rm_import_temps
+
+    def _rm(*paths):
+        try:
+            seen_open.extend(not fobj.closed for fobj in handles)
+            return real_rm(*paths)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(se, "_rm_import_temps", _rm)
+
+    async def _handler(_request):
+        return se._StagedExport(staged, headers={"Content-Type": "application/gzip"})
+
+    app = web.Application()
+    app.router.add_get("/x", _handler)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/x")
+        assert json.loads(gzip.decompress(await resp.read())) == {"k": 1}
+    assert await asyncio.to_thread(removed.wait, 10), "staged export cleanup never ran"
+    assert seen_open == [False]
+    assert not staged.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_staging_failure_is_an_audited_coded_500_and_releases_the_snapshot(
+    monkeypatch, tmp_path
+):
+    """A full staging volume fails the serialisation; the answer is the handler's
+    own coded failure, audited, with the Layer B snapshot removed."""
+    import kiro_crew.dashboard.session_transfer as st
+
+    out = tmp_path / "egress"
+    out.mkdir()
+    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    snap = out / "snap.jsonl"
+    snap.write_bytes(b'{"k":1}\n')
+    monkeypatch.setattr(st, "_resolve_layer_b_sid", lambda *_a, **_k: "a-real-sid")
+    monkeypatch.setattr(
+        st,
+        "_read_layer_b",
+        lambda sid: {"sid": sid, "envelope": {}, "events": st.LayerBEvents(snap)} if sid else None,
+    )
+    monkeypatch.setattr(se, "is_owner_dashboard_request", lambda *_a, **_k: True)
+    monkeypatch.setattr(se, "_export_layer_b_permitted", lambda: True)
+
+    def _full(_bundle):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(se, "_stage_export", _full)
+    audits: list[str] = []
+    monkeypatch.setattr(
+        se, "sel", lambda: SimpleNamespace(log_api_access=lambda **k: audits.append(k["outcome"]))
+    )
+
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    resp = await se.api_chat_slot_export(_request(state, query={"include_layer_b": "true"}))
+
+    assert resp.status == 500
+    assert json.loads(resp.body)["code"] == "export_failed"
+    assert audits == ["error"]
+    assert not snap.exists()
+
+
+# ── the Markdown format ──────────────────────────────────────────────────
+#
+# The format decides only how the assembled bundle is WRITTEN OUT, so the cases
+# that matter are the ones where that could stop being true: a guard that only
+# one format passes, and the sensitive payload the human-readable document must
+# never be able to carry.
+
+
+@pytest.mark.asyncio
+async def test_export_streams_a_markdown_document():
+    slot = _slot(MSGS, title="Design chat")
+    state = _state(MSGS, sessions=_FakeSessions({SESSION_KEY: "auto"}), slots={"slot-1": slot})
+
+    resp = await se.api_chat_slot_export(_request(state, query={"format": "md"}))
+
+    assert resp.status == 200
+    assert resp.content_type == "text/markdown"
+    assert resp.charset == "utf-8"
+    # The body is text this session produced, served on the dashboard's own
+    # origin, so a sniffing browser must not be free to treat it as HTML.
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["Content-Disposition"].endswith(".kcsession.md")
+    assert "design-chat-" in resp.headers["Content-Disposition"]
+
+    text = _export_bytes(resp).decode("utf-8")
+    assert text.startswith("# Design chat\n")
+    assert "## User — t1" in text
+    assert "how does the tunnel work?" in text
+    assert "it forwards loopback" in text
+    # The provenance the JSON bundle carries as ``source`` is a table here, so a
+    # reader of the file alone still learns what the session ran under.
+    assert "| Approval policy | auto |" in text
+
+
+@pytest.mark.asyncio
+async def test_a_message_the_parse_cannot_settle_degrades_alone_and_the_export_succeeds(
+    monkeypatch,
+):
+    """One message no closer is proven for is shown as plain text; the export goes on.
+
+    That message alone is written inside a longer fence, the export is the
+    ordinary audited success, and the next role heading is still a heading: one
+    odd turn does not cost the reader the turns that are fine.
+    """
+    from markdown_it import MarkdownIt
+
+    from kiro_crew.dashboard import session_markdown as sm
+
+    monkeypatch.setattr(sm, "_MAX_CLOSERS", 0)
+    events = _capture_audit(monkeypatch)
+    msgs = [
+        {"role": "assistant", "content": "```\nunfinished", "ts": "t1"},
+        {"role": "user", "content": "thanks", "ts": "t2"},
+    ]
+    state = _state(
+        msgs, sessions=_FakeSessions({SESSION_KEY: "auto"}), slots={"slot-1": _slot(msgs)}
+    )
+
+    resp = await se.api_chat_slot_export(_request(state, query={"format": "md"}))
+
+    assert resp.status == 200
+    assert [e["outcome"] for e in events] == ["allowed"]
+    text = _export_bytes(resp).decode("utf-8")
+    assert "````\n```\nunfinished\n````\n" in text
+    tokens = MarkdownIt("commonmark").parse(text)
+    assert any(
+        token.type == "heading_open"
+        and token.tag == "h2"
+        and tokens[index + 1].content == "User — t2"
+        for index, token in enumerate(tokens[:-1])
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_markdown_export_never_reads_layer_b(monkeypatch):
+    """The one asymmetry between the formats, and it fails closed.
+
+    Markdown installs nowhere, so the model's byte-exact unredacted context
+    window has no job in it — and the document's whole purpose is being pasted
+    into a review, a ticket or a chat. The format gate sits AHEAD of the
+    operator's twofold opt-in, so both opt-ins being ON changes nothing here.
+
+    Asserted on the READ and not on the rendered text, because the renderer never
+    emits ``layer_b`` either way: a text assertion would pass with the gate
+    removed and prove nothing. ``include_layer_b=False`` leaves the resolved sid
+    empty, and ``_read_layer_b`` opens nothing for an empty sid — so no snapshot
+    of the unredacted context window is ever staged for a document that cannot
+    carry it.
+
+    REVERSE-VERIFY: drop the ``export_format == _FORMAT_JSON`` conjunct at the
+    call site and this goes red -- the Markdown export starts snapshotting Layer B
+    for an operator who opted in for the JSON one.
+    """
+    import kiro_crew.dashboard.session_transfer as st
+
+    reads: list[str] = []
+
+    def _spy(sid):
+        reads.append(sid)
+        return {"sid": sid, "envelope": {}, "events": "{}"} if sid else None
+
+    monkeypatch.setattr(st, "_resolve_layer_b_sid", lambda *_a, **_k: "a-real-sid")
+    monkeypatch.setattr(st, "_read_layer_b", _spy)
+    monkeypatch.setattr(se, "is_owner_dashboard_request", lambda *_a, **_k: True)
+    monkeypatch.setattr(se, "_export_layer_b_permitted", lambda: True)
+
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    resp = await se.api_chat_slot_export(
+        _request(state, query={"format": "md", "include_layer_b": "true"})
+    )
+
+    assert resp.status == 200
+    # The builder calls the reader unconditionally; an EMPTY sid is what makes it
+    # open nothing. A real sid reaching it is the leak this gate prevents.
+    assert [
+        sid for sid in reads if sid
+    ] == [], "the Markdown format must not snapshot the context window"
+    text = _export_bytes(resp).decode("utf-8")
+    assert "envelope" not in text
+
+    # The SAME request in the JSON format does read it, so the assertion above is
+    # the format gate and not a broken monkeypatch.
+    reads.clear()
+    slot = _slot(MSGS)
+    state = _state(MSGS, slots={"slot-1": slot})
+    json_resp = await se.api_chat_slot_export(_request(state, query={"include_layer_b": "true"}))
+    assert json_resp.status == 200
+    assert [sid for sid in reads if sid] == ["a-real-sid"]
+
+
+@pytest.mark.asyncio
+async def test_a_restricted_session_is_refused_in_both_formats():
+    """The refusals are the handler's, not the JSON path's.
+
+    An incognito transcript exists under a promise that nothing is produced from
+    it. A Markdown rendering is such a product, so asking for a different format
+    must not be a way around the refusal.
+    """
+    for query in ({}, {"format": "md"}):
+        slot = _slot(MSGS, memory_mode="incognito")
+        state = _state(MSGS, slots={"slot-1": slot})
+        resp = await se.api_chat_slot_export(_request(state, query=query))
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_session_is_refused_in_both_formats():
+    for query in ({}, {"format": "md"}):
+        slot = _slot([])
+        state = _state([], slots={"slot-1": slot})
+        resp = await se.api_chat_slot_export(_request(state, query=query))
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "export_bundle_empty"
+
+
+def test_the_format_query_accepts_only_md_and_defaults_to_json():
+    def fmt(value):
+        return se._export_format(
+            SimpleNamespace(query={"format": value} if value is not None else {})
+        )
+
+    assert fmt(None) == "json"
+    assert fmt("") == "json"
+    assert fmt("md") == "markdown"
+    assert fmt("MD") == "markdown"
+    assert fmt(" md ") == "markdown"
+    # Only the one spelling the menu sends selects Markdown. A second spelling of
+    # the same rendering is a branch no caller exercises, so it could change
+    # behaviour unnoticed; "markdown" is therefore not an accepted value.
+    assert fmt("markdown") == "json"
+    # An unrecognised value is the existing document rather than an error: both
+    # formats share the route's guards and redaction and differ only in whether a
+    # Layer B payload can ride along (only the JSON bundle can, after the explicit
+    # opt-in), so a typo costs a re-click and never a failed export.
+    assert fmt("json") == "json"
+    assert fmt("yaml") == "json"
+    assert fmt("html") == "json"
+
+
+def test_the_two_formats_share_the_kcsession_middle():
+    """So a directory of exports from one conversation still sorts together."""
+    from kiro_crew.dashboard.session_markdown import MARKDOWN_FILE_SUFFIX
+
+    json_name = se.export_filename("Design chat", stamp="S")
+    md_name = se.export_filename("Design chat", stamp="S", suffix=MARKDOWN_FILE_SUFFIX)
+    assert json_name == "design-chat-S.kcsession.json.gz"
+    assert md_name == "design-chat-S.kcsession.md"
+    assert md_name.removesuffix(".md") == json_name.removesuffix(".json.gz")

@@ -27,12 +27,11 @@ The design under test separates all of them:
   deliberately independent of ``done``, and executed under ``asyncio.shield`` so
   an interrupted claimer cannot strand the outcome.
 """
+
 from __future__ import annotations
 
-import ast
 import asyncio
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -40,8 +39,8 @@ import pytest
 from kiro_crew.subagent import (
     SubagentInfo,
     SubagentManager,
-    stage_boundary_owner_for_run,
 )
+from kiro_crew.testing.wait import await_until
 
 
 def _make_manager(max_concurrent: int = 4) -> SubagentManager:
@@ -64,26 +63,97 @@ def _info(**overrides) -> SubagentInfo:
     return info
 
 
-def _wire_report_boundaries(
-    manager: SubagentManager,
-    *scopes: tuple[str, str],
-):
-    from kiro_crew.dashboard.state import StageBoundary
-
-    boundaries = {
-        scope: StageBoundary(stage=1, generation=scope[1]) for scope in scopes
-    }
-    manager._stage_boundary_for_scope = lambda parent, owner: boundaries.get((parent, owner))
-    return boundaries
-
-
 def _done_events(mgr: SubagentManager) -> list:
     """The `subagent_done` fire_event calls only — `_fire_event` carries others."""
     return [c for c in mgr._fire_event.call_args_list if c.args and c.args[0] == "subagent_done"]
 
 
-async def _noop_reset(session_key):
+async def _noop_reset(session_key, **_):
     await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_reap_settles_credits_before_a_cancelled_state_writer_drains(monkeypatch):
+    from kiro_crew.acp.types import AcpPromptStats
+
+    mgr = _make_manager()
+    mgr._sessions.reset = AsyncMock()
+    mgr._running_count = 1
+    info = _info(credits=1.25)
+    mgr._agents[info.id] = info
+    provider = MagicMock()
+    provider.last_prompt_stats = AcpPromptStats(credits=9.0)
+    entered = asyncio.Event()
+    draining = asyncio.Event()
+    released = asyncio.Event()
+    workers = []
+    persisted = []
+    tombstoned = []
+    delivered = []
+    original_wait = asyncio.wait
+    original_to_thread = asyncio.to_thread
+
+    async def blocked_write(func, *args, **fields):
+        # Only the manager's off-loop state writes carry keyword ``fields``
+        # (``turns=`` for the diagnostics write, other keys for plain
+        # persistence). ``asyncio.to_thread`` is patched on the module object,
+        # so it is process-wide for the test's lifetime: any OTHER coroutine
+        # that reaches ``asyncio.to_thread`` (with a bare callable and no state
+        # fields) must run for real rather than be swallowed here — delegating
+        # keeps the patch scoped to the state-writer seam this test drives.
+        if not fields:
+            return await original_to_thread(func, *args)
+        if "turns" in fields:
+            workers.append(asyncio.current_task())
+            entered.set()
+            await released.wait()
+        else:
+            persisted.append(fields)
+        return True
+
+    async def observe_drain(futures, **kwargs):
+        if info._state_drain_active:
+            draining.set()
+        return await original_wait(futures, **kwargs)
+
+    async def billed_consumer(self, run, session_key, usage):
+        usage.begin(provider)
+        provider.last_prompt_stats = AcpPromptStats(credits=0.75)
+        await mgr._write_state_off_loop(run, "diagnostics", turns=1)
+
+    async def on_done(run):
+        delivered.append(run.credits)
+
+    mgr._on_done = on_done
+    mgr._write_tombstone = MagicMock(side_effect=lambda run, cause: tombstoned.append(run.credits))
+    monkeypatch.setattr(type(mgr._run_events), "_run_inner_impl", billed_consumer)
+    monkeypatch.setattr("kiro_crew.subagent.asyncio.to_thread", blocked_write)
+    monkeypatch.setattr("kiro_crew.subagent.asyncio.wait", observe_drain)
+    task = asyncio.create_task(mgr._run_inner(info, f"subagent:{info.id}"))
+    mgr._tasks[info.id] = task
+    try:
+        await await_until(entered)
+        task.cancel()
+        await await_until(draining)
+        await await_until(
+            asyncio.ensure_future(mgr._force_reap(info.id, info, 12.5, reason="deadline"))
+        )
+        assert info._state_drain_active, "test must report before the worker drains"
+        assert not task.done()
+        assert _done_events(mgr)[0].args[2]["credits"] == 2.0
+        assert persisted == []
+        assert tombstoned == [2.0]
+        assert delivered == [2.0]
+    finally:
+        released.set()
+        task.cancel()
+        await await_until(
+            asyncio.ensure_future(
+                asyncio.gather(task, *workers, *mgr._report_tasks, return_exceptions=True)
+            )
+        )
+    assert info.credits == 2.0, "the outer finally must not count the attempt twice"
+    assert info._credit_accounting is None
 
 
 async def _schedule_recovery(mgr: SubagentManager, info: SubagentInfo) -> None:
@@ -94,6 +164,7 @@ async def _schedule_recovery(mgr: SubagentManager, info: SubagentInfo) -> None:
     task that then EXITS — arming it from the test body would sit through the
     real ``_RESET_TIMEOUT + 60`` handshake.
     """
+
     async def _arm() -> None:
         mgr._schedule_cancel_recovery(info)
 
@@ -157,7 +228,7 @@ async def test_done_set_during_reap_teardown_still_reports_and_frees_one_slot():
     info = _info(_session_sharing=False)
     mgr._running_count = 1
 
-    async def _reset_then_finish(session_key):
+    async def _reset_then_finish(session_key, **_):
         # A concurrently-finishing _run_inner marking the record terminal.
         info.done = True
         await asyncio.sleep(0)
@@ -168,9 +239,9 @@ async def test_done_set_during_reap_teardown_still_reports_and_frees_one_slot():
 
     assert len(_done_events(mgr)) == 1, "outcome was not reported exactly once"
     assert mgr._on_done.await_count == 1, "completion never reached the parent"
-    assert mgr._running_count == 0, (
-        f"slot not freed exactly once (_running_count={mgr._running_count})"
-    )
+    assert (
+        mgr._running_count == 0
+    ), f"slot not freed exactly once (_running_count={mgr._running_count})"
 
 
 @pytest.mark.asyncio
@@ -200,7 +271,7 @@ async def test_run_claiming_during_reap_teardown_yields_one_report():
     mgr._running_count = 1
     reports: list[str] = []
 
-    async def _reset_with_race(session_key):
+    async def _reset_with_race(session_key, **_):
         if mgr._claim_finalize(info):
             reports.append("run")
         await asyncio.sleep(0)
@@ -269,10 +340,8 @@ async def test_cancel_during_subagent_done_still_delivers_once():
     mgr._fire_event = AsyncMock(side_effect=_slow_event)
     mgr._on_done = AsyncMock(side_effect=_record_delivery)
 
-    task = asyncio.ensure_future(
-        mgr._force_reap("a1b2c3d4", info, elapsed=1.0, reason="reaped")
-    )
-    await asyncio.wait_for(entered.wait(), timeout=2)  # now inside the shielded report
+    task = asyncio.ensure_future(mgr._force_reap("a1b2c3d4", info, elapsed=1.0, reason="reaped"))
+    await await_until(entered)  # now inside the shielded report
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -280,8 +349,8 @@ async def test_cancel_during_subagent_done_still_delivers_once():
     # The shielded report survives its awaiter's cancellation -- release it
     # and confirm it still completes delivery.
     release.set()
-    await asyncio.wait_for(
-        asyncio.gather(*[t for t in mgr._report_tasks if not t.done()]), timeout=2
+    await await_until(
+        asyncio.ensure_future(asyncio.gather(*[t for t in mgr._report_tasks if not t.done()]))
     )
     assert delivered == ["done"], "shielded report did not complete delivery"
 
@@ -303,18 +372,16 @@ async def test_cancel_during_on_done_produces_no_second_delivery():
 
     mgr._on_done = AsyncMock(side_effect=_slow_on_done)
 
-    task = asyncio.ensure_future(
-        mgr._force_reap("a1b2c3d4", info, elapsed=1.0, reason="reaped")
-    )
+    task = asyncio.ensure_future(mgr._force_reap("a1b2c3d4", info, elapsed=1.0, reason="reaped"))
     # Wait until _on_done is actually executing before cancelling — avoids a
     # race under heavy xdist load where asyncio.sleep(0.01) could expire after
     # _force_reap already completed, so the cancel would be a no-op.
-    await asyncio.wait_for(entered.wait(), timeout=5)
+    await await_until(entered)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.wait_for(
-        asyncio.gather(*[t for t in mgr._report_tasks if not t.done()]), timeout=2
+    await await_until(
+        asyncio.ensure_future(asyncio.gather(*[t for t in mgr._report_tasks if not t.done()]))
     )
 
     # Exactly one injection, and the claim is consumed so no other path retries.
@@ -417,272 +484,6 @@ async def test_run_path_claim_still_withheld_during_recovering():
 
 
 @pytest.mark.asyncio
-async def test_terminal_report_failure_reaches_parent_barrier():
-    """A handled announce failure is still a failed boundary-owned delivery."""
-    from kiro_crew.subagent import SubagentReportDeliveryError
-
-    mgr = _make_manager()
-    owner = "stage-owner"
-    info = _info(parent_session_key="dashboard:parent", _stage_boundary_owner=owner)
-    mgr._on_done = AsyncMock(side_effect=RuntimeError("parent delivery failed"))
-    await mgr._spawn_terminal_report(
-        info,
-        source="test",
-        injection_timeout_reason="delivery failed",
-        mark_delivered_on_success=False,
-    )
-    with pytest.raises(SubagentReportDeliveryError):
-        await mgr.wait_for_parent_reports(info.parent_session_key, owner)
-
-
-@pytest.mark.asyncio
-async def test_unrelated_unowned_report_failure_neither_halts_nor_advances_stage():
-    """An ordinary report cannot poison or bypass a later stage barrier."""
-    mgr = _make_manager()
-    parent, owner = "dashboard:parent", "later-stage-owner"
-    mgr._latch_report_failure(_info(parent_session_key=parent))
-    assert mgr._boundary_report_payloads == {}
-
-    release = asyncio.Event()
-    report = asyncio.create_task(release.wait())
-    mgr._report_owners[report] = _info(
-        parent_session_key=parent, _stage_boundary_owner=owner
-    )
-    waiter = asyncio.create_task(mgr.wait_for_parent_reports(parent, owner))
-    await asyncio.sleep(0)
-    assert not waiter.done(), "unrelated failure halted or advanced the owned barrier"
-    release.set()
-    assert await waiter is True
-
-
-@pytest.mark.asyncio
-async def test_saturated_report_scope_blocks_only_itself_until_discard(monkeypatch):
-    """A saturated boundary cannot block or retain debt for another boundary."""
-    import kiro_crew.subagent as mod
-    from kiro_crew.subagent import SubagentReportDeliveryError
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 1)
-    manager = _make_manager()
-    other_scope = ("dashboard:other", "other-stage")
-    saturated_scope = ("dashboard:saturated", "saturated-stage")
-    boundaries = _wire_report_boundaries(manager, other_scope, saturated_scope)
-    other = _info(
-        id="other-report",
-        parent_session_key=other_scope[0],
-        _stage_boundary_owner=other_scope[1],
-    )
-    saturated = [
-        _info(
-            id=f"saturated-{index}",
-            parent_session_key=saturated_scope[0],
-            _stage_boundary_owner=saturated_scope[1],
-        )
-        for index in range(2)
-    ]
-    manager._latch_report_failure(other)
-    for info in saturated:
-        manager._latch_report_failure(info)
-    manager._run_terminal_report = AsyncMock(return_value=True)
-
-    with pytest.raises(SubagentReportDeliveryError, match="row cap"):
-        await manager.wait_for_parent_reports(*saturated_scope)
-    assert await manager.wait_for_parent_reports(*other_scope) is True
-    assert manager._boundary_report_payloads == {}
-    assert boundaries[saturated_scope].report_retention_refused == "row_cap"
-    assert boundaries[other_scope].report_retention_refused is None
-
-    manager.discard_report_failures(*saturated_scope)
-    assert boundaries[saturated_scope].report_retention_refused is None
-    assert await manager.wait_for_parent_reports(*saturated_scope) is False
-
-
-@pytest.mark.asyncio
-async def test_report_failure_byte_budget_rejects_only_the_new_row(monkeypatch):
-    """A budget-rejected boundary fails alone while older rows still settle."""
-    import kiro_crew.subagent as mod
-    from kiro_crew.subagent import SubagentReportDeliveryError
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURE_BYTE_BUDGET", 1_000_000, raising=False)
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 1)
-    manager = _make_manager()
-    scopes = [(f"dashboard:scope-{index}", f"owner-{index}") for index in range(3)]
-    boundaries = _wire_report_boundaries(manager, *scopes)
-    for index, (parent, owner) in enumerate(scopes[:2]):
-        manager._latch_report_failure(
-            _info(
-                id=f"scope-{index}",
-                parent_session_key=parent,
-                _stage_boundary_owner=owner,
-            )
-        )
-    retained_before_rejection = manager._retained_report_failure_bytes
-    monkeypatch.setattr(mod, "_REPORT_FAILURE_BYTE_BUDGET", retained_before_rejection)
-    manager._latch_report_failure(
-        _info(
-            id="scope-2",
-            task="oversized" * 100,
-            parent_session_key=scopes[2][0],
-            _stage_boundary_owner=scopes[2][1],
-        )
-    )
-    manager._run_terminal_report = AsyncMock(return_value=True)
-
-    with pytest.raises(SubagentReportDeliveryError, match="byte budget"):
-        await manager.wait_for_parent_reports(*scopes[-1])
-    assert boundaries[scopes[-1]].report_retention_refused == "byte_budget"
-    assert manager._retained_report_failure_bytes == retained_before_rejection
-    assert await manager.wait_for_parent_reports(*scopes[0]) is True
-    assert await manager.wait_for_parent_reports(*scopes[1]) is True
-    assert manager._retained_report_failure_bytes == 0
-    assert manager._boundary_report_payloads == {}
-
-    manager.discard_report_failures(*scopes[-1])
-    assert boundaries[scopes[-1]].report_retention_refused is None
-
-
-@pytest.mark.parametrize("linked_parent", ["", "slack:C123:1712345678.900"])
-@pytest.mark.asyncio
-async def test_slot_teardown_discards_exact_failure_scopes_for_its_boundary(
-    tmp_path,
-    monkeypatch,
-    linked_parent,
-):
-    """Dashboard and channel slot teardown release every owned failure scope."""
-    from chat_test_helpers import _make_state
-
-    from kiro_crew.dashboard.chat_handlers import close_slot
-    from kiro_crew.history import ConversationLog
-
-    monkeypatch.setattr("kiro_crew.autonudge._INSTANCE", None)
-    state = _make_state(tmp_path)
-    state.conversation_log = ConversationLog()
-    state.sessions.get_provider.return_value = None
-    state.sessions.remove = AsyncMock()
-    slot = state.get_or_create_slot("failure-scope-owner")
-    slot.linked_session_key = linked_parent
-    dashboard_parent = f"dashboard:{slot.key}"
-    owned_parents = {dashboard_parent}
-    if linked_parent:
-        owned_parents.add(linked_parent)
-    slot.stage_boundary.arm(1)
-    slot.stage_boundary.parent_session_keys.update(owned_parents)
-    owned_owner = slot.stage_boundary.owner
-    assert owned_owner
-
-    manager = _make_manager()
-    state.subagents = manager
-    for parent_index, parent in enumerate(sorted(owned_parents)):
-        manager._latch_report_failure(
-            _info(
-                id=f"owned-{parent_index}",
-                parent_session_key=parent,
-                _stage_boundary_owner=owned_owner,
-            )
-        )
-    foreign_scope = ("dashboard:foreign", "foreign-owner")
-    manager._latch_report_failure(
-        _info(
-            id="foreign",
-            parent_session_key=foreign_scope[0],
-            _stage_boundary_owner=foreign_scope[1],
-        )
-    )
-    assert len(manager._boundary_report_payloads) > 1
-    retained_before_close = manager._retained_report_failure_bytes
-    assert retained_before_close > 0
-
-    await close_slot(state, slot, slot.key)
-
-    assert set(manager._boundary_report_payloads) == {foreign_scope}
-    assert 0 < manager._retained_report_failure_bytes < retained_before_close
-
-
-@pytest.mark.asyncio
-async def test_slot_teardown_preserves_sibling_alias_failure_scope(tmp_path, monkeypatch):
-    """Closing alias A cannot discard alias B's exact boundary debt."""
-    from chat_test_helpers import _make_state
-
-    from kiro_crew.dashboard.chat_handlers import close_slot
-    from kiro_crew.history import ConversationLog
-
-    monkeypatch.setattr("kiro_crew.autonudge._INSTANCE", None)
-    state = _make_state(tmp_path)
-    state.conversation_log = ConversationLog()
-    state.sessions.get_provider.return_value = None
-    state.sessions.remove = AsyncMock()
-    parent = "slack:C123:1712345678.901"
-    first = state.get_or_create_slot("alias-a")
-    second = state.get_or_create_slot("alias-b")
-    for slot in (first, second):
-        slot.linked_session_key = parent
-        slot.stage_boundary.arm(1)
-        slot.stage_boundary.parent_session_keys.add(parent)
-
-    first_scope = (parent, first.stage_boundary.owner or "")
-    second_scope = (parent, second.stage_boundary.owner or "")
-    manager = _make_manager()
-    state.subagents = manager
-    manager._latch_report_failure(
-        _info(
-            id="alias-a-report",
-            parent_session_key=first_scope[0],
-            _stage_boundary_owner=first_scope[1],
-        )
-    )
-    manager._latch_report_failure(
-        _info(
-            id="alias-b-report",
-            parent_session_key=second_scope[0],
-            _stage_boundary_owner=second_scope[1],
-        )
-    )
-
-    await close_slot(state, first, first.key)
-
-    assert set(manager._boundary_report_payloads) == {second_scope}
-
-
-@pytest.mark.asyncio
-async def test_aborted_slot_teardown_preserves_failure_scopes(tmp_path, monkeypatch):
-    """A failed history commit restores both the slot and its failure scope."""
-    from chat_test_helpers import _make_state
-
-    from kiro_crew.dashboard import chat_handlers
-    from kiro_crew.history import ConversationLog
-
-    monkeypatch.setattr("kiro_crew.autonudge._INSTANCE", None)
-    state = _make_state(tmp_path)
-    state.conversation_log = ConversationLog()
-    state.sessions.get_provider.return_value = None
-    state.sessions.remove = AsyncMock()
-    slot = state.get_or_create_slot("failed-scope-close")
-    slot.stage_boundary.arm(1)
-    scope = (f"dashboard:{slot.key}", slot.stage_boundary.owner or "")
-    manager = _make_manager()
-    state.subagents = manager
-    manager._latch_report_failure(
-        _info(
-            id="failed-close-report",
-            parent_session_key=scope[0],
-            _stage_boundary_owner=scope[1],
-        )
-    )
-    retained_before_close = manager._retained_report_failure_bytes
-    monkeypatch.setattr(
-        chat_handlers,
-        "save_slot_off_loop",
-        AsyncMock(side_effect=OSError("history unavailable")),
-    )
-
-    with pytest.raises(chat_handlers.SlotCloseError):
-        await chat_handlers.close_slot(state, slot, slot.key)
-
-    assert state.get_slot(slot.key) is slot
-    assert set(manager._boundary_report_payloads) == {scope}
-    assert manager._retained_report_failure_bytes == retained_before_close
-
-
-@pytest.mark.asyncio
 async def test_parent_pending_work_includes_live_followup_watcher():
     """A parent-owned follow-up watcher holds stage settlement open."""
     manager = _make_manager()
@@ -706,263 +507,6 @@ async def test_parent_pending_work_includes_live_followup_watcher():
 
 
 @pytest.mark.asyncio
-async def test_resident_report_failure_redelivers_from_boundary_payload():
-    """A failed payload is boundary-owned before its record reaches the cap."""
-    manager = _make_manager()
-    parent, owner = "dashboard:resident", "resident-stage"
-    info = _info(
-        id="resident-failure",
-        done=True,
-        parent_session_key=parent,
-        _stage_boundary_owner=owner,
-    )
-    manager._agents = {info.id: info}
-    manager._latch_report_failure(info)
-    manager._run_terminal_report = AsyncMock(return_value=True)
-
-    assert await manager.wait_for_parent_reports(parent, owner) is True
-    manager._run_terminal_report.assert_awaited_once()
-    redelivered = manager._run_terminal_report.await_args.args[0]
-    assert redelivered is not info
-    assert redelivered.id == info.id
-    assert redelivered.parent_session_key == parent
-    assert stage_boundary_owner_for_run(redelivered) == owner
-    assert info.id in manager._agents
-    assert info._report_failure_latched is False
-    assert manager._boundary_report_payloads == {}
-
-
-@pytest.mark.asyncio
-async def test_retained_report_payload_caps_text_bytes_and_redelivers(monkeypatch):
-    """A bounded snapshot preserves delivery text and terminal metadata."""
-    import kiro_crew.subagent as mod
-    from kiro_crew.subagent import SubagentInfo, _ReportFailureSnapshot
-
-    cap = 96
-    monkeypatch.setattr(mod, "_REPORT_FAILURE_PAYLOAD_MAX_BYTES", cap, raising=False)
-    manager = _make_manager()
-    parent, owner = "dashboard:oversized", "oversized-owner"
-    info = _info(
-        id="oversized-report",
-        done=True,
-        parent_session_key=parent,
-        _stage_boundary_owner=owner,
-        _stage_boundary_cancelled=True,
-        result="result🙂" * 100,
-        result_path="/runs/oversized-report/result.txt",
-        result_truncated=True,
-        task="task🙂" * 100,
-        error="error🙂" * 100,
-        user_stopped=True,
-        partial=True,
-        agent="reviewer",
-        silent=True,
-        conversation_key="subagent:origin",
-        model="requested-direct",
-        requested_model="requested-effective",
-        resolved_model="served-model",
-        stop_reason="cancelled",
-        stop_class="cancelled",
-        batch_id="wave42",
-        batch_total=7,
-        _digest_held=True,
-        _digest_flush_only=True,
-        _digest_settle_ids=["held-a", "held-b"],
-        _delivery_queued=True,
-    )
-    info.history = ["history" * 100_000]
-    info.messages = ["message" * 100_000]
-
-    manager._latch_report_failure(info)
-    retained = manager._boundary_report_payloads[(parent, owner)][info.id]
-
-    assert isinstance(retained, _ReportFailureSnapshot)
-    assert not isinstance(retained, SubagentInfo)
-    assert retained is not info
-    assert set(retained.__dataclass_fields__) == _terminal_report_consumer_fields()
-    assert not hasattr(retained, "history")
-    assert not hasattr(retained, "messages")
-    assert retained.id == info.id
-    assert retained.parent_session_key == parent
-    assert retained.outcome == info.outcome == "stopped"
-    assert retained.user_stopped is info.user_stopped is True
-    assert retained._stage_boundary_cancelled is info._stage_boundary_cancelled is True
-    assert retained.partial is info.partial is True
-    assert retained.result_path == info.result_path
-    assert retained.result_truncated is info.result_truncated is True
-    assert retained.agent == info.agent
-    assert retained.silent is info.silent is True
-    assert retained.conversation_key == info.conversation_key
-    assert retained.model == info.model
-    assert retained.requested_model == info.requested_model
-    assert retained.resolved_model == info.resolved_model
-    assert retained.stop_reason == info.stop_reason
-    assert retained.stop_class == info.stop_class
-    assert retained.batch_id == info.batch_id
-    assert retained.batch_total == info.batch_total
-    assert retained._digest_held is info._digest_held is True
-    assert retained._digest_flush_only is info._digest_flush_only is True
-    assert retained._digest_settle_ids == tuple(info._digest_settle_ids)
-    assert retained._delivery_queued is info._delivery_queued is True
-    for field in ("result", "task", "error"):
-        value = getattr(retained, field)
-        assert len(value.encode("utf-8")) <= cap
-        assert "[truncated " in value
-        assert " bytes]" in value
-
-    manager._run_terminal_report = AsyncMock(return_value=True)
-    assert await manager.wait_for_parent_reports(parent, owner) is True
-    redelivered = manager._run_terminal_report.await_args.args[0]
-    assert redelivered is not info
-    assert redelivered.outcome == info.outcome
-    assert redelivered.user_stopped is info.user_stopped
-    assert redelivered._stage_boundary_cancelled is info._stage_boundary_cancelled
-    assert redelivered.partial is info.partial
-    assert redelivered.result_path == info.result_path
-    assert redelivered.result_truncated is info.result_truncated
-    assert redelivered.agent == info.agent
-    assert redelivered.silent is info.silent
-    assert redelivered.conversation_key == info.conversation_key
-    assert redelivered.model == info.model
-    assert redelivered.requested_model == info.requested_model
-    assert redelivered.resolved_model == info.resolved_model
-    assert redelivered.stop_reason == info.stop_reason
-    assert redelivered.stop_class == info.stop_class
-    assert redelivered.batch_id == info.batch_id
-    assert redelivered.batch_total == info.batch_total
-    assert redelivered._digest_held is info._digest_held
-    assert redelivered._digest_flush_only is info._digest_flush_only
-    assert redelivered._digest_settle_ids == info._digest_settle_ids
-    assert redelivered._delivery_queued is info._delivery_queued
-    for field in ("result", "task", "error"):
-        assert "[truncated " in getattr(redelivered, field)
-    assert len(info.task.encode("utf-8")) > cap
-    assert manager._boundary_report_payloads == {}
-
-
-def test_report_failure_counts_are_derived_from_payload_rows():
-    """No count-only state exists outside exact per-scope payload buckets."""
-    manager = _make_manager()
-    parent, owner = "dashboard:derived", "derived-stage"
-    infos = [
-        _info(
-            id=f"derived-{index}",
-            parent_session_key=parent,
-            _stage_boundary_owner=owner,
-        )
-        for index in range(2)
-    ]
-
-    assert not hasattr(manager, "_report_failures")
-    for info in infos:
-        manager._latch_report_failure(info)
-    assert manager._peek_report_failures(parent, owner) == 2
-
-    manager._clear_report_failure(infos[0])
-    assert manager._peek_report_failures(parent, owner) == 1
-    assert list(manager._boundary_report_payloads[(parent, owner)]) == [infos[1].id]
-
-
-def test_report_failure_payload_rows_are_bounded_per_scope(monkeypatch):
-    """Each boundary admits its own capped snapshot rows."""
-    import kiro_crew.subagent as mod
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 2)
-    manager = _make_manager()
-    infos = [
-        _info(id="first-0", parent_session_key="first", _stage_boundary_owner="first"),
-        _info(id="first-1", parent_session_key="first", _stage_boundary_owner="first"),
-        _info(id="second-0", parent_session_key="second", _stage_boundary_owner="second"),
-        _info(id="third-0", parent_session_key="third", _stage_boundary_owner="third"),
-        _info(id="fourth-0", parent_session_key="fourth", _stage_boundary_owner="fourth"),
-    ]
-    for info in infos:
-        manager._latch_report_failure(info)
-
-    assert set(manager._boundary_report_payloads) == {
-        ("first", "first"),
-        ("second", "second"),
-        ("third", "third"),
-        ("fourth", "fourth"),
-    }
-    assert sum(len(rows) for rows in manager._boundary_report_payloads.values()) == 5
-    assert all(info._report_failure_latched for info in infos)
-
-
-@pytest.mark.asyncio
-async def test_saturated_report_payload_boundary_stays_blocked_until_discard(monkeypatch):
-    """An over-cap report blocks only its boundary until explicit discard."""
-    import kiro_crew.subagent as mod
-    from kiro_crew.subagent import SubagentReportDeliveryError
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 1)
-    manager = _make_manager()
-    scope = ("dashboard:saturated", "saturated-stage")
-    boundary = _wire_report_boundaries(manager, scope)[scope]
-    infos = [
-        _info(
-            id=f"saturated-{index}",
-            parent_session_key=scope[0],
-            _stage_boundary_owner=scope[1],
-        )
-        for index in range(3)
-    ]
-    for info in infos:
-        manager._latch_report_failure(info)
-
-    assert boundary.report_retention_refused == "row_cap"
-    assert list(manager._boundary_report_payloads[scope]) == [infos[0].id]
-    assert infos[-1]._report_failure_latched is False
-    manager._run_terminal_report = AsyncMock(return_value=True)
-
-    with pytest.raises(SubagentReportDeliveryError, match="row cap"):
-        await manager.wait_for_parent_reports(*scope)
-    assert manager._run_terminal_report.await_count == 1
-    assert manager._boundary_report_payloads == {}
-    assert boundary.report_retention_refused == "row_cap"
-
-    manager.discard_report_failures(*scope)
-    assert boundary.report_retention_refused is None
-    assert await manager.wait_for_parent_reports(*scope) is False
-
-
-@pytest.mark.asyncio
-async def test_report_failure_refusals_are_boundary_local(monkeypatch):
-    """Many saturated boundaries store only one flag on each live boundary."""
-    import kiro_crew.subagent as mod
-    from kiro_crew.subagent import SubagentReportDeliveryError
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 0)
-    manager = _make_manager()
-    scopes = [(f"parent-{index}", f"owner-{index}") for index in range(8)]
-    boundaries = _wire_report_boundaries(manager, *scopes)
-    for index, (parent, owner) in enumerate(scopes):
-        for attempt in range(2):
-            manager._latch_report_failure(
-                _info(
-                    id=f"saturated-{index}-{attempt}",
-                    parent_session_key=parent,
-                    _stage_boundary_owner=owner,
-                )
-            )
-
-    assert manager._boundary_report_payloads == {}
-    assert all(boundary.report_retention_refused == "row_cap" for boundary in boundaries.values())
-
-    with pytest.raises(SubagentReportDeliveryError, match="row cap"):
-        await manager.wait_for_parent_reports(*scopes[0])
-    manager.discard_report_failures(*scopes[0])
-    assert boundaries[scopes[0]].report_retention_refused is None
-    assert all(
-        boundaries[scope].report_retention_refused == "row_cap"
-        for scope in scopes[1:]
-    )
-    assert await manager.wait_for_parent_reports(*scopes[0]) is False
-    with pytest.raises(SubagentReportDeliveryError, match="row cap"):
-        await manager.wait_for_parent_reports(*scopes[1])
-
-
-@pytest.mark.asyncio
 async def test_settle_before_delete_waits_for_inflight_terminal_report():
     """Deletion cannot remove a run while its claimed report is still active."""
     manager = _make_manager()
@@ -970,7 +514,6 @@ async def test_settle_before_delete_waits_for_inflight_terminal_report():
         id="delete-reporting",
         done=True,
         parent_session_key="dashboard:delete-reporting",
-        _stage_boundary_owner="delete-report-owner",
     )
     manager._agents[info.id] = info
     manager._tasks[info.id] = MagicMock()
@@ -990,9 +533,7 @@ async def test_settle_before_delete_waits_for_inflight_terminal_report():
         mark_delivered_on_success=False,
     )
     await started.wait()
-    deletion = asyncio.create_task(
-        manager.settle_before_delete(info.id, info._stage_boundary_owner)
-    )
+    deletion = asyncio.create_task(manager.settle_before_delete(info.id))
     await asyncio.sleep(0)
     waited = not deletion.done()
     stayed_registered = manager._agents.get(info.id) is info
@@ -1004,88 +545,6 @@ async def test_settle_before_delete_waits_for_inflight_terminal_report():
     assert stayed_registered is True
     assert info.id not in manager._agents
     assert info.id not in manager._tasks
-
-
-@pytest.mark.asyncio
-async def test_settle_before_delete_keeps_run_until_report_delivery_succeeds():
-    """Delete settlement removes a finished run only after delivery succeeds."""
-    manager = _make_manager()
-    parent, owner = "dashboard:delete", "delete-owner"
-    info = _info(
-        id="delete-pending",
-        done=True,
-        parent_session_key=parent,
-        _stage_boundary_owner=owner,
-    )
-    manager._agents[info.id] = info
-    manager._tasks[info.id] = MagicMock()
-    manager._latch_report_failure(info)
-    manager._run_terminal_report = AsyncMock(side_effect=[False, True])
-
-    assert await manager.settle_before_delete(info.id, owner) == "pending"
-    assert manager._agents[info.id] is info
-    assert info.id in manager._tasks
-    assert info._report_failure_latched is True
-
-    assert await manager.settle_before_delete(info.id, owner) == "delivered"
-    assert info.id not in manager._agents
-    assert info.id not in manager._tasks
-    assert info._report_failure_latched is False
-
-
-@pytest.mark.asyncio
-async def test_settle_before_delete_discards_debt_for_an_inactive_boundary():
-    """Deleting a finished run drops debt after its boundary is gone."""
-    manager = _make_manager()
-    info = _info(
-        id="delete-gone",
-        done=True,
-        parent_session_key="dashboard:gone",
-        _stage_boundary_owner="gone-owner",
-    )
-    manager._agents[info.id] = info
-    manager._tasks[info.id] = MagicMock()
-    manager._latch_report_failure(info)
-
-    assert await manager.settle_before_delete(info.id, "") == "delivered"
-    assert manager._boundary_report_payloads == {}
-    assert info.id not in manager._agents
-    assert info.id not in manager._tasks
-    assert info._report_failure_latched is False
-
-
-def test_report_failure_payloads_bound_each_scope_bucket(monkeypatch):
-    """Every scope caps retained rows without inventing delivery success."""
-    import kiro_crew.subagent as mod
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 2)
-    mgr = _make_manager()
-    for index in range(5):
-        mgr._latch_report_failure(
-            _info(
-                id=f"first-{index}",
-                parent_session_key="first",
-                _stage_boundary_owner="first",
-            )
-        )
-    for key in ("second", "third"):
-        mgr._latch_report_failure(
-            _info(id=key, parent_session_key=key, _stage_boundary_owner=key)
-        )
-
-    assert len(mgr._boundary_report_payloads) == 3
-    assert all(len(rows) <= 3 for rows in mgr._boundary_report_payloads.values())
-    settled = _info(
-        id="third-extra",
-        parent_session_key="third",
-        _stage_boundary_owner="third",
-    )
-    mgr._latch_report_failure(settled)
-    assert settled._report_failure_latched is True
-    assert mgr._peek_report_failures("third", "third") == 2
-    mgr._clear_report_failure(settled)
-    assert settled._report_failure_latched is False
-    assert mgr._peek_report_failures("third", "third") == 1
 
 
 # ── the shutdown drain must not abandon stragglers ───────────────────
@@ -1157,22 +616,32 @@ async def test_cancel_all_readmits_an_undelivered_report_to_orphan_recovery(monk
     await mgr.cancel_all()
 
     assert task.cancelled(), "straggler should have been cancelled"
-    assert cleared == [info.id], (
-        "undelivered completion was left tombstoned — unrecoverable on restart"
-    )
+    assert cleared == [
+        info.id
+    ], "undelivered completion was left tombstoned — unrecoverable on restart"
 
 
 @pytest.mark.asyncio
 async def test_cancel_all_keeps_the_tombstone_when_delivery_already_happened(monkeypatch):
-    """The converse: a report cancelled AFTER `_on_done` returned is delivered.
+    """The converse: a report whose `_on_done` has returned is never re-admitted.
 
     Re-admitting it would make the next start inject the same completion a
     second time — the duplicate delivery this PR exists to remove. Only
     `_reported_to_parent == False` may be re-admitted.
+
+    The teardown gate handed to the report never opens. The report waits for it
+    BEFORE it publishes (the payload names the teardown's kill verdict), for
+    `_RESET_TIMEOUT + _TEARDOWN_REPORT_GRACE`, then publishes with the kill
+    named undecided and delivers. Both constants are pinned small here for the
+    same reason the sibling tests pin `_REPORT_DRAIN_TIMEOUT`: at their shipped
+    values (30 s + 30 s) this test spent 60 s in that wait every run, to reach
+    an assertion that does not depend on the length of the wait.
     """
     import kiro_crew.subagent as mod
 
     monkeypatch.setattr(mod, "_REPORT_DRAIN_TIMEOUT", 0.05)
+    monkeypatch.setattr(mod, "_RESET_TIMEOUT", 0.05)
+    monkeypatch.setattr(mod, "_TEARDOWN_REPORT_GRACE", 0.05)
     mgr = _make_manager()
     info = _info()
     cleared: list[str] = []
@@ -1184,8 +653,9 @@ async def test_cancel_all_keeps_the_tombstone_when_delivery_already_happened(mon
         delivered.set()
 
     mgr._on_done = AsyncMock(side_effect=_on_done)
-    # A teardown gate that never opens, so the report is cancelled in the wait
-    # that follows a SUCCESSFUL delivery.
+    # A teardown gate that never opens: the report's pre-publish wait for it runs
+    # out (see the docstring) and the delivery goes ahead with the kill named
+    # undecided. `cancel_all` then meets a report whose delivery already happened.
     never = asyncio.Event()
     assert mgr._claim_finalize(info) is True
     mgr._spawn_terminal_report(
@@ -1276,7 +746,7 @@ async def test_reap_suppression_marker_is_set_before_the_teardown_await():
     mgr._running_count = 1
     seen: dict[str, bool] = {}
 
-    async def _observing_reset(session_key):
+    async def _observing_reset(session_key, **_):
         seen["suppression_during_teardown"] = info._reap_started
         # `.cancelled()` only flips once the task runs, so assert the
         # observable that ordering guarantees: it is already de-registered
@@ -1297,9 +767,9 @@ async def test_reap_suppression_marker_is_set_before_the_teardown_await():
         "respawn suppression was not set while teardown was suspended — a "
         "recovery handshake expiring here would respawn the run being killed"
     )
-    assert seen["recovery_deregistered"] is True, (
-        "recovery task was still registered while teardown was suspended"
-    )
+    assert (
+        seen["recovery_deregistered"] is True
+    ), "recovery task was still registered while teardown was suspended"
     await asyncio.sleep(0)
     assert recovery.cancelled(), "recovery task was never actually cancelled"
 
@@ -1338,6 +808,47 @@ async def test_recovery_respawn_releases_its_fresh_slot():
     )
 
 
+@pytest.mark.asyncio
+async def test_recovery_respawn_is_priced_as_a_fresh_process():
+    """A respawn is a NEW process; the dead one's RSS readings must not settle it.
+
+    The spawn guard treats a dedicated worker as settled once two sweeps have
+    measured it and then reserves only its own peak-vs-RSS gap. A respawned
+    run reuses the same record, so without a reset the fresh process would be
+    priced at ~zero for the sweep before the reaper sees it -- exactly the
+    unmeasured window the reserve exists to cover. The peak stays (a high-water
+    mark, and the conservative direction); the sample count and last reading
+    start over.
+    """
+    from kiro_crew.subagent import _startup_memory_reserve_gb
+
+    mgr = _make_manager()
+    info = _info(_session_sharing=False)
+    info._rss_samples = 2
+    info.last_rss_gb = 5.8
+    info.peak_rss_gb = 6.0
+    assert mgr._release_slot(info) is True
+    mgr._running_count = 0
+    seen: dict[str, object] = {}
+
+    async def _fake_run(_info):
+        seen["samples"] = _info._rss_samples
+        seen["last"] = _info.last_rss_gb
+        seen["peak"] = _info.peak_rss_gb
+        # The guard's view at the moment the fresh process is launched: the
+        # next start (6) plus this warming worker holding nothing yet (6).
+        seen["reserve"] = _startup_memory_reserve_gb(
+            [_info], running_count=mgr._running_count, cost_gb=6.0
+        )
+        if mgr._release_slot(_info):
+            mgr._running_count = max(0, mgr._running_count - 1)
+
+    mgr._run = _fake_run  # type: ignore[assignment]
+    await _schedule_recovery(mgr, info)
+
+    assert seen == {"samples": 0, "last": 0.0, "peak": 6.0, "reserve": pytest.approx(12.0)}
+
+
 # ── the reap marker is split: early for respawn, late for records ────
 
 
@@ -1361,7 +872,7 @@ async def test_run_woken_by_reaper_reset_still_synthesizes_its_error():
     mgr._running_count = 1
     observed: dict[str, bool] = {}
 
-    async def _reset_wakes_the_run(session_key):
+    async def _reset_wakes_the_run(session_key, **_):
         # Exactly the window under test: the reap is in flight and suspended in
         # teardown. A run waking here must still see `reaped == False`.
         observed["reaped"] = info.reaped
@@ -1414,9 +925,9 @@ async def test_cancelled_teardown_still_releases_slot_and_gate():
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert mgr._running_count == 0, (
-        f"cancelled teardown leaked the slot (_running_count={mgr._running_count})"
-    )
+    assert (
+        mgr._running_count == 0
+    ), f"cancelled teardown leaked the slot (_running_count={mgr._running_count})"
     assert "a1b2c3d4" not in mgr._tasks, "cancelled teardown left the task registered"
 
 
@@ -1452,15 +963,20 @@ async def test_run_does_not_block_on_its_report_during_shutdown():
 
     mgr._on_done = _wedged_on_done
 
-    # Must return promptly even though the injection is wedged.
-    await asyncio.wait_for(mgr._run(info), timeout=5)
-
-    await asyncio.wait_for(wedged.wait(), timeout=1)
-    pending = [t for t in mgr._report_tasks if not t.done()]
-    assert pending, "report should still be pending, owned by cancel_all's drain"
-    for t in pending:
-        t.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    try:
+        # Must return promptly even though the injection is wedged.
+        await await_until(asyncio.ensure_future(mgr._run(info)))
+        # The independent report may still be persisting terminal usage when
+        # the run returns; synchronize with its callback rather than scheduling.
+        await await_until(wedged)
+        assert wedged.is_set(), "report never started"
+        pending = [t for t in mgr._report_tasks if not t.done()]
+        assert pending, "report should still be pending, owned by cancel_all's drain"
+    finally:
+        pending = list(mgr._report_tasks)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1502,8 +1018,7 @@ async def test_user_stop_during_pending_recovery_is_not_recorded_as_failure():
         mod.Stats = orig  # type: ignore[assignment]
 
     assert failures == [], (
-        "a neutral user Stop was counted as a subagent failure by the "
-        "cancelled-recovery arm"
+        "a neutral user Stop was counted as a subagent failure by the " "cancelled-recovery arm"
     )
     assert info.error == "", f"user stop synthesized an error: {info.error!r}"
 
@@ -1553,123 +1068,6 @@ async def test_stop_during_pending_spawn_approval_reports_and_releases_once():
         "count permanently inflates apparent capacity"
     )
     total_reports = len(_done_events(mgr)) + len(announced)
-    assert total_reports == 1, (
-        f"terminal outcome delivered {total_reports} times, expected exactly once"
-    )
-
-
-@pytest.mark.asyncio
-async def test_report_retention_refusal_is_boundary_local(monkeypatch):
-    """Refusal state belongs to one boundary and clears only with its discard."""
-    import kiro_crew.subagent as mod
-    from kiro_crew.dashboard.state import StageBoundary
-    from kiro_crew.subagent import SubagentReportDeliveryError
-
-    byte_boundary = StageBoundary()
-    byte_boundary.arm(1)
-    row_boundary = StageBoundary()
-    row_boundary.arm(1)
-    byte_scope = ("dashboard:byte-refused", byte_boundary.owner or "")
-    row_scope = ("dashboard:row-refused", row_boundary.owner or "")
-    boundaries = {byte_scope: byte_boundary, row_scope: row_boundary}
-    manager = _make_manager()
-    manager._stage_boundary_for_scope = lambda parent, owner: boundaries.get((parent, owner))
-
-    monkeypatch.setattr(mod, "_REPORT_FAILURE_BYTE_BUDGET", 0)
-    manager._latch_report_failure(
-        _info(
-            id="byte-refused",
-            parent_session_key=byte_scope[0],
-            _stage_boundary_owner=byte_scope[1],
-        )
-    )
-    monkeypatch.setattr(mod, "_REPORT_FAILURE_BYTE_BUDGET", 1_000_000)
-    monkeypatch.setattr(mod, "_REPORT_FAILURES_PER_PARENT_CAP", 0)
-    manager._latch_report_failure(
-        _info(
-            id="row-refused",
-            parent_session_key=row_scope[0],
-            _stage_boundary_owner=row_scope[1],
-        )
-    )
-
-    assert byte_boundary.report_retention_refused == "byte_budget"
-    assert row_boundary.report_retention_refused == "row_cap"
-    assert manager._boundary_report_payloads == {}
-    for scope in (byte_scope, row_scope):
-        with pytest.raises(SubagentReportDeliveryError):
-            await manager.wait_for_parent_reports(*scope)
-
-    manager.discard_report_failures("dashboard:unrelated", "other-owner")
-    assert byte_boundary.report_retention_refused == "byte_budget"
-    assert row_boundary.report_retention_refused == "row_cap"
-
-    manager.discard_report_failures(*byte_scope)
-    assert byte_boundary.report_retention_refused is None
-    assert row_boundary.report_retention_refused == "row_cap"
-    assert await manager.wait_for_parent_reports(*byte_scope) is False
-    with pytest.raises(SubagentReportDeliveryError):
-        await manager.wait_for_parent_reports(*row_scope)
-
-    manager.discard_report_failures(*row_scope)
-    assert row_boundary.report_retention_refused is None
-    assert await manager.wait_for_parent_reports(*row_scope) is False
-
-
-def _terminal_report_consumer_fields() -> set[str]:
-    """Fields read by terminal reporting and the production completion callback."""
-    root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
-    targets = {
-        "subagent_manager/terminal.py": {
-            "_record_crew_log_terminal",
-            "_report_terminal_impl",
-            "notify_injection_failed_impl",
-        },
-        "subagent_manager/waves.py": {"_settle_digest_holds_impl"},
-        "slack/gateway.py": {
-            "_defer_queued_delivery",
-            "_broadcast_subagent_status",
-            "_subagent_done",
-        },
-    }
-    fields: set[str] = set()
-    for relative, names in targets.items():
-        tree = ast.parse((root / relative).read_text(encoding="utf-8"))
-        functions = {
-            node.name: node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name in names
-        }
-        assert set(functions) == names
-        for function in functions.values():
-            fields.update(
-                node.attr
-                for node in ast.walk(function)
-                if isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "info"
-                and isinstance(node.ctx, ast.Load)
-            )
-            fields.update(
-                node.args[1].value
-                for node in ast.walk(function)
-                if isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "getattr"
-                and len(node.args) >= 2
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id == "info"
-                and isinstance(node.args[1], ast.Constant)
-                and isinstance(node.args[1].value, str)
-            )
-    # The exact owner is consumed through stage_boundary_owner_for_run(info).
-    fields.add("_stage_boundary_owner")
-    return fields
-
-
-def test_report_failure_snapshot_fields_match_terminal_consumers() -> None:
-    """A new terminal consumer field cannot bypass failed-report redelivery."""
-    from kiro_crew.subagent import _ReportFailureSnapshot
-
-    assert set(_ReportFailureSnapshot.__dataclass_fields__) == _terminal_report_consumer_fields()
+    assert (
+        total_reports == 1
+    ), f"terminal outcome delivered {total_reports} times, expected exactly once"

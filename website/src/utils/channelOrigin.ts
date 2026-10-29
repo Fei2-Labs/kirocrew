@@ -29,6 +29,8 @@ const CHANNEL_BRAND: Record<string, string> = {
   wecom: 'WeCom',
   teams: 'Teams',
   weixin: 'Weixin',
+  imessage: 'iMessage',
+  feishu: 'Feishu',
 }
 
 /**
@@ -61,14 +63,14 @@ export function isLegacySlackSlotKey(slotKey?: string): boolean {
 
 /**
  * Whether a slot's `surface` (falling back to `mode`) is one `ChatPage`
- * actually renders — the unified chat view shows the default surface plus
- * `orchestrator` slots together; everything else (e.g. `dashboard`) belongs to
- * a different page entirely. (`crew` was in this set until Crew Mode retired;
+ * actually renders — the default surface; everything else (e.g. `dashboard`)
+ * belongs to a different page entirely. `LEGACY_AUTOPILOT_MODE` is the retired
+ * Autopilot mode: a slot still persisted under it renders as an ordinary chat. (`crew` was in this set until Crew Mode retired;
  * a slot persisted under it is restored server-side as the default surface,
  * so it never reaches this predicate.)
  *
- * Single source of truth for that set: `ChatPage.tsx`'s `filteredSlots` and
- * `ChatSidebar.tsx`'s resume-from-history handler both need the identical
+ * Single source of truth for that set: `chat/page/pageEnvironment.ts`'s `filteredSlots` and
+ * `chat-sidebar/HistoryPane.tsx`'s resume-from-history handler both need the identical
  * answer to "can the chat page show this slot", and having two independent
  * copies is exactly how #3624 happened — the sidebar offered every history
  * row unconditionally, the page silently couldn't display some of them, and
@@ -76,8 +78,12 @@ export function isLegacySlackSlotKey(slotKey?: string): boolean {
  */
 export function isChatPageSurface(surfaceOrMode?: string): boolean {
   const sk = surfaceOrMode ?? ''
-  return sk === '' || sk === 'orchestrator'
+  return sk === '' || sk === LEGACY_AUTOPILOT_MODE
 }
+
+/** Mode value of the retired Autopilot chat mode. Read only to fold such a slot
+ *  into the ordinary chat surface; nothing creates it. */
+export const LEGACY_AUTOPILOT_MODE = 'orchestrator'
 
 /**
  * Return the channel namespace a slot originated from, or `''` for an ordinary

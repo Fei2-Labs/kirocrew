@@ -52,6 +52,7 @@ from kiro_crew.messaging.inbound_spool import (
 )
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.session_allocation import SessionClosingError
+from kiro_crew.testing.wait import async_wait_until
 
 # ── Pipeline stand-ins, mirroring test_messaging_dispatch.py ──────────────────
 
@@ -65,7 +66,7 @@ class _Sessions:
         self.successes = 0
         self.failures = 0
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         return object(), False, False
 
     def begin_turn(self, key):
@@ -215,7 +216,8 @@ def _spool(path: Path, **kw: Any) -> SpooledInbound:
 def test_every_shared_channel_turn_declares_an_inbound_route() -> None:
     root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
     calls: list[tuple[Path, ast.Call]] = []
-    for path in root.glob("*/transport_dispatch.py"):
+    # A channel's dispatcher includes the owners beside its facade (``transport_dispatch_*``).
+    for path in [*root.glob("*/transport_dispatch.py"), *root.glob("*/transport_dispatch_*.py")]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         calls.extend(
             (path, node)
@@ -1210,10 +1212,10 @@ def test_a_cancelled_refusal_handler_still_lands_the_write(spool_home: Path) -> 
             assert not spool_home.exists(), "the write had not been released yet"
             release.set()
             # Let the shielded inner task finish before the loop closes.
-            for _ in range(50):
-                if spool_home.exists() and S.pending_refusal_write_count() == 0:
-                    break
-                await asyncio.sleep(0.02)
+            await async_wait_until(
+                lambda: spool_home.exists() and S.pending_refusal_write_count() == 0,
+                describe=lambda: f"{S.pending_refusal_write_count()} write(s) still pending",
+            )
             assert S.pending_refusal_write_count() == 0
         finally:
             S.record_refusal_sync = real_sync  # type: ignore[assignment]
@@ -1356,6 +1358,50 @@ def test_the_spool_directory_is_masked_in_agent_sandboxes() -> None:
     from kiro_crew.sandbox import _CREW_HIDDEN_LEAVES
 
     assert "inbound-spool" in _CREW_HIDDEN_LEAVES
+
+
+def test_the_spool_root_exists_before_a_mask_has_to_bind_over_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mask over an absent name is no mask, and this store is created on first write.
+
+    ``mount(2)`` cannot cover a path that does not exist and the launcher's
+    ``sensitive_dirs`` loop is guarded on ``isdir``, so on a host where no inbound
+    message has been refused the spool root is skipped and every sandbox spawned
+    first runs with the name unmasked. That sandbox can create the directory itself
+    and leave an entry the gateway reads on the next start and quotes as the
+    operator's own words. The link refusals above do not answer this shape: they
+    refuse a link, and an agent's own directory is a real directory. So the root is
+    materialised -- empty, owner-only -- before any namespace spawn.
+
+    The second half is the other direction: the spool must not care that its root
+    arrived early. Its readers open the leaf INSIDE the root, so an empty root and
+    an absent one give the same answer.
+    """
+    from kiro_crew import sandbox
+
+    home = tmp_path / "crew"
+    home.mkdir()
+    monkeypatch.setattr(sandbox, "config_dir", lambda: home)
+    monkeypatch.setattr(S, "data_home", lambda: home)
+
+    assert "inbound-spool" in sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES, (
+        "membership in _CREW_HIDDEN_LEAVES only declares the intent to mask; a leaf "
+        "the gateway creates lazily also has to exist when the loop runs"
+    )
+
+    root = home / "inbound-spool"
+    assert not root.exists(), "the point of the test is that it starts absent"
+
+    created = sandbox._materialize_maskable_dirs()
+
+    assert str(root) in created
+    assert root.is_dir() and not root.is_symlink()
+    if os.name == "posix":
+        assert oct(root.stat().st_mode & 0o777) == "0o700"
+
+    S._refuse_links(spool_path())
+    assert peek_next() is None, "an empty root must read as an absent one"
 
 
 # ── Channel wiring: what each adopter declares as its route ──────────────────

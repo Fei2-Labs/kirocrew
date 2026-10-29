@@ -35,6 +35,9 @@ jobs:
   label:
     name: Label fork pull requests
     runs-on: ubuntu-latest
+    # A few gh API calls: recent runs take under 20s at p95. The cap only stops
+    # a hung run from holding a runner for GitHub's 6-hour default.
+    timeout-minutes: 5
     steps:
       - name: Add "fork" label to fork pull requests
         env:
@@ -60,7 +63,8 @@ jobs:
           # Adding a label that is already present is a no-op, so this is safe to
           # re-run on every event and every sweep.
           add_label() {
-            jq -n --arg label "$LABEL" '{labels: [$label]}' \
+            # Not `--arg label`: `label` is a jq keyword that jq 1.6 rejects.
+            jq -n --arg name "$LABEL" '{labels: [$name]}' \
               | gh api --method POST "repos/$REPO/issues/$1/labels" --input - >/dev/null
           }
 

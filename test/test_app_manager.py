@@ -1,73 +1,39 @@
-"""Tests for kiro_crew.apps.manager — App lifecycle management."""
+"""Tests for kiro_crew.apps.manager — App lifecycle management.
+
+This file holds the lifecycle doors: name admission, source validation, install, uninstall
+and data preservation, the admission-policy gate, enable/disable and listing. The rest of the
+suite sits beside it: ``test_app_manager_installed_record.py`` (the installed.json record),
+``test_app_manager_copy_tree.py`` (the install and update copy transaction),
+``test_app_manager_installed_tree.py`` (the installed-tree preview) and
+``test_app_manager_registration.py`` (builtin and external registration). Shared fixtures
+and builders are in ``app_manager_helpers.py``.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import shutil
-import stat
 from pathlib import Path
 
 import pytest
-from hypothesis import given, settings
-from hypothesis import strategies as st
+from app_manager_helpers import app_home_fixture  # noqa: F401 - fixture
+from app_manager_helpers import _DATA_IS_A_FILE, _DATA_IS_A_LINK, _make_app_source
 
+from conftest import requires_symlinks
 from kiro_crew import platform_compat
 from kiro_crew.apps.manager import (
     APP_MANIFEST_FILENAME,
-    AppResult,
-    InstalledApp,
     _read_installed,
     _validate_source_path,
-    _write_installed,
-    app_enabled_state,
     disable_app,
     enable_app,
     get_app,
     get_app_manifest,
     install_app,
     list_apps,
-    list_apps_with_skips,
-    register_external_app,
-    registry_source_repository,
     uninstall_app,
-    update_app,
 )
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-def _make_app_source(tmp_path, name="test-app", **manifest_overrides):
-    """Create a minimal app source directory with a valid app.json."""
-    src = tmp_path / "source" / name
-    src.mkdir(parents=True)
-    manifest = {
-        "name": name,
-        "version": "1.0.0",
-        "displayName": "Test App",
-        "description": "A test app for unit tests",
-        "author": "tester",
-        **manifest_overrides,
-    }
-    (src / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
-    return src
-
-
-@pytest.fixture()
-def app_home(tmp_path, monkeypatch):
-    """Set KIROCREW_HOME to a temp directory for isolated testing."""
-    home = tmp_path / "kirocrew-home"
-    home.mkdir()
-    monkeypatch.setenv("KIROCREW_HOME", str(home))
-    # Lifecycle success tests explicitly admit their synthetic third-party apps.
-    (home / "config.json").write_text(
-        json.dumps({"agent": {"apps_allow_third_party": True}}), encoding="utf-8"
-    )
-    return home
-
 
 # ---------------------------------------------------------------------------
 # App-name admission contract
@@ -265,6 +231,249 @@ class TestInstall:
         assert (installed / "agents" / "analyst.json").is_file()
         assert (installed / "skills" / "triage" / "SKILL.md").is_file()
 
+    @requires_symlinks
+    def test_a_shipped_app_secret_link_is_unlinked_before_the_secret_is_written(
+        self, tmp_path, app_home
+    ):
+        """`.app_secret` is the gateway's. The copy keeps an in-tree link as a
+        link, and `write_app_secret` opens the path it is given -- so an app
+        shipping `.app_secret -> ui/leak.js` would have the freshly generated
+        secret written THROUGH the link into a file the unauthenticated UI route
+        serves. The install removes whatever the source shipped under that name,
+        unfollowed, before writing its own regular file there."""
+        src = _make_app_source(tmp_path)
+        (src / "ui").mkdir()
+        (src / "ui" / "leak.js").write_text("export const leak = 1;\n", encoding="utf-8")
+        (src / ".app_secret").symlink_to(Path("ui") / "leak.js")
+
+        result = install_app(src)
+
+        assert result.ok, result.error
+        installed = app_home / "apps" / "test-app"
+        assert (installed / "ui" / "leak.js").read_text(encoding="utf-8") == (
+            "export const leak = 1;\n"
+        )  # the link's target was never written to
+        secret = installed / ".app_secret"
+        assert not os.path.islink(secret) and secret.is_file()
+        assert secret.read_text(encoding="utf-8").strip()  # the gateway's own value
+        assert (src / "ui" / "leak.js").read_text(encoding="utf-8") == "export const leak = 1;\n"
+
+    def test_a_shipped_app_secret_file_is_replaced_by_the_gateway_s_own(self, tmp_path, app_home):
+        src = _make_app_source(tmp_path)
+        (src / ".app_secret").write_text("the-author-s-choice\n", encoding="utf-8")
+
+        result = install_app(src)
+
+        assert result.ok, result.error
+        secret = app_home / "apps" / "test-app" / ".app_secret"
+        assert secret.is_file()
+        assert secret.read_text(encoding="utf-8") != "the-author-s-choice\n"
+
+    @requires_symlinks
+    def test_a_shipped_data_link_is_unlinked_before_preserved_data_is_put_back(
+        self, tmp_path, app_home
+    ):
+        """A default uninstall leaves `data/` behind; the next install puts it back
+        over whatever the source shipped under that name. A shipped `data -> ui`
+        link is unlinked -- never traversed, never left for the move to fail on --
+        exactly as the preview copy the desktop gate judges drops it."""
+        assert install_app(_make_app_source(tmp_path)).ok
+        installed = app_home / "apps" / "test-app"
+        (installed / "data" / "state.json").write_text('{"kept": true}', encoding="utf-8")
+        assert uninstall_app("test-app").ok  # keeps data/
+        assert (installed / "data" / "state.json").is_file()
+
+        src = _make_app_source(tmp_path / "again")
+        (src / "ui").mkdir()
+        (src / "ui" / "index.js").write_text("", encoding="utf-8")
+        (src / "data").symlink_to(Path("ui"))
+
+        result = install_app(src)
+
+        assert result.ok, result.error
+        assert not os.path.islink(installed / "data")
+        assert (installed / "data" / "state.json").read_text(encoding="utf-8") == '{"kept": true}'
+        assert (installed / "ui" / "index.js").is_file()  # the link's target, untouched
+
+    def test_a_root_data_file_is_refused_before_the_installed_record_is_written(
+        self, tmp_path, app_home
+    ):
+        """`app_data_dir()` is `mkdir(exist_ok=True)` at `<app dir>/data`, which a
+        shipped FILE of that name makes raise -- and it ran AFTER installed.json was
+        written, so the app was half-installed: a record, no data directory, no
+        secret. The copied tree is now asked the data directory's own question
+        before the record exists, and the whole copy goes with the refusal."""
+        src = _make_app_source(tmp_path)
+        (src / "data").write_text("a file where the gateway's data directory goes\n", encoding="utf-8")
+
+        result = install_app(src)
+
+        assert not result.ok
+        assert result.error == _DATA_IS_A_FILE, result.error
+        assert _read_installed("test-app") is None
+        assert not (app_home / "apps" / "test-app").exists()  # no partial copy either
+
+        # A preserved `data/` (left by a default uninstall) is put back OVER the
+        # shipped file, as over any other shape: what stands there is then a
+        # directory, and the same source installs.
+        assert install_app(_make_app_source(tmp_path / "first")).ok
+        installed = app_home / "apps" / "test-app"
+        (installed / "data" / "state.json").write_text('{"kept": true}', encoding="utf-8")
+        assert uninstall_app("test-app").ok
+        result = install_app(src)
+        assert result.ok, result.error
+        assert (installed / "data" / "state.json").read_text(encoding="utf-8") == '{"kept": true}'
+
+    @requires_symlinks
+    def test_a_link_planted_at_the_temp_name_refuses_the_install_before_anything_moves(
+        self, tmp_path, app_home
+    ):
+        """`.<name>-data-tmp` is where the install parks a leftover `data/` while it
+        copies. A LINK planted there is not the gateway's stale copy: moving the
+        directory onto it would deposit `data/` inside the link's target, and the
+        restore would rename the link -- not the data -- back. Refused before any
+        move: the leftover directory stays where it is, the link's target receives
+        nothing, the link itself is untouched, no record is written."""
+        assert install_app(_make_app_source(tmp_path / "first")).ok
+        installed = app_home / "apps" / "test-app"
+        (installed / "data" / "state.json").write_text('{"kept": true}', encoding="utf-8")
+        assert uninstall_app("test-app").ok  # default uninstall keeps data/ behind
+        assert (installed / "data" / "state.json").is_file()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        planted = app_home / "apps" / ".test-app-data-tmp"
+        planted.symlink_to(elsewhere, target_is_directory=True)
+
+        result = install_app(_make_app_source(tmp_path))
+
+        assert not result.ok
+        assert result.error == (
+            f"{planted} is a link; Kiro Crew keeps the app's data directory at that name "
+            "while it replaces the app files and cannot use it -- remove it first"
+        ), result.error
+        assert _read_installed("test-app") is None
+        assert (installed / "data" / "state.json").read_text(encoding="utf-8") == '{"kept": true}'
+        assert list(elsewhere.iterdir()) == []  # nothing was moved through the link
+        assert os.path.islink(planted)
+
+        # Remove the planted link and the same source installs, its data restored.
+        planted.unlink()
+        result = install_app(_make_app_source(tmp_path / "again"))
+        assert result.ok, result.error
+        assert (installed / "data" / "state.json").read_text(encoding="utf-8") == '{"kept": true}'
+
+    @requires_symlinks
+    def test_a_root_data_link_is_refused_whatever_it_resolves_to(self, tmp_path, app_home):
+        """A link at `data` is refused before the record on every host, dangling or
+        not: `mkdir(exist_ok=True)` fails on a dangling one, and a link RESOLVING to
+        an in-tree directory would pass it -- then the next update would move the
+        LINK aside, where its relative target does not resolve, put nothing back,
+        and delete the directory it named with the retired tree. Refused here, the
+        shape never reaches an update; the directory the link named is untouched."""
+        src = _make_app_source(tmp_path)
+        (src / "data").symlink_to(Path("nowhere"))
+        result = install_app(src)
+        assert not result.ok
+        assert result.error == _DATA_IS_A_LINK, result.error
+        assert _read_installed("test-app") is None
+        assert not (app_home / "apps" / "test-app").exists()
+
+        linked = _make_app_source(tmp_path / "linked")
+        (linked / "state").mkdir()
+        (linked / "state" / "kept.json").write_text('{"kept": true}', encoding="utf-8")
+        (linked / "data").symlink_to(Path("state"), target_is_directory=True)
+        result = install_app(linked)
+        assert not result.ok
+        assert result.error == _DATA_IS_A_LINK, result.error
+        assert _read_installed("test-app") is None
+        assert not (app_home / "apps" / "test-app").exists()  # the copy went with the refusal
+        # The directory the link named is the source's own and is untouched.
+        assert (linked / "state" / "kept.json").read_text(encoding="utf-8") == '{"kept": true}'
+        assert os.path.islink(linked / "data")
+
+    @requires_symlinks
+    def test_a_pre_existing_data_link_at_a_recordless_app_dir_is_refused_before_the_transaction(
+        self, tmp_path, app_home
+    ):
+        """The THIRD ask of the same predicate. An app directory already standing at
+        the destination with no `installed.json` (a prior default uninstall's
+        leftover, or an orphaned partial copy) whose `data` is a link to a directory
+        elsewhere: the move-aside skips what is not an owned directory, so the orphan
+        cleanup would `rmtree` the app directory and unlink the link, the post-copy
+        ask would see only the source's `data`, and the install would return
+        `ok=True` with a fresh empty `data/` -- the pre-existing entry gone with no
+        refusal, no log line and no error, where `update_app` and `uninstall_app`
+        refuse the identical shape before mutating. Refused here, before anything
+        moves: the link still stands and still resolves, the directory it names is
+        intact, no record and no temp copy appear."""
+        from kiro_crew.apps.manager import app_dir
+
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "sentinel.json").write_text('{"kept": true}', encoding="utf-8")
+        dest = app_dir("test-app")
+        dest.mkdir(parents=True)
+        (dest / "data").symlink_to(elsewhere, target_is_directory=True)
+        assert _read_installed("test-app") is None
+
+        result = install_app(_make_app_source(tmp_path))
+
+        assert not result.ok
+        assert result.error == _DATA_IS_A_LINK, result.error
+        assert os.path.islink(dest / "data") and (dest / "data").resolve() == elsewhere.resolve()
+        assert (elsewhere / "sentinel.json").read_text(encoding="utf-8") == '{"kept": true}'
+        assert _read_installed("test-app") is None
+        assert not (dest / APP_MANIFEST_FILENAME).exists()  # nothing was copied
+        assert not (dest.parent / ".test-app-data-tmp").exists()
+
+    def test_a_pre_existing_data_file_at_a_recordless_app_dir_is_refused_before_the_transaction(
+        self, tmp_path, app_home
+    ):
+        """Same ask, the regular-file shape: `mkdir(exist_ok=True)` cannot stand on a
+        file and the move-aside skips it, so without the refusal the orphan cleanup
+        would delete it and the install would succeed over a fresh empty `data/`.
+        Refused before anything moves; the file and its content are intact."""
+        from kiro_crew.apps.manager import app_dir
+
+        dest = app_dir("test-app")
+        dest.mkdir(parents=True)
+        (dest / "data").write_text("a regular file so named\n", encoding="utf-8")
+
+        result = install_app(_make_app_source(tmp_path))
+
+        assert not result.ok
+        assert result.error == _DATA_IS_A_FILE, result.error
+        assert (dest / "data").read_text(encoding="utf-8") == "a regular file so named\n"
+        assert _read_installed("test-app") is None
+        assert not (dest / APP_MANIFEST_FILENAME).exists()
+        assert not (dest.parent / ".test-app-data-tmp").exists()
+
+    def test_a_pre_existing_data_junction_at_a_recordless_app_dir_is_refused_before_the_transaction(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """The Windows shape of the same ask, fed through the module's junction seam
+        (no POSIX junction exists): a real directory at `data` that
+        `is_link_or_junction` reports as a junction is refused with the link
+        sentence, and the directory and its content are untouched."""
+        from kiro_crew.apps.manager import app_dir
+
+        dest = app_dir("test-app")
+        (dest / "data").mkdir(parents=True)
+        (dest / "data" / "state.json").write_text('{"k": 1}', encoding="utf-8")
+        junction = dest / "data"
+        monkeypatch.setattr(
+            "kiro_crew.apps.manager.is_link_or_junction", lambda path: Path(path) == junction
+        )
+
+        result = install_app(_make_app_source(tmp_path))
+
+        assert not result.ok
+        assert result.error == _DATA_IS_A_LINK, result.error
+        assert (dest / "data" / "state.json").read_text(encoding="utf-8") == '{"k": 1}'
+        assert _read_installed("test-app") is None
+        assert not (dest / APP_MANIFEST_FILENAME).exists()
+        assert not (dest.parent / ".test-app-data-tmp").exists()
+
 
 # ---------------------------------------------------------------------------
 # Uninstall
@@ -361,6 +570,86 @@ class TestUninstall:
         assert result.ok
         assert not (app_home / "apps" / "test-app").exists()
 
+    def test_uninstall_removes_the_agent_lock_and_gateway_overlay(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        # Deregistration unlinks ``<app>--<agent>.json``; uninstall also removes
+        # the empty ``<app>--<agent>.lock`` beside it and the MCP gateway's
+        # overlay copy ``mcp-gateway/agents/<app>--<agent>.json``.
+        from kiro_crew.apps import bridges
+
+        agents = tmp_path / "kiro-agents"
+        agents.mkdir()
+        monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", agents)
+        overlay = app_home / "mcp-gateway" / "agents"
+        overlay.mkdir(parents=True)
+
+        mine_lock = agents / "test-app--bg.lock"
+        mine_lock.touch()
+        mine_overlay = overlay / "test-app--bg.json"
+        mine_overlay.write_text("{}", encoding="utf-8")
+        # Another app's files, and a user agent's, must be left alone.
+        other_lock = agents / "test-app-two--bg.lock"
+        other_lock.touch()
+        other_overlay = overlay / "test-app-two--bg.json"
+        other_overlay.write_text("{}", encoding="utf-8")
+        user_overlay = overlay / "kirocrew.json"
+        user_overlay.write_text("{}", encoding="utf-8")
+
+        install_app(_make_app_source(tmp_path))
+        result = uninstall_app("test-app")
+
+        assert result.ok
+        assert not mine_lock.exists()
+        assert not mine_overlay.exists()
+        assert other_lock.exists()
+        assert other_overlay.exists()
+        assert user_overlay.exists()
+
+    def test_uninstall_keeps_agent_residue_whose_spec_or_content_survives(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        # A spec that is still on disk (deregistration did not run or failed)
+        # keeps its lock and overlay; a non-empty ``.lock`` is not the launcher's
+        # empty sentinel and is never deleted.
+        from kiro_crew.apps import bridges
+
+        agents = tmp_path / "kiro-agents"
+        agents.mkdir()
+        monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", agents)
+        overlay = app_home / "mcp-gateway" / "agents"
+        overlay.mkdir(parents=True)
+
+        (agents / "test-app--live.json").write_text("{}", encoding="utf-8")
+        live_lock = agents / "test-app--live.lock"
+        live_lock.touch()
+        live_overlay = overlay / "test-app--live.json"
+        live_overlay.write_text("{}", encoding="utf-8")
+        full_lock = agents / "test-app--gone.lock"
+        full_lock.write_text("not empty", encoding="utf-8")
+
+        install_app(_make_app_source(tmp_path))
+        assert uninstall_app("test-app").ok
+
+        assert live_lock.exists()
+        assert live_overlay.exists()
+        assert full_lock.exists()
+
+    def test_uninstall_leaves_a_held_agent_lock(self, tmp_path, app_home, monkeypatch):
+        from kiro_crew.apps import bridges
+
+        agents = tmp_path / "kiro-agents"
+        agents.mkdir()
+        monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", agents)
+        held = agents / "test-app--bg.lock"
+        held.touch()
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", lambda fd, exclusive: False)
+
+        install_app(_make_app_source(tmp_path))
+        assert uninstall_app("test-app").ok
+
+        assert held.exists()
+
     def test_uninstall_not_installed(self, app_home):
         result = uninstall_app("nonexistent")
         assert not result.ok
@@ -379,6 +668,39 @@ class TestUninstall:
         assert (app_home / "apps" / "test-app" / "data" / "cache.json").is_file()
         # App files removed
         assert not (app_home / "apps" / "test-app" / APP_MANIFEST_FILENAME).exists()
+
+    def test_uninstall_keeps_data_when_the_app_dir_is_reached_through_a_link(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """Uninstall pins the data directory, and that walk refuses any link it meets.
+
+        Reached through a linked ancestor - a home that is itself a symlink -
+        the pin refuses before the quarantine starts and the uninstall fails
+        with the app still installed. The caller has to hand the walk a path
+        whose ancestors are already canonical, while leaving the app's own name
+        and ``data`` literal so a link at either is still refused.
+        """
+        import os as _os
+
+        from kiro_crew.apps import manager as _mgr
+
+        if not _mgr.platform_compat.IS_WINDOWS:
+            linked_home = tmp_path / "home-link"
+            linked_home.symlink_to(app_home)
+            monkeypatch.setattr(
+                _mgr, "app_dir", lambda name: linked_home / "apps" / name
+            )
+
+        src = _make_app_source(tmp_path)
+        install_app(src)
+        data_dir = _mgr.app_dir("test-app") / "data"
+        (data_dir / "cache.json").write_text('{"key": "value"}', encoding="utf-8")
+
+        result = uninstall_app("test-app", keep_data=True)
+
+        assert result.ok, result.error
+        assert (data_dir / "cache.json").is_file()
+        assert _os.path.lexists(app_home / "apps" / "test-app" / "data" / "cache.json")
 
     def test_uninstall_purges_generated_deps_from_preserved_data(self, tmp_path, app_home):
         """data/ preservation exists for USER data. The gateway-generated
@@ -1057,2449 +1379,3 @@ class TestListing:
 
     def test_get_manifest_not_installed(self, app_home):
         assert get_app_manifest("nonexistent") is None
-
-
-# ---------------------------------------------------------------------------
-# InstalledApp dataclass
-# ---------------------------------------------------------------------------
-
-
-class TestInstalledApp:
-    def test_round_trip(self):
-        meta = InstalledApp(
-            name="my-app",
-            version="1.0.0",
-            displayName="My App",
-            enabled=True,
-            installedAt="2026-04-10T00:00:00Z",
-            source="/tmp/src",
-            origin="registry",
-            resources="gateway",
-            lifecycle="gateway",
-        )
-        d = meta.to_dict()
-        meta2 = InstalledApp.from_dict(d)
-        assert meta2.name == meta.name
-        assert meta2.version == meta.version
-        assert meta2.enabled == meta.enabled
-        assert meta2.origin == meta.origin
-        assert meta2.resources == meta.resources
-        assert meta2.lifecycle == meta.lifecycle
-        assert meta2.schemaVersion == 2
-
-    def test_from_empty_dict(self):
-        meta = InstalledApp.from_dict({})
-        assert meta.name == ""
-        assert meta.enabled is True  # default
-        assert meta.origin == "registry"
-        assert meta.resources == "gateway"
-        assert meta.lifecycle == "gateway"
-
-    def test_builtin_fields(self):
-        meta = InstalledApp.from_dict(
-            {
-                "name": "channels",
-                "origin": "builtin",
-                "resources": "gateway",
-                "lifecycle": "locked",
-            }
-        )
-        assert meta.origin == "builtin"
-        assert meta.lifecycle == "locked"
-
-    def test_external_fields(self):
-        meta = InstalledApp.from_dict(
-            {
-                "name": "some-external-app",
-                "origin": "external",
-                "resources": "app",
-                "lifecycle": "app",
-            }
-        )
-        assert meta.origin == "external"
-        assert meta.resources == "app"
-        assert meta.lifecycle == "app"
-
-    def test_invalid_origin_falls_back(self):
-        meta = InstalledApp.from_dict({"name": "bad", "origin": "typo"})
-        assert meta.origin == "registry"  # default fallback
-
-    def test_invalid_lifecycle_falls_back(self):
-        meta = InstalledApp.from_dict({"name": "bad", "lifecycle": "gatway"})
-        assert meta.lifecycle == "gateway"
-
-    def test_invalid_resources_falls_back(self):
-        meta = InstalledApp.from_dict({"name": "bad", "resources": "self"})
-        assert meta.resources == "gateway"
-
-    def test_validate_fields_valid(self):
-        meta = InstalledApp(origin="builtin", resources="app", lifecycle="locked")
-        assert meta.validate_fields() == []
-
-    def test_validate_fields_invalid(self):
-        meta = InstalledApp(origin="bad", resources="bad", lifecycle="bad")
-        errors = meta.validate_fields()
-        assert len(errors) == 3
-
-    def test_schema_version_persisted(self):
-        meta = InstalledApp(name="x")
-        d = meta.to_dict()
-        assert d["schemaVersion"] == 2
-
-    @pytest.mark.parametrize(
-        "coordinate",
-        [
-            "/tmp/pkg:a@host:path",
-            "./pkg:a@host:path",
-            "../pkg:a@host:path",
-            r"C:\work\pkg:a@host:path",
-            "C:/work/pkg:a@host:path",
-            "registry:my-app",
-            "deploy@host.example:Owner/Repo.git",
-            "deploy:local-segment@host.example:Owner/Repo.git",
-        ],
-    )
-    def test_write_boundary_preserves_non_uri_source_metadata(
-        self, app_home, coordinate: str
-    ):
-        _write_installed(
-            "metadata-app",
-            InstalledApp(
-                name="metadata-app",
-                source=coordinate,
-                sourceRegistry=coordinate,
-            ),
-        )
-
-        stored = _read_installed("metadata-app")
-        assert stored is not None
-        assert stored.source == coordinate
-        assert stored.sourceRegistry == coordinate
-
-    @pytest.mark.parametrize(
-        "scheme,leading_whitespace",
-        [("https", ""), ("ftp", ""), ("s3", "  "), ("x", "")],
-    )
-    def test_write_boundary_strips_explicit_uri_credentials(
-        self, app_home, scheme: str, leading_whitespace: str
-    ):
-        raw = (
-            f"{leading_whitespace}{scheme}://user:secret@example.test/Owner/Repo"
-            "?token=secret#private"
-        )
-        safe = f"{scheme}://example.test/Owner/Repo"
-        _write_installed(
-            "metadata-app",
-            InstalledApp(
-                name="metadata-app",
-                source=raw,
-                sourceUrl=raw,
-                sourceRegistry=raw,
-            ),
-        )
-
-        stored = _read_installed("metadata-app")
-        assert stored is not None
-        assert stored.source == safe
-        assert stored.sourceUrl == safe
-        assert stored.sourceRegistry == safe
-
-    # ── Migration from old "managed" field ──
-
-    def test_migrate_managed_self(self):
-        """Old managed='self' → external/app/app classification."""
-        meta = InstalledApp.from_dict({"name": "old", "managed": "self"})
-        assert meta.origin == "external"
-        assert meta.resources == "app"
-        assert meta.lifecycle == "app"
-        assert meta.schemaVersion == 2
-
-    def test_migrate_managed_builtin(self):
-        """Old managed='builtin' → builtin/gateway/locked classification."""
-        meta = InstalledApp.from_dict({"name": "old", "managed": "builtin"})
-        assert meta.origin == "builtin"
-        assert meta.resources == "gateway"
-        assert meta.lifecycle == "locked"
-        assert meta.schemaVersion == 2
-
-    def test_migrate_managed_kirocrew(self):
-        """Old managed='kirocrew' with no source → defaults to registry."""
-        meta = InstalledApp.from_dict({"name": "old", "managed": "kirocrew"})
-        assert meta.origin == "registry"
-        assert meta.resources == "gateway"
-        assert meta.lifecycle == "gateway"
-        assert meta.schemaVersion == 2
-
-    def test_migrate_managed_kirocrew_local_source(self):
-        """Old managed='kirocrew' with filesystem source → origin='local'."""
-        meta = InstalledApp.from_dict(
-            {
-                "name": "old",
-                "managed": "kirocrew",
-                "source": "/Users/dev/my-tool",
-            }
-        )
-        assert meta.origin == "local"
-        assert meta.resources == "gateway"
-        assert meta.lifecycle == "gateway"
-
-    def test_migrate_managed_kirocrew_registry_source(self):
-        """Old managed='kirocrew' with registry: source → origin='registry'."""
-        meta = InstalledApp.from_dict(
-            {
-                "name": "old",
-                "managed": "kirocrew",
-                "source": "registry:my-app",
-            }
-        )
-        assert meta.origin == "registry"
-        assert meta.resources == "gateway"
-        assert meta.lifecycle == "gateway"
-
-    def test_migrate_skipped_when_origin_present(self):
-        """If origin is already in the dict, migration is skipped even with schemaVersion < 2."""
-        meta = InstalledApp.from_dict(
-            {
-                "name": "old",
-                "managed": "self",
-                "origin": "local",
-                "schemaVersion": 1,
-            }
-        )
-        # origin was explicitly set — migration should NOT override it
-        assert meta.origin == "local"
-        assert meta.resources == "gateway"  # default, not migrated to "app"
-
-    def test_uninstall_locked_rejected(self, tmp_path, app_home):
-        """lifecycle=locked apps cannot be uninstalled."""
-        from kiro_crew.apps.manager import register_builtin_apps
-
-        register_builtin_apps()
-        result = uninstall_app("agent-worlds")
-        assert not result.ok
-        assert "locked" in result.error
-
-
-# ---------------------------------------------------------------------------
-# InstalledApp property tests (Hypothesis)
-# ---------------------------------------------------------------------------
-
-_valid_origins = st.sampled_from(["builtin", "registry", "local", "external"])
-_valid_resources = st.sampled_from(["gateway", "app"])
-_valid_lifecycles = st.sampled_from(["gateway", "app", "locked"])
-
-
-class TestInstalledAppProperties:
-    # Feature: app-classification-redesign, Property 1: InstalledApp serialisation round-trips
-    @given(
-        name=st.from_regex(r"[a-z][a-z0-9\-]{0,20}", fullmatch=True),
-        version=st.from_regex(r"[0-9]+\.[0-9]+\.[0-9]+", fullmatch=True),
-        enabled=st.booleans(),
-        origin=_valid_origins,
-        resources=_valid_resources,
-        lifecycle=_valid_lifecycles,
-    )
-    @settings(max_examples=200)
-    def test_round_trip_property(self, name, version, enabled, origin, resources, lifecycle):
-        """**Validates: Requirements 1.4**"""
-        meta = InstalledApp(
-            name=name,
-            version=version,
-            displayName=f"App {name}",
-            enabled=enabled,
-            installedAt="2026-01-01T00:00:00Z",
-            source="test",
-            origin=origin,
-            resources=resources,
-            lifecycle=lifecycle,
-        )
-        d = meta.to_dict()
-        restored = InstalledApp.from_dict(d)
-        assert restored.name == meta.name
-        assert restored.version == meta.version
-        assert restored.enabled == meta.enabled
-        assert restored.origin == meta.origin
-        assert restored.resources == meta.resources
-        assert restored.lifecycle == meta.lifecycle
-        assert restored.schemaVersion == meta.schemaVersion
-
-    # Feature: app-classification-redesign, Property 2: invalid field values fall back to defaults
-    @given(
-        bad_origin=st.text(min_size=1, max_size=10).filter(
-            lambda s: s not in {"builtin", "registry", "local", "external"}
-        ),
-        bad_resources=st.text(min_size=1, max_size=10).filter(
-            lambda s: s not in {"gateway", "app"}
-        ),
-        bad_lifecycle=st.text(min_size=1, max_size=10).filter(
-            lambda s: s not in {"gateway", "app", "locked"}
-        ),
-    )
-    @settings(max_examples=200)
-    def test_invalid_fields_fallback_property(self, bad_origin, bad_resources, bad_lifecycle):
-        """**Validates: Requirements 1.6**"""
-        meta = InstalledApp.from_dict(
-            {
-                "name": "test",
-                "origin": bad_origin,
-                "resources": bad_resources,
-                "lifecycle": bad_lifecycle,
-            }
-        )
-        assert meta.origin == "registry"
-        assert meta.resources == "gateway"
-        assert meta.lifecycle == "gateway"
-
-
-# ---------------------------------------------------------------------------
-# AppResult
-# ---------------------------------------------------------------------------
-
-
-class TestAppResult:
-    def test_success(self):
-        r = AppResult(ok=True, name="x", message="done")
-        d = r.to_dict()
-        assert d["ok"] is True
-        assert d["name"] == "x"
-        assert "error" not in d
-
-    def test_failure(self):
-        r = AppResult(ok=False, name="x", error="bad")
-        d = r.to_dict()
-        assert d["ok"] is False
-        assert d["error"] == "bad"
-
-
-# --- item #5: cleanup_migrated_builtin matches by name, no migratedTo needed ---
-
-
-class TestCleanupMigratedBuiltin:
-    """cleanup_migrated_builtin must handle pre-existing installs without migratedTo."""
-
-    def test_no_migrated_to_still_cleaned_up(self, tmp_path, monkeypatch):
-        """Old deploy_web install with origin=builtin but NO migratedTo -> still removed."""
-        from kiro_crew.apps import manager
-        from kiro_crew.apps.manager import (
-            INSTALLED_META_FILENAME,
-            cleanup_migrated_builtin,
-        )
-
-        monkeypatch.setattr(manager, "app_dir", lambda name: tmp_path / name)
-
-        # Create a fake deploy_web installed.json with origin=builtin, no migratedTo
-        app_path = tmp_path / "deploy_web"
-        app_path.mkdir()
-        installed = {
-            "name": "deploy_web",
-            "version": "1.0.0",
-            "origin": "builtin",
-            "enabled": True,
-        }
-        (app_path / INSTALLED_META_FILENAME).write_text(json.dumps(installed))
-        (app_path / "app.json").write_text(json.dumps({"name": "deploy_web"}))
-        # Also create a data/ dir that must be PRESERVED
-        (app_path / "data").mkdir()
-        (app_path / "data" / "user-file.txt").write_text("keep me")
-
-        result = cleanup_migrated_builtin("deploy_web")
-        assert result.ok is True
-        assert "cleaned up" in result.message
-
-        # Metadata removed
-        assert not (app_path / INSTALLED_META_FILENAME).exists()
-        assert not (app_path / "app.json").exists()
-        # Data preserved
-        assert (app_path / "data" / "user-file.txt").exists()
-
-    def test_idempotent_already_gone(self, tmp_path, monkeypatch):
-        """If app was never installed, returns ok=True (idempotent)."""
-        from kiro_crew.apps import manager
-        from kiro_crew.apps.manager import cleanup_migrated_builtin
-
-        monkeypatch.setattr(manager, "app_dir", lambda name: tmp_path / name)
-
-        result = cleanup_migrated_builtin("deploy_web")
-        assert result.ok is True
-        assert "nothing to clean up" in result.message
-
-    def test_standalone_origin_not_touched(self, tmp_path, monkeypatch):
-        """If origin is not 'builtin', no cleanup (standalone owns the slot)."""
-        from kiro_crew.apps import manager
-        from kiro_crew.apps.manager import (
-            INSTALLED_META_FILENAME,
-            cleanup_migrated_builtin,
-        )
-
-        monkeypatch.setattr(manager, "app_dir", lambda name: tmp_path / name)
-
-        app_path = tmp_path / "deploy_web"
-        app_path.mkdir()
-        installed = {
-            "name": "deploy_web",
-            "version": "2.0.0",
-            "origin": "registry",
-            "enabled": True,
-        }
-        (app_path / INSTALLED_META_FILENAME).write_text(json.dumps(installed))
-
-        result = cleanup_migrated_builtin("deploy_web")
-        assert result.ok is True
-        assert "already migrated" in result.message
-        # File was NOT deleted
-        assert (app_path / INSTALLED_META_FILENAME).exists()
-
-
-# ---------------------------------------------------------------------------
-# _copy_app_tree — symlink / denylist / off-loop regression tests
-# (app install must not run a raw follow-symlinks copytree on the event loop;
-# a large `build` symlink target froze the loop until the watchdog killed
-# the gateway)
-# ---------------------------------------------------------------------------
-
-
-class TestCopyAppTree:
-    def test_symlink_escaping_source_root_omitted(self, tmp_path, app_home):
-        """A symlink resolving outside the app source is omitted — never
-        followed (no multi-GB walk) and never preserved (nothing in the
-        installed tree can point at e.g. ~/.ssh)."""
-        src = _make_app_source(tmp_path)
-        big = tmp_path / "big-target"
-        big.mkdir()
-        for i in range(20):
-            (big / f"file{i}.bin").write_text("x" * 1024)
-        (src / "assets-link").symlink_to(big)
-
-        result = install_app(src)
-        assert result.ok, result.error
-
-        from kiro_crew.apps.manager import app_dir
-
-        dest = app_dir("test-app")
-        assert not (dest / "assets-link").exists()
-        assert not (dest / "assets-link").is_symlink()
-        # Target contents were not copied anywhere in the installed tree.
-        copied_files = [p for p in dest.rglob("*") if p.is_file() and not p.is_symlink()]
-        assert not any("file0.bin" in str(p) for p in copied_files)
-
-    def test_symlink_inside_source_root_preserved(self, tmp_path, app_home):
-        """An in-tree symlink is preserved — and an ABSOLUTE in-tree link is
-        rewritten to a relative link targeting the installed copy, so the
-        installed app never depends on the original source directory."""
-        import shutil as _shutil
-
-        src = _make_app_source(tmp_path)
-        (src / "shared").mkdir()
-        (src / "shared" / "common.js").write_text("export {}")
-        (src / "alias").symlink_to(src / "shared")  # absolute in-tree link
-
-        result = install_app(src)
-        assert result.ok, result.error
-
-        from kiro_crew.apps.manager import app_dir
-
-        dest = app_dir("test-app")
-        link = dest / "alias"
-        assert link.is_symlink()
-        # Rewritten relative — must not embed an absolute path to the source.
-        assert not os.path.isabs(os.readlink(link))
-        # Resolves inside the installed tree and stays usable even after the
-        # original source directory is gone.
-        _shutil.rmtree(src)
-        assert (link / "common.js").is_file()
-        assert link.resolve().is_relative_to(dest.resolve())
-
-    def test_denylist_dirs_dropped_runtime_payload_kept(self, tmp_path, app_home):
-        src = _make_app_source(tmp_path)
-        (src / "ui" / "node_modules").mkdir(parents=True)
-        (src / "ui" / "node_modules" / "junk.js").write_text("junk")
-        (src / "ui" / "dist").mkdir(parents=True)
-        (src / "ui" / "dist" / "index.mjs").write_text("export {}")
-        (src / ".git").mkdir()
-        (src / ".git" / "config").write_text("[core]")
-        (src / "__pycache__").mkdir()
-        (src / "__pycache__" / "x.pyc").write_bytes(b"\x00")
-        # The gateway's own pip --target provisioning output: machine- and
-        # platform-specific, re-provisioned at the destination on first spawn.
-        # Copying it would put a foreign wheel tree FIRST on the child's
-        # PYTHONPATH, shadowing the correctly provisioned copy. The transient
-        # staging/prior swap directories are denylisted for the same reason.
-        (src / ".kirocrew-deps").mkdir()
-        (src / ".kirocrew-deps" / "requests").mkdir()
-        (src / ".kirocrew-deps" / "requests" / "__init__.py").write_text("x = 1")
-        (src / ".kirocrew-deps-staging").mkdir()
-        (src / ".kirocrew-deps-staging" / "partial.py").write_text("x = 1")
-        (src / ".kirocrew-deps-prior").mkdir()
-        (src / ".kirocrew-deps-prior" / "old.py").write_text("x = 1")
-        # A real `build/` dir is NOT denylisted: the manifest may reference
-        # runtime paths anywhere under the app root, so it must survive.
-        # (A `build` *symlink* is neutralized by symlinks=True instead.)
-        (src / "build").mkdir()
-        (src / "build" / "artifact.txt").write_text("built")
-
-        result = install_app(src)
-        assert result.ok, result.error
-
-        from kiro_crew.apps.manager import app_dir
-
-        dest = app_dir("test-app")
-        assert not (dest / "ui" / "node_modules").exists()
-        assert not (dest / ".git").exists()
-        assert not (dest / "__pycache__").exists()
-        assert not (dest / ".kirocrew-deps").exists()
-        assert not (dest / ".kirocrew-deps-staging").exists()
-        assert not (dest / ".kirocrew-deps-prior").exists()
-        assert (dest / "build" / "artifact.txt").is_file()
-        assert (dest / "ui" / "dist" / "index.mjs").is_file()
-
-    def test_lifecycle_lock_is_per_app(self):
-        from kiro_crew.apps.manager import app_lifecycle_lock
-
-        lock_a = app_lifecycle_lock("app-a")
-        assert app_lifecycle_lock("app-a") is lock_a
-        assert app_lifecycle_lock("app-b") is not lock_a
-
-    @pytest.mark.asyncio
-    async def test_install_off_loop_does_not_block_event_loop(self, tmp_path, app_home):
-        """Heartbeat latency stays low while a many-file install runs off-loop."""
-        import asyncio
-        import time
-
-        src = _make_app_source(tmp_path, name="fat-app")
-        payload = src / "payload"
-        payload.mkdir()
-        for i in range(2000):
-            (payload / f"f{i}.txt").write_text(str(i))
-
-        gaps: list[float] = []
-
-        async def heartbeat():
-            prev = time.monotonic()
-            while True:
-                await asyncio.sleep(0.01)
-                now = time.monotonic()
-                gaps.append(now - prev)
-                prev = now
-
-        hb = asyncio.ensure_future(heartbeat())
-        try:
-            result = await asyncio.to_thread(install_app, src)
-        finally:
-            hb.cancel()
-        assert result.ok, result.error
-        # The watchdog threshold is 30s; anything close to that (or even 1s)
-        # would indicate the copy ran on the loop.
-        assert max(gaps) < 1.0
-
-    def test_orphaned_partial_install_self_heals(self, tmp_path, app_home):
-        """dest exists with junk but no installed metadata → fresh install wins."""
-        from kiro_crew.apps.manager import app_dir
-
-        orphan = app_dir("test-app")
-        orphan.mkdir(parents=True)
-        (orphan / "leftover.bin").write_text("partial copy from a crash")
-
-        src = _make_app_source(tmp_path)
-        result = install_app(src)
-        assert result.ok, result.error
-        assert not (orphan / "leftover.bin").exists()
-        assert (orphan / APP_MANIFEST_FILENAME).is_file()
-
-    def test_local_install_cannot_claim_a_repository_bound_grant(
-        self, tmp_path, app_home
-    ):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        reviewed = "https://clone.example.test/Owner/reviewed-app"
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_allow_third_party": False,
-                        "apps_trusted": ["test-app"],
-                        "apps_trusted_repositories": {"test-app": reviewed},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = install_app(_make_app_source(tmp_path))
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert get_app("test-app") is None
-
-    def test_external_registration_cannot_claim_a_repository_bound_grant(
-        self, app_home
-    ):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        reviewed = "https://clone.example.test/Owner/reviewed-app"
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_allow_third_party": False,
-                        "apps_trusted": ["test-app"],
-                        "apps_trusted_repositories": {"test-app": reviewed},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = register_external_app("test-app", "1.0.0", "Rebound App")
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert get_app("test-app") is None
-
-    def test_legacy_name_grant_cannot_install_repository_code(
-        self, tmp_path, app_home
-    ):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        (app_home / "config.json").write_text(
-            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = install_app(
-            _make_app_source(tmp_path),
-            source_repository="https://User:Secret@example.test/owner/repo",
-        )
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert "Secret" not in result.error
-        assert get_app("test-app") is None
-
-    def test_legacy_name_grant_cannot_claim_fresh_local_install(
-        self, tmp_path, app_home
-    ):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        (app_home / "config.json").write_text(
-            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = install_app(_make_app_source(tmp_path))
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert get_app("test-app") is None
-
-    def test_registry_context_preserves_callable_contract_and_bound_provenance(
-        self, tmp_path, app_home
-    ):
-        """The registry's one-argument manager call still gets its safe source."""
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        reviewed = "ssh://deploy@example.test/owner/repo"
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_trusted": ["test-app"],
-                        "apps_trusted_repositories": {"test-app": reviewed},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        with registry_source_repository(reviewed):
-            result = install_app(_make_app_source(tmp_path))
-
-        # Success proves the repository-bound grant saw the scoped coordinate;
-        # without it the one-argument call is classified as a local takeover and
-        # denied. The same coordinate is provisional durable provenance before
-        # later registry bookkeeping enriches the record.
-        assert result.ok
-        assert get_app("test-app").get("sourceUrl", "") == reviewed
-
-    def test_install_bookkeeping_failure_keeps_provisional_repository_provenance(
-        self, tmp_path, app_home, monkeypatch
-    ):
-        """A failure after installed.json cannot turn repository code local."""
-        from kiro_crew.apps.execution import app_execution_denied
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        reviewed = "https://example.test/owner/reviewed"
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_trusted": ["test-app"],
-                        "apps_trusted_repositories": {"test-app": reviewed},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        def _bookkeeping_failure(*_args, **_kwargs):
-            raise RuntimeError("secret bookkeeping failed")
-
-        monkeypatch.setattr(
-            "kiro_crew.dashboard.token_auth.write_app_secret",
-            _bookkeeping_failure,
-        )
-
-        with pytest.raises(RuntimeError, match="bookkeeping failed"):
-            install_app(
-                _make_app_source(tmp_path),
-                source_repository=reviewed,
-            )
-
-        installed = get_app("test-app")
-        assert installed is not None
-        assert installed["sourceUrl"] == reviewed
-        assert app_execution_denied("test-app", action="module_load") is None
-
-    def test_provenance_enrichment_failure_keeps_provisional_repository(
-        self, tmp_path, app_home, monkeypatch
-    ):
-        from kiro_crew.apps import manager
-
-        reviewed = "https://example.test/owner/reviewed"
-        with registry_source_repository(reviewed):
-            result = install_app(_make_app_source(tmp_path))
-        assert result.ok, result.error
-
-        def _provenance_write_failure(*_args, **_kwargs):
-            raise OSError("provenance write failed")
-
-        monkeypatch.setattr(manager, "_write_installed", _provenance_write_failure)
-        with pytest.raises(OSError, match="provenance write failed"):
-            manager.set_app_provenance(
-                "test-app",
-                source="registry:test-app",
-                url=reviewed,
-                registry="core",
-                commit="a" * 40,
-                signer="release-key",
-            )
-
-        persisted = manager._read_installed("test-app")
-        assert persisted is not None
-        assert persisted.sourceUrl == reviewed
-
-    def test_registry_context_rechecks_binding_at_replacement_boundary(
-        self, tmp_path, app_home
-    ):
-        """A source changed after registry preflight cannot reach the copy step."""
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        reviewed = "ssh://deploy@example.test/owner/reviewed"
-        rebound = "ssh://deploy@example.test/owner/rebound"
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_trusted": ["test-app"],
-                        "apps_trusted_repositories": {"test-app": reviewed},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        with registry_source_repository(rebound):
-            result = install_app(_make_app_source(tmp_path))
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert reviewed not in result.error
-        assert rebound not in result.error
-        assert get_app("test-app") is None
-
-    @pytest.mark.asyncio
-    async def test_registry_context_is_task_local_across_to_thread(self):
-        """Concurrent installs cannot exchange their repository coordinates."""
-        from kiro_crew.apps.manager import _effective_source_repository
-
-        async def _resolve(repository: str) -> str:
-            with registry_source_repository(repository):
-                # Interleave both task contexts before copying them to workers.
-                await asyncio.sleep(0)
-                return await asyncio.to_thread(_effective_source_repository, "")
-
-        first, second = await asyncio.gather(
-            _resolve("https://example.test/owner/first"),
-            _resolve("https://example.test/owner/second"),
-        )
-
-        assert first == "https://example.test/owner/first"
-        assert second == "https://example.test/owner/second"
-
-    def test_legacy_name_grant_cannot_update_to_repository_code(
-        self, tmp_path, app_home
-    ):
-        from kiro_crew.apps.manager import update_app
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        assert install_app(_make_app_source(tmp_path)).ok
-        (app_home / "config.json").write_text(
-            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = update_app(
-            _make_app_source(tmp_path / "v2", version="2.0.0"),
-            source_repository="https://example.test/owner/repo",
-        )
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert get_app("test-app")["version"] == "1.0.0"
-
-    def test_legacy_name_grant_cannot_register_repository_code(self, app_home):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        (app_home / "config.json").write_text(
-            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = register_external_app(
-            "test-app",
-            "1.0.0",
-            "Legacy Rebind",
-            source_repository="https://example.test/owner/repo",
-        )
-
-        assert not result.ok
-        assert result.error_code == "app_trust_repository_mismatch"
-        assert get_app("test-app") is None
-
-    def test_installed_legacy_local_grant_can_update_local_code(
-        self, tmp_path, app_home
-    ):
-        from kiro_crew.apps.manager import update_app
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        assert install_app(_make_app_source(tmp_path)).ok
-        (app_home / "config.json").write_text(
-            json.dumps({"agent": {"apps_trusted": ["test-app"]}}),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        result = update_app(_make_app_source(tmp_path / "v2", version="2.0.0"))
-
-        assert result.ok, result.error
-        assert get_app("test-app")["version"] == "2.0.0"
-
-    def test_update_preserves_data_and_secret(self, tmp_path, app_home):
-        from kiro_crew.apps.manager import app_dir, update_app
-
-        src = _make_app_source(tmp_path)
-        assert install_app(src).ok
-        dest = app_dir("test-app")
-        (dest / "data").mkdir(exist_ok=True)
-        (dest / "data" / "state.json").write_text('{"k": 1}')
-        secret = dest / ".app_secret"
-        secret.write_text("s3cret")
-
-        v2 = _make_app_source(tmp_path / "v2", version="2.0.0")
-        result = update_app(v2)
-        assert result.ok, result.error
-        assert (dest / "data" / "state.json").read_text(encoding="utf-8") == '{"k": 1}'
-        assert secret.read_text(encoding="utf-8") == "s3cret"
-
-    @pytest.mark.parametrize("rollback_metadata_fails", [False, True])
-    def test_metadata_failure_restores_data_secret_and_retired_tree(
-        self, tmp_path, app_home, monkeypatch, rollback_metadata_fails
-    ):
-        from kiro_crew.apps import manager as manager_mod
-        from kiro_crew.apps.manager import app_dir, update_app
-
-        assert install_app(_make_app_source(tmp_path)).ok
-        dest = app_dir("test-app")
-        data = dest / "data"
-        data.mkdir(exist_ok=True)
-        (data / "state.json").write_text('{"kept": true}', encoding="utf-8")
-        secret = dest / ".app_secret"
-        secret.write_text("kept-secret", encoding="utf-8")
-        (dest / "old-only.txt").write_text("old tree", encoding="utf-8")
-
-        v2 = _make_app_source(tmp_path / "v2", version="2.0.0")
-        (v2 / "data").write_text("replacement file", encoding="utf-8")
-        (v2 / ".app_secret").mkdir()
-        (v2 / ".app_secret" / "replacement.txt").write_text(
-            "replacement directory", encoding="utf-8"
-        )
-        (v2 / "new-only.txt").write_text("new tree", encoding="utf-8")
-
-        real_write = manager_mod._write_installed
-        writes = 0
-
-        def _fail_metadata_write(name, meta):
-            nonlocal writes
-            writes += 1
-            if writes == 1 or rollback_metadata_fails:
-                raise OSError("metadata write failed")
-            real_write(name, meta)
-
-        monkeypatch.setattr(manager_mod, "_write_installed", _fail_metadata_write)
-        result = update_app(v2)
-
-        assert not result.ok
-        assert data.is_dir()
-        assert (data / "state.json").read_text(encoding="utf-8") == '{"kept": true}'
-        assert secret.is_file()
-        assert secret.read_text(encoding="utf-8") == "kept-secret"
-        assert (dest / "old-only.txt").read_text(encoding="utf-8") == "old tree"
-        assert not (dest / "new-only.txt").exists()
-        assert get_app_manifest("test-app").version == "1.0.0"
-        restored_meta = _read_installed("test-app")
-        assert restored_meta is not None
-        assert restored_meta.version == "1.0.0"
-
-    def test_update_that_adds_session_approval_disables_until_reconsent(
-        self, tmp_path, app_home, monkeypatch
-    ):
-        # Consent is captured at install/enable while the route guard reads the
-        # live manifest, so a version that ADDS the grant must not inherit the
-        # user's earlier "enabled" -- otherwise an update silently widens what
-        # the app may do to their sessions.
-        from kiro_crew.apps import manager as manager_mod
-        from kiro_crew.apps.manager import update_app
-        from kiro_crew.apps.permissions import app_can_manage_session_approvals
-
-        assert install_app(_make_app_source(tmp_path)).ok
-        assert enable_app("test-app").ok
-        assert get_app("test-app")["enabled"] is True
-
-        v2 = _make_app_source(
-            tmp_path / "v2",
-            version="2.0.0",
-            permissions={"sessionApproval": True},
-        )
-        real_copy = manager_mod._copy_app_tree
-        observed_grants = []
-
-        def _copy_with_permission_probe(source, dest):
-            real_copy(source, dest)
-            observed_grants.append(app_can_manage_session_approvals("test-app"))
-
-        monkeypatch.setattr(manager_mod, "_copy_app_tree", _copy_with_permission_probe)
-        result = update_app(v2)
-        assert result.ok, result.error
-        assert observed_grants == [False]
-        assert "session approval" in result.message
-        # The UI branches on the structured notice, not on the prose.
-        assert result.notice == "session_approval_reconsent"
-        assert result.to_dict()["notice"] == "session_approval_reconsent"
-        assert "code" not in result.to_dict()
-        assert get_app("test-app")["enabled"] is False
-        assert get_app("test-app")["version"] == "2.0.0"
-        assert get_app("test-app")["sessionApprovalConsentPending"] is True
-
-    def test_failed_widening_update_restores_original_tree_and_metadata(
-        self, tmp_path, app_home, monkeypatch
-    ):
-        assert install_app(_make_app_source(tmp_path)).ok
-        assert enable_app("test-app").ok
-        original = _read_installed("test-app")
-        assert original is not None
-
-        v2 = _make_app_source(
-            tmp_path / "v2",
-            version="2.0.0",
-            permissions={"sessionApproval": True},
-        )
-        real_copytree = shutil.copytree
-
-        def _copy_then_fail(*args, **kwargs):
-            real_copytree(*args, **kwargs)
-            raise OSError("simulated copy failure")
-
-        monkeypatch.setattr(shutil, "copytree", _copy_then_fail)
-        result = update_app(v2)
-
-        assert not result.ok
-        assert "failed to update app files" in (result.error or "")
-        assert _read_installed("test-app") == original
-        assert get_app_manifest("test-app").version == "1.0.0"
-        assert get_app("test-app")["enabled"] is True
-        assert get_app("test-app")["sessionApprovalConsentPending"] is False
-
-    def test_fresh_install_with_session_approval_requires_consent(self, tmp_path, app_home):
-        result = install_app(
-            _make_app_source(tmp_path, permissions={"sessionApproval": True})
-        )
-
-        assert result.ok, result.error
-        assert result.notice == "session_approval_reconsent"
-        assert get_app("test-app")["enabled"] is False
-        assert get_app("test-app")["sessionApprovalConsentPending"] is True
-        blocked = enable_app("test-app")
-        assert not blocked.ok
-        assert blocked.error_code == "session_approval_consent_required"
-        assert enable_app("test-app", session_approval_consent=True).ok
-        assert get_app("test-app")["sessionApprovalConsentPending"] is False
-
-    def test_update_keeping_session_approval_stays_enabled(self, tmp_path, app_home):
-        # The grant was already declared when the user enabled the app, so a
-        # refresh that keeps it is not a new request.
-        from kiro_crew.apps.manager import update_app
-
-        assert install_app(
-            _make_app_source(tmp_path, permissions={"sessionApproval": True})
-        ).ok
-        assert enable_app("test-app", session_approval_consent=True).ok
-        v2 = _make_app_source(
-            tmp_path / "v2",
-            version="2.0.0",
-            permissions={"sessionApproval": True},
-        )
-        result = update_app(v2)
-        assert result.ok, result.error
-        assert result.notice == ""
-        assert get_app("test-app")["enabled"] is True
-
-    def test_self_registration_that_adds_session_approval_is_disabled(self, app_home):
-        # Self-managed apps re-register on every launch and author their own
-        # manifest, so a manifest that newly asks for session control must not
-        # inherit the always-enabled default -- that would be a self-grant.
-        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
-        assert get_app("ext-keypad")["enabled"] is True
-
-        result = register_external_app(
-            "ext-keypad",
-            "1.1.0",
-            "Keypad",
-            manifest_data={
-                "name": "ext-keypad",
-                "version": "1.1.0",
-                "permissions": {"sessionApproval": True},
-            },
-        )
-        assert result.ok, result.error
-        assert result.notice == "session_approval_reconsent"
-        assert get_app("ext-keypad")["enabled"] is False
-
-    def test_first_self_registration_with_session_approval_starts_disabled(self, app_home):
-        result = register_external_app(
-            "ext-keypad",
-            "1.0.0",
-            "Keypad",
-            manifest_data={
-                "name": "ext-keypad",
-                "version": "1.0.0",
-                "permissions": {"sessionApproval": True},
-            },
-        )
-        assert result.ok, result.error
-        assert result.notice == "session_approval_reconsent"
-        assert get_app("ext-keypad")["enabled"] is False
-        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
-        # Only a disclosure surface may clear pending consent.
-        blocked = enable_app("ext-keypad")
-        assert not blocked.ok
-        assert blocked.error_code == "session_approval_consent_required"
-        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
-        assert enable_app("ext-keypad", session_approval_consent=True).ok
-        assert get_app("ext-keypad")["enabled"] is True
-        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is False
-
-    def test_self_registration_keeping_session_approval_stays_enabled(self, app_home):
-        manifest = {
-            "name": "ext-keypad",
-            "version": "1.0.0",
-            "permissions": {"sessionApproval": True},
-        }
-        assert register_external_app("ext-keypad", "1.0.0", "Keypad", manifest_data=manifest).ok
-        assert enable_app("ext-keypad", session_approval_consent=True).ok
-        result = register_external_app(
-            "ext-keypad", "1.0.1", "Keypad", manifest_data={**manifest, "version": "1.0.1"}
-        )
-        assert result.ok, result.error
-        assert result.notice == ""
-        assert get_app("ext-keypad")["enabled"] is True
-
-    def test_self_registration_removing_session_approval_clears_pending(self, app_home):
-        manifest = {
-            "name": "ext-keypad",
-            "version": "1.0.0",
-            "permissions": {"sessionApproval": True},
-        }
-        assert register_external_app("ext-keypad", "1.0.0", "Keypad", manifest_data=manifest).ok
-        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
-
-        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
-        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
-
-        result = register_external_app(
-            "ext-keypad",
-            "1.0.1",
-            "Keypad",
-            manifest_data={"name": "ext-keypad", "version": "1.0.1"},
-        )
-
-        assert result.ok, result.error
-        assert get_app("ext-keypad")["enabled"] is False
-        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is False
-
-    def test_failed_self_registration_widening_restores_metadata(
-        self, app_home, monkeypatch
-    ):
-        from kiro_crew.apps import manager as manager_mod
-
-        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
-        original = _read_installed("ext-keypad")
-        assert original is not None
-        real_atomic_write = manager_mod.atomic_write
-        manifest_writes = 0
-
-        def _fail_manifest_once(path, data):
-            nonlocal manifest_writes
-            if Path(path).name == APP_MANIFEST_FILENAME:
-                manifest_writes += 1
-                if manifest_writes == 1:
-                    raise OSError("manifest write failed")
-            real_atomic_write(path, data)
-
-        monkeypatch.setattr(manager_mod, "atomic_write", _fail_manifest_once)
-        result = register_external_app(
-            "ext-keypad",
-            "1.1.0",
-            "Keypad",
-            manifest_data={
-                "name": "ext-keypad",
-                "version": "1.1.0",
-                "permissions": {"sessionApproval": True},
-            },
-        )
-
-        assert not result.ok
-        assert _read_installed("ext-keypad") == original
-        assert get_app_manifest("ext-keypad") is None
-
-    def test_failed_self_registration_removal_preserves_pending_consent(
-        self, app_home, monkeypatch
-    ):
-        from kiro_crew.apps import manager as manager_mod
-
-        manifest = {
-            "name": "ext-keypad",
-            "version": "1.0.0",
-            "permissions": {"sessionApproval": True},
-        }
-        assert register_external_app(
-            "ext-keypad", "1.0.0", "Keypad", manifest_data=manifest
-        ).ok
-        original = _read_installed("ext-keypad")
-        assert original is not None
-        real_write = manager_mod._write_installed
-        metadata_writes = 0
-
-        def _fail_metadata_once(name, meta):
-            nonlocal metadata_writes
-            metadata_writes += 1
-            if metadata_writes == 1:
-                raise OSError("metadata write failed")
-            real_write(name, meta)
-
-        monkeypatch.setattr(manager_mod, "_write_installed", _fail_metadata_once)
-        result = register_external_app(
-            "ext-keypad",
-            "1.1.0",
-            "Keypad",
-            manifest_data={"name": "ext-keypad", "version": "1.1.0"},
-        )
-
-        assert not result.ok
-        assert _read_installed("ext-keypad") == original
-        restored = get_app_manifest("ext-keypad")
-        assert restored is not None
-        assert restored.permissions.sessionApproval is True
-
-    def test_update_of_disabled_app_adding_session_approval_requires_consent(
-        self, tmp_path, app_home
-    ):
-        # A disabled app can be enabled later, so a new grant still needs consent.
-        from kiro_crew.apps.manager import update_app
-
-        assert install_app(_make_app_source(tmp_path)).ok
-        assert get_app("test-app")["enabled"] is False
-        v2 = _make_app_source(
-            tmp_path / "v2",
-            version="2.0.0",
-            permissions={"sessionApproval": True},
-        )
-        result = update_app(v2)
-        assert result.ok, result.error
-        assert get_app("test-app")["enabled"] is False
-        assert result.notice == "session_approval_reconsent"
-        assert get_app("test-app")["sessionApprovalConsentPending"] is True
-
-    def test_update_removing_session_approval_clears_pending(self, tmp_path, app_home):
-        assert install_app(_make_app_source(tmp_path)).ok
-        widened = _make_app_source(
-            tmp_path / "v2",
-            version="2.0.0",
-            permissions={"sessionApproval": True},
-        )
-        assert update_app(widened).ok
-        assert get_app("test-app")["sessionApprovalConsentPending"] is True
-
-        narrowed = _make_app_source(tmp_path / "v3", version="3.0.0")
-        result = update_app(narrowed)
-
-        assert result.ok, result.error
-        assert get_app("test-app")["enabled"] is False
-        assert get_app("test-app")["sessionApprovalConsentPending"] is False
-
-    def test_local_update_clears_prior_registry_provenance(self, tmp_path, app_home):
-        from kiro_crew.apps.manager import (
-            _read_installed,
-            set_app_provenance,
-            update_app,
-        )
-
-        src = _make_app_source(tmp_path)
-        assert install_app(src).ok
-        assert set_app_provenance(
-            "test-app",
-            source="registry:test-app",
-            url="https://clone.example.test/Owner/reviewed-app",
-            registry="corp",
-            commit="a" * 40,
-            signer="release-key",
-        )
-
-        local_v2 = _make_app_source(tmp_path / "local-v2", version="2.0.0")
-        result = update_app(local_v2)
-        assert result.ok, result.error
-
-        meta = _read_installed("test-app")
-        assert meta is not None
-        assert meta.source == str(local_v2.resolve())
-        assert meta.sourceUrl == ""
-        assert meta.sourceRegistry == ""
-        assert meta.sourceCommit == ""
-        assert meta.sourceSigner == ""
-
-    def test_directory_junction_omitted(self, tmp_path, app_home, monkeypatch):
-        """Windows directory junctions (reparse points not reported by
-        islink) are omitted from the copy. Simulated by monkeypatching
-        os.path.isjunction since junctions don't exist on POSIX."""
-        src = _make_app_source(tmp_path)
-        (src / "junction-dir").mkdir()
-        (src / "junction-dir" / "secret.txt").write_text("sensitive")
-
-        def fake_isjunction(p):
-            return os.path.basename(str(p)) == "junction-dir"
-
-        monkeypatch.setattr(os.path, "isjunction", fake_isjunction, raising=False)
-
-        result = install_app(src)
-        assert result.ok, result.error
-
-        from kiro_crew.apps.manager import app_dir
-
-        dest = app_dir("test-app")
-        assert not (dest / "junction-dir").exists()
-
-    def test_update_rejects_mismatched_source_name(self, tmp_path, app_home):
-        """expected_name guards against updating app A from app B's source."""
-        from kiro_crew.apps.manager import update_app
-
-        src = _make_app_source(tmp_path)
-        assert install_app(src).ok
-        other = _make_app_source(tmp_path / "other", name="other-app")
-
-        result = update_app(other, expected_name="test-app")
-        assert not result.ok
-        assert "does not match" in (result.error or "")
-
-    def test_shutil_error_rolls_back_cleanly(self, tmp_path, app_home, monkeypatch):
-        """shutil.Error (copytree aggregate, not an OSError) is caught and
-        reported as a failed AppResult instead of propagating."""
-        src = _make_app_source(tmp_path)
-
-        def failing_copytree(*args, **kwargs):
-            raise shutil.Error([("a", "b", "boom")])
-
-        monkeypatch.setattr(shutil, "copytree", failing_copytree)
-        result = install_app(src)
-        assert not result.ok
-        assert "failed to copy app files" in (result.error or "")
-        assert _read_installed("test-app") is None
-
-
-def _ship_test_builtin(monkeypatch, root, manifest_data):
-    """Give a synthetic builtin immutable package provenance for bridge tests."""
-    from kiro_crew.apps import execution
-
-    shipped = root / "shipped-builtins"
-    shipped_app = shipped / manifest_data["name"]
-    shipped_app.mkdir(parents=True)
-    (shipped_app / "app.json").write_text(
-        json.dumps(manifest_data), encoding="utf-8"
-    )
-    monkeypatch.setattr(execution, "_BUILTINS_DIR", shipped)
-    return shipped_app
-
-
-class TestEnabledStateTellsUnreadableFromNotInstalled:
-    """``app_enabled_state`` exists to keep those apart, and ``is_file()`` cannot.
-
-    ``Path.is_file()`` answers a silent False for five path shapes that are not
-    absence -- a dangling symlink, a directory or fifo in the file's place, a symlink
-    loop, and a non-directory parent component -- so leading with it made each of them
-    indistinguishable from a deliberate uninstall. A genuine ``stat`` fault such as
-    EACCES was already correct, because ``is_file`` re-raises it.
-
-    The cost is asymmetric now that ``hook_reconcile`` consumes this state unattended
-    on a 15s tick: a wrong ``False`` fires an automatic teardown of a live app's
-    routes and modules, while a ``None`` defers to the next tick.
-    """
-
-    def test_a_dangling_symlink_is_unknown(self, app_home):
-        app_root = app_home / "apps" / "shape-probe"
-        app_root.mkdir(parents=True)
-        (app_root / "installed.json").symlink_to(app_root / "gone.json")
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_a_directory_in_its_place_is_unknown(self, app_home):
-        (app_home / "apps" / "shape-probe" / "installed.json").mkdir(parents=True)
-
-        assert app_enabled_state("shape-probe") is None
-
-    @pytest.mark.skipif(
-        not hasattr(os, "mkfifo"),
-        reason="a FIFO is a POSIX-only path shape; os.mkfifo does not exist on Windows",
-    )
-    def test_a_fifo_in_its_place_is_unknown(self, app_home):
-        app_root = app_home / "apps" / "shape-probe"
-        app_root.mkdir(parents=True)
-        os.mkfifo(app_root / "installed.json")
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_a_symlink_loop_is_unknown(self, app_home):
-        app_root = app_home / "apps" / "shape-probe"
-        app_root.mkdir(parents=True)
-        (app_root / "installed.json").symlink_to(app_root / "other.json")
-        (app_root / "other.json").symlink_to(app_root / "installed.json")
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_a_non_directory_parent_is_unknown(self, app_home):
-        """Something occupies the app directory's own path."""
-        (app_home / "apps").mkdir(parents=True, exist_ok=True)
-        (app_home / "apps" / "shape-probe").write_text("not a directory", encoding="utf-8")
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_a_non_directory_parent_is_unknown_under_the_windows_error_class(
-        self, app_home, monkeypatch
-    ):
-        """The verdict must come from the path's SHAPE, not the exception class.
-
-        One condition, two classes: POSIX raises NotADirectoryError (ENOTDIR) while
-        Windows maps ERROR_PATH_NOT_FOUND to ENOENT and raises FileNotFoundError --
-        the same class a genuinely missing file raises. Keying absence on that class
-        told the truth on Linux and not on Windows, where a wrong-shape parent still
-        read as a deliberate uninstall and the hook reconciler would tear a LIVE app
-        down for it.
-
-        The Windows mapping is injected so this runs on every platform; the natural
-        path is covered by the test above on whichever platform produces it.
-        """
-        (app_home / "apps").mkdir(parents=True, exist_ok=True)
-        (app_home / "apps" / "shape-probe").write_text("not a directory", encoding="utf-8")
-
-        real_stat = Path.stat
-
-        def as_windows(self, *args, **kwargs):
-            try:
-                return real_stat(self, *args, **kwargs)
-            except NotADirectoryError as exc:
-                raise FileNotFoundError(2, "No such file or directory", str(self)) from exc
-
-        monkeypatch.setattr(Path, "stat", as_windows)
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_genuine_absence_stays_false_under_the_windows_error_class(
-        self, app_home, monkeypatch
-    ):
-        """The control for the above: the shape check must not swallow real absence.
-
-        Uninstall depends on this False, so a fix for the wrong-shape case that also
-        reported unknown for a missing file would break the caller it exists to serve.
-        """
-        (app_home / "apps" / "shape-probe").mkdir(parents=True)
-
-        real_stat = Path.stat
-
-        def as_windows(self, *args, **kwargs):
-            try:
-                return real_stat(self, *args, **kwargs)
-            except NotADirectoryError as exc:
-                raise FileNotFoundError(2, "No such file or directory", str(self)) from exc
-
-        monkeypatch.setattr(Path, "stat", as_windows)
-
-        assert app_enabled_state("shape-probe") is False
-
-    def test_a_dangling_windows_junction_ancestor_is_unknown(self, app_home, monkeypatch):
-        """A dangling junction occupies the path while looking absent to every predicate.
-
-        The same mistake as the error-class one, one predicate over: ``is_symlink`` is
-        False for a Windows directory junction, so a junction whose target is gone
-        presents as ``is_dir=False, exists=False, is_symlink=False`` -- indistinguishable
-        from nothing at all, which is why this walk stepped over it and reported genuine
-        absence. ``app_enabled_state`` then answers False and the hook reconciler tears a
-        LIVE app down.
-
-        Fed as a SHAPE rather than a real junction: os.mkfifo has a POSIX equivalent to
-        skip for, but a junction has none at all, so requiring one would mean this case
-        is only ever exercised on the platform it breaks. The three ordinary predicates
-        are already False for a path that does not exist, which IS the dangling
-        junction's shape, so only the junction probe has to be stood in for.
-        """
-        (app_home / "apps").mkdir(parents=True, exist_ok=True)
-        junction = app_home / "apps" / "shape-probe"
-        assert not junction.exists() and not junction.is_symlink() and not junction.is_dir()
-
-        monkeypatch.setattr(
-            "kiro_crew.apps.manager.is_link_or_junction",
-            lambda path: Path(path) == junction,
-        )
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_a_dangling_junction_at_the_metadata_path_is_unknown(self, app_home, monkeypatch):
-        """The same shape ON the metadata path, which the ancestor walk cannot reach.
-
-        ``Path.parents`` excludes the path itself, so `_absence_is_genuine` inspects
-        every ancestor and never `installed.json`. The self-check beside it asked only
-        `is_symlink`, which a junction answers False, so a junction occupying the
-        metadata path read as a deliberate uninstall while every ancestor was a healthy
-        directory.
-        """
-        (app_home / "apps" / "shape-probe").mkdir(parents=True)
-        meta = app_home / "apps" / "shape-probe" / "installed.json"
-        assert not meta.exists() and not meta.is_symlink() and not meta.is_dir()
-
-        monkeypatch.setattr(
-            "kiro_crew.apps.manager.is_link_or_junction",
-            lambda path: Path(path) == meta,
-        )
-
-        assert app_enabled_state("shape-probe") is None
-
-    def test_an_unreadable_directory_was_already_correct(self, app_home):
-        """The boundary: is_file() RE-RAISES EACCES, so this case never regressed.
-
-        Kept so the distinction is pinned -- the bug was path SHAPES reading as
-        absence, not permission faults.
-        """
-        app_root = app_home / "apps" / "shape-probe"
-        app_root.mkdir(parents=True)
-        (app_root / "installed.json").write_text('{"enabled": true}', encoding="utf-8")
-        os.chmod(app_root, 0o000)
-        try:
-            if os.access(app_root / "installed.json", os.R_OK):
-                pytest.skip("this user bypasses directory permissions")
-            assert app_enabled_state("shape-probe") is None
-        finally:
-            os.chmod(app_root, stat.S_IRWXU)
-
-    def test_nothing_there_is_still_a_definite_false(self, app_home):
-        """The one case that DOES mean not installed, which uninstall relies on."""
-        (app_home / "apps" / "shape-probe").mkdir(parents=True)
-
-        assert app_enabled_state("shape-probe") is False
-
-    def test_a_readable_record_still_reports_its_flag(self, app_home):
-        app_root = app_home / "apps" / "shape-probe"
-        app_root.mkdir(parents=True)
-        (app_root / "installed.json").write_text(
-            '{"name": "shape-probe", "enabled": false}', encoding="utf-8"
-        )
-
-        assert app_enabled_state("shape-probe") is False
-
-        (app_root / "installed.json").write_text(
-            '{"name": "shape-probe", "enabled": true}', encoding="utf-8"
-        )
-
-        assert app_enabled_state("shape-probe") is True
-
-
-class TestListingReportsWhatItDropped:
-    """Tests for list_apps_with_skips — the listing says when it dropped an app.
-
-    ``list_apps`` reaches ``if not meta: continue`` for a record that does not read
-    and drops the app silently, so its return value cannot separate "no such app is
-    installed" from "that app's record went unread". The rebuild in ``agent.py``
-    needs them apart: treating an unread claim as a genuinely unclaimed name prunes a
-    mount ref that nothing re-adds.
-
-    These live in the owner's suite on purpose: this module owns the record
-    filename, the occupied-entry test and the skip rules, so a caller that walks
-    the apps directory itself can disagree with all three while every test here
-    still passes. Asking the listing is the only way a caller stays in step.
-    """
-
-    def _install_two(self, tmp_path):
-        install_app(_make_app_source(tmp_path, name="app-one"))
-        install_app(_make_app_source(tmp_path, name="app-two"))
-
-    def test_a_healthy_listing_reports_itself_complete(self, tmp_path, app_home):
-        """The accepting case, so the report is not refusing everything."""
-        self._install_two(tmp_path)
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
-        assert listing.complete is True
-
-    def test_the_apps_list_is_handed_back_unchanged(self, tmp_path, app_home):
-        """The completeness flag is added BESIDE the listing, never instead of it.
-
-        ``list_apps`` has many callers and its shape is deliberately untouched, so
-        this pins that the new read is the same rows plus one answer.
-        """
-        self._install_two(tmp_path)
-
-        assert list_apps_with_skips().apps == list_apps()
-
-    def test_a_record_the_listing_drops_is_reported_as_a_skip(self, tmp_path, app_home):
-        """The case the whole function exists for: a record that does not parse.
-
-        The app is installed and its directory is on disk. ``list_apps`` reads the
-        record, fails, and drops the row -- so without this report a caller sees a
-        list that does not carry ``app-two`` and an apps root that does, and has to
-        reconstruct which of the two answers to believe.
-        """
-        self._install_two(tmp_path)
-        (app_home / "apps" / "app-two" / "installed.json").write_text(
-            "{ not json", encoding="utf-8"
-        )
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one"}
-        assert listing.complete is False
-
-    def test_an_unreadable_record_is_reported_as_a_skip(self, tmp_path, app_home):
-        """A permission fault on the record is the same silent drop as a parse fault."""
-        self._install_two(tmp_path)
-        record = app_home / "apps" / "app-two" / "installed.json"
-        os.chmod(record, 0o000)
-        try:
-            if os.access(record, os.R_OK):
-                pytest.skip("this user bypasses file permissions")
-
-            listing = list_apps_with_skips()
-
-            assert {a["name"] for a in listing.apps} == {"app-one"}
-            assert listing.complete is False
-        finally:
-            os.chmod(record, stat.S_IRUSR | stat.S_IWUSR)
-
-    def test_a_dangling_record_link_is_reported_as_a_skip(self, tmp_path, app_home):
-        """Presence is judged WITHOUT resolving the path.
-
-        ``Path.exists`` follows a symlink, so a dangling ``installed.json`` link reads
-        absent while the listing still drops that app for failing to read it. The two
-        answers together would claim there is no such app while the app sits on disk.
-        """
-        self._install_two(tmp_path)
-        record = app_home / "apps" / "app-two" / "installed.json"
-        record.unlink()
-        record.symlink_to(tmp_path / "no-such-target.json")
-        assert not record.exists()
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one"}
-        assert listing.complete is False
-
-    def test_a_junction_shaped_record_is_reported_as_a_skip(self, tmp_path, app_home, monkeypatch):
-        """``is_symlink`` is False for a Windows directory junction, so it is not enough.
-
-        Fed as a SHAPE rather than a real junction, for the reason the enabled-state
-        tests above give: a junction has no POSIX equivalent, so requiring one would
-        exercise this only on the platform it breaks. A dangling junction presents as
-        ``exists=False, is_symlink=False``, which is what an absent record presents as
-        too, so only the junction probe has to be stood in for.
-        """
-        self._install_two(tmp_path)
-        record = app_home / "apps" / "app-two" / "installed.json"
-        record.unlink()
-        assert not record.exists() and not record.is_symlink()
-
-        monkeypatch.setattr(
-            "kiro_crew.apps.manager.is_link_or_junction",
-            lambda path: Path(path) == record,
-        )
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one"}
-        assert listing.complete is False
-
-    def test_a_directory_with_no_record_at_all_is_not_a_skip(self, tmp_path, app_home):
-        """A directory that never held a record stood for no app, so it hides nothing.
-
-        This is the boundary against the tests above: there something was AT the
-        record path and could not be read, here the path is plainly empty. Counting
-        this would hold the listing permanently incomplete for any stray directory.
-        """
-        self._install_two(tmp_path)
-        (app_home / "apps" / "not-an-app").mkdir()
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
-        assert listing.complete is True
-
-    def test_a_plain_file_beside_the_app_directories_is_not_a_skip(self, tmp_path, app_home):
-        """An ordinary file inspects cleanly as a file and is simply not an app.
-
-        It cannot be told apart from an app root overwritten by a file, and counting
-        every one would leave the listing permanently incomplete -- which costs every
-        caller reading completeness as doubt. That residue is deliberate.
-        """
-        self._install_two(tmp_path)
-        (app_home / "apps" / "notes.txt").write_text("not an app", encoding="utf-8")
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
-        assert listing.complete is True
-
-    def test_a_dangling_app_root_link_is_reported_as_a_skip(self, tmp_path, app_home):
-        """The same blindness one level up, where the listing skips a non-directory.
-
-        An app root replaced by a dangling link is not a dir, is not listed, and its
-        record is unreachable, so every resolving predicate agrees the app is absent
-        while something plainly occupies its name.
-        """
-        self._install_two(tmp_path)
-        (app_home / "apps" / "vanished").symlink_to(tmp_path / "no-such-app-dir")
-
-        listing = list_apps_with_skips()
-
-        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
-        assert listing.complete is False
-
-    def test_no_apps_root_at_all_is_a_complete_listing_of_nothing(self, app_home):
-        """An absent root is the ordinary "nothing installed" shape, not a doubt."""
-        assert not (app_home / "apps").exists()
-
-        listing = list_apps_with_skips()
-
-        assert listing.apps == []
-        assert listing.complete is True
-
-    def test_a_root_replaced_by_a_file_is_reported_as_incomplete(self, app_home):
-        """A file standing where the root belongs hides every record beneath it.
-
-        This is the boundary against the test above: both leave nothing to walk, and
-        only the root's own presence separates them. Absent means no app is installed;
-        occupied means every installed app's record is unreachable and none of them can
-        be vouched for by an entry either, because there are no entries to read.
-
-        A plain file counts HERE and not one level down, where an ordinary non-app file
-        sits legitimately beside the app directories. The position carries the
-        argument: no healthy installation has a file where the apps root belongs.
-        """
-        (app_home / "apps").write_text("not a directory", encoding="utf-8")
-
-        listing = list_apps_with_skips()
-
-        assert listing.apps == []
-        assert listing.complete is False
-
-    def test_a_dangling_root_link_is_reported_as_incomplete(self, tmp_path, app_home):
-        """Presence is judged WITHOUT resolving, one level up from the record tests.
-
-        ``Path.exists`` follows the link, so a dangling apps root reads absent by every
-        resolving predicate while something plainly occupies the name. Reading that as
-        "nothing installed" is the answer that prunes a grant nothing re-adds.
-        """
-        (app_home / "apps").symlink_to(tmp_path / "no-such-apps-root")
-        assert not (app_home / "apps").exists()
-
-        listing = list_apps_with_skips()
-
-        assert listing.apps == []
-        assert listing.complete is False
-
-    def test_a_junction_shaped_root_is_reported_as_incomplete(self, app_home, monkeypatch):
-        """``is_symlink`` is False for a Windows directory junction, so it is not enough.
-
-        Fed as a SHAPE for the reason the record-level junction test gives: a junction
-        has no POSIX equivalent, so requiring a real one would exercise this only on
-        the platform it breaks. A dangling junction and an absent root both present as
-        ``exists=False, is_symlink=False``, so the junction probe is the only thing
-        that separates them and the only thing stood in for.
-        """
-        root = app_home / "apps"
-        assert not root.exists() and not root.is_symlink()
-
-        monkeypatch.setattr(
-            "kiro_crew.apps.manager.is_link_or_junction",
-            lambda path: Path(path) == root,
-        )
-
-        listing = list_apps_with_skips()
-
-        assert listing.apps == []
-        assert listing.complete is False
-
-    def test_a_root_that_cannot_be_walked_is_reported_as_incomplete(
-        self, tmp_path, app_home, monkeypatch
-    ):
-        """A root that raises mid-walk vouches for nothing, and keeps the rows it has.
-
-        The rows already read stay in ``apps`` -- they were read before the walk --
-        so the caller keeps every claim it can see and loses only the assurance that
-        it saw them all.
-
-        The completeness walk is picked out by WHEN it runs rather than by counting
-        walks. ``list_apps`` can walk the root more than once on its own: it calls
-        ``detect_orphaned_builtins`` first, which walks the root whenever that
-        module-global cache is cold, so which walk is the Nth depends on whether an
-        earlier test in the same worker happened to warm it. Arming only once
-        ``list_apps`` has returned names the target exactly, however many walks it
-        takes internally, and it keeps the fault out of ``list_apps`` itself --
-        which is called OUTSIDE the completeness ``try``, so an ``OSError`` raised in
-        there would propagate instead of being reported as an incomplete listing.
-        """
-        self._install_two(tmp_path)
-        real_iterdir = Path.iterdir
-        real_list_apps = list_apps
-        root = app_home / "apps"
-        state = {"rows_read": False, "raised": False}
-
-        def _rows_then_arm():
-            rows = real_list_apps()
-            state["rows_read"] = True
-            return rows
-
-        def _explode_once_armed(self):
-            if state["rows_read"] and self == root:
-                state["raised"] = True
-                raise OSError("root unreadable")
-            return real_iterdir(self)
-
-        monkeypatch.setattr("kiro_crew.apps.manager.list_apps", _rows_then_arm)
-        monkeypatch.setattr(Path, "iterdir", _explode_once_armed)
-
-        listing = list_apps_with_skips()
-
-        assert state["raised"], "the completeness walk never ran, so nothing was tested"
-        assert {a["name"] for a in listing.apps} == {"app-one", "app-two"}
-        assert listing.complete is False
-
-
-class TestBootSkillReconcile:
-    """Tests for reconcile_app_skills — startup creates missing skill symlinks."""
-
-    def test_reconcile_creates_missing_skill_symlinks(self, tmp_path, monkeypatch):
-        """An enabled app with manifest skills but missing symlinks gets them on reconcile."""
-        from kiro_crew.apps import bridges, manager
-        from kiro_crew.apps.bridges import reconcile_app_skills
-
-        apps_root = tmp_path / "apps"
-        app_root = apps_root / "test-app"
-        app_root.mkdir(parents=True)
-
-        # Set up fake skills dir (where symlinks go)
-        skills_root = tmp_path / "skills"
-        skills_root.mkdir(parents=True)
-
-        # Write installed.json (enabled, gateway-managed)
-        installed = {
-            "name": "test-app",
-            "version": "1.0.0",
-            "displayName": "Test App",
-            "enabled": True,
-            "origin": "builtin",
-            "resources": "gateway",
-            "lifecycle": "locked",
-            "schemaVersion": 2,
-        }
-        (app_root / "installed.json").write_text(json.dumps(installed))
-
-        manifest_data = {
-            "name": "test-app",
-            "version": "1.0.0",
-            "displayName": "Test App",
-            "description": "A test app",
-            "author": "test",
-            "skills": ["skills/my-skill"],
-        }
-        (app_root / "app.json").write_text(json.dumps(manifest_data))
-        shipped_app = _ship_test_builtin(monkeypatch, tmp_path, manifest_data)
-        skill_dir = shipped_app / "skills" / "my-skill"
-        skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("# My Skill\n")
-
-        # Monkeypatch installed-state and registration paths.
-        monkeypatch.setattr(manager, "apps_dir", lambda: apps_root)
-        monkeypatch.setattr(manager, "app_dir", lambda name: apps_root / name)
-        monkeypatch.setattr(bridges, "_skills_dir", lambda: skills_root)
-        monkeypatch.setattr(bridges, "app_dir", lambda name: apps_root / name)
-
-        # Verify NO symlinks exist yet
-        assert not (skills_root / "test-app").exists()
-        assert not (skills_root / "my-skill").exists()
-
-        registered = reconcile_app_skills("test-app")
-
-        assert len(registered) == 1
-        assert "test-app/my-skill" in registered
-        # symlink on POSIX, directory junction on non-admin Windows.
-        assert platform_compat.is_link_or_junction(skills_root / "test-app" / "my-skill")
-        assert platform_compat.is_link_or_junction(skills_root / "my-skill")
-        # Registration must target the immutable shipped skill, not its install.
-        assert (skills_root / "test-app" / "my-skill").resolve() == skill_dir.resolve()
-
-    def test_reconcile_removes_stale_skill_symlinks(self, tmp_path, monkeypatch):
-        """Skills removed from manifest get their stale symlinks cleaned up."""
-        from kiro_crew.apps import bridges, manager
-        from kiro_crew.apps.bridges import reconcile_app_skills
-
-        apps_root = tmp_path / "apps"
-        app_root = apps_root / "test-app"
-        app_root.mkdir(parents=True)
-
-        # Set up skills dir with a STALE symlink (removed from manifest)
-        skills_root = tmp_path / "skills"
-        app_skills_dir = skills_root / "test-app"
-        app_skills_dir.mkdir(parents=True)
-        stale_target = tmp_path / "old-skill"
-        stale_target.mkdir()
-        # symlink on POSIX, junction on non-admin Windows (a bare os.symlink
-        # would raise WinError 1314 in the fixture setup).
-        platform_compat.symlink_or_junction(str(stale_target), str(app_skills_dir / "old-skill"))
-        platform_compat.symlink_or_junction(str(stale_target), str(skills_root / "old-skill"))
-
-        # Write installed state and ship the authoritative builtin resources.
-        installed = {
-            "name": "test-app",
-            "version": "1.0.0",
-            "displayName": "Test",
-            "enabled": True,
-            "origin": "builtin",
-            "resources": "gateway",
-            "lifecycle": "locked",
-            "schemaVersion": 2,
-        }
-        (app_root / "installed.json").write_text(json.dumps(installed))
-        manifest_data = {
-            "name": "test-app",
-            "version": "1.0.0",
-            "displayName": "Test",
-            "description": "t",
-            "author": "t",
-            "skills": ["skills/kept-skill"],  # old-skill NOT listed
-        }
-        (app_root / "app.json").write_text(json.dumps(manifest_data))
-        shipped_app = _ship_test_builtin(monkeypatch, tmp_path, manifest_data)
-        kept_skill = shipped_app / "skills" / "kept-skill"
-        kept_skill.mkdir(parents=True)
-        (kept_skill / "SKILL.md").write_text("# Kept\n")
-
-        monkeypatch.setattr(manager, "apps_dir", lambda: apps_root)
-        monkeypatch.setattr(manager, "app_dir", lambda name: apps_root / name)
-        monkeypatch.setattr(bridges, "_skills_dir", lambda: skills_root)
-        monkeypatch.setattr(bridges, "app_dir", lambda name: apps_root / name)
-
-        registered = reconcile_app_skills("test-app")
-
-        # Kept skill is registered from immutable provenance.
-        assert "test-app/kept-skill" in registered
-        # symlink on POSIX, directory junction on non-admin Windows.
-        assert platform_compat.is_link_or_junction(skills_root / "test-app" / "kept-skill")
-        assert (
-            skills_root / "test-app" / "kept-skill"
-        ).resolve() == kept_skill.resolve()
-        # Stale skill symlinks removed
-        assert not (app_skills_dir / "old-skill").exists()
-        assert not (skills_root / "old-skill").exists()
-
-
-# ---------------------------------------------------------------------------
-# Builtin app-secret generation for mcpServers-only backends
-#
-# Platform defect: the gateway proxy (handle_app_api_proxy) resolves an app's
-# backend three ways — the third being a fallback that derives a loopback base
-# URL from a manifest's mcpServers entry (self-managed apps whose backend is a
-# separate loopback process, e.g. the Crew Companion desktop app on :7778).
-# register_builtin_apps() must not write a .app_secret ONLY when
-# backend.entryPoint was present, so a builtin declaring only mcpServers
-# resolved a backend fine but was refused a secret — and every proxied request
-# then 502'd with "has no secret". The fix generates the secret whenever a
-# backend is resolvable (entryPoint OR a loopback mcpServers URL), while an app
-# with no backend of any kind still gets none.
-# ---------------------------------------------------------------------------
-
-
-class TestBuiltinSecretForMcpServers:
-    @pytest.fixture(autouse=True)
-    def _clean_port_env(self, monkeypatch):
-        monkeypatch.delenv("KIROCREW_PORT", raising=False)
-
-    def _register_only(self, monkeypatch, apps):
-        """Run register_builtin_apps() with exactly `apps` as the builtin set."""
-        from kiro_crew.apps import manager
-
-        monkeypatch.setattr(manager, "_BUILTIN_APPS", [])
-        monkeypatch.setattr(manager, "discover_builtin_apps", lambda *a, **k: apps)
-        monkeypatch.setattr(manager, "_edition_builtin_apps", lambda: [])
-        manager.register_builtin_apps()
-
-    def test_declares_backend_helper(self):
-        from kiro_crew.apps.manager import _app_declares_backend
-
-        # entryPoint → backend
-        assert _app_declares_backend({"backend": {"entryPoint": "pkg.server"}})
-        # loopback mcpServers URL → backend (the defect case)
-        assert _app_declares_backend({"mcpServers": {"x": {"url": "http://127.0.0.1:7778/mcp"}}})
-        assert _app_declares_backend({"mcpServers": {"x": {"url": "http://localhost:7778/mcp"}}})
-        # no backend of any kind → no secret
-        assert not _app_declares_backend({})
-        assert not _app_declares_backend({"mcpServers": {}})
-        # non-loopback URL is not a reachable local backend
-        assert not _app_declares_backend({"mcpServers": {"x": {"url": "http://10.0.0.5:7778/mcp"}}})
-        # self-referential gateway port is refused by the proxy → no secret
-        assert not _app_declares_backend(
-            {"mcpServers": {"x": {"url": "http://127.0.0.1:5476/mcp"}}}
-        )
-
-    def test_mcpservers_only_builtin_gets_secret(self, tmp_path, app_home, monkeypatch):
-        """A builtin declaring only mcpServers must receive a .app_secret.
-
-        FAILS before the fix (condition was `backend.entryPoint` only), passes
-        after (condition is `_app_declares_backend`).
-        """
-        from kiro_crew.apps.manager import app_dir
-
-        mcp_only = {
-            "name": "mcp-only-app",
-            "version": "1.0.0",
-            "displayName": "MCP Only",
-            "description": "declares only an mcpServers loopback backend",
-            "author": "tester",
-            "defaultEnabled": False,
-            "mcpServers": {"mcp-only-app": {"url": "http://127.0.0.1:7778/mcp"}},
-        }
-        self._register_only(monkeypatch, [mcp_only])
-        assert (app_dir("mcp-only-app") / ".app_secret").is_file()
-
-    def test_no_backend_builtin_gets_no_secret(self, tmp_path, app_home, monkeypatch):
-        """A builtin with no backend of any kind must NOT get a secret."""
-        from kiro_crew.apps.manager import app_dir
-
-        no_backend = {
-            "name": "no-backend-app",
-            "version": "1.0.0",
-            "displayName": "No Backend",
-            "description": "declares no backend at all",
-            "author": "tester",
-            "defaultEnabled": False,
-        }
-        self._register_only(monkeypatch, [no_backend])
-        assert not (app_dir("no-backend-app") / ".app_secret").is_file()
-
-
-class TestBuiltinDoesNotClobberUserInstall:
-    """A builtin must never take over a user-installed app of the same name.
-
-    Apps live at ``apps/<name>/`` keyed on name alone, so a builtin that shares a
-    name with an externally distributed app would, on every gateway restart:
-    replace the user's manifest, set ``lifecycle="locked"`` (removing their
-    ability to uninstall), and overwrite ``origin`` -- which destroys the only
-    record that the install was ever user-owned. That last part is why this is
-    pinned: after one restart, no corrective release could tell the two apart.
-    """
-
-    def _register_only(self, monkeypatch, apps):
-        from kiro_crew.apps import manager
-
-        monkeypatch.setattr(manager, "_BUILTIN_APPS", [])
-        monkeypatch.setattr(manager, "discover_builtin_apps", lambda *a, **k: apps)
-        monkeypatch.setattr(manager, "_edition_builtin_apps", lambda: [])
-        manager.register_builtin_apps()
-
-    BUILTIN = {
-        "name": "collide-app",
-        "version": "9.9.9",
-        "displayName": "Collide (builtin)",
-        "description": "a builtin that shares a name with a user install",
-        "author": "kirocrew",
-        "defaultEnabled": False,
-    }
-
-    def _seed_user_install(self, name="collide-app"):
-        """Write metadata + a manifest the way install_app() would."""
-        import json
-
-        from kiro_crew.apps.manager import (
-            APP_MANIFEST_FILENAME,
-            InstalledApp,
-            _now_iso,
-            _write_installed,
-            app_dir,
-        )
-
-        d = app_dir(name)
-        d.mkdir(parents=True, exist_ok=True)
-        (d / APP_MANIFEST_FILENAME).write_text(
-            json.dumps({"name": name, "version": "0.1.0", "displayName": "Mine"}) + "\n"
-        )
-        _write_installed(
-            name,
-            InstalledApp(
-                name=name,
-                version="0.1.0",
-                displayName="Collide (user install)",
-                enabled=True,
-                installedAt=_now_iso(),
-                source="/Users/someone/src/collide-app",
-                origin="registry",
-                lifecycle="gateway",
-            ),
-        )
-        return d
-
-    def test_user_manifest_is_not_overwritten(self, tmp_path, app_home, monkeypatch):
-        """FAILS before the fix: the manifest was atomic_write'n unconditionally."""
-        import json
-
-        from kiro_crew.apps.manager import APP_MANIFEST_FILENAME
-
-        d = self._seed_user_install()
-        self._register_only(monkeypatch, [self.BUILTIN])
-
-        kept = json.loads((d / APP_MANIFEST_FILENAME).read_text())
-        assert kept["displayName"] == "Mine", "the user's manifest was replaced"
-        assert kept["version"] == "0.1.0"
-
-    def test_origin_and_lifecycle_survive(self, tmp_path, app_home, monkeypatch):
-        """The unrecoverable part: origin must still say the install was the user's.
-
-        FAILS before the fix (origin -> "builtin", lifecycle -> "locked").
-        """
-        from kiro_crew.apps.manager import _read_installed
-
-        self._seed_user_install()
-        self._register_only(monkeypatch, [self.BUILTIN])
-
-        meta = _read_installed("collide-app")
-        assert meta is not None
-        assert meta.origin == "registry", "the user-owned origin record was destroyed"
-        assert meta.lifecycle != "locked", "the user can no longer uninstall"
-        assert meta.version == "0.1.0", "the builtin's version was forced on to it"
-
-    def test_a_genuine_builtin_is_still_updated(self, tmp_path, app_home, monkeypatch):
-        """The guard must not freeze real builtins: ours still take the update."""
-        from kiro_crew.apps.manager import _read_installed
-
-        # First registration creates it with source="builtin".
-        self._register_only(monkeypatch, [self.BUILTIN])
-        assert _read_installed("collide-app").source == "builtin"
-
-        bumped = dict(self.BUILTIN, version="10.0.0", displayName="Collide v10")
-        self._register_only(monkeypatch, [bumped])
-
-        meta = _read_installed("collide-app")
-        assert meta.version == "10.0.0"
-        assert meta.displayName == "Collide v10"
-
-    def test_helper_classifies_both_cases(self):
-        from kiro_crew.apps.manager import InstalledApp, _builtin_owns_install
-
-        ours = InstalledApp(
-            name="x",
-            version="1",
-            displayName="X",
-            enabled=False,
-            installedAt="t",
-            source="builtin",
-        )
-        theirs = InstalledApp(
-            name="x",
-            version="1",
-            displayName="X",
-            enabled=False,
-            installedAt="t",
-            source="/path/to/x",
-            origin="registry",
-        )
-        assert _builtin_owns_install(ours)
-        assert not _builtin_owns_install(theirs)
-
-
-class TestMalformedMcpUrlIsSkippedNotFatal:
-    """A malformed mcpServers URL must be SKIPPED, never raise.
-
-    ``resolve_mcp_backend_url`` runs inside ``register_builtin_apps()`` at gateway
-    startup, and a manifest is user-supplied data. ``urlparse`` accessors are lazy and
-    raise ValueError on malformed input -- ``parsed.port`` does it for ":notaport" --
-    so an escape from here propagates out of registration and the gateway fails to
-    START. One bad manifest would take down every builtin, not just its own app.
-    """
-
-    BAD_URLS = [
-        "http://127.0.0.1:notaport/mcp",  # port is not an integer
-        "http://127.0.0.1:99999/mcp",  # port out of range
-        "http://[::1:/mcp",  # unparsable authority
-    ]
-
-    def test_malformed_urls_return_none_and_do_not_raise(self):
-        from kiro_crew.apps.manager import resolve_mcp_backend_url
-
-        for url in self.BAD_URLS:
-            # The assertion is that this LINE does not raise.
-            assert resolve_mcp_backend_url({"x": {"url": url}}) is None, url
-
-    def test_a_hostless_url_defaults_to_loopback_by_design(self):
-        """`http://:7778/mcp` is not an error — it resolves to loopback deliberately.
-
-        `host = parsed.hostname or "127.0.0.1"` treats a missing host as "this
-        machine", which is the only safe default here: the SSRF guard still holds,
-        because the fallback is loopback rather than anything the manifest supplied.
-        Pinned so the malformed-input guard above is never "tightened" into rejecting
-        it.
-        """
-        from kiro_crew.apps.manager import resolve_mcp_backend_url
-
-        assert (
-            resolve_mcp_backend_url({"x": {"url": "http://:7778/mcp"}}) == "http://127.0.0.1:7778"
-        )
-
-    def test_a_good_server_after_a_bad_one_still_resolves(self):
-        """Skipping means continuing, not abandoning the whole manifest."""
-        from kiro_crew.apps.manager import resolve_mcp_backend_url
-
-        servers = {
-            "broken": {"url": "http://127.0.0.1:notaport/mcp"},
-            "good": {"url": "http://127.0.0.1:7778/mcp"},
-        }
-        assert resolve_mcp_backend_url(servers) == "http://127.0.0.1:7778"
-
-    def test_registration_survives_a_malformed_manifest(self, tmp_path, app_home, monkeypatch):
-        """The end-to-end shape: startup registration must not blow up.
-
-        FAILS before the fix with ValueError out of register_builtin_apps().
-        """
-        from kiro_crew.apps import manager
-
-        bad = {
-            "name": "bad-url-app",
-            "version": "1.0.0",
-            "displayName": "Bad URL",
-            "description": "declares an unparsable mcpServers port",
-            "author": "tester",
-            "defaultEnabled": False,
-            "mcpServers": {"bad-url-app": {"url": "http://127.0.0.1:notaport/mcp"}},
-        }
-        monkeypatch.setattr(manager, "_BUILTIN_APPS", [])
-        monkeypatch.setattr(manager, "discover_builtin_apps", lambda *a, **k: [bad])
-        monkeypatch.setattr(manager, "_edition_builtin_apps", lambda: [])
-
-        manager.register_builtin_apps()  # must not raise
-
-        # It registers, it just gets no secret — there is no reachable backend.
-        assert not (manager.app_dir("bad-url-app") / ".app_secret").is_file()
-
-    def test_a_valid_loopback_url_is_unaffected(self):
-        from kiro_crew.apps.manager import resolve_mcp_backend_url
-
-        assert (
-            resolve_mcp_backend_url({"crew-companion": {"url": "http://127.0.0.1:7778/mcp"}})
-            == "http://127.0.0.1:7778"
-        )
-
-
-class TestRegisterExternalDoesNotTakeOverBuiltin:
-    """Self-registration must not overwrite a builtin-owned installed record.
-
-    Otherwise a POST /api/apps/register could downgrade a shipped builtin's
-    provenance to external and hand its execution/auto-approve exemption to a
-    third-party app — while leaving the boot-warmed first-party sets stale.
-    """
-
-    def test_register_external_refuses_builtin_owned_record(self, app_home):
-        # A builtin-owned record exists (as register_builtin_apps would write).
-        _write_installed(
-            "meetings",
-            InstalledApp(
-                name="meetings",
-                version="1.0.0",
-                displayName="Meetings",
-                source="builtin",
-                origin="builtin",
-                lifecycle="locked",
-            ),
-        )
-
-        result = register_external_app(
-            "meetings",
-            version="9.9.9",
-            display_name="Evil Meetings",
-            source="/tmp/evil",
-            origin="external",
-            resources="app",
-            lifecycle="app",
-        )
-
-        assert result.ok is False
-        assert "builtin" in result.error.lower()
-        # Record is untouched — provenance stays builtin, so the warmed
-        # first-party set remains valid.
-        after = _read_installed("meetings")
-        assert after is not None
-        assert after.origin == "builtin"
-        assert after.source == "builtin"
-        assert after.lifecycle == "locked"
-        assert after.version == "1.0.0"
-
-
-class TestRegisterExternalPreservesServerProvenance:
-    """An app metadata refresh cannot rewrite its server-owned install identity."""
-
-    _REPOSITORY = "https://clone.example.test/owner/self-app.git"
-    _REGISTRY = "registry-A"
-    _COMMIT = "a" * 40
-    _SIGNER = "release-key"
-
-    @classmethod
-    def _seed_registry_app(cls) -> None:
-        from kiro_crew.apps.manager import set_app_provenance
-
-        result = register_external_app(
-            "self-app",
-            "1.0.0",
-            "Self App",
-            source="registry:self-app",
-            origin="registry",
-            resources="app",
-            lifecycle="app",
-            source_repository=cls._REPOSITORY,
-        )
-        assert result.ok, result.error
-        assert set_app_provenance(
-            "self-app",
-            source="registry:self-app",
-            url=cls._REPOSITORY,
-            registry=cls._REGISTRY,
-            commit=cls._COMMIT,
-            signer=cls._SIGNER,
-        )
-
-    @classmethod
-    def _assert_provenance(cls) -> None:
-        meta = _read_installed("self-app")
-        assert meta is not None
-        assert meta.source == "registry:self-app"
-        assert meta.sourceUrl == cls._REPOSITORY
-        assert meta.sourceRegistry == cls._REGISTRY
-        assert meta.sourceCommit == cls._COMMIT
-        assert meta.sourceSigner == cls._SIGNER
-        assert meta.origin == "registry"
-
-    def test_app_controlled_registry_markers_are_not_durable_provenance(self, app_home):
-        """Only sourceUrl, never app-authored classification text, is authority."""
-        spoofed = register_external_app(
-            "self-app",
-            "1.0.0",
-            "Spoofed App",
-            source="registry:self-app",
-            origin="registry",
-        )
-        assert spoofed.ok, spoofed.error
-
-        refreshed = register_external_app(
-            "self-app",
-            "2.0.0",
-            "Local App",
-            source="C:/local/current",
-            origin="external",
-        )
-
-        assert refreshed.ok, refreshed.error
-        meta = _read_installed("self-app")
-        assert meta is not None
-        assert meta.source == "C:/local/current"
-        assert meta.sourceUrl == ""
-        assert meta.origin == "external"
-
-    def test_nonempty_bound_repository_can_transition_a_local_registration(self, app_home):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        local = register_external_app(
-            "self-app",
-            "1.0.0",
-            "Local App",
-            source="C:/local/source",
-            origin="external",
-        )
-        assert local.ok, local.error
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_allow_third_party": False,
-                        "apps_trusted": ["self-app"],
-                        "apps_trusted_repositories": {"self-app": self._REPOSITORY},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        transitioned = register_external_app(
-            "self-app",
-            "2.0.0",
-            "Registry App",
-            source="registry:self-app",
-            origin="registry",
-            source_repository=self._REPOSITORY,
-        )
-
-        assert transitioned.ok, transitioned.error
-        meta = _read_installed("self-app")
-        assert meta is not None
-        assert meta.source == "registry:self-app"
-        assert meta.sourceUrl == self._REPOSITORY
-        assert meta.origin == "registry"
-
-    def test_allow_all_refresh_preserves_pin_and_pinned_resolver(
-        self, app_home, monkeypatch
-    ):
-        from kiro_crew.apps import registry
-
-        self._seed_registry_app()
-        refreshed = register_external_app(
-            "self-app",
-            "2.0.0",
-            "Self App v2",
-            source="C:/caller-controlled/source",
-            origin="external",
-        )
-
-        assert refreshed.ok, refreshed.error
-        self._assert_provenance()
-        meta = _read_installed("self-app")
-        assert meta is not None
-        assert meta.version == "2.0.0"
-        assert meta.displayName == "Self App v2"
-
-        attacker = {
-            "name": "self-app",
-            "gitUrl": "https://attacker.example.test/owner/self-app.git",
-            "_registry": "registry-B",
-        }
-        pinned = {
-            "name": "self-app",
-            "gitUrl": self._REPOSITORY,
-            "_registry": self._REGISTRY,
-        }
-        monkeypatch.setattr(
-            registry, "_registry_app_candidates", lambda name: [attacker, pinned]
-        )
-
-        def _bare_name_lookup(name):
-            raise AssertionError(f"bare-name lookup attempted for {name}")
-
-        monkeypatch.setattr(registry, "get_registry_app", _bare_name_lookup)
-        assert registry._resolve_install_entry("self-app") == (pinned, "")
-
-    def test_repository_bound_refresh_uses_existing_pin_and_rejects_rebind(
-        self, app_home
-    ):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        self._seed_registry_app()
-        (app_home / "config.json").write_text(
-            json.dumps(
-                {
-                    "agent": {
-                        "apps_allow_third_party": False,
-                        "apps_trusted": ["self-app"],
-                        "apps_trusted_repositories": {"self-app": self._REPOSITORY},
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-
-        refreshed = register_external_app(
-            "self-app",
-            "2.0.0",
-            "Self App v2",
-            source="https://caller.example.test/spoof.git",
-            origin="external",
-        )
-        assert refreshed.ok, refreshed.error
-        self._assert_provenance()
-
-        rebound = register_external_app(
-            "self-app",
-            "9.9.9",
-            "Rebound App",
-            source="registry:self-app",
-            origin="registry",
-            source_repository="https://attacker.example.test/owner/self-app.git",
-        )
-        assert not rebound.ok
-        assert rebound.error_code == "app_trust_repository_mismatch"
-        self._assert_provenance()
-        meta = _read_installed("self-app")
-        assert meta is not None
-        assert meta.version == "2.0.0"
-
-    def test_local_external_registration_remains_idempotent(self, app_home):
-        first = register_external_app(
-            "self-app",
-            "1.0.0",
-            "Self App",
-            source="C:/local/first",
-            origin="external",
-        )
-        second = register_external_app(
-            "self-app",
-            "2.0.0",
-            "Self App v2",
-            source="C:/local/second",
-            origin="external",
-        )
-
-        assert first.ok, first.error
-        assert second.ok, second.error
-        meta = _read_installed("self-app")
-        assert meta is not None
-        assert meta.version == "2.0.0"
-        assert meta.displayName == "Self App v2"
-        assert meta.source == "C:/local/second"
-        assert meta.sourceUrl == ""
-        assert meta.origin == "external"

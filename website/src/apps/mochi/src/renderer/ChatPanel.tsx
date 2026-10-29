@@ -1,54 +1,36 @@
 /**
  * Mochi - Chat panel (embedded below pet in expanded mode)
  * Uses three-channel model: chunks via chat:chunk, done via chat:done, messages via chat:message
+ *
+ * This module keeps the panel component (header, transcript, composer, slash
+ * commands, the send-failure line and the context ring) and is the one import
+ * path for the panel's parts, which live in sibling owners:
+ * `ChatPanelPinnedFiles.tsx` (the pinned-files side panel), `ChatPanelMarkdown.tsx`
+ * (message markdown) and `ChatPanelBubble.tsx` (one message bubble). Owners never
+ * import this module.
  */
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import {
-  Ban,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  Copy,
   Eraser,
-  Eye,
-  File,
-  Folder,
-  Handshake,
   LayoutDashboard,
   LoaderCircle,
   Palette,
   PawPrint,
-  Pin,
   RotateCcw,
   Settings,
-  Shield,
-  ShieldCheck,
-  ShieldPlus,
   Square,
   SquarePen,
   Trash2,
   Unplug,
-  Wrench,
   X,
 } from 'lucide-react'
 import Clickable from '../../../../components/Clickable'
-import { familyGrantIsDistinct, trustBasePattern, truncateCommandLabel } from '../shared/trustPatterns'
-import Markdown from 'react-markdown'
-import type { Components } from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import rehypeRaw from 'rehype-raw'
-import { rehypeSanitize, rehypeStableRootKeys, remarkVerbatimUnknownTags } from '../../../../components/MarkdownRenderer'
-import { capWhitespaceRuns, remarkBoundDepth, rehypeBoundRawDepth } from '../../../../utils/markdownDepthBound'
-import { mdImageDestToPath } from '../../../../utils/fileTokens'
-import { copyToClipboard } from '../../../../utils/clipboard'
-import { classifyPlatform } from '../../../../hooks/useGatewayPlatform'
+import ErrorNotice from '../../../../components/ErrorNotice'
 import { useImeGuard } from '../../../../hooks/useImeGuard'
 import type { ChatMessage } from '../shared/types'
 import { applyTheme, type ThemeId } from '../shared/themes'
-import { PINNED_PANEL_WIDTH } from '../shared/constants'
 import { formatShortcut } from '../shared/shortcut'
 import { ContextMenu } from './ContextMenu'
-import { WidgetFrame, parseWidgets, hasWidgets } from './WidgetFrame'
 
 import { api } from '../mochiApi'
 import { DEFAULT_PET_NAME, resolvePetName } from '../../builtinPacks'
@@ -57,13 +39,12 @@ import {
   type PendingAttachment,
 } from '../../panel/composerDrop'
 import { PendingAttachments } from '../../panel/PendingAttachments'
-import { MochiCodeBlock } from '../../panel/MochiCodeBlock'
-import { reportStat } from '../../panel/panelBridge'
+import { reportStat, SendRefusedError, slotRefusalReason, isDefiniteRefusal } from '../../panel/panelBridge'
+import type { ApprovalTarget } from '../../panel/panelBridge'
 import { i18nT } from '../../../../i18n/t'
-import { useLanguageGeneration } from '../../../../i18n/useLanguageGeneration'
-import { i18next } from '../../../../i18n'
-import { electronPlatform, isElectron } from '../../../../lib/electron'
 import { moodLabel, stateLabel } from '../../i18nKeys'
+import { StreamingMarkdown } from './ChatPanelMarkdown'
+import { Bubble, externalApprovalApproved } from './ChatPanelBubble'
 
 /**
  * Slash-command descriptions, keyed by the command itself.
@@ -89,266 +70,11 @@ const SLASH_DESC_KEY = {
 const SLASH_COMMANDS: { cmd: keyof typeof SLASH_DESC_KEY }[] =
   (Object.keys(SLASH_DESC_KEY) as (keyof typeof SLASH_DESC_KEY)[]).map((cmd) => ({ cmd }))
 
-// ── Pinned Files Side Panel ──────────────────────────────────────────────────
-
-/** Local re-declaration of PinnedFileEntry (matches src/main/pinnedFilesService.ts) */
-interface PinnedFileEntry {
-  path: string
-  label: string
-  pinnedAt: number
-  updatedAt?: number
-}
-
-interface PinnedSidePanelProps {
-  pins: PinnedFileEntry[]
-  updatedPaths: Set<string>
-  deletedPaths: Set<string>
-  visible: boolean
-  lang?: string
-  onMarkSeen?: (path: string) => void
-  /** ADDED (not upstream): the empty hint names the PET, which is renameable. */
-  petName?: string
-}
-
-/** Vertical side panel showing pinned file chips — renders on the right side of chat. */
-export const PinnedSidePanel: React.FC<PinnedSidePanelProps> = ({ pins, updatedPaths, deletedPaths, visible, onMarkSeen, petName }) => {
-  if (!visible) return null
-
-  return (
-    <div className="pin-panel-root" style={{
-      width: PINNED_PANEL_WIDTH,
-      minWidth: PINNED_PANEL_WIDTH,
-      height: '100vh',
-      overflow: 'hidden',
-      display: 'flex',
-      flexDirection: 'column',
-      flexShrink: 0,
-      background: 'var(--bg)',
-      borderLeft: '1px solid var(--border)',
-    }}>
-      <style>{`
-        .pin-panel-root { animation: pin-panel-enter 0.2s ease-out both; }
-        @keyframes pin-panel-enter { from { opacity: 0; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
-        @keyframes pulse-dot {
-          0%, 100% { opacity: 1; transform: scale(1); }
-          50% { opacity: 0.6; transform: scale(0.85); }
-        }
-      `}</style>
-      <div style={{
-        flex: 1,
-        overflowY: 'auto',
-        overflowX: 'hidden',
-        padding: '8px 6px',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 1,
-      }}>
-        {pins.length === 0 ? (
-          <div style={{
-            display: 'flex', flexDirection: 'column', alignItems: 'center',
-            justifyContent: 'center', flex: 1, padding: '16px 8px', textAlign: 'center',
-            opacity: 0.5,
-          }}>
-            <Pin size={24} strokeWidth={1.5} style={{ marginBottom: 8, color: 'rgba(255,255,255,0.4)' }} />
-            <span style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', lineHeight: 1.4 }}>
-              {i18nT('apps.mochi.pinned.empty_hint', { name: petName || DEFAULT_PET_NAME })}
-            </span>
-          </div>
-        ) : (() => {
-          // Group pins by full parent path (use full path as key to avoid collisions)
-          const folderMap = new Map<string, PinnedFileEntry[]>()
-          for (const pin of pins) {
-            const parts = pin.path.split('/')
-            parts.pop() // remove filename
-            const fullParent = parts.join('/') || '/'
-            if (!folderMap.has(fullParent)) folderMap.set(fullParent, [])
-            folderMap.get(fullParent)!.push(pin)
-          }
-          const groups: { folder: string; fullPath: string; items: PinnedFileEntry[] }[] = []
-          for (const [fullPath, items] of folderMap) {
-            const folder = fullPath.split('/').pop() || '/'
-            groups.push({ folder, fullPath, items })
-          }
-          return groups.map((group) => (
-            <div key={group.fullPath} style={{ marginBottom: 4 }}>
-              <div style={{
-                fontSize: 10, fontWeight: 600, color: 'rgba(255,255,255,0.35)',
-                padding: '4px 8px 2px', textTransform: 'uppercase', letterSpacing: '0.03em',
-                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              }} title={group.fullPath}>
-                {group.folder}
-              </div>
-              {group.items.map((pin) => (
-                <PinnedChip
-                  key={pin.path}
-                  pin={pin}
-                  isUpdated={updatedPaths.has(pin.path)}
-                  isDeleted={deletedPaths.has(pin.path)}
-
-                  onMarkSeen={onMarkSeen}
-                />
-              ))}
-            </div>
-          ))
-        })()}
-      </div>
-    </div>
-  )
-}
-
-/** File extension to color mapping for visual distinction */
-const extColors: Record<string, string> = {
-  ts: '#3b82f6', tsx: '#3b82f6', js: '#eab308', jsx: '#eab308',
-  py: '#22c55e', md: '#a78bfa', json: '#f97316', yaml: '#f97316', yml: '#f97316',
-  css: '#ec4899', html: '#f43f5e', sh: '#6ee7b7', toml: '#fb923c',
-}
-
-function getExtColor(filePath: string): string {
-  const ext = filePath.split('.').pop()?.toLowerCase() || ''
-  return extColors[ext] || 'var(--accent)'
-}
-
-/** Individual pinned file chip — horizontal: icon left, filename right. */
-const PinnedChip: React.FC<{
-  pin: PinnedFileEntry
-  isUpdated: boolean
-  isDeleted: boolean
-  lang?: string
-  onMarkSeen?: (path: string) => void
-}> = ({ pin, isUpdated, isDeleted, onMarkSeen }) => {
-  const [hovered, setHovered] = useState(false)
-  const displayName = pin.label || pin.path.split('/').pop() || pin.path
-  const extColor = getExtColor(pin.path)
-
-  const handleClick = () => {
-    api?.markPinnedSeen?.(pin.path)
-    // Preview is a shell-bridge capability; in a browser tab the click can
-    // only mark the pin seen, not open the OS previewer.
-    if (isElectron) api?.previewFile?.(pin.path)
-    onMarkSeen?.(pin.path)
-  }
-
-  const handleDismiss = (e: React.MouseEvent) => {
-    e.stopPropagation()
-    api?.unpinFile?.(pin.path)
-  }
-
-  // The row is a click target only while the click has a visible payoff:
-  // opening the OS previewer (shell only), or clearing an unseen-update dot
-  // (HTTP-backed, works everywhere). Otherwise it renders inert — same
-  // treatment as the inline file chip — so a browser tab never shows a
-  // live-looking control that silently does nothing. Hover still reveals the
-  // unpin button, which is its own control and works everywhere.
-  const clickable = isElectron || (isUpdated && !isDeleted)
-
-  const chipStyle: React.CSSProperties = {
-    display: 'flex',
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    padding: '5px 8px',
-    borderRadius: 8,
-    cursor: clickable ? 'pointer' : 'default',
-    background: clickable && hovered ? 'rgba(255,255,255,0.07)' : 'transparent',
-    transition: 'background 0.15s ease',
-    position: 'relative',
-    opacity: isDeleted ? 0.35 : 1,
-    flexShrink: 0,
-  }
-
-  const body = (
-    <>
-      {/* Colored file icon */}
-      <File size={14} color={isDeleted ? 'var(--text-muted)' : extColor} style={{ flexShrink: 0 }} />
-
-      {/* Filename */}
-      <span style={{
-        fontSize: 11,
-        fontWeight: 400,
-        color: isDeleted ? 'var(--text-muted)' : 'rgba(255,255,255,0.8)',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-        flex: 1,
-        minWidth: 0,
-        lineHeight: 1.3,
-      }}>
-        {displayName}
-      </span>
-
-      {/* Update indicator — pulsing green dot */}
-      {isUpdated && !isDeleted && (
-        <span style={{
-          width: 6,
-          height: 6,
-          borderRadius: '50%',
-          background: '#34d399',
-          boxShadow: '0 0 4px rgba(52,211,153,0.6)',
-          animation: 'pulse-dot 2s ease-in-out infinite',
-          flexShrink: 0,
-        }} />
-      )}
-
-      {/* Dismiss button — appears on hover, macOS red dot style */}
-      {hovered && !isDeleted && (
-        <button
-          onClick={handleDismiss}
-          title={i18nT('apps.mochi.pinned.unpin')}
-          aria-label={i18nT('apps.mochi.pinned.unpin')}
-          style={{
-            width: 14,
-            height: 14,
-            borderRadius: '50%',
-            background: 'rgba(239,68,68,0.85)',
-            border: 'none',
-            color: '#fff',
-            fontSize: 8,
-            lineHeight: '14px',
-            textAlign: 'center',
-            cursor: 'pointer',
-            padding: 0,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            flexShrink: 0,
-          }}
-        >
-          <X size={12} />
-        </button>
-      )}
-    </>
-  )
-
-  if (!clickable) {
-    return (
-      // Hover intent only: the two listeners reveal the chip's own unpin button and
-      // nothing else. This branch is the chip that has no path to open, so the
-      // wrapper carries no action a keyboard could reach — the reachable control is
-      // the <button> inside `body`.
-      // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- passive hover reveal, not an interaction; the only action lives on the nested <button>
-      <div
-        onMouseEnter={() => setHovered(true)}
-        onMouseLeave={() => setHovered(false)}
-        title={pin.path}
-        style={chipStyle}
-      >
-        {body}
-      </div>
-    )
-  }
-
-  return (
-    <Clickable
-      onClick={handleClick}
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      title={pin.path}
-      style={chipStyle}
-    >
-      {body}
-    </Clickable>
-  )
-}
+// The panel's parts live in sibling owners (see the header); ChatApp, the
+// capture harnesses and the specs keep importing them from this module.
+export { PinnedSidePanel } from './ChatPanelPinnedFiles'
+export { fixStreamingFences } from './ChatPanelMarkdown'
+export { Bubble, externalApprovalApproved, parseApproval } from './ChatPanelBubble'
 
 // ── Chat Panel ──────────────────────────────────────────────────────────────
 
@@ -389,6 +115,12 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   // against the original.
   const [dropActive, setDropActive] = useState(false)
   const [dropError, setDropError] = useState('')
+  // A FAILED send is kept apart from `dropError`: a dropped-file refusal is a
+  // client-side validation hint, but a send failure is an error (a gateway
+  // refusal or a dead connection), so it renders through `ErrorNotice` — the one
+  // surface that recovers the request's structured context — rather than the
+  // hand-written drop-hint line. See the `errors-use-error-notice` rule.
+  const [sendError, setSendError] = useState('')
   // Queued attachments live HERE, not in the composer text: the reference
   // markdown is composed only at send time so the box the user types in is
   // never filled with plumbing.
@@ -674,12 +406,18 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
         // The bridge answers untyped rows, so the shape is asserted per FIELD here
         // rather than trusted wholesale: the filter is what guarantees `role` is one
         // of the two this panel renders, and a row missing a timestamp gets 0.
+        // The server row id (`meta.mid`) is kept so a patch frame for a row loaded
+        // here still finds it (see the `_patch` branch below).
         const mapped = history
           .filter((m) => m.role === 'user' || m.role === 'assistant')
-          .map((m, i): ChatMessage => ({
-            id: `hist-${i}`, role: m.role as ChatMessage['role'], content: m.content as string,
-            timestamp: (m.timestamp as number) || 0,
-          }))
+          .map((m, i): ChatMessage => {
+            const mid = (m.meta as { mid?: unknown } | null | undefined)?.mid
+            return {
+              id: `hist-${i}`, role: m.role as ChatMessage['role'], content: m.content as string,
+              timestamp: (m.timestamp as number) || 0,
+              ...(typeof mid === 'string' && mid ? { meta: { mid } } : {}),
+            }
+          })
         setAllHistory(mapped)
         setMessages(mapped.slice(-INITIAL_HISTORY))
         wasNearBottomRef.current = true
@@ -741,6 +479,30 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
 
     // Complete messages (user + assistant)
     const offMsg = api?.onChatMessage?.((msg) => {
+      // A retraction frame: the bridge is undoing an optimistic echo it added
+      // (a send the gateway definitely refused). Remove that row by id from both
+      // arrays — it carries no renderable role, so it falls through the normal
+      // append path below.
+      const retractId = (msg as { _retract?: unknown })._retract
+      if (typeof retractId === 'string') {
+        setMessages((prev: ChatMessage[]) => prev.filter(m => m.id !== retractId))
+        setAllHistory((prev: ChatMessage[]) => prev.filter(m => m.id !== retractId))
+        return
+      }
+      // A patch frame: new content for a committed row, named by the server
+      // row id (`meta.mid`) the row carries, from its own frame or from the
+      // history load. The gateway gives back the last run of text it held across
+      // a tool call or approval prompt this way. Like a retraction it carries no
+      // renderable role.
+      const patchMid = (msg as { _patch?: unknown })._patch
+      if (typeof patchMid === 'string') {
+        const content = String(msg.content ?? '')
+        const patch = (prev: ChatMessage[]) => prev.map(m =>
+          (m as { meta?: { mid?: unknown } }).meta?.mid === patchMid ? { ...m, content } : m)
+        setMessages(patch)
+        setAllHistory(patch)
+        return
+      }
       if (msg.role) {
         // The frame IS a chat message; the bridge types it as an untyped record, so
         // the shape is claimed once here instead of at each read below.
@@ -755,8 +517,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
         // Message counters for the Memories view. Counted HERE because this is
         // the one place both directions land; `backfill` marks history replay,
         // which must not re-count messages already counted when they happened.
+        // The OPTIMISTIC echo (`_optimistic`) is NOT counted here — it is
+        // rendered before the gateway's receipt is known, and `sendMessage`
+        // counts the send itself once the receipt is non-refused, so a refused
+        // send never inflates the durable counter. The received direction still
+        // counts here: an assistant frame only arrives when the turn ran.
+        const optimistic = (msg as { _optimistic?: unknown })._optimistic === true
         if (!msg.backfill) {
-          if (msg.role === 'user') reportStat('message_sent')
+          if (msg.role === 'user') { if (!optimistic) reportStat('message_sent') }
           else if (msg.role === 'assistant') reportStat('message_received')
         }
         if (msg.role === 'user' && !msg.backfill) {
@@ -911,20 +679,24 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     if (!text && !screenshotRef.current) return
     setIsWaiting(true)
     setTurnActive(true)
+    setSendError('')
     try {
       await api?.sendMessage?.(text, screenshotRef.current || undefined)
       setScreenshot(null)
-    } catch {
-      // Send failed. handleSend already cleared the composer before awaiting, so
-      // without this the typed text is lost, no error shows, and the spinner
-      // sticks forever. Restore the text (composer is empty on this path), clear
-      // the stuck waiting state, and surface the failure via the existing
-      // error banner — the dashboard AddWatchForm "your input is still here,
-      // try again" recovery.
+    } catch (err) {
+      // The send did not go through. handleSend already cleared the composer
+      // before awaiting, so without this the typed text is lost, no error shows,
+      // and the spinner sticks forever. Restore the text (composer is empty on
+      // this path), clear the stuck waiting state, and surface the failure.
       setIsWaiting(false)
       setTurnActive(false)
       setInput((prev) => (prev ? prev : text))
-      setDropError(i18nT('apps.mochi.chat.send_failed'))
+      // A REFUSAL carries the gateway's own reason (a busy-slot or agent-mismatch
+      // 409, or ensureSlot's binding refusal): show that reason the way the
+      // dashboard does, so the user looks at the slot and not at their
+      // connection. A rejected fetch (offline, DNS) carries no gateway reason, so
+      // it keeps the connection copy — which is what that failure actually is.
+      setSendError(sendFailureMessage(err))
     }
   }, [])
 
@@ -933,8 +705,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
     action: string,
     pattern?: string,
     trustGrantable = false,
+    target?: ApprovalTarget,
   ) => {
-    const res = await api?.respondApproval?.(id, action, pattern, trustGrantable)
+    const res = target
+      ? await api?.respondApproval?.(id, action, pattern, trustGrantable, target)
+      : await api?.respondApproval?.(id, action, pattern, trustGrantable)
     if (res !== undefined && res !== null && res.ok === false) {
       // The POST failed. Do NOT relabel the card "Approved"/"Trusted" — that
       // would claim a security decision that never reached the agent, which is
@@ -979,6 +754,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   const handleSend = async () => {
     const typed = input.trim()
     if (!typed && !screenshot && attachments.length === 0) return
+    // Clear any prior refusal banner on EVERY send attempt, not just the plain
+    // `sendText` path: the edit-resend and slash-command branches below return
+    // without touching it, so a red ErrorNotice from an earlier refused send
+    // otherwise stayed pinned above the composer while the new turn streamed in.
+    setSendError('')
     // Attachment references are appended HERE, not kept in the composer.
     const text = composeMessage(input, attachments)
     setInput('')
@@ -993,7 +773,14 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       const editTsStr = editingTs
       setEditingTs(null)
       setIsWaiting(true)
-      // Remove messages from the edited point onward in local state
+      // Remove messages from the edited point onward in local state. This is
+      // display-only until the next mount re-reads the gateway, which rebuilds
+      // the authoritative transcript either way — so a refusal does NOT restore
+      // the slice: a fallback send that was actually delivered (an `unknown`
+      // transport outcome) must keep its post-send state, and re-adding the
+      // edited-from rows there would duplicate a turn the gateway already ran
+      // (GPT F3). The composer draft, which the gateway never saw on a definite
+      // refusal, is the only thing worth handing back.
       const editTsNum = parseInt(editTsStr)
       setMessages(prev => {
         const idx = prev.findIndex(m => m.role === 'user' && m.timestamp === editTsNum)
@@ -1009,10 +796,38 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
       wasNearBottomRef.current = true
       const result = await api?.editResend?.(text, editTsStr)
       if (!result?.ok) {
-        // Fallback: send as normal message — don't add user msg locally,
-        // sendMessage will trigger chat:message event which adds it
+        // Fallback: send as a normal message. `sendMessage` echoes the turn
+        // itself (and retracts that echo on a definite refusal), so nothing is
+        // added locally here. A definite refusal REJECTS this call (a
+        // rebound/busy slot, a 403); the composer was already cleared above, so
+        // without a catch the typed text is lost and the spinner sticks. Mirror
+        // `sendText`'s recovery: hand the draft back and show the gateway reason.
+        // A transport failure (fetch rejected) also lands here, but there the
+        // draft is deliberately NOT restored (see the catch) — the send may have
+        // run, and re-filling the composer would invite a double-executed turn.
         setIsWaiting(true)
-        await api?.sendMessage?.(text, screenshot || undefined)
+        try {
+          await api?.sendMessage?.(text, screenshot || undefined)
+        } catch (err) {
+          setIsWaiting(false)
+          setTurnActive(false)
+          // Restore the draft ONLY for a DEFINITE refusal (nothing was sent):
+          // `isDefiniteRefusal` is true for ANY `SendRefusedError`/tagged slot
+          // refusal — including a non-2xx whose body is not JSON (an aiohttp 500
+          // or proxy 502 page), where the reason is `undefined`. The earlier
+          // `slotRefusalReason(err) !== undefined` test wrongly dropped the
+          // draft on exactly that ordinary failure (a reason-less definite
+          // refusal) because it cannot tell a reason-less refusal from a
+          // transport error. A transport rejection is NOT a definite refusal:
+          // it keeps its optimistic echo (the text stays visible in the
+          // transcript), so re-filling the composer would invite a re-send that
+          // executes an already-run, side-effecting turn a SECOND time — leave
+          // it cleared there.
+          if (isDefiniteRefusal(err)) {
+            setInput((prev) => (prev ? prev : text))
+          }
+          setSendError(sendFailureMessage(err))
+        }
       }
       return
     }
@@ -1301,8 +1116,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
           ) : null}
         </div>
 
-        {/* Message items — normal flow */}
-        {messages.map((msg) => (
+        {/* Message items — normal flow. An assistant row committed with no text
+            yet is not drawn: all of its text is a run the gateway holds across
+            the tool call or approval prompt after it, and it arrives as a patch
+            (the dashboard hides the same row). */}
+        {messages.filter((msg) => msg.role !== 'assistant' || msg.content).map((msg) => (
           <div key={msg.id} style={{ padding: '3px 10px', display: 'flex', flexDirection: 'column' }}>
             <Bubble message={msg} onOption={sendText} onImageClick={openLightboxCb}
               animate={!msg.id.startsWith('hist-')}
@@ -1407,9 +1225,53 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
           120px. Measuring the stack is what makes the gap real in every state
           (upstream's fixed 52 was tuned for its own single layout). */}
       <div ref={composerRef}>
+      {/* A FAILED send renders through the shared ErrorNotice. This cross-origin
+          panel receives ONLY custom-property CSS (installCoreThemeVars strips
+          every Tailwind utility, and the panel entry never imports index.css),
+          so the component's `block` variant — whose banner box is pure Tailwind
+          (`rounded-lg border bg-danger/10 px-3 py-2`) — renders as unstyled
+          debris here (a lone triangle, a text line, a raw browser-chrome ✕).
+          Follow the SettingsPanel pattern instead: use `variant="inline"` (whose
+          layout is text-only, nothing to lose when utilities drop) inside an
+          inline-styled wrapper that supplies the alert's banner surface —
+          danger color, tinted background, border, padding, size — via
+          `var(--*)` so it does not depend on Tailwind at all. The inline
+          variant's dismiss ✕ carries `bg-transparent border-none p-0`, also
+          stripped here, so a scoped inline `<style>` resets it to a flat icon
+          button rather than the UA's grey-chrome box. No agent hand-off
+          (`askAgent={false}`): the hand-off unmounts this tree and would destroy
+          the restored draft the user is about to retry. */}
+      {sendError !== '' && (
+        <div
+          className="mochi-send-error-banner"
+          role="presentation"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            margin: '6px 10px',
+            padding: '6px 10px',
+            borderRadius: 8,
+            border: '1px solid var(--danger, #e5484d)',
+            background: 'color-mix(in srgb, var(--danger, #e5484d) 12%, transparent)',
+            color: 'var(--danger, #e5484d)',
+            fontSize: 13,
+          }}
+        >
+          <style>{`.mochi-send-error-banner button{background:transparent;border:none;padding:0;cursor:pointer;color:inherit;display:inline-flex;align-items:center;}`}</style>
+          <ErrorNotice
+            variant="inline"
+            message={sendError}
+            askAgent={false}
+            onDismiss={() => setSendError('')}
+          />
+        </div>
+      )}
       {/* ADDED (not upstream): why a dropped file was refused. Reporting it is
           the point — the fork discarded such files silently, which reads as the
-          app being broken rather than the file being unsupported. */}
+          app being broken rather than the file being unsupported. A refused drop
+          is a client-side validation hint, not a failure, so it is NOT an
+          `ErrorNotice` (see the `errors-use-error-notice` rule's own carve-out
+          for validation hints). */}
       {dropError !== '' && (
         <div style={{
           padding: '4px 10px', borderTop: '1px solid var(--border)',
@@ -1637,671 +1499,48 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
   )
 }
 
-const LocalImage: React.FC<{ path: string; onClickImage?: (src: string) => void }> = ({ path, onClickImage }) => {
-  const [src, setSrc] = React.useState<string | null>(null)
-  React.useEffect(() => {
-    api?.readLocalImage?.(path).then((b64: string | null) => {
-      if (b64) setSrc(`data:image/png;base64,${b64}`)
-    })
-  }, [path])
-  if (!src) return <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>...</span>
-  // Hands back the PATH, not `src` (the data: URL built from the bytes). Every
-  // consumer wants to DO something with the file -- open it in the OS viewer --
-  // and a data URL cannot be opened. Passing the rendered URL made each call
-  // site look wired while doing nothing.
-  //
-  // A real <button>, not a clickable <img>: the transcript renders the image at
-  // 200px, so opening the file at full size is a CONTROL, and only the native
-  // element puts it in the tab order and fires it on Enter/Space. `inline-flex`
-  // with zero chrome keeps the image inline and at exactly its own size, and the
-  // button carries the accessible name so the image takes an empty alt rather
-  // than being announced twice.
-  return <button type="button" onClick={() => onClickImage?.(path)}
-    aria-label={i18nT('apps.mochi.chatPanel.open_image')}
-    style={{ display: 'inline-flex', padding: 0, border: 'none', background: 'none', cursor: 'zoom-in' }}>
-    <img src={src} alt=""
-      style={{ maxWidth: 200, maxHeight: 200, borderRadius: 4, marginTop: 4, cursor: 'zoom-in' }} />
-  </button>
-}
-
 /**
- * Streaming-aware markdown renderer.
- * Ported from KiroCrew's MarkdownRenderer — handles incomplete code fences
- * during streaming so partial responses render as proper markdown instead of
- * raw text.
- */
-const StreamingMarkdown = React.memo<{ content: string }>(({ content }) => {
-  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
-  // The whitespace-run cap (see markdownDepthBound) is applied per TEXT
-  // segment below, after widget extraction, so a widget body reaches
-  // WidgetFrame byte-identical -- its <pre> indentation included.
-  const cleaned = content.replace(/^\n+/, '')
-  // If there's a complete widget in the stream, render it
-  if (hasWidgets(cleaned)) {
-    const segments = parseWidgets(cleaned)
-    // Anything after the last complete widget may still be streaming
-    const lastWidget = segments.findLastIndex(s => s.type === 'widget')
-    return (
-      <>
-        {segments.map((seg, i) => {
-          if (seg.type === 'widget') return <WidgetFrame key={i} html={seg.content} title={seg.title} />
-          // Last text segment after final widget — still streaming
-          if (i > lastWidget) {
-            const stripped = seg.content.replace(/<mcwidget[\s\S]*$/, '')
-            const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
-            return <React.Fragment key={i}>
-              <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
-              <span style={{ animation: 'blink 1s step-end infinite', display: 'inline-flex', verticalAlign: 'middle' }}><PawPrint size={11} /></span>
-            </React.Fragment>
-          }
-          return <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
-        })}
-      </>
-    )
-  }
-  // Strip any partial/unclosed <mcwidget tag during streaming
-  const stripped = cleaned.replace(/<mcwidget[\s\S]*$/, '')
-  const prepared = fixStreamingFences(capWhitespaceRuns(stripped))
-  return (
-    <>
-      <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{prepared}</Markdown>
-      <span style={{ animation: 'blink 1s step-end infinite', display: 'inline-flex', verticalAlign: 'middle' }}><PawPrint size={11} /></span>
-    </>
-  )
-})
-
-/** Ensure blank line before fences glued to text, and close any unclosed fence. */
-function fixStreamingFences(s: string): string {
-  // The info string is the whole backtick-free line, including attributes and
-  // a leading space, matching the dashboard's FENCE_OPEN.
-  s = s.replace(/([^\n])(\n?)(```[^`\n]*\n)/g, (_, pre, nl, fence) =>
-    nl ? pre + nl + fence : pre + '\n\n' + fence
-  )
-  // If there's an odd number of ``` fences, the last one is unclosed — close it
-  const fenceCount = (s.match(/^```/gm) || []).length
-  if (fenceCount % 2 === 1) s += '\n```'
-  return s
-}
-
-// `remarkBoundDepth` first: it bounds the parsed tree's depth inside parse(),
-// ahead of remark-gfm's recursive post-parse transform. Shared with the
-// core renderer, for the same reason the sanitizer is: this panel parses
-// the same untrusted message content through the same kind of pipeline.
-const MD_REMARK = [remarkBoundDepth, remarkGfm, remarkVerbatimUnknownTags]
-/**
- * Raw HTML must be ADMITTED, then SANITIZED — in that order.
+ * The composer error line for a send that did not go through.
  *
- * Without `rehype-raw`, react-markdown leaves an `html` node unhandled and its
- * source text is emitted verbatim, so a model writing `<br>` (the only way to
- * break a line inside a GFM table cell) put a literal "<br>" in the bubble.
- * The sanitizer is the core's, imported rather than copied: admitting raw HTML
- * is exactly the point where a second, drifting allowlist would become a hole.
+ * A gateway REFUSAL (a `SendRefusedError` on a non-2xx, or `ensureSlot`'s tagged
+ * binding refusal) names the real reason the gateway returned — a busy slot, a
+ * slot/agent mismatch — and the panel shows it with `pages.chatPage.send_failed_with_error`, the same
+ * core-owned framed string the dashboard uses, so the user looks at the slot and
+ * not at their connection. A refusal that carries no reason falls back to the
+ * unframed `pages.chatPage.send_failed`.
+ *
+ * A rejected fetch (offline, DNS) throws a plain `TypeError` with no gateway
+ * reason, so it keeps `apps.mochi.chat.send_failed` — the connection copy, which
+ * is what that failure is.
+ *
+ * The `i18nT` keys are literals here, not built from the branch, because
+ * `check-i18n-keys.mjs` resolves only file-scope literals and a computed key is
+ * one it cannot verify.
  */
-// ``rehypeStableRootKeys`` goes LAST, after ``rehypeSanitize``, and the order is
-// load-bearing rather than cosmetic: the sanitizer keeps only allowlisted
-// attributes, and ``style`` is on neither the global list nor any list for
-// ``div``. Ahead of it the wrapper would lose ``display: contents`` and become a
-// real layout box around every block, which is a visible regression that the
-// keys it stabilises would not reveal.
-const MD_REHYPE = [rehypeBoundRawDepth, rehypeRaw, rehypeSanitize, rehypeStableRootKeys]
-
-/**
- * Typed against react-markdown's own `Components`, so each override receives the
- * real props of the tag it replaces (the same contract the dashboard's
- * MarkdownRenderer uses) instead of an `any` that hides a misspelled prop.
- */
-const mdComponents: Components = {
-  // react-markdown's defaultUrlTransform rewrites a destination whose scheme is
-  // outside its allowlist (and an empty `[x]()` destination) to href="". An
-  // anchor with an empty href still paints as a live link and its "Copy Link
-  // Address" resolves to the current page URL, so a refused destination renders
-  // as inert text instead -- same degradation as md-notebook's Preview.
-  //
-  // On the anchor path, `href` and the children are restated after the spread --
-  // both already arrive in `p`, so this is the same anchor at runtime -- because
-  // an <a> whose href is only ever supplied by a spread is indistinguishable
-  // from a bare <a onClick>: it is not focusable and Enter does not fire it, and
-  // neither a reader nor the linter can tell it apart from a real link.
-  a: (p) => p.href ? <a {...p} href={p.href} style={{ color: 'var(--accent)', textDecoration: 'none', cursor: 'pointer' }}
-    onMouseEnter={(e) => (e.currentTarget.style.textDecoration = 'underline')}
-    onMouseLeave={(e) => (e.currentTarget.style.textDecoration = 'none')}
-    onClick={(e) => { e.preventDefault(); const href = p.href; if (href) api?.openExternal?.(href) }}>{p.children}</a>
-    : <span>{p.children}</span>,
-  table: (p) => <table style={{ borderCollapse: 'collapse', fontSize: 11, width: '100%', margin: '4px 0' }} {...p} />,
-  th: (p) => <th style={{ border: '1px solid var(--border)', padding: '3px 6px', textAlign: 'left', fontWeight: 600 }} {...p} />,
-  td: (p) => <td style={{ border: '1px solid var(--border)', padding: '3px 6px' }} {...p} />,
-  code: (p) => {
-    // Whole class token, not its leading `\w+` run: `language-error-report`
-    // labels as `error-report`, not `error` (same rule as MarkdownRenderer).
-    const match = /language-(\S+)/.exec(p.className || '')
-    if (match) {
-      return <MochiCodeBlock lang={match[1]} code={String(p.children).replace(/\n$/, '')} />
-    }
-    // Detect inline code that looks like a file path
-    const text = String(p.children)
-    if (/^(?:\/(?:Users|home|tmp|var|etc)\/[^\s]+|[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+)\.(?:md|txt|json|yaml|yml|toml|py|ts|js|sh|cfg|conf|log|csv)$/.test(text)) {
-      return <FileChip path={text} />
-    }
-    return <code style={{ background: 'var(--bg-input)', borderRadius: 3, padding: '1px 4px', fontSize: 11 }} {...p} />
-  },
-  pre: (p) => <>{p.children}</>,
-  p: (p) => {
-    // Detect file paths in paragraph text and render as FileChip
-    const children = React.Children.toArray(p.children)
-    const processed = children.map((child, i) => {
-      if (typeof child !== 'string') return child
-      // Match absolute file paths (not inside backticks — those go through code component)
-      const fileRe = /((?:\/(?:Users|home|tmp|var|etc)\/[^\s,;:'"<>()]+|[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_.-]+)+)\.(?:md|txt|json|yaml|yml|toml|py|ts|js|sh|cfg|conf|log|csv))/g
-      const parts: (string | React.ReactElement)[] = []
-      let lastIdx = 0
-      let match: RegExpExecArray | null
-      while ((match = fileRe.exec(child)) !== null) {
-        if (match.index > lastIdx) parts.push(child.slice(lastIdx, match.index))
-        parts.push(<FileChip key={`fc-${i}-${match.index}`} path={match[1]} />)
-        lastIdx = match.index + match[0].length
-      }
-      if (lastIdx < child.length) parts.push(child.slice(lastIdx))
-      return parts.length > 1 ? <React.Fragment key={i}>{parts}</React.Fragment> : child
-    })
-    return <p style={{ margin: '2px 0' }}>{processed}</p>
-  },
-  ul: (p) => <ul style={{ margin: '2px 0', paddingLeft: 16 }} {...p} />,
-  ol: (p) => <ol style={{ margin: '2px 0', paddingLeft: 16 }} {...p} />,
-  li: (p) => <li style={{ marginBottom: 1 }} {...p} />,
-  img: (p) => {
-    const src = p.src
-    // Any LOCAL FILE path goes through LocalImage, which reads the bytes over the
-    // app API and renders a data URL. A bare `<img src="/Users/…/x.png">` cannot
-    // work in a page: the browser resolves it against the gateway origin and 404s.
-    //
-    // This used to be gated on `.kiro/crew/screenshots/` only, so every UPLOADED
-    // image — which the route stores under `uploads/`, and which is how dropped
-    // files and now crops are referenced — rendered as a broken image. The test
-    // is the shape of the path, not one directory.
-    //
-    // `startsWith('/')` alone is not enough: gateway-relative URLs like
-    // `/assets/logo.png` also start with a slash and must stay ordinary <img>.
-    if (isLocalFilePath(src)) {
-      // `src` (the path), NOT the data URL LocalImage renders: the OS viewer
-      // opens a file, and openLightbox rejects data: URLs for that reason.
-      return <LocalImage path={src} onClickImage={() => api?.openLightbox?.(src)} />
-    }
-    // The markdown author's own alt text, defaulting to '' — an image written
-    // without one is decorative, and an explicit empty alt is what tells a screen
-    // reader to skip it instead of falling back to reading out the URL.
-    return <img {...p} alt={p.alt ?? ''} style={{ maxWidth: '100%', borderRadius: 4, marginTop: 4, cursor: 'zoom-in' }} />
-  },
+function sendFailureMessage(err: unknown): string {
+  const reason = refusalReason(err)
+  if (reason === undefined) return i18nT('apps.mochi.chat.send_failed')
+  return reason === ''
+    ? i18nT('pages.chatPage.send_failed')
+    : i18nT('pages.chatPage.send_failed_with_error', { error: reason })
 }
 
 /**
- * Does this src name a file on THIS machine (rather than a URL the page can load)?
+ * The gateway's explanation for a refused send, or `undefined` when the failure
+ * is not a refusal and should read as a connection problem.
  *
- * Mirrors the absolute-path roots the paragraph renderer already matches for file
- * chips, plus the app's own data home, so a path under `screenshots/` or
- * `uploads/` is recognised wherever the data home lives.
+ * `slotRefusalReason` recognizes exactly two shapes: a `SendRefusedError` (the
+ * gateway's own `error` body on a non-2xx) and a tagged slot-binding refusal
+ * from `ensureSlot`. For a `SendRefusedError` that named no reason it returns the
+ * empty string — the panel then shows the unframed `pages.chatPage.send_failed`.
+ * Any OTHER throw — a rejected fetch, or an unexpected internal error — returns
+ * `undefined` so the panel keeps the localized connection copy rather than
+ * promoting a raw, unlocalized `Error.message` into UI text for every language.
  */
-function isLocalFilePath(src: unknown): src is string {
-  if (typeof src !== 'string' || !src.startsWith('/')) return false
-  return /^\/(?:Users|home|tmp|var|private|etc)\//.test(src) || src.includes('.kiro/crew/')
+function refusalReason(err: unknown): string | undefined {
+  if (err instanceof SendRefusedError) return err.reason ?? ''
+  return slotRefusalReason(err)
 }
-
-/** Inline file chip — shows shortened path with preview + reveal buttons */
-const FileChip: React.FC<{ path: string }> = ({ path: filePath }) => {
-  const parts = filePath.split('/')
-  const short = parts.length > 3 ? `…/${parts.slice(-2).join('/')}` : parts.slice(-2).join('/')
-  // The SHELL's platform, not the gateway's: `revealFile` is an IPC send Mochi's
-  // Electron main process handles, so that host owns which application opens. A
-  // browser tab has no shell to report one — and no shell to reveal anything
-  // either — so it takes the generic wording.
-  const hostPlatform = classifyPlatform(electronPlatform())
-  const revealLabel = hostPlatform === 'darwin'
-    ? i18nT('apps.mochi.chatPanel.open_in_finder')
-    : hostPlatform === 'windows'
-      ? i18nT('apps.mochi.chatPanel.open_in_file_explorer')
-      : i18nT('apps.mochi.chatPanel.show_in_file_manager')
-  return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: 4,
-      background: 'var(--bg-input)', border: '1px solid var(--border)',
-      borderRadius: 6, padding: '2px 6px 2px 5px', margin: '2px 0',
-      fontSize: 11, lineHeight: 1.3, verticalAlign: 'middle',
-    }}>
-      <File size={11} color="var(--text-muted)" />
-      {/* Preview and reveal both delegate to the shell bridge (window.mochi),
-          published only by the Electron preload — in a browser tab the calls
-          are silent no-ops, so the dead controls are withheld rather than
-          rendered. Inside the shell the reveal label names that host's own file
-          manager, since the shell is what performs the reveal. */}
-      {isElectron ? (
-        <>
-          <span style={{ color: 'var(--text)', cursor: 'pointer', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-            title={filePath}
-            role="button"
-            tabIndex={0}
-            onClick={() => api?.previewFile?.(filePath)}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); api?.previewFile?.(filePath) } }}
-          >{short}</span>
-          <button onClick={() => api?.previewFile?.(filePath)} title={i18nT('apps.mochi.chatPanel.preview')} aria-label={i18nT('apps.mochi.chatPanel.preview')} style={{
-            background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
-            color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
-            transition: 'color 0.15s',
-          }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-          ><Eye size={11} /></button>
-          <button onClick={() => api?.revealFile?.(filePath)} title={revealLabel} aria-label={revealLabel} style={{
-            background: 'none', border: 'none', padding: '1px', cursor: 'pointer',
-            color: 'var(--text-muted)', display: 'flex', alignItems: 'center',
-            transition: 'color 0.15s',
-          }}
-            onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--accent)')}
-            onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-muted)')}
-          ><Folder size={11} /></button>
-        </>
-      ) : (
-        <span style={{ color: 'var(--text)', maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-          title={filePath}
-        >{short}</span>
-      )}
-    </span>
-  )
-}
-
-/** Sentinel standing in for the tool name while the sentence is translated.
- *  U+0000 cannot occur in a catalog value, so the split is unambiguous. */
-const TOOL_SLOT = '\u0000'
-
-/**
- * Render an already-translated sentence with the tool name as a styled `<code>`.
- *
- * The sentence used to be two keys with the tool wedged between them
- * ("Wants to run" + tool + "— OK?"), which forces every language into English
- * word order and gives a translator two fragments neither of which is a
- * sentence. It is now ONE key with a `{{tool}}` placeholder the translation may
- * put anywhere; interpolating a sentinel and splitting on it recovers the
- * `<code>` styling without handing the layout back to the code.
- *
- * The caller passes the RESOLVED string, not the key: `check-i18n-keys.mjs`
- * resolves file-scope literals only, so a key arriving as a parameter is a key
- * the gate cannot verify — which would exempt this whole file from every i18n
- * check. Same reason `i18nKeys.ts` indexes its maps inside the `i18nT(...)` call.
- */
-function renderAroundTool(sentence: string, tool: string): React.ReactNode {
-  const [before, after = ''] = sentence.split(TOOL_SLOT)
-  return (
-    <>
-      {before}
-      <code style={{ background: 'var(--bg-input)', borderRadius: 3, padding: '1px 4px', fontSize: 11 }}>{tool}</code>
-      {after}
-    </>
-  )
-}
-
-/** The payload the approval route writes after the `__approval__` marker. */
-interface ApprovalPayload {
-  id: string
-  tool: string
-  toolInput?: string
-  /** Normalized command, for a grant scoped to exactly this command. */
-  fullCommand?: string
-  /** Comma-joined base binaries ("cat,wc"), for a grant scoped to the family. */
-  baseCommand?: string
-  /** Server proof that this pending card may create a durable trust grant. */
-  trustGrantable?: boolean
-}
-
-/** Parse an approval payload, or null when the text is not really one of ours.
- *
- *  Shape-checked, not just JSON-checked: `__approval__"hi"` parses to a string, and
- *  reading `.tool` off it would render `undefined` into the bubble instead of the
- *  message the user typed.
- */
-export function parseApproval(raw: string): ApprovalPayload | null {
-  try {
-    const parsed = JSON.parse(raw)
-    if (!parsed || typeof parsed !== 'object') return null
-    const { id, tool } = parsed as Record<string, unknown>
-    if (typeof id !== 'string' || typeof tool !== 'string') return null
-    return parsed as ApprovalPayload
-  } catch {
-    return null
-  }
-}
-
-/**
- * Whether an EXTERNAL approval resolution (dashboard / Slack / another surface)
- * was an approve. Anything that is not an explicit `approved: true` — a reject,
- * a missing flag, a malformed frame — must NOT read as approved: rendering a
- * rejected tool as "Approved" is a fabricated security decision.
- */
-export function externalApprovalApproved(data?: Record<string, unknown>): boolean {
-  return (data as { approved?: unknown } | undefined)?.approved === true
-}
-
-/** Shared look for the scoped-trust rows (full-width, quieter than the verbs). */
-const trustScopeBtnStyle: React.CSSProperties = {
-  background: 'var(--bg-input)',
-  color: 'var(--text)',
-  // Longhand: the shorthand value ('1px solid rgba(...)') reads as prose to the
-  // i18n lint, which scans module constants. Same border, no word to mistake for copy.
-  borderWidth: 1,
-  borderStyle: 'solid',
-  borderColor: 'rgba(255,180,0,0.25)',
-  display: 'inline-flex',
-  alignItems: 'center',
-  gap: 5,
-  borderRadius: 6,
-  padding: '3px 8px',
-  fontSize: 11,
-  cursor: 'pointer',
-  textAlign: 'left',
-}
-
-// Exported for the capture harness (capture/mochi-trust-label.tsx), which mounts
-// the real approval card as screenshot evidence; not part of the app's API.
-export const Bubble = React.memo<{ message: ChatMessage; onOption?: (text: string) => void; onImageClick?: (b64: string) => void; onApproval?: (id: string, action: string, pattern?: string, trustGrantable?: boolean) => void; onEdit?: (content: string) => void; animate?: boolean }>(({ message, onOption, onImageClick, onApproval, onEdit, animate = true }) => {
-  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
-  const mounted = React.useRef(false)
-  const shouldAnimate = animate && !mounted.current
-  const [copied, setCopied] = React.useState(false)
-  // Whether the scoped-trust grants are revealed. Declared here with the other
-  // Bubble state: this component early-returns for several message shapes, so a
-  // hook added lower down would run conditionally.
-  const [trustOpen, setTrustOpen] = React.useState(false)
-  React.useEffect(() => { mounted.current = true }, [])
-
-  const content = message.content.replace(/^\n+/, '')
-
-  // Approval message.
-  //
-  // The prefix is an internal marker the approval route writes, but NOTHING stops a
-  // user typing it: the composer echoes the message locally, so `__approval__x`
-  // reached this parse and the uncaught SyntaxError took the whole panel down to the
-  // error boundary. A payload that does not parse is treated as what it actually is
-  // — ordinary text the user wrote.
-  const approvalReq = content.startsWith('__approval__') ? parseApproval(content.slice(12)) : null
-  if (approvalReq !== null) {
-    const req = approvalReq
-    // A family grant is only offered when it differs from the exact-command
-    // grant — see src/shared/trustPatterns, which must stay equivalent to the
-    // dashboard's TrustDropdown so both surfaces offer the same scopes.
-    const showTrustBase = familyGrantIsDistinct(req.fullCommand, req.baseCommand)
-    const hasTrustScopes = req.trustGrantable === true
-      && (Boolean(req.fullCommand) || showTrustBase)
-    const approvalActions = [
-      ['approve', i18nT('apps.mochi.approval.btn_approve'), '#2e7d32', Check],
-      ...(req.trustGrantable === true
-        ? [[
-          'trust',
-          // With scopes this button only OPENS the tier list, so the bare verb is
-          // right. Without them the same click IS the broadest grant, so the
-          // button must name what it grants: consent has to match the scope, and
-          // an unqualified "Trust" beside one tool reads as trusting that tool.
-          hasTrustScopes
-            ? i18nT('apps.mochi.approval.btn_trust')
-            : i18nT('apps.mochi.approval.trust_all_tools'),
-          '#1565c0',
-          Handshake,
-        ]]
-        : []),
-      ['reject', i18nT('apps.mochi.approval.btn_reject'), '#c62828', Ban],
-    ] as [string, string, string, React.ComponentType<{ size?: number }>][]
-    return (
-      <div style={{ alignSelf: 'flex-start', maxWidth: '85%', animation: shouldAnimate ? 'msgIn 0.25s ease-out' : 'none' }}>
-        <div style={{
-          padding: '8px 10px', borderRadius: '10px 10px 10px 2px',
-          background: 'var(--bubble-assistant)', border: '1px solid rgba(255,180,0,0.3)',
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 12, marginBottom: 4 }}><Wrench size={13} /> <span>{renderAroundTool(i18nT('apps.mochi.approval.inline_ask', { tool: TOOL_SLOT }), req.tool)}</span></div>
-          {req.toolInput && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 6, whiteSpace: 'pre-wrap', fontFamily: 'monospace', background: 'var(--bg-input)', borderRadius: 4, padding: 4 }}>{req.toolInput}</div>}
-          <div style={{ display: 'flex', gap: 6 }}>
-            {/* The icon is a component, not a glyph inside the translated
-                string: an emoji in the copy can't follow the theme, renders at
-                whatever size the font picks, and has to be repeated in every
-                locale (AGENTS.md: emoji-as-icon is a bug). */}
-            {approvalActions.map(
-              ([action, label, bg, Icon]) => (
-              <button
-                key={action}
-                // Trust is a SCOPE choice, not one verb. Tapping it reveals the
-                // grants inline (see below) instead of firing the broadest one.
-                // The action exists only when the gateway supplied grant proof;
-                // a proven but scopeless card remains a direct broad action.
-                onClick={() => {
-                  if (action === 'trust' && hasTrustScopes) { setTrustOpen(v => !v); return }
-                  onApproval?.(req.id, action, undefined, req.trustGrantable === true)
-                }}
-                aria-expanded={action === 'trust' && hasTrustScopes ? trustOpen : undefined}
-                style={{
-                background: bg, color: '#fff', border: 'none', display: 'inline-flex',
-                alignItems: 'center', gap: 4,
-                borderRadius: 6, padding: '3px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
-              }}
-              ><Icon size={12} />{label}{action === 'trust' && hasTrustScopes ? (trustOpen ? <ChevronDown size={10} /> : <ChevronRight size={10} />) : null}</button>
-            ))}
-          </div>
-          {/* Scoped trust grants, narrowest first — mirroring the dashboard's
-              TrustDropdown so the pet is not stuck with only the widest grant.
-              Rendered inline rather than in a portaled menu: this panel is a
-              ~380px frameless always-on-top window, where a portaled dropdown
-              clips at the window edge. */}
-          {trustOpen && hasTrustScopes && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginTop: 6 }}>
-              {req.fullCommand && (
-                <button
-                  onClick={() => onApproval?.(req.id, 'trust_command', req.fullCommand, true)}
-                  // The untruncated command as a tooltip: the label is budget-clamped,
-                  // and this grant is an exact-string match, so the user must be able
-                  // to read the whole thing before agreeing to it.
-                  title={req.fullCommand}
-                  style={trustScopeBtnStyle}
-                ><Shield size={11} style={{ flexShrink: 0 }} />
-                  {/* The label WRAPS rather than ellipsizing: the panel column
-                      (~240px of text) shows only ~28 chars per line, so a CSS
-                      ellipsis would re-collide the very labels the 64-char budget
-                      distinguishes. minWidth:0 lets the flex item shrink;
-                      overflowWrap:'anywhere' lets an unbreakable run (a sha, a
-                      base64 arg) wrap instead of clipping past the panel edge.
-                      whiteSpace:'pre-wrap' because the default COLLAPSES runs of
-                      whitespace, which for an exact-string grant is an elision
-                      one character wide: `grep "a  b" f` would render as
-                      `grep "a b" f` while granting the two-space string. The
-                      budget clamp above is a layout decision for this narrow
-                      column; collapsing whitespace earns nothing anywhere. */}
-                  <span style={{ minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>
-                    {i18nT('apps.mochi.approval.trust_this_command', { cmd: truncateCommandLabel(req.fullCommand) })}
-                  </span></button>
-              )}
-              {showTrustBase && (
-                <button
-                  onClick={() => onApproval?.(req.id, 'trust_base', trustBasePattern(req.baseCommand ?? ''), true)}
-                  style={trustScopeBtnStyle}
-                ><ShieldPlus size={11} />{i18nT('apps.mochi.approval.trust_all_base', { base: (req.baseCommand ?? '').split(',').join(', ') })}</button>
-              )}
-              <button
-                onClick={() => onApproval?.(req.id, 'trust', undefined, true)}
-                style={trustScopeBtnStyle}
-              ><ShieldCheck size={11} />{i18nT('apps.mochi.approval.trust_all_tools')}</button>
-            </div>
-          )}
-          {req.trustGrantable === true && !hasTrustScopes && (
-            // This hint renders ONLY on the scopeless path, where the button
-            // grants the whole session. It therefore describes the session and
-            // names no tool: naming the pending tool understates the grant.
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 5 }}>
-              {i18nT('apps.mochi.approval.trust_hint')}
-            </div>
-          )}
-        </div>
-      </div>
-    )
-  }
-
-  const optMatch = content.match(/\[options:\s*(.+?)\]\s*$/i)
-  const text = optMatch ? content.slice(0, optMatch.index).trimEnd() : content
-  const options = optMatch ? optMatch[1].split('|').map(o => o.trim()).filter(Boolean) : []
-  const isUser = message.role === 'user'
-
-  // Nothing to draw -> draw nothing.
-  //
-  // A turn whose text is only markup (a lone `<br>`, or whitespace) used to
-  // produce a bubble with an empty body and a timestamp. It was masked while raw
-  // HTML rendered as literal text -- you saw "<br>" and read it as a glitch in a
-  // real message -- and became a visibly blank bubble once the markdown pipeline
-  // started honouring the tag. Attachments, options and widgets each count as
-  // content, so only a genuinely empty message is dropped.
-  const hasVisibleText = text.replace(/<[^>]*>/g, '').trim() !== ''
-  // Bound to a const so the narrowing survives into the click handler below, which
-  // is a closure and would otherwise see the optional field again.
-  const shot = message.screenshot
-  const hasOtherContent =
-    options.length > 0 ||
-    !!shot ||
-    text.includes('![') ||
-    hasWidgets(text)
-  if (!hasVisibleText && !hasOtherContent) return null
-
-  return (
-    <div className="msg-bubble" style={{ alignSelf: isUser ? 'flex-end' : 'flex-start', maxWidth: '85%', width: isUser ? 'fit-content' : undefined, display: 'flex', flexDirection: 'column', alignItems: isUser ? 'flex-end' : 'flex-start', animation: shouldAnimate ? 'msgIn 0.25s ease-out' : 'none' }}>
-      {/* Bubble with tail */}
-      <div style={{ position: 'relative', display: 'inline-block', maxWidth: '100%' }}>
-        <div style={{
-          padding: '6px 10px',
-          borderRadius: isUser ? '10px 10px 2px 10px' : '10px 10px 10px 2px',
-          background: isUser ? 'var(--bubble-user)' : 'var(--bubble-assistant)',
-        }}>
-          {shot && (
-            // A real <button>, not a clickable <img>: the bubble caps the image at
-            // 200px, so opening it full size is a CONTROL and must be tab-reachable
-            // and Enter/Space-activated. Zero chrome and the same width bounds as the
-            // image had, so the thumbnail is unchanged; the button carries the
-            // accessible name, hence the empty alt.
-            <button type="button" onClick={() => onImageClick?.(shot)}
-              aria-label={i18nT('apps.mochi.chatPanel.open_image')}
-              style={{ display: 'block', width: '100%', maxWidth: 200, padding: 0, border: 'none', background: 'none', cursor: 'zoom-in' }}>
-              <img src={`data:image/png;base64,${shot}`} alt=""
-                style={{ width: '100%', borderRadius: 4, marginBottom: 4, cursor: 'zoom-in' }} />
-            </button>
-          )}
-          <div style={{ wordBreak: 'break-word', fontSize: 12, lineHeight: 1.4, overflow: 'hidden' }}>
-            {isUser
-              ? <span style={{ whiteSpace: 'pre-wrap' }}>
-                  {text.split(/\n/).map((line, i) => {
-                    // Detect markdown image syntax: ![...](path). The path may
-                    // be mdImageDest's `<…>`-wrapped form (attachmentLines in
-                    // composerDrop routes uploads through it) — resolve it with
-                    // the shared wrap-aware inverse; unwrapped legacy paths
-                    // are preserved verbatim (issue #3497).
-                    const mdImgMatch = line.match(/^!\[[^\]]*\]\((.+)\)$/)
-                    if (mdImgMatch) {
-                      return <LocalImage key={i} path={mdImageDestToPath(mdImgMatch[1])} onClickImage={onImageClick} />
-                    }
-                    // Detect bare image file paths — line starts with / and ends with image extension.
-                    const trimmed = line.trim()
-                    if (trimmed.startsWith('/') && /\.(?:png|jpg|jpeg|gif|webp)$/i.test(trimmed)) {
-                      return <LocalImage key={i} path={trimmed} onClickImage={onImageClick} />
-                    }
-                    return <React.Fragment key={i}>{i > 0 && '\n'}{line}</React.Fragment>
-                  })}
-                </span>
-              : (() => {
-                  // Extract image paths from markdown ![](path) and bare /path.png references.
-                  // Paths may contain spaces so match broadly: / ... .ext
-                  const imgRe = /!\[[^\]]*\]\(`?(\/[^`\n]+\.(?:png|jpg|jpeg|gif|webp))`?\)/gi
-                  const images: string[] = []
-                  let cleanText = text.replace(imgRe, (_, p) => { images.push(p.trim()); return '' })
-                  const bareRe = /`?(\/[^`\n]+\.(?:png|jpg|jpeg|gif|webp))`?/gi
-                  cleanText = cleanText.replace(bareRe, (_, p) => { images.push(p.trim()); return '' }).trim()
-
-                  // Render mcwidget blocks inline
-                  if (hasWidgets(cleanText)) {
-                    const segments = parseWidgets(cleanText)
-                    return <>
-                      {segments.map((seg, i) => seg.type === 'widget'
-                        ? <WidgetFrame key={i} html={seg.content} title={seg.title} />
-                        : <Markdown key={i} remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(seg.content)}</Markdown>
-                      )}
-                      {images.map((p, i) => <LocalImage key={`img-${i}`} path={p} onClickImage={onImageClick} />)}
-                    </>
-                  }
-
-                  return <>
-                    {cleanText && <Markdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={mdComponents}>{capWhitespaceRuns(cleanText)}</Markdown>}
-                    {images.map((p, i) => <LocalImage key={i} path={p} onClickImage={onImageClick} />)}
-                  </>
-                })()
-            }
-          </div>
-          {options.length > 0 && onOption && (
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 6 }}>
-              {options.map((opt) => (
-                <button key={opt} onClick={() => onOption(opt)} style={{
-                  background: 'var(--accent-glow)', border: '1px solid var(--border-focus)',
-                  borderRadius: 6, padding: '3px 10px', color: 'var(--accent)', fontSize: 11,
-                  cursor: 'pointer',
-                }}>{opt}</button>
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-      {/* Timestamp + copy/edit */}
-      {message.timestamp > 0 && (
-        <div style={{
-          fontSize: 10, color: 'var(--text-faint)', marginTop: 2,
-          display: 'flex', alignItems: 'center', gap: 4,
-          justifyContent: isUser ? 'flex-end' : 'flex-start',
-          paddingLeft: isUser ? 0 : 4, paddingRight: isUser ? 4 : 0,
-        }}>
-          {isUser && onEdit && (
-            <button
-              className="copy-md-btn"
-              onClick={() => onEdit(message.content)}
-              title={i18nT('apps.mochi.chatPanel.edit_resend')}
-              aria-label={i18nT('apps.mochi.chatPanel.edit_resend')}
-              style={{
-                background: 'none', border: 'none', padding: '2px 3px',
-                cursor: 'pointer', color: 'var(--text-faint)',
-                opacity: 0, transition: 'opacity 0.15s, transform 0.15s',
-                lineHeight: 1, display: 'flex', alignItems: 'center',
-                borderRadius: 3,
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.transform = 'scale(1.2)'; e.currentTarget.style.color = 'var(--text-muted)' }}
-              onMouseLeave={(e) => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.color = 'var(--text-faint)' }}
-            ><SquarePen size={11} /></button>
-          )}
-          <span>{relativeTime(message.timestamp)}</span>
-          {!isUser && (
-            <button
-              className="copy-md-btn"
-              onClick={() => {
-                copyToClipboard(text).then((ok) => {
-                  if (!ok) return
-                  setCopied(true)
-                  setTimeout(() => setCopied(false), 1500)
-                })
-              }}
-              title={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}
-              aria-label={copied ? i18nT('apps.mochi.chatPanel.copied') : i18nT('apps.mochi.chatPanel.copy_markdown')}
-              style={{
-                background: 'none', border: 'none', padding: '2px 3px',
-                cursor: 'pointer', color: copied ? 'var(--accent)' : 'var(--text-faint)',
-                opacity: copied ? 1 : 0, transition: 'opacity 0.15s, transform 0.15s, color 0.15s',
-                lineHeight: 1, display: 'flex', alignItems: 'center',
-                borderRadius: 3,
-              }}
-              onMouseEnter={(e) => { e.currentTarget.style.transform = 'scale(1.2)'; e.currentTarget.style.color = 'var(--text-muted)' }}
-              onMouseLeave={(e) => { e.currentTarget.style.transform = 'scale(1)'; e.currentTarget.style.color = copied ? 'var(--accent)' : 'var(--text-faint)' }}
-            >{copied
-              ? <Check size={12} strokeWidth={2.5} />
-              : <Copy size={12} />
-            }</button>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}, (prev, next) => prev.message.id === next.message.id && prev.message.content === next.message.content && prev.animate === next.animate)
 
 function bStyle(role: string): React.CSSProperties {
   return {
@@ -2309,24 +1548,6 @@ function bStyle(role: string): React.CSSProperties {
     alignSelf: role === 'user' ? 'flex-end' : 'flex-start',
     background: role === 'user' ? 'var(--bubble-user)' : 'var(--bubble-assistant)',
   }
-}
-
-function relativeTime(ts: number): string {
-  // The active locale is already a BCP-47 tag, which is what Intl wants. The
-  // language-NAME mapper this replaced existed only because the setting used to
-  // hold 'English'/'Chinese' rather than a code.
-  const locale = i18next.language || 'en'
-  const diff = Math.floor((Date.now() - ts) / 1000)
-  const rtf = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' })
-  if (Math.abs(diff) < 10) return rtf.format(0, 'second')
-  if (Math.abs(diff) < 60) return rtf.format(-diff, 'second')
-  const mins = Math.floor(diff / 60)
-  if (mins < 60) return rtf.format(-mins, 'minute')
-  const hrs = Math.floor(mins / 60)
-  if (hrs < 24) return rtf.format(-hrs, 'hour')
-  const days = Math.floor(hrs / 24)
-  if (days < 7) return rtf.format(-days, 'day')
-  return new Intl.DateTimeFormat(locale, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(ts)
 }
 
 

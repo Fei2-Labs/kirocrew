@@ -6,9 +6,12 @@ This module owns three endpoints. `GET /api/file-search` finds files and
 directories by NAME and backs the `@`-mention picker; `POST /api/file-grep` finds
 them by CONTENT and backs the chat side panel's Files tab; `GET /api/path-complete`
 lists ONE directory level and backs the composer's shell-style `./` completion.
-They share `handlers/files.py`, the sensitive-path fence and the off-loop probe
-discipline, and nothing else: separate roots, separate budgets, separate result
-shapes.
+They share the `handlers/files.py` facade (the routes' import path and patch
+surface), the `_run_path_probe` chokepoint (`dashboard/file_api/path_probe.py`),
+the sensitive-path fence and the off-loop probe discipline, and nothing else:
+separate roots, separate budgets, separate result shapes. Each endpoint's code
+lives in its own `dashboard/file_api/` owner: `search.py`, `path_complete.py`, and
+`grep.py` for the grep route and the engines behind it.
 
 File search backs the `@`-mention picker in the dashboard chat composer. A user types `@` followed by a query that meets the endpoint minimum, picks a result, and the composer inserts a token that serializes into the prompt as an attachment marker; `test_short_query_returns_empty` pins the minimum-query refusal.
 
@@ -25,6 +28,16 @@ Results cover both **files** and **directories**. A file is an attachment whose 
 | `workspace` | no | Workspace name resolved through `workspace_dir_for` only when `project` is absent. A missing workspace does not establish scope, so `api_file_search` uses its fallback roots. |
 | `kinds` | no | `all` (default), `files`, or `dirs`. Unrecognized values fall back to `all`. |
 | `limit` | no | Result page size. `api_file_search` normalizes it to a positive server ceiling; invalid input uses the default. The ceiling is load-bearing because candidate collection scales with the requested page size; `test_limit_clamped_at_server_ceiling`, `test_limit_non_integer_falls_back_to_default`, and `test_limit_negative_or_zero_clamped_to_floor` pin the contract. |
+
+The route is owner-only: `require_owner_dashboard_request` runs first and refuses
+anyone else (403 `owner_only`, or 401 for a stale pre-owner session), because
+`project` names any directory on the host. A
+sensitive `project` is 403 `{"error": "Access denied", "code": "access_denied"}`; a
+`project` that is not a directory is 404
+`{"results": [], "error": "Project directory not found", "code": "project_not_found"}`.
+The short-query exit and the missing-project exit each write an `allowed` SEL
+record (`_audit_file_search_exit`), so a granted request never ends at the gate
+unrecorded; `test_file_search.py` and `test_owner_gate_file_readers.py` pin both.
 
 Response:
 
@@ -315,7 +328,26 @@ across slot switches and reloads for free. The chip's remove control strips
 exactly its token (boundary-checked, so a longer sibling token survives).
 Picker-picked FILES record their inserted `@rel` token too, and the file
 chip's remove strips it — the same remove contract for both chip kinds.
+The file's recorded token outlives that remove until the next send, so an
+undo that brings the token back re-stages the file and a redo unstages it
+again. The remove asks the same revival question the reconciliation asks:
+when a leftover in the stripped text would re-stage the removed file, the
+record is dropped; a leftover the reconciliation ignores, such as an old
+project's spelling, keeps it.
+The recorded tokens are persisted per slot beside the staged files
+(`chatFileTokenDrafts`, sessionStorage), so a chip restored after a reload
+keeps them and behaves like one picked in the current page.
 Uploaded/dropped files have no token and keep a state-only remove.
+
+A file chip is kept in step with its mention text in both directions
+(`website/src/pages/chat/page/composerFileMentions.ts`). The file tree's "Add to
+chat" (context menu or drop) inserts the `@rel` mention at the caret, never
+inside another token. Deleting a mention by hand unstages its file chip, and
+restoring that exact text re-stages it. Only the EXACT aliases a pick recorded
+count as the file's mention: a shortened or re-derived spelling, or a path
+suffix shared with another file, is ordinary text, so it unstages the chip.
+Folder tokens, file mentions and the chip removes all use the one
+mention-boundary grammar in `website/src/utils/fileTokens.ts`.
 
 **Wire.** On send, each `@rel/` token is rewritten in the
 LLM-facing text to `[attached_dir N] /abs/path` — absolute via the slot's
@@ -329,6 +361,22 @@ no backend change is involved. Steer deliberately does NOT serialize: its
 transport is text-only (no meta), so a marker would have no `meta.dirs` index
 to replay against and a spaced path would truncate under the `\S+` fallback —
 the raw `@rel/` token stays correct there.
+
+**Inline file markers.** A picked file mention woven into a sentence is
+rewritten in place to `[attached_file N] /abs/path`. When a marker's neighbour
+is not whitespace (an opening wrapper before it, or `)` or `,` right after the
+path), or is itself a U+200A the user typed, the serializer inserts a hair
+space (U+200A, `MARKER_TRAILER_SEP` in `utils/fileTokens.ts`) on that side.
+A lone U+200A beside a marker is therefore always generated: when the user
+typed one there, theirs is the second, and the single drop never reaches it.
+This keeps the path
+whitespace-terminated for readers that take it as the `\S+` run after the
+marker, and keeps the marker whitespace-preceded for readers that anchor on
+whitespace before `[attached_file`. Every marker reader must treat U+200A as
+whitespace. The renderer and the prompt preview drop exactly the separators
+beside a marker and leave every other U+200A alone. The backend readers are
+pinned by `test/test_attachment_marker_grammar_pin.py`, and a new reader must
+honour the same grammar.
 
 **Render.** `resolveDirSegment` (in `utils/fileTokens.ts`, which owns the
 attachment-marker wire format for files and folders alike) rewrites markers
@@ -351,15 +399,32 @@ shows literally — the same trade-off inline file mentions make.
 
 | File | Role |
 |---|---|
-| `src/kiro_crew/dashboard/handlers/files.py` | `api_file_search` endpoint, fuzzy scorer, walk fallback; `api_file_grep` endpoint, rg argv + stdin pattern channel, python fallback, document pass |
+| `src/kiro_crew/dashboard/handlers/files.py` | Facade the routes bind |
+| `src/kiro_crew/dashboard/file_api/path_probe.py` | `_run_path_probe`, the bounded off-loop probe chokepoint |
+| `src/kiro_crew/dashboard/file_api/search.py` | `api_file_search` endpoint, fuzzy scorer, walk fallback |
+| `src/kiro_crew/dashboard/file_api/path_complete.py` | `api_path_complete` endpoint, lexical containment walk, no-follow per-component open |
+| `src/kiro_crew/dashboard/file_api/grep.py` | `api_file_grep` endpoint; rg argv + stdin pattern channel, python fallback, document pass |
 | `website/src/pages/chat/FileBrowserRail.tsx` | Files tab: Name/Content toggle, result rows, status row |
 | `website/src/api/fileGrep.ts` | `/api/file-grep` client and result types |
 | `src/kiro_crew/dashboard/file_index.py` | `FileIndex`, `FileIndexRegistry` |
-| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode` |
+| `website/src/components/FilePickerMenu.tsx` | Picker UI, `kind` propagation, trailing-slash insertion, `pathMode`, `pathTail` (rows show their root-relative folder cut from the start, so same-named results stay distinguishable in a narrow menu; `ChatEmbed` opts in, the dashboard keeps the full path cut at the end) |
 | `website/src/components/composerTokens.ts` | Caret-relative `@` / `$` / `./` token matchers and the shared token replace |
-| `website/src/components/ChatInput.tsx` | Composer wiring, pending file/folder preview strip |
+| `website/src/components/ChatInput.tsx` | Composer wiring: mounts the trigger pickers and the preview strip |
+| `website/src/chat-core/composer/pickers.ts` | Which trigger picker the text at the caret opens (`@` / `$` / `./` / `/`), one rule for the textarea and the Lexical editor; store-free, shared by `ChatInput` and `ChatEmbed` |
+| `website/src/chat-core/composer/PickerMenus.tsx` | The `@` file picker, the `./` path picker (`pathMode`) and the `$` / `/` menus, anchored to the composer |
+| `website/src/chat-core/composer/pickerSource.ts` | Where the menus read from; a read the host's source does not carry is a menu not mounted |
+| `website/src/components/dashboardPickerSource.ts` | The dashboard's source: its api client, under the query keys the dashboard already uses |
+| `website/src/app-sdk/embedPickerSource.ts` | `ChatEmbed`'s source: the app's scoped client, with a read only for an endpoint the app declared |
+| `website/src/components/chat-input/FilePreviewStrip.tsx` | Pending file/folder preview strip: basename-first folder labels, per-tile remove |
 | `website/src/utils/fileTokens.ts` | Attachment-marker owner: file AND dir token parse/serialize/resolve |
-| `website/src/pages/ChatPage.tsx` | Token-derived staging and send/steer serialization |
+| `website/src/utils/chatFileTokenDrafts.ts` | Per-slot persistence of file-chip aliases beside the staged-file drafts |
+| `website/src/chat-core/composer/outgoingTurn.ts` | Send and steer serialization: `[attached_dir N]` + `meta.dirs` on a send, `@rel/` kept on the text-only steer |
+| `website/src/pages/ChatPage.tsx` | The host that composes the owners below |
+| `website/src/pages/chat/page/composerSend.ts` | Sends the outgoing turn (`buildOutgoingTurn`, `sendTurn`) |
+| `website/src/pages/chat/page/composerStaging.ts` | Staged-resource state; folder chips derived from `@rel/` tokens (`useStagedFolderRefs`) |
+| `website/src/pages/chat/page/composerFileMentions.ts` | Caret mention insertion, file-chip ↔ alias reconciliation, chip remove and its undo |
+| `website/src/pages/chat/page/composerDrafts.ts` | Per-slot draft stores, including the picked-file aliases, and their slot-switch save/restore |
+| `website/src/pages/chat/page/busyTurnControls.ts` | Steer: hands the composer to the outgoing turn |
 | `website/src/pages/chat/ChatPageMessageContent.tsx` | User-message folder marker resolution and inline folder chips |
 
 ## Tests
@@ -367,7 +432,9 @@ shows literally — the same trade-off inline file mentions make.
 | File | Coverage |
 |---|---|
 | `test/test_file_search.py` | Endpoint behaviour, scoring, exclusions |
+| `test/test_dashboard_files_composition_contract.py` | The `files.py` facade's surface and patch reach over the `file_api` owners, and the guards that read them |
 | `test/test_path_complete.py` | Directory listing, prefix + dot-entry rules, cap, the containment refusals (`../` escape, absolute `dir`, symlink out, an entry pointing out), the re-entering `../` run, and the swap-after-validation race |
+| `website/src/test/ChatInput.refactor.pickers.test.tsx` | The same `@` / `$` / `./` / `/` trigger decision from the textarea and from the Lexical change callback, and the caret each publishes |
 | `website/src/test/ChatInput.pathTrigger.test.tsx` | The `./` trigger: scoping per token, Tab/Enter accept, directory re-open, the debounce and placeholder windows (an accepted row is always rebuilt on the prefix that produced it), the out-of-project empty state, Escape, no `~/`, no menu without a project |
 | `website/src/test/composerTokens.test.ts` | Token matchers and detection↔insertion span agreement |
 | `test/test_file_grep.py` | Engine parity, the stdin pattern channel, anchored exclusions, deadline-bounded extraction, row redaction |
@@ -378,5 +445,8 @@ shows literally — the same trade-off inline file mentions make.
 | `website/src/test/FilePickerMenu.dirs.test.tsx` | Folder rows, selection payloads, trailing slash |
 | `website/src/test/ChatInput.dirStripHeight.test.tsx` | Preview-strip height compensation for a folders-only strip |
 | `website/src/test/fileTokens.dirs.test.ts` | Token parse/serialize/resolve units, label widening, lossless spaced paths |
+| `website/src/chat-core/composer/outgoingTurn.test.ts` | Send and steer serialization at the turn: `[attached_dir N]` + `meta.dirs[N-1]` resolved against the project on a send, `@rel/` kept on a steer |
 | `website/src/test/ChatPage.dirStaging.test.tsx` | Token-derived staging, per-slot draft survival, remove parity, send serialization + `meta.dirs` |
+| `website/src/test/ChatPage.chipUndo.test.tsx` | File-chip remove then undo/redo: attachment restored and sent, removed again, duplicate-token, prefix-sibling, old-project-alias, after-reload and post-send cases |
+| `website/src/test/chatFileTokenDrafts.test.ts` | Alias-draft roundtrip and corruption guard |
 | `website/src/test/renderUserContent.dirs.test.tsx` | Bubble chips: fresh, replay, mixed file+dir, paste-adjacent |

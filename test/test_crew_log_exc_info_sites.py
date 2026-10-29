@@ -39,8 +39,7 @@ SOURCE_ROOT = Path(kiro_crew.__file__).parent
 # CrewLog.open(...)``) fails it too; the list is not the only guard.
 VETTED: frozenset[tuple[str, str]] = frozenset(
     {
-        ("checkpoint.py", "_save_one"),
-        ("emit.py", "_reap_child_origin"),
+        ("emit_runtime.py", "_reap_child_origin"),
         ("holders.py", "holders"),
         ("read.py", "dispatch_view"),
         ("session_tree.py", "reading"),
@@ -49,21 +48,31 @@ VETTED: frozenset[tuple[str, str]] = frozenset(
         # committed: the module names no handle at all, opens none, and takes none as a
         # parameter, so no frame OF ITS OWN holds one -- which is why the no-handle check
         # skips the file and each site is listed here. What its own frames cannot say is
-        # who CALLED them: ``record_opened`` and ``_schedule_checkpoint`` (through
-        # ``apply``) run under the emitter's edge recorder, whose ``log`` is a live
-        # handle, and a retained traceback reaches that frame through ``f_back``. Those
-        # two render to text and are NOT here. The six below are reached only from the
-        # dashboard's seed (``ensure_seeded`` and the two it calls), the maintenance
-        # pool's debounced write (``_save_checkpoint``), or ``store.remove_unit`` (the two
-        # retention doors), none of which hold a handle.
-        ("session_tree_projection.py", "_load_checkpoint"),
-        ("session_tree_projection.py", "_replay_tail"),
-        ("session_tree_projection.py", "_save_checkpoint"),
-        ("session_tree_projection.py", "ensure_seeded"),
+        # who CALLED them: ``record_opened``, ``record_adopted``, ``record_released`` and
+        # ``_schedule_checkpoint`` (through ``apply`` and ``apply_edge``) run under the
+        # emitter's edge recorder, whose ``log`` is a live handle, and a retained
+        # traceback reaches that frame through ``f_back``. Those four render to text and
+        # are NOT here. The five below are reached only from the dashboard's seed
+        # (``ensure_seeded`` and the two it calls), the maintenance pool's debounced write
+        # (``_save_checkpoint``), or ``store.remove_unit`` (the two retention doors), none
+        # of which hold a handle.
         ("session_tree_projection.py", "forget_unit"),
+        ("session_tree_projection.py", "reconcile_unit_edge"),
         ("session_tree_projection.py", "retract_unit_parent"),
-        ("store.py", "remove_unit"),
-        ("store.py", "sweep_expired"),
+        ("session_tree_projection_checkpoint.py", "_load_checkpoint"),
+        ("session_tree_projection_checkpoint.py", "_save_checkpoint"),
+        ("session_tree_projection_seed.py", "_replay_tail"),
+        ("session_tree_projection_seed.py", "ensure_seeded"),
+        ("store_removal.py", "remove_unit"),
+        ("store_retention.py", "sweep_expired"),
+        # The OTel roots gauge's collect-time read, run on the SDK's own collection
+        # thread -- never the emitter's writer frame. It names no handle, opens none,
+        # and takes none: it reads only the in-memory session-tree projection (a pure
+        # fold over records another writer committed), so no frame of its own holds a
+        # handle and no caller of its own does either. Its ``exc_info`` log pins no
+        # lease, which is why it joins the list with the same standing as the
+        # projection's own in-memory reads above.
+        ("otel_session_tree_roots.py", "read_roots_with_children"),
     }
 )
 
@@ -139,31 +148,39 @@ def test_the_exc_info_sites_left_in_crew_log_are_exactly_the_vetted_ones() -> No
     )
 
 
-def test_every_log_parameter_of_the_emitter_is_annotated_as_a_handle() -> None:
+def test_every_log_parameter_in_the_package_is_annotated() -> None:
     """The annotation IS the guard, so it is pinned on its own.
 
     The no-handle check above decides whether a frame can hold a handle by reading names,
     and a parameter annotated ``Any`` is invisible to it: erode ``log: CrewLog`` back to
     ``log: Any`` and a restored ``exc_info=True`` in that function passes the check again
-    with nothing else going red. In ``emit.py`` every parameter named ``log`` is the open
-    crew log handed down from the writer job, so each one must name the handle type --
-    the module-level import is ``TYPE_CHECKING``-only, so this costs the boot path nothing.
+    with nothing else going red. So every parameter named ``log`` in the package -- the
+    emitter, its writer and turn tracker, the store and the folds alike -- must say what it
+    is: a handle type, which the check above then sees, or a ``logging.Logger``, which is
+    explicitly not one. The modules import the handle type under ``TYPE_CHECKING`` only, so
+    this costs the boot path nothing.
     """
-    source = (PACKAGE / "emit.py").read_text(encoding="utf-8")
-    tree = ast.parse(source, filename="emit.py")
-    untyped: list[tuple[str, int]] = []
-    seen = 0
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
-            if arg.arg != "log":
+    untyped: list[tuple[str, str, int]] = []
+    seen: dict[str, int] = {}
+    for path in sorted(PACKAGE.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=path.name)
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            seen += 1
-            if arg.annotation is None or not _mentions_handle(arg.annotation):
-                untyped.append((fn.name, fn.lineno))
-    assert seen >= 5, f"walk found only {seen} 'log' parameters in emit.py; expected five"
+            for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
+                if arg.arg != "log":
+                    continue
+                seen[path.name] = seen.get(path.name, 0) + 1
+                annotation = "" if arg.annotation is None else ast.unparse(arg.annotation)
+                is_logger = annotation in {"logging.Logger", "Logger"}
+                if not is_logger and (
+                    arg.annotation is None or not _mentions_handle(arg.annotation)
+                ):
+                    untyped.append((path.name, fn.name, fn.lineno))
+    assert (
+        sum(n for name, n in seen.items() if name == "emit.py" or name.startswith("emit_")) >= 5
+    ), f"walk found only {seen} 'log' parameters; expected five in emit.py and its owners"
     assert not untyped, (
-        "a 'log' parameter in emit.py is not annotated as a CrewLog, so the no-handle check "
-        f"cannot see that its frame holds a handle: {untyped}"
+        "a 'log' parameter is annotated neither as a CrewLog nor as a logging.Logger, so the "
+        f"no-handle check cannot tell whether its frame holds a handle: {untyped}"
     )

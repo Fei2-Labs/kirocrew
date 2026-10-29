@@ -47,10 +47,12 @@ import test_sandbox_off_loop as sandbox
 import test_session_map_locking as session_map
 from source_corpus import (
     candidate_sources,
+    iter_candidate_sources,
+    iter_source_texts,
+    iter_statements,
     repo_files,
     repo_files_named,
     repo_root,
-    source_texts,
     src_root,
     unreadable_files,
 )
@@ -340,19 +342,26 @@ def _unencodable_docstrings(sources: Sequence[tuple[Path, str]]) -> list[tuple[P
 
 
 class TestCorpusHealth:
-    """A stale or empty corpus is the one failure that makes every gate green."""
+    """A stale or empty corpus is the one failure that makes every gate green.
+
+    Streamed, not materialised. ``source_texts()`` holds ~130 MB of ``str`` for as
+    long as its tuple lives, and one comparison written as two of them at once
+    measured at +264 MiB of resident memory -- the very high-water mark the corpus
+    module exists to keep off every gate. So each pin below walks the iterator
+    the gates walk and keeps a count, a path set or two texts, never the tree.
+    """
 
     def test_the_corpus_is_not_empty_or_stale(self):
-        texts = source_texts()
-        assert len(texts) >= _MIN_FILES, (
-            f"source_corpus returned {len(texts)} files; every whole-tree ratchet "
+        count = sum(1 for _pair in iter_source_texts())
+        assert count >= _MIN_FILES, (
+            f"source_corpus returned {count} files; every whole-tree ratchet "
             "reads this, so a short corpus makes all of them pass while blind."
         )
 
     def test_every_file_is_python_under_the_package(self):
         root = src_root()
         assert (root / "security" / "__init__.py").is_file(), f"{root} is not the kiro_crew package"
-        for path, _text in source_texts():
+        for path, _text in iter_source_texts():
             assert path.suffix == ".py"
             assert path.is_relative_to(root)
 
@@ -385,14 +394,43 @@ class TestCorpusHealth:
 
     def test_sources_are_the_real_file_contents(self):
         """Pins the read, not just the count: a corpus of empty strings is worse."""
-        by_name = {path.name: text for path, text in source_texts()}
-        by_rel = {path.relative_to(src_root()).as_posix(): text for path, text in source_texts()}
-        assert "def redact" in by_rel["security/__init__.py"]
-        assert "def batched_save" in by_name["session_map.py"]
+        root = src_root()
+        wanted = {
+            "security/text_redaction.py": "def redact",
+            "session_map_store.py": "def batched_save",
+        }
+        seen: dict[str, str] = {}
+        for path, text in iter_source_texts():
+            for key in (path.relative_to(root).as_posix(), path.name):
+                if key in wanted:
+                    seen[key] = text
+        assert set(seen) == set(wanted), f"corpus is missing {set(wanted) - set(seen)}"
+        for key, marker in wanted.items():
+            assert marker in seen[key], f"{key} did not read as the real file"
 
     def test_a_filter_returns_a_subset_and_no_filter_returns_everything(self):
-        assert set(candidate_sources(blocking._REQUIRE_ALL)) <= set(source_texts())
-        assert candidate_sources() == source_texts()
+        """The filter is a subset of the corpus; an empty filter is the corpus.
+
+        Both halves stream in lockstep with the corpus. A candidate's ``text`` is
+        checked against the file itself, so the subset claim covers the pair and
+        not only the path; ``strict`` makes a filter that drops or invents a file
+        fail on length, not just on content.
+        """
+        corpus_paths = set()
+        for path, _text in iter_source_texts():
+            corpus_paths.add(path)
+        kept = 0
+        for path, text in iter_candidate_sources(blocking._REQUIRE_ALL):
+            assert path in corpus_paths, f"{path} is not in the corpus"
+            assert text == path.read_text(encoding="utf-8"), f"{path} was not read verbatim"
+            kept += 1
+        assert 0 < kept < len(corpus_paths), "the filter admitted nothing, or everything"
+
+        everything = 0
+        for candidate, whole in zip(iter_candidate_sources(), iter_source_texts(), strict=True):
+            assert candidate == whole
+            everything += 1
+        assert everything == len(corpus_paths)
 
 
 class TestFilterLiteralsStillMatchWhatTheGatesReject:
@@ -458,29 +496,47 @@ class TestFilterLiteralsStillMatchWhatTheGatesReject:
 
 
 class TestFiltersStillNarrowTheTree:
-    """A filter that keeps everything is cost with no benefit left in it."""
+    """A filter that keeps everything is cost with no benefit left in it.
+
+    The bar is a share of the tree, not a file count: every change that adds a
+    source file containing the literal grows the kept count, so a count ceiling
+    fails a branch for growing the tree it was meant to measure. A share only
+    moves when the literal does -- a literal that matches every file keeps the
+    whole tree, which no ceiling here admits.
+    """
 
     @pytest.mark.parametrize(
-        ("label", "require_all", "require_any", "ceiling"),
+        ("label", "require_all", "require_any", "max_share"),
         [
             (
                 "sandbox-bare-hop",
                 sandbox.TestNoBareSandboxedSpawnArgvHops._REQUIRE_ALL,
                 sandbox.TestNoBareSandboxedSpawnArgvHops._REQUIRE_ANY,
-                100,
+                0.05,
             ),
-            ("session-map-batch", session_map.TestNoAwaitInsideBatch._REQUIRE_ALL, (), 100),
-            ("security-census", _CENSUS_REQUIRE_ALL, (), 700),
-            ("blocking-on-loop", blocking._REQUIRE_ALL, (), 900),
+            ("session-map-batch", session_map.TestNoAwaitInsideBatch._REQUIRE_ALL, (), 0.05),
+            ("security-census", _CENSUS_REQUIRE_ALL, (), 0.45),
+            ("blocking-on-loop", blocking._REQUIRE_ALL, (), 0.6),
         ],
     )
-    def test_the_filter_narrows_the_tree(self, label, require_all, require_any, ceiling):
-        kept = candidate_sources(require_all, require_any)
+    def test_the_filter_narrows_the_tree(self, label, require_all, require_any, max_share):
+        # Counted off the stream: the broad filters keep up to half the tree, and
+        # a tuple of those texts is most of the corpus resident again.
+        kept = sum(1 for _pair in iter_candidate_sources(require_all, require_any))
+        total = sum(1 for _pair in iter_source_texts())
         assert kept, f"{label}: matched nothing, so that gate now scans an empty tree"
-        assert len(kept) < ceiling, (
-            f"{label}: kept {len(kept)} of {len(source_texts())} files, so the filter "
-            "is no longer buying anything -- either the tree or the literal moved."
+        assert kept <= max_share * total, (
+            f"{label}: kept {kept} of {total} files ({kept / total:.0%}, bar {max_share:.0%}), "
+            "so the filter is not narrowing the tree -- the literal matches too much."
         )
+
+    def test_the_share_bar_refuses_a_literal_that_matches_everything(self):
+        """The negative control: ``import`` is in nearly every file, so the widest
+        bar above must refuse it, or the share bar could not catch a literal that
+        stopped narrowing."""
+        kept = sum(1 for _pair in iter_candidate_sources(("import",), ()))
+        total = sum(1 for _pair in iter_source_texts())
+        assert kept > 0.6 * total, (kept, total)
 
 
 def _plant_nested_checkout(root: Path) -> None:
@@ -758,3 +814,70 @@ class TestNoGateEnumeratesTheCheckoutByWalking:
             "tmp-path": "def t(tmp_path):\n    return list(tmp_path.rglob('*'))\n",
         }.items():
             assert repo_root_scans(source) == [], label
+
+
+class TestTheStatementWalk:
+    """``iter_statements`` is the statement half of ``ast.walk``: the same statements,
+    in the same order, from a sixth of the visits."""
+
+    #: One of every block kind, nested, with a statement in each.
+    _SOURCE = (
+        "import a\n"
+        "try:\n"
+        "    import b\n"
+        "except ImportError as exc:\n"
+        "    c = 1\n"
+        "else:\n"
+        "    d = 2\n"
+        "finally:\n"
+        "    e = 3\n"
+        "class C:\n"
+        "    f: int = 4\n"
+        "    def m(self):\n"
+        "        with open(x) as fh:\n"
+        "            for i in y:\n"
+        "                while z:\n"
+        "                    if q:\n"
+        "                        g = 5\n"
+        "                    else:\n"
+        "                        h = 6\n"
+        "match v:\n"
+        "    case 1:\n"
+        "        j = 7\n"
+        "    case _:\n"
+        "        k = 8\n"
+        "async def af():\n"
+        "    async with a as b:\n"
+        "        async for c in d:\n"
+        "            n = [stmt for stmt in body]\n"
+        "    lam = lambda: (yield_ := 9)\n"
+    )
+
+    def test_it_yields_every_statement_in_walk_order(self):
+        tree = ast.parse(self._SOURCE)
+        expected = [node for node in ast.walk(tree) if isinstance(node, ast.stmt)]
+        assert list(iter_statements(tree)) == expected
+        assert len(expected) == 23
+
+    def test_it_never_enters_an_expression(self):
+        """The nodes it touches are the statements and the two block holders that are
+        not statements, so a module's names, calls and constants are never visited."""
+        tree = ast.parse(self._SOURCE)
+        kinds = {type(node).__name__ for node in iter_statements(tree)}
+        assert kinds == {
+            "Import",
+            "Try",
+            "Assign",
+            "ClassDef",
+            "AnnAssign",
+            "FunctionDef",
+            "With",
+            "For",
+            "While",
+            "If",
+            "Match",
+            "AsyncFunctionDef",
+            "AsyncWith",
+            "AsyncFor",
+        }
+        assert "Expr" not in kinds and "NamedExpr" not in kinds and "ListComp" not in kinds

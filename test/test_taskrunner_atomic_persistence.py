@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from kiro_crew.taskrunner import Step, StepStatus, TaskRun, TaskRunner
+from kiro_crew.testing.wait import await_until
 
 
 def _make_runner(work_dir: Path) -> TaskRunner:
@@ -39,6 +40,21 @@ def _make_run(task_id: str = "t1") -> TaskRun:
 
 
 class TestPersistRoundTrip:
+    def test_resume_hint_round_trips(self, tmp_path: Path) -> None:
+        """An ambiguous-delivery resume hint set on a crash-recovery retry must
+        survive a gateway restart, or a restore returns the task to a verbatim
+        replay of a possibly-executed step."""
+        runner = _make_runner(tmp_path)
+        run = _make_run()
+        run.tasks[0].resume_hint = "Do NOT restart; inspect current state first."
+        runner._runs[run.task_id] = run
+        runner._persist_runs()
+
+        reloaded = _make_runner(tmp_path)
+        reloaded._load_runs()
+        back = reloaded._runs["t1"].tasks[0]
+        assert back.resume_hint == "Do NOT restart; inspect current state first."
+
     def test_persist_writes_valid_json(self, tmp_path: Path) -> None:
         runner = _make_runner(tmp_path)
         runner._runs[_make_run().task_id] = _make_run()
@@ -427,7 +443,7 @@ class TestBackgroundStartAdmission:
 
         async def exercise() -> None:
             first = asyncio.create_task(runner.start_background(spec))
-            await asyncio.wait_for(first_persist_entered.wait(), timeout=2)
+            await await_until(first_persist_entered, timeout=2, what="the first persist entering")
             second = asyncio.create_task(runner.start_background(spec))
             await asyncio.sleep(0)
 

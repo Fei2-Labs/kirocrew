@@ -1,7 +1,7 @@
 """Tests for the session storage endpoints.
 
 These cover the wire contract and the guards, not the filesystem mechanics —
-those live in ``test_session_storage.py``. Two properties are load-bearing here:
+those live in ``test_session_storage.py`` and its topic files. Two properties are load-bearing here:
 every mutation is refused for a restricted session and audited when it succeeds,
 and the payload never splits a session's size across the two stores it occupies.
 """
@@ -19,16 +19,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
+from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew import session_storage as session_storage_module
 from kiro_crew.dashboard.handlers import session_storage as handler
+from kiro_crew.testing.wait import async_wait_until
 
 _DAY = 86400.0
 
 
 @pytest.fixture(autouse=True)
 def _fresh_scan_cache() -> None:
-    """No cached filesystem pass leaks between tests. See test_session_storage.py."""
+    """No cached filesystem pass leaks between tests. See session_storage_helpers.py."""
     session_storage_module.invalidate_scan_cache()
 
 
@@ -68,34 +70,34 @@ def _sel_stub() -> MagicMock:
     return sel
 
 
-def _raw_request(method: str, path: str, raw: bytes, *, restricted: bool = False):
-    """A request whose body is arbitrary bytes, for malformed-payload cases."""
-    headers = {"X-Session-Key": "dashboard:guest" if restricted else "dashboard:ui"}
-    req = make_mocked_request(method, path, headers=headers, payload=None)
+def _raw_request(
+    method: str,
+    path: str,
+    raw: bytes,
+    *,
+    restricted: bool = False,
+    content_type: str = "application/json",
+):
+    """A request whose body is arbitrary bytes, for malformed-payload cases.
+
+    The body is a real stream with its own ``Content-Type`` and
+    ``Content-Length``: the handlers read through ``read_bounded_json``, which
+    checks the declared media type and drains ``request.content``.
+    """
+    headers = {
+        "X-Session-Key": "dashboard:guest" if restricted else "dashboard:ui",
+        "Content-Type": content_type,
+        "Content-Length": str(len(raw)),
+    }
+    req = make_mocked_request(method, path, headers=headers, payload=BodyStreamPayload(raw))
     state = MagicMock()
     state._restricted_keys = {"dashboard:guest"} if restricted else set()
     req.app["state"] = state
-
-    async def _read():
-        return raw
-
-    req.read = _read  # type: ignore[method-assign]
     return req
 
 
 def _request(method: str, path: str, body: dict | None = None, *, restricted: bool = False):
-    headers = {"X-Session-Key": "dashboard:guest" if restricted else "dashboard:ui"}
-    payload = json.dumps(body or {}).encode()
-    req = make_mocked_request(method, path, headers=headers, payload=None)
-    state = MagicMock()
-    state._restricted_keys = {"dashboard:guest"} if restricted else set()
-    req.app["state"] = state
-
-    async def _read():
-        return payload
-
-    req.read = _read  # type: ignore[method-assign]
-    return req
+    return _raw_request(method, path, json.dumps(body or {}).encode(), restricted=restricted)
 
 
 class TestReport:
@@ -554,10 +556,7 @@ class TestEmpty:
                 # its executor down and a failed test became a hung run.
                 try:
                     # Let the worker thread report once.
-                    for _ in range(200):
-                        if job.freed_bytes:
-                            break
-                        await asyncio.sleep(0.01)
+                    await async_wait_until(lambda: job.freed_bytes)
 
                     mid = json.loads(
                         (
@@ -1214,9 +1213,9 @@ class TestWhyAReclaimIsRefused:
             calls["cotenant"] += 1
             return real_cotenants()
 
-        def counted_scan(sid_for_stem):
+        def counted_scan(sid_for_stem, **kwargs):
             calls["scan"] += 1
-            return real_scan(sid_for_stem)
+            return real_scan(sid_for_stem, **kwargs)
 
         monkeypatch.setattr(session_storage_module, "_replay_store_cotenants", counted_cotenants)
         monkeypatch.setattr(session_storage_module, "_scan_raw_uncached", counted_scan)
@@ -1597,3 +1596,95 @@ class TestACredentialInASessionIdIsScrubbed:
         rows = {r["uid"]: r for r in json.loads(resp.body)["sessions"]}
         assert secret in rows, "the row must still be listed and actionable"
         assert secret not in rows[secret]["origin"], "the DISPLAYED string is scrubbed"
+
+
+def test_the_activation_reads_the_live_map_under_the_lock_a_resume_maps_under():
+    """A mapping in the live map is seen before its deferred file write lands."""
+    from types import SimpleNamespace
+
+    from kiro_crew.dashboard.handlers import session_storage as handler
+    from kiro_crew.session_map import _MAP_LOCK
+
+    live = SimpleNamespace(mapped_sids_by_key=lambda: {"dashboard:chat-1": "acp-resumed"})
+    state = SimpleNamespace(sessions=SimpleNamespace(_session_map=live))
+
+    lock, live_index = handler._activation(state)
+    index = live_index()
+
+    assert lock is _MAP_LOCK
+    assert "acp-resumed" in index.active_sids
+    assert index.stem_to_sid.get("dashboard_chat-1") == "acp-resumed"
+    assert handler._activation(SimpleNamespace(sessions=None)) is None
+
+
+class TestJsonContentTypeGate:
+    """Every body-reading route here reads through ``read_bounded_json``.
+
+    A present body must declare JSON (415 otherwise) and fit ``_MAX_BODY_BYTES``
+    (413 otherwise), both refused before it is parsed; nothing is staged or
+    deleted on either refusal.
+    """
+
+    _ROUTES = [
+        ("api_session_storage_cleanup", "cleanup", {"older_than_days": 30}),
+        ("api_session_storage_restore", "restore", {"batch_id": "b1"}),
+        ("api_session_storage_empty", "empty", {"all": True}),
+        ("api_session_inventory_trash", "trash", {"uids": ["aaaa1111"]}),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route,suffix,body", _ROUTES)
+    async def test_a_non_json_media_type_is_refused_415(
+        self, stores: tuple[Path, Path], route: str, suffix: str, body: dict
+    ) -> None:
+        _, kiro_home = stores
+        _retired(kiro_home, "aaaa1111")
+        req = _raw_request(
+            "POST",
+            f"/api/system/session-storage/{suffix}",
+            json.dumps(body).encode(),
+            content_type="text/plain",
+        )
+        with patch.object(handler, "_sel", return_value=_sel_stub()):
+            resp = await getattr(handler, route)(req)
+        assert resp.status == 415
+        assert json.loads(resp.body)["code"] == "unsupported_media_type"
+        assert session_storage_module.list_trash() == []
+
+    @pytest.mark.asyncio
+    async def test_a_declared_oversize_is_refused_413(self, stores: tuple[Path, Path]) -> None:
+        # Declared larger than the cap: refused on the header, before any read.
+        raw = b'{"uids": []}'
+        req = make_mocked_request(
+            "POST",
+            "/api/system/session-storage/trash",
+            headers={
+                "X-Session-Key": "dashboard:ui",
+                "Content-Type": "application/json",
+                "Content-Length": str(handler._MAX_BODY_BYTES + 1),
+            },
+            payload=BodyStreamPayload(raw),
+        )
+        state = MagicMock()
+        state._restricted_keys = set()
+        req.app["state"] = state
+        with patch.object(handler, "_sel", return_value=_sel_stub()):
+            resp = await handler.api_session_inventory_trash(req)
+        assert resp.status == 413
+        assert json.loads(resp.body)["code"] == "payload_too_large"
+
+    def test_the_cap_admits_the_largest_selection_the_route_accepts(self) -> None:
+        """``_MAX_SELECTION`` uids at the longest the uid grammar allows still fit."""
+        uid = "a" * 200
+        assert session_storage_module._UNIT_ID_RE.match(uid)
+        largest = json.dumps({"uids": [uid] * handler._MAX_SELECTION}).encode()
+        assert len(largest) <= handler._MAX_BODY_BYTES
+
+    @pytest.mark.asyncio
+    async def test_an_absent_body_is_still_an_empty_object(self, stores: tuple[Path, Path]) -> None:
+        req = _raw_request("POST", "/api/system/session-storage/trash", b"")
+        with patch.object(handler, "_sel", return_value=_sel_stub()):
+            resp = await handler.api_session_inventory_trash(req)
+        # {} reaches the handler's own check, not a body refusal.
+        assert resp.status == 400
+        assert json.loads(resp.body)["code"] == "nothing_specified"

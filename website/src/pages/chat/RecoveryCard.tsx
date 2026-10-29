@@ -5,11 +5,13 @@ import { i18nT } from '../../i18n/t'
 import { DENY_REASON_MARKER } from '../../utils/denyReason'
 import { useRowDisclosure } from './rowDisclosure'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import type { ChatMessage } from '../../types'
+import { TURN_OPENER_ROLES } from './groupDisplayItems'
 
 /**
  * The synthetic-continuation prefixes the gateway prepends when it recovers a
  * turn that ended early. Kept in sync with the constants in
- * `src/kiro_crew/dashboard/state.py` (REFUSAL_RECOVERY_PREFIX,
+ * `src/kiro_crew/dashboard/state_parts/injected_turns.py` (REFUSAL_RECOVERY_PREFIX,
  * STALE_RECOVERY_PREFIX, TOOL_STALL_RECOVERY_PREFIX, CONN_RECOVERY_PREFIX,
  * BUSY_RECOVERY_PREFIX, POSTTOKEN_RECOVERY_PREFIX,
  * EMPTY_RESPONSE_RECOVERY_PREFIX, COMPACTION_RECOVERY_PREFIX,
@@ -98,7 +100,7 @@ const PREFIXES: ReadonlyArray<[RecoveryKind, string]> = [
   // It is an orchestration prompt asking for the consolidated write-up, so its
   // copy names the fan-out rather than reporting an interruption.
   // WIRE VALUE, not copy: matched byte-for-byte against SUBAGENT_SYNTHESIS_PREFIX
-  // in src/kiro_crew/dashboard/state.py and then sliced off, so no character of
+  // in src/kiro_crew/dashboard/state_parts/injected_turns.py and then sliced off, so no character of
   // it reaches the screen. Translating it would stop the card rendering in that
   // locale — the failure the block comment above this table describes. Exempted
   // by shape (leading bracketed ALL-CAPS tag) in eslint.i18n.config.js.
@@ -379,7 +381,82 @@ export function parseRecoveryMessage(content: string): ParsedRecovery | null {
  * emit time — vanishes after a flush + rehydrate. Anything keyed on its absence
  * therefore mis-renders every restored row.
  */
-export type InjectKind = 'cron' | 'recovery' | 'synthesis' | 'user_replay'
+export type InjectKind = 'cron' | 'mcp_app' | 'recovery' | 'synthesis' | 'user_replay' | 'automation_notice'
+
+/**
+ * Whether each gateway-stamped inject kind OPENS a turn of its own, or
+ * continues the one above it.
+ *
+ * Every kind is a queued prompt the runner drains into a dispatch (the
+ * `_inject_meta` stamp in chat_runner.py's drain, `_run_pending_synthesis`), so
+ * "a new dispatch" is not the question -- WHOSE request the dispatch carries is.
+ * A cron notification is an unrelated prompt with its own reply, and a synthesis
+ * row leads the turn that folds a fan-out into one answer (the boundary
+ * `groupDisplayItems` and `_orphan_in_current_turn` already flush on): both
+ * begin work the rows above did not ask for. A `recovery` continuation resumes
+ * the SAME turn after a stall, and a `user_replay` re-queues the SAME request
+ * verbatim when a turn emitted nothing (`build_recovery_requeue`): the reply
+ * below either one still answers the request above it.
+ *
+ * A `Record` over the union rather than a set of the openers, deliberately: a
+ * fifth kind added to `InjectKind` does not compile until it is classified
+ * here. A hand-listed set would read it as a continuation and never say so.
+ */
+export const INJECT_KIND_OPENS_TURN: Readonly<Record<InjectKind, boolean>> = {
+  cron: true,
+  synthesis: true,
+  recovery: false,
+  user_replay: false,
+  // An app message's delivery dispatches a whole new turn (both the direct
+  // dispatch and the drain), so its inject row opens that turn — without
+  // this, isFeatureRequestRefusal walks past it to an earlier user row and
+  // mis-attributes an app turn's error to that older message.
+  mcp_app: true,
+  // A re-routed automation refusal is drained ALONE and dispatches a turn of
+  // its own (chat_runner `_start_next_queued_turn`), carrying the originating
+  // wake's provenance; so it OPENS a turn, and the interrupt-recovery and
+  // session-start-failure scans must land on it, not walk past to an earlier
+  // reply.
+  automation_notice: true,
+}
+
+/**
+ * True when an `inject` row begins a turn of its own (see
+ * {@link INJECT_KIND_OPENS_TURN}). A row with no stamped kind never does: a
+ * note rides the NEXT turn's context (`isNoteRow`), and the policy-block notice
+ * and the hook-halt marker are display-only rows appended into the running turn
+ * with nothing dispatched. A kind this build does not know (a newer gateway)
+ * reads the same way -- the fail-passive direction `resolveInjectCard` takes
+ * for an unmarked row.
+ */
+export function injectOpensTurn(m: { role: string; meta?: Record<string, unknown> | null }): boolean {
+  if (m.role !== 'inject') return false
+  const kind = m.meta?.injectKind
+  return typeof kind === 'string' && Object.hasOwn(INJECT_KIND_OPENS_TURN, kind) && INJECT_KIND_OPENS_TURN[kind as InjectKind]
+}
+
+/** Whether `row` OPENS a turn (the feature-request scans in
+ *  transcriptRenderers, the crewmate chat's live-turn start). Read
+ *  from the transcript's own row-kind vocabulary, not a role list of this
+ *  module's: the opener ROLES (`TURN_OPENER_ROLES`: a typed row, an auto-nudge
+ *  cycle, a drained sub-agent completion) minus a STEER, plus the inject KINDS
+ *  the gateway stamps as a prompt of their own (`injectOpensTurn`: a cron
+ *  notification, a fan-out synthesis -- a `recovery` or `user_replay` continues
+ *  the request above it, and an unstamped inject dispatches nothing). A steer is
+ *  persisted as a `user` row with `meta.steer` (chat_delivery.py) and appended
+ *  optimistically in the same shape (ChatPage `steer()`), but it was injected
+ *  INTO a running turn, so it cannot begin one. Same answer as the store's
+ *  `isTurnBoundaryUser`, `selectSlotPendingApproval`'s walk and the turn-head
+ *  walk in `app-sdk/turnPolicyBlock.ts`. Every steer row is exempt, the
+ *  optimistic bubble included: a bubble the server turned into a NEW turn is
+ *  reconciled by the echo that carries its `sendId` (the store deletes its
+ *  `steer` flag), and until then a misread here only moves a link between two
+ *  rows -- it never splices content, which is the one reason
+ *  `isTurnBoundaryUser` keeps its optimistic exception. */
+export function opensTurn(row: ChatMessage): boolean {
+  if (row.role === 'user') return !row.meta?.steer
+  return TURN_OPENER_ROLES.has(row.role) || injectOpensTurn(row)
+}
 
 /**
  * Decide which card, if any, an `inject` row gets. The single decision point
@@ -414,6 +491,10 @@ export function resolveInjectCard(m: { content: string; meta?: Record<string, un
   // early returns for those three were measured to be unreachable (the allowlist
   // already rejects them), so they are omitted rather than kept as dead code.
   // The behavioural contract for each is pinned in RecoveryCard.test.tsx.
+  // `automation_notice` is also NOT a note here: it is suppressed entirely on
+  // the Sessions page (transcriptRenderers `automation_notice_inject`) because
+  // the refusal's `notice` bar already shows it, and hidden in the crewmate DM
+  // by MACHINERY_ROLES — so it never needs a card.
   if (kind !== 'recovery' && kind !== 'synthesis') return null
 
   return {

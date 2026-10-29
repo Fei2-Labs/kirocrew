@@ -1,15 +1,16 @@
-import { memo, useId } from 'react'
-import { Archive, ChevronRight } from 'lucide-react'
+import { memo } from 'react'
+import { Archive, Clock, Square } from 'lucide-react'
 
 import ErrorNotice from '../../components/ErrorNotice'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
+import { fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import { isSystemNoticeKind } from '../../lib/systemNotice'
 import CompactionKeepLine from './CompactionKeepLine'
 import { decisionStripFieldOf, readCompactionKeepRecord } from './decisionRecord'
+import MarkdownDisclosureCard from './MarkdownDisclosureCard'
 import NoticeCard from './NoticeCard'
-import { useRowDisclosure } from './rowDisclosure'
 import type { ChatMessage } from '../../types'
 
 /**
@@ -25,8 +26,10 @@ import type { ChatMessage } from '../../types'
  *   ⚠️ Compaction timed out.                 the manual /compact wait
  *   ⚠ Auto-compact failed at N% — …          threshold auto-compact (state.py)
  *   🔄 Auto-compacted at N%.                  threshold auto-compact, success
+ *   🔄 Context at N% (limit M%) — will …     threshold crossed mid-turn (chat_runner)
  *   ♻️ This session was recycled …           watchdog recycle notice
  *   ⏳ This turn has produced nothing …       stuck-turn notice
+ *   ⏹ Compaction at N% was ended by Stop …  a Stop landed on the /compact turn
  *
  * Only the first is a document worth folding: on kiro-cli `<summary>` is the
  * backend's whole context digest (Goal / Status / Technical / Decisions …),
@@ -54,6 +57,10 @@ export interface ParsedCompaction {
   /** `notice`: the row with a known status glyph (🔄 ♻️ ⏳) stripped; NoticeCard
    *  parses its own ℹ️/⚠️/⛔ lead from what remains. */
   text: string
+  /** `notice`: the lead was ⏹, the user's own forced Stop ended the compaction. */
+  stopCaused?: boolean
+  /** `notice`: the mid-turn "will compact after this turn" row: context percent and the threshold it passed. */
+  afterTurn?: { pct: number; limit: number }
 }
 
 // `✅` is U+2705 (no variation selector in practice, tolerate one). The colon
@@ -75,16 +82,36 @@ const FAILED_LEAD_RE =
 // icons beside the lucide glyph (AUTOSDE no-emoji-as-icons). Stripped here,
 // where the writer set is known; the tone stays info — none is a warning.
 // ⏳ is U+23F3 (HOURGLASS WITH FLOWING SAND), the glyph state.py writes — not
-// U+231B (⌛ HOURGLASS).
-const STATUS_LEAD_RE = /^\s*(?:\u{1F504}|\u267B|\u23F3)\uFE0F*\s*/u
+// U+231B (⌛ HOURGLASS). ⏹ is U+23F9, the lead on the "compaction ended by
+// Stop" notice (#14841): a status, not a failure, so it lands here.
+const STATUS_LEAD_RE = /^\s*(?:\u{1F504}|\u267B|\u23F3|\u23F9)\uFE0F*\s*/u
+// The one lead that names an actor rather than the app: the notice for a
+// compaction the user's own forced Stop ended. It keeps the info tone but takes
+// a stop-square glyph, so the two restart notices (this and ♻️'s) are told apart
+// at a glance and the reader is not left guessing which restart was theirs.
+const STOP_LEAD_RE = /^\s*\u23F9\uFE0F*\s*/u
+// The mid-turn row chat_runner writes once per turn when the context crosses the
+// compaction threshold (COMPACT_AFTER_TURN_NOTICE). Matched whole, so it renders
+// from the catalog in the reader's language instead of the stored English.
+const AFTER_TURN_RE = /^\s*\u{1F504}\uFE0F*\s*Context at (\d+)% \(limit (\d+)%\) \u2014 will compact after this turn\.\s*$/u
 
 export function parseCompactionNotice(content: string): ParsedCompaction {
   const raw = content ?? ''
+  const afterTurn = AFTER_TURN_RE.exec(raw)
+  if (afterTurn) {
+    return { status: 'notice', summary: '', reason: '', text: raw, afterTurn: { pct: Number(afterTurn[1]), limit: Number(afterTurn[2]) } }
+  }
   const done = COMPLETED_RE.exec(raw)
   if (done) return { status: 'completed', summary: raw.slice(done[0].length).trim(), reason: '', text: raw }
   const failed = FAILED_LEAD_RE.exec(raw)
   if (failed) return { status: 'failed', summary: '', reason: raw.slice(failed[0].length).trim(), text: raw }
-  return { status: 'notice', summary: '', reason: '', text: raw.replace(STATUS_LEAD_RE, '') }
+  return {
+    status: 'notice',
+    summary: '',
+    reason: '',
+    text: raw.replace(STATUS_LEAD_RE, ''),
+    stopCaused: STOP_LEAD_RE.test(raw),
+  }
 }
 
 /** The tag lives on `kind` for a row that arrived live over the websocket and
@@ -129,8 +156,6 @@ const CompactionCard = memo(function CompactionCard({ content, disclosureKey, ke
   keepRecord?: unknown }) {
   // memo() boundary rendering i18nT() strings: subscribe so a language switch repaints.
   useLanguageGeneration()
-  const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
-  const headlineId = useId()
   const parsed = parseCompactionNotice(content)
   // Validated here rather than at the render site, the rule `decisionRecord.ts` states:
   // this payload names what left the machine and what came back, and a line printing a
@@ -169,81 +194,34 @@ const CompactionCard = memo(function CompactionCard({ content, disclosureKey, ke
     )
   }
   if (parsed.status === 'notice') {
-    return withKeep(<NoticeCard content={parsed.text} />)
+    const after = parsed.afterTurn
+    if (after) {
+      // About what comes next, not a receipt: a clock glyph tells it apart from the
+      // "Auto-compacted" row that follows, on the same calm info tone (nothing to do).
+      const text = i18nT('pages.chat.compactionCard.after_turn', {
+        pct: fmtPercent(after.pct / 100),
+        limit: fmtPercent(after.limit / 100),
+      })
+      return withKeep(<NoticeCard content={text} icon={Clock} />)
+    }
+    return withKeep(<NoticeCard content={parsed.text} icon={parsed.stopCaused ? Square : undefined} />)
   }
 
-  const title = i18nT('pages.chat.compactionCard.title')
   const hasSummary = parsed.summary.length > 0
-  const header = (
-    <>
-      {hasSummary && (
-        <ChevronRight
-          size={13}
-          className={`lucide-inline shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`}
-          aria-hidden="true"
-        />
-      )}
-      <Archive size={13} className="lucide-inline shrink-0" aria-hidden="true" />
-      <span id={headlineId} className="font-medium text-text shrink-0">
-        {title}
-      </span>
-      {/* The hint says what the chevron does; once the summary is open the
-          chevron and the body already say it, and "expand to read" over an
-          expanded body is a contradiction, so it goes. Without a summary the
-          row is a label, not a control, and says so — otherwise it is a
-          non-interactive twin of the row above it and invites a dead click. */}
-      {(!hasSummary || !expanded) && (
-        <span className="truncate text-[12px] leading-5 opacity-75 min-w-0">
-          {hasSummary
-            ? i18nT('pages.chat.compactionCard.summary_hint')
-            : i18nT('pages.chat.compactionCard.no_summary')}
-        </span>
-      )}
-    </>
-  )
-
   return withKeep(
-    <div
-      className="self-center w-full max-w-full min-w-0 rounded-md ring-1 ring-inset forced-colors:border ring-border bg-card text-muted animate-scale-in"
-      data-testid="compaction-card"
-      data-status={parsed.status}
-      data-expanded={hasSummary ? expanded : undefined}
-    >
-      {hasSummary ? (
-        <button
-          type="button"
-          onClick={() => setExpanded(v => !v)}
-          aria-expanded={expanded}
-          // No aria-label: the inner text names the button (title + hint), and
-          // aria-expanded carries the toggle state — same reasoning as RecoveryCard.
-          className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-text transition-colors"
-          data-testid="compaction-card-toggle"
-        >
-          {header}
-        </button>
-      ) : (
-        <div className="flex items-center gap-2 px-3 py-2 min-w-0 text-[13px] leading-5">{header}</div>
-      )}
-      {hasSummary && expanded && (
-        // max-h + overflow-y-auto: the summary is the backend's whole context
-        // digest, routinely taller than the viewport; it scrolls internally so
-        // its height cannot displace the rows below. overflow-x-hidden is
-        // explicit because a non-visible y-axis computes x's `visible` to
-        // `auto`. tabIndex + region: a scroll region with no focusable
-        // descendant is unreachable to a keyboard. Ring INSET because the body
-        // is flush with the card's clipped edges (see SubagentCompletionCard).
-        <div
-          className="px-3 pb-3 pt-2 text-[13px] leading-5 border-t border-border max-h-[24rem] overflow-y-auto overflow-x-hidden focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
-          data-testid="compaction-card-body"
-          role="region"
-          aria-labelledby={headlineId}
-          // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
-          tabIndex={0}
-        >
-          <MarkdownRenderer content={parsed.summary} />
-        </div>
-      )}
-    </div>,
+    <MarkdownDisclosureCard
+      icon={Archive}
+      title={i18nT('pages.chat.compactionCard.title')}
+      detail={({ expanded, hasBody }) => {
+        if (!hasBody) return i18nT('pages.chat.compactionCard.no_summary')
+        return expanded ? null : i18nT('pages.chat.compactionCard.summary_hint')
+      }}
+      body={hasSummary ? <MarkdownRenderer content={parsed.summary} /> : undefined}
+      disclosureKey={disclosureKey}
+      testId="compaction-card"
+      bodyTestId="compaction-card-body"
+      status={parsed.status}
+    />,
   )
 })
 

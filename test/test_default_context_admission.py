@@ -7,6 +7,7 @@ owns its memory, catalog, prompt and configuration; all data stays under tmp_pat
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -28,8 +29,24 @@ pytestmark = [
 ]
 
 
+class _FrozenClock(datetime):
+    """A ``datetime`` whose ``now()`` does not advance.
+
+    The prompt carries a minute-resolution ``[CURRENT DATE]`` line, so two builds
+    that straddle a minute boundary differ in that line alone -- and across
+    midnight the weekday name changes length, so an exact-fit cap taken from the
+    first build does not fit the second. Tests here compare builds byte for
+    byte and size caps from them, so every build reads one instant.
+    """
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        return datetime(2026, 1, 1, 12, 0).replace(tzinfo=tz)
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
+    monkeypatch.setattr(ctx, "datetime", _FrozenClock)
     cfg = KiroCrewConfig()
     monkeypatch.setattr(ctx.KiroCrewConfig, "load", lambda: cfg)
     monkeypatch.setattr(ctx, "agent_skill_globs", lambda agent: [])
@@ -45,7 +62,13 @@ def rig(tmp_path, monkeypatch):
     skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
     lessons = LessonStore(base_dir=tmp_path / "lessons")
     builder = ctx.ContextBuilder(memory=memory, skills=skills, lessons=lessons, hooks=HookManager())
-    return builder, memory, skills, lessons, cfg
+    try:
+        yield builder, memory, skills, lessons, cfg
+    finally:
+        # The loader's skill search index is a SQLite connection (``db`` +
+        # ``-wal`` + ``-shm``) and its first discovery starts the
+        # ``skill-catalog-refresh`` worker; production closes both by exiting.
+        skills.close()
 
 
 def seed_skill(root: Path, name: str, *, always=False, body="Synthetic procedure"):
@@ -59,16 +82,15 @@ def seed_skill(root: Path, name: str, *, always=False, body="Synthetic procedure
 
 
 class TestDefaultMemory:
-    def test_fresh_ordinary_context_keeps_preferences_not_activity(self, rig, monkeypatch):
+    def test_fresh_ordinary_context_keeps_preferences_and_bounded_activity(self, rig):
         builder, memory, _, _, _ = rig
         memory.write_preferences("# Preferences\nAlways preserve approved safety controls.\n")
-        monkeypatch.setattr(
-            memory, "read_recent_history", Mock(side_effect=AssertionError("full history read"))
-        )
         memory.write_projects("# Payment migration\n" + "Details stay on demand.\n" * 100)
         text, _ = builder.build_message("Fix today's task", True, session_key="dashboard:synthetic")
         assert "Payment migration" in text
+        # The projects file is cut at its own cap, never carried whole.
         assert "Details stay on demand.\n" * 100 not in text
+        assert "[truncated]" in text
         assert "Always preserve approved safety controls." in text
         assert "memory_recall" in text
         assert text.endswith("Fix today's task")
@@ -802,6 +824,7 @@ def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch
         member_id=cfg.agents["writer"].member_id,
         store_id=store,
     )
+    skills: SkillsLoader | None = None
     try:
         # Oldest, and the only rule that mentions the request term. Recency order
         # would place it LAST; relevance ranking places it first. set_semantic
@@ -840,9 +863,10 @@ def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch
         monkeypatch.setattr(ctx, "_memory_stores", {})
         monkeypatch.setattr(ctx, "_vector_stores", {store: tier})
 
+        skills = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
         builder = ctx.ContextBuilder(
             memory=MemoryStore(workspace=tmp_path / "global"),
-            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            skills=skills,
             lessons=LessonStore(base_dir=tmp_path / "lessons"),
             hooks=HookManager(),
         )
@@ -858,3 +882,5 @@ def test_member_lessons_renderer_ranks_against_the_request(tmp_path, monkeypatch
         assert "omitted" in text and "use memory_recall." in text
     finally:
         tier.close()
+        if skills is not None:
+            skills.close()

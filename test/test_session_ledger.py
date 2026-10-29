@@ -30,6 +30,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -37,11 +38,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from off_loop_helpers import off_loop
 
 from kiro_crew import crew_log as lg
 from kiro_crew import session_ledger as sl
 from kiro_crew.crew_log import CrewLog
 from kiro_crew.crew_log import emit as crew_log_emit
+from kiro_crew.crew_log import projection as crew_log
 from kiro_crew.platform_compat import IS_POSIX
 
 SESSION = "acp-1"
@@ -59,10 +62,10 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
     crew_log_emit.reset_caches()
-    sl._fold_cache.clear()
+    crew_log.forget_slot_folds()
     yield
     crew_log_emit.reset_caches()
-    sl._fold_cache.clear()
+    crew_log.forget_slot_folds()
 
 
 def _unit(unit_id: str = SESSION, *, slot: str) -> None:
@@ -296,7 +299,7 @@ def test_record_refuses_when_the_session_has_no_crew_log():
 def test_record_refuses_when_the_crew_log_is_switched_off(monkeypatch):
     key = "chat-off-1"
     _unit(slot=key)
-    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
     crew_log_emit.reset_caches()
     with pytest.raises(sl.LedgerUnavailable, match="KIROCREW_CREW_LOG"):
         _record(key, goal="g")
@@ -466,7 +469,13 @@ def test_gateway_fire_callbacks_use_the_composer():
     """
     from kiro_crew.slack import gateway
 
-    src = inspect.getsource(gateway)
+    # Each adapter's own source, wherever its composed owner defines it, indented
+    # back to method level so the split above attributes each body to one adapter.
+    src = "".join(
+        textwrap.indent(textwrap.dedent(inspect.getsource(member)), "    ")
+        for name, member in sorted(vars(gateway.GatewayOrchestrator).items())
+        if re.fullmatch(r"_fire_\w+_nudge", name)
+    )
     adapters = _fire_adapter_bodies(src)
     assert adapters, "no _fire_*_nudge adapters found -- this pattern went stale"
 
@@ -474,7 +483,7 @@ def test_gateway_fire_callbacks_use_the_composer():
     assert not offenders, (
         "these fire adapters neither call compose_nudge_body nor delegate to a "
         "fire path that does, so their surface's loops start each cycle without "
-        f"the work-ledger snapshot: {offenders}"
+        f"the session ledger snapshot: {offenders}"
     )
 
 
@@ -606,6 +615,54 @@ async def test_route_record_without_a_crew_log_is_409(_open_route):
 
 
 @pytest.mark.asyncio
+async def test_route_record_answers_a_typed_refusal_when_the_crew_log_refuses(_open_route):
+    """A crew log the fold REFUSES is answered with a code, never as a bare 500.
+
+    The record is a projection of the session's crew log, so every write folds
+    that log first. The fold's refusal type is ``CrewLogError`` — not a
+    ``ValueError`` and not an ``OSError`` — so the route's typed branches do not
+    name it, and an unhandled one leaves aiohttp to answer ``500 Internal Server
+    Error / Server got itself in trouble``: a body with no code, which tells the
+    caller neither what failed nor whether retrying could ever work.
+
+    409 with the crew log's own code, which is the answer the sibling work-ledger
+    route already gives for the same refusal on the same store
+    (``handlers/work_ledger_conductor.py``, ``crew_log_unreadable``): the request is well
+    formed and the state of the record's home is what blocks it.
+
+    The damage here is the one an append-only writer cannot produce — a
+    byte-identical copy of the newest record, so the last seq appears twice —
+    which is the case ``projection.advance`` refuses with ``bad_data``. Driven
+    through the real store and the real route rather than a patched raise, so the
+    test pins the path a caller actually travels.
+    """
+    routes = _open_route
+    slot = sl.ledger_key("chat-r-1")
+    _unit(slot=slot)
+    first = await routes.api_session_ledger_record(
+        _mk_request("POST", "/api/session-ledger/record", body={"goal": "before the damage"})
+    )
+    assert first.status == 200, "the undamaged write must land, or this pins nothing"
+    assert crew_log_emit.flush(timeout=5.0), "the crew log writer did not drain"
+
+    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
+    newest = path.read_bytes().splitlines(keepends=True)[-1]
+    with open(path, "ab") as damaged:
+        damaged.write(newest)
+    # The warm fold would answer from its cached cell without re-walking the
+    # bytes, so the damage has to be met by a fold that reads the file.
+    crew_log.forget_slot_folds()
+
+    resp = await routes.api_session_ledger_record(
+        _mk_request("POST", "/api/session-ledger/record", body={"goal": "after the damage"})
+    )
+    assert resp.status == 409, f"expected a typed 409, got {resp.status}"
+    body = json.loads(resp.text)
+    assert body["code"] == "crew_log_unreadable", body
+    assert lg.CODE_BAD_DATA in body["error"], body
+
+
+@pytest.mark.asyncio
 async def test_route_refuses_unrecognized_session(monkeypatch):
     from kiro_crew.dashboard.handlers import session_ledger as routes
 
@@ -634,13 +691,19 @@ async def test_route_write_lands_under_ledger_key(_open_route):
     """The route folds the header key exactly like the nudge composer does —
     losslessly, dashboard prefixes only — and the write lands in the crew log the
     calling session is serving on, read back through the fold under the folded
-    key."""
+    key.
+
+    The read-back runs OFF the loop, as ``api_session_ledger_get`` runs it. The eager
+    folder reads this unit on its own thread right after the append, under the unit's
+    append lock, and an acquire on the event-loop thread makes one attempt: a read
+    made there while that pass holds the lock is refused and answers the empty record.
+    """
     routes = _open_route
     sk = "dashboard_chat-77-999"
     _unit(slot=sl.ledger_key(sk))
     req = _mk_request("POST", "/api/session-ledger/record", body={"goal": "fold me"}, sk=sk)
     assert (await routes.api_session_ledger_record(req)).status == 200
-    assert sl.read_state(sl.ledger_key(sk))["goal"] == "fold me"
+    assert off_loop(sl.read_state, sl.ledger_key(sk))["goal"] == "fold me"
 
 
 def test_routes_are_on_the_strict_internal_allowlist():
@@ -1064,8 +1127,106 @@ def test_mcp_tools_pass_the_verified_key_to_transport(monkeypatch):
     monkeypatch.setattr(mcp_core, "_get", get)
     monkeypatch.setattr(mcp_core, "_post", post)
     tools.session_ledger_read("x", {})
-    get.assert_called_once_with("/api/session-ledger", session_key="chat-v-1")
+    get.assert_called_once_with(
+        "/api/session-ledger",
+        session_key="chat-v-1",
+        timeout=tools._LEDGER_READ_TIMEOUT_S,
+    )
     tools.session_ledger_record("x", {"goal": "g"})
     post.assert_called_once_with(
         "/api/session-ledger/record", {"goal": "g"}, session_key="chat-v-1"
     )
+
+
+# ── MCP read budget ───────────────────────────────────────────────────────
+
+
+class _TimingUrlopen:
+    """A socket that honours the timeout it is handed, like a slow route does.
+
+    Raises the exact exception a real read timeout raises -- ``urlopen`` surfaces
+    a socket timeout, which on 3.10+ IS ``TimeoutError("timed out")`` -- so the
+    string the tool ends up returning is produced by the real plumbing rather
+    than asserted into existence.
+    """
+
+    def __init__(self, route_seconds: float, payload: dict[str, Any]) -> None:
+        self.route_seconds = route_seconds
+        self.payload = payload
+        self.timeouts: list[float] = []
+
+    def __call__(self, req, timeout, *, unix_socket_path=None):
+        self.timeouts.append(float(timeout))
+        if float(timeout) < self.route_seconds:
+            raise TimeoutError("timed out")
+        return _JsonResponse(json.dumps(self.payload).encode())
+
+
+class _JsonResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "_JsonResponse":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def test_read_of_a_slot_whose_fold_outlasts_the_telemetry_budget(monkeypatch):
+    """A ledger read must not fail on a slot whose crew log takes a while to fold.
+
+    ``/api/session-ledger`` folds the slot's log, which is O(the log) and streams
+    every unit on a cold fold, so the GET does real work. Given only the 10s
+    ``mcp_core._get`` hands a telemetry read, a big-enough slot answers
+    ``Error: timed out`` -- while ``session_ledger_record``, which reaches the SAME
+    fold through ``_post``, has 30s and succeeds. This pins the read's budget
+    against a route slower than the telemetry default.
+
+    The real chain runs: the tool, ``_get``, ``_send``, and the error wrapping.
+    Only the socket is faked, and it fakes exactly what a slow fold does.
+    """
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import ledger as tools
+
+    route_seconds = 12.0
+    socket = _TimingUrlopen(
+        route_seconds,
+        {"state": {"goal": "harden the log", "phase": "implementation"}, "events": []},
+    )
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "chat-v-1")
+    monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "secret")
+    monkeypatch.setattr(mcp_core, "_resolve_api_target", lambda: ("http://127.0.0.1:9", ""))
+    monkeypatch.setattr(mcp_core, "_api_urlopen", socket)
+
+    out = tools.session_ledger_read("x", {})
+
+    assert "Error: timed out" not in out, (
+        "the read was given a budget too small for its own fold: "
+        f"dialled with timeout={socket.timeouts}"
+    )
+    assert "implementation" in out
+    assert socket.timeouts and min(socket.timeouts) >= route_seconds
+
+
+def test_the_ledger_read_budget_matches_the_write_path(monkeypatch):
+    """Same ledger, same fold, same budget.
+
+    The write pays the fold AND an append, so a read allowed less than the write
+    can fail where that write succeeds -- an outcome no caller can predict from
+    the two tools' descriptions. The floor is read off ``_send``, the one
+    transport every verb funnels through and the default ``_post`` leaves alone,
+    rather than restated here, so the two cannot drift apart silently. (``_post``
+    itself is replaced by the suite's no-traffic fixture, so its signature is the
+    stub's rather than the real one's.)
+    """
+    import inspect
+
+    from kiro_crew import mcp_core
+    from kiro_crew.mcp_tools import ledger as tools
+
+    transport_default = inspect.signature(mcp_core._send).parameters["timeout"].default
+    assert tools._LEDGER_READ_TIMEOUT_S >= transport_default

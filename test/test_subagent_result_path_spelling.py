@@ -118,8 +118,7 @@ class TestEmittedResultPointersAreReadable:
             SubagentManager._notify_orphan(
                 stub,
                 agent_id,
-                {"task": "summarize the diff", "parent_session": ""},
-                recovery="undeliverable",
+                {"task": "summarize the diff", "parent_session": "", "result_complete": True},
                 has_result=True,
             )
         )
@@ -160,6 +159,8 @@ class TestNoEmissionSiteStillUsesTheResolvedHelper:
         offenders = []
         paths = [self._SRC / "subagent.py", self._SRC / "mcp_tools" / "spawn.py"]
         paths.extend(sorted((self._SRC / "subagent_manager").glob("*.py")))
+        paths.extend(sorted((self._SRC / "subagent_parts").glob("*.py")))
+        paths.extend(sorted((self._SRC / "mcp_tools" / "spawn_parts").glob("*.py")))
         for path in paths:
             rel = path.relative_to(self._SRC).as_posix()
             # Explicit utf-8: these sources carry non-ASCII in comments, and a

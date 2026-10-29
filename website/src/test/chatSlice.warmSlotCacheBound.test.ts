@@ -145,13 +145,78 @@ describe('warmSlotCache hydrate bound', () => {
     expect(store.getState().chat.slotPaneHasMore['bg-slot']).toBe(false)
   })
 
-  // Unbounded while streaming is deliberate, not a raw-row guard: the handler
-  // collapses chunk runs BEFORE computing total and slicing, even mid-stream.
-  it('warms a streaming slot unbounded', async () => {
+  /* Streaming is NOT an exception to the bound, and the handler is why: it collapses
+   * chunk runs BEFORE it computes `total` and slices, so a mid-turn window arrives in
+   * the same units a settled one does. An exemption here would aim the unbounded
+   * shape at the panes most likely to be mid-turn when a socket drops, which is the
+   * commonest warm a reconnect issues. */
+  it('bounds a streaming slot to the pane limit like any other', async () => {
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue(detail)
     const store = makeStore('active-slot', { slotRun: { 'bg-slot': { state: 'streaming' } } })
     await store.dispatch(warmSlotCache('bg-slot') as never)
-    expect(api.chatSlotDetail).toHaveBeenCalledWith('bg-slot')
+    expect(api.chatSlotDetail).toHaveBeenCalledWith('bg-slot', PANE_HYDRATE_LIMIT)
+    expect(api.chatSlotDetail).not.toHaveBeenCalledWith('bg-slot')
+  })
+
+  /* The limit counts rows with the SAME predicate coverage measures (durable + a
+   * readable `ts`), not `mid`-bearing rows only. One mid-less legacy row among 50+
+   * identified ones made the page one row short, so coverage always reported a
+   * hole and every warm also paid the unbounded retry. */
+  it('sizes the window to cover a mid-less legacy row without a retry', async () => {
+    const legacy = msg('legacy', new Date(Date.UTC(2026, 7, 13, 7, 0, 0)).toISOString())
+    const identified = Array.from({ length: PANE_HYDRATE_LIMIT }, (_, i) =>
+      msg(`message ${i}`, new Date(Date.UTC(2026, 7, 13, 8, 0, i)).toISOString(), `m-${i}`))
+    const held = [legacy, ...identified]
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockImplementation(
+      (_key: string, limit?: number) => {
+        const start = limit === undefined ? 0 : Math.max(0, held.length - limit)
+        return Promise.resolve({
+          ...detail, messages: held.slice(start), total: held.length, has_more: start > 0,
+        })
+      },
+    )
+    const store = makeStore('active-slot', { slotMessages: { 'bg-slot': held } })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+
+    expect((api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls)
+      .toEqual([['bg-slot', PANE_HYDRATE_LIMIT + 1]])
+  })
+
+  it('leaves room for the folded stream in a count-matched running window', async () => {
+    const held = Array.from({ length: PANE_HYDRATE_LIMIT }, (_, i) =>
+      msg(`message ${i}`, new Date(Date.UTC(2026, 7, 13, 8, 0, i)).toISOString(), `m-${i}`))
+    const streaming = { role: 'streaming', content: 'partial', cls: '', ts: 'x' }
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockImplementation(
+      (_key: string, limit?: number) => {
+        const corpus = [...held, streaming]
+        const start = limit === undefined ? 0 : Math.max(0, corpus.length - limit)
+        return Promise.resolve({
+          ...detail, messages: corpus.slice(start), total: corpus.length, running: true,
+        })
+      },
+    )
+    const store = makeStore('active-slot', {
+      slotRun: { 'bg-slot': { state: 'streaming' } },
+      slotMessages: { 'bg-slot': held },
+    })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+
+    expect((api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls)
+      .toEqual([['bg-slot', PANE_HYDRATE_LIMIT + 1]])
+    expect(store.getState().chat.slotMessages['bg-slot']).toHaveLength(PANE_HYDRATE_LIMIT + 1)
+  })
+
+  it('carries a bounded total through a running coverage miss', async () => {
+    const held = [msg('held', '2026-08-13T08:00:00Z', 'm-1')]
+    const distant = msg('distant', '2026-08-13T12:00:00Z', 'm-9')
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...detail, messages: [distant], total: 3, running: true })
+    const store = makeStore('active-slot', {
+      slotRun: { 'bg-slot': { state: 'streaming' } },
+      slotMessages: { 'bg-slot': held },
+    })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+    expect(store.getState().chat.slotServerTotal['bg-slot']).toBe(3)
   })
 
   it('warms an idle slot bounded', async () => {
@@ -159,6 +224,100 @@ describe('warmSlotCache hydrate bound', () => {
     const store = makeStore('active-slot', { slotRun: { 'bg-slot': { state: 'idle' } } })
     await store.dispatch(warmSlotCache('bg-slot') as never)
     expect(api.chatSlotDetail).toHaveBeenCalledWith('bg-slot', PANE_HYDRATE_LIMIT)
+  })
+
+  /* The coverage path never reads unbounded, running or idle, so the total it
+   * retains is the collapsed count. A raw uncollapsed count (per-turn `done` rows
+   * included) is never a comparable baseline: retaining it makes the next bounded
+   * warm's smaller collapsed count read as a server shrink. */
+  it('carries the bounded total when a coverage miss finds the slot idle', async () => {
+    const held = [msg('held', '2026-08-13T08:00:00Z', 'm-1')]
+    const distant = msg('distant', '2026-08-13T12:00:00Z', 'm-9')
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...detail, messages: [distant], total: 3, running: false })
+    const store = makeStore('active-slot', {
+      slotRun: { 'bg-slot': { state: 'streaming' } },
+      slotMessages: { 'bg-slot': held },
+    })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+    expect(store.getState().chat.slotServerTotal['bg-slot']).toBe(3)
+  })
+
+  it('does not read a later collapsed warm as a shrink after an idle coverage miss', async () => {
+    const held = [msg('held', '2026-08-13T08:00:00Z', 'm-1')]
+    const distant = msg('distant', '2026-08-13T12:00:00Z', 'm-9')
+    // Every request on the coverage path is bounded, so the baseline it leaves is
+    // the collapsed count -- never the raw count an unbounded read reports.
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...detail, messages: [distant], total: 3, running: false })
+    const store = makeStore('active-slot', {
+      slotRun: { 'bg-slot': { state: 'idle' } },
+      slotMessages: { 'bg-slot': held },
+    })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+    expect(store.getState().chat.slotServerTotal['bg-slot']).toBe(3)
+    // A later bounded warm reporting the collapsed count is not a shrink: the pane
+    // keeps a live streaming row the page cannot vouch for instead of dropping it.
+    const streaming = { role: 'streaming', content: 'in-flight reply', cls: '', ts: '2026-08-13T12:00:05Z' }
+    store.dispatch(appendSlotMessage({ slot: 'bg-slot', message: streaming as never }))
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...detail, messages: [held[0], distant], total: 3, running: true })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+    expect(store.getState().chat.slotMessages['bg-slot'].map(m => m.content)).toContain('in-flight reply')
+  })
+
+  /* A rewind that removes a row a background pane still holds ALWAYS reports a
+   * coverage miss (the window cannot contain the removed row), and walking older
+   * cannot reach a row newer than the window's start. The warm confirms with one
+   * fresh read of the same bounded page -- never an unbounded one, whose raw count
+   * would read the rewind as growth -- and the reducer's shrink test drops the
+   * discarded tail. */
+  it('drops a rewind-discarded tail after one fresh bounded read', async () => {
+    const anchor = msg('anchor', '2026-08-13T08:00:00Z', 'm-1')
+    const kept = msg('kept reply', '2026-08-13T09:00:00Z', 'm-2')
+    const discarded = msg('discarded reply', '2026-08-13T10:00:00Z', 'm-3')
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      // Bounded read after the rewind: the collapsed count fell from 3 to 2.
+      .mockResolvedValueOnce({ ...detail, messages: [anchor, kept], has_more: false, total: 2 })
+      // The fresh read confirms it, in the same units.
+      .mockResolvedValueOnce({ ...detail, messages: [anchor, kept], has_more: false, total: 2 })
+    const store = makeStore('active-slot', {
+      slotMessages: { 'bg-slot': [anchor, kept, discarded] },
+      slotServerTotal: { 'bg-slot': 3 },
+    })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+    // The confirming read ran, bounded: the pane held a row the window lacked.
+    expect((api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1]))
+      .toEqual([PANE_HYDRATE_LIMIT, PANE_HYDRATE_LIMIT])
+    const held = store.getState().chat.slotMessages['bg-slot'].map(m => m.content)
+    expect(held).toEqual(['anchor', 'kept reply'])
+    expect(new Set(held).size).toBe(held.length)
+    expect(store.getState().chat.slotServerTotal['bg-slot']).toBe(2)
+  })
+
+  /* Same units, opposite outcome: a REWRITE replaces a reply and the collapsed
+   * count holds. That is also a coverage miss (the superseded row is not in the
+   * window). The confirming read is bounded, so its count matches the baseline,
+   * the rewrite is recognised, and the superseded reply is not appended beside
+   * its replacement. */
+  it('recognises a same-count rewrite after one fresh bounded read', async () => {
+    const question = { role: 'user', content: 'question', cls: '', ts: '2026-08-13T08:00:00Z', meta: { mid: 'm-1' } }
+    const superseded = msg('first reply', '2026-08-13T09:00:00Z', 'm-2')
+    const replacement = msg('rewritten reply', '2026-08-13T09:00:30Z', 'm-3')
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ ...detail, messages: [question, replacement], has_more: false, total: 2 })
+      .mockResolvedValueOnce({ ...detail, messages: [question, replacement], has_more: false, total: 2 })
+    const store = makeStore('active-slot', {
+      slotMessages: { 'bg-slot': [question, superseded] },
+      slotServerTotal: { 'bg-slot': 2 },
+    })
+    await store.dispatch(warmSlotCache('bg-slot') as never)
+    expect((api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls.map(c => c[1]))
+      .toEqual([PANE_HYDRATE_LIMIT, PANE_HYDRATE_LIMIT])
+    const held = store.getState().chat.slotMessages['bg-slot'].map(m => m.content)
+    expect(held).toEqual(['question', 'rewritten reply'])
+    expect(held.filter(c => c.endsWith('reply'))).toHaveLength(1)
+    expect(store.getState().chat.slotServerTotal['bg-slot']).toBe(2)
   })
 
   // Legacy rows predate meta.mid, so no overlap can be found at all. Replacing
@@ -1005,8 +1164,33 @@ describe('switching away from a pane whose own fetch has not landed', () => {
     expect(store.getState().chat.slotServerTotal['bg-slot']).toBe(6)
   })
 
-  // OPPOSITE DIRECTION, and the reason the suppression cannot simply be deleted:
-  // a genuine truncation must NOT have its deleted rows resurrected.
+  it('widens an older bounded snapshot instead of treating it as a shrink', async () => {
+    const history = msg('history', '2026-08-13T08:00:00Z', 'm-1')
+    const newer = msg('newer turn', '2026-08-13T12:00:00Z', 'm-9')
+    let resolveFirst: (v: unknown) => void = () => {}
+    let resolveSecond: (v: unknown) => void = () => {}
+    ;(api.chatSlotDetail as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => new Promise(r => { resolveFirst = r }))
+      .mockImplementationOnce(() => new Promise(r => { resolveSecond = r }))
+      .mockResolvedValueOnce({ ...detail, messages: [history, newer], total: 6, has_more: false })
+    const store = makeStore('active-slot', {
+      slotMessages: { 'bg-slot': [history, newer] },
+      slotServerTotal: { 'bg-slot': 4 },
+    })
+    const first = store.dispatch(warmSlotCache('bg-slot') as never)
+    const second = store.dispatch(warmSlotCache('bg-slot') as never)
+    resolveFirst({ ...detail, messages: [history, newer], total: 6, has_more: false })
+    await first
+    resolveSecond({ ...detail, messages: [history], total: 5, has_more: true })
+    await second
+
+    expect((api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(3)
+    expect(store.getState().chat.slotMessages['bg-slot'].map(m => m.content))
+      .toEqual(['history', 'newer turn'])
+  })
+
+  // The widening retry must still preserve a genuine truncation: its full read
+  // confirms the shorter corpus, so the reducer removes the discarded row.
   it('still drops rows a genuine truncation removed', async () => {
     const anchor = msg('anchor', '2026-08-13T08:00:00Z', 'm-1')
     const discarded = msg('rewound turn', '2026-08-13T12:00:00Z', 'm-9')

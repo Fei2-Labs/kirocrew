@@ -1,7 +1,7 @@
 """Both memory versions leave history and fragment retrieval to the recall tool."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 from test_member_essential_context import env as _member_env
@@ -12,6 +12,13 @@ from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
 
 env = _member_env
+
+
+@pytest.fixture(autouse=True)
+def _close_skills_loaders(close_skills_loaders):
+    """Every test here builds a ``ContextBuilder`` (``env`` included): close its
+    ``SkillsLoader`` (rootdir conftest) -- the skill search index is a SQLite
+    connection nothing else closes."""
 
 
 def test_v2_prompt_lifecycles_leave_retrieval_to_the_tool(env, monkeypatch):
@@ -50,21 +57,24 @@ def test_v2_prompt_lifecycles_leave_retrieval_to_the_tool(env, monkeypatch):
     assert all(call.kwargs["query_text"] for call in rules.call_args_list)
 
 
-def test_v1_new_session_keeps_preferences_and_defers_history_to_recall(tmp_path):
+def test_v1_new_session_reads_activity_once_and_follow_ups_never(tmp_path):
     memory = MemoryStore(workspace=tmp_path / "workspace")
     memory.write_preferences("Use a concise reply.")
     memory.write_projects("The active project is Beacon.")
-    forbidden = Mock(side_effect=AssertionError("prompt construction attempted eager retrieval"))
-    memory.read_recent_history = forbidden
+    history = Mock(return_value="#### 09:00 deploy\nHistory sentinel")
+    memory.read_recent_history = history
     preferences = Mock(return_value="[Semantic Memory]\nPreference fact sentinel")
+    facts = Mock(return_value="[Task facts]\nTask fact sentinel")
+    episodes = Mock(return_value="[Episodic Memory]\nEpisode sentinel")
     lessons = Mock(return_value="[Lessons Learned]\nRelevant correction sentinel")
     memory._vector_store = SimpleNamespace(
         algorithm_version="v1",
-        get_semantic_context=forbidden,
-        get_episodic_context=forbidden,
+        get_semantic_context=facts,
+        get_episodic_context=episodes,
         get_preferences_context=preferences,
         has_any_lesson=lambda: True,
         get_lessons_context=lessons,
+        startup_lesson_query=lambda query_text: None,
     )
     builder = ContextBuilder(
         memory=memory,
@@ -76,19 +86,31 @@ def test_v1_new_session_keeps_preferences_and_defers_history_to_recall(tmp_path)
     for sentinel in (
         "Use a concise reply.",
         "Preference fact sentinel",
+        "Task fact sentinel",
+        "Episode sentinel",
         "Relevant correction sentinel",
-        "memory_recall",
         "[End of memory activity index]",
     ):
-        assert sentinel in first
-    forbidden.assert_not_called()
+        assert first.count(sentinel) == 1, sentinel
+    # Named by the activity index AND carried whole in the activity block.
+    for sentinel in ("The active project is Beacon.", "History sentinel", "memory_recall"):
+        assert sentinel in first, sentinel
     preferences.assert_called_once()
     lessons.assert_called_once()
+    # Facts and episodes are ranked against the request, once each, with the
+    # pref.* rows left to the protected preferences read.
+    facts.assert_called_once_with(query_text=query, cap=ANY, facts_only=True)
+    episodes.assert_called_once_with(query_text=query, cap=ANY)
+    # One history read, by the activity block: the activity index reads the
+    # uncached path and the protected preferences read skips history entirely.
+    history.assert_called_once()
 
     builder.build_message("Continue the same session", False, "session")
-    forbidden.assert_not_called()
     preferences.assert_called_once()
     lessons.assert_called_once()
+    facts.assert_called_once()
+    episodes.assert_called_once()
+    history.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -106,3 +128,61 @@ def test_withheld_memory_does_not_advertise_automatic_recall(tmp_path, options):
     message, _ = builder.build_message("Current question", True, "session", **options)
     assert "[Memory tools]" not in message
     assert "Facts and past experiences are not searched automatically" not in message
+
+
+def test_v1_new_session_bounds_pref_rows_at_the_startup_cap(tmp_path, opened):
+    """The cap must reach the store through the real plumbing
+    (context._ResolvedCaps -> memory.get_context -> get_preferences_context).
+    Mocks cannot see a dropped keyword argument; a real store over the cap can."""
+    from kiro_crew.context import _PREFS_STARTUP_CAP
+    from kiro_crew.vector_memory import VectorMemoryStore
+
+    vectors = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
+    vectors.init()
+    for i in range(60):
+        vectors.set_semantic(f"pref.rule_{i:02d}", f"standing rule {i} " * 25, 0.9, "user_explicit")
+    memory = MemoryStore(workspace=tmp_path / "workspace", vector_store=vectors)
+    builder = ContextBuilder(
+        memory=memory,
+        skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        lessons=LessonStore(base_dir=tmp_path),
+    )
+    first, _ = builder.build_message("plan the deploy", True, "session")
+    start = first.index("[Semantic Memory")
+    end = first.index("[End of semantic memory]\n") + len("[End of semantic memory]\n")
+    block = first[start:end]
+    assert len(block) <= _PREFS_STARTUP_CAP
+    assert "preference facts above the" in block
+    assert f"{_PREFS_STARTUP_CAP}-character startup budget" in block
+    assert 0 < block.count("\npref.rule_") < 60
+
+
+def test_v1_new_session_records_the_pref_cut_beside_its_notice(tmp_path, opened):
+    """The usage record states the same cut the startup notice states, gathered
+    through the real build rather than recomputed."""
+    import re
+
+    from kiro_crew import context_omissions
+    from kiro_crew.vector_memory import VectorMemoryStore
+
+    vectors = opened(VectorMemoryStore(db_path=tmp_path / "mem.db"))
+    vectors.init()
+    for i in range(60):
+        vectors.set_semantic(f"pref.rule_{i:02d}", f"standing rule {i} " * 25, 0.9, "user_explicit")
+    memory = MemoryStore(workspace=tmp_path / "workspace", vector_store=vectors)
+    builder = ContextBuilder(
+        memory=memory,
+        skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+        lessons=LessonStore(base_dir=tmp_path),
+    )
+    with context_omissions.collect() as cut:
+        first, _ = builder.build_message("plan the deploy", True, "session")
+    stated = re.search(r"omitted (\d+) of (\d+) preference facts above the (\d+)-character", first)
+    assert stated
+    omitted, total, limit = (int(g) for g in stated.groups())
+    assert cut[context_omissions.PREFERENCE_FACTS] == {
+        "reason": "budget",
+        "omitted": omitted,
+        "total": total,
+        "budget_chars": limit,
+    }

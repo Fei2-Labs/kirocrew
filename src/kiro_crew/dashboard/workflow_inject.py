@@ -18,9 +18,11 @@ import re
 from typing import Any, Callable, Optional
 
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
     append_and_surface,
+    load_window_off_loop,
     note_crew_log_class,
     row_mid,
 )
@@ -166,9 +168,25 @@ def inject_workflow_result(
         if slot is None:
             if snapshot.get("memory_mode", "persistent") != "persistent":
                 return False
+            # Never adopt an app-owned slot under the run's key: linking it would
+            # hand the app the originating session's transcript.
+            if app_holds_gateway_key(state, f"workflow-{run_id}", "workflow.inject_result"):
+                return False
             slot = state.get_or_create_slot(name=f"workflow-{run_id}")
             if not getattr(slot, "linked_session_key", ""):
                 slot.linked_session_key = session_key
+                # A reused ``workflow-<run_id>`` slot object can still hold the
+                # PRIOR run's in-memory dismissed set. Leaving it in place while
+                # the slot now links a DIFFERENT transcript would let the next
+                # union-save fold those foreign tombstones into the newly-linked
+                # transcript and suppress unrelated links there — the same silent,
+                # permanent cross-transcript corruption the cron bind path clears
+                # against. Empty the set and mark it dismissed-unhydrated so the
+                # union carries only the linked transcript's own on-disk line; a
+                # later readable restore replaces it authoritatively.
+                slot._dismissed_source_links = set()
+                slot.invalidate_source_links()
+                slot._dismissed_hydrated = False
                 note_crew_log_class(state, slot)
             slot.title = f"Workflow: {snapshot.get('name') or run_id}"
 
@@ -190,7 +208,7 @@ def inject_workflow_result(
                     "assistant",
                     msg,
                     "msg msg-a",
-                    extra={"kind": "workflow_result"},
+                    meta={"kind": "workflow_result"},
                 )
             )
             # Persist so a follow-up chat turn has the result as context.
@@ -240,6 +258,24 @@ def inject_workflow_result(
         return False
 
 
+def _seed_turn_timeout(slot: Any, meta: Optional[dict]) -> None:
+    """Give a fresh slot linked to an existing transcript that transcript's turn time limit.
+
+    *meta* is the transcript's readable metadata line, or ``None`` when it could
+    not be read. Unread, the slot holds no limit of its own and is marked
+    unhydrated, so its saves carry the on-disk value forward instead of
+    replacing it with "follow the global".
+    """
+    from kiro_crew.dashboard.slot_persistence.metadata_codec import _validate_turn_timeout_secs
+
+    if meta is None:
+        slot.turn_timeout_secs = None
+        slot._turn_timeout_hydrated = False
+        return
+    slot.turn_timeout_secs = _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    slot._turn_timeout_hydrated = True
+
+
 async def inject_bound_workflow_result(
     state: DashboardState, run_id: str, snapshot: dict, *, on_injected=None
 ) -> bool:
@@ -256,6 +292,15 @@ async def inject_bound_workflow_result(
     )
 
     try:
+        # The delivery appends to the originating tab's rows. A tab restored as a
+        # sidebar row loads its window first, with the read off the loop; every
+        # lookup below reads the slot again after this await.
+        origin = snapshot.get("session_key", "")
+        getter = getattr(state, "get_slot", None)
+        if isinstance(origin, str) and origin and callable(getter):
+            live = getter(_slot_key_from_session(origin))
+            if live is not None:
+                await load_window_off_loop(live)
         execution = execution_from_record(snapshot, required=False)
         if execution is None:
             if snapshot.get("memory_store") or snapshot.get("member_id"):
@@ -297,6 +342,18 @@ async def inject_bound_workflow_result(
             # Bind the original identity when the parent is absent.
             # The new visible slot inherits it before any provider can start.
             await asyncio.to_thread(bind_session_execution, origin, execution)
+            # The transcript's own turn time limit is read before a fresh slot
+            # exists, so the slot never saves "follow the global" over it.
+            limit_meta: dict = {}
+            limit_readable = False
+            log = getattr(state, "conversation_log", None)
+            if slot is None and log is not None:
+                try:
+                    limit_meta, limit_readable = await asyncio.to_thread(
+                        log.get_metadata_status, origin
+                    )
+                except Exception:  # noqa: BLE001 - an unread limit stays deferred below
+                    limit_meta, limit_readable = {}, False
             if (
                 state.get_slot(_slot_key_from_session(origin)) is not None
                 or state.get_slot(fallback_name) is not slot
@@ -310,6 +367,7 @@ async def inject_bound_workflow_result(
                     memory_mode=execution.memory_mode,
                 )
                 slot.memory_store = execution.store.legacy_name
+                _seed_turn_timeout(slot, limit_meta if limit_readable else None)
             on_injected = None
         delivered = dict(snapshot)
         delivered["memory_mode"] = execution.memory_mode

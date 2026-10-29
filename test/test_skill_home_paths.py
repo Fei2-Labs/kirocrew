@@ -3,8 +3,8 @@
 The data home is ``~/.kiro/crew`` (nested under kiro-cli's ``~/.kiro``), not the
 top-level ``~/.kirocrew``. A skill that points at the legacy path makes agents
 run commands against a path that does not exist, and the scripts some skills
-execute (``prepare-pr``'s ``$SKILL_DIR/scripts/*.py``,
-``self-nudge-loop``'s ``.local_secret`` read, ``feature-demo-recording``'s venv)
+execute (``kirocrew-prepare-pr``'s ``$SKILL_DIR/scripts/*.py``,
+``self-nudge-loop``'s ``autonudge.json`` path, ``feature-demo-recording``'s venv)
 fail outright.
 
 These tests keep the fix from silently regressing: a skill that reintroduces the
@@ -130,8 +130,8 @@ def test_migration_exemption_is_narrow() -> None:
 # this covers prose, and neither covers a brand-new description string.
 AGENT_INSTRUCTION_FILES = (
     "src/kiro_crew/config/prompt.md",
-    "src/kiro_crew/config/prompt-orchestrator.md",
     "src/kiro_crew/mcp_cron.py",
+    "src/kiro_crew/mcp_cron_tool_list.py",
     "AUTOSDE.yaml",
     "website/AUTOSDE.yaml",
 )
@@ -142,7 +142,7 @@ def test_agent_instruction_surfaces_do_not_name_the_legacy_home() -> None:
 
     ``config/prompt.md`` is the concrete case this exists for: it instructed
     every agent that cron scripts "must live under ``~/.kirocrew/crons/``" while
-    ``cron_script.py`` enforces ``config_dir()/crons``, so an obedient agent
+    ``cron_script_paths.py`` enforces ``config_dir()/crons``, so an obedient agent
     created the abandoned directory and then had its registration refused.
     """
     scanned = 0

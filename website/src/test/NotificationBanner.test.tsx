@@ -14,8 +14,11 @@ import { createRef } from 'react'
 import { renderWithProviders, createTestStore } from './helpers'
 import NotificationBanner, { computeExitDelta, exitTarget } from '../components/notifications/NotificationBanner'
 import { dispatchLiveNotification } from '../hooks/notificationEvent'
-import { BANNER_AUTO_HIDE_MS, BANNER_ENABLED_KEY, saveBannerEnabled, shouldBannerNote, targetsCurrentView } from '../hooks/notificationBanner'
+import { BANNER_AUTO_HIDE_MS, BANNER_ENABLED_KEY, MEMBER_MESSAGE_CHANNEL, saveBannerEnabled, shouldBannerNote, targetsCurrentView } from '../hooks/notificationBanner'
+import { _resetViewedThreadForTests, setViewedThreadSlot } from '../lib/viewedThread'
 import type { RootState } from '../store'
+import { setActiveId } from '../store/instancesSlice'
+import { LocalOverlayRoot } from '../components/overlayRoot'
 import type { Notification } from '../types'
 
 const mockAck = vi.fn().mockResolvedValue({})
@@ -46,6 +49,7 @@ let isMobileMock = false
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => isMobileMock }))
 
 let reducedMotionMock = false
+let presenceModeMock: string | undefined
 vi.mock('framer-motion', async () => {
   const React = await import('react')
   const FRAMER_PROPS = new Set(['layout', 'layoutId', 'initial', 'animate', 'exit', 'transition', 'variants', 'custom'])
@@ -60,7 +64,10 @@ vi.mock('framer-motion', async () => {
     })
   return {
     motion: { div: make('div') },
-    AnimatePresence: ({ children }: { children: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children, mode }: { children: React.ReactNode; mode?: string }) => {
+      presenceModeMock = mode
+      return React.createElement(React.Fragment, null, children)
+    },
     useReducedMotion: () => reducedMotionMock,
   }
 })
@@ -226,6 +233,39 @@ describe('shouldBannerNote / targetsCurrentView (pure)', () => {
     expect(targetsCurrentView(mkN({ url: '/schedule?job=1' }), { pathname: '/schedule', activeSlot: null, windowFocused: true })).toBe(true)
     expect(targetsCurrentView(mkN({ url: '/schedule' }), { pathname: '/schedule', activeSlot: null, windowFocused: false })).toBe(false)
     expect(targetsCurrentView(mkN({ url: '/schedule' }), { pathname: '/settings', activeSlot: null, windowFocused: true })).toBe(false)
+  })
+  it("treats a mate's message as on screen only while its own thread is", () => {
+    const ada = mkN({ channel: MEMBER_MESSAGE_CHANNEL, kind: 'agent', slot: 'member-ada', url: '/members?member=Ada', member: { slug: 'ada', name: 'Ada' } })
+    const onMembers = { pathname: '/members', activeSlot: null, windowFocused: true }
+    expect(targetsCurrentView(ada, { ...onMembers, viewedThread: 'member-ada' })).toBe(true)
+    // Another crewmate's thread, or the page with no thread open: the route
+    // alone is not this message's view, so it still banners.
+    expect(targetsCurrentView(ada, { ...onMembers, viewedThread: 'member-bo' })).toBe(false)
+    expect(targetsCurrentView(ada, { ...onMembers, viewedThread: null })).toBe(false)
+    expect(targetsCurrentView(ada, { ...onMembers, viewedThread: 'member-ada', windowFocused: false })).toBe(false)
+    // The same thread open as a chat is on screen through the chat rule.
+    expect(targetsCurrentView(ada, { pathname: '/chat', activeSlot: 'member-ada', windowFocused: true })).toBe(true)
+    // Any other note keeps the route rule.
+    expect(targetsCurrentView(mkN({ url: '/members?member=Ada' }), { ...onMembers, viewedThread: 'member-bo' })).toBe(true)
+  })
+})
+
+describe("NotificationBanner: a mate's message", () => {
+  afterEach(() => { _resetViewedThreadForTests() })
+  const adaNote = () => mkN({ channel: MEMBER_MESSAGE_CHANNEL, kind: 'agent', slot: 'member-ada', url: '/members?member=Ada', title: 'Ada' })
+
+  it('banners on the Members page while another thread is open', () => {
+    renderBanner({ route: '/members' })
+    setViewedThreadSlot('member-bo')
+    arrive(adaNote())
+    expect(cards()).toHaveLength(1)
+  })
+
+  it('stays in the bell while its own thread is open', () => {
+    renderBanner({ route: '/members' })
+    setViewedThreadSlot('member-ada')
+    arrive(adaNote())
+    expect(cards()).toHaveLength(0)
   })
 })
 
@@ -436,6 +476,23 @@ describe('NotificationBanner: stack and interaction', () => {
     expect(cards()).toHaveLength(0)
   })
 
+  it('over a remote Crew, the inbox line brings the local Crew forward before it navigates', () => {
+    const store = createTestStore()
+    store.dispatch(setActiveId('remote-crew'))
+    const bellRef = createRef<HTMLButtonElement>()
+    renderWithProviders(
+      <LocalOverlayRoot hidden>
+        <NotificationBanner bellRef={bellRef} popoverOpen={false} onOpenNote={vi.fn()} />
+      </LocalOverlayRoot>,
+      { store, route: '/settings' },
+    )
+    for (let i = 0; i < 6; i++) arrive(mkN())
+    fireEvent.click(screen.getByTestId('notification-banner-count'))
+    fireEvent.click(screen.getByText('+2 more in your inbox'))
+    expect(store.getState().instances.activeId).toBeNull()
+    expect(mockNavigate).toHaveBeenCalledWith('/notifications')
+  })
+
   it('the inbox line is refused by the leave guard like any other navigation', () => {
     mayLeaveMock = false
     renderBanner()
@@ -465,6 +522,37 @@ describe('NotificationBanner: stack and interaction', () => {
     const x = screen.getByTestId('notification-banner-dismiss')
     expect(x.className).toContain('opacity-0')
     expect(x.className).toContain('group-hover:opacity-50')
+  })
+
+  it('pops a dismissed card out of flow and out of hit-testing so the next close lands under the pointer', () => {
+    renderBanner()
+    arrive(mkN({ priority: 'critical', title: 'First' }))
+    arrive(mkN({ priority: 'critical', title: 'Second' }))
+    // popLayout: the leaving card stops occupying its slot at once, so the
+    // card behind it takes that slot instead of waiting out the exit.
+    expect(presenceModeMock).toBe('popLayout')
+    const leaving = cards()[0]
+    // The top card must be positioned, or its zIndex is ignored and the
+    // absolute deck shells paint over it and take its close click.
+    expect(leaving.style.position).toBe('relative')
+    fireEvent.click(screen.getByTestId('notification-banner-dismiss'))
+    expect(cards()).toHaveLength(1)
+    expect(cards()[0].textContent).toContain('First')
+    expect(screen.getByTestId('notification-banner-dismiss')).toBeTruthy()
+    expect(exitTarget({ dx: 24, dy: -38 }, false).pointerEvents).toBe('none')
+    expect(exitTarget({ dx: 24, dy: -38 }, true).pointerEvents).toBe('none')
+  })
+
+  it('lets a note that re-arrives with the same timestamp be dismissed again', () => {
+    renderBanner()
+    const note = mkN({ priority: 'critical', title: 'Same note' })
+    arrive(note)
+    fireEvent.click(screen.getByTestId('notification-banner-dismiss'))
+    expect(cards()).toHaveLength(0)
+    arrive(note)
+    expect(cards()).toHaveLength(1)
+    fireEvent.click(screen.getByTestId('notification-banner-dismiss'))
+    expect(cards()).toHaveLength(0)
   })
 
   it('Escape dismisses the topmost card only', () => {
@@ -504,6 +592,23 @@ describe('NotificationBanner: stack and interaction', () => {
     await waitFor(() => expect(cards()).toHaveLength(0))
     expect(store.getState().notifications.items[0].acked).toBe(true)
     expect(mockAck).toHaveBeenCalledWith(n.ts)
+  })
+
+  it('over a remote Crew, an action brings the local Crew forward before it navigates', async () => {
+    const n = mkN({ actions: [{ id: 'a', label: 'Open run', url: '/schedule' }] })
+    const store = createTestStore({ notifications: { items: [n] } as RootState['notifications'] })
+    store.dispatch(setActiveId('remote-crew'))
+    const bellRef = createRef<HTMLButtonElement>()
+    renderWithProviders(
+      <LocalOverlayRoot hidden>
+        <NotificationBanner bellRef={bellRef} popoverOpen={false} onOpenNote={vi.fn()} />
+      </LocalOverlayRoot>,
+      { store, route: '/settings' },
+    )
+    arrive(n)
+    fireEvent.click(screen.getByText('Open run'))
+    expect(store.getState().instances.activeId).toBeNull()
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/schedule'))
   })
 
   it('an action refused by the leave guard acks nothing and keeps the card', async () => {
@@ -557,9 +662,9 @@ describe('exit geometry', () => {
     expect(full).toMatchObject({ x: 24, y: -38, opacity: 0 })
     expect(full.scale).toBeLessThan(1)
     const reduced = exitTarget({ dx: 24, dy: -38 }, true)
-    expect(reduced).toEqual({ opacity: 0, transition: { duration: 0.18 } })
+    expect(reduced).toEqual({ opacity: 0, pointerEvents: 'none', transition: { duration: 0.18 } })
     expect(Object.keys(reduced)).not.toContain('x')
     expect(Object.keys(reduced)).not.toContain('scale')
-    expect(exitTarget(undefined, false)).toEqual({ opacity: 0, transition: { duration: 0.18 } })
+    expect(exitTarget(undefined, false)).toEqual({ opacity: 0, pointerEvents: 'none', transition: { duration: 0.18 } })
   })
 })

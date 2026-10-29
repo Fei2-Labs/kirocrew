@@ -40,18 +40,21 @@ from types import ModuleType
 
 import pytest
 
-from kiro_crew import artifacts, cloud, validation
+from kiro_crew import cloud, crew_log, skill_providers
 from kiro_crew.apps.builtins.papyrus import backend as papyrus_backend
 from kiro_crew.apps.builtins.papyrus.backend import gitops, store
 from kiro_crew.cloud import config as cloud_config
 from kiro_crew.cloud import ec2, fargate_engine, login_target, ssm
 from kiro_crew.cloud.fargate import identity, runtask, taskdef
+from kiro_crew.crew_log import schema as crew_log_schema
+from kiro_crew.dashboard.handlers import artifacts as artifact_handlers
+from kiro_crew.skill_providers import github as skill_provider_github
 
 #: Packages whose modules validate client-supplied input on a request path.
 #: The structural walk imports every module in each -- recursively, so a
 #: sub-package (``cloud/fargate/``) and any package added under a registered
 #: root later are covered without editing this file.
-_REQUEST_PATH_PACKAGES = (papyrus_backend, cloud)
+_REQUEST_PATH_PACKAGES = (papyrus_backend, cloud, skill_providers, crew_log)
 
 #: (pattern, canonical valid input) for every request-path validator. The
 #: behavioral half of the contract runs each through accept and reject cases.
@@ -61,8 +64,6 @@ _VALIDATORS = (
     pytest.param(gitops.GIT_URL_RE, "https://example.com/group/paper.git", id="git-url-url-form"),
     pytest.param(gitops.GIT_URL_RE, "git@example.com:group/paper.git", id="git-url-scp-form"),
     pytest.param(store.PROJECT_NAME_RE, "paper", id="project-name"),
-    pytest.param(artifacts._TAG_RE, "artifact-tag", id="artifact-store-tag"),
-    pytest.param(validation._ARTIFACT_TAG_RE, "artifact-tag", id="artifact-mcp-tag"),
     pytest.param(cloud_config._TAG_RE, "my-crew-1", id="cloud-config-tag"),
     pytest.param(ec2._TAG_RE, "my-crew-1", id="cloud-ec2-tag"),
     pytest.param(ec2._REGION_RE, "us-east-1", id="cloud-ec2-region"),
@@ -80,19 +81,43 @@ _VALIDATORS = (
     pytest.param(identity._ACCOUNT_RE, "123456789012", id="cloud-identity-account"),
     pytest.param(identity._REGION_RE, "us-east-1", id="cloud-identity-region"),
     pytest.param(
-        identity._SECRET_NAME_RE, "kirocrew/crew/my-crew/gateway_token", id="cloud-identity-secret-name"
+        identity._SECRET_NAME_RE,
+        "kirocrew/crew/my-crew/gateway_token",
+        id="cloud-identity-secret-name",
     ),
     pytest.param(identity._SECRET_SUFFIX_RE, "Ab12Cd", id="cloud-identity-secret-suffix"),
-    pytest.param(
-        identity._SECRET_TAIL_RE, "gateway_token-Ab12Cd", id="cloud-identity-secret-tail"
-    ),
+    pytest.param(identity._SECRET_TAIL_RE, "gateway_token-Ab12Cd", id="cloud-identity-secret-tail"),
     pytest.param(runtask._TAG_VALUE_RE, "kirocrew_launch-1", id="cloud-runtask-tag-value"),
     pytest.param(
         taskdef._DIGEST_REF_RE,
         "public.ecr.aws/kirocrew/crew@sha256:" + "0" * 64,
         id="cloud-taskdef-digest-ref",
     ),
+    pytest.param(skill_provider_github._OWNER_RE, "acme", id="skill-provider-owner"),
+    pytest.param(skill_provider_github._REPO_RE, "widgets", id="skill-provider-repo"),
+    pytest.param(skill_provider_github._FULL_SHA_RE, "0" * 40, id="skill-provider-commit"),
+    pytest.param(skill_provider_github._SEGMENT_RE, "SKILL.md", id="skill-provider-path-segment"),
+    pytest.param(skill_provider_github._REF_RE, "release/1.2", id="skill-provider-ref"),
+    pytest.param(crew_log_schema._SEGMENT_RE, "activity", id="crew-log-name-segment"),
+    # The dashboard artifact handler's two raw ``.match`` validators.
+    # Behavioral half only: the handlers package is not in
+    # ``_REQUEST_PATH_PACKAGES``, since other modules in it still carry the
+    # ``$`` shape and a structural walk over the package is its own change.
+    pytest.param(
+        artifact_handlers._SESSION_KEY_RE, "dashboard:chat-2", id="artifact-origin-session-key"
+    ),
+    pytest.param(
+        artifact_handlers._ARTIFACT_PROVIDER_RE, "default", id="artifact-publish-provider"
+    ),
 )
+
+#: Registered for the STRUCTURAL half only. ``skill_providers.github._ADDRESS_RE``
+#: splits ``owner/repo`` out of an address, and its ``[^/@:]`` classes admit a
+#: newline, so the whole address plus ``"\n"`` matches it even anchored at ``\Z``
+#: -- the newline is refused one step later, when ``_OWNER_RE`` and ``_REPO_RE``
+#: judge the parts it captured. Its anchor still has to be ``\Z`` (the structural
+#: half enforces that), and ``test_skill_provider_github.py`` owns the boundary.
+_SPLITTERS_WITH_NO_BOUNDARY_CASE = (skill_provider_github._ADDRESS_RE,)
 
 #: A ``$`` that is a real anchor: preceded by an EVEN number of backslashes
 #: (``\$`` is a literal dollar; ``\\$`` is an escaped backslash then an
@@ -122,9 +147,9 @@ class TestTrailingNewlineContract:
     def test_valid_input_plus_newline_is_rejected(
         self, pattern: re.Pattern[str], valid: str
     ) -> None:
-        assert pattern.match(valid + "\n") is None, (
-            f"{pattern.pattern!r} accepts a trailing newline -- anchor with \\Z, not $"
-        )
+        assert (
+            pattern.match(valid + "\n") is None
+        ), f"{pattern.pattern!r} accepts a trailing newline -- anchor with \\Z, not $"
 
     def test_no_request_path_pattern_is_dollar_anchored(self) -> None:
         """The structural half: a ``$``-anchored validator anywhere in a
@@ -154,3 +179,16 @@ class TestTrailingNewlineContract:
         assert store.__name__ in walked
         assert ec2.__name__ in walked
         assert identity.__name__ in walked
+        assert skill_provider_github.__name__ in walked
+        assert crew_log_schema.__name__ in walked
+
+    def test_a_splitter_with_no_boundary_case_is_still_z_anchored(self) -> None:
+        """A pattern exempt from the behavioral half is not exempt from the rule.
+
+        Its own character classes admit the newline, so only the structural half
+        can speak for it -- state that here rather than leaving a reader to infer
+        the omission from the registry.
+        """
+        for pattern in _SPLITTERS_WITH_NO_BOUNDARY_CASE:
+            assert not _UNESCAPED_DOLLAR.search(pattern.pattern)
+            assert pattern.pattern.endswith(r"\Z")

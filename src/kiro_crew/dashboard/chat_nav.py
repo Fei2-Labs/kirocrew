@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from urllib.parse import urlparse
@@ -9,7 +10,9 @@ from urllib.parse import urlparse
 from aiohttp import web
 
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.label_guard import looks_like_prose
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.platform import redact_log_via_context
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.session import BACKGROUND_KEY
@@ -23,9 +26,9 @@ _LINK_SUMMARY_PROMPT = (
     "- Output one label per line, in the same order as the input\n"
     "- Each line should be ONLY the label text, nothing else\n"
     "- Be concise: 'Memory V2 Design Doc' not 'A document about the Memory V2 design'\n"
-    "- For CRs: include the feature name, e.g. 'Nav panel link labels CR'\n"
-    "- For tickets: include the topic, e.g. 'OmniScan Cognex deployment'\n"
-    "- If context is insufficient, use the URL type + ID as label, e.g. 'Doc dVbcAXW3'\n\n"
+    "- For pull requests: include the feature name, e.g. 'Nav panel link labels PR'\n"
+    "- For issues: include the topic, e.g. 'Login timeout on mobile'\n"
+    "- If context is insufficient, use the URL type + ID as label, e.g. 'Issue 1234'\n\n"
     "{items}"
 )
 
@@ -55,12 +58,32 @@ def _normalize_link(raw: object) -> dict[str, str]:
     }
 
 
+#: Most characters of a link's url and context the label prompt reads. The in-flight
+#: key and the shared call are built from the same cut (``_bounded_link``), so
+#: nothing they hold grows with the request.
+_LINK_URL_MAX = 500
+_LINK_CONTEXT_MAX = 300
+
+
+def _bounded_link(link: dict) -> dict[str, str]:
+    """The part of ``link`` the label prompt reads: its url and context, cut to their limits.
+
+    Idempotent, so a link it already bounded comes back unchanged: the context is
+    stripped before and after the cut.
+    """
+    return {
+        "url": link.get("url", "")[:_LINK_URL_MAX],
+        "context": link.get("context", "").strip()[:_LINK_CONTEXT_MAX].rstrip(),
+    }
+
+
 def _build_link_summary_prompt(links: list[dict]) -> str:
     """Build prompt for batch link summary generation."""
     items: list[str] = []
     for i, link in enumerate(links):
-        url = _safe_url_for_prompt(link.get("url", "")[:500])
-        ctx = link.get("context", "").strip()[:300]
+        bounded = _bounded_link(link)
+        url = _safe_url_for_prompt(bounded["url"])
+        ctx = bounded["context"]
         ctx_part = f"\n  Context: {ctx}" if ctx else ""
         items.append(f"{i + 1}. URL: {url}{ctx_part}")
     return _LINK_SUMMARY_PROMPT.format(items="\n".join(items))
@@ -70,22 +93,110 @@ def _build_link_summary_prompt(links: list[dict]) -> str:
 # override for auto). A hardcoded model id 400s on accounts/partitions that do
 # not serve it.
 _LINK_SUMMARY_MODEL = "auto"
+#: Bound on one link-label call: the same 30 s the folder icon and folder
+#: suggestion one-liners use.
+_LINK_SUMMARY_TIMEOUT_SECS = 30.0
+#: Link-label calls running now, keyed by their bounded links (``_bounded_link``), so
+#: an identical request awaits the running call instead of starting another. An
+#: entry is removed when its call ends; at most ``_LINK_SUMMARY_INFLIGHT_MAX``
+#: distinct link sets run at once, and a request past that is answered without labels.
+_LINK_SUMMARY_INFLIGHT: dict[tuple[tuple[str, str], ...], asyncio.Task[list[str]]] = {}
+_LINK_SUMMARY_INFLIGHT_MAX = 8
+
+#: Unspaced-script ceiling for the prose guard on a 3-8 word label. The prompt
+#: teaches no character budget (the title's "~4-14 characters" hint is not sent
+#: here), so a legitimate Thai or long-katakana label can run past the title's
+#: 24; 48 keeps such a name while a refusal sentence still runs well past it.
+_LINK_LABEL_MAX_UNSPACED_CHARS = 48
+
+#: A leading list enumerator the model adds on its own ("1. ", "2) "). It is
+#: stripped from the label; a numbered line is by definition a slot, never a
+#: preamble -- see ``_resolve_link_summaries``.
+_ENUMERATOR_RE = re.compile(r"^\d{1,2}[.)]\s+")
+
+#: A list preamble the model adds before the labels, matched as a COMPLETE
+#: phrase: "Here are the labels:", "Here are the labels for your links:",
+#: "Labels:", "The following labels:", "Below are the labels:", "以下是标签：".
+#: A whole-line phrase is required (not a shared first word) so a real label
+#: that starts like one ("Label Printing Bug:", "API Reference Docs:") is never
+#: taken for a preamble.
+_PREAMBLE_RE = re.compile(
+    r"^(?:"
+    r"here(?:'s| is| are) (?:the |your )?labels?(?: for (?:the |your |each |these )?"
+    r"(?:links?|urls?))?"
+    r"|(?:the |your )?labels?"
+    r"|(?:the )?following(?: labels?)?"
+    r"|below (?:is|are) (?:the |your )?labels?"
+    r"|\u4ee5\u4e0b(?:\u662f)?(?:\u94fe\u63a5)?\u6807\u7b7e"
+    r")[:\uff1a]$",
+    re.IGNORECASE,
+)
+
+
+async def _shared_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
+    """Labels for ``links``, sharing one running call among identical requests.
+
+    The key and the call's input are the bounded links (``_bounded_link``), the
+    fields the prompt reads, so an entry holds at most ``_LINK_URL_MAX +
+    _LINK_CONTEXT_MAX`` characters per link however long the request's strings are.
+    Labels are positional, so each waiter's labels line up with its own links. The
+    call is shielded, so a request that goes away does not cancel it for the others.
+    Its entry leaves ``_LINK_SUMMARY_INFLIGHT`` when it ends, however it ends.
+    """
+    bounded = [_bounded_link(link) for link in links]
+    key = tuple((link["url"], link["context"]) for link in bounded)
+    task = _LINK_SUMMARY_INFLIGHT.get(key)
+    if task is None:
+        if len(_LINK_SUMMARY_INFLIGHT) >= _LINK_SUMMARY_INFLIGHT_MAX:
+            raise RuntimeError("too many link-label calls in flight")
+        task = asyncio.ensure_future(_resolve_link_summaries(state, bounded))
+        _LINK_SUMMARY_INFLIGHT[key] = task
+
+        def _forget(done: asyncio.Task[list[str]]) -> None:
+            if _LINK_SUMMARY_INFLIGHT.get(key) is done:
+                del _LINK_SUMMARY_INFLIGHT[key]
+
+        task.add_done_callback(_forget)
+    return list(await asyncio.shield(task))
 
 
 async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> list[str]:
     """Generate summaries for a batch of links using the background session."""
     prompt = _build_link_summary_prompt(links)
-    # Link labeling is a trivial classification task — run on the cheapest model
-    # via the shared background one-liner helper (denials are SEL-logged).
+    # Link labeling is a trivial classification task — run on the session's
+    # governed default model (``_LINK_SUMMARY_MODEL`` is "auto") via the shared
+    # background one-liner helper (denials are SEL-logged).
     text = await run_bg_oneliner(
-        state.sessions, prompt, model=_LINK_SUMMARY_MODEL, sel_source="chat_nav"
+        state.sessions,
+        prompt,
+        model=_LINK_SUMMARY_MODEL,
+        sel_source="chat_nav",
+        timeout=_LINK_SUMMARY_TIMEOUT_SECS,
     )
 
-    # Parse: one label per line
-    lines = [re.sub(r'^\d{1,2}[.)]\s+', '', ln.strip()) for ln in text.strip().splitlines() if ln.strip()]
-    # Redact each label
+    # Parse: one label per line. The frontend merges the reply POSITIONALLY
+    # (label i -> link i), so alignment matters as much as content.
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     results: list[str] = []
-    for ln in lines:
+    for index, raw_line in enumerate(lines):
+        ln, enumerated = _ENUMERATOR_RE.subn("", raw_line)
+        if index == 0 and not enumerated and _PREAMBLE_RE.search(ln):
+            # A list preamble ("Here are the labels:") is recognised as a
+            # COMPLETE phrase with a closing colon (``_PREAMBLE_RE``) on an
+            # unnumbered first line, and is not a slot, so it is dropped --
+            # whatever the line count, because a model that adds a preamble can
+            # also under-produce labels, and keeping the preamble as slot 1
+            # would then shift every label while the endpoint's tail padding
+            # cannot realign it. The phrase match is what protects real labels:
+            # a colon alone would drop "API Reference Docs:", a shared first
+            # word would drop "Label Printing Bug:". Nothing else is ever
+            # dropped. Gate-side log line: context-aware redaction, so raw model
+            # output never reaches the log.
+            # Redact BEFORE truncating: a cut can split a credential so no
+            # pattern matches the surviving fragment.
+            shown = redact_log_via_context(ln)[:120]
+            logger.info("Link summary reply opened with a preamble, dropping: %r", shown)
+            continue
         ln, redacted_url = redact_exfiltration_urls(ln)
         ln, redacted_cred = redact_credentials(ln)
         if redacted_url or redacted_cred:
@@ -94,6 +205,20 @@ async def _resolve_link_summaries(state: DashboardState, links: list[dict]) -> l
                 source="chat_nav", outcome="redacted",
                 metadata={"redacted_url": bool(redacted_url), "redacted_cred": bool(redacted_cred)},
             )
+        if looks_like_prose(ln, max_unspaced_chars=_LINK_LABEL_MAX_UNSPACED_CHARS):
+            # The model narrated instead of labeling ("I cannot access this
+            # link."). The prompt is a list of URLs and the turn is tool-free,
+            # so this is the same refusal the dashboard title discards; never
+            # store it as a chip. The line still OCCUPIES its slot: an empty
+            # label keeps every later label on its own link (the frontend
+            # already treats "" as "no label"), whereas dropping it would
+            # silently chip link i with link i+1's label for the session.
+            # Gate-side log line: the context-aware, non-raising redactor, so a
+            # host with a companion loaded is not scanned with the baseline pass.
+            shown = redact_log_via_context(ln)[:120]
+            logger.info("Link summary reply is prose, discarding: %r", shown)
+            results.append("")
+            continue
         results.append(ln[:80])
     return results
 
@@ -123,7 +248,7 @@ async def api_chat_nav_resolve_links(request: web.Request) -> web.Response:
     links = [_normalize_link(x) for x in links[:20]]
 
     try:
-        summaries = await _resolve_link_summaries(state, links)
+        summaries = await _shared_link_summaries(state, links)
     except Exception as exc:
         # Cosmetic link-label enrichment must never emit a 5xx: a resolver
         # failure (e.g. an LLM/provider error on the shared background session)

@@ -155,6 +155,45 @@ TYPE_OWNERSHIP: dict[str, frozenset[str]] = {
             # reader folds those entries, so this domain is what makes the work
             # ledger a projection of the crew log rather than a store beside it.
             "work",
+            # The crew's published webview. ``panel_publish`` appends one
+            # ``panel/published`` entry to the member's own DM session log and the
+            # drawer folds those entries, so this domain is what makes a published
+            # panel a projection of the crew log rather than a document beside it.
+            # Owned by the session kind because the tool is mounted on nothing but a
+            # member's DM session, which is the unit the entry lands in.
+            "panel",
+            # The crewmate's own dynamic dashboard. Every accepted change to one
+            # crewmate's dashboard instance appends one ``dashboard/instance_changed``
+            # entry to that member's DM session log, and the instance's history is a
+            # fold over those entries -- so this domain is what makes the history a
+            # projection of the crew log rather than a document beside it. Owned by
+            # the session kind for the reason ``panel`` is: the surface that writes it
+            # is mounted on a member's DM session, which is the unit the entry lands in.
+            #
+            # The same domain also carries the values it writes itself
+            # (``dashboard/agentic_value``) and the writes that were refused
+            # (``dashboard/agentic_refused``). Both append to the crewmate's own DM
+            # session log and both are read only by folding those entries, so this
+            # domain is what makes a dashboard value, and a crewmate's mistake book,
+            # projections of the crew log rather than stores beside it.
+            #
+            # Owned by the SESSION kind for ``panel``'s reason -- the tools are
+            # mounted on nothing but a member's DM session, which is the unit the
+            # entries land in. Kept a domain of its own rather than folded into
+            # ``panel`` because the two are different bargains: a panel is DATA
+            # rendered by a human-authored template, while a dashboard value fills a
+            # declared field of a template the crewmate copied, and a reader
+            # separating "what did it publish" from "what did it assert" needs the
+            # two to be separable at the type.
+            "dashboard",
+            # Change cards and guide offers. Each proposal is a row of the
+            # session's conversation, and ``card/*`` / ``guide/*`` record the proposal
+            # and every outcome in the same session's history. The live state stays
+            # the card and guide stores'; these entries are what a reader of the
+            # session (or a reload, once a store has pruned the record) can still say
+            # about it.
+            "card",
+            "guide",
         }
     ),
 }
@@ -208,8 +247,11 @@ GUEST_TYPE_PREFIX = APP_SOURCE_PREFIX
 
 # A name segment: a domain, an action, a crew name, an app name. No separator,
 # so it can never widen a type into another namespace or a path into another
-# directory.
-_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# directory. Ends at ``\Z``, never at ``$``: Python's ``$`` also matches just
+# before a trailing newline, so a ``$``-anchored pattern would accept ``"scan\n"``
+# as a plain name and the newline would reach a persisted entry and every reader
+# of it. ``test/test_regex_anchor_contract.py`` holds this package to that rule.
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 # --------------------------------------------------------------------------- #

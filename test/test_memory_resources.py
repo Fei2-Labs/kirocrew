@@ -18,6 +18,7 @@ from kiro_crew.config.loader import KiroCrewConfig, MemoryStoreConfig
 from kiro_crew.dashboard.handlers._shared import markdown_memory_for_store
 from kiro_crew.heartbeat import HeartbeatService
 from kiro_crew.memory import MemoryStore
+from kiro_crew.testing.wait import await_until
 from kiro_crew.vector_memory import VectorMemoryStore
 
 env = _member_env
@@ -26,6 +27,7 @@ env = _member_env
 @pytest.mark.asyncio
 async def test_member_snapshot_combines_guarded_manual_files_and_database_history(env, monkeypatch):
     import kiro_crew.memory as module
+    import kiro_crew.memory_files as files_module
 
     memory = await markdown_memory_for_store(env.state, "member-alice")
     memory._memory_dir.mkdir(exist_ok=True)
@@ -33,9 +35,9 @@ async def test_member_snapshot_combines_guarded_manual_files_and_database_histor
     memory._projects_file.write_text("Project Atlas", encoding="utf-8")
     memory.append_history("Decision from the member database")
     validate = MagicMock(wraps=memory_stores.require_memory_store)
-    opened = MagicMock(wraps=module.fd_real_path)
+    opened = MagicMock(wraps=files_module.fd_real_path)
     monkeypatch.setattr(memory_stores, "require_memory_store", validate)
-    monkeypatch.setattr(module, "fd_real_path", opened)
+    monkeypatch.setattr(files_module, "fd_real_path", opened)
     snapshot = memory.markdown_snapshot()
     assert len(snapshot["history"]) == 1
     assert "Decision from the member database" in snapshot["history"][0]["content"]
@@ -85,7 +87,7 @@ async def test_late_named_store_construction_cannot_republish_after_eviction(env
         assert release.wait(5)
         return store
 
-    monkeypatch.setattr("kiro_crew.vector_memory.open_member_database", initialize)
+    monkeypatch.setattr("kiro_crew.vector_memory.declared_store", initialize)
     monkeypatch.setattr("kiro_crew.embeddings.model_file_present", lambda: False)
     monkeypatch.setattr("kiro_crew.embeddings.reconcile_store_embedding_space", lambda store: 0)
     monkeypatch.setattr(context, "_vector_stores", {})
@@ -93,7 +95,7 @@ async def test_late_named_store_construction_cannot_republish_after_eviction(env
     monkeypatch.setattr(context, "_lesson_stores", {})
     task = asyncio.create_task(context._build_store_vectors("member-alice"))
     try:
-        await asyncio.wait_for(entered.wait(), 5)
+        await await_until(entered, what="context_build_store_vectors")
         context.release_cached_memory_store("member-alice")
         release.set()
         with pytest.raises(memory_stores.UnknownMemoryStore, match="cache changed"):
@@ -251,7 +253,7 @@ async def test_first_eligible_heartbeat_schedules_one_backup_without_blocking_ti
     service._tick = 1
     try:
         await service._beat()
-        await asyncio.wait_for(started.wait(), 5)
+        await await_until(started, what="service_beat")
         assert observed_kwargs == [["should_stop"]]
         task = service._memory_backup_task
         service._tick = 30

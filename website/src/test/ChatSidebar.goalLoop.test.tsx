@@ -403,7 +403,7 @@ describe('chat sidebar — interrupted ordinary session', () => {
   })
 
   it('drops the Resume instruction on a crew-bound row', () => {
-    // A remote-bound session has no local Continue (`remote_action_unsupported`),
+    // A relay archive has no Continue (`relay_archive_read_only`),
     // so the composer offers no Resume control — the row must not tell the user to
     // press one. The interruption marker itself still belongs there.
     const slots = [{
@@ -439,7 +439,7 @@ describe('chat sidebar — interrupted ordinary session', () => {
         interrupted: true, subagents_running: true, last_message: 'Delegating',
       },
       {
-        key: 'orchestrating', title: 'planning', running: false, messages: 5,
+        key: 'legacy-orchestrating', title: 'planning', running: false, messages: 5,
         interrupted: true, orchestrating: true, last_message: 'Planning',
       },
       {
@@ -455,8 +455,8 @@ describe('chat sidebar — interrupted ordinary session', () => {
     expect(container.querySelector('[data-session-row="plain"]')?.textContent).toContain('In progress')
     expect(container.querySelector('[data-session-row="loop"]')?.textContent).not.toContain('interrupted')
     expect(container.querySelector('[data-session-row="loop"]')?.textContent).toContain('In progress')
-    expect(container.querySelector('[data-session-row="orchestrating"]')?.textContent).not.toContain('Turn interrupted')
-    expect(container.querySelector('[data-session-row="orchestrating"]')?.textContent).toContain('In progress')
+    // A legacy orchestrating flag is not live work: the interruption still shows.
+    expect(container.querySelector('[data-session-row="legacy-orchestrating"]')?.textContent).toContain('Turn interrupted')
     expect(container.querySelector('[data-session-row="queued"]')?.textContent).not.toContain('Turn interrupted')
     expect(container.querySelector('[data-session-row="queued"]')?.textContent).toContain('In progress')
   })

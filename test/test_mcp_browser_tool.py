@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from kiro_crew.browser_cli import own_browser
 from kiro_crew.mcp_tools import browser as mod
 
 
@@ -32,6 +33,12 @@ def _browsing_on(monkeypatch: pytest.MonkeyPatch) -> None:
     # Default: the built-in-browser preference is ON (its OFF path is covered
     # separately); otherwise every test would route to the playwright fallback.
     monkeypatch.setattr(mod, "_use_builtin_browser", lambda: True)
+    # Host probes (is Chrome installed, does a profile carry the extension) are
+    # covered in test_own_browser; here only their placement in a reply matters.
+    monkeypatch.setattr(mod.own_browser, "next_step", lambda: _OWN_STEP)
+
+
+_OWN_STEP = "<own-browser step>"
 
 
 def _capture_post(recorder: list[tuple[str, str, dict, str, int]], status: int, payload: dict):
@@ -55,7 +62,7 @@ def test_unresolved_session_falls_back_without_posting(
     monkeypatch.setattr(mod, "_post_command", _must_not_post)
 
     out = mod.browser("browser", {"op": "navigate", "args": {"url": "https://example.com"}})
-    assert out == mod._FALLBACK_TEXT
+    assert out == f"{mod._FALLBACK_TEXT} {_OWN_STEP}"
 
 
 def test_resolved_session_posts_namespaced_header_and_bare_bus_key(
@@ -101,7 +108,7 @@ def test_no_native_panel_503_falls_back(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(mod, "_post_command", _capture_post([], 503, {"code": "no_native_panel"}))
 
     out = mod.browser("browser", {"op": "navigate", "args": {"url": "https://example.com"}})
-    assert out == mod._FALLBACK_TEXT
+    assert out == f"{mod._FALLBACK_TEXT} {_OWN_STEP}"
 
 
 @pytest.mark.parametrize(
@@ -148,6 +155,79 @@ def test_navigate_classifier_rejects_alternate_ip_encodings() -> None:
     assert mod._navigate_target_is_public("http://2130706433/") is False  # 127.0.0.1
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://%31%32%37.0.0.1:8080/",  # 127.0.0.1
+        "http://%31%36%39.254.169.254/",  # IMDS
+        "http://loc%61lhost/",
+        "http://%4C%4F%43%41%4C%48%4F%53%54/",  # LOCALHOST
+        "http://foo.loc%61lhost/",
+        "http://loc%61lhost%2e/",  # trailing dot
+        "http://127.0.0.1%2e/",  # trailing dot
+        "http://0x7f%30%30%30001/",  # hex 127.0.0.1
+        "http://%32130706433/",  # decimal 127.0.0.1
+        "http://%31%32%37.1/",  # short 127.1
+        "http://%2531%32%37.0.0.1/",  # double-encoded: a '%' survives one decode
+        "http://%ff127.0.0.1/",  # not UTF-8
+        "http://%e2%91%a027.0.0.1/",  # circled digit one
+        "http://%ef%bc%91%ef%bc%92%ef%bc%97.0.0.1/",  # fullwidth digits
+        "http://127%e3%80%820%e3%80%820%e3%80%821/",  # ideographic full stop
+        "http://127.0.0.1%40example.com/",  # '@' after decode
+        "http://169.254.169.254%2f.example.com/",  # '/' after decode
+        "http://127.0.0.1%3a80/",  # ':' after decode
+        "http://a@loc%61lhost/",  # userinfo
+    ],
+)
+def test_navigate_classifier_rejects_percent_encoded_hosts(url: str) -> None:
+    # urlsplit leaves the host percent-encoded; the browser decodes it.
+    assert mod._navigate_target_is_public(url) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://１２７.０.０.１/",  # fullwidth digits
+        "http://ｌｏｃａｌｈｏｓｔ/",  # fullwidth letters
+        "http://①27.0.0.1/",  # circled digit one
+        "http://ⓛocalhost/",  # circled letter
+        "http://127。0。0。1/",  # ideographic full stop
+    ],
+)
+def test_navigate_classifier_rejects_raw_non_ascii_private_hosts(url: str) -> None:
+    assert mod._navigate_target_is_public(url) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example%2ecom/",
+        "https://ex%41mple.com/",
+        "https://example.com/path?q=%2F",
+        "https://xn--bcher-kva.example/",
+        "http://[2606:4700::1111%25eth0]/",
+    ],
+)
+def test_navigate_classifier_keeps_percent_encoded_public_hosts(url: str) -> None:
+    assert mod._navigate_target_is_public(url) is True
+
+
+def test_navigate_percent_encoded_loopback_is_refused_without_posting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod.mcp_core, "_resolve_session_key", lambda: "dashboard:chat-7-1")
+
+    def _must_not_post(*_a: Any, **_k: Any) -> tuple[int, dict]:
+        raise AssertionError("must not POST a percent-encoded loopback target")
+
+    monkeypatch.setattr(mod, "_post_command", _must_not_post)
+
+    out = mod.browser(
+        "browser", {"op": "navigate", "args": {"url": "http://%31%32%37.0.0.1:8080/"}}
+    )
+    assert out.startswith("Error: the browser tool only opens public http(s) URLs")
+
+
 def test_governance_deny_refuses_without_fallback_or_posting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -167,7 +247,7 @@ def test_governance_deny_refuses_without_fallback_or_posting(
 
     out = mod.browser("browser", {"op": "navigate", "args": {"url": "https://example.com"}})
     assert out.startswith("Error: web browsing is disabled by governance policy")
-    assert out != mod._FALLBACK_TEXT  # not the playwright downgrade
+    assert not out.startswith(mod._FALLBACK_TEXT)  # not the playwright downgrade
 
 
 def test_builtin_off_falls_back_to_playwright_without_posting(
@@ -185,7 +265,7 @@ def test_builtin_off_falls_back_to_playwright_without_posting(
     monkeypatch.setattr(mod, "_post_command", _must_not_post)
 
     out = mod.browser("browser", {"op": "navigate", "args": {"url": "https://example.com"}})
-    assert out == mod._DISABLED_TEXT
+    assert out == f"{mod._DISABLED_TEXT} {_OWN_STEP}"
     assert "turned off in Settings" in out
 
 
@@ -209,7 +289,7 @@ def test_governance_deny_wins_over_builtin_off(monkeypatch: pytest.MonkeyPatch) 
 
     out = mod.browser("browser", {"op": "navigate", "args": {"url": "https://example.com"}})
     assert out.startswith("Error: web browsing is disabled by governance policy")
-    assert out != mod._FALLBACK_TEXT
+    assert not out.startswith(mod._FALLBACK_TEXT)
 
 
 def test_navigate_classifier_rejects_parser_differential_hosts() -> None:
@@ -254,6 +334,19 @@ def test_schemas_always_advertises_the_tool(monkeypatch: pytest.MonkeyPatch) -> 
     assert mod.schemas()[0]["name"] == "browser"
     monkeypatch.setattr(mod, "_browsing_available", lambda: False)
     assert mod.schemas()[0]["name"] == "browser"
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin", "linux"])
+def test_description_names_the_attach_command_for_this_host(
+    monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    # The POSIX `NAME=value cmd` prefix sets nothing in PowerShell, so a Windows
+    # host must be told the form that does.
+    monkeypatch.setattr(own_browser.sys, "platform", platform)
+    description = mod.schemas()[0]["description"]
+    assert own_browser.attach_command(platform) in description
+    if platform == "win32":
+        assert own_browser.ATTACH_COMMAND not in description
 
 
 def test_browsing_not_set_up_degrades_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -323,3 +416,62 @@ def test_post_command_parses_success_and_transport_errors(monkeypatch: pytest.Mo
     monkeypatch.setattr(mod.mcp_core, "_api_urlopen", _raise_url)
     status, payload = mod._post_command("chat-1", "snapshot", {}, "dashboard:chat-1", 15000)
     assert status is None and payload == {}
+
+
+def test_post_command_sends_the_session_token_beside_the_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HEADLINE: the token travels WITH the declared key, asserted on the real request.
+
+    On a pid hosting several sessions the peer check cannot tell which of them holds
+    the socket from kernel credentials, so it requires a token naming exactly the
+    declared key and refuses the declaration otherwise. Without this header every
+    native browser-panel op on a shared runtime is refused -- including the founder's,
+    which worked before that demand existed. The header dict is read off the request
+    object rather than from a stub, so a refactor that rebuilds it cannot drop the
+    token silently, which is how it came to be missing.
+    """
+    seen: list[dict] = []
+
+    monkeypatch.setattr(mod.mcp_core, "_api_base", lambda: "http://127.0.0.1:9")
+    monkeypatch.setattr(mod.mcp_core, "_internal_secret", lambda: "sekret")
+    monkeypatch.setattr(
+        mod.mcp_core, "_session_token_header", lambda: {"X-Session-Token": "a-signed-token"}
+    )
+
+    def _record(req, timeout):
+        seen.append(dict(req.headers))
+        return _FakeResp(200, b'{"ok": true}')
+
+    monkeypatch.setattr(mod.mcp_core, "_api_urlopen", _record)
+    mod._post_command("chat-1", "snapshot", {}, "dashboard:chat-1", 15000)
+
+    assert len(seen) == 1
+    # urllib title-cases header names on the Request object.
+    headers = {k.lower(): v for k, v in seen[0].items()}
+    assert headers["x-session-key"] == "dashboard:chat-1"
+    assert headers["x-session-token"] == "a-signed-token"
+
+
+def test_post_command_adds_no_token_header_when_there_is_no_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The converse, and what keeps a 1:1 install byte-identical: with no token the
+    helper contributes no header at all, rather than an empty one that the gateway
+    would have to tell apart from a real attestation."""
+    seen: list[dict] = []
+
+    monkeypatch.setattr(mod.mcp_core, "_api_base", lambda: "http://127.0.0.1:9")
+    monkeypatch.setattr(mod.mcp_core, "_internal_secret", lambda: "sekret")
+    monkeypatch.setattr(mod.mcp_core, "_session_token_header", dict)
+
+    def _record(req, timeout):
+        seen.append(dict(req.headers))
+        return _FakeResp(200, b'{"ok": true}')
+
+    monkeypatch.setattr(mod.mcp_core, "_api_urlopen", _record)
+    mod._post_command("chat-1", "snapshot", {}, "dashboard:chat-1", 15000)
+
+    headers = {k.lower() for k in seen[0]}
+    assert "x-session-key" in headers
+    assert "x-session-token" not in headers

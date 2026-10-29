@@ -1,14 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { createTestStore } from './helpers'
 
-const { mockSideOpen, mockSideTurn, mockSendChat } = vi.hoisted(() => ({
+const { mockSideOpen, mockSideTurn, mockSendChat, mockSideState } = vi.hoisted(() => ({
   mockSideOpen: vi.fn().mockResolvedValue({ ok: true, open: true, messages: 0, last_run_id: '', created_at: '' }),
   mockSideTurn: vi.fn().mockResolvedValue({ ok: true, run_id: 'r1', messages: 1 }),
   mockSendChat: vi.fn().mockResolvedValue({ ok: true }),
+  mockSideState: vi.fn().mockResolvedValue({ open: false }),
 }))
 
 vi.mock('../api/client', () => ({
-  api: new Proxy({ sideOpen: mockSideOpen, sideTurn: mockSideTurn, sendChat: mockSendChat }, {
+  api: new Proxy({ sideOpen: mockSideOpen, sideTurn: mockSideTurn, sendChat: mockSendChat, sideState: mockSideState }, {
     get: (t, prop) => {
       if (prop in t) return (t as Record<string, unknown>)[prop as string]
       return vi.fn().mockResolvedValue({})
@@ -18,6 +19,7 @@ vi.mock('../api/client', () => ({
 }))
 
 import { interceptSlashCommand } from '../pages/chat/ChatInput'
+import { ApiError, AcceptedBodyUnreadable } from '../api/apiError'
 
 const SLOT = 'test-slot-1'
 
@@ -41,7 +43,7 @@ describe('/side slash command interception', () => {
   it('intercepts "/side <message>" and forwards body to sideTurn', async () => {
     const result = await interceptSlashCommand('/side what model is this', SLOT, store.dispatch)
     expect(result.intercepted).toBe(true)
-    expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'what model is this')
+    expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'what model is this', undefined)
     expect(mockSendChat).not.toHaveBeenCalled()
   })
 
@@ -59,7 +61,7 @@ describe('/side slash command interception', () => {
   it('intercepts "/btw <message>" and forwards body to sideTurn', async () => {
     const result = await interceptSlashCommand('/btw is this cached', SLOT, store.dispatch)
     expect(result.intercepted).toBe(true)
-    expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'is this cached')
+    expect(mockSideTurn).toHaveBeenCalledWith(SLOT, 'is this cached', undefined)
     expect(mockSendChat).not.toHaveBeenCalled()
   })
 
@@ -104,6 +106,33 @@ describe('/side slash command interception', () => {
     window.removeEventListener('mc-start-import', listener)
   })
 
+  it('reads the side conversation before it asks, so the panel shows what the question joins', async () => {
+    mockSideState.mockResolvedValueOnce({
+      open: true, created_at: '2026-10-21T06:00:00.000Z', last_run_id: 'r0', running: false, queue: [],
+      messages: [
+        { id: 'u0', run_id: 'r0', role: 'user', content: 'remember pineapple', ts: '2026-10-21T06:00:01.000Z' },
+        { id: 'a0', run_id: 'r0', role: 'assistant', content: 'noted', ts: '2026-10-21T06:00:02.000Z' },
+      ],
+    })
+    const result = await interceptSlashCommand('/side what word?', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true })
+    expect(store.getState().chat.slotSide[SLOT].messages.map(m => m.content)).toEqual(['remember pineapple', 'noted'])
+    expect(mockSideState.mock.invocationCallOrder[0]).toBeLessThan(mockSideTurn.mock.invocationCallOrder[0])
+  })
+
+  it('holds the question back when that read fails, so it is not asked into a conversation nobody can see', async () => {
+    mockSideState.mockRejectedValueOnce(new Error('offline'))
+    const result = await interceptSlashCommand('/side what word?', SLOT, store.dispatch)
+    expect(result).toMatchObject({ intercepted: true, failed: true, stage: 'open' })
+    // The COMPOSER's wording, not the panel's notice: nothing opened, so there is
+    // no Retry button here, and copy that told the reader to press one would point
+    // at a control they cannot see.
+    expect(result.intercepted && result.error).toMatch(/the command was not run\. Your message is still in the composer\./)
+    expect(result.intercepted && result.error).not.toMatch(/Retry before asking/)
+    expect(mockSideTurn).not.toHaveBeenCalled()
+    expect(store.getState().chat.slotSideRestored[SLOT]).toBeUndefined()
+  })
+
   it('reports failed when there is no active slot', async () => {
     const result = await interceptSlashCommand('/side', null, store.dispatch)
     expect(result).toEqual({ intercepted: true, failed: true, stage: 'open' })
@@ -115,8 +144,45 @@ describe('/side slash command interception', () => {
     expect(result).toEqual({ intercepted: true, failed: true, error: 'boom', stage: 'open' })
   })
 
-  it('reports failed when sideTurn rejects (e.g. 409 turn in flight)', async () => {
-    mockSideTurn.mockRejectedValueOnce(new Error('409: side turn already in flight'))
+  it('a 2xx whose body was unreadable is UNCONFIRMED: the composer is kept, no error is reported, and the side panel stands its notice', async () => {
+    // The turn was probably taken, but the outage that cut the body can also
+    // swallow the WS row that would show the question -- so the command must
+    // not be cleared as a success, and must not be reported as a refusal
+    // either (a retry could run the turn twice). Same policy as SideChat.
+    mockSideTurn.mockRejectedValueOnce(new AcceptedBodyUnreadable(new TypeError('network error')))
+    const result = await interceptSlashCommand('/side my question', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true, failed: true, unconfirmed: true, stage: 'turn' })
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus?.notice?.text).toMatch(/^Delivery not confirmed/)
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus?.error).toBeUndefined()
+    // The panel opened -- the notice has somewhere to show.
+    expect(store.getState().chat.activityTab).toBe('side')
+  })
+
+  it("a later /side that the server accepts clears the earlier one's standing unconfirmed notice", async () => {
+    // The notice describes the LAST send; a new submit supersedes it (the rule
+    // SideChat's own submit applies), so an accepted Q2 must not sit under Q1's
+    // "not confirmed".
+    mockSideTurn.mockRejectedValueOnce(new AcceptedBodyUnreadable(new TypeError('network error')))
+    await interceptSlashCommand('/side first question', SLOT, store.dispatch)
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus?.notice).toBeDefined()
+    const result = await interceptSlashCommand('/side second question', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true })
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus).toBeUndefined()
+  })
+
+  it('a raw rejection AFTER the turn was dispatched is UNCONFIRMED, never a retry-safe failure', async () => {
+    // A connection reset before headers cannot be told from a request the server
+    // took whose answer was lost, and /side/open just succeeded on the same
+    // link -- so the composer is kept under the panel's notice, not restored
+    // with "try again" (which would run the turn twice). Same wire as SideChat.
+    mockSideTurn.mockRejectedValueOnce(new TypeError('network error'))
+    const result = await interceptSlashCommand('/side my question', SLOT, store.dispatch)
+    expect(result).toEqual({ intercepted: true, failed: true, unconfirmed: true, stage: 'turn' })
+    expect(store.getState().chat.slotSide[SLOT]?.sendStatus?.notice?.text).toMatch(/^Delivery not confirmed/)
+  })
+
+  it('reports failed when sideTurn is REFUSED (e.g. 409 turn in flight, an ApiError from the client)', async () => {
+    mockSideTurn.mockRejectedValueOnce(new ApiError(409, '409: side turn already in flight'))
     const result = await interceptSlashCommand('/side my question', SLOT, store.dispatch)
     // `stage: 'turn'` because the panel DID open — the caller's title must not say otherwise.
     expect(result).toEqual({ intercepted: true, failed: true, error: '409: side turn already in flight', stage: 'turn' })

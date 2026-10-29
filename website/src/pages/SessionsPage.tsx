@@ -4,13 +4,13 @@ import { useQuery } from '@tanstack/react-query'
 import { Plus, MessagesSquare } from 'lucide-react'
 import { useAppSelector, useAppDispatch } from '../store'
 import { createSlot } from '../store/chatSlice'
-import { readPinnedSessionOrder } from '../utils/pinnedSessionOrder'
 import { api } from '../api/client'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { timeAgo } from '../utils/timeAgo'
 import { lastActivityEpoch, localDaysAgo } from './chat/sessionOrder'
 import { relativeLuminance } from '../lib/iconContrast'
 import { errMessage } from '../utils/thunkError'
+import { sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 import { PageHeader, Btn, SearchInput, Badge, EmptyState, FilteredEmpty } from '../components/ui'
 import ErrorNotice from '../components/ErrorNotice'
 import type { ChatSlot, ChatTag } from '../types'
@@ -108,11 +108,10 @@ export default function SessionsPage() {
     // Pinned slots surface in their own group; unpinned bucket by local day.
     for (const s of filtered) by[s.pinned ? 'pinned' : recencyGroup(lastActivityEpoch(s) * 1000, now)].push(s)
     for (const g of GROUP_ORDER) by[g].sort((a, b) => lastActivityEpoch(b) - lastActivityEpoch(a))
-    // The sidebar's pinned section is MANUALLY ordered (pinnedSessionOrder.ts);
-    // honor the same user-arranged order here so the two surfaces agree.
-    // Keys missing from the stored order keep the recency sort, after ranked ones.
-    const rank = new Map(readPinnedSessionOrder().map((k, i) => [k, i]))
-    by.pinned.sort((a, b) => (rank.get(a.key) ?? Infinity) - (rank.get(b.key) ?? Infinity))
+    // The sidebar's pinned section is MANUALLY ordered (the gateway's pinned
+    // order, carried on each row as `pin_rank`); honor it here so the two
+    // surfaces agree. Rows with no rank keep the recency sort, after ranked ones.
+    by.pinned.sort((a, b) => (a.pin_rank ?? Infinity) - (b.pin_rank ?? Infinity))
     return by
   }, [filtered])
 
@@ -129,7 +128,7 @@ export default function SessionsPage() {
     setCreating(true)
     setCreateError(null)
     try {
-      const slot = await dispatch(createSlot(undefined)).unwrap()
+      const slot = await dispatch(createSlot({ defaultFolder: true })).unwrap()
       if (slot?.key) navigate(`/chat?sid=${encodeURIComponent(slot.key)}`)
     } catch (err) {
       // errMessage, not `err instanceof Error`: unwrap() throws a serialized
@@ -296,7 +295,7 @@ export default function SessionsPage() {
                     </span>
                     <span className="flex-1 min-w-0">
                       <span className="block text-[13.5px] font-medium text-text-strong truncate">
-                        {s.title || s.key}
+                        {sessionDisplayTitle(s)}
                       </span>
                       <span className="block text-[12px] text-muted truncate">
                         {s.agent}

@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { Activity, Goal, Radar, RotateCw, Square, Trash2, X } from 'lucide-react'
-import { useIsFetching, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError, type MonitorWrite } from '../api/client'
 import {
   deriveAutomationStatus,
@@ -13,13 +13,16 @@ import {
   type LegacyGoalLoop,
   type StructuredMonitor,
 } from '../monitoring/automation'
-import { fmtDateTimeNumeric, fmtNumber } from '../i18n/format'
+import { fmtDateTimeNumeric, fmtNumber, fmtUnit, type FormatUnit } from '../i18n/format'
 import { Badge, Btn, IconButton, Input, SendBtn } from './ui'
+import { uiLocation } from '../uiLocations/uiLocation'
+import { useGuidePredicate } from '../guide/guidePredicates'
 import { PopoverContent } from './ui/popover'
 import AutoNudgePopover, { type AutoNudgeLoop } from './AutoNudgePopover'
 import { i18nT } from '../i18n/t'
 import MonitorRadar from './MonitorRadar'
 import ErrorNotice from './ErrorNotice'
+import { useQueryIsFetching } from '../hooks/useQueryIsFetching'
 
 interface Props {
   slotKey: string
@@ -109,6 +112,12 @@ function monitorDraft(monitor: StructuredMonitor): Draft {
   }
 }
 
+/** Rebuild the popover's loop shape from the record the session holds.
+ *
+ * Every field is named here, so a field the record gains is invisible to the
+ * popover until it is named here too -- which is why the judge's three ride along
+ * explicitly rather than by spread: the popover draws its judge line from them,
+ * and their absence reads to it as a loop armed with no judge at all. */
 function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
   return {
     id: loop.id,
@@ -120,8 +129,39 @@ function legacyWire(loop: LegacyGoalLoop): AutoNudgeLoop {
     active: loop.active,
     last_fire_ts: loop.lastFireAt,
     next_due_ts: loop.nextDueAt ?? 0,
+    // The goal editor words a paused loop by this field; dropping it rendered
+    // every inactive loop, a fresh pause included, as a bare stop.
+    stopped_reason: loop.stoppedReason,
+    // Done is worded by the pair: a finished pull-request watch reads merged or
+    // closed without merging, any other finished watch reads as a subject.
+    monitor_outcome: loop.monitorOutcome,
+    monitor_kind: loop.monitorKind,
+    // A held loop reads and acts paused only when this rides along.
+    ...(loop.approvalStalled ? { approval_stalled: true } : {}),
+    ...(loop.waitingOnPerson ? { waiting_on_person: true } : {}),
     ...(loop.stopSentinelPath !== undefined ? { stop_sentinel_path: loop.stopSentinelPath } : {}),
+    ...(loop.judge !== undefined ? { judge: loop.judge } : {}),
+    ...(loop.judge_last_verdict !== undefined
+      ? { judge_last_verdict: loop.judge_last_verdict }
+      : {}),
   }
+}
+
+/** A fire landed (`onFired`): arm the due reading on the record the parent
+ *  holds NOW, never on a snapshot. The fire route arms a zero-delay timer and
+ *  writes no deadline, and its answer is the live loop serialized after an
+ *  audit await, so it can already carry the delivery; a parent measured
+ *  against it rolled a delivered cycle back to due for a whole interval.
+ *  `pressed` is pre-request by construction, so a parent record that fired
+ *  since the press leaves nothing to arm. Null too when the parent's record is
+ *  not this loop (the closure outlived it) or is no longer running (another
+ *  writer paused it; `fire_now` refuses an inactive loop). */
+function armedNow(current: AutomationRecord | null, pressed: AutoNudgeLoop, nowTs: number): LegacyGoalLoop | null {
+  if (current?.kind !== 'legacy_goal_loop') return null
+  if (String(current.id) !== String(pressed.id) || current.slotKey !== pressed.slot_key) return null
+  if (!current.active) return null
+  if (current.lastFireAt > (pressed.last_fire_ts || 0)) return null
+  return { ...current, nextDueAt: nowTs }
 }
 
 function boundedInteger(
@@ -140,6 +180,23 @@ function boundedInteger(
 const fieldClass = 'space-y-1 min-w-0'
 const labelClass = 'block text-[11px] font-medium text-muted'
 const errorClass = 'text-[11px] text-danger'
+// Fail closed to the operator ceiling shipped by the backend when its live read is unavailable.
+const SHIPPED_RUNTIME_CEILING_SECS = 604_800
+
+/* The runtime bound is typed in seconds, and a seven-digit second count says
+   nothing about how long the reader is granting. Glossed with the largest
+   whole unit that divides the bound exactly, so the gloss never rounds a
+   bound the reader is held to; anything else stays in seconds. */
+const DURATION_UNITS: ReadonlyArray<[number, FormatUnit]> = [[86_400, 'day'], [3_600, 'hour'], [60, 'minute']]
+
+function describeDuration(secs: number): string {
+  for (const [unitSecs, unit] of DURATION_UNITS) {
+    if (secs >= unitSecs && secs % unitSecs === 0) {
+      return fmtUnit(secs / unitSecs, unit, { unitDisplay: 'long' })
+    }
+  }
+  return fmtUnit(secs, 'second', { unitDisplay: 'long' })
+}
 
 function FieldError({ id, message }: { id: string; message?: string }) {
   return message ? <p id={id} role="status" aria-live="polite" className={errorClass}>{message}</p> : null
@@ -186,7 +243,7 @@ export default function SessionAutomationPopover({
   const [confirmClear, setConfirmClear] = useState(false)
   const id = useId()
   const queryClient = useQueryClient()
-  const snapshotFetching = useIsFetching({ queryKey: ['session-automation', slotKey], exact: true }) > 0
+  const snapshotFetching = useQueryIsFetching(['session-automation', slotKey])
   const automationRef = useRef(automation)
   automationRef.current = automation
   const slotKeyRef = useRef(slotKey)
@@ -194,6 +251,32 @@ export default function SessionAutomationPopover({
   const sessionModeUnsupported = sessionMode === 'crew' || sessionMode === 'member'
   const legacyView = automation?.kind === 'legacy_goal_loop'
     || (!monitor && boundedModeSlot !== slotKey)
+  /* THE RUNTIME INPUT'S REAL CEILING. `contract.json` carries the ABSOLUTE
+     maximum any install may configure (30 days), while the create/update
+     handlers enforce the LIVE operator ceiling. The form validates against
+     the smaller value after the per-slot read lands. Until then, or if the
+     read fails, it uses the shipped operator ceiling rather than accepting a
+     value a default server will reject after submit. */
+  const liveCeiling = useQuery({
+    queryKey: ['monitor-runtime-ceiling', slotKey],
+    enabled: open && !legacyView,
+    queryFn: () => api.monitorForSlot(slotKey),
+    select: response => response.max_runtime_ceiling_secs,
+    staleTime: 60_000,
+    retry: false,
+  })
+  const ceiling = liveCeiling.isError ? undefined : liveCeiling.data
+  const runtimeLimits = {
+    minimum: STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.minimum,
+    maximum: typeof ceiling === 'number' && Number.isSafeInteger(ceiling) && ceiling >= 1
+      ? Math.min(STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.maximum, ceiling)
+      : SHIPPED_RUNTIME_CEILING_SECS,
+  }
+  /* Both read-failure notices sit behind the request error: a failed save is
+     what the reader must act on first, and stacking a read alert under it puts
+     two unrelated errors in front of them at once. */
+  const ceilingFailed = !errors.request && liveCeiling.isError
+  const snapshotNoticeDue = !errors.request && snapshotFailed
 
   useEffect(() => {
     if (!open) return
@@ -289,16 +372,11 @@ export default function SessionAutomationPopover({
   const legacyCycle = legacyLoop?.maxCycles
     ? `${legacyLoop.cycleCount}/${legacyLoop.maxCycles}`
     : String(legacyLoop?.cycleCount ?? 0)
-  const triggerLabel = legacyLoop?.active
-    ? i18nT(
-      interrupted
-        ? 'components.autoNudgePopover.goal_interrupted_cycle'
-        : 'components.autoNudgePopover.goal_active_cycle',
-      { cycle: legacyCycle },
-    )
-    : monitor
-      ? i18nT('components.sessionAutomationPopover.monitor_status', { status: statusLabel })
-      : i18nT('components.autoNudgePopover.set_a_goal')
+  // The goal panel offers Pause while a loop runs; the monitor panel offers
+  // Stop monitor until the monitor finishes. A guide to either stops before
+  // opening the panel when there is nothing to stop.
+  useGuidePredicate('goal_loop_running', !!legacyLoop?.active)
+  useGuidePredicate('monitor_running', !!monitor && !terminal)
   const busy = mutation.isPending && mutation.variables?.editorKey === editorKey
   const draft = editor.draft
   const hasDirtyFields = Object.keys(editor.dirty).length > 0
@@ -333,7 +411,7 @@ export default function SessionAutomationPopover({
     if (!editedMonitor && !creationReady) return
     if (editedMonitor && !hasDirtyFields) return
     const cadence = boundedInteger(draft.cadence, STRUCTURED_MONITOR_LIMITS.cadenceSecs)
-    const runtime = boundedInteger(draft.runtime, STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs)
+    const runtime = boundedInteger(draft.runtime, runtimeLimits)
     const turns = boundedInteger(draft.turns, STRUCTURED_MONITOR_LIMITS.maxAgentTurns)
     const tokens = boundedInteger(draft.tokens, STRUCTURED_MONITOR_LIMITS.maxTokens)
     const providerErrors = boundedInteger(
@@ -362,7 +440,14 @@ export default function SessionAutomationPopover({
       nextErrors.cadence = rangeError(STRUCTURED_MONITOR_LIMITS.cadenceSecs)
     }
     if (validates('runtime') && runtime === null) {
-      nextErrors.runtime = rangeError(STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs)
+      nextErrors.runtime = i18nT(
+        'components.sessionAutomationPopover.limit_range_duration',
+        {
+          min: fmtNumber(runtimeLimits.minimum),
+          max: fmtNumber(runtimeLimits.maximum),
+          duration: describeDuration(runtimeLimits.maximum),
+        },
+      )
     }
     if (validates('turns') && turns === null) {
       nextErrors.turns = rangeError(STRUCTURED_MONITOR_LIMITS.maxAgentTurns)
@@ -434,15 +519,35 @@ export default function SessionAutomationPopover({
       open={open}
       onOpenChange={requestOpenChange}
       onChange={loop => {
-        if (automationRef.current !== automation) return
+        // Applied only while the parent still holds the record this press was
+        // rendered against (object identity, as `responseIsCurrent` above). The
+        // record carries no revision, and a response arriving after a frame is a
+        // snapshot the frame may have moved past: a PATCH answered before another
+        // tab's pause but delivered after the pause's frame put the active record
+        // back over the paused one, with nothing to correct it short of a
+        // reconnect. Dropped, and the slot's cold read invalidated instead.
+        if (automationRef.current !== automation) {
+          queryClient.invalidateQueries({ queryKey: ['session-automation', slotKey] })
+          return
+        }
         onChange(loop ? normalizeAutomationRecord(loop) : null)
+      }}
+      onFired={pressed => {
+        const armed = armedNow(automationRef.current, pressed, Date.now() / 1000)
+        if (armed) onChange(armed)
       }}
       onSetUpBoundedMonitor={legacyLoop ? undefined : () => setBoundedModeSlot(slotKey)}
       writeDisabled={sessionModeUnsupported}
       interrupted={interrupted}
       trigger={(
         <IconButton
-          aria-label={triggerLabel}
+          // Inline, not a variable: the index reads this label's catalog keys.
+          aria-label={legacyLoop?.active
+            ? i18nT(interrupted ? 'components.autoNudgePopover.goal_interrupted_cycle' : 'components.autoNudgePopover.goal_active_cycle', { cycle: legacyCycle })
+            : monitor
+              ? i18nT('components.sessionAutomationPopover.monitor_status', { status: statusLabel })
+              : i18nT('components.autoNudgePopover.set_a_goal')}
+          {...uiLocation('composer.automation')}
           variant={monitor?.active || legacyLoop?.active ? 'active' : 'default'}
           /* IconButton is a plain block button, so without a flex row the
              inline glyph sits on the text baseline of this 32px box rather
@@ -519,7 +624,11 @@ export default function SessionAutomationPopover({
               <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.latest_decision')}</dt><dd translate="no">{monitor.latest.decision || i18nT('components.sessionAutomationPopover.none_yet')}</dd></div>
               <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.probe_cadence')}</dt><dd>{fmtNumber(monitor.cadenceSecs)}</dd></div>
               <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.maximum_runtime')}</dt><dd>{fmtNumber(monitor.budgets.maxRuntimeSecs)}</dd></div>
-              <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.maximum_agent_turns')}</dt><dd>{fmtNumber(monitor.budgets.maxAgentTurns)}</dd></div>
+              {/* 0 is this budget's unlimited sentinel, so the number is not the
+                  reading: "Maximum agent turns: 0" says the opposite of what it
+                  means. Same treatment the token figure gets when usage is
+                  unreported -- a word where no number is the truth. */}
+              <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.maximum_agent_turns')}</dt><dd>{monitor.budgets.maxAgentTurns === 0 ? i18nT('components.sessionAutomationPopover.unlimited') : fmtNumber(monitor.budgets.maxAgentTurns)}</dd></div>
               <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.maximum_tokens')}</dt><dd>{fmtNumber(monitor.budgets.maxTokens)}</dd></div>
               <div><dt className="text-muted">{i18nT('components.sessionAutomationPopover.maximum_provider_errors')}</dt><dd>{fmtNumber(monitor.budgets.maxProviderErrors)}</dd></div>
             </dl>
@@ -623,8 +732,8 @@ export default function SessionAutomationPopover({
                   type="number"
                   inputMode="numeric"
                   autoComplete="off"
-                  min={STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.minimum}
-                  max={STRUCTURED_MONITOR_LIMITS.maxRuntimeSecs.maximum}
+                  min={runtimeLimits.minimum}
+                  max={runtimeLimits.maximum}
                   step={1}
                   value={draft.runtime}
                   aria-labelledby={`${id}-runtime-label`}
@@ -649,8 +758,16 @@ export default function SessionAutomationPopover({
                   aria-labelledby={`${id}-turns-label`}
                   onChange={event => updateDraft('turns', event.target.value)}
                   aria-invalid={!!errors.turns}
-                  aria-describedby={errors.turns ? `${id}-turns-error` : undefined}
+                  aria-describedby={
+                    errors.turns ? `${id}-turns-error` : `${id}-turns-hint`
+                  }
                 />
+                {/* On a "maximum" field, entering 0 reads as "none allowed".
+                    The hint carries the sentinel's meaning, the way the legacy
+                    cycle cap spells it in its own label. */}
+                <div id={`${id}-turns-hint`} className="text-[11px] text-muted">
+                  {i18nT('components.sessionAutomationPopover.wake_budget_zero_hint')}
+                </div>
                 <FieldError id={`${id}-turns-error`} message={errors.turns} />
               </div>
               <div className={fieldClass}>
@@ -714,14 +831,27 @@ export default function SessionAutomationPopover({
 
         {/* No hand-off: navigating away would discard the unsaved monitor draft. */}
         <ErrorNotice message={errors.request} className="mt-3" />
-        {!errors.request && snapshotFailed ? (
+        {ceilingFailed || snapshotNoticeDue ? (
           <div className="mt-3 space-y-2">
+            {/* ONE notice for the two reads that can fail together. The snapshot
+               and the live ceiling are separate queries with the same failure
+               mode and the same wording, so a notice per read puts two
+               identical alerts with two identical buttons in front of the
+               reader. One button retries whichever reads failed. */}
             {/* No hand-off: a failed refresh must preserve the unsaved monitor draft. */}
-            <ErrorNotice message={i18nT('components.sessionAutomationPopover.snapshot_failed')} />
+            <ErrorNotice
+              message={i18nT('components.sessionAutomationPopover.snapshot_failed')}
+              testId="monitor-read-error"
+            />
             <Btn
               type="button"
-              disabled={snapshotFetching}
-              onClick={() => { void queryClient.refetchQueries({ queryKey: ['session-automation', slotKey], exact: true }) }}
+              disabled={(ceilingFailed && liveCeiling.isFetching) || (snapshotNoticeDue && snapshotFetching)}
+              onClick={() => {
+                if (ceilingFailed) void liveCeiling.refetch()
+                if (snapshotNoticeDue) {
+                  void queryClient.refetchQueries({ queryKey: ['session-automation', slotKey], exact: true })
+                }
+              }}
             >
               {i18nT('components.sessionAutomationPopover.retry_snapshot')}
             </Btn>
@@ -812,7 +942,7 @@ export default function SessionAutomationPopover({
             </>
           ) : (
             <>
-              <Btn type="button" danger disabled={busy} onClick={() => setConfirmStop(true)}><Square className="lucide-inline" aria-hidden /> {i18nT('components.sessionAutomationPopover.stop_monitor')}</Btn>
+              <Btn type="button" danger disabled={busy} onClick={() => setConfirmStop(true)} {...uiLocation('composer.automation.stop-monitor')}><Square className="lucide-inline" aria-hidden /> {i18nT('components.sessionAutomationPopover.stop_monitor')}</Btn>
               <SendBtn
                 type="button"
                 disabled={busy || !monitor.actionable || !hasDirtyFields || sessionModeUnsupported}

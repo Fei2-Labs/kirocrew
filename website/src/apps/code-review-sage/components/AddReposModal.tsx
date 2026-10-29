@@ -90,7 +90,8 @@ function SectionHead({ title, hint }: { title: string; hint?: string }) {
 }
 
 /** `gh` isn't installed or signed in — a normal first-run state, not an error. */
-function GhNotice({ message }: { message?: string }) {
+/** `bare` drops the add-by-URL hint for surfaces that have no URL field. */
+export function GhNotice({ message, bare }: { message?: string; bare?: boolean }) {
   return (
     <div className="rounded-lg border border-border bg-bg-elevated px-3 py-2.5 text-[12.5px] leading-[1.6]">
       <span className="inline-flex items-center gap-1.5 text-warn font-medium">
@@ -100,7 +101,7 @@ function GhNotice({ message }: { message?: string }) {
         {/* One sentence in one key, with the command on its own line: the copy
             used to be four sibling keys wrapped around two <code> elements,
             which no translator could reorder. */}
-        {i18nT('apps.codeReviewSage.components.addReposModal.setup_hint')}
+        {!bare && i18nT('apps.codeReviewSage.components.addReposModal.setup_hint')}
         <div className="mt-1">
           <code className="font-mono">
             {i18nT('apps.codeReviewSage.components.addReposModal.gh_auth_login')}

@@ -21,15 +21,14 @@ So this module asserts three things:
 
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import os
-import signal
 import time
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
+from non_utf8_comm import comm_is_settable, renamed_child
 
+from conftest import absent_sysconf
 from kiro_crew import platform_compat
 from kiro_crew import subagent as sa
 from kiro_crew.mcp_gateway import pool as pool_mod
@@ -78,11 +77,25 @@ class _FakeTree:
 
 class TestPerProcessReads:
     def test_status_rss_parses_vmrss(self) -> None:
-        with patch("builtins.open", mock_open(read_data="Name:\tx\nVmRSS:\t 2048 kB\n")):
+        with (
+            patch.object(platform_compat, "IS_LINUX", True),
+            patch("builtins.open", mock_open(read_data=b"Name:\tx\nVmRSS:\t 2048 kB\n")),
+        ):
             assert platform_compat._proc_status_rss_kb(1234) == 2048
 
     def test_status_rss_unreadable_is_minus_one(self) -> None:
-        with patch("builtins.open", side_effect=OSError):
+        with (
+            patch.object(platform_compat, "IS_LINUX", True),
+            patch("builtins.open", side_effect=OSError),
+        ):
+            assert platform_compat._proc_status_rss_kb(1234) == -1
+
+    def test_status_rss_off_linux_is_minus_one(self) -> None:
+        """Without a /proc there is nothing to open: the walk's unreadable sentinel."""
+        with (
+            patch.object(platform_compat, "IS_LINUX", False),
+            patch("builtins.open", side_effect=AssertionError("opened off Linux")),
+        ):
             assert platform_compat._proc_status_rss_kb(1234) == -1
 
     def test_children_listing_unavailable(self) -> None:
@@ -108,6 +121,62 @@ class TestPerProcessReads:
         # post-comm tokens: state(0) ... utime(11)=120 stime(12)=60
         stat = b"1234 (kiro cli (node)) S 2 3 4 5 6 7 8 9 10 11 120 60 0 0"
         assert platform_compat._parse_cpu_jiffies(stat) == 180
+
+    def test_stat_is_read_as_bytes_past_a_comm_that_is_not_utf8(self, tmp_path) -> None:
+        # A prctl(PR_SET_NAME) name is arbitrary bytes, here with a ')' inside.
+        # post-comm tokens: state(0) ppid(1)=7 pgrp(2)=8 session(3)=9 ...
+        # starttime(19)=4242 vsize(20) rss(21)=55
+        (tmp_path / "1234").mkdir()
+        (tmp_path / "1234" / "stat").write_bytes(
+            b"1234 (\xff) \xfe) S 7 8 9 " + b"0 " * 15 + b"4242 0 55"
+        )
+        assert platform_compat.read_proc_stat(1234, proc_root=tmp_path) == platform_compat.ProcStat(
+            state="S", ppid=7, pgrp=8, session=9, start_ticks=4242, rss_pages=55, cpu_ticks=0
+        )
+        assert platform_compat._parse_ppid((tmp_path / "1234" / "stat").read_bytes()) == 7
+
+    def test_stat_fields_tolerate_a_missing_separator_after_comm(self) -> None:
+        assert platform_compat._parse_ppid(b"1 (x)S 7 8") == 7
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (b"no-parens-here", None),
+            (b"1 (x)", platform_compat.ProcStat()),
+            (b"1 (x) S -7 +8", platform_compat.ProcStat(state="S")),
+        ],
+    )
+    def test_malformed_stat_lines(self, tmp_path, raw: bytes, expected) -> None:
+        (tmp_path / "1").mkdir()
+        (tmp_path / "1" / "stat").write_bytes(raw)
+        assert platform_compat.read_proc_stat(1, proc_root=tmp_path) == expected
+
+    def test_unreadable_stat_is_none(self, tmp_path) -> None:
+        assert platform_compat.read_proc_stat(1, proc_root=tmp_path) is None
+
+    def test_an_overlong_numeric_token_is_none_not_a_raise(self, tmp_path) -> None:
+        (tmp_path / "1").mkdir()
+        (tmp_path / "1" / "stat").write_bytes(b"1 (x) S " + b"9" * 5000 + b" 8")
+        assert platform_compat.read_proc_stat(1, proc_root=tmp_path) == platform_compat.ProcStat(
+            "S", None, 8, None
+        )
+
+    def test_a_zero_tick_rate_dates_nothing(self, monkeypatch) -> None:
+        real = getattr(os, "sysconf", absent_sysconf)  # Windows has no os.sysconf
+        monkeypatch.setattr(
+            os, "sysconf", lambda name: 0 if name == "SC_CLK_TCK" else real(name), raising=False
+        )
+        assert platform_compat.process_start_boot_secs(4242) is None
+        assert platform_compat.process_age_secs(4242) is None
+
+    def test_process_age_is_boot_clock_now_minus_start(self, monkeypatch) -> None:
+        real = getattr(os, "sysconf", absent_sysconf)  # Windows has no os.sysconf
+        monkeypatch.setattr(
+            os, "sysconf", lambda name: 100 if name == "SC_CLK_TCK" else real(name), raising=False
+        )
+        monkeypatch.setattr(platform_compat, "boottime_now", lambda: 100.0)
+        assert platform_compat.process_age_secs(4242) == pytest.approx(57.58)
+        assert platform_compat.process_age_secs(20_000) == 0.0  # floored, never negative
 
     @pytest.mark.parametrize("raw", [b"", b"no-parens-here", b"1 (x) S 1 2 3"])
     def test_malformed_jiffies_are_zero(self, raw: bytes) -> None:
@@ -290,7 +359,7 @@ class TestOneHome:
         module is observed by both callers, which is only possible if neither
         has a walk of its own left."""
         with _FakeTree(needles=(sa.STUB_MODULE,)):
-            assert pool_mod._proc_rss_kb(10) == sum(RSS.values())
+            assert pool_mod.backend_rss_kb(10) == sum(RSS.values())
             assert sa._subtree_cpu_jiffies(10) == sum(JIFFIES.values())
             sample = sa._proc_subtree_sample(10)
         assert sample.rss_kb == sum(RSS.values())
@@ -315,20 +384,14 @@ class TestOneHome:
 # ── the pool caller ───────────────────────────────────────────────────────
 
 
-def _make_pool_key(server: str = "test-server", agent: str = "test-agent") -> PoolKey:
+def _make_pool_key(server: str = "test-server") -> PoolKey:
     return PoolKey(
         server_name=server,
-        agent_name=agent,
         command_args_hash="abc123",
         effective_env_hash="def456",
         work_dir="/tmp/test",
         binary_version="1.0",
         os_uid=1000,
-        sandbox_mode="none",
-        autoapprove_set_hash="ghi789",
-        approval_mode="reads",
-        trust_all_tools=False,
-        config_snapshot_hash="jkl012",
     )
 
 
@@ -423,52 +486,20 @@ class TestHostParentMap:
 
     def test_it_reads_a_process_whose_name_is_not_utf8(self) -> None:
         """A process may set its own name to arbitrary bytes, and the map must
-        still carry it.
-
-        This pins the reason the map parses BYTES instead of calling
-        :func:`parent_pid`, which reaches the same field through ``read_text``:
-        a name that is not valid UTF-8 raises there and is reported as unknown,
-        which in a map drops that process and every descendant behind it from a
-        caller's tree with nothing to see. The assumption is about a function
-        this one does not own, so it is asserted rather than described.
+        still carry it and the subtree behind it -- as must :func:`parent_pid`,
+        which reads the same field. A real process is renamed, so the kernel and
+        not a fixture writes the line.
         """
-        if not platform_compat.IS_LINUX:
+        if not comm_is_settable():
             pytest.skip("/proc parent map is Linux-only")
-        libc_name = ctypes.util.find_library("c")
-        if libc_name is None:
-            pytest.skip("libc not locatable, so the name cannot be set")
-        read_fd, write_fd = os.pipe()
-        child = os.fork()
-        if child == 0:  # pragma: no cover -- runs in the forked child
-            try:
-                libc = ctypes.CDLL(libc_name, use_errno=True)
-                libc.prctl(15, ctypes.c_char_p(b"weird\xff\xfename"), 0, 0, 0)
-                os.close(read_fd)
-                os.write(write_fd, b"x")
-                time.sleep(30)
-            except BaseException:
-                pass
-            os._exit(0)
-        os.close(write_fd)
-        try:
-            os.read(read_fd, 1)
+        with renamed_child(with_grandchild=True) as (child, grandchild):
             with open(f"/proc/{child}/stat", "rb") as fh:
-                raw = fh.read()
-            # The premise: the name really is the invalid-UTF-8 one.
-            assert b"\xff\xfe" in raw[raw.index(b"(") : raw.rindex(b")") + 1]
-            assert platform_compat._parse_ppid(raw) == os.getpid()
-            # The function this one deliberately does not call cannot answer.
-            assert platform_compat.parent_pid(child) is None
-            # ... while a normally-named process is fine through either route,
-            # so the None above is the name, not the call.
-            assert platform_compat.parent_pid(os.getpid()) is not None
+                assert platform_compat._parse_ppid(fh.read()) == os.getpid()
+            assert platform_compat.parent_pid(child) == os.getpid()
             table = platform_compat.proc_child_map()
             assert table is not None
             assert child in table.get(os.getpid(), [])
-        finally:
-            os.close(read_fd)
-            os.kill(child, signal.SIGKILL)
-            os.waitpid(child, 0)
+            assert grandchild in table.get(child, [])
 
     def test_off_linux_it_refuses_rather_than_reporting_an_empty_host(
         self, monkeypatch: pytest.MonkeyPatch

@@ -6,9 +6,9 @@ missing module" commit can put an internal coupling back, and most of them fail
 silently in a public build rather than loudly. This doc is the list of what must never
 come back, what is deliberately inert, and where the fork's UX diverges on purpose.
 
-Why each internal system was removed, and the pre-launch removals still pending, are
-[post-launch-removals.md](post-launch-removals.md) — that file is a dated ledger of
-migration scaffolding, this one is a standing boundary.
+[post-launch-removals.md](post-launch-removals.md) lists the migration scaffolding to
+delete once no legacy data can exist — today only the legacy `~/.kirocrew`
+security-path spelling. This file is a standing boundary.
 
 ## Never re-add
 
@@ -25,9 +25,11 @@ migration scaffolding, this one is a standing boundary.
   paths may still preserve user-supplied MCP server names, and optional skills may name
   an unavailable external governance source; neither is a bundled integration.
 - **Removed product surfaces.** Internal feature-app pages, tabs, API-client methods
-  and the credential-TTL card were deleted together with their backend. A downstream
-  edition re-adds them **additively** through the extension seams, never by editing
-  core.
+  and the credential-TTL card are not in the public build. A downstream edition re-adds
+  them **additively** through the extension seams, never by editing core. The
+  credential-TTL card's backend route stays as an inert seam: `GET /api/sso-ttl`
+  (`handlers_system.api_sso_ttl`) answers the identity seam's status, which is
+  unavailable in the public build, and no public frontend calls it.
 - **Other providers.** Kiro Crew is KiroACP-only: `agent.provider` is fixed to `acp`
   (`enum=["acp"]`) and kiro-cli is REQUIRED. A second harness is selected at
   `agent.acp_backend` and adapted, never added as a second `agent.provider` value,
@@ -45,8 +47,8 @@ Kiro Crew is an ACP *client*, so a second harness arrives as an adapter selected
   through the upstream ACP Registry rather than a hand-maintained table in this repo.
 - **Ungoverned tool calls are refused.** An adapter whose tool calls Kiro Crew cannot
   see does not reach its deny rules or its audit log, so the session refuses to start
-  unless the operator sets the one named opt-out,
-  `agent.acp_backend_allow_ungated_tools`. `ACP_BACKEND_CLAUDE` is selectable *because*
+  whenever its route to the PreToolUse gate cannot be established. There is no local
+  setting that opts an adapter out of this check. `ACP_BACKEND_CLAUDE` is selectable *because*
   the seeded routed mode makes `tool_gate.enforce` resolve ROUTED — not because being
   in the baseline waives the check. `test/test_acp_claude_backend.py::
   TestRoutingRestsOnTheAdapterReadPath::test_claude_is_selectable_only_because_its_tool_calls_are_gated`
@@ -62,7 +64,7 @@ and do not delete them.
 | Where | What it is |
 |---|---|
 | `sso_status.py` | No-op stubs so the dashboard and the Slack handlers keep the same symbols. Reports `available: False`. |
-| `dashboard/handlers/sso_login.py` | Keeps the `api_sso_login_ws` symbol routed in `dashboard/server.py`, accepts the WebSocket, reports unavailable, closes. Spawns no subprocess. |
+| `dashboard/handlers/sso_login.py` | Keeps the `api_sso_login_ws` symbol that `dashboard/routes/connections.py` routes at `/api/sso-login` when `DashboardContributor.sso_login_handler()` returns `None`; accepts the WebSocket, reports unavailable, closes. Spawns no subprocess. |
 | `tunnel/manager.py` | A thin wrapper that delegates lifecycle **unconditionally** to `current_context().tunnel`. The public core ships `DefaultTunnelProvider`, a no-op, so there is deliberately no edition branch in the manager itself. |
 | `website/src/rum.ts` | An inert no-op stub. Keep it inert; never add `aws-rum-web`. |
 
@@ -160,8 +162,9 @@ Two paths produce that one verdict, because a fork head receives no OIDC token:
 | a fork | `fork-internal-content-scan.yml`, Stage 2 | runs privileged from the default branch after `Fast Gate`, never checks out or executes fork code, and posts a check-run under the same `Internal Content Scan` name |
 
 `push` to `main` stays as the backstop for anything reaching the branch without a
-pull request. `merge_group` is declared but fires zero times — this repository has
-no merge queue — and is kept only because it is the trigger a queue would use.
+pull request. `merge_group` scans the merge queue's temporary commit, the tree that
+actually lands on `main`; `merge-queue-readiness.yml` waits on it alongside CI, Fast
+Gate and Build, so a red there holds the group as it holds a pull request.
 
 Two lanes are marked ineligible rather than pending, the same treatment CodeQL
 gets: a **stacked** PR (base is another feature branch) never starts the

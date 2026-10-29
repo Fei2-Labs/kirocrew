@@ -7,16 +7,21 @@ Covers:
 * the ``resolve`` evaluator truth table + the E1–E13 conformance vectors;
 * the **extensibility / decoupling acceptance criterion**: a synthetic scope is
   registered and resolved end-to-end with ZERO evaluator edits.
+
+Policy signature verification is in ``test_governance_policy_signatures.py``, and
+what ``resolve`` and ``gate_decision`` decide for an unnamed capability or an alias
+group, with the ungoverned rows ``kirocrew policy validate`` reports, is in
+``test_governance_policy_decisions.py``. The policy-body builder all
+three share is ``governance_policy_helpers.py``.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 
 import pytest
+from governance_policy_helpers import _policy_body
 
 from kiro_crew.platform import governance
 from kiro_crew.platform.context import PlatformCompositionError
@@ -25,10 +30,6 @@ from kiro_crew.platform.governance import (
     MODE_ALLOW,
     MODE_DENY,
     SCOPE_CATALOG,
-    SIGNATURE_UNCHECKED,
-    SIGNATURE_UNSIGNED,
-    SIGNATURE_UNVERIFIED,
-    SIGNATURE_VERIFIED,
     TIER_ENV,
     Bind,
     CapabilityGate,
@@ -39,7 +40,6 @@ from kiro_crew.platform.governance import (
     ScopedRuleset,
     ScopeSpec,
     assert_governance_floor,
-    assert_policy_signature_satisfied,
     classify_tool_title,
     compose_profiles,
     compose_tier_ladder,
@@ -48,22 +48,11 @@ from kiro_crew.platform.governance import (
     mcp_title_to_ref,
     parse_policy,
     parse_profile,
-    policy_signing_payload,
     register_matcher,
     register_scope,
     resolve,
     resolve_ordinal,
 )
-
-
-# ── A minimal, valid policy body reused across tests ──
-def _policy_body(**overrides) -> dict:
-    body = {
-        "version": 1,
-        "boot": {"fail_closed": True},
-    }
-    body.update(overrides)
-    return body
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -268,9 +257,7 @@ class TestCapabilityGate:
         # Default-ON siblings (memory_writes, browse, …) must not coerce
         # enabled: "false" through bool() and stay on.
         with pytest.raises(PlatformCompositionError, match="boolean"):
-            parse_profile(
-                {"name": "host", "capabilities": {"memory_writes": {"enabled": "false"}}}
-            )
+            parse_profile({"name": "host", "capabilities": {"memory_writes": {"enabled": "false"}}})
 
     def test_scopes_compose_independently(self):
         a = CapabilityGate(
@@ -1166,6 +1153,193 @@ class TestSchemaStrictness:
             ScopedRuleset.from_dict({"mode": "allow", "allow": ["read"], "deny": ["grep"]})
         assert any("Rule 1" in r.message or "allow beats deny" in r.message for r in caplog.records)
 
+    def test_allow_mode_deny_warning_never_carries_the_pasted_url(self, caplog):
+        """The Rule-1 sibling fires on every boot too, so it must not echo a deny entry."""
+        pasted = "https://user:pass@evil.example/p?api_key=SECRET123"
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ScopedRuleset.from_dict({"mode": "allow", "allow": ["skills.sh"], "deny": [pasted]})
+        warned = [
+            r.getMessage() for r in caplog.records if r.name == "kiro_crew.platform.governance"
+        ]
+        assert any("Rule 1: allow beats deny" in m for m in warned), warned
+        for secret in ("user", "pass", "SECRET123", pasted):
+            assert all(secret not in m for m in warned), (secret, warned)
+            assert secret not in caplog.text, secret
+
+    @staticmethod
+    def _host_warnings(caplog, body, *, matcher="host"):
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.platform.governance"):
+            ScopedRuleset.from_dict(body, matcher=matcher, scope="network.egress")
+        return [r.getMessage() for r in caplog.records if "matcher=host" in r.getMessage()]
+
+    @pytest.mark.parametrize("matcher", sorted(governance._MATCHERS))
+    def test_only_the_host_matcher_warns_on_a_url_shaped_item(self, matcher, caplog):
+        """A URL-shaped entry is dead ONLY under `host`, so only `host` may warn.
+
+        Every other matcher tests an item that legitimately carries a `/`, a
+        path, a command line, an `@server/tool` reference, so warning there
+        would be noise on correct config.
+        """
+        warned = self._host_warnings(
+            caplog, {"mode": MODE_DENY, "deny": ["https://skills.sh/api"]}, matcher=matcher
+        )
+        assert bool(warned) is (matcher == "host"), f"{matcher} warned: {bool(warned)}"
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "skills.sh",
+            "*.skills.sh",
+            "*",
+            "**",
+            "*.*",
+            "localhost",
+            "skills.*",
+            "sub.*.skills.sh",
+            # urlparse reads `?` as a query and finds no host, yet the glob works.
+            "?.skills.sh",
+            # `_splitnetloc` cuts a netloc at `?`, so `_url_host` gives `api`, yet
+            # `apix.skills.sh` matches.
+            "api?.skills.sh",
+            "*.skills?.sh",
+            "foo_bar",
+            "127.0.0.1",
+            "UPPER.CASE.COM",
+            "xn--80ak6aa92e.com",
+            "skills.sh.",
+            # `_match_host` strips, so padding is not a dead entry either.
+            " skills.sh ",
+            "server",
+            "intranet",
+            # A bare IPv6 literal is the item `_url_host` yields for `[::1]`, so it
+            # matches. Its colons are not a port, whatever `rsplit(":")` makes of them.
+            "::1",
+            "2001:db8::1",
+            "fe80::1",
+            "2001:db8:0:0:0:0:0:1",
+            # `_match_host` is fnmatch, so a bracket that is not IPv6 syntax is a
+            # live character class: `[ab].example.com` matches `a.example.com`.
+            "[ab].example.com",
+            "[a-z].example.com",
+            # A colon inside the class does not make it IPv6: `_url_host` finds no
+            # host in `[a:].example.com`, and the class matches `a.example.com`.
+            "[a:].example.com",
+            "[a:b].example.com",
+            "[abc]x.com",
+            "web[0-9][0-9].corp.example",
+            # An unpaired bracket is literal to fnmatch, so the entry matches itself.
+            "a]b.com",
+            "a[b.com",
+            # A glob absorbs the colon: `*:443` matches `fe80::443`, the item
+            # `_url_host` yields for `https://[fe80::443]/x`, so this is no port.
+            "*:443",
+            "web*:443",
+        ],
+    )
+    def test_a_pattern_that_can_match_a_host_does_not_warn(self, pattern, caplog):
+        """The form that WORKS must stay silent, or the warning trains operators to ignore it.
+
+        A known-dead sibling rides along so the case fails if the guard is gone,
+        not only if it over-fires.
+        """
+        warned = self._host_warnings(
+            caplog, {"mode": MODE_DENY, "deny": [pattern, "https://dead.example/x"]}
+        )
+        assert len(warned) == 1 and "deny[1]" in warned[0], warned
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "https://skills.sh/api",
+            "skills.sh/api",
+            "//skills.sh/api",
+            "http://skills.sh",
+            "skills.sh:8080",
+            "localhost:3000",
+            "10.0.0.1:443",
+            # A single-label host does not look like a host to `_url_host`, which
+            # finds none here, yet the entry is just as dead.
+            "server:443",
+            "intranet:8080",
+            "db:5432",
+            "https://user:pass@skills.sh/api",
+            "[::1]",
+            "[::1]:443",
+            "[2001:db8::1]",
+            "https://*.skills.sh/api",
+            "/api/v1",
+            "file:///etc/passwd",
+            "http://",
+            "user:pass@skills.sh",
+            "*://skills.sh",
+            "2001:db8::/32",
+            "https://*",
+            "http://*",
+            "10.0.0.0/8",
+            "192.168.0.0/16",
+        ],
+    )
+    def test_a_dead_entry_is_named_by_position(self, pattern, caplog):
+        warned = self._host_warnings(caplog, {"mode": MODE_DENY, "deny": ["ok.example", pattern]})
+        assert len(warned) == 1, warned
+        assert "'network.egress'" in warned[0]
+        assert "deny[1]" in warned[0]
+
+    @pytest.mark.parametrize(
+        "pattern,secret",
+        [
+            ("https://user:pass@skills.sh/api", "pass"),
+            ("https://skills.sh/api?api_key=SECRET123", "SECRET123"),
+            ("https://hooks.slack.com/services/T0/B0/XXSECRETXX", "XXSECRETXX"),
+            # urlsplit cuts a netloc only at `/`, `?` and `#`, so each of these
+            # survives `_url_host` verbatim.
+            ("https://ghp_AAAABBBBCCCCDDDD\\x.com/p", "ghp_"),
+            ("https://ghp_TOKEN1234\\evil.com", "ghp_"),
+            ("https://abc|ghp_LEAK.com/p", "ghp_"),
+            ("https://a'ghp_LEAK2.com/p", "ghp_"),
+            ("https://ghp_TOK^3.com/p", "ghp_"),
+            ("https://a b.com/p", "a b.com"),
+            ("https://a%40b.com/p", "a%40b.com"),
+            # Every character is host-shaped: the token IS the DNS label.
+            ("https://ghp_" + "A" * 36 + ".example.com/p", "ghp_" + "A" * 36),
+            ("https://github_pat_" + "B" * 40 + ".example.com/p", "github_pat_" + "B" * 40),
+            ("https://sk-ant-" + "C" * 40 + ".example.com/p", "sk-ant-" + "C" * 40),
+        ],
+    )
+    def test_the_warning_never_carries_the_pasted_url(self, pattern, secret, caplog):
+        """A pasted URL carries credentials, and this logs on every boot unredacted."""
+        warned = self._host_warnings(caplog, {"mode": MODE_DENY, "deny": [pattern]})
+        assert len(warned) == 1, warned
+        assert "'network.egress'" in warned[0]
+        assert "deny[0]" in warned[0]
+        # The handler's formatted text, so a secret smuggled via `%s` args is caught too.
+        assert secret not in caplog.text
+
+    @pytest.mark.parametrize(
+        "mode,listed,effect",
+        [
+            (MODE_DENY, "deny", "permits"),
+            (MODE_ALLOW, "allow", "refuses"),
+        ],
+    )
+    def test_only_the_list_the_mode_reads_is_walked(self, mode, listed, effect, caplog):
+        """The engine never reads the other list, so a warning about it is noise.
+
+        The consequence must match the mode: a dead allow refuses what it names,
+        and saying "permits" misdirects an operator debugging an egress outage.
+        """
+        warned = self._host_warnings(
+            caplog,
+            {
+                "mode": mode,
+                "allow": ["https://allowed.example/a"],
+                "deny": ["https://denied.example/a"],
+            },
+        )
+        assert len(warned) == 1, warned
+        assert f"{listed}[0]" in warned[0]
+        assert f"the scope {effect} the host it names" in warned[0]
+
     def test_posture_key_must_be_admitted_member(self):
         # posture for a member not in the members allow-set is rejected.
         with pytest.raises(PlatformCompositionError):
@@ -1200,783 +1374,3 @@ class TestSchemaStrictness:
     def test_profile_name_pattern_accepted(self, ok):
         prof = parse_profile({"name": ok})
         assert prof.name == ok
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Policy signature verification (identity.signature) — mirrors admission
-# ──────────────────────────────────────────────────────────────────────────
-def _sign_policy(body: dict, secret: str) -> dict:
-    """Return *body* with a valid ``identity.signature`` for its issuer."""
-    signed = json.loads(json.dumps(body))  # deep copy; body may be reused
-    sig = hmac.new(
-        secret.encode("utf-8"), policy_signing_payload(signed), hashlib.sha256
-    ).hexdigest()
-    signed.setdefault("identity", {})["signature"] = sig
-    return signed
-
-
-def _patch_trust(monkeypatch, *, require: bool, keys: dict):
-    """Point the loader's trust root at fixed settings (no admission file I/O)."""
-    monkeypatch.setattr(
-        "kiro_crew.platform.governance._policy_trust_settings",
-        lambda: (require, dict(keys)),
-    )
-
-
-def _real_trust_file(monkeypatch, tmp_path, *, require: bool, keys: dict):
-    """Write a REAL admission file so both trust-root readers agree.
-
-    ``_patch_trust`` stubs ``_policy_trust_settings``, which the loader uses for keys,
-    but the enforcement gate reads the opt-in from the admission file directly. Tests
-    that exercise the gate therefore need an actual file, not the stub.
-    """
-    adm = tmp_path / "admission_policy.json"
-    adm.write_text(json.dumps({"require_policy_signature": require, "trust_keys": dict(keys)}))
-    monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-
-
-def _load_and_enforce(**kwargs):
-    """Load the policy and apply the boot gate — the real two-step boot sequence.
-
-    Load computes each tier's verdict; the gate judges the one that survived
-    precedence.  Tests assert on the pair because that is what a host actually runs;
-    asserting on ``load_security_policy`` alone would pin an intermediate state and
-    miss the tier-precedence bug that split them apart.
-    """
-    ceiling = load_security_policy(**kwargs)
-    assert_policy_signature_satisfied(ceiling)
-    return ceiling
-
-
-class TestPolicySigningPayload:
-    def test_signature_field_is_excluded_but_issuer_is_covered(self):
-        base = _policy_body(identity={"issuer": "fleet-control"})
-        with_sig = _policy_body(identity={"issuer": "fleet-control", "signature": "deadbeef"})
-        # Adding the signature must not change the payload (it cannot cover itself)…
-        assert policy_signing_payload(base) == policy_signing_payload(with_sig)
-        # …but the issuer IS inside it, so a validly-signed policy cannot be
-        # re-labelled as issued by someone else.
-        other = _policy_body(identity={"issuer": "attacker", "signature": "deadbeef"})
-        assert policy_signing_payload(other) != policy_signing_payload(with_sig)
-
-    def test_payload_is_stable_across_key_order_and_whitespace(self):
-        a = {"version": 1, "boot": {"fail_closed": True}}
-        b = {"boot": {"fail_closed": True}, "version": 1}
-        assert policy_signing_payload(a) == policy_signing_payload(b)
-
-    def test_payload_covers_unknown_forward_compatible_keys(self):
-        # Signing the raw document (not a projection of the parsed ceiling) is what
-        # makes a companion-registered or future scope tamper-evident on a build
-        # that does not know the key.
-        a = _policy_body()
-        b = _policy_body(future_scope={"mode": "allow"})
-        assert policy_signing_payload(a) != policy_signing_payload(b)
-
-    def test_shares_admission_canonicalization(self):
-        # One canonicalizer for both trust roots — a divergence here is exactly how
-        # a signer and a verifier drift apart.
-        from kiro_crew.platform.admission import canonical_signing_bytes
-
-        body = {"version": 1, "boot": {"fail_closed": True}}
-        assert policy_signing_payload(body) == canonical_signing_bytes(body)
-
-
-class TestPolicySignatureStates:
-    def test_verified_good_signature(self, monkeypatch, tmp_path):
-        secret = "trust-key"
-        body = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), secret)
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": secret})
-        ceiling = load_security_policy()
-        assert ceiling is not None
-        assert ceiling.signature_state == SIGNATURE_VERIFIED
-        assert "verified" in ceiling.signature_summary()
-
-    def test_verified_survives_reserialization(self, monkeypatch, tmp_path):
-        # The signature covers the canonical form of the parsed JSON, so an
-        # operator re-indenting or reordering the file does not invalidate it.
-        secret = "trust-key"
-        body = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), secret)
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body, indent=4, sort_keys=True) + "\n")
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": secret})
-        assert load_security_policy().signature_state == SIGNATURE_VERIFIED
-
-    def test_non_ascii_signature_is_unverified_not_a_crash(self, monkeypatch, tmp_path):
-        """A non-ASCII signature must be an ordinary UNVERIFIED verdict.
-
-        ``hmac.compare_digest`` raises TypeError on a str carrying any non-ASCII
-        character, and a policy file's signature is attacker- or paste-controlled
-        text (a smart-quote or NBSP is enough).  A raised TypeError is NOT a
-        denial: it escapes ``load_security_policy`` as a plain exception, the boot
-        handler does not treat it as fatal (it only re-raises
-        ``PlatformCompositionError``), and the later ``safe_context_call``
-        degrades to the no-ceiling fallback — so a tampered policy would yield an
-        UNGOVERNED host even with ``require_policy_signature`` on, inverting the
-        flag.  Both sides are encoded before comparison.
-        """
-        for signature in ("abc\u2013def", "abc\u00a0def", "\u00e9" * 64):
-            body = _policy_body(identity={"issuer": "fleet-control", "signature": signature})
-            p = tmp_path / "policy.json"
-            p.write_text(json.dumps(body))
-            monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-            _patch_trust(monkeypatch, require=False, keys={"fleet-control": "trust-key"})
-            ceiling = load_security_policy()
-            assert ceiling is not None
-            assert ceiling.signature_state == SIGNATURE_UNVERIFIED
-
-    def test_a_lone_surrogate_signature_is_unverified_not_a_crash(self):
-        """``json.loads`` accepts ``"\\udc80"``; a strict ``encode`` would raise.
-
-        A UnicodeEncodeError is a ValueError, not a PlatformCompositionError, so it
-        would escape the loader and the host would degrade to ungoverned. The tier
-        ladder verifies a user-owned home file beneath the central document on every
-        load, so this is one byte in that file removing the fleet ceiling. It must
-        classify like every other malformed signature instead.
-        """
-        doc = json.loads(
-            '{"version": 1, "boot": {"fail_closed": true}, '
-            '"identity": {"issuer": "corp", "signature": "\\udc80"}}'
-        )
-        state, _detail = governance._policy_signature_state(doc, {"corp": "k"})
-        assert state == SIGNATURE_UNVERIFIED
-
-    def test_a_lone_surrogate_trust_key_is_unverified_not_a_crash(self):
-        """The other text the compare depends on: the key from the JSON trust root.
-
-        ``hmac_signature`` encodes the key before hashing; a strict encode raised on a
-        lone surrogate there, one call before the compare this class fixes.
-        """
-        doc = json.loads(
-            '{"version": 1, "boot": {"fail_closed": true}, '
-            '"identity": {"issuer": "corp", "signature": "abcd"}}'
-        )
-        trust_keys = json.loads('{"corp": "\\udc80"}')
-        assert len(trust_keys["corp"]) == 1  # a real lone surrogate, not the 6-char escape
-        state, _detail = governance._policy_signature_state(doc, trust_keys)
-        assert state == SIGNATURE_UNVERIFIED
-
-    def test_non_ascii_signature_fails_closed_when_required(self, monkeypatch, tmp_path):
-        """...and with the opt-in ON it must ABORT, not degrade to ungoverned."""
-        body = _policy_body(identity={"issuer": "fleet-control", "signature": "tamper\u2013ed"})
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": "trust-key"})
-        with pytest.raises(PlatformCompositionError):
-            _load_and_enforce()
-
-    def test_verified_bad_signature_is_unverified(self, monkeypatch, tmp_path):
-        body = _policy_body(identity={"issuer": "fleet-control", "signature": "not-the-mac"})
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": "trust-key"})
-        ceiling = load_security_policy()
-        assert ceiling is not None
-        assert ceiling.signature_state == SIGNATURE_UNVERIFIED
-
-    def test_tampered_payload_invalidates_a_good_signature(self, monkeypatch, tmp_path):
-        # The core threat: an attacker edits a governed scope to WIDEN the ceiling
-        # but cannot re-sign it.
-        secret = "trust-key"
-        body = _sign_policy(
-            _policy_body(
-                identity={"issuer": "fleet-control"},
-                commands={"mode": "deny", "deny": ["git push*"]},
-            ),
-            secret,
-        )
-        body["commands"] = {"mode": "deny", "deny": []}  # ceiling widened in place
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": secret})
-        assert load_security_policy().signature_state == SIGNATURE_UNVERIFIED
-
-    def test_signature_without_issuer_is_unverified(self, monkeypatch, tmp_path):
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body(identity={"signature": "abc"})))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": "k"})
-        assert load_security_policy().signature_state == SIGNATURE_UNVERIFIED
-
-    def test_no_trust_key_for_issuer_is_unverified(self, monkeypatch, tmp_path):
-        body = _sign_policy(_policy_body(identity={"issuer": "unknown-issuer"}), "k")
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": "k"})
-        assert load_security_policy().signature_state == SIGNATURE_UNVERIFIED
-
-    def test_wrong_trust_key_is_unverified(self, monkeypatch, tmp_path):
-        body = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), "real-key")
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={"fleet-control": "other-key"})
-        assert load_security_policy().signature_state == SIGNATURE_UNVERIFIED
-
-
-class TestPolicySignatureOptIn:
-    """The load-bearing design decision: verification is opt-in and advisory."""
-
-    def test_unsigned_with_require_off_still_loads_and_governs(self, monkeypatch, tmp_path):
-        # Backward-compatibility guarantee: every existing policy file keeps
-        # working unchanged, with no signature and no trust key provisioned.
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body(commands={"mode": "deny", "deny": ["git push*"]})))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={})
-        ceiling = load_security_policy()
-        assert ceiling is not None
-        assert ceiling.signature_state == SIGNATURE_UNSIGNED
-        # …and the ceiling is still ENFORCED, not degraded to ungoverned.
-        assert not resolve(ceiling, None, "commands", "git push origin").permitted
-
-    def test_unverified_with_require_off_still_loads(self, monkeypatch, tmp_path):
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body(identity={"issuer": "x", "signature": "bogus"})))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={})
-        assert load_security_policy() is not None
-
-    def test_unsigned_with_require_on_fails_closed(self, monkeypatch, tmp_path):
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": "k"})
-        with pytest.raises(PlatformCompositionError):
-            _load_and_enforce()
-
-    def test_tampered_with_require_on_fails_closed(self, monkeypatch, tmp_path):
-        secret = "trust-key"
-        body = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), secret)
-        body["version"] = 1
-        body["boot"] = {"fail_closed": False}  # tampered after signing
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": secret})
-        with pytest.raises(PlatformCompositionError):
-            _load_and_enforce()
-
-    def test_verified_with_require_on_boots(self, monkeypatch, tmp_path):
-        secret = "trust-key"
-        body = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), secret)
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(body))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=True, keys={"fleet-control": secret})
-        assert load_security_policy().signature_state == SIGNATURE_VERIFIED
-
-    def test_require_on_marks_governance_health_incident(self, monkeypatch, tmp_path):
-        from kiro_crew.platform import governance_health
-
-        governance_health.reset()
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={})
-        with pytest.raises(PlatformCompositionError):
-            _load_and_enforce()
-        inc = governance_health.last_incident()
-        assert inc is not None and inc["kind"] == "failed_closed"
-        governance_health.reset()
-
-    def test_home_tier_is_verified_too(self, monkeypatch, tmp_path):
-        secret = "trust-key"
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        home = tmp_path / "security_policy.json"
-        home.write_text(
-            json.dumps(_sign_policy(_policy_body(identity={"issuer": "operator"}), secret))
-        )
-        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: home)
-        _patch_trust(monkeypatch, require=False, keys={"operator": secret})
-        assert load_security_policy().signature_state == SIGNATURE_VERIFIED
-
-    def test_home_tier_unsigned_with_require_on_fails_closed(self, monkeypatch, tmp_path):
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        home = tmp_path / "security_policy.json"
-        home.write_text(json.dumps(_policy_body()))
-        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: home)
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={})
-        with pytest.raises(PlatformCompositionError):
-            _load_and_enforce()
-
-    def test_signed_bundle_outranks_an_unsigned_home_file(self, monkeypatch, tmp_path):
-        # GPT finding: enforcing at LOAD time raised on whichever tier a given pass
-        # happened to reach. The core's loader-less pass falls through to the HOME
-        # file, so an enterprise host with an unsigned home file and a correctly
-        # signed companion BUNDLE aborted — even though the bundle outranks home and
-        # is what the final ceiling comes from. Enforcement moved to the composed
-        # result so precedence decides which verdict is judged.
-        secret = "trust-key"
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        home = tmp_path / "security_policy.json"
-        home.write_text(json.dumps(_policy_body()))  # unsigned, lower precedence
-        monkeypatch.setattr("kiro_crew.platform.governance._policy_home_path", lambda: home)
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": secret})
-        # The core's loader-less pass must not abort on the lower-precedence tier…
-        assert load_security_policy() is not None
-        # …and the edition's signed bundle is what gets judged, so boot proceeds.
-        bundle = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), secret)
-        assert _load_and_enforce(bundled_loader=lambda: bundle).signature_state == (
-            SIGNATURE_VERIFIED
-        )
-
-    def test_bundled_tier_is_advisory_when_require_off(self, monkeypatch, tmp_path):
-        # With require OFF (the Amazon edition ships no require), an unsigned
-        # bundled policy still loads — advisory, exactly like the file tiers.
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: tmp_path / "nope.json"
-        )
-        _patch_trust(monkeypatch, require=False, keys={})
-        ceiling = load_security_policy(bundled_loader=lambda: _policy_body())
-        assert ceiling is not None
-        assert ceiling.signature_state == SIGNATURE_UNSIGNED
-
-    def test_bundled_tier_is_NOT_exempt_when_required(self, monkeypatch, tmp_path):
-        # GPT-review finding: the plugin-admission manifest signature covers only
-        # name/publisher/version/capabilities, NOT the packaged
-        # security_policy.json bytes, so "covered by admission" never protected
-        # the resource — a tampered bundled policy loaded unchecked. Under
-        # require_policy_signature the bundled tier must verify like any other.
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: tmp_path / "nope.json"
-        )
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": "trust-key"})
-        # An unsigned bundled policy under require must abort, not load.
-        with pytest.raises(PlatformCompositionError):
-            _load_and_enforce(
-                bundled_loader=lambda: _policy_body(identity={"issuer": "fleet-control"})
-            )
-        # A correctly-signed bundled policy verifies and loads.
-        signed = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), "trust-key")
-        ceiling = load_security_policy(bundled_loader=lambda: signed)
-        assert ceiling is not None
-        assert ceiling.signature_state == SIGNATURE_VERIFIED
-
-    def test_no_policy_stays_none_when_require_off(self, monkeypatch, tmp_path):
-        # require OFF: an ungoverned standalone host stays ungoverned.
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: tmp_path / "nope.json"
-        )
-        _patch_trust(monkeypatch, require=False, keys={})
-        assert load_security_policy() is None
-
-    def test_loader_never_raises_on_absence_whatever_the_optin(self, monkeypatch, tmp_path):
-        # The loader is not the authority on absence: it runs once per composition
-        # pass (core without a bundled_loader, edition with one) and cannot tell
-        # whether it is the last word. Raising inside it either aborts a bundle-only
-        # enterprise host before its edition is consulted, or — keyed on the loader
-        # being present — misses a standalone host entirely (the GPT finding). So
-        # absence always yields None here; the refusal lives in the boot gate.
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: tmp_path / "nope.json"
-        )
-        adm = tmp_path / "admission_policy.json"
-        adm.write_text(
-            json.dumps(
-                {"require_policy_signature": True, "trust_keys": {"fleet-control": "trust-key"}}
-            )
-        )
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-        assert load_security_policy() is None  # core's loader-less pass
-        assert load_security_policy(bundled_loader=lambda: None) is None  # edition's pass
-
-
-class TestPolicySignatureAbsenceGate:
-    """``assert_policy_signature_satisfied`` — absence must not satisfy the mandate."""
-
-    def test_no_policy_fails_closed_when_genuinely_required(self, monkeypatch, tmp_path):
-        # With require ON and NO policy at any tier, handing back an ungoverned host
-        # bypasses the requirement precisely when it matters (a mandated-signature
-        # fleet that lost or never shipped its policy). Boot must abort instead.
-        adm = tmp_path / "admission_policy.json"
-        adm.write_text(
-            json.dumps(
-                {"require_policy_signature": True, "trust_keys": {"fleet-control": "trust-key"}}
-            )
-        )
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-        with pytest.raises(PlatformCompositionError):
-            assert_policy_signature_satisfied(None)
-
-    def test_standalone_no_loader_is_covered_too(self, monkeypatch, tmp_path):
-        # GPT finding on the previous shape: gating the refusal on "a bundled_loader
-        # was consulted" meant a STANDALONE host (no edition, so no loader ever) with
-        # a genuine opt-in and no policy ran with no ceiling. The gate runs on the
-        # composed context, so it does not depend on a loader existing at all.
-        adm = tmp_path / "admission_policy.json"
-        adm.write_text(json.dumps({"require_policy_signature": True}))
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-        monkeypatch.delenv("KIROCREW_SECURITY_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.governance._policy_home_path", lambda: tmp_path / "nope.json"
-        )
-        ceiling = load_security_policy()  # standalone: no bundled_loader, ever
-        assert ceiling is None
-        with pytest.raises(PlatformCompositionError):
-            assert_policy_signature_satisfied(ceiling)
-
-    def test_verified_ceiling_satisfies_the_gate(self, monkeypatch, tmp_path):
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": "trust-key"})
-        signed = _sign_policy(_policy_body(identity={"issuer": "fleet-control"}), "trust-key")
-        assert_policy_signature_satisfied(parse_policy(signed, signature_state=SIGNATURE_VERIFIED))
-
-    def test_present_but_unverified_ceiling_does_NOT_satisfy_the_gate(self, monkeypatch, tmp_path):
-        # Presence alone is not enough — the gate is the enforcement point for the
-        # verdict too, now that load time only computes it. A tampered or unsigned
-        # ceiling that survived precedence must abort here.
-        _real_trust_file(monkeypatch, tmp_path, require=True, keys={"fleet-control": "trust-key"})
-        for state in (SIGNATURE_UNSIGNED, SIGNATURE_UNVERIFIED, SIGNATURE_UNCHECKED):
-            with pytest.raises(PlatformCompositionError):
-                assert_policy_signature_satisfied(
-                    parse_policy(_policy_body(), signature_state=state)
-                )
-
-    def test_unverified_ceiling_is_fine_when_require_off(self, monkeypatch, tmp_path):
-        # The compatibility contract: with the flag off an unsigned ceiling loads
-        # AND governs, so the gate must not touch it.
-        _real_trust_file(monkeypatch, tmp_path, require=False, keys={})
-        assert_policy_signature_satisfied(
-            parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
-        )
-
-    def test_require_off_is_a_noop(self, monkeypatch, tmp_path):
-        # The default and what the amazon edition ships: an ungoverned standalone
-        # host stays ungoverned rather than being refused boot.
-        adm = tmp_path / "admission_policy.json"
-        adm.write_text(json.dumps({"mode": "open"}))
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-        assert_policy_signature_satisfied(None)
-
-    @pytest.mark.parametrize(
-        "shape", ['{ "mode": "open",  <-- typo', "[]", "null", '"a string"', "123"]
-    )
-    def test_a_broken_trust_root_reads_as_no_optin_by_design(self, monkeypatch, tmp_path, shape):
-        """A corrupt/malformed admission file does NOT fail closed. Deliberate.
-
-        An attacker who can write this file is outside the policy-signature threat
-        model — they would set the flag to ``false``, which parses fine — so
-        fail-closing on a *malformed* file catches only a clumsy version of an attack
-        the design concedes, while turning a non-atomic fleet push or a hand-edit
-        typo into an unbootable host. Corruption here is a reliability event: logged,
-        predictable, reported by ``kirocrew doctor``.
-        """
-        bad = tmp_path / "admission_policy.json"
-        bad.write_text(shape)
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(bad))
-        assert_policy_signature_satisfied(None)
-        assert_policy_signature_satisfied(
-            parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
-        )
-
-    @pytest.mark.parametrize("junk", ["false", None, 0, 1, ""])
-    def test_junk_flag_in_wellformed_trust_root_fails_closed(
-        self, monkeypatch, tmp_path, junk
-    ):
-        # A well-formed trust root whose flag is PRESENT but not a boolean is a
-        # different case from a broken file: the operator wrote the key down, so
-        # it reads fail-closed as opted-in (via admission._coerce_flag) and an
-        # unsigned policy is refused. Locks the enforcement reader to the same
-        # strict read as the key store.
-        adm = tmp_path / "admission_policy.json"
-        adm.write_text(json.dumps({"require_policy_signature": junk}))
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-        with pytest.raises(PlatformCompositionError):
-            assert_policy_signature_satisfied(
-                parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
-            )
-
-    def test_absent_admission_file_is_a_noop(self, monkeypatch, tmp_path):
-        # No trust root: nobody opted in, so an unsigned policy still loads and
-        # governs (the compatibility contract) and no policy stays ungoverned.
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(tmp_path / "missing.json"))
-        assert_policy_signature_satisfied(None)
-        assert_policy_signature_satisfied(
-            parse_policy(_policy_body(), signature_state=SIGNATURE_UNSIGNED)
-        )
-
-    def test_absent_admission_policy_keeps_verification_advisory(self, monkeypatch, tmp_path):
-        # An admission-policy problem is handled loudly in admission's OWN domain;
-        # it must not additionally make the security ceiling unloadable here.
-        monkeypatch.delenv("KIROCREW_ADMISSION_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.admission._policy_default_path",
-            lambda: tmp_path / "no-admission.json",
-        )
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        ceiling = load_security_policy()
-        assert ceiling is not None
-        assert ceiling.signature_state == SIGNATURE_UNSIGNED
-
-    def test_raising_trust_root_keeps_verification_advisory(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            "kiro_crew.platform.admission.read_policy_trust_root",
-            lambda: (_ for _ in ()).throw(RuntimeError("boom")),
-        )
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        assert load_security_policy().signature_state == SIGNATURE_UNSIGNED
-
-    def test_trust_settings_read_from_admission_policy_file(self, monkeypatch, tmp_path):
-        # One key store: the flag + keys come from the admission policy file, not a
-        # second bespoke file, and NOT from the security policy itself.
-        adm = tmp_path / "admission_policy.json"
-        adm.write_text(
-            json.dumps({"require_policy_signature": True, "trust_keys": {"fleet-control": "k"}})
-        )
-        monkeypatch.setenv("KIROCREW_ADMISSION_POLICY", str(adm))
-        from kiro_crew.platform.governance import _policy_trust_settings
-
-        require, keys = _policy_trust_settings()
-        assert require is True
-        assert keys == {"fleet-control": "k"}
-
-    def test_security_policy_cannot_self_declare_the_requirement(self, monkeypatch, tmp_path):
-        # A require_policy_signature key inside security_policy.json is NOT a
-        # governed scope, so it fails closed as an unknown key rather than being
-        # honored — a document must not be the authority on its own authenticity.
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body(require_policy_signature=True)))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        _patch_trust(monkeypatch, require=False, keys={})
-        with pytest.raises(PlatformCompositionError):
-            load_security_policy()
-
-    def test_loading_does_not_disturb_admission_health_signal(self, monkeypatch, tmp_path):
-        # The trust-root read must NOT run the audited admission loader: that
-        # records posture + a critical SEL, and gatewayd re-loads the security
-        # policy per app call.
-        from kiro_crew.platform import governance_health
-
-        governance_health.reset()
-        monkeypatch.delenv("KIROCREW_ADMISSION_POLICY", raising=False)
-        monkeypatch.setattr(
-            "kiro_crew.platform.admission._policy_default_path",
-            lambda: tmp_path / "no-admission.json",
-        )
-        p = tmp_path / "policy.json"
-        p.write_text(json.dumps(_policy_body()))
-        monkeypatch.setenv("KIROCREW_SECURITY_POLICY", str(p))
-        load_security_policy()
-        assert governance_health.governance_status() == "unknown"
-        assert governance_health.last_incident() is None
-        governance_health.reset()
-
-
-class TestParsePolicySignatureState:
-    def test_direct_parse_is_unchecked_not_unsigned(self):
-        # parse_policy has the document but no trust root; claiming "unsigned"
-        # would conflate "we looked" with "nobody looked".
-        ceiling = parse_policy(_policy_body())
-        assert ceiling.signature_state == SIGNATURE_UNCHECKED
-        assert "not checked" in ceiling.signature_summary()
-
-    def test_identity_fields_still_parsed(self):
-        ceiling = parse_policy(_policy_body(identity={"issuer": "fleet-control", "signature": "s"}))
-        assert ceiling.identity_issuer == "fleet-control"
-        assert ceiling.identity_signature == "s"
-
-
-class TestPolicyShowReporting:
-    """`kirocrew policy show` must distinguish the three provenance states."""
-
-    def _show(self, capsys, ceiling):
-        import argparse
-        from unittest.mock import patch
-
-        from kiro_crew import cli_commands
-
-        args = argparse.Namespace(policy_action="show")
-        # _policy imports current_context lazily from platform.context, so patch
-        # it at the definition site.
-        with patch(
-            "kiro_crew.platform.context.current_context",
-            return_value=type("Ctx", (), {"governance": ceiling})(),
-        ):
-            cli_commands._policy(args)
-        return capsys.readouterr().out
-
-    def _ceiling(self, state, issuer="fleet-control", signature="sig"):
-        return GovernanceCeiling(
-            version=1,
-            boot=parse_policy(_policy_body()).boot,
-            controls={},
-            identity_issuer=issuer,
-            identity_signature=signature,
-            signature_state=state,
-        )
-
-    def test_show_reports_verified(self, capsys):
-        out = self._show(capsys, self._ceiling(SIGNATURE_VERIFIED))
-        assert "signed and verified" in out
-        assert "fleet-control" in out
-
-    def test_show_reports_signed_but_unverified(self, capsys):
-        out = self._show(capsys, self._ceiling(SIGNATURE_UNVERIFIED))
-        assert "UNVERIFIED" in out
-        # An unproven issuer must NOT be presented as an established fact.
-        assert "signed and verified" not in out
-
-    def test_show_reports_unsigned(self, capsys):
-        out = self._show(capsys, self._ceiling(SIGNATURE_UNSIGNED, issuer="", signature=""))
-        assert "unsigned" in out
-        assert "verified" not in out
-
-    def test_show_no_policy_unchanged(self, capsys):
-        out = self._show(capsys, None)
-        assert "No enterprise security policy is active" in out
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Capability omission — the settled contract
-# ──────────────────────────────────────────────────────────────────────────
-def _capability_scopes() -> list[str]:
-    return [name for name, spec in SCOPE_CATALOG.items() if spec.kind == CAPABILITY]
-
-
-class TestCapabilityOmissionIsUngoverned:
-    """An unnamed capability is UNGOVERNED and therefore PERMITTED. On purpose.
-
-    This class exists because the opposite is an inviting mistake. Several
-    ``SCOPE_CATALOG`` comments once described ``capability_default`` as applying
-    when a policy "governs ``capabilities.*`` but omits" a row, which does not
-    match the code. The tempting fix is to make the code match the comments by
-    filling unnamed rows with their registered defaults.
-
-    That fix was implemented, measured, and rejected. Three reasons, recorded here
-    so the next person does not repeat it:
-
-    1. It breaks the model's central invariant. Omission means
-       ungoverned-and-permitted for `mcp`, `tools`, `commands`, `filesystem.*` and
-       `network.egress`; making `capabilities` the one archetype that infers a
-       value is a per-control special case in an evaluator whose stated contract
-       is that it dispatches on archetype and never on scope name.
-    2. It requires a namespace-specific branch in ``_parse_controls``, whose
-       documented contract is that a newly ``register_scope``'d family parses with
-       NO loader edit. A companion's own capability family would not get the same
-       treatment, so the behaviour would not even be uniform.
-    3. It destroys an audit signal. ``Decision.layer == "default"`` means "nothing
-       governed this", which is what operators are told to alert on to find
-       missing controls. A row filled from a catalog default resolves at
-       ``layer="policy"`` and so becomes indistinguishable from one a human
-       actually wrote.
-
-    The real defect was documentation, and the protection is
-    ``kirocrew policy validate`` reporting a partially-governed block.
-    """
-
-    def test_unnamed_capability_is_permitted_and_reads_as_ungoverned(self):
-        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
-        for scope in _capability_scopes():
-            if scope == "capabilities.script_hooks":
-                continue
-            decision = resolve(ceiling, None, scope, "")
-            assert decision.permitted, f"{scope} must be permitted by omission"
-            # Load-bearing: `default` is the audit signal for "nobody governed
-            # this". A filled-in row would report `policy` and hide the gap.
-            assert decision.layer == "default", f"{scope} must read as ungoverned"
-
-    def test_named_row_is_still_governed(self):
-        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
-        decision = resolve(ceiling, None, "capabilities.script_hooks", "")
-        assert not decision.permitted
-        assert decision.layer == "policy"
-
-    def test_omission_behaves_identically_across_archetypes(self):
-        """The consistency argument, asserted rather than assumed."""
-        ceiling = parse_policy(_policy_body(capabilities={"cron": {"enabled": False}}))
-        for scope, item in (
-            ("mcp", "@anything/tool"),
-            ("tools", "anything"),
-            ("commands", "echo hi"),
-            ("filesystem.read", "/etc/hosts"),
-            ("network.egress", "example.com"),
-            ("capabilities.messaging", ""),
-        ):
-            decision = resolve(ceiling, None, scope, item)
-            assert decision.permitted, f"unnamed {scope} must permit"
-            assert decision.layer == "default", f"unnamed {scope} must read as ungoverned"
-
-    def test_no_capabilities_block_leaves_every_capability_ungoverned(self):
-        ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
-        for scope in _capability_scopes():
-            assert resolve(ceiling, None, scope, "").permitted
-
-    def test_present_key_without_enabled_uses_the_registered_default(self):
-        """The case ``capability_default`` DOES cover — and the only one.
-
-        Naming a capability to configure its inner scopes, without saying whether
-        it is on, resolves to the registered default: off for the exfil surfaces,
-        on for the benign ones.
-        """
-        ceiling = parse_policy(
-            _policy_body(
-                capabilities={
-                    "publish": {"scopes": {"destinations": {"mode": MODE_ALLOW, "allow": ["x"]}}},
-                    "spawn": {"scopes": {"agents": {"mode": MODE_ALLOW, "allow": ["a"]}}},
-                }
-            )
-        )
-        assert not resolve(ceiling, None, "capabilities.publish", "").permitted
-        assert SCOPE_CATALOG["capabilities.publish"].capability_default is False
-        assert resolve(ceiling, None, "capabilities.spawn", "").permitted
-        assert SCOPE_CATALOG["capabilities.spawn"].capability_default is True
-
-
-class TestValidateReportsUngovernedCapabilities:
-    """`kirocrew policy validate` must surface a partially-governed block.
-
-    Since omission cannot deny, the only protection against an author believing
-    otherwise is telling them which rows they left open.
-    """
-
-    def _validate(self, capsys, ceiling):
-        import argparse
-        from unittest.mock import patch
-
-        from kiro_crew import cli_commands
-
-        args = argparse.Namespace(policy_action="validate")
-        with patch(
-            "kiro_crew.platform.context.current_context",
-            return_value=type("Ctx", (), {"governance": ceiling})(),
-        ):
-            cli_commands._policy(args)
-        return capsys.readouterr().out
-
-    def test_partial_block_lists_the_ungoverned_rows(self, capsys):
-        ceiling = parse_policy(_policy_body(capabilities={"script_hooks": {"enabled": False}}))
-        out = self._validate(capsys, ceiling)
-        assert "UNGOVERNED" in out
-        assert "Omission does not deny" in out
-        assert "capabilities.cron" in out
-        # The row the author DID name must not be reported as a gap.
-        assert "capabilities.script_hooks\n" not in out.split("UNGOVERNED", 1)[1]
-
-    def test_fully_enumerated_block_reports_no_gap(self, capsys):
-        body = {scope.split(".", 1)[1]: {"enabled": True} for scope in _capability_scopes()}
-        # agentcore requires a known inner posture when enabled.
-        body["agentcore"] = {"enabled": True, "posture": "workload"}
-        out = self._validate(capsys, parse_policy(_policy_body(capabilities=body)))
-        assert "UNGOVERNED" not in out
-        assert "✅ valid" in out
-
-    def test_policy_that_never_mentions_capabilities_reports_no_gap(self, capsys):
-        """Silence about capabilities entirely is not a partial statement."""
-        ceiling = parse_policy(_policy_body(commands={"mode": MODE_DENY, "deny": ["nc *"]}))
-        out = self._validate(capsys, ceiling)
-        assert "UNGOVERNED" not in out

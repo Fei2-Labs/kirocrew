@@ -11,11 +11,12 @@ first, verify the facts second, and only then write.
 
 ## Step 0 — check that this is actually an audience request
 
-Trigger matching here is word-overlap against the phrases above, so it is
-probabilistic and it will sometimes fire on a request that merely contains the
-word "explain". Before entering the skill, confirm the user wants an explanation
-**pitched at somebody**. If they just want to know why CI failed, answer that
-question normally and ignore everything below.
+You reach this skill from its index entry, or — when `skills.max_triggered` is
+above its default of 0 — from word-overlap against the trigger phrases above.
+Either route is probabilistic and will sometimes land on a request that merely
+contains the word "explain". Before entering the skill, confirm the user wants
+an explanation **pitched at somebody**. If they just want to know why CI
+failed, answer that question normally and ignore everything below.
 
 ## Step 1 — resolve the audience
 
@@ -138,6 +139,11 @@ picture often *is* the explanation and the text is a caption. For a manager, one
 before/after or one impact chart, never an architecture diagram. For an engineer
 or a graduate, the real mechanism, drawn precisely. For a parent, draw the
 analogy, not the system.
+
+Draw the analogy as a working object, not as labelled boxes. If a cache is a
+fridge, draw a fridge whose door opens onto full shelves, not a box marked
+"fridge" with an arrow to a box marked "cache". When that drawing is a widget
+that moves, load the `living-ui` skill for how it moves and where its words go.
 
 What is available, in ascending cost:
 

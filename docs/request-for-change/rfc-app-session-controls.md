@@ -63,7 +63,7 @@ Verified on main `1d705a03f` (2026-09-01):
   now"*, and no amount of calling it will.
 
 - **The manifest's UI surfaces are all session-blind.** `UIConfig`
-  (`UIConfig` in `src/kiro_crew/apps/manifest.py`) declares `entry`, `pages`, `overlays`
+  (`UIConfig` in `src/kiro_crew/apps/manifest_sections.py`) declares `entry`, `pages`, `overlays`
   and `sidebar`. A `UIPage` is routed and full-surface; a `UIOverlay`
   (`UIOverlay`) is explicitly *"not routed: it floats above whatever the
   user is looking at"*, and its required `replaces` field names a host slot the
@@ -118,12 +118,12 @@ commands #7423 established there:
 | `id` | Stable per-app identifier, kebab-case (e.g. `"env-picker"`) |
 | `entryPoint` | ESM bundle path relative to `ui/` |
 | `label` | Accessible name, and the chip tooltip |
-| `icon` | lucide icon name |
+| `icon` | icon name from a fixed rendered set; other names fall back to `Package` (see the `contributes.sessionControls[].icon` row of `docs/app-kit/manifest-reference.md`) |
 | `statusPath` | Optional backend route reporting per-session chip state |
 
 Validation, enforced at install:
 
-- `MAX_SESSION_CONTROLS_PER_APP = 2` (`manifest.py`). A cap rather than an
+- `MAX_SESSION_CONTROLS_PER_APP = 2` (`manifest_contributes.py`). A cap rather than an
   unbounded list, because the composer is a fixed-width surface shared with the
   host's own chips. This bounds one manifest; §4.2 bounds the bar.
 - `id` must match `^[a-z0-9]+(?:-[a-z0-9]+)*$`.
@@ -214,6 +214,13 @@ session exists. Polling **fails closed**: a third-party app that is down is not
 retried at the composer's expense, and a malformed or unknown payload degrades
 to `none` rather than rendering an unknown state.
 
+The host re-asks a status when the chat opens, when the control's popover
+closes, and when a turn in that session finishes (`chat_done`). The turn-end
+re-ask selects only that session's probes, and React Query refetches only the
+ones a mounted composer shows. There is no interval: the dashboard's freshness
+model is push (`queryClient.ts`, `staleTime: Infinity`), and a turn boundary is
+the push that already exists for "the agent may have changed something".
+
 ## 5. Migration plan
 
 **S1 and S2 must land together.** Shipping S1 alone would add a twelfth
@@ -241,8 +248,8 @@ simply carry no state until opened.
 
 The change is additive in both directions.
 
-- **An app that declares nothing is unaffected.** `UIConfig.from_dict` reads
-  `data.get("sessionControls", [])` (`manifest.py`), so a manifest without
+- **An app that declares nothing is unaffected.** `Contributes.from_dict` reads
+  `data.get("sessionControls", [])` (`manifest_contributes.py`), so a manifest without
   the key parses to an empty list and behaves exactly as before — no chip, no
   request, no DOM change.
 - **No existing manifest changes on disk.** `to_dict` emits the key only when
@@ -308,14 +315,17 @@ The change is additive in both directions.
    open question — not whether a global cap should exist.
 3. **Should status be pushed rather than polled?** `rfc-local-notification-bus.md`
    has a bus whose Phase 2 is wired with no producer. A control's status change is
-   a plausible producer, and would retire the poll.
+   a plausible producer, and would retire the poll. A finished turn now re-asks
+   the session's statuses (§4.3), which covers changes the agent makes; a change
+   made between turns still waits for the next one, and closing that gap is the
+   app-published push this question is about.
 4. **How does a second surface get selected?** An earlier draft shipped a
    `placement` field for this, with `session-bar` as its only legal value. It was
    removed before merge: nothing branched on it, so it was manifest schema —
    which cannot be withdrawn once apps write it — bought against a surface that
    does not exist. Adding a field when the second surface arrives is a
    backward-compatible change; removing one is not. The same reasoning removed
-   `agent`, `model` and `workspace` from the props contract in §4.3.
+   `agent`, `model` and `workspace` from the props contract in §4.2.
 
 ## 10. Alternatives considered
 

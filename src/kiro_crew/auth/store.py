@@ -93,11 +93,62 @@ class KasToken:
         refresh token is present to renew it. The ONE predicate the spawn-time
         owner decision (:mod:`kiro_crew.auth.bridge`), ``kirocrew doctor`` and the
         dashboard's sign-in card all read, so they cannot disagree about whether a
-        stored identity is live. What it cannot know without a network call is
+        stored entry is live. What it cannot know without a network call is
         whether the issuer still accepts the refresh token; that verdict is
         recorded separately (:meth:`TokenStore.refresh_rejected`).
         """
         return (not self.is_expired()) or bool(self.refresh_token)
+
+    def refresh_blocker(self) -> str:
+        """Why a refresh of THIS token cannot even be ATTEMPTED, or "" when it can.
+
+        Every check here is local: it asks whether the token carries the inputs its own
+        identity kind needs, never whether the issuer would accept them. A reason string
+        rather than a bool so the code that REFUSES a token and the code that tries to
+        refresh one report the same cause in the same words, which is the point of the
+        predicate living here instead of being spelled out at each site.
+
+        This is deliberately NOT folded into :meth:`is_usable`. That predicate answers a
+        looser question -- could this entry serve, possibly after a refresh -- and its
+        answer is read by the spawn-time owner decision, ``kirocrew doctor`` and the
+        dashboard's sign-in card, which this change has no mandate to alter.
+        """
+        if not self.refresh_token:
+            return f"no refresh token for identity {self.identity}"
+        if self.identity in ("builder_id", "identity_center"):
+            if not (self.client_id and self.client_secret):
+                return "SSO-OIDC refresh needs stored client credentials"
+            return ""
+        if self.identity == "external_idp":
+            if not self.token_endpoint:
+                return "external IdP refresh needs a token endpoint"
+            return ""
+        if self.identity == "social":
+            return ""
+        return f"unknown identity for refresh: {self.identity}"
+
+    def is_storable(self) -> bool:
+        """Will the vault KEEP this token, as opposed to accepting the write and
+        dropping it on the next read?
+
+        A social or identity-center token needs a ``profile_arn``: KAS rejects one
+        without it, so :meth:`TokenStore.load` treats such an entry as absent. That
+        makes ``save`` succeeding a weaker fact than it looks -- the write lands and the
+        entry then reads back as nothing.
+
+        Exposed rather than left inline in ``load`` because a caller that is about to
+        OVERWRITE a slot has to know the answer BEFORE it writes: discovering it
+        afterwards means a live credential in that slot is already gone. One predicate
+        with two readers, so the writer's idea of acceptable cannot drift from the
+        reader's.
+
+        Distinct from :meth:`is_usable`, which asks whether a token can still produce an
+        access token. A token can be perfectly live and still not storable, which is
+        exactly the case this exists for.
+        """
+        if self.identity in ("social", "identity_center"):
+            return bool(self.profile_arn)
+        return True
 
     def to_json(self) -> str:
         d = asdict(self)
@@ -268,7 +319,10 @@ class TokenStore:
             logger.warning("corrupt KAS token entry %s: %s", identity, err)
             return None
         # A social/IdC token without a profile ARN is invalid (KAS rejects it); drop it.
-        if token.identity in ("social", "identity_center") and not token.profile_arn:
+        # The rule lives on the token (:meth:`KasToken.is_storable`) so a writer about to
+        # overwrite a slot can consult it BEFORE writing, rather than learning here that
+        # the entry it just replaced a live credential with reads back as nothing.
+        if not token.is_storable():
             # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure - logs the identity slug only, never the token value
             logger.debug("token %s has no profile ARN, treating as invalid", identity)
             return None
@@ -372,3 +426,27 @@ class TokenStore:
             if token is not None:
                 return token
         return None
+
+    def holds_no_identity(self) -> bool:
+        """Whether the vault was read and stores no identity entry at all.
+
+        :meth:`resolve` reports a vault it cannot read or decrypt as empty, so status
+        never fails on one. This reads only the entry map and RAISES when that cannot be
+        read (an unreadable or corrupt ``secrets.enc``, a linked directory), so True means
+        nothing is stored. An entry that would not decrypt or parse still counts as stored.
+        Only a missing ``secrets.enc`` is an empty vault: the vault's own read also takes
+        one it may not look at for missing on CPython 3.14, whose ``Path.exists`` answers
+        False there.
+        """
+        self._assert_unlinked()
+        try:
+            # The vault's own attribute, not the filename spelled out again here, so
+            # a rename inside SecretVault can never point this at a missing file
+            # (renaming the attribute fails closed: the caller treats a raise as no
+            # proof). Read rather than exposed, since the secrets package is a
+            # sensitive path this check does not need to change.
+            os.stat(self._vault._store_path)
+        except FileNotFoundError:
+            return True
+        stored = set(self._vault.list_names())
+        return not any(identity in stored for identity in _PRIORITY)

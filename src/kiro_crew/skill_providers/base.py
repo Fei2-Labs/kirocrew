@@ -82,6 +82,68 @@ class SkillSearchResult:
     """Install/download count reported by the provider (0 = unknown)."""
 
 
+#: The codes a :class:`SkillProviderError` may carry. A code outside this set is
+#: reported as ``unavailable``, so a caller can branch on the code without
+#: trusting a provider to spell it.
+PROVIDER_ERROR_CODES = frozenset({"rate_limited", "not_found", "refused", "unavailable"})
+
+
+class SkillProviderError(Exception):
+    """A provider could not answer, as opposed to answering "nothing".
+
+    ``search`` returning ``[]`` means the provider looked and nothing matched;
+    ``fetch_skill_bundle``/``fetch_skill_content`` returning ``None`` means there
+    is nothing to fetch. Raising this instead says the provider could NOT look,
+    or refused on purpose, and why -- so the dashboard can show the reason in
+    place of an empty result.
+
+    ``code`` is one of :data:`PROVIDER_ERROR_CODES`:
+
+    - ``rate_limited`` -- the remote host's request budget is used up; the user
+      can wait (``message`` should say until when, if known);
+    - ``not_found`` -- the address names nothing: a missing or private
+      repository, a ref that does not exist;
+    - ``refused`` -- the content exists but the provider will not import it
+      (a size or file-count ceiling, a name collision, a partial listing);
+    - ``unavailable`` -- the host could not be reached or answered with
+      something unusable.
+
+    ``message`` is one short sentence for the person who can act on it. It is
+    still provider-authored text: the discover handler scrubs and caps it before
+    it reaches the dashboard, so a provider must not rely on it being shown
+    verbatim -- and must never put a token, a credential-bearing URL or a raw
+    response body in it.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code if code in PROVIDER_ERROR_CODES else "unavailable"
+        self.message = message
+
+
+@dataclass(frozen=True)
+class SkillProviderOutcome:
+    """Outcome of one provider leg in a skill catalog search."""
+
+    name: str
+    status: str
+    """One of ``ok``, ``timeout``, or ``error``."""
+
+    code: str = ""
+    """For an ``error`` the provider explained: a :data:`PROVIDER_ERROR_CODES` member."""
+
+    message: str = ""
+    """For an ``error`` the provider explained: its reason, unscrubbed."""
+
+
+@dataclass(frozen=True)
+class SkillSearchResponse:
+    """Merged search results plus one outcome for every attempted provider."""
+
+    results: list[SkillSearchResult]
+    provider_outcomes: list[SkillProviderOutcome]
+
+
 @runtime_checkable
 class SkillProvider(Protocol):
     """Protocol for skill discovery providers.
@@ -105,7 +167,8 @@ class SkillProvider(Protocol):
 
         Returns up to *limit* results matching *query*. Empty query may
         return featured/popular skills or an empty list depending on the
-        provider's semantics.
+        provider's semantics. ``[]`` means "looked, nothing matched"; a
+        provider that could not look raises :class:`SkillProviderError`.
         """
         ...
 
@@ -113,7 +176,8 @@ class SkillProvider(Protocol):
         """Fetch the raw SKILL.md content for a given skill.
 
         Returns the full markdown content ready to write to disk, or
-        None if the skill cannot be fetched.
+        None if there is no such skill. A provider that can say why it got
+        nothing raises :class:`SkillProviderError` instead.
         """
         ...
 
@@ -135,7 +199,8 @@ class SkillProvider(Protocol):
     # ``fetch_skill_bundle(skill_id) -> list[tuple[str, str]] | None``
     #     Every file of the skill as ``(relative_path, content)``, not just the
     #     instruction file. Preferred by both preview and install when present;
-    #     ``fetch_skill_content`` is the single-file fallback.
+    #     ``fetch_skill_content`` is the single-file fallback. May raise
+    #     ``SkillProviderError`` exactly as ``fetch_skill_content`` may.
     #
     # ``install_slug(skill_id) -> str``
     #     The provider's own local key for a skill, used when the default
@@ -203,11 +268,21 @@ class ProviderRegistry:
         provider: str | None = None,
         limit: int = 20,
     ) -> list[SkillSearchResult]:
-        """Fan-out search across all available providers (or a specific one).
+        """Search while preserving the existing results-only return contract."""
+        return (await self.search_with_outcomes(query, provider=provider, limit=limit)).results
 
-        Results are merged and returned in provider order. Each provider's
-        failures are caught and logged — a single provider timeout does not
-        break the entire search.
+    async def search_with_outcomes(
+        self,
+        query: str,
+        *,
+        provider: str | None = None,
+        limit: int = 20,
+    ) -> SkillSearchResponse:
+        """Search providers and report whether every attempted leg answered.
+
+        Results stay merged in provider order. A timeout or error contributes no
+        rows but remains visible in ``provider_outcomes`` so callers can distinguish
+        an incomplete search from a complete search with zero matches.
         """
 
         # The timeout budget, the provenance re-stamp and the two failure
@@ -216,25 +291,50 @@ class ProviderRegistry:
         # provider's own ``provider`` string survive on one path but not the
         # other. *name* is the vetted registration key, never a re-read of the
         # provider-controlled ``name`` property.
-        async def _search_one(name: str, p: SkillProvider) -> list[SkillSearchResult]:
+        async def _search_one(name: str, p: SkillProvider) -> SkillSearchResponse:
             try:
-                return _stamp_provenance(
+                results = _stamp_provenance(
                     await asyncio.wait_for(
                         p.search(query, limit=limit), timeout=_SEARCH_TIMEOUT_SECS
                     ),
                     name,
                 )
+                return SkillSearchResponse(
+                    results=results,
+                    provider_outcomes=[SkillProviderOutcome(name=name, status="ok")],
+                )
+            except SkillProviderError as exc:
+                # The provider could not look and said why. Logged at info: the
+                # reason now reaches the user, so this is not an unexplained fault.
+                logger.info("Provider %s could not search (%s)", name, exc.code)
+                return SkillSearchResponse(
+                    results=[],
+                    provider_outcomes=[
+                        SkillProviderOutcome(
+                            name=name,
+                            status="error",
+                            code=exc.code,
+                            message=exc.message if isinstance(exc.message, str) else "",
+                        )
+                    ],
+                )
             except asyncio.TimeoutError:
                 logger.warning("Provider %s timed out for query %r", name, query)
-                return []
+                return SkillSearchResponse(
+                    results=[],
+                    provider_outcomes=[SkillProviderOutcome(name=name, status="timeout")],
+                )
             except Exception:
                 logger.warning("Provider %s failed for query %r", name, query, exc_info=True)
-                return []
+                return SkillSearchResponse(
+                    results=[],
+                    provider_outcomes=[SkillProviderOutcome(name=name, status="error")],
+                )
 
         if provider:
             p = self._providers.get(provider)
             if p is None or not provider_available(p):
-                return []
+                return SkillSearchResponse(results=[], provider_outcomes=[])
             # This path applies no ``[:limit]``: the provider was ASKED for at
             # most *limit* rows and is trusted to honour it. The fan-out below
             # re-caps because it merges several providers, not because any one
@@ -246,10 +346,15 @@ class ProviderRegistry:
         # registration key.
         available = [(n, p) for n, p in self._providers.items() if provider_available(p)]
         if not available:
-            return []
+            return SkillSearchResponse(results=[], provider_outcomes=[])
 
-        results_per_provider = await asyncio.gather(*[_search_one(n, p) for n, p in available])
+        responses = await asyncio.gather(*[_search_one(n, p) for n, p in available])
         merged: list[SkillSearchResult] = []
-        for results in results_per_provider:
-            merged.extend(results)
-        return merged[:limit]  # total cap matches what the caller asked for
+        outcomes: list[SkillProviderOutcome] = []
+        for response in responses:
+            merged.extend(response.results)
+            outcomes.extend(response.provider_outcomes)
+        return SkillSearchResponse(
+            results=merged[:limit],  # total cap matches what the caller asked for
+            provider_outcomes=outcomes,
+        )

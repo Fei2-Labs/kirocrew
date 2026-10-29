@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { SUCCESS_WINDOW_MS, appRunStates, nextSuccessExpiryMs } from '../appRunState'
+import { MAX_TIMER_DELAY_MS } from '../utils/timerDelay'
 import type { CronJob } from '../types'
 
 /** A job carrying only the fields the derivation reads. */
@@ -81,10 +82,10 @@ describe('appRunStates', () => {
 
     it('REPORTS a job execution auto-paused after repeated failures', () => {
       // The bug this covers: auto-pause sets enabled=False exactly like a user
-      // pause (cron.py record_failure), so reading `enabled` alone dropped the
-      // mark on an app's WORST job -- the one that failed enough times for the
-      // scheduler to give up on it. The wire distinguishes them with
-      // `user_paused`, which execution never sets.
+      // pause (cron_service/model.py record_failure), so reading `enabled`
+      // alone dropped the mark on an app's WORST job -- the one that failed
+      // enough times for the scheduler to give up on it. The wire
+      // distinguishes them with `user_paused`, which execution never sets.
       expect(appRunStates([
         job({ app: 'ledger', enabled: false, user_paused: false, last_status: 'error' }),
       ], NOW)).toEqual({ ledger: 'error' })
@@ -169,6 +170,15 @@ describe('nextSuccessExpiryMs', () => {
     expect(nextSuccessExpiryMs([j], NOW)).toBe(SUCCESS_WINDOW_MS - 10_000)
   })
 
+  it('clears the mark at the instant its timer fires', () => {
+    // The timer is armed for exactly the time left, so at age == window the mark
+    // must already be gone; otherwise the re-arm would be a zero delay that a
+    // same-millisecond clock update cannot advance.
+    const j = job({ app: 'ledger', last_status: 'ok', last_run_ts: ranAgo(SUCCESS_WINDOW_MS) })
+    expect(appRunStates([j], NOW)).toEqual({})
+    expect(nextSuccessExpiryMs([j], NOW)).toBeNull()
+  })
+
   it('returns null once the window has already passed', () => {
     // An expired run shows no mark, so there is nothing to wait for.
     const j = job({ app: 'ledger', last_status: 'ok', last_run_ts: ranAgo(SUCCESS_WINDOW_MS + 1) })
@@ -187,10 +197,20 @@ describe('nextSuccessExpiryMs', () => {
   it('waits the full window from a future timestamp rather than going negative', () => {
     // Clock skew: `jobState` admits a future run as fresh, so its mark is due to
     // clear 90s after THAT moment -- window + skew from now, not less than the
-    // window. The clamp guards the lower bound only.
+    // window.
     const skewMs = 5_000
     const j = job({ app: 'ledger', last_status: 'ok', last_run_ts: ranAgo(-skewMs) })
     expect(nextSuccessExpiryMs([j], NOW)).toBe(SUCCESS_WINDOW_MS + skewMs)
+  })
+
+  it('caps a far-future timestamp at the longest delay a timer can hold', () => {
+    // A skew past ~24.8 days would make window + skew exceed 2^31 - 1 ms, which a
+    // browser's setTimeout wraps to a far shorter delay -- and the rail re-arms
+    // on every fire, so it would spin re-rendering the root.
+    const skewMs = 30 * 24 * 60 * 60 * 1000
+    const j = job({ app: 'ledger', last_status: 'ok', last_run_ts: ranAgo(-skewMs) })
+    expect(nextSuccessExpiryMs([j], NOW)).toBe(MAX_TIMER_DELAY_MS)
+    expect(MAX_TIMER_DELAY_MS).toBe(2 ** 31 - 1)
   })
 
   it('ignores a paused job and a job owned by a person', () => {

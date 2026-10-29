@@ -23,6 +23,7 @@ import pytest
 
 from kiro_crew.acp.client import _MAX_PARKED_PERMISSIONS, AcpClient
 from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, EVENT_TOOL_CALL, AcpEvent
+from kiro_crew.acp_backends import ACP_BACKEND_OPENCODE
 
 CMD = "ssh host 'python3 sync.py --dry-run'"
 TOOL_ID = "call_xd9OgN52vOYe46tWH4o9o48J"
@@ -40,6 +41,7 @@ def _client() -> AcpClient:
     c = AcpClient.__new__(AcpClient)
     c._parked_permissions = {}
     c._permission_options = {}
+    c._acp_backend = ACP_BACKEND_OPENCODE
     return c
 
 

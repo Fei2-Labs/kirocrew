@@ -33,6 +33,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 from unittest import mock
 
@@ -41,6 +42,7 @@ from aiohttp.test_utils import AioHTTPTestCase, make_mocked_request
 
 from conftest import make_dir_link
 from kiro_crew.apps.builtins.pptx_maker.backend import engine, paths, provision, routes
+from kiro_crew.testing.wait import async_wait_until
 
 # An AKIA-shaped access key ID. The canonical AWS documentation example, so it is
 # a real pattern match without being a live secret.
@@ -64,6 +66,21 @@ def _raster_body(size: int) -> bytes:
     return random.Random(_RASTER_SEED).randbytes(size)
 
 
+_OWNER = "owner-user"
+
+
+@web.middleware
+async def _as_owner(request: web.Request, handler):
+    """Stamp the dashboard owner's identity, as the auth middleware would.
+
+    The mutating routes are owner only, so every request in these tests arrives
+    as the configured owner (``user == owner_id`` with an empty app claim).
+    """
+    request["user"] = _OWNER
+    request["app"] = ""
+    return await handler(request)
+
+
 def _enabled(value: bool):
     """Patch the app-enablement gate the ``_require_enabled`` wrapper consults."""
     return mock.patch.object(routes, "is_app_enabled", return_value=value)
@@ -73,7 +90,8 @@ class _RoutesFixture(AioHTTPTestCase):
     """A live aiohttp app with the real routes and a temp deck root."""
 
     async def get_application(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(middlewares=[_as_owner])
+        app["state"] = SimpleNamespace(owner_id=_OWNER)
         routes.register_routes(app)
         return app
 
@@ -960,23 +978,15 @@ class TestEngineRoutes(_RoutesFixture):
         await asyncio.sleep(0)
 
 
-async def _await_detached(predicate: Callable[[], bool], *, tries: int = 400) -> None:
+async def _await_detached(predicate: Callable[[], bool]) -> None:
     """Wait for detached work that runs in a THREAD, not just on the loop.
 
     ``asyncio.sleep(0)`` only yields to the event loop, so it cannot wait for anything
-    handed to ``run_in_executor`` — the executor thread may not have been scheduled at
-    all yet. On a fast Linux runner it happened to be, so a `sleep(0)` poll passed; on a
-    slower Windows runner all 200 iterations completed before the thread ran and the
-    assertion failed with the work still pending. That is a test race, not a product bug,
-    but it fails a required check either way.
-
-    A real (if tiny) delay yields the GIL and gives the thread somewhere to run, and the
-    loop bounds it so a genuinely broken detach still fails rather than hanging.
+    handed to ``run_in_executor``: the executor thread may not have been scheduled at
+    all yet. The polled wait yields real time between reads, so the thread gets
+    somewhere to run, and a genuinely broken detach fails by name rather than hanging.
     """
-    for _ in range(tries):
-        if predicate():
-            return
-        await asyncio.sleep(0.01)
+    await async_wait_until(predicate)
 
 
 class TestLibraryRoutes(_RoutesFixture):

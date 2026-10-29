@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule, CronService
+from kiro_crew.cron import _AUTO_PAUSE_THRESHOLD, CronJob, CronSchedule, CronService, _RunClaim
 
 
 class TestRecordFailureSuccess:
@@ -248,7 +248,8 @@ class TestAutoPausePersistence:
 
         svc._on_job = retried_twice
         svc._jobs = [job]
-        asyncio.run(svc._run_job_isolated(job))  # every=60s: sub-hourly, no jitter sleep
+        # every=60s: sub-hourly, no jitter sleep
+        asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         svc2 = CronService(base_dir=tmp_path)
         svc2._load()
@@ -447,7 +448,7 @@ class TestExecuteSuccessResetsCounter:
         # Cancel race: cancel() kills the sandboxed subprocess BEFORE
         # task.cancel(), and the gateway's cancelled branch returns None
         # without setting last_status — so the callback can return normally
-        # while the cancel marker is set. cancel() documents that it leaves
+        # while the run's cancel flag is set. cancel() documents that it leaves
         # consecutive_failures untouched; the ok-branch reset must not fire.
         svc = CronService(base_dir=tmp_path)
         job = self._job()
@@ -457,9 +458,25 @@ class TestExecuteSuccessResetsCounter:
             return None  # gateway cancelled branch: no bookkeeping, no last_status
 
         svc._on_job = cancelled_shape
-        svc._cancelled_jobs.add(job.id)
-        try:
-            asyncio.run(svc._execute(job))
-        finally:
-            svc._cancelled_jobs.discard(job.id)
+        meta = _RunClaim(trigger="scheduled", claimed_at=0.0)
+        meta.cancelled = True  # cancel() flags the claim it took
+        asyncio.run(svc._execute(job, meta))
         assert job.consecutive_failures == 3
+
+    def test_another_runs_cancel_marker_does_not_suppress_the_reset(self, tmp_path: Path) -> None:
+        # The cancel flag lives on the run's claim, not on the job: a cancelled
+        # prior run whose finalizer is still pending is not THIS run, so a
+        # clean return from this run still resets the counter.
+        svc = CronService(base_dir=tmp_path)
+        job = self._job()
+        job.consecutive_failures = 3
+
+        async def succeeding(j: CronJob) -> None:
+            return None
+
+        svc._on_job = succeeding
+        prior_run = _RunClaim(trigger="manual", claimed_at=0.0)
+        this_run = _RunClaim(trigger="manual", claimed_at=1.0)
+        prior_run.cancelled = True
+        asyncio.run(svc._execute(job, this_run))
+        assert job.consecutive_failures == 0

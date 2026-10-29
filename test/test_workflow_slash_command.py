@@ -16,8 +16,9 @@ class FakeSlot:
 
     def __init__(self) -> None:
         self.messages: list[tuple[str, str, str]] = []
+        self.credential_evidence = None
 
-    def append(self, role, content, cls):
+    def append(self, role, content, cls, *, meta=None):
         self.messages.append((role, content, cls))
 
 
@@ -72,7 +73,8 @@ async def test_bare_workflow_command_lists_saved_slugs(monkeypatch) -> None:
 
     assert "/workflow debug-project" in slot.messages[0][1]
     assert state.workflow_service.list_thread_id != event_loop_thread_id
-    assert slot.messages[-1][0] == "done"
+    # The reply only: the turn's exit guard ends the cycle, with the done row.
+    assert [m[0] for m in slot.messages] == ["assistant"]
 
 
 @pytest.mark.asyncio

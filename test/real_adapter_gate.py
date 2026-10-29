@@ -36,16 +36,13 @@ adjust the assertions, never to relax one to match whatever the new tree does. T
 bump by hand: edit the exact version, run ``npm install --package-lock-only`` in
 that directory, and commit both files.
 
-ONE contract this lane cannot measure, which a codex-acp bump therefore has to cover
-by hand: whether ``session/close`` leaves the Codex thread LOADABLE. This lane's
-credential is fabricated, and ``session/load`` on a thread that never ran a real turn
-is refused -- "no rollout found for thread id", measured -- so the property is not
-assertable here however the test is written. Where it IS asserted is
-``test_codex_session_mcp.py::test_real_codex_acp_load_after_close_restores``, which
-prompts and so runs only under ``KIROCREW_LIVE_CODEX_PROMPT_TESTS=1`` on a host holding
-a codex credential. codex's membership in ``ACP_BACKENDS_SESSION_SHARING`` rests on that
-property, so a codex-acp bump needs one credentialled run of that test beside this
-lane's green; this lane going green alone does not establish it.
+TWO codex contracts this lane cannot measure, which a codex-acp bump has to cover
+by hand: ``session/delete`` disposing the thread, and a real model ANSWERING from a
+reloaded one. Both live in the opt-in
+``test_codex_session_mcp.py::test_real_codex_acp_load_after_close_restores``, which runs
+only under ``KIROCREW_LIVE_CODEX_PROMPT_TESTS=1`` on a host holding a codex credential.
+Close-then-load itself IS in this lane: the turn tests serve codex a loopback model, so
+the thread has a rollout to reload.
 """
 
 from __future__ import annotations
@@ -73,6 +70,13 @@ LOCKFILE = MANIFEST_DIR / "package-lock.json"
 #: The npm package each guarded file's adapter ships as.
 CODEX_ACP_PACKAGE = "@agentclientprotocol/codex-acp"
 OPENCODE_PACKAGE = "opencode-ai"
+#: pi is TWO packages, and both are pinned: the third-party ACP adapter, and the
+#: agent it spawns. Either can break the session on its own -- the adapter if it
+#: ignores ``PI_ACP_PI_COMMAND`` or drops a confirm dialog, the agent if it omits
+#: an extension's command from its registry or does not load the extension -- so
+#: a pin on one alone would let the other drift unmeasured.
+PI_ACP_PACKAGE = "pi-acp"
+PI_PACKAGE = "@earendil-works/pi-coding-agent"
 
 
 def pinned_version(package: str) -> str:
@@ -97,6 +101,12 @@ MEASURED_CODEX_ACP_VERSION = pinned_version(CODEX_ACP_PACKAGE)
 #: The ``opencode-ai`` release the live measurements in
 #: ``test_opencode_session_mcp.py`` were taken against.
 MEASURED_OPENCODE_VERSION = pinned_version(OPENCODE_PACKAGE)
+
+#: The ``pi-acp`` and ``@earendil-works/pi-coding-agent`` releases the live
+#: measurements in ``test_pi_real_adapter.py`` were taken against. Both must sit at
+#: or above ``acp.harness.pi.PI_MIN_VERSION``'s floor for pi; that test asserts it.
+MEASURED_PI_ACP_VERSION = pinned_version(PI_ACP_PACKAGE)
+MEASURED_PI_VERSION = pinned_version(PI_PACKAGE)
 
 
 def real_adapters_required() -> bool:

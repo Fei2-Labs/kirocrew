@@ -75,14 +75,16 @@ export default function MobileConnectModal({
   // The repo's modal keyboard contract: focus-in on mount, focus-restore on
   // close, Tab trapped inside the dialog, Escape dismisses.
   useDialogFocusTrap(dialogRef, onClose)
-  // Dismiss on any pointer-down OUTSIDE the dialog — the backdrop, the main
-  // content, AND the nav rail, which renders ABOVE the backdrop so a click on
-  // empty sidebar space never reaches the backdrop's own handler (the dead zone
-  // this closes). A nav row's own click still fires, so clicking a tab both
-  // dismisses and navigates. Attached from an effect (after mount) so the very
-  // click that opened the dialog — already dispatched before this runs — cannot
-  // immediately close it; capture phase so a child that stops propagation can't
-  // hide the outside click from us.
+  // Dismiss on any pointer-down OUTSIDE the dialog. The dialog layer is
+  // pointer-events-none, so a click anywhere outside the panel falls through to
+  // whatever paints underneath — the backdrop, the main content, or the nav
+  // rail, which renders ABOVE the backdrop so a click on empty sidebar space
+  // never reaches the backdrop (the dead zone this closes). A nav row's own
+  // click still fires, so clicking a tab both dismisses and navigates. Attached
+  // from an effect (after mount) so the very click that opened the dialog —
+  // already dispatched before this runs — cannot immediately close it; capture
+  // phase so a child that stops propagation can't hide the outside click from
+  // us.
   useEffect(() => {
     const onPointerDown = (e: PointerEvent) => {
       const dialog = dialogRef.current
@@ -98,54 +100,75 @@ export default function MobileConnectModal({
   // registered renderer for a denied or absent method draws nothing.
   const editionSections = getMobileConnectRenderers().filter(r => kinds.includes(r.kind))
 
+  // Two sibling layers, the same split Modal.tsx uses for its backdrop and
+  // dialog wrapper. The BACKDROP stays on the chat-pane ceiling (z-50): the
+  // desktop nav rail (navRail.tsx, `focus-chrome-rail`) is a DOM-later z-50 sibling
+  // in the shell's stacking context, so it wins the tie and stays clickable —
+  // a nav-row click both dismisses (the outside-pointerdown handler above) and
+  // navigates. The DIALOG LAYER sits at z-[65]: ABOVE every piece of chat
+  // chrome the panel must cover — the sessions flyout (z-[59]), its drawer
+  // morph (z-[60]), the rail toggle and focus-peek layers (z-[61]), the
+  // focus-mode rail (inline zIndex 62) and its mac drag strips (inline
+  // zIndex 63) — and BELOW the shell's z-[70] toast/menu band and its z-[100]
+  // full-screen takeovers (the "Installing update…" surface, the update-error
+  // and changelog dialogs), which must always paint over an open panel.
+  // Modal.tsx's z-[100] is NOT the reference here: Modal portals to
+  // document.body, a different stacking context, while this component renders
+  // inside the App shell's `relative z-[1]` root, where z-[100] only ties
+  // with the shell's own DOM-earlier takeovers and wins on document order.
+  // The layer is pointer-events-none (only the panel is pointer-events-auto)
+  // so every click outside the panel passes through to what is underneath.
   return (
-    <div
-      className="fixed inset-0 z-50 bg-bg/80 backdrop-blur-xs flex items-center justify-center animate-rise"
-      role="presentation"
-    >
+    <>
       <div
-        ref={dialogRef}
-        tabIndex={-1}
-        role="dialog"
-        aria-modal="true"
-        aria-label={t('components.mobileConnect.use_kiro_crew_on_your_phone')}
-        className="bg-card border border-border rounded-xl shadow-xl w-[440px] max-w-[90vw] max-h-[85vh] overflow-y-auto outline-hidden p-6 relative"
-      >
-        <button
-          onClick={onClose}
-          aria-label={t('components.mobileConnect.close')}
-          className="absolute top-3 right-3 text-muted hover:text-text bg-transparent border-none cursor-pointer p-1"
+        className="fixed inset-0 z-50 bg-bg/80 backdrop-blur-xs animate-rise"
+        role="presentation"
+      />
+      <div className="fixed inset-0 z-[65] flex items-center justify-center pointer-events-none animate-rise">
+        <div
+          ref={dialogRef}
+          tabIndex={-1}
+          role="dialog"
+          aria-modal="true"
+          aria-label={t('components.mobileConnect.use_kiro_crew_on_your_phone')}
+          className="bg-card border border-border rounded-xl shadow-xl w-[440px] max-w-[90vw] max-h-[85vh] overflow-y-auto outline-hidden p-6 relative pointer-events-auto"
         >
-          <X size={16} />
-        </button>
-        <div className="flex items-center gap-2 text-[15px] font-semibold text-text-strong mb-1.5">
-          <Smartphone size={16} className="shrink-0" />
-          {t('components.mobileConnect.use_kiro_crew_on_your_phone')}
+          <button
+            onClick={onClose}
+            aria-label={t('components.mobileConnect.close')}
+            className="absolute top-3 right-3 text-muted hover:text-text bg-transparent border-none cursor-pointer p-1"
+          >
+            <X size={16} />
+          </button>
+          <div className="flex items-center gap-2 text-[15px] font-semibold text-text-strong mb-1.5">
+            <Smartphone size={16} className="shrink-0" />
+            {t('components.mobileConnect.use_kiro_crew_on_your_phone')}
+          </div>
+          {hasQr && (
+            <p className="text-[12.5px] text-muted leading-relaxed mb-4">
+              {t('components.mobileConnect.scan_with_your_phone_camera_to_continue_with_the_s')}
+            </p>
+          )}
+          {/* Edition sections, each in its own ErrorBoundary so a throwing
+              renderer disables only itself. Deliberately WITHOUT `fallback={null}`,
+              unlike the Overview stat-card slot: a card that vanishes leaves a grid
+              of siblings, but a registered section here can be the dialog's ONLY
+              content, and silently emptying it would strand a user who reached it
+              from a nav row that promised a way in. The default boundary keeps the
+              section occupied, which is also what makes counting these sections a
+              sound input to `standalone` below. */}
+          {editionSections.map(r => (
+            <ErrorBoundary key={r.kind} scope={`mobile-connect:${r.kind}`}>
+              <r.component onClose={onClose} />
+            </ErrorBoundary>
+          ))}
+          {hasQr && <TailnetQrSection onClose={onClose} />}
+          {kinds.includes('login_link') && (
+            <LoginLinkSection standalone={!hasQr && editionSections.length === 0} onClose={onClose} />
+          )}
         </div>
-        {hasQr && (
-          <p className="text-[12.5px] text-muted leading-relaxed mb-4">
-            {t('components.mobileConnect.scan_with_your_phone_camera_to_continue_with_the_s')}
-          </p>
-        )}
-        {/* Edition sections, each in its own ErrorBoundary so a throwing
-            renderer disables only itself. Deliberately WITHOUT `fallback={null}`,
-            unlike the Overview stat-card slot: a card that vanishes leaves a grid
-            of siblings, but a registered section here can be the dialog's ONLY
-            content, and silently emptying it would strand a user who reached it
-            from a nav row that promised a way in. The default boundary keeps the
-            section occupied, which is also what makes counting these sections a
-            sound input to `standalone` below. */}
-        {editionSections.map(r => (
-          <ErrorBoundary key={r.kind} scope={`mobile-connect:${r.kind}`}>
-            <r.component onClose={onClose} />
-          </ErrorBoundary>
-        ))}
-        {hasQr && <TailnetQrSection onClose={onClose} />}
-        {kinds.includes('login_link') && (
-          <LoginLinkSection standalone={!hasQr && editionSections.length === 0} onClose={onClose} />
-        )}
       </div>
-    </div>
+    </>
   )
 }
 
@@ -230,8 +253,17 @@ function TailnetQrSection({ onClose }: { onClose: () => void }) {
       {mintQr.data && (
         <div className="flex flex-col items-center gap-3 mb-2">
           <div className="bg-white p-2.5 rounded-lg leading-none">
-            {/* Server-rendered PNG carrying a live session token — shown, never logged. */}
-            <img src={mintQr.data.image} alt={t('components.mobileConnect.qr_code_for_mobile_access')} width={176} height={176} />
+            {/* Server-rendered PNG carrying a live session token — shown, never logged.
+                Shown at its natural size, never a fixed box: the server draws each
+                module as a whole number of pixels, and squeezing the code into a
+                smaller box leaves its modules too small and soft for a phone camera.
+                pixelated keeps a high-density screen's upscale sharp; max-w-full
+                only shrinks a code wider than the dialog. */}
+            <img
+              src={mintQr.data.image}
+              alt={t('components.mobileConnect.qr_code_for_mobile_access')}
+              className="block max-w-full h-auto [image-rendering:pixelated]"
+            />
           </div>
           <div className="flex items-center gap-2 w-full">
             <input

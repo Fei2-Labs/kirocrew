@@ -40,8 +40,10 @@ ahead of this code -- and it also halves interpreter startup.
 
 from __future__ import annotations
 
+import errno
 import os
 import sys
+import time
 
 try:
     import resource as _resource
@@ -57,6 +59,14 @@ _ARGV_SEPARATOR = "--"
 # that only sees the exit status can still tell an exec failure from the
 # command's own nonzero exit.
 _EXEC_FAILED = 127
+# A target that raises these from ``execv`` is transiently absent, not broken:
+# the Kiro CLI replaces its own executable during an update, and a spawn landing
+# inside that rename window sees ENOENT or ETXTBSY until the replacement settles.
+_EXECV_RETRYABLE_ERRNOS = (errno.ENOENT, errno.ETXTBSY)
+# Six tries over two seconds ride out that window. Reporting it as exit 127
+# instead would make the parent mark the runtime dead with no retry.
+_EXECV_RETRY_ATTEMPTS = 6
+_EXECV_RETRY_DELAY_S = 0.4
 # Matches sandbox.session_host_preexec: raise NOFILE to the inherited hard cap,
 # or to this floor when the kernel reports no ceiling at all.
 _UNLIMITED_NOFILE_FLOOR = 65536
@@ -213,6 +223,50 @@ def _acquire_controlling_tty(fd: int) -> bool:
     return True
 
 
+def _default_ignored_signals() -> list[int]:
+    """Give the terminal session the default dispositions a login would.
+
+    ``SIG_IGN`` survives ``exec`` where a handler does not, so every signal the
+    gateway process inherited as ignored -- a launcher that backgrounds it from
+    a script sets SIGINT and SIGQUIT to ignore, ``nohup`` sets SIGHUP, and this
+    interpreter itself ignores SIGPIPE on startup -- would otherwise reach the
+    shell as ignored. An interactive shell keeps a signal that was ignored on
+    entry ignored in every command it runs, so the user would get a terminal
+    where Ctrl+C never interrupts the foreground job and a closed terminal never
+    hangs it up, with nothing in the shell's own state to say why. ``login``
+    and ``sshd`` hand the shell defaults; so does this.
+
+    Only dispositions that are ``SIG_IGN`` are touched: handlers reset on
+    ``exec`` by themselves, and the two signals that cannot be changed are
+    skipped by the ``OSError`` the kernel raises for them. Returns the signals
+    it changed so a failed ``exec`` can put them back: the shim then reports
+    through the stderr it was given, and must not die of a SIGPIPE it had been
+    told to ignore while doing so.
+    """
+    import signal
+
+    changed: list[int] = []
+    for signum in signal.valid_signals():
+        try:
+            if signal.getsignal(signum) is signal.SIG_IGN:
+                signal.signal(signum, signal.SIG_DFL)
+                changed.append(signum)
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return changed
+
+
+def _reignore_signals(signums: list[int]) -> None:
+    """Undo :func:`_default_ignored_signals` on the path where ``exec`` did not happen."""
+    import signal
+
+    for signum in signums:
+        try:
+            signal.signal(signum, signal.SIG_IGN)
+        except (OSError, ValueError, RuntimeError):
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse the shim's own options, then ``exec`` the command after ``--``.
 
@@ -288,17 +342,34 @@ def main(argv: list[str] | None = None) -> int:
     _apply_rlimits(pairs)
     if want_oom_bias:
         _bias_oom_score()
+    # execv, not execve: the environment this process was given IS the
+    # environment the caller built for the command, and passing it through
+    # untouched avoids rebuilding the whole mapping under the new limits.
+    # No PATH search -- the caller resolves argv[0] in the parent, so a target
+    # that was already missing at resolve time failed the spawn there.
+    # The retry rides out the CLI self-update rename window, which the
+    # runtime spawn path owns. A terminal (--ctty-fd) command that is already
+    # missing must fail fast instead of stalling the shell for the budget.
+    attempts = 1 if ctty_fd is not None else _EXECV_RETRY_ATTEMPTS
+    # A terminal session starts from default signal dispositions, as it would
+    # from login. Done last, so the shim's own failure reports above still run
+    # under the dispositions it was given, and undone if exec does not happen.
+    reset_signals = _default_ignored_signals() if ctty_fd is not None else []
     try:
-        # execv, not execve: the environment this process was given IS the
-        # environment the caller built for the command, and passing it through
-        # untouched avoids rebuilding the whole mapping under the new limits.
-        # No PATH search -- the caller resolves argv[0] so a missing command
-        # surfaces as FileNotFoundError at the spawn, as it did without a shim.
-        os.execv(encoded[0], encoded)
-    except OSError as exc:
-        sys.stderr.write(f"spawn shim: cannot execute {args[0]!r}: {exc.strerror}\n")
-        return _EXEC_FAILED
-    return _EXEC_FAILED  # pragma: no cover - execv does not return on success
+        for attempt in range(attempts):
+            try:
+                os.execv(encoded[0], encoded)
+            except OSError as exc:
+                if exc.errno in _EXECV_RETRYABLE_ERRNOS and attempt < attempts - 1:
+                    time.sleep(_EXECV_RETRY_DELAY_S)
+                    continue
+                _reignore_signals(reset_signals)
+                sys.stderr.write(f"spawn shim: cannot execute {args[0]!r}: {exc.strerror}\n")
+                return _EXEC_FAILED
+            return _EXEC_FAILED  # pragma: no cover - execv does not return on success
+    finally:
+        _reignore_signals(reset_signals)
+    return _EXEC_FAILED  # pragma: no cover - the loop returns on every attempt
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised as a spawned process

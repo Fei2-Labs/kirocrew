@@ -24,7 +24,7 @@
  *     it can still be acted on when it is small.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
@@ -103,10 +103,24 @@ function columnOrder(header: string): string[] {
   )
 }
 
+/**
+ * Scope a query to the mounted table.
+ *
+ * The Spend tab plots the same names above the table as bars — a session title,
+ * an origin, a model id each appear twice on one screen — so an unscoped
+ * `getByText` for a row label matches two elements and a `queryByText` cannot
+ * say whether the TABLE holds the row.
+ */
+const inTable = () => within(document.querySelector('table') as HTMLElement)
+
 beforeEach(() => {
   vi.clearAllMocks()
   qc.clear()
   localStorage.clear()
+  // The spend table ships inside a collapsible that is closed on first paint.
+  // These cases are about the table itself, so they open it the way a returning
+  // reader does: through the persisted preference.
+  localStorage.setItem('telemetry:spend-table-open', '1')
 })
 
 describe('TelemetryPanel — context sessions', () => {
@@ -189,7 +203,7 @@ describe('TelemetryPanel — sorting', () => {
         }),
       }),
     )
-    await waitFor(() => expect(screen.getByText('fast growth')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('fast growth')).toBeInTheDocument())
 
     const growth = screen.getByRole('button', { name: /Growth/ })
     await userEvent.click(growth)
@@ -205,7 +219,7 @@ describe('TelemetryPanel — sorting', () => {
 
   it('marks the sorted column for assistive technology', async () => {
     await mount(only({ cost: cost() }))
-    await waitFor(() => expect(screen.getByText('A named conversation')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('A named conversation')).toBeInTheDocument())
     const credits = screen.getByRole('columnheader', { name: /Credits/ })
     expect(credits).toHaveAttribute('aria-sort', 'descending')
     await userEvent.click(screen.getByRole('button', { name: /Credits/ }))
@@ -216,19 +230,19 @@ describe('TelemetryPanel — sorting', () => {
 describe('TelemetryPanel — group by', () => {
   it('re-keys the same table instead of stacking a second one', async () => {
     await mount(only({ cost: cost() }))
-    await waitFor(() => expect(screen.getByText('A named conversation')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('A named conversation')).toBeInTheDocument())
     // One table, not one per grouping: the old page drew by-model and
     // by-channel as separate always-visible sections.
     expect(document.querySelectorAll('table')).toHaveLength(1)
 
-    await userEvent.click(screen.getByRole('button', { name: 'Model' }))
-    await waitFor(() => expect(screen.getByText('opus-5')).toBeInTheDocument())
-    expect(screen.queryByText('A named conversation')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('radio', { name: 'Model' }))
+    await waitFor(() => expect(inTable().getByText('opus-5')).toBeInTheDocument())
+    expect(inTable().queryByText('A named conversation')).not.toBeInTheDocument()
     expect(document.querySelectorAll('table')).toHaveLength(1)
 
-    await userEvent.click(screen.getByRole('button', { name: 'Category' }))
-    await waitFor(() => expect(screen.getByText('background')).toBeInTheDocument())
-    expect(screen.queryByText('opus-5')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('radio', { name: 'Origin' }))
+    await waitFor(() => expect(inTable().getByText('all background')).toBeInTheDocument())
+    expect(inTable().queryByText('opus-5')).not.toBeInTheDocument()
   })
 })
 
@@ -249,7 +263,7 @@ describe('TelemetryPanel — where the alarm colour goes', () => {
     await mount(
       only({ cost: cost({ conversations: [convo({ peak_pct: 95, turns_to_compaction: 1 })] }) }),
     )
-    await waitFor(() => expect(screen.getByText('A named conversation')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('A named conversation')).toBeInTheDocument())
     const ths = Array.from(document.querySelectorAll('thead th'))
     const idx = ths.findIndex(th => th.textContent?.startsWith('To 90%'))
     const cell = document.querySelectorAll('tbody tr')[0].children[idx] as HTMLElement
@@ -264,7 +278,7 @@ describe('TelemetryPanel — where the alarm colour goes', () => {
     await mount(
       only({ cost: cost({ conversations: [convo({ peak_pct: 95, turns_to_compaction: 40 })] }) }),
     )
-    await waitFor(() => expect(screen.getByText('A named conversation')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('A named conversation')).toBeInTheDocument())
     const ths = Array.from(document.querySelectorAll('thead th'))
     const idx = ths.findIndex(th => th.textContent?.startsWith('To 90%'))
     const cell = document.querySelectorAll('tbody tr')[0].children[idx] as HTMLElement
@@ -291,9 +305,9 @@ describe('TelemetryPanel — share of spend', () => {
         }),
       }),
     )
-    await waitFor(() => expect(screen.getByText('A named conversation')).toBeInTheDocument())
-    await userEvent.click(screen.getByRole('button', { name: 'Model' }))
-    await waitFor(() => expect(screen.getByText('seven')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('A named conversation')).toBeInTheDocument())
+    await userEvent.click(screen.getByRole('radio', { name: 'Model' }))
+    await waitFor(() => expect(inTable().getByText('seven')).toBeInTheDocument())
 
     const shareOf = (name: string) => {
       const ths = Array.from(document.querySelectorAll('thead th'))
@@ -318,7 +332,7 @@ describe('TelemetryPanel — one mounted table per persisted sort', () => {
     // "none". A table sorted by nothing visible is worse than an unsorted one.
     localStorage.setItem('sort:telemetry-spend-conversation', JSON.stringify({ key: 'retired_column', dir: 'desc' }))
     await mount(only({ cost: cost() }))
-    await waitFor(() => expect(screen.getByText('A named conversation')).toBeInTheDocument())
+    await waitFor(() => expect(inTable().getByText('A named conversation')).toBeInTheDocument())
 
     const marked = Array.from(document.querySelectorAll('thead th')).filter(
       th => th.getAttribute('aria-sort') !== 'none',
@@ -335,22 +349,23 @@ describe('TelemetryPanel — latency distribution order', () => {
   })
 
   it('labels bg the same way in the session column and in the category grouping', async () => {
-    // `category_bg` was applied in the Session table's column but not in the
-    // Group-by-Category table, which renders through the shared share-columns —
-    // so ONE field read "background" in one view and the raw "bg" in the other.
+    // `category_bg` is applied in the Session table's column AND in the
+    // Group-by-Origin table, which renders through the shared share-columns —
+    // mapping it in only one view makes ONE field read its label in one place
+    // and the raw "bg" in the other.
     await mount(only({
       cost: cost({
         conversations: [convo({ slot: 'cron:default:nightly', category: 'bg', channel: 'cron' })],
         by_category: [{ name: 'bg', credits: 900, turns: 90, per_turn: 10, share_pct: 100 }],
       }),
     }))
-    await waitFor(() => expect(screen.getAllByText('background').length).toBeGreaterThan(0))
+    await waitFor(() => expect(screen.getAllByText('all background').length).toBeGreaterThan(0))
     // The session view must not show the raw enum.
     expect(screen.queryByText('bg')).toBeNull()
 
     // The category grouping must agree rather than drift back to the enum.
-    await userEvent.click(screen.getAllByRole('button', { name: 'Category' })[0])
-    await waitFor(() => expect(screen.getAllByText('background').length).toBeGreaterThan(0))
+    await userEvent.click(screen.getAllByRole('radio', { name: 'Origin' })[0])
+    await waitFor(() => expect(screen.getAllByText('all background').length).toBeGreaterThan(0))
     expect(screen.queryByText('bg')).toBeNull()
   })
 
@@ -410,8 +425,8 @@ describe('TelemetryPanel — latency distribution order', () => {
         },
       }),
     )
-    await waitFor(() => expect(screen.getByRole('button', { name: /Distribution/ })).toBeInTheDocument())
-    await userEvent.click(screen.getByRole('button', { name: /Distribution/ }))
+    await waitFor(() => expect(screen.getByRole('radio', { name: /Distribution/ })).toBeInTheDocument())
+    await userEvent.click(screen.getByRole('radio', { name: /Distribution/ }))
 
     await waitFor(() => expect(screen.getByText('≤ 500ms')).toBeInTheDocument())
     const labels = ['≤ 500ms', '≤ 1.0s', '≤ 3.0s', '> 3.0s']
@@ -422,6 +437,20 @@ describe('TelemetryPanel — latency distribution order', () => {
         rendered[i - 1].compareDocumentPosition(rendered[i]) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy()
     }
+    // The widths themselves, as values. This renderer is shared with the Spend
+    // tab's credit blocks, so the scale is reachable from two surfaces and a
+    // change made for one of them can silently rescale the other. Peak is the
+    // largest count in the fixture (100), and every bar is its own count over
+    // that peak.
+    const widthOf = (label: string) => {
+      const row = screen.getByText(label).parentElement as HTMLElement
+      const fill = row.querySelector('span[style*="width"]') as HTMLElement
+      return fill.style.width
+    }
+    expect(widthOf('≤ 1.0s')).toBe('100%')
+    expect(widthOf('≤ 500ms')).toBe('5%')
+    expect(widthOf('≤ 3.0s')).toBe('20%')
+    expect(widthOf('> 3.0s')).toBe('3%')
   })
 })
 

@@ -62,18 +62,15 @@ class FlakySlack(MockSlackClient):
             raise RuntimeError("slack remove_reaction unavailable")
         await super().remove_reaction(channel, ts, emoji, raise_on_error)
 
-    async def post_message(self, channel, text, thread_ts=None, unfurl_links=None,
-                           unfurl_media=None):
+    async def post_message(self, channel, text, thread_ts=None):
         if "post_message" in self.fail:
             raise RuntimeError("slack post_message unavailable")
-        return await super().post_message(channel, text, thread_ts, unfurl_links, unfurl_media)
+        return await super().post_message(channel, text, thread_ts)
 
-    async def post_blocks(self, channel, blocks, text, thread_ts=None, unfurl_links=None,
-                          unfurl_media=None):
+    async def post_blocks(self, channel, blocks, text, thread_ts=None):
         if "post_blocks" in self.fail:
             raise RuntimeError("slack post_blocks unavailable")
-        return await super().post_blocks(channel, blocks, text, thread_ts, unfurl_links,
-                                         unfurl_media)
+        return await super().post_blocks(channel, blocks, text, thread_ts)
 
 
 def _raising_sel(*, method: str) -> MagicMock:
@@ -352,7 +349,7 @@ class TestResolveAgentName:
     def test_project_spec_wins_over_user_level_agents(self, monkeypatch, tmp_path):
         spec = tmp_path / "reviewer.agent-spec.json"
         spec.write_text("{}", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [spec])
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [spec])
         monkeypatch.setattr(h, "project_agent_name", lambda p: "project-reviewer")
         assert h._resolve_agent_name("reviewer", str(tmp_path)) == "project-reviewer"
 
@@ -360,7 +357,7 @@ class TestResolveAgentName:
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "helper.json").write_text('{"name": "helper"}', encoding="utf-8", newline="\n")
-        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [])
         monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
         # The hardened reader vets the RESOLVED target in the same step as the
         # read, so the refusal is injected at its gate, not at a path check
@@ -373,7 +370,7 @@ class TestResolveAgentName:
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "helper.json").write_text("{not json", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(h, "_discover_project_agents", lambda _d: [])
+        monkeypatch.setattr(h, "_discover_project_agents", lambda _d, **kw: [])
         monkeypatch.setattr(h, "kiro_agents_dir", lambda: agents)
         assert h._resolve_agent_name("helper") == "helper"
 

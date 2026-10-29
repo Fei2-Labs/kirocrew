@@ -37,6 +37,7 @@ from typing import Any
 
 from kiro_crew.apps.builtins.mochi.soul_loader import rendered_bg_prompt_path, rendered_prompt_path
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
 
@@ -61,14 +62,18 @@ _OWN_SERVER_PREFIX = "mochi"
 #: fail-closed neutralize pass stranded every spawn/learn/cron instruction the
 #: chat prompt makes, so the foreground agent is granted both here.
 #:
-#: ONLY the foreground agent. ``mochi-bg`` is itself a spawned SUBAGENT (its
-#: prompt opens "You are a background subagent … you cannot spawn other agents")
-#: and the platform pins "subagents cannot spawn other subagents"
-#: (``subagent.py`` module docstring). Its ``managedToolPolicy`` unmounting of
-#: ``spawn_run`` is the structural enforcement of that invariant; granting it
-#: core would swap that hard denial for a prompt-only one on an untrusted-content
-#: path (bg runs unattended and ``web_fetch``es watch targets), with no gateway
-#: check refusing a subagent-originated spawn. So bg gets neither core nor cron.
+#: ONLY the foreground agent. ``mochi-bg`` runs unattended and ``web_fetch``es
+#: watch targets, so it reads untrusted content. The platform lets a subagent
+#: spawn its own subagents (``subagent.py`` module docstring), and no gateway
+#: check refuses a subagent-originated spawn, so the denial lives on this agent.
+#: Two layers hold it. Left ungranted, core and cron fall to the neutralize pass
+#: below, which disables each at the server level for bg. And the
+#: ``managedToolPolicy.exclude`` list in ``mochi-bg.json`` makes the managed
+#: server hide and refuse ``spawn_run``, ``task_run``, ``cron_add``,
+#: ``cron_update``, ``cron_remove`` and ``cron_remove_all`` whatever the grants;
+#: that list is what makes its prompt's "you cannot spawn other agents" true. Granting core would still expose core's other tools (such
+#: as ``learn_add``) to that untrusted-content path. So bg gets neither core nor
+#: cron.
 #: A user grant for the same server in Settings still wins (see the merge in
 #: :func:`build_policy`), so this only sets the floor, never overrides intent.
 _BUILTIN_GRANTS: dict[str, list[str]] = {
@@ -112,7 +117,7 @@ def _configured_server_names() -> list[str]:
     """
     config = Path.home() / ".kiro" / "settings" / "mcp.json"
     try:
-        raw = json.loads(config.read_text(encoding="utf-8"))
+        raw = loads_user_json(config.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return []  # no global servers configured at all
     except Exception as exc:  # noqa: BLE001 — a malformed global file is not our error

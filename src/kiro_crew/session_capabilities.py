@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from kiro_crew import agent_state
 from kiro_crew.agent_capabilities import (
+    CapabilityError,
     prepare_member_capabilities,
     reconcile_member_capabilities,
 )
@@ -27,6 +28,7 @@ class CapabilityPreparation:
     project: str = ""
     governance_generation: object = None
     mcp_servers: tuple[str, ...] = ()
+    tool_limited_servers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -65,11 +67,17 @@ def prepare_runtime(
         raise CapabilityStartupError("capability_state_unreadable") from None
     if intent is None:
         return CapabilityPreparation(member)
-    reconcile_member_capabilities(member)
-    if not cwd:
-        cfg = KiroCrewConfig.load()
-        cwd = default_project_dir(cfg.agents[member].workspace)
-    prepared = prepare_member_capabilities(member, cwd)
+    try:
+        reconcile_member_capabilities(member)
+        if not cwd:
+            cfg = KiroCrewConfig.load()
+            cwd = default_project_dir(cfg.agents[member].workspace)
+        prepared = prepare_member_capabilities(member, cwd)
+    except CapabilityError as exc:
+        # The chat error card links to THIS member's Capabilities pane, where
+        # the change is reviewed; the code alone does not say whose file it is.
+        exc.member = member
+        raise
     if not prepared.get("revision") or not prepared.get("template"):
         raise CapabilityStartupError("capability_generation_missing")
     return CapabilityPreparation(
@@ -79,6 +87,7 @@ def prepare_runtime(
         str(Path(cwd).resolve()) if cwd else "",
         governance_answer_generation(),
         tuple(prepared.get("mcp_servers", ())),
+        tuple(prepared.get("tool_limited_servers", ())),
     )
 
 
@@ -97,7 +106,8 @@ def verify_saved(prepared: CapabilityPreparation, cwd: str) -> None:
 
 
 def loaded_stamp(provider: Any, prepared: CapabilityPreparation) -> LoadedCapabilities:
-    """Only an observed active template on a dedicated new process is evidence."""
+    """Require native activation or a verified projection on a fresh process."""
+
     if (
         provider.member_capabilities_supported is not True
         or provider.loaded_capability_template != prepared.template
@@ -128,6 +138,7 @@ def runtime_view(state: SessionRegistryState, member: str, saved_revision: str) 
         provider = session.provider
         status = "pending"
         error_code = ""
+        projection_gaps: tuple[str, ...] = ()
         if stamp is not None and stamp.revision == saved_revision:
             status = "unverified"
             if (
@@ -138,6 +149,7 @@ def runtime_view(state: SessionRegistryState, member: str, saved_revision: str) 
                 and governance_answer_generation() == stamp.governance_generation
             ):
                 status = "applied"
+                projection_gaps = provider.capability_projection_gaps
                 report = provider.mcp_session_report()
                 payload = report.payload() if report is not None else None
                 if payload and (payload.get("failed") or payload.get("unresolved_refs")):
@@ -146,6 +158,8 @@ def runtime_view(state: SessionRegistryState, member: str, saved_revision: str) 
                 elif payload and payload.get("awaiting_auth"):
                     status = "pending"
                     error_code = "capability_mcp_auth_required"
+                elif projection_gaps:
+                    status = "unverified"
                 elif stamp.mcp_servers and (
                     not payload or not set(stamp.mcp_servers) <= set(payload.get("ready", []))
                 ):

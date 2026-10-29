@@ -1,16 +1,14 @@
 """A NEW test that spawns a subagent must not read the host's free memory.
 
-``SubagentManager.spawn`` refuses -- returning before it registers anything in
-``_tasks`` -- while the machine looks short of memory, and it does so twice: an
-absolute floor (``check_memory_available`` against ``agent.spawn_min_memory_gb``)
-and the posture tier (``cached_admission_check``, refusing while the
-cgroup-clamped reading is CRITICAL). ``test/conftest.py``'s
-``healthy_host_memory`` pins both, but only for a file that asks for it -- so
-this is what stops the pinned set falling behind ``test/``.
+``SubagentManager.spawn`` queues -- returning before it registers anything in
+``_tasks`` -- while the machine looks short of memory: the absolute floor
+(``check_memory_available`` against ``agent.spawn_min_memory_gb``).
+``test/conftest.py``'s ``healthy_host_memory`` pins that reading, but only for a
+file that asks for it -- so this is what stops the pinned set falling behind
+``test/``.
 
-A ratchet rather than a convention, because of how the failure reads: a refusal
-IS a ``SubagentInfo`` -- a done one carrying ``error`` -- so
-``assert info is not None`` still passes and the test dies on the NEXT line with
+A ratchet rather than a convention, because of how the failure reads: a queued
+spawn IS a ``SubagentInfo``, so ``assert info is not None`` still passes and the test dies on the NEXT line with
 a bare ``KeyError`` naming an id nothing else mentions. Nothing in the traceback
 says "memory"; the only evidence is a WARNING in the captured log. Measured on a
 CI runner with ~0.5 GB free, on a PR that touched none of this.
@@ -34,9 +32,11 @@ import ast
 import functools
 import pathlib
 
+import pytest
+
 _TEST_DIR = pathlib.Path(__file__).resolve().parent
 
-#: The fixture in ``test/conftest.py`` that pins both guards. A rename that
+#: The fixture in ``test/conftest.py`` that pins the floor reading. A rename that
 #: misses this file turns every module below into an unpinned one, so the
 #: ratchet goes red rather than quietly stopping.
 _FIXTURE = "healthy_host_memory"
@@ -98,16 +98,35 @@ class TestTheSpawnHostMemoryPinRatchet:
     #: why, in the same spirit as ``test_host_isolation_floor.py``'s
     #: ``_EXCLUDED``.
     _EXCLUDED: dict[str, str] = {
-        # The tests OF the two guards. Each patches ``check_memory_available``
-        # and ``cached_admission_check`` in its own body, to refused AND to
-        # admitted, which is the behaviour under test. Pinning the file would
-        # not break them -- an inner patch lands on top -- but it would state a
-        # precondition the opposite of what they exist to vary.
-        "test_admission_gate.py": "drives both guards itself, to refused and to admitted",
+        # The tests OF the guard. Each patches ``check_memory_available`` in its
+        # own body, to low AND to healthy, which is the behaviour under test.
+        # Pinning the file would not break them -- an inner patch lands on top
+        # -- but it would state a precondition the opposite of what they exist
+        # to vary.
+        "test_admission_gate.py": "drives the floor itself, to deferred and to admitted",
+        # Runs the REAL memory check over fabricated /proc and cgroup files; the
+        # pin would replace the check under test.
+        "test_spawn_memory_cause.py": "feeds the real memory check fabricated kernel files",
         # A shared fake, not a collected test module: ``ManagerHarness`` pins
-        # both host-memory readings itself for as long as it is open, so every
+        # the host-memory reading itself for as long as it is open, so every
         # module that spawns through it is pinned without naming the fixture.
         "overload_fakes.py": "fake harness pins the host readings itself",
+        # A shared run harness, not a collected test module: a module-level
+        # ``pytestmark`` here would mark no test. Its one importer,
+        # ``test_subagent_stop_reason_consistency.py``, carries the pin.
+        "subagent_stop_reason_helpers.py": "harness; its importer pins the host readings",
+        # A shared harness, not a collected test module: a module-level
+        # ``pytestmark`` here would mark no test. Its importers, the five
+        # ``test_queue_depth_reconcile*.py`` modules, each carry the pin.
+        "queue_depth_reconcile_helpers.py": "harness; its importers pin the host readings",
+        # A shared harness, not a collected test module: a module-level
+        # ``pytestmark`` here would mark no test. Its importers, the three
+        # ``test_subagent_turn_resilience*.py`` modules, each carry the pin.
+        "subagent_turn_resilience_helpers.py": "harness; its importers pin the host readings",
+        # A shared harness, not a collected test module: the helper methods the
+        # ``test_admission_gate*.py`` spawn-gate classes share. Like
+        # ``test_admission_gate.py``, its importers drive the floor themselves.
+        "admission_gate_helpers.py": "harness; its importers drive the floor themselves",
     }
 
     def test_every_spawning_module_is_pinned_or_excluded(self) -> None:
@@ -123,7 +142,7 @@ class TestTheSpawnHostMemoryPinRatchet:
             "host-memory reading:\n    " + "\n    ".join(unhandled) + "\n"
             f'Add `pytestmark = pytest.mark.usefixtures("{_FIXTURE}")` at module '
             "scope, or exclude the file in _EXCLUDED and say why. Unpinned, the "
-            "spawn is refused on a memory-pressured runner and the test fails as a "
+            "spawn is queued on a memory-pressured runner and the test fails as a "
             "bare KeyError on the following line."
         )
 
@@ -181,7 +200,7 @@ class TestTheHostPinSurvivesTheTestsOwnPatches:
     file is pinned, looks pinned, and is not pinned where it matters.
 
     Measured on a macos-15 nightly backend shard reading 2.58 GB available,
-    under the 4.5 GB floor: ``test_taskq_admission_integration.py``'s drain
+    under the 4.5 GB floor then in force: ``test_taskq_admission_integration.py``'s drain
     deferred a second time. The only failure text was
     ``assert 'queued' == 'starting'``; nothing named memory, and the whole
     nightly publish chain was skipped behind it.
@@ -202,3 +221,25 @@ class TestTheHostPinSurvivesTheTestsOwnPatches:
             f'instead, so leaving the block restores "{_FIXTURE}"\'s readings '
             "rather than the runner's."
         )
+
+
+@pytest.mark.usefixtures(_FIXTURE)
+class TestThePinnedHostIsHealthyNotInfinite:
+    """The pin answers as a real host with that much free memory would.
+
+    A pin that admits whatever floor is asked hides every test whose reserve has
+    outgrown the host: a wave of starts the operator's 8 GB machine would queue
+    reads as admitted here. So the floor is still compared against the pinned
+    figure, and only the reading itself is fixed.
+    """
+
+    def test_a_floor_above_the_pinned_host_is_refused(self) -> None:
+        import kiro_crew.subagent as subagent
+
+        assert subagent.check_memory_available(min_gb=9.0) == (False, 8.0)
+
+    def test_a_floor_the_pinned_host_clears_is_admitted(self) -> None:
+        import kiro_crew.subagent as subagent
+
+        assert subagent.check_memory_available(min_gb=8.0) == (True, 8.0)
+        assert subagent.check_memory_available() == (True, 8.0)

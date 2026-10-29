@@ -136,6 +136,42 @@ describe('IssuePanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Linked/ }))
     expect(screen.getByText('Guard the empty label list')).toBeInTheDocument()
     expect(screen.getByText('#12')).toBeInTheDocument()
+    // #8487: the linked change's `state` ('OPEN') renders through the catalog
+    // ("Open"), not the raw wire value CSS-capitalized. The header state and
+    // this linked-change state both read "Open", so there are now two.
+    expect(screen.getAllByText('Open').length).toBeGreaterThanOrEqual(2)
+  })
+
+  // #8487: a linked change's lifecycle `state` used to print the raw wire value
+  // lowercased with a CSS `capitalize`. A mapped lifecycle value now renders
+  // from the catalog (casing from the catalog, no `capitalize`); an unmapped
+  // provider-specific state (e.g. a Jira workflow state) is untranslated by
+  // design and KEEPS its `capitalize`, so it does not read all-lowercase next
+  // to the catalog-cased siblings.
+  it('renders a mapped state from the catalog and keeps capitalize on the unmapped raw fallback', async () => {
+    const jiraLinked: IssueSource = {
+      ...openIssue,
+      linkedChanges: [
+        // A mapped lifecycle value.
+        { provider: 'github', url: 'https://github.com/acme/widgets/pull/13', number: 13, title: 'Merged change', state: 'MERGED' },
+        // An unmapped Jira workflow state.
+        { provider: 'jira', url: 'https://jira.example/browse/PROJ-1', number: 1, title: 'Jira ticket', state: 'In Review', issueKey: 'PROJ-1' },
+      ],
+    }
+    mockApi.fetchIssueSource.mockImplementation(() => Promise.resolve(jiraLinked))
+    renderPanel()
+    await screen.findByText('Crash on empty label list')
+
+    fireEvent.click(screen.getByRole('tab', { name: /Linked/ }))
+    // Mapped: catalog label, casing from the catalog — no `capitalize`.
+    const mapped = screen.getByText('Merged')
+    expect(mapped).toBeInTheDocument()
+    expect(mapped.className).not.toContain('capitalize')
+    // Unmapped: the raw value (lowercased text node), but `capitalize` restored
+    // so it renders "In Review", not "in review", beside the mapped siblings.
+    const raw = screen.getByText('in review')
+    expect(raw).toBeInTheDocument()
+    expect(raw.className).toContain('capitalize')
   })
 
   it('hides the Linked tab when the provider reported no linked changes', async () => {
@@ -175,6 +211,18 @@ describe('IssuePanel', () => {
     renderPanel({ issues: [links[0]] })
     expect(await screen.findByText('GitHub CLI login required')).toBeInTheDocument()
     expect(screen.getByText('gh auth login')).toBeInTheDocument()
+  })
+
+  it('carries an Enterprise host-scoped login command inside the notice, labelled GitHub', async () => {
+    mockApi.fetchIssueSource.mockRejectedValue(new Error(JSON.stringify({
+      error: 'gh: not logged in. Run `gh auth login --hostname ghe.example.com`, then retry.',
+      code: 'provider_error',
+      loginCommand: 'gh auth login --hostname ghe.example.com',
+    })))
+    renderPanel({ issues: [links[0]] })
+    const notice = await screen.findByTestId('issue-panel-load-error')
+    expect(notice).toHaveTextContent('GitHub CLI login required')
+    expect(notice.querySelector('code')?.textContent).toBe('gh auth login --hostname ghe.example.com')
   })
 
   it('refreshes only on demand, passing the force flag', async () => {

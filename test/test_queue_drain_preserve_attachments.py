@@ -71,7 +71,7 @@ def _busy_state(tmp_path, monkeypatch):
     state = _make_state(tmp_path)
     state.broadcast_ws = MagicMock()
     slot = state.get_or_create_slot("busy-chat")
-    slot._in_stage_execution = True  # force the busy queue path
+    slot.task = _live_turn()  # force the busy queue path
     monkeypatch.setattr("kiro_crew.dashboard.chat_handlers._run_chat", MagicMock())
     return state, slot
 
@@ -89,6 +89,11 @@ def _seed_pending_steer_stores(slot, count):
         {message: {"files": [f"/tmp/file-{i}"]} for i, message in enumerate(messages)}
     )
     return messages
+
+
+def _live_turn() -> MagicMock:
+    """A stand-in for a turn still running on the slot."""
+    return MagicMock(done=MagicMock(return_value=False))
 
 
 class TestAttachmentMeta:
@@ -177,6 +182,80 @@ class TestBusySlotQueueEntry:
         assert "dirs" not in entry["meta"]
 
 
+def _queue_push_frames(state) -> list[dict]:
+    return [c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "queue_push"]
+
+
+class TestQueuePushFrameCarriesTheLists:
+    """Every producer's ``queue_push`` frame names the entry's attachment lists.
+
+    The card that frame draws is what a cancel restores the composer from on a
+    tab that never held the send's own state (a reload, another tab). Without
+    the lists the client parses the marker text by whitespace and a spaced
+    path is truncated or left in the composer verbatim. The key is the
+    ``meta`` the ``queue_pop`` frame already uses; absent, not empty, for an
+    entry without attachments.
+    """
+
+    @pytest.mark.asyncio
+    async def test_busy_slot_frame(self, tmp_path, monkeypatch):
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        receipt = await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH], "dirs": [_DIR]})
+        (frame,) = _queue_push_frames(state)
+        assert frame["queue_id"] == receipt["queue_id"]
+        assert frame["content"] == _WIRE
+        assert frame["meta"] == {"files": [_PATH], "dirs": [_DIR]}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("send_id", [None, "s-2"])
+    async def test_busy_slot_frame_without_attachments_carries_only_send_identity(
+        self, tmp_path, monkeypatch, send_id
+    ):
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        await _post_busy(state, "busy-chat", "plain text", {"sendId": send_id})
+        (frame,) = _queue_push_frames(state)
+        if send_id:
+            assert frame["meta"] == {"sendId": send_id}
+        else:
+            assert "meta" not in frame
+
+    @pytest.mark.asyncio
+    async def test_sub_agent_hold_frame(self, tmp_path, monkeypatch):
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        # The idle-slot hold: no turn is running, but children are.
+        slot.task = None
+        state.subagents = MagicMock(running_agents_for=MagicMock(return_value=["agent-1"]))
+        receipt = await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH]})
+        (frame,) = _queue_push_frames(state)
+        assert frame["queue_id"] == receipt["queue_id"]
+        assert frame["meta"] == {"files": [_PATH]}
+
+    @pytest.mark.asyncio
+    async def test_requeued_steer_frame(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.chat_runner import _requeue_unconsumed_steers
+
+        state, slot = _busy_state(tmp_path, monkeypatch)
+        slot._acp_client = MagicMock(supports_steer=True, steer=AsyncMock(return_value=True))
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat",
+                json={
+                    "slot": "busy-chat",
+                    "message": _WIRE,
+                    "steer": True,
+                    "meta": {"files": [_PATH], "dirs": [_DIR]},
+                },
+            )
+            assert resp.status == 200
+        state.broadcast_ws.reset_mock()
+
+        _requeue_unconsumed_steers(state, slot)
+        (frame,) = _queue_push_frames(state)
+        entry = next(i for i in slot._queue if i["content"] == _WIRE)
+        assert frame["queue_id"] == entry["id"]
+        assert frame["meta"] == {"files": [_PATH], "dirs": [_DIR]}
+
+
 class TestDrainedRow:
     @pytest.mark.asyncio
     async def test_drained_row_carries_the_attachment_lists(self, tmp_path, monkeypatch):
@@ -186,7 +265,7 @@ class TestDrainedRow:
         await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH]})
 
         state.subagents = None
-        slot._in_stage_execution = False
+        slot.task = None
         await _drain_once(state, slot)
 
         rows = _user_rows(slot)
@@ -208,7 +287,7 @@ class TestDrainedRow:
         await _post_busy(state, "busy-chat", _WIRE, {"files": [_PATH], "dirs": [_DIR]})
 
         state.subagents = None
-        slot._in_stage_execution = False
+        slot.task = None
         await _drain_once(state, slot)
 
         pops = [
@@ -225,7 +304,7 @@ class TestDrainedRow:
         await _post_busy(state, "busy-chat", "plain text", None)
 
         state.subagents = None
-        slot._in_stage_execution = False
+        slot.task = None
         await _drain_once(state, slot)
 
         pops = [
@@ -421,7 +500,7 @@ class TestSteeredAttachments:
         assert slot._steer_attachment_meta == {}
 
         state.subagents = None
-        slot._in_stage_execution = False
+        slot.task = None
         await _drain_once(state, slot)
         assert _user_rows(slot)[-1]["meta"]["files"] == [_PATH]
 
@@ -704,5 +783,47 @@ class TestQueueEditPrunesAttachmentMeta:
             if c.args and c.args[0] == "queue_edit"
         )
         assert frame["content"] == expected
+        # The pruned, renumbered list rides the frame beside the renumbered
+        # text: `[attached_file 1]` is now `files[0]`, so a client that
+        # replaces the row's lists from this frame can still restore the
+        # survivor exactly on a later cancel. Without it the row keeps the
+        # pre-edit two-entry list, which indexes nothing in the new text.
+        assert frame["meta"] == {"files": [_PATH]}
         row = next(m for m in slot.messages if m.get("role") == "queued")
         assert row["content"] == expected
+
+    @pytest.mark.asyncio
+    async def test_edit_frame_carries_no_meta_once_every_marker_is_gone(
+        self, tmp_path, monkeypatch
+    ):
+        """An edit that drops the last marker drops the list; the frame says so
+        by carrying no ``meta`` (the client reads absence as "no lists")."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("busy-chat")
+        qid = slot.queue_append(_WIRE, meta={"files": [_PATH]})
+        slot.append("queued", _WIRE, json.dumps({"queue_id": qid}))
+
+        from aiohttp import web
+
+        from kiro_crew.dashboard.chat_handlers import api_chat_slot_queue_edit
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_patch("/api/chat/slots/{slot}/queue/{queue_id}", api_chat_slot_queue_edit)
+        with patch("kiro_crew.sel.sel") as mock_sel:
+            mock_sel.return_value = MagicMock()
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.patch(
+                    f"/api/chat/slots/busy-chat/queue/{qid}", json={"content": "just text"}
+                )
+                assert resp.status == 200
+
+        frame = next(
+            c.args[1]
+            for c in state.broadcast_ws.call_args_list
+            if c.args and c.args[0] == "queue_edit"
+        )
+        assert frame == {"slot": "busy-chat", "queue_id": qid, "content": "just text"}
+        assert "files" not in slot._queue[0]["meta"]

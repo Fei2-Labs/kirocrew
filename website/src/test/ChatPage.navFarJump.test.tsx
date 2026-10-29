@@ -63,6 +63,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       scrollToBottom: vi.fn(),
       scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(() => true),
+      retainRange: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -100,7 +101,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]

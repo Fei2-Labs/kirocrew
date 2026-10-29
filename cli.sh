@@ -47,7 +47,7 @@ set -eu
 unset PYTHONPATH PYTHONHOME
 
 # The URL contract splits by class: FEED_BASE serves the mutable pointers
-# (latest-cli.json), ARTIFACT_BASE serves the bytes (wheels, SHA256SUMS).
+# (latest-cli.json), ARTIFACT_BASE serves the bytes (wheels, cli-manifest.json).
 # Both are aliases of the same distribution today; --cdn / KIROCREW_CDN_BASE
 # overrides BOTH (test / alternate-CDN escape hatch).
 FEED_BASE="${KIROCREW_CDN_BASE:-https://updates.crew.kiro.dev}"
@@ -136,6 +136,8 @@ Options / env:
                                        prebuilt wheel for this host (needs a C
                                        toolchain and -dev headers); by default
                                        the install refuses instead of building
+  KIROCREW_INSTALL_PLAIN=1             plain one-line-per-step output on a
+                                       terminal (no redrawn progress line)
 EOF
       exit 0 ;;
     *) echo "kirocrew-install: unknown argument '$1'" >&2; exit 2 ;;
@@ -145,6 +147,212 @@ FEED_BASE="${FEED_BASE%/}"
 ARTIFACT_BASE="${ARTIFACT_BASE%/}"
 
 err() { echo "kirocrew-install: $*" >&2; exit 1; }
+
+# ── Progress output ──────────────────────────────────────────────────────────
+# The slow steps (the wheel download, pip resolving and fetching every
+# dependency, `python -m venv` running ensurepip) take a minute or more; a
+# single static line in front of that silence reads as a hang. Under
+# `curl ... | sh` only STDIN is the pipe; stdout is still the terminal, so the
+# script can tell an interactive run from a logged one and draw accordingly.
+#
+#   _tty            1 when stdout is a terminal that can take a redrawn line.
+#   CURL_PROGRESS   curl's progress flag for artifact downloads: a progress bar
+#                   on a terminal, silent (as before) in a log.
+#   _run_step LOG MSG CMD...
+#                   runs CMD with stdout+stderr captured to LOG. On a terminal
+#                   it redraws one line: spinner, MSG, elapsed seconds and the
+#                   last line CMD wrote (pip's "Collecting ..." / "Downloading
+#                   ..." lines, so the user sees which package it is on).
+#                   Otherwise it prints one heartbeat line every 30 s so a CI
+#                   log still shows the step is alive. Ends with a "done"/
+#                   "FAILED" line and returns CMD's exit status; the caller
+#                   reads LOG for the failure report, exactly as before.
+#                   Ctrl-C (or TERM) during the step terminates CMD and
+#                   everything CMD forked first (CMD runs in its own process
+#                   group): CMD runs asynchronously, and POSIX starts an async
+#                   child of a non-interactive shell with SIGINT ignored, so
+#                   without this the keypress would stop the spinner while
+#                   pip kept writing the venv. CMD then exits by signal
+#                   (status 128+N), the same status a foreground pip returns
+#                   for the keypress, so the caller's restore-then-err path
+#                   runs unchanged.
+#   _rs_optional=1  set before a _run_step whose failure the caller
+#                   tolerates ("Updating pip"): the closing line reads as a
+#                   warning instead of FAILED. Consumed by the call.
+#   _tolerate RC    for such a step: swallow an ordinary failure, but an
+#                   interrupt (RC > 128) still ends the install (the
+#                   rebuild's EXIT trap puts a moved-aside venv back).
+_tty=0
+if [ -t 1 ] && [ "${TERM:-dumb}" != "dumb" ] && [ -z "${KIROCREW_INSTALL_PLAIN:-}" ]; then
+  _tty=1
+fi
+CURL_PROGRESS="-s"
+if [ "$_tty" = 1 ]; then CURL_PROGRESS="--progress-bar"; fi
+_rs_optional=0
+
+_rs_interrupt() {
+  # Runs from the INT/TERM trap while the step's child is alive: stop the
+  # whole step and let the wait below collect its signal status. The child
+  # was started as its own process group (see _run_step), so the negative
+  # pid reaches its descendants too -- `python -m venv` forks ensurepip and
+  # pip forks build helpers, and a survivor would keep writing into the tree
+  # the caller is about to replace.
+  _rs_sig="$1"
+  # Before the fork there is no child yet; _run_step stops it once it exists.
+  [ -n "$_rs_pid" ] || return 0
+  # `kill -s SIG -- -PGID`: the one spelling both bash and dash accept for a
+  # process group. Fall back to the pid alone if the group is refused.
+  kill -s TERM -- "-$_rs_pid" 2>/dev/null || kill -s TERM "$_rs_pid" 2>/dev/null || true
+}
+
+# The venv rebuild's rollback, run from the EXIT trap it arms for its whole
+# span: an exit for ANY reason after the move-aside -- a signal (the INT,
+# TERM and HUP traps in that span just exit), `set -e`, or a fatal shell
+# error -- puts the previous install back. Gated on _VENV_MOVED, which is set
+# only once the rename actually succeeded, so a stop before that never
+# touches a venv this run did not move. A failure branch restores through
+# _venv_restore_after_failure, which disarms this once its restore returns.
+_venv_rollback_on_exit() {
+  # A second Ctrl-C or TERM must not abort the restore between its delete and
+  # its rename: that would leave no venv at all. The restore is short; an
+  # escalating supervisor still has SIGKILL.
+  trap '' INT TERM HUP
+  if [ "${_VENV_MOVED:-0}" = 1 ] && [ -d "${_VENV_BACKUP:-}" ]; then
+    if _restore_tree "$_VENV_BACKUP" "$VENV"; then
+      echo "interrupted; the previous install was restored and keeps working." >&2
+    else
+      echo "interrupted, and the previous install could not be restored from $_VENV_BACKUP." >&2
+    fi
+  fi
+  rm -rf "$TMP"
+}
+
+# A failure branch's restore of the moved-aside venv; reports and exits. The
+# delete-then-rename runs with INT, TERM and HUP ignored, as in
+# _venv_rollback_on_exit: a stop that exited between the two would leave no
+# venv at all and the backup stranded. The EXIT rollback stands down only once
+# this restore has returned, so it is never disarmed while the backup is out.
+_venv_restore_after_failure() {
+  trap '' INT TERM HUP
+  # $1 reports a restore that worked, $2 one that did not.
+  _restore_tree "$_VENV_BACKUP" "$VENV" || shift
+  _VENV_MOVED=0
+  err "$1"
+}
+
+_tolerate() {
+  [ "$1" -le 128 ] && return 0
+  # An interrupt in a tolerated step still ends the install; the rebuild's
+  # EXIT trap puts the moved-aside venv back.
+  exit "$1"
+}
+
+_run_step() {
+  _rs_log="$1"; _rs_msg="$2"; shift 2
+  _rs_opt=$_rs_optional; _rs_optional=0
+  : > "$_rs_log"
+  # The command gets its own process group, so an interrupt can terminate it
+  # together with everything it forked (`python -m venv` forks ensurepip,
+  # pip forks build helpers). setsid(1) does that on any Linux userland,
+  # tty or not; where it is missing (macOS) job control does the same, and
+  # it is switched off again straight away because the rest of the script
+  # wants the default foreground-group behaviour. dash off a tty cannot
+  # enable job control and says so on stderr; that message is dropped and
+  # the pid-only kill fallback in _rs_interrupt covers the step.
+  # Own INT/TERM/HUP for the life of the step, taken BEFORE the fork so no
+  # signal reaches the caller's handler while a child is already writing.
+  # The caller's traps come back afterwards (the EXIT trap is untouched).
+  # The trap list goes through a file: dash prints nothing for `trap`
+  # inside a command substitution, so `$(trap)` would restore nothing. A
+  # signal the caller does not trap gets an explicit reset appended, so the
+  # restore is one `.` with no window at the default disposition.
+  _rs_sig=""
+  _rs_pid=""
+  _rs_traps="$TMP/.traps.$$"
+  trap > "$_rs_traps"
+  for _rs_s in INT TERM HUP; do
+    # bash outside POSIX mode prints SIGINT, every other shell INT.
+    grep -Eq " (SIG)?$_rs_s\$" "$_rs_traps" 2>/dev/null || echo "trap - $_rs_s" >> "$_rs_traps"
+  done
+  trap '_rs_interrupt INT' INT
+  trap '_rs_interrupt TERM' TERM
+  trap '_rs_interrupt HUP' HUP
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" > "$_rs_log" 2>&1 < /dev/null &
+  else
+    set -m 2>/dev/null || true
+    "$@" > "$_rs_log" 2>&1 < /dev/null &
+    set +m 2>/dev/null || true
+  fi
+  _rs_pid=$!
+  # A signal that landed between the takeover and the fork found no child to
+  # stop; stop the one that now exists.
+  if [ -n "$_rs_sig" ]; then _rs_interrupt "$_rs_sig"; fi
+  # No command substitution while the step owns INT: bash drops a trapped
+  # SIGINT that lands while it waits on a `$(...)`, so a Ctrl-C there would
+  # stop nothing. Each value goes through a scratch file and `read` instead.
+  _rs_out="$TMP/.rs_out.$$"
+  date +%s > "$_rs_out" 2>/dev/null || :
+  IFS= read -r _rs_start < "$_rs_out" || :
+  { tput cols 2>/dev/null || echo "${COLUMNS:-80}"; } > "$_rs_out"
+  IFS= read -r _rs_cols < "$_rs_out" || :
+  case $_rs_cols in ''|*[!0-9]*) _rs_cols=80 ;; esac
+  _rs_i=0
+  _rs_beat=0
+  while kill -0 "$_rs_pid" 2>/dev/null; do
+    date +%s > "$_rs_out" 2>/dev/null || :
+    IFS= read -r _rs_now < "$_rs_out" || :
+    _rs_el=$(( _rs_now - _rs_start ))
+    if [ "$_tty" = 1 ]; then
+      case $((_rs_i % 4)) in
+        0) _rs_f='|' ;; 1) _rs_f='/' ;; 2) _rs_f='-' ;; *) _rs_f='\' ;;
+      esac
+      # Everything on the redrawn line is trimmed to the terminal: a line
+      # that wraps is not replaced by the next \r, it stacks up a new row
+      # per redraw. Width comes from tput, then $COLUMNS, then 80. The
+      # prefix is cut to fit first (a very narrow terminal), and the tail
+      # gets whatever room the prefix leaves.
+      printf "%.$((_rs_cols - 1))s\n" "$_rs_f $_rs_msg (${_rs_el}s)" > "$_rs_out"
+      IFS= read -r _rs_head < "$_rs_out" || :
+      _rs_room=$(( _rs_cols - 1 - ${#_rs_head} - 2 ))
+      _rs_last=""
+      if [ "$_rs_room" -ge 8 ]; then
+        tail -n 1 "$_rs_log" 2>/dev/null | tr -d '\r' \
+          | sed 's/^[[:space:]]*//' | cut -c1-"$_rs_room" > "$_rs_out"
+        IFS= read -r _rs_last < "$_rs_out" || :
+      fi
+      printf '\r\033[K%s%s' "$_rs_head" "${_rs_last:+  $_rs_last}"
+      _rs_i=$((_rs_i + 1))
+      # Fractional sleep is not POSIX; sleep 1 when this sleep lacks it.
+      sleep 0.25 2>/dev/null || sleep 1
+    else
+      if [ $((_rs_el - _rs_beat)) -ge 30 ]; then
+        _rs_beat=$_rs_el
+        echo "$_rs_msg ... still running (${_rs_el}s)"
+      fi
+      sleep 1
+    fi
+  done
+  _rs_rc=0
+  wait "$_rs_pid" || _rs_rc=$?
+  . "$_rs_traps"
+  rm -f "$_rs_traps" "$_rs_out"
+  _rs_el=$(( $(date +%s) - _rs_start ))
+  if [ "$_tty" = 1 ]; then printf '\r\033[K'; fi
+  if [ -n "$_rs_sig" ]; then
+    echo "$_rs_msg ... interrupted (SIG$_rs_sig) after ${_rs_el}s" >&2
+    # A child that exited by signal reports 128+N; make sure an interrupt
+    # never reads as success even if the child swallowed the TERM.
+    [ "$_rs_rc" -gt 128 ] || _rs_rc=130
+  elif [ "$_rs_rc" -eq 0 ]; then
+    echo "$_rs_msg ... done (${_rs_el}s)"
+  elif [ "$_rs_opt" = 1 ]; then
+    echo "$_rs_msg ... skipped (exit $_rs_rc after ${_rs_el}s; continuing)" >&2
+  else
+    echo "$_rs_msg ... FAILED after ${_rs_el}s (exit $_rs_rc)" >&2
+  fi
+  return "$_rs_rc"
+}
 
 # Dependencies come from prebuilt wheels only. Left to itself, pip treats a
 # dependency with no wheel for this host as something to BUILD from its
@@ -240,19 +448,37 @@ while True:
 ' "$1"
 }
 
-# Put a backup tree ($1) back at its original path ($2). Succeeds only when
-# the original path is GONE before the move: `mv` onto a directory that
-# survived `rm -rf` (an immutable file, a read-only remount after an I/O
-# error, a mount point) nests the backup INSIDE it and still exits 0, which
-# would read as a restore that never happened while `kirocrew` stays broken.
-# A dangling symlink at the path fails `-e` yet would still make `mv` rename
-# beside it, so `-L` is checked too. The caller reports the outcome.
+# Put a backup tree ($1) back at its original path ($2). Rename-first: the
+# half-built tree at $2 is RENAMED aside, the backup renamed into place, and
+# only then is the discarded tree deleted. Both renames are metadata-only, so
+# a SIGKILL during the slow delete (a network home directory) leaves a
+# working install plus a stray `.failed.*` sibling, never no install at all.
+# If the rename aside is refused, fall back to deleting $2 in place.
+# Succeeds only when the original path is GONE before the move: `mv` onto a
+# directory that survived (an immutable file, a read-only remount after an
+# I/O error, a mount point) nests the backup INSIDE it and still exits 0,
+# which would read as a restore that never happened while `kirocrew` stays
+# broken. A dangling symlink at the path fails `-e` yet would still make `mv`
+# rename beside it, so `-L` is checked too. The caller reports the outcome.
 _restore_tree() {
-  rm -rf "$2" 2>/dev/null || true
+  _rt_discard=""
+  if [ -e "$2" ] || [ -L "$2" ]; then
+    _rt_discard="${2%/}.failed.$$"
+    _rt_n=0
+    while [ -e "$_rt_discard" ] || [ -L "$_rt_discard" ]; do
+      _rt_n=$((_rt_n + 1))
+      _rt_discard="${2%/}.failed.$$.$_rt_n"
+    done
+    mv "${2%/}" "$_rt_discard" 2>/dev/null || { _rt_discard=""; rm -rf "$2" 2>/dev/null || true; }
+  fi
   if [ -e "$2" ] || [ -L "$2" ]; then
     return 1
   fi
-  mv "$1" "$2" 2>/dev/null
+  mv "$1" "$2" 2>/dev/null || return 1
+  if [ -n "$_rt_discard" ]; then
+    rm -rf "$_rt_discard" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # The channel name IS the storage path segment: publish-cli.yml writes
@@ -410,7 +636,8 @@ _provision_python_via_uv() {
   # the bytes but never substitute them. (uv's own python-build-standalone
   # download honors UV_PYTHON_INSTALL_MIRROR, which inherits through env.)
   _uv_base="${KIROCREW_UV_URL:-https://github.com/astral-sh/uv/releases/download}"
-  curl -fsSL --proto '=https' --proto-redir '=https' \
+  # shellcheck disable=SC2086
+  curl -f $CURL_PROGRESS -S -L --proto '=https' --proto-redir '=https' \
     "${_uv_base%/}/$UV_VERSION/uv-$_uv_target.tar.gz" \
     -o "$TMP/uv.tar.gz" || return 1
   _uv_got="$($SHA_CMD "$TMP/uv.tar.gz" | awk '{print $1}')"
@@ -424,6 +651,9 @@ _provision_python_via_uv() {
   # reach the interpreter that the venv's shebangs point at.
   _uv_data_home="${KIROCREW_HOME:-$HOME/.kiro/crew}"
   _uv_py_dir="${KIROCREW_PYTHON_DIR:-${_uv_data_home%/}-python}"
+  # uv draws its own download progress on a terminal and reuses an already
+  # installed interpreter without a download, so it is not wrapped in _run_step.
+  echo "Installing Python ($UV_PYTHON_SERIES) into $_uv_py_dir via uv ..."
   UV_PYTHON_INSTALL_DIR="$_uv_py_dir" "$_uv_bin" python install "$UV_PYTHON_SERIES" \
     || return 1
   # only-managed: resolve the interpreter just installed, never a system one
@@ -701,7 +931,11 @@ WHEEL_NAME="kirocrew-${VER}-py3-none-any.whl"
 WHL="$TMP/$WHEEL_NAME"
 
 echo "Downloading kirocrew $VER ..."
-curl -fsS --proto '=https' "$WHEEL_URL" -o "$WHL" || err "failed to download wheel from $WHEEL_URL"
+# $CURL_PROGRESS is one word (-s or --progress-bar), unquoted on purpose.
+# shellcheck disable=SC2086
+curl -f $CURL_PROGRESS -S --proto '=https' "$WHEEL_URL" -o "$WHL" || err "failed to download wheel from $WHEEL_URL"
+_whl_kb=$(( $(wc -c < "$WHL") / 1024 ))
+echo "Downloaded $WHEEL_NAME (${_whl_kb} KB); verifying SHA-256 ..."
 
 GOT="$($SHA_CMD "$WHL" | awk '{print $1}')"
 [ "$GOT" = "$SHA" ] || err "SHA-256 mismatch (expected $SHA, got $GOT) — refusing to install"
@@ -788,9 +1022,10 @@ if command -v pipx >/dev/null 2>&1; then
   # is on and nothing at all when it is off (no empty argument for pipx to
   # trip on). The output is captured so a failure can be explained; pipx's
   # own words are replayed by _report_pip_failure.
-  if ! pipx install --force --python "$PY" \
-      ${PIP_BINARY_ONLY:+"--pip-args=$PIP_BINARY_ONLY"} "$WHL" \
-      > "$TMP/pip-install.log" 2>&1; then
+  # shellcheck disable=SC2086
+  if ! _run_step "$TMP/pip-install.log" "Installing kirocrew $VER and its dependencies with pipx" \
+      pipx install --force --python "$PY" \
+      ${PIP_BINARY_ONLY:+"--pip-args=$PIP_BINARY_ONLY"} "$WHL"; then
     _report_pip_failure "$TMP/pip-install.log"
     if [ -n "$_PIPX_VENV_BACKUP" ] && [ -d "$_PIPX_VENV_BACKUP" ]; then
       _restore_tree "$_PIPX_VENV_BACKUP" "$_PIPX_VENV" \
@@ -819,6 +1054,24 @@ else
   VENV="${KIROCREW_VENV:-${_DATA_HOME_FOR_VENV%/}-venv}"
   _OLD_VENV="${_DATA_HOME_FOR_VENV%/}/venv"
   echo "Installing into managed venv at $VENV ..."
+  # One update lease for this layout. The shadow-venv update engine
+  # (`kirocrew update`, and the gateway's automatic and approved updates)
+  # takes this same lock file before it builds or promotes a tree beside
+  # $VENV, so this run and an engine apply never interleave a rebuild with a
+  # promotion. Held on fd 9 until this branch ends; the kernel drops it on any
+  # exit. Never deleted, for the reason the pipx branch's lock is not.
+  _VENV_LOCK="${VENV%/}.update.lock"
+  mkdir -p "${VENV%/*}" 2>/dev/null || true
+  if ! : >> "$_VENV_LOCK" 2>/dev/null; then
+    err "could not create the update lock $_VENV_LOCK (is ${VENV%/*} writable?). Nothing was changed."
+  fi
+  exec 9>>"$_VENV_LOCK"
+  _wait_install_lock 900 && _st=0 || _st=$?
+  if [ "$_st" -ne 0 ]; then
+    [ "$_st" -eq 3 ] \
+      && err "another kirocrew update has been working on $VENV for 15 minutes (lock $_VENV_LOCK). Nothing was changed. Wait for it to finish, or stop it, then re-run this installer." \
+      || err "could not take the update lock $_VENV_LOCK. Nothing was changed."
+  fi
   # Debian/Ubuntu ship the base `python3` WITHOUT the venv/ensurepip module (it
   # lives in the separate `python3-venv` / `python3.X-venv` package), so
   # `python3 -m venv` there dies with "ensurepip is not available" and, under
@@ -845,7 +1098,18 @@ else
   # the link itself) is left as-is. If the rename itself fails (exotic
   # filesystem), fall back to removing only the stale interpreter links so
   # the rebuild still cannot produce the hybrid.
+  #
+  # The rollback is armed BEFORE the move-aside and held until the wheel
+  # lands: the EXIT trap restores (see _venv_rollback_on_exit) and INT, TERM
+  # and HUP just exit, so a stop anywhere in the span -- before, between or
+  # after the steps -- and any other exit puts the previous install back.
+  # _run_step owns the signals while a step runs and puts these back.
   _VENV_BACKUP=""
+  _VENV_MOVED=0
+  trap '_venv_rollback_on_exit' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   if [ -f "$VENV/pyvenv.cfg" ] && [ ! -L "${VENV%/}" ]; then
     _VENV_BACKUP="${VENV%/}.pre-rebuild.$$"
     # A tree already at the backup path (a crashed earlier run whose PID was
@@ -858,7 +1122,12 @@ else
       _n=$((_n + 1))
       _VENV_BACKUP="${VENV%/}.pre-rebuild.$$.$_n"
     done
+    # Set BEFORE the rename: a TERM whose trap runs right after `mv` returns
+    # must still restore. Until the rename lands the backup path is unused,
+    # so the EXIT rollback's `-d "$_VENV_BACKUP"` check keeps it a no-op.
+    _VENV_MOVED=1
     if ! mv "$VENV" "$_VENV_BACKUP" 2>/dev/null; then
+      _VENV_MOVED=0
       _VENV_BACKUP=""
       rm -f "$VENV/bin/python" "$VENV/bin/python3" "$VENV/bin"/python3.* 2>/dev/null || true
     fi
@@ -866,29 +1135,57 @@ else
   # EVERY failure after the move-aside must restore the backup -- under
   # `set -eu` an unguarded command would exit past the restore and leave the
   # working install orphaned at the backup path.
-  if ! "$PY" -m venv "$VENV"; then
+  if ! _run_step "$TMP/venv-create.log" "Creating virtual environment" "$PY" -m venv "$VENV"; then
+    if [ -s "$TMP/venv-create.log" ]; then tail -n 20 "$TMP/venv-create.log" >&2; fi
     if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
-      _restore_tree "$_VENV_BACKUP" "$VENV" \
-        && err "creating the venv at $VENV failed (disk full?). The previous install was restored and keeps working; re-run this installer to retry." \
-        || err "creating the venv at $VENV failed and the previous install could not be restored from $_VENV_BACKUP."
+      _venv_restore_after_failure \
+        "creating the venv at $VENV failed (disk full?). The previous install was restored and keeps working; re-run this installer to retry." \
+        "creating the venv at $VENV failed and the previous install could not be restored from $_VENV_BACKUP."
     fi
     err "creating the venv at $VENV failed."
   fi
-  "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+  _rs_optional=1
+  _run_step "$TMP/pip-upgrade.log" "Updating pip" "$VENV/bin/pip" install --quiet --upgrade pip || _tolerate $?
   # On failure, put the pre-rebuild venv back so the previous install keeps
   # working -- then name the retry instead of dying with a raw pip trace. The
-  # binary-only flag is unquoted on purpose: it is one word or nothing.
+  # binary-only flag is unquoted on purpose: it is one word or nothing. Not
+  # --quiet: pip's "Collecting"/"Downloading" lines are what _run_step shows
+  # on the progress line, and they are the context _report_pip_failure needs.
   # shellcheck disable=SC2086
-  if ! "$VENV/bin/pip" install --quiet $PIP_BINARY_ONLY "$WHL" \
-      > "$TMP/pip-install.log" 2>&1; then
+  if ! _run_step "$TMP/pip-install.log" "Installing kirocrew $VER and its dependencies" \
+      "$VENV/bin/pip" install --progress-bar off $PIP_BINARY_ONLY "$WHL"; then
     _report_pip_failure "$TMP/pip-install.log"
     if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
-      _restore_tree "$_VENV_BACKUP" "$VENV" \
-        && err "installing the wheel into $VENV failed (see the pip output above). The previous install was restored and keeps working; re-run this installer to retry." \
-        || err "installing the wheel into $VENV failed and the previous install could not be restored from $_VENV_BACKUP. Re-run this installer to complete the install."
+      _venv_restore_after_failure \
+        "installing the wheel into $VENV failed (see the pip output above). The previous install was restored and keeps working; re-run this installer to retry." \
+        "installing the wheel into $VENV failed and the previous install could not be restored from $_VENV_BACKUP. Re-run this installer to complete the install."
     fi
     err "installing the wheel into $VENV failed. Re-run this installer to complete the install; until then the previous 'kirocrew' command may be unusable."
   fi
+  # A zero exit from pip is not proof the install is usable: a pip that reports
+  # success but lands a venv with no importable `kiro_crew` and no
+  # `bin/kirocrew` console script (observed in the field as a rebuilt venv
+  # holding only pip) would otherwise be COMMITTED here -- the rollback
+  # disarmed and the pre-rebuild backup, the one working copy left, deleted --
+  # leaving a dangling ~/.local/bin/kirocrew and a service that will not start.
+  # Verify the rebuilt venv the same way install.sh verifies its own before
+  # committing, while the rollback is STILL armed, so a bad rebuild restores
+  # the previous install instead of destroying it. `-I` isolates the import
+  # from an inherited PYTHONPATH, as every other interpreter call here does.
+  if [ ! -x "$VENV/bin/kirocrew" ] || ! "$VENV/bin/python" -I -c 'import kiro_crew' >/dev/null 2>&1; then
+    if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
+      _venv_restore_after_failure \
+        "the wheel install into $VENV reported success but left no usable kirocrew (no importable kiro_crew or bin/kirocrew). The previous install was restored and keeps working; re-run this installer to retry." \
+        "the wheel install into $VENV reported success but left no usable kirocrew, and the previous install could not be restored from $_VENV_BACKUP. Re-run this installer to complete the install."
+    fi
+    err "the wheel install into $VENV reported success but left no usable kirocrew (no importable kiro_crew or bin/kirocrew). Re-run this installer to complete the install; until then the previous 'kirocrew' command may be unusable."
+  fi
+  # Committed: the wheel landed and imports, so the rebuilt venv is the install now.
+  # Disarm the rollback BEFORE deleting the backup: a restore during that
+  # delete would replace the finished venv with a half-deleted tree.
+  _VENV_MOVED=0
+  trap 'rm -rf "$TMP"' EXIT INT TERM
+  trap - HUP
   if [ -n "$_VENV_BACKUP" ] && [ -d "$_VENV_BACKUP" ]; then
     rm -rf "$_VENV_BACKUP" 2>/dev/null || true
   fi
@@ -969,6 +1266,8 @@ except OSError:
       echo "WARNING: new venv at $VENV failed an import check; leaving $_OLD_VENV in place." >&2
     fi
   fi
+  # The managed venv is complete; let a waiting update proceed.
+  exec 9>&-
 fi
 
 _DATA_HOME="${KIROCREW_HOME:-$HOME/.kiro/crew}"

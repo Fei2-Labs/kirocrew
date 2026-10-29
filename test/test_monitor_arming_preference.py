@@ -25,8 +25,8 @@ Two failure modes shaped the assertions:
 
 from __future__ import annotations
 
-import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -233,6 +233,66 @@ class TestAnInstallThatPredatesTheKey:
         assert KiroCrewConfig.load().monitoring.prefer_structured_arming is True
 
 
+class TestAMalformedRuntimeCeilingIsNamedWhenItIsReplaced:
+    """``monitoring.max_runtime_secs`` falls back to the shipped seven days when
+    the stored value cannot be honoured. The fallback is right (a finite bound
+    must always exist) but it must not be SILENT: every budget written from then
+    on is validated against a ceiling the operator did not choose, and the
+    person who typed the value is the one who can correct it. The warning names
+    the value that was replaced and the ceiling that replaced it."""
+
+    _LOGGER = "kiro_crew.monitoring.limits"
+
+    @pytest.mark.parametrize("bad", ["7d", 0, -1, 2_592_001, 1.5, True, {}])
+    def test_a_configured_value_the_policy_rejects_is_named(
+        self, bad: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, coerce_runtime_ceiling
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            assert coerce_runtime_ceiling(bad) == DEFAULT_RUNTIME_CEILING_SECS
+
+        replaced = [r for r in caplog.records if r.name == self._LOGGER]
+        assert len(replaced) == 1
+        text = replaced[0].getMessage()
+        assert repr(bad) in text and str(DEFAULT_RUNTIME_CEILING_SECS) in text and "7 days" in text
+
+    def test_an_unset_key_is_the_ordinary_default_and_stays_quiet(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew.monitoring.limits import DEFAULT_RUNTIME_CEILING_SECS, coerce_runtime_ceiling
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            assert coerce_runtime_ceiling(None) == DEFAULT_RUNTIME_CEILING_SECS
+
+        assert not [r for r in caplog.records if r.name == self._LOGGER]
+
+    def test_a_valid_value_is_kept_and_stays_quiet(self, caplog: pytest.LogCaptureFixture) -> None:
+        from kiro_crew.monitoring.limits import coerce_runtime_ceiling
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            assert coerce_runtime_ceiling(2_592_000) == 2_592_000
+
+        assert not [r for r in caplog.records if r.name == self._LOGGER]
+
+    def test_the_stored_document_path_reports_through_the_same_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The operator edits ``config.json``, not the coercer: the load path
+        has to carry the same report."""
+        stored = tmp_path / "config.json"
+        stored.write_text(
+            json.dumps({"monitoring": {"max_runtime_secs": "thirty days"}}), encoding="utf-8"
+        )
+        monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: stored)
+
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            resolved = KiroCrewConfig.load()
+
+        assert resolved.monitoring.max_runtime_secs == 604_800
+        assert any("'thirty days'" in r.getMessage() for r in caplog.records)
+
+
 class TestTheOperatorFacingClaimsSurviveMeasurement:
     """Three sentences an operator acts on, measured against the code.
 
@@ -297,7 +357,7 @@ class TestTheOperatorFacingClaimsSurviveMeasurement:
         """
         overclaims = ("blocks monitor_start", "disables monitor_start", "requires monitor_watch")
         sites = {
-            "src/kiro_crew/config/sections.py (schema help)": self._entry().help,
+            "src/kiro_crew/config/service_sections.py (schema help)": self._entry().help,
             "config-baseline.json": _baseline_help(_KEY),
             str(_SPEC): _spec_paragraph_about("prefer_structured_arming"),
         }
@@ -396,7 +456,7 @@ class TestTheSettingsPromiseHasWiringBehindIt:
     repository already asserts this for the same reason -- see
     ``test_agent_backend_editable.py`` ("must be PATCH-able or the switch cannot
     save"), and the membership pins in ``test_computer_use_api.py`` and
-    ``test_trusted_apps_api.py``.
+    ``test_trusted_apps_api_withdrawal.py``.
     """
 
     def test_the_key_is_patchable_from_settings(self) -> None:
@@ -409,18 +469,20 @@ class TestTheSettingsPromiseHasWiringBehindIt:
         assert _EDITABLE_CONFIG[_KEY]["type"] == "bool"
 
 
-class TestNothingReadsConfigOnTheGatewayLoop:
-    """The descriptor build must not charge a config read to the event loop.
+class TestNothingReadsConfigOnTheNamesOnlyPath:
+    """The names-only descriptor read must not perform a config read.
 
-    A running loop means the caller is
-    ``mcp_discovery._managed_tools_in_process``, reaching ``_list_tools()`` from
-    ``async def probe_server``. That caller keeps only tool NAMES and discards
-    every description, so the preference cannot be observed there and reading it
-    would buy nothing for the cost. ``mcp_tools/spawn.py::_agent_roster_hint``
-    applies the identical rule for the identical caller.
+    ``mcp_discovery._managed_tools_in_process`` keeps only tool NAMES and reads
+    them through ``schemas(names_only=True)``. The structured-arming preference
+    and the monitor runtime ceiling only shape descriptions a names-only caller
+    discards, so neither is read on that path — and because the path never
+    reaches them, neither needs a ``get_running_loop`` skip of its own. The full
+    descriptor build (what the stdio server serves a model) still reads them.
     """
 
-    def test_a_running_loop_skips_the_read_entirely(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_the_names_only_build_skips_the_config_read_entirely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         loads: list[int] = []
 
         def _counted(cls: type) -> KiroCrewConfig:
@@ -429,44 +491,36 @@ class TestNothingReadsConfigOnTheGatewayLoop:
 
         monkeypatch.setattr(control.KiroCrewConfig, "load", classmethod(_counted))
 
-        async def _on_loop() -> tuple[bool, str]:
-            start = next(
-                item["description"] for item in control.schemas() if item["name"] == "monitor_start"
-            )
-            return control._prefers_structured_arming(), start
-
-        preferred, start = asyncio.run(_on_loop())
-
-        assert preferred is False
-        assert _CONDITIONAL_MARK in start
-        assert loads == [], (
-            "the descriptor build read config while an event loop was running; on "
-            "that path the caller discards every description, so the read is pure "
-            "cost on the gateway's loop"
+        start = next(
+            item["description"]
+            for item in control.schemas(names_only=True)
+            if item["name"] == "monitor_start"
         )
 
-    def test_the_same_call_off_loop_does_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The serving process has no loop, so the preference is not dead.
+        assert _CONDITIONAL_MARK in start
+        assert loads == [], (
+            "the names-only descriptor build read config; on that path the caller "
+            "discards every description, so the read is pure cost on the gateway's "
+            "loop — which is why the former running-loop skip was removed in favour "
+            "of not reaching the read at all"
+        )
 
-        ``mcp_shared.run_mcp_stdio_loop`` is a plain select/readline loop that
-        never imports asyncio, so this is the branch that reaches a model.
-        """
+    def test_the_full_build_still_reads(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The full descriptor path (the stdio server serving a model) is not dead:
+        it still reads the preference."""
         _pin(monkeypatch, on=True)
 
         assert control._prefers_structured_arming() is True
         assert _BY_DEFAULT_MARK in _descriptions()[0]
 
-    def test_the_serving_loop_module_never_imports_asyncio(self) -> None:
-        """Pins the premise the branch above rests on, in the module itself."""
-        import kiro_crew.mcp_shared as mcp_shared
-
-        source = Path(mcp_shared.__file__).read_text(encoding="utf-8")
-
-        assert "import asyncio" not in source, (
-            "mcp_shared now imports asyncio; if the stdio serving loop ever runs "
-            "one, the on-loop skip above would silence the preference on the path "
-            "that actually reaches a model"
-        )
+    def test_the_names_only_build_matches_the_full_build_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Faithful substitute: same tool names, same order."""
+        _pin(monkeypatch, on=True)
+        full = [item["name"] for item in control.schemas()]
+        names_only = [item["name"] for item in control.schemas(names_only=True)]
+        assert full == names_only
 
 
 def _spec_paragraph_about(needle: str) -> str:

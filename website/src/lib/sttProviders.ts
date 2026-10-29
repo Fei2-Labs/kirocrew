@@ -63,6 +63,8 @@ export const PROVIDER_LABEL_KEY: Record<string, string> = {
   local: 'pages.settings.sttSettings.provider_local',
   apple: 'pages.settings.sttSettings.provider_apple',
   transcribe: 'pages.settings.sttSettings.provider_transcribe',
+  // No recogniser; also where the backend lands an unknown stored provider.
+  off: 'pages.settings.sttSettings.provider_off',
 }
 
 /** Localised dropdown label for a provider id, falling back to the raw id. */
@@ -87,13 +89,34 @@ export function providerLabel(provider: string): string {
  */
 export const UNAVAILABLE_CODE_KEY: Record<string, string> = {
   stt_disabled: 'pages.settings.sttSettings.unavailable_disabled',
+  stt_provider_off: 'pages.settings.sttSettings.unavailable_provider_off',
   stt_extra_missing: 'pages.settings.sttSettings.unavailable_extra_missing',
   stt_no_wheel_for_platform: 'pages.settings.sttSettings.unavailable_no_wheel',
   stt_import_failed: 'pages.settings.sttSettings.unavailable_import_failed',
+  stt_unsupported_cpu: 'pages.settings.sttSettings.unavailable_unsupported_cpu',
+  stt_load_crashed: 'pages.settings.sttSettings.unavailable_load_crashed',
+  stt_native_probe_crashed: 'pages.settings.sttSettings.unavailable_native_probe_crashed',
   stt_model_missing: 'pages.settings.sttSettings.unavailable_model_missing',
   stt_apple_unsupported: 'pages.settings.sttSettings.unavailable_apple_unsupported',
   stt_apple_needs_toolchain: 'pages.settings.sttSettings.unavailable_apple_needs_toolchain',
 }
+
+/**
+ * Refusals where the recogniser IS installed but could not be, or would not be, loaded.
+ * The Status badge shows "not working" for these, not "not installed".
+ */
+/**
+ * A registered provider's own check said it cannot run now. Nothing is missing
+ * from the host, so the Status badge says "unavailable", not "not installed".
+ */
+export const CODE_PROVIDER_UNAVAILABLE = 'stt_provider_unavailable'
+
+export const INSTALLED_BUT_REFUSED_CODES: ReadonlySet<string> = new Set([
+  'stt_import_failed',
+  'stt_unsupported_cpu',
+  'stt_load_crashed',
+  'stt_native_probe_crashed',
+])
 
 /**
  * Localised explanation for an availability refusal.
@@ -109,6 +132,43 @@ export function unavailableMessage(code: string, detail = ''): string {
 }
 
 /**
+ * Per-code reason for a surface — the chat mic modal — that can only offer an
+ * "Open settings" button, never a provider menu, an enable toggle or a download
+ * control.
+ *
+ * The availability catalog is written for Settings → Voice and several of its
+ * sentences point "above"/"below" at a control that lives only there:
+ * `stt_disabled` ("Switch it on above"), `stt_provider_off` ("Pick another
+ * provider from the Provider menu below"), `stt_unsupported_cpu` /
+ * `stt_load_crashed` / `stt_native_probe_crashed` ("pick another provider or
+ * Off from the Provider menu below") and `stt_model_missing` ("Download it
+ * below"). Pointing the modal user
+ * at a control that is not on screen is the dead end this surface removes, so:
+ *
+ *   - a code whose sentence is self-contained (extra missing, no wheel, import
+ *     failed, the Apple codes) renders that sentence unchanged;
+ *   - `stt_model_missing` gets a modal-specific sentence — its generic fallback
+ *     would wrongly say "provider isn't installed" when only the model is absent —
+ *     naming the real cause and pointing at the modal's own Open settings button;
+ *   - everything else returns '' so the caller shows its generic, button-backed
+ *     fallback rather than a "below" the modal does not have.
+ */
+const MODAL_SAFE_UNAVAILABLE_CODES = new Set([
+  'stt_extra_missing',
+  'stt_no_wheel_for_platform',
+  'stt_import_failed',
+  'stt_apple_unsupported',
+  'stt_apple_needs_toolchain',
+])
+
+export function modalUnavailableMessage(code: string): string {
+  if (code === 'stt_model_missing') {
+    return i18nT('components.voiceDisabledModal.model_not_downloaded_open_settings')
+  }
+  return MODAL_SAFE_UNAVAILABLE_CODES.has(code) ? unavailableMessage(code) : ''
+}
+
+/**
  * Catalog KEY for each machine-readable reason a live dictation STREAM failed.
  *
  * The `error` frame's `code` is the contract and its `message` is advisory English,
@@ -117,6 +177,12 @@ export function unavailableMessage(code: string, detail = ''): string {
  * reaches the socket too and needs different words there: the settings panel's
  * version says "Download it below", and below the composer there is no "below".
  *
+ * `stt_consent_required` is the AWS consent gate refusing a Transcribe stream, with
+ * the gateway's refusal reason as its advisory English `message`. It is re-checked
+ * live on every stream, so an expired credential on an already-confirmed profile
+ * lands here too, not only a first use — which is why the notice points to the
+ * settings page rather than describing a one-time confirmation.
+ *
  * Keys, not resolved strings, for the same reason as `PROVIDER_LABEL_KEY` — the
  * table is evaluated at module load, so an `i18nT()` here would freeze the boot
  * language.
@@ -124,8 +190,44 @@ export function unavailableMessage(code: string, detail = ''): string {
 export const STREAM_ERROR_CODE_KEY: Record<string, string> = {
   stt_decode_failed: 'lib.sttProviders.stream_error_decode_failed',
   stt_session_failed: 'lib.sttProviders.stream_error_session_failed',
+  stt_aws_access_denied: 'lib.sttProviders.stream_error_aws_access_denied',
   stt_max_duration_exceeded: 'lib.sttProviders.stream_error_max_duration',
   stt_model_missing: 'lib.sttProviders.stream_error_model_missing',
+  stt_consent_required: 'lib.sttProviders.stream_error_consent_required',
+  // Amazon Transcribe refused the chosen custom vocabulary. Retrying cannot help,
+  // so the sentence names the setting that can.
+  stt_transcribe_vocabulary_rejected: 'lib.sttProviders.stream_error_vocabulary_rejected',
+  // Mixed languages are picked but the gateway's amazon-transcribe package predates
+  // the parameters they need. Upgrading it, or picking one language, is the fix.
+  stt_transcribe_sdk_outdated: 'lib.sttProviders.stream_error_sdk_outdated',
+}
+
+/**
+ * The language part of a locale code: `vi` for `vi-VN`, `ckb` for `ckb-IQ`.
+ *
+ * Amazon Transcribe identifies at most one dialect per language in a stream, so
+ * this is the identity the mixed-language picker keeps unique.
+ */
+export function localeLanguage(code: string): string {
+  return code.split('-', 1)[0]
+}
+
+/**
+ * The mixed-language candidates after one option is ticked or unticked.
+ *
+ * Ticking a second dialect of a language replaces the first rather than joining
+ * it, because a stream may carry only one dialect per language (`en-US` beside
+ * `en-GB` fails it). The order is the order of ticking, which is also the order
+ * the backend stores and sends.
+ */
+export function nextTranscribeLanguages(
+  current: readonly string[],
+  code: string,
+  selected: boolean,
+): string[] {
+  const others = current.filter(c => c !== code)
+  if (!selected) return others
+  return [...others.filter(c => localeLanguage(c) !== localeLanguage(code)), code]
 }
 
 /**
@@ -201,15 +303,32 @@ export function downloadRatio(download: { done: number; total: number }): number
 }
 
 /**
- * Localised "downloading the speech model, N% (x of y)" line.
+ * What the recogniser is doing while a session waits for it.
+ *
+ * Two stages reach the user, and they need different sentences: a weight transfer
+ * has bytes to report, and loading those weights into memory has none. The stage
+ * is carried explicitly because a zero `total` cannot tell them apart — an
+ * announced transfer whose size is not known yet also reads as zero.
+ */
+export interface SttModelProgress {
+  done: number
+  total: number
+  /** Omitted means a byte transfer, which is what the settings panel polls. */
+  stage?: 'downloading' | 'preparing'
+}
+
+/**
+ * Localised line for the model a session is waiting on: "downloading, N% (x of
+ * y)" while the weights arrive, "loading" while they are read into memory.
  *
  * Here rather than in either surface that shows it: the recording chrome and the
- * settings panel both report the SAME transfer, and two keys for one event is how
+ * settings panel both report the SAME work, and two keys for one event is how
  * they end up describing it differently in ten languages. Absolute bytes as well
  * as a percentage, because a percentage alone hides how much is left on a slow
  * link, and this transfer runs from 78 MB to 1.6 GB.
  */
-export function downloadLabel(download: { done: number; total: number }): string {
+export function downloadLabel(download: SttModelProgress): string {
+  if (download.stage === 'preparing') return i18nT('lib.sttProviders.loading_speech_model')
   return i18nT('lib.sttProviders.downloading_speech_model', {
     done: fmtBytes(download.done),
     total: fmtBytes(download.total),

@@ -19,16 +19,14 @@ merge into an existing project settings file while session cleanup currently
 removes the whole file. Codex remains withheld because `mode=read-only` blocks
 writes but does not permission-route passive reads, while the standard sandbox
 leaves credential homes readable. The withheld goose path uses `approve` rather than its default
-`auto` (auto-approve);
-after `session/new` Crew pins `approve` (ask before every tool call) and
-refuses if that pin fails. Goose's harness-owned Auto mode has no dashboard
-surface and its mode-change endpoint refuses it: Auto suppresses permission RPCs,
-so it cannot yet inherit Kiro Crew's governance clamp or expiring safety override. pi
+`auto` (auto-approve); Crew seeds `GOOSE_MODE=approve` on the session
+environment and refuses if the session response does not report that mode. Auto
+suppresses permission RPCs, so it cannot inherit Kiro Crew's governance clamp. pi
 sends `session/request_permission` for privileged tools. OpenCode is seeded
 with project `permission: "ask"` in the session
 `work_dir` (never `~/.config/opencode`); an explicit `allow` is left alone and
-the session refuses unless the ungated-tools opt-out is on. All three start
-without that opt-out when ROUTED. Kiro Crew does not implement `fs/*` or
+the session refuses if that setting cannot be established. All three start
+only after the gate route is established. Kiro Crew does not implement `fs/*` or
 `terminal/*`. Pi may accept Crew MCP on `session/new` without forwarding it to
 the pi agent; those tools can stay inert. Doctor reports that as a capability
 note, not an install failure. Do not treat spawn or Crew tools as verified on
@@ -64,14 +62,14 @@ withheld.
 Each one clears the governability bar differently, which is why it is established
 per adapter rather than assumed:
 
-- **goose** asks per privileged tool only after Crew pins session mode
-  `approve`. Its default `auto` auto-approves tools, so Crew neither advertises
-  nor accepts that mode from the approval picker. **pi** asks via
+- **goose** asks per privileged tool after Crew seeds `GOOSE_MODE=approve` and
+  verifies the resolved session mode. Its default `auto` auto-approves tools,
+  so Crew does not select it. **pi** asks via
   `session/request_permission`.
   **OpenCode** is seeded with `permission: "ask"` in the session work_dir
   so those permission frames actually fire (its own default is permissive).
   File I/O stays in the adapter because Kiro Crew does not advertise `fs/*`.
-  That is enough to start without the opt-out.
+  That is enough to start when the setting is verified.
   Crew MCP is delivered to OpenCode and pi when ROUTED; on pi the adapter may
   leave those servers inert until it forwards MCP. Goose establishes its
   `approve` route only after the session exists, so Crew withholds memory, cron,
@@ -120,10 +118,9 @@ that case. Registry metadata remains visible for discovery but never expands the
 initial selection set. `pi` is hand-described and routed; do not treat the
 registry spelling `pi-acp` as a second unverified path.
 
-You can override that with `agent.acp_backend_allow_ungated_tools`, which is the
-single named opt-out. It is off by default and should stay off: with it on, the
-adapter can run commands Kiro Crew never checked, and every session logs which
-controls are not being enforced.
+There is no local opt-out. If Kiro Crew cannot establish that an adapter routes
+tool calls through its permission gate, that adapter refuses to start. Verify the
+adapter's routing before selecting it.
 
 **Kiro Crew stores no credential for any backend, and does not participate in
 sign-in at all.** Each vendor CLI owns its own login and token file. Kiro Crew
@@ -263,8 +260,5 @@ missing token file
 does not mean the adapter cannot authenticate, so it is reported without failing
 the check.
 
-There is one setting that turns the tool-gate refusal off,
-`agent.acp_backend_allow_ungated_tools`. It is off by default and should stay off:
-with it on, an adapter can run commands Kiro Crew never checked. Doctor reports it
-as a problem whenever it is enabled, including when nothing is currently being
-bypassed, because it disarms the refusal for future sessions too.
+There is no local setting that turns the tool-gate refusal off. An adapter whose
+tool calls cannot be shown to reach Kiro Crew's permission gate refuses to start.

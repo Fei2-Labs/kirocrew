@@ -71,6 +71,13 @@ def save(path, payload):
     os.replace(tmp, path)
     os.chmod(path, 0o600)
 """,
+    "temp write, retried publish, then chmod the published path": """
+def save(path, payload):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    replace_with_retry(tmp, path)
+    os.chmod(path, 0o600)
+""",
     "open(file=...) keyword path, then chmod the published path": """
 def persist(final, secret):
     with open(file=final, mode="w", encoding="utf-8") as handle:
@@ -269,6 +276,13 @@ def save(path, payload):
     tmp.write_text(payload, encoding="utf-8")
     platform_compat.restrict_to_owner(tmp)
     os.replace(tmp, path)
+""",
+    "restrict the temp, then replace_with_retry it into place": """
+def save(path, payload):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    platform_compat.restrict_to_owner(tmp)
+    atomic_write.replace_with_retry(tmp, path)
 """,
     "restrict the temp, then Path.rename it into place (#5317 shape)": """
 def snapshot(outfile, stage):
@@ -588,19 +602,20 @@ class TestTheRealTree:
         `scan_path` results over the same `src/kiro_crew` tree; walking and
         re-parsing every file twice per test is what made this class slow.
 
-        Narrowed through ``source_corpus.candidate_sources`` rather than a bare
+        Narrowed through ``source_corpus.iter_candidate_sources`` rather than a bare
         `rglob` + re-read + re-parse of every module: `_lockdown_target` can only
         report a violation from a call to one of the lockdown primitives
         (`restrict_to_owner` / `chmod_safe` / `chmod` / `fchmod_safe` / `fchmod`),
         so a file whose text contains none of those names cannot possibly match
-        and is never a false negative to skip. `candidate_sources` shares the
-        one-time corpus read (and its NFKC-normalised copy) with every other
-        ratchet in the suite instead of re-reading `src/` from disk here.
+        and is never a false negative to skip. Streamed, because the ~145
+        candidates are the largest files in the tree (~13 M characters, stored at
+        four bytes each once a file holds an emoji) and a tuple of their texts
+        was ~50 MiB live for nothing.
         """
-        from source_corpus import candidate_sources  # noqa: PLC0415
+        from source_corpus import iter_candidate_sources  # noqa: PLC0415
 
         found: list[tuple[str, int, str, str]] = []
-        for path, text in candidate_sources(
+        for path, text in iter_candidate_sources(
             require_any=("restrict_to_owner", "chmod_safe", "chmod", "fchmod_safe", "fchmod")
         ):
             # Same relative-to convention as `scan_path` (relative to REPO_ROOT,

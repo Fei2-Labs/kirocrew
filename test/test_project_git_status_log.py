@@ -1350,6 +1350,30 @@ class TestGitStatus:
         # Should have additions (2 new lines) and deletions (original line changed)
         assert "additions" in a or "deletions" in a
 
+    @pytest.mark.asyncio
+    async def test_repo_root_uses_the_path_aware_redactor(self, repo, mock_sel):
+        """``repoRoot`` is an absolute path, so it takes the same wrapper
+        ``/api/project/git`` uses rather than the bare credential detector.
+
+        Without this the two endpoints disagree: a macOS temp project root
+        survives on one and comes back ``[REDACTED: credential]`` on the other.
+        """
+        with patch(
+            "kiro_crew.dashboard.handlers.files._redact_project_path",
+            side_effect=lambda p: f"[{p}]",
+        ) as wrapper:
+            async with TestClient(TestServer(_make_app(str(repo)))) as client:
+                resp = await client.get(f"/api/project/git/status?path={repo}")
+                data = await resp.json()
+        # git reports the toplevel with forward slashes on Windows, so compare
+        # normalised paths rather than pinning a separator.
+        assert wrapper.call_count == 1
+        passed = wrapper.call_args.args[0]
+        assert os.path.normcase(os.path.normpath(passed)) == os.path.normcase(
+            os.path.realpath(str(repo))
+        )
+        assert data["repoRoot"] == f"[{passed}]"
+
 
 # ── /api/project/git/log tests ──
 
@@ -2108,3 +2132,60 @@ class TestListingCap:
         assert resp.status == 200
         assert data["files"] == []
         assert "truncated" not in data
+
+
+class TestConfigDefinedHooks:
+    """A ``hook.<name>.command`` in the repo's config (git 2.54+) is not reached by
+    ``core.hooksPath``; ``status`` would run ``post-index-change`` on every poll."""
+
+    @staticmethod
+    def _plant(repo: Path, marker: Path) -> None:
+        _git(repo, "config", "hook.pwn.event", "post-index-change")
+        _git(repo, "config", "hook.pwn.command", f"echo pwn >> '{marker}' #")
+
+    @staticmethod
+    def _spy(monkeypatch) -> list[list[str]]:
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        seen: list[list[str]] = []
+        inner = files_mod.sandboxed_spawn_argv
+
+        def spy(argv, *a, **kw):
+            seen.append(list(argv))
+            return inner(argv, *a, **kw)
+
+        monkeypatch.setattr(files_mod, "sandboxed_spawn_argv", spy)
+        return seen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route, verb", [("status", "status"), ("log", "log")])
+    async def test_every_git_call_disables_the_hook(
+        self, repo, tmp_path, mock_sel, monkeypatch, route, verb
+    ):
+        marker = tmp_path / "marker"
+        self._plant(repo, marker)
+        (repo / "a.txt").write_text("changed\n")
+        seen = self._spy(monkeypatch)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/{route}?path={repo}")
+        assert resp.status == 200
+        runs = [a for a in seen if verb in a]
+        assert runs, seen
+        for argv in runs:
+            assert "hook.pwn.enabled=false" in argv, argv
+            assert argv.index("hook.pwn.enabled=false") < argv.index(verb)
+        assert not marker.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["status", "log"])
+    async def test_scan_failure_is_unavailable(self, repo, mock_sel, monkeypatch, route):
+        from kiro_crew.dashboard.handlers import files as files_mod
+        from kiro_crew.git_config_hooks import ConfigHookScanError
+
+        def refuse(*a, **k):
+            raise ConfigHookScanError("refused")
+
+        monkeypatch.setattr(files_mod, "config_hook_disable_args_sandboxed", refuse)
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/{route}?path={repo}")
+        assert resp.status == 503

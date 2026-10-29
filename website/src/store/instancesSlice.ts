@@ -36,6 +36,24 @@ export interface HostTab {
   /** Live tunnel state driving the per-tab dot: connected|connecting|error|disconnected. */
   state?: string
   unread: number
+  /** How many crews this one is reached THROUGH (0 = directly). The parent works
+   *  the tree out from its own registry, which a pane cannot see, so the shape is
+   *  relayed rather than re-derived. Absent from an older parent's model, which the
+   *  bar renders as the flat list it always was. */
+  depth?: number
+  /** False when an ancestor's hop is down, so this crew greys out with it. */
+  reachable?: boolean
+  /** `parent \u203a child` for the flat chip surfaces; absent at depth 0. */
+  pathName?: string
+  /** The path's PARENT segment alone, so a chip can squeeze that half and keep the
+   *  crew's own name whole. Absent at depth 0, and absent from an older parent's
+   *  model, which falls back to the joined string. */
+  pathParent?: string
+  /** The nearest ANCESTOR that is actually down, so an unreachable row states the
+   *  real cause instead of its immediate hop -- at depth 2 that hop is typically
+   *  connected and merely unreachable itself, so naming it would be false. Absent
+   *  when the chain is healthy, and absent from an older parent's model. */
+  brokenAt?: string
 }
 
 /** The embedded pane's OWN tunnel status, used by its readout capsule (item 1). */
@@ -59,6 +77,14 @@ export interface HostModel {
    *  embedded header must inset its RIGHT side clear of the native caption
    *  buttons (the transparent titleBarOverlay's min/max/close cluster). */
   winInset: boolean
+  /** The host window's live, zoom-aware caption reserve (e.g. `178px`), read
+   *  from the `--mc-win-caption-reserve` the main process sets on the HOST
+   *  <html>. The pane is a separate document, so it never inherits that value,
+   *  yet it is painted at the host's page zoom: without it the pane header keeps
+   *  the static 142px default, which paints narrower than the caption buttons
+   *  below 100% zoom. Absent when the host has none to relay (an older host, a
+   *  non-Windows host, or before the main process has pushed it). */
+  winCaptionReserve?: string
   /** The parent window's focus mode, relayed so the pane hides its own chrome to
    *  match instead of landing fully-framed inside a focused window. `null` means
    *  the host SENT NO OPINION — an older host whose model predates the field —
@@ -123,7 +149,37 @@ interface CrewFormState {
    * write back a field the user never touched.
    */
   edit: { id: string; draft: InstanceDraft; seq: number } | null
+  /**
+   * What the set-up tab's launch form holds that a launch has not used yet: the
+   * optional subnet, and the Kiro sign-in choice once the reader has made one.
+   * `null` when it holds neither. Same reasoning as above: kept in memory so it
+   * outlives the hand-off, and dies with the tab. Optional because tests
+   * preload partial slices.
+   */
+  launch?: CrewLaunchDraft | null
 }
+
+/** The launch form's sign-in choice: Builder ID, or an Identity Center portal. */
+export interface CrewLaunchIdentity {
+  mode: 'builder_id' | 'identity_center'
+  start_url: string
+  region: string
+}
+
+export interface CrewLaunchDraft {
+  subnet_id: string
+  /** `null` until the reader picks one: the inherited preselection is not kept. */
+  identity: CrewLaunchIdentity | null
+}
+
+const sameLaunchDraft = (a: CrewLaunchDraft | null, b: CrewLaunchDraft | null): boolean =>
+  a === b
+  || (!!a && !!b && a.subnet_id === b.subnet_id
+    && (a.identity === b.identity
+      || (!!a.identity && !!b.identity
+        && a.identity.mode === b.identity.mode
+        && a.identity.start_url === b.identity.start_url
+        && a.identity.region === b.identity.region)))
 
 interface InstancesState {
   warm: Record<string, WarmConn>
@@ -152,9 +208,23 @@ const instancesSlice = createSlice({
   name: 'instances',
   initialState,
   reducers: {
-    setWarm(state, action: PayloadAction<{ id: string; conn: WarmConn }>) {
-      const { id, conn } = action.payload
+    setWarm(
+      state,
+      action: PayloadAction<{ id: string; conn: WarmConn; keepTokenIfPortUnchanged?: boolean }>,
+    ) {
+      const { id, keepTokenIfPortUnchanged } = action.payload
       const prev = state.warm[id]
+      // A connect warm-writer (`connectInstanceInto`) re-mints a token on every
+      // call, so two warm paths firing on load — auto-connect and auto-warm —
+      // each hand back a different token for the SAME already-up port. The token
+      // is part of the iframe src, so writing the second one reloads a pane that
+      // is still loading. The predecessor token is not revoked by a later mint,
+      // so the one already on screen stays valid: when the port is unchanged and
+      // a token is mounted, keep it. The explicit remint path (`refreshToken`)
+      // and a port change (tunnel rebuild) both leave this flag off and swap the
+      // token as before.
+      const keepToken = !!keepTokenIfPortUnchanged && !!prev && prev.port === action.payload.conn.port && !!prev.token
+      const conn: WarmConn = keepToken ? { ...action.payload.conn, token: prev.token } : action.payload.conn
       // A new port/token changes the iframe src (srcFor), which reloads the
       // pane — its previous readiness no longer describes what's on screen.
       // Tests preload partial slices, so tolerate a missing `ready` map.
@@ -222,6 +292,21 @@ const instancesSlice = createSlice({
       if (!state.crewForms) state.crewForms = { add: null, edit: null }
       state.crewForms.edit = action.payload
     },
+    /** Hold (or drop, with `null`) the launch form's unlaunched entries. Written
+     *  on every change, like the add form. */
+    setCrewLaunchDraft(state, action: PayloadAction<CrewLaunchDraft | null>) {
+      if (!state.crewForms) state.crewForms = { add: null, edit: null }
+      state.crewForms.launch = action.payload
+    },
+    /**
+     * A launch has used the draft it was sent with. Dropped only if the held
+     * draft is still that one: an edit typed while the launch request was in
+     * flight is a new draft, and stays.
+     */
+    dropLaunchedCrewDraft(state, action: PayloadAction<CrewLaunchDraft | null>) {
+      if (!state.crewForms) return
+      if (sameLaunchDraft(state.crewForms.launch ?? null, action.payload)) state.crewForms.launch = null
+    },
     clearInstances() {
       return initialState
     },
@@ -238,6 +323,8 @@ export const {
   setHostModel,
   setCrewAddForm,
   setCrewEditForm,
+  setCrewLaunchDraft,
+  dropLaunchedCrewDraft,
   clearInstances,
 } = instancesSlice.actions
 export default instancesSlice.reducer

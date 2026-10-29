@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.config import loader as L
 from kiro_crew.config.loader import KiroCrewConfig
@@ -83,6 +84,8 @@ def test_every_unguarded_str_field_is_in_the_masked_set():
 
     shape_guarded = {
         "reasoning_effort",  # coerce_effort: unknown level collapses to ""
+        "worker_reasoning_effort",  # coerce_effort, same guard as reasoning_effort
+        "approval_mode",  # coerce_member_approval_mode: one of three modes or ""
         "session_color",  # _safe_color: pinned to #rrggbb or ""
     }
     str_fields = {f.name for f in dataclasses.fields(KiroCrewAgentConfig) if f.type in ("str", str)}
@@ -266,6 +269,7 @@ class TestConfigEndpointWire:
         app = web.Application()
         app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
         app["state"] = SimpleNamespace(subagents=MagicMock(spec=["update_completion_keep"]))
+        as_owner(app)
         with patch("kiro_crew.config.loader.config_path", return_value=cfg_path):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.patch(

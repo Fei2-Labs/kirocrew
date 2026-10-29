@@ -111,7 +111,7 @@ async def test_v1_base_visible_matrix(env, monkeypatch, binding, vectors, mode):
     if name:
         # Internal recall resolves a named store from the session's recorded
         # execution, never from transcript metadata alone.
-        env.bind_session(session, name)
+        await env.bind_session_async(session, name)
     env.metadata[session] = {
         "memory_store": name or "default",
         "memory_mode": mode,
@@ -492,24 +492,6 @@ def test_activity_index_keeps_recent_names_when_projects_overflow(rig):
     assert len(index) <= 1800
     assert "Recenttaskquartz" in index
     assert index.endswith("[End of memory activity index]\n\n")
-
-
-@pytest.mark.asyncio
-async def test_ten_thousand_character_slack_thread_does_not_call_model(tmp_path, monkeypatch):
-    from kiro_crew import llm_helpers
-    from kiro_crew.history import ConversationLog
-
-    log = ConversationLog(base_dir=tmp_path / "logs")
-    log.append("slack:thread", "user", "Original task " + "x" * 5000)
-    log.append("slack:thread", "assistant", "Result " + "y" * 5000)
-    model = Mock(side_effect=AssertionError("unnecessary compression"))
-    monkeypatch.setattr(llm_helpers, "background_turn", model)
-    result = await ctx.compress_thread_history(
-        log, "slack:thread", "continue", Mock(), model_window=1_000_000
-    )
-    assert result is not None
-    assert "Original task" in result and "Result" in result
-    model.assert_not_called()
 
 
 def test_session_only_source_snippets_are_retained(rig):

@@ -70,6 +70,16 @@ test('desktop: reads the native factor on mount', async () => {
   expect(result.current.zoom).toBe(125)
 })
 
+test('desktop: setZoom sends the percent as a factor and shows the returned factor', async () => {
+  const api = installZoomAPI(1)
+  // Main clamps; the hook shows whatever factor main returns.
+  api.set.mockImplementationOnce(() => Promise.resolve(1.13))
+  const { result } = renderHook(() => useZoom())
+  await act(async () => { result.current.setZoom(115) })
+  expect(api.set).toHaveBeenCalledWith(1.15)
+  expect(result.current.zoom).toBe(113)
+})
+
 test('desktop: zoomIn/zoomOut step through the bridge and reflect the applied factor', async () => {
   const api = installZoomAPI(1)
   const { result } = renderHook(() => useZoom())
@@ -200,6 +210,16 @@ test('cycleFamily rotates sans → mono → system → opendyslexic → sans', (
   expect(result.current.family).toBe('system')
   act(() => result.current.cycleFamily())
   expect(result.current.family).toBe('opendyslexic')
+  act(() => result.current.cycleFamily())
+  expect(result.current.family).toBe('sans')
+})
+
+test('cycleFamily excludes custom: cycling from custom exits to sans', () => {
+  const { result } = renderHook(() => useZoom())
+  act(() => result.current.setFontFamily('custom'))
+  expect(result.current.family).toBe('custom')
+  // 'custom' is not a cycle stop (it needs the picker), so the keyboard cycle
+  // falls through to the first preset rather than dead-ending on a Sans look-alike.
   act(() => result.current.cycleFamily())
   expect(result.current.family).toBe('sans')
 })

@@ -11,6 +11,13 @@ name: Build Desktop (reusable)
 #   - macOS universal (arm64 + x86_64): shipped (one desktop DMG)
 #   - Linux x64:    shipped (AppImage + deb + rpm)
 #   - Linux arm64:  shipped (AppImage + deb + rpm — Graviton, Raspberry Pi, ARM laptops)
+#   - macOS arm64-only / x86_64-only: shipped, opt-in (`mac_single_arch`).
+#     Two extra DMGs beside the universal one, each about half its size.
+#     nightly.yml and release.yml both turn it on. Each is signed, notarized
+#     and fed by its OWN sign-and-notarize.yml call (`mac_variant`), under
+#     feed/<channel>/<arch>/; the universal call excludes these two artifacts
+#     by name, so the universal DMG stays the only mac bytes it signs
+#     (`build-desktop-mac-single-arch` below).
 #
 # Linux is built NATIVELY per arch, never cross-compiled: build-desktop.sh
 # provisions a python-build-standalone interpreter and then RUNS it (pip
@@ -51,7 +58,44 @@ on:
         required: false
         default: false
         type: boolean
-  # Manual build-only probe: builds every platform's artifacts from any ref
+      mac_single_arch:
+        description: >-
+          Also build the two single-arch macOS DMGs (arm64-only and
+          x86_64-only), unsigned-build-darwin-arm64 / -x64. nightly.yml and
+          release.yml both pass true and sign, publish and feed each with its
+          own sign-and-notarize.yml call (see the platform matrix note at the
+          top). Default false keeps a bare probe cheap.
+        required: false
+        default: false
+        type: boolean
+      soft_fail_mac_single_arch:
+        description: >-
+          Mark the single-arch macOS build job continue-on-error, so a failed
+          arm64-only or x86_64-only build no longer fails this workflow's
+          caller job and skips the universal signing and every Linux publisher
+          with it. nightly.yml passes true: its single-arch legs are
+          best-effort and it records no cross-arch completeness claim.
+          Default false, which is what release.yml keeps: there both
+          single-arch DMGs are REQUIRED promotion-bundle roles
+          (scripts/release_promotion.py), so a failed single-arch build must
+          fail the aggregate BEFORE any publisher writes a versioned key --
+          otherwise the version is burned on a release that can never
+          complete.
+        required: false
+        default: false
+        type: boolean
+      ui_index_strict:
+        description: >-
+          Fail the frontend build when the committed find_ui index
+          (src/kiro_crew/docs/ui-index.generated.json, guidePlans.gen.ts) is
+          stale, instead of warning. Sets KC_UI_INDEX_STRICT=1 for
+          `npm run build`. release.yml passes true so a stale release branch
+          fails before any lane publishes; nightly.yml leaves it false, so a
+          main that merged past a regen still ships a nightly.
+        required: false
+        default: false
+        type: boolean
+  # Manual build-only probe: builds every macOS and Linux artifact from any ref
   # WITHOUT publishing anything (no callers, no S3, no feeds). Used to
   # validate packaging changes (e.g. a new platform lane) before merge.
   workflow_dispatch:
@@ -81,9 +125,46 @@ on:
         required: false
         default: false
         type: boolean
+      mac_single_arch:
+        description: >-
+          Also build the two single-arch macOS DMGs (arm64-only and
+          x86_64-only). A manual probe only builds them; nightly.yml and
+          release.yml also sign, publish and feed them per arch.
+          Declared on BOTH triggers for the same reason as soft_fail_arm64:
+          the job-level `if` below reads it on both paths.
+        required: false
+        default: false
+        type: boolean
+      soft_fail_mac_single_arch:
+        description: >-
+          Mark the single-arch macOS build job continue-on-error (default
+          false: a probe SHOULD fail loudly). Declared on BOTH triggers for the
+          same reason as soft_fail_arm64: the job-level continue-on-error
+          expression below reads it on both paths, and an undeclared input
+          makes that key non-boolean, which rejects the whole workflow at
+          startup.
+        required: false
+        default: false
+        type: boolean
+      ui_index_strict:
+        description: >-
+          Fail the frontend build when the committed find_ui index
+          (src/kiro_crew/docs/ui-index.generated.json, guidePlans.gen.ts) is
+          stale, instead of warning. Sets KC_UI_INDEX_STRICT=1 for
+          `npm run build`. release.yml passes true so a stale release branch
+          fails before any lane publishes; nightly.yml leaves it false, so a
+          main that merged past a regen still ships a nightly.
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
+
+# Read by website/scripts/gen-ui-index.mjs inside `npm run build` (here and in
+# packaging/build-desktop.sh): empty warns on a stale find_ui index, 1 fails.
+env:
+  KC_UI_INDEX_STRICT: ${{ inputs.ui_index_strict && '1' || '' }}
 
 jobs:
   build-desktop:
@@ -113,6 +194,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
+      max-parallel: 4
       fail-fast: false
       matrix:
         include:
@@ -224,6 +306,9 @@ jobs:
         # Makefile target, which only adds a local-dev node-bin-dir PATH
         # nicety that CI's setup-node already covers.
         shell: bash
+        # No bundled kiro-cli (BUNDLE_KIRO_CLI defaults to 0 in the script): the
+        # app detects the user's own install. packaging/kiro-cli-version is read
+        # only by a BUNDLE_KIRO_CLI=1 build.
         run: bash packaging/build-desktop.sh
         env:
           # Unsigned here by design: the signing service signs the .app downstream in
@@ -270,6 +355,146 @@ jobs:
             website/electron/dist/*.rpm
             website/electron/dist/symbols-manifest.json
           if-no-files-found: error
+          retention-days: 14
+
+  # The two single-arch macOS DMGs. Opt-in and build-only: see the platform
+  # matrix note at the top; nightly.yml and release.yml both turn it on.
+  #
+  # A SEPARATE job rather than two more rows in build-desktop's matrix: a
+  # matrix row cannot be switched off by an input (the include list is
+  # static), and rows whose every step is skipped would still show up as
+  # phantom green legs on every release run. The steps mirror build-desktop's
+  # one for one; the comments live there.
+  #
+  # Both legs run on the SAME arm64 runner image as the universal build. The
+  # x86_64 leg builds and gates its backend under Rosetta 2, exactly as the
+  # universal build's x86_64 half already does on that image, so there is no
+  # new host assumption here. TARGET_ARCH is read by build-desktop.sh (which
+  # arch to provision, `--x64`/`--arm64`, the lipo post-gate) and by
+  # emit-symbols-manifest.mjs (which arch's symbols to pin).
+  build-desktop-mac-single-arch:
+    name: Build Desktop (macos-15, ${{ matrix.target-arch }} only)
+    # `== true`: same load-bearing comparison as build-desktop's
+    # continue-on-error, for the same startup-rejection reason.
+    if: ${{ inputs.mac_single_arch == true }}
+    # Caller-scoped soft-fail. This job's result feeds the caller's aggregate
+    # `build-desktop` job, which the universal sign-and-notarize and every
+    # publish-linux job `needs`. On nightly (soft_fail_mac_single_arch: true)
+    # one arch's build must never hold the OTHER lanes: an x86_64-only leg
+    # failing (say, a dependency dropping its macOS Intel wheel) still lets
+    # the universal signing and every Linux publish run, and the failure is
+    # not lost -- the arch's own sign-and-notarize caller fails at
+    # download-artifact. On release.yml (default false) the OPPOSITE holds:
+    # both single-arch DMGs are REQUIRED promotion-bundle roles, and every
+    # publisher writes immutable versioned keys, so a failed single-arch
+    # build must fail the aggregate and skip every publisher before any key
+    # is written -- a soft-failed release would burn the version string on a
+    # release that can never complete. A probe reads the job's own steps.
+    continue-on-error: ${{ inputs.soft_fail_mac_single_arch == true }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      max-parallel: 4
+      fail-fast: false
+      matrix:
+        include:
+          - target-arch: arm64
+            # 'unsigned-' prefix, as on the universal artifact: not an
+            # installable deliverable. Distinct from the universal name so a
+            # future signing lane can address each by name.
+            artifact-name: unsigned-build-darwin-arm64
+          - target-arch: x86_64
+            artifact-name: unsigned-build-darwin-x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        # Exactly ONE setup-uv per job, cache off -- see build-desktop.
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false
+
+      - name: Stamp version
+        env:
+          STAMP_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          sed -i.bak "s/__version__ = \".*\"/__version__ = \"${STAMP_VERSION}\"/" src/kiro_crew/__init__.py
+          rm -f src/kiro_crew/__init__.py.bak
+          node -e "const fs=require('fs');const f='website/electron/package.json';const p=JSON.parse(fs.readFileSync(f));p.version=process.env.STAMP_VERSION;fs.writeFileSync(f,JSON.stringify(p,null,2)+'\n')"
+          echo "Building desktop: ${STAMP_VERSION}"
+
+      - name: Build desktop app (${{ matrix.target-arch }} only)
+        shell: bash
+        run: bash packaging/build-desktop.sh
+        env:
+          UNIVERSAL: "0"
+          TARGET_ARCH: ${{ matrix.target-arch }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Record symbols manifest
+        shell: bash
+        run: node scripts/emit-symbols-manifest.mjs
+        env:
+          UNIVERSAL: "0"
+          TARGET_ARCH: ${{ matrix.target-arch }}
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: |
+            website/electron/dist/*.dmg
+            website/electron/dist/*.zip
+            website/electron/dist/symbols-manifest.json
+          if-no-files-found: error
+          retention-days: 14
+
+  # Install the macOS DMG for real and launch the app it carries.
+  #
+  # Mount, copy the .app out, run the installed launcher, then start the REAL
+  # app from its executable and wait for the gateway its supervisor boots to
+  # answer /api/health. Unsigned build by design: signing is a later stage, and
+  # the launch exercises the binary, not Gatekeeper. See
+  # scripts/smoke-macos-install.sh.
+  smoke-install-macos:
+    name: Smoke-install macOS DMG (launch)
+    needs: build-desktop
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download macOS universal build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-build-darwin-universal
+          path: dist
+
+      - name: Install the DMG and launch the app
+        run: ./scripts/smoke-macos-install.sh dist
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-install-smoke-evidence
+          path: |
+            ${{ runner.temp }}/kirocrew-smoke-*/logs/*
+            ~/Library/Logs/*/gateway-launch.log
+          if-no-files-found: warn
           retention-days: 14
 
   # Install the Linux packages for real, in the distros they target.

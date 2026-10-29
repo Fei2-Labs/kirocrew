@@ -49,10 +49,12 @@ Every store read runs in ``asyncio.to_thread`` (SQLite on the request path is
 blocking I/O), and the list and detail routes serialize their rows THERE too:
 redacting a full page costs about as much as reading it, and the loop those
 requests land on is the one every session's turn shares. Auth is the
-dashboard's token middleware, like every sibling
-handler in this package -- there is no per-route check here, and the routes
-are NOT on the internal-path lists, so an MCP caller with only the internal
-secret is refused the same way it is for ``/api/sessions/health``.
+dashboard's token middleware, like every sibling handler in this package, and
+the routes are NOT on the internal-path lists, so an MCP caller with only the
+internal secret is refused the same way it is for ``/api/sessions/health``. The
+two action routes (``POST /api/tasks/{task_id}`` and ``.../cancel``) add the
+dashboard owner gate on top: they act on the owner's runs, and a non-owner
+dashboard session passes the middleware just as the owner's does.
 
 The lane spelling is ``taskq.lanes`` (RFC Q5): the row's stored ``lane``
 column when the accept path filed it, else derived -- cron and hook roots and
@@ -72,6 +74,8 @@ from aiohttp import web
 
 from kiro_crew import resource_status
 from kiro_crew.dashboard import session_health
+from kiro_crew.dashboard.handlers import spawn_resume
+from kiro_crew.dashboard.handlers._shared import require_owner_for_dashboard_caller
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.recovery.ladder import default_ladder
 from kiro_crew.security import redact_and_truncate
@@ -155,7 +159,7 @@ def _scrub_prose(text: str) -> str:
     what makes a row diagnosable after the process that failed is gone -- so
     the redaction belongs on the way OUT, on every surface that serves it.
     :func:`security.redact_and_truncate` is the composition the sibling
-    surfaces spell by hand (``subagent.py``'s ``_redact``, the pair in
+    surfaces spell by hand (``subagent_parts/run_output.py``'s ``_redact``, the pair in
     ``taskrunner._execute_tasks``): exfiltration URLs FIRST, then credentials.
     That order is load-bearing rather than incidental -- a URL whose query IS
     the credential is the shape the URL rewriter exists for, and it replaces
@@ -396,7 +400,13 @@ async def api_task_cancel(request: web.Request) -> web.Response:
     activity card. Only subagent rows have a live cancel adapter today; a
     workflow or TaskRunner row that the manager does not know answers 409 with
     the row's current state rather than pretending it stopped.
+
+    Owner-gated like ``POST /api/tasks/{task_id}``: a parked runner row ends here
+    through the same ``cancel_wait`` that route's ``cancel_wait`` action calls.
     """
+    owner_denied = await require_owner_for_dashboard_caller(request, "tasks.cancel")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     task_id = request.match_info["task_id"]
     store = _store_of(state)
@@ -532,7 +542,14 @@ async def api_task_action(request: web.Request) -> web.Response:
     read and the write is refused by the STORE and answers the same 409 the
     pre-check would have, from the state the row carries then -- never 200 for a
     cancel, or an answer, that did not happen.
+
+    Owner gate first, before the body is read: the answer is fed into the
+    owner's waiting run, and a non-owner dashboard session (a Telegram, Teams or
+    Webex allowlist link) holds the same empty app claim as the owner's own.
     """
+    owner_denied = await require_owner_for_dashboard_caller(request, "tasks.action")
+    if owner_denied is not None:
+        return owner_denied
     state: DashboardState = request.app["state"]
     task_id = request.match_info["task_id"]
     try:
@@ -653,13 +670,21 @@ def _refused_code(action: str, state: str) -> str:
 # ── summary ──────────────────────────────────────────────────────────────────
 
 
-def _lane_caps(health: dict[str, Any], adaptive: dict[str, Any] | None) -> dict[str, Any]:
+def _lane_caps(
+    health: dict[str, Any], adaptive: dict[str, Any] | None, *, gate_start: int | None = None
+) -> dict[str, Any]:
     """Effective cap vs the user's ceiling per lane.
 
     ``session_health`` publishes whatever cap sources registered (the subagent
     manager's live cap, the controller's when wired); the controller's own
     state carries the ceiling and the spawn-gate capacity. Merged by lane name
     so the panel renders one row per lane whatever the wiring on this build.
+
+    ``gate_start`` is the value a fresh process starts the spawn gate at
+    (``spawn_concurrency_initial``), published as the gate lane's ``start``. The
+    gate starts below its ceiling and grows, so the card counts it as lowered
+    only below ``start`` -- the same rule ``spawn_resume.throttle_view`` gives
+    the chat header's chip, read from the same live policy.
     """
     caps: dict[str, dict[str, Any]] = {}
     for lane, entry in (health.get("effective_caps") or {}).items():
@@ -677,6 +702,8 @@ def _lane_caps(health: dict[str, Any], adaptive: dict[str, Any] | None) -> dict[
                 "effective": adaptive.get("spawn_gate_capacity"),
                 "user_max": adaptive.get("gate_ceiling"),
             }
+    if gate_start is not None and "spawn_gate" in caps:
+        caps["spawn_gate"]["start"] = gate_start
     return caps
 
 
@@ -764,7 +791,7 @@ def _summary_sync(store: Any, snapshot: Any, monitor: Any) -> dict[str, Any]:
             "total": sum(by_state.values()),
         },
         "oldest_wait_secs": oldest,
-        "lanes": _lane_caps(health, adaptive),
+        "lanes": _lane_caps(health, adaptive, gate_start=spawn_resume._start_caps()[1]),
         "degrade_reason": _degrade_reason(health, adaptive),
         "adaptive": adaptive,
         "slots": slots,

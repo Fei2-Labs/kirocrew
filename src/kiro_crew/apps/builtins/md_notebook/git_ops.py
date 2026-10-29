@@ -17,6 +17,7 @@ persist it in ``.git/config`` and leak it into any error message that echoes
 the remote) and never passed as a command-line argument (which would expose it
 in the process table).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -31,6 +32,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Iterator, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.git_config_hooks import ConfigHookScanError, config_hook_disable_args
 from kiro_crew.git_worktree_scope import worktree_probe_failure_is_empty_scope
 
 logger = logging.getLogger(__name__)
@@ -122,6 +124,54 @@ GIT_NETWORK_TIMEOUT_SEC = int(os.environ.get("MDNB_GIT_NETWORK_TIMEOUT_SEC", 180
 
 class GitError(RuntimeError):
     """A git invocation failed. Carries the command's stderr tail."""
+
+
+#: stderr lines that name a transport cause, which git's own tail never repeats.
+#: git ends EVERY fetch/push failure with the same access-rights boilerplate, and
+#: an SSH transport failure prints its diagnosis FIRST, so a last-3-lines tail
+#: reports a permission problem the operator does not have. Concretely, for a
+#: remote reachable only through a ``ProxyCommand`` in ``~/.ssh/config`` the
+#: sandbox's ``ssh -F /dev/null`` (see :mod:`kiro_crew.sandbox`) discards that
+#: config, DNS then fails, and the whole diagnosis is one line above the tail:
+#:
+#:     ssh: Could not resolve hostname <host>: Name or service not known
+#:     fatal: Could not read from remote repository.
+#:     Please make sure you have the correct access rights and the repository exists.
+#:
+#: The tail alone points the operator at credentials for a host that never
+#: resolved. Both spellings are matched: ``ssh``'s own ``prog:`` prefix, and the
+#: same phrases unprefixed (git relays them on some transports).
+#: ``Could not read from remote repository`` is deliberately NOT listed: it is
+#: git's OWN boilerplate, printed for every failure. Treating it as a cause would
+#: let it be prepended when the real diagnosis is missing, leading the message
+#: with the same symptom the tail already carries.
+_TRANSPORT_CAUSE = re.compile(
+    r"^(?:ssh|ssh-\S+):"
+    r"|\b(?:Could not resolve hostname"
+    r"|Host key verification failed|Permission denied \(publickey"
+    r"|Connection refused|No route to host|Connection timed out)\b"
+)
+
+
+def _failure_detail(stderr: str) -> str:
+    """The stderr to put in a :class:`GitError`: git's tail plus the cause.
+
+    The tail alone is kept verbatim, because for most failures it IS the useful
+    part. A failure carrying no transport line produces exactly
+    ``" ".join(stderr.strip().splitlines()[-3:])`` -- the same bytes this helper
+    produced before, blank lines and indentation included (no line is dropped or
+    re-stripped). The FIRST transport-caused line is prepended only when one
+    exists OUTSIDE that tail, so a message never reports only the symptom git
+    repeats for every cause. A line already in the tail is not repeated. This
+    widens what a failure REPORTS; it does not decide whether the command failed.
+    """
+    lines = stderr.strip().splitlines()
+    tail = lines[-3:]
+    lead = next(
+        (line for line in lines[: len(lines) - len(tail)] if _TRANSPORT_CAUSE.search(line)),
+        None,
+    )
+    return " ".join([lead, *tail] if lead else tail)
 
 
 class AttachError(Exception):
@@ -391,7 +441,7 @@ def _git_bin() -> str:
 #: helpers resolve from trusted system directories rather than an agent-writable
 #: entry inherited from the gateway's PATH. Two callers need it: git (ssh for
 #: ssh:// remotes, credential helpers, git-remote-*) and the file-manager reveal
-#: in `server.py` (`xdg-open` is a shell script that searches PATH for `gio`,
+#: in `server_host.py` (`xdg-open` is a shell script that searches PATH for `gio`,
 #: `gvfs-open`, `exo-open`, ...). POSIX only — on Windows (test runners) git's
 #: helpers live beside the install, so the inherited PATH is kept there.
 TRUSTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -429,8 +479,21 @@ async def run_git(
         # git-remote-*) resolve from trusted system dirs, not an agent-writable
         # entry inherited from the gateway's PATH.
         env["PATH"] = TRUSTED_PATH
+    # A hook defined in config (`hook.<name>.command`, git 2.54+) is not reached by the
+    # `core.hooksPath` pin above, and its name is the vault's choice, so each one git can
+    # see is disabled by name. See `kiro_crew.git_config_hooks`.
+    try:
+        hook_off = await asyncio.to_thread(
+            config_hook_disable_args,
+            cwd if cwd is not None else os.getcwd(),
+            git=_git_bin(),
+            env=env,
+        )
+    except ConfigHookScanError as exc:
+        raise GitError(str(exc)) from exc
     proc = await asyncio.create_subprocess_exec(
         _git_bin(),
+        *hook_off,
         *args,
         cwd=cwd,
         env=env,
@@ -448,11 +511,31 @@ async def run_git(
         # into an unbounded wait for a surviving helper's EOF.
         await platform_compat.kill_and_reap(proc)
         raise GitError(f"git {args[0]} timed out after {timeout}s") from None
+    except asyncio.CancelledError:
+        # Shutdown cancels the background syncer mid-``sync`` (see
+        # ``syncer.stop_syncer``), and this child is deliberately session-
+        # detached, so a bare re-raise would leave a ``git merge`` still
+        # rewriting the working tree AFTER ``vault_write_lock`` releases —
+        # restarted note writers would then overlap an orphaned merge and
+        # corrupt the tree/index. Kill and reap the whole isolated tree BEFORE
+        # propagating. The reap runs as a shielded task and is awaited to
+        # completion even if this frame is cancelled again mid-cleanup, so a
+        # second cancellation cannot re-orphan the child; then the original
+        # cancellation is propagated.
+        reap = asyncio.ensure_future(platform_compat.kill_and_reap(proc))
+        while not reap.done():
+            try:
+                await asyncio.shield(reap)
+            except asyncio.CancelledError:
+                # Re-cancelled while reaping — keep waiting for the reap itself,
+                # which is bounded by its own timeout, rather than abandoning it.
+                continue
+        raise
     stdout = out.decode("utf-8", errors)
     stderr = err.decode("utf-8", "replace")
     if check and proc.returncode != 0:
-        tail = " ".join(stderr.strip().splitlines()[-3:])
-        raise GitError(f"git {args[0]} failed ({proc.returncode}): {tail}")
+        detail = _failure_detail(stderr)
+        raise GitError(f"git {args[0]} failed ({proc.returncode}): {detail}")
     return proc.returncode or 0, stdout, stderr
 
 
@@ -533,6 +616,72 @@ async def _has_head(dir_: str) -> bool:
     """True when the repo has at least one commit."""
     code, _, _ = await run_git(["rev-parse", "--verify", "HEAD"], dir_, check=False)
     return code == 0
+
+
+def fetch_head_mtime_ms(gitdir: str) -> Optional[int]:
+    """When the checkout behind *gitdir* last fetched, as epoch ms; None if never.
+
+    Read from ``FETCH_HEAD``'s mtime: git rewrites that file on every ``fetch``
+    and ``pull``, whether or not anything new arrived, and nothing else writes
+    it, so it is the one marker a pull made outside the app always leaves. A
+    push leaves no such marker (the reflog is optional and ``gc`` rewrites it),
+    so a push-only flow is seen at the next fetch.
+
+    A plain stat, meant for a caller's worker thread: it runs on every
+    external-change poll, so it must start no git process. The mtime is only
+    ever a label's input, so nothing here guards it -- ``.git`` is
+    agent-writable and the caller clamps the value to now.
+    """
+    try:
+        st = os.stat(os.path.join(gitdir, "FETCH_HEAD"))
+    except OSError:
+        return None
+    return int(st.st_mtime * 1000)
+
+
+async def gitdir_is_trusted(dir_: str, trusted_gitdir: str) -> bool:
+    """Whether *dir_*'s ``.git`` still resolves to the git dir recorded at clone/attach.
+
+    The same pin :func:`sync` enforces before acting: a redirected ``.git``
+    pointer would otherwise have another repository's state read as this
+    vault's.
+    """
+    current = await _git_dir(dir_)
+    trusted_real = await asyncio.to_thread(os.path.realpath, trusted_gitdir)
+    return current is not None and current == trusted_real
+
+
+async def remote_is_trusted(dir_: str, trusted_remote: str) -> bool:
+    """Whether every configured origin URL (fetch and push) is still *trusted_remote*.
+
+    The vault's ``.git/config`` is agent-writable, so a prompt-injected agent
+    could repoint ``remote.origin.url`` (or add a ``pushurl``) at an attacker.
+    The trusted URL is persisted in vaults.json, behind the sensitive-path
+    floor; :func:`sync` refuses on a mismatch before it pushes, and the
+    external-sync check refuses before it reads the tracking ref.
+    """
+    trusted = _norm_remote(trusted_remote)
+    effective = await _all_origin_urls(dir_)
+    return bool(effective) and all(_norm_remote(u) == trusted for u in effective)
+
+
+async def head_is_fetched_tip(dir_: str) -> bool:
+    """True when HEAD is the remote-tracking ref of the checked-out branch.
+
+    The same ``remote_oid == local_oid`` observation :func:`sync` makes right
+    after its own fetch, which is what earns a clean-sync stamp there. Every
+    ``fetch`` and ``pull`` of the branch moves ``refs/remotes/origin/<branch>``,
+    so this is what the vault knows of its remote. The origin pin
+    (:func:`remote_is_trusted`) is the caller's job and runs first.
+    """
+    branch = await _current_branch(dir_)
+    if branch is None:
+        return False
+    code, out, _ = await run_git(
+        ["rev-parse", "HEAD", f"refs/remotes/origin/{validate_ref(branch)}"], dir_, check=False
+    )
+    oids = out.split()
+    return code == 0 and len(oids) == 2 and oids[0] == oids[1]
 
 
 async def clone_vault(
@@ -706,9 +855,7 @@ async def status(dir_: str, subfolder: Optional[str] = None) -> list[FileChange]
             i += 1
 
     # Untracked files are additions the diff above cannot see.
-    _, untracked, _ = await run_git(
-        ["ls-files", "--others", "--exclude-standard", "-z"], dir_
-    )
+    _, untracked, _ = await run_git(["ls-files", "--others", "--exclude-standard", "-z"], dir_)
     for rel in untracked.split("\0"):
         if rel:
             changes.append(FileChange(path=rel, kind="added"))
@@ -945,7 +1092,9 @@ async def repo_supplied_driver(dir_: str) -> str:
                 # byte-exactly -- a U+FFFD from the display decode would miss
                 # an existing ``config.worktree`` and clear a scope git reads.
                 gd_code, gd_out, _ = await run_git(
-                    ["rev-parse", "--absolute-git-dir"], dir_, check=False,
+                    ["rev-parse", "--absolute-git-dir"],
+                    dir_,
+                    check=False,
                     errors="surrogateescape",
                 )
                 if await asyncio.to_thread(
@@ -988,9 +1137,7 @@ async def repo_supplied_driver(dir_: str) -> str:
             # `remote.origin.url` still reads as the trusted URL — so the
             # trusted-remote check in sync() would not catch it. A vault has no
             # legitimate reason to set these, so refuse.
-            if k.startswith("url.") and (
-                k.endswith(".insteadof") or k.endswith(".pushinsteadof")
-            ):
+            if k.startswith("url.") and (k.endswith(".insteadof") or k.endswith(".pushinsteadof")):
                 return key.strip()
             # `core.worktree` redirects git's working tree. A blanket refusal
             # would break a legitimately-supported vault shape: git itself sets
@@ -1001,9 +1148,7 @@ async def repo_supplied_driver(dir_: str) -> str:
             # effective worktree rather than parsing the (relative-to-GIT_DIR)
             # value ourselves.
             if k == "core.worktree":
-                code2, top, _ = await run_git(
-                    ["rev-parse", "--show-toplevel"], dir_, check=False
-                )
+                code2, top, _ = await run_git(["rev-parse", "--show-toplevel"], dir_, check=False)
                 if code2 != 0:
                     return "core.worktree (unverifiable)"  # fail closed
                 try:
@@ -1092,9 +1237,7 @@ async def sync(
         # there. The trusted URL is persisted in vaults.json, which is behind the
         # sensitive-path floor.
         if trusted_remote is not None:
-            trusted = _norm_remote(trusted_remote)
-            effective = await _all_origin_urls(dir_)
-            if not effective or any(_norm_remote(u) != trusted for u in effective):
+            if not await remote_is_trusted(dir_, trusted_remote):
                 raise GitError(
                     "this vault's git remote URL no longer matches the trusted URL it "
                     "was created with — refusing to sync to avoid pushing to an "
@@ -1106,9 +1249,7 @@ async def sync(
     # an unrelated same-origin checkout. Verify the canonical git dir still
     # matches the one recorded at attach/clone time.
     if trusted_gitdir is not None:
-        current_gitdir = await _git_dir(dir_)
-        trusted_real = await asyncio.to_thread(os.path.realpath, trusted_gitdir)
-        if current_gitdir is None or current_gitdir != trusted_real:
+        if not await gitdir_is_trusted(dir_, trusted_gitdir):
             raise GitError(
                 "this vault's .git location no longer matches where it was "
                 "created — refusing to sync to avoid acting on an unrelated "
@@ -1238,7 +1379,9 @@ async def sync(
         # notes — reporting success here would tell the user their work is
         # backed up when it is only on this machine.
         logger.warning("md-notebook: push to origin/%s failed: %s", target, push_err.strip())
-        raise GitError(f"pulled and merged, but the push to {target} was rejected: {push_err.strip()}")
+        raise GitError(
+            f"pulled and merged, but the push to {target} was rejected: {push_err.strip()}"
+        )
     return {
         "pushed": True,
         "pulled": True,

@@ -29,27 +29,22 @@ The token is the per-SESSION name that tree cannot supply. These tests pin:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import importlib.machinery
 import json
 import logging
 import os
 import subprocess
 import sys
-import tempfile
-import time
 import zipfile
 from pathlib import Path
 from typing import Any
 
+import mcp_gateway_stub_session_token_helpers
 import pytest
-from test_identity_topology import GATEWAY, KIRO_CLI, MCP_SERVER, SESSION_HOST, ProcessTopology
 from test_mcp_gateway_claim import (
     _ANCESTORS,
     _CALL,
     _PID,
-    _WRAPPER_PID,
-    _claim,
 )
 from test_mcp_gateway_claim import _FakeBackend as _FakeBackendType
 from test_mcp_gateway_claim import (
@@ -60,562 +55,31 @@ from test_mcp_gateway_claim import (
     _RecordingWriter,
     _register,
 )
-from test_mcp_gateway_session_inject import _PROBE_SCRIPT, REAL_CLI
 
-from kiro_crew import mcp_caller, mcp_core, platform_compat
+from kiro_crew import mcp_caller, platform_compat
 from kiro_crew.mcp_caller import CallerContext
-from kiro_crew.mcp_gateway import claim as claim_mod
 from kiro_crew.mcp_gateway import gatewayd as gw
 from kiro_crew.mcp_gateway import prewarm as prewarm_mod
 from kiro_crew.mcp_gateway import stub as stub_mod
 from kiro_crew.mcp_gateway.pool import PoolKey
 from kiro_crew.mcp_gateway.session_servers import (
     STUB_SESSION_TOKEN_ENV,
-    attach_stub_session_token,
 )
+from kiro_crew.testing.wait import await_until, finished
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
-PARENT_KEY = "dashboard:chat-1-parent"
-SUB_KEY = "dashboard:chat-1-parent:sub-7"
-TOKEN_A = "a" * 64
-TOKEN_B = "b" * 64
-
-
-@pytest.fixture(autouse=True)
-def _clean_gateway_state() -> Any:
-    """Both module-level registries the token path touches.
-
-    ``test_mcp_gateway_claim``'s own autouse fixture does not reach this module,
-    and a leaked binding is exactly the state that would make a later test read
-    a session name no claim in it ever pushed.
-    """
-    gw._CONN_INDEX.clear()
-    gw._TOKEN_BINDINGS.clear()
-    yield
-    gw._CONN_INDEX.clear()
-    gw._TOKEN_BINDINGS.clear()
-
-
-def _register_with_token(
-    session_key: str,
-    token: str,
-    *,
-    stub_uuid: str = "cp-stub-0001",
-    ancestor_pids: list[int] | None = None,
-) -> dict[str, Any]:
-    frame = _register(session_key, ancestor_pids)
-    frame["stub_uuid"] = stub_uuid
-    if token:
-        frame["stub_session_token"] = token
-    return frame
-
-
-def _claim_with_token(pid: Any, session_key: str, token: str) -> dict[str, Any]:
-    frame = _claim(pid, session_key)
-    if token:
-        frame["stub_session_token"] = token
-    return frame
-
-
-# ---------------------------------------------------------------------------
-# Minting and the injected entry
-# ---------------------------------------------------------------------------
-
-
-def test_token_is_unguessable_and_unique() -> None:
-    """A guessable token IS another session's identity: gatewayd hands a
-    connection the session its token names."""
-    tokens = {claim_mod.mint_stub_session_token() for _ in range(50)}
-    assert len(tokens) == 50
-    for token in tokens:
-        # hex over >= 128 bits of randomness (the module mints 256).
-        assert len(token) >= 32
-        assert int(token, 16) >= 0
-
-
-def test_attach_names_every_stub_entry_of_one_session() -> None:
-    entries = [
-        {"name": "one", "command": "python", "args": [], "env": []},
-        {"name": "two", "command": "python", "args": [], "env": [{"name": "X", "value": "1"}]},
-    ]
-    out = attach_stub_session_token(entries, TOKEN_A)
-    for entry in out:
-        assert {"name": STUB_SESSION_TOKEN_ENV, "value": TOKEN_A} in entry["env"]
-    # The operator's own pair survives beside it.
-    assert {"name": "X", "value": "1"} in out[1]["env"]
-    # The caller's list may be a cached array shared with another session.
-    assert entries[0]["env"] == [] and len(entries[1]["env"]) == 1
-
-
-def test_attach_is_a_no_op_without_a_token() -> None:
-    """A build with the gateway off, or a caller that cannot mint, keeps the
-    pre-token wire shape byte for byte."""
-    entries = [{"name": "one", "command": "python", "args": [], "env": []}]
-    assert attach_stub_session_token(entries, "") is entries
-
-
-def test_attach_replaces_rather_than_appends_a_second_token() -> None:
-    """Two pairs of the same name leave which one wins to the child's env
-    parser — so the entry must never carry two."""
-    once = attach_stub_session_token(
-        [{"name": "one", "command": "python", "args": [], "env": []}], TOKEN_A
-    )
-    twice = attach_stub_session_token(once, TOKEN_B)
-    names = [pair["name"] for pair in twice[0]["env"]]
-    assert names.count(STUB_SESSION_TOKEN_ENV) == 1
-    assert twice[0]["env"][-1]["value"] == TOKEN_B
-
-
-def test_stub_forwards_the_token_from_its_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    args = _stub_args()
-    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
-    assert stub_mod.build_register_payload(args)["stub_session_token"] == TOKEN_A
-    monkeypatch.delenv(STUB_SESSION_TOKEN_ENV)
-    # Absent, the key is omitted entirely rather than sent empty: gatewayd's
-    # PID-keyed behavior is selected by the field NOT being there.
-    assert "stub_session_token" not in stub_mod.build_register_payload(args)
-
-
-def test_the_token_is_not_a_pool_dimension(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A per-connection value in the PoolKey would give every session its own
-    backend and pooling would silently stop."""
-    args = _stub_args()
-    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
-    first = stub_mod.build_register_payload(args)
-    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_B)
-    second = stub_mod.build_register_payload(args)
-    assert first["stub_session_token"] != second["stub_session_token"]
-    assert PoolKey.from_register(first).stable_hash() == PoolKey.from_register(second).stable_hash()
-
-
-def _stub_args() -> Any:
-    return stub_mod._parse_args(
-        [
-            "--server",
-            "echo-mcp",
-            "--agent",
-            "cp-agent",
-            "--target-command",
-            "python",
-            "--work-dir",
-            "/tmp",
-            "--poolable",
-        ]
-    )
-
-
-# ---------------------------------------------------------------------------
-# Claim-push keyed by (pid, token) — the three topologies
-# ---------------------------------------------------------------------------
-
-
-async def _live_conn(
-    monkeypatch: pytest.MonkeyPatch,
-    session_key: str,
-    token: str,
-    stub_uuid: str,
-) -> tuple[Any, Any, Any]:
-    """Drive one real connection handler to its first forwarded call."""
-    backend, sel = _patch_env(monkeypatch)
-    reader = _QueueReader()
-    reader.feed(_register_with_token(session_key, token, stub_uuid=stub_uuid))
-    reader.feed(_CALL)
-    task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
-    return backend, reader, task
-
-
-def _attest(monkeypatch: pytest.MonkeyPatch, host_chain: list[int]) -> None:
-    """Make the kernel place this connection's peer under *host_chain*.
-
-    The token's second factor is the SO_PEERCRED-derived chain gatewayd walks
-    itself, so a test that wants a token honoured has to attest one; a test that
-    wants it refused simply does not.
-    """
-    monkeypatch.setattr(gw.socketsec, "get_peer_pid", lambda _w: host_chain[0])
-    monkeypatch.setattr(gw, "_resolve_peer_identity", lambda _pid: ("", list(host_chain)))
-
-
-async def _close(reader: Any, task: Any) -> None:
-    reader.feed({"type": "unregister"})
-    await task
-
-
-async def _next_caller(backend: Any, reader: Any) -> Any:
-    """The identity the connection forwards on its NEXT call."""
-    backend.forwarded.clear()
-    reader.feed(_CALL)
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
-    return backend.callers[-1]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("topology", ["no-token", "all-tokens", "mixed"])
-async def test_claim_across_token_topologies(
-    monkeypatch: pytest.MonkeyPatch, topology: str
-) -> None:
-    """One runtime, two connections, three deployment shapes.
-
-    ``no-token``: neither connection carries one (a hand-written config, an
-    overlay predating the token) — a tokenless claim re-targets both, exactly as
-    it always did. ``all-tokens``: both name a session, and a claim for one
-    reaches only that one. ``mixed``: the tokened connection is selected by the
-    claim and the tokenless one rides along, because it has no finer identity
-    than the process tree the claim named.
-    """
-    token_first = "" if topology == "no-token" else TOKEN_A
-    token_second = TOKEN_B if topology == "all-tokens" else ""
-
-    first_backend, first_reader, first_task = await _live_conn(
-        monkeypatch, "", token_first, "stub-first"
-    )
-    second_backend, second_reader, second_task = await _live_conn(
-        monkeypatch, "", token_second, "stub-second"
-    )
-
-    claim_token = "" if topology == "no-token" else TOKEN_A
-    ack = await gw._apply_claim(_claim_with_token(_WRAPPER_PID, PARENT_KEY, claim_token))
-    assert ack["type"] == "claimed"
-    assert ack["connections"] == 2
-    expected_updates = {"no-token": 2, "all-tokens": 1, "mixed": 2}[topology]
-    assert ack["updated"] == expected_updates
-
-    first_caller = await _next_caller(first_backend, first_reader)
-    second_caller = await _next_caller(second_backend, second_reader)
-    assert first_caller is not None and first_caller.session_key == PARENT_KEY
-    if topology == "all-tokens":
-        # The other session on the same runtime keeps its own identity — here,
-        # none yet. This is the property the item exists for.
-        assert second_caller is None
-    else:
-        assert second_caller is not None and second_caller.session_key == PARENT_KEY
-
-    await _close(first_reader, first_task)
-    await _close(second_reader, second_task)
-
-
-@pytest.mark.asyncio
-async def test_a_claim_for_one_session_leaves_its_sibling_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """THE isolation property. Two connections under ONE runtime PID with
-    different tokens: a claim for A re-keys only A, B is untouched, and a claim
-    carrying no token still re-targets both (backward compatibility)."""
-    a_backend, a_reader, a_task = await _live_conn(monkeypatch, "", TOKEN_A, "stub-a")
-    b_backend, b_reader, b_task = await _live_conn(monkeypatch, "", TOKEN_B, "stub-b")
-
-    assert (await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A)))["updated"] == 1
-    assert (await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B)))["updated"] == 1
-    assert (await _next_caller(a_backend, a_reader)).session_key == PARENT_KEY
-    assert (await _next_caller(b_backend, b_reader)).session_key == SUB_KEY
-
-    # A re-claim of the parent slot (warm-pool rekey) must not move the subagent.
-    assert (await gw._apply_claim(_claim_with_token(_PID, "dashboard:chat-2", TOKEN_A)))[
-        "updated"
-    ] == 1
-    assert (await _next_caller(a_backend, a_reader)).session_key == "dashboard:chat-2"
-    assert (await _next_caller(b_backend, b_reader)).session_key == SUB_KEY
-
-    # A tokenless claim keeps the PID-wide reach it has always had.
-    ack = await gw._apply_claim(_claim(_PID, "dashboard:chat-3"))
-    assert ack["updated"] == 2
-    assert (await _next_caller(a_backend, a_reader)).session_key == "dashboard:chat-3"
-    assert (await _next_caller(b_backend, b_reader)).session_key == "dashboard:chat-3"
-
-    await _close(a_reader, a_task)
-    await _close(b_reader, b_task)
-
-
-@pytest.mark.asyncio
-async def test_a_claim_binds_its_token_even_when_it_matches_nothing() -> None:
-    """A session's claim is pushed BEFORE its stubs launch, so "matched zero" is
-    the normal ordering — the binding is what the register then reads."""
-    ack = await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B))
-    assert ack["type"] == "claim-noop" and ack["updated"] == 0
-    bound = gw._token_caller(TOKEN_B, [_PID])
-    assert bound is not None and bound.session_key == SUB_KEY
-    # …and the binding is scoped to the runtime the claim named: a connection
-    # elsewhere on the host holding the same token gets nothing from it.
-    assert gw._token_caller(TOKEN_B, [999999]) is None
-    assert gw._token_caller(TOKEN_B, []) is None
-
-
-def test_the_binding_table_is_bounded() -> None:
-    """A long-running daemon must not accumulate bindings without bound.
-    Dropping the oldest costs a re-claim; it never invents an identity."""
-    for index in range(gw._MAX_TOKEN_BINDINGS + 10):
-        gw._bind_token(f"tok-{index}", CallerContext(session_key=f"s{index}"), _PID)
-    assert len(gw._TOKEN_BINDINGS) == gw._MAX_TOKEN_BINDINGS
-    assert gw._token_caller("tok-0", [_PID]) is None
-    assert gw._token_caller(f"tok-{gw._MAX_TOKEN_BINDINGS + 9}", [_PID]) is not None
-
-
-# ---------------------------------------------------------------------------
-# Register-time identity: the binding outranks both process-tree sources
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_register_prefers_the_binding_over_the_stubs_self_report(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A subagent's stub inherits the runtime's env/pid-file, so it self-reports
-    the PARENT's key. The token names the session it actually serves."""
-    _attest(monkeypatch, _ANCESTORS)
-    await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B))
-    backend, reader, task = await _live_conn(monkeypatch, PARENT_KEY, TOKEN_B, "stub-sub")
-    assert backend.callers[0] is not None
-    assert backend.callers[0].session_key == SUB_KEY
-    await _close(reader, task)
-
-
-@pytest.mark.asyncio
-async def test_register_prefers_the_binding_over_the_proc_walk(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The server-side SO_PEERCRED walk reaches the same runtime tree, so it
-    answers with the parent too. The binding wins and the walk's session key is
-    never adopted."""
-    backend, sel = _patch_env(monkeypatch)
-    monkeypatch.setattr(gw.socketsec, "get_peer_pid", lambda _w: 9100)
-    monkeypatch.setattr(gw, "_resolve_peer_identity", lambda _pid: (PARENT_KEY, [9100, 9020]))
-    # The claim names the runtime as the KERNEL sees it, which is the chain the
-    # token is authenticated against.
-    await gw._apply_claim(_claim_with_token(9020, SUB_KEY, TOKEN_B))
-
-    reader = _QueueReader()
-    reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-sub"))
-    reader.feed(_CALL)
-    task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
-
-    assert backend.callers[0] is not None
-    assert backend.callers[0].session_key == SUB_KEY
-    # The host chain is still indexed, so this session's own later claims land.
-    assert 9020 in gw._CONN_INDEX
-    await _close(reader, task)
-
-
-@pytest.mark.asyncio
-async def test_an_unclaimed_token_defers_identity_and_its_claim_repairs_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Fail closed. A token says "a claim names my session", so until that claim
-    arrives there is nothing to grant: every remaining source answers per
-    RUNTIME, and this stub self-reports the parent's key precisely because it
-    shares the parent's process."""
-    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    backend, reader, task = await _live_conn(monkeypatch, PARENT_KEY, TOKEN_B, "stub-sub")
-    assert backend.callers[0] is None
-
-    # …and its own claim repairs it, without touching the parent's connection.
-    assert (await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B)))["updated"] == 1
-    assert (await _next_caller(backend, reader)).session_key == SUB_KEY
-    await _close(reader, task)
-
-
-@pytest.mark.asyncio
-async def test_an_unclaimed_token_is_refused_even_with_nothing_else_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An EMPTY binding table is not evidence that the tree answer is right — it
-    is the state a fresh daemon, a respawn and an evicted binding all share, and
-    in each of those a subagent's stub would otherwise be handed its parent's
-    session. So the refusal cannot be conditional on some sibling happening to
-    be named."""
-    backend, reader, task = await _live_conn(monkeypatch, PARENT_KEY, TOKEN_A, "stub-parent")
-    assert backend.callers[0] is None
-    await _close(reader, task)
-
-
-@pytest.mark.asyncio
-async def test_a_self_reported_ancestry_cannot_authenticate_a_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The register frame is peer-supplied IN FULL, ``ancestor_pids`` included.
-
-    So the actor who read another session's token out of ``/proc`` can also name
-    that session's runtime in its own chain, and a token checked against the
-    self-reported pids would let one actor satisfy both halves — the second
-    factor would authenticate nothing. Only the chain gatewayd walks from the
-    kernel's peer pid counts: here the stub claims the victim's runtime pids and
-    the kernel places it somewhere else entirely.
-    """
-    _attest(monkeypatch, [777001, 777002])
-    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    backend, reader, task = await _live_conn_on(
-        monkeypatch, TOKEN_A, "stub-thief", list(_ANCESTORS)
-    )
-    assert backend.callers[0] is None
-    await _close(reader, task)
-
-
-@pytest.mark.asyncio
-async def test_a_stolen_token_buys_nothing_outside_its_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The token rides an ``env`` pair, and ``/proc/<pid>/environ`` is readable
-    at the operator's own uid, so a process on the host can learn another
-    session's token. A claim binds the token TOGETHER WITH the runtime PID it
-    named, and both are required: presenting the token from a connection the
-    kernel does not place under that runtime resolves to nothing."""
-    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    # A stub elsewhere on the host: its own ancestry shares no pid with the
-    # claimed runtime, and it presents the stolen token plus a self-report.
-    backend, reader, task = await _live_conn_on(
-        monkeypatch, TOKEN_A, "stub-thief", [777001, 777002]
-    )
-    assert backend.callers[0] is None
-    await _close(reader, task)
-
-
-@pytest.mark.asyncio
-async def test_a_daemon_respawn_leaves_no_session_wearing_anothers_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """gatewayd holds the bindings in memory only, so a respawn empties them
-    while both sessions are still live. Their stubs reconnect and re-register
-    with the SAME tokens; neither may resolve from the shared tree, and the
-    per-turn re-claim (``publish_turn_identity`` -> ``reclaim``) is what restores
-    each one to its own session."""
-    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B))
-    # The respawn: a new daemon process starts with an empty table.
-    gw._TOKEN_BINDINGS.clear()
-
-    parent_backend, parent_reader, parent_task = await _live_conn(
-        monkeypatch, PARENT_KEY, TOKEN_A, "stub-parent"
-    )
-    sub_backend, sub_reader, sub_task = await _live_conn(
-        monkeypatch, PARENT_KEY, TOKEN_B, "stub-sub"
-    )
-    assert parent_backend.callers[0] is None
-    assert sub_backend.callers[0] is None
-
-    # Each session's next turn re-pushes its own claim.
-    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B))
-    assert (await _next_caller(parent_backend, parent_reader)).session_key == PARENT_KEY
-    assert (await _next_caller(sub_backend, sub_reader)).session_key == SUB_KEY
-
-    await _close(parent_reader, parent_task)
-    await _close(sub_reader, sub_task)
-
-
-@pytest.mark.asyncio
-async def test_recaller_cannot_name_a_token_carrying_connection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The stub's recaller poll resolves the same pid file, so it re-opens the
-    hole the register path just closed. Same rule, same place in the pipeline:
-    only claim-push may name a token."""
-    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    backend, sel = _patch_env(monkeypatch)
-    reader = _QueueReader()
-    reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-sub"))
-    reader.feed(_CALL)
-    task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
-    assert backend.callers[0] is None
-
-    reader.feed({"type": "recaller", "session_key": PARENT_KEY, "session_type": "dashboard"})
-    assert (await _next_caller(backend, reader)) is None
-    denied = [
-        event
-        for event in sel
-        if event.get("operation") == "mcp-gateway.caller-rekey" and event.get("outcome") == "denied"
-    ]
-    assert denied and "token-carrying connection" in denied[-1]["error"]
-    await _close(reader, task)
-
-
-# ---------------------------------------------------------------------------
-# End to end: a spawn_run-shaped subagent survives the parent's rekey
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_a_subagent_session_survives_its_parents_rekey(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The whole item, end to end, on the real topology.
-
-    ``ProcessTopology`` models the tree a ``spawn_run`` subagent actually runs
-    in: ONE kiro-cli under the session host, with the gateway's
-    ``session_pid_<host_pid>.txt`` naming the PARENT slot — so both the stub's
-    own walk and gatewayd's peer walk resolve the parent for BOTH sessions'
-    stubs. Two connections are opened under that one runtime, each carrying its
-    session's token; the parent then rekeys (warm-pool re-claim) and the
-    subagent's stub must still forward as the SUBAGENT.
-
-    Then the consequence that matters: with the identity gatewayd stamps on that
-    connection, ``require_strict_session_key`` — the one gate ``monitor_start``
-    and every other reflexive tool routes through — answers with the subagent's
-    key. A subagent cannot arm a loop on, or report into, its parent's slot.
-    """
-    topo = ProcessTopology(tmp_path)
-    topo.add(GATEWAY, 1)
-    topo.add(SESSION_HOST, GATEWAY)
-    topo.add(KIRO_CLI, SESSION_HOST)
-    topo.add(MCP_SERVER, KIRO_CLI)
-    topo.write_session_pid(SESSION_HOST, PARENT_KEY)
-    monkeypatch.setattr(gw, "_config_dir", lambda: topo.cfg_dir)
-    monkeypatch.setattr(gw, "_ppid_fn", topo.parent_lookup("host"))
-
-    runtime_pids = [KIRO_CLI, SESSION_HOST]
-    parent_backend, parent_reader, parent_task = await _live_conn_on(
-        monkeypatch, TOKEN_A, "stub-parent", runtime_pids
-    )
-    sub_backend, sub_reader, sub_task = await _live_conn_on(
-        monkeypatch, TOKEN_B, "stub-sub", runtime_pids
-    )
-
-    # Both sessions claim their own token (the parent at slot claim, the
-    # subagent at its create_session).
-    await gw._apply_claim(_claim_with_token(SESSION_HOST, PARENT_KEY, TOKEN_A))
-    await gw._apply_claim(_claim_with_token(SESSION_HOST, SUB_KEY, TOKEN_B))
-    # The parent slot re-keys onto this warm runtime: a PID-wide claim, which
-    # reaches every stub identity under that PID.
-    await gw._apply_claim(_claim_with_token(SESSION_HOST, "dashboard:chat-9", TOKEN_A))
-
-    parent_caller = await _next_caller(parent_backend, parent_reader)
-    sub_caller = await _next_caller(sub_backend, sub_reader)
-    assert parent_caller.session_key == "dashboard:chat-9"
-    assert sub_caller.session_key == SUB_KEY
-
-    # What a reflexive tool in the subagent's backend process then resolves.
-    monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
-    monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
-    # Value-based restore, not token-based: this test crosses asyncio task
-    # boundaries and pytest-xdist shares the worker's Context across tests.
-    previous = mcp_caller._CURRENT_CALLER.get()
-    mcp_caller._CURRENT_CALLER.set(sub_caller)
-    try:
-        resolved, refusal = mcp_core.require_strict_session_key("Error: no session.")
-    finally:
-        mcp_caller._CURRENT_CALLER.set(previous)
-    assert refusal == ""
-    assert resolved == SUB_KEY
-    assert resolved != parent_caller.session_key
-
-    await _close(parent_reader, parent_task)
-    await _close(sub_reader, sub_task)
-
-
-async def _live_conn_on(
-    monkeypatch: pytest.MonkeyPatch,
-    token: str,
-    stub_uuid: str,
-    ancestor_pids: list[int],
-) -> tuple[Any, Any, Any]:
-    backend, sel = _patch_env(monkeypatch)
-    reader = _QueueReader()
-    reader.feed(_register_with_token("", token, stub_uuid=stub_uuid, ancestor_pids=ancestor_pids))
-    reader.feed(_CALL)
-    task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
-    return backend, reader, task
+# The constants, frame helpers and autouse reset shared with the sibling modules, bound
+# here by name (pytest registers the fixture for this module's tests).
+_attest = mcp_gateway_stub_session_token_helpers._attest
+_claim_with_token = mcp_gateway_stub_session_token_helpers._claim_with_token
+_clean_gateway_state = mcp_gateway_stub_session_token_helpers._clean_gateway_state
+_close = mcp_gateway_stub_session_token_helpers._close
+_live_conn = mcp_gateway_stub_session_token_helpers._live_conn
+PARENT_KEY = mcp_gateway_stub_session_token_helpers.PARENT_KEY
+_register_with_token = mcp_gateway_stub_session_token_helpers._register_with_token
+_stub_args = mcp_gateway_stub_session_token_helpers._stub_args
+TOKEN_A = mcp_gateway_stub_session_token_helpers.TOKEN_A
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +171,316 @@ def test_the_fallback_backend_never_inherits_the_token(
     assert seen["env"]["REAL_SERVER_KEY"] == "abc"
 
 
+def _fallback_args(tmp_path: Path, server: str, command: str, target_args: list[str]) -> Any:
+    import base64
+
+    return stub_mod._parse_args(
+        [
+            "--server",
+            server,
+            "--agent",
+            "cp-agent",
+            "--target-command",
+            command,
+            "--target-args-b64=" + base64.b64encode(json.dumps(target_args).encode()).decode(),
+            "--work-dir",
+            str(tmp_path),
+        ]
+    )
+
+
+def _capture_fallback_env(monkeypatch: pytest.MonkeyPatch, args: Any) -> dict[str, str]:
+    seen: dict[str, dict[str, str]] = {}
+
+    def _capture(_argv: str, _args: list[str], env: dict[str, str]) -> None:
+        seen["env"] = dict(env)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(stub_mod.platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(stub_mod.os, "execvpe", _capture)
+    with pytest.raises(SystemExit):
+        stub_mod.fallback_exec(args)
+    return seen["env"]
+
+
+def test_the_fallback_keeps_the_token_for_a_vetted_control_plane(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Kiro Crew's own control plane is what the token exists for. Without it a
+    fallback kirocrew-core refuses every call identity_unattested wherever the
+    kernel peer check cannot name the session (a runtime hosting several
+    sessions, a TCP connection). It is kept only when gatewayd's own vetting
+    accepts the target, and that vetting judges the env the child really gets,
+    minus the token and minus Kiro Crew's pinned UTF-8 keys."""
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
+    for key, value in platform_compat._UTF8_PROCESS_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("SOME_OTHER_VAR", "x")
+    monkeypatch.delenv("PYTHONSAFEPATH", raising=False)
+    judged: list[tuple[str, str, list[str], dict[str, str]]] = []
+
+    def _vet(name: str, command: str, args: Any, *, env: Any = None, **_kw: Any) -> bool:
+        judged.append((name, command, list(args), dict(env)))
+        return True
+
+    monkeypatch.setattr(gw, "_spawns_own_control_plane", _vet)
+    monkeypatch.setattr(gw, "_user_site_holds_our_package", lambda: False)
+    env = _capture_fallback_env(
+        monkeypatch, _fallback_args(tmp_path, "kirocrew-core", "/opt/kc/bin/kirocrew", ["mcp-core"])
+    )
+
+    assert env[STUB_SESSION_TOKEN_ENV] == TOKEN_A
+    assert env["PYTHONSAFEPATH"] == "1"
+    assert env["PYTHONNOUSERSITE"] == "1"
+    [(name, command, target_args, verdict_env)] = judged
+    assert (name, command, target_args) == ("kirocrew-core", "/opt/kc/bin/kirocrew", ["mcp-core"])
+    assert STUB_SESSION_TOKEN_ENV not in verdict_env
+    assert not set(platform_compat._UTF8_PROCESS_ENV) & set(verdict_env)
+    assert verdict_env["SOME_OTHER_VAR"] == "x"
+
+
+def test_a_non_pinned_utf8_value_still_reaches_the_vetting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the exact pinned values are excused. Any other value for those keys is
+    an overlay like any other ``PYTHON*`` key and must reach the fence."""
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
+    monkeypatch.setenv("PYTHONIOENCODING", "latin-1")
+    judged: list[dict[str, str]] = []
+
+    def _vet(_name: str, _command: str, _args: Any, *, env: Any = None, **_kw: Any) -> bool:
+        judged.append(dict(env))
+        return False
+
+    monkeypatch.setattr(gw, "_spawns_own_control_plane", _vet)
+    env = _capture_fallback_env(
+        monkeypatch, _fallback_args(tmp_path, "kirocrew-core", "/opt/kc/bin/kirocrew", ["mcp-core"])
+    )
+    assert judged[0]["PYTHONIOENCODING"] == "latin-1"
+    assert STUB_SESSION_TOKEN_ENV not in env
+
+
+def test_a_reserved_name_on_a_foreign_binary_does_not_get_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The server NAME is not proof. The real vetting refuses a reserved name whose
+    command is not the managed invocation, so the fallback drops the token -- and
+    says so on the stub's own stderr, naming the server, because the only other
+    symptom is every policy-reading tool answering ``identity_unattested``."""
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
+    with caplog.at_level(logging.INFO, logger=stub_mod.logger.name):
+        env = _capture_fallback_env(
+            monkeypatch, _fallback_args(tmp_path, "kirocrew-core", sys.executable, ["mcp-core"])
+        )
+    assert STUB_SESSION_TOKEN_ENV not in env
+    assert TOKEN_A not in json.dumps(env)
+    (record,) = [r for r in caplog.records if "without the session token" in r.getMessage()]
+    assert record.levelno == logging.WARNING and "'kirocrew-core'" in record.getMessage()
+    # The real vetting ran to a verdict: this is a refusal, not a broken check.
+    assert not [r for r in caplog.records if "vetting of" in r.getMessage()]
+    assert TOKEN_A not in caplog.text
+
+
+def test_a_refused_reserved_name_logs_the_vettings_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The fallback hands the vetting its ``denial`` collector and relays what it
+    wrote, so the stderr line points at the condition that failed rather than
+    leaving the operator to correlate it with the daemon logger's wording."""
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
+
+    def _refuse(*_a: Any, denial: Any = None, **_kw: Any) -> bool:
+        assert denial is not None, "the fallback discards the vetting's reason"
+        denial.append("spawned '/opt/evil' is not the spec's '/opt/kc/bin/kirocrew'")
+        return False
+
+    monkeypatch.setattr(gw, "_spawns_own_control_plane", _refuse)
+    with caplog.at_level(logging.INFO, logger=stub_mod.logger.name):
+        env = _capture_fallback_env(
+            monkeypatch, _fallback_args(tmp_path, "kirocrew-core", "/opt/evil", ["mcp-core"])
+        )
+    assert STUB_SESSION_TOKEN_ENV not in env
+    (record,) = [r for r in caplog.records if r.levelno >= logging.INFO]
+    assert record.levelno == logging.WARNING
+    assert "'kirocrew-core'" in record.getMessage()
+    assert "is not the spec's '/opt/kc/bin/kirocrew'" in record.getMessage()
+    assert TOKEN_A not in caplog.text
+
+
+def test_a_third_party_fallback_stays_silent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Dropping the token is the ordinary answer for a third-party server, which
+    is most of them: the stub's own name precheck answers before the vetting is
+    even imported, and the fallback adds no line of its own at INFO or above."""
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
+    with caplog.at_level(logging.DEBUG):
+        env = _capture_fallback_env(
+            monkeypatch, _fallback_args(tmp_path, "echo-mcp", sys.executable, ["--stdio"])
+        )
+    assert STUB_SESSION_TOKEN_ENV not in env
+    assert not [
+        r for r in caplog.records if r.name == stub_mod.logger.name and r.levelno >= logging.INFO
+    ]
+    assert not [r for r in caplog.records if "denied the session token" in r.getMessage()]
+
+
+def test_the_fallback_precheck_covers_every_control_plane() -> None:
+    """The stub decides "is this a Crew name" from the leaf ``mcp_cleanup`` set so
+    a third-party fallback never imports gatewayd. That precheck must be a
+    superset of the daemon's ``CONTROL_PLANE_BACKENDS``, or a control plane added
+    to the daemon's set alone would be skipped here silently: no vetting, no
+    token, no WARNING -- the exact tokenless shape this PR fixed."""
+    from kiro_crew import mcp_cleanup
+
+    assert stub_mod.KIROCREW_BIN_MCP_SERVERS is mcp_cleanup.KIROCREW_BIN_MCP_SERVERS
+    assert gw.CONTROL_PLANE_BACKENDS <= frozenset(stub_mod.KIROCREW_BIN_MCP_SERVERS)
+
+
+_FALLBACK_IMPORT_PROBE = r"""
+import json, sys
+from kiro_crew.mcp_gateway import stub
+
+def _capture(*_a, **_k):
+    raise SystemExit(0)
+
+stub.os.execvpe = _capture
+stub.platform_compat.IS_WINDOWS = False
+args = stub._parse_args(
+    ["--server", sys.argv[1], "--agent", "cp-agent", "--target-command", sys.argv[2],
+     "--work-dir", sys.argv[3]]
+)
+try:
+    stub.fallback_exec(args)
+except SystemExit:
+    pass
+print(json.dumps({
+    "stub": stub.__file__,
+    "modules": sorted(m for m in sys.modules if m.startswith("kiro_crew.mcp_gateway.")),
+}))
+"""
+
+_HEAVY = ("kiro_crew.mcp_gateway.gatewayd", "kiro_crew.mcp_gateway.daemon")
+
+
+def _fallback_import_footprint(server: str, command: str, tmp_path: Path) -> list[str]:
+    """The ``kiro_crew.mcp_gateway`` modules a fresh stub process holds after one
+    fallback exec of *server*. A subprocess, because this test process imported
+    gatewayd at collection and ``sys.modules`` here can prove nothing. The child
+    is pinned to THIS checkout's package by absolute path: the harness's
+    ``PYTHONPATH`` may be relative, and resolved from ``tmp_path`` it would hand
+    the child whatever ``kiro_crew`` the interpreter has installed instead."""
+    src_root = Path(stub_mod.__file__).resolve().parents[2]
+    env = {**os.environ, STUB_SESSION_TOKEN_ENV: TOKEN_A}
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(src_root), *filter(None, [os.environ.get("PYTHONPATH", "")])]
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", _FALLBACK_IMPORT_PROBE, server, command, str(tmp_path)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=True,
+    )
+    report = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert Path(report["stub"]).resolve() == Path(stub_mod.__file__).resolve(), report["stub"]
+    return list(report["modules"])
+
+
+def test_a_third_party_fallback_does_not_import_gatewayd(tmp_path: Path) -> None:
+    """The fallback runs for EVERY stubbed server while gatewayd is down and the
+    token is always in a stub's env, so a gatewayd import inside the vetting
+    helper would be paid by every third-party fallback the vetting refuses on
+    its first line -- the daemon's whole module graph plus its module-level SSL
+    setup. The name precheck must answer first. The Crew-name run is the
+    control: it shows the probe can see the import when it does happen."""
+    third_party = _fallback_import_footprint("echo-mcp", sys.executable, tmp_path)
+    assert not set(third_party) & set(_HEAVY), third_party
+    assert "kiro_crew.mcp_gateway.stub" in third_party
+
+    control_plane = _fallback_import_footprint("kirocrew-core", sys.executable, tmp_path)
+    assert set(_HEAVY) <= set(control_plane), control_plane
+
+
+def test_a_tokenless_fallback_never_consults_the_vetting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no token in the stub's env there is nothing to keep, so even a Crew
+    name takes the plain exec path: no vetting, no gatewayd import."""
+    monkeypatch.delenv(STUB_SESSION_TOKEN_ENV, raising=False)
+
+    def _never(*_a: Any, **_kw: Any) -> bool:
+        raise AssertionError("the vetting ran for a fallback that holds no token")
+
+    monkeypatch.setattr(gw, "_spawns_own_control_plane", _never)
+    env = _capture_fallback_env(
+        monkeypatch, _fallback_args(tmp_path, "kirocrew-core", "/opt/kc/bin/kirocrew", ["mcp-core"])
+    )
+    assert STUB_SESSION_TOKEN_ENV not in env
+
+
+def test_a_vetting_error_drops_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Fail closed: a vetting that raises means "not ours" -- and is logged as a
+    broken check, not a refusal, because a signature drift in the privately
+    imported vetting would otherwise return every control-plane fallback to the
+    tokenless behaviour with nothing on stderr."""
+    monkeypatch.setenv(STUB_SESSION_TOKEN_ENV, TOKEN_A)
+
+    def _boom(*_a: Any, **_kw: Any) -> bool:
+        raise RuntimeError("config plane down")
+
+    monkeypatch.setattr(gw, "_spawns_own_control_plane", _boom)
+    with caplog.at_level(logging.INFO, logger=stub_mod.logger.name):
+        env = _capture_fallback_env(
+            monkeypatch,
+            _fallback_args(tmp_path, "kirocrew-core", "/opt/kc/bin/kirocrew", ["mcp-core"]),
+        )
+    assert STUB_SESSION_TOKEN_ENV not in env
+    (record,) = [r for r in caplog.records if r.levelno >= logging.INFO]
+    assert record.levelno == logging.WARNING
+    assert "vetting of 'kirocrew-core' raised" in record.getMessage()
+    assert record.exc_info is not None and "config plane down" in caplog.text
+    assert not [r for r in caplog.records if "without the session token" in r.getMessage()]
+    assert TOKEN_A not in caplog.text
+
+
+def test_the_fallback_calls_the_real_vetting_in_the_shape_it_accepts(tmp_path: Path) -> None:
+    """Import contract. The accept path cannot run in CI (it needs the managed
+    binary), and every double above swallows keywords, so a signature drift in
+    the privately imported vetting would leave this file green while the stub's
+    real call raised ``TypeError`` into its fail-closed branch. The shape the stub
+    uses -- positional name, command, args; keyword ``env``, ``work_dir``,
+    ``denial`` -- must bind against the REAL function, reached the way the stub
+    reaches it, and a real call in that shape must reach a verdict."""
+    import inspect
+
+    from kiro_crew.mcp_gateway.daemon import control_plane as control_plane_mod
+
+    vetting = gw._spawns_own_control_plane
+    assert vetting is control_plane_mod._spawns_own_control_plane
+    denial: list[str] = []
+    bound = inspect.signature(vetting).bind(
+        "kirocrew-core",
+        str(tmp_path / "not-the-launcher"),
+        ["mcp-core"],
+        env={},
+        work_dir=str(tmp_path),
+        denial=denial,
+    )
+    assert vetting(*bound.args, **bound.kwargs) is False
+    assert denial, "the real vetting refused without writing the reason it was handed"
+
+    user_site = gw._user_site_holds_our_package
+    assert user_site is control_plane_mod._user_site_holds_our_package
+    inspect.signature(user_site).bind()
+    assert isinstance(user_site(), bool)
+
+
 @pytest.mark.asyncio
 async def test_the_token_never_reaches_the_prewarm_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -726,7 +500,7 @@ async def test_the_token_never_reaches_the_prewarm_file(
     reader.feed(_register_with_token(PARENT_KEY, TOKEN_A, stub_uuid="stub-parent"))
     reader.feed(_CALL)
     task = asyncio.create_task(
-        asyncio.wait_for(
+        finished(
             gw._handle_connection(
                 reader,
                 _RecordingWriter(),
@@ -735,10 +509,10 @@ async def test_the_token_never_reaches_the_prewarm_file(
                 socket_path=Path("/tmp/cp.sock"),
                 hot_keys=hot,
             ),
-            timeout=5.0,
+            "hot_keys connection",
         )
     )
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     await _close(reader, task)
 
     payloads = hot.top_register_payloads(10)
@@ -746,603 +520,6 @@ async def test_the_token_never_reaches_the_prewarm_file(
     assert TOKEN_A not in json.dumps(payloads)
     hot.flush()
     assert TOKEN_A not in (tmp_path / "hot_keys.json").read_text(encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
-# The Crew side: who mints the token, and when the claim is pushed
-# ---------------------------------------------------------------------------
-
-
-def _bare_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-    pid: int = 4242,
-    published: list[tuple[str, str]] | None = None,
-) -> Any:
-    from kiro_crew.acp.runtime import AcpRuntime
-
-    runtime = AcpRuntime(work_dir="/tmp")
-    runtime._mcp_gateway_socket = "/tmp/kirocrew-gw.sock"
-    monkeypatch.setattr(type(runtime), "pid", property(lambda _self: pid))
-    # ``_own_stub_session`` now also publishes the token's signed mapping (the
-    # switch-free identity channel). Recorded rather than written: these are unit
-    # tests of the naming/claim contract, and letting them touch the mapping
-    # directory would make each one depend on a trust root it never set up.
-    import kiro_crew.acp.runtime as rt_mod
-
-    sink = published if published is not None else []
-    monkeypatch.setattr(
-        rt_mod, "publish_session_token", lambda token, key: sink.append((token, key))
-    )
-    return runtime
-
-
-@pytest.mark.asyncio
-async def test_the_runtime_names_the_session_before_its_stubs_can_register(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """kiro-cli launches this session's stubs while it serves ``session/new``, so
-    a claim sent afterwards races the register it exists to inform. The claim is
-    pushed — and awaited — first, and the token it names is the one on the
-    entries handed to that request."""
-    import kiro_crew.acp.runtime as rt_mod
-
-    sent: list[tuple[Any, ...]] = []
-
-    async def _record(socket_path, pid, session_key, channel_id, token):
-        sent.append((socket_path, pid, session_key, token))
-        return True
-
-    monkeypatch.setattr(rt_mod, "send_claim", _record)
-    runtime = _bare_runtime(monkeypatch)
-    entries, token = await runtime._own_stub_session(
-        [{"name": "one", "command": "python", "args": [], "env": []}], SUB_KEY
-    )
-    assert token
-    assert {"name": STUB_SESSION_TOKEN_ENV, "value": token} in entries[0]["env"]
-    assert sent == [("/tmp/kirocrew-gw.sock", 4242, SUB_KEY, token)]
-
-
-@pytest.mark.asyncio
-async def test_each_session_on_one_runtime_gets_its_own_token(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Two sessions sharing a kiro-cli process must not share the name that
-    tells them apart."""
-    import kiro_crew.acp.runtime as rt_mod
-
-    async def _ok(*_a: Any, **_k: Any) -> bool:
-        return True
-
-    monkeypatch.setattr(rt_mod, "send_claim", _ok)
-    runtime = _bare_runtime(monkeypatch)
-    entry = [{"name": "one", "command": "python", "args": [], "env": []}]
-    _first, parent_token = await runtime._own_stub_session(list(entry), PARENT_KEY)
-    _second, sub_token = await runtime._own_stub_session(list(entry), SUB_KEY)
-    assert parent_token and sub_token and parent_token != sub_token
-
-
-@pytest.mark.asyncio
-async def test_an_unclaimed_worker_mints_a_token_but_pushes_no_claim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A warm-pool worker is spawned before any session claims it, so there is
-    no owner to name yet — its ``rekey()`` carries the same token later."""
-    import kiro_crew.acp.runtime as rt_mod
-
-    sent: list[Any] = []
-
-    async def _record(*a: Any, **k: Any) -> bool:
-        sent.append(a)
-        return True
-
-    monkeypatch.setattr(rt_mod, "send_claim", _record)
-    runtime = _bare_runtime(monkeypatch)
-    entries, token = await runtime._own_stub_session(
-        [{"name": "one", "command": "python", "args": [], "env": []}], ""
-    )
-    assert token
-    assert {"name": STUB_SESSION_TOKEN_ENV, "value": token} in entries[0]["env"]
-    assert sent == []
-
-
-@pytest.mark.asyncio
-async def test_no_stub_entries_still_names_the_session_but_pushes_no_claim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Gateway off: nothing to CLAIM, but the session still gets a name.
-
-    A token without a reachable gatewayd is not inert, because gatewayd is not its
-    only reader: it also resolves through a MAC-signed mapping file
-    (:mod:`kiro_crew.session_token_sig`) that the strict identity resolver reads
-    with no daemon, no broker stub and no config switch. So a session on a
-    gateway-less install — the default install — needs a name of its own, and
-    withholding one is the identity gap this asserts against.
-
-    The claim half is independent and is asserted too: with no stub entries there
-    is no stub connection for a claim to inform, so no claim is pushed.
-    """
-    import kiro_crew.acp.runtime as rt_mod
-
-    async def _boom(*_a: Any, **_k: Any) -> bool:
-        raise AssertionError("claimed a session with no stub connections to inform")
-
-    monkeypatch.setattr(rt_mod, "send_claim", _boom)
-    published: list[tuple[str, str]] = []
-    runtime = _bare_runtime(monkeypatch, published=published)
-    entries, token = await runtime._own_stub_session([], PARENT_KEY)
-    assert entries == []
-    assert token
-    # ...and the name is published, or the resolver would have nothing to read.
-    assert published == [(token, PARENT_KEY)]
-
-
-def test_the_shared_runtime_rekey_claims_its_own_session_not_the_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A warm-pool re-claim on a runtime hosting subagents must reach only the
-    claiming session's stubs — which is the token the handle carries."""
-    import kiro_crew.acp.session_provider as sp_mod
-
-    pushed: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        sp_mod,
-        "schedule_claim",
-        lambda socket_path, pid, key, channel, token: pushed.append((pid, key, token)),
-    )
-
-    class _Handle:
-        stub_session_token = TOKEN_A
-
-        def rebind_watchdog(self, *_a: Any, **_k: Any) -> None:
-            pass
-
-        class last_prompt_stats:  # noqa: N801 - mirrors the real attribute name
-            @staticmethod
-            def reset_context_state() -> None:
-                pass
-
-    class _Runtime:
-        _mcp_gateway_socket = "/tmp/kirocrew-gw.sock"
-        pid = 4242
-        _crew_agent = ""
-        _last_activity = 0.0
-
-    provider = sp_mod.AcpSessionProvider.__new__(sp_mod.AcpSessionProvider)
-    provider._handle = _Handle()
-    provider._runtime = _Runtime()
-    provider.rekey(PARENT_KEY, None, "", None)
-    assert pushed == [(4242, PARENT_KEY, TOKEN_A)]
-
-
-#: Every ``create_session`` call that opens a session on a runtime SHARED with
-#: other sessions, and the local name holding that session's key. A session here
-#: that names no owner carries a token no claim ever names, so its stubs resolve
-#: to nothing — and before the token they resolved to whichever session the
-#: shared runtime's process tree pointed at. Deleting one keyword argument
-#: re-opens exactly that, which no behavioural test on another file would catch.
-_SHARED_RUNTIME_SESSION_SITES = [
-    ("src/kiro_crew/subagent_manager/run.py", "session_key=session_key"),
-    ("src/kiro_crew/session_allocation.py", "session_key=key"),
-]
-
-
-@pytest.mark.parametrize("path,expected", _SHARED_RUNTIME_SESSION_SITES)
-def test_sessions_on_a_shared_runtime_name_their_own_owner(path: str, expected: str) -> None:
-    body = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
-    start = body.index("await runtime.create_session(")
-    call = body[start : body.index("\n        )", start)]
-    assert expected in call, f"{path} opens a shared-runtime session without naming its owner"
-
-
-def test_every_turn_re_pushes_the_sessions_claim(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The binding lives in the daemon's memory, so it can be lost while the
-    session is alive. The turn boundary that already rewrites the pid file is
-    where it is re-established — reached through ``getattr`` so a provider
-    without stubs is left alone."""
-    import asyncio as _asyncio
-
-    from kiro_crew.messaging import identity as identity_mod
-
-    calls: list[str] = []
-
-    class _Inner:
-        def reclaim(self) -> None:
-            calls.append("reclaimed")
-
-    class _Provider:
-        client = _Inner()
-
-    class _Sessions:
-        def get_pid(self, _key: str) -> None:
-            return None
-
-        def get_provider(self, _key: str) -> Any:
-            return _Provider()
-
-    _asyncio.run(identity_mod.publish_turn_identity(_Sessions(), PARENT_KEY))
-    assert calls == ["reclaimed"]
-
-
-def test_a_provider_without_stubs_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No stub token means no claim to push and nothing that would read one."""
-    import asyncio as _asyncio
-
-    from kiro_crew.messaging import identity as identity_mod
-
-    class _Sessions:
-        def get_pid(self, _key: str) -> None:
-            return None
-
-        def get_provider(self, _key: str) -> Any:
-            return object()
-
-    _asyncio.run(identity_mod.publish_turn_identity(_Sessions(), PARENT_KEY))
-
-
-@pytest.mark.asyncio
-async def test_warm_reuse_claims_the_fresh_sessions_stubs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``new_conversation`` reuses the runtime and launches FRESH stubs, so it
-    mints a fresh token that nothing has named. Left unclaimed, those stubs are
-    refused — a warm worker would run its whole next task with no identity."""
-    import kiro_crew.acp.session_provider as sp_mod
-
-    class _Handle:
-        def __init__(self, token: str = "") -> None:
-            self.stub_session_token = token
-            self.memory_mode = "persistent"
-            self.model = ""
-            self.session_id = "fresh"
-            self.destroyed = False
-
-        async def destroy(self) -> None:
-            self.destroyed = True
-
-    fresh = _Handle(TOKEN_B)
-
-    class _Runtime:
-        _mcp_gateway_socket = "/tmp/kirocrew-gw.sock"
-        _work_dir = "/tmp/ws"
-        _agent = "kirocrew"
-        pid = 4242
-        # ``new_conversation`` refuses a backend whose teardown does not evict the
-        # old session, so it reads the backend before creating anything. ``""`` is
-        # not "unset" here -- it is kiro's own id (``ACP_BACKEND_KIRO``), the real
-        # runtime's default and a member of the eviction set. Warm reuse succeeding
-        # IS this test's subject, so the stub has to carry it.
-        acp_backend = ""
-
-        def is_alive(self) -> bool:
-            return True
-
-        async def create_session(self, **_kwargs: Any) -> Any:
-            return fresh
-
-    pushed: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        sp_mod,
-        "schedule_claim",
-        lambda socket_path, pid, key, channel, token: pushed.append((key, token)),
-    )
-    provider = sp_mod.AcpSessionProvider.__new__(sp_mod.AcpSessionProvider)
-    provider._handle = _Handle(TOKEN_A)
-    provider._runtime = _Runtime()
-    provider._session_key = PARENT_KEY
-    provider._channel_id = None
-    await provider.new_conversation()
-
-    assert provider._handle is fresh
-    assert pushed == [(PARENT_KEY, TOKEN_B)]
-
-
-@pytest.mark.asyncio
-async def test_a_cold_started_session_can_re_bind_after_a_respawn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The cold-start topology: a top-level kiro session that never rekeys.
-
-    ``rekey()`` is a warm-pool event, so a pool miss, pooling switched off, or a
-    subagent's own session reaches it never — and a provider that learned its key
-    only there would re-claim with an EMPTY session key. gatewayd rejects that
-    frame as malformed BEFORE recording the binding, so the token could never be
-    re-bound: one daemon respawn and the session is identity-less for life. The
-    key therefore arrives at construction, and this asserts the whole chain —
-    empty key binds nothing, seeded key re-binds and re-targets the live stub.
-    """
-    import kiro_crew.acp.session_provider as sp_mod
-
-    _attest(monkeypatch, _ANCESTORS)
-    backend, reader, task = await _live_conn(monkeypatch, "", TOKEN_A, "stub-cold")
-    assert backend.callers[0] is None
-
-    class _Handle:
-        stub_session_token = TOKEN_A
-
-    class _Runtime:
-        _mcp_gateway_socket = "/tmp/kirocrew-gw.sock"
-        pid = _PID
-
-    pushed: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        sp_mod,
-        "schedule_claim",
-        lambda socket_path, pid, key, channel, token: pushed.append((pid, key, token)),
-    )
-
-    # What a provider that never learned its key would have pushed — and what
-    # gatewayd does with it: nothing, not even the binding.
-    keyless = sp_mod.AcpSessionProvider.__new__(sp_mod.AcpSessionProvider)
-    keyless._handle = _Handle()
-    keyless._runtime = _Runtime()
-    keyless._session_key = ""
-    keyless._channel_id = None
-    keyless.reclaim()
-    assert pushed == [(_PID, "", TOKEN_A)]
-    ack = await gw._apply_claim(_claim_with_token(_PID, "", TOKEN_A))
-    assert ack["type"] == "claim-rejected"
-    assert gw._token_is_unbound(TOKEN_A)
-
-    # The cold-start provider is handed its owner at construction instead.
-    pushed.clear()
-    seeded = sp_mod.AcpSessionProvider(
-        _Handle(), _Runtime(), session_key=PARENT_KEY, channel_id="C_CP"
-    )
-    seeded.reclaim()
-    assert pushed == [(_PID, PARENT_KEY, TOKEN_A)]
-    ack = await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
-    assert ack["type"] == "claimed" and ack["updated"] == 1
-    assert (await _next_caller(backend, reader)).session_key == PARENT_KEY
-    await _close(reader, task)
-
-
-#: Every construction of a provider over a session that will never rekey, and
-#: the local name holding that session's key. Same failure mode as the
-#: shared-runtime session sites: one deleted keyword argument and the provider's
-#: re-claim carries no key, which gatewayd discards.
-_PROVIDER_OWNER_SITES = [
-    ("src/kiro_crew/providers/acp.py", "session_key=self._owning_session_key()"),
-    ("src/kiro_crew/subagent_manager/run.py", "session_key=session_key"),
-]
-
-
-@pytest.mark.parametrize("path,expected", _PROVIDER_OWNER_SITES)
-def test_every_provider_is_told_which_session_it_serves(path: str, expected: str) -> None:
-    body = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
-    # The CONSTRUCTION, not a mention: the module also names the class in its
-    # import and in prose about which client shape a slot carries.
-    start = body.index("= AcpSessionProvider(")
-    call = body[start : body.index("\n        )", start)]
-    assert expected in call, f"{path} builds a provider that cannot name its own session"
-
-
-@pytest.mark.asyncio
-async def test_a_subagents_own_turn_re_establishes_its_claim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A subagent's turn is driven by its manager, not by a dispatch surface, so
-    the shared identity publisher never runs for it — and it is the session type
-    this token exists to protect. Its provider re-claims at its own turn
-    boundary, so a daemon respawn mid-run costs it one turn rather than the whole
-    remaining run."""
-    import kiro_crew.acp.session_provider as sp_mod
-
-    class _Handle:
-        stub_session_token = TOKEN_B
-        session_id = "subagent-test-session"
-
-        async def prompt(self, _message: str) -> Any:
-            assert pushed == [(_PID, SUB_KEY, TOKEN_B)]
-            for event in ():
-                yield event
-
-    class _Runtime:
-        _mcp_gateway_socket = "/tmp/kirocrew-gw.sock"
-        pid = _PID
-        process_instance = "runtime-test-instance"
-
-        def saw_not_logged_in(self) -> bool:
-            return False
-
-    pushed: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        sp_mod,
-        "schedule_claim",
-        lambda socket_path, pid, key, channel, token: pushed.append((pid, key, token)),
-    )
-    provider = sp_mod.AcpSessionProvider(_Handle(), _Runtime(), session_key=SUB_KEY)
-    async for _event in provider.stream("go"):
-        pass
-    assert pushed == [(_PID, SUB_KEY, TOKEN_B)]
-
-
-def test_the_client_reclaim_names_its_own_token(monkeypatch: pytest.MonkeyPatch) -> None:
-    import kiro_crew.acp.client as client_mod
-
-    pushed: list[tuple[Any, ...]] = []
-    monkeypatch.setattr(
-        client_mod,
-        "schedule_claim",
-        lambda socket_path, pid, key, channel, token: pushed.append((key, token)),
-    )
-    client = client_mod.AcpClient.__new__(client_mod.AcpClient)
-    client._stub_session_token = TOKEN_A
-    client._mcp_gateway_socket = "/tmp/kirocrew-gw.sock"
-    client._session_key = PARENT_KEY
-    client._channel_id = None
-    client._process = None
-    client.reclaim()
-    assert pushed == [(PARENT_KEY, TOKEN_A)]
-    # A client with no injected stubs pushes nothing: there is no token to name.
-    pushed.clear()
-    client._stub_session_token = ""
-    client.reclaim()
-    assert pushed == []
-
-
-# ---------------------------------------------------------------------------
-# The shipped binary: env on the injected element does not cost precedence
-# ---------------------------------------------------------------------------
-
-_TOKEN_DRIVER = r"""
-import json, os, subprocess, sys, threading, time
-from kiro_crew import platform_compat
-
-w = sys.argv[1]
-p = subprocess.Popen(["kiro-cli", "acp", "--agent", "pooltest"], cwd=w + "/proj",
-                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                     stderr=subprocess.PIPE, text=True,
-                     env={**os.environ, "KIRO_HOME": w + "/khome"})
-
-
-def teardown():
-    try:
-        platform_compat.kill_process_tree(p.pid, platform_compat.SIGKILL)
-    except (ProcessLookupError, OSError):
-        p.kill()
-    try:
-        p.wait(timeout=15)
-    except subprocess.TimeoutExpired:
-        pass
-    for stream in (p.stdin, p.stdout, p.stderr):
-        try:
-            stream.close()
-        except OSError:
-            pass
-
-
-send = lambda o: (p.stdin.write(json.dumps(o) + "\n"), p.stdin.flush())
-send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-      "params": {"protocolVersion": 1, "clientCapabilities":
-                 {"fs": {"readTextFile": False, "writeTextFile": False}}}})
-_line = []
-_t = threading.Thread(target=lambda: _line.append(p.stdout.readline()), daemon=True)
-_t.start()
-_t.join(30)
-if not _line:
-    teardown()
-    sys.exit("kiro-cli never answered initialize within 30s")
-send({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-      "params": {"cwd": w + "/proj", "mcpServers": [
-          {"name": "shared", "command": sys.executable,
-           "args": [sys.argv[2], w + "/marks/INJECTED"],
-           "env": [{"name": "KIROCREW_STUB_SESSION_TOKEN", "value": sys.argv[3]}]}]}})
-deadline = time.time() + 20
-injected = os.path.join(w, "marks", "INJECTED")
-while time.time() < deadline and not os.path.exists(injected):
-    time.sleep(0.05)
-time.sleep(1)
-teardown()
-"""
-
-#: Writes the marker AND the token it observed in its own env, so the test can
-#: tell "the element was honored" from "the element's env was honored".
-_TOKEN_PROBE = _PROBE_SCRIPT.replace(
-    'pathlib.Path(sys.argv[1]).write_text("x", encoding="utf-8")',
-    "pathlib.Path(sys.argv[1]).write_text(\n"
-    '    os.environ.get("KIROCREW_STUB_SESSION_TOKEN", ""), encoding="utf-8"\n'
-    ")",
-).replace("import json\nimport pathlib", "import json\nimport os\nimport pathlib")
-
-
-@pytest.mark.skipif(not REAL_CLI, reason="kiro-cli not on PATH")
-@pytest.mark.skipif(os.name != "posix", reason="POSIX pathing in fixture")
-def test_real_kiro_cli_delivers_the_token_and_still_overrides_the_spec() -> None:
-    """ANTI-DRIFT GUARD, the token half.
-
-    ``test_real_kiro_cli_prefers_session_injected_server`` pins that a
-    session-injected element outranks the agent spec's same-named entry — with
-    an EMPTY ``env``. The token rides that element's ``env``, so this pins the
-    two things that shape now depends on: the child receives the pair, and
-    carrying it does not cost the precedence pooling relies on.
-    """
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
-        root = Path(w)
-        (root / "khome" / "agents").mkdir(parents=True)
-        (root / "proj").mkdir()
-        (root / "marks").mkdir()
-        probe = root / "probe.py"
-        probe.write_text(_TOKEN_PROBE, encoding="utf-8")
-        (root / "khome" / "agents" / "pooltest.json").write_text(
-            json.dumps(
-                {
-                    "name": "pooltest",
-                    "description": "token delivery probe",
-                    "model": "claude-haiku-4.5",
-                    "tools": [],
-                    "prompt": "probe",
-                    "mcpServers": {
-                        "shared": {
-                            "command": sys.executable,
-                            "args": [str(probe), str(root / "marks" / "FROM_SPEC")],
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        driver = root / "drive.py"
-        driver.write_text(_TOKEN_DRIVER, encoding="utf-8")
-        # Popen + a finally that reaps the whole TREE, not subprocess.run: the
-        # driver spawns kiro-cli, which spawns the probe servers, and a
-        # parent-side timeout would return from run() leaving all of them alive
-        # holding the temp dir. The driver tears its own tree down on every exit
-        # it controls; this covers the exit it does not.
-        # kiro-cli writes its own log directory and telemetry spool under TMPDIR;
-        # aimed at this tree, that residue is deleted with the test's directory
-        # instead of outliving it in the shared temp root.
-        child_tmp = root / "tmp"
-        child_tmp.mkdir()
-        child_env = {
-            **os.environ,
-            "TMPDIR": str(child_tmp),
-            "TMP": str(child_tmp),
-            "TEMP": str(child_tmp),
-        }
-        proc = subprocess.Popen(
-            [sys.executable, str(driver), str(root), str(probe), TOKEN_A],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",
-            errors="replace",
-            env=child_env,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=180)
-        except subprocess.TimeoutExpired:
-            stdout, stderr = "", "driver exceeded its 180s budget"
-        finally:
-            if proc.poll() is None:
-                try:
-                    platform_compat.kill_process_tree(proc.pid, platform_compat.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    proc.kill()
-                try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    pass
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None:
-                    with contextlib.suppress(OSError):
-                        stream.close()
-        deadline = time.time() + 5
-        while time.time() < deadline and not (root / "marks" / "INJECTED").exists():
-            time.sleep(0.2)
-        assert (root / "marks" / "INJECTED").exists(), (
-            "the injected server never launched with env on its element\n"
-            f"driver exit: {proc.returncode}\n"
-            f"driver stdout: {(stdout or '')[-2000:]}\n"
-            f"driver stderr: {(stderr or '')[-2000:]}"
-        )
-        assert (root / "marks" / "INJECTED").read_text(encoding="utf-8") == TOKEN_A, (
-            "the element's env never reached the child: the stub cannot report a "
-            "token it was not given, and every session on a shared runtime would "
-            "fall back to the parent's identity"
-        )
-        assert not (root / "marks" / "FROM_SPEC").exists(), (
-            "the spec's same-named server ALSO launched: an element carrying env "
-            "no longer overrides, so every pooled server would run twice"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1366,7 +543,7 @@ async def _live_conn_for_server(
     reader.feed(frame)
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     return backend, reader, task
 
 
@@ -1478,7 +655,7 @@ async def test_a_respawned_replacement_is_judged_on_its_own(
     reader.feed(_CALL)
     reader.feed(dict(_CALL, id=2))
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(replacement.forwarded.wait(), timeout=5.0)
+    await await_until(replacement.forwarded)
 
     # The dead control plane was entitled to the token ...
     assert dying.callers[0] is not None and dying.callers[0].session_token == TOKEN_A
@@ -1500,8 +677,8 @@ def test_the_token_is_attached_per_backend_never_to_the_base_caller() -> None:
 
     base = CallerContext(session_key=PARENT_KEY)
     conn = SimpleNamespace(stub_session_token=TOKEN_A)
-    ours = SimpleNamespace(control_plane=True)
-    theirs = SimpleNamespace(control_plane=False)
+    ours = SimpleNamespace(control_plane=True, control_plane_denial="")
+    theirs = SimpleNamespace(control_plane=False, control_plane_denial="")
 
     handed = gw._caller_for_backend(ours, base, conn)  # type: ignore[arg-type]
     assert handed is not None and handed.session_token == TOKEN_A
@@ -1530,7 +707,10 @@ def test_control_plane_backends_contain_session_mcp_and_justify_the_difference()
     tools off unenforceable.
 
     The extras are pinned BY NAME to exactly the opt-in managed servers plus the
-    spec-gated ``kirocrew-computer`` and each is also checked BY PROPERTY. The name
+    spec-gated ``kirocrew-computer`` and the platform guide set, and each is also
+    checked BY PROPERTY. The guide set is emitted into every default spec but is
+    still a spec's to withhold (an operator or a policy can take it off), so it
+    is not mounted regardless of the spec the way the control plane is. The name
     pin makes a new recipient an explicit, reviewable change; the property check
     stops a typo'd or third-party name from being handed a token even if someone
     edits the pin. The whole set is also pinned equal to
@@ -1545,18 +725,32 @@ def test_control_plane_backends_contain_session_mcp_and_justify_the_difference()
     assert frozenset(CONTROL_PLANE_SERVERS) < gw.CONTROL_PLANE_BACKENDS
 
     token_only = gw.CONTROL_PLANE_BACKENDS - frozenset(CONTROL_PLANE_SERVERS)
-    assert token_only == frozenset(OPT_IN_BIN_MCP_SERVERS) | {"kirocrew-computer"}, (
+    assert token_only == frozenset(OPT_IN_BIN_MCP_SERVERS) | {
+        "kirocrew-computer",
+        "kirocrew-guide",
+        "kirocrew-mate",
+    }, (
         "a new token recipient must be added to this pin in the same commit that adds it "
         "to mcp_cleanup's managed-server tuples"
     )
+    from kiro_crew.acp.session_mcp import session_mcp_servers
+
     for name in sorted(token_only):
         spec = _MANAGED_MCP_SERVERS.get(name)
         assert isinstance(spec, dict), f"{name!r} is handed a token but is not a managed server"
-        assert spec.get("opt_in") or callable(spec.get("spec_gate")), (
-            f"{name!r} is token-only, which is only justified for a server that is NOT "
-            "unconditionally mounted (opt_in, or behind a spec_gate); one mounted in every "
-            "session belongs in CONTROL_PLANE_SERVERS as well"
+        # Token-only is justified only for a server that is NOT unconditionally
+        # mounted. Checked by behaviour for every recipient: a spec whose `tools`
+        # does not name it withholds it, while a control-plane server would be
+        # mounted regardless of the spec.
+        withheld = {"mcpServers": {name: {"command": "kirocrew", "args": ["x"]}}, "tools": []}
+        named = {**withheld, "tools": [f"@{name}"]}
+        assert name not in [e.get("name") for e in session_mcp_servers("probe", spec=withheld)], (
+            f"{name!r} is token-only but is mounted even when the spec does not name it; "
+            "one mounted in every session belongs in CONTROL_PLANE_SERVERS as well"
         )
+        assert name in [
+            e.get("name") for e in session_mcp_servers("probe", spec=named)
+        ], f"{name!r}: the withholding probe proves nothing if naming it does not mount it"
 
 
 def test_the_control_plane_check_asks_for_an_opt_in_invocation(
@@ -1929,7 +1123,9 @@ class TestSpawnsOwnControlPlane:
         spawned_env: dict[str, str] = {}
         backend = _fake_backend()
 
-        def classify(server_name: str, command: str, args: Any, *, env: Any, work_dir: Any) -> bool:
+        def classify(
+            server_name: str, command: str, args: Any, *, env: Any, work_dir: Any, denial: Any
+        ) -> bool:
             assert server_name == "kirocrew-cron" and command == "kirocrew" and args == ["mcp-cron"]
             assert "PYTHONSAFEPATH" not in env, "the check sees the env the child would get"
             order.append("verdict")
@@ -1978,7 +1174,9 @@ class TestSpawnsOwnControlPlane:
         spawned_env: dict[str, str] = {}
         backend = _fake_backend()
 
-        def classify(name: str, cmd: str, argv: Any, *, env: Any, work_dir: Any) -> bool:
+        def classify(
+            name: str, cmd: str, argv: Any, *, env: Any, work_dir: Any, denial: Any
+        ) -> bool:
             classifier_env.update(env)
             return name == "kirocrew-cron"
 

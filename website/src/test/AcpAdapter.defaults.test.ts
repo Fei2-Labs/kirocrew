@@ -36,6 +36,12 @@ describe('AcpAdapter.resolveModel — delegates to the backend resolver', () => 
     expect(agentResolvedModel).toHaveBeenCalledWith('oncall')
   })
 
+  it('passes the owning app through, so its own model setting is part of the answer', async () => {
+    agentResolvedModel.mockResolvedValue({ model: 'claude-haiku-5' })
+    expect(await new AcpAdapter().resolveModel('oncall', 'demo-app')).toBe('claude-haiku-5')
+    expect(agentResolvedModel).toHaveBeenCalledWith('oncall', 'demo-app')
+  })
+
   it('does NOT re-derive the precedence client-side', async () => {
     agentResolvedModel.mockResolvedValue({ model: 'claude-opus-5' })
     await new AcpAdapter().resolveModel('oncall')
@@ -69,16 +75,16 @@ describe('AcpAdapter.resolveDefaultEffort', () => {
 
   it('returns the configured default effort', async () => {
     kirocrewConfig.mockResolvedValue({ agent: { reasoning_effort: 'high' } })
-    expect(await new AcpAdapter().resolveDefaultEffort()).toBe('high')
+    expect(await new AcpAdapter().resolveDefaultEffort(() => kirocrewConfig())).toBe('high')
   })
 
   it('returns "" when unset, so callers keep the model-default semantics', async () => {
     kirocrewConfig.mockResolvedValue({ agent: {} })
-    expect(await new AcpAdapter().resolveDefaultEffort()).toBe('')
+    expect(await new AcpAdapter().resolveDefaultEffort(() => kirocrewConfig())).toBe('')
   })
 
   it('returns "" on a failed config read rather than throwing', async () => {
     kirocrewConfig.mockRejectedValue(new Error('boom'))
-    expect(await new AcpAdapter().resolveDefaultEffort()).toBe('')
+    expect(await new AcpAdapter().resolveDefaultEffort(() => kirocrewConfig())).toBe('')
   })
 })

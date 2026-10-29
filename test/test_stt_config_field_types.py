@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
+from dashboard_owner_helpers import NoConfiguredOwner
 
 import kiro_crew.dashboard.handlers.core as core
 from kiro_crew.config.loader import config_path
+from kiro_crew.testing.wait import finished
 
 
 def _put(body: dict) -> MagicMock:
     request = MagicMock(spec=web.Request)
     request.method = "PUT"
     request.json = AsyncMock(return_value=body)
+    # api_theme_config is owner-gated: model the token-auth middleware's signed
+    # local-owner claims so the field contract under test is what answers.
+    request.app = {"state": NoConfiguredOwner()}
+    claims = {"user": "local-app", "app": ""}
+    request.get = lambda key, default=None: claims.get(key, default)
+    request.__contains__.side_effect = lambda key: key in claims
+    request.__getitem__.side_effect = lambda key: claims[key]
     return request
 
 
@@ -29,7 +37,7 @@ def _stub_host_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(core, "_transcribe_extra_importable", lambda: True)
     monkeypatch.setattr(core, "_pip_install_channel_available", lambda: True)
     monkeypatch.setattr(core.platform_compat, "is_bundled_interpreter", lambda: False)
-    monkeypatch.setattr(core, "is_available", lambda _stt: False)
+    monkeypatch.setattr(core, "availability_detail", lambda _stt: core.stt.Availability(False))
 
 
 def _stored_stt() -> dict:
@@ -156,10 +164,12 @@ async def test_language_preference_survives_theme_save_and_provider_roundtrip(
         await core.api_stt_config(_put({"language_code": language}))
     assert _stored_stt()["language_code"] == language
 
-    # This unrelated handler loads and saves the whole dataclass, not an STT delta.
+    # An unrelated handler's write (a dashboard-only delta) must leave STT alone.
     before = json.loads(config_path().read_text(encoding="utf-8"))
     mode = "light" if before.get("dashboard", {}).get("theme_mode") == "dark" else "dark"
-    response = await asyncio.wait_for(core.api_theme_config(_put({"mode": mode})), timeout=5)
+    response = await finished(
+        core.api_theme_config(_put({"mode": mode})), "the theme write", timeout=5
+    )
     assert response.status == 200
     assert _stored_stt()["language_code"] == language
 

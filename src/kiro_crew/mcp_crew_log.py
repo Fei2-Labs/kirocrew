@@ -35,7 +35,7 @@ strict session identity, and then a SCOPE. A session may read its own unit, the
 unit of any session it dispatched at any depth, and, if it is
 the owner at a dashboard tab, any unit at all. This module shapes output and nothing
 else, which is why a reviewer looking for the security argument should read
-``dashboard/handlers/crew_log.py``.
+``dashboard/handlers/crew_log_scope.py``.
 
 **Why a dispatch tree.** A conductor reading the crew logs of the sub-sessions it
 dispatched is the ordinary shape of the work rather than a special case, and the
@@ -96,7 +96,14 @@ TOOLS: tuple[str, ...] = ("crew_log_list", "crew_log_read", "crew_log_projection
 #: description lists them without importing the storage package into this process.
 #: A name this list is missing is refused by the ENDPOINT, which reads the real
 #: ``PROJECTION_NAMES``; a test pins the two together.
-PROJECTION_NAMES: tuple[str, ...] = ("status", "usage", "timeline", "tools", "approvals")
+PROJECTION_NAMES: tuple[str, ...] = (
+    "status",
+    "usage",
+    "timeline",
+    "tools",
+    "approvals",
+    "subagents",
+)
 
 #: Entries one ``crew_log_read`` returns, whatever a caller asks for. The endpoint
 #: clamps its own span too; this is the tool's promise to its caller.
@@ -242,7 +249,9 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "the open turn; 'usage' is tokens, credits, injected context and "
                 "compactions; 'timeline' is the recent moments; 'tools' is per-tool "
                 "counts and outcomes; 'approvals' is what was asked and what was "
-                "answered. Prefer this over reading entries when the question is "
+                "answered; 'subagents' is the children this session dispatched with "
+                "each one's outcome, duration and credits. Prefer this over reading "
+                "entries when the question is "
                 "'what did this session spend' or 'is it still running' — one fold "
                 "answers it without paging the file. ``unit`` takes the same forms "
                 "as crew_log_read, including 'self'. READ-ONLY."
@@ -603,7 +612,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
 #: :func:`~kiro_crew.mcp_core.require_strict_session_key`, whose first source is
 #: that block, and the endpoint scopes every read on the key this server forwards.
 #:
-#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: Advertising is not cosmetic. ``mcp_gateway/backend_stubs.py`` strips any client-forged
 #: caller block from EVERY forwarded request and re-injects its own only when the
 #: backend advertised this capability — so without the advertisement the block
 #: never arrives and a pooled backend would resolve an empty identity for every

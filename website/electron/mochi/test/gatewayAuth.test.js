@@ -31,8 +31,17 @@ test("withGatewayAuth delivers a cookie-sourced credential as a Cookie header, n
     "must branch on how the credential was sourced",
   );
   assert.ok(
-    /headers: \{ Cookie: `mc_token_\$\{port\}=\$\{auth\.value\}` \}/.test(body),
+    /headers: cookie \? \{ Cookie: cookie \} : \{\}/.test(body),
     "a viaCookie credential must be sent as an mc_token_<port> Cookie header",
+  );
+  // sessionCookieHeader is the one builder of that header; its raw-port rule is
+  // unit-tested beside the Crew Companion credential tests.
+  assert.ok(
+    /const cookie = sessionCookieHeader\(url, auth\.value\)/.test(body),
+    "the cookie's port must be the one the URL STATES: the gateway names "
+      + "mc_token_<port> after its own listen port when the Host header carries "
+      + "none, so resolving a scheme default here would name another gateway's "
+      + "cookie out of a host-scoped jar",
   );
   // The cookie branch must return before falling into the query-append path.
   const cookieBranch = body.indexOf("if (auth.viaCookie)");
@@ -65,6 +74,37 @@ test("every local-gateway request built from gatewayToken() routes through withG
   assert.ok(
     !/\$\{BACKEND_URL\}\/api\/apps\/mochi\/settings\?token=\$\{encodeURIComponent/.test(MAIN),
     "mochiSettings must not go back to inlining a bare query token",
+  );
+});
+
+test("withGatewayAuth never re-bases a request onto a derived origin", () => {
+  // The request goes to the URL it was built from. A credential is minted only
+  // after the coverage requirement confirms this gateway holds every loopback
+  // family the configured name resolves to (`listenerSecretsFor`), so the name
+  // already on the URL can reach no one else -- and re-deriving a destination is
+  // what would move the document off its own storage origin.
+  const start = MAIN.indexOf("function withGatewayAuth(");
+  assert.ok(start !== -1, "withGatewayAuth must exist");
+  const body = MAIN.slice(start, MAIN.indexOf("\n}", start));
+  assert.ok(
+    !/auth\.origin/.test(body),
+    "withGatewayAuth must not consume an origin from its auth object",
+  );
+  assert.ok(
+    !/new URL\(built\.pathname/.test(body),
+    "withGatewayAuth must not rebuild the request onto another origin",
+  );
+  assert.ok(
+    /\$\{url\}\$\{sep\}token=/.test(body),
+    "the token is appended to the URL as built",
+  );
+  // Order still matters: the cookie credential returns before any query append,
+  // because it is already scoped by the cookie jar and must not also be inlined.
+  const cookieBranch = body.indexOf("if (auth.viaCookie)");
+  const queryAppend = body.indexOf("token=${encodeURIComponent");
+  assert.ok(
+    cookieBranch !== -1 && cookieBranch < queryAppend,
+    "the cookie credential must return before the token is appended",
   );
 });
 

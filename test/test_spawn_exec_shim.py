@@ -26,6 +26,7 @@ import threading
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 from spawn_test_helpers import strip_spawn_shim
 
 from kiro_crew import _spawn_exec_shim as shim
@@ -41,6 +42,8 @@ from kiro_crew.sandbox import (
     run_limited,
     spawn_shim_argv,
 )
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import finished
 
 # The shim exists to deliver POSIX rlimits, and `spawn_shim_argv` returns an empty
 # prefix on Windows, so there is nothing here to exercise there. Skipping at import
@@ -95,6 +98,22 @@ class TestShimSpecParsing:
         assert applied == [(resource.RLIMIT_NOFILE, (4096, 4096))]
 
 
+def _pin_clock(monkeypatch) -> ManualClock:
+    """A clock only the shim reads, recording its exec-retry sleeps.
+
+    Installed on the shim's own ``time`` binding. That binding IS the stdlib
+    module, so patching ``shim.time.sleep`` would also record every other
+    thread's sleep in the worker.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    clock.install(monkeypatch, shim)
+    return clock
+
+
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch):
+    assert_clock_is_private(_pin_clock(monkeypatch), shim)
+
+
 class TestShimArgvContract:
     def test_missing_separator_is_refused(self, capsys):
         assert shim.main(["--rlimits=RLIMIT_NOFILE:1024"]) == 127
@@ -109,8 +128,46 @@ class TestShimArgvContract:
         assert shim.main(["--"]) == 127
         assert "no command" in capsys.readouterr().err
 
-    def test_exec_failure_reports_127_not_a_traceback(self, capsys):
+    def test_exec_failure_reports_127_not_a_traceback(self, capsys, monkeypatch):
+        clock = _pin_clock(monkeypatch)
         assert shim.main(["--", "/nonexistent/binary"]) == 127
+        assert "cannot execute" in capsys.readouterr().err
+        assert clock.sleeps == (shim._EXECV_RETRY_DELAY_S,) * (shim._EXECV_RETRY_ATTEMPTS - 1)
+
+    def test_transient_target_absence_is_retried_but_other_errors_are_not(
+        self, capsys, monkeypatch
+    ):
+        calls: list[tuple] = []
+        clock = _pin_clock(monkeypatch)
+
+        def fake_execv(path, argv):
+            calls.append((path, argv))
+            if len(calls) == 1:
+                raise FileNotFoundError(2, "No such file or directory")
+            raise OSError(13, "Permission denied")
+
+        with patch.object(shim.os, "execv", fake_execv):
+            assert shim.main(["--", "/bin/echo"]) == 127
+        # One retry for the transient miss, then EACCES stops the loop.
+        assert len(calls) == 2
+        assert clock.sleeps == (shim._EXECV_RETRY_DELAY_S,)
+        assert "Permission denied" in capsys.readouterr().err
+
+    @posix_only
+    def test_a_terminal_command_missing_is_not_retried(self, capsys, monkeypatch):
+        """The rename-window retry is the runtime spawn's; a terminal command fails fast."""
+        calls: list[tuple] = []
+        clock = _pin_clock(monkeypatch)
+        monkeypatch.setattr(shim.os, "login_tty", lambda fd: None)
+
+        def fake_execv(path, argv):
+            calls.append((path, argv))
+            raise OSError(2, "No such file or directory")
+
+        with patch.object(shim.os, "execv", fake_execv):
+            assert shim.main(["--ctty-fd=0", "--", "/bin/true"]) == 127
+        assert len(calls) == 1
+        assert clock.sleeps == ()
         assert "cannot execute" in capsys.readouterr().err
 
     def test_separator_inside_the_command_is_not_consumed(self):
@@ -118,7 +175,7 @@ class TestShimArgvContract:
 
         def fake_execv(_path, argv):
             calls.append(argv)
-            raise OSError(2, "stop here")
+            raise OSError(13, "stop here")
 
         with patch.object(shim.os, "execv", fake_execv):
             shim.main(["--", "/bin/echo", "--", "--rlimits=bogus"])
@@ -133,7 +190,7 @@ class TestShimArgvContract:
             patch.object(
                 shim.os,
                 "execv",
-                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(2, "x")),
+                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(13, "x")),
             ),
         ):
             shim.main(["--rlimits=RLIMIT_NOFILE:1024", "--oom-bias", "--", "/bin/true"])
@@ -169,7 +226,7 @@ class TestShimArgvContract:
             patch.object(
                 shim.os,
                 "execv",
-                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(2, "x")),
+                lambda *_a: order.append("exec") or (_ for _ in ()).throw(OSError(13, "x")),
             ),
         ):
             shim.main(["--rlimits=RLIMIT_NOFILE:1024", "--chdir-fd=9", "--", "/bin/true"])
@@ -195,12 +252,47 @@ class TestShimArgvContract:
         biased: list[bool] = []
         with (
             patch.object(shim, "_bias_oom_score", lambda: biased.append(True)),
-            patch.object(shim.os, "execv", lambda *_a: (_ for _ in ()).throw(OSError(2, "x"))),
+            patch.object(shim.os, "execv", lambda *_a: (_ for _ in ()).throw(OSError(13, "x"))),
         ):
             shim.main(["--", "/bin/true"])
             assert biased == []
             shim.main(["--oom-bias", "--", "/bin/true"])
             assert biased == [True]
+
+
+@posix_only
+class TestShimRetryEndToEnd:
+    @pytest.mark.asyncio
+    async def test_target_appearing_inside_the_retry_window_is_executed(self, tmp_path):
+        """The defect: the CLI binary is briefly absent mid-spawn, then reappears."""
+        target = tmp_path / "late-bird"
+        prepared = tmp_path / ".late-bird-ready"
+        prepared.write_text("#!/bin/sh\nexit 0\n")
+        prepared.chmod(0o755)
+        publication_errors: list[Exception] = []
+
+        def create_target() -> None:
+            try:
+                prepared.replace(target)
+            except Exception as exc:
+                publication_errors.append(exc)
+
+        assert not target.exists(), "the target must be absent when the shim starts"
+        timer = threading.Timer(0.3, create_target)
+        proc = await asyncio.create_subprocess_exec(*spawn_shim_argv(), str(target))
+        try:
+            timer.start()
+            rc = await asyncio.wait_for(proc.wait(), timeout=30)
+        finally:
+            timer.cancel()
+            if timer.ident is not None:
+                await asyncio.to_thread(timer.join, 5)
+            if proc.returncode is None:
+                proc.kill()
+                await finished(proc.wait(), "the killed shim exiting", timeout=5)
+        assert not timer.is_alive(), "the executable publisher survived cleanup"
+        assert not publication_errors, f"executable publication failed: {publication_errors}"
+        assert rc == 0
 
 
 # --------------------------------------------------------------------------

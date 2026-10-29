@@ -144,8 +144,17 @@ describe('fr spacing (style/fr.md §1)', () => {
         // literal the user types, not a French colon. Strip the token and test
         // the REST of the value, so prose beside a path is still held to §1 —
         // an early return here would let a malformed sentence ride in on a path.
-        const withoutDrivePaths = value.replace(/\b[A-Za-z]:[\\/]\S*/g, '')
-        return WRONG_DOUBLE_SPACE.test(withoutDrivePaths)
+        // URI schemes are literals too: the colon in `skill://` is not French
+        // punctuation and must stay byte-for-byte usable by the reader. So is an
+        // AWS IAM action (`transcribe:StartStreamTranscription`), which the reader
+        // pastes into a policy.
+        const withoutUris = value.replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/\S*/g, '')
+        const withoutDrivePaths = withoutUris.replace(/\b[A-Za-z]:[\\/]\S*/g, '')
+        const withoutIamActions = withoutDrivePaths.replace(
+          /\b[a-z][a-z0-9-]*:[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b/g,
+          '',
+        )
+        return WRONG_DOUBLE_SPACE.test(withoutIamActions)
       })
       .map(([key, value]) => `${key}: ${JSON.stringify(value.slice(0, 60))}`)
     expect(bad, `${report(bad)}\n\nThere is no ceiling to raise for these — the value is yours.`)
@@ -170,22 +179,45 @@ describe('fr register (style/fr.md §4)', () => {
 })
 
 describe('fr accents (style/fr.md §7)', () => {
-  it('capitals have their accents', () => {
-    // Common violations: "Etat" should be "État", "A propos" should be "À propos"
-    const MUST_ACCENT: Array<[string, string]> = [
-      ['Etat', 'État'],
-      ['Ecran', 'Écran'],
-      ['Element', 'Élément'],
-      ['Evenement', 'Événement'],
-    ]
+  // Shared by the ceiling below and its companion, so the two can never come to
+  // disagree about what a violation is.
+  const MUST_ACCENT: Array<[string, string]> = [
+    ['Etat', 'État'],
+    ['Ecran', 'Écran'],
+    ['Element', 'Élément'],
+    ['Evenement', 'Événement'],
+  ]
+  const violations = (values: Record<string, string>): string[] => {
     const bad: string[] = []
-    for (const [key, value] of Object.entries(fr)) {
+    for (const [key, value] of Object.entries(values)) {
       for (const [wrong, correct] of MUST_ACCENT) {
         if (value.includes(wrong) && !value.includes(correct)) {
           bad.push(`${key}: has '${wrong}' not '${correct}'`)
         }
       }
     }
+    return bad
+  }
+
+  it('capitals have their accents', () => {
+    // Common violations: "Etat" should be "État", "A propos" should be "À propos"
+    const bad = violations(fr)
     expect(bad.length, report(bad)).toBeLessThanOrEqual(11)
+  })
+
+  // The ceiling's companion: it tolerates the inherited catalog, but it cannot say
+  // whose violation it is, so a branch that adds one rides under it until the count
+  // crosses and the round that reds belongs to someone else. See
+  // docs/ci/i18n-gates.md.
+  it('[changed-values] accents capitals at zero tolerance', () => {
+    const changed = changedFrValues()
+    if (changed === null) {
+      // eslint-disable-next-line no-console -- stdout IS this gate's report channel, and this skip is reachable on a bare local run
+      console.log('[changed-values] skipped — I18N_BASE_REF is unset, so there is no branch to diff.')
+      return
+    }
+    const bad = violations(changed)
+    expect(bad, `${report(bad)}\n\nThere is no ceiling to raise for these — the value is yours.`)
+      .toEqual([])
   })
 })

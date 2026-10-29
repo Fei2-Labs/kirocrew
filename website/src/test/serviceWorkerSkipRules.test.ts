@@ -71,12 +71,18 @@ describe('service worker skip rules', () => {
     expect(intercepts('/apps/dev-fleet/api/state')).toBe(false)
   })
 
+  it('never substitutes the cached dashboard shell for an app window', () => {
+    expect(intercepts('/app-windows/mochi/pet.html')).toBe(false)
+    expect(intercepts('/app-windows/crew-companion/panel.html')).toBe(false)
+  })
+
   it('DOES take hashed assets over, so a 5xx can be retried', () => {
     // Not for caching — the immutable HTTP cache still owns them. The worker sits
     // in the path only so that one 502 on a module script does not kill the page.
-    // The shell above is served from cache, so a module graph that fails leaves a
-    // dark skeleton that no reload clears.
+    // App-window documents bypass the worker, but their /assets sub-resources
+    // still need the same retry protection.
     expect(intercepts('/assets/App-abc123.js', 'no-cors')).toBe(true)
+    expect(intercepts('/assets/app-windows/mochi/pet-abc123.js', 'no-cors')).toBe(true)
   })
 })
 
@@ -122,8 +128,8 @@ describe('the shell cache refresh is scoped to the shell', () => {
     expect(r.puts).toEqual(['/', '/index.html'])
   })
 
-  it('does NOT overwrite the shell from a standalone app-window document', async () => {
-    const r = shellPutsFor('/app-windows/mochi/panel.html') as unknown as { puts: string[]; settled: Promise<unknown> }
+  it('does NOT overwrite the shell from a handled non-shell SPA route', async () => {
+    const r = shellPutsFor('/artifacts') as unknown as { puts: string[]; settled: Promise<unknown> }
     await r.settled
     expect(r.puts).toEqual([])
   })
@@ -234,6 +240,52 @@ describe('hashed-asset 5xx retry', () => {
     const r = assetRequest([502, 200], '/vendor/react.mjs')
     expect((await r.result).status).toBe(200)
     expect(r.attempts()).toBe(2)
+  })
+
+  it('retries /pcm-worklet.js, the boot-critical dictation module', async () => {
+    // addModule('/pcm-worklet.js') is called once with no retry, and a voice
+    // session cannot start without it. This proves the worker now retries a
+    // transient 5xx on that path to a 200 — the same recovery /assets/ and
+    // /vendor/ get. (It proves the retry, not that any particular toast was
+    // caused by a 5xx here.)
+    const r = assetRequest([503, 200], '/pcm-worklet.js')
+    expect((await r.result).status).toBe(200)
+    expect(r.attempts()).toBe(2)
+  })
+})
+
+// A sign-in link (`/?token=...`, from `kirocrew token`) is honoured only by the
+// gateway's auth middleware, which swaps the link token for a session cookie. A
+// phone whose worker answered it from the cached shell never made that exchange:
+// /api/status came back 403 and the page said "Session expired". Runs the real
+// file, like the tests above.
+describe('sign-in links belong to the gateway', () => {
+  it('never answers a navigation that carries a link token', () => {
+    expect(intercepts('/?token=abc123')).toBe(false)
+    expect(intercepts('/index.html?token=abc123')).toBe(false)
+    expect(intercepts('/artifacts?foo=1&token=abc123')).toBe(false)
+  })
+
+  it('leaves an empty or stale token to the gateway too', () => {
+    // Presence, not value: judging a token is the middleware's job.
+    expect(intercepts('/?token=')).toBe(false)
+  })
+
+  it('never claims a token-bearing request under a prefix it would otherwise retry', () => {
+    expect(intercepts('/assets/App-abc123.js?token=abc123', 'no-cors')).toBe(false)
+  })
+
+  it('still owns a shell navigation without a token, so the skip is not vacuous', () => {
+    expect(intercepts('/')).toBe(true)
+    expect(intercepts('/?tab=chat')).toBe(true)
+    // A parameter that merely contains the word is not the sign-in parameter.
+    expect(intercepts('/?access_token_hint=1')).toBe(true)
+  })
+
+  it('does not write a token navigation into the shell cache', async () => {
+    const r = shellPutsFor('/?token=abc123') as unknown as { puts: string[]; settled: Promise<unknown> }
+    await r.settled
+    expect(r.puts).toEqual([])
   })
 })
 

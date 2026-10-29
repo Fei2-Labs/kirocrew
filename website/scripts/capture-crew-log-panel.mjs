@@ -12,6 +12,9 @@
  *     proves the section is drawn from theme variables rather than fixed colours.
  *  3. crew-log-empty.png — a session whose folds are all at seq 0: the section
  *     says nothing is recorded instead of rendering five zeroed sections.
+ *  4. crew-log-off.png — the same empty folds with the gateway reporting recording
+ *     switched off: the section says so and names the flag, which the empty frame
+ *     must not.
  *
  * Each scenario ASSERTS before it photographs, so the run exits non-zero when the
  * section is absent or renders the wrong state (a harness that only writes a PNG
@@ -128,6 +131,39 @@ const POPULATED = {
     by_decision: { approved: 3 },
     last: { approval_id: 'a-3', decision: 'approved', by: 'owner', cause: '', tool: 'fs_write', turn: 11, time: 1789821900000, seq: 1700 },
   }),
+  // Three children, one per state the credits and elapsed cells have to tell apart:
+  // finished having reported a charge, closed having reported none, and still running.
+  // A fixture with only the first would photograph the one case that cannot go wrong.
+  subagents: fold('subagents', 1842, {
+    by_id: {
+      'sub-1': {
+        agent_id: 'sub-1', seq_spawned: 1204,
+        agent: 'kirocrew-worker', model: 'a-model',
+        outcome: 'completed', ms: 412000, credits: 3.18, reason: '',
+      },
+      'sub-2': {
+        agent_id: 'sub-2', seq_spawned: 1388,
+        agent: 'kirocrew-lite', model: 'another-model',
+        outcome: 'stopped', ms: 9400, credits: null,
+        // A stop whose kill then failed: the outcome stays neutral while `info.error`
+        // gains the reap failure, which is the row that made an outcome-gated container
+        // put an error string in a muted cell.
+        reason: 'kill failed: pid 8821 still alive after SIGKILL',
+      },
+      'sub-3': {
+        agent_id: 'sub-3', seq_spawned: 1836,
+        agent: 'kirocrew-worker', model: 'a-model',
+        outcome: null, ms: null, credits: null, reason: '',
+      },
+    },
+    running: 1,
+    running_exact: true,
+    omitted: 0,
+    totals: {
+      spawned: 3, completed: 1, failed: 0, stopped: 1, unknown: 0,
+      closed_unmatched: 0,
+    },
+  }),
 }
 
 /** Every fold at seq 0 — what a session with no crew log reads back. */
@@ -143,7 +179,12 @@ const PANEL_BUCKET = JSON.stringify({
   tabs: [{ id: 'crewlog', kind: 'crewlog', title: 'Crew log' }],
 })
 
-async function renderPanel(browser, base, { theme, bundle, open, close, resolved = true, drained = true }) {
+async function renderPanel(
+  browser, base, {
+    theme, bundle, open, close, resolved = true, drained = true, recording = true,
+    flagValue = 'fasle',
+  },
+) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   const page = await context.newPage()
   logPageProblems(page)
@@ -168,7 +209,12 @@ async function renderPanel(browser, base, { theme, bundle, open, close, resolved
         // state both change wording on these. A capture that omitted them would
         // photograph the default branch while claiming to show the real one.
         await json(route, {
-          session_id: SLOT, projections: bundle, resolved, writes_drained: drained,
+          session_id: SLOT, projections: bundle, resolved, writes_drained: drained, recording,
+          ...(recording ? {} : {
+            flag_value: flagValue,
+            flag_recognised: ['0', 'false', 'no', 'off'].includes(flagValue.toLowerCase()),
+            env_file: '~/.kiro/crew/.env',
+          }),
         })
         return true
       }
@@ -254,12 +300,13 @@ async function main() {
       console.log(`${theme}: data-theme=${rendered.theme} --bg=${rendered.bg}`)
       const text = await sectionText(page)
       assertContains(`populated/${theme}`, text, [
-        'Status', 'Usage', 'Timeline', 'Tools', 'Approvals',
+        'Status', 'Usage', 'Timeline', 'Tools', 'Approvals', 'Subagents',
         // The count line names no actor: the reader of a tile has nowhere to learn
         // what the gateway is, and the empty state is where that word is earned.
         'completed: 12 · refused: 1',
         'calls: 96 · unfinished: 2',
         'asked: 4 · pending: 1',
+        'dispatched: 3 · running: 1',
         'up to date through entry 1,842',
       ])
       if (theme === 'light') {
@@ -304,6 +351,326 @@ async function main() {
     }
 
     {
+      // The subagents table, which no other frame opens. What it has to prove is the
+      // credits and elapsed cells telling THREE states apart -- a reported charge, a
+      // child that reported none, and a child still running -- because a zero in
+      // either column would present the absence of a measurement as a measurement.
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: POPULATED,
+        open: ['Subagents'],
+        // Status and Usage open themselves and together are taller than the column,
+        // so the table would sit below the fold in the frame that is about it.
+        close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents/dark', text, [
+        'subagents dispatched',
+        'subagent', 'model', 'outcome', 'elapsed', 'credits',
+        'kirocrew-worker', 'kirocrew-lite', 'another-model',
+        'finished', 'stopped', 'running',
+        // The middle state, which is the one a panel gets wrong.
+        'not reported',
+      ])
+      // CHILD rows only: a child that did not finish also emits a full-width row carrying
+      // its closer's reason, which has one cell rather than five.
+      const { rows, reasons } = await page.evaluate(() => {
+        const table = [...document.querySelectorAll('[data-testid="crew-log-tab"] table')]
+          .find(t => t.textContent?.includes('outcome'))
+        const all = [...(table?.querySelectorAll('tbody tr') ?? [])].map(tr =>
+          [...tr.querySelectorAll('td')].map(td => td.textContent?.trim() ?? ''))
+        return { rows: all.filter(r => r.length === 5), reasons: all.filter(r => r.length === 1) }
+      })
+      if (rows.length !== 3) {
+        throw new Error(`subagents: ${rows.length} row(s) drawn, expected 3`)
+      }
+      // The reason row is what gives the retained `reason` field a readable consumer.
+      if (!reasons.some(r => r[0].includes('kill failed: pid 8821'))) {
+        throw new Error(`subagents: no reason row drawn: ${JSON.stringify(reasons)}`)
+      }
+      // Dispatch order, which is the order the fold renders and the order a reader of a
+      // session's history expects. Matched with startsWith, not equality: the agent cell
+      // carries a second line (the turn, the steer count, a failure's reason), so its full
+      // text is the name followed by that detail.
+      if (!rows[0][0].startsWith('kirocrew-worker') || !rows[1][0].startsWith('kirocrew-lite')) {
+        throw new Error(`subagents: rows out of dispatch order: ${JSON.stringify(rows)}`)
+      }
+
+      // The running child: neither a charge nor a duration is known yet, and drawing
+      // 0 for either is the defect this assertion exists for.
+      // The running child draws a dash in BOTH numeric cells: neither its duration nor
+      // its cost is knowable until a closer lands.
+      if (rows[2][3] !== '—' || rows[2][4] !== '—') {
+        throw new Error(`subagents: running child drew ${JSON.stringify(rows[2])}`)
+      }
+      if (rows[1][4] !== 'not reported') {
+        throw new Error(`subagents: an unreported charge drew ${JSON.stringify(rows[1])}`)
+      }
+      if (rows[0][4] === 'not reported') {
+        throw new Error(`subagents: a REPORTED charge drew "not said": ${JSON.stringify(rows[0])}`)
+      }
+      await shootPanel(page, 'crew-log-subagents')
+      await context.close()
+    }
+
+    {
+      // Two reasons side by side under DIFFERENT outcomes, both reaching the error surface.
+      // That is the point: a reason is an error value whatever the outcome says, and the
+      // `stopped` row is the one that proves it -- an operator's stop whose kill then failed
+      // keeps the neutral outcome while carrying a reap failure. A frame with only the
+      // `failed` row could not show that the container does not follow the outcome.
+      const FAILED = structuredClone(POPULATED)
+      FAILED.subagents.value.by_id['sub-1'].outcome = 'failed'
+      FAILED.subagents.value.by_id['sub-1'].reason = 'the child could not reach the gateway'
+      Object.assign(FAILED.subagents.value.totals, { completed: 0, failed: 1 })
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: FAILED, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents-failed/dark', text, [
+        'the child could not reach the gateway',
+        'kill failed: pid 8821 still alive after SIGKILL',
+      ])
+      const containers = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-testid="crew-log-tab"] tbody tr')]
+        const find = (needle) => rows.find(r => (r.textContent || '').includes(needle))
+        const failed = find('could not reach the gateway')
+        const stopped = find('kill failed: pid 8821')
+        return {
+          failedHasAlert: !!failed?.querySelector('[role="alert"]'),
+          stoppedHasAlert: !!stopped?.querySelector('[role="alert"]'),
+        }
+      })
+      if (!containers.failedHasAlert) {
+        throw new Error('subagents: a genuine failure did not render the error surface')
+      }
+      if (!containers.stoppedHasAlert) {
+        throw new Error('subagents: a kill failure on a stopped row escaped the error surface')
+      }
+      // The outcome still decides the PILL, which is the distinction the outcome owns.
+      const pills = await page.evaluate(() => {
+        const rows = [...document.querySelectorAll('[data-testid="crew-log-tab"] tbody tr')]
+        return rows.map(r => (r.textContent || '')).filter(t => t.includes('stopped')).length
+      })
+      if (pills < 1) {
+        throw new Error('subagents: the stopped outcome lost its neutral pill')
+      }
+      await shootPanel(page, 'crew-log-subagents-failed')
+      await context.close()
+    }
+
+    {
+      // The subagents fold past its retention cap, plus a closer that matched no
+      // dispatch. Both lines exist so the totals exceeding what the table accounts
+      // for reads as the bound speaking rather than as an arithmetic bug.
+      const CAPPED = structuredClone(POPULATED)
+      Object.assign(CAPPED.subagents.value, { omitted: 11, running: 12 })
+      Object.assign(CAPPED.subagents.value.totals, { spawned: 14 })
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: CAPPED, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents-capped/dark', text, [
+        // Every unlisted child here is one the fold never retained, so the line says the
+        // list CANNOT show them rather than pointing at a list that does not have them.
+        // That dead end is what a reader hit on this exact frame: they counted 11 and
+        // found no way to reach any of them.
+        '11 more counted above, not listed here. The record kept no row for them.',
+        '11 of them are still running.',
+        // The header counts every dispatch, not the three rows below it.
+        'dispatched: 14 · running: 12',
+      ])
+      // The other half of the split, and the reason it is a split: a child the TABLE
+      // trimmed is still in the projection, so that line points at the agent instead.
+      // "Ask the agent for" and NOT "Ask the agent": the bare phrase is the label of the
+      // `AskAgentButton` this very frame renders in the failed child's error row, so the
+      // shorter check fires on a control that is SUPPOSED to be there. An absence check
+      // needs a boundary the present strings do not carry.
+      if (text.includes('Ask the agent for')) {
+        throw new Error('subagents-capped: offered a list for children the fold never kept')
+      }
+      await shootPanel(page, 'crew-log-subagents-capped')
+      await context.close()
+    }
+
+    {
+      // The OTHER two reconciliation sentences, which the capped frame above cannot reach:
+      // it has three children, so nothing is trimmed and every unlisted child is one the
+      // fold dropped. With more retained rows than `TABLE_ROWS` the line has somewhere to
+      // point, and with `omitted` on top of that it says both things at once. Two frames
+      // rather than one, because "reachable" and "not reachable" are different sentences and
+      // the base one only appears when NOTHING was dropped.
+      const many = (bundle, omitted, spawned) => {
+        const byId = bundle.subagents.value.by_id
+        for (let i = 4; i <= 17; i += 1) {
+          byId[`sub-${i}`] = {
+            agent_id: `sub-${i}`, seq_spawned: 1836 + i,
+            agent: 'kirocrew-worker', model: 'a-model',
+            outcome: 'completed', ms: 30000 + i * 1000, credits: 0.4, reason: '',
+          }
+        }
+        Object.assign(bundle.subagents.value, { omitted, running: 1 })
+        Object.assign(bundle.subagents.value.totals, { spawned, completed: 15 })
+        return bundle
+      }
+
+      // 17 retained, 12 drawn, none dropped: every unlisted child is still in the projection.
+      const TRIMMED = many(structuredClone(POPULATED), 0, 17)
+      let shot = await renderPanel(browser, base, {
+        theme: 'dark', bundle: TRIMMED, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      let text = await sectionText(shot.page)
+      assertContains('subagents-trimmed/dark', text, [
+        '5 more counted above, not listed here. Ask the agent for the full list.',
+      ])
+      // The three sentences share an opener now, so the ABSENCE check is on the tail that
+      // only the unrecoverable variants carry. Not on the `gone` tail itself: that string is
+      // a prefix of the `dropped` one, so a plain `includes` for it would fire on the mixed
+      // frame for the wrong reason.
+      if (text.includes('kept no row for')) {
+        throw new Error('subagents-trimmed: called retained rows unreachable')
+      }
+      if (text.includes('at least')) {
+        throw new Error('subagents-trimmed: hedged a count nothing made inexact')
+      }
+      await shootPanel(shot.page, 'crew-log-subagents-trimmed')
+      await shot.context.close()
+
+      // 17 retained and 2 dropped: the line points at the agent AND names the part that has
+      // nowhere to point. This is the only state where both sentences are true at once.
+      const MIXED = many(structuredClone(POPULATED), 2, 19)
+      shot = await renderPanel(browser, base, {
+        theme: 'dark', bundle: MIXED, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      text = await sectionText(shot.page)
+      assertContains('subagents-mixed/dark', text, [
+        // ONE sentence, not two: composing a base with an addition is what put a promised
+        // "full list" next to children that cannot be recovered.
+        '7 more counted above, not listed here. Ask the agent for 5 of them. '
+        + 'The record kept no row for the other 2.',
+      ])
+      await shootPanel(shot.page, 'crew-log-subagents-mixed')
+      await shot.context.close()
+
+      // `running` reported as a FLOOR rather than the answer. Both truncations at once -- a
+      // dispatch dropped past the cap and a closer that matched no row -- and the fold cannot
+      // tell whether that closer belongs to the dropped dispatch, so the count can be short by
+      // an unknown amount. The frame exists because the hedge appears in TWO places a reader
+      // meets separately: the collapsed header and the footer clause.
+      const INEXACT = structuredClone(POPULATED)
+      Object.assign(INEXACT.subagents.value, { omitted: 11, running: 12, running_exact: false })
+      Object.assign(INEXACT.subagents.value.totals, { spawned: 14, closed_unmatched: 2 })
+      shot = await renderPanel(browser, base, {
+        theme: 'dark', bundle: INEXACT, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      text = await sectionText(shot.page)
+      assertContains('subagents-inexact/dark', text, [
+        'dispatched: 14 \u00b7 running: at least 12',
+        'At least 11 of them are still running.',
+      ])
+      // The unhedged sentence, matched at its BOUNDARY: "At least 11 of them are still
+      // running." contains "11 of them are still running." as a substring, so a plain
+      // `includes` for the absent form fires on the present one and fails for the wrong
+      // reason -- the same trap the empty frame's tile-label check hit.
+      if (/(?<!At least )11 of them are still running\./.test(text)) {
+        throw new Error('subagents-inexact: drew a floor as an exact count')
+      }
+      await shootPanel(shot.page, 'crew-log-subagents-inexact')
+      await shot.context.close()
+    }
+
+    {
+      // The state MOST sessions show on first expand: the section with no dispatches at
+      // all. It has its own copy rather than an empty table, and nothing else in this
+      // harness opens Subagents on a session that never spawned one -- so without this
+      // frame the panel's most common appearance goes unphotographed.
+      const NONE = structuredClone(POPULATED)
+      NONE.subagents.value = {
+        by_id: {}, running: 0, running_exact: true, omitted: 0,
+        totals: {
+          spawned: 0, completed: 0, failed: 0, stopped: 0, unknown: 0,
+          closed_unmatched: 0,
+        },
+      }
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: NONE, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      assertContains('subagents-empty/dark', text, [
+        'No subagents dispatched.',
+        // The collapsed-header summary still reads, so the section is not silent.
+        'dispatched: 0 · running: 0',
+      ])
+      // No table and no tile: a header row over an empty body reads as a list that failed
+      // to load rather than as a session that dispatched nobody. Asserted on the DOM, not
+      // on the text -- "No subagents dispatched." CONTAINS the tile's own label, so a
+      // substring check on it passes for the wrong reason.
+      const drawn = await page.evaluate(() => {
+        const tab = document.querySelector('[data-testid="crew-log-tab"]')
+        const tables = [...(tab?.querySelectorAll('table') ?? [])]
+        return { outcomeTable: tables.some(t => t.textContent?.includes('outcome')) }
+      })
+      if (drawn.outcomeTable) {
+        throw new Error('subagents-empty: drew the child table for a session with no children')
+      }
+      if (text.includes('counted above')) {
+        throw new Error('subagents-empty: drew a reconciliation line with nothing to reconcile')
+      }
+      await shootPanel(page, 'crew-log-subagents-empty')
+      await context.close()
+    }
+
+    {
+      // ONLY closers reached the log. A child whose `subagent/spawned` append was abandoned
+      // in a `write/dropped` marker is still closed, so the fold bills `closed_unmatched`,
+      // `ms` and `credits` against a child that genuinely ran while `spawned` stays 0. The
+      // two neighbouring frames each cover half of what that must NOT look like: the empty
+      // frame's copy would deny a cost the totals hold, and the child table would be a
+      // header over an empty body. This frame is the only one that shows the third answer.
+      const CLOSERS = structuredClone(POPULATED)
+      CLOSERS.subagents.value = {
+        by_id: {}, running: 0, running_exact: true, omitted: 0,
+        totals: {
+          spawned: 0, completed: 0, failed: 1, stopped: 0, unknown: 0,
+          closed_unmatched: 1,
+        },
+      }
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: CLOSERS, open: ['Subagents'], close: ['Status', 'Usage'],
+      })
+      const text = await sectionText(page)
+      // The SINGULAR form, which is the one this state produces most often: one lost
+      // `subagent/spawned` append is one child. Both absence checks below still matter --
+      // the empty-state copy would deny a cost the totals hold, and the table would be a
+      // header over an empty body. The table check reads the DOM, because the section's own
+      // tile label is a substring of that copy.
+      assertContains('subagents-closers/dark', text, [
+        '1 subagent finished with no start in the record, so it has no row here.',
+        'Its credits are in this session\u2019s total.',
+      ])
+      if (/\d+ subagents finished/.test(text)) {
+        throw new Error('subagents-closers: drew the plural form for a single closer')
+      }
+      if (text.includes('No subagents dispatched.')) {
+        throw new Error('subagents-closers: denied a dispatch the totals already billed')
+      }
+      const shape = await page.evaluate(() => {
+        const tab = document.querySelector('[data-testid="crew-log-tab"]')
+        const tables = [...(tab?.querySelectorAll('table') ?? [])]
+        return { outcomeTable: tables.some(t => t.textContent?.includes('outcome')) }
+      })
+      if (shape.outcomeTable) {
+        throw new Error('subagents-closers: drew a header row over an empty body')
+      }
+      // The collapsed-header summary too: both its counts would read 0 an inch above a
+      // sentence saying one child finished, which is the contradiction the tile made.
+      if (/dispatched: 0/.test(text)) {
+        throw new Error('subagents-closers: header stated a count the body contradicts')
+      }
+      await shootPanel(page, 'crew-log-subagents-closers')
+      await context.close()
+    }
+
+    {
       // A slot whose ACP session was torn down: the record is on disk under the
       // retired id, so this state exists precisely to NOT say "nothing recorded".
       // It is the peer of the empty frame and carries the heavier copy of the two.
@@ -312,15 +679,19 @@ async function main() {
       })
       const text = await sectionText(page)
       assertContains('unaddressable', text, [
-        'No record addressable for this session',
+        'Nothing saved since this chat’s last reset',
         // Each empty state opens with the ACTION that differs between them, which
         // is what a reader uses to tell the pair apart; `resolved: false` covers a
         // fresh slot too, so the retired case stays conditional.
-        'Run a turn to start a new record',
-        'may not have run a turn yet',
+        'Run a turn to start saving messages again',
+        'has not run a turn yet',
+        'Messages saved before the reset stay saved',
       ])
-      if (text.includes('Nothing recorded for this session')) {
+      if (text.includes('No messages saved for this chat yet')) {
         throw new Error('unaddressable: claimed nothing was recorded for a torn-down session')
+      }
+      if (text.includes('no entries yet')) {
+        throw new Error('unaddressable: the footer claims an up-to-date record that does not exist')
       }
       await shootPanel(page, 'crew-log-unaddressable')
       await context.close()
@@ -363,19 +734,87 @@ async function main() {
       const { context, page } = await renderPanel(browser, base, { theme: 'dark', bundle: EMPTY })
       const text = await sectionText(page)
       assertContains('empty', text, [
-        'Nothing recorded for this session', 'up to date; no entries yet',
-        // An empty fold has TWO causes -- recording off, or a session that has
-        // only just started -- and an unresolvable key is indistinguishable from
-        // both. The body must name them rather than assert one, and it owes a
-        // developer somewhere to look AND one thing to do.
-        'To start recording, set KIROCREW_CREW_LOG=1 where the gateway is launched',
-        'one that has just started has nothing folded yet',
-        'docs/reference/crew-log',
+        'No messages saved for this chat yet', 'up to date; no entries yet',
+        'a chat that has just started has none saved yet',
       ])
+      // Recording is on here, so the switch-off instructions belong to the other frame.
+      if (text.includes('KIROCREW_CREW_LOG')) {
+        throw new Error('empty: recording is on but the switch-off instructions are shown')
+      }
       if (text.includes('Lifecycle')) {
         throw new Error('empty: the section rendered fold bodies for a log with no entries')
       }
       await shootPanel(page, 'crew-log-empty')
+      await context.close()
+    }
+
+    {
+      // The gateway reports recording switched off: the one empty state whose fix is
+      // the flag rather than a turn.
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: EMPTY, recording: false,
+      })
+      const text = await sectionText(page)
+      assertContains('off', text, [
+        'The crew log is off',
+        'Messages in this chat are not being saved.',
+        'KIROCREW_CREW_LOG has a value that is not recognised, “fasle”',
+        'Crew log off',
+        'Remove that setting',
+        'what the crew log stores',
+      ])
+      if (text.includes('No messages saved for this chat yet')) {
+        throw new Error('off: said nothing was recorded instead of that recording is off')
+      }
+      const panelText = await page.locator('[data-testid="crew-log-tab"]').innerText()
+      if (panelText.includes('this chat is writing now') || panelText.includes('no entries yet')) {
+        throw new Error('off: the footer still describes a record while recording is off')
+      }
+      if (!(await page.getByRole('link', { name: 'what the crew log stores' }).count())) {
+        throw new Error('off: the docs path is not a link')
+      }
+      const notice = page.getByTestId('crew-log-off')
+      if (!(await notice.count()) || !(await notice.getAttribute('class')).includes('bg-warn-subtle')) {
+        throw new Error('off: rendered like the neutral empty state instead of a warning')
+      }
+      await shootPanel(page, 'crew-log-off')
+      await context.close()
+    }
+
+    {
+      // Recording switched off on a chat that already has entries: the warning sits
+      // above the folds, which stay readable; the footer leads with the status beside
+      // their watermark, and the scope note about the log being written now is gone.
+      const { context, page } = await renderPanel(browser, base, {
+        theme: 'dark', bundle: POPULATED, recording: false, flagValue: '0',
+      })
+      const text = await sectionText(page)
+      assertContains('off-entries', text, [
+        'The crew log is off',
+        'New messages in this chat are not being saved. The ones below stay.',
+        'Remove KIROCREW_CREW_LOG from ~/.kiro/crew/.env',
+        'It is set to “0”.',
+        'Status', 'Usage', 'Timeline', 'Tools', 'Approvals',
+        'Crew log off · last saved entry 1,842',
+      ])
+      if (text.includes('not recognised')) {
+        throw new Error('off-entries: a switch-off spelling was worded as unrecognised')
+      }
+      if (text.includes('this chat is writing now')) {
+        throw new Error('off-entries: the scope note still claims a log is being written')
+      }
+      const notice = page.getByTestId('crew-log-off')
+      if (!(await notice.count()) || !(await notice.getAttribute('class')).includes('bg-warn-subtle')) {
+        throw new Error('off-entries: no warning notice above the saved entries')
+      }
+      const above = await page.evaluate(() => {
+        const n = document.querySelector('[data-testid="crew-log-off"]')
+        const status = [...document.querySelectorAll('[data-testid="crew-log-tab"] *')]
+          .find(el => el.textContent?.trim() === 'Status')
+        return Boolean(n && status && (n.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING))
+      })
+      if (!above) throw new Error('off-entries: the warning is not above the fold tables')
+      await shootPanel(page, 'crew-log-off-entries')
       await context.close()
     }
   } finally {

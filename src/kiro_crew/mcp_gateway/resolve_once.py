@@ -71,6 +71,7 @@ import re
 import secrets
 import shlex
 import shutil
+import stat
 import tempfile
 import time
 from dataclasses import dataclass
@@ -265,6 +266,11 @@ def store_root(data_home: str) -> str:
 
 def spec_dir(data_home: str, spec: NpmSpec) -> str:
     return os.path.join(store_root(data_home), spec.digest)
+
+
+def _staging_spec_dir(data_home: str, spec: NpmSpec) -> str:
+    """Private install root inside the sandbox-sealed runtime parent."""
+    return os.path.join(data_home, "run", "mcp-resolve", spec.digest)
 
 
 def _record_file(directory: str) -> str:
@@ -601,6 +607,34 @@ async def _rmtree_off_loop(path: str) -> None:
         await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
 
 
+def _copy_file_without_special_bits(source: str, destination: str) -> str:
+    """Copy bytes and permission bits, dropping setuid, setgid and sticky.
+
+    A package may ship native binaries it spawns, so the executable bits must
+    survive the copy; the special bits never need to.
+    """
+    shutil.copyfile(source, destination, follow_symlinks=False)
+    os.chmod(destination, os.stat(source, follow_symlinks=False).st_mode & 0o777)
+    return destination
+
+
+def _copy_tree_for_publish(source: str, destination: str) -> None:
+    """Copy an installed tree into a private gateway-owned directory."""
+    os.mkdir(destination, stat.S_IRWXU)
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            copy_function=_copy_file_without_special_bits,
+            dirs_exist_ok=True,
+        )
+        os.chmod(destination, stat.S_IRWXU)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
 #: How much of an install's combined output is kept for the failure log. The pipe
 #: is still DRAINED to EOF -- a child whose stdout fills blocks forever -- but only
 #: this much is retained. ``communicate()`` retains ALL of it, and a package whose
@@ -668,16 +702,18 @@ async def install(
         _RESOLUTION_PREFIX, int(time.time() * 1000), os.getpid(), secrets.token_hex(3)
     )
     target = os.path.join(spec_root, resolution)
+    staging_spec_root = _staging_spec_dir(data_home, spec)
+    staging_target = os.path.join(staging_spec_root, resolution)
     try:
-        await asyncio.to_thread(functools.partial(os.makedirs, target, exist_ok=True))
+        await asyncio.to_thread(functools.partial(os.makedirs, staging_target, exist_ok=False))
     except OSError:
-        logger.debug("resolve-once: cannot create %s", target, exc_info=True)
+        logger.debug("resolve-once: cannot create %s", staging_target, exc_info=True)
         return None
     # Hand npm the fully-resolved prefix. npm records each package's location
     # relative to the prefix it was given, so a prefix reached through a symlink
     # makes it compute a traversing path instead of a plain ``node_modules/x``.
     # One install could absorb that, but a clean tree costs nothing.
-    real_target = os.path.realpath(target)
+    real_target = os.path.realpath(staging_target)
 
     argv = [
         npm_cmd,
@@ -707,7 +743,11 @@ async def install(
     # one that is not is unreachable for those too, where the fallback lands
     # anyway.
     wrapped_argv, spawn_env, sandbox_cleanup = await sandboxed_spawn_argv_async(
-        argv, mode="standard", strip_python_env=True, _prepare=sandboxed_spawn_argv
+        argv,
+        mode="standard",
+        strip_python_env=True,
+        extra_writable_dirs=(real_target,),
+        _prepare=sandboxed_spawn_argv,
     )
     try:
         # Limits are applied AFTER exec by the spawn shim rather than by a
@@ -732,7 +772,7 @@ async def install(
     except OSError:
         logger.debug("resolve-once: could not start npm for %s", spec.package, exc_info=True)
         _drop_sandbox_launcher(sandbox_cleanup)
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
 
     try:
@@ -747,7 +787,7 @@ async def install(
             timeout_secs,
         )
         _drop_sandbox_launcher(sandbox_cleanup)
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
     except asyncio.CancelledError:
         # Broker shutdown cancels the prefetch task. Without this the install and
@@ -755,7 +795,7 @@ async def install(
         # asked for them, still writing into a tree nothing will ever commit.
         await _reap_install_tree(proc)
         _drop_sandbox_launcher(sandbox_cleanup)
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         raise
     finally:
         # The temp launcher/profile is only needed while the child runs; the
@@ -769,19 +809,46 @@ async def install(
             proc.returncode,
             (output or b"").decode("utf-8", "replace").strip()[:400],
         )
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(staging_target)
         return None
 
-    described = await asyncio.to_thread(_describe_tree, spec_root, resolution, spec.package)
+    # npm may have exited while a detached lifecycle descendant remains in
+    # its process group. Reap the group before copying any bytes it could mutate.
+    await _reap_install_tree(proc)
+
+    copied_target = os.path.join(spec_root, f".publish-{secrets.token_hex(8)}")
+    try:
+        await asyncio.to_thread(functools.partial(os.makedirs, spec_root, exist_ok=True))
+        await asyncio.to_thread(_copy_tree_for_publish, staging_target, copied_target)
+    except OSError:
+        logger.debug("resolve-once: could not copy tree for %s", spec.package, exc_info=True)
+        await _rmtree_off_loop(copied_target)
+        await _rmtree_off_loop(staging_target)
+        return None
+
+    described = await asyncio.to_thread(_describe_tree, copied_target, ".", spec.package)
     if described is None:
         logger.warning(
             "resolve-once: %s installed but exposes nothing runnable; leaving it to npx",
             spec.package,
         )
-        await _rmtree_off_loop(target)
+        await _rmtree_off_loop(copied_target)
+        await _rmtree_off_loop(staging_target)
         return None
 
-    entrypoint, version = described
+    copied_entrypoint, version = described
+    entrypoint = os.path.join(resolution, copied_entrypoint)
+    try:
+        # The sandbox never sees ``copied_target``. The validated runtime carve-out
+        # covers only ``staging_target``, so published inodes are gateway-owned.
+        await asyncio.to_thread(os.replace, copied_target, target)
+    except OSError:
+        logger.debug("resolve-once: could not publish tree for %s", spec.package, exc_info=True)
+        await _rmtree_off_loop(copied_target)
+        await _rmtree_off_loop(staging_target)
+        return None
+    await _rmtree_off_loop(staging_target)
+
     record = ResolvedRecord(
         package=spec.package,
         entrypoint=entrypoint,

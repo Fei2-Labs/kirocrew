@@ -16,8 +16,15 @@ import logging
 
 import pytest
 
-from kiro_crew import mcp_cleanup, onboarding_import
+from kiro_crew import (
+    mcp_cleanup,
+    onboarding_import,
+    onboarding_plan,
+    onboarding_scan,
+    onboarding_sources,
+)
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.onboarding_sources import lineage as lineage_source
 from kiro_crew.platform.bootstrap import build_default_context
 from kiro_crew.platform.context import reset_context, set_context
 from kiro_crew.platform.interfaces import ImportSource
@@ -48,6 +55,11 @@ def _install(*sources: ImportSource) -> None:
 def _clean_context():
     yield
     reset_context()
+
+
+# Keep apply_import's MCP sidecar lock off the real ~/.kiro/settings (see the
+# shared fixture in test/conftest.py).
+pytestmark = pytest.mark.usefixtures("isolate_mcp_host_paths")
 
 
 def _lineage_source(**overrides) -> ImportSource:
@@ -106,11 +118,11 @@ class TestDefaultEdition:
     ):
         """Every builtin's declared env override still resolves after the move
         from a module-level root table to per-descriptor fields."""
-        _base, defaults = onboarding_import._source_roots(tmp_path, {})
+        _base, defaults = onboarding_sources._source_roots(tmp_path, {})
         assert defaults[source_id] == tmp_path / expected_dir
 
         elsewhere = tmp_path / f"relocated-{env_var}"
-        _base, overridden = onboarding_import._source_roots(tmp_path, {env_var: str(elsewhere)})
+        _base, overridden = onboarding_sources._source_roots(tmp_path, {env_var: str(elsewhere)})
         assert overridden[source_id] == elsewhere
 
 
@@ -145,13 +157,13 @@ class TestRegistration:
 
     def test_root_resolves_from_the_declared_home_dir(self, tmp_path):
         _install(_lineage_source())
-        _base, roots = onboarding_import._source_roots(tmp_path, {})
+        _base, roots = onboarding_sources._source_roots(tmp_path, {})
         assert roots["predecessor"] == tmp_path / ".predecessor"
 
     def test_root_resolves_from_the_declared_env_var(self, tmp_path):
         _install(_lineage_source())
         elsewhere = tmp_path / "relocated"
-        _base, roots = onboarding_import._source_roots(
+        _base, roots = onboarding_sources._source_roots(
             tmp_path, {"PREDECESSOR_HOME": str(elsewhere)}
         )
         assert roots["predecessor"] == elsewhere
@@ -188,7 +200,7 @@ class TestScannerIsolation:
         def _explode(_scan) -> None:
             raise RuntimeError("reader blew up")
 
-        monkeypatch.setattr(onboarding_import, "_scan_lineage_install", _explode)
+        monkeypatch.setattr(lineage_source, "_scan_lineage_install", _explode)
         _install(_lineage_source())
         preview = onboarding_import._preview(None, tmp_path, {})
         assert "codex" in {source["id"] for source in preview["sources"]}
@@ -220,7 +232,7 @@ class TestScannerIsolation:
             superseded=False,
             stale_mcp_binaries=frozenset(),
         )
-        scan = onboarding_import._scan_source("predecessor", root, tmp_path, source=source)
+        scan = onboarding_sources._scan_source("predecessor", root, tmp_path, source=source)
         assert any(entry.get("reason") == "source_unreadable" for entry in scan.skipped)
         assert not any(
             scan.items[category] for category in scan.items
@@ -237,7 +249,7 @@ class TestScannerIsolation:
         def _explode(scan):
             raise RuntimeError("reader is broken")
 
-        monkeypatch.setattr(onboarding_import, "_scan_lineage_install", _explode)
+        monkeypatch.setattr(lineage_source, "_scan_lineage_install", _explode)
         _install(_lineage_source())
         (tmp_path / ".predecessor").mkdir()
         preview = onboarding_import._preview(None, tmp_path, {})
@@ -258,13 +270,13 @@ class TestNormalization:
         """`base_home / ""` is the user's ENTIRE home — scanning it would walk
         every file they own, so an unresolvable source stays unresolved."""
         _install(_lineage_source(home_dir=""))
-        _base, roots = onboarding_import._source_roots(tmp_path, {})
+        _base, roots = onboarding_sources._source_roots(tmp_path, {})
         assert "predecessor" not in roots
 
     def test_an_env_only_source_resolves_when_its_variable_is_set(self, tmp_path):
         _install(_lineage_source(home_dir=""))
         target = tmp_path / "elsewhere"
-        _base, roots = onboarding_import._source_roots(tmp_path, {"PREDECESSOR_HOME": str(target)})
+        _base, roots = onboarding_sources._source_roots(tmp_path, {"PREDECESSOR_HOME": str(target)})
         assert roots["predecessor"] == target
 
     def test_the_preview_skips_a_source_with_no_resolvable_root(self, tmp_path):
@@ -324,7 +336,7 @@ class TestNormalization:
     @pytest.mark.parametrize("name", ["python3.12", "node20", "NODE-22.1", "python3"])
     def test_a_versioned_shared_runtime_is_still_refused(self, name):
         """Comparing the raw string let a versioned spelling walk past the guard."""
-        assert onboarding_import._runtime_stem(name) in onboarding_import._SHARED_RUNTIME_BINARIES
+        assert onboarding_sources._runtime_stem(name) in onboarding_sources._SHARED_RUNTIME_BINARIES
 
     @pytest.mark.parametrize("name", ["nodejs", "env", "busybox", "dash", "bunx", "pipx"])
     def test_an_aliased_shared_runtime_is_refused(self, name):
@@ -336,7 +348,7 @@ class TestNormalization:
         descriptor claiming one would have had first-run cleanup delete a
         user-owned MCP server whose command merely resolves to that binary.
         """
-        assert onboarding_import._runtime_stem(name) in onboarding_import._SHARED_RUNTIME_BINARIES
+        assert onboarding_sources._runtime_stem(name) in onboarding_sources._SHARED_RUNTIME_BINARIES
 
     def test_a_descriptor_claiming_an_aliased_runtime_is_dropped(self, caplog):
         """End to end: the guard must actually refuse the descriptor, not just
@@ -350,8 +362,8 @@ class TestNormalization:
         """The version strip must not turn an agent's own name into a runtime."""
         for name in ("predecessor", "meshy2", "claw3"):
             assert (
-                onboarding_import._runtime_stem(name)
-                not in onboarding_import._SHARED_RUNTIME_BINARIES
+                onboarding_sources._runtime_stem(name)
+                not in onboarding_sources._SHARED_RUNTIME_BINARIES
             )
 
     def test_a_reserved_id_is_never_registered(self, caplog):
@@ -456,7 +468,7 @@ class TestMalformedContributions:
         assert not hasattr(ImportSource("x", "X"), "layout")
         _install(_lineage_source())
         assert onboarding_import._sources()["predecessor"].scan is (
-            onboarding_import._scan_lineage_install
+            lineage_source._scan_lineage_install
         )
 
     def test_a_failing_provider_degrades_to_the_builtins(self, caplog):
@@ -600,8 +612,8 @@ class TestLineageScanner:
 
     def test_reads_instructions_schedules_and_settings(self, tmp_path):
         root = self._lineage_home(tmp_path)
-        scan = onboarding_import._Scan(source_id="predecessor", root=root, user_home=tmp_path)
-        onboarding_import._scan_lineage_install(scan)
+        scan = onboarding_scan._Scan(source_id="predecessor", root=root, user_home=tmp_path)
+        lineage_source._scan_lineage_install(scan)
         assert scan.items["instructions"], "workspace AGENTS.md not read"
         assert scan.items["schedules"], "crons.json not read"
         assert scan.items["settings"], "config.json not read"
@@ -609,8 +621,8 @@ class TestLineageScanner:
     def test_settings_are_attributed_to_the_scanning_source(self, tmp_path):
         """The scanner takes its id from the scan, never from a baked-in name."""
         root = self._lineage_home(tmp_path)
-        scan = onboarding_import._Scan(source_id="predecessor", root=root, user_home=tmp_path)
-        onboarding_import._scan_lineage_install(scan)
+        scan = onboarding_scan._Scan(source_id="predecessor", root=root, user_home=tmp_path)
+        lineage_source._scan_lineage_install(scan)
         assert all(item.source_id == "predecessor" for item in scan.items["settings"])
 
     def test_a_registered_lineage_source_is_detected_end_to_end(self, tmp_path):
@@ -847,24 +859,24 @@ class TestPlanIsTheAuthorityAtApply:
     def test_selection_survives_a_registry_that_no_longer_lists_the_source(self):
         # No source registered: this is the degraded-registry state at apply time.
         assert "predecessor" not in tuple(onboarding_import._sources())
-        assert onboarding_import._selected_pairs(self._plan()) == {("predecessor", "memories")}
+        assert onboarding_plan._selected_pairs(self._plan()) == {("predecessor", "memories")}
 
     def test_roots_and_homes_survive_the_same_state(self):
         plan = self._plan()
-        assert "predecessor" in onboarding_import._plan_roots(plan)
-        assert "predecessor" in onboarding_import._plan_user_homes(plan)
+        assert "predecessor" in onboarding_plan._plan_roots(plan)
+        assert "predecessor" in onboarding_plan._plan_user_homes(plan)
 
     def test_a_selection_naming_a_source_absent_from_the_plan_is_still_rejected(self):
         """Trusting the plan is not trusting the request: a pair the plan does not
         contain has no root, so importing it would be undefined."""
         plan = self._plan()
         plan["selection"].append({"source_id": "ghost", "category_id": "memories"})
-        assert onboarding_import._selected_pairs(plan) == {("predecessor", "memories")}
+        assert onboarding_plan._selected_pairs(plan) == {("predecessor", "memories")}
 
     def test_an_unknown_category_is_still_rejected(self):
         plan = self._plan()
         plan["selection"].append({"source_id": "predecessor", "category_id": "not_a_category"})
-        assert onboarding_import._selected_pairs(plan) == {("predecessor", "memories")}
+        assert onboarding_plan._selected_pairs(plan) == {("predecessor", "memories")}
 
 
 class TestSourceFilter:
@@ -910,5 +922,5 @@ class TestUnknownSourceIsInert:
         """A stale id in a persisted plan must not crash the scan."""
         root = tmp_path / "whatever"
         root.mkdir()
-        scan = onboarding_import._scan_source("ghost", root, tmp_path)
+        scan = onboarding_sources._scan_source("ghost", root, tmp_path)
         assert any(entry.get("reason") == "unknown_source" for entry in scan.skipped)

@@ -59,6 +59,25 @@ export const KIROCREW_CONFIG_FIXTURE = {
   auto_update: true,
 }
 
+/**
+ * The `GET /api/kas-bundle` body, matching `KasBundleStatus` in
+ * `website/src/api/client/onboarding.ts`: the route off and nothing installed.
+ *
+ * Named ahead of the catch-all because the KAS engine card on Settings >
+ * Developer > Feature Previews reads `status.progress.total` on render. Under
+ * the guessed `{}` that throws, and the section's error boundary drops the card,
+ * so a capture of that tab would show a page without it.
+ */
+export const KAS_BUNDLE_STATUS_FIXTURE = {
+  enabled: false,
+  pinned_version: '0.66.33',
+  runs_version: '0.66.33',
+  installed: null,
+  installing: false,
+  progress: { done: 0, total: 0 },
+  error: '',
+}
+
 /** The `/api/agent/config` body — the per-agent MCP view. */
 export const AGENT_CONFIG_FIXTURE = { name: 'kirocrew', mcpServers: {} }
 
@@ -184,13 +203,26 @@ export async function stubDashboardApi(page, opts = {}) {
       })
     }
     if (path === '/api/agents' || path === '/api/chat/agents') {
-      return json(route, [{ name: 'kirocrew', source: 'builtin' }, { name: 'oncall', source: 'aim' }])
+      // Object, not a bare array: every reader (useAgents, KiroCrewAgentsPage,
+      // AgentTemplateDetail) takes the roster off `d.agents` and the default off
+      // `d.default_agent`. An array left both undefined, so the roster was empty
+      // and every configured default rendered as an orphan "(not installed)".
+      // `workspace` / `memory_store` carry the record defaults the handler
+      // serializes (`KiroCrewAgentConfig`), not blanks: the agents page counts
+      // them to decide which crews SHARE a workspace or store, and an absent key
+      // renders the row's Workspace and Memory cells empty.
+      const row = { kiro_agent: '', workspace: 'default', memory_store: 'default' }
+      return json(route, {
+        agents: [{ name: 'kirocrew', source: 'builtin', ...row }, { name: 'oncall', source: 'aim', ...row }],
+        default_agent: 'kirocrew',
+      })
     }
     // Named BEFORE the catch-all: both paths match its `config` test, and the
     // `{}` it would return blanks the whole Developer > Config surface (see
     // KIROCREW_CONFIG_FIXTURE for why).
     if (path === '/api/config/kirocrew') return json(route, KIROCREW_CONFIG_FIXTURE)
     if (path === '/api/agent/config') return json(route, AGENT_CONFIG_FIXTURE)
+    if (path === '/api/kas-bundle') return json(route, KAS_BUNDLE_STATUS_FIXTURE)
     if (path === '/api/knowledge/stats') return json(route, KNOWLEDGE_STATS_FIXTURE)
     // Endpoints not worth naming individually: anything object-shaped gets {},
     // everything else gets []. Guessing wrong only costs an empty panel — in

@@ -160,7 +160,7 @@ export function pickFeatured(apps: RegistryApp[]): RegistryApp[] {
  * Announce an install-state change to the app shell.
  *
  * Neither ['apps'] nor ['registry'] is invalidated here: the mc:apps-changed
- * listener in App.tsx owns both caches, for every dispatch site at once.
+ * listener in shell/appShell.tsx owns both caches, for every dispatch site at once.
  */
 export function announceAppsChanged(): void {
   window.dispatchEvent(new Event('mc:apps-changed'))
@@ -183,6 +183,12 @@ export type AppsData = {
   categories: { category: Category; count: number }[]
   /** Source rows for the rail footer / Sources popover counts. */
   sources: SourceRow[]
+  /**
+   * True while the registries list (`listRegistries`) has not landed: still
+   * loading, or its fetch failed. `sources` carries no review tier then, so the
+   * consent gate shows the not-vetted box rather than read the listing as vetted.
+   */
+  registriesUnknown: boolean
   /** The Library list: installed apps with update state attached. */
   installedApps: LibraryApp[]
   /**
@@ -200,7 +206,8 @@ export type AppsData = {
 }
 
 // ---- Pending-update derivation ------------------------------------------
-// Shared by this hook's `updatables` and App.tsx's sidebar Discover badge —
+// Shared by this hook's `updatables` and the rail's Discover badge
+// (shell/nav/railBadges.ts) —
 // the sidebar count must equal the Updates sub-tab count, and one shared
 // derivation is the only arrangement two surfaces cannot drift under.
 
@@ -361,9 +368,10 @@ export async function registryQueryFn(): Promise<{
   editorialSections: EditorialBlock[]
 }> {
     const res = await api.listRegistry()
-    // Normalize at the single fetch boundary: registry.py yields minimal
-    // rows when an app.json fetch fails, and external registries are
-    // user-supplied JSON, so display fields may be missing or mistyped.
+    // Normalize at the single fetch boundary: registry_pipeline/manifests.py
+    // yields minimal rows when an app.json fetch fails, and external
+    // registries are user-supplied JSON, so display fields may be missing or
+    // mistyped.
     //
     // `categoryOrder` is published presentation, so it gets the same
     // treatment: a non-array, or a member that is not a string, collapses to
@@ -648,7 +656,7 @@ export default function useAppsData({ showAll = true }: { showAll?: boolean } = 
       if (seen.has(key)) continue
       seen.add(key)
       const sourceId = sourceKey({ _registry: id })
-      merged.push({ name: id, label: reg.label || reg.name || reg.repo, count: counts.get(sourceId) || 0, builtin: false, review: reg.review })
+      merged.push({ name: id, label: reg.label || reg.name || reg.repo, count: counts.get(sourceId) || 0, builtin: false, review: reg.review, trust: reg.trust })
       counts.delete(sourceId)
     }
     // Display order last, through the same helper the External Registries card
@@ -713,6 +721,7 @@ export default function useAppsData({ showAll = true }: { showAll?: boolean } = 
     featuredSections,
     categories,
     sources,
+    registriesUnknown: registriesData === undefined,
     installedApps,
     disabledCount,
     updatables,

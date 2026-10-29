@@ -23,10 +23,37 @@ export interface Project {
   /** Main-document mtime, in epoch SECONDS (Python's st_mtime). */
   modified: number
   has_pdf: boolean
+  /**
+   * What to DISPLAY for this paper: the name the user set, else `name`. Never an
+   * identifier — `name` stays the key for
+   * every call below, for the PDF URL and for the paper's chat slot, so a
+   * rename cannot break a link.
+   *
+   * The server always sends something displayable (it falls back to `name`), but
+   * an older backend does not send the field at all — hence the `??` at the one
+   * render site rather than trust here.
+   */
+  title: string
+  /**
+   * Which paper this row is: changes when a paper is deleted and created again
+   * under the same name. {@link papyrusApi.setTitle} sends it back so a row
+   * loaded before that replacement cannot rename the new paper.
+   */
+  generation: string
 }
 
 export interface ProjectDetail {
   name: string
+  /**
+   * What to DISPLAY for this paper, resolved exactly as {@link Project.title}
+   * is — so the workspace header and the list row that opened it agree.
+   *
+   * Resolved server-side rather than carried over from the list: a paper opened
+   * straight from a URL never went through the list, and the client holds only
+   * `name`. An older backend omits the field, hence the fallback at the render
+   * site.
+   */
+  title: string
   main_file: string
   files: string[]
   has_pdf: boolean
@@ -97,18 +124,26 @@ export class PapyrusApiError extends Error {
   status: number
   /** Raw git/compiler output, when the endpoint returned any. */
   output: string
+  /** The backend's machine-readable `code`, or '' when it sent none. */
+  code: string
+  /** For `invalid_project_name`: the refused character, or '' when none was named. */
+  char: string
 
-  constructor(message: string, status: number, output = '') {
+  constructor(message: string, status: number, output = '', code = '', char = '') {
     super(message)
     this.name = 'PapyrusApiError'
     this.status = status
     this.output = output
+    this.code = code
+    this.char = char
   }
 }
 
 interface ErrorBody {
   error?: string
   output?: string
+  code?: string
+  char?: string
 }
 
 /** Prefer the backend's own `{error}`/`reason` over a bare "HTTP 500". */
@@ -123,6 +158,8 @@ async function toError(r: Response): Promise<PapyrusApiError> {
     body?.error || r.statusText || `HTTP ${r.status}`,
     r.status,
     body?.output || '',
+    typeof body?.code === 'string' ? body.code : '',
+    typeof body?.char === 'string' ? body.char : '',
   )
 }
 
@@ -209,6 +246,14 @@ export const papyrusApi = {
   deleteFile: (name: string, path: string) => del<{ ok: boolean }>('/file', { name, path }),
   setMainFile: (name: string, path: string) =>
     send<{ ok: boolean; main_file: string }>('PUT', '/main', { name, path }),
+  /**
+   * Rename what the list shows for a paper. `name` (the directory) is untouched.
+   *
+   * An empty `title` CLEARS the override, and the response carries whatever wins
+   * next — `name` — so the caller renders the answer instead of re-deriving it.
+   */
+  setTitle: (name: string, title: string, generation: string) =>
+    send<{ ok: boolean; title: string }>('PUT', '/title', { name, title, generation }),
 
   compile,
 

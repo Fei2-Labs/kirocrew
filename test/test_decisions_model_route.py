@@ -162,13 +162,17 @@ class TestTheQuestion:
         assert mr.TIERS == ("simple", "medium", "complex")
         assert [q.options for q in mr.questions()] == [["simple", "medium", "complex"]]
 
-    def test_every_tier_is_described_in_the_prompt(self):
+    def test_every_tier_is_described_in_the_criteria_keyed_by_option(self):
         """Without the descriptions the three words are the oracle's own guess at
-        what 'medium' means, which is not a question about this product."""
-        prompt = mr.questions()[0].prompt
+        what 'medium' means, which is not a question about this product. The rubric
+        now rides in the provider's own per-option ``criteria`` map, keyed by the
+        tier it describes, not flattened into the prompt."""
+        question = mr.questions()[0]
+        assert question.criteria == mr.TIER_DESCRIPTIONS
         for tier in mr.TIERS:
-            assert f"{tier} = " in prompt
-            assert mr.TIER_DESCRIPTIONS[tier] in prompt
+            assert question.criteria[tier] == mr.TIER_DESCRIPTIONS[tier]
+            # The per-tier prose is carried by criteria, not the prompt stem.
+            assert mr.TIER_DESCRIPTIONS[tier] not in question.prompt
 
     def test_no_description_names_a_model_or_a_price(self):
         """The question is about the WORK. Naming a model would ask the oracle to
@@ -176,6 +180,40 @@ class TestTheQuestion:
         prose = " ".join(mr.TIER_DESCRIPTIONS.values()).lower()
         for forbidden in ("claude", "haiku", "opus", "cheap", "expensive", "cost", "$"):
             assert forbidden not in prose
+
+    def test_authored_criteria_reach_both_backends_end_to_end(self):
+        """``model.route`` is a real caller of ``Choice.criteria``: the rubric it
+        authors reaches BOTH backends in the shape each reads -- the Jev provider's
+        per-option ``criteria`` map and the LLM backend's rendered prompt -- so the
+        field is not inert plumbing. Each tier's own description travels with it."""
+        from kiro_crew.decisions import impl_jev, impl_llm
+
+        question = mr.questions()[0]
+
+        # Jev: the per-option map carries every tier's authored rubric, keyed by
+        # the declared option, with no option dropped.
+        wire = impl_jev._question_to_wire(question)
+        assert wire["type"] == "choice"
+        assert wire["criteria"] == {tier: mr.TIER_DESCRIPTIONS[tier] for tier in mr.TIERS}
+
+        # LLM: render_prompt writes a ``criteria:`` line beside the options, and
+        # each tier's description appears in it.
+        rendered = impl_llm.render_prompt("evidence", [question])
+        assert "criteria:" in rendered
+        tail = rendered.split("criteria:", 1)[1]
+        for tier in mr.TIERS:
+            assert f"{tier}: {mr.TIER_DESCRIPTIONS[tier]}" in tail
+
+    def test_the_prompt_states_which_direction_an_error_costs_more(self):
+        """Without it the oracle weighs the two mistakes equally, and a short message
+        naming long work reads as the cheapest tier. It names no model and no price
+        either: the asymmetry is a property of the WORK's outcome."""
+        assert mr.TIER_ASYMMETRY in mr.questions()[0].prompt
+        assert "however short it is" in mr.TIER_ASYMMETRY
+        prose = mr.TIER_ASYMMETRY.lower()
+        for forbidden in ("claude", "haiku", "opus", "sonnet", "gpt", "token", "$"):
+            assert forbidden not in prose
+        assert not any(ch.isdigit() for ch in prose)
 
     def test_the_message_excerpt_is_bounded_like_skills_select(self):
         """The same text answering a question about the same turn, so two different
@@ -554,3 +592,106 @@ class TestTheOutcome:
         serialized = json.dumps(log_home()).lower()
         for forbidden in ("message", 'history"', "scheduler"):
             assert forbidden not in serialized
+
+
+# ---------------------------------------------------------------------------
+# The two window rules
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def registry_windows(monkeypatch):
+    """Pin what the registry KNOWS, as a ``{model id: window}`` map.
+
+    An id absent from the map is one the registry has not met: ``has_known_window``
+    is False for it while ``model_window`` still answers its guessed reference,
+    which is the pair :func:`known_window` exists to tell apart.
+    """
+    from kiro_crew import model_registry
+
+    def _set(windows: dict[str, int]) -> None:
+        monkeypatch.setattr(model_registry, "has_known_window", lambda name: name in windows)
+        monkeypatch.setattr(
+            model_registry, "model_window", lambda name, **_kw: windows.get(name, 1_000_000)
+        )
+
+    return _set
+
+
+class TestTheConfidenceRule:
+    def test_a_window_that_does_not_shrink_is_permitted_at_any_probability(self):
+        """The harm is one-directional: room that grows or holds changes nothing
+        about what fits, so the probability is not asked to carry the move."""
+        assert mr.permits_smaller_window(0.0, current=200_000, target=1_000_000) is True
+        assert mr.permits_smaller_window(None, current=200_000, target=200_000) is True
+
+    def test_a_smaller_window_needs_the_floor_and_the_bound_is_inclusive(self):
+        """The floor is asserted as the value it is, so weakening it is a failing test
+        rather than a silent widening -- a range around it clears a weaker floor."""
+        assert mr.MIN_DOWNGRADE_P == 0.80
+        floor = mr.MIN_DOWNGRADE_P
+        assert mr.permits_smaller_window(floor, current=1_000_000, target=200_000) is True
+        assert mr.permits_smaller_window(floor - 1e-9, current=1_000_000, target=200_000) is False
+        # A row with no number carries nothing, and ``True`` is an int in Python:
+        # without the type check a producer bug would read as maximum confidence.
+        assert mr.permits_smaller_window(None, current=1_000_000, target=200_000) is False
+        assert mr.permits_smaller_window(True, current=1_000_000, target=200_000) is False
+
+    def test_an_unknown_window_on_either_side_refuses_nothing(self, registry_windows):
+        """``model_window`` answers a guessed reference for an id it has never met.
+        Vetoing on a guess would pin routing to whatever model a session happens to
+        be on for every model nothing is known about."""
+        registry_windows({"small": 200_000})
+        assert mr.is_smaller_window(current=1_000_000, target=200_000) is True
+        assert mr.is_smaller_window(current=None, target=200_000) is False
+        assert mr.is_smaller_window(current=1_000_000, target=None) is False
+        assert mr.known_window("small") == 200_000
+        assert mr.known_window("a-model-nobody-listed") is None
+        assert mr.known_window("") is None
+        assert mr.permits_smaller_window(0.1, current=None, target=200_000) is True
+        assert mr.permits_smaller_window(0.1, current=1_000_000, target=None) is True
+
+    def test_the_floor_is_a_constant_and_not_a_config_knob(self):
+        """It is the meaning of the answer rather than a setting: a configurable
+        floor is a second, undocumented way to turn the rule into a no-op."""
+        names = [n for n in dir(DecisionsConfig()) if not n.startswith("__")]
+        assert not [n for n in names if "threshold" in n or "downgrade" in n]
+
+
+class TestTheWindowLookupSpelling:
+    def test_a_pin_the_owner_cased_differently_is_still_sized(self):
+        """The registry's own lookup is spelling-sensitive while a pin is accepted on a
+        lossless fold, so an id the owner wrote differently must not read as a window
+        nothing knows -- that answer refuses nothing, and the pin would carry the
+        shrink. The registry PAIR is used rather than a placeholder, because a fake id
+        has no entry and would exercise nothing."""
+        plain = mr.known_window("claude-haiku-4.5")
+        assert plain, "the registry pair under test must be listed"
+        assert mr.known_window("Claude-Haiku-4.5") == plain
+        assert mr.known_window("  CLAUDE-HAIKU-4.5  ") == plain
+        # The dotted and dashed entries stay DISTINCT: two entries, two windows, so
+        # folding them together here would size a pin against the wrong one.
+        assert mr.known_window("claude-haiku-4-5") != plain
+
+
+class TestTheMessageInTheFitReading:
+    def test_the_estimate_is_the_shared_divisor_and_an_empty_message_adds_nothing(self):
+        """The same rough divisor the sibling points estimate with, so a reader does
+        not have to learn a second one. Over-estimating costs one downgrade."""
+        from kiro_crew.decisions.points import skills_select as sel
+
+        assert mr.CHARS_PER_TOKEN == sel.CHARS_PER_TOKEN == 4
+        assert mr.prompt_tokens("x" * 400) == 100
+        assert mr.prompt_tokens("") == 0
+
+    def test_token_dense_text_is_not_read_as_a_quarter_of_its_size(self):
+        """The divisor answers for Latin text. A CJK prompt tokenizes several times
+        denser, so dividing every character reads it as a quarter of what it is and
+        clears a shrink on ordinary input. Each non-ASCII character counts as a token,
+        which can only refuse more."""
+        assert mr.prompt_tokens("\u4ea4" * 400) == 400
+        # Mixed input is counted per character, not by whichever kind leads.
+        assert mr.prompt_tokens("x" * 400 + "\u4ea4" * 100) == 200
+        # An over-estimate is the safe direction, so it is never below the divisor.
+        for text in ("\u4ea4" * 400, "x" * 400, "x\u4ea4" * 200, ""):
+            assert mr.prompt_tokens(text) >= len(text) // mr.CHARS_PER_TOKEN

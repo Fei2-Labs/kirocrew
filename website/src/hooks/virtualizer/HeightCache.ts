@@ -26,8 +26,10 @@
 
 // localStorage key prefix — a storage identifier, never rendered. Not UI copy.
 // Kept in sync with SESSION_PREFIXES in `utils/storageGc.ts`, which garbage-
-// collects these keys; changing it orphans every persisted height map.
-const LS_KEY_PREFIX = 'vc_heights_'
+// collects these keys; changing it orphans every persisted height map. Also
+// read by `widthFamilyGc.ts`, which bounds how many per-width blobs one slot
+// retains -- another reason a rename must stay in lockstep across the module.
+export const LS_KEY_PREFIX = 'vc_heights_'
 // Baseline floor for the eviction cap. The effective cap grows with the
 // session's row count up to HARD_CEILING (see effectiveCap()).
 const MAX_ENTRIES = 2000
@@ -63,6 +65,14 @@ const MAX_MEAN_PX = 4000
 // constants and reports a literal matching none of its content exemptions,
 // and lowercase_snake is one of them. A storage identifier, never rendered.
 export const SCHEMA_VERSION_KEY = 'vc_schema_version'
+// Reserved own-property key holding the epoch-ms timestamp of this blob's last
+// WRITE. Read by `widthFamilyGc.ts` to order a slot's per-width blobs by
+// recency so the least-recently-used widths are the first evicted when the
+// family grows past its bound. Like SCHEMA_VERSION_KEY it is not a row: `flush`
+// never persists a row spelled this way and `load` never reads it as a height.
+// Spelled in the module's `vc_` storage vocabulary for the same i18n-strict-pass
+// reason as SCHEMA_VERSION_KEY. A storage identifier, never rendered.
+export const TOUCHED_AT_KEY = 'vc_touched_at'
 // Schema version of the persisted blob. BUMP IT whenever what a stored number
 // MEANS changes -- a different row layout, a different measurement point, a
 // different unit -- so blobs from the old semantics are dropped rather than
@@ -118,11 +128,30 @@ export class HeightCache {
   // Session row count driving the size-aware eviction cap. 0 means UNKNOWN,
   // never "this session is empty" — see setRowCount() and load().
   private rowCount = 0
+  // Fired exactly once, the FIRST time flush() creates this session's blob when
+  // none existed in storage (absent -> present). The per-width family bound
+  // keys off this: a brand-new width scope has NO blob when its HeightIndex is
+  // constructed -- construction only loads, the write happens later in flush()
+  // -- so binding the family at construction skips every width a reader actually
+  // drags through. The first persist is the one moment a new width blob joins
+  // the slot's family, so that is when the bound must run. Injected rather than
+  // imported so HeightCache keeps no dependency on the GC module (which already
+  // imports HeightCache's key constants -- the reverse import would be a cycle).
+  private readonly onFirstPersist?: () => void
+  // Whether this session's blob already exists in storage. Seeded by load()
+  // (a successful read means it is present) so a session reopened from a warm
+  // blob does NOT re-fire onFirstPersist, and flipped true by the first flush
+  // that creates it. Only the absent -> present transition fires the callback.
+  private persisted = false
 
-  constructor(sessionId: string, options?: { rowCount?: number }) {
+  constructor(
+    sessionId: string,
+    options?: { rowCount?: number; onFirstPersist?: () => void },
+  ) {
     this.sessionId = sessionId
     this.storage = getStorage()
     this.storageKey = `${LS_KEY_PREFIX}${sessionId}`
+    this.onFirstPersist = options?.onFirstPersist
     // Only a positive count is information. A caller that constructs the cache
     // before its transcript has loaded passes 0, which must not be mistaken for
     // a genuinely tiny session (load() seeds the cap from the blob instead).
@@ -379,6 +408,19 @@ export class HeightCache {
       // Stamped FIRST so it survives a truncated read and is visible to a
       // human inspecting the blob.
       obj[SCHEMA_VERSION_KEY] = HEIGHT_SCHEMA_VERSION
+      // Recency stamp for the per-width family bound (widthFamilyGc.ts). Every
+      // write refreshes it, so a width the reader keeps returning to stays warm
+      // and the widths they abandoned sort oldest and are evicted first.
+      //
+      // Stored as a STRING, not a number, on purpose: the schema version is not
+      // bumped for this additive key, so a reader from a build BEFORE this
+      // stamp existed loads the same blob. That older load loop admits any
+      // finite `v > 0` as a row height, so a numeric stamp (a ~1.7e12 epoch-ms
+      // value) would be mistaken for a 1.7-trillion-pixel row and clipped to
+      // the mean ceiling, corrupting the cache after a rollback. A string value
+      // fails that reader's `typeof v === 'number'` gate and is skipped as the
+      // reserved key it is; `readTouchedAt` parses it back with Number().
+      obj[TOUCHED_AT_KEY] = String(Date.now())
       // Retired keys are deliberately NOT persisted: the row is gone from the
       // transcript, so after a reload its height would be back in the mean
       // pricing rows that are still there. The in-memory entry is what serves a
@@ -387,10 +429,27 @@ export class HeightCache {
         if (this.retired.has(k)) continue
         // The version slot is not a row. A row key spelled like it loses its
         // persistence rather than overwriting the stamp.
-        if (k === SCHEMA_VERSION_KEY) continue
+        if (k === SCHEMA_VERSION_KEY || k === TOUCHED_AT_KEY) continue
         obj[k] = v
       }
       this.storage.setItem(this.storageKey, JSON.stringify(obj))
+      // The write succeeded. If this session had no blob before, it does now --
+      // the absent -> present transition that means a NEW width scope just
+      // joined its slot's family. Fire the bound hook exactly once, AFTER the
+      // write, so the family walk sees the just-created blob (the current width
+      // it must spare) already in storage. A reopen from a warm blob set
+      // `persisted` in load(), so it does not re-fire here.
+      if (!this.persisted) {
+        this.persisted = true
+        if (this.onFirstPersist) {
+          try {
+            this.onFirstPersist()
+          } catch {
+            // The bound is best-effort housekeeping; a failure in it must never
+            // fail the write that already landed.
+          }
+        }
+      }
     } catch {
       // Quota exceeded or transient failure — drop this flush. A future set()
       // will dirty the cache again and we'll retry on the next debounce window.
@@ -404,6 +463,9 @@ export class HeightCache {
     this.retired.clear()
     this.measuredSum = 0
     this.dirty = false
+    // The blob is about to be absent again, so a later write is once more an
+    // absent -> present first persist for family-bound purposes.
+    this.persisted = false
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer)
       this.flushTimer = null
@@ -440,6 +502,12 @@ export class HeightCache {
       return
     }
     if (raw === null) return
+    // A blob exists for this session, so flush() must NOT treat its next write
+    // as a first persist -- a warm reopen of an existing width is not a new
+    // family member. Set before the schema gate: even a blob this build then
+    // discards (wrong version) was present in storage, so writing a fresh one
+    // over it is still not the absent -> present transition the bound keys off.
+    this.persisted = true
     let parsed: unknown
     try {
       parsed = JSON.parse(raw)
@@ -479,7 +547,7 @@ export class HeightCache {
     // instead makes the row unmeasured, which is the state the estimate path
     // and the write-side floor already handle.
     for (const k of Object.keys(parsed as Record<string, unknown>)) {
-      if (k === SCHEMA_VERSION_KEY) continue
+      if (k === SCHEMA_VERSION_KEY || k === TOUCHED_AT_KEY) continue
       const v = (parsed as Record<string, unknown>)[k]
       if (typeof v === 'number' && Number.isFinite(v) && v > 0) {
         this.cache.set(k, v)

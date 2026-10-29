@@ -35,7 +35,10 @@ _NO_BASH_REASON = "no working bash on PATH (the stamping script only runs on bui
 
 def _run_stamp(dist: str, pkg_dir) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
-        ["bash", str(_STAMP_SCRIPT), dist, str(pkg_dir)], capture_output=True, text=True
+        ["bash", str(_STAMP_SCRIPT), dist, str(pkg_dir)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
 
 
@@ -92,9 +95,7 @@ class TestInstallId:
         assert beacon.install_id(create=False) == ""
         assert not (_isolated_home / beacon.INSTALL_ID_FILE).exists()
 
-    def test_create_false_never_returns_process_local_fallback(
-        self, _isolated_home, monkeypatch
-    ):
+    def test_create_false_never_returns_process_local_fallback(self, _isolated_home, monkeypatch):
         def denied():
             raise PermissionError(13, "Permission denied")
 
@@ -310,6 +311,34 @@ class TestDistributionStamp:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         assert module.DISTRIBUTION == "dmg"
+        assert module.FORK_STAMPED is True
+        try:
+            revision = subprocess.run(
+                ["git", "-C", str(_STAMP_SCRIPT.parents[1]), "rev-parse", "--short=8", "HEAD"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            website_tree = subprocess.run(
+                ["git", "-C", str(_STAMP_SCRIPT.parents[1]), "rev-parse", "HEAD:website"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        except OSError:
+            revision = website_tree = None
+        if revision is not None and revision.returncode == 0:
+            assert module.FORK_REVISION == revision.stdout.strip()
+        else:
+            assert module.FORK_REVISION == ""
+        assert isinstance(module.FORK_DIRTY, bool)
+        assert module.WEBSITE_TREE == (
+            website_tree.stdout.strip()
+            if website_tree is not None and website_tree.returncode == 0
+            else ""
+        )
         monkeypatch.setattr(beacon, "_BAKED_DISTRIBUTION", module.DISTRIBUTION)
         assert beacon.distribution() == "dmg"
 
@@ -374,9 +403,7 @@ class TestDesktopStampPerOS:
             text,
         )
         assert block, "no KC_DISTRIBUTION case found in packaging/build-desktop.sh"
-        found = dict(
-            re.findall(r'(\S+)\)\s*KC_DISTRIBUTION="([^"]+)"', block.group(1))
-        )
+        found = dict(re.findall(r'(\S+)\)\s*KC_DISTRIBUTION="([^"]+)"', block.group(1)))
         assert found, "KC_DISTRIBUTION case matched no branches"
         return found
 
@@ -397,9 +424,9 @@ class TestDesktopStampPerOS:
         from kiro_crew.platform.update_capability import EXTERNALLY_MANAGED_STAMPS
 
         for branch, dist in self._os_stamps().items():
-            assert dist in EXTERNALLY_MANAGED_STAMPS, (
-                f"{branch}) stamps {dist!r}, which is not externally managed"
-            )
+            assert (
+                dist in EXTERNALLY_MANAGED_STAMPS
+            ), f"{branch}) stamps {dist!r}, which is not externally managed"
 
     def test_the_windows_branch_stamps_nsis(self):
         assert self._os_stamps().get("windows") == "nsis"
@@ -531,14 +558,10 @@ class TestFirstEgressPrivacyGate:
             "urlopen",
             lambda req, **_kw: calls.append(req.full_url),
         )
-        assert (
-            beacon.send("https://e.invalid", "1.2.3", enabled=True, acked=False) is False
-        )
+        assert beacon.send("https://e.invalid", "1.2.3", enabled=True, acked=False) is False
         assert calls == []
 
-    def test_established_install_still_sends_when_unacked(
-        self, _isolated_home, monkeypatch
-    ):
+    def test_established_install_still_sends_when_unacked(self, _isolated_home, monkeypatch):
         """The gate is FIRST-egress only.
 
         An install that has sent before has already been past the disclosure (or
@@ -558,14 +581,8 @@ class TestFirstEgressPrivacyGate:
 
     def test_install_receipts_share_the_gate(self, _isolated_home):
         """A second egress route must not bypass the first-egress consent gate."""
-        assert (
-            install_receipt.should_send(enabled=True, official=True, acked=False).ok
-            is False
-        )
-        assert (
-            install_receipt.should_send(enabled=True, official=True, acked=True).ok
-            is True
-        )
+        assert install_receipt.should_send(enabled=True, official=True, acked=False).ok is False
+        assert install_receipt.should_send(enabled=True, official=True, acked=True).ok is True
 
 
 class TestReasonCodes:
@@ -576,9 +593,7 @@ class TestReasonCodes:
     """
 
     def test_status_reports_a_known_code(self, _isolated_home):
-        info = beacon.status(
-            "https://e.invalid", enabled=True, app_version="1.2.3", acked=True
-        )
+        info = beacon.status("https://e.invalid", enabled=True, app_version="1.2.3", acked=True)
         assert info["reason_code"] in beacon.REASONS
 
     @pytest.mark.parametrize(
@@ -1105,7 +1120,9 @@ class TestTelemetryCliWrite:
         original = json.dumps({"timezone": "UTC", section: value})
         cfg.write_text(original)
         monkeypatch.setattr("kiro_crew.config.loader.config_path", lambda: cfg)
-        monkeypatch.setattr(cli_commands.KiroCrewConfig, "load", classmethod(lambda cls: MagicMock()))
+        monkeypatch.setattr(
+            cli_commands.KiroCrewConfig, "load", classmethod(lambda cls: MagicMock())
+        )
 
         with pytest.raises(SystemExit) as excinfo:
             cli_commands._telemetry(self._args("disable"))
@@ -1567,9 +1584,9 @@ class TestGovernancePin:
         from kiro_crew.cli_config import _config_cmd
         from kiro_crew.dashboard.handlers.core import _beacon_governance_pinned_off
 
-        assert _tools_for(lambda: beacon.send("https://e.invalid", "1.2.3", enabled=True, acked=True)) == [
-            "beacon_send"
-        ]
+        assert _tools_for(
+            lambda: beacon.send("https://e.invalid", "1.2.3", enabled=True, acked=True)
+        ) == ["beacon_send"]
         assert _tools_for(lambda: _telemetry(argparse.Namespace(telemetry_action="enable"))) == [
             "telemetry_enable_cli"
         ]

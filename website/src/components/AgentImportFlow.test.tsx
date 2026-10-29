@@ -8,6 +8,7 @@ import type {
 import { api, ApiError } from '../api/client'
 import { renderWithProviders } from '../test/helpers'
 import AgentImportFlow from './AgentImportFlow'
+import { LocalOverlayRoot } from './overlayRoot'
 
 // Spread the real module rather than replacing it: the component branches on
 // `error instanceof ApiError`, which needs the real class identity.
@@ -302,6 +303,25 @@ describe('AgentImportFlow', () => {
     expect(onComplete).not.toHaveBeenCalled()
   })
 
+  it('ignores Escape and Tab while hidden behind a remote Crew', async () => {
+    mockSuccessfulRequests()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <LocalOverlayRoot hidden>
+        <AgentImportFlow initialOpen onComplete={vi.fn()} onSkipAll={onSkipAll} />
+      </LocalOverlayRoot>,
+    )
+    await screen.findByRole('dialog', { name: 'Import agent setup', hidden: true })
+
+    // The keys belong to the Crew in front: neither skips first run unseen nor
+    // is claimed by the hidden chapter's Tab trap.
+    expect(fireEvent.keyDown(document, { key: 'Escape' })).toBe(true)
+    expect(fireEvent.keyDown(document, { key: 'Tab' })).toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(onSkipAll).not.toHaveBeenCalled()
+    expect(api.onboardingImportState).not.toHaveBeenCalled()
+  })
+
   // Both "Skip all" paths (the header control and Escape) write through
   // skipAllMutation, whose failure was previously rendered nowhere — the dialog
   // just stayed open in silence.
@@ -392,7 +412,8 @@ describe('AgentImportFlow', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not save onboarding state')
     expect(onComplete).not.toHaveBeenCalled()
-    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    // The footer button re-sends the write, and now says so.
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }))
     await waitFor(() => expect(onComplete).toHaveBeenCalledOnce())
   })
 
@@ -443,6 +464,47 @@ describe('AgentImportFlow', () => {
     })
     expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
   })
+  // The scan runs because the user asked for it (Settings, Import from another
+  // agent), not because first run reached the chapter. First run ends the chapter
+  // on an empty scan without a word; for a user who just clicked, that is a dialog
+  // that closes before it shows anything.
+  describe('when the user replays the importer and the scan finds nothing', () => {
+    const NOTHING_TO_IMPORT: AgentImportScanResponse = {
+      sources: [{ id: 'codex', name: 'Codex', detected: false, categories: [] }],
+      skipped: [],
+      merge_only: true,
+    }
+
+    it('says so instead of finishing the chapter', async () => {
+      mockSuccessfulRequests(NOTHING_TO_IMPORT)
+      const onComplete = vi.fn()
+      renderWithProviders(
+        <AgentImportFlow initialOpen keepOpenWhenEmpty onComplete={onComplete} />,
+      )
+
+      expect(await screen.findByRole('heading', { name: 'No supported setup found' }))
+        .toBeInTheDocument()
+      expect(screen.getByRole('dialog', { name: 'Import agent setup' })).toBeInTheDocument()
+      expect(api.onboardingImportState).not.toHaveBeenCalled()
+      expect(onComplete).not.toHaveBeenCalled()
+    })
+
+    it('still lets the user leave from the empty result, once', async () => {
+      mockSuccessfulRequests(NOTHING_TO_IMPORT)
+      const onComplete = vi.fn()
+      renderWithProviders(
+        <AgentImportFlow initialOpen keepOpenWhenEmpty onComplete={onComplete} />,
+      )
+
+      await screen.findByRole('heading', { name: 'No supported setup found' })
+      await userEvent.click(screen.getByRole('button', { name: 'Skip import' }))
+
+      await waitFor(() => expect(onComplete).toHaveBeenCalledOnce())
+      expect(api.onboardingImportState).toHaveBeenCalledOnce()
+      expect(api.onboardingImportState).toHaveBeenCalledWith({ completed: true })
+    })
+  })
+
 
   it('does not auto-complete when the only detected source could not be read', async () => {
     // Degrade-don't-fail turned a reader crash into zero eligible sources, which
@@ -513,6 +575,135 @@ describe('AgentImportFlow', () => {
     )
     expect(screen.getByRole('dialog', { name: 'Import agent setup' })).toBeInTheDocument()
     expect(onComplete).not.toHaveBeenCalled()
+  })
+
+  // A failed state write must not be a dead end. The write fails for reasons no
+  // retry clears (an unparseable config.json reads as defaults, so the flag is
+  // false and this flow reopens on every load while the fail-closed write
+  // refuses every exit), and before this every button, "Skip all" included,
+  // re-sent the same failing PUT.
+  it('names an unreadable config and still lets Skip all leave the flow', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"config_unreadable"}'),
+    )
+    const onComplete = vi.fn()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={onComplete} onSkipAll={onSkipAll} />,
+    )
+    await screen.findByRole('dialog', { name: 'Import agent setup' })
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('config.json')
+    // The exit says what happens: the import is kept and setup comes back.
+    expect(alert).toHaveTextContent('Your imported items are kept. Setup opens again next time.')
+    expect(onSkipAll).not.toHaveBeenCalled()
+    await userEvent.click(within(alert).getByRole('button', { name: 'Close setup for now' }))
+
+    expect(onSkipAll).toHaveBeenCalledOnce()
+    expect(onComplete).not.toHaveBeenCalled()
+    expect(screen.queryByRole('dialog', { name: 'Import agent setup' })).not.toBeInTheDocument()
+    // Leaving is local: no further write is attempted on the way out.
+    expect(api.onboardingImportState).toHaveBeenCalledOnce()
+  })
+
+  it('lets a finished import continue when only the completed flag failed to save', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"state_failed"}'),
+    )
+    const onComplete = vi.fn()
+    const onSkipAll = vi.fn()
+    renderWithProviders(
+      <AgentImportFlow initialOpen onComplete={onComplete} onSkipAll={onSkipAll} />,
+    )
+
+    await startImport()
+    await screen.findByText('Import complete')
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Could not save onboarding state.')
+    await userEvent.click(within(alert).getByRole('button', { name: 'Close setup for now' }))
+
+    // The exit the user asked for, not a different one.
+    expect(onComplete).toHaveBeenCalledOnce()
+    expect(onSkipAll).not.toHaveBeenCalled()
+  })
+
+  it('shows the exit on the scan-failed panel too when Skip all cannot save', async () => {
+    vi.mocked(api.onboardingImportScan).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"scan_failed"}'),
+    )
+    vi.mocked(api.onboardingImportState).mockRejectedValue(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"config_unreadable"}'),
+    )
+    const onSkipAll = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} onSkipAll={onSkipAll} />)
+    await screen.findByRole('heading', { name: 'We could not scan agent setup' })
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+
+    const leave = await screen.findByRole('button', { name: 'Close setup for now' })
+    expect(screen.getByTestId('agent-import-completion-error')).toHaveTextContent('config.json')
+    // One notice and one hand-off link for the panel, not a second red box.
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    expect(screen.getAllByText('Ask the agent')).toHaveLength(1)
+    await userEvent.click(leave)
+    expect(onSkipAll).toHaveBeenCalledOnce()
+  })
+
+  it('does not offer the unsaved exit while an import is in flight', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportState).mockRejectedValueOnce(
+      new ApiError(500, 'request failed', '{"error":"request failed","code":"state_failed"}'),
+    )
+    let finishApply: (value: typeof APPLY_RESPONSE) => void = () => {}
+    vi.mocked(api.onboardingImportApply).mockReturnValue(
+      new Promise(resolve => { finishApply = resolve }),
+    )
+    const onComplete = vi.fn()
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={onComplete} />)
+
+    await screen.findByRole('heading', { name: 'Choose sources' })
+    await userEvent.click(screen.getByRole('button', { name: 'Skip import' }))
+    await screen.findByRole('button', { name: 'Close setup for now' })
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Import selected' }))
+
+    expect(screen.getByRole('button', { name: 'Close setup for now' })).toBeDisabled()
+    finishApply(APPLY_RESPONSE)
+    await screen.findByText('Import complete')
+    expect(onComplete).not.toHaveBeenCalled()
+  })
+
+  it('says the import is not live when the agent spec was not rewritten', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockResolvedValue({ ...APPLY_RESPONSE, agent_spec_rewritten: false })
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('Import complete')
+
+    expect(await screen.findByTestId('agent-spec-not-rewritten')).toHaveTextContent(
+      'Saved, but this copy of Kiro Crew could not update the agent config',
+    )    // "Ready" would contradict the notice.
+    expect(screen.queryByText(/ready in Kiro Crew/i)).not.toBeInTheDocument()
+  })
+
+  it('shows no notice when the agent spec was rewritten', async () => {
+    mockSuccessfulRequests()
+    vi.mocked(api.onboardingImportApply).mockResolvedValue({ ...APPLY_RESPONSE, agent_spec_rewritten: true })
+
+    renderWithProviders(<AgentImportFlow initialOpen onComplete={vi.fn()} />)
+    await startImport()
+    await screen.findByText('Import complete')
+
+    expect(screen.queryByTestId('agent-spec-not-rewritten')).not.toBeInTheDocument()
   })
 
   it('offers a resolution when items conflict, and does not by default', async () => {

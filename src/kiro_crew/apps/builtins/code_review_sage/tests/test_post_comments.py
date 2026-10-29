@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -20,10 +22,11 @@ from pathlib import Path
 
 from aiohttp import web
 from backend import routes
-from sage_lib import results
+from sage_lib import discovery, report, results
 from sage_lib import review_driver as D
 from sage_lib import store
 
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import OwnerRequest
 from kiro_crew.dashboard import state as dashboard_state
 
 
@@ -49,6 +52,14 @@ def _record(cid: str = "CR-1", red: int = 1, yellow: int = 2) -> dict:
         "deep_reviewed": True, "title": cid, "ship_summary": "looks fine",
         "files_covered": ["f.py"], "coverage_complete": True,
     }
+
+
+def _response(task: str, record: dict) -> str:
+    capability = re.search(r'"capability": "([^"]+)"', task)
+    assert capability is not None
+    return json.dumps({"schema": D._RESPONSE_SCHEMA, "version": D._RESPONSE_VERSION,
+                       "capability": capability.group(1), "change_id": record["change_id"],
+                       "record": record})
 
 
 def await_sync(fn, *a, **kw):
@@ -90,6 +101,41 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
 
 class TestPostRecorded(_Base):
+    async def test_failed_confirmation_restores_accepted_record_before_retry(self):
+        accepted = _record()
+        results.write_result(accepted, self.root, "run-a")
+
+        def plant(task, timeout=0):
+            forged = results.read_result("CR-1", self.root, None)
+            forged["findings"][0]["observation"] = "forged finding"
+            forged["posted_comments"] = 1
+            results.write_result(forged, self.root, None)
+            return {"ok": True, "error": ""}
+
+        def reject(link, payload):
+            durable = results.read_result("CR-1", self.root, "run-a")
+            self.assertEqual(durable["findings"], accepted["findings"])
+            return False
+
+        out = await_sync(
+            D.post_recorded, "CR-1", "https://github.com/o/r/pull/1",
+            dispatch=plant, confirm=reject, root=self.root, run_id="run-a",
+            accepted_record=accepted)
+        self.assertFalse(out["post_ok"])
+        durable = results.read_result("CR-1", self.root, "run-a")
+        self.assertEqual(durable["findings"], accepted["findings"])
+        self.assertFalse(durable.get("posted_keys"))
+        retried = []
+
+        def retry(task, timeout=0):
+            retried.append(results.read_result("CR-1", self.root, None))
+            return {"ok": True, "error": ""}
+
+        await_sync(
+            D.post_recorded, "CR-1", "https://github.com/o/r/pull/1",
+            dispatch=retry, confirm=_unconfirmed, root=self.root, run_id="run-a")
+        self.assertEqual(retried[0]["findings"], accepted["findings"])
+
     async def test_publishes_the_redacted_envelope_not_model_text(self):
         results.write_result(_record(), self.root, "run-a")
         seen: list = []
@@ -341,8 +387,7 @@ class TestSelectivePosting(_Base):
 class TestRecordsSurviveForPosting(_Base):
     def _dispatch(self):
         def dispatch(task, timeout=0):
-            results.write_result(_record(), self.root)
-            return {"ok": True, "output": "done", "error": ""}
+            return {"ok": True, "output": _response(task, _record()), "error": ""}
         return dispatch
 
     async def test_records_are_kept_when_the_review_was_not_posted(self):
@@ -364,7 +409,7 @@ class TestRecordsSurviveForPosting(_Base):
 
         def dispatch(task, timeout=0):
             if "SINGLE thorough pass" in task:
-                results.write_result(_record(), self.root)
+                return {"ok": True, "output": _response(task, _record()), "error": ""}
             else:
                 rec = results.read_result("CR-1", self.root, None)
                 if rec:
@@ -541,10 +586,236 @@ class TestGroupedPost(_Base):
         self.assertEqual(self.dispatched, [])
 
 
-class _FakeRequest:
+class TestDismissFinding(_Base):
+    """A finding can be dismissed with a reason, and is then never posted."""
+
+    async def asyncSetUp(self):
+        routes._RUNS.clear()
+        self._write = unittest.mock.patch.object(routes, "_write_runs")
+        self.write = self._write.start()
+        self.addCleanup(self._write.stop)
+
+    def _run(self, **over) -> dict:
+        run = {
+            "run_id": "run-d", "repo": "o/r",
+            "changes": ["https://github.com/o/r/pull/1"],
+            "change_ids": ["CR-1"], "status": "done",
+            "started_at": "2026-01-01T00:00:00Z",
+            "finished_at": "2026-01-01T00:05:00Z",
+            **over,
+        }
+        routes._RUNS.append(run)
+        return run
+
+    async def _dismiss(self, body: dict) -> web.Response:
+        return await routes._handle_run_dismiss(
+            _FakeRequest("run-d", body))  # type: ignore[arg-type]
+
+    async def test_the_reason_is_stored_on_the_run(self):
+        run = self._run()
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:1",
+                                    "reason": "  false positive  "})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(run["dismissed"]["CR-1"]["finding:1"],
+                         {"reason": "false positive"})
+        self.write.assert_called_once()
+
+    async def test_undo_removes_the_dismissal(self):
+        run = self._run(dismissed={"CR-1": {"finding:1": {"reason": "x"}}},
+                        posted_at="2026-01-01T00:06:00Z")
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:1",
+                                    "dismissed": False})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(run["dismissed"], {})
+        # The undone finding is pending, so the run is not fully posted
+        # and "post all" must not answer already_posted.
+        self.assertIsNone(run["posted_at"])
+
+    async def test_a_failed_save_is_reported_and_rolled_back(self):
+        run = self._run()
+        self.write.side_effect = OSError("disk full")
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:1",
+                                    "reason": "no"})
+        self.assertEqual(resp.status, 500)
+        self.assertFalse(run.get("dismissed"))
+
+    async def test_the_live_run_changes_only_after_the_write_lands(self):
+        run = self._run()
+        seen: list = []
+        self.write.side_effect = lambda payload: seen.append(
+            (run.get("dismissed"), payload))
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:1",
+                                    "reason": "no"})
+        self.assertEqual(resp.status, 200)
+        live_during_write, payload = seen[0]
+        # A concurrent /runs read during the write sees the old state...
+        self.assertFalse(live_during_write)
+        # ...while the bytes on disk already carry the dismissal.
+        self.assertIn('"finding:1"', payload)
+        self.assertEqual(run["dismissed"], {"CR-1": {"finding:1": {"reason": "no"}}})
+
+    async def test_refuses_while_the_review_is_being_posted(self):
+        run = self._run(posting=True)
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:1",
+                                    "reason": "no"})
+        self.assertEqual(resp.status, 409)
+        self.assertFalse(run.get("dismissed"))
+
+    async def test_a_dismissed_finding_is_not_counted_or_posted(self):
+        results.write_result(_record(), None, "run-d")
+        run = self._run()
+        await self._dismiss({"change_id": "CR-1", "key": "finding:0", "reason": "no"})
+        n = await asyncio.to_thread(routes._pending_comment_count, "run-d", run)
+        # 1 red + 2 yellow + ship = 4, minus the dismissed red.
+        self.assertEqual(n, 3)
+        everything = routes._without_dismissed("run-d", run, "CR-1", None)
+        self.assertNotIn("finding:0", everything)
+        self.assertIn("finding:1", everything)
+        picked = routes._without_dismissed("run-d", run, "CR-1", ["finding:0"])
+        self.assertEqual(picked, [])
+
+    async def test_dismissing_the_only_red_finding_rebands_the_row(self):
+        """The row is red for its one red finding alone (design CONCERNS, risk
+        medium, blast MEDIUM). Dismissing that finding must move the row to yellow
+        in the report endpoint AND in the run-card tallies; undoing it moves it
+        back. The two yellow findings and the medium blast keep it out of green."""
+        results.write_result(_record(), None, "run-d")
+        built = report.generate(None, run_id="run-d")["index"]
+        self.assertEqual(built["bands"], {"red": 1, "yellow": 0, "green": 0})
+        run = self._run(summary={"ok": True, "report": dict(built)})
+
+        async def _report() -> dict:
+            resp = await routes._handle_run_report(_FakeRequest("run-d"))
+            self.assertEqual(resp.status, 200)
+            return json.loads(resp.body)
+
+        before = await _report()
+        self.assertEqual(before["rows"][0]["band"], "red")
+
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:0", "reason": "no"})
+        self.assertEqual(resp.status, 200)
+        after = await _report()
+        self.assertEqual(after["rows"][0]["band"], "yellow")
+        self.assertEqual(after["bands"], {"red": 0, "yellow": 1, "green": 0})
+        # The report's own finding tally is untouched; the dashboard subtracts
+        # the dismissal from it when it draws the chips.
+        self.assertEqual(after["rows"][0]["red"], 1)
+        self.assertEqual(run["summary"]["report"]["bands"],
+                         {"red": 0, "yellow": 1, "green": 0})
+        self.assertEqual(run["summary"]["report"]["total"], built["total"])
+
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:0",
+                                    "dismissed": False})
+        self.assertEqual(resp.status, 200)
+        undone = await _report()
+        self.assertEqual(undone["rows"][0]["band"], "red")
+        self.assertEqual(run["summary"]["report"]["bands"],
+                         {"red": 1, "yellow": 0, "green": 0})
+
+    async def test_a_row_red_for_its_blast_stays_red_when_its_finding_is_dismissed(self):
+        rec = _record()
+        rec["blast_radius"] = {"rating": "LARGE", "signals": {}}
+        results.write_result(rec, None, "run-d")
+        report.generate(None, run_id="run-d")
+        self._run()
+        await self._dismiss({"change_id": "CR-1", "key": "finding:0", "reason": "no"})
+        resp = await routes._handle_run_report(_FakeRequest("run-d"))
+        data = json.loads(resp.body)
+        self.assertEqual(data["rows"][0]["band"], "red")
+        self.assertEqual(data["rows"][0]["why"], "blast=LARGE")
+        self.assertEqual(data["bands"]["red"], 1)
+
+    async def _post_through_the_real_path(self, body: dict) -> list:
+        """Run `_handle_run_post` and the real `_post_comments_bg` it schedules.
+
+        Only the pool and `post_recorded` are stubbed, so the keys captured here
+        are exactly what the poster would be asked to publish.
+        """
+        dispatched: list = []
+
+        def _record_post(cid, link, *, dispatch, run_id, keys):
+            dispatched.append(keys)
+            return {"post_ok": True, "posted_keys": []}
+
+        class _Pool:
+            async def begin_batch(self):
+                return None
+
+            async def end_batch(self):
+                return None
+
+        with unittest.mock.patch.object(routes.review_pool, "get_pool", lambda: _Pool()), \
+                unittest.mock.patch.object(routes.review_pool, "make_sync_dispatch",
+                                           lambda loop, pool: None), \
+                unittest.mock.patch.object(routes.review_driver, "post_recorded",
+                                           _record_post), \
+                unittest.mock.patch.object(routes, "_record_reviewed", lambda run: None), \
+                unittest.mock.patch.dict(routes._INFLIGHT, clear=True):
+            # Another test in this worker may still hold a claim on CR-1.
+            resp = await routes._handle_run_post(
+                _FakeRequest("run-d", body))  # type: ignore[arg-type]
+            self.assertEqual(resp.status, 200, _body(resp))
+            await asyncio.gather(*list(routes._TASKS))
+        return dispatched
+
+    async def test_the_post_path_never_sends_a_dismissed_finding(self):
+        results.write_result(_record(), None, "run-d")
+        run = self._run()
+        await self._dismiss({"change_id": "CR-1", "key": "finding:0", "reason": "no"})
+
+        # "Post all": the poster gets an explicit list without the dismissed
+        # finding, not None (which would mean "everything recorded").
+        sent = await self._post_through_the_real_path({})
+        self.assertEqual(sent, [["finding:1", "finding:2", "design"]])
+
+        # A hand-picked selection that names the dismissed finding drops it.
+        run["posted_at"] = None
+        sent = await self._post_through_the_real_path(
+            {"change_id": "CR-1", "keys": ["finding:0", "finding:1"]})
+        self.assertEqual(sent, [["finding:1"]])
+
+    async def test_undo_of_a_finding_never_dismissed_keeps_posted_at(self):
+        run = self._run(posted_at="2026-01-01T00:06:00Z")
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:1",
+                                    "dismissed": False})
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(run["posted_at"], "2026-01-01T00:06:00Z")
+
+    async def test_refuses_what_is_not_a_finding(self):
+        self._run()
+        resp = await self._dismiss({"change_id": "CR-1", "key": "ship"})
+        self.assertEqual(resp.status, 400)
+
+    async def test_refuses_an_unknown_change(self):
+        self._run()
+        resp = await self._dismiss({"change_id": "CR-9", "key": "finding:0",
+                                    "reason": "no"})
+        self.assertEqual(resp.status, 404)
+
+    async def test_refuses_a_finding_already_on_the_pull_request(self):
+        self._run(posted_keys={"CR-1": ["finding:0"]})
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:0",
+                                    "reason": "no"})
+        self.assertEqual(resp.status, 409)
+
+    async def test_refuses_a_dismissal_without_a_reason(self):
+        self._run()
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:0",
+                                    "reason": "   "})
+        self.assertEqual(resp.status, 400)
+
+    async def test_refuses_an_overlong_reason(self):
+        self._run()
+        resp = await self._dismiss({"change_id": "CR-1", "key": "finding:0",
+                                    "reason": "x" * 501})
+        self.assertEqual(resp.status, 400)
+
+
+class _FakeRequest(OwnerRequest):
     """Minimal stand-in: the handler only reads match_info, query and json()."""
 
     def __init__(self, run_id: str, body: dict | None = None):
+        super().__init__()
         self.match_info = {"run_id": run_id}
         self.query: dict = {}
         self._body = body
@@ -847,8 +1118,6 @@ class TestPaginationContract(unittest.TestCase):
     """Every paginated read must ask for JSONL, or page two breaks the parse."""
 
     def test_draft_confirmation_paginates_as_jsonl(self):
-        from sage_lib import discovery
-
         calls: list[dict] = []
 
         def run_gh_json(path, jq=None, *, timeout=0, paginate=False, host=None):
@@ -866,7 +1135,13 @@ class TestPaginationContract(unittest.TestCase):
             self.assertTrue(
                 D._draft_confirmed("https://github.com/o/r/pull/1", payload))
 
-        self.assertEqual(len(calls), 2, calls)
+        # reviews, the pull request's (head, base) pinned before the comments
+        # are read, and the comments; no `/files` read, every line is resolved.
+        self.assertEqual(len(calls), 3, calls)
+        self.assertEqual(
+            [c["path"] for c in calls],
+            ["repos/o/r/pulls/1/reviews", "repos/o/r/pulls/1",
+             "repos/o/r/pulls/1/reviews/7/comments"], calls)
         for call in calls:
             if call["paginate"]:
                 self.assertEqual(call["jq"], ".[]", call)
@@ -886,19 +1161,38 @@ class TestDraftConfirmed(unittest.TestCase):
             ],
         }
 
-    def _stub(self, reviews, comments):
-        """Answer the two `gh api` reads `_draft_confirmed` makes."""
+    def _stub(self, reviews, comments, files=None, head="abc123",
+              base="base1"):
+        """Answer the `gh api` reads `_draft_confirmed` makes: reviews, one
+        review's comments, and (for a PENDING draft) the pull request itself
+        and its files."""
         def run_gh_json(path, jq=None, *, paginate=False, host=None):
-            return comments if "/comments" in path else reviews
+            if "/comments" in path:
+                return comments
+            if path.endswith("/files"):
+                if files is None:
+                    raise AssertionError("files read not expected here")
+                return files
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": head}, "base": {"sha": base}}]
+            return reviews
         return run_gh_json
 
     def _review(self, body="[code-review-sage] summary", commit="abc123"):
         return [{"id": 7, "state": "PENDING", "body": body, "commit_id": commit}]
 
-    def _confirm(self, reviews, comments, payload=None):
-        from sage_lib import discovery
+    # One hunk starting at new line 1 with no removed lines, so new line N
+    # sits at diff position N.
+    PATCH = "@@ -1,5 +1,6 @@\n a\n b\n c\n+widened\n e\n f"
+
+    def _files(self, patch=PATCH, filename="src/a.py"):
+        return [{"filename": filename, "patch": patch}]
+
+    def _confirm(self, reviews, comments, payload=None, files=None,
+                 head="abc123"):
         with unittest.mock.patch.object(
-                discovery, "run_gh_json", self._stub(reviews, comments)):
+                discovery, "run_gh_json",
+                self._stub(reviews, comments, files, head)):
             return D._draft_confirmed(self.LINK, payload or self._payload())
 
     def test_confirms_the_draft_that_was_sent(self):
@@ -926,6 +1220,224 @@ class TestDraftConfirmed(unittest.TestCase):
         """Where a comment lands is part of what the review says."""
         got = [{"path": "src/a.py", "line": 9, "body": "widens scope"}]
         self.assertFalse(self._confirm(self._review(), got))
+
+    def test_confirms_a_pending_draft_whose_lines_are_still_unresolved(self):
+        """GitHub resolves `line` and `side` only once a review is submitted;
+        a PENDING review's comments carry null for both and only a diff
+        `position`. The anchor is then checked through the pull request's
+        diff: the payload's (path, line) occupies one position, and the
+        comment has to sit there."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "side": None, "position": 4, "original_position": 4,
+                "body": "widens scope"}]
+        self.assertEqual(
+            self._confirm(self._review(), got, files=self._files()), "7")
+
+    def test_pending_shape_refuses_a_stale_draft_anchored_elsewhere(self):
+        """Same words, same commit, different position: a draft the poster
+        failed to replace, not the one just sent."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 2, "body": "widens scope"}]
+        self.assertFalse(self._confirm(self._review(), got, files=self._files()))
+        no_position = [{"path": "src/a.py", "line": None, "original_line": None,
+                        "position": None, "body": "widens scope"}]
+        self.assertFalse(
+            self._confirm(self._review(), no_position, files=self._files()))
+
+    def test_pending_shape_refuses_when_the_diff_cannot_place_the_anchor(self):
+        """No patch for the file (binary or too large), or a diff read that
+        fails, leaves the anchor unprovable, so the draft stays unconfirmed."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "widens scope"}]
+        withheld = [{"filename": "src/a.py", "patch": None}]
+        self.assertFalse(self._confirm(self._review(), got, files=withheld))
+
+        def failing(path, jq=None, *, paginate=False, host=None):
+            if path.endswith("/files"):
+                raise RuntimeError("gh timed out")
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": "abc123"}, "base": {"sha": "base1"}}]
+            return got if "/comments" in path else self._review()
+        with unittest.mock.patch.object(discovery, "run_gh_json", failing):
+            self.assertFalse(D._draft_confirmed(self.LINK, self._payload()))
+
+    def test_pending_shape_refuses_when_the_head_moved_during_posting(self):
+        """`/files` serves the CURRENT head's diff. A push that lands while the
+        draft is being posted would place the payload's lines in a diff the
+        draft is not anchored to, so a head other than the draft's commit
+        leaves the anchors unprovable."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "widens scope"}]
+        self.assertFalse(self._confirm(self._review(), got, files=self._files(),
+                                       head="def456"))
+        self.assertFalse(self._confirm(self._review(), got, files=self._files(),
+                                       head=""))
+
+    def test_pending_shape_refuses_a_push_between_the_head_and_files_reads(self):
+        """The head is checked again after `/files` is read, so a push that
+        lands between the two reads is caught: the diff that came back is the
+        new head's, and the anchors cannot be trusted."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "widens scope"}]
+        heads = iter(["abc123", "def456"])
+        files = self._files()
+
+        def run_gh_json(path, jq=None, *, paginate=False, host=None):
+            if "/comments" in path:
+                return got
+            if path.endswith("/files"):
+                return files
+            if path.endswith("/pulls/1"):
+                return [{"head": {"sha": next(heads)}, "base": {"sha": "base1"}}]
+            return self._review()
+        with unittest.mock.patch.object(discovery, "run_gh_json", run_gh_json):
+            self.assertFalse(D._draft_confirmed(self.LINK, self._payload()))
+
+    def test_pending_shape_refuses_a_head_that_only_matches_after_the_files_read(self):
+        """The head is checked BEFORE `/files` too: a head that reads as
+        another commit first and as the draft's commit afterwards means the
+        diff that came back may be the other commit's, so the second read
+        agreeing is not enough."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "widens scope"}]
+        files = self._files()
+        files_read = []
+
+        def run_gh_json(path, jq=None, *, paginate=False, host=None):
+            if "/comments" in path:
+                return got
+            if path.endswith("/files"):
+                files_read.append(path)
+                return files
+            if path.endswith("/pulls/1"):
+                # Keyed on whether the diff has been read, not on how many
+                # head reads came first, so only the pre-read check can refuse.
+                return [{"head": {"sha": "abc123" if files_read else "def456"},
+                         "base": {"sha": "base1"}}]
+            return self._review()
+        with unittest.mock.patch.object(discovery, "run_gh_json", run_gh_json):
+            self.assertFalse(D._draft_confirmed(self.LINK, self._payload()))
+
+    def test_pending_shape_refuses_a_base_retarget_with_the_head_unchanged(self):
+        """`/files` is the diff between the CURRENT base and head, so a base
+        retarget moves which line a position names even while the head stays
+        the draft's commit. The (head, base) pair is pinned before the
+        comments are read and must read the same after `/files`: a retarget
+        anywhere in that window leaves the anchors unprovable. Each case is
+        keyed on how far the read-back has got, so only the base changes."""
+        got = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "widens scope"}]
+        files = self._files()
+
+        def reads(base_at):
+            seen = []
+
+            def run_gh_json(path, jq=None, *, paginate=False, host=None):
+                if "/comments" in path:
+                    seen.append("comments")
+                    return got
+                if path.endswith("/files"):
+                    seen.append("files")
+                    return files
+                if path.endswith("/pulls/1"):
+                    return [{"head": {"sha": "abc123"},
+                             "base": {"sha": base_at(seen)}}]
+                return self._review()
+            return run_gh_json
+
+        cases = {
+            "between the comments and files reads":
+                lambda seen: "base2" if "comments" in seen else "base1",
+            "after the files read":
+                lambda seen: "base2" if "files" in seen else "base1",
+            "no base reported": lambda seen: "",
+        }
+        for name, base_at in cases.items():
+            with self.subTest(name), unittest.mock.patch.object(
+                    discovery, "run_gh_json", reads(base_at)):
+                self.assertFalse(D._draft_confirmed(self.LINK, self._payload()))
+        # The same reads with the base held still confirm, so the refusals
+        # above are the base moving and nothing else.
+        with unittest.mock.patch.object(
+                discovery, "run_gh_json", reads(lambda seen: "base1")):
+            self.assertEqual(D._draft_confirmed(self.LINK, self._payload()), "7")
+
+    def test_pending_shape_still_refuses_a_different_path_or_body(self):
+        """Position checking widens nothing else: path and body still identify."""
+        other_path = [{"path": "src/b.py", "line": None, "original_line": None,
+                       "position": 4, "body": "widens scope"}]
+        other_body = [{"path": "src/a.py", "line": None, "original_line": None,
+                       "position": 4, "body": "a different finding"}]
+        files = self._files()
+        self.assertFalse(self._confirm(self._review(), other_path, files=files))
+        self.assertFalse(self._confirm(self._review(), other_body, files=files))
+
+    def test_pending_shape_refuses_a_missing_or_extra_comment(self):
+        payload = self._payload()
+        payload["comments"].append(
+            {"path": "src/c.py", "line": 12, "side": "RIGHT", "body": "second"})
+        one = [{"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "widens scope"}]
+        files = self._files()
+        self.assertFalse(
+            self._confirm(self._review(), one, payload=payload, files=files))
+        extra = one + [{"path": "src/c.py", "line": None, "original_line": None,
+                        "position": 9, "body": "second"},
+                       {"path": "src/d.py", "line": None, "original_line": None,
+                        "position": 1, "body": "third"}]
+        self.assertFalse(
+            self._confirm(self._review(), extra, payload=payload, files=files))
+
+    def test_pending_shape_matches_same_body_comments_by_anchor_not_order(self):
+        """Two pending comments with the same path and body sort as a tie
+        (neither has a resolved line), so pairing them with the payload by
+        position in a sorted list depends on the order GitHub returns them.
+        Each comment's position is resolved to its line through the diff
+        instead, and the two sides compare as multisets of anchors: the
+        draft is confirmed in either return order, and refused when one of
+        the two sits on a line the payload never named."""
+        payload = self._payload()
+        payload["comments"] = [
+            {"path": "src/a.py", "line": 2, "side": "RIGHT", "body": "same"},
+            {"path": "src/a.py", "line": 4, "side": "RIGHT", "body": "same"},
+        ]
+        at_2 = {"path": "src/a.py", "line": None, "original_line": None,
+                "position": 2, "body": "same"}
+        at_4 = {"path": "src/a.py", "line": None, "original_line": None,
+                "position": 4, "body": "same"}
+        at_5 = {"path": "src/a.py", "line": None, "original_line": None,
+                "position": 5, "body": "same"}
+        files = self._files()
+        for got in ([at_2, at_4], [at_4, at_2]):
+            self.assertEqual(self._confirm(self._review(), got,
+                                           payload=payload, files=files), "7")
+        for got in ([at_2, at_5], [at_5, at_2], [at_4, at_4]):
+            self.assertFalse(self._confirm(self._review(), got,
+                                           payload=payload, files=files))
+
+    def test_mixed_resolved_and_pending_same_body_comments_confirm(self):
+        """One same-body comment with a resolved line and one still pending
+        pair by anchor, whichever the resolved one's line is."""
+        payload = self._payload()
+        payload["comments"] = [
+            {"path": "src/a.py", "line": 2, "side": "RIGHT", "body": "same"},
+            {"path": "src/a.py", "line": 4, "side": "RIGHT", "body": "same"},
+        ]
+        resolved_4 = {"path": "src/a.py", "line": 4, "position": 4,
+                      "body": "same"}
+        pending_2 = {"path": "src/a.py", "line": None, "original_line": None,
+                     "position": 2, "body": "same"}
+        self.assertEqual(self._confirm(self._review(), [resolved_4, pending_2],
+                                       payload=payload, files=self._files()),
+                         "7")
+
+    def test_patch_positions_follow_githubs_counting(self):
+        """Position counts every line below the first `@@`, including later
+        hunk headers and removed lines, and maps only lines the new file has."""
+        patch = ("@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"
+                 "@@ -10,2 +10,3 @@\n j\n+K\n k\n\\ No newline at end of file")
+        got = D._patch_positions(patch)
+        self.assertEqual(got, {1: 1, 2: 3, 3: 4, 10: 6, 11: 7, 12: 8})
 
     def test_refuses_a_matching_body_anchored_to_another_revision(self):
         """Right words about the wrong code is not the review that was sent."""

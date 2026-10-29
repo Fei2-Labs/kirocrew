@@ -247,7 +247,6 @@ def _active_state(
     try:
         cfg = KiroCrewConfig.load()
         active = cfg.agent.acp_backend or ""
-        allow_ungated = bool(cfg.agent.acp_backend_allow_ungated_tools)
     except Exception:
         logger.debug("Could not read the ACP backend config", exc_info=True)
         return {"active": "", "allow_ungated_tools": False, "routing_verdict": ""}
@@ -276,7 +275,7 @@ def _active_state(
 
     return {
         "active": active,
-        "allow_ungated_tools": allow_ungated,
+        "allow_ungated_tools": False,
         "routing_verdict": verdict,
         "routing_reason": reason,
     }

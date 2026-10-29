@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew.dashboard.chat_utils import run_config_write
+from kiro_crew.testing.wait import await_until
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
 
@@ -31,7 +32,33 @@ _CONFIG_WRITERS = (
     "persist_tracking_channel",
 )
 
-_SLACK_SOURCES = ("interactions.py", "handler.py", "events.py", "allowlist.py")
+#: The native handler's owners under ``slack/handler_runtime/`` are composed into
+#: handler.py and hold its ``!agent`` / ``!channel`` writes, so they are scanned too.
+_SLACK_SOURCES = (
+    "interactions.py",
+    "interactions_approvals.py",
+    "interactions_context.py",
+    "interactions_modals.py",
+    "interactions_options.py",
+    "interactions_sessions.py",
+    "interactions_settings.py",
+    "handler.py",
+    "events.py",
+    "events_block_text.py",
+    "events_home_tab.py",
+    "events_inbound.py",
+    "events_queue.py",
+    "events_slash.py",
+    "events_voice.py",
+    "allowlist.py",
+) + tuple(
+    f"handler_runtime/{path.name}"
+    for path in sorted((SRC / "slack" / "handler_runtime").glob("[!_]*.py"))
+)
+
+#: ``run_config_write(`` call sites across ``_SLACK_SOURCES``: a floor, so a writer
+#: that moves out of the scanned files fails here instead of leaving the scan.
+_SLACK_HELPER_SITES_FLOOR = 22
 
 
 class TestRunConfigWrite:
@@ -54,7 +81,7 @@ class TestRunConfigWrite:
             task = asyncio.create_task(_write())
             await asyncio.sleep(0.05)
             assert not ran.is_set(), "write started while a legacy writer held the lock"
-        await asyncio.wait_for(task, timeout=5)
+        await await_until(task, what="config write to complete")
         assert ran.is_set()
 
     @pytest.mark.asyncio
@@ -83,6 +110,13 @@ class TestSlackWritersUseBothLocks:
             for m in pattern.finditer((SRC / "slack" / name).read_text(encoding="utf-8"))
         ]
         assert offenders == [], f"config writers offloaded without _get_config_lock: {offenders}"
+
+    def test_the_scan_covers_every_slack_config_write(self) -> None:
+        sites = sum(
+            (SRC / "slack" / name).read_text(encoding="utf-8").count("run_config_write(")
+            for name in _SLACK_SOURCES
+        )
+        assert sites >= _SLACK_HELPER_SITES_FLOOR, sites
 
     def test_no_slack_async_function_calls_a_config_writer_inline(self) -> None:
         """Inside `async def`, a bare (un-awaited-wrapper) writer call blocks the

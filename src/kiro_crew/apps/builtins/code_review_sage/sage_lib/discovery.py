@@ -312,6 +312,56 @@ def list_contributed_repos(login: str, *, within_days: int = CONTRIB_WINDOW_DAYS
     return rows, truncated
 
 
+_QUEUE_LIMIT = 100
+_QUEUE_FIELDS = "number,title,url,repository,author,updatedAt,isDraft,labels"
+# Each retained field is bounded, not just the row count: the rows come from an
+# external provider and live in the gateway process until the response is sent.
+_QUEUE_MAX_TEXT = 500
+_QUEUE_MAX_LABELS = 100  # GitHub caps labels at 100 per PR, so this drops nothing
+
+
+def _clip(value: object) -> str:
+    return value[:_QUEUE_MAX_TEXT] if isinstance(value, str) else ""
+
+
+def list_review_requested(*, timeout: float = GH_TIMEOUT_SEC) -> tuple[list[dict], bool]:
+    """Open PRs that request the ``gh`` user's review, newest update first, in
+    the repo PR list's row shape. Search results carry no head SHA, so a row is
+    never marked reviewed. Returns ``(rows, truncated)``: one row past the cap is
+    fetched, so ``truncated`` means requests really were left out."""
+    argv = [gh_bin(), "search", "prs", "--review-requested=@me", "--state=open",
+            "--sort=updated", "--json", _QUEUE_FIELDS, "--limit", str(_QUEUE_LIMIT + 1)]
+    try:
+        proc = _run_gh(argv, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise GhSetupError("the `gh` CLI is not installed on this host") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GhError("`gh search prs` timed out") from exc
+    except OSError as exc:  # e.g. a resolved gh that has since lost its exec bit
+        raise GhError("`gh search prs` could not start") from exc
+    if proc.returncode != 0:
+        tail = " ".join((proc.stderr or "").strip().splitlines()[-3:])
+        if "auth login" in tail or "not logged" in tail.lower():
+            raise GhSetupError(f"`gh` is not authenticated: {tail}")
+        raise GhError(f"`gh search prs` failed (exit {proc.returncode}): {tail}")
+    try:
+        loaded = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise GhError("could not parse `gh search prs` output") from exc
+    hits = [r for r in loaded if isinstance(r, dict) and _clip(r.get("url"))] if isinstance(loaded, list) else []
+    rows = [{
+        "url": _clip(r["url"]), "number": r.get("number") if isinstance(r.get("number"), int) else 0,
+        "title": _clip(r.get("title")),
+        "repo": _clip((r.get("repository") or {}).get("nameWithOwner")),
+        "author": _clip((r.get("author") or {}).get("login")),
+        "updated_at": _clip(r.get("updatedAt")), "draft": bool(r.get("isDraft")),
+        "labels": [_clip(lb.get("name")) for lb in (r.get("labels") or [])[:_QUEUE_MAX_LABELS]
+                   if isinstance(lb, dict)],
+        "head_sha": "", "reviewed": False, "reviewed_stale": False,
+    } for r in hits[:_QUEUE_LIMIT]]
+    return rows, len(hits) > _QUEUE_LIMIT
+
+
 # --- Pinned repos ------------------------------------------------------------
 
 def repos_path(root: Path | None = None) -> Path:

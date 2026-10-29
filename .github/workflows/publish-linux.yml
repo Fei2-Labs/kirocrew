@@ -1,6 +1,6 @@
 name: Publish Linux Desktop (reusable)
 
-# Reusable workflow: publish one already-built Linux artifact (AppImage or deb) to a release
+# Reusable workflow: publish one already-built Linux artifact (AppImage, deb or rpm) to a release
 # channel on the distribution CDN. Called by nightly.yml (channel: nightly)
 # and release.yml (channel: insider | stable) as its own lane BESIDE the
 # macOS sign-and-notarize workflow, mirroring publish-cli.yml: the Linux
@@ -53,7 +53,8 @@ on:
         type: string
       format:
         description: >-
-          Linux artifact format this invocation publishes: appimage | deb.
+          Linux artifact format this invocation publishes: appimage | deb | rpm
+          (rpm publishes under feed/<channel>/rpm).
           One invocation publishes exactly ONE (arch, format) pair, so no two
           formats ever share a CDN key, a feed, or a latest alias — the same
           discipline the arch dimension already enforces.
@@ -167,8 +168,8 @@ jobs:
       # and arch with no hook to change it, so two formats cannot share a
       # directory without one overwriting the other's feed. A per-format
       # subdirectory leaves that derivation — including the -arm64 suffix —
-      # completely untouched; auto-update.js points a package install at the same
-      # subdirectory via buildFeedBase()'s `variant`.
+      # completely untouched; runtime/update/feed-lane.js points a package install
+      # at the same subdirectory via auto-update.js's buildFeedBase() `variant`.
       - name: Resolve format-dependent names
         run: |
           set -euo pipefail
@@ -193,7 +194,7 @@ jobs:
 
       - name: Configure AWS credentials
         if: env.HAS_SIGNING_SECRETS
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
           aws-region: us-west-2
@@ -237,7 +238,7 @@ jobs:
             echo "No ${LINUX_EXT} found matching ${PATTERN} in build artifacts"; exit 1
           fi
           if [ "${#MATCHES[@]}" -gt 1 ]; then
-            echo "Expected exactly one ${LINUX_EXT} matching ${PATTERN}, found ${#MATCHES[@]}:"; printf '%s\n' "${MATCHES[@]}"; exit 1
+            echo "Expected exactly one ${LINUX_EXT} matching ${PATTERN}, found ${#MATCHES[@]}:"; printf '%s\n' ${MATCHES[@]+"${MATCHES[@]}"}; exit 1
           fi
           echo "ARTIFACT_PATH=${MATCHES[0]}" >> "$GITHUB_ENV"
           ls -la "${MATCHES[0]}"

@@ -21,13 +21,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from kiro_crew.constants import MAX_SHORT_STRING
+
 # ── Constants ──
 
 PRIORITIES = ("critical", "default", "passive")
 _DEFAULT_PRIORITY = "default"
 _SYSTEM_SOURCE = "system"
 
-# System channels mirror the legacy notification kinds one-to-one.
+# System channels mostly mirror the legacy notification kinds one-to-one;
+# system.monitor is the exception (its notes keep kind "agent", see below).
 # Values are the channel's default priority (RFC "Priority semantics"):
 # approval is critical (blocks an agent turn); subagent is passive (the
 # completion event already injects into the originating chat session).
@@ -53,7 +56,34 @@ SYSTEM_CHANNELS: dict[str, str] = {
     # default stays `default`; the producer escalates the entering-critical
     # note explicitly (see notifications/resource_pressure.py).
     "system.resources": _DEFAULT_PRIORITY,
+    # Monitoring-loop lifecycle notices (a watch finished, spent its budget,
+    # stopped on a blocker or a stalled verdict). A separate channel lets the
+    # user mute them without muting system.agent, which carries the notes
+    # agents write for a human decision. Same default priority as
+    # system.agent: nothing changes until the user mutes or re-prioritises it.
+    "system.monitor": _DEFAULT_PRIORITY,
+    # A dashboard terminal shell that exited with a non-zero code; its tab
+    # closed with it, so the note is where the code is left to read.
+    "system.terminal": _DEFAULT_PRIORITY,
+    # A crewmate's message in its DM thread (dashboard/member_message_notes.py).
+    # Its own channel so the user can mute crewmate chatter without muting
+    # system.agent; the note keeps kind "agent", as system.monitor's do.
+    # Passive: the note lands in the bell without a banner, sound or OS toast
+    # until the user raises the channel in Settings -> Notifications.
+    "system.member": "passive",
+    # An installed app has a newer version published. Its own channel for the
+    # same reason system.monitor has one: this is the one system note a user
+    # may reasonably never want, and without a channel of its own it would
+    # fall back to system.agent, where muting it also mutes the notes agents
+    # write for a human decision. Default priority -- nothing is blocked, the
+    # app keeps working on the version it has.
+    "system.apps": _DEFAULT_PRIORITY,
 }
+
+# The channel the gateway's monitor-loop stop/finish notices use. Their legacy
+# ``kind`` stays "agent" so the feed badge, stat cards and per-kind sound are
+# unchanged; only the mute/priority channel moves.
+MONITOR_CHANNEL = "system.monitor"
 
 # Fallback channel for legacy kinds that have no dedicated system channel
 # (defensive: nothing emits unknown kinds today, but old JSONL rows might).
@@ -68,6 +98,9 @@ _MAX_ACTIONS = 4
 _MAX_ACTION_ID_LEN = 64
 _MAX_ACTION_LABEL_LEN = 40
 _MAX_ACTION_URL_LEN = 500
+# A crewmate's name may be as long as any crew name (MEMBER_NAME_MAX_CHARS is
+# this same constant), so a valid crewmate can never fail this bound.
+_MAX_MEMBER_FIELD_LEN = MAX_SHORT_STRING
 
 # Schema-owned note keys. Meta merging skips these entirely: setdefault alone
 # would only protect keys already present, letting meta smuggle unvalidated
@@ -87,6 +120,14 @@ _RESERVED_NOTE_KEYS = frozenset(
         "url",
         "icon",
         "ttl",
+        # Which crewmate published the note. Only gateway handlers that
+        # resolved it from a verified session key set it, so meta (which an
+        # app push forwards from its request body) must not be able to forge
+        # a crewmate's face onto a note.
+        "member",
+        # Which session published the note; set only by gateway handlers from an
+        # attested key, and read by the delivery sink for that session's mute.
+        "publisher_session",
         # Sink/frontend-owned status fields: a caller must not be able to
         # pre-suppress or pre-acknowledge a note it is pushing.
         "silenced",
@@ -143,7 +184,14 @@ class NotificationPayload:
     url: str | None = None
     icon: str | None = None
     ttl: int | None = None
+    # {"slug", "name"} of the crewmate that published the note, resolved by
+    # the gateway from the caller's verified session key; never caller-supplied.
+    member: dict[str, str] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    # Session key of the session that published the note, from the caller's
+    # attested key; never caller-supplied. The delivery sink reads it to apply
+    # that session's mute and drops it, so it is not stored or broadcast.
+    publisher_session: str | None = None
 
     def validate(self) -> None:
         """Raise :class:`NotificationValidationError` on any schema violation."""
@@ -245,6 +293,22 @@ class NotificationPayload:
             if not isinstance(self.url, str):
                 raise NotificationValidationError("url must be a dashboard-internal path")
             _validate_internal_url(self.url, field="url")
+        if self.member is not None and (
+            not isinstance(self.member, dict)
+            or set(self.member) != {"slug", "name"}
+            or not all(
+                isinstance(self.member[k], str) and 0 < len(self.member[k]) <= _MAX_MEMBER_FIELD_LEN
+                for k in ("slug", "name")
+            )
+        ):
+            # Closed shape: the frontend reads exactly these two strings.
+            raise NotificationValidationError(
+                "member must be {slug, name} with non-empty string values"
+            )
+        if self.publisher_session is not None and (
+            not isinstance(self.publisher_session, str) or not self.publisher_session
+        ):
+            raise NotificationValidationError("publisher_session must be a non-empty string")
 
 
 def _channel_for_kind(kind: str) -> str:
@@ -265,6 +329,9 @@ def payload_from_legacy(
     *,
     url: str | None = None,
     actions: list[dict[str, Any]] | None = None,
+    channel: str | None = None,
+    member: dict[str, str] | None = None,
+    publisher_session: str | None = None,
 ) -> NotificationPayload:
     """Build a v2 payload from the legacy ``notify(kind, ...)`` call shape.
 
@@ -284,8 +351,19 @@ def payload_from_legacy(
     path-validated rather than discarded. Unlike the title/body repairs above
     these do NOT repair: an invalid deep link raises, because a button that
     navigates somewhere unintended is worse than no button.
+
+    ``channel`` routes the note to a system channel other than the one its
+    ``kind`` maps to, keeping ``kind`` for the frontend. It must name a system
+    channel (the note's source is ``system``); anything else raises.
+
+    ``member`` attributes the note to a crewmate (see
+    :attr:`NotificationPayload.member`); like ``url`` it is a schema field, so
+    an invalid value raises rather than being repaired.
     """
-    channel = _channel_for_kind(kind)
+    if channel is None:
+        channel = _channel_for_kind(kind)
+    elif channel not in SYSTEM_CHANNELS:
+        raise NotificationValidationError(f"not a system channel: {channel!r}")
     # Coerce first: notify() never raised, and a non-string here would
     # TypeError out of the adapter before validation could catch it.
     if not isinstance(title, str):
@@ -306,6 +384,8 @@ def payload_from_legacy(
         kind=kind,
         url=url,
         actions=actions,
+        member=member,
+        publisher_session=publisher_session,
         meta=dict(meta) if meta else {},
     )
 
@@ -361,9 +441,7 @@ class NotificationBus:
         Returns the number of channels removed.
         """
         prefix = f"{app_name}."
-        doomed = [
-            c for c in self._channels if c.startswith(prefix) and c not in SYSTEM_CHANNELS
-        ]
+        doomed = [c for c in self._channels if c.startswith(prefix) and c not in SYSTEM_CHANNELS]
         for channel in doomed:
             self._channels.pop(channel, None)
         return len(doomed)
@@ -405,6 +483,8 @@ class NotificationBus:
             ("url", payload.url),
             ("icon", payload.icon),
             ("ttl", payload.ttl),
+            ("member", payload.member),
+            ("publisher_session", payload.publisher_session),
         ):
             if value is not None:
                 note[key] = value

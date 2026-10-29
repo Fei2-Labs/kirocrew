@@ -26,7 +26,9 @@ from typing import Any
 from kiro_crew import file_delivery_consent, mcp_core
 from kiro_crew.constants import CHANNEL_OWNER_DM_NAMESPACES
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes
+from kiro_crew.platform import binary_content_is_flagged
 from kiro_crew.platform import redact_via_context as redact
+from kiro_crew.platform import wide_content_is_flagged
 from kiro_crew.security import BINARY_MIME_ALLOWLIST, redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import _SLACK_TS_RE, CHANNEL_ID_RE, CHANNEL_MAX_LEN
 
@@ -120,7 +122,7 @@ def schemas() -> list[dict[str, Any]]:
                 "options: combining any of them with a channel session is REFUSED, "
                 "not silently ignored."
                 "\n\nOn a non-Slack messaging channel (Telegram, Discord, Teams, "
-                "Webex, WeCom, Weixin, WhatsApp, iMessage) set 'channel_type' to "
+                "Webex, WeCom, Weixin, WhatsApp, iMessage, Feishu) set 'channel_type' to "
                 "that channel's name to post into the conversation you are already "
                 "talking in. Use it in preference to a channel session whenever you "
                 "are talking on that channel — it reaches the conversation at hand, "
@@ -150,7 +152,14 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "blocks": {
                         "type": "array",
-                        "description": "Optional Slack Block Kit blocks array. When provided, the message is sent as a rich Block Kit message with text as fallback.",
+                        "description": (
+                            "Optional Slack Block Kit blocks array. When provided, "
+                            "the message is sent as rich Block Kit with text as "
+                            "fallback. Agent-supplied blocks cannot contain image "
+                            "or video blocks, or image_url, thumbnail_url, or "
+                            "video_url fields; those server-fetched media forms are "
+                            "refused."
+                        ),
                         "items": {"type": "object"},
                         "maxItems": 50,
                     },
@@ -168,7 +177,7 @@ def schemas() -> list[dict[str, Any]]:
                             "Deliver into the non-Slack messaging conversation this "
                             "session belongs to, named by its transport: "
                             '"telegram", "discord", "teams", "webex", "wecom", '
-                            '"weixin", "whatsapp" or "imessage". Use it when the '
+                            '"weixin", "whatsapp", "imessage" or "feishu". Use it when the '
                             "[RUNTIME] marker says you are talking over one of "
                             "those channels and you want a proactive message "
                             "(a silent cron's report, a finished background task) "
@@ -194,11 +203,18 @@ def schemas() -> list[dict[str, Any]]:
                     },
                     "unfurl_links": {
                         "type": "boolean",
-                        "description": "Whether to unfurl URL link previews. Defaults to true.",
+                        "description": (
+                            "Deprecated. Link previews are always off on bot "
+                            "posts (a preview is a zero-click fetch of the "
+                            "URL). false is accepted; true is refused."
+                        ),
                     },
                     "unfurl_media": {
                         "type": "boolean",
-                        "description": "Whether to unfurl media (images/video) previews. Defaults to true.",
+                        "description": (
+                            "Deprecated. Media previews are always off on bot "
+                            "posts. false is accepted; true is refused."
+                        ),
                     },
                     "thread_ts": {
                         "type": "string",
@@ -215,6 +231,23 @@ def schemas() -> list[dict[str, Any]]:
                             "When true and 'thread_ts' is set, also broadcast the threaded reply "
                             "to the channel's main message list. Requires 'thread_ts' — passing "
                             "reply_broadcast=true without thread_ts returns 400. Defaults to false."
+                        ),
+                    },
+                    "include_session_link": {
+                        "type": "boolean",
+                        "description": (
+                            "When true and the message is delivered to Slack, append an "
+                            '"Open session" button that deep-links to THIS session\'s '
+                            "dashboard chat (a cron links to its origin session). The link "
+                            "is built server-side from the verified caller identity, so it "
+                            "always points at the calling session — you never assemble it. "
+                            "The button's embedded sign-in credential expires ~5 minutes "
+                            "after send: a later tap still opens the session for a browser "
+                            "holding a dashboard session cookie, and otherwise lands on "
+                            "the sign-in page — so do not present the button as a durable "
+                            "link. Silently omitted (message still delivered) for non-Slack "
+                            "delivery, a caller with no resolvable session, or when no "
+                            "dashboard origin/tunnel is available. Defaults to false."
                         ),
                     },
                     "session": {
@@ -241,8 +274,8 @@ def schemas() -> list[dict[str, Any]]:
             "name": "send_notification",
             "description": (
                 "Publish a notification to the Kiro Crew notification center "
-                "(bell feed) through the system.agent channel (RFC notification "
-                "bus Phase 5). Unlike send_message, this is a pure notification: "
+                "(bell feed) through the system.agent channel. Unlike "
+                "send_message, this is a pure notification: "
                 "it never sends chat messages or DMs. "
                 "Supports priority tiers, a dashboard-internal "
                 "deep link, and group stacking. Use for structured, glanceable "
@@ -264,7 +297,8 @@ def schemas() -> list[dict[str, Any]]:
                         "type": "string",
                         "enum": ["critical", "default", "passive"],
                         "description": (
-                            "critical = badge+sound+banner, default = badge+sound, "
+                            "critical = badge+sound+banner, default = badge, with "
+                            "sound and banner per the channel's settings, "
                             "passive = feed-only. Omit for the channel default."
                         ),
                     },
@@ -290,7 +324,7 @@ def schemas() -> list[dict[str, Any]]:
                             '{"id": str (<=64), "label": str (<=40), "url"?: '
                             "dashboard-internal path (<=500)}. Rendered on the "
                             "notification card; url-less actions are legal but "
-                            "render nothing today."
+                            "render nothing."
                         ),
                         "items": {
                             "type": "object",
@@ -392,19 +426,26 @@ def schemas() -> list[dict[str, Any]]:
             "description": (
                 "Send a file to the user. Copies the file to the outbox and "
                 "notifies the dashboard with a download link. When this "
-                "session is linked to a Telegram conversation the file is "
-                "also delivered there natively; otherwise it uploads to "
+                "session is linked to a Telegram, Discord or WeCom "
+                "conversation the file is also delivered there natively; "
+                "otherwise it uploads to "
                 "Slack when the caller's Slack identity permits it. Use "
-                "when you've generated a report, export, artifact, or any "
-                "file the user should receive. Native channel delivery is "
+                "when you've generated a report, export or artifact the "
+                "user should receive. Any text file is accepted, but a "
+                "binary file only when it is audio, video, an image or a "
+                "PDF: other binary formats (zip, tar, Office "
+                "documents) are refused, so give the user their path "
+                "instead. Native channel delivery is "
                 "not guaranteed: the result reports skips and failures, and "
                 "a Slack-linked session reports a successful Slack upload. "
                 "If neither delivers, the file remains available from the "
                 "dashboard. To put an IMAGE inline in a "
                 "messaging conversation, reference it in your reply as "
-                "![alt](/abs/path) from the session's working directory — "
-                "the channel renderer uploads it as a native picture, which "
-                "this tool's outbox copy is not eligible for."
+                "![alt](/abs/path) from the session's working directory or "
+                "the browser tool's own output directory "
+                "($PLAYWRIGHT_MCP_OUTPUT_DIR, where playwright-cli screenshots "
+                "land) — the channel renderer uploads it as a native picture, "
+                "which this tool's outbox copy is not eligible for."
             ),
             "inputSchema": {
                 "type": "object",
@@ -483,6 +524,10 @@ def send_message(name: str, args: dict[str, Any]) -> str:
         payload["thread_ts"] = args["thread_ts"]
     if args.get("reply_broadcast"):
         payload["reply_broadcast"] = args["reply_broadcast"]
+    # Server-side deep-link button opt-in. Forwarded as a plain flag; the gateway
+    # resolves the caller identity and builds the URL, so no session key is sent.
+    if args.get("include_session_link"):
+        payload["include_session_link"] = True
     if session:
         payload["session"] = session
     # Always tell the gateway when the caller is a cron — even on a bare
@@ -887,7 +932,8 @@ def _describe_channel_skip(reason: str) -> str:
         # extraction uploads a real image referenced inline in the reply.
         return (
             f"{head}; for an inline image on a messaging channel, reference it as "
-            "![alt](/abs/path) from the session's working directory instead)"
+            "![alt](/abs/path) from the session's working directory or the browser "
+            "tool's output directory instead)"
         )
     return f"{head})"
 
@@ -942,14 +988,24 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             outcome="denied",
             error=f"sensitive_filename: {redact(clean_name)}",
         )
+        file_delivery_consent.audit_refusal(
+            file_delivery_consent.CLASS_OWNER_DASHBOARD,
+            leg="file_send",
+            name=redact(clean_name),
+            reason="flagged name",
+        )
         return "Error: filename contains sensitive content. Rename the file first."
-    # For text files, check content for sensitive data; binary files skip this
-    # and validate MIME against the shared BINARY_MIME_ALLOWLIST (deny-by-default).
-    is_text = True
+    # Content is scanned whichever way it decodes: UTF-8 text through ``redact``,
+    # non-UTF-8 bytes through the shared ``binary_content_is_flagged``. Binary
+    # must also carry an allow-listed MIME type (deny-by-default), and that check
+    # runs first so bytes of a type this path refuses outright are never scanned.
+    # ``wide_content_is_flagged`` runs on BOTH branches: NUL-interleaved ASCII is
+    # valid UTF-8, so a wide-encoded credential decodes cleanly and its characters
+    # arrive NUL-separated, which the contiguous-ASCII detectors do not match.
+    flagged = False
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        is_text = False
         guessed = mimetypes.guess_type(clean_name)[0] or ""
         if guessed not in BINARY_MIME_ALLOWLIST:
             mcp_core.sel().log_tool_invocation(
@@ -960,13 +1016,9 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 error=f"binary_mime_not_allowed: {guessed}",
             )
             return f"Error: binary file type not allowed: {guessed or 'unknown'}. Allowed: audio, video, image, PDF."
-        mcp_core.sel().log_tool_invocation(
-            session_key="mcp_core",
-            source="mcp",
-            tool_name="file_send",
-            outcome="info",
-            error="binary_file_skipping_content_scan",
-        )
+        flagged = binary_content_is_flagged(raw)
+    else:
+        flagged = redact(text) != text or wide_content_is_flagged(raw)
     # A positive here is almost always CORRECT -- the reported case (a VPN device
     # private key) matches the PEM branch, the highest-confidence detector in the
     # catalogue -- so the remedy is not a looser scan but an owner who can say
@@ -975,7 +1027,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     # ``_gate_upload_file``, which does not read the consent store and refuses them
     # regardless (see file_delivery_consent for why that is structural).
     delivered_under_consent = False
-    if is_text and redact(text) != text:
+    if flagged:
         if not file_delivery_consent.is_granted(file_delivery_consent.CLASS_OWNER_DASHBOARD):
             mcp_core.sel().log_tool_invocation(
                 session_key="mcp_core",
@@ -983,6 +1035,16 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 tool_name="file_send",
                 outcome="denied",
                 error="sensitive_content_detected",
+            )
+            # The error string below reaches the AGENT. This entry is what reaches
+            # the OWNER, so it carries the name: the panel it points them at asks
+            # them to allow delivery, and an owner who cannot see which of their
+            # files was stopped has nothing to base that on.
+            file_delivery_consent.audit_refusal(
+                file_delivery_consent.CLASS_OWNER_DASHBOARD,
+                leg="file_send",
+                name=clean_name,
+                reason="flagged content",
             )
             return (
                 "Error: file content contains sensitive data; send aborted. The owner "
@@ -995,6 +1057,24 @@ def file_send(name: str, args: dict[str, Any]) -> str:
                 "upload legs can never be granted."
             )
         delivered_under_consent = True
+    dest = mcp_core.outbox_dir() / clean_name
+    try:
+        with dest.open("xb") as f:
+            f.write(raw)
+    except FileExistsError:
+        dest = (
+            mcp_core.outbox_dir()
+            / f"{Path(clean_name).stem}_{uuid.uuid4().hex}{Path(clean_name).suffix}"
+        )
+        dest.write_bytes(raw)
+    if delivered_under_consent:
+        # Emitted once the bytes are on disk. A full outbox or a read-only
+        # workspace is an ordinary operational condition, and only
+        # ``FileExistsError`` is recovered above, so any other write error
+        # propagates from here; a record written before the copy would claim a
+        # consented delivery that never happened and there is no retraction
+        # entry to correct it. Over-reporting a release of flagged content is the
+        # direction an incident review cannot afford.
         mcp_core.sel().log_tool_invocation(
             session_key="mcp_core",
             source="mcp",
@@ -1007,16 +1087,6 @@ def file_send(name: str, args: dict[str, Any]) -> str:
             outcome="delivered",
             detail=f"file_send: {clean_name}",
         )
-    dest = mcp_core.outbox_dir() / clean_name
-    try:
-        with dest.open("xb") as f:
-            f.write(raw)
-    except FileExistsError:
-        dest = (
-            mcp_core.outbox_dir()
-            / f"{Path(clean_name).stem}_{uuid.uuid4().hex}{Path(clean_name).suffix}"
-        )
-        dest.write_bytes(raw)
     mcp_core.sel().log_tool_invocation(
         session_key="mcp_core",
         source="mcp",

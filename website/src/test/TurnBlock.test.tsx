@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
 import TurnBlock from '../pages/chat/TurnBlock'
+import { groupDisplayItems } from '../pages/chat/groupDisplayItems'
 import type { DisplayItem, TurnItem } from '../pages/chat/types'
+import type { ChatMessage } from '../types'
 
 function makeTurn(items: TurnItem[], complete = true): Extract<DisplayItem, {kind:'turn'}> {
   return { kind: 'turn', items, complete }
@@ -19,7 +21,7 @@ describe('TurnBlock — interim fan-out fold', () => {
     { kind: 'single', msg: { role: 'error', content: 'a spawn failed', ts: '2' }, idx: 1 },
   ]
   /** The element CollapsibleSection wraps its children in. */
-  const collapsed = (c: HTMLElement) => c.querySelector('[style*="overflow: hidden"]')
+  const collapsed = (c: HTMLElement) => c.querySelector('[data-collapsed="true"]')
 
   it('folds the region behind one toggle in DEFAULT mode, where nothing folded before', () => {
     const turn = { ...makeTurn(interimItems()), interim: true }
@@ -117,7 +119,7 @@ describe('TurnBlock — file role visibility', () => {
     // File message at idx 1 must be visible (not inside collapsed overflow:hidden section)
     const fileItem = container.querySelector('[data-testid="item-1"]')
     expect(fileItem).not.toBeNull()
-    expect(fileItem?.closest('[style*="overflow"]')).toBeNull()
+    expect(fileItem?.closest('[data-collapsed="true"]')).toBeNull()
     // Conclusion still visible
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
   })
@@ -143,7 +145,7 @@ describe('TurnBlock — file role visibility', () => {
     // (overflow-hidden) section — same assertion shape as the file-row test.
     const reportItem = container.querySelector('[data-testid="item-0"]')
     expect(reportItem).not.toBeNull()
-    expect(reportItem?.closest('[style*="overflow"]')).toBeNull()
+    expect(reportItem?.closest('[data-collapsed="true"]')).toBeNull()
     // Conclusion still visible
     expect(container.querySelector('[data-testid="item-2"]')).not.toBeNull()
   })
@@ -168,11 +170,11 @@ describe('TurnBlock — file role visibility', () => {
     // not render or sits inside a collapsed overflow section. This pins the
     // user-preference contract the marker deliberately opts OUT of.
     const reportItem = container.querySelector('[data-testid="item-0"]')
-    expect(reportItem === null || reportItem.closest('[style*="overflow"]') !== null).toBe(true)
+    expect(reportItem === null || reportItem.closest('[data-collapsed="true"]') !== null).toBe(true)
     // The conclusion is the visible survivor.
     const conclusion = container.querySelector('[data-testid="item-2"]')
     expect(conclusion).not.toBeNull()
-    expect(conclusion?.closest('[style*="overflow"]')).toBeNull()
+    expect(conclusion?.closest('[data-collapsed="true"]')).toBeNull()
   })
 
   it('renders file in its original turn position (not hoisted to top)', () => {
@@ -219,7 +221,7 @@ describe('TurnBlock — renderable content stays visible in collapseAll mode', (
     const widgetItem = container.querySelector('[data-testid="item-1"]')
     expect(widgetItem).not.toBeNull()
     // It should NOT be a descendant of a CollapsibleSection (motion.div with overflow:hidden).
-    const collapsedAncestors = widgetItem?.closest('[style*="overflow"]') ?? null
+    const collapsedAncestors = widgetItem?.closest('[data-collapsed="true"]') ?? null
     expect(collapsedAncestors).toBeNull()
     // The conclusion (last assistant message) is still visible.
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
@@ -243,7 +245,7 @@ describe('TurnBlock — renderable content stays visible in collapseAll mode', (
     )
     const imgItem = container.querySelector('[data-testid="item-1"]')
     expect(imgItem).not.toBeNull()
-    expect(imgItem?.closest('[style*="overflow"]')).toBeNull()
+    expect(imgItem?.closest('[data-collapsed="true"]')).toBeNull()
   })
 
   it('plain prose between tool calls still collapses (no regression)', () => {
@@ -264,7 +266,7 @@ describe('TurnBlock — renderable content stays visible in collapseAll mode', (
     // Plain prose at idx 1 should be inside a collapsed (overflow:hidden) section.
     const proseItem = container.querySelector('[data-testid="item-1"]')
     expect(proseItem).not.toBeNull()
-    expect(proseItem?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(proseItem?.closest('[data-collapsed="true"]')).not.toBeNull()
     // Conclusion still visible.
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
   })
@@ -444,7 +446,7 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
     // (overflow:hidden) reasoning section — it is a real deliverable.
     const handBack = container.querySelector('[data-testid="item-1"]')
     expect(handBack).not.toBeNull()
-    expect(handBack?.closest('[style*="overflow"]')).toBeNull()
+    expect(handBack?.closest('[data-collapsed="true"]')).toBeNull()
     // The final conclusion is still visible too.
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
   })
@@ -467,7 +469,7 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
     // collapsed section — surfacing it would defeat "hide intermediate reasoning".
     const prose = container.querySelector('[data-testid="item-1"]')
     expect(prose).not.toBeNull()
-    expect(prose?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(prose?.closest('[data-collapsed="true"]')).not.toBeNull()
     // Conclusion still visible.
     expect(container.querySelector('[data-testid="item-3"]')).not.toBeNull()
   })
@@ -494,10 +496,10 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
     for (const i of [1, 2, 3]) {
       const el = container.querySelector(`[data-testid="item-${i}"]`)
       expect(el).not.toBeNull()
-      expect(el?.closest('[style*="overflow"]')).toBeNull()
+      expect(el?.closest('[data-collapsed="true"]')).toBeNull()
     }
     // ...while the templated ack is still free to fold away.
-    expect(container.querySelector('[data-testid="item-0"]')?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="item-0"]')?.closest('[data-collapsed="true"]')).not.toBeNull()
   })
 
   it('does not treat a stray class containing "crew-reply" as a marker', () => {
@@ -514,7 +516,7 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
         collapseAll={true}
       />
     )
-    expect(container.querySelector('[data-testid="item-0"]')?.closest('[style*="overflow"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="item-0"]')?.closest('[data-collapsed="true"]')).not.toBeNull()
   })
 
   it('the "Worked through N steps" count excludes the now-visible hand-back', () => {
@@ -535,6 +537,60 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
     // inline and must NOT inflate the count to 3.
     expect(screen.getByRole('button', { name: /Worked through 2 steps/ })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Worked through 3 steps/ })).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * A tool-refusal recovery is queued after the turn's dispatch ends, so it can land
+ * after an answer the user already read, and the reply to it continues the same
+ * turn. Both the answer and the card must survive collapseAll.
+ */
+describe('TurnBlock — answer before a tool-refusal recovery', () => {
+  const renderItem = (it: TurnItem, i: number) => <div data-testid={`item-${i}`}>{it.kind === 'single' ? it.msg.content : 'group'}</div>
+  const isFolded = (container: HTMLElement, i: number) =>
+    container.querySelector(`[data-testid="item-${i}"]`)?.closest('[data-collapsed="true"]') != null
+
+  it('keeps the answer and the refusal card visible when a reply follows the card', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Here is the full answer to your question, with every detail the user asked for.', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'inject', content: '[Tool refusal — automatic recovery]\nOne or more tool calls were blocked.', ts: '3', meta: { injectKind: 'recovery' } }, idx: 2 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '4' }, idx: 3 },
+      { kind: 'single', msg: { role: 'assistant', content: 'A note on the blocked command: it was an over-block and changes nothing above.', ts: '5' }, idx: 4 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(isFolded(container, 1)).toBe(false)
+    expect(isFolded(container, 2)).toBe(false)
+    expect(isFolded(container, 4)).toBe(false)
+    expect(isFolded(container, 0)).toBe(true)
+    expect(isFolded(container, 3)).toBe(true)
+    expect(screen.getByRole('button', { name: /Worked through 2 steps/ })).toBeInTheDocument()
+  })
+
+  it('still folds narration that a blocked tool call followed', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'assistant', content: 'Let me check the deployment logs to see why the canary failed.', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'inject', content: '[Tool blocked — reason sent to the agent]\nBlocked by security policy.', ts: '3', meta: {} }, idx: 2 },
+      { kind: 'single', msg: { role: 'inject', content: '[Tool refusal — automatic recovery]\nOne or more tool calls were blocked.', ts: '4', meta: { injectKind: 'recovery' } }, idx: 3 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Read the logs through an allowed command instead; the error is a stale signing key.', ts: '5' }, idx: 4 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(isFolded(container, 0)).toBe(true)
+    expect(isFolded(container, 3)).toBe(true)
+    expect(isFolded(container, 4)).toBe(false)
+  })
+
+  it('does not apply to other recovery kinds', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'assistant', content: 'Working through the migration now, starting with the schema and then the data.', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'inject', content: '[Stalled turn — automatic recovery]\nContinue from where you stopped.', ts: '3', meta: { injectKind: 'recovery' } }, idx: 2 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Finished the migration: schema and data are both moved and verified.', ts: '4' }, idx: 3 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(isFolded(container, 0)).toBe(true)
+    expect(isFolded(container, 2)).toBe(true)
   })
 })
 
@@ -726,5 +782,151 @@ describe('TurnBlock — summary counts distinct tool calls', () => {
     const items = [tool('🔧 Running: read_me', '1', 'tc-1'), tool('✅ read_me', '2', 'tc-1'), tool('🔧 Running: legacy', '3'), conclusion]
     render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} />)
     expect(screen.getByText('2 tool calls')).toBeInTheDocument()
+  })
+})
+
+// #15115: the watchdog's recycle notice is an assistant-role row tagged
+// `kind: 'compaction'` and lands AFTER a finished turn's answer. It must not be
+// picked as the turn's conclusion, or the real answer folds into the
+// "Worked through N steps" pane and the banner is the only visible output.
+describe('TurnBlock — trailing recycle notice does not become the conclusion (#15115)', () => {
+  const answer = 'Here is the full answer to your question, long enough to be substantive on its own.'
+  const notice = '♻️ This session was recycled by the watchdog (memory limit (1950MB)). Conversation history is preserved — your next message starts a fresh process.'
+  const items = (): TurnItem[] => [
+    { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read_me', ts: '1' }, idx: 0 },
+    { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '2' }, idx: 1 },
+    { kind: 'single', msg: { role: 'assistant', content: answer, ts: '3', meta: { turn_stats: { tool_calls: 2 } } }, idx: 2 },
+    { kind: 'single', msg: { role: 'assistant', content: notice, ts: '4', meta: { kind: 'compaction', notice: 'session_recycled' } }, idx: 3 },
+  ]
+  const renderItem = (it: TurnItem, i: number) => (
+    <div data-testid={`item-${i}`}>{it.kind === 'single' ? it.msg.content : 'group'}</div>
+  )
+  const inFold = (el: HTMLElement) => el.closest('[data-collapsed="true"]')
+
+  for (const collapseAll of [false, true]) {
+    it(`keeps the answer visible and the notice after it (collapseAll=${collapseAll})`, () => {
+      const { container } = render(
+        <TurnBlock turn={makeTurn(items())} renderItem={renderItem} collapseAll={collapseAll} />
+      )
+      const answerEl = screen.getByTestId('item-2')
+      const noticeEl = screen.getByTestId('item-3')
+      expect(inFold(answerEl)).toBeNull()
+      expect(inFold(noticeEl)).toBeNull()
+      expect(answerEl.compareDocumentPosition(noticeEl) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(container.textContent).toContain(answer)
+    })
+  }
+})
+
+describe('TurnBlock — collapseAll folds a turn that has no conclusion', () => {
+  const renderItem = (it: TurnItem, i: number) => (
+    <div data-testid={`item-${i}`} data-role={it.kind === 'single' ? it.msg.role : 'group'}>
+      {it.kind === 'single' ? it.msg.content : 'group'}
+    </div>
+  )
+  const collapsed = (c: HTMLElement) => c.querySelector('[data-collapsed="true"]')
+
+  it('a quiet end (nothing_to_do, no assistant text) folds every working step', () => {
+    // The conclusion is what the agent handed the user at the end of the turn.
+    // A quiet end hands them nothing, so there is nothing to keep out of the
+    // fold: the tool rows are all working steps and all of them fold.
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: git status', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: gh pr checks', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: nothing_to_do', ts: '3' }, idx: 2 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(container.querySelector('button')).toBeInTheDocument()
+    for (const id of ['item-0', 'item-1', 'item-2']) {
+      expect(screen.getByTestId(id).closest('[data-collapsed="true"]')).not.toBeNull()
+    }
+  })
+
+  it('an error that ended the turn stays outside the fold', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: git status', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: pytest', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'error', content: 'turn failed', ts: '3' }, idx: 2 },
+    ]
+    render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(screen.getByTestId('item-0').closest('[data-collapsed="true"]')).not.toBeNull()
+    expect(screen.getByTestId('item-2').closest('[data-collapsed="true"]')).toBeNull()
+  })
+
+  it('the work above a mid-turn steer, grouped as a turn of its own, folds the same way', () => {
+    // A steer is its own display row (the pinned-prompt band pins it), so the
+    // grouping closes a turn right above it: tools, maybe a reasoning burst,
+    // and no answer. Same shape as the quiet end, same fold.
+    const steered = groupDisplayItems([
+      { role: 'user', content: 'ship it', ts: '0' },
+      { role: 'thinking', content: 'first the checks', ts: '1' },
+      { role: 'tool', content: '🔧 Running: git status', ts: '2' },
+      { role: 'tool', content: '🔧 Running: pytest', ts: '3' },
+      { role: 'user', content: 'stop at phase 2', ts: '4', meta: { steer: true, steerState: 'consumed' } },
+      { role: 'assistant', content: 'Stopped at phase 2 as requested; the two files are written and the tests pass.', ts: '5' },
+    ] as ChatMessage[])
+    const aboveSteer = steered.turns.find((d): d is Extract<DisplayItem, { kind: 'turn' }> => d.kind === 'turn')
+    expect(aboveSteer).toBeDefined()
+    expect(aboveSteer!.items.map(it => it.kind === 'single' ? it.msg.content : 'group')).toEqual(['first the checks', '🔧 Running: git status', '🔧 Running: pytest'])
+    render(<TurnBlock turn={aboveSteer!} renderItem={renderItem} collapseAll={true} />)
+    for (const id of ['item-0', 'item-1', 'item-2']) {
+      expect(screen.getByTestId(id).closest('[data-collapsed="true"]')).not.toBeNull()
+    }
+  })
+
+  it('a system notice that closed a conclusion-less turn stays outside the fold', () => {
+    // A failed auto-compact, a stuck-turn or a recycle notice is an assistant
+    // row the conclusion scan skips; it is the only row that says why the turn
+    // has no answer, so the whole-turn fold must leave it in view.
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: git status', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: pytest', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'assistant', content: '❌ Auto-compact failed. Run /compact to retry.', ts: '3', kind: 'compaction' }, idx: 2 },
+    ]
+    render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(screen.getByTestId('item-0').closest('[data-collapsed="true"]')).not.toBeNull()
+    expect(screen.getByTestId('item-1').closest('[data-collapsed="true"]')).not.toBeNull()
+    expect(screen.getByTestId('item-2').closest('[data-collapsed="true"]')).toBeNull()
+  })
+
+  it('a Stop card and a notice row that ended a conclusion-less turn stay outside the fold', () => {
+    // The whole-turn fold takes working steps only (tool, reasoning, agent
+    // text); the rows that say how the turn ended are its outcome, not its work.
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: git status', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: pytest', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'notice', content: 'Auto-continue cancelled', ts: '3' }, idx: 2 },
+      { kind: 'single', msg: { role: 'system', content: 'Stopped', ts: '4', kind: 'stop_event' }, idx: 3 },
+    ]
+    render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(screen.getByTestId('item-0').closest('[data-collapsed="true"]')).not.toBeNull()
+    expect(screen.getByTestId('item-1').closest('[data-collapsed="true"]')).not.toBeNull()
+    expect(screen.getByTestId('item-2').closest('[data-collapsed="true"]')).toBeNull()
+    expect(screen.getByTestId('item-3').closest('[data-collapsed="true"]')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Worked through 2 steps' })).toBeInTheDocument()
+  })
+
+  it('a system notice before the conclusion of an answered turn still folds, as before', () => {
+    // The notice exemption belongs to the whole-turn fold only: a turn that has
+    // an answer keeps folding everything before it, notices included.
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: git status', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'assistant', content: '✅ Compacted the conversation.', ts: '2', kind: 'compaction' }, idx: 1 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: pytest', ts: '3' }, idx: 2 },
+      { kind: 'single', msg: { role: 'assistant', content: 'All 42 tests pass and the working tree is clean, so the branch is ready.', ts: '4' }, idx: 3 },
+    ]
+    render(<TurnBlock turn={makeTurn(items)} renderItem={renderItem} collapseAll={true} />)
+    expect(screen.getByTestId('item-1').closest('[data-collapsed="true"]')).not.toBeNull()
+    expect(screen.getByTestId('item-3').closest('[data-collapsed="true"]')).toBeNull()
+  })
+
+  it('does not fold a conclusion-less turn while it is still running', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: git status', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: gh pr checks', ts: '2' }, idx: 1 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items, false)} renderItem={renderItem} collapseAll={true} />)
+    expect(container.querySelector('button')).toBeNull()
+    expect(collapsed(container)).toBeNull()
   })
 })

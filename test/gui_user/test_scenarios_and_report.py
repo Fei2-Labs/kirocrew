@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,8 @@ SCENARIOS_DIR = Path(__file__).parent / "scenarios"
 KNOWLEDGE_NOTES_DIR = (
     Path(__file__).resolve().parents[2] / "scripts" / "gui-user-test" / "knowledge-notes"
 )
+#: boot.sh's seed step; a script, not a package, so the test loads it by path.
+SEED_HOME_PY = Path(__file__).resolve().parents[2] / "scripts" / "gui-user-test" / "seed_home.py"
 
 
 # --------------------------------------------------------------------------
@@ -23,6 +26,7 @@ KNOWLEDGE_NOTES_DIR = (
 
 
 SHIPPED_SMOKE = {
+    "apps-discover-enable-notes",
     "apps-discover-enable-research-lab",
     "artifacts-library-table-and-kind-filter",
     "auth-sign-in-card-signed-out",
@@ -57,10 +61,17 @@ SHIPPED_SMOKE = {
     "taskrunner-projects-page-compose",
 }
 SHIPPED = SHIPPED_SMOKE | {
+    "chat-subagents-panel-empty",
+    "crewmate-chat-clean",
+    "crewmate-create-first",
     "crewmate-panel-tabs",
+    "crewmate-reply-thread",
+    "customize-tabs",
     "knowledge-add-folder-source-and-scan",
     "members-dm-hello",
     "members-private-memory-keeps-thread",
+    "members-roster-filter",
+    "schedule-add-cron-job",
 }
 
 
@@ -83,8 +94,8 @@ class TestShippedScenarios:
             assert s.max_steps <= 14, s.name
         smoke_steps = sum(s.max_steps for s in smoke)
         smoke_seconds = sum(s.max_seconds for s in smoke)
-        assert smoke_steps == 307, f"smoke max_steps total is {smoke_steps}; re-pin"
-        assert smoke_seconds == 8420, f"smoke max_seconds total is {smoke_seconds}; re-pin"
+        assert smoke_steps == 321, f"smoke max_steps total is {smoke_steps}; re-pin"
+        assert smoke_seconds == 8720, f"smoke max_seconds total is {smoke_seconds}; re-pin"
 
     def test_nightly_includes_smoke(self) -> None:
         nightly = scenarios.select(scenarios.load_all(SCENARIOS_DIR), tier="nightly")
@@ -107,6 +118,98 @@ class TestShippedScenarios:
         assert any("3 supported files found" in step for step in sc.steps)
         assert any('"3 items"' in exp for exp in sc.expectations)
         assert any("/tmp/kirocrew-gui-user-test/team-notes" in step for step in sc.steps)
+
+    def test_knowledge_scenario_judges_the_settled_badge_and_survives_a_retry(self) -> None:
+        # Two ways this scenario reached NO_VERDICT on a night the product was
+        # healthy (run 36550183001). (1) The row's badge settles on "Up to date"
+        # once the scan the wait step waits for has finished; "Active" is only
+        # the in-flight state after "Start Scanning", so an expectation demanding it
+        # asks for a screen the tester can never see, and the verdict then rides
+        # on judge leniency. (2) The retry runs against the same un-reseeded
+        # gateway, so attempt 2 meets the row attempt 1 added; a second add of
+        # the same folder is refused (409 "source already exists"), so the add
+        # step must name the final state and add nothing when the row is there.
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "knowledge-add-folder-source-and-scan.yaml")
+        assert any('"Up to date"' in exp for exp in sc.expectations)
+        for exp in sc.expectations:
+            if '"Active"' in exp:
+                assert '"Up to date"' in exp, f"expectation demands the in-flight badge: {exp}"
+        guard = [s for s in sc.steps if "already listed" in s and "add nothing" in s]
+        assert guard, "no step tells a retry to leave an already-listed source alone"
+        add_step = next(i for i, s in enumerate(sc.steps) if 'Click "Local Folder"' in s)
+        assert sc.steps.index(guard[0]) < add_step, "the guard must come before the add"
+        assert '"Up to date"' in sc.steps[-1], "the wait must stop on the settled badge"
+
+    def test_seeded_project_reaches_the_transcript_reader(self, tmp_path: Path) -> None:
+        # seed_home.py --project writes into the starter transcript's metadata line
+        # by hand, and the dashboard restores `slot.project` from the same record
+        # through ConversationLog. Patch the real `rich` starter and read it back
+        # with the real reader, so a metadata-shape change on either side fails
+        # here rather than as "No project directory is set" on a paid nightly run.
+        import importlib.util
+
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.testing.fixtures import seeded_home
+
+        spec = importlib.util.spec_from_file_location("gui_seed_home", SEED_HOME_PY)
+        assert spec is not None and spec.loader is not None
+        seed_home = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(seed_home)
+
+        project = tmp_path / "sample-project"
+        project.mkdir()
+        with seeded_home("rich") as home:
+            sessions = home / "sessions"
+            starter = sessions / seed_home.STARTER_SESSION
+            before = starter.read_text(encoding="utf-8").splitlines()
+            seed_home._set_session_project(starter, str(project))
+            after = starter.read_text(encoding="utf-8").splitlines()
+            assert after[1:] == before[1:]  # only the metadata line moved
+            meta = ConversationLog(base_dir=sessions).get_metadata(starter.stem)
+        assert meta["project"] == str(project)
+        assert meta["title"] == "Welcome to KiroCrew"  # brand-ok: verbatim seeded title
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "chat-files-side-panel-browse.yaml")
+        assert any(meta["title"] in step for step in sc.steps)
+
+    def test_scenarios_search_before_clicking_a_seeded_members_card(self) -> None:
+        # The Mates page lists a mate unasked only once its DM thread
+        # holds a message or the user starred it (rfc-session-template-vs-crewmate,
+        # rule 3); a seeded member's thread is empty at boot, so its card is
+        # reached through the roster search and nothing else. A scenario that
+        # tells the tester to click the card without searching first stalls on a
+        # roster that lists only `default` and Mate, so the search step must come
+        # before the first click, in every scenario that opens that page. The
+        # Capabilities > Mates pane is a different surface: it lists every
+        # config row, so a scenario on it has nothing to search for.
+        checked = 0
+        for path in sorted(SCENARIOS_DIR.glob("*.yaml")):
+            sc = scenarios.load_scenario(path)
+            if not sc.members or not any("Open the Mates page" in step for step in sc.steps):
+                continue
+            labels = list(sc.members) + [
+                " ".join(part.capitalize() for part in m.split("-")) for m in sc.members
+            ]
+            click_at = next(
+                (
+                    i
+                    for i, step in enumerate(sc.steps)
+                    if any(label in step for label in labels)
+                    and re.search(r"\b(click|find)\b", step, re.IGNORECASE)
+                    and "Search mates" not in step
+                ),
+                None,
+            )
+            if click_at is None:
+                continue
+            checked += 1
+            searched = any(
+                "Search mates" in step and any(m.split("-")[0] in step.lower() for m in sc.members)
+                for step in sc.steps[:click_at]
+            )
+            assert (
+                searched
+            ), f"{path.name}: step {click_at + 1} clicks a seeded member's card with no search step before it"
+        assert checked >= 5, f"only {checked} scenarios click a seeded member's card"
 
     def test_rich_seed_artifacts_are_the_ones_the_scenario_reads(self) -> None:
         # The Artifacts scenario names the three artifacts the `rich` seed ships and
@@ -141,6 +244,32 @@ class TestShippedScenarios:
         )
         assert any(f'"v{version}"' in exp for exp in sc.expectations)
 
+    def test_fresh_target_scenarios_run_before_any_scenario_that_writes(self) -> None:
+        # The target boots once and nothing resets it. In file-name order the
+        # members-*/crewmate-* chats post crewmate notes and add crewmates
+        # before notifications-* and customize-tabs read an empty inbox and a
+        # one-card roster. The scenarios that read the boot state say so, and
+        # select() runs them first in every tier.
+        fresh = {
+            "capabilities-agents-list-and-open-editor",
+            "customize-tabs",
+            "notifications-bell-sheet-open-close",
+            "notifications-center-empty-state",
+        }
+        loaded = scenarios.load_all(SCENARIOS_DIR)
+        assert {s.name for s in loaded if s.fresh_target} == fresh
+        for tier in ("smoke", "nightly"):
+            run = scenarios.select(loaded, tier=tier)
+            flags = [s.fresh_target for s in run]
+            first_other = flags.index(False)
+            assert all(flags[:first_other]) and not any(flags[first_other:]), tier
+            scenarios.check_run_order(run)
+            # Each part keeps file-name order, so the rest of the run is unchanged.
+            rest = [s.name for s in run[first_other:]]
+            assert rest == sorted(rest), tier
+        picked = scenarios.select(loaded, names=["members-dm-hello", "customize-tabs"])
+        assert [s.name for s in picked] == ["customize-tabs", "members-dm-hello"]
+
     def test_explicit_name_selection(self) -> None:
         picked = scenarios.select(scenarios.load_all(SCENARIOS_DIR), names=["members-dm-hello"])
         assert [s.name for s in picked] == ["members-dm-hello"]
@@ -159,6 +288,27 @@ class TestShippedScenarios:
         # The catalog fields describe the scenario to people, not to the model.
         assert sc.user_story not in prompt
 
+    def test_a_retry_creates_a_new_name_not_the_first_attempts(self) -> None:
+        # The target boots once per run, so attempt 2 finds the crewmate attempt 1
+        # made. Asking it for the same name is refused as a duplicate and leaves
+        # a dirty "New crewmate" form for the next scenario (Leave site?).
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "crewmate-create-first.yaml")
+        first, second = sc.task_prompt(1), sc.task_prompt(2)
+        assert scenarios.ATTEMPT_SUFFIX not in first + second
+        assert 'type exactly "Radar" in the "Name" field' in first
+        assert 'type exactly "Radar 2" in the "Name" field' in second
+        assert '"Radar 2" is visible' in second
+        assert sc.task_prompt() == first
+
+    def test_attempt_suffix(self) -> None:
+        assert [scenarios.attempt_suffix(n) for n in (0, 1, 2, 3)] == ["", "", " 2", " 3"]
+
+    def test_report_summary_carries_no_placeholder(self) -> None:
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "crewmate-create-first.yaml")
+        res = harness.ScenarioResult.for_scenario(sc, "SKIPPED")
+        assert scenarios.ATTEMPT_SUFFIX not in res.summary
+        assert "named Radar with a job" in res.summary
+
     def test_every_shipped_scenario_is_classified(self) -> None:
         for sc in scenarios.load_all(SCENARIOS_DIR):
             assert sc.feature in scenarios.FEATURES
@@ -172,6 +322,7 @@ class TestShippedScenarios:
         assert {slug: [s.name for s in g] for slug, g in groups.items()} == {
             "chat": [
                 "chat-session-title",
+                "chat-subagents-panel-empty",
                 "chat-switch-seeded-sessions",
                 "chat-turn-stats-footer",
                 "sessions-new-chat",
@@ -184,22 +335,30 @@ class TestShippedScenarios:
             ],
             "search": ["search-everywhere-jump-to-setting"],
             "members": [
+                "crewmate-chat-clean",
+                "crewmate-create-first",
                 "crewmate-panel-tabs",
+                "crewmate-reply-thread",
                 "members-dm-hello",
                 "members-private-memory-keeps-thread",
+                "members-roster-filter",
             ],
             "capabilities": [
                 "capabilities-agents-list-and-open-editor",
                 "capabilities-skills-filter-and-open-builtin",
+                "customize-tabs",
             ],
             "connections": ["connections-services-search-and-mcp-list"],
             "memory": ["memory-open-browser-from-overview"],
             "knowledge": ["knowledge-add-folder-source-and-scan"],
             "artifacts": ["artifacts-library-table-and-kind-filter"],
             "files": ["chat-files-side-panel-browse"],
-            "apps": ["apps-discover-enable-research-lab"],
+            "apps": ["apps-discover-enable-notes", "apps-discover-enable-research-lab"],
             "task-runner": ["taskrunner-projects-page-compose"],
-            "schedule": ["schedule-list-calendar-executions-views"],
+            "schedule": [
+                "schedule-add-cron-job",
+                "schedule-list-calendar-executions-views",
+            ],
             "notifications": [
                 "notifications-bell-sheet-open-close",
                 "notifications-center-empty-state",
@@ -249,21 +408,149 @@ class TestShippedScenarios:
         preview_step = next(
             s for s in sc.steps if "preview" in s.lower() and "turn on" in s.lower()
         )
-        assert 'starts with "Crew Members"' in preview_step
+        assert 'starts with "Mates"' in preview_step
         assert (
             "Crew Members and Crew Mode" in preview_step
-        )  # the longer title is still a valid reading
-        assert any('"Crew Members" item appears in the left rail' in s for s in sc.steps)
+        )  # the older titles are still valid readings on older builds
+        assert any('"Mates" item appears in the left rail' in s for s in sc.steps)
 
     def test_members_scenarios_hedge_the_card_label(self) -> None:
-        """A seeded member has no display name, so its card shows the id; both members scenarios say so."""
-        for name in ("members-dm-hello", "members-private-memory-keeps-thread"):
+        """A seeded member has no display name, so its card shows the id; every members scenario says so."""
+        for name in (
+            "members-dm-hello",
+            "members-private-memory-keeps-thread",
+            "crewmate-reply-thread",
+        ):
             sc = scenarios.load_scenario(SCENARIOS_DIR / f"{name}.yaml")
             card_steps = [s for s in sc.steps if "Nova Sky" in s]
             assert card_steps, name
             for step in card_steps:
                 assert 'may read "nova-sky"' in step, (name, step)
             assert not any('named "Nova Sky"' in s for s in sc.steps), name
+
+    def test_crewmates_scenarios_name_the_current_preview_and_rail_label(self) -> None:
+        """Every scenario that turns on the Crewmates preview leads with today's card title and rail label."""
+        checked = 0
+        for path in sorted(SCENARIOS_DIR.glob("*.yaml")):
+            sc = scenarios.load_scenario(path)
+            preview_steps = [
+                s for s in sc.steps if "turn on the preview" in s.lower() and "Crew" in s
+            ]
+            for step in preview_steps:
+                checked += 1
+                assert 'starts with "Mates"' in step, (path.name, step)
+            rail_steps = [s for s in sc.steps if "item appears in the left rail" in s]
+            for step in rail_steps:
+                assert '"Mates" item appears in the left rail' in step, (path.name, step)
+        assert checked >= 5
+
+    def test_created_crewmate_speaks_first_with_no_user_greeting_bubble(self) -> None:
+        """A new crewmate's first turn is a hidden kickoff, so the only bubble is its reply.
+
+        The create sends ``first_greeting`` and the server starts the
+        mate's first turn from a kickoff that is never written to the
+        transcript (``mate_welcome``). No user bubble is drawn, so an
+        expectation that asks for one fails on every nightly.
+        """
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "crewmate-create-first.yaml")
+        expectations = " ".join(sc.expectations)
+        assert "welcome to the team" not in expectations
+        assert "on your behalf" not in expectations
+        from kiro_crew.testing.fake_acp_backend import REPLY_TEXT
+
+        assert f'"{REPLY_TEXT}"' in expectations
+        assert "no bubble from you" in expectations
+
+    def test_customize_and_memory_scenarios_quote_the_shipped_labels(self) -> None:
+        """Each label these scenarios tell the tester to find is a string the UI ships.
+
+        A quoted label the dashboard does not draw fails the scenario on every
+        nightly, at a model-call cost, so the quote is read from the same en
+        catalog the page renders and the retired readings are refused.
+        """
+        locales = Path(__file__).resolve().parents[2] / "website/src/i18n/locales"
+        en = json.loads((locales / "en.json").read_text(encoding="utf-8"))
+        manual = json.loads((locales / "en.manual.json").read_text(encoding="utf-8"))
+        pages = en["pages"]
+        rail = manual["crewEditorNext"]
+
+        def text(name: str) -> str:
+            sc = scenarios.load_scenario(SCENARIOS_DIR / f"{name}.yaml")
+            return " ".join([*sc.steps, *sc.expectations])
+
+        new_crewmate = pages["kiroCrewAgentsPage"]["add_crew_member"]
+        editor = text("capabilities-agents-list-and-open-editor")
+        for label in (
+            new_crewmate,
+            pages["kiroCrewAgentsPage"]["filter_agents"],
+            manual["components"]["avatarBuilder"]["edit_avatar"],
+            *(rail[k] for k in ("section_general", "section_built_from", "tab_approvals")),
+            *(rail[k] for k in ("tab_schedules", "tab_webhooks", "section_memory")),
+            rail["section_danger"],
+        ):
+            assert f'"{label}"' in editor, label
+        for retired in ("Add crewmate", "Chat with this crewmate", "Who it is", "Overview"):
+            assert retired not in editor, retired
+
+        customize = text("customize-tabs")
+        assert f'"{new_crewmate}"' in customize
+        assert f'"{pages["capabilitiesPage"]["agent_capabilities"]}"' in customize
+        assert "Add crewmate" not in customize
+        picker_step = next(s for s in customize.split(". ") if "New sessions use" in s)
+        assert "At its top" in picker_step, picker_step
+
+        memory = text("memory-open-browser-from-overview")
+        memory_tab = pages["overview"]["memoryTab"]
+        assert f'"{memory_tab["consolidation_idle_hours"]}"' in memory
+        assert f'"{memory_tab["memory_settings"]}"' in memory
+        assert f'"{pages["overview"]["memoryStoreCard"]["memory_store"]}"' in memory
+        assert "Consolidation idle" not in memory
+
+    def test_shortcuts_scenario_judges_everything_on_the_frame_it_lands_on(self) -> None:
+        """The harness judges every expectation on the last screenshot.
+
+        A scroll moves the Preferences switch off screen, so the scenario reads
+        the first frame only: the switch and the Chat Navigation rows under it.
+        """
+        sc = scenarios.load_scenario(SCENARIOS_DIR / "settings-shortcuts.yaml")
+        assert not any("scroll down" in s.lower() for s in sc.steps), sc.steps
+        assert any('"Enable shortcuts"' in e for e in sc.expectations), sc.expectations
+        assert any('"Chat Navigation"' in e for e in sc.expectations), sc.expectations
+        for exp in sc.expectations:
+            assert "screenshot taken" not in exp, exp
+            assert "Panel Navigation" not in exp, exp
+
+    def test_scenarios_name_the_dormant_row_by_its_shipped_sentence(self) -> None:
+        """The sleeping-session expander row is named by its shipped sentence.
+
+        A step or expectation naming the row must quote the exact en.json
+        sentence for a count of one so the tester looks for the right words.
+        """
+        en = json.loads(
+            (Path(__file__).resolve().parents[2] / "website/src/i18n/locales/en.json").read_text(
+                encoding="utf-8"
+            )
+        )["pages"]["chatSidebar"]
+        allowed = {
+            en[f"stale_collapse_row_{state}_one"].replace("{{count}}", "1")
+            for state in ("hidden", "shown")
+        }
+        # Derive the key adjective from the allowed set, e.g. "sleeping".
+        # Skip short words and generic ones shared across many labels.
+        generic = {"show", "hide", "count", "session", "sessions", "1"}
+        row_adj = {
+            w for label in allowed for w in label.lower().split() if w not in generic and len(w) > 3
+        }
+        checked = 0
+        for path in sorted(SCENARIOS_DIR.glob("*.yaml")):
+            sc = scenarios.load_scenario(path)
+            for text in [*sc.steps, *sc.expectations]:
+                assert "Dormant sessions" not in text, (path.name, text)
+                for quoted in text.split('"')[1::2]:
+                    if any(w in quoted.lower() for w in row_adj):
+                        checked += 1
+                        assert quoted in allowed, (path.name, quoted)
+        assert checked >= 3
 
 
 def _write(tmp_path: Path, name: str, doc: dict) -> Path:
@@ -292,7 +579,23 @@ class TestScenarioValidation:
         sc = scenarios.load_scenario(_write(tmp_path, "demo", _valid()))
         assert sc.members == ("nova-sky",) and sc.start_url == "/settings" and sc.seed == "rich"
         assert sc.feature == "settings" and sc.user_story.startswith("As a user")
-        assert sc.docs_url == ""
+        assert sc.docs_url == "" and sc.fresh_target is False
+
+    def test_runner_refuses_a_fresh_target_scenario_after_any_other(self, tmp_path: Path) -> None:
+        doc = _valid("fresh")
+        doc["preconditions"]["fresh_target"] = True
+        fresh = scenarios.load_scenario(_write(tmp_path, "fresh", doc))
+        other = scenarios.load_scenario(_write(tmp_path, "other", _valid("other")))
+        assert fresh.fresh_target and not other.fresh_target
+        scenarios.check_run_order([fresh, other])
+        with pytest.raises(scenarios.ScenarioError, match="fresh needs a fresh target"):
+            scenarios.check_run_order([other, fresh])
+        assert scenarios.select([other, fresh]) == [fresh, other]
+        # The runner's own check fires before it touches the model or the display,
+        # so a bare instance is enough.
+        runner = harness.Runner.__new__(harness.Runner)
+        with pytest.raises(scenarios.ScenarioError, match="fresh needs a fresh target"):
+            harness.Runner.run(runner, [other, fresh], retries=0)
 
     def test_docs_url_accepts_https_and_repo_docs_paths(self, tmp_path: Path) -> None:
         for url in (
@@ -342,6 +645,7 @@ class TestScenarioValidation:
             (lambda d: d.update(max_seconds=scenarios.MAX_SECONDS_CEILING + 1), "max_seconds"),
             (lambda d: d.update(max_seconds=True), "max_seconds"),
             (lambda d: d.update(bonus=1), "unknown keys"),
+            (lambda d: d["preconditions"].update(fresh_target="yes"), "fresh_target"),
             (lambda d: d["preconditions"].update(start_url="settings"), "start_url"),
             (lambda d: d["preconditions"].update(start_url="/x?token=1"), "start_url"),
             (lambda d: d["preconditions"].update(members=["Nova Sky"]), "members"),
@@ -597,7 +901,7 @@ class TestReport:
         md = report.render_features(catalog, _summary(), run_url="https://x/run")
         assert md.startswith("# GUI user-test feature catalog\n")
         assert (
-            f"_18 of {len(scenarios.FEATURES)} features covered · 36 scenarios (32 smoke / 4 nightly)._"
+            f"_18 of {len(scenarios.FEATURES)} features covered · 44 scenarios (33 smoke / 11 nightly)._"
             in md
         )
         assert (

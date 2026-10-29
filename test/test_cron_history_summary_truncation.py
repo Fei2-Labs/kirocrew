@@ -578,7 +578,7 @@ class TestRunPathDoesNotPreTruncate:
         result = "Reviewed the sweep. " + "x" * (300 - 20 - len(_PR_URL) - 8) + f"\nPR: {_PR_URL}"
         assert 280 <= len(result) <= 320
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result(result)
             job.last_status = "ok"
             job.last_error = None
@@ -589,7 +589,7 @@ class TestRunPathDoesNotPreTruncate:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _rows(tmp_path, job.id)
         assert row["summary"] == result
@@ -602,7 +602,7 @@ class TestRunPathDoesNotPreTruncate:
         result = "Swept the backlog. " + "detail " * 120 + f"\nOpened {_PR_URL}"
         assert len(result) > 500
 
-        async def _produce(job):
+        async def _produce(job, meta=None):
             job.set_run_result(result)
             job.last_status = "ok"
             job.last_error = None
@@ -612,7 +612,7 @@ class TestRunPathDoesNotPreTruncate:
         svc._jobs = [job]
         svc._save()
         with patch.object(svc, "_execute", side_effect=_produce):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
 
         (row,) = _rows(tmp_path, job.id)
         assert len(row["summary"]) <= _SUMMARY_CAP

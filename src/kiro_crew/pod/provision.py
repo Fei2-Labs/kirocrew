@@ -7,7 +7,12 @@ module collapses them into one command (``kirocrew pod provision`` /
 ``pod up --provision``).
 
 Cost asymmetry drives the design:
-  * venv  — pure pip editable install, ~1 min, idempotent → safe to auto-run.
+  * venv  — editable install, idempotent → safe to auto-run. By default it is a
+            plain pip install, ~1 min and ~400 MB per worktree. With
+            :data:`USE_UV_ENV` set it is built by ``uv`` instead: ~10 s, and its
+            site-packages are copy-on-write clones out of uv's global cache
+            (~10 MB of unique disk per worktree on a reflink filesystem; a
+            full copy elsewhere).
   * dist  — the Vite/npm SPA build, minutes → only on explicit consent.
 
 So plain ``pod up`` auto-builds the venv but never the dist (it fails loud and
@@ -22,11 +27,14 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
 from kiro_crew import platform_compat
-from kiro_crew.env import find_node_tool, node_augmented_path
+from kiro_crew.constants import env_flag_enabled
+from kiro_crew.env import find_node_tool, node_augmented_path, resolve_uv
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 #: How many trailing stderr lines of the step that FAILED provisioning are
 #: re-emitted as ``::steperr::`` markers. Four covers the shape pip and npm use
@@ -93,17 +101,212 @@ def _say(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
 
 
-def _find_python(version: str = "3.12") -> str | None:
-    """Locate a pythonX.Y interpreter for the venv."""
-    candidates = [
-        Path.home() / ".local" / "bin" / f"python{version}",
-        Path(f"/usr/bin/python{version}"),
-        Path(f"/usr/local/bin/python{version}"),
-    ]
-    for c in candidates:
-        if c.exists() and os.access(c, os.X_OK):
-            return str(c)
-    return shutil.which(f"python{version}")
+#: Bound on the ``py`` launcher probe. It only reads the registry and prints a
+#: path, so a launcher that has not answered by now is not going to.
+_PY_LAUNCHER_TIMEOUT_S = 10
+
+
+def _find_python_via_launcher(version: str) -> str | None:
+    """Ask the Windows ``py`` launcher where pythonX.Y lives, or None.
+
+    A python.org install on Windows ships ``python.exe`` and never a
+    ``pythonX.Y.exe``, so the name the POSIX lookup asks for does not exist
+    there however many interpreters are installed. The launcher is the
+    platform's own index of them (PEP 397 / PEP 514), and ``py -X.Y`` selects
+    exactly one. The candidate prints its own ``sys.executable``, so an answer
+    is a real interpreter of that version that actually ran, not a path guess.
+    """
+    launcher = shutil.which("py")
+    if not launcher:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                launcher,
+                f"-{version}",
+                "-I",
+                "-X",
+                "utf8",
+                "-c",
+                "import sys; print(sys.executable)",
+            ],
+            timeout=_PY_LAUNCHER_TIMEOUT_S,
+            stderr=subprocess.DEVNULL,
+            **UTF8_TEXT,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        # No such version registered, or the launcher could not run it.
+        return None
+    return out if out and Path(out).is_file() else None
+
+
+#: The interpreter floor, ``requires-python`` in ``pyproject.toml`` (pinned by
+#: ``test_pod``). A worktree venv on any newer minor is as valid as one on this.
+MIN_PYTHON = (3, 12)
+
+#: Minor versions asked for by name (``python3.N``), after the gateway's own.
+#: Bounded rather than open-ended because a name lookup per minor is the only
+#: way to find a versioned binary; ``python3`` below catches anything newer.
+_NAMED_MINORS = tuple(range(MIN_PYTHON[1], 16))
+
+#: Bound on one candidate probe: a ``venv --without-pip`` into a temp dir plus
+#: one interpreter start. Seconds on any healthy host.
+_PROBE_TIMEOUT_S = 60
+
+#: Variables that can make an interpreter start in the PROBE and not in the
+#: venv the probe vouches for: a relocatable CPython (the Builder Toolbox
+#: build) only finds ``libpython`` through a loader path its launcher passes,
+#: and the provision steps do not carry one.
+_PROBE_DROPPED_ENV = ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "PYTHONHOME", "PYTHONPATH")
+
+#: Runs INSIDE the throwaway venv: the version floor, and ``ensurepip``, which
+#: the pip path needs and a stripped bundled interpreter (the desktop app's)
+#: does not ship.
+_PROBE_SNIPPET = (
+    "import sys, ensurepip; " f"sys.exit(0 if sys.version_info[:2] >= {MIN_PYTHON!r} else 3)"
+)
+
+
+def _python_in(venv_dir: Path) -> Path:
+    """A venv's interpreter, for the venv at *venv_dir* (any name, not just .venv)."""
+    if platform_compat.IS_WINDOWS:
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
+def _probe_python(candidate: str) -> str | None:
+    """``None`` when *candidate* can build a working venv, else why it cannot.
+
+    Existence and the execute bit prove nothing. A version-manager shim (mise,
+    pyenv, asdf) exists and is executable for a version it has no install for,
+    and fails only when run. A relocatable interpreter starts fine through the
+    wrapper that sets its library path, and the venv built from it does not,
+    because the venv links the real binary. So the probe does what provisioning
+    will do, at the smallest scale: create a venv without pip in a temp dir,
+    then run that venv's own interpreter.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _PROBE_DROPPED_ENV}
+    with tempfile.TemporaryDirectory(prefix="kc-pyprobe-") as tmp:
+        venv_dir = Path(tmp) / "v"
+        steps = (
+            [candidate, "-I", "-m", "venv", "--without-pip", str(venv_dir)],
+            [str(_python_in(venv_dir)), "-I", "-c", _PROBE_SNIPPET],
+        )
+        for argv in steps:
+            try:
+                proc = subprocess.run(  # nosec B603 - argv list, no shell
+                    argv,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=_PROBE_TIMEOUT_S,
+                    **UTF8_TEXT,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return f"could not run ({exc.__class__.__name__}: {exc})"
+            if proc.returncode == 3:
+                return f"older than {MIN_PYTHON[0]}.{MIN_PYTHON[1]}"
+            if proc.returncode != 0:
+                lines = [ln for ln in (proc.stderr or "").strip().splitlines() if ln.strip()]
+                detail = lines[-1].strip()[:200] if lines else ""
+                return f"exit {proc.returncode}" + (f": {detail}" if detail else "")
+    return None
+
+
+def _uv_found_python() -> str | None:
+    """The interpreter ``uv python find`` resolves for the floor, or None.
+
+    uv-managed interpreters are standalone builds that venvs work from, which is
+    what a host whose own Python is relocatable or stripped needs. Asked whether
+    or not :data:`USE_UV_ENV` is set: this only FINDS an interpreter, it builds
+    nothing, and it never downloads one (``--no-python-downloads``).
+    """
+    uv = resolve_uv()
+    if not uv:
+        return None
+    try:
+        out = subprocess.check_output(  # nosec B603 - argv list, no shell
+            [uv, "python", "find", "--no-python-downloads", f">={MIN_PYTHON[0]}.{MIN_PYTHON[1]}"],
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_PROBE_TIMEOUT_S,
+            **UTF8_TEXT,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out or None
+
+
+def _python_candidates():
+    """Interpreters to try, best first, lazily (the uv lookup is a subprocess).
+
+    1. This process's base interpreter -- the gateway's (or the CLI's) own, so a
+       pod runs on the Python version its operator already runs.
+    2. ``python3.N`` by name, the gateway's minor first, then the floor upward,
+       each in ``~/.local/bin``, the platform's system bin directories and on
+       ``PATH``; then ``python3``. On Windows, which ships no versioned names,
+       the ``py`` launcher per minor.
+    3. ``uv python find`` for the floor.
+    """
+    base = getattr(sys, "_base_executable", "") or sys.executable
+    if base:
+        yield base
+    own = sys.version_info[1]
+    minors = [own] + [m for m in _NAMED_MINORS if m != own]
+    for minor in minors:
+        name = f"python3.{minor}"
+        user_bin = Path.home() / ".local" / "bin" / name
+        if user_bin.exists() and os.access(user_bin, os.X_OK):
+            yield str(user_bin)
+        found = platform_compat.trusted_system_bin_quiet(name)
+        if found:
+            yield found
+        found = shutil.which(name)
+        if found:
+            yield found
+    found = shutil.which("python3")
+    if found:
+        yield found
+    if platform_compat.IS_WINDOWS:
+        for minor in minors:
+            found = _find_python_via_launcher(f"3.{minor}")
+            if found:
+                yield found
+    found = _uv_found_python()
+    if found:
+        yield found
+
+
+def _find_python() -> str | None:
+    """The first candidate that can build a working venv, or None.
+
+    Every rejection is said, so a failure lists each interpreter that was tried
+    and why it was refused, rather than claiming none exists.
+
+    A relative candidate is skipped, not absolutized: ``shutil.which`` returns
+    one when the ``PATH`` entry it matched is relative (``.``, ``bin``), and
+    the provision steps run with ``cwd=<checkout>``, where it does not
+    resolve. A binary found that way is whatever sits in the current
+    directory, the same rule :func:`kiro_crew.env.resolve_uv` applies to uv.
+    """
+    seen: set[str] = set()
+    for candidate in _python_candidates():
+        if not os.path.isabs(candidate):
+            _say(f"[provision] skipping {candidate}: found through a relative PATH entry")
+            continue
+        # The literal path, not the resolved one: every version-manager shim
+        # resolves to the SAME manager binary, and each one selects a different
+        # interpreter by the name it was invoked as.
+        key = os.path.abspath(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        reason = _probe_python(candidate)
+        if reason is None:
+            return candidate
+        _say(f"[provision] skipping {candidate}: {reason}")
+    return None
 
 
 def venv_bin_dir(checkout: Path) -> Path:
@@ -302,17 +505,159 @@ def _npm_bin() -> str | None:
     return None
 
 
+#: Set to a truthy value (``1``/``true``/``yes``/``on``) to build the venv with
+#: ``uv`` out of its shared global cache (copy-on-write clones) instead of the
+#: default ``python -m venv`` + pip. Opt-in, not default: the pip path is what
+#: every contributor runs today and the two must stay byte-for-byte identical in
+#: layout until the switch has been exercised beyond the author's host. Flipping
+#: the default is Phase 2 of the
+#: "Shared Dependency Cache for Worktrees" RFC and waits on that document being
+#: accepted on main.
+USE_UV_ENV = "KIROCREW_PROVISION_USE_UV"
+
+
+def _find_uv() -> str | None:
+    """Absolute path to ``uv``, or ``None`` when the pip path should be used.
+
+    ``None`` unless :data:`USE_UV_ENV` is set: the pip path is the default, and
+    a host opts into uv because every worktree venv is the same few hundred MB
+    of wheels — uv installs them as copy-on-write clones out of ONE global cache
+    (``uv cache dir``), so the twentieth worktree costs about as much disk as
+    the first, and the install itself is seconds rather than a minute.
+
+    Resolution is :func:`kiro_crew.env.resolve_uv` — ``uv`` is a declared
+    dependency shipped as a wheel, located through ``uv.find_uv_bin()`` and then
+    ``PATH`` — the same ladder the pptx-maker engine uses. ``None`` is a
+    reportable condition (the pip path runs), never an exception.
+    """
+    if not env_flag_enabled(USE_UV_ENV):
+        return None
+    return resolve_uv()
+
+
+def _venv_python(checkout: Path) -> Path:
+    name = "python.exe" if platform_compat.IS_WINDOWS else "python"
+    return venv_bin_dir(checkout) / name
+
+
+def _ensure_venv_uv(checkout: Path, uv: str, py: str) -> bool:
+    """Build the venv with ``uv``. Returns True when ``.venv/bin/kirocrew`` exists
+    afterward; False leaves the caller free to fall back to pip.
+
+    ``--link-mode clone`` is explicit on BOTH uv steps rather than left to uv's
+    default: ``uv venv --seed`` installs pip and setuptools from the same
+    global cache as ``uv pip install`` does, so the seed step needs the same
+    mode or the seeded packages would be whatever uv picks. Both flags are
+    accepted by ``uv venv`` (``uv venv --help``: ``--seed`` "install seed
+    packages (one or more of: pip, setuptools, and wheel)"; ``--link-mode``
+    "the method to use when installing packages from the global cache",
+    values clone/copy/hardlink/symlink; ``--allow-existing`` "preserve any
+    existing files or directories at the target path"), all older than the
+    declared floor (``--allow-existing`` since uv 0.1.40, seed-package link
+    mode since 0.1.32), and ``--group`` on ``uv pip install``
+    exists since uv 0.6.7, which is the floor ``setup.cfg`` declares. uv picks
+    ``clone`` only on macOS, and on Linux its default has been observed to copy
+    on a host whose filesystem supports reflinks. Clone means copy-on-write: on
+    XFS with reflink, btrfs, APFS and ReFS the venv shares blocks with uv's
+    cache until something writes to a file, and that write copies the block, so
+    an edit to one venv can never reach the cache or a sibling venv. Where the
+    filesystem cannot reflink (ext4, XFS formatted without reflink, a cache on a
+    different filesystem) uv falls back to a plain copy — the install still
+    succeeds and is still faster than pip, it just does not share disk.
+    Hardlink mode was rejected: it shares the inode itself, so one in-place
+    write would land in every venv and in the cache. ``--project`` points
+    ``--group`` at the worktree's ``pyproject.toml`` regardless of the caller's
+    cwd (the Dev Fleet backend and a login shell provision from different
+    directories).
+    ``--seed`` installs ``pip`` into the venv, which ``uv venv`` otherwise omits:
+    nothing here needs it, but ``make backend`` drives ``$(VENV)/bin/pip`` and a
+    contributor's ad-hoc ``.venv/bin/pip …`` must keep working on a worktree a
+    pod provisioned — a venv that differs from the pip-built one only by lacking
+    pip is a trap, not a saving.
+    """
+    venv_dir = checkout / ".venv"
+    _say(f"[provision] creating venv for {checkout.name} with uv (one-time, ~10 s)…")
+    seed = [
+        uv,
+        "venv",
+        "--seed",
+        "--allow-existing",
+        "--link-mode",
+        "clone",
+        "--python",
+        py,
+        str(venv_dir),
+    ]
+    if _run_uv(seed, checkout) != 0:
+        return False
+    install = [
+        uv,
+        "pip",
+        "install",
+        "--link-mode",
+        "clone",
+        "--python",
+        str(_venv_python(checkout)),
+        "--project",
+        str(checkout),
+        "--editable",
+        str(checkout),
+        "--group",
+        "dev",
+    ]
+    if _run_uv(install, checkout) != 0:
+        return False
+    return has_venv(checkout)
+
+
+def _run_uv(cmd: list[str], checkout: Path) -> int:
+    """:func:`_run` for a uv step, with a spawn failure folded into the rc.
+
+    ``resolve_uv`` trusts the wheel locator's path after ``os.path.isfile`` only,
+    so a uv binary that exists but cannot be executed (mode bits stripped, a
+    ``noexec`` mount) reaches ``Popen`` and raises ``OSError`` instead of
+    running. Every other uv failure is a nonzero exit that the caller already
+    turns into the pip fallback; a spawn failure must land on the same path, not
+    escape ``ensure_venv`` as a traceback the bool contract cannot express.
+    """
+    try:
+        return _run(cmd, checkout)
+    except OSError as exc:
+        _say(f"[provision] uv could not be started ({exc}); falling back to pip")
+        return 1
+
+
 def ensure_venv(checkout: Path) -> bool:
     """Create the worktree's editable venv if missing. Idempotent. Returns True if
-    the venv is ready afterward."""
+    the venv is ready afterward.
+
+    Builds with ``python -m venv`` + pip by default. When :data:`USE_UV_ENV` is
+    set it tries ``uv`` first (shared global cache, copy-on-write site-packages,
+    seconds) and falls back to the pip path when uv cannot be located or fails
+    part-way. Neither path deletes ``.venv``: ``uv venv`` runs with
+    ``--allow-existing`` because its default is to REMOVE a virtual environment
+    already at the target, and ``python -m venv`` runs over whatever uv left,
+    exactly as it already does over a venv an interrupted pip provision left
+    behind, so two provisioners racing on one checkout (CLI and Dev Fleet) can
+    never remove each other's finished venv.
+    """
     if has_venv(checkout):
         return True
     py = _find_python()
     if not py:
-        _say("FATAL: no python3.12 found (need it to build the venv)")
+        _say(
+            f"FATAL: no Python >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]} that can build a venv "
+            "(each candidate tried is listed above). Install one, e.g. "
+            f"`uv python install {MIN_PYTHON[0]}.{MIN_PYTHON[1]}`, and re-run provision"
+        )
         return False
-    _say(f"[provision] creating venv for {checkout.name} (one-time, ~1 min)…")
     venv_dir = checkout / ".venv"
+    uv = _find_uv()
+    if uv:
+        if _ensure_venv_uv(checkout, uv, py):
+            return True
+        _say("[provision] uv provisioning failed — falling back to python -m venv + pip")
+    _say(f"[provision] creating venv for {checkout.name} (one-time, ~1 min)…")
     if _run([py, "-m", "venv", str(venv_dir)], checkout) != 0:
         return _fail()
     pip = venv_bin_dir(checkout) / ("pip.exe" if platform_compat.IS_WINDOWS else "pip")
@@ -324,10 +669,13 @@ def ensure_venv(checkout: Path) -> bool:
     # If `--group` is unsupported (pip < 25.1) the command exits
     # nonzero, so fall back to a runtime-only editable install and warn — never
     # hard-fail provisioning just because the dev extras could not be installed.
-    if _run(
-        [str(pip), "install", "--editable", str(checkout), "--group", "dev"],
-        checkout,
-    ) != 0:
+    if (
+        _run(
+            [str(pip), "install", "--editable", str(checkout), "--group", "dev"],
+            checkout,
+        )
+        != 0
+    ):
         _say(
             "[provision] `pip install --group dev` failed (pip < 25.1?) — falling "
             "back to a runtime-only editable install; dev tools (pytest/flake8) "

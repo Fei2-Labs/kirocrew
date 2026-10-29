@@ -622,6 +622,10 @@ describe('MarkdownPanel — live file watch', () => {
     const props = { ...panelProps({ onContentChange }), liveWatch: true }
     render(<MarkdownPanel embedded {...props} />, { wrapper })
     await waitFor(() => expect(streams.length).toBe(1))
+    // A live-watched tab reads once on mount (#14236's catch-up latch starts
+    // `due`); let that land so the failed re-read below is the only read left.
+    await waitFor(() => expect(onContentChange).toHaveBeenCalledWith('content from disk'))
+    onContentChange.mockClear()
     vi.mocked(globalThis.fetch).mockResolvedValueOnce(
       { ok: false, status: 500, headers: { get: () => null } } as unknown as Response,
     )

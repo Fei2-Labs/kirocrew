@@ -15,7 +15,9 @@ Covers:
 from __future__ import annotations
 
 import io
+import json
 import logging
+import os
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -32,12 +34,14 @@ def reset_module_state(monkeypatch):
     mcp_shared._last_startup_race_time = 0.0
     mcp_shared._last_startup_race_key = ""
     mcp_shared._failure_count = 0
+    mcp_shared._last_failure_class = ""
     yield
     mcp_shared._excluded_tools_by_session.clear()
     mcp_shared._last_failure_time = 0.0
     mcp_shared._last_startup_race_time = 0.0
     mcp_shared._last_startup_race_key = ""
     mcp_shared._failure_count = 0
+    mcp_shared._last_failure_class = ""
 
 
 @pytest.fixture
@@ -107,9 +111,9 @@ class TestSuccessCaching:
         monkeypatch.setattr(mcp_shared, "loopback_urlopen", urlopen)
         assert mcp_shared._resolve_excluded_tools() == {"blocked"}
         request = urlopen.call_args.args[0]
-        assert request.full_url == f"http://localhost:{expected_port}/api/session-tool-policy"
+        assert request.full_url == f"http://127.0.0.1:{expected_port}/api/session-tool-policy"
         assert request.get_header("X-internal-secret") == "synthetic-bound-secret"
-        secret.assert_called_once_with(expected_port)
+        secret.assert_called_once_with(expected_port, dial_host="127.0.0.1")
 
     def test_first_call_queries_gateway_then_caches(
         self, fake_sel, patch_session_setup, monkeypatch
@@ -137,6 +141,7 @@ class TestSuccessCaching:
         # meaning is unknown, so it is reported unknown rather than narrowed to
         # an empty set that would read as "the operator excluded nothing".
         assert policy.unresolved == "policy_unreadable"
+        assert "managedToolPolicy.exclude" in policy.detail
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.unreadable" in ops
 
@@ -168,6 +173,7 @@ class TestSuccessCaching:
             policy = mcp_shared._resolve_tool_policy()
         assert policy.excluded == set()
         assert policy.unresolved == "policy_unreadable"
+        assert "managedToolPolicy.exclude" in policy.detail
 
     def test_a_well_formed_exclude_resolves(
         self, fake_sel, patch_session_setup, monkeypatch
@@ -356,6 +362,10 @@ class TestLongCacheFailures:
         ]
         assert audits, "the identity refusal must have its own audit event"
         assert "token=absent" in audits[0]["resources"]
+        # Which process asked, so a short-lived tokenless server can be traced
+        # to its launcher after it has exited.
+        assert f"pid={os.getpid()}" in audits[0]["resources"]
+        assert f"ppid={os.getppid()}" in audits[0]["resources"]
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.unreadable" not in ops
         assert mcp_shared._last_failure_time == 0.0
@@ -390,6 +400,42 @@ class TestLongCacheFailures:
         ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
         assert "tool_policy.unreadable" in ops
         assert "tool_policy.unattested" not in ops
+        # No reason reached this process, so none is carried; the refusal text
+        # then falls back to its generic wording, as it always has.
+        assert policy.detail == ""
+
+    def test_the_409_bodys_reason_rides_on_the_policy(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        """The gateway's ``reason`` is carried, so the refusal can name the file.
+
+        A resolver that reads only ``code`` from the 409 body leaves the
+        client's error saying "fix or remove the unreadable spec" with no way to
+        tell which. Nothing else moves: the reason is ``policy_unreadable``,
+        the exclusion set is empty, and the answer is still not negative-cached.
+        """
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:chat-4")
+        reason = "agent spec 'broken.json' in the agents directory could not be read (bad JSON)"
+        body = json.dumps({"error": "x", "code": "policy_unreadable", "reason": reason}).encode()
+        urlopen = MagicMock(side_effect=_make_http_error(409, body))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            policy = mcp_shared._resolve_tool_policy()
+        assert policy.unresolved == "policy_unreadable"
+        assert policy.excluded == set()
+        assert policy.detail == reason
+        assert mcp_shared._last_failure_time == 0.0
+
+    def test_a_non_string_reason_is_dropped_not_carried(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        """``reason`` is untrusted wire data: only a string is carried."""
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:chat-5")
+        body = b'{"error": "x", "code": "policy_unreadable", "reason": ["not", "a", "string"]}'
+        urlopen = MagicMock(side_effect=_make_http_error(409, body))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            policy = mcp_shared._resolve_tool_policy()
+        assert policy.unresolved == "policy_unreadable"
+        assert policy.detail == ""
 
     def test_an_unenumerated_4xx_is_permissive_not_an_outage(
         self, fake_sel, patch_session_setup, monkeypatch
@@ -502,6 +548,60 @@ class TestLongCacheFailures:
         with patch.object(mcp_shared, "loopback_urlopen", urlopen):
             mcp_shared._resolve_tool_policy()
         assert urlopen.call_count == 0
+
+
+class TestFailureCause:
+    """A ``resolution_failed`` read names the exception that caused it."""
+
+    def _failed_event(self, fake_sel):
+        events = [
+            c.kwargs
+            for c in fake_sel.log_api_access.call_args_list
+            if c.kwargs.get("operation") == "tool_policy.resolution_failed"
+        ]
+        assert len(events) == 1, events
+        return events[0]
+
+    def test_audit_event_carries_the_exception_class_and_message(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        urlopen = MagicMock(side_effect=ConnectionRefusedError("gateway port closed"))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            policy = mcp_shared._resolve_tool_policy()
+        assert policy.unresolved == "resolution_failed"
+        assert policy.detail == "ConnectionRefusedError"
+        event = self._failed_event(fake_sel)
+        assert event["error"] == "ConnectionRefusedError: gateway port closed"
+        assert event["resources"] == "error_class=ConnectionRefusedError"
+
+    def test_message_is_redacted_and_capped(self, fake_sel, patch_session_setup, monkeypatch):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        token = "ghp_" + "a1B2" * 9
+        urlopen = MagicMock(side_effect=OSError(f"bad {token} " + "x" * 500))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            mcp_shared._resolve_tool_policy()
+        error = self._failed_event(fake_sel)["error"]
+        assert error.startswith("OSError: bad ")
+        assert token not in error
+        assert len(error) <= len("OSError: ") + mcp_shared._FAILURE_MESSAGE_MAX
+
+    def test_negative_cache_hit_still_names_the_class(
+        self, fake_sel, patch_session_setup, monkeypatch
+    ):
+        monkeypatch.setenv("KIROCREW_SESSION_KEY", "subagent:abc")
+        urlopen = MagicMock(side_effect=TimeoutError("timed out"))
+        with patch.object(mcp_shared, "loopback_urlopen", urlopen):
+            mcp_shared._resolve_tool_policy()
+            cached = mcp_shared._resolve_tool_policy()
+        assert urlopen.call_count == 1
+        assert cached.detail == "TimeoutError"
+        hits = [
+            c.kwargs
+            for c in fake_sel.log_api_access.call_args_list
+            if c.kwargs.get("operation") == "tool_policy.negative_cache_hit"
+        ]
+        assert hits and hits[-1]["error"] == "TimeoutError"
 
 
 # ─────────────────────────────────────────────────────────────────────

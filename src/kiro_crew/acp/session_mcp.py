@@ -73,13 +73,19 @@ otherwise easy to argue backwards:
 
 from __future__ import annotations
 
+import asyncio
+import codecs
 import json
 import logging
-from collections.abc import Collection
+import time
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from kiro_crew import agent as _agent_mod
+from kiro_crew import hooks as _hooks
+from kiro_crew import mcp_provenance
+from kiro_crew.acp.mcp_session_report import sanitize_sink_text
 from kiro_crew.agent import (
     _mcp_registry_mode,
     agent_spec_path,
@@ -90,24 +96,33 @@ from kiro_crew.agent import (
 from kiro_crew.agent_discovery import _read_agent_spec, project_agent_files, project_agent_name
 from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
 from kiro_crew.env import sanitize_spec_env
-from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS, mcp_entry_is_muted
+from kiro_crew.mcp_cleanup import (
+    CONTROL_PLANE_SERVERS,
+    KIROCREW_BIN_MCP_SERVERS,
+    mcp_entry_is_muted,
+)
+from kiro_crew.user_json import loads_user_jsonc
 
 logger = logging.getLogger(__name__)
 
-# Crew's own control plane. Re-derived from the managed source of truth on every
-# spawn so a stale hand-edited command in the spec cannot cost a claude session
-# the tools it needs to report back to its channel at all. Both are always-on
-# (no gate, not opt_in), so ``managed_mcp_spec_entry`` returns them unless the
-# install is broken. Re-derived, not read from the spec, is also what keeps them
-# out of the registry filter below: they are the host's own process, not a
-# third-party server the admin's catalog governs.
+# Crew's own control plane, defined in the ``mcp_cleanup`` leaf and re-exported
+# here. Re-derived from the managed source of truth on every spawn so a stale
+# hand-edited command in the spec cannot cost a claude session the tools it needs
+# to report back to its channel at all. Both are always-on (no gate, not
+# opt_in), so ``managed_mcp_spec_entry`` returns them unless the install is
+# broken. Re-derived, not read from the spec, is also what keeps them out of the
+# registry filter below: they are the host's own process, not a third-party
+# server the admin's catalog governs.
 #
-# PUBLIC because the codex projection carries this session's identity onto these
-# two entries and onto NOTHING else. Naming the same tuple twice is how the two
-# decisions drift apart, and the safety of that carriage rests on this being the
-# set the loop below REPLACES from the managed source: the element's command, args
-# and env are Crew's own by construction, not the spec's.
-CONTROL_PLANE_SERVERS = ("kirocrew-core", "kirocrew-cron")
+# PUBLIC on this module because the codex projection carries this session's
+# identity onto these entries; an opt-in dashboard mount is rebuilt separately
+# by the Codex mirror before receiving identity. The safety of that
+# carriage rests on this being the set the loop below REPLACES from the managed
+# source: the element's command, args and env are Crew's own by construction, not
+# the spec's. The definition sits in the leaf so a consumer the agent-SDK import
+# boundary keeps off ``kiro_crew.acp`` -- the broker-stub ceiling in
+# ``mcp_gateway.session_servers`` -- reads the same tuple rather than a second
+# copy of it.
 
 # Every managed Crew server that must be handed the session's IDENTITY when it
 # is mounted -- a wider set than the control plane above, and a different
@@ -217,25 +232,131 @@ class _Unread:
 _UNREAD = _Unread()
 
 
+#: Pauses before the retries of the gated read in :func:`_read_mcp_settings`, in
+#: seconds; the first attempt runs before any of them. Only used off the loop:
+#: on a loop thread there is exactly one attempt (see :func:`_read_mcp_settings`).
+#: The read fails transiently in two ways, both seen on a live host: a writer
+#: renames a new file over the one we opened (the descriptor check then names
+#: the unlinked inode), and the sensitive-path resolver pool is saturated so a
+#: resolution never starts inside its budget and the gate refuses fail-closed.
+#: The first clears on an immediate re-check (``0.0``). The second clears once
+#: the pool drains, and the pool drains at the pace of its own budget: a
+#: candidate resolution that has not finished within
+#: ``security.paths._PATH_RESOLVE_TIMEOUT_SECS`` (2.0 s) is refused and its
+#: worker classed wedged, so a 2.0 s pause is the longest a healthy in-flight
+#: job can hold a worker before the queue moves. One pause of that size, then a
+#: final attempt. No other refusal changes with time inside this call: a
+#: stall-prefix cooldown holds for 30-1800 s without touching the filesystem,
+#: and a non-regular, missing-permission or oversized file fails identically
+#: every time, so more pauses would only delay the fail-closed answer. Losing
+#: this read withholds every identity element from a kiro session for its whole
+#: life (see :func:`kiro_control_plane_servers`), which is why the one pause is
+#: worth 2 s of an off-loop thread.
+_SETTINGS_READ_BACKOFF_SECS: tuple[float, ...] = (0.0, 2.0)
+
+#: The pause primitive :func:`_read_mcp_settings` uses, held as a module attribute
+#: so a test can replace it without touching the shared ``time`` module that
+#: pytest and logging read from.
+_sleep = time.sleep
+
+
+def _on_loop_thread() -> bool:
+    """True when the calling thread is running an asyncio event loop.
+
+    :func:`_read_mcp_settings` is reached from both kinds of thread: the spawn
+    path warms ``AcpClient._session_mcp_cache`` off the loop, but a cold cache is
+    resolved inline on the loop by ``_session_mcp_servers``, and the non-strict
+    :func:`_global_settings` readers sit on synchronous paths that may run on
+    either. A ``time.sleep`` on the loop thread stalls every session the gateway
+    serves, under exactly the load that makes the read fail, so the pauses are
+    conditional on this answer rather than on a claim about the call graph.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+#: The four bytes JSON allows as insignificant whitespace (RFC 8259 section 2).
+#: ``bytes.strip()`` with no argument also strips ``\x0b`` and ``\x0c``, which a
+#: JSON document may not contain, so a file of those is malformed, not empty.
+_JSON_WHITESPACE = b" \t\n\r"
+
+
 def _read_mcp_settings(path: Path) -> dict[str, Any]:
-    """Read settings through the credential gate; only absence means no restrictions."""
+    """Read settings through the credential gate; only absence or emptiness means no restrictions.
+
+    A file that is empty or holds only JSON whitespace (space, tab, CR, LF), with
+    or without a single leading UTF-8 byte-order mark, reads as ``{}``, like an
+    absent one: it declares nothing, so there is no restriction to fail closed on.
+    The same single leading BOM ahead of a document is dropped and the document
+    is parsed normally. Any other byte leaves it to the parser, which fails closed.
+
+    Off the event loop, a gated read that fails transiently is retried (see
+    :data:`_SETTINGS_READ_BACKOFF_SECS`): the first attempt, one immediate
+    re-check, one pause, one final attempt. Each retry re-runs the whole gate,
+    so a path that is really refused stays refused, and a read that keeps
+    failing still raises: the caller's fail-closed reading of "unreadable" is
+    unchanged.
+
+    On a thread running an event loop, exactly ONE attempt runs, with no re-check
+    and no pause: the same single gated read the caller made before retries
+    existed. Every attempt is two to three bounded sensitive-path resolutions
+    (``validate_file_path``, ``safe_read_file_bytes``'s own ``validate_file_path``,
+    then the descriptor check's ``is_sensitive_path``), and each resolution can
+    block the calling thread for its 2 s budget plus up to 3 s of grace. The
+    resolver caps one thread's waits at 12 s per 25 s window and refuses
+    fail-closed for the rest of the window once that is spent, so one failing
+    attempt already prices at up to 12 s of blocked loop, and a second attempt
+    there would only add refusals to a thread that has just exhausted its
+    allowance while every session the gateway serves waits. Off the loop the
+    same cap bounds the three attempts at 12 s of waits plus the 2 s pause; the
+    rename-over race is cleared by the re-check, and a saturated pool by the
+    pause. A stall that reaches the loop thread is left to the fail-closed
+    contract rather than bought with a blocked loop.
+    """
     from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, validate_file_path
 
-    # Screen before even probing existence: a Windows link can name an untrusted share.
-    if validate_file_path(str(path)) is None:
-        raise ValueError("MCP settings path was refused")
-    try:
-        path.lstat()
-    except FileNotFoundError:
+    refusal = "MCP settings could not be safely read"
+    if _on_loop_thread():
+        # One attempt, never a re-check or a pause: see the docstring.
+        schedule: tuple[float, ...] = (0.0,)
+    else:
+        schedule = (0.0, *_SETTINGS_READ_BACKOFF_SECS)
+    for pause in schedule:
+        if pause:
+            _sleep(pause)
+        # Screen before even probing existence: a Windows link can name an untrusted share.
+        if validate_file_path(str(path)) is None:
+            refusal = "MCP settings path was refused"
+            continue
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return {}
+        try:
+            raw = safe_read_file_bytes(str(path))
+        except FileTooLargeError as exc:
+            raise ValueError("MCP settings exceed the safe read limit") from exc
+        if raw is not None:
+            break
+        refusal = "MCP settings could not be safely read"
+    else:
+        raise ValueError(refusal)
+    # Windows editors commonly save UTF-8 with a byte-order mark. Drop it before
+    # the emptiness test so a BOM-only file reads as the empty file it is.
+    raw = raw.removeprefix(codecs.BOM_UTF8)
+    if not raw.strip(_JSON_WHITESPACE):
+        # A 0-byte or whitespace-only file declares no server, so it carries no
+        # restriction to keep authoritative: it reads as absent, the same "no
+        # servers" kiro-cli loads it as. Refusing it would withhold every element
+        # and refuse every search agent's session over a file with nothing in it.
         return {}
     try:
-        raw = safe_read_file_bytes(str(path))
-    except FileTooLargeError as exc:
-        raise ValueError("MCP settings exceed the safe read limit") from exc
-    if raw is None:
-        raise ValueError("MCP settings could not be safely read")
-    try:
-        settings = json.loads(raw.decode("utf-8"))
+        # JSONC-tolerant, like discovery: a commented file's restrictions
+        # (``disabledTools``, muted servers) must still be enforced.
+        settings = loads_user_jsonc(raw.decode("utf-8"))
     except RecursionError as exc:
         raise ValueError("MCP settings exceed the JSON nesting limit") from exc
     if not isinstance(settings, dict) or not isinstance(settings.get("mcpServers", {}), dict):
@@ -305,8 +426,14 @@ class ToolsAllowlist(NamedTuple):
     applies: bool
     grant_all: bool
     refs: frozenset[str]
+    #: Servers switched off WHOLE (:func:`session_mcp_disabled_servers`). Never
+    #: granted, whatever ``tools`` says, so a mirror's stub loop -- which asks this
+    #: allowlist -- withholds them exactly as the translated half does.
+    muted: frozenset[str] = frozenset()
 
     def grants(self, name: str) -> bool:
+        if name in self.muted:
+            return False
         return (not self.applies) or self.grant_all or name in self.refs
 
 
@@ -335,12 +462,66 @@ def _project_spec_path_for(agent: str, work_dir: str | Path | None) -> Path | No
     if not work_dir:
         return None
     try:
-        for spec in project_agent_files(work_dir):
+        for spec in project_agent_files(
+            work_dir, operation="session_mcp_project_agent", source="unknown"
+        ):
             if project_agent_name(spec) == agent:
                 return spec
     except OSError:
         logger.debug("session MCP: could not scan %s for project agents", work_dir, exc_info=True)
     return None
+
+
+def project_agent_spec(agent: str, work_dir: str | Path | None) -> tuple[bool, dict | None]:
+    """Whether the checkout declares *agent*, and that spec's read.
+
+    The project half of :func:`_agent_spec_and_snapshot_for`, through the same
+    resolver and reader, for a caller that must see the spec the session runs
+    (Crew-fired spec hooks). ``(True, None)`` is a project spec that exists but
+    could not be read; ``(False, None)`` is no project spec at all.
+    """
+    project = _project_spec_path_for(agent, work_dir)
+    if project is None:
+        return False, None
+    return True, _read_agent_spec(project, operation="spec_hooks_project_agent", source="unknown")
+
+
+def trusted_project_agent_spec(agent: str, work_dir: str | Path | None) -> tuple[bool, dict | None]:
+    """:func:`project_agent_spec` as a reader of the spec's ``hooks`` consumes it.
+
+    A hook in that spec is a command Crew runs as the user when a session opens
+    or a prompt is sent, so the checkout's spec answers here only when
+    :func:`_project_mcp_trusted` lets it choose commands -- the same verdict, on
+    the same resolution, that decides whether its ``mcpServers`` launch. Refused,
+    it answers ``(False, None)``: the caller falls through to the user-level spec
+    of that name, the one the session's MCP array falls back to as well. A spec
+    that exists but cannot be read still answers ``(True, None)``, so a caller
+    that fails closed on it keeps doing so.
+    """
+    declared, spec = project_agent_spec(agent, work_dir)
+    if not declared or spec is None or _project_mcp_trusted(work_dir):
+        return declared, spec
+    logger.info(
+        "spec hooks: the project spec for agent %r is not trusted to run commands;"
+        " its hooks are not loaded",
+        agent,
+    )
+    return False, None
+
+
+def project_spec_hooks_withheld(agent: str, work_dir: str | Path | None) -> bool:
+    """Whether the checkout's own spec for *agent* sets ``hooks`` that do not run.
+
+    True when that spec reads, sets a non-empty ``hooks`` field, and
+    :func:`_project_mcp_trusted` refuses it, which is the refusal
+    :func:`trusted_project_agent_spec` applies. The session-start notice asks
+    this, so a repository's hooks never stop running unseen. A spec that cannot
+    be read answers ``False``: that case already fails PreToolUse closed.
+    """
+    declared, spec = project_agent_spec(agent, work_dir)
+    if not declared or not isinstance(spec, dict) or not spec.get("hooks"):
+        return False
+    return not _project_mcp_trusted(work_dir)
 
 
 def _agent_spec_for(agent: str, work_dir: str | Path | None = None) -> dict[str, Any] | None:
@@ -353,8 +534,115 @@ def _agent_spec_for(agent: str, work_dir: str | Path | None = None) -> dict[str,
     return _agent_spec_and_snapshot_for(agent, work_dir)[0]
 
 
-def _agent_spec_and_snapshot_for(
+def _project_mcp_trusted(work_dir: str | Path | None) -> bool:
+    """Whether a checkout's own spec may choose a mirrored session's MCP servers.
+
+    Never. A server in that array is a command the adapter launches as the user at
+    ``session/new``, outside the sandbox and before any prompt, so a spec shipped
+    inside a cloned repository would run its author's code the moment a session
+    opened there. kiro-cli loads a workspace agent only for a trusted workspace;
+    Crew cannot read that verdict, and the project-skills consent covers skill
+    files entering context, not commands launching, so neither is borrowed here.
+    The answer stays ``False`` until a consent exists whose wording names MCP
+    servers. *work_dir* is the seam such a consent would key on. The same verdict
+    gates the spec's ``hooks`` (:func:`trusted_project_agent_spec`), so a consent
+    for it also admits the checkout's hook commands and must say so.
+
+    Refusing the servers does not refuse the spec's restrictions: a project entry's
+    switch-off keys (:func:`_project_restrictions`) still apply, because they can
+    only take tools and servers away.
+    """
+    del work_dir
+    return False
+
+
+def _project_restrictions(spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The switch-off keys of a project spec's ``mcpServers``, every other key withheld.
+
+    An allow list, not a deny list: ``disabledTools`` is kept, and ``disabled``
+    only as ``True`` when :func:`mcp_entry_is_muted` reads the entry as muted.
+    Everything else -- ``command``, ``args``, ``type``, ``env``, ``url``,
+    ``headers``, ``cwd``, ``timeout``, ``autoApprove`` and any key added later --
+    either launches a server or grants something, so none of it survives. An
+    entry left with neither key is dropped, and one that keeps a key carries no
+    ``command`` or ``url``, so :func:`acp_server_element` never mounts it.
+    """
+    raw = spec.get("mcpServers")
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        kept: dict[str, Any] = {}
+        tools = entry.get("disabledTools")
+        if isinstance(tools, list):
+            kept["disabledTools"] = list(tools)
+        if "disabled" in entry and mcp_entry_is_muted(entry):
+            kept["disabled"] = True
+        if kept:
+            out[str(name)] = kept
+    return out
+
+
+def _with_restrictions(
+    base: dict[str, Any], restrictions: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """*base* with *restrictions* layered on: tool lists joined, a mute wins.
+
+    Only ever narrows *base*. ``restrictions`` carries ``disabled`` solely as
+    ``True``, so a project entry cannot unmute a server *base* muted, and a name
+    *base* does not declare gains a switch-off-only entry that nothing mounts.
+    """
+    if not restrictions:
+        return base
+    raw = base.get("mcpServers")
+    servers: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    for name, kept in restrictions.items():
+        own = servers.get(name)
+        entry: dict[str, Any] = dict(own) if isinstance(own, dict) else {}
+        tools = kept.get("disabledTools")
+        if isinstance(tools, list):
+            prior = entry.get("disabledTools")
+            entry["disabledTools"] = [*(prior if isinstance(prior, list) else []), *tools]
+        if kept.get("disabled") is True:
+            entry["disabled"] = True
+        servers[name] = entry
+    return {**base, "mcpServers": servers}
+
+
+def _user_agent_spec(agent: str) -> dict[str, Any] | None:
+    """The user-level spec for *agent*, or ``None`` when absent, ambiguous or unreadable."""
+    try:
+        path = agent_spec_path(agent)
+    except ValueError:
+        # Two specs declare this name, so which one is live is undefined. No
+        # answer is the honest one; the control plane still loads below.
+        logger.warning("session MCP: ambiguous agent spec for %r", agent, exc_info=True)
+        return None
+    if path is None:
+        logger.info(
+            "session MCP: no spec on disk for agent %r; loading Crew's control plane only", agent
+        )
+        return None
+    return _read_agent_spec(path, operation="session_mcp_servers", source="unknown")
+
+
+def _session_spec_and_snapshot_for(
     agent: str, work_dir: str | Path | None = None
+) -> tuple[dict[str, Any] | None, Any]:
+    """:func:`_agent_spec_and_snapshot_for` as a mirrored session's array consumes it.
+
+    The array is where an array-backed host gets its MCP servers, so this is the
+    read that applies :func:`_project_mcp_trusted` to them. Crew-fired spec hooks
+    apply the same verdict through :func:`trusted_project_agent_spec`; the
+    unresolved-ref diagnostic on every host keeps the plain resolution.
+    """
+    return _agent_spec_and_snapshot_for(agent, work_dir, mirrored_session=True)
+
+
+def _agent_spec_and_snapshot_for(
+    agent: str, work_dir: str | Path | None = None, *, mirrored_session: bool = False
 ) -> tuple[dict[str, Any] | None, Any]:
     """The spec for *agent* AND the ``DerivedSpecSnapshot`` it was verified against.
 
@@ -372,13 +660,25 @@ def _agent_spec_and_snapshot_for(
     applied. The project spec therefore wins when both declare the name, the way
     a nearer config layer normally does.
 
+    **An untrusted checkout never picks the servers.** With *mirrored_session*,
+    a project spec that :func:`_project_mcp_trusted` refuses yields the
+    user-level spec of the same name -- the one the user wrote; the checkout's
+    ``tools`` filter is nothing the user granted -- with the project's switch-off
+    keys (:func:`_project_restrictions`) layered on. With no user-level spec it
+    yields the project spec with ``mcpServers`` cut down to those switch-off keys,
+    so its ``tools`` allowlist, its restrictions and every other field still apply
+    and no project server launches. The verdict is taken inside this one read: a
+    second scan of the checkout would let a spec that appears between the two
+    reach the array unchecked.
+
     Materializes first: a source checkout that skipped setup has no spec on disk
     at all, and the claude spawn path -- unlike kiro-cli's ``--agent`` one -- has
     no other reason to write it. Best-effort and never raises.
 
-    A DERIVED agent (``kirocrew-worker``) is answered from the freshness gate's own
-    snapshot and reads nothing here -- see the comment at that branch for why a read
-    after the gate is a second observation rather than a tighter one.
+    A DERIVED agent (``kirocrew-worker``, ``kirocrew-heartbeat``) is answered from the
+    freshness gate's own snapshot and reads nothing here -- see the comment at that
+    branch for why a read after the gate is a second observation rather than a tighter
+    one.
 
     Reads through ``agent_discovery._read_agent_spec``, the module's documented
     ONE reader, rather than parsing the file here: the agents directory is
@@ -411,23 +711,20 @@ def _agent_spec_and_snapshot_for(
         return snapshot.spec, snapshot
     project = _project_spec_path_for(agent, work_dir)
     if project is not None:
-        return (
-            _read_agent_spec(project, operation="session_mcp_project_agent", source="unknown"),
-            None,
-        )
-    try:
-        path = agent_spec_path(agent)
-    except ValueError:
-        # Two specs declare this name, so which one is live is undefined. No
-        # answer is the honest one; the control plane still loads below.
-        logger.warning("session MCP: ambiguous agent spec for %r", agent, exc_info=True)
-        return None, None
-    if path is None:
+        spec = _read_agent_spec(project, operation="session_mcp_project_agent", source="unknown")
+        if not mirrored_session or spec is None or _project_mcp_trusted(work_dir):
+            return spec, None
         logger.info(
-            "session MCP: no spec on disk for agent %r; loading Crew's control plane only", agent
+            "session MCP: the project spec for agent %r is not trusted to choose MCP"
+            " servers; only the switch-off keys of its mcpServers are kept",
+            agent,
         )
-        return None, None
-    return _read_agent_spec(path, operation="session_mcp_servers", source="unknown"), None
+        restrictions = _project_restrictions(spec)
+        user = _user_agent_spec(agent)
+        if user is not None:
+            return _with_restrictions(user, restrictions), None
+        return {**spec, "mcpServers": restrictions}, None
+    return _user_agent_spec(agent), None
 
 
 def agent_spec_snapshot(
@@ -438,7 +735,7 @@ def agent_spec_snapshot(
     Exported for the unresolved-ref detector's two callers --
     :mod:`kiro_crew.acp.mcp_ref_guard` at session establishment and
     ``agent_sdk.drivers.acp.agent_spec_mcp_refs`` for ``kirocrew doctor`` -- which
-    have to judge the spec's ``tools`` refs against the array a session receives.
+    have to judge the spec's ``tools`` refs against the array Crew sends a session.
     Reading the file themselves would give them a SECOND resolution order, and
     either could then report a ref as unresolved because it read a different spec
     than the one the projection ran on -- see :func:`_agent_spec_for` for why the order (project
@@ -520,7 +817,7 @@ def session_mcp_disabled_tools(
     nothing off from that source.
     """
     if isinstance(spec, _Unread):
-        spec = _agent_spec_for(agent, work_dir) if agent else None
+        spec = _session_spec_and_snapshot_for(agent, work_dir)[0] if agent else None
     if isinstance(settings, _Unread):
         settings = _global_settings()
     pairs: set[tuple[str, str]] = set()
@@ -572,7 +869,9 @@ def session_mcp_disabled_servers(spec: Any, settings: Any) -> frozenset[str]:
         if not isinstance(raw, dict):
             continue
         for name, entry in raw.items():
-            if isinstance(entry, dict) and entry.get("disabled"):
+            # The shared launch predicate (fail-closed on a non-boolean), the same
+            # read the projections and the gateway rewriter make.
+            if mcp_entry_is_muted(entry):
                 names.add(str(name))
     return frozenset(names)
 
@@ -708,6 +1007,15 @@ class SessionMcpProjection(NamedTuple):
     #: host consumes the spec, so the caller re-verifies THIS after ``session/new`` /
     #: ``session/load`` -- one snapshot per consumed load.
     derived_spec_snapshot: Any = None
+    #: Whether the spec declares ``"tools": []`` -- an explicit, empty list, not a
+    #: missing key (which means "no restriction stated", the ordinary default). The
+    #: allowlist above already reduces both to "mount nothing", which answers the
+    #: MCP-array question; this answers a different one an ``AcpClient`` session
+    #: asks of the SAME parse: does this agent claim zero tools at all, including
+    #: the harness's own native ones the array has no opinion on. See
+    #: ``AcpClient._spec_zero_tools``.
+    zero_tools: bool = False
+    agent_spec: dict[str, Any] | None = None
 
 
 def session_mcp_projection(
@@ -737,20 +1045,28 @@ def session_mcp_projection(
     Blocking (parses the spec and the global settings file once each), so callers
     run it off the event loop.
     """
-    spec, snapshot = _agent_spec_and_snapshot_for(agent, work_dir) if agent else (None, None)
+    spec, snapshot = _session_spec_and_snapshot_for(agent, work_dir) if agent else (None, None)
     settings = _global_settings()
     disabled_tools = session_mcp_disabled_tools(
         agent, work_dir=work_dir, spec=spec, settings=settings
     )
+    disabled_servers = session_mcp_disabled_servers(spec, settings)
+    spec_tools = spec.get("tools") if isinstance(spec, dict) else None
     return SessionMcpProjection(
         servers=session_mcp_servers(
-            agent, stub_server_names=stub_server_names, work_dir=work_dir, spec=spec
+            agent,
+            stub_server_names=stub_server_names,
+            work_dir=work_dir,
+            spec=spec,
+            muted=disabled_servers,
         ),
         restricted=session_mcp_restricted_servers(disabled_tools),
         disabled_tools=disabled_tools,
-        disabled_servers=session_mcp_disabled_servers(spec, settings),
-        allowlist=_tools_allowlist(spec),
+        disabled_servers=disabled_servers,
+        allowlist=_tools_allowlist(spec)._replace(muted=disabled_servers),
         derived_spec_snapshot=snapshot,
+        zero_tools=isinstance(spec_tools, list) and not spec_tools,
+        agent_spec=spec,
     )
 
 
@@ -760,8 +1076,14 @@ def session_mcp_servers(
     stub_server_names: Collection[str] = (),
     work_dir: str | Path | None = None,
     spec: dict[str, Any] | None | _Unread = _UNREAD,
+    muted: Collection[str] | _Unread = _UNREAD,
 ) -> list[dict[str, Any]]:
     """The ACP ``mcpServers`` array for a session running as *agent*.
+
+    A server switched off whole (*muted*, :func:`session_mcp_disabled_servers`) is
+    never in the array: every element in it is a process the adapter launches, so a
+    mute that only labelled the entry would still launch it. Not supplied, the set
+    is read from this call's spec and the global settings file.
 
     Called only for a backend in ``ACP_BACKENDS_SESSION_MCP_ARRAY``; every other
     harness reads the same spec itself and gets an empty array.
@@ -787,7 +1109,7 @@ def session_mcp_servers(
     servers: dict[str, Any] = {}
     tools: Any = None
     if isinstance(spec, _Unread):
-        spec = _agent_spec_for(agent, work_dir) if agent else None
+        spec = _session_spec_and_snapshot_for(agent, work_dir)[0] if agent else None
     if spec is not None:
         raw = spec.get("mcpServers")
         if isinstance(raw, dict):
@@ -880,6 +1202,12 @@ def session_mcp_servers(
         allow = _tools_allowlist(spec)
         servers = {n: e for n, e in servers.items() if allow.grants(n)}
 
+    if isinstance(muted, _Unread):
+        muted = session_mcp_disabled_servers(spec, _global_settings())
+    for name in sorted(set(servers) & {str(m) for m in muted}):
+        logger.info("session MCP: withholding server %r -- it is switched off whole", name)
+        servers.pop(name)
+
     out: list[dict[str, Any]] = []
     for name in sorted(servers):
         element = acp_server_element(name, servers[name])
@@ -931,13 +1259,527 @@ def _managed_element_env(declared: Any) -> dict[str, str]:
     return env
 
 
+def builtin_app_identity_launches() -> dict[str, dict[str, Any]]:
+    """Builtin app MCP servers that get a per-session identity element, and their launch.
+
+    The app-server half of the population :func:`kiro_control_plane_servers`
+    re-declares. A builtin app server whose shipped manifest runs the host CLI
+    (``mochi:mochi``, ``command: "kirocrew"``) is pinned by
+    ``bridges._pin_host_cli_command`` to this gateway's own interpreter, so it is
+    Kiro Crew's own code and serves through ``mcp_shared.run_mcp_stdio_loop``,
+    whose ``tools/call`` needs the same attestation as the managed servers. Mounted
+    straight from the spec it carries no session token and refuses every call as
+    ``identity_unattested``.
+
+    Maps each such name to ``{"command", "args", "env"}`` re-derived from the
+    IMMUTABLE manifest and pinned exactly as the registration path pins it, so the
+    element's launch is never the spec's. Fail-soft: an unreadable manifest source
+    yields no entry, which leaves that server as it is today.
+    """
+    # circular import: apps.bridges imports agent and config machinery at load.
+    from kiro_crew.apps.bridges import _pin_host_cli_command
+    from kiro_crew.apps.execution import builtin_app_host_cli_mcp_launches
+
+    try:
+        shipped = builtin_app_host_cli_mcp_launches()
+    except Exception:  # noqa: BLE001 -- a manifest read failure must not fail a spawn
+        logger.warning("session MCP: could not read builtin app manifests", exc_info=True)
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for name, (app_name, args) in sorted(shipped.items()):
+        try:
+            pinned = _pin_host_cli_command(app_name, {"command": "kirocrew", "args": list(args)})
+        except Exception:  # noqa: BLE001 -- one app's pin failure must not cost the others
+            logger.warning(
+                "session MCP: could not pin %r to the host interpreter", name, exc_info=True
+            )
+            continue
+        command = pinned.get("command")
+        if not isinstance(command, str) or not command or command == "kirocrew":
+            continue
+        out[name] = {
+            "command": command,
+            "args": [str(a) for a in pinned.get("args") or []],
+            "env": {str(k): str(v) for k, v in (pinned.get("env") or {}).items()},
+        }
+    return out
+
+
+def _declared_launch(source: Mapping[str, Any]) -> tuple[str, list[str]]:
+    """``(command, args)`` as a spec or settings entry declares them, for comparison.
+
+    A non-sequence ``args`` (``8080``, ``"--flag"``) reads as no args rather than
+    being iterated: it cannot equal the managed launch either way, and raising
+    here would abort ``session/new`` over a typo the module's own rules say must
+    not raise (see :func:`acp_server_element`).
+    """
+    raw_args = source.get("args")
+    args = [str(a) for a in raw_args] if isinstance(raw_args, (list, tuple)) else []
+    return str(source.get("command", "") or ""), args
+
+
+# The keys a native declaration of a managed server may carry and still be
+# re-declared as a per-session element: the table the spec rebuild keeps on a
+# managed entry (``agent._MANAGED_MCP_ENTRY_KEYS`` -- ``command``, ``args``,
+# ``env``, ``type``, ``autoApprove``, ``timeout``, ``disabled``,
+# ``disabledTools``), read from there so the two cannot drift, minus the one key
+# in it that :func:`acp_server_element` does not carry: ``timeout``. The element
+# REPLACES the declaration it is named after (an injected server wins over a
+# same-named native one), so a ``timeout`` the user set there would run on the
+# default with nothing to say so; the declaration stays native and the element
+# is withheld, naming the key, the same way the KAS carriage leaves a ``timeout``
+# customization in the agent block where that field is honoured. Anything else
+# outside the table is a kiro-cli-only setting the element cannot express and is
+# withheld for the same reason (see :func:`native_mount_withholding`). A key in
+# the table is not by itself a restriction -- ``autoApprove`` narrows no tool
+# surface -- only the values the arms below read.
+_NATIVE_ELEMENT_KEYS: frozenset[str] = _agent_mod._MANAGED_MCP_ENTRY_KEYS - {"timeout"}
+
+# Kiro Crew's OWN bookkeeping on an entry: the provenance marker the global-file
+# sync stamps on an entry it authored, and the derived-field record the spec
+# rebuild writes. Neither is a setting kiro-cli reads -- unknown keys are dropped
+# at deserialization -- so neither restricts the server, and an element that
+# omits them expresses everything the declaration says. Judging them as "a key
+# the element cannot carry" would refuse the default agent for Crew's own stamp,
+# with a message telling the user to remove it.
+_NATIVE_INERT_KEYS = frozenset({mcp_provenance.MARKER_KEY, mcp_provenance.DERIVED_KEY})
+
+# How the three places a managed server is declared are named to a user. These
+# land in the message that refuses a projected search agent, so they name the
+# FILE someone would open, not the variable that holds it.
+NATIVE_SOURCE_SPEC = "the agent spec"
+NATIVE_SOURCE_GLOBAL = "the global MCP settings"
+NATIVE_SOURCE_PROJECT = "the project's MCP settings"
+
+# The dashboard's MCP tab is the one writer of ``disabledTools`` and ``disabled``
+# on Crew's own servers (``/api/mcp/toggle-tool`` and the server toggle, both
+# into the global settings), so it is the recovery the message points at first.
+_NATIVE_REMEDY_DASHBOARD = "in the dashboard's MCP tab"
+
+# How many disabled tools a refusal names before it counts the rest: the
+# message reaches a log line and an error dialog, and the list is user-authored.
+_NATIVE_NAMED_TOOLS = 8
+
+# How many characters of ONE user-authored value a refusal repeats -- a tool
+# name, a key, a transport, the ``repr`` of a value that is not what it should
+# be. The count bound above bounds how many names a message carries; this
+# bounds each of them, and the two together bound the message, which the
+# projection RETAINS per agent (``NativeSkillProjection.errors``) for the life
+# of the runtime while the file it came from is read up to the reader's 50 MB
+# ceiling. Tool names are identifiers of a few dozen characters; a value this
+# long is not one, and the message says so by cutting it.
+_NATIVE_NAMED_CHARS = 64
+
+# How many characters of a settings file's PATH a refusal repeats. The path is
+# the remedy -- it names the file the user opens -- so it is cut from the FRONT,
+# keeping the tail that locates the file under its project. A project path is
+# admitted, not typed, but its length is the filesystem's ceiling and not ours,
+# and the string is retained per agent for the life of the runtime.
+_NATIVE_NAMED_PATH_CHARS = 256
+
+# How many characters of ONE value the cleaner READS before the message repeats
+# its bounded head. The value comes out of a settings file -- the project's is
+# checked out with the repository -- and the message reaches the gateway's log,
+# so it goes through the package's one sink cleaner
+# (:func:`~kiro_crew.acp.mcp_session_report.sanitize_sink_text`: redact, drop
+# control characters, THEN cut), never raw: a newline or an escape sequence in
+# a tool name would otherwise write its own log line. The cleaner runs over
+# this window whole, so nothing the message repeats was cut before it was
+# redacted; and the window, not the file, is what a value costs, because the
+# redactors are regular expressions whose time grows faster than the text on
+# some shapes (measured: 100,000 digits, 10.8 s) and the reader admits 50 MB.
+_NATIVE_NAMED_WINDOW = 16 * _NATIVE_NAMED_CHARS
+
+
+def _named_path(path: Path) -> str:
+    """*path* as a message repeats it: its tail, within :data:`_NATIVE_NAMED_PATH_CHARS`.
+
+    Cleaned like every other value the message carries: the path is the session's
+    working directory as admitted, and a control character in it would reach the
+    same log line.
+    """
+    text = str(path)
+    text = sanitize_sink_text(text, len(text))
+    if len(text) <= _NATIVE_NAMED_PATH_CHARS:
+        return text
+    return "..." + text[-(_NATIVE_NAMED_PATH_CHARS - 3) :]
+
+
+class NativeSettingsSource(NamedTuple):
+    """One settings file kiro-cli enforces beside the agent spec.
+
+    ``servers`` is its ``mcpServers`` map, empty for an absent file -- only
+    absence means "no restrictions"; a file that cannot be read safely never
+    becomes a source (see :func:`native_settings_sources`).
+    """
+
+    label: str
+    path: Path
+    servers: Mapping[str, Any]
+
+    @property
+    def named(self) -> str:
+        """The source as a refusal names it: the label and the file, bounded."""
+        return f"{self.label} ({_named_path(self.path)})"
+
+
+class NativeSettingsUnreadable(ValueError):
+    """A settings file exists but could not be read safely.
+
+    Raised by :func:`native_settings_sources` in place of the reader's own
+    ``OSError``/``ValueError`` (kept as ``__cause__``) so a caller can name the
+    file it could not read. It IS a ``ValueError``, so a caller that catches the
+    reader's exceptions still catches this one.
+    """
+
+    def __init__(self, label: str, path: Path) -> None:
+        super().__init__(f"{label} ({_named_path(path)}) could not be read safely")
+        self.label = label
+        self.path = path
+
+    def explain(self, outcome: str) -> str:
+        """One sentence for a user: why every native element is withheld."""
+        return (
+            f"{self.label} ({_named_path(self.path)}) could not be read safely, so no Kiro Crew"
+            f" server can be mounted with this session's identity; repair or remove"
+            f" that file to restore {outcome}"
+        )
+
+
+def native_settings_sources(work_dir: str | Path | None) -> list[NativeSettingsSource]:
+    """The settings files kiro-cli enforces beside the agent spec, global first.
+
+    This is the source set that decides whether a managed server's native
+    declaration can be re-declared as a per-session element. Its one reader is
+    :func:`kiro_control_plane_servers`, which mounts the element or not at each
+    session start and hands its verdict on; the skill projection, which decides
+    whether an agent may depend on the element, judges the agent spec alone and
+    never reads these files, so no two readers can answer from different files
+    or from the same file at different moments. The global file is the one the
+    dashboard's tool toggle writes; the per-project file is read beside the
+    session's working directory, the same directory the projection is prepared
+    for and ``session/new`` receives as ``cwd``.
+
+    Raises :class:`NativeSettingsUnreadable` when a file exists but fails the
+    gated read, or, off the event loop, when a file is replaced or rewritten
+    during every bracketed pass; the caller then withholds EVERY element, because a restriction
+    it cannot read must stay authoritative. An absent file contributes nothing.
+    """
+    reads: list[tuple[str, Path, Any]] = [
+        (NATIVE_SOURCE_GLOBAL, _agent_mod._KIRO_MCP_JSON, lambda _p: _global_settings(strict=True))
+    ]
+    if work_dir:
+        project_path = Path(work_dir) / ".kiro" / "settings" / "mcp.json"
+        reads.append((NATIVE_SOURCE_PROJECT, project_path, _read_mcp_settings))
+    if _on_loop_thread():
+        # No read on the loop thread pauses, so no pause can open a gap between
+        # the two reads; bracketing there would only add blocked resolutions.
+        return _read_native_sources_once(reads)
+    # Off the loop a read may pause for a retry, and a file replaced during that
+    # pause leaves the pass holding a snapshot of the OTHER file that is older
+    # than session start. Bracket each pass with every file's identity: a pass
+    # is kept only when no file was replaced or rewritten while it ran. Identity,
+    # not content, is compared, so a file swapped away and back to equal content
+    # still voids the pass.
+    paths = [path for _label, path, _read in reads]
+    changed: tuple[str, Path] = (reads[0][0], reads[0][1])
+    for _ in range(_NATIVE_SOURCES_BRACKETED_PASSES):
+        before = [_settings_file_identity(path) for path in paths]
+        sources = _read_native_sources_once(reads)
+        after = [_settings_file_identity(path) for path in paths]
+        moved = [
+            (label, path)
+            for (label, path, _read), was, now in zip(reads, before, after)
+            if was != now or was is _IDENTITY_UNKNOWN
+        ]
+        if not moved:
+            return sources
+        changed = moved[0]
+    raise NativeSettingsUnreadable(*changed)
+
+
+#: How many bracketed passes :func:`native_settings_sources` makes off the event
+#: loop before refusing the set. The known writers replace a file every 35-40 s,
+#: so a sub-second pass is voided at most once by an ordinary save; a file that
+#: moves under every pass is churning faster than any snapshot can be trusted,
+#: and the set is refused like an unreadable file.
+_NATIVE_SOURCES_BRACKETED_PASSES = 4
+
+#: Identity of a settings file whose identity could not be taken safely. It
+#: never matches, so a pass it brackets is voided.
+_IDENTITY_UNKNOWN = object()
+
+
+def _settings_file_identity(path: Path) -> Any:
+    """``(st_dev, st_ino, st_mtime_ns, st_size)`` of *path*, ``None`` when absent.
+
+    An atomic replace always yields a new inode and an in-place write moves the
+    mtime or size, so two equal identities mean the file was neither replaced
+    nor rewritten in between. Every sample goes through
+    :func:`kiro_crew.hooks.safe_file_identity`, which screens the path afresh
+    and reads the identity from a no-reparse descriptor, so no sample follows a
+    link swapped in after an earlier one. A refused or unopenable path returns
+    :data:`_IDENTITY_UNKNOWN`.
+    """
+    try:
+        return _hooks.safe_file_identity(str(path))
+    except OSError:
+        return _IDENTITY_UNKNOWN
+
+
+def _read_native_sources_once(
+    reads: list[tuple[str, Path, Any]],
+) -> list[NativeSettingsSource]:
+    """One gated read of every settings source, returned in global-first order.
+
+    The global file is read LAST: it is the one the dashboard's tool toggle
+    writes, so no retry pause on the project read can fall between the global
+    read and session start.
+    """
+    sources: list[NativeSettingsSource] = []
+    for label, path, read in reversed(reads):
+        try:
+            settings = read(path)
+        except (OSError, ValueError) as exc:
+            raise NativeSettingsUnreadable(label, path) from exc
+        declared = settings.get("mcpServers", {}) if isinstance(settings, dict) else {}
+        sources.append(
+            NativeSettingsSource(label, path, declared if isinstance(declared, dict) else {})
+        )
+    sources.reverse()
+    return sources
+
+
+def native_declarations(
+    name: str, spec_entry: Any, settings: Collection[NativeSettingsSource]
+) -> list[tuple[str, Any]]:
+    """Every declaration of *name* a session is subject to, as ``(source, entry)``.
+
+    The spec's own entry first, then each settings file that names the server,
+    in the order :func:`native_settings_sources` returns them. The entries are
+    returned as declared -- a settings file is hand-editable JSON, so one may not
+    even be an object -- and the caller decides what a malformed one means.
+    """
+    declarations: list[tuple[str, Any]] = [(NATIVE_SOURCE_SPEC, spec_entry)]
+    for source in settings:
+        if name in source.servers:
+            declarations.append((source.named, source.servers[name]))
+    return declarations
+
+
+class NativeMountWithholding(NamedTuple):
+    """Why a managed server's per-session element is withheld, named for a user.
+
+    ``source`` is the declaration that carries the restriction (one of the
+    ``NATIVE_SOURCE_*`` labels, with the file's path for a settings file),
+    ``restriction`` what it says, ``remedy`` what removes it. :meth:`explain`
+    renders the sentence both readers of the predicate hand on: the projection
+    as the reason a search agent was refused, the element writer as its log line.
+    """
+
+    server: str
+    source: str
+    restriction: str
+    remedy: str
+
+    def explain(self, outcome: str) -> str:
+        return (
+            f"{self.server} is withheld by {self.source}: {self.restriction};"
+            f" {self.remedy} to restore {outcome}"
+        )
+
+
+class NativeControlPlaneMount(NamedTuple):
+    """What ONE read of the sources yields for a session's identity-bound servers.
+
+    ``elements`` is the per-session ``mcpServers`` array
+    :func:`kiro_control_plane_servers` produced. ``withheld`` names, for each
+    identity-bound server the spec grants whose element it did NOT produce
+    because a declaration keeps the server native, that declaration's
+    :class:`NativeMountWithholding` -- or, when a settings file could not be read
+    safely, the :class:`NativeSettingsUnreadable` that withheld every element. A
+    server in neither was not granted, not declared, or already in the array
+    with the files allowing it. Both come from the one read of the settings
+    files the mount performs, so a caller that refuses a session on ``withheld``
+    refuses it for the reason the array was built on, never for what the files
+    say a moment later.
+    """
+
+    elements: list[dict[str, Any]]
+    withheld: dict[str, NativeMountWithholding | NativeSettingsUnreadable]
+
+
+def _named(value: Any) -> str:
+    """*value* as a message repeats it: at most :data:`_NATIVE_NAMED_CHARS` characters.
+
+    Every user-authored field a refusal interpolates goes through here, so the
+    bound is one bound and a field added later cannot miss it by being spelled
+    differently. The text is cleaned before it is cut -- the first
+    :data:`_NATIVE_NAMED_WINDOW` characters go through the sink cleaner whole, so
+    a credential is redacted before a cut could split it and a control character
+    never reaches the message -- and a cut value ends in ``...`` inside the bound,
+    never past it. A value the window did not hold whole is a cut value too.
+    """
+    text = value if isinstance(value, str) else repr(value)
+    window = text[:_NATIVE_NAMED_WINDOW]
+    clean = sanitize_sink_text(window, len(window))
+    if len(text) <= _NATIVE_NAMED_WINDOW and len(clean) <= _NATIVE_NAMED_CHARS:
+        return clean
+    return clean[: _NATIVE_NAMED_CHARS - 3] + "..."
+
+
+def _named_some(values: list[Any]) -> str:
+    """The first :data:`_NATIVE_NAMED_TOOLS` of *values*, each bounded, then a count."""
+    named = ", ".join(_named(value) for value in values[:_NATIVE_NAMED_TOOLS])
+    if len(values) > _NATIVE_NAMED_TOOLS:
+        named += f" and {len(values) - _NATIVE_NAMED_TOOLS} more"
+    return named
+
+
+def _named_tools(value: Any) -> str:
+    """Render a ``disabledTools`` value for a message, bounded and typed."""
+    if not isinstance(value, list) or not all(isinstance(tool, str) for tool in value):
+        return f"is {_named(repr(value))}, not a list of tool names"
+    return f"lists {_named_some(value)}"
+
+
+def _native_restriction(
+    declared: Any, *, dashboard_writes: bool = False, crews_registry_marker: bool = False
+) -> tuple[str, str] | None:
+    """``(restriction, remedy)`` when one declaration keeps its server native.
+
+    The order is the order the questions are cheapest to answer and matters only
+    for which reason a declaration with several is named for. The two flags say
+    which declaration this is, because two answers depend on it. ``dashboard_writes``:
+    the declaration lives in the file the dashboard's MCP tab writes -- the global
+    settings -- so a mute or a ``disabledTools`` there is offered the tab as the
+    way back; a spec or project entry is not, since following that remedy would
+    leave the restriction where it is and refuse the next session again.
+    ``crews_registry_marker``: a ``registry`` transport value on this declaration
+    is Crew's own marker -- the declaration is the agent spec's managed entry AND
+    registry mode is on, the one state in which the spec rebuild stamps it there
+    -- so it restricts nothing. In every other state the same value is one
+    kiro-cli drops, and the caller says so by leaving the flag off.
+    """
+    if not isinstance(declared, dict):
+        return ("its entry is not a server object", "declare it as an object there")
+    extra = sorted(str(key) for key in set(declared) - _NATIVE_ELEMENT_KEYS - _NATIVE_INERT_KEYS)
+    if extra:
+        return (
+            f"its entry carries {_named_some(extra)}, which a per-session element cannot"
+            " express",
+            "remove that setting from the entry there",
+        )
+    transport = declared.get("type", "stdio")
+    # ``registry`` is Crew's OWN marker only where Crew writes it: on the SPEC's
+    # managed entry while ``agent.mcp_registry_mode`` is on, where the spec
+    # rebuild stamps it on every managed entry (``_enforce_managed_mcp_ownership``
+    # removes it again the moment the mode is off). Reading it as "not stdio"
+    # there would refuse the default agent on every enterprise-governed install
+    # and tell the operator to delete a marker the next rebuild re-stamps. In
+    # every other state the value is one kiro-cli DROPS: outside registry mode
+    # kiro-cli drops a marked entry wherever it is declared -- a spec entry
+    # marked while the mode is off is not Crew's marker but a declaration the
+    # rebuild has not yet removed or a line someone wrote, and a settings file is
+    # never stamped by any Crew writer -- so mounting the element for it would
+    # launch a server kiro-cli refuses, and the declaration stays native. The
+    # mount itself answers registry mode before it reaches this predicate, so
+    # from the mount the flag is only ever off; the projection, which judges the
+    # spec at preparation, is the reader the exemption is for.
+    transports = ("stdio", _KIRO_REGISTRY_TYPE) if crews_registry_marker else ("stdio",)
+    if transport not in transports:
+        return (
+            f"its type is {_named(repr(transport))}, not stdio",
+            "declare it as a stdio server there",
+        )
+    if mcp_entry_is_muted(declared):
+        return (
+            "it is disabled",
+            _remedy("re-enable the server", "set disabled to false there", tab=dashboard_writes),
+        )
+    disabled_tools = declared.get("disabledTools", [])
+    if disabled_tools != []:
+        return (
+            f"its disabledTools {_named_tools(disabled_tools)}",
+            _remedy(
+                "re-enable those tools",
+                "remove the disabledTools entry there",
+                tab=dashboard_writes,
+            ),
+        )
+    return None
+
+
+def _remedy(action: str, edit: str, *, tab: bool) -> str:
+    """The way back, one grammatical sentence whichever file holds the restriction.
+
+    Where the dashboard's MCP tab writes the file, the tab is offered first and the
+    hand edit is the alternative, joined by the ``or`` that two options need.
+    Where it does not, the edit stands alone: *action* would only restate what the
+    edit does, and a connective belongs to the arm that has two clauses to join.
+    """
+    if tab:
+        return f"{action} {_NATIVE_REMEDY_DASHBOARD}, or {edit}"
+    return edit
+
+
+def native_mount_withholding(
+    name: str, spec_entry: Any, settings: Collection[NativeSettingsSource]
+) -> NativeMountWithholding | None:
+    """Whether *name*'s per-session element must be withheld, and why.
+
+    THE predicate for "does a native restriction keep this managed server out of
+    the per-session ``mcpServers`` array": ``None`` means the element may be
+    mounted, anything else names the declaration and the restriction. A
+    per-session element cannot carry a kiro-cli-only setting -- a mute, a
+    ``disabledTools`` list, a non-stdio transport, any key outside
+    :data:`_NATIVE_ELEMENT_KEYS` -- and dropping one would widen the session's
+    tool surface behind the user's back, so the declaration that carries it
+    stays native and the element is withheld. Crew's own marks on an entry are
+    not settings and restrict nothing: the ``registry`` transport value on the
+    spec's managed entry while registry mode is on (the one state in which Crew
+    writes it; in any other it is a value kiro-cli drops, and it withholds), the
+    provenance marker and the derived-field record (:data:`_NATIVE_INERT_KEYS`).
+    That is the same answer for every
+    declaration the session is subject to, the spec's and each settings file's
+    (:func:`native_declarations`).
+
+    Two readers ask this question and MUST reach the same answer for the same
+    declaration: :func:`kiro_control_plane_servers`, which mounts the element or
+    not and hands its verdict on (:class:`NativeControlPlaneMount`), and the
+    skill projection, which decides whether an agent may rely on the element
+    being there. They split the sources by what each one is. The projection
+    judges the agent spec's entry at preparation, over no settings source, since
+    a restriction authored there is static for the view's life; the mount is the
+    ONE reader of the settings files, at each session start, and a runtime that
+    refuses a session for what a file says refuses it on the mount's verdict
+    rather than on a read of its own. A projection judging the spec by a rule
+    of its own would promise an element the mount then withholds, and
+    ``session/new`` would fail with an error pointing at the wrong file; so both
+    call this one function, and neither keeps a copy of the merge or of the
+    predicate.
+    """
+    dashboard_writes = {s.named for s in settings if s.label == NATIVE_SOURCE_GLOBAL}
+    registry_mode = _registry_mode()
+    for source, declared in native_declarations(name, spec_entry, settings):
+        verdict = _native_restriction(
+            declared,
+            dashboard_writes=source in dashboard_writes,
+            crews_registry_marker=source == NATIVE_SOURCE_SPEC and registry_mode,
+        )
+        if verdict is not None:
+            restriction, remedy = verdict
+            return NativeMountWithholding(name, source, restriction, remedy)
+    return None
+
+
 def kiro_control_plane_servers(
     agent: str | None,
     *,
     work_dir: str | Path | None,
     existing_names: Collection[str] = (),
     spec_override: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
+) -> NativeControlPlaneMount:
     """Carry ordinary session identity without widening Kiro's native tool surface.
 
     Only an existing managed stdio declaration can be overridden. Native-only
@@ -956,49 +1798,112 @@ def kiro_control_plane_servers(
     the same form ``mcp_gateway.gatewayd`` reads: it answers for a granted opt-in
     server where the writers' emission question would refuse to mint one, and
     still yields ``None`` behind a closed ``spec_gate``.
+
+    Builtin app servers that run Crew's own code (:func:`builtin_app_identity_launches`)
+    are covered the same way and for the same reason: kiro-cli mounts them straight
+    from the spec, so without this element ``mochi:mochi`` refuses every call. Their
+    launch is re-derived from the shipped manifest, never the spec, and an app that
+    ships its own binary is not in that set.
+
+    Returns the array AND the verdicts it withheld on
+    (:class:`NativeControlPlaneMount`), both from this call's one read of the
+    settings files. The verdict is reached before the array is consulted: a name
+    a broker stub already carries gets no element either way, but the
+    restriction a declaration puts on it is what the session-start guard has to
+    know -- a stub carries a kiro-cli-only restriction no better than the
+    element does -- and it has to come from this read. A second read for it
+    would be the window in which a toggle undone in between answers ``None``
+    and the session falls back to a guard that names the wrong file.
     """
     if not agent or _registry_mode():
-        return []
+        return NativeControlPlaneMount([], {})
     spec = spec_override if spec_override is not None else _agent_spec_for(agent, work_dir)
     if not isinstance(spec, dict) or not isinstance(spec.get("mcpServers"), dict):
-        return []
+        return NativeControlPlaneMount([], {})
     allow = _tools_allowlist(spec)
     try:
-        settings = [_global_settings(strict=True)]
-        if work_dir:
-            settings.append(_read_mcp_settings(Path(work_dir) / ".kiro" / "settings" / "mcp.json"))
-    except (OSError, ValueError):
-        logger.debug("session MCP: withholding Kiro overrides because settings are unreadable")
-        return []
-    supported = {"command", "args", "env", "type", "autoApprove", "disabled", "disabledTools"}
-    out = []
-    for name in IDENTITY_BOUND_SERVERS:
-        if name in existing_names or not allow.grants(name):
-            continue
+        settings = native_settings_sources(work_dir)
+    except NativeSettingsUnreadable as exc:
+        # Withholding is the right direction (a native restriction we cannot read
+        # must stay authoritative), but unpooled Crew servers that kiro-cli mounts
+        # from the spec lose their session identity element, so their calls are
+        # refused ``identity_unattested``. Pooled broker stubs keep their token.
+        logger.warning(
+            "session MCP: MCP settings unreadable (%s); agent %r gets no identity"
+            " elements for unpooled Kiro Crew servers mounted from its spec, so their"
+            " calls will refuse identity_unattested",
+            exc,
+            agent,
+        )
+        # The verdict covers the whole population this function mounts, the
+        # builtin app servers included, so a withheld one is named as such.
+        unreadable = (*IDENTITY_BOUND_SERVERS, *builtin_app_identity_launches())
+        return NativeControlPlaneMount([], {name: exc for name in unreadable})
+    out: list[dict[str, Any]] = []
+    withheld_by_name: dict[str, NativeMountWithholding | NativeSettingsUnreadable] = {}
+    # Crew's managed servers first, in their established order, then the builtin
+    # app servers that run Crew's own code (see builtin_app_identity_launches).
+    # Each carries the launch it must be re-derived from and, for an app server,
+    # the env its pinned launch needs (PYTHONPATH and KIROCREW_HOME).
+    candidates: list[tuple[str, dict[str, Any] | None, dict[str, str]]] = [
+        (name, managed_mcp_spec_entry(name, include_opt_in=True), {})
+        for name in IDENTITY_BOUND_SERVERS
+        if allow.grants(name)
+    ]
+    app_launches = builtin_app_identity_launches()
+    candidates.extend(
+        (name, launch, dict(launch.get("env") or {}))
+        for name, launch in app_launches.items()
+        if name not in IDENTITY_BOUND_SERVERS and allow.grants(name)
+    )
+    for name, managed, pinned_env in candidates:
         entry = spec["mcpServers"].get(name)
-        managed = managed_mcp_spec_entry(name, include_opt_in=True)
         if not isinstance(entry, dict) or not isinstance(managed, dict):
             continue
-        sources = [entry]
-        for settings_source in settings:
-            declared = (
-                settings_source.get("mcpServers", {}) if isinstance(settings_source, dict) else {}
-            )
-            if isinstance(declared, dict) and name in declared:
-                sources.append(declared[name])
-        if any(
-            not isinstance(source, dict)
-            or set(source) - supported
-            or source.get("type", "stdio") != "stdio"
-            or mcp_entry_is_muted(source)
-            or source.get("disabledTools", []) != []
-            or ("command" in source and source["command"] != managed.get("command"))
-            or ("args" in source and source["args"] != managed.get("args", []))
-            for source in sources
-        ):
+        withheld = native_mount_withholding(name, entry, settings)
+        if withheld is not None:
+            logger.debug("session MCP: %s", withheld.explain("its per-session element"))
+            withheld_by_name[name] = withheld
             continue
-        owned = {**entry, "env": _managed_element_env(entry.get("env"))}
+        if name in existing_names:
+            continue
+        # The launch is the managed source's, never the spec's. A hand-authored
+        # command for a reserved name cannot be right across users or upgrades
+        # (the managed path carries the home and the installed version; the one
+        # writable spelling, bare ``kirocrew``, resolves to the Toolbox
+        # dispatcher), and skipping such an entry cost the session every
+        # control-plane tool while the server looked mounted. The
+        # module docstring already states the rule -- "re-derived from the
+        # managed source of truth on every spawn so a stale hand-edited command
+        # in the spec cannot cost a claude session the tools it needs" -- and the
+        # codex/opencode projections REPLACE the same way; this applies it here.
+        # Restrictions (mute, ``disabledTools``, non-stdio) still withhold above:
+        # they narrow the grant, which stays the spec's; only the invocation is
+        # ours. Only a sequence is iterated, as in ``acp_server_element``: the
+        # spec is hand-editable JSON, so ``"args": 8080`` is an easy thing to
+        # write, and it must read as "not the managed launch", not abort
+        # ``session/new`` with a TypeError from inside a comprehension.
+        declared = [
+            _declared_launch(source)
+            for _source_label, source in native_declarations(name, entry, settings)
+            if isinstance(source, dict) and ("command" in source or "args" in source)
+        ]
+        managed_launch = _declared_launch(managed)
+        if any(launch != managed_launch for launch in declared):
+            logger.warning(
+                "session MCP: agent %r declares reserved server %r with a command that is"
+                " not the managed invocation; mounting the managed one so the gateway can"
+                " attest it",
+                agent,
+                name,
+            )
+        owned = {
+            **entry,
+            "command": managed_launch[0],
+            "args": list(managed_launch[1]),
+            "env": {**_managed_element_env(entry.get("env")), **pinned_env},
+        }
         element = acp_server_element(name, owned)
         if element is not None:
             out.append(element)
-    return out
+    return NativeControlPlaneMount(out, withheld_by_name)

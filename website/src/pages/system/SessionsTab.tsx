@@ -7,7 +7,7 @@
  * `Group by` folds rows on an ATTRIBUTE (agent, channel). Sorting, expansion,
  * grouping, and aggregation come from `@tanstack/react-table`.
  */
-import { type MutableRefObject, useCallback, useEffect, useMemo, useState } from 'react'
+import { type MutableRefObject, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -30,6 +30,7 @@ import { Btn, Card, ContentSkeleton, EmptyState, IconButton, SearchInput } from 
 import { Popover, PopoverContent, PopoverTrigger } from '../../components/ui/popover'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table'
 import InfoTip from '../../components/InfoTip'
+import { SettingRef } from '../../components/settingRef/SettingRef'
 import SegmentedControl, { type Segment } from '../../components/SegmentedControl'
 import { fmtNumber, fmtPercent } from '../../i18n/format'
 import {
@@ -43,6 +44,8 @@ import {
   fmtUptime,
   heatLevel,
   rowName,
+  aggregateOncePerRuntime,
+  sumOncePerRuntime,
   type SessionRow,
 } from './sessionRows'
 
@@ -153,7 +156,14 @@ export default function SessionsTab({ planeStateRef }: Props) {
   }, [sessions])
   const creatorOf = (r: SessionRow): string | null => {
     if (r.kind !== 'session' || r.parent == null) return null
-    return (r.parent.key != null ? nameOf.get(r.parent.key) : undefined) ?? nameOf.get(r.parent.slot) ?? r.parent.slot
+    // `key` names the CREATOR only on an ordinary edge. On a re-parented row it is
+    // the nearest open ancestor, and naming that one here would credit the creating
+    // to a session that did not do it -- so the citation falls back to `slot`, which
+    // is the creator either way.
+    const named = r.parent.key != null && r.parent.ancestor !== true
+      ? nameOf.get(r.parent.key)
+      : undefined
+    return named ?? nameOf.get(r.parent.slot) ?? r.parent.slot
   }
 
   const columns = useMemo(
@@ -198,7 +208,8 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('procs', {
           header: i18nT('pages.sessionsTab.procs'),
           enableGrouping: false,
-          aggregationFn: 'sum',
+          // Runtime-level count: added once per runtime, not once per co-tenant.
+          aggregationFn: (_id, leafRows) => aggregateOncePerRuntime('procs', leafRows),
           size: 68,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -208,7 +219,8 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('mcp', {
           header: i18nT('pages.sessionsTab.mcp_stubs'),
           enableGrouping: false,
-          aggregationFn: 'sum',
+          // Runtime-level count: added once per runtime, not once per co-tenant.
+          aggregationFn: (_id, leafRows) => aggregateOncePerRuntime('mcp', leafRows),
           size: 92,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -249,6 +261,11 @@ export default function SessionsTab({ planeStateRef }: Props) {
         helper.accessor('pid', {
           header: i18nT('pages.sessionsTab.pid'),
           enableGrouping: false,
+          // A pid is an identifier, not a quantity: the default numeric roll-up
+          // added four pids into one impossible number on every group row. A
+          // group spans several runtimes, so it HAS no single pid -- the honest
+          // aggregate is none, and the cell falls through to its em-dash.
+          aggregationFn: () => null,
           size: 74,
           cell: c => {
             const v = c.getValue<number | null>()
@@ -297,7 +314,12 @@ export default function SessionsTab({ planeStateRef }: Props) {
     (m, s) => (s.rss_mb != null && (m == null || s.rss_mb > m) ? s.rss_mb : m),
     null,
   )
-  const procTotal = sessions.reduce((n, s) => n + (s.procs ?? 0), 0)
+  // Each runtime's process count ONCE. `procs` is the runtime's own total,
+  // reported whole on every co-tenant row, so a plain sum over rows multiplies a
+  // shared runtime by its tenant count -- three co-tenants of one 9-process
+  // runtime read as 27. Same rule as the `procs` column's group aggregate; this
+  // footer is a second reader of the same figure and needs the same key.
+  const procTotal = sumOncePerRuntime(sessions.map(s => [s.pid, s.procs] as const)) ?? 0
 
   // Finding 7a: surface the disabled reason via InfoTip, not just title
   const groupSegments: Array<Segment<GroupBy>> = [
@@ -327,7 +349,7 @@ export default function SessionsTab({ planeStateRef }: Props) {
       {isError && data && (
         <div
           data-testid="sessions-stale"
-          className="flex items-center gap-2 px-3.5 py-2 border-b border-border bg-warn-subtle text-[11.5px] text-warn"
+          className="flex items-center gap-2 px-3.5 py-2 border-b border-border bg-warn-subtle text-[11.5px] text-warn-text"
         >
           <TriangleAlert size={13} aria-hidden="true" className="lucide-inline shrink-0" />
           <span>{i18nT('pages.sessionsTab.could_not_refresh')}</span>
@@ -656,7 +678,17 @@ export default function SessionsTab({ planeStateRef }: Props) {
                                   </span>
                                 )
                               })()}
-                              {r.shared && !grouped && (
+                              {/* On a LEAF row the badge qualifies that row's own
+                                  rss/cpu as an attributed share. On a GROUP row it
+                                  says the fold contains a multiplexed runtime --
+                                  the group's own total is de-duplicated per pid, but
+                                  the member figures it rolls up are still shares, and
+                                  a group row's `original` is a synthetic placeholder
+                                  whose `shared` says nothing, so the answer comes
+                                  from the leaves. */}
+                              {(grouped
+                                ? row.getLeafRows().some(leaf => leaf.original.shared)
+                                : r.shared) && (
                                 <span className="shrink-0 ml-1.5 text-[10px] px-1.5 rounded border border-warn/40 text-warn">
                                   {i18nT('pages.sessionsTab.shared')}
                                 </span>
@@ -665,16 +697,26 @@ export default function SessionsTab({ planeStateRef }: Props) {
                             {/* A created row sitting under its creator needs no
                                 citation: its place in the tree is one, and the
                                 creator's expander names the relation. A created
-                                row that could not be nested (creator not running,
-                                a cycle) says who opened it here, as visible text
-                                and not a title: a keyboard or touch reader never
-                                sees a native tooltip, and this row has nothing
-                                else that says it. `nested` comes from buildTree,
-                                not from the row tree: under a fold a top-level
-                                row's parent row is a group row. */}
-                            {!grouped && creatorOf(r) != null && !r.nested && (
+                                row that could not be nested (nothing open above
+                                it, a cycle) says who opened it here, as visible
+                                text and not a title: a keyboard or touch reader
+                                never sees a native tooltip, and this row has
+                                nothing else that says it. `nested` comes from
+                                buildTree, not from the row tree: under a fold a
+                                top-level row's parent row is a group row.
+
+                                A row placed on an `ancestor` edge is the one
+                                nested row that still needs the line, and the
+                                reason is the rule above: its place in the tree
+                                is NOT its creator. It hangs from the nearest
+                                open ancestor, so the expander above it names a
+                                session that did not open it, and without this
+                                line nothing on screen says the creator closed. */}
+                            {!grouped && creatorOf(r) != null && (!r.nested || r.parent?.ancestor === true) && (
                               <span className="block whitespace-normal break-words leading-tight text-[10.5px] text-muted cursor-default">
-                                {i18nT('pages.sessionsTab.created_by', { name: creatorOf(r) })}
+                                {r.parent?.ancestor === true
+                                  ? i18nT('pages.sessionsTab.created_by_closed', { name: creatorOf(r) })
+                                  : i18nT('pages.sessionsTab.created_by', { name: creatorOf(r) })}
                               </span>
                             )}
                           </span>
@@ -729,12 +771,15 @@ export default function SessionsTab({ planeStateRef }: Props) {
             a label that names logs on disk, since the strip already counts
             sessions, task sessions and session procs; the hint names the cap
             itself, because it opens away from the value it explains. Shown
-            only when there is something to say. */}
+            only when there is something to say. The retention command sits
+            beside the stat as a SettingRef, not in the hint: a hint is a
+            tooltip, and a command a reader has to copy cannot live in one. */}
         {totals?.lineage_over_cap === true && (
           <FooterStat
             label={i18nT('pages.sessionsTab.footer_lineage_over_cap')}
             value={`${fmtNumber(totals.lineage_cap)}+`}
             hint={i18nT('pages.sessionsTab.footer_lineage_over_cap_hint', { cap: fmtNumber(totals.lineage_cap) })}
+            action={<SettingRef configKey="session.archive_retention_days" valuePlaceholder="7" />}
           />
         )}
       </div>
@@ -761,12 +806,15 @@ function FooterStat({
   value,
   warn,
   hint,
+  action,
 }: {
   label: string
   value: string
   warn?: boolean
   /** The page's "?" hint (the column-header pattern), for a stat a reader cannot act on from its label alone. */
   hint?: string
+  /** An interactive affordance for the stat, rendered after the value; never inside the hint's tooltip. */
+  action?: ReactNode
 }) {
   // An inline-flex row: the hint's button is a flex box of its own, and inline
   // text beside a block would break the stat over two lines.
@@ -779,6 +827,7 @@ function FooterStat({
       <span className={`font-mono tabular-nums text-[12px] font-medium ${warn ? 'text-warn' : 'text-text-strong'}`}>
         {value}
       </span>
+      {action}
     </span>
   )
 }

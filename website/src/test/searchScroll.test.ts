@@ -7,6 +7,7 @@ import {
   pollRowSettled,
   glideOnceStep,
   attachUserScrollIntent,
+  pointerOnScrollbar,
 } from '../utils/searchScroll'
 import { applySearchHighlights, clearSearchHighlights, getCurrentSearchRange } from '../utils/domHighlight'
 import { installHighlightApiStub } from './highlightApiStub'
@@ -495,9 +496,9 @@ describe('attachUserScrollIntent', () => {
     // the bottom is an ordinary streaming input and must not read as upward.
     const { el, onUser, detach } = harness()
     el.dispatchEvent(new WheelEvent('wheel', { deltaY: -40 }))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 40)
     el.dispatchEvent(new WheelEvent('wheel', { deltaY: 40 }))
-    expect(onUser).toHaveBeenLastCalledWith('down')
+    expect(onUser).toHaveBeenLastCalledWith('down', 40)
     el.dispatchEvent(new WheelEvent('wheel', { deltaY: 0 }))
     expect(onUser).toHaveBeenLastCalledWith(undefined)
     detach()
@@ -517,11 +518,51 @@ describe('attachUserScrollIntent', () => {
     detach()
   })
 
-  it('a scrollbar grab is directionless', () => {
+  it('a pointer with no scrollbar geometry is directionless', () => {
     const { el, onUser, detach } = harness()
     el.dispatchEvent(new Event('pointerdown'))
     expect(onUser).toHaveBeenLastCalledWith()
     detach()
+  })
+
+  describe('a pointer on the scrollbar band is a grab', () => {
+    // `clientWidth` excludes the scrollbar; the box includes it. The band
+    // between the two is the only place a pointerdown means "a scroll is about
+    // to happen": the drag names no direction until its first scroll event, so
+    // the follow guard holds for it. A pointer anywhere else -- on a message,
+    // selecting text -- moves nothing and stays directionless.
+    function scroller(rtl = false) {
+      const { el, onUser, detach } = harness()
+      Object.defineProperty(el, 'clientWidth', { configurable: true, get: () => 385 })
+      el.getBoundingClientRect = (() => ({ top: 0, left: 0, right: 400, bottom: 600, width: 400, height: 600, x: 0, y: 0, toJSON: () => ({}) })) as unknown as typeof el.getBoundingClientRect
+      if (rtl) el.style.direction = 'rtl'
+      return { el, onUser, detach }
+    }
+    it('reports `grab` for a pointer inside the band (LTR: the right edge)', () => {
+      const { el, onUser, detach } = scroller()
+      el.dispatchEvent(new MouseEvent('pointerdown', { clientX: 392 }))
+      expect(onUser).toHaveBeenLastCalledWith('grab')
+      detach()
+    })
+    it('a pointer on the content is not a grab', () => {
+      const { el, onUser, detach } = scroller()
+      el.dispatchEvent(new MouseEvent('pointerdown', { clientX: 120 }))
+      expect(onUser).toHaveBeenLastCalledWith()
+      el.dispatchEvent(new MouseEvent('pointerdown', { clientX: 384 }))
+      expect(onUser).toHaveBeenLastCalledWith()
+      detach()
+    })
+    it('an overlay scrollbar (no band) never reports a grab', () => {
+      const { el, onUser, detach } = harness()
+      Object.defineProperty(el, 'clientWidth', { configurable: true, get: () => 400 })
+      el.getBoundingClientRect = (() => ({ top: 0, left: 0, right: 400, bottom: 600, width: 400, height: 600, x: 0, y: 0, toJSON: () => ({}) })) as unknown as typeof el.getBoundingClientRect
+      el.dispatchEvent(new MouseEvent('pointerdown', { clientX: 399 }))
+      expect(onUser).toHaveBeenLastCalledWith()
+      detach()
+    })
+    it('pointerOnScrollbar answers false for a target that is not an element', () => {
+      expect(pointerOnScrollbar(window, { clientX: 5 })).toBe(false)
+    })
   })
 
   it('derives touch direction from the finger path, anchored on touchstart', () => {
@@ -534,9 +575,9 @@ describe('attachUserScrollIntent', () => {
     el.dispatchEvent(touchAt('touchstart', 300))
     // Finger moving DOWN the screen scrolls the content UP.
     el.dispatchEvent(touchAt('touchmove', 340))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 40)
     el.dispatchEvent(touchAt('touchmove', 310))
-    expect(onUser).toHaveBeenLastCalledWith('down')
+    expect(onUser).toHaveBeenLastCalledWith('down', 30)
     detach()
   })
 
@@ -573,12 +614,12 @@ describe('attachUserScrollIntent', () => {
     el.dispatchEvent(touchAt('touchstart', 700))
     el.dispatchEvent(touchAt('touchmove', 600))
     el.dispatchEvent(touchAt('touchmove', 500))
-    expect(onUser).toHaveBeenLastCalledWith('down')
+    expect(onUser).toHaveBeenLastCalledWith('down', 100)
     el.dispatchEvent(touchAt('touchend'))
     // Gesture 2 starts far from where gesture 1 ended, and goes the other way.
     el.dispatchEvent(touchAt('touchstart', 200))
     el.dispatchEvent(touchAt('touchmove', 260))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 60)
     detach()
   })
 
@@ -594,16 +635,16 @@ describe('attachUserScrollIntent', () => {
     const { el, onUser, detach } = harness()
     el.dispatchEvent(ev('touchstart', [200]))
     el.dispatchEvent(ev('touchmove', [260]))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 60)
     // Second finger lands far up the screen: the baseline must not move to it.
     el.dispatchEvent(ev('touchstart', [260, 50]))
     el.dispatchEvent(ev('touchmove', [320, 110]))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 60)
     // One finger lifts, one remains: still the same gesture, and the survivor
     // is the finger the baseline was already tracking, so its path continues.
     el.dispatchEvent(ev('touchend', [320]))
     el.dispatchEvent(ev('touchmove', [380]))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 60)
     detach()
   })
 
@@ -623,14 +664,14 @@ describe('attachUserScrollIntent', () => {
     const { el, onUser, detach } = harness()
     el.dispatchEvent(ev('touchstart', [500]))
     el.dispatchEvent(ev('touchmove', [560]))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 60)
     // Second finger lands high up the screen; the baseline stays on finger 0.
     el.dispatchEvent(ev('touchstart', [560, 120]))
     // Finger 0 lifts. Finger 1, at 120, becomes touches[0].
     el.dispatchEvent(ev('touchend', [120]))
     // Finger 1 drags DOWN the glass, which scrolls up into older history.
     el.dispatchEvent(ev('touchmove', [180]))
-    expect(onUser).toHaveBeenLastCalledWith('up')
+    expect(onUser).toHaveBeenLastCalledWith('up', 60)
     detach()
   })
 

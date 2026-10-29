@@ -5,7 +5,13 @@ import { StatCard, Card } from '../components/ui'
 import ErrorNotice from '../components/ErrorNotice'
 
 import { i18nT } from '../i18n/t'
-type Backend = { server: string; agent: string; pid: number | null; sessions: number; idle_s: number; rss_kb: number }
+// `stubs` is optional for the same reason `sharers` is on the sessions payload: a
+// dashboard served from a build newer than the gateway it talks to reads the
+// field the gateway does not send yet, and `undefined` in arithmetic renders NaN
+// across the card. Absent reads as zero for one release.
+// No `agent` field: the agent is not a pool dimension, so a row describes a
+// process one or several agents share and the gateway stopped sending one.
+type Backend = { server: string; pid: number | null; stubs?: number; idle_s: number; rss_kb: number }
 type Metrics = {
   running: boolean; size?: number; max_backends?: number; backends: Backend[]
   // Present only when prewarming is enabled (gatewayd folds in the warm-pool
@@ -78,9 +84,12 @@ export default function McpGatewayCard() {
   }
 
   const backends = metricsQ.data?.backends ?? []
-  const sessions = backends.reduce((n, b) => n + b.sessions, 0)
+  // Attached stub CONNECTIONS, not sessions: one agent runtime opens one stub
+  // per MCP server however many sessions it hosts, so this is a lower bound on
+  // the sessions being served — and so is the unpooled estimate built from it.
+  const stubs = backends.reduce((n, b) => n + (b.stubs ?? 0), 0)
   const poolKb = backends.reduce((n, b) => n + Math.max(0, b.rss_kb), 0)
-  const unpooledKb = backends.reduce((n, b) => n + Math.max(0, b.rss_kb) * Math.max(1, b.sessions), 0)
+  const unpooledKb = backends.reduce((n, b) => n + Math.max(0, b.rss_kb) * Math.max(1, b.stubs ?? 0), 0)
   const savedKb = Math.max(0, unpooledKb - poolKb)
   const savedPct = unpooledKb > 0 ? Math.round((savedKb / unpooledKb) * 100) : 0
   const withPct = unpooledKb > 0 ? Math.max(4, Math.round((poolKb / unpooledKb) * 100)) : 0
@@ -115,7 +124,7 @@ export default function McpGatewayCard() {
 
       <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(130px,1fr))] mb-4">
         <StatCard label={i18nT('pages.mcpGatewayCard.backends')} value={`${backends.length}${metricsQ.data?.max_backends ? ` / ${metricsQ.data.max_backends}` : ''}`} />
-        <StatCard label={i18nT('pages.mcpGatewayCard.active_sessions')} value={sessions} />
+        <StatCard label={i18nT('pages.sessionsTab.mcp_stubs')} value={stubs} />
         <StatCard label={i18nT('pages.mcpGatewayCard.pool_ram')} value={formatKb(poolKb)} />
         <StatCard label={i18nT('pages.mcpGatewayCard.ram_saved')} value={`${formatKb(savedKb)} (${savedPct}%)`} accent />
         {warmEnabled && (
@@ -142,7 +151,7 @@ export default function McpGatewayCard() {
             <tr className="text-muted text-left">
               <th className="font-normal py-1 pr-3">{i18nT('pages.mcpGatewayCard.server')}</th>
               <th className="font-normal py-1 pr-3">{i18nT('pages.mcpGatewayCard.pid')}</th>
-              <th className="font-normal py-1 pr-3">{i18nT('pages.mcpGatewayCard.sessions')}</th>
+              <th className="font-normal py-1 pr-3">{i18nT('pages.sessionsTab.mcp_stubs')}</th>
               <th className="font-normal py-1 pr-3">{i18nT('pages.mcpGatewayCard.idle')}</th>
               <th className="font-normal py-1">{i18nT('pages.mcpGatewayCard.rss')}</th>
             </tr>
@@ -152,7 +161,7 @@ export default function McpGatewayCard() {
               <tr key={backendRowKey(b, i)} className="border-t border-border">
                 <td className="py-1 pr-3">{b.server}</td>
                 <td className="py-1 pr-3">{b.pid ?? '—'}</td>
-                <td className="py-1 pr-3">{b.sessions}</td>
+                <td className="py-1 pr-3">{b.stubs ?? '—'}</td>
                 <td className="py-1 pr-3">{b.idle_s}{i18nT('pages.mcpGatewayCard.s')}</td>
                 <td className="py-1">{formatKb(b.rss_kb)}</td>
               </tr>

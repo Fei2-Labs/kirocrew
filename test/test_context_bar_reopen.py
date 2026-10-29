@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
+from windows_sim import read_text_sharing_violation
 
 from kiro_crew.acp.types import AcpPromptStats
 from kiro_crew.dashboard.state import DashboardState
@@ -141,6 +142,7 @@ async def test_snapshot_survives_a_gateway_restart(tmp_path):
     # reads back. A state that has never touched the map must load it from disk
     # rather than starting empty.
     before = _make_state(tmp_path)
+    before.open_slots_restored = True
     slot = before.get_or_create_slot("s1")
     slot.model = "claude-opus-5"
     before.broadcast_ws = MagicMock()
@@ -300,6 +302,7 @@ def test_repeating_the_same_reading_leaves_nothing_to_flush(tmp_path, monkeypatc
     # has no write to do. Asserted on the writer itself rather than on file
     # mtime, which is a proxy a coarse filesystem clock can satisfy vacuously.
     state = _make_state(tmp_path)
+    state.open_slots_restored = True
     slot = state.get_or_create_slot("s1")
     slot.model = "claude-opus-5"
     state.broadcast_ws = MagicMock()
@@ -336,6 +339,7 @@ def test_deleted_slots_are_evicted_from_the_file(tmp_path):
     # The map must stay bounded by the open-slot set: a deleted session cannot
     # leave its usage behind to be served to whatever reuses its key.
     state = _make_state(tmp_path)
+    state.open_slots_restored = True
     for name in ("s1", "s2"):
         state.get_or_create_slot(name).model = "claude-opus-5"
     state.broadcast_ws = MagicMock()
@@ -360,6 +364,7 @@ def test_failed_write_is_retried_on_the_next_flush(tmp_path, monkeypatch):
     # the reading's claim on persistence — the next flush must retry it, and
     # the failure must not escape (a raising flush callee kills the loop).
     state = _make_state(tmp_path)
+    state.open_slots_restored = True
     state.get_or_create_slot("s1").model = "claude-opus-5"
     state.broadcast_ws = MagicMock()
     state.broadcast_context_usage("s1", {"slot": "s1", "pct": 11.4})
@@ -388,6 +393,7 @@ def test_flush_preserves_prior_process_readings_it_has_not_served_yet(tmp_path):
         json.dumps({"s2": {"pct": 33.0, "model": "claude-opus-5"}})
     )
     state = _make_state(tmp_path)
+    state.open_slots_restored = True
     for name in ("s1", "s2"):
         state.get_or_create_slot(name).model = "claude-opus-5"
     state.broadcast_ws = MagicMock()
@@ -410,6 +416,7 @@ def test_overlapping_flushes_cannot_roll_the_file_back(tmp_path, monkeypatch):
     from kiro_crew.dashboard.state import atomic_write as real_write
 
     state = _make_state(tmp_path)
+    state.open_slots_restored = True
     state.get_or_create_slot("s1").model = "claude-opus-5"
     state.broadcast_ws = MagicMock()
     state.broadcast_context_usage("s1", {"slot": "s1", "pct": 10.0})
@@ -444,7 +451,7 @@ def test_overlapping_flushes_cannot_roll_the_file_back(tmp_path, monkeypatch):
     # then buries once released.
     deadline = time.monotonic() + 1.0
     while not completed_payloads and time.monotonic() < deadline:
-        time.sleep(0.01)
+        time.sleep(0.01)  # flake-ok: absence window; a completed payload is the failure signal
 
     release_first_write.set()
     flush_a.join(5)
@@ -482,11 +489,79 @@ def test_flush_during_startup_restore_cannot_evict_unrestored_tabs(tmp_path):
     # completes (s2 now present) writes the new reading without evicting s2.
     state.get_or_create_slot("s2").model = "claude-opus-5"
     state.restoring_open_slots = False
+    state.open_slots_restored = True  # restore has completed this boot
     _flush(state)
 
     on_disk = json.loads((tmp_path / "context_snapshots.json").read_text())
     assert on_disk["s1"]["pct"] == 12.0
     assert on_disk["s2"] == {"pct": 22.0, "model": "claude-opus-5"}
+
+
+def test_unreadable_snapshot_file_is_not_replaced_after_restore(tmp_path):
+    # After restore the write prunes to the open tabs, but an open tab with no
+    # fresh reading in this process still has its reading only on disk. A
+    # transient read failure (a Windows sharing violation) must not be latched
+    # as an empty, loaded map: the next write would then drop that reading.
+    # The write is skipped and the next flush retries the read.
+    snap_path = tmp_path / "context_snapshots.json"
+    snap_path.write_text(json.dumps({"s2": {"pct": 33.0, "model": "claude-opus-5"}}))
+    before = snap_path.read_bytes()
+    state = _make_state(tmp_path)
+    state.open_slots_restored = True
+    for name in ("s1", "s2"):
+        state.get_or_create_slot(name).model = "claude-opus-5"
+    state.broadcast_ws = MagicMock()
+    state.broadcast_context_usage("s1", {"slot": "s1", "pct": 11.4})
+
+    with read_text_sharing_violation(match="context_snapshots.json", times=1) as seen:
+        _flush(state)  # must swallow, not raise
+
+    assert seen["n"] == 1, "the simulator never intercepted the snapshot read"
+    assert snap_path.read_bytes() == before, "a failed read let the write drop s2"
+
+    _flush(state)
+
+    on_disk = json.loads(snap_path.read_text())
+    assert on_disk["s2"] == {"pct": 33.0, "model": "claude-opus-5"}
+    assert on_disk["s1"]["pct"] == 11.4
+
+
+@pytest.mark.asyncio
+async def test_slot_detail_retries_a_transiently_unreadable_snapshot_file(tmp_path):
+    # The first disk read can also come from the slot-detail handler. A
+    # transient failure there must not latch an empty map for the process
+    # lifetime: the next request reads the file and shows the reading.
+    (tmp_path / "context_snapshots.json").write_text(
+        json.dumps({"s1": {"pct": 31.5, "model": "claude-opus-5"}})
+    )
+    state = _make_state(tmp_path)
+    state.get_or_create_slot("s1").model = "claude-opus-5"
+    state.sessions.get_provider = MagicMock(return_value=None)
+
+    with read_text_sharing_violation(match="context_snapshots.json", times=1):
+        first = await _detail(state, "s1")
+    second = await _detail(state, "s1")
+
+    assert "context_pct" not in first
+    assert second["context_pct"] == 31.5
+    assert second["context_stale"] is True
+
+
+def test_corrupt_snapshot_file_is_repaired_not_retried_forever(tmp_path):
+    # Content that was read but does not parse holds nothing recoverable. It
+    # is treated as empty and latched, so the write repairs the file instead
+    # of skipping on every flush (a permanent off-switch).
+    snap_path = tmp_path / "context_snapshots.json"
+    snap_path.write_text('{"s2": {"pct": 3')  # truncated
+    state = _make_state(tmp_path)
+    state.get_or_create_slot("s1").model = "claude-opus-5"
+    state.broadcast_ws = MagicMock()
+    state.broadcast_context_usage("s1", {"slot": "s1", "pct": 11.4})
+
+    _flush(state)
+
+    on_disk = json.loads(snap_path.read_text())
+    assert on_disk["s1"]["pct"] == 11.4
 
 
 def test_frame_without_a_usable_pct_is_not_recorded(tmp_path):

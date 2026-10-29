@@ -16,7 +16,7 @@
  * Mock setup mirrors ChatSidebar.offline.test.tsx: the chat slice's switchSlot
  * thunk is mocked so we can assert whether a click reached the row handler.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, createEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -142,10 +142,23 @@ const clickChip = (el: HTMLElement, init?: MouseEventInit): boolean => {
 /** The consumer took the link (the normal case). */
 const took = () => vi.fn(() => true)
 
+// Each describe below owns its stored state, so it passes alone and in any order.
+// The fixture rows carry fixed old timestamps, so every block turns the stale-session
+// collapse off itself; otherwise every row but the active one folds behind the dormant
+// expander and its chips never render. Clearing storage before the seed is what
+// isolates a block; the clear after each test is a backstop so nothing lingers.
+
 describe('ChatSidebar – PR chip', () => {
   beforeEach(() => {
     switchSlotMock.mockClear()
+    localStorage.clear()
+    sessionStorage.clear()
     localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
   })
 
   it('is still an anchor carrying the provider url', () => {
@@ -200,6 +213,41 @@ describe('ChatSidebar – PR chip', () => {
     expect(switchSlotMock).toHaveBeenCalledTimes(1)
   })
 
+  it('releases focus on a pointer click so the row action strip can hide', () => {
+    // The action strip reveals on `:focus-visible` inside the row; a chip left
+    // focused after a click must not be able to keep it showing.
+    renderSidebar({ onOpenSource: took() })
+    const a = chip()
+    a.focus()
+    expect(a).toHaveFocus()
+    clickChip(a, { detail: 1 })
+    expect(a).not.toHaveFocus()
+  })
+
+  it('the row action strip reveals on hover and keyboard focus, not after a click', () => {
+    // A click focuses the row's own button; a `focus-within` reveal pinned the
+    // strip open once the pointer left. `:focus-visible` keeps it for keyboard.
+    renderSidebar()
+    const bar = screen.getAllByRole('button', { name: 'More options' })
+      .map(b => b.parentElement as HTMLElement)
+      .find(p => p.className.includes('right-1.5')) as HTMLElement
+    expect(bar.className).toContain('opacity-0')
+    expect(bar.className).toContain('group-hover:opacity-100')
+    expect(bar.className).toContain('group-focus-visible:opacity-100')
+    expect(bar.className).toContain('group-has-[:focus-visible]:opacity-100')
+    expect(bar.className).toContain('has-[[data-state=open]]:opacity-100')
+    expect(bar.className).not.toContain('focus-within')
+  })
+
+  it('keeps focus on the chip when it is activated from the keyboard', () => {
+    // Enter on a focused anchor dispatches a click with detail 0.
+    renderSidebar({ onOpenSource: took() })
+    const a = chip()
+    a.focus()
+    clickChip(a, { detail: 0 })
+    expect(a).toHaveFocus()
+  })
+
   it('lets a modifier click through to the provider in a new tab', () => {
     const onOpenSource = took()
     renderSidebar({ onOpenSource })
@@ -252,6 +300,17 @@ describe('ChatSidebar – PR chip', () => {
  * control live in one table.
  */
 describe('ChatSidebar – terminal PR chips suppress CI', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+  })
+
   const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
 
   function stateRows(): ChatSlot[] {
@@ -362,6 +421,17 @@ describe('ChatSidebar – terminal PR chips suppress CI', () => {
  * worse outcome is the one worth showing.
  */
 describe('ChatSidebar – conflicted PR chips', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+  })
+
   const url = (n: number) => `https://github.com/kirodotdev/KiroCrew/pull/${n}`
 
   /** One chip carrying exactly the merge/CI combination under test. */
@@ -395,6 +465,25 @@ describe('ChatSidebar – conflicted PR chips', () => {
     renderSidebar({ rows: chipRows({ ci: 'failed', mergeable: 'conflicting', mergeStateStatus: 'dirty' }) })
     expect(glyph('Checks failed')).not.toBeNull()
     expect(glyph('Merge conflicts')).toBeNull()
+  })
+
+  it('keeps a failed chip visibly in flight while other checks still run', () => {
+    renderSidebar({ rows: chipRows({ ci: 'failed', ciPending: '1' }) })
+    const group = glyph('Checks failed; others still running')
+    expect(group).not.toBeNull()
+    // The group is icon-only, so its tooltip carries the same words.
+    expect(group!.getAttribute('title')).toBe(group!.getAttribute('aria-label'))
+    // The failure glyph plus the static pending dot — never a spinner, which
+    // on a session card reads as agent activity.
+    expect(group!.querySelectorAll('svg')).toHaveLength(2)
+    expect(group!.innerHTML).not.toMatch(/animate/)
+    expect(glyph('Checks failed')).toBeNull()
+  })
+
+  it('drops the in-flight dot once the failed run has finished', () => {
+    renderSidebar({ rows: chipRows({ ci: 'failed' }) })
+    expect(glyph('Checks failed')).not.toBeNull()
+    expect(glyph('Checks failed; others still running')).toBeNull()
   })
 
   it('outranks a pending rollup', () => {
@@ -439,6 +528,17 @@ describe('ChatSidebar – conflicted PR chips', () => {
 })
 
 describe('ChatSidebar – chip label and provider mark', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    localStorage.setItem('mc-session-stale-collapse-ms', '0')
+  })
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    vi.clearAllMocks()
+  })
+
   /** A payload naming a provider this build does not know.
    *
    *  Cast because `provider` is typed as the three the serializer produces
@@ -461,12 +561,49 @@ describe('ChatSidebar – chip label and provider mark', () => {
     // tanuki and GitLab's `!` numbering. Misattributing one vendor's work to
     // another is the one thing a wayfinding chip must not do.
     renderSidebar({ rows: foreignRows })
-    const el = chip('https://review.acme.internal/c/4821')
+    // No mark of its own, so the tooltip names the provider (here only its id is
+    // known) and the chip's own label, never a `#4821` the chip does not show.
+    const el = screen.getByTitle(`acme-review CR-4821: ${chipTitle('https://review.acme.internal/c/4821').replace(/^Open/, 'open')}`)
     expect(el.querySelector('[data-provider-mark="gitlab"]')).toBeNull()
     expect(el.querySelector('[data-provider-mark="github"]')).toBeNull()
     expect(el.querySelector('[data-testid="jira-provider-mark"]')).toBeNull()
+    expect(el.querySelector('[data-provider-mark="neutral"]')).not.toBeNull()
     expect(el).toHaveTextContent('CR-4821')
     expect(el).not.toHaveTextContent('!4821')
+  })
+
+  /** Bitbucket Server ships no logo: the first built-in drawn with the neutral
+   *  glyph. Its chip number reads like GitHub's, so nothing but the tooltip can
+   *  say which provider it is. */
+  const bitbucketUrl = 'https://bitbucket.example.test/projects/PROJ/repos/svc/pull-requests/42'
+  const bitbucketRows = [
+    {
+      key: 's1', title: 'Bitbucket review', messages: 1, running: false, mode: '', created: '', last_ts: '2026-01-01T00:00:00Z',
+      source_links: [
+        { provider: 'bitbucket_server', number: 42, label: '#42', url: bitbucketUrl, state: 'open', kind: 'change' },
+      ],
+      source_links_total: 1,
+    },
+  ] as unknown as ChatSlot[]
+
+  it('names a logo-less provider in the chip tooltip and draws the shared neutral mark', () => {
+    renderSidebar({ rows: bitbucketRows })
+    const el = screen.getByTitle(`Bitbucket Server PR #42: ${chipTitle(bitbucketUrl).replace(/^Open/, 'open')}`)
+    expect(el).toHaveTextContent('#42')
+    // The same neutral glyph the Changes panel tab draws for this provider
+    // (PullRequestPanel.test.tsx), so the chip and its tab read as one item.
+    const mark = el.querySelector('[data-provider-mark="neutral"]')
+    expect(mark).not.toBeNull()
+    expect(mark!.getAttribute('class')).toContain('lucide-link-2')
+    expect(mark!.getAttribute('width')).toBe('10')
+  })
+
+  it('leaves the tooltip of a chip that wears its provider logo as it was', () => {
+    renderSidebar()
+    // `chip()` finds the GitHub chip by the plain tooltip: a provider named by
+    // its logo is not named again in words.
+    expect(chip().querySelector('[data-provider-mark="github"]')).not.toBeNull()
+    expect(chip().getAttribute('title')).not.toMatch(/^GitHub/)
   })
 
   it('keeps each known provider on its own mark', () => {

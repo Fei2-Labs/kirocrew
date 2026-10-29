@@ -390,7 +390,7 @@ class _Sessions:
     def is_busy(self, key) -> bool:
         return False
 
-    async def get_or_create(self, key, *, agent=None, channel_id=None):
+    async def get_or_create(self, key, *, agent=None, channel_id=None, start_priority=None):
         return SimpleNamespace(supports_steer=False), False, False
 
     async def set_channel(self, key, channel_id) -> None:
@@ -636,9 +636,16 @@ class TestCardActionRouting:
         seen: list[TeamsInbound] = []
         minted: list[str] = []
 
-        async def _record(inbound, *, interpret_commands: bool = True, drain: bool = True) -> None:
+        async def _record(
+            inbound,
+            *,
+            interpret_commands: bool = True,
+            drain: bool = True,
+            option_session_key: str | None = None,
+        ) -> None:
             seen.append(inbound)
             assert interpret_commands is False, "a chip must reach the model as text"
+            assert option_session_key == session_key, "the label turn names its posting session"
 
         async def _explode(inbound, arg) -> None:  # pragma: no cover - must not run
             minted.append(arg)

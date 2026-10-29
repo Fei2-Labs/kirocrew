@@ -99,15 +99,25 @@ class InProcessEmbedder:
         TTL so we don't probe every call; positives are re-validated after
         the TTL too (a broken backend must not report available forever).
         """
-        if self._available is not None and (time.time() - self._last_check) < NEGATIVE_CACHE_TTL:
-            return self._available
+        cached = self._fresh_cached_availability()
+        if cached is not None:
+            return cached
         embedder = self._get_embedder()
+        can_load = getattr(embedder, "can_load_on_demand", None)
         if embedder.is_ready():
+            self._available = True
+        elif callable(can_load) and can_load():
+            # Not in memory, but an embed will load it. Reported available so a
+            # search gets semantic results (its embed waits for the load once)
+            # rather than a keyword-only answer. No load is started here: status
+            # and listing pages ask this too, and must not pull in ~1 GB.
             self._available = True
         else:
             # Non-blocking probe: kicks a background load if the model file
             # just landed; returns None (→ unavailable) until the load finishes.
-            vec = embedder.embed("_availability_probe")
+            # Bulk class so it never waits for the load (only interactive
+            # embeds do).
+            vec = embedder.embed("_availability_probe", priority=_embeddings.PRIORITY_BULK)
             self._available = vec is not None
         self._last_check = time.time()
         if not self._available:
@@ -130,6 +140,18 @@ class InProcessEmbedder:
         self._last_check = time.time()
         return self._available
 
+    async def model_resident_async(self) -> bool:
+        """True only when the model is in memory now. Never starts a load.
+
+        For bulk corpus work (the watcher's self-heal re-embed). Its embeds use
+        the bulk class, which never waits for a load, so a sweep started while
+        the model is only loadable would fail every row. It must not start a
+        load either: the watcher asks on every pass, so a load here would bring
+        back an idle-unloaded model within one watcher interval. The sweep runs
+        on a later pass once a search or memory write has loaded the model.
+        """
+        return self._get_embedder().is_ready()
+
     async def is_available_async(self) -> bool:
         """Loop-safe :meth:`is_available` — runs the probe off-loop.
 
@@ -140,9 +162,36 @@ class InProcessEmbedder:
         embed still burns CPU — keep it on the ``mc-embed`` bulkhead pool.
         """
         # Fast path: cached result within TTL needs no thread hop.
-        if self._available is not None and (time.time() - self._last_check) < NEGATIVE_CACHE_TTL:
-            return self._available
+        cached = self._fresh_cached_availability()
+        if cached is not None:
+            return cached
         return await run_in_embed_pool(self.is_available)
+
+    def _fresh_cached_availability(self) -> bool | None:
+        """The cached verdict while it is inside the TTL, else ``None``.
+
+        A cached ``False`` is checked against the backend's non-blocking
+        ``is_ready()`` first, so a model that finishes loading inside the TTL
+        is used at once instead of after the TTL runs out.
+        """
+        if self._available is None or (time.time() - self._last_check) >= NEGATIVE_CACHE_TTL:
+            return None
+        if not self._available and self._get_embedder().is_ready():
+            self._available = True
+            self._last_check = time.time()
+        return self._available
+
+    def prefetch(self) -> None:
+        """Let the shared model start loading before this search's embed. Never blocks.
+
+        Only a hint to the backend (see ``EmbeddingBackend.prefetch``): no result
+        changes, and any error is swallowed because the embed that follows makes
+        the same attempt and reports it the usual way.
+        """
+        try:
+            self._get_embedder().prefetch()
+        except Exception:  # noqa: BLE001
+            logger.debug("embedding prefetch failed", exc_info=True)
 
     def embed(self, text: str, *, priority: int = PRIORITY_NORMAL) -> list[float] | None:
         """Embed a single text. Returns float list or None on failure.
@@ -231,9 +280,7 @@ def bytes_to_floats(data: bytes) -> list[float]:
     else:
         if isinstance(parsed, list):
             try:
-                if all(
-                    isinstance(x, (int, float)) and not isinstance(x, bool) for x in parsed
-                ):
+                if all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in parsed):
                     return [float(x) for x in parsed]
             except (ValueError, OverflowError):
                 pass
@@ -249,9 +296,7 @@ def bytes_to_floats(data: bytes) -> list[float]:
     return []
 
 
-def embed_signature(
-    model: str, dim: int, content_budget: int = _EMBED_CONTENT_BUDGET
-) -> str:
+def embed_signature(model: str, dim: int, content_budget: int = _EMBED_CONTENT_BUDGET) -> str:
     """Signature over the embedding inputs a re-embed can actually change.
 
     Built ON TOP of :func:`~kiro_crew.embeddings.embedding_space_signature`
@@ -341,7 +386,10 @@ def create_embedder_from_config(config: dict) -> InProcessEmbedder:
     # fall back to the module defaults unless the config supplies a *positive*
     # number (missing key, 0 sentinel, negative, or non-numeric all resolve to
     # the built-in default).
-    knowledge_cfg = config.get("knowledge", {}) or {}
+    knowledge_cfg = config.get("knowledge") if isinstance(config, dict) else None
+    if not isinstance(knowledge_cfg, dict):
+        # A hand-edited non-object section is a state the loader degrades too.
+        knowledge_cfg = {}
     timeout_secs = _positive_or(knowledge_cfg.get("embed_timeout_secs"), TIMEOUT)
     content_budget = int(
         _positive_or(knowledge_cfg.get("embed_content_budget"), _EMBED_CONTENT_BUDGET)

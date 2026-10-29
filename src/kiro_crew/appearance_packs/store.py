@@ -28,12 +28,16 @@ import json
 import logging
 import os
 import shutil
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from kiro_crew.appearance_packs.ids import DEFAULT_PACK, safe_pack_id
 from kiro_crew.appearance_packs.sounds import SOUND_STATES, SOUND_SUFFIXES, sound_body
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.constants import WINDOWS_DEVICE_STEMS
 from kiro_crew.platform_compat import chmod_safe, is_link_or_junction
 
@@ -77,6 +81,22 @@ class PackMeta:
             "format": self.format,
             "recoloured": self.recoloured,
         }
+
+
+def _new_transaction() -> str:
+    """A per-save id whose LEXICAL order matches creation order.
+
+    Staging and ``.old.`` backup paths carry this so concurrent saves (Crew
+    Companion runs each through ``asyncio.to_thread``) never share a directory.
+    Recovery must be able to pick the newest of several stranded backups, and
+    filesystem mtimes are unreliable for that — 1–2s granularity ties, and a
+    failed ``stat()`` leaves the order undefined. Leading with a zero-padded
+    ``time.time_ns()`` makes the NAME itself sortable, so recovery orders by
+    filename and never depends on the filesystem's timestamp resolution. The
+    pid + uuid tail keeps it unique across threads and processes even when two
+    saves land in the same nanosecond.
+    """
+    return f"{time.time_ns():020d}-{os.getpid()}-{uuid.uuid4().hex}"
 
 
 def _is_windows_reserved(name: str) -> bool:
@@ -124,6 +144,10 @@ class AppearanceStore:
         self._root = Path(data_dir) / PACKS_DIRNAME
         #: id -> colour map, for packs the user has recoloured.
         self._colour_maps: dict[str, dict[str, str]] = {}
+        # Route writes run through ``asyncio.to_thread`` and can overlap. Keep
+        # each in-memory mutation, disk publish and possible rollback as one
+        # transaction so a failed older request cannot undo a newer success.
+        self._colour_lock = threading.RLock()
         #: The filename is a persisted artefact of the library it sits in, so it
         #: keeps its name: renaming it would leave every already-recoloured pack
         #: reading as un-recoloured, silently losing the user's colour choices.
@@ -142,14 +166,15 @@ class AppearanceStore:
             if self._colour_path.exists():
                 raw = json.loads(self._colour_path.read_text("utf-8"))
                 if isinstance(raw, dict):
-                    self._colour_maps = {k: v for k, v in raw.items() if isinstance(v, dict)}
+                    with self._colour_lock:
+                        self._colour_maps = {k: v for k, v in raw.items() if isinstance(v, dict)}
         except (OSError, ValueError) as exc:
             # A corrupt colour file costs the user their recolouring, not their art,
             # so carrying on with defaults beats refusing to start.
             logger.warning("appearance-packs: colour maps unreadable: %s", exc)
 
     def _recover_orphaned_backups(self) -> None:
-        """Restore a pack stranded as ``<name>.old.<pid>`` by an interrupted save.
+        """Restore a pack stranded as ``<name>.old.<transaction>`` by an interrupted save.
 
         The overwrite is two renames: target -> backup, then staging -> target.
         A gateway termination BETWEEN them leaves the pack existing only as the
@@ -158,26 +183,59 @@ class AppearanceStore:
         the pack as gone. Backup-with-target-present is the opposite case (died
         after the second rename, before cleanup): the new pack won, the backup
         is leftover garbage.
+
+        Because each save's backup carries a per-transaction suffix, more than
+        one ``<name>.old.*`` backup can survive for the same pack (a save whose
+        publish crashed leaves its backup behind, and a later save cannot see
+        it to collapse it). Recovery must therefore be deterministic: for each
+        pack it keeps the NEWEST backup — the last revision moved aside is the
+        one closest to the user's latest intent — and deletes the older ones,
+        so it can never restore a stale revision over a newer committed pack.
         """
         try:
             entries = list(self._root.iterdir())
         except OSError:
             return
+        # Group backups by the pack they belong to so a pack with several
+        # accumulated backups resolves to exactly one restore decision.
+        backups: dict[str, list[Path]] = {}
         for entry in entries:
-            name = entry.name
-            head, sep, _pid = name.rpartition(".old.")
+            head, sep, _txn = entry.name.rpartition(".old.")
             if not sep or _safe_id(head) is None or not entry.is_dir():
                 continue
+            backups.setdefault(head, []).append(entry)
+        for head, group in backups.items():
             target = self._root / head
+            # The transaction suffix leads with a zero-padded ``time.time_ns()``,
+            # so the filename itself sorts by creation order — newest last. This
+            # is deterministic and needs no ``stat()``, unlike an mtime sort that
+            # ties on coarse-granularity filesystems and loses all order when a
+            # ``stat()`` fails.
+            group.sort(key=lambda p: p.name)
+            keep: Path | None = group[-1]
+            stale = group[:-1]
             try:
                 if target.exists():
-                    shutil.rmtree(entry, ignore_errors=True)
-                    logger.info("appearance-packs: removed stale pack backup %s", name)
+                    # The new pack already won; every backup is leftover garbage.
+                    stale = group
+                    keep = None
                 else:
-                    os.replace(entry, target)
-                    logger.info("appearance-packs: restored pack %r from backup %s", head, name)
+                    os.replace(group[-1], target)
+                    logger.info(
+                        "appearance-packs: restored pack %r from backup %s", head, group[-1].name
+                    )
             except OSError as exc:
-                logger.warning("appearance-packs: backup recovery failed for %s: %s", name, exc)
+                logger.warning(
+                    "appearance-packs: backup recovery failed for %s: %s", group[-1].name, exc
+                )
+                # The restore did not land, so do not delete the backup we
+                # failed to promote; only the ones we were going to drop anyway.
+                stale = group[:-1]
+            for extra in stale:
+                if extra is keep:
+                    continue
+                shutil.rmtree(extra, ignore_errors=True)
+                logger.info("appearance-packs: removed stale pack backup %s", extra.name)
 
     # ── reads ───────────────────────────────────────────────────────────────
 
@@ -206,12 +264,17 @@ class AppearanceStore:
                 logger.warning("appearance-packs: skipping unreadable pack %s", entry.name)
         return packs
 
-    def pack_detail(self, pack_id: str) -> dict[str, Any] | None:
+    def pack_detail(self, pack_id: str, *, include_content: bool = True) -> dict[str, Any] | None:
         """A pack with its animation content inlined, ready to render.
 
         Content is returned inline rather than as URLs because a custom pack's files
         are user data outside the served tree; handing back paths would mean opening
         a file-serving route over that directory.
+
+        ``include_content=False`` is the same answer without any file's bytes: each
+        slot carries only its ``format`` and ``sourceImage`` is absent, so a client
+        can learn which player draws a slot without downloading the pack. The files
+        are still read, so it lists exactly the slots whose art loads.
         """
         ident = _safe_id(pack_id)
         if ident is None:
@@ -292,7 +355,13 @@ class AppearanceStore:
                     slot_fmt = "svg"
                 else:
                     slot_fmt = fmt
-                animations[slot] = {"content": content, "format": slot_fmt}
+                if include_content:
+                    animations[slot] = {"content": content, "format": slot_fmt}
+                elif content:
+                    # An empty file has no art. A client drops such a slot from a
+                    # full answer and falls back past it, so it is left out here,
+                    # where there is no content to show it is empty.
+                    animations[slot] = {"format": slot_fmt}
                 categories[category].append(slot)
                 if category == "random":
                     random_names.append(slot)
@@ -315,7 +384,7 @@ class AppearanceStore:
         # it through the slot map came back empty, which made the sprite editor
         # fall back to strips and an overwrite save silently DROP the sheet.
         source_name = sprite.get("source") if isinstance(sprite, dict) else None
-        if isinstance(source_name, str) and source_name:
+        if include_content and isinstance(source_name, str) and source_name:
             source = self._read_pack_file(pack_dir, source_name)
             if source is not None:
                 detail["sourceImage"] = source
@@ -346,7 +415,8 @@ class AppearanceStore:
         does next.
         """
         ident = _safe_id(pack_id)
-        return dict(self._colour_maps.get(ident or "", {}))
+        with self._colour_lock:
+            return dict(self._colour_maps.get(ident or "", {}))
 
     # ── writes ──────────────────────────────────────────────────────────────
 
@@ -360,19 +430,20 @@ class AppearanceStore:
         clean = {
             str(k): str(v) for k, v in colours.items() if isinstance(k, str) and isinstance(v, str)
         }
-        prev = self._colour_maps.get(ident)
-        self._colour_maps[ident] = clean
-        try:
-            self._save_colours()
-        except OSError:
-            # Roll back so memory matches disk — otherwise the UI shows the
-            # new colour until a restart silently reverts it. Re-raise so the
-            # route answers 503 instead of pretending the save landed.
-            if prev is None:
-                self._colour_maps.pop(ident, None)
-            else:
-                self._colour_maps[ident] = prev
-            raise
+        with self._colour_lock:
+            prev = self._colour_maps.get(ident)
+            self._colour_maps[ident] = clean
+            try:
+                self._save_colours()
+            except OSError:
+                # Roll back so memory matches disk — otherwise the UI shows the
+                # new colour until a restart silently reverts it. Re-raise so the
+                # route answers 503 instead of pretending the save landed.
+                if prev is None:
+                    self._colour_maps.pop(ident, None)
+                else:
+                    self._colour_maps[ident] = prev
+                raise
         return True
 
     def delete_pack(self, pack_id: str) -> bool:
@@ -403,14 +474,15 @@ class AppearanceStore:
         except OSError as exc:
             logger.warning("appearance-packs: pack delete failed: %s", exc)
             return False
-        self._colour_maps.pop(ident, None)
-        try:
-            self._save_colours()
-        except OSError as exc:
-            # The pack itself is already gone — a stale colour entry for a
-            # nonexistent pack is harmless and gets rewritten on the next
-            # successful save, so the delete still reports success.
-            logger.warning("appearance-packs: colour map write failed: %s", exc)
+        with self._colour_lock:
+            self._colour_maps.pop(ident, None)
+            try:
+                self._save_colours()
+            except OSError as exc:
+                # The pack itself is already gone — a stale colour entry for a
+                # nonexistent pack is harmless and gets rewritten on the next
+                # successful save, so the delete still reports success.
+                logger.warning("appearance-packs: colour map write failed: %s", exc)
         return True
 
     def save_pack(self, pack_id: str, manifest: Any, files: Any) -> bool:
@@ -463,7 +535,13 @@ class AppearanceStore:
                 manifest = {**manifest, "sounds": kept_states}
                 files = {**{n: c for n, c in kept_files.items() if n not in files}, **files}
 
-        staging = self._root / f".tmp-{ident}-{os.getpid()}"
+        # Crew Companion offloads each request independently, so two saves can
+        # run in this process at once.  A PID-only name makes them share one
+        # directory and can publish one request's manifest with the other's art.
+        # Give every save its own transaction paths; the ``.old.`` spelling is
+        # retained so startup recovery still recognizes interrupted overwrites.
+        transaction = _new_transaction()
+        staging = self._root / f".tmp-{ident}-{transaction}"
         target = self._root / ident
         # Serialize and size-check the manifest BEFORE creating staging or
         # touching the target. Every pack file below is capped at
@@ -529,7 +607,7 @@ class AppearanceStore:
             # trade worth the two extra lines this avoids.
             backup: Path | None = None
             if target.exists():
-                backup = target.with_name(f"{target.name}.old.{os.getpid()}")
+                backup = target.with_name(f"{target.name}.old.{transaction}")
                 if backup.exists():
                     shutil.rmtree(backup, ignore_errors=True)
                 os.replace(target, backup)
@@ -542,7 +620,8 @@ class AppearanceStore:
             if backup is not None:
                 shutil.rmtree(backup, ignore_errors=True)
             return True
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError covers content UTF-8 cannot encode (a lone surrogate).
             logger.warning("appearance-packs: pack save failed: %s", exc)
             try:
                 if staging.exists():
@@ -729,7 +808,7 @@ class AppearanceStore:
             description="The default companion.",
             type="builtin",
             format="svg",
-            recoloured=bool(self._colour_maps.get(DEFAULT_PACK)),
+            recoloured=bool(self.colour_map(DEFAULT_PACK)),
         )
 
     def _read_manifest(self, pack_dir: Path) -> dict[str, Any] | None:
@@ -771,7 +850,7 @@ class AppearanceStore:
             description=str(meta.get("description") or ""),
             type="custom",
             format=fmt if fmt in FORMATS else "svg",
-            recoloured=bool(self._colour_maps.get(ident)),
+            recoloured=bool(self.colour_map(ident)),
         )
 
     def _read_pack_file(self, pack_dir: Path, filename: Any) -> str | None:
@@ -809,14 +888,21 @@ class AppearanceStore:
         wrapper maps the raised OSError to 503 store_write_failed (same
         contract as the reminder store).
         """
-        tmp = self._colour_path.with_suffix(f".json.tmp.{os.getpid()}")
-        tmp.write_text(json.dumps(self._colour_maps, indent=2), "utf-8")
-        # chmod_safe, not os.chmod: docs/system-specs/common/platform-compat.md
-        # mandates the
-        # platform_compat shim, which is a no-op where POSIX modes mean
-        # nothing (Windows) instead of raising or silently misleading.
-        chmod_safe(tmp, 0o600)
-        os.replace(tmp, self._colour_path)
+        transaction = _new_transaction()
+        tmp = self._colour_path.with_suffix(f".json.tmp.{transaction}")
+        try:
+            tmp.write_text(json.dumps(self._colour_maps, indent=2), "utf-8")
+            # chmod_safe, not os.chmod: docs/system-specs/common/platform-compat.md
+            # mandates the platform_compat shim, which is a no-op where POSIX
+            # modes mean nothing (Windows) instead of raising or silently
+            # misleading.
+            chmod_safe(tmp, 0o600)
+            replace_with_retry(tmp, self._colour_path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _safe_filename(raw: Any) -> str | None:

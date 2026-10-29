@@ -21,6 +21,7 @@ import { useProvider } from '../providers'
 import { providerUsageQuery } from '../api/providerUsageQuery'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { fmtDuration } from '../i18n/format'
 
 // The record editor and recovery tools are needed only inside this drill-in.
@@ -89,11 +90,15 @@ function UsageSummaryCard({ onOpen }: { onOpen: () => void }) {
         !isError && <div className="skeleton h-14 rounded" />
       ) : (
         <div className="flex flex-col gap-2">
-          <div className="text-[13px] text-muted">
-            {i18nT('pages.overviewPage.today')} {fmtNum(today?.sessions)} {i18nT('pages.overviewPage.sessions')} {fmtNum(today?.messages)} {i18nT('pages.overviewPage.messages')}
-            {data.tokens?.total != null && <> · {fmtNum(data.tokens.total)} {i18nT('pages.overviewPage.tokens')}</>}
-            {data.costUsd != null && <> · ${data.costUsd.toFixed(2)}</>}
-          </div>
+          {data.refreshing ? (
+            <div data-testid="overview-usage-refreshing" className="skeleton h-4 rounded max-w-[320px]" />
+          ) : (
+            <div className="text-[13px] text-muted">
+              {i18nT('pages.overviewPage.today')} {fmtNum(today?.sessions)} {i18nT('pages.overviewPage.sessions')} {fmtNum(today?.messages)} {i18nT('pages.overviewPage.messages')}
+              {data.tokens?.total != null && <> · {fmtNum(data.tokens.total)} {i18nT('pages.overviewPage.tokens')}</>}
+              {data.costUsd != null && <> · ${data.costUsd.toFixed(2)}</>}
+            </div>
+          )}
           {b?.plan && (
             <div className="flex items-center gap-2 text-[12px] text-muted">
               <span>{b.plan}</span>
@@ -119,7 +124,11 @@ function WakaTimeSummaryCard({ onOpen }: { onOpen: () => void }) {
     queryKey: ['wakatime-stats', 'last_7_days'],
     queryFn: () => api.wakatimeStats('last_7_days'),
   })
-  const total = data?.stats?.total_seconds ?? 0
+  // Prefer the include-other total so this card matches the WakaTime drill-in
+  // it opens; the classified-only total_seconds drops the "Other" bucket and
+  // reads low. Fall back to total_seconds when the include-other field is null
+  // (free accounts, which do not report it).
+  const total = data?.stats?.total_seconds_including_other_language ?? data?.stats?.total_seconds ?? 0
   const fmtHm = (s: number) => {
     // Round to whole minutes first, then split, so 7199s -> 2h 0m, not 1h 60m.
     const totalMin = Math.round(Math.max(0, s) / 60)
@@ -160,7 +169,7 @@ function MemorySummaryCard({ onOpen }: { onOpen: () => void }) {
     <Card>
       <CardTitle>
         <Brain className="lucide-inline" /> {i18nT('pages.overviewPage.memory')}
-        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline">
+        <button onClick={onOpen} className="ml-auto inline-flex items-center gap-1 text-[12px] font-medium text-accent bg-transparent border-none cursor-pointer hover:underline" {...uiLocation('overview.memory-details')}>
           {i18nT('pages.overviewPage.view_details')} <ArrowRight size={12} />
         </button>
       </CardTitle>
@@ -201,7 +210,7 @@ export const STAT_LABEL_KEY: Record<StatId, string> = {
 }
 
 /**
- * Signpost to the Kiro sign-in card's home, Developer > Agent Backend
+ * Signpost to the Kiro sign-in card's home, Settings > Agent Harness
  * (`KIRO_SIGN_IN_PATH`), shown only while KAS is the selected backend: those
  * users read token expiry on this page by habit, and the card now sits beside
  * the switch that picks KAS. Everyone else sees nothing -- the identity does not
@@ -249,7 +258,7 @@ export default function OverviewPage() {
   if (view === 'memory') {
     const selectedStore = params.get('store') || ''
     return <DrillIn title={i18nT('pages.overviewPage.memory')} hideTitle={!!selectedStore && selectedStore !== 'default'} onBack={() => setView(null)}>
-      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} onStoreNavigate={store => setParams(previous => {
+      <Suspense fallback={<ContentSkeleton rows={6} />}><MemoryTab refreshTrigger={refreshTrigger} selectedStore={selectedStore} focus={params.get('focus')} onStoreNavigate={store => setParams(previous => {
         const next = new URLSearchParams(previous)
         if (store) next.set('store', store)
         else next.delete('store')

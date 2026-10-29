@@ -7,8 +7,15 @@ import { renderWithProviders } from '../../test/helpers'
 vi.mock('../../api/client', () => ({
   api: {
     members: vi.fn(),
+    // The roster's team grouping reads the team list; "no teams" keeps the
+    // list flat, which is the shape every case here was written against.
+    teams: { list: vi.fn(() => Promise.resolve({ teams: [] })) },
     // The page opens a member on arrival, so the thread endpoint must answer
     // from the first render; echo the slug back as the member (happy path).
+    // The warm greeting's read of the crewmate's work ledger. No ledger is the
+    // state every case not about the greeting wants: the chat opens bare.
+    crewBoard: vi.fn(() => Promise.reject(Object.assign(new Error('no_ledger'), { status: 404 }))),
+    memberRecap: vi.fn(() => Promise.reject(new Error('no recap in this test'))),
     memberThread: vi.fn((slug: string) =>
       Promise.resolve({ slot_key: 'member-' + slug, slug, member: slug, created: true }),
     ),
@@ -20,11 +27,12 @@ vi.mock('../../api/client', () => ({
     defaultAgent: vi.fn(() => Promise.resolve({ default_agent: '' })),
     updateKirocrewAgent: vi.fn(() => Promise.resolve({ ok: true })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
+    autonudgeForSlot: vi.fn(() => Promise.resolve({ enabled: true, loop: null })),
+    monitorForSlot: vi.fn(() => Promise.resolve({ enabled: true, monitor: null })),
     // The drawer's webview section. Stubbed as "nothing published" so it renders
     // its empty state: an unstubbed reader rejects, the section shows an
     // ErrorNotice of its own, and assertions that read the LAST ErrorNotice props
     // then pick up the webview's failure instead of the one under test.
-    memberPanel: vi.fn(() => Promise.resolve({ panel: null, html: null })),
   },
 }))
 
@@ -110,6 +118,7 @@ async function openFilters() {
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  localStorage.setItem('mc-preview-crew', '1')
 })
 
 describe('matchesSource', () => {
@@ -160,19 +169,19 @@ describe('MembersPage filters', () => {
     // The menu trigger is the sidebar's 24px filter button, docked in the field.
     const trigger = screen.getByTestId('member-filter-menu')
     expect(trigger.className).toMatch(/\bw-6\b/)
-    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter members')
+    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter mates')
   })
 
   it('header reads "N of M" while a filter narrows the list, plain count otherwise', async () => {
     await renderPage()
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 members')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
     await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 members')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 mates')
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     // The search box is not a "filter" for this purpose: it is transient.
     fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 members')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
   })
 
   it('starred-only keeps just the starred rows and persists the toggle', async () => {
@@ -243,7 +252,7 @@ describe('MembersPage filters', () => {
     fireEvent.click(screen.getByTestId('member-filter-source-package'))
     expect(names()).toEqual([])
     expect(screen.getByTestId('member-filtered-out')).toBeInTheDocument()
-    expect(screen.queryByText(/No crew members yet/i)).toBeNull()
+    expect(screen.queryByText(/No mates yet/i)).toBeNull()
     fireEvent.click(screen.getByTestId('member-filters-clear'))
     expect(names()).toHaveLength(5)
     expect(localStorage.getItem('mc-members-starred-only')).toBe('0')
@@ -272,11 +281,35 @@ describe('MembersPage filters', () => {
     // A second status widens the set (OR), so a member in either state shows.
     fireEvent.click(screen.getByTestId('member-filter-status-unread'))
     expect(names()).toEqual(['conductor', 'pkg-a'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 members')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 mates')
     fireEvent.click(screen.getByTestId('member-filter-status-working'))
     // Only "unread" left and nothing is unread: the filters, not the roster, emptied the list.
     expect(names()).toEqual([])
     expect(screen.getByTestId('member-filtered-out')).toBeInTheDocument()
+  })
+
+  it('the active unread status row lights its status token, not brand accent', async () => {
+    // The STATUS_ICON map's own contract is "lit in the state's colour when
+    // active", and three of its four rows honour it: working -> --warn,
+    // needs_you -> --info. `unread` was the one reading brand accent, which is
+    // also what the sidebar's unread filter chip stopped doing in #10488
+    // (ChatSidebar.tsx SESSION_FILTERS). Asserting on the ACTIVE icon is the
+    // point: inactive rows are `text-muted` for every state, so an inactive
+    // assertion would pass whatever the active colour is.
+    await renderPage([row('conductor'), row('pkg-a')])
+    await openFilters()
+    fireEvent.click(screen.getByTestId('member-filter-status-unread'))
+    const rowEl = screen.getByTestId('member-filter-status-unread')
+    expect(rowEl).toHaveAttribute('aria-checked', 'true')
+    const icon = rowEl.querySelector('svg')
+    expect(icon).not.toBeNull()
+    expect(icon?.getAttribute('fill')).toBe('var(--ok)')
+    expect(icon?.getAttribute('class') || '').not.toContain('text-accent')
+    // The two neighbours are the control: they already read status tokens, so a
+    // change that swept the whole map to one colour would fail here.
+    const working = screen.getByTestId('member-filter-status-working')
+    fireEvent.click(working)
+    expect(working.querySelector('svg')?.getAttribute('fill')).toBe('var(--warn)')
   })
 
   it('sort switches between recent activity and name and persists', async () => {
@@ -350,17 +383,198 @@ describe('MembersPage star', () => {
     const notice = await screen.findByTestId('member-star-error')
     expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'false')
     // Localized copy, not the raw server text.
-    expect(notice).toHaveTextContent("Could not update this member's star.")
+    expect(notice).toHaveTextContent("Could not update this mate's star.")
     expect(notice).not.toHaveTextContent('Forbidden')
     // The journaled report is recovered from the THROWN message (not the
     // localized one) and handed to ErrorNotice explicitly, so the agent
     // hand-off keeps endpoint / status / code / detail.
     expect(findReport).toHaveBeenCalledWith('Forbidden')
-    const noticeProps = (ErrorNoticeMock as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0]
+    const noticeProps = (ErrorNoticeMock as ReturnType<typeof vi.fn>).mock.calls
+      .map(([props]) => props)
+      .filter((props) => props.testId === 'member-star-error' && props.report)
+      .at(-1)
     expect(noticeProps?.report).toEqual(FAKE_REPORT)
-    expect(noticeProps?.message).toBe("Could not update this member's star.")
+    expect(noticeProps?.message).toBe("Could not update this mate's star.")
     // A later successful toggle clears the stale notice.
     fireEvent.click(screen.getByTestId('member-star-pkg-b'))
     await waitFor(() => expect(screen.queryByTestId('member-star-error')).toBeNull())
+  })
+})
+
+/* The default roster lists a row when its DM thread holds a message, whoever
+ * sent it, or when it is starred -- like a messages app, which lists no empty
+ * thread. Everything else is hidden until the search reaches it; the built-in
+ * default crewmate follows the same rule. Every fixture above omits the field,
+ * as an older gateway does, and those rows stay listed. */
+describe('MembersPage hides unlisted mates', () => {
+  const NO = { dashboard_created: false, has_dm_message: false }
+  const MIXED = [
+    row('kirocrew', { source: 'builtin', ...NO, has_dm_message: true, last_active_ts: 20 }),
+    row('radar', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Issue Radar', has_dm_message: true, last_active_ts: 30 }),
+    row('oncall', { source: 'radar-app', ...NO, starred: true, last_active_ts: 10 }),
+    row('legacy-aim', { source: 'aim', ...NO }),
+    row('pkg-tool', { ...NO }),
+  ]
+
+  it('lists rows whose thread holds a message and starred rows; the count says how many are listed', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.getByTestId('member-count')).toHaveTextContent('3 mates')
+    // Not "filtered out": hidden rows are unlisted, so no chip and no notice.
+    expect(screen.queryByTestId('member-filter-chips')).toBeNull()
+    expect(screen.queryByTestId('member-filtered-out')).toBeNull()
+  })
+
+  it('the search reaches a hidden row, and the count grows to include it', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
+    expect(names()).toEqual(['pkg-tool'])
+    expect(screen.getByTestId('member-count')).toHaveTextContent('4 mates')
+    fireEvent.click(screen.getByTestId('member-search-clear'))
+    expect(names()).toEqual(['radar', 'kirocrew', 'oncall'])
+  })
+
+  // #21852: "2 crewmates" over a crew of three read as the whole crew, and the
+  // third only turned up when a search happened to match it. The rule and the
+  // count stay; the list now ends by naming the rest, saying the count above
+  // leaves them out, and how to reach them.
+  it('ends the list by naming the mates the rule hides and saying the search finds them', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.getByTestId('member-count')).toHaveTextContent('3 mates')
+    expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent(
+      "legacy-aim and pkg-tool are hidden because you haven't used them yet, and aren't counted above. Search to find them.",
+    )
+    // The hint is the list's last item, after every listed row.
+    const list = screen.getByTestId('member-hidden-hint').closest('ul')
+    expect(list?.lastElementChild).toBe(screen.getByTestId('member-hidden-hint'))
+    // A typed search decides the list alone, so the hint gives way to it...
+    fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
+    expect(names()).toEqual(['pkg-tool'])
+    expect(screen.queryByTestId('member-hidden-hint')).toBeNull()
+    // ...and comes back with the default list.
+    fireEvent.click(screen.getByTestId('member-search-clear'))
+    expect(screen.getByTestId('member-hidden-hint')).toBeInTheDocument()
+  })
+
+  it('names a single hidden mate by the label its row shows, in the singular', async () => {
+    await renderPage([
+      ...MIXED.filter((m) => m.name !== 'pkg-tool' && m.name !== 'legacy-aim'),
+      row('nova-sky', { ...NO, dashboard_created: true, display_name: 'Nova Sky' }),
+    ])
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent(
+      "Nova Sky is hidden because you haven't used it yet, and isn't counted above. Search to find it.",
+    )
+  })
+
+  it('past three hidden mates, names the first three in roster order and counts the rest', async () => {
+    await renderPage([
+      ...MIXED,
+      row('pkg-two', { ...NO }),
+      row('pkg-three', { ...NO }),
+    ])
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    // The whole line: the counted form names no action.
+    expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
+      "legacy-aim, pkg-three, pkg-tool and 1 more mate you haven't used yet are hidden and aren't counted above.",
+    )
+  })
+
+  it('names the mates the user made ahead of package and app rows', async () => {
+    // A crewmate the user just created sorts last by name here, behind four
+    // package rows; it is still one of the three named, and named first.
+    await renderPage([
+      ...MIXED,
+      row('pkg-two', { ...NO }),
+      row('pkg-three', { ...NO }),
+      row('zebra-notes', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Zebra Notes' }),
+    ])
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
+      "Zebra Notes, legacy-aim, pkg-three and 2 more mates you haven't used yet are hidden and aren't counted above.",
+    )
+  })
+
+  it('counts every hidden mate past the three it names', async () => {
+    await renderPage([
+      ...MIXED,
+      row('pkg-two', { ...NO }),
+      row('pkg-three', { ...NO }),
+      row('pkg-four', { ...NO }),
+    ])
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
+      "legacy-aim, pkg-four, pkg-three and 2 more mates you haven't used yet are hidden and aren't counted above.",
+    )
+  })
+
+  it('says nothing when the rule hides no mate', async () => {
+    await renderPage(MIXED.filter((m) => m.name !== 'pkg-tool' && m.name !== 'legacy-aim'))
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    expect(screen.queryByTestId('member-hidden-hint')).toBeNull()
+  })
+
+  it('says nothing while a filter narrows the list', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    await openFilters()
+    fireEvent.click(screen.getByTestId('member-filter-starred'))
+    expect(names()).toEqual(['oncall'])
+    expect(screen.queryByTestId('member-hidden-hint')).toBeNull()
+  })
+
+  it('filter tallies count listed rows only, and "N of M" reads M from them', async () => {
+    await renderPage(MIXED)
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    await openFilters()
+    // Three package-bucket rows exist; only the starred app row is listed, so
+    // the tally says 1, and the built-in row with a message is the one builtin.
+    expect(within(screen.getByTestId('member-filter-source-package')).getByText('1')).toBeInTheDocument()
+    expect(within(screen.getByTestId('member-filter-source-builtin')).getByText('1')).toBeInTheDocument()
+    fireEvent.click(screen.getByTestId('member-filter-starred'))
+    expect(names()).toEqual(['oncall'])
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 3 mates')
+  })
+
+  it('a team whose every mate is hidden keeps its header, so the team stays reachable', async () => {
+    ;(api.teams.list as ReturnType<typeof vi.fn>).mockResolvedValue({
+      teams: [{ id: 't-hidden', name: 'Hidden team', members: ['legacy-aim', 'pkg-tool'] }],
+    })
+    try {
+      await renderPage(MIXED)
+      await waitFor(() =>
+        expect(document.querySelector('[data-testid="team-group"][data-team="t-hidden"]')).not.toBeNull(),
+      )
+      expect(names()).not.toContain('pkg-tool')
+    } finally {
+      ;(api.teams.list as ReturnType<typeof vi.fn>).mockResolvedValue({ teams: [] })
+    }
+  })
+
+  it('a remembered mate that the rule hides is restored, listed while open, and the memory is kept', async () => {
+    localStorage.setItem('mc-members-last-member', 'pkg-tool')
+    ;(api.members as ReturnType<typeof vi.fn>).mockResolvedValue({ members: MIXED })
+    renderWithProviders(<MembersPage />)
+    expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-pkg-tool')
+    await waitFor(() => expect(names()).toContain('pkg-tool'))
+    expect(localStorage.getItem('mc-members-last-member')).toBe('pkg-tool')
+  })
+
+  it('with every thread empty, the newest hidden mate opens and is listed while open', async () => {
+    ;(api.members as ReturnType<typeof vi.fn>).mockResolvedValue({
+      members: [
+        row('kirocrew', { source: 'builtin', ...NO }),
+        row('default', { source: 'builtin', ...NO }),
+        row('pkg-tool', { ...NO, last_active_ts: 5 }),
+        row('pkg-old', { ...NO, last_active_ts: 1 }),
+      ],
+    })
+    renderWithProviders(<MembersPage />)
+    expect(await screen.findByTestId('chat-pane-stub')).toHaveTextContent('member-pkg-tool')
+    await waitFor(() => expect(names()).toContain('pkg-tool'))
+    expect(names()).not.toContain('pkg-old')
+    expect(screen.queryByTestId('crewmate-empty-hero')).toBeNull()
   })
 })

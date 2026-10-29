@@ -586,7 +586,7 @@ class TestSchedulerContract:
 
         svc._on_job = blocked_cb
         job = svc.add_job("blocked", "go", every_secs=900)
-        await svc._run_job_isolated(job)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
 
         assert svc._history.append.await_count == 1
         record = svc._history.append.await_args.args[0]
@@ -605,7 +605,7 @@ class TestSchedulerContract:
 
         svc._on_job = clean_cb
         job = svc.add_job("okjob", "go", every_secs=900)
-        await svc._run_job_isolated(job)
+        await svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled"))
 
         assert svc._history.append.await_count == 1
         record = svc._history.append.await_args.args[0]

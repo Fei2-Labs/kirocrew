@@ -8,15 +8,22 @@
  *  1. A slotStatusDetail write for ONE slot re-renders only that slot's row —
  *     and that row's visible status text updates. Hoisting the subscription
  *     back to the sidebar shell fails this either way: as a whole-map shell
- *     read it re-renders every row (probe counts explode); as a shell read
- *     behind the memo with unchanged props it re-renders none (the status
+ *     read it re-renders every row (render counts explode); as a shell read
+ *     behind the memo with an unchanged view it re-renders none (the status
  *     text never appears).
- *  2. A shell re-render with unchanged row props re-renders NO rows. Removing
+ *  2. A shell re-render with unchanged row views re-renders NO rows. Removing
  *     the memo() wrapper fails this: every shell render re-executes all 200+
  *     row bodies, which is the whole-sidebar jank the boundary exists to stop.
  *
- * Render counts are unobservable from the DOM, so the rows report each body
- * execution through the exported sessionRowRenderProbe test seam.
+ * Render counts are unobservable from the DOM, so they are counted at the
+ * row's own boundary: every SessionRow body renders exactly one row-target
+ * `DndDroppable` (`pinned-session` on a pinned row, `manual-session` on any
+ * other), and a test-side wrapper around that real component records
+ * each render by slot key. The wrapper re-renders only when the row body hands
+ * it a new element, so its count is the row's body count. (A React `<Profiler>`
+ * inside the row cannot stand in: dnd-kit's context re-runs the droppable's
+ * render prop on every shell render, which a Profiler reports as a commit even
+ * while the row body bails out.)
  */
 import React from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -68,6 +75,27 @@ vi.mock('framer-motion', async () => {
   }
 })
 
+// Count row-menu renders through the real components: the displacement test
+// below pins that a moved row does not rebuild its menus.
+const menuRenders = { dropdown: 0, contextContent: 0 }
+vi.mock('../components/ui/dropdown-menu', async (orig) => {
+  const React = await import('react')
+  const real = await orig<typeof import('../components/ui/dropdown-menu')>()
+  const DropdownMenu = (props: React.ComponentProps<typeof real.DropdownMenu>) => {
+    menuRenders.dropdown++
+    return React.createElement(real.DropdownMenu, props)
+  }
+  return { ...real, DropdownMenu }
+})
+vi.mock('../components/ui/context-menu', async (orig) => {
+  const React = await import('react')
+  const real = await orig<typeof import('../components/ui/context-menu')>()
+  const ContextMenuContent = React.forwardRef((props: React.ComponentProps<typeof real.ContextMenuContent>, ref) => {
+    menuRenders.contextContent++
+    return React.createElement(real.ContextMenuContent, { ...props, ref } as React.ComponentProps<typeof real.ContextMenuContent>)
+  })
+  return { ...real, ContextMenuContent }
+})
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 // Legacy single-lane list (no tag columns) keeps the rows flat + easy to query.
 vi.mock('../pages/chat/ChatSettings', () => ({
@@ -91,7 +119,25 @@ Object.defineProperty(window, 'matchMedia', {
   })),
 })
 
-import ChatSidebar, { sessionRowRenderProbe, SIDEBAR_DISPLACEMENT_WINDOW } from '../pages/ChatSidebar'
+// Per-row body renders, by slot key (see the file doc). Hoisted so the mock
+// factory below can write it.
+const { counts } = vi.hoisted(() => ({ counts: {} as Record<string, number> }))
+vi.mock('../components/dnd', async (orig) => {
+  const React = await import('react')
+  const real = await orig<typeof import('../components/dnd')>()
+  const DndDroppable = (props: React.ComponentProps<typeof real.DndDroppable>) => {
+    // A row's own target: `pinned-session` on a pinned row, `manual-session` on
+    // every other row, so each row body renders exactly one of the two.
+    if (props.data?.type === 'pinned-session' || props.data?.type === 'manual-session') {
+      const key = String(props.data.key)
+      counts[key] = (counts[key] || 0) + 1
+    }
+    return React.createElement(real.DndDroppable, props)
+  }
+  return { ...real, DndDroppable }
+})
+
+import ChatSidebar, { SIDEBAR_DISPLACEMENT_WINDOW } from '../pages/ChatSidebar'
 import { setSlotStatusDetail } from '../store/chatSlice'
 
 const slot = (key: string, over: Record<string, unknown> = {}) => ({
@@ -217,14 +263,11 @@ function renderSidebarWithSlots(slots: ReturnType<typeof slot>[]) {
   return { store, sidebarWithSlots, wrap }
 }
 
-const counts: Record<string, number> = {}
 beforeEach(() => {
   localStorage.clear()
   for (const k of Object.keys(counts)) delete counts[k]
-  sessionRowRenderProbe.current = (key) => { counts[key] = (counts[key] || 0) + 1 }
 })
 afterEach(() => {
-  sessionRowRenderProbe.current = null
   vi.clearAllMocks()
 })
 
@@ -255,7 +298,7 @@ describe('chat sidebar — session row memo boundary', () => {
     expect(counts['k-c']).toBeUndefined()
   })
 
-  it('a shell re-render with unchanged row props re-renders no rows', () => {
+  it('a shell re-render with unchanged row views re-renders no rows', () => {
     // The prop change must originate BELOW the providers: view.rerender()
     // re-renders the whole wrapper tree, and ThemeProvider mints a fresh
     // context value per render — a context update bypasses memo entirely and
@@ -315,6 +358,36 @@ describe('chat sidebar — session row memo boundary', () => {
     }
     expect(rerendered).toHaveLength(SIDEBAR_DISPLACEMENT_WINDOW + 1)
   })
+
+  // A displaced row re-renders for the layout spring, but nothing in its ⋯
+  // dropdown or its context-menu content depends on position: those elements
+  // are memoized and React skips them. Building them on every displacement is
+  // ~90% of a pin's render work in a 65-session sidebar.
+  it('a displaced row re-renders without rebuilding its menus', () => {
+    const N = 20
+    const initial = Array.from({ length: N }, (_, i) => slot(`m-${String(i).padStart(2, '0')}`))
+    const setters: Array<(v: typeof initial) => void> = []
+    function Harness({ sidebar }: { sidebar: (s: typeof initial) => React.ReactElement }) {
+      const [rows, setRows] = React.useState(initial)
+      setters.push(setRows)
+      return sidebar(rows)
+    }
+    const { sidebarWithSlots, wrap } = renderSidebarWithSlots(initial)
+    render(wrap(<Harness sidebar={sidebarWithSlots} />))
+    for (const k of Object.keys(counts)) delete counts[k]
+    menuRenders.dropdown = 0
+    menuRenders.contextContent = 0
+
+    act(() => { setters[setters.length - 1]([slot('m-new'), ...initial]) })
+
+    // Every existing row moved down one slot and re-rendered...
+    for (const row of initial) expect(counts[row.key]).toBeGreaterThan(0)
+    // ...but only the NEW row built a context menu, and the dropdowns built are
+    // the new row's plus whatever the sidebar shell owns -- nowhere near one per
+    // displaced row.
+    expect(menuRenders.contextContent).toBe(1)
+    expect(menuRenders.dropdown).toBeLessThan(N / 2)
+  })
 })
 
 describe('selectSidebarWorkflowActive — hostile session keys', () => {
@@ -345,9 +418,9 @@ describe('selectSidebarWorkflowActive — hostile session keys', () => {
  * extraction honest — the resolution has to live INSIDE the memoized row, so a
  * future refactor that moves the row body again cannot quietly drop it.
  *
- * Note on the re-tint case: `installedAgents` is an ARRAY prop on the row, so
- * under memo's default shallow compare a new array identity re-renders every
- * row, not just the affected one. That is the existing prop contract, so this
+ * Note on the re-tint case: `installedAgents` is an ARRAY member of the one row
+ * shell every view holds, so a new array identity re-renders every row, not
+ * just the affected one. That is the existing contract, so this
  * pins the CORRECTNESS claim (the tint updates) and deliberately does not
  * assert single-row isolation, which would require passing a pre-resolved
  * per-row primitive instead.
@@ -444,5 +517,36 @@ describe('chat sidebar — agent default session colour', () => {
     expect(tintOf(rowFor('k-inherit'))).toBe(AGENT_TINT_EDITED)
     // …while a session carrying its own colour is unmoved by the agent edit.
     expect(tintOf(rowFor('k-own'))).toBe(SESSION_TINT)
+  })
+})
+
+/**
+ * The page rebuilds its source-reveal handler whenever that handler's own
+ * inputs move. Rows only call it, so a new identity must not reach the row
+ * actions object, which every row's memo compares by reference.
+ */
+describe('chat sidebar — onOpenSource identity', () => {
+  it('a new onOpenSource identity re-renders no rows', () => {
+    const slots = [slot('k-a'), slot('k-b'), slot('k-c')]
+    const { wrap } = renderSidebarWithSlots(slots)
+    let setOpen: ((f: () => boolean) => void) | undefined
+    function Harness() {
+      const [openSource, setOpenSource] = React.useState<() => boolean>(() => () => true)
+      setOpen = (f) => setOpenSource(() => f)
+      return (
+        <ChatSidebar
+          slots={slots} activeSlot={null} unreadSlots={EMPTY_UNREAD}
+          history={EMPTY_HISTORY} historyHasMore={false} defaultAgent="" installedAgents={EMPTY_AGENTS}
+          onOpenSource={openSource}
+        />
+      )
+    }
+    render(wrap(<Harness />))
+    expect(counts['k-a']).toBeGreaterThan(0)
+    for (const k of Object.keys(counts)) delete counts[k]
+
+    act(() => { setOpen!(() => false) })
+
+    expect(counts).toEqual({})
   })
 })

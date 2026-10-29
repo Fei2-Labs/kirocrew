@@ -21,8 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -31,9 +29,6 @@ from kiro_crew.messaging.link import ChannelLink, canonical_key
 from kiro_crew.session_map import SessionMap
 from kiro_crew.slack import transport_dispatch
 
-_test_dir = Path(__file__).parent
-if str(_test_dir) not in sys.path:  # pragma: no cover
-    sys.path.insert(0, str(_test_dir))
 _golden = importlib.import_module("test_slack_golden_transcript")
 
 FakeSessions = _golden.FakeSessions
@@ -67,7 +62,7 @@ class _RoutingSessions(FakeSessions):
     def get_session_for_thread(self, thread_ts):
         return self._thread_index.get(thread_ts)
 
-    async def get_or_create(self, session_key, agent=None, channel_id=None):
+    async def get_or_create(self, session_key, agent=None, channel_id=None, start_priority=None):
         self.acquired_keys.append(session_key)
         return await super().get_or_create(session_key, agent=agent, channel_id=channel_id)
 
@@ -333,7 +328,7 @@ def test_a_link_created_mid_turn_is_not_clobbered(monkeypatch):
 
     original = sessions.get_or_create
 
-    async def claim_during_acquisition(session_key, agent=None, channel_id=None):
+    async def claim_during_acquisition(session_key, agent=None, channel_id=None, start_priority=None):
         # Stand in for the dashboard's send-to-Slack landing mid-turn.
         sessions._thread_index[_THREAD_TS] = _DASHBOARD_KEY
         return await original(session_key, agent=agent, channel_id=channel_id)

@@ -17,6 +17,86 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 KIRO_CLI_NAME = "kiro-cli"
 
+#: The directory holding the kiro-cli copy the desktop app ships inside its own
+#: resources. The Electron shell sets it at gateway spawn
+#: (``website/electron/gateway-env.js``) only when the payload actually shipped;
+#: ``packaging/build-desktop.sh`` stages it. Set by the process that starts the
+#: gateway, like ``KIROCREW_KIRO_BIN``, never by a directory an agent can plant
+#: a file in -- which is what lets :func:`pin_kiro_cli` trust it while it still
+#: refuses the inherited ``PATH``. A directory rather than a binary because the
+#: Electron side only stats the directory it staged; the name of the entry
+#: binary inside it lives on this side, in :func:`bundled_kiro_cli_entry`.
+BUNDLED_KIRO_DIR_ENV = "KIROCREW_BUNDLED_KIRO_DIR"
+
+#: The executable the bundled directory is entered through: the chat binary,
+#: not the ``kiro-cli`` launcher. The launcher resolves ``kiro-cli-chat`` via
+#: ``$HOME/.local/bin`` and ``PATH`` and never looks in its own directory, so a
+#: bundle entered through it would silently run whatever copy the USER has
+#: installed and, on a clean machine, fail with "failed to launch
+#: kiro-cli-chat" -- while the launcher answers ``--version`` and ``whoami``
+#: itself, so those probes pass. ``kiro-cli-chat`` is the process every session
+#: is anyway, accepts every subcommand used here (``acp``, ``login``, ``whoami``,
+#: ``mcp``, ``agent``, ``settings``, ``--version``) and finds its own helpers
+#: through its own executable path, so it is self-contained.
+BUNDLED_KIRO_CLI_ENTRY = "kiro-cli-chat"
+BUNDLED_KIRO_CLI_WINDOWS_ENTRY = "kiro-cli.exe"
+
+
+def bundled_kiro_cli_entry(platform_name: str) -> str:
+    """Return the executable staged for *platform_name*.
+
+    Windows' MSI carries one self-contained ``kiro-cli.exe``. POSIX releases
+    stage ``kiro-cli-chat`` directly because their launcher does not resolve a
+    sibling chat binary.
+    """
+    if platform_name == "win32":
+        return BUNDLED_KIRO_CLI_WINDOWS_ENTRY
+    return BUNDLED_KIRO_CLI_ENTRY
+
+
+def chat_sibling(binary: str, platform_name: str | None = None) -> str | None:
+    """The ``kiro-cli-chat`` beside a resolved ``kiro-cli`` launcher, or ``None``.
+
+    The POSIX ``kiro-cli`` is the q_cli launcher (install, update, doctor,
+    login, shell completion). It ``exec``s ``kiro-cli-chat`` for ``chat`` and
+    ``acp`` -- but only after checking ITS OWN sign-in, so ``kiro-cli acp
+    --agent-engine v3`` with no ``--auth-method cli`` exits ``You are not logged
+    in`` on a host where kiro-cli is signed out, even though that mode leaves the
+    credential to the ACP client and ``kiro-cli-chat acp --agent-engine v3`` runs
+    (verified on 2.25.0: the chat binary starts KAS in ``--auth=acp-callback``
+    and asks the host). A KAS spawn that Crew's vault is about to authenticate
+    therefore has to enter through the chat binary, which is what the desktop
+    bundle already does (:data:`BUNDLED_KIRO_CLI_ENTRY`).
+
+    ``None`` whenever the swap does not apply, so callers fall back to *binary*
+    unchanged: on Windows (one self-contained ``kiro-cli.exe``), when *binary*
+    is not named ``kiro-cli`` (the operator's ``KIROCREW_KIRO_BIN`` may name
+    anything; the bundled entry is already the chat binary), or when no
+    non-empty executable ``kiro-cli-chat`` sits in the SAME directory. The directory is the
+    resolved path's own, never its ``realpath``: the launch-in-place rule
+    (acp-client spec) means a symlinked ``~/.local/bin/kiro-cli`` is joined by
+    ``~/.local/bin/kiro-cli-chat`` when the install shipped both, and a wrapper
+    directory without one keeps the wrapper. Pure ``stat`` work, no spawn.
+    """
+    resolved_platform = platform_name or sys.platform
+    if resolved_platform == "win32" or not binary:
+        return None
+    if os.path.basename(binary) != KIRO_CLI_NAME:
+        return None
+    sibling = os.path.join(os.path.dirname(binary), BUNDLED_KIRO_CLI_ENTRY)
+    if not platform_compat.is_executable_file(sibling, platform_name=resolved_platform):
+        return None
+    # An executable that is empty cannot be exec'd (ENOEXEC) and would fail the
+    # spawn loudly where the launcher might still have run; the same guard the
+    # win32 candidate walk applies to App-Execution-Alias stubs.
+    try:
+        if os.path.getsize(sibling) == 0:
+            return None
+    except OSError:
+        return None
+    return sibling
+
+
 # kiro-cli's own local state database. Holds identity-describing rows next to
 # credential rows, so every reader here is read-only and key-scoped. Alias of
 # the single canonical filename constant so the six former copies cannot drift.
@@ -60,6 +140,14 @@ _STATE_DB_TIMEOUT_SECS = 5.0
 #: A changelog entry is not a probe; a release nobody ran stays above the floor.
 SPEC_PERMISSIONS_MIN_VERSION: tuple[int, int, int] = (2, 23, 0)
 
+#: Lowest verified release for both kiro and KAS where deferred Crew tools avoid
+#: the thinking-signature rejection. Older or unknown engines keep Crew tools resident.
+#: Empirical, not a named upstream fix: thinking turns before and after a deferred
+#: kirocrew-* load ran clean on the default engine at 2.26.1 and 2.27.0 and on KAS
+#: (``acp --agent-engine v3``) at 2.27.0. Lowering it needs that same matrix re-run
+#: on both engines at the lower release.
+MANDATORY_MCPS_DROP_MIN_VERSION: tuple[int, int, int] = (2, 27, 0)
+
 #: ``--version`` is a local read of an already-resolved binary, so it gets the
 #: same short leash the readiness probe puts on its own first execution.
 _VERSION_PROBE_TIMEOUT_SECS = 5
@@ -68,6 +156,60 @@ _VERSION_PROBE_TIMEOUT_SECS = 5
 #: its mtime, so ``kiro-cli update`` swapping the binary invalidates the entry
 #: instead of leaving a whole gateway lifetime on a stale verdict.
 _version_cache: dict[tuple[str, int], tuple[int, int, int] | None] = {}
+
+
+def mandatory_mcps_drop_supported(version: tuple[int, int, int] | None) -> bool:
+    """Whether *version* meets the verified floor for deferring Crew's MCP servers."""
+    return version is not None and version >= MANDATORY_MCPS_DROP_MIN_VERSION
+
+
+def mandatory_mcps_drop_allowed(spawned_binary: str | None) -> bool:
+    """Allow deferral only for the pinned install and its own chat sibling.
+
+    The executable must match the pin or its chat sibling by realpath, and its
+    invoked directory must match the pin's directory. Both pinned executables
+    must meet the version floor; only those paths are probed. Missing spawn
+    paths, pod bundles, and non-pinned launchers keep Crew's servers resident.
+    An edition companion swapping in a direct executable is trusted gateway
+    code and is not compared. Any failure keeps the servers resident; never raises.
+
+    An operator ``KIROCREW_KIRO_BIN`` override also keeps them resident: its
+    directory is the operator's choice, not a known install directory, so no path
+    derived from it is probed (the KAS spawn skips that sibling for the same reason).
+    """
+    if not spawned_binary or (os.environ.get("KIROCREW_KIRO_BIN") or "").strip():
+        return False
+    try:
+        pinned = pin_kiro_cli()[0]
+        if pinned is None:
+            return False
+        sibling = chat_sibling(pinned)
+        # A POSIX launcher with no sibling in its own directory execs whatever
+        # kiro-cli-chat it finds on PATH, whose version is unknown.
+        if (
+            sibling is None
+            and sys.platform != "win32"
+            and os.path.basename(pinned) == KIRO_CLI_NAME
+        ):
+            return False
+        candidates = [pinned, sibling]
+        if os.path.normcase(os.path.realpath(spawned_binary)) not in {
+            os.path.normcase(os.path.realpath(binary))
+            for binary in candidates
+            if binary is not None
+        } or os.path.normcase(
+            os.path.realpath(os.path.dirname(spawned_binary))
+        ) != os.path.normcase(
+            os.path.realpath(os.path.dirname(pinned))
+        ):
+            return False
+        return all(
+            mandatory_mcps_drop_supported(kiro_cli_version_at(binary))
+            for binary in candidates
+            if binary is not None
+        )
+    except Exception:  # noqa: BLE001 - an unanswerable trust check refuses deferral
+        return False
 
 
 def spec_permissions_supported(version: tuple[int, int, int] | None) -> bool:
@@ -98,18 +240,24 @@ def installed_kiro_cli_version() -> tuple[int, int, int] | None:
     unparseable output) gives the same answer as an old CLI: unknown, which the
     gate reads as "do not write the field".
     """
+    try:
+        binary, _unpinned = pin_kiro_cli()
+    except Exception:  # noqa: BLE001 - an unanswerable probe is not an error here
+        return None
+    return kiro_cli_version_at(binary) if binary is not None else None
+
+
+def kiro_cli_version_at(binary: str) -> tuple[int, int, int] | None:
+    """Probe a resolved executable, cached by path and mtime; failure returns None.
+
+    Call only on a path derived from :func:`pin_kiro_cli`.
+    """
     # The ``--version`` line and the handshake's ``agentInfo.version`` are the
     # same spelling, so the parser is shared rather than copied. Imported here
     # because ``mcp_hot_reload`` reaches ``acp_backends``, and this module is a
     # leaf every setup and launch path imports at boot.
     from kiro_crew.mcp_hot_reload import parse_kiro_cli_version  # noqa: PLC0415
 
-    try:
-        binary, _unpinned = pin_kiro_cli()
-    except Exception:  # noqa: BLE001 - an unanswerable probe is not an error here
-        return None
-    if binary is None:
-        return None
     try:
         key = (binary, os.stat(binary).st_mtime_ns)
     except OSError:
@@ -124,6 +272,9 @@ def installed_kiro_cli_version() -> tuple[int, int, int] | None:
             capture_output=True,
             timeout=_VERSION_PROBE_TIMEOUT_SECS,
             check=False,
+            # A console-less Windows gateway would otherwise flash a console
+            # window for this child; the constant is 0 elsewhere.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             # Pinned UTF-8 rather than bare text=True: a platform-locale decode
             # could mangle the version token and report a supported kiro-cli as
             # unparseable, which this gate reads as refusing.
@@ -135,6 +286,40 @@ def installed_kiro_cli_version() -> tuple[int, int, int] | None:
         version = parse_kiro_cli_version(completed.stdout or completed.stderr or "")
     _version_cache[key] = version
     return version
+
+
+#: Ceiling on the ``acp --help`` spawn. Help output is local and immediate; the cap
+#: only bounds a wedged binary.
+_KAS_HELP_PROBE_TIMEOUT_SECS = 15
+
+
+def kas_relay_help(binary: str) -> str | None:
+    """``acp --help`` text for this kiro-cli, or ``None`` when the probe FAILED.
+
+    Read from help output because there is no machine-readable capability surface
+    for the engine selector. ``None`` means only one thing — the probe could not
+    run (spawn error, timeout) — so the caller reports genuinely-unknown as
+    unknown. Help text that RAN and simply lacks the engine selector is returned
+    as-is, not as ``None``: a kiro-cli too old to offer ``--agent-engine`` cannot
+    serve KAS at all, and reporting that as "unknown" would let a broken
+    configuration pass the readiness check and fail later at spawn instead.
+
+    Local binary, argv list, no shell, no credential involved.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - argv list, no shell, local binary
+            [binary, "acp", "--help"],
+            capture_output=True,
+            timeout=_KAS_HELP_PROBE_TIMEOUT_SECS,
+            check=False,
+            # Pinned UTF-8 rather than bare text=True: help output is decoded
+            # here, and a platform-locale decode could mangle the flag name this
+            # probe searches for and report a supported kiro-cli as unreadable.
+            **UTF8_TEXT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"{proc.stdout}\n{proc.stderr}"
 
 
 def kiro_cli_state_dbs(
@@ -272,6 +457,39 @@ def _unique(items: list[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
 
 
+def bundled_kiro_cli_dir(environ: Mapping[str, str]) -> str | None:
+    """The desktop app's bundled kiro-cli directory, or ``None`` when not bundled.
+
+    Whitespace-only and unset both read as "not bundled": a blank value is what
+    an unbundled build leaves behind, never a directory to search.
+    """
+    bundled = environ.get(BUNDLED_KIRO_DIR_ENV, "").strip()
+    return bundled or None
+
+
+def is_bundled_kiro_cli(binary: str, environ: Mapping[str, str]) -> bool:
+    """Whether *binary* is the desktop app's own bundled kiro-cli.
+
+    True only when a bundled directory is declared AND the binary's directory
+    is that directory, compared as normalised strings. The resolver builds the
+    bundled candidate from the same directory string
+    (:func:`find_kiro_cli_candidates`), so a textual compare is exact for
+    anything it produced; a symlinked ``KIROCREW_KIRO_BIN`` override that
+    points into the bundle reads as "not bundled", which keeps the operator's
+    binary on its normal update path. Pure string work -- no ``resolve()``, no
+    stat -- so it is safe to call on the event loop.
+
+    Provenance callers key off this: the setup gate serves the bundled copy's
+    absolute path as the sign-in command (it is not on the user's shell PATH),
+    and the self-update paths skip it (it lives inside a signed, read-only app
+    bundle and is replaced by the next app update, never in place).
+    """
+    bundled_dir = bundled_kiro_cli_dir(environ)
+    if not bundled_dir or not binary:
+        return False
+    return os.path.normpath(os.path.dirname(binary)) == os.path.normpath(bundled_dir)
+
+
 def _windows_program_files(environ: Mapping[str, str]) -> str:
     return environ.get("ProgramFiles") or environ.get("PROGRAMFILES") or r"C:\Program Files"
 
@@ -315,16 +533,31 @@ def known_kiro_cli_dirs(
     that were searched. (:func:`~kiro_crew.env.mise_data_dir` still honours the
     process-level ``MISE_DATA_DIR``/``XDG_DATA_HOME`` overrides, so the mise
     shim entry is home-pinned only in their absence.)
+
+    The desktop app's bundled copy (:data:`BUNDLED_KIRO_DIR_ENV`) leads the
+    list on every platform. It ranks ABOVE every system install -- the app was
+    built and tested against that exact version -- but BELOW the
+    ``KIROCREW_KIRO_BIN`` operator override, which
+    :func:`find_kiro_cli_candidates` places ahead of every directory here, so
+    an operator can still force a different binary. It sits in the FIXED part
+    of the list, ahead of the ``include_inherited_path`` branch, so the pinned
+    off-``PATH`` spawns (:func:`pin_kiro_cli`, the ACP launch, the readiness
+    probe) resolve the bundled copy through the same ranking as the
+    interactive setup path: one candidate order, whichever caller asks.
     """
 
+    dirs: list[str] = []
+    bundled = bundled_kiro_cli_dir(environ)
+    if bundled:
+        dirs.append(bundled)
     if platform_name == "win32":
         local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        dirs = [
+        dirs += [
             str(local_app_data / "Kiro-Cli"),
             str(Path(_windows_program_files(environ)) / "Kiro-Cli"),
         ]
     else:
-        dirs = [
+        dirs += [
             str(home / ".local" / "bin"),
             str(home / ".cargo" / "bin"),
         ]
@@ -367,15 +600,25 @@ def find_kiro_cli_candidates(
     *,
     include_inherited_path: bool = True,
 ) -> list[str]:
-    """Enumerate executable Kiro CLI candidates without mutating the environment."""
+    """Enumerate executable Kiro CLI candidates without mutating the environment.
+
+    Every directory contributes ``kiro-cli`` (``.exe`` on Windows) except the
+    desktop app's bundled directory, which contributes
+    :func:`bundled_kiro_cli_entry`: POSIX ships the chat binary directly while
+    Windows ships the one executable extracted from its MSI.
+    """
 
     name = f"{KIRO_CLI_NAME}.exe" if platform_name == "win32" else KIRO_CLI_NAME
+    bundled = bundled_kiro_cli_dir(environ)
     candidates: list[str] = []
     override = environ.get("KIROCREW_KIRO_BIN", "")
     if override:
         candidates.append(override)
     candidates.extend(
-        str(Path(directory) / name)
+        str(
+            Path(directory)
+            / (bundled_kiro_cli_entry(platform_name) if directory == bundled else name)
+        )
         for directory in known_kiro_cli_dirs(
             platform_name,
             home,
@@ -408,11 +651,12 @@ def resolve_kiro_cli(
     ``include_inherited_path=False`` forwards to
     :func:`find_kiro_cli_candidates` and drops the inherited ``PATH`` from the
     candidate set. What remains is the fixed known install directories plus the
-    explicit ``KIROCREW_KIRO_BIN`` override, which is deliberately still
-    honoured: it is set by the operator who starts the gateway, not named by a
-    directory an agent can plant a file in. Unattended callers pass the keyword
-    so a ``PATH`` leading with an agent-writable directory cannot choose what
-    they execute; interactive ones keep the default, where a nonstandard install
+    explicit ``KIROCREW_KIRO_BIN`` override and the desktop app's bundled
+    directory (:data:`BUNDLED_KIRO_DIR_ENV`), which are deliberately still
+    honoured: both are set by the process that starts the gateway, not named by
+    a directory an agent can plant a file in. Unattended callers pass the
+    keyword so a ``PATH`` leading with an agent-writable directory cannot choose
+    what they execute; interactive ones keep the default, where a nonstandard install
     on ``PATH`` is a convenience rather than an exposure.
     """
 
@@ -445,8 +689,9 @@ def pin_kiro_cli() -> tuple[str | None, bool]:
     ``PATH`` can lead with an agent-writable directory (a worktree venv's
     ``bin``), so the candidate set is :func:`resolve_kiro_cli` with
     ``include_inherited_path=False``: the fixed known install directories plus
-    the operator's own ``KIROCREW_KIRO_BIN``. ``None`` means refuse — callers
-    skip the step rather than fall back to the bare name.
+    the operator's own ``KIROCREW_KIRO_BIN`` and the desktop app's bundled
+    directory. ``None`` means refuse — callers skip the step rather than fall
+    back to the bare name.
 
     The second element separates the two ways the pin comes back empty, which
     a caller reports differently: kiro-cli is not installed at all (nothing to

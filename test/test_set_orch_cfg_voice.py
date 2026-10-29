@@ -2,28 +2,38 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from kiro_crew.slack import handler as handler_mod
-from kiro_crew.slack.handler import _vc, load_voice_reply_config, set_orch_cfg
+from kiro_crew.slack.handler import _vc, _VoiceConfig, load_voice_reply_config, set_orch_cfg
 from kiro_crew.voice_reply import DEFAULT_PROVIDER, PROVIDER_POLLY
 
 
 @pytest.fixture(autouse=True)
 def _reset_vc():
-    """Reset _vc flags before/after each test."""
-    _vc.auto_speak = False
-    _vc.global_enabled = False
-    _vc.auto_reply_to_voice = False
-    _vc.provider = "polly"
-    yield
-    _vc.auto_speak = False
-    _vc.global_enabled = False
-    _vc.auto_reply_to_voice = False
-    _vc.provider = "polly"
+    """Start each test from a pristine voice config and no orchestrator config.
+
+    ``set_orch_cfg`` binds ``handler._orch_cfg`` and ``load_voice_reply_config``
+    rewrites every ``_vc`` field. Both are process state that later tests read:
+    a leftover ``SimpleNamespace()`` here made ``slack_cfg().slack`` raise in
+    ``test_slack_sessions_view.py``. A private ``MonkeyPatch`` puts back what the
+    test inherited, whatever the test's own ``monkeypatch`` does. ``_vc`` is
+    patched field by field, never rebound, because this module and the handler
+    hold the same object.
+    """
+    pristine = _VoiceConfig()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(handler_mod, "_orch_cfg", None)
+        for field in dataclasses.fields(_vc):
+            mp.setattr(_vc, field.name, getattr(pristine, field.name))
+        # The paid provider as the starting value, so a load that kept the old
+        # provider instead of falling back fails the "never polly" assertions.
+        mp.setattr(_vc, "provider", PROVIDER_POLLY)
+        yield
 
 
 def _cfg_file(tmp_path, monkeypatch, voice_reply: dict) -> None:
@@ -114,10 +124,13 @@ def test_provider_polly_accepted(tmp_path, monkeypatch):
     assert _vc.provider == "polly"
 
 
-def test_provider_piper_accepted(tmp_path, monkeypatch):
-    _cfg_file(tmp_path, monkeypatch, {"provider": "piper"})
+def test_removed_piper_provider_loads_as_the_local_default(tmp_path, monkeypatch):
+    # A saved Piper config must keep the gateway speaking, not fail to load.
+    monkeypatch.setattr("kiro_crew.voice_reply._warned_removed_providers", set())
+    _cfg_file(tmp_path, monkeypatch, {"provider": "piper", "piper_model": "~/v.onnx"})
     set_orch_cfg(SimpleNamespace())
-    assert _vc.provider == "piper"
+    assert _vc.provider == "system"
+    assert not hasattr(_vc, "piper_model")
 
 
 def test_provider_typo_falls_back_to_local_with_warning(tmp_path, monkeypatch, caplog):
@@ -188,9 +201,6 @@ def test_non_string_path_and_voice_values_normalise_to_unset(tmp_path, monkeypat
         {
             "enabled": True,
             "system_voice": {},
-            "piper_binary": ["/usr/bin/piper"],
-            "piper_model": 42,
-            "piper_model_config": None,
             "voice_id": {},
             "engine": [],
             "rate": {"pct": 100},
@@ -202,9 +212,6 @@ def test_non_string_path_and_voice_values_normalise_to_unset(tmp_path, monkeypat
     load_voice_reply_config()
     # Fields whose "unset" is empty.
     assert _vc.system_voice == ""
-    assert _vc.piper_binary == ""
-    assert _vc.piper_model == ""
-    assert _vc.piper_model_config == ""
     assert _vc.aws_profile == ""
     assert _vc.region == ""
     # Fields with a real documented default fall back to it, not to empty: an
@@ -220,11 +227,11 @@ def test_string_path_and_voice_values_are_preserved(tmp_path, monkeypatch):
     _cfg_file(
         tmp_path,
         monkeypatch,
-        {"enabled": True, "system_voice": "Alex", "piper_binary": "/usr/bin/piper"},
+        {"enabled": True, "system_voice": "Alex", "aws_profile": "work"},
     )
     load_voice_reply_config()
     assert _vc.system_voice == "Alex"
-    assert _vc.piper_binary == "/usr/bin/piper"
+    assert _vc.aws_profile == "work"
 
 
 # ── restore without a Slack orchestrator (dashboard-only gateway) ────────

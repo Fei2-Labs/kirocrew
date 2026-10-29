@@ -85,7 +85,7 @@ class _Sessions:
     def max_generation(self, bucket: str) -> int:
         return -1
 
-    def clear_queue(self, key) -> None:
+    def clear_queue(self, key, owned_by=None) -> None:
         self.cleared.append(key)
 
     def enqueue(self, key, msg_ts, text, *, force=False, **kw) -> bool:

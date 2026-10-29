@@ -1,6 +1,6 @@
 """``agent.acp_backend`` is writable from the dashboard, and only to real backends.
 
-The Developer > Agent Backend switch writes this field over
+The Settings > Agent Harness switch writes this field over
 ``PATCH /api/config/kirocrew``, so it has to be in ``_EDITABLE_CONFIG`` at all —
 before this it was absent and every save came back "field not editable".
 
@@ -34,19 +34,16 @@ from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 FIELD = "agent.acp_backend"
 
 #: Known ids the public baseline deliberately does not offer, each entry carrying its
-#: reason in ``test_baseline_ships_every_known_backend``. Empty was the state until the
-#: first exception; an entry is a reasoned exclusion rather than a defect, and it earns
-#: its place by naming what the id fails. ``deepseek`` is the one member today.
-#:
-#: deepseek passes the install-probe half of the selectability bar and fails the
-#: ROUTING half. Its sandbox decides its own tool calls -- an in-policy action runs
-#: silently and an out-of-policy one is denied with the denial in the tool result --
-#: and ``session/request_permission`` carries only a model-initiated request to
-#: escalate past that sandbox, refused outright when the model omits its
-#: justification. Four live captures across its confined and read-only postures raised
-#: no permission request at all. So Crew's PreToolUse gate would not run for what a
-#: session actually does, and the switch would be offering a harness Crew cannot gate.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({ACP_BACKEND_DEEPSEEK})
+#: reason in ``test_baseline_ships_every_known_backend``. An entry is a reasoned
+#: exclusion rather than a defect, and it earns its place by naming what the id fails.
+#: Empty today: no id is excluded. ``deepseek`` was the one member while it failed the
+#: ROUTING half of the selectability bar -- its sandbox decides its own tool calls and
+#: its ``session/request_permission`` carries only a model-initiated escalation, so
+#: Crew's PreToolUse gate never ran for what a session did. It left the set when Crew
+#: composed its own gate plugin into the harness and read the plugin's load marker
+#: back before the first prompt (``Routing.VERIFIED_GATE_EXTENSION``), which is the
+#: routing half met the way the exclusion said it had to be.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset()
 
 
 @pytest.fixture
@@ -84,7 +81,17 @@ def test_the_allowlist_resolves_the_set_and_never_carries_a_literal():
     spec = _EDITABLE_CONFIG[FIELD]
     assert "values" not in spec, "a frozen list here is exactly the drift being removed"
     assert callable(spec["values_fn"])
-    assert set(spec["values_fn"]()) == set(acp_backends.selectable_backends())
+    # The config-file vocabulary: Kiro CLI is "kiro", and "" stores "no choice".
+    assert set(spec["values_fn"]()) == {
+        acp_backends.backend_to_stored(b) for b in acp_backends.selectable_backends()
+    } | {""}
+
+
+def test_the_allowlist_speaks_the_stored_vocabulary():
+    """A Kiro CLI pick is written as "kiro"; "" is "no choice", never Kiro CLI."""
+    allowed = _EDITABLE_CONFIG[FIELD]["values_fn"]()
+    assert acp_backends.STORED_BACKEND_KIRO in allowed
+    assert acp_backends.STORED_BACKEND_KIRO == acp_backends.POLICY_ID_KIRO
 
 
 def test_the_default_backend_is_accepted_by_its_own_allowlist():
@@ -132,7 +139,10 @@ def test_the_schema_endpoint_serves_the_same_set_as_the_allowlist():
     """
     entry: Dict[str, Any] = {"path": FIELD, "enumValues": None}
     _supply_live_enum(entry)
-    assert entry["enumValues"] == _EDITABLE_CONFIG[FIELD]["values_fn"]()
+    # The PATCH also takes "" ("no choice"), which is not an option to render.
+    assert entry["enumValues"] == sorted(set(_EDITABLE_CONFIG[FIELD]["values_fn"]()) - {""})
+    assert acp_backends.STORED_BACKEND_KIRO in entry["enumValues"]
+    assert "" not in entry["enumValues"]
 
 
 def test_the_schema_endpoint_leaves_other_fields_alone():
@@ -188,6 +198,7 @@ def test_baseline_ships_every_known_backend():
             ACP_BACKEND_OPENCODE,
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
+            ACP_BACKEND_DEEPSEEK,
             ACP_BACKEND_COPILOT,
         ]
     )

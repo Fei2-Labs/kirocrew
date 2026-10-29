@@ -191,6 +191,71 @@ def test_provider_failures_never_buy_a_model_turn(
 
 
 @pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ProviderErrorKind.TRANSIENT, MonitorDecision.RETRY_PROVIDER),
+        (ProviderErrorKind.RATE_LIMITED, MonitorDecision.RETRY_PROVIDER),
+        (ProviderErrorKind.AUTHENTICATION, MonitorDecision.STOP_BLOCKED),
+        (ProviderErrorKind.AUTHORIZATION, MonitorDecision.STOP_BLOCKED),
+        (ProviderErrorKind.NOT_FOUND, MonitorDecision.STOP_BLOCKED),
+        (ProviderErrorKind.SETUP, MonitorDecision.STOP_BLOCKED),
+    ],
+)
+@pytest.mark.parametrize("site", ["settled", "masked_actionable"])
+def test_supplemental_error_kind_gates_retry(
+    error: ProviderErrorKind,
+    expected: MonitorDecision,
+    site: str,
+) -> None:
+    """A permanent secondary failure stops instead of burning the error budget.
+
+    Both callers are covered: a settled (non-actionable) tick, and an actionable
+    tick whose every condition is still inside its re-alert interval.
+    """
+    if site == "settled":
+        observation = MonitorObservation(
+            "pending-a",
+            MonitorObservationStatus.PENDING,
+            supplemental_provider_error=error,
+        )
+        state = _state(
+            last_fingerprint="pending-a",
+            budgets=MonitorBudgets(max_provider_errors=3),
+        )
+    else:
+        observation = MonitorObservation(
+            "dup",
+            MonitorObservationStatus.ACTIONABLE,
+            supplemental_provider_error=error,
+        )
+        state = _state(
+            last_fingerprint="dup",
+            last_wake_fingerprint="dup",
+            coalesce_alerted={"dup": 1_000.0},
+            budgets=MonitorBudgets(max_provider_errors=3),
+        )
+    assert decide_monitor(state, observation, now=1_100.0).decision is expected
+
+
+@pytest.mark.parametrize("error", [ProviderErrorKind.TRANSIENT, ProviderErrorKind.RATE_LIMITED])
+def test_supplemental_retryable_error_still_stops_at_budget(
+    error: ProviderErrorKind,
+) -> None:
+    """The retryable gate does not lift the budget: the last retry still stops."""
+    observation = MonitorObservation(
+        "pending-a",
+        MonitorObservationStatus.PENDING,
+        supplemental_provider_error=error,
+    )
+    state = _state(
+        last_fingerprint="pending-a",
+        consecutive_provider_errors=2,
+        budgets=MonitorBudgets(max_provider_errors=3),
+    )
+    assert decide_monitor(state, observation, now=1_100.0).decision is MonitorDecision.STOP_BLOCKED
+
+
+@pytest.mark.parametrize(
     ("state", "now"),
     [
         (_state(budgets=MonitorBudgets(max_runtime_secs=100)), 1_100.0),
@@ -225,15 +290,24 @@ def test_exhausted_budget_prevents_even_an_actionable_wake(
     ("field", "value"),
     [
         ("max_runtime_secs", 0),
-        ("max_agent_turns", 0),
         ("max_tokens", 0),
         ("max_provider_errors", 0),
     ],
 )
-def test_structured_monitor_budgets_cannot_be_unlimited(field: str, value: int) -> None:
-    """First-class monitors reject legacy goal-loop unlimited values."""
+def test_structured_monitor_cost_budgets_cannot_be_unlimited(field: str, value: int) -> None:
+    """The three cost budgets reject legacy goal-loop unlimited values.
+
+    These are what bound what a watch SPENDS, and an unlimited wake count relies
+    on them to stay affordable, so zero is refused here even though
+    ``max_agent_turns`` admits it.
+    """
     with pytest.raises(ValueError, match=field):
         MonitorBudgets(**{field: value})
+
+
+def test_structured_monitor_wake_budget_reads_zero_as_unlimited() -> None:
+    """``max_agent_turns`` alone carries the legacy unlimited meaning."""
+    assert MonitorBudgets(max_agent_turns=0).max_agent_turns == 0
 
 
 def test_provider_error_observation_requires_an_error_category() -> None:

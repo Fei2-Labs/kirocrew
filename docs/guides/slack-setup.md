@@ -43,7 +43,12 @@ This prints a one-click URL that opens Slack's "Create New App" page with all sc
 ```
 🔗 Click to create your Slack app:
 https://api.slack.com/apps?new_app=1&manifest_yaml=...
+
+   Slash command: /kirocrew-<alias> — the gateway answers it once slack.command matches:
+   kirocrew config set slack.command kirocrew-<alias>
 ```
+
+The app's slash command is `/kirocrew-<alias>` (lowercase, cut to Slack's 32-character limit), so people with different aliases in one Enterprise Grid org register different commands. Two aliases that differ only in case, or only after their first 22 characters, still collide; pass `--alias` to pick another. Run the printed `kirocrew config set slack.command` line so the gateway answers it; `kirocrew setup --slack` keeps offering `kirocrew` (or your configured command) as its default.
 
 ### Step 2. Create the App from the Link
 
@@ -157,7 +162,9 @@ Add it only if you want custom workspace emojis to appear in the emoji picker.
 > retroactively grant it: Slack only grants new scopes when the app is
 > **reinstalled** to the workspace. After adding scopes (or importing an
 > updated manifest), go to **Settings → Install App → Reinstall to Workspace**
-> and copy the new Bot Token.
+> and copy the new Bot Token. Importing a manifest from `kirocrew manifest`
+> renames the app's slash command to `/kirocrew-<alias>`: run the
+> `kirocrew config set slack.command` line it prints, then restart the gateway.
 
 ### Step 4. Add User Scopes
 
@@ -408,8 +415,9 @@ A dashboard chat session can be linked to a Slack thread for two-way sync.
 2. Pick a target from the link list. The Slack DM entry is always offered; other
    entries come from your configured channel targets
 3. A new thread is posted in that conversation, titled from the session title
-   (falling back to a snippet of the first prompt), followed by the last five
-   messages as context. Titles and message text are redacted before posting
+   (falling back to a snippet of the first prompt), followed by the opening
+   turn, a gap marker when turns were skipped, and the last five turns (user and
+   assistant) as context. Titles and message text are redacted before posting
 4. The menu then shows a "Connected" row for the link, plus actions to post a
    reminder into the thread or to unlink
 
@@ -441,7 +449,7 @@ message being forwarded to the linked session.
 
 ### Slash Commands
 
-The slash command name is configurable via `slack.command` in config (default: `kirocrew`).
+The slash command name is configurable via `slack.command` in config (default: `kirocrew`). It must match the command in your Slack app: `kirocrew manifest` registers `/kirocrew-<alias>` and prints the matching `kirocrew config set slack.command` line.
 
 | Command | Purpose |
 |---------|---------|
@@ -465,7 +473,11 @@ match falls through to it.
 
 ### Owner-Only Bang Commands
 
-These `!`-prefixed commands are restricted to `KIROCREW_OWNER_ID`.
+These `!`-prefixed commands are restricted to `KIROCREW_OWNER_ID`. Most of them
+are deprecated in favour of `/kirocrew` sub-commands: `!yolo`, `!stop`, `!voice`,
+`!agent`, `!ta`, `!dashboard`, `!channel`, `!link-to-dashboard` and `!restart`
+still run, and the reply carries a deprecation notice naming the slash command
+to use instead.
 
 | Command | Purpose |
 |---------|---------|
@@ -490,9 +502,12 @@ Available in DMs or @mentions.
 | `status` | Show runtime stats summary |
 | `spawn <task>` | Start a background subagent |
 | `bg <task>` | Alias for `spawn <task>` |
-| `spawn list` | List active subagents |
+| `spawn list` / `spawn status` | List active subagents |
 | `cron list` | List cron jobs |
 | `cron remove <id>` | Remove a cron job |
+| `cron remove all` | Remove every cron job |
+| `cron pause <id>` / `cron resume <id>` | Pause or resume a cron job |
+| `run <spec-path>` | Start the task runner on a spec file |
 | `sessions` | List recent sessions with resume buttons |
 
 ---

@@ -16,9 +16,10 @@ existing suite leaves untouched:
 * ``/api/outbox`` and ``/api/outbox/{filename}`` — listing filters and the
   download refusals.
 * ``/api/reveal`` — the ``action=open`` arms and the no-opener fallback.
-* ``/api/upload`` and ``/api/screenshot`` — the non-macOS refusal and, with a
-  faked ``asyncio.create_subprocess_exec``, the success, cancel and timeout
-  arms. No real process is ever spawned.
+* ``/api/upload`` and ``/api/screenshot`` — the non-macOS refusal, the refusal
+  when the dialog binary does not resolve out of the trusted system directories,
+  and, with a faked ``asyncio.create_subprocess_exec``, the success, cancel and
+  timeout arms. No real process is ever spawned.
 * ``/api/dashboard/config`` — the PUT field validation matrix and the
   cancellation audit arm.
 * ``_content_matches_ext`` / ``_fuzzy_score`` — pure-function branches.
@@ -42,6 +43,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from kiro_crew import atomic_write as atomic_write_mod
@@ -85,13 +87,13 @@ def mock_sel():
 def _app(method: str, route: str, handler) -> web.Application:
     app = web.Application()
     app.router.add_route(method, route, handler)
-    return app
+    return as_owner(app)
 
 
 def _get_app(route: str, handler) -> web.Application:
     app = web.Application()
     app.router.add_get(route, handler)  # allow_head=True → HEAD hits the same handler
-    return app
+    return as_owner(app)
 
 
 # ── /api/file-read ──
@@ -148,6 +150,180 @@ class TestFileRead:
             assert resp.status == 200
             assert resp.headers["X-Truncated"] == "true"
             assert len(await resp.text()) == 512_000
+
+    @pytest.mark.asyncio
+    async def test_a_credential_straddling_the_read_cap_is_still_masked(self, tmp_path, mock_sel):
+        """The redaction pass sees whole text and the cap cuts afterwards.
+
+        A cut first severs a credential at the cap and serves its prefix as real
+        bytes; whoever writes the file chooses the offset.
+        """
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        f = tmp_path / "padded.txt"
+        f.write_bytes(("a" * (files_mod._FILE_READ_CAP - 10) + secret + "\nkeep\n").encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert secret[:10] not in body
+        assert len(body) <= files_mod._FILE_READ_CAP
+
+    @pytest.mark.asyncio
+    async def test_redaction_shrinking_earlier_text_pulls_no_unmatched_tail_under_the_cap(
+        self, tmp_path, mock_sel
+    ):
+        """The cut is in raw coordinates, not in the shorter redacted output.
+
+        Long tokens near the top shrink by thousands of characters when masked;
+        a cut of the redacted text at the cap would then reach raw text past the
+        read window, where a key the read severed was never matched whole.
+        """
+        import base64
+
+        def b64(raw: str) -> str:
+            return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+
+        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + b64("x" * 3000) + "." + "s" * 43
+        head = (jwt + "\n") * 4
+        cap, margin = files_mod._FILE_READ_CAP, files_mod._STREAM_HOLDBACK_JWT_MAX
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        filler = "a" * (cap + margin - 6 - len(head))
+        f = tmp_path / "shrink.txt"
+        f.write_bytes((head + filler + secret + "\nkeep\n").encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert resp.headers["X-Redacted"] == "true"
+        assert jwt not in body
+        assert secret[:6] not in body
+        assert len(body) <= cap
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("before_cap", [4999, 100])
+    async def test_a_jwt_longer_than_the_margin_straddling_the_cap_is_masked(
+        self, tmp_path, mock_sel, before_cap
+    ):
+        """A token longer than the margin is masked wherever it crosses the cap.
+
+        Its header may sit more than the margin before the cap, or its end may
+        lie past the read, so no pass over the read sees it whole.
+        """
+        import base64
+
+        def b64(raw: str) -> str:
+            return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+
+        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + b64("x" * 4500) + "." + "s" * 43
+        assert len(jwt) > files_mod._STREAM_HOLDBACK_JWT_MAX
+        cap = files_mod._FILE_READ_CAP
+        f = tmp_path / "long_jwt.txt"
+        f.write_bytes(("a" * (cap - before_cap) + " " + jwt + "\nkeep\n").encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert jwt[:40] not in body
+        assert len(body) <= cap
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("before_cap", [9999, 8000])
+    async def test_a_jwt_over_twice_the_margin_ending_inside_the_read_is_masked(
+        self, tmp_path, mock_sel, before_cap
+    ):
+        """A JWT that crosses the cap and ends inside the read is seen whole once.
+
+        The whole-read pass must hold the token in one redaction call, wherever
+        below the cap it starts and however long it is.
+        """
+        import base64
+
+        def b64(raw: str) -> str:
+            return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+
+        jwt = b64('{"alg":"HS256","typ":"JWT"}') + "." + b64("x" * 8500) + "." + "s" * 43
+        cap, margin = files_mod._FILE_READ_CAP, files_mod._STREAM_HOLDBACK_JWT_MAX
+        start = cap - before_cap
+        assert len(jwt) > 2 * margin
+        assert cap < start + len(jwt) < cap + margin
+        raw = "a" * (start - 1) + " " + jwt + "\n" + "b\n" * 10_000
+        f = tmp_path / "longer_jwt.txt"
+        f.write_bytes(raw.encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert jwt[:40] not in body
+        assert len(body) <= cap
+
+    @pytest.mark.asyncio
+    async def test_a_pem_block_below_the_cap_is_masked_and_keeps_the_body_whole(
+        self, tmp_path, mock_sel
+    ):
+        """A key block well below the cap is masked and the body runs to the cap."""
+        line = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7" + "x" * 12
+        # The markers are assembled so this file's own text carries no key marker.
+        pem = (
+            "-----BEGIN " + "PRIVATE KEY-----\n"
+            + "\n".join([line] * 100)
+            + "\n-----END " + "PRIVATE KEY-----\n"
+        )
+        cap = files_mod._FILE_READ_CAP
+        raw = "a\n" * 50_000 + pem + "b\n" * 300_000
+        f = tmp_path / "pem.txt"
+        # Bytes, not text mode: Windows would write every "\n" as "\r\n".
+        f.write_bytes(raw.encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert line[:20] not in body
+        assert body.endswith("b\n" * 100)
+        assert len(body) > cap - len(pem) - 8192
+
+    @pytest.mark.asyncio
+    async def test_a_jwt_run_the_read_cuts_off_is_withheld_whole(
+        self, tmp_path, mock_sel, monkeypatch
+    ):
+        """A run with a JWT header that the read's end severs never reaches the body.
+
+        The redactor is the identity here, so only the cut-back can keep it out.
+        """
+        seen: list[int] = []
+
+        def recording(text: str) -> str:
+            seen.append(len(text))
+            return text
+
+        monkeypatch.setattr(files_mod, "redact", recording)
+        f = tmp_path / "eyj.txt"
+        f.write_bytes(("a\n" + "eyJ" * 173_333 + "!").encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert body == "a\n"
+        assert sorted(seen) == [2, files_mod._FILE_READ_CAP]
+
+    @pytest.mark.asyncio
+    async def test_a_run_without_a_jwt_header_across_the_cap_keeps_the_body_whole(
+        self, tmp_path, mock_sel
+    ):
+        """An anchorless run across the cap is cut a holdback before the read's end."""
+        f = tmp_path / "blob.txt"
+        f.write_bytes(("A" * 600_000).encode("utf-8"))
+        async with TestClient(TestServer(self._client_app())) as client:
+            resp = await client.get(f"/api/file-read?path={f}")
+            body = await resp.text()
+        assert resp.status == 200
+        assert resp.headers["X-Truncated"] == "true"
+        assert body == "A" * files_mod._FILE_READ_CAP
 
     @pytest.mark.asyncio
     async def test_untruncated_file_has_no_flag(self, tmp_path, mock_sel):
@@ -270,7 +446,9 @@ class TestFileRead:
 class TestFileWrite:
     @staticmethod
     def _client_app() -> web.Application:
-        return _app("POST", "/api/file-write", files_mod.api_file_write)
+        # Owner-gated route: the identity is plumbing so these tests stay on the
+        # branch each one names (the gate itself: test_file_write_owner_gate.py).
+        return as_owner(_app("POST", "/api/file-write", files_mod.api_file_write))
 
     @pytest.mark.asyncio
     async def test_writes_content_atomically(self, tmp_path, mock_sel):
@@ -951,6 +1129,19 @@ class _FakeProc:
             raise ProcessLookupError
 
 
+@pytest.fixture()
+def trusted_dialog_bin(monkeypatch):
+    """Resolve the dialog binaries without probing this host.
+
+    Both handlers pin their binary to the fixed system directories, and the
+    machine running these tests holds neither one there, so a darwin-simulating
+    test would otherwise land on the unavailable arm instead of the spawn.
+    """
+    monkeypatch.setattr(
+        platform_compat, "trusted_system_bin", lambda name: f"/usr/bin/{name}"
+    )
+
+
 class TestNativePickers:
     @pytest.mark.asyncio
     async def test_upload_is_refused_off_macos(self, mock_sel):
@@ -963,7 +1154,43 @@ class TestNativePickers:
                 assert "only available on macOS" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_upload_returns_selected_paths(self, mock_sel):
+    async def test_upload_is_refused_when_osascript_is_not_trusted(self, mock_sel, monkeypatch):
+        """An osascript that does not resolve out of the trusted directories is a
+        refusal, not a bare-name spawn: PATH can lead with an agent-writable
+        directory, so the bare name is exactly what must never run."""
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+        spawn = AsyncMock()
+        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+            async with TestClient(
+                TestServer(_app("POST", "/api/upload", files_mod.api_upload))
+            ) as client:
+                resp = await client.post("/api/upload")
+                assert resp.status == 501
+                body = await resp.json()
+                assert body["code"] == "file_picker_unavailable"
+                assert "unavailable" in body["error"]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_screenshot_is_refused_when_screencapture_is_not_trusted(
+        self, mock_sel, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
+        monkeypatch.setattr(platform_compat, "trusted_system_bin", lambda name: None)
+        spawn = AsyncMock()
+        with patch("sys.platform", "darwin"), patch("asyncio.create_subprocess_exec", spawn):
+            async with TestClient(
+                TestServer(_app("POST", "/api/screenshot", files_mod.api_screenshot))
+            ) as client:
+                resp = await client.post("/api/screenshot")
+                assert resp.status == 501
+                body = await resp.json()
+                assert body["code"] == "screenshot_unavailable"
+                assert "unavailable" in body["error"]
+        spawn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_upload_returns_selected_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"/Users/x/a.png\n\n/Users/x/b.txt\n")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
@@ -973,10 +1200,10 @@ class TestNativePickers:
                 resp = await client.post("/api/upload")
                 assert resp.status == 200
                 assert (await resp.json())["paths"] == ["/Users/x/a.png", "/Users/x/b.txt"]
-        assert spawn.await_args.args[0] == "osascript"
+        assert spawn.await_args.args[0] == "/usr/bin/osascript"
 
     @pytest.mark.asyncio
-    async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel):
+    async def test_upload_cancelled_dialog_returns_no_paths(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(stdout=b"\n  \n")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -987,7 +1214,7 @@ class TestNativePickers:
                 assert await resp.json() == {"paths": []}
 
     @pytest.mark.asyncio
-    async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel):
+    async def test_upload_timeout_kills_dialog_and_returns_504(self, mock_sel, trusted_dialog_bin):
         proc = _FakeProc(fail_first=True, kill_raises=True)
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
@@ -1010,7 +1237,8 @@ class TestNativePickers:
                 assert "only available on macOS" in (await resp.json())["error"]
 
     @pytest.mark.asyncio
-    async def test_screenshot_returns_captured_path(self, tmp_path, mock_sel, monkeypatch):
+    async def test_screenshot_returns_captured_path(self, tmp_path, mock_sel, monkeypatch,
+                                                    trusted_dialog_bin):
         shots = tmp_path / "screenshots"
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", shots)
         captured: dict[str, tuple] = {}
@@ -1029,13 +1257,13 @@ class TestNativePickers:
                 resp = await client.post("/api/screenshot")
                 assert resp.status == 200
                 path = (await resp.json())["path"]
-        assert captured["argv"][:2] == ("screencapture", "-i")
+        assert captured["argv"][:2] == ("/usr/bin/screencapture", "-i")
         assert Path(path).parent == shots
         assert Path(path).read_bytes().startswith(b"\x89PNG")
 
     @pytest.mark.asyncio
     async def test_screenshot_user_cancel_returns_empty_path(self, tmp_path, mock_sel,
-                                                             monkeypatch):
+                                                             monkeypatch, trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         with patch("sys.platform", "darwin"), \
              patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_FakeProc())):
@@ -1047,7 +1275,8 @@ class TestNativePickers:
                 assert await resp.json() == {"path": ""}
 
     @pytest.mark.asyncio
-    async def test_screenshot_timeout_returns_504(self, tmp_path, mock_sel, monkeypatch):
+    async def test_screenshot_timeout_returns_504(self, tmp_path, mock_sel, monkeypatch,
+                                                  trusted_dialog_bin):
         monkeypatch.setattr(files_mod, "_SCREENSHOT_DIR", tmp_path / "shots")
         proc = _FakeProc(fail_first=True)
         with patch("sys.platform", "darwin"), \
@@ -1282,10 +1511,13 @@ class TestDashboardConfigPut:
             "merge_queued_messages",
             "tail_fork_enabled",
             "folder_suggestions_enabled",
+            "topic_tags_enabled",
             "link_previews",
             "quick_send",
             "session_grid",
             "mcp_app_panel",
+            "side_panel_always_open",
+            "side_panel_pin_summary",
         ]
         async with TestClient(TestServer(config_client_app)) as client:
             for field in bool_fields:
@@ -1297,8 +1529,11 @@ class TestDashboardConfigPut:
     async def test_coded_boolean_errors_carry_a_machine_code(self, config_client_app):
         coded = {
             "folder_suggestions_enabled": "invalid_folder_suggestions_enabled",
+            "topic_tags_enabled": "invalid_topic_tags_enabled",
             "link_previews": "invalid_link_previews",
             "mcp_app_panel": "invalid_mcp_app_panel",
+            "side_panel_always_open": "invalid_side_panel_always_open",
+            "side_panel_pin_summary": "invalid_side_panel_pin_summary",
         }
         async with TestClient(TestServer(config_client_app)) as client:
             for field, code in coded.items():
@@ -1360,13 +1595,16 @@ class TestDashboardConfigPut:
             "merge_queued_messages": True,
             "default_memory_mode": "temporary",
             "widget_density": "less",
-            "verbosity": "ultra",
+            "verbosity": "answer_only",
             "quick_send": True,
             "session_grid": True,
             "mcp_app_panel": True,
             "tail_fork_enabled": True,
             "link_previews": True,
             "folder_suggestions_enabled": True,
+            "topic_tags_enabled": True,
+            "side_panel_always_open": True,
+            "side_panel_pin_summary": True,
         }
         async with TestClient(TestServer(config_client_app)) as client:
             resp = await client.put("/api/dashboard/config", json=payload)

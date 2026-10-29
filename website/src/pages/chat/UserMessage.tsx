@@ -1,6 +1,6 @@
 import { memo, useState, useRef, useEffect, useCallback, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
-import { Pencil, Send, Copy, Check, Link2, Target, Pin, PinOff, X } from 'lucide-react'
+import { Pencil, Send, Copy, Check, Link2, MessageSquare, Target, Pin, PinOff, X, Clock, Quote, MoreHorizontal } from 'lucide-react'
 import { copyToClipboard } from '../../utils/clipboard'
 import { copySessionLink } from '../../utils/shareUrl'
 import { ICON_ACTION_ROW_CLS } from '../../utils/touchActions'
@@ -14,7 +14,12 @@ import { type PasteBlock, expandAll as expandPasteTokens } from '../../utils/pas
 import { i18nT } from '../../i18n/t'
 import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 import InfoTip from '../../components/InfoTip'
+import ErrorNotice from '../../components/ErrorNotice'
 import SteerDecisionLine from './SteerDecisionLine'
+import QuoteCard from './QuoteCard'
+import MessageContextMenu, { type MessageMenuItem } from './MessageContextMenu'
+import { prependQuote, quoteBlock, readMessageQuote, stripQuoteBlock, type MessageQuote } from '../../chat-core/composer/messageQuote'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../../components/ui/dropdown-menu'
 import { readSteerRecord } from './decisionRecord'
 // Steer bubbles play a one-shot entrance (slide-in + ring pulse) when they land.
 // The chat transcript is virtualized, so a row can remount when scrolled away and
@@ -35,12 +40,21 @@ interface UserMessageProps {
   canEdit?: boolean
   messageIndex?: number
   messageTs?: string
-  onEditResend?: (index: number, ts: string, newContent: string) => void
+  /** Returns `false` when the host could not take the edit right now: the
+   *  editor then stays open with the text, so nothing typed is lost. */
+  onEditResend?: (index: number, ts: string, newContent: string) => void | boolean
+  /** Opt-in: a double-click on the read-only bubble opens the editor. Off by
+   *  default because the gesture replaces native double-click word selection
+   *  on the bubble. The pencil button is the edit path for everyone. Wired
+   *  from Settings → Chat → "Double-click to edit your messages". */
+  doubleClickToEdit?: boolean
   slotKey?: string
   slotTitle?: string
   mode?: string
   pinned?: boolean
   onTogglePin?: () => void
+  /** Open (or start) the reply thread on this message. Only a crewmate's chat offers it. */
+  onReplyInThread?: () => void
   /** Whether the slot currently has a running turn. Gates the pending-steer
    *  indicator: the backend settle is best-effort, so a row can be stranded in
    *  `written` forever, and a perpetual "Steering…" pulse on an idle slot
@@ -55,9 +69,39 @@ interface UserMessageProps {
    *  send while the member works is a steer), the badge would label every
    *  such send with the mechanics the surface exists to hide. */
   hideSteerBadge?: boolean
+  /** Bubble colour. `default` is the single-chat page's neutral `bg-card`
+   *  surface. `accent` fills the bubble with the theme accent and sets its text
+   *  to `--accent-fg` — the iMessage pairing a crewmate's chat uses (#17839),
+   *  where the crewmate's gray bubble sits opposite. The `user-bubble-accent`
+   *  hook recolours inline code and links onto `--accent-fg` (index.css), since
+   *  the message-wide code and link colours assume the neutral surface. */
+  tone?: 'default' | 'accent'
+  /** ⌘↑ / Ctrl+Up edit request: a monotonically increasing sequence
+   *  number. ChatPage passes a NEW value when the keyboard requests an edit of
+   *  THIS row (the session's last user message); the rising edge opens the
+   *  existing Edit & resend editor with the caret at the end — the same state
+   *  the hover affordance drives. */
+  editRequest?: number
+  /** Acknowledgement for the ⌘↑ request above: called exactly once when this
+   *  row consumes a request, so ChatPage can drop it. A consumed request must
+   *  never persist — a remount would replay the rising edge and re-open the
+   *  editor over the user's dismissed draft. */
+  onEditConsumed?: () => void
+  /** Stage THIS whole message as the quote of the next send. Offering it
+   *  changes the row's shape: Quote takes the first seat and the everyday
+   *  actions (copy, link, pin, edit) fold into a More menu, so the row keeps
+   *  two peer controls. It also arms the bubble's right-click / long-press menu,
+   *  which lists Quote first and the same actions after it. Absent, the row
+   *  and the bubble are byte-for-byte what they were. Receives the text this
+   *  bubble SHOWS -- collapsed pastes expanded from `meta.pastes` -- so a
+   *  quoted paste carries the pasted text, never its `[ Paste #N ]` token. */
+  onQuoteMessage?: (shownContent: string) => void
+  /** Scroll to the message this row quotes (`meta.quote`). Absent, the card is
+   *  drawn but is not a control. */
+  onJumpToQuote?: (quote: MessageQuote) => void
 }
 
-const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, slotKey, slotTitle, mode, pinned, onTogglePin, slotRunning, hideSteerBadge }: UserMessageProps) {
+const UserMessage = memo(function UserMessage({ content, meta, timestamp, timestampTitle, renderContent, canEdit, messageIndex, messageTs, onEditResend, doubleClickToEdit = false, slotKey, slotTitle, mode, pinned, onTogglePin, onReplyInThread, slotRunning, hideSteerBadge, tone = 'default', editRequest, onEditConsumed, onQuoteMessage, onJumpToQuote }: UserMessageProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [editing, setEditing] = useState(false)
   const ime = useImeGuard()
@@ -70,6 +114,19 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   type CopyOutcome = 'idle' | 'ok' | 'failed'
   const [copied, setCopied] = useState<CopyOutcome>('idle')
   const [linkCopied, setLinkCopied] = useState<CopyOutcome>('idle')
+  // Open state of the More menu the row shows once Quote is offered.
+  const [moreOpen, setMoreOpen] = useState(false)
+  // A refused clipboard write is reported through ErrorNotice under the row
+  // (the same surface AssistantMessage uses), not only by the icon flip.
+  const [copyFailed, setCopyFailed] = useState(false)
+  // Whether this row is the pinned banner's stand-in at the moment a menu
+  // opens. index.css hides the inline pencil there (`[data-pinned-standin]
+  // [data-message-edit]{display:none}`) because Edit would mount the editor
+  // inside a `visibility: hidden` row; a menu item is portaled out of that
+  // subtree, so the same rule cannot reach it -- the item is withheld here
+  // instead, read off the DOM when the menu opens (fork Opus review).
+  const [standIn, setStandIn] = useState(false)
+  const readStandIn = (open: boolean) => setStandIn(open && !!userRef.current?.closest('[data-pinned-standin]'))
   const copyOutcomeIcon = (state: CopyOutcome, idle: ReactNode) =>
     state === 'ok' ? <Check size={14} className="text-ok" />
       : state === 'failed' ? <X size={14} className="text-danger" />
@@ -108,7 +165,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
   // what both doors carry -- the live `steer_push` / `queue_push` reconcile and a
   // row reloaded from history -- so the line survives a reload without a fetch.
   // Absent on every ordinary send, and that absence is what draws nothing.
-  const steerDecision = readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
+  const steerDecision = hideSteerBadge ? null : readSteerRecord((meta as { decisions_strip?: unknown } | undefined)?.decisions_strip)
   const steerState = (meta as { steerState?: string } | undefined)?.steerState
   const steerOptimistic = !!(meta as { optimistic?: boolean } | undefined)?.optimistic
   const isSteer = !hideSteerBadge
@@ -155,6 +212,26 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     setPlaySteer(true)
   }, [isSteer, playSteer, meta, messageTs, content])
 
+  // A PLAIN send whose receipt never came. `markSendUnconfirmed` stamps
+  // `deliveryUnconfirmed` on the bubble when the transport deadline fires with
+  // no echo, and the receipt or echo that finally proves delivery clears it.
+  // Keyed on that mark, never on `optimistic` alone: the flag also survives a
+  // `refused` or `transport-error` send (whose error row and restored composer
+  // already say what happened) and a `queued` receipt (whose card owns the
+  // text), and a line on those rows would claim a wait nobody is waiting on.
+  // Carried on the row itself, not left to the WARN notice the same receipt
+  // posts under it: that notice is an ordinary transcript row, not an
+  // always-visible one like an error row, so once a later inject-dispatched
+  // turn (a cron prompt, a queued continuation) lands in this bubble's turn,
+  // a transcript that collapses reasoning folds the notice behind the steps
+  // toggle while the bubble stays on screen. No running-turn gate either,
+  // unlike `pendingSteer`: the mark is client-minted and never persisted, so
+  // a row re-read from history cannot carry it, and the send that most needs
+  // the line is one whose local turn has already ended. A steer bubble never
+  // carries it (the steer path drops its bubble on this receipt), so the two
+  // pending treatments stay disjoint.
+  const pendingSend = !!(meta as { deliveryUnconfirmed?: boolean } | undefined)?.deliveryUnconfirmed
+
   useEffect(() => {
     if (editing && taRef.current) {
       const ta = taRef.current
@@ -163,22 +240,50 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     }
   }, [editing])
 
+  // The quote this row CARRIES (`meta.quote`): drawn as a card at the top of the
+  // bubble, and the matching `>` block is dropped from the rendered body so the
+  // same text is not shown twice. See `messageQuote.ts`.
+  const carriedQuote = readMessageQuote(meta)
   const startEdit = useCallback(() => {
     // Expand any collapsed paste tokens into their original content so the
     // user can actually edit the pasted text. Once edited, the message is
-    // resent as plain expanded text — no chip reconstruction.
+    // resent as plain expanded text — no chip reconstruction. The carried
+    // quote's block comes off too: the editor shows what the bubble shows,
+    // and `submit` puts the block back on the head.
     const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
-    const initial = pastes.length ? expandPasteTokens(content, pastes) : content
+    const body = carriedQuote ? stripQuoteBlock(content, carriedQuote) : content
+    const initial = pastes.length ? expandPasteTokens(body, pastes) : body
     setDraft(initial)
     setEditing(true)
-  }, [content, meta])
+  }, [content, meta, carriedQuote])
+
+  // ⌘↑ / Ctrl+Up edit request: fire on the rising edge only, so a
+  // re-render that re-delivers the same seq (or a memo-compare miss elsewhere)
+  // does not re-open the editor over the user's in-progress draft.
+  const lastEditRequestRef = useRef(0)
+  useEffect(() => {
+    if (!editRequest || editRequest === lastEditRequestRef.current) return
+    lastEditRequestRef.current = editRequest
+    if (editing) {
+      // Already open with a draft in progress — restart would overwrite it
+      // with the original content. Just refocus, no re-fetch.
+      taRef.current?.focus()
+      onEditConsumed?.()
+    } else if (canEdit && onEditResend) {
+      startEdit()
+      onEditConsumed?.()
+    }
+  }, [editRequest, editing, canEdit, onEditResend, onEditConsumed, startEdit])
   const cancel = useCallback(() => setEditing(false), [])
   const submit = useCallback(() => {
     const trimmed = draft.trim()
     if (!trimmed) { setEditing(false); return }
-    onEditResend?.(messageIndex ?? 0, messageTs ?? '', trimmed)
+    // The block the editor hid goes back on the head, so the resent text
+    // still carries the quoted message the user wrote the reply to.
+    const resend = carriedQuote && content.startsWith(quoteBlock(carriedQuote)) ? prependQuote(trimmed, carriedQuote) : trimmed
+    if (onEditResend?.(messageIndex ?? 0, messageTs ?? '', resend) === false) return
     setEditing(false)
-  }, [draft, onEditResend, messageIndex, messageTs])
+  }, [draft, onEditResend, messageIndex, messageTs, carriedQuote, content])
 
   const userRef = useRef<HTMLDivElement>(null)
   const { term, caseSensitive } = useSearchHighlight()
@@ -214,6 +319,16 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     const contained = userRef.current && containedSelectionRange(range, userRef.current)
     if (!contained) return
     const frag = contained.cloneContents()
+    // A chip carries its full path as visually-hidden `sr-only` text, so a
+    // screen reader reads the path rather than the short visible label. That
+    // text is a real node in the clone, and the `textContent` serialization
+    // below does not consult CSS — so `user-select: none`, which does keep the
+    // path out of the browser's OWN copy, cannot keep it out of this one, and
+    // the path would land in the clipboard glued to the label beside it. Drop
+    // every visually-hidden node from the clone first, so what is written is
+    // what the bubble shows. Done here rather than per chip shape: any
+    // visually-hidden text inside a bubble belongs to a reader, not a paste.
+    frag.querySelectorAll('.sr-only').forEach(n => n.remove())
     const chips = frag.querySelectorAll('[data-paste-seq]')
     if (!chips.length) return
     const bySeq = new Map(pastes.map(p => [p.seq, p]))
@@ -230,16 +345,29 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     e.preventDefault()
   }, [meta])
 
+  // The gesture is attached only when the user opted in: it takes the
+  // double-click that would otherwise select a word in the bubble.
+  const dblClickEdits = !!(canEdit && onEditResend && doubleClickToEdit)
+
+  // Declared before the editing early-return so hook order stays stable across
+  // the read-only and editing renders.
+  const handleDoubleClick = useCallback(() => { startEdit() }, [startEdit])
+
   if (editing) {
     return (
-      <div data-role="user" className="group/msg flex flex-col items-end max-w-full">
+      // `data-message-editing`: usePinnedPrompt reads this off the row it is about
+      // to hide and refuses to pin it. The stand-in state hides the whole row and
+      // the card copies only a bubble, so an edit opened before the row reached
+      // the fold would otherwise continue inside an invisible textarea, with its
+      // Send out of reach. The editor stays visible; the banner is simply absent.
+      <div data-role="user" data-message-editing="" className="group/msg flex flex-col items-end max-w-full">
         {/* `edit-grow` is a CSS grid auto-sizer: a hidden ::after mirror (fed by
             data-replicated-value) drives the grid track so the textarea grows
             with its own content — width AND height — exactly like the read-only
-            bubble it replaces, capped at 550px or the column, whichever is
-            smaller. No JS measurement. */}
+            bubble it replaces, capped at the content column (Settings → Chat →
+            Content Width, via the row's --mc-content-width). No JS measurement. */}
         <div
-          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] outline-solid outline-2 -outline-offset-2 outline-accent/60"
+          className="edit-grow user-bubble px-4 py-2 leading-relaxed rounded-xl bg-card text-card-fg overflow-hidden min-w-0 w-fit max-w-full outline-solid outline-2 -outline-offset-2 outline-accent/60 focus-within:outline-accent"
           data-replicated-value={draft}
           style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}
         >
@@ -265,7 +393,9 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
         </div>
         {/* Actions sit BELOW the bubble (like the read-only action row) so they
             never impose a min-width floor on the auto-sized bubble. */}
-        <div className="flex justify-end gap-2 mt-1">
+        <div className="flex justify-end items-center gap-2 mt-1">
+          {/* Send rewinds: say what it costs, beside the button that does it. */}
+          <span className="text-[12px] leading-4 text-muted">{i18nT('pages.chat.userMessage.edit_replaces_below')}</span>
           <button onClick={cancel} className="px-3 py-1 text-[13px] leading-5 text-muted hover:text-text rounded border border-border hover:bg-bg-hover transition-colors" title={i18nT('pages.chat.userMessage.cancel_esc')}>
             {i18nT('pages.chat.userMessage.cancel')}
           </button>
@@ -277,9 +407,82 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
     )
   }
 
+  // Collapsed pastes expanded: the text this bubble stands for, which is what
+  // Copy copies and what Quote quotes. Only well-formed blocks expand; anything
+  // else on `meta.pastes` is ignored and the content stays as written.
+  const pasteBlocks = (Array.isArray(meta?.pastes) ? meta.pastes : []).filter((b): b is PasteBlock =>
+    !!b && typeof b === 'object' && typeof (b as PasteBlock).seq === 'number' && typeof (b as PasteBlock).content === 'string')
+  const shownContent = pasteBlocks.length ? expandPasteTokens(content, pasteBlocks) : content
+  const renderedBody = carriedQuote ? stripQuoteBlock(content, carriedQuote) : content
+  // What Quote quotes: the body as shown -- a carried quote's block excluded,
+  // so quoting a quoting message never nests the old block and its attribution
+  // inside the new one (fork Opus review) -- with collapsed pastes expanded.
+  const quotableContent = pasteBlocks.length ? expandPasteTokens(renderedBody, pasteBlocks) : renderedBody
+  const copyMessage = () => {
+    const flash = (outcome: CopyOutcome) => {
+      setCopied(outcome)
+      setCopyFailed(outcome === 'failed')
+      if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current)
+      copyResetTimerRef.current = setTimeout(() => {
+        copyResetTimerRef.current = null
+        setCopied('idle')
+      }, 1500)
+    }
+    // `copyToClipboard` resolves `false` (legacy execCommand fallback
+    // refused) as well as rejecting — both are a copy that did not happen.
+    copyToClipboard(shownContent).then(ok => flash(ok ? 'ok' : 'failed'), () => flash('failed'))
+  }
+  const quoteShown = () => onQuoteMessage?.(quotableContent)
+  const copyLink = () => {
+    if (!messageTs || !slotKey) return
+    // Same error surface as Copy: a refused write is reported under the row,
+    // not only on an icon that a closed menu no longer shows.
+    const flash = (outcome: CopyOutcome) => { setLinkCopied(outcome); setCopyFailed(outcome === 'failed'); setTimeout(() => setLinkCopied('idle'), 1500) }
+    copySessionLink(slotKey, slotTitle, messageTs, mode).then(ok => flash(ok ? 'ok' : 'failed'), () => flash('failed'))
+  }
+  const canCopyLink = !!(messageTs && slotKey)
+  const canPin = !!(messageTs && onTogglePin)
+  const canEditResend = !!(canEdit && onEditResend)
+  // Row shape with Quote offered: seat + Copy + More. The seat is Quote, or
+  // Reply in thread on a surface that offers it (Quote then joins the menu).
+  // Copy always follows the seat and never moves into More: one control over
+  // the max-two-buttons rule, a deliberate product ruling, because Copy is the
+  // most-used action.
+  // A message that is ONLY a carried quote has no body of its own to quote:
+  // `quoteFromMessage` refuses empty text, so the action would be a silent
+  // no-op. Withheld from the row and both menus instead (fork Opus review).
+  const quoteOffered = !!onQuoteMessage && quotableContent.trim().length > 0
+  const quoteInRow = quoteOffered && !onReplyInThread
+  const compactRow = !!onQuoteMessage
+  // Copy is a row button, so a message with nothing else to offer (a bare
+  // carried quote on a surface without link, pin or edit) shows no empty More.
+  const moreHasItems = quoteOffered || canCopyLink || canPin || (canEditResend && !standIn)
+  const menuItems: MessageMenuItem[] = onQuoteMessage ? [
+    ...(quoteOffered ? [{ id: 'quote', label: i18nT('pages.chat.userMessage.quote_message'), icon: <Quote size={14} />, onSelect: quoteShown }] : []),
+    // "Copy text", the words the reply's menus use, so the same action reads
+    // the same on both rows (UX review).
+    { id: 'copy', label: i18nT('pages.chat.assistantMessage.copy_text'), icon: <Copy size={14} />, onSelect: copyMessage, separatorBefore: quoteOffered },
+    ...(canCopyLink ? [{ id: 'copy-link', label: i18nT('pages.chat.userMessage.copy_link_to_message'), icon: <Link2 size={14} />, onSelect: copyLink }] : []),
+    ...(canPin ? [{ id: 'pin', label: pinned ? i18nT('pages.chat.userMessage.unpin_message') : i18nT('pages.chat.userMessage.pin_message'), icon: pinned ? <PinOff size={14} /> : <Pin size={14} />, onSelect: () => onTogglePin?.() }] : []),
+    ...(canEditResend && !standIn ? [{ id: 'edit', label: i18nT('pages.chat.userMessage.edit_resend'), icon: <Pencil size={14} />, onSelect: startEdit }] : []),
+  ] : []
+
   const bubble = (
     // 'message-bubble' is a stable theming hook — see website/docs/theming-contract.md
-    <div ref={userRef} onCopy={handleCopy} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-[min(550px,100%)] ${isSteer ? 'bg-accent-subtle text-text' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
+    // `max-w-full`, not a pixel cap: the bubble's maximum is the content column
+    // the transcript row clamps to --mc-content-width, so Settings → Chat →
+    // Content Width governs it exactly as it governs agent output (#8398), while
+    // `w-fit` keeps a short message hugging its text.
+    // A carried quote gives the bubble a FIXED floor (16rem), because the card
+    // inside takes no intrinsic width (see QuoteCard) and a quoted "why?" would
+    // otherwise draw a 60px card. Fixed, not a percentage: every box between
+    // here and the column is fit-content, so a percentage min-width has no
+    // definite containing block and resolves to 0. 16rem is under the
+    // narrowest column the transcript renders (a 390px phone gives 358px).
+    // Disable is safe: the keyboard-accessible edit path is the aria-labelled
+    // pencil button in the action row below, not this bubble.
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions
+    <div ref={userRef} onCopy={handleCopy} onDoubleClick={dblClickEdits ? handleDoubleClick : undefined} className={`message-bubble mc-message-font-scope msg-content px-4 py-2 leading-relaxed rounded-xl overflow-hidden min-w-0 w-fit max-w-full ${carriedQuote ? 'min-w-64' : ''} ${isSteer ? 'bg-accent-subtle text-text' : tone === 'accent' ? 'user-bubble user-bubble-accent bg-accent text-accent-fg' : 'user-bubble bg-card text-card-fg'}`} style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
       {/* `messageTs` FIRST, `clientTs` only as a fallback. The opposite order is
           correct for the audio key above, which wants the optimistic bubble's own
           identity, but this value is COMPARED against server-clock slot mint
@@ -287,9 +490,14 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
           an ahead-skewed one would let a reused slot pass the mint check and open
           the wrong conversation, silently. The fallback still covers a bubble that
           has no server ts yet. */}
-      {renderContent(content, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
+      {carriedQuote && <QuoteCard quote={carriedQuote} variant="sent" onJump={carriedQuote.ts ? onJumpToQuote : undefined} />}
+      {renderContent(renderedBody, meta, messageTs || ((meta as { clientTs?: string })?.clientTs))}
     </div>
   )
+  // The right-click menu wraps the bubble only when Quote is offered (the
+  // menu's reason to exist) on a pointer device; otherwise `MessageContextMenu`
+  // renders the bubble bare.
+  const bubbleWithMenu = <MessageContextMenu items={menuItems} onOpenChange={readStandIn} onCopyFailed={() => setCopyFailed(true)}>{bubble}</MessageContextMenu>
 
   return (
     // Every box between the content column and the bubble is a fit-content flex
@@ -316,19 +524,20 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               decision behind it. */}
           {steerDecision && <SteerDecisionLine record={steerDecision} />}
           <motion.div
-            /* Same width cap as the bubble, not just max-w-full: this wrapper
-               sits between the content column and the bubble, and a percentage
-               cap only bites once EVERY box in that chain carries one (see the
-               root's comment). With only max-w-full, intrinsic sizing treats
-               the bubble's percentage max-width as none, the wrapper inflates
-               to the full column, and the capped bubble inside lands at its
-               LEFT edge while the badge stays right. */
-            className="relative w-fit max-w-[min(550px,100%)]"
+            /* Same width cap as the bubble (the column, `max-w-full`): this
+               wrapper sits between the content column and the bubble, and a
+               percentage cap only bites once EVERY box in that chain carries
+               one (see the root's comment). During intrinsic sizing a
+               percentage max-width is treated as none, so a wrapper whose cap
+               differed from the bubble's would inflate to the full column and
+               the capped bubble inside would land at its LEFT edge while the
+               badge stays right; one shared cap resolves both to one width. */
+            className="relative w-fit max-w-full"
             initial={playSteer ? { opacity: 0, x: 16 } : false}
             animate={{ opacity: 1, x: 0 }}
             transition={{ duration: 0.32, ease: 'easeOut' }}
           >
-            {bubble}
+            {bubbleWithMenu}
             {playSteer && (
               <motion.div
                 aria-hidden="true"
@@ -352,6 +561,20 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               exclusive to backend-confirmed injection (#7997). Rendering in the
               badge's slot keeps the pending -> consumed / requeued hand-off a
               content change in one place rather than a layout jump. */}
+          {pendingSend && (
+            /* The plain send's counterpart to the steer line below: same slot,
+               same muted weight, same pulse for a wait still open (a late echo
+               can still settle it), its own glyph so the two pending states
+               never read as one. No explainer of its own: the WARN notice the
+               same receipt posts directly under the bubble says what to do.
+               `role="status"` lets a screen reader hear that the message is
+               unconfirmed. */
+            <div role="status" className="inline-flex items-center gap-1 text-[12px] leading-5 font-medium text-muted mb-1 pr-1" data-testid="send-pending">
+              <span className="inline-flex items-center gap-1 animate-pulse">
+                <Clock size={12} className="shrink-0" aria-hidden="true" /> {i18nT('pages.chat.userMessage.delivery_pending')}
+              </span>
+            </div>
+          )}
           {pendingSteer && (
             /* animate-pulse (a simple loading indicator, per the animation
                conventions) marks it as in-flight; it must NOT touch
@@ -383,42 +606,107 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
               arm wraps its bubble in an animated box, and a line inside that box
               would slide in with it as though it were part of the message. */}
           {steerDecision && <SteerDecisionLine record={steerDecision} />}
-          {bubble}
+          {bubbleWithMenu}
         </>
       )}
       {/* Where the pointer cannot hover the footer is always visible and its
           descendant overrides grow every action to a 40px touch target (20px
           icon + 10px padding); hover-capable pointers keep the reveal-on-hover
-          behavior and the compact 14px icons untouched. */}
-      <div className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 ${ICON_ACTION_ROW_CLS}`}>
+          behavior and the compact 14px icons untouched.
+          `data-message-actions` is the hook index.css uses while this row is
+          the pinned banner's stand-in (`[data-pinned-standin]`): the row is
+          `visibility: hidden` and the card copies only the bubble, so the strip
+          is re-shown in place — visible outright, because the card lives in an
+          overlay outside this row and its hover can never be `group-hover/msg`. */}
+      <div data-message-actions="" className={`flex items-center gap-y-1 mt-1 opacity-0 transition-opacity duration-300 delay-100 group-hover/msg:opacity-100 group-hover/msg:delay-300 group-focus-within/msg:opacity-100 group-focus-within/msg:delay-300 has-[[data-state=open]]:opacity-100 ${ICON_ACTION_ROW_CLS}`}>
+        {onReplyInThread && (
+          <button
+            onClick={onReplyInThread}
+            className="text-muted hover:text-text p-0.5 rounded transition-colors"
+            data-testid="reply-in-thread"
+            title={i18nT('pages.chat.thread.reply_in_thread')}
+            aria-label={i18nT('pages.chat.thread.reply_in_thread')}
+          >
+            <MessageSquare size={14} />
+          </button>
+        )}
+        {quoteInRow && (
+          <button
+            onClick={quoteShown}
+            className="text-muted hover:text-text p-0.5 rounded transition-colors"
+            data-testid="quote-message"
+            title={i18nT('pages.chat.userMessage.quote_message')}
+            aria-label={i18nT('pages.chat.userMessage.quote_message')}
+          >
+            <Quote size={14} />
+          </button>
+        )}
         <button
-          onClick={() => {
-            const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
-            const toCopy = pastes.length ? expandPasteTokens(content, pastes) : content
-            const flash = (outcome: CopyOutcome) => {
-              setCopied(outcome)
-              if (copyResetTimerRef.current) clearTimeout(copyResetTimerRef.current)
-              copyResetTimerRef.current = setTimeout(() => {
-                copyResetTimerRef.current = null
-                setCopied('idle')
-              }, 1500)
-            }
-            // `copyToClipboard` resolves `false` (legacy execCommand fallback
-            // refused) as well as rejecting — both are a copy that did not happen.
-            copyToClipboard(toCopy).then(ok => flash(ok ? 'ok' : 'failed'), () => flash('failed'))
-          }}
+          onClick={copyMessage}
           className="text-muted hover:text-text p-0.5 rounded transition-colors"
           title={i18nT('pages.chat.userMessage.copy')}
           aria-label={copyOutcomeLabel(copied, i18nT('pages.chat.userMessage.copy'))}
         >
           {copyOutcomeIcon(copied, <Copy size={14} />)}
         </button>
-        {messageTs && slotKey && (
+        {compactRow && moreHasItems && (
+          /* Everything but Copy the row used to show inline, one menu deep.
+             A copy outcome keeps flashing on its item so the person can still
+             tell whether the write happened; `preventDefault` on select holds
+             the menu open long enough to read it. */
+          <DropdownMenu open={moreOpen} onOpenChange={open => { readStandIn(open); setMoreOpen(open) }}>
+            <DropdownMenuTrigger asChild>
+              <button
+                className="text-muted hover:text-text p-0.5 rounded transition-colors"
+                title={i18nT('pages.chat.userMessage.more_actions')}
+                aria-label={i18nT('pages.chat.userMessage.more_actions')}
+                data-testid="user-more-actions"
+              >
+                <MoreHorizontal size={14} />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="min-w-[210px]">
+              {/* Quote is listed here too, even when it has the row seat: the
+                  bubble's right-click menu leads with it, so the two
+                  look-alike menus on one message agree. */}
+              {quoteOffered && (
+                <DropdownMenuItem data-testid="quote-message-menu-item" onSelect={quoteShown}>
+                  {/* Layout and the touch floor live on this span: the primitive owns its own classes (shadcn/no-restyle). */}
+                  <span className="flex items-center gap-2 [@media(hover:none)]:min-h-7">
+                    <Quote className="lucide-inline shrink-0" /><span>{i18nT('pages.chat.userMessage.quote_message')}</span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+              {canCopyLink && (
+                <DropdownMenuItem data-testid="copy-link-menu-item" onSelect={e => { e.preventDefault(); copyLink() }}>
+                  {/* Layout and the touch floor live on this span: the primitive owns its own classes (shadcn/no-restyle). */}
+                  <span className="flex items-center gap-2 [@media(hover:none)]:min-h-7">
+                    {copyOutcomeIcon(linkCopied, <Link2 className="lucide-inline shrink-0" />)}<span>{copyOutcomeLabel(linkCopied, i18nT('pages.chat.userMessage.copy_link_to_message'))}</span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+              {canPin && (
+                <DropdownMenuItem data-testid="pin-menu-item" aria-pressed={!!pinned} onSelect={() => onTogglePin?.()}>
+                  {/* Layout and the touch floor live on this span: the primitive owns its own classes (shadcn/no-restyle). */}
+                  <span className="flex items-center gap-2 [@media(hover:none)]:min-h-7">
+                    {pinned ? <PinOff className="lucide-inline shrink-0" /> : <Pin className="lucide-inline shrink-0" />}<span>{pinned ? i18nT('pages.chat.userMessage.unpin_message') : i18nT('pages.chat.userMessage.pin_message')}</span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+              {canEditResend && !standIn && (
+                <DropdownMenuItem data-testid="edit-menu-item" onSelect={startEdit}>
+                  {/* Layout and the touch floor live on this span: the primitive owns its own classes (shadcn/no-restyle). */}
+                  <span className="flex items-center gap-2 [@media(hover:none)]:min-h-7">
+                    <Pencil className="lucide-inline shrink-0" /><span>{i18nT('pages.chat.userMessage.edit_resend')}</span>
+                  </span>
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
+        {!compactRow && messageTs && slotKey && (
           <button
-            onClick={() => {
-              const flash = (outcome: CopyOutcome) => { setLinkCopied(outcome); setTimeout(() => setLinkCopied('idle'), 1500) }
-              copySessionLink(slotKey, slotTitle, messageTs, mode).then(ok => flash(ok ? 'ok' : 'failed'), () => flash('failed'))
-            }}
+            onClick={copyLink}
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
             title={i18nT('pages.chat.userMessage.copy_link_to_message')}
             aria-label={copyOutcomeLabel(linkCopied, i18nT('pages.chat.userMessage.copy_link_to_message'))}
@@ -426,7 +714,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             {copyOutcomeIcon(linkCopied, <Link2 size={14} />)}
           </button>
         )}
-        {messageTs && onTogglePin && (
+        {!compactRow && messageTs && onTogglePin && (
           <button
             onClick={onTogglePin}
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
@@ -437,9 +725,16 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             {pinned ? <PinOff size={14} /> : <Pin size={14} />}
           </button>
         )}
-        {canEdit && onEditResend && (
+        {!compactRow && canEdit && onEditResend && (
           <button
             onClick={startEdit}
+            // `data-message-edit`: index.css drops this control while the row is
+            // the pinned banner's stand-in. Editing replaces the bubble with the
+            // textarea + Cancel/Send tree above, which is not part of the strip
+            // and so would open inside the row's `visibility: hidden` — an editor
+            // no one can see, focus or leave. Edit is offered again once the row
+            // scrolls back below the fold.
+            data-message-edit=""
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
             title={i18nT('pages.chat.userMessage.edit_resend')}
             aria-label={i18nT('pages.chat.userMessage.edit_resend')}
@@ -452,6 +747,13 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             the Font Family setting never writes. */}
         {timestamp && <span className="text-muted text-[12px] leading-5 tabular-nums" title={timestampTitle}>{timestamp}</span>}
       </div>
+      {/* No hand-off: the row's own inline editor and the composer draft are
+          unsaved text a navigation would discard (same ruling as AssistantMessage). */}
+      <ErrorNotice
+        message={copyFailed ? i18nT('pages.settings.remoteCrewPanel.copy_failed') : null}
+        onDismiss={() => setCopyFailed(false)}
+        className="mt-1 [@media(hover:none)]:[&_button]:min-h-10 [@media(hover:none)]:[&_button]:min-w-10"
+      />
     </div>
   )
 })

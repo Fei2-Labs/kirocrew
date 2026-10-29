@@ -24,22 +24,53 @@ denying by default on timeout; the callback handler resolves it via
 ``resolve_global``.
 
 Dependency direction is ``telegram -> messaging`` (allowed).
+
+``TelegramRenderer`` is composed from owners: display-form redaction, UTF-16 measures
+and the option and steer strips (``renderer_display``), table structure
+(``renderer_tables``), the approval prompt and ``TelegramApprovalDecider``
+(``renderer_approval``), the typing indicator, stall marks and footers
+(``renderer_status``), chunk intake and the live frame (``renderer_live``) and outbound
+images (``renderer_uploads``). An owner function whose first parameter is ``self`` is
+bound as the class attribute of the same name. This module keeps the renderer's state,
+rotation, the credential-aware splitters, every sealing path, the markdown translations,
+the inline keyboard and finalization, and stays the only import path and patch surface:
+:mod:`kiro_crew._facade_mirror` carries a patch of one of its names to every owner that
+reads it. Which owner takes new work is recorded in
+``docs/system-specs/modules/messaging.md`` (Telegram channel).
 """
 
 from __future__ import annotations
 
 import asyncio
 import html
+import importlib as _importlib
 import logging
 import os
 import re
-import secrets
+import sys as _sys
 import time
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.constants import split_trailing_protocol_suffix, strip_control_comments
-from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S
-from kiro_crew.messaging.display_safety import redact_for_display
+from kiro_crew import _facade_mirror
+from kiro_crew.constants import (
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    split_trailing_protocol_suffix,
+    strip_control_comments,
+)
+from kiro_crew.messaging.approval import APPROVAL_TIMEOUT_S, adoptable_reservation
+from kiro_crew.messaging.display_safety import (
+    TELEGRAM_FALLBACK_BOLD_STAR,
+    TELEGRAM_FALLBACK_BOLD_USCORE,
+    TELEGRAM_FALLBACK_FENCE,
+    TELEGRAM_FALLBACK_HEADING,
+    TELEGRAM_FALLBACK_INLINE_CODE,
+    TELEGRAM_FALLBACK_LINK,
+    TELEGRAM_FALLBACK_LINK_TEXT,
+    redact_for_display,
+    safe_split_offset,
+    severs_a_credential,
+    telegram_fallback_heading_text,
+)
 from kiro_crew.messaging.outbound_files import (
     ExtractLimits,
     OutboundFile,
@@ -54,36 +85,50 @@ from kiro_crew.messaging.renderer import (
     apply_options_cap,
     count_redaction_tags,
     new_approval_nonce,
+    nonce_eq,
     redaction_notice,
+    repaired_after_a_sent_tail,
     session_provenance_tag,
     split_options_trailer,
 )
-from kiro_crew.messaging.split import split_markdown_safe
+from kiro_crew.messaging.split import (
+    bounded_for_delivery,
+    repaired_for_delivery,
+    split_markdown_safe,
+)
+from kiro_crew.messaging.tables import display_width
 from kiro_crew.messaging.transport import TransportCapabilities
 from kiro_crew.sel import sel
+from kiro_crew.telegram import renderer_approval as _renderer_approval
+from kiro_crew.telegram import renderer_live as _renderer_live
+from kiro_crew.telegram import renderer_status as _renderer_status
+from kiro_crew.telegram import renderer_uploads as _renderer_uploads
 from kiro_crew.telegram.client import (
     TELEGRAM_MAX_MEDIA_GROUP,
     TELEGRAM_MAX_PHOTO_BYTES,
     TELEGRAM_MAX_TOTAL_UPLOAD_BYTES,
     TELEGRAM_RICH_MAX_CHARS,
 )
+from kiro_crew.telegram.renderer_display import (
+    _MIN_SPLIT_LIMIT,
+    _delivered_form,
+    _display_safe,
+    _extract_options,
+    _may_exceed_rendered,
+    _neutralize_md,
+    _shrunk_limit,
+)
+from kiro_crew.telegram.renderer_tables import (
+    _FENCE_LINE_RE,
+    _has_table,
+    _split_table_rows,
+    _table_blocks,
+)
 
 if TYPE_CHECKING:
     from kiro_crew.telegram.client import TelegramClient
 
-logger = logging.getLogger(__name__)
-
-#: Budgets handed to the shared extractor, so an oversize image is refused BY
-#: THE READ and keeps its markup rather than being uploaded and 413'd, or
-#: stripped out of the text and then dropped.
-_UPLOAD_LIMITS = ExtractLimits(
-    max_files=TELEGRAM_MAX_MEDIA_GROUP,
-    max_total_bytes=TELEGRAM_MAX_TOTAL_UPLOAD_BYTES,
-    max_file_bytes=TELEGRAM_MAX_PHOTO_BYTES,
-)
-
-#: Refusal lines appended to an answer before the count collapses into a tally.
-_MAX_REJECTION_LINES = 3
+logger = logging.getLogger("kiro_crew.telegram.renderer")
 
 #: How far past one message a segment may grow while it holds an image reference
 #: back from length rotation. The hold exists so a cut cannot bisect
@@ -94,156 +139,15 @@ _MAX_REJECTION_LINES = 3
 #: markup and prints its path, which is the documented honest degradation.
 _UPLOAD_HOLD_LIMIT_FACTOR = 4
 
-# Telegram has no native token streaming: "streaming" meant editing one message
-# on every chunk, and each edit is a full HTTP round-trip + a whole-bubble
-# re-render, which reads as a stutter (WeCom streams frames over a persistent
-# WebSocket, so it stays smooth). Instead we do "block streaming": hold a live
-# "typing…" indicator while the answer forms, then post the finished answer as
-# one clean block. This kills the edit-jank entirely and only touches this
-# renderer -- the shared messaging event stream (and Slack/WeCom) is untouched.
-#
-# Telegram's "typing" chat action lasts ~5s, so refresh it just under that
-# for the duration of a turn (shown while we accumulate before posting).
-_TYPING_REFRESH_S = 4.0
-
-# Min seconds between live streaming edits to one message. Telegram rate-limits
-# edits (~this cadence), so we coalesce chunks and edit the message in place at
-# most this often. The final formatted edit always lands regardless of throttle.
-_EDIT_THROTTLE_S = 1.0
-
-# Interactive approval wait; deny-by-default when it elapses with no press.
-# Owned by messaging.approval so every channel's window is the same one.
-_APPROVAL_TIMEOUT_S = APPROVAL_TIMEOUT_S
-
-# ── Stall marks on the live bubble ──
-# Telegram has no message-reaction budget to spend on a phase indicator: a bot
-# holds ONE reaction per message (setting is a replace, not an add), its emoji
-# allow-list has no globe/wrench/brand mark, a chat's own available_reactions can
-# narrow it further at any time, and the rate limit is per CHAT — so a reaction
-# per phase competes with the streaming edits this channel already spends. The
-# typing indicator plus the transient "🔧 {tool}…" footer already say "working";
-# what they cannot say is "working, but nothing has moved in a while". These two
-# marks ride the footer the renderer was going to edit anyway, so they cost no
-# extra API class. Same thresholds as the Slack controller's soft/hard stalls.
-_SOFT_STALL_S = 15.0
-_HARD_STALL_S = 45.0
-_SOFT_STALL_MARK = "🥱 still working…"
-_HARD_STALL_MARK = "😨 this is taking a while…"
-
-#: How much of a tool's arguments the approval prompt shows. Enough to judge a
-#: shell command or a file path; past this the operator is reading a payload, not
-#: making a decision, and the prompt has to stay inside one message.
-_APPROVAL_INPUT_CHARS = 900
-
-#: Context-usage gauge thresholds for the turn footer, and Slack's own: a shared
-#: reading of "how close is this conversation to needing /compact".
-_CTX_GAUGE = ((70, "🔴"), (50, "🟠"), (30, "🟡"), (0, "🟢"))
-
-#: The footer is shown only when it carries something ACTIONABLE. Slack posts its
-#: equivalent on every turn, but Slack has a `context` block — a small grey line
-#: — while Telegram's nearest affordance is a quote bar under the answer, and
-#: "Finished in 1s · 🟢 ctx 4%" as a permanent fixture under every reply is noise
-#: that trains the reader to skip the place the real warning will appear. So:
-#: a duration worth noticing, or a context reading worth acting on.
-_FOOTER_MIN_SECS = 10.0
-_FOOTER_MIN_CTX_PCT = 50
-
-#: The reasoning post's fixed wrapper (``<blockquote expandable>💭 …`` plus its
-#: closer). Subtracted from the render budget so the truncation can never cut
-#: inside the tags it has to leave balanced.
-_THINKING_SCAFFOLD = "<blockquote expandable>💭 </blockquote>"
-
 # Fallback placeholder for a turn that failed without a user-safe reason. The
 # retry wording is only correct for transient failures; a permanent failure
 # (e.g. the account lacks the selected model) passes its own bounded reason via
 # ``close(failure_reason=...)`` so the user is never told to retry an error
 # that says retrying will not help.
 _GENERIC_ERROR_TEXT = "⚠️ Error — please try again"
-
-
-def _display_safe(text: str) -> str:
-    """Redact against the form Telegram RENDERS, not the bytes we send.
-
-    The byte-level pass in ``TurnDriver`` runs before this renderer introduces any
-    markup, and it cannot see a credential that markup will reassemble:
-    ``redact_credentials("AKIA**IOSFODNN7EXAMPLE**")`` matches nothing because the
-    ``**`` sits inside the key, and then ``_md_to_telegram_html`` emits
-    ``AKIA<b>IOSFODNN7EXAMPLE</b>`` — which Telegram displays as an intact access
-    key. ``[AKIA](https://x)IOSFODNN7EXAMPLE`` is the same hazard through a link,
-    and a zero-width character between two halves is the same hazard with no
-    markup at all. ``redact_for_display`` canonicalizes to the rendered form and
-    scans BOTH that and the literal, which is why it exists and why Slack and
-    Discord both run it at their own render boundaries.
-
-    Applied at the two sinks, BEFORE any tags are introduced: the live plaintext
-    frame and the seal. A redaction can make the text LONGER than the segment
-    budget that sized it; that is accepted, and the seal re-measures and re-splits
-    against the render cap. Losing formatting to keep a rendered secret redacted
-    is the documented trade.
-
-    Runs the SHARED ``_default_redactor`` (exfil URLs then credentials), the same
-    pair ``TurnDriver`` streams provider text through, so a display sink cannot end
-    up scanning for less than the stream did.
-    """
-    safe, _ = redact_for_display(text or "", _default_redactor)
-    return safe
-
-
-def _utf16_len(text: str) -> int:
-    """Length of *text* in UTF-16 code units — the unit of Telegram's caps.
-
-    Python counts code points; the Bot API counts UTF-16 units, so every
-    astral character (emoji, most notably) costs 2 against Telegram's 4096
-    while costing 1 against ``len``. The entity machinery in
-    ``telegram/client.py`` already measures in these units; message budgets
-    here measure the same way.
-    """
-    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
-
-
-def _utf16_cut(text: str, limit: int) -> int:
-    """Largest CODE-POINT index whose prefix fits ``limit`` UTF-16 units.
-
-    Returning a code-point index means ``str`` slicing can never bisect a
-    surrogate pair: an astral character either fits whole or is excluded
-    whole. The floor of 2 is load-bearing — at ``limit=1`` a leading astral
-    character (2 units) would cut at index 0, and a caller consuming the
-    text chunk by chunk would stop making progress.
-    """
-    budget = max(2, limit)
-    units = 0
-    for index, ch in enumerate(text):
-        units += 2 if ord(ch) > 0xFFFF else 1
-        if units > budget:
-            return index
-    return len(text)
-
-
-def _utf16_chunks(text: str, limit: int) -> list[str]:
-    """Split ``text`` into pieces of at most ``limit`` UTF-16 units each.
-
-    Prefers newline boundaries so a line (one restored image reference, in
-    the recovery caller) stays whole within one message; a single line
-    larger than the whole budget is hard-cut at a code-point boundary
-    rather than dropped. Boundary newlines are consumed by the split.
-    """
-    chunks: list[str] = []
-    current = ""
-    for line in text.split("\n"):
-        candidate = f"{current}\n{line}" if current else line
-        if _utf16_len(candidate) <= max(2, limit):
-            current = candidate
-            continue
-        if current:
-            chunks.append(current)
-        while _utf16_len(line) > max(2, limit):
-            cut = _utf16_cut(line, limit)
-            chunks.append(line[:cut])
-            line = line[cut:]
-        current = line
-    if current:
-        chunks.append(current)
-    return chunks
+#: Sent in place of a part of a reply whose every send failed, so the later parts
+#: do not read as the whole reply.
+_LOST_PART_NOTICE = "Part of this reply may not have been delivered."
 
 
 def md_to_telegram_html_safe(text: str) -> str:
@@ -268,72 +172,11 @@ def md_to_telegram_html_safe(text: str) -> str:
     return _md_to_telegram_html(_display_safe(text))
 
 
-def _extract_options(text: str) -> tuple[str, list[str]]:
-    """Split text into ``(body, options)``, holding back a streamed partial.
-
-    ``hide_partial=True`` because this renderer STREAMS: a still-arriving
-    ``[OPTIONS…`` fragment really may be a marker mid-flight, and the next frame
-    re-renders from the full buffer, so hiding it costs nothing permanent.
-    """
-    return split_options_trailer(text, hide_partial=True)
-
-
-# kiro-cli emits an inline "[STEERING steer-<id>: …]" ack marker when it folds a
-# mid-turn steer at a boundary. The dashboard parses it into a chip; Telegram has
-# no parser, so strip it — the user's own steer message already shows the
-# instruction (and gets a steer-ack reaction), so the raw inline marker is just
-# redundant noise in the bubble.
-_STEER_MARKER_RE = re.compile(r"\[STEERING\b[^\]]*\]", re.IGNORECASE)
-# Same marker, capturing the ack SUMMARY kiro-cli embeds after "steer-<id>:".
-# The dashboard renders this summary as its "Steered — …" chip; we prefer it
-# for the Telegram chip too (the user's own words are already on screen as
-# their message — the summary is the only NEW information).
-_STEER_SUMMARY_RE = re.compile(r"\[STEERING\s+steer-[0-9a-f]+\s*:\s*([^\]]*)\]", re.IGNORECASE)
-
-
-def _strip_steering(text: str) -> str:
-    """Remove kiro-cli's inline ``[STEERING …]`` steer-ack marker from output.
-
-    Also strips an UNCLOSED trailing ``[STEERING …`` (still streaming, no closing
-    ``]`` yet): otherwise the marker's long rephrase streams into the live draft
-    and then vanishes when ``on_done`` finally strips the completed marker — a
-    jarring show-then-vanish. Stripping the partial marker keeps the draft in
-    sync with the final message.
-    """
-    cleaned = _STEER_MARKER_RE.sub("", text)  # complete markers anywhere
-    cleaned = re.sub(r"\[STEERING\b[^\]]*$", "", cleaned)  # unclosed, still streaming
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)  # collapse gaps left behind
-    return cleaned.strip()
-
-
-def _neutralize_md(raw: str) -> str:
-    """Collapse whitespace, cap length, and strip Markdown control chars from a
-    steer's text so the chip renders literally (inside a blockquote) and can't
-    perturb surrounding formatting."""
-    t = " ".join((raw or "").split())[:120]
-    return re.sub(r"[*_`\[\]()]", "", t)
-
-
-def _strip_hr(text: str) -> str:
-    """Drop Markdown horizontal rules (``---`` / ``***`` / ``___`` on their own
-    line) — they render as literal dashes on Telegram and just add noise.
-    Fenced code blocks are stashed first so a standalone ``---`` INSIDE a code
-    block (e.g. a YAML document separator) is never touched. An unclosed fence
-    mid-stream isn't stashed, but live frames are throttled previews — the
-    final seal sees the closed fence and preserves its content."""
-    stash: list[str] = []
-
-    def _keep(fragment: str) -> str:
-        stash.append(fragment)
-        return f"\x00H{len(stash) - 1}\x00"
-
-    text = _FENCE_RE.sub(lambda m: _keep(m.group(0)), text)
-    # Max 3 leading spaces (markdown HR rule) — a 4-space-indented "---" is
-    # indented CODE (e.g. a YAML separator) and must survive.
-    out = re.sub(r"(?m)^[ ]{0,3}([-*_])\1{2,}[ \t]*$", "", text)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    out = re.sub(r"\x00H(\d+)\x00", lambda m: stash[int(m.group(1))], out)
-    return out.strip()
+# Widest label that still shows whole on a half-width inline button on a
+# narrow phone, in display cells: a CJK ideograph or fullwidth form counts as
+# two, a combining mark as none. Still approximate, since proportional fonts
+# vary by phone.
+_HALF_WIDTH_LABEL_CELLS = 16
 
 
 def build_inline_keyboard(options: list[str], session_key: str) -> dict | None:
@@ -343,7 +186,16 @@ def build_inline_keyboard(options: list[str], session_key: str) -> dict | None:
     the payload because Telegram caps it at 64 bytes and a multi-byte CJK/emoji
     label could overflow. The compact deterministic tag binds a later press to
     the session that posted the keyboard; the label is recovered from the button
-    text at callback time. Two buttons per row keeps the keyboard mobile-friendly.
+    text at callback time.
+
+    Rows hold two buttons while every label fits a half-width button, and one
+    button each as soon as any label is wider than ``_HALF_WIDTH_LABEL_CELLS``
+    display cells: a phone truncates a half-width button mid-label, so two
+    choices that differ late in their text would read the same. Width is
+    measured with ``display_width``, so a CJK label counts its rendered width,
+    not its code points. The rule covers the whole keyboard, not one row, so
+    the buttons stay a uniform width. Keyboard height is bounded by the
+    25-button ceiling, not by this rule.
 
     A label is MODEL-authored text that Telegram renders, so it is a display sink
     like the answer body: the driver's byte-level scan can see a credential as
@@ -357,12 +209,16 @@ def build_inline_keyboard(options: list[str], session_key: str) -> dict | None:
     if not options:
         return None
     origin_tag = session_provenance_tag(session_key)
+    labels: list[str] = []
+    for opt in options:
+        safe, _ = redact_for_display(opt, _default_redactor)
+        labels.append(safe[:64])
+    per_row = 1 if any(display_width(label) > _HALF_WIDTH_LABEL_CELLS for label in labels) else 2
     buttons: list[list[dict]] = []
     row: list[dict] = []
-    for i, opt in enumerate(options):
-        safe, _ = redact_for_display(opt, _default_redactor)
-        row.append({"text": safe[:64], "callback_data": f"opt:{i}:{origin_tag}"})
-        if len(row) == 2:
+    for i, label in enumerate(labels):
+        row.append({"text": label, "callback_data": f"opt:{i}:{origin_tag}"})
+        if len(row) == per_row:
             buttons.append(row)
             row = []
     if row:
@@ -392,8 +248,17 @@ def _split_markdown(text: str, limit: int) -> list[str]:
     cut-preference ladder (paragraph break past half the budget, else line break
     past a quarter, else a hard cut) is the same one this channel used, so chunk
     boundaries are unchanged for text with no fence in it.
+
+    The cut is credential-aware, because this channel rotates: each chunk but the
+    last is sealed as its OWN message and the redaction runs per segment, so a key
+    severed by a boundary is a key neither message holds and neither redacts,
+    while the reader scrolling the two reads it whole. Passing the redactor grades
+    the boundaries as the reader sees them and moves the cut instead, which keeps
+    every character. Nothing here asks for the prefix-stable mode: a rotation
+    replaces the buffer with the retained tail, so text already sealed is never
+    part of a later cut.
     """
-    return split_markdown_safe(text, limit)
+    return split_markdown_safe(text, limit, redactor=_default_redactor)
 
 
 # Telegram renders a small HTML subset (<b>/<i>/<code>/<pre>/<a>) far more
@@ -402,165 +267,16 @@ def _split_markdown(text: str, limit: int) -> list[str]:
 # final message. Code spans are stashed first so their contents are never
 # treated as markup, then the remaining text is HTML-escaped before any tags
 # are introduced -- so raw '<', '>' and '&' in the answer can't break the parse.
-_FENCE_RE = re.compile(r"```[^\n]*\n?(.*?)```", re.DOTALL)
-_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$", re.MULTILINE)
-_BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_BOLD_USCORE_RE = re.compile(r"__(.+?)__", re.DOTALL)
+# The fence, inline-code, heading, ``**``, ``__`` and link patterns are the
+# display-safety screen's (``TELEGRAM_FALLBACK_*``): the screen models
+# ``_strip_md`` with the same objects, so what it scans is what the fallback
+# shows. The link's label class is the screen's (no ``[``, ``]`` or line break),
+# so this never links (or, in ``_strip_md``, flattens) a label the screen left raw,
+# and its url is the shared destination unit, so a balanced pair may sit inside
+# it; see :func:`kiro_crew.constants.md_link_destination`.
 _ITALIC_STAR_RE = re.compile(r"(?<!\w)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\w)")
 _ITALIC_USCORE_RE = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
-_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+", re.MULTILINE)
-
-# Characters a GFM separator row may contain (`| --- |`, `|:---|---:|`, `- | -`).
-_TABLE_SEP_CHARS = set("-:| \t")
-
-
-#: A line that opens or closes a fenced code block.
-_FENCE_LINE_RE = re.compile(r"^[ \t]*(?:`{3,}|~{3,})", re.MULTILINE)
-
-
-def _is_table_separator(line: str) -> bool:
-    """True if *line* is a GFM separator row (``| --- |``, ``---|---``).
-
-    Every cell must be non-empty and carry a dash. Both halves are what the
-    server was observed to do, not what a spec reading predicts: ``| --- | |``
-    comes back as a ``paragraph`` (so an empty cell must be rejected, or the
-    block ships flattened), while ``| - - | --- |`` comes back as a ``table``
-    (so a broken dash run must be ACCEPTED -- demanding a contiguous run here
-    would degrade a table the server renders fine into a monospace block).
-    """
-    stripped = line.strip()
-    if not stripped or not set(stripped) <= _TABLE_SEP_CHARS:
-        return False
-    if "-" not in stripped or "|" not in stripped:
-        return False
-    cells = _row_cells(stripped)
-    if len(cells) > 1 and cells[0].strip() == "":
-        cells = cells[1:]
-    if len(cells) > 1 and cells[-1].strip() == "":
-        cells = cells[:-1]
-    return bool(cells) and all("-" in cell for cell in cells)
-
-
-def _row_cells(row: str) -> list[str]:
-    """Split a table row on its UNESCAPED cell boundaries.
-
-    Escaping is decided by walking the row, not by a lookbehind: ``\\|`` is cell
-    content, but ``\\\\`` is a literal backslash that leaves a following ``|`` as
-    a real boundary. A fixed-width lookbehind cannot express that -- it reads the
-    second backslash of an even run as an escape and merges two cells, which
-    under-counts the row and can make a malformed header match its delimiter.
-    """
-    cells: list[str] = []
-    buf: list[str] = []
-    escaped = False
-    for ch in row:
-        if escaped:
-            buf.append(ch)
-            escaped = False
-        elif ch == "\\":
-            buf.append(ch)
-            escaped = True
-        elif ch == "|":
-            cells.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-    cells.append("".join(buf))
-    return cells
-
-
-def _row_cell_count(row: str) -> int:
-    """Number of cells in a GFM table row.
-
-    Outer pipes are optional, so a single leading and a single trailing boundary
-    -- which show up as empty first/last cells -- are dropped.
-    """
-    cells = _row_cells(row.strip())
-    if len(cells) > 1 and cells[0] == "":
-        cells = cells[1:]
-    if len(cells) > 1 and cells[-1] == "":
-        cells = cells[:-1]
-    return len(cells)
-
-
-def _has_table(text: str) -> bool:
-    """True if *text* contains a GFM pipe table.
-
-    A table is a pipe-bearing line immediately followed by a separator row whose
-    cell count MATCHES it. The count check is what GFM (and therefore Telegram's
-    Rich Markdown) uses to decide a table exists at all, so skipping it sends
-    content down the rich path that the server then renders as a plain paragraph
-    -- newlines collapsed, pipes literal, worse than the monospace fallback.
-
-    Outer pipes are optional on BOTH rows, because GFM accepts ``a | b`` /
-    ``--- | ---`` with no leading or trailing pipe -- anchoring on a leading
-    ``|`` silently missed those and rendered them as literal pipes.
-
-    The separator row must contain a dash (so it is a separator, not more data)
-    and a pipe (so a bare ``-----`` horizontal rule under a pipe-bearing
-    sentence is not mistaken for a table). The header must contain a pipe for
-    the same reason: a one-cell separator would otherwise promote any ordinary
-    sentence above it to a table.
-
-    Deliberately does NOT exclude fenced code blocks. Table markup inside a
-    fence only means one extra rich send, not wrong output: Rich Markdown parses
-    fences itself and renders the sample as the code block it is. Screening for
-    fences here would mean maintaining CommonMark's fence rules (delimiter
-    character, run length, indentation, info strings) as a second parser beside
-    the one the HTML renderer already owns, and every gap between the two is a
-    bug -- for a check whose only job is deciding which transport to use.
-    """
-    lines = text.split("\n")
-    return any(
-        "|" in header
-        and _is_table_separator(sep)
-        and _row_cell_count(header) == _row_cell_count(sep)
-        for header, sep in zip(lines, lines[1:])
-    )
-
-
-def _table_blocks(text: str) -> list[tuple[bool, list[str]]]:
-    """Partition *text* into alternating ``(is_table, lines)`` blocks.
-
-    A table run starts on a pipe-bearing line whose successor is a separator row
-    and extends while lines carry a pipe. This is the single run detector behind
-    both the degraded seal (``_seal_table_fallback``) and table-aware splitting,
-    so the two can never disagree about where a table begins or ends.
-
-    It is deliberately looser than ``_has_table``, which additionally requires
-    the separator's cell count to match its header. The two are not
-    interchangeable and must not be unified: this one decides how a run is
-    FRAMED, so over-matching costs nothing (``<pre>`` reproduces its input
-    verbatim), while ``_has_table`` decides which TRANSPORT a segment takes and
-    so must agree with the server's own GFM rule.
-
-    Callers must screen out fenced text first (see
-    ``_split_markdown_table_aware``).
-    """
-    lines = text.split("\n")
-    blocks: list[tuple[bool, list[str]]] = []
-    prose: list[str] = []
-    i = 0
-    while i < len(lines):
-        if "|" in lines[i] and i + 1 < len(lines) and _is_table_separator(lines[i + 1]):
-            if prose:
-                blocks.append((False, prose))
-                prose = []
-            block = [lines[i], lines[i + 1]]
-            i += 2
-            # Body rows run until the first line that is not part of the table.
-            while i < len(lines) and "|" in lines[i]:
-                block.append(lines[i])
-                i += 1
-            blocks.append((True, block))
-            continue
-        prose.append(lines[i])
-        i += 1
-    if prose:
-        blocks.append((False, prose))
-    return blocks
 
 
 def _seal_table_fallback(text: str) -> str:
@@ -617,17 +333,21 @@ def _md_to_telegram_html(text: str) -> str:
         stash.append(fragment)
         return f"\x00{len(stash) - 1}\x00"
 
-    text = _FENCE_RE.sub(
-        lambda m: _keep(f"<pre>{html.escape(m.group(1).rstrip(chr(10)))}</pre>"), text
+    text = TELEGRAM_FALLBACK_FENCE.sub(
+        lambda m: _keep(f"<pre>{html.escape((m.group(1) or '').rstrip(chr(10)))}</pre>"), text
     )
-    text = _INLINE_CODE_RE.sub(lambda m: _keep(f"<code>{html.escape(m.group(1))}</code>"), text)
+    text = TELEGRAM_FALLBACK_INLINE_CODE.sub(
+        lambda m: _keep(f"<code>{html.escape(m.group(1))}</code>"), text
+    )
     text = html.escape(text)
-    text = _HEADING_RE.sub(lambda m: f"<b>{m.group(1).strip()}</b>", text)
-    text = _BOLD_STAR_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
-    text = _BOLD_USCORE_RE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = TELEGRAM_FALLBACK_HEADING.sub(
+        lambda m: f"<b>{telegram_fallback_heading_text(m)}</b>", text
+    )
+    text = TELEGRAM_FALLBACK_BOLD_STAR.sub(lambda m: f"<b>{m.group(1)}</b>", text)
+    text = TELEGRAM_FALLBACK_BOLD_USCORE.sub(lambda m: f"<b>{m.group(1)}</b>", text)
     text = _ITALIC_STAR_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
     text = _ITALIC_USCORE_RE.sub(lambda m: f"<i>{m.group(1)}</i>", text)
-    text = _LINK_RE.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
+    text = TELEGRAM_FALLBACK_LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
     text = _BULLET_RE.sub(lambda m: f"{m.group(1)}\u2022 ", text)
     # Group consecutive "> " lines (escaped to "&gt; ") into a native Telegram
     # <blockquote> — the ▎ quote bar. Runs after inline formatting so bold/italic
@@ -644,74 +364,9 @@ def _md_to_telegram_html(text: str) -> str:
     return text
 
 
-#: Minimum source-chunk budget when shrinking to fit the rendered cap. Below
-#: this, shrinking stops making progress; the caller's tag-safe truncation and
-#: plaintext fallback are the backstop for genuinely indivisible content.
-_MIN_SPLIT_LIMIT = 400
-
-#: How much one shrink round cuts at minimum, BEFORE the ``_MIN_SPLIT_LIMIT``
-#: clamp. The proportional step alone cuts 5% of the current budget, which for a
-#: small budget is a few tens of characters, so this is what bounds the number of
-#: re-split rounds; above roughly 20x it the 5% cut is the larger of the two and
-#: this never binds. Near the floor the clamp wins and the real cut is smaller.
-_SHRINK_STEP = 128
-
-
-def _shrunk_limit(current: int, rendered_cap: int, worst: int) -> int:
-    """The next source budget to try after a chunk rendered past ``rendered_cap``.
-
-    Shrinks in proportion to the observed inflation (``rendered_cap / worst``)
-    with a 5% margin, taking at least ``_SHRINK_STEP`` unless the floor is
-    nearer than that, and drops straight to ``_MIN_SPLIT_LIMIT`` when the
-    proportional answer would not shrink at all.
-
-    **Callers must hold ``current > _MIN_SPLIT_LIMIT`` and
-    ``worst > rendered_cap > 0``.** Under those the result is strictly below
-    *current* and never below the floor, which is what makes a shrink loop
-    terminate; at or below the floor there is nowhere left to shrink to and the
-    answer is the floor itself, so a caller that skips the guard would spin.
-    Both call sites guard it before they get here.
-    """
-    scaled = int(current * (rendered_cap / worst) * 0.95)
-    nxt = max(_MIN_SPLIT_LIMIT, min(scaled, current - _SHRINK_STEP))
-    return nxt if nxt < current else _MIN_SPLIT_LIMIT
-
-
 def _rendered_len(source: str) -> int:
     """Length of ``source`` once converted to Telegram HTML."""
     return len(_md_to_telegram_html(source))
-
-
-#: Markup that makes ``_md_to_telegram_html`` EMIT TAGS, and therefore grow the
-#: text by an amount no per-character arithmetic can bound: a line-leading ``>``
-#: (blockquote) or ``#`` (heading), or any ``*``/``_``/backtick/``[`` (bold,
-#: italic, code span, link). Cheap single-pass scan; used only as a gate.
-_MARKUP_HINT_RE = re.compile(r"(?m)^[ \t]{0,3}[>#]|[*_`\[]")
-
-
-def _may_exceed_rendered(source: str, cap: int) -> bool:
-    """Conservative "could this render past ``cap``?" gate.
-
-    A ``False`` MUST mean "provably fits" -- it is the only case the caller skips
-    the authoritative ``_rendered_len`` check for, so under-estimating ships
-    oversize HTML. Over-returning ``True`` is always safe: it costs one real
-    render on a buffer that is nowhere near the cap.
-
-    Per-construct growth constants were tried and rejected as whack-a-mole --
-    blockquote, heading, bold/italic and code spans each need their own term,
-    the measured inflation reaches 3.75x (``"`x` " * 700``: 2800 source chars ->
-    10500 rendered), and any new converter rule silently reintroduces
-    unsoundness. Instead trust the cheap arithmetic ONLY for prose containing no
-    tag-producing markup at all, and measure everything else for real.
-    """
-    if len(source) >= cap:
-        return True
-    if _MARKUP_HINT_RE.search(source):
-        return True  # tags will be emitted -- refuse to guess, measure instead
-    # Tag-free prose: the only growth left is ``html.escape``, which adds at most
-    # 5 chars per escape-worthy character (``'`` -> ``&#x27;``).
-    escapes = sum(source.count(c) for c in ("&", "<", ">", '"', "'"))
-    return len(source) + 5 * escapes >= cap
 
 
 def _split_markdown_bounded(text: str, rendered_limit: int) -> list[str]:
@@ -729,44 +384,24 @@ def _split_markdown_bounded(text: str, rendered_limit: int) -> list[str]:
     the client backstop then truncates them, silently dropping content. Only at
     the floor -- where the content is genuinely indivisible -- may oversize chunks
     be returned.
+
+    Each candidate answer also goes through
+    :func:`~kiro_crew.messaging.split.bounded_for_delivery`, because a
+    credential-aware cut may DECLINE to cut: when no budget has clean boundaries
+    the splitter answers with the text whole, which is fail-closed but is one
+    chunk over the budget, and this channel's client truncates a larger payload
+    after every scan has run. The bound cuts that answer back and grades the
+    sequence it actually produced.
     """
     src_limit = max(_MIN_SPLIT_LIMIT, rendered_limit)
-    chunks = _split_markdown(text, src_limit)
     while True:
+        chunks = bounded_for_delivery(
+            _split_markdown(text, src_limit), src_limit, _default_redactor
+        )
         worst = max((_rendered_len(c) for c in chunks), default=0)
         if worst <= rendered_limit or src_limit <= _MIN_SPLIT_LIMIT:
             return chunks
         src_limit = _shrunk_limit(src_limit, rendered_limit, worst)
-        chunks = _split_markdown(text, src_limit)
-
-
-def _split_table_rows(rows: list[str], limit: int) -> list[str]:
-    """Split one table run at ROW boundaries into chunks of <=``limit`` chars.
-
-    Every continuation chunk repeats the header and separator row, so each
-    chunk is independently detected by ``_has_table`` and seals through the
-    rich path. The alternative (bare body rows) fails detection and arrives as
-    literal pipes -- the exact defect table-aware splitting exists to fix.
-
-    A single row longer than ``limit`` cannot be cut (there is no sub-row
-    boundary that keeps the table valid); its chunk is returned oversize and
-    the client's tag-safe truncation is the backstop.
-    """
-    header, sep = rows[0], rows[1]
-    head_len = len(header) + len(sep) + 2  # + the two joining newlines
-    chunks: list[str] = []
-    cur = [header, sep]
-    cur_len = head_len
-    for row in rows[2:]:
-        row_cost = len(row) + 1  # + the joining newline
-        if cur_len + row_cost > limit and len(cur) > 2:
-            chunks.append("\n".join(cur))
-            cur = [header, sep]
-            cur_len = head_len
-        cur.append(row)
-        cur_len += row_cost
-    chunks.append("\n".join(cur))
-    return chunks
 
 
 def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int) -> list[str]:
@@ -784,6 +419,20 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
     where a fence begins and ends means reimplementing CommonMark's fence rules
     as a second parser (the same invariant ``_seal_table_fallback`` documents),
     and a pipe pattern inside a fence is not a table anyway.
+
+    The assembled sequence is graded once at the end. Each block is cut on its own
+    here, so a boundary BETWEEN two blocks -- a table run and the prose after it,
+    or two row-split pieces -- belongs to no single cut and is graded by none of
+    them, while the reader still reads those messages in order. The repair's
+    subject is ``text``, the body this function holds, never the concatenation of
+    the blocks, which is not the reply.
+
+    Every block is redacted BEFORE it enters the list, which the grade requires:
+    :func:`~kiro_crew.messaging.split._rejoins_a_key` reads the sequence as one
+    text and is sound only on chunks that are already a fixed point of that scan,
+    so an unredacted table cell holding a whole credential would fire the seam
+    repair for something no seam severed. The prose branch gets that redaction from
+    the splitter; a table run bypasses the splitter and needs it here.
     """
     if _FENCE_LINE_RE.search(text):
         return _split_markdown_bounded(text, rendered_limit)
@@ -791,129 +440,40 @@ def _split_markdown_table_aware(text: str, rendered_limit: int, rich_limit: int)
     for is_table, lines in _table_blocks(text):
         block = "\n".join(lines)
         if is_table:
-            if len(block) <= rich_limit:
-                out.append(block)
+            safe_block = _display_safe(block)
+            if len(safe_block) <= rich_limit:
+                out.append(safe_block)
             else:
-                out.extend(_split_table_rows(lines, rich_limit))
+                out.extend(_split_table_rows(safe_block.split("\n"), rich_limit))
         elif block.strip():
             out.extend(_split_markdown_bounded(block, rendered_limit))
-    return [c for c in out if c.strip()]
+    kept = [c for c in out if c.strip()]
+
+    def bounded(repaired: str) -> list[str]:
+        return _split_markdown_bounded(repaired, rendered_limit)
+
+    repaired = repaired_for_delivery(text, kept, _default_redactor, bounded)
+    if repaired is None:
+        return kept
+    return bounded(repaired)
 
 
 def _strip_md(text: str) -> str:
     """Flatten Markdown to clean plaintext for the streaming typewriter frames
     (and as the safe fallback if an HTML final edit is ever rejected) -- avoids
-    showing raw ``**``/``##``/``[x](url)`` noise while the answer is forming."""
-    text = _FENCE_RE.sub(lambda m: m.group(1), text)
-    text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
-    text = _HEADING_RE.sub(lambda m: m.group(1).strip(), text)
-    text = _BOLD_STAR_RE.sub(lambda m: m.group(1), text)
-    text = _BOLD_USCORE_RE.sub(lambda m: m.group(1), text)
-    text = _LINK_RE.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    showing raw ``**``/``##``/``[x](url)`` noise while the answer is forming.
+    The fence, inline-code, heading, ``**``, ``__`` and link passes are the
+    display-safety screen's own objects and replacements, in the order its
+    ``_plain_reading`` applies them. The bullet pass keeps a visible bullet
+    between surrounding text and remains this renderer's own."""
+    text = TELEGRAM_FALLBACK_FENCE.sub(lambda m: m.group(1) or "", text)
+    text = TELEGRAM_FALLBACK_INLINE_CODE.sub(lambda m: m.group(1), text)
+    text = TELEGRAM_FALLBACK_HEADING.sub(telegram_fallback_heading_text, text)
+    text = TELEGRAM_FALLBACK_BOLD_STAR.sub(lambda m: m.group(1), text)
+    text = TELEGRAM_FALLBACK_BOLD_USCORE.sub(lambda m: m.group(1), text)
+    text = TELEGRAM_FALLBACK_LINK.sub(TELEGRAM_FALLBACK_LINK_TEXT, text)
     text = _BULLET_RE.sub(lambda m: f"{m.group(1)}\u2022 ", text)
     return text
-
-
-class TelegramApprovalDecider:
-    """Awaits an inline-button approval for a tool-permission request.
-
-    Process-global Future registry keyed by ``session_key:request_id`` so
-    concurrent turns (and users) never resolve each other's prompts. Denies by
-    default when the wait elapses.
-    """
-
-    _REGISTRY: dict[str, "asyncio.Future[bool]"] = {}
-    #: registry key -> the nonce minted for the buttons now showing. A press whose
-    #: nonce does not match is refused, which is what stops a button from a previous
-    #: run answering a live prompt that reuses its request id.
-    _NONCES: dict[str, str] = {}
-
-    def __init__(self, *, session_key: str) -> None:
-        self._session_key = session_key
-
-    @staticmethod
-    def key(session_key: str, request_id: str | int) -> str:
-        return f"{session_key}:{request_id}"
-
-    @classmethod
-    def arm(cls, key: str, nonce: str) -> None:
-        """Record the nonce for the buttons the renderer is about to post."""
-        cls._NONCES[key] = nonce
-
-    @classmethod
-    def retire(cls, key: str) -> None:
-        """Drop an armed nonce whose prompt never went out (idempotent).
-
-        ``__call__`` retires the nonce with the prompt it waited on, but a caller
-        that ARMS then fails to post (a spawn-approval prompt Telegram rejected)
-        has no wait to run that ``finally`` — without this the stale nonce would
-        outlive the prompt that never existed.
-        """
-        cls._NONCES.pop(key, None)
-
-    async def __call__(self, event: Any) -> bool:
-        k = self.key(self._session_key, getattr(event, "request_id", ""))
-        fut: "asyncio.Future[bool]" = asyncio.get_running_loop().create_future()
-        TelegramApprovalDecider._REGISTRY[k] = fut
-        try:
-            return bool(await asyncio.wait_for(fut, _APPROVAL_TIMEOUT_S))
-        except asyncio.TimeoutError:
-            return False  # deny-by-default on timeout
-        finally:
-            TelegramApprovalDecider._REGISTRY.pop(k, None)
-            # Retire the nonce with the prompt, so a button for a request id the
-            # provider later reuses cannot match a nonce that is not live.
-            TelegramApprovalDecider._NONCES.pop(k, None)
-
-    @classmethod
-    def nonce_matches(cls, key: str, nonce: str) -> bool:
-        """Whether *nonce* is the one minted for the prompt currently at *key*.
-
-        The binding a key alone cannot provide. ACP request ids are REUSABLE — a
-        provider or gateway restart resets the sequence — and the conversation
-        generation only changes on ``/new`` or an idle/daily rotation. So a
-        provider that restarts mid-conversation issues request id 1 again, and a
-        stale button from before the restart carries that same id: pressing it
-        resolves a prompt for an UNRELATED tool the user never read, and on the
-        Trust button also hands out standing auto-approve for the conversation.
-        Only an unpredictable per-prompt value closes that, so the nonce is the
-        thing actually checked and the key is just where it is filed.
-
-        Constant-time compare, and fails closed on a missing or empty value.
-        """
-        expected = cls._NONCES.get(key)
-        if not expected or not nonce:
-            return False
-        return secrets.compare_digest(nonce, expected)
-
-    @classmethod
-    def is_pending(cls, key: str, nonce: str = "") -> bool:
-        """Whether a live, unresolved prompt is registered for *key*.
-
-        Asked BEFORE a side effect that a press should only be able to cause
-        while its prompt is still live. The registry is empty after a gateway
-        restart, so every approval button still sitting in a chat's scrollback
-        would otherwise take effect against a session that does not exist.
-
-        *nonce* is checked when supplied, so a caller asking "may this PRESS act"
-        gets the prompt-identity answer rather than the weaker key-identity one.
-        """
-        if nonce and not cls.nonce_matches(key, nonce):
-            return False
-        fut = cls._REGISTRY.get(key)
-        return fut is not None and not fut.done()
-
-    @classmethod
-    def resolve_global(cls, key: str, approved: bool, *, nonce: str = "") -> bool:
-        """Resolve a pending approval by key. Returns True iff one was waiting
-        AND the pressed button's nonce matches the one minted for that prompt."""
-        if not cls.nonce_matches(key, nonce):
-            return False  # stale or foreign button — fail closed
-        fut = cls._REGISTRY.get(key)
-        if fut is not None and not fut.done():
-            fut.set_result(bool(approved))
-            return True
-        return False
 
 
 class TelegramRenderer(Renderer):
@@ -1001,6 +561,15 @@ class TelegramRenderer(Renderer):
         # One-slot memo for the live frame's safe body, keyed on its exact source.
         self._safe_src = "\x00"  # a value no segment can equal
         self._safe_out = ""
+        self._safe_sent = "\x00"  # the memo also depends on the sealed predecessor
+        #: The last segment SEALED as its own message, whole. A rotation replaces
+        #: the buffer with the retained tail, so text already sent leaves the
+        #: buffer and no later cut can see it -- and a boundary graded at seal time
+        #: says nothing about text that arrives afterwards. Keeping the sealed
+        #: predecessor is what lets the next thing shown be graded against what the
+        #: reader is already looking at. Bounded by one message, not by the turn:
+        #: only the message a new one sits under can rejoin anything with it.
+        self._sent_tail = ""
         # True between posting an approval prompt and the turn resuming. A turn
         # waiting on a button is blocked on the user, not stalled.
         self._awaiting_approval = False
@@ -1022,98 +591,8 @@ class TelegramRenderer(Renderer):
         # extraction has no approved root and uploads stay off.
         self._uploads_allowed = bool(uploads_allowed)
         self._upload_root = ""
-
-    # -- lifecycle ----------------------------------------------------------
-    async def on_turn_start(self) -> None:
-        # Typing indicator only — no draft preview. Idempotent (dispatch + driver
-        # both call this).
-        if self._typing_task is not None or self._closed:
-            return
-        self._note_progress()
-        self._typing_task = asyncio.create_task(self._typing_loop())
-
-    async def _typing_loop(self) -> None:
-        """Keep the 'typing…' chat action alive (it expires after ~5s) for the
-        duration of the turn, and surface a stall mark when nothing has moved.
-
-        The stall check rides this existing tick rather than a task of its own:
-        the loop already wakes every ``_TYPING_REFRESH_S``, which is finer than
-        the soft threshold, and the mark it publishes goes on a frame the
-        renderer edits anyway. Cancelled by ``_stop_typing``.
-        """
-        try:
-            while not self._closed:
-                try:
-                    await self._client.send_typing(self._chat_id, message_thread_id=self._thread_id)
-                except Exception:
-                    logger.debug("Telegram: typing refresh failed", exc_info=True)
-                if not self._closed and self._stall_mark() != self._shown_stall:
-                    # force=True so the mark lands now: the throttle exists to
-                    # coalesce a token stream, and by definition there is none.
-                    try:
-                        await self._stream_live(force=True)
-                    except Exception:
-                        logger.debug("Telegram: stall mark refresh failed", exc_info=True)
-                await asyncio.sleep(_TYPING_REFRESH_S)
-        except asyncio.CancelledError:
-            pass
-
-    def _stop_typing(self) -> None:
-        self._closed = True
-        task, self._typing_task = self._typing_task, None
-        if task is not None and not task.done():
-            task.cancel()
-
-    def _note_progress(self) -> None:
-        """Reset the stall clock, and end any approval wait. Any provider event is
-        progress — and an event arriving after an approval prompt is exactly how
-        this renderer learns the decision was made."""
-        self._last_progress = time.monotonic()
-        self._awaiting_approval = False
-
-    def _stall_mark(self) -> str:
-        """The stall mark the live frame should carry right now, or ``""``.
-
-        Read from the clock rather than latched, so the mark clears itself the
-        moment output resumes instead of persisting to the end of the turn.
-
-        Suppressed while a tool approval is pending: the turn is blocked on the
-        USER, not stalled, and the approval window is 300s against a 45s hard
-        mark — so without this every approval that waits a minute reports the
-        agent as hung. Slack's controller pauses its own watchdog for the same
-        reason (``pause_stall_watchdog`` around its approval wait).
-        """
-        if self._awaiting_approval:
-            return ""
-        idle = time.monotonic() - self._last_progress
-        if idle >= _HARD_STALL_S:
-            return _HARD_STALL_MARK
-        if idle >= _SOFT_STALL_S:
-            return _SOFT_STALL_MARK
-        return ""
-
-    async def on_text_chunk(self, text: str) -> None:
-        self._buf.append(text)
-        self._note_progress()
-        self._tool = ""  # text resumed -> drop the transient tool footer
-        # 1) Defensive fallback for callers that bypass TurnDriver and
-        #    deliver raw protocol text directly to the renderer.
-        await self._rotate_at_markers()
-        # 1b) Materialize the pending chip once real post-steer text exists.
-        self._materialize_chip()
-        # 2) Rotate when a segment would exceed one Telegram message.
-        await self._rotate_on_length()
-        # 3) Live-stream the current segment: edit the message in place (throttled).
-        await self._stream_live()
-
-    def _materialize_chip(self) -> None:
-        """Prepend the pending steer chip to the segment — but only when the
-        segment carries real text. Keeps an end-of-stream marker from ever
-        posting a chip-only ack bubble."""
-        if self._pending_chip and self._segment_text().strip():
-            body = "".join(self._buf).lstrip("\n")
-            self._buf = [f"{self._pending_chip}\n\n{body}"]
-            self._pending_chip = ""
+        # The session's own scratch directory, set only beside a valid root.
+        self._scratch_root = ""
 
     async def on_steer_consumed(self, summary: str = "") -> None:
         """Seal the pre-steer segment at the driver's structured boundary."""
@@ -1148,20 +627,6 @@ class TelegramRenderer(Renderer):
         self._buf = []
         if sealed:
             self._open_new_message()
-
-    async def _rotate_at_markers(self) -> None:
-        """Defence for callers that bypass TurnDriver and pass raw markers."""
-        while True:
-            self._materialize_chip()
-            raw = "".join(self._buf)
-            marker = _STEER_MARKER_RE.search(raw)
-            if marker is None:
-                return
-            self._buf = [raw[: marker.start()]]
-            summary_match = _STEER_SUMMARY_RE.match(raw, marker.start())
-            summary = _neutralize_md(summary_match.group(1)) if summary_match else ""
-            await self.on_steer_consumed(summary)
-            self._buf = [raw[marker.end() :]]
 
     async def _rotate_on_length(self) -> None:
         """Rotate when the segment exceeds one Telegram message. Uses
@@ -1214,7 +679,36 @@ class TelegramRenderer(Renderer):
                 if spans[0][0] == 0:
                     return  # the whole buffer is protected — do not rotate at all
                 held = raw[spans[0][0] :]
-                for chunk in _split_markdown_bounded(raw[: spans[0][0]], rendered_cap):
+                # The boundary between the last sealed chunk and ``held`` needs no
+                # grade, deliberately. ``held`` begins AT the ref span, so its first
+                # two characters are always ``![`` -- and ``!`` survives
+                # canonicalising, standing between the sealed chunk's last character
+                # and anything the tail could contribute. Measured over alt-text,
+                # link-target, trailing-text and bare-adjacency shapes: no join
+                # reaches a credential pattern, so a gate there would be a gate on an
+                # unreachable boundary.
+                #
+                # The boundaries AMONG the prefix chunks are a different matter. The
+                # splitter redacts before choosing one, but it reads the RAW pieces,
+                # where a horizontal rule still stands between two fragments; the
+                # seal strips rules, so the reader sees them flush. And the seam
+                # repair that does read the delivered form reads one predecessor
+                # only. A key whose fragments sit across three chunks separated by
+                # ``---`` is therefore clean in every reading that runs. Grade the
+                # prefix as a SEQUENCE in its delivered form, the same gate the
+                # length path below carries, and carve on it when it severs.
+                prefix = raw[: spans[0][0]]
+                chunks = await asyncio.to_thread(_split_markdown_bounded, prefix, rendered_cap)
+                if await asyncio.to_thread(
+                    severs_a_credential, chunks, _default_redactor, _delivered_form
+                ):
+                    carved = await self._carve_graded(prefix, limit, rendered_cap)
+                    if carved is None:
+                        # Deliver NOTHING: the whole buffer, reference included, rides
+                        # the next rotation and the semantic seal redacts it intact.
+                        return
+                    chunks = carved
+                for chunk in chunks:
                     self._buf = [chunk]
                     await self._seal_current(extract_uploads=False)
                     self._open_new_message()
@@ -1240,7 +734,9 @@ class TelegramRenderer(Renderer):
             # _has_table guarantees at least two lines, so a newline exists.
             head, nl, partial = raw.rpartition("\n")
             head += nl
-            chunks = _split_markdown_table_aware(head, rendered_cap, rich_cap)
+            chunks = await asyncio.to_thread(
+                _split_markdown_table_aware, head, rendered_cap, rich_cap
+            )
             if chunks:
                 # Reattach what the line-joining splitter drops: the complete
                 # prefix's trailing newlines, then the unterminated line. The
@@ -1250,7 +746,7 @@ class TelegramRenderer(Renderer):
             else:
                 chunks = [partial]
         else:
-            chunks = _split_markdown_bounded(raw, rendered_cap)
+            chunks = await asyncio.to_thread(_split_markdown_bounded, raw, rendered_cap)
         # Mid-stream the source fence is often still OPEN (the model has not
         # emitted its closing ``` yet). _split_markdown balances each chunk by
         # appending a synthetic closer, which is right for the chunks we seal but
@@ -1261,6 +757,46 @@ class TelegramRenderer(Renderer):
             tail = chunks[-1].rstrip()
             if tail.endswith("```"):
                 chunks[-1] = tail[:-3].rstrip("\n")
+        # The chunks are sealed as separate messages and each is redacted on its own,
+        # so a key the cut severed matches nothing in any one of them while the
+        # reader's client renders the markup away and reads them as one key down the
+        # screen. Grade the DELIVERED form, which the seal strips.
+        if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor, _delivered_form):
+            # Cut where the reader cannot rejoin rather than where the budget lands.
+            # Both sides are SOURCE slices: splitter output does not concatenate back
+            # to its input (fences are closed and reopened), so rejoining chunks
+            # would hand the user text the model never wrote.
+            #
+            # The offset is bounded by the SOURCE budget, and escaping inflates, so a
+            # safe head can still render past the HTML cap. Shrink the budget by the
+            # inflation actually observed and look again, which is the same loop the
+            # splitter itself runs -- a safe cut that fits is worth more than giving
+            # up on the rotation, since a deferral holds the whole buffer.
+            # The search grades the DELIVERED form of both sides, so the offset it
+            # returns is one this caller can take. Grading raw here and re-checking
+            # afterwards would deadlock the segment: the search is deterministic, so a
+            # rejected answer is the same answer every rotation and nothing ever goes
+            # out. Off the loop for the cost reason the redaction above carries -- each
+            # sampled offset is two full-buffer redaction passes.
+            budget, head, offset = limit, "", 0
+            while True:
+                offset = await asyncio.to_thread(
+                    safe_split_offset, raw, budget, _default_redactor, _delivered_form
+                )
+                head = raw[:offset]
+                worst = await asyncio.to_thread(_rendered_len, head)
+                if not offset or worst <= rendered_cap:
+                    break
+                if budget <= _MIN_SPLIT_LIMIT:
+                    offset = 0
+                    break
+                budget = _shrunk_limit(budget, rendered_cap, worst)
+            if not offset:
+                # Deliver NOTHING: the withheld text rides the next rotation, and the
+                # final seal re-splits and seals an over-cap segment chunk by chunk.
+                self._buf = [raw + protocol_suffix]
+                return
+            chunks = [head, raw[offset:]]
         for ch in chunks[:-1]:
             self._buf = [ch]
             # A length rotation never extracts: only a SEMANTIC seal (steer
@@ -1271,43 +807,49 @@ class TelegramRenderer(Renderer):
             self._open_new_message()
         self._buf = [(chunks[-1] if chunks else "") + protocol_suffix]
 
-    def _open_new_message(self) -> None:
-        """Next render creates a fresh message instead of editing the old one."""
-        self._stream_mid = None
-        self._shown = ""
+    async def _carve_graded(self, source: str, limit: int, rendered_cap: int) -> list[str] | None:
+        """``source`` cut into pieces no reader can rejoin into a credential, or
+        ``None`` when no safe cut exists and the text must be withheld whole.
 
-    def _segment_text(self) -> str:
-        """Current segment's markdown source (chip already seeded into _buf),
-        with the steer marker and horizontal-rule noise stripped."""
-        return _strip_hr(_strip_steering("".join(self._buf)))
+        Every piece this returns is SEALED by the caller, with no rotation left
+        ahead of any of them, so the carve continues until the remainder fits the
+        budget rather than stopping at one offset. A piece left over the cap is
+        re-split by ``_seal_current`` on length alone, with no credential grade,
+        which is the cut this gate exists to close -- so taking a single offset
+        would buy ONE safe boundary by handing every later boundary in the same
+        text to an ungraded one.
 
-    def _consume_reply_to(self) -> int | None:
-        """The reply target for this send, spent so only the FIRST one carries it.
-
-        Every later bubble of the same turn — a rotated frame, an image, a
-        follow-up segment — is already attached by adjacency, and a reply quote on
-        each one would triple the visual weight of a multi-part answer for no
-        added information. Consuming here rather than at the call sites means a
-        send path that runs first cannot leave the target for a later one to spend
-        a second time; whichever path opens the turn gets it.
+        Each step grades its head against the whole remainder, which is the
+        per-boundary reading ``severs_a_credential`` applies to the finished list.
+        That reading is still asked for once at the end: canonicalising DROPS a
+        link target, so markup spanning a middle piece can collapse two distant
+        pieces together in a way no single boundary check sees. The cost is
+        confined to text that already severs -- a prefix the splitter cut safely
+        never reaches here.
         """
-        target, self._reply_to = self._reply_to, None
-        return target
-
-    async def _stream_live(self, *, force: bool = False) -> None:
-        """Throttled in-place edit of the current segment (plaintext, so partial
-        markdown never 400s). Sends the message on first render. The transient
-        ``🔧 {tool}…`` footer and the stall mark are appended ONLY here (live
-        frames) — seals and the final render read ``_segment_text`` and never
-        carry either. ``force`` bypasses the throttle so a tool-call event, or a
-        stall mark the typing tick noticed, surfaces immediately.
-
-        Serialized by ``_frame_lock``: the typing loop is a SEPARATE task, so
-        without it a stall-mark frame could interleave with a token frame and
-        leave the older text on screen.
-        """
-        async with self._frame_lock:
-            await self._stream_live_locked(force=force)
+        graded: list[str] = []
+        rest = source
+        while len(rest) > limit or await asyncio.to_thread(_rendered_len, rest) > rendered_cap:
+            budget = limit
+            while True:
+                offset = await asyncio.to_thread(
+                    safe_split_offset, rest, budget, _default_redactor, _delivered_form
+                )
+                if not offset:
+                    return None
+                head = rest[:offset]
+                worst = await asyncio.to_thread(_rendered_len, head)
+                if worst <= rendered_cap:
+                    break
+                if budget <= _MIN_SPLIT_LIMIT:
+                    return None
+                budget = _shrunk_limit(budget, rendered_cap, worst)
+            graded.append(head)
+            rest = rest[offset:]
+        chunks = [*graded, rest]
+        if await asyncio.to_thread(severs_a_credential, chunks, _default_redactor, _delivered_form):
+            return None
+        return chunks
 
     async def _safe_body(self, seg: str) -> str:
         """The live frame's plaintext body: markup hidden, markdown flattened, and
@@ -1325,60 +867,25 @@ class TelegramRenderer(Renderer):
         equality, not a heuristic — a segment that has not changed cannot have a
         different safe form.
         """
-        if seg == self._safe_src:
+        if seg == self._safe_src and self._sent_tail == self._safe_sent:
             return self._safe_out
         hide = hide_local_refs if self._uploads_enabled() else None
+        sent = self._sent_tail
 
         def _render() -> str:
-            return _display_safe(_strip_md(hide(seg) if hide else seg))
+            safe = _display_safe(_strip_md(hide(seg) if hide else seg))
+            # The frame sits directly under the message sealed before it, so the
+            # same seam applies: a key begun at the end of that message and
+            # completed here reads whole down the screen. The sealed half cannot be
+            # changed, so this half gives up the span that completes it.
+            repaired = repaired_after_a_sent_tail(sent, safe, _default_redactor)
+            return repaired if repaired is not None else safe
 
         out = await asyncio.to_thread(_render)
-        self._safe_src, self._safe_out = seg, out
+        self._safe_src, self._safe_out, self._safe_sent = seg, out, sent
         return out
 
-    async def _stream_live_locked(self, *, force: bool) -> None:
-        now = time.monotonic()
-        if not force and now - self._last_edit < _EDIT_THROTTLE_S:
-            return
-        # Hold back trailing [OPTIONS:] markup (complete or still-streaming
-        # partial) from live frames — it is an internal directive, extracted
-        # into the inline keyboard at finalization.
-        seg, _ = _extract_options(self._segment_text())
-        # A control-tag line still arriving is held off the frame the same way.
-        seg = strip_control_comments(seg, hide_partial=True)
-        body = await self._safe_body(seg)
-        stall = self._stall_mark()
-        # The tool footer wins: it names what is happening, which is strictly
-        # more informative than "nothing has happened".
-        footer = f"🔧 {self._tool}…" if self._tool else stall
-        if footer:
-            # Keep the footer visible even when it must displace body tail chars.
-            room = self._limit() - len(footer) - 2
-            text = f"{body[:room]}\n\n{footer}".strip() if room > 0 else footer
-        else:
-            text = body[: self._limit()]
-        # Recorded BEFORE the suppression check: when the frame is unchanged there
-        # is nothing to send, but the typing tick compares against this to decide
-        # whether to try at all — leaving it stale makes it retry every tick for
-        # the rest of the turn.
-        self._shown_stall = stall
-        if not text or text == self._shown:
-            return
-        self._last_edit = now
-        self._shown = text
-        if self._stream_mid is None:
-            mid = await self._client.send_message(
-                self._chat_id,
-                text,
-                message_thread_id=self._thread_id,
-                reply_to_message_id=self._consume_reply_to(),
-            )
-            if mid is not None:
-                self._stream_mid = mid
-        else:
-            await self._client.edit_message(self._chat_id, self._stream_mid, text)
-
-    async def _seal_without_rich(self, text: str) -> tuple[str, str]:
+    async def _seal_without_rich(self, text: str) -> tuple[str, str, int | None]:
         """HTML for a seal that cannot use Rich Messages, plus the tail segment.
 
         Pipe blocks are wrapped in ``<pre>`` so a block Rich Markdown would
@@ -1396,171 +903,67 @@ class TelegramRenderer(Renderer):
 
         Returns the HTML to seal with and the tail segment it renders, which the
         caller seals through its normal path so the keyboard lands on the final
-        message.
+        message. The third value is the streamed bubble the chunks were sent
+        below because it could not be edited, for the caller to delete once the
+        tail has landed too. It is None when there is no such bubble, and when a
+        chunk did not land: the bubble may then show rows that no sent message
+        carries.
         """
         html_text = _seal_table_fallback(text)
+        replaced: int | None = None
         if len(html_text) > self._rendered_limit():
             html_text = _md_to_telegram_html(text)
             if len(html_text) > self._rendered_limit():
-                chunks = self._degraded_table_chunks(text)
+                chunks = await asyncio.to_thread(self._degraded_table_chunks, text)
+                all_landed = True
                 for ch in chunks[:-1]:
-                    await self._seal_chunk_html(ch)
+                    landed, frame = await self._seal_chunk_html(ch)
+                    all_landed = all_landed and landed
+                    if frame is not None:
+                        replaced = frame
+                if not all_landed:
+                    replaced = None
                 if chunks:
                     text = chunks[-1]
+                # The tail sits under the last chunk this method just sealed, and
+                # that chunk did not exist when the segment's own seam was graded.
+                # So it is graded again here, against what the reader can now see.
+                text = await asyncio.to_thread(self._seam_safe, text)
                 html_text = _seal_table_fallback(text)
                 if len(html_text) > self._rendered_limit():
                     html_text = _md_to_telegram_html(text)
-        return html_text, text
+        return html_text, text, replaced
 
-    # ── Outbound image upload ──────────────────────────────────────────────
+    def _seam_safe(self, text: str) -> str:
+        """*text* display-safe, with its seam to the message above repaired.
 
-    def attach_context_client(self, client: Any) -> None:
-        """Supply the provider's ACP client, whose ``context_usage_pct`` the turn
-        footer reads. Set after the session is acquired, because the provider does
-        not exist before then; absent, the footer reports duration only."""
-        self._ctx_client = client
+        The one place a sealed segment's text is decided, so it is the one place
+        that has to know about the message above it. Callers only seal; none of them
+        carries a seam rule of its own, which is what keeps a new sealing path from
+        shipping an open seam.
 
-    def authorize_upload_root(self, root: object) -> None:
-        """Authorize the provider's resolved cwd as extraction's approved root.
+        It does NOT record the predecessor. What the next segment must be graded
+        against is the message the reader can see, and text this returns has not
+        been sent yet: every send and edit path below can fail, and recording here
+        would make unsent text the predecessor, after which the next delivered
+        message gives up a leading span for a key nobody ever read. ``_record_sent``
+        is called once a delivery path confirms.
 
-        Anything that is not an ABSOLUTE STRING PATH disables uploads rather than
-        widening them: this root is the trust boundary extraction measures every
-        reference against — it refuses a path lexically outside the root before
-        any metadata probe — so a value it cannot evaluate must be no root at all,
-        not a root it guesses at.
+        Runs on a worker thread: both the redaction and the grade scan.
         """
-        if isinstance(root, str) and os.path.isabs(root):
-            self._upload_root = root
-            return
-        self._upload_root = ""
-        if root:
-            # A non-empty root we cannot trust is worth a line: it is the
-            # difference between "this instance has no provider cwd" and "the cwd
-            # changed shape", and both present as uploads silently not happening.
-            logger.info("telegram: refusing an untrusted upload root (%s)", type(root).__name__)
+        safe = _display_safe(text)
+        repaired = repaired_after_a_sent_tail(self._sent_tail, safe, _default_redactor)
+        return repaired if repaired is not None else safe
 
-    def _uploads_enabled(self) -> bool:
-        """Transport capability AND an unrestricted session AND a trusted root."""
-        return (
-            bool(self.capabilities.files_outbound)
-            and self._uploads_allowed
-            and bool(self._upload_root)
-        )
+    def _record_sent(self, text: str) -> None:
+        """Remember *text* as the message the next seam is graded against.
 
-    async def _extract_uploads(self, text: str) -> tuple[str, list[OutboundFile]]:
-        """Pull local image references out of one sealed segment, fail-soft.
-
-        Runs off-loop (extraction reads files) and never raises into the seal: a
-        failure here must cost the picture, not the answer.
+        Called only after a send or edit reports success, and with the text that
+        actually went out -- which is not always the text ``_seam_safe`` returned: a
+        degraded segment is re-split after that point, so the last chunk shown is
+        what the reader is looking at and what the next segment sits under.
         """
-        try:
-            result = await extract_local_refs_off_loop(
-                text, within_root=self._upload_root, limits=_UPLOAD_LIMITS
-            )
-        except Exception:
-            logger.warning("telegram: outbound file extraction failed", exc_info=True)
-            return text, []
-        if result.rejections:
-            sel().log_api_access(
-                caller=self._session_key or "telegram",
-                operation="telegram_renderer.upload_files",
-                outcome="denied",
-                source="telegram",
-                resources=f"{len(result.rejections)} rejection(s)",
-                # Only the closed reason CODES — never the LLM-authored destination.
-                error=",".join(sorted({item.reason for item in result.rejections})),
-            )
-        body = result.rewritten_text.strip()
-        if not body and not result.files:
-            body = text
-        if result.rejections:
-            body = self._append_rejections(body, result.rejections)
-        if result.files:
-            sel().log_api_access(
-                caller=self._session_key or "telegram",
-                operation="telegram_renderer.upload_files",
-                outcome="allowed",
-                source="telegram",
-                resources=f"{len(result.files)} file(s)",
-            )
-        return body, result.files
-
-    def _append_rejections(self, body: str, rejections: list[Rejection]) -> str:
-        """Name every refusal in the answer, as long as the budget permits.
-
-        A file dropped in silence leaves a reply that talks about a picture with
-        no picture and no explanation, so the reasons are surfaced; past
-        ``_MAX_REJECTION_LINES`` they collapse into a tally rather than crowding
-        out the answer.
-        """
-        for rejection in rejections:
-            logger.info("telegram: local image not uploaded (%s)", rejection.reason)
-        lines = [f"⚠️ {rejection}" for rejection in rejections[:_MAX_REJECTION_LINES]]
-        if len(rejections) > _MAX_REJECTION_LINES:
-            lines.append(f"⚠️ …and {len(rejections) - _MAX_REJECTION_LINES} more")
-        note = "\n".join(lines)
-        if len(body) + len(note) + 2 > self._limit():
-            return body
-        return f"{body}\n\n{note}"
-
-    async def _send_uploads(self, files: list[OutboundFile]) -> None:
-        """Ship the extracted images as their own message, after the text seal.
-
-        Photos deliberately do NOT ride the answer as a caption. A caption is
-        capped at 1024 characters against the message's 4096, carries no
-        ``reply_markup`` on an album, and the answer has already been rendered
-        through this channel's HTML/table machinery — folding a truncated second
-        copy into a caption would be strictly worse than one clean bubble followed
-        by its pictures. ``disable_notification`` because the answer bubble
-        already pinged.
-
-        On failure the REFERENCES are restored, not the segment. Unlike Discord —
-        which sends text and files in one multipart call, so recovery has to
-        re-post the whole thing — the text bubble here has already landed, so
-        re-posting the source would duplicate the entire answer. The markup is
-        rebuilt from each ``OutboundFile``'s own alt and path (``path`` is
-        provenance for exactly this) so the user learns which picture is missing
-        and where it is, without the answer arriving twice.
-        """
-        if not files:
-            return
-        try:
-            sent = await self._client.send_media_group(
-                self._chat_id,
-                files,
-                message_thread_id=self._thread_id,
-                disable_notification=True,
-            )
-        except Exception:
-            logger.warning("telegram: image upload raised", exc_info=True)
-            sent = []
-        if sent:
-            return
-        logger.warning("telegram: upload of %d image(s) failed; restoring their markup", len(files))
-        # The alt text is LLM-authored and the markup itself can reassemble a
-        # credential out of formatting Telegram then hides, so the restored
-        # references are redacted against the rendered form. Markup that concealed
-        # a secret loses its formatting rather than its redaction — the documented
-        # direction of that trade.
-        restored = _display_safe(
-            "\n".join(f"![{item.alt or 'image'}]({item.path})" for item in files)
-        )
-        # A single truncated bubble keeps only what fits under the cap, so with
-        # several failed images the LATER references vanish silently. Measuring
-        # the cap in code points also mismatches Telegram's UTF-16 count, so
-        # emoji-dense alt text passes the slice and then bounces at the API.
-        # Chunk the redacted whole by UTF-16 budget instead (redaction
-        # first, so the scanner saw the contiguous text; a chunk is a pure
-        # substring of it). Header rides the first bubble only.
-        header = "⚠️ Couldn't upload:\n"
-        budget = self._limit() - _utf16_len(header)
-        for index, chunk in enumerate(_utf16_chunks(restored, budget)):
-            await self._client.send_message(
-                self._chat_id,
-                f"{header}{chunk}" if index == 0 else chunk,
-                message_thread_id=self._thread_id,
-                disable_notification=True,
-            )
+        self._sent_tail = text
 
     async def _seal_current(
         self,
@@ -1601,23 +1004,6 @@ class TelegramRenderer(Renderer):
             await self._retire_live_frame()
         await self._send_uploads(files)
 
-    async def _retire_live_frame(self) -> None:
-        """Remove a live bubble that ended up carrying no answer of its own.
-
-        Deleted rather than blanked: Telegram rejects an empty ``editMessageText``,
-        and a placeholder would be one more thing above the real content. Failure
-        is non-fatal — a stale footer is worse than nothing, not worse than a
-        crash.
-        """
-        async with self._frame_lock:
-            mid, self._stream_mid, self._shown = self._stream_mid, None, ""
-        if mid is None:
-            return
-        try:
-            await self._client.delete_message(self._chat_id, mid)
-        except Exception:
-            logger.debug("Telegram: retiring the live frame failed", exc_info=True)
-
     async def _seal_text(self, text: str, keyboard: dict | None, *, footer: str = "") -> None:
         """Land one segment's text: replace its live plaintext with the formatted
         HTML (and optional keyboard). Edits the streamed message in place, or
@@ -1640,7 +1026,16 @@ class TelegramRenderer(Renderer):
         # budgeted against the rich cap, where this measures in the tens of
         # milliseconds — holding the frame lock across it would block the typing
         # task too, and holding the loop would block every other conversation.
-        text = await asyncio.to_thread(_display_safe, text)
+        #
+        # The seam repair and the predecessor record live HERE, in the sink, for the
+        # same reason the redaction does: five paths seal a segment as its own
+        # message, and a guard at one of them is not a guard on the channel. A
+        # segment whose tail is a credential PREFIX matches nothing, so it seals, and
+        # the characters completing the key arrive in the segment below it -- which
+        # this is. The message above cannot be recalled, so this one gives up the
+        # span that completes the key, and then becomes the predecessor the next seal
+        # is graded against.
+        text = await asyncio.to_thread(self._seam_safe, text)
         if footer:
             # A quoted line under the answer rather than a separate message: the
             # footer is metadata about the turn, and a second bubble for it would
@@ -1675,6 +1070,7 @@ class TelegramRenderer(Renderer):
                     )
                     if mid is not None:
                         self._tally_redactions(text)
+                        self._record_sent(text)
                         if self._stream_mid is not None:
                             # The rich message now carries this segment; drop the
                             # superseded plaintext bubble so the user sees one message.
@@ -1688,14 +1084,14 @@ class TelegramRenderer(Renderer):
                     logger.debug(
                         "sendRichMessage failed for chat %s, falling back to HTML", self._chat_id
                     )
-                    html_text, text = await self._seal_without_rich(text)
+                    html_text, text, stale_mid = await self._seal_without_rich(text)
                 else:
                     # No conforming table, which includes pipe markup GFM rejects -- a
                     # header row whose cell count disagrees with its delimiter. Rich
                     # Markdown renders that as one paragraph with the newlines collapsed,
                     # so it must not take the rich path; the monospace seal shows every
                     # row verbatim on its own line instead.
-                    html_text, text = await self._seal_without_rich(text)
+                    html_text, text, stale_mid = await self._seal_without_rich(text)
                 if self._stream_mid is not None:
                     ok = await self._client.edit_message(
                         self._chat_id,
@@ -1714,11 +1110,15 @@ class TelegramRenderer(Renderer):
                         )
                     if ok:
                         self._tally_redactions(text)
+                        self._record_sent(text)
                         return
                     # Both edits failed — the live message is gone (e.g. the user
-                    # deleted it mid-turn). Fall through and SEND the final content so
-                    # the completed answer (and its keyboard) is never silently lost.
-                    self._stream_mid = None
+                    # deleted it mid-turn), or it is still there and could not be
+                    # edited (the per-chat edit budget, or two timeouts). Fall
+                    # through and SEND the final content so the completed answer
+                    # (and its keyboard) is never silently lost; once that send
+                    # lands, the frame it replaces is deleted.
+                    stale_mid, self._stream_mid = self._stream_mid, None
                 mid = await self._client.send_message(
                     self._chat_id,
                     html_text,
@@ -1737,72 +1137,17 @@ class TelegramRenderer(Renderer):
                     )
                 if mid is not None:
                     self._tally_redactions(text)
+                    self._record_sent(text)
+                    # Every part has landed: ``stale_mid`` is None when a chunk did not.
+                    await self._delete_replaced_frame(stale_mid)
+                else:
+                    await self._send_lost_part_notice()
 
             finally:
                 # Retire the live message: this segment is final, so nothing
                 # may edit it again.
                 self._stream_mid = None
                 self._shown = ""
-
-    async def on_thinking(self, text: str) -> None:
-        """Accumulate the model's reasoning; posted once at ``on_done``.
-
-        Counts as progress: a turn emitting reasoning is working, and a stall mark
-        that appeared over it would report the opposite.
-
-        Deliberately NOT streamed. Reasoning arrives as many small chunks and
-        Telegram's only streaming primitive is an edit of a message, so streaming
-        it would either disturb the answer bubble it must stay out of, or spend an
-        edit per chunk on a second bubble — against a per-CHAT rate budget the
-        answer is already spending. Off by default (``telegram.show_thinking``),
-        and dropped entirely when off so nothing accumulates unread.
-        """
-        self._note_progress()
-        if not self._show_thinking or not text:
-            return
-        # Bounded: only one message of reasoning is ever posted, and a long
-        # agentic turn can emit megabytes of it. Keeping the whole stream would
-        # hold it all resident to then discard all but the first few thousand
-        # characters. Stop appending once the budget is covered.
-        if self._thinking_chars >= self._thinking_budget():
-            return
-        self._thinking.append(text)
-        self._thinking_chars += len(text)
-
-    def _turn_footer(self) -> str:
-        """``Finished in 12s · 🟠 ctx 54%``, or ``""`` when neither is worth saying.
-
-        Two facts a user cannot get any other way on this channel: how long the
-        turn took, and how close the conversation is to needing ``/compact``. Both
-        are only interesting past a threshold (see ``_FOOTER_MIN_SECS`` /
-        ``_FOOTER_MIN_CTX_PCT``), and a footer that appears under every reply is
-        one the reader learns to skip — including on the turn where the context
-        warning finally matters.
-        """
-        elapsed = max(0.0, time.monotonic() - self._turn_started)
-        pct: int | None = None
-        reader = getattr(self._ctx_client, "context_usage_pct", None)
-        if callable(reader):
-            try:
-                pct = round(reader())
-            except Exception:
-                logger.debug("Telegram: context usage read failed", exc_info=True)
-        if elapsed < _FOOTER_MIN_SECS and (pct is None or pct < _FOOTER_MIN_CTX_PCT):
-            return ""
-        if elapsed < 60:
-            duration = f"{int(elapsed)}s"
-        else:
-            mins, secs = divmod(int(elapsed), 60)
-            duration = f"{mins}m {secs}s"
-        footer = f"Finished in {duration}"
-        if pct is None:
-            return footer
-        icon = next(mark for floor, mark in _CTX_GAUGE if pct >= floor)
-        return f"{footer} · {icon} ctx {pct}%"
-
-    def _thinking_budget(self) -> int:
-        """Source characters worth accumulating for the one reasoning message."""
-        return max(0, self._rendered_limit() - len(_THINKING_SCAFFOLD))
 
     async def _post_thinking(self) -> None:
         """Post the accumulated reasoning as ONE expandable blockquote.
@@ -1840,114 +1185,6 @@ class TelegramRenderer(Renderer):
             self._tally_redactions(inner)
         except Exception:
             logger.debug("Telegram: thinking post failed", exc_info=True)
-
-    async def on_tool_call(
-        self, tool_call_id: str, title: str, tool_kind: str = "", tool_purpose: str = ""
-    ) -> None:
-        self._note_progress()
-        # Surface mid-turn tool activity as a transient "🔧 {tool}…" footer on
-        # the live bubble (force=True so it shows immediately, not throttled).
-        # We deliberately do NOT seal a message here: models interleave tool
-        # calls mid-sentence, so sealing at a tool boundary chops a sentence
-        # into broken bare messages on a channel with no tool cards (proven on
-        # Telegram). The footer lives only on live frames — on_text_chunk clears
-        # it and seals/finals never carry it.
-        self._last_tool = title or tool_kind or "tool"
-        self._tool = self._last_tool
-        await self._stream_live(force=True)
-
-    async def on_prompt_choice(  # noqa: D401 - imperative reads wrong for a handler
-        self,
-        options: list[dict[str, Any]],
-        request_id: str | int,
-        tool_title: str = "",
-        tool_purpose: str = "",
-        tool_input: str = "",
-    ) -> None:
-        # Approve/Deny as a SEPARATE message so ongoing streaming edits to the
-        # answer bubble don't clobber the buttons.
-        #
-        # callback_data is ``a:<request_id>:<nonce>:<1|0|t>`` and stays well under
-        # Telegram's 64-byte cap. The NONCE is load-bearing: ACP request ids restart
-        # at 1 in every provider process, so a button still sitting in a Telegram
-        # chat from a previous run names an id that is live again for a DIFFERENT
-        # tool, and pressing it would approve that one. Minted per prompt and
-        # compared on resolve, exactly as Discord and Teams do.
-        self._note_progress()
-        self._awaiting_approval = True
-        rid = str(request_id)
-        nonce = new_approval_nonce()
-        TelegramApprovalDecider.arm(TelegramApprovalDecider.key(self._session_key, rid), nonce)
-        # Three choices, matching Slack's ladder: approve this one, trust the rest
-        # of this session, or refuse. Without Trust every tool of an agentic turn
-        # costs its own round-trip, which is what pushes an operator to global YOLO,
-        # a far wider grant than the one they actually wanted.
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Approve", "callback_data": f"a:{rid}:{nonce}:1"},
-                    {"text": "🚫 Deny", "callback_data": f"a:{rid}:{nonce}:0"},
-                ],
-                [
-                    {
-                        "text": "🤝 Trust this conversation",
-                        "callback_data": f"a:{rid}:{nonce}:t",
-                    }
-                ],
-            ]
-        }
-        # The tool name and its arguments are LLM-authored and land in a body
-        # Telegram RENDERS, so both go through the same display-form scan as the
-        # answer rather than relying on the driver's byte-level pass alone: that
-        # pass sees `AKIA**...**` as broken while the rendered message shows it
-        # whole. Off-loop, because the scan is a full credential/exfil pass.
-        #
-        # The request's OWN title first: `_last_tool` is the last tool_call seen and
-        # is never cleared, so it names the PREVIOUS tool for any permission that
-        # arrives without one of its own, and the operator would be consenting to
-        # something other than what they read.
-        #
-        # The name is monospaced, so this goes out as HTML: send_message defaults
-        # to plaintext and markdown backticks would arrive literally. Escaped after
-        # the scan, and retry_plain re-sends without a parse_mode if the markup is
-        # ever rejected.
-        tool = await asyncio.to_thread(_display_safe, tool_title or self._last_tool or "this tool")
-        body = f"🔐 Approve <code>{html.escape(tool)}</code>?"
-        # Show the arguments. "Approve bash?" is not a decision a user can make;
-        # which command it wants to run is. Bounded so the prompt stays one message.
-        detail = " ".join((tool_input or "").split())
-        if detail:
-            detail = await asyncio.to_thread(_display_safe, detail)
-            if len(detail) > _APPROVAL_INPUT_CHARS:
-                detail = detail[: _APPROVAL_INPUT_CHARS - 1].rstrip() + "…"
-            body = f"{body}\n<pre>{html.escape(detail)}</pre>"
-        await self._client.send_message(
-            self._chat_id,
-            body,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            message_thread_id=self._thread_id,
-        )
-
-    async def on_compaction(self, context_usage_pct: float) -> None:
-        self._note_progress()
-        try:
-            await self._client.send_message(
-                self._chat_id,
-                "🗜️ Compacting context…",
-                message_thread_id=self._thread_id,
-            )
-        except Exception:
-            logger.debug("Telegram: compaction notice send failed", exc_info=True)
-
-    def note_steer(self, text: str) -> None:
-        """Record the user's own mid-turn steer text (their typed words, NOT the
-        redacted backend echo). Called by the dispatcher when a steer is actually
-        injected; rendered as an inline "↪️ steered: …" chip in on_done. Capped to
-        avoid unbounded growth on a pathological steer burst."""
-        t = (text or "").strip()
-        if t and len(self._steer_texts) < 50:
-            self._steer_texts.append(t)
 
     async def on_done(self, stop_reason: str = "") -> None:
         if self._finalized:
@@ -2080,17 +1317,30 @@ class TelegramRenderer(Renderer):
                 out.append(c)
         return out
 
-    async def _seal_chunk_html(self, chunk: str) -> None:
+    async def _seal_chunk_html(self, chunk: str) -> tuple[bool, int | None]:
         """Seal one leading chunk of an overflowing degraded segment as HTML.
 
         The first chunk re-uses the streamed bubble (it is the OLDEST message,
         so it must carry the earliest content or the reply reads out of order);
         later chunks are fresh sends. Mirrors the tail seal's degradation
         ladder: HTML edit -> plaintext edit, or HTML send -> plaintext send.
+
+        Its text goes through ``_seam_safe`` like every other sealed segment: this
+        is a separate sink from ``_seal_text``, so it carries the seam repair itself
+        rather than relying on the other one, and records the predecessor only where
+        a delivery reports success.
+
+        Returns whether the chunk landed and, when both edits of the streamed
+        bubble failed and the chunk went out below it, that bubble's id. This
+        method never deletes it: the chunks and the tail still to come are not
+        sent yet, and the bubble may show rows of theirs that no sent message
+        carries.
         """
+        chunk = await asyncio.to_thread(self._seam_safe, chunk)
         html_text = _seal_table_fallback(chunk)
         if len(html_text) > self._rendered_limit():
             html_text = _md_to_telegram_html(chunk)
+        stale_mid: int | None = None
         if self._stream_mid is not None:
             mid = self._stream_mid
             self._stream_mid = None
@@ -2098,9 +1348,13 @@ class TelegramRenderer(Renderer):
                 self._chat_id, mid, html_text, parse_mode="HTML", retry_plain=False
             )
             if ok:
-                return
+                self._record_sent(chunk)
+                return True, None
             if await self._client.edit_message(self._chat_id, mid, _strip_md(chunk)):
-                return
+                self._record_sent(chunk)
+                return True, None
+            # The frame may still exist; the chunk goes out below it.
+            stale_mid = mid
         mid2 = await self._client.send_message(
             self._chat_id,
             html_text,
@@ -2109,18 +1363,30 @@ class TelegramRenderer(Renderer):
             message_thread_id=self._thread_id,
         )
         if mid2 is None:
-            await self._client.send_message(
+            if await self._client.send_message(
                 self._chat_id, _strip_md(chunk), message_thread_id=self._thread_id
-            )
+            ):
+                self._record_sent(chunk)
+                return True, stale_mid
+            await self._send_lost_part_notice()
+            return False, None
+        self._record_sent(chunk)
+        return True, stale_mid
 
-    def _chip_for_seal(self, i: int) -> str | None:
-        """The steer chip (a "> quote" blockquote of the USER's own words) that
-        heads the segment opened by the i-th rotation. None when we have no
-        recorded text for that rotation (chip is simply omitted)."""
-        if 0 <= i < len(self._steer_texts):
-            t = _neutralize_md(self._steer_texts[i])
-            return f"> {t}" if t else None
-        return None
+    async def _send_lost_part_notice(self) -> None:
+        """Mark the place of a part whose every send failed.
+
+        The later parts of the reply still go out, so without a mark the reply
+        reads as complete. Best-effort: a notice that cannot be sent either is
+        logged, never raised.
+        """
+        logger.warning("Telegram: a part of the reply to chat %s was not delivered", self._chat_id)
+        try:
+            await self._client.send_message(
+                self._chat_id, _LOST_PART_NOTICE, message_thread_id=self._thread_id
+            )
+        except Exception:
+            logger.debug("Telegram: the lost-part notice failed", exc_info=True)
 
     def _tally_redactions(self, text: str) -> None:
         """Record the redaction placeholders in one LANDED frame's final text."""
@@ -2165,3 +1431,125 @@ class TelegramRenderer(Renderer):
             if failure_reason:
                 self._failure_reason = failure_reason
             await self.on_done(stop_reason="error")
+
+    # Bound from renderer_approval: the approval prompt.
+    on_prompt_choice = _renderer_approval.on_prompt_choice
+
+    # Bound from renderer_status: typing, stall marks, footers.
+    on_turn_start = _renderer_status.on_turn_start
+    _typing_loop = _renderer_status._typing_loop
+    _stop_typing = _renderer_status._stop_typing
+    _note_progress = _renderer_status._note_progress
+    _stall_mark = _renderer_status._stall_mark
+    attach_context_client = _renderer_status.attach_context_client
+    on_thinking = _renderer_status.on_thinking
+    _turn_footer = _renderer_status._turn_footer
+    _thinking_budget = _renderer_status._thinking_budget
+    on_tool_call = _renderer_status.on_tool_call
+    on_compaction = _renderer_status.on_compaction
+
+    # Bound from renderer_live: chunk intake and the live frame.
+    on_text_chunk = _renderer_live.on_text_chunk
+    _materialize_chip = _renderer_live._materialize_chip
+    _rotate_at_markers = _renderer_live._rotate_at_markers
+    _open_new_message = _renderer_live._open_new_message
+    _segment_text = _renderer_live._segment_text
+    _consume_reply_to = _renderer_live._consume_reply_to
+    _stream_live = _renderer_live._stream_live
+    _stream_live_locked = _renderer_live._stream_live_locked
+    _retire_live_frame = _renderer_live._retire_live_frame
+    _delete_replaced_frame = _renderer_live._delete_replaced_frame
+    note_steer = _renderer_live.note_steer
+    _chip_for_seal = _renderer_live._chip_for_seal
+
+    # Bound from renderer_uploads: outbound images.
+    authorize_upload_root = _renderer_uploads.authorize_upload_root
+    _uploads_enabled = _renderer_uploads._uploads_enabled
+    _extract_uploads = _renderer_uploads._extract_uploads
+    _append_rejections = _renderer_uploads._append_rejections
+    _send_uploads = _renderer_uploads._send_uploads
+
+
+#: BASE imports this module binds for its importers and for the patches the mirror
+#: routes through it, though its own code does not read them.
+_BOUND_FOR_IMPORTERS = (
+    APPROVAL_TIMEOUT_S,
+    DENY_CAUSE_APPROVAL_TIMEOUT,
+    ExtractLimits,
+    Rejection,
+    TELEGRAM_MAX_MEDIA_GROUP,
+    TELEGRAM_MAX_PHOTO_BYTES,
+    TELEGRAM_MAX_TOTAL_UPLOAD_BYTES,
+    adoptable_reservation,
+    extract_local_refs_off_loop,
+    new_approval_nonce,
+    nonce_eq,
+    os,
+    sel,
+    split_options_trailer,
+)
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.telegram.renderer_display",
+    "kiro_crew.telegram.renderer_tables",
+    "kiro_crew.telegram.renderer_approval",
+    "kiro_crew.telegram.renderer_status",
+    "kiro_crew.telegram.renderer_live",
+    "kiro_crew.telegram.renderer_uploads",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name this module serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+#: The unsplit module's names: everything the family binds except the methods the class
+#: binds from its owners, which were never module names.
+_SURFACE = frozenset().union(globals(), *(vars(_sys.modules[o]) for o in _OWNERS)) - {
+    n for n, m in vars(TelegramRenderer).items() if getattr(m, "__module__", "") in _OWNERS
+}
+_EXPORTS.update(
+    _facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=(), surface=_SURFACE).served
+)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.telegram.renderer_approval import (  # noqa: F401
+        _APPROVAL_INPUT_CHARS,
+        _APPROVAL_TIMEOUT_S,
+        TelegramApprovalDecider,
+    )
+    from kiro_crew.telegram.renderer_display import (  # noqa: F401
+        _MARKUP_HINT_RE,
+        _SHRINK_STEP,
+        _STEER_MARKER_RE,
+        _STEER_SUMMARY_RE,
+        _strip_hr,
+        _strip_steering,
+        _utf16_chunks,
+        _utf16_cut,
+        _utf16_len,
+    )
+    from kiro_crew.telegram.renderer_live import (  # noqa: F401
+        _EDIT_THROTTLE_S,
+    )
+    from kiro_crew.telegram.renderer_status import (  # noqa: F401
+        _CTX_GAUGE,
+        _FOOTER_MIN_CTX_PCT,
+        _FOOTER_MIN_SECS,
+        _HARD_STALL_MARK,
+        _HARD_STALL_S,
+        _SOFT_STALL_MARK,
+        _SOFT_STALL_S,
+        _THINKING_SCAFFOLD,
+        _TYPING_REFRESH_S,
+    )
+    from kiro_crew.telegram.renderer_tables import (  # noqa: F401
+        _TABLE_SEP_CHARS,
+        _is_table_separator,
+        _row_cell_count,
+        _row_cells,
+    )
+    from kiro_crew.telegram.renderer_uploads import (  # noqa: F401
+        _MAX_REJECTION_LINES,
+        _UPLOAD_LIMITS,
+    )

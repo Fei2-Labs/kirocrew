@@ -1,5 +1,7 @@
 /**
- * Tests for reasoning effort button in ChatInput.
+ * Tests for the reasoning effort level shown on the ChatInput model chip.
+ * Model + effort are ONE control (docs/decisions/2026-06-14): the chip names the
+ * level; the slider that changes it lives inside the model picker.
  * Tests the ChatInput component directly to avoid ChatPage's complex dependencies.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -32,37 +34,88 @@ function renderInput(props: Partial<Parameters<typeof ChatInput>[0]> = {}) {
     onSend: vi.fn(),
     providerId: 'acp',
     reasoningEffort: 'high',
-    onReasoningEffortClick: vi.fn(),
+    hasEffort: true,
     modelName: 'claude-opus-4.7',
     onModelClick: vi.fn(),
   }
   return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><Provider store={store}><ChatInput {...defaults} {...props} /></Provider></QueryClientProvider>)
 }
 
-describe('ChatInput reasoning effort button', () => {
-  it('renders effort button with current level for claude_code provider', () => {
+describe('ChatInput reasoning effort on the model chip', () => {
+  it('names the current level on the model chip when the capability is on', () => {
     renderInput()
     expect(screen.getByText('High')).toBeInTheDocument()
   })
 
-  it('does not render effort button when capability is off (prop undefined)', () => {
-    renderInput({ onReasoningEffortClick: undefined })
+  it('shows no effort level when the capability is off (hasEffort unset)', () => {
+    renderInput({ hasEffort: undefined })
     expect(screen.queryByText('High')).not.toBeInTheDocument()
+  })
+
+  it('never renders a standalone effort button beside the model chip', () => {
+    renderInput()
+    expect(screen.queryByTestId('composer-effort-chip')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Reasoning effort' })).toBeNull()
+    expect(screen.getByTestId('composer-model-chip')).toHaveTextContent('High')
   })
 
 
   it('calls onModelClick with rect on click (reasoning effort merged into model button)', () => {
     const onModelClick = vi.fn()
     renderInput({ onModelClick })
-    fireEvent.click(screen.getByTitle('Model: claude-opus-4.7'))
+    fireEvent.click(screen.getByTitle('Model: claude-opus-4.7 · Reasoning effort: High'))
     expect(onModelClick).toHaveBeenCalledTimes(1)
     expect(onModelClick.mock.calls[0][0]).toHaveProperty('x')
   })
 
-  it('shows disabled state when running', () => {
+  it('carries the effort level in the chip\'s accessible name and hover title', () => {
+    // `aria-label` replaces the button's content in its accessible name, so a
+    // level that is only rendered INSIDE the chip is announced nowhere; the
+    // title is the one readout left when the shelf is too narrow to show it.
+    renderInput()
+    const chip = screen.getByTestId('composer-model-chip')
+    expect(chip).toHaveAccessibleName('Model: claude-opus-4.7 · Reasoning effort: High')
+    expect(chip).toHaveAttribute('title', 'Model: claude-opus-4.7 · Reasoning effort: High')
+  })
+
+  it('shows the concrete level on the chip and keeps "default" for its name', () => {
+    // The user needs the level in force, not which setting chose it; the
+    // accessible name and tooltip still say it is the default.
+    renderInput({ effortIsDefault: true })
+    const chip = screen.getByTestId('composer-model-chip')
+    expect(chip).toHaveTextContent(/^claude-opus-4\.7·High$/)
+    expect(chip).toHaveAccessibleName('Model: claude-opus-4.7 · Reasoning effort: Default · High')
+  })
+
+  it('does not mark an inherited default model on the chip', () => {
+    // The id already names the model the user chose as their default, so a
+    // "default" word beside it adds nothing; the accessible name still says
+    // it is inherited.
+    renderInput({ effortIsDefault: true, modelIsInheritedDefault: true })
+    const chip = screen.getByTestId('composer-model-chip')
+    expect(chip).toHaveTextContent(/^claude-opus-4\.7·High$/)
+    expect(chip).toHaveAccessibleName(
+      'This session runs on the default model (claude-opus-4.7). It has no model of its own, so it changes if the default does. Click to pin one. · Reasoning effort: Default · High',
+    )
+  })
+
+  it('never says Default on the chip when the model is inherited and no level is set', () => {
+    renderInput({ reasoningEffort: '', modelIsInheritedDefault: true })
+    expect(screen.getByTestId('composer-model-chip')).toHaveTextContent(/^claude-opus-4\.7$/)
+  })
+
+  it('names only the model when the capability is off', () => {
+    renderInput({ hasEffort: undefined })
+    expect(screen.getByTestId('composer-model-chip')).toHaveAccessibleName('Model: claude-opus-4.7')
+  })
+
+  it('stays enabled when running, still names the level, and says a pick applies next', () => {
     renderInput({ isRunning: true })
-    const btn = screen.getByTitle('Stop the current response to switch model')
-    expect(btn).toBeDisabled()
+    const btn = screen.getByTestId('composer-model-chip')
+    expect(btn).toBeEnabled()
+    expect(btn).toHaveAccessibleName(
+      'Model: claude-opus-4.7 · Reasoning effort: High\nYour next message runs on the model you pick. This reply finishes on the model it started with.',
+    )
   })
 
   it('EFFORT_LABEL_KEY covers all valid values incl xhigh', () => {
@@ -131,6 +184,16 @@ function renderDropdown(props: Partial<Parameters<typeof ReasoningEffortDropdown
 describe('ReasoningEffortDropdown', () => {
   beforeEach(() => { mockApi.effortLevels.mockClear(); mockApi.chatSlotReasoningEffort.mockClear() })
 
+  it('uses ACP-advertised Pi levels in their reported order', async () => {
+    renderDropdown({ currentEffort: 'minimal', levelsOverride: ['off', 'minimal', 'high'] })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    expect(slider).toHaveAttribute('aria-valuemax', '2')
+    expect(slider).toHaveAttribute('aria-valuenow', '1')
+    fireEvent.keyDown(slider, { key: 'ArrowRight' })
+    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'high'))
+    expect(mockApi.effortLevels).not.toHaveBeenCalled()
+  })
+
   it('renders a slider over the concrete levels with the current value', async () => {
     renderDropdown()
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
@@ -163,6 +226,18 @@ describe('ReasoningEffortDropdown', () => {
     fireEvent.keyDown(slider, { key: 'ArrowRight' })
     await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'xhigh'))
     await vi.waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.reasoning_effort).toBe('xhigh'))
+  })
+
+  it('updates the model row when an effort pick normalizes a legacy Codex pair', async () => {
+    mockApi.chatSlotReasoningEffort.mockResolvedValueOnce({ ok: true, reasoning_effort: '', model: 'gpt-6-sol' })
+    const { store } = renderDropdown({ currentEffort: 'high' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('4'))
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Use default effort' }))
+
+    await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', ''))
+    await vi.waitFor(() => expect(store.getState().dashboard.slots.find(s => s.key === 's1')?.model).toBe('gpt-6-sol'))
   })
 
   it('stages the pick synchronously so a cycle press inside the debounce window sees it (#5120)', async () => {
@@ -339,7 +414,7 @@ describe('ReasoningEffortDropdown', () => {
 
   it('disables the slider while the default mode is active', async () => {
     renderDropdown({ currentEffort: '' })
-    const toggle = await screen.findByRole('switch', { name: 'Use model default' })
+    const toggle = await screen.findByRole('switch', { name: 'Use default effort' })
     expect(toggle.getAttribute('aria-checked')).toBe('true')
     const slider = screen.getByRole('slider', { name: 'Reasoning effort' })
     expect(slider.getAttribute('aria-disabled')).toBe('true')
@@ -351,7 +426,7 @@ describe('ReasoningEffortDropdown', () => {
   it('toggling default on persists the empty sentinel; off persists a concrete level', async () => {
     // Start explicit ('high') -> toggle on -> persists ''.
     renderDropdown({ currentEffort: 'high' })
-    const toggle = await screen.findByRole('switch', { name: 'Use model default' })
+    const toggle = await screen.findByRole('switch', { name: 'Use default effort' })
     expect(toggle.getAttribute('aria-checked')).toBe('false')
     fireEvent.click(toggle)
     await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', ''))
@@ -359,7 +434,7 @@ describe('ReasoningEffortDropdown', () => {
 
   it('toggling default off persists the slider level (not empty)', async () => {
     renderDropdown({ currentEffort: '' })
-    const toggle = await screen.findByRole('switch', { name: 'Use model default' })
+    const toggle = await screen.findByRole('switch', { name: 'Use default effort' })
     expect(toggle.getAttribute('aria-checked')).toBe('true')
     fireEvent.click(toggle)
     // default idx for an unset slot is 'high' (index 2 of low..max).
@@ -375,11 +450,31 @@ describe('ReasoningEffortDropdown', () => {
     expect(screen.getByText('Default · High')).toBeInTheDocument()
   })
 
-  it('labels the toggle for the configured default, not the model default', async () => {
+  it('shows the locked slider hint as visible text that is also its description', async () => {
+    // The hint was a bare `title`, then a `title` plus an sr-only span: a
+    // touch reader -- the one most likely to poke a dead track -- never
+    // hovers and never hears the sr-only copy. One visible element serves
+    // every reader and is the slider's accessible description.
     renderDropdown({ currentEffort: '', defaultEffort: 'high' })
-    const toggle = await screen.findByRole('switch', { name: 'Use configured default' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    const hint = screen.getByText('Locked to the default. Turn the switch off to pick a level.')
+    expect(hint).toBeVisible()
+    expect(hint).not.toHaveClass('sr-only')
+    expect(slider).toHaveAccessibleDescription(/Turn the switch off/)
+    expect(slider.closest('[title]')).toBeNull()
+  })
+
+  it('labels the toggle for the configured default and names its level', async () => {
+    // "Use default effort" alone leaves the reader guessing what the default
+    // runs at; the label carries the level so the toggle's outcome is legible
+    // without a trip to Settings. Same stem in both states -- only the level
+    // suffix differs -- so the switch never reads as two different controls.
+    // Without a configured default the frontend has no level to name (the
+    // model's own is not exposed), so that label stays plain.
+    renderDropdown({ currentEffort: '', defaultEffort: 'high' })
+    const toggle = await screen.findByRole('switch', { name: 'Use default effort (High)' })
     expect(toggle.getAttribute('aria-checked')).toBe('true')
-    expect(screen.queryByRole('switch', { name: 'Use model default' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: 'Use default effort' })).not.toBeInTheDocument()
   })
 
   it('syncs the default thumb when live levels arrive asynchronously', async () => {
@@ -387,7 +482,7 @@ describe('ReasoningEffortDropdown', () => {
     renderDropdown({ currentEffort: '', defaultEffort: 'max' })
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
     await vi.waitFor(() => expect(slider.getAttribute('aria-valuemax')).toBe('1'))
-    const toggle = screen.getByRole('switch', { name: 'Use configured default' })
+    const toggle = screen.getByRole('switch', { name: 'Use default effort (Max)' })
     fireEvent.click(toggle)
     await vi.waitFor(() => expect(mockApi.chatSlotReasoningEffort).toHaveBeenCalledWith('s1', 'max'))
   })
@@ -399,7 +494,7 @@ describe('ReasoningEffortDropdown', () => {
     try {
       renderDropdown({ currentEffort: 'low', defaultEffort: 'high', levelsOverride: ['low', 'medium', 'high'] })
       const slider = screen.getByRole('slider', { name: 'Reasoning effort' })
-      const toggle = screen.getByRole('switch', { name: 'Use configured default' })
+      const toggle = screen.getByRole('switch', { name: 'Use default effort (High)' })
       expect(toggle).toHaveAttribute('aria-checked', 'false')
       expect(slider).toHaveAttribute('aria-valuetext', 'Low')
       fireEvent.click(toggle)
@@ -423,15 +518,31 @@ describe('ReasoningEffortDropdown', () => {
     renderDropdown({ currentEffort: 'low', defaultEffort: 'high' })
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
     await vi.waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('Low'))
-    const marker = screen.getByRole('img', { name: 'Configured default' })
+    const marker = screen.getByRole('img', { name: 'Default effort' })
     expect(marker).toHaveAttribute('data-slider-marker')
     expect(slider.getAttribute('aria-valuenow')).toBe('0')
+  })
+
+  it('drops the default marker and names the way back while the switch is on', async () => {
+    renderDropdown({ currentEffort: '', defaultEffort: 'high' })
+    const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
+    const toggle = screen.getByRole('switch', { name: 'Use default effort (High)' })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    // The header and the switch already say "default" and "High"; a third
+    // "Default" label on the track would repeat them.
+    expect(screen.queryByRole('img', { name: 'Default effort' })).toBeNull()
+    // The inert track says how to unlock it, in visible text under the track.
+    expect(screen.getByText('Locked to the default. Turn the switch off to pick a level.')).toBeVisible()
+    fireEvent.click(toggle)
+    expect(screen.getByRole('img', { name: 'Default effort' })).toBeInTheDocument()
+    expect(screen.queryByText('Locked to the default. Turn the switch off to pick a level.')).toBeNull()
+    expect(slider).not.toHaveAttribute('aria-describedby')
   })
 
   it('does not render a default marker without a configured level or when it is absent', async () => {
     const view = renderDropdown({ defaultEffort: '' })
     await screen.findByRole('slider', { name: 'Reasoning effort' })
-    expect(screen.queryByRole('img', { name: 'Configured default' })).toBeNull()
+    expect(screen.queryByRole('img', { name: 'Default effort' })).toBeNull()
     view.rerender(
       <QueryClientProvider client={new QueryClient()}>
         <Provider store={view.store}>
@@ -439,7 +550,7 @@ describe('ReasoningEffortDropdown', () => {
         </Provider>
       </QueryClientProvider>,
     )
-    expect(screen.queryByRole('img', { name: 'Configured default' })).toBeNull()
+    expect(screen.queryByRole('img', { name: 'Default effort' })).toBeNull()
   })
 
   it('retains the help and Faster / Smarter labels in the inline control', async () => {
@@ -454,13 +565,17 @@ describe('ReasoningEffortDropdown', () => {
     renderDropdown({ currentEffort: '', defaultEffort: '' })
     await screen.findByRole('slider', { name: 'Reasoning effort' })
     expect(screen.getByText('Default')).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: 'Use model default' })).toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Use default effort' })).toBeInTheDocument()
   })
 
   it('an explicit per-slot override still outranks the configured default', async () => {
     renderDropdown({ currentEffort: 'low', defaultEffort: 'max' })
     const slider = await screen.findByRole('slider', { name: 'Reasoning effort' })
     await vi.waitFor(() => expect(slider.getAttribute('aria-valuetext')).toBe('Low'))
-    expect(screen.queryByText(/Default/)).not.toBeInTheDocument()
+    // The header names the override, not "Default · Max", and the toggle is off;
+    // the default marker still labels where the configured level sits.
+    expect(screen.queryByText(/^Default · /)).not.toBeInTheDocument()
+    expect(screen.getByRole('switch', { name: 'Use default effort (Max)' })).toHaveAttribute('aria-checked', 'false')
+    expect(screen.getByRole('img', { name: 'Default effort' })).toBeInTheDocument()
   })
 })

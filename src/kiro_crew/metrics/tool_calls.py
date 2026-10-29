@@ -27,12 +27,13 @@ round-trip through a server that can be slow or wedged.
 **Two layers, one registry, exactly one sample.** There is no single choke point
 to instrument, because the two backends parse tool frames in different places.
 The kiro backend runs on ``AcpRuntime`` + ``AcpSessionHandle``, which parses
-through the shared ``acp/_dispatch.py`` builders; the claude backend (and the app
+through the shared ``acp/_dispatch_parts/`` builders; the claude backend (and the app
 worker pools that build a client directly, e.g. ``knowledge/llm_pool``) stays on
-``acp/client.py``, which re-implements the same shaping inline and never calls
+``AcpClient`` (its tool-frame shaping lives in ``acp/client_tool_events.py``), which
+re-implements the same shaping inline and never calls
 ``parse_session_update``. ``providers/acp.py`` constructs an ``AcpClient`` and
-then swaps in an ``AcpSessionProvider`` at startup for the kiro path, so both
-parsers are live in a normal install and both are instrumented here.
+``providers/acp_runtime_start.py`` swaps in an ``AcpSessionProvider`` at startup for
+the kiro path, so both parsers are live in a normal install and both are instrumented here.
 
 Every surface -- dashboard, Slack, Discord, cron, subagents, task runner,
 workflow -- sits DOWNSTREAM of those two: they consume the emitted ``AcpEvent``
@@ -45,7 +46,7 @@ frame is ever seen by both layers, the first finish records it and the second is
 a no-op -- the layering cannot double-count.
 
 **Why not reuse the watchdog's existing dispatch clock.**
-``acp/liveness.py::ToolCallState`` already stamps ``dispatch_ts`` on a tool call,
+``acp/liveness_tool_state.py::ToolCallState`` already stamps ``dispatch_ts`` on a tool call,
 and ``AcpSessionHandle`` clears it on the result. It is deliberately NOT reused:
 ``_inflight_tool`` is a SINGLE SLOT holding the most recent call, which is the
 right shape for stall attribution (the oracle only asks "what are we waiting on
@@ -121,8 +122,8 @@ _TERMINAL_STATUSES = frozenset({OUTCOME_COMPLETED, OUTCOME_FAILED, OUTCOME_CANCE
 # A turn cannot legitimately hold this many tool calls open at once, so a
 # registry that reaches the cap is evidence of frames whose completion never
 # arrived (a killed process, a cancelled turn). It is dropped wholesale rather
-# than grown for the life of the process -- the same trade ``AcpClient`` makes
-# for its ``_skill_read_noted`` bookkeeping. The cost is missing samples for the
+# than grown for the life of the process -- the same trade the ACP layer's
+# ``SkillReadTracker`` makes for its noted set. The cost is missing samples for the
 # calls that were in flight, never a leak.
 _MAX_OPEN_CALLS = 4096
 
@@ -139,7 +140,7 @@ def _registry_key(tool_call_id: str, scope: str) -> str:
     the second start is dropped as a duplicate and the first finish pops the
     shared entry, so one sample is misattributed and the other is lost.
 
-    ``acp/_dispatch.py`` already solved this for its tool-input caches with
+    ``acp/_dispatch_parts/tool_call_provenance.py`` already solved this for its tool-input caches with
     ``_ck = f"{cache_scope}|{tool_call_id}"``; this is the same key so the two
     cannot disagree about what "the same tool call" means.
     """

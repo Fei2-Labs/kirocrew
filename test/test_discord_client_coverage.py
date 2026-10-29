@@ -184,9 +184,7 @@ def _make_client(**kwargs: Any) -> DiscordClient:
     return DiscordClient(**kwargs)
 
 
-def _bind_session(
-    client: DiscordClient, session: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _bind_session(client: DiscordClient, session: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     async def _ensure() -> Any:
         return session
 
@@ -248,9 +246,7 @@ class TestReadinessAndStateObserver:
 
 class TestLifecycle:
     @pytest.mark.asyncio
-    async def test_start_launches_the_gateway_loop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_start_launches_the_gateway_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         ran = asyncio.Event()
 
@@ -265,9 +261,7 @@ class TestLifecycle:
         assert client._closed is False
 
     @pytest.mark.asyncio
-    async def test_close_stops_task_ws_and_session(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_close_stops_task_ws_and_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         ws = FakeWS()
         session = FakeSession()
@@ -371,7 +365,7 @@ class TestOutboundRest:
         client = _make_client()
         calls: list[tuple[str, str, Any]] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             calls.append((method, path, payload))
             return {"id": 991}
 
@@ -412,7 +406,7 @@ class TestOutboundRest:
         client = _make_client()
         calls: list[tuple[str, str, Any]] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             calls.append((method, path, payload))
             return {"id": "t9"}
 
@@ -436,7 +430,7 @@ class TestOutboundRest:
         client = _make_client()
         calls: list[tuple[str, str, Any]] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             calls.append((method, path, payload))
             return {}
 
@@ -462,13 +456,11 @@ class TestOutboundRest:
         assert await client.edit_message_components("c1", "m1", []) is False
 
     @pytest.mark.asyncio
-    async def test_typing_reaction_and_ack_paths(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_typing_reaction_and_ack_paths(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         calls: list[tuple[str, str, Any]] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             calls.append((method, path, payload))
             return {}
 
@@ -494,13 +486,17 @@ class TestOutboundRest:
         client = _make_client()
         calls: list[tuple[str, str, Any]] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             calls.append((method, path, payload))
             return {}
 
         monkeypatch.setattr(client, "_api", _api)
         assert await client.edit_message_components("c1", "m1", []) is True
-        assert calls[0] == ("PATCH", "/channels/c1/messages/m1", {"components": []})
+        assert calls[0] == (
+            "PATCH",
+            "/channels/c1/messages/m1",
+            {"components": [], "flags": 4},
+        )
 
     @pytest.mark.asyncio
     async def test_create_dm_channel_success_and_failure(
@@ -509,7 +505,7 @@ class TestOutboundRest:
         client = _make_client()
         outcomes: list[Any] = [{"id": 42}, None]
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             assert (method, path) == ("POST", "/users/@me/channels")
             assert payload == {"recipient_id": "u9"}
             return outcomes.pop(0)
@@ -531,7 +527,7 @@ class TestIsThreadChannel:
         client = _make_client()
         calls: list[str] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             calls.append(path)
             return {"type": channel_type}
 
@@ -694,9 +690,7 @@ class TestGatewayLoop:
         assert slept == []
 
     @pytest.mark.asyncio
-    async def test_cancellation_breaks_the_loop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_cancellation_breaks_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
 
         async def _run() -> None:
@@ -856,9 +850,7 @@ class TestHandleFrame:
         }
 
     @pytest.mark.asyncio
-    async def test_hello_with_a_session_resumes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_hello_with_a_session_resumes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         intervals: list[float] = []
         monkeypatch.setattr(
@@ -934,9 +926,7 @@ class TestHandleFrame:
     ) -> None:
         client = _make_client()
         seen: list[tuple[str, dict]] = []
-        monkeypatch.setattr(
-            client, "_on_dispatch", lambda event, d: seen.append((event, d))
-        )
+        monkeypatch.setattr(client, "_on_dispatch", lambda event, d: seen.append((event, d)))
         await client._handle_frame(FakeWS(), {"op": _OP_DISPATCH})
         assert seen == [("", {})]
 
@@ -1013,9 +1003,7 @@ class TestHeartbeat:
         assert ws.sent == []
 
     @pytest.mark.asyncio
-    async def test_send_failure_closes_the_socket(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_failure_closes_the_socket(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         _patch_sleep(monkeypatch)
         ws = FakeWS()
@@ -1041,9 +1029,7 @@ class TestHeartbeat:
         assert ws.close_calls == 1
 
     @pytest.mark.asyncio
-    async def test_cancellation_is_absorbed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_cancellation_is_absorbed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         _patch_sleep(monkeypatch)
         ws = FakeWS()
@@ -1348,9 +1334,7 @@ class TestApi:
         assert kwargs["proxy"] == "http://proxy.invalid:8080"
 
     @pytest.mark.asyncio
-    async def test_2xx_json_body_is_returned(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_2xx_json_body_is_returned(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         _bind_session(client, FakeSession(responses=[FakeResponse(201, {"id": "9"})]), monkeypatch)
         assert await client._api("POST", "/p", None) == {"id": "9"}
@@ -1360,9 +1344,7 @@ class TestApi:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         client = _make_client()
-        session = FakeSession(
-            responses=[FakeResponse(200, json_error=ValueError("not json"))]
-        )
+        session = FakeSession(responses=[FakeResponse(200, json_error=ValueError("not json"))])
         _bind_session(client, session, monkeypatch)
         assert await client._api("GET", "/p", None) == {}
 
@@ -1404,9 +1386,7 @@ class TestApi:
         assert slept == [expected_delay]
 
     @pytest.mark.asyncio
-    async def test_second_rate_limit_gives_up(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_second_rate_limit_gives_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         _patch_sleep(monkeypatch)
         session = FakeSession(
@@ -1484,9 +1464,7 @@ class TestResolveProxy:
         monkeypatch.setenv(var, "http://proxy.invalid:3128")
         assert _resolve_proxy() == "http://proxy.invalid:3128"
 
-    def test_no_proxy_variables_resolves_to_none(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_no_proxy_variables_resolves_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for name in _PROXY_VARS:
             monkeypatch.delenv(name, raising=False)
         assert _resolve_proxy() is None
@@ -1519,7 +1497,7 @@ class TestMentionSuppression:
     def _payloads(self, monkeypatch: pytest.MonkeyPatch, client: Any) -> list[Any]:
         seen: list[Any] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             seen.append(payload)
             return {"id": 1}
 
@@ -1546,11 +1524,15 @@ class TestMentionSuppression:
         await client.send_message_with_files("c1", "@here look", [payload_file])
         await client.edit_message_with_files("c1", "m1", "@here look", [payload_file])
         await client.respond_interaction("i1", "tok", "@everyone status")
+        await client.respond_interaction("i2", "tok", "public status", ephemeral=False)
 
-        assert len(seen) == 5
+        assert len(seen) == 6
         for payload in seen:
             body = payload.get("data", payload)
             assert body["allowed_mentions"] == {"parse": []}, payload
+            assert body["flags"] & 4, payload
+        assert seen[4]["data"]["flags"] == 4 | 64
+        assert seen[5]["data"]["flags"] == 4
 
     @pytest.mark.asyncio
     async def test_the_mention_text_survives_so_only_the_ping_is_removed(
@@ -1604,7 +1586,10 @@ class TestApplicationCommandRegistration:
             return {}
 
         monkeypatch.setattr(client, "_api", _api)
-        assert await client.register_application_commands([{"name": "new", "description": "d"}]) is False
+        assert (
+            await client.register_application_commands([{"name": "new", "description": "d"}])
+            is False
+        )
         assert called == []
 
     @pytest.mark.asyncio
@@ -1617,7 +1602,7 @@ class TestApplicationCommandRegistration:
         client.application_id = "app1"
         seen: list[Any] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             seen.append((method, path, payload))
             return []
 
@@ -1637,9 +1622,7 @@ class TestApplicationCommandRegistration:
         assert [row["name"] for row in payload] == ["good"]
 
     @pytest.mark.asyncio
-    async def test_every_row_malformed_sends_nothing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_every_row_malformed_sends_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         client = _make_client()
         client.application_id = "app1"
         called: list[Any] = []
@@ -1649,7 +1632,9 @@ class TestApplicationCommandRegistration:
             return []
 
         monkeypatch.setattr(client, "_api", _api)
-        assert await client.register_application_commands([{"name": "X", "description": ""}]) is False
+        assert (
+            await client.register_application_commands([{"name": "X", "description": ""}]) is False
+        )
         assert called == []
 
     @pytest.mark.asyncio
@@ -1660,7 +1645,7 @@ class TestApplicationCommandRegistration:
         client.application_id = "app1"
         seen: list[Any] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             seen.append(payload)
             return []
 
@@ -1689,15 +1674,14 @@ class TestApplicationCommandRegistration:
 
 class TestEphemeralInteractionResponse:
     @pytest.mark.asyncio
-    async def test_ephemeral_sets_the_flag_and_visible_omits_it(
+    async def test_ephemeral_ors_with_suppress_embeds_flag(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """EPHEMERAL is message flag 1<<6. A command reply carries runtime state
-        or a login link, so it is the default."""
+        """EPHEMERAL (1<<6) composes with the always-on SUPPRESS_EMBEDS (1<<2)."""
         client = _make_client()
         seen: list[Any] = []
 
-        async def _api(method: str, path: str, payload: Any, timeout: int = 30) -> Any:
+        async def _api(method: str, path: str, payload: Any, timeout: int = 30, **_kw: Any) -> Any:
             seen.append((path, payload))
             return {}
 
@@ -1707,5 +1691,5 @@ class TestEphemeralInteractionResponse:
         assert seen[0][0] == "/interactions/i1/tok/callback"
         # CHANNEL_MESSAGE_WITH_SOURCE
         assert seen[0][1]["type"] == 4
-        assert seen[0][1]["data"]["flags"] == 64
-        assert "flags" not in seen[1][1]["data"]
+        assert seen[0][1]["data"]["flags"] == 64 | 4
+        assert seen[1][1]["data"]["flags"] == 4

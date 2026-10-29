@@ -44,6 +44,7 @@ vi.mock('../../utils/clipboard', () => ({
 vi.mock('../../store', () => ({
   useAppDispatch: () => dispatch,
   useAppSelector: (fn: (s: unknown) => unknown) => fn(storeState),
+  useAppStore: () => ({ getState: () => storeState }),
 }))
 vi.mock('../../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
@@ -236,6 +237,15 @@ describe('command bar — copy the selected row', () => {
     // anybody. Silence would read as a copy that worked.
     mount()
     type('artifact')
+    // Named rather than assumed to rank first, for the reason `selectSettingsRow`
+    // gives above: the top hit for "artifact" is the Artifact Deploy setting, whose
+    // title the query is a prefix of, so copying whatever happened to be selected
+    // would test the ranking instead of the copy layer. Hovering is how a reader
+    // moves the selection onto a row without activating it.
+    await waitFor(() => expect(hasRow('Search Artifacts')).toBe(true))
+    // Hover selects on real pointer motion, so the pointer moves across the row.
+    fireEvent.mouseMove(rowByText('Search Artifacts'), { clientX: 10, clientY: 10 })
+    fireEvent.mouseMove(rowByText('Search Artifacts'), { clientX: 12, clientY: 10 })
     await waitFor(() => expect(selectedRow().textContent).toContain('Search Artifacts'))
     pressCopy()
     await waitFor(() => expect(screen.getByRole('status').textContent).toBe('Nothing here to copy.'))

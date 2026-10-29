@@ -66,7 +66,7 @@ from kiro_crew.agent_discovery import (
     iter_agent_spec_files,
     list_agents,
 )
-from kiro_crew.agent_files import OWNED_KIRO_AGENT_FILES
+from kiro_crew.agent_files import KAS_RESERVED_AGENT_IDS, OWNED_KIRO_AGENT_FILES
 from kiro_crew.agent_spec_format import is_markdown_spec
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -87,6 +87,7 @@ from kiro_crew.dashboard.chat_utils import drained_to_thread
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import discovery_executor
 from kiro_crew.sel import sel
+from kiro_crew.validation import TEMPLATE_NAME_RE
 from kiro_crew.webhooks import token_store
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,9 @@ FolderPin = tuple[str, str, str]
 #: ``model`` and ``skills`` the crew pane already writes. ``resources`` and
 #: ``mcpServers`` are deliberately absent: skills are a computed view OVER
 #: ``resources`` (writing both would race), and an MCP server is a capability
-#: grant that has its own admission path (the MCP page and its quarantine).
+#: grant that has its own admission path (the MCP page and its quarantine). The
+#: one ``mcpServers`` write a tools edit makes is the declaration of a Crew
+#: control-plane server the new ``tools`` grants (``control_plane_declarations``).
 TEMPLATE_DEFINITION_KEYS = frozenset({"description", "prompt", "tools", "allowedTools"})
 
 _READ_ONLY_PACKAGE = "package"
@@ -322,7 +325,7 @@ def _template_rows(folders: list[FolderPin]) -> list[dict[str, Any]]:
     verbatim. ``read_only`` and reference kinds are this module's own words.
     """
     # circular import: see api_agent_template_create.
-    from kiro_crew.dashboard.handlers.agents import _roster_mask
+    from kiro_crew.dashboard.handlers.agents import _roster_mask, default_template_eligible
 
     agents_dir = kiro_agents_dir_path()
     infos = list(list_agents(agents_dir=agents_dir))
@@ -344,6 +347,10 @@ def _template_rows(folders: list[FolderPin]) -> list[dict[str, Any]]:
             # offer one that can only answer 404.
             reason = _READ_ONLY_RUNTIME
         row["read_only"] = reason
+        # Whether the tab's default template picker may offer the row. The
+        # same predicate drives the write's lifecycle checks, while the lenient
+        # roster lineage is re-derived strictly inside the locked write.
+        row["default_eligible"] = default_template_eligible(info)
         row["used_by"] = _masked_refs(
             template_references(aliases, cfg, forks, crons, folders, webhooks), _roster_mask
         )
@@ -432,7 +439,6 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
     # definition-key helpers, so its name/lock/spec helpers are bound here at
     # call time rather than at import time.
     from kiro_crew.dashboard.handlers.agents import (
-        _TEMPLATE_NAME_RE,
         _AmbiguousTemplateName,
         _get_config_lock,
         _is_reserved_basename,
@@ -455,7 +461,7 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
             {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
         )
     raw_name = body.get("name")
-    if not isinstance(raw_name, str) or not _TEMPLATE_NAME_RE.match(raw_name.strip()):
+    if not isinstance(raw_name, str) or not TEMPLATE_NAME_RE.fullmatch(raw_name.strip()):
         return web.json_response(
             {
                 "error": "name must be 1-63 letters, digits, dots, dashes or underscores",
@@ -469,6 +475,19 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
     }:
         return web.json_response(
             {"error": f"'{name}' is reserved", "code": "template_name_reserved"}, status=400
+        )
+    if name in KAS_RESERVED_AGENT_IDS:
+        # The KAS engine keeps its own agent under this id (or drops the entry)
+        # without an error, so a template created under it never runs there.
+        # Exact match, as the engine matches: ``Default`` registers normally.
+        # Its own code, distinct from the runtime-owned stems above, so the
+        # dashboard can say WHOSE name it is rather than "reserved" alone.
+        return web.json_response(
+            {
+                "error": f"'{name}' is reserved by the KAS agent engine",
+                "code": "template_name_reserved_by_engine",
+            },
+            status=400,
         )
     description = body.get("description", "")
     if not isinstance(description, str) or len(description) > MAX_TEMPLATE_DESCRIPTION_CHARS:
@@ -514,10 +533,7 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
                 )
         except _AmbiguousTemplateName as exc:
             return web.json_response(
-                {
-                    "error": f"'{exc}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         # A member of this name would make the new template unreachable by bare
@@ -567,14 +583,12 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
                             # copy would carry the wrong definition. Exactly one
                             # file may reach the source name, and it must be the
                             # one the probe chose.
-                            claimants = {
-                                (agents_dir / info.filename).resolve()
-                                for info in _find_infos(source_key)
-                            }
+                            infos = _find_infos(source_key)
+                            claimants = {(agents_dir / info.filename).resolve() for info in infos}
                             if not claimants:
                                 raise FileNotFoundError(source_path)
                             if claimants != {source_path.resolve()}:
-                                raise _AmbiguousOnDisk(source_name)
+                                raise _AmbiguousOnDisk(source_key, _claimant_paths(infos))
                             fresh = _read_agent_spec(
                                 source_path,
                                 operation="api_agent_template_create",
@@ -618,13 +632,10 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
                 {"error": f"Template '{source_name}' not found", "code": "template_not_found"},
                 status=404,
             )
-        except _AmbiguousOnDisk:
+        except _AmbiguousOnDisk as exc:
             # A second file reached the source name after the probe.
             return web.json_response(
-                {
-                    "error": f"'{source_name}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         except Exception:
@@ -657,7 +668,31 @@ async def api_agent_template_create(request: web.Request) -> web.Response:
 class _AmbiguousOnDisk(Exception):
     """Under the spec lock, the name resolves to something other than exactly the
     file the pre-lock probe chose -- a second claimant is present, or the file
-    is not the one the probe saw."""
+    is not the one the probe saw.
+
+    ``paths`` lists the claimants only when there are two or more: a lone
+    replacement file is not "more than one", so it keeps the bare sentence.
+    """
+
+    def __init__(self, name: str, paths: tuple[Path, ...] = ()) -> None:
+        super().__init__(name)
+        self.name = name
+        self.paths = paths
+
+    def refusal_text(self) -> str:
+        """The ``409 ambiguous_template_name`` sentence, worded and bounded by
+        ``_AmbiguousTemplateName.refusal_text`` (file names only, masked)."""
+        # circular import: see api_agent_template_create.
+        from kiro_crew.dashboard.handlers.agents import _AmbiguousTemplateName
+
+        return _AmbiguousTemplateName(self.name, self.paths).refusal_text()
+
+
+def _claimant_paths(infos: list[AgentInfo]) -> tuple[Path, ...]:
+    """The spec files *infos* name, for a refusal -- empty unless two or more."""
+    if len(infos) < 2:
+        return ()
+    return tuple(Path(info.filename) for info in infos)
 
 
 class _ReadOnlyOnDisk(Exception):
@@ -684,7 +719,7 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
 
     The reference check and the unlink are ONE critical section, off the loop,
     under every lock the reference stores' writers take -- the shape
-    ``_unlink_copy_unless_referenced`` in ``handlers.agents`` established:
+    ``_unlink_copy_unless_referenced`` in ``dashboard/agent_admin/template_lineage.py`` established:
 
     * the folder store lock (``state.hold_folders``), held across the whole
       section, so no folder pin can commit between the check and the unlink;
@@ -735,7 +770,7 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
             # as create and the definition PATCH already insist.
             return web.json_response(
                 {
-                    "error": f"'{name}' matches more than one template file; rename one first.",
+                    "error": _AmbiguousOnDisk(name, _claimant_paths(matches)).refusal_text(),
                     "code": "ambiguous_template_name",
                 },
                 status=409,
@@ -811,11 +846,10 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
                         # the stale single match unlink the user's own file.
                         # Exactly one file may reach the name, and it must be
                         # the one about to go.
-                        claimants = {
-                            (agents_dir / info.filename).resolve() for info in _find_infos(name)
-                        }
+                        infos = _find_infos(name)
+                        claimants = {(agents_dir / info.filename).resolve() for info in infos}
                         if claimants != {spec_path.resolve()}:
-                            raise _AmbiguousOnDisk(name)
+                            raise _AmbiguousOnDisk(name, _claimant_paths(infos))
                         forks = agent_state.all_fork_info()
                         fork = forks.get(on_disk.name)
                         if fork:
@@ -909,12 +943,9 @@ async def api_agent_template_delete(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
-        except _AmbiguousOnDisk:
+        except _AmbiguousOnDisk as exc:
             return web.json_response(
-                {
-                    "error": f"'{name}' matches more than one template file; rename one first.",
-                    "code": "ambiguous_template_name",
-                },
+                {"error": exc.refusal_text(), "code": "ambiguous_template_name"},
                 status=409,
             )
         except CronStoreUnreadable:
@@ -1017,6 +1048,92 @@ def apply_definition_patch(data: dict[str, Any], patch_body: dict[str, Any]) -> 
     for key in TEMPLATE_DEFINITION_KEYS:
         if key in patch_body:
             data[key] = patch_body[key]
+
+
+class ControlPlaneNotDeclarable(ValueError):
+    """A tools save names a Crew control-plane server the spec cannot declare.
+
+    Raised instead of writing the grant alone, which would mount nothing: the
+    tools list would show the tool while the agent never gets it. ``str()`` is
+    the sentence the save bar shows, so it names the server and the remedy.
+    """
+
+    code = "control_plane_not_declarable"
+
+    def __init__(self, server: str, reason: str) -> None:
+        super().__init__(reason)
+        self.server = server
+
+
+def control_plane_declarations(tools: Any, servers: Any) -> dict[str, dict[str, Any]]:
+    """The ``mcpServers`` entries a tools save must add for Crew's control plane.
+
+    kiro-cli mounts a server only when the spec both grants it in ``tools`` and
+    declares it under ``mcpServers``, so a template whose author adds
+    ``@kirocrew-core/spawn_run`` through the tools list would otherwise carry a
+    grant that mounts nothing. Only Crew's own control plane is declared here:
+    its launch is re-derived from the managed source at every session start, so
+    the entry written is a placeholder for the grant, not a command anyone can
+    steer. A third-party server keeps its own admission path (the MCP page and
+    its quarantine), and an opt-in Crew server is assigned by hand, never minted
+    by a tools edit -- ``managed_mcp_spec_entry`` answers ``None`` for both a
+    gated and an opt-in name. An existing declaration is never replaced, and a
+    declaration whose grant is later removed is left in place: ``tools`` is the
+    allowlist, so an ungranted declaration mounts nothing.
+
+    A server counts as named when *tools* carries ``@server`` or
+    ``@server/tool``, with or without ``*`` beside it. ``*`` alone grants every
+    DECLARED server and declares nothing; an explicit ref next to it is still a
+    request for that server, and skipping it would save a grant that mounts
+    nothing.
+
+    Each entry carries the registry marker while ``agent.mcp_registry_mode`` is
+    on, for the reason ``_managed_opt_in_entry`` gives: a registry-mode client
+    drops every unmarked entry, so the grant would mount nothing there.
+
+    Raises :class:`ControlPlaneNotDeclarable` when a named server cannot be
+    declared (*servers* is not an object, or the install cannot resolve the
+    managed launch), so the save is refused with a reason instead of written as
+    a grant that mounts nothing. The PATCH asks this BEFORE its bookkeeping, so
+    a refusal leaves the model sidecar and the file as they were, and adds the
+    answer to the spec as re-read under the spec lock, beside whatever a
+    concurrent writer saved to ``mcpServers`` in the meantime.
+    """
+    from kiro_crew.agent import _MCP_REGISTRY_TYPE, _mcp_registry_mode, managed_mcp_spec_entry
+    from kiro_crew.agent_sdk.mcp_refs import parse_tools_refs
+    from kiro_crew.mcp_cleanup import CONTROL_PLANE_SERVERS
+
+    _grant_all, named = parse_tools_refs(tools if isinstance(tools, list) else [])
+    wanted = [name for name in CONTROL_PLANE_SERVERS if name in named]
+    if not wanted:
+        return {}
+    if servers is not None and not isinstance(servers, dict):
+        # A hand-edited non-object is the author's to fix; rewriting it would
+        # drop whatever they meant by it, and saving the grant beside it would
+        # mount nothing.
+        raise ControlPlaneNotDeclarable(
+            wanted[0],
+            f"Could not add {wanted[0]}: the MCP servers section of this agent's file is "
+            "malformed, so the tool would never load. Fix that section in the file, then "
+            "save again.",
+        )
+    missing = [name for name in wanted if name not in (servers or {})]
+    if not missing:
+        return {}
+    registry_mode = _mcp_registry_mode()
+    out: dict[str, dict[str, Any]] = {}
+    for name in missing:
+        entry = managed_mcp_spec_entry(name)
+        if entry is None:
+            raise ControlPlaneNotDeclarable(
+                name,
+                f"Could not add {name}: Kiro Crew cannot find how to start it on this "
+                "install, so the tool would never load. The Logs panel in a chat shows why.",
+            )
+        if registry_mode:
+            entry["type"] = _MCP_REGISTRY_TYPE
+        out[name] = entry
+    return out
 
 
 def read_only_reason_for_path(path: Path) -> str | None:

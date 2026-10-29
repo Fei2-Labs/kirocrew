@@ -1,11 +1,48 @@
-import { useId, useLayoutEffect, useMemo, useRef, type CSSProperties, type ReactNode } from 'react'
+import { createContext, Fragment, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, type CSSProperties, type ReactNode } from 'react'
 import type { FileContents } from '@pierre/diffs'
-import type { PierreDiffOptions } from './config'
-import { changedLineSpan } from '../utils/diffLineCounts'
+import {
+  DIFF_HEADER_BG_CSS,
+  DIFF_HEADER_COUNT_MIN_WIDTH_CH,
+  DIFF_HEADER_META_W_PX,
+  DIFF_HEADER_PADDING_INLINE_PX,
+  type PierreDiffOptions,
+} from './config'
+import { changedLineSpan, plainPatchHunks } from '../utils/diffLineCounts'
 import { Btn } from '../components/ui'
 import ErrorNotice from '../components/ErrorNotice'
+import { WarmSwapHeldContext } from '../components/pierreStaging'
 import { i18nT } from '../i18n/t'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
+
+/**
+ * What a surface that draws its OWN header row over a patch body tells the
+ * plain bodies rendered beneath that row.
+ *
+ * The chat diff block owns its row (`PlainFilePairHeader`, one per file) and
+ * hands Pierre the body only. Under a row that already says which file, which
+ * rename, which kind of change and how many lines, a plain body's raw `diff
+ * --git` / `---` / `+++` / `@@` lines read as plumbing leaking through, so
+ * EVERY plain body under this context prints the hunks' content only (see
+ * `PatchSection.body`): the stand-in shown while frames still arrive, the
+ * fallback `WarmSwap` holds while Pierre mounts and the text Pierre prints
+ * INSTEAD of the diff (its pool down, a section it cannot parse) are then one
+ * shape, and the hold — which measures the impl's own height against the held
+ * fallback — releases where it should. Only the last, rendered with
+ * `degraded`, REPORTS itself, so the row can say why its body is plain and
+ * withhold the layout controls only a highlighted body needs; the hold before
+ * a paint does not, because the toggle it would gate still shapes the diff
+ * that is about to land.
+ *
+ * Provided by the surface around `PierrePatch`; read by `PlainCodeFallback`.
+ * Absent (the default), a plain body prints its text verbatim, which is what
+ * every surface without a row of its own needs — the `---`/`+++` lines are
+ * then the only thing naming the file — and what plain-diff mode promises.
+ */
+export interface PlainPatchBodyOwner {
+  /** A degraded plain body mounted (`true`) or left (`false`) beneath the row. */
+  onPlainBody: (mounted: boolean) => void
+}
+export const PlainPatchBodyContext = createContext<PlainPatchBodyOwner | null>(null)
 
 /** Plain-text stand-in used while the Pierre chunk loads and for patch text
  *  that does not (yet) parse — e.g. the partial frames of a streaming diff.
@@ -17,31 +54,190 @@ import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
  *  This is also the final patch render when plain-diff mode is enabled, so it
  *  preserves a caller class. Recovery and file-pair loading additionally use
  *  the optional header; a collapsed pair renders the header row alone.
+ *
+ *  Under a `PlainPatchBodyContext` owner the body prints the hunks' content
+ *  only, whatever it stands in for. `degraded` marks the body a patch surface
+ *  shows INSTEAD of the highlighted diff — no worker generation, an
+ *  unparseable patch — as opposed to a hold before the diff paints: only that
+ *  body reports itself to the owner. Without an owner the text prints
+ *  verbatim and nothing is reported.
  */
-export function PlainCodeFallback({ text, className, contentStyle, header }: {
+export function PlainCodeFallback({ text, className, contentStyle, header, degraded = false }: {
   text: string
   className?: string
   contentStyle?: CSSProperties
   header?: ReactNode
+  degraded?: boolean
 }) {
+  const owner = useContext(PlainPatchBodyContext)
+  const reports = degraded && owner != null
+  useEffect(() => {
+    if (!reports) return
+    owner.onPlainBody(true)
+    return () => owner.onPlainBody(false)
+  }, [reports, owner])
+  const hunks = useMemo(() => (owner != null ? plainPatchHunks(text) : null), [owner, text])
+  // An entry with nothing left to print — a 100%-similarity rename — is the
+  // row alone, as it is when Pierre draws it: a padded empty strip under the
+  // row reads as something missing.
+  if (hunks != null && hunks.length === 0) return header != null ? <PlainFallbackHeader>{header}</PlainFallbackHeader> : null
   return (
     <>
       {header != null ? <PlainFallbackHeader>{header}</PlainFallbackHeader> : null}
       <pre style={contentStyle} className={`pierre-plain m-0 px-3 py-2 overflow-x-auto text-[13px] font-mono leading-5 whitespace-pre${className ? ` ${className}` : ''}`}>
-        {text}
+        {hunks == null
+          ? text
+          : hunks.map((hunk, i) => (
+            <Fragment key={i}>
+              {/* Where the `@@` line was: the hairline Pierre's `simple`
+                  separator draws between hunks. */}
+              {i > 0 && <span aria-hidden className="my-1 block border-t border-border" />}
+              {hunk}
+            </Fragment>
+          ))}
       </pre>
     </>
   )
 }
 
 /** The header row shared by the fallbacks, sized to Pierre's own header so a
- *  swap does not move the layout. A collapsed pair is this row alone. */
+ *  swap does not move the layout. A collapsed pair is this row alone.
+ *
+ *  Inside the fallback a `WarmSwap` is holding (`WarmSwapHeldContext`), the
+ *  row ends with the one-line "Highlighting code…" cue: the plain text below is
+ *  readable but uncoloured, and for the seconds a slow highlight pool takes,
+ *  uncoloured text reads as a deliberate display mode rather than as a load in
+ *  progress (#13937). The cue takes the place Pierre's header metadata fills
+ *  once painted, in a row that exists in both states, so it costs the hold no
+ *  height. Plain text, no motion (nothing to gate on `prefers-reduced-motion`),
+ *  not a live region (it corrects a VISUAL misreading a screen reader never
+ *  makes, and a row of cards would otherwise announce it once per card). Below
+ *  420px of ROW width (`@max-[420px]:hidden`, a container query against this
+ *  row — it carries `@container` — never the viewport) the cue steps aside the
+ *  way the neighbouring header content does: on a ~300px card it would take
+ *  ~110px (en) to ~165px (it, ru) of the filename's room for the whole hold and
+ *  hand it back on the paint — the filename keeps priority. A viewport query
+ *  would miss the card that is narrow in a wide window: a 1920px window with
+ *  the side panel dragged out until the chat pane sits at `CHAT_PANE_MIN_W`
+ *  (320px) shows a ~300px card. The row's width IS the card's, and inline-size
+ *  containment changes nothing about it: the row is a stretched block child of
+ *  the fallback, so its width never came from its content. */
 function PlainFallbackHeader({ children }: { children: ReactNode }) {
+  const held = useContext(WarmSwapHeldContext)
+  useLanguageGeneration()
   return (
-    <div data-diffs-header="" className="flex min-h-9 items-center justify-end gap-1 border-b border-border px-2 py-1">
+    <div data-diffs-header="" className="@container flex min-h-9 items-center justify-end gap-1 border-b border-border px-2 py-1">
       {children}
+      {held && <span className="shrink-0 @max-[420px]:hidden text-[12px] text-muted">{i18nT('components.fileChangeChips.highlighting')}</span>}
     </div>
   )
+}
+
+/**
+ * The header row of the simplified file-pair fallback: the caller's prefix
+ * slot (the card's expand/collapse control), the filename, the caller's
+ * filename suffix, an optional state label, the caller's metadata, and the
+ * caller's actions.
+ *
+ * Exported because two surfaces keep THIS row as their header for the whole
+ * life of the card and let Pierre draw the body only: the opted-in oversized
+ * pair once the line-by-line diff replaces the two-side body, and the chat diff
+ * block in every state. Pierre's own header exists only while its renderer has
+ * a highlight result to draw — none while the worker pool is still
+ * initialising, recovering, or unavailable, none for a patch that will not
+ * parse, none at all in plain-diff mode — so a control slotted into it would
+ * vanish in every one of those states. One row, the same component in every
+ * state; only the body beneath it changes.
+ */
+export function PlainFilePairHeader({ filename, titleId, label, titleClickable, stats, renderHeaderPrefix, renderHeaderFilenameSuffix, renderHeaderMetadata, renderHeaderActions }: {
+  filename: string
+  titleId?: string
+  label?: string
+  /** The caller opens the file when the filename is clicked (a light-DOM
+   *  listener resolving `headerClickAction`), so the filename shows the pointer
+   *  and hover accent. Pierre's own header gets the same cue through the
+   *  caller's `unsafeCSS`, which is scoped to Pierre's shadow root and cannot
+   *  reach this row. */
+  titleClickable?: boolean
+  /** Exact added/removed line counts, rightmost like Pierre's own. The
+   *  opted-in pair reads them off its computed patch and the chat diff block
+   *  off the patch it renders; the fallback's bounded scan cannot count lines
+   *  and passes none. */
+  stats?: { added: number; removed: number }
+  renderHeaderPrefix?: () => ReactNode
+  renderHeaderFilenameSuffix?: () => ReactNode
+  /** The file row's diffstat indicator: drawn INSIDE the metadata group, before
+   *  the counts, in the fixed-width box that keeps it at one x across rows. */
+  renderHeaderMetadata?: () => ReactNode
+  /** The caller's action cluster, drawn BEFORE the counts — where Pierre's own
+   *  header shows its metadata slot, which is where the chat diff block's
+   *  Open / layout / Copy controls sit when Pierre draws that header — so the
+   *  counts stay rightmost. Outside the metadata group: a cluster is wider than
+   *  the indicator's box, and it aligns to the counts rather than to a column. */
+  renderHeaderActions?: () => ReactNode
+}) {
+  const metadata = renderHeaderMetadata?.()
+  const removed = stats?.removed ?? 0
+  const added = stats?.added ?? 0
+  return (
+    <div
+      data-diffs-header
+      className="flex min-h-9 items-center gap-2 border-b border-border text-[12px]"
+      style={HEADER_ROW_STYLE}
+    >
+      {/* Wraps: at 320px the filename, the caller's suffix and the label do
+          not all share one line — the suffix and the label drop under the name
+          before any of them gives way — and an item wider than the line still
+          truncates (`min-w-0`) rather than push the row past the card. The
+          name keeps the first line with the caller's prefix (its expand
+          control), capped at the line so a long name truncates there rather
+          than wrap under the control. The actions and the counts keep their
+          width; the row grows a line instead. */}
+      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1.5 gap-y-0.5">
+        <span className="flex min-w-0 max-w-full items-center gap-1.5">
+          {renderHeaderPrefix?.()}
+          <span id={titleId} data-title className={`min-w-0 truncate font-mono font-medium${titleClickable ? ' cursor-pointer hover:text-accent' : ''}`}>
+            {filename}
+          </span>
+        </span>
+        {renderHeaderFilenameSuffix?.()}
+        {/* Shrinks and truncates like the title, with the whole wording
+            reachable as the tooltip. */}
+        {label != null && <span data-label className="min-w-0 truncate text-[11px] font-normal text-muted" title={label}>{label}</span>}
+      </div>
+      {renderHeaderActions?.()}
+      {/* The same group Pierre's header draws — the caller's metadata (its
+          diffstat indicator) pinned left, the ±counts pinned right, in a box of
+          fixed width — so the indicator starts at the same x on this row as on
+          the within-budget rows around it, whether or not a count is present.
+          The box is pinned only when there is an indicator to align: counts on
+          their own sit together at the row's edge, as in Pierre's header. */}
+      {(metadata != null || removed > 0 || added > 0) && (
+        <div data-metadata className="flex shrink-0 items-center gap-2" style={metadata != null ? HEADER_META_GROUP_STYLE : undefined}>
+          {metadata}
+          {removed > 0 && <span data-deletions-count="" className="font-mono text-danger" style={HEADER_COUNT_STYLE}>-{removed}</span>}
+          {added > 0 && <span data-additions-count="" className="font-mono text-ok" style={HEADER_COUNT_STYLE}>+{added}</span>}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/* Inline because a `unsafeCSS` stylesheet is scoped to Pierre's shadow root and
+ * cannot reach a light-DOM row; the values are the ones `ROW_CSS_BASE` injects
+ * there (see pierre/config.ts), so the two headers cannot drift apart. */
+const HEADER_ROW_STYLE: CSSProperties = {
+  backgroundColor: DIFF_HEADER_BG_CSS,
+  paddingInline: DIFF_HEADER_PADDING_INLINE_PX,
+}
+const HEADER_META_GROUP_STYLE: CSSProperties = {
+  flex: `0 0 ${DIFF_HEADER_META_W_PX}px`,
+  justifyContent: 'space-between',
+}
+const HEADER_COUNT_STYLE: CSSProperties = {
+  display: 'inline-block',
+  minWidth: `${DIFF_HEADER_COUNT_MIN_WIDTH_CH}ch`,
+  textAlign: 'right',
 }
 
 const KEYBOARD_SCROLL_REGION_PROPS = { role: 'region' as const, tabIndex: 0 }
@@ -57,6 +253,8 @@ interface PlainFilePairFallbackProps {
   renderHeaderMetadata?: () => ReactNode
   renderHeaderPrefix?: () => ReactNode
   renderHeaderFilenameSuffix?: () => ReactNode
+  /** See `PlainFilePairHeader`. */
+  titleClickable?: boolean
   onShowLineByLineDiff?: () => void
   /** Off-thread compute status for the opt-in. `computing` swaps the button
    *  for a progress label + Cancel; `error` re-offers the button with a short
@@ -81,6 +279,7 @@ export function PlainFilePairFallback({
   renderHeaderMetadata,
   renderHeaderPrefix,
   renderHeaderFilenameSuffix,
+  titleClickable,
   onShowLineByLineDiff,
   lineByLineState = 'idle',
   onCancelLineByLineDiff,
@@ -184,20 +383,15 @@ export function PlainFilePairFallback({
       className={`pierre-surface min-w-0 overflow-hidden bg-bg text-text ${className ?? ''}`}
     >
       {showHeader && (
-        <div
-          data-diffs-header
-          className="flex min-h-9 items-center gap-2 border-b border-border bg-bg px-3 text-[12px]"
-        >
-          <div className="flex min-w-0 flex-1 items-center gap-1.5">
-            {renderHeaderPrefix?.()}
-            <span id={titleId} data-title className="truncate font-mono font-medium">
-              {filename}
-            </span>
-            {renderHeaderFilenameSuffix?.()}
-            <span className="text-[11px] font-normal text-muted">{filePairLabel}</span>
-          </div>
-          {renderHeaderMetadata && <div className="shrink-0">{renderHeaderMetadata()}</div>}
-        </div>
+        <PlainFilePairHeader
+          filename={filename}
+          titleId={titleId}
+          label={filePairLabel}
+          titleClickable={titleClickable}
+          renderHeaderPrefix={renderHeaderPrefix}
+          renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
+          renderHeaderMetadata={renderHeaderMetadata}
+        />
       )}
       {/* Opt-in control lives in its own strip BETWEEN the header and the
           scroller, never inside either: the header already carries the

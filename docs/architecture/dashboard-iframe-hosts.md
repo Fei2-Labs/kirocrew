@@ -1,8 +1,8 @@
 # Dashboard iframe hosts — which one to use
 
-This note covers four core interactive iframe hosts. The dashboard also has
+This note covers five core interactive iframe hosts. The dashboard also has
 static renderers and app-specific frames, so this list is not exhaustive. These
-four look interchangeable and are not: each has a different sandbox posture
+five look interchangeable and are not: each has a different sandbox posture
 (including no `sandbox` on remote-instance panes), and two make *opposite*
 assumptions about whether the frame may talk back.
 
@@ -10,10 +10,12 @@ Pick a host from this table. **Do not widen an existing host's sandbox to make i
 
 | Host | `sandbox` | Content it is for | Frame → host messages |
 |---|---|---|---|
-| `WebPreviewPanel.tsx` (the **Browser** tab) | `allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads` | An explicitly loaded loopback preview or the loopback Playwright CLI dashboard; Electron browsing can use a native Chromium view instead | none |
-| `WidgetFrame.tsx` (`<mcwidget>`, artifacts) | `allow-scripts allow-popups allow-popups-to-escape-sandbox` | **LLM-emitted HTML** | **Defended against.** A malicious emitted `<script>` can `postMessage`, so the host treats inbound messages as hostile |
+| `WebPreviewPanel.tsx` (the **Browser** tab) | `allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads` | An explicitly loaded loopback preview or the loopback Playwright CLI dashboard; Electron browsing can use a native Chromium view instead. The relayed browser view, served on the dashboard's own origin, uses `VIEW_SANDBOX` instead: the same flags without `allow-same-origin` | none |
+| `WidgetFrame.tsx` (`<mcwidget>`, artifacts) | `allow-scripts allow-popups allow-popups-to-escape-sandbox` | **LLM-emitted HTML**. `buildSrcdoc` injects a click-time shim that gives bare absolute `http(s)` links `target=_blank rel=noopener noreferrer`; a host whose sandbox withholds popups (the mochi `WidgetFrame.tsx`) passes `rewriteBareLinks: false` | **Defended against.** A malicious emitted `<script>` can `postMessage`, so the host treats inbound messages as hostile |
 | `McpAppFrame.tsx` (the **App** tab) | `allow-scripts allow-forms` | **MCP-server-supplied HTML** (`srcDoc`) | **Required and trusted-by-capability.** SEP-1865 JSON-RPC bridge; the host holds a `callback_secret` |
 | `InstancesViewport.tsx` | none | another instance's dashboard | n/a |
+| `CrewDynamicDashboard.tsx` (crew **Dashboard** tab and a root session's side-panel Overview) | `allow-scripts` | **Agent-written crew pages** (built-in templates) | **Two, both narrow.** `kirocrew-dashboard:act {text}` (Dashboard tab and session Overview) fills the composer and never sends. `kirocrew-dashboard:open {url}` (`useFrameOpenLink`) opens only `^https://github\.com/<owner>/<repo>/pull/<n>/?$`, only from that host's own frame, only with a live user activation while that iframe holds focus, via `window.open(url, '_blank', 'noopener,noreferrer')` |
+| `SessionStatusFrame.tsx` (automatic session card) | empty sandbox | Sanitized gateway-composed card HTML/CSS/SVG; no model scripts or outbound links | none; answers and approvals use separate native controls |
 
 ## The two axes
 
@@ -67,9 +69,9 @@ So `WebPreviewPanel.tsx` does not detect this state. It carries a standing note 
 
 ## Adding a new panel tab kind
 
-Tab kinds live in `website/src/hooks/usePanelTabs.ts` (`ViewKind` / `TabKind`), and the body is dispatched in `website/src/pages/chat/SidePanel.tsx`. Two things to know before adding one:
+Tab kinds live in `website/src/hooks/usePanelTabs.ts` (`ViewKind` / `TabKind`), and the body is dispatched in `website/src/pages/chat/SidePanel.tsx` : category views, the Files home and the Dashboard tab inline; terminal, Browser and document (file, diff, folder, artifact) bodies through `TabBody`, and MCP app and app-contributed tabs from the cross-slot app list through `McpAppTabBody` / `AppPanelTabBody`, all three in `website/src/pages/chat/SidePanelTabBodies.tsx`. Two things to know before adding one:
 
-- **Tab switch is safe only for non-category bodies.** Terminal, document, artifact, folder, and App bodies are kept mounted and hidden via `display` in `SidePanel.tsx`, so switching those tabs does not tear down a frame. Category views are unmounted when inactive.
-- **Category views unmount on switch** (`if (!isActive) return null`), so a stateful frame must not be registered as a category view.
+- **Tab switch is safe only for non-category bodies.** Terminal, document, artifact, folder, Browser, and App bodies are kept mounted and hidden via `display` in `SidePanel.tsx`, so switching those tabs does not tear down a frame. Category views (the `VIEW_KINDS` set) are unmounted when inactive.
+- **Category views unmount on switch** (`if (!isActive || panelHidden) return null`), so a stateful frame must not be registered as a category view.
 
-Auto-opening a tab is a solved pattern: dispatch `openActivityPanel()` then call `tabsCtlRef.current.openView(<kind>)` — see the web-preview path in `website/src/pages/ChatPage.tsx`.
+Auto-opening a tab is a solved pattern: dispatch `openActivityPanel()` then call `tabsCtlRef.current.openView(<kind>)` — see the web-preview path in `website/src/pages/chat/page/eventBridges.ts` (`useChatEventBridges`).

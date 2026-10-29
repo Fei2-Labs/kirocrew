@@ -1,11 +1,12 @@
 import { Check, ChevronDown, Mic, TriangleAlert } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
+import { OverlayPortal, useCloseWhenCrewHidden } from './overlayRoot'
 
 import { i18nT } from '../i18n/t'
-import { getPreferredMicId, listMicrophones } from '../hooks/mic'
+import { DEFAULT_PSEUDO_DEVICE_ID, defaultMicName, getPreferredMicId, listMicrophones, selectableMicrophones, stripDefaultPrefix } from '../hooks/mic'
 import { useAnchorRemeasure } from '../hooks/useAnchorRemeasure'
 import { useMenuKeyboard } from '../hooks/useMenuKeyboard'
+import { usePressActivation } from '../hooks/usePressActivation'
 
 interface Props {
   /** Label of the device actually capturing, for the trigger text. */
@@ -49,6 +50,8 @@ interface Props {
  */
 export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, recording, liveSwitch, triggerClass = '' }: Props) {
   const [open, setOpen] = useState(false)
+  // Holds no input, so a Crew switch closes it like a click outside (components/overlayRoot).
+  useCloseWhenCrewHidden(open, useCallback(() => setOpen(false), []))
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([])
   const [preferred, setPreferred] = useState(getPreferredMicId())
   const [rect, setRect] = useState<{ left: number; top: number; bottom: number } | null>(null)
@@ -59,7 +62,7 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
   // holding it is unmounted by the close — without a restore, focus would be
   // orphaned on <body> and the next Tab would restart from the top of the
   // document, nowhere near the composer the user came from. Same posture as
-  // `MenuBtn` (DevFleetPage), the precedent for this contract.
+  // `MenuBtn` (DevFleetPageMenus.tsx), the precedent for this contract.
   const triggerRef = useRef<HTMLButtonElement | null>(null)
 
   // role="menu" promises the WAI-ARIA menu keyboard contract (arrow-key row
@@ -111,6 +114,11 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
     if (r) setRect({ left: r.left, top: r.bottom, bottom: r.top })
     setOpen(true)
   }
+  // Opens on the mouse press (usePressActivation); keyboard and touch on click.
+  // The outside-press dismiss above skips `wrapRef`, so a press on this trigger
+  // while open is a toggle, not a dismiss followed by a reopen. The menu moves
+  // focus to its first item on open, so the trigger must not take it back.
+  const bindPress = usePressActivation()
 
   const pick = (id: string) => {
     setPreferred(id)
@@ -155,28 +163,42 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
     return d.deviceId === preferred
   }
   // "System default" is an intent, not a device: mid-capture the concrete
-  // device row carries the truth, so the default row is never marked then.
-  const defaultChecked = recording ? false : !preferred
+  // device row carries the truth, so the default row is marked then only when
+  // the live track is Chromium's `default` pseudo-device, which has no row of
+  // its own (see `selectableMicrophones`). A preference saved as that id
+  // before the fold is still "follow the OS", so idle it marks this row too.
+  const liveOnDefault = activeDeviceId
+    ? activeDeviceId === DEFAULT_PSEUDO_DEVICE_ID
+    : !!deviceLabel && devices.some(d => d.deviceId === DEFAULT_PSEUDO_DEVICE_ID && d.label === deviceLabel)
+  const defaultChecked = recording ? liveOnDefault : !preferred || preferred === DEFAULT_PSEUDO_DEVICE_ID
+  const rows = selectableMicrophones(devices)
+  // Same naming as the Settings picker, so the device "System default" means
+  // can be confirmed where the user dictates.
+  const defaultName = defaultMicName(devices)
+  // The live track's label, without Chromium's "Default - " prefix, the same way
+  // the picker and the mic test name it. `deviceLabel` itself stays the raw
+  // label, because `isChecked` matches it against device labels.
+  const shownLabel = deviceLabel ? stripDefaultPrefix(deviceLabel) : ''
 
   return (
     <span ref={wrapRef} className="relative flex-1 min-w-0 flex items-center">
       <button
         type="button"
         ref={triggerRef}
-        onClick={toggle}
+        {...bindPress(toggle, { keepFocusOffTrigger: true })}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={i18nT('components.micSourceMenu.change_input_source')}
-        title={deviceLabel || undefined}
+        title={shownLabel || undefined}
         className={`flex items-center gap-1 min-w-0 max-w-full bg-transparent border-none px-1 -ml-1 py-px rounded cursor-pointer hover:bg-bg-hover ${triggerClass}`}
       >
         <Mic size={12} className="shrink-0 opacity-70" aria-hidden="true" />
-        <span className="truncate">{deviceLabel || i18nT('components.voiceStatusBar.default_microphone')}</span>
+        <span className="truncate">{shownLabel || i18nT('components.voiceStatusBar.default_microphone')}</span>
         <ChevronDown size={11} className="shrink-0 opacity-70" aria-hidden="true" />
       </button>
 
-      {open && rect && createPortal(
-        // PORTALLED to <body> on purpose: VoiceDictationPanel's root is
+      {open && rect && <OverlayPortal>{
+        // PORTALLED to the body-level overlay root on purpose: VoiceDictationPanel's root is
         // `h-[168px] overflow-hidden` (it clips the shader), which clipped the
         // bottom of an in-flow menu — "System default" and the footnote were
         // simply not there. Fixed positioning off the trigger's rect is what
@@ -207,7 +229,7 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
           <div className="px-2 pt-1 pb-1.5 text-[10.5px] font-mono font-semibold tracking-wide text-muted">
             {i18nT('components.micSourceMenu.input_source')}
           </div>
-          {devices.map(d => (
+          {rows.map(d => (
             <button
               key={d.deviceId}
               type="button"
@@ -236,7 +258,9 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
             className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[12.5px] text-left bg-transparent border-none cursor-pointer hover:bg-bg-hover ${defaultChecked ? 'text-accent' : 'text-text'}`}
           >
             <span className="w-3 shrink-0">{defaultChecked && <Check size={12} aria-hidden="true" />}</span>
-            <span className="truncate">{i18nT('components.micSourceMenu.system_default')}</span>
+            <span className="truncate">{defaultName
+              ? i18nT('components.micSourceMenu.system_default_named', { device: defaultName })
+              : i18nT('components.micSourceMenu.system_default')}</span>
           </button>
           {savedMissing && (
             <div className="flex gap-1.5 items-start px-2 py-1.5 text-[11px] leading-snug text-warn">
@@ -252,9 +276,8 @@ export default function MicSourceMenu({ deviceLabel, activeDeviceId, onSelect, r
                 : i18nT('components.micSourceMenu.applies_next_recording')}
             </div>
           )}
-        </div>,
-        document.body,
-      )}
+        </div>
+      }</OverlayPortal>}
     </span>
   )
 }

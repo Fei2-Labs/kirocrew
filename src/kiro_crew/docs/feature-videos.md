@@ -6,7 +6,7 @@ Clips are hosted, not shipped inside the package. Kiro Crew downloads them in th
 
 ## How It Works
 
-- The catalog is data, not generated: a signed manifest published for your release, with a small built-in list as the fallback for an install that has never fetched one. There is no model call.
+- The catalog is data, not generated: a signed manifest published for your release, with a small built-in list as the fallback for an install that has never fetched one. There is no model call. The built-in list currently ships no media, so an install that has never fetched a manifest offers no clips.
 - A clip is eligible when the feature is on, its media is on your machine, it is not yet recorded as seen or dismissed, the running version satisfies its floor, and no "you already use this" signal fires.
 - Which eligible clip you get is random. Eligibility is not: a clip you retired, or one for a feature you already use, can never come back.
 - Only clips already on your disk are offered, so playback starts immediately and costs no bandwidth. A hosted clip that has not finished downloading waits for the next launch.
@@ -88,8 +88,15 @@ you are about to play would just download them again.
 
 Two independent switches:
 
-- `dashboard.feature_videos_enabled: false` (the default) turns the whole feature
-  off: nothing is fetched and nothing is shown.
+- `dashboard.feature_videos_enabled: false` (the default) turns the feature off:
+  nothing is fetched and no clip is shown, except the built-in **Meet your Mates**
+  intro. That one is marked `default_on` because it stands in for a first-run step
+  that never had this switch; set `dashboard.crewmates_onboarded: true` to turn it
+  off. It is not a clip: the dashboard draws the dialog itself (the catalog entry
+  carries `component: "crewmates"` and no media), so nothing is fetched for it. Its
+  **Try now** button opens the entry's `cta_route` (`/members?member=mate`, the
+  first Mate's chat); on **Not now** Mate's avatar flies to the Mates rail item
+  and becomes a "New" tag there that opens the same chat.
 - A managed fleet can forbid the fetch itself with the
   `capabilities.feature_videos_download` policy scope. Then no manifest is requested,
   no clip is downloaded, and nothing streams from the CDN — clips already on disk
@@ -138,7 +145,7 @@ Rules the catalog enforces, each of which drops the entry with a logged warning 
 - `src` and `poster` must pass `validate_asset_path`.
 - `min_version` is optional and must parse as a version when present.
 
-Place the clip and its poster in `website/public/app-assets/feature-videos/`.
+Place the clip and its poster in `website/public/app-assets/feature-videos/`. That folder does not exist yet, because no built-in entry ships media today; create it. An entry whose files are missing is withheld, not shown.
 
 ## Publishing a Release of Videos
 

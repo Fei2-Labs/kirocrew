@@ -10,7 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev"
-PREPARE = SKILLS / "prepare-pr" / "SKILL.md"
+PREPARE = SKILLS / "kirocrew-prepare-pr" / "SKILL.md"
 
 
 def _text(path):
@@ -25,20 +25,18 @@ def test_family_ladders_preserve_generation_then_capability_fallback():
     rows = [line.split("|")[2].strip() for line in _routing().splitlines() if " -> " in line]
     assert [row.split(" -> ") for row in rows] == [
         [
-            "Fable 5.1",
-            "Fable 5",
             "latest available Opus",
             "older Opus generations",
             "lower-capability available general model",
         ],
         [
-            "GPT 6",
-            "GPT 5.6 best available variant",
+            "GPT 6 Astra",
+            "GPT 6.1 Sol",
             "older capable GPT",
             "available general fallback",
         ],
     ]
-    assert "Opus-family" in _routing() and "GPT 5.6 review lane" in _routing()
+    assert "Opus-family" in _routing() and "GPT 6.1 review lane" in _routing()
     assert "fork lanes" in _routing()
 
 
@@ -95,7 +93,7 @@ def test_fallback_does_not_skip_siblings_or_replay_partial_edits():
 def test_entry_skills_load_one_canonical_contract(name):
     path = SKILLS / name / "SKILL.md"
     text = _text(path)
-    link = "../prepare-pr/SKILL.md#review-repair-routing"
+    link = "../kirocrew-prepare-pr/SKILL.md#review-repair-routing"
     assert "MUST load" in text and link in text
     assert (path.parent / link.split("#")[0]).resolve() == PREPARE
     assert "Fable 5.1" not in text
@@ -106,7 +104,7 @@ def test_local_review_and_generic_monitoring_keep_their_own_contracts():
     assert "never the repair-family table" in prepare
     assert "do not change CI models, profile `reviewers[]`/`model_tier`" in prepare
     babysit = " ".join(_text(SKILLS / "babysit" / "SKILL.md").split())
-    assert "works without a Kiro Crew checkout or prepare-pr installed" in babysit
+    assert "works without a Kiro Crew checkout or kirocrew-prepare-pr installed" in babysit
     for contract in ("GitLab", "Bitbucket", "Stall tripwire", "not counted AND not reset"):
         assert contract in babysit
     assert "Other-host guidance is not live-verified here" in babysit
@@ -115,19 +113,23 @@ def test_local_review_and_generic_monitoring_keep_their_own_contracts():
 
 @pytest.mark.parametrize(
     ("name", "byte_ceiling"),
-    [("kirocrew-worktree-dev", 16000), ("babysit", 22000), ("prepare-pr", 68000)],
+    [("kirocrew-worktree-dev", 16000), ("babysit", 22000), ("kirocrew-prepare-pr", 56000)],
 )
 def test_slim_skills_do_not_regrow_duplicate_guidance_or_wire_model_ids(name, byte_ceiling):
     text = _text(SKILLS / name / "SKILL.md")
-    assert len(text.encode("utf-8")) <= byte_ceiling
+    assert len(text.encode("utf-8")) <= byte_ceiling, (
+        f"{name}/SKILL.md is over {byte_ceiling} bytes. Move detail out rather than "
+        "trimming words: script flags to the script's --help, rules a step reads only "
+        "sometimes to references/, with a one-line pointer left behind."
+    )
     assert not re.search(r"\b(?:gpt|claude|fable)-(?:\d|opus|fable)", text)
     assert len(_routing().encode("utf-8")) <= 3000
 
 
 def test_ci_doc_links_the_contract_and_rationale_drops_stale_budget():
     ci_doc = _text(ROOT / "docs/ci/ci-and-reviews.md")
-    assert "prepare-pr/SKILL.md#review-repair-routing" in ci_doc
-    rationale = _text(SKILLS / "prepare-pr/references/rationale.md")
+    assert "kirocrew-prepare-pr/SKILL.md#review-repair-routing" in ci_doc
+    rationale = _text(SKILLS / "kirocrew-prepare-pr/references/rationale.md")
     assert "3 is the real limit" not in rationale and "10-iteration backstop" not in rationale
     assert "## Why review repairs are delegated by reviewer family" in rationale
 
@@ -141,7 +143,7 @@ def test_ladder_generation_names_live_only_in_the_canonical_table():
     assert heads
     for path in (
         ROOT / "docs/ci/ci-and-reviews.md",
-        SKILLS / "prepare-pr/references/rationale.md",
+        SKILLS / "kirocrew-prepare-pr/references/rationale.md",
         SKILLS / "kirocrew-worktree-dev/SKILL.md",
         SKILLS / "babysit/SKILL.md",
     ):
@@ -164,7 +166,7 @@ def test_local_reviewers_are_pinned_per_call_and_launched_concurrently():
     assert "END THE TURN after each call" not in phase_two
 
 
-@pytest.mark.parametrize("name", ["prepare-pr", "babysit"])
+@pytest.mark.parametrize("name", ["kirocrew-prepare-pr", "babysit"])
 def test_arming_refusals_preserve_existing_loops_and_user_stops(name):
     text = " ".join(_text(SKILLS / name / "SKILL.md").split())
     assert "create-only refusal means a loop may already be active" in text
@@ -188,9 +190,11 @@ def test_babysit_separates_provider_facts_from_comment_and_reporting_work():
         "typed provider observes every fact",
         "On Webex, use the finite legacy path",
         "generic issue/pull-request comments or advisory review findings",
-        "call the finite legacy path directly with `gate=false`",
+        "call the finite legacy path directly;",
         "terminal success uses zero model turns",
         "final report or notification",
+        "use the finite legacy path with `gate=false`",
+        "A merge or close ends a gated loop with a notice",
     ):
         assert contract in text
     assert "token cap applies only when usage is reported" in text
@@ -198,11 +202,12 @@ def test_babysit_separates_provider_facts_from_comment_and_reporting_work():
     assert "Terminal records are read-only" in text
     assert "Changing `target` or `objective` starts a new baseline" in text
     assert "retained user stop cannot be replaced by rearming" in text
-    assert "do not copy or register it for new babysit work" in text
+    assert "hands its whole pull-request reading" in text
+    assert "`wake_when` may name prose" in text
     assert "Use `0` only" not in text
 
 
-@pytest.mark.parametrize("name", ["prepare-pr", "babysit"])
+@pytest.mark.parametrize("name", ["kirocrew-prepare-pr", "babysit"])
 def test_arm_acknowledgement_requires_a_later_turn_not_an_immediate_retry(name):
     text = " ".join(_text(SKILLS / name / "SKILL.md").split())
     assert "pending request" in text or "pending application request" in text
@@ -214,23 +219,27 @@ def test_arm_acknowledgement_requires_a_later_turn_not_an_immediate_retry(name):
     assert "check BEFORE ending the turn" not in text
 
 
-def test_comment_aware_recipes_are_finite_ungated_and_keep_repair_routing():
+def test_comment_aware_recipes_are_finite_gated_with_the_judge_off_and_keep_repair_routing():
 
     babysit = _text(SKILLS / "babysit" / "SKILL.md")
     legacy, _ = json.JSONDecoder().raw_decode(babysit.split("monitor_start(", 1)[1])
     prepare_recipe = next(
         textwrap.dedent(block).strip()
-        for block in _text(PREPARE).split("```")
+        for block in _text(PREPARE.parent / "references" / "monitor-loop.md").split("```")
         if textwrap.dedent(block).strip().startswith("monitor_start(")
     )
     call = ast.parse(prepare_recipe, mode="eval").body
     assert isinstance(call, ast.Call)
     prepare = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords}
     for recipe in (legacy, prepare):
-        assert recipe["gate"] is False
+        # Gated (the default), with the judge off: an unchanged pull request costs no
+        # turn and every change to its reading wakes the loop once.
+        assert recipe.get("gate", True) is True
+        assert recipe["judge"] is False
         assert recipe["interval_secs"] > 0
         assert recipe["max_cycles"] > 0
-        assert recipe["max_runtime_secs"] > recipe["interval_secs"] * recipe["max_cycles"]
+        # The runtime, not the cycle cap, ends the loop.
+        assert recipe["interval_secs"] * recipe["max_cycles"] >= recipe["max_runtime_secs"]
         for contract in (
             "Review repair routing",
             "model-pinned",
@@ -241,6 +250,10 @@ def test_comment_aware_recipes_are_finite_ungated_and_keep_repair_routing():
             "autonudge_stop",
         ):
             assert contract in recipe["message"]
-    assert (prepare["max_cycles"], prepare["max_runtime_secs"]) == (80, 86400)
-    assert (legacy["max_cycles"], legacy["max_runtime_secs"]) == (24, 14400)
-    assert "`max_cycles=80` and `max_runtime_secs=86400`" in _text(PREPARE)
+    assert (prepare["max_cycles"], prepare["max_runtime_secs"]) == (288, 86400)
+    assert (legacy["max_cycles"], legacy["max_runtime_secs"]) == (48, 14400)
+    assert "`max_cycles=288` and `max_runtime_secs=86400`" in _text(PREPARE)
+    # SKILL.md keeps the fixed arguments and points at the call that carries them.
+    skill = " ".join(_text(PREPARE).split())
+    assert "references/monitor-loop.md" in skill
+    assert "interval_secs=300, max_cycles=288, max_runtime_secs=86400, judge=False" in skill

@@ -85,18 +85,40 @@ DEFAULT_SSH_COMPRESSION: bool = True
 DEFAULT_PROBE_INTERVAL_SECS: int = 30
 DEFAULT_PROBE_FAILURE_THRESHOLD: int = 3
 
+# Total timeout (secs) for one steady-state end-to-end liveness probe: a
+# `GET /api/health` through the local forward that must reach the remote gateway
+# and return an HTTP response. A TCP connect alone only proves the local
+# listener is bound, which a zombie forward (a session-manager-plugin holding
+# the socket while relaying nothing) satisfies while the far end answers with
+# zero bytes; requiring a completed response within a bounded budget is what
+# turns that stall into a probe failure. Set to 4x the 1.0s loopback TCP
+# connect budget `_port_reachable` uses, so one slow round trip does not tear
+# down a good tunnel before the consecutive-failure threshold has a say. This
+# is deliberately not user-tunable (the per-transport connect timeouts below
+# are the knob for a slow proxy); a round trip through a bound local forward
+# that cannot answer in 4s is treated as a stall.
+DEFAULT_PROBE_HEALTH_TIMEOUT_SECS: float = 4.0
+
 # Max consecutive self-heal attempts before giving up on an unhealthy tunnel
-# (2-tier recovery). Reset to 0 once a rebuild succeeds, so a tunnel that
-# flaps-then-recovers isn't permanently capped. With the capped-exponential
-# backoff below, this many attempts span the total recovery window (~2 min at
-# the default 8 attempts / 30s cap) before the tunnel is left disconnected.
+# (2-tier recovery). Reset to 0 once a rebuilt forward answers the end-to-end
+# health probe (not merely on a local rebind), so a tunnel that
+# flaps-then-recovers isn't permanently capped while one whose far end stays
+# dead still climbs to the cap. Two windows bound the climb: a rebuild that
+# fails outright spends only the capped-exponential backoff between attempts
+# (~2 min total at the default 8 attempts / 30s cap), while a dead-far-end
+# forward that re-binds but never answers additionally spends one probe window
+# per attempt (DEFAULT_PROBE_FAILURE_THRESHOLD x DEFAULT_PROBE_INTERVAL_SECS =
+# 3 x 30s = 90s), so the handoff to diagnosis takes attempts x (90s + backoff)
+# ~= 16 min at the defaults. Size instances.max_recovery_attempts against the
+# longer window.
 DEFAULT_MAX_RECOVERY_ATTEMPTS: int = 8
 
 # Upper bound on a user-configured instances.max_recovery_attempts. A value above
 # this is clamped down to it (with a warning) so a pathological setting can't turn
 # the bounded self-heal into a near-infinite retry loop on a dead connection. Kept
-# generous (~47 min recovery window at the 30s backoff cap) so only extreme values
-# trip it.
+# generous: at this ceiling a dead-far-end forward spends roughly
+# CEILING x (probe_failure_threshold x probe_interval + 30s backoff cap) =
+# 100 x (90s + 30s) ~= 3.3h before giving up, so only extreme values trip it.
 MAX_RECOVERY_ATTEMPTS_CEILING: int = 100
 
 # Cap (secs) on the per-attempt backoff between self-heal attempts. The backoff
@@ -108,7 +130,8 @@ DEFAULT_RECOVER_BACKOFF_MAX_SECS: float = 30.0
 # larger value is clamped down to it (with a warning) so a pathological pacing
 # (e.g. a 1-day backoff) can't stretch the bounded self-heal into a multi-day
 # wall-clock window even with the attempt count capped. At this ceiling the worst
-# case is ~MAX_RECOVERY_ATTEMPTS_CEILING * this (~8h).
+# case is ~MAX_RECOVERY_ATTEMPTS_CEILING * (probe window + this) =
+# 100 * (90s + 300s) ~= 10.8h.
 RECOVER_BACKOFF_MAX_CEILING_SECS: float = 300.0
 
 # How long (secs) to wait for the local forward port to start accepting
@@ -170,6 +193,48 @@ MINT_TIMEOUT_CEILING_SECS: float = 120.0
 # TTL, before the 20h cap. 0.8 = refresh at 80% elapsed.
 DEFAULT_TOKEN_REFRESH_FRACTION: float = 0.8
 
+# Ceiling on the lifetime of a credential minted for ANOTHER gateway's pane (the
+# hub-lending mint). A crew's own row TTL governs this gateway's own pane and is
+# left alone; only the lent credential is capped, and the cap is taken as a
+# MINIMUM against the row so a row already shorter stays shorter.
+#
+# It is a ceiling on an EXPOSURE WINDOW rather than a tuning knob. A lent port is
+# held by this gateway for the life of the lease, and a socket cannot outlive the
+# process holding it: a gateway exit releases every hold while the credential
+# naming that port stays valid, because the credential was issued by the remote
+# crew and nothing here can invalidate it. So the window between this gateway
+# exiting and the credential dying IS one of these TTLs, and its length is the
+# only part of that window this gateway gets to choose.
+#
+# 30m rather than something smaller because the refresh loop re-mints at
+# DEFAULT_TOKEN_REFRESH_FRACTION of the lifetime, which leaves 20% of it as the
+# margin a re-mint has to complete in. At 30m that margin is 360s, against a
+# worst case of MINT_TIMEOUT_CEILING_SECS + 15 for a chained mint and
+# DEFAULT_SSM_MINT_TIMEOUT_SECS for an SSM one -- so the slowest mint in the tree
+# finishes inside it with room over. A cap low enough to eat that margin would
+# expire the token mid-mint and the hub's pane would reload on every cycle.
+LENT_HOP_TTL_CAP: str = "30m"
+
+# The retained-field bounds for the hop-lease map, which `a-bound-bounds-every-field-it-
+# retains` requires of every field the registry keeps. Both are enforced twice: at
+# ADMISSION in `lend_hop`, which refuses rather than trims because a refused mint is a
+# credential never issued, and at LOAD, which cannot refuse (a foreign or corrupted write
+# is already on disk) and so clamps instead.
+#
+# 64 live leases through one gateway. A lease exists only while a chained credential
+# against that port is valid, so this bounds concurrently-chained crews, not crews: the
+# warm-set cap is a single digit and nobody chains 64 crews behind one parent. Startup
+# binds one listening socket per non-in-use lease, so this is also the ceiling on that
+# descriptor burst.
+HOP_LEASE_MAX: int = 64
+
+# Must equal ``ttl_to_seconds(LENT_HOP_TTL_CAP)``; pinned by a test rather than computed
+# here, because `ttl_to_seconds` lives in ``token_mint`` and the registry must not import
+# it (the registry is below the mint in the dependency order). A stored deadline further
+# out than this cannot have come from this gateway's writer, which already clamps to the
+# cap, so clamping at load bounds what a foreign write can reserve.
+HOP_LEASE_DEADLINE_CAP_SECS: int = 30 * 60
+
 # Timeout (secs) for the loopback liveness probe that validates a *stored* token
 # before the API hands it to the browser on (re)connect. A stored token can go
 # stale while the tunnel stays CONNECTED (a failed self-heal re-mint, or a remote
@@ -204,6 +269,13 @@ DEFAULT_PROXY_READ_IDLE_TIMEOUT_SECS: float = 120.0
 # SEARCH_REPLY_MAX_BYTES: bound before buffering.
 PROXY_REQUEST_BODY_MAX_BYTES: int = 2 * 1024 * 1024
 
+# Cap (bytes) on what the chat proxy holds to redact one peer reply: a whole
+# JSON body, or one SSE event. Redaction needs a complete string, so the proxy
+# buffers up to this much; a reply past it is refused rather than forwarded
+# unredacted. Sized above the largest real reply (a 200-row slot page, the
+# peer's full `slots` broadcast, itself bounded by PEER_SLOTS_REPLY_MAX_BYTES).
+PROXY_REDACT_BUFFER_MAX_BYTES: int = 8 * 1024 * 1024
+
 # How many times the chat proxy will percent-decode a caller-supplied path
 # before refusing it. The path is decoded to a FIXED POINT so the string the
 # policy inspects is the string the peer will resolve — one decode pass is not
@@ -215,16 +287,29 @@ PROXY_PATH_MAX_DECODE_PASSES: int = 4
 
 # Timeout (secs) for one session-transfer request over an already-open tunnel
 # (POST the bundle to the peer's import endpoint — no SSH spawn). Far larger than
-# the token probe above because this carries a whole conversation: a bundle is
-# capped at ~20 MB of message content, and the SSH forward it crosses can be a
-# high-latency link, so a probe-sized budget would fail every large transfer. The
-# request is still bounded rather than unlimited, so an unresponsive peer
+# the token probe above, because the SSH forward it crosses can be a
+# high-latency link. It bounds each connect and each read, NOT the whole
+# request: a bundle has no size ceiling, so a total budget would fail every
+# transfer that simply takes long to upload. An unresponsive peer still
 # surfaces as a clean transfer error instead of hanging the caller's turn.
 DEFAULT_SESSION_TRANSFER_TIMEOUT_SECS: float = 30.0
 
+# How long (secs) an arriving session waits for the host to have memory to
+# parse it before the importer answers a retryable 429. Shared with the sender,
+# whose wait for the importer's reply has to outlast it.
+SESSION_IMPORT_MEMORY_WAIT_SECS: float = 300.0
+
+# Cap (bytes) on a peer's reply to a session transfer, read before it is
+# decoded. The upload has no size ceiling and so no total timeout, which leaves
+# the reply as the one read nothing else bounds. An importer answers with a few
+# hundred bytes of JSON (the new slot and its title, or a refusal code); 256 KiB
+# only ever bites on a hostile or broken peer. Bound before buffering, like
+# SEARCH_REPLY_MAX_BYTES.
+SESSION_TRANSFER_REPLY_MAX_BYTES: int = 256 * 1024
+
 # Timeout (secs) for one federated session-search request over an already-open
 # tunnel (GET the peer's /api/sessions/search — no SSH spawn). Sized between the
-# token probe (2s, a bare status ping) and the transfer (30s, a ~20 MB bundle):
+# token probe (2s, a bare status ping) and the transfer (30s per connect/read):
 # a search reply is a small JSON page but the peer does real scanning work
 # (bounded by its own _SEARCH_SCAN_WINDOW), so the probe budget would produce
 # false "unreachable" verdicts on a loaded peer, while anything transfer-sized
@@ -258,8 +343,14 @@ DEFAULT_CAPABILITY_PROXY_TIMEOUT_SECS: float = 8.0
 # Timeout (secs) for the peer's /api/models capability read specifically. The
 # other four reads answer from state the peer already holds, but the model list
 # is the one read whose COLD path runs real subprocess work on the peer: up to
-# 5s of sandbox-backend detection plus up to 10s of `kiro-cli chat
-# --list-models` before the first reply is cached, ~15s worst case end to end.
+# 5s of sandbox-backend detection (_SANDBOX_BACKEND_PROBE_TIMEOUT_SECS in
+# sandbox_probe.py) plus up to 10s of `kiro-cli chat --list-models`
+# (_LIST_MODELS_SUBPROCESS_TIMEOUT_SECS in dashboard/handlers/agents.py), plus
+# up to 3s of entitlement revalidation
+# (_READ_PATH_PROBE_DEADLINE_SECS in acp/session_handle_model_selection.py, bounding the
+# read-path probe before the picker narrows) before the first reply is cached,
+# ~18s worst case end to end (5 + 10 + 3 < 20). Each term is a named production
+# bound, and the proxy test sums those names.
 # Budgeting it at the shared 8s guarantees the cold read is killed by this side
 # while the peer's own bounded work is still running, and the aggregator then
 # reports `capability_unreachable` for a peer that is healthy — the model
@@ -275,6 +366,27 @@ DEFAULT_MODELS_CAPABILITY_PROXY_TIMEOUT_SECS: float = 20.0
 # tens of KiB each even on a heavily-configured gateway, so 2 MiB only ever
 # bites on a hostile or broken peer.
 CAPABILITY_REPLY_MAX_BYTES: int = 2 * 1024 * 1024
+
+# Timeout (secs) for asking a parent crew to mint a token for a crew chained
+# behind it. The parent answers by running `kirocrew token` over ITS OWN hop to
+# that crew, so the budget has to cover the parent's whole remote mint plus the
+# round trip through the hub's forward to the parent -- which is why it is not
+# the 8s capability budget, whose reads answer from state the peer already holds.
+# It sits ABOVE the widest mint the parent can arm. Not above SSM's DEFAULT alone:
+# `mint_timeout_secs` is operator-settable up to MINT_TIMEOUT_CEILING_SECS, so the
+# ceiling plus relay margin is the only bound that holds for every configuration.
+# That ordering is the point: the parent's own timeout fires first, so a slow crew
+# is reported as a mint failure carrying the parent's reason rather than as an
+# unreachable parent. The budget spans the WHOLE call including its single retry,
+# not each attempt, so the worst case here is what a caller holding a lock waits for.
+DEFAULT_CHAINED_MINT_TIMEOUT_SECS: float = MINT_TIMEOUT_CEILING_SECS + 15.0
+
+# Byte ceiling for one chained-mint reply, enforced BEFORE JSON decoding. The
+# honest payload is one token and one port -- a few hundred bytes -- so 64 KiB is
+# already orders of magnitude of slack and only ever bites on a hostile or broken
+# parent. Far tighter than the capability cap above because, unlike a roster, this
+# reply has no list in it whose length depends on how the parent is configured.
+CHAINED_MINT_REPLY_MAX_BYTES: int = 64 * 1024
 
 # Byte ceiling for one peer's live-slots reply, enforced BEFORE JSON decoding for
 # the same reason as the two caps above. The peer answers with a full slot

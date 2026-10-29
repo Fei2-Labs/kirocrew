@@ -10,25 +10,31 @@ operator can trust whose state they are reading.
 from __future__ import annotations
 
 import json
-import os
 import shutil
-from contextlib import asynccontextmanager
-from types import SimpleNamespace
-from urllib.parse import quote
 
 import pytest
+from agent_panel_routes_helpers import (  # noqa: F401 -- fixtures are used by name
+    CREW,
+    SLUG,
+    _client,
+    _crew_log_on,
+    _folded,
+    _mounted,
+    _State,
+    _unit_for,
+    vetted_fixture,
+)
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from off_loop_helpers import off_loop
 
 from kiro_crew import agent_panel
 from kiro_crew import members as members_mod
 from kiro_crew.config.paths import data_home
+from kiro_crew.crew_log import projection as crew_log_projection
 from kiro_crew.dashboard.handlers import agent_panel as routes
 
 pytestmark = pytest.mark.asyncio
-
-CREW = "fleet-crew"
-SLUG = "fleet-crew"
 
 #: A crew whose name matches a template the OPERATOR installed. The route's
 #: name-match behaviour is proven against a template this test drops on disk, so
@@ -47,108 +53,6 @@ def _install_template(template_id: str) -> None:
     (over / f"{template_id}.html").write_text(agent_panel.DATA_MARKER, encoding="utf-8")
 
 
-class _Sessions:
-    """The SessionManager surface this handler uses, and only that.
-
-    On its own attribute rather than on ``_State`` because that is where the real
-    one lives (``DashboardState.sessions``). A stub that answered
-    ``state.get_agent_selection`` directly would make a handler calling the wrong
-    receiver pass here and fail in production, which is exactly what happened.
-    """
-
-    def __init__(self, agent: str | None, namespace: str):
-        self._agent = agent
-        self._namespace = namespace
-
-    def get_agent_selection(self, _key) -> tuple[str, str]:
-        if self._agent is None:
-            return "template", ""
-        return self._namespace, self._agent
-
-
-class _State:
-    """Just enough DashboardState for the crew resolver, plus a broadcast log."""
-
-    def __init__(self, agent: str | None, *, namespace: str = "member"):
-        self._agent = agent
-        # What the allocation SELECTED, which is the crew binding the resolver
-        # trusts. ``get_slot().agent`` carries the same string for a provider
-        # template of that name, so the two are kept separate here for the reason
-        # the resolver keeps them separate: a template selection must not read as
-        # a crew binding.
-        self._namespace = namespace
-        self.sessions = _Sessions(agent, namespace)
-        self.broadcasts: list[tuple[str, object]] = []
-
-    def get_slot(self, _name):
-        if self._agent is None:
-            return None
-        return SimpleNamespace(agent=self._agent)
-
-    def broadcast_ws(self, msg_type: str, data: object) -> None:
-        self.broadcasts.append((msg_type, data))
-
-
-def _mounted(
-    agent: str | None = CREW, *, internal: bool = True, namespace: str = "member"
-) -> web.Application:
-    """The panel routes on a bare app.
-
-    ``internal`` mints what ``token_auth_middleware`` sets ONLY on a verified
-    ``X-Internal-Secret`` match. It defaults to True because the publish surface
-    is MCP-only and that is the shape of every real caller; the cookie-only case
-    gets its own test, which is the one that matters.
-
-    ``namespace`` is what the allocation selected: ``member`` for a crew, or
-    ``template`` for a provider template that merely shares the name.
-    """
-    app = web.Application()
-    app["state"] = _State(agent, namespace=namespace)
-    if internal:
-
-        @web.middleware
-        async def _internal(request, handler):
-            request["internal_auth"] = True
-            return await handler(request)
-
-        app.middlewares.append(_internal)
-    routes.register_agent_panel_routes(app)
-    return app
-
-
-@pytest.fixture
-def vetted(monkeypatch):
-    """Treat the caller as a recognized, unrestricted session."""
-
-    async def _recognize(_state, _sk, _op, **_kw):
-        return None
-
-    monkeypatch.setattr(routes, "_recognize_session", _recognize)
-    monkeypatch.setattr(routes, "_is_restricted_session", lambda *_a, **_k: False)
-
-
-@asynccontextmanager
-async def _client(agent: str | None = CREW, *, internal: bool = True, namespace: str = "member"):
-    """A started client that always closes.
-
-    An ``async with`` helper rather than an ``@pytest_asyncio.fixture``, by this
-    repo's convention: the pinned pytest-asyncio does not collect async-generator
-    fixtures declared with plain ``@pytest.fixture``.
-
-    Closing is not tidiness. A ``TestClient`` owns an aiohttp session AND a
-    listening socket, so a returned-but-never-closed client leaks two descriptors
-    per test and, on a loaded runner, fails UNRELATED tests with EMFILE. aiohttp
-    does say so -- "Unclosed client session" -- but on stderr, where a green run
-    hides it.
-    """
-    c = TestClient(TestServer(_mounted(agent, internal=internal, namespace=namespace)))
-    await c.start_server()
-    try:
-        yield c
-    finally:
-        await c.close()
-
-
 # ------------------------------------------------------------------ publishing
 
 
@@ -161,10 +65,36 @@ async def test_a_publish_lands_on_the_callers_own_crew(vetted):
         )
         assert resp.status == 200, await resp.text()
         assert (await resp.json())["ok"] is True
+        # The DURABLE record, which is what keeps this route working with the crew
+        # log off -- the default.
         stored = agent_panel.read(SLUG)
         assert stored is not None
         assert stored["crew"] == CREW
         assert stored["data"] == {"cycle": 47}
+        # And the ADDITIONAL record, which is what gives the panel a history.
+        folded = _folded()
+        assert folded is not None, "the publish recorded no history"
+        assert folded["data"] == {"cycle": 47}
+        assert folded["publishes"] == 1
+
+
+async def test_the_fold_a_page_reads_carries_the_scrubbed_publish_not_the_raw_body(vetted):
+    """A dashboard page binds the ``panel`` fold, so the fold must hold what the
+    publish path scrubbed, never the body the caller sent."""
+    # Assembled at runtime so the diff carries no credential-shaped literal.
+    token = "ghp" + "_" + "ZXAMPLEzxampleZXAMPLEzxampleZXAMPLE12"
+    _unit_for(CREW)
+    async with _client() as c:
+        resp = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"note": f"fetched with {token}"}, "title": f"t {token}"},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert resp.status == 200, await resp.text()
+    folded = _folded()
+    assert folded is not None, "the publish recorded no history"
+    assert token not in json.dumps(folded), "the fold carries the raw publish body"
+    assert "fetched with" in folded["data"]["note"]
 
 
 async def test_a_publish_keys_on_the_crews_persisted_member_id(vetted):
@@ -201,11 +131,17 @@ async def test_a_publish_keys_on_the_crews_persisted_member_id(vetted):
         )
         assert resp.status == 200, await resp.text()
 
-    stored = agent_panel.read(persisted)
+    stored = _folded()
     assert stored is not None, "the record must land where the drawer reads"
     assert stored["data"] == {"cycle": 47}
-    assert agent_panel.read(SLUG) is None, (
-        "nothing may be written under the name-derived slug: that is the record "
+    # The name-derived slug is the slot NO read path resolves to. Asserted on the
+    # slot rather than on the file because the slot is what the append is keyed by.
+    crew_log_projection.forget_slot_folds()
+    astray = off_loop(
+        crew_log_projection.read_slot_projection, members_mod.member_slot_key(SLUG), "panel"
+    ).value
+    assert not (astray.get("owners") if isinstance(astray, dict) else None), (
+        "nothing may be appended under the name-derived slug: that is the slot "
         "no read path resolves to"
     )
 
@@ -302,6 +238,35 @@ async def test_the_drawer_read_needs_no_internal_secret():
         assert resp.status == 200
 
 
+async def test_a_non_owner_reads_the_panel_but_triggers_no_card_write(vetted):
+    """The panel READ is served to any dashboard caller -- the crew webview depends on it,
+    so a route-level owner gate would 403 a non-owner's webview. Only the derived-card WRITE
+    is owner-gated: a dashboard token with an empty app identity but a NON-owner subject (the
+    `!dashboard` Slack case) still READS its panel, but must not reach `_publish_derived_card`,
+    or a non-owner GET would mutate the owner-facing store and broadcast to owners.
+    """
+    app = _mounted()
+    async with TestClient(TestServer(app)) as c:
+        # Publish a card as the owner so there is something to protect.
+        pub = await c.post(
+            "/api/agent-panel/publish",
+            json={"data": {"x": 1}},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert pub.status == 200
+        before = len(app["state"].broadcasts)
+        # A non-owner (named via X-Test-User) is SERVED the read -- the webview still works --
+        # but the write is skipped, so nothing reaches a broadcast.
+        resp = await c.get(
+            f"/api/members/{SLUG}/panel?member={CREW}",
+            headers={"X-Test-User": "not-the-owner"},
+        )
+        assert resp.status == 200, "the non-owner read was refused, breaking the crew webview"
+        # The write is gated, not the read: no store mutation reaches a broadcast on the
+        # non-owner read.
+        assert len(app["state"].broadcasts) == before
+
+
 async def test_the_crew_is_not_taken_from_the_body(vetted):
     async with _client() as c:
         resp = await c.post(
@@ -316,8 +281,16 @@ async def test_the_crew_is_not_taken_from_the_body(vetted):
         assert agent_panel.read("research-lab") is None
 
 
-async def test_a_session_with_no_crew_is_refused_plainly(vetted):
-    """A conductor publishing every cycle into a void looks like a broken feature."""
+async def test_a_session_with_no_dashboard_slot_is_told_that_and_nothing_else(vetted):
+    """A conductor publishing every cycle into a void looks like a broken feature.
+
+    Three causes, three messages. A caller with no dashboard slot is told THAT --
+    not that its allocation could not be resolved, which for such a caller is
+    false: a subagent inheriting its parent's member selection resolves perfectly
+    well and is refused because publishing is confined to the crew's own thread.
+    Collapsing the two would reintroduce, one case over, the conflation this
+    change exists to remove.
+    """
     async with _client(agent=None) as c:
         resp = await c.post(
             "/api/agent-panel/publish",
@@ -325,7 +298,7 @@ async def test_a_session_with_no_crew_is_refused_plainly(vetted):
             headers={"X-Session-Key": "dashboard:chat-1"},
         )
         assert resp.status == 400
-        assert (await resp.json())["code"] == "no_crew"
+        assert (await resp.json())["code"] == "no_dashboard_slot"
 
 
 async def test_an_omitted_template_resolves_to_the_crews_own(vetted):
@@ -451,6 +424,82 @@ async def test_the_drawer_read_returns_the_composed_document(vetted):
         assert agent_panel.DATA_MARKER not in body["html"], "the marker must have been filled"
 
 
+async def test_the_drawer_read_serves_the_publish_history_the_fold_records(vetted):
+    """The fold computes ``history``/``publishes``/``history_omitted`` on every
+
+    publish, and the widened serializer serves all three to the drawer. A
+    multi-cycle history is published so the three are non-trivial, and the round
+    trip asserts they arrive.
+    """
+    async with _client() as c:
+        for i in range(3):
+            await c.post(
+                "/api/agent-panel/publish",
+                json={"data": {"cycle": i}},
+                headers={"X-Session-Key": "dashboard:chat-1"},
+            )
+        body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
+        panel = body["panel"]
+        # publishes counts every publish on this owner's slot.
+        assert panel["publishes"] == 3
+        # history holds the superseded panels (publishes minus the current one),
+        # each an {at,title,template} row.
+        assert isinstance(panel["history"], list)
+        assert len(panel["history"]) == 2
+        for row in panel["history"]:
+            assert set(row) == {"at", "title", "template"}
+        # history_omitted is the bound speaking; nothing aged out under the cap here.
+        assert panel["history_omitted"] == 0
+
+
+async def test_the_widened_serializer_still_withholds_the_ownership_digest(vetted):
+    """The allow-list serves only classified keys, so it never leaks ``crew_key``.
+
+    ``_panel_owner_record`` carries the digest, and an allow-list classifies it
+    WITHHELD -- a deny-list serving "everything but a few" is what a leak would need.
+    This is the sibling of the route's own crew_key-never-served pin, asserted on a
+    record that also carries history so the served set stays free of the digest even
+    for a rich record.
+    """
+    async with _client() as c:
+        for i in range(2):
+            await c.post(
+                "/api/agent-panel/publish",
+                json={"data": {"cycle": i}},
+                headers={"X-Session-Key": "dashboard:chat-1"},
+            )
+        body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
+        assert "crew_key" not in json.dumps(body)
+        assert agent_panel.crew_key(CREW) not in json.dumps(body)
+        # schema is the record's internal version tag and is withheld too.
+        assert "schema" not in body["panel"]
+
+
+def test_the_drawer_serializer_classifies_every_record_key():
+    """The red-on-unclassified contract: every key ``_panel_owner_record`` produces
+
+    is classified served-or-withheld, and a key in NEITHER set reddens rather than
+    being silently served or silently dropped. Keying the test on the record's OWN
+    keys is what keeps the fold's shape and the drawer's shape from diverging
+    silently: add a field to ``_panel_owner_record`` without classifying it in
+    ``agent_panel_read.py`` and this fails.
+    """
+    from kiro_crew.crew_log import projection
+
+    record = projection._panel_owner_record(projection._panel_owner_start())
+    classified = routes._PANEL_SERVED_KEYS | routes._PANEL_WITHHELD_KEYS
+    unclassified = set(record) - classified
+    assert not unclassified, (
+        f"_panel_owner_record produces {sorted(unclassified)}, classified neither "
+        "served nor withheld; add them to _PANEL_SERVED_KEYS or _PANEL_WITHHELD_KEYS"
+    )
+    # The sets are disjoint -- a key cannot be both served and withheld.
+    assert not (routes._PANEL_SERVED_KEYS & routes._PANEL_WITHHELD_KEYS)
+    # And the serializer raises, not defaults, on a genuinely unclassified key.
+    with pytest.raises(KeyError):
+        routes._panel_meta({**record, "a_brand_new_unclassified_field": 1})
+
+
 async def test_the_drawer_read_carries_the_raw_data_in_published_order(vetted):
     """The docked summary is rendered natively from this, not from the document.
 
@@ -560,10 +609,13 @@ async def test_the_publish_routes_are_under_the_strict_internal_prefix():
 async def test_the_response_comes_from_a_single_record_read(vetted, monkeypatch):
     """Both halves from ONE snapshot, so a mid-request publish cannot split them.
 
-    ``render`` + ``read`` as two calls read the file twice; a publish landing
+    ``render`` + ``read`` as two calls read the record twice; a publish landing
     between them returned the OLD document beside the NEW summary, and the docked
     chip would then contradict the expanded view. Counting reads is the property --
     an interleaving test would depend on winning a race.
+
+    Counted at ``_panel_record``, which is where the one snapshot is taken now that
+    the fold is the record and the file is only its fallback.
     """
     async with _client() as c:
         await c.post(
@@ -573,13 +625,13 @@ async def test_the_response_comes_from_a_single_record_read(vetted, monkeypatch)
         )
 
         reads: list[str] = []
-        real = agent_panel.read
+        real = routes._panel_record
 
-        def counting(slug: str):
+        def counting(slot: str, slug: str, owner_key: str):
             reads.append(slug)
-            return real(slug)
+            return real(slot, slug, owner_key)
 
-        monkeypatch.setattr(agent_panel, "read", counting)
+        monkeypatch.setattr(routes, "_panel_record", counting)
         body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
 
         # Both halves are actually populated, or the count below would be vacuous.
@@ -679,6 +731,10 @@ def test_the_stub_matches_where_the_real_selection_lives():
     assert hasattr(_State(CREW).sessions, "get_agent_selection")
     # And NOT on the state itself, which is what made the wrong receiver pass.
     assert not hasattr(_State(CREW), "get_agent_selection")
+    # Same for the existence question that tells the two refusals apart.
+    assert hasattr(SessionManager, "has_session")
+    assert hasattr(_State(CREW).sessions, "has_session")
+    assert not hasattr(_State(CREW), "has_session")
 
 
 async def test_a_same_named_provider_template_cannot_publish_as_the_crew(vetted):
@@ -698,7 +754,7 @@ async def test_a_same_named_provider_template_cannot_publish_as_the_crew(vetted)
                 headers={"X-Session-Key": "dashboard:chat-1"},
             )
         ).status == 200
-    kept = agent_panel.read(SLUG)
+    kept = _folded()
     assert kept is not None and kept["data"] == {"cycle": 47}
 
     async with _client(namespace="template") as impostor:
@@ -711,436 +767,8 @@ async def test_a_same_named_provider_template_cannot_publish_as_the_crew(vetted)
         assert (await resp.json())["code"] == "no_crew"
 
     # The owner's record is untouched, which is the property that matters: a
-    # refusal that still overwrote would satisfy the status assertion above.
-    after = agent_panel.read(SLUG)
+    # refusal that still appended would satisfy the status assertion above.
+    after = _folded()
     assert after is not None
     assert after["crew"] == CREW
     assert after["data"] == {"cycle": 47}
-
-
-async def test_a_degraded_roster_refuses_takeover_rather_than_granting_it(vetted, monkeypatch):
-    """ "Cannot read the roster" must not answer "the owner is gone".
-
-    The takeover path exists so a renamed or deleted crew does not hold a slug
-    forever, and it asks the config roster whether the recorded owner is still
-    live. ``KiroCrewConfig.load()`` returns a defaults-only config when the file
-    is unreadable, so an empty enumeration means either "nobody holds this slug"
-    or "we could not read which crews exist" -- and reading the second as the
-    first hands a colliding publish a live crew's record.
-    """
-    async with _client() as owner:
-        assert (
-            await owner.post(
-                "/api/agent-panel/publish",
-                json={"data": {"cycle": 47}},
-                headers={"X-Session-Key": "dashboard:chat-1"},
-            )
-        ).status == 200
-
-    real_load = routes.KiroCrewConfig.load
-
-    def _degraded_load(*a, **kw):
-        cfg = real_load(*a, **kw)
-        object.__setattr__(cfg, "_degraded_sections", frozenset({"whole-config"}))
-        return cfg
-
-    monkeypatch.setattr(routes.KiroCrewConfig, "load", staticmethod(_degraded_load))
-
-    other = CREW.upper()
-    assert members_mod.slug_for_name(other) == SLUG, "fixture no longer collides"
-    async with _client(other) as colliding:
-        resp = await colliding.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 999}},
-            headers={"X-Session-Key": "dashboard:chat-3"},
-        )
-        assert resp.status == 400, await resp.text()
-
-    kept = agent_panel.read(SLUG)
-    assert kept is not None
-    assert kept["crew"] == CREW
-    assert kept["data"] == {"cycle": 47}
-
-
-async def test_a_name_the_grammar_rejects_still_holds_its_panel(vetted, monkeypatch):
-    """Existing is not the same question as addressable.
-
-    The create route validates a crew name only against the credential-shape
-    check, so ``"On call"`` -- a space, which the agent-name grammar rejects -- is
-    a real crew that derives the slug ``on-call``. The liveness check asks whether
-    the recorded owner is still there, and enumerating only the ADDRESSABLE names
-    drops that crew, reports its owner as gone, and hands the colliding publisher
-    its record.
-    """
-    spaced = "On call"
-    spaced_slug = members_mod.slug_for_name(spaced)
-    async with _client(spaced) as owner:
-        assert (
-            await owner.post(
-                "/api/agent-panel/publish",
-                json={"data": {"cycle": 47}},
-                headers={"X-Session-Key": "dashboard:chat-1"},
-            )
-        ).status == 200, "the space-named crew could not publish at all"
-    kept = agent_panel.read(spaced_slug)
-    assert kept is not None and kept["crew"] == spaced
-
-    # The roster holds the space-named crew and nothing else, so the ONLY reason
-    # the enumeration could miss it is the grammar filter.
-    real_load = routes.KiroCrewConfig.load
-
-    def _roster_with_the_spaced_crew(*a, **kw):
-        cfg = real_load(*a, **kw)
-        cfg.agents.clear()
-        cfg.agents[spaced] = SimpleNamespace(name=spaced)
-        return cfg
-
-    monkeypatch.setattr(routes.KiroCrewConfig, "load", staticmethod(_roster_with_the_spaced_crew))
-
-    colliding = "on-call"
-    assert members_mod.slug_for_name(colliding) == spaced_slug, "fixture no longer collides"
-    async with _client(colliding) as impostor:
-        resp = await impostor.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 999}},
-            headers={"X-Session-Key": "dashboard:chat-2"},
-        )
-        assert resp.status == 400, await resp.text()
-
-    after = agent_panel.read(spaced_slug)
-    assert after is not None
-    assert after["crew"] == spaced
-    assert after["data"] == {"cycle": 47}
-
-
-async def test_a_colliding_crew_cannot_read_the_other_crews_panel(vetted):
-    """The READ half of the ownership guard.
-
-    ``publish`` refuses the colliding WRITE, so one crew cannot overwrite the
-    other's record. But with the read keyed on the slug alone, the crew that did
-    NOT publish still saw the publisher's dashboard rendered in its own drawer --
-    the guard was half-applied. Both halves check the same stored claim.
-
-    ``Oncall`` and ``oncall`` slugify to one slug, which is the whole premise.
-    """
-    async with _client() as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        # The owner sees it.
-        owner_body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
-        assert owner_body["panel"]["crew"] == CREW
-        assert owner_body["html"]
-
-        # The colliding crew, same slug, different exact name, sees an empty state --
-        # not the other crew's document, and not an error naming them either.
-        other = CREW.upper()
-        assert members_mod.slug_for_name(other) == SLUG, "fixture no longer collides"
-        resp = await c.get(f"/api/members/{SLUG}/panel?member={other}")
-        assert resp.status == 200
-        body = await resp.json()
-        assert body["panel"] is None
-        assert body["html"] is None
-
-
-async def test_the_read_requires_the_exact_crew_name(vetted):
-    """Required, not optional, so a mixed read is impossible by construction.
-
-    An optional parameter puts the guard behind a caller obligation, and the one
-    caller that forgets is the bug. Mirrors ``/activity``, which made the same
-    parameter required for the same reason.
-    """
-    async with _client() as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        resp = await c.get(f"/api/members/{SLUG}/panel")
-        assert resp.status == 400
-        assert (await resp.json())["code"] == "missing_member"
-
-
-async def test_a_hostile_member_name_is_refused_on_the_read(vetted):
-    """The name is validated, not just compared."""
-    async with _client() as c:
-        for hostile in ("../../etc/passwd", "a\nb", "x" * 300, "a;b"):
-            resp = await c.get(
-                f"/api/members/{SLUG}/panel?member={quote(hostile, safe='')}",
-            )
-            assert resp.status == 400, f"{hostile!r} was accepted"
-
-
-async def test_a_credential_shaped_crew_name_can_still_read_its_own_panel(vetted):
-    """Two of our own guards collided, and only this shape shows it.
-
-    Redaction scrubs the stored ``crew`` because a crew name is untrusted text
-    rendered to the operator. The read check compares the EXACT name because
-    slugification is lossy. Together they locked out any crew whose name happens to
-    look credential-shaped: the stored owner became ``[REDACTED: credential]``,
-    which equals no exact name, so that crew could never read its own panel.
-
-    Ownership is decided on a digest of the exact name; the display text stays
-    redacted. Nobody would think to try this name, which is exactly why it is
-    pinned.
-    """
-    # An AKIA-prefixed 20-character name is enough to trip the credential detector.
-    # Assembled rather than written literally; see test_mcp_panel_runtime.py.
-    shaped = "".join(["AKIA", "IOSFODNN7", "EXAMPLE"])
-    assert agent_panel._scrub(shaped) != shaped, "fixture is no longer redacted"
-
-    slug = members_mod.slug_for_name(shaped)
-    async with _client(agent=shaped) as c:
-        pub = await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        assert pub.status == 200, await pub.text()
-
-        body = await (await c.get(f"/api/members/{slug}/panel?member={shaped}")).json()
-        assert body["panel"] is not None, "the crew was locked out of its own panel"
-        assert body["html"], "no document returned to the owning crew"
-        assert body["panel"]["data"] == {"cycle": 47}
-        # The DISPLAY text is still redacted -- the fix must not have simply stopped
-        # scrubbing the name to make the comparison work.
-        assert shaped not in json.dumps(body), "an unredacted credential-shaped name was served"
-        assert "REDACTED" in body["panel"]["crew"]
-
-
-async def test_a_linked_record_is_a_coded_refusal_not_a_500(vetted):
-    """The store refuses to write through an alias; the route must say so with a code.
-
-    A symlink or junction standing where the record belongs is how a write reaches
-    an inode outside the fenced directory, so :func:`agent_panel.panel_path` raises
-    rather than following it. That refusal is neither the crew's fault nor the
-    drawer's, and an uncaught ``CrewSlugError`` reaches the caller as an opaque 500
-    -- telling the one party who can repair it (the operator, who removes the link)
-    nothing about what happened.
-
-    The READ path needs no such catch: ``read`` treats any ``ValueError`` as "no
-    panel published", so a linked record renders the empty state.
-    """
-    async with _client() as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 1}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        # Stand a symlink where the record belongs, pointing at a sibling.
-        path = agent_panel.panel_path(SLUG)
-        elsewhere = path.with_suffix(".elsewhere")
-        elsewhere.write_text("{}", encoding="utf-8")
-        path.unlink()
-        os.symlink(elsewhere, path)
-
-        r = await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 2}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        assert r.status == 400, f"a linked record surfaced as {r.status}"
-        assert (await r.json())["code"] == "panel_record_is_a_symlink"
-
-        # And the read side stays an empty state rather than an error.
-        body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
-        assert body["panel"] is None and body["html"] is None
-
-
-async def test_an_unowned_record_is_not_served_to_anyone(vetted):
-    """The read guard must fail CLOSED when ownership cannot be established.
-
-    Comparing only when the stored ``crew_key`` is truthy would let a record with
-    an empty key skip the check and reach whoever asked -- and with the query
-    parameter the only thing naming the crew, that is any caller. The publish path
-    cannot create such a record, which leaves a forged one as the only source, and
-    a forgery is precisely what must not render in someone's drawer.
-    """
-    async with _client() as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        # Strip the ownership claim, as a write outside the API would.
-        path = agent_panel.panel_path(SLUG)
-        forged = json.loads(path.read_text(encoding="utf-8"))
-        forged["crew_key"] = ""
-        forged["data"] = {"planted": "by nobody"}
-        path.write_text(json.dumps(forged), encoding="utf-8")
-
-        body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
-        assert body["panel"] is None, "an unowned record was served"
-        assert body["html"] is None
-        assert "planted" not in json.dumps(body)
-
-
-async def test_publishing_pushes_a_refresh_to_open_drawers(vetted):
-    """The drawer showed its first read forever without this.
-
-    The query client sets ``staleTime: Infinity`` because freshness is driven by
-    WebSocket push, and nothing pushed for a panel -- so a crew publishing on an
-    unattended loop was invisible after the drawer's first render, which is the one
-    thing the feature exists to do.
-    """
-    app = _mounted()
-    async with TestClient(TestServer(app)) as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        sent = app["state"].broadcasts
-        assert ("panel_published", {"slug": SLUG}) in sent, f"no refresh pushed: {sent}"
-
-
-async def test_the_refresh_frame_carries_no_ownership_digest(vetted):
-    """The frame says "re-read this slug" and nothing more.
-
-    The digest is a hash of the exact crew name, which may itself be
-    credential-shaped -- a sibling test pins that it never reaches a client, and a
-    broadcast goes to EVERY connected client, not just this crew's viewer.
-    """
-    app = _mounted()
-    async with TestClient(TestServer(app)) as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        blob = json.dumps(app["state"].broadcasts)
-        assert agent_panel.crew_key(CREW) not in blob
-        assert "crew_key" not in blob
-
-
-async def test_the_ownership_digest_never_reaches_the_client(vetted):
-    """It is derived from a name that may itself be credential-shaped."""
-    async with _client() as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        body = await (await c.get(f"/api/members/{SLUG}/panel?member={CREW}")).json()
-        assert "crew_key" not in json.dumps(body)
-        assert agent_panel.crew_key(CREW) not in json.dumps(body)
-
-
-async def test_an_app_identified_internal_caller_cannot_publish(vetted):
-    """The secret gate does NOT imply "not an app".
-
-    ``token_auth`` sets ``internal_auth`` and then derives ``request["app"]`` in the
-    SAME branch, so one internal caller can carry both. An app-owned agent granted
-    the panel tools, whose slot's ``agent`` happens to name a crew, therefore
-    satisfied ``internal_secret_required`` and published as that crew -- replacing a
-    crew's own dashboard with app-authored content. The read route denied app
-    callers from the start; this is the write half of the same guard.
-    """
-
-    @web.middleware
-    async def _as_app(request: web.Request, handler):
-        request["app"] = "some-app"
-        return await handler(request)
-
-    # Inserted BEFORE the server starts, for the reason the sibling test records:
-    # aiohttp freezes the app on startup, so a late append is a no-op and this would
-    # pass without ever presenting an app identity.
-    app = _mounted()
-    app.middlewares.insert(0, _as_app)
-    async with TestClient(TestServer(app)) as app_client:
-        resp = await app_client.post(
-            "/api/agent-panel/publish",
-            json={"data": {"planted": "by an app"}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-        assert resp.status == 404, f"an app published as a crew: {resp.status}"
-        assert agent_panel.read(SLUG) is None, "an app's data landed in a crew's panel"
-
-
-async def test_an_app_token_caller_is_denied_the_panel(vetted):
-    """``/api/members/{slug}/panel`` is a CHILD of ``/api/members``.
-
-    An app token scoped to the parent is admitted to this route by prefix, so the
-    denial has to be explicit. Apps are isolated from member surfaces generally --
-    ``/api/members``, ``.../thread`` and ``.../activity`` all 404 for an app token --
-    and a panel is a crew's published state plus a rendered document, squarely
-    inside what that isolation withholds.
-
-    404 rather than 403, matching the sibling: a distinct status would confirm the
-    surface exists to a caller that may not know about it.
-    """
-    async with _client() as c:
-        await c.post(
-            "/api/agent-panel/publish",
-            json={"data": {"cycle": 47}},
-            headers={"X-Session-Key": "dashboard:chat-1"},
-        )
-
-        @web.middleware
-        async def _as_app(request: web.Request, handler):
-            request["app"] = "some-app"
-            return await handler(request)
-
-        # Middleware has to be inserted BEFORE the server starts: aiohttp freezes the
-        # app on startup, so appending to a started client's middlewares is a no-op
-        # and the test would pass without ever presenting an app token.
-        app = _mounted()
-        app.middlewares.insert(0, _as_app)
-        # `async with` for the same reason `_client` uses it: a started client owns
-        # a session and a socket, and this path builds its own rather than going
-        # through the helper, so it needs its own close.
-        async with TestClient(TestServer(app)) as app_client:
-            resp = await app_client.get(f"/api/members/{SLUG}/panel?member={CREW}")
-            assert resp.status == 404, "an app token reached the panel read"
-            body = await resp.text()
-            assert "cycle" not in body, "panel data leaked to an app-token caller"
-
-
-async def test_no_route_here_writes_from_the_browser_surface():
-    """Everything under /api/members here is a read; writes are MCP-only."""
-    member_routes = [
-        r
-        for r in _mounted().router.routes()
-        if str(r.resource.canonical).startswith("/api/members")
-    ]
-    assert member_routes
-    assert {r.method for r in member_routes} <= {"GET", "HEAD"}
-
-
-async def test_the_gateway_registers_exactly_these_paths_without_importing_us():
-    """The boot path binds these routes DEFERRED, so the paths are written twice.
-
-    ``server._register_mcp_routes`` cannot call ``register_agent_panel_routes``:
-    that would import this optional subsystem on every gateway launch before the
-    socket binds, which the boot-path rule forbids. It therefore restates each
-    path against ``server._deferred``, and a restated path is a path
-    that can drift -- a route renamed here and not there would 404 in the gateway
-    while every test in this file passed.
-
-    Compares the two SETS rather than looking for known strings, so a route added
-    to either side has to be added to both.
-    """
-    import inspect
-
-    from kiro_crew.dashboard import server
-
-    ours = {str(r.resource.canonical) for r in _mounted().router.routes()}
-    boot_src = inspect.getsource(server._register_mcp_routes)
-    # One spelling, normalised, so black's line wrapping cannot change the answer:
-    # the binder call may sit on the same line as the path or on the next one.
-    flat = " ".join(boot_src.split())
-    deferred = {
-        path
-        for path in ours
-        # The deferred binder is what proves the gateway serves it without an eager
-        # import; a path bound any other way would not match.
-        if f'"{path}", _deferred("agent_panel",' in flat
-    }
-    missing = ours - deferred
-    assert not missing, (
-        f"{sorted(missing)} are registered by this module but the gateway boot path "
-        "does not bind them through the deferred binder, so they are either "
-        "unserved or imported eagerly"
-    )

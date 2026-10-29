@@ -22,7 +22,7 @@ nothing, so the page rendered the interactive median and called it the system's
 health. There was also no way to see how many background turns had run at all.
 
 **The shared boundary is the usage row, not the ACP turn.** The obvious
-candidate was ``acp/session_handle.py::SessionHandle._run_turn``, which every
+candidate was ``acp/session_handle_turn.py::AcpSessionHandle._run_turn``, which every
 ACP-backed surface really does cross. It was rejected: the handle knows only its
 ACP ``sessionId``, not the Kiro Crew session key this metric must group by, and
 an ``AcpClient``-backed session (the claude_code backend) never reaches it at
@@ -196,8 +196,8 @@ def emit_turn_duration(
     the transport namespace for a channel key, a local label for the rest,
     ``other`` for a shape it does not recognise. Deliberately NOT
     ``validation.infer_use_case``, whose output also gates an artifact check
-    (``handlers/artifacts.py``) — a metric must not be the reason an
-    authorization-adjacent mapping grows a case.
+    (``handlers/artifacts_parts/record_serialization.py``) — a metric must not be
+    the reason an authorization-adjacent mapping grows a case.
 
     Caveat on what the wall clock measures: ``elapsed_ms`` runs from the start
     of the turn, so a turn parked on an interactive tool-approval prompt counts

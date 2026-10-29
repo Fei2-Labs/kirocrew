@@ -38,13 +38,26 @@ def _info(**overrides) -> SubagentInfo:
     return info
 
 
-def _event(*, title="Running: sleep 600", is_shell=True, tool_input='{"command": "sleep 600"}'):
-    """Minimal stand-in for the AcpEvent the subagent loop receives."""
+def _event(
+    *,
+    title="Running: sleep 600",
+    is_shell=True,
+    tool_input='{"command": "sleep 600"}',
+    call_id="call-1",
+):
+    """Minimal stand-in for the AcpEvent the subagent loop receives.
+
+    Every frame names the same call unless *call_id* says otherwise, so a result
+    built here closes the dispatch built here.
+    """
     ev = MagicMock()
     ev.title = title
     ev.tool_input = tool_input
     ev.is_shell = is_shell
     ev.tool_name = "execute_bash" if is_shell else "some_mcp_tool"
+    ev.tool_call_id = call_id
+    ev.tool_status = ""
+    ev.sub_session_id = ""
     return ev
 
 
@@ -537,3 +550,416 @@ async def test_a_done_sibling_does_not_restore_the_fast_path():
         mgr._live_shared_count(4242, list(mgr._agents.values())) == 1
     ), "a done sibling must not count as live"
     assert await _flag_with_dead(mgr, info, now) is False, "shared agent kept fast path"
+
+
+# ── the kirocrew-core wait tool's declared-duration contract ─────────
+
+
+def _wait_event(
+    seconds: int = 270,
+    *,
+    title: str = "wait",
+    trusted: bool = True,
+    server="kirocrew-core",
+    call_id: str = "call-1",
+):
+    """A dispatched ``kirocrew-core`` ``wait`` call, as the subagent loop sees it.
+
+    *trusted* sets the adapter-authored identity the reaper keys on; the title is
+    model-authored and selects nothing.
+    """
+    ev = _event(
+        title=title,
+        is_shell=False,
+        tool_input=f'{{"seconds": {seconds}, "reason": "waiting for CI"}}',
+        call_id=call_id,
+    )
+    ev.tool_name = "wait"
+    ev.mcp_server_name = server
+    ev.mcp_identity_trusted = trusted
+    return ev
+
+
+def _age_dispatch(info: SubagentInfo, secs: float) -> None:
+    """Move the in-flight tool's dispatch instant *secs* into the past."""
+    info._inflight_tool.dispatch_ts -= secs
+
+
+@pytest.mark.asyncio
+async def test_a_declared_wait_reads_working_inside_its_duration():
+    """The wait contract reads only this agent's own tool input and dispatch
+    time, so it is as attributable as the shell-child match and must not be
+    declined with the opaque MCP tools."""
+    from kiro_crew.acp.liveness import WAIT_TOOL_SLACK_SECS
+
+    mgr = _make_manager()
+    info = _info(_pid=4242)
+    SubagentManager._note_tool_dispatch(info, _wait_event(270))
+    _age_dispatch(info, 238)
+    verdict, evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_WORKING, evidence
+    assert "wait tool declared 270s" in evidence
+
+    # Past seconds + slack the contract does not vouch for the agent.
+    _age_dispatch(info, 270 + WAIT_TOOL_SLACK_SECS)
+    verdict, evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_UNKNOWN
+    assert "elapsed" in evidence
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_inside_a_declared_wait_is_not_flagged():
+    """The reported symptom: two sweeps 238s into a ``wait(seconds=270)``
+    marked the agent stalled and emitted ``subagent_stalled``."""
+    mgr = _make_manager(stall_idle_secs=120)
+    now = 1_000.0
+    info = _info(turns=1, _pid=4242, last_activity=now - 238)
+    SubagentManager._note_tool_dispatch(info, _wait_event(270))
+    _age_dispatch(info, 238)
+    with patch("kiro_crew.subagent.record_slow_command") as rec:
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now)
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now + 60)
+    assert info.stalled is False
+    mgr._fire_event.assert_not_called()
+    rec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_long_declared_wait_is_not_capped_by_the_suppression_ceiling():
+    """The ceiling bounds a cmdline match that may belong to a sibling. The wait
+    contract cannot be misattributed and bounds itself at seconds + slack, so a
+    1800s wait must not be flagged at 4x the idle threshold."""
+    from kiro_crew.subagent import _SUPPRESS_CEILING
+
+    mgr = _make_manager(stall_idle_secs=120)
+    now = 1_000.0
+    idle = 120 * _SUPPRESS_CEILING + 300
+    info = _info(turns=1, _pid=4242, last_activity=now - idle, _stall_suspect_at=now - 60)
+    SubagentManager._note_tool_dispatch(info, _wait_event(1800))
+    _age_dispatch(info, idle)
+    with patch("kiro_crew.subagent.record_slow_command"):
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now)
+    assert info.stalled is False
+    mgr._fire_event.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_wait_past_its_declared_duration_flags_after_two_sweeps():
+    """Once seconds + slack have elapsed the verdict is UNKNOWN again and the
+    idle-time path applies unchanged."""
+    from kiro_crew.acp.liveness import WAIT_TOOL_SLACK_SECS
+
+    mgr = _make_manager(stall_idle_secs=120)
+    now = 1_000.0
+    overdue = 270 + WAIT_TOOL_SLACK_SECS + 30
+    info = _info(turns=1, _pid=4242, last_activity=now - overdue)
+    SubagentManager._note_tool_dispatch(info, _wait_event(270))
+    _age_dispatch(info, overdue)
+    with patch("kiro_crew.subagent.record_slow_command"):
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now)
+        assert info.stalled is False and info._stall_suspect_at > 0
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now + 60)
+    assert info.stalled is True
+
+
+@pytest.mark.asyncio
+async def test_the_wait_contract_needs_no_proc_consult():
+    """The contract is pure arithmetic on the tool snapshot, so it must not
+    queue a /proc walk on the subprocess executor."""
+    mgr = _make_manager()
+    info = _info(_pid=4242)
+    SubagentManager._note_tool_dispatch(info, _wait_event(270))
+    with patch("kiro_crew.subagent.consult_offloaded", new=AsyncMock()) as consult:
+        verdict, _evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_WORKING
+    consult.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_declared_duration_past_the_wait_maximum_counts_as_the_maximum():
+    """The declared ``seconds`` is model-authored input, so a value beyond what
+    the wait tool will ever sleep must not hold the badge back for longer than
+    that tool's own clamp."""
+    from kiro_crew.acp.liveness import WAIT_TOOL_MAX_SECS, WAIT_TOOL_SLACK_SECS
+
+    mgr = _make_manager()
+    info = _info(_pid=4242)
+    SubagentManager._note_tool_dispatch(info, _wait_event(86_400))
+    _age_dispatch(info, WAIT_TOOL_MAX_SECS + WAIT_TOOL_SLACK_SECS + 1)
+    verdict, _evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_UNKNOWN
+
+
+def _core_non_wait_event():
+    """A trusted kirocrew-core call that is not ``wait`` but carries ``seconds``."""
+    ev = _wait_event(1800, title="wait")
+    ev.tool_name = "monitor_start"
+    return ev
+
+
+def _forged_wait_event(seconds: int = 1800, *, title: str = "wait_for_ci"):
+    """A non-wait MCP call whose model-authored title and args look like a wait."""
+    ev = _event(
+        title=title,
+        is_shell=False,
+        tool_input=f'{{"seconds": {seconds}}}',
+    )
+    ev.tool_name = "wait_for_ci"
+    ev.mcp_server_name = "third-party"
+    ev.mcp_identity_trusted = True
+    return ev
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        pytest.param(_forged_wait_event(title="wait_for_ci"), id="other-tool-wait-title"),
+        pytest.param(_forged_wait_event(title="wait"), id="other-tool-exact-wait-title"),
+        pytest.param(_wait_event(1800, server="third-party"), id="wait-on-another-server"),
+        pytest.param(_wait_event(1800, trusted=False), id="unverified-identity"),
+        pytest.param(_core_non_wait_event(), id="other-core-tool"),
+    ],
+)
+async def test_the_wait_contract_is_selected_by_trusted_identity_not_title(event):
+    """The contract lifts the suppression ceiling, so a model-authored title or
+    an unverified identity must not select it: such a call stays declined."""
+    mgr = _make_manager()
+    info = _info(_pid=4242)
+    SubagentManager._note_tool_dispatch(info, event)
+    verdict, evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_UNKNOWN
+    assert "not attributable" in evidence
+
+
+@pytest.mark.asyncio
+async def test_a_forged_wait_title_does_not_lift_the_suppression_ceiling():
+    """Even if some other evidence reads WORKING, a call that is not the trusted
+    wait tool keeps the ceiling: past it the badge wins."""
+    from kiro_crew.subagent import _SUPPRESS_CEILING
+
+    mgr = _make_manager(stall_idle_secs=10)
+    now = 1_000.0
+    info = _info(
+        turns=1,
+        _pid=4242,
+        last_activity=now - 10 * _SUPPRESS_CEILING - 50,
+        _stall_suspect_at=now - 60,
+    )
+    SubagentManager._note_tool_dispatch(info, _forged_wait_event())
+    mgr._stall_verdict = AsyncMock(return_value=(VERDICT_WORKING, "wait tool declared 1800s"))
+    with patch("kiro_crew.subagent.record_slow_command"):
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now)
+    assert info.stalled is True
+
+
+@pytest.mark.asyncio
+async def test_a_real_acp_wait_event_selects_the_contract():
+    """Pins the field wiring against the real event type: the adapter identity a
+    kiro-cli ``_meta.kiro`` frame yields for the wait tool selects the contract."""
+    from kiro_crew.acp.types import EVENT_TOOL_CALL, AcpEvent
+
+    ev = AcpEvent(
+        kind=EVENT_TOOL_CALL,
+        title="Waiting for CI",
+        tool_input='{"seconds": 300, "reason": "ci"}',
+        is_shell=False,
+        tool_name="wait",
+        mcp_server_name="kirocrew-core",
+        tool_identity_trusted=True,
+        mcp_identity_trusted=True,
+    )
+    mgr = _make_manager()
+    info = _info(_pid=4242)
+    SubagentManager._note_tool_dispatch(info, ev)
+    verdict, evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_WORKING, evidence
+
+
+def test_the_contract_ceiling_matches_the_wait_tool_schema():
+    """The reaper stops vouching for a wait at ``WAIT_TOOL_MAX_SECS`` plus slack.
+    If the tool's own accepted maximum ever rose past it, a legitimate long wait
+    would be badged stalled again, so the two numbers are pinned together."""
+    from kiro_crew.acp.liveness import WAIT_TOOL_MAX_SECS
+    from kiro_crew.validation import WAIT_SCHEMA
+
+    (seconds,) = [f for f in WAIT_SCHEMA.fields if f.name == "seconds"]
+    assert seconds.max_val == WAIT_TOOL_MAX_SECS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "meta",
+    [
+        pytest.param(
+            {"kiro": {"toolName": "wait", "mcpServerName": "kirocrew-core"}}, id="kiro-cli"
+        ),
+        pytest.param(
+            {"kiro": {"toolName": "kirocrew-core___wait", "mcpServerName": "kirocrew-core"}},
+            id="kiro-cli-server-qualified",
+        ),
+        pytest.param(
+            {
+                "goose": {
+                    "toolCall": {
+                        "toolName": "kirocrew-core__wait",
+                        "extensionName": "kirocrew-core",
+                    }
+                }
+            },
+            id="goose",
+        ),
+    ],
+)
+async def test_a_raw_harness_wait_frame_selects_the_contract(meta):
+    """End to end from the wire: the adapter's own identity block on a raw
+    ``tool_call`` frame, built by the production frame builder, must yield the
+    trusted pair the contract keys on. A hand-built event cannot catch a builder
+    that stops earning ``mcp_identity_trusted``."""
+    from kiro_crew.acp._dispatch import _build_tool_call_event
+
+    update = {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "toolu_wait",
+        "kind": "other",
+        "title": "Waiting for CI",
+        "rawInput": {"seconds": 300, "reason": "ci"},
+        "_meta": meta,
+    }
+    ev = _build_tool_call_event(update, {})
+    assert ev.mcp_identity_trusted is True
+    mgr = _make_manager()
+    info = _info(_pid=4242)
+    SubagentManager._note_tool_dispatch(info, ev)
+    verdict, evidence = await mgr._stall_verdict(info)
+    assert verdict == VERDICT_WORKING, evidence
+
+
+# ── parallel calls finish in any order ───────────────────────────────
+
+
+def _result(call_id: str, *, status: str = "completed"):
+    """A terminal result frame for *call_id*."""
+    ev = MagicMock()
+    ev.tool_call_id = call_id
+    ev.tool_status = status
+    ev.tool_final = status == "completed"
+    return ev
+
+
+def _write_event(call_id: str = "write-1"):
+    """A file write: a non-shell call that returns in milliseconds."""
+    return _event(
+        title="Editing PLAN-a.md",
+        is_shell=False,
+        tool_input='{"path": "PLAN-a.md"}',
+        call_id=call_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("write_first", [True, False], ids=["write-first", "wait-first"])
+async def test_a_parallel_call_returning_first_leaves_the_wait_judged(write_first):
+    """The reported symptom: a subagent called a file write and ``wait(1800)``
+    in one turn. The write's result emptied the one in-flight slot, the reaper
+    then saw no tool in flight, and two sweeps later badged the agent stalled
+    while it sat inside its declared wait. Either dispatch order must hold."""
+    mgr = _make_manager(stall_idle_secs=120)
+    now = 1_000.0
+    info = _info(turns=1, _pid=4242, last_activity=now - 300)
+    calls = [_wait_event(1800, call_id="wait-1"), _write_event()]
+    for ev in reversed(calls) if write_first else calls:
+        SubagentManager._note_tool_dispatch(info, ev)
+    SubagentManager._note_tool_result(info, _result("write-1"))
+
+    assert info._inflight_tool is info._active_tool_calls["wait-1"]
+    _age_dispatch(info, 300)
+    with patch("kiro_crew.subagent.record_slow_command") as rec:
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now)
+        await mgr._maybe_flag_stall("a1b2c3d4", info, now + 60)
+    assert info.stalled is False
+    mgr._fire_event.assert_not_called()
+    rec.assert_not_called()
+
+
+def test_the_slot_empties_only_when_every_call_has_returned():
+    """Handing the slot to the call still running is a new judged call, so it
+    retires the oracle; the last call returning leaves nothing in flight."""
+    info = _info()
+    SubagentManager._note_tool_dispatch(info, _wait_event(1800, call_id="wait-1"))
+    SubagentManager._note_tool_dispatch(info, _write_event())
+    gen = info._stall_gen
+
+    SubagentManager._note_tool_result(info, _result("write-1"))
+    assert info._inflight_tool is info._active_tool_calls["wait-1"]
+    assert info._stall_gen == gen + 1
+
+    SubagentManager._note_tool_result(info, _result("wait-1"))
+    assert info._inflight_tool is None
+    assert info._active_tool_calls == {}
+    assert info._stall_gen == gen + 2
+
+
+@pytest.mark.parametrize("call_id", ["write-1", "never-dispatched"])
+def test_a_result_for_a_call_not_being_judged_changes_nothing(call_id):
+    """The judged call and the baseline its oracle gathered survive another
+    call's result, including one for a call this agent never dispatched."""
+    info = _info()
+    SubagentManager._note_tool_dispatch(info, _write_event())
+    SubagentManager._note_tool_dispatch(info, _event(call_id="shell-1"))
+    oracle = _oracle(VERDICT_WORKING)
+    info._stall_oracle = oracle
+    judged, gen = info._inflight_tool, info._stall_gen
+
+    SubagentManager._note_tool_result(info, _result(call_id))
+    assert info._inflight_tool is judged
+    assert info._stall_gen == gen
+    oracle.fresh.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled", "refused"])
+def test_a_call_that_ends_without_completing_is_retired(status):
+    """``tool_final`` is true only for ``completed``, but a failed, cancelled or
+    refused call is over too. Kept in flight it would be handed the slot when a
+    later call returns, and a shell call whose child is gone reads DEAD, which
+    badges the agent at once."""
+    info = _info()
+    SubagentManager._note_tool_dispatch(info, _event(call_id="shell-1"))
+    SubagentManager._note_tool_result(info, _result("shell-1", status=status))
+    assert info._inflight_tool is None
+    assert info._active_tool_calls == {}
+
+
+def test_a_new_prompt_drops_calls_the_last_turn_left_open():
+    """A call the previous turn never closed must not be handed the slot when a
+    call from the next turn returns."""
+    info = _info()
+    SubagentManager._note_tool_dispatch(info, _event(call_id="stale-1"))
+    SubagentManager._clear_tool_dispatch(info)
+    SubagentManager._note_tool_dispatch(info, _write_event())
+    SubagentManager._note_tool_result(info, _result("write-1"))
+    assert info._inflight_tool is None
+    assert info._active_tool_calls == {}
+
+
+def test_a_native_child_call_is_judged_but_never_held_open():
+    """A native child's permission request names a command running in this
+    runtime, so it is judged, but its results go to the backend's own session
+    and never reach this loop. It gets no running-set entry, and this agent's
+    own next result moves the slot off it instead of leaving a finished child
+    command judged for the rest of the prompt."""
+    info = _info()
+    SubagentManager._note_tool_dispatch(info, _wait_event(1800, call_id="wait-1"))
+    SubagentManager._note_tool_dispatch(info, _event(call_id="shell-1"))
+    child = _event(call_id="child-1", tool_input='{"command": "make test"}')
+    child.sub_session_id = "child-session"
+    SubagentManager._note_tool_dispatch(info, child)
+    assert info._inflight_tool.command == '{"command": "make test"}'
+    assert "child-1" not in info._active_tool_calls
+
+    SubagentManager._note_tool_result(info, _result("shell-1"))
+    assert info._inflight_tool is info._active_tool_calls["wait-1"]
+
+    SubagentManager._note_tool_result(info, _result("wait-1"))
+    assert info._inflight_tool is None
+    assert info._active_tool_calls == {}

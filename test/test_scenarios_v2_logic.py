@@ -21,6 +21,7 @@ from kiro_crew.taskrunner import (
     TaskRunner,
     WorkingMemory,
 )
+from kiro_crew.testing.wait import await_until
 
 
 def _make_mock_sessions() -> MagicMock:
@@ -36,7 +37,9 @@ def _make_mock_sessions() -> MagicMock:
     sessions.check_context_usage = MagicMock()
     sessions.recycle_background = AsyncMock()
 
-    async def _open_task_session(_parent_key, session_key, *, agent=None, cwd=None, approval_policy=""):
+    async def _open_task_session(
+        _parent_key, session_key, *, agent=None, cwd=None, approval_policy="", start_priority=None
+    ):
         return await sessions.get_or_create(session_key, agent=agent, cwd=cwd)
 
     sessions.open_task_session = _open_task_session
@@ -571,7 +574,7 @@ class TestScenarioParallelExecution:
                         if len(arrived) >= 2:
                             barrier.set()
                         else:
-                            await asyncio.wait_for(barrier.wait(), timeout=2.0)
+                            await await_until(barrier, what="the other parallel step arriving")
                         break
                 yield LLMEvent(kind="text_chunk", text="done")
                 yield LLMEvent(kind="complete")

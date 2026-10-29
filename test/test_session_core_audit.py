@@ -19,6 +19,7 @@ Covers three remediations in ``src/kiro_crew/session.py``:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -27,6 +28,7 @@ import pytest
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session import FirstTurnState, SessionManager, _Session
+from kiro_crew.testing.wait import await_until, until_parked
 
 
 @pytest.fixture
@@ -80,10 +82,8 @@ async def test_open_task_session_revalidates_dead_provider_after_semaphore(cfg):
     async def _driver() -> None:
         # Let open_task_session block on the semaphore, then kill the provider
         # and release the turn so the fast path proceeds and re-validates.
-        while not sess.semaphore.locked():
-            await asyncio.sleep(0.01)
-        # semaphore is locked (held by us); wait a beat so the coroutine is
-        # actually parked inside acquire(), then flip dead + release.
+        # Semaphore is locked (held by the test); wait for open_task_session
+        # to park on it before flipping the provider dead and releasing.
         await asyncio.sleep(0.02)
         dead_provider._alive = False
         sess.semaphore.release()
@@ -92,9 +92,7 @@ async def test_open_task_session_revalidates_dead_provider_after_semaphore(cfg):
         "kiro_crew.acp.session_provider.AcpSessionProvider",
         return_value=fresh_provider,
     ):
-        _, result = await asyncio.gather(
-            _driver(), sm.open_task_session("parent", key)
-        )
+        _, result = await asyncio.gather(_driver(), sm.open_task_session("parent", key))
 
     provider, is_new, resumed = result
     assert provider is fresh_provider, "must cold-start a fresh session, not reuse the dead one"
@@ -123,8 +121,8 @@ async def test_open_task_session_revalidates_removed_session_after_semaphore(cfg
     fresh_provider.shutdown = AsyncMock()
 
     async def _driver() -> None:
-        while not sess.semaphore.locked():
-            await asyncio.sleep(0.01)
+        # Semaphore is locked (held by the test); wait a beat so the target
+        # coroutine parks on acquire() before we recycle the session.
         await asyncio.sleep(0.02)
         # Another coroutine recycled the session: removed from the map.
         sm._sessions.pop(key, None)
@@ -134,9 +132,7 @@ async def test_open_task_session_revalidates_removed_session_after_semaphore(cfg
         "kiro_crew.acp.session_provider.AcpSessionProvider",
         return_value=fresh_provider,
     ):
-        _, result = await asyncio.gather(
-            _driver(), sm.open_task_session("parent", key)
-        )
+        _, result = await asyncio.gather(_driver(), sm.open_task_session("parent", key))
 
     provider, is_new, _resumed = result
     assert provider is fresh_provider
@@ -184,19 +180,21 @@ async def test_open_task_session_lost_race_revalidates_recycled_winner(cfg):
 
     sm._get_or_bootstrap_run_runtime = AsyncMock(side_effect=_bootstrap)  # type: ignore[method-assign]
 
-    dup_provider = AsyncMock()          # the redundant provider we lose with
+    dup_provider = AsyncMock()  # the redundant provider we lose with
     dup_provider.shutdown = AsyncMock()
-    fresh_provider = AsyncMock()        # the winning provider on the retry
+    # Synchronous on the real provider; an AsyncMock attribute would hand the
+    # registry an un-awaited coroutine when it disowns the lost-race provider.
+    dup_provider.disown_work_dir = MagicMock()
+    fresh_provider = AsyncMock()  # the winning provider on the retry
     fresh_provider.shutdown = AsyncMock()
 
     async def _driver() -> None:
         # Wait until open_task_session is parked on the winner's semaphore
         # (lost-race acquire), then recycle the winner: flip its provider dead
         # and release the turn so re-validation runs and finds it stale.
-        while not (key in sm._sessions and sm._sessions[key] is winner
-                   and winner.semaphore.locked()):
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.02)  # ensure the loser is parked inside acquire()
+        # open_task_session is parked on the winner's semaphore once at least
+        # one waiter is pending; until_parked guarantees this before we proceed.
+        await until_parked(winner.semaphore)
         winner_provider._alive = False
         winner.semaphore.release()
 
@@ -204,9 +202,7 @@ async def test_open_task_session_lost_race_revalidates_recycled_winner(cfg):
         "kiro_crew.acp.session_provider.AcpSessionProvider",
         side_effect=[dup_provider, fresh_provider],
     ):
-        _, result = await asyncio.gather(
-            _driver(), sm.open_task_session("parent", key)
-        )
+        _, result = await asyncio.gather(_driver(), sm.open_task_session("parent", key))
 
     provider, is_new, resumed = result
     assert provider is fresh_provider, "loser must revalidate + cold-start, not reuse dead winner"
@@ -298,9 +294,7 @@ async def test_resolve_agent_model_serves_cache_within_ttl(tmp_path, monkeypatch
     monkeypatch.setattr("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path)
     SessionManager._agent_model_cache = {}  # type: ignore[attr-defined]
 
-    (tmp_path / "z.json").write_text(
-        json.dumps({"name": "z", "model": "mz"}), encoding="utf-8"
-    )
+    (tmp_path / "z.json").write_text(json.dumps({"name": "z", "model": "mz"}), encoding="utf-8")
     assert SessionManager._resolve_agent_model("z") == "mz"
 
     calls = {"n": 0}
@@ -345,9 +339,9 @@ async def test_reacquire_and_validate_releases_semaphore_on_cancellation(cfg):
         task = asyncio.ensure_future(sm._reacquire_and_validate(key, sess))
         # Wait until the method has grabbed the per-session semaphore and is now
         # blocked trying to take self._lock.
-        while not sess.semaphore.locked():
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.02)  # ensure it is parked inside the lock acquire
+        # _reacquire_and_validate acquires sess.semaphore then parks on
+        # sm._lock (held by us); until_parked confirms it is parked there.
+        await until_parked(sm._lock)
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -358,5 +352,204 @@ async def test_reacquire_and_validate_releases_semaphore_on_cancellation(cfg):
     # The semaphore must have been released on cancellation, so the key is free.
     assert not sess.semaphore.locked(), "cancellation must not leak the semaphore"
     # And it is genuinely re-acquirable without blocking.
-    await asyncio.wait_for(sess.semaphore.acquire(), timeout=1.0)
+    await await_until(
+        asyncio.ensure_future(sess.semaphore.acquire()), what="semaphore re-acquirable after cancel"
+    )
     sess.semaphore.release()
+
+
+# --------------------------------------------------------------------------
+# Bug: a reset between the reacquire's permit and its lock wait
+# --------------------------------------------------------------------------
+
+#: Lost-run ceiling for the steps below that stay a ``wait_for``. Each finishes in
+#: milliseconds once the interleaving is set up, so the ceiling only turns a hang
+#: into a failure and never decides pass versus fail.
+_LOST_RUN_CEILING_SECS = 30.0
+
+
+async def _until(cond, what: str) -> None:
+    """Yield to the loop until *cond* holds; a bounded count, not a wall clock."""
+    for _ in range(500):
+        if cond():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"timed out waiting for: {what}")
+
+
+def _live_session() -> _Session:
+    provider = _dead_after_probe_provider()  # reports alive
+    return _Session(provider=provider, first_turn=FirstTurnState.NOTHING_ARMED)
+
+
+def _orphans(sm: SessionManager, key: str) -> set:
+    return set(sm._lifecycle_boundary().state.orphaned_holders.get(key, set()))
+
+
+async def _cancel_and_drain(task: asyncio.Task) -> None:
+    """Cancel a test's background task and wait for it, so a failed assertion
+    never leaves it pending; bounded so a task that ignores the cancel fails
+    by name here instead of hanging the worker."""
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await await_until(task, what="the cancelled background task")
+
+
+async def _hand_permit_into_reset_window(sm: SessionManager, key: str, sess: _Session):
+    """Drive a turn T, a claimant W parked on its permit, and a reset queued
+    on the manager lock, until T's release has handed the permit to W and W
+    waits for the lock behind the reset. Returns (t_task, w_task, r_task,
+    t_next) with the lock released, so the reset runs next. Setting
+    ``t_next`` lets T go on to its next claim on the key.
+    """
+    t_done = asyncio.Event()
+    t_next = asyncio.Event()
+    t_claimed_successor = asyncio.Event()
+
+    async def _turn() -> None:
+        # wait_for, not await_until: the test cancels T while it is parked on an
+        # event here, and wait_for cancels the inner event wait with it.
+        assert await sm._reacquire_and_validate(key, sess)
+        await asyncio.wait_for(t_done.wait(), timeout=_LOST_RUN_CEILING_SECS)
+        sm.release(key)
+        await asyncio.wait_for(t_next.wait(), timeout=_LOST_RUN_CEILING_SECS)
+        successor = sm._sessions[key]
+        assert await sm._reacquire_and_validate(key, successor)
+        t_claimed_successor.set()
+        sm.release(key)
+
+    t_task = asyncio.ensure_future(_turn())
+    await _until(lambda: sess.turn_owner is t_task, "T holds the turn")
+    w_task = asyncio.ensure_future(sm._reacquire_and_validate(key, sess))
+    await _until(lambda: bool(sess.semaphore._waiters), "W parked on the permit")
+    await sm._lock.acquire()
+    r_task = asyncio.ensure_future(sm.reset(key))
+    await _until(lambda: bool(sm._lock._waiters), "the reset queued on the lock")
+    t_done.set()
+    await _until(lambda: len(sm._lock._waiters or ()) == 2, "W queued behind the reset")
+    sm._lock.release()
+    return t_task, w_task, r_task, (t_next, t_claimed_successor)
+
+
+@pytest.mark.asyncio
+async def test_a_reset_while_a_woken_claimant_waits_for_the_lock_releases_the_permit_once(cfg):
+    """The busy turn's release hands the permit to the parked claimant W, and a
+    reset pops the session while W waits for the manager lock. The reset must
+    record W, the task holding the permit, and release it once; W then returns
+    False without releasing it a second time, instead of raising
+    ``ValueError: BoundedSemaphore released too many times``.
+    """
+    sm = SessionManager(cfg)
+    key = "sess:reacquire-reset-window"
+    sess = _live_session()
+    sm._sessions[key] = sess
+
+    t_task, w_task, r_task, _t_next = await _hand_permit_into_reset_window(sm, key, sess)
+    try:
+        await await_until(r_task, what="the reset")
+        assert await await_until(w_task, what="the woken claimant") is False
+
+        assert t_task not in _orphans(sm, key), "T had already released; it is not the holder"
+        assert w_task not in _orphans(sm, key), "W's record is consumed by its own refusal"
+        assert not sess.semaphore.locked()
+        await asyncio.wait_for(sess.semaphore.acquire(), timeout=_LOST_RUN_CEILING_SECS)
+        sess.semaphore.release()
+    finally:
+        await _cancel_and_drain(t_task)
+
+
+@pytest.mark.asyncio
+async def test_a_fence_refusal_after_a_reset_in_the_reacquire_window_does_not_over_release(
+    cfg, monkeypatch
+):
+    """Same window, refused at the ending fence instead: the refusal reaches the
+    caller as ``SessionEndingError``, not as a ``ValueError`` from releasing a
+    permit the reset already released."""
+    from kiro_crew.session_allocation import SessionEndingError
+
+    sm = SessionManager(cfg)
+    key = "sess:reacquire-reset-fence"
+    sess = _live_session()
+    sm._sessions[key] = sess
+    real_refuse = type(sm._allocation_boundary())._refuse_if_ending
+
+    def _refuse_once_popped(self, k, reservation):
+        if k == key and sm._sessions.get(key) is not sess:
+            raise SessionEndingError(key)
+        return real_refuse(self, k, reservation)
+
+    monkeypatch.setattr(type(sm._allocation_boundary()), "_refuse_if_ending", _refuse_once_popped)
+
+    t_task, w_task, r_task, _t_next = await _hand_permit_into_reset_window(sm, key, sess)
+    try:
+        await await_until(r_task, what="the reset")
+        with pytest.raises(SessionEndingError):
+            await await_until(w_task, what="the woken claimant")
+        assert not sess.semaphore.locked()
+    finally:
+        await _cancel_and_drain(t_task)
+
+
+@pytest.mark.asyncio
+async def test_a_reset_in_the_reacquire_window_leaves_the_previous_turns_next_release_genuine(cfg):
+    """The turn that handed the permit over is not the holder the reset
+    records. Its next claim on the key is a successor's permit, and its release
+    of that permit must unlock it rather than be absorbed, or the key stays busy.
+    """
+    sm = SessionManager(cfg)
+    key = "sess:reacquire-reset-leak"
+    sess = _live_session()
+    sm._sessions[key] = sess
+
+    t_task, w_task, r_task, (t_next, t_claimed) = await _hand_permit_into_reset_window(
+        sm, key, sess
+    )
+    await await_until(r_task, what="the reset")
+    await await_until(asyncio.gather(w_task, return_exceptions=True), what="the woken claimant")
+
+    successor = _live_session()
+    sm._sessions[key] = successor
+    t_next.set()
+    await await_until(t_task, what="the previous turn's claim on the successor")
+    assert t_claimed.is_set()
+    assert not successor.semaphore.locked(), "T's genuine release was absorbed; the key stays busy"
+    await asyncio.wait_for(successor.semaphore.acquire(), timeout=_LOST_RUN_CEILING_SECS)
+    successor.semaphore.release()
+
+
+@pytest.mark.asyncio
+async def test_a_reset_while_a_claimant_is_still_parked_wakes_it_and_absorbs_the_holders_release(
+    cfg,
+):
+    """Control for the parked-waiter path: the reset lands while T still holds
+    the permit and W is still parked on it. The reset records T and wakes W;
+    W finds the session gone and returns False; T's later release is absorbed
+    and does not unlock the successor another task now holds."""
+    sm = SessionManager(cfg)
+    key = "sess:reset-parked-waiter"
+    sess = _live_session()
+    sm._sessions[key] = sess
+    t_done = asyncio.Event()
+
+    async def _turn() -> None:
+        assert await sm._reacquire_and_validate(key, sess)
+        await await_until(t_done, what="the signal for T to release its permit")
+        sm.release(key)
+
+    t_task = asyncio.ensure_future(_turn())
+    await _until(lambda: sess.turn_owner is t_task, "T holds the turn")
+    w_task = asyncio.ensure_future(sm._reacquire_and_validate(key, sess))
+    await _until(lambda: bool(sess.semaphore._waiters), "W parked on the permit")
+
+    await asyncio.wait_for(sm.reset(key), timeout=_LOST_RUN_CEILING_SECS)
+    assert t_task in _orphans(sm, key)
+    assert await await_until(w_task, what="the parked claimant") is False
+
+    successor = _live_session()
+    sm._sessions[key] = successor
+    await successor.semaphore.acquire()  # another task's turn on the successor
+    t_done.set()
+    await await_until(t_task, what="the holder's release")
+    assert successor.semaphore.locked(), "T's release must not unlock the successor's turn"
+    assert t_task not in _orphans(sm, key)
+    successor.semaphore.release()

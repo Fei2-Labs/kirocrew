@@ -1,12 +1,13 @@
 /**
  * Tests for usePanelTabs — the tabbed side panel state model. Pins the
  * tab-strip contracts: singleton view tabs, document dedupe/focus,
- * replace-in-place opens, patch-without-focus, neighbor refocus on close,
- * and reordering.
+ * replace-in-place opens, patch-without-focus, return-to-last-viewed refocus
+ * on close, and reordering.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
-import { usePanelTabs, openPanelView, __resetPanelTabs, useAnyLiveAppTab, useAllAppTabs } from '../hooks/usePanelTabs'
+import { usePanelTabs, openPanelView, __resetPanelTabs, useAnyLiveAppTab, useAllAppTabs, evictDocumentBodies, purgeDocumentBodiesForRedactionChange, documentBodyEpochNow, takePlainPanelShow, notePanelStoppedShowing, notePanelShown } from '../hooks/usePanelTabs'
+import * as panelTabsModule from '../hooks/usePanelTabs'
 import { shouldMountSidePanel, isSidePanelHidden } from '../pages/chat/sidePanelMount'
 
 // App-contributed tab descriptors are an ARGUMENT to `usePanelTabs`, not something
@@ -71,7 +72,7 @@ describe('usePanelTabs', () => {
   })
 
   it('openFile dedupes on path, titles by basename, and carries the origin slot', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
     act(() => result.current.openFile('/src/pages/ChatPage.tsx', 'body-1', 'slot-a'))
     expect(result.current.tabs).toHaveLength(1)
     expect(result.current.activeTab).toMatchObject({
@@ -84,13 +85,92 @@ describe('usePanelTabs', () => {
     expect(result.current.activeTab?.content).toBe('body-2')
   })
 
+  it('routes the file tab into the NAMED slot bucket, not the bound one (#9921 split panes)', () => {
+    // Split view shares ONE opener across panes but each pane owns its own
+    // slot. A file opened from pane B must land in B's bucket AND be stamped B,
+    // or the tab vanishes when B becomes active (it would sit in the bound
+    // active slot A's bucket, keyed elsewhere). Same contract openView holds.
+    const { result, rerender } = renderHook(({ slot }: { slot: string | null }) => usePanelTabs(slot, mock.descriptors), {
+      initialProps: { slot: 'pane-a' as string | null },
+    })
+    // Bound to A; open a file for pane B (the shared-opener situation).
+    act(() => result.current.openFile('/x/spec.md', 'body', 'pane-b'))
+    expect(result.current.tabs).toEqual([]) // A's bucket is untouched
+
+    rerender({ slot: 'pane-b' })
+    expect(result.current.tabs.map(t => t.id)).toEqual(['file:/x/spec.md'])
+    expect(result.current.activeTab).toMatchObject({ slot: 'pane-b', content: 'body' })
+  })
+
+  it('evictDocumentBodies drops clean file bodies and diff tabs, keeps dirty buffers, in every slot', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+    const b = renderHook(() => usePanelTabs('slot-b', mock.descriptors))
+    act(() => a.result.current.openFile('/clean.md', 'AKIA-raw-while-off', 'slot-a'))
+    act(() => a.result.current.openFile('/dirty.md', 'on-disk', 'slot-a'))
+    act(() => a.result.current.patchTab('file:/dirty.md', { content: 'user edits' }))
+    act(() => a.result.current.openDiff('/clean.md', 'AKIA-raw-while-off', 'AKIA-raw-while-off'))
+    act(() => b.result.current.openFile('/other.md', 'raw-too', 'slot-b'))
+    let touched = 0
+    act(() => { touched = evictDocumentBodies() })
+    expect(touched).toBe(3)
+    const clean = a.result.current.tabs.find(t => t.id === 'file:/clean.md')
+    expect(clean).toBeTruthy()
+    expect(clean?.content).toBeUndefined() // rehydrates through /api/file-read
+    expect(clean?.savedContent).toBeUndefined()
+    const dirty = a.result.current.tabs.find(t => t.id === 'file:/dirty.md')
+    expect(dirty?.content).toBe('user edits') // unsaved work is never discarded
+    expect(a.result.current.tabs.some(t => t.kind === 'diff')).toBe(false)
+    expect(b.result.current.tabs.find(t => t.id === 'file:/other.md')?.content).toBeUndefined()
+    // Focus survives on a still-present tab.
+    expect(a.result.current.tabs.some(t => t.id === a.result.current.activeId)).toBe(true)
+  })
+
+  it('evictDocumentBodies leaves a host leading-tab focus alone (it lives outside the bucket)', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors, { leadingIds: ['notes'] }))
+    act(() => a.result.current.openFile('/clean.md', 'raw', 'slot-a'))
+    act(() => a.result.current.openDiff('/clean.md', 'raw', 'raw'))
+    act(() => a.result.current.setActive('notes'))
+    expect(a.result.current.activeId).toBe('notes')
+    act(() => { evictDocumentBodies() })
+    // The diff tab is gone, the file body is gone, and the focus is still the host's tab.
+    expect(a.result.current.tabs.some(t => t.kind === 'diff')).toBe(false)
+    expect(a.result.current.activeId).toBe('notes')
+  })
+
+  it('evictDocumentBodies refocuses only when the focused tab was a dropped diff', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+    act(() => a.result.current.openFile('/clean.md', 'raw', 'slot-a'))
+    act(() => a.result.current.openDiff('/clean.md', 'raw', 'raw'))
+    expect(a.result.current.activeId).toBe('diff:/clean.md')
+    act(() => { evictDocumentBodies() })
+    expect(a.result.current.activeId).toBe('file:/clean.md')
+  })
+
+  it('every eviction moves the document-body epoch, so a read that straddles it can tell', () => {
+    const before = documentBodyEpochNow()
+    act(() => { evictDocumentBodies() })
+    expect(documentBodyEpochNow()).toBe(before + 1)
+    act(() => { evictDocumentBodies() })
+    expect(documentBodyEpochNow()).toBe(before + 2)
+  })
+
+  it('purgeDocumentBodiesForRedactionChange resets both file caches and evicts the tab bodies', () => {
+    const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+    act(() => a.result.current.openFile('/clean.md', 'AKIA-raw-while-off', 'slot-a'))
+    const reset: unknown[][] = []
+    // RESET, not remove: a mounted observer must drop its result and refetch.
+    act(() => purgeDocumentBodiesForRedactionChange({ resetQueries: f => { reset.push(f.queryKey) } }))
+    expect(reset).toEqual([['file-read'], ['file-diff']])
+    expect(a.result.current.tabs.find(t => t.id === 'file:/clean.md')?.content).toBeUndefined()
+  })
+
   it('re-opening a file with unsaved edits focuses it and keeps the edited buffer', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
     act(() => result.current.openFile('/notes.md', 'on-disk', 'slot-a'))
     // The user types into the editor (MarkdownPanel patches content per edit).
     act(() => result.current.patchTab('file:/notes.md', { content: 'user edits' }))
     // Something re-opens the same path — another chip, the Files tab row.
-    act(() => result.current.openFile('/notes.md', 'on-disk'))
+    act(() => result.current.openFile('/notes.md', 'on-disk', 'slot-a'))
     expect(result.current.tabs).toHaveLength(1)
     expect(result.current.activeId).toBe('file:/notes.md')
     // The buffer survives; the on-disk bytes do not revert it silently.
@@ -99,7 +179,7 @@ describe('usePanelTabs', () => {
   })
 
   it('re-opening a dirty text tab keeps its edits reachable: the disk binary verdict is not applied to the preserved buffer', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot', mock.descriptors))
     act(() => result.current.openFile('/a.bin', 'x', 'slot', { binary: false }))
     act(() => result.current.patchTab('file:/a.bin', { content: 'x edited' }))
 
@@ -116,7 +196,7 @@ describe('usePanelTabs', () => {
   })
 
   it('re-opening a CLEAN tab does apply the incoming disk binary verdict', () => {
-    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    const { result } = renderHook(() => usePanelTabs('slot', mock.descriptors))
     act(() => result.current.openFile('/a.bin', 'x', 'slot', { binary: false }))
     // No unsaved edits (buffer === baseline): the disk read replaces both the
     // buffer and its verdict, so the sibling branch does stamp binary: true.
@@ -216,6 +296,108 @@ describe('usePanelTabs', () => {
     expect(result.current.activeTab?.modified).toBe('mod-2')
   })
 
+  describe('openWorkingTreeDiff (#9695 — coexisting diff tab)', () => {
+    it('opens a wtdiff tab keyed wtdiff:<path>, in diff mode, titled "name (working tree)"', () => {
+      const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => result.current.openWorkingTreeDiff('/src/App.tsx', 'body', 'slot-a'))
+      expect(result.current.activeTab).toMatchObject({
+        id: 'wtdiff:/src/App.tsx', kind: 'wtdiff', title: 'App.tsx (working tree)',
+        path: '/src/App.tsx', content: 'body', savedContent: 'body', diffMode: true, slot: 'slot-a',
+      })
+    })
+
+    it('titles the working-tree diff distinctly from the turn-snapshot diff tab', () => {
+      const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => result.current.openDiff('/src/App.tsx', 'mod', 'orig'))
+      act(() => result.current.openWorkingTreeDiff('/src/App.tsx', 'body', 'slot-a'))
+      const snapshot = result.current.tabs.find(t => t.id === 'diff:/src/App.tsx')
+      const wt = result.current.tabs.find(t => t.id === 'wtdiff:/src/App.tsx')
+      // Both diff tabs for one path must NOT share a title (#9695 UX): the
+      // snapshot reads "- Diff", the working-tree view reads "(working tree)".
+      expect(snapshot?.title).toBe('App.tsx - Diff')
+      expect(wt?.title).toBe('App.tsx (working tree)')
+      expect(snapshot?.title).not.toBe(wt?.title)
+    })
+
+    it('coexists with the plain file tab for the same path instead of replacing it', () => {
+      const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => result.current.openFile('/src/App.tsx', 'file-body', 'slot-a'))
+      act(() => result.current.openWorkingTreeDiff('/src/App.tsx', 'wt-body', 'slot-a'))
+      // Both tabs are present — this is the whole point of #9695.
+      expect(result.current.tabs.map(t => t.id)).toEqual(['file:/src/App.tsx', 'wtdiff:/src/App.tsx'])
+      expect(result.current.activeId).toBe('wtdiff:/src/App.tsx')
+      // Opening the file again does NOT touch the wtdiff tab, and vice versa.
+      act(() => result.current.openFile('/src/App.tsx', 'file-body-2', 'slot-a'))
+      expect(result.current.tabs.map(t => t.id)).toEqual(['file:/src/App.tsx', 'wtdiff:/src/App.tsx'])
+      expect(result.current.activeId).toBe('file:/src/App.tsx')
+    })
+
+    it('dedupes per path: re-opening the diff focuses the existing wtdiff tab', () => {
+      const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => result.current.openWorkingTreeDiff('/src/App.tsx', 'v1', 'slot-a'))
+      act(() => result.current.openView('files'))
+      act(() => result.current.openWorkingTreeDiff('/src/App.tsx', 'v2', 'slot-a'))
+      expect(result.current.tabs.filter(t => t.kind === 'wtdiff')).toHaveLength(1)
+      expect(result.current.activeId).toBe('wtdiff:/src/App.tsx')
+      expect(result.current.tabs.find(t => t.id === 'wtdiff:/src/App.tsx')?.content).toBe('v2')
+    })
+
+    it('is read-only: re-opening refreshes to the latest disk content (no editable buffer to preserve)', () => {
+      // A wtdiff tab is a read-only diff (SidePanel renders it with readOnly), so
+      // it never holds unsaved edits. Re-opening therefore adopts the newer disk
+      // read rather than preserving a buffer — there is no editable second buffer
+      // whose save could race the file tab's (#9695).
+      const { result } = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => result.current.openWorkingTreeDiff('/notes.md', 'disk', 'slot-a'))
+      act(() => result.current.openView('files'))
+      act(() => result.current.openWorkingTreeDiff('/notes.md', 'disk-newer', 'slot-a'))
+      const wt = result.current.tabs.find(t => t.id === 'wtdiff:/notes.md')
+      expect(wt?.content).toBe('disk-newer')
+      expect(wt?.savedContent).toBe('disk-newer') // clean: content === savedContent
+      expect(result.current.activeId).toBe('wtdiff:/notes.md')
+    })
+
+    it('is persisted (not dropped like a snapshot diff) and self-hydrates with its body stripped', () => {
+      vi.useFakeTimers()
+      try {
+        const { result } = renderHook(() => usePanelTabs('slot-wt', mock.descriptors))
+        act(() => result.current.openWorkingTreeDiff('/src/App.tsx', 'big-body', 'slot-wt'))
+        act(() => { vi.advanceTimersByTime(500) })
+        const stored = JSON.parse(localStorage.getItem('mc-panel-tabs:slot-wt') || 'null')
+        const tab = stored.tabs.find((t: { id: string }) => t.id === 'wtdiff:/src/App.tsx')
+        expect(tab).toBeTruthy() // persisted, unlike a `diff:` tab
+        expect(tab.kind).toBe('wtdiff')
+        expect(tab.diffMode).toBe(true)
+        expect(tab.content).toBeUndefined() // heavy body stripped, re-fetched on reload
+        expect(tab.savedContent).toBeUndefined()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('evictDocumentBodies treats a clean wtdiff like a file (strips body, keeps the tab)', () => {
+      const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => a.result.current.openWorkingTreeDiff('/clean.md', 'raw', 'slot-a'))
+      act(() => { evictDocumentBodies() })
+      const wt = a.result.current.tabs.find(t => t.id === 'wtdiff:/clean.md')
+      expect(wt).toBeTruthy() // NOT closed like a snapshot diff
+      expect(wt?.content).toBeUndefined()
+      expect(wt?.savedContent).toBeUndefined()
+    })
+
+    it('evictDocumentBodies drops a wtdiff body (read-only: nothing user-authored to preserve)', () => {
+      const a = renderHook(() => usePanelTabs('slot-a', mock.descriptors))
+      act(() => a.result.current.openWorkingTreeDiff('/disk.md', 'disk', 'slot-a'))
+      act(() => { evictDocumentBodies() })
+      // A wtdiff tab is read-only, so its body is never dirty and eviction can clear it
+      // like any other reloadable buffer; the tab stays open and refetches on reopen.
+      const wt = a.result.current.tabs.find(t => t.id === 'wtdiff:/disk.md')
+      expect(wt).toBeTruthy()
+      expect(wt?.content).toBeUndefined()
+      expect(wt?.savedContent).toBeUndefined()
+    })
+  })
+
   it('keeps a folder tab while files open in separate de-duplicated tabs', () => {
     const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
     act(() => result.current.openFolder('/Users/me/workspace/KiroCrew', 'chat-a'))
@@ -260,34 +442,81 @@ describe('usePanelTabs', () => {
     expect(result.current.tabs).toHaveLength(2)
   })
 
-  it('closeTab refocuses the left neighbor (then right, then null)', () => {
+  it('closeTab returns focus to the tab viewed before the closed one, not to its neighbour', () => {
     const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
     act(() => result.current.openView('files'))
     act(() => result.current.openView('logs'))
     act(() => result.current.openView('side'))
+    act(() => result.current.setActive('files'))
+    act(() => result.current.openView('git'))
+    // Strip: files, logs, side, git. Viewed last to first: git, files, side, logs.
+    expect(result.current.tabs.map(t => t.id)).toEqual(['files', 'logs', 'side', 'git'])
+
+    // Back to Files, which was viewed before Git; Side is only Git's neighbour.
+    act(() => result.current.closeTab('git'))
+    expect(result.current.activeId).toBe('files')
+    // Closing again keeps walking back: Side, not Files' neighbour Logs.
+    act(() => result.current.closeTab('files'))
     expect(result.current.activeId).toBe('side')
 
-    // Close active (rightmost) -> left neighbor takes focus.
-    act(() => result.current.closeTab('side'))
-    expect(result.current.activeId).toBe('logs')
-
     // Close a NON-active tab -> focus untouched.
-    act(() => result.current.closeTab('files'))
-    expect(result.current.activeId).toBe('logs')
+    act(() => result.current.closeTab('logs'))
+    expect(result.current.activeId).toBe('side')
 
     // Close the last tab -> nothing focused.
-    act(() => result.current.closeTab('logs'))
+    act(() => result.current.closeTab('side'))
     expect(result.current.tabs).toEqual([])
     expect(result.current.activeId).toBeNull()
   })
 
-  it('closeTab on the active leftmost tab focuses the (new) first tab', () => {
+  it('closeTab falls back to the left neighbour, then the right, when no other tab was viewed', () => {
     const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
-    act(() => result.current.openView('files'))
     act(() => result.current.openView('logs'))
-    act(() => result.current.setActive('files'))
-    act(() => result.current.closeTab('files'))
+    // `syncPinned` adds Changes and Files without focusing them: Logs alone was viewed.
+    act(() => result.current.syncPinned(['changes', 'files']))
+    const [changes, files, logs] = result.current.tabs
+    act(() => result.current.setOrder([changes, logs, files]))
     expect(result.current.activeId).toBe('logs')
+    act(() => result.current.closeTab('logs'))
+    expect(result.current.activeId).toBe('changes')
+    act(() => result.current.closeTab('changes'))
+    expect(result.current.activeId).toBe('files')
+  })
+
+  it('the focus history survives a reload, without the tabs storage drops', async () => {
+    const stored = (): { recent?: unknown[] } => JSON.parse(localStorage.getItem('mc-panel-tabs:chat-h')!)
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => usePanelTabs('chat-h', mock.descriptors))
+      act(() => result.current.openView('files'))
+      act(() => result.current.openView('logs'))
+      act(() => result.current.openDiff('/a.ts', 'new', 'old'))
+      act(() => result.current.setActive('files'))
+      act(() => result.current.openView('git'))
+      act(() => { vi.advanceTimersByTime(500) })
+      // A diff tab is not persisted, so its id leaves the stored history too.
+      expect(stored().recent).toEqual(['logs', 'files', 'git'])
+    } finally {
+      vi.useRealTimers()
+    }
+    // A history written by another build is read as ids only.
+    localStorage.setItem('mc-panel-tabs:chat-h', JSON.stringify({ ...stored(), recent: ['logs', 7, 'files', 'git'] }))
+    vi.resetModules()
+    const fresh = await import('../hooks/usePanelTabs')
+    vi.useFakeTimers()
+    try {
+      const { result } = renderHook(() => fresh.usePanelTabs('chat-h', mock.descriptors))
+      expect(result.current.activeId).toBe('git')
+      act(() => result.current.closeTab('git'))
+      expect(result.current.activeId).toBe('files')
+      act(() => result.current.closeTab('files'))
+      expect(result.current.activeId).toBe('logs')
+      act(() => { vi.advanceTimersByTime(500) })
+      expect(stored().recent).toEqual(['logs'])
+    } finally {
+      vi.useRealTimers()
+      fresh.__resetPanelTabs()
+    }
   })
 
   it('closeAll clears tabs and focus; setOrder replaces the strip order wholesale', () => {
@@ -507,6 +736,132 @@ describe('usePanelTabs — per-slot isolation', () => {
     expect(result.current.tabs.map(t => t.id)).toEqual(['logs', 'side'])
   })
 
+  it('syncPinned pins leading views ahead of the block, and keeps one that leaves as an ordinary tab', () => {
+    const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
+    act(() => result.current.openView('logs'))
+    act(() => result.current.syncPinned(['changes', 'artifacts', 'files'], ['summary']))
+    expect(result.current.tabs.map(t => t.id)).toEqual(['summary', 'changes', 'artifacts', 'files', 'logs'])
+    act(() => result.current.syncPinned(['changes', 'artifacts', 'files']))
+    expect(result.current.tabs.map(t => t.id)).toEqual(['changes', 'artifacts', 'files', 'summary', 'logs'])
+  })
+
+  it('takes a plain show once, and a stop re-arms it', () => {
+    renderHook(() => usePanelTabs('plain-slot', mock.descriptors))
+    // Never shown in this page session: a plain open (a reload).
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    // Once per show: a remount of the same show lands nothing.
+    expect(takePlainPanelShow('plain-slot')).toBe(false)
+    notePanelStoppedShowing('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+  })
+
+  it('ends a show when the panel reports another chat\'s strip', () => {
+    notePanelShown('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    notePanelShown('other-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+  })
+
+  it('ends nothing when the panel reports the same strip again', () => {
+    notePanelShown('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    notePanelShown('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(false)
+  })
+
+  it('ends a show when the panel reports no strip, as when it closes', () => {
+    notePanelShown('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    notePanelShown(null)
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+  })
+
+  it('ends a show when the first report after the chat page was away names another chat', () => {
+    // The page's last report before it unmounted.
+    notePanelShown('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    // The chat changed with no page mounted, so nothing reported in between:
+    // the page mounts again on the other chat and reports it first.
+    notePanelShown('other-slot')
+    expect(takePlainPanelShow('other-slot')).toBe(true)
+    // Back to the first chat on the page: a new show, so it lands.
+    notePanelShown('plain-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+  })
+
+  it('forgets the shown strip on reset', () => {
+    notePanelShown('plain-slot')
+    __resetPanelTabs()
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    // Nothing is shown after the reset, so this report ends no show.
+    notePanelShown('other-slot')
+    expect(takePlainPanelShow('plain-slot')).toBe(false)
+  })
+
+  it('counts asked-for tabs, the one already shown included, but not store writes or automatic opens', () => {
+    const { result } = renderHook(() => usePanelTabs('plain-slot', mock.descriptors))
+    // syncPinned writes a fresh strip's focus on its own: that is no choice.
+    act(() => result.current.syncPinned(['changes', 'artifacts', 'files']))
+    expect(result.current.activeId).toBe('changes')
+    // A discovery tab (Git, Changes or Issues for a new link) is not a choice either.
+    act(() => result.current.openView('git', { automatic: true }))
+    act(() => result.current.openView('issues', { automatic: true }))
+    expect(takePlainPanelShow('plain-slot')).toBe(true)
+    // Asking again for the tab already shown still decides the tab.
+    notePanelStoppedShowing('plain-slot')
+    act(() => result.current.setActive('issues'))
+    expect(result.current.activeId).toBe('issues')
+    expect(takePlainPanelShow('plain-slot')).toBe(false)
+    notePanelStoppedShowing('plain-slot')
+    act(() => result.current.openView('logs'))
+    expect(takePlainPanelShow('plain-slot')).toBe(false)
+    // A view opened by slot (a session row's chip, a first pin) is a choice too.
+    notePanelStoppedShowing('plain-slot')
+    act(() => openPanelView('plain-slot', 'changes'))
+    expect(takePlainPanelShow('plain-slot')).toBe(false)
+  })
+
+  /** One call of each tab opener on 'choice-slot': the hook's `open*` callbacks
+   *  and the module's `open*` exports. Every one opens a tab someone asked for,
+   *  so it must count as a tab choice (see `takePlainPanelShow`). */
+  const OPENER_CALLS: Record<string, (tabs: ReturnType<typeof usePanelTabs>) => unknown> = {
+    openView: t => t.openView('logs'),
+    openPanelTab: t => t.openPanelTab(demoTab),
+    openTerminal: t => t.openTerminal(),
+    openFile: t => t.openFile('/repo/a.md', '# a'),
+    openWorkingTreeDiff: t => t.openWorkingTreeDiff('/repo/a.md', '# a'),
+    openDiff: t => t.openDiff('/repo/a.md', '# b', '# a'),
+    openArtifact: t => t.openArtifact({ slug: 'doc', kind: 'markdown' }, '# doc'),
+    openFolder: t => t.openFolder('/repo/src'),
+    openApp: t => t.openApp('tool-call-1', 'App'),
+    openPanelView: () => openPanelView('choice-slot', 'issues'),
+  }
+
+  it('counts every exported tab opener as a tab choice', () => {
+    const { result } = renderHook(() => usePanelTabs('choice-slot', mock.descriptors))
+    const names = [...Object.entries(result.current), ...Object.entries(panelTabsModule)]
+      .filter(([name, value]) => name.startsWith('open') && typeof value === 'function')
+      .map(([name]) => name)
+    expect(names.filter(name => !(name in OPENER_CALLS)),
+      'usePanelTabs exports tab openers this test does not classify. Add each one to OPENER_CALLS, '
+      + 'so this test checks that it counts as a tab choice. An opener that must not count needs its own case here.',
+    ).toEqual([])
+    expect(Object.keys(OPENER_CALLS).filter(name => !names.includes(name)),
+      'OPENER_CALLS lists openers that usePanelTabs no longer exports: remove them.',
+    ).toEqual([])
+    // An automatic open (a tab created for discovery) is not a choice, so a
+    // stopped show stays plain.
+    notePanelStoppedShowing('choice-slot')
+    act(() => result.current.openView('git', { automatic: true }))
+    expect(result.current.activeId).toBe('git')
+    expect(takePlainPanelShow('choice-slot')).toBe(true)
+    for (const name of names) {
+      notePanelStoppedShowing('choice-slot')
+      act(() => { OPENER_CALLS[name](result.current) })
+      expect.soft(takePlainPanelShow('choice-slot'), `${name} must count as a tab choice`).toBe(false)
+    }
+  })
+
   it('openView("git") creates a singleton tab titled "Git"', () => {
     const { result } = renderHook(() => usePanelTabs(null, mock.descriptors))
     act(() => result.current.openView('git'))
@@ -604,6 +959,31 @@ describe('openPanelView', () => {
       mock.descriptors = []
       rerender()
       expect(result.current.tabs.map(t => t.kind)).toEqual(['files'])
+      expect(result.current.activeId).toBe('files')
+    })
+
+    it('closeTab skips a tab whose app is gone and keeps it stored for when the app returns', () => {
+      mock.descriptors = [demoTab]
+      const { result, rerender } = renderHook(() => usePanelTabs('slot-skip', mock.descriptors))
+      act(() => result.current.openView('files'))
+      act(() => result.current.openView('logs'))
+      act(() => result.current.setActive('files'))
+      act(() => result.current.openPanelTab(demoTab))
+      act(() => result.current.openView('git'))
+      // Viewed last to first: Git, the app tab, Files, Logs. Then the app goes away.
+      mock.descriptors = []
+      rerender()
+      expect(result.current.tabs.map(t => t.id)).toEqual(['files', 'logs', 'git'])
+
+      // Back to Files, the last viewed tab the strip can show. Returning to the
+      // hidden app tab would show Logs, the last visible tab, instead.
+      act(() => result.current.closeTab('git'))
+      expect(result.current.activeId).toBe('files')
+
+      // The app comes back: its tab is still stored, and focus stays on Files.
+      mock.descriptors = [demoTab]
+      rerender()
+      expect(result.current.tabs.map(t => t.id)).toEqual(['files', 'logs', demoTab.kind])
       expect(result.current.activeId).toBe('files')
     })
 

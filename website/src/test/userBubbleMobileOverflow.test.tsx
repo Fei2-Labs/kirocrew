@@ -9,13 +9,17 @@
  * viewport-relative AND every box in the chain has to carry one, because a
  * percentage cap resolves against the parent's used width.
  *
+ * The cap is now the column itself (`max-w-full`, the same cap the row wrapper
+ * and the root carry), so the bubble follows Settings → Chat → Content Width
+ * like agent output does (#8398) and a phone viewport still caps it at 100%.
+ *
  * happy-dom performs no layout, so these pin the class contract; the
  * narrow-width measurement lives in the capture script beside them.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import React from 'react'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import userEvent from '@testing-library/user-event'
@@ -23,11 +27,20 @@ import UserMessage from '../pages/chat/UserMessage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const src = (rel: string) => readFileSync(resolve(HERE, '..', rel), 'utf8')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the ChatPage row reads the page and those owners.
+const chatPageSource = () => [
+  src('pages/ChatPage.tsx'),
+  ...readdirSync(resolve(HERE, '..', 'pages/chat/page')).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => src(`pages/chat/page/${f}`)),
+  ...readdirSync(resolve(HERE, '..', 'pages')).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => src(`pages/${f}`)),
+].join('\n')
+
+/** Any arbitrary-value width cap in pixels: `max-w-[550px]`, `max-w-[min(550px,100%)]`, … */
+const PIXEL_CAP = /max-w-\[[^\]]*\d+px[^\]]*\]/
 
 /** Both hosts render the same UserMessage inside the same wrapper pair. */
 const HOSTS = [
-  ['ChatPage.tsx', 'pages/ChatPage.tsx'],
-  ['app-sdk/ChatMessageList.tsx', 'app-sdk/ChatMessageList.tsx'],
+  ['ChatPage.tsx', chatPageSource],
+  ['app-sdk/ChatMessageList.tsx', () => src('app-sdk/ChatMessageList.tsx')],
 ] as const
 
 function renderBubble(props: Partial<React.ComponentProps<typeof UserMessage>> = {}) {
@@ -52,10 +65,11 @@ describe('user bubble stays inside a phone viewport', () => {
   it('caps the bubble against the viewport, not at a fixed 550px', () => {
     const { container } = renderBubble()
     const bubble = container.querySelector('.message-bubble')!
-    expect(bubble.className).toContain('max-w-[min(550px,100%)]')
+    expect(bubble.className).toContain('max-w-full')
     // A bare fixed cap is the defect: on a 390px viewport it holds the bubble
-    // at 550px and pushes its left edge off-screen.
-    expect(bubble.className).not.toMatch(/max-w-\[550px\]/)
+    // at 550px and pushes its left edge off-screen. Any pixel arm is one:
+    // `min(550px,100%)` kept the phone safe but ignored Content Width (#8398).
+    expect(bubble.className).not.toMatch(PIXEL_CAP)
   })
 
   it('caps the edit-mode box the same way', async () => {
@@ -63,8 +77,8 @@ describe('user bubble stays inside a phone viewport', () => {
     const { container } = renderBubble({ canEdit: true, onEditResend: () => {}, messageIndex: 0, messageTs: '1' })
     await user.click(screen.getByLabelText('Edit & Resend'))
     const box = container.querySelector('.edit-grow')!
-    expect(box.className).toContain('max-w-[min(550px,100%)]')
-    expect(box.className).not.toMatch(/max-w-\[550px\]/)
+    expect(box.className).toContain('max-w-full')
+    expect(box.className).not.toMatch(PIXEL_CAP)
   })
 
   it('caps its own wrapper, in both the read-only and the edit branch', async () => {
@@ -79,15 +93,16 @@ describe('user bubble stays inside a phone viewport', () => {
     const { container } = renderBubble({ meta: { steer: true } })
     // An uncapped box anywhere in the chain re-breaks the whole chain, and this
     // one only exists for a steered message. The wrapper carries the bubble's
-    // own min(550px,100%) cap — the 100% arm is what keeps a phone viewport
-    // capped, and the 550px arm is what keeps a long steered bubble on the
-    // shared end edge in a wide column.
+    // own cap — the column (`max-w-full`), which is what keeps a phone viewport
+    // capped and what keeps a long steered bubble on the shared end edge in a
+    // wide column: wrapper and bubble resolve to the same width.
     const wrapper = container.querySelector('[data-role="user"] .relative')!
-    expect(wrapper.className).toContain('max-w-[min(550px,100%)]')
+    expect(wrapper.className).toContain('max-w-full')
+    expect(wrapper.className).not.toMatch(PIXEL_CAP)
   })
 
-  it.each(HOSTS)('%s caps the transcript row wrapper it shares with the bubble', (_label, rel) => {
-    const text = src(rel)
+  it.each(HOSTS)('%s caps the transcript row wrapper it shares with the bubble', (_label, read) => {
+    const text = read()
     const wrappers = text.match(/flex flex-col gap-0\.5 min-w-0 overflow-hidden[^`'"]*/g) ?? []
     expect(wrappers.length).toBeGreaterThan(0)
     for (const w of wrappers) expect(w).toContain('max-w-full')

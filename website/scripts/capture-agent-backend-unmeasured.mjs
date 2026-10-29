@@ -10,10 +10,11 @@
  * Every `capabilities` row below is copied verbatim from what
  * `backend_cards.card_payload()` emits for that harness on this revision, so a frame
  * documents the answer the server actually gives rather than a shape hand-written to
- * make a point. pi and goose are the two harnesses whose `/compact` cell is declared
- * unmeasured (`DECLARED_UNMEASURED`, from `ACP_BACKENDS_COMPACT`'s own "unclassified"
- * words), and kiro-cli sits beside them as the all-measured comparison — which is what
- * makes the three marks comparable in one read.
+ * make a point. `DECLARED_UNMEASURED` is empty on this revision, so no live card has an
+ * unmeasured cell. The pi and goose rows are each card as it read before that harness's
+ * `/compact` capture, kept so the frames still show the third mark, and kiro-cli sits
+ * beside them as the all-measured comparison — which is what makes the three marks
+ * comparable in one read.
  *
  * Usage: node scripts/capture-agent-backend-unmeasured.mjs [outDir]
  */
@@ -27,13 +28,11 @@ const PROJECT = '/home/user/workspace/KiroCrew'
 
 mkdirSync(OUT, { recursive: true })
 
-/** `card_payload("pi")` on this revision. */
+/** `card_payload("pi")` before its `/compact` capture. */
 const PI_CAPABILITIES = [
   { id: 'crew_tools', available: false, measured: true, unmeasured_reason: '' },
   { id: 'member_thread_tools', available: false, measured: true, unmeasured_reason: '' },
-  { id: 'member_saved_agent', available: false, measured: true, unmeasured_reason: '' },
   { id: 'side_chat_tools', available: false, measured: true, unmeasured_reason: '' },
-  { id: 'subagent_continuation', available: false, measured: true, unmeasured_reason: '' },
   { id: 'mid_turn_steer', available: false, measured: true, unmeasured_reason: '' },
   {
     id: 'manual_compact',
@@ -43,10 +42,9 @@ const PI_CAPABILITIES = [
   },
   { id: 'reasoning_effort', available: false, measured: true, unmeasured_reason: '' },
   { id: 'model_switch', available: true, measured: true, unmeasured_reason: '' },
-  { id: 'markdown_agents', available: false, measured: true, unmeasured_reason: '' },
 ]
 
-/** `card_payload("goose")` on this revision: same unmeasured cell, more available. */
+/** `card_payload("goose")` before its `/compact` capture: pi's unmeasured cell, more available. */
 const GOOSE_CAPABILITIES = PI_CAPABILITIES.map(line =>
   line.id === 'crew_tools' ? { ...line, available: true } : line,
 )
@@ -54,7 +52,7 @@ const GOOSE_CAPABILITIES = PI_CAPABILITIES.map(line =>
 /** `card_payload("")` — kiro-cli, measured on every line. */
 const KIRO_CAPABILITIES = PI_CAPABILITIES.map(line => ({
   ...line,
-  available: !['member_thread_tools', 'markdown_agents'].includes(line.id),
+  available: line.id !== 'member_thread_tools',
   measured: true,
   unmeasured_reason: '',
 }))
@@ -149,7 +147,9 @@ await page.addInitScript(() => {
   localStorage.setItem('mc-onboarded', '1')
 })
 
-const heading = () => page.getByText('Agent Backend', { exact: true }).first()
+// The card's own title, in Settings > Agent Harness (`settings.tabs.agent.label`);
+// the sidebar repeats the label, hence `.first()` for the page title.
+const heading = () => page.getByText('Agent Harness', { exact: true }).first()
 
 const shoot = async name => {
   await heading().waitFor({ timeout: 20000 })
@@ -157,12 +157,18 @@ const shoot = async name => {
   await page.screenshot({ path: `${OUT}/${name}` })
 }
 
-/** Put one harness's detail on screen. Highlighting is not selecting. */
+/**
+ * Put one harness's detail on screen. The rows are one radio group laid out like
+ * first-run setup's picker: checking a row opens its detail under itself, and
+ * the config changes only through the detail's own Use button — so checking is
+ * looking, not switching.
+ */
 const highlight = async name => {
-  await page.getByRole('tab', { name }).click()
+  await page.getByRole('radio', { name }).check()
+  await page.getByTestId('agent-harness-detail').waitFor({ timeout: 20000 })
 }
 
-await page.goto(`${base}/developer?tab=agent-backend`, { waitUntil: 'domcontentloaded' })
+await page.goto(`${base}/settings/agent`, { waitUntil: 'domcontentloaded' })
 
 // Every string the frame is EVIDENCE for is waited on individually, so the shutter
 // cannot fire on a half-rendered card or document an older draft of the copy.
@@ -185,7 +191,7 @@ await shoot('agent-backend-unmeasured-goose.png')
 // The comparison frame: a harness measured on every line, so the reader can see that
 // the third mark is a third mark rather than a restyled cross.
 await highlight('Kiro CLI')
-await page.getByText('supports 8 of 10 features', { exact: false }).first().waitFor({
+await page.getByText('supports 6 of 7 features', { exact: false }).first().waitFor({
   timeout: 20000,
 })
 await shoot('agent-backend-unmeasured-kiro-comparison.png')

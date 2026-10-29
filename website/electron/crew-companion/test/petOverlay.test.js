@@ -25,20 +25,31 @@ function stubElectron() {
       this.destroyed = false;
       this.ignoreMouse = null;
       this.focusable = true;
+      this.focusableCalls = [];
+      this.focusCalls = 0;
+      this.blurCalls = 0;
       this.workspaces = null;
       this.loadedUrl = "";
       this.shown = false;
       this._events = {};
+      this._webContentsEvents = {};
       this.sent = [];
       // did-finish-load fires synchronously so the activation handshake in
-      // createOverlayFor runs and its set-active sends are observable.
+      // createOverlayFor runs and its set-active sends are observable. Other
+      // navigation events stay controllable for the error-document tests.
       this.webContents = {
-        on: (ev, cb) => { if (ev === "did-finish-load") cb(); },
+        on: (ev, cb) => {
+          this._webContentsEvents[ev] = cb;
+          if (ev === "did-finish-load") cb();
+        },
+        emit: (ev, ...args) => this._webContentsEvents[ev]?.(...args),
         send: (ch, ...args) => this.sent.push({ ch, args }),
       };
       created.push(this);
     }
-    setFocusable(v) { this.focusable = v; }
+    setFocusable(v) { this.focusable = v; this.focusableCalls.push(v); }
+    focus() { this.focusCalls += 1; }
+    blur() { this.blurCalls += 1; }
     setContentProtection(v) { this.contentProtection = v; }
     setIgnoreMouseEvents(ignore, opts) { this.ignoreMouse = { ignore, opts }; }
     setVisibleOnAllWorkspaces(v, opts) { this.workspaces = { v, opts }; }
@@ -46,6 +57,7 @@ function stubElectron() {
     once(ev, cb) { this._events[ev] = cb; }
     on(ev, cb) { this._events[ev] = cb; }
     showInactive() { this.shown = true; }
+    hide() { this.shown = false; }
     isVisible() { return this.shown; }
     isDestroyed() { return this.destroyed; }
     destroy() { this.destroyed = true; }
@@ -144,6 +156,13 @@ async function settle() {
   for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 10));
 }
 
+/** Run the rest of test `t` as if on `platform`; restored when `t` ends. */
+function forcePlatform(t, platform) {
+  const orig = process.platform;
+  Object.defineProperty(process, "platform", { value: platform, configurable: true });
+  t.after(() => Object.defineProperty(process, "platform", { value: orig, configurable: true }));
+}
+
 // ── the overlay window ──────────────────────────────────────────────────────
 
 test("opens one overlay per display, covering each display's full bounds", () => {
@@ -179,7 +198,9 @@ test("the overlay refuses mouse input by default, with forwarding on", () => {
   }
 });
 
-test("the overlay is transparent, frameless, always on top and not focusable", () => {
+test("the overlay is transparent, frameless, always on top and not focusable", (t) => {
+  // Non-focusable is the macOS/Linux shape; Windows is pinned separately below.
+  forcePlatform(t, "darwin");
   const stub = stubElectron();
   try {
     const { overlay } = loadModules();
@@ -252,6 +273,123 @@ test("the overlay accepts the first mouse click, or nothing in it can be clicked
   }
 });
 
+// ── Windows: the overlay must stay activatable (#11865) ─────────────────────
+//
+// On Windows setFocusable(false) makes Chromium answer WM_MOUSEACTIVATE with
+// MA_NOACTIVATEANDEAT, which discards every mouse button-down. No left click,
+// drag or menu item could ever work, and the full-display menu hitbox could not
+// be dismissed, locking the whole display. These pin that the overlay is never
+// made non-activatable there, by creation or by the panel's focusable IPC.
+
+/** The display overlays only; `created` also holds the hidden brain window. */
+const displayOverlays = (stub) => stub.created.filter((w) => w.opts.transparent === true);
+
+test("only Windows keeps the overlay activatable", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    assert.strictEqual(overlay.overlayMayBeNonActivatable("win32"), false);
+    for (const platform of ["darwin", "linux"]) {
+      assert.strictEqual(overlay.overlayMayBeNonActivatable(platform), true, platform);
+    }
+  } finally {
+    stub.restore();
+  }
+});
+
+test("on Windows no overlay is made non-focusable at creation", (t) => {
+  forcePlatform(t, "win32");
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "");
+    overlay.openPetWindow();
+
+    assert.strictEqual(displayOverlays(stub).length, 2, "one overlay per display");
+    for (const win of displayOverlays(stub)) {
+      assert.deepStrictEqual(win.focusableCalls, [], "setFocusable never called");
+      // The rest of the overlay contract is unchanged: still click-through by
+      // default, still off the taskbar, still shown without taking focus.
+      assert.deepStrictEqual(win.ignoreMouse, { ignore: true, opts: { forward: true } });
+      assert.strictEqual(win.opts.skipTaskbar, true);
+      assert.strictEqual(win.shown, true);
+      assert.strictEqual(win.focusCalls, 0, "appearing does not steal focus");
+    }
+  } finally {
+    stub.restore();
+  }
+});
+
+for (const platform of ["darwin", "linux"]) {
+  test(`on ${platform} every overlay is still made non-focusable`, (t) => {
+    forcePlatform(t, platform);
+    const stub = stubElectron();
+    try {
+      const { overlay } = loadModules();
+      overlay.setOverlayTarget("http://localhost:5476", "");
+      overlay.openPetWindow();
+      assert.strictEqual(displayOverlays(stub).length, 2);
+      for (const win of displayOverlays(stub)) {
+        assert.deepStrictEqual(win.focusableCalls, [false]);
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+}
+
+function initForFocusableIpc(stub) {
+  const { overlay, index } = loadModules();
+  overlay.setOverlayTarget("http://localhost:5476", "cred");
+  overlay.openPetWindow();
+  index.initCrewCompanion({
+    backendUrl: "http://127.0.0.1:9",
+    fetchLocalToken: async () => "cred",
+    glog: () => {},
+  });
+  const win = displayOverlays(stub)[0];
+  win.focusableCalls.length = 0;
+  const send = (focusable) =>
+    stub.ipcHandlers["crew-companion:focusable"]({ sender: win.webContents }, focusable);
+  return { index, win, send };
+}
+
+test("on Windows the panel's focusable IPC focuses and blurs without setFocusable", (t) => {
+  forcePlatform(t, "win32");
+  const stub = stubElectron();
+  try {
+    const { index, win, send } = initForFocusableIpc(stub);
+
+    send(true);
+    assert.strictEqual(win.focusCalls, 1, "panel open moves focus to the overlay");
+    send(false);
+    assert.strictEqual(win.blurCalls, 1, "panel close hands focus back");
+    // setFocusable(false) would re-break every click; setFocusable(true) would
+    // also clear skipTaskbar and put the overlay in the taskbar.
+    assert.deepStrictEqual(win.focusableCalls, []);
+    index.shutdownCrewCompanion();
+  } finally {
+    stub.restore();
+  }
+});
+
+test("on macOS the panel's focusable IPC still toggles setFocusable", (t) => {
+  forcePlatform(t, "darwin");
+  const stub = stubElectron();
+  try {
+    const { index, win, send } = initForFocusableIpc(stub);
+
+    send(true);
+    send(false);
+    assert.deepStrictEqual(win.focusableCalls, [true, false]);
+    assert.strictEqual(win.focusCalls, 1);
+    assert.strictEqual(win.blurCalls, 0);
+    index.shutdownCrewCompanion();
+  } finally {
+    stub.restore();
+  }
+});
+
 test("opening twice does not create a second overlay per display", () => {
   const stub = stubElectron();
   try {
@@ -292,7 +430,192 @@ test("no overlay is opened before a gateway origin is known", () => {
   }
 });
 
+test("a gateway error document stays hidden until a healthy reload", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "stale");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+    assert.strictEqual(win.shown, true, "the healthy companion starts visible");
+    win.setIgnoreMouseEvents(false);
+
+    win.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      403,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(win.shown, false, "the full-display error document stays hidden");
+    assert.deepStrictEqual(
+      win.ignoreMouse,
+      { ignore: true, opts: { forward: true } },
+      "a failed full-display overlay must stop intercepting clicks immediately",
+    );
+    assert.strictEqual(overlay._hasBlankedOverlay(), true, "the failed overlay is recoverable");
+
+    overlay.setOverlayTarget("http://localhost:5476", "fresh");
+    assert.strictEqual(overlay.rearmBlankedCompanionWindows(), 1, "only the failed overlay reloads");
+    assert.match(win.loadedUrl, /[?&]token=fresh(?:&|$)/, "the reload uses the accepted credential");
+
+    win.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      200,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(win.shown, true, "a healthy companion document may reveal the overlay");
+    assert.strictEqual(overlay._hasBlankedOverlay(), false, "success clears the failure latch");
+  } finally {
+    stub.restore();
+  }
+});
+
+test("a main-frame transport failure hides the overlay without hiding for harmless failures", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "cred");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+
+    win.webContents.emit(
+      "did-fail-load",
+      {},
+      -106,
+      "ERR_INTERNET_DISCONNECTED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      false,
+    );
+    assert.strictEqual(win.shown, true, "a sub-frame failure leaves the companion visible");
+    assert.strictEqual(overlay._hasBlankedOverlay(), false);
+
+    win.webContents.emit(
+      "did-fail-load",
+      {},
+      -3,
+      "ERR_ABORTED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      true,
+    );
+    assert.strictEqual(win.shown, true, "a superseded load is not an error document");
+    assert.strictEqual(overlay._hasBlankedOverlay(), false);
+
+    win.webContents.emit(
+      "did-fail-load",
+      {},
+      -102,
+      "ERR_CONNECTION_REFUSED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      true,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(win.shown, false, "Chromium's full-display error document stays hidden");
+    assert.strictEqual(overlay._hasBlankedOverlay(), true);
+  } finally {
+    stub.restore();
+  }
+});
+
+test("the hidden notification owner stays inert on failure and re-arms after a healthy probe", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "stale");
+    overlay.openPetWindow();
+    const brain = stub.created[2];
+    assert.deepStrictEqual(
+      brain.sent.map(({ ch }) => ch),
+      ["crew-companion:set-owner", "crew-companion:set-active"],
+      "the healthy brain initializes as notification owner",
+    );
+
+    brain.sent.length = 0;
+    brain.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      403,
+    );
+    brain.webContents.emit("did-finish-load");
+    assert.deepStrictEqual(brain.sent, [], "an HTTP error document cannot become the owner");
+
+    overlay.setOverlayTarget("http://localhost:5476", "fresh");
+    assert.strictEqual(
+      overlay.rearmBlankedCompanionWindows(),
+      1,
+      "the failed brain reloads without reopening healthy overlays",
+    );
+    assert.match(brain.loadedUrl, /[?&]token=fresh(?:&|$)/);
+    brain.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      200,
+    );
+    brain.webContents.emit("did-finish-load");
+    assert.deepStrictEqual(
+      brain.sent.map(({ ch }) => ch),
+      ["crew-companion:set-owner", "crew-companion:set-active"],
+      "the recovered document resumes notification ownership",
+    );
+
+    brain.sent.length = 0;
+    brain.webContents.emit(
+      "did-fail-load",
+      {},
+      -102,
+      "ERR_CONNECTION_REFUSED",
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      true,
+    );
+    brain.webContents.emit("did-finish-load");
+    assert.deepStrictEqual(brain.sent, [], "a transport error document also stays inert");
+
+    overlay.setOverlayTarget("http://localhost:5476", "newer");
+    assert.strictEqual(overlay.rearmBlankedCompanionWindows(), 1);
+    assert.match(brain.loadedUrl, /[?&]token=newer(?:&|$)/);
+  } finally {
+    stub.restore();
+  }
+});
+
 // ── the page URL ────────────────────────────────────────────────────────────
+
+test("a cookie-authenticated target re-arms with a bare URL; no credential re-arms nothing", () => {
+  const stub = stubElectron();
+  try {
+    const { overlay } = loadModules();
+    overlay.setOverlayTarget("http://localhost:5476", "link");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+    win.webContents.emit(
+      "did-navigate",
+      {},
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      403,
+    );
+    win.webContents.emit("did-finish-load");
+    assert.strictEqual(overlay._hasBlankedOverlay(), true);
+
+    // Neither a URL credential nor a cookie: the probe was never answered.
+    overlay.setOverlayTarget("http://localhost:5476", "", false);
+    assert.strictEqual(overlay.rearmBlankedCompanionWindows(), 0);
+
+    // A borrowed session cookie answered the probe: reload bare, ride the cookie.
+    overlay.setOverlayTarget("http://localhost:5476", "", true);
+    assert.strictEqual(overlay.rearmBlankedCompanionWindows(), 1);
+    assert.strictEqual(
+      win.loadedUrl,
+      "http://localhost:5476/app-windows/crew-companion/pet.html",
+      "a cookie credential is never put on the page URL",
+    );
+  } finally {
+    stub.restore();
+  }
+});
 
 test("the page URL mirrors the file layout, and omits an empty credential", () => {
   const stub = stubElectron();
@@ -313,6 +636,54 @@ test("the page URL mirrors the file layout, and omits an empty credential", () =
 
 // ── the reconcile rule ──────────────────────────────────────────────────────
 
+test("a successful reconcile re-arms failed companion windows with the accepted credential", async () => {
+  const stub = stubElectron();
+  const server = require("node:http").createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([{ name: "crew-companion", enabled: true }]));
+  });
+  let index = null;
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const origin = `http://127.0.0.1:${server.address().port}`;
+    const loaded = loadModules();
+    const { overlay } = loaded;
+    index = loaded.index;
+    overlay.setOverlayTarget(origin, "stale");
+    overlay.openPetWindow();
+    const win = stub.created[0];
+    const brain = stub.created[2];
+    for (const failed of [win, brain]) {
+      failed.webContents.emit(
+        "did-fail-load",
+        {},
+        -102,
+        "ERR_CONNECTION_REFUSED",
+        `${origin}/app-windows/crew-companion/pet.html`,
+        true,
+      );
+    }
+    assert.strictEqual(overlay._hasBlankedOverlay(), true, "the failed overlay starts latched");
+
+    index.initCrewCompanion({
+      backendUrl: origin,
+      fetchGatewayAuth: async () => ({ value: "fresh" }),
+      glog: () => {},
+    });
+    await settle();
+
+    assert.match(win.loadedUrl, /[?&]token=fresh(?:&|$)/, "the reconcile reloads the overlay");
+    assert.match(brain.loadedUrl, /[?&]token=fresh(?:&|$)/, "the reconcile reloads the owner");
+  } finally {
+    index?.shutdownCrewCompanion();
+    await new Promise((resolve) => server.close(resolve));
+    stub.restore();
+  }
+});
+
 test("an inconclusive probe leaves the windows exactly as they are", async () => {
   const stub = stubElectron();
   try {
@@ -326,7 +697,7 @@ test("an inconclusive probe leaves the windows exactly as they are", async () =>
     // reappear every few seconds during an ordinary restart.
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "cred",
+      fetchGatewayAuth: async () => ({ value: "cred" }),
       glog: () => {},
     });
     await settle();
@@ -348,7 +719,7 @@ test("an inconclusive probe does not OPEN a companion either", async () => {
 
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "cred",
+      fetchGatewayAuth: async () => ({ value: "cred" }),
       glog: () => {},
     });
     await settle();
@@ -378,7 +749,7 @@ test("no credential is unknown, not disabled", async () => {
 
     index.initCrewCompanion({
       backendUrl: "http://localhost:5476",
-      fetchLocalToken: async () => "", // cannot ask
+      fetchGatewayAuth: async () => ({ value: "" }), // cannot ask
       glog: () => {},
     });
     await settle();
@@ -397,7 +768,7 @@ test("shutdown closes every overlay", async () => {
     overlay.openPetWindow();
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "cred",
+      fetchGatewayAuth: async () => ({ value: "cred" }),
       glog: () => {},
     });
     index.shutdownCrewCompanion();
@@ -507,7 +878,7 @@ test("open-session surfaces the dashboard and routes it to that session", () => 
     const win = fakeDashboard({ minimized: true });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -529,7 +900,7 @@ test("open-session encodes the slot key rather than splicing it into the query",
     const win = fakeDashboard();
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -551,7 +922,7 @@ test("an approval with no owning session raises the dashboard but routes nowhere
     const win = fakeDashboard();
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -574,7 +945,7 @@ test("open-session refuses when there is no dashboard window to surface", () => 
     const { index } = loadModules();
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => null,
     });
@@ -595,7 +966,7 @@ test("a routing request that cannot be delivered fails whole, without raising", 
     const win = fakeDashboard({ viewGone: true });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -619,7 +990,7 @@ test("the renderer's open-session channel answers rather than fires and forgets"
     const win = fakeDashboard();
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -647,7 +1018,7 @@ test("re-initialising does not throw on the already-registered channel", () => {
     const { index } = loadModules();
     const deps = {
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => null,
     };
@@ -670,7 +1041,7 @@ test("open-session refuses while the view shows the boot/recovery splash", () =>
     const win = fakeDashboard({ url: "file:///C:/app/electron/loading.html" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -696,7 +1067,7 @@ test("open-session refuses while the view is still blank", () => {
     const win = fakeDashboard({ url: "" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -716,7 +1087,7 @@ test("open-session refuses when the view holds a foreign origin", () => {
     const win = fakeDashboard({ url: "https://example.com/chat?sid=chat-7" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -742,7 +1113,7 @@ test("open-session still routes when the dashboard is on an in-app route", () =>
     const win = fakeDashboard({ url: "http://127.0.0.1:9/system?token=abc123" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -770,7 +1141,7 @@ test("open-session with no session key surfaces a splash window but does NOT ack
     const win = fakeDashboard({ url: "file:///C:/app/electron/loading.html" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -799,7 +1170,7 @@ test("a slot-less approval is refused when the window shows a foreign origin", (
     const win = fakeDashboard({ url: "https://example.invalid/other" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -828,7 +1199,7 @@ test("a slot-less approval is refused when the view is gone", () => {
     const win = fakeDashboard({ viewGone: true });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -855,7 +1226,7 @@ test("a ROUTED approval is still refused on the splash it cannot deliver to", ()
     const win = fakeDashboard({ url: "file:///C:/app/electron/loading.html" });
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "",
+      fetchGatewayAuth: async () => ({ value: "" }),
       glog: () => {},
       getDashboardWindow: () => win,
     });
@@ -878,7 +1249,7 @@ test("the turn-off IPC closes every overlay immediately", () => {
     assert.ok(overlay.petWindowCount() > 0, "overlays are open first");
     index.initCrewCompanion({
       backendUrl: "http://127.0.0.1:9",
-      fetchLocalToken: async () => "cred",
+      fetchGatewayAuth: async () => ({ value: "cred" }),
       glog: () => {},
     });
     // The renderer sends this after its disable POST succeeds. It must close the

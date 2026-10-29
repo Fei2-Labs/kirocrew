@@ -24,7 +24,7 @@ const NOW = new Date(2026, 7, 28, 15, 0, 0).getTime() // local Aug 28 2026 15:00
 
 function slot(key: string, title: string, tsMs: number, extra: Partial<ChatSlot> = {}): ChatSlot {
   // No `surface`: the default (empty) surface is the ordinary chat surface per
-  // isChatPageSurface — '', 'orchestrator' and 'crew' are the chat-page set.
+  // isChatPageSurface.
   return {
     key, title, messages: 1, running: false,
     last_ts: new Date(tsMs).toISOString(), ...extra,
@@ -134,6 +134,24 @@ describe('SessionsPage', () => {
     // ChatPage activates the session from ?sid= — a key in the path slug is
     // ignored and would silently reopen the last-used session instead.
     expect(screen.getByTestId('chat-sid')).toHaveTextContent('s1')
+  })
+
+  it('labels an untitled session "Untitled session", never its key, and still opens the key (#20875)', async () => {
+    renderPage([
+      slot('chat-9-1785440411', '', NOW - 60_000),
+      slot('chat-8-1785440400', 'chat-8-1785440400', NOW - 120_000),
+      slot('s-named', 'Named work', NOW - 180_000),
+    ])
+    const untitled = await screen.findByTestId('sessions-row-chat-9-1785440411')
+    expect(untitled).toHaveTextContent('Untitled session')
+    expect(untitled.textContent).not.toContain('chat-9-1785440411')
+    const keyTitled = screen.getByTestId('sessions-row-chat-8-1785440400')
+    expect(keyTitled).toHaveTextContent('Untitled session')
+    expect(keyTitled.textContent).not.toContain('chat-8-1785440400')
+    expect(screen.getByTestId('sessions-row-s-named')).toHaveTextContent('Named work')
+
+    fireEvent.click(untitled)
+    expect(screen.getByTestId('chat-sid')).toHaveTextContent('chat-9-1785440411')
   })
 
   it('never auto-selects or auto-creates: empty store renders empty state, no slot created', async () => {
@@ -306,17 +324,15 @@ describe('SessionsPage', () => {
   })
 
   it('orders the Pinned group by the sidebar\'s manual pin order, not recency', async () => {
-    // pinnedSessionOrder.ts is the user-arranged artifact both surfaces share.
-    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['s-b', 's-a']))
+    // The gateway's pinned order (pin_rank) is what both surfaces share.
     renderPage([
-      slot('s-a', 'Pinned, touched recently', NOW - 60_000, { pinned: true }),
-      slot('s-b', 'Pinned, ranked first by hand', NOW - 3_600_000, { pinned: true }),
+      slot('s-a', 'Pinned, touched recently', NOW - 60_000, { pinned: true, pin_rank: 1 }),
+      slot('s-b', 'Pinned, ranked first by hand', NOW - 3_600_000, { pinned: true, pin_rank: 0 }),
     ])
     const sections = await screen.findAllByRole('region')
     const rows = within(sections[0]).getAllByTestId(/sessions-row-/)
     // Recency alone would put s-a first; the manual order says s-b.
     expect(rows[0]).toHaveAttribute('data-testid', 'sessions-row-s-b')
     expect(rows[1]).toHaveAttribute('data-testid', 'sessions-row-s-a')
-    localStorage.removeItem('mc-pinned-session-order')
   })
 })

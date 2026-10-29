@@ -17,14 +17,25 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { renderHook, render as rtlRender, act } from '@testing-library/react'
 import { type RefObject } from 'react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Resolved from the vitest cwd (website/), used by the chokepoint source guard.
-const HOOK_SRC = 'src/hooks/virtualizer/useVirtualChat.ts'
+// The virtualizer is a facade over composed owners, so the source guards below
+// read EVERY module in its directory: a new owner file is covered the moment it
+// exists, and a raw write cannot escape the guard by moving to another file.
+const VIRTUALIZER_DIR = 'src/hooks/virtualizer'
+const CHOKEPOINT_SRC = join(VIRTUALIZER_DIR, 'followPolicy.ts')
+const virtualizerSources = (): { file: string; src: string }[] =>
+  readdirSync(VIRTUALIZER_DIR)
+    .filter((f) => /\.tsx?$/.test(f))
+    .sort()
+    .map((f) => ({ file: f, src: readFileSync(join(VIRTUALIZER_DIR, f), 'utf8').replace(/\r\n/g, '\n') }))
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
 import {
   HEIGHT_SCHEMA_VERSION,
   SCHEMA_VERSION_KEY,
+  TOUCHED_AT_KEY,
 } from '../hooks/virtualizer/HeightCache'
 import type { UseVirtualChatOptions } from '../hooks/virtualizer/types'
 
@@ -114,6 +125,43 @@ describe('useVirtualChat integration: follow / pin wiring', () => {
 
     // Position preserved — no yank back to 1800.
     expect(el.scrollTop).toBe(600)
+  })
+
+  it('sets overflow-anchor none while followed and auto once the reader scrolls up (Firefox autoscroll)', () => {
+    // Firefox's native scroll anchoring, left on, holds a node above the tail
+    // and drags scrollTop up off the bottom as output streams — read by the
+    // follow guard as a user scroll-up, releasing the pin for the rest of the
+    // turn. The pin therefore turns native anchoring OFF while it owns the
+    // position, and back ON when the reader scrolls up (where it is relied on).
+    const { el, state, view } = render(
+      { scrollTop: 0, scrollHeight: 2000, clientHeight: 400 },
+      mkItems(5),
+      'ff-anchor',
+    )
+    // Slot entry force-pinned to the bottom (follow armed) → anchoring off.
+    expect(el.scrollTop).toBe(1600)
+    expect(el.style.overflowAnchor).toBe('none')
+
+    // A streamed append while followed re-pins and keeps anchoring off.
+    act(() => {
+      state.scrollHeight = 2400
+      view.rerender({ items: mkItems(6), sessionId: 'ff-anchor', getKey, externalScrollerRef: { current: el } })
+    })
+    expect(el.scrollTop).toBe(2000)
+    expect(el.style.overflowAnchor).toBe('none')
+
+    // The reader scrolls up to read history: follow releases and native
+    // anchoring is handed back on so it steadies their view.
+    act(() => { state.scrollTop = 600; el.dispatchEvent(new Event('scroll')) })
+    expect(el.style.overflowAnchor).toBe('auto')
+
+    // A later append must not yank them, and anchoring stays on while released.
+    act(() => {
+      state.scrollHeight = 2800
+      view.rerender({ items: mkItems(7), sessionId: 'ff-anchor', getKey, externalScrollerRef: { current: el } })
+    })
+    expect(el.scrollTop).toBe(600)
+    expect(el.style.overflowAnchor).toBe('auto')
   })
 
   it('force-pins to the bottom on slot switch even if the previous slot was scrolled up', () => {
@@ -372,28 +420,39 @@ describe('useVirtualChat: every scroll write goes through the one chokepoint', (
   // load-bearing). Asserting it at the source level does discriminate: adding a
   // raw write fails this test immediately.
   it('has no raw scrollTop / scrollTo writes outside writeScrollTop', () => {
-    const src = readFileSync(HOOK_SRC, 'utf8')
-    // Isolate the chokepoint body — the one place raw writes are allowed.
-    const chokeStart = src.indexOf('const writeScrollTop = useCallback(')
+    const choke = readFileSync(CHOKEPOINT_SRC, 'utf8').replace(/\r\n/g, '\n')
+    // The chokepoint body — the one place raw writes are allowed — lives in the
+    // follow owner. Its declaration must exist there exactly once.
+    const chokeStart = choke.indexOf('const writeScrollTop = useCallback(')
     expect(chokeStart).toBeGreaterThan(-1)
-    const chokeEnd = src.indexOf('\n  )', chokeStart)
-    const outside = src.slice(0, chokeStart) + src.slice(chokeEnd)
+    expect(choke.indexOf('const writeScrollTop = useCallback(', chokeStart + 1)).toBe(-1)
+    const chokeEnd = choke.indexOf('\n  )', chokeStart)
+    expect(chokeEnd).toBeGreaterThan(chokeStart)
 
-    const rawWrites = outside
-      .split('\n')
-      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter(({ line }) => !line.startsWith('//'))
-      .filter(({ line }) => /\.scrollTop\s*(=|\+=|-=)/.test(line) || /\.scrollTo\(\{/.test(line))
+    const rawWrites: string[] = []
+    for (const { file, src } of virtualizerSources()) {
+      const outside = file === 'followPolicy.ts' ? src.slice(0, chokeStart) + src.slice(chokeEnd) : src
+      outside
+        // Prose that names a write (`el.scrollTop = target` in a doc) is not one.
+        // Only a block that OPENS a line is stripped: a `/*` inside a `//`
+        // comment or after code must not open a span that hides real code.
+        .replace(/^\s*\/\*[\s\S]*?\*\//gm, '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => !line.startsWith('//'))
+        .filter((line) => /\.scrollTop\s*(=|\+=|-=)/.test(line) || /\.scrollTo\(\{/.test(line))
+        .forEach((line) => rawWrites.push(`${file}: ${line}`))
+    }
 
     expect(
-      rawWrites.map((r) => r.line),
+      rawWrites,
       'raw scroll writes must go through writeScrollTop(el, top, behavior, accounting)',
     ).toEqual([])
   })
 
   it('states an accounting disposition at every call site', () => {
-    const src = readFileSync(HOOK_SRC, 'utf8')
-    const calls = [...src.matchAll(/writeScrollTop\(\s*el[^)]*\)/g)].map((m) => m[0])
+    const calls = virtualizerSources().flatMap(({ src }) =>
+      [...src.matchAll(/writeScrollTop\(\s*el[^)]*\)/g)].map((m) => m[0]))
     // Every call site (excluding the declaration) passes 'pin' or 'release'.
     expect(calls.length).toBeGreaterThanOrEqual(5)
     for (const c of calls) {
@@ -541,6 +600,20 @@ describe('useVirtualChat: smooth-pin guard (GPT MEDIUM round 4)', () => {
     h.scrollTo(900) // user grabbed the page: scrollTop moved backward
     expect(h.result.current.isAtBottom).toBe(false)
     expect(h.wheelAborts()).toBe(false) // already disarmed by the backward move
+  })
+
+  it('hands overflow-anchor back to auto when the reader grabs the scroller mid-glide (Firefox autoscroll)', () => {
+    // The grab is a release with no write of ours after it, so nothing but the
+    // scroll handler can restore native anchoring for the reader who now owns
+    // the position (see followAnchorMode).
+    const h = smoothPinHarness('smooth-grab-anchor')
+    // The smooth pin re-armed follow, so native anchoring stands down.
+    expect(h.el.style.overflowAnchor).toBe('none')
+    h.scrollTo(1400)
+    expect(h.el.style.overflowAnchor).toBe('none')
+    h.scrollTo(900) // grabbed: scrollTop moved backward against the glide
+    expect(h.result.current.isAtBottom).toBe(false)
+    expect(h.el.style.overflowAnchor).toBe('auto')
   })
 
   it('a wheel abort freezes the glide in place instead of only releasing stick', () => {
@@ -757,13 +830,14 @@ describe('useVirtualChat: height-cache eviction cap is wired to the row count', 
     for (let i = 0; i < n; i++) blob[`m${i}`] = 40 + (i % 5)
     window.localStorage.setItem(`vc_heights_${sessionId}`, JSON.stringify(blob))
   }
-  // HEIGHTS only. The schema stamp shares the blob but is not a row, and
-  // counting it would put every cap assertion one off the cap it names.
+  // HEIGHTS only. The schema stamp and the lastTouched stamp share the blob but
+  // are not rows, and counting them would put every cap assertion off the cap
+  // it names.
   const persistedCount = (sessionId: string) => {
     const raw = window.localStorage.getItem(`vc_heights_${sessionId}`)
     if (!raw) return 0
     return Object.keys(JSON.parse(raw) as Record<string, number>)
-      .filter((k) => k !== SCHEMA_VERSION_KEY).length
+      .filter((k) => k !== SCHEMA_VERSION_KEY && k !== TOUCHED_AT_KEY).length
   }
   // Mount, then push ONE real measurement through the hook's own measure path.
   // That matters: flush() skips when the cache isn't dirty, so without a write

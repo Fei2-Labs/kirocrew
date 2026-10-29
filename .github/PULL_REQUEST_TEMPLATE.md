@@ -1,18 +1,36 @@
-<!-- Fill in each section below. Omit a section only when it is genuinely not
-     applicable, and say so (e.g. "N/A — ..."). Keep the diff and this
-     description in sync: every claim here must be supported by the diff. -->
+<!-- The first three sections (Problem / Motivation, Why it matters, Not a
+     goal) state the PR's goal. They are FROZEN once the PR opens: agents
+     never edit them on their own, only when a human explicitly asks. Every
+     section from "What changed" down is rewritten to match the current diff.
+     Omit a section only when it is genuinely not applicable, and say so
+     (e.g. "N/A — ..."). Every claim here must be supported by the diff. -->
 
 ## Problem / Motivation
 
-<!-- Bug fix: the concrete symptom — what is broken or missing, ideally what the
+**Goal:**
+
+<!-- Fill in the Goal line above: ONE sentence on what this PR achieves, in
+     user terms -- the outcome, not the mechanism.
+     Then:
+     Bug fix: the concrete symptom — what is broken or missing, ideally what the
      user observes.
      New feature / enhancement: the gap, use case, or opportunity this addresses
-     — what a user cannot do (or does awkwardly) today. -->
+     — what a user cannot do (or does awkwardly) today.
+     New evidence found after the PR opens goes in a PR comment, not here. -->
 
 ## Why it matters
 
-<!-- Impact if this is left undone: for a fix, who is hit by the bug and how
-     badly; for a feature, the user/business value it unlocks. -->
+<!-- Frozen. Impact if this is left undone: for a fix, who is hit by the bug
+     and how badly; for a feature, the user/business value it unlocks. -->
+
+## Not a goal
+
+<!-- Frozen. What this PR deliberately does NOT do, one bullet per excluded
+     scope. A review finding outside the Goal is answered (rebutted or
+     deferred), never absorbed by widening this section or the Goal. A defect
+     in code this PR adds or changes is always in scope and gets fixed; 'out
+     of goal' applies only to new scope — a new feature, surface, or hardening
+     this PR does not need. -->
 
 ## What changed (motivation → approach → change)
 
@@ -29,9 +47,7 @@
        `implemented`; an RFC shipped in this PR, or
        whose status this PR flips, does not count. Without one the First
        Principles lane BLOCKs until a maintainer records the decision with
-       `/ai-review override first-principles <head-sha>: <reason>` (same-repo
-       PRs only -- on a fork PR the override is not consumed: merge the RFC
-       first, or ask a maintainer to push the branch to this repository). -->
+       `/ai-review override first-principles <head-sha>: <reason>`. -->
 
 ## Backwards compatibility
 
@@ -43,11 +59,34 @@
        Breaking: <what stops working>. Writer sweep on origin/main @ <sha>:
        <every writer/caller found and how each is handled>.
      A Breaking change tightens one contract; the writers it breaks may live in
-     other open PRs, so re-run the sweep on fresh main before the last push. -->
+     other open PRs, so re-run the sweep on fresh main before the last push.
+
+     Then, if the diff TAKES SOMETHING AWAY (hides a path, deletes records or
+     rows, tightens a validator, migrates or prunes data, removes or renames a
+     key or a public function), list every reader of that thing, one line each:
+       Reader: <path>:<symbol> -- <entry: chat|cron|subagent|app|crew page|release> -- <why it still works | test name>
+     Find readers by grepping origin/main across every entry point (crew page,
+     chat, subagent, cron, app bundles, release branch), not by reasoning about
+     the Goal; "No documented capability is removed" is not a reader list.
+     If nothing is taken away, write exactly one line instead (reviewers read
+     it; CI does not check it):
+       Removes nothing: <why>
+     PR Hygiene requires at least one Reader: line when the diff has a
+     take-away shape; Removes nothing: does not satisfy it. See
+     docs/system-specs/common/take-away-changes.md. -->
 
 ## Tests
 
-<!-- Automated tests added/updated and the behavior each one locks in. -->
+<!-- Automated tests added/updated and the behavior each one locks in.
+     fix PRs: add one line under this heading, pasted from the kirocrew-prepare-pr
+     skill's prove.py (it reverts your production hunks and re-runs the changed tests):
+       Proof: PROVEN <the tests that fail without the fix> (head <sha12>)
+     or, when it cannot run:
+       Proof: not provable -- <reason>
+     Reasons: frontend test (prove.py runs Python only) | test-only change |
+     copy-only change | docs or config only | prove.py timed out |
+     other: <20+ characters>
+     A new test that still passes with the fix reverted does not test the fix. -->
 
 ## Manual verification
 
@@ -61,9 +100,14 @@
      layouts, themes).
 
      For a watched frontend path with no rendered delta, keep this section and
-     use the `no-visual-delta` marker with a `Why no screenshot` justification;
-     maintainers may instead apply the `no-screenshots` label. Delete this
-     section only when the diff does not touch a user-visible frontend surface.
+     add two lines to the description: the `no-visual-delta` marker written as
+     an HTML comment, and a bold `Why no screenshot` line ending in a colon and
+     one sentence. Copy the exact shapes from "Waiving the screenshot
+     requirement" in docs/ci/ci-and-reviews.md; they are not spelled out here
+     because this comment block would then satisfy the check by itself.
+     Maintainers may instead apply the `no-screenshots` label. Delete this
+     section only when the diff does not touch a user-visible frontend
+     surface.
 
      - Show each affected surface in its meaningful variants (e.g. desktop vs
        browser, empty vs populated, light vs dark).
@@ -81,6 +125,18 @@
          ![alt](./evidence/after.png)
          ![](./evidence/demo.mp4)   <- alone in its paragraph renders as a player
        Limits: 10 MB per image/GIF, 100 MB per video.
+     - WITHOUT write access on this repository (a fork PR), `--attach` is not
+       available to you: the upload endpoint answers read permission with a
+       404 (cli/cli#14302). Either drag the file into this box in the web UI,
+       which works with read access, or commit it -- `git add -f
+       temp-screenshots/<topic>/after.png`, forced because that directory is
+       gitignored -- and reference the repository-relative path here. The
+       review lanes read committed media the same way they read an attachment,
+       with ONE limit for a committed file: 10 MB, video included -- a bigger
+       file is skipped, not reviewed. A recording over 10 MB goes into this
+       box via the web UI, where the 100 MB video limit above applies.
+       Know the cost: a committed file merges into main's history for good;
+       the maintainer removes it from the tip afterwards, the blob stays.
      - Non-media evidence is neither attached with --attach nor committed.
        Text (a provenance JSON, a perf baseline, an assertion dump) goes in
        a fenced code block in a PR comment (65,536 characters max). A
@@ -93,6 +149,18 @@
 ## Related Issues
 
 <!-- Link to relevant issues, e.g. Fixes #123 -->
+
+## Sibling sweep
+
+<!-- fix/revert PRs only; delete this section otherwise. List every OTHER place
+     with the same defect, found by searching for what the defect lives in (not
+     for your fix), one line each:
+       Swept: <the search you ran, e.g. git grep -nE "redact\(" -- src/>
+       Sibling: <path>[:<line>] -- changed here | tracked in #<n> | not affected -- <why, 8+ characters>
+     or, when the defect has no second site:
+       Siblings: none -- <why, 8+ characters>
+     PR Hygiene checks the shape and that each path exists; it cannot check that
+     the list is complete, so run the search. -->
 
 ## Pattern harvest
 
@@ -124,5 +192,5 @@
 
 ## Contribution License Agreement
 
-<!-- PLACEHOLDER: The exact CLA wording will be supplied by OSPO before the first public PR.
-     Do not invent CLA text — it will be added here once Legal provides it. -->
+<!-- Contributions are accepted under the project's Apache-2.0 license; see
+     the Licensing section of CONTRIBUTING.md. -->

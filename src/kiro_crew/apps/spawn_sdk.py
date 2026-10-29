@@ -22,8 +22,9 @@ import inspect
 import logging
 from typing import Awaitable, Callable
 
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import is_internal_agent_spec, list_agents
 from kiro_crew.sel import sel
+from kiro_crew.subagent_manager.admission.types import TASK_STORE_UNAVAILABLE_CODE
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,48 @@ def _audit_spawn_denied(app: str, agent: str, reason: str) -> None:
 SpawnImpl = Callable[[str, str, bool, str, str], Awaitable[str]]
 
 
+def _app_spawn_model(app: str, agent: str) -> str:
+    """The user's ``apps.<name>.model`` for a spawn that picked no model, or ``""``.
+
+    ``""`` -- no setting, an agent that pins its own model, or a config that could
+    not be read -- leaves the spawn on the model it runs on without the setting.
+    Blocking (config load and agent JSON reads): call off the loop. Never raises.
+    """
+    try:
+        # Lazy: this SDK module imports no config at load time.
+        from kiro_crew.config.loader import KiroCrewConfig, resolve_app_spawn_model
+
+        return resolve_app_spawn_model(KiroCrewConfig.load(), app, agent)
+    except Exception:  # noqa: BLE001 — an unreadable setting must not refuse the spawn
+        logger.warning("Could not read the model setting for app %r", app, exc_info=True)
+        return ""
+
+
 class SpawnError(RuntimeError):
-    """The host declined or could not start the requested agent."""
+    """The host declined or could not start the requested agent.
+
+    ``declined`` separates two kinds of failure. ``True`` is a HOST-PRESSURE
+    decline — the admission gate had no capacity to START this spawn and did not
+    accept it either: a task-store refusal (a memory wait it had no durable row
+    to park, or a store write that failed), which the gate marks with
+    ``error_code`` == ``task_store_unavailable`` (``build_spawn_impl`` recognises
+    that code), or it returned nothing at all (an empty id). A caller may treat
+    this as a back-off signal. ``False`` is a programming or impl fault (empty
+    task, empty agent, a normalised impl exception, or any other refusal) that
+    no amount of waiting fixes.
+
+    An accepted-but-deferred spawn is NOT a decline and raises nothing: the gate
+    returns a queued record with a real id, so ``build_spawn_impl`` hands that id
+    back like any other accepted spawn. The caller must treat a returned id as
+    in flight (queued or running) and not re-submit it.
+
+    A caller that backed off on the whole exception type would pause on faults
+    too, so the flag is the signal to gate on — not ``isinstance``.
+    """
+
+    def __init__(self, *args: object, declined: bool = False) -> None:
+        super().__init__(*args)
+        self.declined = declined
 
 
 #: Optional probe the gateway injects alongside the impl:
@@ -105,7 +146,9 @@ class SpawnSDK:
         bypassed. The parameter keeps its ``""`` default only so the failure is a
         loud raise here rather than a TypeError. ``model`` overrides the agent's
         default model for this run — unattended work is where users most want a
-        cheaper model, since nobody is present to weigh cost against quality.
+        cheaper model, since nobody is present to weigh cost against quality. With
+        no ``model``, the user's own ``apps.<name>.model`` setting applies unless
+        the agent pins a model.
         """
         if not task.strip():
             raise SpawnError("spawn task is empty")
@@ -126,7 +169,8 @@ class SpawnSDK:
         if not spawn_id:
             raise SpawnError(
                 f"host declined the spawn for app {self._app_name!r} "
-                f"(agent={agent or 'default'!r})"
+                f"(agent={agent or 'default'!r})",
+                declined=True,
             )
         logger.info(
             "App %s spawned background agent %s (id=%s, silent=%s)",
@@ -172,7 +216,13 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             # approval_mode="auto", a full-privilege escalation from the app's own
             # restricted background agent.
             prefix = f"{app}--"
-            known = {a.name for a in agents if a.filename.startswith(prefix)}
+            # Kiro Crew's own generated specs are never an app's agent, even when
+            # derived from one (``<app>--<agent>--readonly`` shares the prefix).
+            known = {
+                a.name
+                for a in agents
+                if a.filename.startswith(prefix) and not is_internal_agent_spec(a)
+            }
         except Exception as exc:  # noqa: BLE001 — cannot confirm → refuse
             reason = f"cannot verify agent {agent!r} for app {app!r}: {exc}"
             _audit_spawn_denied(app, agent, reason)
@@ -184,6 +234,10 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
             )
             _audit_spawn_denied(app, agent, reason)
             raise SpawnError(reason)
+        # An explicit per-spawn model wins; with none, the app's own model setting
+        # applies unless the agent pins a model of its own.
+        if not model:
+            model = await asyncio.to_thread(_app_spawn_model, app, agent)
         # ``app`` is forwarded so SubagentManager.spawn can resolve the calling
         # app's per-app governance profile — a profile that denies
         # ``capabilities.spawn`` for this app must win even when the policy
@@ -208,7 +262,19 @@ def build_spawn_impl(subagents: object) -> SpawnImpl:
         if info is None:
             return ""
         if getattr(info, "error", ""):
-            raise SpawnError(str(info.error))
+            # A done record carrying ``error`` is a refusal, not a started run.
+            # A task-store refusal — the admission floor could not record the
+            # spawn's durable row (a memory wait it has no row to park, or a
+            # store write that failed) — carries ``error_code`` ==
+            # ``task_store_unavailable`` (the gate sets it; it never sets
+            # ``queued_reason`` on a refusal — that rides only on an ACCEPTED
+            # queued record). Any such store refusal is the host-pressure
+            # DECLINE this flags for back-off: a host that cannot record a
+            # spawn gains nothing from re-attempting every one-second poll.
+            # Every other error (empty/unknown agent, bad cwd, governance) is a
+            # fault no cooldown fixes, raised undeclined.
+            declined = str(getattr(info, "error_code", "")) == TASK_STORE_UNAVAILABLE_CODE
+            raise SpawnError(str(info.error), declined=declined)
         return str(getattr(info, "id", "") or "")
 
     # Ride the probe on the impl callable rather than adding a second parameter
@@ -222,13 +288,22 @@ def build_done_probe(subagents: object) -> DoneProbe:
     """Adapt a live ``SubagentManager`` to :data:`DoneProbe`.
 
     An id the manager does not track reads as done: the reaper prunes
-    records, and "gone" must never hold a caller's serial lock open.
+    records, and "gone" must never hold a caller's serial lock open. The one
+    exception is a spawn accepted behind the concurrency / adaptive cap: it has
+    no ``_agents`` entry yet (``get`` misses) but is real pending work, so
+    reading it as done would clear the guard and let the caller queue a
+    duplicate of work that has not run. ``is_queued`` names that window.
     """
 
     def _probe(spawn_id: str) -> bool:
         if subagents is None or not spawn_id:
             return True
         info = subagents.get(spawn_id)  # type: ignore[attr-defined]
-        return info is None or bool(getattr(info, "done", False))
+        if info is not None:
+            return bool(getattr(info, "done", False))
+        is_queued = getattr(subagents, "is_queued", None)
+        if callable(is_queued) and is_queued(spawn_id):
+            return False  # accepted, not started: pending work holds the guard
+        return True
 
     return _probe

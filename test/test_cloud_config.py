@@ -23,8 +23,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 #: ``kirocrew/crew/<crew>/<ENV>`` and the ARN is that name plus one six-character
 #: service suffix. The account id is fictional.
 CREDENTIAL_SECRET = [
-    "kirocrew/crew/demo/KIRO_API_KEY",
-    "arn:aws:secretsmanager:us-east-1:123456789012:secret:kirocrew/crew/demo/KIRO_API_KEY-abcdef",
+    "kirocrew/crew/demo/KIRO_IDENTITY",
+    "arn:aws:secretsmanager:us-east-1:123456789012:secret:kirocrew/crew/demo/KIRO_IDENTITY-abcdef",
 ]
 
 #: A complete Fargate block. Every case below is this, minus or plus one thing, so
@@ -128,7 +128,7 @@ class TestFargateConfig:
             ("subnets not a list", {**COMPLETE_FARGATE, "subnets": "subnet-a"}),
             ("secrets not a list", {**COMPLETE_FARGATE, "secrets": "nope"}),
             ("secret entry is not a pair", {**COMPLETE_FARGATE, "secrets": [["only-one"]]}),
-            ("secret arn is empty", {**COMPLETE_FARGATE, "secrets": [["KIRO_API_KEY", ""]]}),
+            ("secret arn is empty", {**COMPLETE_FARGATE, "secrets": [["KIRO_IDENTITY", ""]]}),
             ("no secrets at all", {**COMPLETE_FARGATE, "secrets": []}),
             (
                 "secrets but none named for the model credential",
@@ -167,7 +167,7 @@ class TestFargateConfig:
                     **COMPLETE_FARGATE,
                     "secrets": [
                         [
-                            "x" * (cloud_config._MAX_STRING_LEN + 1) + "/KIRO_API_KEY",
+                            "x" * (cloud_config._MAX_STRING_LEN + 1) + "/KIRO_IDENTITY",
                             CREDENTIAL_SECRET[1],
                         ]
                     ],
@@ -231,6 +231,77 @@ class TestFargateConfig:
 
         expected = {f.name for f in fields(FargateConfig) if isinstance(f.default, str)}
         assert set(_STRING_FIELD_DEFAULTS) == expected
+
+    @pytest.mark.parametrize("bad", ["true", "false", "0", "1", 1, 0, None, [], {}])
+    def test_no_boolean_field_coerces_a_non_boolean(self, bad: object):
+        """Every boolean field, derived from the dataclass, not a branch someone maintains.
+
+        Coercion would read the string ``"false"`` as true, and these fields decide
+        network exposure and the trust boundary -- the two directions a value must never
+        be guessed in. Parametrized over the FIELDS for the reason the string version is:
+        ``assign_public_ip`` had a hand-written branch of its own, and ``internal_only``
+        would have arrived beside it as a second one free to disagree.
+
+        ``None`` is in the values because an explicit JSON ``null`` is a PRESENT value
+        and must drop the block rather than fall through to the default.
+        """
+        from kiro_crew.cloud.config import _BOOL_FIELD_DEFAULTS
+
+        assert _BOOL_FIELD_DEFAULTS, "the field derivation must not be empty"
+        for field_name in _BOOL_FIELD_DEFAULTS:
+            block = {**COMPLETE_FARGATE, field_name: bad}
+            assert FargateConfig.from_mapping(block) is None, f"{field_name}={bad!r}"
+
+    def test_the_boolean_field_list_matches_the_dataclass(self):
+        """Pins the derivation, so a boolean cannot silently drop out of the type check.
+
+        Named as well as derived, because "every boolean field" is only a useful claim if
+        the set is the one a reader expects. A boolean that stopped being read here would
+        be coerced again with nothing saying so.
+        """
+        from dataclasses import fields
+
+        from kiro_crew.cloud.config import _BOOL_FIELD_DEFAULTS
+
+        expected = {f.name for f in fields(FargateConfig) if isinstance(f.default, bool)}
+        assert set(_BOOL_FIELD_DEFAULTS) == expected
+        assert set(_BOOL_FIELD_DEFAULTS) == {"assign_public_ip", "internal_only"}
+
+    def test_every_boolean_field_defaults_to_the_safe_direction(self):
+        """Absent must mean the protective answer for each one, and both are ``False``.
+
+        Worth stating rather than reading off the dataclass: ``internal_only`` is the one
+        field in this block that LOOSENS a posture, so a default of ``True`` would hand
+        every lane an unsandboxed model subprocess for saying nothing at all.
+        """
+        from kiro_crew.cloud.config import _BOOL_FIELD_DEFAULTS
+
+        assert all(default is False for default in _BOOL_FIELD_DEFAULTS.values())
+
+    @pytest.mark.parametrize(("value", "expected"), [(True, True), (False, False)])
+    def test_a_boolean_internal_only_claim_is_read_as_written(self, value: bool, expected: bool):
+        config = FargateConfig.from_mapping({**COMPLETE_FARGATE, "internal_only": value})
+        assert config is not None
+        assert config.internal_only is expected
+
+    def test_an_absent_internal_only_claim_defaults_to_not_claimed(self):
+        assert "internal_only" not in COMPLETE_FARGATE
+        config = FargateConfig.from_mapping(COMPLETE_FARGATE)
+        assert config is not None
+        assert config.internal_only is False
+
+    def test_a_lane_that_does_not_claim_the_boundary_is_still_a_complete_lane(self):
+        """``internal_only`` is deliberately outside the completeness judgement.
+
+        A lane that does not claim it is usable -- it simply cannot run where there is no
+        user namespace, which is every lane's behaviour before the key existed. Folding it
+        into ``is_complete`` would leave the lane UNREGISTERED for declining to loosen a
+        posture, which inverts what the claim is for.
+        """
+        config = FargateConfig.from_mapping(COMPLETE_FARGATE)
+        assert config is not None and config.is_complete()
+        claimed = FargateConfig.from_mapping({**COMPLETE_FARGATE, "internal_only": True})
+        assert claimed is not None and claimed.is_complete()
 
     def test_an_omitted_bound_takes_the_engine_default(self):
         """The default lives in the ENGINE, and this asserts against it, not a copy.
@@ -1105,8 +1176,8 @@ class TestTheCredentialGateAgreesWithTheEngine:
     The gate exists so an incomplete block leaves the lane UNREGISTERED instead of
     registered-and-refusing. A gate that accepts a name the engine rejects recreates
     that exact state from inside the gate, which is what a tail-only check did: both a
-    bare ``KIRO_API_KEY`` and a wrong-prefix ``junk/KIRO_API_KEY`` passed here and were
-    refused by ``identity.secret_env_name``.
+    bare ``KIRO_IDENTITY`` and a wrong-prefix ``junk/KIRO_IDENTITY`` pass a tail-only
+    check and are refused by ``identity.secret_env_name``.
     """
 
     @staticmethod
@@ -1121,19 +1192,20 @@ class TestTheCredentialGateAgreesWithTheEngine:
     @pytest.mark.parametrize(
         "name",
         [
-            "KIRO_API_KEY",
-            "junk/KIRO_API_KEY",
-            "kirocrew/crew/KIRO_API_KEY",
-            "kirocrew/crew//KIRO_API_KEY",
-            "kirocrew/crew/a/b/KIRO_API_KEY",
+            "KIRO_IDENTITY",
+            "junk/KIRO_IDENTITY",
+            "kirocrew/crew/KIRO_IDENTITY",
+            "kirocrew/crew//KIRO_IDENTITY",
+            "kirocrew/crew/a/b/KIRO_IDENTITY",
             "kirocrew/crew/demo/OTHER_KEY",
+            "kirocrew/crew/demo/KIRO_API_KEY",
         ],
     )
     def test_a_name_the_engine_would_refuse_does_not_register_the_lane(self, name: str):
         assert FargateConfig.from_mapping(self._with_credential_named(name)) is None, name
 
     def test_a_conforming_name_is_accepted(self):
-        block = self._with_credential_named("kirocrew/crew/demo/KIRO_API_KEY")
+        block = self._with_credential_named("kirocrew/crew/demo/KIRO_IDENTITY")
         assert FargateConfig.from_mapping(block) is not None
 
     def test_every_name_this_gate_accepts_the_engine_also_accepts(self):
@@ -1167,7 +1239,7 @@ class TestTheCredentialGateAgreesWithTheEngine:
             "",
             "ab/cd",
         ]
-        keys = ["KIRO_API_KEY", "kiro_api_key", "OTHER"]
+        keys = ["KIRO_IDENTITY", "kiro_identity", "KIRO_API_KEY", "OTHER"]
 
         accepted = 0
         for prefix, crew, key in itertools.product(prefixes, crews, keys):
@@ -1185,10 +1257,10 @@ class TestTheCredentialGateAgreesWithTheEngine:
     )
     def test_a_crew_segment_the_engine_would_refuse_does_not_register(self, crew: str):
         """Each of these passed the earlier truthiness check and died in provisioning."""
-        name = f"kirocrew/crew/{crew}/KIRO_API_KEY"
+        name = f"kirocrew/crew/{crew}/KIRO_IDENTITY"
         assert FargateConfig.from_mapping(self._with_credential_named(name)) is None, crew
 
     @pytest.mark.parametrize("crew", ["demo", "a", "1", "a-b", "a--b", "d" * 32])
     def test_a_conforming_crew_segment_registers(self, crew: str):
-        name = f"kirocrew/crew/{crew}/KIRO_API_KEY"
+        name = f"kirocrew/crew/{crew}/KIRO_IDENTITY"
         assert FargateConfig.from_mapping(self._with_credential_named(name)) is not None, crew

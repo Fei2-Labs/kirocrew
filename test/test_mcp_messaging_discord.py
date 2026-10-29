@@ -284,7 +284,11 @@ def test_every_slack_only_field_is_covered_by_the_refusal() -> None:
     ``_SLACK_ONLY_FIELDS`` or this fails, which is the point.
     """
     properties = set(_descriptor()["inputSchema"]["properties"])
-    core = {"text", "title", "session", "channel_type", "target_id"}
+    # Not Slack-protocol options: text/title/session are universal, channel_type
+    # and target_id are the OTHER destination mechanism, and include_session_link
+    # is a cross-surface opt-in that DEGRADES to a no-op off Slack (never refused
+    # -- the message must still deliver), so it must not join _SLACK_ONLY_FIELDS.
+    core = {"text", "title", "session", "channel_type", "target_id", "include_session_link"}
     assert set(_SLACK_ONLY_FIELDS) == properties - core
 
 
@@ -600,6 +604,22 @@ async def test_a_failed_channel_delivery_is_reported_not_swallowed(audit) -> Non
         payload = await resp.json()
         assert payload["ok"] is False
         assert payload["code"] == "channel_delivery_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_send_whose_answer_was_lost_is_not_reported_as_failed(audit) -> None:
+    """A DM send that timed out may have landed, so the caller is told it was not
+    confirmed: a caller told "delivery failed" sends the message again."""
+    transport = _discord_transport()
+    transport.client.send_message = AsyncMock(side_effect=TimeoutError())
+    async with TestClient(TestServer(_app(_state(transport)))) as client:
+        resp = await client.post("/api/send-message", json={"text": "hi", "session": "discord"})
+        assert resp.status == 502
+        payload = await resp.json()
+        assert payload["code"] == "channel_delivery_failed"
+        assert payload["error"].startswith("discord delivery was not confirmed")
+        assert "delivery failed" not in payload["error"]
+    transport.client.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

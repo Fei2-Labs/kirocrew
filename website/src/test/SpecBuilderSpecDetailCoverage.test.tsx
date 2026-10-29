@@ -126,12 +126,13 @@ function renderDetail(
 }
 
 /** Pick a document tab regardless of whether SegmentedControl collapsed to its
- *  dropdown (it does under a zero-width test layout). */
+ *  dropdown (it does under a zero-width test layout). The tabs are radios in
+ *  both forms; only the collapsed dropdown's trigger is a plain button. */
 async function selectTab(label: string) {
-  let options = screen.queryAllByRole('button', { name: label })
+  let options = screen.queryAllByRole('radio', { name: label })
   if (!options.length) {
     fireEvent.click(screen.getAllByRole('button', { name: /Requirements|Design|Tasks/ })[0])
-    options = await screen.findAllByRole('button', { name: label })
+    options = await screen.findAllByRole('radio', { name: label })
   }
   fireEvent.click(options[options.length - 1])
 }
@@ -422,6 +423,17 @@ describe('SpecDetail review overlay', () => {
 })
 
 describe('SpecDetail phase actions', () => {
+  it('keeps the advance button on one line in the crowded doc header', async () => {
+    installFetch(BASE)
+    renderDetail()
+
+    // At 1440px the label wrapped to three lines and ran past the header edge.
+    const approve = await screen.findByRole('button', { name: /Approve → Design/ })
+    expect(approve).toHaveClass('whitespace-nowrap', 'shrink-0', 'rounded-full')
+    // Too narrow for tabs plus button, the header drops the button to a second row.
+    expect(approve.parentElement).toHaveClass('flex-wrap')
+  })
+
   it('refuses to advance when the reviewed document has no trustworthy hash', async () => {
     installFetch({ ...BASE, docs: {} })
     renderDetail()

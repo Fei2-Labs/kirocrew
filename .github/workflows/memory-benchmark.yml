@@ -20,7 +20,7 @@ name: Memory Benchmark (nightly)
 #      same backend, so the runner image has to be pinned for the comparison to
 #      mean anything.
 #   4. Nothing in a normal PR moves the number. Only `vector_memory.py`,
-#      `embeddings.py` and `context.py` do.
+#      `vector_memory_runtime/`, `embeddings*.py`, `context.py` and `context_assembly/` do.
 #
 # The arms run as a MATRIX rather than sequentially in one job, and that is a
 # measurement result, not a style choice: two arms in one job overruns any
@@ -88,6 +88,7 @@ jobs:
     # genuine hang burn hours.
     timeout-minutes: 90
     strategy:
+      max-parallel: 4
       # One arm's failure must not cancel the other: a partial result is still
       # worth reading, and the accept job below tolerates a missing arm.
       fail-fast: false
@@ -331,6 +332,9 @@ jobs:
             # is red every time and that nobody can act on trains maintainers to
             # ignore the signal. Any OTHER create failure is a real error and
             # must still fail loud. Same remedy as add-contributor.yml.
+            # The standing tracking issue for workflow-generated PRs; the Issue
+            # Gate lane reads this line.
+            printf '\nPart of #16362\n' >> comparison.md
             rc=0
             out="$(gh pr create --base main --head "$BRANCH" \
               --title "chore(bench): accept new memory-benchmark baseline" \
@@ -340,7 +344,7 @@ jobs:
               case "$out" in
                 *"not permitted to create or approve pull requests"*)
                   compare="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/main...$BRANCH?expand=1"
-                  echo "::notice::Branch $BRANCH is pushed and ready, but GitHub Actions may not open pull requests in this repository. Open it here: $compare"
+                  echo "::notice::Branch $BRANCH is pushed and ready, but GitHub Actions may not open pull requests in this repository. Open it here: $compare Put \`Part of #16362\` on a line of its own in the description so the Issue Gate lane passes (that is the standing tracking issue for workflow-generated PRs)."
                   exit 0
                   ;;
                 *)

@@ -15,6 +15,7 @@ arm with ``WinError 193`` when these fakes were shell scripts).
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import os
 import sys
 from pathlib import Path
@@ -252,6 +253,8 @@ def test_the_probe_refusal_becomes_a_recorded_terminal_exit(
         raise rt.PodError("child could not bootstrap (probe)")
 
     monkeypatch.setattr(rt, "_boot_unguarded", _raise)
+    if rt.IS_WINDOWS:
+        rt.win_backend.runs.reserve(cfg, "viability-probe-test")  # The boot claims it first.
 
     code = rt.boot(cfg, "viability-probe-test")
 
@@ -263,9 +266,9 @@ def test_the_probe_refusal_becomes_a_recorded_terminal_exit(
 
 def test_boot_probes_before_declaring_the_pod_up() -> None:
     """The call site is ordered after the env is built and before the gateway runs."""
-    source = Path(rt.__file__).read_text()
+    source = Path(inspect.getsourcefile(rt._boot_unguarded) or "").read_text(encoding="utf-8")
     probe_at = source.index("_probe_pod_child_bootstrap(pod_env)")
-    env_at = source.index("pod_env = build_pod_env(")
+    env_at = source.index("pod_env = runtime.build_pod_env(")
     gateway_at = source.index('argv = ["gateway"]')
     assert env_at < probe_at < gateway_at
 
@@ -477,6 +480,8 @@ class TestTheProbeIsConfined:
             return 0
 
         monkeypatch.setattr(rt, "_boot_unguarded", _probe_then_raise)
+        if rt.IS_WINDOWS:
+            rt.win_backend.runs.reserve(cfg, "viability-sandbox-test")  # The boot claims first.
 
         code = rt.boot(cfg, "viability-sandbox-test")
 

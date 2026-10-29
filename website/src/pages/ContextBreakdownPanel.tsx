@@ -1,18 +1,21 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 
 import { api } from '../api/client'
+import { contextTraceKey } from '../hooks/useWebSocket'
 import ErrorNotice from '../components/ErrorNotice'
-import { fmtNumber, fmtPercent, fmtUnit } from '../i18n/format'
+import { fmtNumber } from '../i18n/format'
 import { i18nT } from '../i18n/t'
 import type { SubagentActivity } from '../types'
 import { SessionBreakdownTree } from './SessionBreakdownTree'
-import { SOURCE_MUTE, sourceFg, sourceFill } from './contextSourceColors'
+import { CATEGORY_FILL } from './contextSourceColors'
 
 /**
  * One turn's injection record, as GET /api/telemetry/context-trace returns it.
- * `context_used` / `context_window` are in TOKENS; every block size is in CHARS,
- * so the two are only comparable through the backend's estimate (see below).
+ * `context_used` / `context_window` are in TOKENS; every block size is in CHARS.
+ * The panel reads only `blocks` and `total_chars`; the other fields stay on the
+ * wire for the recorder's other readers.
  */
 export interface ContextTurn {
   ts: string
@@ -22,10 +25,14 @@ export interface ContextTurn {
   context_used: number
   context_window: number
   model: string
-  /** Real billing from the same shard row — absent on rows written before the
-   *  recorder carried it, so render as unknown rather than zero. */
-  credits?: number
-  duration_ms?: number
+  /** The turn's EXACT 1-based position in the whole session history, assigned by the
+   *  backend fold before any truncation. Shown as the turn number directly: it stays
+   *  true no matter how many older turns the fold dropped or this day view excluded,
+   *  where a count applied to the array index would not. */
+  ordinal: number
+  /** Whether this row is the session's real start rather than a later rebuild, as the
+   *  backend fold marked it. Absent on a gateway older than the field. */
+  first_start?: boolean
 }
 
 export interface ContextTrace {
@@ -34,13 +41,16 @@ export interface ContextTrace {
   totals: Record<string, number>
   injected_chars: number
   user_chars: number
-  // The model context KiroCrew did NOT inject (kiro-cli's own prompt + tool
-  // catalogue), derived from peak token occupancy via a chars-per-token ratio.
-  // An ESTIMATE — surfaced hatched and labelled as one everywhere it renders.
-  estimated_other_chars: number
+  /** Occupancy pair in TOKENS, read by the Session Breakdown tree. */
   peak_context_used: number
   context_window: number
   window_days: number
+  /** Whether the gateway is recording at all. `false` means nothing will ever arrive
+   *  while the switch stays off, so the empty state must not promise otherwise. Absent
+   *  on a payload from a gateway older than the field, which reads as recording. */
+  recording?: boolean
+  /** The `.env` file the gateway reads, sent only while recording is off. */
+  env_file?: string
 }
 
 /** The user's own text, and the labels the backend groups under one bucket. */
@@ -58,6 +68,45 @@ export const EVERY_TURN_MEMBERS: ReadonlySet<string> = new Set([
 ])
 const EVERY_TURN_KEY = 'every_turn'
 
+/** The five plain-language categories the chart stacks, bottom to top. */
+export type Category = 'message' | 'memory' | 'rules' | 'skills' | 'other'
+export const CATEGORIES: readonly Category[] = ['message', 'memory', 'rules', 'skills', 'other']
+
+/**
+ * Backend block label -> chart category. A label absent here lands in `other`,
+ * so an unrecognised block is never dropped from a turn's total. The
+ * every-turn members and `unclassified` are deliberately absent: they are
+ * "other" by definition.
+ */
+export const CATEGORY_OF: Readonly<Record<string, Category>> = {
+  [USER_LABEL]: 'message',
+  memory: 'memory',
+  semantic_memory: 'memory',
+  episodic_memory: 'memory',
+  task_facts: 'memory',
+  lessons: 'rules',
+  critical_rules: 'rules',
+  agent_instructions: 'rules',
+  response_preferences: 'rules',
+  skill_index: 'skills',
+  skill_hint: 'skills',
+  loaded_skill: 'skills',
+}
+
+export function categoryOf(label: string): Category {
+  return CATEGORY_OF[label] ?? 'other'
+}
+
+/** Sum a turn's blocks into the five categories. Every category is present (zero when empty). */
+export function categorise(blocks: Record<string, number>): Record<Category, number> {
+  const out: Record<Category, number> = { message: 0, memory: 0, rules: 0, skills: 0, other: 0 }
+  for (const [label, chars] of Object.entries(blocks)) out[categoryOf(label)] += chars
+  return out
+}
+
+/** The newest turns the chart draws; older ones are summarised as a count. */
+export const MAX_CHART_TURNS = 30
+
 // Stable label -> catalog-key map. Anything absent is humanised from its id at
 // render time (dynamic, so it needs no catalog entry — the long tail of rare
 // blocks never earns a translated string).
@@ -68,12 +117,22 @@ const BLOCK_KEY: Record<string, string> = {
   lessons: 'pages.contextBreakdown.block_lessons',
   semantic_memory: 'pages.contextBreakdown.block_semantic_memory',
   episodic_memory: 'pages.contextBreakdown.block_episodic_memory',
+  task_facts: 'pages.contextBreakdown.block_task_facts',
   skill_index: 'pages.contextBreakdown.block_skill_index',
   skill_hint: 'pages.contextBreakdown.block_skill_hint',
   loaded_skill: 'pages.contextBreakdown.block_loaded_skill',
   critical_rules: 'pages.contextBreakdown.block_critical_rules',
+  response_preferences: 'pages.contextBreakdown.block_response_preferences',
   [EVERY_TURN_KEY]: 'pages.contextBreakdown.block_every_turn',
   unclassified: 'pages.contextBreakdown.block_unclassified',
+}
+
+const CATEGORY_KEY: Record<Category, string> = {
+  message: 'pages.contextBreakdown.cat_message',
+  memory: 'pages.contextBreakdown.cat_memory',
+  rules: 'pages.contextBreakdown.cat_rules',
+  skills: 'pages.contextBreakdown.cat_skills',
+  other: 'pages.contextBreakdown.cat_other',
 }
 
 /** Merge the every-turn members into one bucket; every other label passes through. */
@@ -84,19 +143,6 @@ export function groupBlocks(blocks: Record<string, number>): Record<string, numb
     out[key] = (out[key] ?? 0) + chars
   }
   return out
-}
-
-/**
- * Bar length as a fraction of the widest turn, on a SQUARE-ROOT scale.
- *
- * A session's turns span ~70x (a session-start turn dwarfs a follow-up), and on
- * a linear scale the small turns collapse to unreadable stubs. sqrt compresses
- * that spread — the biggest turn still dominates, but a 1.5k-char turn stays
- * wide enough to read its own composition, which is the whole point of the row.
- */
-export function barWidthPct(total: number, maxTotal: number): number {
-  if (maxTotal <= 0 || total <= 0) return 0
-  return Math.sqrt(total / maxTotal) * 100
 }
 
 /** Humanise a block id for the long tail: `hook_context` -> `Hook context`. */
@@ -110,229 +156,388 @@ function displayName(label: string): string {
   return key ? i18nT(key) : humanise(label)
 }
 
-/**
- * Maps a block's size rank onto the eight-step `--ctx-k*` ramp defined in
- * index.css, which is mixed from the theme's own foreground/surface tokens so it
- * tracks every theme and its polarity. Rank 0 (the largest block) takes the most
- * prominent step. `fg` is the ramp's contrasting endpoint (not another mid-mix,
- * which would leave the label nearly invisible on its own fill).
- */
-export function rampShade(rank: number, count: number): { fill: string; fg: string } {
-  const steps = 8
-  const span = count > 1 ? Math.min(Math.max(rank, 0), count - 1) / (count - 1) : 0
-  const step = Math.min(steps, Math.max(1, Math.round(1 + span * (steps - 1))))
-  return { fill: `var(--ctx-k${step})`, fg: `var(--ctx-fg${step})` }
-}
-
-/** Colour per label from the shared per-SOURCE hue map (see
- *  `contextSourceColors`), so every composition bar — the per-turn rows here AND
- *  the Session Breakdown tree above — colours a source the same way. Hue is the
- *  data channel; the long tail of unrecognised blocks shares the neutral mute.
- *  (Previously a size-ranked grey ramp, which made the two surfaces disagree and
- *  buried the composition signal.) */
-function buildColorMap(totals: Record<string, number>): Map<string, { fill: string; fg: string }> {
-  const grouped = groupBlocks(totals)
-  const map = new Map<string, { fill: string; fg: string }>()
-  for (const label of Object.keys(grouped)) {
-    if (label === USER_LABEL) continue
-    map.set(label, { fill: sourceFill(label), fg: sourceFg() })
-  }
-  return map
-}
-
-// Both go through the app-language formatters rather than the host locale, so
-// digits and separators match the translated UI around them. Percent values are
-// carried as a ratio because fmtPercent renders the unit itself.
 const fmtN = (n: number): string => fmtNumber(Math.round(n))
-const fmtPct = (p: number): string =>
-  fmtPercent(p / 100, { maximumFractionDigits: Number.isInteger(Math.round(p * 10) / 10) ? 0 : 1 })
 
-const USER_SEG = { fill: 'var(--accent)', fg: 'var(--ctx-user-fg)' }
-const ESTIMATE_FILL = 'var(--ctx-hatch)'
-
-interface Seg {
-  key: string
-  label: string
-  pct: number
-  fill: string
-  fg: string
-  // Native-tooltip text shown on hover. Bars carry NO baked-in labels — colour
-  // is decoded by the legend below, and hovering a segment reveals what it is
-  // and how much of the turn it took.
-  title: string
-  isUser?: boolean
-  isEstimate?: boolean
+/**
+ * Y-axis ticks: a "nice" step (1, 2 or 5 times a power of ten) chosen so
+ * the axis carries three or four gridlines, and a ceiling that is a whole
+ * multiple of it. The top tick is what the chart scales against.
+ */
+export function niceTicks(max: number): number[] {
+  if (max <= 0) return [0, 1]
+  const rough = max / 3
+  const mag = 10 ** Math.floor(Math.log10(rough))
+  const unit = rough / mag
+  const step = (unit <= 1 ? 1 : unit <= 2 ? 2 : unit <= 5 ? 5 : 10) * mag
+  const ticks: number[] = []
+  for (let v = 0; v < max + step; v += step) ticks.push(Math.round(v * 1e6) / 1e6)
+  return ticks
 }
 
-function turnSegments(
-  blocks: Record<string, number>,
-  total: number,
-  colorOf: (label: string) => { fill: string; fg: string },
-): Seg[] {
-  const grouped = groupBlocks(blocks)
-  const nonUser = Object.entries(grouped)
-    .filter(([label]) => label !== USER_LABEL)
-    .sort((a, b) => b[1] - a[1])
-  const segs: Seg[] = nonUser.map(([label, chars]) => {
-    const name = displayName(label)
-    const pct = total > 0 ? (chars / total) * 100 : 0
-    return {
-      key: label,
-      label: name,
-      pct,
-      title: i18nT('pages.contextBreakdown.segment_label', { label: name, pct: fmtPct(pct) }),
-      ...colorOf(label),
+/** Character delta between the selected turn and the one before it. */
+function deltaText(current: number, previous: number | undefined): string | null {
+  if (previous === undefined) return null
+  const diff = current - previous
+  if (diff === 0) return i18nT('pages.contextBreakdown.delta_same')
+  const n = fmtN(Math.abs(diff))
+  return diff > 0
+    ? i18nT('pages.contextBreakdown.delta_up', { n })
+    : i18nT('pages.contextBreakdown.delta_down', { n })
+}
+
+const CHART_HEIGHT = 260
+const CHART_FALLBACK_WIDTH = 520
+const MARGIN = { top: 22, right: 28, bottom: 44, left: 60 }
+/** Horizontal room one x-axis label needs; the label stride derives from it. */
+const LABEL_MIN_PX = 44
+/** Below this a per-turn hit column is too thin to aim at; one plot-wide surface takes over. */
+const HIT_COLUMN_MIN_PX = 12
+/** Below this the selected turn's value label is dropped: the detail's big number repeats it. */
+const VALUE_LABEL_MIN_WIDTH = 480
+
+interface ChartTurn {
+  /** 1-based index WITHIN the retained window. The selection key and the array
+   *  index (`trace.turns[n - 1]`), NOT what the user sees: turns dropped by the
+   *  backend before the window are not in the array, so this is not the turn's
+   *  true ordinal. */
+  n: number
+  /** The turn's TRUE ordinal for display, straight from the backend row's own
+   *  `ordinal`. Shown to the user; never used to index
+   *  the window-local array. */
+  displayN: number
+  total: number
+  cats: Record<Category, number>
+  isStart: boolean
+  /** The session's real start, not a rebuild. */
+  isFirstStart: boolean
+}
+
+/**
+ * Which x-axis labels to draw for `count` turns across `plotWidth` px: every
+ * `stride`-th turn, plus the selected and the last turn, minus a strided
+ * neighbour that would sit on top of either of those two.
+ */
+export function axisLabelIndices(count: number, plotWidth: number, selectedIdx: number): number[] {
+  const maxLabels = Math.max(1, Math.floor(plotWidth / LABEL_MIN_PX))
+  const stride = Math.max(1, Math.ceil(count / maxLabels))
+  const last = count - 1
+  const out: number[] = []
+  for (let i = 0; i < count; i++) {
+    if (i === selectedIdx || i === last) {
+      out.push(i)
+      continue
     }
-  })
-  const userChars = grouped[USER_LABEL] ?? 0
-  if (userChars > 0) {
-    const name = displayName(USER_LABEL)
-    const pct = total > 0 ? (userChars / total) * 100 : 0
-    segs.push({
-      key: USER_LABEL,
-      label: name,
-      pct,
-      title: i18nT('pages.contextBreakdown.segment_label', { label: name, pct: fmtPct(pct) }),
-      isUser: true,
-      ...USER_SEG,
-    })
+    if (i % stride !== 0) continue
+    if (Math.abs(i - selectedIdx) < stride || last - i < stride) continue
+    out.push(i)
   }
-  return segs
+  return out
 }
 
-/** The bar: pure coloured proportion, no baked-in text. Colour is decoded by
- *  the legend below; hovering a segment pops a small styled bubble naming it and
- *  its share. The bubble is a real DOM element (not the native `title`, which is
- *  OS-drawn and never shows in a screen recording) and is `position: fixed` so
- *  it escapes the row's `overflow-hidden` clip. The human slice keeps a small
- *  min-width so a few-character message stays a visible, hoverable sliver. */
-function Bar({ segs, widthPct }: { segs: Seg[]; widthPct: number }) {
-  const [tip, setTip] = useState<{ text: string; x: number; y: number } | null>(null)
+/**
+ * The stacked area: one polygon per category, separated by card-coloured
+ * hairlines, a foreground line along the top, and a dashed marker on the
+ * selected turn. Turns are keyboard-reachable buttons laid over the plot area,
+ * so the chart itself stays a plain `role="img"` picture.
+ */
+function StackedArea({
+  turns,
+  selected,
+  selectedDisplayN,
+  onSelect,
+  width: fixedWidth,
+}: {
+  turns: ChartTurn[]
+  selected: number
+  /** The selected turn's TRUE ordinal, resolved by the PARENT against the whole
+   *  retained set. The chart cannot derive it: `turns` here holds only the rows it
+   *  draws, so a session-start row selected ABOVE the chart is absent from it and
+   *  `selected` is that row's window-local `n`, which is not what the user is shown. */
+  selectedDisplayN: number
+  onSelect: (n: number) => void
+  /** Overrides the measured width (capture harnesses and tests). */
+  width?: number
+}) {
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const buttonRefs = useRef<(HTMLButtonElement | null)[]>([])
+  const [measured, setMeasured] = useState(CHART_FALLBACK_WIDTH)
+  const width = fixedWidth ?? measured
+
+  useLayoutEffect(() => {
+    const el = wrapRef.current
+    if (!el || fixedWidth !== undefined || typeof ResizeObserver === 'undefined') return
+    const measure = () => {
+      const w = el.getBoundingClientRect().width
+      if (w > 0) setMeasured(w)
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [fixedWidth])
+
+  const count = turns.length
+  const plotLeft = MARGIN.left
+  const plotRight = Math.max(plotLeft + 1, width - MARGIN.right)
+  const plotWidth = plotRight - plotLeft
+  const plotTop = MARGIN.top
+  const plotBottom = CHART_HEIGHT - MARGIN.bottom
+  const maxTotal = Math.max(...turns.map(t => t.total), 0)
+  const ticks = niceTicks(maxTotal)
+  const yMax = ticks[ticks.length - 1]
+  const y = (v: number) => plotBottom - (v / yMax) * (plotBottom - plotTop)
+  // A single turn has no run along the x axis, so its band spans the whole plot.
+  const xAt = (i: number) => (count === 1 ? (plotLeft + plotRight) / 2 : plotLeft + (i * plotWidth) / (count - 1))
+  const polyXs = count === 1 ? [plotLeft, plotRight] : turns.map((_, i) => xAt(i))
+  const valuesOf = (pick: (t: ChartTurn) => number) =>
+    count === 1 ? [pick(turns[0]), pick(turns[0])] : turns.map(pick)
+
+  let bottom = valuesOf(() => 0)
+  const layers = CATEGORIES.map(cat => {
+    const top = bottom.map((v, i) => v + valuesOf(t => t.cats[cat])[i])
+    const topPts = top.map((v, i) => `${polyXs[i]},${y(v)}`)
+    const bottomPts = bottom.map((v, i) => `${polyXs[i]},${y(v)}`).reverse()
+    const layer = { cat, polygon: [...topPts, ...bottomPts].join(' '), line: topPts.join(' ') }
+    bottom = top
+    return layer
+  })
+  const totalLine = bottom.map((v, i) => `${polyXs[i]},${y(v)}`).join(' ')
+
+  // -1 when the selected turn is a session-start row above the chart: then no
+  // chart column is marked or pressed, and the keyboard enters at the newest.
+  const selectedIdx = turns.findIndex(t => t.n === selected)
+  const sel = selectedIdx >= 0 ? turns[selectedIdx] : undefined
+  const focusIdx = selectedIdx >= 0 ? selectedIdx : count - 1
+  const selX = xAt(focusIdx)
+  const selY = y(sel?.total ?? 0)
+  // The value label sits above the highest point of the top line within one
+  // column either side, so a rising neighbour never runs through it.
+  const localMax = Math.max(
+    ...turns.slice(Math.max(0, focusIdx - 1), Math.min(count, focusIdx + 2)).map(t => t.total),
+  )
+  const labelY = y(localMax) - 12
+  const showValueLabel = sel !== undefined && width >= VALUE_LABEL_MIN_WIDTH
+  // Keep the value label inside the plot when the selected turn sits at an edge.
+  const labelAnchor = focusIdx === count - 1 && count > 1 ? 'end' : focusIdx === 0 && count > 1 ? 'start' : 'middle'
+  const labelX = labelAnchor === 'end' ? selX - 10 : labelAnchor === 'start' ? selX + 10 : selX
+  const labelled = new Set(axisLabelIndices(count, plotWidth, focusIdx))
+
+  // Arrow keys move from the button that received them, so focus never jumps
+  // to the far end of the chart; the group is one tab stop (roving tabindex).
+  const move = (from: number, delta: number) => {
+    const next = Math.min(count - 1, Math.max(0, from + delta))
+    if (next === from) return
+    onSelect(turns[next].n)
+    buttonRefs.current[next]?.focus()
+  }
+  const onArrow = (e: KeyboardEvent<HTMLButtonElement>, from: number) => {
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      move(from, -1)
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault()
+      move(from, 1)
+    }
+  }
+
+  const columnWidth = plotWidth / Math.max(1, count - 1)
+  const hitLeft = (i: number) => (count === 1 ? plotLeft : xAt(i) - columnWidth / 2)
+  const hitWidth = count === 1 ? plotWidth : columnWidth
+  // Thin columns cannot be aimed at, so one surface over the whole plot takes
+  // the pointer and hands the nearest turn to the same selection; the per-turn
+  // buttons stay for the keyboard and assistive tech.
+  const pointerSurface = count > 1 && columnWidth < HIT_COLUMN_MIN_PX
+  const nearestTurn = (clientX: number): number => {
+    const left = wrapRef.current?.getBoundingClientRect().left ?? 0
+    const i = Math.round((clientX - left - plotLeft) / columnWidth)
+    return turns[Math.min(count - 1, Math.max(0, i))].n
+  }
+
   return (
-    <>
-      <div
-        className="absolute left-0 top-0 h-full flex rounded-[3px] overflow-hidden"
-        style={{ width: `${widthPct}%` }}
+    <div ref={wrapRef} className="relative w-full" style={{ height: CHART_HEIGHT }}>
+      <svg
+        width={width}
+        height={CHART_HEIGHT}
+        className="block"
+        role="img"
+        aria-label={i18nT('pages.contextBreakdown.chart_aria', { n: fmtN(selectedDisplayN) })}
+        style={{ fontSize: 11 }}
       >
-        {segs.map(seg => (
-          // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- hover-reveal only: the three listeners position a tooltip and the segment has no action to perform, so there is nothing for a keyboard to activate. The same colour→label mapping is spelled out by the legend below, so a non-pointer reader is not left without the information.
-          <div
-            key={seg.key}
-            className="h-full min-w-0 cursor-default"
-            data-user={seg.isUser ? 'true' : undefined}
-            data-estimate={seg.isEstimate ? 'true' : undefined}
-            data-tip={seg.title}
-            style={{
-              width: `${seg.pct}%`,
-              background: seg.fill,
-              ...(seg.isUser ? { minWidth: '3px' } : {}),
+        {ticks.map(v => (
+          <g key={v}>
+            <line x1={plotLeft} x2={plotRight} y1={y(v)} y2={y(v)} stroke="var(--border)" />
+            <text x={plotLeft - 10} y={y(v) + 4} textAnchor="end" fill="var(--muted)" className="tabular-nums">
+              {fmtN(v)}
+            </text>
+          </g>
+        ))}
+        {layers.map(layer => (
+          <g key={layer.cat} data-category={layer.cat}>
+            <polygon points={layer.polygon} fill={CATEGORY_FILL[layer.cat]} fillOpacity={0.83} />
+            <polyline points={layer.line} fill="none" stroke="var(--card)" strokeWidth={1} />
+          </g>
+        ))}
+        <polyline points={totalLine} fill="none" stroke="var(--card-fg, var(--text-strong))" strokeWidth={1.5} />
+        {sel ? (
+          <>
+            <line
+              x1={selX}
+              x2={selX}
+              y1={plotTop - 4}
+              y2={plotBottom + 4}
+              stroke="var(--card-fg, var(--text-strong))"
+              strokeWidth={1}
+              strokeDasharray="3 4"
+              data-testid="selected-turn-marker"
+            />
+            <circle cx={selX} cy={selY} r={4} fill="var(--card)" stroke="var(--card-fg, var(--text-strong))" strokeWidth={2} />
+          </>
+        ) : null}
+        {sel && showValueLabel ? (
+          <text
+            x={labelX}
+            y={labelY}
+            textAnchor={labelAnchor}
+            fill="var(--card-fg, var(--text-strong))"
+            fontWeight={600}
+            className="tabular-nums"
+            data-testid="selected-turn-value"
+          >
+            {fmtN(sel.total)}
+          </text>
+        ) : null}
+        {turns.map((t, i) =>
+          labelled.has(i) ? (
+            <text
+              key={t.n}
+              x={xAt(i)}
+              y={plotBottom + 24}
+              textAnchor="middle"
+              fill={i === selectedIdx ? 'var(--card-fg, var(--text-strong))' : 'var(--muted)'}
+              fontWeight={i === selectedIdx ? 600 : 400}
+              data-axis-label={t.n}
+            >
+              {i18nT('pages.contextBreakdown.axis_turn_n', { n: fmtN(t.displayN) })}
+            </text>
+          ) : null,
+        )}
+      </svg>
+      {/* Transparent hit columns: one real button per turn so selection is
+          clickable, focusable and arrow-key navigable. */}
+      <div className="absolute inset-y-0 left-0 right-0 cursor-pointer" role="group" aria-label={i18nT('pages.contextBreakdown.turn_picker')}>
+        {pointerSurface ? (
+          <button
+            type="button"
+            tabIndex={-1}
+            aria-hidden="true"
+            data-testid="turn-pointer-surface"
+            className="absolute inset-y-0 appearance-none bg-transparent border-0 p-0 m-0 cursor-pointer"
+            style={{ left: plotLeft, width: plotWidth }}
+            onClick={e => onSelect(nearestTurn(e.clientX))}
+          />
+        ) : null}
+        {turns.map((t, i) => (
+          <button
+            key={t.n}
+            ref={el => {
+              buttonRefs.current[i] = el
             }}
-            onMouseEnter={e => setTip({ text: seg.title, x: e.clientX, y: e.clientY })}
-            onMouseMove={e => setTip({ text: seg.title, x: e.clientX, y: e.clientY })}
-            onMouseLeave={() => setTip(null)}
+            type="button"
+            tabIndex={i === focusIdx ? 0 : -1}
+            aria-pressed={i === selectedIdx}
+            aria-label={i18nT('pages.contextBreakdown.turn_button', { n: fmtN(t.displayN), chars: fmtN(t.total) })}
+            data-turn={t.n}
+            className={`absolute inset-y-0 appearance-none bg-transparent border-0 p-0 m-0 cursor-pointer rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${
+              pointerSurface ? 'pointer-events-none' : 'hover:bg-[var(--card-hl)]'
+            }`}
+            style={{ left: hitLeft(i), width: hitWidth }}
+            onClick={() => onSelect(t.n)}
+            onKeyDown={e => onArrow(e, i)}
           />
         ))}
       </div>
-      {tip ? (
-        <div
-          role="tooltip"
-          className="fixed z-50 pointer-events-none px-2 py-1 rounded-md text-[11px] font-mono whitespace-nowrap shadow-md"
-          style={{
-            left: tip.x + 12,
-            top: tip.y - 30,
-            background: 'var(--bg-elevated)',
-            color: 'var(--text)',
-            border: '1px solid var(--border)',
-          }}
-        >
-          {tip.text}
-        </div>
-      ) : null}
-    </>
-  )
-}
-
-/** One per-turn row: number · pure-colour bar · absolute chars. The bar carries
- *  no text; the legend decodes colour and hover reveals each segment. */
-function TurnRow({
-  n,
-  turn,
-  maxTotal,
-  colorOf,
-  showCredits,
-}: {
-  n: number
-  turn: ContextTurn
-  maxTotal: number
-  colorOf: (label: string) => { fill: string; fg: string }
-  /** Rendered only when SOME turn in the trace carries billing, so an all-dash
-   *  column never appears on pre-recorder history. */
-  showCredits: boolean
-}) {
-  const isStart = turn.phase === 'session_start'
-  const total = turn.total_chars
-  const width = barWidthPct(total, maxTotal)
-  const segs = turnSegments(turn.blocks, total, colorOf)
-  const grid = showCredits ? 'grid-cols-[3.5rem_1fr_5rem_4rem]' : 'grid-cols-[3.5rem_1fr_5rem]'
-
-  return (
-    <div className={`grid ${grid} gap-2.5 items-center px-3.5 py-[3px] hover:bg-[var(--bg-hover)] rounded`}>
-      <div className="font-mono text-[11px] text-muted text-right whitespace-nowrap">
-        <b className="text-text font-medium">{n}</b>
-        {isStart ? <> {i18nT('pages.contextBreakdown.row_start')}</> : null}
-      </div>
-      <div className="relative h-5 overflow-hidden">
-        <Bar segs={segs} widthPct={width} />
-      </div>
-      <div className="font-mono text-[11px] text-text text-right tabular-nums">{fmtN(total)}</div>
-      {showCredits ? <CreditsCell turn={turn} /> : null}
     </div>
   )
 }
 
-/** One turn's credits, with the duration in the tooltip when the row has it. */
-function CreditsCell({ turn }: { turn: ContextTurn }) {
-  if (turn.credits === undefined) {
-    return <div className="font-mono text-[11px] text-muted text-right tabular-nums">—</div>
-  }
-  const credits = fmtNumber(turn.credits, { maximumFractionDigits: 2 })
-  const title =
-    turn.duration_ms === undefined
-      ? i18nT('pages.contextBreakdown.turn_credits_title', { credits })
-      : i18nT('pages.contextBreakdown.turn_credits_duration_title', {
-          credits,
-          duration: fmtUnit(turn.duration_ms / 1000, 'second', { maximumFractionDigits: 1 }),
-        })
+/** A session-start turn, listed above the chart so its size does not pin the
+ *  y-axis and flatten every later turn. Selectable like any chart turn. */
+function StartTurnRow({ turn, selected, onSelect }: { turn: ChartTurn; selected: boolean; onSelect: (n: number) => void }) {
   return (
-    <div className="font-mono text-[11px] text-text text-right tabular-nums" title={title}>
-      {credits}
-    </div>
+    <button
+      type="button"
+      aria-pressed={selected}
+      data-turn={turn.n}
+      data-start-row
+      className={`w-full flex items-center justify-between gap-3 px-3 py-2 mb-2 rounded-lg border text-left text-[13px] cursor-pointer appearance-none bg-transparent focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] ${
+        selected ? 'border-[var(--accent)] text-text-strong bg-[var(--bg-accent)]' : 'border-border text-text hover:bg-[var(--card-hl)]'
+      }`}
+      onClick={() => onSelect(turn.n)}
+    >
+      <span>
+        {/* Each row is a session-start COMPOSITION, and a unit emits one per start or
+            rebuild. Only the fold's first one is the session's beginning; a later one
+            is a rebuild, and labelling it "session start" reads as a session that
+            began there. */}
+        {turn.isFirstStart
+          ? i18nT('pages.contextBreakdown.start_row', { n: fmtN(turn.displayN) })
+          : i18nT('pages.contextBreakdown.rebuild_row', { n: fmtN(turn.displayN) })}
+      </span>
+      <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">
+        {i18nT('pages.contextBreakdown.turn_button_chars', { chars: fmtN(turn.total) })}
+      </span>
+    </button>
   )
 }
 
-function Stat({ label, value, sub, accent }: { label: string; value: string; sub: string; accent?: boolean }) {
+/** One category of the selected turn: colour dot, name, count, and the raw
+ *  blocks behind it as a disclosure. */
+function CategoryRow({ cat, chars, blocks }: { cat: Category; chars: number; blocks: Record<string, number> }) {
+  const [open, setOpen] = useState(false)
+  const name = i18nT(CATEGORY_KEY[cat])
+  const parts = Object.entries(groupBlocks(blocks)).sort((a, b) => b[1] - a[1])
+  const Chevron = open ? ChevronDown : ChevronRight
   return (
-    <div className="px-3.5 py-3 border-r border-border last:border-r-0">
-      <div className="font-mono text-[10px] text-muted uppercase tracking-wide mb-0.5">{label}</div>
-      <div
-        className="font-mono text-[19px] leading-tight tabular-nums"
-        style={{ color: accent ? 'var(--accent)' : 'var(--text-strong)' }}
+    <div className="border-b border-border last:border-b-0" data-category-row={cat}>
+      <button
+        type="button"
+        className="w-full flex items-center justify-between gap-3 py-2.5 text-left bg-transparent border-0 appearance-none cursor-pointer text-[13px] text-text hover:text-text-strong rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+        aria-expanded={open}
+        onClick={() => setOpen(o => !o)}
       >
-        {value}
-      </div>
-      <div className="font-mono text-[10px] text-muted-strong mt-0.5">{sub}</div>
+        <span className="flex items-center gap-2 min-w-0">
+          <i className="w-2.5 h-2.5 rounded-[2px] shrink-0" style={{ background: CATEGORY_FILL[cat] }} aria-hidden="true" />
+          <span className="truncate">{name}</span>
+          <Chevron size={14} className="lucide-inline shrink-0 text-muted" aria-hidden="true" />
+        </span>
+        <span className="font-mono text-[12px] text-muted tabular-nums shrink-0">{fmtN(chars)}</span>
+      </button>
+      {open ? (
+        <ul className="list-none m-0 mb-2 ml-1 pl-4 border-l-2 border-border">
+          {parts.map(([label, n]) => (
+            <li key={label} className="flex items-center justify-between gap-3 py-1 text-[12px] text-text">
+              <span className="truncate">{displayName(label)}</span>
+              <span className="font-mono text-muted tabular-nums shrink-0">{fmtN(n)}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   )
 }
 
-/** The pure, data-in view. Kept free of data fetching so the maths, grouping,
- *  min-width and estimate handling are all exercisable from a fabricated trace. */
+/** The pure, data-in view. Kept free of data fetching so the category maths,
+ *  the turn window and the selection model are all exercisable from a
+ *  fabricated trace. */
 export function ContextBreakdownPanel({
   trace,
   isLoading,
+  chartWidth,
 }: {
   trace: ContextTrace | null | undefined
   isLoading?: boolean
+  /** Fixed chart width in px (capture harnesses and tests); measured when absent. */
+  chartWidth?: number
 }) {
   let body
   if (isLoading && !trace) {
@@ -342,202 +547,187 @@ export function ContextBreakdownPanel({
       </div>
     )
   } else if (!trace || trace.turns.length === 0) {
+    // Four roads lead here and only one is final. A session recorded before the fold,
+    // one with no completed turn yet, and one whose rows all fall outside the day
+    // window each fill on the next turn, so "yet" is true for them. With recording
+    // switched off nothing ever arrives, and the payload says so.
     body = (
-      <div className="text-muted text-[11px] py-6 text-center">
-        {i18nT('pages.contextBreakdown.empty')}
+      <div className="text-muted text-[11px] py-6 text-center" data-testid={trace?.recording === false ? 'context-breakdown-off' : undefined}>
+        {trace?.recording === false
+          ? i18nT('pages.contextBreakdown.empty_off', { file: trace.env_file || '~/.kiro/crew/.env' })
+          : i18nT('pages.contextBreakdown.empty')}
       </div>
     )
   } else {
-    body = <ContextBreakdownCard trace={trace} />
+    body = <ContextBreakdownCard trace={trace} chartWidth={chartWidth} />
   }
 
   return <div>{body}</div>
 }
 
-function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
-  const colorMap = buildColorMap(trace.totals)
-  const fallback = { fill: SOURCE_MUTE, fg: sourceFg() }
-  const colorOf = (label: string) => colorMap.get(label) ?? fallback
+function ContextBreakdownCard({ trace, chartWidth }: { trace: ContextTrace; chartWidth?: number }) {
+  // `null` follows the newest turn as the trace grows; a number pins a turn the
+  // user chose, so a new row arriving does not yank the detail view away.
+  const [pinned, setPinned] = useState<number | null>(null)
 
-  const totalWindow = trace.injected_chars + trace.estimated_other_chars
-  const kirocrewAdded = Math.max(0, trace.injected_chars - trace.user_chars)
-  const pctOf = (n: number) => (totalWindow > 0 ? (n / totalWindow) * 100 : 0)
+  const all: ChartTurn[] = trace.turns.map((turn, i) => ({
+    n: i + 1,
+    // The turn's TRUE ordinal, straight from the backend. NOT the array index plus a
+    // uniform omitted count: the array holds only the rows the fold kept AND this day
+    // view included, so an index-derived number would drift by every excluded row.
+    displayN: turn.ordinal || i + 1,
+    total: turn.total_chars,
+    cats: categorise(turn.blocks),
+    isStart: turn.phase === 'session_start',
+    // The fold's own mark, never the ordinal: a refused turn 1 puts the real start at
+    // ordinal 2. An older gateway sends no mark, and turn 1 is the best guess there.
+    isFirstStart: turn.first_start ?? (turn.ordinal || i + 1) === 1,
+  }))
+  // One entry per TURN, not per row. A retried or recomposed turn writes one row per
+  // attempt and every attempt carries that turn's single ordinal, so listing rows would
+  // show "Turn N" twice and count it twice. Keep the newest attempt, the one the turn
+  // ended on, at the turn's first position. Session-start turns follow the same rule:
+  // a replay that regenerates a turn re-emits its session-start composition.
+  const startByTurn = new Map<number, ChartTurn>()
+  const byTurn = new Map<number, ChartTurn>()
+  for (const t of all) {
+    const map = t.isStart ? startByTurn : byTurn
+    // A recomposed turn keeps the newest attempt, but stays the session start if any
+    // of its rows was.
+    if (map.get(t.displayN)?.isFirstStart) t.isFirstStart = true
+    map.set(t.displayN, t)
+  }
+  // Session-start turns are listed above the chart: one of them is many times
+  // the size of any later turn and would pin the y-axis, flattening the rest.
+  const starts = [...startByTurn.values()]
+  const regular = [...byTurn.values()]
+  // The chart draws the newest MAX_CHART_TURNS regular turns; the rest are earlier.
+  const clipped = Math.max(0, regular.length - MAX_CHART_TURNS)
+  const shown = regular.slice(clipped)
+  // "Earlier turns not shown" = the regular turns before the first one the chart draws.
+  // Derived from that row's EXACT ordinal, so it counts every earlier turn -- those the
+  // backend dropped, those this day view excluded, and those this chart clipped -- and
+  // never a turn shown above as a session-start row. Exact and window-scoped, because
+  // the first shown row is chosen after the day-window filter.
+  const firstShown = shown[0]
+  // `starts` holds one entry per turn, so this counts turn positions, not rows.
+  const startsBeforeFirstShown = firstShown
+    ? starts.filter(t => t.displayN < firstShown.displayN).length
+    : 0
+  const hidden = firstShown ? Math.max(0, firstShown.displayN - 1 - startsBeforeFirstShown) : 0
+  // Worded as the RANGE of earlier turns, not a count. A count reads as a set you could
+  // open, and the fold keeps no detail for most of these turns; a range also reconciles
+  // on sight with the first turn the chart draws, and naming the session-start rows
+  // explains why the range is wider than the turns it hides.
+  const lastEarlier = firstShown ? firstShown.displayN - 1 : 0
+  const earlierText =
+    startsBeforeFirstShown > 0
+      ? i18nT('pages.contextBreakdown.earlier_range_starts', {
+          first: fmtN(1),
+          last: fmtN(lastEarlier),
+          count: startsBeforeFirstShown,
+        })
+      : lastEarlier === 1
+        ? i18nT('pages.contextBreakdown.earlier_single', { n: fmtN(1) })
+        : i18nT('pages.contextBreakdown.earlier_range', { first: fmtN(1), last: fmtN(lastEarlier) })
+  const newest = all.length
+  const selectable = new Set([...starts, ...shown].map(t => t.n))
+  const selected = pinned !== null && selectable.has(pinned) ? pinned : newest
+  const selectedTurn = trace.turns[selected - 1]
+  const selectedChart = all[selected - 1]
+  // The previous TURN, not the previous row: a retried turn's earlier attempts are not
+  // drawn, so comparing against one would label attempt-vs-attempt as turn-vs-turn.
+  const kept = new Set<ChartTurn>([...starts, ...regular])
+  const sequence = all.filter(t => kept.has(t))
+  const at = sequence.indexOf(selectedChart)
+  const previous = at > 0 ? sequence[at - 1].total : undefined
+  const delta = deltaText(selectedChart.total, previous)
+  const select = (n: number) => setPinned(n === newest ? null : n)
 
-  const numbered = trace.turns.map((turn, i) => ({ turn, n: i + 1 }))
-  const starts = numbered.filter(t => t.turn.phase === 'session_start')
-  const perTurn = numbered.filter(t => t.turn.phase !== 'session_start')
-  const maxTotal = Math.max(1, ...trace.turns.map(t => t.total_chars))
-  // Billing rides the same rows; the column appears only when at least one
-  // turn actually carries it, so pre-recorder history stays three columns.
-  const hasCredits = trace.turns.some(t => t.credits !== undefined)
-  const totalCredits = trace.turns.reduce((sum, t) => sum + (t.credits ?? 0), 0)
-
-  // Whole-window summary: aggregate blocks + the estimated non-KiroCrew remainder.
-  const groupedTotals = groupBlocks(trace.totals)
-  const windowNonUser = Object.entries(groupedTotals)
-    .filter(([label]) => label !== USER_LABEL)
-    .sort((a, b) => b[1] - a[1])
-  const windowSegs: Seg[] = []
-  if (trace.estimated_other_chars > 0) {
-    windowSegs.push({
-      key: '__estimate__',
-      label: i18nT('pages.contextBreakdown.block_kiro_builtin'),
-      pct: pctOf(trace.estimated_other_chars),
-      title: i18nT('pages.contextBreakdown.estimate_label', { pct: fmtPct(pctOf(trace.estimated_other_chars)) }),
-      fill: ESTIMATE_FILL,
-      fg: 'var(--muted)',
-      isEstimate: true,
-    })
-  }
-  for (const [label, chars] of windowNonUser) {
-    const name = displayName(label)
-    const pct = pctOf(chars)
-    windowSegs.push({
-      key: label,
-      label: name,
-      pct,
-      title: i18nT('pages.contextBreakdown.segment_label', { label: name, pct: fmtPct(pct) }),
-      ...colorOf(label),
-    })
-  }
-  if (trace.user_chars > 0) {
-    const name = displayName(USER_LABEL)
-    const pct = pctOf(trace.user_chars)
-    windowSegs.push({
-      key: USER_LABEL,
-      label: name,
-      pct,
-      title: i18nT('pages.contextBreakdown.segment_label', { label: name, pct: fmtPct(pct) }),
-      isUser: true,
-      ...USER_SEG,
-    })
-  }
-
-  const legend: { key: string; label: string; chars: number; fill: string; estimate?: boolean }[] = [
-    { key: USER_LABEL, label: displayName(USER_LABEL), chars: trace.user_chars, fill: USER_SEG.fill },
-    ...windowNonUser.map(([label, chars]) => ({ key: label, label: displayName(label), chars, fill: colorOf(label).fill })),
-  ]
-  if (trace.estimated_other_chars > 0) {
-    legend.push({
-      key: '__estimate__',
-      label: i18nT('pages.contextBreakdown.block_kiro_builtin'),
-      chars: trace.estimated_other_chars,
-      fill: ESTIMATE_FILL,
-      estimate: true,
-    })
-  }
+  const rows = CATEGORIES.map(cat => ({
+    cat,
+    chars: selectedChart.cats[cat],
+    blocks: Object.fromEntries(Object.entries(selectedTurn.blocks).filter(([label]) => categoryOf(label) === cat)),
+  })).filter(r => r.chars > 0)
 
   return (
     <div className="border border-border bg-card rounded-xl overflow-hidden">
-      <div className="flex items-center justify-between gap-3 px-3.5 py-3 border-b border-border bg-[var(--bg-accent)]">
-        <span className="text-[11.5px] font-semibold uppercase tracking-wide text-text">
-          {i18nT('pages.contextBreakdown.title')}
-        </span>
-        <span className="font-mono text-[11px] text-muted">
-          {i18nT('pages.contextBreakdown.card_meta', {
-            turns: fmtN(trace.turns.length),
-            chars: fmtN(trace.injected_chars),
-          })}
-        </span>
+      <div className="px-4 py-4 border-b border-border">
+        <h2 className="m-0 text-[17px] font-semibold tracking-tight text-text-strong">
+          {i18nT('pages.contextBreakdown.heading')}
+        </h2>
+        <p className="m-0 mt-1 text-[13px] text-muted">{i18nT('pages.contextBreakdown.subtitle')}</p>
       </div>
 
-      <div className="grid grid-cols-3 border-b border-border">
-        <Stat
-          label={i18nT('pages.contextBreakdown.strip_your_messages')}
-          value={fmtPct(pctOf(trace.user_chars))}
-          sub={i18nT('pages.contextBreakdown.strip_your_messages_sub', {
-            chars: fmtN(trace.user_chars),
-            total: fmtN(totalWindow),
-          })}
-          accent
-        />
-        <Stat
-          label={i18nT('pages.contextBreakdown.strip_kirocrew_added')}
-          value={fmtPct(pctOf(kirocrewAdded))}
-          sub={i18nT('pages.contextBreakdown.strip_kirocrew_added_sub', { chars: fmtN(kirocrewAdded) })}
-        />
-        <Stat
-          label={i18nT('pages.contextBreakdown.strip_kiro_builtin')}
-          value={fmtPct(pctOf(trace.estimated_other_chars))}
-          sub={i18nT('pages.contextBreakdown.strip_kiro_builtin_sub', {
-            chars: fmtN(trace.estimated_other_chars),
-          })}
-        />
-      </div>
+      <div className="px-4 pt-4">
+        {starts.map(t => (
+          <StartTurnRow key={t.n} turn={t} selected={t.n === selected} onSelect={select} />
+        ))}
 
-      <div
-        className={`grid ${hasCredits ? 'grid-cols-[3.5rem_1fr_5rem_4rem]' : 'grid-cols-[3.5rem_1fr_5rem]'} gap-2.5 px-3.5 pt-2.5 pb-1 font-mono text-[10px] text-muted-strong tracking-wide`}
-      >
-        <span>{i18nT('pages.contextBreakdown.axis_turn')}</span>
-        <span>{i18nT('pages.contextBreakdown.axis_bar')}</span>
-        <span className="text-right">{i18nT('pages.contextBreakdown.axis_chars')}</span>
-        {hasCredits ? (
-          <span className="text-right uppercase">{i18nT('pages.contextBreakdown.col_credits')}</span>
+        {shown.length > 0 ? (
+          <>
+            <div className="flex items-center justify-between gap-3 mb-2">
+              <span className="text-[13px] font-semibold text-text">
+                {hidden > 0
+                  ? i18nT('pages.contextBreakdown.scope_turns', { count: shown.length })
+                  : i18nT('pages.contextBreakdown.scope_all_turns', { count: shown.length })}
+              </span>
+              <span className="text-[12px] text-muted">{i18nT('pages.contextBreakdown.scope_unit')}</span>
+            </div>
+            {hidden > 0 ? (
+              <p className="m-0 mb-2 text-[12px] text-muted" data-testid="earlier-turns">
+                {earlierText}
+              </p>
+            ) : null}
+
+            <StackedArea
+              turns={shown}
+              selected={selected}
+              selectedDisplayN={selectedChart.displayN}
+              onSelect={select}
+              width={chartWidth}
+            />
+
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5 mt-2 text-[12px] text-muted">
+              {CATEGORIES.map(cat => (
+                <span key={cat} className="flex items-center gap-1.5">
+                  <i className="w-2.5 h-2.5 rounded-[2px] shrink-0" style={{ background: CATEGORY_FILL[cat] }} aria-hidden="true" />
+                  {i18nT(CATEGORY_KEY[cat])}
+                </span>
+              ))}
+            </div>
+            <p className="m-0 mt-2 text-[12px] text-muted">{i18nT('pages.contextBreakdown.pick_hint')}</p>
+            <p className="m-0 mt-2 text-[12px] text-muted">
+              {i18nT('pages.contextBreakdown.chart_note')}
+              {starts.length > 0 ? <> {i18nT('pages.contextBreakdown.start_note')}</> : null}
+            </p>
+          </>
         ) : null}
       </div>
 
-      {starts.map(({ turn, n }) => (
-        <TurnRow key={n} n={n} turn={turn} maxTotal={maxTotal} colorOf={colorOf} showCredits={hasCredits} />
-      ))}
-
-      {perTurn.length > 0 ? (
-        <div className="flex items-center gap-2.5 px-3.5 pt-2.5 pb-1">
-          <span className="font-mono text-[10px] text-muted-strong uppercase tracking-wide">
-            {i18nT('pages.contextBreakdown.group_per_turn')}
+      <div className="mx-4 mt-4 pt-4 border-t border-border" data-testid="selected-turn-detail">
+        <div className="flex items-center justify-between gap-3">
+          <strong className="text-[15px] text-text-strong">
+            {selected === newest
+              ? i18nT('pages.contextBreakdown.turn_latest', { n: fmtN(selectedChart.displayN) })
+              : i18nT('pages.contextBreakdown.turn_n', { n: fmtN(selectedChart.displayN) })}
+          </strong>
+          {delta ? <span className="text-[12px] text-muted">{delta}</span> : null}
+        </div>
+        <div className="mt-1 mb-3 text-[28px] font-semibold tracking-tight tabular-nums text-text-strong">
+          {fmtN(selectedChart.total)}
+          <span className="ml-1.5 text-[13px] font-normal tracking-normal text-muted">
+            {i18nT('pages.contextBreakdown.unit_chars')}
           </span>
-          <span className="flex-1 h-px bg-border" />
         </div>
-      ) : null}
-
-      {perTurn.map(({ turn, n }) => (
-        <TurnRow key={n} n={n} turn={turn} maxTotal={maxTotal} colorOf={colorOf} showCredits={hasCredits} />
-      ))}
-
-      <div className="px-3.5 pt-3 pb-1 border-t border-border mt-1.5">
-        <div className="font-mono text-[10px] text-muted-strong uppercase tracking-wide pb-1">
-          {i18nT('pages.contextBreakdown.group_whole_window')}
-        </div>
-        <div
-          className={`grid ${hasCredits ? 'grid-cols-[3.5rem_1fr_5rem_4rem]' : 'grid-cols-[3.5rem_1fr_5rem]'} gap-2.5 items-center py-[3px]`}
-        >
-          <div className="font-mono text-[11px] text-muted text-right">
-            <b className="text-text font-medium">{i18nT('pages.contextBreakdown.row_all')}</b>
-          </div>
-          <div className="relative h-5">
-            <Bar segs={windowSegs} widthPct={100} />
-          </div>
-          <div className="font-mono text-[11px] text-text text-right tabular-nums">{fmtN(totalWindow)}</div>
-          {hasCredits ? (
-            <div
-              className="font-mono text-[11px] text-text text-right tabular-nums"
-              title={i18nT('pages.contextBreakdown.total_credits_title')}
-            >
-              {fmtNumber(totalCredits, { maximumFractionDigits: 1 })}
-            </div>
-          ) : null}
-        </div>
-      </div>
-
-      <div className="flex flex-wrap gap-x-5 gap-y-1 px-3.5 py-3 border-t border-border bg-[var(--bg-accent)]">
-        {legend.map(item => (
-          <span key={item.key} className="flex items-center gap-1.5 text-[11px] min-w-[13rem]">
-            <i
-              className="w-2 h-2 rounded-[2px] shrink-0"
-              style={{ background: item.fill }}
-              aria-hidden="true"
-            />
-            <span className="text-text">{item.label}</span>
-            {item.estimate ? (
-              <span className="font-mono text-[10px] text-muted border border-dashed border-border-strong rounded px-1">
-                {i18nT('pages.contextBreakdown.tag_estimate')}
-              </span>
-            ) : null}
-            <span className="ml-auto font-mono text-[10.5px] text-muted tabular-nums">{fmtN(item.chars)}</span>
-          </span>
+        {rows.map(r => (
+          <CategoryRow key={r.cat} cat={r.cat} chars={r.chars} blocks={r.blocks} />
         ))}
       </div>
 
-      <div className="px-3.5 pb-3 text-[11px] text-muted">{i18nT('pages.contextBreakdown.caption')}</div>
+      <p className="m-0 mx-4 mt-4 mb-4 pt-3 border-t border-border text-[12px] text-muted">
+        {i18nT('pages.contextBreakdown.footer')}
+      </p>
     </div>
   )
 }
@@ -552,18 +742,22 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
  */
 export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagents?: Record<string, SubagentActivity> }) {
   const { data, isLoading, error } = useQuery<ContextTrace>({
-    queryKey: ['context-trace', slot],
+    queryKey: contextTraceKey(slot),
     queryFn: () => api.telemetryContextTrace(slot),
     enabled: !!slot,
-    // The trace grows by one row per turn, so a tab left open goes stale.
-    refetchInterval: 15_000,
+    // Read on every mount, even over a cached value: the app's default staleTime
+    // is Infinity, and frames that landed while the tab was closed refreshed
+    // nothing. After that nothing polls: a pushed `usage` frame for this slot
+    // asks for one re-read (`hooks/websocket/contextTraceRefresh.ts`), and a
+    // reconnect re-reads once.
+    refetchOnMount: 'always',
   })
 
   return (
     <div className="h-full overflow-auto p-3">
       <SessionBreakdownTree subagents={subagents ?? {}} />
       {/* A failed trace read otherwise rendered as an empty panel. Read-only
-          side tab, so the hand-off loses nothing; the poll above retries. */}
+          side tab, so the hand-off loses nothing; the next pushed frame re-reads. */}
       <ErrorNotice message={error ? (error instanceof Error ? error.message : String(error)) : null} askAgent className="mb-3" />
       <ContextBreakdownPanel trace={data} isLoading={isLoading} />
     </div>

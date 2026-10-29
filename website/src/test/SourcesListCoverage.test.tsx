@@ -202,6 +202,25 @@ describe('SourcesList — row actions', () => {
     expect(callsTo('/sources/s1/sync', 'POST')).toHaveLength(1)
   })
 
+  it('offers no Sync on the aggregate Auto-added source, which has nothing to fetch', async () => {
+    handler = (path: string) => {
+      if (path === '/sources') {
+        return [src({ id: 'a1', name: 'Auto-added', source_type: 'agent', uri: 'agent://', sync_status: 'active', syncable: false })]
+      }
+      return { ok: true }
+    }
+    renderList()
+    await screen.findByText('Auto-added')
+    expect(screen.queryByLabelText('Sync source')).toBeNull()
+    // The "manual" hint tells the user to press Sync, so the row says how it
+    // does update instead, with the why in the tooltip.
+    expect(screen.queryByText(/manual/)).toBeNull()
+    const hint = screen.getByText(/added by agent/)
+    expect(hint.getAttribute('title')).toMatch(/nothing to sync/)
+
+    expect(screen.getByLabelText('Remove source')).toBeTruthy()
+  })
+
   it('offers Pause on a watching folder and Resume on a paused one', async () => {
     handler = (path: string) => {
       if (path === '/sources') return [
@@ -221,6 +240,23 @@ describe('SourcesList — row actions', () => {
 
     fireEvent.click(screen.getByLabelText('Resume scan'))
     await waitFor(() => expect(callsTo('/sources/f2/resume', 'POST')).toHaveLength(1))
+  })
+
+  it('labels the status badge in words, not the raw sync_status', async () => {
+    handler = (path: string) => {
+      if (path === '/sources') return [
+        folder({ id: 'f1', name: 'Watched folder', sync_status: 'active' }),
+        src({ id: 's2', name: 'Done file', sync_status: 'synced' }),
+      ]
+      return { ok: true }
+    }
+    renderList()
+    await screen.findByText('Watched folder')
+
+    expect(screen.getByText('Active')).toBeTruthy()
+    expect(screen.getByText('Up to date')).toBeTruthy()
+    expect(screen.queryByText('active')).toBeNull()
+    expect(screen.queryByText('synced')).toBeNull()
   })
 
   it('confirms a folder that is still awaiting confirmation', async () => {

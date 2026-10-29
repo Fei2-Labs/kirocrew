@@ -105,7 +105,9 @@ async def test_text_the_model_spoke_before_a_tool_call_lands_before_it(tmp_path)
     The narration is flushed by ``_flush_segment``, which is what appends this
     turn's ``message/sent`` -- so emitting ``tool/called`` before that flush put the
     call at a LOWER seq than the text that preceded it. A fold reading in seq order
-    then sees the narration after the call and reads it as the call's result.
+    then sees the narration after the call and reads it as the call's result. The
+    narration's last word waits at the call and follows as its own entry (the next
+    test); the row's entry is the one that lands first.
     """
     state, slot = _state_and_slot(
         tmp_path,
@@ -131,7 +133,8 @@ async def test_text_the_model_spoke_before_a_tool_call_lands_before_it(tmp_path)
     types = [e["type"] for e in entries]
     assert "message/sent" in types, f"the narration never reached the log: {types}"
     assert "tool/called" in types, f"the tool call never reached the log: {types}"
-    assert _seq_of(entries, "message/sent") < _seq_of(entries, "tool/called"), (
+    first_sent = min(e["seq"] for e in entries if e["type"] == "message/sent")
+    assert first_sent < _seq_of(entries, "tool/called"), (
         "the tool call landed at a lower seq than the text the model spoke before "
         f"it: {[(e['seq'], e['type']) for e in entries]}"
     )
@@ -139,7 +142,55 @@ async def test_text_the_model_spoke_before_a_tool_call_lands_before_it(tmp_path)
     # pass while breaking a neighbour.
     assert _seq_of(entries, "tool/called") < _seq_of(entries, "tool/completed")
     assert _seq_of(entries, "tool/completed") < _seq_of(entries, "turn/completed")
-    assert _seq_of(entries, "turn/started") < _seq_of(entries, "message/sent")
+    assert _seq_of(entries, "turn/started") < first_sent
+
+
+@pytest.mark.parametrize(
+    "after",
+    [[], [AcpEvent(kind=EVENT_TEXT_CHUNK, text=" Found it.")]],
+    ids=["turn-ends", "text-follows"],
+)
+@pytest.mark.asyncio
+async def test_the_last_word_held_at_a_tool_call_reaches_the_log_with_its_model_call(
+    tmp_path, after
+):
+    """The narration's last word waits at the tool call, because the text after the
+    call could finish a credential it began. The row's ``message/sent`` still lands
+    before the call, without that word; the word, given back once the text after
+    the call shows it is a word of its own, is written as its own entry under the
+    SAME turn and model call. Joined, that call's entries are what the model wrote.
+    """
+    state, slot = _state_and_slot(
+        tmp_path,
+        [
+            AcpEvent(kind=EVENT_TEXT_CHUNK, text="Let me check the config."),
+            AcpEvent(
+                kind=EVENT_TOOL_CALL,
+                tool_call_id="tc-1",
+                title="fs_read",
+                tool_name="fs_read",
+            ),
+            AcpEvent(
+                kind=EVENT_TOOL_RESULT, tool_call_id="tc-1", tool_output="ok", tool_final=True
+            ),
+            *after,
+            AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+        ],
+    )
+
+    await _run_chat(state, slot, "look at the config")
+    assert emit.flush(timeout=20.0)  # flake-ok: 20s crew-log flush, as sibling order tests
+
+    entries = _entries()
+    sent = [e for e in entries if e["type"] == "message/sent"]
+    assert sent, f"nothing the model wrote reached the log: {[e['type'] for e in entries]}"
+    first_step = sent[0]["data"]["step"]
+    narration = [e["data"]["text"] for e in sent if e["data"]["step"] == first_step]
+    assert "".join(narration) == "Let me check the config."
+    assert sent[0]["seq"] < _seq_of(entries, "tool/called")
+    later = [e["data"]["text"] for e in sent if e["data"]["step"] != first_step]
+    assert later == ([" Found it."] if after else [])
+    assert max(e["seq"] for e in sent) < _seq_of(entries, "turn/completed")
 
 
 @pytest.mark.asyncio
@@ -268,11 +319,16 @@ def test_no_recovery_handler_persists_a_partial_reply_without_recording_it():
 
     Mutation guard: re-inlining any of those blocks reddens this.
     """
-    import inspect
-
     from kiro_crew.dashboard import chat_runner
 
-    src = inspect.getsource(chat_runner).splitlines()
+    src = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [
+            *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+            Path(chat_runner.__file__),
+        ]
+        if turn_file.name != "__init__.py"
+    ).splitlines()
     offenders = []
     for i, line in enumerate(src):
         if "slot.purge_chunks()" not in line:
@@ -322,7 +378,7 @@ async def test_message_received_records_entry_text_before_prompt_expansion(tmp_p
 
     state, slot = _state_and_slot(tmp_path, [AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok")])
 
-    async def _expand(_message, _state, _slot):
+    async def _expand(_message, _state, _slot, *, project=None):
         return "injected prompt body", "ok"
 
     with pytest.MonkeyPatch.context() as patch:
@@ -433,13 +489,26 @@ def test_a_segment_cut_by_a_steer_is_recorded_as_interrupted():
     assert "interrupted=interrupted" in flush_src, "the flush does not pass it to the crew log"
 
     # The steer cut is the caller that must set it. Read from the source of the
-    # enclosing runner because the callback is a closure built per turn.
-    runner_src = inspect.getsource(chat_runner)
+    # runner and its owners because the callback is the cut bound to each turn.
+    runner_src = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [
+            *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+            Path(chat_runner.__file__),
+        ]
+        if turn_file.name != "__init__.py"
+    )
     cut_at = runner_src.index("def _steer_segment_cut(")
     cut_body = runner_src[cut_at : cut_at + 4000]
+    # A steer cut is interrupted unless its caller says the reply goes on
+    # (a crewmate send that waits behind the turn).
+    signature = cut_body[: cut_body.index(")") + 1]
+    assert "interrupted: bool = True" in signature, "a steer cut does not default to interrupted"
     call_at = cut_body.index("_flush_segment(")
     call = cut_body[call_at : call_at + 300]
-    assert "interrupted=True" in call, "the pre-steer flush does not mark its text interrupted"
+    assert (
+        "interrupted=interrupted" in call
+    ), "the pre-steer flush does not mark its text interrupted"
 
 
 def test_an_ordinary_segment_is_not_marked_interrupted():
@@ -593,6 +662,9 @@ async def test_the_turn_ordinal_keeps_rising_across_a_native_clear(tmp_path):
     Mutation guard: dropping the base advance at the clear site makes the third
     ordinal fall back to the low single digits and reddens both assertions.
     """
+    from chat_test_helpers import pin_kiro_cli_harness
+
+    pin_kiro_cli_harness()
     events: list[AcpEvent] = [AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok")]
     state, slot = _state_and_slot(tmp_path, events)
     # Several prior rows, so a window rebuilt from scratch is visibly shorter.

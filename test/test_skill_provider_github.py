@@ -28,7 +28,7 @@ from unittest.mock import patch
 import pytest
 
 from kiro_crew.skill_providers import github as gh
-from kiro_crew.skill_providers.base import SkillProvider
+from kiro_crew.skill_providers.base import SkillProvider, SkillProviderError
 
 # ---- fixtures / fakes ------------------------------------------------------
 
@@ -53,6 +53,19 @@ def _no_provider_network(monkeypatch) -> None:
         )
 
     monkeypatch.setattr(gh._http, "open_guarded", _refuse, raising=True)
+
+
+async def _raises(awaitable, code: str) -> str:
+    """Await *awaitable*, require a ``SkillProviderError`` with *code*, return its message.
+
+    A refusal carries its reason, and these tests pin which kind of reason
+    each refusal is.
+    """
+    with pytest.raises(SkillProviderError) as caught:
+        await awaitable
+    assert caught.value.code == code, caught.value.message
+    assert caught.value.message
+    return caught.value.message
 
 
 _COMMIT = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567"
@@ -267,10 +280,31 @@ class TestParseRepoSpec:
             "-acme/widgets",  # nor may an owner
             "acme/widgets@ref?query=1",
             "acme/wid gets",
+            # The ceilings are enforced by the end anchor and by nothing else: a
+            # pattern that stopped anchoring would accept these and carry the
+            # overlong name into the request URL and the recorded pin.
+            "a" * 40 + "/widgets",
+            "acme/" + "r" * 101,
         ],
     )
     def test_refusals(self, raw):
         assert gh.parse_repo_spec(raw) is None
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "acme\n/widgets",  # owner
+            "acme/widgets\n@v1",  # repository
+            "acme/widgets@v1\n:skills/reviewer",  # ref
+            "acme/widgets:skills\n/reviewer",  # path segment
+        ],
+    )
+    def test_a_newline_ending_any_part_is_refused(self, raw):
+        # Each part is judged by a pattern anchored at ``\Z``. A ``$``-anchored
+        # one also accepts the same text followed by one newline, which would
+        # carry the newline into the request URL and the recorded pin.
+        assert gh.parse_repo_spec(raw) is None
+        assert gh.parse_repo_spec(raw.replace("\n", "")) is not None
 
     def test_non_string_is_refused(self):
         # search() forwards whatever the caller passed; a non-string must not
@@ -435,7 +469,7 @@ class TestSearch:
     async def test_unresolvable_ref_yields_nothing(self):
         fake = _Fake(json_routes={}, text_routes={})  # /commits/ returns None
         with fake.install():
-            assert await gh.GitHubRepoProvider().search("acme/widgets@nope") == []
+            await _raises(gh.GitHubRepoProvider().search("acme/widgets@nope"), "unavailable")
 
     @pytest.mark.asyncio
     async def test_non_sha_commit_response_is_refused(self):
@@ -447,7 +481,7 @@ class TestSearch:
                 text_routes={"/commits/": bogus},
             )
             with fake.install():
-                assert await gh.GitHubRepoProvider().search("acme/widgets") == []
+                await _raises(gh.GitHubRepoProvider().search("acme/widgets"), "unavailable")
 
     @pytest.mark.asyncio
     async def test_a_ref_named_like_a_commit_is_refused(self):
@@ -461,9 +495,9 @@ class TestSearch:
             text_routes={"/commits/": other, "/SKILL.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().search(f"acme/widgets@{_COMMIT}") == []
-            assert (
-                await gh.GitHubRepoProvider().fetch_skill_bundle(f"acme/widgets@{_COMMIT}") is None
+            await _raises(gh.GitHubRepoProvider().search(f"acme/widgets@{_COMMIT}"), "refused")
+            await _raises(
+                gh.GitHubRepoProvider().fetch_skill_bundle(f"acme/widgets@{_COMMIT}"), "refused"
             )
 
     @pytest.mark.asyncio
@@ -505,7 +539,7 @@ class TestSearch:
             text_routes={"/commits/": _COMMIT},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().search("acme/widgets") == []
+            await _raises(gh.GitHubRepoProvider().search("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_malformed_tree_payload_yields_nothing(self):
@@ -515,7 +549,7 @@ class TestSearch:
                 text_routes={"/commits/": _COMMIT},
             )
             with fake.install():
-                assert await gh.GitHubRepoProvider().search("acme/widgets") == []
+                await _raises(gh.GitHubRepoProvider().search("acme/widgets"), "unavailable")
 
     @pytest.mark.asyncio
     async def test_an_unwritable_tree_path_refuses_before_any_fetch(self):
@@ -532,7 +566,7 @@ class TestSearch:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
         assert [u for u in fake.text_urls if "/commits/" not in u] == []
 
     @pytest.mark.asyncio
@@ -550,7 +584,7 @@ class TestSearch:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
         assert [u for u in fake.text_urls if "/commits/" not in u] == []
 
     @pytest.mark.asyncio
@@ -646,7 +680,7 @@ class TestFetchBundle:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_a_case_variant_of_the_pin_filename_also_refuses(self):
@@ -666,7 +700,25 @@ class TestFetchBundle:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
+
+    @pytest.mark.asyncio
+    async def test_a_listed_file_name_ending_in_a_newline_refuses_the_bundle(self):
+        # The tree listing is external input, so the grammar has to reach the
+        # true end of the name. A newline is unnameable on Windows, where the write raises
+        # OSError and refuses the whole install at the handler; on POSIX it
+        # succeeds and installs a file whose name no instruction can reference.
+        # Refusing here is what keeps the answer complete-or-refused.
+        fake = _Fake(
+            json_routes={"/git/trees/": _tree(("SKILL.md", 10), ("rules/tests.md\n", 10))},
+            text_routes={
+                "/commits/": _COMMIT,
+                "/SKILL.md": _SKILL_MD,
+                "/rules/tests.md": "always ask for a test",
+            },
+        )
+        with fake.install():
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_nested_skill_files_are_excluded(self):
@@ -715,7 +767,7 @@ class TestFetchBundle:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "not_found")
         # Refused on the listing alone -- no blob was read.
         assert [u for u in fake.text_urls if "/commits/" not in u] == []
 
@@ -744,7 +796,7 @@ class TestFetchBundle:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
         assert not any("huge.bin" in u for u in fake.text_urls)
         assert not any("SKILL.md" in u for u in fake.text_urls if "/commits/" not in u)
 
@@ -764,7 +816,7 @@ class TestFetchBundle:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_file_count_ceiling_refuses_the_bundle(self):
@@ -776,7 +828,7 @@ class TestFetchBundle:
             text_routes={"/commits/": _COMMIT, ".md": "body"},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_a_bundle_at_the_file_ceiling_is_accepted(self):
@@ -805,7 +857,7 @@ class TestFetchBundle:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_a_failed_fetch_refuses_the_bundle(self):
@@ -817,7 +869,7 @@ class TestFetchBundle:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_case_colliding_paths_refuse_the_bundle(self):
@@ -835,7 +887,7 @@ class TestFetchBundle:
             },
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_an_empty_instruction_file_refuses_the_bundle(self):
@@ -846,7 +898,7 @@ class TestFetchBundle:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": ""},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_bundle_without_an_instruction_file_is_refused(self):
@@ -857,7 +909,7 @@ class TestFetchBundle:
             text_routes={"/commits/": _COMMIT},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_bad_address_is_refused_before_any_request(self):
@@ -1048,6 +1100,8 @@ class TestWriterCompatibility:
             "back\\slash.md",
             "trailing space.md ",
             "tab\tname.md",
+            "SKILL.md\n",  # a trailing newline, which no platform can name a file with
+            "rules\n/tests.md",
             # Refused by the allowlist rather than by a rule of their own. Each was
             # a separate check once; the shape covers all of them.
             "rules/my file.md",
@@ -1103,6 +1157,11 @@ class TestWriterCompatibility:
 
     def test_an_absurdly_long_ref_is_refused(self):
         assert gh._valid_ref("a/" * 5000 + "b") is False
+
+    def test_a_ref_ending_in_a_newline_is_refused(self):
+        assert gh._valid_ref("main") is True
+        assert gh._valid_ref("main\n") is False
+        assert gh._valid_ref("release/2\n") is False
 
 
 class TestMaterialisation:
@@ -1175,7 +1234,7 @@ class TestMaterialisation:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_a_reserved_name_refuses_the_bundle(self):
@@ -1184,7 +1243,7 @@ class TestMaterialisation:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
 
 class TestInstructionFileMustBeUsable:
@@ -1200,7 +1259,7 @@ class TestInstructionFileMustBeUsable:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": "", "/AGENTS.md": _SKILL_MD},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_a_whitespace_only_skill_md_is_refused(self):
@@ -1209,7 +1268,7 @@ class TestInstructionFileMustBeUsable:
             text_routes={"/commits/": _COMMIT, "/SKILL.md": "  \n\t "},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_an_empty_agents_md_alone_is_refused(self):
@@ -1218,7 +1277,7 @@ class TestInstructionFileMustBeUsable:
             text_routes={"/commits/": _COMMIT, "/AGENTS.md": ""},
         )
         with fake.install():
-            assert await gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets") is None
+            await _raises(gh.GitHubRepoProvider().fetch_skill_bundle("acme/widgets"), "refused")
 
     @pytest.mark.asyncio
     async def test_a_good_agents_md_alone_still_imports(self):

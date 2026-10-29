@@ -14,7 +14,7 @@ vi.mock('../hooks/useTheme', () => ({
 }))
 
 import ThemeExperienceLayer from '../components/ThemeExperienceLayer'
-import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, registerThemeDecorSlot, __resetThemeDecorSlot } from '../lib/themeDecorLayer'
+import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, registerThemeDecorBehindSlot, registerThemeDecorSlot, __resetThemeDecorSlot } from '../lib/themeDecorLayer'
 
 // The layer reads `instances.activeId` (it unmounts when a remote Crew is active),
 // so every mount needs a Redux Provider. Shim `render` through RTL's `wrapper`
@@ -374,12 +374,63 @@ describe('ThemeExperienceLayer', () => {
     }
   })
 
+  it('portals behind-layer overlays into the behind slot and keeps them click-through', () => {
+    const slot = document.createElement('div')
+    const behind = document.createElement('div')
+    document.body.append(slot, behind)
+    try {
+      registerThemeDecorSlot(slot)
+      registerThemeDecorBehindSlot(behind)
+      setTheme({
+        assets: {
+          overlays: [
+            { id: 'web', position: 'fullscreen', zIndex: 1, pointerEvents: true, layer: 'behind', trigger: 'continuous' },
+            { id: 'sign', position: 'top-right', zIndex: 2, pointerEvents: true, trigger: 'continuous' },
+          ],
+          hasAudio: false,
+          hasPersona: false,
+        },
+      })
+      render(<ThemeExperienceLayer />)
+      const under = frames(behind)
+      expect(under).toHaveLength(1)
+      expect(under[0].getAttribute('src')).toMatch(/\/overlay\/web$/)
+      // A stale descriptor asking for clicks on the behind layer is ignored.
+      expect(under[0].style.pointerEvents).toBe('none')
+      const above = frames(slot)
+      expect(above).toHaveLength(1)
+      expect(above[0].getAttribute('src')).toMatch(/\/overlay\/sign$/)
+      expect(above[0].style.pointerEvents).toBe('auto')
+    } finally {
+      slot.remove()
+      behind.remove()
+    }
+  })
+
   it('renders overlays inline when no shell has registered a slot (onboarding, bootstrap)', () => {
     setTheme({
       assets: { overlays: ['stars'], hasAudio: false, hasPersona: false },
     })
     const { container } = render(<ThemeExperienceLayer />)
     const fs = frames(container)
+    expect(fs).toHaveLength(1)
+    expect(fs[0].getAttribute('src')).toMatch(/\/overlay\/stars$/)
+  })
+
+  it('skips behind-layer overlays when no shell registered a behind slot (popout, embed)', () => {
+    setTheme({
+      assets: {
+        overlays: [
+          { id: 'web', position: 'fullscreen', zIndex: 1, pointerEvents: false, layer: 'behind', trigger: 'continuous' },
+          'stars',
+        ],
+        hasAudio: false,
+        hasPersona: false,
+      },
+    })
+    const { container } = render(<ThemeExperienceLayer />)
+    const fs = frames(container)
+    // Inline there is nothing on top to cover it, so the behind overlay would paint over the text.
     expect(fs).toHaveLength(1)
     expect(fs[0].getAttribute('src')).toMatch(/\/overlay\/stars$/)
   })
@@ -729,6 +780,27 @@ describe('ThemeExperienceLayer', () => {
       render(<ThemeExperienceLayer />)
       await userEvent.click(screen.getByRole('button', { name: /enable experience/i }))
       expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-xyz')
+    })
+
+    it('does NOT revoke a valid grant on a render-cache Level-1 seed, then honours it once the L2 detail arrives', () => {
+      // Cold load: the render cache seeds the Level-1 projection of an L2 pack
+      // (level capped to 1, personaInfo stripped) before the server detail
+      // arrives. A valid grant for the pack's persona is stored.
+      localStorage.setItem('mc-theme-consent-bikini-bottom', 'sha-abc')
+      setTheme({ level: 1, assets: { branding: { botName: 'Bubbles' } } })
+      const { container, rerender } = render(<ThemeExperienceLayer />)
+      // The seed has no consent to read or revoke: grant intact, no re-prompt.
+      expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-abc')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(frames(container)).toHaveLength(0)
+      // Server detail lands: full L2 entry with the matching persona sha256.
+      setTheme({ assets: l2Assets({ personaInfo: persona('sha-abc') }) })
+      act(() => {
+        rerender(<ThemeExperienceLayer />)
+      })
+      expect(localStorage.getItem('mc-theme-consent-bikini-bottom')).toBe('sha-abc')
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(frames(container).length).toBeGreaterThan(0)
     })
   })
 })

@@ -4,7 +4,7 @@
  * - macOS fullscreen: 'mac-fullscreen' class driven by the electron
  *   fullscreen-changed bridge (drops the 84px traffic-light inset via CSS)
  *
- * (The activity-panel open toggle lives in the ChatPage session header, not
+ * (The activity-panel open toggle lives in the ChatTitleOverlay session header, not
  * the top bar — see ChatPage.responsivePanel.test.tsx for its coverage.)
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -12,6 +12,9 @@ import { act, screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import { safeSetItem } from '../utils/safeStorage'
 import { setDesktopUpdateAvailable } from '../store/dashboardSlice'
+import { MAC_FULLSCREEN_TOP_RESERVE_PX } from '../lib/electron'
+import { api } from '../api/client'
+import { namedCeiling } from './namedCeiling'
 
 vi.mock('../pages/ChatPage', () => ({ default: () => <div data-testid="chat-page">ChatPage</div> }))
 vi.mock('../pages/SystemPage', () => ({ default: () => null }))
@@ -44,6 +47,10 @@ vi.mock('../api/client', () => ({
     chatSlotModel: vi.fn().mockResolvedValue({}),
     chatMode: vi.fn().mockResolvedValue({}),
     listInstances: vi.fn().mockResolvedValue({ instances: [], warm_set_cap: 5 }),
+    // Rejecting by default keeps every other test on its unloaded-config path;
+    // the sign-in pill test below answers them.
+    kirocrewConfig: vi.fn(() => Promise.reject(new Error('not stubbed'))),
+    kasLoginStatus: vi.fn(() => Promise.reject(new Error('not stubbed'))),
   },
   isAuthBannerShown: vi.fn(() => false),
   ApiError: class ApiError extends Error {
@@ -147,6 +154,32 @@ describe('App top bar — update pill shifts the collapse-ladder budget', () => 
   })
 })
 
+describe('App shell — Kiro sign-in notice', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    setWindowWidth(1400)
+  })
+
+  it('shows a lapsed KAS sign-in above the page, outside the top bar, away from the sign-in card', async () => {
+    // The persistent surface #11596 asked for: the sign-in card that already
+    // says "Sign-in expired" sits on Settings > Agent Harness, so an app-level
+    // notice is the only place a user who never opens that page can learn it.
+    // It is not a top-bar control: the bar's action groups are at their cap.
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ agent: { acp_backend: 'kas' } } as Awaited<ReturnType<typeof api.kirocrewConfig>>)
+    vi.mocked(api.kasLoginStatus).mockResolvedValue({
+      authenticated: true, provider: 'Google', identity: 'social', transport: 'device',
+      expires_at: '2000-01-01T00:00:00Z', expired: true, has_refresh_token: false,
+      refresh_rejected: false, usable: false,
+    })
+    const { container } = renderWithProviders(<App />, { route: '/chat' })
+    // Behind the lazy chunk, then the config read, then the status read it enables.
+    const el = await screen.findByTestId('kiro-sign-in-notice', {}, namedCeiling('KIRO_SIGN_IN_NOTICE_IN_APP', 10000))
+    expect(container.querySelector('main#main-content')?.contains(el)).toBe(true)
+    expect(container.querySelector('header')?.contains(el)).toBe(false)
+    expect(el).toHaveTextContent('Kiro sign-in expired')
+  })
+})
+
 describe('App shell — macOS fullscreen class', () => {
   it('toggles mac-fullscreen on the root grid from the electron bridge', async () => {
     let fsCallback: ((fs: boolean) => void) | undefined
@@ -160,11 +193,64 @@ describe('App shell — macOS fullscreen class', () => {
     expect(root).toBeTruthy()
     expect(root.classList.contains('mac-fullscreen')).toBe(false)
 
+    // The frame around local and remote panes clears the fullscreen menu-bar
+    // strip only while fullscreen, so the header's crew switcher stays clickable.
+    const frame = screen.getByTestId('app-frame')
+    expect(frame.style.paddingTop).toBe('')
+
     act(() => fsCallback?.(true))
     expect(root.classList.contains('mac-fullscreen')).toBe(true)
+    expect(frame.style.paddingTop).toBe(`${MAC_FULLSCREEN_TOP_RESERVE_PX}px`)
 
     act(() => fsCallback?.(false))
     expect(root.classList.contains('mac-fullscreen')).toBe(false)
+    expect(frame.style.paddingTop).toBe('')
+    delete (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI
+  })
+
+  it('keeps no band when the shell says the menu bar cannot overlap (notched display)', async () => {
+    // A notched display already puts the fullscreen window below the menu bar,
+    // so a band there is only an empty gap under it.
+    let fsCallback: ((fs: boolean, menuBarOverlap?: boolean) => void) | undefined
+    ;(window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean, menuBarOverlap?: boolean) => void) => () => void } }).electronAPI = {
+      onFullScreenChanged: (cb: (fs: boolean, menuBarOverlap?: boolean) => void) => { fsCallback = cb; return () => { fsCallback = undefined } },
+    }
+    const { container } = renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByTestId('chat-page')
+    const root = container.querySelector('.mac-electron') as HTMLElement
+    const frame = screen.getByTestId('app-frame')
+
+    act(() => fsCallback?.(true, false))
+    expect(root.classList.contains('mac-fullscreen')).toBe(true)
+    expect(frame.style.paddingTop).toBe('')
+
+    // The same window moved to a display without a notch: the band returns.
+    act(() => fsCallback?.(true, true))
+    expect(frame.style.paddingTop).toBe(`${MAC_FULLSCREEN_TOP_RESERVE_PX}px`)
+
+    act(() => fsCallback?.(false, false))
+    expect(frame.style.paddingTop).toBe('')
+    delete (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean, menuBarOverlap?: boolean) => void) => () => void } }).electronAPI
+  })
+
+  it('scales the fullscreen reserve by native zoom so it still covers the strip', async () => {
+    // The strip is in screen points; at zoom 0.5 a CSS px is half a point, so
+    // the reserve doubles in CSS px to stay the same height on screen.
+    let fsCallback: ((fs: boolean) => void) | undefined
+    ;(window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI = {
+      onFullScreenChanged: (cb: (fs: boolean) => void) => { fsCallback = cb; return () => { fsCallback = undefined } },
+    }
+    window.zoomAPI = { get: vi.fn(async () => 0.5), set: vi.fn(async (f: number) => f), step: vi.fn(async () => 1) }
+    renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByTestId('chat-page')
+    const frame = screen.getByTestId('app-frame')
+
+    await act(async () => { fsCallback?.(true) })
+    expect(frame.style.paddingTop).toBe(`${MAC_FULLSCREEN_TOP_RESERVE_PX * 2}px`)
+
+    act(() => fsCallback?.(false))
+    expect(frame.style.paddingTop).toBe('')
+    delete window.zoomAPI
     delete (window as { electronAPI?: { onFullScreenChanged?: (cb: (fs: boolean) => void) => () => void } }).electronAPI
   })
 })

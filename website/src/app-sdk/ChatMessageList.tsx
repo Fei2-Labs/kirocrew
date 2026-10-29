@@ -15,17 +15,21 @@
  *   own scroll container.
  * ChatPage keeps its inline virtualizer wiring for now (P5-f).
  */
-import React, { useMemo, useCallback, useLayoutEffect, memo, forwardRef } from 'react'
+import React, { useMemo, useCallback, useLayoutEffect, useRef, memo, forwardRef } from 'react'
 import VirtualTranscript, {
   type TranscriptEarlierPaging,
   type VirtualTranscriptHandle,
 } from '../chat-core/transcript/VirtualTranscript'
+import { createTranscriptVersioner } from '../chat-core/transcript/transcriptVersion'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
 import TurnBlock from '../pages/chat/TurnBlock'
+import { createDisplayItemReconciler, hasToolStep } from '../pages/chat/groupDisplayItems'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import {
   type MessageRenderer,
   type MessageRenderContext,
+  type ThreadHooks,
   GROUPED_ROLES,
   mergeRenderers,
   resolveRenderer,
@@ -61,13 +65,32 @@ export interface ChatMessageListProps {
    *  path has no trust verb, so a Trust offer there overstates the grant
    *  (#5400, #5434). */
   canTrust?: boolean
+  /** Whether error notices inside the list (a failed approval decision, a
+   *  refused tool-output copy) offer the "Ask the agent" hand-off. The hand-off
+   *  navigates to the main chat, so a host holding unsaved local state the
+   *  navigation would drop (ChatEmbed's composer draft) passes `false`.
+   *  Default `true`. Renderers read it as `ctx.handOff`. */
+  handOff?: boolean
+  /** Whether a tool row opens its input/output panel on click. Default
+   *  `true`; `false` leaves each tool row a status pill with no panel.
+   *  Renderers read it as `ctx.toolDetails`; a `renderTool` row ignores it. */
+  toolDetails?: boolean
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact link in the host's side panel; see
+   *  `MessageRenderContext.onArtifactOpen`. */
+  onArtifactOpen?: (slug: string) => void
   /** Selection actions offered on assistant text, next to Copy. Host
    *  capabilities, not list behaviour: Quote needs the host's composer, Ask
    *  needs a Side Chat surface the host can bring on screen. Either absent
    *  hides its action (see chat-core/composer/selectionActions). */
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
+  /** Quote a whole row into the host's next send. Host capability; absent
+   *  hides the action on every row (see `MessageRenderContext.onQuoteMessage`). */
+  onQuoteMessage?: MessageRenderContext['onQuoteMessage']
+  /** Reply threads on this transcript's messages (a crewmate's chat): footer
+   *  data per `mid` and the open action. Absent on every other surface. */
+  threads?: ThreadHooks
   /** Optional host-injected renderer for tool messages (role 'tool'/'tool_call'/
    *  'tool_result'). Lets a Redux-connected host (e.g. the dashboard's split-view
    *  ChatPane) render the full slot-aware ToolCallLine while this component stays
@@ -103,8 +126,14 @@ export interface ChatMessageListProps {
    *  first hid the wrong row (the "two stacked boxes" bug the main chat fixed).
    *  Deliberately a single hidden-row key, not a per-row style hook: one
    *  consumer needs exactly this, and the ts-vs-index rule lives here once
-   *  instead of in every host. */
-  hiddenRow?: { ts?: string | null; index: number }
+   *  instead of in every host. `stripUncovered` says the row's action strip is
+   *  still on screen below the card standing in for its bubble (the host's
+   *  pinned state derives it from the strip's own rect against the card's
+   *  resting bottom): the row is then marked `data-pinned-standin="folding"`,
+   *  the value index.css keys the row's re-shown action strip on, and the bare
+   *  marker otherwise — once the strip has slid under the card or behind the
+   *  header it must not be visible (nor focusable) there. */
+  hiddenRow?: { ts?: string | null; index: number; stripUncovered?: boolean }
   /** Mount the rows inside the list's own virtualized scroller. Supplying it
    *  is what makes this component the scroll container: the host drops its
    *  `overflow-y-auto` div and its follow hook, and reaches the scroller
@@ -146,6 +175,24 @@ function msgKey(m: ChatMessage, i: number): string {
   return (m.ts || '') + '-' + i + '-' + m.role
 }
 
+/** One virtualized row's content. memo(): a settled row gets the SAME `item`
+ *  object back from the reconcile and the same `renderItem` while nothing it
+ *  draws from has moved, so a streaming flush or a keystroke in the host's
+ *  composer re-renders only the row that changed. Produces no DOM of its own:
+ *  the measured `data-display-index` wrapper around it is VirtualTranscript's. */
+const ListRow = memo(function ListRow({ item, index, renderItem }: {
+  item: DisplayItem
+  index: number
+  renderItem: (item: TurnItem, i: number) => React.ReactNode
+}) {
+  // Every row draws translated text and app-language dates, and a language
+  // switch reaches a memo boundary only through its own subscription.
+  useLanguageGeneration()
+  return item.kind === 'turn'
+    ? <TurnBlock turn={item} renderItem={renderItem} />
+    : <>{renderItem(item, index)}</>
+})
+
 // ── Main component ──
 
 const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageListProps>(function ChatMessageList({
@@ -155,9 +202,14 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
   onApprove,
   onApproveBatch,
   canTrust,
+  handOff = true,
+  toolDetails = true,
   onFileOpen,
+  onArtifactOpen,
   onQuote,
   onAsk,
+  onQuoteMessage,
+  threads,
   renderTool,
   hideCardOwnedOAuth = false,
   renderers,
@@ -170,6 +222,12 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
   // hiddenRow); one that supplies neither gets the unwrapped DOM. A virtualized
   // mount always indexes: its measured wrapper is the indexed block.
   const indexRows = onDisplayItems != null || hiddenRow != null
+
+  // Every streaming flush hands this list a new `messages` array, so the
+  // grouping below re-runs and mints fresh objects for every row. The reconcile
+  // gives each row that describes the same message references its previous
+  // object back -- ChatPage's createTurnGrouper does the same for the main chat.
+  const reconcileRows = useMemo(() => createDisplayItemReconciler(), [])
 
   // Phase 1: Build raw items — skip permissions, group thinking
   const displayItems = useMemo<DisplayItem[]>(() => {
@@ -203,7 +261,8 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
 
     const flushTurn = (complete: boolean) => {
       if (!turnItems.length) return
-      if (hasWorkingSteps(turnItems) && turnItems.length > 2) {
+      // A tool call wraps at any length, so a one-tool turn folds (#23017).
+      if (hasToolStep(turnItems) || (hasWorkingSteps(turnItems) && turnItems.length > 2)) {
         turns.push({ kind: 'turn', items: turnItems, complete })
       } else {
         turns.push(...turnItems)
@@ -223,8 +282,26 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
     }
     flushTurn(!running)
 
-    return turns
-  }, [messages, running])
+    return reconcileRows(turns)
+  }, [messages, running, reconcileRows])
+
+  // THE ROWS' VIEW OF `messages`: a new object exactly when the transcript
+  // version moves (chat-core/transcript/transcriptVersion), which is on every
+  // change to `messages` except a streaming row's text growing -- the one
+  // change no other row reads. The row renderers below read the list through
+  // it, never from `messages` directly, so their identity, and with it every
+  // memoized row's props, moves only when a row's output can change; every
+  // other input they close over sits in their own dependency arrays. The list
+  // is read through a ref, so a row that does render always sees the newest
+  // messages.
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  const transcriptVersionOf = useMemo(() => createTranscriptVersioner(), [])
+  const transcriptVersion = transcriptVersionOf(messages)
+  const versioned = useMemo(
+    () => ({ version: transcriptVersion, get messages() { return messagesRef.current } }),
+    [transcriptVersion],
+  )
 
   // tool_call_ids whose call was blocked by a security-policy deny rule or
   // hook. The gateway appends a hidden "🚫 …" tool message sharing the visible
@@ -234,12 +311,12 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
   // 'rejected' on its permission/pill state, which the pill checks first.
   const autoDeniedIds = useMemo(() => {
     const ids = new Set<string>()
-    for (const m of messages) {
+    for (const m of versioned.messages) {
       const tcid = m.meta?.tool_call_id as string | undefined
       if (m.role === 'tool' && tcid && m.content?.startsWith('🚫')) ids.add(tcid)
     }
     return ids
-  }, [messages])
+  }, [versioned])
 
   // Resolve each row through the registry. Host entries are searched first, so
   // the same lookup serves a plain embed and a store-connected dashboard.
@@ -250,7 +327,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
     const wrapper = (children: React.ReactNode, isUser = false) => (
       <div key={key} className="px-4 mx-auto w-full py-1" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <div className={`group flex flex-col min-w-0 ${isUser ? 'items-end' : ''}`}>
-          <div className={`flex flex-col gap-0.5 min-w-0 overflow-hidden max-w-full ${isUser ? 'items-end' : ''}`}>
+          <div className={`chat-message-body flex flex-col gap-0.5 min-w-0 overflow-hidden max-w-full ${isUser ? 'items-end' : ''}`}>
             {children}
           </div>
         </div>
@@ -267,20 +344,25 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
 
     const ctx: MessageRenderContext = {
       index: i,
-      messages,
+      messages: versioned.messages,
       running,
       key,
       onFileOpen,
+      onArtifactOpen,
       onQuote,
       onAsk,
+      onQuoteMessage,
+      threads,
       hideCardOwnedOAuth,
+      handOff,
+      toolDetails,
       autoDeniedIds,
       renderTool,
       wrapper,
       row,
     }
     return entry.render(m, ctx)
-  }, [messages, running, contentWidth, onFileOpen, onQuote, onAsk, renderTool, autoDeniedIds, hideCardOwnedOAuth, activeRenderers])
+  }, [versioned, running, contentWidth, onFileOpen, onArtifactOpen, onQuote, onAsk, onQuoteMessage, threads, renderTool, autoDeniedIds, hideCardOwnedOAuth, handOff, toolDetails, activeRenderers])
 
 
   // Render a TurnItem (single or group)
@@ -334,7 +416,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
       <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <CollapsibleToolGroup
           count={nonPerm.length}
-          autoExpand={(running && item.startIdx >= messages.length - 5) || !!handleApproveBatch}
+          autoExpand={(running && item.startIdx >= versioned.messages.length - 5) || !!handleApproveBatch}
           hasPermission={unresolvedPerms.length > 0}
           isRunning={running}
           permissionMeta={lastPerm?.meta}
@@ -343,6 +425,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
           onApprove={handleApprove}
           onApproveBatch={handleApproveBatch}
           canTrust={canTrust}
+          askAgent={handOff}
         >
           {/* Grouped messages (thinking, permission) return null from renderMessage
               intentionally — CollapsibleToolGroup handles their display via its
@@ -351,7 +434,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
         </CollapsibleToolGroup>
       </div>
     )
-  }, [renderMessage, running, messages.length, contentWidth, onApprove, onApproveBatch, canTrust])
+  }, [renderMessage, running, versioned, contentWidth, onApprove, onApproveBatch, canTrust, handOff])
 
   // Render a DisplayItem (single, group, or turn)
   const renderDisplayItem = useCallback((item: DisplayItem, i: number) => {
@@ -365,8 +448,11 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
     // A plain block wrapper: it takes the row's own box (padding included), so
     // its rect IS the row's rect for the geometry that reads it, and it adds no
     // class of its own so the theming contract on the inner row is untouched.
+    // `data-pinned-standin` marks the hidden row for index.css, which re-shows
+    // the message's action strip beneath the card standing in for its bubble —
+    // only while the value is `folding`, i.e. while that strip is still uncovered.
     return (
-      <div key={'row-' + i} data-display-index={i} style={hidden ? { visibility: 'hidden' } : undefined}>
+      <div key={'row-' + i} data-display-index={i} data-pinned-standin={hidden ? (hiddenRow?.stripUncovered ? 'folding' : '') : undefined} style={hidden ? { visibility: 'hidden' } : undefined}>
         {node}
       </div>
     )
@@ -377,10 +463,11 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
 
   // The row's content alone: the virtualized mount supplies the measured,
   // indexed wrapper, so the fragment path's wrapper must not stack under it.
+  // `renderItem` keeps its identity across a flush that only grew the
+  // streaming row and across a keystroke in the host's composer (see
+  // `versioned`), so every other mounted row bails out of the redraw.
   const renderRowContent = useCallback((item: DisplayItem, i: number) => (
-    item.kind === 'turn'
-      ? <TurnBlock turn={item} renderItem={renderItem} />
-      : renderItem(item, i)
+    <ListRow item={item} index={i} renderItem={renderItem} />
   ), [renderItem])
   const isRowHidden = useCallback((item: DisplayItem, i: number) => (
     hiddenRow != null && (hiddenRow.ts != null
@@ -422,6 +509,7 @@ const ChatMessageList = memo(forwardRef<VirtualTranscriptHandle, ChatMessageList
         onTopReached={transcript.onTopReached}
         prefetchStartIndex={transcript.prefetchStartIndex}
         isRowHidden={hiddenRow != null ? isRowHidden : undefined}
+        hiddenRowStripUncovered={hiddenRow?.stripUncovered === true}
       />
     )
   }

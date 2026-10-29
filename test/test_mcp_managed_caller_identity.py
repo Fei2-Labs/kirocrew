@@ -20,10 +20,13 @@ import importlib
 import pytest
 
 from kiro_crew import mcp_discovery
+from kiro_crew.mcp_caller import POOLING_REQUIRES_TENANT_NONCE
 from kiro_crew.mcp_discovery import (
     _MANAGED_SERVER_TOOL_MODULES,
     managed_server_is_session_bound,
 )
+from kiro_crew.mcp_gateway.gatewayd import REGISTERED_CAPABILITIES
+from kiro_crew.mcp_gateway.stub import must_degrade_nonce_blind
 
 #: Managed server name -> the function that starts its stdio loop. Separate from
 #: the discovery map because that map points at the module whose ``_list_tools``
@@ -37,6 +40,8 @@ _SERVE_ENTRY = {
     "kirocrew-dashboard": "run_mcp_server",
     "kirocrew-work": "run_mcp_server",
     "kirocrew-panel": "run_mcp_server",
+    "kirocrew-guide": "run_mcp_server",
+    "kirocrew-mate": "run_mcp_server",
 }
 
 
@@ -112,6 +117,34 @@ def test_the_withheld_set_is_a_real_exception_not_a_stale_one(monkeypatch) -> No
         )
 
 
+def test_a_negotiating_server_keeps_what_earns_its_place() -> None:
+    """A caller-aware entry resting on the nonce must keep all three of its parts.
+
+    ``kirocrew-computer`` is not shareable because its attribution is right for the
+    callers the gateway CAN name. It is shareable because the callers it cannot
+    name are separated by the per-connection nonce, and because a daemon that mints
+    none is refused before any pooling happens. Any one of the three going missing
+    restores the namespace collapse this classification would then be promising
+    against, and none of the checks above can see it: they read the advertising bit
+    only, which stays true throughout.
+    """
+    assert "kirocrew-computer" in mcp_discovery._MANAGED_SERVERS_CALLER_AWARE
+    # 1. the backend separates the callers the gateway cannot name by the nonce
+    assert "kirocrew-computer" in POOLING_REQUIRES_TENANT_NONCE
+    # 2. a current daemon attests that it mints one
+    assert "tenant_nonce" in REGISTERED_CAPABILITIES
+    # 3. a stub asked to POOL it behind a daemon that does not attest is degraded
+    assert must_degrade_nonce_blind("kirocrew-computer", poolable=True, capabilities=[]) is True
+    assert (
+        must_degrade_nonce_blind(
+            "kirocrew-computer",
+            poolable=True,
+            capabilities=list(REGISTERED_CAPABILITIES),
+        )
+        is False
+    )
+
+
 def test_the_concrete_verdicts_are_spelled_out() -> None:
     """The concrete answers the dashboard renders, spelled out.
 
@@ -121,18 +154,16 @@ def test_the_concrete_verdicts_are_spelled_out() -> None:
     and refuse or safely namespace an unidentified caller, so none is
     session-bound — ``kirocrew-work`` refuses outright, since a work-ledger tool
     with no verifiable session has no ledger and no binding to reach.
-    ``kirocrew-computer`` also advertises and consumes the block (its pooled
-    attribution is correct for every caller the gateway can name), but it stays
-    session-bound DELIBERATELY: the per-connection nonce removes the namespace
-    collision on a CURRENT
-    gateway, while this classification is what ``seed.py`` turns into a config
-    write, and the daemon serving those shared frames may be a pre-nonce one
-    ``manager.py`` adopted across an upgrade. Promotion waits on a negotiated
-    guarantee that a nonce-blind gateway cannot serve a pooled computer backend.
+    ``kirocrew-computer`` reaches the same verdict by the other route: it
+    separates the callers the gateway cannot name by the per-connection nonce,
+    and because this classification is what ``seed.py`` turns into a config
+    write, that separation is negotiated on the handshake rather than assumed —
+    a daemon that does not attest ``tenant_nonce`` cannot serve it pooled at all
+    (``test_a_negotiating_server_keeps_what_earns_its_place`` below).
     """
     assert managed_server_is_session_bound("kirocrew-core") is False
     assert managed_server_is_session_bound("kirocrew-cron") is False
-    assert managed_server_is_session_bound("kirocrew-computer") is True
+    assert managed_server_is_session_bound("kirocrew-computer") is False
     assert managed_server_is_session_bound("kirocrew-dashboard") is False
     assert managed_server_is_session_bound("kirocrew-work") is False
     # ``kirocrew-debug`` consumes the block and is not session-bound, and here that

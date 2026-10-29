@@ -3,19 +3,15 @@
  * the alternative ways to create one.
  *
  * Two load-bearing assertions:
- *   (1) "New chat" renders in the menu alongside "New autopilot chat" — a menu
- *       that offers only autopilot + folder entries reads as if the caret could
- *       not make a plain chat at all;
- *   (2) it creates a PLAIN chat even when `defaultAutopilot` is on. The main
- *       segment honours that preference; this entry names its mode, so it must
- *       pin it — otherwise the one control that says "New chat" hands back an
- *       autopilot session.
+ *   (1) "New chat" renders in the menu — a menu that offers only the other
+ *       create entries reads as if the caret could not make a plain chat at all;
+ *   (2) it creates a PLAIN chat: the mode it sends is the default surface ('').
  *
  * Radix DropdownMenu cannot be opened by mouse in jsdom (needs PointerEvent),
  * so the trigger is activated by keyboard — the path jsdom does handle.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
@@ -25,6 +21,7 @@ import { ThemeProvider } from '../hooks/useTheme'
 import { SETTINGS_CREW_MEMBERS_PREVIEW_ID } from '../hooks/useSettingHighlight'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 import type { RootState } from '../store'
+import type { ChatFolder } from '../types'
 
 // Render framer-motion elements as plain DOM because jsdom cannot run projection.
 vi.mock('framer-motion', async () => {
@@ -55,15 +52,17 @@ vi.mock('framer-motion', async () => {
 
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 
-// `defaultAutopilot` is the whole point of assertion (2), so the config mock is
-// a mutable box the tests flip between renders.
-const cfg = vi.hoisted(() => ({ value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown> }))
+// A mutable box so a test can flip the config between renders.
+const cfg = vi.hoisted(() => ({ value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown> }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
   saveChatConfig: vi.fn(),
 }))
 
-const mocks = vi.hoisted(() => ({ createChatSlot: vi.fn(), listInstances: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  createChatSlot: vi.fn(), listInstances: vi.fn(), chatFolders: vi.fn(),
+  instancesCapabilities: vi.fn(), crewPeerPost: vi.fn(), dashboardConfig: vi.fn(),
+}))
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
   api: new Proxy(mocks as Record<string, unknown>, {
@@ -92,6 +91,8 @@ import {
 // Not mocked: the gate reads real localStorage, so the fixture that turns crew
 // on is the same write the Settings > Developer > Feature Previews toggle performs.
 import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT } from '../utils/previewFlags'
+import enManual from '../i18n/locales/en.manual.json'
+import { openCrewWindow, closeCrewWindow } from '../pages/chat/crew-window/crewWindowStore'
 
 /** Where the router is: the "Crew Members" entry navigates rather than creates,
  *  so its tests read the destination back instead of a create call. */
@@ -100,10 +101,12 @@ function LocationProbe() {
   return <div data-testid="location">{loc.pathname}{loc.search}</div>
 }
 
-function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: string } = {}) {
+function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: string; onOpenPeerSession?: (id: string, key: string) => void; connected?: boolean; folders?: ChatFolder[] } = {}) {
   const store = createTestStore({
     dashboard: {
-      status: {}, connected: false, slots: [], approvalMode: 'normal',
+      // The creators are gateway-gated, so a case asserting a create reaches the
+      // server needs a live gateway; the offline cases pass `connected: false`.
+      status: {}, connected: opts.connected ?? true, slots: [], approvalMode: 'normal',
       channelTrusted: false, refreshTrigger: 0, unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -115,7 +118,10 @@ function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: st
     ...(opts.warm ? { instances: { warm: opts.warm } as unknown as RootState['instances'] } : {}),
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  qc.setQueryData(['chat-folders'], [])
+  // Seeded AND mocked: the ['chat-folders'] query refetches on mount, so a seed
+  // alone is replaced by the Proxy's default [] mid-test.
+  mocks.chatFolders.mockResolvedValue(opts.folders ?? [])
+  qc.setQueryData(['chat-folders'], opts.folders ?? [])
   const view = render(
     <QueryClientProvider client={qc}>
       <Provider store={store}>
@@ -124,7 +130,8 @@ function renderSidebar(opts: { warm?: Record<string, unknown>; defaultAgent?: st
             <ChatSidebar
               slots={[]} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent={opts.defaultAgent ?? ''} installedAgents={[]}
-            />
+              onOpenPeerSession={opts.onOpenPeerSession}
+              />
             <LocationProbe />
           </MemoryRouter>
         </ThemeProvider>
@@ -141,12 +148,12 @@ function openCreateMenu() {
 
 /** Reach a menu ROW by role, never by text.
  *
- *  The split button's main segment is labelled "New chat" too, so a bare
- *  `findByText('New chat')` matches the header span as well as this row and
- *  throws on the ambiguity. The role scopes the query to the menu, and the
+ *  The split button's main segment carries its own "New" label and a title of
+ *  "New chat", so a text query is one relabel away from matching the header as
+ *  well as this row. The role scopes the query to the menu, and the
  *  accessible name is the row's own label — the leading lucide icon
  *  contributes no text. */
-function findCreateMenuItem(label: string) {
+function findCreateMenuItem(label: string | RegExp) {
   return screen.findByRole('menuitem', { name: label })
 }
 
@@ -157,8 +164,11 @@ beforeEach(() => {
   __resetErrorJournalForTests()
   __resetNavSeamForTests()
   installSoftNavigate(() => {})
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   mocks.createChatSlot.mockResolvedValue({ key: 'chat-new-1' })
+  mocks.instancesCapabilities.mockResolvedValue({ version_match: true, version: '0.9.0', local_version: '0.9.0' })
+  mocks.dashboardConfig.mockResolvedValue({ default_memory_mode: 'persistent' })
+  mocks.crewPeerPost.mockResolvedValue({ key: 'peer-new-1' })
   mocks.listInstances.mockResolvedValue({
     active: true, warm_set_cap: 5, sso: {},
     instances: [{ id: 'i-nobita', name: 'nobita' }, { id: 'i-gian', name: 'gian' }],
@@ -171,30 +181,32 @@ afterEach(() => {
 })
 
 describe('create-button caret menu', () => {
-  it('lists "New chat" next to "New autopilot chat"', async () => {
+  it('lists "New chat" in the caret menu', async () => {
     renderSidebar()
     openCreateMenu()
     expect(await findCreateMenuItem('New chat')).toBeTruthy()
-    expect(screen.getByText('New autopilot chat')).toBeTruthy()
   })
 
-  it('explains the engineered entries, at the point of choice', async () => {
-    // The moment a user cannot tell Autopilot from Crew Members is the moment
-    // this menu opens. Before this, the only explanation was a native title= on
-    // the sidebar badge — i.e. visible only after the session already existed.
+  it('offers importing a session from a file among the create entries', async () => {
+    // Import creates a session, so it is reachable without first opening the
+    // ⋯ menu of some unrelated session.
+    renderSidebar()
+    openCreateMenu()
+    expect(await findCreateMenuItem(/import a session from a file/i)).toBeTruthy()
+  })
+
+  it('explains the Crew Members entry at the point of choice', async () => {
     // The Members page is on, so the crew gloss describes the page itself.
     localStorage.setItem(PREVIEW_CREW, '1')
     renderSidebar()
     openCreateMenu()
-    await screen.findByText('New autopilot chat')
-    // The contrast that matters: one job in stages vs standing agents you talk to.
-    expect(screen.getByText(/One job, done in steps/)).toBeTruthy()
-    expect(screen.getByText(/Opens the Crew Members page/)).toBeTruthy()
+    await findCreateMenuItem('New chat')
+    expect(screen.getByText(/Opens the Mates page/)).toBeTruthy()
   })
 
   it('leaves the plain entries single-line', async () => {
-    // "New chat" / "New folder" need no gloss, and describing them would bury
-    // the contrast between the two engineered modes.
+    // "New chat" / "New folder" need no gloss; only the Crew Members entry,
+    // which does not create a chat, carries one.
     renderSidebar()
     openCreateMenu()
     await findCreateMenuItem('New chat')
@@ -207,24 +219,13 @@ describe('create-button caret menu', () => {
     }
   })
 
-  it('"New chat" creates a plain session even when defaultAutopilot is on', async () => {
-    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: true }
+  it('"New chat" creates a plain session', async () => {
     renderSidebar()
     openCreateMenu()
     fireEvent.click(await findCreateMenuItem('New chat'))
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
-    // createSlot passes the mode positionally; assert no call carried 'orchestrator'.
-    for (const call of mocks.createChatSlot.mock.calls) {
-      expect(call).not.toContain('orchestrator')
-    }
-  })
-
-  it('"New autopilot chat" still creates an orchestrator session', async () => {
-    renderSidebar()
-    openCreateMenu()
-    fireEvent.click(await screen.findByText('New autopilot chat'))
-    await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
-    expect(mocks.createChatSlot.mock.calls.some(c => c.includes('orchestrator'))).toBe(true)
+    // `mode` is the FOURTH positional argument of createChatSlot.
+    expect(mocks.createChatSlot.mock.calls.at(-1)?.[3]).toBe('')
   })
 
   // "Crew Members" — Crew Mode retired, and the entry that used to create a
@@ -237,9 +238,9 @@ describe('create-button caret menu', () => {
     openCreateMenu()
     // Anchor on a sibling entry first: an empty query below would also pass if
     // the menu simply failed to open.
-    await screen.findByText('New autopilot chat')
+    await findCreateMenuItem('New chat')
     const item = screen.getByTestId('open-crew-members')
-    expect(item.textContent).toContain('Crew Members')
+    expect(item.textContent).toContain('Mates')
     // The retired ingress and its experimental tag are gone, not merely hidden.
     expect(screen.queryByTestId('new-crew-chat')).toBeNull()
     expect(screen.queryByText('New Crew Mode chat')).toBeNull()
@@ -267,7 +268,7 @@ describe('create-button caret menu', () => {
     // The gloss discloses the detour BEFORE the click, instead of promising the
     // page and then landing somewhere else (UX review on #9519).
     expect(item.textContent).toMatch(/Opens Settings first/)
-    expect(item.textContent).not.toMatch(/Opens the Crew Members page/)
+    expect(item.textContent).not.toMatch(/Opens the Mates page/)
     fireEvent.click(item)
     await waitFor(() => expect(screen.getByTestId('location').textContent)
       .toBe(`/settings/developer?highlight=${SETTINGS_CREW_MEMBERS_PREVIEW_ID}`))
@@ -326,33 +327,52 @@ describe('create-button caret menu', () => {
     expect(screen.queryByTestId('new-chat-on-crew-i-gian')).toBeNull()
 
     fireEvent.click(row)
-    // The session is created LOCALLY and bound to the peer for execution, so it
-    // lands in this machine's list with a crew chip. This replaced an earlier
-    // shape that POSTed straight to the peer's own create endpoint through the
-    // proxy: the session then existed only over there, and the only way to reach
-    // it was to switch to that crew's iframe pane. `instance_id` is what carries
-    // the binding, and it must be sent at BIRTH — the backend opens the peer's
-    // slot before creating the local one, so a disconnected or version-skewed
-    // peer fails the create instead of leaving a session that cannot send.
+    // The session is minted ON the peer through the proxy, with this machine's
+    // privacy default, and opens as a window. Nothing is created locally.
     await waitFor(() =>
-      expect(mocks.createChatSlot).toHaveBeenCalledWith(
-        undefined, undefined, undefined, undefined, 'persistent', undefined, undefined,
-        undefined, 'i-nobita',
-        // The trailing `adopt_remote_slot`, and it must stay UNDEFINED here: this
-        // is the MINT path ("New chat on crew"), which asks the peer for a brand
-        // new session. Naming a key here would turn it into an adopt of somebody
-        // else's existing session — the two paths differ only by this argument.
-        undefined,
-        // `agent_kind`: no agent was named, so no namespace rides with it.
-        undefined,
-        // This build's own create tail, after upstream's `agent_kind`:
-        // `clean_mode`, then `project`. Both undefined HERE for their own
-        // reason, not as padding — the crew row names neither, and `project`
-        // falls through to the active slot's, which this test has none of.
-        undefined,
-        undefined,
-      ),
-    )
+      expect(mocks.crewPeerPost).toHaveBeenCalledWith('i-nobita', 'api/chat/slots', { memory_mode: 'persistent' }))
+    await waitFor(() =>
+      expect(JSON.parse(sessionStorage.getItem('kirocrew.crewWindow') || 'null')).toEqual({ instanceId: 'i-nobita', key: 'peer-new-1' }))
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('hands a new crew session to a host with no chat pane of its own', async () => {
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
+    const onOpenPeerSession = vi.fn()
+    renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } }, onOpenPeerSession })
+    openCreateMenu()
+    fireEvent.keyDown(await screen.findByTestId('new-chat-on-crew'), { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByTestId('new-chat-on-crew-i-nobita'))
+    await waitFor(() => expect(onOpenPeerSession).toHaveBeenCalledWith('i-nobita', 'peer-new-1'))
+    expect(sessionStorage.getItem('kirocrew.crewWindow') || null).toBeNull()
+  })
+
+  it('does not yank the view onto the new crew session when the user moved meanwhile', async () => {
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
+    let finish: (v: unknown) => void = () => {}
+    mocks.crewPeerPost.mockReturnValue(new Promise(r => { finish = r }))
+    renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } } })
+    openCreateMenu()
+    fireEvent.keyDown(await screen.findByTestId('new-chat-on-crew'), { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByTestId('new-chat-on-crew-i-nobita'))
+    await waitFor(() => expect(mocks.crewPeerPost).toHaveBeenCalled())
+    // The user opens another crew session while the create is in flight.
+    openCrewWindow({ instanceId: 'i-other', key: 'elsewhere' })
+    await act(async () => { finish({ key: 'peer-new-1' }) })
+    expect(JSON.parse(sessionStorage.getItem('kirocrew.crewWindow') || 'null')).toEqual({ instanceId: 'i-other', key: 'elsewhere' })
+    closeCrewWindow()
+  })
+
+  it('refuses a crew create across a version mismatch before minting anything', async () => {
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
+    mocks.instancesCapabilities.mockResolvedValue({ version_match: false, version: '0.6.0', local_version: '0.9.0' })
+    renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } } })
+    openCreateMenu()
+    fireEvent.keyDown(await screen.findByTestId('new-chat-on-crew'), { key: 'ArrowRight' })
+    fireEvent.click(await screen.findByTestId('new-chat-on-crew-i-nobita'))
+    const alert = await screen.findByTestId('new-chat-on-crew-error')
+    expect(alert.textContent).toContain('0.6.0')
+    expect(mocks.crewPeerPost).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -364,7 +384,7 @@ describe('create-button caret menu', () => {
     const user = userEvent.setup()
     mobileViewport.value = mobile
     localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
-    mocks.createChatSlot.mockRejectedValue(new Error('peer version mismatch'))
+    mocks.crewPeerPost.mockRejectedValue(new Error('peer version mismatch'))
     renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } } })
     openCreateMenu()
 
@@ -376,12 +396,12 @@ describe('create-button caret menu', () => {
     row.focus()
     await user.keyboard('{Enter}')
     const alert = await screen.findByTestId('new-chat-on-crew-error')
-    expect(mocks.createChatSlot).toHaveBeenCalledTimes(1)
+    expect(mocks.crewPeerPost).toHaveBeenCalledTimes(1)
 
     row = await screen.findByTestId('new-chat-on-crew-i-nobita')
     row.focus()
     await user.keyboard('{Enter}')
-    await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(mocks.crewPeerPost).toHaveBeenCalledTimes(2))
     await screen.findByTestId('new-chat-on-crew-error')
 
     row = await screen.findByTestId('new-chat-on-crew-i-nobita')
@@ -393,16 +413,12 @@ describe('create-button caret menu', () => {
     await user.keyboard(key)
 
     expect(consumeChatHandoff()).toContain('peer version mismatch')
-    expect(mocks.createChatSlot).toHaveBeenCalledTimes(2)
+    expect(mocks.crewPeerPost).toHaveBeenCalledTimes(2)
   })
 
   it('sends no agent with a crew create even when this machine has a default', async () => {
-    // The assertion above pins `agent` to undefined too, but only because its
-    // fixture configures no default — so it would still pass if the entry sent
-    // one. This is the case that makes the omission load-bearing: `defaultAgent`
-    // names a crew from THIS machine's roster and the backend forwards any agent
-    // it is given straight to the peer, where that name means nothing (or means
-    // a different crew). The peer applies its own default instead.
+    // `defaultAgent` names a crew from THIS machine's roster, where the peer's
+    // name means nothing (or a different crew). The peer applies its own.
     localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
     renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } }, defaultAgent: 'planner' })
     openCreateMenu()
@@ -410,21 +426,112 @@ describe('create-button caret menu', () => {
     fireEvent.keyDown(trigger, { key: 'ArrowRight' })
     fireEvent.click(await screen.findByTestId('new-chat-on-crew-i-nobita'))
 
-    // `agent` is the SECOND positional argument; `instance_id` the tenth.
-    await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
-    const call = mocks.createChatSlot.mock.calls.at(-1)
-    expect(call?.[1]).toBeUndefined()
-    expect(call?.[8]).toBe('i-nobita')
-    expect(call).not.toContain('planner')
+    await waitFor(() => expect(mocks.crewPeerPost).toHaveBeenCalled())
+    expect(JSON.stringify(mocks.crewPeerPost.mock.calls.at(-1))).not.toContain('planner')
   })
 
-  it('still stamps the default agent on an ordinary local create', async () => {
-    // The contrast that makes the subtraction above a deliberate one rather than
-    // a dropped argument: the local entry DOES carry this machine's default.
+  it('sends no agent on an ordinary local create either', async () => {
+    // `defaultAgent` is the roster's default CREWMATE alias. A session created
+    // without picking a crewmate runs the default custom agent (a template),
+    // which the server stamps, so the local entry carries no agent at all.
     renderSidebar({ defaultAgent: 'planner' })
     openCreateMenu()
     fireEvent.click(await findCreateMenuItem('New chat'))
     await waitFor(() => expect(mocks.createChatSlot).toHaveBeenCalled())
-    expect(mocks.createChatSlot.mock.calls.at(-1)?.[1]).toBe('planner')
+    expect(mocks.createChatSlot.mock.calls.at(-1)?.[1]).toBeUndefined()
+  })
+
+  // A crew create takes seconds (a version read, then the peer's own create),
+  // so the picked row must show the pending window: a spinner and a label naming
+  // the crew, both gone once the create settles either way.
+  it.each([
+    ['succeeds', true],
+    ['fails', false],
+  ])('shows a pending crew create until it %s', async (_outcome, ok) => {
+    let settle: (v: unknown) => void = () => {}
+    let fail: (e: unknown) => void = () => {}
+    mocks.crewPeerPost.mockReturnValue(new Promise((resolve, reject) => { settle = resolve; fail = reject }))
+    localStorage.setItem(PREVIEW_REMOTE_CREW_CHAT, '1')
+    renderSidebar({ warm: { 'i-nobita': { local_port: 7879, token: 't' } } })
+    openCreateMenu()
+    fireEvent.keyDown(await screen.findByTestId('new-chat-on-crew'), { key: 'ArrowRight' })
+    // Wait for the crew NAME, not the id fallback: the pending label reads it.
+    await waitFor(() => expect(screen.getByTestId('new-chat-on-crew-i-nobita').textContent).toContain('nobita'))
+    expect(screen.queryByTestId('new-chat-on-crew-spinner-i-nobita')).toBeNull()
+    const pendingText = enManual.pages.chatSidebar.creating_on_crew.replace('{{name}}', 'nobita')
+
+    fireEvent.click(screen.getByTestId('new-chat-on-crew-i-nobita'))
+    await screen.findByTestId('new-chat-on-crew-spinner-i-nobita')
+    expect(screen.getByTestId('new-chat-on-crew-i-nobita').textContent?.trim()).toBe(pendingText)
+    expect(screen.getByTestId('new-chat-on-crew-i-nobita')).toHaveAttribute('aria-busy', 'true')
+    // Not disabled (so not faded): it is the progress cue. A second pick is
+    // refused by the guard, not by the disabled state.
+    expect(screen.getByTestId('new-chat-on-crew-i-nobita')).not.toHaveAttribute('data-disabled')
+    fireEvent.click(screen.getByTestId('new-chat-on-crew-i-nobita'))
+    await waitFor(() => expect(mocks.crewPeerPost).toHaveBeenCalledTimes(1))
+
+    if (ok) settle({ key: 'peer-new-1' })
+    else fail(new Error('peer version mismatch'))
+    await waitFor(() => expect(screen.queryByTestId('new-chat-on-crew-spinner-i-nobita')).toBeNull())
+    expect(screen.queryByText(pendingText)).toBeNull()
+    if (!ok) expect(await screen.findByTestId('new-chat-on-crew-error')).toBeTruthy()
+  })
+})
+
+describe('create-menu offline gating', () => {
+  // Listed INLINE at phone width, which is also the only width where jsdom can
+  // reach the folder rows: a Radix flyout needs PointerEvent support jsdom lacks.
+  const folders: ChatFolder[] = [{ id: 'f-alpha', name: 'Alpha', order: 0 } as ChatFolder]
+
+  it('offline a folder row dims, announces itself, and refuses the pick', async () => {
+    mobileViewport.value = true
+    renderSidebar({ connected: false, folders })
+    openCreateMenu()
+    // The offline accessible name REPLACES the folder name: finding it under
+    // 'Alpha' would mean the announcement never applied.
+    const row = await screen.findByRole('menuitem', { name: 'Alpha disabled \u2014 gateway offline' })
+    expect(row.className).toContain('opacity-40')
+    expect(row.className).toContain('text-muted')
+    expect(row.getAttribute('aria-disabled')).toBe('true')
+    fireEvent.click(row)
+    // Radix closes a menu on onSelect, so a surviving menu is the refusal firing.
+    expect(screen.getByTestId('new-menu-offline-reason')).toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: 'Alpha disabled \u2014 gateway offline' })).toBeInTheDocument()
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('connected the same folder row keeps its name and carries no dim', async () => {
+    mobileViewport.value = true
+    renderSidebar({ connected: true, folders })
+    openCreateMenu()
+    const row = await screen.findByRole('menuitem', { name: 'Alpha' })
+    expect(row.className).not.toContain('opacity-40')
+    expect(screen.queryByTestId('new-menu-offline-reason')).toBeNull()
+  })
+
+  it('offline every create row is dimmed and the menu says why', async () => {
+    renderSidebar({ connected: false })
+    openCreateMenu()
+    const rows = [
+      await screen.findByTestId('new-plain-chat'),
+      screen.getByTestId('new-incognito-chat'),
+      screen.getByTestId('new-temporary-chat'),
+      screen.getByTestId('new-folder'),
+    ]
+    for (const row of rows) {
+      expect(row.getAttribute('aria-disabled')).toBe('true')
+      expect(row.getAttribute('title')).toMatch(/offline/i)
+      expect(row.className).toContain('opacity-40')
+    }
+    expect(screen.getByTestId('new-menu-offline-reason')).toBeInTheDocument()
+    fireEvent.click(rows[0])
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
+  })
+
+  it('offline the split button\'s primary segment refuses with a notice, not a failure', async () => {
+    renderSidebar({ connected: false })
+    fireEvent.click(screen.getByRole('button', { name: /new chat session disabled/i }))
+    expect(await screen.findByTestId('folder-action-offline')).toHaveTextContent(/reconnect to create sessions/i)
+    expect(mocks.createChatSlot).not.toHaveBeenCalled()
   })
 })

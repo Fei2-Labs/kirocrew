@@ -1,54 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
-import { createPortal } from 'react-dom'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import {
-  ArrowRight,
-  Check,
-  Clock,
-  Command,
-  Cog,
-  Component,
-  Folder,
-  GitMerge,
-  Loader2,
-  MessageSquare,
-  MessageSquarePlus,
-  Package,
-  RotateCcw,
-  Search,
-  Send,
-  ScanEye,
-  SunMoon,
-  Terminal,
-} from 'lucide-react'
+import { OverlayPortal } from '../../components/overlayRoot'
+import { Command, Loader2 } from 'lucide-react'
 
-import { api } from '../../api/client'
-import { commandFolderName, fileSessionInCommandFolder } from './sessionFolder'
-import type { ChatFolderRow } from './sessionFolder'
-import type { ChatFolder } from '../../types'
-import { appNavTargets } from '../../appNav'
-import { useAppDispatch, useAppSelector } from '../../store'
-import { createSlot, setPendingInput, switchSlot, requestFolderReveal } from '../../store/chatSlice'
+import { useAppDispatch, useAppSelector, useAppStore } from '../../store'
 import { findReport } from '../../utils/errorReport'
 import { errMessage } from '../../utils/thunkError'
 import ErrorNotice from '../../components/ErrorNotice'
-import { Highlighted } from '../../components/commandPalette/Highlighted'
-import { SETTINGS_REGISTRY } from '../../components/commandPalette/settingsRegistry.gen'
-import { localizedSettingLabel } from '../../components/commandPalette/settingsSearchCore'
-import { settingsRoute } from '../../components/commandPalette/settingsRoute'
-import { settingsSubtitle } from '../../components/commandPalette/settingsTabLabel'
+import { useSettingsSearchGovernance } from '../../components/commandPalette/useSettingsSearchGovernance'
 import { usePaletteActions } from '../../components/commandPalette/paletteActions'
-import { appIcon } from '../../components/commandPalette/providers/appsProvider'
-import { sessionStatus, useRecentsProvider } from '../../components/commandPalette/providers/recentsProvider'
-import { createArtifactsProvider } from '../../components/commandPalette/providers/artifactsProvider'
-import type { ArtifactsResponse } from '../../components/commandPalette/providers/artifactsProvider'
-import { createFoldersProvider, FOLDERS_STALE_MS } from './foldersProvider'
-import { useSessionsProvider } from '../../components/commandPalette/providers/sessionsProvider'
-import type { Result } from '../../components/commandPalette/types'
 import { resolveCopyTarget, type CopyableRow } from '../../components/commandPalette/copyTarget'
 import { copyToClipboard } from '../../utils/clipboard'
-import { platformShortcut } from '../../utils/platform'
 import { buildShareableUrl } from '../../utils/shareUrl'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useVisualViewport } from '../../hooks/useVisualViewport'
@@ -57,8 +18,7 @@ import { useTheme } from '../../hooks/useTheme'
 import { i18nT } from '../../i18n/t'
 import { useLanguage } from '../../i18n/LanguageProvider'
 
-import { loadUsage, recordUse, type UsageMap } from './frecency'
-import { rankRootRows, type RankedRow, type RootGroup, type RootRow, type RootRowKind, type RowStatus } from './rootIndex'
+import { loadUsage, type UsageMap } from './frecency'
 import {
   argumentIsValid,
   contributedCommands,
@@ -66,6 +26,14 @@ import {
   type ContributedCommand,
 } from './contributedCommands'
 import { useImeGuard } from '../../hooks/useImeGuard'
+import { usePreviewFlag } from '../../hooks/usePreviewFlag'
+import { PREVIEW_CREW } from '../../utils/previewFlags'
+import { ARTIFACTS_ROW_LIMIT, COPY_KEY, DEBOUNCE_MS, ENTER_KEY, SKELETON_WIDTHS, actionLabel, headerOf, rootRowCopyable, type Scope } from './commandBarOverlayModel'
+import { useCommandBarOverlayEngines } from './useCommandBarOverlayEngines'
+import { useCommandBarOverlayRootRows } from './CommandBarOverlayRootRows'
+import { useCommandBarOverlaySlots } from './useCommandBarOverlaySlots'
+import { useCommandBarOverlayActivation } from './useCommandBarOverlayActivation'
+import { commandBarOverlaySlotRenderer } from './CommandBarOverlaySlot'
 
 /**
  * Command Bar — the ⌘K launcher.
@@ -85,370 +53,38 @@ import { useImeGuard } from '../../hooks/useImeGuard'
  * ranking) is what makes a frequent row reachable in one or two keystrokes.
  */
 
-/** Scoped views the bar can enter. Each one owns its own engine. */
-type Scope = null | 'sessions' | 'artifacts' | 'folders'
-
-const SESSIONS_MIN_CHARS = 2
-/**
- * Shortest query the artifacts view will send.
- *
- * Two characters for a different reason than the sessions threshold above, which
- * mirrors a backend floor that returns nothing below it. The artifacts endpoint
- * answers a one-character name query perfectly well — what it costs is a scan over
- * every artifact's metadata to return most of the corpus, which is what the view
- * already shows for free when the query is empty. So the floor buys a cheaper
- * keystroke, not a correct answer.
- */
-const ARTIFACTS_MIN_CHARS = 2
-/**
- * Rows the artifacts view renders, listing and search alike.
- *
- * The endpoint returns the whole matching set with no page size, so this is the
- * only thing between a heavy instance and a thousand-row option list inside a
- * dialog. Sized to the list's own height rather than to the corpus: a name search
- * that needs more than this many rows to find its artifact needs a narrower query,
- * and the listing state is a shortcut to something recent, not an inventory.
- */
-const ARTIFACTS_ROW_LIMIT = 12
-const DEBOUNCE_MS = 150
-
-function groupLabel(group: RootGroup): string {
-  switch (group) {
-    case 'attention':
-      return i18nT('apps.commandBar.group_attention')
-    case 'commands':
-      return i18nT('apps.commandBar.group_commands')
-    case 'apps':
-      return i18nT('apps.commandBar.group_apps')
-    case 'settings':
-      return i18nT('apps.commandBar.group_settings')
-  }
-}
-
-/**
- * The row's own type, for the right-aligned label.
- *
- * Keyed off `kind` first: a `view` row opens a surface inside the bar, which is a
- * different promise from a row that acts and closes, and that difference matters
- * more to the reader than which group it was filed under. Everything else is named
- * by its group. There is deliberately no "Session" case: an attention row's column
- * carries its LIVE STATE instead, which is both more useful and the reason that
- * section exists — and a "Session" kind was considered for this surface once
- * before and dropped.
- */
-function kindLabel(row: { kind: RootRowKind; group: RootGroup; appLabel?: string }): string | null {
-  if (row.group === 'attention') return null
-  if (row.kind === 'view') return i18nT('apps.commandBar.kind.view')
-  if (row.group === 'apps') return i18nT('apps.commandBar.kind.app')
-  if (row.group === 'settings') return i18nT('apps.commandBar.kind.setting')
-  const kind = i18nT('apps.commandBar.kind.command')
-  // Provenance ahead of the kind for a contributed row. Composed with the separator this
-  // column already uses for folder/timestamp rather than a new string, so no catalog
-  // learns a sentence about attribution -- the app's own name is data, not copy.
-  return row.appLabel ? `${row.appLabel}${META_SEP}${kind}` : kind
-}
-
-/**
- * The root list's own row model, expressed as something the copy layer can read.
- *
- * The root index is not the palette's `Result` — it predates the declarative Enter
- * matrix and says where a row goes with `kind` + `route`. That is the same fact in
- * different words, so the adapter is a restatement rather than new wiring, and every
- * `navigate` row in the index (each settings row, each app row, each page row) becomes
- * copyable without touching the place that builds it.
- *
- * The other kinds have no address on purpose. A `view` row opens a surface INSIDE the
- * bar, so there is nothing to hand anybody; `invoke` runs a callback; `prompt` is a
- * question the reader has not answered yet.
- */
-function rootRowCopyable(row: RootRow): CopyableRow {
-  return row.kind === 'navigate' && row.route
-    ? { enter: { kind: 'navigate', route: row.route } }
-    : {}
-}
-
-function groupIcon(group: RootGroup) {
-  switch (group) {
-    case 'attention':
-      return <MessageSquare size={14} className="lucide-inline" />
-    case 'commands':
-      return <Terminal size={14} className="lucide-inline" />
-    case 'apps':
-      return <Package size={14} className="lucide-inline" />
-    case 'settings':
-      return <Cog size={14} className="lucide-inline" />
-  }
-}
-
-/**
- * The right-hand column when a row has live state.
- *
- * One renderer for both row kinds -- a launcher row built from the store and a
- * session row built by a view's engine -- because the two would otherwise drift into
- * two treatments of the same fact. `pill` is reserved for what the user OWES the
- * session; a running session gets a dot, so "needs me" and "busy" never look alike.
- *
- * Sizing: only the pill and the dot are unshrinkable, because they are the signal and
- * they are a few pixels wide. Everything textual yields -- the label truncates and
- * the detail is dropped outright below the `sm` breakpoint -- so the ROW TITLE always
- * wins the contest for space. Held the other way round (a rigid accessory) a long
- * tool name collapsed the title on a 320px viewport, which inverts the point: the
- * title is what identifies the row, the detail is a bonus.
- */
-function statusAccessory(status: RowStatus) {
-  return (
-    <span className="flex items-center gap-1.5 text-[11px] min-w-0 overflow-hidden">
-      {status.pill ? (
-        <span
-          className="shrink-0 px-1.5 rounded text-[10px] uppercase tracking-wide"
-          style={{ background: `var(${status.colorVar})`, color: 'var(--bg)' }}
-        >
-          {status.label}
-        </span>
-      ) : (
-        <>
-          <span
-            className={`shrink-0 w-1.5 h-1.5 rounded-full${status.pulse ? ' animate-pulse' : ''}`}
-            style={{ background: `var(${status.colorVar})` }}
-          />
-          <span className="truncate" style={{ color: `var(${status.colorVar})` }}>
-            {status.label}
-          </span>
-        </>
-      )}
-      {status.detail && (
-        <span className="hidden sm:inline truncate text-muted max-w-[180px]">
-          {status.detail}
-        </span>
-      )}
-    </span>
-  )
-}
-
-/**
- * Every list position the bar can offer, as data.
- *
- * The bar used to hold its rows as one array plus two booleans, and read the extra
- * positions back out with index arithmetic (`rows.length`, `rows.length + 1`)
- * repeated in the activation switch, the render, and the id generator. That works
- * for two extras and stops working at four: each new one has to be inserted at the
- * same offset in three places, and getting it wrong activates a DIFFERENT row than
- * the one the user is looking at — a failure with no visual symptom until it fires.
- *
- * Positions are now one ordered list of tagged slots. Selection is an index into
- * it, and activation, the footer's action name and the rendered row all switch on
- * the same tag, so a slot cannot exist in one of those and not the others.
- */
-type Slot =
-  /** A launcher row from the root index. */
-  | { key: string; tag: 'root'; row: RankedRow }
-  /** A row produced by a scoped view's engine (session search, recents). */
-  | { key: string; tag: 'result'; row: Result }
-  /** Carry the typed text into the sessions view. */
-  | { key: string; tag: 'fallback' }
-  /**
-   * Carry the typed text into the artifacts view.
-   *
-   * A separate tag rather than a scope field on `fallback` so the footer's action
-   * name, the rendered row and activation each switch on the tag and cannot
-   * disagree about which corpus the Enter reaches.
-   */
-  | { key: string; tag: 'fallback-artifacts' }
-  /**
-   * Carry the typed text into the folders view.
-   *
-   * Its own tag for the reason the artifacts tag above gives: the footer's action
-   * name, the rendered row and the activation all switch on the tag, so none of
-   * them can disagree about which corpus the Enter reaches.
-   */
-  | { key: string; tag: 'fallback-folders' }
-  /** Hand the typed text to an agent — the active session, or a new one. */
-  | { key: string; tag: 'ask' }
-  /** The dead end's way out: the corpora this surface does not reach. */
-  | { key: string; tag: 'recovery' }
-  /** Re-run a scoped search that failed. */
-  | { key: string; tag: 'retry' }
-  /** Re-run an artifact search that failed. */
-  | { key: string; tag: 'retry-artifacts' }
-  /** Re-run a folder listing that failed. */
-  | { key: string; tag: 'retry-folders' }
-  /** Drop the query and fall back to the recent sessions listing. */
-  | { key: string; tag: 'clear-query' }
-  /**
-   * Drop the query and fall back to the whole folder list.
-   *
-   * Separate from `clear-query` because the two rows name different destinations:
-   * a session listing is the RECENT ones, while the folder listing is all of them
-   * in sidebar order. One tag would have to read the live scope to pick the verb,
-   * and `actionLabel` is pure over the slot precisely so it cannot.
-   */
-  | { key: string; tag: 'clear-query-folders' }
-
-/**
- * What Enter on this slot will do, named for the footer.
- *
- * The bar's whole promise is that Enter does something specific, and until this
- * existed nothing said what: the row carried its TYPE ("Command", "View") while
- * the verb — run it, open it, step into it — was left for the user to infer from
- * having pressed Enter before.
- */
-function actionLabel(slot: Slot): string {
-  switch (slot.tag) {
-    case 'root':
-      if (slot.row.kind === 'view') return i18nT('apps.commandBar.action_enter')
-      // A `prompt` row steps into a field rather than acting, so Enter is named for
-      // proceeding. Calling it "Run" would promise that this Enter approves or
-      // merges something, which is the one thing it must not be read as -- but
-      // reusing the view row's "Open View" was its own false promise: no view opens
-      // in either shape, and for an argument-less command that Enter creates a
-      // session. "Continue" is the one word true of both, and it commits to nothing
-      // the next step does not do.
-      if (slot.row.kind === 'prompt') return i18nT('apps.commandBar.action_continue')
-      if (slot.row.kind === 'navigate') return i18nT('apps.commandBar.action_open')
-      return i18nT('apps.commandBar.action_run')
-    case 'result':
-      // An artifact row, a folder row and a session row are the same SHAPE and three
-      // different promises, and the footer names the promise. Keyed off the producing
-      // provider rather than the live scope because this function is pure over the
-      // slot — and because the row carries where it came from, while the scope is
-      // state next to it that a future view could disagree with.
-      //
-      // A folder gets `action_open` rather than "Run": pressing Enter reveals it in
-      // the sidebar, and "Run" is the strongest verb this footer has, reserved for
-      // the rows that approve or merge.
-      if (slot.row.providerId === 'artifacts') return i18nT('apps.commandBar.action_open_artifact')
-      if (slot.row.providerId === 'folders') return i18nT('apps.commandBar.action_open')
-      return i18nT('apps.commandBar.action_open_session')
-    case 'fallback':
-      return i18nT('apps.commandBar.action_search_sessions')
-    case 'fallback-artifacts':
-      return i18nT('apps.commandBar.action_search_artifacts')
-    case 'fallback-folders':
-      return i18nT('apps.commandBar.action_search_folders')
-    case 'ask':
-      return i18nT('apps.commandBar.action_ask')
-    case 'recovery':
-      return i18nT('apps.commandBar.action_open_app')
-    case 'retry':
-    case 'retry-artifacts':
-    case 'retry-folders':
-      return i18nT('apps.commandBar.retry')
-    case 'clear-query':
-      return i18nT('apps.commandBar.action_show_recent')
-    case 'clear-query-folders':
-      return i18nT('apps.commandBar.action_show_all_folders')
-  }
-}
-
-/**
- * The section header this slot opens, or null when it continues the one above it.
- *
- * Root slots head on their group; view slots head on whatever the engine grouped
- * them by (the recents listing separates live sessions from history). The synthetic
- * slots — fallback, recovery, retry — head on nothing: they are one-offs at the
- * bottom of the list, and a header over a single row is noise.
- */
-function headerOf(slot: Slot, prev?: Slot): string | null {
-  if (slot.tag === 'root') {
-    if (prev?.tag === 'root' && prev.row.group === slot.row.group) return null
-    return groupLabel(slot.row.group)
-  }
-  if (slot.tag === 'result') {
-    const label = slot.row.groupLabel
-    if (!label) return null
-    if (prev?.tag === 'result' && prev.row.groupLabel === label) return null
-    return label
-  }
-  return null
-}
-
-/** Placeholder bar widths, descending so the block reads as text rather than a grid. */
-const SKELETON_WIDTHS = ['58%', '46%', '34%'] as const
-
-/**
- * The Enter keycap.
- *
- * A symbol rather than the word: the footer is a key hint, and every locale's
- * keyboard prints this glyph on the key itself. Held as a constant so the
- * untranslated-literal gate is not asked to judge a lone punctuation mark.
- */
-const ENTER_KEY = '\u21B5'
-/**
- * The copy chord, spelled for the machine the reader is on.
- *
- * Through the product's own formatter rather than a literal, because the chord is not
- * the same everywhere: a hardcoded glyph would name a key Windows and Linux readers do
- * not have.
- */
-const COPY_KEY = platformShortcut('Cmd+C')
-
-/**
- * Separator between a session row's folder and its timestamp.
- *
- * A constant for the same reason as the keycap: a lone middle dot is not copy, and
- * asking the untranslated-literal gate to judge one produces a false positive.
- */
-const META_SEP = ' \u00B7 '
-
-/**
- * Key of the ask slot.
- *
- * A constant because three places have to agree on it: the slot itself, the
- * in-flight guard that refuses a second activation, and the spinner that says the
- * work is running. A literal repeated three times is how the spinner ends up
- * pointing at a row that is not the one working.
- */
-const ASK_SLOT_KEY = 'slot:ask'
-
-/**
- * Glyphs a contributed command may name, and the fallback when it names none.
- *
- * An allowlist rather than a URL or inline SVG the app supplies, for two reasons
- * that both matter more than the extra vocabulary: the root promises to issue no
- * request, and a glyph that must be fetched breaks that promise on every open; and
- * an app-supplied SVG is app-authored markup rendered inside the host's own
- * surface. The set is small on purpose and grows by pull request, which is a cheap
- * ask compared to either alternative.
- */
-const CONTRIBUTED_ICONS: Record<string, ReactNode> = {
-  Check: <Check size={14} className="lucide-inline" />,
-  Command: <Command size={14} className="lucide-inline" />,
-  GitMerge: <GitMerge size={14} className="lucide-inline" />,
-  Package: <Package size={14} className="lucide-inline" />,
-  ScanEye: <ScanEye size={14} className="lucide-inline" />,
-  Search: <Search size={14} className="lucide-inline" />,
-  Send: <Send size={14} className="lucide-inline" />,
-  Terminal: <Terminal size={14} className="lucide-inline" />,
-}
-
-/** The named glyph, or the generic command one when the name is unknown. */
-function contributedIcon(name: string): ReactNode {
-  // `Object.hasOwn`, not a plain index with `??`. An INHERITED key is not nullish, so
-  // `CONTRIBUTED_ICONS['__proto__']` yields an object and `CONTRIBUTED_ICONS['constructor']`
-  // a function -- neither triggers the fallback, and both are then handed to React as a
-  // child, which throws. `icon` is deliberately unvalidated beyond being a string ("an
-  // unknown name falls back"), so any name reaches this line, and the crash takes the
-  // whole overlay down on every open rather than degrading that one row.
-  return Object.hasOwn(CONTRIBUTED_ICONS, name) ? (
-    CONTRIBUTED_ICONS[name]
-  ) : (
-    <Terminal size={14} className="lucide-inline" />
-  )
-}
-
 export default function CommandBarOverlay({
   open,
   onClose,
+  initialQuery = '',
 }: {
   open: boolean
   onClose: () => void
+  initialQuery?: string
 }) {
   const ime = useImeGuard()
+  /**
+   * Whether the Crewmates preview is on for this reader.
+   *
+   * This bar is an INGRESS to `/members`, and that page is registered with
+   * `previewFlag: PREVIEW_CREW` — so every other door to it applies this gate, and a
+   * surface that did not would advertise a page the operator has not opted into. The
+   * app ships `defaultEnabled: true`, so without this a default install shows
+   * `Search Crewmates` in the root, carries a typed query into it, and lets Enter
+   * reach `/members` while the page itself is supposed to be invisible.
+   *
+   * It gates all THREE rows this feature adds — the view row, the fallback row and the
+   * empty-state row — because each one is independently reachable.
+   */
+  const crewPreview = usePreviewFlag(PREVIEW_CREW)
   const vv = useVisualViewport()
   const inputRef = useRef<HTMLInputElement | null>(null)
   const dialogRef = useRef<HTMLDivElement | null>(null)
-  const [query, setQuery] = useState('')
-  const [debounced, setDebounced] = useState('')
+  // Seeded from what the host caught while this chunk loaded, so keys typed right
+  // after the gesture rank the first render instead of being lost. The host mounts
+  // the bar once per open, so this is also what makes each open start fresh.
+  const [query, setQuery] = useState(initialQuery)
+  const [debounced, setDebounced] = useState(initialQuery)
   const [scope, setScope] = useState<Scope>(null)
   /**
    * The contributed command whose ARGUMENT the field is currently collecting.
@@ -475,7 +111,43 @@ export default function CommandBarOverlay({
   const [previewClipped, setPreviewClipped] = useState(false)
 
   const [selected, setSelected] = useState(0)
+  /**
+   * Where the pointer was at the last mousemove anywhere over the bar, so hover
+   * selects a row only on REAL motion.
+   *
+   * The browser fires mouseover, mouseenter and even mousemove when rows re-render
+   * or scroll under a pointer that has not moved. None of those is the reader
+   * pointing at a row, and selecting on them would let a resting pointer overwrite
+   * the reset to row 0 that every keystroke makes, so Enter would act on whatever row
+   * landed under the cursor.
+   *
+   * The position is recorded by the backdrop, which every mousemove inside the bar
+   * bubbles to: over a row, a group header, the empty notice or the backdrop itself.
+   * A row compares against it before the event reaches the backdrop. Recording only
+   * over rows would compare a pointer resting on a header against an older row
+   * position and read the re-render as motion. The first event only records: with
+   * nothing to compare against it cannot be told apart from a re-render under a
+   * resting pointer, and one swallowed pixel of motion is the cost.
+   */
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null)
+  const recordPointer = (e: { clientX: number; clientY: number }) => {
+    lastPointerRef.current = { x: e.clientX, y: e.clientY }
+  }
+  const selectOnPointerMove = (i: number, e: { clientX: number; clientY: number }) => {
+    const last = lastPointerRef.current
+    if (!last || (last.x === e.clientX && last.y === e.clientY)) return
+    setSelected(i)
+  }
+  /**
+   * Whether the reader asked to see every session waiting on them. Until then the
+   * attention group keeps the root's per-group cap and ends on a row counting the
+   * rest, so a seventh blocked session is never dropped without a trace.
+   */
+  const [attentionExpanded, setAttentionExpanded] = useState(false)
   const [usage, setUsage] = useState<UsageMap>(() => loadUsage())
+  // The rows every other settings search withholds, withheld here too, from
+  // cached answers only: the root issues no request.
+  const settingsGovernance = useSettingsSearchGovernance({ fetch: false })
   const [actionError, setActionError] = useState<string | null>(null)
   /**
    * What the last copy did, held until the reader moves.
@@ -525,6 +197,11 @@ export default function CommandBarOverlay({
   const { resolved } = useLanguage()
   const { cycle: cycleTheme } = useTheme()
   const dispatch = useAppDispatch()
+  // A store HANDLE for the session rows' post-switch focus: by the time a
+  // `switchSlot` settles this bar has closed, so only the store can still say
+  // which slot is active. Read, never subscribed -- the selectors below are the
+  // subscriptions.
+  const store = useAppStore()
   // Live session state, read straight from the store the dashboard already keeps
   // current over its socket. This is what lets the root LEAD with the sessions that
   // owe the user something without issuing a request: the facts are already here,
@@ -538,137 +215,32 @@ export default function CommandBarOverlay({
   // handler below, which needs it to pop a scope before it closes the bar (and
   // claims it through the IME latch first).
   useDialogFocusTrap(dialogRef, onClose, { handleEscape: false })
-  // Constructing the sessions engine is just memoized closures — it issues no
-  // request until `search()` is called, and only the sessions VIEW calls it. That
-  // call site, not the construction, is what the root must never reach.
-  // Constructed here but INERT until the sessions view is entered: the hook's own
-  // ['instances'] query would otherwise fire on a warm install the moment the root
-  // opened, which is exactly the request this surface promises not to make.
-  const sessions = useSessionsProvider({ active: scope === 'sessions' })
-  // The sessions view's LISTING engine. Constructed here and inert: the hook reads
-  // live slots out of the store and reads a localStorage preference, but issues no
-  // request until `search()` is called, and the only call site is gated on the
-  // scope below. Constructing it costs the root nothing; entering the view is what
-  // makes it fetch.
-  const recentSessions = useRecentsProvider()
+  const {
+    sessions,
+    recentSessions,
+    apps,
+    chatFoldersRef,
+    queryClient,
+    folderSortMode,
+    folderSortError,
+    artifacts,
+    folders,
+    runningMates,
+    mates,
+  } = useCommandBarOverlayEngines({ scope, liveSlots, dispatch, navigate })
 
-  // The app list is READ, never fetched: the shell publishes its own
-  // `GET /api/apps` response under this key, and `enabled: false` makes this a
-  // cache subscriber that re-renders when that write lands. Fetching here would
-  // reintroduce a request on any open past the stale window, which is exactly the
-  // cost this surface exists to remove. Before the shell's first response the Apps
-  // group is simply empty; commands and settings are local and render regardless.
-  const { data: apps } = useQuery({
-    queryKey: ['apps'],
-    queryFn: () => api.listApps(),
-    enabled: false,
-  })
-
-  // The folder list is READ the same way and for a sharper reason: `GET
-  // /api/chat/folders` walks the on-disk session list synchronously to count archived
-  // sessions per folder, so fetching it here would pay for a filesystem scan on every
-  // command run to learn what the sidebar's own cache already holds (the WebSocket
-  // seeds this key from the folder tree). A cold cache falls back to one fetch inside
-  // `fileSessionInCommandFolder`.
-  const { data: chatFolders } = useQuery({
-    queryKey: ['chat-folders'],
-    queryFn: () => api.chatFolders(),
-    enabled: false,
-  })
-  // Held in a ref because the filing runs from an async callback, long after the render
-  // that read the cache.
-  const chatFoldersRef = useRef<unknown>(chatFolders)
-  chatFoldersRef.current = chatFolders
-  const queryClient = useQueryClient()
-
-  /**
-   * The artifacts view's engine.
-   *
-   * Built here from the palette provider's factory rather than taken from its hook,
-   * for two reasons that both matter to this surface. The request is ours: the hook
-   * asks for `content=1` and `snippet=1`, and `snippet=1` alone makes the server
-   * read every listed artifact's body to build a preview — so a name search that
-   * left it on would pay for the full-corpus content read it was avoiding. And the
-   * navigation is ours: every other row in this file leaves through
-   * `usePaletteActions().navigate`, and the hook would bring a second router
-   * mechanism in beside it.
-   *
-   * What IS reused is the part worth reusing: how an artifact becomes a row, so a
-   * result here and a result in the palette are the same row built by the same code.
-   *
-   * Inert on construction, like the two engines above — `fetchQuery` runs from
-   * `search()`, and the only call site is gated on the artifacts scope.
-   *
-   * Content search is the next step, and it is this one request that changes.
-   */
-  const artifacts = useMemo(
-    () =>
-      createArtifactsProvider({
-        fetchArtifacts: q =>
-          queryClient.fetchQuery<ArtifactsResponse>({
-            queryKey: ['artifacts', 'command-bar', 'name', q],
-            queryFn: () => api.artifacts({ q: q || undefined }),
-            staleTime: 15_000,
-          }),
-        openArtifact: slug => navigate(`/artifacts/${slug}`),
-      }),
-    [navigate, queryClient],
-  )
-
-  /**
-   * The folders view's engine — this app's own folders corpus
-   * (`./foldersProvider`), wired to THIS surface's seams.
-   *
-   * It lives beside this file rather than under the host palette's providers, and
-   * that is the point: the host carries no Folders tab, so there is one
-   * implementation of "find a folder and land on it" and the app owns it. The
-   * corpus itself is hook-free precisely so the wiring stays here — React-Query for
-   * the fetch, `usePaletteActions` for the route change. Every route change in this
-   * overlay goes through that hook, and one component holding two navigation
-   * mechanisms is how one of them ends up unexercised.
-   *
-   * Inert on construction, like the two engines above: the fetch runs from
-   * `search()`, and the only call site is gated on the folders scope.
-   */
-  const folders = useMemo(
-    () =>
-      createFoldersProvider({
-        fetchFolders: async () => {
-          const rows = await queryClient.fetchQuery<ChatFolder[]>({
-            // The SHARED key the sidebar and the filing path below read, so entering
-            // the view on a warm cache costs nothing and a cold one pays once.
-            queryKey: ['chat-folders'],
-            queryFn: () => api.chatFolders(),
-            staleTime: FOLDERS_STALE_MS,
-          })
-          // The key is shared, so what comes back is whatever the last writer put
-          // there. A non-array reaches `folders.map` inside the ordering helper and
-          // throws in render, which would take the whole launcher down over a bad
-          // payload that only this one view needs.
-          return Array.isArray(rows) ? rows : []
-        },
-        revealFolder: folderId => {
-          // Store write BEFORE the route change: the request is held in the store
-          // precisely because the sidebar may not be mounted yet, and its consuming
-          // effect runs on mount as well as on change, so an early request is
-          // replayed rather than dropped.
-          dispatch(requestFolderReveal(folderId))
-          navigate('/chat')
-        },
-      }),
-    [dispatch, navigate, queryClient],
-  )
-
+  // The query is NOT reset here. It is seeded at mount, and clearing it on the open
+  // edge would drop the type-ahead along with anything typed before this effect ran.
   useEffect(() => {
     if (!open) return
-    setQuery('')
-    setDebounced('')
     setScope(null)
     setArgCommand(null)
     setSelected(0)
+    lastPointerRef.current = null
     setUsage(loadUsage())
     setActionError(null)
     setPendingRow(null)
+    setAttentionExpanded(false)
   }, [open])
 
   useEffect(() => {
@@ -744,670 +316,30 @@ export default function CommandBarOverlay({
   }, [apps])
   commandByIdRef.current = commandById
 
-  const rootRows: RootRow[] = useMemo(() => {
-    const rows: RootRow[] = []
-    // The sessions that owe the user something, FIRST.
-    //
-    // `sessionStatus` marks exactly those with `style: 'pill'` — an approval to
-    // grant, a question to answer — and everything else (running, unread, idle) with
-    // a dot or nothing. Only the pill cases are lifted here, so this section is
-    // usually absent: a launcher that always opens on a "Needs You" header teaches
-    // the user to ignore it, and the whole value is that its presence means
-    // something. A running session is not waiting on anyone and stays in the
-    // sessions view where it belongs.
-    for (const slot of liveSlots) {
-      const st = sessionStatus(slot, unreadSlots, slotStatusDetail[slot.key], simplifiedToolNames)
-      if (st.style !== 'pill' || !st.label || !st.colorVar) continue
-      rows.push({
-        id: `attention:${slot.key}`,
-        title: slot.title || slot.key,
-        group: 'attention',
-        kind: 'invoke',
-        icon: <MessageSquare size={14} className="lucide-inline" />,
-        status: { colorVar: st.colorVar, label: st.label, detail: st.detail, pill: true },
-        // Same activation the sidebar and the recents listing use, so a session
-        // opened from here lands exactly where it lands from anywhere else.
-        run: async () => {
-          dispatch(switchSlot({ key: slot.key, announceOnMissing: true }))
-          navigate('/chat')
-        },
-      })
-    }
-    rows.push(
-      {
-        id: 'command:new-session',
-        title: i18nT('apps.commandBar.cmd_new_session'),
-        group: 'commands',
-        kind: 'invoke',
-        icon: <MessageSquarePlus size={14} className="lucide-inline" />,
-        // `dispatch(...).unwrap()` already returns a promise that rejects on failure,
-        // which is the whole contract an `invoke` row needs. Wrapping it in a mutation
-        // added state nothing reads, changed identity every render (so this memo never
-        // held), and refused to re-run after a rejection -- leaving a failed New
-        // Session unretryable without closing the bar.
-        //
-        // The navigate is part of the action, not decoration: created off-screen from
-        // Settings or Task Runner the new session is invisible, so a success reads as a
-        // failure and the user runs it again into a duplicate. The palette carried this
-        // in the mutation's `onSuccess`; it belongs to the row either way.
-        run: async () => {
-          await dispatch(createSlot(undefined)).unwrap()
-          navigate('/chat')
-        },
-        keywords: ['chat', 'start', 'blank'],
-      },
-      {
-        id: 'command:toggle-theme',
-        title: i18nT('apps.commandBar.cmd_toggle_theme'),
-        // The cycle has three stops, so a hop onto `system` that happens to match the
-        // current look changes nothing visible and reads as a silent failure. Naming
-        // the cycle is what makes that outcome legible. Key already in the catalog.
-        subtitle: i18nT('components.commandPalette.providers.actionsProvider.cycle_light_dark_system'),
-        group: 'commands',
-        kind: 'invoke',
-        icon: <SunMoon size={14} className="lucide-inline" />,
-        // Same side effect the palette's actions provider invokes, reached through the
-        // theme context directly so the row needs nothing threaded into the overlay.
-        run: async () => cycleTheme(),
-        keywords: ['dark', 'light', 'appearance', 'colour', 'color'],
-      },
-      {
-        id: 'command:search-sessions',
-        title: i18nT('apps.commandBar.cmd_search_sessions'),
-        group: 'commands',
-        kind: 'view',
-        view: 'sessions',
-        icon: <Search size={14} className="lucide-inline" />,
-        keywords: ['history', 'chat', 'conversation'],
-      },
-      {
-        id: 'command:search-artifacts',
-        title: i18nT('apps.commandBar.cmd_search_artifacts'),
-        // "Artifacts" is this product's word, not the reader's: a first-time reader
-        // called them "whatever they are". The subtitle names the things instead of
-        // the category, which is what the settings rows in this same list do. The
-        // sessions row above needs none, because "Sessions" already says it.
-        subtitle: i18nT('apps.commandBar.cmd_search_artifacts_sub'),
-        group: 'commands',
-        kind: 'view',
-        view: 'artifacts',
-        // The glyph artifacts carry everywhere else in the product — the side
-        // panel's view and the opened-artifact tab both use this one.
-        icon: <Component size={14} className="lucide-inline" />,
-        // `widget` earns its place: what the user saved is usually an mcwidget, and
-        // that is the word they watched the chat call it. The rest are the nouns the
-        // artifact list itself is filed under.
-        keywords: ['widget', 'html', 'saved', 'document', 'chart'],
-      },
-      {
-        // The sidebar's own folders, reached the way sessions and artifacts are: ONE
-        // row that opens a view, not the folder list flattened into the first page.
-        // A folder list is a corpus, and the reader has already learned from the two
-        // rows above what a corpus costs them here — press Enter, then type.
-        // Spreading tens of folder rows through the root instead made the same
-        // collection behave unlike every other corpus this surface holds: demoted and
-        // capped while the query was empty, so the feature read as missing, and
-        // competing with commands once it was not.
-        id: 'command:search-folders',
-        title: i18nT('apps.commandBar.cmd_search_folders'),
-        group: 'commands',
-        kind: 'view',
-        view: 'folders',
-        icon: <Folder size={14} className="lucide-inline" />,
-        keywords: ['sidebar', 'tree', 'group'],
-      },
-    )
-    // Commands contributed by installed apps. This is the seam that lets a row live
-    // outside this repository: the app declares the row and what it does, and the
-    // host renders and runs it. Nothing app-authored executes here.
-    for (const cmd of commandById.values()) {
-      rows.push({
-        id: cmd.id,
-        title: cmd.title,
-        // Falls back to the contributing app's name. A contributed row with no
-        // subtitle is otherwise indistinguishable from a builtin one, and "which
-        // app put this in my launcher" is the first thing a reader asks of a row
-        // they did not recognise.
-        subtitle: cmd.subtitle || cmd.appLabel,
-        group: 'commands',
-        kind: 'prompt',
-        icon: contributedIcon(cmd.icon),
-        keywords: cmd.keywords,
-        // Derived, not declared: a command that needs an argument cannot act on an
-        // empty query, so it has nothing to offer a launcher that has just opened.
-        // Leaving this to the manifest would mean asking every app author to
-        // volunteer their row out of the first page, which none would.
-        idleDemote: cmd.argument !== null,
-        appLabel: cmd.appLabel,
-      })
-    }
-    for (const target of appNavTargets(apps ?? [])) {
-      rows.push({
-        id: `app:${target.name}`,
-        title: target.label,
-        group: 'apps',
-        kind: 'navigate',
-        route: target.route,
-        // The app's own art, through the chain the rail and the palette already
-        // share. Filed by group alone every app row rendered the same package
-        // outline, so the icon column told the reader only that these were apps --
-        // which the group header above them and the label to their right both
-        // already said.
-        icon: appIcon(target),
-      })
-    }
-    for (const entry of SETTINGS_REGISTRY) {
-      rows.push({
-        id: `setting:${entry.id}`,
-        // The shared resolver, not a bare labelKey lookup: resolving the key
-        // alone drops the fan-out suffix ("Bot Token (Discord)" → "Bot
-        // Token"), rendering per-channel rows as indistinguishable titles.
-        title: localizedSettingLabel(entry),
-        subtitle: settingsSubtitle(entry),
-        group: 'settings',
-        kind: 'navigate',
-        route: settingsRoute(entry),
-      })
-    }
-    return rows
-    // `resolved` appears in the deps without appearing in the body on purpose: every
-    // title and subtitle above is a catalog lookup, and a language change re-renders
-    // the tree without remounting it, which does not recompute a memo. Omitting it
-    // would freeze these rows in whichever language the surface first resolved.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apps, commandById, cycleTheme, dispatch, liveSlots, navigate, resolved, simplifiedToolNames, slotStatusDetail, unreadSlots])
+  const ranked = useCommandBarOverlayRootRows({
+    liveSlots, unreadSlots, slotStatusDetail, simplifiedToolNames, dispatch, navigate, store, cycleTheme,
+    crewPreview, commandById, apps, settingsGovernance, resolved, scope, query, usage, attentionExpanded,
+    setAttentionExpanded,
+  })
 
-  // The root ranks from the LIVE query, not the debounced one. Ranking is pure and
-  // local, so there is nothing to throttle, and debouncing it would let a fast Enter
-  // -- two keystrokes then return, which is the whole point of a launcher -- activate
-  // the row selected against the previous query. Debounce exists for the scoped
-  // views, which do hit the network.
-  const ranked: RankedRow[] = useMemo(
-    () => (scope ? [] : rankRootRows(rootRows, query, usage)),
-    [scope, rootRows, query, usage],
-  )
-
-  // Sessions view. Enabled only inside the scope, so the root cannot trigger it.
-  const scopedQuery = scope === 'sessions' ? debounced.trim() : ''
-  /** The scoped SEARCH is armed only once the query is long enough to answer. */
-  const searchArmed = scope === 'sessions' && scopedQuery.length >= SESSIONS_MIN_CHARS
   const {
-    data: scopedResults,
-    error: sessionsSearchError,
-    isFetching,
-    isError,
-    refetch: refetchSessions,
-  } = useQuery({
-    queryKey: ['command-bar', 'sessions', scopedQuery],
-    queryFn: () => Promise.resolve(sessions.search(scopedQuery)) as Promise<Result[]>,
-    enabled: searchArmed,
-    staleTime: 15_000,
+    scopedQuery, sessionsSearchError, refetchSessions,
+    artifactsQuery, artifactRows, artifactsSearchError, artifactsError, refetchArtifacts,
+    folderQuery, foldersError, foldersSearchError, refetchFolders,
+    mateQuery, matesError, matesSearchError, refetchMates,
+    rowsAnswerTheQuery, slots, rowCount, scopeLoading, scopeFetching,
+  } = useCommandBarOverlaySlots({
+    scope, debounced, query, sessions, recentSessions, artifacts, folderSortMode, folders, runningMates, mates,
+    argCommand, crewPreview, ranked, selected, setSelected,
   })
 
-  /**
-   * What the sessions view shows BEFORE a query narrows it: the recent sessions.
-   *
-   * Entering the view used to land on a centred "keep typing" sentence — a screen
-   * with no rows, so no selection, so nothing Enter could do. That state is also
-   * the only reason the input needs a focus box at all: the cue normally rides the
-   * active option, and there was no option to ride. A view whose listing IS its
-   * empty state has neither problem, and the listing is what the user is most often
-   * after anyway — the session they were in a minute ago, reachable without
-   * remembering a word from its title.
-   *
-   * `enabled` is what keeps the root request-free: the provider is inert until
-   * `search()` runs, and this is its only call site.
-   */
-  const listingArmed = scope === 'sessions' && !searchArmed
-  const { data: recentRows } = useQuery({
-    queryKey: ['command-bar', 'recents'],
-    queryFn: () => Promise.resolve(recentSessions.search('')) as Promise<Result[]>,
-    enabled: listingArmed,
-    staleTime: 15_000,
+  const { seedNewSession, activateIndex } = useCommandBarOverlayActivation({
+    open, onClose, scope, setScope, query, setQuery, setDebounced, selected, setSelected, inputRef,
+    setUsage, setArgCommand, pendingRow, setPendingRow, setActionError, dialogRunRef,
+    commandById, commandByIdRef, chatFoldersRef, dispatch, navigate, queryClient,
+    slots, rowsAnswerTheQuery, scopeLoading, scopeFetching,
+    refetchSessions, refetchArtifacts, refetchFolders, refetchMates,
   })
-
-  /**
-   * Artifacts view. ONE query for both of its states, unlike the sessions view
-   * above.
-   *
-   * The sessions view needs two engines because its listing is a different thing
-   * from its search — live slots and history buckets, not a query with no words in
-   * it. Artifacts has no such split: the list endpoint with no `q` already answers
-   * "the newest ones", which is exactly the listing, so an empty query is a
-   * narrowing of zero rather than a second mode. Sending it through one query keeps
-   * the two states on one cache key and removes the window where a view could show
-   * a listing and a search at once.
-   */
-  const artifactsQuery =
-    scope === 'artifacts' && debounced.trim().length >= ARTIFACTS_MIN_CHARS ? debounced.trim() : ''
-  const {
-    data: artifactRows,
-    error: artifactsSearchError,
-    isFetching: artifactsFetching,
-    isError: artifactsError,
-    refetch: refetchArtifacts,
-  } = useQuery({
-    // Distinct from the provider's own `['artifacts', 'command-bar', 'name', q]`
-    // key, which caches the RESPONSE. This one caches the mapped rows. Both live
-    // under `['artifacts']` so artifact mutations invalidate them, while the
-    // `view` discriminator keeps their different response shapes on separate keys.
-    queryKey: ['artifacts', 'command-bar', 'view', artifactsQuery],
-    queryFn: () => artifacts.search(artifactsQuery) as Promise<Result[]>,
-    enabled: scope === 'artifacts',
-    staleTime: 15_000,
-  })
-  /**
-   * The rows the view may render, capped — see {@link ARTIFACTS_ROW_LIMIT}.
-   *
-   * The LISTING state carries a group label, so the list says what it is. Without
-   * one the view opened on five unexplained rows: a reader can guess they are the
-   * recent ones, but nothing on screen said so, while every group in the root
-   * announces itself with a header. A filtered list gets no header — what those
-   * rows are is the word the reader just typed.
-   */
-  const artifactSlotRows = useMemo(
-    () => (artifactRows ?? [])
-      .slice(0, ARTIFACTS_ROW_LIMIT)
-      .map(row => (artifactsQuery ? row : { ...row, groupLabel: i18nT('apps.commandBar.group_recent') })),
-    [artifactRows, artifactsQuery],
-  )
-
-  /**
-   * Folders view — the same two states the sessions view has, from ONE engine, for
-   * the reason the artifacts view has one.
-   *
-   * The provider answers an empty query with every folder in the order the sidebar
-   * draws them, so the listing the view lands on and the filtered list a query
-   * produces are the same call with a different argument. There is deliberately no
-   * {@link SESSIONS_MIN_CHARS} or {@link ARTIFACTS_MIN_CHARS} equivalent: the corpus
-   * is the folder list already cached under `['chat-folders']`, so one character
-   * costs a local filter rather than a round trip, and a view that refused to narrow
-   * on one character would make the shortest names the hardest to reach. There is no
-   * row cap either, for the same reason the sidebar draws every folder: the count is
-   * the user's own filing, not a corpus that grows on its own.
-   *
-   * `enabled` on the scope is what keeps the root request-free. Entering the view is
-   * the activation event that may pay for one folder fetch on a cold cache — the
-   * same bargain the two views above make.
-   */
-  const folderQuery = scope === 'folders' ? debounced.trim() : ''
-  const {
-    data: folderRows,
-    isFetching: foldersFetching,
-    isError: foldersError,
-    error: foldersSearchError,
-    refetch: refetchFolders,
-  } = useQuery({
-    queryKey: ['command-bar', 'folders', folderQuery],
-    queryFn: () => Promise.resolve(folders.search(folderQuery)) as Promise<Result[]>,
-    enabled: scope === 'folders',
-    staleTime: 15_000,
-  })
-
-  const use = useCallback((id: string) => setUsage(prev => recordUse(id, Date.now(), prev)), [])
-
-  const enterScope = useCallback((view: Scope, keepQuery: string) => {
-    setScope(view)
-    setQuery(keepQuery)
-    setDebounced(keepQuery)
-    setSelected(0)
-    inputRef.current?.focus()
-  }, [])
-
-  /**
-   * Create a session, put `text` in it, and go there.
-   *
-   * ONE copy, shared by the ask row and the three bulk modes, because the ordering
-   * here is the whole correctness of the thing and a second copy would be a second
-   * place for it to rot: create without activating, take the claim, activate, seed,
-   * navigate — and re-check the claim after every await.
-   *
-   * A NEW session, never the active one's composer: `ChatPage` consumes
-   * `pendingInput` by REPLACING the slot's draft and persisting it, so seeding the
-   * current slot would destroy a half-written message. These rows also fire from
-   * anywhere in the dashboard, where the active session may be one the user last
-   * touched hours ago.
-   *
-   * `autoSend` is what separates a question from a command. The ask row hands over
-   * a sentence the user wrote and stops at a filled composer, so they can still
-   * edit it. A bulk mode's text is not theirs to edit — it is generated from a row
-   * they picked and a link they pasted, and the argument step was the deliberate
-   * act — so it sends.
-   *
-   * The steps are run here rather than through the shared `newSessionWithToken`
-   * because that helper is fire-and-forget: its failure path is a `console.error`,
-   * so a gateway that refuses the create would leave the bar closing on nothing and
-   * the user's text gone. Both callers carry something they cannot retype from
-   * memory, so the bar closes only once the session exists, and a rejection keeps
-   * it open with the field intact.
-   */
-  const seedNewSession = useCallback(
-    (pendingKey: string, text: string, failureLabel: string, autoSend: boolean) => {
-      const run = dialogRunRef.current
-      const owned = () => dialogRunRef.current === run
-      // Whether this seed belongs to a CONTRIBUTED command, decided before the awaits.
-      // The Ask row uses this same path and is never in the map, so it is unaffected.
-      const contributed = commandByIdRef.current.has(pendingKey)
-      // The folder this session will be filed into, read BEFORE the awaits for the
-      // same reason `contributed` is: the app can be disabled mid-flight, and the
-      // filing below must not depend on the row still being in the map.
-      const folderName = commandFolderName(commandByIdRef.current, pendingKey)
-      // Still offered by an enabled app? `owned()` tracks the dialog's own lifetime and
-      // cannot see this: the app can be disabled from the Apps page while the session
-      // create is still in flight, which leaves the run legitimately owned and the
-      // command gone. Checked after every await, because that is the window.
-      const stillOffered = () => !contributed || commandByIdRef.current.has(pendingKey)
-      setPendingRow(pendingKey)
-      // `activate: false` is what makes the rest of this safe, and it exists for
-      // exactly this shape: the thunk creates the session WITHOUT stealing focus so a
-      // caller that must finish setting the slot up can do so before the user is able
-      // to type into it. Leaning on "create makes the new slot active" is only true at
-      // the instant it resolves -- and this callback can resolve long after the user
-      // has moved on, at which point the seed lands in whatever they moved to.
-      void dispatch(createSlot({
-        activate: false,
-        ...(contributed ? { memory_mode: 'persistent' } : {}),
-      }))
-        .unwrap()
-        .then(
-          async slot => {
-            // The guard is released in `finally`, AFTER every await. Releasing it
-            // earlier leaves it open across the awaits, so a second Enter during a slow
-            // slot fetch starts a second create -- two sessions from one intent, which
-            // is the exact failure the guard exists to prevent.
-            try {
-              if (!owned() || !stillOffered()) return
-              // `keepTargetOnMissing`: this slot was JUST created, so a 404 from its
-              // own detail fetch is a create/fetch race on a slot that does exist.
-              // Without the opt-out, `switchSlot.rejected` treats the 404 as "target is
-              // gone" and puts `activeSlot` back to where it came from (#6309) -- and
-              // the seed below would then land in the reader's PREVIOUS conversation
-              // and, with autoSend, fire there. A contributed prompt is typically an
-              // instruction to act on a list of pull requests; running it against the
-              // wrong session is the worst outcome this path has.
-              //
-              // With the opt-out the reducer keeps the fresh slot selected atomically,
-              // so the rejection needs no repair from here and stays ignored: the
-              // activation held either way.
-              await dispatch(switchSlot({ key: slot.key, keepTargetOnMissing: true }))
-                .unwrap()
-                .catch(() => {})
-              // Re-checked: the switch is another await, and the bar is still
-              // dismissable across it. `stillOffered` too -- this is the last instant
-              // before app-authored text becomes a message, and a disable that landed
-              // during the switch must stop it here.
-              if (!owned() || !stillOffered()) return
-              dispatch(setPendingInput(text))
-              // `autoSend=1` alone, never with `newSession=1`: the session already
-              // exists -- we just created and activated it -- and asking ChatPage to
-              // force a new one would land the text in a second, different session.
-              navigate(autoSend ? '/chat?autoSend=1' : '/chat')
-              onClose()
-              // Filed LAST, and deliberately not awaited. A contributed row opens a new
-              // session on every run, so unfiled they bury the reader's own chats and two
-              // commands' runs interleave with nothing between them -- but the text is
-              // already seeded by this point, so a slow, capped or refused folder API can
-              // only cost this session its place in the sidebar. Contributed rows only:
-              // the Ask row carries a sentence the reader wrote and belongs wherever they
-              // are working, not in a folder named after a command.
-              if (contributed && folderName) {
-                void fileSessionInCommandFolder(
-                  slot.key,
-                  folderName,
-                  Array.isArray(chatFoldersRef.current)
-                    ? (chatFoldersRef.current as ChatFolderRow[])
-                    : undefined,
-                  // A folder this run created is not in the cache it just read, and the
-                  // WebSocket push that would seed it is not guaranteed to arrive. Left
-                  // uninvalidated, the sidebar can keep rendering a tree without the new
-                  // folder and the next run reads the same stale list.
-                  () => queryClient.invalidateQueries({ queryKey: ['chat-folders'] }),
-                )
-              }
-            } finally {
-              // Only the OWNING run may clear the guard. Unconditionally, a stale
-              // activation clears a LIVE one's: close and reopen during create A, start
-              // create B, then let A resolve -- A's finally wipes B's `pendingRow`, and
-              // the next Enter starts a second create for the same intent, which with
-              // autoSend is a duplicate session that sends. `exitArgumentState` clears it
-              // when it revokes, so a revoked run cannot leave the guard stuck either.
-              if (owned()) setPendingRow(null)
-            }
-          },
-          () => {
-            if (!owned()) return
-            setPendingRow(null)
-            setActionError(i18nT('apps.commandBar.action_failed', { action: failureLabel }))
-          },
-        )
-    },
-    [dispatch, navigate, onClose, queryClient],
-  )
-
-  const activateRoot = useCallback(
-    (row: RankedRow) => {
-      // A second Enter while the first activation is still resolving would run the
-      // work twice -- two sessions from one intent -- because the bar stays open
-      // until the promise settles.
-      if (pendingRow) return
-      use(row.id)
-      if (row.kind === 'view') {
-        // Entering is the activation event: the engine's first query happens
-        // here, not while the user was still typing in the root.
-        enterScope((row.view as Scope) ?? null, '')
-        return
-      }
-      if (row.kind === 'prompt') {
-        const cmd = commandById.get(row.id)
-        // A row whose contribution is gone (the app was disabled while the bar was
-        // open) must do nothing rather than fall through to the `invoke` branch and
-        // silently close as if it had worked.
-        if (!cmd) return
-        if (!cmd.argument) {
-          // Nothing to collect, so this is the whole action: seed and go.
-          seedNewSession(cmd.id, cmd.prompt, cmd.title, cmd.autoSend)
-          return
-        }
-        // No work yet -- this row's operation is defined by a value the user has not
-        // given. The query is cleared because what they typed was the row's NAME, and
-        // leaving it in a field that now means "paste the link" would read as a value
-        // already supplied.
-        setArgCommand(cmd)
-        setQuery('')
-        setDebounced('')
-        setSelected(0)
-        inputRef.current?.focus()
-        return
-      }
-      if (row.kind === 'navigate' && row.route) {
-        navigate(row.route)
-        onClose()
-        return
-      }
-      // An `invoke` row may do work that fails. Closing first would tell the user
-      // it succeeded -- a new session that was never created looks identical to a
-      // created one once the bar is gone -- so the bar closes only after the work
-      // resolves, and a rejection keeps it open carrying the error.
-      const pending = row.run?.()
-      if (pending) {
-        setPendingRow(row.id)
-        void pending.then(
-          () => {
-            setPendingRow(null)
-            onClose()
-          },
-          () => {
-            setPendingRow(null)
-            // Name the row and the way out: the bar deliberately stays open so Enter
-            // retries, but that is invisible unless the copy says so.
-            setActionError(i18nT('apps.commandBar.action_failed', { action: row.title }))
-          },
-        )
-        return
-      }
-      onClose()
-    },
-    [commandById, enterScope, navigate, onClose, pendingRow, seedNewSession, use],
-  )
-
-  const slots: Slot[] = useMemo(() => {
-    // The argument state lists nothing: there is one thing to do and the field is
-    // where it is done, so Enter belongs to the input rather than to a row. A
-    // zero-row state is already part of this surface's keyboard contract -- it is
-    // what moves the focus cue onto the field -- so this needs no new affordance.
-    if (argCommand) return []
-    if (scope === 'sessions') {
-      const engine = searchArmed ? scopedResults : recentRows
-      const out: Slot[] = (engine ?? []).map(row => ({ key: row.id, tag: 'result' as const, row }))
-      if (searchArmed && isError) {
-        // A failed search is not an empty one. The retry was a bare <button> inside
-        // the empty-state paragraph, which the keyboard path that reached this state
-        // could not get to without Tabbing out of the list.
-        out.push({ key: 'slot:retry', tag: 'retry' })
-      } else if (searchArmed && !isFetching && out.length === 0) {
-        // A query that matched nothing still has somewhere to go — back to the
-        // listing — so the view never bottoms out with nothing selectable.
-        out.push({ key: 'slot:clear-query', tag: 'clear-query' })
-      }
-      return out
-    }
-    if (scope === 'artifacts') {
-      const out: Slot[] = artifactSlotRows.map(row => ({ key: row.id, tag: 'result' as const, row }))
-      if (artifactsError) {
-        out.push({ key: 'slot:retry', tag: 'retry-artifacts' })
-      } else if (!artifactsFetching && out.length === 0 && artifactsQuery) {
-        // A name that matched nothing still has somewhere to go — back to the
-        // listing — so the view never bottoms out with nothing selectable. Gated on
-        // there BEING a query: an instance with no artifacts at all has no listing
-        // to return to, and offering one would be a row that does nothing.
-        out.push({ key: 'slot:clear-query', tag: 'clear-query' })
-      }
-      return out
-    }
-    if (scope === 'folders') {
-      const out: Slot[] = (folderRows ?? []).map(row => ({ key: row.id, tag: 'result' as const, row }))
-      // The same two dead ends the views above have, told apart the same way: a
-      // folder list that could not be read is a failure to retry, an empty result for
-      // a query the user typed is a filter to drop. Both are ROWS so the keyboard can
-      // reach them without leaving the list. The drop row is gated on there BEING a
-      // query for the same reason it is above — a reader with no folders at all has no
-      // listing to return to.
-      if (foldersError) {
-        out.push({ key: 'slot:retry', tag: 'retry-folders' })
-      } else if (!foldersFetching && out.length === 0 && folderQuery) {
-        out.push({ key: 'slot:clear-query', tag: 'clear-query-folders' })
-      }
-      return out
-    }
-    const out: Slot[] = ranked.map(row => ({ key: row.id, tag: 'root' as const, row }))
-    if (query.trim().length > 0) {
-      // The agent goes FIRST among the tail rows. Every other surface in this
-      // product ends in saying something to one, so the typed text having somewhere
-      // to go is not a corner-of-the-screen fallback for when search failed — it is
-      // the general case, and the command list above it is the shortcut layer.
-      out.push({ key: ASK_SLOT_KEY, tag: 'ask' })
-      out.push({ key: 'slot:fallback', tag: 'fallback' })
-      // Typed text that is an ARTIFACT's name matched nothing above it: the root
-      // ranks launcher rows on their own vocabulary, so "Q3 Revenue Chart" reaches
-      // the artifacts view only by first typing a word like "artifact". This row is
-      // the same way out the sessions corpus already had. Placed after it rather
-      // than before so the row the sessions fallback has always occupied does not
-      // move under a reader who navigates by position.
-      out.push({ key: 'slot:fallback-artifacts', tag: 'fallback-artifacts' })
-      // And the same way out for the folders corpus, for the same reason: the root
-      // holds ONE row per corpus, so a typed folder name would otherwise reach
-      // nothing until the reader thought to enter the view first and retype it. Last
-      // of the three because a typed word is a session title or an artifact name far
-      // more often than a folder name.
-      out.push({ key: 'slot:fallback-folders', tag: 'fallback-folders' })
-      // The recovery row exists for the dead end — a typed query that matched
-      // nothing — not for every keystroke. Riding the fallback's own condition put a
-      // row about switching the feature off under every successful search, and
-      // ArrowUp from the top wrapped selection straight onto it.
-      if (ranked.length === 0) out.push({ key: 'slot:recovery', tag: 'recovery' })
-    }
-    return out
-  }, [argCommand, isError, isFetching, query, ranked, recentRows, scope, scopedResults, searchArmed, artifactSlotRows, artifactsError, artifactsFetching, artifactsQuery, folderQuery, folderRows, foldersError, foldersFetching])
-
-  const rowCount = slots.length
-  /**
-   * True while a scoped engine owes us rows.
-   *
-   * Distinguished from "empty" because the two need opposite treatments: a pending
-   * listing renders placeholder rows that hold the list's height, where the centred
-   * "Searching…" line it replaces collapsed the panel and then jumped when results
-   * landed.
-   */
-  const scopeLoading =
-    rowCount === 0 &&
-    ((scope === 'sessions' && (isFetching || (listingArmed && recentRows === undefined))) ||
-      (scope === 'artifacts' && (artifactsFetching || artifactRows === undefined)) ||
-      (scope === 'folders' && (foldersFetching || folderRows === undefined)))
-
-  useEffect(() => {
-    if (selected >= rowCount) setSelected(Math.max(0, rowCount - 1))
-  }, [rowCount, selected])
-
-  const activateIndex = useCallback(
-    (index: number) => {
-      const slot = slots[index]
-      if (!slot) return
-      switch (slot.tag) {
-        case 'root':
-          activateRoot(slot.row)
-          return
-        case 'result':
-          slot.row.onActivate()
-          onClose()
-          return
-        case 'fallback':
-          enterScope('sessions', query)
-          return
-        case 'fallback-artifacts':
-          enterScope('artifacts', query)
-          return
-        case 'fallback-folders':
-          enterScope('folders', query)
-          return
-        case 'ask': {
-          // Stops at a FILLED composer rather than sending: the user wrote this
-          // sentence, so the last look at it is theirs.
-          if (pendingRow) return
-          seedNewSession(
-            ASK_SLOT_KEY,
-            query.trim(),
-            i18nT('apps.commandBar.action_ask'),
-            false,
-          )
-          return
-        }
-        case 'recovery':
-          // Offer the way back rather than only describing it.
-          navigate('/apps/detail/command-bar')
-          onClose()
-          return
-        case 'retry':
-          void refetchSessions()
-          return
-        case 'retry-artifacts':
-          void refetchArtifacts()
-          return
-        case 'retry-folders':
-          void refetchFolders()
-          return
-        case 'clear-query':
-        case 'clear-query-folders':
-          // Emptying the query is what re-arms the listing; the debounced copy has to
-          // go with it or the view stays on the failed search for one more tick.
-          setQuery('')
-          setDebounced('')
-          setSelected(0)
-          inputRef.current?.focus()
-          return
-      }
-    },
-    [activateRoot, enterScope, navigate, onClose, pendingRow, query, refetchArtifacts, refetchFolders, refetchSessions, seedNewSession, slots],
-  )
 
   /**
    * Put the selected row's address on the clipboard.
@@ -1555,7 +487,7 @@ export default function CommandBarOverlay({
       return
     }
     setActionError(null)
-    seedNewSession(live.id, now, live.title, live.autoSend)
+    seedNewSession(live.id, now, live.title, live.autoSend, live.agent, live.appName)
   }, [argCommand, commandById, exitArgumentState, pendingRow, query, seedNewSession])
 
   const onKeyDown = useCallback(
@@ -1576,7 +508,7 @@ export default function CommandBarOverlay({
           submitArgument()
           return
         }
-        activateIndex(selected)
+        activateIndex(selected, 'key')
       } else if (
         (e.metaKey || e.ctrlKey) &&
         !e.altKey &&
@@ -1639,16 +571,19 @@ export default function CommandBarOverlay({
         ? i18nT('apps.commandBar.cmd_search_artifacts')
         : scope === 'folders'
           ? i18nT('apps.commandBar.cmd_search_folders')
-          : ''
+          : scope === 'mates'
+            ? i18nT('apps.commandBar.cmd_search_mates')
+            : ''
   /**
    * The failure this change is responsible for, and the only one that gets a notice.
    *
    * Each scope's retry ROW is pushed by that scope's own branch in the slot builder
-   * above, so there is no shared failure flag to key this on: the notice belongs to
-   * the artifacts scope alone.
+   * (`useCommandBarOverlaySlots`), so there is no shared failure flag to key this on:
+   * the notice belongs to the artifacts scope alone.
    */
   const artifactsFailed = scope === 'artifacts' && !!artifactsError
   const foldersFailed = scope === 'folders' && !!foldersError
+  const matesFailed = scope === 'mates' && !!matesError
   const searchError =
     scope === 'sessions'
       ? sessionsSearchError
@@ -1656,7 +591,9 @@ export default function CommandBarOverlay({
         ? artifactsSearchError
         : scope === 'folders'
           ? foldersSearchError
-          : undefined
+          : scope === 'mates'
+            ? matesSearchError
+            : undefined
   /**
    * What the failure SAYS, for the scope this change adds.
    *
@@ -1678,7 +615,7 @@ export default function CommandBarOverlay({
    */
   const searchFailedText = artifactsFailed
     ? i18nT('apps.commandBar.artifact_search_failed')
-    : foldersFailed
+    : foldersFailed || matesFailed
       ? i18nT('apps.commandBar.search_failed')
       : ''
   /**
@@ -1692,250 +629,11 @@ export default function CommandBarOverlay({
   const listId = 'command-bar-list'
   const rowId = (i: number) => `command-bar-row-${i}`
 
-  /**
-   * What one slot puts in each of the row's four columns.
-   *
-   * Split from the shell below so every tag renders through the SAME shell: the
-   * right-hand column only shares one edge if one element owns its width, and the
-   * previous form (per-branch JSX) is how a `view` row's label ended up pushed left
-   * by its own arrow.
-   */
-  const slotParts = (
-    slot: Slot,
-  ): { icon: ReactNode; title: ReactNode; subtitle?: ReactNode; accessory?: ReactNode; arrow?: boolean; dim?: boolean; wrap?: boolean } => {
-    switch (slot.tag) {
-      case 'root': {
-        const row = slot.row
-        return {
-          icon: row.icon ?? groupIcon(row.group),
-          title: <Highlighted text={row.title} indices={row.indices} />,
-          // Settings titles repeat across tabs ("Speed" exists on more than one), so
-          // the row is only identifiable with its subtitle rendered — and when the
-          // subtitle is what MATCHED, it is highlighted, because an unhighlighted row
-          // in a filtered list reads as a row that should not be there.
-          subtitle: row.subtitle
-            ? row.matchField === 'subtitle'
-              ? <Highlighted text={row.subtitle} indices={row.subtitleIndices ?? []} />
-              : row.subtitle
-            : undefined,
-          accessory: (
-            <>
-              {/* The alias that put this row here. Without it a keyword hit rendered
-                  with no highlight anywhere: typing `theme` listed settings rows whose
-                  title and subtitle both lack the word, and the row offered the reader
-                  no way to tell why it had matched. */}
-              {row.matchField === 'keyword' && row.matchedKeyword && (
-                <span className="truncate text-[11px] text-muted max-w-[140px]">
-                  {row.matchedKeyword}
-                </span>
-              )}
-              {/* Live state OUTRANKS the static kind label: on the one row where both
-                  could apply, what the session is waiting for is the reason the row is
-                  on screen and "Session" would be the reason it is not. */}
-              {row.status ? (
-                statusAccessory(row.status)
-              ) : (
-                <span className="shrink-0 text-[11px] text-muted">{kindLabel(row)}</span>
-              )}
-            </>
-          ),
-          arrow: row.kind === 'view' || row.kind === 'prompt',
-        }
-      }
-      case 'result': {
-        const row = slot.row
-        // The live state a session row carries, mapped onto the same shape the
-        // launcher rows use. This is the surface's own advantage and it was being
-        // thrown away: the provider computes an approval pill, a pulsing "Thinking…"
-        // and the running tool's name, and the row was rendering a folder and a clock.
-        const status: RowStatus | undefined =
-          row.statusLabel && row.statusColorVar
-            ? {
-                colorVar: row.statusColorVar,
-                label: row.statusLabel,
-                detail: row.statusDetail,
-                pulse: row.statusPulse,
-                pill: row.statusStyle === 'pill',
-              }
-            : undefined
-        // Where it lives and when it was last touched — the two things that tell two
-        // similarly-titled conversations apart. Yields the column to live state,
-        // which is the more urgent fact about the same row.
-        const meta = [row.folder, row.timestamp].filter(Boolean).join(META_SEP)
-        return {
-          icon: row.icon,
-          title: <Highlighted text={row.title} indices={row.indices} />,
-          subtitle: row.subtitle ? (
-            <Highlighted text={row.subtitle} indices={row.subtitleIndices ?? []} />
-          ) : undefined,
-          accessory: status
-            ? statusAccessory(status)
-            : meta
-              ? <span className="truncate text-[11px] text-muted max-w-[180px]">{meta}</span>
-              : undefined,
-        }
-      }
-      case 'ask':
-        // Every other surface in this product ends in saying something to an agent, so
-        // the typed text always has this way out — named with the text itself so the
-        // row states what it will send rather than advertising a feature.
-        return {
-          icon: <Send size={14} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.ask_agent', { query: query.trim() }),
-          arrow: true,
-          dim: true,
-        }
-      case 'fallback':
-        // The root does not search content, so the typed text still has somewhere to
-        // go: one Enter carries it into the sessions view instead of scanning the
-        // corpus on every keystroke.
-        return {
-          icon: <Search size={14} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.fallback_sessions', { query }),
-          arrow: true,
-          dim: true,
-        }
-      case 'fallback-artifacts':
-        // Named with the query so the row states which text it carries, the same way
-        // the sessions row above it does. Both are dim: they are ways out of the
-        // root, not results, and a reader scanning for a match should read past them.
-        //
-        // Its subtitle is its OWN, not the view row's. It needs a gloss at all because
-        // "artifact" is our word and a reader who arrives here by typing a name has
-        // not necessarily read the view row. But when the typed word also matches the
-        // command ("widget", "saved"), both rows are on screen at once, and sharing
-        // one subtitle made them read as duplicates -- a reader could not tell how
-        // their results would differ. So this one names what it does with the text
-        // that is already typed, while the view row still describes the corpus.
-        return {
-          icon: <Package size={13} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.fallback_artifacts', { query }),
-          subtitle: i18nT('apps.commandBar.fallback_artifacts_sub'),
-          arrow: true,
-          dim: true,
-        }
-      case 'fallback-folders':
-        // Named with the query, dim, and arrowed like the two rows above it, for the
-        // same reasons. No subtitle: "folder" is the reader's own word for the thing
-        // the sidebar already shows them, so there is nothing to gloss.
-        return {
-          icon: <Folder size={14} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.fallback_folders', { query }),
-          arrow: true,
-          dim: true,
-        }
-      case 'recovery':
-        // Naming the corpora this surface does NOT reach -- at the moment the user is
-        // looking for them -- is what keeps a typed knowledge or skill name from being
-        // a silent dead end. Artifacts is no longer among them: it has a view of its
-        // own now, so the string stopped listing it.
-        //
-        // The second clause names what CLICKING does, not what the user must switch
-        // off, and names it without implying a transaction. Three readers in sequence
-        // failed it. "disable Command Bar" described the end state, so the row itself
-        // read as the thing that would disable their search box. Naming the App Store
-        // fixed that and introduced a cost: "App Store sounds like it might want me to
-        // install or buy something." The destination is neither -- it is AppDetailPage
-        // at `/apps/detail/command-bar`, this app's OWN page under Apps, carrying its
-        // Enabled switch. So the row names that section. Wording that blocks the users
-        // a row exists for is not a smaller bug than a broken link.
-        //
-        // What is NOT solvable here: the same reader did not know what "Command Bar"
-        // is. They are inside it. A row cannot teach the name of the app it lives in,
-        // and the instruction is unactionable without naming the app to turn off.
-        //
-        // This is the one row that WRAPS. Every other row is a short label, but this
-        // one is a sentence, and a sentence truncated mid-clause loses exactly the
-        // half that explains itself, so the row is allowed two lines to finish. The
-        // capture harness measures that: it asserts this row renders with no ellipsis
-        // and that the clamp still engages when the text is longer than two lines.
-        return {
-          icon: <Package size={13} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.other_search_hint'),
-          arrow: true,
-          dim: true,
-          wrap: true,
-        }
-      case 'retry-artifacts':
-        // Separate tags keep the sessions row byte-identical to main, so this change
-        // does not reshape a surface it does not own.
-        return {
-          icon: <RotateCcw size={14} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.retry'),
-        }
-      case 'retry-folders':
-        // Plain Retry, like the artifacts row above: WHAT failed is said by the
-        // `ErrorNotice` above the list, which is where an error surfaced to the user
-        // belongs (AUTOSDE `errors-use-error-notice`). Its own tag keeps the sessions
-        // row below byte-identical to main, whose hand-written text this change does
-        // not own and does not touch.
-        return {
-          icon: <RotateCcw size={14} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.retry'),
-        }
-      case 'retry':
-        return {
-          icon: <RotateCcw size={14} className="lucide-inline" />,
-          title: <span className="text-danger">{i18nT('apps.commandBar.search_failed')}</span>,
-        }
-      case 'clear-query':
-        // One row carrying both halves: the search found nothing, and the listing is
-        // one Enter away. Split across a message and a control they were two things
-        // to read; as a row it is one thing to do.
-        return {
-          icon: <Clock size={14} className="lucide-inline" />,
-          title:
-            scope === 'artifacts'
-              ? i18nT('apps.commandBar.no_artifact_match_show_recent', { query: artifactsQuery })
-              : i18nT('apps.commandBar.no_match_show_recent', { query: scopedQuery }),
-          dim: true,
-        }
-      case 'clear-query-folders':
-        // The same row for the folders view, with the folder glyph rather than the
-        // clock: what it returns to is the whole list in sidebar order, which has no
-        // recency for a clock to stand for.
-        return {
-          icon: <Folder size={14} className="lucide-inline" />,
-          title: i18nT('apps.commandBar.no_match_show_all_folders', { query: folderQuery }),
-          dim: true,
-        }
-    }
-  }
+  const renderSlot = commandBarOverlaySlotRenderer({
+    query, scope, artifactsQuery, scopedQuery, folderQuery, mateQuery, pendingRow,
+  })
 
-  const renderSlot = (slot: Slot): ReactNode => {
-    const parts = slotParts(slot)
-    return (
-      <>
-        <span className="shrink-0 w-4 flex justify-center text-muted">{parts.icon}</span>
-        <span className="flex-1 min-w-0">
-          <span className={`block ${parts.wrap ? 'line-clamp-2' : 'truncate'}${parts.dim ? ' text-muted' : ''}`}>{parts.title}</span>
-          {parts.subtitle && (
-            <span className="block truncate text-[11px] text-muted">{parts.subtitle}</span>
-          )}
-        </span>
-        {parts.accessory}
-        {/* The arrow gets a slot of its own on EVERY row, not just the rows that have
-            one. Rendered inline it pushed the label of a `view` row left by its own
-            width, so the labels stopped sharing a right edge and the column read as
-            misaligned. */}
-        <span className="shrink-0 w-[13px] flex justify-end">
-          {parts.arrow && <ArrowRight size={13} className="lucide-inline text-muted" />}
-        </span>
-        {/* The row doing awaited work says so. Both kinds that can be in flight are
-            named here: an `invoke` launcher row, and the ask row. */}
-        {((slot.tag === 'root' && pendingRow === slot.row.id) ||
-          (slot.tag === 'ask' && pendingRow === ASK_SLOT_KEY)) && (
-          <Loader2
-            size={13}
-            aria-label={i18nT('apps.commandBar.working')}
-            className="lucide-inline text-muted shrink-0 animate-spin"
-          />
-        )}
-      </>
-    )
-  }
-
-  return createPortal(
+  return <OverlayPortal>
     <div
       className="fixed left-0 right-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-xs animate-rise"
       style={{ top: vv.offsetTop, height: vv.height }}
@@ -1948,6 +646,9 @@ export default function CommandBarOverlay({
       onMouseDown={e => {
         if (e.target === e.currentTarget) onClose()
       }}
+      // Every mousemove in the bar ends here, after a row has compared against the
+      // previous position. See `lastPointerRef`.
+      onMouseMove={recordPointer}
     >
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- a dialog owns the keyboard dismissal of its own subtree; the handler below is Escape only, and every gesture inside is on a real control */}
       <div
@@ -2018,7 +719,7 @@ export default function CommandBarOverlay({
                 // where you are, what follows is what you type. The focus ring stays,
                 // and unlike the field's it only ever paints on Tab, so it is never the
                 // permanent box.
-                className="shrink-0 max-w-[40%] truncate text-[13px] text-text bg-transparent border-none p-0 cursor-pointer focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/40 rounded"
+                className="shrink-0 max-w-[40%] truncate text-[13px] text-text bg-transparent border-none p-0 cursor-pointer focus-ring-accent rounded"
               >
                 {navName}
               </button>
@@ -2050,9 +751,11 @@ export default function CommandBarOverlay({
                   ? i18nT('apps.commandBar.placeholder_artifacts')
                   : scope === 'folders'
                     ? i18nT('apps.commandBar.placeholder_folders')
-                    : scope
-                      ? i18nT('apps.commandBar.placeholder_sessions')
-                      : i18nT('apps.commandBar.placeholder')
+                    : scope === 'mates'
+                      ? i18nT('apps.commandBar.placeholder_mates')
+                      : scope
+                        ? i18nT('apps.commandBar.placeholder_sessions')
+                        : i18nT('apps.commandBar.placeholder')
             }
             aria-label={i18nT('apps.commandBar.title')}
             // Selection stays on the input and is announced through
@@ -2092,20 +795,56 @@ export default function CommandBarOverlay({
           </div>
         )}
 
-        {/* ARTIFACTS AND FOLDERS: the sessions scope keeps the failure row it
-            already had.
+        {/* ARTIFACTS, FOLDERS AND CREWMATES: the sessions scope keeps the failure row
+            it already had.
+            The crewmates scope needs this MORE than the two beside it, and leaving it
+            out was a real hole: its retry row deliberately carries no text because
+            this notice is what names the failure, so without the disjunct a catalog
+            rejection rendered one bare `Retry` and nothing else -- `findReport` never
+            resolved, the endpoint, status and backend `code` were dropped, and a
+            failed read was indistinguishable from a crew-less install. That is the
+            exact pair of states `useAgents` records six triage passes being lost to.
             No hand-off: the combobox query is unsaved local state, and the
             hand-off navigation would unmount the command bar and discard it.
             Keep the notice outside the listbox so ErrorNotice can never put an
             interactive control inside an option; Retry remains a separate option
             on the combobox's Arrow/Enter path. */}
-        {(artifactsFailed || foldersFailed) && (
+        {(artifactsFailed || foldersFailed || matesFailed) && (
           <div className="px-3 py-2 border-b border-border">
             <ErrorNotice
               message={searchFailedText}
               report={findReport(errMessage(searchError))}
               variant="inline"
             />
+          </div>
+        )}
+
+        {/* FOLDERS: the shared settings read the order comes from has FAILED with no
+            body to draw from, so the list below is the stored order whatever mode
+            the person chose — said here the way the sidebar says it over its own
+            tree (there is no sidebar on this surface), because a list drawn silently
+            in the wrong order is the dead end, not the failure. The raw server
+            string is the message so the notice's journal lookup still finds the
+            endpoint and status -- under the title, smaller, because "config store"
+            and "gateway" are the detail, not the lead; the plain line under it says
+            what the list is showing (a picker: "listed", not the sidebar's
+            "arrangement"), that nothing is asked of the reader (the shell's read
+            retries on its own), and where the hand-off lives, since this notice has
+            none: the query typed into the bar is unsaved and the navigation would
+            take it along. */}
+        {scope === 'folders' && folderSortError && (
+          <div className="px-3 py-2 border-b border-border">
+            <ErrorNotice
+              variant="inline"
+              className="flex-wrap"
+              title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+              message={folderSortError}
+              messagePlacement="below"
+              testId="command-bar-folder-order-unavailable"
+            />
+            <p className="mt-0.5 text-[11px] text-muted" data-testid="command-bar-folder-order-unavailable-detail">
+              {i18nT('pages.chatSidebar.folder_order_unavailable_detail_picker_ask')}
+            </p>
           </div>
         )}
 
@@ -2181,7 +920,7 @@ export default function CommandBarOverlay({
                       // halt on inert text.
                       // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
                       tabIndex={0}
-                      className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded border border-border bg-bg-hover/40 p-2 text-[11px] text-text focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-accent"
+                      className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words rounded border border-border bg-bg-hover/40 p-2 text-[11px] text-text focus-ring-accent"
                     >
                       {resolvePrompt(argCommand, query)}
                     </pre>
@@ -2213,6 +952,12 @@ export default function CommandBarOverlay({
               // The folders view reaches it the same way and for the same reason, so
               // it gets the same treatment: a reader with no folders is told they
               // have none, not that no sessions matched.
+              //
+              // The crewmates view has NO branch here, deliberately. Every empty case it
+              // can reach pushes a ROW instead — `open-crewmates` for no crew,
+              // `clear-query-mates` for a query that matched nothing, `retry-mates` for a
+              // failed read — so this centred notice is unreachable for that scope, and a
+              // branch for it would be a sentence with no affordance that nothing renders.
               <div role="status" className="px-3 py-6 text-center text-[12px] text-muted">
                 {scope === 'artifacts'
                   ? i18nT('apps.commandBar.no_artifacts_yet')
@@ -2225,7 +970,7 @@ export default function CommandBarOverlay({
             )
           ) : (
             slots.map((slot, i) => {
-              const header = headerOf(slot, slots[i - 1])
+              const header = headerOf(slot, slots[i - 1], query.trim().length > 0)
               return (
                 <div key={slot.key}>
                   {header && (
@@ -2238,8 +983,8 @@ export default function CommandBarOverlay({
                     role="option"
                     tabIndex={-1}
                     aria-selected={selected === i}
-                    onMouseDown={() => activateIndex(i)}
-                    onMouseEnter={() => setSelected(i)}
+                    onMouseDown={() => activateIndex(i, 'pointer')}
+                    onMouseMove={e => selectOnPointerMove(i, e)}
                     className={`flex items-center gap-2.5 px-3 py-2 cursor-pointer text-[13px] ${
                       selected === i ? 'bg-bg-hover text-text' : 'text-text'
                     }`}
@@ -2362,7 +1107,6 @@ export default function CommandBarOverlay({
           </div>
         )}
       </div>
-    </div>,
-    document.body,
-  )
+    </div>
+  </OverlayPortal>
 }

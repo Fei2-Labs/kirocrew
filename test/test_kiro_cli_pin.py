@@ -85,6 +85,12 @@ def shadowed_path(monkeypatch, tmp_path):
     monkeypatch.setattr(kiro_cli, "_MACOS_SYSTEM_DIRS", ())
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.delenv("KIROCREW_KIRO_BIN", raising=False)
+    # The desktop app exports its bundled kiro-cli directory to every child,
+    # and ``known_kiro_cli_dirs`` ranks that directory FIRST. A test process
+    # started from a dashboard session (a sweep run that way sees it)
+    # inherits it, and the pin then resolves the app's own copy -- again the
+    # product behaving correctly -- so the fake host must not carry it either.
+    monkeypatch.delenv(kiro_cli.BUNDLED_KIRO_DIR_ENV, raising=False)
     monkeypatch.setenv("PATH", str(shim.parent))
     return shim
 
@@ -428,12 +434,6 @@ _BARE_NAME_CONSTANTS = {"KIRO_CLI_BIN", "KIRO_CLI_NAME"}
 #: and a new site anywhere is refused outright.
 _KNOWN_INTERACTIVE_SITES = frozenset(
     {
-        # `kirocrew doctor` sign-in row: which(KIRO_CLI_BIN) probe, then
-        # [KIRO_CLI_BIN, "whoami"].
-        "cli_doctor.py::_kiro_cli_signed_in",
-        # `kirocrew doctor` dependency + connectivity rows: which(KIRO_CLI_BIN),
-        # then [KIRO_CLI_BIN, "--version"].
-        "cli_doctor.py::_doctor",
         # `kirocrew setup` prerequisite notice: which(KIRO_CLI_BIN), no spawn.
         "cli_setup.py::_ensure_prerequisites",
     }

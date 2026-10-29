@@ -29,7 +29,7 @@ not systemd's ``AppArmorProfile=`` alone.** Two other designs do not work:
    audit log shows that
    ``AppArmorProfile=`` labels only the literal top-level unit PID
    (``change_onexec`` "converted to stacking"). The gateway's sandbox probe
-   (``sandbox.py``'s ``_probe_child_sequence``) runs in a **different PID**
+   (``sandbox_probe.py``'s ``_probe_child_sequence``) runs in a **different PID**
    reached through the launcher's own exec chain, and that PID was still
    ``unconfined`` in the audit trail at the moment it called ``unshare()`` — the
    stacking never propagated that far down, reproducing identically across a
@@ -359,7 +359,8 @@ def validate(parser: str, text: str) -> tuple[bool, str]:
 
 # A probe that mirrors what the gateway actually needs: the launcher's split
 # unshare sequence. Run INSIDE the profile via aa-exec, because the process doing
-# the install is not itself confined by it (systemd applies it to the service), so
+# the install is not itself confined by it (the profile is path-attached and the
+# kernel applies it at execve() of the launcher), so
 # probing here would report the unpatched host and look like a failure.
 # A SELF-CONTAINED replica of the launcher's split unshare sequence. It must not
 # import kiro_crew: this runs under sudo, and importing our own package would
@@ -420,7 +421,9 @@ def verify_enforcement(
        trusted system ``python3``, never ``sys.executable`` (the venv python is
        user-writable), and the payload is a constant stdlib snippet that does not
        import kiro_crew — otherwise ``sudo`` would execute user-controlled
-       site-packages.
+       site-packages. A trusted interpreter is not enough on its own: it runs
+       with ``-I`` so the working directory, user site and ``PYTHON*``
+       variables cannot inject code ahead of the payload.
     3. **The probe itself must run UNPRIVILEGED**, or it proves nothing: root may
        be permitted to create namespaces regardless of the restriction, so a
        root-side success would not tell us the gateway's user can. ``setpriv``
@@ -451,6 +454,12 @@ def verify_enforcement(
             "--clear-groups",
             "--",
             python3,
+            # Isolated mode: this python runs as root under `sudo
+            # kirocrew service install`. -I keeps the caller's working
+            # directory off sys.path and ignores the user site and every
+            # PYTHON* variable, so a planted ctypes.py, .pth line,
+            # sitecustomize or PYTHONPATH entry cannot run before the payload.
+            "-I",
             "-c",
             _VERIFY_SNIPPET,
         )
@@ -915,7 +924,7 @@ def installed_attachment(
 
     Defaults to the launcher profile (``kirocrew sandbox status``'s original
     caller). The service profile is attached too, so
-    ``cli_doctor.py`` passes ``PROFILE_PATH`` / ``PROFILE_NAME`` here to answer
+    ``doctor_checks/confinement.py`` passes ``PROFILE_PATH`` / ``PROFILE_NAME`` here to answer
     the same question for the systemd service — "is the profile actually
     attached to the launcher script this host currently resolves?" — instead of
     the unit-directive check.
@@ -940,6 +949,56 @@ def installed_attachment(
         return None
     match = _attachment_re(profile_name).search(body)
     return match.group("path") if match else None
+
+
+def service_profile_attachment(
+    launcher: str,
+    unit_path: Path,
+    profile_path: Path | None = None,
+    profile_name: str | None = None,
+) -> str | None:
+    """The launcher the service profile really applies to today, or ``None``.
+
+    The confining mechanism is a path attachment, not a systemd
+    ``AppArmorProfile=<name>`` directive: the profile is attached BY PATH to the
+    launcher script ``ExecStart`` uses, and installing the directive alongside a
+    path attachment makes the directive silently win, defeating the attachment.
+    So the profile applies only when its attachment clause names the launcher
+    as it resolves NOW (*launcher*, resolved strictly) AND the unit at
+    *unit_path* carries no ``AppArmorProfile=`` line. A moved or reinstalled
+    launcher reads as ``None`` until ``kirocrew service install`` re-renders the
+    profile. Shared by ``kirocrew doctor`` and the update engine's re-attach
+    question, so the two can never disagree.
+
+    *profile_path*/*profile_name* default to the service profile, resolved in
+    the body so a test's ``monkeypatch.setattr(apparmor, "PROFILE_PATH", ...)``
+    applies.
+    """
+    if profile_path is None:
+        profile_path = PROFILE_PATH
+    if profile_name is None:
+        profile_name = PROFILE_NAME
+    attached = installed_attachment(profile_path, profile_name)
+    if attached is None:
+        return None
+    try:
+        current = str(Path(launcher).resolve(strict=True))
+    except OSError:
+        return None
+    if attached != current:
+        return None
+    # A unit that still carries ``AppArmorProfile=`` (a hand-edited unit, a
+    # drop-in, an older install) silently WINS over the path attachment. Best
+    # effort: an unreadable unit (or none installed) proves nothing and does not
+    # flip a verified attachment.
+    try:
+        # errors="replace": undecodable bytes must not crash the verdict.
+        unit_text = unit_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return attached
+    if any(line.strip().startswith("AppArmorProfile=") for line in unit_text.splitlines()):
+        return None
+    return attached
 
 
 def install_launcher(

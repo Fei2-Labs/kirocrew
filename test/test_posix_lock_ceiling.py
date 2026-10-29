@@ -29,13 +29,17 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
+from typing import Iterator
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 
 from kiro_crew import platform_compat
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.clock import ManualClock
 
 pytestmark = pytest.mark.skipif(
     not platform_compat.IS_POSIX, reason="POSIX flock ceiling; Windows has its own branch"
@@ -125,8 +129,9 @@ class TestFileLockCeiling:
 
         message = str(excinfo.value)
         assert "could not acquire" in message
-        assert f"{_TEST_CEILING:g}s" in message
-        assert "stuck" in message
+        assert f"limit {_TEST_CEILING:g}s" in message
+        assert "still held after waiting" in message
+        assert "stuck" not in message
         assert "unserialized" in message
 
     def test_uncontended_acquire_still_succeeds(self, tmp_path: Path):
@@ -225,8 +230,8 @@ class TestCallerSuppliedCeiling:
             os.close(fd)
 
         message = str(excinfo.value)
-        assert f"{caller_ceiling:g}s" in message
-        assert f"{_TEST_CEILING:g}s" not in message
+        assert f"limit {caller_ceiling:g}s" in message
+        assert f"limit {_TEST_CEILING:g}s" not in message
 
     def test_omitting_the_ceiling_still_uses_the_module_default(self, held_lock: Path):
         # The parameter is additive: a caller that passes nothing is bounded by
@@ -243,7 +248,7 @@ class TestCallerSuppliedCeiling:
 
         assert waited >= _TEST_CEILING
         assert waited < _TEST_CEILING + 30
-        assert f"{_TEST_CEILING:g}s" in str(excinfo.value)
+        assert f"limit {_TEST_CEILING:g}s" in str(excinfo.value)
 
 
 class TestStagingLockOutlastsItsOwnWork:
@@ -282,6 +287,38 @@ class TestStagingLockOutlastsItsOwnWork:
         assert seen.get("timeout") == frontend._STAGING_LOCK_TIMEOUT
 
 
+def _pin_clock(monkeypatch) -> ManualClock:
+    """A clock only the lock helpers read, starting at 0.
+
+    Installed on ``platform_compat``'s own binding. Its ``time`` IS the stdlib
+    module, so patching ``platform_compat.time.sleep`` (or the stdlib ``time``
+    itself) would also record, and count against the deadline, any other
+    thread's sleep in the worker.
+
+    The lock owners in ``kiro_crew.platform_lock_compat`` read the clock through a
+    function-local ``from kiro_crew.platform_compat import ... time``
+    (``_posix_acquire_blocking``, ``_win_acquire_blocking``, ``file_lock`` and
+    ``acquire_lock``), so this one install clocks all of them, including a
+    ``file_lock`` that another thread left running in this worker takes while
+    the test runs.
+
+    It also clocks ``platform_compat``'s own readers of that binding, such as
+    ``terminate_and_reap_sync`` (its POSIX process-group wait) and
+    ``_drain_windows_process_tree``. A thread left inside one of those while
+    the test runs would still record its poll sleep here. That window is
+    acceptable: it needs a leftover thread in one of a few cleanup loops for
+    the length of one test, where a stdlib patch would record every sleeping
+    thread in the worker.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    clock.install(monkeypatch, platform_compat)
+    return clock
+
+
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch):
+    assert_clock_is_private(_pin_clock(monkeypatch), platform_compat)
+
+
 class TestOnLoopNeverSleeps:
     """A contended acquire on the event-loop thread must not sleep there."""
 
@@ -293,17 +330,25 @@ class TestOnLoopNeverSleeps:
 
         async def _acquire_on_loop() -> None:
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(time, "sleep", lambda s: slept.append(s))
+                clock = _pin_clock(mp)
                 fd = os.open(held_lock, os.O_CREAT | os.O_RDWR, 0o600)
                 try:
                     started = time.monotonic()
-                    with pytest.raises(OSError):
+                    with pytest.raises(OSError) as excinfo:
                         with platform_compat.file_lock(fd, exclusive=True, wait=True):
                             pytest.fail("entered the critical section while held")
                     # Refused promptly, not at the ceiling.
                     assert time.monotonic() - started < _TEST_CEILING
+                    # And the refusal says so: no ceiling it never applied, no
+                    # claimed cause, and where a caller that must wait goes.
+                    message = str(excinfo.value)
+                    assert "never waits" in message
+                    assert "worker thread" in message
+                    assert f"{_TEST_CEILING:g}s" not in message
+                    assert "stuck" not in message
                 finally:
                     os.close(fd)
+                slept.extend(clock.sleeps)
 
         asyncio.run(_acquire_on_loop())
         # The assertion that matters: zero sleeps on the loop thread. A patched
@@ -341,29 +386,141 @@ class TestOnLoopNeverSleeps:
         assert waited >= _TEST_CEILING
 
 
+class TestInProcessOverlapOffTheLoop:
+    """A coroutine that must wait for the lock takes it from a worker thread.
+
+    ``flock`` counts a second descriptor in the SAME process as a competing
+    holder, so a sibling thread's brief critical section refuses an on-loop
+    acquire. Offloaded with ``asyncio.to_thread`` the acquire is a real bounded
+    wait and the loop keeps running.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _hold_in_thread(lock_path: Path) -> Iterator[threading.Event]:
+        """Hold the lock on a thread until the yielded event is set, never on a timer.
+
+        Leaving the block always releases and joins the holder, including when the
+        holder never took the lock in time.
+        """
+        held = threading.Event()
+        stop = threading.Event()
+
+        def _run() -> None:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                with platform_compat.file_lock(fd, exclusive=True):
+                    held.set()
+                    stop.wait()
+            finally:
+                os.close(fd)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        try:
+            assert held.wait(5), "holder thread failed to take the lock"
+            yield stop
+        finally:
+            stop.set()
+            thread.join(5)
+
+    @staticmethod
+    def _locked_section(lock_path: Path, timeout: float) -> float:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            started = time.monotonic()
+            with platform_compat.file_lock(fd, exclusive=True, timeout=timeout):
+                return time.monotonic() - started
+        finally:
+            os.close(fd)
+
+    def test_a_brief_in_process_holder_is_waited_out(self, tmp_path: Path, monkeypatch):
+        lock_path = tmp_path / "overlap.lock"
+        hold_secs = 0.05
+        # Only a safety ceiling: the waiter is released long before it, so a
+        # starved runner must not turn a slow wake-up into a refusal.
+        waiter_ceiling = 10.0
+        with self._hold_in_thread(lock_path) as stop:
+            # The holder lets go on a signal, not after a fixed hold: a fixed hold
+            # races the waiter's own start, and a waiter scheduled after it ends
+            # finds the lock already free. The signal is the waiter's own refused
+            # attempt on THIS lock file, so no other thread's flock can send it.
+            lock_inode = os.stat(lock_path).st_ino
+            met = threading.Event()
+            real_flock = platform_compat.fcntl.flock
+
+            def _flock(fd: int, op: int) -> None:
+                try:
+                    real_flock(fd, op)
+                except BlockingIOError:
+                    if op & platform_compat.fcntl.LOCK_NB and os.fstat(fd).st_ino == lock_inode:
+                        met.set()
+                    raise
+
+            monkeypatch.setattr(platform_compat.fcntl, "flock", _flock)
+
+            async def _main() -> float:
+                waiter = asyncio.create_task(
+                    asyncio.to_thread(self._locked_section, lock_path, waiter_ceiling)
+                )
+                watcher = asyncio.create_task(asyncio.to_thread(met.wait, 5))
+                # Release inside the coroutine: asyncio.run joins its executor
+                # before an outer finally could, and the waiter cannot finish
+                # while the lock is held.
+                try:
+                    await asyncio.wait({waiter, watcher}, return_when=asyncio.FIRST_COMPLETED)
+                    if waiter.done():
+                        return await waiter  # its own error, not "never met"
+                    assert watcher.result(), "waiter never met the lock"
+                    await asyncio.sleep(hold_secs)
+                finally:
+                    stop.set()
+                    met.set()
+                return await waiter
+
+            waited = asyncio.run(_main())
+
+        # Refused at first, then entered (a refusal at the ceiling would have
+        # raised) no earlier than the release: a real wait, not a free lock.
+        assert waited >= hold_secs
+
+    def test_a_holder_that_never_releases_is_refused_at_the_timeout(self, tmp_path: Path):
+        lock_path = tmp_path / "held-forever.lock"
+
+        async def _main() -> tuple[OSError, float]:
+            started = time.monotonic()
+            with pytest.raises(OSError) as excinfo:
+                await asyncio.to_thread(self._locked_section, lock_path, 2.0)
+            return excinfo.value, time.monotonic() - started
+
+        with self._hold_in_thread(lock_path):
+            error, waited = asyncio.run(_main())
+
+        assert not isinstance(error, BlockingIOError)
+        assert 2.0 <= waited < 3.0
+        message = str(error)
+        # The real wait and the limit, and no claimed cause.
+        assert "still held after waiting 2." in message
+        assert "limit 2s" in message
+        assert "stuck" not in message
+
+
 class TestPollBackoff:
     """The poll stands in for a zero-cost kernel sleep, so its wakeups are bounded."""
 
     def test_backoff_caps_the_sleep_and_never_overshoots_the_deadline(self, monkeypatch):
         # No real lock here: the SLEEP SCHEDULE is the subject, so the acquire is
         # stubbed permanently-held and every sleep is recorded instead of taken.
-        slept: list[float] = []
         monkeypatch.setattr(platform_compat, "_LOCK_TIMEOUT_SECS", 5.0)
 
         def _always_held(fd, mode):
             raise OSError(errno.EAGAIN, "held")
 
-        clock = {"now": 0.0}
-
-        def _fake_sleep(secs: float) -> None:
-            slept.append(secs)
-            clock["now"] += secs
-
         monkeypatch.setattr(platform_compat.fcntl, "flock", _always_held)
-        monkeypatch.setattr(platform_compat.time, "sleep", _fake_sleep)
-        monkeypatch.setattr(platform_compat.time, "monotonic", lambda: clock["now"])
+        clock = _pin_clock(monkeypatch)
 
         assert platform_compat._posix_acquire_blocking(0, 0) is False
+        slept = clock.sleeps
 
         # Bounded wakeups: a flat 10ms poll over 5s would be ~500 sleeps.
         assert len(slept) < 60, f"too many wakeups: {len(slept)}"
@@ -381,7 +538,7 @@ class TestAcquireLockCeiling:
         fd = os.open(held_lock, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             started = time.monotonic()
-            with pytest.raises(OSError, match="stuck"):
+            with pytest.raises(OSError, match="still held"):
                 platform_compat.acquire_lock(fd, exclusive=True)
             assert time.monotonic() - started >= _TEST_CEILING
         finally:
@@ -409,7 +566,7 @@ class TestAgentSpecLockDoesNotHangBoot:
         agents_dir.mkdir()
         proc = _spawn_holder(agents_dir / ".kirocrew-agents.lock")
         try:
-            with pytest.raises(OSError, match="stuck"):
+            with pytest.raises(OSError, match="still held"):
                 with agents_spec_lock(agents_dir):
                     pytest.fail("took the agent-spec lock while another process held it")
         finally:
@@ -486,7 +643,7 @@ class TestLockFailureIsReported:
         proc = _spawn_holder(agents_dir / ".kirocrew-agents.lock")
         try:
             with caplog.at_level("WARNING", logger="kiro_crew.agent"):
-                with pytest.raises(OSError, match="stuck"):
+                with pytest.raises(OSError, match="still held"):
                     with agents_spec_lock(agents_dir):
                         pytest.fail("took the lock while another process held it")
         finally:
@@ -496,7 +653,7 @@ class TestLockFailureIsReported:
                 proc.stdout.close()
 
         messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        assert any("stuck" in m for m in messages), messages
+        assert any("still held" in m for m in messages), messages
         assert any(".kirocrew-agents.lock" in m for m in messages), messages
         # The read-only remedy would be wrong advice here: the path IS writable.
         assert not any("KIRO_HOME" in m for m in messages), messages

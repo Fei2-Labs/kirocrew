@@ -4,8 +4,8 @@ status: partial
 revision: v1
 author: Kiro Crew
 created: 2026-09-06
-last-audited: 2026-09-22
-audited-at: 80bd0a81f
+last-audited: 2026-10-05
+audited-at: e281ecaf33
 doc-pr:
 implementation-prs: [8403]
 tracking-issues: []
@@ -22,18 +22,18 @@ The run-lifecycle boundary is also discussed in
 
 ## Current SDK boundary
 
-The App SDK does not provide a shared durable-job or URL-view-state contract.
 `AppContext` exposes `cron`, `events`, `storage`, and `spawn` when their
-permissions allow them; it has no job service (`src/kiro_crew/apps/context.py`,
-`AppContext` and `build_app_context`). The frontend barrel exports app API,
-event, metadata, navigation, and chat surfaces, but no `useAppJob` or
-`useAppViewState` hook (`website/src/app-sdk/index.ts`, `useAppApi`,
-`useAppEvents`, `useAppInfo`, `useNavigate`, and the barrel exports).
+permissions allow them, and `job: JobSDK` when the manifest sets
+`permissions.jobs` (`src/kiro_crew/apps/context.py`, `AppContext` and
+`build_app_context`). So the gateway side has a durable job service. The
+frontend has no matching `useAppJob` hook: the barrel exports app API, event,
+metadata, navigation, and chat surfaces (`website/src/app-sdk/index.ts`,
+`useAppApi`, `useAppEvents`, `useAppInfo`, `useNavigate`, and the barrel
+exports). `useAppViewState` ships in `website/src/app-sdk/viewState.ts` but is
+not exported from the barrel.
 
-This boundary is load-bearing: an app that needs to report or recover
-long-running work must own its server route, persistence, lifecycle recovery,
-and frontend reattachment. A common SDK cannot be assumed to supply those
-semantics.
+The remaining gap is the frontend: an app that follows a durable job must still
+write its own client-side reattachment, because no shared hook supplies it.
 
 `CronSDK` is a separate app-scoped scheduling surface (`src/kiro_crew/apps/cron_sdk.py`,
 `CronSDK`). It does not establish a job-run registry for app-initiated HTTP
@@ -43,32 +43,32 @@ work.
 
 ### AWS Control backups
 
-`_handle_backup_run` executes the selected backup runner in a worker thread and
-returns its terminal record (`src/kiro_crew/apps/builtins/aws_control/backend/routes.py`,
-`_handle_backup_run`). The runner records completed backup metadata through
-`_record_run`, and `last_runs` reads that per-account terminal ledger
-(`backend/backup.py`, `_record_run` and `last_runs`). The status endpoint
-returns that ledger as `runs` (`backend/routes.py`, `_handle_backup_status`).
-There is no backup job identifier or persisted in-flight registry in this path.
+AWS Control declares `"jobs": true` in its `app.json`. `_handle_backup_run`
+starts the backup as a Job SDK run and returns its run id without waiting for it
+to finish (`src/kiro_crew/apps/builtins/aws_control/backend/routes_parts/backups.py`,
+`_handle_backup_run`). The in-flight fact therefore lives on the server: a
+reload, a navigation away, or a second tab still sees it. The runner still
+records completed backup metadata through `_record_run`, and `last_runs` reads
+that per-account terminal ledger (`backend/backup_parts/ledger.py`, `_record_run`
+and `last_runs`). The status endpoint returns that ledger as `runs` and the
+account's job state as `jobs` (`backend/routes_parts/backups.py`, `_handle_backup_status`).
 
-A worker thread cannot be killed by cancelling the awaiting coroutine, and
-`_STOP` only prevents an upload reached after app teardown (`backend/backup.py`,
-`_STOP` and `_authorize_upload`). A client disconnect therefore does not create
-a cancelable or reattachable backup job.
+`_STOP` only prevents an upload reached after app teardown
+(`backend/backup_parts/uploads.py`, `_STOP` and `_authorize_upload`).
 
-The backup UI starts the request with a component-owned React Query mutation and
-derives its running indicator from that mutation (`website/src/apps/aws-control/DrivePage.tsx`,
-`BackupSection` and `runMut.isPending`). The API client posts directly to the
-backup route (`website/src/apps/aws-control/api.ts`, `backupRun`). A fresh mount
-can read prior terminal records through the status query, but it has no
-server-owned in-flight record to adopt.
+The backup UI's `busy` indicator comes from the server-owned job state, not
+only from the mutation (`website/src/apps/aws-control/DrivePageBackup.tsx`,
+`BackupSection`: `job?.active != null || runMut.isPending`). The API client
+posts directly to the backup route (`website/src/apps/aws-control/api.ts`,
+`backupRun`). A fresh mount adopts an in-flight backup through the status
+query. That reattachment is AWS Control's own code, not an SDK hook.
 
 ### Code Review Sage review runs
 
 Code Review Sage implements its own durable review-run registry. Its backend
 stores lightweight run descriptors in `_RUNS`, writes the registry to
-`runs.json`, and reloads it at startup (`src/kiro_crew/apps/builtins/code_review_sage/backend/routes.py`,
-`_RUNS`, `_runs_file`, `_save_runs`, and `_load_runs`). On load,
+`runs.json`, and reloads it at startup (`_RUNS` in `src/kiro_crew/apps/builtins/code_review_sage/backend/routes.py`;
+`_runs_file`, `_save_runs`, and `_load_runs` in `src/kiro_crew/apps/builtins/code_review_sage/backend/routes_parts/registry.py`). On load,
 `_load_runs` marks a persisted `running` review as `interrupted` because the
 in-process driver did not survive the restart. The test
 `test_orphaned_running_becomes_interrupted_on_load` enforces that recovery
@@ -120,15 +120,15 @@ registration path.
 Together the two produce a record that contradicts the work it describes. At
 gateway startup `_reap_stale_app_backends` terminates a backend left by a prior
 gateway generation only when the pid's identity positively matches the recorded
-one; when identity cannot be confirmed the pid is left alone (`backend.py`,
+one; when identity cannot be confirmed the pid is left alone (`backend_runtime/stale_reap.py`,
 `_reap_stale_app_backends`). A backend spared by that check keeps executing, and
 the new gateway's reconciliation marks its runs `INTERRUPTED`, recording that the
 gateway restarted while the run was executing and that no runner is registered for
 its kind — a backend-process runner has no registration path, so the resolved
 record's `interrupt_cause` is `runner_unregistered` (`job_sdk.py`,
-`JobSDK.reconcile` and `CAUSE_RUNNER_UNREGISTERED`).
+`JobSDK.reconcile`; `job_sdk_records.py`, `CAUSE_RUNNER_UNREGISTERED`).
 `INTERRUPTED` is a member of `TERMINAL_STATES`, so that record is neither
-reconciled again nor resumed (`job_sdk.py`, `TERMINAL_STATES`).
+reconciled again nor resumed (`job_sdk_records.py`, `TERMINAL_STATES`).
 
 This scope is load-bearing: an app whose run registry is process memory reports
 nothing after a restart, and reporting nothing is accurate, while a durable record
@@ -153,7 +153,7 @@ resolve it.
 
 ## View position is not an App SDK contract
 
-Builtin apps are mounted by the single-segment `/:builtinApp` route, and
+Builtin apps are mounted on the catch-all `/:builtinApp/*` route, and
 `BuiltinAppRoute` resolves that parameter to one component
 (`website/src/App.tsx`, builtin-app `Route`; `website/src/apps/BuiltinAppRoute.tsx`,
 `BuiltinAppRoute`). The host does not provide a builtin-app sub-route contract.
@@ -164,10 +164,13 @@ Apps can already read URL search parameters: `CodeReviewSagePage` calls
 view keys for apps, so each app that needs URL-backed state must define that
 contract itself.
 
-AWS Control keeps its selected account and drive in local component state
-(`website/src/apps/aws-control/AwsControlPage.tsx`, `AwsControlPage`). Those
-values are not encoded in its URL, so they cannot identify an account or drive
-in a shareable link. This local-state boundary is load-bearing: a URL can only
+`useAppViewState` (`website/src/app-sdk/viewState.ts`) persists view state in
+host-namespaced storage under `kc:app:<appId>:view`. It is not exported from the
+App SDK barrel. AWS Control's drive view uses it, scoped by account
+(`website/src/apps/aws-control/useDrivePageFiles.ts`). The selected account is still
+local component state (`website/src/apps/aws-control/AwsControlPage.tsx`,
+`AwsControlPage`). Neither is encoded in the URL, so they cannot identify an
+account or drive in a shareable link. This local-state boundary is load-bearing: a URL can only
 restore coordinates that the application has made part of its URL contract.
 
 ## Query-client scope

@@ -33,6 +33,27 @@ from kiro_crew.vector_memory import VectorMemoryStore, open_member_database
 pytestmark = pytest.mark.xdist_group("member_memory_api")
 
 
+@pytest.fixture
+def on_teardown():
+    """Run each registered callable after the test, whichever way it ended.
+
+    For handles the test opens itself (a ``SkillsLoader`` and its search index,
+    a tier the handler publishes on ``state``) that ``env`` does not own: an
+    unclosed sqlite connection is a reference cycle on CPython 3.11+, so its
+    descriptors survive the test until the cyclic collector runs.
+    """
+    callbacks: list = []
+    yield callbacks.append
+    for callback in reversed(callbacks):
+        callback()
+
+
+def _close_standalone_vector(state) -> None:
+    standalone = getattr(state, "_standalone_vector", None)
+    if standalone is not None:
+        standalone.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["", "bob"])
 async def test_spawn_inherits_member_or_uses_explicit_target(env, target):
@@ -90,6 +111,61 @@ async def test_internal_spawn_parent_must_match_caller_identity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("body_extra", [{}, {"parent_session": ""}], ids=["omitted", "empty"])
+async def test_internal_spawn_without_session_or_parent_is_admitted(env, body_extra):
+    """A process holding only the internal secret (a host-side sidecar, the CLI)
+    sends no ``X-Session-Key`` and no parent. ``api_spawn`` defaults the parent
+    to "", which must read as "no claim", not as a claim that fails to match."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    env.state.subagents = SimpleNamespace(
+        spawn=mock.Mock(return_value=SimpleNamespace(id="run-1", done=False))
+    )
+    response = await messaging.api_spawn(
+        request(env, body={"task": "spawn", **body_extra}, internal=True, session="")
+    )
+    assert response.status == 200, response.text
+    env.state.subagents.spawn.assert_called_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_extra", [{}, {"parent_session": ""}], ids=["omitted", "empty"])
+async def test_internal_spawn_with_session_but_no_parent_is_refused(env, body_extra):
+    """A caller WITH a verified session may not drop its parent: a run parented to
+    "" would be owned by no session, so the initiating session could not control
+    it while any sessionless internal caller could. The empty claim stays a claim."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    env.state.subagents = SimpleNamespace(spawn=mock.Mock())
+    response = await messaging.api_spawn(
+        request(env, body={"task": "spawn", **body_extra}, internal=True)
+    )
+    assert response.status == 409
+    assert json.loads(response.text)["code"] == "member_identity_unavailable"
+    env.state.subagents.spawn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "header, parent, claim",
+    [
+        ("", "", None),
+        ("", "dashboard:alice", "dashboard:alice"),
+        ("dashboard:alice", "", ""),
+        ("dashboard:alice", "dashboard:alice", "dashboard:alice"),
+    ],
+    ids=["sessionless-no-parent", "sessionless-parent", "session-no-parent", "session-parent"],
+)
+def test_spawn_parent_claim_drops_only_a_sessionless_empty_parent(header, parent, claim):
+    """Every spawn route (create, continue, both batch routes) takes its claim from
+    this helper, so this pins the rule for all four."""
+    from kiro_crew.dashboard.handlers._shared import spawn_parent_claim
+
+    headers = {"X-Session-Key": header} if header else {}
+    req = make_mocked_request("POST", "/api/spawn", headers=headers)
+    assert spawn_parent_claim(req, parent) == claim
+
+
+@pytest.mark.asyncio
 async def test_private_taskrunner_start_forwards_protected_origin(env):
     from kiro_crew.execution_context import read_session_execution
 
@@ -120,7 +196,7 @@ async def test_taskrunner_status_uses_ordinary_internal_transport(env):
         ("taskrunner:alice-run:runtime", "member-alice"),
         ("taskrunner:bob-run:runtime", "member-bob"),
     ):
-        env.bind_session(key, store)
+        await env.bind_session_async(key, store)
     runner = SimpleNamespace(
         status=lambda: {
             "runs": [
@@ -1111,6 +1187,339 @@ async def test_spawn_list_follows_origin_including_cross_member_delegation(env):
     assert "result-bob" not in response.text and "result-global" not in response.text
 
 
+def _spawn_rows():
+    def row(name, parent):
+        return SimpleNamespace(
+            id=name,
+            memory_store="",
+            task=name,
+            done=True,
+            parent_session_key=parent,
+            agent="kirocrew",
+            started=1,
+            result="result-" + name,
+            error="",
+            user_stopped=False,
+            outcome="success",
+            include_memory=True,
+            include_lessons=True,
+            include_project=True,
+        )
+
+    return [row("owned-run", "dashboard:someone"), row("cli-run", "")]
+
+
+@pytest.mark.asyncio
+async def test_run_controls_fail_closed_for_a_caller_with_no_session_identity(env):
+    """Run controls are ownership-scoped for EVERY internal caller. One that
+    presents no ``X-Session-Key`` owns no run a session started, so it is refused
+    with a reason that names the identity gap; it keeps reaching a run no session
+    started (the host operator's own CLI run), which is the only run it can own.
+    """
+    from kiro_crew.dashboard.handlers import messaging
+
+    rows = {r.id: r for r in _spawn_rows()}
+    env.state.subagents = SimpleNamespace(get=rows.get, all_agents=list(rows.values()))
+
+    req = request(env, body={"message": "steer"}, internal=True, session="")
+    req.match_info["agent_id"] = "owned-run"
+    refusal = await messaging._spawn_scope_refusal(req)
+    assert refusal is not None and refusal.status == 404
+    payload = json.loads(refusal.text)
+    assert payload["code"] == "task_scope_denied"
+    assert "no session identity" in payload["error"]
+    assert "kirocrew doctor" in payload["error"]
+
+    req = request(env, body={"message": "steer"}, internal=True, session="")
+    req.match_info["agent_id"] = "cli-run"
+    assert await messaging._spawn_scope_refusal(req) is None
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_run_is_owned_by_nobody(env):
+    """No managed run, no persisted record, no native card: nothing vouches for who
+    started it, so an internal caller with no identity is refused rather than
+    matched against an empty parent. A harness-native child is owned by the
+    dashboard slot that tracks its card, and by nothing else."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    rows = {r.id: r for r in _spawn_rows()}
+    env.state.subagents = SimpleNamespace(get=rows.get, all_agents=list(rows.values()))
+    env.state._native_cards = {"native:abc": {"slot": "owner-slot", "session_id": "s"}}
+    with mock.patch("kiro_crew.dashboard.handlers.messaging.read_state", return_value=None):
+        req = request(env, body={"message": "x"}, internal=True, session="")
+        req.match_info["agent_id"] = "never-seen"
+        refusal = await messaging._spawn_scope_refusal(req)
+        assert refusal is not None and refusal.status == 404
+
+        req = request(env, body={"message": "x"}, internal=True, session="")
+        req.match_info["agent_id"] = "native:abc"
+        refusal = await messaging._spawn_scope_refusal(req)
+        assert refusal is not None and refusal.status == 404
+
+        req = request(env, body={"message": "x"}, internal=True, session="dashboard:owner-slot")
+        req.match_info["agent_id"] = "native:abc"
+        assert await messaging._spawn_scope_refusal(req) is None
+
+
+@pytest.mark.asyncio
+async def test_a_persisted_run_is_owned_by_its_recorded_parent(env):
+    """A run that is not live is judged by its persisted record, whose
+    field is ``parent_session``: the recorded owner is admitted, an identity-less
+    caller is refused, a record without the field owns nobody, and a persisted
+    CLI run (empty parent) is still the one thing an identity-less caller reaches."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    env.state.subagents = SimpleNamespace(get=lambda _id: None, all_agents=[])
+    records = {
+        "owned-old": {"parent_session": "dashboard:someone"},
+        "cli-old": {"parent_session": ""},
+        "no-field": {"task": "x"},
+    }
+    with mock.patch(
+        "kiro_crew.dashboard.handlers.messaging.read_state",
+        side_effect=lambda rid: records.get(rid),
+    ):
+        for run_id, session, admitted in (
+            ("owned-old", "", False),
+            ("owned-old", "dashboard:someone", True),
+            ("cli-old", "", True),
+            ("no-field", "", False),
+        ):
+            req = request(env, body={"message": "x"}, internal=True, session=session)
+            req.match_info["agent_id"] = run_id
+            refusal = await messaging._spawn_scope_refusal(req)
+            assert (refusal is None) is admitted, (run_id, session)
+
+
+@pytest.mark.asyncio
+async def test_a_sessions_own_kiro_cli_process_still_controls_its_runs(env, monkeypatch):
+    """The compatibility claim behind the fence: a session's own kiro-cli process
+    carries its key, so its run controls are unaffected. Exercised end to end on
+    the identity CHAIN rather than a hand-written header: the key the MCP process
+    would send is what ``mcp_core._resolve_session_key`` returns for that process
+    (here through its ``KIROCREW_SESSION_KEY`` source), and that value is the
+    ``X-Session-Key`` the fence compares against the run's parent. The same chain
+    with no source resolves to no identity and is refused."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    rows = {r.id: r for r in _spawn_rows()}
+    env.state.subagents = SimpleNamespace(get=rows.get, all_agents=list(rows.values()))
+    monkeypatch.setattr(mcp_core, "current_caller", lambda: None)
+    monkeypatch.setattr(mcp_core, "_session_key_from_token", lambda: "")
+    monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+
+    monkeypatch.setenv("KIROCREW_SESSION_KEY", "dashboard:someone")
+    carried = mcp_core._resolve_session_key()
+    assert carried == "dashboard:someone"
+    req = request(env, body={"message": "steer"}, internal=True, session=carried)
+    req.match_info["agent_id"] = "owned-run"
+    assert await messaging._spawn_scope_refusal(req) is None
+
+    monkeypatch.delenv("KIROCREW_SESSION_KEY")
+    monkeypatch.setattr(mcp_core.os, "getppid", lambda: 1)
+    carried = mcp_core._resolve_session_key()
+    assert carried == ""
+    req = request(env, body={"message": "steer"}, internal=True, session=carried)
+    req.match_info["agent_id"] = "owned-run"
+    refusal = await messaging._spawn_scope_refusal(req)
+    assert refusal is not None and refusal.status == 404
+
+
+@pytest.mark.asyncio
+async def test_a_global_memory_session_still_only_controls_its_own_runs(env):
+    """Resolving to Global memory is not ownership: a verified session with no
+    private store takes the same ownership check as a private-memory one, so it
+    controls only the runs it started."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    rows = {r.id: r for r in _spawn_rows()}
+    env.state.subagents = SimpleNamespace(get=rows.get, all_agents=list(rows.values()))
+    with mock.patch("kiro_crew.execution_context.read_session_execution", return_value=None):
+        req = request(env, body={"message": "steer"}, internal=True, session="dashboard:other")
+        req.match_info["agent_id"] = "owned-run"
+        refusal = await messaging._spawn_scope_refusal(req)
+        assert refusal is not None and refusal.status == 404
+        assert json.loads(refusal.text) == {"error": "not found", "code": "task_scope_denied"}
+
+        req = request(env, body={"message": "steer"}, internal=True, session="dashboard:someone")
+        req.match_info["agent_id"] = "owned-run"
+        assert await messaging._spawn_scope_refusal(req) is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_list_shows_an_identity_less_caller_only_unowned_runs(env):
+    """The list must not hand out the run ids, task text and parent keys that the
+    control routes would refuse to act on for the same caller."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    rows = _spawn_rows()
+    env.state.subagents = SimpleNamespace(
+        all_agents=rows, _agents={r.id: r for r in rows}, _tasks={r.id: object() for r in rows}
+    )
+    response = await messaging.api_spawn_list(request(env, internal=True, session=""))
+    assert [r["id"] for r in json.loads(response.text)["agents"]] == ["cli-run"]
+    assert "dashboard:someone" not in response.text and "result-owned" not in response.text
+
+
+def _queued_registry(*queued, truncated=False):
+    """A registry holding only accepted spawns that have not started yet."""
+    from kiro_crew.subagent_manager.admission.types import QueuedRunListing
+
+    by_id = {q.id: q for q in queued}
+
+    async def queued_run_async(run_id):
+        return by_id.get(run_id)
+
+    async def queued_runs_async(parent=None, *, app=None):
+        return QueuedRunListing(
+            tuple(q for q in queued if parent is None or q.parent_session_key == parent),
+            truncated,
+        )
+
+    return SimpleNamespace(
+        get=lambda _id: None,
+        all_agents=[],
+        queued_run_async=queued_run_async,
+        queued_runs_async=queued_runs_async,
+    )
+
+
+def _queued(run_id, parent, **kw):
+    from kiro_crew.subagent_manager.admission.types import QueuedRun
+
+    return QueuedRun(id=run_id, task=f"task {run_id}", parent_session_key=parent, **kw)
+
+
+@pytest.mark.asyncio
+async def test_a_queued_run_is_owned_by_its_rows_session_and_reported_queued(env):
+    """A spawn the gate deferred has no run and no folder. Its row's session key
+    owns it, so the caller that was told "queued" can read it (and nobody else
+    can), and the status route answers ``queued`` instead of 404."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    env.state.subagents = _queued_registry(
+        _queued(
+            "q1",
+            "dashboard:alice",
+            accepted_at=1.0,
+            reason="low_memory",
+            reason_detail="low memory: 3.9 GB available, need 4.5 GB",
+        )
+    )
+    with mock.patch(
+        "kiro_crew.dashboard.handlers.messaging.read_state",
+        side_effect=AssertionError("a queued id has no run folder to read"),
+    ):
+        for session, admitted in (("dashboard:alice", True), ("dashboard:bob", False), ("", False)):
+            req = request(env, internal=True, session=session)
+            req.match_info["agent_id"] = "q1"
+            refusal = await messaging._spawn_scope_refusal(req)
+            assert (refusal is None) is admitted, session
+
+        req = request(env, internal=True, session="dashboard:alice")
+        req.match_info["agent_id"] = "q1"
+        response = await messaging.api_spawn_status(req)
+    assert response.status == 200
+    payload = json.loads(response.text)
+    assert payload["done"] is False and payload["queued"] is True
+    assert payload["reason"] == "low_memory"
+    assert payload["reason_detail"] == "low memory: 3.9 GB available, need 4.5 GB"
+    assert payload["started"] == 1.0 and payload["elapsed"] > 0
+    assert "result" not in payload and "turns" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_list_names_the_callers_own_queued_runs_apart_from_its_runs(env):
+    """Queued spawns are listed under ``queued`` -- not in ``agents``, whose
+    readers take a not-done entry for a run in progress -- and within the same
+    caller bound as the run rows."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    env.state.subagents = _queued_registry(
+        _queued("q-alice", "dashboard:alice"), _queued("q-bob", "dashboard:bob")
+    )
+    body = json.loads(
+        (
+            await messaging.api_spawn_list(
+                request(env, internal=True, session="dashboard:alice", query={"queued": "1"})
+            )
+        ).text
+    )
+    assert body["agents"] == []
+    assert [(q["id"], q["queued"], q["done"]) for q in body["queued"]] == [("q-alice", True, False)]
+    assert "q-bob" not in json.dumps(body)
+
+    owner = json.loads(
+        (await messaging.api_spawn_list(request(env, owner=True, query={"queued": "1"}))).text
+    )
+    assert sorted(q["id"] for q in owner["queued"]) == ["q-alice", "q-bob"]
+
+    # Every row is a permission decision and is audited, allowed or denied. A
+    # registry that ignores the parent narrowing forces the route's own bound.
+    registry = _queued_registry(
+        _queued("q-alice", "dashboard:alice"), _queued("q-bob", "dashboard:bob")
+    )
+    everyone = registry.queued_runs_async
+
+    async def ignore_parent(_parent=None, **_kw):
+        return await everyone(None)
+
+    registry.queued_runs_async = ignore_parent
+    env.state.subagents = registry
+    with (
+        mock.patch.object(messaging, "_audit_deny") as deny,
+        mock.patch.object(messaging, "_audit_allow") as allow,
+    ):
+        body = json.loads(
+            (
+                await messaging.api_spawn_list(
+                    request(env, internal=True, session="dashboard:alice", query={"queued": "1"})
+                )
+            ).text
+        )
+    assert [q["id"] for q in body["queued"]] == ["q-alice"]
+    assert [c.args[1:] for c in deny.call_args_list] == [
+        ("api_spawn_list", "queued_scope_mismatch")
+    ]
+    assert [c.args[1:] for c in allow.call_args_list] == [("api_spawn_list",)]
+
+    env.state.subagents = _queued_registry()
+    empty = json.loads(
+        (await messaging.api_spawn_list(request(env, owner=True, query={"queued": "1"}))).text
+    )
+    assert "queued" not in empty, "the payload is unchanged when nothing is queued"
+    assert "queued_truncated" not in empty
+
+    # A page that stopped at the cap says so, so its tail is not read as spawns
+    # that were never accepted.
+    env.state.subagents = _queued_registry(_queued("q-old", "dashboard:alice"), truncated=True)
+    page = json.loads(
+        (await messaging.api_spawn_list(request(env, owner=True, query={"queued": "1"}))).text
+    )
+    assert [q["id"] for q in page["queued"]] == ["q-old"]
+    assert page["queued_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_dashboard_owner_still_sees_and_controls_every_run(env):
+    """Cookie-authenticated owner surface: no ``internal_auth``, no ownership fence."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    rows = _spawn_rows()
+    env.state.subagents = SimpleNamespace(
+        get={r.id: r for r in rows}.get,
+        all_agents=rows,
+        _agents={r.id: r for r in rows},
+        _tasks={r.id: object() for r in rows},
+    )
+    response = await messaging.api_spawn_list(request(env, owner=True))
+    assert sorted(r["id"] for r in json.loads(response.text)["agents"]) == ["cli-run", "owned-run"]
+    req = request(env, body={"message": "steer"}, owner=True)
+    req.match_info["agent_id"] = "owned-run"
+    assert await messaging._spawn_scope_refusal(req) is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "handler_name",
@@ -1391,7 +1800,7 @@ async def test_member_history_oversized_document_is_unavailable_without_overwrit
     "question", ["{}", "What do we know about {}?", "Which project does {} belong to?"]
 )
 async def test_markdown_only_facts_reachable_from_agent_recall(
-    env, monkeypatch, mode, vector_available, question
+    env, monkeypatch, mode, vector_available, question, on_teardown
 ):
     from kiro_crew import context, member_memory_auth
     from kiro_crew.hooks import HookManager
@@ -1402,10 +1811,15 @@ async def test_markdown_only_facts_reachable_from_agent_recall(
     store.write_projects("# Active Projects\nNotebookquartz task belongs to the synthetic project.")
     store.append_history("Dailyquartz milestone was verified.")
     assert env.tiers[""].get_semantic("Notebookquartz") is None
+    skills = SkillsLoader(skills_path=env.home / "synthetic-skills", install_builtins=False)
+    on_teardown(skills.close)
+    # With no vector tier on the memory store the recall handler opens a standalone
+    # one and publishes it on ``state``, where production keeps it for the process.
+    on_teardown(lambda: _close_standalone_vector(env.state))
     builder = context.ContextBuilder(
         memory=store,
         lessons=LessonStore(base_dir=env.home / "synthetic-lessons"),
-        skills=SkillsLoader(skills_path=env.home / "synthetic-skills", install_builtins=False),
+        skills=skills,
         hooks=HookManager(),
     )
     monkeypatch.setattr(context, "kiro_agents_dir", lambda: env.home / "empty-agents")
@@ -1478,7 +1892,7 @@ async def test_markdown_recall_is_bound_to_named_v1_not_global(env, monkeypatch)
     env.state._slots["legacy"] = SimpleNamespace(is_restricted=False, blocks_reads=False)
     # Internal recall resolves the store from the session's recorded execution,
     # never from transcript metadata alone.
-    env.bind_session("dashboard:legacy", "legacy-notebook")
+    await env.bind_session_async("dashboard:legacy", "legacy-notebook")
     monkeypatch.setattr(member_memory_auth, "_request_peer_pid", lambda request: os.getpid())
     response = await memory_member.api_memory_recall(
         request(

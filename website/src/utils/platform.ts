@@ -1,6 +1,11 @@
 /** Platform detection utilities for keyboard shortcut labels */
 export const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform)
 
+/** Unlike isMac, exclude desktop-mode iPadOS, which reports MacIntel with touch points. */
+export function isMacOSPlatform(): boolean {
+  return typeof navigator !== 'undefined' && /^Mac/.test(navigator.platform) && navigator.maxTouchPoints === 0
+}
+
 /** Format a shortcut string like "Shift+Enter" for the current platform */
 export const platformShortcut = (shortcut: string): string =>
   isMac

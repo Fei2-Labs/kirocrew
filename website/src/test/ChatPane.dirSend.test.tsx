@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { i18nT } from '../i18n/t'
 import type { ReactNode } from 'react'
-import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -9,9 +10,13 @@ import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
 import chatReducer, { setQuestionCard, sseChatMessage, selectComposerBusy, selectSlotMessages } from '../store/chatSlice'
-import dashboardReducer from '../store/dashboardSlice'
+import dashboardReducer, { sseSlots } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import { store as appStore } from '../store'
+import { TerminalHostContext } from '../hooks/useTerminalCommand'
+import * as bottomTerminal from '../hooks/useBottomTerminal'
+import * as terminalRegistry from '../utils/terminalRegistry'
+import * as terminalPopout from '../utils/terminalPopout'
 
 /* ChatPane sends must follow ChatPage's wire/bubble split for folder tokens
  * (issue #743 review finding): the API payload carries `[attached_dir N] path`
@@ -66,13 +71,13 @@ Object.defineProperty(window, 'matchMedia', {
 import ChatPane from '../components/ChatPane'
 import { api } from '../api/client'
 
-function makeStore(slotKey: string, busy = false) {
+function makeStore(slotKey: string, busy = false, overrides: Partial<RootState['dashboard']['slots'][number]> = {}) {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
       dashboard: {
         status: null, connected: true,
-        slots: [{ key: slotKey, messages: 0, running: false, subagents_running: busy, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }],
+        slots: [{ key: slotKey, messages: 0, running: false, subagents_running: busy, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined, ...overrides }],
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
       } as unknown as RootState['dashboard'],
@@ -80,9 +85,9 @@ function makeStore(slotKey: string, busy = false) {
   })
 }
 
-function renderPane(slotKey: string, busy = false) {
+function renderPane(slotKey: string, busy = false, overrides: Partial<RootState['dashboard']['slots'][number]> = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const store = makeStore(slotKey, busy)
+  const store = makeStore(slotKey, busy, overrides)
   return renderWithStore(store, qc, slotKey)
 }
 
@@ -92,7 +97,7 @@ function renderWithStore(store: ReturnType<typeof makeStore>, qc: QueryClient, s
       <QueryClientProvider client={qc}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatPane slotKey={slotKey} />
+            <TerminalHostContext.Provider value="docked"><ChatPane slotKey={slotKey} /></TerminalHostContext.Provider>
           </MemoryRouter>
         </ThemeProvider>
       </QueryClientProvider>
@@ -208,7 +213,10 @@ describe('ChatPane send — the response confirms the optimistic bubble', () => 
 describe('ChatPane agent switch — failures reach the shared notice', () => {
   async function openAgentPicker() {
     const { store } = renderPane('pane-agent')
-    const trigger = await screen.findByLabelText(/agent/i)
+    // The picker's own label, not `/agent/i`: the slot key doubles as the
+    // pane title, and the rename trigger's name carries the title too
+    // ("pane-agent (rename session)"), so the loose regex matches both.
+    const trigger = await screen.findByLabelText(/follows the default agent|^Agent: /)
     fireEvent.click(trigger)
     return store
   }
@@ -569,9 +577,10 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
 })
 
 /* #10634: a NATIVE AskUserQuestion card is raised WHILE its own turn is still
- * running and waiting on the answer, and it carries neither `ask_id` (the
- * blocking backend card) nor `card_id` (the non-blocking `ask_question` MCP
- * card). Answering it must STEER into the live turn, not queue behind it — the
+ * running and waiting on the answer. It is server-owned like every card (a
+ * `card_id`) and the server marks it `native` on the frame — the one
+ * thing that tells it apart from the non-blocking `ask_question` MCP card.
+ * Answering it must STEER into the live turn, not queue behind it — the
  * queue path is what left the question unanswered until timeout. When the turn
  * has ended, the same card answer starts an ordinary next turn, exactly as the
  * non-blocking card always does. */
@@ -613,11 +622,13 @@ describe('ChatPane native question card (#10634) — steer while the turn is liv
   }
 
   function seedNativeCard(store: ReturnType<typeof nativeStore>, slot: string) {
-    // No ask_id AND no card_id — the native card shape (chat_runner.py broadcasts
-    // { slot, questions } only). setQuestionCard with neither id reproduces it.
+    // The native card shape: a server `card_id` plus the `native` mark
+    // (chat_runner.py posts it through post_question_card(native=True)).
     act(() => {
       store.dispatch(setQuestionCard({
         slot,
+        card_id: 'card-native',
+        native: true,
         questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
       }))
     })
@@ -781,5 +792,93 @@ describe('ChatPane file drop', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('chat-drop-overlay')).not.toBeInTheDocument()
     })
+  })
+})
+
+describe('ChatPane terminal attachment and session boundaries', () => {
+  beforeEach(() => {
+    terminalRegistry.setTerminalEnabledFlag(true)
+    vi.spyOn(bottomTerminal, 'addTab').mockReturnValue('pane-terminal')
+    vi.spyOn(terminalRegistry, 'sendToTerminalSession').mockReturnValue(true)
+    vi.spyOn(terminalRegistry, 'onTerminalReady').mockImplementation((_id, ready) => {
+      ready()
+      return vi.fn()
+    })
+    vi.spyOn(terminalPopout, 'bringBack').mockImplementation(() => {})
+  })
+  afterEach(() => {
+    terminalRegistry.setTerminalEnabledFlag(false)
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  it('refuses a dropped folder until its chip removes the token, then reviews the pane workspace', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal('kirocrew', { getPathForFile: () => '/work/docs' })
+    renderPane('pane-terminal-folder', false, { project: '/work/pane-project' })
+    const box = await screen.findByRole('textbox', { name: 'Message input' })
+    const folder = new File([], 'docs')
+    const dataTransfer = {
+      types: ['Files'], files: [folder],
+      items: [{ kind: 'file', getAsFile: () => folder, webkitGetAsEntry: () => ({ isDirectory: true }) }],
+    }
+    fireEvent.drop(box, { dataTransfer })
+    expect(box).toHaveValue('@/work/docs/ ')
+    fireEvent.change(box, { target: { value: '! pwd @/work/docs/ ' } })
+    const run = screen.getByRole('button', { name: 'Review terminal command' })
+    expect(run).toBeDisabled()
+    expect(screen.getByText('Remove folder attachments before running. Removing a folder also removes its @path reference from the command.')).toBeVisible()
+    await user.click(run)
+    await user.click(box)
+    await user.keyboard('{Enter}')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(box).toHaveValue('! pwd @/work/docs/ ')
+    expect(bottomTerminal.addTab).not.toHaveBeenCalled()
+    expect(terminalRegistry.sendToTerminalSession).not.toHaveBeenCalled()
+    expect(terminalPopout.bringBack).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(api.uploadFiles).not.toHaveBeenCalled()
+
+    await user.click(within(screen.getByRole('group', { name: '/work/docs/' })).getByRole('button', { name: 'Remove folder' }))
+    expect(box).toHaveValue('! pwd ')
+    expect(run).toBeEnabled()
+    await user.click(run)
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toHaveTextContent('/work/pane-project')
+    expect(bottomTerminal.addTab).not.toHaveBeenCalled()
+    await user.click(within(dialog).getByRole('button', { name: 'Run', exact: true }))
+    expect(bottomTerminal.addTab).toHaveBeenCalledExactlyOnceWith('/work/pane-project')
+    expect(terminalRegistry.sendToTerminalSession).toHaveBeenCalledExactlyOnceWith('pane-terminal', 'pwd ', { preserveTrailingWhitespace: true })
+    expect(box).toHaveValue('! pwd ')
+    expect(api.sendChat).not.toHaveBeenCalled()
+  })
+
+  it('keeps a retained remote pane blocked when its row disappears, without replay on rehydration', async () => {
+    const user = userEvent.setup()
+    const { store } = renderPane('pane-remote-retained', false, { executor: 'remote', project: '/peer/project' })
+    const row = store.getState().dashboard.slots[0]
+    act(() => store.dispatch(sseSlots([row])))
+    const box = await screen.findByRole('textbox', { name: 'Message input' })
+    fireEvent.change(box, { target: { value: '! pwd' } })
+    expect(screen.getByText('Terminal commands are unavailable for sessions on another server. Remove the leading ! to return to chat.')).toBeVisible()
+    act(() => store.dispatch(sseSlots([])))
+    expect(store.getState().dashboard.slots).toHaveLength(0)
+    expect(screen.getByText('Wait for session details to load, or select another session.')).toBeVisible()
+    const run = screen.getByRole('button', { name: 'Review terminal command' })
+    expect(run).toBeDisabled()
+    await user.click(run)
+    await user.click(box)
+    await user.keyboard('{Enter}')
+    expect(box).toHaveValue('! pwd')
+    act(() => store.dispatch(sseSlots([row])))
+    expect(screen.getByText('Terminal commands are unavailable for sessions on another server. Remove the leading ! to return to chat.')).toBeVisible()
+    expect(run).toBeDisabled()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(box).toHaveValue('! pwd')
+    expect(bottomTerminal.addTab).not.toHaveBeenCalled()
+    expect(terminalRegistry.onTerminalReady).not.toHaveBeenCalled()
+    expect(terminalRegistry.sendToTerminalSession).not.toHaveBeenCalled()
+    expect(terminalPopout.bringBack).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
   })
 })

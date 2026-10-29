@@ -18,10 +18,8 @@ import { describe, it, expect, vi } from 'vitest'
 import { render, screen, act, fireEvent } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
 import { createTestStore } from './helpers'
+import { readIndexCss } from './indexCssSource'
 
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
 vi.mock('../components/DiffPanel', () => ({ default: () => null }))
@@ -73,10 +71,7 @@ function renderPanel() {
   )
 }
 
-const cssSource = () => {
-  const here = dirname(fileURLToPath(import.meta.url))
-  return readFileSync(join(here, '..', 'index.css'), 'utf8')
-}
+const cssSource = () => readIndexCss()
 
 describe('side panel browser-tab strip', () => {
   it('marks the active chip with side-tab-active + the body background, not inactive ones', () => {
@@ -158,9 +153,11 @@ describe('side panel browser-tab strip', () => {
     expect(strip.className).toContain('border-border')
     const group = screen.getByRole('tablist')
     expect(group.className).toContain('-mb-px')
-    // The drop lives on the GROUP containers, not the chips: the tablist
-    // scrolls, and a chip's own negative margin would be clipped away.
-    expect(group.parentElement!.querySelector(':scope > div.shrink-0')!.className).toContain('-mb-px')
+    // The drop lives on the GROUP containers, not the chips: both groups
+    // scroll, and a chip's own negative margin would be clipped away. The
+    // fixed group is named by its testid rather than by a layout class — it
+    // scrolls like the tablist, so it is no longer `shrink-0`.
+    expect(screen.getByTestId('side-panel-fixed-tabs').className).toContain('-mb-px')
   })
 
   it('goes transparent on the pinned↔dynamic divider when an adjacent tab is active', () => {

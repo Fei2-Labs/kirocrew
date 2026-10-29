@@ -1,26 +1,35 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Globe, RotateCw, ExternalLink, ArrowLeft, ArrowRight, Expand, Minimize, Smartphone, Monitor, Check, Crop, Play, Loader2, AlertTriangle, Info, MoreHorizontal, MousePointerClick, Pencil, X, Plus } from 'lucide-react'
+import { Globe, RotateCw, ExternalLink, ArrowLeft, ArrowRight, Expand, Minimize, Smartphone, Monitor, Check, Crop, Play, Loader2, AlertTriangle, Info, MoreHorizontal, X } from 'lucide-react'
 
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent, DropdownMenuSeparator,
 } from './ui/dropdown-menu'
 import ErrorNotice from './ErrorNotice'
-import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
-import {
-  OPAQUE_ROLE_KEYS, PREVIEW_ANNOTATE_EVENT, annotationScreenshotFile, annotationStamp, describeAnnotationTarget,
-  type AnnotationItem, type PreviewAnnotateDetail,
-} from '../utils/browserAnnotations'
-import { formatAnnotationDraft } from '../utils/browserAnnotations.prompt'
-import { ApiError } from '../api/apiError'
+import { safeSetItem } from '../utils/safeStorage'
 import { Btn } from './ui'
 import { SettingRef } from './settingRef/SettingRef'
 import { isScreenSnipSupported } from '../hooks/useScreenSnip'
 import { useIsMobile } from '../hooks/useIsMobile'
 import { useBrowserView } from '../hooks/useBrowserView'
 import { useNativeBrowser } from '../hooks/useNativeBrowser'
+import {
+  PENDING_KEY_PREFIX, PREVIEW_PENDING_EVENT, PREVIEW_URL_EVENT, URL_KEY_PREFIX,
+  hasQueryOrFragment, httpEmbedRefusal, isDashboardOrigin, isInvalidUrlRefusal, isLoopbackHost,
+  isolateFrameTarget, isolatePreviewHost, normalizeUrl,
+} from './webPreviewPanelUrl'
+import { useWebPreviewPanelAnnotate } from './useWebPreviewPanelAnnotate'
+import { useFrameNavigationBlock } from './useFrameNavigationBlock'
+import { useRelayCookieRefusal } from './useRelayCookieRefusal'
+import WebPreviewPanelNativeSurface from './WebPreviewPanelNativeSurface'
 
 import { i18nT } from '../i18n/t'
+
+export {
+  EMBEDDABLE_LOOPBACK_HOSTS, httpEmbedRefusal, isDashboardOrigin, isPotentiallyTrustworthyHost, isolatePreviewHost, normalizeUrl,
+  setSessionPreviewPending, setSessionPreviewUrl,
+} from './webPreviewPanelUrl'
+
 /**
  * WebPreviewPanel — a docked, session-scoped **live web preview** of a URL the
  * user is serving locally (a dev server / static server for the project they're
@@ -53,19 +62,10 @@ import { i18nT } from '../i18n/t'
  * non-loopback host.
  */
 
-const URL_KEY_PREFIX = 'mc-webpreview-url:'
-/** localStorage prefix for a chat-fed URL that is PENDING an explicit "Load
- *  preview" click — surfaced as a card, never auto-navigated (click-to-load). */
-const PENDING_KEY_PREFIX = 'mc-webpreview-pending:'
 /** localStorage flag: the reader dismissed the padlock hint under the browser
  *  view once. Per browser, not per chat -- the hint explains a control that is
  *  the same in every chat, so one reading is enough. */
 const PADLOCK_HINT_DISMISSED_KEY = 'mc-webpreview-padlock-hint-dismissed'
-/** Window event that feeds a URL into a mounted panel from outside (ChatPage). */
-const PREVIEW_URL_EVENT = 'kirocrew-web-preview-url'
-/** Window event feeding a PENDING url (shown as a Load-preview card, NOT
- *  navigated) — the click-to-load counterpart of PREVIEW_URL_EVENT. */
-const PREVIEW_PENDING_EVENT = 'kirocrew-web-preview-pending'
 /**
  * Window event: enter/leave the preview expand mode. App collapses the
  * left nav and ChatPage hides the session list + maximizes the side panel, so
@@ -83,128 +83,27 @@ export const PREVIEW_EXPAND_EVENT = 'kirocrew-preview-expand'
  */
 export const PREVIEW_SNIP_EVENT = 'kirocrew-web-preview-snip'
 
-/** The panel's mirror of the in-page pick overlay plus the notes it owns,
- *  keyed by the slot it belongs to (see the Annotate section in the component). */
-interface AnnotateMirror {
-  slot: string
-  /** An overlay session is alive on the page (poll it). */
-  live: boolean
-  picking: boolean
-  /** Picks on the current page, as the overlay reports them. */
-  targets: BrowserAnnotationTarget[]
-  /** Notes by pick id. Panel-owned; never sent to the page. */
-  notes: Record<number, string>
-  /** Noted picks kept from a page that navigated away (detached). */
-  retained: AnnotationItem[]
-  page: { url: string; title: string }
-  /** The note editor: which pick, and the text being typed. */
-  editing: { id: number; text: string } | null
-}
-const EMPTY_TARGETS: BrowserAnnotationTarget[] = []
-const EMPTY_ANNOTATE: AnnotateMirror = {
-  slot: '', live: false, picking: false, targets: EMPTY_TARGETS, notes: {}, retained: [], page: { url: '', title: '' }, editing: null,
-}
-/** One mirror per chat slot. Kept as a map (not "the current slot's mirror")
- *  so switching sessions and coming back finds the notes where they were. */
-type AnnotateMirrors = Record<string, AnnotateMirror>
-/** sessionStorage key: typed prose must survive a dashboard reload too (the
- *  native view -- and the overlay in it -- outlives the renderer). Session
- *  scoped, not local: notes are about a page that is open right now. */
-const ANNOTATE_STORE_KEY = 'mc-browser-annotations'
-function loadAnnotateMirrors(): AnnotateMirrors {
-  try {
-    const raw = sessionStorage.getItem(ANNOTATE_STORE_KEY)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw) as unknown
-    if (!parsed || typeof parsed !== 'object') return {}
-    const out: AnnotateMirrors = {}
-    for (const [slot, m] of Object.entries(parsed as Record<string, Partial<AnnotateMirror>>)) {
-      if (!m || typeof m !== 'object') continue
-      out[slot] = {
-        slot,
-        live: !!m.live,
-        // Pick mode is a live gesture, never resumed from storage.
-        picking: false,
-        targets: Array.isArray(m.targets) ? m.targets : EMPTY_TARGETS,
-        notes: m.notes && typeof m.notes === 'object' ? m.notes : {},
-        retained: Array.isArray(m.retained) ? m.retained : [],
-        page: m.page && typeof m.page === 'object' ? { url: String(m.page.url ?? ''), title: String(m.page.title ?? '') } : { url: '', title: '' },
-        editing: m.editing && typeof m.editing === 'object' && typeof m.editing.id === 'number' ? { id: m.editing.id, text: String(m.editing.text ?? '') } : null,
-      }
-    }
-    return out
-  } catch {
-    return {}
-  }
-}
-/** Keep the text of an open editor as its pick's note (live picks only; a
- *  retained pick's draft is written by the caller). Never drops prose. */
-function flushDraft(
-  editing: AnnotateMirror['editing'],
-  notes: Record<number, string>,
-  targets: BrowserAnnotationTarget[],
-): Record<number, string> {
-  if (!editing) return notes
-  const text = editing.text.replace(/\s+/g, ' ').trim()
-  if (!text || !targets.some(t => t.id === editing.id)) return notes
-  return { ...notes, [editing.id]: text }
-}
-/** The page went away (navigation, view lost): stop the live session but keep
- *  every noted pick -- including a note still being typed -- as detached. */
-function detachAll(prev: AnnotateMirror): AnnotateMirror {
-  const notes = { ...prev.notes }
-  // Text in the open editor is the user's too; an uncommitted draft is kept
-  // as that pick's note rather than lost with the page.
-  if (prev.editing && prev.editing.text.trim() && prev.targets.some(t => t.id === prev.editing!.id)) {
-    notes[prev.editing.id] = prev.editing.text.replace(/\s+/g, ' ').trim()
-  }
-  return {
-    ...prev,
-    live: false,
-    picking: false,
-    editing: prev.editing && prev.retained.some(a => a.id === prev.editing!.id) ? prev.editing : null,
-    retained: [
-      ...prev.retained,
-      ...prev.targets.filter(t => (notes[t.id] ?? '').trim()).map(t => ({ ...t, note: notes[t.id] ?? '', detached: true })),
-    ],
-    targets: EMPTY_TARGETS,
-    notes: {},
-  }
-}
-function saveAnnotateMirrors(mirrors: AnnotateMirrors): void {
-  const kept = Object.fromEntries(Object.entries(mirrors).filter(([, m]) => m.live || m.targets.length || m.retained.length || m.editing))
-  // The WRITE goes through the helper: a full quota would otherwise raise
-  // QuotaExceededError on the render path. The delete stays a plain call —
-  // removing a key frees space rather than needing it, so it is not the quota
-  // failure mode this migration is about (it keeps its own guard for a denied
-  // store). Either way the in-memory map still covers this tab.
-  if (Object.keys(kept).length) safeSetSessionItem(ANNOTATE_STORE_KEY, JSON.stringify(kept))
-  else { try { sessionStorage.removeItem(ANNOTATE_STORE_KEY) } catch { /* storage unavailable */ } }
-}
-
-type AnnotateResult = Awaited<ReturnType<NonNullable<BrowserAPI['annotate']>>>
-/** Explicit guards, not `in` narrowing: the bridge returns a wide union and
- *  `tsc -b` under the app config does not narrow `'items' in res` usefully. */
-function isAnnotatePoll(res: AnnotateResult): res is BrowserAnnotatePoll {
-  return !!res && res.ok === true && Array.isArray((res as { items?: unknown }).items) && typeof (res as { picking?: unknown }).picking === 'boolean'
-}
-function isAnnotateCapture(res: AnnotateResult): res is BrowserAnnotateCapture {
-  return !!res && res.ok === true && typeof (res as { png?: unknown }).png === 'string'
-}
-/** Plain names for the opaque ARIA roles, in the UI language (the on-page
- *  hover tag gets the same map, since the page realm has no catalog). */
-function annotateRoleNames(): Record<string, string> {
-  const out: Record<string, string> = {}
-  for (const [role, key] of Object.entries(OPAQUE_ROLE_KEYS)) out[role] = i18nT(key)
-  return out
-}
-function annotateFailureText(res: AnnotateResult): string {
-  return res && res.ok === false && typeof res.error === 'string' ? res.error : ''
-}
 /** Common local dev-server ports offered as one-click starting points. */
 const COMMON_PORTS = [3000, 5173, 8080, 4321, 8000]
 /** iframe sandbox — permissive enough for real apps + HMR, but still a sandbox. */
 const SANDBOX = 'allow-scripts allow-same-origin allow-forms allow-popups allow-modals allow-downloads'
+/** Browser-view iframe sandbox for the RELAY PATH ONLY — deliberately WITHOUT
+ * `allow-same-origin`. The relay serves the view SPA on the dashboard's OWN
+ * origin, so granting the frame a real origin would let that content (or
+ * anything squatting the relay's loopback target port) reach the parent DOM
+ * and drive the dashboard's cookie-authed APIs. The opaque origin — reinforced
+ * server-side by the relay's CSP `sandbox` stamp — keeps the view exactly as
+ * isolated as its old loopback origin was. An opaque origin sends no cookies,
+ * which is why the relay path embeds its own capability token.
+ * `allow-popups` matches the direct path: without
+ * `allow-popups-to-escape-sandbox` a popup INHERITS these flags — opaque
+ * origin included — so parity costs no isolation (the view SPA has no popup
+ * affordance today; this keeps one added later from no-op'ing only via relay).
+ * The direct-URL fallback (older gateway, no relay `path`) keeps the plain
+ * SANDBOX instead: it is already a foreign loopback origin, and only relayed
+ * documents get the storage shim — sandboxing the direct frame opaque would
+ * crash the view SPA's boot on its bare localStorage access. */
+const VIEW_SANDBOX = 'allow-scripts allow-forms allow-popups allow-modals allow-downloads'
 
 /** Preview viewport presets. `w`/`h` absent = responsive desktop (fill panel);
  *  present = a fixed device-sized frame (mobile/tablet). */
@@ -252,53 +151,6 @@ function deviceLabel(d: DevicePreset): string {
     : (d.label ?? d.id)
 }
 
-/** Coerce free-form input into a safe http(s) URL, or null if unusable. A bare
- *  host gets a scheme: `http://` for a loopback host or anything carrying an
- *  explicit port or IP literal (`localhost:5173`, `192.168.1.4:3000` — the
- *  dev-server shapes, which are plain http), `https://` for a bare public host
- *  (`google.com`), which is what a real site answers on and what a browser's own
- *  address bar would try. Any explicit scheme that isn't http(s) (javascript:,
- *  file:, data:, ftp://, …) is rejected so the iframe can't be pointed at a
- *  dangerous target. */
-export function normalizeUrl(raw: string): string | null {
-  const trimmed = raw.trim()
-  if (!trimmed) return null
-  // Reject dangerous / non-web schemes up front (these have no `//` authority,
-  // so the scheme:// check below wouldn't catch them).
-  if (/^(javascript|data|file|vbscript|blob|about):/i.test(trimmed)) return null
-  const schemeSep = trimmed.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//)
-  let candidate = trimmed
-  if (schemeSep) {
-    // An explicit scheme:// — only http(s) allowed (rejects ftp://, ws://, …).
-    if (!/^https?$/i.test(schemeSep[1])) return null
-  } else {
-    // No scheme (e.g. `localhost:5173`, where `localhost` is a host, not a
-    // scheme). Parse once as http to read the host and port back, then decide.
-    let probe: URL
-    try { probe = new URL(`http://${trimmed}`) } catch { return null }
-    candidate = `${defaultSchemeFor(probe)}://${trimmed}`
-  }
-  try {
-    const u = new URL(candidate)
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
-    return u.toString()
-  } catch {
-    return null
-  }
-}
-
-/** `https` for a bare PUBLIC hostname, `http` for everything a dev server looks
- *  like: a loopback host, an IP literal, or any host with an explicit port. A
- *  `host:port` typed bare is a local or LAN server in practice, and a public site
- *  is never typed with one. */
-function defaultSchemeFor(u: URL): 'http' | 'https' {
-  if (u.port) return 'http'
-  const h = u.hostname
-  if (isLoopbackHost(h)) return 'http'
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h) || h.startsWith('[')) return 'http'
-  return 'https'
-}
-
 /** Query param carrying the reload counter (see `withCacheBuster`). Deliberately
  *  namespaced so setting it can't clobber a param the previewed app owns. */
 const RELOAD_PARAM = '_kcreload'
@@ -331,245 +183,6 @@ export function withCacheBuster(url: string, key: number): string {
     // as-is rather than not at all.
     return url
   }
-}
-
-/** Loopback hostnames that share cookies by host (port-agnostic). */
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1'])
-
-/** True for any host that resolves to the local machine and can therefore share
- *  host-scoped cookies with a same-host dashboard — the loopback IPs/names plus
- *  the `*.localhost` reserved TLD (e.g. `kirocrew.localhost`, which the desktop
- *  app and tunnels use). */
-function isLoopbackHost(h: string): boolean {
-  return LOOPBACK_HOSTS.has(h) || h === 'localhost' || h.endsWith('.localhost')
-}
-
-/** Loopback hosts an `http://` preview may be FRAMED on while the dashboard
- *  itself is served over `https`. Two conditions, and a host has to meet both:
- *
- *  1. **The engine must not block the frame as mixed content.** `127.0.0.1` and
- *     `localhost` are potentially trustworthy origins under W3C Secure Contexts,
- *     so an `http://` document on them is exempt. `0.0.0.0` is the unspecified
- *     address rather than loopback, so it is not exempt and really is blocked.
- *  2. **The dashboard's own CSP must admit the origin.** `frame-src` carries
- *     `http://127.0.0.1:*` and `http://localhost:*` unconditionally (`server.py`
- *     `_LOOPBACK_FRAME_SRC`), while `http://*.localhost:*` is added only in
- *     instances mode, and no wildcard-port entry for the rest of `127.0.0.0/8`
- *     or for a bracketed IPv6 literal exists at all — the latter is invalid CSP
- *     grammar.
- *
- *  A host missing either condition keeps the explanatory card, which is strictly
- *  better than a frame the engine or the CSP silently blanks. IPv6 loopback still
- *  reaches the frame: `isolatePreviewHost` canonicalizes `[::1]` to `127.0.0.1`
- *  before the target is ever framed. */
-const EMBEDDABLE_LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost'])
-
-/** Whether an `http://` document on *h* is a potentially trustworthy origin under
- *  W3C Secure Contexts — `localhost`, the `*.localhost` reserved TLD, all of
- *  `127.0.0.0/8`, and IPv6 loopback — so the ENGINE does not block it as mixed
- *  content inside an `https` dashboard. `0.0.0.0` is the unspecified address,
- *  not loopback, and is deliberately absent: the engine really does block it.
- *
- *  This is condition 1 of `EMBEDDABLE_LOOPBACK_HOSTS`, split out so the refusal
- *  card can name the right blocker: a trustworthy host that is still not
- *  embeddable fails only condition 2, the dashboard's own `frame-src`. */
-export function isPotentiallyTrustworthyHost(h: string): boolean {
-  if (h === 'localhost' || h.endsWith('.localhost')) return true
-  if (h === '[::1]' || h === '::1') return true
-  return /^127\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})$/.test(h)
-}
-
-/** Why an `http://` target cannot be framed inside an `https` dashboard, or
- *  `null` when it can (an embeddable loopback host) or the question does not
- *  arise (an `http` dashboard, an `https` target).
- *
- *  - `'browser'`: the host is not potentially trustworthy, so the engine blocks
- *    the frame as mixed content. Nothing on the gateway side can change that.
- *  - `'policy'`: the engine would allow it, but this dashboard does not embed
- *    it: `EMBEDDABLE_LOOPBACK_HOSTS` is pinned to the hosts the gateway's CSP
- *    `frame-src` carries in every mode, and this host is not one of them (a
- *    `*.localhost` entry exists only in instances mode, so the panel refuses it
- *    even there rather than guess). That is a gateway policy, not a browser one.
- *
- *  One sentence used to cover both, and blamed the browser for the second — which
- *  sent a reader into a mixed-content investigation for a CSP problem. */
-export function httpEmbedRefusal(url: string, dashboardProtocol: string): 'browser' | 'policy' | null {
-  if (dashboardProtocol !== 'https:' || !url.startsWith('http://')) return null
-  const host = hostnameOf(url)
-  if (EMBEDDABLE_LOOPBACK_HOSTS.has(host)) return null
-  return isPotentiallyTrustworthyHost(host) ? 'policy' : 'browser'
-}
-
-/** A URL's hostname, or `''` when it will not parse — so a caller deciding
- *  whether to RELAX a guard fails closed instead of throwing during render. */
-function hostnameOf(url: string): string {
-  try { return new URL(url).hostname } catch { return '' }
-}
-
-/** A URL's port as the browser resolves it, so `:80` and an absent port on
- *  `http://` compare equal. */
-function effectivePort(u: URL): string {
-  if (u.port) return u.port
-  return u.protocol === 'https:' ? '443' : '80'
-}
-
-/**
- * True when `url` points back at the gateway serving this dashboard.
- *
- * Such a target can never render in the preview iframe, and the panel would
- * otherwise show a blank frame with no explanation. The gateway answers every
- * request with `X-Frame-Options: SAMEORIGIN` and CSP `frame-ancestors 'self'`,
- * and `isolatePreviewHost` deliberately swaps the host to the *other* loopback
- * name for cookie isolation — so the frame is always cross-origin to the
- * dashboard by construction, and always refused. (Keeping the host identical to
- * pass `'self'` is not an option: that is the cookie leak the swap exists to
- * prevent.) Reporting it beats framing it.
- *
- * Both sides must be loopback: when the dashboard is reached over a tunnel or a
- * LAN address, a loopback target is the *user's own* machine — an ordinary dev
- * server — not this gateway. Ports are compared because the host strings
- * legitimately differ (`localhost` vs `127.0.0.1`) for one and the same server.
- * `dashboardOrigin` defaults to the current document location (overridable for
- * tests).
- *
- * Same port on loopback therefore means the same server, with one exception: a
- * dev server bound to a DIFFERENT loopback interface (`::1`) on the gateway's own
- * port is a distinct listener that this reports as self. That target degrades to
- * the explanatory state plus its open-in-browser link rather than to a blank
- * frame, so the misread costs a click and never silently swallows a page.
- */
-export function isDashboardOrigin(url: string, dashboardOrigin?: string): boolean {
-  let target: URL
-  try { target = new URL(url) } catch { return false }
-  let origin = dashboardOrigin
-  if (origin == null) {
-    try { origin = typeof window !== 'undefined' ? window.location.href : '' } catch { origin = '' }
-  }
-  if (!origin) return false
-  let self_: URL
-  try { self_ = new URL(origin) } catch { return false }
-  if (!isLoopbackHost(target.hostname) || !isLoopbackHost(self_.hostname)) return false
-  return effectivePort(target) === effectivePort(self_)
-}
-
-/**
- * Normalize a loopback preview URL's host so it is both reachable under the
- * dashboard CSP and cookie-isolated from the dashboard. Two rewrites, in order:
- *
- * 1. **IPv6 loopback → IPv4.** The dashboard CSP admits loopback preview origins
- *    (see `server.py` `_LOOPBACK_FRAME_SRC`), but a bracketed IPv6 literal with a
- *    wildcard port — `http://[::1]:*` — is INVALID CSP grammar, so Chromium drops
- *    the whole source and can never admit it. The panel's no-cors liveness probe
- *    to `[::1]` is therefore refused and a perfectly healthy dev server shows as
- *    "Preview server not reachable" (while it opens fine in the OS browser, whose
- *    top-level navigation is not bound by the dashboard CSP). `127.0.0.1` is the
- *    same loopback and IS admitted, so canonicalize `[::1]`/`::1` to it. This runs
- *    independent of the dashboard host — even when it is unknown — because the CSP
- *    gap has nothing to do with cookie isolation.
- *
- * 2. **Cookie isolation.** Cookies are scoped by host but NOT by port, so an
- *    iframe pointed at `http://localhost:5173` while the dashboard is served from
- *    the same host (`localhost`, `127.0.0.1`, or a `*.localhost` alias like
- *    `kirocrew.localhost`) would send the dashboard's host-scoped auth cookie to
- *    the previewed dev server (which could read/replay it). When the preview host
- *    matches the dashboard host and both are loopback, swap it to a
- *    guaranteed-distinct loopback host (`127.0.0.1`, or `localhost` when the
- *    dashboard already IS `127.0.0.1`) — a different host string, so no dashboard
- *    cookie is ever sent to the framed server.
- *
- * Non-loopback hosts and already-distinct hosts skip the isolation swap.
- * `dashboardHost` defaults to the current document host (overridable for tests).
- */
-export function isolatePreviewHost(url: string, dashboardHost?: string): string {
-  let u: URL
-  try { u = new URL(url) } catch { return url }
-  // (1) IPv6 loopback canonicalization — unconditional (the CSP gap is
-  // orthogonal to the dashboard host, so it must fire even when host is unknown).
-  // A parsed URL exposes an IPv6 host in bracketed form (`[::1]`); guard the bare
-  // form too, defensively.
-  if (u.hostname === '[::1]' || u.hostname === '::1') u.hostname = '127.0.0.1'
-  // (2) Cookie isolation — needs to know the dashboard host to compare against.
-  let host = dashboardHost
-  if (host == null) {
-    try { host = typeof window !== 'undefined' ? window.location.hostname : '' } catch { host = '' }
-  }
-  if (!host) return u.toString()
-  const h = u.hostname
-  if (!isLoopbackHost(h)) return u.toString()  // real host / tunnel — leave it
-  if (h !== host) return u.toString()          // already a distinct host → isolated
-  u.hostname = h === '127.0.0.1' ? 'localhost' : '127.0.0.1'
-  return u.toString()
-}
-
-/**
- * Isolate a host only for a target the panel will actually FRAME.
- *
- * The host swap in `isolatePreviewHost` exists to keep the dashboard's
- * host-scoped cookie out of a framed server. A target that is this gateway is
- * never framed — it renders the explanatory state instead — so the swap buys no
- * safety there and actively misreports the target: someone who typed
- * `127.0.0.1:6776` would be told `localhost:6776` "is the dashboard's own
- * server", at the exact moment the panel is explaining itself. Show what they
- * entered.
- */
-function isolateFrameTarget(url: string): string {
-  return isDashboardOrigin(url) ? url : isolatePreviewHost(url)
-}
-
-/**
- * Feed a URL into a session's Web Preview tab from OUTSIDE the panel — e.g.
- * ChatPage auto-detecting a dev-server URL (or the agent's `kirocrew:preview`
- * marker) in chat. Persists it as the session's preview target (so the panel
- * picks it up on mount if the tab isn't open yet) AND — when ``open`` is true —
- * notifies an already-mounted panel to load it live. Pass ``open=false`` to
- * pre-fill WITHOUT auto-loading (the heuristic "offer" path: it loads only when
- * the user actually opens the tab, never as a drive-by GET). Returns the
- * normalized+isolated URL, or null if unusable.
- */
-export function setSessionPreviewUrl(sessionKey: string, rawUrl: string, open = true): string | null {
-  if (!sessionKey) return null
-  const norm = normalizeUrl(rawUrl)
-  if (!norm) return null
-  const isolated = isolateFrameTarget(norm)
-  safeSetItem(`${URL_KEY_PREFIX}${sessionKey}`, isolated)
-  if (open) {
-    window.dispatchEvent(new CustomEvent(PREVIEW_URL_EVENT, { detail: { slot: sessionKey, url: isolated } }))
-  }
-  return isolated
-}
-
-/**
- * Feed a PENDING preview URL for a session — the agent's `kirocrew:preview`
- * marker or a heuristic localhost URL detected in chat. Unlike
- * `setSessionPreviewUrl`, this NEVER loads the iframe: it persists the URL under
- * the pending key and notifies a mounted panel to show a **"Load preview"** card.
- * The GET only fires when the user clicks Load (an explicit gesture) — closing
- * the auto-navigation vector where agent output could drive a scripted iframe to
- * an arbitrary host with no user consent.
- *
- * Chat-fed URLs are additionally **loopback-only**: agent output (which can be
- * prompt-injected by browsed/read content) can only ever offer a LOCAL dev
- * server, never an external host — the feature's whole purpose is local
- * previews, so this costs nothing. A URL pointing back at this gateway is
- * rejected too: it can never be framed (see `isDashboardOrigin`), so offering it
- * would only produce a Load button that leads to a blank panel. The manual URL
- * bar is not restricted (typing a URL is the user's own action). Returns the
- * normalized+isolated URL, or null when unusable, non-loopback, or self.
- */
-export function setSessionPreviewPending(sessionKey: string, rawUrl: string): string | null {
-  if (!sessionKey) return null
-  const norm = normalizeUrl(rawUrl)
-  if (!norm) return null
-  try {
-    if (!isLoopbackHost(new URL(norm).hostname)) return null
-  } catch {
-    return null
-  }
-  if (isDashboardOrigin(norm)) return null
-  const isolated = isolatePreviewHost(norm)
-  safeSetItem(`${PENDING_KEY_PREFIX}${sessionKey}`, isolated)
-  window.dispatchEvent(new CustomEvent(PREVIEW_PENDING_EVENT, { detail: { slot: sessionKey, url: isolated } }))
-  return isolated
 }
 
 /** URL-bar navigation history. `index` points at the current entry in `stack`.
@@ -654,28 +267,6 @@ interface LaunchState {
   refused?: 'local' | 'gateway'
 }
 
-/** Whether the launcher would refuse *url* for its shape alone (see `refused`).
- * Mirrors the gateway's `validate_url`: a non-empty query or fragment. A bare
- * trailing `?` or `#` carries nothing and passes there, so it passes here. */
-function hasQueryOrFragment(url: string): boolean {
-  try {
-    const u = new URL(url)
-    return u.search !== '' || u.hash !== ''
-  } catch {
-    return false
-  }
-}
-
-/** The gateway's own refusal of a URL shape (`code: "invalid_url"` on a 400). */
-function isInvalidUrlRefusal(err: unknown): boolean {
-  if (!(err instanceof ApiError) || err.status !== 400) return false
-  try {
-    return (JSON.parse(err.body) as { code?: unknown }).code === 'invalid_url'
-  } catch {
-    return false
-  }
-}
-
 export default function WebPreviewPanel({ sessionKey, active = true }: { sessionKey?: string | null; active?: boolean }) {
   const storageKey = sessionKey ? `${URL_KEY_PREFIX}${sessionKey}` : null
   const pendingKey = sessionKey ? `${PENDING_KEY_PREFIX}${sessionKey}` : null
@@ -745,20 +336,46 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
   // driven. There is no per-frame push to subscribe to any more: the view is a
   // process with a URL, so the panel polls its status and frames the URL.
   const view = useBrowserView(active)
-  // Validate the server-reported URL before it becomes an iframe `src`. The
-  // contract promises `http://127.0.0.1:<port>/`, and `normalizeUrl` rejects
-  // anything that is not http(s) — so a malformed or hostile value degrades to
-  // the explanatory state instead of being navigated.
+  // Validate the server-reported target before it becomes an iframe `src`.
   //
-  // Deliberately NOT run through `isolatePreviewHost`: that swaps a loopback host
-  // matching the dashboard's onto the other alias, and the CLI binds ONE
-  // interface (`--host 127.0.0.1`). Swapping `127.0.0.1` to `localhost` can
-  // resolve to `::1`, where nothing is listening — the exact IPv6 trap the
-  // explicit bind exists to avoid. The view's URL is used verbatim.
+  // Preferred: the gateway's same-origin relay `path`
+  // (`/browser-view/<token>/`). A relative path rides whatever origin delivers
+  // the dashboard itself — an SSH forward, a tunnel — so the view is reachable
+  // remotely with no pinned port and no second forward. The embedded
+  // capability token is the relay's auth (the frame below is an opaque-origin
+  // sandbox that sends no cookies). The shape check (single leading slash)
+  // keeps a malformed or hostile value from becoming a protocol-relative
+  // (`//host`) navigation.
+  //
+  // Fallback: the absolute `url` from an older gateway that predates the relay.
+  // The contract promises `http://127.0.0.1:<port>/`, and `normalizeUrl`
+  // rejects anything that is not http(s) — so a malformed or hostile value
+  // degrades to the explanatory state instead of being navigated.
+  //
+  // The fallback is deliberately NOT run through `isolatePreviewHost`: that
+  // swaps a loopback host matching the dashboard's onto the other alias, and
+  // the CLI binds ONE interface (`--host 127.0.0.1`). Swapping `127.0.0.1` to
+  // `localhost` can resolve to `::1`, where nothing is listening — the exact
+  // IPv6 trap the explicit bind exists to avoid. The view's URL is used
+  // verbatim.
   const viewUrl = useMemo(
-    () => (view.data?.url ? normalizeUrl(view.data.url) : null),
-    [view.data?.url],
+    () => {
+      const relayPath = view.data?.path
+      if (typeof relayPath === 'string' && relayPath.startsWith('/') && !relayPath.startsWith('//')) {
+        return relayPath
+      }
+      return view.data?.url ? normalizeUrl(view.data.url) : null
+    },
+    [view.data?.path, view.data?.url],
   )
+  // Which sandbox the view frame needs tracks HOW the URL was resolved. A relay
+  // path is same-origin (relative, guaranteed above to start with a single '/'),
+  // so it must be framed WITHOUT `allow-same-origin`; the direct loopback URL
+  // (older gateway, no `path`) is a foreign origin where `allow-same-origin`
+  // grants only that origin — and it MUST keep real storage access, because the
+  // relay's localStorage shim is injected only into relayed documents, so an
+  // opaque-origin direct frame crashes the view SPA's boot.
+  const viewIsRelay = !!viewUrl && viewUrl.startsWith('/')
   const viewRunning = view.data?.status === 'running' && !!viewUrl
   // Whether the browser view OWNS the panel. Null = follow the view itself (it
   // takes over as soon as it is running, which is how the old frame mirror
@@ -799,424 +416,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     setViewOverride(v => !(v ?? viewRunning))
   }, [viewRunning])
 
-  // ── Annotate: element notes on the live page ──────────────────────────────
-  // The user points at elements IN the native page (hover highlight, click to
-  // select); that surface is an overlay injected into the page by the main
-  // process, because the native view is composited above this DOM. The NOTE
-  // is typed HERE, in the panel: the page is external content, and a text
-  // input inside it would let any page script read the user's prose. So the
-  // overlay reports picked elements (id, number, ref, description, liveness)
-  // and the panel owns the notes, the editor, the list and Send/Clear.
-  // Native-only by construction: the remote/CLI transport has no in-process
-  // view to inject into, so the button is not rendered there.
-  const annotateBridge = window.browserAPI?.annotate
-  const canAnnotate = nativeOpen && typeof annotateBridge === 'function'
-  // One mirror per slot, read through the CURRENT slot key in the same
-  // render, so a session switch never shows -- or sends -- another session's
-  // notes, and coming back finds this session's notes where they were. The
-  // map also lives in sessionStorage so a dashboard reload keeps typed prose.
-  const [annotateMirrors, setAnnotateMirrors] = useState<AnnotateMirrors>(loadAnnotateMirrors)
-  const mirror = annotateMirrors[sessionKey || ''] ?? EMPTY_ANNOTATE
-  useEffect(() => { saveAnnotateMirrors(annotateMirrors) }, [annotateMirrors])
-  const mirrorsRef = useRef(annotateMirrors)
-  mirrorsRef.current = annotateMirrors
-  const annotateOn = mirror.live
-  const picking = mirror.picking
-  const editing = mirror.editing
-  /** Everything listed: notes kept from a page that navigated away, then the
-   *  current page's picks with their (panel-owned) notes. */
-  const annotations = useMemo<AnnotationItem[]>(() => [
-    ...mirror.retained,
-    ...mirror.targets.map(t => ({ ...t, note: mirror.notes[t.id] ?? '' })),
-  ], [mirror.retained, mirror.targets, mirror.notes])
-  /** What Send hands over: only picks that actually carry a note. */
-  const noted = useMemo(() => annotations.filter(a => a.note.trim()), [annotations])
-  /** Add to chat has something to send once a note is saved -- or typed and
-   *  still open in the editor (it is committed on the way out). */
-  const canSend = noted.length > 0 || !!editing?.text.trim()
-  const [annotateBusy, setAnnotateBusy] = useState(false)
-  const [annotateError, setAnnotateError] = useState('')
-  /** The agent hand-off is offered on errors it could act on -- not on the
-   *  capture-failed notice, which already says the notes were added and what
-   *  did not happen; there is nothing for the agent to fix there. */
-  const annotateErrorAskAgent = annotateError !== i18nT('components.webPreviewPanel.annotate_capture_failed')
-  /** Brief confirmation after Add to chat: the result lands in the composer,
-   *  away from the button, so say here that nothing was sent yet. */
-  const [addedAck, setAddedAck] = useState(false)
-  /** Two-step Clear: first click arms (label restates the count), second within
-   *  the window executes. Typed prose must not vanish on one click. */
-  const [clearArmed, setClearArmed] = useState(false)
-  const clearTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  /** Consecutive poll failures that are NOT "the overlay is gone". */
-  const pollFailures = useRef(0)
-  /**
-   * Picks the poll updater abandons (nothing typed, editor moved on) and the
-   * page has not been told to drop yet, keyed by the slot they belong to. The
-   * updater fills it; the effect below drains it after the commit. React runs
-   * a state updater lazily whenever the hook already has an update queued, so
-   * a decision made inside it is not readable on the line after setState --
-   * only after the render it produces. The slot travels with the id because
-   * that render can also be the one that switches sessions: a remove bound to
-   * the session current at drain time would reach the other slot's page, where
-   * the same marker number may be a live pick.
-   */
-  const abandonedPicks = useRef<Map<string, Set<number>>>(new Map())
-  const noteInputRef = useRef<HTMLInputElement>(null)
-
-  const callAnnotate = useCallback(async (op: BrowserAnnotateOp, args?: Record<string, unknown>) => {
-    if (!sessionKey || typeof annotateBridge !== 'function') return null
-    return annotateBridge(sessionKey, op, args)
-  }, [annotateBridge, sessionKey])
-
-  /** Update ONE slot's mirror; every other slot's state is left alone. */
-  const patchSlot = useCallback((slot: string, fn: (prev: AnnotateMirror) => AnnotateMirror) => {
-    setAnnotateMirrors(prev => {
-      const cur = prev[slot] ?? { ...EMPTY_ANNOTATE, slot }
-      const next = fn(cur)
-      return next === cur ? prev : { ...prev, [slot]: next }
-    })
-  }, [])
-  /** Update the current slot's mirror. */
-  const patchMirror = useCallback((fn: (prev: AnnotateMirror) => AnnotateMirror) => {
-    patchSlot(sessionKey || '', fn)
-  }, [patchSlot, sessionKey])
-
-  // Tell each slot's overlay to drop the picks the poll updater abandoned. This
-  // runs after the commit that removed them from the list, so list, count and
-  // page highlight agree, and it addresses the bridge by the recorded slot
-  // rather than through callAnnotate, which is bound to whichever session is
-  // current now. The Set dedupes the updater's second run under StrictMode.
-  useEffect(() => {
-    if (!abandonedPicks.current.size) return
-    const pending = [...abandonedPicks.current]
-    abandonedPicks.current.clear()
-    if (typeof annotateBridge !== 'function') return
-    for (const [slot, ids] of pending) for (const id of ids) void annotateBridge(slot, 'remove', { id })
-  }, [annotateMirrors, annotateBridge])
-
-  // A session switch resets the per-turn transients: poll failure count and an
-  // armed Clear -- a confirmation armed for one session's notes must never fire
-  // on another session's.
-  useEffect(() => {
-    pollFailures.current = 0
-    setClearArmed(false)
-    if (clearTimer.current) { clearTimeout(clearTimer.current); clearTimer.current = null }
-  }, [sessionKey])
-
-  /** Toggle pick mode. First use installs the overlay and starts polling. */
-  const toggleAnnotate = useCallback(async () => {
-    if (annotateBusy) return
-    setAnnotateError('')
-    if (annotateOn && picking) {
-      // Only a confirmed stop flips the local state; a failed one is surfaced
-      // and `picking` is left for the poll to reconcile with the page.
-      const stopped = await callAnnotate('stop')
-      if (!stopped || !stopped.ok) {
-        setAnnotateError(annotateFailureText(stopped) || i18nT('components.webPreviewPanel.annotate_update_failed'))
-        return
-      }
-      patchMirror(prev => ({ ...prev, picking: false }))
-      return
-    }
-    // Continue numbering after notes retained from a page that navigated
-    // away, so on-page markers, the list and the draft agree, and ids never
-    // collide with the retained ones.
-    const res = await callAnnotate('start', {
-      editHint: i18nT('components.webPreviewPanel.annotate_click_to_edit'),
-      roleNames: annotateRoleNames(),
-      seq: mirror.retained.reduce((m, a) => Math.max(m, a.n), 0),
-      idStart: mirror.retained.reduce((m, a) => Math.max(m, a.id), 0),
-    })
-    if (!res || !res.ok) {
-      setAnnotateError(annotateFailureText(res) || i18nT('components.webPreviewPanel.annotate_failed'))
-      return
-    }
-    const page = { url: res.url ?? '', title: res.title ?? '' }
-    pollFailures.current = 0
-    // Starting never wipes: picks and notes from a paused session (Done,
-    // Add to chat, or a transient poll failure) stay exactly as they are. If
-    // the overlay really is gone, the first poll answers `no_overlay` and
-    // `detachAll` moves the noted picks to `retained` -- nothing typed is
-    // discarded on any path.
-    patchMirror(prev => ({ ...prev, live: true, picking: true, page }))
-  }, [annotateBusy, annotateOn, picking, callAnnotate, patchMirror, mirror.retained])
-
-  // Mirror the overlay while a session is alive. The overlay lives in the
-  // page, so the picks the user makes there reach this panel only by asking;
-  // 150ms keeps it feeling live without measurable cost (one tiny
-  // executeJavaScript per tick; state is replaced only when something
-  // changed). Two failure shapes, two answers:
-  //   • `no_overlay` -- the document navigated and took the overlay with it.
-  //     Polling stops, but the notes the user typed are KEPT (moved to
-  //     `retained`, marked detached), so Send still works: the draft flags
-  //     them, no screenshot. Annotating a dev app the agent is editing means
-  //     HMR reloads mid-session are routine; wiping typed prose on each one
-  //     would be the wrong default.
-  //   • anything else (timeout, exception) -- transient. Retry; after three in
-  //     a row surface it and pause polling, still keeping the notes.
-  useEffect(() => {
-    if (!annotateOn || !canAnnotate) return
-    let stopped = false
-    const slot = sessionKey || ''
-    const tick = async () => {
-      const res = await callAnnotate('poll')
-      if (stopped) return
-      if (isAnnotatePoll(res)) {
-        pollFailures.current = 0
-        patchSlot(slot, prev => {
-          // A live pick can never share an id with a retained note (the overlay
-          // is started past the highest retained id); one that does is a
-          // page-controlled reply and is ignored rather than aliasing a note.
-          const incoming = prev.retained.length
-            ? res.items.filter(t => !prev.retained.some(a => a.id === t.id))
-            : res.items
-          const sameTargets = JSON.stringify(incoming) === JSON.stringify(prev.targets)
-          let targets = sameTargets ? prev.targets : incoming
-          let notes = prev.notes
-          let retained = prev.retained
-          if (!sameTargets) {
-            // A pick the reply no longer lists: the honest overlay only drops
-            // one on the user's own remove/clear (both already handled here),
-            // so anything else -- a page tampering with the reply -- must not
-            // cost a note. Noted picks that went missing are kept as detached.
-            const keep = new Set(targets.map(t => t.id))
-            const missingNoted = prev.targets.filter(t => !keep.has(t.id) && (prev.notes[t.id] ?? '').trim() && !retained.some(a => a.id === t.id))
-            if (missingNoted.length) retained = [...retained, ...missingNoted.map(t => ({ ...t, note: prev.notes[t.id], detached: true }))]
-            notes = Object.fromEntries(Object.entries(prev.notes).filter(([id]) => keep.has(Number(id))))
-          }
-          let editing = prev.editing
-          const moveTo = res.picked !== undefined ? res.picked : res.edit
-          if (moveTo !== undefined && (!editing || editing.id !== moveTo)) {
-            // The editor moves to another pick. Whatever was typed for the one
-            // it leaves is kept as that pick's note -- live or retained -- and
-            // never dropped (same rescue as detachAll on navigation). A pick
-            // left with NOTHING typed is abandoned: it goes, like Esc does, so
-            // the list, the count and the draft never disagree about it.
-            notes = flushDraft(editing, notes, targets)
-            if (editing && editing.text.trim() && retained.some(a => a.id === editing!.id)) {
-              const text = editing.text.replace(/\s+/g, ' ').trim()
-              retained = retained.map(a => (a.id === editing!.id ? { ...a, note: text } : a))
-            }
-            if (editing && !editing.text.trim() && !(notes[editing.id] ?? '').trim() && targets.some(t => t.id === editing!.id) && editing.id !== moveTo) {
-              const ids = abandonedPicks.current.get(slot) ?? new Set<number>()
-              ids.add(editing.id)
-              abandonedPicks.current.set(slot, ids)
-              targets = targets.filter(t => t.id !== editing!.id)
-            }
-            editing = { id: moveTo, text: notes[moveTo] ?? '' }
-          }
-          else if (editing && !targets.some(t => t.id === editing!.id) && !retained.some(a => a.id === editing!.id)) editing = null
-          const page = { url: res.url, title: res.title }
-          if (sameTargets && notes === prev.notes && retained === prev.retained && editing === prev.editing && prev.picking === res.picking
-            && prev.page.url === page.url && prev.page.title === page.title) return prev
-          return { ...prev, picking: res.picking, targets, notes, retained, editing, page }
-        })
-        return
-      }
-      // The overlay is gone (navigation) or the view itself is (closed,
-      // destroyed): either way the page is not coming back for these picks.
-      if (res && !res.ok && (res.code === 'no_overlay' || res.code === 'no_view')) {
-        patchSlot(slot, detachAll)
-        return
-      }
-      pollFailures.current += 1
-      if (pollFailures.current >= 3) {
-        setAnnotateError(annotateFailureText(res) || i18nT('components.webPreviewPanel.annotate_failed'))
-        patchSlot(slot, prev => ({ ...prev, live: false, picking: false }))
-      }
-    }
-    void tick()
-    const t = setInterval(() => { void tick() }, 150)
-    return () => {
-      stopped = true
-      clearInterval(t)
-    }
-  }, [annotateOn, canAnnotate, callAnnotate, sessionKey, patchSlot])
-
-  // The pick happened in the page; the note is typed here. Focus the editor
-  // as soon as it opens (the main process has already handed keyboard focus
-  // back to this renderer on the poll that reported the pick).
-  const editingId = editing?.id
-  useEffect(() => {
-    if (editingId === undefined) return
-    const el = noteInputRef.current
-    if (!el) return
-    el.focus()
-    el.select()
-  }, [editingId])
-
-  // Losing the native view (transport switch, panel close) ends the live
-  // session; noted picks are kept as detached until cleared.
-  useEffect(() => {
-    if (canAnnotate) return
-    patchMirror(prev => (prev.live ? detachAll(prev) : prev))
-  }, [canAnnotate, patchMirror])
-  // Unmount (the panel itself closes) tears every live overlay down. A session
-  // SWITCH does not: the other session's native view -- and the overlay in it
-  // -- stays alive, so its picks are still there when the user comes back.
-  useEffect(() => () => {
-    if (typeof annotateBridge !== 'function') return
-    for (const [slot, m] of Object.entries(mirrorsRef.current)) {
-      if (slot && m.live) void annotateBridge(slot, 'teardown')
-    }
-  }, [annotateBridge])
-
-  useEffect(() => {
-    if (!annotateError) return
-    const t = setTimeout(() => setAnnotateError(''), 8000)
-    return () => clearTimeout(t)
-  }, [annotateError])
-  useEffect(() => {
-    if (!addedAck) return
-    const t = setTimeout(() => setAddedAck(false), 5000)
-    return () => clearTimeout(t)
-  }, [addedAck])
-  useEffect(() => () => { if (clearTimer.current) clearTimeout(clearTimer.current) }, [])
-
-  const dropLocally = useCallback((id: number) => {
-    patchMirror(prev => {
-      const isTarget = prev.targets.some(t => t.id === id)
-      const notes = { ...prev.notes }
-      delete notes[id]
-      return {
-        ...prev,
-        notes,
-        targets: isTarget ? prev.targets.filter(t => t.id !== id) : prev.targets,
-        retained: prev.retained.filter(a => a.id !== id),
-        editing: prev.editing?.id === id ? null : prev.editing,
-      }
-    })
-  }, [patchMirror])
-  /** Remove a pick. On a live page the overlay is asked FIRST and the note is
-   *  dropped only once it confirms: a refused removal must not leave a marker
-   *  on the page whose note has already vanished from here. */
-  const removeAnnotation = useCallback(async (id: number) => {
-    const live = annotateOn && mirror.targets.some(t => t.id === id)
-    if (!live) {
-      dropLocally(id)
-      return
-    }
-    const res = await callAnnotate('remove', { id })
-    if (res && res.ok) dropLocally(id)
-    else setAnnotateError(annotateFailureText(res) || i18nT('components.webPreviewPanel.annotate_update_failed'))
-  }, [annotateOn, mirror.targets, callAnnotate, dropLocally])
-  const editAnnotation = useCallback((id: number) => {
-    patchMirror(prev => {
-      if (prev.editing?.id === id) return prev
-      // Moving the editor keeps the in-flight text of the pick it leaves.
-      const notes = flushDraft(prev.editing, prev.notes, prev.targets)
-      const retained = prev.editing && prev.editing.text.trim() && prev.retained.some(a => a.id === prev.editing!.id)
-        ? prev.retained.map(a => (a.id === prev.editing!.id ? { ...a, note: prev.editing!.text.replace(/\s+/g, ' ').trim() } : a))
-        : prev.retained
-      const existing = notes[id] ?? retained.find(a => a.id === id)?.note ?? ''
-      return { ...prev, notes, retained, editing: { id, text: existing } }
-    })
-  }, [patchMirror])
-  const setEditingText = useCallback((text: string) => {
-    patchMirror(prev => (prev.editing ? { ...prev, editing: { ...prev.editing, text } } : prev))
-  }, [patchMirror])
-  /** Enter / Save: keep the note; an empty note on a fresh pick removes the pick. */
-  const commitNote = useCallback(() => {
-    const cur = editing
-    if (!cur) return
-    const text = cur.text.replace(/\s+/g, ' ').trim()
-    if (!text) {
-      const had = mirror.notes[cur.id] ?? mirror.retained.find(a => a.id === cur.id)?.note ?? ''
-      if (!had) void removeAnnotation(cur.id)
-      else patchMirror(prev => ({ ...prev, editing: null }))
-      return
-    }
-    patchMirror(prev => ({
-      ...prev,
-      notes: prev.targets.some(t => t.id === cur.id) ? { ...prev.notes, [cur.id]: text } : prev.notes,
-      retained: prev.retained.map(a => (a.id === cur.id ? { ...a, note: text } : a)),
-      editing: null,
-    }))
-  }, [editing, mirror.notes, mirror.retained, removeAnnotation, patchMirror])
-  /** Esc / Cancel: drop the edit; a fresh pick with nothing typed is removed. */
-  const cancelNote = useCallback(() => {
-    const cur = editing
-    if (!cur) return
-    const had = mirror.notes[cur.id] ?? mirror.retained.find(a => a.id === cur.id)?.note ?? ''
-    if (!had) void removeAnnotation(cur.id)
-    else patchMirror(prev => ({ ...prev, editing: null }))
-  }, [editing, mirror.notes, mirror.retained, removeAnnotation, patchMirror])
-  const clearAnnotations = useCallback(() => {
-    if (!clearArmed) {
-      setClearArmed(true)
-      if (clearTimer.current) clearTimeout(clearTimer.current)
-      // Long enough to read the restated label, short enough that a stale
-      // armed state cannot ambush a later click.
-      clearTimer.current = setTimeout(() => setClearArmed(false), 4000)
-      return
-    }
-    if (clearTimer.current) clearTimeout(clearTimer.current)
-    setClearArmed(false)
-    const wipe = () => patchMirror(prev => ({ ...prev, targets: EMPTY_TARGETS, notes: {}, retained: [], editing: null }))
-    if (!annotateOn) {
-      wipe()
-      return
-    }
-    // Live page: clear the markers first; only a confirmed clear drops the notes.
-    void callAnnotate('clear').then(res => {
-      if (res && res.ok) wipe()
-      else setAnnotateError(annotateFailureText(res) || i18nT('components.webPreviewPanel.annotate_update_failed'))
-    })
-  }, [clearArmed, annotateOn, callAnnotate, patchMirror])
-
-  /** Add to chat: screenshot with the markers + the numbered draft, both into
-   *  the composer of THIS session (nothing is sent). Notes stay so the user
-   *  can keep adding and add again. */
-  const sendAnnotations = useCallback(async () => {
-    if (annotateBusy) return
-    // Text still open in the editor is the user's newest words for that pick:
-    // commit it first so the draft carries it, not the previously saved note.
-    const openText = editing?.text.replace(/\s+/g, ' ').trim() ?? ''
-    const outgoing = annotations
-      .map(a => (editing && a.id === editing.id && openText ? { ...a, note: openText } : a))
-      .filter(a => a.note.trim())
-    if (!outgoing.length) return
-    if (editing && openText) {
-      patchMirror(prev => ({
-        ...prev,
-        notes: prev.targets.some(t => t.id === editing.id) ? { ...prev.notes, [editing.id]: openText } : prev.notes,
-        retained: prev.retained.map(a => (a.id === editing.id ? { ...a, note: openText } : a)),
-        editing: null,
-      }))
-    }
-    setAnnotateBusy(true)
-    setAnnotateError('')
-    try {
-      const cap = annotateOn ? await callAnnotate('capture') : null
-      const files: File[] = []
-      let page = mirror.page
-      let screenshotName: string | undefined
-      if (isAnnotateCapture(cap)) {
-        const file = annotationScreenshotFile(cap.png, annotationStamp())
-        files.push(file)
-        screenshotName = file.name
-        page = { url: cap.url, title: cap.title }
-      } else if (annotateOn) {
-        // The notes still go into the composer; say precisely what did not.
-        setAnnotateError(i18nT('components.webPreviewPanel.annotate_capture_failed'))
-      }
-      const draft = formatAnnotationDraft(outgoing, { url: page.url, title: page.title, screenshotName })
-      const detail: PreviewAnnotateDetail = { slot: sessionKey || '', files, draft }
-      window.dispatchEvent(new CustomEvent(PREVIEW_ANNOTATE_EVENT, { detail }))
-      setAddedAck(true)
-      if (annotateOn && picking) {
-        // Pick mode ends only when the page confirms; otherwise say so and let
-        // the poll reconcile `picking` with the page's real state.
-        const stopped = await callAnnotate('stop')
-        if (stopped && stopped.ok) patchMirror(prev => ({ ...prev, picking: false }))
-        else setAnnotateError(annotateFailureText(stopped) || i18nT('components.webPreviewPanel.annotate_update_failed'))
-      }
-    } catch (e) {
-      setAnnotateError(e instanceof Error && e.message ? e.message : i18nT('components.webPreviewPanel.annotate_failed'))
-    } finally {
-      setAnnotateBusy(false)
-    }
-  }, [annotateBusy, annotations, editing, annotateOn, picking, mirror.page, callAnnotate, sessionKey, patchMirror])
+  const annotate = useWebPreviewPanelAnnotate(sessionKey, nativeOpen)
 
   const persist = useCallback((u: string) => {
     if (storageKey && u) safeSetItem(storageKey, u)
@@ -1505,17 +705,29 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     reloadKey,
   )
 
-  // Liveness of the framed CLI view, from THIS browser's point of view. The view
-  // is served on the gateway host's loopback, so from a browser on another
-  // machine (a laptop reaching a remote gateway over an SSH tunnel) the frame is
-  // dead unless `dashboard.browser_view_port` is pinned and that port forwarded
-  // too. The gateway's status says "running" either way — it is reachable from
-  // where IT stands — so the panel has to find out for itself and explain the
-  // pin + forward instead of showing the browser's own error page in the frame.
+  // Liveness of the framed CLI view, from THIS browser's point of view — for
+  // the DIRECT-URL fallback only. That URL is served on the gateway host's
+  // loopback, so from a browser on another machine (a laptop reaching a remote
+  // gateway over an SSH tunnel) the frame is dead unless
+  // `dashboard.browser_view_port` is pinned and that port forwarded too. The
+  // gateway's status says "running" either way — it is reachable from where IT
+  // stands — so the panel has to find out for itself and explain the pin +
+  // forward instead of showing the browser's own error page in the frame.
   // Same probe as the dev server's, and CSP admits it (loopback connect-src).
+  // The relay path NEVER gets this probe: it is same-origin, so its health is
+  // the dashboard's own — and a no-cors probe against it would tell us nothing
+  // (the response is opaque) while costing the relay's per-request ownership
+  // proofs every 5 seconds for every open panel.
   const viewUnreachable = useLivenessProbe(
     viewUrl || '',
-    !!viewUrl && viewRunning && showBrowserView && active,
+    !!viewUrl && !viewIsRelay && viewRunning && showBrowserView && active,
+    viewProbeKey,
+  )
+  // The relay path's own failure: a cookie-checking front door refuses the
+  // opaque-origin frame's asset fetches, so the view never boots (#23180).
+  const viewCookieRefused = useRelayCookieRefusal(
+    viewUrl || '',
+    viewIsRelay && viewRunning && showBrowserView && active,
     viewProbeKey,
   )
 
@@ -1537,6 +749,21 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
    * replaces the frame with the launcher card, so the hint must not show.
    */
   const framing = !!url && !launch && !pending && !embedRefusal && !selfOrigin && !unreachable
+
+  // A navigation inside the frame that the dashboard's own `frame-src` refused
+  // (an OAuth redirect to a sign-in page, most often). The frame is left blank
+  // and the app's button spins, so a notice above it names the refused origin
+  // and the way out. Cleared by a new URL, a reload or its dismiss.
+  const frameRef = useRef<HTMLIFrameElement>(null)
+  // `framing` is in the reset key because a frame that left the screen (an
+  // unreachable server, the launcher card) remounts on a fresh load; `active`
+  // is not, because a tab switch keeps the same blank frame mounted.
+  const frameOrigin = useMemo(() => {
+    try { return url ? new URL(url).origin : '' } catch { return '' }
+  }, [url])
+  const [frameBlocked, dismissFrameBlocked] = useFrameNavigationBlock(
+    framing && active, frameRef, `${reloadKey}:${url}:${framing}`, frameOrigin,
+  )
 
   const iconBtn = 'flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-text '
     + 'hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 '
@@ -1561,25 +788,36 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             it does not — a green dot beside an "unreachable" card contradicted it. */}
         {viewRunning && (
           <span
-            className={`inline-block w-1.5 h-1.5 rounded-full ${viewUnreachable ? '' : 'animate-pulse'}`}
-            style={{ backgroundColor: viewUnreachable ? 'var(--danger)' : 'var(--ok)' }}
+            className={`inline-block w-1.5 h-1.5 rounded-full ${viewUnreachable || viewCookieRefused ? '' : 'animate-pulse'}`}
+            style={{ backgroundColor: viewUnreachable || viewCookieRefused ? 'var(--danger)' : 'var(--ok)' }}
             data-testid="web-preview-view-dot"
             aria-hidden
           />
         )}
-        {/* This chat's browser, by the session name the framed dashboard lists it
-            under — the sidebar lists the gateway's own browser sessions, and the
-            name is what tells this one apart. The label is visible text, not a
-            tooltip, and deliberately does not say "session": that word is already
-            what the app calls its chats and what the frame's own list is headed,
-            so the name chip carries the identity. Rendered only once a launch has
-            named it. The group is the row's only flexible item: at narrow widths
-            (320px) it gives way first — label, then name, each truncating — so
-            the controls to its right, including the only way back to the preview
-            bar, always fit. */}
+        {/* What THIS chat launched, by the session name the framed dashboard
+            lists it under — the sidebar lists the gateway's own browser sessions,
+            and the name is what tells this one apart.
+
+            A LAUNCH FACT, deliberately not an ownership claim (#5940). The reveal
+            that points the dashboard's single viewport at a session is one
+            machine-wide switch, so anything else that launches — an agent or the
+            CLI for another chat's session, a second dashboard tab — moves the
+            frame without this panel hearing about it. A header reading "this
+            chat's browser" then described a page the reader was not looking at.
+            "Opened from this chat" stays true under every reveal, and the panel
+            has no way to say more: `/api/browser/view` answers status, url, port
+            and reason, and the frame is cross-origin.
+
+            The label is visible text, not a tooltip, and deliberately does not
+            say "session": that word is already what the app calls its chats and
+            what the frame's own list is headed, so the name chip carries the
+            identity. Rendered only once a launch has named it. The group is the
+            row's only flexible item: at narrow widths (320px) it gives way first
+            — label, then name, each truncating — so the controls to its right,
+            including the only way back to the preview bar, always fit. */}
         {launchedSession && (
           <span className="flex min-w-0 flex-1 items-center gap-1 text-[11px] text-muted overflow-hidden" data-testid="web-preview-session-label">
-            <span className="min-w-0 truncate">{i18nT('components.webPreviewPanel.this_chat_s_browser_session')}</span>
+            <span className="min-w-0 truncate">{i18nT('components.webPreviewPanel.opened_from_this_chat')}</span>
             <code className="font-mono px-1.5 py-0.5 rounded bg-bg-elevated text-text truncate shrink min-w-[6ch] max-w-[180px]" data-testid="web-preview-session-name">
               {launchedSession}
             </code>
@@ -1625,6 +863,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
         && launchedAttached !== false
         && viewRunning
         && !viewUnreachable
+        && !viewCookieRefused
         && !padlockHintDismissed && (
         <div
           className="flex items-center gap-2 px-3 py-1 border-b border-border shrink-0 text-[11px] text-muted leading-snug"
@@ -1687,6 +926,27 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
               <RotateCw size={13} /> {i18nT('components.webPreviewPanel.try_again')}
             </button>
           </div>
+        ) : viewRunning && viewCookieRefused ? (
+          // Something in front of the dashboard wants a cookie the sandboxed
+          // frame cannot send, so the frame would stay blank: say so, and name
+          // the way that works (a direct forward with no such front door).
+          <div className="flex flex-col items-center justify-center h-full gap-3 px-6 text-center bg-bg">
+            <Monitor size={22} className="text-muted" />
+            <ErrorNotice
+              title={i18nT('components.webPreviewPanel.browser_view_can_t_load_its_files_here')}
+              message={i18nT('components.webPreviewPanel.a_sign_in_proxy_refuses_the_view_s_files')}
+              className="max-w-[420px] text-left"
+              testId="web-preview-view-cookie-refused"
+              askAgent
+            />
+            <button
+              type="button"
+              onClick={() => setViewProbeKey(k => k + 1)}
+              className="inline-flex items-center gap-1.5 text-[12px] px-3 py-1.5 rounded-md border border-border text-text hover:bg-bg-hover transition-colors cursor-pointer bg-transparent"
+            >
+              <RotateCw size={13} /> {i18nT('components.webPreviewPanel.try_again')}
+            </button>
+          </div>
         ) : viewRunning ? (
           // The CLI dashboard, framed. It brings its own session grid, tab bar,
           // navigation and remote input, so the panel adds no controls of its own.
@@ -1694,7 +954,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
             src={viewUrl as string}
             title={i18nT('components.webPreviewPanel.live_browser_session')}
             className="absolute inset-0 w-full h-full border-0 bg-bg-elevated"
-            sandbox={SANDBOX}
+            sandbox={viewIsRelay ? VIEW_SANDBOX : SANDBOX}
           />
         ) : view.data?.status === 'stopped' ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 px-6 text-center bg-bg">
@@ -1752,232 +1012,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
     </div>
   )
 
-  // Native browse surface — the counterpart to `liveMirror` for the case where
-  // the browser runs in THIS process. The page is a real Chromium view the main
-  // process composites over `hostRef`'s rectangle, so the div below is
-  // deliberately empty: it exists to be measured, not painted. Nothing may be
-  // rendered inside it, because the native layer would cover it.
-  const nativeSurface = (
-    <div className="absolute inset-0 z-10 flex flex-col h-full min-h-0 bg-bg">
-      <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0" style={{ backgroundColor: 'var(--bg-elevated)' }}>
-        <Monitor size={14} className="shrink-0 text-muted" />
-        <span className="shrink-0 text-[13px] font-medium text-text">{i18nT('components.webPreviewPanel.browser_live')}</span>
-        <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--ok)' }} aria-hidden />
-        <div className="flex-1" />
-        {/* Annotate: pick elements on the page and type a note on each. Lives
-            on the native header (which had no actions); the preview toolbar's
-            4-control row is untouched. Labelled, not icon-only: the verb is new
-            to users. While picking, the same button reads "Done" -- one control,
-            two states, so there is always a visible way out besides Esc. */}
-        {canAnnotate && (
-          <button
-            type="button"
-            onClick={() => { void toggleAnnotate() }}
-            disabled={annotateBusy}
-            aria-pressed={picking}
-            className={`inline-flex items-center gap-1.5 h-6 px-2 rounded-md text-[12px] font-medium border transition-colors cursor-pointer shrink-0 disabled:opacity-60 disabled:cursor-default ${
-              picking
-                ? 'text-accent bg-accent-subtle border-accent hover:bg-accent-subtle'
-                : 'text-text bg-transparent border-border hover:bg-bg-hover hover:border-border-strong'
-            }`}
-            title={picking ? i18nT('components.webPreviewPanel.annotate_done_tooltip') : i18nT('components.webPreviewPanel.annotate_tooltip')}
-            data-testid="browser-annotate"
-          >
-            <MousePointerClick size={13} aria-hidden />
-            <span>{picking ? i18nT('components.webPreviewPanel.annotate_done') : i18nT('components.webPreviewPanel.annotate')}</span>
-          </button>
-        )}
-      </div>
-      {/* Annotate errors get their own row under the header: inline in the
-          header they would wrap into a sliver beside the button. askAgent is
-          safe here -- the notes live in the panel's mirror (persisted per slot),
-          so the hand-off destroys nothing. */}
-      {annotateError && (
-        <div className="px-3 py-1.5 border-b border-border shrink-0" style={{ backgroundColor: 'var(--bg-elevated)' }}>
-          <ErrorNotice message={annotateError} variant="inline" askAgent={annotateErrorAskAgent} onDismiss={() => setAnnotateError('')} />
-        </div>
-      )}
-      {/* Address bar. The preview subtree below (which owns the other URL form)
-          is hidden while the native surface is up, so without this the user
-          could reach a page and then have no way to leave it. */}
-      <form
-        className="flex items-center gap-1 px-2 py-1.5 border-b border-border shrink-0"
-        onSubmit={e => { e.preventDefault(); commitNative(draft) }}
-      >
-        <div className="flex-1 min-w-0 flex items-center gap-0.5 h-7 pl-1 pr-1 rounded-md bg-bg-elevated border border-border focus-within:border-accent transition-colors">
-          <input
-            ref={nativeInputRef}
-            type="text"
-            value={draft}
-            onChange={e => setDraft(e.target.value)}
-            placeholder={i18nT('components.webPreviewPanel.localhost_5173')}
-            aria-label={i18nT('components.webPreviewPanel.preview_url')}
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-            className="flex-1 min-w-0 h-full bg-transparent border-none text-[12px] text-text placeholder:text-muted px-1"
-          />
-          <a
-            href={native.state?.url || undefined}
-            target="_blank"
-            rel="noreferrer"
-            aria-disabled={!native.state?.url}
-            className={`flex items-center justify-center w-6 h-6 rounded text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 no-underline ${!native.state?.url ? 'opacity-40 pointer-events-none' : ''}`}
-            title={i18nT('components.webPreviewPanel.open_in_browser')}
-            aria-label={i18nT('components.webPreviewPanel.open_in_browser')}
-          >
-            <ExternalLink size={13} />
-          </a>
-        </div>
-      </form>
-      {/* Measured host for the native view. Empty by design. */}
-      <div ref={native.hostRef} className="flex-1 min-h-0 bg-black" />
-      {/* Annotation list: mirrors the notes typed on the page. Below the view so
-          the address bar and the page stay together; the host above shrinks to
-          make room, which the bounds report picks up. Shown while a session is
-          alive (picking, or notes exist). */}
-      {(picking || annotations.length > 0) && (
-        <div className="shrink-0 border-t border-border" style={{ backgroundColor: 'var(--bg-elevated)' }} data-testid="browser-annotations">
-          <div className="flex items-center gap-2 px-3 py-1.5">
-            <span className="text-[12px] font-medium text-text">
-              {i18nT('components.webPreviewPanel.annotations_count', { count: annotations.length })}
-            </span>
-            <div className="flex-1" />
-            <button
-              type="button"
-              onClick={clearAnnotations}
-              disabled={!annotations.length || annotateBusy}
-              className={`text-[12px] px-2 h-6 rounded-md border transition-colors cursor-pointer bg-transparent disabled:opacity-40 disabled:cursor-default ${
-                clearArmed ? 'text-danger border-danger hover:bg-danger/10' : 'text-text border-border hover:bg-bg-hover hover:border-border-strong'
-              }`}
-              aria-label={clearArmed
-                ? i18nT('components.webPreviewPanel.annotate_clear_confirm', { count: annotations.length })
-                : i18nT('components.webPreviewPanel.annotate_clear')}
-            >
-              {clearArmed
-                ? i18nT('components.webPreviewPanel.annotate_clear_confirm', { count: annotations.length })
-                : i18nT('components.webPreviewPanel.annotate_clear')}
-            </button>
-            <button
-              type="button"
-              onClick={() => { void sendAnnotations() }}
-              disabled={!canSend || annotateBusy}
-              // Disabled = muted fill, not accent-at-40%: on dark themes a faded
-              // accent still reads as clickable, and this button is disabled
-              // exactly while the first note is being typed.
-              className="inline-flex items-center gap-1.5 text-[12px] px-2.5 h-6 rounded-md bg-accent text-white hover:opacity-90 transition-opacity cursor-pointer border-none disabled:bg-bg-hover disabled:text-muted disabled:cursor-default disabled:hover:opacity-100"
-              title={i18nT('components.webPreviewPanel.annotate_send_tooltip')}
-              data-testid="browser-annotations-send"
-            >
-              {annotateBusy ? <Loader2 size={12} className="animate-spin" aria-hidden /> : <Plus size={12} aria-hidden />}
-              {i18nT('components.webPreviewPanel.annotate_send')}
-            </button>
-          </div>
-          {addedAck && (
-            <div className="px-3 pb-1.5 text-[11px] leading-snug text-accent" role="status" data-testid="browser-annotations-added">
-              {i18nT('components.webPreviewPanel.annotate_added_ack')}
-            </div>
-          )}
-          {annotations.some(a => a.detached) && (
-            <div className="px-3 pb-1.5 text-[11px] text-muted leading-snug">
-              {i18nT('components.webPreviewPanel.annotate_detached')}
-            </div>
-          )}
-          {annotations.length === 0 ? (
-            <div className="px-3 pb-2 text-[11px] text-muted leading-snug">
-              {i18nT('components.webPreviewPanel.annotate_empty_hint')}
-            </div>
-          ) : (
-            <ul className="m-0 p-0 list-none max-h-40 overflow-y-auto border-t border-border">
-              {annotations.map(a => (
-                <li
-                  key={a.id}
-                  // Wraps: the editor takes a full row of its own, so a 320px
-                  // panel still shows badge + descriptor above a usable input.
-                  className={`flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-1 border-b border-border last:border-b-0 text-[12px] ${a.detached ? 'opacity-70' : ''}`}
-                  title={a.detached ? i18nT('components.webPreviewPanel.annotate_detached') : undefined}
-                  data-testid={editing?.id === a.id ? 'browser-annotation-editing' : undefined}
-                >
-                  <span
-                    className="shrink-0 min-w-[18px] h-[18px] px-1.5 rounded-full text-[11px] font-semibold text-white text-center leading-[18px]"
-                    // Marker identity colour, matching the on-page badges; not
-                    // the danger hue, which belongs to Remove and the armed Clear.
-                    style={{ backgroundColor: 'var(--accent)' }}
-                    aria-hidden
-                  >
-                    {a.n}
-                  </span>
-                  <span className={`shrink-0 font-mono text-[11px] text-muted truncate ${editing?.id === a.id ? 'max-w-[calc(100%-1.75rem)]' : 'max-w-[40%]'}`} title={`${a.ref} · ${a.selector}`}>
-                    {describeAnnotationTarget(a, annotateRoleNames())}
-                  </span>
-                  {editing?.id === a.id ? (
-                    // The note editor. Typed HERE, not in the page: the page is
-                    // external content and must never see the user's prose.
-                    // Enter saves, Esc cancels (a fresh pick with nothing typed
-                    // is dropped), Save/Remove for pointer users.
-                    <div className="flex items-center gap-2 basis-full min-w-0">
-                      <input
-                        ref={noteInputRef}
-                        type="text"
-                        value={editing.text}
-                        onChange={e => setEditingText(e.target.value)}
-                        onKeyDown={e => {
-                          if (e.key === 'Enter') { e.preventDefault(); commitNote() }
-                          else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cancelNote() }
-                        }}
-                        placeholder={i18nT('components.webPreviewPanel.annotate_note_placeholder')}
-                        aria-label={i18nT('components.webPreviewPanel.annotate_note_for_n', { n: a.n })}
-                        className="flex-1 min-w-0 h-6 px-2 rounded-md bg-bg-elevated border border-border text-[12px] text-text placeholder:text-muted focus-ring"
-                        data-testid="browser-annotation-note-input"
-                      />
-                      <button
-                        type="button"
-                        onClick={commitNote}
-                        className="text-[12px] px-2 h-6 rounded-md bg-accent text-white border-none cursor-pointer hover:opacity-90 transition-opacity shrink-0"
-                      >
-                        {i18nT('components.webPreviewPanel.annotate_save')}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => { void removeAnnotation(a.id) }}
-                        className="flex items-center justify-center w-6 h-6 rounded text-muted hover:text-danger hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-                        title={i18nT('components.webPreviewPanel.annotate_remove')}
-                        aria-label={i18nT('components.webPreviewPanel.annotate_remove_n', { n: a.n })}
-                      >
-                        <X size={12} />
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <span className="flex-1 min-w-0 truncate text-text" title={a.note}>{a.note}</span>
-                      <button
-                        type="button"
-                        onClick={() => editAnnotation(a.id)}
-                        className="flex items-center justify-center w-6 h-6 rounded text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-                        title={i18nT('components.webPreviewPanel.annotate_edit_note')}
-                        aria-label={i18nT('components.webPreviewPanel.annotate_edit_note_n', { n: a.n })}
-                      >
-                        <Pencil size={12} />
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => { void removeAnnotation(a.id) }}
-                        className="flex items-center justify-center w-6 h-6 rounded text-muted hover:text-danger hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0"
-                        title={i18nT('components.webPreviewPanel.annotate_remove')}
-                        aria-label={i18nT('components.webPreviewPanel.annotate_remove_n', { n: a.n })}
-                      >
-                        <X size={12} />
-                      </button>
-                    </>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-    </div>
-  )
+  const nativeSurface = <WebPreviewPanelNativeSurface native={native} annotate={annotate} draft={draft} setDraft={setDraft} commitNative={commitNative} nativeInputRef={nativeInputRef} />
 
   return (
     <div className="relative flex flex-col h-full min-h-0 bg-bg">
@@ -2140,7 +1175,44 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
           because a glyph carries a convention only to a reader who
           already knows it, while an unlabelled line of muted text above a frame
           reads as a warning that has not cleared. */}
-      {framing && (
+      {/* A navigation inside the frame the dashboard's own `frame-src` refused.
+          Said ABOVE the frame and never instead of it: the report cannot always
+          be tied to this frame (see useFrameNavigationBlock), so a wrong guess
+          must cost one dismissable line, never the previewed app's state.
+          Sign-in providers refuse framing by their own policy too, so the way
+          out is the app itself in a real tab, where sign-in runs top-level. */}
+      {framing && frameBlocked !== null && (
+        <div className="px-3 py-2 border-b border-border shrink-0" data-testid="web-preview-frame-blocked">
+          {/* No hand-off: the address bar above this notice holds an unsaved
+              draft URL, and the agent cannot lift a sign-in provider's own
+              refusal to be framed anyway. */}
+          <ErrorNotice
+            title={i18nT('components.webPreviewPanel.frame_navigation_blocked_title')}
+            message={i18nT('components.webPreviewPanel.frame_navigation_blocked_body')}
+            messagePlacement="below"
+            onDismiss={dismissFrameBlocked}
+            testId="web-preview-frame-blocked-notice"
+            footer={(
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-0.5 text-[12px]">
+                {frameBlocked && (
+                  <span className="min-w-0 break-all" data-testid="web-preview-frame-blocked-origin">
+                    {i18nT('components.webPreviewPanel.frame_navigation_blocked_origin', { origin: frameBlocked })}
+                  </span>
+                )}
+                <a
+                  href={url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 shrink-0 font-medium text-danger-text underline"
+                >
+                  <ExternalLink size={12} aria-hidden /> {i18nT('components.webPreviewPanel.open_in_browser')}
+                </a>
+              </div>
+            )}
+          />
+        </div>
+      )}
+      {framing && frameBlocked === null && (
         <div
           className="flex items-center gap-2 px-3 py-1 border-b border-border shrink-0 text-[11px] text-muted leading-snug"
           data-testid="web-preview-frame-hint"
@@ -2372,6 +1444,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
           // Fixed device size — center the frame in a scrollable, muted backdrop.
           <div className="absolute inset-0 overflow-auto bg-bg-elevated flex items-start justify-center p-4">
             <iframe
+              ref={frameRef}
               key={reloadKey}
               src={frameSrc}
               title={i18nT('components.webPreviewPanel.web_preview')}
@@ -2382,6 +1455,7 @@ export default function WebPreviewPanel({ sessionKey, active = true }: { session
           </div>
         ) : (
           <iframe
+            ref={frameRef}
             key={reloadKey}
             src={frameSrc}
             title={i18nT('components.webPreviewPanel.web_preview')}

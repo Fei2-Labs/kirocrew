@@ -14,7 +14,10 @@ future reader can diff against a newer upstream):
 
 * LoCoMo      — ``task_eval/evaluation.py``, ``eval_question_answering``
                 (snorkel-ai/long-context-memory "locomo" release).
-* LongMemEval — ``src/evaluation/evaluate_qa.py``, ``get_anscheck_prompt``.
+* LongMemEval — ``src/evaluation/evaluate_qa.py``, ``get_anscheck_prompt``
+                (github.com/xiaowu0162/LongMemEval at
+                ``d6dc8b50a2d9ac0c99485ea28fa5755c62414c34``; every
+                ``evaluate_qa.py`` line ref below is to that revision).
 
 The important asymmetry for callers: LoCoMo is fully deterministic and needs no
 network, no API key, and no model. That is why it is the harness default —
@@ -53,8 +56,9 @@ from .corpus import CAT_UNKNOWN, BenchQuery
 # overwhelming majority of English tokens but are not bit-identical.
 #
 # snowballstemmer keeps the in-progress word as mutable instance state, so a
-# shared instance is not thread-safe (same hazard documented in
-# vector_memory.py:133). One instance per thread; construction is trivial.
+# shared instance is not thread-safe (same hazard documented at
+# `_snowball_local` in vector_memory_runtime/text_scoring.py). One instance per
+# thread; construction is trivial.
 _stemmer_local = threading.local()
 
 
@@ -353,7 +357,7 @@ _QUESTION_TYPE_PROMPTS = {
     "single-session-preference": _PROMPT_PREFERENCE,
 }
 
-# Judge call parameters upstream sends alongside the prompt (evaluate_qa.py:118-126).
+# Judge call parameters upstream sends alongside the prompt (evaluate_qa.py:102-110).
 # Exposed as data so a caller's judge closure can honor them without re-reading
 # the paper: temperature=0 for reproducibility, max_tokens=10 because the reply is
 # meant to be "yes"/"no", n=1 because a single sample is the published protocol.
@@ -364,7 +368,7 @@ def is_abstention(query: BenchQuery) -> bool:
     """True when the abstention prompt applies.
 
     Upstream's only signal is ``'_abs' in entry['question_id']``
-    (evaluate_qa.py:117) — a substring test, not a suffix test, and abstention is
+    (evaluate_qa.py:101) — a substring test, not a suffix test, and abstention is
     NOT exposed as a ``question_type``. The corpus contract sets
     ``unanswerable`` from that same signal, so both are accepted: the id test
     keeps fidelity when a corpus was built without the flag, and the flag keeps
@@ -376,7 +380,7 @@ def is_abstention(query: BenchQuery) -> bool:
 def longmemeval_judge_prompt(query: BenchQuery, prediction: str) -> str:
     """Build the exact prompt upstream would send. Pure — no network, no client.
 
-    Port of evaluate_qa.py:24-45 ``get_anscheck_prompt``. Abstention is checked
+    Port of evaluate_qa.py:24-43 ``get_anscheck_prompt``. Abstention is checked
     first because upstream ignores ``task`` entirely in that branch.
 
     Raises NotImplementedError on an unknown question type, as upstream does
@@ -410,7 +414,7 @@ def score_longmemeval(
     tests exercise the label rule with a two-line fake.
 
     The label rule is upstream's, verbatim: ``label = 'yes' in reply.lower()``
-    (evaluate_qa.py:128). It is substring-based, so a hedged reply like
+    (evaluate_qa.py:113). It is substring-based, so a hedged reply like
     "yes, but incorrect" labels positive. That is a real upstream property, not a
     bug being reproduced by accident — the call is made with max_tokens=10 so the
     model has no room to hedge in practice.

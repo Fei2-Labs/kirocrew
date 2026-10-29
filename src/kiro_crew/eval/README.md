@@ -25,6 +25,9 @@ kirocrew eval --all
 kirocrew eval --judge my_scenario
 ```
 
+`--no-jail` (the shared top-level CLI flag) applies here as it does to every
+`kirocrew` command.
+
 ## Available Scenarios
 
 | Name | Turns | Sessions | Dimensions | Time est. |
@@ -39,7 +42,7 @@ kirocrew eval --judge my_scenario
 
 `kirocrew eval subagent_policy` exercises eighteen hypothetical decisions with
 the existing read-only harness. It covers direct work, parent plus one child,
-independent fan-out, dependencies, legitimate and invented solo reasons,
+independent fan-out, dependencies, legitimate and invented reasons for a single child,
 bounded parent work, terminal failures, cancellation, explicit user choices,
 blocking-tool limits and conflicting writers. No spawn tools are enabled by
 this scenario. Its response assertions test **planned decisions**, not actual
@@ -49,13 +52,12 @@ For a before/after comparison, use the same case text, provider/model and tool
 availability with each revision's orchestration prompt, repeat key cases, and
 retain raw responses. Record actual and planned agent counts separately, parent
 work, wait reasons, wall latency and provider-reported usage. Missing token
-counts are unknown. Pair the decision traces with deterministic solo-gate,
-busy-parent delivery and delayed-startup-memory tests; enum acceptance alone
-does not prove meaningful delegation.
+counts are unknown. Pair the decision traces with deterministic
+busy-parent delivery and delayed-startup-memory tests.
 
 ## Output
 
-Results print to stdout and save to `eval_results/`:
+Results print to stdout and save to `eval_results/` under the current working directory:
 - `eval_<timestamp>.md` — full markdown report
 - `eval_<timestamp>.json` — structured JSON for programmatic comparison
 
@@ -138,6 +140,7 @@ Scenarios are JSON files in `src/kiro_crew/eval/scenarios/`. Each defines sessio
   "name": "my_scenario",
   "description": "What this tests.",
   "dimensions": ["memory_recall"],
+  "judge_criteria": "Recalls the user's stated preference without being told again.",
   "seed": {
     "preferences": "- Prefers dark mode",
     "projects": "Working on Starfish cache",
@@ -161,7 +164,8 @@ Scenarios are JSON files in `src/kiro_crew/eval/scenarios/`. Each defines sessio
         {
           "user": "What is my favorite language?",
           "assertions": [
-            {"type": "contains", "value": "rust"}
+            {"type": "contains", "value": "rust"},
+            {"type": "judge", "value": "Names Rust as the favorite language."}
           ]
         }
       ]
@@ -178,13 +182,13 @@ Scenarios are JSON files in `src/kiro_crew/eval/scenarios/`. Each defines sessio
 | `not_contains` | Response does not contain value |
 | `regex` | Response matches regex pattern |
 | `equals` | Response equals value exactly (trimmed) |
-| `judge` | Separate LLM judge scores the response when `--judge` is enabled; otherwise it is not scored |
+| `judge` | Runs only with `--judge`; otherwise it is not scored. A separate LLM judge scores the response 1–5 against the assertion's `value`, else the scenario's top-level `judge_criteria`, else its `description`; it passes at a score of 3 or more (`LLMJudge` `pass_threshold` 3.0, no CLI override). An unparseable judge reply scores 0 and fails |
 
 String-matching assertions are case-insensitive by default. Add `case_sensitive: true` to override.
 
 ## Tool Safety
 
-During eval, tool approval uses a name-based allowlist (`_SAFE_TOOL_EXACT` for exact matches, plus `_SAFE_TOOL_PREFIXES_FS` and `_SAFE_TOOL_PREFIXES_API` for prefix matches). Filesystem-prefix tools must expose a path and pass `is_sensitive_path()`; exact and read-only API entries do not take the filesystem path branch. All other tools are rejected outright. This keeps eval runs side-effect-free while allowing the agent to use read-only tools.
+During eval, tool approval uses a name-based allowlist (`_SAFE_TOOL_EXACT` for exact matches, plus `_SAFE_TOOL_PREFIXES_FS` and `_SAFE_TOOL_PREFIXES_API` for prefix matches). Filesystem-prefix tools must expose a path and pass `is_sensitive_path()`; exact and read-only API entries do not take the filesystem path branch. All other tools are rejected. The permission gate (`refusal_for`) runs before the allowlist, and every rejection is preceded by an in-band `[Kiro Crew host notice]` deny steer (`_steer_host_deny`, see [injected messages](../../../docs/system-specs/common/injected-messages.md#turn-recovery-continuations)) so the model knows the host refused the call. The judge session refuses every tool. This keeps eval runs side-effect-free while allowing the agent to use read-only tools.
 
 ## Architecture
 

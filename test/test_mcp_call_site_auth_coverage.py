@@ -6,11 +6,16 @@ up at runtime: the caller sends ``X-Internal-Secret``, the middleware does not
 find the path in either internal allowlist, and the call 403s. Nothing fails at
 import, review, or build time. This test is the missing coupling.
 
-Callers reach the dashboard two ways, and BOTH are in scope. Most go through the
+Callers reach the dashboard three ways, and ALL are in scope. Most go through the
 ``_post``/``_get``/``_put``/``_patch``/``_delete`` helpers in ``mcp_core``, which
 attach the secret centrally. A few build their own ``urllib.request.Request`` and
 set the header themselves (``mcp_computer``, ``cron_script``, the code-review-sage
-driver). The middleware grants any of them only for paths in
+driver). And a server built on ``mcp_tools.table.ToolTable`` (``mcp_dashboard``)
+reaches it through the ``DashboardClient`` port: each tool row DECLARES the routes
+it may reach, and the client the table hands the tool refuses any other before
+sending it. For those, the declared routes are the paths the loopback client's
+sites forward, so the walk resolves them from the rows (``_TABLE_SERVERS``) instead
+of from the tool bodies. The middleware grants any of them only for paths in
 ``_STRICT_INTERNAL_API_PATHS`` or ``_MIXED_INTERNAL_API_PATHS``, matched by
 prefix. A path in neither set falls through to ordinary token auth and is
 unreachable for that caller. The population is therefore "sends the internal
@@ -74,7 +79,11 @@ from kiro_crew.dashboard.server import (
     _MIXED_INTERNAL_API_PATHS,
     _STRICT_INTERNAL_API_PATHS,
 )
-from kiro_crew.dashboard.token_auth import _BYPASS_EXACT, internal_path_matches
+from kiro_crew.dashboard.token_auth import (
+    _BYPASS_EXACT,
+    _BYPASS_EXACT_METHODS,
+    internal_path_matches,
+)
 
 # One xdist worker for the whole module: every test here derives from ONE module-cached
 # scan of src/ (rglob + ast.parse, ~30s). Under `--dist loadgroup` an unmarked module is
@@ -97,21 +106,32 @@ _UNKNOWN = "{X}"
 # than listed so a new tool module is scanned the day it is added.
 _SOURCES = (
     _CORE,
+    *sorted((_SRC / "mcp_core_parts").glob("*.py")),
     _SRC / "mcp_shared.py",
-    _SRC / "mcp_dashboard.py",
+    _SRC / "mcp_shared_policy.py",
     _SRC / "mcp_work.py",
     _SRC / "mcp_crew_log.py",
     _SRC / "mcp_debug.py",
     _SRC / "mcp_panel.py",
+    _SRC / "mcp_guide.py",
+    _SRC / "mcp_mate.py",
     _SRC / "mcp_computer.py",
     _SRC / "mcp_cron.py",
-    _SRC / "cli_commands.py",
+    *sorted(_SRC.glob("mcp_cron_*.py")),
+    _SRC / "cli_commands_gateway_api.py",
     _SRC / "cli_server.py",
+    _SRC / "cli_server_peer.py",
+    _SRC / "cli_server_requests.py",
+    _SRC / "cli_server_stop.py",
+    _SRC / "cli_server_restart.py",
+    _SRC / "cli_server_update.py",
     _SRC / "cron_script.py",
+    *sorted(_SRC.glob("cron_script_*.py")),
     _SRC / "cron_trigger.py",
     _SRC / "apps/builtins/code_review_sage/sage_lib/review_driver.py",
     _SRC / "computer_use/screencast.py",
-    *sorted((_SRC / "mcp_tools").glob("*.py")),
+    _SRC / "doctor_checks/workload.py",
+    *sorted((_SRC / "mcp_tools").rglob("*.py")),
 )
 
 # Ceiling on how many possible values one expression may resolve to. Past it the
@@ -147,19 +167,18 @@ _KNOWN_UNRESOLVED = frozenset(
         "mcp_core.py:_put",
         "mcp_core.py:_patch",
         "mcp_core.py:_delete",
-        "mcp_dashboard.py:_get_rows",
-        "cron_script.py:_post",
+        "cron_script_context.py:_post",
         # The gateway liveness probe: its URL is assembled from a resolved port
         # via a helper, and the endpoint (/api/ready) carries no auth by
         # design — it answers before auth middleware exists so a starting
         # gateway can be told apart from a dead one.
-        "cli_server.py:_probe_dashboard_health",
+        "cli_server_requests.py:_probe_dashboard_health",
         # NOT a gateway call at all: this fetches the public release feed
         # (updates.crew.kiro.dev) over HTTPS to compare versions. There is no
         # /api path to resolve because the peer is the CDN, and no secret is
         # attached (the feed is unauthenticated display metadata; the signed
         # manifest is verified by the wheel engine before anything installs).
-        "cli_server.py:_update_wheel",
+        "cli_server_update.py:_update_wheel",
         "review_driver.py:_api_request",
     }
 )
@@ -419,6 +438,103 @@ def _called_helper_name(func: ast.expr, wrappers: dict[str, int]) -> str | None:
     return None
 
 
+#: HTTP method each transport helper carries in its own name.
+_HELPER_METHODS = {
+    "_post": "POST",
+    "_get": "GET",
+    "_put": "PUT",
+    "_patch": "PATCH",
+    "_delete": "DELETE",
+}
+
+
+def _call_method(call: ast.Call, called: str) -> str:
+    """The HTTP method a transport/``Request`` call uses.
+
+    Needed only to validate a path granted by the method-scoped bypass map:
+    that map grants a route for one method (POST for the self-authenticating
+    loopback/webhook routes), and a call on the same path under another method
+    is still refused by the middleware. A transport helper names its verb; a raw
+    ``urllib.request.Request`` carries it in ``method=`` (a literal), else defaults
+    to GET; a path-forwarding wrapper's verb belongs to its caller, so it is
+    reported unknown. Unknown never asserts a match — the caller fails closed.
+    """
+    if called in _HELPER_METHODS:
+        return _HELPER_METHODS[called]
+    if called == "Request":
+        for kw in call.keywords:
+            if kw.arg == "method" and isinstance(kw.value, ast.Constant):
+                if isinstance(kw.value.value, str):
+                    return kw.value.value.upper()
+        return "GET"
+    return "?"
+
+
+# Servers built on ``mcp_tools.table.ToolTable`` whose bodies reach the dashboard
+# through the loopback ``DashboardClient``, keyed by their path under ``_SRC``. Their
+# reach is their rows' declared routes, which ``_scan`` resolves the loopback
+# client's sites to; no other module may build a loopback client
+# (``test_only_a_table_server_builds_a_loopback_client``).
+_TABLE_SERVERS = {"mcp_dashboard.py": "kiro_crew.mcp_dashboard"}
+
+# The loopback client's own module. Its verbs forward a path, so they are
+# wrappers, but their callers are table rows (resolved from the rows' declared
+# routes in ``_scan``), not calls in this module -- where a ``.get(...)`` is a
+# dict read, not a forwarded request.
+_LOOPBACK_SRC = _SRC / "mcp_tools" / "dashboard_client.py"
+
+# The modules that define the loopback client and the per-frame context that
+# builds it; using those names is what they are for.
+_LOOPBACK_OWNERS = frozenset({"mcp_tools/dashboard_client.py", "mcp_tools/table.py"})
+
+
+def _builds_loopback_client(tree: ast.Module) -> bool:
+    """True when a module names the loopback client or the context that builds one."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "LoopbackDashboardClient":
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in {
+            "LoopbackDashboardClient",
+            "for_frame",
+        }:
+            return True
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.name == "LoopbackDashboardClient" for alias in node.names
+        ):
+            return True
+    return False
+
+
+def _declared_dashboard_routes() -> dict[str, set[str]]:
+    """``{normalised path: {"<tool>:<METHOD>", ...}}`` over every table server's rows."""
+    import importlib
+
+    out: dict[str, set[str]] = {}
+    for module_name in _TABLE_SERVERS.values():
+        for tool in importlib.import_module(module_name).TABLE:
+            for route in tool.routes:
+                method, _, path = route.partition(" ")
+                out.setdefault(_normalise(path), set()).add(f"{tool.name}:{method}")
+    return out
+
+
+def _loopback_verbs() -> dict[str, str]:
+    """``{"dashboard_client.py:<verb>": METHOD}`` for each verb of the loopback client.
+
+    Read off the class, so a verb added to the adapter is resolved the day it lands.
+    """
+    src = _LOOPBACK_SRC
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LoopbackDashboardClient"
+    )
+    return {
+        f"{src.name}:{fn.name}": fn.name.upper()
+        for fn in cls.body
+        if isinstance(fn, ast.FunctionDef) and fn.name.upper() in _HELPER_METHODS.values()
+    }
+
+
 def _scan() -> tuple[dict[str, set[str]], set[str]]:
     """Walk every source, returning (path -> call sites, unresolved site keys).
 
@@ -432,7 +548,7 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
 
     for src in _SOURCES:
         tree = ast.parse(src.read_text(encoding="utf-8"))
-        wrappers = wrapper_index.get(src.name, {})
+        wrappers = {} if src == _LOOPBACK_SRC else wrapper_index.get(src.name, {})
         module_scope = _str_assignments(tree.body)
         module_scope.update(_url_builders(tree, [module_scope], core))
 
@@ -459,10 +575,22 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
                                 cands = []
                             for cand in cands:
                                 norm = _normalise(cand)
-                                at = norm.find("/api/")
+                                # A transport call normally addresses the gateway
+                                # API surface at ``/api/...``, so the resolved path
+                                # is anchored at its first ``/api/``. One shape is
+                                # NOT ``/api``-rooted: the dashboard app reverse
+                                # proxy ``/apps/{name}/api/{path}`` (handle_app_api_proxy),
+                                # which an internal-secret MCP caller
+                                # (design_tweak_update_thread) now reaches. Slicing
+                                # that at its inner ``/api/`` would check a fragment
+                                # (``/api/thread``) instead of the real admitted
+                                # path, so a ``/apps/`` route is kept whole and must
+                                # itself appear in an internal allowlist.
+                                at = 0 if norm.startswith("/apps/") else norm.find("/api/")
                                 if at >= 0:
+                                    method = _call_method(child, called)
                                     paths.setdefault(norm[at:], set()).add(
-                                        f"{src.name}:{child.lineno}"
+                                        f"{src.name}:{child.lineno}:{method}"
                                     )
                                     found = True
                         if not found:
@@ -479,6 +607,22 @@ def _scan() -> tuple[dict[str, set[str]], set[str]]:
                 visit(child, scopes, fname, enclosing)
 
         visit(tree, [module_scope], "<module>", [])
+
+    # The loopback DashboardClient forwards the path it is handed, and the only
+    # paths it is handed are its table servers' declared routes: the table gives
+    # each body a client that refuses any other before sending, and no module
+    # outside ``_TABLE_SERVERS`` may build a loopback client
+    # (``test_only_a_table_server_builds_a_loopback_client``). So a verb's site
+    # reaches exactly the routes declared for that verb, and resolves to them.
+    declared = _declared_dashboard_routes()
+    for key, method in _loopback_verbs().items():
+        if key not in unresolved:
+            continue
+        unresolved.discard(key)
+        for path, sites in declared.items():
+            for site in sites:
+                if site.endswith(f":{method}"):
+                    paths.setdefault(path, set()).add(f"{key}<-{site}")
     return paths, unresolved
 
 
@@ -496,9 +640,24 @@ def _is_allowlisted(path: str) -> bool:
     return internal_path_matches(path, allow)
 
 
-def _is_reachable(path: str) -> bool:
-    """Allowlisted, or auth-exempt outright via ``token_auth._BYPASS_EXACT``."""
-    return _is_allowlisted(path) or path in _BYPASS_EXACT
+def _is_reachable(path: str, methods: frozenset[str]) -> bool:
+    """Allowlisted, path-only-exempt, or method-exempt for the methods used.
+
+    Mirrors the middleware, which admits a tokenless call whose path is in the
+    path-only ``_BYPASS_EXACT`` (any method) OR in the method-scoped
+    ``_BYPASS_EXACT_METHODS`` for the specific method being called. A wrong-method
+    call to a POST-only bypass is NOT reachable — the middleware still rejects it —
+    so the method scope is enforced here rather than treating any presence in the
+    map as a grant. ``methods`` is the set of HTTP verbs the scan saw at this
+    path's call sites; ``"?"`` (a verb the scan could not read) never satisfies a
+    method-scoped grant, so such a call fails closed.
+    """
+    if _is_allowlisted(path) or path in _BYPASS_EXACT:
+        return True
+    allowed = _BYPASS_EXACT_METHODS.get(path)
+    if allowed is None:
+        return False
+    return bool(methods) and methods <= allowed
 
 
 def _is_prefix_path(path: str) -> bool:
@@ -513,13 +672,141 @@ def _is_prefix_path(path: str) -> bool:
     return at > 0 and path[at - 1] != "/"
 
 
-def _is_granted(path: str) -> bool:
+def _is_granted(path: str, methods: frozenset[str]) -> bool:
     """Reachability for a concrete path; family-granted for a prefix path."""
     if not _is_prefix_path(path):
-        return _is_reachable(path)
+        return _is_reachable(path, methods)
     head = path[: path.find(_UNKNOWN)]
     allow = _STRICT_INTERNAL_API_PATHS | _MIXED_INTERNAL_API_PATHS
-    return _is_reachable(head) or any(entry.startswith(head) for entry in allow)
+    return _is_reachable(head, methods) or any(entry.startswith(head) for entry in allow)
+
+
+def _methods_for(sites: set[str]) -> frozenset[str]:
+    """The HTTP verbs recorded across a path's call sites (site tail ``:METHOD``)."""
+    return frozenset(s.rsplit(":", 1)[1] for s in sites)
+
+
+class TestDeclaredDashboardRoutes:
+    """A table-built server's call sites are its rows' declared routes."""
+
+    def test_the_declarations_are_resolved_by_the_walk(self):
+        """Every declared route is a resolved call site, so the grant check covers it.
+
+        An empty or shrunken declaration set would pass the grant check free, so
+        the set is also held to the routes the dashboard tools are known to reach.
+        """
+        declared = _declared_dashboard_routes()
+        for path in (
+            "/api/chat/folders",
+            "/api/chat/folders/{X}",
+            "/api/chat/slots/{X}/folder",
+            "/api/chat/tag-columns/order",
+            "/api/session-control/create",
+            "/api/session-control/read",
+        ):
+            assert path in declared, f"{path} is no longer declared by any dashboard tool"
+        assert len(declared) >= 25, sorted(declared)
+        sites = _call_sites()
+        missing = sorted(p for p in declared if p not in sites)
+        assert not missing, f"declared route(s) the walk does not resolve: {missing}"
+        for path, tools in declared.items():
+            assert _methods_for(sites[path]) >= _methods_for(tools), path
+
+    def test_an_ungranted_declaration_would_fail(self):
+        """Mutation proof for the grant check: a route no allowlist names fails it."""
+        assert not _is_granted("/api/zz-not-a-granted-route", frozenset({"POST"}))
+        assert _is_granted("/api/chat/folders", frozenset({"POST"}))
+
+    def test_only_a_table_server_builds_a_loopback_client(self):
+        """The loopback client's sites resolve to declared routes only for these.
+
+        A module that builds one anywhere else -- scanned by the walk or not --
+        sends paths no row declares and no grant check sees, so it fails here
+        until it is a table server in ``_TABLE_SERVERS``.
+        """
+        builders = set()
+        for path in sorted(_SRC.rglob("*.py")):
+            rel = path.relative_to(_SRC).as_posix()
+            if "/tests/" in f"/{rel}" or path.name.startswith("test_"):
+                continue
+            if _builds_loopback_client(ast.parse(path.read_text(encoding="utf-8"))):
+                builders.add(rel)
+        assert builders - _LOOPBACK_OWNERS == set(_TABLE_SERVERS), sorted(builders)
+        # Inside a table server the client is built once, for the frame the table
+        # runs: a second use would send paths outside every row's declaration.
+        for rel in _TABLE_SERVERS:
+            tree = ast.parse((_SRC / rel).read_text(encoding="utf-8"))
+            frames = [
+                n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr == "for_frame"
+            ]
+            handed_to_table = [
+                n
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "call"
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "TABLE"
+                and any(
+                    isinstance(a, ast.Call)
+                    and isinstance(a.func, ast.Attribute)
+                    and a.func.attr == "for_frame"
+                    for a in n.args
+                )
+            ]
+            assert len(frames) == 1 and len(handed_to_table) == 1, rel
+            assert not any(
+                isinstance(n, ast.Name) and n.id == "LoopbackDashboardClient"
+                for n in ast.walk(tree)
+            ), rel
+
+    def test_the_loopback_module_sends_only_the_path_it_is_handed(self):
+        """``_scan`` sees no wrapper call in the loopback client's own module, so a
+        route spelled there would reach the wire unchecked. Every transport or
+        client-verb call in it must forward the enclosing verb's ``path``; a route
+        literal or a route built in place fails.
+        """
+        verbs = _TRANSPORT_HELPERS | {"get", "post", "patch", "put", "delete"}
+        tree = ast.parse(_LOOPBACK_SRC.read_text(encoding="utf-8"))
+        bad: list[str] = []
+        calls = 0
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for call in ast.walk(fn):
+                if not (
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Attribute)
+                    and call.func.attr in verbs
+                ):
+                    continue
+                sent = [*call.args[:1], *(k.value for k in call.keywords if k.arg == "path")]
+                for arg in sent:
+                    routed = isinstance(arg, ast.JoinedStr) or (
+                        isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, str)
+                        and arg.value.startswith("/")
+                    )
+                    if routed:
+                        bad.append(f"{fn.name}:{call.lineno}: {ast.unparse(call)}")
+                    elif isinstance(arg, ast.Name) and arg.id == "path":
+                        calls += 1
+        assert not bad, f"dashboard_client.py sends a route of its own: {bad}"
+        assert calls >= 10, f"only {calls} forwarding call(s) found; the check went blind"
+
+    def test_the_loopback_detector_sees_every_spelling(self):
+        """Non-vacuity for ``test_only_a_table_server_builds_a_loopback_client``."""
+        for flagged in (
+            "from kiro_crew.mcp_tools.dashboard_client import LoopbackDashboardClient",
+            "from kiro_crew.mcp_tools import dashboard_client as dc\nc = dc.LoopbackDashboardClient()",
+            "ctx = ToolContext.for_frame('kirocrew-x')",
+        ):
+            assert _builds_loopback_client(ast.parse(flagged)), flagged
+        for ignored in ("client.post('/api/x', {})", "from kiro_crew.mcp_tools.table import Tool"):
+            assert not _builds_loopback_client(ast.parse(ignored)), ignored
+        for rel in _TABLE_SERVERS:
+            tree = ast.parse((_SRC / rel).read_text(encoding="utf-8"))
+            assert _builds_loopback_client(tree), f"{rel} no longer builds a loopback client"
 
 
 class TestMcpCallSiteAuthCoverage:
@@ -556,7 +843,7 @@ class TestMcpCallSiteAuthCoverage:
         gaps = {
             path: sorted(sites)
             for path, sites in _call_sites().items()
-            if not _is_granted(path) and path not in _KNOWN_UNREACHABLE
+            if not _is_granted(path, _methods_for(sites)) and path not in _KNOWN_UNREACHABLE
         }
         assert not gaps, (
             "MCP call site(s) reach a path that is in no internal allowlist, so "
@@ -565,7 +852,9 @@ class TestMcpCallSiteAuthCoverage:
 
     def test_known_unreachable_ratchet_has_no_stale_entries(self):
         """The known-gap ratchet may only shrink, so a fixed path is de-listed."""
-        unreachable = {p for p in _call_sites() if not _is_granted(p)}
+        unreachable = {
+            p for p, sites in _call_sites().items() if not _is_granted(p, _methods_for(sites))
+        }
         stale = sorted(_KNOWN_UNREACHABLE - unreachable)
         assert not stale, (
             f"_KNOWN_UNREACHABLE lists path(s) that are now reachable: {stale}. "
@@ -575,7 +864,10 @@ class TestMcpCallSiteAuthCoverage:
     def test_extraction_is_not_vacuous(self):
         """If extraction silently found nothing, the coverage test passes free."""
         found = _call_sites()
-        assert len(found) >= 25, f"suspiciously few call sites found: {sorted(found)}"
+        # Counted without the declared routes the loopback client's sites resolve
+        # to, so a blind walk cannot pass on the table servers' rows alone.
+        walked = {path for path, sites in found.items() if any("<-" not in s for s in sites)}
+        assert len(walked) >= 25, f"suspiciously few call sites found: {sorted(walked)}"
 
     def test_extraction_covers_every_call_shape(self):
         """Pin one real path per argument shape and per source module.
@@ -586,7 +878,7 @@ class TestMcpCallSiteAuthCoverage:
         found = _call_sites()
         for path, shape in (
             ("/api/spawn", "literal arg, qualified mcp_core._post"),
-            ("/api/chat/folders", "literal arg, bare imported _post"),
+            ("/api/agent-panel/publish", "literal arg, bare imported _post"),
             ("/api/apps/issue-radar/investigation", "the _put helper"),
             ("/api/artifacts/{X}/comments", "f-string with an interpolation"),
             ("/api/session-tool-policy", "direct urllib Request, leading f-string"),
@@ -594,12 +886,19 @@ class TestMcpCallSiteAuthCoverage:
             ("/api/browser/command", "module constant interpolated into an f-string"),
             ("/api/computer-use/invoke", "own Request + header, outside mcp_tools"),
             ("/api/computer-use/frame", "path returned by a zero-arg URL builder"),
-            ("/api/chat/slots", "literal passed to an exempted wrapper's caller"),
+            ("/api/artifacts", "literal passed to an exempted wrapper's caller"),
             ("/api/crons/{X}/run", "a non-MCP caller (cron_trigger)"),
             ("/api/artifacts/{X}/versions/{X}", "local variable assigned in a branch"),
             ("/api/apps/ops-mission-control{X}", "local built by + concatenation"),
         ):
             assert path in found, f"{path} not extracted -- {shape} is now blind"
+        # The wrapper-caller shape by its own mark: a path-forwarding wrapper's verb
+        # belongs to its caller, so the caller's site carries "?". Other modules
+        # also reach /api/artifacts directly, which the bare check above accepts.
+        assert any(
+            s.startswith("cli_commands_gateway_api.py:") and s.endswith(":?")
+            for s in found["/api/artifacts"]
+        ), "the literal passed to cli_commands' _request wrapper is no longer extracted"
 
     def test_keyword_passed_paths_are_visited(self):
         """A transport call with no positional args must still be resolved.
@@ -683,6 +982,24 @@ class TestMcpCallSiteAuthCoverage:
         assert not _is_allowlisted(
             entry + "-sibling"
         ), "a shared string prefix is not a shared path prefix -- the / matters"
+
+    def test_method_scoped_bypass_is_granted_only_for_its_methods(self):
+        """A ``_BYPASS_EXACT_METHODS`` path is reachable for its verb, not others.
+
+        The middleware grants a method-scoped bypass one verb; a call on the same
+        path under another verb still 403s. The reachability check must enforce
+        that, so relaxing it to any-method (which would let an unreachable call
+        read green) is what this pins.
+        """
+        if not _BYPASS_EXACT_METHODS:
+            pytest.skip("no method-scoped bypass entries to check")
+        path, allowed = next(iter(_BYPASS_EXACT_METHODS.items()))
+        good = next(iter(allowed))
+        assert _is_reachable(path, frozenset({good})), "the granted method must be reachable"
+        bogus = frozenset({"GET", "PUT", "PATCH", "DELETE"}) - allowed
+        assert not _is_reachable(path, bogus), "a non-granted method must not be reachable"
+        assert not _is_reachable(path, frozenset({"?"})), "an unreadable verb must fail closed"
+        assert not _is_reachable(path, frozenset()), "no observed method must fail closed"
 
     def test_no_secret_caller_is_unscanned(self):
         """Any module reaching the dashboard must be in ``_SOURCES``.

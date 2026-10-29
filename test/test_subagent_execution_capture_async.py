@@ -200,7 +200,14 @@ async def test_async_spawn_captures_parent_off_loop_before_policy_gates(
         return "synthetic policy refusal"
 
     monkeypatch.setattr(subagent, "_vet_spawn_governance", governance)
-    options = {"_execution_context": captured.to_record()} if supplied else {}
+    # A caller that supplies the execution supplies the parent's spawn policy
+    # beside it (as ``/api/spawn`` does): the gate's allowlist read then needs
+    # no parent record either.
+    options = (
+        {"_execution_context": captured.to_record(), "_parent_spawn_policy": ("kirocrew", ())}
+        if supplied
+        else {}
+    )
     info = await manager.spawn_async("synthetic", parent_session_key=parent, **options)
     assert info.done and "synthetic policy refusal" in info.error
     assert policy_calls == ["owner-app"]
@@ -309,7 +316,15 @@ async def test_retry_retains_original_member_app_and_mode_after_parent_closes(mo
     )
     request = SimpleNamespace(
         get=lambda key, default=None: default,
-        app={"state": SimpleNamespace(subagents=SimpleNamespace(get=lambda _id: old))},
+        app={
+            "state": SimpleNamespace(
+                subagents=SimpleNamespace(
+                    get=lambda _id: old,
+                    claim_retry=lambda _old: "",
+                    settle_retry=lambda _old, _id: None,
+                )
+            )
+        },
         match_info={"agent_id": old.id},
     )
     loop_thread = threading.get_ident()

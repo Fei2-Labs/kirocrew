@@ -145,19 +145,25 @@ describe('windows image paths render through file-raw (issue #3497)', () => {
     )
   })
 
-  it('remote images stay untouched', () => {
+  it('remote images stay behind the click-to-load gate', () => {
     const { container } = render(
       <MarkdownRenderer content="![image](https://example.com/x.png)" />,
     )
-    expect(srcOf(container)).toBe('https://example.com/x.png')
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.querySelector('button')?.getAttribute('title')).toBe('https://example.com/x.png')
   })
 
-  it('a drive-path LINK still renders with no live href (strict default kept)', () => {
+  it('a drive-path LINK still gets no live href — now as inert text, not an empty anchor (#9925)', () => {
+    // The strict default still REJECTS a drive path on href (only image `src`
+    // gets the pass-through). Pre-#9925 the rejection rendered `<a href="">`,
+    // which this test pinned; an empty href resolves to the CURRENT page, so
+    // the pinned shape was itself the #9925 defect. The rejection now renders
+    // the label as inert text: no anchor, and nothing carrying href="".
     const { container } = render(
       <MarkdownRenderer content="[open](C:/Users/me/doc.html)" />,
     )
-    const a = container.querySelector('a')
-    expect(a).not.toBeNull()
-    expect(a!.getAttribute('href') || '').toBe('')
+    expect(container.textContent).toContain('open')
+    expect(container.querySelector('a')).toBeNull()
+    expect(container.querySelector('[href=""]')).toBeNull()
   })
 })

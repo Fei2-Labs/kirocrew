@@ -47,6 +47,7 @@ from kiro_crew.session import (
     SessionManager,
     _Session,
 )
+from kiro_crew.testing.wait import async_wait_until
 
 
 @pytest.fixture
@@ -76,6 +77,8 @@ def _provider(**attrs):
         "context_usage_pct": lambda: 0.0,
         "cwd": "",
         "is_process_alive": lambda: True,
+        # The registry calls this on a race loser before its shutdown.
+        "disown_work_dir": lambda: None,
     }
     base.update(attrs)
     return SimpleNamespace(**base)
@@ -467,10 +470,7 @@ class TestDiscardPoolProvider:
             with pytest.raises(_Bang):
                 await mgr._discard_pool_provider(provider, "unit")
         # Dispatched to the executor; wait for the worker to pick it up.
-        for _ in range(200):
-            if killer.call_count:
-                break
-            await asyncio.sleep(0.001)
+        await async_wait_until(lambda: killer.call_count)
         assert killer.call_args.args[0] is provider
 
     @pytest.mark.asyncio
@@ -592,7 +592,7 @@ class TestGetBgSessionRespawn:
                 self.pid = 4242
                 created.append(self)
 
-            async def spawn(self) -> None:
+            async def spawn(self, start_priority=None) -> None:
                 return None
 
             def is_alive(self) -> bool:
@@ -857,7 +857,7 @@ class TestStopTurnHooks:
     async def test_a_failing_hard_hook_still_reports_a_hard_stop(self, mgr, no_child_scan) -> None:
         provider = _provider(
             cancel=AsyncMock(return_value="acked"),
-            runtime_info=lambda: (None, None),
+            runtime_abort_target=lambda: None,
         )
         _register(mgr, "dashboard:a", provider=provider)
         outcome = await mgr.stop_turn(

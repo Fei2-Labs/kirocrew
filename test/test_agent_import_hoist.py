@@ -26,9 +26,48 @@ _HOISTED_MODULES = (
 _HOISTED_FILES = (
     "kiro_crew/dashboard/handlers/agents.py",
     "kiro_crew/dashboard/handlers/mcp.py",
+    "kiro_crew/dashboard/handlers/mcp_agent_sync.py",
+    "kiro_crew/dashboard/handlers/mcp_config_entries.py",
+    "kiro_crew/dashboard/handlers/mcp_config_files.py",
+    "kiro_crew/dashboard/handlers/mcp_config_purge.py",
+    "kiro_crew/dashboard/handlers/mcp_gateway_routes.py",
+    "kiro_crew/dashboard/handlers/mcp_gateway_stubs.py",
+    "kiro_crew/dashboard/handlers/mcp_probe.py",
     "kiro_crew/dashboard/handlers/hooks.py",
+    "kiro_crew/dashboard/handlers/hooks_scripts.py",
+    "kiro_crew/dashboard/handlers/hooks_webhook_intake.py",
+    "kiro_crew/dashboard/handlers/hooks_webhooks.py",
     "kiro_crew/session.py",
+    "kiro_crew/session_parts/claims.py",
+    "kiro_crew/session_parts/config_apply.py",
+    "kiro_crew/session_parts/links.py",
+    "kiro_crew/session_parts/policy.py",
+    "kiro_crew/session_parts/provider_probes.py",
+    "kiro_crew/session_parts/record.py",
+    "kiro_crew/session_parts/runtimes.py",
+    "kiro_crew/session_parts/state_views.py",
+    "kiro_crew/session_parts/sweeps.py",
+    "kiro_crew/session_parts/teardown.py",
+    "kiro_crew/session_parts/turn_context.py",
 )
+
+
+#: ``handlers/agents.py`` runs the functions its ``dashboard/agent_admin`` owners
+#: define on its own globals, so the ratchet reads those owners as part of it.
+_COMPOSED_OWNERS = {
+    "kiro_crew/dashboard/handlers/agents.py": "kiro_crew/dashboard/agent_admin",
+}
+
+
+def _hoisted_text(rel: str) -> str:
+    """*rel*'s source, followed by the owner modules it composes."""
+    text = (_SRC / rel).read_text(encoding="utf-8")
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return text
+    owners = sorted((_SRC / owner_dir).glob("[!_]*.py"))
+    assert len(owners) >= 13, f"{owner_dir}: the composed owners were not found"
+    return "\n".join([text, *(owner.read_text(encoding="utf-8") for owner in owners)])
 
 
 def _fresh_import(statements: str) -> None:
@@ -37,6 +76,7 @@ def _fresh_import(statements: str) -> None:
         [sys.executable, "-c", statements],
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=120,
     )
     assert res.returncode == 0, (
@@ -78,7 +118,7 @@ def test_no_function_local_agent_imports_remain() -> None:
     )
     offenders = {}
     for rel in _HOISTED_FILES:
-        text = (_SRC / rel).read_text(encoding="utf-8")
+        text = _hoisted_text(rel)
         hits = local_import.findall(text)
         if hits:
             offenders[rel] = len(hits)

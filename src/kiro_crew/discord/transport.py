@@ -26,6 +26,7 @@ from kiro_crew.discord.client import (
     DISCORD_CHUNK_LIMIT,
     DiscordClient,
     DiscordInbound,
+    SendPermission,
 )
 from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.outbound_files import OutboundFile
@@ -147,6 +148,11 @@ class DiscordTransport(MessagingTransport):
         self._on_thread_created = on_thread_created
         self._dispatch = dispatch
         self.capabilities = DISCORD_CAPABILITIES
+        # The rosters live here, and the REST ladder's waits live in the client, so
+        # the client is handed the predicate rather than a copy of the rosters.
+        # Installed here and not in the gateway so a transport built anywhere -- a
+        # unit harness included -- carries the same mid-send contract.
+        client.still_permitted = self._still_may_send_to
 
     @property
     def client(self) -> DiscordClient:
@@ -365,20 +371,128 @@ class DiscordTransport(MessagingTransport):
         recipient is exactly the case that must not be waved through: this is a
         network egress boundary, and the caller audits the refusal.
 
-        The one route that reaches that refusal is a ``unified`` DM bucket, whose
-        key names no peer by design. Refusing costs an unattended notice there and
-        is the correct trade: that bucket deliberately collapses SEVERAL peers into
-        one session, so nothing available to this seam establishes which of them the
-        link currently points at. Sessions under the default ``per-channel-peer``
-        scope carry their peer in the key and are unaffected. Serving it needs a
-        ``dm_channel_id -> user_id`` pairing persisted when the DM is opened, which
-        is a Discord-owned schema change.
+        Two routes name no peer in their session KEY. A dashboard-born session
+        mirrored into a DM is served anyway, from the record the GATEWAY wrote when
+        it admitted the mirror: the link carries the peer (``ChannelLink.principal``)
+        under a MAC the gateway alone can mint (``mirror_admission``, keyed from the
+        sandbox-masked token signing key over the session key and the whole
+        location), and the ladder hands that peer in here as *principal* only when
+        the MAC verifies. The session map is writable by in-sandbox code, so an
+        unsigned or rewritten row -- one pointed at another user's DM, or given
+        another user's name -- fails verification and is refused, and a key rotation
+        refuses every such mirror until it is re-linked. This transport's own pairing
+        (:meth:`direct_peer_of`) is read as well, as defense in depth: when the client
+        knows which user a channel belongs to and that disagrees with the record, the
+        record loses; when it knows nothing (a DM this process has not opened or seen,
+        the ordinary state right after a restart) the verified record stands, which is
+        what keeps this check admitting the mirror across a restart with no inbound
+        message. One residual is the REST ladder's own mid-send re-check
+        (:meth:`_still_may_send_to`), which reads the pairing alone: a send that hits
+        one of the ladder's waits before the pairing is re-learned is still refused
+        there, while a send that never waits is delivered. The
+        route that stays refused is a ``unified`` DM bucket bound from inside the
+        channel, whose link records no peer. Refusing costs an unattended notice
+        there and is the correct trade: that bucket deliberately collapses SEVERAL
+        peers into one session, so nothing available to this seam establishes which
+        of them the link currently points at. Sessions under the default
+        ``per-channel-peer`` scope carry their peer in the key and are unaffected.
         """
         if not conversation_id:
             return False
         if conversation_id in self._allowed_threads:
             return True
         return bool(principal) and principal in self._allowed
+
+    def _still_may_send_to(self, channel_id: str) -> SendPermission:
+        """May a channel the REST ladder already started sending to still be
+        written to? Fails closed. Installed on the client as
+        ``still_permitted``.
+
+        The ladder asks this after each of its own waits, holding a channel id and
+        nothing else, so this answers strictly what a channel id can settle and
+        refuses when even that much is missing. Three arms decide everything a
+        channel id can decide:
+
+        * an id on the thread roster, or on the shared-channel roster, passes --
+          the same sets ``receive`` gates inbound on and :meth:`may_send_to`
+          consults, so a destination an operator withdraws stops being written to
+          mid-send. Both CURRENT rosters are read first, so moving an id between
+          ``allowed_thread_ids`` and ``allowed_channel_ids`` reads as the
+          reclassification it is rather than as a withdrawal;
+        * an id paired with a DM peer is decided on THAT peer, so the roster is
+          asked about the one user the message would actually reach. Every writer of
+          that pairing is DM-gated, which is what makes the pairing's presence a
+          reliable statement that the id is a DM channel and not a guild one;
+        * anything left is REFUSED. An id on no roster is either withdrawn or never
+          admitted, and a DM channel whose peer is not derivable here -- the DM
+          roster is keyed by the peer's user id while a DM link persists the channel
+          id ``create_dm_channel`` returned, and the pairing is not re-derivable
+          synchronously -- cannot be told from a withdrawn one. At a network egress
+          boundary "cannot tell" reads as no. Asking instead whether the roster
+          admits ANYBODY would let one remaining peer authorize a different, revoked
+          one.
+
+        A refusing final arm is what keeps this short: an id no roster and no pairing
+        can place is refused by it, so a separate record of what was once admitted
+        would answer after the same refusal and change nothing.
+
+        The cost of that last arm is an unattended proactive DM whose destination was
+        read back from a link written before a restart, and which served one of the
+        ladder's waits: it is refused rather than delivered. The alternative is
+        delivering to a peer whose authorization may already be gone, which is the
+        thing this exists to stop. A caller that needs the send to survive can re-open
+        the DM through ``create_dm_channel``, which establishes the pairing.
+
+        Each refusal names its OWN ground, because only here can the two be told
+        apart: a peer the roster refuses is a withdrawal, while an id nothing
+        can place is a destination this process cannot attribute. The caller reports
+        whichever it is, so an operator reading a dropped notification is not told a
+        policy changed when none did.
+        """
+        if not channel_id:
+            return SendPermission.unattributable()
+        if channel_id in self._allowed_threads:
+            return SendPermission.allow()
+        if channel_id in self._allowed_channels:
+            return SendPermission.allow()
+        peer = self._client.cached_dm_recipient(channel_id)
+        if peer is not None:
+            if peer in self._allowed:
+                return SendPermission.allow()
+            return SendPermission.revoked()
+        return SendPermission.unattributable()
+
+    def direct_peer_of(self, conversation_id: str) -> str:
+        """The user this DM channel belongs to, from the client's own pairing alone.
+
+        A Discord DM link persists the channel id ``create_dm_channel`` returned,
+        which is unrelated to the user snowflake, so the peer has to come from the
+        record that call (and an authorized inbound DM or button press) leaves --
+        ``cached_dm_recipient``, the same pairing :meth:`_still_may_send_to`
+        decides on. Every writer of that pairing is DM-gated, so an answer is also
+        the statement that the id is a DM channel and not a guild one; a guild
+        channel or thread id is never paired and reads ``""``.
+
+        This is what the per-send recipient leg reads as defense in depth for a
+        dashboard-born session's mirror: the gateway-signed record on the link names
+        the peer, and when this pairing knows the channel too the two must agree --
+        a disagreement refuses the send, whatever the record says.
+
+        Session control's owner-DM predicate (``owner_dm_refusal``) reads the same
+        answer to place a dashboard tab's mirror as the owner's own DM, and refuses
+        on ``""``: a DM opened before a restart stays refused THERE until the
+        pairing is learned again, while the recipient leg below admits it.
+
+        In-process only, by the pairing's own contract: a DM opened before a
+        restart names nobody until the bot re-opens it or the peer writes into it,
+        and the reader treats ``""`` as "not on record" rather than as a
+        contradiction -- the verified record stands at the recipient leg, so a
+        restart costs no admission there (the mid-send re-check, which reads this
+        pairing alone, can still refuse a send that waits before it is re-learned).
+        """
+        if not conversation_id:
+            return ""
+        return self._client.cached_dm_recipient(conversation_id) or ""
 
     # -- Lifecycle ----------------------------------------------------------
     async def connect(self) -> None:
@@ -519,6 +633,13 @@ class DiscordTransport(MessagingTransport):
         )
         if not self.authorize(msg):
             return
+        if not inbound.guild_id:
+            # An authorized DM names its peer, and the reply goes to this same
+            # channel without ever opening it, so this is the one point the
+            # pairing can be learned for the inbound direction. Guild channels
+            # are excluded: their ids are decided by the channel rosters, not by
+            # a peer.
+            self._client.remember_dm_recipient(inbound.channel_id, inbound.user_id)
         if thread_id and not await self._client.is_thread_channel(thread_id):
             sel().log_api_access(
                 caller=inbound.user_id,
@@ -528,4 +649,6 @@ class DiscordTransport(MessagingTransport):
             )
             return
         if self._dispatch is not None:
+            # Received from a person: its start is FOREGROUND (kiro_crew.start_priority).
+            msg.person_origin = True
             await self._dispatch(msg)

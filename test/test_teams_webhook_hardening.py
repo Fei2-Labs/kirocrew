@@ -89,6 +89,11 @@ class _FakeRequest(dict):
         # same way ``request.json()`` does. A real ``web.Request`` always
         # exposes it (None when the Content-Type declares no charset).
         self.charset: str | None = None
+        # Same reason as ``charset``: a real ``web.Request`` always exposes both,
+        # and ``read_bounded_json`` reads them to decide whether a body is present
+        # and whether it declares JSON (415 when it does not).
+        self.can_read_body = bool(self.content_length)
+        self.content_type = "application/json"
         self.app = app if app is not None else {"allowed_origins": {"http://localhost:5476"}}
 
 
@@ -272,6 +277,13 @@ def test_both_servers_install_the_shared_csrf_barrier() -> None:
     ):
         src = inspect.getsource(func)
         assert "_make_csrf_middleware(" in src, f"{name} no longer uses the shared CSRF factory"
+        # The chain the barrier is handed to is installed by a server_runtime owner.
+        installer = {
+            "start_dashboard": server_mod._install_dashboard_middlewares,
+            "start_api_server": server_mod._install_api_middlewares,
+        }[name]
+        assert f"{installer.__name__}(" in src
+        src += inspect.getsource(installer)
         assert "async def csrf_middleware" not in src, (
             f"{name} re-introduced an inline CSRF middleware; keep the shared "
             "factory as the single exemption point"
@@ -365,6 +377,74 @@ class TestActivityRouteHardening:
         req.content_length = None
         resp = await messaging.api_teams_activity(req)
         assert resp.status == 413
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content_type", ["application/json", "text/plain", "application/octet-stream"]
+    )
+    async def test_the_streamed_cap_holds_whatever_media_type_is_declared(
+        self, content_type: str
+    ) -> None:
+        """The cap must not be reachable-around via the Content-Type header.
+
+        ``read_bounded_json`` refuses a non-JSON media type 415 BEFORE reading a
+        byte, and this route forwards only a 413 -- so with the gate left ON here,
+        that 415 is dropped, the body is never stashed, and ``on_activity``'s bare
+        ``request.json()`` fallback buffers the untouched stream up to the app's
+        60 MiB ``client_max_size`` instead of ``TEAMS_MAX_ACTIVITY_BYTES``. The
+        route therefore opts out (``require_json_content_type=False``), which keeps
+        the capped read that produces the stash.
+
+        ``application/json`` is parametrized alongside as the control: it takes the
+        path that was never broken, so a green run on the other two is not the fake
+        simply failing to reach the cap. ``application/octet-stream`` is what
+        aiohttp reports when the client sends no Content-Type at all.
+        """
+        delegated: list[int] = []
+
+        async def _delegate(request: Any) -> web.Response:
+            delegated.append(1)
+            return web.Response(status=200)
+
+        req = self._request(
+            state=_State(_delegate),
+            body=b"x" * (TEAMS_MAX_ACTIVITY_BYTES + 1),
+            content_length=None,
+        )
+        req.content_length = None
+        req.content_type = content_type
+        resp = await messaging.api_teams_activity(req)
+        assert resp.status == 413
+        assert delegated == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["text/plain", "application/octet-stream"])
+    async def test_a_non_json_media_type_is_stashed_not_left_to_the_fallback(
+        self, content_type: str
+    ) -> None:
+        """The stash is the mechanism, so assert the mechanism and not just the cap.
+
+        ``on_activity`` falls back to its own ``request.json()`` whenever the stash
+        is unset, and that fallback is uncapped. An in-cap activity therefore has to
+        arrive PARSED, not merely be answered 200 -- a 200 alone would also be
+        returned by the broken path, which accepts the same activity after
+        re-reading it off an unbounded stream.
+
+        Refusing a non-JSON media type here would be a change to what this route
+        answers Microsoft's Connector, which is a separate decision about an
+        external contract; this pins that the route still accepts it.
+        """
+        seen: list[Any] = []
+
+        async def _delegate(request: Any) -> web.Response:
+            seen.append(request.get(TEAMS_ACTIVITY_REQUEST_KEY))
+            return web.Response(status=200)
+
+        req = self._request(state=_State(_delegate), body=b'{"type": "message"}')
+        req.content_type = content_type
+        resp = await messaging.api_teams_activity(req)
+        assert resp.status == 200
+        assert seen == [{"type": "message"}]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("body", [b"not json", b"[1, 2]", b""])

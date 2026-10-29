@@ -17,7 +17,24 @@ import { http, HttpResponse } from 'msw'
 import { expect, it } from 'vitest'
 import { server } from '../../integration/mocks/server'
 import { BackupSection } from '../apps/aws-control/DrivePage'
-import { renderWithProviders } from './helpers'
+import { renderWithProviders as renderUnderHost } from './helpers'
+import { AppIdentityProvider } from '../app-sdk/identity'
+
+/**
+ * The section under its own app identity, the way `BuiltinAppRoute` mounts it.
+ *
+ * Its queries are keyed through the host, which prefixes them with the appId on
+ * this context. A bare render leaves that context empty and the keys resolve
+ * unprefixed, so the section would be exercised on a cache layout the product
+ * never has.
+ */
+function renderSection() {
+  return renderUnderHost(
+    <AppIdentityProvider appId="aws-control" origin="builtin">
+      <BackupSection account="prod" />
+    </AppIdentityProvider>,
+  )
+}
 
 const SELF_ID = 'a'.repeat(32)
 const KEY = 'kirocrew/backups/snapshot/2026-09-10T00-00-00Z.tar.zst'
@@ -69,7 +86,7 @@ async function restoreTheRow() {
 
 it('opens the confirm strip when a self-origin restore is refused, and the accept retries with foreignOk', async () => {
   const restoreBodies = wireDrive()
-  const view = renderWithProviders(<BackupSection account="prod" />)
+  const view = renderSection()
 
   await restoreTheRow()
   // The self path mutates at once, with no override.
@@ -107,7 +124,7 @@ it('keeps a refusal of an attempt that already carried foreignOk as an error, no
       return HttpResponse.json({ code: 'foreign_install_archive' }, { status: 409 })
     }),
   )
-  const view = renderWithProviders(<BackupSection account="prod" />)
+  const view = renderSection()
 
   await restoreTheRow()
   const strip = await screen.findByTestId('backup-restore-confirm')
@@ -131,7 +148,7 @@ it('carries the failure in the refusal sentence when the disclosure collapses un
   // a refusal is waiting must hand the failure back to the section-level
   // notice -- otherwise the refused restore is reported nowhere on the page.
   wireDrive()
-  const view = renderWithProviders(<BackupSection account="prod" />)
+  const view = renderSection()
 
   await restoreTheRow()
   await screen.findByTestId('backup-restore-confirm')
@@ -154,7 +171,7 @@ it('concludes the refused attempt on Cancel: no strip, no refusal sentence', asy
   // Cancel answers the strip's question with "no". Re-rendering the refusal
   // sentence after that would tell the reader to answer it again.
   wireDrive()
-  const view = renderWithProviders(<BackupSection account="prod" />)
+  const view = renderSection()
 
   await restoreTheRow()
   await screen.findByTestId('backup-restore-confirm')

@@ -18,12 +18,13 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
 
   // Chat
   'chat.default-model': ['model', 'llm', 'opus', 'sonnet', 'haiku', 'gpt', 'default model', 'fallback model', 'switch model', 'which model'],
-  'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort'],
+  'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort', 'how long models think', 'think before answering', 'thinking time'],
   'chat.auto-compact-threshold': ['context window', 'compaction', 'memory', 'conversation length'],
   'chat.show-timestamps': ['time', 'clock', 'message time'],
   'chat.merge-queued-messages': ['queue', 'batch', 'combine messages'],
   'chat.quick-send': ['fast send', 'enter to send', 'hotkey'],
   'chat.spell-check-message-input': ['spell check', 'spellcheck', 'spelling', 'red underline', 'squiggle', 'dictionary'],
+  'chat.style-markdown-while-typing': ['markdown', 'bold', 'italic', 'strikethrough', 'inline code', 'formatting', 'live preview'],
   'chat.split-side-by-side-diffs': ['split', 'unified', 'split view', 'unified view', 'diff layout', 'side by side'],
 
   // Voice
@@ -39,11 +40,11 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
   'notifications.sources': ['mute', 'priority', 'channel', 'per-app', 'silence'],
   'notifications.volume': ['loudness', 'sound level', 'quieter', 'louder'],
 
+  // About. fuzzyMatch is literal, so the spaced and hyphenated spellings are
+  // both listed; "auto-update on restart" is the name both switches shipped under.
+  'about.update-the-gateway-automatically': ['auto update', 'auto-update', 'automatic updates', 'gateway updates', 'auto update on restart', 'auto-update on restart', 'install updates', 'update check'],
+  'about.install-app-updates-automatically': ['auto update', 'auto-update', 'automatic updates', 'auto update on restart', 'auto-update on restart', 'auto download', 'app updates'],
   // About (manual entries — settingsManual.ts)
-  // The gateway row's rendered label is a ternary: self-updatable installs show
-  // "Auto-update on restart" while the entry is indexed under the notify
-  // wording — these keywords keep the row findable under BOTH phrasings.
-  'about.update-notifications': ['auto-update', 'auto update on restart', 'automatic updates', 'update check'],
   'about.update-channel': ['stable', 'insider', 'nightly', 'release channel', 'beta'],
 
   // Browser

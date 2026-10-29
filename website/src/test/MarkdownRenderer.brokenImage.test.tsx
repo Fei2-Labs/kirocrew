@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, fireEvent, waitFor } from '@testing-library/react'
-import MarkdownRenderer from '../components/MarkdownRenderer'
+import { render, fireEvent, waitFor, act } from '@testing-library/react'
+import MarkdownRenderer, { COPY_FAILED_FLASH_MS } from '../components/MarkdownRenderer'
 import { copyToClipboard } from '../utils/clipboard'
 
 vi.mock('../utils/clipboard', () => ({
@@ -36,7 +36,12 @@ beforeEach(() => {
 
 function renderErrored(content: string) {
   const utils = render(<MarkdownRenderer content={content} />)
-  const img = utils.container.querySelector('img')
+  let img = utils.container.querySelector('img')
+  if (!img) {
+    const approval = utils.container.querySelector('button')
+    if (approval) fireEvent.click(approval)
+    img = utils.container.querySelector('img')
+  }
   if (!img) throw new Error('no <img> rendered')
   fireEvent.error(img)
   return utils
@@ -74,12 +79,43 @@ describe('broken-image fallback chip', () => {
     expect(queryByText(MISSING_LABEL)).toBeNull()
   })
 
-  it('copies the on-disk path on click and confirms via the title flash', async () => {
+  it('copies the on-disk path on click and confirms via the title flash once the write lands', async () => {
+    vi.mocked(copyToClipboard).mockResolvedValue(true)
     const { getByRole } = renderErrored(`![账户列表](${GONE})`)
     const chip = getByRole('button')
-    fireEvent.click(chip)
+    await act(async () => { fireEvent.click(chip) })
     expect(copyToClipboard).toHaveBeenCalledWith(GONE)
     expect(chip.getAttribute('title')).toBe('Copied!')
+  })
+
+  it('renders a refused write as the one failure surface — the notice in the bubble — never as "Copied!" and never in the flow', async () => {
+    vi.useFakeTimers()
+    // The probe stays in flight, so the only thing that could change the
+    // sentence around the chip is the refused copy.
+    fetchMock.mockReturnValue(new Promise(() => {}))
+    vi.mocked(copyToClipboard).mockResolvedValue(false)
+    const { getByRole, getAllByTestId, getAllByRole, queryByRole, queryByTestId, container } = renderErrored(`Missing: ![账户列表](${GONE}) here.`)
+    const chip = getByRole('button', { name: /账户列表/ })
+    const flow = container.querySelector('p')!
+    const flowBefore = flow.innerHTML
+    await act(async () => { fireEvent.click(chip) })
+    expect(chip.getAttribute('title')).not.toBe('Copied!')
+    const notices = getAllByTestId('md-chip-copy-error')
+    expect(notices).toHaveLength(1)
+    // This chip shows its alt and copies the PATH, which is in the tooltip, not
+    // on the page — "select the text to copy it manually" would have the reader
+    // copy the alt. The notice names the object that failed to copy instead.
+    expect(notices[0]).toHaveTextContent(/^Couldn’t copy the image path 01-accounts\.png\.$/)
+    expect(notices[0]).not.toHaveTextContent(/select the text/i)
+    expect(getByRole('tooltip').contains(notices[0])).toBe(true)
+    // Nothing beside the chip: the sentence around it is byte-for-byte what
+    // it was, and the notice is the document's only (accessible) alert.
+    expect(flow.innerHTML).toBe(flowBefore)
+    expect(getAllByRole('alert')).toEqual([notices[0]])
+    expect(queryByRole('button', { name: 'Dismiss' })).toBeNull()
+    act(() => { vi.advanceTimersByTime(COPY_FAILED_FLASH_MS) })
+    expect(queryByTestId('md-chip-copy-error')).toBeNull()
+    vi.useRealTimers()
   })
 
   it('copies via keyboard activation (Enter)', () => {

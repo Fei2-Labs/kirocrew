@@ -5,28 +5,43 @@ lease needed to allocate from it.  Warm-pool inventory, compaction, teardown,
 and cleanup policy remain separate owner-facade responsibilities.  This module
 never imports :mod:`kiro_crew.session` at runtime; patchable compatibility seams
 are supplied through :class:`AllocationDeps`.
+
+The class keeps its whole interface; the bodies of its two largest member groups
+live in the :mod:`kiro_crew.session_allocation_parts` package: ``get_or_create``
+(claiming or cold-starting the session for a key) and ``companions`` (companion and
+run runtimes). Each member there is a function whose first parameter is ``self``,
+bound on the class by name, and the refusals the class and ``get_or_create`` raise
+live in its ``errors`` module. Every project name this module bound before the owners
+existed still resolves here, and :mod:`kiro_crew._facade_mirror` carries a patch of
+one of them through this module to every owner that reads it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import importlib as _importlib
 import logging
-import threading
+import sys as _sys
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.agent_spec_format import iter_agent_spec_files
-from kiro_crew.metrics.sessions import (
-    END_REASON_EVICTED,
-    discard_session_start,
-    record_session_ended,
-    record_session_started,
+from kiro_crew.aws_project_profiles import configured_project_profiles, resolve_project_profile
+from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
+from kiro_crew.metrics.sessions import discard_session_start, record_session_started
+from kiro_crew.runtime_ownership import PidRefcount
+from kiro_crew.session_allocation_parts.errors import (
+    ENDING_FENCE_WAIT_SECS,
+    SessionClosingError,
+    SessionEndingError,
 )
-from kiro_crew.validation import bounded_session_id
+from kiro_crew.session_lifecycle import adopt_parked_queue
+from kiro_crew.start_priority import PrioritySemaphore, StartPriority
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
@@ -39,23 +54,10 @@ else:
 ProviderFactory = Callable[..., LLMProvider]
 
 
-class SessionClosingError(RuntimeError):
-    """A turn was requested after manager shutdown began."""
-
-
-class SessionBusyError(RuntimeError):
-    """A caller requested an immediate turn claim while the session was held."""
-
-
-class SpeculativeResumeRefused(RuntimeError):
-    """A speculative allocation may not consume an unrequested native resume."""
-
-
 @dataclass(frozen=True, slots=True)
 class AllocationConstants:
     """Behavioral constants supplied by the facade's patchable namespace."""
 
-    max_concurrent_cold_starts: int
     won_race_max_retries: int
     circuit_breaker_threshold: int
     agent_model_cache_ttl: Callable[[], float]
@@ -66,6 +68,8 @@ class AllocationConstants:
     stateless_prefixes: tuple[str, ...]
     provider_label_default: str
     provider_label_claude: str
+    # Singleton stateless sessions, matched exactly rather than by prefix.
+    stateless_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,10 +100,8 @@ class AllocationDeps:
     session_provider_type: Callable[[], Callable[[Any, Any], LLMProvider]]
     unlink_session_queue: Callable[[Any], None]
     unlink_queued_temp_paths: Callable[[dict[str, Any]], None]
+    # (cfg, agent, crew_agent, *, app_name, session_key, backend_override)
     session_model: Callable[..., str | None]
-    # FORK: whether this backend consumes model_registry ids. Decides if a bound
-    # KIRO agent file may be read for it -- see session._session_model's guard.
-    uses_registry_model_ids: Callable[[str], bool]
     load_config: Callable[[], Any]
     resolve_crew_identity: Callable[[Any, str | None, str | None], str]
     load_watchdog_settings: Callable[[str], object]
@@ -113,7 +115,14 @@ class AllocationDeps:
     #: would make the pool's scope rule the only one a test cannot swap.
     model_pin_applies: Callable[[str, str, Sequence[str] | None], bool]
     provider_model_namespace: Callable[[LLMProvider], str]
-    resolve_pin_spelling: Callable[[str, list[str]], str]
+    #: The pin fold, taking the PROVIDER as well so the answer can be the one
+    #: that harness's wire takes: a ``<model>[<effort>]`` pair-id backend
+    #: advertises rows its own ``model`` option refuses, and resolves a bare pin
+    #: to the bare id that option does accept. Reading the backend HERE rather
+    #: than passing a pre-resolved id keeps this site answering from the same
+    #: fold the cold start uses, which is the property this dependency exists
+    #: to hold.
+    resolve_pin_spelling: Callable[[str, list[str], LLMProvider], str]
     to_provider_id: Callable[[str, str], str]
     to_acp_id: Callable[[str], str]
     inc_session_created: Callable[[], None]
@@ -126,6 +135,36 @@ class AllocationDeps:
     agent_model_cache: Callable[[], dict[str, tuple[str, float, float]]]
 
 
+# Concurrent cold starts ``SessionManager._start_sem`` allows background starts by
+# default; ``agent.cold_start_concurrency`` sets it (``cold_start_sizing``). A
+# provider inside ``start()`` has not published a PID yet, so the semaphore is the
+# only evidence it exists, which is why the identity sweep drains it
+# (``PrioritySemaphore.drain``) as its barrier.
+MAX_CONCURRENT_COLD_STARTS = 4
+# Cold-start permits on top of those that only a FOREGROUND start may hold (rule:
+# ``kiro_crew.start_priority``). ``_start_sem`` is held across the provider's own
+# spawn admission and ``session/new`` waits, so ordering alone cannot help a person
+# when every permit belongs to a background start stuck behind a fan-out further
+# in. With this reserve the first concurrent person start always gets an outer
+# permit at once and then goes ahead at the inner queues; further concurrent person
+# starts are served ahead of background ones as permits free. Additive, so
+# background keeps the full width while no person is starting.
+FOREGROUND_COLD_START_RESERVE = 1
+
+
+def new_cold_start_semaphore(width: int = MAX_CONCURRENT_COLD_STARTS) -> PrioritySemaphore:
+    """``SessionManager._start_sem``: *width* background permits plus the person reserve."""
+    return PrioritySemaphore(
+        width + FOREGROUND_COLD_START_RESERVE,
+        foreground_reserve=FOREGROUND_COLD_START_RESERVE,
+    )
+
+
+def widen_cold_start_semaphore(sem: PrioritySemaphore, width: int) -> None:
+    """Grow *sem* to *width* background permits (plus the reserve); never shrinks."""
+    sem.widen_to(width + FOREGROUND_COLD_START_RESERVE)
+
+
 @dataclass(slots=True)
 class SessionRegistryState:
     """Mutable state exclusively owned by the allocation boundary."""
@@ -135,16 +174,61 @@ class SessionRegistryState:
     closing: bool = False
     update_pause_owned: bool = False
     update_restart_fenced: bool = False
-    start_sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(4))
-    starting_pids: set[int] = field(default_factory=set)
+    start_sem: PrioritySemaphore = field(default_factory=new_cold_start_semaphore)
+    #: COUNTED, not listed: two starts can legitimately shield one pid (the
+    #: allocator carries a race budget for starting one session twice), and as a
+    #: plain set the first to finish tore the shield off a process the other was
+    #: still cold-starting. Reads like the set it replaces.
+    starting_pids: PidRefcount = field(default_factory=PidRefcount)
     allocation_reservations: dict[str, set[object]] = field(default_factory=dict)
     inbound_callback_reservations: set[object] = field(default_factory=set)
     ownership_generations: dict[str, int] = field(default_factory=dict)
     subagent_runtimes: dict[str, Any] = field(default_factory=dict)
     subagent_runtime_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    #: Busy wrong-account companion runtimes displaced out of
+    #: ``subagent_runtimes`` by the spawn-identity gate: unclaimable while
+    #: parked (a fresh acquisition spawns a replacement under the live
+    #: account), so their in-flight work drains before the reap kills them.
+    draining_subagent_runtimes: list[Any] = field(default_factory=list)
     continuable_keys: set[str] = field(default_factory=set)
     capability_failures: dict[str, dict[str, str]] = field(default_factory=dict)
     continuable_fallback: Callable[[str], bool] | None = None
+    #: Keys whose run is being ended (``begin_ending``): a claim or cold start
+    #: under one is HELD at the door until the fence lifts. The value is the set
+    #: of allocation reservation tokens that were in flight when the fence went
+    #: up -- a cold start caught inside ``provider.start()`` -- kept so
+    #: ``end_ending`` can tell them apart from reservations that never met the
+    #: fence.
+    ending_keys: dict[str, set[object]] = field(default_factory=dict)
+    #: Reservation tokens invalidated by a fence: their cold start is refused at
+    #: registration even after the fence lifts, and its provider hard-killed.
+    #: A token leaves the set when its reservation is removed.
+    invalidated_reservations: set[object] = field(default_factory=set)
+    #: Per fenced key, the event ``end_ending`` sets when the fence lifts: what a
+    #: request held at the door waits on. Created by ``begin_ending``, removed
+    #: with the fence (waiters hold their own reference to it).
+    ending_lifted: dict[str, asyncio.Event] = field(default_factory=dict)
+    #: Reservation tokens past the cold start's SPAWN DOOR (the pre-spawn fence
+    #: check in ``get_or_create``) -- or holding a warm-pool claim, a live process
+    #: from the claim on -- and not yet through registration: the span in
+    #: which a process is owned that no map read can see. A reservation
+    #: under a fenced key that is NOT here is a claim waiting on a live session's
+    #: turn or a cold start still ahead of its spawn door -- no process of its
+    #: own, so nothing an ending caller must answer for. Read by
+    #: ``spawn_in_flight``; a token leaves at registration (published, or a
+    #: won race) or with its reservation.
+    spawning_reservations: set[object] = field(default_factory=set)
+    #: Per fenced key, a receipt for every start the fence caught past its spawn
+    #: door and whose reservation was then removed WHILE the fence was still up:
+    #: the start returned during the ending caller's passes, its registration
+    #: was refused and its provider hard-killed by the allocation path
+    #: (``_dispatch_hard_kill``, dispatched off the loop with no outcome this
+    #: process reads back). Kept so the ending caller's post-pass read still
+    #: names that process -- without the receipt the reservation cleanup erased
+    #: every trace of it before the read, and a kill the dispatch could not land
+    #: left a process alive behind a record that said ``reaped``. Cleared by
+    #: ``end_ending``, once the caller has written its record.
+    refused_spawns: dict[str, int] = field(default_factory=dict)
 
 
 class InboundCallbackReservation:
@@ -184,6 +268,8 @@ class _AllocationOwner(Protocol):
 
     def _fold_key(self, key: str) -> str: ...
 
+    def _bg_backend_supports_runtime(self) -> bool: ...
+
     async def await_replay_gap(self, key: str) -> None: ...
 
     def absorb_orphaned_release(self, key: str) -> bool: ...
@@ -193,7 +279,13 @@ class _AllocationOwner(Protocol):
     def get_provider(self, key: str) -> LLMProvider | None: ...
 
     async def get_subagent_runtime(
-        self, parent_session_key: str, agent: str | None = None
+        self,
+        parent_session_key: str,
+        agent: str | None = None,
+        *,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
+        on_gate_queued: Callable[..., None] | None = None,
+        on_gate_acquired: Callable[..., None] | None = None,
     ) -> Any: ...
 
     async def _get_or_bootstrap_run_runtime(
@@ -202,6 +294,7 @@ class _AllocationOwner(Protocol):
         *,
         agent: str | None = None,
         cwd: str | None = None,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> Any: ...
 
     async def _reacquire_and_validate(
@@ -210,6 +303,7 @@ class _AllocationOwner(Protocol):
         session: Any,
         *,
         wait_if_busy: bool = True,
+        reservation: object | None = None,
     ) -> bool: ...
 
     async def _evict_stale_session(self, key: str, session: Any) -> None: ...
@@ -247,63 +341,11 @@ class _AllocationOwner(Protocol):
     def _append_companion_runtime_rows(self, rows: list[dict[str, object]]) -> None: ...
 
 
-def _collect_parent_runtime_kwargs(
-    owner: _AllocationOwner,
-    parent_session_key: str,
-) -> dict[str, Any]:
-    """Mirror the parent client's sandbox, gateway, env, and backend posture."""
-    provider = owner.get_provider(parent_session_key)
-    if provider is None:
-        return {}
-    client = getattr(provider, "client", None) or getattr(provider, "_client", None)
-    if client is None:
-        return {}
-    kwargs: dict[str, Any] = {}
-    for attribute, key in (
-        ("_sandbox_mode", "sandbox_mode"),
-        ("_extra_env", "extra_env"),
-        ("_mcp_gateway_overlay", "mcp_gateway_overlay"),
-        ("_mcp_gateway_socket", "mcp_gateway_socket"),
-        ("backend", "acp_backend"),
-    ):
-        value = getattr(client, attribute, None)
-        if value is not None:
-            kwargs[key] = value
-    # The MCP Tool Search choice rides the runtime constructor on a wire-settings
-    # host, so a companion runtime built without it would run with the setting
-    # left to the host's default rather than the explicit value the parent sent.
-    # Read off the LLMProvider capability (safe default None), never probed.
-    tool_search = provider.tool_search_settings
-    if tool_search is not None:
-        kwargs["tool_search"] = tool_search
-    # The parent's session tree keeps ONE work directory across every process
-    # it spans: a companion runtime is handed the parent's ``$KIROCREW_SCRATCH``
-    # as a second private window into the masked scratch root, so a brief the
-    # parent staged there is readable by the subagents the runtime hosts (see
-    # ``agent_scratch``); at spawn it joins the tree's owner marker beside the parent.
-    shared_scratch = parent_work_scratch_dir(owner, parent_session_key)
-    if shared_scratch is not None:
-        kwargs["shared_scratch"] = shared_scratch
-    return kwargs
-
-
-def parent_work_scratch_dir(owner: _AllocationOwner, parent_session_key: str) -> Path | None:
-    """The work directory of *parent_session_key*'s session tree, or None.
-
-    Read off the parent's live provider through the ``LLMProvider``
-    capability (``work_scratch_dir``, harness-parity H14 -- declared on the
-    ABC with a ``None`` default, never probed for a private name); None when
-    the parent has no live provider or its process carries no scratch. The
-    caller passes it as ``shared_scratch`` to the spawn it makes on the
-    parent's behalf -- a companion runtime here, a dedicated subagent process
-    in ``subagent_manager/run.py`` -- and the spawn re-validates it at mount
-    time (``agent_scratch.shared_scratch_window``).
-    """
-    provider = owner.get_provider(parent_session_key)
-    if provider is None:
-        return None
-    path = provider.work_scratch_dir
-    return path if isinstance(path, Path) else None
+# The class below binds its largest member groups from these owner modules, and the
+# end of this module installs the mirror over them, so they load here.
+from kiro_crew import _facade_mirror  # noqa: E402
+from kiro_crew.session_allocation_parts import companions as _sa_companions  # noqa: E402
+from kiro_crew.session_allocation_parts import get_or_create as _sa_get_or_create  # noqa: E402
 
 
 class SessionAllocationService:
@@ -346,19 +388,19 @@ class SessionAllocationService:
         self.state.closing = value
 
     @property
-    def _start_sem(self) -> asyncio.Semaphore:
+    def _start_sem(self) -> PrioritySemaphore:
         return self.state.start_sem
 
     @_start_sem.setter
-    def _start_sem(self, value: asyncio.Semaphore) -> None:
+    def _start_sem(self, value: PrioritySemaphore) -> None:
         self.state.start_sem = value
 
     @property
-    def _starting_pids(self) -> set[int]:
+    def _starting_pids(self) -> PidRefcount:
         return self.state.starting_pids
 
     @_starting_pids.setter
-    def _starting_pids(self, value: set[int]) -> None:
+    def _starting_pids(self, value: PidRefcount) -> None:
         self.state.starting_pids = value
 
     @property
@@ -396,6 +438,14 @@ class SessionAllocationService:
     @_subagent_runtime_locks.setter
     def _subagent_runtime_locks(self, value: dict[str, asyncio.Lock]) -> None:
         self.state.subagent_runtime_locks = value
+
+    @property
+    def _draining_subagent_runtimes(self) -> list[Any]:
+        return self.state.draining_subagent_runtimes
+
+    @_draining_subagent_runtimes.setter
+    def _draining_subagent_runtimes(self, value: list[Any]) -> None:
+        self.state.draining_subagent_runtimes = value
 
     @property
     def _continuable_keys(self) -> set[str]:
@@ -467,6 +517,186 @@ class SessionAllocationService:
         """Return whether a folded alias has an allocation/claim in flight."""
         return bool(self._allocation_reservations.get(self._owner._fold_key(key)))
 
+    def spawn_in_flight(self, key: str) -> str | None:
+        """Why a cold start under *key* is a process the ending caller must name, or None.
+
+        The read an ending caller (``begin_ending`` holder) makes after its kill
+        passes. A reservation alone is not a process: a claim waiting on the live
+        session's turn semaphore, or a cold start still ahead of the pre-spawn
+        fence check, has started nothing and will be held or refused before it
+        does. Two things are named. A reservation in ``spawning_reservations`` --
+        past that door, its ``provider.start()`` in flight or returned but
+        unregistered -- is a process the passes could not see: refused at
+        registration and hard-killed there, but not answered by the caller's own
+        passes. And a receipt in ``refused_spawns``: a start the fence caught that
+        already returned during the passes, was refused and had its provider
+        hard-killed by the allocation path -- a kill dispatched off the loop
+        whose outcome nothing here reads back, so the record cannot call that
+        process gone either. The phrase returned is the reason the caller records.
+        """
+        reasons: list[str] = []
+        folded = self._owner._fold_key(key)
+        spawning = self.state.spawning_reservations
+        if spawning and any(
+            token in spawning for token in self._allocation_reservations.get(folded, ())
+        ):
+            reasons.append("refused at registration, its provider hard-killed there")
+        refused = self.state.refused_spawns.get(folded, 0)
+        if refused:
+            reasons.append(
+                f"{refused} refused at registration during the ending, the provider hard-killed "
+                "there by the allocation path -- an outcome this record does not confirm"
+            )
+        return "; ".join(reasons) if reasons else None
+
+    def begin_ending(self, key: str) -> None:
+        """Raise the per-key ending fence: nothing lands under *key* until ``end_ending``.
+
+        The run that owned the key is being ended by a caller that holds its
+        claim (the cron reaper, ``cancel()``), and that caller is about to record
+        the run as reaped or cancelled. From here to ``end_ending`` -- held from
+        before the caller's kill passes until the run's terminal record and
+        audit are written -- a claim or a new allocation under the key is HELD
+        at the door of ``get_or_create`` (it waits for the fence to lift, then
+        proceeds; see :func:`wait_for_ending_fence`), and every allocation
+        reservation already in flight under the key is INVALIDATED: a cold start
+        caught inside ``provider.start()`` has published nothing the caller's
+        passes could see, so it is refused at registration when it gets there,
+        even after the fence lifts, the provider it started is hard-killed by the
+        same path a closing manager uses, and its call then waits for the lift
+        and allocates again. Without this the record would say ``reaped`` while
+        that process published afterwards and the injection that started it ran
+        on. Nothing held is dropped: the request lands under the key once the
+        run is recorded, as it did before the fence existed -- only never inside
+        the run being ended, and never under a key that is neither being ended
+        nor recorded. Synchronous and lock-free by design: the reservation map
+        only moves between awaits on the loop, so a snapshot taken here is
+        consistent, and the caller must be able to raise the fence before its
+        first await. One fence per key, owned by the run claim's taker; a
+        second ``begin_ending`` on a fenced key adds the reservations it now
+        sees.
+        """
+        folded = self._owner._fold_key(key)
+        pending = set(self._allocation_reservations.get(folded, ()))
+        self.state.ending_keys.setdefault(folded, set()).update(pending)
+        self.state.invalidated_reservations.update(pending)
+        self.state.ending_lifted.setdefault(folded, asyncio.Event())
+
+    def end_ending(self, key: str) -> None:
+        """Lift the ending fence for *key*; reservations it invalidated stay invalidated.
+
+        Called once the run's terminal record and audit are written. Every
+        request held at the door wakes and proceeds under the recorded key, while
+        a cold start that was in flight when the fence went up still cannot
+        register: its token stays in ``invalidated_reservations`` until the
+        reservation itself is removed -- and its call, refused there, allocates
+        again. The key's receipts of starts refused during the ending
+        (``refused_spawns``) go with the fence: the caller has consumed them.
+        """
+        folded = self._owner._fold_key(key)
+        self.state.ending_keys.pop(folded, None)
+        self.state.refused_spawns.pop(folded, None)
+        lifted = self.state.ending_lifted.pop(folded, None)
+        if lifted is not None:
+            lifted.set()
+
+    async def wait_for_ending_fence(self, key: str, deadline: float | None) -> float | None:
+        """Hold the caller until *key*'s ending fence lifts, bounded; return the wait's deadline.
+
+        ``key`` is already folded. Returns at once for a key that is not fenced.
+        ``deadline`` is the loop-time bound the caller carries across its own
+        retries (``None`` the first time, when it is set from
+        :data:`ENDING_FENCE_WAIT_SECS`): one budget for the whole call, so a fence
+        that goes up again after a retry does not restart it. A fence still up at
+        the deadline is a holder stuck past the bounded passes it exists for; the
+        caller is refused with :class:`SessionEndingError` so the defect surfaces.
+        """
+        lifted = self.state.ending_lifted.get(key)
+        if lifted is None or key not in self.state.ending_keys:
+            return deadline
+        loop = asyncio.get_running_loop()
+        if deadline is None:
+            deadline = loop.time() + ENDING_FENCE_WAIT_SECS
+        remaining = deadline - loop.time()
+        if remaining > 0:
+            try:
+                await asyncio.wait_for(lifted.wait(), timeout=remaining)
+                return deadline
+            except asyncio.TimeoutError:
+                pass
+        raise SessionEndingError(
+            f"session key {key!r} is still being ended after {ENDING_FENCE_WAIT_SECS:.0f}s "
+            "(its run's reap or cancel has not released the key); refusing to claim or "
+            "start a session under it"
+        )
+
+    def _refuse_if_ending(self, key: str, reservation: object | None) -> None:
+        """Refuse a claim or allocation under a fenced key, or one whose reservation a fence invalidated.
+
+        ``key`` is already folded. Called at the doors of ``get_or_create``'s
+        allocation body -- the claim of a live session, again after that
+        claim's semaphore wait (:meth:`_reacquire_and_validate`, since the wait
+        can outlast a fence rising), the cold start before it spawns, and the
+        registration after ``provider.start()`` -- with the
+        call's own reservation token, so a start that was in flight when the
+        fence went up is refused even after ``end_ending``; ``get_or_create``
+        turns that refusal into a wait for the lift and a fresh allocation, so
+        the request is held, not dropped. And at the entry of
+        ``open_task_session``, the other publication door, with no token and
+        no retry: that path reserves only around its create on a shared runtime,
+        so it is refused while the fence is up. The front door of
+        ``get_or_create`` does not call this: it holds the caller instead
+        (:meth:`wait_for_ending_fence`).
+        """
+        if key in self.state.ending_keys:
+            raise SessionEndingError(
+                f"session key {key!r} is being ended (its run is being reaped or "
+                "cancelled); refusing to claim or start a session under it"
+            )
+        if reservation is not None and reservation in self.state.invalidated_reservations:
+            raise SessionEndingError(
+                f"session key {key!r} was ended while this allocation was starting; "
+                "refusing to register the session it started"
+            )
+
+    def _install_work_dir_claim_probe(self, key: str, provider: LLMProvider) -> None:
+        """Guard *provider*'s final work-dir reclaim with registry ownership.
+
+        The context manager deliberately retains ``_lock`` through the reclaim
+        operation. A bool sampled under the lock and acted on afterwards would
+        reopen the same pop-then-shutdown race this guard closes.
+        """
+
+        def provider_cwd(candidate: LLMProvider) -> str:
+            try:
+                value = candidate.cwd
+            except Exception:
+                return ""
+            return value if isinstance(value, str) else ""
+
+        target_cwd = provider_cwd(provider)
+
+        @contextlib.asynccontextmanager
+        async def claim():
+            async with self._lock:
+                claimed = not bool(self._allocation_reservations.get(key))
+                if claimed:
+                    for registered_key, session in self._sessions.items():
+                        other = session.provider
+                        if other is provider:
+                            continue
+                        if registered_key == key:
+                            claimed = False
+                            break
+                        if target_cwd and provider_cwd(other) == target_cwd:
+                            claimed = False
+                            break
+                yield claimed
+
+        setter = getattr(type(provider), "set_work_dir_claim_probe", None)
+        if callable(setter):
+            setter(provider, claim)
+
     async def try_acquire(self, key: str) -> bool:
         """Acquire only an exact-key idle session; alias folding is intentional absent."""
         session = self._sessions.get(key)
@@ -502,179 +732,37 @@ class SessionAllocationService:
         except AttributeError:
             return None
 
-    async def get_subagent_runtime(self, parent_session_key: str, agent: str | None = None) -> Any:
-        """Get or spawn the canonical shared companion runtime for a parent."""
-        runtime_type, runtime_dead = self._deps.runtime_types()
-        max_retries = 1
-        attempt = 0
-        selected_agent = agent
-        while True:
-            lock = self._subagent_runtime_locks.setdefault(parent_session_key, asyncio.Lock())
-            async with lock:
-                if self._subagent_runtime_locks.get(parent_session_key) is not lock:
-                    # release_subagent_runtime removed the lock while we waited;
-                    # retry under the newly-canonical lock without spending a
-                    # process-spawn retry.
-                    continue
-                existing = self._subagent_runtimes.get(parent_session_key)
-                if existing is not None and existing.is_alive():
-                    return existing
-                if existing is not None:
-                    try:
-                        await existing.kill(
-                            reason="reaping a dead shared subagent runtime before respawn"
-                        )
-                    except Exception:
-                        self._deps.logger.debug(
-                            "get_subagent_runtime: dead runtime kill failed for %s",
-                            parent_session_key,
-                            exc_info=True,
-                        )
-                selected_agent = (
-                    selected_agent
-                    or self._owner._get_session_agent(parent_session_key)
-                    or "kirocrew"
-                )
-                kwargs = self._owner._parent_runtime_kwargs(parent_session_key)
-                runtime = runtime_type(agent=selected_agent, **kwargs)
-                try:
-                    await runtime.spawn()
-                except runtime_dead:
-                    if attempt >= max_retries:
-                        raise
-                    attempt += 1
-                    self._deps.logger.warning(
-                        "Subagent runtime spawn failed for %s (attempt %d/%d), retrying",
-                        parent_session_key,
-                        attempt,
-                        max_retries + 1,
-                        exc_info=True,
-                    )
-                    continue
-                self._subagent_runtimes[parent_session_key] = runtime
-                return runtime
-
-    async def release_subagent_runtime(self, parent_session_key: str) -> None:
-        """Serialize release with spawn and kill the detached runtime off-map."""
-        lock = self._subagent_runtime_locks.get(parent_session_key)
-        if lock is not None:
-            async with lock:
-                runtime = self._subagent_runtimes.pop(parent_session_key, None)
-                # A waiter on this removed lock re-checks canonical identity in
-                # get_subagent_runtime and retries under the live lock.
-                self._subagent_runtime_locks.pop(parent_session_key, None)
-        else:
-            runtime = self._subagent_runtimes.pop(parent_session_key, None)
-        if runtime is not None:
-            try:
-                await runtime.kill(expected=True, reason="subagent runtime released")
-            except Exception:
-                self._deps.logger.warning(
-                    "Failed to kill subagent runtime for %s",
-                    parent_session_key,
-                    exc_info=True,
-                )
-
-    async def _get_or_bootstrap_run_runtime(
-        self,
-        parent_session_key: str,
-        *,
-        agent: str | None = None,
-        cwd: str | None = None,
-    ) -> Any:
-        """Adopt a configured bootstrap provider's runtime for a task run."""
-        owner = self._owner
-        if not owner._provider_factory:
-            # Outside the per-key lock: get_subagent_runtime takes that lock and
-            # asyncio.Lock is not reentrant.
-            return await owner.get_subagent_runtime(parent_session_key, agent=agent)
-
-        if parent_session_key not in self._subagent_runtime_locks:
-            self._subagent_runtime_locks[parent_session_key] = asyncio.Lock()
-        lock = self._subagent_runtime_locks[parent_session_key]
-        async with lock:
-            existing = self._subagent_runtimes.get(parent_session_key)
-            if existing is not None and existing.is_alive():
-                return existing
-            provider = owner._provider_factory(parent_session_key, agent=agent, cwd=cwd)
-            await provider.start()
-            session_provider = getattr(provider, "_client", None)
-            runtime = getattr(session_provider, "_runtime", None)
-            if session_provider is not None and runtime is not None:
-                try:
-                    session_provider._owns_runtime = False
-                except Exception:
-                    self._deps.logger.debug("run runtime ownership transfer failed", exc_info=True)
-                self._subagent_runtimes[parent_session_key] = runtime
-                try:
-                    handle = getattr(session_provider, "_handle", None)
-                    session_id = getattr(handle, "session_id", None) or getattr(
-                        handle, "_session_id", None
-                    )
-                    if session_id:
-                        await runtime.terminate_session(session_id)
-                except Exception:
-                    self._deps.logger.debug(
-                        "run runtime bootstrap-session terminate failed", exc_info=True
-                    )
-                return runtime
-            try:
-                await provider.shutdown()
-            except Exception:
-                self._deps.logger.debug(
-                    "run runtime bootstrap provider shutdown failed", exc_info=True
-                )
-        return await owner.get_subagent_runtime(parent_session_key, agent=agent)
-
-    async def _reacquire_and_validate(
-        self,
-        key: str,
-        session: Any,
-        *,
-        wait_if_busy: bool = True,
-    ) -> bool:
-        """Acquire with the global lock released, then validate exact identity."""
-        if not wait_if_busy and session.semaphore.locked():
-            raise SessionBusyError(key)
-        # An idle Semaphore(1) acquires without suspension, so this is the
-        # authoritative non-waiting claim boundary after the locked check.
-        await session.semaphore.acquire()
-        try:
-            async with self._lock:
-                still_valid = (
-                    self._sessions.get(key) is session
-                    and not session.retire_on_identity_change
-                    and self._deps.provider_effectively_alive(session.provider)
-                )
-        except BaseException:
-            # The held-semaphore contract was never returned to the caller.
-            session.semaphore.release()
-            raise
-        if not still_valid:
-            session.semaphore.release()
-        else:
-            session.turn_owner = asyncio.current_task()
-        return still_valid
-
-    async def _evict_stale_session(self, key: str, session: Any) -> None:
-        """Pop only the observed stale object and close it outside the lock."""
-        dead: LLMProvider | None = None
-        async with self._lock:
-            if self._sessions.get(key) is session:
-                del self._sessions[key]
-                self.advance_ownership_generation(key)
-                dead = session.provider
-                # Same tick as the removal. Left unrecorded, the start crumb
-                # survives and the next boot calls this a crash.
-                await record_session_ended(key, end_reason=END_REASON_EVICTED)
-        if dead is not None:
-            await asyncio.to_thread(self._deps.unlink_session_queue, session)
-            try:
-                await dead.shutdown()
-            except Exception:
-                self._deps.logger.warning(
-                    "Failed to shut down stale provider for %s", key, exc_info=True
-                )
+    # Companion and run runtimes, the parent-sharing decision and the runtimes' process
+    # rows: ``kiro_crew.session_allocation_parts.companions``.
+    get_subagent_runtime = _sa_companions.get_subagent_runtime
+    release_subagent_runtime = _sa_companions.release_subagent_runtime
+    _get_or_bootstrap_run_runtime = _sa_companions._get_or_bootstrap_run_runtime
+    _get_session_agent = _sa_companions._get_session_agent
+    _parent_runtime_kwargs = _sa_companions._parent_runtime_kwargs
+    is_session_sharing_eligible = _sa_companions.is_session_sharing_eligible
+    _parent_aws_profile = _sa_companions._parent_aws_profile
+    aws_profile_split_possible = _sa_companions.aws_profile_split_possible
+    project_aws_profile = _sa_companions.project_aws_profile
+    aws_profile_differs_from_parent = _sa_companions.aws_profile_differs_from_parent
+    _runtime_pid = staticmethod(_sa_companions._runtime_pid)
+    runtime_pids = _sa_companions.runtime_pids
+    _append_companion_runtime_rows = _sa_companions._append_companion_runtime_rows
+    # Claiming the live session for a key or cold-starting one:
+    # ``kiro_crew.session_allocation_parts.get_or_create``.
+    _reacquire_and_validate = _sa_get_or_create._reacquire_and_validate
+    _release_reacquired = _sa_get_or_create._release_reacquired
+    _evict_stale_session = _sa_get_or_create._evict_stale_session
+    _is_member_key = staticmethod(_sa_get_or_create._is_member_key)
+    _crew_pins_effort = _sa_get_or_create._crew_pins_effort
+    _dispatch_hard_kill = _sa_get_or_create._dispatch_hard_kill
+    _remove_reservation_now = _sa_get_or_create._remove_reservation_now
+    _remove_reservation_cancellation_drained = (
+        _sa_get_or_create._remove_reservation_cancellation_drained
+    )
+    _held_start_permit = _sa_get_or_create._held_start_permit
+    get_or_create = _sa_get_or_create.get_or_create
+    _remember_capability_failure = _sa_get_or_create._remember_capability_failure
+    _get_or_create_impl = _sa_get_or_create._get_or_create_impl
 
     async def open_task_session(
         self,
@@ -685,6 +773,7 @@ class SessionAllocationService:
         cwd: str | None = None,
         approval_policy: str = "",
         _won_race_retries: int = 0,
+        start_priority: StartPriority = StartPriority.BACKGROUND,
     ) -> tuple[LLMProvider, bool, bool]:
         """Open a per-step session on the task run's shared runtime.
 
@@ -704,9 +793,56 @@ class SessionAllocationService:
             # A restricted task starts a fresh native conversation whose
             # retention policy is fixed before launch; do not borrow a parent.
             return await owner.get_or_create(
-                key, agent=agent, approval_policy=approval_policy, cwd=cwd
+                key,
+                agent=agent,
+                approval_policy=approval_policy,
+                cwd=cwd,
+                start_priority=start_priority,
+            )
+        if not owner._bg_backend_supports_runtime():
+            # Dispatch on the SAME membership rule ``get_bg_session`` uses: only
+            # a backend in ``ACP_BACKENDS_ACP_RUNTIME`` has a shared multiplexed
+            # runtime to open a per-step session on. A harness outside that set
+            # has no such runtime to share, so ``_get_or_bootstrap_run_runtime``
+            # would bootstrap one -- always a kiro-family process -- under the
+            # task runner's own key, spawning kiro-cli under a foreign backend
+            # label (and failing outright when kiro-cli is not installed). Route
+            # those to the dedicated per-session path instead, exactly as
+            # ``get_bg_session`` serves them a provider-backed session.
+            return await owner.get_or_create(
+                key,
+                agent=agent,
+                approval_policy=approval_policy,
+                cwd=cwd,
+                start_priority=start_priority,
+            )
+        project_profiles = configured_project_profiles(owner._cfg)
+        if (
+            project_profiles
+            and cwd
+            and await asyncio.to_thread(resolve_project_profile, project_profiles, cwd)
+        ):
+            # The run's shared runtime is one process with one environment, so a
+            # step in a project bound to an AWS profile takes the dedicated path,
+            # where get_or_create sets that profile for its own process.
+            return await owner.get_or_create(
+                key,
+                agent=agent,
+                approval_policy=approval_policy,
+                cwd=cwd,
+                start_priority=start_priority,
             )
         async with self._lock:
+            # The other publication door: a key whose run is being ended
+            # (``begin_ending``) admits no per-step session either. Refused here
+            # -- not held like ``get_or_create``'s front door -- before anything
+            # is created for it, because this path reserves only around its
+            # create, never refuses at registration, and has no hard-kill handler
+            # for a session already created on the shared runtime. A create already in
+            # flight when the fence goes up publishes under the task runner's own
+            # ``taskrunner:`` key, which no cron reap ends; the ending caller's
+            # post-pass read of its key names whatever else lands there.
+            self._refuse_if_ending(key, None)
             existing = self._sessions.get(key)
             if existing is not None:
                 existing.last_used = time.monotonic()
@@ -722,11 +858,23 @@ class SessionAllocationService:
         prepared = await asyncio.to_thread(prepare_runtime, agent, None, cwd)
         if prepared.revision:
             return await owner.get_or_create(
-                key, agent=agent, approval_policy=approval_policy, cwd=cwd
+                key,
+                agent=agent,
+                approval_policy=approval_policy,
+                cwd=cwd,
+                start_priority=start_priority,
             )
         runtime = await owner._get_or_bootstrap_run_runtime(
-            parent_session_key, agent=agent, cwd=cwd
+            parent_session_key, agent=agent, cwd=cwd, start_priority=start_priority
         )
+        # Reserve the key for the create-and-register window, as
+        # ``get_or_create`` does, so ``has_allocation_reservation`` and
+        # ``session_keys`` see a per-step session that is still being created.
+        token = object()
+        async with self._lock:
+            self._refuse_if_ending(key, None)
+            self._allocation_reservations.setdefault(key, set()).add(token)
+            self.advance_ownership_generation(key)
         try:
             handle = await runtime.create_session(
                 cwd=cwd or None,
@@ -737,56 +885,73 @@ class SessionAllocationService:
                 # resolved to the run's parent session.
                 session_key=key,
                 memory_mode=execution.memory_mode if execution is not None else "persistent",
+                start_priority=start_priority,
             )
         except AcpWorkspaceBindingError:
+            self._remove_reservation_now(key, token)
             return await owner.get_or_create(
                 key,
                 agent=agent,
                 approval_policy=approval_policy,
                 cwd=cwd,
+                start_priority=start_priority,
             )
-        provider = self._deps.session_provider_type()(handle, runtime)
-        setattr(
-            provider,
-            "memory_mode",
-            execution.memory_mode if execution is not None else "persistent",
-        )
+        except BaseException:
+            self._remove_reservation_now(key, token)
+            raise
+        try:
+            provider = self._deps.session_provider_type()(handle, runtime)
+            setattr(
+                provider,
+                "memory_mode",
+                execution.memory_mode if execution is not None else "persistent",
+            )
 
-        duplicate: LLMProvider | None = None
-        won_race_session: Any | None = None
-        async with self._lock:
-            current = self._sessions.get(key)
-            if current is not None:
-                session = current
-                session.last_used = time.monotonic()
-                if approval_policy:
-                    session.approval_policy = approval_policy
-                duplicate = provider
-            else:
-                session = self._deps.session_factory(
-                    provider=provider,
-                    first_turn=self._deps.first_turn_fresh,
-                    approval_policy=approval_policy,
-                    agent=agent or "",
-                )
-                session.capability_member = prepared.member
-                self._sessions[key] = session
-                self.advance_ownership_generation(key)
-                won_race_session = session
-                try:
-                    await record_session_started(key)
-                except BaseException:
-                    # This await is the only suspension point between registering
-                    # the session and returning it. Cancelled here, the caller
-                    # hard-kills the provider while the entry stays visible, so a
-                    # claimant can be handed a session whose process is already
-                    # dying -- and the crumb would outlive it into a false crash.
-                    if self._sessions.get(key) is session:
-                        del self._sessions[key]
-                        self.advance_ownership_generation(key)
-                    await discard_session_start(key)
-                    raise
+            duplicate: LLMProvider | None = None
+            won_race_session: Any | None = None
+            async with self._lock:
+                current = self._sessions.get(key)
+                if current is not None:
+                    session = current
+                    session.last_used = time.monotonic()
+                    if approval_policy:
+                        session.approval_policy = approval_policy
+                    duplicate = provider
+                else:
+                    session = self._deps.session_factory(
+                        provider=provider,
+                        first_turn=self._deps.first_turn_fresh,
+                        approval_policy=approval_policy,
+                        agent=agent or "",
+                    )
+                    session.capability_member = prepared.member
+                    self._install_work_dir_claim_probe(key, provider)
+                    self._sessions[key] = session
+                    self.advance_ownership_generation(key)
+                    won_race_session = session
+                    try:
+                        await record_session_started(key)
+                    except BaseException:
+                        # This await is the only suspension point between registering
+                        # the session and returning it. Cancelled here, the caller
+                        # hard-kills the provider while the entry stays visible, so a
+                        # claimant can be handed a session whose process is already
+                        # dying -- and the crumb would outlive it into a false crash.
+                        if self._sessions.get(key) is session:
+                            del self._sessions[key]
+                            self.advance_ownership_generation(key)
+                        await discard_session_start(key)
+                        raise
+                    # After the registration has committed: the rollback above is
+                    # behind us, so a cancelled start cannot take parked entries
+                    # down with the session it removes.
+                    adopt_parked_queue(session, key)
+        finally:
+            self._remove_reservation_now(key, token)
         if duplicate is not None:
+            # ``current`` holds this key and runs in the directory this
+            # provider derived from it; the loser must not reclaim it.
+            duplicate.disown_work_dir()
             try:
                 await duplicate.shutdown()
             except Exception:
@@ -810,100 +975,12 @@ class SessionAllocationService:
                 cwd=cwd,
                 approval_policy=approval_policy,
                 _won_race_retries=_won_race_retries + 1,
+                start_priority=start_priority,
             )
         assert won_race_session is session
         await session.semaphore.acquire()
         session.turn_owner = asyncio.current_task()
         return session.provider, True, False
-
-    def _get_session_agent(self, session_key: str) -> str:
-        session = self._sessions.get(session_key)
-        if session is None:
-            return ""
-        return getattr(session, "agent", "") or ""
-
-    def _parent_runtime_kwargs(self, parent_session_key: str) -> dict[str, Any]:
-        return _collect_parent_runtime_kwargs(self._owner, parent_session_key)
-
-    def is_session_sharing_eligible(self, parent_session_key: str) -> bool:
-        # Exact-key lookup is current behavior; do not fold this seam here.
-        session = self._sessions.get(parent_session_key)
-        if session is None:
-            return False
-        if session.loaded_capabilities is not None:
-            return False
-        return getattr(session.provider, "is_session_sharing_eligible", False)
-
-    @staticmethod
-    def _runtime_pid(runtime: Any) -> int | None:
-        pid = getattr(runtime, "pid", None)
-        return pid if isinstance(pid, int) and pid > 0 else None
-
-    def runtime_pids(self) -> list[dict[str, object]]:
-        """Return process-identity snapshots without performing OS sampling."""
-        rows: list[dict[str, object]] = []
-        for key, session in self._sessions.items():
-            client = getattr(session.provider, "_client", None)
-            if client is None:
-                client = session.provider
-            runtime = getattr(client, "_runtime", None)
-            rows.append(
-                {
-                    "key": key,
-                    "agent": session.agent,
-                    # The ACP session id, which is also the id of this session's
-                    # crew log unit; the Sessions table's lineage reader joins on
-                    # it. Backend-authored, so bounded here where it is retained
-                    # (the bound every other store of this id applies); an
-                    # oversize or empty value is carried as None, not truncated.
-                    "sid": bounded_session_id(getattr(session.provider, "session_id", None)),
-                    "pid": self._runtime_pid(runtime),
-                    "owns_runtime": bool(getattr(client, "_owns_runtime", True)),
-                    "created_at": session.created_at,
-                    "prompts": session.prompt_count,
-                }
-            )
-        self._owner._append_companion_runtime_rows(rows)
-        return rows
-
-    def _append_companion_runtime_rows(self, rows: list[dict[str, object]]) -> None:
-        """Append manager-owned background and subagent runtime process rows."""
-        now_wall = time.time()
-        now_monotonic = time.monotonic()
-
-        def add(label: str, runtime: object, agent: str) -> None:
-            try:
-                if runtime is None or not runtime.is_alive():  # type: ignore[attr-defined]
-                    return
-                pid = self._runtime_pid(runtime)
-                if pid is None:
-                    return
-                spawned = getattr(runtime, "_spawn_monotonic", None)
-                created = (
-                    now_wall - (now_monotonic - spawned)
-                    if isinstance(spawned, (int, float))
-                    else None
-                )
-                rows.append(
-                    {
-                        "key": label,
-                        "agent": agent,
-                        "pid": pid,
-                        "owns_runtime": True,
-                        "created_at": created,
-                        "prompts": None,
-                    }
-                )
-            except Exception:
-                self._deps.logger.debug("runtime_pids: probe failed for %s", label, exc_info=True)
-
-        add(
-            "Background runtime",
-            self._owner._bg_runtime,
-            self._deps.constants.background_agent,
-        )
-        for parent_key, runtime in list(self._subagent_runtimes.items()):
-            add(f"Subagent runtime ({parent_key})", runtime, "")
 
     def record_success(self, key: str) -> None:
         session = self._sessions.get(self._owner._fold_key(key))
@@ -982,6 +1059,29 @@ class SessionAllocationService:
     def mapped_sid(self, key: str) -> str:
         return self._owner._session_map.mapped_sid(self._owner._fold_key(key))
 
+    def allocation_predecessor(self, key: str) -> str:
+        """The store *key*'s live session superseded, or ``""``.
+
+        The id the mapping named -- live, or the stash a recycle left -- at the
+        instant this boundary registered the key's live session, read under the same
+        lock and in the same tick as the registration itself and stamped on the
+        session (``_Session.predecessor_sid``). That is what makes it safe to
+        consume after ``get_or_create`` returns: a caller that read the mapping
+        around its own call could be suspended inside the allocation while a
+        concurrent turn on the key allocated and recycled an intermediate session,
+        and would then cite the store before that one. Read off the live session,
+        like ``requested_model``, so a warm claim reads the value its session was
+        registered with and ordinary teardown releases it -- a table keyed by
+        session key would grow by one entry per ``/new`` or generation rotation for
+        the life of the gateway. Empty for a key with no live session, and for a
+        session whose registration found no earlier store.
+        """
+        session = self._sessions.get(self._owner._fold_key(key))
+        return session.predecessor_sid if session is not None else ""
+
+    def mapped_session_keys(self) -> frozenset[str]:
+        return frozenset(self._owner._session_map.mapped_sids_by_key())
+
     def seed_conversation(
         self,
         key: str,
@@ -1004,6 +1104,17 @@ class SessionAllocationService:
         self._owner._session_map.delete(folded)
         self._continuable_keys.discard(folded)
         return sid
+
+    def forget_conversation_if_sid(self, key: str, expected_sid: str) -> tuple[bool, str | None]:
+        """Forget the resumable pointer only while it is still *expected_sid*.
+
+        ``SessionMap.delete_if_sid`` compares and deletes in one step under its
+        own lock; a mismatch deletes nothing and preserves the successor's
+        pointer. This is the method's only mutation. Returns the map's
+        ``(removed, current_sid)``.
+        """
+        folded = self._owner._fold_key(key)
+        return self._owner._session_map.delete_if_sid(folded, expected_sid)
 
     def conversation_provider(self, key: str) -> str:
         return self._owner._session_map.get_provider(self._owner._fold_key(key))
@@ -1049,6 +1160,33 @@ class SessionAllocationService:
                     "new occupant's",
                     key,
                 )
+            else:
+                # The holding this release ends is over, so its record goes in the
+                # same step. A waiter the permit was just handed to names itself
+                # when it next runs; until then the record names nobody, rather
+                # than a task that has let the permit go
+                # (``compaction_waits_for_turn``, ``cancel_owned_turn``).
+                session.turn_owner = None
+                # A release marks the end of a live turn, not the start of
+                # idleness: refresh liveness so the idle sweep measures from
+                # when the session went quiet rather than when it was
+                # acquired. A run that never returns still goes stale and is
+                # reaped; a run working between tasks is not mistaken for one.
+                session.last_used = time.monotonic()
+            if getattr(session, "adopted_parked", False):
+                # The claim that just ended adopted entries a forced stop parked
+                # (``adopt_parked_queue``). Their channels' drains are woken
+                # NOW, after the lease is free, or the entries sit on the queue
+                # until an unrelated message happens to start a turn. Off this
+                # synchronous call, as ``wake_other_drains`` requires.
+                session.adopted_parked = False
+                channels = [entry_channel(e[2]) for e in session.queue]
+                if any(channels):
+                    task = asyncio.ensure_future(
+                        wake_other_drains(waker="", session_key=key, channels=channels)
+                    )
+                    self._owner._background_tasks.add(task)
+                    task.add_done_callback(self._owner._background_tasks.discard)
 
     async def _safe_cleanup(self, provider: LLMProvider, session_id: str) -> None:
         try:
@@ -1127,16 +1265,88 @@ class SessionAllocationService:
             return True
         return False
 
-    def clear_queue(self, key: str) -> None:
+    def detach_queue(self, key: str) -> tuple[Any, ...]:
+        """Take every queued entry OUT of the live queue, keeping its files.
+
+        For a Stop that must neither run nor lose what was queued when it was
+        pressed: taken before the first await, so an end-of-turn drain during the
+        stop finds nothing to start; then either ``clear_queue(only=...)`` drops
+        it (the stop went through) or ``restore_queue`` puts it back (declined).
+        """
+        session = self._sessions.get(self._owner._fold_key(key))
+        if session is None:
+            return ()
+        taken = tuple(session.queue)
+        session.queue.clear()
+        return taken
+
+    def restore_queue(self, key: str, entries: tuple[Any, ...]) -> None:
+        """Put ``detach_queue``'s entries back at the head, ahead of newer arrivals."""
+        session = self._sessions.get(self._owner._fold_key(key))
+        if session is None or not entries:
+            return
+        session.queue.extendleft(reversed(entries))
+
+    def clear_queue(
+        self,
+        key: str,
+        owned_by: Callable[[dict], bool] | None = None,
+        *,
+        only: tuple[Any, ...] | None = None,
+    ) -> None:
         key = self._owner._fold_key(key)
         session = self._sessions.get(key)
-        if session:
+        if only is not None:
+            # Identity, not equality: two entries can carry the same text. The
+            # entries need not still be IN the queue -- ``detach_queue`` takes
+            # them out first -- so their files are unlinked from the HANDLES,
+            # before the session guard: a hard stop pops the session between
+            # the detach and this clear, and the detached entries were never on
+            # the popped queue the teardown unlinks.
+            for _, _, kwargs in only:
+                self._deps.unlink_queued_temp_paths(kwargs)
+            if session is None:
+                return
+            wanted = {id(item) for item in only}
+            kept = [item for item in session.queue if id(item) not in wanted]
+            if len(kept) != len(session.queue):
+                session.queue.clear()
+                session.queue.extend(kept)
+            # ``cancelled`` left alone, as on the ``owned_by`` branch below.
+            return
+        if session is None:
+            return
+        if owned_by is None:
             for _, _, kwargs in session.queue:
                 self._deps.unlink_queued_temp_paths(kwargs)
             session.queue.clear()
             session.cancelled.clear()
+            return
+        # Partitioned BEFORE anything is mutated, so a predicate that raises leaves the
+        # queue exactly as it was. Every entry is already dequeued nowhere else -- this
+        # runs under the caller's receipt lock -- so the pass costs one walk.
+        dropped = [item for item in session.queue if owned_by(item[2])]
+        if not dropped:
+            return
+        kept = [item for item in session.queue if not owned_by(item[2])]
+        for _, _, kwargs in dropped:
+            self._deps.unlink_queued_temp_paths(kwargs)
+        session.queue.clear()
+        session.queue.extend(kept)
+        # ``cancelled`` is deliberately LEFT ALONE. It holds bare message timestamps a
+        # mid-turn cancel asked ``dequeue`` to skip, with nothing on them saying whose
+        # they are, so clearing it here would un-cancel somebody else's cancel request.
+        # The whole-session branch above may clear it because it empties the queue those
+        # timestamps describe.
 
     async def is_provider_alive(self, key: str) -> bool | None:
+        """Whether *key*'s provider process is up, or None when there is no session.
+
+        Forwards a PROCESS-level answer (``provider.is_process_alive``) under a
+        per-key question. On a shared runtime every co-tenant key returns the
+        same value, so a True here does not establish that *key* itself is still
+        served -- only that the process behind it has not exited.
+        """
         key = self._owner._fold_key(key)
         async with self._lock:
             session = self._sessions.get(key)
@@ -1218,839 +1428,87 @@ class SessionAllocationService:
         cache[agent] = (model, directory_mtime, now)
         return model
 
-    @staticmethod
-    def _is_member_key(key: str) -> bool:
-        """Whether *key* addresses a crew member's pinned DM session.
 
-        Wrapper so the pool-bypass arm stays readable and the import stays off
-        module top level (circular import: members' module graph is heavy and
-        imports config, which sits below this module).
-        """
-        from kiro_crew.members import is_member_session_key
-
-        return is_member_session_key(key)
-
-    async def _crew_pins_effort(self, agent: str | None, crew_agent: object) -> bool:
-        """True when the crew this session runs as pins its own reasoning effort.
-
-        Read off the event loop: ``load_config`` parses (and deep-copies, even on
-        a cache hit) the whole config, which is not work to do inline. Only the
-        warm-pool decision calls this, so the cost lands once per cold start
-        rather than once per turn, and never on a session that was already
-        skipping the pool for a cheaper reason.
-
-        Failure answers False -- the pre-field behaviour. An unreadable config
-        must not stop a session from starting, and pooling it is only wrong for a
-        crew that pins an effort, which is exactly what could not be read.
-        """
-        try:
-            config = await asyncio.to_thread(self._deps.load_config)
-            crew = crew_agent if isinstance(crew_agent, str) else None
-            return bool(config.crew_pinned_effort(agent, crew))
-        except Exception:
-            self._deps.logger.warning(
-                "Could not read the crew effort pin for agent=%r; pooling as before",
-                agent,
-                exc_info=True,
-            )
-            return False
-
-    def _dispatch_hard_kill(self, provider: LLMProvider) -> None:
-        """Dispatch blocking provider teardown away from the event-loop thread."""
-        kill = self._deps.get_sync_kill_provider()
-        try:
-            asyncio.get_running_loop().run_in_executor(
-                self._deps.get_subprocess_executor(),
-                kill,
-                provider,
-            )
-        except RuntimeError:
-            # During executor shutdown, a daemon thread is safer than running
-            # waitpid/taskkill inline and wedging the event loop.
-            threading.Thread(target=kill, args=(provider,), daemon=True).start()
-
-    def _remove_reservation_now(self, key: str, token: object) -> None:
-        """Remove a token in the yield-free span after a successful claim."""
-        reservations = self._allocation_reservations.get(key)
-        if reservations is not None and token in reservations:
-            reservations.remove(token)
-            self.advance_ownership_generation(key)
-            if not reservations:
-                self._allocation_reservations.pop(key, None)
-
-    async def _remove_reservation_cancellation_drained(self, key: str, token: object) -> None:
-        """Remove one failed/cancelled reservation despite caller cancellation."""
-
-        async def remove() -> None:
-            async with self._lock:
-                self._remove_reservation_now(key, token)
-
-        cleanup = asyncio.create_task(remove())
-        cancellation: asyncio.CancelledError | None = None
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-        await cleanup
-        if cancellation is not None:
-            raise cancellation
-
-    async def get_or_create(
-        self,
-        key: str,
-        agent: str | None = None,
-        channel_id: str | None = None,
-        approval_policy: str = "",
-        model: str | None = None,
-        cwd: str | None = None,
-        extra_env: dict[str, str] | None = None,
-        speculative: bool = False,
-        speculative_resume: bool = False,
-        wait_if_busy: bool = True,
-        _won_race_retries: int = 0,
-        **extra_factory_kwargs: Any,
-    ) -> tuple[LLMProvider, bool, bool]:
-        """Reserve logical ownership for the complete claim/allocation call."""
-        # An older message between its reset and its replay holds the key: a
-        # claim made now would run -- and persist -- ahead of it. Waited out
-        # BEFORE the reservation so the ownership generation does not move for a
-        # claimant that has not been admitted yet; the replay's own task passes.
-        await self._owner.await_replay_gap(key)
-        token = object()
-        async with self._lock:
-            if self._closing:
-                raise SessionClosingError(
-                    "SessionManager is closing (gateway restart/shutdown in "
-                    "progress); refusing to start or resume a turn"
-                )
-            reserved_key = self._owner._fold_key(key)
-            self._allocation_reservations.setdefault(reserved_key, set()).add(token)
-            self.advance_ownership_generation(reserved_key)
-        try:
-            result = await self._get_or_create_impl(
-                reserved_key,
-                agent=agent,
-                channel_id=channel_id,
-                approval_policy=approval_policy,
-                model=model,
-                cwd=cwd,
-                extra_env=extra_env,
-                speculative=speculative,
-                speculative_resume=speculative_resume,
-                wait_if_busy=wait_if_busy,
-                _won_race_retries=_won_race_retries,
-                **extra_factory_kwargs,
-            )
-        except BaseException:
-            await self._remove_reservation_cancellation_drained(reserved_key, token)
-            raise
-        self._remove_reservation_now(reserved_key, token)
-        # This task now holds the key's live permit. If it reset its previous
-        # session on this key (a replay), the release it will make is for THIS
-        # permit and must not be swallowed as the old one's.
-        self._owner.adopt_turn(reserved_key)
-        return result
-
-    def _remember_capability_failure(self, key: str, preparation: Any) -> None:
-        # Only closed error vocabulary reaches the owner API; provider errors
-        # can contain transport credentials. Successful retry removes this row.
-        failures = self.state.capability_failures
-        failures.pop(key, None)
-        failures[key] = {
-            "member": preparation.member,
-            "status": "failed",
-            "saved_revision": preparation.revision,
-            "error_code": "capability_startup_failed",
-        }
-        if len(failures) > 128:
-            failures.pop(next(iter(failures)))
-
-    async def _get_or_create_impl(
-        self,
-        key: str,
-        agent: str | None = None,
-        channel_id: str | None = None,
-        approval_policy: str = "",
-        model: str | None = None,
-        cwd: str | None = None,
-        extra_env: dict[str, str] | None = None,
-        speculative: bool = False,
-        speculative_resume: bool = False,
-        wait_if_busy: bool = True,
-        _won_race_retries: int = 0,
-        **extra_factory_kwargs: Any,
-    ) -> tuple[LLMProvider, bool, bool]:
-        """Claim a live session or cold-start one, returning its held lease.
-
-        The returned tuple is ``(provider, is_new, resumed)``.  A successful
-        return always owns the session semaphore and must be paired with
-        ``release``.  First-turn observation is consumed only by the real
-        claimant that actually wins that semaphore.
-        """
-        owner = self._owner
-        constants = self._deps.constants
-        key = owner._fold_key(key)
-        from kiro_crew.execution_context import read_session_execution
-
-        execution = await asyncio.to_thread(read_session_execution, key)
-        member_context = execution is not None and execution.member_id is not None
-        memory_mode = execution.memory_mode if execution is not None else "persistent"
-        stale_provider: LLMProvider | None = None
-        stale_session: Any | None = None
-        claimed: Any | None = None
-        factory: ProviderFactory
-        try:
-            async with self._lock:
-                if self._closing:
-                    raise SessionClosingError(
-                        "SessionManager is closing (gateway restart/shutdown in "
-                        "progress); refusing to start or resume a turn"
-                    )
-
-                existing = self._sessions.get(key)
-                recycling = existing is not None and owner._recycling.get(key) is existing
-                if existing is not None and not recycling:
-                    session = existing
-                    if getattr(session.provider, "memory_mode", "persistent") != memory_mode:
-                        raise RuntimeError(
-                            "This conversation's privacy mode changed; open a new conversation"
-                        )
-                    alive = session.provider.is_process_alive()
-                    if not alive:
-                        if (
-                            self._deps.is_claude_provider(session.provider)
-                            and session.provider.connection_mode == "per_session"
-                        ):
-                            self._deps.logger.info(
-                                "Session %s CC process dead — will reconnect on next stream()",
-                                key,
-                            )
-                            alive = True
-                        else:
-                            self._deps.logger.warning(
-                                "Session %s has dead provider — removing stale entry",
-                                key,
-                            )
-                            stale_provider = session.provider
-                            stale_session = session
-                            del self._sessions[key]
-                            self.advance_ownership_generation(key)
-                            # Same tick as the removal. Left unrecorded, the
-                            # start crumb survives and the next boot calls this
-                            # a crash rather than an eviction.
-                            await record_session_ended(key, end_reason=END_REASON_EVICTED)
-                    if alive:
-                        session.last_used = time.monotonic()
-                        if (
-                            self._deps.is_claude_provider(session.provider)
-                            and session.provider.session_id
-                            and not owner._session_map.get(key)
-                        ):
-                            owner._session_map.set(
-                                key,
-                                session.provider.session_id,
-                                provider=constants.provider_label_claude,
-                                cwd=session.provider.cwd,
-                            )
-                        # The semaphore may be held for a full turn; claim it
-                        # only after releasing the global registry lock.
-                        claimed = session
-
-                if claimed is None:
-                    if not owner._provider_factory:
-                        raise RuntimeError("No provider factory configured")
-                    factory = owner._provider_factory
-        finally:
-            if stale_provider is not None:
-                if stale_session is not None:
-                    await asyncio.to_thread(self._deps.unlink_session_queue, stale_session)
-                try:
-                    await stale_provider.shutdown()
-                except Exception:
-                    self._deps.logger.warning(
-                        "Failed to shut down stale provider for %s",
-                        key,
-                        exc_info=True,
-                    )
-
-        if claimed is not None:
-            session = claimed
-            if await owner._reacquire_and_validate(
-                key,
-                session,
-                wait_if_busy=wait_if_busy,
-            ):
-                first_turn = session.first_turn
-                if not speculative:
-                    session.first_turn = self._deps.first_turn_nothing_armed
-                return session.provider, first_turn.is_new, first_turn.resumed
-            await owner._evict_stale_session(key, session)
-            # Re-enter the claim rather than cold-start in place. The session
-            # this claimant waited on was replaced or retired under it -- a reset
-            # wakes its waiters exactly so they get here -- and the key may now
-            # hold a successor, or sit inside a replay gap that must be waited
-            # out; only the front door sees either. Bounded like the won-race
-            # retry it mirrors. A key that simply has no session any more takes
-            # the same cold start it would have taken here, one hop later.
-            maximum = constants.won_race_max_retries
-            if _won_race_retries >= maximum:
-                raise RuntimeError(
-                    f"get_or_create({key!r}) exceeded {maximum} won-race retries — "
-                    "session kept going stale between acquire and re-validate"
-                )
-            return await owner.get_or_create(
-                key,
-                agent=agent,
-                channel_id=channel_id,
-                approval_policy=approval_policy,
-                model=model,
-                cwd=cwd,
-                extra_env=extra_env,
-                speculative=speculative,
-                speculative_resume=speculative_resume,
-                wait_if_busy=wait_if_busy,
-                _won_race_retries=_won_race_retries + 1,
-                **extra_factory_kwargs,
-            )
-
-        # FORK CROSSOVER (restored at the 2026-09-21 sync; upstream has no
-        # equivalent). A caller may name a backend that is NOT the configured one
-        # -- a dedicated child on its parent's harness, a Settings change mid-run.
-        # Two things then have to change together: the FACTORY must be the one
-        # that can construct that backend's provider class, and the configured
-        # harness's own model pin must NOT be inherited across the namespace
-        # boundary, or the child is handed a model its harness never served.
-        # Namespace scoping alone cannot object here: a harness that has
-        # advertised nothing is silent, and silence is not a refusal
-        # (see model_scope) -- which is exactly the crossover case.
-        configured_backend = getattr(owner, "acp_backend", "")
-        if not isinstance(configured_backend, str):
-            configured_backend = ""
-        effective_backend = extra_factory_kwargs.get("acp_backend", configured_backend)
-        if not isinstance(effective_backend, str):
-            effective_backend = configured_backend
-        inherits_config_model = effective_backend == configured_backend
-        if not inherits_config_model:
-            extra_factory_kwargs["inherit_config_model"] = False
-            factory = owner._provider_factory_for_backend(effective_backend)
-
-        resume_sid: str | None = None
-        is_stateless = (
-            key in (constants.background_key, constants.heartbeat_key)
-            or any(key.startswith(prefix) for prefix in constants.stateless_prefixes)
-        ) and not owner._is_continuable_key(key)
-        if not is_stateless:
-            resume_sid = owner._session_map.get(key)
-        if speculative and resume_sid and not speculative_resume:
-            raise SpeculativeResumeRefused(key)
-
-        from kiro_crew.session_capabilities import prepare_runtime
-
-        effective_cwd = cwd
-        if not effective_cwd and resume_sid:
-            stored_cwd = owner._session_map.get_cwd(key)
-            if stored_cwd and await asyncio.to_thread(Path(stored_cwd).is_dir):
-                effective_cwd = stored_cwd
-        claim_crew = extra_factory_kwargs.get("crew_agent")
-        session_agent = agent
-        preparation = await asyncio.to_thread(prepare_runtime, agent, claim_crew, effective_cwd)
-        if preparation.revision:
-            # The factory may retain the pre-reconciliation config snapshot.
-            # Pass the prepared template explicitly, keeping the member namespace.
-            agent = preparation.template
-            effective_cwd = preparation.project or effective_cwd
-            extra_factory_kwargs["crew_agent"] = preparation.member
-
-        # Reconciliation can publish a new template model. Resolve only after
-        # that boundary, while retaining an explicit caller model unchanged.
-        if model is None and inherits_config_model:
-
-            def resolve_model() -> str | None:
-                cfg = self._deps.load_config() if preparation.revision else owner._cfg
-                selected = preparation.member or agent
-                # Pass the namespace verdict: an adapter that does not consume
-                # registry model ids must not have a kiro agent file read for it.
-                return self._deps.session_model(
-                    cfg,
-                    selected,
-                    claim_crew,
-                    self._deps.uses_registry_model_ids(effective_backend),
-                )
-
-            model = await asyncio.to_thread(resolve_model)
-
-        self._deps.logger.info(
-            "Pool decision: key=%s resume_sid=%s model=%s agent=%s "
-            "pool_size=%d pool_qsize=%d cwd=%s pool_cwd=%s",
-            key,
-            resume_sid,
-            model,
-            agent,
-            owner._pool_size,
-            owner._warm_pool.qsize(),
-            cwd,
-            owner._pool_cwd,
-        )
-        provider_switched = False
-        cwd_blocks_pool = bool(cwd and cwd != owner._pool_cwd)
-        if not owner._pool_size:
-            pool_decision = "disabled"
-        elif preparation.revision:
-            pool_decision = "bypass_member_capabilities"
-        elif resume_sid:
-            pool_decision = "bypass_resume"
-        elif is_stateless:
-            pool_decision = "bypass_stateless"
-        elif self._is_member_key(key):
-            # A pooled child was spawned with no session key, so it runs the
-            # factory's DEFAULT backend and none of the member construction
-            # route (per-session dispatch-tool mount, member backend). A warm
-            # hit would silently hand a member DM a session that cannot mount
-            # its tools; cold-starting through the factory is what makes the
-            # member route real. String check — as cheap as the arms above.
-            pool_decision = "bypass_member"
-        elif memory_mode != "persistent":
-            pool_decision = "bypass_restricted_context"
-        elif member_context:
-            # Native launch documents are captured before session creation.
-            # An already launched generic pool cannot supply that receipt.
-            pool_decision = "bypass_member_context"
-        elif cwd_blocks_pool:
-            pool_decision = "bypass_cwd"
-        elif extra_env:
-            pool_decision = "bypass_env"
-        elif (
-            "acp_backend" in extra_factory_kwargs
-            and extra_factory_kwargs["acp_backend"] != configured_backend
-        ):
-            # FORK ARM (restored at the 2026-09-21 sync). A pooled child was
-            # spawned with no session key, so it runs the factory's DEFAULT
-            # backend. Claiming it for a caller pinned to a DIFFERENT harness
-            # hands that caller a process of the wrong harness entirely -- the
-            # model namespace, the wire dialect and the tool-approval route all
-            # belong to the pool's backend, not the one asked for. Cold-starting
-            # through the factory is what makes the pin real.
-            pool_decision = "bypass_backend"
-        elif extra_factory_kwargs.get("shared_scratch") is not None:
-            # A dedicated subagent joining its parent's session tree needs the
-            # parent's work directory MOUNTED, and a pooled child's mounts were
-            # fixed when it was pre-spawned with no parent. Cold-starting is what
-            # makes ``$KIROCREW_SCRATCH`` name the same place as the parent's.
-            pool_decision = "bypass_shared_scratch"
-        elif await self._crew_pins_effort(agent, extra_factory_kwargs.get("crew_agent")):
-            # A CREW's pinned effort is fixed at spawn time and the warm-pool
-            # claim path never re-pushes it, so a warm hit would silently run
-            # this crew at the wrong depth.  Cold-starting is what makes the
-            # pin real.  (Caller-supplied reasoning_effort_override is handled
-            # post-claim via provider.change_effort instead — see below.)
-            #
-            # Last in the chain on purpose: it is the only arm that needs to
-            # read config, so every cheaper reason to skip the pool is settled
-            # first and a bypassing session never pays for the lookup.
-            pool_decision = "bypass_effort"
-        else:
-            pool_decision = ""
-
-        pooled = None if pool_decision else await owner._drain_and_claim(agent)
-        if not pool_decision:
-            pool_decision = "hit" if pooled is not None else "miss_empty"
-        owner._record_pool_decision(pool_decision, key)
-        if pooled is not None:
-            provider = pooled
-            cast(Any, provider).memory_mode = memory_mode
-            if self._deps.is_acp_provider(provider):
-                cast(Any, provider).member_context = member_context
-            try:
-                if self._deps.is_acp_provider(provider):
-                    claim_kwarg = extra_factory_kwargs.get("crew_agent")
-
-                    def resolve_claim_watchdog() -> tuple[str, object]:
-                        # Resolve from a fresh config off-loop.  AcpClient.rekey
-                        # resets prompt cost/context state while rebinding the
-                        # handle and watchdog to the claiming crew.
-                        config = self._deps.load_config()
-                        crew = self._deps.resolve_crew_identity(
-                            config,
-                            agent,
-                            None if claim_kwarg is None else str(claim_kwarg),
-                        )
-                        return crew, self._deps.load_watchdog_settings(crew)
-
-                    claim_crew, claim_watchdog = await asyncio.to_thread(resolve_claim_watchdog)
-                    cast(Any, provider).client.rekey(
-                        key,
-                        channel_id,
-                        crew_agent=claim_crew,
-                        watchdog=claim_watchdog,
-                    )
-                    if model:
-                        # A cache miss walks the agents directory and reads specs
-                        # until the pool agent matches: filesystem work, off the
-                        # loop like the config load above.
-                        pool_model = (
-                            await asyncio.to_thread(owner._resolve_agent_model, owner._pool_agent)
-                            if owner._pool_agent
-                            else None
-                        )
-                        if pool_model:
-                            try:
-                                advertised = self._deps.advertised_model_ids(
-                                    provider.available_models()
-                                )
-                            except Exception:  # pragma: no cover - defensive
-                                advertised = []
-                            _namespace = self._deps.provider_model_namespace(provider)
-                            _foreign_scope = not self._deps.model_pin_applies(
-                                model,
-                                _namespace,
-                                advertised,
-                            )
-                        if self._deps.is_claude_backend(provider):
-                            switch_model = self._deps.to_provider_id(model, "claude_code")
-                            comparable_pool = (
-                                self._deps.to_provider_id(pool_model, "claude_code")
-                                if pool_model
-                                else pool_model
-                            )
-                        else:
-                            switch_model = self._deps.to_acp_id(model)
-                            comparable_pool = (
-                                self._deps.to_acp_id(pool_model) if pool_model else pool_model
-                            )
-                        if pool_model and _foreign_scope:
-                            # Harness ownership and account entitlement are
-                            # separate decisions. A foreign pin inherits this
-                            # harness's current pooled model.
-                            self._deps.logger.info(
-                                "Pool post-claim: model %s belongs to another harness, "
-                                "not %s; leaving the claimed process on %s",
-                                model,
-                                _namespace,
-                                pool_model,
-                            )
-                        elif pool_model and switch_model != comparable_pool:
-                            _send_model = switch_model
-                            if advertised and self._deps.model_is_unusable(
-                                switch_model, advertised
-                            ):
-                                # A literal miss can be a stale `<namespace>::`
-                                # qualifier on a model the backend fully serves:
-                                # resolve to the advertised spelling and
-                                # send THAT — the same fold the cold-start spawn
-                                # and the display verdict use, so a warm claim
-                                # runs exactly what a cold start of the same pin
-                                # runs. A pin absent under either spelling still
-                                # takes the withhold below.
-                                _send_model = self._deps.resolve_pin_spelling(
-                                    switch_model, advertised
-                                )
-                            if not _send_model:
-                                self._deps.logger.warning(
-                                    "Pool post-claim: model %s is not available to this "
-                                    "account; leaving the claimed process on %s",
-                                    switch_model,
-                                    pool_model,
-                                )
-                            else:
-                                await cast(Any, provider).client.set_model(_send_model)
-                                self._deps.logger.info(
-                                    "Pool post-claim: switched model to %s",
-                                    _send_model,
-                                )
-                    _effort_override = extra_factory_kwargs.get("reasoning_effort_override")
-                    if _effort_override:
-                        _eff = str(_effort_override)
-                        try:
-                            if not await provider.change_effort(_eff):
-                                _cur_model = (
-                                    getattr(cast(Any, provider).client, "_model", None) or ""
-                                )
-                                self._deps.logger.warning(
-                                    "reasoning effort '%s' will not be applied (session %s) — "
-                                    "model '%s' does not support effort configuration",
-                                    _eff,
-                                    key or "?",
-                                    _cur_model or "auto",
-                                )
-                            else:
-                                _cur_model = (
-                                    getattr(cast(Any, provider).client, "_model", None) or ""
-                                )
-                                self._deps.logger.info(
-                                    "Pool post-claim: applied reasoning effort %s to model %s",
-                                    _eff,
-                                    _cur_model,
-                                )
-                        except Exception:
-                            self._deps.logger.warning(
-                                "Pool post-claim: failed to apply reasoning effort '%s' (session %s)",
-                                _eff,
-                                key or "?",
-                                exc_info=True,
-                            )
-                self._deps.logger.info(
-                    "Claimed warm-pool process for %s (agent=%s)",
-                    key,
-                    agent or owner._pool_agent,
-                )
-                owner._schedule_replenish()
-            except (asyncio.CancelledError, Exception):
-                owner._dispatch_hard_kill(provider)
-                raise
-        else:
-            provider = factory(
-                key,
-                agent=agent,
-                channel_id=channel_id,
-                model_override=model,
-                cwd=effective_cwd,
-                extra_env=extra_env,
-                **extra_factory_kwargs,
-            )
-            cast(Any, provider).memory_mode = memory_mode
-            if self._deps.is_acp_provider(provider):
-                cast(Any, provider).member_context = member_context
-            if memory_mode != "persistent":
-                resume_sid = None
-            provider_switched = False
-            if resume_sid:
-                is_claude_now = self._deps.is_claude_provider(
-                    provider
-                ) or self._deps.is_claude_backend(provider)
-                current_provider = (
-                    constants.provider_label_claude
-                    if is_claude_now
-                    else self._deps.provider_label(provider)
-                )
-                if self._deps.detect_provider_switch(owner._session_map, key, current_provider):
-                    resume_sid = None
-                    provider_switched = True
-                    owner._session_map.clear_sid(key)
-
-            if resume_sid:
-                if self._deps.is_acp_provider(provider):
-                    cast(Any, provider).client.set_resume_session_id(resume_sid)
-                    self._deps.logger.info(
-                        "Attempting session/load for %s (sid=%s)", key, resume_sid
-                    )
-                elif self._deps.is_claude_provider(provider):
-                    cast(Any, provider).set_resume_session_id(resume_sid)
-                    self._deps.logger.info("CC resume for %s (sid=%s)", key, resume_sid)
-            async with self._start_sem:
-                try:
-                    if preparation.revision:
-                        from kiro_crew.session_capabilities import (
-                            CapabilityStartupError,
-                            verify_saved,
-                        )
-
-                        if provider.member_capabilities_supported is not True:
-                            raise CapabilityStartupError("capability_harness_unsupported")
-                        if provider.process_instance:
-                            raise CapabilityStartupError("capability_runtime_not_fresh")
-                        await asyncio.to_thread(verify_saved, preparation, provider.cwd)
-                    await provider.start()
-                except (asyncio.CancelledError, Exception):
-                    if preparation.revision:
-                        self._remember_capability_failure(key, preparation)
-                    owner._dispatch_hard_kill(provider)
-                    raise
-
-        # start() has published the PID, but registry ownership is not visible
-        # until the lock section below. Shield this narrow orphan-sweep window.
-        starting_pid = getattr(getattr(provider, "client", None), "_pid", None)
-        if not isinstance(starting_pid, int):
-            process = getattr(provider, "_proc", None)
-            starting_pid = (
-                process.pid if process is not None and process.returncode is None else None
-            )
-        if not isinstance(starting_pid, int):
-            starting_pid = None
-        if starting_pid is not None:
-            self._starting_pids.add(starting_pid)
-
-        won_race_session: Any | None = None
-        duplicate_provider: LLMProvider | None = None
-        try:
-            stamp = None
-            if preparation.revision:
-                from kiro_crew.session_capabilities import loaded_stamp, verify_saved
-
-                observed = loaded_stamp(provider, preparation)
-                await asyncio.to_thread(verify_saved, preparation, provider.cwd)
-                stamp = loaded_stamp(provider, preparation)
-                if stamp != observed:
-                    raise RuntimeError("capability_process_changed_during_verification")
-            resumed = False
-            if self._deps.is_acp_provider(provider):
-                resumed = cast(Any, provider).client.resumed
-            if speculative and speculative_resume and not resumed:
-                raise SpeculativeResumeRefused(key)
-
-            async with self._lock:
-                # start() can span the complete close_all snapshot, so closing
-                # must be checked a second time immediately before registration.
-                if self._closing:
-                    raise SessionClosingError(
-                        "SessionManager began closing during provider startup; "
-                        "refusing to register a session behind the shutdown snapshot"
-                    )
-
-                existing = self._sessions.get(key)
-                recycling = existing is not None and owner._recycling.get(key) is existing
-                if existing is not None and not recycling:
-                    session = existing
-                    session.last_used = time.monotonic()
-                    if approval_policy:
-                        session.approval_policy = approval_policy
-                    if session_agent and not preparation.revision:
-                        session.agent = session_agent
-                    won_race_session = session
-                    duplicate_provider = provider
-                else:
-                    if not speculative:
-                        first_turn = self._deps.first_turn_nothing_armed
-                    elif resumed:
-                        first_turn = self._deps.first_turn_resumed
-                    else:
-                        first_turn = self._deps.first_turn_fresh
-                    session = self._deps.session_factory(
-                        provider=provider,
-                        first_turn=first_turn,
-                        approval_policy=approval_policy,
-                        agent=session_agent or "",
-                    )
-                    session.capability_member = preparation.member
-                    # The id the provider above was constructed with, kept
-                    # readable for the allocation's caller. ``model`` is resolved
-                    # from config when the caller passed none, and that resolution
-                    # is invisible in this call's return value, so a caller
-                    # recording the session's selection has no other source for it.
-                    # Stamped from the same local rather than re-resolved, which is
-                    # what keeps the id sent and the id read identical.
-                    session.requested_model = model or ""
-                    session.loaded_capabilities = stamp
-                    self.state.capability_failures.pop(key, None)
-                    replay_needed = getattr(provider, "_history_replay_needed", False) is True
-                    provider_label = self._deps.provider_label(provider)
-                    defer_sid_promotion = (
-                        replay_needed
-                        and provider.defer_replay_sid_promotion is True
-                        and provider_label == constants.provider_label_default
-                    )
-                    if provider_switched or replay_needed:
-                        session.provider_switch_replay = True
-                    if replay_needed and provider_label != constants.provider_label_default:
-                        owner._session_map.clear_sid(key)
-                    self._sessions[key] = session
-                    self.advance_ownership_generation(key)
-                    try:
-                        await record_session_started(key)
-                    except BaseException:
-                        # See open_task_session: a cancellation here would leave a
-                        # registered session whose provider the caller is about to
-                        # kill, plus a crumb the next boot reads as a crash.
-                        if self._sessions.get(key) is session:
-                            del self._sessions[key]
-                            self.advance_ownership_generation(key)
-                        await discard_session_start(key)
-                        raise
-                    self._deps.logger.info(
-                        "New session: %s agent=%s resumed=%s provider_switch=%s (total=%d)",
-                        key,
-                        agent or "kirocrew",
-                        resumed,
-                        provider_switched,
-                        len(self._sessions),
-                    )
-
-                    provider_cwd = provider.cwd
-                    if not is_stateless and self._deps.is_acp_provider(provider):
-                        sid = cast(Any, provider).client._session_id
-                        if sid and not defer_sid_promotion:
-                            owner._session_map.set(
-                                key,
-                                sid,
-                                provider=provider_label,
-                                cwd=provider_cwd,
-                            )
-                        elif sid:
-                            self._deps.logger.info(
-                                "Deferring fresh SID promotion for replay-pending "
-                                "session %s; prior resumable SID stays durable",
-                                key,
-                            )
-                    elif not is_stateless and self._deps.is_claude_provider(provider):
-                        sid = provider.session_id
-                        if sid:
-                            owner._session_map.set(
-                                key,
-                                sid,
-                                provider=constants.provider_label_claude,
-                                cwd=provider_cwd,
-                            )
-
-                    # Cleanup owns its task slot; allocation only asks the
-                    # facade to ensure it at the original registration point.
-                    owner._ensure_cleanup_task()
-                    # Fresh semaphore acquisition is synchronous and cannot
-                    # wait, so doing it under _lock does not invert lock order.
-                    await session.semaphore.acquire()
-                    session.turn_owner = asyncio.current_task()
-                    self._deps.inc_session_created()
-                    result = (provider, True, resumed)
-        except BaseException:
-            if preparation.revision:
-                self._remember_capability_failure(key, preparation)
-            owner._dispatch_hard_kill(provider)
-            raise
-        finally:
-            if starting_pid is not None:
-                self._starting_pids.discard(starting_pid)
-
-        if won_race_session is not None:
-            if duplicate_provider is not None:
-                try:
-                    await duplicate_provider.shutdown()
-                except Exception:
-                    self._deps.logger.warning(
-                        "Failed to shut down duplicate provider for %s",
-                        key,
-                        exc_info=True,
-                    )
-            if await owner._reacquire_and_validate(
-                key,
-                won_race_session,
-                wait_if_busy=wait_if_busy,
-            ):
-                first_turn = won_race_session.first_turn
-                if not speculative:
-                    won_race_session.first_turn = self._deps.first_turn_nothing_armed
-                return (
-                    won_race_session.provider,
-                    first_turn.is_new,
-                    first_turn.resumed,
-                )
-            maximum = constants.won_race_max_retries
-            if _won_race_retries >= maximum:
-                raise RuntimeError(
-                    f"get_or_create({key!r}) exceeded {maximum} won-race retries — "
-                    "session kept going stale between acquire and re-validate"
-                )
-            return await owner.get_or_create(
-                key,
-                agent=session_agent,
-                channel_id=channel_id,
-                approval_policy=approval_policy,
-                model=model,
-                cwd=cwd,
-                extra_env=extra_env,
-                speculative=speculative,
-                speculative_resume=speculative_resume,
-                wait_if_busy=wait_if_busy,
-                _won_race_retries=_won_race_retries + 1,
-                **extra_factory_kwargs,
-            )
-
-        return result
+# The owner modules above hold code that was this module's own: the
+# ``SessionAllocationService`` members the class binds, the refusals and the two
+# companion-posture helpers. Every project name this module bound before the owners
+# existed still resolves here. The ones this module's own code reads it still binds; the
+# ones only the owners' code reads now (``_SERVED_NAMES``) it serves from the first owner
+# binding them. Either way ``_facade_mirror`` sends a write or delete of the name to every
+# owner binding the same object, so a patch of ``kiro_crew.session_allocation.<name>``
+# reaches the moved code that reads it, as it reached the one module before. The
+# surface is this module's own namespace plus those names, so an owner's own function
+# is never served here. ``test/test_session_allocation_bindings.py`` pins the reach.
+#: The allocation owner modules, lowest layer first.
+_ALLOCATION_OWNERS: tuple[str, ...] = (
+    "kiro_crew.session_allocation_parts.errors",
+    "kiro_crew.session_allocation_parts.companions",
+    "kiro_crew.session_allocation_parts.get_or_create",
+)
+#: Project names this module bound before the owners existed that only the owners read.
+_SERVED_NAMES: frozenset[str] = frozenset(
+    {
+        "AWS_PROFILE_ENV",
+        "END_REASON_EVICTED",
+        "START_QUEUE_COLD_START",
+        "START_QUEUE_COMPANION",
+        "START_QUEUE_LOG_MIN_MS",
+        "SessionBusyError",
+        "SpeculativeResumeRefused",
+        "_collect_parent_runtime_kwargs",
+        "acquire_session_lease",
+        "bound_profile_env",
+        "bounded_session_id",
+        "notify_start_queue",
+        "parent_work_scratch_dir",
+        "pre_spawn_identity",
+        "record_session_ended",
+        "release_session_lease",
+        "spawn_pid",
+        "stamp_spawn_identity",
+    }
+)
+# Every owner is loaded before the mirror indexes the family; ``install`` refuses one that
+# is not, since an owner imported later would be missing from the index for good.
+for _owner in _ALLOCATION_OWNERS:
+    _importlib.import_module(_owner)
+#: Name this module serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_MIRROR = _facade_mirror.install(
+    _sys.modules[__name__],
+    _ALLOCATION_OWNERS,
+    excluded=(),
+    surface=frozenset(globals()) | _SERVED_NAMES,
+)
+_EXPORTS.update(_MIRROR.served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: the unsplit module's public names, less the standard-library
+#: and typing imports only the owners read now.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+if TYPE_CHECKING:  # the names in _SERVED_NAMES, for type checkers and IDEs
+    from kiro_crew.aws_project_profiles import AWS_PROFILE_ENV, bound_profile_env  # noqa: F401
+    from kiro_crew.kiro_prerequisite import (  # noqa: F401
+        pre_spawn_identity,
+        spawn_pid,
+        stamp_spawn_identity,
+    )
+    from kiro_crew.metrics.sessions import END_REASON_EVICTED, record_session_ended  # noqa: F401
+    from kiro_crew.runtime_ownership import (  # noqa: F401
+        acquire_session_lease,
+        release_session_lease,
+    )
+    from kiro_crew.session_allocation_parts.companions import (  # noqa: F401
+        _collect_parent_runtime_kwargs,
+        parent_work_scratch_dir,
+    )
+    from kiro_crew.session_allocation_parts.errors import (  # noqa: F401
+        SessionBusyError,
+        SpeculativeResumeRefused,
+    )
+    from kiro_crew.start_priority import (  # noqa: F401
+        START_QUEUE_COLD_START,
+        START_QUEUE_COMPANION,
+        START_QUEUE_LOG_MIN_MS,
+        notify_start_queue,
+    )
+    from kiro_crew.validation import bounded_session_id  # noqa: F401

@@ -12,25 +12,28 @@ import pytest
 from kiro_crew.dashboard.handlers.messaging import (
     _validated_command_identity,
     api_spawn,
-    api_spawn_command_lookup,
     api_spawn_delete,
     api_spawn_steer,
 )
 from kiro_crew.subagent_command_authority import CommandIdentity
 
 
-class _Request:
+class _Request(dict):
     def __init__(self, subagents: object, body: dict[str, object], *, agent_id: str = "") -> None:
-        self.app = {"state": SimpleNamespace(subagents=subagents, conversation_log=None)}
+        super().__init__(
+            app={"state": SimpleNamespace(subagents=subagents, conversation_log=None)},
+            internal_auth=True,
+        )
         self._body = body
         self.match_info = {"agent_id": agent_id}
+        self.headers = {}
+
+    @property
+    def app(self) -> dict[str, object]:
+        return self["app"]
 
     async def json(self) -> dict[str, object]:
         return self._body
-
-    def get(self, key: str, default: object = None) -> object:
-        # aiohttp's Request is a MutableMapping; the handlers read request['app'].
-        return default
 
 
 def _response_json(response: object) -> dict[str, object]:
@@ -110,8 +113,20 @@ async def test_keyed_spawn_uses_authority_and_never_calls_legacy_spawn() -> None
 
 
 @pytest.mark.asyncio
+async def test_keyed_spawn_fails_closed_when_authority_is_retired() -> None:
+    manager = SimpleNamespace(command_authority=None)
+    body = _identified("spawn", {"task": "work", "run_id": "c" * 8})
+
+    response = await api_spawn(_Request(manager, body))  # type: ignore[arg-type]
+
+    assert response.status == 503
+    assert _response_json(response)["code"] == "coordinator_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_keyed_steer_uses_authority_and_returns_identifiers() -> None:
     manager = MagicMock()
+    manager.steer_run = AsyncMock(return_value=(True, "ok"))
     manager.command_authority.steer = AsyncMock(return_value=(True, "ok"))
     body = _identified("steer", {"message": "correct it", "mode": "interrupt"})
 
@@ -126,25 +141,10 @@ async def test_keyed_steer_uses_authority_and_returns_identifiers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_command_lookup_returns_durable_response_without_manager_effect() -> None:
-    manager = MagicMock()
-    manager.command_authority.lookup_response = AsyncMock(
-        return_value={"found": True, "id": "c" * 8, "status": "spawned"}
-    )
-    request = _Request(manager, {})
-    request.match_info = {"idempotency_key": "b" * 32}
-
-    response = await api_spawn_command_lookup(request)  # type: ignore[arg-type]
-
-    assert response.status == 200
-    assert _response_json(response)["found"] is True
-    manager.command_authority.lookup_response.assert_awaited_once_with("b" * 32)
-
-
-@pytest.mark.asyncio
 async def test_keyed_cancel_uses_authority_for_unregistered_target() -> None:
     manager = MagicMock()
     manager._agents = {}
+    manager.cancel = AsyncMock(return_value=True)
     manager.command_authority.cancel = AsyncMock(return_value=True)
     body = _identified("cancel", {})
 

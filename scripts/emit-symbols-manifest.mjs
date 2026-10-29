@@ -51,8 +51,10 @@
 // Usage:
 //   node scripts/emit-symbols-manifest.mjs [outputPath]
 //
-// Honors the same UNIVERSAL env var as packaging/build-desktop.sh, so a
-// `UNIVERSAL=0` macOS build records the one arch it actually produced.
+// Honors the same UNIVERSAL and TARGET_ARCH env vars as
+// packaging/build-desktop.sh, so a `UNIVERSAL=0` macOS build records the one
+// arch it actually produced -- the NAMED one when TARGET_ARCH is set, which
+// on an Apple-Silicon runner building x86_64 is not process.arch.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -69,11 +71,19 @@ function readJson(file) {
 /**
  * The arches this build produced, mirroring build-desktop.sh's own rule:
  * macOS packages one universal app (arm64 + x86_64 lipo-merged) unless
- * UNIVERSAL=0; every other platform builds the host arch only.
+ * UNIVERSAL=0; a UNIVERSAL=0 macOS build with TARGET_ARCH names its one arch
+ * (uname spelling, mapped to Electron's); every other build is the host arch.
  */
+const TARGET_ARCH_TO_ELECTRON = { arm64: "arm64", x86_64: "x64" };
+
 function builtArches(platform = process.platform, env = process.env) {
   const universal = env.UNIVERSAL ?? (platform === "darwin" ? "1" : "0");
   if (platform === "darwin" && universal === "1") return ["arm64", "x64"];
+  if (platform === "darwin" && env.TARGET_ARCH) {
+    const named = TARGET_ARCH_TO_ELECTRON[env.TARGET_ARCH];
+    if (!named) throw new Error(`TARGET_ARCH must be arm64 or x86_64, got '${env.TARGET_ARCH}'`);
+    return [named];
+  }
   return [process.arch === "arm" ? "armv7l" : process.arch];
 }
 

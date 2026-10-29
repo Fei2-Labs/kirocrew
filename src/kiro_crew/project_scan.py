@@ -59,8 +59,10 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, cast
 import pathspec
 import yaml  # type: ignore[import-untyped]
 
+from kiro_crew import platform_compat
 from kiro_crew.hooks import safe_read_file_bytes_nolink
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.yaml_safe import NoAliasSafeLoader
 
 if sys.platform == "win32":
     import _winapi
@@ -292,24 +294,13 @@ def _npm_workspaces(text: str) -> list[str]:
     return _string_list(declared, where="workspaces")
 
 
-class _NoAliasLoader(yaml.SafeLoader):
-    """SafeLoader that refuses YAML aliases.
+class _NoAliasLoader(NoAliasSafeLoader):
+    """The ``pnpm-workspace.yaml`` loader.
 
-    ``safe_load`` expands ``*alias`` references, so a small file can compose a
-    graph orders of magnitude larger than itself. A scan reads whatever
-    ``pnpm-workspace.yaml`` it finds in a tree the user merely pointed at, and no
-    real member list needs an alias, so the amplification vector is closed
-    outright instead of bounded. A lone anchor with nothing referencing it is
-    harmless and stays allowed.
+    A scan reads whatever declaration it finds in a tree the user merely pointed
+    at, and no real member list needs an alias, so the amplification vector is
+    closed outright instead of bounded.
     """
-
-    def compose_node(self, parent: object, index: object) -> object:
-        if self.check_event(yaml.events.AliasEvent):
-            event = self.get_event()
-            raise yaml.composer.ComposerError(
-                None, None, "found alias, which is not allowed", event.start_mark
-            )
-        return super().compose_node(parent, index)
 
 
 def _load_no_alias_yaml(text: str) -> object:
@@ -1003,12 +994,6 @@ class _Frame:
     identity: _DirId | None = None
 
 
-# The name-surrogate bit of a Windows reparse tag (``IsReparseTagNameSurrogate``
-# in the Windows SDK): set on every reparse kind whose NAME resolves somewhere
-# else — symlinks and mount points (junctions) today, and whatever redirecting
-# kind ships next — and clear on the kinds that decorate a real local directory
-# in place (cloud placeholders, WCI, dedup), which must keep scanning.
-_REPARSE_NAME_SURROGATE = 0x2000_0000
 # ``stat.FILE_ATTRIBUTE_REPARSE_POINT`` exists at runtime on every platform but
 # typeshed declares it Windows-only, so the value is pinned here — the same
 # treatment ``platform_compat`` gives it.
@@ -1042,7 +1027,7 @@ def _entry_redirects(entry: os.DirEntry[str]) -> bool:
         return False
     if not getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
         return False
-    return bool(getattr(info, "st_reparse_tag", 0) & _REPARSE_NAME_SURROGATE)
+    return platform_compat.lstat_is_name_surrogate(info)
 
 
 def _entry_identity(entry: os.DirEntry[str]) -> _DirId | None:

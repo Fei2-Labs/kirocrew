@@ -150,6 +150,11 @@ def _inject(state, job, result_text, **kw):
         "history",
         state.conversation_log.read_messages(f"cron:{job.id}") if state.conversation_log else [],
     )
+    # Production's async caller prefetches the transcript's dismissed set
+    # off-loop and passes it in; the fallback binds only when it was READABLE.
+    # These synchronous tests mirror that with a readable (empty) set so the
+    # bind/hydrate/deliver path runs (an absent value would defer the bind).
+    kw.setdefault("dismissed", [])
     inject_cron_result_to_dashboard(state, job, result_text, **kw)
 
 
@@ -1139,7 +1144,7 @@ class TestPersistsResultToConversationLog:
         # unlocked read_messages probe at the inject layer. The inject path must
         # delegate to append_if_absent and not do its own log-persist.
         # (append_if_absent's own skip-on-duplicate behavior is covered by
-        # test_history_locking_remediation::TestAppendIfAbsent.)
+        # test_history_locking_remediation_locked_section::TestAppendIfAbsent.)
         state = _make_state()
         job = _make_job(job_id="job2", name="my-cron")
         _inject(state, job, "the result")

@@ -11,7 +11,15 @@ from __future__ import annotations
 
 from aiohttp import web
 
-from kiro_crew.dashboard import chat, handlers, session_export, session_transfer
+from kiro_crew.dashboard import (
+    chat,
+    chat_follow_default,
+    chat_threads,
+    handlers,
+    session_export,
+    session_transfer,
+)
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.dashboard.handlers.source_providers import (
     api_app_contributors,
     api_issue_source,
@@ -28,6 +36,30 @@ from kiro_crew.dashboard.handlers.source_providers import (
     api_pull_request_unresolve,
 )
 from kiro_crew.dashboard.handlers.worktree import api_worktree_create
+from kiro_crew.dashboard.slot_ownership import slot_not_found
+
+
+async def api_dashboard_card(request: web.Request) -> web.Response:
+    """Owner-only read; registering this route never loads the optional producer."""
+    denied = await require_owner_dashboard_request(request, "dashboard.card.read")
+    if denied is not None:
+        return denied
+    state = request.app["state"]
+    slot = state._slots.get(request.match_info["slot"])
+    if slot is None:
+        return slot_not_found()
+    lifecycle = getattr(state, "_dynamic_cards", None)
+    if lifecycle is None:
+        return web.json_response(
+            {
+                "card": None,
+                "status": "disabled",
+                "published_at": None,
+                "content_event_at": None,
+                "stale": False,
+            }
+        )
+    return web.json_response(await lifecycle.read(slot))
 
 
 def register(app: web.Application) -> None:
@@ -52,6 +84,18 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/handoff", chat.api_chat_handoff)
     app.router.add_post("/api/chat/slots/cleanup", chat.api_chat_slots_cleanup)
     app.router.add_post("/api/chat/slots/model", chat.api_chat_slots_model)
+    # Settings > Chat > Models: count, then clear, the chats that keep a model of
+    # their own. Static segment, so it sits before the ``{slot}`` routes below.
+    app.router.add_get(
+        "/api/chat/slots/follow-default", chat_follow_default.api_chat_slots_follow_default
+    )
+    app.router.add_post(
+        "/api/chat/slots/follow-default", chat_follow_default.api_chat_slots_follow_default
+    )
+    # Static segment BEFORE the ``/api/chat/slots/{slot}`` GET below, for the reason
+    # the import route's own note gives: aiohttp resolves in registration order, so a
+    # later wildcard would shadow this path and answer it as a slot detail read.
+    app.router.add_get("/api/chat/slots/unrestored", chat.api_chat_slots_unrestored)
     # Static segment BEFORE the {slot} routes below, matching the cleanup/model
     # precedent: aiohttp resolves in registration order, so a later
     # ``/api/chat/slots/{slot}`` POST would otherwise shadow this path.
@@ -62,10 +106,17 @@ def register(app: web.Application) -> None:
     # the tunnel's send, so it is not a pure read of the disk.
     app.router.add_get("/api/chat/slots/{slot}/export", session_export.api_chat_slot_export)
     app.router.add_get("/api/chat/slots/{slot}/summary", chat.api_chat_slot_summary)
+    app.router.add_get("/api/chat/slots/{slot}/dashboard-card", api_dashboard_card)
     # Same path, POST: reading a summary must stay free of side effects, so
     # generating one is a separate verb rather than a query flag on the GET.
     app.router.add_post("/api/chat/slots/{slot}/summary", chat.api_chat_slot_summary_generate)
     app.router.add_get("/api/chat/slots/{slot}/source-links", chat.api_chat_slot_source_links)
+    # DELETE one chip: registered before the {slot} DELETE below so the more
+    # specific path wins aiohttp's registration-order resolution.
+    app.router.add_delete(
+        "/api/chat/slots/{slot}/source-links/{identity}",
+        chat.api_chat_slot_source_link_unlink,
+    )
     app.router.add_post("/api/chat/slots/{slot}/stop", chat.api_chat_slot_stop)
     app.router.add_post("/api/chat/slots/{slot}/interrupt", chat.api_chat_slot_interrupt)
     app.router.add_post("/api/chat/slots/{slot}/end-wait", chat.api_chat_slot_end_wait)
@@ -88,8 +139,14 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/slots/{slot}/model", chat.api_chat_slot_model)
     app.router.add_get("/api/chat/slots/{slot}/autocompact", chat.api_chat_slot_autocompact)
     app.router.add_post("/api/chat/slots/{slot}/autocompact", chat.api_chat_slot_autocompact)
+    app.router.add_get("/api/chat/slots/{slot}/turn-timeout", chat.api_chat_slot_turn_timeout)
+    app.router.add_post("/api/chat/slots/{slot}/turn-timeout", chat.api_chat_slot_turn_timeout)
     app.router.add_post(
         "/api/chat/slots/{slot}/reasoning-effort", chat.api_chat_slot_reasoning_effort
+    )
+    app.router.add_get(
+        "/api/chat/slots/{slot}/selection-capabilities",
+        chat.api_chat_slot_selection_capabilities,
     )
     app.router.add_post("/api/chat/slots/{slot}/workspace", chat.api_chat_slot_workspace)
     app.router.add_post("/api/chat/slots/{slot}/reload", chat.api_chat_slot_reload)
@@ -98,14 +155,29 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/chat/slots/{slot}/followup", chat.api_chat_slot_followup)
     app.router.add_post("/api/worktree/create", api_worktree_create)
     app.router.add_get("/api/recent-projects", chat.api_recent_projects)
+    # Favourited project directories: the picker's third tab. Separate persistence from
+    # the recents list above (see _favorite_projects_path), so the three verbs are their
+    # own handlers rather than a flag on the recents read.
+    app.router.add_get("/api/favorite-projects", chat.api_favorite_projects)
+    app.router.add_post("/api/favorite-projects", chat.api_favorite_project_add)
+    app.router.add_delete("/api/favorite-projects", chat.api_favorite_project_remove)
     app.router.add_patch("/api/chat/slots/{slot}/color", chat.api_chat_slot_color)
     # Context injection (App Kit — silent background context)
     app.router.add_post("/api/chat/slots/{slot}/context", chat.api_chat_slot_context)
     # Note — visible transcript line + silent next-turn context, no LLM turn
     app.router.add_post("/api/chat/slots/{slot}/note", chat.api_chat_slot_note)
     app.router.add_post("/api/chat/slots/{slot}/fork", chat.api_chat_slot_fork)
+    # Reply threads on a crewmate chat message. The literal ``/threads`` summary
+    # is registered before the ``{mid}`` pattern that would otherwise capture
+    # "threads" as an id, per this module's ordering rule.
+    app.router.add_get("/api/chat/threads", chat_threads.api_chat_threads_summary)
+    app.router.add_get("/api/chat/threads/{mid}", chat_threads.api_chat_thread_detail)
+    app.router.add_post("/api/chat/threads/{mid}/reply", chat_threads.api_chat_thread_reply)
+    app.router.add_get("/api/chat/side/tools", handlers.api_side_tools)
+    app.router.add_get("/api/chat/slots/{slot}/side", handlers.api_side_state)
     app.router.add_post("/api/chat/slots/{slot}/side/open", handlers.api_side_open)
     app.router.add_post("/api/chat/slots/{slot}/side/turn", handlers.api_side_turn)
+    app.router.add_post("/api/chat/slots/{slot}/side/stop", handlers.api_side_stop)
     app.router.add_post("/api/chat/slots/{slot}/side/close", handlers.api_side_close)
     app.router.add_delete(
         "/api/chat/slots/{slot}/side/queue/{queue_id}",

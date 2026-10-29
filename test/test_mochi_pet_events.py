@@ -18,9 +18,23 @@ from typing import Any
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.backend import routes
+
+
+def _owner_request(*args, **kwargs):
+    """A mocked request that reads as the dashboard owner.
+
+    The mutating routes are owner-gated, and the gate reads
+    ``request.app["state"]`` plus the claims the token middleware sets.
+    """
+    req = make_mocked_request(*args, **kwargs)
+    req.app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
+    return req
 
 
 class _Ctx:
@@ -44,10 +58,8 @@ async def _live_runtime(tmp_path):
     """Start the runtime inside the test's own loop, stop it on exit.
 
     An async CONTEXT MANAGER rather than an ``@pytest_asyncio.fixture``: the
-    suite pins pytest-asyncio 0.20.3, whose async-fixture wrapper reads the
-    ``fixturedef.unittest`` attribute pytest 8.1 removed — on CI every
-    async-generator fixture errors at setup. The repo avoids the decorator by
-    convention (see test_denied_commands_api.py's module docstring).
+    suite's convention for teardown that must await on the test's own loop
+    (see test_denied_commands_api.py's module docstring).
     """
     await hooks.on_startup(_Ctx(tmp_path))
     try:
@@ -57,7 +69,7 @@ async def _live_runtime(tmp_path):
 
 
 def _post(body: dict | None):
-    req = make_mocked_request(
+    req = _owner_request(
         "POST", "/api/apps/mochi/pet-event", headers={"Content-Type": "application/json"}
     )
 
@@ -315,6 +327,42 @@ class TestChatPushConversationGate:
             pushed = self._pushes(seen)
             assert len(pushed) == 1
             assert pushed[0]["content"] == "Good evening! All quiet 🌙"
+
+    @pytest.mark.asyncio
+    async def test_delivery_uncertain_releases_without_flushing(self, tmp_path, monkeypatch):
+        """A transport rejection reports `delivery_uncertain` — a NON-terminal
+        signal. It must NOT flush, and (GPT/Opus F1) it must NOT clear the
+        interleave latch: the turn may still be running over a surviving socket,
+        so clearing the latch would let the drain order an ambient push ahead of
+        that live reply once the 8s grace passes. The latch stays ACTIVE and is
+        released only by a real terminal event or the `_CHAT_TURN_MAX_MS`
+        ceiling, which then lets the drain DELIVER (not discard) the backlog."""
+        async with _live_runtime(tmp_path) as runtime:
+            seen: list[tuple[str, dict]] = []
+            runtime.publish = lambda ch, data: seen.append((ch, data))  # type: ignore[assignment]
+            clock = {"now": 1_000_000}
+            monkeypatch.setattr(hooks, "_now_ms", lambda: clock["now"])
+            runtime.note_chat_lifecycle("user_input", clock["now"])
+            runtime.notify_user({"summary": "Good evening! All quiet 🌙", "pushToChat": True})
+            assert self._pushes(seen) == []
+            # Transport rejection: no flush, and the latch stays SET so the gate
+            # keeps protecting a possibly-live reply.
+            runtime.note_chat_lifecycle("delivery_uncertain", clock["now"])
+            assert runtime._chat_turn_active is True
+            assert self._pushes(seen) == []
+            # Past the 8s grace the gate STILL holds (unlike a cleared latch),
+            # because the latch is active and the ceiling has not elapsed.
+            clock["now"] += runtime._CHAT_ACTIVE_GRACE_MS + 1
+            runtime._drain_deferred_chat_pushes(clock["now"])
+            assert self._pushes(seen) == []
+            # Only once the _CHAT_TURN_MAX_MS ceiling ages the flag out does the
+            # drain deliver the backlog — exactly once, and never discarded.
+            clock["now"] += runtime._CHAT_TURN_MAX_MS + 1
+            runtime._drain_deferred_chat_pushes(clock["now"])
+            pushed = self._pushes(seen)
+            assert len(pushed) == 1
+            assert pushed[0]["content"] == "Good evening! All quiet 🌙"
+            assert runtime._chat_turn_active is False
 
     @pytest.mark.asyncio
     async def test_grace_window_defers_then_delivers_after_expiry(self, tmp_path, monkeypatch):

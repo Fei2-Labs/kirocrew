@@ -1,11 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { PREVIEW_ARTIFACT_DEPLOY } from '../utils/previewFlags'
 import { screen, waitFor, fireEvent, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ComponentType } from 'react'
 import ArtifactsPage from '../pages/ArtifactsPage'
-import { renderWithProviders } from './helpers'
+import { renderWithProviders, createTestStore } from './helpers'
+import { sseConnected } from '../store/dashboardSlice'
+
+/** The row's star and delete are gateway-gated, so this fixture connects. */
+function connectedStore() {
+  const s = createTestStore()
+  s.dispatch(sseConnected())
+  return s
+}
 import { api } from '../api/client'
 import type { Artifact } from '../types'
+import { __resetPathKindCache } from '../hooks/usePathKind'
+import { stubPathKinds } from './pathKindStub'
 
 // The thumbnail frame mints a gateway document instead of building a blob. The
 // automock resolves every api method to `undefined`, which it cannot await.
@@ -15,6 +26,14 @@ beforeEach(() => {
 
 
 vi.mock('../api/client')
+
+// `directLocal` gates the session-document path's open-in-editor launch; every
+// other test runs with the context default (false).
+const brandingEnv = vi.hoisted(() => ({ directLocal: false }))
+vi.mock('../hooks/useBranding', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../hooks/useBranding')>()),
+  useBranding: () => ({ botName: 'Kiro Crew', avatar: '/logo.png', directLocal: brandingEnv.directLocal }),
+}))
 
 // VirtuosoMasonry virtualizes against real layout, which jsdom lacks, so it
 // renders zero items in tests. Mock it to a plain map through ItemContent so
@@ -245,7 +264,7 @@ describe('ArtifactsPage', () => {
     vi.mocked(api).artifacts = vi.fn().mockResolvedValue({
       artifacts: [mkArtifact('cr-queue', { pinned: true })],
     })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('cr queue')).toBeInTheDocument())
     const starBtn = screen.getByLabelText('Remove star from artifact')
     expect(starBtn).toBeInTheDocument()
@@ -323,10 +342,43 @@ describe('ArtifactsPage', () => {
     vi.mocked(api).artifactSessionDocs = vi.fn().mockResolvedValue({
       docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
     })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
     expect(screen.getByText(/From your chats/i)).toBeInTheDocument()
     expect(screen.getByLabelText('Star document')).toBeInTheDocument()
+  })
+
+  it('opens a session document path from the gallery in the editor without opening the preview', async () => {
+    const open = vi.fn().mockResolvedValue({ ok: true })
+    ;(window as { fileOpenAPI?: unknown }).fileOpenAPI = { open }
+    brandingEnv.directLocal = true
+    const realFetch = globalThis.fetch
+    __resetPathKindCache()
+    stubPathKinds(() => 'file')
+    try {
+      vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
+      vi.mocked(api).artifactSessionDocs = vi.fn().mockResolvedValue({
+        docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
+      })
+      renderWithProviders(<ArtifactsPage />)
+      // Chained wait: the session-docs query resolves, the row mounts, its path
+      // is sent in the /api/file-kinds batch, and the probe's reply turns the
+      // path into a button.
+      const pathButton = await screen.findByRole(
+        'button', { name: 'Open /ws/research/FINDINGS.md in editor' }, { timeout: 5000 },
+      )
+      fireEvent.click(pathButton)
+      await waitFor(() => expect(open).toHaveBeenCalledWith('/ws/research/FINDINGS.md'), { timeout: 5000 })
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      // The rest of the row keeps its own gesture: it opens the preview, a
+      // modal mounted from the row click's state update.
+      fireEvent.click(screen.getByText('FINDINGS.md'))
+      expect(await screen.findByRole('dialog', {}, { timeout: 5000 })).toBeInTheDocument()
+    } finally {
+      delete (window as { fileOpenAPI?: unknown }).fileOpenAPI
+      brandingEnv.directLocal = false
+      globalThis.fetch = realFetch
+    }
   })
 
   it('shows session documents in the gallery even when the library is empty', async () => {
@@ -423,7 +475,7 @@ describe('ArtifactsPage', () => {
     })
     const materializeSpy = vi.fn().mockResolvedValue({})
     vi.mocked(api).materializeArtifact = materializeSpy
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
     await user.click(screen.getByLabelText('Star document'))
@@ -436,12 +488,25 @@ describe('ArtifactsPage', () => {
   // a read-only preview (via the redacting /api/file-read), so the user can
   // read a document before deciding to keep it.
   describe('session-doc preview', () => {
+    // Carries `headers` because the shared read asks for the backend's binary
+    // verdict (`X-File-Binary`): a double without them models a response no
+    // gateway sends, and would hide exactly the field the entry must store.
     const stubFileRead = (text: string) =>
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
         ok: true,
         status: 200,
         statusText: 'OK',
+        headers: { get: () => null },
         text: () => Promise.resolve(text),
+      }))
+    /** The envelope /api/file-read answers for bytes it could not decode. */
+    const stubBinaryFileRead = () =>
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: { get: (h: string) => (h === 'X-File-Binary' ? 'true' : null) },
+        text: () => Promise.resolve('{"binary": true, "content": ""}'),
       }))
     afterEach(() => vi.unstubAllGlobals())
 
@@ -459,9 +524,13 @@ describe('ArtifactsPage', () => {
 
       await user.click(screen.getByText('FINDINGS.md'))
       const dialog = await screen.findByRole('dialog')
-      // Content comes from the same redacting file-read the chat panel uses.
+      // Content comes from the same redacting file-read the chat panel uses,
+      // through the shared helper -- which forwards React Query's AbortSignal,
+      // so a preview closed mid-read cancels its request instead of landing in
+      // the cache after the modal is gone.
       expect(globalThis.fetch).toHaveBeenCalledWith(
         '/api/file-read?path=' + encodeURIComponent('/ws/research/FINDINGS.md'),
+        expect.objectContaining({ signal: expect.anything() }),
       )
       await waitFor(() => expect(within(dialog).getByText('Findings headline')).toBeInTheDocument())
 
@@ -486,7 +555,7 @@ describe('ArtifactsPage', () => {
       })
       vi.mocked(api).materializeArtifact = vi.fn().mockResolvedValue({})
       stubFileRead('# Findings headline')
-      renderWithProviders(<ArtifactsPage />)
+      renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
       await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
       // The star sits inside the clickable row: saving must not ALSO open the
@@ -497,10 +566,10 @@ describe('ArtifactsPage', () => {
     })
 
     // The preview shares `['file-read', path]` with the chat side panel, whose
-    // cold-tab hydration reads `{ text, ok, status }` from the same entry
-    // within staleTime. A divergent shape here (say `{ text, missing }`) would
-    // poison that consumer: preview a doc, open it in chat within 10s, and the
-    // panel sees an entry with `ok`/`status` undefined.
+    // cold-tab hydration and chip click read the WHOLE entry from it within
+    // staleTime. The shape is the helper's, not this surface's: `binary` is
+    // what decides whether that tab offers an editor, so an entry missing it
+    // opens an editable buffer over bytes a save would corrupt.
     it('populates the shared file-read cache with the chat panel contract shape', async () => {
       const user = userEvent.setup()
       vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
@@ -516,7 +585,56 @@ describe('ArtifactsPage', () => {
       const dialog = await screen.findByRole('dialog')
       await waitFor(() => expect(within(dialog).getByText('Findings headline')).toBeInTheDocument())
       expect(queryClient.getQueryData(['file-read', '/ws/research/FINDINGS.md']))
-        .toEqual({ text: '# Findings headline', ok: true, status: 200 })
+        .toEqual({ text: '# Findings headline', ok: true, status: 200, binary: false, truncated: false, redacted: false, lossy: false })
+    })
+
+    // A session doc is a .md/.txt path, but the BYTES on disk decide whether
+    // /api/file-read can decode them: the endpoint sniffs the first 8 KiB for a
+    // NUL and answers a binary file with the envelope `{"binary": true,
+    // "content": ""}` under `X-File-Binary: true` (a UTF-16-saved .md is the
+    // ordinary way a doc row lands here). The envelope is NOT the document, so
+    // it must never be rendered as one -- MarkdownPanel refuses to promote on
+    // exactly this header for exactly this reason.
+    it('never renders the binary envelope as the document body', async () => {
+      const user = userEvent.setup()
+      vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
+      vi.mocked(api).artifactSessionDocs = vi.fn().mockResolvedValue({
+        docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
+      })
+      vi.mocked(api).materializeArtifact = vi.fn().mockResolvedValue({})
+      stubBinaryFileRead()
+      renderWithProviders(<ArtifactsPage />)
+      await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
+
+      await user.click(screen.getByText('FINDINGS.md'))
+      const dialog = await screen.findByRole('dialog')
+      await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
+      expect(dialog.textContent).not.toContain('"binary"')
+      expect(dialog.textContent).not.toContain('"content"')
+    })
+
+    // The entry this preview writes is READ BACK by the chat side panel's
+    // openFile within its 10s staleTime, and `binary` is what decides whether
+    // that tab offers an editor at all. An entry missing the verdict opens an
+    // editable buffer over the envelope, and a save writes the envelope over
+    // the user's file.
+    it('carries the backend binary verdict into the shared cache entry', async () => {
+      const user = userEvent.setup()
+      vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
+      vi.mocked(api).artifactSessionDocs = vi.fn().mockResolvedValue({
+        docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
+      })
+      vi.mocked(api).materializeArtifact = vi.fn().mockResolvedValue({})
+      stubBinaryFileRead()
+      const { queryClient } = renderWithProviders(<ArtifactsPage />)
+      await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
+
+      await user.click(screen.getByText('FINDINGS.md'))
+      await screen.findByRole('dialog')
+      await waitFor(() =>
+        expect(queryClient.getQueryData(['file-read', '/ws/research/FINDINGS.md'])).toBeTruthy())
+      expect(queryClient.getQueryData(['file-read', '/ws/research/FINDINGS.md']))
+        .toEqual({ text: '', ok: true, status: 200, binary: true, truncated: false, redacted: false, lossy: false })
     })
 
     // The row is a keyboard target too — and the star nested inside it bubbles
@@ -532,7 +650,7 @@ describe('ArtifactsPage', () => {
       const materializeSpy = vi.fn().mockResolvedValue({})
       vi.mocked(api).materializeArtifact = materializeSpy
       stubFileRead('# Findings headline')
-      renderWithProviders(<ArtifactsPage />)
+      renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
       await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
       // Keyboard-activate the star first: materializes, no preview.
@@ -619,6 +737,7 @@ describe('ArtifactsPage', () => {
       vi.mocked(api).materializeArtifact = vi.fn().mockResolvedValue({})
       vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
         ok: false, status: 500, statusText: 'Internal Server Error',
+        headers: { get: () => null },
         text: () => Promise.resolve(''),
       }))
       renderWithProviders(<ArtifactsPage />)
@@ -660,7 +779,7 @@ describe('ArtifactsPage', () => {
       docs: [mkDoc('/ws/research/FINDINGS.md', 'FINDINGS.md')],
     })
     vi.mocked(api).materializeArtifact = vi.fn().mockRejectedValue(new Error('materialize blew up'))
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
     await user.click(screen.getByLabelText('Star document'))
@@ -682,7 +801,7 @@ describe('ArtifactsPage', () => {
       slug: 'findings-md-2',
       slug_collided_with: 'findings-md',
     })
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
     await user.click(screen.getByLabelText('Star document'))
@@ -713,7 +832,7 @@ describe('ArtifactsPage', () => {
     })
     const materializeSpy = vi.fn().mockResolvedValue({ slug: 'findings-md', slug_collided_with: '' })
     vi.mocked(api).materializeArtifact = materializeSpy
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
     await user.click(screen.getByLabelText('Star document'))
@@ -741,7 +860,7 @@ describe('ArtifactsPage', () => {
         slug: 'findings-md-2',
         slug_collided_with: 'findings-md',
       })
-      renderWithProviders(<ArtifactsPage />)
+      renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
       await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
       await user.click(screen.getByLabelText('Star document'))
@@ -768,7 +887,7 @@ describe('ArtifactsPage', () => {
       .mockResolvedValueOnce({ slug: 'findings-md-2', slug_collided_with: 'findings-md' })
       .mockResolvedValueOnce({ slug: 'notes-md', slug_collided_with: '' })
     vi.mocked(api).materializeArtifact = materializeSpy
-    renderWithProviders(<ArtifactsPage />)
+    renderWithProviders(<ArtifactsPage />, { store: connectedStore() })
     await waitFor(() => expect(screen.getByText('FINDINGS.md')).toBeInTheDocument())
 
     const stars = screen.getAllByLabelText('Star document')
@@ -890,6 +1009,9 @@ describe('ArtifactsPage', () => {
   })
 
   it('renders Artifact Deploy button that navigates to /deploy', async () => {
+    // Artifact Deploy is a Feature Preview, so the door is only offered to an
+    // operator who opted in. The flag is a plain localStorage key.
+    localStorage.setItem(PREVIEW_ARTIFACT_DEPLOY, '1')
     vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
     renderWithProviders(<ArtifactsPage />, { route: '/artifacts' })
     await waitFor(() => expect(screen.getByText('Artifact Deploy')).toBeInTheDocument())
@@ -900,6 +1022,18 @@ describe('ArtifactsPage', () => {
     // matching Route defined in the test wrapper, we verify the button exists
     // and is clickable (navigation intent is covered by the navigate call).
     expect(btn).toBeInTheDocument()
+    localStorage.removeItem(PREVIEW_ARTIFACT_DEPLOY)
+  })
+
+  it('does not offer the Artifact Deploy door until the preview is on', async () => {
+    // Default OFF is the point: every door behind this flag leads to spending in
+    // a real AWS account and to content on the open internet.
+    localStorage.removeItem(PREVIEW_ARTIFACT_DEPLOY)
+    const artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
+    vi.mocked(api).artifacts = artifacts
+    renderWithProviders(<ArtifactsPage />, { route: '/artifacts' })
+    await waitFor(() => expect(artifacts).toHaveBeenCalled())
+    expect(screen.queryByText('Artifact Deploy')).toBeNull()
   })
 })
 

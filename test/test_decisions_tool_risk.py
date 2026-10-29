@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -92,6 +93,15 @@ def _answering(tier: str, p: float = 0.88, *, seen: list[dict] | None = None):
     return patch.object(tr.core, "decide", _decide)
 
 
+#: Repo root, for the spec gate below: this file lives at ``test/`` beneath it.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: The module spec, which names the bar's constant, and the operator doc, which
+#: prints only the number a reader sees on the card.
+_SPEC = _REPO_ROOT / "docs" / "system-specs" / "modules" / "decisions.md"
+_OPERATOR_DOC = _REPO_ROOT / "src" / "kiro_crew" / "docs" / "decisions.md"
+
+
 # ── the record it returns ─────────────────────────────────────────────────────
 
 
@@ -117,7 +127,7 @@ class TestTheRecord:
 
     @pytest.mark.asyncio
     async def test_a_caution_answer_is_flagged_too(self, home):
-        with _answering(tr.TIER_CAUTION):
+        with _answering(tr.TIER_CAUTION, 0.95):
             record = await tr.risk_record(
                 tool="fsWrite", arguments="{}", policy="yolo", session_key="chat-1"
             )
@@ -497,14 +507,18 @@ class TestBudgets:
 # ── the confidence a `risky` answer needs ─────────────────────────────────────
 
 
-class TestTheRiskyConfidenceThreshold:
-    """``risky`` is the alarming word, so it has to be believed before it is printed.
+class TestTheConfidenceThresholds:
+    """Neither flagged tier is printed until it is believed.
 
-    Two things these tests hold, and they pull in opposite directions. The badge
-    must not fire on a coin-flip ``risky`` -- that is what costs every other badge
-    its meaning. And the bar must not be so high that a force-push goes unbadged,
-    which is why the value is pinned inside the window it was measured in rather
-    than merely asserted to exist.
+    Two things these tests hold, and they pull in opposite directions. A badge must
+    not fire on a coin-flip answer -- that is what costs every other badge its
+    meaning. And a bar must not be so high that a force-push goes unbadged, which is
+    why each value is pinned inside the window it was measured in rather than merely
+    asserted to exist.
+
+    The two bars are two INDEPENDENTLY MOVABLE constants, currently measured at
+    the same value (0.80): they are read off different populations, so a
+    reading that moves one must be able to leave the other alone.
     """
 
     @pytest.mark.parametrize(
@@ -517,9 +531,11 @@ class TestTheRiskyConfidenceThreshold:
             (tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD, True),
             (tr.TIER_RISKY, 0.98, True),
             (tr.TIER_RISKY, 1.0, True),
-            # ``caution`` is the mild word and clears on its tier alone.
-            (tr.TIER_CAUTION, 0.0, True),
-            (tr.TIER_CAUTION, 0.34, True),
+            # ``caution`` has its own bar, currently the same value -- also inclusive.
+            (tr.TIER_CAUTION, 0.0, False),
+            (tr.TIER_CAUTION, 0.34, False),
+            (tr.TIER_CAUTION, 0.79, False),
+            (tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD, True),
             (tr.TIER_CAUTION, 1.0, True),
             # ``safe`` is never a badge at any confidence at all.
             (tr.TIER_SAFE, 0.0, False),
@@ -572,25 +588,34 @@ class TestTheRiskyConfidenceThreshold:
         assert [r for r in _rows(home) if r.get("tier")] == [record]
 
     @pytest.mark.asyncio
-    async def test_a_caution_answer_at_the_same_confidence_is_still_badged(self, home):
-        """The asymmetry is DELIBERATE and is pinned so it is not quietly repaired.
+    async def test_a_suppressed_caution_still_writes_its_row(self, home):
+        """The suppressed ``caution`` rows are what a later bar is re-read from.
 
-        A ``caution`` under the bar draws a badge while a ``risky`` under it draws
-        none. That is not an ordering slip: the two words name different claims,
-        and only ``risky``'s is expensive to be wrong about.
+        Same rule the suppressed ``risky`` rows follow: the badge is refused, the
+        observation is not, so the number stays measurable from this build's own log.
         """
-        low = tr.RISKY_CONFIDENCE_THRESHOLD - 0.25
-        with _answering(tr.TIER_CAUTION, low):
-            caution = await tr.risk_record(
+        with _answering(tr.TIER_CAUTION, 0.52):
+            record = await tr.risk_record(
                 tool="fsWrite", arguments="{}", policy="trust", session_key="chat-1"
             )
-        with _answering(tr.TIER_RISKY, low):
-            risky = await tr.risk_record(
-                tool="bash", arguments="git push", policy="trust", session_key="chat-2"
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["p"] == 0.52
+        assert outcome[0]["flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_confident_caution_answer_is_badged_and_flagged(self, home):
+        with _answering(tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD):
+            record = await tr.risk_record(
+                tool="fsWrite", arguments="{}", policy="trust", session_key="chat-1"
             )
 
-        assert caution is not None
-        assert risky is None
+        assert record is not None
+        assert record["tier"] == tr.TIER_CAUTION
+        assert record["flagged"] is True
 
     @pytest.mark.asyncio
     async def test_the_constant_is_what_decides(self, home, monkeypatch):
@@ -625,10 +650,276 @@ class TestTheRiskyConfidenceThreshold:
         """
         assert 0.75 <= tr.RISKY_CONFIDENCE_THRESHOLD <= 0.85
 
-    def test_it_is_a_probability_and_not_a_percentage(self):
-        """``p`` is a 0..1 probability everywhere in this package, so the bar is too."""
-        assert isinstance(tr.RISKY_CONFIDENCE_THRESHOLD, float)
-        assert 0.0 < tr.RISKY_CONFIDENCE_THRESHOLD <= 1.0
+    @pytest.mark.asyncio
+    async def test_the_caution_constant_is_what_decides(self, home, monkeypatch):
+        """Revert-verify for the second bar, and it must move ALONE.
+
+        The ``risky`` bar is left untouched here on purpose: a shared constant, or a
+        lookup table built once at import, would pass the parametrised cases above
+        and still fail this -- which is the drift two separately named bars exist to
+        prevent.
+        """
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.50)
+        with _answering(tr.TIER_CAUTION, 0.57):
+            now_badged = await tr.risk_record(
+                tool="fsWrite", arguments="{}", policy="trust", session_key="chat-1"
+            )
+        assert now_badged is not None, "0.57 must badge once the caution bar is 0.50"
+
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.99)
+        with _answering(tr.TIER_CAUTION, 0.98):
+            now_hidden = await tr.risk_record(
+                tool="fsWrite", arguments="{}", policy="trust", session_key="chat-2"
+            )
+        assert now_hidden is None, "0.98 must be refused once the caution bar is 0.99"
+
+    def test_they_are_probabilities_and_not_percentages(self):
+        """``p`` is a 0..1 probability everywhere in this package, so the bars are too."""
+        for bar in (tr.RISKY_CONFIDENCE_THRESHOLD, tr.CAUTION_CONFIDENCE_THRESHOLD):
+            assert isinstance(bar, float)
+            assert 0.0 < bar <= 1.0
+
+    def test_the_docs_print_the_caution_bar_at_the_value_the_code_ships(self):
+        """The prose and the constant cannot drift apart silently.
+
+        The module spec names each bar's CONSTANT beside its value, so a reader
+        re-deriving the bar has more than the badge to go on; the spec assertion is
+        read against the constant rather than a literal, so the gate follows the
+        code instead of pinning a second copy of it. The operator doc prints no
+        bare number -- caution and risky are two independently movable bars and a
+        shared numeric row would print the wrong one for whichever bar moves next --
+        so its assertion pins the qualitative wording instead: risky still reads as
+        confidence-gated, and caution still reads as confidence-gated AND carrying
+        the file-write carve-out.
+        """
+        value = f"{tr.CAUTION_CONFIDENCE_THRESHOLD:.2f}"
+        spec = _SPEC.read_text(encoding="utf-8")
+        assert f"`CAUTION_CONFIDENCE_THRESHOLD` ({value})" in spec, (
+            "the module spec must print the caution bar's constant at the value the " "code ships"
+        )
+        risky_value = f"{tr.RISKY_CONFIDENCE_THRESHOLD:.2f}"
+        assert f"`RISKY_CONFIDENCE_THRESHOLD` ({risky_value})" in spec, (
+            "the module spec must print the risky bar's constant at the value the " "code ships"
+        )
+        operator = _OPERATOR_DOC.read_text(encoding="utf-8")
+        assert (
+            "risky`, and Jev is sure" in operator
+        ), "the operator doc must still gate the risky row on confidence, in words"
+        assert "caution`, is sure, and the call is not a plain file write" in operator, (
+            "the operator doc must still gate the caution row on confidence and the "
+            "file-write carve-out, in words"
+        )
+        # The retired single-bar wording must actually be gone from the BADGE
+        # table rows, not just outnumbered by the new ones -- scoped to those
+        # rows rather than the whole file, since "or more" is ordinary prose
+        # elsewhere on this page (and in its sibling docs) and would red the
+        # gate on an unrelated sentence.
+        badge_rows = [line for line in operator.splitlines() if "| Trusts the session" in line]
+        assert badge_rows, "the operator doc must still carry the tool.risk badge rows"
+        badge_text = "\n".join(badge_rows)
+        assert "score of" not in badge_text, (
+            "the badge rows must not carry the retired shared-bar wording "
+            "('score of N.NN or more') now that caution and risky are separately movable bars"
+        )
+        assert (
+            "or more" not in badge_text
+        ), "the badge rows must not carry a retired numeric threshold phrase"
+
+
+class TestTheCautionConfidenceThreshold:
+    """``caution`` must be believed too, and a plain file write never draws it."""
+
+    @pytest.mark.asyncio
+    async def test_a_hesitant_caution_draws_nothing_but_keeps_its_row(self, home):
+        with _answering(tr.TIER_CAUTION, 0.79):
+            record = await tr.risk_record(
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
+            )
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["flagged"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_confident_caution_is_badged(self, home):
+        with _answering(tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD):
+            record = await tr.risk_record(
+                tool="bash", arguments="mkdir build", policy="trust", session_key="chat-1"
+            )
+
+        assert record is not None
+        assert record["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_the_constant_is_what_decides(self, home, monkeypatch):
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.50)
+        with _answering(tr.TIER_CAUTION, 0.57):
+            now_badged = await tr.risk_record(
+                tool="bash", arguments="mkdir b", policy="trust", session_key="chat-1"
+            )
+        assert now_badged is not None
+
+        monkeypatch.setattr(tr, "CAUTION_CONFIDENCE_THRESHOLD", 0.99)
+        with _answering(tr.TIER_CAUTION, 0.98):
+            now_hidden = await tr.risk_record(
+                tool="bash", arguments="mkdir b", policy="trust", session_key="chat-2"
+            )
+        assert now_hidden is None
+
+    def test_the_value_sits_at_or_above_the_risky_bar_and_below_certainty(self):
+        """Equal to ``risky``'s bar (both measured at 0.80), and below 1.0 so the
+        word can still print."""
+        assert tr.RISKY_CONFIDENCE_THRESHOLD <= tr.CAUTION_CONFIDENCE_THRESHOLD < 1.0
+        assert isinstance(tr.CAUTION_CONFIDENCE_THRESHOLD, float)
+
+    def test_the_value_sits_inside_the_window_it_was_measured_in(self):
+        """A bound on both sides, the same shape ``risky``'s pin uses.
+
+        This build's own measured window for ``caution`` is 0.75..0.85: below it
+        the tier is dominated by calls that only read, and above 0.85 the same
+        reading starts dropping ordinary rebases and amends -- the tier's own
+        target population. A value outside this window contradicts that reading;
+        a later reading may move the window, but a drive-by edit must not be able
+        to widen it to ``0 < bar <= 1`` and still pass.
+        """
+        assert 0.75 <= tr.CAUTION_CONFIDENCE_THRESHOLD <= 0.85
+
+    @pytest.mark.parametrize(
+        "tier, p, badged",
+        [
+            (tr.TIER_CAUTION, 0.99, False),
+            (tr.TIER_CAUTION, 1.0, False),
+            # A risky write is still badged: outside the workspace is what the word names.
+            (tr.TIER_RISKY, 0.95, True),
+            (tr.TIER_RISKY, 0.79, False),
+            (tr.TIER_SAFE, 1.0, False),
+        ],
+    )
+    def test_a_file_write_never_draws_caution(self, tier, p, badged):
+        assert tr.earns_badge(tier, p, file_write=True) is badged
+
+    @pytest.mark.asyncio
+    async def test_a_file_write_caution_keeps_its_tier_on_the_row(self, home):
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "README.md"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="edit",
+            )
+
+        assert record is None
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["tier"] == tr.TIER_CAUTION
+        assert outcome[0]["p"] == 0.99
+        assert outcome[0]["flagged"] is False
+        assert outcome[0]["file_write"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_non_file_write_row_carries_file_write_false(self, home):
+        """The write carve-out must be re-derivable from the log without the
+        harness's own tool title, which the structured-kind test above pins as
+        not the signal the point itself reads."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            await tr.risk_record(
+                tool="bash",
+                arguments='{"command": "mkdir build"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="execute",
+            )
+
+        outcome = [r for r in _rows(home) if r.get("tier")]
+        assert len(outcome) == 1
+        assert outcome[0]["file_write"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_file_write_risky_is_still_badged(self, home):
+        with _answering(tr.TIER_RISKY, 0.95):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "/home/u/.aws/credentials"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="edit",
+            )
+
+        assert record is not None
+        assert record["flagged"] is True
+
+    @pytest.mark.asyncio
+    async def test_only_the_structured_kind_marks_a_file_write(self, home):
+        """The display title is not the signal: a caution titled "Write File" with
+        another kind and no diff path is judged on its confidence alone."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments="{}",
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="execute",
+            )
+
+        assert record is not None
+
+    @pytest.mark.asyncio
+    async def test_a_diff_path_alone_marks_a_file_write(self, home):
+        """A real edit whose ACP ``kind`` is empty or ``read`` (agent-influenced,
+        per ``is_edit_call``'s own docstring) still carries no caution badge once
+        its tool_call frame cached a diff-block path -- the same routing predicate
+        the hook edit gate and governance classification share."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments='{"path": "README.md"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="read",
+                diff_path="README.md",
+            )
+
+        assert record is None
+
+    @pytest.mark.asyncio
+    async def test_an_edit_kind_with_no_diff_path_is_still_a_file_write(self, home):
+        """``kind="edit"`` alone still routes -- the diff path is an OR, not a
+        replacement for the ACP kind."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Write File",
+                arguments="{}",
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="edit",
+                diff_path="",
+            )
+
+        assert record is None
+
+    @pytest.mark.asyncio
+    async def test_a_delete_is_not_the_workspace_edit_the_carve_out_describes(self, home):
+        """``delete`` is on the gates' write-plane routing (``is_edit_call``); if
+        the badge carve-out read that same predicate, a KAS ``delete_file`` would
+        lose its ``caution`` badge on exactly the auto-approving sessions where
+        the badge is the only signal. The carve-out's ground is a workspace edit
+        "easy to put back"; a deletion is not, so it keeps the badge
+        (``is_workspace_edit_call``)."""
+        with _answering(tr.TIER_CAUTION, 0.99):
+            record = await tr.risk_record(
+                tool="Delete File",
+                arguments='{"targetFile": "notes.md"}',
+                policy="trust",
+                session_key="chat-1",
+                tool_kind="delete",
+                diff_path="",
+            )
+
+        assert record is not None
+        assert record["tier"] == tr.TIER_CAUTION
 
 
 # ── the point's own identity ──────────────────────────────────────────────────
@@ -638,19 +929,22 @@ class TestThePointIsShipped:
     def test_the_gate_admits_the_name(self):
         assert tr.POINT in gate.DECISION_POINT_NAMES
 
-    def test_safe_is_not_a_flagged_tier(self):
-        assert tr.TIER_SAFE not in tr.FLAGGED_TIERS
-        assert set(tr.FLAGGED_TIERS) == {tr.TIER_CAUTION, tr.TIER_RISKY}
+    def test_safe_never_earns_a_badge_at_any_confidence(self):
         assert tr.TIERS == (tr.TIER_SAFE, tr.TIER_CAUTION, tr.TIER_RISKY)
+        for p in (0.0, 0.5, tr.CAUTION_CONFIDENCE_THRESHOLD, tr.RISKY_CONFIDENCE_THRESHOLD, 1.0):
+            assert tr.earns_badge(tr.TIER_SAFE, p) is False
 
-    def test_membership_in_the_flagged_tiers_is_necessary_and_not_sufficient(self):
+    def test_a_flagged_tier_is_necessary_and_not_sufficient(self):
         """One reader for the whole question, so a caller cannot ask half of it.
 
-        A surface that tested ``tier in FLAGGED_TIERS`` alone would print a badge
-        the point refused, which is the drift ``earns_badge`` exists to prevent.
+        A surface that tested the tier alone would print a badge the point refused,
+        which is the drift ``earns_badge`` exists to prevent: each flagged tier is
+        refused under its OWN bar and admitted at it.
         """
-        assert tr.TIER_RISKY in tr.FLAGGED_TIERS
-        assert tr.earns_badge(tr.TIER_RISKY, 0.10) is False
+        assert tr.earns_badge(tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD - 0.01) is False
+        assert tr.earns_badge(tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD - 0.01) is False
+        assert tr.earns_badge(tr.TIER_RISKY, tr.RISKY_CONFIDENCE_THRESHOLD) is True
+        assert tr.earns_badge(tr.TIER_CAUTION, tr.CAUTION_CONFIDENCE_THRESHOLD) is True
 
     def test_the_module_imports_no_dashboard_or_permission_code(self):
         """A point may not reach the approval path, even to read it.

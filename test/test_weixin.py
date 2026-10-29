@@ -8,11 +8,11 @@ without touching ilinkai.weixin.qq.com.
 from __future__ import annotations
 
 import asyncio
-import os
 
 import pytest
 
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.testing.wait import await_until
 from kiro_crew.weixin.client import (
     ILINK_APP_ID,
     ITEM_TEXT,
@@ -24,9 +24,7 @@ from kiro_crew.weixin.client import (
     WeixinSendError,
     _base_info,
     _headers,
-    load_weixin_account,
     protocol_error_code,
-    save_weixin_account,
 )
 from kiro_crew.weixin.renderer import (
     WEIXIN_CHUNK_LIMIT,
@@ -128,77 +126,6 @@ def test_typing_ticket_cache_returns_fresh_entries():
     cache.set("u1", "ticket")
     assert cache.get("u1") == "ticket"
     assert cache.get("absent") is None
-
-
-def test_account_credentials_persist_and_round_trip(tmp_path):
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None
-    assert loaded["base_url"] == "https://x"
-    assert loaded["user_id"] == "u9"
-    assert load_weixin_account(str(tmp_path), "missing") is None
-
-
-@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits only")
-def test_account_credentials_are_owner_only(tmp_path):
-    """NTFS reports synthetic mode bits, so this guarantee is POSIX-checked;
-    cross-platform enforcement comes from platform_compat.restrict_to_owner."""
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-    path = tmp_path / "weixin" / "accounts" / "acct1.json"
-    assert path.stat().st_mode & 0o077 == 0
-
-
-def test_account_credentials_lockdown_precedes_content(tmp_path, monkeypatch):
-    """The token must never exist in a file that has not been locked down yet.
-
-    On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
-    ``restrict_to_owner`` is the only protection; applying it after the write
-    left the bot credential readable under the parent directory's inherited ACL
-    for the whole write window. Asserted by measuring the file's
-    SIZE at the moment the lockdown is applied — zero means no payload byte
-    existed yet. A post-write stat passes on the buggy ordering too, so it
-    would not be a regression test.
-    """
-    from kiro_crew import platform_compat
-
-    sizes: list[int] = []
-    real_restrict = platform_compat.restrict_to_owner
-
-    def _measuring_restrict(target):
-        sizes.append(os.stat(target).st_size)
-        return real_restrict(target)
-
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", _measuring_restrict)
-
-    save_weixin_account(str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x")
-
-    assert sizes, "premise: the lockdown ran at all"
-    assert (
-        sizes[0] == 0
-    ), f"the file already held payload bytes when it was locked down: {sizes[0]} bytes"
-
-
-def test_account_credentials_survive_a_failed_lockdown(tmp_path, monkeypatch):
-    """``restrict_on_error="warn"`` keeps this site's established policy: the
-    credential write matters more than the permissions, so a lockdown failure
-    is logged but must not cost the account file."""
-    from kiro_crew import platform_compat
-
-    def _refuse(_target):
-        raise OSError("cannot resolve the invoking user's SID")
-
-    monkeypatch.setattr(platform_compat, "restrict_to_owner", _refuse)
-
-    save_weixin_account(
-        str(tmp_path), account_id="acct1", token="s3cr3t", base_url="https://x", user_id="u9"
-    )
-
-    loaded = load_weixin_account(str(tmp_path), "acct1")
-    assert loaded is not None, "warn policy must keep the write"
-    assert loaded["token"] == "s3cr3t"
-    assert loaded["user_id"] == "u9"
 
 
 # ── renderer ──────────────────────────────────────────────────────────────────
@@ -642,6 +569,98 @@ def test_poll_loop_backs_off_on_an_unknown_error_code(tmp_path, monkeypatch):
     t._running = True
     asyncio.run(t._poll_loop())
     assert sleeps and sleeps[0] > 0
+
+
+def test_closing_the_client_handle_stops_the_transport_poll_loop(tmp_path):
+    """The gateway's channel handle is the ``WeixinClient``, and a channel restart
+    or shutdown closes only that. The long-poll belongs to the transport, so a
+    close that shut just the HTTP session left the loop re-polling a closed
+    session forever beside the replacement channel."""
+
+    async def scenario() -> None:
+        client = WeixinClient(token="t", base_url="https://example.invalid")
+        polling = asyncio.Event()
+
+        async def hold_the_poll(_buf):
+            polling.set()
+            await asyncio.Event().wait()
+
+        client.get_updates = hold_the_poll  # type: ignore[method-assign]
+        t = WeixinTransport(
+            client,
+            account_id="acct1",
+            ctx_store=ContextTokenStore(str(tmp_path)),
+            dm_policy="open",
+        )
+        await t.connect()
+        poll_task = t._poll_task
+        assert poll_task is not None
+        try:
+            await await_until(polling, what="the poll to start")
+            await await_until(asyncio.ensure_future(client.close()), what="client.close()")
+            assert poll_task.done()
+            assert client._session.closed
+            await await_until(asyncio.ensure_future(client.close()), what="a second close")
+        finally:
+            poll_task.cancel()
+            await asyncio.gather(poll_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_a_bounded_close_does_not_cut_the_poll_cleanup_short(tmp_path):
+    """A channel restart bounds ``close()`` and cancels it at the bound. The poll
+    may still be finishing an inline turn by then, and that turn's cleanup is what
+    hands the session permit back: a second cancellation reaching it skips the
+    release and leaves the conversation busy until the gateway restarts."""
+
+    async def scenario() -> None:
+        client = WeixinClient(token="t", base_url="https://example.invalid")
+        polling = asyncio.Event()
+        cleaning = asyncio.Event()
+        may_finish = asyncio.Event()
+        released = asyncio.Event()
+
+        async def poll_then_clean_up(_buf):
+            polling.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await may_finish.wait()
+                released.set()
+                raise
+
+        client.get_updates = poll_then_clean_up  # type: ignore[method-assign]
+        t = WeixinTransport(
+            client,
+            account_id="acct1",
+            ctx_store=ContextTokenStore(str(tmp_path)),
+            dm_policy="open",
+        )
+        await t.connect()
+        poll_task = t._poll_task
+        assert poll_task is not None
+        try:
+            await await_until(polling, what="the poll to start")
+            closing = asyncio.ensure_future(client.close())
+            await await_until(cleaning, what="the poll cleanup to start")
+            closing.cancel()  # the restart's bound on close() expires
+            await await_until(
+                asyncio.ensure_future(asyncio.gather(closing, return_exceptions=True)),
+                what="the cancelled close() to return",
+            )
+            may_finish.set()
+            await await_until(released, what="the poll cleanup to finish")
+        finally:
+            may_finish.set()
+            poll_task.cancel()
+            await await_until(
+                asyncio.ensure_future(asyncio.gather(poll_task, return_exceptions=True)),
+                what="the poll to stop",
+            )
+
+    asyncio.run(scenario())
 
 
 def test_outbound_message_shape_marks_bot_and_finished():

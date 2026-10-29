@@ -17,6 +17,9 @@ from kiro_crew.agent_discovery import AgentInfo
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.sections import KiroCrewAgentConfig
 from kiro_crew.dashboard.handlers import agent_catalog
+from kiro_crew.platform import build_default_context, set_context
+from kiro_crew.platform.context import PlatformCompositionError
+from kiro_crew.platform.defaults import DefaultProviderRegistry
 
 
 def _template(name: str, **kwargs) -> AgentInfo:
@@ -27,7 +30,7 @@ def _template(name: str, **kwargs) -> AgentInfo:
 
 def _owned(name: str, **kwargs) -> AgentInfo:
     """A spec the runtime writes itself, as global discovery reports it."""
-    source = "kirocrew" if name in ("kirocrew", "kirocrew-lite") else "builtin"
+    source = "kirocrew" if name in ("kirocrew", "kirocrew-lite", "kirocrew-guest") else "builtin"
     return _template(name, source=source, kirocrew_owned=True, **kwargs)
 
 
@@ -42,6 +45,10 @@ def catalog(monkeypatch, tmp_path):
     monkeypatch.setattr(KiroCrewConfig, "load", lambda: config)
     discovery = Mock(return_value=[_template("reviewer"), _template("test-writer")])
     monkeypatch.setattr(agent_catalog, "list_agents", discovery)
+    # The refresh scans the real agents dir and would replace a snapshot a test
+    # arranged; stubbed here, asserted by its own test.
+    refresh = Mock()
+    monkeypatch.setattr(agent_catalog, "refresh_materialized_agents", refresh)
     monkeypatch.setattr(agent_catalog.agent_state, "all_fork_info", lambda: {})
     save = Mock(side_effect=AssertionError("Catalog must not persist config"))
     allocate = Mock(side_effect=AssertionError("Catalog must not allocate member memory"))
@@ -69,6 +76,7 @@ def catalog(monkeypatch, tmp_path):
         app=app,
         config=config,
         discovery=discovery,
+        refresh=refresh,
         save=save,
         allocate=allocate,
         state=state,
@@ -90,12 +98,42 @@ async def test_catalog_keeps_namespaces_and_never_changes_registry(catalog):
         ("template", "reviewer"),
         ("template", "test-writer"),
     ]
-    assert result["default_agent"] == "reviewer"
+    # The picker's default is the one for NEW SESSIONS: the default template, not
+    # the roster's default crewmate alias (`config.default_agent == "reviewer"`).
+    assert result["default_agent"] == "kirocrew"
     assert result["agents"][0]["memory_store"] == "retained-store"
     assert "memory_store" not in result["agents"][-1]
     assert dataclasses.asdict(catalog.config) == before
     catalog.save.assert_not_called()
     catalog.allocate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_catalog_fetch_refreshes_the_snapshot_before_reading_the_default(
+    catalog, monkeypatch
+):
+    # The picker's fetch is the moment an agent removed outside the gateway is
+    # noticed: the refresh (whose landed scan resets a dangling default) runs off
+    # the loop with the template scan, and the config is read AFTER it so the
+    # response names the default the user will get.
+    import threading
+
+    order: list[str] = []
+    loop_thread = threading.get_ident()
+    catalog.refresh.side_effect = lambda **_: order.append(
+        "refresh-off-loop" if threading.get_ident() != loop_thread else "refresh-on-loop"
+    )
+    catalog.discovery.side_effect = lambda **kwargs: order.append("templates") or [
+        _template("reviewer")
+    ]
+    config = catalog.config
+    monkeypatch.setattr(KiroCrewConfig, "load", lambda: order.append("config") or config)
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+    # Later loads (the roster rows) may follow; the first comes after the scan.
+    assert order[:3] == ["refresh-off-loop", "templates", "config"]
+    assert set(order[3:]) <= {"config"}
 
 
 @pytest.mark.asyncio
@@ -194,6 +232,14 @@ def test_background_exclusion_is_by_owned_file_not_by_name():
     project_lite = _template("kirocrew-lite", scope="project", kirocrew_owned=False)
     assert not agent_catalog._is_background_only(project_lite)
     assert agent_catalog._is_background_only(_owned("kirocrew-lite"))
+    assert agent_catalog._is_background_only(_owned("kirocrew-guest"))
+    # Withheld for what it CANNOT do: the panel server and ``fs_read`` and nothing
+    # else, so a chat run as it would be an agent that cannot answer anything.
+    assert agent_catalog._is_background_only(_owned("kirocrew-dashboard-manager"))
+    # Withheld because it is not a deliberate pick: it is the default template
+    # under its own filename (rfc-mate-owned-agent-config.md, migration step 1),
+    # reached only through a crewmate's own binding.
+    assert agent_catalog._is_background_only(_owned("kirocrew-mate-conductor"))
     assert not agent_catalog._is_background_only(_owned("kirocrew"))
     assert not agent_catalog._is_background_only(_owned("kirocrew-worker"))
 
@@ -209,8 +255,10 @@ def test_every_owned_spec_is_classified_for_the_picker():
         agent_files.LEDGER_CONDUCTOR_AGENT_FILENAME,
         agent_files.SECURITY_CONDUCTOR_AGENT_FILENAME,
         agent_files.WORKER_AGENT_FILENAME,
+        agent_files.DASHBOARD_AUTHOR_AGENT_FILENAME,
         agent_files.KNOWLEDGE_AGENT_FILENAME,
         agent_files.RESEARCH_AGENT_FILENAME,
+        agent_files.TEAM_LEAD_AGENT_FILENAME,
         agent_files.HEARTBEAT_AGENT_FILENAME,
     }
     background = set(agent_catalog._BACKGROUND_ONLY_FILES)
@@ -239,7 +287,15 @@ async def test_catalog_failure_is_explicit_without_partial_success(catalog, monk
 
 def test_template_projection_omits_runtime_and_file_details():
     row = agent_catalog._template_row(_template("reviewer"))
-    assert set(row) == {"name", "selection_kind", "scope", "kiro_agent", "description", "source"}
+    assert set(row) == {
+        "name",
+        "selection_kind",
+        "scope",
+        "kiro_agent",
+        "description",
+        "source",
+        "markdown_only",
+    }
     assert "filename" not in row
 
 
@@ -248,3 +304,254 @@ def test_lineage_stem_cannot_be_published_as_an_alias(monkeypatch):
     monkeypatch.setattr(agent_catalog, "list_agents", lambda **kwargs: [agent])
     monkeypatch.setattr(agent_catalog.agent_state, "all_fork_info", lambda: {"private-stem": {}})
     assert agent_catalog._templates(Path("project")) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_identity", ["review-engine", ""])
+async def test_member_rows_carry_the_companion_runtime_policy(catalog, engine_identity):
+    catalog.config.agents["reviewer"].kiro_agent = engine_identity
+    policy = {"runtime": "engine-a", "model": "selectable"}
+    lookup_key = engine_identity or "reviewer"
+    policy_getter = Mock(side_effect=lambda key: policy if key == lookup_key else None)
+    provider = SimpleNamespace(agent_runtime_policy=policy_getter)
+    set_context(dataclasses.replace(build_default_context(catalog.config), providers=provider))
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        rows = (await response.json())["agents"]
+    members = [r for r in rows if r["selection_kind"] == "member"]
+    templates = [r for r in rows if r["selection_kind"] == "template"]
+    assert members[0]["runtime_policy"] == policy
+    assert all("runtime_policy" not in r for r in members[1:])
+    assert all("runtime_policy" not in r for r in templates)
+    assert [call.args[0] for call in policy_getter.call_args_list] == [
+        lookup_key,
+        "missing-template",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_file_name_bound_member_asks_the_policy_for_the_declared_agent(catalog, monkeypatch):
+    # A row that recorded the engine's FILE name runs the agent that file
+    # declares, so the companion is asked about that agent, not the file name.
+    import kiro_crew.config.loader as loader
+
+    catalog.config.agents["reviewer"].kiro_agent = "Pkg-review-engine"
+    monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS", frozenset({"review-engine"}))
+    monkeypatch.setattr(loader, "_MATERIALIZED_STEMS", {"Pkg-review-engine": "review-engine"})
+    monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS_READY", True)
+    policy = {"runtime": "engine-a", "model": "selectable"}
+    policy_getter = Mock(side_effect=lambda key: policy if key == "review-engine" else None)
+    provider = SimpleNamespace(agent_runtime_policy=policy_getter)
+    set_context(dataclasses.replace(build_default_context(catalog.config), providers=provider))
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        rows = (await response.json())["agents"]
+    members = [r for r in rows if r["selection_kind"] == "member"]
+    assert members[0]["runtime_policy"] == policy
+    assert policy_getter.call_args_list[0].args == ("review-engine",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["other-user", "anonymous", "app", "missing-state"])
+async def test_redacted_catalog_neither_reads_nor_emits_runtime_policy(catalog, caller):
+    if caller == "other-user":
+        catalog.caller.user = "another-user"
+    elif caller == "anonymous":
+        catalog.caller.user = ""
+    elif caller == "app":
+        catalog.caller.app = "caller-app"
+    else:
+        del catalog.app["state"]
+    policy_getter = Mock(return_value={"runtime": "private-engine", "model": "selectable"})
+    provider = SimpleNamespace(agent_runtime_policy=policy_getter)
+    set_context(dataclasses.replace(build_default_context(catalog.config), providers=provider))
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        rows = (await response.json())["agents"]
+    assert all("runtime_policy" not in row for row in rows)
+    policy_getter.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("caller", ["other-user", "anonymous", "app", "missing-state"])
+async def test_only_the_owner_s_catalog_fetch_may_reset_the_default(catalog, caller):
+    # The refresh may write the owner's ``default_agent``. A caller who is not the
+    # owner still gets a fresh template list, but its fetch never writes config.
+    if caller == "other-user":
+        catalog.caller.user = "another-user"
+    elif caller == "anonymous":
+        catalog.caller.user = ""
+    elif caller == "app":
+        catalog.caller.app = "caller-app"
+    else:
+        del catalog.app["state"]
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+    catalog.refresh.assert_called_once_with(heal_default=False)
+
+
+@pytest.mark.asyncio
+async def test_the_owner_s_catalog_fetch_resets_a_dangling_default(catalog):
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+    catalog.refresh.assert_called_once_with(heal_default=True)
+
+
+@pytest.mark.asyncio
+async def test_catalog_rows_omit_runtime_policy_without_a_companion(catalog):
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        rows = (await response.json())["agents"]
+    assert all("runtime_policy" not in r for r in rows)
+
+
+def test_public_provider_has_no_runtime_policy():
+    assert DefaultProviderRegistry().agent_runtime_policy("reviewer") is None
+
+
+@pytest.mark.parametrize("failure", [OSError, PlatformCompositionError])
+def test_runtime_policy_lookup_preserves_composition_failures(catalog, failure, caplog):
+    provider = SimpleNamespace(agent_runtime_policy=Mock(side_effect=failure("lookup failed")))
+    set_context(dataclasses.replace(build_default_context(catalog.config), providers=provider))
+
+    if failure is PlatformCompositionError:
+        with pytest.raises(PlatformCompositionError, match="lookup failed"):
+            agent_catalog._agent_runtime_policy("reviewer", "review-engine")
+    else:
+        with caplog.at_level("DEBUG", logger="kiro_crew.platform.context"):
+            assert agent_catalog._agent_runtime_policy("reviewer", "review-engine") is None
+        assert "Failed to read runtime policy for crew reviewer" in caplog.text
+    provider.agent_runtime_policy.assert_called_once_with("review-engine")
+
+
+# ── markdown-only agents ──
+# The picker badges a ``markdown_only`` row whose chat runs on a harness outside
+# ``markdown_spec_backends``. The catalog carries the facts; it gates nothing.
+
+
+def test_template_row_carries_markdown_only():
+    assert agent_catalog._template_row(_template("md", markdown_only=True))["markdown_only"] is True
+    assert agent_catalog._template_row(_template("js"))["markdown_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_catalog_marks_markdown_only_templates_and_the_members_bound_to_them(catalog):
+    catalog.config.agents["reviewer"].kiro_agent = "md-engine"
+    # A crewmate's agent may be one the template list withholds (here a
+    # background-only owned file), so membership is read from the whole scan.
+    catalog.discovery.return_value = [
+        _template("test-writer", markdown_only=True),
+        dataclasses.replace(
+            _owned("md-engine", markdown_only=True), filename=agent_files.LITE_AGENT_FILENAME
+        ),
+    ]
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        rows = (await response.json())["agents"]
+    by_id = {(r["selection_kind"], r["name"]): r["markdown_only"] for r in rows}
+    assert by_id == {
+        ("member", "reviewer"): True,
+        ("member", "retained-member"): False,
+        ("template", "test-writer"): True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_names_the_harness_facts_without_hard_coding_one(catalog):
+    from kiro_crew.acp_backends import ACP_BACKENDS_MARKDOWN_AGENT_SPECS, backend_to_stored
+
+    catalog.config.agent.acp_backend = ""  # the runtime id for kiro-cli
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        body = await response.json()
+    assert body["markdown_spec_backends"] == sorted(
+        backend_to_stored(b) for b in ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    )
+    assert body["session_backend"] == "kiro"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_key", "expected"),
+    [
+        (None, "kiro"),  # no chat: a new session runs agent.acp_backend
+        ("chat-empty", "kiro"),  # an ordinary chat
+        ("dashboard:member-reviewer", "kas"),  # a crewmate DM: agent.member_acp_backend
+    ],
+)
+async def test_session_backend_follows_the_member_split(catalog, session_key, expected):
+    catalog.config.agent.acp_backend = ""
+    catalog.config.agent.member_acp_backend = "kas"
+    catalog.state._slots["member-reviewer"] = SimpleNamespace(project="", _app="")
+    headers = {"X-Session-Key": session_key} if session_key else {}
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog", headers=headers)
+        assert response.status == 200
+        assert (await response.json())["session_backend"] == expected
+
+
+@pytest.mark.parametrize(
+    "session_key",
+    [
+        "",
+        "chat-1",
+        "crew-ops",
+        "member-reviewer",
+        "dashboard:member-reviewer",
+        "dashboard_member-reviewer",
+    ],
+)
+@pytest.mark.parametrize(("default", "member"), [("", "kas"), ("kas", ""), ("kas", "kas")])
+def test_session_backend_matches_the_provider_selection(session_key, default, member):
+    """The picker's harness is the one the provider factory starts for that key."""
+    from kiro_crew.acp_backends import backend_to_stored
+    from kiro_crew.members import select_provider_backend
+
+    config = KiroCrewConfig()
+    config.agent.acp_backend = default
+    config.agent.member_acp_backend = member
+    expected = backend_to_stored(select_provider_backend(session_key, member, default))
+    assert agent_catalog._session_backend(config, session_key) == expected
+
+
+def test_refused_backends_are_the_hosts_whose_activation_guard_refuses():
+    """The routing-table answer equals the harness answer, host by host.
+
+    A host refuses a markdown-only agent when its harness verifies activation and
+    cannot read markdown. The catalog derives the set from the routing table (the
+    dashboard may not import the ACP layer), so this pins the two to one answer.
+    """
+    from kiro_crew.acp.harness import harness_for
+    from kiro_crew.acp_backends import ACP_BACKENDS_KNOWN, backend_to_stored
+
+    expected = set()
+    for backend in ACP_BACKENDS_KNOWN:
+        try:
+            harness = harness_for(backend)
+        except ValueError:
+            continue
+        if harness.verifies_agent_activation and not harness.reads_markdown_agent_specs:
+            expected.add(backend_to_stored(backend))
+    refused = agent_catalog._markdown_refused_backends()
+    assert set(refused) == expected
+    assert "kiro" in refused
+    assert not set(refused) & {
+        backend_to_stored(b) for b in agent_catalog.ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    }
+
+
+@pytest.mark.asyncio
+async def test_catalog_sends_the_refused_backends(catalog):
+    async with TestClient(TestServer(catalog.app)) as client:
+        response = await client.get("/api/agents/catalog")
+        assert response.status == 200
+        body = await response.json()
+    assert body["markdown_refused_backends"] == agent_catalog._markdown_refused_backends()

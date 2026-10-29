@@ -2,29 +2,18 @@ import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, CheckCircle2, KeyRound, Loader2, LogOut, RefreshCw } from 'lucide-react'
 import { api, type KasLoginStatus } from '../../api/client'
-import { KasLoginEmbedded, providerLabelFromWire } from '../../components/KasLoginGate'
+import { KasLoginEmbedded } from '../../components/KasLoginGate'
+import { providerLabelFromWire } from '../../components/kasProviderLabel'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Btn, Card, CardTitle } from '../../components/ui'
 import { KIRO_SIGN_IN_HIGHLIGHT_ANCHOR } from '../../hooks/useSettingHighlight'
 import { fmtDateTime, fmtRelative } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { signInLapsed } from './kiroSignInState'
 
 // Same cache key the embedded flow reads status under (KasLoginGate.QUERY_KEY):
 // a sign-out here must invalidate the flow's query, not a private copy of it.
 const STATUS_QUERY_KEY = ['kas-login'] as const
-
-/**
- * Whether the stored sign-in can still do its job. Two independent verdicts
- * from the gateway, both token-free: `usable` is the spawn-time predicate (an
- * expired access token with nothing to renew it), `refresh_rejected` is the
- * issuer's refusal recorded by the last refresh attempt. Either one means the
- * agents will be told they are not signed in until the user signs in again --
- * and NOTHING falls back to kiro-cli's login on its own, which is why the card
- * has to say so rather than let a live-looking account sit there.
- */
-function signInLapsed(status: KasLoginStatus): boolean {
-  return !status.usable || status.refresh_rejected
-}
 
 function SignedInSummary({
   status,
@@ -67,7 +56,7 @@ function SignedInSummary({
       <div className="flex flex-wrap items-start gap-3">
         <div
           className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${
-            lapsed ? 'bg-warn/15 text-warn' : 'bg-ok/15 text-ok'
+            lapsed ? 'bg-warn/15 text-warn-text' : 'bg-ok/15 text-ok-text'
           }`}
           aria-hidden="true"
         >
@@ -137,7 +126,7 @@ function SignedInSummary({
 }
 
 /**
- * Developer > Agent Backend card for signing in to Kiro Crew's OWN Kiro identity
+ * Settings > Agent Harness card for signing in to Kiro Crew's OWN Kiro identity
  * -- the one the gateway hands to agent processes (KAS relay) so they run as the
  * user without depending on `kiro-cli login`. Wraps the sign-in flow
  * `KasLoginGate` carries in its embedded chrome, and adds the two things a card
@@ -146,14 +135,21 @@ function SignedInSummary({
  * expired" state that asks the user to sign in again instead of quietly falling
  * back to kiro-cli's login.
  *
- * Rendered by `AgentBackendTab` under the backend switch, and only while KAS is
- * a backend that switch offers: the stored identity is consumed by the KAS
+ * Rendered by `AgentBackendTab` INSIDE the KAS row's detail, and only while KAS
+ * is a backend that switch offers: the stored identity is consumed by the KAS
  * relay alone, so on a build or policy that cannot select KAS there is nothing
- * to sign in for. That is also why it is NOT on Settings > Overview (its former
- * home) nor indexed into Settings search: KAS is a Developer Mode preview, and a
- * sign-in chooser on the landing page read as a required step to every user.
+ * to sign in for, and on a row that is not KAS it would be a sign-in for an
+ * agent that never uses it. That is also why it is NOT on Settings > Overview
+ * (its former home) nor indexed into Settings search: a sign-in chooser on the
+ * landing page read as a required step to every user.
+ *
+ * `compact` is that in-detail form: a section with a small heading rather than
+ * a `Card` with a `CardTitle`, because the detail it sits in is already the
+ * bordered panel and a card inside it would be a box inside a box. The anchor
+ * (`data-setting-key`) and the test id are the same in both forms, so the
+ * chat's deep link rings whichever one is on screen.
  */
-export function KiroSignInCard() {
+export function KiroSignInCard({ compact = false }: { compact?: boolean } = {}) {
   const title = i18nT('pages.developer.kiroSignInCard.title')
   // Set after a successful sign-out, so the "applies to agent processes started
   // from now on" note shows at the moment the change was made. Held HERE, above
@@ -172,12 +168,8 @@ export function KiroSignInCard() {
   useEffect(() => {
     if (authenticated) setSignedOutNote(false)
   }, [authenticated])
-  return (
-    <Card data-setting-key={KIRO_SIGN_IN_HIGHLIGHT_ANCHOR} data-testid="kiro-sign-in-card">
-      <CardTitle>
-        <KeyRound className="lucide-inline" aria-hidden="true" />
-        {title}
-      </CardTitle>
+  const body = (
+    <>
       {signedOutNote ? (
         <p className="mb-3 text-[12px] text-muted" role="status" data-testid="kiro-sign-in-takes-effect">
           {i18nT('pages.developer.kiroSignInCard.takes_effect_next_process')}
@@ -205,6 +197,31 @@ export function KiroSignInCard() {
           </button>
         )}
       />
+    </>
+  )
+  if (compact) {
+    return (
+      <section
+        aria-label={title}
+        className="border-t border-border pt-3"
+        data-setting-key={KIRO_SIGN_IN_HIGHLIGHT_ANCHOR}
+        data-testid="kiro-sign-in-card"
+      >
+        <h3 className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-text-strong">
+          <KeyRound className="lucide-inline" aria-hidden="true" />
+          {title}
+        </h3>
+        {body}
+      </section>
+    )
+  }
+  return (
+    <Card data-setting-key={KIRO_SIGN_IN_HIGHLIGHT_ANCHOR} data-testid="kiro-sign-in-card">
+      <CardTitle>
+        <KeyRound className="lucide-inline" aria-hidden="true" />
+        {title}
+      </CardTitle>
+      {body}
     </Card>
   )
 }

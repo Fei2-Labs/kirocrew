@@ -10,6 +10,8 @@ text without rendering it; both producers must apply it.
 
 from __future__ import annotations
 
+import time
+
 from kiro_crew.dashboard.state import _ChatSlot
 from kiro_crew.preview_text import strip_markdown_preview
 
@@ -98,6 +100,20 @@ class TestStripMarkdownPreview:
         assert strip_markdown_preview("![screenshot](/tmp/a.png)") == "screenshot"
         assert strip_markdown_preview("![](/tmp/a.png)") == "(image)"
 
+    def test_a_balanced_pair_in_a_link_url_leaves_only_the_label(self):
+        url = "https://en.wikipedia.org/wiki/Python_(programming_language)"
+        assert strip_markdown_preview(f"see [Python]({url}) now") == "see Python now"
+
+    def test_a_balanced_pair_in_an_image_url_leaves_only_the_alt(self):
+        assert strip_markdown_preview("![chart](https://x.y/a_(b).png) now") == "chart now"
+        assert strip_markdown_preview("![](https://x.y/a_(b).png) now") == "(image) now"
+
+    def test_an_unbalanced_link_url_is_left_as_written(self):
+        # No channel renderer and no CommonMark reader links this, so the
+        # preview shows what the message shows.
+        src = "see [a](https://x.y/(b) now"
+        assert strip_markdown_preview(src) == src
+
     def test_headers_quotes_bullets_stripped(self):
         src = "## Summary\n> quoted\n- item one\n2. item two"
         assert strip_markdown_preview(src) == "Summary quoted item one item two"
@@ -137,6 +153,25 @@ class TestStripMarkdownPreview:
     def test_format_chars_dropped_from_mixed_content(self):
         # Dropped, not turned into spaces: visible text stays intact.
         assert strip_markdown_preview("a\u200bb c") == "ab c"
+
+    def test_indented_line_markers_still_stripped(self):
+        # The line-anchored markers accept horizontal indentation only
+        # ([^\S\n], not \s) — same visible result, linear scan.
+        src = "  > quoted\n\t- item\n   2. two\n  ---  \nend"
+        assert strip_markdown_preview(src) == "quoted item two end"
+
+    def test_blank_line_runs_do_not_backtrack(self):
+        # CWE-1333 / py/polynomial-redos regression: with MULTILINE ^\s*,
+        # every line-start anchor in a run of blank lines rescanned the
+        # run's remainder — O(n^2). A ~100k-char whitespace-heavy preview
+        # wedged the gateway event loop past the 25s watchdog window at
+        # dashboard boot, and the same persisted slot re-triggered it on
+        # every restart (dump-then-exit crash loop). Linear now.
+        evil = "x" + "\n" * 100_000 + " " * 100_000 + "tail"
+        start = time.perf_counter()
+        assert strip_markdown_preview(evil) == "x tail"
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"preview strip too slow ({elapsed:.2f}s) — may backtrack"
 
 
 class TestSlotLastMessageStripsMarkdown:

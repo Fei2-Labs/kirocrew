@@ -30,6 +30,7 @@ import time
 import pytest
 
 from kiro_crew import platform_compat, sandbox
+from kiro_crew.testing.wait import wait_until
 
 _WINDOWS_ONLY = pytest.mark.skipif(
     not platform_compat.IS_WINDOWS, reason="Job objects are Windows-only"
@@ -456,3 +457,218 @@ class TestPosixIsUnaffected:
         monkeypatch.setattr(sandbox.platform_compat, "apply_job_limits", _boom)
         assert sandbox.apply_windows_resource_ceiling(1) is False
         assert not called, "POSIX must never reach the Job object path"
+
+
+# A pid no OS hands out, so a stub that leaks to a real syscall cannot hit a live process.
+_UNALLOCATABLE_PID = 99_999_999_999
+
+
+class TestInertResourceLimitsWarning:
+    """Keys Windows cannot enforce are named once, never silently dropped.
+
+    Ungated: the platform is faked through ``platform_compat.IS_WINDOWS`` so the
+    Linux/macOS runners prove both arms.
+    """
+
+    @staticmethod
+    def _arm(monkeypatch, raw: dict) -> None:
+        monkeypatch.setattr(sandbox, "_WINDOWS_INERT_LIMITS_WARNED", False)
+        monkeypatch.setattr("kiro_crew.config.loader._raw_config", lambda: {"resource_limits": raw})
+        monkeypatch.setattr(sandbox, "_cgroup_limits_from_config", lambda: (7, 321, 100, 0))
+        monkeypatch.setattr(sandbox.platform_compat, "apply_job_limits", lambda *a, **k: True)
+
+    def test_windows_names_each_set_inert_key_once(self, monkeypatch, caplog) -> None:
+        self._arm(
+            monkeypatch, {"cpu_weight": 80, "max_total_memory_mb": 4096, "max_cpu_percent": 0}
+        )
+        monkeypatch.setattr(sandbox.platform_compat, "IS_WINDOWS", True)
+        caplog.set_level("WARNING", logger="kiro_crew.sandbox")
+
+        assert sandbox.apply_windows_resource_ceiling(_UNALLOCATABLE_PID) is True
+        assert sandbox.apply_windows_resource_ceiling(_UNALLOCATABLE_PID) is True
+
+        hits = [
+            r.getMessage() for r in caplog.records if "not enforced on Windows" in r.getMessage()
+        ]
+        assert len(hits) == 1
+        assert "resource_limits.cpu_weight" in hits[0]
+        assert "resource_limits.max_total_memory_mb" in hits[0]
+        # A zero value is "unset" for the opt-in quota, so it is not named.
+        assert "max_cpu_percent" not in hits[0]
+
+    def test_windows_without_inert_keys_logs_nothing(self, monkeypatch, caplog) -> None:
+        self._arm(monkeypatch, {"max_processes": 64, "max_memory_mb": 2048})
+        monkeypatch.setattr(sandbox.platform_compat, "IS_WINDOWS", True)
+        caplog.set_level("WARNING", logger="kiro_crew.sandbox")
+
+        assert sandbox.apply_windows_resource_ceiling(_UNALLOCATABLE_PID) is True
+        assert not [r for r in caplog.records if "not enforced on Windows" in r.getMessage()]
+
+    def test_linux_never_reaches_the_warning(self, monkeypatch) -> None:
+        self._arm(monkeypatch, {"cpu_weight": 80, "max_total_memory_mb": 4096})
+        monkeypatch.setattr(sandbox.platform_compat, "IS_WINDOWS", False)
+        calls: list[None] = []
+        monkeypatch.setattr(
+            sandbox, "_warn_windows_inert_resource_limits_once", lambda: calls.append(None)
+        )
+
+        assert sandbox.apply_windows_resource_ceiling(_UNALLOCATABLE_PID) is False
+        assert calls == []
+
+
+class TestPythonLauncherHops:
+    """A venv's ``Scripts\\python.exe`` is a redirector, and a process ceiling has to count it.
+
+    Ungated: driven by pinning ``IS_WINDOWS`` and the two ``sys`` executables, so the
+    POSIX runners prove the derivation and the ``0`` they must always get.
+    """
+
+    def test_posix_never_counts_a_hop(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+        monkeypatch.setattr(sys, "_base_executable", str(tmp_path / "base"), raising=False)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "venv"))
+        assert platform_compat.python_launcher_hops() == 0
+
+    def test_an_interpreter_is_one_process(self, monkeypatch, tmp_path) -> None:
+        exe = tmp_path / "python.exe"
+        exe.write_bytes(b"")
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(sys, "_base_executable", str(exe), raising=False)
+        monkeypatch.setattr(sys, "executable", str(exe))
+        assert platform_compat.python_launcher_hops() == 0
+
+    def test_a_redirector_is_one_extra_process(self, monkeypatch, tmp_path) -> None:
+        base = tmp_path / "base" / "python.exe"
+        venv = tmp_path / "venv" / "Scripts" / "python.exe"
+        for p in (base, venv):
+            p.parent.mkdir(parents=True)
+            p.write_bytes(b"")
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(sys, "_base_executable", str(base), raising=False)
+        monkeypatch.setattr(sys, "executable", str(venv))
+        assert platform_compat.python_launcher_hops() == 1
+
+    def test_an_unresolvable_path_fails_toward_the_hop(self, monkeypatch, tmp_path) -> None:
+        """``realpath`` raising must not read as "one process": over-counting is
+        harmless, under-counting refuses the child. Differing spellings count the
+        hop; identical spellings do not."""
+        import os
+
+        def boom(_p):
+            raise OSError("unresolvable")
+
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(os.path, "realpath", boom)
+        monkeypatch.setattr(
+            sys, "_base_executable", str(tmp_path / "base" / "python.exe"), raising=False
+        )
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "venv" / "Scripts" / "python.exe"))
+        assert platform_compat.python_launcher_hops() == 1
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "base" / "python.exe"))
+        assert platform_compat.python_launcher_hops() == 0
+
+    def test_no_base_executable_means_no_hop(self, monkeypatch, tmp_path) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(sys, "_base_executable", "", raising=False)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / "python.exe"))
+        assert platform_compat.python_launcher_hops() == 0
+
+    @_WINDOWS_ONLY
+    def test_a_sys_executable_child_starts_under_a_ceiling_of_one_plus_the_hop(self) -> None:
+        """Live kernel: the exact spawn ``pdf_extract`` makes, under the exact ceiling.
+
+        A suspended ``sys.executable -c`` child gets ``ActiveProcessLimit`` of
+        ``1 + hops``. From an interpreter that is one process and the child prints;
+        from a venv it is the redirector plus the interpreter it spawns, and with
+        the hop uncounted the redirector's ``CreateProcess`` is refused (exit 101,
+        ``Unable to create process using ...``) -- which is what every PDF read
+        from a venv-hosted gateway on Windows hit. Whether THIS run is venv-hosted
+        is a host fact, so the assertion is on the derived number, in both arms.
+        """
+        hops = platform_compat.python_launcher_hops()
+
+        def run_under(max_procs: int) -> tuple[int, str, str]:
+            child = subprocess.Popen(
+                [sys.executable, "-c", "print('ran')"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                creationflags=platform_compat.CREATE_SUSPENDED
+                | platform_compat._SUBPROCESS_NO_WINDOW,
+            )
+            try:
+                assert platform_compat.apply_job_limits(
+                    child.pid, max_procs=max_procs, max_memory_bytes=512 * 1024 * 1024
+                )
+                assert platform_compat.resume_process_main_thread(child.pid)
+                out, err = child.communicate(timeout=60)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=15)
+            return child.returncode, out, err
+
+        rc, out, _err = run_under(1 + hops)
+        assert (rc, out.strip()) == (0, "ran")
+        if hops:
+            # The negative arm, only where the host can show it: the uncounted
+            # redirector is exactly the refusal the helper exists to prevent.
+            rc, _out, err = run_under(1)
+            assert rc == 101, (rc, err)
+            assert "Unable to create process" in err
+
+    @_WINDOWS_ONLY
+    def test_a_timed_out_redirector_child_does_not_outlive_the_deadline(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Live kernel, the real ``pdf_extract`` deadline path: the interpreter the
+        venv redirector spawns is gone after the timeout, not orphaned behind a
+        dead parent. This pins the PROPERTY, not the mechanism: CPython's
+        redirector runs its child inside its own ``KILL_ON_JOB_CLOSE`` job, so on
+        this host the interpreter dies with the redirector even with the tree kill
+        neutralised (measured). The tree kill makes the guarantee the gateway's
+        own rather than the launcher's implementation detail, and
+        ``test_pdf_extract.TestWindowsCeiling`` pins that it is issued. On an
+        interpreter host there is no redirector and this degenerates to "the one
+        child is gone", which still holds.
+        """
+        from kiro_crew import pdf_extract
+
+        pid_file = tmp_path / "child.pid"
+        code = (
+            "import os, time, pathlib; "
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+            "time.sleep(8)"
+        )
+        monkeypatch.setattr(pdf_extract, "_child_argv", lambda *_a: [sys.executable, "-c", code])
+        pdf = (
+            b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[]/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n"
+        )
+        child_pid: int | None = None
+        try:
+            outcome = pdf_extract.extract_pdf_segments(
+                pdf, max_chars=10, deadline=time.monotonic() + 2.0
+            )
+            assert outcome.failure == "timeout", outcome
+            assert pid_file.is_file(), "the interpreter never started, so the test measured nothing"
+            child_pid = int(pid_file.read_text())
+            wait_until(
+                lambda: not platform_compat.pid_exists(child_pid),
+                timeout=10,
+                describe=lambda: f"interpreter {child_pid} is still alive",
+            )
+            assert not platform_compat.pid_exists(
+                child_pid
+            ), f"interpreter {child_pid} outlived its redirector"
+        finally:
+            # The failing arm of this test IS an orphaned interpreter, so the
+            # kill it asserts on cannot be the only kill: collect the recorded
+            # pid here whether or not the product did. The sleeper is short
+            # enough that even a missed kill self-heals within the test's budget.
+            if child_pid is not None and platform_compat.pid_exists(child_pid):
+                try:
+                    platform_compat.kill_pid(child_pid, platform_compat.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass

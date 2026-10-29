@@ -71,10 +71,14 @@ async def forward_completion(
     settings: common.Settings,
     body: dict[str, Any],
 ) -> Response:
-    """Single, non-streamed turn. Relays the backend's status and body verbatim.
+    """Single, non-streamed turn. Relays the backend's status and body.
 
     A non-streamed completion returns assistant text; the backend's ``/v1``
     ``usage`` block is hardcoded to zero, so there is nothing to redact here.
+
+    The one field that is not relayed as it arrived is ``model``: the customer sees
+    the crew they addressed, not the agent id the backend was asked for. See
+    :func:`_with_customer_model`.
     """
     url = settings.backend_base_url + TURN_PATH
     headers = build_outbound_headers(_read_secret(settings), stream=False)
@@ -108,10 +112,37 @@ async def forward_completion(
         )
 
     return Response(
-        content=resp.content,
+        content=_with_customer_model(resp.content, settings.crew_name),
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type", "application/json"),
     )
+
+
+def _with_customer_model(content: bytes, crew_name: str) -> bytes:
+    """*content* with its ``model`` reading as the crew the customer addressed.
+
+    A crew's spec is installed and dispatched inside the crew namespace, so the id
+    this process sends as ``model`` is not the name the customer used, and the
+    backend echoes the id it was given. A customer who read that id back and sent it
+    as ``model`` would be told this deployment does not serve it, which is a broken
+    round trip on the one field the OpenAI shape requires. The namespace is applied on
+    the way in by ``front.app._forward_body`` and undone here, so it never leaves this
+    process.
+
+    Relays the bytes UNCHANGED for everything it cannot confidently rewrite: a body
+    that is not a JSON object, one with no string ``model``, or one already naming the
+    crew. Re-serialising a payload this function does not understand would be a worse
+    answer than an unrewritten field.
+    """
+    try:
+        obj = json.loads(content)
+    except (ValueError, TypeError):
+        return content
+    if not isinstance(obj, dict) or not isinstance(obj.get("model"), str):
+        return content
+    if obj["model"] == crew_name:
+        return content
+    return json.dumps({**obj, "model": crew_name}, ensure_ascii=False).encode("utf-8")
 
 
 def forward_stream(
@@ -187,7 +218,9 @@ def forward_stream(
                         yield _sse_error("upstream error")
                         return
 
-                    async for frame in project_sse(resp.aiter_bytes()):
+                    async for frame in project_sse(
+                        resp.aiter_bytes(), crew_name=settings.crew_name
+                    ):
                         yield frame
                 finally:
                     if entered is not None:

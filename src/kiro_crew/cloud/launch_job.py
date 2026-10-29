@@ -96,6 +96,24 @@ class LaunchCancelled(Exception):
     then rolled back rather than abandoned."""
 
 
+class RegistrationUnavailable(Exception):
+    """An engine's ``register`` could not add the crew, and the launch stands anyway.
+
+    The narrow case where a failed connect step must NOT fail the launch: the
+    compute exists, it is billing, and the only thing missing is the registry row.
+    An engine raises this when it can say that positively — the crew list can be
+    repaired from Settings, the running crew cannot be recovered from a red card
+    that reports the launch itself as failed.
+
+    Distinct from every other exception a register may raise, which stays fatal.
+    ``RealLaunchEngine.register`` raises a plain ``RuntimeError`` on purpose: for
+    the EC2 lane a missing row means an instance the user was told about and
+    cannot see, so that one fails the launch. The difference is not which lane it
+    is, it is whether the engine knows the launch is sound; this type is how an
+    engine says so, and an engine that raises anything else has not said it.
+    """
+
+
 # ── State model ──────────────────────────────────────────────────────────────
 @dataclass
 class SigninPrompt:
@@ -182,6 +200,8 @@ class LaunchJob:
     #: read is answered by reading them. Kept off ``error`` because the retry
     #: worker clears that field as routine state, which would drop the guard.
     target_unreadable: bool = False
+    # Explicit EC2 subnet (the VPC follows from it); empty = network auto-discovery.
+    subnet_id: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -210,6 +230,7 @@ class LaunchJob:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "login_target": self.login_target.to_dict(),
+            "subnet_id": self.subnet_id,
         }
 
     @classmethod
@@ -253,6 +274,7 @@ class LaunchJob:
             provider_id=str(d.get("provider_id") or BUILTIN_PROVISIONER_ID),
             login_target=login_target,
             target_unreadable=target_unreadable,
+            subnet_id=str(d.get("subnet_id") or ""),
         )
 
 
@@ -327,6 +349,7 @@ class LaunchJobStore:
         provider_id: str = BUILTIN_PROVISIONER_ID,
         step_labels: Optional[Mapping[str, str]] = None,
         login_target: Optional[KiroLoginTarget] = None,
+        subnet_id: str = "",
     ) -> LaunchJob:
         """Build + persist a fresh PENDING job.
 
@@ -345,11 +368,12 @@ class LaunchJobStore:
         job = LaunchJob(
             id=_new_job_id(),
             profile=profile,
-            region=region,
+            region=region or _default_region(),
             size_key=size_key,
             provider_id=provider_id,
             steps=default_steps(step_labels),
             login_target=login_target or KiroLoginTarget(),
+            subnet_id=subnet_id,
         )
         # Claim ownership BEFORE the file exists. `reap_orphans` spares only jobs this
         # process owns, and it runs off the event loop: a reap already in flight can
@@ -733,10 +757,10 @@ def mark_signed_in(job: "LaunchJob", detail: str = "Signed in.") -> None:
     Three paths confirm one: the retry's own wait, its already-signed-in answer,
     and the dashboard's re-probe of a preserved code. Setting ``signin_detected``
     alone leaves the rest of the job saying the opposite -- an "Interrupted"
-    error from a restart, a connect step still reading "Finish the Kiro sign-in
-    before connecting." A card that says signed
-    in and not signed in at once is the state this feature exists to remove, so
-    the normalisation lives in one place.
+    error from a restart, a connect step still reading "Sign in to Kiro on the
+    crew after you connect." A card that says signed in and not signed in at
+    once is the state this feature exists to remove, so the normalisation lives
+    in one place.
     """
     job.signin_detected = True
     job.signin = None
@@ -796,12 +820,16 @@ def _rollback_cancelled_stack(
 ) -> None:
     """Delete the stack a cancelled launch had already created.
 
-    Cancellation is only observed *between* steps, and the instance is not added to
-    the crew registry until the final step. So a cancel during provisioning — or
-    during the sign-in wait, which is the likeliest moment for a human to give up —
-    would otherwise leave a running, billing instance that never appears in the crew
-    list: invisible to the very dashboard that offered the Cancel button, and
-    removable only from the CLI or the AWS console.
+    Cancellation is only observed *between* steps, so a cancel during
+    provisioning — or during the sign-in wait, which is the likeliest moment for a
+    human to give up — would otherwise leave a running, billing instance that
+    never appears in the crew list: invisible to the very dashboard that offered
+    the Cancel button, and removable only from the CLI or the AWS console.
+
+    A cancel observed just after the registration step is the other way round: the
+    record exists and the resource is about to stop. Removing it belongs to the
+    engine's ``teardown``, which knows which resources it actually stopped, rather
+    than here, where the registry needle would have to be guessed from the tag.
 
     Ack, then confirm. The cancelled state is persisted BEFORE the delete is awaited
     so the card stops saying "running" immediately, and the outcome is only written
@@ -883,6 +911,30 @@ def _rollback_failed_provision(
     logger.warning("Rollback of %s after provision failure did not confirm", job.tag)
 
 
+def _default_region() -> str:
+    """The region a launch uses when the caller named none.
+
+    The operator's configured region first, then the AWS default the config
+    itself falls back to. Resolved HERE rather than at each call site because
+    every provisioner's preflight refuses an empty region -- the Fargate
+    identity check reports it as ``region='' is not a region``, which reads as a
+    malformed value rather than an absent one -- and a caller that simply has no
+    region to send (the Settings form posting a body without the field) would
+    otherwise fail at preflight instead of using the region the operator already
+    configured.
+
+    Guarded, because a launch must not fail on an unreadable config file: an
+    unreadable one leaves the region empty and the preflight refusal stands,
+    which is the same outcome as before and names the real problem.
+    """
+    try:
+        from kiro_crew.cloud.config import CloudConfig
+
+        return str(CloudConfig.load().region or "")
+    except Exception:  # noqa: BLE001 - a bad config is the preflight's to report
+        return ""
+
+
 def _new_tag() -> str:
     return f"kc-{secrets.token_hex(3)}"
 
@@ -942,8 +994,10 @@ def run_launch(
         # 2) Provision (create instance + install; blocks until healthy)
         _check_cancel()
         s = _activate(STEP_PROVISION)
+        # Only the built-in EC2 engine takes a subnet; the handler refuses it elsewhere.
+        subnet = {"subnet_id": job.subnet_id} if job.subnet_id else {}
         job.instance_id = engine.provision(
-            tag=job.tag, size_key=job.size_key, profile=job.profile, region=job.region
+            tag=job.tag, size_key=job.size_key, profile=job.profile, region=job.region, **subnet
         )
         s.detail = job.instance_id
         s.state = STEP_DONE
@@ -1010,20 +1064,54 @@ def run_launch(
         # 4) Register in the Instances hub so it appears under "Your crews"
         _check_cancel()
         s = _activate(STEP_CONNECT)
-        engine.register(
-            instance_id=job.instance_id, tag=job.tag, profile=job.profile, region=job.region
-        )
-        s.state = STEP_DONE
-        # The step ran -- the instance is registered -- but a green check with no
-        # words beside "Connect" reads as ready to use. Say what is still owed
-        # when the sign-in did not confirm; the card's icon shows a waiting key in
-        # that case and this is the sentence under it.
-        s.detail = (
-            "Added to Your crews."
-            if job.signin_detected
-            else "Added to Your crews. Finish the Kiro sign-in before connecting."
-        )
-        store.save(job)
+        registration_error = ""
+        try:
+            engine.register(
+                instance_id=job.instance_id, tag=job.tag, profile=job.profile, region=job.region
+            )
+        except RegistrationUnavailable as exc:
+            # The engine has said the launch itself is sound and only the registry
+            # row is missing. Recording it on the step and continuing is the whole
+            # point: the compute exists and is billing, so reporting the LAUNCH as
+            # failed would put a red card over a running crew and leave its owner
+            # with nothing to act on, while the real remedy — add it under Remote
+            # crew, or tear it down — needs the launch to be reported as it is.
+            # Every other exception propagates and fails the launch, unchanged.
+            #
+            # NOT saved here, unlike the branch below. A failed connect step with a
+            # non-terminal status is the one combination ``reap_orphans`` reads as an
+            # interrupted launch, and it rewrites the status to FAILED -- so a
+            # restart between this point and the terminal save would turn the DONE
+            # this path is heading for into a red card over a running crew, the exact
+            # outcome the paragraph above rejects. Both exits below save, so the
+            # step, its reason and the terminal status land in ONE write and no
+            # window persists one without the others.
+            registration_error = str(exc)
+            s.state = STEP_FAILED
+            s.detail = registration_error[:400]
+        else:
+            s.state = STEP_DONE
+            # The step ran -- the instance is registered -- but a green check with no
+            # words beside "Connect" reads as ready to use. Say what is still owed
+            # when the sign-in did not confirm; the card's icon shows a waiting key in
+            # that case and this is the sentence under it.
+            s.detail = (
+                "Added to Your crews."
+                if job.signin_detected
+                else "Added to Your crews. Sign in to Kiro on the crew after you connect."
+            )
+            store.save(job)
+
+        # The register step can BLOCK now: the Fargate engine polls DescribeTasks for
+        # up to REGISTER_TARGET_TIMEOUT_SECONDS waiting for a runtime id, where the
+        # EC2 engine returns at once. A cancel arriving inside that wait only sets the
+        # event -- the route tears nothing down -- so without this check the launch
+        # would fall straight through to DONE and the cancelled crew would keep
+        # billing with its cancel silently dropped. Checked AFTER the step rather than
+        # inside the poll, which is how ``provision`` already treats a cancel during a
+        # long AWS call: acted on when the call returns. Raising here reaches the
+        # handler below, which aborts the sign-in and rolls the task back.
+        _check_cancel()
 
         if signin_error:
             # Registered (visible, recoverable) but NOT done: the crew is running
@@ -1033,6 +1121,14 @@ def run_launch(
             job.status = FAILED
             store.save(job)
             return job
+
+        if registration_error:
+            # DONE, because the task launched -- which is what this status reports.
+            # The reason is carried on ``job.error`` as well as on the step so it
+            # reaches a reader who sees only the job: a launch that finished with
+            # the crew absent from the list is the one outcome here that still
+            # needs a human to do something.
+            job.error = registration_error[:400]
 
         job.status = DONE
         store.save(job)

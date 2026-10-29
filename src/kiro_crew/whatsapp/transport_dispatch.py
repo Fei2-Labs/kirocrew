@@ -26,12 +26,16 @@ from kiro_crew.messaging.approval import (
 from kiro_crew.messaging.commands import (
     compact_refusal_plain_text,
     compact_unsupported_backend,
+    context_recycle_warning,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import (
     ConversationState,
     reserve_new_generation,
 )
 from kiro_crew.messaging.dispatch import (
+    TOOLLESS_TURN_AGENT,
     ChannelTurn,
     admit_inbound_callback,
     delivery_is_muted,
@@ -42,11 +46,19 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+)
+from kiro_crew.start_priority import person_priority
 from kiro_crew.whatsapp.commands import (
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
     COMPACT_NOTHING_TEXT,
+    COMPACT_TIMED_OUT_TEXT,
     COMPACTED_TEXT,
     CONTEXT_LONG_TEXT,
     NEW_SESSION_TEXT,
@@ -69,6 +81,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_AGENT = "kirocrew"
+#: Scope segment appended to a group JID for a non-operator's own session bucket
+#: in that group. Colon-free by construction, so it is one more scope segment in
+#: the ``{channel}:{agent}:{chat_type}:{scope}`` key shape.
+GUEST_SCOPE_SEGMENT = "guest"
+
+#: The receipt a sender gets while a reply is still streaming into their chat.
+BUSY_NOTE = "Still working on the last message; please resend shortly."
 
 #: Phase reactions placed on the OPERATOR'S OWN inbound message, which is the
 #: same affordance Slack draws with its status reactions. Reacting to their
@@ -259,6 +278,22 @@ class WhatsAppDispatcher:
             logger.warning("whatsapp: could not build the status summary", exc_info=True)
             return STATUS_UNAVAILABLE_TEXT
 
+    def _live_session_key(self, scope: str) -> str:
+        """The session key of *scope* a command should act on.
+
+        A group has two buckets, the operator's and the members' (tool-less
+        agent, ``guest`` segment). A command typed by the operator addresses the
+        conversation, not a bucket, so it acts on whichever bucket is busy; the
+        operator's own when neither is. Only the operator reaches this: a
+        non-operator's commands are dropped by the transport.
+        """
+        own = self._session_key(scope, is_operator=True)
+        if is_group_jid(scope) and not self.sessions.is_busy(own):
+            other = self._session_key(scope, is_operator=False)
+            if self.sessions.is_busy(other):
+                return other
+        return own
+
     async def _handle_stop(self, scope: str) -> None:
         """Cooperative cancel, then report which of the two things happened.
 
@@ -268,13 +303,36 @@ class WhatsAppDispatcher:
         for both would leave them unsure whether the reply they were waiting on
         is still coming.
         """
-        session_key = self._session_key(scope)
+        session_key = self._live_session_key(scope)
+        # A repeat within the window after a declined stop is the second press
+        # and forces; the first decline records the marker below. Only the
+        # operator reaches a command, so the conversation names the presser.
+        force = consume_stop_declined(session_key, scope) and compaction_in_flight(
+            self.sessions, session_key
+        )
         try:
-            outcome = await self.sessions.stop_turn(session_key)
+            # ``preserve_queue`` on the force: the hard reset pops the session
+            # and its queue, and under a unified ``dm_scope`` that queue holds
+            # other channels' messages; ``stop_turn`` parks them for the
+            # successor instead. This channel queues nothing of its own.
+            outcome = await (
+                self.sessions.stop_turn(session_key, force=True, preserve_queue=True)
+                if force
+                else self.sessions.stop_turn(session_key)
+            )
         except Exception:  # noqa: BLE001: the queue clear below still applies
             logger.warning("whatsapp: stop_turn failed", exc_info=True)
             outcome = None
-        stopped = str(getattr(outcome, "kind", outcome) or "") in ("soft", "hard")
+        kind = str(getattr(outcome, "kind", outcome) or "")
+        if kind == "compacting":
+            # Sent before the marker is armed: an undelivered warning plus an
+            # armed escalation is a retry that hard-resets the session with the
+            # operator never told that it would.
+            await decline_stop(
+                session_key, scope, lambda: self._say(scope, STOP_DECLINED_COMPACTING_TEXT)
+            )
+            return
+        stopped = kind in ("soft", "hard")
         await self._say(scope, STOPPED_TEXT if stopped else STOP_NOTHING_RUNNING_TEXT)
 
     async def _handle_compact(self, scope: str) -> None:
@@ -288,7 +346,7 @@ class WhatsAppDispatcher:
         wrong one leaves them waiting for a compaction that will never happen.
         Whatever is acquired is always released.
         """
-        session_key = self._session_key(scope)
+        session_key = self._live_session_key(scope)
         if not await self.sessions.try_acquire(session_key):
             has_session = False
             try:
@@ -312,8 +370,17 @@ class WhatsAppDispatcher:
                 await self._say(scope, compact_refusal_plain_text(unsupported))
                 return
             await provider.compact()
-            await provider.wait_for_compaction()
-            await self._say(scope, COMPACTED_TEXT)
+            # Failure and timeout come back as the result's ``type``, not as an
+            # exception, so the receipt is read off it rather than assumed.
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
+            if cr["type"] == "completed":
+                await self._say(scope, COMPACTED_TEXT)
+            elif cr["type"] == "failed":
+                await self._say(scope, COMPACT_FAILED_TEXT)
+            else:
+                await self._say(scope, COMPACT_TIMED_OUT_TEXT)
         except Exception:
             logger.exception("whatsapp: /compact failed for %s", session_key)
             await self._say(scope, COMPACT_FAILED_TEXT)
@@ -362,6 +429,13 @@ class WhatsAppDispatcher:
         if self.sessions.is_busy(session_key):
             await self._handle_busy(inbound, session_key)
             return
+        if group and self.sessions.is_busy(self._session_key(scope, is_operator=not is_operator)):
+            # Back-pressure is a property of the CONVERSATION: a group has two
+            # buckets (the operator's and the members'), and a reply streaming
+            # from either is a reply in this chat. The other bucket is never this
+            # sender's to steer, so only the receipt is sent.
+            await self._say(scope, BUSY_NOTE)
+            return
         m = self._live_cfg().messaging
         self._conv.maybe_rotate(
             scope,
@@ -409,6 +483,7 @@ class WhatsAppDispatcher:
             # Resolved at delivery time: the shared pipeline acquires the
             # provider inside the turn, so its cwd is not known here yet.
             upload_root=lambda: self._provider_cwd(session_key),
+            scratch_root=lambda: self._provider_scratch_dir(session_key),
         )
         user_text = inbound.text
         if unprompted:
@@ -416,6 +491,7 @@ class WhatsAppDispatcher:
         await self._react(inbound, REACTION_WORKING, session_key=session_key)
         await drive_turn(
             ChannelTurn(
+                start_priority=person_priority(inbound.person_origin),
                 channel_type="whatsapp",
                 session_key=session_key,
                 conversation_id=f"whatsapp:{scope}",
@@ -443,6 +519,7 @@ class WhatsAppDispatcher:
                 decider=decider,
                 auto_approve_session=(decider.trusted if decider is not None else None),
                 deny_all_tools=deny_all_tools,
+                unprompted=unprompted,
                 # Private context is withheld whenever the SESSION is shared, not
                 # merely when the current sender is not the operator. Denying
                 # their tools does not reach this: the disclosure is in the
@@ -532,6 +609,18 @@ class WhatsAppDispatcher:
             return ""
         return str(getattr(provider, "cwd", "") or "")
 
+    def _provider_scratch_dir(self, session_key: str) -> str:
+        """The acquired provider's runtime ``$KIROCREW_SCRATCH``, or "" when unknown.
+
+        Where the agent is told to stage screenshots; admitted only beside the
+        cwd root, so empty just leaves the cwd as the one tree.
+        """
+        try:
+            provider = self.sessions.get_provider(session_key)
+        except Exception:  # noqa: BLE001
+            return ""
+        return str(getattr(provider, "work_scratch_dir", None) or "")
+
     async def _handle_busy(self, inbound: InboundMessage, session_key: str) -> None:
         if not self.sessions.is_busy(session_key):
             await self.handle_message(inbound)
@@ -553,11 +642,9 @@ class WhatsAppDispatcher:
             and steer is not None
             and await steer(inbound.text)
         )
-        if ok:
-            note = "Folded into the current reply."
-        else:
-            note = "Still working on the last message; please resend shortly."
-        await self._say(inbound.conversation_id, note)
+        await self._say(
+            inbound.conversation_id, "Folded into the current reply." if ok else BUSY_NOTE
+        )
 
     async def _maybe_notice(
         self, scope: str, session_key: str, provider: Any, *, unprompted: bool
@@ -583,6 +670,14 @@ class WhatsAppDispatcher:
         pct = self.sessions.check_context_usage(session_key, provider)
         may_speak = not unprompted and not delivery_is_muted(self.sessions, session_key, "whatsapp")
         soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(
+                self.sessions, self._conv, scope, session_key, pct, may_speak=may_speak
+            ):
+                await self._say(scope, context_recycle_warning())
+            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -598,9 +693,17 @@ class WhatsAppDispatcher:
             self._conv.clear_awaiting(scope)
             try:
                 await provider.compact()
-                await provider.wait_for_compaction()
+                result = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
+                kind = result["type"]
             except Exception:  # noqa: BLE001: the reply already landed
                 logger.debug("whatsapp: hard-threshold compaction failed", exc_info=True)
+                return
+            # A failed or timed-out compaction is a RETURNED result, not an
+            # exception, so the notice is posted only for a completed one.
+            if kind != "completed":
+                logger.warning("whatsapp: hard-threshold compaction reported %s", kind)
                 return
             if may_speak:
                 await self._say(scope, COMPACT_AUTO_TEXT)
@@ -625,13 +728,24 @@ class WhatsAppDispatcher:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "WhatsApp"
             self.conv_log.set_title(session_key, title)
 
-    async def _say(self, chat_jid: str, text: str) -> None:
+    async def _say(self, chat_jid: str, text: str) -> bool:
+        """Send one out-of-band message; did it land?
+
+        Most callers ignore the answer -- a command ack is cosmetic beside the
+        command's effect. One does not: the compaction decline arms an escalation
+        that resets the session on the next press, and the only thing that makes
+        that press informed is this text arriving. A missing transport and a
+        swallowed send error both return ``False`` so that escalation stays
+        unarmed.
+        """
         if self.transport is None:
-            return
+            return False
         try:
             await self.transport.send_message(chat_jid, text)
         except Exception:
             logger.warning("whatsapp: out-of-band send failed", exc_info=True)
+            return False
+        return True
 
     def _session_key(self, scope: str, *, is_operator: bool = True) -> str:
         """The session address for *scope*.
@@ -644,6 +758,15 @@ class WhatsAppDispatcher:
         admitted peer could ask what was discussed earlier and be told. A
         non-operator therefore always gets their own per-peer bucket, whatever
         the global setting says.
+
+        A non-operator's bucket is also built under the tool-less agent every
+        ``deny_all_tools`` turn runs on (``dispatch.TOOLLESS_TURN_AGENT``), and in
+        a GROUP it is a per-group bucket that is not the operator's: the shared
+        pipeline drives such a turn on that agent, and ``get_or_create`` keeps an
+        existing session's agent, so a key shared with the operator's tooled
+        session would either hand the member the operator's tools or refuse the
+        turn. The group's shared session belongs to the operator; admitted members
+        get one of their own for the group, minimal-context like every group turn.
         """
         from kiro_crew.messaging.link import (
             CHAT_TYPE_DIRECT,
@@ -654,10 +777,16 @@ class WhatsAppDispatcher:
         chat_type = CHAT_TYPE_FORUM if is_group_jid(scope) else CHAT_TYPE_DIRECT
         gen = self._conv.current_gen(scope)
         dm_scope = str(self.cfg.messaging.dm_scope) if is_operator else DM_SCOPE_PER_CHANNEL_PEER
+        if is_operator:
+            agent = self._resolve_agent()
+            user = scope
+        else:
+            agent = TOOLLESS_TURN_AGENT
+            user = f"{scope}:{GUEST_SCOPE_SEGMENT}" if chat_type == CHAT_TYPE_FORUM else scope
         return build_dm_session_key(
             "whatsapp",
-            self._resolve_agent(),
-            scope,
+            agent,
+            user,
             gen=gen,
             dm_scope=dm_scope,
             chat_type=chat_type,
@@ -684,13 +813,33 @@ class WhatsAppDispatcher:
         live in, answer 0, and reintroduce exactly the resurrection this seeding
         exists to prevent.
         """
-        from kiro_crew.messaging.link import CHAT_TYPE_DIRECT, CHAT_TYPE_FORUM
+        from kiro_crew.messaging.link import (
+            CHAT_TYPE_DIRECT,
+            CHAT_TYPE_FORUM,
+            DM_SCOPE_PER_CHANNEL_PEER,
+        )
 
-        return seed_generation(
+        chat_type = CHAT_TYPE_FORUM if is_group_jid(scope) else CHAT_TYPE_DIRECT
+        operator_gen = seed_generation(
             self.sessions,
             channel="whatsapp",
             agent=self._resolve_agent(),
             user_id=scope,
             dm_scope=str(self.cfg.messaging.dm_scope),
-            chat_type=CHAT_TYPE_FORUM if is_group_jid(scope) else CHAT_TYPE_DIRECT,
+            chat_type=chat_type,
         )
+        # The non-operator bucket for the same scope lives under the tool-less
+        # agent (and a ``guest`` segment in a group) and shares this scope's
+        # generation counter. Seeding from the operator's bucket alone under-seeds
+        # when only members have talked since the last restart, handing a member
+        # back a generation whose session is still on disk. One counter per
+        # scope, so the seed is the max over both buckets.
+        guest_gen = seed_generation(
+            self.sessions,
+            channel="whatsapp",
+            agent=TOOLLESS_TURN_AGENT,
+            user_id=f"{scope}:{GUEST_SCOPE_SEGMENT}" if chat_type == CHAT_TYPE_FORUM else scope,
+            dm_scope=DM_SCOPE_PER_CHANNEL_PEER,
+            chat_type=chat_type,
+        )
+        return max(operator_gen, guest_gen)

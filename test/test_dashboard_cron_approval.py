@@ -197,6 +197,60 @@ class TestCronCreateModel:
         assert kwargs.get("model") == "glm-4.7"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "gpt-6-astra[high]",
+            "global.anthropic.claude-opus-4-8[1m]",
+            "model[A1._-]",
+            "model_1.v2-fast",
+        ],
+    )
+    async def test_provider_qualified_model_accepted(self, model):
+        # The cron model dropdown is sourced from the live kiro-cli
+        # --list-models, so a provider-qualified effort id it advertises
+        # (e.g. gpt-6-astra[high]) must be accepted and persisted verbatim.
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": model})
+        resp = await api_crons_create(request)
+        assert resp.status == 200
+        _, kwargs = request.app["state"].crons.add_job_async.call_args
+        assert kwargs.get("model") == model
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "model[]",
+            "model[high",
+            "modelhigh]",
+            "model[[high]]",
+            "model[high][low]",
+            "model[high]suffix",
+            "[high]model",
+            "model[hi;gh]",
+            "model[$x]",
+        ],
+    )
+    async def test_malformed_qualifier_rejected(self, model):
+        request = self._make_request({"name": "t", "message": "m", "every": 300, "model": model})
+        resp = await api_crons_create(request)
+        assert resp.status == 400
+        assert "invalid model format" in json.loads(resp.body)["error"]
+        request.app["state"].crons.add_job_async.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_qualified_model_with_illegal_char_rejected(self):
+        # Brackets alone are not a free pass: an id that keeps an illegal
+        # character inside the qualifier is still refused by the format gate.
+        request = self._make_request(
+            {"name": "t", "message": "m", "every": 300, "model": "gpt-6-astra[high]!"}
+        )
+        resp = await api_crons_create(request)
+        assert resp.status == 400
+        body = json.loads(resp.body)
+        assert "invalid model format" in body["error"]
+
+    @pytest.mark.asyncio
     async def test_non_string_model_rejected(self):
         # A numeric/bool JSON `model` must be rejected as a clean 400, not raise
         # AttributeError on .strip() and leak an HTTP 500.
@@ -230,6 +284,7 @@ class TestCronListFields:
         mock_job.hide_in_chat = False
         mock_job.minimal_context = False
         mock_job.persistent_session = True
+        mock_job.auto_pause_after_failures = 5
         mock_job.schedule = CronSchedule(kind="every", every_secs=300)
         mock_job.last_run_ts = None
         mock_job.last_result = None
@@ -239,6 +294,8 @@ class TestCronListFields:
         # serialize — so a field added to the payload fails this test until the
         # stub names it.
         mock_job.last_retry_run_ts = 0.0
+        mock_job.consecutive_failures = 0
+        mock_job.failure_backoff_until.return_value = None
         mock_job.created_ts = None
         mock_job.timezone = ""
         mock_job.skip_dates = []

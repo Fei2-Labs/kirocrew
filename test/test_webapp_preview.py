@@ -18,6 +18,7 @@ from aiohttp import web
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
 from kiro_crew.dashboard.handlers import webapp_preview as wp
+from kiro_crew.deploy import handlers as deploy_handlers
 from kiro_crew.deploy.webapp_types import webapp_metadata_from_dict
 
 
@@ -34,7 +35,11 @@ def env(tmp_path: Path, monkeypatch):
     (app_dir / "public" / ".kirocrew-deploy.json").write_text("{}")
     (app_dir / "api" / "secret").mkdir(parents=True)
     (app_dir / "api" / "secret" / "keys.py").write_text("SECRET = 1")
-    monkeypatch.setattr(wp, "_allowed_local_roots", lambda: [ws.resolve()])
+    # The web-root resolution (and its allow-list check) lives in
+    # deploy.handlers.resolve_webapp_public_dir, which the preview channel
+    # delegates to so the publish path and the preview cannot disagree about
+    # what is servable. Patch the roots where that check reads them.
+    monkeypatch.setattr(deploy_handlers, "_allowed_local_roots", lambda: [ws.resolve()])
     return store, app_dir
 
 
@@ -274,6 +279,32 @@ class TestRound2Fixes:
         # Round-4 F1: ACAO is scoped by content type — the HTML document
         # itself must NOT be cross-origin readable.
         assert "Access-Control-Allow-Origin" not in resp.headers
+
+    @pytest.mark.asyncio
+    async def test_csp_blocks_js_eval_but_allows_wasm(self, env) -> None:
+        """eval()/new Function are gated by 'unsafe-eval' alone, which must
+        be absent. WebAssembly.compile/instantiate are gated by
+        'unsafe-eval' OR 'wasm-unsafe-eval', so the narrower token must be
+        present or the .wasm this channel serves cannot run. Pins the exact
+        egress directive so a later edit cannot quietly widen it."""
+        store, app_dir = env
+        token = _mint(store, app_dir, slug="eval-app")
+        resp = await wp.serve_artifact_app_file(
+            _req({"slug": "eval-app", "token": token, "path": ""}))
+        csp = resp.headers["Content-Security-Policy"]
+        directives = [d.strip() for d in csp.split(";") if d.strip()]
+        sources = directives[1].split()
+        # JS eval / new Function: blocked.
+        assert "'unsafe-eval'" not in sources
+        assert "'unsafe-eval'" not in csp.replace("'wasm-unsafe-eval'", "")
+        # WebAssembly.compile: allowed.
+        assert "'wasm-unsafe-eval'" in sources
+        assert directives[:2] == [
+            "sandbox allow-scripts",
+            "default-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' data: blob:",
+        ]
+        # No script-src override that could re-grant or drop either token.
+        assert not any(d.startswith("script-src") for d in directives)
 
     @pytest.mark.asyncio
     async def test_frame_ancestors_uses_self_plus_embedding_ancestors(self, env) -> None:

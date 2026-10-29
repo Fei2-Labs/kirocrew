@@ -15,6 +15,7 @@ type Entry = {
   default?: boolean
   supports_effort?: boolean
   supports_auto?: boolean
+  released_at?: string
   aliases?: string[]
   providers: Record<string, string>
 }
@@ -106,6 +107,12 @@ export function canonicalKey(name: string): string | null {
   // conservative heuristic in `isModelDowngrade`.
   const stripped = raw.replace(ROUTING_PREFIX_RE, '')
   return stripped !== raw ? lookup(stripped) : null
+}
+
+/** Registry-declared ISO release date (`YYYY-MM-DD`), or `null`; mirrors `model_registry.released_at`. */
+export function releasedAt(name: string): string | null {
+  const key = canonicalKey(name)
+  return (key !== null && REGISTRY[key].released_at) || null
 }
 
 /** Dropdown rows (canonical key + display + window), default first. */

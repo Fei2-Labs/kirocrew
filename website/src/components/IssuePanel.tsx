@@ -21,9 +21,7 @@ import {
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
 import { sourceTabQualifier } from '../utils/sourceProviderMeta'
-import GithubLogo from './icons/GithubLogo'
-import GitlabLogo from './icons/GitlabLogo'
-import JiraLogo from './icons/JiraLogo'
+import SourceProviderMark from './SourceProviderMark'
 import { timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from './MarkdownRenderer'
 import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
@@ -89,6 +87,22 @@ const REACTION_LABEL_KEY: Record<string, string> = {
   eyes: 'components.issuePanel.reaction_eyes',
 }
 
+/** Catalog keys for a linked change's lifecycle `state`. The wire value is a
+ *  free-form provider string (GitHub / GitLab PRs report open|closed|merged|
+ *  draft; a linked Jira issue can report any workflow state), so it was printed
+ *  raw and CSS-capitalized — untranslated in every locale and invisible to the
+ *  i18n added-lines gate. The four common lifecycle values render from the
+ *  catalog; an unmapped provider-specific value keeps its lowercased raw form,
+ *  because a Jira workflow state has no fixed catalog entry to translate to.
+ *  Flat and indexed inline so the key gate resolves the map, matching
+ *  `REACTION_LABEL_KEY` above. */
+const CHANGE_STATE_LABEL_KEY: Record<string, string> = {
+  open: 'components.issuePanel.change_state_open',
+  closed: 'components.issuePanel.change_state_closed',
+  merged: 'components.issuePanel.change_state_merged',
+  draft: 'components.issuePanel.change_state_draft',
+}
+
 /** Reaction tallies worth showing, in a stable order. Zero counts are dropped —
  *  an issue with no thumbs-up should not render a "0" next to every reaction
  *  name. Copy lives in `REACTION_LABEL_KEY` above. */
@@ -117,7 +131,7 @@ function stateTone(source: IssueSource): string {
   if (source.state === 'closed') {
     return source.stateReason === 'not_planned' ? 'bg-bg-hover text-muted' : 'bg-aim/15 text-aim'
   }
-  return 'bg-ok/15 text-ok'
+  return 'bg-ok/15 text-ok-text'
 }
 
 /** Prefilled chat handoff for the whole issue: enough context for the agent to
@@ -248,7 +262,21 @@ function IssueBody({
               <div className="flex items-center gap-2 mt-1 text-[11px] text-muted">
                 {change.relation && <span className="shrink-0 italic">{change.relation}</span>}
                 <span className="shrink-0">{identifier}</span>
-                {change.state && <span className="capitalize shrink-0">{change.state.toLowerCase()}</span>}
+                {change.state && (() => {
+                  const wire = change.state.toLowerCase()
+                  const key = CHANGE_STATE_LABEL_KEY[wire]
+                  // A mapped lifecycle value renders from the catalog, which
+                  // decides its casing — so NO `capitalize` there. An unmapped
+                  // provider-specific state (e.g. a Jira workflow state) is
+                  // untranslated by design and keeps its raw lowercased form;
+                  // it DOES get `capitalize`, or it would read all-lowercase
+                  // ("in progress") next to catalog-cased siblings ("Open").
+                  // `i18nT` only ever sees a resolvable literal key, so the key
+                  // gate stays static.
+                  return key
+                    ? <span className="shrink-0">{i18nT(key)}</span>
+                    : <span className="shrink-0 capitalize">{wire}</span>
+                })()}
               </div>
             </div>
             {changeUrl && <ExternalLink className="lucide-inline shrink-0 text-muted" aria-hidden="true" />}
@@ -418,11 +446,7 @@ export default function IssuePanel({
               className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border-none cursor-pointer text-[12px] transition-colors ${item.url === selected?.url ? 'bg-bg-hover text-text' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover/60'}`}
               title={item.url}
             >
-              {item.provider === 'github'
-                ? <GithubLogo size={13} className="shrink-0" />
-                : item.provider === 'jira'
-                ? <JiraLogo size={13} className="shrink-0" />
-                : <GitlabLogo size={13} className="shrink-0" />}
+              <SourceProviderMark provider={item.provider} size={13} />
               {/* No CSS truncation: the qualifier is already shortened to its
                   minimal unique trailing suffix; the full url is in the title. */}
               {qualifier && <span>{qualifier}</span>}
@@ -443,22 +467,20 @@ export default function IssuePanel({
             {/* askAgent on: the panel is read-only (no draft), and a provider
                 CLI that is missing, logged out or answering 404 is exactly the
                 kind of failure the agent can diagnose. The login-required
-                branch keeps the command as the remedy text beneath. */}
+                branch carries the command in the notice's footer, laid out
+                like the Changes panel's. */}
             {queryError.loginCommand ? (
-              <>
-                <ErrorNotice
-                  className="w-full"
-                  title={i18nT('components.issuePanel.cli_login_required', {
-                    provider: queryError.loginCommand === 'gh auth login' ? 'GitHub' : 'GitLab',
-                  })}
-                  message={i18nT('components.issuePanel.kiro_crew_uses_your_local_provider_cli_to_load_i')}
-                  askAgent
-                  testId="issue-panel-load-error"
-                />
-                <code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text">
-                  {queryError.loginCommand}
-                </code>
-              </>
+              <ErrorNotice
+                className="w-full"
+                title={i18nT('components.issuePanel.cli_login_required', {
+                  provider: queryError.loginCommand.startsWith('gh ') ? 'GitHub' : 'GitLab',
+                })}
+                message={i18nT('components.issuePanel.kiro_crew_uses_your_local_provider_cli_to_load_i')}
+                footer={<code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text break-all">{queryError.loginCommand}</code>}
+                actionPlacement="below"
+                askAgent
+                testId="issue-panel-load-error"
+              />
             ) : (
               <ErrorNotice
                 className="w-full max-h-64 overflow-y-auto leading-relaxed"
@@ -535,11 +557,7 @@ export default function IssuePanel({
                 {issueStateLabel(source)}
               </span>
               <span className="inline-flex items-center gap-1 shrink-0">
-                {source.provider === 'github'
-                  ? <GithubLogo size={12} className="shrink-0" />
-                  : source.provider === 'jira'
-                  ? <JiraLogo size={12} className="shrink-0" />
-                  : <GitlabLogo size={12} className="shrink-0" />}
+                <SourceProviderMark provider={source.provider} size={12} />
                 {/* Brand names are proper nouns, not translatable UI copy. The
                     i18n checker exempts them via the existing interpolation at
                     line 413 where they are provider: param values. Here we

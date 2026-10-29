@@ -33,6 +33,7 @@ import chatReducer, {
   clearUndeletableHistory,
   createSlot,
   deleteHistorySession,
+  clearHistorySessions,
   deleteSlot,
   fetchHistory,
   finalizeAssistant,
@@ -63,10 +64,11 @@ import chatReducer, {
   transcriptTsMs,
   truncateAfterIndex,
 } from '../store/chatSlice'
-import dashboardReducer, { addSlotOptimistic } from '../store/dashboardSlice'
+import dashboardReducer, { addSlotOptimistic, setSidebarOrder } from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 import instancesReducer from '../store/instancesSlice'
 import { SPAWN_LAUNCH_MARKER } from '../pages/chat/types'
+import { ASK_ANSWERED_HEADER, ASK_QUESTION_SERVER, MAX_TOOL_RESULT_CHARS } from '../utils/askQuestionTool'
 import type { ChatMessage, ChatSlot } from '../types'
 import type { RootState } from '../store'
 import { __resetErrorJournalForTests, recordError } from '../utils/errorReport'
@@ -78,6 +80,7 @@ const apiMock = vi.hoisted(() => ({
   createChatSlot: vi.fn(),
   deleteChatSlot: vi.fn(),
   deleteSession: vi.fn(),
+  clearSessions: vi.fn(),
   resumeChatSlot: vi.fn(),
   sessions: vi.fn(),
   setSlotColor: vi.fn(),
@@ -947,9 +950,11 @@ describe('chatSlice slot-detail refresh merges', () => {
       slot: 'B',
       messages: [msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-9', resolved: 'rejected' } })],
     }))
+    // `runTickAtDispatch: 0` is what the thunk stamps for an entry it found
+    // with no tick: no ordered write raced this warm, so its idle write lands.
     s = chatReducer(s, lifecycle('chat/warmSlotCache/fulfilled', 'B', detail('B', [
       msg({ role: 'permission', content: 'run?', meta: { approval_id: 'ap-9' } }),
-    ])))
+    ], { runTickAtDispatch: 0 })))
     expect(s.slotMessages.B[0].meta?.resolved).toBe('rejected')
     expect(s.slotRun.B.state).toBe('idle')
   })
@@ -1241,6 +1246,57 @@ describe('chatSlice message patching', () => {
     expect(outs[4]).toContain('Spawned 2')
     expect(outs[2]).toBeUndefined()
     expect(outs[1]).toBeUndefined()
+  })
+
+  it('does not copy answered output onto a third-party ask_question row', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('A'))
+    store.dispatch(replaceMessages([
+      msg({
+        role: 'tool',
+        content: '🔧 ask_question',
+        meta: { tool_call_id: 'tc-ask', tool_name: 'ask_question', mcp_server: ASK_QUESTION_SERVER },
+      }),
+      msg({
+        role: 'tool',
+        content: '🔧 ask_question',
+        meta: { tool_call_id: 'tc-ask', tool_name: 'ask_question', mcp_server: 'third-party' },
+      }),
+    ]))
+    const output = `${ASK_ANSWERED_HEADER}\n"Question" -> "Answer"`
+    store.dispatch(sseToolResult({ slot: 'A', tool_call_id: 'tc-ask', output }))
+    expect(chat(store).messages[0].meta?.output).toBe(output)
+    expect(chat(store).messages[1].meta?.output).toBeUndefined()
+  })
+
+  it('copies answered output onto a kirocrew-core ask_question row', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('A'))
+    store.dispatch(replaceMessages([
+      msg({
+        role: 'tool',
+        content: '🔧 ask_question',
+        meta: { tool_call_id: 'tc-ask', tool_name: 'ask_question', mcp_server: ASK_QUESTION_SERVER },
+      }),
+    ]))
+    const output = `${ASK_ANSWERED_HEADER}\n"Question" -> "Answer"`
+    store.dispatch(sseToolResult({ slot: 'A', tool_call_id: 'tc-ask', output }))
+    expect(chat(store).messages[0].meta?.output).toBe(output)
+  })
+
+  it('does not copy oversized answered output into message meta', () => {
+    const store = makeStore()
+    store.dispatch(setActiveSlot('A'))
+    store.dispatch(replaceMessages([
+      msg({
+        role: 'tool',
+        content: '🔧 ask_question',
+        meta: { tool_call_id: 'tc-ask', tool_name: 'ask_question', mcp_server: ASK_QUESTION_SERVER },
+      }),
+    ]))
+    const output = `${ASK_ANSWERED_HEADER}\n${'x'.repeat(MAX_TOOL_RESULT_CHARS)}`
+    store.dispatch(sseToolResult({ slot: 'A', tool_call_id: 'tc-ask', output }))
+    expect(chat(store).messages[0].meta?.output).toBeUndefined()
   })
 })
 
@@ -1627,6 +1683,61 @@ describe('chatSlice thunks', () => {
     expect(chat(store).history).toEqual([])
   })
 
+  // "Delete all". The gateway answers a partial clear with 200 and
+  // `ok: false`, so the thunk must read the body, not just the status: both a
+  // refused request and a 200 shortfall land on the same refused-delete notice.
+  it('records nothing when Delete all left nothing behind', async () => {
+    apiMock.clearSessions.mockResolvedValueOnce({ ok: true, cleared: 2, skipped: 0, failed: 0, undeletable: [] })
+    const store = makeStore()
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toBeNull()
+  })
+
+  it('names the rows a 200 Delete all left behind and counts the failed ones', async () => {
+    apiMock.sessions.mockResolvedValue({ sessions: [{ key: 'h1', title: 'Nightly digest' }, { key: 'h2' }], has_more: false })
+    apiMock.clearSessions.mockResolvedValueOnce({
+      ok: false,
+      cleared: 0,
+      skipped: 0,
+      failed: 2,
+      undeletable: [
+        { id: 'h1', code: 'cron_ownership_unknown' },
+        { id: 'gone', code: 'ledger_exclusion_unwritable' },
+      ],
+    })
+    const store = makeStore()
+    await store.dispatch(fetchHistory(false))
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toEqual({
+      key: '',
+      title: '',
+      code: '',
+      bulk: {
+        left: 4,
+        cleared: 0,
+        rows: [
+          { key: 'h1', title: 'Nightly digest', code: 'cron_ownership_unknown' },
+          { key: 'gone', title: '', code: 'ledger_exclusion_unwritable' },
+        ],
+      },
+    })
+  })
+
+  it('records a refused Delete all by code and clears it on the next attempt', async () => {
+    apiMock.clearSessions.mockRejectedValueOnce(Object.assign(new Error('conflict'), {
+      status: 409,
+      body: JSON.stringify({ ok: false, error: 'busy', code: 'cron_store_busy', cleared: 0 }),
+    }))
+    const store = makeStore()
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toEqual({
+      key: '', title: '', code: 'cron_store_busy', bulk: { left: null, cleared: 0, rows: [] },
+    })
+    apiMock.clearSessions.mockResolvedValueOnce({ ok: true, cleared: 0, skipped: 0, failed: 0, undeletable: [] })
+    await store.dispatch(clearHistorySessions())
+    expect(chat(store).undeletableHistory).toBeNull()
+  })
+
   // The older-page REQUEST is exercised at the reducer boundary rather than
   // through `loadOlderMessages()`: the thunk dispatches `pending` (which sets
   // `loadingOlder`) before its payload creator reads that same flag as a
@@ -1692,6 +1803,75 @@ describe('chatSlice thunks', () => {
     await store.dispatch(deleteSlot('doomed'))
     expect(chat(store).activeSlot).toBe('peer')
     expect(store.getState().dashboard.slots.some(sl => sl.key === 'doomed')).toBe(false)
+  })
+
+  // Closing the active session lands on the row BELOW it in the sidebar, like
+  // closing a browser tab focuses the tab to its right, even when the user
+  // visited the row above more recently.
+  it('lands on the sidebar row below the closed session, not the last-visited one', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    const store = makeStore()
+    for (const k of ['above', 'doomed', 'below']) store.dispatch(addSlotOptimistic(slotRow(k, { mode: 'dashboard', surface: 'dashboard' })))
+    store.dispatch(setSidebarOrder(['above', 'doomed', 'below']))
+    await store.dispatch(switchSlot('below'))
+    await store.dispatch(switchSlot('above'))
+    await store.dispatch(switchSlot('doomed'))
+
+    await store.dispatch(deleteSlot('doomed'))
+    expect(chat(store).activeSlot).toBe('below')
+  })
+
+  // A remote-bound local session publishes `<instance_id>:<peer_key>` as its
+  // sidebar row, not its slot key; it must still count as the row below.
+  it('lands on a remote-bound session below, matched through its row identity', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    const store = makeStore()
+    store.dispatch(addSlotOptimistic(slotRow('above', { mode: 'dashboard', surface: 'dashboard' })))
+    store.dispatch(addSlotOptimistic(slotRow('doomed', { mode: 'dashboard', surface: 'dashboard' })))
+    store.dispatch(addSlotOptimistic(slotRow('bound', { mode: 'dashboard', surface: 'dashboard', row_identity: 'inst-1:peer-key' })))
+    store.dispatch(setSidebarOrder(['above', 'doomed', 'inst-1:peer-key']))
+    await store.dispatch(switchSlot('above'))
+    await store.dispatch(switchSlot('doomed'))
+
+    await store.dispatch(deleteSlot('doomed'))
+    expect(chat(store).activeSlot).toBe('bound')
+  })
+
+  it('lands on the row above when the closed session is the last sidebar row', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    const store = makeStore()
+    for (const k of ['first', 'above', 'doomed']) store.dispatch(addSlotOptimistic(slotRow(k, { mode: 'dashboard', surface: 'dashboard' })))
+    store.dispatch(setSidebarOrder(['first', 'above', 'doomed']))
+    await store.dispatch(switchSlot('first'))
+    await store.dispatch(switchSlot('doomed'))
+
+    await store.dispatch(deleteSlot('doomed'))
+    expect(chat(store).activeSlot).toBe('above')
+  })
+
+  it('lands on an orchestrator row below a default-surface session', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    const store = makeStore()
+    store.dispatch(addSlotOptimistic(slotRow('doomed', { mode: '', surface: '' })))
+    store.dispatch(addSlotOptimistic(slotRow('orchestrator-row', { mode: 'orchestrator', surface: 'orchestrator' })))
+    store.dispatch(setSidebarOrder(['doomed', 'orchestrator-row']))
+    await store.dispatch(switchSlot('doomed'))
+
+    await store.dispatch(deleteSlot('doomed'))
+    expect(chat(store).activeSlot).toBe('orchestrator-row')
+  })
+
+  it('skips a sidebar row on another surface when picking the row below', async () => {
+    apiMock.chatSlotDetail.mockResolvedValue({ messages: [], running: false })
+    const store = makeStore()
+    store.dispatch(addSlotOptimistic(slotRow('doomed', { mode: 'dashboard', surface: 'dashboard' })))
+    store.dispatch(addSlotOptimistic(slotRow('slack-row', { mode: 'slack', surface: 'slack' })))
+    store.dispatch(addSlotOptimistic(slotRow('below', { mode: 'dashboard', surface: 'dashboard' })))
+    store.dispatch(setSidebarOrder(['doomed', 'slack-row', 'below']))
+    await store.dispatch(switchSlot('doomed'))
+
+    await store.dispatch(deleteSlot('doomed'))
+    expect(chat(store).activeSlot).toBe('below')
   })
 
   it('falls back to a cleared view when navigating to the peer fails', async () => {

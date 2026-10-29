@@ -215,7 +215,7 @@ describe('ChatMessageList', () => {
         <ChatMessageList messages={[msg('user', 'Q'), msg('tool_result', 'output')]} running />,
       )
       expect(container.querySelectorAll('.animate-spin').length).toBe(0)
-      expect(container.querySelector('.text-ok')).toBeTruthy()
+      expect(container.querySelector('.text-ok-text')).toBeTruthy()
     })
 
     it('offers a file affordance when the tool input names a safe path', () => {
@@ -380,6 +380,28 @@ describe('ChatMessageList', () => {
       // Whether it forms a TurnBlock depends on the item count after grouping
       // thinking group + assistant + thinking group + assistant = 4 items > 2
       expect(turnBlocks.length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('wraps a one-tool turn (tool call + answer) in TurnBlock (#23017)', () => {
+      const msgs: ChatMessage[] = [
+        msg('user', 'Go'),
+        msg('tool', '🔧 Running: read'),
+        msg('assistant', 'done'),
+        msg('user', 'Next'),
+      ]
+      render(<ChatMessageList messages={msgs} running={false} />)
+      expect(screen.getAllByTestId('turn-block')).toHaveLength(1)
+    })
+
+    it('does not wrap a reasoning + answer turn with no tool call', () => {
+      const msgs: ChatMessage[] = [
+        msg('user', 'Go'),
+        msg('thinking', 'hm'),
+        msg('assistant', 'done'),
+        msg('user', 'Next'),
+      ]
+      render(<ChatMessageList messages={msgs} running={false} />)
+      expect(screen.queryByTestId('turn-block')).toBeNull()
     })
 
     it('does not wrap short sequences in TurnBlock', () => {

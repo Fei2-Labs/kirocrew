@@ -31,9 +31,16 @@ from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
 logger = logging.getLogger(__name__)
 
+# The one 503 ``code`` every "Kiro CLI must be signed in" refusal carries, so a
+# client can tell a sign-in wall from any other degraded answer. Public because a
+# SECOND spawn site reaches the same verdict a different way: ``GET /api/models``
+# detects an EXPIRED mid-session login from ``--list-models`` auth stderr (the
+# readiness latch is stale-true there, so this gate's own refusal never fires) and
+# must answer with the identical code so the dashboard shows one sign-in message.
+KIRO_PREREQUISITE_REQUIRED_CODE = "kiro_prerequisite_required"
 _KIRO_NOT_READY_RESPONSE = {
     "error": "Kiro CLI setup or sign-in is required before starting a session.",
-    "code": "kiro_prerequisite_required",
+    "code": KIRO_PREREQUISITE_REQUIRED_CODE,
 }
 _KIRO_NOT_READY_CODE = _KIRO_NOT_READY_RESPONSE["code"]
 
@@ -58,10 +65,27 @@ _REFUSAL_REWARN_SECS = 1800.0
 # the same clock-injection shape ``KiroPrerequisiteService`` uses for its own staleness.
 _clock = time.monotonic
 
-# How stale a probe may be and still authorize a destructive or spawning call.
-# Small enough that an external logout cannot linger behind this gate, large
-# enough that a burst of callers collapses onto one probe.
+# How stale a probe may be and still authorize a DESTRUCTIVE rerun. Small enough
+# that an external logout cannot linger behind this gate before history is
+# rewritten, large enough that a burst of callers collapses onto one probe. The
+# reruns are rare and human-paced, so the tight bound costs nothing here.
 _VERIFY_MAX_AGE_SECS = 30.0
+
+# How stale a probe may be and still authorize the ``/api/sessions/usage``
+# poll gate. The 30s bound above is a poison for it: that bound expires at almost
+# every tick, so whichever request lands first after expiry runs a full
+# ``whoami`` probe INLINE and waits seconds on it, which is the credit pill
+# periodically hanging. The gate exists only to keep a signed-out gateway from
+# spawning a browser-opening CLI on a timer, and that threat tolerates a wide
+# window: the worst case of a longer bound is one such spawn up to this long
+# after an external logout, where the tight bound is one every poll interval. A
+# real logout is also caught sooner by the identity-change re-probe and by
+# Refresh. The usage spawn is itself throttled to one fetch per
+# ``_USAGE_REFRESH_SECS`` (600s), so the wide window cannot storm it; five
+# minutes is comfortably longer than the poll interval, so a healthy latch
+# authorizes many polls between probes and the periodic probe keeps the single
+# service-wide latch warm for the tight-bound callers.
+_POLL_GATE_MAX_AGE_SECS = 300.0
 
 
 async def kiro_session_ready(service: object) -> bool:
@@ -72,8 +96,10 @@ async def kiro_session_ready(service: object) -> bool:
     return await service.session_ready()
 
 
-async def kiro_verified_ready(service: object) -> bool:
-    """Return readiness backed by a probe that is FRESH ENOUGH to authorize on.
+async def kiro_verified_ready(
+    service: object, *, max_age_secs: float = _VERIFY_MAX_AGE_SECS
+) -> bool:
+    """Return readiness backed by a probe no older than *max_age_secs*.
 
     The latch alone cannot authorize these callers. It is written at boot and
     narrowed only when a chat turn observes ``AcpAuthRequired``, so an external
@@ -83,16 +109,23 @@ async def kiro_verified_ready(service: object) -> bool:
     only" is the right rule for the send path, which risks nothing; it is the
     wrong rule for authorization.
 
-    So this re-probes when the latch is older than
-    ``_VERIFY_MAX_AGE_SECS``. That is bounded work — it happens only on a
-    destructive rerun or a poll tick, never on the message hot path — and the
-    service's own short cache collapses bursts (e.g. the three destructive
-    routes, or several pollers firing together) into one probe.
+    So this re-probes when the latch is older than *max_age_secs*. That is
+    bounded work — it happens only on a destructive rerun or a poll tick, never
+    on the message hot path — and the service's own short cache collapses bursts
+    (e.g. the three destructive routes, or several pollers firing together) into
+    one probe.
+
+    The bound is the CALLER's to pass, because the two caller classes carry
+    different freshness needs. A destructive rerun rewrites persisted history, so
+    it reads on ``_VERIFY_MAX_AGE_SECS`` — tight, since a stale ``ready=True``
+    there drops prior turns. A poll-driven spawn site only guards against a
+    timed browser login, so it reads on ``_POLL_GATE_MAX_AGE_SECS`` — wide, since
+    a tight bound there expires at every poll and forces the probe inline.
     """
 
     if not isinstance(service, KiroPrerequisiteService):
         return False
-    return await service.verified_ready(max_age_secs=_VERIFY_MAX_AGE_SECS)
+    return await service.verified_ready(max_age_secs=max_age_secs)
 
 
 def _log_safe_path(request: object) -> str:
@@ -158,11 +191,11 @@ def _warn_refused_once(path: str) -> None:
     It must ALSO not be visible 570 times an hour. A signed-out gateway with an open
     dashboard polls ``/api/models`` every 8s and ``/api/sessions/usage`` every 30s,
     and every one of those refuses HERE — the sibling branches that log in
-    ``api_models`` sit BELOW this gate (``agents.py:1014`` onward vs the gate at
-    ``:942``) and are never reached in that state, so one line per refused request is
+    ``api_models`` (``dashboard/handlers/agents.py``) sit BELOW its call to this gate
+    and are never reached in that state, so one line per refused request is
     not "the same order of magnitude as its siblings" — it is 570 lines/hour against
     their none. The dashboard log ring is ``deque(maxlen=1000)``
-    (``handlers/updates.py:1381``), which that rate churns end to end every ~1.8
+    (``handlers/updates_streams.py::_log_ring``), which that rate churns end to end every ~1.8
     hours, evicting the genuine diagnostics an operator came to read. A line meant to
     make the log trustworthy must not be the thing that empties it.
 
@@ -216,7 +249,9 @@ def _service(request: web.Request) -> object:
     return service
 
 
-async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None:
+async def reject_if_kiro_unverified(
+    request: web.Request, *, max_age_secs: float = _VERIFY_MAX_AGE_SECS
+) -> web.Response | None:
     """Return 503 for the endpoints that must fail closed on a stale latch.
 
     Two classes qualify, both because the ACP attempt cannot be their authority:
@@ -247,12 +282,24 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
     stale ``ready=False`` here (it authorizes the history rewrite or the
     browser-opening spawn), and only these paths pay for the re-probe.
 
+    *max_age_secs* is how stale the backing probe may be. The default fits the
+    destructive reruns and ``/v1/chat/completions``, which carry the tight
+    freshness need. The poll-driven spawn sites pass
+    :data:`_POLL_GATE_MAX_AGE_SECS` instead: their only risk is a timed browser
+    login, which a wide window still contains, and the tight default would expire
+    at nearly every poll and run the probe inline — the latency this gate's own
+    pollers would otherwise pay on each tick.
+
     **Backend scope.** The probe asks whether ``kiro-cli`` is installed and
-    signed in. It governs every backend in ``host_auth.backends_retired_by_host_logout()``:
-    KAS is reached through the authenticated Kiro relay and therefore becomes
-    unusable after the same external logout as the Kiro backend. Other adapters
-    own different identity stores, and ``kiro-cli`` may not exist on their
-    hosts, so the gate opens for them.
+    signed in. It governs every backend in
+    ``host_auth.backends_retired_by_host_logout()``: KAS is reached through the
+    authenticated Kiro relay and therefore becomes unusable after the same
+    external logout as the Kiro backend. Other adapters own different identity
+    stores, and ``kiro-cli`` may not exist on their hosts, so the gate opens for
+    them. A slot with a live provider answers for ITS backend, not the
+    configured default — a live kiro session still needs the latch after the
+    default switched away, and a live adapter session must not be blocked by a
+    kiro latch it never consults.
 
     Checked BEFORE ``kiro_verified_ready`` on purpose: the point is to skip the
     probe, not to run it and ignore the answer. The probe spawns a subprocess.
@@ -266,7 +313,7 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
         else await asyncio.to_thread(_configured_acp_backend)
     )
     if effective_backend in backends_retired_by_host_logout():
-        if await kiro_verified_ready(_service(request)):
+        if await kiro_verified_ready(_service(request), max_age_secs=max_age_secs):
             _clear_refusal_warning()
             return None
         _warn_refused_once(_log_safe_path(request))

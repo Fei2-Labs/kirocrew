@@ -22,43 +22,183 @@ appear as user-style messages tagged ``[auto-nudge cycle N]`` so they are
 visually distinct from human input.
 
 Feature-flagged via env ``KIROCREW_AUTONUDGE`` (on by default; set to ``0`` to disable).
+
+The service's responsibilities live in :mod:`kiro_crew.autonudge_service`, one owner
+per module: the loop record and its vocabulary, monitor inference, the durable store,
+the maintenance transaction, the timer lifecycle, the probe gate, the wake judge's
+tick, the fire cycle, the loop transactions, the structured-monitor transitions, and
+the loader, which vets and scrubs every stored row at the trust boundary and keeps the
+scrub helpers every other entrance uses too.
+:class:`AutoNudgeService` is defined here and composes them. It keeps the live loop
+registry and the coordination state those owners share, its lifecycle and singleton,
+the observer hook and the persistence entry points. The owners' methods are bound on
+the class by name, in one table at the end of its body.
+
+This module is also the subsystem's import and patch surface: every name it defined
+before those owners moved out still resolves here as the same object its owner holds,
+and so does every public name it imported from the rest of the package and every
+other import callers and tests read off it. The names moved code reads through this
+module on each call -- so a patch here reaches it -- are
+``_OVERDUE_REARM_SECS``, ``_RECONCILE_INTERVAL_SECS``, ``_DRAIN_CANCEL_GRACE_SECS``,
+``replace_with_retry``, ``fsync_dir``, ``scrubbed_judge_spec``, ``_bounded_judge_verdict``,
+``repair_sentinel_path``, ``_INSTANCE``, ``_MAINTENANCE_LOCKS`` and
+``_MUTATION_LOCK_OWNERS``. Every other name the owners read is their own global, which
+a patch here does not reach.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
+import contextvars
 import logging
-import math
 import os
-import secrets
-import tempfile
-import time
-import uuid
-from contextlib import asynccontextmanager, contextmanager
-from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+import time  # noqa: F401 -- read off this module by callers and tests
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
+from typing import Any, Awaitable, Callable
 
-from kiro_crew import irq, platform_compat, probes, shutdown_event
-from kiro_crew.atomic_write import fsync_dir, replace_with_retry
-from kiro_crew.config.loader import config_dir, data_home
+from kiro_crew import irq  # noqa: F401 -- read off this module by callers and tests
+from kiro_crew import platform_compat  # noqa: F401 -- re-exported
+from kiro_crew import probes  # noqa: F401 -- re-exported
+from kiro_crew import shutdown_event  # noqa: F401 -- re-exported
+from kiro_crew import autonudge_stop_log, validation  # noqa: F401 -- re-exported
+from kiro_crew.atomic_write import (  # noqa: F401 -- read off this module by callers and tests
+    fsync_dir,
+    replace_with_retry,
+)
+from kiro_crew.autonudge_service import firing as _firing
+from kiro_crew.autonudge_service import gate as _gate
+from kiro_crew.autonudge_service import judge_tick as _judge_tick
+from kiro_crew.autonudge_service import maintenance as _maintenance
+from kiro_crew.autonudge_service import monitor_records as _monitor_records
+from kiro_crew.autonudge_service import mutations as _mutations
+from kiro_crew.autonudge_service import store_loader as _store_loader
+from kiro_crew.autonudge_service import timers as _timers
+from kiro_crew.autonudge_service.gate import (  # noqa: F401 -- re-exported
+    _JUDGE_QUIET_STREAK_FLOOR_DEFAULT,
+    _MAX_QUIET_STREAK,
+    _WAKE_FOLLOWUP_TICKS,
+)
+from kiro_crew.autonudge_service.maintenance import (  # noqa: F401 -- re-exported
+    _DRAIN_CANCEL_GRACE_SECS,
+    _assert_mutation_lock_owned,
+    _AutoNudgeMaintenanceView,
+    _cancel_and_drain_tasks,
+    _claim_mutation_lock,
+    _DurabilityDrain,
+    _maintenance_lock,
+    _release_mutation_lock,
+    _unclaim_mutation_lock,
+)
+from kiro_crew.autonudge_service.model import (  # noqa: F401 -- re-exported
+    _CHANNEL_KEY_PREFIXES,
+    _CONSECUTIVE_FAILURE_STANDDOWN_AFTER,
+    _MAX_IDLE_SECS,
+    _MIN_IDLE_SECS,
+    _REPLACEABLE_LOOP_STOP_REASONS,
+    _START_FAILURE_BACKOFF_AFTER,
+    _START_FAILURE_STANDDOWN_AFTER,
+    _TERMINAL_BOUND_REASONS,
+    APPROVAL_STALL_REASON,
+    AUTONUDGE_STOP_REASON,
+    CONSECUTIVE_FAILURE_REASON,
+    CYCLE_CAP_REASON,
+    FINISHED_LOOP_REASONS,
+    LOOP_BOUND_FIELDS,
+    MANUAL_STOP_REASON,
+    MODEL_REFUSED_REASON,
+    MONITOR_TERMINAL_REASON,
+    NUDGE_RENEW_DUE_SHARE,
+    RUNTIME_BUDGET_REASON,
+    SENTINEL_DROPPED_REASON,
+    SERVICE_SHUTTING_DOWN_MESSAGE,
+    SESSION_START_FAILURE_REASON,
+    STOP_SENTINEL_REASON,
+    STRUCTURAL_TERMINAL_REASON,
+    AutoNudgeStaleBaseline,
+    AutoNudgeStoreUnvetted,
+    MonitorUpdateConflict,
+    NudgeAdmissionReason,
+    NudgeAdmissionRefused,
+    NudgeLoop,
+    _MutationAdmission,
+    _positive_number,
+    _stopped_row_is_replaceable,
+    _TransactionSubmissions,
+    is_channel_key,
+    is_structured_monitor_loop,
+    new_goal_token,
+    nudge_cycle_header,
+    reason_in,
+    runtime_budget_exceeded,
+    stored_bound,
+    terminal_notification_delivery_matches,
+)
+from kiro_crew.autonudge_service.store import (  # noqa: F401 -- re-exported
+    _NUDGES_FILE,
+    _QUARANTINE_FILE,
+    _STORE_VERSION,
+    LoopStore,
+    _locked_file,
+    _quarantine_row_key,
+    _rows_or_empty,
+)
+from kiro_crew.autonudge_service.store_loader import (  # noqa: F401 -- re-exported
+    _JUDGE_MAX_CRITERION_CHARS,
+    _JUDGE_MAX_CURSORS,
+    _JUDGE_MAX_OUTCOME_CHARS,
+    _JUDGE_MAX_TARGET_CHARS,
+    _JUDGE_MAX_TARGETS,
+    ADDRESSING_FIELDS,
+    _addressing_value_unsafe_why,
+    _bounded_judge_cursors,
+    _bounded_judge_pr_seen,
+    _bounded_judge_recent,
+    _bounded_judge_spec,
+    _bounded_judge_verdict,
+    _is_torn_deactivation,
+    _repair_number,
+    redact_store_value,
+    scrub_loop_text,
+    scrubbed_judge_spec,
+)
+from kiro_crew.autonudge_service.subject import (  # noqa: F401 -- re-exported
+    _JUDGE_PR_SEEN_DIGEST_CHARS,
+    _JUDGE_PR_SEEN_REMARKS,
+    _PR_FACTS_TICK_KEYS,
+    _judge_pr_targets,
+    _pr_facts_digest,
+    _pr_observation_of,
+    infer_monitor,
+    infer_subject,
+    loop_subject,
+    read_session_texts,
+)
+from kiro_crew.autonudge_service.timers import (  # noqa: F401 -- re-exported
+    _MONITOR_RETRY_BACKOFF_SECS,
+    _MONITOR_RETRY_MAX_BACKOFF_SECS,
+    _OVERDUE_REARM_SECS,
+    _REARM_BACKOFF_MAX_SHIFT,
+    _REARM_BACKOFF_SECS,
+    _REARM_MAX_BACKOFF_SECS,
+    _RECONCILE_INTERVAL_SECS,
+    _current_task_or_none,
+    _resolve_beat,
+)
+from kiro_crew.config.loader import data_home  # noqa: F401 -- re-exported
+from kiro_crew.config.loader import config_dir
 from kiro_crew.config.paths import legacy_home
-from kiro_crew.constants import MAX_BANNER_CHARS
-from kiro_crew.monitoring.decision import (
+from kiro_crew.constants import MAX_BANNER_CHARS  # noqa: F401 -- re-exported
+from kiro_crew.monitoring.decision import (  # noqa: F401 -- re-exported
     decide_monitor,
     monitor_budget_reason,
     monitor_stall_reason,
     stamp_monitor_alerted,
 )
-
-# The one place this module names a host: a tick that sent no request is a third
-# outcome ``MonitorObservation`` has no field for, so the marker is the reason code
-# the probe set, and a reason code belongs to the kind that emits it.
-from kiro_crew.monitoring.github_provider_errors import is_unattempted_probe
-from kiro_crew.monitoring.models import (
+from kiro_crew.monitoring.github_provider_errors import (  # noqa: F401 -- re-exported
+    is_unattempted_probe,
+)
+from kiro_crew.monitoring.limits import validate_runtime_secs  # noqa: F401 -- re-exported
+from kiro_crew.monitoring.models import (  # noqa: F401 -- re-exported
     MONITOR_BUSY_RETRY_SECS,
     MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS,
     MONITOR_STATE_VERSION,
@@ -84,327 +224,19 @@ from kiro_crew.monitoring.models import (
     quarantine_monitor_state,
     retained_outcome_blocks_rearm,
 )
-from kiro_crew.monitoring.registry import REVIEW_READY, kind_supports_objective
-from kiro_crew.platform import (
-    PlatformCompositionError,
-    redact_log_via_context,
-    redact_via_context,
+from kiro_crew.monitoring.registry import (  # noqa: F401 -- re-exported
+    REVIEW_READY,
+    kind_supports_objective,
 )
-from kiro_crew.probes import targets
-from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
+from kiro_crew.platform import PlatformCompositionError  # noqa: F401 -- re-exported
+from kiro_crew.platform import redact_log_via_context  # noqa: F401 -- re-exported
+from kiro_crew.platform import redact_via_context  # noqa: F401 -- re-exported
+from kiro_crew.probes import targets  # noqa: F401 -- re-exported
+from kiro_crew.security import redact_credentials  # noqa: F401 -- re-exported
+from kiro_crew.security import redact_exfiltration_urls  # noqa: F401 -- re-exported
+from kiro_crew.security import is_sensitive_path
 
 logger = logging.getLogger(__name__)
-
-#: ``stopped_reason`` for a loop whose watched subject finished (a merged or
-#: closed pull request). Distinct from the bound reasons because there is nothing
-#: left to SERVICE, not because it went well: only a merge is recorded as a
-#: success, while a pull request closed without merging is recorded as blocked and
-#: still needs a decision. What the two share -- and what this reason means -- is
-#: that re-arming would poll a dead subject, so a revival check that treated it as
-#: a cap would bring back a watch with nothing to watch.
-MONITOR_TERMINAL_REASON = "monitor_terminal"
-
-#: Ticks the gate is bypassed for after each wake, so a woken agent gets a
-#: second turn to finish. One, because the cost is paid per wake and a second
-#: free turn buys progress the probe cannot observe; raising it multiplies the
-#: cost of every wake, and lowering it to zero reintroduces the stall.
-_WAKE_FOLLOWUP_TICKS = 1
-
-#: Consecutive quiet observations after which a gated loop is delivered anyway.
-#:
-#: This is what makes "gating slows an act-on-quiet loop" true instead of
-#: "gating silences it". Ten keeps the great majority of the saving (nine ticks
-#: in ten cost nothing) while bounding how long any loop can go undelivered to
-#: ten intervals -- under an hour on the 300s interval agents actually use.
-#: Lower wastes the saving on loops that had nothing to do; higher starts to
-#: look like silence to whoever armed the watch.
-_MAX_QUIET_STREAK = 10
-
-_NUDGES_FILE = "autonudge.json"
-# A build predating the ``quarantined`` key writes only ``autonudge.json``, so an
-# embedded copy dies with its next wholesale write; a sidecar it never opens survives.
-_QUARANTINE_FILE = "autonudge.quarantine.json"
-_STORE_VERSION = 1
-_MIN_IDLE_SECS = 15
-_MAX_IDLE_SECS = 86400  # 24h
-
-
-#: Fields a client ADDRESSES a row by, so the REST scrub exempts them -- which is
-#: only safe because ``_load`` refuses a row whose value here is credential-shaped.
-ADDRESSING_FIELDS = frozenset({"id", "slot_key"})
-
-
-def _quarantine_row_key(row: dict) -> str:
-    """Stable identity for a held-aside row, for de-duplicating an additive write.
-
-    The WHOLE serialized row, never just ``id``: two held rows can share an id while
-    differing in content, and collapsing those drops the copy an operator repaired --
-    which a failed main-store replacement then loses permanently.
-    """
-    return json.dumps(row, sort_keys=True, default=repr)
-
-
-def _addressing_value_unsafe_why(got: object) -> str:
-    """Why the load guard holds a row aside for THIS addressing value, or ``""``.
-
-    ONE definition, shared by the guard that refuses a row and the matcher that decides a
-    repair superseded it. Two copies could disagree, and a matcher with a laxer notion of
-    unsafe would retire a held row against a loop the guard never accepted.
-    """
-    if not isinstance(got, str):
-        return "is not a string"
-    if not got.isprintable():
-        return "contains a non-printable character"
-    if redact_via_context(got) != got:
-        return "is credential-shaped"
-    return ""
-
-
-def _rows_or_empty(value: Any) -> list:
-    """Return ``value`` if it is a list, else ``[]``.
-
-    ``data.get(key, [])`` yields the default only when the key is ABSENT, so a
-    hand-edited store carrying ``"loops": null`` returns ``None`` and every
-    iteration or unpack of it raises ``TypeError`` uncaught during startup.
-    """
-    return value if isinstance(value, list) else []
-
-
-# Re-arm delay after a skipped/failed fire so a busy slot or a transient fire
-# error can't silently orphan the loop. The delay escalates exponentially per
-# consecutive failure (base << streak) up to _REARM_MAX_BACKOFF_SECS, and is
-# always capped by the loop's idle_secs, so a permanently-wedged callback backs
-# off to a slow poll instead of hammering every base interval.
-_REARM_BACKOFF_SECS = 15
-_REARM_MAX_BACKOFF_SECS = 300  # 5m ceiling for the escalated re-arm delay
-_REARM_BACKOFF_MAX_SHIFT = 16  # clamp the 2**shift exponent
-_MONITOR_RETRY_BACKOFF_SECS = 15
-_MONITOR_RETRY_MAX_BACKOFF_SECS = 300
-
-# Re-arm delay when a loop's deadline has already passed while a user turn was
-# in flight. Small but non-zero: firing the instant the user's turn ends would
-# race their follow-up message; a short beat leaves room for notify_user_input
-# to cancel the pending fire again if they are still actively conversing.
-_OVERDUE_REARM_SECS = 10
-
-# How often the reconciler walks the store looking for an active loop with no
-# live timer task. A stranded loop (fire delivered but the slot's stop hook
-# never arrived, a dropped deferred re-arm) is rescued after two consecutive
-# eligible passes -- so within two to three intervals of going quiet; the walk
-# itself is an in-memory scan of a small dict, so the interval is chosen for
-# rescue latency, not cost. The two-pass requirement, not this number, is what
-# keeps the reconciler from mistaking short-lived live states (a running user
-# turn, a mutation window) for strandings; see _reconcile_once.
-_RECONCILE_INTERVAL_SECS = 60
-
-
-def _resolve_beat(beat: "asyncio.Future[None]") -> None:
-    """Resolve one reconciler heartbeat future (see ``_reconcile_forever``)."""
-    if not beat.done():
-        beat.set_result(None)
-
-
-# Persisted source category for a deliberate ``autonudge_stop`` directive.
-# The caller's free-form explanation is intentionally not stored: it is
-# model-authored text and the watchdog only needs the deterministic source.
-AUTONUDGE_STOP_REASON = "autonudge_stop"
-
-# Persisted reason for a loop stopped because one of its cycles could not obtain
-# tool approval. Named separately from the other bounds because its remedy is
-# different in kind: the cap and the budget are raised, this one needs an
-# authorization the loop cannot grant itself.
-APPROVAL_STALL_REASON = "approval_stalled"
-
-# Persisted reason for a loop that stood down because its cycles kept failing to
-# get a model session at all. A delivered cycle whose turn dies on
-# ``session/new timed out`` costs a full turn's dispatch and produces nothing, so
-# re-arming on the plain interval buys another identical failure: observed on an
-# operator host as 15 consecutive auto-nudge cycles all ending in
-# ``session/new timed out after 90s (0/10 MCP server(s) reported)``, stopped only
-# by ``max_cycles`` running out. System-imposed like the other bounds -- the
-# remedy (host pressure easing, a gate unstarving) is not something the loop can
-# arrange -- so it is re-armable.
-SESSION_START_FAILURE_REASON = "session_start_failures"
-
-# Consecutive start failures before a wake is DEFERRED instead of fired, and
-# before the loop stands down for good. Two separate numbers because they answer
-# two different questions: the first assumes the host is briefly busy and slows
-# the poll (the failures are themselves evidence of contention, so retrying at
-# full rate adds to it), the second concludes that whatever is wrong is not
-# clearing and stops spending turns on it. A single landed turn on the slot
-# clears the streak, so a loop that recovers is never held back.
-_START_FAILURE_BACKOFF_AFTER = 3
-_START_FAILURE_STANDDOWN_AFTER = 5
-
-# Persisted reason for a loop stopped because its LAST delivered cycle ended on
-# a STRUCTURAL terminal error -- the backend rejected the prompt's shape as
-# malformed, deterministically, so re-firing the identical context every
-# interval can only reproduce the rejection. System-imposed like a spent bound:
-# the remedy is a NEW context (a human /clear then a fresh message, which the
-# genuine-turn reset in chat_runner already clears the slot's verdict for), so a
-# later directive re-arm may displace it -- it is a member of
-# ``_REPLACEABLE_LOOP_STOP_REASONS`` (via ``_TERMINAL_BOUND_REASONS`` below) for
-# exactly that reason.
-STRUCTURAL_TERMINAL_REASON = "structural_terminal"
-
-
-def new_goal_token() -> str:
-    """A fresh opaque identity for a goal write.
-
-    Random rather than content-derived so the value can be served next to the goal's
-    own redaction without becoming a brute-force oracle against the masked span. Its
-    only consumer compares it for equality against a value from a prior GET.
-    """
-    return secrets.token_hex(16)
-
-
-class AutoNudgeStaleBaseline(RuntimeError):
-    """Raised when an update's confirmed baseline does not match the stored goal.
-
-    Compared INSIDE ``_update_unserialized``'s lock, because any check outside it is the
-    TOCTOU this exists to close: a second client committing between a caller's read and
-    its write would otherwise have its goal silently overwritten last-write-wins. The
-    HTTP layer answers this with 409 so the loss becomes a refusal the user can see.
-    """
-
-
-class NudgeAdmissionRefused(RuntimeError):
-    """The session authorized for an arm disappeared before its commit point."""
-
-
-# System-imposed terminal bounds. Membership here gives a reason TWO properties:
-# (1) ``update`` refuses to overwrite an ALREADY-inactive loop with one of these
-# (the no-op branch in ``_update_locked``), so a stop these mark cannot clobber a
-# manual pause the user landed first -- e.g. a structural stop firing on an
-# in-flight cycle right after the user paused must NOT replace that pause and
-# make it directive-revivable; and (2) they are re-armable (folded into
-# ``_REPLACEABLE_LOOP_STOP_REASONS`` below). ``structural_terminal`` needs both,
-# for the same reason ``cycle_cap``/``runtime_budget`` do.
-_TERMINAL_BOUND_REASONS = frozenset(
-    {
-        "cycle_cap",
-        "runtime_budget",
-        APPROVAL_STALL_REASON,
-        STRUCTURAL_TERMINAL_REASON,
-        SESSION_START_FAILURE_REASON,
-    }
-)
-
-# Persisted reason for a loop ``_load`` deactivated because its kill-switch path
-# became sensitive (``repair_sentinel_path`` dropped it). System-imposed: the
-# re-arm path re-validates the sentinel, so displacing this row is safe.
-SENTINEL_DROPPED_REASON = "sentinel_dropped"
-
-# Persisted reason for a paused loop that recorded no reason of its own —
-# ``update(active=False)`` stores this default.
-MANUAL_STOP_REASON = "manual"
-
-#: Stops the SYSTEM imposed on a legacy loop, which a directive re-arm may
-#: therefore displace: a lapsed approval, a spent bound, a finished subject, a
-#: dropped kill switch. Everything else — a manual pause (``"manual"``), a
-#: research tombstone (``AUTONUDGE_STOP_REASON``, consumed by the auto_research
-#: watchdog to tell deliberate completion from crash cleanup), and any reason
-#: this version does not know — is evidence some consumer may read, so it fails
-#: CLOSED to preserved.
-_REPLACEABLE_LOOP_STOP_REASONS = _TERMINAL_BOUND_REASONS | {
-    MONITOR_TERMINAL_REASON,
-    SENTINEL_DROPPED_REASON,
-}
-
-
-def _stopped_row_is_replaceable(loop: "NudgeLoop") -> bool:
-    """Whether a directive re-arm (``replace_stopped``) may displace this row.
-
-    Callers have already established the row is INACTIVE. The split is by who
-    recorded the stop: a stop the system imposed (bound expiry, approval
-    stall, terminal subject, crash retirement) is automatically re-armable,
-    while a stop a person or an app recorded — ``USER_STOP``, session-close
-    retention, a manual pause, a research tombstone — is retained evidence.
-    Unknown outcomes and reasons are treated as evidence (fail closed).
-
-    An EMPTY reason is evidence too: a pause recorded before the reason field
-    existed carries one, and the store holds nothing that tells it apart from a
-    torn write. The torn shape that CAN be told apart — no reason AND a live
-    deadline — is resumed by ``_load`` (``_is_torn_deactivation``) before any
-    re-arm asks, so refusing here costs nothing for that case.
-    """
-    state = loop.monitor
-    if state is not None and state.outcome is not None:
-        # Delegated to the shared predicate in ``monitoring.models`` so the MCP
-        # preflight, which reads the same record over the session-monitor
-        # endpoint, cannot answer differently from this enforcement point. The
-        # quarantined-record and fail-closed rules live there.
-        return not retained_outcome_blocks_rearm(state.outcome, state.stopped_reason)
-    return (loop.stopped_reason or "") in _REPLACEABLE_LOOP_STOP_REASONS
-
-
-# Namespaced session-key prefixes that identify messaging-channel sessions
-# (as opposed to bare dashboard chat-slot keys). Channel-bound loops have no
-# dashboard turn-lifecycle hooks (notify_turn_complete / notify_user_input),
-# so they run on a fixed interval instead of an idle timer: the timer re-arms
-# itself right after every delivered fire.
-#
-# This mirrors ``messaging.link.CHANNEL_SESSION_NAMESPACES``, spelled out here
-# rather than derived from it, for two independent reasons:
-#
-# 1. IMPORT WEIGHT. ``autonudge`` is imported at module scope by ``mcp_core``
-#    (i.e. by every MCP server process) and by the dashboard chat layer, and it
-#    depends only on config/security/platform_compat today. Naming
-#    ``kiro_crew.messaging.link`` runs ``messaging/__init__``, which pulls the
-#    driver/renderer/transport layer and, transitively, the ACP client, agent,
-#    hooks, artifacts, metrics and sqlite — measured at 48 additional
-#    ``kiro_crew`` modules to obtain one tuple of string literals.
-# 2. THIS IS A KEY-SHAPE QUESTION, NOT A LIVE-CAPABILITY ONE. ``is_channel_key``
-#    selects the RE-ARM STRATEGY and the expiry-notification metadata, so it has
-#    to answer identically whether or not the transport happens to be registered
-#    at this instant. Deriving it from a runtime ``supports_proactive_send``
-#    lookup fails toward the WRONG branch: a loop whose transport is momentarily
-#    absent would read as a dashboard slot, so ``_run_fire_cycle`` would stop
-#    self-re-arming it — and nothing else ever will, since
-#    ``notify_turn_complete`` never fires for a channel key — while the expiry
-#    notice would synthesize a ``dashboard:<namespace>:<id>`` jump link pointing
-#    at no slot.
-#
-# Membership therefore does NOT assert deliverability; it asserts "this key names
-# a conversation rather than a chat slot". Whether a nudge can actually be
-# delivered stays with the fail-closed ladder in ``dashboard/chat_runner.py``
-# (``_resolve_channel_target``: governance, then a REGISTERED transport, then
-# ``supports_proactive_send``), which logs its reason and degrades to a no-op.
-# So a namespace is listed even when nothing can currently be delivered to it,
-# and the two clearest cases are both here: ``whatsapp`` has no transport package
-# in this fork at all, and ``feishu`` ships one that declares
-# ``supports_proactive_send=False`` (its renderer only replies to an inbound
-# message id, so a nudge cycle has nowhere to put the answer). Both still classify
-# as channel keys, because the alternative is worse than a refusal: an unlisted key
-# is read as a dashboard slot and silently stops being re-armed, whereas a listed
-# one reaches the ladder and is refused with a logged reason. Being listed is
-# likewise not an arming permission — that is ``binding_key_for``, which is
-# narrower still and gated on an ownership check and a fire route.
-_CHANNEL_KEY_PREFIXES = (
-    "slack:",
-    "discord:",
-    "telegram:",
-    "wecom:",
-    "whatsapp:",
-    "webex:",
-    "teams:",
-    "weixin:",
-    "imessage:",
-    "feishu:",
-    "unified:",
-)
-
-
-def is_channel_key(key: str) -> bool:
-    """True when *key* names a messaging-channel session (``slack:<ts>``,
-    ``discord:{agent}:direct:{user}`` ...) rather than a dashboard chat slot.
-
-    A CLASSIFICATION, not a permission: see :data:`_CHANNEL_KEY_PREFIXES` for why
-    the set is spelled out, and why membership says nothing about whether a nudge
-    can be delivered. Callers asking "may this session be armed?" want
-    :func:`binding_key_for` instead.
-    """
-    return key.startswith(_CHANNEL_KEY_PREFIXES)
 
 
 def binding_key_for(session_key: str) -> str | None:
@@ -456,49 +288,6 @@ def structured_monitor_binding_key_for(session_key: str) -> str | None:
 def enabled() -> bool:
     """Feature flag — on by default. Set ``KIROCREW_AUTONUDGE=0`` to disable."""
     return os.environ.get("KIROCREW_AUTONUDGE", "1").lower() not in ("0", "false", "no")
-
-
-def scrub_loop_text(value: Any) -> Any:
-    """Credential-scrub one serialized ``NudgeLoop`` field value.
-
-    ``None`` passes through untouched, because ``str(None)`` would turn an absent value
-    into a message that reads like content. Everything else is scrubbed through
-    ``platform.redact_via_context``, coerced with ``str()`` first when not already a
-    string -- coerced rather than blanked so the operator can still see the bad row.
-    """
-    if value is None:
-        return value
-    if isinstance(value, str):
-        if not value:
-            return value
-        return redact_via_context(value)
-    return redact_via_context(str(value))
-
-
-class AutoNudgeStoreUnvetted(RuntimeError):
-    """Raised when a persist is attempted after the loader refused the store.
-
-    An empty ``_loops`` then means "could not vet" rather than "store is empty", so
-    writing it would delete rows the operator still has to correct.
-
-    This must RAISE rather than return: every mutation caller already wraps its persist
-    in ``except BaseException`` and rolls back, so returning success defeated those
-    handlers and left the caller confirming a loop that existed only in memory.
-    """
-
-
-def redact_store_value(value: object) -> str:
-    """Render a store-sourced value safe for a log line in this module.
-
-    ``repr`` supplies the ESCAPE: a store value can carry a newline or an ANSI
-    sequence, and a raw ``%r``/``%s`` would let it forge a second log record.
-
-    The SCRUB is delegated to ``redact_log_via_context``, which already owns exactly
-    this contract -- context-aware redaction for a log line that must not raise. That
-    matters because several callers sit inside ``except`` arms whose documented job is
-    to never raise.
-    """
-    return redact_log_via_context(repr(value))
 
 
 def repair_sentinel_path(raw: str) -> str:
@@ -628,366 +417,28 @@ def repair_sentinel_path(raw: str) -> str:
 # on start(); cleared on stop().
 _INSTANCE: "AutoNudgeService | None" = None
 _MAINTENANCE_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
-
-
-def _maintenance_lock(base_dir: Path) -> asyncio.Lock:
-    """Per-event-loop lock serializing store maintenance with service startup."""
-    loop = asyncio.get_running_loop()
-    path_key = os.path.normcase(os.path.abspath(str(base_dir)))
-    return _MAINTENANCE_LOCKS.setdefault((loop, path_key), asyncio.Lock())
-
-
-async def _cancel_and_drain_tasks(*tasks: asyncio.Task[Any]) -> bool:
-    """Cancel child tasks without letting repeated cancellation abort cleanup."""
-    for task in tasks:
-        task.cancel()
-    drain = asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True))
-    interrupted = False
-    while not drain.done():
-        try:
-            await asyncio.shield(drain)
-        except asyncio.CancelledError:
-            interrupted = True
-    drain.result()
-    return interrupted
+_MUTATION_LOCK_OWNERS: dict[asyncio.Lock, asyncio.Task[Any]] = {}
 
 
 def get_instance() -> "AutoNudgeService | None":
     return _INSTANCE
 
 
-def _current_task_or_none() -> "asyncio.Task[Any] | None":
-    """:func:`asyncio.current_task`, or ``None`` when no loop is running.
+def release_approval_hold_for(slot_key: str | None, *, why: str) -> None:
+    """End *slot_key*'s approval hold, if its loop has one. Best-effort.
 
-    ``current_task`` raises ``RuntimeError: no running event loop`` outside a loop, and
-    ``stop()`` is reached from SYNCHRONOUS callers — the gateway's shutdown path and test
-    teardown — where nothing is running. There, no task can be "the current" one, which is
-    the answer this returns rather than an exception the caller would have to know about.
+    The one call the approval paths make once a person answers a prompt. It
+    schedules ``AutoNudgeService.release_approval_hold`` (which awaits its own
+    durable write) and returns at once. A monitoring convenience must never change
+    how that answer is applied, so a missing service, an empty key or a fault here
+    is swallowed.
     """
     try:
-        return asyncio.current_task()
-    except RuntimeError:
-        return None
-
-
-@dataclass
-class NudgeLoop:
-    """A single auto-nudge loop bound to one session.
-
-    ``slot_key`` is the binding key: either a bare dashboard chat-slot key
-    (e.g. ``chat-1-1721...``, idle-timer driven via notify_turn_complete) or a
-    namespaced messaging-channel session key (e.g. ``slack:<thread_ts>``,
-    ``discord:{agent}:direct:{user_id}``), which runs on a fixed interval.
-    The field keeps its historical name for store/REST/WS compatibility.
-    """
-
-    id: str
-    slot_key: str
-    message: str
-    idle_secs: int = 60
-    max_cycles: int = 0  # 0 = unlimited
-    cycle_count: int = 0
-    active: bool = True
-    last_fire_ts: float = 0.0
-    created_ts: float = 0.0
-    stop_sentinel_path: str = ""  # optional absolute path; if present loop halts
-    # Opaque per-write identity of ``message``, for stale-baseline (409) detection.
-    # RANDOM: a digest served beside its own redaction is an oracle for the masked span.
-    # NOT PERSISTED -- re-minted on every load, so a pre-restart value cannot authorise.
-    goal_token: str = ""
-    # Wall-clock budget in seconds, measured from ``created_ts`` (0 = unlimited).
-    # A cycle cap alone cannot bound COST: a loop whose turns are slow or whose
-    # idle gap is long can run for days within its cycle budget. Anchoring on
-    # the persisted ``created_ts`` (not arm time) makes the budget restart-proof
-    # — a gateway restart re-arms the loop but never resets its clock.
-    max_runtime_secs: int = 0
-    #: Whether this loop may be observation-gated. Defaults to FALSE, which is what
-    #: a record stored before this field existed decodes to.
-    #:
-    #: THE PRINCIPLE, stated once because it is easy to get backwards: gating is
-    #: the state that can silently stop work -- a gated loop whose subject is merged
-    #: or closed DEACTIVATES -- so every uncertainty resolves to UNGATED, and only an
-    #: explicit boolean true gates. An absent key is a loop nobody chose to gate,
-    #: usually a generic goal loop that predates the feature; a corrupt value is not
-    #: a decision either. Being wrong in this direction costs a turn per interval,
-    #: which is what today already costs. Being wrong the other way stops a
-    #: recurring task because its instruction happened to mention a pull request.
-    #:
-    #: Persisted because the opt-out has to SURVIVE. The instruction is the target,
-    #: so editing it re-infers the subject; without a remembered decision an
-    #: explicitly ungated loop would be silently re-gated by the next wording
-    #: change -- exactly the harm the opt-out exists to prevent, arriving through
-    #: the documented way to revise a loop.
-    gate: bool = False
-    # WHY the loop was last deactivated: "" (active / never stopped),
-    # "manual" (user pause / any caller that didn't say otherwise),
-    # "autonudge_stop" (deliberate directive), "cycle_cap",
-    # "runtime_budget", or "approval_stalled" (set by _timer's terminal
-    # bounds).
-    # Persisted so revival logic can distinguish a manual pause from a bound
-    # expiry — elapsed wall-clock keeps growing after a manual pause, so
-    # WITHOUT this record a paused loop whose budget has since elapsed is
-    # indistinguishable from a budget-stopped one, and a budget raise would
-    # resume unattended execution against the user's explicit pause.
-    stopped_reason: str = ""
-    # Evidence that a cycle in this loop's session asked for tool approval and
-    # nobody answered within the window. Set by ``notify_approval_stalled`` and
-    # consumed by ``_timer`` as a terminal condition on the NEXT wake, which is
-    # the whole point: the loop stops on proof that it could not act, never on a
-    # prediction that it might not be able to. A loop whose turns only touch
-    # auto-approved tools never reaches an interactive wait, so it can never be
-    # flagged here — that is what keeps a working read-only loop running instead
-    # of needing a "does this loop need approval?" guess.
-    # Persisted, because the condition that produced it (a lapsed grant) usually
-    # outlives a restart; cleared on every revival so a re-granted loop is not
-    # stopped by stale evidence.
-    approval_stalled: bool = False
-    # How many of this loop's cycles in a row ended without ever getting a model
-    # session (``session/new`` timed out or otherwise failed). Raised by
-    # ``notify_cycle_start_failed`` and zeroed by ``notify_cycle_landed``, both
-    # driven by evidence from the slot's own turns rather than by a prediction.
-    # Consumed by ``_timer``: past ``_START_FAILURE_BACKOFF_AFTER`` the wake is
-    # deferred, past ``_START_FAILURE_STANDDOWN_AFTER`` the loop stops with
-    # ``SESSION_START_FAILURE_REASON``. Persisted, because the host condition
-    # that produces it routinely outlives a restart, and cleared on every revival
-    # so a recovered loop is not stood down by stale evidence.
-    consecutive_start_failures: int = 0
-    # Absolute wall-clock deadline for the next fire (0 = unset: the next arm
-    # starts a fresh full countdown). This is what makes the countdown
-    # deadline-preserving — user turns cancel the pending timer TASK but never
-    # touch this field, so the schedule survives an active conversation.
-    # Cleared on every delivered fire (the next cycle is measured from the
-    # nudge turn's END, whose timestamp is only known at notify_turn_complete).
-    # Every assignment is persisted: add/update/fire bookkeeping write it
-    # inline, and turn-lifecycle arms schedule a supervised background write,
-    # so a restart resumes the countdown. A lost background write degrades to
-    # a fresh full countdown after restart, never a lost or premature fire.
-    next_due_ts: float = 0.0
-    # Optional observation/controller state. ``gate=True`` records belong to the
-    # prompt path; controller-owned records carry state with ``gate=False``.
-    monitor: MonitorState | None = None
-    # Durable delivery generation outside MonitorState. A future-version monitor
-    # is retained as an opaque payload, so mutating a field inside its local view
-    # cannot survive serialization. Keeping the exact terminal identity on the
-    # stable outer record preserves both the opaque bytes and restart dedupe.
-    terminal_notification_outcome: str = ""
-    terminal_notification_stopped_at: float = 0.0
-    # Optional SHORT stand-in for ``message`` in the VISIBLE dashboard
-    # transcript row. Empty (the default) means the row is byte-identical to
-    # what it has always been, so no existing loop changes behaviour.
-    #
-    # ``message`` serves two consumers with opposite needs. The model needs the
-    # whole instruction re-delivered every cycle — that is the guarantee the
-    # nudge exists to provide. A person reading the transcript needs only "a
-    # nudge happened", yet gets the same multi-KB payload appended per cycle:
-    # measured on one long-running loop, 44 nudge rows of ~7.9KB were 51.8% of
-    # the entire 671,900-char session file.
-    #
-    # The PROMPT is never affected by this field (see
-    # ``GatewayOrchestrator._fire_dashboard_nudge``): shortening the model's
-    # copy would delete real instruction, which is the opposite of the point.
-    # Scoped to the dashboard transcript row — channel-bound loops
-    # (``slack:``/``discord:``/``webex:``) deliver the nudge as the turn's own
-    # input and have no separate display surface to shorten.
-    #
-    # Appended LAST rather than placed beside ``message`` so a persisted store
-    # written by this version still loads on a build that predates the field:
-    # ``_load`` filters unknown keys, so a downgrade degrades to the verbose
-    # display instead of raising.
-    banner: str = ""
-    # WHO armed this loop, reduced to the one distinction the authorizer needs:
-    # True when the arming request came from a turn OF THE BOUND SESSION ITSELF
-    # (the ``monitor_start`` / ``monitor_watch`` session directive, applied by
-    # the turn loop to the exact session that produced it), False for every
-    # external arm (REST, workflow ``ctx.nudge``, an app handler).
-    #
-    # Exists because crew- and member-mode slots refuse automation turns armed
-    # from OUTSIDE the session -- nothing may inject work into a member's own
-    # thread -- yet a member is by definition a self-directed resident agent,
-    # and refusing its own ``monitor_start`` left the conductor member thread
-    # never waking again (the very loop it exists to run). The authorizer
-    # admits the self-arm and records it here so the FIRE-time re-check in
-    # ``GatewayOrchestrator._fire_dashboard_nudge`` can tell "this slot was a
-    # member when its own turn armed the loop" from "this slot switched into
-    # crew mode after an outsider armed it", which is the case that guard
-    # exists to stop. Persisted for the same reason ``gate`` is: a restart
-    # re-arms every loop, and a self-armed member loop that lost this bit
-    # would be refused at its first post-restart wake. Absent in a store
-    # written before the field existed decodes to False -- every such loop
-    # was armed under the old rule, which admitted no self-arm.
-    self_armed: bool = False
-    # Monotonic per-loop CONFIG generation. Advanced by ``_update_unserialized``
-    # ONLY on a real configuration change (a changed ``message``) or a revival
-    # (inactive -> active), never by internal timer/cycle bookkeeping. Captured
-    # at fire time and compared atomically (under the service ``_lock``) before a
-    # structural-terminal stop is applied, so a stale completion of an OLD
-    # instruction cannot deactivate a loop whose instruction was re-committed
-    # since (the A->B->A race that value-identity on ``message`` alone cannot
-    # tell apart). Reuses the module's generation/fence pattern rather than a new
-    # concurrency framework. Absent in a store written before this field ->
-    # decodes to 0, and a first fire simply captures 0.
-    config_generation: int = 0
-
-
-def is_structured_monitor_loop(loop: NudgeLoop) -> bool:
-    """Distinguish controller records from prompt loops carrying probe state."""
-    return getattr(loop, "monitor", None) is not None and not getattr(loop, "gate", False)
-
-
-def terminal_notification_delivery_matches(
-    loop: NudgeLoop,
-    outcome: MonitorOutcome,
-    stopped_at: float,
-) -> bool:
-    """Whether this exact terminal generation has a durable delivery record."""
-    if loop.terminal_notification_outcome:
-        return (
-            loop.terminal_notification_outcome == outcome.value
-            and loop.terminal_notification_stopped_at == stopped_at
-        )
-    state = loop.monitor
-    return state is not None and state.terminal_notification_delivered
-
-
-class MonitorUpdateConflict(ValueError):
-    """A structured mutation would break active action correlation."""
-
-
-def _is_torn_deactivation(loop: NudgeLoop) -> bool:
-    """Whether a persisted row is inactive without any stop having been recorded.
-
-    Every deactivation this service performs leaves one of two marks: a
-    non-empty ``stopped_reason`` on the loop (``update`` defaults to
-    ``"manual"``; the timer bounds, the terminal settlement and the
-    sentinel-drop repair write theirs) or a terminal ``outcome`` on a monitor
-    record — and all of them clear ``next_due_ts``. A row that is inactive with
-    NEITHER mark and a deadline still set was therefore not stopped by this
-    service; ``_load`` resumes it. A monitor whose wake is in flight is left to
-    the claim-recovery branches, which own that state.
-
-    The row must still carry its kill-switch path. A sentinel-drop repair that
-    predates ``SENTINEL_DROPPED_REASON`` persisted this very shape MINUS the
-    sentinel (it blanked the path and recorded nothing), and that stop was a
-    fail-closed refusal to run without a kill switch -- so an empty sentinel is
-    the one persisted discriminator between a torn write and that refusal, and
-    the ambiguous shape stays inactive. A loop armed without a sentinel in the
-    first place therefore is not resumed here either; the dashboard revives it.
-    """
-    if loop.active or loop.stopped_reason or loop.next_due_ts <= 0:
-        return False
-    if not loop.stop_sentinel_path:
-        return False
-    state = loop.monitor
-    if state is None:
-        return True
-    return (
-        state.version == MONITOR_STATE_VERSION
-        and state.outcome is None
-        and not state.wake_in_flight
-    )
-
-
-def _repair_number(
-    value: Any, *, lo: float, fallback: float, hi: float | None = None
-) -> tuple[float, bool]:
-    """Coerce a persisted numeric field to a FINITE value within [lo, hi].
-
-    Returns ``(repaired_value, was_repaired)``. Non-numeric, non-finite
-    (``1e309`` parses to ``inf``, which json.dump would emit as invalid
-    ``Infinity``), and out-of-range inputs all repair rather than raise, so a
-    corrupt store entry can never abort gateway startup or poison the JSON
-    the REST/WS surface emits.
-    """
-    try:
-        num = float(value)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError: JSON integers are arbitrary-precision, so a persisted
-        # 10**400 converts to float by raising rather than returning inf —
-        # without this arm the error would escape to _load()'s per-entry
-        # handler, which SKIPS the loop and lets the next persist delete it.
-        return fallback, True
-    if math.isnan(num) or math.isinf(num):
-        return fallback, True
-    clamped = max(lo, num) if hi is None else max(lo, min(hi, num))
-    return clamped, clamped != num
-
-
-def runtime_budget_exceeded(loop: "NudgeLoop", now: float | None = None) -> bool:
-    """True when *loop* has a wall-clock budget and it is spent.
-
-    Single source of truth shared by ``_timer`` (enforcement) and the expiry
-    notifier (wording), so the two can never disagree on WHY a loop stopped.
-    A loop with no ``created_ts`` (a malformed/legacy store entry) never
-    trips the budget — there is no anchor to measure from, and guessing one
-    could kill a healthy loop on its first cycle after an upgrade.
-    """
-    if not loop.max_runtime_secs or not loop.created_ts:
-        return False
-    return (now if now is not None else time.time()) - loop.created_ts >= loop.max_runtime_secs
-
-
-@contextmanager
-def _locked_file(path: Path, mode: str) -> Iterator[Any]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if "r" in mode and not path.exists():
-        path.write_text(json.dumps({"version": _STORE_VERSION, "loops": []}))
-    # "r" -> "r+": Windows msvcrt.locking requires WRITE access on the fd — a
-    # read-only handle fails with EACCES, which platform_compat.file_lock
-    # swallows (best-effort), silently degrading the reader's lock to a no-op
-    # and letting a concurrent _save race the read (same fix as
-    # apps/bridges.py:_mcp_lock). The shared/exclusive decision keys off the
-    # ORIGINAL mode so a reader still requests a shared lock.
-    exclusive = "w" in mode or "+" in mode
-    if mode == "r":
-        mode = "r+"
-    with open(path, mode, encoding="utf-8") as fh:
-        with platform_compat.file_lock(fh.fileno(), exclusive=exclusive):
-            yield fh
-
-
-def infer_monitor(
-    message: str,
-    now: float,
-    *,
-    creation_surface: MonitorCreationSurface = MonitorCreationSurface.UNKNOWN,
-) -> MonitorState | None:
-    """Build a monitor for *message*'s subject, or ``None`` to stay ungated.
-
-    ``None`` is the common, safe answer: a loop watching something with no probe
-    -- a deployment, a ticket, a file -- keeps exactly the behaviour it had
-    before this feature existed. Only a message that names ONE observable
-    subject becomes a gated monitor.
-
-    Public because the ARMING SURFACE has to report this same decision in its
-    acknowledgement, and the reasons it can answer ``None`` are not all in
-    :func:`targets.infer` -- a subject that will not form a valid monitor is
-    another. An ack that re-derived the answer from the target alone could claim
-    a gate the loop never got, which is the one thing a disclosure must not do.
-    One function, one answer.
-
-    Budgets are left at their defaults and are NOT enforced on this path. The
-    default cap is 8 agent turns, and real babysit loops run for dozens of
-    cycles, so enforcing it here would stop working watches early -- a
-    regression wearing a budget's clothing. Enforcement belongs with the
-    decision controller that owns the rest of the budget vocabulary, and is
-    deliberately not smuggled in behind a token saving.
-    """
-    target = targets.infer(message)
-    if target is None:
-        return None
-    try:
-        return MonitorState(
-            kind=target.kind,
-            target=target.subject,
-            objective=REVIEW_READY,
-            created_ts=now,
-            creation_surface=creation_surface,
-        )
-    except ValueError:
-        # A subject that cannot form a valid monitor is not a reason to refuse
-        # the loop the caller asked for. Arm it ungated.
-        logger.warning("AutoNudge: inferred target %r rejected by MonitorState", target.subject)
-        return None
+        svc = _INSTANCE
+        if svc is not None and slot_key:
+            _timers._schedule_release(svc, slot_key, why=why)
+    except Exception:
+        logger.debug("autonudge.release_approval_hold failed", exc_info=True)
 
 
 class AutoNudgeService:
@@ -998,56 +449,124 @@ class AutoNudgeService:
         base_dir: Path | None = None,
         on_fire: Callable[[NudgeLoop], Awaitable[bool]] | None = None,
         on_monitor_tick: Callable[[NudgeLoop], Awaitable[None]] | None = None,
+        collect_judge_evidence: Callable[[NudgeLoop], Awaitable[Any]] | None = None,
+        emit_judge_notice: Callable[[NudgeLoop, str], Awaitable[None]] | None = None,
+        worker_running: Callable[[str], bool] | None = None,
+        worker_closed: Callable[[str], bool] | None = None,
     ) -> None:
         self._base_dir = base_dir or config_dir()
-        self._path = self._base_dir / _NUDGES_FILE
-        self._quarantine_path = self._base_dir / _QUARANTINE_FILE
+        # The durable store's state and file protocol (see autonudge_service.store).
+        self._store = LoopStore(self._base_dir)
         self._on_fire = on_fire
         self._on_monitor_tick = on_monitor_tick
+        #: Reads the wake judge's evidence for one loop. Injected rather than called
+        #: directly because authorizing a session read needs ``DashboardState``,
+        #: which this service does not hold -- the same reason ``on_fire`` and
+        #: ``owner_session_id`` are closures the gateway supplies. ``None`` means this
+        #: build collects nothing, so every judge verdict is a fail-open FALLBACK and
+        #: the tick behaves exactly as it does today.
+        self._collect_judge_evidence = collect_judge_evidence
+        #: Writes ONE transcript notice row on the owning session, so a verdict that
+        #: spent no turn is still visible to whoever is reading the tab. Injected for
+        #: the same reason the reader above is: appending a row needs
+        #: ``DashboardState``. ``None`` means this build renders no notice, which
+        #: costs the verdict nothing -- it is already on the loop record and in the
+        #: decisions log.
+        self._emit_judge_notice = emit_judge_notice
+        #: ``session_key -> that slot has a turn in flight``. Injected because the
+        #: slot table is the dashboard's, and this service is constructed with
+        #: callbacks rather than a handle on it. Only the work-ledger probe reads
+        #: it, to answer the "not running" half of the staleness conjunction; when
+        #: it is absent every worker reads as idle, which can only make that probe
+        #: louder, never quieter. See :mod:`kiro_crew.probes.work_ledger`.
+        self._worker_running_resolver = worker_running
+        #: ``session_key -> that slot is GONE``. Injected for the same reason the
+        #: liveness resolver above is, and read by the same probe -- but it answers a
+        #: different question: a closed worker is stale AT ONCE, where an idle one waits
+        #: out the staleness window. Absent means "not closed", which keeps the window.
+        self._worker_closed_resolver = worker_closed
         self._loops: dict[str, NudgeLoop] = {}
-        # Rows withheld from the live map but preserved on disk for repair. Kept off
-        # every egress path because ADDRESSING_FIELDS are exempt from the scrub.
-        self._quarantined: list[dict] = []
-        # Whole-row keys THIS instance enumerated from the sidecar at load. Compaction may
-        # remove only these: a row it never saw belongs to a writer it cannot account for.
-        self._sidecar_seen: set[str] = set()
-        # Rows ``_load`` could not parse, kept VERBATIM so a rewrite round-trips them:
-        # skipping a row must not delete the entry the operator was warned to repair.
-        self._unparsed_rows: list[Any] = []
-        # Persisted but rolled back in memory for the delivery window, so another
-        # writer snapshotting mid-turn records the claim rather than erasing it.
-        self._delivering_claim: dict[str, tuple[int, float]] = {}
-        #: loop id -> the claimed cycle that loaded unresolved, awaiting a
-        #: deliberate re-activation to settle it.
-        self._unreconciled_claim: dict[str, int] = {}
-        #: loop ids whose claim is held for a turn the fire path reported did NOT go out,
-        #: so reactivation retries the release rather than charging the reader for it.
-        self._undelivered_claim: set[str] = set()
-        # Depth, not a flag: the sidecar lock is taken on nested paths within one process.
-        self._sidecar_lock_depth = 0
         self._timers: dict[str, asyncio.Task] = {}
         # Loop ids whose re-arm was requested while their fire window was open.
         # Applied when the window closes (see _timer): a dashboard turn can
         # complete while the firing task is still persisting, and honouring the
         # hook immediately would cancel that task mid-persist.
         self._rearm_pending: set[str] = set()
-        # Loop ids removed from memory whose durable state write has not yet
-        # succeeded. A caller may retry remove(id) after the first write fails;
-        # an arbitrary unknown id remains a no-op.
-        self._pending_removals: set[str] = set()
+        #: Loop ids whose PULL-FORWARD was refused because the loop was mid-fire, so the
+        #: deferred re-arm must run at delay zero rather than toward the loop's own
+        #: deadline. A plain ``_rearm_pending`` entry re-arms from the deadline, which for
+        #: a conductor patrolling on an hours-long cadence would turn a worker's report
+        #: into an hours-long wait -- exactly the delay the crew-log wake removes. Kept
+        #: BESIDE that set rather than replacing it, because the two say different things
+        #: about the same window ("resume the countdown" and "run now"), and released at
+        #: the one site that applies it (``_run_fire_cycle``'s tail) plus the removal
+        #: path, so a claim cannot outlive its loop.
+        self._pulled_forward: set[str] = set()
+        #: Loop ids whose ARMED timer was set by a worker's push and has not started.
+        #: Moved to ``_pushed_running`` when that tick begins, and dropped by every
+        #: other arm, so it always describes the timer actually armed. A push landing
+        #: while it is set buys nothing new: the armed tick has not read the ledger yet.
+        self._pushed_ticks: set[str] = set()
+        #: Loop ids whose RUNNING tick was armed by a worker's push. Such a tick goes
+        #: through the probe gate rather than spending the post-wake follow-up (the
+        #: free follow-up belongs to the loop's own cadence), and a quiet answer keeps
+        #: the loop's earlier deadline rather than pushing it out. Reset at every tick.
+        self._pushed_running: set[str] = set()
+        #: ``loop id -> failure streak`` a work-ledger wake was delivered at, so the
+        #: gate can retry that wake if its own turn fails; see
+        #: ``gate._spend_ledger_wake_retry``. Released with the loop.
+        self._ledger_wake_streak: dict[str, int] = {}
+        #: ``loop id -> ledger fingerprint`` read by the running tick's person-wait
+        #: check ("" when not every open item waits on a person). The delivered turn
+        #: copies it to ``ledger_seen_fp``; see ``_holds_for_person_wait``.
+        self._ledger_tick_fp: dict[str, str] = {}
+        #: ``loop id -> item id -> wall-clock times`` of the pull-forwards that item
+        #: bought its conductor in the last hour, and the ``(loop id, item id)`` pairs
+        #: whose cap has already been logged in the current window. Read and written by
+        #: ``conductor_wake`` on the event loop; released with the loop.
+        self._pull_forward_counts: dict[str, dict[str, list[float]]] = {}
+        self._pull_forward_capped: set[tuple[str, str]] = set()
         # Loop ids whose CURRENT tick observed a wake but has not yet had its fire
         # confirmed. Transient on purpose: it is a claim about a turn in flight,
         # so a restart must forget it rather than charge a turn that never ran.
-        self._pending_monitor_wake: set[str] = set()
+        #: A MAP, not a set, and the value is the kernel's own wake text: which
+        #: items moved and how, as ``irq`` composed it from the probe's briefs.
+        #: A GATED loop's fire path builds its prompt from the loop's own message
+        #: and carries no envelope, so the verdict was the only holder of that text
+        #: and it went out of scope at the gate -- which is why a delivered
+        #: work-ledger wake said only that a cycle had happened.
+        #:
+        #: Carried ON the claim rather than in a second table beside it, because
+        #: the two have one lifetime: a claim released without delivering must not
+        #: leave text behind for whatever fire comes next, and this file already
+        #: records what two claim tables with separate release points cost. Every
+        #: site that releases the claim therefore releases the text by doing so.
+        #:
+        #: The text is worker-attributed prose about the ledger, so the in-memory
+        #: lifetime is a boundary and not only a restart choice: the one place it
+        #: is entitled to appear is the conductor's own turn, and writing it beside
+        #: the watch state would put it outside the store's identity-gated read
+        #: path -- exactly what ``ledger_wake.wake_brief`` keeps out of there.
+        self._pending_monitor_wake: dict[str, str] = {}
         #: A quiet-streak floor tick that has decided to deliver but not yet
         #: delivered. Same shape and same reason as the wake claim above: the charge
         #: belongs at the single point delivery is confirmed, never at the decision.
         self._pending_floor_tick: set[str] = set()
+        #: Consecutive indeterminate re-probes of a delivered terminal, per loop.
+        #: In memory on purpose: it only decides when the settlement-only branch
+        #: hands the tick back to ordinary observation, and the delivered marker
+        #: survives that hand-off, so a restart resetting it buys a few more quiet
+        #: re-probes and never a second terminal turn.
+        self._terminal_reprobe_unknowns: dict[str, int] = {}
         # Loop ids whose timer task is CURRENTLY inside its ``_on_fire`` await.
         # ``update()`` must not cancel such a timer: for channel-bound loops the
         # fire callback runs the unattended turn INLINE, so cancelling it kills
         # the in-flight turn and loses its transcript and cycle bookkeeping.
         self._firing: set[str] = set()
+        # Loop ids whose delivered-terminal ``holds`` snapshot is being written.
+        # A manual fire in this window must refuse rather than arm a timer that
+        # publishing the staged stop immediately retires.
+        self._terminal_settlement_writes: set[str] = set()
         # Loop ids owned by an administrative cleanup. Public mutations on the
         # same firing loop must not wait for the maintenance mutex: the cleanup
         # is waiting for that timer to finish, so waiting would invert the lock.
@@ -1058,9 +577,6 @@ class AutoNudgeService:
         # Set by _load() when persisted state is repaired in memory so start()
         # flushes the correction before any loop can re-arm.
         self._store_dirty = False
-        # Set when ``_load`` could not vet the store at all, so an empty map means
-        # "could not vet" rather than "empty" and every persist raises, never deletes.
-        self._load_refused: bool = False
         # Consecutive non-delivery count per loop (drives escalating re-arm
         # backoff + once-per-streak failure logging). Not persisted; resets on
         # a delivered fire, on removal, and on restart.
@@ -1072,10 +588,56 @@ class AutoNudgeService:
         # good. Not persisted: a restart re-arms on a fresh full interval anyway,
         # so the worst a lost entry costs is one extra deferral.
         self._start_failure_deferred: dict[str, int] = {}
-        # Strong refs to in-flight shielded add() tasks: keeps a detached
-        # mutation supervised (no GC, failures logged) even when every awaiting
-        # caller was cancelled. Discarded on completion.
-        self._inflight_adds: set = set()
+        # Closed synchronously at shutdown entry, before any drain awaits. New
+        # callers are refused after closure; a lease captured before closure
+        # remains valid for one persistence submission in this generation.
+        self._accepting_mutations = True
+        self._mutation_generation = 0
+        # A timer callback admitted before closure keeps using the same
+        # generation lease for the writes its own task makes, including the
+        # bookkeeping a delivery cancelled by shutdown performs on its way out.
+        # A task it spawns sees the lease but is not its owner, so it does not
+        # inherit it; ordinary public mutations still receive a
+        # single-persistence lease from `_admit_mutation`.
+        self._mutation_admission: contextvars.ContextVar[_MutationAdmission | None] = (
+            contextvars.ContextVar(
+                f"autonudge_mutation_admission_{id(self)}",
+                default=None,
+            )
+        )
+        # A remove-class transaction runs in a detached child, but timer
+        # cancellation must still recognize the callback task that owns it as
+        # self-cancellation. Set only in that child's copied context.
+        self._admitted_transaction_owner: contextvars.ContextVar[asyncio.Task[Any] | None] = (
+            contextvars.ContextVar(
+                f"autonudge_admitted_transaction_owner_{id(self)}",
+                default=None,
+            )
+        )
+        # The writes one admitted transaction has started, carried in the same
+        # child context. The caller's cancellation hold reads it, so a detached
+        # write under the callback's shared lease, which runs in its own context,
+        # cannot pass for this transaction's submission.
+        self._admitted_transaction_submissions: contextvars.ContextVar[
+            _TransactionSubmissions | None
+        ] = contextvars.ContextVar(
+            f"autonudge_admitted_transaction_submissions_{id(self)}",
+            default=None,
+        )
+        # Strong refs to owned mutation tasks and owner-completion futures:
+        # keep detached mutations supervised (no GC, failures logged) and let
+        # shutdown map a drained section or transaction back to its timer callback
+        # without waiting on that callback's whole lifetime. Discarded on completion.
+        self._inflight_adds: set[asyncio.Future[Any]] = set()
+        # Timer tasks past their sleep. Shutdown cancels them like dormant timers,
+        # including one whose own loop was removed mid-callback and so has left
+        # ``_timers``; only a callback identified by a registered drain-owner
+        # completion in ``_inflight_adds`` is drained instead.
+        self._running_callbacks: set[asyncio.Task[Any]] = set()
+        # Executor-backed writes outlive cancellation of their asyncio waiter.
+        # Track the raw futures separately so shutdown can prove the durable
+        # boundary before the store path is released.
+        self._inflight_persistence: set[asyncio.Future[Any]] = set()
         # Structured replacements whose prior row must keep its protected trust
         # until the caller completes a second durable authorization step. The
         # monitor snapshot and the protected trust record are separate files, so
@@ -1090,6 +652,14 @@ class AutoNudgeService:
         # its accepted fingerprint. Durable delivery state remains authoritative
         # after the dispatcher returns or the process restarts.
         self._accepted_monitor_turns: dict[str, str] = {}
+        # Runtime authority for a completion emitted by the exact task whose
+        # dashboard/channel turn crossed the provider-entry boundary. The owner
+        # task stays out of the mutation drain, so a stop never waits on its
+        # turn; the entry outlives shutdown until that task ends, and the write
+        # its completion makes is drained like any other admitted write.
+        self._accepted_monitor_completion_authorities: dict[
+            tuple[str, str], tuple[asyncio.Task[Any], _MutationAdmission]
+        ] = {}
         # The periodic reconciler task (see _reconcile_forever). Owned by
         # start()/stop(); None while the service is not running.
         self._reconciler: asyncio.Task | None = None
@@ -1099,532 +669,111 @@ class AutoNudgeService:
         # so any sign of life restarts the two-pass clock. Not persisted --
         # after a restart, start() re-arms every active loop anyway.
         self._reconcile_candidates: set[str] = set()
+        # One lock per structured monitor orders its durable patch and any
+        # credential continuation as one transaction. The map lookup is protected
+        # by ``_lock``; callers then acquire this lock before re-entering ``_lock``.
+        # Registered users keep an entry stable across a concurrent row removal.
+        self._monitor_mutation_locks: dict[str, asyncio.Lock] = {}
+        self._monitor_mutation_lock_users: dict[str, int] = {}
         self._observers: list[Callable[[str, NudgeLoop | None], None]] = []
         self._lock = asyncio.Lock()
 
+    @property
+    def accepting_mutations(self) -> bool:
+        """Whether this service generation admits a new public mutation."""
+        return self._accepting_mutations
+
+    @property
+    def _path(self) -> Path:
+        """The store file's path, which callers and tests read off the service.
+
+        Read from the composed store on every access rather than copied at
+        construction, so the loader reads the file the store writes even after
+        the store's path is reassigned.
+        """
+        return self._store.path
+
     # ── Persistence ──
 
-    def _load(self) -> None:
-        """Read the store and repair each entry. BLOCKING — see ``start()``.
+    def _admit_mutation(
+        self,
+        *,
+        allow_multiple_persistence: bool = False,
+    ) -> _MutationAdmission:
+        """Capture mutation authority before the caller reaches its first await."""
+        current = _current_task_or_none()
+        inherited = self._mutation_admission.get()
+        if inherited is not None and inherited.owner_task is current:
+            return inherited
+        if not self._accepting_mutations:
+            raise NudgeAdmissionRefused(
+                SERVICE_SHUTTING_DOWN_MESSAGE,
+                reason=NudgeAdmissionReason.SERVICE_SHUTTING_DOWN,
+            )
+        return _MutationAdmission(
+            self._mutation_generation,
+            owner_task=current,
+            allow_multiple_persistence=allow_multiple_persistence,
+        )
 
-        Does file I/O (locked read) and, via ``repair_sentinel_path``, realpath
-        resolution that can stall on an unavailable network mount, so callers on
-        the event loop MUST offload this (``no-blocking-call-on-event-loop``).
+    def _effective_admission(
+        self,
+        admission: _MutationAdmission | None,
+    ) -> _MutationAdmission | None:
+        """The explicit lease, else the one the current timer task inherited."""
+        if admission is not None:
+            return admission
+        inherited = self._mutation_admission.get()
+        if inherited is None or inherited.owner_task is not _current_task_or_none():
+            return None
+        return inherited
+
+    def _mutation_allowed(self, admission: _MutationAdmission | None) -> bool:
+        effective = self._effective_admission(admission)
+        if effective is None:
+            return self._accepting_mutations
+        return effective.generation == self._mutation_generation
+
+    def _start_persistence(
+        self,
+        payload: dict,
+        *,
+        admission: _MutationAdmission | None = None,
+    ) -> asyncio.Future[None]:
+        """Start one off-loop write under live or already-admitted authority.
+
+        The single submission point for an executor-backed store write, so the
+        raw future is registered where ``shutdown()`` drains it even when every
+        asyncio waiter of the write was cancelled.
         """
-        with _locked_file(self._path, "r") as fh:
-            data = json.load(fh)
-        # Reset per load: a re-read must not inherit a refusal from a prior one.
-        self._load_refused = False
-        # Prior quarantine is re-read and kept HELD: repairing the offending field is
-        # not enough on its own, because the sidecar must not be the only durable copy.
-        self._quarantined = []
-        # And the ownership set with it: it is the LICENCE to remove, so a key surviving a
-        # pass the row did not lets compaction delete a row a peer wrote afterwards.
-        self._sidecar_seen = set()
-        # Re-read per load: a row repaired between loads must stop being carried.
-        self._unparsed_rows = []
-        # No turn is in flight across a load, so no claim can be owed.
-        self._delivering_claim = {}
-        # Re-derived below from each row's own marker, never carried across a load.
-        self._undelivered_claim = set()
-        # The sidecar is the SINGLE durable location. Held-aside rows are deliberately
-        # not embedded in the store too -- two copies of one state can disagree.
-        prior_quarantined = self._read_quarantine_sidecar()
-        # Arming while writes are refused is worse than arming nothing: a delivered cycle
-        # cannot persist its counter, so a restart re-fires it past its own cycle cap.
-        if self._load_refused:
-            logger.warning(
-                "AutoNudge: arming no loops — the quarantine sidecar at %s could not be "
-                "read, so a delivered cycle could not record itself. Fix the file and "
-                "restart.",
-                self._quarantine_path,
+        effective = self._effective_admission(admission)
+        if not self._mutation_allowed(effective):
+            raise NudgeAdmissionRefused(
+                SERVICE_SHUTTING_DOWN_MESSAGE,
+                reason=NudgeAdmissionReason.SERVICE_SHUTTING_DOWN,
             )
-            return
-        # Probe the ACTIVE credential policy ONCE, before the row loop: inside it the
-        # per-row ``except`` swallows a composition failure and misreports the defect.
-        try:
-            redact_via_context("")
-        except PlatformCompositionError:
-            self._load_refused = True
-            logger.error(
-                "AutoNudge: refusing to arm any loop — this host declares a credential "
-                "policy it could not compose, so a persisted addressing field cannot be "
-                "vetted. The store is left untouched (writes are refused while this "
-                "holds); fix the host and restart.",
-                exc_info=True,
+        if (
+            effective is not None
+            and effective.persistence_submitted
+            and not effective.allow_multiple_persistence
+        ):
+            raise NudgeAdmissionRefused(
+                "mutation persistence lease is already consumed",
+                reason=NudgeAdmissionReason.PERSISTENCE_LEASE_CONSUMED,
             )
-            return
-        # The list guard below cannot see a NON-DICT root: ``"loops" in []`` is False, so
-        # a hand-edited ``[]`` or bare number reached the row loop and aborted boot.
-        if not isinstance(data, dict):
-            self._load_refused = True
-            logger.error(
-                "AutoNudge: refusing to arm any loop — the store at %s holds %s at its "
-                "root instead of an object, so no row can be read. Writes are refused (a "
-                "write would delete them); fix the file and restart.",
-                self._path,
-                type(data).__name__,
-            )
-            return
-        # PRESENT-BUT-NOT-A-LIST is corruption, not an empty store: read as empty, the
-        # next mutation replaces the file and deletes every row it held. ABSENT is legal.
-        if "loops" in data and not isinstance(data["loops"], list):
-            self._load_refused = True
-            logger.error(
-                "AutoNudge: refusing to arm any loop — the store at %s carries %s under "
-                "'loops' instead of a list, so its rows cannot be enumerated. Writes are "
-                "refused (a write would delete them); fix the file and restart.",
-                self._path,
-                type(data["loops"]).__name__,
-            )
-            return
-        store_rows = _rows_or_empty(data.get("loops"))
-        # HELD, NEVER ARMED: arming a held-aside row made the sidecar the only durable
-        # copy of a live row, so a failed compaction plus a delete left it to re-arm.
-        for raw in prior_quarantined:
-            self._quarantined.append(deepcopy(raw))
-            # Accounted for by THIS instance, so compaction may later drop it once repaired.
-            # A row a peer adds after this read stays outside the set, and so survives.
-            self._sidecar_seen.add(_quarantine_row_key(raw))
-            logger.warning(
-                "autonudge: not arming held-aside loop %s -- held rows are kept for "
-                "repair, never armed; move the repaired row into %s to arm it",
-                redact_store_value(raw.get("id") if isinstance(raw, dict) else None),
-                self._path,
-            )
-        for raw in store_rows:
-            try:
-                loop_values = {
-                    key: raw[key]
-                    for key in raw
-                    if key in NudgeLoop.__dataclass_fields__ and key != "monitor"
-                }
-                # ``gate`` decides whether a loop may be observation-gated, and a
-                # stored value that is not a bool is not a decision: the STRING
-                # "false" is truthy, so passing it through would gate a loop that
-                # asked not to be. Normalise it here, at the boundary, rather than
-                # hardening each read site.
-                # PRESENT-AND-NOT-A-BOOL, which includes ``null``, normalised to
-                # FALSE. Normalising it to True instead -- on the grounds that reading
-                # corrupt data as an opt-out would ungate loops nobody chose to
-                # ungate -- has the asymmetry backwards: gating is the state that
-                # can silently STOP a loop, so an unreadable value must resolve to
-                # ungated -- costing a turn per interval, which is today's cost --
-                # rather than to gated, which can deactivate a recurring task whose
-                # instruction merely mentioned a pull request. Only an explicit
-                # boolean true gates.
-                if "gate" in loop_values and not isinstance(loop_values["gate"], bool):
-                    logger.warning(
-                        "AutoNudge: loop %s stored a non-boolean gate (%r); leaving it ungated",
-                        raw.get("id"),
-                        loop_values["gate"],
-                    )
-                    loop_values["gate"] = False
-                # ``self_armed`` is the ONE bit that relaxes the crew/member
-                # fire-time guard, and this store is agent-writable. A persisted
-                # non-boolean (the string "false" is truthy) must therefore
-                # normalise to the REFUSING value, exactly as ``gate`` above
-                # normalises to its safe value: only an explicit boolean True
-                # admits, and the fire-time check compares ``is True`` besides.
-                if "self_armed" in loop_values and not isinstance(loop_values["self_armed"], bool):
-                    logger.warning(
-                        "AutoNudge: loop %s stored a non-boolean self_armed (%s); "
-                        "treating it as externally armed",
-                        redact_store_value(raw.get("id")),
-                        redact_store_value(loop_values["self_armed"]),
-                    )
-                    loop_values["self_armed"] = False
-                # ``config_generation`` is agent-writable persisted data and is
-                # used in arithmetic (``+= 1``) and an equality fence. A stored
-                # ``null``, string or negative would raise mid-mutation (a partial
-                # update + HTTP 500) or corrupt the fence, so normalise it at the
-                # boundary to a non-negative int, exactly like ``gate`` above.
-                # Absent -> the dataclass default 0. An unreadable value resets to
-                # 0, which only makes a captured pre-existing verdict's generation
-                # not match (a missed stop, the safe direction), never a wrong stop.
-                if "config_generation" in loop_values:
-                    _cg = loop_values["config_generation"]
-                    if not isinstance(_cg, int) or isinstance(_cg, bool) or _cg < 0:
-                        logger.warning(
-                            "AutoNudge: loop %s stored a non-int/negative "
-                            "config_generation (%r); resetting to 0",
-                            raw.get("id"),
-                            _cg,
-                        )
-                        loop_values["config_generation"] = 0
-                loop = NudgeLoop(**loop_values)
-                # Rotated on EVERY load: a human may have hand-edited the goal while we
-                # were down, so a pre-restart token must not authorise overwriting it.
-                loop.goal_token = new_goal_token()
-                # Owed in BOTH arms: a cap applied later is refused against ``cycle_count``, so
-                # committing an unconfirmed cycle is not inert even on an uncapped loop.
-                inflight = raw.get("inflight_cycle")
-                if isinstance(inflight, bool):
-                    # ``isinstance(True, int)`` is TRUE, so a stored boolean would read as
-                    # cycle 1 and spend a phantom cycle that no turn ever claimed.
-                    logger.warning(
-                        "AutoNudge: loop %s stored a non-integer cycle claim (%s); ignoring it",
-                        redact_store_value(raw.get("id")),
-                        redact_store_value(inflight),
-                    )
-                    inflight = None
-                    self._store_dirty = True
-                if isinstance(inflight, int) and inflight > loop.cycle_count:
-                    # The claim reaches disk BEFORE the turn it claims, so an unresolved one
-                    # cannot say whether the reader already received that turn.
-                    logger.warning(
-                        "AutoNudge: loop %s was interrupted mid-delivery on cycle %d — it is "
-                        "owed, not spent, and is held stopped until re-activated",
-                        redact_store_value(raw.get("id")),
-                        inflight,
-                    )
-                    self._unreconciled_claim[loop.id] = inflight
-                    if raw.get("inflight_undelivered") is True:
-                        # The writer knew this turn never went out, so the charge is not owed.
-                        self._undelivered_claim.add(loop.id)
-                    loop.active = False
-                    # A reason the UI can render: without it a routine restart mid-fire
-                    # surfaced as an unexplained pause with only a log line behind it.
-                    loop.stopped_reason = "interrupted_cycle"
-                    self._store_dirty = True
-                # TRUST BOUNDARY: the REST scrub exempts these fields, so a credential
-                # placed in one reaches every client verbatim. REFUSED, never scrubbed.
-                unsafe_field = None
-                unsafe_why = ""
-                for name in sorted(ADDRESSING_FIELDS):
-                    why = _addressing_value_unsafe_why(getattr(loop, name, None))
-                    if why:
-                        unsafe_field, unsafe_why = name, why
-                        break
-                if unsafe_field is not None:
-                    logger.warning(
-                        "AutoNudge: refusing loop %s — its %s %s and addressing fields are "
-                        "served unscrubbed; fix the store entry",
-                        redact_store_value(loop.id),
-                        unsafe_field,
-                        unsafe_why,
-                    )
-                    # QUARANTINE rather than refuse the store: siblings keep running while
-                    # the offending row is held on disk for repair instead of deleted.
-                    key = _quarantine_row_key(raw)
-                    if key not in {_quarantine_row_key(r) for r in self._quarantined}:
-                        self._quarantined.append(deepcopy(raw))
-                    self._store_dirty = True
-                    continue
-                if "monitor" in raw:
-                    monitor_raw = raw["monitor"]
-                    monitor_quarantined = False
-                    try:
-                        loop.monitor = monitor_state_from_dict(monitor_raw)
-                    except (TypeError, ValueError):
-                        monitor_quarantined = True
-                        quarantine_needs_rewrite = loop.active or loop.next_due_ts != 0.0
-                        loop.monitor = quarantine_monitor_state(monitor_raw)
-                        loop.active = False
-                        loop.next_due_ts = 0.0
-                        self._store_dirty = self._store_dirty or quarantine_needs_rewrite
-                        logger.warning(
-                            "AutoNudge: quarantined malformed monitor record for loop %s",
-                            loop.id,
-                            exc_info=True,
-                        )
-                    if (
-                        "gate" not in raw
-                        and loop.monitor.version == MONITOR_STATE_VERSION
-                        and not monitor_quarantined
-                    ):
-                        # Records from the pre-gate prompt path can carry inferred
-                        # observation state without an explicit decision to gate.
-                        # Migrate them to a plain ungated loop so later saves and
-                        # restarts cannot mistake the inert payload for a typed
-                        # controller record.
-                        loop.monitor = None
-                        self._store_dirty = True
-                    if loop.monitor is None:
-                        pass
-                    elif loop.monitor.version != MONITOR_STATE_VERSION:
-                        # An older controller cannot safely interpret a newer
-                        # policy. The stored ``active`` intent is deliberately
-                        # left alone -- it belongs to the gateway that wrote it
-                        # and must survive a downgrade so an upgrade resumes the
-                        # legacy watch. A structured controller record, however,
-                        # is exposed through control surfaces that must agree it
-                        # cannot be scheduled, so retire only that record shape.
-                        loop.monitor.outcome = MonitorOutcome.BLOCKED
-                        loop.monitor.stopped_reason = MONITOR_STOP_UNSUPPORTED_VERSION
-                        if is_structured_monitor_loop(loop):
-                            if loop.active or loop.next_due_ts:
-                                self._store_dirty = True
-                            loop.active = False
-                            loop.next_due_ts = 0.0
-                    elif loop.monitor.outcome is not None:
-                        # A terminal record is inspectable, never schedulable,
-                        # even when a hand-edited store contradicts itself.
-                        if loop.active or loop.monitor.wake_in_flight or loop.next_due_ts:
-                            self._store_dirty = True
-                        loop.active = False
-                        loop.monitor.wake_in_flight = False
-                        loop.monitor.completion_evidence_deadline = 0.0
-                        loop.next_due_ts = 0.0
-                    elif is_structured_monitor_loop(loop) and loop.monitor.wake_in_flight:
-                        if (
-                            loop.monitor.wake_delivery is None
-                            and loop.monitor.completion_evidence_deadline > 0
-                        ):
-                            # A legacy snapshot can carry the accepted evidence
-                            # deadline without the later typed delivery marker.
-                            # Recover it as dispatched so the finite expiry path
-                            # owns the claim instead of leaving it immortal.
-                            loop.monitor.wake_delivery = MonitorDispatchResult.DISPATCHED
-                            self._store_dirty = True
-                        if (
-                            loop.monitor.wake_delivery is MonitorDispatchResult.BUSY
-                            and loop.next_due_ts > 0
-                        ):
-                            # BUSY proves no action turn started. Resume the
-                            # already-claimed wake at its persisted retry instead
-                            # of treating the intentionally empty evidence
-                            # deadline as an ambiguous accepted dispatch.
-                            if loop.monitor.next_probe_at != loop.next_due_ts:
-                                loop.monitor.next_probe_at = loop.next_due_ts
-                                self._store_dirty = True
-                        elif loop.monitor.completion_evidence_deadline <= 0:
-                            # A persisted claim with no accepted-dispatch
-                            # deadline may have died on either side of handoff.
-                            # Retire it without charging or redispatching.
-                            loop.monitor.wake_in_flight = False
-                            if loop.monitor.outcome is None:
-                                loop.monitor.outcome = MonitorOutcome.BLOCKED
-                                loop.monitor.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
-                            loop.active = False
-                            loop.next_due_ts = 0.0
-                            self._store_dirty = True
-                        elif loop.next_due_ts != loop.monitor.completion_evidence_deadline:
-                            loop.next_due_ts = loop.monitor.completion_evidence_deadline
-                            loop.monitor.next_probe_at = loop.next_due_ts
-                            self._store_dirty = True
-                    elif (
-                        is_structured_monitor_loop(loop)
-                        and loop.active
-                        and self._on_monitor_tick is None
-                        and self._on_fire is not None
-                    ):
-                        # Structured monitor delivery belongs to the controller,
-                        # which is intentionally not wired in this substrate.
-                        # Deactivate rather than allowing the legacy timer to
-                        # inject the prompt before a typed decision is made.
-                        loop.active = False
-                        loop.monitor.outcome = MonitorOutcome.BLOCKED
-                        loop.monitor.stopped_reason = MONITOR_STOP_SESSION_UNAVAILABLE
-                        loop.monitor.stopped_at = time.time()
-                        loop.next_due_ts = 0.0
-                        self._store_dirty = True
-                    # A current, un-claimed, unsettled monitor keeps its active
-                    # intent and re-arms like any other loop. It used to be
-                    # deactivated here because delivery had no gate and the
-                    # legacy timer would have injected a prompt without a
-                    # decision; the gate in _monitor_tick_is_quiet now makes that
-                    # decision on every tick, so surviving a restart is correct
-                    # rather than a hazard. Deactivating instead would end every
-                    # watch at the next gateway restart -- silently, since a
-                    # stopped watch and a quiet one look identical from outside.
-                # Re-home / re-validate the persisted kill-switch path. A loop
-                # armed before the data-home move would otherwise be re-armed
-                # with a sentinel path nothing can ever create (see
-                # repair_sentinel_path). INSIDE the per-entry try: a malformed
-                # store entry must be skipped, never abort start() and take the
-                # gateway offline.
-                repaired = repair_sentinel_path(loop.stop_sentinel_path)
-                # Same fail-open posture for the numeric timer fields: they
-                # drive arithmetic at arm time (``start()`` →
-                # ``_arm_from_deadline``) and are emitted as JSON by the
-                # REST/WS surface, so both must be finite and in range. A
-                # hand-edited or foreign-written store degrades per-field —
-                # never a startup abort (TypeError on a string interval) and
-                # never non-standard JSON output (a 1e309 deadline parses to
-                # ``inf``, which json.dump emits as invalid ``Infinity``).
-                loop.next_due_ts, due_repaired = _repair_number(
-                    loop.next_due_ts, lo=0.0, fallback=0.0
-                )
-                idle_num, idle_repaired = _repair_number(
-                    loop.idle_secs,
-                    lo=float(_MIN_IDLE_SECS),
-                    hi=float(_MAX_IDLE_SECS),
-                    fallback=float(_MIN_IDLE_SECS),
-                )
-                loop.idle_secs = int(idle_num)
-                # ``consecutive_start_failures`` is compared with ``>=`` on every
-                # wake, and this store is agent-writable, so a persisted string or
-                # ``null`` would raise ``TypeError`` inside ``_timer`` and the
-                # active automation would silently never fire again -- and the
-                # malformed value survives every reload. Normalised at the
-                # boundary for the same reason ``gate``, ``self_armed`` and
-                # ``config_generation`` are, rather than by hardening the one
-                # comparison.
-                streak_num, streak_repaired = _repair_number(
-                    loop.consecutive_start_failures, lo=0.0, fallback=0.0
-                )
-                loop.consecutive_start_failures = int(streak_num)
-                if streak_repaired:
-                    self._store_dirty = True
-                if (
-                    loop.monitor is not None
-                    and loop.monitor.version == MONITOR_STATE_VERSION
-                    and loop.monitor.next_probe_at != loop.next_due_ts
-                ):
-                    # NudgeLoop owns the restart schedule; the monitor field is
-                    # its atomically-persisted inspection mirror.
-                    loop.monitor.next_probe_at = loop.next_due_ts
-                    self._store_dirty = True
-                if due_repaired or idle_repaired:
-                    self._store_dirty = True
-                notification_stopped_at, notification_time_repaired = _repair_number(
-                    loop.terminal_notification_stopped_at,
-                    lo=0.0,
-                    fallback=0.0,
-                )
-                loop.terminal_notification_stopped_at = notification_stopped_at
-                notification_outcome = loop.terminal_notification_outcome
-                valid_notification_outcomes = {item.value for item in MonitorOutcome}
-                if (
-                    not isinstance(notification_outcome, str)
-                    or notification_outcome not in valid_notification_outcomes
-                ):
-                    if (
-                        notification_outcome
-                        or notification_stopped_at
-                        or notification_time_repaired
-                    ):
-                        self._store_dirty = True
-                    loop.terminal_notification_outcome = ""
-                    loop.terminal_notification_stopped_at = 0.0
-                elif notification_time_repaired:
-                    self._store_dirty = True
-                if (
-                    loop.monitor is not None
-                    and loop.monitor.outcome is not None
-                    and loop.monitor.terminal_notification_delivered
-                    and not loop.terminal_notification_outcome
-                ):
-                    loop.terminal_notification_outcome = loop.monitor.outcome.value
-                    loop.terminal_notification_stopped_at = loop.monitor.stopped_at
-                    self._store_dirty = True
-                # ``banner`` is display-only, but it is ``.strip()``ed on the
-                # fire path, so a non-string value there raises AttributeError
-                # and the loop rearms forever without ever delivering. Normalize
-                # it here for the same reason ``repair_sentinel_path`` opens with
-                # an isinstance check: both are persisted STRING fields read
-                # straight out of parsed JSON, where the dataclass annotation is
-                # not enforced. Repaired-and-persisted rather than merely
-                # tolerated, so a hand-edited store is corrected once instead of
-                # silently suppressing the banner on every boot.
-                if not isinstance(loop.banner, str):
-                    logger.warning(
-                        "AutoNudge: loop %s had a non-string banner (type %s) — treating it "
-                        "as absent; the transcript row falls back to the full message",
-                        loop.id,
-                        type(loop.banner).__name__,
-                    )
-                    loop.banner = ""
-                    self._store_dirty = True
-                elif loop.banner:
-                    # SCRUB a persisted string banner, redacting the FULL value
-                    # BEFORE any cap slice. A banner reaches the store through
-                    # producers that skip the authorized write paths — a
-                    # hand-edited ``autonudge.json``, a direct agent ``svc.add``,
-                    # or a banner persisted before this scrub existed — and the
-                    # loop is served RAW by ``GET /api/autonudge`` (``_serialize``
-                    # is ``asdict``), broadcast to every dashboard client, and
-                    # replayed by the fire path, so an unscrubbed credential here
-                    # reaches the browser after a restart. Same two passes the
-                    # write path uses, redaction FIRST so a secret straddling the
-                    # cap is masked WHOLE — slicing first would leave a raw prefix
-                    # the scanner cannot match. An over-cap banner — measured
-                    # BEFORE redaction OR after (redaction can shrink an
-                    # exfiltration URL below the cap, or grow a credential above
-                    # it) — is then BLANKED (absent), matching the promise the cap
-                    # makes elsewhere: a value the authorized write path would have
-                    # rejected is not invented back by keeping a shrunk remnant,
-                    # and the row falls back to the full message.
-                    scrubbed, _ = redact_exfiltration_urls(loop.banner)
-                    scrubbed, _ = redact_credentials(scrubbed)
-                    if len(loop.banner) > MAX_BANNER_CHARS or len(scrubbed) > MAX_BANNER_CHARS:
-                        scrubbed = ""
-                    if scrubbed != loop.banner:
-                        loop.banner = scrubbed
-                        self._store_dirty = True
-                # SCRUB the persisted ``message`` on load — same rationale as the
-                # banner above and the same two redaction passes. The store is
-                # writable out-of-band (a hand-edited ``autonudge.json`` or a
-                # direct ``svc.add``) and served RAW by ``GET /api/autonudge``,
-                # so a credential that reached the store bypassing the authorized
-                # write path — which already scrubs ``message`` — would otherwise
-                # be broadcast to every dashboard client after a restart. Unlike
-                # the banner this is redaction ONLY, never blank-on-length:
-                # ``message`` is the payload the model receives and has no
-                # fallback row, and its 8000-char limit is a write-path concern.
-                if isinstance(loop.message, str) and loop.message:
-                    scrubbed_msg, _ = redact_exfiltration_urls(loop.message)
-                    scrubbed_msg, _ = redact_credentials(scrubbed_msg)
-                    if scrubbed_msg != loop.message:
-                        loop.message = scrubbed_msg
-                        self._store_dirty = True
-                if _is_torn_deactivation(loop):
-                    # INACTIVE, NO stop reason, deadline still LIVE. No stop path
-                    # of this service produces that shape: ``update`` clears the
-                    # deadline and records a reason on every deactivation, the
-                    # timer bounds and the terminal paths record theirs, and the
-                    # repairs above zero the deadline when they retire a record.
-                    # The row was flipped by a write outside the stop paths (a
-                    # store migrated between hosts or edited by hand) and, left
-                    # alone, it is a loop that nobody stopped yet nothing will
-                    # ever arm again — every babysit silently dead after one
-                    # restart, with the re-arm refused on top. Resume it: the
-                    # schedule the user set is still on the row, and so is its
-                    # kill switch (the predicate requires the sentinel path).
-                    logger.warning(
-                        "AutoNudge: loop %s was inactive with no stop reason and a live "
-                        "deadline — resuming it; a paused loop records a reason",
-                        loop.id,
-                    )
-                    loop.active = True
-                    self._store_dirty = True
-            except Exception:
-                logger.warning("AutoNudge: skipping malformed loop entry: %r", raw, exc_info=True)
-                # Without this, a sibling flagging the store dirty makes the rewrite delete
-                # this row permanently -- the warning above is then its only other trace.
-                self._unparsed_rows.append(raw)
-                continue
-            self._loops[loop.id] = loop
-            if repaired != loop.stop_sentinel_path:
-                dropped = bool(loop.stop_sentinel_path) and not repaired
-                loop.stop_sentinel_path = repaired
-                if dropped:
-                    # FAIL CLOSED, matching the arm-time contract:
-                    # authorize_and_add_nudge REFUSES to arm a loop whose
-                    # sentinel is sensitive, so a persisted loop whose sentinel
-                    # has become sensitive must not be re-armed with no kill
-                    # switch at all. Deactivating leaves it inspectable and
-                    # restartable rather than silently unstoppable-by-file.
-                    logger.warning(
-                        "AutoNudge: deactivating loop %s — its stop sentinel was dropped",
-                        loop.id,
-                    )
-                    # Record WHY and clear the schedule, like every other stop:
-                    # a reasonless inactive row with a live deadline is the
-                    # torn-write shape ``_is_torn_deactivation`` resumes on the
-                    # next boot, which would undo this refusal. Only a row THIS
-                    # branch deactivates gets the stamp: a row already paused
-                    # keeps the reason its own stop recorded (a manual pause
-                    # relabelled ``sentinel_dropped`` would become re-armable).
-                    if loop.active:
-                        loop.active = False
-                        loop.stopped_reason = SENTINEL_DROPPED_REASON
-                    loop.next_due_ts = 0.0
-                    if loop.monitor is not None:
-                        loop.monitor.next_probe_at = 0.0
-                self._store_dirty = True
-        logger.info("AutoNudge: loaded %d loops", len(self._loops))
+        future = asyncio.get_running_loop().run_in_executor(
+            None,
+            self._write_state,
+            payload,
+        )
+        if effective is not None:
+            effective.persistence_submitted = True
+        submissions = self._admitted_transaction_submissions.get()
+        if submissions is not None:
+            submissions.count += 1
+        self._inflight_persistence.add(future)
+        future.add_done_callback(self._inflight_persistence.discard)
+        return future
 
     @classmethod
     async def load_for_maintenance(cls, base_dir: Path | None = None) -> "AutoNudgeService":
@@ -1640,29 +789,6 @@ class AutoNudgeService:
         await asyncio.get_running_loop().run_in_executor(None, service._load)
         return service
 
-    @classmethod
-    @asynccontextmanager
-    async def maintenance_service(
-        cls, base_dir: Path | None = None
-    ) -> AsyncIterator["_AutoNudgeMaintenanceView"]:
-        """Yield one authoritative store view, serialized with startup and peers."""
-        selected_dir = base_dir or data_home()
-        async with _maintenance_lock(selected_dir):
-            live = _INSTANCE
-            if live is not None and live._base_dir == selected_dir:
-                view = _AutoNudgeMaintenanceView(live)
-                try:
-                    yield view
-                finally:
-                    view._release()
-                return
-            offline = await cls.load_for_maintenance(base_dir=selected_dir)
-            view = _AutoNudgeMaintenanceView(offline)
-            try:
-                yield view
-            finally:
-                view._release()
-
     def _serialize_state(self) -> dict:
         """Snapshot the store payload ON THE CALLER'S THREAD.
 
@@ -1676,7 +802,7 @@ class AutoNudgeService:
         and this write does not touch, so the entry the operator was warned about is
         still there to repair. It is kept out of ``loops`` because addressing fields are
         served unscrubbed. A row that could not be PARSED is carried here verbatim from
-        ``_unparsed_rows``: it arms nothing, but any cause that flags the store dirty would
+        ``self._store.unparsed_rows``: it arms nothing, but any cause that flags the store dirty would
         otherwise make this write delete a neighbour nobody chose to remove.
 
         A whole-store refusal covers three causes, and ``_write_state`` honours all of
@@ -1693,7 +819,7 @@ class AutoNudgeService:
         ``_QUARANTINE_FILE``) reads this payload back with no held-row concept, so an
         embedded row is an ordinary loop to it and it ARMS the addressing field this
         quarantine refuses. Serving is NOT the reason: a held row is absent from ``_loops``,
-        so no client frame can carry it, exactly as ``_unparsed_rows`` rides this list
+        so no client frame can carry it, exactly as ``self._store.unparsed_rows`` rides this list
         unserved. Revisiting it means accepting that downgrade-arming risk.
         """
         payload: dict[str, Any] = {
@@ -1709,106 +835,18 @@ class AutoNudgeService:
         skip: set[str] | None = None,
         extra: list[NudgeLoop] | None = None,
     ) -> list[Any]:
-        """Build EVERY store payload's ``loops`` list, so no writer can omit a row.
+        """Every store payload's ``loops`` list: the store's rows around the live loops.
 
-        Two classes of row are invisible in ``_loops`` and were dropped by any builder that
-        walked it directly -- which the monitor paths did, replacing the whole store:
-
-        * a row ``_load`` could not PARSE, held verbatim in ``_unparsed_rows``;
-        * a cycle CLAIM persisted before a turn went out and rolled back in memory for the
-          delivery window, which a concurrent write would otherwise erase.
+        Each live loop goes through ``self._serialize_loop``, so a patch on the service
+        shapes every stored row, as it did when this builder lived on the service.
         """
-        rows: list[Any] = []
-        for candidate in list(self._loops.values()) + list(extra or []):
-            if skip and candidate.id in skip:
-                continue
-            row = self._serialize_loop((replace or {}).get(candidate.id, candidate))
-            claimed = self._delivering_claim.get(candidate.id)
-            if claimed is not None:
-                # BESIDE the spent count, never inside it: a restart must be able to tell a
-                # claimed-but-undelivered cycle from a spent one. Disk-only, so no client sees it.
-                row["inflight_cycle"], row["last_fire_ts"] = claimed
-            elif candidate.id in self._unreconciled_claim:
-                # Carried from an earlier run: dropping it here would leave the next restart
-                # with no marker at all, and re-activation would then replay that turn.
-                row["inflight_cycle"] = self._unreconciled_claim[candidate.id]
-            if candidate.id in self._undelivered_claim and "inflight_cycle" in row:
-                # Disk-only, like the claim it qualifies: without it a restart cannot tell a
-                # turn that never went out from one whose delivery is merely unknown.
-                row["inflight_undelivered"] = True
-            rows.append(row)
-        return rows + list(self._unparsed_rows)
-
-    @staticmethod
-    def _serialize_loop(loop: NudgeLoop) -> dict[str, Any]:
-        payload = asdict(loop)
-        # In-memory only: the load path re-mints it unconditionally, so a persisted
-        # value could never be honoured and writing one would dirty a clean store.
-        payload.pop("goal_token", None)
-        if loop.monitor is None:
-            # Preserve the legacy wire shape instead of eagerly migrating every
-            # record the next time an unrelated loop is saved.
-            payload.pop("monitor", None)
-        else:
-            payload["monitor"] = monitor_state_to_dict(loop.monitor)
-        return payload
+        return self._store.serialized_loops(
+            self._loops, self._serialize_loop, replace=replace, skip=skip, extra=extra
+        )
 
     def _write_state(self, payload: dict) -> None:
-        # Atomic write: serialize to a temp file in the same dir, fsync, then
-        # replace onto the target path. Eliminates the truncate-before-
-        # flock race that plain open(path, "w") has — readers always see either
-        # the old complete file or the new complete file, never a partial one.
-        # The rename goes through replace_with_retry because on Windows it can
-        # fail with PermissionError while another handle is transiently open on
-        # the fresh temp file (indexer / AV), which loses the write.
-        # Blocking (fsync) — async callers offload this to an executor.
-        # Every mutation caller wraps its persist in ``except BaseException`` and rolls
-        # back, so reporting success here confirmed a row that vanished on restart.
-        if self._load_refused:
-            raise AutoNudgeStoreUnvetted(
-                "refusing to persist -- the last load could not vet the store, so the "
-                "in-memory list is empty for that reason rather than because the store "
-                "is empty. Fix the store entry or the host's credential policy and "
-                "restart; the file on disk is untouched."
-            )
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            # BEFORE the main store lands: if this raises, the file on disk is still the
-            # old consistent one rather than a new one whose rows have no durable copy.
-            self._write_quarantine_sidecar()
-            replace_with_retry(tmp_path, self._path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
-        # The rename is the COMMIT POINT, so nothing past it may raise: the caller rolls
-        # its loop back on an exception while disk KEEPS the change.
-        try:
-            fsync_dir(self._path.parent)
-        except OSError:
-            # Compaction DELETES rows and its durability rests on this sync, so an
-            # unsynced store keeps the superset exactly as a failed compaction does.
-            logger.warning(
-                "autonudge: could not sync the store directory after a committed write; "
-                "the write STANDS and the quarantine superset is kept uncompacted",
-                exc_info=True,
-            )
-            return
-        # Non-fatal for the same reason. Compaction drops only rows this write observed,
-        # so a failure leaves a superset that the next successful write retries.
-        try:
-            self._compact_quarantine_sidecar()
-        except Exception:
-            logger.warning(
-                "autonudge: could not compact the quarantine sidecar after a committed "
-                "store write; the durable copy is kept and the next write retries",
-                exc_info=True,
-            )
+        """Commit one payload through the store; every service write goes through here."""
+        self._store.write_state(payload)
 
     def _save(self) -> None:
         self._write_state(self._serialize_state())
@@ -1819,18 +857,39 @@ class AutoNudgeService:
         self._observers.append(cb)
 
     def _emit(self, event: str, loop: NudgeLoop | None) -> None:
-        for cb in self._observers:
-            try:
-                cb(event, loop)
-            except Exception:
-                logger.warning("AutoNudge observer failed", exc_info=True)
+        # A detached admitted child carries its owner in ``_admitted_transaction_owner``
+        # for its own timer cancellations only, its submission token in
+        # ``_admitted_transaction_submissions`` for its own writes only, and a monitor
+        # update's post-commit handle for its own credential continuation only. An
+        # observer runs in the emitter's context and a task it creates copies that
+        # context, so all three are cleared for the observers: their follow-up must not
+        # pass for the owner's callback, a write it starts must not count as the
+        # transaction's own, and nothing it starts may reach the update's continuation.
+        owner_token = self._admitted_transaction_owner.set(None)
+        submissions_token = self._admitted_transaction_submissions.set(None)
+        post_commit_token = _monitor_records._MONITOR_UPDATE_POST_COMMIT.set(None)
+        try:
+            for cb in self._observers:
+                try:
+                    cb(event, loop)
+                except Exception:
+                    logger.warning("AutoNudge observer failed", exc_info=True)
+        finally:
+            _monitor_records._MONITOR_UPDATE_POST_COMMIT.reset(post_commit_token)
+            self._admitted_transaction_submissions.reset(submissions_token)
+            self._admitted_transaction_owner.reset(owner_token)
 
     # ── Lifecycle ──
 
     async def start(self) -> None:
         if not enabled():
-            logger.info("AutoNudge disabled (KIROCREW_AUTONUDGE not set)")
+            logger.info("AutoNudge disabled (KIROCREW_AUTONUDGE is 0/false/no)")
             return
+        # A restart after shutdown() opens a NEW generation, so a lease captured
+        # before the previous closure cannot write into this one.
+        if not self._accepting_mutations:
+            self._mutation_generation += 1
+        self._accepting_mutations = True
         # This lock spans load, repair, timer arming and singleton publication.
         # Disabled-mode maintenance that got here first finishes its whole
         # read/modify/write transaction before startup loads; maintenance that
@@ -1849,9 +908,42 @@ class AutoNudgeService:
                     )
             for loop in self._loops.values():
                 if loop.active:
-                    self._arm_from_deadline(loop)
+                    # A work-ledger loop resumes at delay ZERO instead of toward its
+                    # persisted deadline, and only this kind does. The crew-log wake is a
+                    # push off an in-process queue, so every push in flight when this
+                    # process died is gone -- the entry is durable, the notification was
+                    # not. For a pull-request watch that costs nothing (the next poll
+                    # reads the same pull request), but a conductor's whole point in
+                    # setting an hours-long cadence is that the push carries the news, so
+                    # a restart would hide a worker's report for those hours. One tick
+                    # per such loop at boot replays them all, because the probe reads the
+                    # ledger ITSELF: whatever landed while the process was down is in the
+                    # fold, and a tick that finds nothing actionable answers quiet and
+                    # spends no turn. That is also why there is no replay log -- the
+                    # store is the record, and re-reading it is the replay.
+                    if self._observes_work_ledger(loop):
+                        # Marked as a pushed tick for the same reason a worker's push
+                        # is: the gate's post-wake follow-up allowance skips the
+                        # probe, and a replay that took it would spend an unattended
+                        # turn without reading the ledger -- the opposite of why the
+                        # replay exists. A pushed tick always goes through the probe.
+                        # Marked AFTER arming: _arm_timer clears the mark it replaces.
+                        self._arm_timer(loop, delay=0.0)
+                        self._pushed_ticks.add(loop.id)
+                    else:
+                        self._arm_from_deadline(loop)
             global _INSTANCE
             _INSTANCE = self
+        # The crew-log bus subscriptions that pull a work-ledger loop forward when its
+        # board's ``work`` fold advances: one keyed subscription per watched board,
+        # following this service's loop table. Installed HERE because this service owns
+        # the loops it fires -- the bus's rule is that a consumer subscribes where its
+        # state exists. Function-local import to keep ``conductor_wake`` off this
+        # module's import graph: it imports ``autonudge`` back (for ``get_instance``),
+        # and a module-level import here would close that cycle.
+        from kiro_crew import conductor_wake
+
+        conductor_wake.install(self)
         # The reconciler is the timer-driven backstop for a loop stranded
         # active-but-unarmed (see _reconcile_forever). Spawned outside the
         # maintenance lock: it takes no locks of its own and its first pass is
@@ -1869,7 +961,7 @@ class AutoNudgeService:
             self._reconciler = asyncio.create_task(self._reconcile_forever())
         logger.info("AutoNudge started")
 
-    def stop(self) -> None:
+    def stop(self, *, preserve_admitted: bool = False) -> None:
         # Retire the reconciler first so a pass cannot re-arm a timer this
         # method is about to cancel. Same closed-loop guard as _cancel_timer:
         # stop() runs from synchronous shutdown paths where the task's loop
@@ -1881,615 +973,136 @@ class AutoNudgeService:
         # Through _cancel_timer, not a bare t.cancel() loop: shutdown is the likeliest
         # moment for a timer's loop to be closing already, and one cancellation policy
         # means this path inherits both of its guards instead of restating neither.
-        # It pops as it goes, so iterate over a snapshot of the keys.
+        # A timer identified by a drain-owner completion is inside bookkeeping
+        # or a detached admitted transaction. Async shutdown detaches and drains
+        # that boundary; synchronous stop keeps its historical cancel-all behavior.
+        drained_callback_owners = _timers._drain_registered_owners(self)
         for loop_id in list(self._timers):
+            timer = self._timers.get(loop_id)
+            if preserve_admitted and timer in drained_callback_owners:
+                self._timers.pop(loop_id, None)
+                continue
             self._cancel_timer(loop_id)
         self._timers.clear()
+        if preserve_admitted:
+            return
         self._reconcile_candidates.clear()
+        self._terminal_reprobe_unknowns.clear()
         self._accepted_monitor_turns.clear()
+        self._accepted_monitor_completion_authorities.clear()
         self._maintenance_quiescing.clear()
         self._maintenance_quiesce_events.clear()
+        self._unpublish()
+
+    def _unpublish(self) -> None:
+        """Withdraw the singleton, so no late caller reaches this service."""
         global _INSTANCE
         if _INSTANCE is self:
             _INSTANCE = None
+            # The crew-log subscriptions and the boards they filled are bounded by this
+            # service's loop table; with the table gone they have nothing to fire, so
+            # they are disposed with it. A later start() joins them again.
+            from kiro_crew import conductor_wake
 
-    # ── Loop CRUD ──
+            conductor_wake.dispose_all()
 
-    def _begin_maintenance_quiesce(self, loop_id: str) -> None:
-        self._maintenance_quiescing.add(loop_id)
-        self._maintenance_quiesce_events.setdefault(loop_id, asyncio.Event()).set()
+    async def shutdown(self) -> None:
+        """Close admission, cancel every timer outside drained bookkeeping, drain the rest.
 
-    def _end_maintenance_quiesce(self, loop_id: str) -> None:
-        self._maintenance_quiescing.discard(loop_id)
-        self._maintenance_quiesce_events.pop(loop_id, None)
+        A running callback is cancelled exactly like a dormant timer, so a gateway stop
+        never waits on a delivery, a probe or a judge call. The exception is a callback
+        owning a registered bookkeeping section or detached admitted transaction: that
+        boundary is drained with the other owners instead, without extending the drain
+        through the callback's remaining lifetime. A terminal settlement's provider
+        re-probe runs outside every registered section, so it is cancelled with its
+        callback: the delivered marker persisted before it stays owed, and the next
+        start settles it without another turn.
+        """
+        self._accepting_mutations = False
+        current = _current_task_or_none()
+        armed = {task for task in self._timers.values() if isinstance(task, asyncio.Task)}
+        all_controls = {
+            task
+            for task in (self._reconciler, *armed, *self._running_callbacks)
+            if isinstance(task, asyncio.Task)
+            and task is not current
+            and not task.done()
+            and not task.get_loop().is_closed()
+        }
+        # A callback whose own loop was removed mid-callback has left the timer table,
+        # so ``stop()`` cannot reach it; it is cancelled here on the same terms. A
+        # registered callback is represented by its drain-owner completion future
+        # instead of by the task's whole remaining lifetime.
+        drained_callback_owners = _timers._drain_registered_owners(self)
+        controls = all_controls - drained_callback_owners
+        unarmed_callbacks = {task for task in controls - armed if task in self._running_callbacks}
+        self.stop(preserve_admitted=True)
+        for task in unarmed_callbacks:
+            task.cancel()
+        drain = _DurabilityDrain()
+        settled = await drain.settle(*controls)
 
-    async def _acquire_mutation_lock(self, loop_id: str) -> asyncio.Lock | None:
-        """Acquire the store mutex unless cleanup claims this loop first."""
-        if loop_id in self._maintenance_quiescing:
-            return None
-        lock = _maintenance_lock(self._base_dir)
-        event = self._maintenance_quiesce_events.setdefault(loop_id, asyncio.Event())
-        acquire_task = asyncio.create_task(lock.acquire())
-        quiesce_task = asyncio.create_task(event.wait())
-        try:
-            done, _pending = await asyncio.wait(
-                {acquire_task, quiesce_task}, return_when=asyncio.FIRST_COMPLETED
+        # Public mutations and timer callbacks share the same drain registry.
+        # Re-snapshot until no task/future remains: an admitted section may start
+        # its raw executor write after shutdown takes the first snapshot. The
+        # loop ends early only when the drain's post-cancellation window has
+        # closed -- re-snapshotting the same wedged write would otherwise grant
+        # it a fresh window on every pass.
+        pending: set[asyncio.Future[Any]] = set()
+        while settled:
+            mutations = {
+                task for task in self._inflight_adds if task is not current and not task.done()
+            }
+            writes = {future for future in self._inflight_persistence if not future.done()}
+            pending = {*mutations, *writes}
+            if not pending:
+                break
+            settled = await drain.settle(*pending)
+
+        if not settled:
+            # Not a lost write: the executor thread keeps running and the store
+            # write is atomic, so the file holds the new state or the previous
+            # complete one. What is lost is the wait, which the supervisor's kill
+            # would have ended less gracefully.
+            logger.warning(
+                "AutoNudge shutdown stopped waiting on %d owned task(s)/write(s) still "
+                "pending %.1fs after cancellation; each store write is atomic",
+                sum(1 for future in {*controls, *pending} if not future.done()),
+                _DRAIN_CANCEL_GRACE_SECS,
             )
-        except BaseException:
-            await _cancel_and_drain_tasks(acquire_task, quiesce_task)
-            if acquire_task.done() and not acquire_task.cancelled():
-                lock.release()
-            raise
-        if acquire_task in done:
-            interrupted = await _cancel_and_drain_tasks(quiesce_task)
-            if interrupted:
-                lock.release()
-                raise asyncio.CancelledError()
-            if loop_id not in self._maintenance_quiescing:
-                return lock
-            lock.release()
-            return None
-        interrupted = await _cancel_and_drain_tasks(acquire_task)
-        if acquire_task.done() and not acquire_task.cancelled():
-            lock.release()
-        if interrupted:
+
+        # Filter only settled entries in place. Pending admitted tasks must stay
+        # registered for their done callbacks and any work still reading this set.
+        self._inflight_adds.difference_update({task for task in self._inflight_adds if task.done()})
+        self._inflight_persistence.difference_update(
+            {future for future in self._inflight_persistence if future.done()}
+        )
+        if settled:
+            # Callback bookkeeping may release the runtime claim sets only after
+            # every admitted owner and write has settled. Finalize here, before
+            # callers close the stores and sessions those callbacks use, but keep
+            # the closed service published until the gateway has closed its
+            # dashboard. Slot retirement in that window must reach this service
+            # and fail loudly, not mistake an absent singleton for no loop.
+            # Accepted-turn authorities stay: each ends with its owner task, which
+            # a stop does not wait on, so a completion that turn emits while the
+            # gateway closes sessions still persists under its captured lease.
+            self._reconcile_candidates.clear()
+            self._accepted_monitor_turns.clear()
+            self._maintenance_quiescing.clear()
+            self._maintenance_quiesce_events.clear()
+        # Work the drain stopped waiting on may still read the claim sets, so an
+        # unsettled drain leaves those sets intact. Both outcomes keep the
+        # singleton and its crew-log subscriptions published; gateway teardown
+        # withdraws them only after the dashboard runner has stopped serving.
+        if drain.interrupted:
             raise asyncio.CancelledError()
-        return None
 
-    async def add(
-        self,
-        slot_key: str,
-        message: str,
-        idle_secs: int = 60,
-        max_cycles: int = 0,
-        stop_sentinel_path: str = "",
-        max_runtime_secs: int = 0,
-        banner: str = "",
-        admission_check: Callable[[], bool] | None = None,
-        # UNGATED by default, and the default lives at the ARMING SURFACES instead.
-        # The evidence for gating is about monitor_start -- a babysit loop whose work
-        # IS the pull request. This service also arms loops whose work is not: a goal
-        # loop, an app's own timer. Defaulting to gated here inferred a monitor from
-        # any message that merely MENTIONED one PR, which throttles such a loop and,
-        # if that PR is already merged, deactivates it before its first turn.
-        gate: bool = False,
-        replace_existing: bool = True,
-        replace_stopped: bool = False,
-        self_armed: bool = False,
-        loop_id: str | None = None,
-        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
-    ) -> NudgeLoop:
-        # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
-        # the awaiting caller is cancelled mid-write, a bare await would release
-        # ``_lock`` while the executor write is still running — a subsequent
-        # add/update could persist newer state first and then be clobbered by
-        # this operation's stale snapshot (lost update after restart). Shielding
-        # keeps the inner task (and the lock) alive until the write completes,
-        # so writes remain strictly serialized; the cancelled caller still sees
-        # CancelledError, with the arm possibly landed (same "mutation may have
-        # already landed" semantics as other cancellation-uncertain mutations).
-        # The inner task is retained in ``_inflight_adds`` (discarded when done)
-        # so it stays SUPERVISED — strongly referenced and completion-logged —
-        # even if every awaiting caller has been cancelled.
-        inner: "asyncio.Task[NudgeLoop]" = asyncio.ensure_future(
-            self._add_locked(
-                slot_key,
-                message,
-                idle_secs=idle_secs,
-                max_cycles=max_cycles,
-                stop_sentinel_path=stop_sentinel_path,
-                max_runtime_secs=max_runtime_secs,
-                banner=banner,
-                admission_check=admission_check,
-                gate=gate,
-                replace_existing=replace_existing,
-                replace_stopped=replace_stopped,
-                self_armed=self_armed,
-                loop_id=loop_id,
-                creation_surface=creation_surface,
-            )
-        )
-        self._inflight_adds.add(inner)
-
-        def _finish(t: "asyncio.Task[NudgeLoop]") -> None:
-            self._inflight_adds.discard(t)
-            if not t.cancelled() and t.exception() is not None:
-                logger.warning("AutoNudge: detached add() failed", exc_info=t.exception())
-
-        inner.add_done_callback(_finish)
-        return await asyncio.shield(inner)
-
-    async def add_monitor(
+    async def _persist_locked(
         self,
         *,
-        slot_key: str,
-        kind: str,
-        target: str,
-        objective: str,
-        cadence_secs: int,
-        budgets: MonitorBudgets,
-        wake_instructions: str = "",
-        now: float | None = None,
-        replace_existing: bool = True,
-        replace_stopped: bool = False,
-        expected_existing_monitor_id: str | None = None,
-        expected_existing_config_generation: int | None = None,
-        admission_check: Callable[[], bool] | None = None,
-        self_armed: bool = False,
-        loop_id: str | None = None,
-        defer_replaced_trust_revocation: bool = False,
-        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
-    ) -> NudgeLoop:
-        """Create one durable structured record without legacy prompt routing."""
-        inner: "asyncio.Task[NudgeLoop]" = asyncio.ensure_future(
-            self._add_monitor_locked(
-                slot_key=slot_key,
-                kind=kind,
-                target=target,
-                objective=objective,
-                cadence_secs=cadence_secs,
-                budgets=budgets,
-                wake_instructions=wake_instructions,
-                now=now,
-                replace_existing=replace_existing,
-                replace_stopped=replace_stopped,
-                expected_existing_monitor_id=expected_existing_monitor_id,
-                expected_existing_config_generation=expected_existing_config_generation,
-                admission_check=admission_check,
-                self_armed=self_armed,
-                loop_id=loop_id,
-                defer_replaced_trust_revocation=defer_replaced_trust_revocation,
-                creation_surface=creation_surface,
-            )
-        )
-        self._inflight_adds.add(inner)
-
-        def _finish(t: "asyncio.Task[NudgeLoop]") -> None:
-            self._inflight_adds.discard(t)
-            if not t.cancelled() and t.exception() is not None:
-                logger.warning("detached structured monitor add failed", exc_info=t.exception())
-
-        inner.add_done_callback(_finish)
-        return await asyncio.shield(inner)
-
-    async def _add_monitor_locked(
-        self,
-        *,
-        slot_key: str,
-        kind: str,
-        target: str,
-        objective: str,
-        cadence_secs: int,
-        budgets: MonitorBudgets,
-        wake_instructions: str,
-        now: float | None,
-        replace_existing: bool,
-        replace_stopped: bool = False,
-        expected_existing_monitor_id: str | None,
-        expected_existing_config_generation: int | None,
-        admission_check: Callable[[], bool] | None,
-        self_armed: bool = False,
-        loop_id: str | None = None,
-        defer_replaced_trust_revocation: bool = False,
-        creation_surface: MonitorCreationSurface,
-    ) -> NudgeLoop:
-        created = time.time() if now is None else now
-        cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
-        async with _maintenance_lock(self._base_dir):
-            async with self._lock:
-                if admission_check is not None and not admission_check():
-                    raise NudgeAdmissionRefused("session changed before monitor arm committed")
-                existing = self._find_by_slot(slot_key)
-                if expected_existing_monitor_id is not None:
-                    existing_monitor = existing.monitor if existing is not None else None
-                    if (
-                        existing is None
-                        or existing.id != expected_existing_monitor_id
-                        or existing_monitor is None
-                        or existing_monitor.config_generation != expected_existing_config_generation
-                    ):
-                        raise MonitorUpdateConflict("monitor changed before restart")
-                if existing:
-                    # Same split as the legacy add: create-only refuses ANY
-                    # record unless the caller opted into ``replace_stopped``,
-                    # which under the owner's ruling displaces only
-                    # SYSTEM-imposed stops (a spent bound, a finished subject).
-                    # A consumer-recorded stop — including a USER_STOP record
-                    # retained by monitor_stop — is preserved; the dashboard
-                    # restart route (conditional replace) is the sanctioned way
-                    # to succeed one. Dashboard creates never opt in, so their
-                    # any-record 409 keeps retained evidence intact. The
-                    # wake-in-flight guard below still covers a terminal record
-                    # that owns an accepted, uncompleted wake.
-                    if not replace_existing and (existing.active or not replace_stopped):
-                        raise MonitorUpdateConflict("session already has an automation")
-                    existing_monitor = existing.monitor
-                    if (
-                        not replace_existing
-                        and existing_monitor is not None
-                        and existing_monitor.version != MONITOR_STATE_VERSION
-                    ):
-                        # Same rule as the legacy add: a future-version record
-                        # is a newer gateway's state, retained inactive across a
-                        # downgrade on purpose — never deletable by this one.
-                        raise MonitorUpdateConflict(
-                            "the session's stopped automation was written by a newer "
-                            "gateway and cannot be replaced by this one"
-                        )
-                    if (
-                        not replace_existing
-                        and replace_stopped
-                        and not _stopped_row_is_replaceable(existing)
-                    ):
-                        # Same owner ruling as the legacy add: consumer-recorded
-                        # stops (USER_STOP, SESSION_CLOSE, tombstones) are
-                        # evidence, never displaced by a re-arm.
-                        raise MonitorUpdateConflict(
-                            "the session's stopped automation is retained as evidence "
-                            "and is not replaceable by a re-arm; its owner must clear "
-                            "it first from the dashboard's goal popover"
-                        )
-                    if existing_monitor is not None and existing_monitor.wake_in_flight:
-                        raise MonitorUpdateConflict(
-                            "existing monitor cannot be replaced while a wake is in flight"
-                        )
-                due = created + cadence
-                # Refused HERE rather than discovered later. This is the one place a
-                # caller-supplied kind reaches persistence, and a monitor stored under
-                # a kind nothing registered would be probed by whatever provider the
-                # controller happens to hold.
-                if not kind_supports_objective(kind, objective):
-                    raise ValueError(f"no monitored kind {kind!r} supports objective {objective!r}")
-                monitor = MonitorState(
-                    kind=kind,
-                    target=target,
-                    objective=objective,
-                    created_ts=created,
-                    creation_surface=creation_surface,
-                    budgets=budgets,
-                    cadence_secs=cadence,
-                    wake_instructions=wake_instructions,
-                    next_probe_at=due,
-                )
-                loop = NudgeLoop(
-                    id=self._mint_loop_id(loop_id),
-                    slot_key=slot_key,
-                    message="",
-                    idle_secs=cadence,
-                    created_ts=created,
-                    next_due_ts=due,
-                    goal_token=new_goal_token(),
-                    monitor=monitor,
-                    self_armed=self_armed,
-                )
-                deferred_prior = (
-                    deepcopy(existing)
-                    if existing is not None and defer_replaced_trust_revocation
-                    else None
-                )
-                restore_prior_provider_credentials = False
-                if existing is not None and defer_replaced_trust_revocation:
-                    restore_prior_provider_credentials = (
-                        await self._provider_credentials_authorized(existing)
-                    )
-                    await self._revoke_provider_credentials_before_removal(existing.id)
-                replacement_payload = {
-                    "version": _STORE_VERSION,
-                    "loops": self._serialized_loops(
-                        skip={existing.id} if existing is not None else None,
-                        extra=[loop],
-                    ),
-                }
-                try:
-                    await self._write_monitor_snapshot_locked(replacement_payload)
-                except BaseException:
-                    if restore_prior_provider_credentials:
-                        assert existing is not None
-                        await self._restore_provider_credentials(existing)
-                    raise
-                if existing is not None:
-                    self.remove_sync(existing.id, persist=False)
-                    if defer_replaced_trust_revocation:
-                        self._deferred_monitor_replacements[loop.id] = (
-                            deferred_prior,
-                            deepcopy(loop),
-                            restore_prior_provider_credentials,
-                        )
-                    else:
-                        # The snapshot above already committed the replacement.
-                        self._revoke_self_arm_for(existing)
-                elif defer_replaced_trust_revocation:
-                    self._deferred_monitor_replacements[loop.id] = (
-                        None,
-                        deepcopy(loop),
-                        False,
-                    )
-                self._loops[loop.id] = loop
-                if self._on_monitor_tick is not None:
-                    self._arm_from_deadline(loop)
-        self._emit("added", loop)
-        return loop
-
-    def commit_monitor_replacement(self, loop_id: str) -> None:
-        """Release prior trust after a replacement's authorization commits."""
-        if loop_id not in self._deferred_monitor_replacements:
-            raise MonitorUpdateConflict("monitor replacement is no longer pending")
-        prior, _replacement, _restore_prior_provider_credentials = (
-            self._deferred_monitor_replacements.pop(loop_id)
-        )
-        if prior is not None:
-            self._revoke_self_arm_for(prior)
-
-    async def rollback_monitor_replacement(self, loop_id: str) -> bool:
-        """Restore the pre-replacement row after authorization cannot commit.
-
-        The failed row is removed and the prior row is written in one snapshot.
-        ``False`` means another mutation already consumed the pending replacement,
-        so the rollback deliberately leaves that newer state untouched.
-        """
-        removed: NudgeLoop | None = None
-        prior: NudgeLoop | None = None
-        async with _maintenance_lock(self._base_dir):
-            async with self._lock:
-                if loop_id not in self._deferred_monitor_replacements:
-                    return False
-                prior, replacement, restore_prior_provider_credentials = (
-                    self._deferred_monitor_replacements.pop(loop_id)
-                )
-                current = self._loops.get(loop_id)
-                if current is None or self._serialize_loop(current) != self._serialize_loop(
-                    replacement
-                ):
-                    if prior is not None:
-                        self._revoke_self_arm_for(prior)
-                    return False
-                payload = {
-                    "version": _STORE_VERSION,
-                    "loops": self._serialized_loops(
-                        skip={loop_id},
-                        extra=[prior] if prior is not None else None,
-                    ),
-                }
-                try:
-                    await self._write_monitor_snapshot_locked(payload)
-                except BaseException:
-                    self._deferred_monitor_replacements[loop_id] = (
-                        prior,
-                        replacement,
-                        restore_prior_provider_credentials,
-                    )
-                    raise
-                removed = self.remove_sync(loop_id, persist=False, emit=False)
-                if prior is not None:
-                    self._loops[prior.id] = prior
-                    if restore_prior_provider_credentials:
-                        await self._restore_provider_credentials(prior)
-                    if prior.active and self._on_monitor_tick is not None:
-                        self._arm_from_deadline(prior)
-        if removed is not None:
-            self._emit("removed", removed)
-        if prior is not None:
-            self._emit("added", prior)
-        return True
-
-    def _mint_loop_id(self, requested: str | None) -> str:
-        """The new loop's id: the caller's pre-minted one, else a fresh one.
-
-        A caller pre-mints an id when something must be recorded ABOUT the loop
-        before it exists -- the authorizer writes the keystone-gated self-arm
-        entry first, so a failed trust write denies before this store is
-        touched and a loop this arm would displace is never removed for
-        nothing. Called under ``_lock``, so the in-use check is not racy; an id
-        already in use is a caller bug (or a collision on 8 hex chars, which is
-        not worth silently re-minting over -- the caller's record would name
-        the wrong loop) and is refused as a conflict.
-        """
-        if requested is None:
-            return uuid.uuid4().hex[:8]
-        if requested in self._loops:
-            raise MonitorUpdateConflict(f"loop id {requested!r} is already in use")
-        return requested
-
-    async def _add_locked(
-        self,
-        slot_key: str,
-        message: str,
-        *,
-        idle_secs: int,
-        max_cycles: int,
-        stop_sentinel_path: str,
-        max_runtime_secs: int = 0,
-        banner: str = "",
-        admission_check: Callable[[], bool] | None = None,
-        gate: bool = False,
-        replace_existing: bool = True,
-        replace_stopped: bool = False,
-        self_armed: bool = False,
-        loop_id: str | None = None,
-        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
-    ) -> NudgeLoop:
-        async with _maintenance_lock(self._base_dir):
-            return await self._add_unserialized(
-                slot_key,
-                message,
-                idle_secs=idle_secs,
-                max_cycles=max_cycles,
-                stop_sentinel_path=stop_sentinel_path,
-                max_runtime_secs=max_runtime_secs,
-                banner=banner,
-                admission_check=admission_check,
-                gate=gate,
-                replace_existing=replace_existing,
-                replace_stopped=replace_stopped,
-                self_armed=self_armed,
-                loop_id=loop_id,
-                creation_surface=creation_surface,
-            )
-
-    async def _add_unserialized(
-        self,
-        slot_key: str,
-        message: str,
-        *,
-        idle_secs: int,
-        max_cycles: int,
-        stop_sentinel_path: str,
-        max_runtime_secs: int = 0,
-        banner: str = "",
-        admission_check: Callable[[], bool] | None = None,
-        gate: bool = False,
-        replace_existing: bool = True,
-        replace_stopped: bool = False,
-        self_armed: bool = False,
-        loop_id: str | None = None,
-        creation_surface: MonitorCreationSurface = MonitorCreationSurface.DASHBOARD,
-    ) -> NudgeLoop:
-        idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
-        async with self._lock:
-            if admission_check is not None and not admission_check():
-                raise NudgeAdmissionRefused("session changed before nudge arm committed")
-            # One loop per slot — replace any existing loop on this slot.
-            # persist=False: the offloaded write below persists the combined
-            # removal+add atomically, avoiding a duplicate blocking save here.
-            existing = self._find_by_slot(slot_key)
-            restore_existing_provider_credentials = False
-            if existing:
-                # Create-only (``replace_existing=False``) refuses ANY existing
-                # record by default — the dashboard REST creates depend on that:
-                # their documented contract is a 409 that never discards a
-                # retained inspection record. ``replace_stopped`` is the
-                # directive re-arm path's explicit opt-in to narrow the refusal
-                # to ACTIVE records, because a retained INACTIVE row
-                # (approval-stalled, capped, budget-spent, or a terminal record
-                # kept for inspection) otherwise deadlocks the session's only
-                # re-arm: monitor_update's approval-stall refusal names
-                # monitor_start as the remedy. The wake-in-flight guard below
-                # still runs for the replaced-inactive case, so a terminal
-                # record whose accepted wake is awaiting completion evidence
-                # keeps its own refusal rather than having its correlation
-                # orphaned by a replacement.
-                if not replace_existing and (existing.active or not replace_stopped):
-                    raise MonitorUpdateConflict("session already has an automation")
-                existing_monitor = existing.monitor
-                if (
-                    not replace_existing
-                    and existing_monitor is not None
-                    and existing_monitor.version != MONITOR_STATE_VERSION
-                ):
-                    # A future-version record belongs to the newer gateway that
-                    # wrote it: _load() retains it inactive so an upgrade can
-                    # resume the watch, and the retarget path refuses to touch
-                    # it for the same reason. A stopped-replacement here would
-                    # destroy state this gateway cannot even read. Checked
-                    # BEFORE the evidence allowlist so the version message —
-                    # the actionable one — wins for such records.
-                    raise MonitorUpdateConflict(
-                        "the session's stopped automation was written by a newer "
-                        "gateway and cannot be replaced by this one"
-                    )
-                if (
-                    not replace_existing
-                    and replace_stopped
-                    and not _stopped_row_is_replaceable(existing)
-                ):
-                    # Owner ruling (option A): only system-imposed stops are
-                    # re-armable. A stop recorded FOR a consumer — a research
-                    # tombstone, a manual pause, a user stop, session-close
-                    # retention — is evidence, and an unknown reason is
-                    # treated as evidence too.
-                    raise MonitorUpdateConflict(
-                        "the session's stopped automation is retained as evidence "
-                        f"(stop reason: {existing.stopped_reason or 'none recorded'!s}) "
-                        "and is not replaceable by a re-arm; its owner must clear it "
-                        "first from the dashboard's goal popover"
-                    )
-                if existing_monitor is not None and existing_monitor.wake_in_flight:
-                    raise MonitorUpdateConflict(
-                        "existing monitor cannot be replaced while a wake is in flight"
-                    )
-                restore_existing_provider_credentials = await self._provider_credentials_authorized(
-                    existing
-                )
-                await self._revoke_provider_credentials_before_removal(existing.id)
-                self.remove_sync(existing.id, persist=False, emit=False)
-            now = time.time()
-            loop = NudgeLoop(
-                id=self._mint_loop_id(loop_id),
-                slot_key=slot_key,
-                message=message,
-                idle_secs=idle_secs,
-                max_cycles=max(0, int(max_cycles)),
-                created_ts=now,
-                goal_token=new_goal_token(),
-                stop_sentinel_path=stop_sentinel_path,
-                max_runtime_secs=max(0, int(max_runtime_secs)),
-                # Anchor the first deadline at arm time (set BEFORE the
-                # snapshot below so it persists): the countdown starts the
-                # moment the loop is armed, and user turns from here on only
-                # defer delivery, never restart it.
-                next_due_ts=now + idle_secs,
-                # The SUBJECT is decided HERE, from the instruction the caller
-                # already wrote -- no target, kind or enable flag is ever passed.
-                # WHETHER to look for one is the ``gate`` argument above, which the
-                # arming surfaces set and this service defaults to False; saying
-                # "rather than from a parameter" was true before that default moved
-                # and is not any more. What has never been a parameter, and is the
-                # point, is the subject: every earlier attempt at this saving
-                # shipped as an opt-in and measured zero adoption -- the switch
-                # existed, the agent arming the loop was mid-task, and nothing made
-                # it worth its five steps. There is no SUBJECT parameter to forget
-                # here: whatever the caller already wrote is where the target comes
-                # from, on every surface. Gating itself is no longer inherited by
-                # construction, though -- that claim was true before the default
-                # moved and is not now. Each arming surface chooses: monitor_start's
-                # directive gates by default, the generic REST route does not.
-                #
-                # ``gate=False`` is the one escape, and it is an opt-OUT of a
-                # default that lives at the ARMING SURFACE: monitor_start's own
-                # directive gates unless told otherwise, while this service and the
-                # generic REST route default to ungated -- they also arm loops whose
-                # work is not a pull request. So it cannot repeat the zero-adoption
-                # failure on the babysit path, which is the path the evidence is
-                # about. The escape exists because a loop whose duty is to act WHILE
-                # its subject is quiet is invisible to an observation of that
-                # subject; keying that only on the wording of the instruction made a
-                # cadence contract depend on prose.
-                monitor=(
-                    infer_monitor(message, now, creation_surface=creation_surface) if gate else None
-                ),
-                gate=gate,
-                banner=banner,
-                self_armed=self_armed,
-            )
-            self._loops[loop.id] = loop
-            # Persist WITHOUT blocking the event loop (no-blocking-call rule:
-            # _write_state fsyncs, and a wedged disk must not freeze the
-            # gateway). Snapshot under the lock (mutation safety), write on a
-            # worker thread, and await it so a persistence failure still
-            # propagates to the caller before the loop is reported armed.
-            payload = self._serialize_state()
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
-            except BaseException:
-                self._loops.pop(loop.id, None)
-                if existing is not None:
-                    self._loops[existing.id] = existing
-                    if restore_existing_provider_credentials:
-                        await self._restore_provider_credentials(existing)
-                    if existing.active:
-                        self._arm_from_deadline(existing)
-                raise
-            self._arm_from_deadline(loop)
-            if existing is not None:
-                # Committed: the displaced row is gone from the store, so its
-                # self-arm entry is revoked now, not before the write.
-                self._revoke_self_arm_for(existing)
-                self._emit("removed", existing)
-        self._emit("added", loop)
-        logger.info("AutoNudge: added loop %s on slot %s (idle=%ds)", loop.id, slot_key, idle_secs)
-        return loop
-
-    async def _persist_locked(self) -> None:
+        admission: _MutationAdmission | None = None,
+    ) -> None:
         """Snapshot under the service lock and write on a worker thread.
 
         The SINGLE async persistence path for post-arm mutations. Two properties
@@ -2506,749 +1119,7 @@ class AutoNudgeService:
         """
         async with self._lock:
             payload = self._serialize_state()
-            await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
-
-    async def update(
-        self,
-        loop_id: str,
-        *,
-        message: str | None = None,
-        idle_secs: int | None = None,
-        max_cycles: int | None = None,
-        active: bool | None = None,
-        max_runtime_secs: int | None = None,
-        stopped_reason: str | None = None,
-        banner: str | None = None,
-        expected_generation: int | None = None,
-        expect_fingerprint: str | None = None,
-    ) -> NudgeLoop | None:
-        # CANCELLATION SAFETY: same contract as add(). The mutate+persist runs
-        # as a SHIELDED, supervised task so a caller cancelled mid-write cannot
-        # release ``_lock`` while the executor write is still in flight — which
-        # would let a later write land first and then be clobbered by this
-        # operation's stale snapshot (lost update after restart).
-        inner: "asyncio.Task[NudgeLoop | None]" = asyncio.ensure_future(
-            self._update_locked(
-                loop_id,
-                message=message,
-                idle_secs=idle_secs,
-                max_cycles=max_cycles,
-                active=active,
-                max_runtime_secs=max_runtime_secs,
-                stopped_reason=stopped_reason,
-                banner=banner,
-                expected_generation=expected_generation,
-                expect_fingerprint=expect_fingerprint,
-            )
-        )
-        self._inflight_adds.add(inner)
-
-        def _finish(t: "asyncio.Task[NudgeLoop | None]") -> None:
-            self._inflight_adds.discard(t)
-            if t.cancelled():
-                return
-            exc = t.exception()
-            # A stale baseline is the 409 this update's caller already surfaces, so it is
-            # an answer rather than a fault; every other exception keeps its warning.
-            if exc is None or isinstance(exc, AutoNudgeStaleBaseline):
-                return
-            logger.warning("AutoNudge: detached update() failed", exc_info=exc)
-
-        inner.add_done_callback(_finish)
-        return await asyncio.shield(inner)
-
-    async def deactivate_and_wait(self, loop_id: str) -> bool:
-        """Persistently pause a loop and wait for its current timer to quiesce.
-
-        ``update(active=False)`` deliberately does not cancel a timer already
-        inside its fire callback because channel turns run inline there.  A
-        cleanup caller has a different need: it must know that a dashboard fire
-        can no longer materialize a slot after the caller takes its snapshot.
-        The loop remains durably present and inactive until the caller removes
-        it, so a timeout or process exit leaves a restart-visible recovery
-        marker instead of losing the orphan's only identity.
-        """
-        timer_before = self._timers.get(loop_id)
-        loop = await self.update(loop_id, active=False)
-        if loop is None:
-            return False
-        # A turn-complete notification can replace the timer while update()
-        # waits to acquire and persist the inactive state. Once update returns,
-        # active=False prevents any further replacement, so both tasks close
-        # the final slot-publication window.
-        timer_after = self._timers.get(loop_id)
-        current = asyncio.current_task()
-        for timer in {timer_before, timer_after}:
-            if timer is not None and timer is not current and not timer.done():
-                await asyncio.shield(timer)
-        return True
-
-    async def _deactivate_and_wait_unserialized(self, loop_id: str) -> bool:
-        """Quiesce a loop while the caller owns the maintenance transaction."""
-        self._begin_maintenance_quiesce(loop_id)
-        timer_before = self._timers.get(loop_id)
-        inner = asyncio.create_task(self._update_unserialized(loop_id, active=False))
-        try:
-            loop = await asyncio.shield(inner)
-        except asyncio.CancelledError:
-            # maintenance_service() must not release its transaction while the
-            # executor-backed write can still commit a stale snapshot.
-            while not inner.done():
-                try:
-                    await asyncio.shield(inner)
-                except asyncio.CancelledError:
-                    continue
-            inner.result()
-            raise
-        if loop is None:
-            return False
-        timer_after = self._timers.get(loop_id)
-        current = asyncio.current_task()
-        for timer in {timer_before, timer_after}:
-            if timer is not None and timer is not current and not timer.done():
-                await asyncio.shield(timer)
-        return True
-
-    async def _update_locked(
-        self,
-        loop_id: str,
-        *,
-        message: str | None = None,
-        idle_secs: int | None = None,
-        max_cycles: int | None = None,
-        active: bool | None = None,
-        max_runtime_secs: int | None = None,
-        stopped_reason: str | None = None,
-        banner: str | None = None,
-        expected_generation: int | None = None,
-        expect_fingerprint: str | None = None,
-    ) -> NudgeLoop | None:
-        lock = await self._acquire_mutation_lock(loop_id)
-        if lock is None:
-            return None
-        try:
-            return await self._update_unserialized(
-                loop_id,
-                message=message,
-                idle_secs=idle_secs,
-                max_cycles=max_cycles,
-                active=active,
-                max_runtime_secs=max_runtime_secs,
-                stopped_reason=stopped_reason,
-                banner=banner,
-                expected_generation=expected_generation,
-                expect_fingerprint=expect_fingerprint,
-            )
-        finally:
-            lock.release()
-
-    async def _update_unserialized(
-        self,
-        loop_id: str,
-        *,
-        message: str | None = None,
-        idle_secs: int | None = None,
-        max_cycles: int | None = None,
-        active: bool | None = None,
-        max_runtime_secs: int | None = None,
-        stopped_reason: str | None = None,
-        banner: str | None = None,
-        expected_generation: int | None = None,
-        expect_fingerprint: str | None = None,
-    ) -> NudgeLoop | None:
-        async with self._lock:
-            loop = self._loops.get(loop_id)
-            if not loop:
-                return None
-            # ATOMIC generation fence (inside _lock, before any mutation): a
-            # caller applying a structural-terminal stop passes the generation it
-            # captured at fire time. If the loop's config generation has moved
-            # since (a changed instruction, or a revival), the completion is
-            # STALE -- it belongs to an older configuration -- so refuse the stop
-            # without touching the loop. Checked here, not by an external
-            # read-then-update, so there is no TOCTOU window between the compare
-            # and the write.
-            if expected_generation is not None and loop.config_generation != expected_generation:
-                logger.info(
-                    "AutoNudge: loop %s structural stop refused — captured gen %s "
-                    "!= current gen %s (config changed under the fired turn)",
-                    loop.id,
-                    expected_generation,
-                    loop.config_generation,
-                )
-                return loop
-            if is_structured_monitor_loop(loop):
-                # Generic update owns only legacy prompt loops. Reject before
-                # touching even one shared scheduling field so a non-HTTP
-                # caller cannot bypass structured policy.
-                return loop
-            # Under the lock, so no write can land between this and the mutation. The
-            # fingerprint is authoritative: a projection baseline cannot distinguish goals.
-            if expect_fingerprint is not None and (
-                not expect_fingerprint or loop.goal_token != expect_fingerprint
-            ):
-                raise AutoNudgeStaleBaseline(loop_id)
-            # Keep typed nested values intact. ``asdict`` recursively converts
-            # MonitorState to a plain dict, which is not a valid rollback value.
-            previous = {item.name: getattr(loop, item.name) for item in fields(loop)}
-            # Set only if a retarget takes this loop's pending wake claim, so the
-            # rollback below restores exactly what it removed and nothing else.
-            claim_discarded_for_retarget = False
-            floor_discarded_for_retarget = False
-            was_active = loop.active
-            if message is not None:
-                retarget = message != loop.message
-                loop.message = message
-                # A new goal is a new identity, so a baseline served for the old text
-                # cannot authorise a write.
-                loop.goal_token = new_goal_token()
-                if retarget:
-                    # A changed instruction is a new config generation, so a
-                    # structural-terminal verdict recorded for the OLD
-                    # instruction does not apply to it. Advanced here (not on a
-                    # no-op same-message save) so an unrelated settings save does
-                    # not spend a generation.
-                    loop.config_generation += 1
-                    # The instruction IS the target, so a changed instruction can
-                    # change the subject. Re-infer, or the loop keeps polling the
-                    # pull request it was armed on: the new subject is never
-                    # watched, and the old one merging would retire the loop while
-                    # the work it was retargeted to sits unobserved.
-                    #
-                    # An unchanged subject keeps its existing monitor rather than a
-                    # fresh one -- refining the wording of an instruction about the
-                    # same PR is the common use of this path, and rebuilding would
-                    # discard the metering counters and the follow-up allowance for
-                    # no reason. A message that no longer names one subject clears
-                    # the monitor, which returns the loop to a plain timer.
-                    #
-                    # A loop armed with gate=False is never re-inferred here. Its
-                    # caller said the cadence matters, and re-gating it because the
-                    # wording changed would revoke that through the documented way
-                    # to revise a loop -- silently, since an ungated loop and a
-                    # re-gated one look identical until the turns stop arriving.
-                    inferred = infer_monitor(message, time.time()) if loop.gate else None
-                    current = loop.monitor
-                    # The stored spelling is a canonical shorthand and cannot
-                    # express a HOST, so kind and target alone would call an edit
-                    # from an enterprise shorthand to the same public slug
-                    # "unchanged" and keep polling the wrong server. This is the
-                    # third of the three places that comparison had to reach; the
-                    # other two are the post-poll binding and the dedupe identity.
-                    old_probe = targets.infer(str(previous.get("message") or ""))
-                    new_probe = targets.infer(message)
-                    same_host = (old_probe.host_key if old_probe else None) == (
-                        new_probe.host_key if new_probe else None
-                    )
-                    same_subject = (
-                        inferred is not None
-                        and current is not None
-                        and current.kind == inferred.kind
-                        and current.target == inferred.target
-                        and same_host
-                    )
-                    if not same_subject:
-                        if current is not None and current.version != MONITOR_STATE_VERSION:
-                            # A FUTURE version cannot be interpreted here, so it must
-                            # not be REPLACED here either. The revival guard below
-                            # already refuses to touch such a record, on the grounds
-                            # that the stored intent belongs to the newer gateway that
-                            # wrote it -- but that guard runs after this assignment,
-                            # so a downgraded gateway destroyed the payload before the
-                            # rule protecting it ever applied. Same rule, second
-                            # surface: leave the record alone and let the message
-                            # change without rebinding the watch.
-                            logger.info(
-                                "AutoNudge: loop %s carries a monitor from version %d, so "
-                                "its retarget is refused rather than overwriting state "
-                                "this gateway cannot read",
-                                loop.id,
-                                current.version,
-                            )
-                        else:
-                            # A wake claimed for the OLD subject must not be spent on
-                            # the new one. The claim is keyed by loop id, so without
-                            # this the in-flight turn's delivery charges a wake to a
-                            # monitor that has observed nothing, and grants it a
-                            # follow-up allowance it never earned. Remembered so the
-                            # persistence rollback below can hand it back if this
-                            # retarget never lands.
-                            claim_discarded_for_retarget = loop.id in self._pending_monitor_wake
-                            self._pending_monitor_wake.discard(loop.id)
-                            # And the floor claim, for the identical reason. I added
-                            # that second claim one round ago and wrote on the pull
-                            # request that two hand-written claim sets with two release
-                            # points would go wrong at the third site; this IS that
-                            # site, missed by the same change that predicted it. Third
-                            # time a claim has been released in one set and forgotten
-                            # in another.
-                            floor_discarded_for_retarget = loop.id in self._pending_floor_tick
-                            self._pending_floor_tick.discard(loop.id)
-                            loop.monitor = inferred
-            if banner is not None:
-                # Display-only, so no deadline or timer consequence — unlike
-                # ``idle_secs`` below, quieting a running loop must not restart
-                # its countdown. "" clears it back to the verbose default.
-                loop.banner = banner
-            interval_changed = False
-            if idle_secs is not None:
-                new_idle = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
-                interval_changed = new_idle != loop.idle_secs
-                loop.idle_secs = new_idle
-            if max_cycles is not None:
-                loop.max_cycles = max(0, int(max_cycles))
-            if max_runtime_secs is not None:
-                loop.max_runtime_secs = max(0, int(max_runtime_secs))
-            if active is not None:
-                if (
-                    active
-                    and loop.monitor is not None
-                    and loop.monitor.version != MONITOR_STATE_VERSION
-                ):
-                    # A FUTURE version cannot be interpreted here. IGNORE the
-                    # flag -- deliberately without touching ``loop.active`` --
-                    # because the stored intent belongs to the newer gateway that
-                    # wrote it and will resume it. Forcing it off would let an
-                    # older process silently retire a watch it cannot even read.
-                    pass
-                elif active and loop.monitor is not None and loop.monitor.outcome is not None:
-                    # A monitor with an outcome is finished -- its subject merged,
-                    # or its budget is spent. Reviving it would fire ungated
-                    # prompts at a settled subject, because the tick gate
-                    # declines to observe a monitor that already has an outcome.
-                    #
-                    # A current, unsettled monitor falls through to the ordinary
-                    # activation below: its delivery is gated per tick, so
-                    # resuming it cannot inject an ungated prompt. Spelling both
-                    # refusals out separately matters -- collapsing them into one
-                    # branch on ``loop.monitor is not None`` swallowed the
-                    # revival entirely, leaving the loop neither refused nor
-                    # activated.
-                    loop.active = False
-                    loop.next_due_ts = 0.0
-                # TERMINAL-TRANSITION ATOMICITY: a bound-tagged deactivation
-                # (stopped_reason supplied — the _timer's cycle_cap /
-                # runtime_budget paths) must never OVERWRITE a deactivation
-                # that landed first. The race: user pauses right after the
-                # timer detects expiry — the pause persists "manual" and
-                # cancels the timer, but the timer's already-inflight shielded
-                # update would stamp "runtime_budget" over it, making the loop
-                # budget-revivable against an explicit pause. Both transitions
-                # serialize on _lock, so re-checking here closes the race: the
-                # bound's deactivation degrades to a no-op when the loop is
-                # already inactive. The reverse order is already safe — a
-                # manual pause overwriting a bound tag only ever NARROWS
-                # revivability ("manual" never auto-revives).
-                elif (
-                    not active
-                    and stopped_reason is None
-                    and loop.stopped_reason == AUTONUDGE_STOP_REASON
-                ):
-                    # A reasonless repeat of an already-inactive state is not a
-                    # new stop transition. Preserve source-owned completion
-                    # evidence until its Research Lab watchdog consumes it;
-                    # dashboard retries and unrelated patches must not turn a
-                    # deliberate stop into a revivable manual pause.
-                    logger.info(
-                        "AutoNudge: loop %s retains its source stop reason on "
-                        "reasonless inactive update",
-                        loop.id,
-                    )
-                elif stopped_reason in _TERMINAL_BOUND_REASONS and not active and not loop.active:
-                    logger.info(
-                        "AutoNudge: loop %s already deactivated (%s) — %s bound "
-                        "not overwriting it",
-                        loop.id,
-                        loop.stopped_reason or MANUAL_STOP_REASON,
-                        stopped_reason,
-                    )
-                else:
-                    loop.active = bool(active)
-                    # Record WHY on every deactivation and clear it on every
-                    # revival, so the store always reflects the LAST transition.
-                    # ``stopped_reason`` is an internal caller parameter (_timer's
-                    # terminal bounds pass "cycle_cap"/"runtime_budget"); external
-                    # deactivations (REST pause, deactivate-mid-fire) default to
-                    # "manual", which the revive logic never auto-resumes.
-                    if loop.active:
-                        loop.stopped_reason = ""
-                        # Spent only by an actual REVIVAL, hence ``not
-                        # was_active``. A still-active loop also receives
-                        # ``active=True`` from an ordinary settings save (the
-                        # goal popover sends it on every edit), and treating
-                        # that as an answer would erase evidence recorded
-                        # moments earlier and let one more doomed cycle fire.
-                        # Keeping it costs at most a resumable stop the operator
-                        # can undo; dropping it costs a wasted cycle and the
-                        # silence this stop exists to end.
-                        if not was_active:
-                            loop.approval_stalled = False
-                            # Same rule, same reason: the streak is evidence
-                            # about a PAST run, and a revival starts a fresh one.
-                            loop.consecutive_start_failures = 0
-                    else:
-                        loop.stopped_reason = stopped_reason or MANUAL_STOP_REASON
-            revived = loop.active and not was_active
-            if revived:
-                # A revival re-arms the loop for a fresh run: a structural verdict
-                # recorded before it was stopped must not carry over (the user or
-                # a directive chose to run it again). Advancing the generation
-                # invalidates any in-flight stale completion keyed to the old one.
-                loop.config_generation += 1
-            # Deadline bookkeeping (BEFORE the snapshot below so it persists):
-            # an interval change restarts an EXISTING countdown at the new
-            # interval — the old deadline encodes the old cadence and honouring
-            # it would make the new setting take a full stale cycle to apply.
-            # Any other patch (message edit, cap raise) keeps the deadline, so
-            # a monitor_update refining the instruction never delays the next
-            # check. Deactivation clears it — a paused loop holds no schedule.
-            # A deadline that is ALREADY cleared (a delivered fire whose turn
-            # is still running — nudge turns commonly call monitor_update)
-            # stays cleared: the turn's END anchors the next full countdown
-            # via notify_turn_complete, and assigning here would start the
-            # interval mid-turn, so a turn longer than the interval would be
-            # followed by a spurious overdue fire instead of a full cycle.
-            if not loop.active:
-                loop.next_due_ts = 0.0
-            elif interval_changed and loop.next_due_ts > 0:
-                loop.next_due_ts = time.time() + loop.idle_secs
-            # Persist WITHOUT blocking the event loop — _write_state fsyncs, and
-            # a wedged disk must not freeze chat/heartbeat/liveness. Snapshot
-            # under THIS lock hold (mutation safety + serialization vs the
-            # post-fire write) and await the offloaded write so a persistence
-            # failure still reaches the caller. Same contract as _add_locked.
-            payload = self._serialize_state()
-            claim_was_held = claim_discarded_for_retarget
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
-            except BaseException:
-                for field_name, value in previous.items():
-                    setattr(loop, field_name, value)
-                if claim_was_held:
-                    # The retarget above dropped this loop's pending wake claim,
-                    # because a claim earned by the OLD subject must not be spent on
-                    # the new one. If the write then fails the retarget did not
-                    # happen -- so the claim belongs to the loop again, and leaving
-                    # it discarded costs the delivered wake its accounting and its
-                    # follow-up turn. Rolling back the fields but not this is the
-                    # same incomplete-restore defect as the terminal transition's.
-                    self._pending_monitor_wake.add(loop.id)
-                if floor_discarded_for_retarget:
-                    # Same restore, same reason. This is the fourth hand-written
-                    # restore of a per-loop claim in this file, and the review has now
-                    # found a claim missing from one of them three separate times --
-                    # which is the argument for one transition object with one restore
-                    # rather than a fifth.
-                    self._pending_floor_tick.add(loop.id)
-                raise
-            # Re-arm the timer with the new settings — but NEVER while its
-            # callback is mid-fire. Cancelling a firing timer cancels the
-            # in-flight turn itself (channel loops run the turn inline in
-            # _on_fire), destroying the response and the cycle accounting. A
-            # firing timer re-arms itself on every exit path anyway (backoff
-            # re-arm when undelivered, self-re-arm for channel keys,
-            # notify_turn_complete for dashboard slots), and each of those reads
-            # the freshly-updated idle_secs/active, so the new settings still
-            # take effect on the next cycle.
-            if loop.id in self._firing:
-                logger.info(
-                    "AutoNudge: loop %s updated mid-fire — deferring re-arm to the "
-                    "running timer so the in-flight turn is not cancelled",
-                    loop.id,
-                )
-            else:
-                self._cancel_timer(loop_id)
-                # Arm only when a schedule exists (deadline set) or this update
-                # REVIVED the loop (fresh full countdown for a paused loop —
-                # nothing else will arm it). An active loop with a cleared
-                # deadline is a delivered fire whose turn is still running;
-                # notify_turn_complete owns its next arm (see the deadline
-                # bookkeeping above), so arming here would anchor the interval
-                # mid-turn.
-                if loop.active and (loop.next_due_ts > 0 or revived):
-                    self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-        return loop
-
-    def remove_sync(
-        self, loop_id: str, *, persist: bool = True, emit: bool = True
-    ) -> NudgeLoop | None:
-        """Remove a loop. ``persist=False`` skips the blocking save — used by
-        async callers that snapshot+offload the write themselves right after."""
-        if persist and loop_id in self._loops:
-            from kiro_crew import autonudge_provider_trust
-
-            autonudge_provider_trust.forget_monitor_owner_credentials(loop_id)
-        loop = self._loops.pop(loop_id, None)
-        if loop is None:
-            return None
-        self._cancel_timer(loop_id)
-        self._rearm_fail_count.pop(loop_id, None)
-        self._start_failure_deferred.pop(loop_id, None)
-        self._rearm_pending.discard(loop_id)
-        self._accepted_monitor_turns.pop(loop_id, None)
-        if persist:
-            self._save()
-            # Revoke the keystone-gated self-arm entry only AFTER the store
-            # committed the removal: a save that raises leaves the loop's
-            # durable row in place, and a loop that is still stored must keep
-            # the entry it needs to fire. Provider credential denial is the
-            # inverse: it must be durable before the agent-writable row can
-            # disappear. ``persist=False`` callers own both commit boundaries.
-            self._revoke_self_arm_for(loop)
-        if emit:
-            self._emit("removed", loop)
-        deferred_replacement = self._deferred_monitor_replacements.pop(loop_id, None)
-        if deferred_replacement is not None and deferred_replacement[0] is not None:
-            deferred_prior = deferred_replacement[0]
-            assert deferred_prior is not None
-            self._revoke_self_arm_for(deferred_prior)
-        return loop
-
-    def _revoke_self_arm_for(self, loop: NudgeLoop) -> None:
-        """Revoke for EVERY loop leaving the store, not only ``self_armed`` ones.
-
-        The ``self_armed`` bit lives in the agent-writable store, so keying the
-        revocation on it would let a forged ``false`` (plus a restart) skip the
-        revoke and leave the keystone entry orphaned for a later loop that
-        reuses the id on the same slot -- the exact adversary the trust record
-        exists to defeat. Revocation therefore keys on the one fact the store
-        cannot forge: the loop is being removed. A loop with no entry costs one
-        offloaded read (``forget_self_arm`` writes only when it deletes).
-        """
-        self._revoke_self_arm(loop.id)
-
-    @staticmethod
-    def _revoke_self_arm(loop_id: str) -> None:
-        """Finish best-effort trust cleanup after a loop leaves the store.
-
-        Every removal path (explicit remove, session close, replacement by a
-        new arm) funnels through ``remove_sync``, so this is the one place the
-        self-arm trust record is told a loop has left the store -- and the ONLY
-        path that drops an entry, since ``record_self_arm`` is a pure upsert.
-        Provider credential denial has already been made durable before removal;
-        repeating it here finishes cleanup after a partial tombstone transaction.
-        File IO is offloaded when an event loop is running (``remove_sync`` is
-        reached from async paths that must not block on fsync); the sync
-        fallback covers shutdown/test callers with no loop. Best-effort: a
-        revocation failure is logged inside ``forget_self_arm`` and never
-        breaks the removal.
-        """
-        from kiro_crew import autonudge_provider_trust, autonudge_selfarm
-
-        def _forget_all_trust() -> None:
-            autonudge_selfarm.forget_self_arm(loop_id)
-            autonudge_provider_trust.forget_monitor_owner_credentials(loop_id)
-
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            _forget_all_trust()
-            return
-        fut = running.run_in_executor(None, _forget_all_trust)
-
-        def _log(f: "asyncio.Future[None]") -> None:
-            if not f.cancelled() and f.exception() is not None:
-                logger.warning("self-arm revocation failed for %s", loop_id, exc_info=f.exception())
-
-        fut.add_done_callback(_log)
-
-    async def remove(self, loop_id: str) -> None:
-        lock = await self._acquire_mutation_lock(loop_id)
-        if lock is None:
-            return
-        try:
-            await self._remove_unserialized(loop_id)
-        finally:
-            lock.release()
-
-    async def remove_by_slot(self, slot_key: str) -> NudgeLoop | None:
-        """Retire the current slot generation inside one maintenance transaction."""
-        async with _maintenance_lock(self._base_dir):
-            loop = self._find_by_slot(slot_key)
-            if loop is None:
-                return None
-            if is_structured_monitor_loop(loop):
-                await self.retire_monitor_for_session_close(loop.id)
-            else:
-                await self._remove_unserialized(loop.id)
-            return loop
-
-    async def clear_terminal_monitor(self, monitor_id: str) -> bool:
-        """Remove a structured monitor row ONLY while it is still terminal.
-
-        The owner-facing clear (``authorize_and_clear_monitor``) checks the
-        record's state, then audits — and the audit hands off to a thread, which
-        yields the event loop. In that window a concurrent
-        ``restore_monitor_after_failed_session_close`` can put the SAME row back
-        into service, so an unconditional removal afterwards would delete a live
-        watch with no record it existed: exactly the harm the live-monitor
-        refusal exists to prevent, reached from the other side.
-
-        So the decision is re-taken here, under the one lock hold that also
-        performs the removal. Returns ``False`` when the row moved on (restored,
-        already gone, or a wake accepted since), and removes nothing.
-        """
-
-        def _still_terminal(loop: NudgeLoop) -> bool:
-            state = loop.monitor
-            if state is None or state.outcome is None:
-                return False
-            if state.version != MONITOR_STATE_VERSION:
-                return False
-            return not state.wake_in_flight
-
-        lock = await self._acquire_mutation_lock(monitor_id)
-        if lock is None:
-            return False
-        try:
-            return await self._remove_unserialized(monitor_id, precondition=_still_terminal)
-        finally:
-            lock.release()
-
-    async def _remove_unserialized(
-        self,
-        loop_id: str,
-        *,
-        precondition: Callable[[NudgeLoop], bool] | None = None,
-    ) -> bool:
-        """Remove one loop. Returns whether the removal happened.
-
-        ``precondition`` is evaluated on the LIVE row inside the same ``_lock``
-        hold that removes it, so a caller whose decision was taken before an
-        await can re-take it atomically here instead of racing whatever landed
-        in between. A refused precondition changes nothing.
-        """
-        async with self._lock:
-            existed = loop_id in self._loops
-            if not existed and loop_id not in self._pending_removals:
-                return False
-            current = self._loops.get(loop_id)
-            if precondition is not None:
-                if current is None or not precondition(current):
-                    return False
-            restore_provider_credentials = False
-            if existed:
-                assert current is not None
-                was_active = current.active
-                current.active = False
-                self._cancel_timer(loop_id)
-                try:
-                    restore_provider_credentials = await self._provider_credentials_authorized(
-                        current
-                    )
-                    await self._revoke_provider_credentials_before_removal(loop_id)
-                except BaseException:
-                    current.active = was_active
-                    if current.active:
-                        self._arm_from_deadline(current)
-                    raise
-                current.active = was_active
-            # Remove in-memory but SKIP the blocking save: _save() -> _write_state
-            # fsyncs, and a wedged disk must not freeze the event loop. Snapshot
-            # under THIS lock hold (serialization vs the post-fire write). Keep
-            # the removal INLINE (not a separate task) so _cancel_timer's
-            # "never cancel the current task" self-guard still applies when
-            # _timer removes its own loop.
-            removed_loop: NudgeLoop | None = None
-            if existed:
-                removed_loop = self.remove_sync(loop_id, persist=False, emit=False)
-                self._pending_removals.add(loop_id)
-            payload = self._serialize_state()
-            fut = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
-
-            async def _restore_failed_removal() -> None:
-                self._pending_removals.discard(loop_id)
-                if removed_loop is None:
-                    return
-                self._loops[loop_id] = removed_loop
-                if restore_provider_credentials:
-                    await self._restore_provider_credentials(removed_loop)
-                if removed_loop.active:
-                    self._arm_from_deadline(removed_loop)
-
-            try:
-                await asyncio.shield(fut)
-            except asyncio.CancelledError:
-                # Caller cancelled mid-write: the executor thread can't be
-                # cancelled and is still fsyncing. shield re-raised on us
-                # immediately, so DRAIN the write to completion before this
-                # `async with` exits and releases _lock — otherwise a waiter
-                # (add()/update()/_persist_locked) could acquire the lock and
-                # race a second os.replace(), clobbering newer state with this
-                # stale removal snapshot ("lost update after restart"). Then
-                # propagate the cancellation.
-                while not fut.done():
-                    try:
-                        await asyncio.shield(fut)
-                    except asyncio.CancelledError:
-                        continue
-                try:
-                    fut.result()
-                except Exception:
-                    await _restore_failed_removal()
-                    raise
-                self._pending_removals.discard(loop_id)
-                if removed_loop is not None:
-                    self._revoke_self_arm_for(removed_loop)
-                    self._emit("removed", removed_loop)
-                raise
-            except Exception:
-                # Persistence is the commit point. Restore the live row (and
-                # its timer when it was active) so an immediate retry can still
-                # see the same loop the durable store retained.
-                await _restore_failed_removal()
-                raise
-            else:
-                self._pending_removals.discard(loop_id)
-                if removed_loop is not None:
-                    # The store committed: the row is gone, so its self-arm
-                    # entry may go too (see remove_sync for why not earlier).
-                    self._revoke_self_arm_for(removed_loop)
-                    self._emit("removed", removed_loop)
-                return True
-
-    @staticmethod
-    async def _revoke_provider_credentials_before_removal(loop_id: str) -> None:
-        """Require a durable provider denial before an agent-writable row disappears."""
-        from kiro_crew import autonudge_provider_trust
-
-        await asyncio.to_thread(
-            autonudge_provider_trust.forget_monitor_owner_credentials,
-            loop_id,
-        )
-
-    @staticmethod
-    async def _provider_credentials_authorized(loop: NudgeLoop) -> bool:
-        """Whether this exact structured row currently owns provider credentials."""
-        from kiro_crew import autonudge_provider_trust
-
-        state = loop.monitor
-        if state is None:
-            return False
-        return await asyncio.to_thread(
-            autonudge_provider_trust.is_monitor_owner_credentials_recorded,
-            loop.id,
-            loop.slot_key,
-            state.kind,
-            state.target,
-        )
-
-    @staticmethod
-    async def _restore_provider_credentials(loop: NudgeLoop) -> None:
-        """Restore the exact grant for a row whose replacement did not commit."""
-        from kiro_crew import autonudge_provider_trust
-
-        state = loop.monitor
-        if state is None:
-            raise ValueError("provider credential restoration requires a structured monitor")
-        await asyncio.to_thread(
-            autonudge_provider_trust.record_monitor_owner_credentials,
-            loop.id,
-            loop.slot_key,
-            state.kind,
-            state.target,
-        )
+            await asyncio.shield(self._start_persistence(payload, admission=admission))
 
     def get_by_id(self, loop_id: str) -> NudgeLoop | None:
         """The loop with this id, or ``None``.
@@ -3268,959 +1139,30 @@ class AutoNudgeService:
     def list_all(self) -> list[NudgeLoop]:
         return list(self._loops.values())
 
-    def _read_quarantine_sidecar(self) -> list:
-        """Read held-aside rows from the sidecar, tolerating absence but not corruption.
+    def pending_wake_briefs(self, loop_id: str) -> str:
+        """The wake text owed to *loop_id*'s next delivered cycle, or ``""``.
 
-        A missing file is the normal case and reads as "nothing held aside".
+        An accessor rather than a reach into ``_pending_monitor_wake``, matching
+        ``get_by_id`` / ``get_by_slot``: the fire path lives in the gateway, which is
+        another module, and the one thing it needs there is a read.
 
-        Content we cannot parse is different, and returning ``[]`` for it was a data-loss
-        path: the loader would report nothing held aside, and the next write would call
-        ``_drop_quarantine_sidecar`` and UNLINK the only surviving copy of rows the
-        loader itself refused. So an unreadable or wrongly-shaped sidecar refuses every
-        persist in this process with ``AutoNudgeStoreUnvetted``, and MOVES THE FILE ASIDE
-        under a ``.corrupt-<ts>`` name so recovery is a restart rather than a human
-        editing JSON -- the bytes an operator needs are preserved either way.
-
-        ``_load`` also ARMS NOTHING once this flag is set. Arming while writes are refused
-        is worse than arming nothing: a delivered cycle cannot persist its counter, so a
-        restart re-fires it past its own cycle cap.
+        A READ, not a take. The text stays owed until delivery is confirmed, for the
+        same reason the claim carrying it does -- a fire the slot refuses delivered
+        nothing, and taking the text here would leave the retry with a turn that says
+        only that a cycle happened.
         """
-        try:
-            raw = json.loads(self._quarantine_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return []
-        except (OSError, ValueError):
-            logger.warning(
-                "autonudge: quarantine sidecar at %s is unreadable; refusing writes so "
-                "it is not replaced or unlinked before it can be recovered",
-                self._quarantine_path,
-            )
-            self._refuse_writes_and_preserve_sidecar()
-            return []
-        # Not a startup failure on its own -- `raw.get` would raise AttributeError straight
-        # out of `_load` -- but it is still an unreadable copy, so writes stay refused.
-        if not isinstance(raw, dict):
-            logger.warning(
-                "autonudge: quarantine sidecar at %s is not an object (%s); refusing "
-                "writes so it is not replaced or unlinked",
-                self._quarantine_path,
-                type(raw).__name__,
-            )
-            self._refuse_writes_and_preserve_sidecar()
-            return []
-        # `_rows_or_empty` answers a dict- or scalar-shaped value with [], which reads as
-        # "nothing is held aside" and lets the next persist unlink the only copy.
-        if "quarantined" in raw and not isinstance(raw["quarantined"], list):
-            logger.warning(
-                "autonudge: quarantine sidecar at %s has a non-list `quarantined` (%s); "
-                "refusing writes so it is not replaced or unlinked",
-                self._quarantine_path,
-                type(raw["quarantined"]).__name__,
-            )
-            self._refuse_writes_and_preserve_sidecar()
-            return []
-        # ABSENT is not EMPTY: `raw.get` answers a dict with no `quarantined` key with None,
-        # which read as "nothing held aside" and let the next persist unlink the only copy.
-        if "quarantined" not in raw:
-            logger.warning(
-                "autonudge: quarantine sidecar at %s has no `quarantined` key; refusing "
-                "writes so it is not replaced or unlinked",
-                self._quarantine_path,
-            )
-            self._refuse_writes_and_preserve_sidecar()
-            return []
-        rows = _rows_or_empty(raw["quarantined"])
-        # FILTERING a non-dict member would silently shrink the held-aside set and let the
-        # load proceed, so an unreadable member refuses the store exactly as a bad file does.
-        if any(not isinstance(row, dict) for row in rows):
-            logger.warning(
-                "autonudge: quarantine sidecar at %s holds a non-object entry; refusing "
-                "writes so it is not replaced or unlinked",
-                self._quarantine_path,
-            )
-            self._refuse_writes_and_preserve_sidecar()
-            return []
-        return rows
+        return self._pending_monitor_wake.get(loop_id, "")
 
-    def _drop_quarantine_sidecar(self) -> None:
-        """Remove the sidecar once no rows remain -- ONLY after the main store landed.
-
-        Removing it is itself the deletion of a durable copy: a row repaired in the
-        sidecar and dropped from ``_quarantined`` exists nowhere else until the new
-        store is on disk, so unlinking before a replacement that can fail would lose
-        it permanently.
-
-        """
-        if self._quarantined:
-            return
-        with contextlib.suppress(OSError):
-            self._quarantine_path.unlink()
-
-    def _refuse_writes_and_preserve_sidecar(self) -> None:
-        """Refuse persistence for THIS process, and move the unreadable file aside.
-
-        Both halves are load-bearing. Refusing keeps the store consistent now, because
-        a write would compact around rows nothing enumerated. The move-aside is what
-        stops that being a permanent outage: recovery becomes a restart, not a human
-        editing JSON, and the original bytes survive under a ``.corrupt-<ts>`` name.
-        """
-        self._load_refused = True
-        self._move_aside_unreadable_sidecar()
-
-    def _move_aside_unreadable_sidecar(self) -> None:
-        """Rename an unreadable sidecar so recovery does not need a human repair.
-
-        The bytes are PRESERVED under a ``.corrupt-<ts>`` suffix rather than unlinked --
-        an operator still needs them to re-inject the held rows -- but the service can
-        persist again after a restart instead of staying down until someone edits JSON.
-        """
-        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        base = f"{self._quarantine_path.name}.corrupt-{stamp}"
-        target = self._quarantine_path.with_name(base)
-        try:
-            with self._sidecar_transaction():
-                # REVALIDATE inside the lock. Detection ran earlier and unlocked, so a peer may
-                # have published a readable replacement whose rows this rename would discard.
-                if self._quarantine_rows_on_disk() is not None:
-                    logger.warning(
-                        "autonudge: the quarantine sidecar at %s is readable again -- another "
-                        "instance replaced it since detection, so it is left in place",
-                        self._quarantine_path,
-                    )
-                    return
-                self._move_aside_locked(target, base)
-        except OSError:
-            # The LOCK itself can be unopenable -- a directory in its place, an exhausted
-            # disk -- and this runs during startup, where raising ends the process.
-            logger.warning(
-                "autonudge: could not take the quarantine sidecar lock at %s to move the "
-                "unreadable file aside; it stays in place and writes remain refused",
-                self._quarantine_path,
-                exc_info=True,
-            )
-
-    def _move_aside_locked(self, target: Path, base: str) -> None:
-        """Reserve a free ``.corrupt-`` name and rename the sidecar onto it."""
-        # ``replace`` CLOBBERS and the stamp is second-granular, so RESERVE the name with
-        # O_EXCL first -- two instances in one second would otherwise destroy these bytes.
-        for _ in range(8):
-            try:
-                os.close(os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-                break
-            except FileExistsError:
-                target = self._quarantine_path.with_name(f"{base}-{secrets.token_hex(4)}")
-            except OSError:
-                break
-        try:
-            self._quarantine_path.replace(target)
-        except OSError:
-            logger.warning(
-                "autonudge: could not move the unreadable quarantine sidecar at %s "
-                "aside; it stays in place and writes remain refused",
-                self._quarantine_path,
-                exc_info=True,
-            )
-            return
-        logger.warning(
-            "autonudge: quarantine sidecar at %s was unreadable and has been moved to "
-            "%s; its held-aside rows must be re-injected from there",
-            self._quarantine_path,
-            target,
-        )
-
-    def _quarantine_rows_on_disk(self) -> list[dict] | None:
-        """Read the sidecar's rows, or None when it cannot be enumerated."""
-        try:
-            raw = self._quarantine_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return []
-        except OSError:
-            return None
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return None
-        if not isinstance(data, dict):
-            return None
-        rows = data.get("quarantined")
-        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-            return None
-        return rows
-
-    @contextmanager
-    def _sidecar_transaction(self) -> Iterator[None]:
-        """Hold an EXCLUSIVE cross-process lock for a sidecar read-modify-write.
-
-        The union below is not atomic across PROCESSES: a second AutoNudge writing the
-        same home can add a row between the read and the replace, and the sidecar is that
-        row's only durable copy. Within one event loop the pair is synchronous so the
-        intra-process race cannot happen -- this closes the inter-process one.
-
-        Distinct from the stat bracket removed earlier: that COMPARED a snapshot identity
-        and hoped nothing moved, which POSIX rename cannot make atomic. This EXCLUDES the
-        other writer, so there is no window to lose a row in.
-
-        The lock lives on a stable sentinel beside the sidecar rather than on the sidecar
-        itself, which is renamed and replaced underneath. Mode ``a+`` is exclusive without
-        tripping ``_locked_file``'s seed-a-store-shaped-file branch.
-        """
-        lock_path = self._quarantine_path.with_name(self._quarantine_path.name + ".lock")
-        if self._sidecar_lock_depth:
-            # RE-ENTRANT: ``flock`` is per-fd, so a second open here would block on a lock
-            # this process already holds, and the nested body is already excluded by it.
-            yield
-            return
-        with _locked_file(lock_path, "a+"):
-            self._sidecar_lock_depth += 1
-            try:
-                yield
-            finally:
-                self._sidecar_lock_depth -= 1
-
-    def _write_quarantine_sidecar(self) -> None:
-        """Publish held-aside rows under the cross-process sidecar lock."""
-        with self._sidecar_transaction():
-            self._write_quarantine_sidecar_locked()
-
-    def _write_quarantine_sidecar_locked(self) -> None:
-        """Persist held-aside rows ADDITIVELY, before the main store replacement.
-
-        Writing only the in-memory set SHRINKS the file whenever a row was repaired
-        this pass while a sibling stayed held: if the replacement then fails, that
-        repaired row is in neither the reduced sidecar nor the unchanged store. So
-        union with what is already on disk, and compact once the store has landed.
-
-        The union is not STAT-BRACKETED. That bracket was a check-then-mutate that could
-        not close the window it narrowed, and it made a repair an operator saved inside
-        that window destroyable. Exclusion by ``_sidecar_transaction`` replaces it.
-
-        Callers here must NOT re-enter the lock: the flock is per-fd, so a second
-        acquisition from this process on a fresh fd would block against itself.
-        """
-        on_disk = self._quarantine_rows_on_disk()
-        if on_disk is None:
-            # Fail CLOSED: returning here let the store land and the sidecar compact
-            # around rows this process never enumerated, overwriting or unlinking them.
-            self._refuse_writes_and_preserve_sidecar()
-            raise AutoNudgeStoreUnvetted(
-                f"quarantine sidecar at {self._quarantine_path} could not be read, so "
-                "this write is refused; it has been moved aside for inspection"
-            )
-        rows = deepcopy(self._quarantined)
-        seen = {_quarantine_row_key(row) for row in rows}
-        for row in on_disk:
-            key = _quarantine_row_key(row)
-            if key not in seen:
-                seen.add(key)
-                rows.append(row)
-        self._write_quarantine_rows(rows)
-
-    def _compact_quarantine_sidecar(self) -> None:
-        """Compact the sidecar under the cross-process sidecar lock."""
-        with self._sidecar_transaction():
-            self._compact_quarantine_sidecar_locked()
-
-    def _compact_quarantine_sidecar_locked(self) -> None:
-        """Reduce the sidecar to rows this write can PROVE it superseded, after the commit.
-
-        Compacting from ``self._quarantined`` alone deletes rows this process never saw. The
-        cross-process lock does not help: it SERIALIZES writers, so a peer's row is already
-        durably on disk and simply absent from this instance's memory, which is stale rather
-        than racing. An empty local set then unlinked the file and took the peer's only
-        durable copy with it.
-
-        So the licence to remove a row is having ENUMERATED it at load and not holding
-        it. Absence from ``_sidecar_seen`` means another writer owns it, and it is kept. The
-        file is dropped only when nothing survives that test.
-
-        Called with the lock ALREADY held, so neither the read nor the drop re-enters it.
-        """
-        on_disk = self._quarantine_rows_on_disk()
-        if on_disk is None:
-            # Cannot enumerate: keeping the superset is the whole point of the file.
-            return
-        held = {_quarantine_row_key(row) for row in self._quarantined}
-        keep = [
-            row
-            for row in on_disk
-            if _quarantine_row_key(row) in held
-            or _quarantine_row_key(row) not in self._sidecar_seen
-        ]
-        if not keep:
-            self._drop_quarantine_sidecar()
-            return
-        self._write_quarantine_rows(keep)
-
-    def _write_quarantine_rows(self, rows: list[dict]) -> None:
-        """Atomically write exactly ``rows``. Never REMOVES the file -- see the drop half.
-
-        Written from a single sink so EVERY caller is correct by construction rather
-        than each having to remember the atomicity and never-unlink invariants.
-        """
-        if not rows:
-            return
-        payload = {"version": _STORE_VERSION, "quarantined": rows}
-        self._quarantine_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(dir=self._quarantine_path.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            replace_with_retry(tmp_path, self._quarantine_path)
-            # Fsyncing the bytes leaves the RENAME unflushed, so a crash could drop
-            # these rows from the only place still holding them.
-            fsync_dir(self._quarantine_path.parent)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path)
-            raise
-
-    def _monitor_snapshot_with_replacement(
+    async def _write_monitor_snapshot_locked(
         self,
-        loop: NudgeLoop,
-        replacement: NudgeLoop,
-    ) -> dict:
-        """Serialize one staged monitor replacement without changing live state."""
-        return {
-            "version": _STORE_VERSION,
-            "loops": self._serialized_loops(replace={loop.id: replacement}),
-        }
-
-    def _apply_staged_monitor(self, loop: NudgeLoop, staged: NudgeLoop) -> None:
-        """Publish a durable staged transition while preserving live object identity."""
-        state = loop.monitor
-        staged_state = staged.monitor
-        if state is None or staged_state is None:
-            raise ValueError("structured monitor replacement requires monitor state")
-        for loop_field in fields(NudgeLoop):
-            if loop_field.name != "monitor":
-                setattr(loop, loop_field.name, deepcopy(getattr(staged, loop_field.name)))
-        for state_field in fields(MonitorState):
-            setattr(
-                state,
-                state_field.name,
-                deepcopy(getattr(staged_state, state_field.name)),
-            )
-
-    async def _persist_staged_monitor_locked(
-        self,
-        loop: NudgeLoop,
-        staged: NudgeLoop,
+        payload: dict | None = None,
+        *,
+        admission: _MutationAdmission | None = None,
     ) -> None:
-        """Persist a complete replacement before publishing it to live readers."""
-        payload = self._monitor_snapshot_with_replacement(loop, staged)
-        try:
-            await self._write_monitor_snapshot_locked(payload)
-        except asyncio.CancelledError:
-            # The snapshot writer propagates cancellation only after draining
-            # the executor write. Publish the state that is already durable
-            # before preserving the caller's cancellation.
-            self._apply_staged_monitor(loop, staged)
-            raise
-        self._apply_staged_monitor(loop, staged)
-
-    async def apply_monitor_probe(
-        self,
-        monitor_id: str,
-        result: MonitorProbeResult,
-        *,
-        now: float,
-        config_generation: int,
-    ) -> MonitorVerdict:
-        """Persist one probe decision and any wake claim as one transition.
-
-        A refusal that never reaches the decision engine carries no entries: no
-        observation was judged, so the verdict has nothing to name.
-        """
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if loop is None or state is None or not loop.active or state.outcome is not None:
-                return MonitorVerdict(decision=MonitorDecision.STOP_BLOCKED)
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            if state.config_generation != config_generation:
-                self._set_monitor_deadline(staged, now + staged_state.cadence_secs)
-                decision = MonitorDecision.NO_CHANGE
-                verdict = MonitorVerdict(decision=decision)
-            elif state.wake_in_flight:
-                return MonitorVerdict(decision=MonitorDecision.NO_CHANGE)
-            else:
-                verdict = decide_monitor(staged_state, result.observation, now=now)
-                decision = verdict.decision
-                staged_state.probe_count += 1
-                staged_state.last_probe_at = now
-                staged_state.last_decision = decision
-                observation = result.observation
-                staged_state.last_observation_status = observation.status
-                staged_state.last_observation_reason_code = observation.reason_code
-                provider_error = (
-                    observation.provider_error or observation.supplemental_provider_error
-                )
-                if is_unattempted_probe(observation):
-                    # THE THIRD OUTCOME, and it moves neither counter, for the same
-                    # reason ``shadow.apply_monitor_probe`` gives: the provider-error
-                    # budget is finite and never refunded, so it has to measure
-                    # refusals the HOST gave this watch. Charged for a request the
-                    # probe declined to send, a shared cooldown that unrelated work
-                    # opened retires a healthy watch on its own cadence; clearing the
-                    # streak instead is the opposite error, because an outage
-                    # interleaved with skips would never retire the watch it blinds.
-                    # This is the PRODUCTION counting site, so the rule has to hold
-                    # in both or it holds nowhere.
-                    pass
-                elif provider_error is not None:
-                    staged_state.provider_error_count += 1
-                    staged_state.consecutive_provider_errors += 1
-                    staged_state.last_provider_error = provider_error
-                else:
-                    staged_state.consecutive_provider_errors = 0
-                    staged_state.last_provider_error = None
-                if observation.status is not MonitorObservationStatus.PROVIDER_ERROR:
-                    staged_state.last_observation = deepcopy(result.canonical)
-                    staged_state.last_fingerprint = observation.fingerprint
-                    staged_state.last_observed_at = now
-
-                if decision in {MonitorDecision.NO_CHANGE, MonitorDecision.RECORD_ONLY}:
-                    self._set_monitor_deadline(staged, now + staged_state.cadence_secs)
-                elif decision is MonitorDecision.RETRY_PROVIDER:
-                    shift = max(0, staged_state.consecutive_provider_errors - 1)
-                    retry = min(
-                        _MONITOR_RETRY_MAX_BACKOFF_SECS,
-                        _MONITOR_RETRY_BACKOFF_SECS * (2 ** min(shift, _REARM_BACKOFF_MAX_SHIFT)),
-                        staged_state.cadence_secs,
-                    )
-                    self._set_monitor_deadline(staged, now + retry)
-                elif decision is MonitorDecision.WAKE_ACTIONABLE:
-                    staged_state.last_wake_fingerprint = observation.fingerprint
-                    staged_state.last_wake_reason_code = observation.reason_code
-                    # Record that a wake was DECIDED for the conditions it
-                    # delivers, next to the persist so the stamp cannot outlive
-                    # its write: the re-alert interval is measured from here.
-                    # decide_monitor only READS this map. The engine owns which
-                    # conditions the wake covered, so it owns the keying too.
-                    stamp_monitor_alerted(staged_state, now=now)
-                    staged_state.wake_in_flight = True
-                    staged_state.wake_delivery = None
-                    self._set_monitor_deadline(staged, 0.0)
-                elif decision is MonitorDecision.STOP_BUDGET:
-                    reason = monitor_budget_reason(staged_state, now=now)
-                    self._apply_monitor_budget_stop(staged, reason, stopped_at=now)
-                else:
-                    staged.active = False
-                    self._set_monitor_deadline(staged, 0.0)
-                    staged_state.outcome = (
-                        MonitorOutcome.SUCCESS
-                        if decision is MonitorDecision.STOP_SUCCESS
-                        else MonitorOutcome.BLOCKED
-                    )
-                    staged_state.stopped_reason = (
-                        monitor_stall_reason(staged_state, now=now)
-                        or observation.reason_code
-                        or "monitor_blocked"
-                    )
-                    staged_state.stopped_at = now
-            # Every probe advances durable inspection state and the next
-            # deadline. Persist before publishing so a restart cannot restore
-            # an overdue schedule and repeat an unchanged probe early.
-            await self._persist_staged_monitor_locked(loop, staged)
-            if not loop.active:
-                self._sync_terminal_completion_timer(loop)
-        self._emit("updated", loop)
-        return verdict
-
-    async def stop_monitor_if_budget_exhausted(
-        self,
-        monitor_id: str,
-        *,
-        now: float,
-    ) -> bool:
-        """Stop a spent structured monitor before starting another provider probe."""
-        stopped_loop: NudgeLoop | None = None
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if loop is not None and state is not None and loop.active and state.outcome is None:
-                reason = monitor_budget_reason(state, now=now)
-                if reason:
-                    stopped = deepcopy(loop)
-                    if stopped.monitor is not None:
-                        stopped.monitor.last_decision = MonitorDecision.STOP_BUDGET
-                    self._apply_monitor_budget_stop(stopped, reason, stopped_at=now)
-                    await self._persist_staged_monitor_locked(loop, stopped)
-                    self._sync_terminal_completion_timer(loop)
-                    stopped_loop = loop
-        if stopped_loop is not None:
-            self._emit("updated", stopped_loop)
-        return stopped_loop is not None
-
-    def _set_monitor_deadline(self, loop: NudgeLoop, deadline: float) -> None:
-        """Write the scheduler authority and inspection mirror together."""
-        loop.next_due_ts = deadline
-        if loop.monitor is not None:
-            loop.monitor.next_probe_at = deadline
-
-    async def stop_monitor(
-        self,
-        monitor_id: str,
-        *,
-        now: float | None = None,
-        user_reason: str = "",
-    ) -> NudgeLoop | None:
-        """Retain a structured record with a durable user-stop outcome."""
-        stopped_at = time.time() if now is None else now
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if loop is None or state is None:
-                return None
-            if state.outcome is not None:
-                return loop
-            stopped = deepcopy(loop)
-            self._apply_monitor_user_stop(stopped, stopped_at=stopped_at)
-            assert stopped.monitor is not None
-            stopped.monitor.user_stop_reason = user_reason
-            # Keep the live state and timer untouched until the terminal
-            # snapshot is durable. A failed write must leave memory matching
-            # the still-active record on disk so restart cannot resurrect work
-            # the current process already considers stopped.
-            await self._persist_staged_monitor_locked(loop, stopped)
-            self._sync_terminal_completion_timer(loop)
-        self._emit("updated", loop)
-        return loop
-
-    async def mark_terminal_notification_delivered(
-        self,
-        monitor_id: str,
-        outcome: MonitorOutcome,
-        stopped_at: float,
-    ) -> bool:
-        """Persist delivery only when the same terminal generation still exists."""
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or loop.active
-                or state.outcome is not outcome
-                or state.stopped_at != stopped_at
-                or terminal_notification_delivery_matches(loop, outcome, stopped_at)
-            ):
-                return False
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            staged_state.terminal_notification_delivered = True
-            staged.terminal_notification_outcome = outcome.value
-            staged.terminal_notification_stopped_at = stopped_at
-            await self._persist_staged_monitor_locked(loop, staged)
-        return True
-
-    async def retire_monitor_for_session_close(
-        self, monitor_id: str, *, now: float | None = None
-    ) -> NudgeLoop | None:
-        """Retain a terminal session-close record while disarming its timer."""
-        stopped_at = time.time() if now is None else now
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if loop is None or state is None:
-                return None
-            if state.outcome is not None:
-                return loop
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            staged.active = False
-            self._retain_accepted_terminal_completion(staged, stopped_at=stopped_at)
-            staged_state.outcome = MonitorOutcome.SESSION_CLOSE
-            staged_state.stopped_reason = MONITOR_STOP_SESSION_CLOSE
-            staged_state.stopped_at = stopped_at
-            await self._persist_staged_monitor_locked(loop, staged)
-            self._sync_terminal_completion_timer(loop)
-        self._emit("updated", loop)
-        return loop
-
-    async def restore_monitor_after_failed_session_close(
-        self,
-        monitor_id: str,
-        *,
-        now: float | None = None,
-        admission_check: Callable[[], bool] | None = None,
-    ) -> NudgeLoop | None:
-        """Rollback only the close-owned terminal transition after close failure."""
-        restored_at = time.time() if now is None else now
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if loop is None or state is None or state.outcome is not MonitorOutcome.SESSION_CLOSE:
-                return None
-            if admission_check is not None and not admission_check():
-                return None
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            staged.active = True
-            staged_state.outcome = None
-            staged_state.stopped_reason = ""
-            staged_state.stopped_at = 0.0
-            if (
-                staged_state.wake_in_flight
-                and staged_state.wake_delivery is MonitorDispatchResult.DISPATCHED
-                and staged_state.completion_evidence_deadline > 0
-            ):
-                deadline = staged_state.completion_evidence_deadline
-            elif staged_state.wake_in_flight:
-                staged_state.wake_delivery = MonitorDispatchResult.BUSY
-                staged_state.completion_evidence_deadline = 0.0
-                deadline = restored_at + min(
-                    MONITOR_BUSY_RETRY_SECS,
-                    staged_state.cadence_secs,
-                )
-            else:
-                deadline = restored_at + staged_state.cadence_secs
-            self._set_monitor_deadline(staged, deadline)
-            await self._persist_staged_monitor_locked(loop, staged)
-            if self._on_monitor_tick is not None:
-                self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-        return loop
-
-    async def update_monitor(
-        self,
-        monitor_id: str,
-        *,
-        target: str | None = None,
-        objective: str | None = None,
-        cadence_secs: int | None = None,
-        budgets: MonitorBudgets | None = None,
-        budget_patch: dict[str, int] | None = None,
-        wake_instructions: str | None = None,
-        creation_surface: MonitorCreationSurface | None = None,
-        _prior_snapshot_out: list[NudgeLoop] | None = None,
-    ) -> NudgeLoop | None:
-        """Patch an active structured record without implicit revival."""
-        if budgets is not None and budget_patch is not None:
-            raise ValueError("budgets and budget_patch are mutually exclusive")
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if loop is None or state is None or state.outcome is not None:
-                return None
-            reset_baseline = (target is not None and target != state.target) or (
-                objective is not None and objective != state.objective
-            )
-            if reset_baseline and state.wake_in_flight:
-                raise MonitorUpdateConflict(
-                    "target or objective cannot change while a wake is in flight"
-                )
-            if _prior_snapshot_out is not None:
-                _prior_snapshot_out.append(deepcopy(loop))
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            if target is not None:
-                staged_state.target = target
-            if creation_surface is not None:
-                staged_state.creation_surface = creation_surface
-            if objective is not None:
-                # The objective allowlist upstream is a union across every publicly
-                # armable kind, so it is a first filter and never the whole check.
-                # This is the boundary that knows BOTH halves -- the monitor's kind is
-                # already fixed -- so the pairing is refused here rather than
-                # discovered at probe time.
-                if not kind_supports_objective(staged_state.kind, objective):
-                    raise ValueError(
-                        f"monitored kind {staged_state.kind!r} does not support "
-                        f"objective {objective!r}"
-                    )
-                staged_state.objective = objective
-            if cadence_secs is not None:
-                cadence = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(cadence_secs)))
-                staged_state.cadence_secs = cadence
-                staged.idle_secs = cadence
-                if staged.active and not staged_state.wake_in_flight and staged.next_due_ts > 0:
-                    self._set_monitor_deadline(staged, time.time() + cadence)
-            if budget_patch is not None:
-                budget_fields = {
-                    "max_runtime_secs",
-                    "max_agent_turns",
-                    "max_tokens",
-                    "max_provider_errors",
-                }
-                unknown = set(budget_patch) - budget_fields
-                if unknown:
-                    raise ValueError(
-                        "unknown structured monitor budget fields: " + ", ".join(sorted(unknown))
-                    )
-                values = {field: getattr(staged_state.budgets, field) for field in budget_fields}
-                values.update(budget_patch)
-                staged_state.budgets = MonitorBudgets(**values)
-            elif budgets is not None:
-                staged_state.budgets = budgets
-            if wake_instructions is not None:
-                staged_state.wake_instructions = wake_instructions
-            if reset_baseline:
-                staged_state.config_generation += 1
-                staged_state.last_observation = {}
-                staged_state.last_observation_status = None
-                staged_state.last_observation_reason_code = ""
-                staged_state.last_fingerprint = ""
-                staged_state.last_observed_at = 0.0
-                staged_state.last_decision = None
-                staged_state.last_wake_fingerprint = ""
-                staged_state.last_wake_reason_code = ""
-                staged_state.wake_in_flight = False
-                staged_state.wake_delivery = None
-                staged_state.completion_evidence_deadline = 0.0
-                staged_state.last_completion_fingerprint = ""
-                staged_state.consecutive_provider_errors = 0
-                staged_state.last_provider_error = None
-                staged_state.coalesce_windows = {}
-                staged_state.coalesce_alerted = {}
-                staged_state.stall_digest = ""
-                staged_state.stall_streak = 0
-                staged_state.stall_started_at = 0.0
-            await self._persist_staged_monitor_locked(loop, staged)
-            if loop.active and not state.wake_in_flight and loop.id not in self._firing:
-                self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-        return loop
-
-    async def rollback_monitor_update(
-        self,
-        monitor_id: str,
-        prior: NudgeLoop,
-        failed_update: NudgeLoop,
-    ) -> bool:
-        """Restore an update only while the failed state is still current."""
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            if (
-                loop is None
-                or loop.monitor is None
-                or prior.id != monitor_id
-                or failed_update.id != monitor_id
-                or self._serialize_loop(loop) != self._serialize_loop(failed_update)
-            ):
-                return False
-            await self._persist_staged_monitor_locked(loop, deepcopy(prior))
-            state = loop.monitor
-            assert state is not None
-            if loop.active and not state.wake_in_flight and loop.id not in self._firing:
-                self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-        return True
-
-    async def mark_monitor_action_in_flight(
-        self,
-        monitor_id: str,
-        fingerprint: str,
-        *,
-        now: float | None = None,
-    ) -> bool:
-        """Persist the dispatch claim for one actionable fingerprint."""
-        if not isinstance(fingerprint, str) or not fingerprint:
-            raise ValueError("fingerprint must be a non-empty string")
-        checked_at = time.time() if now is None else now
-        if (
-            isinstance(checked_at, bool)
-            or not isinstance(checked_at, (int, float))
-            or not math.isfinite(checked_at)
-            or checked_at < 0
-        ):
-            raise ValueError("now must be a finite non-negative number")
-        dispatched = False
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or not loop.active
-                or state.outcome is not None
-                or state.wake_in_flight
-                or state.last_wake_fingerprint == fingerprint
-            ):
-                return False
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            reason = monitor_budget_reason(staged_state, now=checked_at)
-            if reason:
-                self._apply_monitor_budget_stop(staged, reason, stopped_at=checked_at)
-            else:
-                staged_state.last_wake_fingerprint = fingerprint
-                staged_state.wake_in_flight = True
-                staged_state.wake_delivery = None
-                dispatched = True
-            await self._persist_staged_monitor_locked(loop, staged)
-            if not loop.active:
-                self._sync_terminal_completion_timer(loop)
-        self._emit("updated", loop)
-        return dispatched
-
-    async def record_monitor_turn_completion(
-        self,
-        completion: MonitorActionCompletion,
-    ) -> None:
-        """Charge one correlated, completed action turn exactly once."""
-        async with self._lock:
-            if self._accepted_monitor_turns.get(completion.monitor_id) == completion.fingerprint:
-                self._accepted_monitor_turns.pop(completion.monitor_id, None)
-            loop = self._loops.get(completion.monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or not state.wake_in_flight
-                or state.last_wake_fingerprint != completion.fingerprint
-            ):
-                return
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            disposition = (
-                MonitorActionDisposition.APPROVAL_STALL
-                if staged.approval_stalled
-                else completion.disposition
-            )
-            if staged_state.wake_delivery is not MonitorDispatchResult.DISPATCHED:
-                staged_state.wake_count += 1
-            staged_state.wake_in_flight = False
-            staged_state.wake_delivery = None
-            staged_state.completion_evidence_deadline = 0.0
-            staged_state.last_completion_fingerprint = completion.fingerprint
-            staged_state.last_completion_disposition = disposition
-            staged_state.last_completed_at = completion.completed_ts
-            staged_state.agent_turns += 1
-            if completion.input_tokens is None or completion.output_tokens is None:
-                staged_state.token_usage_known = False
-            if completion.input_tokens is not None:
-                staged_state.input_tokens += completion.input_tokens
-            if completion.output_tokens is not None:
-                staged_state.output_tokens += completion.output_tokens
-            reason = monitor_budget_reason(staged_state, now=completion.completed_ts)
-            if staged_state.outcome is not None:
-                self._set_monitor_deadline(staged, 0.0)
-            elif reason:
-                self._apply_monitor_budget_stop(
-                    staged,
-                    reason,
-                    stopped_at=completion.completed_ts,
-                )
-            elif (
-                disposition is MonitorActionDisposition.APPROVAL_STALL
-                and staged_state.outcome is None
-            ):
-                staged.active = False
-                self._set_monitor_deadline(staged, 0.0)
-                staged_state.outcome = MonitorOutcome.BLOCKED
-                staged_state.stopped_reason = MONITOR_STOP_APPROVAL_STALL
-                staged_state.stopped_at = completion.completed_ts
-            elif staged.active and staged_state.outcome is None:
-                self._set_monitor_deadline(
-                    staged,
-                    completion.completed_ts + staged_state.cadence_secs,
-                )
-            await self._persist_staged_monitor_locked(loop, staged)
-            if not loop.active:
-                self._sync_terminal_completion_timer(loop)
-            if loop.active and state.outcome is None:
-                if loop.id in self._firing:
-                    self._rearm_pending.add(loop.id)
-                else:
-                    self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-
-    def _apply_monitor_budget_stop(
-        self,
-        loop: NudgeLoop,
-        reason: str,
-        *,
-        stopped_at: float,
-    ) -> None:
-        """Apply budget-stop fields without changing the live timer registry."""
-        state = loop.monitor
-        if state is None:
-            return
-        loop.active = False
-        self._retain_accepted_terminal_completion(loop, stopped_at=stopped_at)
-        state.outcome = MonitorOutcome.BUDGET
-        state.stopped_reason = reason
-        state.stopped_at = stopped_at
-
-    def _apply_monitor_user_stop(self, loop: NudgeLoop, *, stopped_at: float) -> None:
-        """Apply a user stop after its replacement snapshot is durable."""
-        state = loop.monitor
-        if state is None:
-            return
-        loop.active = False
-        self._retain_accepted_terminal_completion(loop, stopped_at=stopped_at)
-        state.outcome = MonitorOutcome.USER_STOP
-        state.stopped_reason = MONITOR_STOP_USER
-        state.stopped_at = stopped_at
-
-    def _retain_accepted_terminal_completion(
-        self,
-        loop: NudgeLoop,
-        *,
-        stopped_at: float,
-    ) -> None:
-        """Bound an accepted terminal claim until completion or evidence expiry."""
-        state = loop.monitor
-        if state is None:
-            return
-        accepted = (
-            self._accepted_monitor_turns.get(loop.id) == state.last_wake_fingerprint
-            and state.wake_delivery is not MonitorDispatchResult.BUSY
-        )
-        if not accepted:
-            self._accepted_monitor_turns.pop(loop.id, None)
-            state.wake_in_flight = False
-            state.wake_delivery = None
-            state.completion_evidence_deadline = 0.0
-            self._set_monitor_deadline(loop, 0.0)
-            return
-        deadline = state.completion_evidence_deadline
-        if deadline <= stopped_at:
-            deadline = stopped_at + MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS
-            state.completion_evidence_deadline = deadline
-        self._set_monitor_deadline(loop, deadline)
-
-    def _waits_for_terminal_completion(self, loop: NudgeLoop) -> bool:
-        """Whether a terminal row still owns a finite accepted-turn correlation."""
-        state = loop.monitor
-        return bool(
-            state is not None
-            and state.outcome
-            in {
-                MonitorOutcome.BUDGET,
-                MonitorOutcome.SESSION_CLOSE,
-                MonitorOutcome.USER_STOP,
-            }
-            and state.wake_in_flight
-            and state.completion_evidence_deadline > 0
-        )
-
-    def _sync_terminal_completion_timer(self, loop: NudgeLoop) -> None:
-        """Keep only the timer needed to expire an accepted terminal claim."""
-        if self._waits_for_terminal_completion(loop):
-            if loop.id in self._firing:
-                self._rearm_pending.add(loop.id)
-            else:
-                self._arm_from_deadline(loop)
-            return
-        self._cancel_timer(loop.id)
-
-    async def _write_monitor_snapshot_locked(self, payload: dict | None = None) -> None:
         """Persist a monitor transition without releasing ``_lock`` mid-write."""
         if payload is None:
             payload = self._serialize_state()
-        future = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+        future = self._start_persistence(payload, admission=admission)
         cancelled = False
         while not future.done():
             try:
@@ -4235,199 +1177,6 @@ class AutoNudgeService:
             # Propagate cancellation only after the executor result has been
             # observed while the caller still owns the lock.
             raise asyncio.CancelledError
-
-    async def record_monitor_dispatch_failure(
-        self,
-        monitor_id: str,
-        fingerprint: str,
-        *,
-        now: float | None = None,
-    ) -> None:
-        """Retire an acknowledged wake when its session cannot accept it."""
-        async with self._lock:
-            if self._accepted_monitor_turns.get(monitor_id) == fingerprint:
-                self._accepted_monitor_turns.pop(monitor_id, None)
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or state.outcome is not None
-                or not state.wake_in_flight
-                or state.last_wake_fingerprint != fingerprint
-            ):
-                return
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            staged_state.wake_in_flight = False
-            staged_state.completion_evidence_deadline = 0.0
-            staged_state.wake_delivery = MonitorDispatchResult.UNAVAILABLE
-            staged.active = False
-            staged_state.outcome = MonitorOutcome.TARGET_UNAVAILABLE
-            staged_state.stopped_reason = MONITOR_STOP_SESSION_UNAVAILABLE
-            staged_state.stopped_at = time.time() if now is None else now
-            self._set_monitor_deadline(staged, 0.0)
-            await self._persist_staged_monitor_locked(loop, staged)
-            self._cancel_timer(loop.id)
-        self._emit("updated", loop)
-
-    async def monitor_dispatch_is_authorized(
-        self,
-        monitor_id: str,
-        fingerprint: str,
-    ) -> bool:
-        """Revalidate a persisted claim immediately before transport handoff."""
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            return bool(
-                loop is not None
-                and state is not None
-                and loop.active
-                and state.outcome is None
-                and state.wake_in_flight
-                and state.last_wake_fingerprint == fingerprint
-                and state.wake_delivery is not MonitorDispatchResult.DISPATCHED
-            )
-
-    def mark_monitor_turn_accepted(self, monitor_id: str, fingerprint: str) -> None:
-        """Remember a claimed wake that crossed a channel's provider boundary."""
-        loop = self._loops.get(monitor_id)
-        state = loop.monitor if loop is not None else None
-        if (
-            loop is not None
-            and state is not None
-            and loop.active
-            and state.outcome is None
-            and state.wake_in_flight
-            and state.last_wake_fingerprint == fingerprint
-        ):
-            self._accepted_monitor_turns[monitor_id] = fingerprint
-
-    async def record_monitor_dispatch_busy(
-        self,
-        monitor_id: str,
-        fingerprint: str,
-        *,
-        now: float,
-    ) -> None:
-        """Retry one claimed wake after ordinary session concurrency clears."""
-        async with self._lock:
-            if self._accepted_monitor_turns.get(monitor_id) == fingerprint:
-                self._accepted_monitor_turns.pop(monitor_id, None)
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or not loop.active
-                or not state.wake_in_flight
-                or state.last_wake_fingerprint != fingerprint
-            ):
-                return
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            reason = monitor_budget_reason(staged_state, now=now)
-            if reason:
-                self._apply_monitor_budget_stop(staged, reason, stopped_at=now)
-            else:
-                staged_state.wake_delivery = MonitorDispatchResult.BUSY
-                staged_state.completion_evidence_deadline = 0.0
-                self._set_monitor_deadline(
-                    staged,
-                    now + min(MONITOR_BUSY_RETRY_SECS, staged_state.cadence_secs),
-                )
-            await self._persist_staged_monitor_locked(loop, staged)
-            if not loop.active:
-                self._sync_terminal_completion_timer(loop)
-            if loop.active:
-                if loop.id in self._firing:
-                    self._rearm_pending.add(loop.id)
-                else:
-                    self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-
-    async def record_monitor_dispatched(
-        self,
-        monitor_id: str,
-        fingerprint: str,
-        *,
-        now: float,
-    ) -> None:
-        """Persist the finite window for authoritative completion evidence."""
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or not loop.active
-                or not state.wake_in_flight
-                or state.last_wake_fingerprint != fingerprint
-            ):
-                return
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            deadline = now + MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS
-            if staged_state.wake_delivery is not MonitorDispatchResult.DISPATCHED:
-                staged_state.wake_count += 1
-            staged_state.wake_delivery = MonitorDispatchResult.DISPATCHED
-            staged_state.completion_evidence_deadline = deadline
-            self._set_monitor_deadline(staged, deadline)
-            await self._persist_staged_monitor_locked(loop, staged)
-            if loop.id in self._firing:
-                self._rearm_pending.add(loop.id)
-            else:
-                self._arm_from_deadline(loop)
-        self._emit("updated", loop)
-
-    async def record_monitor_completion_evidence_unavailable(
-        self,
-        monitor_id: str,
-        fingerprint: str,
-        *,
-        now: float,
-    ) -> None:
-        """Fail closed when an accepted wake never reports raw completion."""
-        async with self._lock:
-            loop = self._loops.get(monitor_id)
-            state = loop.monitor if loop is not None else None
-            if (
-                loop is None
-                or state is None
-                or not state.wake_in_flight
-                or state.last_wake_fingerprint != fingerprint
-                or state.completion_evidence_deadline <= 0
-                or now < state.completion_evidence_deadline
-            ):
-                return
-            terminal = state.outcome is not None
-            if terminal and state.outcome not in {
-                MonitorOutcome.BUDGET,
-                MonitorOutcome.SESSION_CLOSE,
-                MonitorOutcome.USER_STOP,
-            }:
-                return
-            if self._accepted_monitor_turns.get(monitor_id) == fingerprint:
-                self._accepted_monitor_turns.pop(monitor_id, None)
-            staged = deepcopy(loop)
-            staged_state = staged.monitor
-            assert staged_state is not None
-            staged_state.wake_in_flight = False
-            staged_state.wake_delivery = None
-            staged_state.completion_evidence_deadline = 0.0
-            if not terminal:
-                staged.active = False
-                staged_state.outcome = MonitorOutcome.BLOCKED
-                staged_state.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
-                staged_state.stopped_at = now
-            self._set_monitor_deadline(staged, 0.0)
-            await self._persist_staged_monitor_locked(loop, staged)
-            self._cancel_timer(loop.id)
-        self._emit("updated", loop)
 
     def _find_by_slot(self, slot_key: str) -> NudgeLoop | None:
         """The loop bound to *slot_key*, which may be a binding key OR a tab name.
@@ -4456,280 +1205,6 @@ class AutoNudgeService:
                 return lp
         return None
 
-    # ── Reactive arming ──
-
-    def notify_approval_stalled(self, slot_key: str) -> None:
-        """Record that a tool approval in *slot_key* went unanswered.
-
-        Called from the approval path when a prompt times out with no decision.
-        That is the only evidence available that an unattended loop can no longer
-        act, and it is evidence rather than inference: an auto-approved tool
-        never reaches the interactive wait, so this is unreachable for a loop
-        whose cycles only touch read-only tools.
-
-        Records the fact and returns. The STOP is left to ``_timer``, which
-        already owns every terminal decision and evaluates them serialized before
-        a fire — stopping from here would mean cancelling a timer that may be
-        mid-fire (the one thing the fire-window contracts forbid, since it kills
-        the in-flight turn) and racing the very turn that produced the evidence.
-        Deferring costs the cycle already in flight and saves every later one.
-
-        The evidence is slot-level, not cycle-level: an unanswered prompt in an
-        attended tab counts too. That is the conservative direction — the loop
-        deactivates inspectable and restartable with a notice naming the remedy,
-        and a person who was merely away resumes it — whereas the alternative
-        needs a reliable "is this turn a nudge cycle?" test, which the fire
-        window does not provide for dashboard slots (their turn outlives it).
-        """
-        loop = self._find_by_slot(slot_key)
-        if not loop or not loop.active or loop.approval_stalled:
-            return
-        loop.approval_stalled = True
-        logger.warning(
-            "AutoNudge: a tool approval went unanswered in loop %s's session — "
-            "it will stop instead of firing another cycle",
-            loop.id,
-        )
-        self._persist_soon()
-
-    def notify_cycle_start_failed(self, slot_key: str) -> None:
-        """Record that a turn in *slot_key* never obtained a model session.
-
-        Called from the chat runner's terminal-error path when the failure is
-        tagged ``session_start_failed`` and the turn was this loop's own cycle.
-        Evidence, not inference: the turn was dispatched, spent its budget and
-        produced nothing, which is the one thing that distinguishes a starved
-        cycle from a quiet one.
-
-        Records and returns. Like ``notify_approval_stalled``, the decision is
-        left to ``_timer``, which owns every terminal and scheduling decision and
-        evaluates them serialized before a fire -- deciding here would mean
-        touching a timer that may be mid-fire.
-        """
-        loop = self._find_by_slot(slot_key)
-        if not loop or not loop.active:
-            return
-        loop.consecutive_start_failures += 1
-        logger.warning(
-            "AutoNudge: loop %s's cycle never got a model session "
-            "(%d consecutive); it will back off at %d and stand down at %d",
-            loop.id,
-            loop.consecutive_start_failures,
-            _START_FAILURE_BACKOFF_AFTER,
-            _START_FAILURE_STANDDOWN_AFTER,
-        )
-        self._persist_soon()
-
-    def notify_cycle_landed(self, slot_key: str) -> None:
-        """Clear *slot_key*'s start-failure streak: a turn on it completed.
-
-        Any landed turn counts, a human's as much as a cycle's -- the streak is a
-        reading of whether this session can start at all, and a turn that reached
-        completion proves it can. That is the conservative direction: it can only
-        let a loop keep running, never stop one.
-        """
-        loop = self._find_by_slot(slot_key)
-        if not loop or not loop.consecutive_start_failures:
-            return
-        loop.consecutive_start_failures = 0
-        # Drop the paid-deferral marker with the streak it belonged to: a streak
-        # that climbs back to the same value must pay its own deferral again.
-        self._start_failure_deferred.pop(loop.id, None)
-        self._persist_soon()
-
-    def notify_turn_complete(self, slot_key: str) -> None:
-        """Called by gateway after HOOK_EVENT_STOP — resume the countdown for this slot.
-
-        Re-arms toward the loop's persistent deadline (``_arm_from_deadline``),
-        NOT with a fresh full interval: after a user turn the timer picks up
-        the remaining time (or fires shortly after, if the deadline passed
-        mid-turn), while the first turn-complete after a delivered fire — the
-        nudge turn's own end — finds the deadline cleared and starts the next
-        full cycle. DEFERS while the loop's own timer task is mid-fire:
-        ``_arm_timer`` cancels the existing task, and during the fire window
-        that task may be parked on ``_persist_locked()`` writing the delivered
-        cycle. Cancelling it there loses the ``cycle_count`` bump and lets the
-        loop run extra cycles after a restart. The deferred re-arm is applied
-        when the window closes.
-        """
-        loop = self._find_by_slot(slot_key)
-        if not loop or not loop.active:
-            return
-        if loop.id in self._firing:
-            self._rearm_pending.add(loop.id)
-            return
-        self._arm_from_deadline(loop)
-
-    def notify_user_input(self, slot_key: str) -> None:
-        """Called when user sends a message — cancel the pending nudge task.
-
-        Cancelling the TASK defers delivery until the user's turn ends (a
-        nudge must never race a human turn); the loop's ``next_due_ts`` is
-        untouched, so the schedule itself survives — ``notify_turn_complete``
-        resumes the same countdown rather than restarting the full interval.
-
-        While the loop is mid-fire this must NOT cancel the timer: that task may
-        be parked on ``_persist_locked()`` writing the delivered cycle, and
-        cancelling it there abandons an in-flight executor write whose stale
-        payload can later overwrite a newer update/delete (state resurrected
-        after a restart). User priority is still honoured — the deferred re-arm
-        is dropped, so no further nudge is scheduled from this cycle.
-        """
-        loop = self._find_by_slot(slot_key)
-        if not loop:
-            return
-        # A user turn starting is proof the slot is alive: restart the
-        # reconciler's two-pass clock so the stranded-loop backstop never
-        # re-arms a timer this hook is about to cancel on purpose. If this
-        # turn then dies without its stop hook, candidacy simply rebuilds
-        # over the next two passes and the rescue still happens.
-        self._reconcile_candidates.discard(loop.id)
-        if loop.id in self._firing:
-            self._rearm_pending.discard(loop.id)
-            logger.info(
-                "AutoNudge: user input during loop %s's fire window — dropped the "
-                "deferred re-arm instead of cancelling mid-persist",
-                loop.id,
-            )
-            return
-        self._cancel_timer(loop.id)
-
-    def _cancel_timer(self, loop_id: str, *, drop_claims: bool = True) -> None:
-        """Retire one loop's timer task. The single cancellation policy.
-
-        Two conditions make a cancel wrong rather than merely redundant, and both are
-        stated here so no caller has to remember either:
-
-        * **The currently running timer task** (a self-re-arm from inside ``_timer``) is
-          about to return on its own, and cancelling it would inject a spurious
-          ``CancelledError`` into the finishing task.
-        * **A task whose event loop has already closed.** ``Task.cancel`` schedules the
-          cancellation through ``loop.call_soon``, which raises ``RuntimeError: Event loop
-          is closed`` — so this raises out of ``remove``/``remove_sync`` and the dashboard
-          handler above it answers 500. The service is a process-global singleton, so its
-          ``_timers`` outlive the loop that created them whenever one loop is replaced by
-          another: the gateway's own shutdown, and every test that drives a handler after
-          an earlier test's loop closed. Asked positively (``get_loop().is_closed()``)
-          rather than by catching the ``RuntimeError``, because a closed loop is the one
-          state where cancelling is a NO-OP by definition — the task can never run again —
-          and catching would also swallow a genuine scheduling fault.
-
-        The closed-loop question is asked FIRST because it needs no running loop of its
-        own, and ``stop()`` reaches here from synchronous callers (gateway shutdown, test
-        teardown) where ``asyncio.current_task()`` would raise instead of answering — hence
-        :func:`_current_task_or_none`.
-        """
-        t = self._timers.pop(loop_id, None)
-        if t is None or t.done():
-            return
-        # Closed-loop check FIRST: it needs no running loop of its own, so a dead timer is
-        # retired even from a synchronous caller.
-        if t.get_loop().is_closed():
-            logger.debug(
-                "AutoNudge: dropped loop %s's timer without cancelling — its event loop "
-                "has closed, so the task can no longer run",
-                loop_id,
-            )
-            return
-        if t is _current_task_or_none():
-            return
-        t.cancel()
-        if not drop_claims:
-            # Replacing a timer is not cancelling a cycle. ``_arm_timer`` cancels before
-            # it creates, so every ordinary re-arm came through here -- including the
-            # backoff re-arm on the refused-fire path, which erased the claim that same
-            # path had re-owed one statement earlier. The accounting fix was defeated by
-            # the cleanup meant to protect it.
-            return
-        # A cancelled CYCLE drops its claim. Without this the id stays in the claim set
-        # and the loop's next delivered fire -- a fallback, a floor tick -- inherits it
-        # and is charged as a wake as well, counting one delivered turn under two
-        # counters. That trade is deliberate: an undelivered observation is lost rather
-        # than attributed to a turn that did not carry it.
-        self._pending_monitor_wake.discard(loop_id)
-        self._pending_floor_tick.discard(loop_id)
-
-    def _arm_timer(self, loop: NudgeLoop, delay: float | None = None) -> None:
-        self._cancel_timer(loop.id, drop_claims=False)
-        self._timers[loop.id] = asyncio.create_task(self._timer(loop, delay))
-
-    async def _deactivate_unwired_monitor(self, loop_id: str) -> None:
-        """Retain but disarm a structured record when no controller is wired."""
-        async with self._lock:
-            loop = self._loops.get(loop_id)
-            if loop is None or loop.monitor is None:
-                return
-            staged = deepcopy(loop)
-            staged.active = False
-            assert staged.monitor is not None
-            staged.monitor.wake_in_flight = False
-            staged.monitor.wake_delivery = None
-            staged.monitor.completion_evidence_deadline = 0.0
-            staged.monitor.outcome = MonitorOutcome.BLOCKED
-            staged.monitor.stopped_reason = MONITOR_STOP_SESSION_UNAVAILABLE
-            staged.monitor.stopped_at = time.time()
-            self._set_monitor_deadline(staged, 0.0)
-            await self._persist_staged_monitor_locked(loop, staged)
-            self._cancel_timer(loop.id)
-        self._emit("updated", loop)
-
-    def _arm_from_deadline(self, loop: NudgeLoop) -> None:
-        """(Re)arm the timer toward the loop's persistent deadline.
-
-        The countdown anchors on ``next_due_ts`` instead of restarting at the
-        full interval on every arm, so user turns in the bound session defer a
-        pending fire without pushing the schedule back. An unset deadline (0 —
-        a just-delivered fire, a legacy store entry) starts a fresh full
-        countdown from now, and the assignment is persisted through a
-        supervised background write so a restart resumes this countdown
-        rather than restarting the interval. A deadline still in the future
-        resumes with exactly the remaining time; only one already in the past
-        fires after a short beat (``_OVERDUE_REARM_SECS``) rather than
-        instantly, so a user mid-conversation keeps deferring it simply by
-        sending another message. The delay is capped at ``idle_secs`` so a
-        clock jump can never park the timer beyond one full interval.
-
-        A monitor loop arms through this same path and on the same deadline. Its
-        cadence is the interval the user already set, not a second clock on the
-        monitor record: two clocks for one countdown would have to be kept
-        agreed, and the one the user can see is the one they set. What differs
-        for a monitor is not WHEN the timer wakes but what the wake costs -- the
-        probe gate in :meth:`_timer` decides whether that tick spends a turn.
-
-        ONE monitor is refused a timer outright: a record whose ``version`` this
-        gateway does not implement. Such a record belongs to a newer gateway
-        (a downgrade or a rollback read its store), and this controller cannot
-        interpret its policy -- so arming it would run the loop under a policy
-        nobody here understands, which for the pre-gate code path means
-        injecting the raw message every interval with no decision at all. The
-        refusal is deliberately made HERE, on the arm, rather than by rewriting
-        the record: the stored ``active`` intent belongs to the gateway that
-        wrote it and must survive the downgrade so an upgrade resumes the watch.
-        Inertness is the local consequence, not a change of intent.
-        """
-        monitor = loop.monitor
-        if monitor is not None and monitor.version != MONITOR_STATE_VERSION:
-            logger.info(
-                "AutoNudge: not arming loop %s -- its monitor record is version %s and "
-                "this gateway implements %s",
-                loop.id,
-                monitor.version,
-                MONITOR_STATE_VERSION,
-            )
-            return
-        now = time.time()
-        if loop.next_due_ts <= 0:
-            loop.next_due_ts = now + loop.idle_secs
-            if loop.monitor is not None:
-                loop.monitor.next_probe_at = loop.next_due_ts
-            self._persist_soon()
-        remaining = loop.next_due_ts - now
-        if remaining <= 0:
-            delay = float(_OVERDUE_REARM_SECS)
-        else:
-            delay = min(remaining, float(loop.idle_secs))
-        self._arm_timer(loop, delay=delay)
-
     def _persist_soon(self) -> None:
         """Schedule a supervised background persist of loop state.
 
@@ -4738,9 +1213,25 @@ class AutoNudgeService:
         supervised — strong ref in ``_inflight_adds`` plus failure logging —
         so the assignment reaches the store and a restart resumes the
         countdown. A lost write degrades to a fresh full countdown after
-        restart, never a premature or dropped fire.
+        restart, never a premature or dropped fire. A live caller without an
+        inherited lease captures one single-write admission before the task is
+        created, so closure cannot overtake queued lifecycle persistence. After
+        shutdown closes admission the persist is skipped unless the caller is an
+        admitted timer callback, whose lease the detached write inherits
+        explicitly. A task created inside an admitted transaction clears only
+        that transaction's
+        submission token, so its write cannot count as the child's own.
         """
-        task = asyncio.create_task(self._persist_locked())
+        admission = self._effective_admission(None)
+        if admission is None:
+            if not self._accepting_mutations:
+                return
+            admission = self._admit_mutation()
+        submissions_token = self._admitted_transaction_submissions.set(None)
+        try:
+            task = asyncio.create_task(self._persist_locked(admission=admission))
+        finally:
+            self._admitted_transaction_submissions.reset(submissions_token)
         self._inflight_adds.add(task)
 
         def _finish(t: "asyncio.Task[None]") -> None:
@@ -4750,1371 +1241,208 @@ class AutoNudgeService:
 
         task.add_done_callback(_finish)
 
-    async def _reconcile_forever(self) -> None:
-        """Periodically rescue any active loop left with no live timer.
+    def _worker_running(self, session_key: str) -> bool:
+        """Whether *session_key*'s slot has a turn in flight.
 
-        A dashboard-bound loop has exactly one re-arm path after a delivered
-        fire: ``notify_turn_complete``, called by the gateway after the slot's
-        stop hook. If that hook never arrives -- the nudge turn errors, times
-        out or is cancelled on a path that skips it, or the deferred re-arm was
-        dropped by ``notify_user_input`` during the fire window -- the loop is
-        left persisted ``active=true`` with a finished (or missing) timer task
-        and nothing on a timer ever revives it. The only rescues used to be a
-        gateway restart or a genuine turn completing in that exact slot. This
-        task is the general backstop: it re-arms toward the loop's own
-        persisted deadline, so a rescue never fires earlier than the schedule
-        the user set (``_arm_from_deadline`` self-heals a cleared deadline into
-        a fresh full countdown).
-
-        The wait is scheduled through ``loop.call_later`` rather than
-        ``asyncio.sleep`` on purpose: this file's own test suite (and any
-        similar consumer) routinely patches module-level ``asyncio.sleep`` to
-        a no-op to fast-forward the per-loop timers, and under that patch a
-        sleep-based periodic task degrades into a busy loop that re-arms and
-        re-fires everything continuously. A watchdog's cadence must stay on
-        the wall clock regardless of how the timers it watches are driven.
+        False when no resolver was injected, which is the direction that cannot
+        lose a signal: the work-ledger probe uses this for the "not running" half
+        of the staleness conjunction, so an unknown liveness produces a stall wake
+        the conductor may not have needed (one turn) rather than silence about a
+        worker that stopped without reporting (the task). A resolver that raises is
+        treated the same way -- a slot-table read must not kill a tick.
         """
-        ev_loop = asyncio.get_running_loop()
-        while True:
-            beat: asyncio.Future[None] = ev_loop.create_future()
-            handle = ev_loop.call_later(_RECONCILE_INTERVAL_SECS, _resolve_beat, beat)
-            try:
-                await beat
-            finally:
-                handle.cancel()
-            if shutdown_event.is_set():
-                return
-            try:
-                self._reconcile_once()
-            except Exception:  # noqa: BLE001 - one bad pass must not kill the backstop
-                logger.exception("AutoNudge: reconciler pass failed")
+        resolver = self._worker_running_resolver
+        if resolver is None or not session_key:
+            return False
+        try:
+            return bool(resolver(session_key))
+        except Exception:  # pragma: no cover - a liveness read must not fail a tick
+            logger.debug("AutoNudge: worker liveness read failed for %s", session_key)
+            return False
 
-    def _reconcile_once(self) -> None:
-        """One reconciler pass: rescue active loops stranded with no live timer.
+    def _worker_looping(self, session_key: str) -> bool:
+        """Whether *session_key*'s own session holds an active loop that will wake it.
 
-        "No live timer" means the ``_timers`` entry is absent OR its task has
-        finished. The finished-task form matters: nothing pops a timer task
-        from ``_timers`` when it completes normally, so the stranded states
-        this backstop exists for (a delivered fire whose stop hook never came,
-        a timer task killed by an exception) leave a DONE task behind rather
-        than an empty slot -- a membership test alone would miss every one of
-        them. The absent form covers a loop whose pending timer was cancelled
-        by ``notify_user_input`` and whose ``notify_turn_complete`` then never
-        arrived because the slot's turn died on a hook-skipping path.
-
-        A loop is re-armed only after TWO CONSECUTIVE passes observe it
-        eligible-and-unarmed, because one observation cannot tell "stranded"
-        apart from two live states that look identical for a while:
-
-        * A slot whose user turn is still running. ``notify_user_input``
-          cancelled the timer on purpose, and ``notify_turn_complete`` will
-          re-arm when the turn ends. The turn-start hook also clears this
-          loop's candidacy (see ``notify_user_input``), so a session showing
-          any sign of life defers its rescue by a full two intervals. A turn
-          that outlives BOTH intervals is re-armed anyway -- one observation
-          window has to end somewhere, and the fire path's busy-slot refusal
-          (plus its backoff) keeps a rescue that guessed wrong from ever
-          delivering into the running turn; the wasted attempt is the cost of
-          rescuing the turn that died silently, which looks identical from
-          here.
-        * A loop inside another coroutine's mutation window. ``update()``
-          mutates fields, awaits an offloaded store write, and ROLLS BACK the
-          fields if the write fails -- a single-pass reconciler could arm the
-          transiently-active shape and leave a rolled-back inactive loop with
-          a live timer. Two passes shrink that window, but the write has no
-          timeout, so the guard that CLOSES it is the lock check below: every
-          mutation runs inside ``self._lock``, this pass is synchronous, and
-          a pass that finds the lock held defers entirely.
-
-        Deliberately never touched, whatever the passes observe:
-
-        * A loop mid-fire (``_firing``): its running task must never be
-          cancelled (see ``update``), and ``_arm_timer`` cancels before it
-          creates. The fire window owns its own re-arm bookkeeping.
-        * A loop quiesced by administrative cleanup: cleanup owns it.
-        * A monitor record whose version this gateway does not implement:
-          ``_arm_from_deadline`` refuses those with an INFO line, and letting
-          the reconciler retry it would repeat that line every pass forever.
-        * A monitor whose wake claim is in flight with NO completion-evidence
-          deadline -- EXCEPT a ``BUSY`` retry. The no-deadline shape is a
-          claim that died mid-handoff: ``_load`` retires it on restart, and
-          arming it here would wake a controller that answers ``NO_CHANGE``
-          forever (the probe path is never reached, so no budget or cap can
-          end it) -- an unretirable zombie dressed as a rescue. A ``BUSY``
-          delivery is the one no-deadline shape that is legitimately LIVE:
-          it proves no action turn started, and ``_load`` resumes it at its
-          persisted retry deadline, so this pass must too. A claim WITH a
-          deadline is safe: its ``next_due_ts`` is that deadline, and the
-          armed tick either finds evidence or retires the claim through
-          ``record_monitor_completion_evidence_unavailable``.
+        Answered from this service's own loop table, so no resolver is injected: the
+        logic is ``ledger_wake.worker_looping``, which the dashboard's ``stale`` flag
+        reads too, and an unreadable answer is False -- the direction that cannot
+        suppress a stall wake.
         """
-        if self._lock.locked():
-            # A mutation or persist is mid-flight. ``update()`` mutates loop
-            # fields, awaits an offloaded store write, and ROLLS BACK the
-            # fields if the write fails -- all inside ``self._lock`` -- and
-            # that write has no timeout, so a wedged disk can hold the
-            # transient shape across ANY number of passes; observation counts
-            # alone cannot bound it. This pass is synchronous, so deferring
-            # whenever the lock is held at entry makes overlap with a locked
-            # mutation window impossible rather than merely unlikely.
-            # Candidacies are left untouched: the deferred pass neither
-            # confirms nor refutes them, and dropping them would push every
-            # rescue behind a busy store's persist cadence.
-            return
-        eligible: set[str] = set()
-        for loop in list(self._loops.values()):
-            # Mirror _timer's own re-arm guard, not a stricter one: an
-            # INACTIVE loop still waiting for terminal-completion evidence
-            # owns a finite accepted-turn correlation whose expiry needs a
-            # timer (_waits_for_terminal_completion), and losing that timer
-            # to a user-input cancel with no turn-complete re-arm (the hook
-            # ignores inactive loops) would otherwise strand the claim and
-            # refuse every replacement watch on the slot forever.
-            if not loop.active and not self._waits_for_terminal_completion(loop):
-                continue
-            if loop.id in self._firing or loop.id in self._maintenance_quiescing:
-                continue
-            monitor = loop.monitor
-            if monitor is not None and monitor.version != MONITOR_STATE_VERSION:
-                continue
-            if (
-                monitor is not None
-                and monitor.wake_in_flight
-                and monitor.completion_evidence_deadline <= 0
-                and monitor.wake_delivery is not MonitorDispatchResult.BUSY
-            ):
-                # A BUSY retry is EXEMPT from this skip: it proves no action
-                # turn started, its evidence deadline is intentionally empty,
-                # and _load resumes exactly this shape at its persisted retry
-                # deadline on restart -- so retiring it here would kill a
-                # retry the store's own recovery logic considers live.
-                continue
-            timer = self._timers.get(loop.id)
-            if timer is not None and not timer.done():
-                continue
-            if loop.id not in self._reconcile_candidates:
-                eligible.add(loop.id)
-                continue
-            logger.info(
-                "AutoNudge: reconciler re-arming stranded loop %s on slot %s "
-                "(active with no live timer across two passes)",
-                loop.id,
-                loop.slot_key,
-            )
-            self._arm_from_deadline(loop)
-        self._reconcile_candidates = eligible
+        from kiro_crew import ledger_wake
 
-    async def _monitor_tick_is_quiet(self, loop: NudgeLoop) -> bool:
-        """Observe this loop's subject cheaply; say whether to skip the turn.
+        return ledger_wake.worker_looping(self, session_key)
 
-        Returns True only when the tick is DEFINITELY not worth a model turn.
-        Every other case -- no monitor, no probe for that subject kind, an
-        un-inferable target, a probe defect, a kernel that reached no verdict --
-        returns False so the caller fires exactly as it does today.
+    def _observes_work_ledger(self, loop: NudgeLoop) -> bool:
+        """Whether *loop*'s monitor is a work-ledger watch THIS gateway may arm.
 
-        The asymmetry is the whole safety argument. A wrongly-QUIET tick is
-        silence: the loop stops waking and the work it was watching stalls with
-        nothing on screen to say why. A wrongly-spent tick costs one turn, which
-        is what every tick costs today. So every uncertain path resolves toward
-        spending, and only a positive "nothing happened" from the kernel skips.
+        A predicate rather than an inline comparison because the answer decides a
+        STARTUP behaviour (resume now, not at the deadline) and the reason is specific to
+        this kind: its news arrives by an in-process push that a restart loses, where
+        every other kind's arrives by the probe's own poll.
 
-        The kernel call is offloaded to a thread because observing runs ``gh``
-        as a subprocess with a 25s timeout. On the event loop that would freeze
-        chat, the channel transports and the liveness probes for as long as one
-        slow GitHub call takes.
+        The VERSION is part of the question, not a separate guard, and leaving it out was
+        a reachable hole rather than a theoretical one. ``_arm_from_deadline`` refuses a
+        monitor record whose ``version`` this gateway does not implement, because such a
+        record belongs to a newer gateway and running the loop would deliver an unattended
+        turn under a policy nothing here can interpret. A work-ledger watch is a
+        ``gate=True`` prompt loop, so ``is_structured_monitor_loop`` is False and ``_load``
+        leaves such a row ACTIVE -- exactly the shape a zero-delay arm here would have
+        bypassed that refusal for. Answering False sends the row to
+        ``_arm_from_deadline``, which refuses it and logs why, so the refusal lives in one
+        place rather than being restated here.
+
+        The kind is compared against ``probes.WORK_LEDGER``, read off the module-level
+        ``probes`` binding this facade already re-exports.
         """
-        monitor = loop.monitor
-        if monitor is None or monitor.outcome is not None:
+        monitor = getattr(loop, "monitor", None)
+        if monitor is None:
             return False
-        if not loop.gate:
-            # An opt-out that only SOME paths honour is worse than no opt-out. This
-            # check exists because the two can now disagree: a record stored with a
-            # monitor but no ``gate`` key -- one armed while the default was True,
-            # or upgraded from an earlier build of this branch -- decodes to
-            # ``gate=False`` with its monitor intact. Reading only the monitor would
-            # poll such a loop anyway and let a terminal verdict DEACTIVATE it,
-            # which is exactly the harm the opt-out exists to prevent. The stored
-            # decision wins over the presence of the object.
+        if getattr(monitor, "version", None) != MONITOR_STATE_VERSION:
             return False
-        # A wake buys the agent one more turn, unconditionally and BEFORE any
-        # observation. The probe watches the subject, not the agent: a turn that
-        # was woken and has not pushed yet leaves the subject unchanged, so
-        # observing here would read "nothing happened" and starve work already in
-        # progress. Bounded on purpose -- one tick per wake, spent whether or not
-        # it was needed -- because the alternative designs both fail worse: an
-        # unbounded allowance driven by a completion signal disables gating
-        # entirely on any surface where that signal never arrives, and no
-        # allowance at all lets a watch go silent while holding half-finished
-        # work. Costing one turn per wake is the cheap failure.
-        if monitor.followup_ticks > 0 and not monitor.terminal_pending:
-            # NOT while a terminal turn is owed. The allowance exists to protect work
-            # already in progress, which is why it skips observation -- but a subject
-            # with terminal debt is FINISHED, so there is no in-progress work to
-            # protect, and the retry's correctness depends on it still being finished.
-            # Skipping the poll here is what let a REOPENED pull request keep its stale
-            # debt: the clearing added for that case lives after the poll, so the
-            # bypass jumped straight over it and the retried delivery settled a
-            # terminal state that no longer held. Re-observing costs one probe call on
-            # a path that is already firing a turn.
-            monitor.followup_ticks -= 1
-            self._persist_soon()
-            logger.debug("AutoNudge: loop %s spending a post-wake follow-up tick", loop.id)
-            return False
-        probe = probes.build(monitor.kind)
-        if probe is None:
-            return False
-        # Derive the probe's config from the LOOP'S OWN INSTRUCTION, then check
-        # the subject it yields against the stored monitor.
-        #
-        # Not from ``monitor.target``: that is the CANONICAL subject
-        # ("owner/name#123"), a shorthand, and a shorthand deliberately carries no
-        # host -- so re-inferring from it would discard the github.com pin that a
-        # URL-armed watch is entitled to, and on a machine configured for an
-        # enterprise server the probe would resolve the slug there. A
-        # same-numbered enterprise pull request being merged would then falsely
-        # terminate a live public watch.
-        #
-        # The instruction is the only place the original spelling survives, and
-        # storing the host a second time would put one fact in two places that can
-        # disagree. So infer from the message and REQUIRE the result to name the
-        # subject the monitor is bound to; a mismatch means the two have drifted
-        # apart, which is not something to resolve by guessing -- fire instead, the
-        # same direction every other uncertain path takes.
-        target = targets.infer(loop.message)
-        if target is None or (target.kind, target.subject) != (monitor.kind, monitor.target):
-            if target is not None:
-                logger.info(
-                    "AutoNudge: loop %s instruction names %s but its monitor is bound to "
-                    "%s -- firing instead of observing",
-                    loop.id,
-                    target.subject,
-                    monitor.target,
-                )
-            return False
-        # Captured BEFORE the poll, which awaits: this is what the verdict is
-        # about, and it is checked again afterwards. The derived CONFIG is part of
-        # it, not just the subject: the stored target is a shorthand, so an
-        # instruction edited from an enterprise shorthand to the same public URL
-        # leaves kind and target identical while changing which SERVER is being
-        # observed. Comparing only the subject would let a verdict about one host
-        # settle a watch that now means the other.
-        binding = (monitor.kind, monitor.target, target.message)
-        # The dedupe memory is keyed on this identity, so it must move when the
-        # subject's host does -- otherwise a retargeted watch inherits
-        # observations made against a different server and suppresses the first
-        # real signal from the new one. Only this driver's identity changes; the
-        # cron path keeps the one its persisted state was written under.
-        identity = f"{loop.id}:{target.host_key}"
-        if monitor.poll_in_flight:
-            # A previous poll was interrupted after the kernel may already have
-            # committed "reported" for what it saw. That observation reached
-            # nobody, and re-observing now would read the same state as unchanged,
-            # so this tick must not trust a quiet verdict -- it fires. The flag is
-            # cleared first so the doubt is consumed once rather than latching.
-            monitor.poll_in_flight = False
-            monitor.gate_fallbacks += 1
-            self._persist_soon()
-            logger.info(
-                "AutoNudge: loop %s had a poll interrupted -- firing rather than "
-                "trusting a fresh observation of the same state",
-                loop.id,
-            )
-            return False
-        # Durable BEFORE the probe runs, because the case it protects against is
-        # this coroutine never resuming. ``_persist_soon`` would not do: a
-        # scheduled write does not survive the shutdown that causes the problem.
-        monitor.poll_in_flight = True
-        try:
-            # ``_write_monitor_snapshot_locked`` under ``_lock``, NOT
-            # ``_persist_locked``: that one releases ``_lock`` if the awaiting task
-            # is cancelled while the executor write is still in flight, so a
-            # pause or retarget landing here could have this stale snapshot
-            # overwrite the newer state it just wrote. The settlements already use
-            # the non-releasing writer; these marker writes were left behind.
-            async with self._lock:
-                await self._write_monitor_snapshot_locked()
-        except Exception:
-            # Could not record the doubt, so do not incur it: fire this tick
-            # rather than run a probe whose interruption would be invisible.
-            monitor.poll_in_flight = False
-            logger.warning(
-                "AutoNudge: could not record the in-flight marker for loop %s -- "
-                "firing instead of polling",
-                loop.id,
-                exc_info=True,
-            )
-            return False
-        try:
-            verdict = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: irq.poll(identity, target.message, probe)
-            )
-        except Exception:
-            monitor.poll_in_flight = False
-            logger.warning(
-                "AutoNudge: probe gate raised for loop %s — firing as usual",
-                loop.id,
-                exc_info=True,
-            )
-            return False
-        if verdict.outcome is not irq.Outcome.WAKE:
-            # The doubt is discharged when the thing it protects has happened -- and
-            # for a WAKE that is DELIVERY, not the poll returning. The kernel has
-            # already committed "reported" for what it saw, so if this process dies
-            # between here and the turn landing, a fresh observation reads the same
-            # state as unchanged and the signal is gone until the streak floor. The
-            # in-process refusal is covered by ``followup_ticks``; a DEATH is covered
-            # only by this marker outliving the fire, so a wake keeps it set and the
-            # fire cycle clears it where the wake claim is consumed.
-            #
-            # The asymmetry is deliberate: the SET must be durable because it guards
-            # against a death, while a CLEAR may ride the debounced write -- losing a
-            # clear costs one unnecessary fire, the direction this design resolves
-            # toward anyway.
-            monitor.poll_in_flight = False
+        return str(getattr(monitor, "kind", "")) == probes.WORK_LEDGER
 
-        # The poll above is a real await -- it runs ``gh`` in a thread for up to
-        # 25 seconds -- so the loop can be RETARGETED while it is in flight:
-        # ``update(message=...)`` rebinds the monitor to a different pull request,
-        # or clears it. Acting on this verdict now would apply an observation of
-        # the OLD subject to the new one, and the terminal branch would deactivate
-        # a watch that had just been pointed at a live pull request. Compare the
-        # binding, not the object: a retarget mutates the same MonitorState.
-        fresh = targets.infer(loop.message)
-        current_binding = (
-            (monitor.kind, monitor.target, fresh.message) if fresh is not None else None
-        )
-        if loop.monitor is not monitor or current_binding != binding:
-            # The verdict is thrown away, so no wake is owed and the doubt has
-            # nothing left to protect. Clear it, or the next tick would fire a
-            # second time on a discharged suspicion and count a phantom fallback.
-            monitor.poll_in_flight = False
-            logger.info(
-                "AutoNudge: loop %s was retargeted while its probe was in flight -- "
-                "discarding the stale verdict and firing as usual",
-                loop.id,
-            )
-            return False
+    def _worker_closed(self, session_key: str) -> bool:
+        """Whether *session_key*'s slot is gone.
 
-        if verdict.outcome is irq.Outcome.TERMINAL:
-            # The subject is finished (a merged or closed pull request). Stop the
-            # loop rather than firing: there is nothing left to service, and one
-            # more turn would only rediscover that. ``expired`` is the existing
-            # channel for "this loop stopped rather than the agent finishing",
-            # and the emitted payload carries ``stopped_reason``, which is what
-            # distinguishes a merged subject from a spent bound.
-            #
-            # Deliberately NOT counted as a wake: no turn is delivered here. A
-            # terminal observation that incremented ``wakes`` would report a turn
-            # that never ran, in the very counters this change exists to make
-            # trustworthy.
-            # Record the finish ON THE MONITOR, not only on the loop. Without
-            # this the record reads as merely paused, and the generic resume path
-            # -- the goal popover's Save, which is allowed to revive a current
-            # unsettled monitor -- would re-arm the watch onto a subject that is
-            # already merged. It would then observe TERMINAL, deactivate, and be
-            # revivable again: a loop that cannot be told apart from a working
-            # one. Reaching the end of the thing you were watching is a SUCCESS,
-            # so the outcome says so rather than borrowing a bound's vocabulary.
-            # ONE transition, committed once. Four rounds of review landed on this
-            # hunk and each earlier shape had a gap: announcing before the write
-            # promised a finish the record did not have; announcing after it was
-            # swallowed by ``update``'s cancel reaching this very task; and doing
-            # both left TWO await points, so a write failure killed the timer with
-            # the loop still active, and a retarget landing between them let an old
-            # verdict deactivate a subject that had never been observed.
-            #
-            # So there is no ``update`` call here at all. The marks go on in memory
-            # with no await between them, one durable write commits them, and the
-            # deactivation is simply ``active = False`` -- which the re-arm guard
-            # below already honours, making the timer cancel unnecessary rather
-            # than merely deferred.
-            # Reaching the end of the thing you were watching is not automatically
-            # a success. A MERGED subject is; one CLOSED WITHOUT MERGING ended on a
-            # question -- reopen or abandon -- and recording SUCCESS there tells the
-            # user "no action needed" about the one case that needs them most. The
-            # probe distinguishes the two, so this reads its KEYS rather than its
-            # prose, which would break the first time that wording is edited. No
-            # key at all (an unusable target) is also not a success.
-            merged = "merged" in verdict.keys
-            # EVERY field this transition writes has to be in here. The loop's own
-            # ``stopped_reason`` is written alongside the monitor's, and leaving it
-            # out of the rollback left a live loop tagged as terminated -- which the
-            # fallback delivery would then persist.
-            restore = (
-                monitor.outcome,
-                monitor.stopped_reason,
-                monitor.stopped_at,
-                loop.active,
-                loop.stopped_reason,
-            )
-            logger.info(
-                "AutoNudge: loop %s subject reached a terminal state (%s)",
-                loop.id,
-                ",".join(verdict.keys) or "unattributed",
-            )
-            # SERIALIZED against ``update``. This path has no second await of its
-            # own; this closes the other side of the same race, which is
-            # ``update``'s. That method takes the MAINTENANCE lock (not ``_lock``)
-            # and awaits inside it, so a retarget could pass its precheck, yield,
-            # let this branch settle the OLD subject with ``active = False``, and
-            # then bind the NEW subject onto that inactive loop -- a fresh watch
-            # that never ticks. Holding the same lock across revalidate, mutate and
-            # persist is what makes the two mutually exclusive; ``_lock`` alone
-            # would not, because that is not the lock ``update`` contends for.
-            #
-            # Lock ORDER matches ``update``'s (maintenance, then ``_lock`` for the
-            # write) so the two cannot deadlock against each other.
-            # A CHANNEL loop is told by a delivered TURN, not by the dashboard
-            # notification -- so for one the settlement must not be committed yet.
-            # Committing it means an inactive loop, and if that final fire is
-            # refused (a busy thread, the ordinary case) nothing re-arms and the
-            # news is lost: exactly the silent ending the previous round added this
-            # delivery to prevent. So mark what is OWED, durably, and settle only
-            # once the turn has landed. No outcome is recorded in the meantime, so a
-            # restart in this window finds a plain live loop rather than one tagged
-            # as finished and refused revival.
-            if is_channel_key(loop.slot_key):
-                if not monitor.terminal_pending:
-                    monitor.terminal_pending = "success" if merged else "blocked"
-                    try:
-                        # Same writer as the settlements, for the same reason: a
-                        # cancelled ``_persist_locked`` releases ``_lock`` mid-write.
-                        async with self._lock:
-                            await self._write_monitor_snapshot_locked()
-                    except Exception:
-                        monitor.terminal_pending = ""
-                        logger.exception(
-                            "AutoNudge: could not record the owed terminal turn for %s",
-                            loop.id,
-                        )
-                return False
-            settle_lock = await self._acquire_mutation_lock(loop.id)
-            if settle_lock is None:
-                # Maintenance has claimed this loop. Not ours to settle: fire, and
-                # the next tick will observe the same terminal state.
-                return False
-            try:
-                # Re-read under the lock. The checks before it were made while a
-                # retarget could still land.
-                fresh_under_lock = targets.infer(loop.message)
-                if (
-                    loop.monitor is not monitor
-                    or loop.id not in self._loops
-                    or (
-                        (monitor.kind, monitor.target, fresh_under_lock.message)
-                        if fresh_under_lock is not None
-                        else None
-                    )
-                    != binding
-                ):
-                    logger.info(
-                        "AutoNudge: loop %s changed before its terminal settlement -- firing",
-                        loop.id,
-                    )
-                    return False
-                monitor.outcome = MonitorOutcome.SUCCESS if merged else MonitorOutcome.BLOCKED
-                monitor.stopped_reason = MONITOR_TERMINAL_REASON
-                monitor.stopped_at = time.time()
-                loop.stopped_reason = MONITOR_TERMINAL_REASON
-                loop.active = False
-                try:
-                    async with self._lock:
-                        await self._write_monitor_snapshot_locked()
-                except asyncio.CancelledError:
-                    # The writer drains its executor write before propagating
-                    # cancellation, so by HERE the settlement is already committed
-                    # -- and on restart the loop reads as settled, so nothing would
-                    # ever notify. Tell the user now, then preserve the
-                    # cancellation. Same shape as ``_apply_staged_monitor``'s.
-                    self._emit("expired", loop)
-                    raise
-                except Exception:
-                    # A failed write must not take the watch down with it. Undo the
-                    # marks and fire: the loop stays watchable, the user gets a
-                    # turn, and the next tick observes the same terminal state and
-                    # tries again. Letting this raise would kill the timer task
-                    # with the loop still active in memory and on disk -- a dead
-                    # watch that looks exactly like a calm one, which is the
-                    # failure mode this whole change exists to remove.
-                    (
-                        monitor.outcome,
-                        monitor.stopped_reason,
-                        monitor.stopped_at,
-                        loop.active,
-                        loop.stopped_reason,
-                    ) = restore
-                    logger.exception(
-                        "AutoNudge: could not persist the terminal transition for %s -- "
-                        "keeping the watch alive and firing instead",
-                        loop.id,
-                    )
-                    return False
-            finally:
-                settle_lock.release()
-            self._emit("expired", loop)
-            return True
-
-        if monitor.terminal_pending and verdict.outcome in (
-            irq.Outcome.QUIET,
-            irq.Outcome.WAKE,
-        ):
-            # The subject came BACK. A channel loop defers its settlement as a durable
-            # debt because only a delivered turn can carry the news, and that debt
-            # outlives the observation that created it -- so a closed PR that is
-            # REOPENED while the final fire is still owed would have its next
-            # delivered turn claim the stale debt and deactivate a watch whose
-            # subject is live again. Nothing else cleared it: the marker was written
-            # once and read at settlement, which is the same absence-shaped defect
-            # this review has now found twelve times.
-            #
-            # Only a TRUSTWORTHY observation clears it. A FALLBACK means the subject
-            # was NOT observed (a failed fetch, a probe defect), and letting an
-            # unobserved tick erase real debt would lose the terminal news for good --
-            # the opposite of the invariant that failure resolves toward spending.
-            monitor.terminal_pending = ""
-            try:
-                async with self._lock:
-                    await self._write_monitor_snapshot_locked()
-            except Exception:
-                # NOT rolled back -- and there is deliberately no saved copy to roll
-                # back TO. Restoring the debt here to keep memory and disk in
-                # agreement is the right instinct almost everywhere and the
-                # wrong one here: a trustworthy live observation has just DISPROVED
-                # the debt, so restoring it lets the next delivered turn settle a
-                # terminal state that no longer holds and silently stop a watch whose
-                # subject is alive. The divergence is safe in exactly one direction --
-                # memory saying "no debt" keeps the watch running, and if the process
-                # restarts before the write lands, the disk's stale debt comes back and
-                # the tick RE-OBSERVES it (an outstanding debt no longer spends the
-                # observation-free follow-up tick), which clears it again. So the
-                # failure path converges instead of stopping work.
-                logger.exception(
-                    "AutoNudge: could not persist the cleared terminal debt for %s -- "
-                    "keeping it cleared in memory so a live subject is not settled",
-                    loop.id,
-                )
-
-        if verdict.outcome is irq.Outcome.QUIET:
-            monitor.quiet_ticks += 1
-            monitor.quiet_streak += 1
-            monitor.last_observed_at = time.time()
-            if monitor.quiet_streak >= _MAX_QUIET_STREAK:
-                # Floor reached: deliver anyway. The gate can only see the
-                # SUBJECT, and a loop whose duty is to act while the subject is
-                # quiet -- refresh a heartbeat, chase a silent reviewer, rebase
-                # onto a moving base -- is invisible to it and would otherwise
-                # never be delivered again. Inference cannot read that intent out
-                # of the wording, so the honest answer is not to guess it but to
-                # bound how long any loop can go undelivered.
-                monitor.quiet_streak = 0
-                # NOT charged here, for the same reason the WAKE branch is not: this
-                # tick has decided to deliver but has not delivered, and the fire can
-                # still be refused by a busy slot. Charging now would report a turn
-                # that never ran, and since the honest free-tick figure is
-                # ``quiet_ticks`` minus ``floor_ticks``, an over-counted floor
-                # UNDERSTATES the saving -- the safe direction, but still a wrong
-                # number in the one artifact this PR exists to produce.
-                #
-                # GPT's prescribed remedy was to revert this counter until it could be
-                # charged after delivery. Declined: the counter is what separates a
-                # quiet verdict from a free tick, so deleting it would remove the
-                # subtraction that makes the metering honest. The substance -- charge
-                # only on confirmed delivery -- is adopted instead, by the mechanism
-                # the wake charge already uses.
-                #
-                # Two counters now carry the same owed-charge shape through the same
-                # fire cycle. They belong in one structure; that is the collapse
-                # recommended on the pull request rather than a third set later.
-                self._pending_floor_tick.add(loop.id)
-                logger.info(
-                    "AutoNudge: loop %s hit the quiet-streak floor after %d quiet ticks",
-                    loop.id,
-                    _MAX_QUIET_STREAK,
-                )
-                # Persisted AFTER the reset, not before it. Today the earlier
-                # call would have captured this anyway, because the write is a
-                # detached task that cannot run until this block yields -- but
-                # that is an accident of the persist being deferred, and a
-                # restart reading a streak that was never reset would deliver one
-                # extra turn and under-count the floor. Ordering it explicitly
-                # costs nothing and does not depend on that.
-                self._persist_soon()
-                return False
-            self._persist_soon()
-            logger.debug("AutoNudge: loop %s quiet tick (%s)", loop.id, verdict.body)
-            return True
-
-        # WAKE, and FALLBACK, both spend a turn. FALLBACK is counted separately
-        # from a wake so the metering cannot flatter itself: a gate that never
-        # works would otherwise read as a busy, well-used watch.
-        monitor.quiet_streak = 0
-        if verdict.outcome is irq.Outcome.WAKE:
-            # NOT charged here. A wake is a DELIVERED turn, and this tick has not
-            # delivered one yet -- the fire that follows can still be refused (a
-            # busy slot, a callback error, a loop deactivated mid-flight). Charging
-            # now would report a turn that never ran and would hand out the
-            # follow-up allowance for it, so the next tick would skip its
-            # observation to protect work that was never started. The charge is
-            # claimed at the one point delivery is confirmed, in
-            # :meth:`_run_fire_cycle`. A process that dies in between charges
-            # nothing, which is the right direction: never invent a turn.
-            self._pending_monitor_wake.add(loop.id)
-        else:
-            # A fallback is an OBSERVATION outcome, not a delivery, so it is
-            # counted here where it happened.
-            monitor.gate_fallbacks += 1
-        monitor.last_observed_at = time.time()
-        self._persist_soon()
-        return False
-
-    async def _timer(self, loop: NudgeLoop, delay: float | None = None) -> None:
-        try:
-            await asyncio.sleep(loop.idle_secs if delay is None else delay)
-        except asyncio.CancelledError:
-            return
-        if shutdown_event.is_set():
-            return
-        if is_structured_monitor_loop(loop):
-            assert loop.monitor is not None
-            waiting_for_terminal_completion = self._waits_for_terminal_completion(loop)
-            if not loop.active and not waiting_for_terminal_completion:
-                return
-            if self._on_monitor_tick is None:
-                if waiting_for_terminal_completion:
-                    await self.record_monitor_completion_evidence_unavailable(
-                        loop.id,
-                        loop.monitor.last_wake_fingerprint,
-                        now=time.time(),
-                    )
-                    return
-                # A structured record must never fall through to legacy prompt
-                # delivery when its typed controller is unavailable.
-                await self._deactivate_unwired_monitor(loop.id)
-                return
-            self._firing.add(loop.id)
-            try:
-                await self._on_monitor_tick(loop)
-            except Exception:
-                logger.exception("structured monitor tick failed for %s", loop.id)
-            finally:
-                self._firing.discard(loop.id)
-                self._rearm_pending.discard(loop.id)
-                if (
-                    (loop.active or self._waits_for_terminal_completion(loop))
-                    and loop.id in self._loops
-                    and loop.next_due_ts > 0
-                ):
-                    self._arm_from_deadline(loop)
-            return
-        # Kill switch: sentinel file present?
-        if loop.stop_sentinel_path and Path(loop.stop_sentinel_path).exists():
-            logger.info("AutoNudge: stop sentinel found for %s — removing loop", loop.id)
-            await self.remove(loop.id)
-            return
-        # Reached before either dispatch: a fire settles through the same refused writer,
-        # so an unattended turn would go out with no restart able to tell that it had.
-        if self._load_refused:
-            logger.error(
-                "AutoNudge: not firing loop %s -- persistence is refused, so a delivered "
-                "cycle could not be recorded; fix the store and restart",
-                loop.id,
-            )
-            return
-        # Cycle cap reached?
-        if loop.max_cycles and loop.cycle_count >= loop.max_cycles:
-            logger.info("AutoNudge: loop %s reached max_cycles — deactivating", loop.id)
-            await self.update(loop.id, active=False, stopped_reason="cycle_cap")
-            # Signal the cap. Reaching max_cycles is NOT a successful finish —
-            # the loop ran out of cycles with its goal possibly unmet — yet the
-            # only trace used to be this log line plus an ``updated`` event
-            # indistinguishable from a user pressing Stop. A capped-out babysit
-            # was therefore impossible to tell apart from the agent stopping on
-            # its own. ``expired`` is emitted so an observer can raise a
-            # notification the user actually sees.
-            #
-            # Emitted AFTER update() (which already persisted active=False and
-            # emitted ``updated``), so a subscriber handling ``expired`` always
-            # observes the loop in its final deactivated state. Deliberately a
-            # NEW event kind rather than overloading ``updated``: the many
-            # benign updates (message edits, manual pause) must not notify.
-            self._emit("expired", loop)
-            return
-        # Wall-clock budget spent? Checked AFTER the cycle cap (both exhausted
-        # → the cap wins, keeping historical wording) and BEFORE the fire, so
-        # a spent budget never buys one more unattended turn. Same terminal
-        # treatment as the cap: deactivate (inspectable/restartable, not
-        # removed) and emit ``expired`` so the existing observer raises a
-        # user-visible notification — a budget that stops a loop silently
-        # would be indistinguishable from the agent stopping on its own.
-        if runtime_budget_exceeded(loop):
-            logger.info(
-                "AutoNudge: loop %s exceeded max_runtime_secs=%d — deactivating",
-                loop.id,
-                loop.max_runtime_secs,
-            )
-            await self.update(loop.id, active=False, stopped_reason="runtime_budget")
-            self._emit("expired", loop)
-            return
-        # Proved unable to act? Checked LAST, so a loop that is also out of
-        # cycles or budget still reports the bound it would otherwise report. This
-        # one is reactive by construction: it fires only on recorded
-        # evidence that a cycle's approval went unanswered (see
-        # ``notify_approval_stalled``), never on a reading of whether a grant
-        # happens to be in force — a loop that only ever calls auto-approved
-        # tools needs no grant, and stopping it would turn a working
-        # configuration into a stopped one.
-        #
-        # Same terminal treatment as the other bounds: deactivate rather than
-        # remove, so the loop stays inspectable and can be resumed once the
-        # operator restores the authorization it cannot obtain for itself, and
-        # emit ``expired`` so the notifier tells them it stopped rather than
-        # finished. Without this the loop keeps waking, dispatching, being
-        # declined and spending its cap on cycles that were never able to work.
-        if loop.approval_stalled:
-            logger.info(
-                "AutoNudge: loop %s cannot obtain tool approval — deactivating "
-                "instead of firing cycle %d",
-                loop.id,
-                loop.cycle_count + 1,
-            )
-            await self.update(loop.id, active=False, stopped_reason=APPROVAL_STALL_REASON)
-            self._emit("expired", loop)
-            return
-        # Cycles that never reach a model session. A delivered cycle whose turn
-        # dies on ``session/new`` produced nothing, and firing the next one on the
-        # plain interval reproduces it -- 15 times in a row on the host this came
-        # from, until ``max_cycles`` happened to run out. Checked here, with the
-        # other terminal bounds, on recorded evidence only
-        # (``notify_cycle_start_failed``); a single landed turn on the slot clears
-        # the streak, so a loop that recovers is never held back.
-        #
-        # Stand-down is terminal in the same shape as the other bounds
-        # (deactivate, ``expired`` so the notifier tells the user rather than
-        # letting it go silent, re-armable once the host recovers). Below that,
-        # the wake is DEFERRED rather than spent: the delay escalates per failure
-        # past the threshold and is capped by the loop's own interval, so a loop
-        # under a briefly-loaded host slows to a poll instead of adding its own
-        # retries to the contention.
-        if loop.consecutive_start_failures >= _START_FAILURE_STANDDOWN_AFTER:
-            logger.warning(
-                "AutoNudge: loop %s stood down — %d consecutive cycles never got "
-                "a model session, so cycle %d would spend a turn to fail the same "
-                "way; it stays inspectable and can be resumed once the host "
-                "recovers",
-                loop.id,
-                loop.consecutive_start_failures,
-                loop.cycle_count + 1,
-            )
-            self._start_failure_deferred.pop(loop.id, None)
-            await self.update(loop.id, active=False, stopped_reason=SESSION_START_FAILURE_REASON)
-            self._emit("expired", loop)
-            return
-        if loop.consecutive_start_failures >= _START_FAILURE_BACKOFF_AFTER:
-            # ONE deferral per streak value, then fire again. The streak only
-            # grows on a DELIVERED cycle that fails, so deferring every wake at
-            # the same value would freeze it below the stand-down threshold and
-            # poll at the backoff interval forever -- a slower version of the
-            # very loop this exists to end. Paying the delay once per failure
-            # lets the next cycle either recover (a landed turn clears the
-            # streak) or advance it toward the stand-down.
-            already = self._start_failure_deferred.get(loop.id)
-            if already != loop.consecutive_start_failures:
-                self._start_failure_deferred[loop.id] = loop.consecutive_start_failures
-                shift = min(
-                    loop.consecutive_start_failures - _START_FAILURE_BACKOFF_AFTER,
-                    _REARM_BACKOFF_MAX_SHIFT,
-                )
-                backoff = min(
-                    _REARM_BACKOFF_SECS * (2**shift),
-                    _REARM_MAX_BACKOFF_SECS,
-                    loop.idle_secs,
-                )
-                logger.info(
-                    "AutoNudge: loop %s deferring cycle %d by %gs — %d consecutive "
-                    "cycles never got a model session",
-                    loop.id,
-                    loop.cycle_count + 1,
-                    backoff,
-                    loop.consecutive_start_failures,
-                )
-                self._arm_timer(loop, delay=backoff)
-                return
-        # Fire. Update state only if the callback reports actual delivery —
-        # otherwise skipped nudges (e.g. slot mid-turn) inflate cycle_count and
-        # prematurely trip max_cycles. Missing callback → nothing to deliver.
-        if self._on_fire is None:
-            return
-        # Probe gate. For a monitor loop, decide whether this tick is worth a
-        # turn BEFORE spending one: a quiet tick returns here having cost one
-        # bounded subprocess and no model call at all, which is the entire
-        # saving this path exists for. A loop with no monitor -- and a monitor
-        # whose subject has no probe, or whose probe failed -- falls straight
-        # through to the unchanged legacy fire, so the absence of a gate can
-        # never be the reason a loop goes silent.
-        #
-        # This moves what ``max_cycles`` bounds. ``cycle_count`` only advances on
-        # a DELIVERED fire, so for a gated loop the cap counts delivered TURNS
-        # rather than ticks. Not "wakes": a floor delivery, a fallback and a
-        # follow-up are all delivered turns that advance it, and only quiet ticks
-        # are free. Calling it wakes would undercount what the number actually
-        # bounds, which is what the user pays for. A watch can still sit on a pull
-        # request for days inside a small cap, which is the intended reading of the
-        # number, and monitor_start's own description says so at the arming surface.
-        #
-        # Exception-safe on purpose, and exception-safe in the SPENDING
-        # direction. The gate resolves every uncertainty it can reason about
-        # toward firing, and an exception ESCAPING it means its own failure
-        # handling was bypassed -- so the escape is treated exactly like every
-        # other uncertain observation: not quiet, fall through to the fire.
-        # Letting it escape here instead killed the timer task outright:
-        # ``self._timers`` holds a strong reference, so the dead task was never
-        # garbage-collected, "Task exception was never retrieved" was never
-        # emitted, and the loop sat persisted active with nothing left to wake
-        # it. Skipping the tick would be the other wrong answer: a gate that
-        # raises deterministically would keep the loop alive, re-arming and
-        # delivering nothing forever -- the silent-mute shape this whole gate
-        # is documented to avoid ("every uncertain path resolves toward
-        # spending"). Firing keeps the loop doing its job with the gate's
-        # saving lost for that tick, and the traceback makes the defect loud.
-        try:
-            tick_is_quiet = await self._monitor_tick_is_quiet(loop)
-        except Exception:  # noqa: BLE001 - any escape here used to kill the timer
-            logger.exception(
-                "AutoNudge: probe gate failed for loop %s -- treating the tick "
-                "as not quiet and firing",
-                loop.id,
-            )
-            tick_is_quiet = False
-        if tick_is_quiet:
-            # A quiet tick MUST re-arm itself. Nothing else will: the delivered
-            # paths re-arm through notify_turn_complete (dashboard slots) or
-            # through the fire cycle's own exit (channel keys), and a quiet tick
-            # reaches neither. Returning here without arming would make the FIRST
-            # quiet observation the last one the watch ever makes -- the exact
-            # silent failure this gate is otherwise built to avoid, and invisible
-            # from outside because a dead watch and a calm one look identical.
-            #
-            # Self-re-arm from inside the running timer is the supported pattern
-            # (see _cancel_timer, which refuses to cancel the current task), and
-            # is what the delivered path's own `finally` already does.
-            #
-            # ONLY while the loop is still live, though. "Do not spend a turn" and
-            # "keep watching" are different answers, and the terminal verdict
-            # returns the first while having just deactivated the loop: re-arming
-            # on that would poll a merged pull request forever and re-emit its
-            # expiry notification on every tick. Registration is checked too, so
-            # a loop removed during the observation is not resurrected by its own
-            # in-flight tick.
-            if loop.active and loop.id in self._loops:
-                loop.next_due_ts = time.time() + loop.idle_secs
-                self._persist_soon()
-                self._arm_from_deadline(loop)
-            return
-        self._firing.add(loop.id)
-        try:
-            await self._run_fire_cycle(loop)
-        finally:
-            self._firing.discard(loop.id)
-            # A re-arm requested DURING the fire window (a dashboard turn that
-            # completed while we were still persisting) was deferred rather than
-            # applied, because applying it would have cancelled this very task
-            # mid-persist. Apply it now that the window is closed — dropping it
-            # would leave a dashboard loop with no armed timer at all, since the
-            # delivered path relies on notify_turn_complete for those slots.
-            if loop.id in self._rearm_pending:
-                self._rearm_pending.discard(loop.id)
-                if loop.active and loop.id in self._loops:
-                    self._arm_from_deadline(loop)
-
-    async def _terminal_still_holds(self, loop: NudgeLoop, monitor: MonitorState) -> bool:
-        """Re-observe the subject and report whether the OWED terminal still holds.
-
-        Used only where a settlement is about to deactivate a loop, because that is the
-        one action here that stops work silently. The answer is deliberately asymmetric:
-        only a fresh terminal that CARRIES THE SAME CLASSIFICATION returns True, so an
-        unobservable subject -- a failed fetch, a probe defect, a binding that no longer
-        resolves -- keeps the watch alive rather than letting an absence of evidence
-        retire it.
-
-        Matching the classification matters as much as matching the outcome. A pull
-        request can be closed, reopened and MERGED inside one channel turn, and a
-        revalidation that accepted any terminal would then settle the merge under the
-        stale "blocked" marker and announce an unmerged close. When the two disagree the
-        owed terminal is simply gone: this returns False, the debt is dropped, and the
-        next tick records the real one with the right classification.
-
-        Reuses the tick's probe machinery, and the same ``"merged" in keys`` rule the
-        tick's own terminal branch applies, instead of adding a marker to remember what
-        was already delivered. This review has paid for a defect at an existing site for
-        each new piece of per-loop state, so re-asking is the cheaper way to answer.
+        False when no resolver was injected, and here that is the direction that cannot
+        INVENT a signal: this input removes the staleness window, so answering True
+        without a slot table would flag every freshly created item. A resolver that
+        raises is treated the same way, for the reason the liveness read is -- a
+        slot-table read must not kill a tick.
         """
-        target = targets.infer(loop.message)
-        probe = probes.build(monitor.kind)
-        if target is None or probe is None:
-            # Cannot re-check, so cannot confirm. Keep the loop alive.
+        resolver = self._worker_closed_resolver
+        if resolver is None or not session_key:
             return False
-        # A DISTINCT identity, because this call throws its verdict away. ``identity``
-        # is the kernel's dedupe key -- ``poll``'s own contract says it "replaces the
-        # cron job id in the state digest, so two drivers watching one subject keep
-        # independent dedupe memories" -- so sharing the tick's key would let this
-        # re-read consume the tick's credit: a reopened subject with a fresh comment
-        # would be marked reported here, and then the next real tick would read it as
-        # unchanged and go quiet until the streak floor. A poll whose answer is
-        # discarded must not be able to swallow a signal, so it observes on its own
-        # memory and leaves the tick's untouched.
-        identity = f"{loop.id}:{target.host_key}:terminal-recheck"
         try:
-            verdict = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: irq.poll(identity, target.message, probe)
-            )
-        except Exception:
-            logger.warning(
-                "AutoNudge: could not revalidate the terminal verdict for %s -- keeping "
-                "the watch alive rather than settling on a stale observation",
-                loop.id,
-                exc_info=True,
-            )
-            return False
-        if verdict.outcome is not irq.Outcome.TERMINAL:
-            return False
-        fresh = "success" if "merged" in verdict.keys else "blocked"
-        if fresh != monitor.terminal_pending:
-            logger.info(
-                "AutoNudge: loop %s owed a %s settlement but now observes %s -- dropping "
-                "the owed one rather than announcing the wrong ending",
-                loop.id,
-                monitor.terminal_pending,
-                fresh,
-            )
-            return False
-        return True
-
-    async def _run_fire_cycle(self, loop: NudgeLoop) -> None:
-        """Fire once, then persist bookkeeping and decide the re-arm.
-
-        Runs entirely inside the caller's ``_firing`` window so a concurrent
-        ``update()`` never cancels this task between delivery and persistence.
-        """
-        if self._on_fire is None:
-            return
-        # Mark the fire window so a concurrent update() defers its re-arm
-        # instead of cancelling this task mid-turn (see update()). The window
-        # stays open through the post-delivery bookkeeping and the re-arm
-        # decision, NOT just the callback: clearing it the moment _on_fire
-        # returned let a waiting update() cancel this task while it was parked
-        # on _persist_locked(), so the delivered cycle was never written and the
-        # loop could run extra cycles after a restart. _run_fire_cycle owns the
-        # window; this method is the body.
-        try:
-            delivered = await self._on_fire(loop)
-        except Exception:
-            delivered = False
-            # Full traceback only on the first failure of a streak; subsequent
-            # failures stay at debug so a permanently-wedged callback can't spam
-            # a traceback every re-arm.
-            if self._rearm_fail_count.get(loop.id, 0) == 0:
-                logger.exception("AutoNudge fire callback failed for %s", loop.id)
-            else:
-                logger.debug(
-                    "AutoNudge fire still failing for %s (streak=%d)",
-                    loop.id,
-                    self._rearm_fail_count.get(loop.id, 0) + 1,
-                )
-        claimed_wake = loop.id in self._pending_monitor_wake
-        self._pending_monitor_wake.discard(loop.id)
-        claimed_floor = loop.id in self._pending_floor_tick
-        self._pending_floor_tick.discard(loop.id)
-        if claimed_wake and loop.monitor is not None:
-            # Delivery is settled either way now -- landed or refused -- so the doubt
-            # the wake carried across the fire is discharged here. A debounced write
-            # is enough: this process survived, and a lost clear only costs one extra
-            # fire on the next tick.
-            loop.monitor.poll_in_flight = False
-            self._persist_soon()
-        if not delivered and loop.monitor is not None and loop.id in self._loops:
-            # A REFUSED fire must not consume the tick that earned it. Two credits
-            # are at stake and both are spent by the time we get here: a claimed
-            # wake, and a follow-up allowance the gate decremented to let this
-            # tick through. Neither can be recovered by simply re-arming, because
-            # the kernel has already DEDUPED the observation this fire was
-            # carrying -- the next tick would look at an unchanged subject, judge
-            # it quiet, and the signal would not come back until the streak floor.
-            # A busy slot is ordinary (the user is typing), so that is a routine
-            # path to losing a real wake.
-            #
-            # Granting one gate-free tick makes the next tick RETRY the delivery
-            # instead of re-observing. Set rather than incremented, so a
-            # permanently refusing callback cannot accumulate an unbounded
-            # bypass; the existing per-failure backoff bounds how fast it retries.
-            loop.monitor.followup_ticks = _WAKE_FOLLOWUP_TICKS
-            if claimed_wake:
-                # And keep the wake OWED. The claim was discarded above on the
-                # assumption that reaching here meant the wake had been accounted
-                # for, but a refused fire accounts for nothing: the next tick takes
-                # the observation-free bypass, DELIVERS the turn, and finds no claim
-                # to charge -- so a wake that really happened and really woke the
-                # agent was missing from ``wakes`` entirely. That counter is the one
-                # artifact this PR exists to make trustworthy, and omitting a
-                # delivered wake makes the saving look BETTER than it is, which is
-                # the same dishonesty as the zero nothing surfaced before.
-                #
-                # Re-adding cannot double-charge: the charge happens once, at the
-                # single point delivery is confirmed, and the claim is discarded
-                # there. A retry that is refused again re-owes it, which is correct
-                # and bounded by the same backoff that bounds the retry itself.
-                self._pending_monitor_wake.add(loop.id)
-            if claimed_floor:
-                # Same reasoning: a refused floor delivery spent nothing, so the charge
-                # stays owed rather than being recorded or dropped.
-                self._pending_floor_tick.add(loop.id)
-            self._persist_soon()
-        if delivered:
-            # BEFORE the settlement below, not after. That block carries a comment
-            # forbidding an early RETURN precisely so this bookkeeping still runs --
-            # but a re-raised ``CancelledError`` leaves by the same door a return
-            # would, and the terminal write deliberately DRAINS before propagating,
-            # so the loop would be committed as finished while the turn that carried
-            # the news went uncounted. Recording a delivery that has already happened
-            # cannot be wrong; deferring it past a re-raise can.
-            self._rearm_fail_count.pop(loop.id, None)
-            loop.cycle_count += 1
-            loop.last_fire_ts = time.time()
-        if delivered and loop.monitor is not None and loop.monitor.terminal_pending:
-            # The owed turn landed, so the watch can be closed now -- and only now.
-            # Until this point the loop stayed live on purpose, so a refused fire
-            # would re-arm and retry rather than leave the channel unaware. The
-            # probe re-raises a terminal state on every tick (it is not deduped),
-            # which is what makes that retry converge.
-            # SERIALIZED, like the gate's own settlement. ``update`` takes the
-            # MAINTENANCE lock and awaits inside it, so without holding that same
-            # lock a retarget could land between the read and the write here and
-            # have its new subject deactivated by the old subject's finish. This is
-            # the site the previous round named as still open; closing it needs the
-            # lock, not merely the ordering fix that round shipped.
-            #
-            # Safe to take here: this runs after ``_on_fire`` has returned, and the
-            # timer that called us does not hold the lock -- the same evidence that
-            # lets the gate's settlement take it.
-            settle_lock = await self._acquire_mutation_lock(loop.id)
-            # No early RETURN in here: the rest of this fire cycle still has to
-            # charge the wake and run its re-arm bookkeeping. Skipping that to bail
-            # out of a settlement would trade one defect for another.
-            if settle_lock is not None:
-                try:
-                    # Re-read under the lock, and re-check that the monitor is still
-                    # THERE. Waiting for the lock is an await, so a retarget can
-                    # clear ``loop.monitor`` to None in that gap -- and dereferencing
-                    # it then raises out of the fire cycle, which leaves the newly
-                    # retargeted loop active with no timer: a watch that never ticks
-                    # again. The earlier checks covered the debt and the
-                    # registration but not the object itself.
-                    monitor = loop.monitor
-                    pending = monitor.terminal_pending if monitor is not None else ""
-                    settle_now = bool(monitor is not None and pending and loop.id in self._loops)
-                    if settle_now and monitor is not None:
-                        if not await self._terminal_still_holds(loop, monitor):
-                            # The subject came back while the turn was being delivered.
-                            # Every earlier guard for a reopened subject lives on the
-                            # NEXT TICK -- the debt clearing and the forced
-                            # re-observation -- and this
-                            # settlement runs before any tick can happen, so the window
-                            # between the terminal observation and the turn landing had
-                            # no evidence in it at all. A channel turn runs inline and
-                            # can take minutes, which is long enough for a pull request
-                            # to be reopened.
-                            #
-                            # Settling is the one action that STOPS work, so it needs a
-                            # CONFIRMED terminal rather than merely an unrefuted one:
-                            # anything else -- reopened, or simply unobservable -- leaves
-                            # the watch alive. Failure resolves toward spending, here as
-                            # everywhere else in this file.
-                            #
-                            # SKIPPED, not returned from. This block's own comment forbids
-                            # an early exit because the rest of the fire cycle still has
-                            # to run, and a re-raise leaving through the same door breaks
-                            # that exact rule.
-                            monitor.terminal_pending = ""
-                            self._persist_soon()
-                            logger.info(
-                                "AutoNudge: loop %s had its subject come back while the "
-                                "final turn was delivered -- dropping the owed settlement "
-                                "and keeping the watch alive",
-                                loop.id,
-                            )
-                            settle_now = False
-                    if settle_now and monitor is not None:
-                        restore = (
-                            pending,
-                            monitor.outcome,
-                            monitor.stopped_reason,
-                            monitor.stopped_at,
-                            loop.active,
-                            loop.stopped_reason,
-                        )
-                        monitor.terminal_pending = ""
-                        monitor.outcome = (
-                            MonitorOutcome.SUCCESS
-                            if pending == "success"
-                            else MonitorOutcome.BLOCKED
-                        )
-                        monitor.stopped_reason = MONITOR_TERMINAL_REASON
-                        monitor.stopped_at = time.time()
-                        loop.stopped_reason = MONITOR_TERMINAL_REASON
-                        loop.active = False
-                        # PERSIST BEFORE ANNOUNCING -- the same rule the gate's own
-                        # settlement follows. This site was added two rounds later
-                        # and did not inherit it: the delivered path does reach a
-                        # write further down, but it is AFTER the emit, so a failed
-                        # write left memory reporting a finish while the record
-                        # still said active-and-owed, and the restart would deliver
-                        # the final turn a second time.
-                        try:
-                            async with self._lock:
-                                await self._write_monitor_snapshot_locked()
-                        except asyncio.CancelledError:
-                            # Committed before the cancellation propagates, so the
-                            # user must hear it now or never -- a restart reads the
-                            # loop as settled and no longer owes a turn.
-                            self._emit("expired", loop)
-                            raise
-                        except Exception:
-                            (
-                                monitor.terminal_pending,
-                                monitor.outcome,
-                                monitor.stopped_reason,
-                                monitor.stopped_at,
-                                loop.active,
-                                loop.stopped_reason,
-                            ) = restore
-                            logger.exception(
-                                "AutoNudge: could not persist the delivered terminal "
-                                "settlement for %s -- leaving the watch live so it "
-                                "retries",
-                                loop.id,
-                            )
-                        else:
-                            self._emit("expired", loop)
-                finally:
-                    settle_lock.release()
-        if claimed_wake and delivered and loop.monitor is not None:
-            # The turn happened, so it is a wake, and only now does the agent own
-            # work the probe cannot see -- which is what the follow-up allowance
-            # protects. A refused fire falls through here uncharged.
-            #
-            # No persist call of its own: the delivered path below reaches
-            # ``await self._persist_locked()`` with no await in between, so these
-            # counters are already in the state that write serialises -- and that
-            # write is the stronger one, since it holds the lock and cannot be
-            # clobbered by a concurrent update()'s snapshot.
-            loop.monitor.wakes += 1
-            loop.monitor.followup_ticks = _WAKE_FOLLOWUP_TICKS
-        if delivered and claimed_floor and loop.monitor is not None:
-            # The floor's turn happened. No follow-up allowance goes with it: the floor
-            # exists to break a silence, not to protect work the agent had already
-            # started, so there is nothing in progress for a bypassed tick to shield.
-            loop.monitor.floor_ticks += 1
-        if not delivered:
-            # If the fire path already removed the loop (e.g. slot missing →
-            # remove()), do NOT resurrect it with a fresh timer — that would
-            # orphan-poll forever. Clear the streak and stop.
-            if loop.id not in self._loops:
-                self._rearm_fail_count.pop(loop.id, None)
-                return
-            # A concurrent update() may have DEACTIVATED this loop while the
-            # callback was in flight; that update deliberately deferred the
-            # cancel to avoid killing the turn, so the failure path must honour
-            # the pause instead of re-arming. Otherwise "stop the loop" during a
-            # cycle whose delivery then fails silently resumes unattended tool
-            # execution.
-            if not loop.active:
-                logger.info(
-                    "AutoNudge: loop %s was deactivated mid-fire — not re-arming",
-                    loop.id,
-                )
-                self._rearm_fail_count.pop(loop.id, None)
-                return
-            # Slot was busy mid-turn, or the fire callback errored. Do NOT end
-            # the loop — re-arm so it self-heals and never depends solely on the
-            # external notify_turn_complete hook (skipped on a slot's error/
-            # timeout/cancel exit paths). Escalate the delay per consecutive
-            # failure so a never-delivering loop backs off to a slow poll
-            # instead of hammering, capped by idle_secs and _REARM_MAX_BACKOFF.
-            n = self._rearm_fail_count.get(loop.id, 0) + 1
-            self._rearm_fail_count[loop.id] = n
-            shift = min(n - 1, _REARM_BACKOFF_MAX_SHIFT)
-            backoff = min(
-                _REARM_BACKOFF_SECS * (2**shift),
-                _REARM_MAX_BACKOFF_SECS,
-                loop.idle_secs,
-            )
-            self._arm_timer(loop, delay=backoff)
-            return
-        # Delivered — the failure streak and the turn accounting were already
-        # recorded above, before the terminal settlement could re-raise past them.
-        loop.next_due_ts = 0.0
-        # Persist through the shared locked+offloaded path so this bookkeeping
-        # cannot be clobbered by a concurrent update()'s snapshot (and so the
-        # fsync stays off the event loop).
-        await self._persist_locked()
-        # At INFO, deliberately. Delivered fires used to be unlogged entirely,
-        # so a loop that died and a loop with nothing to report were
-        # byte-identical in the journal. One line per DELIVERED turn -- each of
-        # which already spends a model turn, so the log can never outpace the
-        # work -- is what makes both this loop's health and the reconciler's
-        # rescues observable from outside the process.
-        logger.info(
-            "AutoNudge: loop %s fired cycle %d on slot %s (delivered)",
-            loop.id,
-            loop.cycle_count,
-            loop.slot_key,
-        )
-        self._emit("fired", loop)
-        # POST-DELIVERY budget check: the budget gates when turns START, so a
-        # slow in-flight turn can overshoot it (bounded by the transport's
-        # per-turn ceiling, constants.CHAT_TURN_TIMEOUT — this service must
-        # not cancel a running turn; see the mid-fire contracts above). But
-        # once the turn HAS finished, a spent budget must take effect NOW —
-        # deactivating here instead of on the next idle timer closes the
-        # window where notify_turn_complete arms another full idle cycle for
-        # a loop that is already over budget.
-        if runtime_budget_exceeded(loop) and loop.active and loop.id in self._loops:
-            logger.info(
-                "AutoNudge: loop %s exceeded max_runtime_secs=%d during its turn "
-                "— deactivating post-delivery",
-                loop.id,
-                loop.max_runtime_secs,
-            )
-            await self._update_unserialized(loop.id, active=False, stopped_reason="runtime_budget")
-            self._emit("expired", loop)
-            return
-        # Channel-bound loops (Slack/Discord/...) have no dashboard
-        # turn-lifecycle hook to re-arm them (notify_turn_complete never fires
-        # for these keys), so they self-re-arm on a fixed interval. The fire
-        # callback runs the turn inline, so the next fire lands idle_secs
-        # after the previous turn finished; the busy-skip + backoff above
-        # handles any overlap.
-        if is_channel_key(loop.slot_key) and loop.active and loop.id in self._loops:
-            self._arm_from_deadline(loop)
-
-    async def fire_now(self, loop_id: str) -> tuple["NudgeLoop | None", str, int]:
-        """Bring one loop's next cycle forward to now, out of band from its countdown.
-
-        Returns ``(loop, "", 200)`` once the cycle is armed to run, or
-        ``(None, reason, status)`` on refusal — the ``(obj, error, status)``
-        shape the authz chokepoints in :mod:`kiro_crew.autonudge_authz` already
-        use, so the HTTP handler stays a thin mapping.
-
-        WHAT THIS DELIBERATELY DOES NOT DO: it does not deliver the nudge
-        itself. It re-arms through :meth:`_arm_timer`, so the cycle runs inside
-        the ordinary :meth:`_timer` body — the stop sentinel, the cycle cap, the
-        wall-clock budget, the approval-stall stop and the probe gate all apply
-        exactly as they do on a scheduled tick, and the delivery goes through the
-        one ``_on_fire`` path. Calling :meth:`_run_fire_cycle` directly would have
-        needed that whole ladder restated here, and a second copy of a
-        five-condition gate is a divergence waiting to happen.
-
-        ``delay=0.0`` rather than :meth:`_arm_from_deadline`'s
-        ``_OVERDUE_REARM_SECS`` beat. That beat exists so an elapsed deadline
-        does not ambush a user mid-conversation — they keep deferring it simply
-        by typing. A manual trigger IS the user asking, so the condition the beat
-        protects against is not present.
-
-        Three refusals, and each one is load-bearing rather than defensive:
-
-        * **Not registered** -> 404. Nothing to fire. This is also where the stop
-          SENTINEL lands: it goes through ``remove``, so the loop is gone rather
-          than merely inactive.
-        * **Not active** -> 409. The non-removing terminal bounds — the cycle
-          cap, the wall-clock budget and the approval stall — all leave the loop
-          registered but inactive, so this ONE condition covers them without
-          restating the list. A manual press must not buy a turn past a bound the
-          user armed.
-        * **Mid-fire** -> 409. :meth:`_arm_timer` cancels the existing timer
-          task, and during the fire window that task may be parked on
-          ``_persist_locked()`` writing the delivered cycle; cancelling it there
-          loses the ``cycle_count`` bump. This is the same window
-          ``notify_turn_complete``/``notify_user_input`` defer around, and the
-          same answer the sibling immediate-trigger route gives for a run
-          already in flight (``POST /api/crons/{id}/run`` -> 409).
-
-        NO SUSPENSION POINT, and that is the design rather than an omission.
-        ``async def`` for the caller's convenience, but nothing inside awaits, so
-        the guards and the arm are atomic with respect to the event loop: between
-        reading ``loop`` and arming it, no other coroutine can run.
-
-        This shape was arrived at the hard way and the history is worth keeping.
-        An earlier revision wrote ``next_due_ts = time.time()`` and awaited a
-        DURABLE persist before arming, so a restart between the press and the
-        fire would resume overdue. That await was a suspension window, and this
-        module has several writers to ``next_due_ts`` that hold NO lock while
-        writing it — the quiet-tick re-arm on the gated-wake branch is one. Each
-        guard added to close one writer's window exposed the next: a concurrent
-        ``remove`` arming a stale object, a cancelled caller abandoning the write,
-        a countdown entering ``_firing`` mid-persist, a quiet tick overwriting the
-        deadline, then the refused path leaving its own value durably committed.
-        Five rounds, each caused by the fix before it. The window is not closable
-        at this call site, because the racing writers take no lock at all.
-
-        SO THE WRITE IS GONE. ``_arm_timer(delay=0.0)`` is what brings the cycle
-        forward: :meth:`_timer` sleeps the delay it is given and fires WITHOUT
-        consulting ``next_due_ts``. The write was only ever for restart cosmetics,
-        and that is exactly what is given up — a gateway restart between the press
-        and the fire resumes on the loop's own schedule instead of overdue, and
-        the operator presses again. That is the same degradation
-        :meth:`_persist_soon` documents as acceptable for every other deadline
-        assignment in this class ("a lost write degrades to a fresh full countdown
-        after restart, never a premature or dropped fire"), and a far better trade
-        than a sixth guard on an uncloseable window.
-
-        The countdown reset callers ask for is UNAFFECTED, because it never
-        came from this write: a delivered cycle clears ``next_due_ts`` in
-        :meth:`_run_fire_cycle` and the re-arm then starts a fresh full interval.
-        """
-        loop = self.get_by_id(loop_id)
-        if loop is None:
-            return None, "loop not found", 404
-        if not loop.active:
-            return None, "loop is not active", 409
-        if loop_id in self._firing:
-            return None, "loop is already firing", 409
-        self._arm_timer(loop, delay=0.0)
-        logger.info(
-            "AutoNudge: loop %s brought forward by hand — cycle %d armed to run now",
-            loop.id,
-            loop.cycle_count + 1,
-        )
-        return loop, "", 200
-
-
-class _AutoNudgeMaintenanceView:
-    """Store operations that are safe inside ``maintenance_service``'s lock."""
-
-    def __init__(self, service: AutoNudgeService) -> None:
-        self._service = service
-        self._quiescing: set[str] = set()
-
-    def _release(self) -> None:
-        for loop_id in self._quiescing:
-            self._service._end_maintenance_quiesce(loop_id)
-        self._quiescing.clear()
-
-    def list_all(self) -> list[NudgeLoop]:
-        return self._service.list_all()
-
-    def get_by_slot(self, slot_key: str) -> NudgeLoop | None:
-        return self._service.get_by_slot(slot_key)
-
-    async def deactivate_and_wait(self, loop_id: str) -> bool:
-        self._quiescing.add(loop_id)
-        quiesced = await self._service._deactivate_and_wait_unserialized(loop_id)
-        if quiesced:
-            return True
-        else:
-            self._service._end_maintenance_quiesce(loop_id)
-            self._quiescing.discard(loop_id)
+            return bool(resolver(session_key))
+        except Exception:  # pragma: no cover - a slot read must not fail a tick
+            logger.debug("AutoNudge: worker close read failed for %s", session_key)
             return False
 
-    async def remove(self, loop_id: str) -> None:
-        await self._service._remove_unserialized(loop_id)
-        self._service._end_maintenance_quiesce(loop_id)
-        self._quiescing.discard(loop_id)
+    # ── Owner methods ──
+    # Each name below IS its owner's function, bound here by name: one
+    # definition, reached through the instance, so a patch on the service reaches
+    # every caller. test_autonudge_refactor_contract pins each binding.
+    # autonudge_service.store
+    _serialize_loop = staticmethod(LoopStore.serialize_loop)
+    # autonudge_service.maintenance
+    maintenance_service = classmethod(_maintenance.maintenance_service)
+    _begin_maintenance_quiesce = _maintenance._begin_maintenance_quiesce
+    _end_maintenance_quiesce = _maintenance._end_maintenance_quiesce
+    _acquire_mutation_lock = _maintenance._acquire_mutation_lock
+    deactivate_and_wait = _maintenance.deactivate_and_wait
+    _deactivate_and_wait_unserialized = _maintenance._deactivate_and_wait_unserialized
+    # autonudge_service.timers
+    notify_approval_stalled = _timers.notify_approval_stalled
+    release_approval_hold = _timers.release_approval_hold
+    notify_cycle_start_failed = _timers.notify_cycle_start_failed
+    notify_cycle_failed = _timers.notify_cycle_failed
+    notify_cycle_landed = _timers.notify_cycle_landed
+    notify_turn_complete = _timers.notify_turn_complete
+    notify_user_input = _timers.notify_user_input
+    drain_section = _timers.drain_section
+    settle_admitted_writes = _timers.settle_admitted_writes
+    _cancel_timer = _timers._cancel_timer
+    _arm_timer = _timers._arm_timer
+    _arm_from_deadline = _timers._arm_from_deadline
+    _reconcile_forever = _timers._reconcile_forever
+    _reconcile_once = _timers._reconcile_once
+    # autonudge_service.gate
+    _commit_judge_pr_seen = _gate._commit_judge_pr_seen
+    _publish_pr_observation = _gate._publish_pr_observation
+    _monitor_tick_is_quiet = _gate._monitor_tick_is_quiet
+    _settle_delivered_terminal = _gate._settle_delivered_terminal
+    _terminal_still_holds = _gate._terminal_still_holds
+    # autonudge_service.judge_tick
+    _judge_quiet_streak_floor = _judge_tick._judge_quiet_streak_floor
+    _judge_tick_is_quiet = _judge_tick._judge_tick_is_quiet
+    _record_judge_verdict = _judge_tick._record_judge_verdict
+    _withdraw_judge_suppression = _judge_tick._withdraw_judge_suppression
+    _confirm_judge_delivery = _judge_tick._confirm_judge_delivery
+    _label_judge_delivery_locked = _judge_tick._label_judge_delivery_locked
+    _append_judge_labels = _judge_tick._append_judge_labels
+    _persist_judge_state = _judge_tick._persist_judge_state
+    # autonudge_service.firing
+    _timer = _firing._timer
+    _run_timer_callback = _firing._run_timer_callback
+    _extend_for_open_ledger = _firing._extend_for_open_ledger
+    _holds_for_person_wait = _firing._holds_for_person_wait
+    _run_fire_cycle = _firing._run_fire_cycle
+    _settle_fire_cycle = _firing._settle_fire_cycle
+    _finish_fire_cycle = _firing._finish_fire_cycle
+    fire_now = _firing.fire_now
+    # autonudge_service.mutations
+    add = _mutations.add
+    _mint_loop_id = _mutations._mint_loop_id
+    _add_locked = _mutations._add_locked
+    _add_unserialized = _mutations._add_unserialized
+    update = _mutations.update
+    _update_locked = _mutations._update_locked
+    _update_unserialized = _mutations._update_unserialized
+    remove_sync = _mutations.remove_sync
+    _revoke_self_arm_for = _mutations._revoke_self_arm_for
+    _revoke_self_arm = staticmethod(_mutations._revoke_self_arm)
+    remove = _mutations.remove
+    remove_by_slot = _mutations.remove_by_slot
+    clear_terminal_monitor = _mutations.clear_terminal_monitor
+    _remove_unserialized = _mutations._remove_unserialized
+    _revoke_provider_credentials_before_removal = staticmethod(
+        _mutations._revoke_provider_credentials_before_removal
+    )
+    _provider_credentials_authorized = staticmethod(_mutations._provider_credentials_authorized)
+    _restore_provider_credentials = staticmethod(_mutations._restore_provider_credentials)
+    # autonudge_service.monitor_records
+    add_monitor = _monitor_records.add_monitor
+    _add_monitor_locked = _monitor_records._add_monitor_locked
+    commit_monitor_replacement = _monitor_records.commit_monitor_replacement
+    rollback_monitor_replacement = _monitor_records.rollback_monitor_replacement
+    _monitor_snapshot_with_replacement = _monitor_records._monitor_snapshot_with_replacement
+    _apply_staged_monitor = _monitor_records._apply_staged_monitor
+    _persist_staged_monitor_locked = _monitor_records._persist_staged_monitor_locked
+    apply_monitor_probe = _monitor_records.apply_monitor_probe
+    stop_monitor_if_budget_exhausted = _monitor_records.stop_monitor_if_budget_exhausted
+    _set_monitor_deadline = _monitor_records._set_monitor_deadline
+    stop_monitor = _monitor_records.stop_monitor
+    _stop_monitor_admitted = _monitor_records._stop_monitor_admitted
+    mark_terminal_notification_delivered = _monitor_records.mark_terminal_notification_delivered
+    retire_monitor_for_session_close = _monitor_records.retire_monitor_for_session_close
+    restore_monitor_after_failed_session_close = (
+        _monitor_records.restore_monitor_after_failed_session_close
+    )
+    update_monitor = _monitor_records.update_monitor
+    _update_monitor_admitted = _monitor_records._update_monitor_admitted
+    rollback_monitor_update = _monitor_records.rollback_monitor_update
+    mark_monitor_action_in_flight = _monitor_records.mark_monitor_action_in_flight
+    record_monitor_turn_completion = _monitor_records.record_monitor_turn_completion
+    _record_monitor_turn_completion_admitted = (
+        _monitor_records._record_monitor_turn_completion_admitted
+    )
+    _apply_monitor_budget_stop = _monitor_records._apply_monitor_budget_stop
+    _apply_monitor_user_stop = _monitor_records._apply_monitor_user_stop
+    _retain_accepted_terminal_completion = _monitor_records._retain_accepted_terminal_completion
+    _waits_for_terminal_completion = _monitor_records._waits_for_terminal_completion
+    _sync_terminal_completion_timer = _monitor_records._sync_terminal_completion_timer
+    record_monitor_dispatch_failure = _monitor_records.record_monitor_dispatch_failure
+    monitor_dispatch_is_authorized = _monitor_records.monitor_dispatch_is_authorized
+    mark_monitor_turn_accepted = _monitor_records.mark_monitor_turn_accepted
+    record_monitor_dispatch_busy = _monitor_records.record_monitor_dispatch_busy
+    record_monitor_dispatched = _monitor_records.record_monitor_dispatched
+    record_monitor_completion_evidence_unavailable = (
+        _monitor_records.record_monitor_completion_evidence_unavailable
+    )
+    _deactivate_unwired_monitor = _monitor_records._deactivate_unwired_monitor
+    # autonudge_service.store_loader
+    _load = _store_loader._load
+
+
+# An owner function annotates ``self`` / ``cls`` as the service so mypy checks its
+# body; once it is bound above, that annotation is dropped from the runtime object and
+# from every function it wraps, so ``inspect.signature`` and ``typing.get_type_hints``
+# read each method exactly as a method defined in this class body would.
+for _member in vars(AutoNudgeService).values():
+    _function = getattr(_member, "__func__", _member)
+    while getattr(_function, "__module__", "").startswith("kiro_crew.autonudge_service."):
+        _function.__annotations__.pop("self", None)
+        _function.__annotations__.pop("cls", None)
+        _function = getattr(_function, "__wrapped__", None)
+del _member, _function

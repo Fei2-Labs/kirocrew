@@ -16,10 +16,22 @@ sites with no guard against a third.
 from __future__ import annotations
 
 import ast
+import importlib
 import pathlib
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 HANDLER = SRC / "dashboard" / "handlers" / "mcp.py"
+
+
+def _handler_family_text() -> str:
+    """``HANDLER`` and the owners its ``_OWNERS`` names, read as one text."""
+    from kiro_crew.dashboard.handlers import mcp
+
+    return "\n".join(
+        pathlib.Path(importlib.import_module(module).__file__).read_text(encoding="utf-8")
+        for module in (mcp.__name__, *mcp._OWNERS)
+    )
+
 
 # Keys whose write makes the legacy alias resolution unstable or authoritative.
 #
@@ -130,7 +142,7 @@ def _calls(tree: ast.AST, func_name: str, callee: str) -> bool:
 
 
 def test_every_section_writer_freezes_the_alias_first() -> None:
-    tree = ast.parse(HANDLER.read_text(encoding="utf-8"))
+    tree = ast.parse(_handler_family_text())
     writers = _functions_writing_guarded_keys(tree)
 
     # Self-check: the two known writers must still be found, or this ratchet has
@@ -161,14 +173,14 @@ def test_every_section_writer_freezes_the_alias_first() -> None:
 
 
 def test_the_builtin_app_config_writer_cannot_reach_mcp_gateway() -> None:
-    """``apps/routes.py::_sync_builtin_config`` writes ``section["enabled"]`` for
+    """``apps/routes_enable.py::_sync_builtin_config`` writes ``section["enabled"]`` for
     whatever key ``_BUILTIN_SERVICE_APPS`` maps an app to, and does NOT freeze.
 
     It is harmless today because that table is empty, but registering
     ``mcp_gateway`` there would create a third writer outside the guarded
     handler — exactly the drift this ratchet exists to catch.
     """
-    routes = SRC / "apps" / "routes.py"
+    routes = SRC / "apps" / "routes_enable.py"
     tree = ast.parse(routes.read_text(encoding="utf-8"))
 
     table: ast.AST | None = None
@@ -181,7 +193,7 @@ def test_the_builtin_app_config_writer_cannot_reach_mcp_gateway() -> None:
                 if isinstance(t, ast.Name) and t.id == "_BUILTIN_SERVICE_APPS":
                     table = node.value
 
-    assert table is not None, "_BUILTIN_SERVICE_APPS not found in apps/routes.py"
+    assert table is not None, "_BUILTIN_SERVICE_APPS not found in apps/routes_enable.py"
     assert isinstance(table, ast.Dict), "_BUILTIN_SERVICE_APPS is no longer a literal dict"
 
     mapped = [

@@ -27,6 +27,7 @@ import kiro_crew.dashboard.handlers.steering as steering_mod
 from kiro_crew.dashboard.handlers._shared import active_project_dir, active_project_state
 from kiro_crew.dashboard.handlers.steering import (
     _STEERING_META_MAX_CHARS,
+    MAX_STEERING_NAME_BYTES,
     STEERING_FILE_MAX_BYTES,
     STEERING_INCLUSION_DEFAULT,
     STEERING_INCLUSION_MODES,
@@ -65,10 +66,18 @@ def _write_steering(root: Path, rel: str, body: str = "# Title\nrules\n") -> Pat
     return path
 
 
+#: The subject ``_make_app``'s identity middleware presents, and the id ``_state``
+#: reports as its owner. Steering writes are owner-only, so a suite about file
+#: resolution and content handling models the owner's own session.
+_OWNER_SUBJECT = "U0OWNER0000"
+
+
 def _state(project: str | Path | None = None, *, restricted: bool = False):
     """A MagicMock DashboardState exposing one slot with a project dir."""
     slot = MagicMock(project=str(project) if project else "", is_restricted=restricted)
-    return MagicMock(_slots={"default": slot}, _restricted_keys=set())
+    return MagicMock(
+        _slots={"default": slot}, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+    )
 
 
 def _project_headers(project: str | Path) -> dict[str, str]:
@@ -80,8 +89,22 @@ def _project_headers(project: str | Path) -> dict[str, str]:
     return {STEERING_PROJECT_HEADER: _project_key(Path(project))}
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    """What ``token_auth`` publishes for the owner's own dashboard session.
+
+    Without it these requests carry no dashboard-user claim at all, and the
+    owner gate on the write routes refuses them before the assertion each test is
+    about. The restricted-session rows are unaffected: ``_blocked`` runs first and
+    still answers for a restricted tab, owner or not.
+    """
+    request["user"] = _OWNER_SUBJECT
+    request["app"] = ""
+    return await handler(request)
+
+
 def _make_app(state):
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
     app["state"] = state
     app.router.add_get("/api/steering", api_steering)
     app.router.add_post("/api/steering", api_steering_create)
@@ -634,7 +657,9 @@ class TestProjectResolution:
             f"slot{i}": MagicMock(project=str(p), is_restricted=False)
             for i, p in enumerate(projects)
         }
-        return MagicMock(_slots=slots, _restricted_keys=set())
+        return MagicMock(
+            _slots=slots, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+        )
 
     def test_single_shared_project_is_used(self, fake_home, tmp_path):
         proj = tmp_path / "proj"
@@ -695,7 +720,9 @@ class TestProjectStateReason:
             f"slot{i}": MagicMock(project=str(p), is_restricted=False)
             for i, p in enumerate(projects)
         }
-        return MagicMock(_slots=slots, _restricted_keys=set())
+        return MagicMock(
+            _slots=slots, _restricted_keys=set(), owner_id=_OWNER_SUBJECT
+        )
 
     def test_single_slot_with_project_is_set(self, fake_home, tmp_path):
         proj = tmp_path / "proj"
@@ -1556,3 +1583,40 @@ class TestProjectPrecondition:
             resp = await client.get("/api/steering/workspace/api.md")
             assert resp.status == 200
             assert (await resp.json())["content"] == "# body\n"
+
+
+# ── Name length bound ──
+#
+# ``_safe_rel_name`` screens the character set but not the length, so a long name
+# would reach the write and the host would refuse the joined path for its length
+# (POSIX ENAMETOOLONG; a Windows host without LongPathsEnabled a bare
+# FileNotFoundError from CreateFileW), surfacing as an uncoded 500. The create
+# bounds the byte length first and answers a coded 400 on every host.
+
+
+class TestNameLengthBound:
+    @pytest.mark.asyncio
+    async def test_over_budget_name_is_coded_400(self, fake_home):
+        long_name = "a" * (MAX_STEERING_NAME_BYTES + 1)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.post(
+                "/api/steering", json={"name": long_name, "content": "x"}
+            )
+            assert resp.status == 400
+            data = await resp.json()
+        assert data["code"] == "name_too_long"
+        # Nothing written: the refusal precedes the create.
+        assert not (fake_home / ".kiro" / "steering" / f"{long_name}.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_at_budget_name_is_created(self, fake_home):
+        # "<stem>.md" exactly at the budget is accepted and written.
+        stem = "b" * (MAX_STEERING_NAME_BYTES - len(".md"))
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.post(
+                "/api/steering", json={"name": stem, "content": "# ok\n"}
+            )
+            assert resp.status == 200
+            key = (await resp.json())["key"]
+        assert key == f"user/{stem}.md"
+        assert (fake_home / ".kiro" / "steering" / f"{stem}.md").read_text() == "# ok\n"

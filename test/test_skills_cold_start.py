@@ -16,6 +16,7 @@ from kiro_crew import skills
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.security import paths
 from kiro_crew.skill_search_index import SkillSearchIndex
+from kiro_crew.testing.wait import wait_until
 
 
 def _skill(root: Path, key: str, *, always: bool = False) -> Path:
@@ -200,8 +201,10 @@ def test_inline_rebuilds_coalesce_and_waiters_refresh_roots(tmp_path, monkeypatc
                 current[0] = roots._replace(home=str(tmp_path / "moved"))
         finally:
             release.set()
-        assert first.result(timeout=5) == {roots.home}
-        assert second.result(timeout=5) == {current[0].home}
+        wait_until(first.done)
+        wait_until(second.done)
+        assert first.result() == {roots.home}
+        assert second.result() == {current[0].home}
     assert len(builds) == (2 if retarget else 1)
 
 
@@ -220,7 +223,8 @@ def test_bounded_gate_never_waits_for_inline_rebuild_lock(tmp_path, monkeypatch)
     with ThreadPoolExecutor(max_workers=1) as pool:
         with paths._home_targets_inline_lock:
             future = pool.submit(paths._home_dir_targets, [".ssh"])
-            assert future.result(timeout=5) == {roots.home}
+            wait_until(future.done)
+            assert future.result() == {roots.home}
 
 
 @pytest.mark.parametrize("existing_cache", [False, True])
@@ -233,6 +237,9 @@ def test_metadata_refresh_work_does_not_scan_other_skills(tmp_path, existing_cac
         "INSERT INTO skill_meta_term(term, path) VALUES (?, ?)",
         [(f"otherword{i:04}", f"other/{i}") for i in range(4096)],
     )
+    # Committed here: the index rolls back a transaction left open on its
+    # connection before handing it to the next call.
+    db.commit()
     assert index.store_metadata([("target", "before", {"name": "previousrare"})])
     if existing_cache:
         # Simulate the existing schema from before the access-path optimization.

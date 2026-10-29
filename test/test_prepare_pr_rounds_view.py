@@ -1,4 +1,4 @@
-"""Tests for `pr_findings.py --rounds`, the prepare-pr loop's cross-round memory.
+"""Tests for `pr_findings.py --rounds`, the kirocrew-prepare-pr loop's cross-round memory.
 
 The view is rebuilt from the PR's own writer-authored disposition comments, so
 nothing lives on disk and the record outlives the loop. Three properties are
@@ -27,7 +27,7 @@ SCRIPT = (
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "scripts"
     / "pr_findings.py"
 )
@@ -124,6 +124,33 @@ def test_exit_30_on_third_round_and_on_a_span_at_three(monkeypatch, capsys):
     assert "  aaaaaaaaaaa1 ×3" in capsys.readouterr().out
 
 
+def test_size_line_splits_code_and_test_and_never_moves_the_exit(monkeypatch, capsys):
+    mod = _load()
+    first, now = "a" * 40, "c" * 40
+    diffs = {
+        first: "src/x.py\t10\t2\ntest/test_x.py\t5\t0\n",
+        now: "src/x.py\t40\t5\ntest/test_x.py\t20\t1\nwebsite/electron/mochi/test/machineStore.test.js\t3\t0\n",
+    }
+
+    def fake_run(args):
+        sha = args[2].rsplit("...", 1)[1]
+        return (0, diffs[sha], "") if sha in diffs else (1, "", "No commit found")
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    _wire(mod, monkeypatch, [_disp(1, "gpt", first, "aaaaaaaaaaa1")])
+    assert mod.rounds_view("o/r", 7, now, {"baseRefName": "main"}) == 0
+    out = capsys.readouterr().out
+    assert "size at first judged head: code 12, test 5 lines   now: code 45, test 24 lines" in out
+    # a first head GitHub cannot read (force-pushed away) reads as unknown
+    _wire(mod, monkeypatch, [_disp(1, "gpt", "d" * 40, "aaaaaaaaaaa1")])
+    assert mod.rounds_view("o/r", 7, now, {"baseRefName": "main"}) == 0
+    assert "size at first judged head: unknown   now: code 45" in capsys.readouterr().out
+    # a compare GitHub truncated at its file cap is not a size
+    diffs[now] = "src/x.py\t1\t0\n" * mod.COMPARE_FILE_CAP
+    assert mod.rounds_view("o/r", 7, now, {"baseRefName": "main"}) == 0
+    assert "now: unknown" in capsys.readouterr().out
+
+
 def test_rounds_view_fails_closed_when_comments_are_unreadable(monkeypatch, capsys):
     mod = _load()
     monkeypatch.setattr(mod, "fetch_disposition_comments", lambda repo, number: None)
@@ -136,7 +163,39 @@ def test_rounds_view_fails_closed_when_comments_are_unreadable(monkeypatch, caps
 def test_skill_wires_the_rounds_view_and_the_two_lines():
     skill = (SCRIPT.parent.parent / "SKILL.md").read_text(encoding="utf-8")
     assert "pr_findings.py <pr#> --rounds" in skill
-    assert "prepare-pr-intent" in skill
+    # The intent lives in the PR body's frozen sections, not in a separate comment.
+    assert "prepare-pr-intent" not in skill
+    flat = " ".join(skill.split())
+    assert "Copy the frozen goal verbatim every round." in flat
+    assert "revert to `<head sha>` and redo via a smaller path" in flat
     assert "`self-added: yes|no`" in skill and "`mechanism: <one line>`" in skill
     assert "round_notes" not in skill
     assert "## Three questions per finding" in skill
+
+
+def test_the_frozen_goal_line_is_printed_from_the_pr_body(monkeypatch, capsys):
+    mod = _load()
+    _wire(mod, monkeypatch, [])
+    body = "## Problem / Motivation\r\n\r\n**Goal:**  Users can resume a chat.  \r\n"
+    assert mod.rounds_view("o/r", 7, "f" * 40, {"body": body}) == 0
+    assert "goal (frozen): Users can resume a chat.\n" in capsys.readouterr().out
+
+
+def test_an_unfilled_or_absent_goal_line_reads_as_missing(monkeypatch, capsys):
+    mod = _load()
+    _wire(mod, monkeypatch, [])
+    # The template ships an empty `**Goal:**` scaffold; that is not a goal.
+    for pr_json in ({"body": "## Problem / Motivation\n\n**Goal:**\n\nText.\n"}, {}):
+        mod.rounds_view("o/r", 7, "f" * 40, pr_json)
+        assert "goal (frozen): MISSING" in capsys.readouterr().out
+
+
+def test_the_goal_line_is_redacted_before_printing(monkeypatch, capsys):
+    """The body is PR-controlled, so a credential in it must not reach the transcript."""
+    mod = _load()
+    _wire(mod, monkeypatch, [])
+    secret = "ghp_" + "a" * 36
+    mod.rounds_view("o/r", 7, "f" * 40, {"body": "**Goal:** leak token={}\n".format(secret)})
+    out = capsys.readouterr().out
+    assert "goal (frozen): leak" in out
+    assert secret not in out

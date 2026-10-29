@@ -1,6 +1,7 @@
 import { api } from '../../api/client'
+import { apiErrorCode } from '../../api/apiError'
 import modelTokensRaw from '../../model_tokens.json'
-import { markModelsDegraded } from '../modelListHealth'
+import { markModelsDegraded, markModelsAuthRequired } from '../modelListHealth'
 import { isPricedMultiplier } from '../modelList'
 import { i18nT } from '../../i18n/t'
 import type {
@@ -10,6 +11,7 @@ import type {
   AgentBinding,
   NormalizedUsage,
   NormalizedProviderHook,
+  NormalizedUnsentHook,
   NormalizedPlugin,
   ModelInfo,
   PermissionMode,
@@ -217,6 +219,7 @@ interface RawDailyHistory {
   sessions: number
   messages: number
   tool_calls: number
+  credits?: number
 }
 
 /** Raw provider-hook entry from /api/kiro-hooks. */
@@ -224,6 +227,17 @@ interface RawHookEntry {
   command: string
   matcher?: string
   source?: string
+}
+
+/** Raw `unsent` entry from /api/kiro-hooks: a validated `agent.kiro_hooks`
+ *  document left out of the kiro-cli spec. */
+interface RawUnsentHook {
+  name?: string
+  trigger?: string
+  matcher?: string
+  action_type?: string
+  command?: string
+  reason?: string
 }
 
 /** Raw plugin (agent/skill/mcp) entry from /api/capability/*. */
@@ -293,36 +307,6 @@ function isBackendNamespaceUnavailable(e: unknown): boolean {
  *  the same reason: class identity does not survive a partial module mock or a
  *  second bundle realm. A gateway error that identifies its namespace lets the
  *  failure path judge the cache instead of guessing. */
-function backendFromErrorBody(e: unknown): string | null {
-  const body = (e as { body?: unknown } | null)?.body
-  if (typeof body !== 'string') return null
-  try {
-    const parsed = JSON.parse(body)
-    return typeof parsed?.backend === 'string' ? parsed.backend : null
-  } catch {
-    return null
-  }
-}
-
-/** Whether an ERROR body affirms that the active backend serves `auto`, or null
- *  when it says nothing about it.
- *
- *  The degraded 503 is the response that matters most here — it is the steady
- *  state of an adapter with no live session yet — so it carries `serves_auto`
- *  alongside `backend`. Tri-state on purpose: a body from an older gateway omits
- *  the field, and `false` would then be read as a denial rather than as silence,
- *  wrongly stripping a kiro-family operator's Auto row. */
-function servesAutoFromErrorBody(e: unknown): boolean | null {
-  const body = (e as { body?: unknown } | null)?.body
-  if (typeof body !== 'string') return null
-  try {
-    const parsed = JSON.parse(body)
-    return typeof parsed?.serves_auto === 'boolean' ? parsed.serves_auto : null
-  } catch {
-    return null
-  }
-}
-
 export class AcpAdapter implements ProviderAdapter {
   readonly id = 'acp' as const
   readonly displayName = 'ACP'
@@ -351,7 +335,6 @@ export class AcpAdapter implements ProviderAdapter {
 
   readonly labels: ProviderLabels = {
     sessionProcess: 'ACP subprocess',
-    agentTemplateField: 'Agent Template',
     processCountLabel: 'acp_cli',
     configFile: 'kirocrew.json',
     pluginRegistryName: 'Packages',
@@ -362,7 +345,7 @@ export class AcpAdapter implements ProviderAdapter {
     return agent.kiro_agent || agent.name
   }
 
-  async resolveModel(agentName: string): Promise<string> {
+  async resolveModel(agentName: string, app?: string): Promise<string> {
     // Ask the backend which model a new session on this agent would run on, so
     // the composer shows the real value before a session exists to report one.
     //
@@ -376,9 +359,10 @@ export class AcpAdapter implements ProviderAdapter {
     //
     // `agentName` is a KiroCrew agent name (a "crew"), not a kiro agent
     // template — the per-agent default is stored per crew, and several crews can
-    // share one template.
+    // share one template. `app` names the app that owns the session, so the
+    // answer includes that app's own model setting as the session start does.
     try {
-      const d = await api.agentResolvedModel(agentName)
+      const d = await (app ? api.agentResolvedModel(agentName, app) : api.agentResolvedModel(agentName))
       return d?.model || ''
     } catch {
       return ''
@@ -400,10 +384,12 @@ export class AcpAdapter implements ProviderAdapter {
 
   /** KiroCrew's configured default reasoning effort (Settings → Chat). '' means
    *  no default, i.e. the model picks its own. A per-slot override outranks it,
-   *  matching ConfigLoader._acp()'s `reasoning_effort_override or default`. */
-  async resolveDefaultEffort(): Promise<string> {
+   *  matching ConfigLoader._acp()'s `reasoning_effort_override or default`.
+   *  `readConfig` supplies the gateway config body from the caller's shared
+   *  `['kirocrewConfig']` query, avoiding a second GET at boot. */
+  async resolveDefaultEffort(readConfig: () => Promise<unknown>): Promise<string> {
     try {
-      const c = (await api.kirocrewConfig()) as KirocrewAgentConfig
+      const c = (await readConfig()) as KirocrewAgentConfig
       return c?.agent?.reasoning_effort || ''
     } catch {
       return ''
@@ -432,6 +418,7 @@ export class AcpAdapter implements ProviderAdapter {
     if (s?.error) throw new Error(String(s.error))
     const b = data.billing || {}
     return {
+      refreshing: data.refreshing === true,
       sessions: {
         total: s.total_sessions,
         today: { sessions: s.today.sessions, messages: s.today.messages, toolCalls: s.today.tool_calls },
@@ -444,6 +431,7 @@ export class AcpAdapter implements ProviderAdapter {
           sessions: d.sessions,
           messages: d.messages,
           toolCalls: d.tool_calls,
+          credits: typeof d.credits === 'number' && Number.isFinite(d.credits) ? d.credits : undefined,
         })),
       },
       billing: b.plan ? {
@@ -470,6 +458,20 @@ export class AcpAdapter implements ProviderAdapter {
       }))
     }
     return result
+  }
+
+  async fetchUnsentProviderHooks(): Promise<NormalizedUnsentHook[]> {
+    const data = await api.kiroHooks()
+    // An older gateway sends no `unsent`; that reads as nothing left out.
+    const unsent: RawUnsentHook[] = Array.isArray(data.unsent) ? data.unsent : []
+    return unsent.map(u => ({
+      name: u.name || '',
+      trigger: u.trigger || '',
+      matcher: u.matcher || '',
+      actionType: u.action_type || '',
+      command: u.command || '',
+      reason: u.reason || '',
+    }))
   }
 
   async listPlugins(): Promise<NormalizedPlugin[]> {
@@ -521,7 +523,7 @@ export class AcpAdapter implements ProviderAdapter {
       if (sessionScoped) markModelsDegraded(this.id, degraded)
     }
     try {
-      const raw = await api.models(opts?.slot ? { slot: opts.slot } : undefined)
+      const raw = await api.models()
       // TWO shapes, and the shape itself identifies the namespace. The kiro
       // path answers with a BARE ARRAY; a non-kiro backend answers
       // `{models, backend}`. Reading only the array form treated a perfectly
@@ -574,53 +576,41 @@ export class AcpAdapter implements ProviderAdapter {
       }
       markDegraded(false) // live success → self-heal can stop polling
       return result
-    } catch (e) {
-      // Two different failures reach this catch and they need opposite answers.
-      //
-      // `acp_backend_models_unavailable` is the gateway saying the active
-      // backend is NOT kiro and no live session has advertised its namespace
-      // yet. Falling back to `auto` there offers an id that backend does not
-      // serve: "auto" is a kiro-namespace sentinel the gateway resolves against
-      // kiro's advertised set, and a spec adapter rejects it. The operator would
-      // pick the only row on offer and the turn would fail at the wire. Serve
-      // nothing instead and let the picker render its empty/degraded state — no
-      // rows is honest, one unusable row is not.
-      //
-      // Anything else is a transient backend failure (503 / network / cold
-      // start). The cache may still be served there, but ONLY when it is stamped
-      // with the namespace that is actually active — otherwise a blip on a spec
-      // adapter would resurrect kiro's ids, which is the very confusion the
-      // branch above exists to prevent.
+    } catch (err) {
+      // Transient backend failure (503 / network): NOT live — keep polling.
+      // Serve the last-good live list if we have one, else auto-only. Never
+      // surface canonical registry keys — the ACP CLI rejects them (-32603).
+      // Read the refusal code HERE, where the error is formed, so an expired /
+      // signed-out kiro-cli login (503 `kiro_prerequisite_required`) can raise
+      // the one actionable sign-in banner instead of the generic config-load
+      // failure. Any other cause clears the auth flag — only this code means a
+      // sign-in wall.
       markDegraded(true)
-      if (sessionScoped) return []
-      const named = backendFromErrorBody(e)
-      if (named !== null) rememberBackend(named)
-      const affirmed = servesAutoFromErrorBody(e)
-      if (affirmed !== null) rememberServesAuto(affirmed)
-      if (isBackendNamespaceUnavailable(e)) {
-        // No live session has advertised yet. A cache stamped for THIS backend
-        // is still its own namespace and stays valid — the refusal is about not
-        // knowing the namespace, not about the cache being wrong. Anything
-        // stamped for another backend (or unstamped) yields no rows, because a
-        // plausible `gpt-5.6-sol` row reads as a real option and is rejected at
-        // the wire.
-        //
-        // `auto` survives here ONLY on an explicit affirmation in this very body,
-        // not on `servesAutoModel()`'s remembered default. Reaching this branch is
-        // itself proof the backend is not kiro — the gateway emits this code
-        // nowhere else — so the absent-means-kiro default is not merely
-        // unnecessary here, it would be wrong, and a body from a gateway too old
-        // to send the field must keep answering with no rows.
-        //
-        // The affirmation exists for KAS, which reaches this branch like any other
-        // non-kiro backend (it has no local binary to list models) yet does serve
-        // `auto`. Deciding by "is the backend id non-empty" stripped the Auto row
-        // from a harness that has it; asking whether the backend serves `auto`
-        // states the actual requirement (harness-parity H6).
-        return readCachedModels(named) ?? (affirmed === true ? this._defaultModels() : [])
+      markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
+      if (isBackendNamespaceUnavailable(err)) {
+        const refusal = (err as { body?: string }).body
+        try {
+          const envelope = JSON.parse(refusal ?? '') as {
+            backend?: unknown
+            serves_auto?: unknown
+          }
+          if (typeof envelope.backend === 'string') {
+            rememberBackend(envelope.backend)
+            rememberServesAuto(
+              envelope.backend === '' || envelope.serves_auto === true
+            )
+          } else {
+            // This refusal is emitted by non-Kiro adapters whose namespace
+            // cannot be listed yet. Missing capability metadata cannot make
+            // the Kiro-only `auto` sentinel safe to offer.
+            rememberServesAuto(false)
+          }
+        } catch {
+          // The code predicate already checked the body; malformed extras do
+          // not identify a namespace, so keep the last known answer.
+        }
       }
-      const active = named ?? lastKnownBackend()
-      return readCachedModels(active) ?? (servesAutoModel() ? this._defaultModels() : [])
+      return readCachedModels(lastKnownBackend()) ?? (servesAutoModel() ? this._defaultModels() : [])
     }
   }
 

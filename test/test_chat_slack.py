@@ -9,6 +9,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state, drain_background_tasks
 
+from kiro_crew.messaging.link import ChannelLink, binding_token
+
 
 def _make_slack_app(state):
     from kiro_crew.dashboard.chat_slack import (
@@ -109,6 +111,195 @@ class TestSlackLink:
 
 class TestSlackUnlink:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "relink_ts", ["ts-2", "ts-1"], ids=["another-thread", "the-same-thread"]
+    )
+    async def test_a_relink_that_lands_inside_the_flush_window_survives_the_unlink(
+        self, tmp_path, monkeypatch, relink_ts
+    ):
+        """The teardown is conditional on what the map holds after the flush.
+
+        The durability wait is a real thread hop, and a second same-slot
+        ``slack-link`` can run its whole handler inside it (the existing-thread
+        branch reaches ``link_slack`` with no network await). An unconditional
+        teardown afterwards stripped that NEW link's fields and reverse-index
+        entry while the map kept asserting it, and a re-link then short-circuited
+        on ``already_linked`` -- no in-process recovery. Now the route reads the
+        map once the await returns: a link there is the newer write (the route
+        cleared the old one), so its fields and index stand, the thread gets no
+        "unlinked" note and no struck control, and the answer says ``relinked``.
+        Both a different thread and the very same thread relinked -- the latter
+        is the case a field-by-field compare cannot see.
+        """
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map._FLUSH_DEBOUNCE_SECS", 60.0)
+        sm = SessionMap()
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        key = f"dashboard:{slot.key}"
+        sm.set_slack_link(key, "ts-1", "C-1")
+        sm.flush()
+        slot._slack_linked = True
+        slot._slack_channel = "C-1"
+        slot._slack_thread_ts = "ts-1"
+        state._slack_to_slot["ts-1"] = slot.key
+        for name in (
+            "set_slack_link",
+            "clear_slack_link",
+            "clear_slack_link_if",
+            "get_slack_link",
+            "batched_save",
+        ):
+            setattr(state.sessions, name, getattr(sm, name))
+        state.slack_client = MagicMock()
+        state.slack_client.post_message = AsyncMock()
+        state.push_slots_update = MagicMock()
+        strikes = AsyncMock()
+        monkeypatch.setattr("kiro_crew.dashboard.chat_slack.expire_slack_options", strikes)
+
+        async def relink_inside_the_write_window() -> None:
+            # The concurrent request, landing while the unlink waits on the disk:
+            # the real link path, fields and reverse index included.
+            state.link_slack(slot.key, relink_ts, "C-1")
+            await sm.aflush()
+
+        state.sessions.aflush = relink_inside_the_write_window
+        try:
+            async with TestClient(TestServer(_make_slack_app(state))) as client:
+                resp = await client.post("/api/chat/slots/s1/slack-unlink")
+                assert resp.status == 200
+                answer = await resp.json()
+            # The newer link stands, in the map and in the process alike.
+            assert sm.get_slack_link(key) == (relink_ts, "C-1")
+            assert slot._slack_linked is True, "the unlink stripped the relinked slot's fields"
+            assert slot._slack_channel == "C-1"
+            assert slot._slack_thread_ts == relink_ts
+            assert state._slack_to_slot.get(relink_ts) == slot.key
+            assert answer == {"ok": True, "was_linked": True, "relinked": True}
+            # Nothing told the relinked thread it was unlinked.
+            state.slack_client.post_message.assert_not_awaited()
+            strikes.assert_not_awaited()
+            # The row redraw still goes out: it carries the newer link.
+            state.push_slots_update.assert_called()
+        finally:
+            await sm.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_plain_unlink_still_tears_down_the_slot_and_the_reverse_index(
+        self, tmp_path, monkeypatch
+    ):
+        """No relink inside the window: the old binding's fields and index go, the note is posted."""
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map._FLUSH_DEBOUNCE_SECS", 60.0)
+        sm = SessionMap()
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        key = f"dashboard:{slot.key}"
+        sm.set_slack_link(key, "ts-1", "C-1")
+        sm.flush()
+        slot._slack_linked = True
+        slot._slack_channel = "C-1"
+        slot._slack_thread_ts = "ts-1"
+        state._slack_to_slot["ts-1"] = slot.key
+        for name in ("clear_slack_link", "clear_slack_link_if", "get_slack_link", "aflush"):
+            setattr(state.sessions, name, getattr(sm, name))
+        state.slack_client = MagicMock()
+        state.slack_client.post_message = AsyncMock()
+        state.push_slots_update = MagicMock()
+        try:
+            async with TestClient(TestServer(_make_slack_app(state))) as client:
+                resp = await client.post("/api/chat/slots/s1/slack-unlink")
+                assert resp.status == 200
+                assert (await resp.json()) == {"ok": True, "was_linked": True, "relinked": False}
+            assert sm.get_slack_link(key) == (None, None)
+            assert slot._slack_linked is False
+            assert slot._slack_channel == ""
+            assert slot._slack_thread_ts == ""
+            assert "ts-1" not in state._slack_to_slot
+            state.slack_client.post_message.assert_awaited_once()
+            assert "ts-1" not in (tmp_path / "session_map.json").read_text(encoding="utf-8")
+        finally:
+            await sm.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_flush_still_tears_down_the_slot_and_the_reverse_index(
+        self, tmp_path, monkeypatch
+    ):
+        """The in-process teardown follows the map's clear, in failure too.
+
+        The route clears the persisted link, then awaits the map's durability
+        point before it tells the user. ``SessionMap.aflush`` re-raises a
+        failed write (a full or read-only data home), and the failure must
+        surface -- but the map is already clear in memory, so a teardown
+        skipped by the raise would leave the slot's fields and the thread's
+        reverse-index entry asserting a thread the map does not hold: the
+        row keeps rendering, a reply in the thread still resolves here, and a
+        retried Unlink is 409 with nothing left to compare. Driven against a
+        REAL map with the debounce held off, so the route's own flush is the
+        write that fails.
+        """
+        import errno
+        import os
+
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        monkeypatch.setattr("kiro_crew.session_map._FLUSH_DEBOUNCE_SECS", 60.0)
+        sm = SessionMap()
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        sm.set_slack_link(f"dashboard:{slot.key}", "ts-1", "C-1")
+        sm.flush()
+        on_disk = tmp_path / "session_map.json"
+        assert "ts-1" in on_disk.read_text(encoding="utf-8"), "precondition: the thread is on disk"
+        slot._slack_linked = True
+        slot._slack_channel = "C-1"
+        slot._slack_thread_ts = "ts-1"
+        state._slack_to_slot["ts-1"] = slot.key
+        state.sessions.clear_slack_link = sm.clear_slack_link
+        state.sessions.clear_slack_link_if = sm.clear_slack_link_if
+        state.sessions.get_slack_link = sm.get_slack_link
+        state.sessions.aflush = sm.aflush
+        state.push_slots_update = MagicMock()
+        # The disk fails for as long as the switch is on -- the route's flush
+        # raises; the teardown at the end of the test writes normally again.
+        disk = {"full": True}
+        real_write = SessionMap._write_payload
+
+        def failing_write(self, payload, seq):
+            if disk["full"]:
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            return real_write(self, payload, seq)
+
+        monkeypatch.setattr(SessionMap, "_write_payload", failing_write)
+        try:
+            async with TestClient(TestServer(_make_slack_app(state))) as client:
+                resp = await client.post("/api/chat/slots/s1/slack-unlink")
+                # The failure surfaces: no `ok`, no was_linked, nothing published.
+                assert resp.status == 500
+            state.push_slots_update.assert_not_called()
+            # The map is clear in memory; the fields and the reverse index follow it.
+            assert sm.get_slack_link(f"dashboard:{slot.key}") == (None, None)
+            assert slot._slack_linked is False
+            assert slot._slack_channel == ""
+            assert slot._slack_thread_ts == ""
+            assert "ts-1" not in state._slack_to_slot
+            # The residue, exactly: the write failed, so the file still holds the
+            # thread -- a restart reloads the link, and the user was told nothing
+            # to the contrary.
+            assert "ts-1" in on_disk.read_text(encoding="utf-8")
+        finally:
+            disk["full"] = False
+            await sm.aclose()
+
+    @pytest.mark.asyncio
     async def test_slot_not_found(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -135,7 +326,7 @@ class TestSlackUnlink:
             resp = await client.post("/api/chat/slots/s1/slack-unlink")
             assert resp.status == 200
             data = await resp.json()
-            assert data == {"ok": True, "was_linked": True}
+            assert data == {"ok": True, "was_linked": True, "relinked": False}
         # Both key variants cleared: "dashboard:s1" (from _history_key_for) and "s1".
         cleared_keys = {c.args[0] for c in state.sessions.clear_slack_link.call_args_list}
         assert cleared_keys == {"dashboard:s1", "s1"}
@@ -143,6 +334,157 @@ class TestSlackUnlink:
         assert slot._slack_linked is False
         assert slot._slack_channel == ""
         assert slot._slack_thread_ts == ""
+
+    @pytest.mark.asyncio
+    async def test_a_stale_row_cannot_unlink_a_relinked_thread(self, tmp_path, monkeypatch):
+        """Same guard as mirror-unlink, on the Slack fields the row is drawn from.
+
+        The thread id is the only discriminator a Slack link has: a re-link after
+        an unlink (or a Slack-side resume) lands in the SAME owner DM channel on
+        a fresh thread. A tab still showing the old thread's row must not tear
+        down the replacement: the old row's token is a 409 ``mirror_changed``
+        that clears nothing, the current row's token unlinks, and no body keeps
+        the unconditional clear.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot._slack_linked = True
+        slot._slack_channel = "D-owner-dm"
+        slot._slack_thread_ts = "ts-new"
+        state.sessions.set_slack_link("dashboard:s1", "ts-new", "D-owner-dm")
+        state.slack_client = MagicMock()
+        state.slack_client.post_message = AsyncMock()
+        state.sessions.clear_slack_link = MagicMock(return_value=True)
+        state.push_slots_update = MagicMock()
+        old_row = ChannelLink("slack", channel_id="D-owner-dm", thread_id="ts-old")
+        current_row = ChannelLink("slack", channel_id="D-owner-dm", thread_id="ts-new")
+        current_token = binding_token(current_row, state.sessions.slack_link_nonce("dashboard:s1"))
+        assert binding_token(old_row) != current_token
+        async with TestClient(TestServer(_make_slack_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/slack-unlink",
+                json={"channel_type": "slack", "binding": binding_token(old_row)},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "mirror_changed"
+            state.sessions.clear_slack_link.assert_not_called()
+            assert slot._slack_linked is True
+            resp = await client.post(
+                "/api/chat/slots/s1/slack-unlink",
+                json={"channel_type": "slack", "binding": current_token},
+            )
+            assert resp.status == 200
+            assert (await resp.json()) == {"ok": True, "was_linked": True, "relinked": False}
+        assert slot._slack_linked is False
+
+    @pytest.mark.asyncio
+    async def test_a_garbled_body_is_refused_on_the_slack_route_too(self, tmp_path, monkeypatch):
+        """The one body reader serves both routes: garbled JSON is 400 here as well.
+
+        Only an EMPTY body reaches the unconditional clear; a body that is present
+        but unparseable (or not an object) is refused with ``invalid_body`` and
+        the thread stays linked.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot._slack_linked = True
+        slot._slack_channel = "D-owner-dm"
+        slot._slack_thread_ts = "ts-new"
+        state.sessions.set_slack_link("dashboard:s1", "ts-new", "D-owner-dm")
+        state.slack_client = MagicMock()
+        state.slack_client.post_message = AsyncMock()
+        state.sessions.clear_slack_link = MagicMock(return_value=True)
+        state.push_slots_update = MagicMock()
+        headers = {"Content-Type": "application/json"}
+        async with TestClient(TestServer(_make_slack_app(state))) as client:
+            for garbled in ('{"channel_type": "slack", ', "[]"):
+                resp = await client.post(
+                    "/api/chat/slots/s1/slack-unlink", data=garbled, headers=headers
+                )
+                assert resp.status == 400, garbled
+                assert (await resp.json())["code"] == "invalid_body"
+        state.sessions.clear_slack_link.assert_not_called()
+        state.push_slots_update.assert_not_called()
+        assert slot._slack_linked is True
+
+    @pytest.mark.asyncio
+    async def test_an_undecodable_body_is_refused_on_the_slack_route_too(
+        self, tmp_path, monkeypatch
+    ):
+        """Invalid UTF-8 or an unknown charset is the garbled body here as well: 400, nothing cleared."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot._slack_linked = True
+        slot._slack_channel = "D-owner-dm"
+        slot._slack_thread_ts = "ts-new"
+        state.sessions.set_slack_link("dashboard:s1", "ts-new", "D-owner-dm")
+        state.sessions.clear_slack_link = MagicMock(return_value=True)
+        state.push_slots_update = MagicMock()
+        async with TestClient(TestServer(_make_slack_app(state))) as client:
+            for data, headers in (
+                (b"\xff\xfe{", {"Content-Type": "application/json; charset=utf-8"}),
+                (
+                    b'{"channel_type": "slack"}',
+                    {"Content-Type": "application/json; charset=zzq-no-such"},
+                ),
+            ):
+                resp = await client.post(
+                    "/api/chat/slots/s1/slack-unlink", data=data, headers=headers
+                )
+                assert resp.status == 400, headers
+                assert (await resp.json())["code"] == "invalid_body"
+        state.sessions.clear_slack_link.assert_not_called()
+        state.push_slots_update.assert_not_called()
+        assert slot._slack_linked is True
+
+    @pytest.mark.asyncio
+    async def test_a_row_from_before_an_unlink_cannot_unlink_the_same_thread_relinked(
+        self, tmp_path, monkeypatch
+    ):
+        """A thread re-linked to the SAME coordinates after an unlink is a new binding.
+
+        Same ABA as the mirror side: the coordinates alone cannot tell the old
+        binding from its byte-identical recreation, so the row's token digests
+        the link's own persisted nonce -- minted by ``set_slack_link`` on every
+        create or rebind, dropped by ``clear_slack_link`` -- and a delayed unlink
+        naming the old row is refused instead of tearing down the new link.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("s1")
+        slot._slack_linked = True
+        slot._slack_channel = "D-owner-dm"
+        slot._slack_thread_ts = "ts-same"
+        state.sessions.set_slack_link("dashboard:s1", "ts-same", "D-owner-dm")
+        state.slack_client = MagicMock()
+        state.slack_client.post_message = AsyncMock()
+        state.push_slots_update = MagicMock()
+        row = ChannelLink("slack", channel_id="D-owner-dm", thread_id="ts-same")
+        old_token = binding_token(row, state.sessions.slack_link_nonce("dashboard:s1"))
+        # Another tab: unlink, then re-link the same thread.
+        assert state.sessions.clear_slack_link("dashboard:s1") is True
+        state.sessions.set_slack_link("dashboard:s1", "ts-same", "D-owner-dm")
+        new_token = binding_token(row, state.sessions.slack_link_nonce("dashboard:s1"))
+        assert new_token != old_token
+        async with TestClient(TestServer(_make_slack_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/slack-unlink",
+                json={"channel_type": "slack", "binding": old_token},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "mirror_changed"
+            assert state.sessions.get_slack_link("dashboard:s1") == ("ts-same", "D-owner-dm")
+            assert slot._slack_linked is True
+            resp = await client.post(
+                "/api/chat/slots/s1/slack-unlink",
+                json={"channel_type": "slack", "binding": new_token},
+            )
+            assert resp.status == 200
+        assert state.sessions.get_slack_link("dashboard:s1") == (None, None)
+        assert slot._slack_linked is False
 
     @pytest.mark.asyncio
     async def test_unlink_posts_courtesy_note(self, tmp_path, monkeypatch):
@@ -179,7 +521,7 @@ class TestSlackUnlink:
             resp = await client.post("/api/chat/slots/s1/slack-unlink")
             assert resp.status == 200
             data = await resp.json()
-            assert data == {"ok": True, "was_linked": False}
+            assert data == {"ok": True, "was_linked": False, "relinked": False}
         # No courtesy note when nothing was linked.
         state.slack_client.post_message.assert_not_awaited()
 
@@ -389,7 +731,7 @@ class TestSlackLinkAnchorTitleFallback:
     @pytest.mark.asyncio
     async def test_default_key_title_never_leaks(self, tmp_path, monkeypatch):
         """Fork adaptation guard: a slot fresh from get_or_create_slot carries
-        its raw key as the DEFAULT title (state.py initializes title to the
+        its raw key as the DEFAULT title (state_parts/chat_slot.py initializes title to the
         key); the display_title predicate must treat that as untitled so the
         anchor shows 'New session', never the raw key."""
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)

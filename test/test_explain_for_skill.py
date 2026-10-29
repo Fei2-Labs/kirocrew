@@ -32,8 +32,10 @@ from pathlib import Path
 
 import pytest
 
+import kiro_crew.skills as skills_module
 from kiro_crew.config.loader import KiroCrewConfig, SkillsConfig
 from kiro_crew.skills import SkillsLoader
+from kiro_crew.testing.wait import wait_until
 
 ROOT = Path(__file__).resolve().parent.parent
 SKILL_DIR = ROOT / "src" / "kiro_crew" / "builtin_skills" / "explain-for"
@@ -41,6 +43,11 @@ SKILL_FILE = SKILL_DIR / "SKILL.md"
 EVAL_DIR = ROOT / "evals" / "explain-for"
 CASES_FILE = EVAL_DIR / "cases.json"
 RUNNER = EVAL_DIR / "run_evals.py"
+
+# Generous on purpose: this bounds a lost race on a loaded runner, so it must be
+# far above the loader's own ``_COLD_CATALOG_WAIT_SECS`` (2s) or it re-creates
+# the flake it guards against with a bigger number.
+_CATALOG_WAIT_SECS = 30.0
 
 
 def _cases() -> list[dict]:
@@ -52,7 +59,7 @@ def _case_id(case: dict) -> str:
 
 
 @pytest.fixture
-def loader(tmp_path: Path) -> SkillsLoader:
+def loader(tmp_path: Path, opened) -> SkillsLoader:
     """A loader over a skills tree holding only explain-for.
 
     Two things are pinned deliberately, and neither is incidental.
@@ -65,7 +72,7 @@ def loader(tmp_path: Path) -> SkillsLoader:
     **``config`` is passed explicitly, and the fixture is function-scoped.**
     ``SkillsLoader(config=None)`` falls back to ``KiroCrewConfig.load()``, which
     resolves ``config_dir()`` — and that CREATES the operator's real data home as
-    a side effect (see ``_isolate_kirocrew_home`` in the rootdir ``conftest.py``),
+    a side effect (see ``_isolate_kirocrew_home`` in ``test/conftest_floor_home.py``),
     which ``no-test-side-effects`` forbids. A module-scoped fixture is built
     BEFORE that function-scoped autouse isolation applies, so the scope is load
     bearing here, not a performance choice.
@@ -82,15 +89,84 @@ def loader(tmp_path: Path) -> SkillsLoader:
     with the triggers under test. ``1`` is the tightest non-zero cap, so these
     assertions state that explain-for is reachable even when a message may flag
     one skill.
+
+    **The catalog is settled before the loader is handed out.** A brand-new
+    skills root has no in-memory list and no stored snapshot, so the first
+    enumeration waits at most ``_COLD_CATALOG_WAIT_SECS`` (2s) on a background
+    walk and then serves ``[]`` with the scope marked ``"building"`` — by design,
+    so a live turn never stalls on discovery. A test is not a live turn: an empty
+    catalog there fails exactly the ``expect_trigger`` cases while the control
+    cases pass trivially: the failing parameter id is whichever triggering case
+    the losing shard is handed, and a rerun is green. Polling the
+    public ``catalog_status`` to ``"complete"`` here turns a lost race into an
+    honest wait for every test in the class, not just the one seen to fail.
+
+    **The loader is closed at teardown.** Construction opens the skill search
+    index (a SQLite connection) and the first discovery starts the catalog
+    worker; ``opened`` releases both through ``SkillsLoader.close()`` so no test
+    leaks descriptors or a thread (``no-test-side-effects``).
     """
     dest = tmp_path / "skills" / "explain-for"
     dest.mkdir(parents=True)
     (dest / "SKILL.md").write_text(SKILL_FILE.read_text(encoding="utf-8"), encoding="utf-8")
-    return SkillsLoader(
-        skills_path=tmp_path / "skills",
-        install_builtins=False,
-        config=KiroCrewConfig(skills=SkillsConfig(max_triggered=1)),
+    loader = opened(
+        SkillsLoader(
+            skills_path=tmp_path / "skills",
+            install_builtins=False,
+            config=KiroCrewConfig(skills=SkillsConfig(max_triggered=1)),
+        )
     )
+    _settle_catalog(loader)
+    return loader
+
+
+def _settle_catalog(loader: SkillsLoader) -> None:
+    """Block until *loader*'s first discovery walk has published its list.
+
+    ``catalog_status`` answers ``"complete"`` for a scope that has never been
+    asked, so the first ``list_skills`` call is what arms it: it either returns
+    the full list inside the cold budget (status stays ``"complete"``) or marks
+    the scope ``"building"`` and returns a partial answer. From then on each poll
+    re-requests the walk and the status flips back once it publishes. No fixed
+    sleep decides the outcome; the deadline only bounds a runner that is truly
+    stuck.
+    """
+
+    def _published() -> bool:
+        loader.list_skills()
+        return loader.catalog_status() == "complete"
+
+    wait_until(
+        _published,
+        timeout=_CATALOG_WAIT_SECS,
+        describe=lambda: (
+            f"skill catalog still building after {_CATALOG_WAIT_SECS:.0f}s; "
+            "the fixture cannot vouch for a complete catalog"
+        ),
+    )
+
+
+@pytest.fixture
+def lost_cold_race(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Expire the loader's cold-start budget instantly.
+
+    This is the race a loaded Windows shard loses, made deterministic:
+    the first enumeration of a fresh root is guaranteed to come back partial.
+    Request it BEFORE ``loader`` so the fixture builds under the shrunken budget.
+    """
+    monkeypatch.setattr(skills_module, "_COLD_CATALOG_WAIT_SECS", 0.0)
+
+
+class TestTheFixtureSettlesTheCatalog:
+    def test_a_lost_cold_race_still_yields_a_complete_catalog(
+        self, lost_cold_race: None, loader: SkillsLoader
+    ):
+        """Without ``_settle_catalog`` the first read is ``[]`` and ``"building"``."""
+        assert "explain-for" in [s["name"] for s in loader.list_skills()]
+        assert loader.catalog_status() == "complete"
+        assert "explain-for" in loader.get_triggered_skills(
+            "Explain like I am five what a message queue is"
+        )
 
 
 class TestReachability:

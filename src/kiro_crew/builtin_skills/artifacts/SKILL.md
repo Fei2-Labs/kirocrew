@@ -1,6 +1,6 @@
 ---
 name: artifacts
-description: Persist, version, and iterate on LLM-generated UI (widgets, HTML, markdown). Load when the user wants to save, find, update, or iterate on a previously-rendered widget — anything that should outlive the chat scrollback.
+description: Persist, version, and iterate on LLM-generated UI (widgets, HTML, markdown). Load for Dynamic Dashboards on long workflows and conductor runs, or when saving, finding or updating a previously-rendered widget.
 triggers: artifact, save widget, save this, iterate, iterate on, update the widget, change the widget, version, library, find widget, what have we built, iterate again, redo the
 ---
 
@@ -26,7 +26,82 @@ on across sessions without losing prior versions, or share with peers for
 feedback. The library is curated: it holds work worth keeping, not a mirror of
 every file or a copy of the chat.
 
-## Mental model
+## Dynamic Dashboards for long work
+
+The host's opt-in automatic session cards are separate from saved artifacts:
+session events trigger bounded updates from that session's recent messages,
+without a conductor publishing on its behalf. The model can reuse a card's HTML
+layout and update only text data. Runtime state, Needs you, and exact-session
+answers/approvals belong to the host. Polling an artifact is not a card-generation
+trigger. Use the saved-view flow below for a durable, task-specific publication,
+not to imitate those controls or keep every session's status alive.
+
+Interactive sessions with a Dashboard surface receive a concise saved-view
+pointer, not this whole skill. When the current automatic-cards setting is on,
+their per-turn guidance also requests concise evidence, result and next step at
+milestones, failures or human-only decisions. The next turn observes live setting
+changes, including after resume or compaction. Those messages feed eligible
+automatic cards; no special
+markup, tool-by-tool narration, duplicate artifact or extra builder is needed.
+Load this skill on demand for a distinct durable visualization. Do not enable
+automatic generation yourself, promise an immediate update, or bypass privacy
+or permission limits. Reuse a saved view when it already serves the task.
+
+For a large workflow, conductor run or multi-session task, publish a Dynamic Dashboard
+early and update it at meaningful milestones. The model owns the design: choose
+the information architecture and visual form the task needs, and change it when
+the work changes. A timeline, dependency map, experiment comparison, release
+board or deliverable gallery are examples, NOT required panels or a template.
+Respect any known style preferences; do not interrupt unattended work to ask
+about style when the user delegated that choice.
+
+- Create with `artifact_save(name=<task title>, kind="html", tags=["task-dashboard"],
+  content=<self-contained HTML>)` from the owning session or a descendant
+  dashboard-builder session. Caller provenance, not a title or claimed root id,
+  determines where it appears. A builder in an unrelated session will not appear
+  in this team's dashboard. Never borrow another task's artifact because its
+  name happens to match.
+- Keep the returned slug. Publish subsequent changes with `artifact_update`
+  on that slug; retain the tag. Do not make a new artifact per step. The chat and
+  Crew side panels pick up each published change as it is saved while visible.
+- Use real status/evidence from the task's existing sources. Show what is stuck,
+  what needs human input, its context, and the next action. Distinguish a proposed
+  default from an authorized action. No invented progress percentages, elapsed
+  times, fabricated approvals or "complete" claims from an idle worker. Stamp
+  the snapshot with the real clock and refresh after a meaningful state change.
+- For decisions, use the real `ask_question` capability. Tool approvals remain
+  the runtime's normal approval flow. The host separately lists questions and
+  approvals by their exact owning session, including Normal permission mode.
+  Do not build imitation approval buttons or claim that clicking HTML can change
+  a session's permissions. Never change approval mode to keep a run moving.
+- The chat side panel shows the published page as its WHOLE Overview (the host
+  draws only the header, the Overview / Questions / Approvals segments with their
+  counts, and notices), so a recommended layout, not a template: what needs the
+  user first, naming or linking the decision (answering happens in the Questions
+  tab, not in the page); then one line per work item with a status word (done /
+  running / waiting / needs you) and details folded in `details`; when tasks wait
+  on others, show the dependencies — batches that can run together, a "waits on
+  #N" mark, or a metro-line style map for many tasks; cost/credits and technical
+  detail (SHAs, check counts) inside the folded details; theme CSS variables.
+- HTML/CSS/SVG may freely lay out the presentation. Use theme variables, readable
+  typography and responsive layouts from a 320px phone to an expanded view.
+  Use meaningful task/session names and plain-language summaries: explain what
+  happened, what is stuck, and what decision is needed. Internal session/run IDs
+  belong only in optional technical details, never as the main labels. Avoid
+  fixed-width canvases or tables that force the whole page to scroll sideways;
+  stack or disclose dense content on phones and keep controls touch-friendly. The
+  frame strips model scripts, event handlers, forms, remote resources and outbound
+  links. Use native `details`/`summary` for disclosure; no JavaScript runtime is
+  provided. Do not fetch APIs; publish fresh content through the tool.
+  Native answers and approvals live outside the authored frame.
+- A dashboard is a projection, not a second task store or a reason to widen
+  authority. Read-only conductors can delegate presentation to an authorized
+  descendant; they must not unmount their own restrictions to publish it.
+  If publishing is unavailable or the session is incognito/temporary, keep
+  reporting normally; do not bypass the persistence policy. The host's live
+  activity and approval surfaces still work without an authored page.
+
+## Artifact identity
 
 | Concept | Means |
 |---|---|
@@ -53,8 +128,8 @@ every file or a copy of the chat.
 | `artifact_folder_rename` | Rename a folder |
 | `artifact_folder_move` | Reparent a folder (cycle-guarded) |
 | `artifact_folder_delete` | Remove a folder; safe by default, destructive with `delete_contents=true` |
-| `artifact_get_comments` | Read every comment thread on an artifact |
-| `artifact_post_comment` | Open a thread, optionally anchored to a quoted span |
+| `artifact_get_comments` | Read every comment thread on an artifact; pass `exclude_resolved` to skip threads already resolved |
+| `artifact_post_comment` | Open a document-level thread (`slug`, `text`, optional `scope`); the tool takes no anchor — only the dashboard can anchor a comment to a span |
 | `artifact_reply_comment` | Reply in an existing thread |
 | `artifact_mark_review` | Advance a thread to REVIEW — addressed, awaiting human check |
 | `artifact_delete_comment` | Delete a thread you demonstrably applied; requires a reason |
@@ -245,7 +320,8 @@ Rules:
 
 When the user asks "what have we built?" / "what artifacts do we have?" /
 "show me my widgets", call `artifact_list` and present the results — slug,
-name, kind, version, updated_at. Group by tag if that aids comprehension.
+name, kind, version and tags (it lists newest first; `artifact_get` gives
+`updated_at`). Group by tag if that aids comprehension.
 
 `artifact_list` accepts `tag`, `kind`, and `q` (name substring) filters.
 Use them to narrow when the user gives constraints.

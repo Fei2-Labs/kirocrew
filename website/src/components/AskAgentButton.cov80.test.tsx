@@ -40,7 +40,7 @@ describe('AskAgentButton', () => {
     const prompt = send.mock.calls[0][0]
     expect(prompt).toContain('zzq-boom-1')
     expect(prompt).toContain('zzq-detail-1')
-    expect(send.mock.calls[0][1]).toEqual({ hard: false })
+    expect(send.mock.calls[0][1]).toEqual({ hard: false, leaveGranted: false })
   })
 
   it('falls back to the bare message when the journal has no entry', () => {
@@ -53,7 +53,25 @@ describe('AskAgentButton', () => {
     render(<AskAgentButton report={report({ message: 'zzq-explicit' })} hard variant="solid" />)
     fireEvent.click(screen.getByRole('button'))
     expect(send.mock.calls[0][0]).toContain('zzq-explicit')
-    expect(send.mock.calls[0][1]).toEqual({ hard: true })
+    expect(send.mock.calls[0][1]).toEqual({ hard: true, leaveGranted: false })
+  })
+
+  it('runs the whole hand-off through the gate, so a veto stages nothing', () => {
+    // The gate stands in for `useGuardedLeave`'s `leave`: it is handed the
+    // hand-off and decides. Declining must leave no trace — not even a staged
+    // prompt for the next chat to drain.
+    const gate = vi.fn<(proceed: () => void) => void>()
+    render(<AskAgentButton message="zzq-gated" gate={gate} />)
+    fireEvent.click(screen.getByRole('button'))
+    expect(gate).toHaveBeenCalledTimes(1)
+    expect(send).not.toHaveBeenCalled()
+
+    // Allowed: the gate runs what it was handed, and that is the hand-off.
+    gate.mock.calls[0][0]()
+    expect(send).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls[0][0]).toContain('zzq-gated')
+    // The gate already asked the leave guard, so the hand-off says so and is not asked twice.
+    expect(send.mock.calls[0][1]).toEqual({ hard: false, leaveGranted: true })
   })
 
   it('the solid variant carries the accent skin, the link variant the danger skin', () => {
@@ -61,7 +79,7 @@ describe('AskAgentButton', () => {
     expect(screen.getByRole('button').className).toContain('bg-accent')
     unmount()
     render(<AskAgentButton message="zzq-a" />)
-    expect(screen.getByRole('button').className).toContain('text-danger/80')
+    expect(screen.getByRole('button').className).toContain('text-danger-text')
   })
 
   it('askAgentPrompt embeds the message', () => {

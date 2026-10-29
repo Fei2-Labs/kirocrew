@@ -20,6 +20,7 @@ such as guarded reset and queue retirement.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Callable
@@ -27,8 +28,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.messaging.commands import compact_unsupported_backend as _compact_unsupported_backend
+from kiro_crew.messaging.queue_drain import entry_channel, wake_other_drains
 from kiro_crew.metrics.events import CONTEXT_COMPACTIONS, emit_counter
-from kiro_crew.metrics.sessions import END_REASON_RECYCLED, record_session_ended
+from kiro_crew.metrics.sessions import (
+    END_REASON_RECYCLED,
+    record_session_ended,
+    record_session_started,
+)
+from kiro_crew.session_lifecycle import allocation_identity, clear_stop_declined
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
@@ -50,6 +58,20 @@ COMPACT_OUTCOME_RECYCLED = "recycled"
 #: missing capability there would be false about a harness that has it and merely
 #: failed once.
 COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE = "restarted_uncompactable"
+#: A context restart is held -- after a failed compaction, or on a backend that has
+#: none: sub-agents still run on this session's process, and restarting it now would
+#: end them. Sent with ``success=False``. Both arms send it, so a notice for it names
+#: neither cause.
+COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS = "waiting_for_subagents"
+#: The in-flight compaction was ended by a user Stop, not by the harness. Sent with
+#: ``success=False``. A separate value because the failure arm's other destination is
+#: a RECYCLE, and a Stop the user pressed must never read as "compaction didn't
+#: succeed, so the session was restarted": the session is not recycled on this
+#: outcome, the cooldown is armed and the next threshold reading retries.
+COMPACT_OUTCOME_CANCELLED = "cancelled"
+
+#: Fired when *key* enters or leaves the compacting set, with the new membership.
+CompactingCallback = Callable[[str, bool], None]
 
 
 class CompactCallback(Protocol):
@@ -68,6 +90,11 @@ class CompactionState:
     """Mutable state owned exclusively by the compaction boundary."""
 
     compacting: set[str] = field(default_factory=set)
+    #: The task running each in-flight compaction, keyed like ``compacting`` and
+    #: kept in step with it by ``_set_compacting``. ``compaction_waits_for_turn``
+    #: compares it with ``turn_owner`` to tell the compaction holding the turn
+    #: permit from the turn it is still waiting behind.
+    compaction_tasks: dict[str, asyncio.Task[Any]] = field(default_factory=dict)
     #: Keys whose in-flight recycle is happening because NOTHING could compact them,
     #: as opposed to because a compaction failed. Written by ``_recycle_held`` and
     #: consumed by ``_fire_compact_callback`` at the end of the same recycle, so it
@@ -76,12 +103,17 @@ class CompactionState:
     cooldown_until: dict[str, float] = field(default_factory=dict)
     pending_verdict: dict[str, float] = field(default_factory=dict)
     #: Per-session threshold overrides (folded key -> pct). A key absent here
-    #: falls back to the published global (``cfg.session.autocompact_pct``).
+    #: falls back to the default its agent declares, then to the published
+    #: global (``cfg.session.autocompact_pct``).
     #: Deliberately independent of ``_sessions`` membership: an override is a
     #: user preference on the conversation, so it survives session resets and
     #: recycles, and is re-seeded from slot persistence after a restart.
     pct_overrides: dict[str, float] = field(default_factory=dict)
     on_compacted: CompactCallback | None = None
+    #: Observer of the ``compacting`` set, so a surface can show a compaction WHILE
+    #: it runs rather than only announce its verdict. Synchronous and fail-soft: it
+    #: is called from the same tick that commits the membership change.
+    on_compacting_changed: CompactingCallback | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,12 +136,20 @@ class CompactionDeps:
     context_pct_is_unknown: Callable[[LLMProvider], bool]
     unlink_session_queue: Callable[[Any], None]
     compact_wait_timeout_secs: Callable[[], float]
-    compact_result_wait_secs: Callable[[float], float]
+    compact_result_wait_secs: Callable[[float, float], float]
     context_warn_margin_pct: float
     compact_result_wait_margin_secs: float
     compact_failure_cooldown_secs: float
     compact_min_effect_pct_points: float
     post_compact_reset_pct: float
+    #: How long a restart waits for sub-agents sharing the process it would kill,
+    #: and how often it looks again while it waits.
+    cotenant_wait_secs: float = 600.0
+    cotenant_poll_secs: float = 2.0
+    #: The compaction threshold the agent a live session runs declares, or
+    #: ``None`` when it declares none (or there is no live session). Given the
+    #: ``_Session`` object, so this boundary needs no config import to answer.
+    agent_autocompact_pct: Callable[[Any], float | None] = lambda _session: None
 
 
 class _CompactionOwner(Protocol):
@@ -154,9 +194,23 @@ class _CompactionOwner(Protocol):
         self, key: str, pct_before: float, pct_after: float, *, expect: Any | None
     ) -> bool: ...
 
-    async def _fire_compact_callback(self, key: str, pct: float, *, success: bool) -> None: ...
+    async def _fire_compact_callback(
+        self, key: str, pct: float, *, success: bool, outcome: str | None = None
+    ) -> None: ...
 
     def mark_needs_reinjection(self, key: str) -> None: ...
+
+    def stop_generation(self, key: str) -> int: ...
+
+    def absorb_orphaned_release(self, key: str) -> bool: ...
+
+    def _lifecycle_boundary(self) -> Any: ...
+
+    async def get_or_create(self, key: str, **kwargs: Any) -> Any: ...
+
+    def release(self, key: str) -> None: ...
+
+    def get_channel(self, key: str) -> str | None: ...
 
     async def reset(
         self,
@@ -167,26 +221,6 @@ class _CompactionOwner(Protocol):
         clear_conversation: bool = False,
         ends_conversation: bool = False,
     ) -> bool: ...
-
-
-def _compact_unsupported_backend(provider: LLMProvider) -> str | None:
-    """Backend id this provider names as unable to serve ``/compact``, else None.
-
-    The same capability the manual entry points read, asked for the
-    automatic one.  The property is spelled ``manual_`` because the manual
-    command was its first consumer, but its ANSWER is a property of the
-    BACKEND -- ``ACP_BACKENDS_COMPACT`` membership -- not of the entry point,
-    so it is the right question here too: a backend that cannot act on the
-    ``/compact`` prompt cannot act on it whoever sent it.
-
-    Read with the consumption contract the ABC declares: only a non-empty
-    ``str`` counts.  That guard is load-bearing rather than defensive -- the
-    compaction suite drives this gate with bare ``object()`` and ``MagicMock``
-    providers, and a truthy attribute read on either must not be mistaken for
-    a positively named unsupported backend.
-    """
-    backend = getattr(provider, "manual_compact_unsupported_backend", None)
-    return backend if isinstance(backend, str) and backend else None
 
 
 def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:
@@ -207,6 +241,18 @@ def _compaction_unmanaged_backend(provider: LLMProvider) -> str | None:
     have a truthy attribute mistaken for a positive claim that nothing compacts.
     """
     backend = getattr(provider, "compaction_unmanaged_backend", None)
+    return backend if isinstance(backend, str) and backend else None
+
+
+def _harness_managed_backend(provider: LLMProvider) -> str | None:
+    """Backend id this provider names as compacting on its own initiative.
+
+    The threshold leaves such a harness alone even when Crew could hand it a
+    manual ``/compact``: its own summarization bounds the context, and a
+    Crew compaction at ``session.autocompact_pct`` would only move that
+    point earlier. Same ``str`` contract as its siblings.
+    """
+    backend = getattr(provider, "harness_managed_compaction_backend", None)
     return backend if isinstance(backend, str) and backend else None
 
 
@@ -241,7 +287,9 @@ class CompactionCoordinator:
         self._deps = deps
         self.state = state
 
-    def check_context_usage(self, key: str, provider: LLMProvider) -> float:
+    def check_context_usage(
+        self, key: str, provider: LLMProvider, *, defer_compaction: bool = False
+    ) -> float:
         """Record usage and fire background compaction at the configured threshold."""
         owner = self._owner
         key = owner._fold_key(key)
@@ -252,6 +300,19 @@ class CompactionCoordinator:
         if session:
             session.prompt_count += 1
             self._record_floor(key, session, provider, pct)
+
+        # Only the proactive threshold may yield to an admitted human answer.
+        # Keep the critical ceiling, unknown readings, pending verdicts and
+        # existing compactions on their ordinary path; native limits stay native.
+        if (
+            defer_compaction
+            and 0 < pct < self._deps.post_compact_reset_pct
+            and self.compaction_due_after_turn(key, provider)
+        ):
+            self._deps.logger.info(
+                "Session %s context at %.0f%% -- deferring compaction for human reply", key, pct
+            )
+            return pct
 
         # Go through the owner so patches on SessionManager._trigger_compaction
         # keep intercepting the call after this extraction.
@@ -313,7 +374,10 @@ class CompactionCoordinator:
         self._deps.logger.warning("Session %s compacting — context at %.0f%% (awaited)", key, pct)
         # There is deliberately no await between the membership check in the
         # gate and this commit; that is the event-loop dedup handshake.
-        self.state.compacting.add(key)
+        self._set_compacting(key, True)
+        current = asyncio.current_task()
+        if current is not None:
+            self.state.compaction_tasks[key] = current
         return await owner._compact_session(key, pct)
 
     def set_compact_callback(self, cb: CompactCallback | None) -> None:
@@ -323,6 +387,113 @@ class CompactionCoordinator:
                 "Compact callback already registered; replacing existing handler"
             )
         self.state.on_compacted = cb
+
+    def set_compacting_callback(self, cb: CompactingCallback | None) -> None:
+        """Register the observer of the compacting set (see ``CompactionState``)."""
+        self.state.on_compacting_changed = cb
+
+    def is_compacting(self, key: str) -> bool:
+        """Whether a compaction is in flight on *key* (folded or not)."""
+        return key in self.state.compacting or self._owner._fold_key(key) in self.state.compacting
+
+    def compaction_waits_for_turn(self, key: str) -> bool:
+        """Whether *key*'s compaction is still waiting for a turn that holds the session.
+
+        A trigger commits the compaction (``is_compacting``) before its task has
+        the turn permit, and the task then waits up to ``compact_wait_timeout_secs``
+        for it. Until then the turn holding the permit owns the session, so a Stop
+        pressed in that window is aimed at that turn, not at a ``/compact`` turn.
+        True only when the permit is held by a live task other than the
+        compaction's own. Every other state answers False, including a compaction
+        with no recorded task, so the Stop decline keeps its old reach there.
+
+        The holder is read from ``turn_owner``, so the answer is only as good as
+        that record. Each compaction path names itself there in the step its
+        acquire returns (the Claude arm of ``_compact_session``,
+        ``_recycle_unmanaged``, ``_compact_in_place``), and every release of a
+        holding that named itself clears it in the same step
+        (``SessionManager.release``, those three paths, ``recycle_background``).
+        So the record never names a task that has let the permit go. When a turn
+        releases the permit to the parked compaction, the record names nobody
+        until the compaction's task runs, and a Stop in that hand-off is
+        declined: the permit is the compaction's from the release on. A holder
+        that has not named itself reads the same way and keeps the decline.
+        """
+        folded = self._owner._fold_key(key)
+        task = self.state.compaction_tasks.get(folded)
+        session = self._owner._sessions.get(folded)
+        if task is None or session is None or folded not in self.state.compacting:
+            return False
+        semaphore = getattr(session, "semaphore", None)
+        holder = getattr(session, "turn_owner", None)
+        if semaphore is None or not semaphore.locked() or holder is task:
+            return False
+        return isinstance(holder, asyncio.Task) and not holder.done()
+
+    def _set_compacting(self, key: str, on: bool) -> None:
+        """The ONE writer of ``state.compacting``: commit, then tell the observer.
+
+        Membership is committed before the observer runs, so a reader the observer
+        wakes (a slot broadcast) sees the same answer ``is_compacting`` gives. The
+        observer is a surface concern and may not fail a compaction, so it is
+        guarded; a no-op transition (already in, already out) is not reported.
+        """
+        was = key in self.state.compacting
+        if on:
+            self.state.compacting.add(key)
+        else:
+            self.state.compacting.discard(key)
+            self.state.compaction_tasks.pop(key, None)
+            # The markers this compaction's declines armed die with it, under
+            # every spelling of the key a channel may have pressed with: the
+            # next compaction, even one starting inside the window, owes its
+            # own first refusal rather than inheriting a force from this one.
+            clear_stop_declined(key, fold=self._owner._fold_key)
+        if was == on:
+            return
+        cb = self.state.on_compacting_changed
+        if cb is None:
+            return
+        try:
+            cb(key, on)
+        except Exception:
+            self._deps.logger.debug("compacting observer failed for %s", key, exc_info=True)
+
+    def _stop_generation(self, key: str) -> int:
+        """The user-Stop counter for *key*; 0 when the owner cannot answer.
+
+        Read before and after a compaction turn: a rise means a Stop landed on
+        the session while its ``/compact`` ran, which is the one failure cause
+        the failure arm must NOT answer with a recycle. Fail-soft to 0 so an
+        owner double without the counter degrades to "no Stop seen".
+        """
+        probe = getattr(self._owner, "stop_generation", None)
+        if not callable(probe):
+            return 0
+        try:
+            return int(probe(key))
+        except Exception:
+            return 0
+
+    async def _settle_cancelled(self, key: str, pct: float) -> str:
+        """The verdict for a compaction ended by a user Stop: cooldown, no recycle.
+
+        The session keeps whatever the Stop left of it (a soft stop keeps the
+        process; a hard stop already reset it and respawned its successor), and
+        the next confirmed threshold reading retries after the cooldown. What
+        this arm must not do is what the generic failure arm does: recycle the
+        provider and tell the user compaction "didn't succeed".
+        """
+        self._deps.logger.warning(
+            "Session %s compaction ended by a user Stop at %.0f%% — cooldown, no recycle",
+            key,
+            pct,
+        )
+        self.state.cooldown_until[key] = time.monotonic() + self._deps.compact_failure_cooldown_secs
+        await self._owner._fire_compact_callback(
+            key, pct, success=False, outcome=COMPACT_OUTCOME_CANCELLED
+        )
+        return "cancelled"
 
     def mark_needs_reinjection(self, key: str) -> None:
         """Flag the live session to restore skill context on its next turn."""
@@ -352,10 +523,26 @@ class CompactionCoordinator:
             self.state.pct_overrides[key] = pct
 
     def effective_autocompact_pct(self, key: str) -> float:
-        """This session's compaction threshold: its override, else the global."""
-        return self.state.pct_overrides.get(
-            self._owner._fold_key(key), self._owner._cfg.session.autocompact_pct
-        )
+        """This session's compaction threshold.
+
+        Precedence, highest first: the session's own override (the slider),
+        then the default the session's agent declares, then the global.
+        """
+        key = self._owner._fold_key(key)
+        override = self.state.pct_overrides.get(key)
+        if override is not None:
+            return override
+        agent_pct = self.agent_autocompact_pct(key)
+        if agent_pct is not None:
+            return agent_pct
+        return self._owner._cfg.session.autocompact_pct
+
+    def agent_autocompact_pct(self, key: str) -> float | None:
+        """The threshold the agent behind *key*'s live session declares, else ``None``."""
+        session = self._owner._sessions.get(self._owner._fold_key(key))
+        if session is None:
+            return None
+        return self._deps.agent_autocompact_pct(session)
 
     def _compaction_gate_decision(self, key: str, provider: LLMProvider, pct: float) -> str | None:
         """Return the first compaction gate decline, in lifecycle order.
@@ -403,18 +590,29 @@ class CompactionCoordinator:
             # later turn's growth and is only safe for cooldown damping.
             self._owner._judge_compact_effect(key, baseline, pct)
 
+        return self._gate_rung(key, provider, pct, log=True)
+
+    def _gate_rung(self, key: str, provider: LLMProvider, pct: float, *, log: bool) -> str | None:
+        """The gate's declining rungs, in lifecycle order, with no state change.
+
+        The ONE ladder both questions read: :meth:`_compaction_gate_decision`
+        (which settles a pending verdict first, then asks here with ``log=True``)
+        and :meth:`compaction_due_after_turn` (which asks mid-turn with
+        ``log=False``, so a reading taken inside a turn writes no line the real
+        check writes again at turn end).
+        """
         if self._deps.is_cc_managed(provider):
             return "cc_managed"
         if pct < self.effective_autocompact_pct(key):
             return "below_threshold"
-        unsupported = _compact_unsupported_backend(provider)
+        unsupported = _compact_unsupported_backend(provider) or _harness_managed_backend(provider)
         if unsupported is not None and _compaction_unmanaged_backend(provider) is None:
             # Declining, not recycling, and ONLY for a harness that positively
             # claims the other side of the bargain. A member of
             # ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` (KAS) summarizes on its
             # own initiative and its ``summarization_completed`` frame calls
             # ``reset_after_compaction()`` on the meter
-            # (``acp/session_handle.py``), so the reading this gate just read
+            # (``acp/session_handle_kas.py``), so the reading this gate just read
             # falls back below the threshold without us acting -- the same
             # relationship ``cc_managed`` encodes for Claude-Code sessions.
             # Recycling such a session would not have been the smaller harm: it
@@ -439,10 +637,12 @@ class CompactionCoordinator:
             # ``cc_managed``'s: the key, the reading, AND which backend
             # answered. INFO, not WARNING: a standing correct condition is not
             # an anomaly, and every sibling rung is INFO too.
-            if _compaction_harness_managed(provider):
+            if not log:
+                pass
+            elif _compaction_harness_managed(provider):
                 self._deps.logger.info(
                     "Session %s context at %.0f%% -- %s manages compaction itself; "
-                    "skipping the /compact dispatch it cannot answer",
+                    "skipping Crew's /compact dispatch",
                     key,
                     pct,
                     unsupported,
@@ -467,25 +667,53 @@ class CompactionCoordinator:
                 )
             return "compact_unsupported"
         if self._deps.context_pct_is_unknown(provider):
-            self._deps.logger.info(
-                "Session %s context %.0f%% is unconfirmed for this session — "
-                "skipping compaction until telemetry reports",
-                key,
-                pct,
-            )
+            if log:
+                self._deps.logger.info(
+                    "Session %s context %.0f%% is unconfirmed for this session — "
+                    "skipping compaction until telemetry reports",
+                    key,
+                    pct,
+                )
             return "unconfirmed"
         if key in self.state.compacting:
-            self._deps.logger.info("Session %s compaction already in progress", key)
+            if log:
+                self._deps.logger.info("Session %s compaction already in progress", key)
             return "in_progress"
         cooldown_until = self.state.cooldown_until.get(key, 0.0)
         if cooldown_until > time.monotonic():
-            self._deps.logger.info(
-                "Session %s compaction skipped — cooldown active for %.0fs more",
-                key,
-                cooldown_until - time.monotonic(),
-            )
+            if log:
+                self._deps.logger.info(
+                    "Session %s compaction skipped — cooldown active for %.0fs more",
+                    key,
+                    cooldown_until - time.monotonic(),
+                )
             return "cooldown"
         return None
+
+    def compaction_due_after_turn(self, key: str, provider: LLMProvider) -> bool:
+        """Whether the end-of-turn check would compact *key* if the turn ended now.
+
+        For a caller still INSIDE the turn (the dashboard's "will compact after
+        this turn" notice). It reads the gate's own ladder (:meth:`_gate_rung`) and
+        changes nothing, so asking mid-turn cannot change what the real check
+        decides at turn end. Two answers are False although the ladder passes:
+
+        * a pending verdict is waiting. The gate settles it first, and that
+          settlement can arm a cooldown that declines this very compaction, so
+          nothing is promised until it has settled;
+        * the backend takes the recycle arm (it cannot be handed ``/compact`` and
+          nothing else bounds it). That restarts the session instead of
+          compacting it, so "will compact" would be false.
+        """
+        key = self._owner._fold_key(key)
+        if key in self.state.pending_verdict:
+            return False
+        if self._gate_rung(key, provider, provider.context_usage_pct(), log=False) is not None:
+            return False
+        return (
+            _compact_unsupported_backend(provider) is None
+            and _harness_managed_backend(provider) is None
+        )
 
     def _trigger_compaction(
         self, key: str, reason: str, pct: float, provider: LLMProvider
@@ -498,8 +726,9 @@ class CompactionCoordinator:
         self._deps.logger.warning("Session %s compacting — %s", key, reason)
         # Keep check-and-add synchronous so the awaited trigger cannot commit
         # a second attempt in the same event-loop turn.
-        self.state.compacting.add(key)
+        self._set_compacting(key, True)
         task = asyncio.create_task(owner._compact_session(key, pct))
+        self.state.compaction_tasks[key] = task
         owner._background_tasks.add(task)
         task.add_done_callback(owner._background_tasks.discard)
         return None
@@ -580,9 +809,29 @@ class CompactionCoordinator:
                 # boundary, so the durable mapping remains untouched.
                 claude_session = session
 
+                # Read once before the wait, so a timeout spent parked behind a
+                # live turn compares against the session's real count and is a
+                # failure, not a cancel; refreshed once the semaphore is held,
+                # so a Stop that ended THAT turn is not this compaction's cancel.
+                stop_gen = self._stop_generation(key)
+
                 async def _run_compact() -> None:
-                    async with claude_session.semaphore:
+                    nonlocal stop_gen
+                    # Manual acquire/release, not ``async with``: a hard Stop
+                    # that lands on this compaction pops the session and hands
+                    # the permit to a woken claimant, and a context manager
+                    # would release it a second time under that claimant. Same
+                    # ownership record as ``_compact_in_place``'s ``finally``:
+                    # this task names itself the holder, ``reset`` orphans it.
+                    await claude_session.semaphore.acquire()
+                    claude_session.turn_owner = asyncio.current_task()
+                    try:
+                        stop_gen = self._stop_generation(key)
                         await claude_session.provider.compact()
+                    finally:
+                        if not owner.absorb_orphaned_release(key):
+                            claude_session.semaphore.release()
+                            claude_session.turn_owner = None
 
                 timeout = self._deps.compact_wait_timeout_secs()
                 try:
@@ -590,6 +839,8 @@ class CompactionCoordinator:
                     # compact call itself.
                     await asyncio.wait_for(_run_compact(), timeout=timeout)
                 except (Exception, asyncio.TimeoutError) as exc:
+                    if self._stop_generation(key) > stop_gen:
+                        return await self._settle_cancelled(key, pct)
                     if isinstance(exc, asyncio.TimeoutError):
                         self._deps.logger.error(
                             "Compact timed out after %.0fs for %s", timeout, key
@@ -643,7 +894,7 @@ class CompactionCoordinator:
             self._deps.logger.exception("Session compaction/recycle failed for %s", key)
             return "failed"
         finally:
-            self.state.compacting.discard(key)
+            self._set_compacting(key, False)
 
     async def _recycle_held(
         self, key: str, session: Any, pct: float, *, uncompactable: bool = False
@@ -676,6 +927,13 @@ class CompactionCoordinator:
                     await record_session_ended(key, end_reason=END_REASON_RECYCLED)
 
             await asyncio.to_thread(self._deps.unlink_session_queue, session)
+            if owner._sessions.get(key) is not None:
+                # A successor already holds this key -- the "entry already
+                # replaced" arm, or one that registered under the recycling
+                # marker during the unlink above -- and it runs in the same
+                # derived work directory. This provider's shutdown must leave
+                # that directory to the successor (session_work_dir).
+                session.provider.disown_work_dir()
             if popped is None:
                 await session.provider.shutdown()
                 self._deps.logger.info(
@@ -697,6 +955,149 @@ class CompactionCoordinator:
                 # this key an uncompactable backend, which on a kiro-cli session
                 # claims a missing capability the harness has.
                 self.state.uncompactable_recycles.discard(key)
+
+    def _live_cotenants(self, runs: Any, key: str) -> list[str]:
+        """Ids of *key*'s runs that are live on a process they share with it."""
+        return [
+            info.id
+            for info in runs.running
+            if info.parent_session_key == key
+            and runs.has_live_shared_session(info.conversation_key or f"subagent:{info.id}")
+        ]
+
+    async def _await_cotenants(
+        self, key: str, pct: float, *, stopped: Callable[[], bool] | None = None
+    ) -> bool:
+        """Hold a context restart while sub-agents share the process.
+
+        A failed or unavailable compaction is a pause, not an end. The parent's
+        process also hosts its session-sharing sub-agents, so shutting it down ends
+        them with no report.
+        The restart polls (the manager's per-key completion event is shared, so another
+        waiter may release it) for at most ``cotenant_wait_secs``. Past that it stops
+        those runs with the ordinary cancel, bounded, so each reports "stopped" into
+        the conversation, which carries on after the restart.
+
+        *stopped* is polled on every tick: a user Stop that lands during the wait has
+        already reset the parent, and this task's restart is then stale -- cancelling
+        the live sub-agents and recycling again would end work the Stop did not ask
+        to end. Returns False when the wait ended for that reason, True otherwise.
+        """
+        lifecycle = self._owner._lifecycle_boundary()
+        # The ``SubagentManager`` registered as the parent-end teardown handler.
+        runs = lifecycle._child_teardown
+        if runs is None or not self._live_cotenants(runs, key):
+            return True
+        self._deps.logger.warning("Session %s restart held: sub-agents share its process", key)
+        callback = self.state.on_compacted
+        if callback is not None:
+            try:
+                await callback(
+                    key, pct, success=False, outcome=COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS
+                )
+            except Exception:
+                self._deps.logger.exception("Compact callback failed for %s", key)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._deps.cotenant_wait_secs
+        while ids := self._live_cotenants(runs, key):
+            if stopped is not None and stopped():
+                return False
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._deps.logger.warning("Session %s: stopping sub-agents %s", key, ids)
+                for info in runs.running:
+                    if info.id in ids and not info._stop_origin:
+                        info._stop_origin = "stopped at a context restart"
+                task = asyncio.ensure_future(asyncio.gather(*(runs.cancel(i) for i in ids)))
+                self._owner._background_tasks.add(task)
+                task.add_done_callback(self._owner._background_tasks.discard)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(asyncio.shield(task), timeout=20.0)
+                return True
+            await asyncio.sleep(min(remaining, self._deps.cotenant_poll_secs))
+        return not (stopped is not None and stopped())
+
+    async def _restart_held(self, key: str, session: Any, pct: float) -> str:
+        """Start the successor first and hand it the held session's queue, then recycle.
+
+        The queued messages land in its real queue, behind its lease until their drain
+        is scheduled. If it cannot start, the old session keeps its queue and key.
+        Taken even with an empty queue: a message can still queue during the teardown.
+        """
+        owner = self._owner
+        if owner._sessions.get(key) is not session:
+            # Superseded by another teardown: its queue was discarded there.
+            await owner._recycle_held(key, session, pct)
+            return "recycled"
+        owner._recycling[key] = session  # get_or_create builds past a recycling entry
+        dropped_sid = owner._session_map.mapped_sid(key)
+        owner._session_map.clear_sid(key)  # the overflowed conversation must not resume
+        # Before the successor's start record replaces this session's own.
+        await record_session_ended(key, end_reason=END_REASON_RECYCLED)
+        started = False
+        try:
+            await owner.get_or_create(
+                key,
+                **allocation_identity(owner, key, session),
+                speculative=True,
+            )
+            started = True
+        except Exception:
+            self._deps.logger.exception("Session %s successor did not start; kept", key)
+            self.state.cooldown_until[key] = (
+                time.monotonic() + self._deps.compact_failure_cooldown_secs
+            )
+            await owner._fire_compact_callback(key, pct, success=False)
+            # Nothing else drains the kept queue; no await follows, so it reads it
+            # once the old lease is released.
+            self._wake_drains(key)
+            return "failed"
+        finally:
+            if not started:  # failed or cancelled: the old session keeps the key
+                if owner._recycling.get(key) is session:
+                    owner._recycling.pop(key, None)
+                self._keep_resume_sid(key, session, dropped_sid)
+                if owner._sessions.get(key) is session:
+                    await record_session_started(key)  # it lives on
+        try:
+            successor = owner._sessions.get(key)
+            live = [e for e in session.queue if e[0] not in session.cancelled]
+            if successor is not None and successor is not session:
+                for entry in live:
+                    session.queue.remove(entry)
+                successor.queue.extendleft(reversed(live))
+            # The successor holds the key now, so this records no end of its own.
+            await owner._recycle_held(key, session, pct)
+        finally:
+            # Even when the teardown raises, the handed-off queue needs its drain.
+            self._wake_drains(key)
+            owner.release(key)
+        return "recycled"
+
+    def _keep_resume_sid(self, key: str, session: Any, sid: str) -> None:
+        """Point *key* back at *session*'s conversation if it still holds the key."""
+        if self._owner._sessions.get(key) is not session:
+            return  # a racing successor owns the key's resume pointer now
+        if session.retire_on_identity_change:
+            return  # a retiring session must not re-point the key at itself
+        if sid:
+            self._owner._session_map.set(key, sid)
+
+    def _wake_drains(self, key: str) -> None:
+        """Wake each channel with a message queued on *key*, read after the release.
+
+        Call it with no await before the lease is released.
+        """
+
+        async def _wake() -> None:
+            live = self._owner._sessions.get(key)
+            channels = [entry_channel(e[2]) for e in getattr(live, "queue", ())]
+            if any(channels):
+                await wake_other_drains(waker="", session_key=key, channels=channels)
+
+        task = asyncio.ensure_future(_wake())
+        self._owner._background_tasks.add(task)
+        task.add_done_callback(self._owner._background_tasks.discard)
 
     async def _recycle_unmanaged(self, key: str, session: Any, pct: float) -> str:
         """Recycle a session no compaction path can reach, turn-exclusive.
@@ -723,10 +1124,31 @@ class CompactionCoordinator:
             await asyncio.wait_for(session.semaphore.acquire(), timeout=timeout)
         except asyncio.TimeoutError:
             return "busy"
+        # The same three guards as ``_compact_in_place``, for the same Stop. Read
+        # AFTER the permit is held: a Stop that ended the turn this waited behind
+        # is not this recycle's cancel.
+        stop_gen = self._stop_generation(key)
+        # Named where ``reset`` looks (``_orphan_turn_holder``), so a hard Stop
+        # during the wait below records this task as the holder of the permit it
+        # hands to a woken claimant.
+        session.turn_owner = asyncio.current_task()
         try:
+            # The restart ends this process and every sub-agent that shares it.
+            if not await self._await_cotenants(
+                key, pct, stopped=lambda: self._stop_generation(key) > stop_gen
+            ):
+                # A Stop landed during the wait. A force Stop has already reset the
+                # parent and respawned its successor, so this restart is stale, and
+                # the sub-agents it would stop are the user's live work.
+                return await self._settle_cancelled(key, pct)
             await self._owner._recycle_held(key, session, pct, uncompactable=True)
         finally:
-            session.semaphore.release()
+            # Release ONLY a permit this task still owns. A hard Stop during the
+            # wait popped the session and handed its permit to a woken claimant;
+            # a second release here would raise in that claimant's own release.
+            if not self._owner.absorb_orphaned_release(key):
+                session.semaphore.release()
+                session.turn_owner = None
         return "recycled"
 
     async def _compact_in_place(self, key: str, session: Any, pct: float) -> str:
@@ -737,6 +1159,10 @@ class CompactionCoordinator:
         that is still compacting, consume the late completion event, and hang
         without an end-turn boundary.
         """
+        # One effective budget per compaction: this single snapshot feeds the
+        # permit wait below, the outer ``_run`` backstop, and the inner status
+        # wait, so a live ``session.compact_wait_secs`` change mid-compaction
+        # cannot split one compaction across two deadlines.
         timeout = self._deps.compact_wait_timeout_secs()
         try:
             await asyncio.wait_for(session.semaphore.acquire(), timeout=timeout)
@@ -745,6 +1171,14 @@ class CompactionCoordinator:
 
         started = time.monotonic()
         result_wait_used: float | None = None
+        # Read AFTER the semaphore is held: a Stop that landed while this waited
+        # for the turn ended THAT turn, not this compaction.
+        stop_gen = self._stop_generation(key)
+        # This task holds the permit now, and says so where ``reset`` looks
+        # (``_orphan_turn_holder``): a hard Stop that pops the session records
+        # this task as the holder whose permit it handed on, and the ``finally``
+        # reads that record back rather than inferring it.
+        session.turn_owner = asyncio.current_task()
         try:
 
             async def _run() -> None:
@@ -770,7 +1204,7 @@ class CompactionCoordinator:
                     # site instead would have left the same strand at every
                     # other site that awaits a compaction.
                     result_wait_used = self._deps.compact_result_wait_secs(
-                        time.monotonic() - started
+                        time.monotonic() - started, timeout
                     )
                     result = await session.provider.wait_for_compaction(timeout=result_wait_used)
                     status = result.get("type") if isinstance(result, dict) else None
@@ -783,6 +1217,13 @@ class CompactionCoordinator:
                 _run(), timeout=timeout + self._deps.compact_result_wait_margin_secs
             )
         except (Exception, asyncio.TimeoutError):
+            if self._stop_generation(key) > stop_gen:
+                # A user Stop ended the ``/compact`` turn. That is not the harness
+                # failing to compact, and the recycle below must not answer it: a
+                # user who presses Stop on what looks like a stalled turn would
+                # lose the session's memory to a restart the notice then blames
+                # on compaction.
+                return await self._settle_cancelled(key, pct)
             self._deps.logger.warning(
                 "Session %s in-place /compact failed after %.0fs — recycling "
                 "(semaphore held; async status wait %s)",
@@ -791,12 +1232,31 @@ class CompactionCoordinator:
                 "never reached" if result_wait_used is None else f"{result_wait_used:.0f}s",
                 exc_info=True,
             )
-            # This owner-facade hop is load-bearing for both monkeypatches and
-            # the lifecycle boundary's exact-identity recycling marker.
-            await self._owner._recycle_held(key, session, pct)
-            return "recycled"
+            if not await self._await_cotenants(
+                key, pct, stopped=lambda: self._stop_generation(key) > stop_gen
+            ):
+                # A force Stop landed during the wait: it reset the parent and
+                # respawned its successor itself. This restart is stale, and
+                # the sub-agents it would have stopped are the user's live work.
+                return await self._settle_cancelled(key, pct)
+            return await self._restart_held(key, session, pct)
         finally:
-            session.semaphore.release()
+            # Release ONLY the permit this task still owns. The one path that
+            # takes it away is a hard Stop landing during this hold -- on the
+            # ``/compact`` turn, or in the cotenant wait or successor start of
+            # the recycle path: ``reset`` pops the session, records this task
+            # as the orphaned holder and releases the permit to wake waiters
+            # (``_wake_turn_waiters``), and from that tick the permit belongs
+            # to whichever claimant woke. A second release here would surface
+            # as a ``ValueError`` on THAT task's own release. ``locked()``
+            # cannot tell the two apart (the claimant re-locks it), so the
+            # record ``reset`` wrote is what decides, the same one a turn's
+            # key-only release consults. The recycle path pops the session
+            # itself and writes no record, so its release goes through and a
+            # claimant parked on the permit wakes.
+            if not self._owner.absorb_orphaned_release(key):
+                session.semaphore.release()
+                session.turn_owner = None
 
         escalate = self._owner._settle_compact_cooldown(key, session.provider, pct)
         self._deps.logger.info("Compacted session %s in place (context overflow)", key)
@@ -935,8 +1395,15 @@ class CompactionCoordinator:
             )
         return did_reset
 
-    async def _fire_compact_callback(self, key: str, pct: float, *, success: bool) -> None:
-        """Mark reinjection and invoke the compact callback, swallowing errors."""
+    async def _fire_compact_callback(
+        self, key: str, pct: float, *, success: bool, outcome: str | None = None
+    ) -> None:
+        """Mark reinjection and invoke the compact callback, swallowing errors.
+
+        *outcome* names the verdict when the caller knows something this method
+        cannot derive from the recycling marker -- today only a user-cancelled
+        compaction. Left ``None`` on every other path, where the marker decides.
+        """
         # Every compaction that reached a verdict passes here, whether or not a
         # callback is registered, so this is where the counter belongs: the early
         # return below would otherwise drop the surfaces that register none.
@@ -957,7 +1424,9 @@ class CompactionCoordinator:
         # indistinguishable from a compaction, and the dashboard announced one as the
         # other -- "Auto-compacted at N%." on a session whose history had just been
         # discarded, which is the untruth this whole change set out to remove.
-        if not recycled:
+        if outcome is not None:
+            pass
+        elif not recycled:
             outcome = COMPACT_OUTCOME_COMPACTED
         elif key in self.state.uncompactable_recycles:
             # Consumed HERE, at the end of the recycle that set it: the marker's whole

@@ -92,20 +92,27 @@ describe('conversation attention sounds', () => {
     expect(kinds).toEqual(['turn'])
   })
 
-  it('the fresh frame overrides stale running child and plan snapshots', async () => {
+  it('the fresh frame overrides stale running child snapshots', async () => {
     const ws = await connect()
-    ws.frame('slots', [{ key: SLOT, messages: 1, running: true, subagents_running: true, orchestrating: true }])
+    ws.frame('slots', [{ key: SLOT, messages: 1, running: true, subagents_running: true }])
     ws.frame('subagent_spawn', { slot: SLOT, id: 'child', task: 'work', agent: 'worker' })
     ws.frame('workflow_run_event', { run_id: 'stale-workflow', session_key: `dashboard:${SLOT}`, type: 'run_started' })
     ws.frame('chat_done', { slot: SLOT, continuing: false })
     expect(kinds).toEqual(['turn'])
   })
 
-  it.each(['subagents_running', 'orchestrating'])('honors %s on older frames without an activity hint', async field => {
+  it('honors subagents_running on older frames without an activity hint', async () => {
     const ws = await connect()
-    ws.frame('slots', [{ key: SLOT, messages: 1, running: false, [field]: true }])
+    ws.frame('slots', [{ key: SLOT, messages: 1, running: false, subagents_running: true }])
     ws.frame('chat_done', { slot: SLOT })
     expect(kinds).toEqual([])
+  })
+
+  it('ignores a legacy orchestrating flag on older frames', async () => {
+    const ws = await connect()
+    ws.frame('slots', [{ key: SLOT, messages: 1, running: false, orchestrating: true }])
+    ws.frame('chat_done', { slot: SLOT })
+    expect(kinds).toEqual(['turn'])
   })
 
   it('honors queued turns on older frames', async () => {

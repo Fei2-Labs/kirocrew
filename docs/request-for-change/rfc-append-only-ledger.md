@@ -4,8 +4,8 @@ status: partial
 revision: v2
 author: mingweic, with Kiro
 created: 2026-09-11
-last-audited: 2026-09-22
-audited-at: 80bd0a81f
+last-audited: 2026-10-05
+audited-at: e281ecaf33
 doc-pr: 10090
 implementation-prs: [10091]
 tracking-issues: []
@@ -21,9 +21,24 @@ superseded-by: []
 > were so external links keep resolving; only the name of the thing changed.
 
 Status: partial. The `kiro_crew.crew_log` store, session emitter, projections,
-routes, and message entries are on main behind `KIROCREW_CREW_LOG`. The flag
-remains opt-in, while the legacy transcript and conductor work-ledger stores
-still exist, so the full cutover described below is incomplete.
+routes, and message entries are on main. `KIROCREW_CREW_LOG` is on by default;
+only a falsy or unrecognised value turns it off. The legacy transcript and
+conductor work-ledger stores still exist, so the full cutover described below is
+incomplete.
+
+Implemented and proposed parts of this body:
+
+| Section | State on main |
+|---|---|
+| §3 Files and envelope | envelope implemented; the storage layout is `crew-log/<kind>/<store name>/log.jsonl`, not `ledgers/` (see `../system-specs/modules/crew-log-core.md` §3) |
+| §4 Event families, crew kind | only `crew/dispatch` and `crew/report` ship; `item/*`, topics, knowledge and memory families are proposed |
+| §4 Event families, session kind | implemented (see `../system-specs/modules/crew-log-core.md` §4a) |
+| §5 Projections and pages | session projections and paging routes ship; the crew `tree`, `topics`, `items`, `board`, `budget`, `attention` and `context` projections are proposed |
+| §6 Grants and visibility | visibility classes and tombstones are proposed; the `crew-log` leaf carries the sandbox deny |
+| §7 Migration | proposed; not started |
+
+`../system-specs/modules/crew-log-core.md` §4 is the current specification of
+the envelope and entry types.
 
 ## 1. Introduction: five heads, no history
 
@@ -55,22 +70,26 @@ the code (`session_ledger.py`, `work_ledger.py`): a **ledger** is the append-onl
   instead. Message BODIES are in scope and are written, because they are redacted before
   they reach the file -- exfiltration URLs then credentials, in the writer rather than at
   the call sites, so a new call site cannot forget -- and a redaction that fails yields the
-  empty string, never the input. Bodies on disk are GATED: `KIROCREW_CREW_LOG` may
-  not default to on until session trash and permanent delete reach a session's ledger
-  directory and `StorageReport` counts its bytes. Until both land, "delete this
-  conversation" would not delete it and the disk-use surface would understate it, which are
-  product promises rather than costs. Tracked as kirodotdev/KiroCrew#10705.
+  empty string, never the input. Bodies on disk are GATED on session trash and permanent
+  delete reaching a session's ledger directory and `StorageReport` counting its bytes.
+  Session trash stages every crew-log unit the session owns inside the agent-hidden
+  crew-log tree, restore puts them back and emptying the trash removes them; a permanent
+  delete from an open tab removes the units it proved; and `StorageReport` counts their
+  bytes. An open unit grows for the life of its session; segments are not rotated, and
+  that is accepted. `KIROCREW_CREW_LOG` is on by default on that basis. A history row deleted with no
+  open tab proves no unit and leaves its units to retention, which collects only
+  `destroyed` closes, so units ended by a reset stay until the session is trashed. Tracked
+  as kirodotdev/KiroCrew#10705.
 - FR-8 Cold load synthesizes closers for open intervals.
 - NFR-1 Cheap to fold: checkpoints on disk; state never replays everything.
 - NFR-2 The backend extracts, the frontend loads pages; no client folds a ledger.
 
 ## 3. Files and envelope
 
-```
-<data home>/ledgers/crews/<crew>/ledger.jsonl               the crew's activity ledger
-<data home>/ledgers/crews/<crew>/projections/<key>.json     fold checkpoints, disposable
-<data home>/ledgers/sessions/<id>/ledger.jsonl              the session ledger
-```
+The proposed layout was `<data home>/ledgers/crews/<crew>/ledger.jsonl` and
+`<data home>/ledgers/sessions/<id>/ledger.jsonl`. As shipped, every kind lives
+under one `crew-log` root, `<data home>/crew-log/<kind>/<store name>/log.jsonl`;
+`../system-specs/modules/crew-log-core.md` §3 owns the layout and its fences.
 
 Line 1 is the header; then:
 
@@ -155,10 +174,11 @@ flowchart LR
     class M,C,S store
 ```
 
-The dashboard splits the same way: the backend folds and cuts pages
-(`/crews/<id>/activity?before=<seq>&limit=`, `/sessions/<id>/ledger?from=&to=`) and pushes
+The dashboard splits the same way: the backend folds and cuts pages and pushes
 `member_projection` and `session_projection` frames; the frontend renders and pages, never
-folds.
+folds. The read routes are the `/api/sessions/{id}/crew-log` family, `/api/crew-log/*`
+and `/api/members/{slug}/activity`; `../system-specs/modules/crew-log-projection.md` owns
+them.
 
 ## 6. Grants and visibility
 
@@ -169,14 +189,15 @@ one, and the grants with it: an attach lets the parent resolve into the child's 
 dispatch into the dispatched session. Each type carries a visibility class (`public`,
 `tree`, `owner`); a filtered line leaves a tombstone so `seq` stays contiguous.
 `member/binding`, `member/rules` and `turn/started` are `owner`. Below all of that,
-`ledgers/` carries the same sandbox deny as the work ledger — only the gateway process
+the `crew-log` leaf carries the same sandbox deny as the work ledger — only the gateway process
 reads or writes it — so in-sandbox code can neither forge an entry attributed to the
 gateway nor rewrite the history a conductor is meant to trust.
 
 ## 7. Migration
 
-Activity ledger: `members/<slug>/activity.jsonl` is rewritten into the envelope at
-`ledgers/crews/<crew>/ledger.jsonl`, with `seq` assigned in file order. Crew store: fold
+Proposed, not started. Activity ledger: `members/<slug>/activity.jsonl` is rewritten
+into the envelope under the `crew-log` root (`../system-specs/modules/crew-log-core.md`
+§3), with `seq` assigned in file order. Crew store: fold
 its JSON files into `topics` lines once, rename them `.migrated`, route `CrewStore` through
 the ledger. Work ledger: `items/<id>.jsonl` lines become `item/*` events,
 `items/<id>.json` the `items` checkpoint; the `work_*` tools keep their surface. Sessions:

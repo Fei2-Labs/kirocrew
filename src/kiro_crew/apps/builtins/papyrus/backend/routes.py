@@ -15,7 +15,7 @@ Routes (browser-facing, same-origin authed):
   GET    /api/apps/papyrus/projects                  -> {"projects": [...]}
   POST   /api/apps/papyrus/projects                  {"name", "template"?}
   POST   /api/apps/papyrus/projects/clone            {"url", "name"?}
-  GET    /api/apps/papyrus/project?name=<n>          -> {"name","main_file","files","has_pdf"}
+  GET    /api/apps/papyrus/project?name=<n>          -> {"name","title","main_file","files","has_pdf"}
   DELETE /api/apps/papyrus/project?name=<n>          -> {"ok": true}
   GET    /api/apps/papyrus/files?name=<n>            -> {"files": [...]}
   GET    /api/apps/papyrus/file?name=<n>&path=<p>    -> {"path", "content"}
@@ -23,6 +23,7 @@ Routes (browser-facing, same-origin authed):
   POST   /api/apps/papyrus/file                      {"name","path","content"?}  (create)
   DELETE /api/apps/papyrus/file?name=<n>&path=<p>    -> {"ok": true}
   PUT    /api/apps/papyrus/main                      {"name","path"}
+  PUT    /api/apps/papyrus/title                     {"name","title","generation"} -> {"ok","title"}
   POST   /api/apps/papyrus/compile                   {"name"} -> CompileResult
   GET    /api/apps/papyrus/pdf?name=<n>              -> application/pdf
   GET    /api/apps/papyrus/git?name=<n>              -> GitStatus
@@ -30,15 +31,23 @@ Routes (browser-facing, same-origin authed):
   POST   /api/apps/papyrus/git/push                  {"name"}
   POST   /api/apps/papyrus/git/pull                  {"name"}
 
-Authorization is deny-by-default at three layers, in this order:
+Authorization is deny-by-default at four layers, in this order:
 
 1. ``_require_enabled`` — the app is opt-in (``defaultEnabled: false``) but routes
    are registered once at startup, so every handler refuses with 403 while the app
    is disabled.
-2. ``_project`` — the project name must be a single validated slug that resolves
+2. Owner-only, INCLUDING reads, enforced in the same wrapper. The papers are the
+   owner's private drafts, and the git routes run with the owner's own git
+   credentials, so every route answers anyone but the dashboard owner with the
+   shared ``require_owner_dashboard_request`` 403 ``owner_only``. That covers a
+   non-owner dashboard subject and every app token, papyrus's own included: the
+   page is a builtin that fetches with the owner's session cookie, and the
+   co-author agent edits files with its own file tools, so no app-token caller
+   exists.
+3. ``_project`` — the project name must be a single validated slug that resolves
    inside the app's own data dir (``store.safe_project_dir``), and the directory
    must exist. A name that fails either is a 400/404, never a filesystem touch.
-3. ``store.safe_child`` — every relative path (read, write, create, delete, main
+4. ``store.safe_child`` — every relative path (read, write, create, delete, main
    selection) is re-validated against the resolved project root, which is what
    rejects traversal and symlink escapes.
 
@@ -72,6 +81,7 @@ from off the loop. Pinned by ``test_papyrus_routes.py``
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from functools import wraps
 from pathlib import Path
@@ -79,9 +89,9 @@ from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 
-from kiro_crew import platform_compat
 from kiro_crew.apps.builtins.papyrus.backend import gitops, latex, store, tectonic
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.slugs import refused_slug_char
 
 try:
     from kiro_crew.security import redact
@@ -136,17 +146,29 @@ _Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
 def _require_enabled(handler: _Handler) -> _Handler:
-    """Deny every request while Papyrus is disabled (deny-by-default).
+    """Deny every request while Papyrus is disabled, then to anyone but the owner.
 
     Routes are registered once at gateway startup, so a default-disabled app
     would otherwise stay callable. ``is_app_enabled`` is a synchronous
     ``installed.json`` read, so it runs off the event loop.
+
+    The owner gate runs second, on every route, reads included: see layer 2 in
+    the module docstring.
     """
+
+    operation = f"papyrus.{handler.__name__.removeprefix('_handle_')}"
 
     @wraps(handler)
     async def _wrapped(request: web.Request) -> web.StreamResponse:
         if not await asyncio.to_thread(is_app_enabled, store.APP_NAME):
             return web.json_response({"error": "papyrus is disabled", "code": "app_disabled"}, status=403)
+        # Imported here, not at module top: ``_shared`` pulls in the dashboard
+        # handler surface (issue_radar resolves it the same way).
+        from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+        owner_denied = await require_owner_dashboard_request(request, operation)
+        if owner_denied is not None:
+            return owner_denied
         return await handler(request)
 
     return _wrapped
@@ -215,6 +237,29 @@ def _str_field(source: dict[str, Any], key: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _invalid_name(typed: str) -> web.HTTPBadRequest:
+    """A 400 whose JSON body names the rule and the refused character.
+
+    ``code`` is what the dashboard switches on to explain the rule in the user's
+    own language, and ``char`` lets that copy say which character it was (a name
+    typed in another script is refused at its first letter). *typed* is the name
+    as the caller sent it, before :func:`store.normalize_project_name`, so the
+    character named is one the user typed -- not a lowercased stand-in that can
+    look like an allowed Latin letter. The English ``error`` is for logs and
+    clients without a catalog. Raised, not returned, because the name gate runs
+    inside a worker-thread closure -- see the module docstring.
+    """
+    char = refused_slug_char(typed)
+    error = (
+        "invalid project name: use lowercase a-z, 0-9, '.', '_' or '-', "
+        "starting with a letter or digit, at most 64 characters"
+    )
+    if char:
+        error += f"; {char!r} is not allowed"
+    payload = {"error": error, "code": "invalid_project_name", "char": char}
+    return web.HTTPBadRequest(text=json.dumps(payload), content_type="application/json")
+
+
 def _project(name: str) -> Path:
     """Resolve *name* to an existing project directory, or raise an HTTP error.
 
@@ -230,6 +275,8 @@ def _project(name: str) -> Path:
         raise web.HTTPBadRequest(reason="missing 'name'")
     try:
         project = store.safe_project_dir(name)
+    except store.InvalidProjectName as exc:
+        raise _invalid_name(name) from exc
     except store.PathRejected as exc:
         raise web.HTTPBadRequest(reason=str(exc)) from exc
     if not project.is_dir():
@@ -237,8 +284,11 @@ def _project(name: str) -> Path:
     return project
 
 
-def _project_for_create(name: str) -> Path:
+def _project_for_create(name: str, typed: str) -> Path:
     """Resolve a project directory that must NOT yet exist.
+
+    *name* is the normalized name that is validated and created; *typed* is what
+    the user sent, used only to name the refused character.
 
     BLOCKING — ``Path.resolve()`` plus an ``exists()`` ``stat``. Worker thread only.
     """
@@ -246,6 +296,8 @@ def _project_for_create(name: str) -> Path:
         raise web.HTTPBadRequest(reason="missing 'name'")
     try:
         project = store.safe_project_dir(name)
+    except store.InvalidProjectName as exc:
+        raise _invalid_name(typed) from exc
     except store.PathRejected as exc:
         raise web.HTTPBadRequest(reason=str(exc)) from exc
     if project.exists():
@@ -345,14 +397,46 @@ async def _handle_provision_compiler(request: web.Request) -> web.StreamResponse
 # ── projects ────────────────────────────────────────────────────────────────
 
 
+def _display_title(title: str, name: str) -> str:
+    """Redact a paper title bound for the list, falling back to the identifier.
+
+    A title is not authored by this app alone: it is stored in ``.papyrus.json``,
+    which arrives wholesale with ``POST /projects/clone``. That makes it the same class of text as the compile
+    log — untrusted content rendered in the dashboard — so it takes the same
+    redaction pass, which is also what keeps a token pasted into a title out of
+    the paper list.
+
+    Falls back to the directory name when redaction is unavailable or eats the
+    whole value: ``_clean``'s withheld-output marker is the right answer for a log
+    pane and the wrong one for a name, and the identifier is always displayable.
+
+    The length cap comes AFTER redaction, on purpose: cut first, and a credential
+    straddling :data:`store.MAX_TITLE_CHARS` loses its tail, the redactor does
+    not recognize what is left, and that prefix reaches the dashboard.
+    """
+    cleaned = _clean(title).strip()
+    if not cleaned or not _HAS_SECURITY:
+        return name
+    return cleaned[: store.MAX_TITLE_CHARS].strip()
+
+
 async def _handle_list_projects(request: web.Request) -> web.StreamResponse:
-    projects = await asyncio.to_thread(store.list_projects)
-    return web.json_response({"projects": [p.to_dict() for p in projects]})
+    def _rows() -> list[dict[str, Any]]:
+        """BLOCKING — list and redact in one hop: redaction is CPU work per row."""
+        rows = []
+        for project in store.list_projects():
+            row = project.to_dict()
+            row["title"] = _display_title(str(row["title"]), project.name)
+            rows.append(row)
+        return rows
+
+    return web.json_response({"projects": await asyncio.to_thread(_rows)})
 
 
 async def _handle_create_project(request: web.Request) -> web.StreamResponse:
     body = await _json_body(request)
-    name = store.normalize_project_name(_str_field(body, "name"))
+    typed = _str_field(body, "name")
+    name = store.normalize_project_name(typed)
     template = body.get("template")
     content = template if isinstance(template, str) and template.strip() else DEFAULT_TEMPLATE
 
@@ -373,7 +457,7 @@ async def _handle_create_project(request: web.Request) -> web.StreamResponse:
                 max_size=store.MAX_FILE_BYTES,
                 actual_size=len(content.encode("utf-8")),
             )
-        project = _project_for_create(name)
+        project = _project_for_create(name, typed)
         try:
             # `exist_ok=False` (the default) on purpose: the FileExistsError is the
             # authoritative answer to "did someone else take this name", and it is the
@@ -407,7 +491,7 @@ async def _handle_clone_project(request: web.Request) -> web.StreamResponse:
     # subprocess that needs the resolved path, so there is nothing to group it
     # with. The check/use window is unchanged — it was already an `await` wide,
     # and `git clone` refuses a non-empty destination at the syscall regardless.
-    project = await asyncio.to_thread(_project_for_create, name)
+    project = await asyncio.to_thread(_project_for_create, name, requested)
 
     try:
         await gitops.clone(url, project)
@@ -427,9 +511,11 @@ async def _handle_clone_project(request: web.Request) -> web.StreamResponse:
     if main_file is None:
         # A repo with no .tex is not a paper. Remove the clone so the name is
         # free again and the user is not left with an unopenable project.
-        # `rmtree_force` because this tree is a git checkout by construction — see
-        # `_handle_delete_project` for why `ignore_errors` is not enough on Windows.
-        await asyncio.to_thread(platform_compat.rmtree_force, project)
+        # `delete_project` (an `rmtree_force` under the config lock) because this
+        # tree is a git checkout by construction — see `_handle_delete_project`
+        # for why `ignore_errors` is not enough on Windows — and because a title
+        # write racing the cleanup would otherwise recreate the rejected paper.
+        await asyncio.to_thread(store.delete_project, project)
         return web.json_response({"error": "no .tex file found in repository", "code": "no_tex_in_repository"}, status=422)
     logger.info("papyrus: cloned project %s", name)
     return web.json_response({"name": name, "main_file": main_file}, status=201)
@@ -438,24 +524,39 @@ async def _handle_clone_project(request: web.Request) -> web.StreamResponse:
 async def _handle_get_project(request: web.Request) -> web.StreamResponse:
     name = request.query.get("name", "").strip()
 
-    def _read() -> tuple[Path, str | None, list[str], bool]:
+    def _read() -> tuple[Path, str | None, str, list[str], bool]:
         """BLOCKING — authorize the name, then walk the project, in ONE hop."""
         project = _project(name)
         main_file = store.resolve_main_file(project)
         if main_file is None:
-            return project, None, [], False
+            return project, None, "", [], False
         return (
             project,
             main_file,
+            # The SAME resolution the list uses, so the workspace header and the
+            # row that opened it cannot disagree about what the paper is called.
+            # Resolved here rather than derived on the client: the client holds
+            # only `name`, and a paper opened by URL never went through the list.
+            # Redacted in this hop, off the event loop, like the compile log.
+            _display_title(store.project_title(project), project.name),
             store.list_files(project),
             bool((pdf := store.pdf_path(project, main_file)) and pdf.is_file()),
         )
 
-    project, main_file, files, has_pdf = await asyncio.to_thread(_read)
+    project, main_file, title, files, has_pdf = await asyncio.to_thread(_read)
     if main_file is None:
         raise web.HTTPNotFound(reason="no .tex file found in project")
     return web.json_response(
-        {"name": project.name, "main_file": main_file, "files": files, "has_pdf": has_pdf}
+        {
+            "name": project.name,
+            # Through the SAME redaction the list row takes (applied in `_read`):
+            # the title is untrusted (a cloned `.tex` or `.papyrus.json` supplies
+            # it) and it lands in the dashboard header.
+            "title": title,
+            "main_file": main_file,
+            "files": files,
+            "has_pdf": has_pdf,
+        }
     )
 
 
@@ -471,7 +572,7 @@ async def _handle_delete_project(request: web.Request) -> web.StreamResponse:
         # the parent directory instead), so `ignore_errors` silently left
         # `.git/objects` on disk and this handler still answered `ok: true` — the
         # name stayed taken and the next create answered 409 with no explanation.
-        return project, platform_compat.rmtree_force(project)
+        return project, store.delete_project(project)
 
     project, removed = await asyncio.to_thread(_delete)
     if not removed:
@@ -597,7 +698,8 @@ async def _handle_set_main(request: web.Request) -> web.StreamResponse:
         _safe_relative(project, relative)
         if not store.safe_child(project, relative).is_file():
             raise FileNotFoundError(relative)
-        store.set_main_file(project, relative)
+        if not store.set_main_file(project, relative):
+            raise store.ConfigWriteRefused(project.name)
 
     try:
         await asyncio.to_thread(_apply)
@@ -605,7 +707,88 @@ async def _handle_set_main(request: web.Request) -> web.StreamResponse:
         raise web.HTTPBadRequest(reason=str(exc)) from exc
     except FileNotFoundError as exc:
         raise web.HTTPNotFound(reason="file not found") from exc
+    except store.ConfigWriteRefused:
+        return web.json_response(
+            {
+                "error": "this paper's settings file cannot be written, so the main "
+                "document was not changed",
+                "code": "project_config_refused",
+            },
+            status=409,
+        )
     return web.json_response({"ok": True, "main_file": relative})
+
+
+async def _handle_set_title(request: web.Request) -> web.StreamResponse:
+    """Rename what the list DISPLAYS for a paper; the directory keeps its name.
+
+    An empty ``title`` clears the override and the response carries whatever the
+    list will show next — the directory name — so the client renders the answer
+    instead of guessing.
+    """
+    body = await _json_body(request)
+    name = _str_field(body, "name")
+    # An explicit "" is how a rename is cleared, so it cannot double as "missing":
+    # a body without a string title is refused, never read as a request to clear.
+    if not isinstance(body.get("title"), str):
+        raise web.HTTPBadRequest(reason="title must be a string")
+    title = _str_field(body, "title")
+    # Which paper the client's row is. Required: without it a row loaded before
+    # a delete and a same-name create would rename the paper that replaced it.
+    generation = body.get("generation")
+    if not isinstance(generation, str) or not generation:
+        raise web.HTTPBadRequest(reason="generation must be a non-empty string")
+
+    def _apply() -> str:
+        """BLOCKING — authorize the name, then write the config, in ONE hop.
+
+        The config lock is taken BEFORE the existence check and held through the
+        write. The generation check refuses a paper that was deleted and created
+        again under the same name, whether that happened before this request
+        arrived or while it waited for the lock: a delete forgets the token, so
+        the paper that replaced it answers with a new one.
+        """
+        try:
+            path = store.safe_project_dir(name)
+        except store.PathRejected as exc:
+            raise web.HTTPBadRequest(reason=str(exc)) from exc
+        with store.config_lock(path):
+            project = _project(name)
+            if store.project_generation(project) != generation:
+                raise store.ProjectReplaced(project.name)
+            store.set_project_title_locked(project, title)
+        # Redacted here, off the event loop.
+        resolved = store.project_title(project)
+        return _display_title(resolved, project.name)
+
+    try:
+        resolved = await asyncio.to_thread(_apply)
+    except store.TitleRejected:
+        return web.json_response(
+            {
+                "error": "this name has no displayable text; leave the field empty to clear it",
+                "code": "title_rejected",
+            },
+            status=400,
+        )
+    except store.ConfigWriteRefused:
+        return web.json_response(
+            {
+                "error": "this paper's settings file cannot be written, so the name was not saved",
+                "code": "project_config_refused",
+            },
+            status=409,
+        )
+    except store.ProjectReplaced:
+        return web.json_response(
+            {
+                "error": "this paper changed since the list was loaded; the list has been "
+                "reloaded, press Enter to save the name again",
+                "code": "project_replaced",
+            },
+            status=409,
+        )
+    return web.json_response({"ok": True, "title": resolved})
 
 
 # ── compile + pdf ───────────────────────────────────────────────────────────
@@ -887,6 +1070,7 @@ def register_routes(app: web.Application) -> None:
     app.router.add_post(f"{API_BASE}/file", _require_enabled(_handle_create_file))
     app.router.add_delete(f"{API_BASE}/file", _require_enabled(_handle_delete_file))
     app.router.add_put(f"{API_BASE}/main", _require_enabled(_handle_set_main))
+    app.router.add_put(f"{API_BASE}/title", _require_enabled(_handle_set_title))
 
     app.router.add_post(f"{API_BASE}/compile", _require_enabled(_handle_compile))
     app.router.add_get(f"{API_BASE}/pdf", _require_enabled(_handle_pdf))

@@ -4,17 +4,21 @@
 // delegates stick-to-bottom follow to the virtualized transcript behind
 // ChatMessageList (chat-core P5-e) and mounts the shared EdgeFade /
 // JumpToBottomButton chrome. These tests pin the wiring at the host level:
-//   1. both edge fades render (top under the header, bottom above the bars),
+//   1. the top edge fade renders under the header, and there is NO bottom fade:
+//      the composer dock floats over the scroller (ChatPage's layout, #18279)
+//      and the scroller pays for the covered strip with its padding instead,
 //   2. the jump-to-bottom pill appears once the user scrolls up and jumping
 //      lands back at the bottom,
-//   3. the scroller's scroll events drive the pill state.
+//   3. the scroller's scroll events drive the pill state,
+//   4. sending a message force-pins the transcript and re-arms follow, as
+//      ChatPage does — a Crewmate DM sent from mid-history lands on the bubble.
 //
 // The follow DECISIONS themselves (release/re-engage/shrink re-pin) are pinned
 // by FollowController.test.ts and the virtualizer's own tests; duplicating them
 // here would test the hook twice through a heavier harness.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, act, screen } from '@testing-library/react'
+import { render, act, screen, fireEvent } from '@testing-library/react'
 import type { RootState } from '../store'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -73,7 +77,7 @@ function makeStore() {
   })
 }
 
-function renderPane() {
+function renderPane(props: Partial<React.ComponentProps<typeof ChatPane>> = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const store = makeStore()
   const view = render(
@@ -81,7 +85,7 @@ function renderPane() {
       <QueryClientProvider client={qc}>
         <ThemeProvider>
           <MemoryRouter>
-            <ChatPane slotKey={SLOT} />
+            <ChatPane slotKey={SLOT} {...props} />
           </MemoryRouter>
         </ThemeProvider>
       </QueryClientProvider>
@@ -137,15 +141,48 @@ afterEach(() => {
 })
 
 describe('ChatPane shared scroll chrome', () => {
-  it('renders both edge fades around the transcript scroller', () => {
+  it('pays for a host band floating over its top edge (`topInset`, #18325)', () => {
+    const { container } = renderPane({ topInset: 48 })
+    // The scroller pads its rows below the band on top of its own 12px, so
+    // at scroll top nothing hides under it while rows still scroll under it.
+    const scroller = container.querySelector('.chat-container') as HTMLElement
+    expect(scroller.style.paddingTop).toBe('60px')
+    // The pinned-prompt band (its fold sentinel's parent) hangs under the band
+    // too: a relative offset, so it costs no flow height.
+    const pinBand = container.querySelector('.relative.z-\\[2\\]') as HTMLElement
+    expect(pinBand).not.toBeNull()
+    expect(pinBand.style.top).toBe('48px')
+    // Default: no band, nothing paid.
+    const plain = renderPane()
+    expect((plain.container.querySelector('.chat-container') as HTMLElement).style.paddingTop).toBe('12px')
+    expect((plain.container.querySelector('.relative.z-\\[2\\]') as HTMLElement).style.top).toBe('')
+  })
+
+  it('renders the top edge fade only; the composer dock floats over the scroller', () => {
     const { container } = renderPane()
     const topFade = container.querySelector('.bg-gradient-to-b.from-bg')
-    const bottomFade = container.querySelector('.bg-gradient-to-t.from-bg')
     expect(topFade).not.toBeNull()
-    expect(bottomFade).not.toBeNull()
-    // Both are decorative: hidden from the a11y tree and pointer-inert.
+    // Decorative: hidden from the a11y tree and pointer-inert.
     expect(topFade!.getAttribute('aria-hidden')).toBe('true')
-    expect(bottomFade!.getAttribute('aria-hidden')).toBe('true')
+    // No opaque band between transcript and composer: the transcript scrolls
+    // under the glass, so a bottom fade would hide exactly what the layout
+    // exists to show (docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md).
+    expect(container.querySelector('.bg-gradient-to-t.from-bg')).toBeNull()
+    // The dock is out of flow over the scroller's bottom edge and holds the
+    // composer, so the scroller runs the full height of the pane.
+    const dock = container.querySelector('[data-testid="composer-dock-root"]') as HTMLElement
+    expect(dock).not.toBeNull()
+    expect(dock.className.split(/\s+/)).toEqual(expect.arrayContaining(['absolute', 'bottom-0', 'pointer-events-none']))
+    // Inert on the inner boxes, never the root (see the dockClearance pins):
+    // the jump pill's full-width wrapper is a direct child of the root and
+    // must stay pointer-inert, or it swallows input over the rows behind it.
+    expect(dock.className.split(/\s+/)).not.toContain('dock-inert')
+    const inputArea = screen.getAllByRole('textbox')[0].closest('.dock-inert') as HTMLElement
+    expect(inputArea).not.toBeNull()
+    expect(inputArea.parentElement).toBe(dock)
+    expect(dock.querySelector('[data-testid="composer-status-stack"]')!.className.split(/\s+/)).toContain('dock-inert')
+    const scroller = container.querySelector('.chat-container') as HTMLElement
+    expect(dock.compareDocumentPosition(scroller) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
   })
 
   it('shows the jump pill after a user scroll up, and jumping returns to the bottom', () => {
@@ -164,11 +201,90 @@ describe('ChatPane shared scroll chrome', () => {
     // Scrolled up: pill appears; clicking it lands at the bottom and hides it.
     act(() => { state.scrollTop = 100; scroller.dispatchEvent(new Event('scroll')) })
     const pill = screen.getByLabelText('Scroll to bottom')
+    // The pill's full-width wrapper is a direct child of the dock root and
+    // stays pointer-inert (only the button catches input), so the strip above
+    // the composer never swallows clicks or wheel meant for the rows under it.
+    const pillWrap = pill.parentElement as HTMLElement
+    expect(pillWrap.parentElement).toBe(container.querySelector('[data-testid="composer-dock-root"]'))
+    expect(pillWrap.className.split(/\s+/)).toContain('pointer-events-none')
+    expect(pillWrap.className.split(/\s+/)).not.toContain('dock-inert')
+    expect(pill.className.split(/\s+/)).toContain('pointer-events-auto')
     act(() => { pill.click() })
     flushFrames()
     expect(state.scrollTop).toBe(600)
     // The browser reports the programmatic scroll back as a scroll event.
     act(() => { scroller.dispatchEvent(new Event('scroll')) })
     expect(screen.queryByLabelText('Scroll to bottom')).toBeNull()
+  })
+
+  it('sending from a scrolled-up reader lands at the bottom and re-arms follow', async () => {
+    const { container, store } = renderPane()
+    act(() => {
+      store.dispatch(appendSlotMessage({ slot: SLOT, message: { role: 'assistant', content: 'earlier', cls: '', ts: '2026-01-01T00:00:00Z' } }))
+    })
+    const scroller = container.querySelector('.chat-container') as HTMLElement
+    const state = fakeGeom(scroller, { scrollTop: 600, scrollHeight: 1000, clientHeight: 400 })
+    act(() => { scroller.dispatchEvent(new Event('scroll')) })
+    // Reading history: follow released, pill shown.
+    act(() => { state.scrollTop = 100; scroller.dispatchEvent(new Event('scroll')) })
+    expect(screen.getByLabelText('Scroll to bottom')).not.toBeNull()
+
+    const box = screen.getAllByRole('textbox')[0]
+    await act(async () => {
+      fireEvent.change(box, { target: { value: 'are you there?' } })
+      fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    })
+    // The pin is deferred past the bubble's commit (SCROLL_AFTER_RENDER_MS),
+    // then applied on the next frame by the virtualizer.
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)) })
+    flushFrames()
+    expect(state.scrollTop).toBe(600)
+    act(() => { scroller.dispatchEvent(new Event('scroll')) })
+    expect(screen.queryByLabelText('Scroll to bottom')).toBeNull()
+  })
+})
+
+describe('ChatPane mate greeting (`crewmateGreeting`)', () => {
+  const greeting = <div data-testid="host-greeting">Where we left off</div>
+  // The greeting's "newer than me" test compares a row's stamp with the moment
+  // it appeared, so the clock is pinned: Date only, the frame fakes above stay.
+  const SHOWN_AT = '2026-10-11T04:00:00.000Z'
+  beforeEach(() => { vi.setSystemTime(new Date(SHOWN_AT)) })
+  afterEach(() => { vi.useRealTimers() })
+
+  it("draws the host's greeting inside the transcript scroller, after the rows", () => {
+    const { container } = renderPane({ crewmate: { name: 'oncall' }, crewmateGreeting: greeting })
+    const drawn = screen.getByTestId('host-greeting')
+    expect(container.querySelector('.chat-container')!.contains(drawn)).toBe(true)
+  })
+
+  // Drawn after the last row, so a reply landing after it (a patrol / wake
+  // turn, which keeps the greeting up) must take it down: a stale summary
+  // under a fresher reply would read as the newest word.
+  it("takes the greeting down once the mate says something newer, so it is never under a fresher reply", () => {
+    const { store } = renderPane({ crewmate: { name: 'oncall' }, crewmateGreeting: greeting })
+    expect(screen.getByTestId('host-greeting')).toBeInTheDocument()
+    act(() => {
+      store.dispatch(appendSlotMessage({ slot: SLOT, message: { role: 'nudge', content: '[auto-nudge cycle 3] Checking on round 3', cls: '', ts: SHOWN_AT } }))
+    })
+    // A patrol wake alone draws nothing, so the greeting is still the newest word.
+    expect(screen.getByTestId('host-greeting')).toBeInTheDocument()
+    act(() => {
+      store.dispatch(appendSlotMessage({ slot: SLOT, message: { role: 'assistant', content: 'K is done; J is still running.', cls: '', ts: '2026-10-11T04:00:01.000Z' } }))
+    })
+    expect(screen.queryByTestId('host-greeting')).toBeNull()
+  })
+
+  it('keeps the greeting when the transcript that lands after it is older', () => {
+    const { store } = renderPane({ crewmate: { name: 'oncall' }, crewmateGreeting: greeting })
+    act(() => {
+      store.dispatch(appendSlotMessage({ slot: SLOT, message: { role: 'assistant', content: 'from yesterday', cls: '', ts: '2026-01-01T00:00:00Z' } }))
+    })
+    expect(screen.getByTestId('host-greeting')).toBeInTheDocument()
+  })
+
+  it('draws nothing for an ordinary chat: the greeting belongs to a mate', () => {
+    renderPane({ crewmateGreeting: greeting })
+    expect(screen.queryByTestId('host-greeting')).toBeNull()
   })
 })

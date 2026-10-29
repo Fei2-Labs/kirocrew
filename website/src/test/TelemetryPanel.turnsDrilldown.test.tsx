@@ -31,7 +31,7 @@ const convo = (over: Record<string, unknown> = {}) => ({
 
 const resp = (conversations: Record<string, unknown>[]) => ({
   enabled: true,
-  window_days: 14,
+  window_days: 7,
   shard_count: 3,
   metrics_dir: "/tmp/metrics",
   startup: null,
@@ -79,13 +79,19 @@ async function mount(turns: Record<string, unknown>[]) {
     turns,
   } as never);
   render(<TelemetryPanel />, { wrapper: Wrapper });
-  await screen.findByRole("link", { name: "Costly one" });
+  // Exactly two links carry this title: the session bar block and the table row
+  // it also appears in. Pinned rather than merely awaited — a third would mean a
+  // surface rendered the conversation twice.
+  expect(await screen.findAllByRole("link", { name: "Costly one" })).toHaveLength(2);
 }
 
 describe("TelemetryPanel — per-turn drill-down", () => {
   beforeEach(() => {
     qc.clear();
     vi.clearAllMocks();
+    // The row expanders live in the spend table, which ships inside a
+    // collapsible that is closed on first paint.
+    localStorage.setItem("telemetry:spend-table-open", "1");
   });
 
   it("opens a session row into its per-turn rows, querying that slot", async () => {
@@ -105,7 +111,8 @@ describe("TelemetryPanel — per-turn drill-down", () => {
     );
     expect(await screen.findByText("claude-x")).toBeInTheDocument();
     const { api } = await import("../api/client");
-    expect(vi.mocked(api.usageTurns)).toHaveBeenCalledWith("chat-1-1700000000");
+    // The drill-down reads the same window as the panel it opens under (the default week).
+    expect(vi.mocked(api.usageTurns)).toHaveBeenCalledWith("chat-1-1700000000", "days=7");
     // Both turns render, each with its own model and credits — the row the
     // average hides is exactly what this surface exists to show.
     expect(screen.getByText("claude-y")).toBeInTheDocument();
@@ -113,6 +120,72 @@ describe("TelemetryPanel — per-turn drill-down", () => {
     expect(screen.getByText("1.25")).toBeInTheDocument();
     // The second row has no duration/context: unknown renders as a dash, not 0.
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+  });
+
+  it("keeps an open drill-down on the window on screen while a new pick loads", async () => {
+    await mount([{ ts: "2026-08-20T10:00:00Z", model: "claude-x", credits: 3.5 }]);
+    fireEvent.click(
+      screen.getAllByRole("button", { name: "Show per-turn detail" })[0],
+    );
+    expect(await screen.findByText("claude-x")).toBeInTheDocument();
+    const { api } = await import("../api/client");
+    let land: (v: unknown) => void = () => {};
+    vi.mocked(api.telemetryStartup).mockReturnValue(
+      new Promise((r) => (land = r)) as never,
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "30d" }));
+    await vi.waitFor(() =>
+      expect(screen.getByTestId("telemetry-range-pending")).toHaveTextContent("Loading telemetry"),
+    );
+    // The totals above still describe the week, so the rows under them must too.
+    expect(vi.mocked(api.usageTurns)).not.toHaveBeenCalledWith("chat-1-1700000000", "days=30");
+    land({ ...resp([convo({ title: "Costly one" })]), window_days: 30 });
+    await vi.waitFor(() =>
+      expect(vi.mocked(api.usageTurns)).toHaveBeenCalledWith("chat-1-1700000000", "days=30"),
+    );
+  });
+
+  it("reads the drill-down over the spend week while the panel is on Default", async () => {
+    const { api } = await import("../api/client");
+    vi.mocked(api.telemetryStartup).mockResolvedValue({
+      ...resp([convo({ title: "Costly one" })]),
+      window_days: 14,
+      window_default: true,
+      cost_window_days: 7,
+    } as never);
+    vi.mocked(api.usageTurns).mockResolvedValue({ slot: "chat-1-1700000000", turns: [] } as never);
+    render(<TelemetryPanel />, { wrapper: Wrapper });
+    await screen.findAllByRole("link", { name: "Costly one" });
+    fireEvent.click(screen.getAllByRole("button", { name: "Show per-turn detail" })[0]);
+    await vi.waitFor(() =>
+      expect(vi.mocked(api.usageTurns)).toHaveBeenCalledWith("chat-1-1700000000", "days=7"),
+    );
+  });
+
+  it("reads the drill-down over the measured bounds, not the requested future end", async () => {
+    // A custom range ending today asks for `until` = tomorrow's midnight; the
+    // gateway measured up to its own minute ceiling. The drill-down must list
+    // the turns of THAT window, not re-clamp the future end to a later now.
+    localStorage.setItem("telemetry:range", "custom");
+    const { api } = await import("../api/client");
+    const start = "2026-09-25T04:00:00Z";
+    const end = "2026-10-02T05:31:00Z";
+    vi.mocked(api.telemetryStartup).mockResolvedValue({
+      ...resp([convo({ title: "Costly one" })]),
+      window_rolling: false,
+      window_start: start,
+      window_end: end,
+    } as never);
+    vi.mocked(api.usageTurns).mockResolvedValue({ slot: "chat-1-1700000000", turns: [] } as never);
+    render(<TelemetryPanel />, { wrapper: Wrapper });
+    await screen.findAllByRole("link", { name: "Costly one" });
+    fireEvent.click(screen.getAllByRole("button", { name: "Show per-turn detail" })[0]);
+    await vi.waitFor(() =>
+      expect(vi.mocked(api.usageTurns)).toHaveBeenCalledWith(
+        "chat-1-1700000000",
+        `since=${Date.parse(start) / 1000}&until=${Date.parse(end) / 1000}`,
+      ),
+    );
   });
 
   it("says so when the window holds no per-turn rows", async () => {
@@ -132,7 +205,7 @@ describe("TelemetryPanel — per-turn drill-down", () => {
     );
     vi.mocked(api.usageTurns).mockRejectedValue(new Error("boom"));
     render(<TelemetryPanel />, { wrapper: Wrapper });
-    await screen.findByRole("link", { name: "Costly one" });
+    expect(await screen.findAllByRole("link", { name: "Costly one" })).toHaveLength(2);
     fireEvent.click(
       screen.getAllByRole("button", { name: "Show per-turn detail" })[0],
     );

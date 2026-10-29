@@ -29,9 +29,11 @@ import pytest
 from chat_test_helpers import _make_state
 
 from kiro_crew.dashboard.chat_persistence import (
+    _attach_variants,
     _build_history_prefix,
     _build_message_entry,
     _rehydrate_slot_from_history,
+    restore_recent_sessions,
 )
 from kiro_crew.dashboard.chat_utils import _history_key_for, _prepare_messages
 
@@ -162,32 +164,6 @@ def test_side_chat_parent_snapshot_keeps_user_text() -> None:
     slot = _ChatSlot("chat-1-sideu")
     slot.append("user", "my own question", "msg msg-u", broadcast=False)
     assert "my own question" in _format_parent_snapshot(slot)
-
-
-def test_stage_result_capture_redacts_before_writing_to_disk(tmp_path, monkeypatch) -> None:
-    """The stage-result capture writes assistant text to a NEW file on disk.
-
-    A gateway restart mid-orchestration leaves restored (now unredacted) turns in
-    the window, so without redaction here those bytes would be written out.
-
-    Composed from the two halves the stage loop itself calls: the message walk
-    runs on the caller (it reads live slot state) and the redact-plus-write half
-    takes only strings, which is what makes it safe to hand to a worker thread.
-    """
-    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-    monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
-    from kiro_crew.dashboard.chat_orchestrator import (
-        _collect_stage_result_parts,
-        _write_stage_result,
-    )
-    from kiro_crew.dashboard.state import _ChatSlot
-
-    slot = _ChatSlot("chat-1-stage")
-    slot.append("assistant", f"result with {SECRET}", "msg msg-a", broadcast=False)
-
-    path = _write_stage_result(slot.key, 1, _collect_stage_result_parts(slot))
-    written = pathlib.Path(path).read_text()
-    assert SECRET not in written, "stage result persisted an unredacted credential"
 
 
 # ── 4. restore must not broadcast replayed history ───────────────────────────
@@ -804,3 +780,102 @@ def test_ws_broadcast_redacts_structured_content(tmp_path, monkeypatch) -> None:
     assert sent[0]["_type"] == "chat_message"
     assert isinstance(sent[0]["content"], str), "wire content must be a string"
     assert SECRET not in sent[0]["content"], "structured leaf leaked raw"
+
+
+# LOAD path: a structured row must not raise on the way in
+#
+# A str-only redactor pair rejects a list/dict `content` with TypeError, so any
+# load site that hands it raw row content refuses a pre-rule, legacy, or
+# hand-edited structured row during restore / rehydrate / cron inject - before
+# the display boundary, which tolerates that shape, is ever reached. Each test
+# below drives ONE of the four load sites.
+
+#: The shape a legacy or foreign writer can leave on disk: a provider content
+#: block list rather than flat text.
+STRUCTURED_CONTENT = [{"type": "text", "text": f"key {SECRET}"}]
+
+
+def _rewrite_last_content(log, key: str, content) -> None:
+    """Replace the last stored record's ``content`` with a structured value.
+
+    ``ConversationLog.append`` takes a ``str`` and the write path would
+    string-shape and redact the value before it landed, so editing the JSONL
+    directly is the only way to stage bytes a legacy or foreign writer could
+    have left. Same reason :func:`_rewrite_last_meta` exists.
+    """
+    path = pathlib.Path(log._path(key))
+    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    assert lines, "precondition: something was written"
+    rec = json.loads(lines[-1])
+    rec["content"] = content
+    lines[-1] = json.dumps(rec)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _seed_structured(state, slot_key: str) -> None:
+    log = state.conversation_log
+    assert log is not None
+    key = _history_key_for(slot_key)
+    log.append(key, "assistant", "placeholder")
+    _rewrite_last_content(log, key, STRUCTURED_CONTENT)
+
+
+def test_rehydrate_tolerates_structured_content(tmp_path, monkeypatch) -> None:
+    """``_rehydrate_slot_from_history`` loads a structured row, redacted and flat."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    _seed_structured(_make_state(tmp_path / "sessions"), "chat-1-rhstruct")
+
+    state2 = _make_state(tmp_path / "sessions")
+    slot = _rehydrate_slot_from_history(state2, "chat-1-rhstruct")
+    assert slot is not None and slot.messages, "precondition: history was restored"
+    loaded = slot.messages[-1]["content"]
+    assert isinstance(loaded, str), "slot content must keep its wire string shape"
+    assert SECRET not in loaded, "structured leaf leaked raw onto the slot"
+
+
+def test_restore_recent_sessions_tolerates_structured_content(tmp_path, monkeypatch) -> None:
+    """The SECOND restore loop shares the tolerance — the guard is not per-site."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    _seed_structured(_make_state(tmp_path / "sessions"), "chat-1-rrstruct")
+
+    state2 = _make_state(tmp_path / "sessions")
+    assert restore_recent_sessions(state2, window_minutes=0) == 1
+    slot = state2._slots.get("chat-1-rrstruct")
+    assert slot is not None and slot.messages, "precondition: messages were replayed"
+    loaded = slot.messages[-1]["content"]
+    assert isinstance(loaded, str), "slot content must keep its wire string shape"
+    assert SECRET not in loaded, "structured leaf leaked raw onto the slot"
+
+
+def test_attach_variants_tolerates_structured_variant_content(tmp_path, monkeypatch) -> None:
+    """The load-side variants branch redacts a structured variant instead of raising."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    slot = state.get_or_create_slot("chat-1-varstruct")
+    slot.append("assistant", "fine", "msg msg-a", broadcast=False)
+
+    _attach_variants(slot, {"variants": [{"content": STRUCTURED_CONTENT}], "variant_idx": 0})
+
+    restored = slot.messages[-1]["variants"][0]["content"]
+    assert isinstance(restored, str), "variant content must keep its wire string shape"
+    assert SECRET not in restored, "structured variant leaf leaked raw onto the slot"
+
+
+def test_cron_hydrate_tolerates_structured_content(tmp_path, monkeypatch) -> None:
+    """``hydrate_slot_from_history`` (cron inject) shares the same guard.
+
+    Its ``if not content: continue`` skip does not cover this: a non-empty
+    structured value is truthy, so it reaches the redaction call either way.
+    """
+    from kiro_crew.dashboard.cron_inject import hydrate_slot_from_history
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    state = _make_state(tmp_path / "sessions")
+    slot = state.get_or_create_slot("chat-1-cronstruct")
+
+    hydrate_slot_from_history(slot, [{"role": "assistant", "content": STRUCTURED_CONTENT}])
+
+    assert slot.messages, "precondition: the row was hydrated"
+    loaded = slot.messages[-1]["content"]
+    assert isinstance(loaded, str), "slot content must keep its wire string shape"
+    assert SECRET not in loaded, "structured leaf leaked raw onto the slot"

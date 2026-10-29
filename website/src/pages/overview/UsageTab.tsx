@@ -1,12 +1,20 @@
-import { BarChart3 } from 'lucide-react'
+import { Fragment } from 'react'
+import { BarChart3, ChartArea } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
-import { Card, CardTitle, Badge } from '../../components/ui'
+import { Btn, Card, CardTitle, Badge } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { useProvider } from '../../providers'
 import { providerUsageQuery } from '../../api/providerUsageQuery'
+import { api } from '../../api/client'
+import { reportsCredits } from '../../api/acpBackend'
+import { failedWithNoData } from '../../api/queryState'
+import { reportForError } from '../../utils/errorReport'
+import type { AcpBackendConfig } from '../../api/acpBackend'
 import { TokenDailyChart } from './TokenDailyChart'
+import { TokenStackedAreaChart } from './TokenStackedAreaChart'
 import { formatCost } from '../../utils/formatCost'
 
+import { fmtNumber, fmtPercent } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 function fmtNum(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -14,10 +22,48 @@ function fmtNum(n: number): string {
   return String(n)
 }
 
+const EM_DASH = '\u2014'
+
+/** A day's credits, localized, in the Billing card's two decimals; a dash when the day has no figure. */
+function fmtCredits(credits: number | undefined): string {
+  return credits == null ? EM_DASH : fmtNumber(credits, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+
+/**
+ * A day's credits as a share of the CURRENT billing period's plan allowance --
+ * the same `limit` the Billing card divides by, so the two reconcile. Not
+ * clamped: a day can legitimately exceed 100% of the period allowance. A dash
+ * when there is no allowance to divide by (no plan, or a zero/absent limit) or
+ * no figure for the day, rather than a misleading 0%. The percent sign and its
+ * spacing are the locale's (`fmtPercent`), not a hardcoded suffix.
+ */
+function fmtCreditsPct(credits: number | undefined, limit: number | undefined): string {
+  if (credits == null || limit == null || !(limit > 0)) return EM_DASH
+  return fmtPercent(credits / limit, { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+}
+
 export default function UsageTab() {
   const provider = useProvider()
   const { data, error: queryErr } = useQuery(providerUsageQuery(provider))
   const err = queryErr ? (queryErr instanceof Error ? queryErr.message : String(queryErr)) : ''
+  // The spend chart stacks credits, so it shows only once a LOADED config names
+  // a default harness that bills in them (kiro-cli, KAS); on a harness that
+  // bills in tokens or dollars its rows carry no credits, and the chart would
+  // call turns that did run "no spend". Read positively, never as "not claude";
+  // crew members on another harness (member_acp_backend) write to the same
+  // store and count whatever credits they recorded.
+  const cfgQuery = useQuery<AcpBackendConfig>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  const creditsHarness = reportsCredits(cfgQuery.data)
+  // A config read that failed with nothing cached is said where the card would
+  // stand: on a kiro-cli install a silent absence would read as "this harness
+  // has no credits". `failedWithNoData`, not `isError`, so the notice holds
+  // through the retry instead of blinking out; the failed request's report
+  // rides along for the agent hand-off, since the message is a translated
+  // sentence no journal entry matches.
+  const harnessUnread = failedWithNoData(cfgQuery)
 
   if (!provider.capabilities.usageBilling) return (
     <Card>
@@ -82,49 +128,93 @@ export default function UsageTab() {
         </Card>
       )}
 
+      {/* Whole-install spend by channel / agent / model / session start week,
+          from the per-turn shards -- the Daily History credits below, decomposed.
+          It fetches its own series, so it renders beside the usage report
+          regardless of what the provider's report carries. */}
+      {creditsHarness ? (
+        <Card>
+          <CardTitle><ChartArea className="lucide-inline" /> {i18nT('pages.overview.usageTab.spend_over_time')}</CardTitle>
+          <TokenStackedAreaChart />
+        </Card>
+      ) : harnessUnread ? (
+        <Card>
+          <ErrorNotice message={i18nT('pages.overview.usageTab.harness_unread')} report={reportForError(cfgQuery.error)} askAgent testId="usage-series-harness-unread" />
+          <Btn className="mt-3 min-h-11" disabled={cfgQuery.isFetching} onClick={() => void cfgQuery.refetch()}>
+            {i18nT('pages.overview.usageSeriesChart.retry')}
+          </Btn>
+        </Card>
+      ) : null}
+
       <Card>
         <CardTitle><BarChart3 className="lucide-inline" /> {i18nT('pages.overview.usageTab.session_activity_30_days')}</CardTitle>
-        {s.refusedTranscripts > 0 && (
-          <ErrorNotice
-            variant="inline"
-            askAgent
-            className="mb-4"
-            message={i18nT('pages.overview.usageTab.refused_transcripts_warning', { count: s.refusedTranscripts })}
-          />
+        {data.refreshing ? (
+          <div data-testid="usage-session-refreshing" className="skeleton h-32 rounded" />
+        ) : (
+          <>
+            {s.refusedTranscripts > 0 && (
+              <ErrorNotice
+                variant="inline"
+                askAgent
+                className="mb-4"
+                message={i18nT('pages.overview.usageTab.refused_transcripts_warning', { count: s.refusedTranscripts })}
+              />
+            )}
+            <div className="grid grid-cols-3 gap-4 max-[600px]:grid-cols-1 mb-4">
+              <PeriodCard label={i18nT('pages.overview.usageTab.today')} p={s.today} />
+              <PeriodCard label={i18nT('pages.overview.usageTab.this_week')} p={s.thisWeek} />
+              <PeriodCard label={i18nT('pages.overview.usageTab.this_month')} p={s.thisMonth} />
+            </div>
+            <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
+              <Row label={i18nT('pages.overview.usageTab.total_sessions_30d')} value={s.total} />
+              <Row label={i18nT('pages.overview.usageTab.avg_messages_session')} value={s.avgMsgsPerSession} />
+            </div>
+          </>
         )}
-        <div className="grid grid-cols-3 gap-4 max-[600px]:grid-cols-1 mb-4">
-          <PeriodCard label={i18nT('pages.overview.usageTab.today')} p={s.today} />
-          <PeriodCard label={i18nT('pages.overview.usageTab.this_week')} p={s.thisWeek} />
-          <PeriodCard label={i18nT('pages.overview.usageTab.this_month')} p={s.thisMonth} />
-        </div>
-        <div className="grid grid-cols-2 gap-x-6 gap-y-2 max-[600px]:grid-cols-1">
-          <Row label={i18nT('pages.overview.usageTab.total_sessions_30d')} value={s.total} />
-          <Row label={i18nT('pages.overview.usageTab.avg_messages_session')} value={s.avgMsgsPerSession} />
-        </div>
       </Card>
 
       {s.dailyHistory.length > 0 && (
         <Card>
           <CardTitle>{i18nT('pages.overview.usageTab.daily_history')}</CardTitle>
           <div className="max-h-64 overflow-y-auto">
-            <table className="w-full text-sm">
+            <table className="w-full text-sm tabular-nums">
               <thead className="sticky top-0 bg-bg-elevated">
                 <tr className="text-muted text-left">
                   <th className="pb-2 font-medium">{i18nT('pages.overview.usageTab.date')}</th>
                   <th className="pb-2 font-medium text-right">{i18nT('pages.overview.usageTab.sessions')}</th>
                   <th className="pb-2 font-medium text-right">{i18nT('pages.overview.usageTab.messages')}</th>
                   <th className="pb-2 font-medium text-right">{i18nT('pages.overview.usageTab.tool_calls')}</th>
+                  <th className="pb-2 font-medium text-right max-[600px]:hidden">{i18nT('pages.overview.usageTab.credits_used')}</th>
+                  <th className="pb-2 font-medium text-right max-[600px]:hidden" title={i18nT('pages.overview.usageTab.credits_used_pct_title')}>
+                    {i18nT('pages.overview.usageTab.credits_used_pct')}
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {[...s.dailyHistory].reverse().map(d => (
-                  <tr key={d.date} className="border-t border-border">
-                    <td className="py-1.5 font-mono text-[13px]">{d.date}</td>
-                    <td className="py-1.5 text-right">{d.sessions}</td>
-                    <td className="py-1.5 text-right">{d.messages}</td>
-                    <td className="py-1.5 text-right">{d.toolCalls}</td>
-                  </tr>
-                ))}
+                {[...s.dailyHistory].reverse().map(d => {
+                  const credits = fmtCredits(d.credits)
+                  const pct = fmtCreditsPct(d.credits, b?.limit)
+                  return (
+                    <Fragment key={d.date}>
+                      <tr className="border-t border-border">
+                        <td className="py-1.5 font-mono text-[13px]">{d.date}</td>
+                        <td className="py-1.5 text-right">{d.sessions}</td>
+                        <td className="py-1.5 text-right">{d.messages}</td>
+                        <td className="py-1.5 text-right">{d.toolCalls}</td>
+                        <td className="py-1.5 text-right max-[600px]:hidden">{credits}</td>
+                        <td className="py-1.5 text-right max-[600px]:hidden">{pct}</td>
+                      </tr>
+                      {/* Phone: six columns would wrap every cell, and the repo forbids a
+                          sideways-scrolling table, so the two credit figures fold onto a
+                          second line under the day instead of squeezing beside it. */}
+                      <tr className="hidden max-[600px]:table-row text-muted text-[12px]" data-phone-line="">
+                        <td colSpan={4} className="pb-1.5 text-right">
+                          {i18nT('pages.overview.usageTab.credits_used_compact', { credits, pct })}
+                        </td>
+                      </tr>
+                    </Fragment>
+                  )
+                })}
               </tbody>
             </table>
           </div>

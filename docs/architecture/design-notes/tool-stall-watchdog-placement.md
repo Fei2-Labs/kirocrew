@@ -20,8 +20,8 @@ read, and how out-of-band action stays out of the in-band recovery path's way.
 ## The failure that made this concrete
 
 `_dispatch_events` yields a permission event (`action == "permission"` →
-`_build_permission_event`). The consumer, `dashboard/chat_runner.py`, handles it
-in place at the `EVENT_PERMISSION_REQUEST` branch and awaits the user's decision:
+`_build_permission_event`). The consumer, `dashboard/chat_turn/permission_prompt.py`, handles it
+in place in `_on_permission_prompt` and awaits the user's decision:
 
 ```python
 outcome = await asyncio.wait_for(fut, timeout=_approval_window)
@@ -87,10 +87,13 @@ distinguished because they need different remedies:
 
 - **(a) Consumer parked at a `yield`.** Any await in the `async for` body. The
   approval future is the one that bit us, but it is not the only await in that
-  branch: `post_linked_approval` is a network call, `hooks.on_tool_call` runs
-  arbitrary user hook code, and the MCP Apps spool read is thread-offloaded.
-  Each is a candidate for the same freeze, and each new await added to a
-  consumer branch enlarges this class silently.
+  branch: `post_linked_approval` is a network call, and both `hooks.on_tool_call`
+  and the MCP Apps spool read are thread-offloaded: `hooks.on_tool_call` runs its
+  arbitrary user hook code through `executors.run_in_tool_gate_pool` on the
+  dedicated `mc-toolgate` pool, under a bounded `_TOOL_GATE_QUEUE_WAIT_SECS` wait
+  with a fail-closed `hook_gate_busy` refusal. Each remaining loop-resident await
+  is a candidate for the same freeze, and each new await added to a consumer
+  branch enlarges this class silently.
 - **(b) Consumer task gone or never resuming.** `slot.task` cancelled without
   draining, an exception swallowed above the loop, a slot lock held by a turn
   that will not finish.
@@ -179,11 +182,12 @@ The criterion and the constraints in §2 and §3 hold either way; see
 
 The out-of-band carrier already exists and needs no new machinery.
 `SessionWatchdog` (`watchdog.py`) is a stateless dispatcher over a fixed list of
-`CleanupHook`s, ticked from `SessionManager._cleanup_loop` on its own
-`asyncio.wait_for(shutdown_event.wait(), timeout=interval)` sleep, where
-`interval = max(timeout // 6, 60)` (`SessionManager._cleanup_loop`). It depends
-on no session's read loop. Three hooks are registered today: `idle_expiry`,
-`orphan_mcp`, `rss_threshold`.
+`CleanupHook`s, ticked from the cleanup loop that `session_cleanup.SessionCleanup`
+runs on its own `asyncio.wait_for(shutdown_event.wait(), timeout=interval)` sleep,
+where `interval = min(max(timeout // 6, 60), MAX_TICK_INTERVAL_SECS)` and
+`MAX_TICK_INTERVAL_SECS` is 300. It depends on no session's read loop. The
+registered hooks are listed in [session.md](../../system-specs/modules/session.md),
+which owns them.
 
 **Readable at that layer.** `SessionManager._sessions` under `self._lock`, and
 per `_Session`: `semaphore.locked()` (the only in-flight signal at this layer),
@@ -199,14 +203,14 @@ no defined lifetime.
 
 **Not reachable at all, structurally.** Anything in `DashboardState`. The
 watchdog is in the session layer; slots, `slot.running`, `slot._approval_futures`,
-`slot._tool_stall_retries` are in `dashboard/state.py`, and `SessionManager`
+`slot._tool_stall_retries` are in `dashboard/state_parts/slot_ladder.py`, and `SessionManager`
 holds no reference to it. The session layer must not import the dashboard.
 
 **The blind spot that matters — and why it was not a plumbing problem.** From
 outside, a healthy 40-minute turn and a turn parked on an approval for 40 minutes
-look identical: `semaphore.locked()` is True for both, and `last_used` is bumped
-only by `get_or_create()` (the "Known limitation" note in `session.py`'s module
-docstring), so it does not advance during a turn at all.
+look identical: `semaphore.locked()` is True for both, and `last_used` advances
+only on the allocation paths and on `touch()`, not on every LLM round-trip
+(`session_parts/sweeps.py`'s module docstring), so it does not track a turn's progress.
 
 The tempting reading is that the signal has to be *injected* from the layer that
 can see it — a consumer-supplied reader in the shape of
@@ -248,11 +252,11 @@ cannot see the evidence it would need.
 ## 3. Not fighting the in-band recovery path
 
 In-band recovery already exists end to end. `_end_stalled_tool`
-(`session_handle.py`) cancels **this session only** on a bounded 5s budget —
+(`session_handle_watchdog.py`) cancels **this session only** on a bounded 5s budget —
 never the process, because co-tenant sessions share the runtime — and yields one
 terminal `EVENT_COMPLETE` carrying `STOP_REASON_TOOL_STALL` plus the tool title,
 redacted command, and evidence. The consumer's `STOP_REASON_TOOL_STALL` branch
-in `chat_runner.py` then, for `_prompt_depth == 0 and
+in `_turn_stop_recovery` (`chat_turn/stop_recovery.py`) then, for `_prompt_depth == 0 and
 slot._tool_stall_retries < 3`, increments the
 budget and `queue_insert`s a continue-nudge (`SYNTHETIC_RECOVERY_KIND` /
 `RecoveryPayload.CONTINUATION`) naming the stalled tool. It no longer replays the
@@ -334,7 +338,8 @@ into this note would blur what is being decided.
 
 All three questions this note opened are settled, and the hook they describe is
 implemented (`SessionManager._stuck_turn_check`, registered on `SessionWatchdog`
-alongside `idle_expiry` / `orphan_mcp` / `rss_threshold`).
+as the `stuck_turn` hook alongside the other cleanup hooks that
+[session.md](../../system-specs/modules/session.md) lists).
 
 **Where current behavior is authoritative:** `session.md` and `acp-client.md`, not
 this note. A behavior change is contractually required to update the owning module
@@ -368,5 +373,5 @@ diagnostic gap that this was written to close.
 
 Still open, and belonging to the *cause* rather than the detection: every
 transport's per-event outbound send is an unbounded network await inside the turn
-path, and `hooks.on_tool_call` is synchronous on the event loop. Both widen class
+path. It widens class
 (a) — and (c), which as noted above no loop-resident observer can cover.

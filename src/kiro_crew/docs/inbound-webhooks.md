@@ -15,9 +15,7 @@ behind one per-device switch:
 
 **Settings > Developer > Feature Previews** — switch **Webhooks** on. A
 **Webhooks** row appears in the sidebar immediately (and an "Open Webhooks"
-link on the feature's own card). Developer Mode is NOT required: the previews
-section sits on the always-visible Settings tab, not on the Developer page it
-used to be a tab of.
+link on the feature's own card). Developer Mode is NOT required.
 
 Nothing about the API changes either way — tokens, the kill switch, and delivery
 all behave the same whether the page is visible or not. The one consequence is
@@ -43,7 +41,11 @@ mapping is operator-owned:
   authentication but before the request body is read. Other sources and the
   global switch are unaffected.
 
-Management uses the dashboard-authenticated API:
+Management uses the dashboard-authenticated API. Every route below that changes
+something — and each `/api/hooks*` create, update, toggle and test route — is
+owner-only: any other dashboard session gets `403` with `code: "owner_only"`.
+The inbound `POST /api/hooks/agent` is not a management route and keeps its own
+bearer authentication.
 
 ```text
 GET    /api/webhooks
@@ -121,7 +123,7 @@ This unsigned request works only with a bearer-only source (`require_signature: 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `message` | string | — | Required, non-empty after trimming. Max 49,999 characters. |
-| `sessionKey` | string | `hook:default:<unix-ts>` | Must start with `hook:`. The part after the prefix is the **hook id** used to look up registered context. |
+| `sessionKey` | string | `hook:default:<unix-ts>-<random hex>` | Must start with `hook:`. The part after the prefix is the **hook id** used to look up registered context. |
 | `name` | string | `Webhook` | Human label shown in the notification title. |
 | `agent` | string | source destination | Optional compatibility field. For a mapped source it must be omitted or exactly match the operator-owned destination; a conflict is `409 agent_conflict`. Unmapped historical and legacy credentials retain caller/default routing. |
 | `deliver` | boolean or truthy/falsy value | `true` | When false, the turn runs and is logged but nothing is pushed to you. Other values use normal Python truthiness. |
@@ -357,9 +359,6 @@ first is reversible with one click; the second needs a token.
 | Signature timestamp window | ±300 seconds | `401`, request is not run |
 | Failed authentications per source | 10 per 60 seconds | `429` for 300 seconds |
 
-The two timeout bounds are prime numbers on purpose — they keep repeated webhook
-runs from settling into lockstep with cron intervals.
-
 ## Session lifecycle
 
 Webhook sessions are **ephemeral**. The session is created (or an existing one
@@ -370,6 +369,13 @@ This is the same model subagents use, and it is why the `sessionKey` is a routin
 key rather than a handle: two calls with the same `sessionKey` are two unrelated
 turns, not a thread. Anything the second turn needs to know, the first turn has
 to have written down.
+
+Before the first prompt of a new session, the run waits up to 30 seconds for
+every MCP server the agent spec declares to report that it started, failed or
+needs authorization. Nobody can reconnect a slow server by hand in a webhook
+run. A run that still lacks a declared server ends with outcome `degraded`
+instead of `completed`, and its detail names the server. The run list and the
+notification show it, so you can see which run to retry.
 
 When the turn ends, the result is redacted for credentials and exfiltration URLs
 before it leaves the gateway. Delivery, when `deliver` is true, is a dashboard
@@ -392,7 +398,9 @@ message:
 ```
 
 `register_hook` takes `hook_id` and `context_summary` and returns the session key
-(`hook:<hook_id>`) and the webhook URL to hand to the external system.
+(`hook:<hook_id>`; from a crew member's session, `hook:<store_id>:<hook_id>`) and
+the webhook URL to hand to the external system. An Incognito or Temporary session
+is refused: `hook registration is disabled for Incognito and Temporary sessions`.
 Registrations live in `~/.kiro/crew/hooks.json`, written under an exclusive lock
 with an atomic replace, and are keyed by hook id — registering the same id again
 overwrites the previous summary. A registration is not consumed by a call; it
@@ -431,7 +439,7 @@ The agent pushes a branch and opens a pull request, then calls:
 }
 ```
 
-The tool returns:
+The tool returns, among other lines:
 
 ```
 Hook registered: review:pr-123

@@ -1,21 +1,25 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { render, fireEvent, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { NotificationsPanel } from '../pages/settings/NotificationsPanel'
 import { __resetForTests } from '../hooks/useNotificationSound'
 import type { NotificationChannel } from '../types'
 
 /** The channels section reads/writes through React Query, so the panel needs
- *  a client. `retry: false` so the "API fails" case settles in one round. */
+ *  a client. `retry: false` so the "API fails" case settles in one round.
+ *  Rendered on the Sources rail item, which is where the channels list lives. */
 function renderPanel() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}><NotificationsPanel /></QueryClientProvider>)
+  return render(<MemoryRouter initialEntries={['/settings?tab=notifications&sub=sources']}><QueryClientProvider client={qc}><NotificationsPanel /></QueryClientProvider></MemoryRouter>)
 }
 
 const CHANNELS: NotificationChannel[] = [
   { channel: 'system.approval', source: 'system', registered: true, default_priority: 'critical', protected: true, settings: {} },
   { channel: 'system.cron', source: 'system', registered: true, default_priority: 'default', protected: false, settings: {} },
   { channel: 'system.heartbeat', source: 'system', registered: true, default_priority: 'passive', protected: false, settings: { muted: true } },
+  { channel: 'system.member', source: 'system', registered: true, default_priority: 'passive', protected: false, settings: {} },
+  { channel: 'system.apps', source: 'system', registered: true, default_priority: 'default', protected: false, settings: {} },
   { channel: 'oncall-radar.ticket-update', source: 'oncall-radar', registered: true, default_priority: 'default', protected: false, settings: { priority: 'critical' } },
   { channel: 'oncall-radar.sync-status', source: 'oncall-radar', registered: false, default_priority: null, protected: false, settings: { muted: true } },
 ]
@@ -52,6 +56,20 @@ describe('NotificationsPanel channels section', () => {
     // Channel labels drop the source prefix
     expect(screen.getByText('ticket-update')).toBeTruthy()
     expect(screen.queryByText('oncall-radar.ticket-update')).toBeNull()
+  })
+
+  it('names the crewmate-message channel in words, not by its id', async () => {
+    renderPanel()
+    expect(await screen.findByText('Mate messages')).toBeTruthy()
+    expect(screen.queryByText('member')).toBeNull()
+  })
+
+  it('names the app-update channel in words, so muting it reads as what it does', async () => {
+    // The bare id "apps" reads as "every app's notifications"; muting it only
+    // silences the "a newer version is published" notes.
+    renderPanel()
+    expect(await screen.findByText('App updates')).toBeTruthy()
+    expect(screen.queryByText('apps')).toBeNull()
   })
 
   it('renders protected channels locked without controls', async () => {

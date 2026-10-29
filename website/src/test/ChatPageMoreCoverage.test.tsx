@@ -6,16 +6,15 @@
  * Three cold areas, all through a real `render(<ChatPage />)`:
  *
  *  1. The row callbacks ChatPage hands to AssistantMessage: `handleFork` (all
- *     three outcomes plus the cold-config refetch), `handlePlanFromHere`,
- *     `handleQuote`, `handleAsk`, `handleRegenerate` (including the snapshot
+ *     three outcomes plus the cold-config refetch), `handleQuote`, `handleAsk`, `handleRegenerate` (including the snapshot
  *     rollback on a failed request), `handleSpeak` (both voice states) and
  *     `handleApplyPlan`'s failure path. AssistantMessage is stubbed as a prop
  *     recorder so the callbacks can be invoked directly — the card's own
  *     rendering is covered by AssistantMessage.test.tsx.
  *
  *  2. The window-event listeners: `mc-config-changed` (chat-settings reload),
- *     `toggle-pin-chat-sidebar`, `kirocrew-tool-call` (foreground browser
- *     auto-open), and `mc:run-in-terminal` (both the non-string guard and the
+ *     `toggle-pin-chat-sidebar`, `kirocrew-tool-call` (a shell browse must NOT
+ *     auto-open the panel), and `mc:run-in-terminal` (both the non-string guard and the
  *     PTY-never-connects timeout that reports failure back to the code block).
  *
  *  3. The welcome-state "Continue a previous chat?" suggestion list and
@@ -26,7 +25,7 @@
  * (the technique ChatPageCoverage.test.tsx uses). Nothing else about the page is
  * faked: grouping, the render dispatch and the handlers run for real.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, act, waitFor, fireEvent, within, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -34,8 +33,10 @@ import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { RUN_IN_TERMINAL_READY_DEADLINE_MS, RUN_IN_TERMINAL_OPENING_GRACE_MS } from '../utils/fenceShell'
-import { useBottomTerminal, __resetBottomTerminal, removeTab } from '../hooks/useBottomTerminal'
-import { registerTerminalWs, unregisterTerminalWs } from '../utils/terminalRegistry'
+import { useBottomTerminal, __resetBottomTerminal, removeTab, addTab, MAX_TERMINALS } from '../hooks/useBottomTerminal'
+import { unregisterTerminalWs } from '../utils/terminalRegistry'
+import * as terminalRegistry from '../utils/terminalRegistry'
+import { i18nT } from '../i18n/t'
 
 // The run-in-terminal rollback consults the popout probe to avoid tearing a
 // session out of a popped-out panel; the flag lets each test pick the state.
@@ -43,6 +44,10 @@ let mockTerminalPopoutOpen = false
 vi.mock('../utils/terminalPopout', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../utils/terminalPopout')>()),
   isPopoutOpen: () => mockTerminalPopoutOpen,
+}))
+const copyToClipboardMock = vi.hoisted(() => vi.fn<(text: string) => Promise<boolean>>())
+vi.mock('../utils/clipboard', () => ({
+  copyToClipboard: (text: string) => copyToClipboardMock(text),
 }))
 const disposeTerminalSessionSpy = vi.hoisted(() => vi.fn())
 vi.mock('../components/CliPanel', async (importOriginal) => {
@@ -57,7 +62,7 @@ vi.mock('../components/CliPanel', async (importOriginal) => {
 })
 import { ThemeProvider } from '../hooks/useTheme'
 import { store as appStore } from '../store'
-import { setVoicePlaying, switchSlot } from '../store/chatSlice'
+import { appendMessage, setVoicePlaying, switchSlot } from '../store/chatSlice'
 import { sseDisconnected } from '../store/dashboardSlice'
 import type { RootState } from '../store'
 import type { ChatMessage } from '../types'
@@ -67,14 +72,16 @@ import type { ChatMessage } from '../types'
 interface AssistantProps {
   content: string
   timestamp?: string
-  onFork?: (visibleIndex: number) => void | Promise<void>
-  onPlanFromHere?: (visibleIndex: number) => void | Promise<void>
+  onFork?: (visibleIndex: number, messageId?: string, direction?: 'head') => void | Promise<void>
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
   onSpeak?: (content: string) => void
   onRegenerate?: () => void
   onApplyPlan?: (steps: never[]) => Promise<boolean>
   forkIndex?: number
+  forkDirectionChoice?: boolean
+  forkHasLaterMessages?: (forkIndex: number) => boolean
+  shareEnabled?: boolean
 }
 let assistantProps: AssistantProps | null = null
 
@@ -104,9 +111,14 @@ vi.mock('../pages/chat', async () => {
 vi.mock('../components/ChatInput', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/ChatInput')>()
   const React = await import('react')
+  // The page hands the text over through the Composer root's draft store, not
+  // a `value` prop; the stand-in reads it the way the real ChatInput does.
+  const { useComposerDraftText } = await import('../chat-core/composer/Composer')
   return {
     ...actual,
-    default: (props: InputProps) => {
+    default: function ChatInputStub(rawProps: InputProps) {
+      const draft = useComposerDraftText()
+      const props = draft === null ? rawProps : { ...rawProps, value: draft }
       inputProps = props
       return React.createElement('textarea', {
         'aria-label': 'Message input',
@@ -156,16 +168,21 @@ vi.mock('../components/AgentDropdownList', () => ({ default: () => null, Default
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
 vi.mock('../components/SegmentedControl', () => ({ default: () => null }))
-interface WelcomeProps {
-  onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void | Promise<void>
-}
-let welcomeProps: WelcomeProps | null = null
 vi.mock('../components/WelcomeView', async () => {
   const React = await import('react')
+  return { default: () => React.createElement('div', { 'data-testid': 'welcome' }) }
+})
+// The welcome-state memory chip sits above the composer, rendered by ChatPage itself.
+interface MemoryChipProps {
+  onSwitchMode?: (mode: 'persistent' | 'incognito' | 'temporary') => void | Promise<void>
+}
+let memoryChipProps: MemoryChipProps | null = null
+vi.mock('../components/MemoryModeChip', async () => {
+  const React = await import('react')
   return {
-    default: (props: WelcomeProps) => {
-      welcomeProps = props
-      return React.createElement('div', { 'data-testid': 'welcome' })
+    MemoryModeChip: (props: MemoryChipProps) => {
+      memoryChipProps = props
+      return React.createElement('div', { 'data-testid': 'memory-mode-chip' })
     },
   }
 })
@@ -213,6 +230,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(() => false),
+      retainRange: vi.fn(),
       farmIsMeasured: () => true,
       farmRecord: vi.fn(() => true),
       measureRef: () => () => {},
@@ -246,7 +264,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -256,17 +275,26 @@ vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
 }))
 
-Object.defineProperty(window, 'matchMedia', {
-  writable: true,
-  value: vi.fn().mockImplementation((q: string) => ({
+// A direct assignment outlives this file: a sibling in the same shard would inherit a
+// matchMedia that never matches and a fetch that resolves empty. stubGlobal reverses.
+vi.stubGlobal(
+  'matchMedia',
+  vi.fn().mockImplementation((q: string) => ({
     matches: false, media: q, onchange: null,
     addListener: vi.fn(), removeListener: vi.fn(),
     addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn(),
   })),
+)
+vi.stubGlobal(
+  'fetch',
+  vi.fn().mockResolvedValue({
+    ok: true, status: 200, text: () => Promise.resolve(''), json: () => Promise.resolve({}),
+  }),
+)
+
+afterAll(() => {
+  vi.unstubAllGlobals()
 })
-globalThis.fetch = vi.fn().mockResolvedValue({
-  ok: true, status: 200, text: () => Promise.resolve(''), json: () => Promise.resolve({}),
-}) as never
 
 import ChatPage from '../pages/ChatPage'
 import { readSideChatDraft } from '../chat-core/composer/sideChatDrafts'
@@ -366,11 +394,13 @@ beforeEach(() => {
   inputProps = null
   projectPickerProps = null
   gridProps = null
-  welcomeProps = null
+  memoryChipProps = null
   chatSettings = { contentWidth: 'compact' }
   localStorage.clear()
   sessionStorage.clear()
   for (const k of Object.keys(apiMocks)) delete apiMocks[k]
+  copyToClipboardMock.mockReset()
+  copyToClipboardMock.mockResolvedValue(true)
   disposeTerminalSessionSpy.mockClear()
   alertSpy = makeAlertSpy()
   vi.useFakeTimers({ shouldAdvanceTime: true })
@@ -382,8 +412,8 @@ afterEach(() => {
   alertSpy.mockRestore()
 })
 
-describe('Welcome recreation preserves remote execution', () => {
-  it('carries instanceId through a memory mode change', async () => {
+describe('Welcome recreation of a crew archive', () => {
+  it('recreates a plain local session that names no crew', async () => {
     apiSpy('dashboardConfig').mockResolvedValue({ default_memory_mode: 'persistent' })
     apiSpy('createChatSlot').mockResolvedValue({
       ...REMOTE_SLOT,
@@ -392,14 +422,14 @@ describe('Welcome recreation preserves remote execution', () => {
     })
     apiSpy('deleteChatSlot').mockResolvedValue({ ok: true })
     renderChatPage([], { slots: [REMOTE_SLOT] })
-    await waitFor(() => expect(welcomeProps).not.toBeNull())
+    await waitFor(() => expect(memoryChipProps).not.toBeNull())
 
     await act(async () => {
-      await welcomeProps!.onSwitchMode?.('persistent')
+      await memoryChipProps!.onSwitchMode?.('persistent')
     })
 
     await waitFor(() => expect(apiMocks.createChatSlot).toHaveBeenCalled())
-    expect(apiMocks.createChatSlot.mock.calls.at(-1)?.[8]).toBe('crew-remote-1')
+    expect(apiMocks.createChatSlot.mock.calls.at(-1)).not.toContain('crew-remote-1')
     expect(apiMocks.deleteChatSlot).toHaveBeenCalledWith('chat-1')
   })
 })
@@ -428,57 +458,125 @@ describe('ChatPage row callbacks — fork', () => {
     expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 3, undefined, undefined, 'tail')
   })
 
-  it('reports a refused fork through the in-page ErrorNotice instead of switching sessions', async () => {
+  it('reports a refused fork through the error notice instead of switching sessions', async () => {
     apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'slot is busy' })
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    // The surface is the shared ErrorNotice (role="alert" + agent hand-off),
-    // never a native alert(): the rule `errors-use-error-notice` forbids the
-    // browser dialog, which also carried no structured context to the agent.
-    const notice = await screen.findByTestId('action-error')
+    const notice = await waitFor(() => screen.getByTestId('action-error'))
+    // The id rides `ErrorNotice`'s own `testId`, so the element found by it is the
+    // one carrying `role="alert"`. A wrapper div would split those apart.
     expect(notice).toHaveAttribute('role', 'alert')
     expect(notice.textContent).toContain('slot is busy')
+    // A fork failure rides the surface that already existed rather than a second
+    // one of its own, so there is no `fork-error` slot to find.
+    expect(screen.queryByTestId('fork-error')).toBeNull()
     expect(alertSpy).not.toHaveBeenCalled()
   })
 
-  it('still reports when the fork request throws, naming the real reason', async () => {
+  it('still surfaces a thrown fork request, naming the real reason', async () => {
     apiSpy('forkChatSlot').mockRejectedValue(new Error('network down'))
     await renderTurn()
     await act(async () => { await assistantProps!.onFork!(1) })
-    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    const notice = await waitFor(() => screen.getByTestId('action-error'))
+    const said = notice.textContent ?? ''
     expect(said).toContain('Fork failed')
-    // Flipped, as this assertion's previous form asked to be: it pinned the
-    // reason being LOST — `unwrap()` rejects with a redux-toolkit
-    // SerializedError (a PLAIN OBJECT), so the handler's `e instanceof Error`
-    // test was false and the `String(e)` fallback rendered '[object Object]'.
-    // The handler now reads the message through `utils/thunkError.errMessage`,
-    // which knows that shape, so the notice carries the real text.
+    // `unwrap()` rejects with a SerializedError (a PLAIN OBJECT), so an `e instanceof
+    // Error` test reads false and a `String(e)` fallback renders '[object Object]'.
     expect(said).toContain('network down')
     expect(said).not.toContain('[object Object]')
     expect(alertSpy).not.toHaveBeenCalled()
   })
+
+  it.each([
+    ['head', 'Fork with earlier messages', 'an earlier message'],
+    [undefined, 'Fork with later messages only', 'a later message'],
+  ] as const)('names the %s entry the menu shows when a too-large fork is refused with Tail-only Fork on', async (direction, label, where) => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: true })
+    apiSpy('forkChatSlot').mockRejectedValue(new ApiError(400, 'Bad Request', JSON.stringify({ error: 'too large', code: 'fork_corpus_too_large' })))
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.forkDirectionChoice).toBe(true))
+    await act(async () => { await (direction ? assistantProps!.onFork!(1, 'row-1', direction) : assistantProps!.onFork!(1, 'row-1')) })
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain(`choose “${label}”`)
+    expect(said).toContain(where)
+  })
+
+  it('keeps naming the lone fork entry when a too-large fork is refused with Tail-only Fork off', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: false, social_share_enabled: true })
+    apiSpy('forkChatSlot').mockRejectedValue(new ApiError(400, 'Bad Request', JSON.stringify({ error: 'too large', code: 'fork_corpus_too_large' })))
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.shareEnabled).toBe(true))
+    await act(async () => { await assistantProps!.onFork!(1, 'row-1') })
+    const said = (await screen.findByTestId('action-error')).textContent ?? ''
+    expect(said).toContain('choose “Fork conversation from here”')
+  })
+
+  it.each([false, true] as const)('forks with history when the menu entry names head whatever Tail-only Fork says (setting %s)', async (setting) => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: setting })
+    apiSpy('forkChatSlot').mockResolvedValue({ ok: true, key: 'chat-2', title: 'fork' })
+    await renderTurn()
+    await act(async () => { await assistantProps!.onFork!(1, 'row-1', 'head') })
+    expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 1, undefined, undefined, 'head', 'row-1')
+  })
+
+  it.each([[false, 'head'], [true, 'tail']] as const)('still lets the setting pick the direction for the plain entry (setting %s)', async (setting, direction) => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: setting })
+    apiSpy('forkChatSlot').mockResolvedValue({ ok: true, key: 'chat-2', title: 'fork' })
+    await renderTurn()
+    await act(async () => { await assistantProps!.onFork!(2, 'row-9') })
+    expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 2, undefined, undefined, direction, 'row-9')
+  })
+
+  it('offers the fork-direction choice while Tail-only Fork is on', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: true })
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.forkDirectionChoice).toBe(true))
+  })
+
+  it('withholds the fork-direction choice while Tail-only Fork is off, because the server would answer a tail request with a history fork', async () => {
+    // `shareEnabled` and `forkDirectionChoice` are both read from the one ['dashboardConfig']
+    // query, so `shareEnabled` going true proves the payload landed with the setting off.
+    apiSpy('dashboardConfig').mockResolvedValue({ tail_fork_enabled: false, social_share_enabled: true })
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.shareEnabled).toBe(true))
+    expect(assistantProps!.forkDirectionChoice).toBe(false)
+  })
+
+  it('withholds the fork-direction choice while the config does not name the setting', async () => {
+    apiSpy('dashboardConfig').mockResolvedValue({ social_share_enabled: true })
+    await renderTurn()
+    await waitFor(() => expect(assistantProps!.shareEnabled).toBe(true))
+    expect(assistantProps!.forkDirectionChoice).toBe(false)
+  })
+
+  it('tells the newest reply that no message follows it', async () => {
+    await renderTurn()
+    expect(assistantProps!.forkIndex).toBe(1)
+    expect(assistantProps!.forkHasLaterMessages!(1)).toBe(false)
+  })
+
+  it('keeps one check for an older reply that sees a message appended after it', async () => {
+    const { store } = await renderTurn()
+    const check = assistantProps!.forkHasLaterMessages!
+    expect(check(1)).toBe(false)
+    act(() => { store.dispatch(appendMessage(msg('user', 'which ones?', { ts: '2026-08-12T07:00:09Z' }))) })
+    expect(check(1)).toBe(true)
+    expect(assistantProps!.forkHasLaterMessages).toBe(check)
+  })
+
+  it('tells a reply with a later message that one follows it', async () => {
+    renderChatPage([
+      msg('user', 'what changed?', { ts: '2026-08-12T07:00:00Z' }),
+      msg('assistant', 'two files changed', { ts: '2026-08-12T07:00:05Z' }),
+      msg('user', 'which ones?', { ts: '2026-08-12T07:00:09Z' }),
+    ])
+    await waitFor(() => expect(assistantProps).not.toBeNull())
+    expect(assistantProps!.forkIndex).toBe(1)
+    expect(assistantProps!.forkHasLaterMessages!(1)).toBe(true)
+  })
 })
 
-describe('ChatPage row callbacks — plan from here', () => {
-  it('forks into an orchestrator session without a direction', async () => {
-    apiSpy('forkChatSlot').mockResolvedValue({ ok: true, key: 'chat-2' })
-    await renderTurn()
-    await act(async () => { await assistantProps!.onPlanFromHere!(2) })
-    await waitFor(() => expect(apiMocks.forkChatSlot).toHaveBeenCalled())
-    expect(apiMocks.forkChatSlot).toHaveBeenCalledWith('chat-1', 2, undefined, 'orchestrator', undefined)
-    expect(alertSpy).not.toHaveBeenCalled()
-  })
-
-  it('reports a refused plan-from-here with its own message, not the fork one', async () => {
-    apiSpy('forkChatSlot').mockResolvedValue({ ok: false, error: 'no orchestrator agent' })
-    await renderTurn()
-    await act(async () => { await assistantProps!.onPlanFromHere!(2) })
-    const said = (await screen.findByTestId('action-error')).textContent ?? ''
-    expect(said).toContain('no orchestrator agent')
-    expect(said).not.toContain('Fork failed')
-    expect(alertSpy).not.toHaveBeenCalled()
-  })
-
+describe('ChatPage row callbacks — apply plan', () => {
   it('surfaces a failed plan apply and resolves false', async () => {
     apiSpy('planFromChat').mockResolvedValue({ ok: false })
     await renderTurn()
@@ -648,7 +746,7 @@ describe('ChatPage row callbacks — regenerate and speak', () => {
     apiSpy('voiceSynthesize').mockResolvedValue({})
     await renderTurn()
     act(() => { assistantProps!.onSpeak!('two files changed') })
-    await waitFor(() => expect(apiMocks.voiceSynthesize).toHaveBeenCalledWith('chat-1', 'two files changed'))
+    await waitFor(() => expect(apiMocks.voiceSynthesize).toHaveBeenCalledWith('chat-1', 'two files changed', { clientFallback: true }))
   })
 
   it('stops playback instead of synthesizing again while a clip is playing', async () => {
@@ -691,7 +789,13 @@ describe('ChatPage window-event listeners', () => {
     await waitFor(() => expect(localStorage.getItem('mc-sidebar-pinned')).not.toBe(first))
   })
 
-  it('opens the Browser panel when the foreground session starts a playwright-cli command', async () => {
+  it('leaves the activity panel alone when the agent runs a playwright-cli shell command', async () => {
+    // A shell `playwright-cli` call drives an agent-owned headless Chromium that
+    // the Browser panel has no way to frame: the native view is reached only by
+    // `browser` MCP ops (surfaced by `browser:agent-opened`), and the gateway's
+    // framed `show` server lives in its own session namespace. Opening the
+    // panel here could only land on the "not running" card, so it must not.
+    delete (window as unknown as { browserAPI?: unknown }).browserAPI
     const { store } = await renderTurn()
     expect(store.getState().chat.activityOpen).toBe(false)
 
@@ -705,7 +809,34 @@ describe('ChatPage window-event listeners', () => {
       }))
     })
 
-    await waitFor(() => expect(store.getState().chat.activityOpen).toBe(true))
+    await act(async () => { await new Promise((r) => setTimeout(r, 20)) })
+    expect(store.getState().chat.activityOpen).toBe(false)
+  })
+
+  it('leaves the activity panel alone on a playwright-cli shell command even when the native bridge is present', async () => {
+    // Bridge presence is not evidence the shell browse landed in the native
+    // view — it never does. The desktop path opens the panel from the main
+    // process's `browser:agent-opened` signal, not from the tool-call preview.
+    ;(window as unknown as { browserAPI?: unknown }).browserAPI = {
+      trackSession: vi.fn(async () => ({ ok: true })),
+      onAgentOpened: vi.fn(() => () => {}),
+    }
+    try {
+      const { store } = await renderTurn()
+      act(() => {
+        window.dispatchEvent(new CustomEvent('kirocrew-tool-call', {
+          detail: {
+            slot: 'chat-1',
+            is_shell: true,
+            input_preview: 'playwright-cli snapshot',
+          },
+        }))
+      })
+      await act(async () => { await new Promise((r) => setTimeout(r, 20)) })
+      expect(store.getState().chat.activityOpen).toBe(false)
+    } finally {
+      delete (window as unknown as { browserAPI?: unknown }).browserAPI
+    }
   })
 
   it('ignores a run-in-terminal request that carries no command', async () => {
@@ -752,6 +883,37 @@ describe('ChatPage window-event listeners', () => {
 })
 
 describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
+  /** Drive the real registry through upgrade/error/reconnect without a PTY. */
+  const terminalSockets = () => {
+    const sockets: Socket[] = []
+    class Socket {
+      static OPEN = 1
+      static CONNECTING = 0
+      static CLOSING = 2
+      static CLOSED = 3
+      readyState = Socket.CONNECTING
+      onopen: (() => void) | null = null
+      onmessage: ((event: { data: string }) => void) | null = null
+      onclose: ((event: { code: number }) => void) | null = null
+      send = vi.fn()
+      constructor() { sockets.push(this) }
+      open() { this.readyState = Socket.OPEN; this.onopen?.() }
+      message(payload: unknown) { this.onmessage?.({ data: JSON.stringify(payload) }) }
+      close() { this.readyState = Socket.CLOSED; this.onclose?.({ code: 1006 }) }
+    }
+    vi.stubGlobal('WebSocket', Socket)
+    const connect = (sessionId: string) => {
+      const term = { reset: vi.fn(), onData: vi.fn(), onResize: vi.fn() }
+      terminalRegistry.ensureTerminalConnection(
+        sessionId,
+        term as unknown as Parameters<typeof terminalRegistry.ensureTerminalConnection>[1],
+        { fit: vi.fn() } as unknown as Parameters<typeof terminalRegistry.ensureTerminalConnection>[2],
+      )
+      sockets.at(-1)!.open()
+    }
+    return { sockets, connect }
+  }
+
   const collect = () => {
     const results: { reqId?: string; ok?: boolean }[] = []
     const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
@@ -760,6 +922,127 @@ describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
   }
 
   beforeEach(() => { __resetBottomTerminal(); mockTerminalPopoutOpen = false })
+
+  it('keeps a generic startup failure visible past the button hint and deadline without replay on reconnect', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { sockets, connect } = terminalSockets()
+    const { results, stop } = collect()
+    const jitter = vi.spyOn(Math, 'random').mockReturnValue(0)
+    let sessionId = ''
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'generic-startup' },
+        }))
+      })
+      sessionId = dock.result.current.tabs[0].id
+      act(() => {
+        connect(sessionId)
+        sockets[0].message({ type: 'error', message: 'Shell startup failed' })
+      })
+      expect(results).toEqual([{ reqId: 'generic-startup', ok: false }])
+      await act(async () => {})
+      const notice = screen.getByTestId('action-error')
+      expect(notice).toHaveAttribute('role', 'alert')
+      expect(notice).toHaveTextContent(i18nT('pages.chatPage.run_in_terminal_liveness_probe_failed_error'))
+      expect(within(notice).getAllByRole('button', { name: /ask the agent/i })).toHaveLength(1)
+
+      // Each upgrade resets the registry retry count. Repeated generic errors
+      // need not exhaust it, so the page's persistent notice must carry them.
+      act(() => sockets[0].close())
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+      expect(sockets).toHaveLength(2)
+      act(() => {
+        sockets[1].open()
+        sockets[1].message({ type: 'error', message: 'Shell startup failed again' })
+        sockets[1].close()
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_001) })
+      expect(sockets).toHaveLength(3)
+      expect(screen.getByTestId('action-error')).toBe(notice)
+      act(() => {
+        sockets[2].open()
+        sockets[2].message({ type: 'ready', shell: '/bin/bash' })
+      })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + RUN_IN_TERMINAL_OPENING_GRACE_MS)
+      })
+      expect(screen.getByTestId('action-error')).toBe(notice)
+      expect(results).toEqual([{ reqId: 'generic-startup', ok: false }])
+      for (const socket of sockets) expect(socket.send).not.toHaveBeenCalled()
+      expect(dock.result.current.tabs).toEqual([expect.objectContaining({ id: sessionId })])
+      expect(fetchSpy).not.toHaveBeenCalledWith('/api/terminal/sessions')
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).not.toHaveBeenCalled()
+      fireEvent.click(within(notice).getByRole('button', { name: 'Dismiss' }))
+      expect(screen.queryByTestId('action-error')).not.toBeInTheDocument()
+    } finally {
+      stop()
+      if (sessionId) terminalRegistry.disposeTerminalConnection(sessionId)
+      jitter.mockRestore()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it.each([
+    ['close', false], ['popout', false], ['close', true], ['popout', true],
+  ] as const)('suppresses a startup notice on %s (error before release: %s)', async (ownership, errorFirst) => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { sockets, connect } = terminalSockets()
+    const { results, stop } = collect()
+    let sessionId = ''
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'ownership-lost' },
+        }))
+      })
+      sessionId = dock.result.current.tabs[0].id
+      act(() => {
+        connect(sessionId)
+        if (errorFirst) sockets[0].message({ type: 'error', message: 'Shell startup failed' })
+        if (ownership === 'popout') mockTerminalPopoutOpen = true
+        // Match the real close caller: dispose notifies failure while its tab
+        // is still present, then removeTab commits the ownership change.
+        terminalRegistry.disposeTerminalConnection(sessionId)
+        expect(dock.result.current.tabs).toHaveLength(1)
+        if (ownership === 'close') removeTab(sessionId)
+      })
+      expect(results).toEqual([{ reqId: 'ownership-lost', ok: false }])
+      await act(async () => {})
+      expect(screen.queryByTestId('action-error')).not.toBeInTheDocument()
+      const send = vi.fn()
+      act(() => terminalRegistry.registerTerminalWs(
+        sessionId, { readyState: WebSocket.OPEN, send } as unknown as WebSocket,
+      ))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + RUN_IN_TERMINAL_OPENING_GRACE_MS)
+      })
+      expect(screen.queryByTestId('action-error')).not.toBeInTheDocument()
+      expect(results).toEqual([{ reqId: 'ownership-lost', ok: false }])
+      expect(send).not.toHaveBeenCalled()
+      expect(fetchSpy).not.toHaveBeenCalledWith('/api/terminal/sessions')
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(dock.result.current.tabs).toHaveLength(ownership === 'close' ? 0 : 1)
+    } finally {
+      stop()
+      if (sessionId) {
+        terminalRegistry.disposeTerminalConnection(sessionId)
+        terminalRegistry.unregisterTerminalWs(sessionId)
+      }
+      vi.unstubAllGlobals()
+    }
+  })
 
   it('leaves a tab the user already closed alone — no second PTY delete, no store write', async () => {
     await renderTurn()
@@ -825,6 +1108,111 @@ describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
       expect(dock.result.current.tabs.length).toBe(1)
     } finally {
       stop()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('settles a released local terminal handoff without a later probe, delete or replay', async () => {
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    let sessionId = ''
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'disposed-local' },
+        }))
+      })
+      expect(dock.result.current.tabs).toHaveLength(1)
+      sessionId = dock.result.current.tabs[0].id
+      expect(results).toEqual([])
+
+      // Local ownership can end before CliPanel creates its connection.
+      act(() => { terminalRegistry.disposeTerminalConnection(sessionId) })
+      expect(results).toEqual([{ reqId: 'disposed-local', ok: false }])
+      const send = vi.fn()
+      const ws = { readyState: WebSocket.OPEN, send } as unknown as WebSocket
+      act(() => { terminalRegistry.registerTerminalWs(sessionId, ws) })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + RUN_IN_TERMINAL_OPENING_GRACE_MS + 1_000)
+      })
+      expect(results).toEqual([{ reqId: 'disposed-local', ok: false }])
+      expect(send).not.toHaveBeenCalled()
+      expect(fetchSpy).not.toHaveBeenCalledWith('/api/terminal/sessions')
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('action-error')).not.toBeInTheDocument()
+      // Releasing a local socket must leave a popout's shared tab intact.
+      expect(dock.result.current.tabs).toEqual([expect.objectContaining({ id: sessionId })])
+    } finally {
+      stop()
+      if (sessionId) {
+        terminalRegistry.disposeTerminalConnection(sessionId)
+        terminalRegistry.unregisterTerminalWs(sessionId)
+      }
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it.each(['already known', 'reported later'] as const)('settles a directory refusal %s without losing its diagnostic tab', async timing => {
+    const project = '/missing/code-block-workspace'
+    const slot = { ...SLOT, project }
+    await renderTurn({ slots: [slot] })
+    const dock = renderHook(() => useBottomTerminal())
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(null, { status: 204 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const { results, stop } = collect()
+    const onTerminalReady = terminalRegistry.onTerminalReady
+    let refuse: (() => void) | undefined
+    const readySpy = vi.spyOn(terminalRegistry, 'onTerminalReady').mockImplementation((id, onReady, onFailure) => {
+      const unsubscribe = onTerminalReady(id, onReady, onFailure)
+      // Model the registry's refusal contract: consume the ready listener before
+      // reporting failure, including a known failure before subscription returns.
+      refuse = () => { unsubscribe(); onFailure?.() }
+      if (timing === 'already known') refuse()
+      return unsubscribe
+    })
+    let sessionId = ''
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'npm test', reqId: 'invalid-cwd' },
+        }))
+      })
+      expect(dock.result.current.tabs).toHaveLength(1)
+      sessionId = dock.result.current.tabs[0].id
+      if (timing === 'reported later') {
+        expect(results).toEqual([])
+        act(() => refuse?.())
+      }
+      // Failure is acknowledged before the readiness deadline, not at it.
+      expect(results).toEqual([{ reqId: 'invalid-cwd', ok: false }])
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(RUN_IN_TERMINAL_READY_DEADLINE_MS + RUN_IN_TERMINAL_OPENING_GRACE_MS + 1_000)
+      })
+      expect(dock.result.current.tabs).toEqual([expect.objectContaining({ id: sessionId, cwd: project })])
+      expect(fetchSpy).not.toHaveBeenCalledWith('/api/terminal/sessions')
+      expect(fetchSpy).not.toHaveBeenCalledWith(
+        `/api/terminal/sessions/${sessionId}`, expect.objectContaining({ method: 'DELETE' }),
+      )
+      expect(disposeTerminalSessionSpy).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('action-error')).not.toBeInTheDocument()
+
+      // A later successful reconnect cannot replay the refused command.
+      const send = vi.fn()
+      const ws = { readyState: WebSocket.OPEN, send } as unknown as WebSocket
+      act(() => { terminalRegistry.registerTerminalWs(sessionId, ws) })
+      expect(send).not.toHaveBeenCalled()
+      expect(results).toEqual([{ reqId: 'invalid-cwd', ok: false }])
+    } finally {
+      stop()
+      readySpy.mockRestore()
+      if (sessionId) terminalRegistry.unregisterTerminalWs(sessionId)
       vi.unstubAllGlobals()
     }
   })
@@ -1091,7 +1479,7 @@ describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
       // The PTY reports ready: registering the socket drains the ready
       // listener synchronously and the command goes out on it.
       const ws = { readyState: WebSocket.OPEN, send: (d: Uint8Array) => { sent.push(d) } } as unknown as WebSocket
-      act(() => { registerTerminalWs(sessionId, ws) })
+      act(() => { terminalRegistry.registerTerminalWs(sessionId, ws) })
 
       await waitFor(() => expect(results.length).toBe(1))
       expect(results[0]).toMatchObject({ reqId: 'rb2', ok: true })
@@ -1105,8 +1493,211 @@ describe('ChatPage run-in-terminal dispatch rollback (#10822)', () => {
       )
     } finally {
       stop()
-      if (sessionId) unregisterTerminalWs(sessionId)
+      if (sessionId) terminalRegistry.unregisterTerminalWs(sessionId)
       vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('ChatPage run-in-terminal reuse-current (#11641)', () => {
+  const collect = () => {
+    const results: { reqId?: string; ok?: boolean }[] = []
+    const onResult = (e: Event) => { results.push((e as CustomEvent).detail) }
+    window.addEventListener('mc:run-in-terminal-result', onResult)
+    return { results, stop: () => window.removeEventListener('mc:run-in-terminal-result', onResult) }
+  }
+
+  beforeEach(() => { __resetBottomTerminal(); mockTerminalPopoutOpen = false })
+
+  it('focuses the existing terminal and copies the command instead of injecting bytes', async () => {
+    // Setting ON: the handler reads it off the kirocrewConfig query at event
+    // time. A stale fetch mock would read as off, so seed BEFORE render.
+    apiMocks.kirocrewConfig = vi.fn().mockResolvedValue({
+      dashboard: { terminal: { reuse_current: true } },
+    })
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+
+    // A terminal the user already has open. The security contract is that a
+    // possibly partially typed command is NEVER concatenated with a snippet;
+    // the command is copied for the user to paste after they inspect the shell.
+    let existingId = ''
+    act(() => { existingId = addTab() ?? '' })
+    await waitFor(() => expect(dock.result.current.tabs.length).toBe(1))
+    expect(existingId).toBeTruthy()
+
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'aws s3 ls', reqId: 're-reuse' },
+        }))
+      })
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 're-reuse', ok: true, copied: true })
+      expect(copyToClipboardMock).toHaveBeenCalledWith('aws s3 ls')
+      // The selected tab is focused but untouched: no raw PTY bytes and no
+      // second terminal tab are created.
+      expect(dock.result.current.tabs).toHaveLength(1)
+      expect(dock.result.current.tabs[0].id).toBe(existingId)
+      expect(dock.result.current.activeId).toBe(existingId)
+    } finally {
+      stop()
+    }
+  })
+
+  it('reports failure when copying for the selected terminal is refused', async () => {
+    apiMocks.kirocrewConfig = vi.fn().mockResolvedValue({
+      dashboard: { terminal: { reuse_current: true } },
+    })
+    copyToClipboardMock.mockResolvedValueOnce(false)
+    await renderTurn()
+    act(() => { addTab() })
+
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'aws s3 ls', reqId: 're-copy-failed' },
+        }))
+      })
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 're-copy-failed', ok: false, copied: false })
+      const notice = await screen.findByTestId('action-error')
+      expect(notice).toHaveAttribute('role', 'alert')
+      expect(notice.textContent).toContain("The command couldn't be copied")
+    } finally {
+      stop()
+    }
+  })
+
+  it('surfaces a read-failure notice and still opens a fresh terminal when the config fetch fails (F1)', async () => {
+    // A failed kirocrewConfig read means the saved reuse setting is unknown, so
+    // a saved reuse-on would be silently ignored. errors-use-error-notice: the
+    // query's failure must reach a user-facing notice rather than collapsing
+    // into the off branch with nothing on screen. The command is NOT dropped —
+    // a fresh tab is still minted and runs it — but the read failure is stated.
+    apiMocks.kirocrewConfig = vi.fn().mockRejectedValue(new Error('settings unavailable'))
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+
+    const { stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'aws s3 ls', reqId: 're-cfg-failed' },
+        }))
+      })
+      // The command still runs: a fresh tab is minted.
+      await waitFor(() => expect(dock.result.current.tabs.length).toBe(1))
+      // The config-read failure IS surfaced (errors-use-error-notice): a saved
+      // reuse-on cannot be honoured when the read failed, and that is stated.
+      const notice = await screen.findByTestId('action-error')
+      expect(notice).toHaveAttribute('role', 'alert')
+      expect(notice.textContent).toContain("terminal settings couldn't be read")
+    } finally {
+      stop()
+      const id = dock.result.current.tabs[0]?.id
+      if (id) unregisterTerminalWs(id)
+    }
+  })
+
+  it('surfaces an ErrorNotice when the terminal cap blocks the fresh-tab fallback (F3)', async () => {
+    // Reuse on, no reusable tab, and the cap is already full: no fresh tab can
+    // be minted, so the command is neither copied nor run. Say so through
+    // ErrorNotice rather than only the button glyph (errors-use-error-notice).
+    apiMocks.kirocrewConfig = vi.fn().mockResolvedValue({
+      dashboard: { terminal: { reuse_current: false } },
+    })
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    // Fill to the cap so addDockTerminal returns null.
+    act(() => { for (let i = 0; i < MAX_TERMINALS; i++) addTab() })
+    await waitFor(() => expect(dock.result.current.tabs.length).toBe(MAX_TERMINALS))
+
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'aws s3 ls', reqId: 're-cap' },
+        }))
+      })
+      const notice = await screen.findByTestId('action-error')
+      expect(notice).toHaveAttribute('role', 'alert')
+      expect(notice.textContent).toContain('too many are already open')
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 're-cap', ok: false })
+      // No tab beyond the cap was minted.
+      expect(dock.result.current.tabs.length).toBe(MAX_TERMINALS)
+    } finally {
+      stop()
+      for (const t of dock.result.current.tabs) unregisterTerminalWs(t.id)
+    }
+  })
+
+  it('copies (never runs) when reuse is on but no terminal is open — the dialog promised a copy', async () => {
+    // Opus BLOCKING (#11641): the reuse-current confirm dialog promises a COPY
+    // for manual paste. When no reusable tab exists, the handler must still copy
+    // — NOT fall through to minting a fresh tab and executing the command, which
+    // would run something the dialog said would only be copied. With no tab to
+    // focus, the raw command is copied verbatim (no shell to fence-transform for)
+    // and no tab is minted.
+    apiMocks.kirocrewConfig = vi.fn().mockResolvedValue({
+      dashboard: { terminal: { reuse_current: true } },
+    })
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    expect(dock.result.current.tabs.length).toBe(0)
+
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'aws s3 ls', reqId: 're-none' },
+        }))
+      })
+      // The command is copied for manual paste; the result reports copied=true.
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 're-none', ok: true, copied: true })
+      expect(copyToClipboardMock).toHaveBeenCalledWith('aws s3 ls')
+      // No fresh tab is minted and nothing is executed.
+      expect(dock.result.current.tabs.length).toBe(0)
+    } finally {
+      stop()
+    }
+  })
+
+  it('copies (never runs) while the initial config read is still pending (F1) — no execute on an unknown', async () => {
+    // GPT 5.6 BLOCKING (#11641): the handler installs once ([]-deps) and reads
+    // the reuse setting at event time. Before the kirocrewConfig query settles
+    // we cannot know whether reuse was saved on; collapsing that unknown to the
+    // fresh-tab EXECUTE path would run a command a reuse-on user expected only
+    // to be copied. So an UNSETTLED read takes the copy-never-run path: a tab is
+    // not minted and nothing is executed, exactly as reuse-on behaves. (Benign
+    // if reuse was actually off — the user merely pastes it themselves.)
+    let resolveCfg: (v: unknown) => void = () => {}
+    apiMocks.kirocrewConfig = vi.fn().mockImplementation(
+      () => new Promise(res => { resolveCfg = res }), // never settles during the test
+    )
+    await renderTurn()
+    const dock = renderHook(() => useBottomTerminal())
+    expect(dock.result.current.tabs.length).toBe(0)
+
+    const { results, stop } = collect()
+    try {
+      act(() => {
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal', {
+          detail: { code: 'aws s3 ls', reqId: 're-pending' },
+        }))
+      })
+      // Copied for manual paste; no execution, no fresh tab minted.
+      await waitFor(() => expect(results.length).toBe(1))
+      expect(results[0]).toMatchObject({ reqId: 're-pending', ok: true, copied: true })
+      expect(copyToClipboardMock).toHaveBeenCalledWith('aws s3 ls')
+      expect(dock.result.current.tabs.length).toBe(0)
+    } finally {
+      stop()
+      resolveCfg({ dashboard: { terminal: { reuse_current: false } } })
     }
   })
 })

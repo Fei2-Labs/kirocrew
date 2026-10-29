@@ -554,7 +554,7 @@ class TestCronFailurePersistence:
         with patch.object(svc, "_execute", side_effect=_hang), patch(
             "kiro_crew.cron._JOB_TIMEOUT_SECS", 0.05
         ):
-            asyncio.run(svc._run_job_isolated(job))
+            asyncio.run(svc._run_job_isolated(job, svc._claim_run(job.id, "scheduled")))
         svc2 = CronService(base_dir=tmp_path)
         svc2._load()
         assert svc2._jobs[0].last_failure_hash == ""

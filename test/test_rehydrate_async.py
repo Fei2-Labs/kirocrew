@@ -20,6 +20,8 @@ the thread each half actually ran on.
 from __future__ import annotations
 
 import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -65,21 +67,35 @@ def _state(log: _Log) -> MagicMock:
 
 @pytest.mark.asyncio
 async def test_reads_run_off_the_loop_and_build_runs_on_it(monkeypatch) -> None:
-    log = _Log({"title": "Babysit PR"}, [{"role": "user", "content": "hi"}])
+    log = _Log(
+        {"title": "Babysit PR", "reasoning_effort": "minimal"},
+        [{"role": "user", "content": "hi"}],
+    )
     state = _state(log)
     built_on: list[str] = []
+    marker_read_on: list[str] = []
     sentinel = MagicMock(name="slot")
+
+    def _marker(raw):
+        assert raw == "minimal"
+        marker_read_on.append(threading.current_thread().name)
+        return True
 
     def _build(_state, _slot_name, **kwargs):
         built_on.append(threading.current_thread().name)
         # The prefetched values must be threaded through so the builder does no
         # further disk I/O of its own.
-        assert kwargs["_prefetched_meta"] == {"title": "Babysit PR"}
+        assert kwargs["_prefetched_meta"] == {
+            "title": "Babysit PR",
+            "reasoning_effort": "minimal",
+        }
         assert kwargs["_prefetched_messages"] == [{"role": "user", "content": "hi"}]
+        assert kwargs["_prefetched_effort_marker"] is True
         return sentinel
 
     monkeypatch.setattr(cp, "_rehydrate_slot_from_history", _build)
     monkeypatch.setattr(cp, "_build_kiro_model_map", lambda: {})
+    monkeypatch.setattr(cp, "_has_validated_effort_marker", _marker)
 
     main = threading.current_thread().name
     result = await cp.rehydrate_slot_from_history_async(state, "chat-1-1785")
@@ -87,6 +103,7 @@ async def test_reads_run_off_the_loop_and_build_runs_on_it(monkeypatch) -> None:
     assert result is sentinel
     assert log.read_threads, "the transcript was never read"
     assert all(t != main for t in log.read_threads), "a disk read ran on the event loop"
+    assert marker_read_on and all(t != main for t in marker_read_on)
     assert built_on == [main], "slot construction left the event-loop thread"
 
 
@@ -128,14 +145,26 @@ async def test_a_close_predating_the_read_does_not_block(monkeypatch) -> None:
     must not additionally reject an unrelated stale tombstone — that would make
     a reopened tab un-rehydratable for the tombstone's lifetime.
     """
-    import time as _time
-
     from kiro_crew.dashboard import channel_slots
 
     log = _Log({"title": "Reopened"}, [{"role": "user", "content": "hi"}])
     state = _state(log)
-    channel_slots.note_slot_closed(state, "chat-1-old")  # then reopened
-    _time.sleep(0.01)
+    # The close must land STRICTLY before the wrapper's own ``started =
+    # time.time()``, and ``slot_closed_since`` is inclusive (``when >= instant``). A
+    # sleep cannot promise that: on Windows through CPython 3.12 ``time.sleep`` is a
+    # high-resolution timer while ``time.time`` steps in 15.6 ms ticks, so both
+    # readings can be EQUAL. Stamp an older instant through ``channel_slots``'s own
+    # clock instead: ``started`` is read later on the real clock, so it is strictly
+    # newer whatever the tick. The gap stays small (10 ms plus the time to that
+    # read), so a guard that grew a "slack" window wider than it would block this read.
+    closed_at = time.time() - 0.01
+    with monkeypatch.context() as mp:
+        mp.setattr(channel_slots, "time", SimpleNamespace(time=lambda: closed_at))
+        stamped = channel_slots.note_slot_closed(state, "chat-1-old")  # then reopened
+    assert stamped == closed_at, "the tombstone was not stamped through the pinned clock"
+    # Non-vacuous: the tombstone EXISTS and refuses a read starting at its own
+    # instant, so only the strictly later start below may pass it.
+    assert channel_slots.slot_closed_since(state, "chat-1-old", closed_at) is True
     sentinel = MagicMock(name="slot")
     monkeypatch.setattr(cp, "_build_kiro_model_map", lambda: {})
     monkeypatch.setattr(cp, "_rehydrate_slot_from_history", lambda *a, **k: sentinel)
@@ -212,7 +241,7 @@ def test_prefetch_reports_an_unreadable_metadata_read() -> None:
     it drops a live tab. So the flag must survive the trip through the prefetch.
     """
     log = _StatusLog({}, [], readable=False)
-    meta, readable, messages, model_map, _mid, _agent = cp._prefetch_rehydrate_inputs(
+    meta, readable, messages, model_map, _mid, _agent, _marker = cp._prefetch_rehydrate_inputs(
         log, "dashboard:chat-1-x", with_status=True
     )
     assert meta == {}
@@ -224,7 +253,7 @@ def test_prefetch_reports_an_unreadable_metadata_read() -> None:
 def test_prefetch_skips_the_transcript_walk_for_an_absent_session() -> None:
     """No metadata → no transcript read. The walk is the expensive half."""
     log = _StatusLog({}, [{"role": "user", "content": "hi"}], readable=True)
-    meta, readable, messages, _, _mid, _agent = cp._prefetch_rehydrate_inputs(
+    meta, readable, messages, _, _mid, _agent, _marker = cp._prefetch_rehydrate_inputs(
         log, "dashboard:chat-1-x", with_status=True
     )
     assert (meta, readable, messages) == ({}, True, None)
@@ -236,7 +265,7 @@ def test_prefetch_skips_the_transcript_walk_for_an_absent_session() -> None:
 def test_prefetch_skips_the_transcript_walk_for_a_closed_session() -> None:
     """A session closed with ✕ is not rebuilt, so its transcript is dead weight."""
     log = _Log({"closed": True}, [{"role": "user", "content": "hi"}])
-    _meta, _readable, messages, model_map, _mid, _agent = cp._prefetch_rehydrate_inputs(
+    _meta, _readable, messages, model_map, _mid, _agent, _marker = cp._prefetch_rehydrate_inputs(
         log, "dashboard:chat-1-closed"
     )
     assert messages is None
@@ -248,7 +277,7 @@ def test_prefetch_skips_the_transcript_walk_for_a_closed_session() -> None:
 def test_prefetch_adopts_a_closed_session_on_request() -> None:
     """``adopt_closed`` callers (app-owned worker slots) still get the walk."""
     log = _Log({"closed": True}, [{"role": "user", "content": "hi"}])
-    _meta, _readable, messages, _, _mid, _agent = cp._prefetch_rehydrate_inputs(
+    _meta, _readable, messages, _, _mid, _agent, _marker = cp._prefetch_rehydrate_inputs(
         log, "dashboard:chat-1-closed", adopt_closed=True, kiro_model_map={}
     )
     assert messages == [{"role": "user", "content": "hi"}]
@@ -272,7 +301,7 @@ def test_prefetch_reuses_a_callers_model_map() -> None:
     original = cp._build_kiro_model_map
     cp._build_kiro_model_map = _boom  # type: ignore[assignment]
     try:
-        _m, _r, _msgs, model_map, _mid, _agent = cp._prefetch_rehydrate_inputs(
+        _m, _r, _msgs, model_map, _mid, _agent, _marker = cp._prefetch_rehydrate_inputs(
             log, "dashboard:chat-1-x", kiro_model_map=shared
         )
     finally:

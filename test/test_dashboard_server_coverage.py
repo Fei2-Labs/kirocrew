@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import logging
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,10 +31,65 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
-from conftest import requires_symlinks
+from conftest import make_dir_link, requires_symlinks
 from kiro_crew.dashboard import server as srv
+from kiro_crew.platform_compat import unlink_link_or_junction
+from kiro_crew.testing import wait
+from kiro_crew.testing.clock import ManualClock
+from kiro_crew.testing.wait import async_wait_until
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+
+async def _sweep_once_released(path: Path, *, timeout: float | None = None) -> None:
+    """Remove ``path`` once the server has let go of the file it served from it.
+
+    ``web.FileResponse`` closes its file on an executor thread after the client
+    already holds the body, and Windows refuses to unlink a file any handle still
+    holds (``[WinError 32]``). So the sweep retries on ``PermissionError`` under a
+    bounded deadline, off the loop so the server's close can run, and fails by name,
+    chained to the last ``PermissionError``, if the handle is never released.
+    """
+
+    def _swept() -> bool:
+        shutil.rmtree(path)
+        return True
+
+    await async_wait_until(
+        _swept,
+        timeout=timeout,
+        ignoring=(PermissionError,),
+        off_loop=True,
+        describe=lambda: f"{path} exists={path.exists()}",
+    )
+
+
+@pytest.fixture
+def virtual_wait_clock(monkeypatch):
+    """Drive ``kiro_crew.testing.wait``'s deadline and evaluation bound in the test.
+
+    ``async_wait_until`` reaches its deadline through a :class:`ManualClock`, so a
+    timeout passes in virtual time at no wall-clock cost. Its per-evaluation bound,
+    which times each ``off_loop=True`` call against the real clock, is replaced with
+    one that awaits the evaluation to completion: the test's predicate is an instant
+    mock, so running it inline removes any dependence on how fast a worker thread
+    schedules. The verdict is then fixed by the mock, never by runner speed.
+    """
+    clock = ManualClock(monotonic_start=0.0)
+    real_asyncio_sleep = asyncio.sleep
+
+    async def virtual_asyncio_sleep(seconds: float) -> None:
+        clock.sleep(seconds)
+        await real_asyncio_sleep(0)
+
+    async def run_to_completion(awaitable, bound, predicate=None):
+        return await awaitable
+
+    monkeypatch.setattr(wait, "_monotonic", clock.monotonic)
+    monkeypatch.setattr(wait, "_sleep", clock.sleep)
+    monkeypatch.setattr(wait, "_asyncio_sleep", virtual_asyncio_sleep)
+    monkeypatch.setattr(wait, "_bounded", run_to_completion)
+    return clock
 
 
 class _FakeInhibitor:
@@ -200,15 +256,91 @@ class TestWindowEntryHandler:
     async def test_handler_serves_the_file_bound_at_registration(
         self, tmp_path
     ) -> None:
-        entry = tmp_path / "board.html"
+        entry = tmp_path / "src" / "apps" / "papyrus" / "board.html"
+        entry.parent.mkdir(parents=True)
         entry.write_text("<h1>board</h1>", encoding="utf-8")
         app = web.Application()
-        app.router.add_get("/w.html", srv._window_entry_handler(entry))
+        app.router.add_get("/w.html", srv._window_entry_handler(tmp_path, "papyrus/board.html"))
 
         async with TestClient(TestServer(app)) as client:
             resp = await client.get("/w.html")
             assert resp.status == 200
             assert await resp.text() == "<h1>board</h1>"
+
+    @pytest.mark.asyncio
+    async def test_handler_follows_a_re_pointed_dist(self, tmp_path) -> None:
+        """A window route resolves the served dist per request, not at registration.
+
+        Staging re-points ``static/dist`` at a fresh copy and sweeps the old one;
+        a route pinned to the old copy at startup would 404 from then on.
+        """
+        for name, body in (("old", "<h1>old</h1>"), ("new", "<h1>new</h1>")):
+            entry = tmp_path / name / "src" / "apps" / "papyrus" / "board.html"
+            entry.parent.mkdir(parents=True)
+            entry.write_text(body, encoding="utf-8")
+        served = tmp_path / "served"
+        make_dir_link(served, tmp_path / "old")
+        app = web.Application()
+        app.router.add_get("/w.html", srv._window_entry_handler(served, "papyrus/board.html"))
+
+        async with TestClient(TestServer(app)) as client:
+            assert await (await client.get("/w.html")).text() == "<h1>old</h1>"
+            unlink_link_or_junction(served)
+            make_dir_link(served, tmp_path / "new")
+            await _sweep_once_released(tmp_path / "old")
+            resp = await client.get("/w.html")
+            assert resp.status == 200
+            assert await resp.text() == "<h1>new</h1>"
+
+    @pytest.mark.asyncio
+    async def test_sweep_waits_out_a_handle_released_late(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A sharing violation that clears is retried until the tree is gone."""
+        old = tmp_path / "old"
+        (old / "sub").mkdir(parents=True)
+        (old / "sub" / "board.html").write_text("x", encoding="utf-8")
+        real_rmtree = shutil.rmtree
+        calls: list[Path] = []
+
+        def held_twice(path, *args, **kwargs):
+            calls.append(Path(path))
+            if len(calls) <= 2:
+                raise PermissionError(32, "being used by another process")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", held_twice)
+
+        await _sweep_once_released(old)
+
+        assert not old.exists()
+        assert calls == [old, old, old]
+
+    @pytest.mark.asyncio
+    async def test_sweep_fails_by_name_when_the_handle_is_never_released(
+        self, tmp_path, monkeypatch, virtual_wait_clock
+    ) -> None:
+        """A handle that never closes is a leak: the sweep must not swallow it.
+
+        The wait's deadline runs on a manual clock and each evaluation runs inline,
+        so the only thing that decides the verdict is the always-raising ``rmtree``
+        mock: the sweep reaches the deadline and fails with its "still false"
+        message, chained to the ``PermissionError``, at no wall-clock cost.
+        """
+        old = tmp_path / "old"
+        old.mkdir()
+
+        def always_held(path, *args, ignore_errors=False, **kwargs):
+            if not ignore_errors:
+                raise PermissionError(32, "being used by another process")
+
+        monkeypatch.setattr(shutil, "rmtree", always_held)
+
+        with pytest.raises(AssertionError, match="still false") as excinfo:
+            await _sweep_once_released(old, timeout=0.2)
+
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+        assert old.exists()
 
     @pytest.mark.asyncio
     async def test_app_window_entries_are_registered_as_get_routes(
@@ -234,12 +366,7 @@ class TestWindowEntryHandler:
         assert f"/{srv.APP_WINDOW_URL_PREFIX}/papyrus/editor.html" in canonical
         # App Store brand assets: without this mount the builtin app icons and
         # hero images fall through to the SPA shell and render as placeholders.
-        prefixes = {
-            r.get_info().get("prefix")
-            for r in app.router.resources()
-            if r.get_info().get("prefix")
-        }
-        assert "/app-assets" in prefixes
+        assert "/app-assets/{tail}" in canonical
 
 
 # ── _precompute_telemetry ────────────────────────
@@ -414,9 +541,9 @@ class TestReviveIntendedInstances:
         registry = MagicMock(
             list=MagicMock(
                 return_value=[
-                    SimpleNamespace(id="boom", was_connected=True),
-                    SimpleNamespace(id="degraded", was_connected=True),
-                    SimpleNamespace(id="ok", was_connected=True),
+                    SimpleNamespace(id="boom", was_connected=True, disabled=False),
+                    SimpleNamespace(id="degraded", was_connected=True, disabled=False),
+                    SimpleNamespace(id="ok", was_connected=True, disabled=False),
                 ]
             )
         )
@@ -510,8 +637,15 @@ class TestConnectionsWarmLifecycle:
             assert kick in source
             # The kick must run strictly AFTER the listener binds: an on_startup hook (or
             # any pre-bind call) puts the scavenge's deferred import in front of the bind,
-            # which no-new-work-on-gateway-boot-path forbids.
-            assert source.index("_start_site(site, port)") < source.index(kick)
+            # which no-new-work-on-gateway-boot-path forbids. The serving step differs per
+            # entrypoint: start_dashboard listens on its pre-reserved socket via SockSite
+            # ("await site.start()"); start_api_server binds via _start_site.
+            serving = (
+                "_start_site(site, port)"
+                if "_start_site(site, port)" in source
+                else "await site.start()"
+            )
+            assert source.index(serving) < source.index(kick)
 
 
 # ── _register_browser_view_cleanup ──────────────────────────────────────

@@ -12,6 +12,7 @@ that happening a second time in the other direction.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -34,11 +35,13 @@ from kiro_crew.providers.mirrors import Concern, Disposition, mirror_for
 from kiro_crew.providers.mirrors.identity import identity_bound_crew_servers
 from kiro_crew.providers.mirrors.opencode import (
     OpenCodeMirror,
-    narrowed_control_plane,
+    opencode_deny_rules,
     opencode_elements,
     opencode_projection,
+    opencode_tool_id,
     without_stdio_tag,
 )
+from kiro_crew.testing.wait import wait_until
 
 #: What opencode 1.18.30's ``initialize`` actually answered. Two fields, because
 #: ACP's ``McpCapabilities`` has exactly two -- which is the whole point: there is
@@ -53,7 +56,7 @@ _CRON = {"command": "/opt/kirocrew", "args": ["mcp-cron"]}
 def agents_dir(tmp_path, monkeypatch):
     """Point the agent-spec resolver at a temp agents directory.
 
-    Same seam as ``test_codex_session_mcp.py``: materialization would rebuild the
+    Same seam as ``codex_session_mcp_helpers.py``: materialization would rebuild the
     managed default from bundled defaults, and these tests supply the spec.
     """
     d = tmp_path / "agents"
@@ -353,26 +356,33 @@ class TestNoNameFolding:
 # ── withholding ─────────────────────────────────────────────────────────────
 
 
-class TestWhatIsWithheld:
-    def test_a_narrowed_third_party_server_is_withheld_whole(self, agents_dir):
-        """The codex precedent: this transport has no per-tool deny slot, so the
-        faithful options are withhold the server or widen the session behind the
-        user's back. An availability cost is the honest price; reachability of a tool
-        the user switched off is not."""
+class TestPerToolDenyRules:
+    """A switched-off tool becomes a ``deny`` rule; its server stays mounted.
+
+    The rule rides the permission routing Crew already seeds, under the id the
+    harness gives an MCP tool. The live half
+    (:func:`test_real_opencode_hides_a_denied_tool_and_keeps_its_sibling`) is what
+    shows the rule hides one tool and leaves its siblings usable.
+    """
+
+    def test_a_narrowed_third_party_server_stays_mounted_with_a_deny_rule(self, agents_dir):
         _write_spec(
             agents_dir,
             servers={"narrowed": {"command": "/bin/x", "disabledTools": ["danger"]}},
             tools=["@narrowed"],
         )
-        names = [e["name"] for e in opencode_projection("kirocrew").params["mcpServers"]]
-        assert "narrowed" not in names
+        projection = opencode_projection("kirocrew")
+        names = [e["name"] for e in projection.params["mcpServers"]]
+        assert "narrowed" in names
+        assert projection.harness_deny_rules == ("narrowed_danger",)
+        assert projection.unhonoured_servers == frozenset()
+        assert projection.restricted_servers == frozenset()
 
-    def test_a_third_party_server_narrowed_only_in_the_global_file_is_withheld(
+    def test_a_third_party_server_narrowed_only_in_the_global_file_gets_its_rule(
         self, agents_dir, tmp_path, monkeypatch
     ):
         """The dashboard's ordinary tool-off action writes to the global settings
-        file, not to the spec, so a withhold set read from the spec alone would let
-        that server mount un-narrowed."""
+        file, not to the spec, so rules read from the spec alone would miss it."""
         settings = tmp_path / "settings-mcp.json"
         settings.write_text(
             json.dumps({"mcpServers": {"narrowed": {"disabledTools": ["danger"]}}}),
@@ -380,89 +390,85 @@ class TestWhatIsWithheld:
         )
         monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", settings)
         _write_spec(agents_dir, servers={"narrowed": {"command": "/bin/x"}}, tools=["@narrowed"])
-        names = [e["name"] for e in opencode_projection("kirocrew").params["mcpServers"]]
-        assert "narrowed" not in names
+        projection = opencode_projection("kirocrew")
+        assert "narrowed" in [e["name"] for e in projection.params["mcpServers"]]
+        assert projection.harness_deny_rules == ("narrowed_danger",)
 
-    def test_a_narrowed_control_plane_server_is_withheld_too(self, agents_dir):
-        """Where this backend parts company with codex, and why.
-
-        codex exempts the control plane from the withholding -- but the exemption was
-        never about the wire. ``managed_mcp_spec_entry`` emits only
-        command/args/env, so the narrowing reaches no element on either backend; what
-        makes keeping the server safe on codex is its SECOND channel, refusing the
-        call at the permission request. This harness emits no
-        ``rawInput.server``/``tool``, so that channel does not exist -- and carrying
-        the exemption across without the mechanism would leave a tool the operator
-        switched off on the dashboard REACHABLE, on an ordinary path, with nothing
-        saying so.
-        """
+    def test_a_narrowed_control_plane_stays_mounted_with_a_deny_rule(self, agents_dir):
+        """The case whole-server withholding cost most: with kirocrew-core gone a
+        session cannot report back to its channel at all."""
         _write_spec(
             agents_dir,
             servers={"kirocrew-core": {"command": "/x", "disabledTools": ["spawn_run"]}},
             tools=["@kirocrew-core", "@kirocrew-cron"],
         )
-        names = [e["name"] for e in opencode_projection("kirocrew").params["mcpServers"]]
-        assert "kirocrew-core" not in names
-        # Only the NARROWED one. A blanket "the spec narrows something, drop the whole
-        # control plane" would cost a session its channel for an unrelated setting.
-        assert "kirocrew-cron" in names
-
-    def test_a_control_plane_narrowed_only_in_the_global_file_is_withheld(
-        self, agents_dir, tmp_path, monkeypatch
-    ):
-        """The path that matters, since it is the one the dashboard writes.
-
-        A tool-off action writes ``disabledTools`` to the global MCP settings file and
-        not to the agent spec, so a rule reading the spec alone would miss exactly the
-        ordinary case and leave the switched-off tool reachable.
-        """
-        settings = tmp_path / "settings-mcp.json"
-        settings.write_text(
-            json.dumps({"mcpServers": {"kirocrew-core": {"disabledTools": ["spawn_run"]}}}),
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(agent_mod, "_KIRO_MCP_JSON", settings)
-        _write_spec(agents_dir, servers={}, tools=["@kirocrew-core", "@kirocrew-cron"])
-        names = [e["name"] for e in opencode_projection("kirocrew").params["mcpServers"]]
-        assert "kirocrew-core" not in names
-        assert "kirocrew-cron" in names
+        projection = opencode_projection("kirocrew")
+        names = [e["name"] for e in projection.params["mcpServers"]]
+        assert names == ["kirocrew-core", "kirocrew-cron"]
+        assert projection.harness_deny_rules == ("kirocrew-core_spawn_run",)
 
     def test_an_unnarrowed_control_plane_pays_nothing(self, agents_dir):
-        """The cost lands only on an operator who narrowed it deliberately.
-
-        A default install narrows nothing, so the whole control plane is there. Without
-        this the withhold rule could quietly become "opencode has no control plane".
-        """
         _write_spec(agents_dir, servers={}, tools=["@kirocrew-core", "@kirocrew-cron"])
-        names = [e["name"] for e in opencode_projection("kirocrew").params["mcpServers"]]
+        projection = opencode_projection("kirocrew")
+        names = [e["name"] for e in projection.params["mcpServers"]]
         assert names == ["kirocrew-core", "kirocrew-cron"]
+        assert projection.harness_deny_rules == ()
 
-    def test_the_narrowed_set_is_derived_from_the_pairs_not_the_spec(self, agents_dir):
-        """Same parse for both decisions, and control-plane names only.
+    def test_the_rule_is_spelled_the_way_the_harness_names_the_tool(self):
+        """opencode names an MCP tool ``sanitize(server) + "_" + sanitize(tool)``,
+        keeping only ``[a-zA-Z0-9_-]``. So a rule can never hold ``*`` or ``?``, and
+        cannot widen into a wildcard pattern."""
+        assert opencode_tool_id("probe-core", "secret") == "probe-core_secret"
+        assert opencode_tool_id("a.b", "c d") == "a_b_c_d"
+        assert opencode_tool_id("s*", "t?") == "s__t_"
+        assert opencode_deny_rules([("b", "y"), ("a", "x"), ("a", "x")]) == ("a_x", "b_y")
 
-        ``session_mcp_restricted_servers`` SUBTRACTS the control plane, so this rule
-        cannot be folded into it -- and it must not widen to a third-party name that
-        set already owns, or the two would disagree about who withheld what.
-        """
-        assert narrowed_control_plane([("kirocrew-core", "spawn_run")]) == frozenset(
-            {"kirocrew-core"}
+    def test_an_id_the_harness_remaps_to_a_builtin_is_withheld_whole(self, agents_dir):
+        """The harness judges ``apply_patch`` (and five more) by a builtin's rule, so a
+        deny Crew writes under that id is not the rule it reads."""
+        _write_spec(
+            agents_dir,
+            servers={"apply": {"command": "/bin/x", "disabledTools": ["patch"]}},
+            tools=["@apply"],
         )
-        assert narrowed_control_plane([("third-party", "x")]) == frozenset()
-        assert narrowed_control_plane([]) == frozenset()
-        # And the pairs it reads are the ones the restricted set drops.
-        assert not session_mcp.session_mcp_restricted_servers(
-            [("kirocrew-core", "spawn_run")]
-        ) & set(session_mcp.CONTROL_PLANE_SERVERS)
+        projection = opencode_projection("kirocrew")
+        assert "apply" not in [e["name"] for e in projection.params["mcpServers"]]
+        assert projection.harness_deny_rules == ()
+        assert projection.unhonoured_servers == frozenset({"apply"})
+        assert projection.restricted_servers == frozenset({"apply"})
+
+    def test_a_rule_not_in_force_withholds_only_its_server(self, agents_dir):
+        """What the client hands back after a read-back found a rule outranked."""
+        _write_spec(
+            agents_dir,
+            servers={
+                "narrowed": {"command": "/bin/x", "disabledTools": ["danger"]},
+                "kirocrew-core": {"command": "/x", "disabledTools": ["spawn_run"]},
+            },
+            tools=["@narrowed", "@kirocrew-core"],
+        )
+        projection = opencode_projection(
+            "kirocrew", denies_in_force=frozenset({"kirocrew-core_spawn_run"})
+        )
+        names = [e["name"] for e in projection.params["mcpServers"]]
+        assert names == ["kirocrew-core"]
+        assert projection.unhonoured_servers == frozenset({"narrowed"})
+
+    def test_the_mirror_face_passes_the_in_force_set_through(self, agents_dir):
+        _write_spec(
+            agents_dir,
+            servers={"narrowed": {"command": "/bin/x", "disabledTools": ["danger"]}},
+            tools=["@narrowed"],
+        )
+        mirror = OpenCodeMirror()
+        kept = mirror.session_projection("kirocrew", harness_denies_in_force=None)
+        lost = mirror.session_projection("kirocrew", harness_denies_in_force=frozenset())
+        assert "narrowed" in [e["name"] for e in kept.params["mcpServers"]]
+        assert "narrowed" not in [e["name"] for e in lost.params["mcpServers"]]
 
     def test_denied_tools_is_empty_because_this_transport_cannot_match_a_pair(self, agents_dir):
-        """A DECISION, pinned so it cannot become an accident.
-
-        The client's per-call refusal identifies an MCP call from codex-acp's
-        ``rawInput = {server, tool}``, which this harness does not emit -- it sends a
-        fused ``<server>_<tool>`` title and no ``_meta.kiro``. Returning pairs would
-        read as an enforced restriction that never matches, which is worse than an
-        empty set; the restriction is honoured by withholding instead.
-        """
+        """The client's per-call refusal needs a structured ``(server, tool)``, and this
+        harness sends only a fused title. Pairs here could never match."""
         _write_spec(
             agents_dir,
             servers={"kirocrew-core": {"command": "/x", "disabledTools": ["spawn_run"]}},
@@ -470,7 +476,7 @@ class TestWhatIsWithheld:
         )
         assert opencode_projection("kirocrew").denied_tools == frozenset()
         reason = OpenCodeMirror().rulings()[Concern.DENIED_TOOLS].reason
-        assert "narrowed_control_plane" in reason
+        assert "deny" in reason and "fused" in reason
 
     def test_crews_other_managed_servers_are_withheld_rather_than_mounted_unusable(
         self, agents_dir, monkeypatch
@@ -531,9 +537,27 @@ class TestPooledStubs:
         )
         stub = {"name": "narrowed", "command": "/opt/stub", "args": [], "env": []}
         elements = opencode_projection(
-            "kirocrew", stub_server_names=("narrowed",), stub_elements=[stub]
+            "kirocrew",
+            stub_server_names=("narrowed",),
+            stub_elements=[stub],
+            denies_in_force=frozenset(),
         ).params["mcpServers"]
         assert "narrowed" not in _by_name(elements)
+
+    def test_a_stub_of_a_narrowed_server_with_its_rule_in_force_is_mounted(self, agents_dir):
+        """The rule keys on the server NAME, which the stub shares, so the stub's
+        switched-off tool is denied the same way."""
+        _write_spec(
+            agents_dir,
+            servers={"narrowed": {"command": "/bin/x", "disabledTools": ["danger"]}},
+            tools=["@narrowed"],
+        )
+        stub = {"name": "narrowed", "command": "/opt/stub", "args": [], "env": []}
+        projection = opencode_projection(
+            "kirocrew", stub_server_names=("narrowed",), stub_elements=[stub]
+        )
+        assert _by_name(projection.params["mcpServers"])["narrowed"]["command"] == "/opt/stub"
+        assert projection.harness_deny_rules == ("narrowed_danger",)
 
     def test_a_stub_gets_no_crew_identity(self, agents_dir):
         """Stubs are gateway-authored and their env is the broker's own; a
@@ -651,16 +675,22 @@ class TestTheMirrorFaces:
         OpenCodeMirror().write_files("kirocrew", work_dir=tmp_path)
         assert sorted(p.name for p in tmp_path.iterdir()) == before
 
-    def test_the_routing_seed_carries_no_mcp_block(self):
-        """The other half of "pick one channel", asserted against the code that
-        writes the config Crew DOES seed."""
-        import inspect
+    def test_the_routing_seed_carries_no_mcp_block(self, monkeypatch):
+        """The other half of "pick one channel", asserted against the config Crew
+        DOES seed: its only key of Crew's own is the permission setting, so no
+        ``mcp`` block reaches the harness through it, with or without an operator's
+        own config to merge over."""
+        from kiro_crew import acp_tool_gate
+        from kiro_crew.acp.harness import opencode as opencode_mod
 
-        from kiro_crew.acp import client as client_mod
+        setting_key, _value = acp_tool_gate.permission_setting_for(ACP_BACKEND_OPENCODE)
+        monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+        seeded = json.loads(opencode_mod._opencode_routing_config(ACP_BACKEND_OPENCODE))
+        assert set(seeded) == {setting_key}
 
-        body = inspect.getsource(client_mod.AcpClient._opencode_routing_config)
-        assert '"mcp"' not in body
-        assert "mcpServers" not in body
+        monkeypatch.setenv("OPENCODE_CONFIG_CONTENT", json.dumps({"theme": "dark"}))
+        merged = json.loads(opencode_mod._opencode_routing_config(ACP_BACKEND_OPENCODE))
+        assert set(merged) == {"theme", setting_key}
 
 
 # ── the real adapter ────────────────────────────────────────────────────────
@@ -1107,34 +1137,55 @@ def test_the_driver_runner_reaps_descendants_on_the_timeout_path():
 
     Asserted on the GRANDCHILD, because a parent-only kill is the bug -- the parent
     dies either way.
+
+    The grandchild is known here only as a NUMBER the driver printed, and by the
+    time this process reads it the driver's group has been SIGKILLed: on the
+    passing path init has already collected the grandchild and the kernel is free
+    to hand its number to a stranger. So the driver reports the grandchild's
+    start-time identity alongside the pid, read through the repo's own helper at
+    the one moment the pid is provably ours, and "gone" below means "no process
+    with THAT identity" -- a reissued number is a stranger, neither a leak nor a
+    kill target. The failure-path kill is pinned to the same identity.
     """
-    parent = r"""
-import subprocess, sys, time
-g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
-print(g.pid, flush=True)
-time.sleep(300)
-"""
+    src_root = Path(platform_compat.__file__).resolve().parents[1]
+    parent = (
+        "import subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(src_root)!r})\n"
+        "from kiro_crew.platform_compat import get_process_start_id\n"
+        'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])\n'
+        "print(g.pid, get_process_start_id(g.pid) or '', flush=True)\n"
+        "time.sleep(300)\n"
+    )
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as w:
         script = Path(w) / "parent.py"
         script.write_text(parent, encoding="utf-8")
         started = time.monotonic()
         result = _run_driver_reaping_group([sys.executable, str(script)], timeout=5, cwd=w)
         assert time.monotonic() - started < 90
-        grandchild = int((result.stdout or "").strip().splitlines()[0])
+        reported = (result.stdout or "").strip().splitlines()[0].split()
+        grandchild = int(reported[0])
+        assert len(reported) == 2, (
+            f"the driver could not read the start-time identity of grandchild "
+            f"{grandchild}, so neither the liveness check nor the failure-path kill "
+            "below could be pinned to the process it spawned"
+        )
+        grandchild_identity = reported[1]
 
-    # Liveness through the repo's own probe (AGENTS.md "Cross-platform"): a raw
-    # ``os.kill(pid, 0)`` is a POSIX idiom that TERMINATES the target on Windows,
-    # and the sweep's caller filter recognises only the sanctioned helper.
-    # ``PID_UNSIGNALABLE`` counts as gone, like a bare ``OSError``: the grandchild
-    # was ours, so a number this process cannot signal is not it.
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        if platform_compat.pid_liveness(grandchild) != platform_compat.PID_ALIVE:
-            break
-        time.sleep(0.2)
-    else:  # pragma: no cover - the failure this test exists to catch
+    # Liveness through the repo's own identity helper (AGENTS.md "Cross-platform"):
+    # a raw ``os.kill(pid, 0)`` is a POSIX idiom that TERMINATES the target on
+    # Windows, the sweep's caller filter recognises only the sanctioned helpers,
+    # and a bare existence probe cannot tell our reaped grandchild's reissued
+    # number from the grandchild itself.
+    try:
+        wait_until(
+            lambda: platform_compat.get_process_start_id(grandchild) != grandchild_identity,
+            describe=lambda: f"pid {grandchild} still carries identity {grandchild_identity}",
+        )
+    except AssertionError:  # pragma: no cover - the failure this test exists to catch
         try:
-            os.kill(grandchild, 9)
+            platform_compat.kill_pid_pinned(
+                grandchild, grandchild_identity, platform_compat.SIGKILL
+            )
         except OSError:
             pass
         pytest.fail(
@@ -1155,3 +1206,167 @@ def test_the_driver_and_stub_are_syntactically_valid_python():
 
     ast.parse(_DRIVER)
     ast.parse(_STUB_MCP)
+
+
+def _real_opencode_read_back(tmp_path, global_permission: dict) -> tuple[str, str]:
+    """Run the real routing read-back under a private HOME holding *global_permission*."""
+    from kiro_crew.acp.client import AcpClient
+    from kiro_crew.acp.harness import opencode as opencode_mod
+
+    home = tmp_path / "home"
+    config_home = home / ".config"
+    (config_home / "opencode").mkdir(parents=True)
+    (config_home / "opencode" / "opencode.json").write_text(
+        json.dumps({"permission": global_permission}), encoding="utf-8"
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    isolated = {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(config_home),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+    }
+    client = AcpClient(work_dir=work, acp_backend=ACP_BACKEND_OPENCODE, extra_env=isolated)
+    seed = opencode_mod._opencode_routing_config(ACP_BACKEND_OPENCODE)
+    return opencode_mod._verify_opencode_routing(
+        client, ACP_BACKEND_OPENCODE, [str(_BIN), "debug", "config"], seed
+    )
+
+
+@pytest.mark.parametrize(
+    ("resolved_permission", "refused"),
+    [
+        ({"bash": {"git *": "allow", "*": "ask"}, "edit": "allow", "*": "ask"}, False),
+        ({"bash": {"pwd": "deny"}, "*": "ask"}, True),
+    ],
+)
+def test_the_real_read_back_helper_reaches_the_routing_read_back(
+    tmp_path, monkeypatch, resolved_permission, refused
+):
+    """The live tests' helper, run against a canned ``debug config`` everywhere.
+
+    The live tests run only where the harness is installed, so a helper that stopped
+    reaching the read-back would fail only in the lane that installs it. Here the
+    harness's answer is canned: the helper must drive the read-back with the seed it
+    built, in the private HOME it built, and read the answer the way the live test
+    expects -- a per-tool allow under a trailing ask is in force, a deny is refused.
+    """
+    from kiro_crew.acp.harness import opencode as opencode_mod
+
+    ran: list[tuple[list[str], dict]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = json.dumps({"permission": resolved_permission})
+        stderr = ""
+
+    def _run(argv, **kwargs):
+        ran.append((list(argv), dict(kwargs["env"])))
+        return _Completed()
+
+    monkeypatch.setattr(opencode_mod.subprocess_mod, "run", _run)
+    issue, _remedy = _real_opencode_read_back(tmp_path, {"bash": {"pwd": "deny"}})
+
+    assert len(ran) == 1
+    argv, env = ran[0]
+    assert argv[1:] == ["debug", "config"]
+    assert env["HOME"] == str(tmp_path / "home")
+    assert json.loads(env["OPENCODE_CONFIG_CONTENT"]) == json.loads(
+        opencode_mod._opencode_routing_config(ACP_BACKEND_OPENCODE)
+    )
+    assert bool(issue) is refused, issue
+    if refused:
+        assert "deny" in issue
+
+
+@pytest.mark.real_adapter
+def test_real_opencode_a_lower_source_per_tool_allow_is_in_force(tmp_path):
+    """ANTI-DRIFT GUARD for the read-back's last-match-wins reading.
+
+    The harness merges sources key by key, so a per-tool ``allow`` in the operator's
+    global config keeps its place and the seed's ``"*": "ask"`` lands after it. The
+    harness lets the last matching rule win, so every call still asks -- and the
+    session must start. If a release changes the merge order (``"*"`` first) or the
+    evaluation order, this read-back turns into a refusal here instead of a session
+    that silently stops asking.
+    """
+    _require_opencode()
+    assert _BIN is not None
+    issue, remedy = _real_opencode_read_back(
+        tmp_path, {"bash": {"git *": "allow", "*": "ask"}, "edit": "allow"}
+    )
+    assert (issue, remedy) == ("", ""), f"refused: {issue} / {remedy}"
+
+
+@pytest.mark.real_adapter
+def test_real_opencode_a_lower_source_deny_is_still_refused(tmp_path):
+    """The seed's trailing ``"*"`` would outrank a ``deny`` and turn it into a prompt,
+    so a global config that denies anything is refused rather than weakened."""
+    _require_opencode()
+    assert _BIN is not None
+    issue, _remedy = _real_opencode_read_back(tmp_path, {"bash": {"pwd": "deny"}})
+    assert issue and "deny" in issue
+
+
+class _VersionProbeSession:
+    """The session surface the version gate's probe reads, nothing more."""
+
+    def __init__(self, work_dir):
+        self._spawn_work_dir = work_dir
+        self._extra_env = {}
+
+    def _agent_env_for_spawn(self):
+        return {}
+
+
+@pytest.mark.real_adapter
+def test_real_opencode_the_version_gate_passes_the_pinned_binary(tmp_path):
+    """ANTI-DRIFT GUARD for the fail-closed version gate, against the REAL binary.
+
+    The gate refuses every launch whose wrapped ``--version`` answer is not an
+    exit-0, dotted, in-range major -- so its premise is how the REAL binary
+    answers through the REAL sandbox mask, not through a stub. This drives
+    ``_opencode_version_refusal`` exactly as the launch does -- the adapter's
+    credential mask, the same spawn-env bindings, the wrapped child off the
+    loop -- against the binary this host resolves, and the verdict is host-class
+    specific, never assumed:
+
+    - a host where the mask applies (macOS seatbelt, a Linux with user
+      namespaces) must answer the in-range verdict for the pinned release -- a
+      release that changes where ``--version`` prints, wraps badly, or exits
+      non-zero turns this into a refusal here instead of every session being
+      refused where no one can see it;
+    - a host with NO OS sandbox backend must NOT answer in-range by silently
+      unwrapping: production refuses such a launch at the preflight, before any
+      child runs, so ``SandboxUnavailableError`` propagating IS the contract
+      there.
+    """
+    import kiro_crew.sandbox as sandbox_mod
+    from kiro_crew.acp.harness import opencode as opencode_mod
+    from kiro_crew.agent_sdk import tool_gate as acp_tool_gate
+
+    _require_opencode()
+    assert _BIN is not None
+
+    hidden = acp_tool_gate.adapter_hidden_credential_dirs(ACP_BACKEND_OPENCODE)
+    expose = acp_tool_gate.adapter_expose_files(ACP_BACKEND_OPENCODE, hidden)
+    work = tmp_path / "work"
+    work.mkdir()
+    try:
+        issue, remedy = asyncio.run(
+            opencode_mod._opencode_version_refusal(
+                _VersionProbeSession(work),
+                str(_BIN),
+                sandbox_mode="auto",
+                hidden=hidden,
+                expose=expose,
+            )
+        )
+    except sandbox_mod.SandboxUnavailableError:
+        # The launch would refuse at the preflight on this host: no child of the
+        # harness runs at all, so there is no version answer to check. What this
+        # host CAN prove is that the gate did not dodge its own mask.
+        return
+    assert (issue, remedy) == ("", ""), f"the pinned binary failed its own gate: {issue} / {remedy}"

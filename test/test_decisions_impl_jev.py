@@ -20,14 +20,16 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from kiro_crew.config.sections import DecisionProviderConfig
+from kiro_crew.decisions import impl_jev
 from kiro_crew.decisions.impl_jev import (
     JevHttpError,
     JevOracle,
     JevProtocolError,
     _to_wire,
+    close_sessions,
     resolve_api_key,
 )
-from kiro_crew.decisions.types import Choice
+from kiro_crew.decisions.types import Choice, Noul, Score
 
 VAULT_REF = "secret://TYPESAFE_API_KEY"
 VAULT_KEY = "test-key"
@@ -74,11 +76,12 @@ def _yes(p=0.9):
 class _Recorder:
     """A tiny aiohttp app that answers with a canned response and records the request."""
 
-    def __init__(self, *, status=200, body=None, raw=None, delay=0.0):
+    def __init__(self, *, status=200, body=None, raw=None, delay=0.0, resp_headers=None):
         self.status = status
         self.body = body
         self.raw = raw
         self.delay = delay
+        self.resp_headers = resp_headers or {}
         self.requests: list[dict] = []
         self.headers: list[dict] = []
 
@@ -91,8 +94,13 @@ class _Recorder:
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.raw is not None:
-            return web.Response(status=self.status, text=self.raw, content_type="application/json")
-        return web.json_response(self.body or {}, status=self.status)
+            return web.Response(
+                status=self.status,
+                text=self.raw,
+                content_type="application/json",
+                headers=self.resp_headers,
+            )
+        return web.json_response(self.body or {}, status=self.status, headers=self.resp_headers)
 
     def app(self) -> web.Application:
         app = web.Application()
@@ -108,19 +116,28 @@ async def _run(
     api_key=VAULT_REF,
     state="hi",
     model="jev-latest",
+    host="localhost",
 ):
-    """Serve *recorder* on loopback and ask *questions* through a real socket."""
-    server = TestServer(recorder.app())
+    """Serve *recorder* on loopback and ask *questions* through a real socket.
+
+    *host* defaults to the NAME ``localhost``, which reaches the same socket but is
+    not a literal loopback address, so the client treats it as a remote provider and
+    sends the key. Pass ``127.0.0.1`` to exercise the local-model path, which sends
+    none.
+    """
+    server = TestServer(recorder.app(), host="127.0.0.1")
     await server.start_server()
     try:
         provider = DecisionProviderConfig(
-            endpoint=str(server.make_url("/v1/systemone")),
+            endpoint=f"http://{host}:{server.port}/v1/systemone",
             api_key=api_key,
             model=model,
             timeout_ms=timeout_ms,
         )
         return await JevOracle(provider).ask(state, questions)
     finally:
+        # The shared keep-alive session belongs to this loop, which ends with the call.
+        await close_sessions()
         await server.close()
 
 
@@ -130,6 +147,25 @@ def _ok_body(answers, *, input_tokens=312):
         "answers": answers,
         "usage": {"input_tokens": input_tokens, "output_tokens": 48},
     }
+
+
+async def _run_oracle(recorder: _Recorder, questions, *, timeout_ms=5000, model="jev-latest"):
+    """Like ``_run`` but returns the ``JevOracle`` so its ``last_response_meta`` can be read."""
+    server = TestServer(recorder.app(), host="127.0.0.1")
+    await server.start_server()
+    try:
+        provider = DecisionProviderConfig(
+            endpoint=f"http://localhost:{server.port}/v1/systemone",
+            api_key=VAULT_REF,
+            model=model,
+            timeout_ms=timeout_ms,
+        )
+        oracle = JevOracle(provider)
+        answers = await oracle.ask("hi", questions)
+        return answers, oracle
+    finally:
+        await close_sessions()
+        await server.close()
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +218,11 @@ class TestRequestShape:
         assert sent["model"] == "jev-latest"
         assert sent["state"] == {"messages": ["hello"]}
 
-    def test_choice_criteria_is_a_map_of_option_to_null(self):
-        """Per the API a Choice's ``criteria`` is a MAP; a list would be rejected."""
+    def test_choice_without_criteria_sends_a_map_of_option_to_null(self):
+        """A ``Choice`` that authored no criteria sends the SAME wire as before:
+        a map keyed by every option, each value ``None``. Per the API a Choice's
+        ``criteria`` is a MAP, not a list, and the option-keyed shape is preserved
+        so a point that supplies nothing changes nothing."""
         rec = _Recorder(
             body=_ok_body(
                 {
@@ -202,8 +241,58 @@ class TestRequestShape:
         assert q["instructions"] == CHOICE.prompt
         assert q["criteria"] == {"billing": None, "technical": None, "sales": None}
 
-    def test_only_choice_questions_go_over_the_wire(self):
-        """The wire speaks Choice only; any other object is a caller bug, not a request."""
+    def test_choice_criteria_are_threaded_per_option_keeping_the_map_shape(self):
+        """Authored criteria reach the provider keyed by option; an option with no
+        text still appears, carrying ``None``, so the option domain is intact."""
+        q = Choice(
+            id="department",
+            prompt="Which team?",
+            options=["billing", "technical", "sales"],
+            criteria={
+                "billing": "payment, invoice or refund questions",
+                "technical": "bug reports and how-to questions",
+            },
+        )
+        rec = _Recorder(
+            body=_ok_body(
+                {
+                    "department": {
+                        "type": "choice",
+                        "choice": "billing",
+                        "probabilities": {"billing": 1.0},
+                    }
+                }
+            )
+        )
+        asyncio.run(_run(rec, [q]))
+        sent = rec.requests[0]["questions"]["department"]["criteria"]
+        assert sent == {
+            "billing": "payment, invoice or refund questions",
+            "technical": "bug reports and how-to questions",
+            "sales": None,
+        }
+
+    def test_choice_criteria_for_an_undeclared_option_is_not_sent(self):
+        """A ``criteria`` key naming an option not in ``options`` is ignored, never
+        sent: the map is built from the option domain, so a stale key carries no text."""
+        q = Choice(
+            id="verdict",
+            prompt="?",
+            options=["A", "B"],
+            criteria={"A": "the first", "Z": "not an option"},
+        )
+        rec = _Recorder(
+            body=_ok_body(
+                {"verdict": {"type": "choice", "choice": "A", "probabilities": {"A": 1.0}}}
+            )
+        )
+        asyncio.run(_run(rec, [q]))
+        sent = rec.requests[0]["questions"]["verdict"]["criteria"]
+        assert sent == {"A": "the first", "B": None}
+        assert "Z" not in sent
+
+    def test_an_object_of_no_question_type_is_refused(self):
+        """The wire speaks the three question types; any other object is a caller bug."""
         from kiro_crew.decisions.impl_jev import _to_wire
 
         with pytest.raises(JevProtocolError, match="unsupported question type"):
@@ -243,10 +332,13 @@ class TestSuccessfulParse:
         assert answer.confidence is None
 
     def test_a_usage_block_is_read_past_rather_than_parsed(self):
-        """``ask`` answers with the answers alone -- no spend column to fill.
+        """``usage`` is read into the row metadata, never into the answers.
 
-        The wire still carries ``usage``; a body that omits it must parse exactly
-        the same, which is what says the field is not on the read path at all.
+        The wire carries ``usage``; a body that omits it must parse to the SAME
+        answers, which is what says the field is not on the answer path. What
+        changed is that the client now also records it as metadata (see
+        ``TestResponseMetadata``) -- the answers themselves are still the only
+        thing ``ask`` returns.
         """
         with_usage = _Recorder(body=_ok_body({"is_urgent": _yes(0.1)}, input_tokens=1900))
         without = _Recorder(body={"model": "jev-latest", "answers": {"is_urgent": _yes(0.1)}})
@@ -261,8 +353,195 @@ class TestSuccessfulParse:
 
 
 # ---------------------------------------------------------------------------
+# Response metadata: model, usage and request id, read off a successful call
+# ---------------------------------------------------------------------------
+
+
+class TestResponseMetadata:
+    """``last_response_meta`` carries the provider-stamped fields the gate logs.
+
+    The three fields make a timeout question answerable from the rows: ``model``
+    (``jev-latest`` is an alias that can move under a caller), token ``usage``, and
+    the ``x-typesafe-request-id`` support asks for. The metadata is never answers,
+    carries no conversation text, and is set only on a fully-valid response.
+    """
+
+    def test_model_usage_and_request_id_are_captured(self):
+        rec = _Recorder(
+            body=_ok_body({"is_urgent": _yes()}, input_tokens=312),
+            resp_headers={"x-typesafe-request-id": "req_abc123"},
+        )
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert oracle.last_response_meta == {
+            "provider_model": "jev-latest",
+            "input_tokens": 312,
+            "output_tokens": 48,
+            "request_id": "req_abc123",
+        }
+
+    def test_a_missing_request_id_header_is_simply_absent(self):
+        """No header, no key -- the metadata holds only what the provider stamped."""
+        rec = _Recorder(body=_ok_body({"is_urgent": _yes()}))
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert oracle.last_response_meta is not None
+        assert "request_id" not in oracle.last_response_meta
+        assert oracle.last_response_meta["provider_model"] == "jev-latest"
+
+    def test_a_body_without_model_or_usage_yields_none_when_no_header(self):
+        """A response that stamps nothing leaves the metadata ``None``, not an empty dict."""
+        rec = _Recorder(body={"answers": {"is_urgent": _yes()}})
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert oracle.last_response_meta is None
+
+    def test_metadata_is_not_set_when_the_response_fails_validation(self):
+        """``last_response_meta`` is assigned only after ``_from_wire`` accepts the
+        parse. A body that stamps a model but carries no ``answers`` object fails
+        validation, so the oracle keeps ``None`` and the gate's error row carries no
+        metadata -- without this, setting it before the parse turns no test red."""
+        rec = _Recorder(
+            body={"model": "jev-latest", "usage": {"input_tokens": 1}},
+            resp_headers={"x-typesafe-request-id": "req_should_not_be_kept"},
+        )
+
+        async def _go():
+            server = TestServer(rec.app(), host="127.0.0.1")
+            await server.start_server()
+            try:
+                provider = DecisionProviderConfig(
+                    endpoint=f"http://localhost:{server.port}/v1/systemone",
+                    api_key=VAULT_REF,
+                    model="jev-latest",
+                )
+                oracle = JevOracle(provider)
+                assert oracle.last_response_meta is None
+                with pytest.raises(JevProtocolError, match="no 'answers' object"):
+                    await oracle.ask("hi", [URGENT])
+                return oracle
+            finally:
+                await server.close()
+
+        oracle = asyncio.run(_go())
+        assert oracle.last_response_meta is None
+
+    def test_the_reported_model_can_differ_from_the_requested_alias(self):
+        """``jev-latest`` is an alias; the row records the concrete model answered with."""
+        rec = _Recorder(
+            body={
+                "model": "jev-1.13",
+                "answers": {"is_urgent": _yes()},
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+            resp_headers={"x-typesafe-request-id": "req_x"},
+        )
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT], model="jev-latest"))
+        assert oracle.last_response_meta["provider_model"] == "jev-1.13"
+
+    @pytest.mark.parametrize(
+        "usage",
+        [
+            {"input_tokens": -1, "output_tokens": 2},  # negative dropped
+            {"input_tokens": True, "output_tokens": 2},  # bool is not a count
+            {"input_tokens": 1.5, "output_tokens": 2},  # float is not a count
+            {"input_tokens": "10", "output_tokens": 2},  # string is not a count
+        ],
+    )
+    def test_a_malformed_token_count_is_dropped_not_written(self, usage):
+        rec = _Recorder(
+            body={"model": "jev-latest", "answers": {"is_urgent": _yes()}, "usage": usage}
+        )
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        meta = oracle.last_response_meta or {}
+        assert "input_tokens" not in meta
+        assert meta.get("output_tokens") == 2
+
+    def test_a_provider_model_string_is_bounded(self):
+        """A misbehaving provider cannot write an unbounded model field onto the row."""
+        from kiro_crew.decisions.impl_jev import _META_STR_MAX
+
+        rec = _Recorder(
+            body={"model": "m" * (_META_STR_MAX + 50), "answers": {"is_urgent": _yes()}}
+        )
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert len(oracle.last_response_meta["provider_model"]) == _META_STR_MAX
+
+
+# ---------------------------------------------------------------------------
 # Failures: each raises, so the gate can convert it into None + a logged reason
 # ---------------------------------------------------------------------------
+
+
+class TestLocalModelServer:
+    """A literal loopback endpoint is a local model server: it gets no credential."""
+
+    def test_no_authorization_header_is_sent(self, fake_vault):
+        fake_vault("sk-live-abc")
+        rec = _Recorder(body=_ok_body({"is_urgent": _yes()}))
+        answers = asyncio.run(_run(rec, [URGENT], host="127.0.0.1"))
+        assert answers["is_urgent"].value == "yes"
+        assert "Authorization" not in rec.headers[0]
+
+    def test_the_vault_is_never_read(self, monkeypatch):
+        """Not merely left out of the header: the key is never fetched at all."""
+        import kiro_crew.decisions.impl_jev as mod
+
+        def _boom(_raw):
+            raise AssertionError("the vault was read for a local server")
+
+        monkeypatch.setattr(mod, "resolve_api_key", _boom)
+        rec = _Recorder(body=_ok_body({"is_urgent": _yes()}))
+        asyncio.run(_run(rec, [URGENT], host="127.0.0.1"))
+        assert rec.requests, "the request still went out"
+
+    def test_no_key_is_not_a_refusal_locally(self):
+        rec = _Recorder(body=_ok_body({"is_urgent": _yes()}))
+        asyncio.run(_run(rec, [URGENT], host="127.0.0.1", api_key=""))
+        assert rec.requests
+
+    def test_the_name_localhost_still_needs_the_key(self):
+        """A name can resolve anywhere, so it is treated as a remote provider."""
+        rec = _Recorder(body=_ok_body({"is_urgent": _yes()}))
+        with pytest.raises(JevProtocolError, match="no api key"):
+            asyncio.run(_run(rec, [URGENT], host="localhost", api_key=""))
+        assert rec.requests == []
+
+    def test_a_hand_written_loopback_address_says_once_that_no_key_is_sent(
+        self, monkeypatch, caplog
+    ):
+        """A tunnel to hosted Jev would get 401s; the log names the withheld key, once."""
+        import kiro_crew.decisions.impl_jev as mod
+
+        monkeypatch.setattr(mod, "_keyless_loopback_warned", set())
+        mod._warn_keyless_custom_loopback("http://127.0.0.1:9001/v1/systemone", "jev-latest")
+        mod._warn_keyless_custom_loopback("http://127.0.0.1:9001/v1/systemone", "jev-latest")
+        hits = [r for r in caplog.records if "no Jev API key is sent" in r.getMessage()]
+        assert len(hits) == 1
+
+    def test_query_variants_of_one_address_warn_once_and_the_set_stays_bounded(
+        self, monkeypatch, caplog
+    ):
+        import kiro_crew.decisions.impl_jev as mod
+
+        monkeypatch.setattr(mod, "_keyless_loopback_warned", set())
+        for n in range(200):
+            mod._warn_keyless_custom_loopback(
+                f"http://127.0.0.1:9001/v1/systemone?n={n}", "jev-latest"
+            )
+        hits = [r for r in caplog.records if "no Jev API key is sent" in r.getMessage()]
+        assert len(hits) == 1
+        for port in range(9002, 9200):
+            mod._warn_keyless_custom_loopback(f"http://127.0.0.1:{port}/v1/systemone", "jev-latest")
+        assert len(mod._keyless_loopback_warned) <= mod._KEYLESS_WARNED_MAX
+
+    def test_a_local_preset_is_not_warned_about(self, monkeypatch, caplog):
+        import kiro_crew.decisions.impl_jev as mod
+        from kiro_crew.decisions import local_models
+
+        monkeypatch.setattr(mod, "_keyless_loopback_warned", set())
+        preset = local_models.LOCAL_MODELS[0]
+        mod._warn_keyless_custom_loopback(
+            local_models.endpoint_for(preset.default_port), preset.model
+        )
+        assert not [r for r in caplog.records if "no Jev API key is sent" in r.getMessage()]
 
 
 class TestFailures:
@@ -549,3 +828,519 @@ class TestProviderDefaults:
         from kiro_crew.decisions.impl_jev import _to_wire
 
         json.dumps(_to_wire("hi", "jev-latest", [CHOICE, URGENT]))
+
+
+# ---------------------------------------------------------------------------
+# Noul and Score: the provider's other two question types
+# ---------------------------------------------------------------------------
+
+IS_URGENT = Noul(
+    id="is_urgent",
+    prompt="Does this convey urgency?",
+    true_means="Explicitly time-sensitive",
+    false_means="No urgency expressed",
+)
+FRUSTRATION = Score(
+    id="frustration",
+    prompt="How frustrated is the customer?",
+    levels=["Calm", "Frustrated", "Very angry"],
+)
+
+
+def _score_body(score=1.05, probabilities=None, confidence=0.92):
+    return {
+        "type": "score",
+        "score": score,
+        "legend": {"0": "Calm", "1": "Frustrated", "2": "Very angry"},
+        "probabilities": (
+            {"0": 0.0, "1": 0.95, "2": 0.05} if probabilities is None else probabilities
+        ),
+        "confidence": confidence,
+    }
+
+
+class TestNoulAndScoreRequestShape:
+    def test_noul_and_score_go_out_in_the_documented_shape(self):
+        rec = _Recorder(
+            body=_ok_body(
+                {"is_urgent": {"type": "noul", "noul": 0.95}, "frustration": _score_body()}
+            )
+        )
+        asyncio.run(_run(rec, [IS_URGENT, FRUSTRATION]))
+        questions = rec.requests[0]["questions"]
+        assert questions["is_urgent"] == {
+            "type": "noul",
+            "instructions": IS_URGENT.prompt,
+            "criteria": {"true": "Explicitly time-sensitive", "false": "No urgency expressed"},
+        }
+        assert questions["frustration"] == {
+            "type": "score",
+            "instructions": FRUSTRATION.prompt,
+            "criteria": ["Calm", "Frustrated", "Very angry"],
+        }
+
+    def test_a_noul_with_no_rubric_sends_no_criteria(self):
+        """``criteria`` is optional for a Noul; an empty object is not sent in its place."""
+        wire = _to_wire("hi", "jev-latest", [Noul(id="n", prompt="Yes?")])
+        assert wire["questions"]["n"] == {"type": "noul", "instructions": "Yes?"}
+
+    def test_a_noul_with_one_side_sends_only_that_side(self):
+        wire = _to_wire("hi", "jev-latest", [Noul(id="n", prompt="Yes?", true_means="it is")])
+        assert wire["questions"]["n"]["criteria"] == {"true": "it is"}
+
+    @pytest.mark.parametrize("levels", [[], ["only"], [str(i) for i in range(11)]])
+    def test_a_score_outside_two_to_ten_levels_is_refused_before_sending(self, levels):
+        with pytest.raises(JevProtocolError, match="number of levels"):
+            _to_wire("hi", "jev-latest", [Score(id="s", prompt="?", levels=levels)])
+
+
+class TestNoulAndScoreParse:
+    def test_noul_value_is_the_probability_of_yes(self):
+        rec = _Recorder(body=_ok_body({"is_urgent": {"type": "noul", "noul": 0.2}}))
+        answer = asyncio.run(_run(rec, [IS_URGENT]))["is_urgent"]
+        assert answer.value == pytest.approx(0.2)
+        assert answer.p == pytest.approx(0.8), "p is the more likely side's probability"
+        assert answer.confidence is None
+
+    def test_score_value_is_the_weighted_level_and_p_the_likeliest_level(self):
+        rec = _Recorder(body=_ok_body({"frustration": _score_body()}))
+        answer = asyncio.run(_run(rec, [FRUSTRATION]))["frustration"]
+        assert answer.value == pytest.approx(1.05)
+        assert answer.p == pytest.approx(0.95)
+        assert answer.confidence == pytest.approx(0.92)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"type": "choice", "choice": "yes", "probabilities": {"yes": 1.0}},
+            {"type": "noul"},
+            {"type": "noul", "noul": 1.5},
+            {"type": "noul", "noul": -0.1},
+            {"type": "noul", "noul": True},
+            {"type": "noul", "noul": "0.9"},
+            {"type": "noul", "noul": float("nan")},
+        ],
+        ids=["wrong-type", "missing", "above-1", "below-0", "bool", "string", "nan"],
+    )
+    def test_a_malformed_noul_answer_raises(self, raw):
+        rec = _Recorder(raw=json.dumps(_ok_body({"is_urgent": raw}), allow_nan=True))
+        with pytest.raises(JevProtocolError):
+            asyncio.run(_run(rec, [IS_URGENT]))
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            {"type": "noul", "noul": 0.5},
+            _score_body(score=2.5),
+            _score_body(score=-0.1),
+            _score_body(score=True),
+            _score_body(probabilities={}),
+            _score_body(probabilities={"3": 1.0}),
+            _score_body(probabilities={"0": 1.2}),
+            {k: v for k, v in _score_body().items() if k != "probabilities"},
+        ],
+        ids=[
+            "wrong-type",
+            "above-top-level",
+            "below-0",
+            "bool",
+            "empty-distribution",
+            "unknown-level",
+            "probability-above-1",
+            "no-probabilities",
+        ],
+    )
+    def test_a_malformed_score_answer_raises(self, raw):
+        rec = _Recorder(body=_ok_body({"frustration": raw}))
+        with pytest.raises(JevProtocolError):
+            asyncio.run(_run(rec, [FRUSTRATION]))
+
+    def test_a_partial_response_across_types_raises(self):
+        """One answer missing from a mixed request is a failure, never a partial result."""
+        rec = _Recorder(body=_ok_body({"is_urgent": {"type": "noul", "noul": 0.9}}))
+        with pytest.raises(JevProtocolError, match="no answer for question"):
+            asyncio.run(_run(rec, [IS_URGENT, FRUSTRATION, CHOICE]))
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare Workers AI envelope (Clef)
+# ---------------------------------------------------------------------------
+
+
+def _cf_envelope(answers, *, success=True, model="clef-flash"):
+    """The body Cloudflare's REST endpoint returns around a System One response."""
+    return {
+        "result": {"model": model, "answers": answers, "usage": {"input_tokens": 312}},
+        "success": success,
+        "errors": [],
+        "messages": [],
+    }
+
+
+class TestCloudflareEnvelope:
+    def test_a_wrapped_success_parses_like_the_unwrapped_shape(self):
+        rec = _Recorder(body=_cf_envelope({"is_urgent": _yes(0.92)}))
+        answer = asyncio.run(_run(rec, [URGENT], model="clef-flash"))["is_urgent"]
+        assert answer.value == "yes"
+        assert answer.p == pytest.approx(0.92)
+        assert rec.requests[0]["model"] == "clef-flash", "the model id goes out unchanged"
+
+    @pytest.mark.parametrize("top_answers", ["absent", None, [], "invalid"])
+    def test_wrapped_metadata_comes_from_the_answer_object(self, top_answers):
+        body = _cf_envelope({"is_urgent": _yes(0.92)})
+        if top_answers != "absent":
+            body["answers"] = top_answers
+        body.update(model="outer-model", usage={"input_tokens": 999})
+        body["result"]["usage"]["output_tokens"] = 48
+        rec = _Recorder(body=body, resp_headers={"x-typesafe-request-id": "req_wrapped"})
+        answers, oracle = asyncio.run(_run_oracle(rec, [URGENT], model="clef-flash"))
+        assert answers["is_urgent"].p == pytest.approx(0.92)
+        assert oracle.last_response_meta == {
+            "provider_model": "clef-flash",
+            "input_tokens": 312,
+            "output_tokens": 48,
+            "request_id": "req_wrapped",
+        }
+
+    @pytest.mark.parametrize("header", [False, True])
+    def test_missing_wrapped_metadata_never_falls_back_to_outer_fields(self, header):
+        body = _cf_envelope({"is_urgent": _yes()})
+        body["result"] = {"answers": body["result"]["answers"]}
+        body.update(model="outer-model", usage={"input_tokens": 999})
+        rec = _Recorder(
+            body=body, resp_headers={"x-typesafe-request-id": "req_only"} if header else {}
+        )
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert oracle.last_response_meta == ({"request_id": "req_only"} if header else None)
+
+    def test_wrapped_metadata_keeps_the_same_bounds_and_filters(self):
+        body = _cf_envelope({"is_urgent": _yes()}, model="m" * (impl_jev._META_STR_MAX + 1))
+        body["result"]["usage"] = {"input_tokens": True, "output_tokens": 2}
+        body["result"]["state"] = "secret-state"
+        rec = _Recorder(body=body)
+        _answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert oracle.last_response_meta == {
+            "provider_model": "m" * impl_jev._META_STR_MAX,
+            "output_tokens": 2,
+        }
+
+    def test_a_wrapped_mixed_request_parses_every_type(self):
+        answers = {
+            "department": {
+                "type": "choice",
+                "choice": "billing",
+                "probabilities": {"billing": 0.8, "technical": 0.1, "sales": 0.1},
+            },
+            "frustration": _score_body(),
+            "is_urgent": {"type": "noul", "noul": 0.25},
+        }
+        rec = _Recorder(body=_cf_envelope(answers))
+        got = asyncio.run(_run(rec, [CHOICE, FRUSTRATION, IS_URGENT], model="clef"))
+        assert got["department"].value == "billing"
+        assert got["frustration"].value == pytest.approx(1.05)
+        assert got["is_urgent"].value == pytest.approx(0.25)
+        assert got["is_urgent"].p == pytest.approx(0.75)
+
+    def test_a_failed_envelope_never_echoes_provider_text(self):
+        body = {
+            "result": None,
+            "success": False,
+            "errors": [{"code": 10000, "message": "secret-state-echo"}],
+            "messages": [],
+        }
+        rec = _Recorder(body=body)
+        with pytest.raises(JevProtocolError) as caught:
+            asyncio.run(_run(rec, [URGENT], model="clef-flash"))
+        assert "secret-state-echo" not in str(caught.value)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"result": {"model": "clef-flash"}, "success": True},
+            {"result": {"answers": []}, "success": True},
+            {"result": {"answers": None}, "success": True},
+            {"result": [], "success": True},
+            {"result": "x", "success": True},
+            {"success": True},
+        ],
+        ids=[
+            "no-answers",
+            "answers-list",
+            "answers-null",
+            "result-list",
+            "result-str",
+            "no-result",
+        ],
+    )
+    def test_an_envelope_without_an_answers_object_is_refused(self, body):
+        rec = _Recorder(body=body)
+        with pytest.raises(JevProtocolError, match="no 'answers' object"):
+            asyncio.run(_run(rec, [URGENT], model="clef-flash"))
+
+    def test_the_unwrapped_jev_shape_is_unchanged(self):
+        rec = _Recorder(body=_ok_body({"is_urgent": _yes(0.4)}))
+        assert asyncio.run(_run(rec, [URGENT]))["is_urgent"].p == pytest.approx(0.4)
+
+    def test_a_top_level_answers_object_wins_over_a_result_sibling(self):
+        """Jev's own shape is read first, so a stray ``result`` key cannot redirect it."""
+        body = _ok_body({"is_urgent": _yes(0.4)})
+        body["result"] = {
+            "answers": {"is_urgent": _yes(0.99)},
+            "model": "other-model",
+            "usage": {"input_tokens": 999},
+        }
+        body["success"] = False
+        rec = _Recorder(body=body)
+        answers, oracle = asyncio.run(_run_oracle(rec, [URGENT]))
+        assert answers["is_urgent"].p == pytest.approx(0.4)
+        assert oracle.last_response_meta == {
+            "provider_model": "jev-latest",
+            "input_tokens": 312,
+            "output_tokens": 48,
+        }
+
+    def test_answers_are_still_validated_strictly_inside_the_envelope(self):
+        rec = _Recorder(body=_cf_envelope({"is_urgent": {"type": "noul", "noul": 0.9}}))
+        with pytest.raises(JevProtocolError, match="type does not match"):
+            asyncio.run(_run(rec, [URGENT], model="clef-flash"))
+
+    def test_an_unanswered_question_inside_the_envelope_is_still_a_failure(self):
+        rec = _Recorder(body=_cf_envelope({"is_urgent": _yes(0.5)}))
+        with pytest.raises(JevProtocolError, match="no answer for question"):
+            asyncio.run(_run(rec, [URGENT, CHOICE], model="clef-flash"))
+
+    @pytest.mark.parametrize("model", ["clef", "clef-flash"])
+    def test_the_clef_model_ids_are_valid_wire_model_ids(self, model):
+        from kiro_crew.decisions.types import is_model_id
+
+        assert is_model_id(model)
+        assert _to_wire("hi", model, [URGENT])["model"] == model
+
+
+# ---------------------------------------------------------------------------
+# Connection reuse: one keep-alive session per loop, shared by every oracle
+# ---------------------------------------------------------------------------
+
+
+class _PeerRecorder(_Recorder):
+    """A :class:`_Recorder` that also notes which client socket sent each request."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.peers: list[tuple] = []
+        self.cookies: list[str | None] = []
+        self.set_cookie = False
+
+    async def handle(self, request: web.Request) -> web.Response:
+        self.peers.append(request.transport.get_extra_info("peername"))
+        self.cookies.append(request.headers.get("Cookie"))
+        response = await super().handle(request)
+        if self.set_cookie:
+            response.set_cookie("session", "abc")
+        return response
+
+
+class _Serving:
+    """Serve *recorder* on loopback for several asks made inside ONE running loop."""
+
+    def __init__(self, recorder: _Recorder):
+        self.recorder = recorder
+        self.server = TestServer(recorder.app(), host="127.0.0.1")
+
+    async def __aenter__(self):
+        await self.server.start_server()
+        return self
+
+    async def __aexit__(self, *exc):
+        await close_sessions()
+        await self.server.close()
+
+    def oracle(self, *, timeout_ms=5000, model="jev-latest", api_key=VAULT_REF):
+        provider = DecisionProviderConfig(
+            endpoint=f"http://localhost:{self.server.port}/v1/systemone",
+            api_key=api_key,
+            model=model,
+            timeout_ms=timeout_ms,
+        )
+        return JevOracle(provider)
+
+
+def _ok(p=0.9):
+    return _Recorder(body=_ok_body({"is_urgent": _yes(p)}))
+
+
+class TestConnectionReuse:
+    def test_two_asks_share_one_session_connector_and_socket(self):
+        async def scenario():
+            rec = _PeerRecorder(body=_ok_body({"is_urgent": _yes()}))
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                first = impl_jev._session_for_running_loop()
+                connector = first.connector
+                await serving.oracle().ask("hi", [URGENT])
+                second = impl_jev._session_for_running_loop()
+                same_connector = second.connector is connector
+                return rec, first, second, same_connector
+
+        rec, first, second, same_connector = asyncio.run(scenario())
+        assert first is second, "a new oracle per decision must not mean a new session"
+        assert same_connector
+        assert len(rec.peers) == 2
+        assert rec.peers[0] == rec.peers[1], "both requests must ride one TCP connection"
+
+    def test_a_closed_session_is_recreated_and_works(self):
+        async def scenario():
+            rec = _ok()
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                first = impl_jev._session_for_running_loop()
+                await first.close()
+                answers = await serving.oracle().ask("hi", [URGENT])
+                second = impl_jev._session_for_running_loop()
+                return first, second, second.closed, answers
+
+        first, second, second_closed, answers = asyncio.run(scenario())
+        assert second is not first
+        assert not second_closed
+        assert answers["is_urgent"].p == pytest.approx(0.9)
+
+    def test_a_new_event_loop_gets_its_own_session_and_the_dead_one_is_dropped(self):
+        async def grab():
+            rec = _ok()
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                session = impl_jev._session_for_running_loop()
+            # ``_Serving`` closed it; keep an open one on this loop to be left behind.
+            left = impl_jev._session_for_running_loop()
+            return session, left
+
+        _, left = asyncio.run(grab())
+        rec = _ok()
+
+        async def later():
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                return impl_jev._session_for_running_loop(), len(impl_jev._sessions)
+
+        fresh, held = asyncio.run(later())
+        assert fresh is not left
+        assert held == 1, "the session of the closed loop is dropped, not kept forever"
+
+    def test_close_sessions_closes_and_forgets_them(self):
+        async def scenario():
+            rec = _ok()
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                session = impl_jev._session_for_running_loop()
+                await close_sessions()
+                await close_sessions()  # idempotent, nothing open
+                return session, dict(impl_jev._sessions)
+
+        session, held = asyncio.run(scenario())
+        assert session.closed
+        assert held == {}
+
+    def test_the_timeout_is_per_request_and_does_not_poison_the_session(self):
+        async def scenario():
+            rec = _Recorder(body=_ok_body({"is_urgent": _yes(0.2)}), delay=0.4)
+            async with _Serving(rec) as serving:
+                with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+                    await serving.oracle(timeout_ms=100).ask("hi", [URGENT])
+                session = impl_jev._session_for_running_loop()
+                # A later call with a larger budget succeeds on the SAME session: the
+                # 100 ms of the call before it was not inherited.
+                answers = await serving.oracle(timeout_ms=5000).ask("hi", [URGENT])
+                # And the short budget is still enforced on the reused session.
+                with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+                    await serving.oracle(timeout_ms=100).ask("hi", [URGENT])
+                after = impl_jev._session_for_running_loop()
+                return session, after, after.closed, answers
+
+        before, after, after_closed, answers = asyncio.run(scenario())
+        assert before is after and not after_closed
+        assert answers["is_urgent"].p == pytest.approx(0.2)
+
+    def test_a_redirect_is_still_refused_on_a_reused_session(self):
+        followed: list[str] = []
+
+        async def _sink(request: web.Request) -> web.Response:
+            followed.append(request.path)
+            return web.json_response(_ok_body({"is_urgent": _yes()}))
+
+        class _Flaky(_Recorder):
+            redirect = False
+
+            def app(self) -> web.Application:
+                app = super().app()
+                app.router.add_post("/elsewhere", _sink)
+                return app
+
+            async def handle(self, request: web.Request) -> web.Response:
+                if self.redirect:
+                    return web.Response(status=307, headers={"Location": "/elsewhere"})
+                return await super().handle(request)
+
+        async def scenario():
+            rec = _Flaky(body=_ok_body({"is_urgent": _yes()}))
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                rec.redirect = True
+                with pytest.raises(JevHttpError) as caught:
+                    await serving.oracle().ask("hi", [URGENT])
+                rec.redirect = False
+                await serving.oracle().ask("hi", [URGENT])  # still usable afterwards
+                return str(caught.value)
+
+        assert "307" in asyncio.run(scenario())
+        assert followed == []
+
+    def test_an_oversized_body_is_still_refused_and_the_session_survives(self):
+        from kiro_crew.decisions.impl_jev import _MAX_RESPONSE_BYTES
+
+        class _Big(_Recorder):
+            big = True
+
+            async def handle(self, request: web.Request) -> web.Response:
+                if self.big:
+                    return web.Response(
+                        body=b" " * (_MAX_RESPONSE_BYTES + 1), content_type="application/json"
+                    )
+                return await super().handle(request)
+
+        async def scenario():
+            rec = _Big(body=_ok_body({"is_urgent": _yes()}))
+            async with _Serving(rec) as serving:
+                with pytest.raises(JevProtocolError, match="exceeded"):
+                    await serving.oracle().ask("hi", [URGENT])
+                rec.big = False
+                return await serving.oracle().ask("hi", [URGENT])
+
+        assert asyncio.run(scenario())["is_urgent"].value == "yes"
+
+    def test_a_cookie_the_provider_sets_is_never_replayed(self):
+        async def scenario():
+            rec = _PeerRecorder(body=_ok_body({"is_urgent": _yes()}))
+            rec.set_cookie = True
+            async with _Serving(rec) as serving:
+                await serving.oracle().ask("hi", [URGENT])
+                await serving.oracle().ask("hi", [URGENT])
+                return rec
+
+        rec = asyncio.run(scenario())
+        assert rec.cookies == [None, None]
+
+    def test_each_request_carries_the_key_it_resolved_not_a_stale_one(self, fake_vault):
+        async def scenario():
+            rec = _Recorder(body=_ok_body({"is_urgent": _yes()}))
+            async with _Serving(rec) as serving:
+                fake_vault("key-one")
+                await serving.oracle().ask("hi", [URGENT])
+                fake_vault("key-two")
+                await serving.oracle().ask("hi", [URGENT])
+                return rec
+
+        rec = asyncio.run(scenario())
+        assert [h.get("Authorization") for h in rec.headers] == [
+            "Bearer key-one",
+            "Bearer key-two",
+        ]

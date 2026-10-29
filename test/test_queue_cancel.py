@@ -234,3 +234,103 @@ class TestQueueCancelEndpoint:
         assert len(queued_msgs) == 1
         cls = json.loads(queued_msgs[0].get("cls", "{}"))
         assert cls.get("queue_id") == id1
+
+
+# ── Attachment lists ride the slot-detail queue and the queue_push frame ──
+
+# `[attached_file 1]` is `files[0]`: the path has a space, which is exactly the
+# shape a client cannot recover from the marker text alone.
+_SPACED = "/Users/me/Desktop/My Report.pdf"
+_WIRE = f"summarize this\n[attached_file 1] {_SPACED}"
+
+
+def _detail_app(state):
+    from chat_test_helpers import _make_app
+
+    return _make_app(state)
+
+
+class TestQueueEntryAttachmentsAreEchoed:
+    @pytest.mark.asyncio
+    async def test_slot_detail_queue_items_carry_the_lists(self, tmp_path):
+        """GET slot detail echoes each entry's lists beside its id and content."""
+        from chat_test_helpers import _make_state as _make_detail_state
+
+        state = _make_detail_state(tmp_path)
+        state.push_slots_update = lambda: None
+        slot = _ChatSlot(key="chat-1")
+        slot.messages = [{"role": "user", "content": "hi"}]
+        state._slots["chat-1"] = slot
+        with_meta = slot.queue_append(_WIRE, meta={"files": [_SPACED], "sendId": "s-1"})
+        bare = slot.queue_append("no attachments")
+
+        async with TestClient(TestServer(_detail_app(state))) as client:
+            resp = await client.get("/api/chat/slots/chat-1")
+            assert resp.status == 200
+            body = await resp.json()
+
+        assert body["queue"] == [
+            {"id": with_meta, "content": _WIRE, "meta": {"sendId": "s-1", "files": [_SPACED]}},
+            {"id": bare, "content": "no attachments"},
+        ]
+
+    def test_queue_entry_view_redacts_a_path_like_the_content(self):
+        """A credential in a path is scrubbed the same way it is in the text."""
+        from kiro_crew.dashboard.chat_delivery import queue_entry_view
+
+        secret_path = "/tmp/AKIAIOSFODNN7EXAMPLE/report.pdf"
+        view = queue_entry_view(
+            {
+                "id": "q1",
+                "content": f"see\n[attached_file 1] {secret_path}",
+                "meta": {"files": [secret_path]},
+            }
+        )
+        assert "AKIAIOSFODNN7EXAMPLE" not in view["content"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in view["meta"]["files"][0]
+        # Same redaction on both, so `[attached_file 1]` still equals `files[0]`.
+        assert view["content"].endswith(view["meta"]["files"][0])
+
+    def test_queue_for_next_turn_push_frame_carries_the_lists(self):
+        """The busy-slot `queue_push` frame names the lists the entry got."""
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state()
+        slot = state.get_or_create_slot("chat-1")
+        state.broadcast_ws = MagicMock()
+        with (
+            patch("kiro_crew.dashboard.session_control.containment_meta", return_value={}),
+            patch("kiro_crew.dashboard.chat_delivery.start_queue_persist"),
+        ):
+            qid = queue_for_next_turn(state, slot, _WIRE, attachments={"files": [_SPACED]})
+        frame = next(
+            payload
+            for kind, payload in (c.args for c in state.broadcast_ws.call_args_list)
+            if kind == "queue_push"
+        )
+        assert frame == {
+            "slot": "chat-1",
+            "content": _WIRE,
+            "ts": frame["ts"],
+            "queue_id": qid,
+            "meta": {"files": [_SPACED]},
+        }
+
+    def test_queue_for_next_turn_push_frame_without_lists_is_unchanged(self):
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state()
+        slot = state.get_or_create_slot("chat-1")
+        state.broadcast_ws = MagicMock()
+        with (
+            patch("kiro_crew.dashboard.session_control.containment_meta", return_value={}),
+            patch("kiro_crew.dashboard.chat_delivery.start_queue_persist"),
+        ):
+            qid = queue_for_next_turn(state, slot, "plain")
+        frame = next(
+            payload
+            for kind, payload in (c.args for c in state.broadcast_ws.call_args_list)
+            if kind == "queue_push"
+        )
+        assert set(frame) == {"slot", "content", "ts", "queue_id"}
+        assert frame["queue_id"] == qid

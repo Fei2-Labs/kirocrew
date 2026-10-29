@@ -18,11 +18,13 @@ key:
 | `label` | English label the panel renders |
 | `tab` | Settings tab the control lives on, e.g. `display` |
 | `route` | The finished link that opens and flashes the control |
-| `description` | The in-panel help text, when the control has one |
+| `description` | Help text the row shows on screen, when it has any |
+| `hint` | Help text behind the row's info tip, when it has any; not shown on the row |
 | `configKey` | The config key the control writes, when it maps to exactly one |
 
-Many controls carry no `description`, so treat it as a bonus signal and never as
-a required field.
+Many controls carry no `description` or `hint`, so treat them as bonus signals and
+never as required fields. Quote only `description` as text the row displays: a
+`hint` sits behind the row's info tip, so tell the user to open the tip for it.
 
 ## Using a route
 
@@ -31,7 +33,7 @@ highlight parameter — so there is nothing to assemble and nothing to guess. Fo
 the "Highlight recent sessions" entry, the route is:
 
 ```
-/settings/display?highlight=display.highlight-recent-sessions
+/settings/display/sidebar?highlight=display.highlight-recent-sessions
 ```
 
 Present it as a link labelled with the control name — a markdown link whose
@@ -47,16 +49,23 @@ shipped prebuilt rather than described:
   lands on an empty tab and highlights nothing.
 - **`%3A` in a route is an encoded `:`** and belongs there. Leave it alone.
 
+A control that sits inside a collapsed group on its tab still works: the link
+opens that group on the way in, because the highlight is resolved by finding the
+control on the page and a collapsed group renders none of its rows at all. Only
+the group holding the control opens — other collapsed groups on the same tab are
+left as they were, including one nested inside it — and it stays open afterwards
+rather than closing again the moment the highlight lands.
+
 A route is a dashboard path, so it is clickable only where a dashboard path
 resolves. On a chat channel (Slack, Telegram, Teams, …) prefix it with the
-gateway's own address — `http://localhost:5476/settings/display?highlight=…` for
+gateway's own address — `http://localhost:5476/settings/display/sidebar?highlight=…` for
 a default local install — or name the tab and the control in words if you do not
 know the address.
 
 ## Matching a request to a control
 
 A user describes a setting the way it reads on screen, not the way it is keyed.
-Match their phrasing against `label` first, then `description`, and prefer the
+Match their phrasing against `label` first, then `description` and `hint`, and prefer the
 entry whose `tab` fits what they were talking about — "the sidebar looks wrong"
 points at `display` long before it points at `chat`.
 
@@ -88,7 +97,7 @@ second form meeting a translated dashboard, not a stale registry.
 - Controls whose label is computed at runtime rather than written in the panel.
   They are skipped by generation, so a control missing from the file is not
   necessarily missing from the UI.
-- Everything outside Settings — the Developer page, Agent Capabilities, and the
+- Everything outside Settings — the Developer page, Customize, and the
   App Store each have their own routes and are not enumerated here.
 - Config keys with no control at all. Those are set in `config.json` or with
   `kirocrew config`; see [configuration.md](configuration.md).

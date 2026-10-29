@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import api_file_search
 
@@ -18,8 +19,11 @@ def _make_app() -> web.Application:
     # api_file_search reads app["state"].file_indexes for the index fast path
     state = MagicMock()
     state.file_indexes.get.return_value = None  # no index → always use walk fallback
+    # A MagicMock attribute reads as a non-empty configured owner id, which no
+    # caller can equal, so the owner gate would answer every row alike.
+    state.owner_id = ""
     app["state"] = state
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture()
@@ -180,6 +184,8 @@ class TestFileSearch:
                 assert resp.status == 403
                 data = await resp.json()
                 assert data["error"] == "Access denied"
+                # The UI keys per-cause copy on `code`, never on the human string.
+                assert data["code"] == "access_denied"
 
     @pytest.mark.asyncio
     async def test_path_match_ranked_below_name_match(self, tmp_path, mock_sel):
@@ -207,6 +213,7 @@ class TestFileSearch:
             assert resp.status == 404
             data = await resp.json()
             assert data["error"] == "Project directory not found"
+            assert data["code"] == "project_not_found"
             assert data["results"] == []
 
     @pytest.mark.asyncio
@@ -302,3 +309,39 @@ class TestFileSearch:
             for bad in ("-5", "0"):
                 resp = await client.get(f"/api/file-search?q=match&project={tmp_path}&limit={bad}")
                 assert len((await resp.json())["results"]) == 1, bad
+
+
+class TestFolderScopedSearchReachesWhatTheProjectPageMisses:
+    """Why the Files rail sends a cut folder to its folder tab ("Open in folder tab").
+
+    The rail's project-wide search answers one ranked page (it asks for 50). Inside a
+    folder too big to list, a match that ranks below that page is never shown by it;
+    the folder tab's search, rooted at that folder, reaches it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_match_below_the_project_page_is_found_by_the_folder_search(
+        self, tmp_path, mock_sel
+    ):
+        busy = tmp_path / "aaa"
+        busy.mkdir()
+        for i in range(60):
+            (busy / f"billing{i}.ts").write_text("x")
+        deep = tmp_path / "huge" / "zz"
+        deep.mkdir(parents=True)
+        (deep / "billing_report_quarterly_final_v2.ts").write_text("x")
+
+        async with TestClient(TestServer(_make_app())) as client:
+            project = await client.get(
+                "/api/file-search", params={"q": "billing", "project": str(tmp_path), "limit": "50"}
+            )
+            scoped = await client.get(
+                "/api/file-search",
+                params={"q": "billing", "project": str(tmp_path / "huge"), "limit": "50"},
+            )
+            project_names = {r["name"] for r in (await project.json())["results"]}
+            scoped_names = {r["name"] for r in (await scoped.json())["results"]}
+
+        assert len(project_names) == 50
+        assert "billing_report_quarterly_final_v2.ts" not in project_names
+        assert "billing_report_quarterly_final_v2.ts" in scoped_names

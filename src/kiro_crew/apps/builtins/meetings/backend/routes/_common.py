@@ -5,6 +5,8 @@ Holds the pieces every handler needs and nothing route-specific:
 * :func:`require_enabled` — the deny-by-default authorization decorator. The app
   is ``defaultEnabled: false`` and routes are registered once at gateway
   startup, so without this a disabled app would stay callable.
+* :func:`require_owner` — the dashboard-owner gate for the write routes that
+  change a meeting or drive its agents, in the shape ``/import`` uses.
 * :func:`json_body` / the ``field_*`` helpers — input validation. Every value
   that reaches the filesystem or a model prompt goes through one of these.
 * :data:`ACTIVE` — the single active meeting (``MAX_CONCURRENT_MEETINGS == 1``).
@@ -30,6 +32,7 @@ from kiro_crew.apps.builtins.meetings.backend.domain.session import (
     end_meeting_meta,
 )
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.hooks import get_global_hook_store  # noqa: F401  (re-export for handlers)
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact
@@ -281,6 +284,37 @@ def require_enabled(handler: Handler) -> Handler:
     return _wrapped
 
 
+def require_owner(operation: str) -> Callable[[Handler], Handler]:
+    """Refuse *handler* to every caller but the dashboard owner.
+
+    The same gate ``audio_import.handle_import_audio`` runs inline: the shared
+    ``is_owner_dashboard_request`` predicate, the shared ``_owner_denial_response``
+    with the ``dashboard_owner_required`` code, and a SEL record for BOTH the
+    denial and the allow. A non-owner dashboard subject and any app token are
+    refused before the body is read, so neither the store nor an agent is reached.
+    """
+
+    def _decorate(handler: Handler) -> Handler:
+        @wraps(handler)
+        async def _wrapped(request: web.Request) -> web.StreamResponse:
+            if not is_owner_dashboard_request(request):
+                audit(operation, f"{request.path} reason:non-owner", outcome="denied")
+                # Imported here, not at module top: ``_shared`` pulls in the
+                # dashboard handler surface (``audio_import`` resolves it the same
+                # way for the same reason).
+                from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+
+                return _owner_denial_response(
+                    request, "dashboard owner required", "dashboard_owner_required"
+                )
+            audit(operation, f"{request.path} owner-check", outcome="allowed")
+            return await handler(request)
+
+        return _wrapped
+
+    return _decorate
+
+
 def audit(operation: str, resource: str, *, outcome: str, error: str = "") -> None:
     """SEL-audit an app-level decision. Never raises."""
     try:
@@ -320,10 +354,10 @@ async def json_body(
     A non-object body (list, string, number) is rejected rather than coerced —
     every handler indexes the result by key, so a list would surface as a 500.
 
-    *max_bytes* exists for the ONE route whose body is a whole document rather than
-    a short field (the minutes edit; see
-    :data:`constants.MAX_MINUTES_BODY_BYTES` for the arithmetic). Raising it per
-    route rather than raising the default keeps every other body small.
+    *max_bytes* exists for the routes whose bodies contain whole documents rather
+    than short fields (the minutes and personal-note edits; see their constants for
+    the byte-limit arithmetic). Raising it per route rather than raising the default
+    keeps every other JSON body small.
     """
     if request.content_length is not None and request.content_length > max_bytes:
         raise BadRequest("request body is too large", status=413)
@@ -451,6 +485,12 @@ def error_response(exc: Exception) -> web.Response:
     # traversal). Not 503 — no configuration change or retry will make it work.
     if exc.status == HTTPStatus.NOT_IMPLEMENTED:
         return web.json_response({"error": str(exc), "code": exc.code}, status=501)
+    # 500: the request was fine and OUR side failed — the note read that cannot be
+    # reported as an empty note, because the client would overwrite it. Without this
+    # branch the fall-through answered 400, which tells the user to fix a request
+    # that had nothing wrong with it.
+    if exc.status == HTTPStatus.INTERNAL_SERVER_ERROR:
+        return web.json_response({"error": str(exc), "code": exc.code}, status=500)
     return web.json_response({"error": str(exc), "code": exc.code}, status=400)
 
 
@@ -675,9 +715,9 @@ def sessions_of(request: web.Request) -> Any:
 def hooks_of(request: web.Request) -> Any:
     """The gateway's HookManager, so agent turns traverse the PreToolUse gate.
 
-    ``context_builder.hooks`` is where the dashboard chat path reads it from
-    (``chat_runner.py``). When it is absent (a bare test app), None makes
-    ``stream_and_collect`` fall back to its always-enforced deny checks, which
+    ``context_builder.hooks`` is where the dashboard chat path reads it from: the permission
+    phase ``_on_permission_request`` (``chat_turn/tool_approval.py``). When it is absent (a bare
+    test app), None makes ``stream_and_collect`` fall back to its always-enforced deny checks, which
     still cover deny patterns and sensitive paths.
     """
     state = request.app.get("state")

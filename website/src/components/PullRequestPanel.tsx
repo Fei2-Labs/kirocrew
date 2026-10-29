@@ -30,14 +30,15 @@ import type {
   PullRequestStatusBatch,
 } from '../types'
 import {
+  findSourceForUrl,
   MAX_PULL_REQUEST_SOURCES,
+  sourceLinkKey,
   type PullRequestLink,
 } from '../utils/pullRequestLinks'
 import { sourceProviderMeta, sourceTabQualifier } from '../utils/sourceProviderMeta'
 import CopyBranchButton from './CopyBranchButton'
 import { PierrePatch } from '../pierre'
-import GithubLogo from './icons/GithubLogo'
-import GitlabLogo from './icons/GitlabLogo'
+import SourceProviderMark from './SourceProviderMark'
 import { timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from './MarkdownRenderer'
 import CommentThreads from './CommentThreads'
@@ -45,8 +46,7 @@ import { Btn } from './ui'
 
 
 import { i18nT } from '../i18n/t'
-import { OWNER_SETTINGS_TARGET, pullRequestErrorDetails } from '../utils/pullRequestErrors'
-import { SettingsLink } from './SettingsLink'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
 const CHECK_POLL_BASE_MS = 10_000
 const CHECK_POLL_MAX_MS = 60_000
@@ -221,6 +221,31 @@ export function pullRequestMergeBlocker(source: PullRequestSource): PullRequestM
     }
   }
   if (source.mergeStateStatus === 'blocked') {
+    // GitHub reports `blocked` while required checks are still running, which
+    // the generic branch-protection copy cannot distinguish from a missing
+    // approval. Say checks are still running when any are, and lead with the
+    // failure when one has already failed, so a red check is never hidden
+    // behind "still running". Only GitHub gets this copy: GitLab reports a
+    // merge-gating running pipeline as `unstable`, so a GitLab `blocked` with
+    // jobs running is blocked by something else (approvals, open discussions)
+    // and keeps the generic copy, as does every other provider.
+    const checks = source.provider === 'github' ? source.checks || [] : []
+    const running = checks.filter(checkInFlight).length
+    const failed = checks.filter(check => check.bucket === 'failed').length
+    if (running > 0 && failed > 0) {
+      return {
+        tone: 'danger',
+        title: i18nT('components.pullRequestPanel.checks_failed_others_still_running'),
+        detail: i18nT('components.pullRequestPanel.checks_failed_still_running_detail', { failed, running, total: checks.length }),
+      }
+    }
+    if (running > 0) {
+      return {
+        tone: 'warn',
+        title: i18nT('components.pullRequestPanel.merge_blocked'),
+        detail: i18nT('components.pullRequestPanel.waiting_on_checks_detail'),
+      }
+    }
     return {
       tone: 'warn',
       title: i18nT('components.pullRequestPanel.merge_blocked'),
@@ -233,7 +258,7 @@ export function pullRequestMergeBlocker(source: PullRequestSource): PullRequestM
 function stateTone(source: PullRequestSource): string {
   const state = source.state.toLowerCase()
   if (source.mergedAt || state === 'merged') return 'bg-aim/15 text-aim'
-  if (state === 'open' || state === 'opened') return 'bg-ok/15 text-ok'
+  if (state === 'open' || state === 'opened') return 'bg-ok/15 text-ok-text'
   return 'bg-bg-hover text-muted'
 }
 
@@ -277,6 +302,13 @@ export function pullRequestCiSignal(
   if (checks.some(check => check.bucket === 'failed')) return 'failed'
   if (checks.some(check => check.bucket === 'pending')) return 'running'
   return 'passed'
+}
+
+/** Whether one check is still running: bucketed `pending` and not a manual
+ * gate. A GitLab required manual job is bucketed `pending` with status
+ * `MANUAL`; it waits on a person, so it is never "running". */
+export function checkInFlight(check: PullRequestCheck): boolean {
+  return check.bucket === 'pending' && (check.status || '').toUpperCase() !== 'MANUAL'
 }
 
 /** A merge field the provider actually answered, or undefined.
@@ -371,6 +403,22 @@ const CI_LABEL_KEY: Record<NonNullable<PullRequestStatus['ci']>, string> = {
   failed: 'components.pullRequestPanel.checks_failed',
 }
 
+/** Catalog keys for a changed file's `status` — GitHub's per-file vocabulary
+ * (added|modified|removed|renamed|copied|changed|unchanged). The wire value was
+ * printed raw and CSS-capitalized: untranslated in every locale and invisible
+ * to the i18n added-lines gate. Flat and indexed inline so the key gate
+ * resolves the map, like LIFECYCLE_LABEL_KEY. `?? file_status_changed` covers a
+ * value outside the known set so an unmapped status still reads as a word. */
+const FILE_STATUS_LABEL_KEY: Record<string, string> = {
+  added: 'components.pullRequestPanel.file_status_added',
+  modified: 'components.pullRequestPanel.file_status_modified',
+  removed: 'components.pullRequestPanel.file_status_removed',
+  renamed: 'components.pullRequestPanel.file_status_renamed',
+  copied: 'components.pullRequestPanel.file_status_copied',
+  changed: 'components.pullRequestPanel.file_status_changed',
+  unchanged: 'components.pullRequestPanel.file_status_unchanged',
+}
+
 /** CI rollup glyph, tone, and catalog KEY. Keys not strings — see LIFECYCLE_META. */
 const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check; tone: string; spin?: boolean }> = {
   running: { icon: Loader, tone: 'text-warn', spin: true },
@@ -382,7 +430,7 @@ const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check
  * plus one health glyph while the pull request is live. Failed CI wins; a merge
  * conflict otherwise replaces pending/passed CI so an unmergeable branch never
  * reads as ready. Merged/closed suppress both CI and conflict because lifecycle
- * is the terminal signal there. `ChatSidebar.tsx::chipStatusGlyph` applies the
+ * is the terminal signal there. `SessionSourceChips.tsx::chipStatusGlyph` applies the
  * same precedence to the sidebar chip. */
 function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   const lifecycle = status?.state
@@ -474,7 +522,7 @@ function ChangeRow({ file }: { file: PullRequestFile }) {
       >
         {open ? <ChevronDown className="lucide-inline shrink-0 text-muted" /> : <ChevronRight className="lucide-inline shrink-0 text-muted" />}
         <span className="text-[13px] text-text truncate min-w-0 flex-1">{file.path}</span>
-        <span className="text-[11px] text-muted capitalize shrink-0">{file.status}</span>
+        <span className="text-[11px] text-muted shrink-0">{i18nT(FILE_STATUS_LABEL_KEY[file.status?.toLowerCase()] ?? 'components.pullRequestPanel.file_status_changed')}</span>
         <span className="text-[11px] shrink-0"><span className="text-ok">+{file.additions}</span> <span className="text-danger">-{file.deletions}</span></span>
       </Btn>
       {open && (
@@ -712,7 +760,7 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
           title={isGitHub
             ? i18nT('components.pullRequestPanel.github_merges_this_pull_request_automatically_on')
             : i18nT('components.pullRequestPanel.gitlab_merges_this_merge_request_when_the_pipeli')}
-          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${confirmAutoMerge || immediateMergeWarning ? 'border-warn text-warn hover:bg-warn/10' : 'border-border bg-transparent text-muted hover:text-text hover:bg-bg-hover'}`}
+          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${confirmAutoMerge || immediateMergeWarning ? 'border-warn text-warn hover:text-warn-text hover:bg-warn/10' : 'border-border bg-transparent text-muted hover:text-text hover:bg-bg-hover'}`}
         >
           {autoMergeMutation.isPending ? <Loader className="lucide-inline animate-spin" /> : <GitMerge className="lucide-inline" />}
           {immediateMergeWarning ? i18nT('components.pullRequestPanel.merge_now') : confirmAutoMerge ? i18nT('components.pullRequestPanel.confirm_auto_merge') : i18nT('components.pullRequestPanel.enable_auto_merge')}
@@ -730,24 +778,11 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
       )}
       <ErrorNotice message={error} variant="inline" askAgent />
     </div>
-    {/* The remedy link lives OUTSIDE the action row, on its own line — never
-        as a row peer, which would push the row past the two-button cap in the
-        confirm state (Cancel + Confirm are already there). */}
-    {error && errorDetails.ownerNotConfigured && (
-      <div className="mt-1.5">
-        <SettingsLink
-          {...OWNER_SETTINGS_TARGET}
-          className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline"
-        >
-          {i18nT('components.pullRequestPanel.open_slack_settings')} <ArrowRight className="lucide-inline" />
-        </SettingsLink>
-      </div>
-    )}
     </>
   )
 }
 
-function PullRequestBody({ source, tab, onAddToChat }: { source: PullRequestSource; tab: SourceTab; onAddToChat?: (text: string) => void }) {
+function PullRequestBody({ source, tab, onAddToChat, writesPaused = false }: { source: PullRequestSource; tab: SourceTab; onAddToChat?: (text: string) => void; writesPaused?: boolean }) {
   if (tab === 'description') {
     return source.description
       ? <div className="px-4 py-4 text-[13px]"><MarkdownRenderer content={source.description} /></div>
@@ -828,6 +863,7 @@ function PullRequestBody({ source, tab, onAddToChat }: { source: PullRequestSour
     <div className="p-3">
       <CommentThreads
         src={source}
+        writesPaused={writesPaused}
         // The panel owns what it says to the agent; the thread list only
         // reports which comment was picked.
         onAddToChat={onAddToChat && ((c) => onAddToChat(commentHandoff(c)))}
@@ -857,7 +893,7 @@ export default function PullRequestPanel({
   onAddToChat?: (text: string) => void
 }) {
   const cappedSources = sources.slice(0, MAX_PULL_REQUEST_SOURCES)
-  const selected = cappedSources.find(source => source.url === selectedUrl) || cappedSources[0]
+  const selected = findSourceForUrl(cappedSources, selectedUrl) || cappedSources[0]
   // A GitLab MR IID is unique only within its project, so tabs read as bare
   // `MR !1` and two projects sharing an IID become indistinguishable. When the
   // rendered tabs span more than one distinct project, qualify each tab label
@@ -879,9 +915,10 @@ export default function PullRequestPanel({
     if (selected && selected.url !== selectedUrl) (onReconcile || onSelect)(selected.url)
   }, [selected, selectedUrl, onSelect, onReconcile])
 
+  const selectedKey = selected ? sourceLinkKey(selected) : undefined
   useEffect(() => {
     setTab('changes')
-  }, [selected?.url])
+  }, [selectedKey])
 
   const queryKey = useMemo(
     () => ['pull-request-source', selected?.url] as const,
@@ -889,6 +926,15 @@ export default function PullRequestPanel({
   )
   const query = useQuery<PullRequestSource>({
     queryKey,
+    // Keep the composer mounted across revisions of this review, but never
+    // carry another review's payload into the newly selected one.
+    placeholderData: (previousData, previousQuery) => {
+      const previousUrl = previousQuery?.queryKey[1]
+      return selected && typeof previousUrl === 'string'
+        && findSourceForUrl([selected], previousUrl)
+        ? previousData
+        : undefined
+    },
     queryFn: () => {
       const force = forceRefreshRef.current
       forceRefreshRef.current = false
@@ -1055,11 +1101,16 @@ export default function PullRequestPanel({
       complete: checks.filter(check => check.bucket === 'passed' || check.bucket === 'skipped').length,
       failed: checks.filter(check => check.bucket === 'failed').length,
       pending: checks.filter(check => check.bucket === 'pending').length,
+      running: checks.filter(checkInFlight).length,
       total: checks.length,
     }
   }, [source?.checks])
   const checksUnavailable = checksPollingPaused
   const checksRunning = checkCounts.pending > 0 && !checksUnavailable
+  // A `complete/total` fraction counts a failed check as not complete, so it
+  // cannot say whether the rest are still running or one has failed; once a
+  // check has failed while others run, the tab counts both instead.
+  const checksFailedStillRunning = checksRunning && checkCounts.failed > 0 && checkCounts.running > 0
   const allChecksPassed = checkCounts.total > 0
     && checkCounts.failed === 0
     && checkCounts.pending === 0
@@ -1078,7 +1129,7 @@ export default function PullRequestPanel({
     return merged
   }, [statusQuery.data, source])
 
-  const allTabs: Array<{ id: SourceTab; label: string; count?: number; tone?: string }> = source ? [
+  const allTabs: Array<{ id: SourceTab; label: string; count?: number; countText?: string; tone?: string }> = source ? [
     { id: 'changes', label: i18nT('components.pullRequestPanel.changes'), count: source.files.length },
     { id: 'description', label: i18nT('components.pullRequestPanel.description') },
     { id: 'commits', label: i18nT('components.pullRequestPanel.commits'), count: source.commits.length },
@@ -1086,12 +1137,19 @@ export default function PullRequestPanel({
       id: 'checks',
       label: checksUnavailable
         ? i18nT('components.pullRequestPanel.checks_unavailable')
-        : checksRunning
-          ? i18nT('components.pullRequestPanel.checks_running')
-          : showAllChecksPassed
-            ? i18nT('components.pullRequestPanel.all_checks_passed')
-            : i18nT('components.pullRequestPanel.checks'),
+        : checksFailedStillRunning
+          ? i18nT('components.pullRequestPanel.checks')
+          : checksRunning
+            ? i18nT('components.pullRequestPanel.checks_running')
+            : showAllChecksPassed
+              ? i18nT('components.pullRequestPanel.all_checks_passed')
+              : i18nT('components.pullRequestPanel.checks'),
       count: checkCounts.total,
+      countText: checksFailedStillRunning
+        ? i18nT('components.pullRequestPanel.checks_count_running_failed', { running: checkCounts.running, failed: checkCounts.failed })
+        : checkCounts.total
+          ? `${checkCounts.complete}/${checkCounts.total}`
+          : undefined,
       tone: checkCounts.failed
         ? 'text-danger'
         : checksUnavailable || checksRunning
@@ -1133,16 +1191,7 @@ export default function PullRequestPanel({
             className={`shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border-none cursor-pointer text-[12px] transition-colors ${item.url === selected?.url ? 'bg-bg-hover text-text' : 'bg-transparent text-muted hover:text-text hover:bg-bg-hover/60'}`}
             title={item.url}
           >
-            {itemMeta.logo === 'github'
-              ? <GithubLogo size={13} className="shrink-0" />
-              : itemMeta.logo === 'gitlab'
-                ? <GitlabLogo size={13} className="shrink-0" />
-                : itemMeta.icon
-                  ? <itemMeta.icon size={13} className="shrink-0" />
-                  // Explicit 13 to match its siblings: `lucide-inline` sizes at
-                  // `1em`, which is 12px in this tab strip, so the neutral glyph
-                  // rendered a pixel smaller than every branded one beside it.
-                  : <GitPullRequest size={13} className="lucide-inline shrink-0" />}
+            <SourceProviderMark provider={item.provider} size={13} />
             {/* No CSS truncation here: sourceTabQualifier shortens deep paths
                 to their minimal unique trailing suffix, so the discriminating
                 segment is always visible. The full url stays on the Btn's
@@ -1167,24 +1216,37 @@ export default function PullRequestPanel({
           fix the refresh. */}
       {query.error && !source && (
         <div className="flex-1 flex items-center justify-center px-6">
-          <div role="alert" className="max-w-md flex flex-col items-center">
-            <AlertCircle className={`lucide-inline mb-2 ${queryError.loginCommand ? 'text-warn' : 'text-danger'}`} />
-            <div className="text-[13px] font-medium text-text">
-              {queryError.loginCommand
-                ? queryError.loginCommand === 'gh auth login'
-                  ? i18nT('components.pullRequestPanel.github_cli_login_required')
-                  : i18nT('components.pullRequestPanel.gitlab_cli_login_required')
-                : i18nT('components.pullRequestPanel.could_not_load_this_pull_request')}
-            </div>
+          <div className="max-w-md w-full flex flex-col items-center">
+            {/* askAgent on, as in the Issues panel: the panel is read-only (no
+                draft), and a provider CLI that is missing or logged out is the
+                kind of failure the agent can diagnose. The login command rides
+                in the notice's footer, so it reads as the answer to the message. */}
             {queryError.loginCommand ? (
-              <>
-                <div className="text-[12px] text-muted mt-1 text-center">{i18nT('components.pullRequestPanel.kiro_crew_uses_your_local_provider_cli_to_load_p')}</div>
-                <code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text">{queryError.loginCommand}</code>
-              </>
+              <ErrorNotice
+                className="w-full"
+                title={queryError.loginCommand.startsWith('gh ')
+                  ? i18nT('components.pullRequestPanel.github_cli_login_required')
+                  : i18nT('components.pullRequestPanel.gitlab_cli_login_required')}
+                message={i18nT('components.pullRequestPanel.kiro_crew_uses_your_local_provider_cli_to_load_p')}
+                footer={<code className="inline-block mt-2 px-2 py-1 rounded bg-bg-hover text-[12px] text-text break-all">{queryError.loginCommand}</code>}
+                actionPlacement="below"
+                askAgent
+                testId="pull-request-panel-load-error"
+              />
             ) : (
-              <div className="mt-2 w-full max-h-64 overflow-y-auto rounded-md bg-bg-hover/50 border border-border px-3 py-2 text-left text-[12px] text-muted whitespace-pre-wrap break-words font-mono leading-relaxed">{queryError.message}</div>
+              <ErrorNotice
+                className="w-full max-h-64 leading-relaxed"
+                messageClassName="font-mono whitespace-pre-wrap break-words"
+                title={i18nT('components.pullRequestPanel.could_not_load_this_pull_request')}
+                message={queryError.message}
+                messagePlacement="below"
+                actionPlacement="below"
+                scrollMessage
+                askAgent
+                testId="pull-request-panel-load-error"
+              />
             )}
-            <Btn type="button" onClick={handleRefresh} className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-border bg-transparent text-[12px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer"><RefreshCw className="lucide-inline" />{i18nT('components.pullRequestPanel.retry')}</Btn>
+            <Btn type="button" onClick={handleRefresh} className="mt-3 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md border border-border bg-transparent text-[12px] text-muted hover:text-text hover:bg-bg-hover cursor-pointer"><RefreshCw className="lucide-inline" aria-hidden="true" />{i18nT('components.pullRequestPanel.retry')}</Btn>
           </div>
         </div>
       )}
@@ -1226,7 +1288,9 @@ export default function PullRequestPanel({
               <span><span className="text-ok">+{source.additions}</span> <span className="text-danger">-{source.deletions}</span></span>
               {source.updatedAt && <span>{i18nT('components.pullRequestPanel.updated')} {age(source.updatedAt)}</span>}
             </div>
-            <PullRequestActions key={source.url} source={source} />
+            {/* A placeholder payload belongs to an earlier revision, so its
+                merge-state writes would land on that revision's url. */}
+            {!query.isPlaceholderData && <PullRequestActions key={source.url} source={source} />}
           </div>
 
           {mergeBlocker && (
@@ -1278,13 +1342,15 @@ export default function PullRequestPanel({
                   <Check className="lucide-inline text-ok" />
                 ) : null}
                 {item.label}
-                {item.count !== undefined && <span className="text-muted">{item.id === 'checks' && checkCounts.total ? `${checkCounts.complete}/${item.count}` : item.count}</span>}
+                {item.countText !== undefined
+                  ? <span className="text-muted">{item.countText}</span>
+                  : item.count !== undefined && <span className="text-muted">{item.count}</span>}
               </Btn>
             ))}
           </div>
 
           <div id="pr-tabpanel" role="tabpanel" aria-labelledby={`pr-tab-${activeTab}`} className="flex-1 min-h-0 overflow-y-auto">
-            <PullRequestBody source={source} tab={activeTab} onAddToChat={onAddToChat} />
+            <PullRequestBody source={source} tab={activeTab} onAddToChat={onAddToChat} writesPaused={query.isPlaceholderData} />
           </div>
         </>
       )}

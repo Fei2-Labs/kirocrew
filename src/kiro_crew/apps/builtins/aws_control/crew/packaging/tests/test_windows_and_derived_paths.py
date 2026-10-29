@@ -31,7 +31,14 @@ import pathlib
 
 import pytest
 
-from .test_producer import BUILD_PY, load_build, make_crew, sign_plan
+from .test_producer import (
+    builder_source_text,
+    builder_trees,
+    called_name,
+    load_build,
+    make_crew,
+    sign_plan,
+)
 
 _posix_only = pytest.mark.skipif(
     os.name != "posix",
@@ -62,20 +69,20 @@ def test_every_o_directory_use_is_behind_the_platform_guard() -> None:
     without the check. The rule is that any function naming ``O_DIRECTORY`` also consults
     ``_dir_fd_supported``, which is the one predicate all of them now share.
     """
-    tree = ast.parse(BUILD_PY.read_text(encoding="utf-8"), str(BUILD_PY))
     offenders: list[str] = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        names = {node.attr for node in ast.walk(fn) if isinstance(node, ast.Attribute)}
-        if "O_DIRECTORY" not in names:
-            continue
-        guarded = any(
-            isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_dir_fd_supported"
-            for node in ast.walk(fn)
-        )
-        if not guarded:
-            offenders.append(f"{fn.name}:{fn.lineno}")
+    for path, tree in builder_trees():
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            names = {node.attr for node in ast.walk(fn) if isinstance(node, ast.Attribute)}
+            if "O_DIRECTORY" not in names:
+                continue
+            guarded = any(
+                isinstance(node, ast.Call) and called_name(node) == "_dir_fd_supported"
+                for node in ast.walk(fn)
+            )
+            if not guarded:
+                offenders.append(f"{path.name}:{fn.name}:{fn.lineno}")
 
     assert not offenders, (
         "these functions use os.O_DIRECTORY without asking _dir_fd_supported() first, "
@@ -85,9 +92,9 @@ def test_every_o_directory_use_is_behind_the_platform_guard() -> None:
 
 def test_the_o_directory_rule_is_scanning_real_functions() -> None:
     """Non-vacuity: a rule over an empty set would pass while the crash came back."""
-    tree = ast.parse(BUILD_PY.read_text(encoding="utf-8"), str(BUILD_PY))
     users = [
         fn.name
+        for _path, tree in builder_trees()
         for fn in ast.walk(tree)
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
         and any(isinstance(n, ast.Attribute) and n.attr == "O_DIRECTORY" for n in ast.walk(fn))
@@ -208,26 +215,26 @@ def test_both_derived_paths_go_through_one_writer() -> None:
     its plain ``write_text``. A source assertion is the cheap way to keep that from
     recurring, since a second spelling is what has to be prevented.
     """
-    tree = ast.parse(BUILD_PY.read_text(encoding="utf-8"), str(BUILD_PY))
     callers = {
         fn.name
+        for _path, tree in builder_trees()
         for fn in ast.walk(tree)
         if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
         and any(
             isinstance(n, ast.Call)
-            and getattr(n.func, "id", "") in {"_write_nofollow", "_write_bytes_nofollow"}
+            and called_name(n) in {"_write_nofollow", "_write_bytes_nofollow"}
             for n in ast.walk(fn)
         )
     }
     assert {
         "_write_marker_exclusive",
-        # ``build_bundle``, not ``_cmd_build``: the report moved inside the build so it is
-        # written BEFORE the swap. Written after, a failure landed once the previous bundle had
+        # ``_write_report_temp``, the report owner's writer, which ``build_bundle`` calls
+        # BEFORE the swap. Written after, a failure landed once the previous bundle had
         # already been renamed aside and deleted -- a failure that had already replaced what it
         # was going to replace. The rule is about which WRITER is used; the function named here
         # follows wherever the write lives. Either no-follow helper counts -- the bytes core or
         # its str wrapper -- because both refuse a planted link at the leaf.
-        "build_bundle",
+        "_write_report_temp",
     } <= callers, (
         f"both derived-path writes must use the no-follow primitive; found {sorted(callers)}"
     )
@@ -302,7 +309,7 @@ def test_both_parent_opens_go_through_the_pinning_helper_in_source() -> None:
     """Source rule: neither the staged-leaf write nor the marker read may open the parent by a
     bare path string; both must pin every component. A concurrent-swap race cannot be
     reproduced deterministically at those sites, so the writer choice is pinned by reading."""
-    src = BUILD_PY.read_text(encoding="utf-8")
+    src = builder_source_text()
     assert "os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)" not in src, (
         "a parent directory is opened by bare path string, which follows a component swapped "
         "into the window; open it through _open_dir_nofollow_pinned instead"
@@ -339,7 +346,7 @@ def test_read_bytes_openat_refuses_an_intermediate_symlink_and_is_byte_exact(
 def test_author_path_reads_do_not_use_the_leaf_only_reader_in_source() -> None:
     """Source rule: the copy phase and skill enumeration read files that become shipped bytes,
     so they must anchor every component (_read_text_openat), never the leaf-only reader."""
-    src = BUILD_PY.read_text(encoding="utf-8")
+    src = builder_source_text()
     # _read_text_nofollow is a leaf-only reader; it is legitimate only as the Windows fallback
     # INSIDE the openat readers, never as a direct author-path read. No call passing a bare
     # skill/source path should remain.
@@ -418,6 +425,15 @@ _POSIX_ONLY_PRIMITIVES = (
     "_staged_tree_hash",
 )
 
+#: The sensitive-source suite the two guards below read as one tree: its first module and the
+#: topic modules beside it, so a test is scanned wherever in the suite it lives.
+_SENSITIVE_SOURCE_SUITE = (
+    "test_sensitive_source_and_report_identity.py",
+    "test_sensitive_source_and_report_identity_credential_floor.py",
+    "test_sensitive_source_and_report_identity_nofollow_reads.py",
+    "test_sensitive_source_and_report_identity_staging_and_disposal.py",
+)
+
 
 def _test_has_posix_skip(fn: ast.FunctionDef) -> bool:
     """A test is POSIX-gated if a decorator is ``@_posix_only`` or a ``skipif`` naming posix."""
@@ -453,8 +469,9 @@ def test_every_sensitive_source_test_touching_a_posix_primitive_is_posix_gated()
     This asserts every such test in the sensitive-source suite carries a POSIX skip, so the
     next neighbour pulled onto that path is caught here rather than on the Windows run.
     """
-    suite = pathlib.Path(__file__).resolve().parent / "test_sensitive_source_and_report_identity.py"
-    tree = ast.parse(suite.read_text(encoding="utf-8"), str(suite))
+    here = pathlib.Path(__file__).resolve().parent
+    suite = [here / name for name in _SENSITIVE_SOURCE_SUITE]
+    tree = ast.parse("\n".join(p.read_text(encoding="utf-8") for p in suite), str(suite[0]))
     offenders = [
         fn.name
         for fn in ast.walk(tree)
@@ -476,8 +493,9 @@ def test_the_posix_gate_guard_is_scanning_real_tests() -> None:
     A guard that matched nothing would pass while an unmarked test raised on Windows. Confirm
     the suite has several tests that DO drive a primitive, so the rule is scanning a real set.
     """
-    suite = pathlib.Path(__file__).resolve().parent / "test_sensitive_source_and_report_identity.py"
-    tree = ast.parse(suite.read_text(encoding="utf-8"), str(suite))
+    here = pathlib.Path(__file__).resolve().parent
+    suite = [here / name for name in _SENSITIVE_SOURCE_SUITE]
+    tree = ast.parse("\n".join(p.read_text(encoding="utf-8") for p in suite), str(suite[0]))
     drivers = [
         fn.name
         for fn in ast.walk(tree)

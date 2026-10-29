@@ -30,13 +30,17 @@ from __future__ import annotations
 import asyncio
 import enum
 import hashlib
+import html as _html
 import logging
 import os
 import re
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
+from typing import AsyncIterator, Final
 
 # Concrete publish providers are NOT imported here. In the public edition no
 # provider is registered (the registry stays empty → get_provider() raises
@@ -47,6 +51,7 @@ from pathlib import Path
 from kiro_crew.artifacts import (
     Artifact,
     ArtifactPublication,
+    ArtifactReplacedError,
     ArtifactValidationError,
     ForkMetadata,
     get_default_store,
@@ -354,6 +359,99 @@ def _redact_untrusted(text: str, source: str) -> str:  # noqa: ARG001
 _NON_TEXT_KINDS: frozenset[str] = NON_TEXT_KINDS
 
 
+#: Put ahead of a crewmate's html report (``goal_report``) when it is published or
+#: synced, so the copy a destination serves is as static as the one the viewer
+#: opens: no script, no fetch, no outside image, font or frame, only the page's
+#: inline styles and ``data:`` images. A ``meta`` policy governs everything after
+#: it and a later one can only tighten it, so the prefix comes before every page
+#: byte; the page's own doctype then parses as an ignored repeat.
+STATIC_REPORT_PREFIX: Final[str] = (
+    '<!DOCTYPE html><meta http-equiv="Content-Security-Policy" content="'
+    "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; "
+    "base-uri 'none'; form-action 'none'\">"
+)
+
+
+class _LinkTitles(HTMLParser):
+    """Pass a report through unchanged except that each link shows where it goes.
+
+    Every ``a`` and ``area`` with an ``href`` (or ``*:href``) and no ``title`` gets
+    ``title`` set to that href, so hovering a link in the published copy shows its
+    full URL, as a link in a session does. Everything else is written back as read.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.out: list[str] = []
+
+    def _tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        raw = self.get_starttag_text() or ""
+        href = next((v for k, v in attrs if k == "href" or k.endswith(":href")), None)
+        if tag in ("a", "area") and href and not any(k == "title" for k, _ in attrs):
+            cut = len(raw) - (2 if raw.endswith("/>") else 1)
+            raw = f'{raw[:cut]} title="{_html.escape(href)}"{raw[cut:]}'
+        self.out.append(raw)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag(tag, attrs)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        self.out.append(f"</{tag}>")
+
+    def handle_data(self, data: str) -> None:
+        self.out.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self.out.append(f"&#{name};")
+
+    def handle_comment(self, data: str) -> None:
+        self.out.append(f"<!--{data}-->")
+
+    def handle_decl(self, decl: str) -> None:
+        self.out.append(f"<!{decl}>")
+
+    def handle_pi(self, data: str) -> None:
+        self.out.append(f"<?{data}>")
+
+    def unknown_decl(self, data: str) -> None:
+        self.out.append(f"<![{data}]>")
+
+
+def _link_titles(content: str) -> str:
+    """*content* with each link's ``title`` set to its href (:class:`_LinkTitles`)."""
+    parser = _LinkTitles()
+    parser.feed(content)
+    parser.close()
+    return "".join(parser.out)
+
+
+def _static_report_document(name: str, content: str) -> str:
+    """A crewmate's report as the document a destination serves: one frame.
+
+    The page goes in an ``iframe`` whose ``sandbox`` is EMPTY, as its ``srcdoc``
+    attribute, escaped. An empty sandbox withholds ``allow-scripts``, and that also
+    sets the sandboxed automatic features flag, so neither a script nor a refresh
+    ``meta`` in the page runs, and nothing has to parse or clean the page to get
+    there. Escaped into one attribute value, none of the page's markup is live in
+    the outer document. Inside, :data:`STATIC_REPORT_PREFIX` still comes first, so
+    the page also loads nothing from outside. Its links stay clickable, each showing
+    its full URL on hover (:func:`_link_titles`), as links in a session do.
+    """
+    inner = STATIC_REPORT_PREFIX + _link_titles(content)
+    return (
+        f'<!DOCTYPE html><meta charset="utf-8"><title>{_html.escape(name)}</title>'
+        "<style>html,body{margin:0;height:100%}"
+        "iframe{display:block;border:0;width:100%;height:100%}</style>"
+        f'<iframe sandbox="" srcdoc="{_html.escape(inner, quote=True)}"></iframe>'
+    )
+
+
 def _render_content(art: Artifact) -> tuple[str, str]:
     """Return ``(rendered_text, content_type)`` for an artifact's current
     content, applying the widget standalone-HTML wrap where needed.
@@ -374,6 +472,9 @@ def _render_content(art: Artifact) -> tuple[str, str]:
     content = _redact_untrusted(art.content or "", art.source)
     if art.kind == "widget":
         content = wrap_widget_html(content)
+    if art.kind == "html" and art.goal_report is True:
+        # The title goes in the uploaded document, so it takes the same redaction.
+        content = _static_report_document(_redact_untrusted(art.name, art.source), content)
     return content, content_type
 
 
@@ -440,17 +541,90 @@ def _publication_summary(pub: ArtifactPublication) -> dict[str, object]:
 #: Same shape as ``_clone_lock`` below, for the same reason: find-then-create is a
 #: non-atomic check-then-act, and the check is what both racers pass.
 #:
-#: Per slug rather than global so unrelated artifacts never wait on each other. Entries
-#: are not evicted -- one small lock per artifact published in this process is cheaper
-#: than freeing a lock another task may be about to take.
+#: Per slug rather than global so unrelated artifacts never wait on each other.
+#:
+#: Taken by ``publication_guard``, whose docstring carries the contract: the publish path
+#: is one taker among several, and a path that destroys an artifact takes it too.
 _publish_locks: dict[str, LoopBoundLock] = {}
+#: How many tasks hold or are waiting for each lock above. The lock is dropped at zero,
+#: which is the only moment at which dropping it excludes nobody.
+_publish_lock_users: dict[str, int] = {}
 _publish_locks_guard = threading.Lock()
 
 
-def _publish_lock(slug: str) -> LoopBoundLock:
-    """The lock guarding one artifact's publish path."""
+@asynccontextmanager
+async def publication_guard(slug: str) -> AsyncIterator[None]:
+    """The lock one artifact's publication state is decided under.
+
+    Every path that reads whether this artifact has a live publication and then ACTS on
+    that reading holds this, not only the publish path. A first publish uploads the
+    object before the record naming it exists, so during that upload the store answers
+    "not published" about content that is already public. A destroy that trusts that
+    answer erases the artifact and leaves the copy served with nothing able to withdraw
+    it, and no later action reaches it.
+
+    Holding this across the destroy is what makes the store's own
+    ``delete(refuse_if_published=True)`` re-read decisive: the record is then either
+    absent because no publish is running, or present because the publish finished, and
+    never absent merely because a publish is halfway through.
+
+    The registry is REFCOUNTED, which is what lets a slug that names no artifact be
+    guarded too. A delete is asked about slugs the store never resolved, so a table that
+    only ever grew would grow with request volume; but the artifact that has to be
+    excluded on such a slug is one CREATED and first-published inside the delete's own
+    window, which is exactly the case a caller cannot pre-resolve. The count is taken
+    before the acquire, so a waiter keeps the entry alive, and the entry is dropped only
+    when nobody holds or waits -- at which point a later caller minting a fresh lock
+    excludes nobody, because there is no holder to exclude.
+
+    Process-local, and per running loop within the process (see :class:`LoopBoundLock`):
+    it excludes concurrent tasks in this gateway, which is where both the publish and the
+    destroy paths run. A publish issued by a separate process is not excluded.
+    """
     with _publish_locks_guard:
-        return _publish_locks.setdefault(slug, LoopBoundLock())
+        lock = _publish_locks.get(slug)
+        if lock is None:
+            lock = _publish_locks[slug] = LoopBoundLock()
+        _publish_lock_users[slug] = _publish_lock_users.get(slug, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        with _publish_locks_guard:
+            remaining = _publish_lock_users.get(slug, 0) - 1
+            if remaining > 0:
+                _publish_lock_users[slug] = remaining
+            else:
+                _publish_lock_users.pop(slug, None)
+                _publish_locks.pop(slug, None)
+
+
+#: How wide each visibility reaches, narrowest first. An unknown value ranks as the
+#: widest: a publication of unknown reach is treated as public.
+_VISIBILITY_RANK = {"PRIVATE": 0, "SHARED": 1, "PUBLIC": 2}
+
+
+def _visibility_rank(visibility: str | None) -> int:
+    return _VISIBILITY_RANK.get((visibility or "").upper(), 2)
+
+
+def _narrows(
+    old_visibility: str | None,
+    old_shared_with: list[str] | None,
+    new_visibility: str | None,
+    new_shared_with: list[str] | None,
+) -> bool:
+    """Whether a sharing change takes access away from anyone who has it now.
+
+    A lower rank narrows; so does a shared publication that drops a person, since
+    that person is losing access just the same.
+    """
+    old_rank, new_rank = _visibility_rank(old_visibility), _visibility_rank(new_visibility)
+    if new_rank != old_rank:
+        return new_rank < old_rank
+    if new_rank == _VISIBILITY_RANK["SHARED"]:
+        return not set(new_shared_with or []) >= set(old_shared_with or [])
+    return False
 
 
 async def publish(
@@ -475,7 +649,7 @@ async def publish(
     ``push_version`` and ``update_sharing`` are the two functions this path calls and
     neither publishes.
     """
-    async with _publish_lock(slug):
+    async with publication_guard(slug):
         return await _publish_unlocked(
             slug,
             visibility=visibility,
@@ -522,6 +696,19 @@ async def _publish_unlocked(
     # plus a sharing update, reusing the same destination id/URL — never a
     # second artifact. Use the artifact's existing provider.
     if art.publication is not None:
+        sharing = Capability.SHARING in provider.capabilities()
+        # Order the two steps by direction. Widening pushes first, so the new content
+        # lands while the link is still narrow; narrowing changes sharing first, so the
+        # new content never reaches the wider audience being withdrawn.
+        narrowing = sharing and _narrows(
+            art.publication.visibility,
+            art.publication.shared_with,
+            visibility,
+            shared_with,
+        )
+        if narrowing:
+            await update_sharing(slug, visibility=visibility, shared_with=shared_with)
+            art = await asyncio.to_thread(store.get, slug)
         await push_version(art, force=True)
         # push_version is best-effort and records failures in
         # publication.last_error; update_sharing then clears last_error. Capture
@@ -533,7 +720,7 @@ async def _publish_unlocked(
         # Skip the sharing reconcile for providers whose sharing is not
         # programmable via the API (e.g. a live CRDT provider — web-UI-only). Re-publish is
         # then just a content push; the existing publication summary is returned.
-        if Capability.SHARING in provider.capabilities():
+        if sharing and not narrowing:
             result = await update_sharing(slug, visibility=visibility, shared_with=shared_with)
         else:
             result = (
@@ -859,7 +1046,30 @@ async def unpublish(slug: str) -> None:
             "The destination did not confirm the removal, so this artifact is still "
             "marked published and the withdrawal can be retried."
         ) from exc
-    await asyncio.to_thread(store.clear_publication, slug)
+    # Pinned to BOTH the generation and the publication read before the withdrawal above,
+    # which is a network round trip. A slug is only a name, the store re-mints a freed one
+    # identically, and this path holds no guard, so by now the slug can hold a different
+    # artifact created and published while the removal was in flight. The generation alone
+    # does not settle it either: re-publishing the SAME artifact replaces the record and
+    # leaves `created_at` untouched, so a second withdrawal in flight would find an
+    # unchanged stamp over a brand-new live copy. Clearing then discards that copy's only
+    # handle and nothing later reaches it. The withdrawal this call asked for did complete,
+    # so neither case is an error here: the record is left alone and the caller is answered
+    # normally.
+    try:
+        await asyncio.to_thread(
+            store.clear_publication,
+            slug,
+            expect_created_at=art.created_at,
+            expect_publication_id=art.publication.artifact_id,
+        )
+    except ArtifactReplacedError:
+        logger.warning(
+            "unpublish: withdrew the copy of %s but left the record alone -- the record "
+            "under that slug names a different artifact or a different copy, so it "
+            "belongs to a publication this call never withdrew",
+            slug,
+        )
     logger.info("artifact unpublished: slug=%s", slug)
 
 
@@ -912,9 +1122,10 @@ async def refresh_publication(slug: str) -> Artifact:
             fields["shared_with"] = normalized
     # Out-of-band content/version drift: someone rolled the provider's live
     # pointer back to an older version, or edited the bytes directly. We do NOT
-    # mirror it into KiroCrew's append-only history; instead surface a re-sync
-    # prompt (the conflict banner's "Force re-sync" re-asserts KiroCrew's
-    # current content as a new top version). KiroCrew stays authoritative.
+    # mirror it into Kiro Crew's append-only history; instead record a drift
+    # message telling the user to publish again (re-publishing an already-published
+    # artifact force-pushes Kiro Crew's current content as a new top version).
+    # Kiro Crew stays authoritative.
     expected_dest_v = pub.version_map.get(str(pub.last_synced_kirocrew_version))
     cur_v = state.get("current_version")
     cur_sha = state.get("sha256")
@@ -923,7 +1134,7 @@ async def refresh_publication(slug: str) -> Artifact:
     # copy) that the user can PULL into a new local snapshot — see
     # ``pull_upstream`` / ``upstream_status``. Only a NON-ahead mismatch (a
     # rollback to an older version, or an out-of-band edit at the SAME version
-    # detected via sha) is genuine drift the force-re-sync banner addresses.
+    # detected via sha) is genuine drift the drift message addresses.
     cloud_ahead = isinstance(cur_v, int) and expected_dest_v is not None and cur_v > expected_dest_v
     drifted = not cloud_ahead and (
         (isinstance(cur_v, int) and expected_dest_v is not None and cur_v != expected_dest_v)
@@ -934,7 +1145,7 @@ async def refresh_publication(slug: str) -> Artifact:
         )
     )
     # A live CRDT doc has no version/sha drift to reconcile — the remote
-    # owns the doc. Never surface a Force-resync banner for a LIVE publication.
+    # owns the doc. Never surface a drift message for a LIVE publication.
     if pub.collab_mode == "live":
         drifted = False
     if drifted:
@@ -944,7 +1155,8 @@ async def refresh_publication(slug: str) -> Artifact:
         )
         drift_msg = (
             f"{_DRIFT_PREFIX}: it is showing {cur_v_str} (Kiro Crew published "
-            f"{expected_str}). Force re-sync to re-publish Kiro Crew's current version."
+            f"{expected_str}). Publish the artifact again to re-publish Kiro Crew's "
+            "current version."
         )
         if pub.last_error != drift_msg:
             fields["last_error"] = drift_msg

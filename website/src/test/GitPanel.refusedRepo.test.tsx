@@ -24,7 +24,7 @@ function renderPanel(status: StatusPayload) {
   vi.mocked(api.projectGitLog).mockResolvedValue({ repo: false, commits: [] })
   return render(
     <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
-      <GitPanel projectDir={WS} onClose={() => {}} />
+      <GitPanel projectDir={WS} section={{ label: WS }} />
     </QueryClientProvider>,
   )
 }

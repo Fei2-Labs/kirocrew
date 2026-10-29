@@ -26,7 +26,6 @@ vi.mock('../hooks/useDevMode', () => ({ useDevMode: () => false }))
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => false }))
 vi.mock('../pages/chat/FileBrowserRail', () => ({
   default: () => null,
-  useTreeAvailable: () => true,
   useTreeState: () => 'ready',
 }))
 vi.mock('../components/MarkdownPanel', async () => {
@@ -54,15 +53,15 @@ let tabsCtl: TabsCtl | undefined
 interface FetchCall {
   url: string
   signal?: AbortSignal
-  settle: (init: { ok: boolean; status?: number; text?: string; binary?: boolean }) => void
+  settle: (init: { ok: boolean; status?: number; text?: string; binary?: boolean; truncated?: boolean }) => void
 }
 let fetchCalls: FetchCall[] = []
 
-function response({ ok, status = ok ? 200 : 500, text = '', binary = false }: { ok: boolean; status?: number; text?: string; binary?: boolean }) {
+function response({ ok, status = ok ? 200 : 500, text = '', binary = false, truncated = false }: { ok: boolean; status?: number; text?: string; binary?: boolean; truncated?: boolean }) {
   return {
     ok,
     status,
-    headers: { get: (k: string) => (k === 'X-File-Binary' ? (binary ? 'true' : null) : null) },
+    headers: { get: (k: string) => (k === 'X-File-Binary' ? (binary ? 'true' : null) : k === 'X-Truncated' ? (truncated ? 'true' : null) : null) },
     text: async () => text,
     json: async () => { try { return JSON.parse(text || 'null') } catch { return null } },
   } as unknown as Response
@@ -155,6 +154,24 @@ describe('cold file tab hydration', () => {
     expect(screen.queryByTestId('file-tab-hydrating')).toBeNull()
   })
 
+  it('stamps the tab partial when the hydration read was cut at the gateway cap, and forgets it across persistence', async () => {
+    // The verdict rides in the read's `X-Truncated` header and lands on the
+    // TAB with the text, where a panel remounted later still finds it: a file
+    // deleted meanwhile is then offered for download as the partial copy it
+    // is, never under its own name as if whole. Transient like `binary`: the
+    // persisted tab drops it, and the next hydration read re-establishes it.
+    renderPanel()
+    await waitFor(() => expect(fetchCalls.length).toBe(1))
+    act(() => fetchCalls[0].settle({ ok: true, text: '# README (a prefix)', truncated: true }))
+    await screen.findByTestId('markdown-panel')
+    const tab = tabsCtl?.tabs.find(t => t.id === 'file:/repo/README.md')
+    expect(tab?.partial).toBe(true)
+    expect(tab?.content).toBe('# README (a prefix)')
+    // The store persists per slot on a short debounce.
+    await waitFor(() => expect(localStorage.getItem('mc-panel-tabs:slot-a')).toContain('file:/repo/README.md'), { timeout: 2000 })
+    expect(localStorage.getItem('mc-panel-tabs:slot-a')).not.toContain('"partial"')
+  })
+
   it('shows the failure instead of an endless skeleton when the read fails', async () => {
     renderPanel()
 
@@ -195,7 +212,7 @@ describe('cold file tab hydration', () => {
     // use, so a second consumer inside the freshness window is served from it:
     // one restored tab, one GET.
     const cached = queryClient?.getQueryData(['file-read', '/repo/README.md'])
-    expect(cached).toEqual({ text: '# README', ok: true, status: 200, binary: false })
+    expect(cached).toEqual({ text: '# README', ok: true, status: 200, binary: false, truncated: false, redacted: false, lossy: false })
     const before = fetchCalls.length
     await queryClient?.fetchQuery({
       queryKey: ['file-read', '/repo/README.md'],

@@ -18,9 +18,11 @@ import { useImeGuard } from '../hooks/useImeGuard'
 import { recordEvent } from '../rum'
 
 import { i18nT } from '../i18n/t'
+import { uiLocation } from '../uiLocations/uiLocation'
 import { fmtTimeNumeric } from '../i18n/format'
 import ErrorNotice from './ErrorNotice'
 import { orderByReview } from './appstore/registryOrder'
+import { registryRefreshFailureMessage, type RegistryRefreshResult } from './appstore/registryRefreshMessage'
 // ``trust`` selects the credential posture for cloning a registry's apps, and it
 // is meaningful only on a BUILD-PINNED row: the backend resolves the trusted tier
 // solely from what the build supplies, because ``config.json`` is agent-writable.
@@ -153,7 +155,10 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
   ])
 
   const mutation = useMutation({
-    mutationFn: (regs: Registry[]) => api.updateRegistries(regs),
+    // Only the row's own coordinates go back: `trust` in the GET is the tier in
+    // force (possibly an operator grant), which a config row never stores.
+    mutationFn: (regs: Registry[]) =>
+      api.updateRegistries(regs.map(({ name, repo, branch }) => ({ name, repo, branch }))),
     onSuccess: (res: { newlyTrustedHosts?: string[] }) => {
       queryClient.invalidateQueries({ queryKey: ['registries'] })
       queryClient.invalidateQueries({ queryKey: ['registry'] })
@@ -171,18 +176,14 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
 
   const refreshMutation = useMutation({
     mutationFn: (repo?: string) => api.refreshRegistries(repo),
-    onSuccess: (res: { lastSyncedAt?: string; ok?: boolean; failed?: string[] }) => {
+    onSuccess: (res: RegistryRefreshResult & { lastSyncedAt?: string }) => {
       queryClient.invalidateQueries({ queryKey: ['registry'] })
       queryClient.invalidateQueries({ queryKey: ['registries'] })
       if (res?.lastSyncedAt) setLastSyncedAt(res.lastSyncedAt)
       // Surface per-registry failures instead of reporting a blanket success:
       // a failed refetch keeps serving the prior (stale) listing rather than
       // dropping the registry's apps, so the user must know it didn't sync.
-      if (res?.ok === false && res.failed && res.failed.length > 0) {
-        setError(i18nT('components.registryManager.could_not_refresh_still_showing_last_synced', { names: res.failed.join(', ') }))
-      } else {
-        setError('')
-      }
+      setError(registryRefreshFailureMessage(res))
     },
     onError: (e: unknown) => setError(e instanceof Error ? e.message : i18nT('components.registryManager.failed_to_refresh_registries')),
   })
@@ -403,14 +404,14 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
                   Controls stay visible without hover below `sm`: a touch
                   viewport has no hover, so hover-only actions are unreachable. */}
               <Clickable
-                className="text-muted hover:text-accent transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100"
+                className="text-muted hover:text-accent transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 [@media(hover:none)]:opacity-100"
                 onClick={() => window.open(repoWebUrl(reg.repo), '_blank')}
                 aria-label={i18nT('components.registryManager.open_repository', { repo: reg.repo })}
               >
                 <ExternalLink size={14} />
               </Clickable>
               <Clickable
-                className={`text-muted hover:text-accent transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 ${refreshMutation.isPending ? 'pointer-events-none opacity-30' : ''}`}
+                className={`text-muted hover:text-accent transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 ${refreshMutation.isPending ? 'pointer-events-none opacity-30 [@media(hover:none)]:opacity-30' : '[@media(hover:none)]:opacity-100'}`}
                 onClick={() => refreshMutation.mutate(reg.repo)}
                 aria-label={i18nT('components.registryManager.refresh_registry', { name: reg.label || reg.name || reg.repo })}
               >
@@ -418,7 +419,7 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
               </Clickable>
               {!reg.isPinned && (
                 <Clickable
-                  className={`text-muted hover:text-danger transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 ${mutation.isPending ? 'pointer-events-none opacity-30' : ''}`}
+                  className={`text-muted hover:text-danger transition-colors opacity-100 sm:opacity-0 sm:group-hover:opacity-100 ${mutation.isPending ? 'pointer-events-none opacity-30 [@media(hover:none)]:opacity-30' : '[@media(hover:none)]:opacity-100'}`}
                   onClick={() => handleRemove(reg.repo)}
                   aria-label={i18nT('components.registryManager.remove_registry', { name: reg.name })}
                 >
@@ -488,7 +489,7 @@ export default function RegistryManager({ bare = false }: { bare?: boolean } = {
         </div>
       ) : (
         <div className="mt-4 flex items-center gap-2">
-          <Btn onClick={() => setAdding(true)}>
+          <Btn onClick={() => setAdding(true)} {...uiLocation('apps.sources.add-registry')}>
             <Plus size={14} /> {i18nT('components.registryManager.add_registry')}
           </Btn>
           {registries.length > 0 || pinned.length > 0 ? (

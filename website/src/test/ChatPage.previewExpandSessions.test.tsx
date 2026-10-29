@@ -16,7 +16,7 @@ import { createTestStore } from './helpers'
 import type { ChatSlot } from '../types'
 import { ThemeProvider } from '../hooks/useTheme'
 import { __resetPanelTabs } from '../hooks/usePanelTabs'
-import { sseSlots } from '../store/dashboardSlice'
+import { sseSlots, fetchSlots } from '../store/dashboardSlice'
 import { toggleActivity } from '../store/chatSlice'
 
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
@@ -52,7 +52,6 @@ vi.mock('../pages/chat/SidePanel', () => ({
   CHAT_PANE_MIN_W: 320,
   sidePanelFillWidth: () => undefined,
 }))
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
 vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))
@@ -65,7 +64,7 @@ vi.mock('../api/client', () => ({
   api: Object.fromEntries(
     ['sessions', 'chatSlotDetail', 'createChatSlot', 'deleteChatSlot', 'resumeChatSlot',
       'deleteSession', 'agentDetail', 'approveChatSlot', 'chatSlotAgent', 'chatSlotModel',
-      'chatSlotWorkspace', 'models', 'planAction', 'planFromChat', 'renameSlot',
+      'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
       'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
       'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
       'notifications', 'status', 'generateTitle'].map(k => [k, vi.fn().mockResolvedValue(
@@ -91,14 +90,14 @@ const setExpanded = (expanded: boolean) => act(() => {
   window.dispatchEvent(new CustomEvent('kirocrew-preview-expand', { detail: { expanded } }))
 })
 
-function renderChat({ slots = 1, strict = false }: { slots?: number; strict?: boolean } = {}) {
+function renderChat({ slots = 1, strict = false, loaded = true }: { slots?: number; strict?: boolean; loaded?: boolean } = {}) {
   const store = createTestStore()
   // The sessions toggle only renders when there is a session to show.
-  act(() => {
-    store.dispatch(sseSlots(
-      Array.from({ length: slots }, (_, i) => ({ key: `slot-${i}`, title: `Session ${i}` }) as unknown as ChatSlot),
-    ))
-  })
+  // An empty push frame before the first list is ignored as "not loaded yet",
+  // so an empty list lands the way a cold boot's REST snapshot does.
+  const rows = Array.from({ length: slots }, (_, i) => ({ key: `slot-${i}`, title: `Session ${i}` }) as unknown as ChatSlot)
+  // `loaded: false` mounts the page before any list has arrived, as a refresh does.
+  if (loaded) act(() => { store.dispatch(rows.length ? sseSlots(rows) : fetchSlots.fulfilled([], 'req')) })
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   const tree = (
     <QueryClientProvider client={queryClient}>
@@ -174,10 +173,8 @@ describe('ChatPage — sessions toggle inside preview expand mode', () => {
   })
 
   it('does not let expand mode overwrite the stored preference when the list drains to empty', () => {
-    // The force-open rule persists 'true' whenever the list is empty and
-    // unpinned. Expand mode also unpins, so without the guard, draining the list
-    // to zero inside expand mode would write 'true' over a user who chose
-    // hidden — and the restore on exit would then contradict it in the live state.
+    // Expand mode unpins the list, so draining it to zero there must neither
+    // fight the auto-hide nor write over a user who chose hidden.
     const store = renderChat()
     fireEvent.click(screen.getByRole('button', { name: 'Hide sessions sidebar' }))
     expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
@@ -187,8 +184,10 @@ describe('ChatPage — sessions toggle inside preview expand mode', () => {
     expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
 
     setExpanded(false)
-    // Out of expand mode the empty list is the force-open rule's business again.
-    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('true')
+    // Out of expand mode the empty list is the force-open rule's business again,
+    // and that open is live only: the stored choice is not rewritten.
+    expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
   })
 
   it('stops maximizing the panel once the user reopens the session list', async () => {
@@ -228,6 +227,35 @@ describe('ChatPage — sessions toggle inside preview expand mode', () => {
   })
 })
 
+describe('ChatPage — a hidden session list survives a page refresh', () => {
+  beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1400 })
+    localStorage.clear()
+    __resetPanelTabs()
+  })
+
+  it('keeps the list hidden while the first slot list is still on its way', () => {
+    // A refresh mounts with an empty, not-yet-loaded list. That is not "no
+    // sessions", so the force-open rule must not open the list or store 'true'.
+    localStorage.setItem('mc-sidebar-pinned', 'false')
+    const store = renderChat({ slots: 0, loaded: false })
+    expect(screen.queryByTestId('sessions-drawer')).not.toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
+
+    act(() => { store.dispatch(sseSlots([{ key: 'slot-0', title: 'Session 0' } as unknown as ChatSlot])) })
+    expect(screen.queryByTestId('sessions-drawer')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Show sessions sidebar' })).toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
+  })
+
+  it('still opens the list for a loaded empty list without storing the open', () => {
+    localStorage.setItem('mc-sidebar-pinned', 'false')
+    renderChat({ slots: 0 })
+    expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
+    expect(localStorage.getItem('mc-sidebar-pinned')).toBe('false')
+  })
+})
+
 describe('ChatPage — mobile session drawer inside preview expand mode', () => {
   beforeEach(() => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 420 })
@@ -254,5 +282,26 @@ describe('ChatPage — mobile session drawer inside preview expand mode', () => 
     // Still reachable — an override would have made this button do nothing.
     openDrawer()
     expect(screen.getByTestId('sessions-drawer')).toBeInTheDocument()
+  })
+})
+
+// A width saved in board view (#14853) can be wider than SIDEBAR_MAX. The
+// collapsed sidebar's recents flyout is a session list, so it stays at most
+// SIDEBAR_MAX wide even when ChatSidebar is not mounted to report its seat.
+describe('ChatPage — the collapsed sessions flyout with a wide saved width', () => {
+  beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 3440 })
+    localStorage.clear()
+    __resetPanelTabs()
+  })
+
+  it('opens no wider than 1400 px', async () => {
+    localStorage.setItem('mc-sidebar-width', '2884')
+    renderChat()
+    fireEvent.click(screen.getByRole('button', { name: 'Hide sessions sidebar' }))
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Show sessions sidebar' }), { key: 'ArrowDown' })
+    const menu = await screen.findByRole('menu')
+    expect(menu.style.width).toBe('1400px')
+    expect(localStorage.getItem('mc-sidebar-width')).toBe('2884')
   })
 })

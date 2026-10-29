@@ -81,11 +81,8 @@ def test_goose_is_not_in_the_capability_sets_it_has_no_evidence_for() -> None:
     steer method, or an internal sandbox that would displace the credential mask
     this harness depends on.
 
-    ``ACP_BACKENDS_COMPACT`` is deliberately NOT in this list, and the sibling
-    test below says why: goose publishes ``compact`` among the built-ins its
-    ``available_commands_update`` carries and dispatches it before any model
-    turn, so its membership rests on evidence rather than on resemblance.
-    ``test_compaction_other_backends`` holds that evidence.
+    ``ACP_BACKENDS_COMPACT`` is deliberately NOT in this list: goose is a member,
+    on the driven capture the sibling test below names.
     """
     assert GOOSE not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
     assert GOOSE not in sdk_backends.ACP_BACKENDS_STEER
@@ -93,28 +90,34 @@ def test_goose_is_not_in_the_capability_sets_it_has_no_evidence_for() -> None:
     assert GOOSE not in sdk_backends.ACP_BACKENDS_SESSION_SHARING
 
 
-def test_goose_compaction_is_unclassified_pending_a_capture() -> None:
-    """Absence as a decision, and the decision is about the evidence CLASS.
+def test_goose_compacts_inline_on_a_driven_capture() -> None:
+    """goose 1.50.1 serves a manual ``/compact`` and finishes it inside the turn.
 
-    goose 1.50.1 -- the release this harness pins as its VERIFIED RANGE --
-    dispatches ``/compact`` out of ``Agent::reply`` through ``execute_command``
-    before a model turn starts, and its own ``command_starts_turn("/compact")``
-    is false, so its SOURCE says the compaction finishes inside the prompt turn.
-    What it lacks is a driven capture, which is the bar
-    ``ACP_BACKENDS_COMPACT`` holds its members to.
-
-    So goose is in none of the three compaction sets, and that is the position
-    every arm has to agree on: it is not offered a manual ``/compact``, it is not
-    claimed to manage its own context, and it is not recycled.
+    ``test/fixtures/acp_frames/goose/compact-live.jsonl`` is the drive:
+    ``usage_update.used`` climbed 1529 -> 1991 -> 2453, the ``/compact`` turn
+    ended with ``end_turn`` and no status frame, and the next ordinary turn read
+    1749. So Crew compacts it, and it is neither harness-managed nor recycled.
     """
-    assert GOOSE not in sdk_backends.ACP_BACKENDS_COMPACT
-    assert GOOSE not in sdk_backends.ACP_BACKENDS_INLINE_COMPACTION
+    assert GOOSE in sdk_backends.ACP_BACKENDS_COMPACT
+    assert GOOSE in sdk_backends.ACP_BACKENDS_INLINE_COMPACTION
     harness_managed = getattr(sdk_backends, "ACP_BACKENDS_HARNESS_MANAGED_COMPACTION", None)
     assert harness_managed is not None, "agent_sdk.backends declares no harness-managed set"
     assert GOOSE not in harness_managed
     recycle = getattr(sdk_backends, "ACP_BACKENDS_CONTEXT_RECYCLE", None)
     assert recycle is not None, "agent_sdk.backends declares no context-recycle set"
     assert GOOSE not in recycle
+
+
+def test_goose_takes_effort_through_its_own_advertised_option() -> None:
+    """goose joins the effort channel under ``thinking_effort``, and its option decides.
+
+    ``effort-live.jsonl`` is the evidence: a thinking model is offered off through max
+    and a write of ``high`` reads back ``high``.
+    """
+    assert GOOSE in sdk_backends.ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+    assert GOOSE in sdk_backends.ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION
+    assert sdk_backends.effort_config_option_id(GOOSE) == "thinking_effort"
+    assert sdk_backends.effort_config_option_value(GOOSE, "high") == "high"
 
 
 def test_goose_serves_session_load_so_it_needs_no_load_workaround() -> None:
@@ -145,6 +148,9 @@ def _stub(backend: str = GOOSE) -> AcpClient:
     client._acp_backend = backend
     client._available_mode_ids = []
     client._modes_advertised = False
+    client._session_key = ""
+    client._agent = ""
+    client._spec_zero_tools = False
     return client
 
 
@@ -334,35 +340,26 @@ def test_goose_gets_its_own_mcp_array_at_both_session_call_sites() -> None:
     import inspect
     import textwrap
 
-    # The two arrays sit in DIFFERENT methods -- session/new is composed by
-    # ``_new_session_following_substitution`` and session/load by
-    # ``_initialize_session`` -- so both are read rather than assuming one owner.
-    gated = 0
+    # Three arrays are composed across two methods: the initial session/new and
+    # its substitution retry live in ``_new_session_following_substitution``;
+    # session/load lives in ``_initialize_session``.
+    splices = 0
     for method in (
         AcpClient._new_session_following_substitution,
         AcpClient._initialize_session,
     ):
         tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-        gated += sum(
+        splices += sum(
             1
             for node in ast.walk(tree)
             if isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in ("_goose_session_mcp_servers", "_gated_session_mcp_servers")
         )
-    assert gated == 2, (
-        "goose is in ACP_BACKENDS_SESSION_MCP_ARRAY, so its array must be composed at "
-        f"BOTH the session/new and session/load call sites; found {gated}"
-    )
-
-    # The membership half, which is what actually decides the array is non-empty:
-    # ``_session_mcp_servers`` returns ``[]`` for any backend OUTSIDE the set and
-    # resolves the spec for a member, so a goose client must take the member path.
-    client = _stub(GOOSE)
-    client._session_mcp_cache = [{"name": "kirocrew", "command": "kirocrew", "args": []}]
-    assert client._session_mcp_servers(), (
-        "a goose session must receive a non-empty mcpServers array -- the array is "
-        "the ONLY channel Crew's tools reach this harness on"
+    assert splices == 3, (
+        "goose is in ACP_BACKENDS_SESSION_MCP_ARRAY, so its array must be spliced into "
+        "the initial session/new, the substitution retry, and session/load; "
+        f"found {splices}"
     )
 
 
@@ -1565,20 +1562,10 @@ def test_a_classified_goose_call_is_still_approved_without_a_deny_set() -> None:
 
 
 def test_a_harness_outside_the_set_builds_nothing_without_a_deny_set() -> None:
-    """Every other backend keeps the prior site: no JUDGING, plain approve.
+    """Every other backend keeps the prior answer: a plain approve, no option ids.
 
-    FORK DIVERGENCE (.fork-sync.yml, divergences/mcp-injection-composition's
-    sibling -- the unattended worker gate): upstream builds the permission event
-    INSIDE ``if self._judges_permission_requests``, so it can assert that a
-    non-judging session builds no event at all. This build hoists the build above
-    that branch because its fork-only worker gate (``_audit_source`` ->
-    ``event.raw_params_trusted`` / ``event.shell_classified``) reads the event on
-    the NON-judging path too; making the build conditional again would leave that
-    gate with nothing to read and fail it OPEN. So what is asserted here is the
-    invariant the original test stands for -- a session that judges nothing runs
-    none of the judging refusals and plainly approves -- rather than the absence
-    of the build itself.
-    """
+    The event is built for the approval floor alone; nothing it advertised is
+    recorded, so the answer this site sends is the one it always sent."""
     import asyncio
 
     from kiro_crew.acp.types import JsonRpcMessage
@@ -1590,21 +1577,18 @@ def test_a_harness_outside_the_set_builds_nothing_without_a_deny_set() -> None:
     async def _approve(request_id: str) -> None:
         approved.append(request_id)
 
-    async def _never_judge(_event):  # pragma: no cover - must not run
-        raise AssertionError("a judging refusal ran on a session that judges nothing")
+    built: list = []
+    client._permission_options = {}
+
+    def _build(msg):
+        from kiro_crew.acp.types import EVENT_PERMISSION_REQUEST, AcpEvent
+
+        built.append(msg.id)
+        client._permission_options[msg.id] = {"once": "allow"}
+        return AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id=msg.id)
 
     client.approve_tool = _approve  # type: ignore[method-assign]
-    client._deny_spec_disabled_tool = _never_judge  # type: ignore[method-assign]
-    client._refuse_identity_drift = _never_judge  # type: ignore[method-assign]
-    # The real ``_build_permission_event`` now runs on this path (see the
-    # divergence above), so the stub carries the maps ``__init__`` would have.
-    client._tool_call_inputs = {}
-    client._tool_call_is_shell = {}
-    client._tool_call_mcp_server = {}
-    client._tool_call_params = {}
-    client._tool_call_tool_name = {}
-    client._permission_options = {}
-    assert not client._judges_permission_requests
+    client._build_permission_event = _build  # type: ignore[method-assign]
 
     # ``params`` carries this handle's own ``sessionId``: the fork's
     # ``_permission_frame_answerable`` refuses a frame with NO session id as
@@ -1618,6 +1602,8 @@ def test_a_harness_outside_the_set_builds_nothing_without_a_deny_set() -> None:
     )
     asyncio.run(client._handle_permission(msg))
     assert approved == ["perm-c"]
+    assert built == ["perm-c"], "the approval floor needs the event"
+    assert "perm-c" not in client._permission_options
 
 
 def test_the_drift_refusals_run_on_both_answering_sites() -> None:
@@ -1631,3 +1617,320 @@ def test_the_drift_refusals_run_on_both_answering_sites() -> None:
     stream = inspect.getsource(AcpClient.send_message_stream)
     assert "if self._judges_permission_requests:" in stream
     assert "self._extract_tool_event(msg)" in stream
+
+
+# ── An unconfigured harness: the declared message, and no retry ──
+
+#: The ``session/new`` error goose 1.50.1 and 1.52.0 return when no provider is
+#: configured, copied off the live wire (``goose acp``, empty config home).
+_GOOSE_NO_PROVIDER_ERROR = {
+    "code": -32603,
+    "message": "Internal error",
+    "data": "Failed to resolve provider: Configuration value not found: GOOSE_PROVIDER",
+}
+
+
+def _startup_client(backend: str, spawns: list[int]) -> AcpClient:
+    """A client whose every ``session/new`` answers the live no-provider error.
+
+    Shaped the way ``_send_request`` raises it, so the startup ladder sees the same
+    ``AcpError`` text a real goose child produces.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp.client import AcpError
+
+    client = AcpClient(acp_backend=backend)
+    client._process = None
+    client._session_id = None
+    client._kill_process = AsyncMock()
+    client._cleanup_failed_live_spawn = AsyncMock()
+    client._snapshot_process_tree = AsyncMock()
+
+    def _reset():
+        # The real reset drops the process handle, which is what makes the next
+        # pass spawn again; without it a retry would silently be a no-op.
+        client._process = None
+        client._session_id = None
+
+    client._reset_state = _reset
+
+    async def _spawn():
+        spawns.append(1)
+        client._process = MagicMock()
+        client._process.returncode = None
+
+    async def _session_new():
+        raise AcpError(f"JSON-RPC error: {_GOOSE_NO_PROVIDER_ERROR}")
+
+    client._spawn = _spawn
+    client._initialize_session = _session_new
+    return client
+
+
+def test_an_unconfigured_goose_names_the_fix_and_is_not_retried() -> None:
+    import asyncio
+
+    from kiro_crew.acp.client import AcpAuthRequired, AcpError
+    from kiro_crew.agent_sdk import host_auth
+
+    spawns: list[int] = []
+    client = _startup_client(GOOSE, spawns)
+    with pytest.raises(AcpError) as info:
+        asyncio.run(client.ensure_ready())
+    assert str(info.value) == host_auth.signed_out_message(GOOSE)
+    # One spawn: a fresh process reads the same missing provider.
+    assert spawns == [1]
+    assert info.value.transient is False
+    # Not the Kiro sign-in type: the dashboard would mark a valid kiro-cli login
+    # as signed out over a goose setup gap.
+    assert not isinstance(info.value, AcpAuthRequired)
+    assert info.value.auth_required is False
+
+
+def test_the_goose_phrase_does_not_classify_another_harness() -> None:
+    """Scoped per harness: kiro-cli meeting the same words keeps its retry."""
+    import asyncio
+
+    from kiro_crew.acp.client import AcpAuthRequired, AcpError
+
+    spawns: list[int] = []
+    client = _startup_client(acp_backends.ACP_BACKEND_KIRO, spawns)
+    with pytest.raises(AcpError) as info:
+        asyncio.run(client.ensure_ready())
+    assert not isinstance(info.value, AcpAuthRequired)
+    assert spawns == [1, 1]
+
+
+def test_a_cancel_answers_the_open_permission_request_as_cancelled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACP: after ``session/cancel`` the client answers every open permission request.
+
+    goose holds a cancelled turn open until its permission request is answered, so a
+    Stop from a surface that did not reject the open approval first waited out the
+    whole ack budget and hard-killed the process. The frame is the live capture's own.
+    """
+    import asyncio
+    import threading
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp.types import JsonRpcMessage
+
+    frame = next(
+        json.loads(line)
+        for line in (CORPUS / "turn-live.jsonl").read_text(encoding="utf-8").splitlines()
+        if '"session/request_permission"' in line
+    )
+    audited: list[dict] = []
+    recorder = MagicMock()
+    recorder.log_tool_invocation = lambda **kw: audited.append(kw)
+    resolved_on: list[object] = []
+
+    def _sel() -> MagicMock:
+        # An unwarmed sel() initialises on the calling thread, so it must be
+        # resolved inside the off-loop hop, never on the event loop.
+        resolved_on.append(threading.current_thread())
+        return recorder
+
+    monkeypatch.setattr(acp_client.sel_module, "sel", _sel)
+    client = AcpClient(work_dir=tmp_path, acp_backend=GOOSE)
+    proc = MagicMock()
+    proc.returncode = None
+    proc.stdin.drain = AsyncMock()
+    client._process = proc
+    client._session_id = frame["params"]["sessionId"]
+    client._build_permission_event(
+        JsonRpcMessage(id=frame["id"], method=frame["method"], params=frame["params"])
+    )
+
+    asyncio.run(client.cancel_session())
+
+    # The cancelled approval is a denial Crew made, so it is audited like one.
+    assert [(a["outcome"], a["request_id"]) for a in audited] == [
+        ("rejected_on_cancel", frame["id"])
+    ]
+    assert resolved_on and threading.main_thread() not in resolved_on
+
+    written = [
+        json.loads(line)
+        for call in proc.stdin.write.call_args_list
+        for line in call.args[0].decode().splitlines()
+    ]
+    assert [w.get("method") for w in written] == ["session/cancel", None]
+    assert written[1] == {
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": {"outcome": {"outcome": "cancelled"}},
+    }
+    # Answered once: a second cancel has nothing left to answer.
+    asyncio.run(client.cancel_session())
+    assert len(proc.stdin.write.call_args_list) == len(written) + 1
+
+
+def test_a_keyring_only_goose_is_told_how_to_store_its_key_where_it_can_read_it() -> None:
+    """The one goose sign-in that ``goose configure`` alone cannot fix.
+
+    goose keeps keys in the OS keyring by default, which the sandboxed child
+    cannot reach. goose 1.52.0, run live with a provider configured and its key
+    only in the keyring, opens the session and answers the first
+    ``session/prompt`` with this frame. The message must name the file-storage
+    switch: telling that operator to run ``goose configure`` again only puts the
+    key back in the keyring.
+    """
+    from kiro_crew.acp.client import _format_acp_error
+
+    text = _format_acp_error({"code": -32000, "message": "Authentication required"}, backend=GOOSE)
+
+    assert "GOOSE_DISABLE_KEYRING=true goose configure" in text
+    assert "keyring" in text
+    assert "secrets.yaml" in text
+
+
+# ── Reasoning effort, per model ──────────────────────────────────────────────
+
+
+def _effort_frames() -> list[dict]:
+    """Every frame of ``effort-live.jsonl``, header excluded."""
+    lines = (CORPUS / "effort-live.jsonl").read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines[1:]]
+
+
+def _config_option_sets() -> list[list[dict]]:
+    """Each ``configOptions`` array the capture carries, in wire order."""
+    sets = []
+    for frame in _effort_frames():
+        result = frame.get("result") or {}
+        update = (frame.get("params") or {}).get("update") or {}
+        options = result.get("configOptions") or update.get("configOptions")
+        if options:
+            sets.append(options)
+    return sets
+
+
+def _thinking_effort(options: list[dict]) -> tuple[str, list[str]]:
+    for option in options:
+        if option.get("id") == "thinking_effort":
+            return option["currentValue"], [v["value"] for v in option["options"]]
+    raise AssertionError("no thinking_effort option in this configOptions array")
+
+
+def _goose_provider(tmp_path, options: list[dict]):
+    """An ``AcpProvider`` on goose with one captured ``configOptions`` array stored."""
+    from kiro_crew.providers.acp import AcpProvider
+
+    provider = AcpProvider(acp_backend=GOOSE, work_dir=tmp_path, model="claude-sonnet-4")
+    provider._client._acp_config_options = options
+    return provider
+
+
+class TestGooseEffortReachesAThinkingModel:
+    """The capture is one live session: thinking model, a write, then a model switch."""
+
+    def test_the_capture_shows_the_option_following_the_model(self) -> None:
+        """The premise: goose offers levels on a thinking model and ``off`` alone otherwise."""
+        sets = [_thinking_effort(options) for options in _config_option_sets()]
+        full = ["off", "low", "medium", "high", "max"]
+        assert sets[0] == ("off", full)
+        # The write of ``high`` on the thinking model, as update then result.
+        assert sets[1] == ("high", full)
+        assert sets[2] == ("high", full)
+        # The switch to a model with no extended thinking, and a write there.
+        assert sets[3:] == [("off", ["off"])] * 4
+
+    def test_a_thinking_session_offers_the_control(self, tmp_path) -> None:
+        provider = _goose_provider(tmp_path, _config_option_sets()[0])
+
+        assert provider.supports_effort() is True
+        assert provider.get_valid_effort_levels() == ["off", "low", "medium", "high", "max"]
+        assert provider.accepts_effort_level("high") is True
+        # Absent from goose's vocabulary, so hidden rather than folded.
+        assert provider.accepts_effort_level("xhigh") is False
+
+    @pytest.mark.asyncio
+    async def test_the_level_is_written_under_thinking_effort(self, tmp_path) -> None:
+        from unittest.mock import AsyncMock
+
+        provider = _goose_provider(tmp_path, _config_option_sets()[0])
+        provider._client.set_config_option = AsyncMock()
+
+        await provider._set_effort_config_option("high")
+
+        provider._client.set_config_option.assert_awaited_once_with("thinking_effort", "high")
+
+    def test_a_non_thinking_model_offers_no_control(self, tmp_path) -> None:
+        """``off`` alone: every write reads back ``off``, so no dropdown is offered."""
+        provider = _goose_provider(tmp_path, _config_option_sets()[-1])
+
+        assert provider.supports_effort() is False
+
+    def test_a_model_switch_update_withdraws_the_control(self, tmp_path) -> None:
+        """The live update after the switch is what moves the answer, not a re-spawn."""
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        provider = _goose_provider(tmp_path, _config_option_sets()[0])
+        assert provider.supports_effort() is True
+        switch = [
+            frame
+            for frame in _effort_frames()
+            if ((frame.get("params") or {}).get("update") or {}).get("sessionUpdate")
+            == "config_option_update"
+        ][1]
+
+        provider._client._handle_config_option_update(
+            JsonRpcMessage(method=switch["method"], params=switch["params"])
+        )
+
+        assert provider.supports_effort() is False
+
+    @pytest.mark.asyncio
+    async def test_a_live_set_model_withdraws_the_control(self, tmp_path) -> None:
+        """``AcpProvider.set_model`` reads goose's answer to the ``model`` write itself.
+
+        The real path, not the notification handler: the switch goes through
+        ``AcpClient.set_config_option``, whose wait only buffers the
+        ``config_option_update`` that arrives first, so the answer must come from
+        the result's own ``configOptions``. The wire frames are the capture's.
+        """
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        frames = _effort_frames()
+        # The model switch: goose's update, then the result of request id 5.
+        switch_update, switch_result = frames[4], frames[5]
+        assert switch_result["id"] == 5
+        assert _thinking_effort(switch_result["result"]["configOptions"]) == ("off", ["off"])
+        provider = _goose_provider(tmp_path, _config_option_sets()[0])
+        client = provider._client
+        client._session_id = "goose-session-1"
+        assert provider.supports_effort() is True
+
+        sent: list[tuple[str, dict]] = []
+        wire = [JsonRpcMessage.from_dict(switch_update), JsonRpcMessage.from_dict(switch_result)]
+
+        async def _send_request(method, params, **_kwargs):
+            sent.append((method, params))
+            return 5
+
+        async def _read_message(timeout=None):
+            return wire.pop(0) if wire else None
+
+        client._send_request = _send_request
+        client._read_message = _read_message
+
+        await provider.set_model("llama3.2:3b")
+
+        assert sent[0] == (
+            "session/set_config_option",
+            {"sessionId": "goose-session-1", "configId": "model", "value": "llama3.2:3b"},
+        )
+        assert provider.supports_effort() is False
+        # The off-only model takes no effort write after the switch.
+        assert [params["configId"] for _method, params in sent] == ["model"]
+
+    def test_the_knowledge_pool_sends_nothing_on_an_off_only_option(self) -> None:
+        from kiro_crew.knowledge.llm_pool import _select_effort_level
+
+        assert _select_effort_level("high", ["off"]) is None
+        assert _select_effort_level("high", ["off", "low", "medium", "high", "max"]) == "high"
+        # An option with no recognisable level at all keeps the lazy-backend attempt.
+        assert _select_effort_level("high", ["minimal"]) == "high"

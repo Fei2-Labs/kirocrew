@@ -11,8 +11,9 @@ command — reads its answer from :func:`derive_capability` instead of probing t
 environment itself, so the derivation cannot drift between them.
 
 ``mode`` describes the designed consent posture for a shape, not the behavior of
-the legacy ``auto_update`` config key, which still drives an unattended
-boot-time apply on a git checkout and is governed elsewhere.
+the legacy ``auto_update`` config key. What that key actually does on this
+install is :func:`auto_update_effect`, the one derivation both the gateway's
+unattended update loop and the dashboard status read.
 
 Two fields specified for this contract are deliberately absent: ``state`` and
 ``progress`` describe an apply/drain lifecycle that does not exist yet, and
@@ -24,11 +25,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from dataclasses import dataclass, replace
 from typing import Any
 
 from kiro_crew._bootstrap import _source_checkout_root
-from kiro_crew.beacon import distribution
+from kiro_crew.beacon import baked_distribution, distribution
 from kiro_crew.platform_compat import trusted_system_bin
 
 #: Who owns replacing this install's bytes.
@@ -105,6 +107,22 @@ _CONTAINER_DISTRIBUTIONS = frozenset({"docker"})
 EXTERNALLY_MANAGED_STAMPS = _ELECTRON_DISTRIBUTIONS | _CONTAINER_DISTRIBUTIONS
 
 _GIT_TIMEOUT_SECS = 5
+
+#: What the gateway's unattended update loop does with an available update.
+#: ``install``: with ``auto_update`` on, it installs and restarts. ``notify``: it
+#: only tells the user, whatever ``auto_update`` says. ``mandatory``: a policy
+#: floor this build is below installs it whatever ``auto_update`` says.
+#: ``unknown`` is the status surface's value before the first derivation; the
+#: loop never sees it.
+AUTO_EFFECT_INSTALL = "install"
+AUTO_EFFECT_NOTIFY = "notify"
+AUTO_EFFECT_MANDATORY = "mandatory"
+AUTO_EFFECT_UNKNOWN = "unknown"
+
+#: Which unattended apply path installs on this install.
+AUTO_ROUTE_GIT = "git"
+AUTO_ROUTE_WHEEL = "wheel"
+AUTO_ROUTE_PROVIDER = "provider"
 
 #: Environment variables that point git at a DIFFERENT repository than ``-C``
 #: names. Left in place, ``GIT_DIR`` alone makes ``rev-parse --show-toplevel``
@@ -470,7 +488,193 @@ def derive_capability(
     )
 
 
+@dataclass(frozen=True)
+class AutoUpdateEffect:
+    """The answer :func:`auto_update_effect` gives: what, which path, and why not."""
+
+    effect: str
+    #: The apply path that installs here, or ``None`` when nothing can.
+    route: str | None
+    #: Why no path can install here; empty when one can.
+    reason: str = ""
+
+    @property
+    def blocked(self) -> bool:
+        """The policy source pin is the reason: no path, manual ones included, may install."""
+        return self.reason == _SOURCE_PIN_REASON
+
+
+#: Default for :func:`auto_update_effect`'s ``provider``: resolve it from policy.
+_RESOLVE_PROVIDER: Any = object()
+
+#: The reason a route's update source fails the policy source pin.
+_SOURCE_PIN_REASON = "the update source is not the one the security policy pins"
+
+
+def bundled_by_desktop_app(dist: str | None = None) -> bool:
+    """Is this gateway the backend the desktop app bundles and launches?
+
+    Read from the BAKED distribution stamp, the same check ``derive_capability``
+    makes first, so it is a property of how this copy was packaged and nothing a
+    running install can relabel. Independent of who owns the UPDATE: with a
+    policy ``updates`` provider, ``managed_by`` reports ``command`` on the very
+    same bundle (the provider is resolved before the desktop deferral), so a
+    surface that needs "am I inside the app" cannot read that field for it. No
+    I/O, so a status frame may call it.
+    """
+    return (baked_distribution() if dist is None else dist) in _ELECTRON_DISTRIBUTIONS
+
+
+def _installer_runs_here() -> bool:
+    """The managed venv is cli.sh's, a POSIX install; the seam tests pin this."""
+    return sys.platform != "win32"
+
+
+def _git_route(root: str) -> tuple[str | None, str]:
+    """The unattended git apply's STATIC gates, read with the helpers it uses."""
+    from kiro_crew import platform_compat
+    from kiro_crew.platform.update_governance import (
+        _git,
+        is_primary_branch,
+        repo_exec_config_reason,
+        resolve_remote_url,
+        tracks_upstream,
+        update_blocked_reason,
+    )
+
+    if platform_compat.trusted_git_bin() is None:
+        return None, "no trustworthy git outside PATH"
+    branch = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch:
+        return None, "the current branch could not be read"
+    if not is_primary_branch(branch):
+        label = "a detached HEAD" if branch == "HEAD" else branch
+        return None, f"{label} is not a primary branch"
+    if repo_exec_config_reason(root):
+        return None, "the repository names a program git would run during the update"
+    if not tracks_upstream(root, branch):
+        return None, f"{branch} does not track origin/{branch}"
+    if update_blocked_reason(resolve_remote_url(root, remote="origin")):
+        return None, _SOURCE_PIN_REASON
+    return AUTO_ROUTE_GIT, ""
+
+
+def _runs_from_managed_venv() -> bool:
+    """Whether the cli.sh-managed venv serves this process (layout stats only)."""
+    from kiro_crew.platform.wheel_engine import running_from_managed_venv
+
+    return running_from_managed_venv()
+
+
+def _wheel_route() -> tuple[str | None, str]:
+    """The unattended shadow apply's STATIC gates (``wheel_apply.preflight_bases``)."""
+    from kiro_crew.platform.update_governance import update_blocked_reason
+    from kiro_crew.platform.update_layout import cdn_bases, cdn_bases_are_safe
+    from kiro_crew.platform_compat import trusted_system_bin
+
+    if not _installer_runs_here():
+        return None, "the managed venv is a POSIX install"
+    if not trusted_system_bin("openssl"):
+        # The engine verifies the signed manifest with a trusted openssl and
+        # refuses rather than fall back to a bare name, so a host with none
+        # cannot install unattended at all.
+        return None, "no trusted openssl outside PATH to verify the signed release"
+    if not _runs_from_managed_venv():
+        return None, "only the managed venv updates itself unattended"
+    if not cdn_bases_are_safe():
+        return None, "the CDN base is not a safe HTTPS URL"
+    if any(update_blocked_reason(base) for base in cdn_bases()):
+        return None, _SOURCE_PIN_REASON
+    return AUTO_ROUTE_WHEEL, ""
+
+
+def auto_update_effect(
+    *,
+    install_root: str | None = None,
+    dist: str | None = None,
+    provider: Any = _RESOLVE_PROVIDER,
+    running_version: str | None = None,
+    git_probes: bool = True,
+) -> AutoUpdateEffect | None:
+    """What an available update leads to on this install, and by which path.
+
+    Derived from install shape and policy alone, so it is known before any
+    check has run: a policy provider owns the update when one is configured,
+    and can install only with an ``apply_command`` it can run; a git checkout
+    and a managed venv install only past their unattended path's static gates
+    (dynamic ones, such as the git path's "a release, not just new commits",
+    stay with the update itself); anything else is updated elsewhere. A build
+    below the policy floor is ``mandatory`` wherever a path can install.
+
+    Blocking I/O (git, policy, the filesystem): call it off the event loop.
+    *provider* defaults to the policy's; pass ``None`` when the caller already
+    knows there is none.
+
+    ``git_probes=False`` answers only where no git subprocess is needed -- the
+    packaged shapes from their baked stamp, a policy provider from the
+    boot-frozen pins, and every install not running from a source checkout from
+    the installer route's own gates -- and returns ``None`` for a checkout,
+    whose branch and remote only git can report. A status surface serving a frame before the update loop's
+    first derivation uses it, so a shape whose answer is already knowable is
+    never reported as unknown.
+    """
+    if provider is _RESOLVE_PROVIDER:
+        from kiro_crew.platform.update_provider import resolve_provider
+
+        provider = resolve_provider()
+    route: str | None
+    if provider is not None:
+        # A provider predating ``can_apply`` applies whenever asked, as before.
+        if getattr(provider, "can_apply", lambda: True)():
+            route, reason = AUTO_ROUTE_PROVIDER, ""
+        else:
+            route, reason = None, "the policy's apply_command is missing or cannot run here"
+    elif (distribution() if dist is None else dist) in EXTERNALLY_MANAGED_STAMPS:
+        # The baked stamp, so this one needs no I/O at all.
+        route, reason = None, "its own updater owns this install"
+    elif not git_probes and _source_checkout_root() is None:
+        # Not running from a source checkout, so the git route cannot apply and
+        # the answer is the installer route's, which needs no git: a managed
+        # venv installs, a pipx or bare venv only notifies.
+        route, reason = _wheel_route()
+    elif not git_probes:
+        # A checkout: its branch and remote are what git alone can report.
+        return None
+    else:
+        if install_root is None:
+            install_root = os.environ.get("KIROCREW_PROJECT_DIR", "")
+        managed_by = derive_capability(install_root=install_root, dist=dist).managed_by
+        if managed_by == MANAGED_BY_GIT:
+            route, reason = _git_route(install_root)
+        elif managed_by == MANAGED_BY_KIROCREW:
+            route, reason = _wheel_route()
+        else:
+            route, reason = None, "its own updater owns this install"
+    if route is None:
+        return AutoUpdateEffect(AUTO_EFFECT_NOTIFY, None, reason)
+
+    from kiro_crew.platform.update_governance import update_required
+
+    if running_version is None:
+        import kiro_crew
+
+        running_version = kiro_crew.__version__
+    if update_required(running_version):
+        return AutoUpdateEffect(AUTO_EFFECT_MANDATORY, route)
+    return AutoUpdateEffect(AUTO_EFFECT_INSTALL, route)
+
+
 __all__ = [
+    "AUTO_EFFECT_INSTALL",
+    "AUTO_EFFECT_MANDATORY",
+    "AUTO_EFFECT_NOTIFY",
+    "AUTO_EFFECT_UNKNOWN",
+    "AUTO_ROUTE_GIT",
+    "AUTO_ROUTE_PROVIDER",
+    "AUTO_ROUTE_WHEEL",
+    "AutoUpdateEffect",
+    "auto_update_effect",
+    "bundled_by_desktop_app",
     "CHECK_CHECKING",
     "CHECK_DEFERRED",
     "CHECK_FAILED",

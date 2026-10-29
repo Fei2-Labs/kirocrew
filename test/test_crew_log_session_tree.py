@@ -23,6 +23,7 @@ from kiro_crew.crew_log.session_tree import (
     CHAIN_END_CYCLE,
     CHAIN_END_FIRST,
     CHAIN_END_FOREIGN,
+    CHAIN_END_GAP,
     CHAIN_END_MISSING,
     CHAIN_END_UNKNOWN,
     SLOT_CHAIN_CAP,
@@ -45,9 +46,27 @@ def _isolated_home(tmp_path, monkeypatch):
     yield
 
 
-def _rec(sid: str, slot: str, created: int = 1, parent: str | None = None, previous=None):
+def _rec(
+    sid: str,
+    slot: str,
+    created: int = 1,
+    parent: str | None = None,
+    previous=None,
+    edge: str | None = None,
+):
+    # Mirror the emitter: a log that names a predecessor carries EDGE_NAMED, and one
+    # that names none STATES it starts the chain (EDGE_NONE, what previous_none=True
+    # records). ``edge`` overrides this to build a GAP log -- a cold-started
+    # successor that cites nothing without stating it is first.
+    if edge is None:
+        edge = session_tree.EDGE_NAMED if previous else session_tree.EDGE_NONE
     return OpenedRecord(
-        sid=sid, slot=slot, created_at=created, parent_slot=parent, previous_sid=previous
+        sid=sid,
+        slot=slot,
+        created_at=created,
+        parent_slot=parent,
+        previous_sid=previous,
+        previous_edge=edge,
     )
 
 
@@ -62,6 +81,8 @@ def _opened(
     parent: dict[str, str] | None = None,
     resumed: bool = False,
     previous: object = None,
+    previous_none: bool = False,
+    previous_undecided: bool = False,
 ) -> None:
     data = {
         "agent": "kirocrew",
@@ -77,6 +98,13 @@ def _opened(
     # log and the reader's "first log" answer depends on that absence.
     if previous is not None:
         data["previous"] = previous
+    # The emitter STATES a first log with ``previous_none`` and a gap it could not
+    # name with ``previous_undecided``; a log that writes neither (predating the keys)
+    # reads as EDGE_LEGACY, which is also a gap.
+    if previous_none:
+        data["previous_none"] = True
+    if previous_undecided:
+        data["previous_undecided"] = True
     handle.append("session/opened", data, src=GATEWAY)
 
 
@@ -766,6 +794,149 @@ def test_parent_payload_never_nests_a_cycle_or_a_row_under_itself() -> None:
     assert parent_payload(nodes["S"], live, "dashboard:S")["key"] is None  # type: ignore[index]
 
 
+# ── nesting past a closed creator ──────────────────────────────────────────
+#
+# The chain the fold holds outlives the sessions on it: a closed session's records
+# stay in the projection, so the walk has somewhere to go. These are the cases
+# where the walk must and must not move a row.
+
+
+def _crew() -> dict[str, session_tree.TreeNode]:
+    """lead -> mid -> inner -> worker, the shape the real case came from."""
+    return fold_tree(
+        [
+            _rec("l", "lead", created=1),
+            _rec("m", "mid", created=2, parent="lead"),
+            _rec("i", "inner", created=3, parent="mid"),
+            _rec("w", "worker", created=4, parent="inner"),
+        ]
+    )
+
+
+def test_parent_payload_nests_under_the_nearest_open_ancestor() -> None:
+    nodes = _crew()
+    # ``mid`` is open and ``inner`` is closed, so the worker belongs under ``mid`` --
+    # the NEAREST open ancestor, not the root.
+    live = {"lead": "dashboard:lead", "mid": "dashboard:mid", "worker": "dashboard:worker"}
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) == {
+        "slot": "inner",
+        "key": "dashboard:mid",
+        "ancestor": True,
+    }
+    # Only ``lead`` left open: the walk runs the whole chain to it.
+    assert parent_payload(
+        nodes["worker"], {"lead": "dashboard:lead"}, "dashboard:worker", nodes
+    ) == {
+        "slot": "inner",
+        "key": "dashboard:lead",
+        "ancestor": True,
+    }
+
+
+def test_parent_payload_marks_the_ancestor_edge_only_when_it_moved_the_row() -> None:
+    nodes = _crew()
+    live = {"inner": "dashboard:inner"}
+    # The creator itself is open: the ordinary edge, and no flag on it.
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) == {
+        "slot": "inner",
+        "key": "dashboard:inner",
+    }
+
+
+def test_parent_payload_stays_an_orphan_root_when_no_ancestor_is_open() -> None:
+    nodes = _crew()
+    # Every ancestor closed, so there is nothing to nest under and the citation is
+    # the whole answer -- byte-identical to what the surface drew before the walk.
+    assert parent_payload(
+        nodes["worker"], {"worker": "dashboard:worker"}, "dashboard:worker", nodes
+    ) == {
+        "slot": "inner",
+        "key": None,
+    }
+
+
+def test_parent_payload_walk_stops_where_the_fold_stops() -> None:
+    # ``inner``'s own log is not in the fold, so the chain above the closed creator
+    # is unknown rather than closed, and the row stays a root.
+    nodes = fold_tree(
+        [
+            _rec("l", "lead", created=1),
+            _rec("w", "worker", created=4, parent="inner"),
+        ]
+    )
+    live = {"lead": "dashboard:lead", "worker": "dashboard:worker"}
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) == {
+        "slot": "inner",
+        "key": None,
+    }
+
+
+def test_parent_payload_walk_refuses_a_cycle_and_a_row_above_itself() -> None:
+    # ``mid`` and ``top`` cite each other; the worker hangs off that cycle. The fold
+    # marks the pair, and the walk follows neither, so the worker keeps its citation.
+    nodes = fold_tree(
+        [
+            _rec("t", "top", created=1, parent="mid"),
+            _rec("m", "mid", created=2, parent="top"),
+            _rec("w", "worker", created=3, parent="mid"),
+        ]
+    )
+    assert parent_payload(nodes["worker"], {"top": "dashboard:top"}, "dashboard:worker", nodes) == {
+        "slot": "mid",
+        "key": None,
+    }
+    # And a chain that leads back to the row itself is not an edge either: ``mid``
+    # cites the worker, so nesting the worker on it would invert the tree.
+    own = fold_tree(
+        [
+            _rec("w", "worker", created=1, parent="mid"),
+            _rec("m", "mid", created=2, parent="worker"),
+        ]
+    )
+    assert parent_payload(
+        own["worker"], {"worker": "dashboard:worker"}, "dashboard:worker", own
+    ) == {
+        "slot": "mid",
+        "key": None,
+    }
+
+
+def test_parent_payload_walk_is_bounded_by_the_unit_cap() -> None:
+    # A chain longer than the hop ceiling, every member closed except the very top.
+    # The walk must stop at the cap rather than run the whole thing.
+    length = session_tree.TREE_UNIT_CAP + 50
+    records = [_rec("s0", "s0", created=1)]
+    records += [_rec(f"s{i}", f"s{i}", created=i + 1, parent=f"s{i - 1}") for i in range(1, length)]
+    nodes = fold_tree(records)
+    tail = f"s{length - 1}"
+    assert parent_payload(nodes[tail], {"s0": "dashboard:s0"}, f"dashboard:{tail}", nodes) == {
+        "slot": f"s{length - 2}",
+        "key": None,
+    }
+    # The same chain, with an open ancestor inside the ceiling, still nests.
+    near = f"s{length - 3}"
+    assert parent_payload(nodes[tail], {near: f"dashboard:{near}"}, f"dashboard:{tail}", nodes) == {
+        "slot": f"s{length - 2}",
+        "key": f"dashboard:{near}",
+        "ancestor": True,
+    }
+
+
+def test_parent_payload_leaves_a_released_slot_unnested() -> None:
+    # A release is the one way a parent is taken away, and the walk must not put it
+    # back: the node carries no citation at all, so there is nothing to walk from.
+    nodes = fold_tree(
+        [
+            _rec("l", "lead", created=1),
+            _rec("m", "mid", created=2, parent="lead"),
+            _rec("w", "worker", created=3, parent="mid"),
+        ],
+        [session_tree.EdgeRecord(slot="worker", parent_slot=None, at=9, sid="w", seq=2)],
+    )
+    live = {"lead": "dashboard:lead", "worker": "dashboard:worker"}
+    assert parent_payload(nodes["worker"], live, "dashboard:worker", nodes) is None
+
+
 # --- succession: the slot's own chain of logs, walked through ``previous`` -------
 #
 # The tree above is PARENTHOOD between slots. These are SUCCESSION between logs of
@@ -791,11 +962,44 @@ def test_a_slot_s_logs_come_back_newest_first_through_the_previous_edge() -> Non
 
 
 def test_a_slot_s_first_log_answers_only_itself_and_reports_first() -> None:
-    chain = fold_slot_chain([_rec("a", "chat-1")], "a")
+    # The log STATES it starts the chain (previous_none=True -> EDGE_NONE), so the
+    # walk reaching it is the slot's whole life.
+    chain = fold_slot_chain([_rec("a", "chat-1", edge=session_tree.EDGE_NONE)], "a")
     assert chain.sids == ("a",)
     # Not "missing": the emitter omits the key for a first log, so a reader can tell
     # "there is nothing before this" from "a predecessor I could not reach".
     assert chain.ended == CHAIN_END_FIRST
+    assert chain.cited is None
+
+
+@pytest.mark.parametrize(
+    "edge",
+    [session_tree.EDGE_UNDECIDED, session_tree.EDGE_UNREAD, session_tree.EDGE_LEGACY],
+)
+def test_an_oldest_log_that_cites_nothing_without_stating_first_ends_in_a_gap(edge) -> None:
+    # The walk ran off the end, but the oldest log did not STATE it starts the chain:
+    # its writer could not name a predecessor, there was no announce to read, or it
+    # predates the edge keys. The unit before it may exist, so this is not the slot's
+    # whole life and must not read as CHAIN_END_FIRST.
+    chain = fold_slot_chain([_rec("a", "chat-1", edge=edge)], "a")
+    assert chain.sids == ("a",)
+    assert chain.ended == CHAIN_END_GAP
+    # No cited id: nothing was named to follow, the record simply ran out.
+    assert chain.cited is None
+
+
+def test_a_chain_whose_oldest_log_left_a_gap_is_not_whole() -> None:
+    # The walk follows the previous edges to the oldest log, which cites nothing but
+    # left a gap. The ids come back in order; only the end reason says it is a gap.
+    chain = fold_slot_chain(
+        [
+            _rec("a", "chat-1", created=1, edge=session_tree.EDGE_UNDECIDED),
+            _rec("b", "chat-1", created=2, previous="a"),
+        ],
+        "b",
+    )
+    assert chain.sids == ("b", "a")
+    assert chain.ended == CHAIN_END_GAP
     assert chain.cited is None
 
 
@@ -916,6 +1120,59 @@ def test_a_record_names_no_previous_when_its_entry_omits_the_key() -> None:
     record = session_tree.opened_record(directory, header, entry)
     assert record is not None
     assert record.previous_sid is None
+    # The announce was read and says NOTHING about a predecessor. That is the state a
+    # log written before these keys existed is in, and it is not a statement.
+    assert record.previous_edge == session_tree.EDGE_LEGACY
+
+
+def test_an_announce_that_states_no_predecessor_is_not_a_legacy_silence() -> None:
+    """The positive statement, which is the only thing a ranking fold may pass over.
+
+    A log that merely omits every predecessor key is indistinguishable from one the
+    old gateway wrote when it could not name a predecessor, so passing over that one
+    elects the log before it and orphans it. Saying so is what separates the two.
+    """
+    handle = _log("sid-declared-first", "chat-1")
+    handle.append(
+        "session/opened",
+        {
+            "agent": "kirocrew",
+            "slot": "chat-1",
+            "model": "opus",
+            "cwd": "/w",
+            "owner": "raymond",
+            "resumed": False,
+            "previous_none": True,
+        },
+        src=GATEWAY,
+    )
+    directory = crew_store.unit_dir_for(lg.KIND_SESSION, "sid-declared-first")
+    header, entry, _ = crew_store.read_head(crew_store.oldest_segment(directory))
+    record = session_tree.opened_record(directory, header, entry)
+    assert record is not None
+    assert record.previous_sid is None
+    assert record.previous_edge == session_tree.EDGE_NONE
+
+
+def test_a_first_entry_that_is_not_the_announce_leaves_the_edge_unread() -> None:
+    """Retention took the creating segment, so no announce is there to read.
+
+    ``previous_sid`` is ``None`` here exactly as it is for a log that states it has no
+    predecessor, and the three must not be confused: this one has no announce, so the
+    record is incomplete and a fold refuses until it is readable; a log that STATES it
+    has none may be passed over; a log that is merely silent goes to the mapping.
+    """
+    handle = _log("sid-truncated", "chat-1")
+    handle.append("session/turn", {"slot": "chat-1"}, src=GATEWAY)
+    directory = crew_store.unit_dir_for(lg.KIND_SESSION, "sid-truncated")
+    header, entry, _ = crew_store.read_head(crew_store.oldest_segment(directory))
+    record = session_tree.opened_record(directory, header, entry)
+    assert record is not None
+    assert record.previous_sid is None
+    assert record.previous_edge == session_tree.EDGE_UNREAD, (
+        "a log whose announce was never read reported a STATED absence of a "
+        "predecessor, so a fold would pass over it and orphan it"
+    )
 
 
 def test_an_oversized_previous_sid_refuses_the_whole_record() -> None:
@@ -991,7 +1248,7 @@ def test_a_previous_object_with_an_empty_sid_refuses_the_whole_record() -> None:
     """An empty citation is refused exactly as an oversized one is, and for the same
     reason: it is not a value the emitter can write.
 
-    ``emit.py`` gates the write on the id's own truthiness, so ``{"sid": ""}`` never
+    ``emit_session.py`` gates the write on the id's own truthiness, so ``{"sid": ""}`` never
     reaches a log the gateway wrote. An entry carrying one is therefore not the
     emitter's, and nothing on it is believed -- which is also precisely how the
     ``parent.slot`` field one line above treats an empty slot, so the two citations
@@ -1009,14 +1266,33 @@ def test_the_scanner_walks_two_real_logs_of_one_slot_on_disk() -> None:
     """End to end through the store, so the walk is reachable from the scanner and
     not only from a hand-built record list."""
     first = _log("acp-1", "chat-7")
-    _opened(first, "chat-7")
+    _opened(first, "chat-7", previous_none=True)
     second = _log("acp-2", "chat-7")
     _opened(second, "chat-7", previous={"sid": "acp-1"})
 
     reading = SessionTree().chain("acp-2")
     assert reading.chain.slot == "chat-7"
     assert reading.chain.sids == ("acp-2", "acp-1")
+    # The oldest log STATES it starts the chain, so the walk reached the slot's
+    # whole life.
     assert reading.chain.ended == CHAIN_END_FIRST
+    assert reading.incomplete is False
+
+
+def test_the_scanner_reports_a_gap_when_the_oldest_real_log_does_not_state_first() -> None:
+    """The same walk, but the oldest log cites nothing without stating it starts the
+    chain (a log from before the edge keys). The ids come back the same; only the
+    end reason says the unit before it may exist, so this is not the slot's whole
+    life."""
+    first = _log("acp-g1", "chat-g")
+    _opened(first, "chat-g")  # neither previous_none nor previous_undecided: a gap
+    second = _log("acp-g2", "chat-g")
+    _opened(second, "chat-g", previous={"sid": "acp-g1"})
+
+    reading = SessionTree().chain("acp-g2")
+    assert reading.chain.slot == "chat-g"
+    assert reading.chain.sids == ("acp-g2", "acp-g1")
+    assert reading.chain.ended == CHAIN_END_GAP
     assert reading.incomplete is False
 
 

@@ -17,11 +17,11 @@ to pay for, so the whole subsystem is inert until `session_summary.enabled`.
 
 | Concern | Module |
 |---|---|
-| Config section and its clamps | `config/loader.py` (`SessionSummaryConfig`) |
+| Config section and its clamps | `config/memory_sections.py` (`SessionSummaryConfig`; built by `config/section_builders.py`) |
 | Transcript extraction, payload shaping | `session_summary.py` |
 | Turn-end generation, the prompt | `dashboard/chat_summary.py` |
-| Sidecar cache | `history.py` (`ConversationLog`) |
-| Read endpoint | `dashboard/chat_handlers.py` (`api_chat_slot_summary`) |
+| Sidecar cache | `history_summaries.py` (bound on `ConversationLog`) |
+| Read endpoint | `dashboard/chat_api/slot_summary.py` (`api_chat_slot_summary`) |
 
 ## Storage: a sidecar, never the transcript
 
@@ -92,6 +92,22 @@ exists to avoid.
 
 Both sidecars are reaped by `delete_session`, which is contractually a permanent
 removal: a deleted session must leave no orphaned model-generated text on disk.
+Their user-facing reads validate the transcript's derivation policy through
+`ConversationLog.derivation_hold` while holding the transcript lock; the intent
+panel's GET, the POST's read-back and the `session_summary` MCP tool's
+`GET /api/session-control/summary` share one helper
+(`chat_summary.read_cached_intent_summary`), so a `.intents`
+file left by the key's earlier persistent life is never served bare to a slot that
+is now restricted. Each writer revalidates through
+`ConversationLog.publication_hold` immediately after the model call and keeps that
+hold through the sidecar write. A lock timeout maps to `TranscriptBusy` and follows
+the existing empty/refused result on both READ and PUBLISH: the publish-time
+privacy verdict could not be obtained, so `_summarize_one` discards the generated
+one-line summary as well as skipping its sidecar write; the intent generator,
+which returns no text to a requester, likewise reports the pass as not published.
+The `TranscriptBusy` and `TranscriptWithheld` refusal arms therefore both return an
+empty summary and differ only in their diagnostic log text. No transcript lock
+spans model latency.
 
 **The write is guarded against resurrecting a delete.** Generation holds no lock
 while the model call is in flight (it can take tens of seconds), so a permanent
@@ -173,12 +189,24 @@ to 50; a long list stops being read. Durable cross-session preferences belong in
   602 KB and `meta` was the other 14.65 MB. Ignoring it rather than excerpting it
   is the single largest saving available.
 - **Tool and error rows are dropped.** The assistant has already distilled them.
-- **User messages whole, assistant messages excerpted** head-and-tail at
-  `assistant_excerpt_chars` (default 400). Intent lives in the user's messages,
+- **User messages capped at 4 000 characters (head kept), assistant messages
+  excerpted** head-and-tail at `assistant_excerpt_chars` (default 400). Intent lives in the user's messages,
   which are small; progress lives in the assistant's, which are not.
 
 Measured against three real sessions, this reads roughly 1% of a transcript's
 bytes.
+
+`render_bounded_input()` then caps the transcript part of the prompt at
+`_MAX_INPUT_CHARS` (40 000); the fixed instructions come on top. A session under it renders unchanged. Over it, the input keeps the turns
+through the first `_KEEP_FIRST_TURNS` (3) user turns while they fit in half the
+budget, then as many of the newest turns as fit. One
+`[... user turns A-B omitted ...]` line stands in for the middle, naming the user
+turn numbers it dropped. Any single turn is cut again to its head and tail, about a
+quarter of the budget, so a very large `assistant_excerpt_chars` is not honoured
+there. A user turn, already capped at 4 000 characters, is kept whole or dropped. The trade is
+deliberate: the opening goals and the current state usually stay in view, and an
+intent that lived only in the dropped middle can fall out of a regenerated
+summary.
 
 ### Mechanically detectable traps live here
 
@@ -202,8 +230,10 @@ crowd out the session; intent survives truncation.
 
 ## Generation
 
-Dispatched from `_finish_queue_cycle` in `dashboard/chat_runner.py` — the post-turn
-hub, alongside auto-titling — as a background task. Not from `hooks.py`: the
+Dispatched from `_finish_queue_cycle` in `dashboard/chat_turn/queue_cycle.py` — the post-turn
+hub, alongside auto-titling — as a background task, for a cycle in which a turn
+reached a provider (learn-cron-dashboard.md, "Every turn exit runs the turn's
+tail"); a cycle of local commands has nothing to summarize. Not from `hooks.py`: the
 `Stop` hook event is script/config-driven and fires only for dashboard turns, and
 shipped behavior does not belong on a user-extension seam.
 
@@ -216,7 +246,7 @@ indistinguishable from one that is broken.
 | `disabled` | The flag is off — the common case, and it costs nothing |
 | `in_flight` | A pass for this slot is already running. The marker is taken **before the first await**, so two concurrent callers cannot both reach the model call — on-demand generation made that reachable from two clients at once |
 | `running` | A turn is in flight (`slot.running`). Consulted directly rather than inferred from the stop reason, because the marker is cleared at turn start: an empty `_last_stop_reason` means BOTH "idle session restored in a later process" and "streaming right now". **Holds under `force`** |
-| `memory_mode` | Incognito or temporary: no derived artifact from this conversation (mirrors `history.INCOGNITO_MEMORY_MODES` — a temporary transcript is discarded, so a persisted summary would outlive it) |
+| `memory_mode` | Incognito or temporary: no derived artifact from this conversation (mirrors `history.INCOGNITO_MEMORY_MODES` — the transcript is kept for the user's own History, and a summary is exactly the kind of model-produced artifact the mode withholds). Checked on the live slot AND on the on-disk line (`history.transcript_withholds_derivation`, before and after the transcript read, failing closed on an unreadable line), because the rows come from disk and the file can be stricter than the slot that kept it in memory. The panel read applies the same two gates while holding the transcript lock across its `.intents` sidecar read, so a summary cached before a same-key restricted recreation is not served. The sidecar is retained rather than deleted: a later persistent holder may legitimately reuse it if its transcript signature still matches. |
 | `stop_reason:<r>` | The turn did not cleanly end |
 | `too_few_turns` | Below `min_user_turns` |
 | `cadence` | Fewer than `regenerate_after_turns` since the last pass |
@@ -237,7 +267,8 @@ restore), so summarizing the in-memory tail of a long session would regenerate
 from a truncated view and overwrite the sidecar — earlier intents would silently
 vanish from the panel. The generator reads `read_messages_chained()` off the event
 loop; the cheap slot-level gates (disabled, unclean stop) run first so the common
-skip cases cost no disk IO, and `extract_turns` still bounds what the model reads.
+skip cases cost no disk IO, and `extract_turns` plus `render_bounded_input` bound
+what the model reads.
 
 **An unchanged transcript costs nothing.** Before any model call the pass checks
 the sidecar; a valid signature means the stored summary is already exactly right.
@@ -248,6 +279,18 @@ The model comes from `AgentConfig.resolve_model("background")`; the role never
 inherits `agent.model`, so unattended summarization cannot ride the interactive
 flagship. Every failure path is swallowed and logged: a lost summary must never
 surface as a failed turn, and the previous cached summary stays valid.
+
+The summary text follows the **workspace UI language** (`dashboard.language`)
+rather than the transcript's. `_generate_locked` hands `context.ui_language_tag(cfg)`
+to `_build_prompt`, which fills the prompt's `{language}` slot just before the
+transcript; an unset language, or a tag that names no shipped catalog, fills it with
+nothing and leaves the prompt byte-identical. The slot is filled by `str.replace` on
+the constant alone, before the transcript is appended, so a transcript that quotes
+`{language}` cannot restate it. The JSON keys and the `status` values stay as the
+prompt spells them, because `normalize_payload` reads them. A summary already cached
+for the current transcript keeps the language it was written in until the transcript
+changes. `TestPromptFollowsTheUiLanguage` in `test_session_summary_generate.py` pins
+the slot.
 
 On success, `push_session_summary()` broadcasts `{"_type": "session_summary"}` so
 the panel invalidates immediately rather than polling.
@@ -262,8 +305,10 @@ at all until the user reloads. The fallback also dispatches the payload as a
 Notification, adding a `ts`-less entry to the bell feed.
 `test_session_summary_api.py::TestSessionSummaryBroadcast` pins the envelope.
 
-The client closes the same gap on its other edge: `useWebSocket`'s reconnect
-catch-up invalidates `['session-summary']` wholesale, because a summary
+The client closes the same gap on its other edge: the socket's reconnect
+catch-up (`website/src/hooks/websocket/reconnectCatchUp.ts`, through
+`refreshServerStateAfterReconnect` in `website/src/hooks/websocket/serverState.ts`)
+invalidates `['session-summary']` wholesale, because a summary
 regenerated while the socket was down pushed a frame nobody received, and a
 non-polling panel would otherwise keep showing the stale one until the tab
 remounted. `useWebSocket.sessionSummary.test.ts` covers both the live frame and
@@ -285,6 +330,41 @@ retry, and a user correction is the highest-value signal per character in the fi
 
 ## Endpoint
 
+With the dashboard preview flag on, the Sessions three-dot menu also opens `/session-dashboards`: a read-only
+summary gallery alongside each session's model-authored Dynamic Dashboards.
+The gallery cards the sessions that have a CARD to show, by `canCarryCard` — not
+private, not remote, no session-tree `parent` — which is the same predicate
+`SessionStatusFrame` fetches on, so the list and the frame cannot disagree about who
+has a board. That is deliberately NOT the root test: `GET .../dashboard-card` has no
+root test, so a session another session DISPATCHED still owns a derived board and the
+route serves it, and this gallery is that board's only mount. What a non-root session
+does not own is the dashboard PACKAGE (`GET .../dashboard`, 404 `not_root_session`,
+and the side panel's Overview), so the page's own wording names what an entry carries
+— a saved summary and a status card — rather than promising each session a dashboard
+of its own.
+Sessions the gallery withholds are SAID, not silently dropped: a muted line under the
+list counts them (`commandCenter.cards_withheld`), and when the open sessions have no
+card between them the empty state says that (`commandCenter.no_cards`) rather than "No
+sessions", which would tell someone with open sessions that their sessions were gone.
+"No sessions" is kept for the one case where it is true, no open session at all.
+A centralized Needs you inbox precedes the gallery, including on phones. It covers
+every open session, carded or not: an adopted worker's question is answered here,
+and the search and Needs you filter reach those items. Each
+native question or approval has one control there, labeled with its human
+session name and current task context when available; session cards do not
+duplicate those controls. Search filters both sections, but the summary page
+limit never hides pending decisions. The view shares `['session-summary', slot]` with the chat
+panel and its websocket invalidation. Only visible cards read summaries (a window of 12,
+moved with explicit Previous sessions / Next sessions buttons); opening, filtering, or refreshing this
+page never calls the generation POST. Disabled, missing, stale, and failed
+summary reads remain distinct. Filtering hides inbox items rather than unmounting
+their unsent answer drafts. Hidden model-authored iframe documents are unloaded;
+the current page mounts at most 12 session cards. This view does not change summary
+generation, privacy, or ownership policy. Automatic HTML status cards are a
+separate opt-in (`dashboard.dynamic_dashboard_cards`), updated from session
+events under their own budget, not by this summary GET or its refresh interval.
+See [automatic session cards](learn-cron-dashboard.md#automatic-session-status-cards).
+
 ```
 GET /api/chat/slots/{slot}/summary
 ```
@@ -300,12 +380,26 @@ behavior the feature exists to remove.
 | `404` `{"code": "slot_not_found"}` | Unknown slot, or a slot the calling app does not own |
 
 While `enabled` is false the panel's `+`-menu row is **hidden** as well
-(`newMenuSections` in `SidePanel.tsx`). The settings toggle ships separately, so
-offering the row would send every reader to a panel that says the feature is off
-and gives them no way to change it. `SidePanel` reads the flag from this same
+(`newMenuSections` in `SidePanelAddMenu.tsx`), because the feature is turned on from
+Settings → Chat (`session_summary.enabled`), not from the panel, so offering the
+row would only lead to a panel saying the feature is off. `SidePanel` reads the flag from this same
 endpoint under the same react-query key the tab uses, so it is one cheap
 read-only request per slot that doubles as the tab's prefetch, and it fails OPEN
 so a slow response can never hide a feature that is enabled.
+
+With Pin Summary in Side Panel (`dashboard.side_panel_pin_summary`) on, Summary is
+the first pinned tab instead, ahead of Changes, Artifacts and Files
+(`pages/chat/usePinnedViews.ts`), and the `+` menu leaves its row out. The pin reads
+the same flag strictly: Summary is pinned only once a read says on, since a chip
+pinned on an unknown flag would come down again when the read says off. Until a
+chat's read answers, the strip keeps the pinned block it has. A plain show of the
+panel lands on Summary once per show, after a read that says on; a panel opened for
+something specific, like a file chip, keeps that item (`takePlainPanelShow` in
+`hooks/usePanelTabs.ts`). After that landing, an automatic discovery open creates or
+updates its Git, Changes or Issues tab without moving focus while pinned Summary
+remains active. Before the landing, after another tab is chosen, with Pin Summary
+off, and for every explicit open, the opened tab takes focus as before. A host that
+withholds Summary, such as the Members page, never pins it.
 
 ### `POST /api/chat/slots/{slot}/summary` — generate on request
 
@@ -329,7 +423,11 @@ A forced pass lifts **exactly two** gates — `stop_reason` and `cadence` — be
 those bound spending nobody asked for, and an explicit click already carries the
 consent they stand in for. `disabled`, `in_flight`, `memory_mode`, `running` and
 `too_few_turns` all still hold, and the cache check is not skipped, so a second
-click cannot buy an identical answer.
+click cannot buy an identical answer. The handler answers from a **read-back** of
+the sidecar rather than the pass's return value (a forced pass returns `False` both
+for "produced nothing" and "already current"), and that read-back is the GET's own
+gated read: a pass skipped for `memory_mode` is answered `409 summary_unavailable`,
+never with a `.intents` sidecar the key wrote in an earlier persistent life.
 
 `generate_state` on the GET tells the panel which affordance to offer:
 `ready` / `too_few_turns` / `unavailable`. It is decided server-side so the frontend
@@ -400,15 +498,15 @@ Out-of-range values are clamped with a warning rather than raising, and a
 malformed section degrades to defaults, so a hand-edited `config.json` cannot
 prevent the gateway from starting.
 
-## Scope in this release
+## Scope
 
 **The boundary is the turn loop, not the surface.** `_should_summarize` contains
 no check on where a message came from — it gates on `enabled`, an in-flight pass,
 incognito mode, liveness, a clean `end_turn`, the turn count and the cadence, and
 nothing else. Coverage is decided instead by *where the generator is called from*:
 the automatic pass has exactly one dispatch site, `_finish_queue_cycle` at the
-tail of a `_ChatSlot` turn in `dashboard/chat_runner.py`, plus the explicit
-on-demand route in `dashboard/chat_handlers.py`. Only a turn that ran through
+tail of a `_ChatSlot` turn in `dashboard/chat_turn/queue_cycle.py`, plus the explicit
+on-demand route in `dashboard/chat_api/slot_summary.py`. Only a turn that ran through
 `_run_chat` on a slot reaches the automatic pass — and reaching it is not the same
 as producing a summary, because the gates above still apply. The on-demand route
 is the one path that produces a summary with no turn at all.
@@ -418,10 +516,10 @@ than "not the dashboard":
 
 | Surface | Where its turn is driven instead |
 |---|---|
-| Slack | `slack/handler.py` (native ACP loop) or `messaging/driver.py` (`TurnDriver`) |
+| Slack | `slack/handler_runtime/turn.py` (native ACP loop, run by `slack/handler.py`) or `messaging/driver.py` (`TurnDriver`) |
 | Discord, Telegram, Teams, Webex, WeCom, WeChat | `messaging/driver.py` (`TurnDriver`), one shared loop |
 | Task runner | `task_executor.py`, streaming an ACP client directly |
-| Cron wake | `slack/gateway.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
+| Cron wake | `slack/gateway_runtime/cron_turn.py` and `cron_delivery.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
 | Agent webhooks | `dashboard/handlers/hooks.py` |
 | Workflow phase calls | `workflows/agent_exec.py` |
 | Subagents | `subagent.py` — never a `_ChatSlot` at all, so a `.intents` sidecar is not reachable |
@@ -466,5 +564,6 @@ addition later; if one is ever added it must be registered inline in
 | `test_session_summary_config.py` | Defaults, clamping, disk parsing, malformed sections |
 | `test_session_summary_extract.py` | Role filtering, `meta` ignored, excerpting, the two mechanical traps |
 | `test_session_summary_storage.py` | Sidecar round-trip, invalidation, transcript-untouched, delete reaping |
-| `test_session_summary_generate.py` | Gating, caching, failure containment, prompt trap coverage |
+| `test_session_summary_generate.py` | Gating, caching, failure containment, prompt trap coverage, the UI-language slot |
 | `test_session_summary_api.py` | Status codes, error `code`, stale flag, never-generates |
+| `test_mcp_dashboard_session_summary.py` | The `session_summary` MCP reader |

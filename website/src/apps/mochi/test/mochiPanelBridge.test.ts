@@ -123,6 +123,29 @@ describe('mochi panelBridge chat transport', () => {
     expect(doneCount).toBe(1)
   })
 
+  it('hands a content patch for a committed row to the transcript as a _patch frame', () => {
+    // The gateway holds the last run of text before a tool call off the row it
+    // was cut from, then gives it back as this patch keyed by the row's `mid`.
+    // Without it the pet drops that word ("check the [config] file").
+    const frames: Record<string, unknown>[] = []
+    bridge.onChatMessage((m) => frames.push(m))
+    const ws = FakeWebSocket.last!
+
+    ws.emit('chat_message_update', {
+      slot: bridge.MOCHI_SLOT,
+      ts: 't1',
+      mid: 'm1',
+      content: 'Let me check the config',
+    })
+    // Nothing for a row the panel draws: a tool row's update, another slot's
+    // row, and a patch that changes only meta.
+    ws.emit('chat_message_update', { slot: bridge.MOCHI_SLOT, tool_call_id: 'tc-1', content: 'ls' })
+    ws.emit('chat_message_update', { slot: 'default', mid: 'm2', content: 'not mine' })
+    ws.emit('chat_message_update', { slot: bridge.MOCHI_SLOT, mid: 'm3', meta: { steerState: 'consumed' } })
+
+    expect(frames).toEqual([{ _patch: 'm1', content: 'Let me check the config' }])
+  })
+
   it('ignores chat events belonging to another slot', () => {
     const chunks: string[] = []
     let doneCount = 0
@@ -167,7 +190,7 @@ describe('mochi panelBridge chat transport', () => {
   })
 
   it('sendMessage posts to the mochi slot with ws fan-out', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
 
     await bridge.sendMessage('hi')
@@ -179,7 +202,7 @@ describe('mochi panelBridge chat transport', () => {
   })
 
   it('sendMessage carries a screenshot as meta when present', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
 
     await bridge.sendMessage('look', 'data:image/png;base64,AAA')
@@ -203,7 +226,7 @@ describe('mochi panelBridge chat transport', () => {
   })
 
   it('sendMessage binds the slot to the mochi agent before the first send', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
     await bridge.sendMessage('hi')
     const createCall = fetchMock.mock.calls.find((c) => c[0] === '/api/chat/slots')!
@@ -216,7 +239,7 @@ describe('mochi panelBridge chat transport', () => {
     // Closing the slot from the dashboard used to leave this page latched, so the
     // next send created a slot with the DEFAULT agent -- taking the pet's prompt,
     // skills, MCP and context-usage reporting with it, silently.
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
     await bridge.sendMessage('first')
     const binds = () => fetchMock.mock.calls.filter((c) => c[0] === '/api/chat/slots').length
@@ -250,7 +273,7 @@ describe('mochi panelBridge chat transport', () => {
   })
 
   it('binds the slot only once across sends (idempotent)', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
     await bridge.sendMessage('one')
     await bridge.sendMessage('two')
@@ -262,7 +285,7 @@ describe('mochi panelBridge chat transport', () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: false, status: 503 }) // ensureSlot fails
-      .mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+      .mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
     await bridge.sendMessage('one')
     await bridge.sendMessage('two')
@@ -282,8 +305,93 @@ describe('mochi panelBridge chat transport', () => {
     expect(fetchMock.mock.calls.some((c) => c[0] === '/api/chat?ws=1')).toBe(false)
   })
 
+  // The optimistic echo is emitted BEFORE the dispatch (base ordering), so an
+  // accepted send whose HTTP response is lost keeps its bubble and a fast WS
+  // reply cannot invert the transcript. The ONE outcome that must not keep it —
+  // a definite refusal — is undone by a correlated `_retract` frame.
+  it('echoes the user turn before dispatch and keeps it on a 2xx acceptance', async () => {
+    const frames: Array<Record<string, unknown>> = []
+    bridge.onChatMessage((m) => frames.push(m))
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
+    vi.stubGlobal('fetch', fetchMock)
+    await bridge.sendMessage('hi')
+    // Exactly one user bubble, and no retraction frame.
+    expect(frames.filter((m) => m.role === 'user').map((m) => m.content)).toEqual(['hi'])
+    expect(frames.some((m) => typeof m._retract === 'string')).toBe(false)
+    // The echo is tagged optimistic — the consumer defers the `message_sent`
+    // count to the receipt — and `sendMessage` reports exactly one stat on this
+    // accepted outcome.
+    expect(frames.find((m) => m.role === 'user')?._optimistic).toBe(true)
+    const statSends = fetchMock.mock.calls
+      .filter((c) => c[0] === '/api/apps/mochi/stat')
+      .map((c) => JSON.parse(c[1].body).kind)
+      .filter((k: string) => k === 'message_sent')
+    expect(statSends).toEqual(['message_sent'])
+  })
+
+  it('echoes then RETRACTS the user turn when the gateway refuses with a non-2xx', async () => {
+    const frames: Array<Record<string, unknown>> = []
+    bridge.onChatMessage((m) => frames.push(m))
+    // slot binds ok (agent mochi); the chat POST is a definite 409 refusal.
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/chat/slots') return Promise.resolve({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
+      if (url === '/api/chat?ws=1') return Promise.resolve({ ok: false, status: 409, json: async () => ({ error: 'the slot is busy with another turn' }) })
+      return Promise.resolve({ ok: true, json: async () => ({}) }) // pet-event etc.
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(bridge.sendMessage('hi')).rejects.toMatchObject({ status: 409 })
+    // The echo was emitted (base ordering) and then retracted by its id, so the
+    // consumer that applies both frames is left with no user bubble.
+    const echoed = frames.find((m) => m.role === 'user')
+    expect(echoed).toBeDefined()
+    expect(frames.some((m) => m._retract === echoed!.id)).toBe(true)
+    // A definite refusal must NOT count `message_sent` — the durable backend
+    // counter has no decrement path, so a refused send would inflate it forever.
+    const statSends = fetchMock.mock.calls
+      .filter((c) => c[0] === '/api/apps/mochi/stat')
+      .map((c) => JSON.parse(c[1].body).kind)
+      .filter((k: string) => k === 'message_sent')
+    expect(statSends).toEqual([])
+  })
+
+  it('RETAINS the echo on a transport failure (the turn may have landed)', async () => {
+    const frames: Array<Record<string, unknown>> = []
+    bridge.onChatMessage((m) => frames.push(m))
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === '/api/chat/slots') return Promise.resolve({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
+      if (url === '/api/chat?ws=1') return Promise.reject(new TypeError('Failed to fetch')) // offline/DNS
+      return Promise.resolve({ ok: true, json: async () => ({}) }) // pet-event etc.
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    await expect(bridge.sendMessage('hi')).rejects.toThrow(/Failed to fetch/)
+    // The echo is kept (no retraction) so the WS reply, if the turn reached the
+    // gateway, threads under it.
+    expect(frames.filter((m) => m.role === 'user').map((m) => m.content)).toEqual(['hi'])
+    expect(frames.some((m) => typeof m._retract === 'string')).toBe(false)
+    // The chat-turn latch (set by `user_input`) is NOT touched by the
+    // NON-TERMINAL `delivery_uncertain` pet event: a transport rejection has an
+    // INDETERMINATE outcome (the turn may still be running over a surviving
+    // socket), so it must NOT emit the terminal `error` (which would flush
+    // deferred pushes ahead of a reply that may yet arrive) AND must leave the
+    // latch active so the interleave gate keeps protecting that possibly-live
+    // reply until a terminal event or the _CHAT_TURN_MAX_MS ceiling.
+    const petEvents = fetchMock.mock.calls
+      .filter((c) => c[0] === '/api/apps/mochi/pet-event')
+      .map((c) => JSON.parse(c[1].body).event)
+    expect(petEvents).toContain('delivery_uncertain')
+    expect(petEvents).not.toContain('error')
+    // A transport rejection commonly still DELIVERED the turn (lost response),
+    // and `messages.sent` is a best-effort monotonic counter, so the uncertain
+    // path counts `message_sent` once rather than dropping a delivered message.
+    const statSends = fetchMock.mock.calls
+      .filter((c) => c[0] === '/api/apps/mochi/stat')
+      .map((c) => JSON.parse(c[1].body).kind)
+      .filter((k: string) => k === 'message_sent')
+    expect(statSends).toEqual(['message_sent'])
+  })
+
   it('stopGeneration targets the mochi slot', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
 
     await bridge.stopGeneration()
@@ -324,7 +432,7 @@ describe('mochi panelBridge chat transport', () => {
   })
 
   it('newSession deletes the slot and tolerates a missing one', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ agent: 'mochi' }) })
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true, agent: 'mochi' }) })
     vi.stubGlobal('fetch', fetchMock)
     await bridge.newSession()
     const [url, init] = fetchMock.mock.calls[0]
@@ -549,6 +657,58 @@ describe('mochi panelBridge live events', () => {
     expect(calls[0]).toBe('/api/approvals/a1/approve')
     expect(calls[1]).toBe('/api/approvals/a2/reject')
     expect(calls[2]).toBe('/api/chat/slots/mochi/approve')
+  })
+
+  it('carries the coordinator target on an approval frame', () => {
+    const seen: Record<string, unknown>[] = []
+    bridge.onApprovalRequest((r) => seen.push(r))
+    FakeWebSocket.last!.emit('approval', { slot: 'mochi', id: 'a1', tool: 'fs_write', instance: 'inst-a' })
+    expect(seen[0].target).toEqual({ origin: 'coordinator', slot: 'mochi', instance: 'inst-a' })
+  })
+
+  it('carries the native target (row mid) on a permission frame', () => {
+    const seen: Record<string, unknown>[] = []
+    bridge.onApprovalRequest((r) => seen.push(r))
+    const cls = JSON.stringify({ request_id: 'req-9', tool_title: 'fs_read' })
+    FakeWebSocket.last!.emit('chat_message', {
+      slot: 'mochi', role: 'permission', content: 'fs_read', cls, meta: { mid: 'mid-a' },
+    })
+    expect(seen[0].target).toEqual({ origin: 'native', requestMid: 'mid-a' })
+  })
+
+  describe('respondApproval with an owner-bound target', () => {
+    let calls: { url: string; body: string }[]
+    beforeEach(() => {
+      calls = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockImplementation((url: string, init?: { body?: string }) => {
+          calls.push({ url, body: String(init?.body ?? '') })
+          return Promise.resolve({ ok: true, json: async () => ({}) })
+        }),
+      )
+    })
+
+    it('names the coordinator slot and instance on the approvals route', async () => {
+      await bridge.respondApproval('a1', 'approve', undefined, false, {
+        origin: 'coordinator', slot: 'mochi', instance: 'inst-a',
+      })
+      expect(calls[0].url).toBe('/api/approvals/a1/approve?origin=coordinator&slot=mochi&instance=inst-a')
+    })
+
+    it('sends a native decide to the slot route with its request_mid', async () => {
+      await bridge.respondApproval('req-9', 'reject', undefined, false, { origin: 'native', requestMid: 'mid-a' })
+      expect(calls[0].url).toBe('/api/chat/slots/mochi/approve')
+      expect(JSON.parse(calls[0].body)).toEqual({
+        action: 'rejected', request_id: 'req-9', origin: 'native', request_mid: 'mid-a',
+      })
+    })
+
+    it('keeps the id-only slot form for a durable trust action', async () => {
+      await bridge.respondApproval('req-9', 'trust', undefined, true, { origin: 'native', requestMid: 'mid-a' })
+      expect(calls[0].url).toBe('/api/chat/slots/mochi/approve')
+      expect(JSON.parse(calls[0].body)).toEqual({ action: 'trust', request_id: 'req-9' })
+    })
   })
 
   it('respondApproval refuses durable trust without pending-card proof', async () => {

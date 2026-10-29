@@ -26,6 +26,7 @@ from kiro_crew.apps.manager import (
     update_app,
 )
 from kiro_crew.apps.routes import register_app_routes
+from kiro_crew.testing.wait import async_wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +76,18 @@ def _setup_env(tmp_path, monkeypatch):
 
     monkeypatch.delenv("KIROCREW_SANDBOX_ACTIVE", raising=False)
     monkeypatch.setattr(sandbox_mod, "_macos_sandbox_state", lambda: None)
+    # The single confinement probe now also reads the Linux kirocrew-agents.slice
+    # cgroup, which the suite's own process is under; point its read at a cgroup
+    # with no slice so the baseline is a host terminal. The agent-refusal tests
+    # below re-set the marker or re-patch the structural probe on purpose.
+    _plain_cgroup = tmp_path / "cgroup-host"
+    _plain_cgroup.write_text("0::/user.slice/user-1000.slice/session-1.scope\n")
+    _real_evidence = sandbox_mod.agent_confinement_evidence
+    monkeypatch.setattr(
+        sandbox_mod,
+        "agent_confinement_evidence",
+        lambda cgroup_path=str(_plain_cgroup): _real_evidence(cgroup_path=cgroup_path),
+    )
     return home
 
 
@@ -449,13 +462,8 @@ async def test_watch_loop_broadcasts_reload_on_edit(tmp_path, monkeypatch):
     monkeypatch.setattr(dev_mode, "_scan_ui_mtimes", _counting_scan)
 
     async def _wait_until(predicate, what: str) -> None:
-        """Poll *predicate* on the loop, generous enough for a loaded host."""
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if predicate():
-                return
-            await asyncio.sleep(0.01)
-        raise AssertionError(f"timed out waiting for {what}")
+        """Wait for *predicate* on the loop; a hang fails naming *what*."""
+        await async_wait_until(predicate, describe=lambda: f"waiting for {what}")
 
     task = asyncio.get_running_loop().create_task(dev_mode._watch_loop(_capture))
     try:
@@ -572,16 +580,34 @@ async def test_watch_loop_picks_up_out_of_process_toggle(tmp_path, monkeypatch):
     monkeypatch.setattr(dev_mode, "POLL_INTERVAL_SECS", 0.02)
 
     events: list[tuple[str, dict]] = []
+    scans: list[object] = []
+    _real_scan = dev_mode._scan_ui_mtimes
+
+    def _spy(ui_dir):
+        sig = _real_scan(ui_dir)  # record only AFTER the walk completed
+        scans.append(ui_dir)
+        return sig
+
+    monkeypatch.setattr(dev_mode, "_scan_ui_mtimes", _spy)
     task = asyncio.get_running_loop().create_task(
         dev_mode._watch_loop(lambda e, p: events.append((e, p)))
     )
     try:
         await asyncio.sleep(0.1)  # running with no dev apps
         assert events == []
+        assert scans == [], "walked a ui/ tree before any app was in dev mode"
 
         # Out-of-process toggle: write the sentinel + installed.json.
         set_dev_mode("dev-mode-app", True)
-        await asyncio.sleep(0.1)  # watcher re-reads sentinel, seeds state
+        # Wait for two completed walks. A fixed sleep assumes three to_thread
+        # hops plus an rglob fit inside it; on a loaded Windows runner they do
+        # not, the seed then contains the edit below, prev is None, and the loop
+        # seeds instead of broadcasting. Two walks mean the seeding tick ran to
+        # its broadcast decision, so the assertion below is not vacuous.
+        await async_wait_until(
+            lambda: len(scans) >= 2,
+            describe=lambda: "watcher never seeded state for the newly-dev app",
+        )
         assert events == [], "seeding a newly-dev app must not broadcast"
 
         ui_file = dev_mode.app_dir("dev-mode-app") / "ui" / "index.mjs"
@@ -589,10 +615,9 @@ async def test_watch_loop_picks_up_out_of_process_toggle(tmp_path, monkeypatch):
         import os
         os.utime(ui_file, (time.time() + 5, time.time() + 5))
 
-        for _ in range(100):
-            await asyncio.sleep(0.02)
-            if events:
-                break
+        await async_wait_until(
+            lambda: bool(events), describe=lambda: "no app_reload broadcast after the edit"
+        )
     finally:
         task.cancel()
         try:

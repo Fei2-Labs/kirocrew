@@ -3,16 +3,16 @@
  * and the dashboard-config type. The settings UI itself lives in
  * pages/settings/ChatPanel.tsx and pages/settings/VoicePanel.tsx.
  */
-import { safeSetItem } from '../../utils/safeStorage'
+import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
+import { markCompositeFieldsDirty } from '../../lib/uiPrefs'
+import { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE } from './contentWidth'
 
 export type ContentWidth = 'compact' | 'comfortable' | 'full'
 
-/** Chat message bubble font-size bounds, in px. Mirrors useTerminalFont's
- *  MIN/MAX_TERMINAL_FONT_SIZE bracket — below 12 body text is unreadable,
- *  above 22 a bubble wastes more width wrapping than it gains in legibility. */
-export const MIN_MESSAGE_FONT_SIZE = 12
-export const MAX_MESSAGE_FONT_SIZE = 22
-export const DEFAULT_MESSAGE_FONT_SIZE = 14
+/* The font-size bounds live in ./contentWidth (with the width scaling that
+ * needs them) and are re-exported here so importers of the config module keep
+ * one source for everything chat-config shaped. */
+export { DEFAULT_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE, MIN_MESSAGE_FONT_SIZE }
 
 /** Send-key mode: enter (Enter sends), ctrl-enter (Ctrl+Enter sends), enter-ctrl-newline (Enter sends, Ctrl+Enter = newline) */
 export type SendMode = 'enter' | 'ctrl-enter' | 'enter-ctrl-newline'
@@ -46,19 +46,36 @@ export interface ChatConfig {
   showContextPct: boolean
   /** Show used/window token counts in the inline context readout. */
   showContextTokens: boolean
-  defaultAutopilot: boolean
   /** Pin the most recent prompt above the fold as a sticky banner. */
   pinLastPrompt: boolean
   /** Spellcheck the message composer. When off, the composer input carries
    *  `spellCheck={false}` so the browser draws no red misspelled-word
    *  underlines. Default true — the behaviour every install has always had. */
   spellcheck: boolean
+  /** Style bold, italic, strikethrough and inline code in the composer as the
+   *  user types. Display only: the markers stay visible and the sent message is
+   *  the markdown they typed. A textarea cannot draw styled text, so turning
+   *  this on also moves the user onto the Lexical composer (see ChatInput).
+   *  Default false: it changes how every draft looks,
+   *  so it is the user's call rather than something a client with no stored
+   *  config inherits. */
+  inlineMarkdown: boolean
   /** Opt in to giving a folder that holds nothing no body at all, so it costs one
    *  row instead of two. Default false: this changes how every empty folder in
    *  the sidebar reads, and the row it removes is the only labelled "New chat in
    *  <name>" affordance those folders have, so it is the user's call rather than
    *  something a client with no stored config inherits. */
   hideEmptyFolderBody: boolean
+  /** While the session list scrolls, titles the rows clip are shown in full
+   *  in a floating layer over them; rows keep their width (desktop only).
+   *  Off by default. */
+  fullTitlesOnScroll: boolean
+  /** Opt in to a plain click on a sidebar session giving it its own session
+   *  tab, as the row menu's "Open in a session tab" does, instead of replacing
+   *  the session in the active tab. Default false: the replace is what keeps
+   *  the tab strip hidden until a user asks for a second tab, so a client with
+   *  no stored config keeps it. */
+  sidebarClickOpensTab: boolean
   /** Which pane edge hosts the turn minimap. The right-edge variant replaces
    *  the native scrollbar while the rail is shown. */
   minimapSide: MinimapSide
@@ -69,10 +86,28 @@ export interface ChatConfig {
    *  the user's call rather than something a client with no stored config
    *  inherits. Cmd/Ctrl+Shift+V remains the per-paste escape hatch either way. */
   showFullPastes: boolean
-  /** Font size in px for message bubble body text (paragraphs, list items),
-   *  clamped to [MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE]. Scoped to the
-   *  message content itself — sidebar, session list, and other chrome are
-   *  unaffected, same as `contentWidth`. */
+  /** Open tool call rows (the per-call pill and the group row around several
+   *  calls) expanded instead of collapsed. Initial state only: a row the user
+   *  toggled keeps that choice. Default false, so a client with no stored
+   *  choice keeps today's collapsed rows (#18254). */
+  toolCallsStartExpanded: boolean
+  /** Opt in to a double-click on one of your own messages opening the editor
+   *  (#7911). Default false: the gesture takes the double-click that would
+   *  otherwise select a word in the bubble, so it is the user's call rather
+   *  than something a client with no stored config inherits. The pencil button
+   *  is the edit path either way. */
+  doubleClickToEdit: boolean
+  /** Fade split-view panes that do not hold keyboard focus. Default true. When
+   *  false every pane stays at full brightness; the focused pane's accent
+   *  border still marks where keyboard input goes. */
+  dimInactivePanes: boolean
+  /** Font size in px for the conversation surface — what the user reads and
+   *  writes: message text, inline and block code, tables, follow-up chips and
+   *  the composer — clamped to [MIN_MESSAGE_FONT_SIZE, MAX_MESSAGE_FONT_SIZE].
+   *  Each element keeps the ratio to body text it has at the default, and the
+   *  Compact content width scales with it (see `scaleContentWidth` in ./contentWidth). Chrome —
+   *  sidebar, session list, status lines, toolbars — is unaffected, same as
+   *  `contentWidth`. */
   messageFontSize: number
 }
 
@@ -93,7 +128,7 @@ const LS_KEY = 'mc-chat-config'
  *  it. The sidebar's view toggle persists this flag BEFORE creating its first
  *  column, so a deliberate board user always has an explicit `true` stored and
  *  is unaffected by the default. */
-const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, defaultAutopilot: false, pinLastPrompt: true, hideEmptyFolderBody: false, spellcheck: true, showFullPastes: false, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE }
+const DEFAULTS: ChatConfig = { historyExpanded: true, showTimestamps: true, showTurnStats: true, sendOnEnter: 'enter', collapseAllSteps: true, confirmCloseSession: false, simplifiedToolNames: true, contentWidth: 'compact', tagColumnsEnabled: false, fileChipStyle: 'expanded', followUpLayout: 'scroll', streamMode: 'smooth', showContextPct: false, showContextTokens: false, pinLastPrompt: true, hideEmptyFolderBody: false, sidebarClickOpensTab: false, spellcheck: true, inlineMarkdown: false, showFullPastes: false, toolCallsStartExpanded: false, doubleClickToEdit: false, dimInactivePanes: true, minimapSide: 'left', messageFontSize: DEFAULT_MESSAGE_FONT_SIZE, fullTitlesOnScroll: false }
 
 const clampMessageFontSize = (n: number): number =>
   Math.max(MIN_MESSAGE_FONT_SIZE, Math.min(MAX_MESSAGE_FONT_SIZE, Math.round(n)))
@@ -133,13 +168,23 @@ export function loadChatConfig(): ChatConfig {
     // Coerced, not trusted: a stored non-boolean must not decide whether the
     // composer draws the browser's red spellcheck underlines.
     if (typeof cfg.spellcheck !== 'boolean') cfg.spellcheck = true
+    if (typeof cfg.inlineMarkdown !== 'boolean') cfg.inlineMarkdown = false
     // Coerced, not trusted: a stored non-boolean would otherwise make the empty
     // folder shape depend on a truthy string.
     if (typeof cfg.hideEmptyFolderBody !== 'boolean') cfg.hideEmptyFolderBody = false
+    if (typeof cfg.fullTitlesOnScroll !== 'boolean') cfg.fullTitlesOnScroll = false
+    // Coerced, not trusted: a stored non-boolean must not decide whether a
+    // sidebar click opens a tab.
+    if (typeof cfg.sidebarClickOpensTab !== 'boolean') cfg.sidebarClickOpensTab = false
     // Coerced, not trusted: a stored non-boolean would otherwise let a truthy
     // string turn off paste collapsing, which is the main-thread guard for a
     // very large paste.
     if (typeof cfg.showFullPastes !== 'boolean') cfg.showFullPastes = false
+    if (typeof cfg.toolCallsStartExpanded !== 'boolean') cfg.toolCallsStartExpanded = false
+    // Coerced, not trusted: a stored non-boolean must not attach the
+    // double-click gesture that replaces word selection on the bubble.
+    if (typeof cfg.doubleClickToEdit !== 'boolean') cfg.doubleClickToEdit = false
+    if (typeof cfg.dimInactivePanes !== 'boolean') cfg.dimInactivePanes = true
     if (cfg.minimapSide !== 'left' && cfg.minimapSide !== 'right') cfg.minimapSide = 'left'
     cfg.messageFontSize = typeof cfg.messageFontSize === 'number' ? clampMessageFontSize(cfg.messageFontSize) : DEFAULT_MESSAGE_FONT_SIZE
     return cfg
@@ -147,9 +192,155 @@ export function loadChatConfig(): ChatConfig {
   catch { return { ...DEFAULTS } }
 }
 
-export function saveChatConfig(cfg: ChatConfig) {
-  safeSetItem(LS_KEY, JSON.stringify(cfg))
+/**
+ * Persist the chat config. The marker rollback keeps the stored blob and its
+ * dirty markers consistent on a quota-exhausted write (a stored-but-unmarked
+ * edit would be mishandled by the sync). Surfacing a FAILED per-field save IS a
+ * goal (GPT 6.1 F1, errors-use-error-notice): when the blob or its dirty-marker
+ * write cannot be persisted and is rolled back, nothing was stored, so this
+ * returns `false` and the caller (`ChatPanel.setChat`) renders the failure
+ * through `ErrorNotice` and keeps the prior value on screen rather than showing
+ * the un-persisted value as if it saved. A successful or no-op save returns
+ * `true`. This is narrower than the pre-existing silent `safeSetItem` behaviour
+ * the issue's host-log data ruled out as the #15236 cause; it covers only the
+ * per-field save path this change introduces.
+ */
+export function saveChatConfig(cfg: ChatConfig): boolean {
+  // Record which fields this write actually changed, so a deliberate edit --
+  // even one that sets a field back to its default value -- is uploaded to the
+  // host backup rather than withheld as an unproven default (GPT 5.6 F1). This
+  // runs at the single seam every chat-config edit already passes through; it
+  // is a marker set here, not interception of the ~300 raw localStorage writers
+  // (uiPrefs design decision 2).
+  //
+  // The comparison basis is the NORMALIZED prior via `loadChatConfig()`, not the
+  // raw stored blob: the blob is routinely PARTIAL (restore writers merge only
+  // host-held fields, and a build upgrade adds fields the old blob lacks) AND
+  // holds un-migrated legacy values, while `cfg` already came through
+  // `loadChatConfig()`'s normalizing read (`fileChipStyle:"pebble"` ->
+  // `'expanded'`, `sendOnEnter:false` -> `'ctrl-enter'`). Comparing a normalized
+  // `cfg` field against a raw legacy `prior` field would mark it dirty on an
+  // unrelated toggle and force-upload that untouched field over another origin's
+  // host value. `loadChatConfig()` default-fills AND migrates, so a field is
+  // dirty only when the user actually changed it (GPT/Opus F1).
+  const base = loadChatConfig() as unknown as Record<string, unknown>
+  const changed: string[] = []
+  for (const [field, value] of Object.entries(cfg)) {
+    // Guard the dirty comparison's serialization (GPT 6.1 F1, compare side):
+    // `base[field]` comes from the raw stored blob via `loadChatConfig()`,
+    // which does not type-check every field, so a hand-tampered / host-backup
+    // value nested thousands of arrays deep sits within the store size cap but
+    // overflows the JS stack -- a bare `JSON.stringify(base[field])` throws a
+    // RangeError here, before the replacement boolean is ever persisted, and
+    // the toggle (and the boot path that calls it) dies with no recovery.
+    // `value` is always writer-produced (a primitive), so it serializes; treat
+    // an unserializable prior value as changed so the serializable replacement
+    // is persisted, which is exactly the repair the user is performing.
+    let priorStr: string | undefined
+    try {
+      priorStr = JSON.stringify(base[field])
+    } catch {
+      changed.push(field)
+      continue
+    }
+    if (priorStr !== JSON.stringify(value)) changed.push(field)
+  }
+  // Persist ONLY the changed fields merged into the prior RAW blob -- NOT the
+  // whole `loadChatConfig()`-default-filled `cfg`. Writing the full default
+  // blob materializes all ~21 fields, so `expandComposite` yields 21 child
+  // keys with no fingerprints; on a profile that has synced other keys but
+  // never stored a chat-config child (any second origin/device's first chat
+  // edit after the upgrade) the composite counts as untouched, nothing is
+  // withheld, and `buildPatch` uploads every default over newer host values --
+  // overwriting e.g. the host's `showTimestamps` with the local default, with
+  // no recovery path (GPT 6.1, ChatSettings.tsx:202). Merging only the edited
+  // fields into the prior raw blob leaves unedited/absent fields ABSENT, so
+  // they stay genuinely unreconciled and are withheld from the flush, while the
+  // edited fields are forced up by the dirty marker below. An absent field a
+  // reader needs is default-filled on read by `loadChatConfig`, exactly as
+  // before -- the default lives in the reader, not the stored blob.
+  let priorBlob: Record<string, unknown> = {}
+  const priorRaw = safeGetItem(LS_KEY)
+  if (priorRaw !== null) {
+    try {
+      const parsed: unknown = JSON.parse(priorRaw)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        priorBlob = parsed as Record<string, unknown>
+      }
+    } catch {
+      /* unparseable prior: start from an empty blob, only edited fields land */
+    }
+  }
+  const nextBlob: Record<string, unknown> = { ...priorBlob }
+  const cfgRecord = cfg as unknown as Record<string, unknown>
+  for (const field of changed) nextBlob[field] = cfgRecord[field]
+  // Exclude any field the raw prior blob carried forward that cannot be
+  // serialized (GPT 6.1 F1, save side): a legacy value nested thousands of
+  // arrays deep sits within the store's size cap but overflows the JS stack, so
+  // a bare JSON.stringify(nextBlob) throws a RangeError and the save -- and the
+  // boot path that calls it -- dies before React mounts, with no recovery.
+  // Serialize once with a replacer that drops any unserializable field,
+  // preserving every valid sibling; a changed field (writer-produced, always a
+  // primitive) is never the one dropped.
+  let serialized: string
+  try {
+    serialized = JSON.stringify(nextBlob)
+  } catch {
+    const safe: Record<string, unknown> = {}
+    for (const [field, value] of Object.entries(nextBlob)) {
+      try {
+        JSON.stringify(value)
+      } catch {
+        continue
+      }
+      safe[field] = value
+    }
+    serialized = JSON.stringify(safe)
+  }
+  // Write the merged blob FIRST, and mark fields dirty only if that write
+  // succeeded (GPT/Opus F2, first half). safeSetItem returns false when quota
+  // is exhausted after reclaim; a dirty marker written ahead of a failed blob
+  // write would force the UN-updated prior value past buildPatch's withholding
+  // and overwrite the host backup -- so no marker is left for a value that was
+  // never stored.
+  //
+  // But the marker is its own ~40-byte key, so the blob write can land while
+  // the marker write fails (near-full storage). An edited field recorded in the
+  // blob but NOT the marker is then withheld as an unproven default and
+  // baselined without uploading, and a cold restore reinstates the stale host
+  // value -- the edit is lost silently on both sides (GPT 5.6 F2). So when there
+  // ARE changed fields, the marker must persist for the save to be consistent:
+  // if it fails, roll the blob back to the prior raw value, leaving nothing
+  // stored that the sync would mishandle. The in-memory UI keeps the user's
+  // value and the next save retries; a quota wall surfaces as "not saved yet",
+  // never as a silent host-value overwrite.
+  const wrote = safeSetItem(LS_KEY, serialized)
+  if (wrote && changed.length > 0) {
+    const marked = markCompositeFieldsDirty(changed)
+    if (!marked) {
+      // Marker could not be persisted: undo the blob so no stored-but-unmarked
+      // edit survives for the sync to upload-or-withhold incorrectly. The
+      // in-memory UI keeps the user's value and the next save retries, and the
+      // caller is told the save did not persist so it can surface the failure
+      // (GPT 6.1 F1, errors-use-error-notice) instead of showing a value that
+      // reload will discard.
+      if (priorRaw === null) localStorage.removeItem(LS_KEY)
+      else safeSetItem(LS_KEY, priorRaw)
+      return false
+    }
+  }
+  // The blob write itself failed (quota exhausted even after reclaim): when the
+  // user actually changed a field, nothing was stored, so report failure the
+  // same way as the marker rollback -- the caller must not display a value that
+  // reload will discard (GPT 6.1 F1, errors-use-error-notice). A no-op save (no
+  // changed fields) that merely failed to re-write an identical blob loses
+  // nothing, so it still reports success.
+  if (!wrote && changed.length > 0) {
+    window.dispatchEvent(new Event('mc-config-changed'))
+    return false
+  }
   window.dispatchEvent(new Event('mc-config-changed'))
+  return true
 }
 
 export interface DashboardConfig {
@@ -159,7 +350,7 @@ export interface DashboardConfig {
   default_memory_mode: MemoryMode
   widget_density: 'more' | 'less'
   use_builtin_browser: boolean
-  verbosity: 'default' | 'concise' | 'ultra' | 'answer_only'
+  verbosity: 'default' | 'concise' | 'answer_only'
   quick_send: boolean
   session_grid: boolean
   tail_fork_enabled: boolean
@@ -167,8 +358,15 @@ export interface DashboardConfig {
   link_patterns: { pattern: string; url: string }[]
   mcp_app_panel: boolean
   auto_open_git_panel: boolean
+  side_panel_always_open?: boolean
+  side_panel_pin_summary?: boolean
   session_card_source_links: boolean
+  /** Directory each new chat gets its own fresh folder under; '' = off. */
+  session_folder_root?: string
+  /** Sidebar folder ID new chats are filed into when started without one; '' = unfiled. */
+  default_session_folder?: string
   folder_suggestions_enabled: boolean
+  topic_tags_enabled?: boolean
   model_picker_hidden_models: string[]
   model_picker_configured?: boolean
 }

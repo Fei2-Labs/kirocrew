@@ -46,7 +46,11 @@ from kiro_crew.apps.builtins.mochi.pinned_files_service import (
     read_pins_for_update,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
-from kiro_crew.validation import ValidationError, validate_mcp_tool_arguments
+from kiro_crew.validation import (
+    ValidationError,
+    coerce_mcp_tool_args_json_schema,
+    validate_mcp_tool_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -597,9 +601,11 @@ def _tool_pin_file(args: dict[str, Any]) -> str:
     # reading it — so the path has to clear the same gate every other file surface
     # uses (hooks.on_tool_call, validate_file_path, artifacts, knowledge indexing)
     # rather than a check of its own.
-    from kiro_crew.security import is_sensitive_path
+    from kiro_crew.security import is_unverifiable_path_refusal, sensitive_path_refusal
 
-    if is_sensitive_path(path):
+    if reason := sensitive_path_refusal(path):
+        if is_unverifiable_path_refusal(reason):
+            return f"Error: pin_file failed: {reason}"
         return "Error: pin_file failed: that path is not allowed"
     pins_path = _data_dir() / _PINNED_FILE
     # Under the shared lock: the gateway's PinnedFilesService persists its WHOLE
@@ -701,8 +707,14 @@ def _validate_args(name: str, raw_args: dict[str, Any]) -> dict[str, Any]:
     names.
     """
     args = raw_args or {}
+    schema = _INPUT_SCHEMAS.get(name)
     try:
-        validate_mcp_tool_arguments(args, _INPUT_SCHEMAS.get(name))
+        # Repair an int an upstream deferred-schema runtime re-typed from a
+        # numeric-looking string ("42" -> 42) back to its string form on a
+        # string-typed property, BEFORE validation — this entry point is where
+        # that re-typing lands (see coerce_mcp_tool_args_json_schema).
+        args = coerce_mcp_tool_args_json_schema(args, schema)
+        validate_mcp_tool_arguments(args, schema)
     except ValidationError as exc:
         # Re-raise naming the tool. The shared helper renders a ValidationError as
         # `Error: <message>`, and a bare `arguments.which: not in enum` does not say

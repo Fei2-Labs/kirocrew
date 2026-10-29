@@ -446,25 +446,148 @@ def test_the_sweep_is_its_own_command_and_doctor_stays_read_only(monkeypatch, tm
     so the sweep is a top-level command: its flags belong to it alone, and a
     modifier handed to ``doctor`` is an argparse error rather than a health pass
     that exits 0 and reads like a purge that found nothing."""
+    import logging
     import sys
 
     from kiro_crew.cli import main
+    from kiro_crew.cli_log_files import _AppendOnlyLogFileHandler, _OwnerOnlyRotatingFileHandler
+
+    # Snapshot both loggers' handlers BEFORE calling main().  main() calls
+    # _setup_cli_logging, which installs a _AppendOnlyLogFileHandler on the
+    # ``kiro_crew`` logger pointing at a path under ``tmp_path``.  When
+    # pytest later deletes tmp_path the handler is still installed on the
+    # process-global logger, so any subsequent kiro_crew log record causes a
+    # FileNotFoundError whose traceback formatting (via handleError) races
+    # half-finalised PosixPath objects and fires an unraisable exception that
+    # is blamed on the next innocent test.  The finally below removes every
+    # handler the main() calls add, and the assertion below acts as a
+    # regression guard.
+    kiro_logger = logging.getLogger("kiro_crew")
+    pre_kiro_handlers = frozenset(kiro_logger.handlers)
 
     monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
     ran: list[dict[str, object]] = []
     monkeypatch.setattr(sweep, "run_command", lambda **kwargs: ran.append(kwargs))
 
-    monkeypatch.setattr(sys, "argv", ["kirocrew", "ledger-sweep", "--older-than-days", "7"])
-    main()
-    assert ran == [{"purge": False, "older_than_days": 7.0, "purge_unreadable": False}]
-
-    monkeypatch.setattr(sys, "argv", ["kirocrew", "doctor", "--purge"])
-    with pytest.raises(SystemExit) as exit_info:
+    try:
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "ledger-sweep", "--older-than-days", "7"])
         main()
-    assert exit_info.value.code == 2
-    err = capsys.readouterr().err
-    assert "unrecognized arguments: --purge" in err
-    assert len(ran) == 1, "doctor never reaches the sweep"
+        assert ran == [{"purge": False, "older_than_days": 7.0, "purge_unreadable": False}]
+
+        monkeypatch.setattr(sys, "argv", ["kirocrew", "doctor", "--purge"])
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+        assert exit_info.value.code == 2
+        err = capsys.readouterr().err
+        assert "unrecognized arguments: --purge" in err
+        assert len(ran) == 1, "doctor never reaches the sweep"
+    finally:
+        # Close and remove every file handler main() added to the named
+        # loggers.  We deliberately skip the root logger: pytest's
+        # catching_logs fixture adds and removes its own handlers per test
+        # phase, and snapshotting it would re-attach a phase handler that
+        # the framework already removed.
+        for lgr in (kiro_logger,):
+            for h in list(lgr.handlers):
+                if h in pre_kiro_handlers:
+                    continue
+                if isinstance(h, (_AppendOnlyLogFileHandler, _OwnerOnlyRotatingFileHandler)):
+                    lgr.removeHandler(h)
+                    h.close()
+        # Regression guard: no stray file handler should survive after the
+        # test. A failure here means _setup_cli_logging changed its attach
+        # target; update the cleanup loop above accordingly.
+        stray = [
+            h
+            for h in kiro_logger.handlers
+            if h not in pre_kiro_handlers
+            and isinstance(h, (_AppendOnlyLogFileHandler, _OwnerOnlyRotatingFileHandler))
+        ]
+        assert not stray, (
+            f"_setup_cli_logging left {len(stray)} stray file handler(s) on the kiro_crew "
+            f"logger after the test: {stray}. The test cleanup in this function must be "
+            f"updated to remove them so they do not outlive tmp_path."
+        )
+
+
+# ── doctor's count line ──────────────────────────────────────────────────
+
+
+def test_doctor_counts_what_the_dry_run_lists_and_deletes_nothing(capsys):
+    """The doctor line is the dry run's count at the default window, and it names
+    the command that holds the detail. It purges nothing."""
+    from kiro_crew.doctor_checks import workload
+
+    session = _session_ledger("chat-1-old", phase="done", age_days=90)
+    work = _work_ledger()
+    _session_ledger("chat-2-live", phase="implementing", age_days=90)
+    _session_ledger("chat-3-recent", phase="done", age_days=1)
+
+    workload._doctor_ledger_backlog()
+
+    out = capsys.readouterr().out
+    assert out == (
+        "\nLedgers\n"
+        "  ledgers:     🧹 kirocrew ledger-sweep lists 2 ledger(s) (30-day window)"
+        " -- run it to review them\n"
+    )
+    assert session.name not in out, "a count only; the detail lives in the dry run"
+    assert session.is_dir() and work.is_dir(), "doctor must not remove anything"
+
+
+@pytest.mark.skipif(not IS_POSIX, reason="symlink creation needs no privilege on POSIX")
+def test_doctor_counts_a_linked_store_without_calling_it_finished(tmp_path, capsys):
+    import shutil
+
+    from kiro_crew.doctor_checks import workload
+
+    directory = _session_ledger("chat-linked", phase="implementing", age_days=0)
+    target = tmp_path / "session-target"
+    shutil.move(str(directory), str(target))
+    directory.symlink_to(target, target_is_directory=True)
+    assert _stores(sweep.scan()) == {directory.name}
+
+    workload._doctor_ledger_backlog()
+
+    out = capsys.readouterr().out
+    assert out == (
+        "\nLedgers\n"
+        "  ledgers:     🧹 kirocrew ledger-sweep lists 1 ledger(s) (30-day window)"
+        " -- run it to review them\n"
+    )
+    assert "finished" not in out and "idle" not in out
+    assert directory.is_symlink() and target.is_dir()
+
+
+def test_doctor_says_so_when_the_dry_run_lists_nothing(capsys):
+    from kiro_crew.doctor_checks import workload
+
+    workload._doctor_ledger_backlog()
+
+    assert capsys.readouterr().out == (
+        "\nLedgers\n  ledgers:     ✅ kirocrew ledger-sweep lists nothing (30-day window)\n"
+    )
+
+
+def test_doctor_reports_an_unreadable_root_and_keeps_going(monkeypatch, capsys):
+    """``scan`` raises when a root exists but cannot be read. Doctor calls its
+    sections directly, so the section turns that into one row instead of ending
+    the health run, and it never adds to ``issues``: it takes no list at all."""
+    import inspect
+
+    from kiro_crew.doctor_checks import workload
+
+    def denied(**_kwargs):
+        raise PermissionError(13, "Permission denied", "/data/work-ledger\x1b[2J")
+
+    monkeypatch.setattr(sweep, "scan", denied)
+
+    workload._doctor_ledger_backlog()
+
+    out = capsys.readouterr().out
+    assert out.startswith("\nLedgers\n  ledgers:     ⚠️  could not check: ")
+    assert "Permission denied" in out and "\x1b" not in out
+    assert not inspect.signature(workload._doctor_ledger_backlog).parameters
 
 
 # ── damage is classified last ──────────────────────────────────────────────

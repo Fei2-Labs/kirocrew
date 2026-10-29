@@ -21,6 +21,9 @@ AGENT_FILENAME = "kirocrew.json"
 
 # Background/auxiliary managed agent specs KiroCrew writes under ~/.kiro/agents/.
 LITE_AGENT_FILENAME = "kirocrew-lite.json"
+# The tool-less agent a non-operator channel sender talks to. Its own file so the
+# background helper (lite) may grow a tool one day without handing it to a guest.
+GUEST_AGENT_FILENAME = "kirocrew-guest.json"
 CONDUCTOR_AGENT_FILENAME = "kirocrew-conductor.json"
 PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 # The goal conductor's work-ledger variant, and a SEPARATE spec rather than a flag
@@ -33,9 +36,119 @@ PIPELINE_CONDUCTOR_AGENT_FILENAME = "kirocrew-pipeline-conductor.json"
 LEDGER_CONDUCTOR_AGENT_FILENAME = "kirocrew-ledger-conductor.json"
 SECURITY_CONDUCTOR_AGENT_FILENAME = "kirocrew-security-conductor.json"
 WORKER_AGENT_FILENAME = "kirocrew-worker.json"
+# The mate conductor: the agent a crewmate's own chat runs on. Derived from the
+# default template (same prompt, tools and mcpServers), so today it is behaviour-
+# identical to `kirocrew.json` -- only its definition now has its own name in
+# source rather than being an alias for the shared default. See
+# docs/request-for-change/rfc-mate-owned-agent-config.md, migration step 1: this
+# spec intentionally does not yet read or write `~/.kiro/mates/agents/` (step 3).
+MATE_CONDUCTOR_AGENT_FILENAME = "kirocrew-mate-conductor.json"
+# The mate worker: the agent a crewmate's worker sessions run on (the session a
+# crewmate's own chat opens with ``session_create``). Source-defined like the
+# conductor; a crewmate's own file under ``~/.kiro/mates/agents/`` adds to it at
+# projection time (``kiro_crew.mate_worker``), never on disk here.
+MATE_WORKER_AGENT_FILENAME = "kirocrew-mate-worker.json"
+#: The two crewmate specs Crew generates. They live in ``~/.kiro/mates/agents/``
+#: beside the crewmates' own files, NOT in ``~/.kiro/agents/``: kiro-cli lists
+#: every spec in its agents folder, and these two are never picked by hand. The
+#: KAS projection resolves that folder after the user level, and reads these two
+#: names there first (``acp/harness/kas.resolve_projected_spec``). Being in that
+#: folder, their stems are reserved: no crewmate may own a file by either name
+#: (``mate_config.write_mate_spec``).
+MATE_SERVICE_AGENT_FILENAMES = (MATE_CONDUCTOR_AGENT_FILENAME, MATE_WORKER_AGENT_FILENAME)
+MATE_SERVICE_AGENT_NAMES = frozenset(f[: -len(".json")] for f in MATE_SERVICE_AGENT_FILENAMES)
+
+
+def is_mate_service_agent(name: object) -> bool:
+    """Whether *name* is the mate conductor or the mate worker (case-folded)."""
+    return isinstance(name, str) and name.casefold() in MATE_SERVICE_AGENT_NAMES
+
+
+# The dashboard-author crewmate: authors ONE dashboard template and lands it as a
+# pull request, writing no runtime code. Its own file because it is a dispatched,
+# worker-shaped agent with its own charter and tool surface -- it writes files and
+# drives git, but mounts neither the work-ledger set nor the publication surface, so
+# it is neither the default-mirroring worker nor a conductor. Its system prompt and
+# tool charter are the shipped ``dashboard-template/agent-spec.md`` (parsed at install);
+# its installer lives in ``worker_agent.py`` beside the other dispatched-agent installer.
+DASHBOARD_AUTHOR_AGENT_FILENAME = "kirocrew-dashboard-author.json"
 KNOWLEDGE_AGENT_FILENAME = "kirocrew-knowledge.json"
 RESEARCH_AGENT_FILENAME = "kirocrew-research.json"
+# The team lead: owns a goal and does the focused work on it itself (running a
+# goal as a team is a planned follow-up). A DEFAULT agent beside research rather
+# than a kind of its own -- it derives the same ceiling, is written by the same
+# install sequence and is overwritten on every boot, so an operator who wants a
+# customized copy makes one under a different name.
+TEAM_LEAD_AGENT_FILENAME = "kirocrew-team-lead.json"
 HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
+DASHBOARD_MANAGER_AGENT_FILENAME = "kirocrew-dashboard-manager.json"
+
+# The dashboard manager's agent NAME, derived from its filename rather than spelled
+# a second time. kiro-cli resolves an agent by reading ``<agents dir>/<name>.json``,
+# so the two are the same string by construction -- and this one is also a wire
+# string in the member base prompt, which routes a crewmate's page work to it. A
+# name that drifts from the filename routes the member to an agent that does not
+# resolve, which fails the turn rather than the feature.
+#
+# It lives HERE, with the filenames, because this module imports nothing from the
+# package: ``context_assembly.member`` needs the name for the prompt it builds, and
+# reading it off ``agent.py`` would close an import cycle at module scope.
+DASHBOARD_MANAGER_AGENT_NAME = DASHBOARD_MANAGER_AGENT_FILENAME[: -len(".json")]
+# The config key of the first crewmate every install creates once (shown as
+# Mate). An ordinary crewmate on the ordinary crewmate template: renameable,
+# deletable and never re-created. ``display_name`` is the label the user sees and
+# may change.
+ASSISTANT_MEMBER_NAME = "mate"
+#: The label the first crewmate shows while its ``display_name`` is empty.
+ASSISTANT_DEFAULT_DISPLAY_NAME = "Mate"
+
+
+#: Agent names a chat session treats as "the kirocrew default" for context
+#: assembly, never as a hand-written custom agent. ``context_assembly`` guards
+#: workspace identity, the docs pointer and steering re-injection behind an
+#: ``is_custom`` check whose question is "did a user replace the default
+#: agent", so it is keyed on NAME EQUALITY to ``AGENT_FILENAME``'s stem
+#: (``"kirocrew"``) rather than on content. A mate's own chat runs on
+#: ``kirocrew-mate-conductor`` -- a Crew-owned spec byte-identical to the
+#: default template, not a user's custom agent -- so it belongs in this set:
+#: without it, a crewmate's chat loses its workspace identity block and docs
+#: pointer purely because its spec has its own filename. The crewmate's worker,
+#: ``kirocrew-mate-worker``, is the same kind of spec and is in the set for the
+#: same reason: its sessions keep the workspace identity and docs pointer a
+#: crewmate's hand-off sessions always had. The
+#: ``kirocrew-research``/``kirocrew-worker``/``kirocrew-team-lead`` service and
+#: dispatch specs do NOT join this set: they are backend loops with their own
+#: context rules.
+KIROCREW_DEFAULT_AGENT_NAMES = frozenset(
+    {
+        AGENT_FILENAME[: -len(".json")],
+        "kirocrew-mate-conductor",
+        MATE_WORKER_AGENT_FILENAME[: -len(".json")],
+    }
+)
+
+
+def is_kirocrew_default_agent(agent: object) -> bool:
+    """Whether *agent* is one of :data:`KIROCREW_DEFAULT_AGENT_NAMES`.
+
+    The single predicate every ``is_custom`` check in ``context.py`` and
+    ``context_assembly/`` should read instead of repeating the name-equality
+    literal -- so a future name joining the set is a one-line change here,
+    not a hunt across four call sites.
+    """
+    return agent in KIROCREW_DEFAULT_AGENT_NAMES
+
+
+def is_assistant_member(name: object, entry: object) -> bool:
+    """True when *name* is the first crewmate's key. *entry* is not consulted.
+
+    Kept as a predicate over ``(name, entry)`` so callers read the same way they
+    read any member test; the first crewmate is identified by its key alone,
+    whatever template it is bound to.
+    """
+    del entry
+    return name == ASSISTANT_MEMBER_NAME
+
 
 # Collective allowlists — the EXACT filenames KiroCrew owns in each dir. Used by
 # the Playwright convergence sweep (browser/setup.py) so it rewrites only files
@@ -44,14 +157,20 @@ HEARTBEAT_AGENT_FILENAME = "kirocrew-heartbeat.json"
 OWNED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
+    GUEST_AGENT_FILENAME,
     CONDUCTOR_AGENT_FILENAME,
     PIPELINE_CONDUCTOR_AGENT_FILENAME,
     LEDGER_CONDUCTOR_AGENT_FILENAME,
     SECURITY_CONDUCTOR_AGENT_FILENAME,
     WORKER_AGENT_FILENAME,
+    MATE_CONDUCTOR_AGENT_FILENAME,
+    MATE_WORKER_AGENT_FILENAME,
+    DASHBOARD_AUTHOR_AGENT_FILENAME,
     KNOWLEDGE_AGENT_FILENAME,
     RESEARCH_AGENT_FILENAME,
+    TEAM_LEAD_AGENT_FILENAME,
     HEARTBEAT_AGENT_FILENAME,
+    DASHBOARD_MANAGER_AGENT_FILENAME,
 )
 
 # The specs that MUST exist for the product to work at all. kiro-cli resolves an
@@ -61,11 +180,80 @@ OWNED_KIRO_AGENT_FILES = (
 #   * ``kirocrew.json``      — the agent behind user-facing chat.
 #   * ``kirocrew-lite.json`` — the cheap background agent (auto-titles,
 #     compaction, heartbeat), reached via ``SessionManager.get_bg_session``.
-# The remaining OWNED_KIRO_AGENT_FILES entries are deliberately excluded: their
-# installers in ``agent.py`` already degrade to ``logger.debug`` on failure
-# because each one only disables its own feature (goal conducting, Knowledge
-# extraction, Research Lab, unattended heartbeat polling).
+# The remaining OWNED_KIRO_AGENT_FILES entries are deliberately excluded because
+# each one only disables its own feature (guest replies, goal conducting,
+# Knowledge extraction, Research Lab, unattended heartbeat polling). Their
+# installer calls in ``agent_parts/spec_rebuild.py`` degrade to ``logger.debug`` on failure, except
+# ``kirocrew-guest.json``, which ``_install_aim_capabilities`` writes unguarded
+# after the lite fallback.
 REQUIRED_KIRO_AGENT_FILES = (
     AGENT_FILENAME,
     LITE_AGENT_FILENAME,
 )
+
+# Agent ids the KAS engine (``kiro-cli acp --agent-engine v3``) will not run
+# from the wire. A ``_meta.kiro.customAgents`` entry under one of these ids is
+# accepted without an error and then either never appears in the session's
+# ``availableModes`` or is shadowed by the engine's own built-in agent of that
+# id, so a ``session/set_mode`` for it is refused, or activates the built-in
+# instead of the definition Crew sent. Measured against kiro-cli 2.23.0 by
+# injecting every id below in ONE ``session/new``, each with a distinctive
+# ``description``, and reading the advertised mode back:
+#
+#   injected id                       advertised mode         definition that runs
+#   ------------------------------    --------------------    --------------------
+#   default                           none (dropped)          none: set_mode refused
+#   vibe / spec / quick-spec /        the built-in            the built-in; the
+#     bug-fix / plan / autonomous     (origin: bundled)       client entry discarded
+#   Default / DEFAULT / Vibe / Spec   the client entry        the client entry
+#     / PLAN / kiro_default / kiro    (origin: client)
+#     / kiro-default / default_agent
+#   kirocrew-conductor /              the client entry        the client entry: the
+#     semantic_reviewer (also on      (origin: client)        wire definition replaces
+#     disk, advertised from there)                            the on-disk one
+#
+# The match is therefore exact and case-sensitive: the built-in ids are all
+# lower-case, and every case variant registers as an ordinary client agent.
+#
+# Why this lives with the FILENAMES: Kiro Crew names a crewmate's private
+# template copy after the crewmate, and the seeded first crewmate is called
+# ``default``, so without this set its first template edit writes
+# ``~/.kiro/agents/default.json`` and binds the crewmate to an id that can never
+# be activated on KAS. The template writers (fork, publish, create) consult it
+# when choosing a stem. A spec that already carries one of these ids -- written
+# before the writers did, or a kiro-cli setup carried over to KAS -- is sent to
+# the engine under :func:`kas_wire_agent_id` instead, so it runs unchanged.
+KAS_RESERVED_AGENT_IDS = frozenset(
+    {
+        "default",
+        "vibe",
+        "spec",
+        "quick-spec",
+        "bug-fix",
+        "plan",
+        "autonomous",
+    }
+)
+
+#: Appended to a reserved id to make the id the KAS engine sees. A hyphenated
+#: lower-case id is the shape measured above to register as a client agent
+#: (``kiro-default``).
+KAS_WIRE_ID_SUFFIX = "-crewmate"
+
+
+def kas_wire_agent_id(agent_id: str) -> str:
+    """The id *agent_id* is registered and activated under on the KAS wire.
+
+    Itself for every id but :data:`KAS_RESERVED_AGENT_IDS`, which the engine
+    drops or shadows; those get :data:`KAS_WIRE_ID_SUFFIX`. Applied only where
+    the id crosses the wire (the ``customAgents`` batch, ``set_mode``, the
+    advertised modes read back), so the rest of Kiro Crew keeps the crewmate's
+    own id and kiro-cli, which reserves none of these, never sees the alias.
+
+    A session registers exactly one agent, so the alias cannot meet a second
+    entry of the same id in its batch; an on-disk spec that happens to carry it
+    is replaced by the wire definition (the ``kirocrew-conductor`` row above).
+    """
+    if agent_id in KAS_RESERVED_AGENT_IDS:
+        return f"{agent_id}{KAS_WIRE_ID_SUFFIX}"
+    return agent_id

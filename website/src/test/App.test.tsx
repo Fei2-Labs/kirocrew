@@ -1,20 +1,22 @@
+// App routing: the onboarding gates, routes, the nav rail, branding, the top-bar
+// layout contract and the shell. App.topbarAndShortcuts.test.tsx covers the rest
+// with the same mocks: the top bar's readouts, the global shortcuts and two
+// App.tsx source contracts.
 import { afterAll, describe, it, expect, vi } from 'vitest'
 import { readFileSync, readdirSync } from 'node:fs'
 import { MOBILE_BREAKPOINT } from '../hooks/useIsMobile'
 import { join } from 'node:path'
 import { render, screen, act, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
+import { readIndexCss } from './indexCssSource'
 import App, { NavBadge } from '../App'
 import { sseConnected, sseDisconnected, markSlotUnread } from '../store/dashboardSlice'
 import { openActivityPanel, sseSubagentQueued } from '../store/chatSlice'
 import { SHORTCUTS_ENABLED_KEY } from '../hooks/useKeyboardShortcuts'
 import SegmentedControl from '../components/SegmentedControl'
-import { ApiError } from '../api/client'
 import { safeSetItem } from '../utils/safeStorage'
 import { FEATURE_REQUEST_PROMPT_FALLBACK } from '../prompts/featureRequest'
-
-/** A failure `POST /api/chat/slots/{slot}/agent` really can return today. */
-const REAL_FAILURE = 'invalid agent name'
+import { consumeChatHandoff } from '../utils/errorReport'
 
 /** Chrome the side tracks never get: the header's own `pl-2 pr-3` (20px) plus the
  *  two 12px track gaps. Subtracted before reasoning about a group's width —
@@ -30,7 +32,7 @@ const searchWidth = (w: number) => Math.min(480, Math.max(240, w * 0.22))
  *  jsdom applies no CSS, so these read the rule text rather than computed style,
  *  which would pass against an empty rule. */
 function topbarCss(): string {
-  return readFileSync(join(__dirname, '..', 'index.css'), 'utf8')
+  return readIndexCss()
 }
 /** The three declared tracks of the header grid, whitespace-normalised. */
 function topbarTracks(): { sides: string[]; search: string } {
@@ -58,6 +60,17 @@ vi.mock('../pages/KiroCrewAgentsPage', () => ({ default: () => <div data-testid=
 vi.mock('../pages/CapabilitiesPage', () => ({ default: () => <div data-testid="capabilities-page">CapabilitiesPage</div> }))
 vi.mock('../pages/NotificationsPage', () => ({ default: () => <div data-testid="notifications-page">NotificationsPage</div> }))
 vi.mock('../pages/SchedulePage', () => ({ default: () => <div data-testid="schedule-page">SchedulePage</div> }))
+// A lazy route whose first chunk fetch rejects, then succeeds when retried.
+// The factory count models the browser re-attempting the dynamic import after
+// a transient gateway or stale-chunk failure.
+const hooksPageMock = vi.hoisted(() => ({ attempts: 0 }))
+vi.mock('../pages/HooksPage', () => {
+  hooksPageMock.attempts += 1
+  if (hooksPageMock.attempts === 1) {
+    throw new Error('Failed to fetch dynamically imported module: HooksPage')
+  }
+  return { default: () => <div data-testid="hooks-page">HooksPage</div> }
+})
 vi.mock('../hooks/useWebSocket', () => ({ useWebSocket: () => ({ subscribeLogs: () => {} }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: vi.fn(() => ({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })) }))
 vi.mock('../providers/context', () => ({ useProvider: () => ({ id: 'acp' }) }))
@@ -69,6 +82,9 @@ vi.mock('../api/client', () => ({
     status: vi.fn().mockResolvedValue({ uptime: '1h', sessions: 0, messages: 0, cron_jobs: 0, subagents: 0, lessons: 0 }),
     sessionsUsage: vi.fn().mockResolvedValue({ usage: { credits_used: 3044, credits_covered: 3044, credits_overage: 0, credits_plan: 10000, resets: '2026-07-01', plan: 'KIRO POWER', cost_usd: 0, overage_rate: '0.04', bonus_credits: [{ name: 'Launch bonus', used: 250, total: 1000, days_left: 30 }], email: 'owner@example.com', account_type: 'Social' } }),
     listApps: vi.fn().mockResolvedValue([]),
+    // A NON-Kiro harness by default, so the credit pill's Kiro-only surfaces
+    // (the no-reading dash) stay off unless a test names the kiro backend.
+    kirocrewConfig: vi.fn().mockResolvedValue({ agent: { acp_backend: 'claude' } }),
     system: vi.fn().mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 }),
     chatSlotAgent: vi.fn().mockResolvedValue({}),
     chatSlotReasoningEffort: vi.fn().mockResolvedValue({}),
@@ -417,9 +433,10 @@ describe('App routing', () => {
     expect(shell!.className).toContain('supports-[height:100dvh]:h-dvh')
   })
 
-  it('redirects /agents to the Agent Capabilities panel', () => {
+  // CapabilitiesPage is a lazy route chunk, so it lands after a Suspense tick.
+  it('redirects /agents to the Customize panel', async () => {
     renderWithProviders(<App />, { route: '/agents' })
-    expect(screen.getByTestId('capabilities-page')).toBeInTheDocument()
+    expect(await screen.findByTestId('capabilities-page')).toBeInTheDocument()
   })
 
   // /projects now resolves through BuiltinAppRoute -> BUILTIN_COMPONENT_REGISTRY
@@ -440,6 +457,53 @@ describe('App routing', () => {
     expect(screen.getByTestId('logs-page')).toBeInTheDocument()
   })
 
+  // Route-only pages load through React.lazy; each must still mount behind its
+  // Suspense boundary once its chunk resolves.
+  it.each([
+    ['/notifications', 'notifications-page'],
+    ['/schedule', 'schedule-page'],
+    ['/capabilities', 'capabilities-page'],
+  ])('renders the lazy route page at %s', async (route, testId) => {
+    renderWithProviders(<App />, { route })
+    expect(await screen.findByTestId(testId)).toBeInTheDocument()
+  })
+
+  // A rejected lazy import must stay inside its route area, preserve its
+  // diagnostic for agent hand-off, and recover when the user retries the fetch.
+  it('recovers a lazy route after its first chunk load fails', async () => {
+    // React and ErrorBoundary both report the caught throw on console.error;
+    // it is the expected outcome here, not noise to fail on.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      sessionStorage.clear()
+      const view = renderWithProviders(<App />, { route: '/hooks' })
+      const notice = await screen.findByRole('alert')
+      const caughtDiagnostic = '[vitest] There was an error when mocking a module.'
+      expect(notice).toHaveTextContent("This page couldn't load. Check the connection to the gateway, then try again.")
+      expect(notice).toHaveTextContent(caughtDiagnostic)
+      expect(screen.getByRole('button', { name: 'Try Again' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Reload page' })).toBeInTheDocument()
+      // The nav rail is still rendered around the failed route.
+      expect(screen.getByText('Sessions')).toBeInTheDocument()
+      expect(screen.getByText('Settings')).toBeInTheDocument()
+
+      fireEvent.click(within(notice).getByRole('button', { name: 'Ask the agent' }))
+      expect(consumeChatHandoff()).toContain(`- Message: ${caughtDiagnostic}`)
+
+      // The hand-off navigates to chat. Remounting the failed route models the
+      // user returning before retrying; the rejected React.lazy wrapper remains.
+      view.unmount()
+      renderWithProviders(<App />, { route: '/hooks' })
+      expect(await screen.findByRole('alert')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Try Again' }))
+
+      expect(await screen.findByTestId('hooks-page')).toBeInTheDocument()
+      expect(hooksPageMock.attempts).toBe(2)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+
   it('redirects unknown routes to /chat', () => {
     renderWithProviders(<App />, { route: '/nonexistent' })
     expect(screen.getByTestId('chat-page')).toBeInTheDocument()
@@ -448,7 +512,7 @@ describe('App routing', () => {
   it('renders nav items', () => {
     renderWithProviders(<App />, { route: '/chat' })
     expect(screen.getByText('Sessions')).toBeInTheDocument()
-    expect(screen.getByText('Agent Capabilities')).toBeInTheDocument()
+    expect(screen.getByText('Customize')).toBeInTheDocument()
     expect(screen.getByText('Settings')).toBeInTheDocument()
     // PR1 App Store split: the single 'Explore' entry is gone — the sidebar
     // now carries TWO App Store rows, Discover (/apps) and Library
@@ -958,11 +1022,15 @@ describe('App routing', () => {
     }
   })
 
-  it('opens Search Everywhere from the theme-aware shadowless header trigger', () => {
+  it('opens Search Everywhere from the glass header trigger', () => {
     renderWithProviders(<App />, { route: '/chat' })
     const trigger = screen.getByRole('button', { name: 'Search sessions, files, and commands' })
-    expect(trigger).toHaveClass('rounded-md', 'border-border', 'bg-card', 'shadow-none')
-    expect(trigger).not.toHaveClass('rounded-full')
+    // The trigger IS the Liquid Glass pane (components/Glass.tsx, rendered as
+    // the button): the material carries the edge, so the control has no border,
+    // fill or utility radius of its own -- only the hover tint step and the
+    // neutral rest shadow every pane wears.
+    expect(trigger).toHaveClass('liquid-glass', 'glass-hover', 'glass-shadow')
+    expect(trigger).not.toHaveClass('border-border', 'bg-card', 'rounded-md', 'rounded-full')
     fireEvent.click(trigger)
     expect(screen.getByRole('dialog', { name: 'Search everywhere' })).toBeInTheDocument()
   })
@@ -1133,7 +1201,9 @@ describe('App routing', () => {
     const PILL_WIDEST_LABELED = 201.7 // de downloading_percent "Wird heruntergeladen 100 %"
     const GROUP_GAP = 6
     const SHIFT_LABELED = Math.ceil(PILL_WIDEST_LABELED + GROUP_GAP)
-    const TERMINAL = '.tb-capsule > *:not(:first-child)'
+    // The capsule is a Liquid Glass host whose effect layers precede the
+    // segments, so the rung skips `[data-liquid-glass-layer]` on both sides.
+    const TERMINAL = '.tb-capsule > :not([data-liquid-glass-layer]) ~ :not([data-liquid-glass-layer])'
     // ≥640px (label visible): every rung, terminal included, shifts by the
     // labeled footprint, inside the media gate.
     for (const sel of ['.tb-drop-metrics', '.tb-drop-usage', '.tb-drop-feedback', TERMINAL]) {
@@ -1418,13 +1488,16 @@ describe('App routing', () => {
         // cannot leave it queued for a later, unrelated message.
         { source: 'feature-request', maxAge: 60 },
       )
-      // sendTurn's dashboard wire passes (message, slot, agent, signal, memoryMode, steer).
+      // sendTurn's dashboard wire passes (message, slot, colorTheme, signal,
+      // meta, steer). `meta` carries only the seeded turn's correlation id
+      // (#13342): the hidden instructions ride the context seed above, never
+      // the visible message.
       expect(api.sendChat).toHaveBeenCalledWith(
         'I’d like to request a feature!',
         'feature-slot',
         expect.any(String),
         expect.any(AbortSignal),
-        undefined,
+        { sendId: expect.stringMatching(/^s-/), featureRequest: true },
         undefined,
       )
     })
@@ -1465,662 +1538,5 @@ describe('App routing', () => {
     expect(buttons[0]).toHaveAttribute('title', 'Prompt for approval')
     expect(buttons[1]).toHaveAttribute('title', 'Auto-approve all tools')
     Object.defineProperty(HTMLElement.prototype, 'clientWidth', { configurable: true, value: 0 })
-  })
-})
-
-describe('mobile nav drawer insets', () => {
-  /** The drawer's className, read from source: it only renders below 768px and
-   *  jsdom applies no CSS, so a rendered assertion here would either need the
-   *  whole mobile shell stood up or would pass against an empty rule. */
-  function mobileDrawerClasses(): string[] {
-    const src = readFileSync(join(__dirname, '..', 'App.tsx'), 'utf8')
-    const drawer = src.slice(src.indexOf('key="mobile-nav-drawer"'))
-    const cls = drawer.match(/className="([^"]+)"/)?.[1] ?? ''
-    expect(cls, 'expected to find the mobile nav drawer className').not.toBe('')
-    return cls.split(/\s+/)
-  }
-
-  it('insets all four sides equally', () => {
-    // The drawer is `fixed` to the VIEWPORT, not placed in the grid row below
-    // the topbar the way the desktop rail is, so it owns its own top offset.
-    // Without it the card's rounded top edge sits flat against the screen while
-    // the other three sides float — see the reported defect.
-    const classes = mobileDrawerClasses()
-    expect(classes).toContain('mx-2')
-    expect(classes).toContain('mt-2')
-    expect(classes).toContain('mb-2')
-    expect(classes).not.toContain('mt-0')
-  })
-
-  it('spans the viewport height so both margins resolve', () => {
-    // An anchor on BOTH ends plus a margin on each resolves the height to
-    // viewport-16px. Dropping either anchor would make the margins inert (auto
-    // height) and re-open the flush-top defect from the other direction.
-    //
-    // The safe-area variants satisfy this the same way the plain ones do: they
-    // set top/bottom to env(safe-area-inset-*), a definite length that is 0 on
-    // hardware without a notch. So accept either form per end, but keep
-    // requiring that BOTH ends are anchored -- that is the actual invariant,
-    // and the literal class name is not.
-    const classes = mobileDrawerClasses()
-    expect(classes).toContain('fixed')
-    expect(classes.some(c => c === 'top-0' || c === 'top-safe'), `expected a top anchor, got: ${classes.join(' ')}`).toBe(true)
-    expect(classes.some(c => c === 'bottom-0' || c === 'bottom-safe'), `expected a bottom anchor, got: ${classes.join(' ')}`).toBe(true)
-  })
-})
-
-describe('TopbarMetrics widget', () => {
-  it('shows only the Activity toggle button when metricsOpen is not set', () => {
-    localStorage.removeItem('mc-topbar-metrics')
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(screen.getByTitle('System metrics')).toBeInTheDocument()
-    expect(screen.queryByText(/CPU /)).not.toBeInTheDocument()
-    expect(screen.queryByText(/MEM /)).not.toBeInTheDocument()
-  })
-
-  it('persists toggle open state in localStorage and renders the metrics pill', async () => {
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
-    expect(screen.getByText(/MEM 25%/)).toBeInTheDocument()
-    expect(screen.getByText(/DSK 40%/)).toBeInTheDocument()
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-
-  it('renders placeholder dashes instead of NaN when memTotal or diskTotal is 0', async () => {
-    const { api } = await import('../api/client')
-    const sysMock = vi.mocked(api.system)
-    sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 0, cpu_pct: 25.0, disk_total_gb: 0, disk_free_gb: 0 } as never)
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    // The capsule paints `MEM —` / `DSK —` BEFORE the first frame lands too (the
-    // loading placeholder reuses the loaded branch's "no valid reading" glyph),
-    // so a dash is not proof the frame arrived. `CPU 25%` only exists in the
-    // loaded branch: wait for that, then read the dashes off the same frame.
-    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
-    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
-    expect(screen.getByText(/DSK —/)).toBeInTheDocument()
-    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-
-  it('renders "MEM —" instead of crashing when mem_used_gb is missing but mem_total_gb is present', async () => {
-    const { api } = await import('../api/client')
-    const sysMock = vi.mocked(api.system)
-    // The shape that crashed the root app-shell boundary with
-    // "Cannot read properties of undefined (reading 'toFixed')":
-    // `_collect_system_metrics` seeds the frame from the CACHED static system
-    // info (which carries mem_total_gb) and then computes mem_used_gb/
-    // mem_free_gb under `try/except: pass`, so a failed memory probe yields a
-    // total with no used. A `memTotal > 0` gate admits that frame and then
-    // formats `undefined.toFixed(1)`.
-    sysMock.mockResolvedValueOnce({ mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    // Same ordering as above: `MEM —` is also the pre-frame placeholder, so the
-    // wait has to be on a reading only the loaded frame can produce.
-    expect(await screen.findByText(/CPU 25%/)).toBeInTheDocument()
-    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
-    // The rest of the same frame still renders — one absent probe must not
-    // blank the whole capsule, let alone unmount the app.
-    expect(screen.getByText(/DSK 40%/)).toBeInTheDocument()
-    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-
-  it('renders "DSK —" instead of NaN when disk_free_gb is missing but disk_total_gb is present', async () => {
-    const { api } = await import('../api/client')
-    const sysMock = vi.mocked(api.system)
-    sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0 } as never)
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/DSK —/)).toBeInTheDocument()
-    expect(screen.getByText(/MEM 25%/)).toBeInTheDocument()
-    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-
-  it('renders every readout as "—" instead of crashing when the frame carries non-finite numbers', async () => {
-    const { api } = await import('../api/client')
-    const sysMock = vi.mocked(api.system)
-    // NaN/Infinity reach the frame when a probe divides by an unmeasured total;
-    // they must take the placeholder path, not render "NaN%".
-    sysMock.mockResolvedValueOnce({ mem_used_gb: NaN, mem_total_gb: 16.0, cpu_pct: NaN, disk_total_gb: Infinity, disk_free_gb: 60.0 } as never)
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/CPU —/)).toBeInTheDocument()
-    expect(screen.getByText(/MEM —/)).toBeInTheDocument()
-    expect(screen.getByText(/DSK —/)).toBeInTheDocument()
-    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-
-  it('renders "CPU —" instead of crashing when cpu_pct is undefined', async () => {
-    const { api } = await import('../api/client')
-    const sysMock = vi.mocked(api.system)
-    // Backend omits cpu_pct (partial/stale frame or older gateway) -> cpuPct is undefined.
-    sysMock.mockResolvedValueOnce({ mem_used_gb: 4.0, mem_total_gb: 16.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/CPU —/)).toBeInTheDocument()
-    // mem/disk still render normally from the same frame.
-    expect(screen.getByText(/MEM 25%/)).toBeInTheDocument()
-    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-
-  it('renders "metrics unavailable" pill when api.system rejects', async () => {
-    const { api } = await import('../api/client')
-    const sysMock = vi.mocked(api.system)
-    sysMock.mockRejectedValueOnce(new Error('boom'))
-    localStorage.setItem('mc-topbar-metrics', '1')
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByText(/metrics unavailable/)).toBeInTheDocument()
-    sysMock.mockResolvedValue({ mem_used_gb: 4.0, mem_total_gb: 16.0, cpu_pct: 25.0, disk_total_gb: 100.0, disk_free_gb: 60.0 } as never)
-    localStorage.removeItem('mc-topbar-metrics')
-  })
-})
-
-describe('onCycleAgent keyboard shortcut', () => {
-  it('cycles to next agent when Alt+Shift+A is pressed', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    // Set up the real singleton store state that onCycleAgent reads via store.getState()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    // The switch now rides performSlotSwitch (#5120), so the API call lands a
-    // microtask after the keydown — flush with an async act.
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'reviewer')
-    // The pick must land in the store WITHOUT a slots round trip (#5120):
-    // no websocket exists in this harness, so only the optimistic write can
-    // move the row. The mock resolves {} — the requested-name fallback path.
-    await waitFor(() => expect(
-      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.agent,
-    ).toBe('reviewer'))
-  })
-
-  it('does not call api.chatSlotAgent when no active slot', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'chat/setActiveSlot', payload: null })
-    renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotAgent).not.toHaveBeenCalled()
-  })
-
-  it.each([
-    ['forward', 'A', 'KeyA', 'reviewer'],
-    ['backward', 'Z', 'KeyZ', 'oracle'],
-  ])('surfaces an agent-switch API failure when cycling %s', async (_direction, key, code, expectedAgent) => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
-      new ApiError(400, REAL_FAILURE, JSON.stringify({ error: REAL_FAILURE })),
-    )
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: true, agent: 'kirocrew' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-
-    // The switch now rides performSlotSwitch (#5120): flush the microtask
-    // chain so both the API call and the failure notice land.
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key, code, altKey: true, shiftKey: true, bubbles: true }))
-    })
-
-    expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', expectedAgent)
-    const noticeText = await screen.findByText(
-      REAL_FAILURE,
-    )
-    expect(noticeText.closest('[role="status"]')).not.toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
-    expect(screen.queryByText(
-      REAL_FAILURE,
-    )).not.toBeInTheDocument()
-  })
-
-  it('restarts the six-second expiry after a repeated failure', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-    try {
-      const failure = new ApiError(400, REAL_FAILURE, JSON.stringify({ error: REAL_FAILURE }))
-      ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockRejectedValue(failure)
-      store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: true, agent: 'kirocrew' }] })
-      store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-      renderWithProviders(<App />, { route: '/chat' })
-
-      await act(async () => {
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
-        await Promise.resolve()
-      })
-      const copy = REAL_FAILURE
-      expect(screen.getByText(copy)).toBeInTheDocument()
-
-      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-      await act(async () => {
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
-        await Promise.resolve()
-      })
-      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
-      expect(screen.getByText(copy)).toBeInTheDocument()
-
-      await act(async () => { await vi.advanceTimersByTimeAsync(4500) })
-      expect(screen.queryByText(copy)).not.toBeInTheDocument()
-    } finally {
-      vi.useRealTimers()
-      ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockResolvedValue({})
-    }
-  })
-})
-
-describe('onCycleAgent edge cases', () => {
-  it('does not cycle agent when installedAgents is empty', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    const useAgentsMod = await import('../hooks/useAgents')
-    const useAgentsMock = vi.mocked(useAgentsMod).useAgents
-    useAgentsMock.mockReturnValue({ agents: [], defaultAgent: '' })
-    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'A', code: 'KeyA', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotAgent).not.toHaveBeenCalled()
-    useAgentsMock.mockReturnValue({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })
-  })
-})
-
-describe('onCycleReasoningEffort keyboard shortcut (#5120)', () => {
-  it('steps a burst from the in-flight target and writes the adjudicated level', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'max' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    // Two presses in one synchronous batch: the first pick is still in
-    // flight when the second press computes its base. From 'max' the first
-    // press targets '' (clear the override — a REAL target), so the second
-    // press's base MUST come from pendingSlotSwitchTarget: reading the store
-    // (still 'max', nothing settled) would issue '' twice, and the ''-falsy
-    // accessor would misread the in-flight '' the same way.
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(1, 'slot-1', '')
-    expect(api.chatSlotReasoningEffort).toHaveBeenNthCalledWith(2, 'slot-1', 'low')
-    // The adjudicated survivor (the newest pick) lands in the store without
-    // a slots round trip — no websocket exists in this harness.
-    await waitFor(() => expect(
-      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
-    ).toBe('low'))
-  })
-
-  it('cycles backward on Alt+Shift+C and writes the store', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'kirocrew', reasoning_effort: 'low' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    // 'low' is index 1; backward reaches '' (provider default).
-    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', '')
-    await waitFor(() => expect(
-      store.getState().dashboard.slots.find((s: { key: string }) => s.key === 'slot-1')?.reasoning_effort,
-    ).toBe(''))
-  })
-})
-
-describe('onCyclePrevAgent edge cases', () => {
-  it('does not cycle prev agent when no active slot', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'chat/setActiveSlot', payload: null })
-    renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotAgent).not.toHaveBeenCalled()
-  })
-
-  it('does not cycle prev agent when installedAgents is empty', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    const useAgentsMod = await import('../hooks/useAgents')
-    const useAgentsMock = vi.mocked(useAgentsMod).useAgents
-    useAgentsMock.mockReturnValue({ agents: [], defaultAgent: '' })
-    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    act(() => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotAgent).not.toHaveBeenCalled()
-    useAgentsMock.mockReturnValue({ agents: [{ name: 'kirocrew' }, { name: 'reviewer' }, { name: 'oracle' }], defaultAgent: 'kirocrew' })
-  })
-})
-
-describe('onCycleApprovalMode and onCyclePrevApprovalMode no-slot cases', () => {
-  it('does not cycle approval mode when no active slot', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatMode as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'chat/setActiveSlot', payload: null })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'F', code: 'KeyF', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatMode).not.toHaveBeenCalled()
-  })
-
-  it('does not cycle prev approval mode when no active slot', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatMode as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'chat/setActiveSlot', payload: null })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'V', code: 'KeyV', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatMode).not.toHaveBeenCalled()
-  })
-})
-
-describe('onCycleReasoningEffort no-slot cases', () => {
-  it('does not cycle reasoning effort when no active slot', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'chat/setActiveSlot', payload: null })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotReasoningEffort).not.toHaveBeenCalled()
-  })
-
-  it('does not cycle prev reasoning effort when no active slot', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'chat/setActiveSlot', payload: null })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotReasoningEffort).not.toHaveBeenCalled()
-  })
-})
-
-describe('onCycleApprovalMode and onCyclePrevAgent shortcuts', () => {
-  it('cycles approval mode forward on Alt+Shift+F', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'F', code: 'KeyF', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatMode).toHaveBeenCalledWith('trust_reads', 'slot-1')
-  })
-
-  it('cycles agent backward on Alt+Shift+Z', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotAgent as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, agent: 'reviewer' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    // Async act: the switch protocol (#5120) chains the wire call on a
-    // microtask, so the mock is invoked a tick after the keydown.
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Z', code: 'KeyZ', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotAgent).toHaveBeenCalledWith('slot-1', 'kirocrew')
-  })
-
-  it('cycles approval mode backward on Alt+Shift+V', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatMode as ReturnType<typeof vi.fn>).mockClear()
-    // Force approvalMode to 'yolo' via fulfilled thunk action
-    store.dispatch({ type: 'dashboard/changeApprovalMode/fulfilled', payload: 'yolo' })
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'V', code: 'KeyV', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatMode).toHaveBeenCalledWith('trust', 'slot-1')
-  })
-
-  it('cycles reasoning effort forward on Alt+Shift+D', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, reasoning_effort: '' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', 'low')
-  })
-
-  it('cycles reasoning effort backward on Alt+Shift+C', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotReasoningEffort as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, reasoning_effort: 'low' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'C', code: 'KeyC', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotReasoningEffort).toHaveBeenCalledWith('slot-1', '')
-  })
-})
-
-describe('Alt+Shift+S/X model cycling via React Query cache', () => {
-  it('does not call chatSlotModel on Alt+Shift+S without cache', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotModel as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, model: 'claude-3' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'S', code: 'KeyS', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotModel).not.toHaveBeenCalled()
-  })
-
-  it('does not call chatSlotModel on Alt+Shift+X without cache', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotModel as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, model: 'claude-3' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    renderWithProviders(<App />, { route: '/chat' })
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'X', code: 'KeyX', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotModel).not.toHaveBeenCalled()
-  })
-
-  it('cycles to next model on Alt+Shift+S', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotModel as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, model: 'auto' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
-    queryClient.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'opus' }, { name: 'sonnet' }])
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'S', code: 'KeyS', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotModel).toHaveBeenCalledWith('slot-1', 'opus')
-  })
-
-  it('cycles to previous model on Alt+Shift+X', async () => {
-    const { api } = await import('../api/client')
-    const { store } = await import('../store')
-    ;(api.chatSlotModel as ReturnType<typeof vi.fn>).mockClear()
-    store.dispatch({ type: 'dashboard/sseSlots', payload: [{ key: 'slot-1', messages: 0, running: false, model: 'opus' }] })
-    store.dispatch({ type: 'chat/setActiveSlot', payload: 'slot-1' })
-    const { queryClient } = renderWithProviders(<App />, { route: '/chat' })
-    queryClient.setQueryData(['available-models', 'acp'], [{ name: 'auto' }, { name: 'opus' }, { name: 'sonnet' }])
-    await act(async () => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'X', code: 'KeyX', altKey: true, shiftKey: true, bubbles: true }))
-    })
-    expect(api.chatSlotModel).toHaveBeenCalledWith('slot-1', 'auto')
-  })
-})
-
-describe('Kiro credits pill', () => {
-  it('shows a checking/loading state until usage resolves with plan data', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: {} } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByTitle(/Kiro credit usage/)).toBeInTheDocument()
-  })
-
-  it('renders used/limit and percentage once loaded', async () => {
-    renderWithProviders(<App />, { route: '/chat' })
-    // default mock: 3044 total used of 10000 = 30%
-    const pill = await screen.findByTitle('Kiro credit usage')
-    expect(pill).toBeInTheDocument()
-  })
-
-  it('renders the true total (credits_used) including overage above the plan', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockResolvedValueOnce({
-      usage: { credits_covered: 10000, credits_used: 10500, credits_overage: 500, credits_plan: 10000, resets: '2026-07-01', plan: 'KIRO POWER' },
-    } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    // credits_used=10500 total / 10000 plan = 105% (500 over plan)
-    expect(await screen.findByTitle('Kiro credit usage')).toBeInTheDocument()
-  })
-
-  it('opens a details modal with breakdown rows when clicked', async () => {
-    renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle('Kiro credit usage')
-    fireEvent.click(pill)
-    expect(await screen.findByRole('dialog', { name: 'Kiro Account' })).toBeInTheDocument()
-    expect(await screen.findByText('owner@example.com')).toBeInTheDocument()
-    expect(screen.getByText(/Signed in with Social login/)).toBeInTheDocument()
-    expect(await screen.findByText('KIRO POWER')).toBeInTheDocument()
-    expect(screen.getByText(/Resets/)).toBeInTheDocument()
-    expect(screen.getByText(/Remaining credit balance: 6,956/)).toBeInTheDocument()
-    expect(screen.getByText('Launch bonus')).toBeInTheDocument()
-    expect(screen.getByText(/Remaining credit balance: 750/)).toBeInTheDocument()
-    expect(screen.getByText('Overage used')).toBeInTheDocument()
-    expect(screen.getByText(/across chat, agents, MCP/)).toBeInTheDocument()
-  })
-})
-
-describe('Kiro credits pill — edge cases', () => {
-  it('stays in loading state if the usage fetch rejects', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockRejectedValueOnce(new Error('boom'))
-    renderWithProviders(<App />, { route: '/chat' })
-    // useQuery (retry:false) surfaces the error and leaves data undefined; pill stays in the checking/loading state
-    expect(await screen.findByTitle(/Kiro credit usage/)).toBeInTheDocument()
-  })
-
-  it('opens the modal in a loading state when clicked before data resolves', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: {} } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    const loadingPill = await screen.findByTitle(/Kiro credit usage/)
-    fireEvent.click(loadingPill)
-    expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
-  })
-
-  it('defaults covered/overage to 0 and renders sub-1000 values without K suffix', async () => {
-    const { api } = await import('../api/client')
-    // only credits_plan present -> credits_used falls back to 0
-    vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: { credits_plan: 500 } } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle('Kiro credit usage')
-    expect(pill).toHaveTextContent('0/500') // sub-1000 -> no "K" formatting
-    fireEvent.click(pill)
-    expect(await screen.findByText('0 credits')).toBeInTheDocument() // Overage used row
-  })
-
-  it('handles a zero limit without dividing by zero (0%)', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockResolvedValueOnce({ usage: { credits_plan: 0, credits_covered: 0 } } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    expect(await screen.findByTitle('Kiro credit usage')).toBeInTheDocument()
-  })
-
-  it('falls back to an empty object when the response has no usage key', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockResolvedValueOnce({} as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    // d?.usage is undefined -> `|| {}` -> credits_plan absent -> stays loading
-    expect(await screen.findByTitle(/Kiro credit usage/)).toBeInTheDocument()
-  })
-
-  it('closes the modal on Escape', async () => {
-    renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle('Kiro credit usage')
-    // Focus the pill first, as a real click does: focus restore is `Modal`'s
-    // generic behaviour (it returns focus to whatever was focused when the
-    // dialog opened), not a per-call-site `ref.focus()` in App.
-    pill.focus()
-    fireEvent.click(pill)
-    expect(await screen.findByText('Overage used')).toBeInTheDocument()
-    act(() => { fireEvent.keyDown(window, { key: 'Escape' }) })
-    await waitFor(() => expect(screen.queryByText('Overage used')).not.toBeInTheDocument())
-    await waitFor(() => expect(pill).toHaveFocus())
-  })
-
-  it('hides the pill entirely when usage is unavailable (non-Kiro provider)', async () => {
-    const { api } = await import('../api/client')
-    // Backend reports available:false when kiro-cli is absent (e.g. a Claude-only provider).
-    vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { available: false } } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    await waitFor(() => expect(screen.queryByTitle(/Kiro credit usage/)).not.toBeInTheDocument())
-    expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument()
-  })
-
-  it('auto-closes the modal if usage resolves to unavailable while it is open', async () => {
-    const { api } = await import('../api/client')
-    let resolveUsage: (v: unknown) => void = () => {}
-    vi.mocked(api.sessionsUsage).mockReturnValue(new Promise(r => { resolveUsage = r }) as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    const pill = await screen.findByTitle(/Kiro credit usage/)
-    fireEvent.click(pill)
-    expect(await screen.findByLabelText('Checking credit usage')).toBeInTheDocument()
-    await act(async () => { resolveUsage({ usage: { available: false } }); await Promise.resolve() })
-    await waitFor(() => expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument())
-  })
-
-  it('never renders NaN when credit fields arrive non-finite', async () => {
-    const { api } = await import('../api/client')
-    vi.mocked(api.sessionsUsage).mockResolvedValue({ usage: { credits_plan: NaN, credits_used: NaN, credits_covered: NaN } } as never)
-    renderWithProviders(<App />, { route: '/chat' })
-    // Non-finite plan is rejected by the Number.isFinite guard, so the loaded
-    // pill (which would otherwise show "NaN / NaN") never appears.
-    await waitFor(() => expect(screen.queryByTitle('Kiro credit usage')).not.toBeInTheDocument())
-    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
   })
 })

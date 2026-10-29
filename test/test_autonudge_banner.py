@@ -45,13 +45,33 @@ from kiro_crew.validation import ValidationError
 # ── Fire-path harness (mirrors test_autonudge_dashboard_fire.py) ──
 
 
+def _owner_dashboard_identity():
+    """The owner's dashboard claims, for the routes the owner gate covers.
+
+    ``app == ""`` with the owner's subject: ``state.owner_id`` when one is
+    configured, else the signed local bootstrap subject.
+    """
+    from aiohttp import web
+
+    @web.middleware
+    async def middleware(request, handler):
+        state = request.app.get("state")
+        request["user"] = str(getattr(state, "owner_id", "") or "") or "local-app"
+        request["app"] = ""
+        return await handler(request)
+
+    return middleware
+
+
 def _loop(**kw) -> NudgeLoop:
     base = dict(
         id="loop-abc",
         slot_key="chat-1-1785",
         message="the full multi-paragraph babysit instruction",
         idle_secs=300,
-        max_cycles=24,
+        # Uncapped: a capped loop adds a ``[patrol budget: ...]`` line to the
+        # tag (``test_patrol_budget.py``), which these banner pins are not about.
+        max_cycles=0,
         cycle_count=3,
     )
     base.update(kw)
@@ -62,7 +82,6 @@ def _slot(key: str = "chat-1-1785") -> MagicMock:
     slot = MagicMock()
     slot.key = key
     slot.running = False
-    slot._in_stage_execution = False
     return slot
 
 
@@ -142,6 +161,20 @@ async def _fire_full(loop: NudgeLoop, *, ledger: str = "") -> tuple[str, str, di
     prompt = run_chat.call_args.args[2]
     meta = slot.append.call_args.kwargs["meta"]["nudge"]
     return appended, prompt, meta
+
+
+class TestCappedLoopShowsItsBudget:
+    @pytest.mark.asyncio
+    async def test_the_prompt_carries_the_budget_line(self) -> None:
+        """A capped loop's prompt names what is left, under the unchanged tag.
+
+        The conductor renews its patrol from this line; without it the cap runs
+        out and the loop deactivates before any turn could call monitor_update.
+        """
+        loop = _loop(max_cycles=24)
+        row, prompt = await _fire(loop)
+        assert prompt == f"[auto-nudge cycle 4]\n[patrol budget: cycle 4/24]\n{loop.message}"
+        assert row == prompt
 
 
 class TestDefaultRowIsUnchanged:
@@ -746,7 +779,7 @@ class TestRestSurface:
         state._slots = {
             "chat-1-123": MagicMock(workspace="default", memory_mode="persistent", mode="chat")
         }
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_dashboard_identity()])
         app["state"] = state
         app.router.add_post("/api/autonudge", _handler.api_autonudge_start)
         app.router.add_patch("/api/autonudge/{loop_id}", _handler.api_autonudge_update)
@@ -965,7 +998,7 @@ class TestRestSurface:
         """Negative control: redaction that does NOT grow the value stays accepted.
 
         The exfiltration placeholder replaces the whole matched URL and here
-        measures 27 characters SHORTER, so this at-cap banner ends well inside the
+        measures 39 characters SHORTER, so this at-cap banner ends well inside the
         bound. Without this, a fix that rejected any banner whose redaction
         changed it — or that simply lowered the cap — would pass the two arms
         above while refusing legitimate input. Complements
@@ -973,7 +1006,8 @@ class TestRestSurface:
         """
         from aiohttp.test_utils import TestClient, TestServer
 
-        url = "https://a.co/upload?data=aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQ="
+        # 48-char padded base64: a run of 40+ on its own, not via ``data=``.
+        url = "https://a.co/upload?data=aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQgcGF5bG9hZA=="
         at_cap_with_url = "y" * (MAX_BANNER_CHARS - len(url)) + url
         assert len(at_cap_with_url) == MAX_BANNER_CHARS, "fixture is not at the cap"
         svc = self._svc()
@@ -1431,11 +1465,18 @@ class TestARealProducerSetsTheBanner:
     """
 
     def test_the_goal_command_passes_a_banner_to_add(self) -> None:
-        import inspect
+        from pathlib import Path
 
         from kiro_crew.dashboard import chat_runner
 
-        src = inspect.getsource(chat_runner)
+        src = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
         assert (
             "normalize_banner(_objective, absent_ok=True, truncate=True)" in src
         ), "/goal no longer routes the objective through normalize_banner(truncate=True)"
@@ -1494,3 +1535,24 @@ class TestBanneredRowShowsTheBannerEveryCycle:
         assert "watching CI" in row, "the first cycle did not show the banner"
         assert loop.message not in row, "the first cycle carried the full message"
         assert loop.message in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_idle_fire_takes_its_row_from_the_wake_origin() -> None:
+    """The fire's nudge row comes from ``session_deliver.origin_row`` for an
+    ``automation`` origin, the one mapping a steered wake uses too."""
+    from kiro_crew.dashboard import session_deliver
+
+    real = session_deliver.write_origin_row
+    seen: list[tuple[str, int, str]] = []
+
+    def _recording(slot, text, origin, **kwargs):
+        seen.append((origin.kind, origin.nudge["cycle"], origin.nudge["loop_id"]))
+        return real(slot, text, origin, **kwargs)
+
+    loop = _loop()
+    with patch.object(session_deliver, "write_origin_row", _recording):
+        appended, _prompt, meta = await _fire_full(loop)
+    assert seen == [(session_deliver.ORIGIN_AUTOMATION, loop.cycle_count + 1, loop.id)]
+    assert meta == {"cycle": loop.cycle_count + 1, "loop_id": loop.id}
+    assert appended.startswith("[auto-nudge cycle")

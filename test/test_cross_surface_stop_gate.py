@@ -20,6 +20,7 @@ from chat_test_helpers import _make_ready_kiro_prerequisite
 from kiro_crew.agent_sdk import TURN_STOP_REASON_CANCELLED
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.dashboard.chat import _run_chat
+from kiro_crew.dashboard.recovery_replays import ReplayFamily
 from kiro_crew.dashboard.state import REFUSAL_RECOVERY_PREFIX, DashboardState, _ChatSlot
 from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import ToolHookResult
@@ -29,6 +30,7 @@ from kiro_crew.providers.base import (
     LLMEvent,
 )
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import await_until
 
 LINKED_KEY = "slack:1700000000.000100"
 
@@ -58,11 +60,32 @@ def _provider_factory():
         provider.context_usage_pct = lambda: 0.0
         provider.context_window_tokens = lambda: 0
         provider.has_active_turn = lambda: False
-        provider.runtime_info = lambda: (None, None)
+        provider.runtime_abort_target = lambda: None
         provider.stream_command = MagicMock(side_effect=_empty_stream)
         return provider
 
     return _factory
+
+
+async def _until_parked(mgr: SessionManager, key: str, *, deadline: float = 5.0) -> None:
+    """Yield until some task is blocked on *key*'s held lease.
+
+    ``asyncio.Semaphore`` keeps its blocked acquirers in ``_waiters`` (``None``
+    or an empty deque while nobody waits); polling it is the one observable
+    that says "the claimant has reached the semaphore", which is what the
+    replay-gap scenarios need to be true BEFORE the reset lands. A wall-clock
+    sleep cannot promise that on a slow runner. Bounded so a claimant that
+    never arrives fails the test loudly instead of hanging it.
+    """
+    loop = asyncio.get_running_loop()
+    stop = loop.time() + deadline
+    while loop.time() < stop:
+        session = mgr._sessions.get(mgr._fold_key(key))
+        waiters = getattr(getattr(session, "semaphore", None), "_waiters", None)
+        if waiters:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"no claimant parked on {key!r} within {deadline}s")
 
 
 class TestStopTurnRecordsASessionScopedStop:
@@ -199,7 +222,7 @@ class TestStopTurnRecordsASessionScopedStop:
         await asyncio.sleep(0.05)
         assert order == ["replay"]
         mgr.release(LINKED_KEY)
-        await asyncio.wait_for(newer, timeout=2)
+        await await_until(newer, what="newer message task finished")
 
         assert order == ["replay", "newer"]
         await mgr.close_all()
@@ -225,7 +248,7 @@ class TestStopTurnRecordsASessionScopedStop:
 
         await mgr.reset(LINKED_KEY)
 
-        assert await asyncio.wait_for(waiter, timeout=5) == "claimed"
+        assert await await_until(waiter, what="waiter claimed") == "claimed"
         assert mgr.has_session(LINKED_KEY)
         await mgr.close_all()
 
@@ -251,14 +274,14 @@ class TestStopTurnRecordsASessionScopedStop:
         await asyncio.sleep(0.05)
 
         await mgr.reset(LINKED_KEY)
-        await asyncio.wait_for(successor_held.wait(), timeout=5)
+        await await_until(successor_held, what="successor held permit")
         assert mgr.is_busy(LINKED_KEY), "the woken waiter holds the successor"
 
         mgr.release(LINKED_KEY)  # the torn-down turn's own finally
         assert mgr.is_busy(LINKED_KEY), "absorbed: the successor's permit is not ours to give back"
 
         let_go.set()
-        await asyncio.wait_for(waiter, timeout=5)
+        await await_until(waiter, what="waiter finished")
         assert not mgr.is_busy(LINKED_KEY), "the holder's own release is the one that counts"
         # Absorbed exactly once: a later release from this task is an ordinary one.
         await mgr.get_or_create(LINKED_KEY)
@@ -282,18 +305,28 @@ class TestStopTurnRecordsASessionScopedStop:
             mgr.release(LINKED_KEY)
 
         waiter = asyncio.create_task(waiting_message())
-        await asyncio.sleep(0.05)
+        # The scenario is "a claimant ALREADY parked on the held lease when the
+        # reset lands". A wall-clock sleep only approximates that: on a loaded
+        # Windows runner the task may not have reached the semaphore in 50 ms,
+        # and a claimant that has not parked yet is a different scenario with a
+        # different (and legitimate) outcome. Wait for the park itself.
+        await _until_parked(mgr, LINKED_KEY)
 
         mgr.open_replay_gap(LINKED_KEY)
         await mgr.reset(LINKED_KEY)
         await mgr.get_or_create(LINKED_KEY)  # the replay's successor, held
         order.append("replay")
+        # Give the woken waiter every chance to run: it must be blocked on the
+        # open gap, not merely slow. A few loop iterations plus a short sleep
+        # is an absence check, so it stays generous rather than tight.
+        for _ in range(20):
+            await asyncio.sleep(0)
         await asyncio.sleep(0.05)
         assert order == ["replay"], "the woken waiter waits behind the open gap"
         mgr.release(LINKED_KEY)
         mgr.close_replay_gap(LINKED_KEY)
 
-        await asyncio.wait_for(waiter, timeout=5)
+        await await_until(waiter, what="waiter finished")
         assert order == ["replay", "newer"]
         await mgr.close_all()
 
@@ -319,7 +352,7 @@ class TestStopTurnRecordsASessionScopedStop:
         assert not newer.done(), "a stranger's close must leave the owner's gap open"
 
         mgr.close_replay_gap(LINKED_KEY)  # the owner
-        await asyncio.wait_for(newer, timeout=2)
+        await await_until(newer, what="newer message task finished")
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -335,7 +368,7 @@ class TestStopTurnRecordsASessionScopedStop:
         assert not newer.done()
 
         await mgr.close_all()
-        await asyncio.wait_for(newer, timeout=2)
+        await await_until(newer, what="newer message task finished")
 
     @pytest.mark.asyncio
     async def test_a_closed_replay_gap_records_nothing_again(self, cfg):
@@ -510,8 +543,13 @@ class TestChannelStopPurgesAQueuedContinuationAtDrain:
             meta=containment_meta(state, slot),
         )
         # Snapshots taken at enqueue: no stop on either counter yet.
-        slot._promise_only_stop_gen = slot._stop_generation
-        slot._promise_only_session_stop_gen = 0
+        slot.replays.arm(
+            ReplayFamily.CONTINUATION,
+            entry_id="",
+            session_key="",
+            stop_gen=slot._stop_generation,
+            session_stop_gen=0,
+        )
         return state, slot
 
     @pytest.mark.asyncio

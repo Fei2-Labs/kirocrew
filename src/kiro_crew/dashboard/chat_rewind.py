@@ -26,7 +26,11 @@ import logging
 
 from aiohttp import web
 
-from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
+from kiro_crew.dashboard.chat_delivery import queued_text_for_display
+from kiro_crew.dashboard.chat_persistence import (
+    _save_slot_to_history,
+    register_guarded_history_write,
+)
 from kiro_crew.dashboard.chat_runner import _run_chat, _start_next_queued_turn
 from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
@@ -34,9 +38,15 @@ from kiro_crew.dashboard.chat_utils import (
     slot_history_key,
 )
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
-from kiro_crew.dashboard.remote_relay import remote_bound_refusal
-from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.dashboard.relay_archive import relay_archive_refusal
+from kiro_crew.dashboard.slot_ownership import (
+    audit_app_slot_denial,
+    checkpoint_slot_replaced,
+    deny_app_slot_access,
+    slot_not_found,
+)
+from kiro_crew.dashboard.state import _TRANSIENT_ROLES, DashboardState
+from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.sel import sel
 from kiro_crew.session_map import _kiro_sessions_dir
 
@@ -52,6 +62,13 @@ logger = logging.getLogger(__name__)
 # undetermined rather than assuming one. ``chat_regenerate`` carries the same
 # reasoning for its history-rewrite drain (``_SAVE_DRAIN_ATTEMPTS``).
 _DISCARD_DRAIN_ATTEMPTS = 8
+
+# The same bound for the history rewrite's own drain, named the way
+# ``chat_regenerate`` names it for the identical drain. A cancelled rewrite task
+# loses both its outcome and its place in the slot's guarded-write registry, and
+# the registry is what a close waits on before it retracts the slot's name, so
+# abandoning the drain can cost the conversation rather than just the answer.
+_SAVE_DRAIN_ATTEMPTS = 8
 
 
 async def _delete_orphan_kiro_session(session_id: str) -> None:
@@ -71,6 +88,25 @@ async def _delete_orphan_kiro_session(session_id: str) -> None:
             logger.debug("rewind: could not delete %s: %s", candidate, exc)
 
 
+def _native_fork_point(prefix: list[dict]) -> str:
+    """The native message id the retained *prefix* ends on, or ``""``.
+
+    Runtime notices and wire-only rows (the ``done`` every finished turn leaves
+    in the live window) are not part of the native conversation and are skipped.
+    Any other last row -- a tool call cut off mid-turn, a user row -- marks no
+    finished assistant message to fork at, so the rewind starts fresh instead.
+    """
+    for row in reversed(prefix):
+        role, meta = row.get("role"), row.get("meta")
+        if role == "system" or role in _TRANSIENT_ROLES or is_system_notice(role, meta):
+            continue
+        message_id = meta.get("native_message_id") if isinstance(meta, dict) else None
+        if role != "assistant" or not isinstance(message_id, str):
+            return ""
+        return message_id
+    return ""
+
+
 async def api_chat_slot_rewind(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/rewind — edit a past message and re-run in place.
 
@@ -78,7 +114,10 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
 
     Effect: replaces the slot's ACP session with a fresh one primed only with
     messages up to (but not including) ``at_message_index``, then runs the
-    edited prompt against it. Slot key, title, folder, sidebar position, and
+    edited prompt against it. On the claude backend the fresh session is a fork
+    of the native one cut at the retained prefix's last assistant message, so it
+    keeps that history whole; elsewhere, or when the fork cannot run, it is
+    primed with the text replay. Slot key, title, folder, sidebar position, and
     color are unchanged.
     """
     # Destructive: this truncates and PERSISTS history before the background
@@ -91,33 +130,24 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     request_app = request.get("app", "")
-    if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # The readiness await above can outlast a close and a same-name create; the
+    # slot the per-slot checkpoint judged is the only one this may act on.
+    if not slot or checkpoint_slot_replaced(request, slot):
+        return slot_not_found()
     under_construction = reject_if_slot_under_construction(state, slot)
     if under_construction is not None:
         return under_construction
 
-    # App ownership check — mirror fork's contract so apps can't rewind
-    # slots they don't own.
-    if request_app:
-        if not slot._app or slot._app != request_app:
-            sel().log_api_access(
-                caller=request_app,
-                operation="chat.slot_rewind",
-                outcome="denied",
-                source="app_isolation",
-                resources=f"slot={name}",
-                error="app cannot rewind unscoped or unowned slot",
-            )
-            # 404 (not 403): indistinguishable from a missing slot —
-            # anti-enumeration (CWE-204); true reason logged via SEL above.
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # App ownership check -- the shared decision fork uses too, so apps can't
+    # rewind slots they don't own. 404 (not 403): indistinguishable from a
+    # missing slot (CWE-204); the true reason is logged via SEL.
+    denied = deny_app_slot_access(request_app, slot, name, "chat.slot_rewind")
+    if denied is not None:
+        return denied
 
-    # A crew-bound slot has no local rewind: it would rebuild the LOCAL ACP
-    # session and re-run the edited turn on this machine, diverging from the peer.
-    # AFTER the app-ownership 404 above so a foreign app cannot tell a remote slot
-    # apart from a missing one via the 409.
-    refusal = remote_bound_refusal(slot)
+    # A relay archive is read-only. AFTER the app-ownership 404 above so a
+    # foreign app cannot tell an archive apart from a missing slot via the 409.
+    refusal = relay_archive_refusal(slot)
     if refusal is not None:
         return refusal
 
@@ -140,8 +170,19 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         return web.json_response({"error": "content too long (max 32768 chars)"}, status=400)
 
     async with slot._lock:
+        if request_app and state._slots.get(name) is not slot:
+            return slot_not_found()
         if slot.running:
             return web.json_response({"error": "slot is running"}, status=409)
+        if slot.is_closing:
+            # A close that is already running has fenced the slot and waits for
+            # the truncating writes registered against it. Admitting a rewind
+            # into that wait dispatches a write the close has stopped waiting
+            # for. ``cancel_close`` releases the fence on every path that leaves
+            # the slot live, so an aborted close re-admits the edit.
+            return web.json_response(
+                {"error": "slot is closing", "code": "slot_closing"}, status=409
+            )
 
         msgs = slot.messages
 
@@ -230,15 +271,10 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         # session the app does not own. Same 404-not-403 shape as the
         # ownership check above (anti-enumeration); SEL records the truth.
         if request_app and getattr(slot, "linked_session_key", ""):
-            sel().log_api_access(
-                caller=request_app,
-                operation="chat.slot_rewind",
-                outcome="denied",
-                source="app_isolation",
-                resources=f"slot={name}",
-                error="app cannot rewind a channel-linked slot",
+            audit_app_slot_denial(
+                request_app, "chat.slot_rewind", name, "app cannot rewind a channel-linked slot"
             )
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+            return slot_not_found()
 
         # The transcript this rewind was authorized against. A concurrent
         # rebinding (a cron injection re-linking the slot) moves the slot to
@@ -252,6 +288,7 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                 orphan_kiro_session_id = state.sessions._session_map.get(session_key) or ""
             except Exception:
                 logger.debug("rewind: failed to read session_map", exc_info=True)
+        native_fork_point = _native_fork_point(slot.messages[:index])
 
         # Prepare the prospective state on a copy. The dirty-slot flush can run
         # while either durable boundary below is pending, so exposing a truncated
@@ -276,9 +313,20 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         discarded_queue_ids = {item["id"] for item in discarded_queue}
 
         # Build the user row through the slot's normal append path without
-        # publishing it to the live slot before persistence succeeds.
-        redacted_content, _ = redact_exfiltration_urls(content)
-        redacted_content, _ = redact_credentials(redacted_content)
+        # publishing it to the live slot before persistence succeeds. This row
+        # is ALSO the turn's input (``_run_chat`` below runs the same value), so
+        # the session's own human's edit is delivered AS TYPED -- the rule an
+        # ordinary send follows -- and redacting it would strip a link the human
+        # kept in the message from the model. An app-driven rewind
+        # (``request_app`` set) is not the reader's own words, so it stays
+        # display-redacted, matching ``queue_entry_is_user_origin``'s boundary.
+        # ``not request_app`` is the whole owner test here, not a narrowing of
+        # that discriminator: this HTTP endpoint carries only the dashboard
+        # composer or an app, so a channel or producer ``kind`` stamp (the other
+        # two legs ``queue_entry_is_user_origin`` checks on the drain) cannot
+        # reach it -- the sole question left is whether an app drives the edit.
+        _user_origin = not bool(request_app)
+        redacted_content = queued_text_for_display(content, user_origin=_user_origin)
         prospective_slot.append("user", redacted_content, "msg msg-u")
         msgs_snapshot = list(prospective_slot.messages)
         # The frozen-prefix boundary this snapshot must be written against. An
@@ -343,6 +391,8 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
 
         async def _rewind_dispatch() -> None:
             await dispatch_ready.wait()
+            if request_app and state._slots.get(name) is not slot:
+                return
             if dispatch_commit:
                 await _run_chat(
                     state,
@@ -518,6 +568,10 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                         },
                         status=503,
                     )
+                if request_app and state._slots.get(name) is not slot:
+                    if discarded:
+                        _sel_native_destroyed("commit_target_moved")
+                    return slot_not_found()
                 if not discarded:
                     state.push_slots_update()
                     return web.json_response(
@@ -563,6 +617,10 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                         },
                         status=503,
                     )
+
+            if request_app and state._slots.get(name) is not slot:
+                _sel_native_destroyed("commit_target_moved")
+                return slot_not_found()
 
             def _commit_live_state() -> None:
                 """Adopt the prepared state on the live slot (synchronous).
@@ -709,6 +767,48 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
             # worker's real outcome and complete the matching commit (and let
             # the reserved dispatch task run the edited prompt) before
             # propagating the cancellation.
+            if slot.is_closing:
+                # The admission arm above is read once, and this handler
+                # suspends several times between it and here. By now a close can
+                # already have finished waiting for the registry below and be on
+                # its way to popping the name, so dispatching would put a worker
+                # thread on its way to the rename with nothing left to order
+                # against it, and whatever adopts the name next inherits the
+                # truncated transcript.
+                #
+                # Reading the fence HERE is what makes the pair decidable:
+                # nothing suspends between this read and the registration two
+                # lines below, so there are exactly two interleavings -- the
+                # fence is up and this write refuses, or the write is registered
+                # and the close waits for it.
+                #
+                # The native context is already gone at this point, which is the
+                # same destroyed-without-a-commit outcome as the refusals below.
+                logger.warning(
+                    "rewind: refusing the truncating save for %s; the conversation is closing",
+                    slot.key,
+                )
+                _sel_native_destroyed("slot_closing")
+                state.push_slots_update()
+                return web.json_response(
+                    {
+                        "error": "the conversation is closing; the edit was not saved",
+                        "code": "slot_closing",
+                    },
+                    status=409,
+                )
+            # Both axes are pinned INTO the write, because the commit boundary is
+            # the only place either can be decided. ``expected_history_key``
+            # catches a RENAMED replacement; a same-name close-and-recreate
+            # resumes the same transcript and keeps that key identical, so it
+            # slips past. ``expected_slot_name`` carries this slot's map key in,
+            # where ``state._slots[name]`` is re-read inside the transcript lock
+            # with no await before the write: a map holding a different slot
+            # object refuses the save, nothing written. The fence read above is
+            # not a substitute -- it answers whether a retraction has STARTED,
+            # while this answers whether one has already completed and republished
+            # the name. A refusal returns ``False`` and reaches the 503 below with
+            # the prepared state never committed.
             save_task = asyncio.ensure_future(
                 asyncio.to_thread(
                     _save_slot_to_history,
@@ -717,17 +817,58 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                     msgs_snapshot,
                     expected_history_key=expected_history_key,
                     expected_disk_older_count=pre_await_disk_older_count,
+                    expected_slot_name=name,
                 )
             )
+            # This is the one truncating write that does not go through
+            # ``save_slot_off_loop``, so it registers itself. Without this the
+            # close's wait sees an empty registry and pops the name while the
+            # rewrite is in flight. The task is shielded below and nothing else
+            # holds it, so it resolves when the worker thread returns.
+            register_guarded_history_write(slot, save_task)
             try:
                 saved = await asyncio.shield(save_task)
             except asyncio.CancelledError:
+                # Bounded re-shield rather than a bare ``await save_task``. This
+                # await is itself a cancellation point, and ``CancelledError`` is
+                # a BaseException that no ``except Exception`` absorbs, so one
+                # further cancel -- a gateway shutdown reaching a handler already
+                # unwinding from a client disconnect -- would cancel the task
+                # while its worker thread runs on to the rename. That matters
+                # twice over: the rewrite's outcome would be lost, AND the done
+                # callback would drop the task from
+                # ``slot._guarded_history_writes``, so a close would drain an
+                # empty registry and retract the name with the thread still
+                # writing. Shielding each attempt keeps the task alive across
+                # those cancellations and the outcome is read off the settled
+                # task rather than awaited, so it cannot be lost to a cancel
+                # landing between the two. A task that never settles stays
+                # pending and stays registered, which is what the close needs.
                 landed = False
-                try:
-                    landed = bool(await save_task)
-                except Exception:
-                    landed = False
-                if landed and slot_history_key(slot) == expected_history_key:
+                for _ in range(_SAVE_DRAIN_ATTEMPTS):
+                    if save_task.done():
+                        break
+                    try:
+                        await asyncio.shield(save_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if save_task.done() and not save_task.cancelled():
+                    save_exc = save_task.exception()
+                    landed = save_exc is None and bool(save_task.result())
+                elif not save_task.done():
+                    logger.warning(
+                        "rewind: the history rewrite for %s did not settle within "
+                        "%d cancellation(s); leaving the live slot untouched",
+                        slot.key,
+                        _SAVE_DRAIN_ATTEMPTS,
+                    )
+                if (
+                    landed
+                    and slot_history_key(slot) == expected_history_key
+                    and (not request_app or state._slots.get(name) is slot)
+                ):
                     _commit_live_state()
                     dispatch_commit = True
                     logger.info(
@@ -756,6 +897,9 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
+            if request_app and state._slots.get(name) is not slot:
+                _sel_native_destroyed("commit_target_moved")
+                return slot_not_found()
             if not saved:
                 # The save's own guards refused the write (the session was
                 # permanently deleted, or the slot was rebound to another
@@ -811,12 +955,25 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
             # prompt that never runs.
             dispatch_commit = True
 
+            # Read by the replacement turn's cold start, which the reserved
+            # dispatch only begins once ``dispatch_ready`` is set below.
+            # Best-effort: a fork that is never armed falls back to the replay.
+            if orphan_kiro_session_id and native_fork_point:
+                try:
+                    state.sessions._session_map.set_native_fork(
+                        session_key, orphan_kiro_session_id, native_fork_point
+                    )
+                except Exception:
+                    logger.debug("rewind: failed to arm the native fork", exc_info=True)
+
             # Best-effort cleanup of the orphaned kiro-cli session JSONL so it
             # does not show up in ``kiro-cli chat -l`` or the resume picker.
             # After the commit (and skipped on the cancellation path): purely
             # cosmetic, kiro-cli's own GC reclaims the file eventually.
             if orphan_kiro_session_id:
                 await _delete_orphan_kiro_session(orphan_kiro_session_id)
+                if request_app and state._slots.get(name) is not slot:
+                    return slot_not_found()
         finally:
             # Wake the reserved dispatch task on every exit: it runs the
             # replacement turn on commit and the queue handoff on abort.

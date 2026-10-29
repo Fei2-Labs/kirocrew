@@ -1,4 +1,9 @@
-"""Authenticated record of which nudge loops a crew/member session armed ITSELF.
+"""Authenticated record of which nudge loops a session armed ITSELF.
+
+Written when a crew/member slot, or a slot running one of
+:data:`WAKE_RESET_AGENTS`, arms a loop from its own turn. Two readers: the
+crew/member fire-time guard below, and the conductor wake-reset gate
+(``session_directive_apply._refuse_unvouched_wake_reset``).
 
 ``NudgeLoop.self_armed`` is the one bit that relaxes the crew/member
 external-arm refusal at fire time (``GatewayOrchestrator._fire_dashboard_nudge``),
@@ -46,6 +51,10 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
 
 logger = logging.getLogger(__name__)
+
+#: The agents whose patrol wake may drop its own chat: the goal conductor and its
+#: deprecated alias name (``conductor_agents.DEPRECATED_AGENT_SPECS``).
+WAKE_RESET_AGENTS: frozenset[str] = frozenset({"kirocrew-conductor", "kirocrew-ledger-conductor"})
 
 SELF_ARM_RECORD_NAME = "autonudge-self-armed.json"
 _LOCK_NAME = SELF_ARM_RECORD_NAME + ".lock"
@@ -96,7 +105,7 @@ def _read_record() -> dict[str, dict[str, Any]]:
 def _write_record(entries: dict[str, dict[str, Any]]) -> None:
     path = self_arm_record_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # The trust subtree is owner-only everywhere else (sel.py creates it 0o700);
+    # The trust subtree is owner-only everywhere else (sel_trust_root.py creates it 0o700);
     # tighten best-effort so a parents=True mkdir does not leave a default-mode
     # directory. The sensitive-path floor is the real fence.
     try:

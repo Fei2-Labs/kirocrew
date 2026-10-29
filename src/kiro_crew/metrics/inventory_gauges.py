@@ -63,6 +63,7 @@ name                                       value      attributes      source
 ``kirocrew.inventory.lessons``             count      —               ``lessons.jsonl``
 ``kirocrew.inventory.mcp.servers``         count      ``class``       MCP roster
 ``kirocrew.inventory.config.toggle``       0/1        ``key``         config flags
+``kirocrew.inventory.webhooks.registered`` count      —               ``hooks.json``
 ``kirocrew.inventory.probe.failures``      count      ``probe``       this module
 =========================================  =========  ==============  ==================
 
@@ -130,6 +131,7 @@ memory / config toggles    fingerprint-cached config read (2 stats)     none
 knowledge documents        ``sqlite3`` connect + one indexed COUNT(*)   300s TTL
 lessons                    mtime-cached JSONL read                      store's own
 MCP servers                a few small ``json.loads``                   none
+registered webhooks        one small ``json.loads`` of ``hooks.json``   none
 =========================  ===========================================  ==========
 
 Nothing here walks a whole data directory, opens a write connection, or creates a
@@ -163,11 +165,13 @@ OSS-CLEAN: opentelemetry (Apache-2.0) + stdlib + first-party helpers only.
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Optional
 
+# The knowledge store holds knowledge.db open in this process through the shim; a
+# probe on a second SQLite library would drop that store's locks when it closes.
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.metrics.schema import validate_name
 
 if TYPE_CHECKING:  # annotation-only; never imported at runtime
@@ -183,6 +187,7 @@ GAUGE_KNOWLEDGE_DOCUMENTS = "kirocrew.inventory.knowledge.documents"
 GAUGE_LESSONS = "kirocrew.inventory.lessons"
 GAUGE_MCP_SERVERS = "kirocrew.inventory.mcp.servers"
 GAUGE_CONFIG_TOGGLE = "kirocrew.inventory.config.toggle"
+GAUGE_WEBHOOKS_REGISTERED = "kirocrew.inventory.webhooks.registered"
 GAUGE_PROBE_FAILURES = "kirocrew.inventory.probe.failures"
 
 ALL_METRIC_NAMES = (
@@ -194,6 +199,7 @@ ALL_METRIC_NAMES = (
     GAUGE_LESSONS,
     GAUGE_MCP_SERVERS,
     GAUGE_CONFIG_TOGGLE,
+    GAUGE_WEBHOOKS_REGISTERED,
     GAUGE_PROBE_FAILURES,
 )
 
@@ -221,6 +227,7 @@ PROBE_KNOWLEDGE = "knowledge"
 PROBE_LESSONS = "lessons"
 PROBE_MCP = "mcp"
 PROBE_CONFIG_TOGGLES = "config_toggles"
+PROBE_WEBHOOKS = "webhooks"
 
 ALL_PROBES = (
     PROBE_CRONS,
@@ -231,6 +238,7 @@ ALL_PROBES = (
     PROBE_LESSONS,
     PROBE_MCP,
     PROBE_CONFIG_TOGGLES,
+    PROBE_WEBHOOKS,
 )
 
 #: The knowledge table this module counts. A named constant rather than a literal
@@ -580,7 +588,10 @@ def read_knowledge_documents() -> Optional[int]:
 
 
 def read_lessons() -> Optional[int]:
-    """Count of saved lessons.
+    """Count of lessons in the global (V1) lesson store.
+
+    Private Memory V2 crew-member lessons live only in each member's own
+    database and are not counted here.
 
     Uncached here on purpose: the store already caches by file mtime, so a
     repeated read on an unchanged file is one ``stat``. A second cache would only
@@ -599,6 +610,37 @@ def read_lessons() -> Optional[int]:
             _lesson_store = LessonStore()
         store = _lesson_store
     return len(store.load_all())
+
+
+def read_registered_webhooks() -> Optional[int]:
+    """Count of webhook callback contexts registered on this install.
+
+    Entry count of the registrations file, reduced by
+    ``webhooks.registered_context_count`` -- the same owner the dashboard's own
+    listing and its id-addressed delete use, so the gauge cannot report a number
+    no surface can confirm. The file is shared with the script-hook store, whose
+    entries are not registrations and are not counted.
+
+    One small ``json.loads`` per collection, the same cost as the cron probe, so
+    it is uncached for the same reason.
+
+    No hook id, session key or context summary is read: every one of them is
+    agent-chosen free text, and the count rides in the VALUE, which costs no
+    series.
+
+    Returns ``None`` when the file is present but does not parse, and records a
+    ``webhooks`` probe failure on the way out -- a fault, like an unparseable
+    ``crons.json``: the registrations the dashboard would list are unknown, and a
+    0 would read as an install where nobody registered a hook. A MISSING file is
+    a genuine 0, which is the steady state of an install that uses no webhooks.
+    """
+    from kiro_crew import webhooks
+
+    count, loadable = webhooks.registered_context_count()
+    if not loadable:
+        _note_probe_failure(PROBE_WEBHOOKS)
+        return None
+    return count
 
 
 def read_mcp_server_classes() -> Optional[dict[str, int]]:
@@ -784,7 +826,7 @@ def register_inventory_gauges(meter: "Meter") -> None:
             GAUGE_LESSONS,
             callbacks=[_observations(PROBE_LESSONS, read_lessons)],
             unit="1",
-            description="Lessons this install has saved",
+            description="Lessons saved in the global (V1) lesson store",
         )
         meter.create_observable_gauge(
             GAUGE_MCP_SERVERS,
@@ -797,6 +839,12 @@ def register_inventory_gauges(meter: "Meter") -> None:
             callbacks=[_keyed_observations(PROBE_CONFIG_TOGGLES, read_config_toggles, "key")],
             unit="1",
             description="Feature-switch state (0/1) per key, over a closed key set",
+        )
+        meter.create_observable_gauge(
+            GAUGE_WEBHOOKS_REGISTERED,
+            callbacks=[_observations(PROBE_WEBHOOKS, read_registered_webhooks)],
+            unit="1",
+            description="Webhook callback contexts registered on this install",
         )
         meter.create_observable_gauge(
             GAUGE_PROBE_FAILURES,

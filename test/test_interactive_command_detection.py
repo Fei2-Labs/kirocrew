@@ -75,6 +75,14 @@ from kiro_crew.acp.types import (
         ("npm init", INTERACTIVE_CONFIRM, "npm"),
         ("sudo apt-get install -y jq", INTERACTIVE_PROMPT, "sudo"),
         ("ssh build-host uptime", INTERACTIVE_PROMPT, "ssh"),
+        # The proposed BatchMode replacement is not treated as proof of no prompt:
+        # a FIDO/sk PIN or an encrypted key's passphrase may still be asked for.
+        (
+            "ssh -o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=0 "
+            "-o PasswordAuthentication=no -o KbdInteractiveAuthentication=no build-host uptime",
+            INTERACTIVE_PROMPT,
+            "ssh",
+        ),
         ("scp file host:/tmp/", INTERACTIVE_PROMPT, "scp"),
         ("gpg --decrypt secret.gpg", INTERACTIVE_PROMPT, "gpg"),
         ("docker login registry", INTERACTIVE_PROMPT, "docker"),
@@ -143,6 +151,82 @@ def test_json_wrapped_tool_input_is_unwrapped():
     found = classify_interactive_command('{"command": "git log --graph", "cwd": "/x"}')
     assert found.risk == INTERACTIVE_PAGER
     assert found.program == "git log"
+
+
+@pytest.mark.parametrize(
+    "cmd, program",
+    [
+        ("git rebase --continue", "git rebase --continue"),
+        ("git cherry-pick --continue", "git cherry-pick --continue"),
+        ("git merge --continue", "git merge --continue"),
+        ("git revert --continue", "git revert --continue"),
+        ("git revert HEAD", "git revert"),
+        ("git revert abc1234", "git revert"),
+    ],
+)
+def test_sequencer_steps_that_write_a_commit_message_are_editor_commands(cmd, program):
+    found = classify_interactive_command(cmd)
+    assert found.risk == INTERACTIVE_EDITOR, cmd
+    assert found.program == program
+    assert found.side_effecting
+    # The hint it offers must not itself be flagged, or the agent loops on it.
+    assert classify_interactive_command(found.hint) == NOT_INTERACTIVE, found.hint
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git rebase origin/main",
+        "git revert --no-edit HEAD",
+        "git revert -n HEAD",
+        "git revert --no-commit HEAD",
+        "git revert --abort",
+        "git cherry-pick --abort",
+        "git cherry-pick abc1234",
+        "git merge --abort",
+        # ``git am --continue`` commits with the patch's own message and
+        # never starts the editor, with or without a terminal.
+        "git am --continue",
+    ],
+)
+def test_sequencer_steps_that_keep_the_message_are_not_editor_commands(cmd):
+    assert classify_interactive_command(cmd) == NOT_INTERACTIVE, cmd
+
+
+def test_global_options_with_a_value_do_not_hide_the_subcommand():
+    for cmd in (
+        "git -C /x rebase --continue",
+        "git --git-dir /x/.git --work-tree /x merge --continue",
+        "git -c color.ui=never cherry-pick --continue",
+        "git -C /x -c user.name=a commit",
+    ):
+        assert classify_interactive_command(cmd).risk == INTERACTIVE_EDITOR, cmd
+    assert classify_interactive_command("git -C /x log").program == "git log"
+
+
+def test_a_non_interactive_editor_override_clears_the_editor_rows():
+    for cmd in (
+        "git -c core.editor=true rebase --continue",
+        "git -c core.editor=: merge --continue",
+        "GIT_EDITOR=true git cherry-pick --continue",
+        "GIT_EDITOR=true git revert HEAD",
+        "env GIT_EDITOR=true git -C /x commit",
+        "GIT_SEQUENCE_EDITOR=true git rebase -i HEAD~3",
+        "git -c sequence.editor=true rebase -i HEAD~3",
+    ):
+        assert classify_interactive_command(cmd) == NOT_INTERACTIVE, cmd
+
+
+def test_an_override_naming_a_real_editor_does_not_clear_the_row():
+    for cmd in (
+        "git -c core.editor=vim rebase --continue",
+        "GIT_EDITOR=vim git merge --continue",
+        # The environment variable wins over ``-c core.editor``.
+        "GIT_EDITOR=vim git -c core.editor=true rebase --continue",
+        # The sequence editor covers only the todo list, not commit messages.
+        "GIT_SEQUENCE_EDITOR=true git rebase --continue",
+    ):
+        assert classify_interactive_command(cmd).risk == INTERACTIVE_EDITOR, cmd
 
 
 def test_env_assignments_and_wrappers_are_skipped():
@@ -217,7 +301,7 @@ def test_hints_are_proposals_not_rewrites():
     for cmd, expect in (
         ("git log", "git -P log"),
         ("apt-get install jq", "apt-get -y"),
-        ("ssh host", "BatchMode=yes"),
+        ("ssh host", "NumberOfPasswordPrompts=0"),
         ("python", "python -c"),
         ("git commit", "git commit -m"),
     ):

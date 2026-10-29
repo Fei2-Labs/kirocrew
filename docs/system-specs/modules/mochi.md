@@ -32,7 +32,7 @@ the reconcile tick re-arms it once a target answers.
 
 | Path | What it is |
 |---|---|
-| `src/kiro_crew/apps/builtins/mochi/app.json` | manifest (`backend.routes`, `backend.hooks`, `backend.mcpServers`, `ui.pages`, agents, permissions, `platform.requiresDesktopApp`) |
+| `src/kiro_crew/apps/builtins/mochi/app.json` | manifest (`backend.routes`, `backend.hooks`, top-level `mcpServers`, `ui.pages`, agents, permissions, `platform.requiresDesktopApp`) |
 | `.../hooks.py` | **the owner loop** — `MochiRuntime`, the `on_startup`/`on_shutdown` lifecycle hooks, the poller/idle/watchlist callback bags, and the notify path |
 | `.../queue_file.py`, `.../queue_poller.py` | the behaviour queue (planned moves/moods/reminders) + the poller that executes it — a **file-based scheduler that lives beside core `cron.py`**, not on top of it |
 | `.../watchlist_file.py`, `.../watchlist_service.py` | watch items (add/cancel/remove/update), cross-process-locked RMW |
@@ -48,7 +48,32 @@ the reconcile tick re-arms it once a target answers.
 | `website/src/apps/mochi/` | vendored renderer (`ChatPanel`, `WatchlistPanel`, `GalleryPanel`, `SettingsPanel`, pet overlay) + the `mochiApi` seam |
 | `website/electron/mochi/` | the Electron main-process shell (pet overlay windows, panel/settings/avatar windows, global shortcuts, multi-instance) |
 
+### Chat panel files
+
+`website/src/apps/mochi/src/renderer/ChatPanel.tsx` is the chat panel's one import
+path: `ChatApp.tsx`, the capture harnesses and the specs import from it, and it
+re-exports `PinnedSidePanel`, `Bubble`, `fixStreamingFences`, `parseApproval` and
+`externalApprovalApproved` from the owners that define them. It keeps the panel
+component (header, transcript, composer, slash commands, the send-failure line and
+the context ring). Owners never import it, and nothing outside the panel's own
+files, bar its specs, imports an owner.
+
+| Owner | Holds |
+|---|---|
+| `ChatPanelPinnedFiles.tsx` | the pinned-files side panel (`PinnedSidePanel`) and its file chips |
+| `ChatPanelMarkdown.tsx` | message markdown: the remark and rehype chains, the element overrides (inline file chips, local images) and the streaming renderer (`StreamingMarkdown`, `fixStreamingFences`) |
+| `ChatPanelBubble.tsx` | one transcript message (`Bubble`): the approval card and its scoped-trust rows, `parseApproval`, `externalApprovalApproved` and the relative timestamp |
+
+New work for a responsibility in the table goes to its owner; anything else starts
+in `ChatPanel.tsx`. A fix ported from upstream Mochi's `ChatPanel.tsx` lands in
+whichever of the four files holds that code. `ChatPanel.owners.test.tsx` pins the
+owner set, the re-exports and the import direction.
+
 ## Load-bearing contracts
+
+The desktop shell rate-limits repeated instance-resolution diagnostics per
+outcome for one minute. Alternating unanswered and resolved polls do not flood
+the log, while a confirmed target change (including a new port) logs immediately.
 
 - **Reserved `mochi` chat slot.** The chat panel is backed by a dedicated core
   chat slot keyed `mochi`. It is the app's identity for streaming/approvals; do
@@ -73,6 +98,12 @@ the reconcile tick re-arms it once a target answers.
 - **Agent-authored data is redacted at every browser sink.** notify/mood/
   watchlist/chat-push/pins all pass through `redact.redact_tree` (or
   `_redact_plan_tree`) before reaching the browser.
+- **Mutating routes are owner-only for dashboard subjects.** Every POST/DELETE
+  handler in `backend/routes.py` calls `_owner_denied` first: a caller with an
+  empty or missing `app` claim must pass `require_owner_dashboard_request` or
+  gets the shared 403 `owner_only`, before any body read or runtime use. An app
+  token keeps the scope `token_auth` already granted it. GET routes are not
+  owner-gated. Pinned by `test/test_mochi_owner_gate.py`.
 
 ## Deliberate divergences (do NOT "fix" in an upstream sync)
 
@@ -88,6 +119,12 @@ the reconcile tick re-arms it once a target answers.
   windows exist because it is a first-party desktop pet.
 
 ## Cross-platform
+
+Pending dropped attachments display the basename of Windows drive and UNC
+producer paths in the chip, tooltip and accessible labels. Display calculation
+uses `pathBasename` (the shared separator-aware basename helper); the staged
+attachment path stays unchanged for removal and send serialization. POSIX
+filenames containing a literal backslash retain that character.
 
 Shortcut hints resolve `CommandOrControl` for the current platform via
 `website/src/apps/mochi/src/shared/shortcut.ts` (⌘ on macOS, `Ctrl` on

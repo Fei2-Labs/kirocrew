@@ -22,7 +22,8 @@ for the full design.
 
 import importlib
 import sys
-from typing import TYPE_CHECKING
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 #: Platforms where the sidecar broker can run. The broker listens on a local
 #: endpoint owned by ``mcp_gateway.transport`` -- an ``AF_UNIX`` socket on POSIX,
@@ -86,12 +87,63 @@ _LAZY = {
 }
 
 
-def __getattr__(name: str):
-    target = _LAZY.get(name)
-    if target is None:
+#: Package attribute -> ``(owning module, symbol on that module)``. The attribute
+#: and the symbol are allowed to differ: ``mcp_gateway.stub_main`` is
+#: ``mcp_gateway.stub.main``. A re-exported name lives in exactly one place, the
+#: submodule that defines it: reads resolve that submodule's current value and
+#: writes go to it, so ``mcp_gateway.rewrite_agents`` and
+#: ``mcp_gateway.rewriter.rewrite_agents`` cannot hold different values.
+_OWNED: dict[str, tuple[str, str]] = {
+    name: (f"{__name__}.{module}", symbol) for name, (module, symbol) in _LAZY.items()
+}
+
+
+def _owner(name: str) -> ModuleType:
+    """Return the module that defines ``name``, importing it on first use.
+
+    ``importlib.import_module`` is the resolution rather than a mapping kept here.
+    It answers from :data:`sys.modules`, the one place a module is stored, so a
+    purged or replaced owner is seen at once; and it waits on that module's import
+    lock while its body is still running. A private mapping of resolved owners
+    would be a second storage location, and a bare ``sys.modules`` read would hand
+    a partially initialised module to a thread that asks for a name while another
+    thread is still importing its owner.
+    """
+    module_name = _OWNED[name][0]
+    return importlib.import_module(module_name)
+
+
+def __getattr__(name: str) -> Any:
+    """Read a re-exported name from the module that owns it (:pep:`562`)."""
+    if name not in _OWNED:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = importlib.import_module(f"{__name__}.{target[0]}")
-    return getattr(module, target[1])
+    return getattr(_owner(name), _OWNED[name][1])
+
+
+class _ReExportModule(ModuleType):
+    """Send a write to a re-exported name to the module that owns it.
+
+    Binding the name in this package's own namespace instead would shadow the
+    owner permanently, because ``__getattr__`` runs only for a name the package
+    does not already hold: the shadow would win every later read, and the owner's
+    value would become unreachable through this package. Forwarding the write
+    leaves one value for a test harness to remember and one to put back.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _OWNED:
+            setattr(_owner(name), _OWNED[name][1], value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in _OWNED:
+            delattr(_owner(name), _OWNED[name][1])
+        else:
+            super().__delattr__(name)
+
+
+sys.modules[__name__].__class__ = _ReExportModule
 
 
 def __dir__():

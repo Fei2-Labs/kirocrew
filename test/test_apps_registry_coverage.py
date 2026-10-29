@@ -11,2148 +11,30 @@ Every subprocess is faked at this module's own chokepoints
 the harness already used by ``test_apps_registry.py``, so nothing here spawns
 git, npm, or pip. All filesystem work happens under ``tmp_path`` with
 ``_manifest_cache_dir`` redirected, so no test touches the real Kiro Crew home.
+
+This module holds the build step: ``_run_app_build``'s command selection and execution.
+The other helpers are covered by its siblings ``test_apps_registry_coverage_gates.py``,
+``_manifests.py``, ``_provenance.py``, ``_install.py`` and ``_characterization.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib.machinery
-import importlib.util
 import json
-import os
+import re
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
+from apps_registry_coverage_helpers import _explicit_registry_execution_admission  # noqa: F401
+from apps_registry_coverage_helpers import bundled_interpreter_fixture  # noqa: F401
+from apps_registry_coverage_helpers import pip_importable_fixture  # noqa: F401
+from apps_registry_coverage_helpers import _DATA_IS_A_FILE, _asgi_backend, _fake_sandbox, _FakeProc
 
 from conftest import requires_symlinks
 from kiro_crew.apps import registry
-from kiro_crew.platform import PlatformCompositionError
-
-# ---------------------------------------------------------------------------
-# Fixtures / shared fakes
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _explicit_registry_execution_admission(monkeypatch):
-    """These tests reach admitted registry code paths unless they say otherwise."""
-    monkeypatch.setattr("kiro_crew.apps.execution.third_party_execution_allowed", lambda: True)
-
-
-@pytest.fixture()
-def cache_dir(tmp_path, monkeypatch):
-    """Redirect the manifest cache to a temp directory (never the real home)."""
-    cache = tmp_path / "cache" / "app-manifests"
-    cache.mkdir(parents=True)
-    monkeypatch.setattr(registry, "_manifest_cache_dir", lambda: cache)
-    return cache
-
-
-@pytest.fixture()
-def pip_importable(monkeypatch):
-    """Pin the gateway interpreter as one that HAS a ``pip`` module.
-
-    ``_run_app_build`` decides whether to plan a Python build by probing
-    ``importlib.util.find_spec("pip")`` on the RUNNING interpreter. That reads
-    the host's own packaging, not the fixture tree: a venv created by ``uv`` or
-    ``--without-pip`` has no ``pip`` module, so the branch soft-skips and every
-    "the pip command is planned" assertion fails there while passing on a
-    stdlib venv. Tests asserting the planned command take this fixture; the
-    soft-skip contract is pinned separately with the opposite answer.
-    """
-    import site
-
-    from kiro_crew import platform_compat
-
-    monkeypatch.setattr(site, "ENABLE_USER_SITE", False)
-    monkeypatch.setattr(platform_compat, "is_bundled_interpreter", lambda: False)
-    real_find_spec = importlib.util.find_spec
-
-    def _with_pip(name, *args, **kwargs):
-        if name == "pip":
-            return importlib.machinery.ModuleSpec("pip", loader=None)
-        return real_find_spec(name, *args, **kwargs)
-
-    monkeypatch.setattr(registry.importlib.util, "find_spec", _with_pip)
-
-
-class _FakeProc:
-    """Minimal stand-in for ``asyncio.subprocess.Process``.
-
-    *stdout_lines* makes ``proc.stdout`` async-iterable, which is what
-    ``_run_app_build``'s drain loop consumes.
-    """
-
-    def __init__(
-        self,
-        returncode: int = 0,
-        stdout_lines: list[bytes] | None = None,
-        output: bytes = b"",
-    ) -> None:
-        self.returncode = returncode
-        self.pid = 31337
-        self.kill_calls = 0
-        self.wait_calls = 0
-        self._output = output
-        self.stdout = _AsyncLines(stdout_lines or [])
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        return self._output, b""
-
-    def kill(self) -> None:
-        self.kill_calls += 1
-
-    async def wait(self) -> int:
-        self.wait_calls += 1
-        return self.returncode or 0
-
-
-class _AsyncLines:
-    def __init__(self, lines: list[bytes]) -> None:
-        self._lines = list(lines)
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> bytes:
-        if not self._lines:
-            raise StopAsyncIteration
-        return self._lines.pop(0)
-
-
-def _fake_sandbox(monkeypatch, procs):
-    """Neutralize the sandbox wrappers and hand out *procs* in order.
-
-    Returns the list that each spawn's argv is appended to.
-    """
-    spawned: list[list[str]] = []
-    queue = list(procs)
-
-    async def _spawn(*argv, **kwargs):
-        spawned.append(list(argv))
-        return queue.pop(0) if queue else _FakeProc()
-
-    monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (list(cmd), None))
-    monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: list(cmd))
-    monkeypatch.setattr(registry, "create_subprocess_limited", _spawn)
-    return spawned
-
-
-def _reg(name: str, repo: str, branch: str = "main") -> SimpleNamespace:
-    """A configured-registry stand-in with the fields the module reads."""
-    return SimpleNamespace(name=name, repo=repo, branch=branch)
-
-
-def _config_with(monkeypatch, registries: list[SimpleNamespace]) -> None:
-    """Make every ``KiroCrewConfig.load()`` in this module see *registries*."""
-    monkeypatch.setattr(
-        "kiro_crew.config.loader.KiroCrewConfig.load",
-        classmethod(lambda cls: SimpleNamespace(registries=registries)),
-    )
-
-
-# ---------------------------------------------------------------------------
-# StreamingLogLines
-# ---------------------------------------------------------------------------
-
-
-class TestStreamingLogLines:
-    def test_append_stores_and_forwards(self):
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
-        lines = registry.StreamingLogLines(queue)
-        lines.append("hello")
-        assert list(lines) == ["hello"]
-        assert queue.get_nowait() == "hello"
-
-    def test_extend_forwards_every_line(self):
-        queue: asyncio.Queue[str | None] = asyncio.Queue()
-        lines = registry.StreamingLogLines(queue)
-        lines.extend(["a", "b"])
-        assert list(lines) == ["a", "b"]
-        assert [queue.get_nowait(), queue.get_nowait()] == ["a", "b"]
-
-    def test_full_queue_drops_without_raising(self):
-        """A slow SSE consumer must not break the install it is watching."""
-        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=1)
-        lines = registry.StreamingLogLines(queue)
-        lines.append("kept")
-        lines.append("dropped")
-        # The list keeps everything; only the queue drops the overflow.
-        assert list(lines) == ["kept", "dropped"]
-        assert queue.get_nowait() == "kept"
-        assert queue.empty()
-
-
-# ---------------------------------------------------------------------------
-# Environment construction
-# ---------------------------------------------------------------------------
-
-
-class TestEnvHelpers:
-    def test_minimal_env_keeps_allowlisted_and_drops_the_rest(self, monkeypatch):
-        monkeypatch.setenv("PATH", "/usr/bin")
-        monkeypatch.setenv("MY_SECRET_TOKEN_VALUE", "hunter2")
-        env = registry.minimal_env()
-        assert env["PATH"] == "/usr/bin"
-        assert "MY_SECRET_TOKEN_VALUE" not in env
-
-    def test_minimal_env_applies_extras(self, monkeypatch):
-        monkeypatch.setenv("PATH", "/usr/bin")
-        assert registry.minimal_env(PATH="/opt/bin")["PATH"] == "/opt/bin"
-
-    def test_minimal_env_keeps_external_bytecode_cache(self, monkeypatch):
-        cache_dir = "/writable/kirocrew/cache/pycache"
-        monkeypatch.setenv("PYTHONPYCACHEPREFIX", cache_dir)
-
-        assert registry.minimal_env()["PYTHONPYCACHEPREFIX"] == cache_dir
-
-    def test_anonymous_git_env_strips_credential_carriers(self, monkeypatch):
-        monkeypatch.setenv("PATH", "/usr/bin")
-        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
-        monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i /home/me/.ssh/id_ed25519")
-        env = registry.anonymous_git_env()
-        assert "SSH_AUTH_SOCK" not in env
-        assert env["GIT_TERMINAL_PROMPT"] == "0"
-        assert env["GIT_CONFIG_NOSYSTEM"] == "1"
-        assert env["GIT_CONFIG_GLOBAL"] == os.devnull
-        assert "BatchMode=yes" in env["GIT_SSH_COMMAND"]
-        assert "id_ed25519" not in env["GIT_SSH_COMMAND"]
-
-
-# ---------------------------------------------------------------------------
-# URL shape helpers
-# ---------------------------------------------------------------------------
-
-
-class TestUrlHelpers:
-    @pytest.mark.parametrize(
-        "raw,expected",
-        [
-            ({"gitUrl": " https://example.com/a.git "}, "https://example.com/a.git"),
-            ({"repo": "https://example.com/b.git"}, "https://example.com/b.git"),
-            ({"gitUrl": "", "repo": "legacy-name"}, "legacy-name"),
-            ({}, ""),
-            ({"gitUrl": {"nested": "object"}}, ""),
-            ({"gitUrl": 42}, ""),
-        ],
-    )
-    def test_entry_git_url(self, raw, expected):
-        assert registry._entry_git_url(raw) == expected
-
-    @pytest.mark.parametrize(
-        "url,expected",
-        [
-            ("https://example.com/a.git", True),
-            ("http://example.com/a.git", True),
-            ("ssh://git@example.com/a.git", True),
-            ("git://example.com/a.git", True),
-            ("git+ssh://example.com/a.git", True),
-            ("git@example.com:owner/a.git", True),
-            ("bare-name", False),
-            ("", False),
-            ("/abs/path", False),
-        ],
-    )
-    def test_looks_like_git_url(self, url, expected):
-        assert registry._looks_like_git_url(url) is expected
-
-    @pytest.mark.parametrize(
-        "url,expected",
-        [
-            ("https://Example.COM/a.git", "example.com"),
-            ("ssh://git@Example.com:2222/a.git", "example.com"),
-            ("git@example.com:owner/a.git", "example.com"),
-            ("git+ssh://user@host.internal/a.git", "host.internal"),
-            ("ssh://git@[2001:DB8:0:0::1]:2222/a.git", "2001:db8::1"),
-            ("git@[2001:DB8::1]:owner/a.git", "2001:db8::1"),
-            ("https://[2001:db8::1]/owner/a.git", "2001:db8::1"),
-            ("ssh://git@[2001:db8::1/a.git", ""),
-            ("ssh://git@[]/a.git", ""),
-            ("ssh://git@[not-ipv6]/a.git", ""),
-            ("ssh://git@[2001:db8::1]junk/a.git", ""),
-            ("ssh://git@[2001:db8::1]:0/a.git", ""),
-            ("ssh://git@[2001:db8::1]:65536/a.git", ""),
-            ("git@[2001:db8::1]junk:owner/a.git", ""),
-            ("ssh://git@2001:db8::1/a.git", ""),
-            ("ssh://git@example.test:１２/a.git", ""),
-            ("ssh://deploy:password@example.test/a.git", ""),
-            ("git+ssh://deploy:password@example.test/a.git", ""),
-            ("  ", ""),
-            ("not a url", ""),
-        ],
-    )
-    def test_git_url_host(self, url, expected):
-        assert registry._git_url_host(url) == expected
-
-    @pytest.mark.parametrize(
-        "url,expected",
-        [
-            ("ssh://git@github.com/a.git", True),
-            ("git+ssh://git@github.com/a.git", True),
-            ("git@github.com:owner/a.git", True),
-            ("ssh://git@[2001:db8::1]/a.git", True),
-            ("git@[2001:db8::1]:owner/a.git", True),
-            ("git@[2001:db8::1]junk:owner/a.git", False),
-            ("ssh://deploy:password@github.com/a.git", False),
-            ("https://github.com/owner/a.git", False),
-            ("", False),
-        ],
-    )
-    def test_is_ssh_git_url(self, url, expected):
-        assert registry._is_ssh_git_url(url) is expected
-
-
-class TestCloneSandboxMode:
-    def test_public_ssh_forge_gets_standard(self):
-        assert registry._clone_sandbox_mode("git@github.com:owner/a.git") == "standard"
-
-    def test_configured_host_is_added_to_the_trusted_set(self):
-        mode = registry._clone_sandbox_mode(
-            "git@gitea.internal:owner/a.git", frozenset({"gitea.internal"})
-        )
-        assert mode == "standard"
-
-    def test_untrusted_ssh_host_stays_strict(self):
-        assert registry._clone_sandbox_mode("git@evil.example:owner/a.git") == "strict"
-
-    def test_colon_bearing_ssh_userinfo_never_receives_host_trust(self):
-        target = "ssh://deploy:password@github.com/owner/a.git"
-
-        assert registry.is_clone_host_trusted(target) is False
-        assert registry._clone_sandbox_mode(
-            target, frozenset({"github.com"})
-        ) == "strict"
-
-    def test_https_never_needs_ssh_keys(self):
-        assert registry._clone_sandbox_mode("https://github.com/owner/a.git") == "strict"
-
-    def test_hostless_ssh_url_fails_closed(self, monkeypatch):
-        monkeypatch.setattr(registry, "_is_ssh_git_url", lambda url: True)
-        monkeypatch.setattr(registry, "_git_url_host", lambda url: "")
-        assert registry._clone_sandbox_mode("nonsense") == "strict"
-
-
-class TestConfiguredRegistryHosts:
-    def test_collects_hosts_of_configured_registries(self, monkeypatch):
-        _config_with(
-            monkeypatch,
-            [
-                _reg("a", "https://gitea.internal/org/idx.git"),
-                _reg("b", "bare-name-no-host"),
-            ],
-        )
-        assert registry._configured_registry_hosts() == frozenset({"gitea.internal"})
-
-    def test_ipv6_hosts_are_exact_for_trust_and_ssh_sandbox(self, monkeypatch):
-        configured = "ssh://git@[2001:DB8::1]/owner/index.git"
-        _config_with(monkeypatch, [_reg("ipv6", configured)])
-
-        trusted = registry._configured_registry_hosts()
-        assert trusted == frozenset({"2001:db8::1"})
-
-        exact_uri = "ssh://git@[2001:db8::1]/owner/app.git"
-        other_uri = "ssh://git@[2001:dead::2]/owner/app.git"
-        exact_scp = "git@[2001:db8::1]:owner/app.git"
-        other_scp = "git@[2001:dead::2]:owner/app.git"
-
-        assert registry.is_clone_host_trusted(exact_uri) is True
-        assert registry.is_clone_host_trusted(exact_scp) is True
-        assert registry.is_clone_host_trusted(other_uri) is False
-        assert registry.is_clone_host_trusted(other_scp) is False
-        assert registry._clone_sandbox_mode(exact_uri, trusted) == "standard"
-        assert registry._clone_sandbox_mode(exact_scp, trusted) == "standard"
-        assert registry._clone_sandbox_mode(other_uri, trusted) == "strict"
-        assert registry._clone_sandbox_mode(other_scp, trusted) == "strict"
-
-    @pytest.mark.parametrize(
-        "target",
-        [
-            "ssh://git@[2001:db8::1/owner/app.git",
-            "ssh://git@[]/owner/app.git",
-            "ssh://git@[not-ipv6]/owner/app.git",
-            "git@[2001:db8::1]junk:owner/app.git",
-        ],
-    )
-    def test_malformed_ipv6_hosts_fail_closed(self, monkeypatch, target):
-        _config_with(
-            monkeypatch,
-            [_reg("ipv6", "ssh://git@[2001:db8::1]/owner/index.git")],
-        )
-
-        assert registry._git_url_host(target) == ""
-        assert registry.is_clone_host_trusted(target) is False
-        assert registry._clone_sandbox_mode(target) == "strict"
-
-    def test_oversized_ports_fail_closed_without_integer_conversion_crash(
-        self, monkeypatch
-    ):
-        _config_with(
-            monkeypatch,
-            [_reg("ipv6", "ssh://git@[2001:db8::1]/owner/index.git")],
-        )
-        oversized = "9" * 5000
-        targets = [
-            f"ssh://git@[2001:db8::1]:{oversized}/owner/app.git",
-            f"ssh://git@example.test:{oversized}/owner/app.git",
-        ]
-
-        for target in targets:
-            assert registry._git_url_host(target) == ""
-            assert registry.is_clone_host_trusted(target) is False
-            assert registry._clone_sandbox_mode(target) == "strict"
-
-    def test_config_load_failure_degrades_to_empty(self, monkeypatch):
-        def _boom(cls):
-            raise OSError("config unreadable")
-
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.KiroCrewConfig.load", classmethod(_boom)
-        )
-        assert registry._configured_registry_hosts() == frozenset()
-
-
-class TestContextCloneSandboxMode:
-    def test_composition_error_is_never_swallowed(self, monkeypatch):
-        def _boom():
-            raise PlatformCompositionError("companion missing")
-
-        monkeypatch.setattr(registry, "current_context", _boom)
-        with pytest.raises(PlatformCompositionError):
-            registry._context_clone_sandbox_mode("git@github.com:o/a.git")
-
-    def test_adapter_failure_falls_back_to_the_module_decision(self, monkeypatch):
-        def _boom():
-            raise RuntimeError("adapter down")
-
-        monkeypatch.setattr(registry, "current_context", _boom)
-        monkeypatch.setattr(registry, "_configured_registry_hosts", frozenset)
-        # The security gate must survive the adapter: a public forge still
-        # resolves, an unknown host still fails closed.
-        assert registry._context_clone_sandbox_mode("git@github.com:o/a.git") == "standard"
-        assert registry._context_clone_sandbox_mode("git@evil.example:o/a.git") == "strict"
-
-
-class TestIsCloneHostTrusted:
-    def test_hostless_url_is_untrusted(self):
-        assert registry.is_clone_host_trusted("bare-name") is False
-
-    def test_composition_error_propagates(self, monkeypatch):
-        def _boom():
-            raise PlatformCompositionError("companion missing")
-
-        monkeypatch.setattr(registry, "current_context", _boom)
-        with pytest.raises(PlatformCompositionError):
-            registry.is_clone_host_trusted("https://github.com/o/a.git")
-
-    def test_adapter_failure_keeps_the_default_trust_set(self, monkeypatch):
-        def _boom():
-            raise RuntimeError("adapter down")
-
-        monkeypatch.setattr(registry, "current_context", _boom)
-        monkeypatch.setattr(registry, "_configured_registry_hosts", frozenset)
-        assert registry.is_clone_host_trusted("https://github.com/o/a.git") is True
-        assert registry.is_clone_host_trusted("https://127.0.0.1:8443/x.git") is False
-
-
-class TestOwnerDesignatedRepo:
-    def test_bundled_entry_is_not_index_originated(self):
-        assert registry._is_owner_designated_repo({"gitUrl": "https://x/y.git"}) is False
-
-    def test_entry_without_resolvable_url_is_refused(self, monkeypatch):
-        assert registry._is_owner_designated_repo({"_registry": "mine"}) is False
-
-    def test_byte_identical_url_is_owner_designated(self, monkeypatch):
-        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/org/idx.git")])
-        entry = {"_registry": "mine", "gitUrl": "https://gitea.internal/org/idx.git"}
-        assert registry._is_owner_designated_repo(entry) is True
-
-    def test_sibling_repo_on_the_same_host_is_not(self, monkeypatch):
-        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/org/idx.git")])
-        entry = {"_registry": "mine", "gitUrl": "https://gitea.internal/org/private.git"}
-        assert registry._is_owner_designated_repo(entry) is False
-
-
-class TestSelCredentialGrant:
-    def test_audit_failure_is_swallowed(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_sel_fn", MagicMock(side_effect=RuntimeError("sel down"))
-        )
-        registry._sel_credential_grant("op", "https://x/y.git")  # must not raise
-
-    def test_grant_is_logged_when_sel_is_present(self, monkeypatch):
-        sel_obj = MagicMock()
-        monkeypatch.setattr(registry, "_sel_fn", lambda: sel_obj)
-        registry._sel_credential_grant("install_from_registry", "https://x/y.git")
-        assert sel_obj.log_api_access.call_args.kwargs["outcome"] == "granted"
-
-
-# ---------------------------------------------------------------------------
-# Registry file loading + edition rows
-# ---------------------------------------------------------------------------
-
-
-class TestLoadRegistryFile:
-    def test_missing_file_yields_no_rows(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "_REGISTRY_FILE", tmp_path / "absent.json")
-        monkeypatch.setattr(registry, "_edition_registry_rows", list)
-        assert registry._load_registry_file() == []
-
-    def test_non_array_json_is_rejected(self, monkeypatch, tmp_path):
-        path = tmp_path / "app-registry.json"
-        path.write_text('{"not": "an array"}', encoding="utf-8")
-        monkeypatch.setattr(registry, "_REGISTRY_FILE", path)
-        monkeypatch.setattr(registry, "_edition_registry_rows", list)
-        assert registry._load_registry_file() == []
-
-    def test_invalid_json_is_rejected(self, monkeypatch, tmp_path):
-        path = tmp_path / "app-registry.json"
-        path.write_text("{{{ not json", encoding="utf-8")
-        monkeypatch.setattr(registry, "_REGISTRY_FILE", path)
-        monkeypatch.setattr(registry, "_edition_registry_rows", list)
-        assert registry._load_registry_file() == []
-
-    def test_edition_rows_are_add_only_and_never_repoint_a_core_row(
-        self, monkeypatch, tmp_path
-    ):
-        path = tmp_path / "app-registry.json"
-        path.write_text(
-            json.dumps([{"name": "core-app", "repo": "core/repo"}]), encoding="utf-8"
-        )
-        monkeypatch.setattr(registry, "_REGISTRY_FILE", path)
-        monkeypatch.setattr(
-            registry,
-            "_edition_registry_rows",
-            lambda: [
-                {"name": "core-app", "repo": "attacker/repo"},
-                {"name": "edition-app", "repo": "edition/repo"},
-            ],
-        )
-        rows = registry._load_registry_file()
-        assert [r["name"] for r in rows] == ["core-app", "edition-app"]
-        assert rows[0]["repo"] == "core/repo"
-
-
-class TestEditionRegistryRows:
-    def test_malformed_rows_are_dropped(self, monkeypatch):
-        loader = SimpleNamespace(
-            registry_rows=lambda: [
-                {"name": "good"},
-                {"name": 7},
-                "not-a-dict",
-                {},
-            ]
-        )
-        monkeypatch.setattr(
-            registry, "current_context", lambda: SimpleNamespace(apps_loader=loader)
-        )
-        assert registry._edition_registry_rows() == [{"name": "good"}]
-
-    def test_seam_failure_falls_back_to_bundled_only(self, monkeypatch):
-        def _boom():
-            raise RuntimeError("loader down")
-
-        monkeypatch.setattr(registry, "current_context", _boom)
-        assert registry._edition_registry_rows() == []
-
-
-# ---------------------------------------------------------------------------
-# Manifest cache
-# ---------------------------------------------------------------------------
-
-
-class TestManifestCache:
-    _DEMO = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
-
-    def test_missing_cache_reads_none(self, cache_dir):
-        assert registry._read_manifest_cache({"name": "nope"}) is None
-
-    def test_round_trip(self, cache_dir):
-        registry._write_manifest_cache(self._DEMO, {"name": "demo", "version": "1.0.0"})
-        assert registry._read_manifest_cache(self._DEMO) == {"name": "demo", "version": "1.0.0"}
-
-    def test_stale_cache_reads_none(self, cache_dir):
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-        path = registry._manifest_cache_path(self._DEMO)
-        past = time.time() - registry._MANIFEST_CACHE_TTL - 3600
-        os.utime(path, (past, past))
-        assert registry._read_manifest_cache(self._DEMO) is None
-
-    def test_corrupt_cache_reads_none(self, cache_dir):
-        path = registry._manifest_cache_path(self._DEMO)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("not json", encoding="utf-8")
-        assert registry._read_manifest_cache(self._DEMO) is None
-
-    def test_write_failure_is_swallowed(self, cache_dir, monkeypatch):
-        def _boom(path, data):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(registry, "atomic_write", _boom)
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})  # must not raise
-        assert registry._read_manifest_cache(self._DEMO) is None
-
-    def test_traversing_name_is_confined_to_the_cache_dir(self, cache_dir):
-        path = registry._manifest_cache_path({"name": "../../escape"})
-        assert path.parent == cache_dir / registry._MANIFEST_SOURCE_SUBDIR
-        assert cache_dir.resolve() in path.resolve().parents
-
-    def test_branch_change_is_a_cache_miss(self, cache_dir):
-        # The cache identity folds the effective branch in, so flipping the
-        # configured branch can never reuse metadata resolved from another one.
-        main_row = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
-        dev_row = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "dev"}
-        assert registry._manifest_cache_path(main_row) != registry._manifest_cache_path(dev_row)
-        registry._write_manifest_cache(main_row, {"name": "demo", "version": "1.0.0"})
-        assert registry._read_manifest_cache(dev_row) is None
-        assert registry._read_manifest_cache(main_row) is not None
-
-    def test_same_name_different_repos_do_not_share_cache(self, cache_dir):
-        one = {"name": "demo", "repo": "https://github.com/one/demo.git", "branch": "main"}
-        two = {"name": "demo", "repo": "https://github.com/two/demo.git", "branch": "main"}
-        assert registry._manifest_cache_path(one) != registry._manifest_cache_path(two)
-        registry._write_manifest_cache(one, {"name": "demo", "description": "repo one"})
-        assert registry._read_manifest_cache(two) is None
-
-    def test_subdirectory_and_commit_pin_scope_the_identity(self, cache_dir):
-        base = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
-        subdir = dict(base, subdirectory="apps/demo")
-        pinned = dict(base, commit="a" * 40)
-        paths = {
-            registry._manifest_cache_path(base),
-            registry._manifest_cache_path(subdir),
-            registry._manifest_cache_path(pinned),
-        }
-        assert len(paths) == 3
-
-    def test_branch_change_is_a_miss_even_under_an_unchanged_pin(self, cache_dir):
-        # Non-catalog pins are data fidelity, not what the listing fetch
-        # resolves — the fetch follows the BRANCH. A ref that kept only the
-        # commit would hold the cache path fixed across an operator's branch
-        # change, serving another branch's metadata for every pinned row.
-        pin = "a" * 40
-        main_row = {
-            "name": "demo",
-            "repo": "https://github.com/o/demo.git",
-            "branch": "main",
-            "commit": pin,
-        }
-        dev_row = dict(main_row, branch="dev")
-        assert registry._manifest_cache_path(main_row) != registry._manifest_cache_path(dev_row)
-        registry._write_manifest_cache(main_row, {"name": "demo", "version": "1.0.0"})
-        assert registry._read_manifest_cache(dev_row) is None
-
-    def test_credential_in_url_never_reaches_the_cache_identity(self, cache_dir):
-        # Normalization strips userinfo, so the same repo with and without an
-        # embedded credential is ONE cache identity and the secret is not in
-        # the file name.
-        plain = {"name": "demo", "gitUrl": "https://git.example.com/o/demo.git"}
-        credentialed = {"name": "demo", "gitUrl": "https://user:secret@git.example.com/o/demo.git"}
-        assert registry._manifest_cache_path(plain) == registry._manifest_cache_path(credentialed)
-        assert "secret" not in registry._manifest_cache_path(credentialed).name
-
-    def test_external_cache_write_failure_is_swallowed(self, cache_dir, monkeypatch):
-        def _boom(path, data):
-            raise OSError("disk full")
-
-        monkeypatch.setattr(registry, "atomic_write", _boom)
-        registry._write_external_registry_cache("mine", [{"name": "a"}])
-        assert registry._read_external_registry_cache("mine") is None
-
-
-class TestSafeCacheStem:
-    def test_pure_name_is_byte_identical(self):
-        assert registry._safe_cache_stem("my-app_1.0") == "my-app_1.0"
-
-    def test_traversal_is_slugified_and_disambiguated(self):
-        stem = registry._safe_cache_stem("../../config")
-        assert "/" not in stem and ".." not in stem
-        # Distinct originals must not collide after slugification.
-        assert stem != registry._safe_cache_stem("..-..-config")
-
-    def test_all_disallowed_characters_still_yield_a_stem(self):
-        assert registry._safe_cache_stem("///").startswith("app-")
-
-
-class TestExpireCacheFile:
-    _DEMO = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
-
-    def test_backdates_instead_of_unlinking(self, cache_dir):
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-        path = registry._manifest_cache_path(self._DEMO)
-        registry._expire_cache_file(path)
-        assert path.is_file()  # data survives as stale fallback
-        assert registry._read_manifest_cache(self._DEMO) is None
-
-    def test_missing_file_is_a_no_op(self, cache_dir):
-        registry._expire_cache_file(cache_dir / "absent.json")
-
-    def test_path_outside_the_cache_dir_is_refused(self, cache_dir, tmp_path):
-        outside = tmp_path / "victim.json"
-        outside.write_text("{}", encoding="utf-8")
-        before = outside.stat().st_mtime
-        registry._expire_cache_file(outside)
-        assert outside.stat().st_mtime == before
-
-    def test_utime_failure_is_swallowed(self, cache_dir, monkeypatch):
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-
-        def _boom(path, times):
-            raise OSError("read-only fs")
-
-        monkeypatch.setattr(registry.os, "utime", _boom)
-        registry._expire_cache_file(registry._manifest_cache_path(self._DEMO))
-
-
-class TestManifestCacheGc:
-    _DEMO = {"name": "demo", "repo": "https://github.com/o/demo.git", "branch": "main"}
-
-    def _age(self, path, extra=0):
-        past = (
-            time.time()
-            - max(registry._MANIFEST_CACHE_TTL, registry._EXTERNAL_REGISTRY_CACHE_TTL)
-            - registry._MANIFEST_CACHE_GC_GRACE
-            - 3600
-            - extra
-        )
-        os.utime(path, (past, past))
-
-    def test_write_reclaims_orphans_past_every_ttl_plus_grace(self, cache_dir):
-        # A coordinate change orphans the old file (no reader derives its path
-        # again); once it is older than every TTL plus the grace window, the
-        # next write sweeps it, so churned coordinates cannot grow the dir
-        # without bound.
-        old_row = dict(self._DEMO, branch="dead-branch")
-        registry._write_manifest_cache(old_row, {"name": "demo"})
-        orphan = registry._manifest_cache_path(old_row)
-        self._age(orphan)
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-        assert not orphan.exists()
-        assert registry._manifest_cache_path(self._DEMO).is_file()
-
-    def test_fresh_and_recently_expired_files_survive(self, cache_dir):
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-        kept = registry._manifest_cache_path(self._DEMO)
-        # A file _expire_cache_file just backdated is expired but NOT yet
-        # GC-eligible: expiry preserves it on purpose.
-        registry._expire_cache_file(kept)
-        other = dict(self._DEMO, name="other")
-        registry._write_manifest_cache(other, {"name": "other"})
-        assert kept.is_file()
-
-    def test_registry_index_caches_are_never_swept(self, cache_dir):
-        index_file = cache_dir / "_registry_acme.json"
-        index_file.write_text("[]", encoding="utf-8")
-        self._age(index_file)
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-        assert index_file.is_file()
-
-    def test_a_registry_prefixed_app_name_cannot_escape_the_gc(self, cache_dir):
-        # _safe_cache_stem returns plain names byte-identical, so an external
-        # index can name an app `_registry_evil`. The GC boundary is the
-        # by-source subdirectory, not a name prefix, so such a file is
-        # reclaimed like any other manifest instead of accumulating forever.
-        evil = {"name": "_registry_evil", "repo": "https://github.com/o/x.git", "branch": "main"}
-        registry._write_manifest_cache(evil, {"name": "_registry_evil"})
-        orphan = registry._manifest_cache_path(evil)
-        assert orphan.parent.name == registry._MANIFEST_SOURCE_SUBDIR
-        self._age(orphan)
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-        assert not orphan.exists()
-
-    def test_gc_errors_are_swallowed(self, cache_dir, monkeypatch):
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})
-
-        def _boom(self_path):
-            raise OSError("no listdir for you")
-
-        monkeypatch.setattr(registry.Path, "iterdir", _boom)
-        registry._write_manifest_cache(self._DEMO, {"name": "demo"})  # must not raise
-
-
-# ---------------------------------------------------------------------------
-# Subdirectory containment
-# ---------------------------------------------------------------------------
-
-
-class TestSubdirGates:
-    @pytest.mark.parametrize(
-        "subdir,expected",
-        [
-            (None, True),
-            ("", True),
-            ("apps/demo", True),
-            ("..", False),
-            ("apps/../..", False),
-            ("./apps", False),
-            ("/etc", False),
-            ("C:/Windows", False),
-            ("apps\\demo", False),
-            ("apps/\x00demo", False),
-            (7, False),
-            (["apps"], False),
-        ],
-    )
-    def test_is_safe_registry_subdir(self, subdir, expected):
-        assert registry._is_safe_registry_subdir(subdir) is expected
-
-    def test_contained_join_returns_root_for_empty_subdir(self, tmp_path):
-        assert registry._contained_join(tmp_path, "") == tmp_path
-
-    def test_contained_join_resolves_inside(self, tmp_path):
-        (tmp_path / "apps" / "demo").mkdir(parents=True)
-        joined = registry._contained_join(tmp_path, "apps/demo")
-        assert joined is not None
-        assert os.path.realpath(joined) == os.path.realpath(tmp_path / "apps" / "demo")
-
-    def test_contained_join_rejects_traversal(self, tmp_path):
-        root = tmp_path / "root"
-        root.mkdir()
-        assert registry._contained_join(root, "../outside") is None
-
-    @requires_symlinks
-    def test_contained_join_rejects_symlink_escape(self, tmp_path):
-        root = tmp_path / "root"
-        root.mkdir()
-        outside = tmp_path / "outside"
-        outside.mkdir()
-        os.symlink(str(outside), str(root / "link"))
-        assert registry._contained_join(root, "link") is None
-
-    def test_contained_join_degrades_to_none_on_os_error(self, tmp_path, monkeypatch):
-        def _boom(self, strict=False):
-            raise OSError("too many levels")
-
-        monkeypatch.setattr(Path, "resolve", _boom)
-        assert registry._contained_join(tmp_path, "sub") is None
-
-
-# ---------------------------------------------------------------------------
-# Manifest fetch
-# ---------------------------------------------------------------------------
-
-
-def _tmp_clone_dir(monkeypatch, tmp_path, name: str = "clone") -> Path:
-    """Point ``tempfile.mkdtemp`` at a directory under *tmp_path*.
-
-    Keeps the throwaway manifest clone inside the test sandbox, so the module's
-    own ``shutil.rmtree`` in its ``finally`` block leaves nothing behind.
-    """
-    import tempfile
-
-    target = tmp_path / name
-    target.mkdir()
-    monkeypatch.setattr(tempfile, "mkdtemp", lambda *a, **k: str(target))
-    return target
-
-
-class TestFetchAppManifest:
-    @pytest.mark.asyncio
-    async def test_local_checkout_is_used_when_origin_and_branch_match(
-        self, monkeypatch, tmp_path
-    ):
-        src = tmp_path / "app-sources" / "demo"
-        src.mkdir(parents=True)
-        (src / "app.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
-        monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
-
-        async def _origin_matches(dest, git_url):
-            return True
-
-        async def _branch_matches(dest, branch):
-            return True
-
-        monkeypatch.setattr(registry, "_clone_origin_matches", _origin_matches)
-        monkeypatch.setattr(registry, "_clone_branch_matches", _branch_matches)
-
-        got = await registry._fetch_app_manifest(
-            "o/demo", "main", app_name="demo", git_url="https://github.com/o/demo.git"
-        )
-        assert got == {"name": "demo"}
-
-    @pytest.mark.asyncio
-    async def test_corrupt_local_manifest_falls_through(self, monkeypatch, tmp_path):
-        src = tmp_path / "app-sources" / "demo"
-        src.mkdir(parents=True)
-        (src / "app.json").write_text("not json", encoding="utf-8")
-        monkeypatch.setattr(registry, "app_source_dir", lambda n: src)
-
-        async def _true(*a, **k):
-            return True
-
-        monkeypatch.setattr(registry, "_clone_origin_matches", _true)
-        monkeypatch.setattr(registry, "_clone_branch_matches", _true)
-        # Not cloneable, so the fall-through path ends in None rather than a clone.
-        assert (
-            await registry._fetch_app_manifest(
-                "o/demo", "main", app_name="demo", git_url="bare-name"
-            )
-            is None
-        )
-
-    @pytest.mark.asyncio
-    async def test_non_cloneable_url_returns_none(self):
-        assert await registry._fetch_app_manifest("bare", "main") is None
-
-    @pytest.mark.asyncio
-    async def test_untrusted_host_is_refused(self, monkeypatch):
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: False)
-        got = await registry._fetch_app_manifest(
-            "o/demo", "main", git_url="https://127.0.0.1:8443/x.git"
-        )
-        assert got is None
-
-    @pytest.mark.asyncio
-    async def test_failed_clone_returns_none(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
-        _tmp_clone_dir(monkeypatch, tmp_path)
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=128)])
-        got = await registry._fetch_app_manifest(
-            "o/demo", "main", git_url="https://github.com/o/demo.git"
-        )
-        assert got is None
-
-    @pytest.mark.asyncio
-    async def test_missing_manifest_in_clone_returns_none(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
-        _tmp_clone_dir(monkeypatch, tmp_path)
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        got = await registry._fetch_app_manifest(
-            "o/demo", "main", git_url="https://github.com/o/demo.git"
-        )
-        assert got is None
-
-    @pytest.mark.asyncio
-    async def test_successful_clone_reads_the_manifest(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
-        clone = _tmp_clone_dir(monkeypatch, tmp_path)
-        (clone / "app.json").write_text(
-            json.dumps({"name": "demo", "version": "2.0.0"}), encoding="utf-8"
-        )
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        got = await registry._fetch_app_manifest(
-            "o/demo", "main", git_url="https://github.com/o/demo.git"
-        )
-        assert got == {"name": "demo", "version": "2.0.0"}
-
-    @pytest.mark.asyncio
-    async def test_subdirectory_escape_after_clone_is_refused(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
-        _tmp_clone_dir(monkeypatch, tmp_path)
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        monkeypatch.setattr(registry, "_contained_join", lambda root, sub: None)
-        got = await registry._fetch_app_manifest(
-            "o/demo", "main", "evil", git_url="https://github.com/o/demo.git"
-        )
-        assert got is None
-
-    @pytest.mark.asyncio
-    async def test_owner_designated_clone_uses_owner_credentials(self, monkeypatch, tmp_path):
-        """The same-repo carve-out must flip env AND audit the grant."""
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
-        clone = _tmp_clone_dir(monkeypatch, tmp_path)
-        (clone / "app.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
-
-        grants: list[str] = []
-        monkeypatch.setattr(
-            registry, "_sel_credential_grant", lambda op, url: grants.append(op)
-        )
-        monkeypatch.setattr(registry, "_context_clone_sandbox_mode", lambda url: "standard")
-        monkeypatch.setattr(registry, "minimal_env", lambda **kw: {"SENTINEL": "owner"})
-
-        seen_env: list[dict[str, str]] = []
-
-        async def _spawn(*argv, **kwargs):
-            seen_env.append(kwargs["env"])
-            return _FakeProc(returncode=0)
-
-        monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (list(cmd), None))
-        monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: list(cmd))
-        monkeypatch.setattr(registry, "create_subprocess_limited", _spawn)
-
-        got = await registry._fetch_app_manifest(
-            "o/demo",
-            "main",
-            git_url="https://github.com/o/demo.git",
-            owner_designated=True,
-        )
-        assert got == {"name": "demo"}
-        assert seen_env == [{"SENTINEL": "owner"}]
-        assert grants == ["fetch_app_manifest"]
-
-    @pytest.mark.asyncio
-    async def test_anonymous_clone_is_the_default_posture(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "is_clone_host_trusted", lambda url: True)
-        clone = _tmp_clone_dir(monkeypatch, tmp_path)
-        (clone / "app.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
-        monkeypatch.setattr(registry, "anonymous_git_env", lambda **kw: {"SENTINEL": "anon"})
-
-        modes: list[str] = []
-        seen_env: list[dict[str, str]] = []
-
-        async def _spawn(*argv, **kwargs):
-            seen_env.append(kwargs["env"])
-            return _FakeProc(returncode=0)
-
-        def _wrap(cmd, mode=""):
-            modes.append(mode)
-            return list(cmd), None
-
-        monkeypatch.setattr(registry, "wrap_argv", _wrap)
-        monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: list(cmd))
-        monkeypatch.setattr(registry, "create_subprocess_limited", _spawn)
-
-        await registry._fetch_app_manifest(
-            "o/demo", "main", git_url="https://github.com/o/demo.git"
-        )
-        assert seen_env == [{"SENTINEL": "anon"}]
-        assert modes == ["strict"]
-
-
-# ---------------------------------------------------------------------------
-# Manifest resolution / merge / enrichment
-# ---------------------------------------------------------------------------
-
-
-class TestResolveManifest:
-    @pytest.mark.asyncio
-    async def test_entry_without_url_is_returned_unchanged(self):
-        entry = {"name": "demo"}
-        assert await registry._resolve_manifest(entry) is entry
-
-    @pytest.mark.asyncio
-    async def test_cached_manifest_short_circuits_the_fetch(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_read_manifest_cache", lambda entry: {"description": "cached"}
-        )
-
-        async def _never(*a, **k):
-            raise AssertionError("fetch must not run when a fresh cache exists")
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _never)
-        got = await registry._resolve_manifest(
-            {"name": "demo", "gitUrl": "https://github.com/o/demo.git"}
-        )
-        assert got["description"] == "cached"
-
-    @pytest.mark.asyncio
-    async def test_fetched_manifest_is_cached_and_merged(self, monkeypatch):
-        monkeypatch.setattr(registry, "_read_manifest_cache", lambda entry: None)
-        monkeypatch.setattr(registry, "_is_owner_designated_repo", lambda entry: False)
-        written: list[tuple[str, dict]] = []
-        monkeypatch.setattr(
-            registry,
-            "_write_manifest_cache",
-            lambda entry, data: written.append((entry["name"], data)),
-        )
-
-        async def _fetch(*a, **k):
-            return {"description": "fresh"}
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
-        got = await registry._resolve_manifest(
-            {"name": "demo", "gitUrl": "https://github.com/o/demo.git"}
-        )
-        assert got["description"] == "fresh"
-        assert written == [("demo", {"description": "fresh"})]
-
-    @pytest.mark.asyncio
-    async def test_unavailable_manifest_leaves_a_minimal_row(self, monkeypatch):
-        monkeypatch.setattr(registry, "_read_manifest_cache", lambda entry: None)
-        monkeypatch.setattr(registry, "_is_owner_designated_repo", lambda entry: False)
-
-        async def _fetch(*a, **k):
-            return None
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
-        entry = {"name": "demo", "gitUrl": "https://github.com/o/demo.git"}
-        assert await registry._resolve_manifest(entry) == entry
-
-    @pytest.mark.asyncio
-    async def test_failed_fetch_never_attaches_another_sources_manifest(
-        self, cache_dir, monkeypatch
-    ):
-        # A manifest cached for branch `main` must not be attached to the same
-        # app configured for branch `dev` when the dev fetch fails: the row
-        # comes back minimal, never wearing another branch's metadata.
-        main_row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "main"}
-        registry._write_manifest_cache(main_row, {"description": "from main", "version": "9.9.9"})
-        monkeypatch.setattr(registry, "_owner_designated_repo_target", lambda entry: "")
-
-        async def _fetch(*a, **k):
-            return None
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
-        dev_row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "dev"}
-        got = await registry._resolve_manifest(dict(dev_row))
-        assert "description" not in got
-        assert got.get("version") is None
-
-    @pytest.mark.asyncio
-    async def test_refresh_expiry_updates_available_version_for_not_installed_app(
-        self, cache_dir, monkeypatch
-    ):
-        # After the refresh path expires the coordinates' cache, the next
-        # listing resolve refetches and surfaces the NEW available version;
-        # install-status enrichment keeps the row not-installed.
-        row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "main"}
-        registry._write_manifest_cache(row, {"version": "1.0.0"})
-        registry._expire_cache_file(registry._manifest_cache_path(row))
-        monkeypatch.setattr(registry, "_owner_designated_repo_target", lambda entry: "")
-
-        async def _fetch(*a, **k):
-            return {"version": "2.0.0"}
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _fetch)
-        got = await registry._resolve_manifest(dict(row))
-        assert got["version"] == "2.0.0"
-        enriched = registry._enrich_with_install_status([got], installed_map={})
-        assert enriched[0]["installed"] is False
-        assert "installedVersion" not in enriched[0]
-
-    @pytest.mark.asyncio
-    async def test_installed_and_available_versions_stay_distinct(self, cache_dir, monkeypatch):
-        row = {"name": "demo", "gitUrl": "https://github.com/o/demo.git", "branch": "main"}
-        registry._write_manifest_cache(row, {"version": "2.0.0"})
-        got = await registry._resolve_manifest(dict(row))
-        assert got["version"] == "2.0.0"
-        enriched = registry._enrich_with_install_status(
-            [got], installed_map={"demo": {"version": "1.0.0", "enabled": True}}
-        )
-        assert enriched[0]["installedVersion"] == "1.0.0"
-        assert enriched[0]["version"] == "2.0.0"
-        assert enriched[0]["updateAvailable"] is True
-
-
-class TestMergeManifest:
-    def test_display_fields_come_from_the_manifest(self):
-        merged = registry._merge_manifest(
-            {"name": "demo", "repo": "o/demo", "branch": "main"},
-            {
-                "displayName": "Demo",
-                "description": "d",
-                "version": "1.2.3",
-                "author": "someone",
-                "tags": ["a"],
-                "highlights": ["h"],
-                "useCases": ["u"],
-                "configuration": ["c"],
-                "license": "MIT",
-                "minKiroCrewVersion": "0.1.0",
-            },
-        )
-        assert merged["displayName"] == "Demo"
-        assert merged["tags"] == ["a"]
-        assert merged["useCases"] == ["u"]
-        assert merged["configuration"] == ["c"]
-        assert merged["minKiroCrewVersion"] == "0.1.0"
-        # Registry-only fields survive.
-        assert merged["name"] == "demo" and merged["branch"] == "main"
-
-    def test_runtime_fields_are_nested_under_manifest(self):
-        merged = registry._merge_manifest(
-            {"name": "demo", "repo": "o/demo"},
-            {
-                "agents": ["a"],
-                "skills": ["s"],
-                "crons": [],
-                "mcpServers": {},
-                "permissions": {"x": 1},
-                "setup": {"onInstall": "echo hi"},
-                "ui": {"panel": True},
-                "openCommand": "open",
-            },
-        )
-        assert merged["manifest"]["setup"] == {"onInstall": "echo hi"}
-        assert merged["manifest"]["openCommand"] == "open"
-
-    def test_no_manifest_key_means_no_manifest_block(self):
-        merged = registry._merge_manifest({"name": "demo", "repo": "o/demo"}, {})
-        assert "manifest" not in merged
-
-    def test_platform_config_is_carried_over(self):
-        merged = registry._merge_manifest(
-            {"name": "demo", "repo": "o/demo"}, {"platform": {"os": ["macos"]}}
-        )
-        assert merged["platform"] == {"os": ["macos"]}
-
-    def test_image_paths_become_blob_proxy_urls(self):
-        merged = registry._merge_manifest(
-            {"name": "demo", "repo": "o/demo"},
-            {
-                "iconPath": "assets/icon.png",
-                "icon": "sparkles",
-                "screenshots": ["a.png", "b.png"],
-                "screenshotsDark": ["a-dark.png"],
-                "heroImage": "hero.png",
-                "heroImageDark": "hero-dark.png",
-                "heroImageDetail": "detail.png",
-                "heroImageDetailDark": "detail-dark.png",
-            },
-        )
-        assert merged["iconUrl"] == "/api/apps/blob?repo=o/demo&path=assets/icon.png"
-        assert merged["icon"] == "sparkles"
-        assert merged["screenshots"] == [
-            "/api/apps/blob?repo=o/demo&path=a.png",
-            "/api/apps/blob?repo=o/demo&path=b.png",
-        ]
-        assert merged["screenshotsDark"] == ["/api/apps/blob?repo=o/demo&path=a-dark.png"]
-        assert merged["heroImage"] == "/api/apps/blob?repo=o/demo&path=hero.png"
-        assert merged["heroImageDark"] == "/api/apps/blob?repo=o/demo&path=hero-dark.png"
-        assert merged["heroImageDetail"] == "/api/apps/blob?repo=o/demo&path=detail.png"
-        assert (
-            merged["heroImageDetailDark"]
-            == "/api/apps/blob?repo=o/demo&path=detail-dark.png"
-        )
-
-    def test_blob_urls_never_embed_registry_clone_credentials(self):
-        secret = "BlobProxySecret"
-        merged = registry._merge_manifest(
-            {"name": "demo", "repo": f"https://user:{secret}@example.com/o/demo.git"},
-            {"iconPath": "assets/icon.png", "screenshots": ["shot.png"]},
-        )
-
-        wire = json.dumps(merged)
-        assert secret not in wire
-        assert "user:" not in wire
-        assert "repo=https://example.com/o/demo.git" in wire
-
-    def test_without_a_repo_no_blob_urls_are_minted(self):
-        merged = registry._merge_manifest(
-            {"name": "demo"},
-            {"iconPath": "icon.png", "screenshots": ["a.png"], "heroImage": "h.png"},
-        )
-        assert "iconUrl" not in merged
-        assert "screenshots" not in merged
-        assert "heroImage" not in merged
-
-    def test_the_entry_is_not_mutated(self):
-        entry = {"name": "demo", "repo": "o/demo"}
-        registry._merge_manifest(entry, {"description": "d"})
-        assert entry == {"name": "demo", "repo": "o/demo"}
-
-
-class TestEnrichWithInstallStatus:
-    def test_installed_app_carries_manager_state(self):
-        rows = registry._enrich_with_install_status(
-            [{"name": "demo", "version": "2.0.0"}],
-            {
-                "demo": {
-                    "version": "1.0.0",
-                    "enabled": True,
-                    "origin": "registry",
-                    "resources": "app",
-                    "lifecycle": "app",
-                }
-            },
-        )
-        row = rows[0]
-        assert row["installed"] is True
-        assert row["installedVersion"] == "1.0.0"
-        assert row["enabled"] is True
-        assert row["resources"] == "app"
-        assert row["updateAvailable"] is True
-
-    def test_externally_detected_app_is_marked_external(self):
-        rows = registry._enrich_with_install_status(
-            [{"name": "demo", "version": "2.0.0"}], {}, detected={"demo"}
-        )
-        row = rows[0]
-        assert row["installed"] is True
-        assert row["installedVersion"] == "unknown"
-        assert row["origin"] == "external"
-        assert row["updateAvailable"] is False
-
-    def test_not_installed_app_reports_no_update(self):
-        rows = registry._enrich_with_install_status([{"name": "demo"}], {})
-        assert rows[0]["installed"] is False
-        assert rows[0]["updateAvailable"] is False
-
-    def test_external_row_never_inherits_origin_from_a_same_named_install(self):
-        """Regression: an external registry row named after an installed
-        built-in must not get that app's ``origin`` cross-stamped by name —
-        the wire value would contradict the ``provenance: "external"`` stamped
-        beside it."""
-        rows = registry._enrich_with_install_status(
-            [{"name": "meetings", "_registry": "third-party", "version": "9.0.0"}],
-            {"meetings": {"version": "1.0.0", "enabled": True, "origin": "builtin"}},
-        )
-        row = rows[0]
-        assert "origin" not in row
-        # Install-state facts about the machine still flow: only the
-        # trust-adjacent field is withheld.
-        assert row["installed"] is True
-        assert row["installedVersion"] == "1.0.0"
-
-    def test_provenance_external_row_is_also_refused_the_origin_copy(self):
-        rows = registry._enrich_with_install_status(
-            [{"name": "demo", "provenance": "external"}],
-            {"demo": {"version": "1.0.0", "origin": "builtin"}},
-        )
-        assert "origin" not in rows[0]
-
-    def test_non_external_row_still_receives_origin(self):
-        rows = registry._enrich_with_install_status(
-            [{"name": "demo"}],
-            {"demo": {"version": "1.0.0", "origin": "builtin"}},
-        )
-        assert rows[0]["origin"] == "builtin"
-
-
-class TestApplyTrustFields:
-    def test_external_row_can_never_self_verify_or_self_feature(self):
-        rows = registry._apply_trust_fields(
-            [
-                {
-                    "name": "demo",
-                    "_registry": "third-party",
-                    "_index_author": "kirocrew",
-                    "verified": True,
-                    "provenance": "official",
-                    "featured": True,
-                }
-            ]
-        )
-        assert rows[0]["provenance"] == "external"
-        assert rows[0]["verified"] is False
-        assert "featured" not in rows[0]
-        assert "_index_author" not in rows[0]
-
-    def test_builtin_row_is_verified(self):
-        rows = registry._apply_trust_fields([{"name": "demo", "origin": "builtin"}])
-        assert rows[0]["provenance"] == "builtin"
-        assert rows[0]["verified"] is True
-
-    def test_core_row_is_verified_only_from_the_index_author(self):
-        rows = registry._apply_trust_fields(
-            [
-                {"name": "a", "_index_author": "KiroCrew"},  # brand-ok: registry.py compares author.lower() == "kirocrew"
-                {"name": "b", "_index_author": "someone-else"},
-                {"name": "c", "_index_author": {"name": "kirocrew"}},
-            ]
-        )
-        assert [r["verified"] for r in rows] == [True, False, False]
-        assert all(r["provenance"] == "official" for r in rows)
-
-    def test_external_row_origin_is_scrubbed_at_the_trust_boundary(self):
-        """Regression: an index-published (or name-collision-inherited)
-        ``origin`` on an external row is dropped, so the wire never carries
-        ``origin: "builtin"`` beside ``provenance: "external"``."""
-        rows = registry._apply_trust_fields(
-            [{"name": "demo", "_registry": "third-party", "origin": "builtin"}]
-        )
-        assert rows[0]["provenance"] == "external"
-        assert "origin" not in rows[0]
-
-    def test_external_row_keeps_the_server_stamped_external_origin(self):
-        rows = registry._apply_trust_fields(
-            [{"name": "demo", "_registry": "third-party", "origin": "external"}]
-        )
-        assert rows[0]["origin"] == "external"
-        assert rows[0]["provenance"] == "external"
-
-
-class TestVersionNewer:
-    @pytest.mark.parametrize(
-        "registry_ver,installed_ver,expected",
-        [
-            ("2.0.0", "1.0.0", True),
-            ("1.0.1", "1.0.0", True),
-            ("1.0.0", "1.0.0", False),
-            ("1.0.0", "2.0.0", False),
-            ("1.1", "1.0.9", True),
-            ("2", "1.9.9", True),
-            ("2.0.0-beta.1", "1.9.9", True),
-            ("1.0.0+build.9", "1.0.0", False),
-            ("not-a-version", "1.0.0", False),
-            ("1.0.0", "", False),
-            ("", "", False),
-        ],
-    )
-    def test_version_newer(self, registry_ver, installed_ver, expected):
-        assert registry._version_newer(registry_ver, installed_ver) is expected
-
-    def test_non_string_input_is_conservative(self):
-        assert registry._version_newer(None, "1.0.0") is False
-
-
-# ---------------------------------------------------------------------------
-# Candidate resolution / provenance pinning
-# ---------------------------------------------------------------------------
-
-
-class TestCandidateResolution:
-    def test_candidates_span_bundled_and_every_configured_registry(
-        self, monkeypatch, cache_dir
-    ):
-        # `_registry_app_candidates` consults the official catalog with a fresh
-        # uncached HTTPS fetch, and DROPS every candidate when that lookup
-        # fails; pin "catalog reachable, app absent" so the assertion
-        # exercises the bundled + external span deterministically.
-        monkeypatch.setattr(
-            "kiro_crew.apps.official_catalog.inventory_for_install",
-            lambda name: None,
-        )
-        monkeypatch.setattr(
-            registry,
-            "_load_registry_file",
-            lambda: [{"name": "demo", "gitUrl": "https://github.com/core/demo.git"}, "junk"],
-        )
-        reg = _reg("mine", "https://gitea.internal/idx.git")
-        _config_with(monkeypatch, [reg])
-        registry._write_external_registry_cache(
-            registry._external_registry_cache_identity(reg),
-            [
-                {"name": "demo", "gitUrl": "https://gitea.internal/other/demo.git"},
-                {"name": "unrelated"},
-            ],
-        )
-        candidates = registry._registry_app_candidates("demo")
-        assert [registry._entry_git_url(c) for c in candidates] == [
-            "https://github.com/core/demo.git",
-            "https://gitea.internal/other/demo.git",
-        ]
-
-    def test_pinned_entry_requires_both_url_and_registry_to_match(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_registry_app_candidates",
-            lambda name: [
-                {"gitUrl": "https://x/other.git", "_registry": "mine"},
-                {"gitUrl": "https://x/demo.git", "_registry": "someone-else"},
-                {"gitUrl": "https://x/demo.git", "_registry": "mine", "hit": True},
-            ],
-        )
-        entry = registry._pinned_registry_entry(
-            "demo", {"sourceUrl": "https://x/demo.git", "sourceRegistry": "mine"}
-        )
-        assert entry is not None and entry.get("hit") is True
-
-    def test_rotated_credentials_still_match_the_same_pinned_source(self, monkeypatch):
-        """Userinfo authenticates transport; it is not repository identity."""
-        monkeypatch.setattr(
-            registry,
-            "_registry_app_candidates",
-            lambda name: [
-                {
-                    "gitUrl": "https://new-user:new-secret@example.com/o/demo.git",
-                    "_registry": "https://new-reg:new-token@example.com/o/index.git",
-                    "hit": True,
-                }
-            ],
-        )
-
-        entry = registry._pinned_registry_entry(
-            "demo",
-            {
-                "sourceUrl": "https://old-user:old-secret@example.com/o/demo.git",
-                "sourceRegistry": "https://old-reg:old-token@example.com/o/index.git",
-            },
-        )
-
-        assert entry is not None and entry.get("hit") is True
-
-    def test_pinned_entry_returns_none_when_the_source_is_gone(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_registry_app_candidates",
-            lambda name: [{"gitUrl": "https://x/other.git"}],
-        )
-        assert (
-            registry._pinned_registry_entry("demo", {"sourceUrl": "https://x/demo.git"})
-            is None
-        )
-
-    def test_bundled_candidate_matches_the_bundled_source(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_registry_app_candidates",
-            lambda name: [{"gitUrl": "https://x/demo.git"}],
-        )
-        entry = registry._pinned_registry_entry("demo", {"sourceUrl": "https://x/demo.git"})
-        assert entry == {"gitUrl": "https://x/demo.git"}
-
-
-class TestResolveInstallEntry:
-    def test_record_without_provenance_keeps_first_match_wins(self, monkeypatch):
-        monkeypatch.setattr(registry, "get_app", lambda name: {"name": "demo"})
-        monkeypatch.setattr(registry, "get_registry_app", lambda name: {"name": "demo"})
-        entry, err = registry._resolve_install_entry("demo")
-        assert err == ""
-        assert entry == {"name": "demo"}
-
-    def test_fresh_install_uses_the_bare_name_lookup(self, monkeypatch):
-        monkeypatch.setattr(registry, "get_app", lambda name: None)
-        monkeypatch.setattr(registry, "get_registry_app", lambda name: {"name": "demo"})
-        entry, err = registry._resolve_install_entry("demo")
-        assert (entry, err) == ({"name": "demo"}, "")
-
-    def test_pinned_record_resolves_to_its_own_source(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "get_app", lambda name: {"sourceUrl": "https://x/demo.git"}
-        )
-        monkeypatch.setattr(
-            registry, "_pinned_registry_entry", lambda name, meta: {"name": "demo"}
-        )
-        entry, err = registry._resolve_install_entry("demo")
-        assert (entry, err) == ({"name": "demo"}, "")
-
-    def test_missing_pinned_source_refuses_instead_of_falling_back(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "get_app", lambda name: {"sourceUrl": "https://x/demo.git"}
-        )
-        monkeypatch.setattr(registry, "_pinned_registry_entry", lambda name, meta: None)
-        monkeypatch.setattr(
-            registry,
-            "get_registry_app",
-            lambda name: pytest.fail("must not fall back to a bare-name lookup"),
-        )
-        entry, err = registry._resolve_install_entry("demo")
-        assert entry is None
-        assert "refusing to update it from a different source" in err
-
-    def test_missing_pin_error_never_returns_embedded_credentials(self, monkeypatch):
-        secret = "PinMismatchSecret"
-        raw_url = f"https://user:{secret}@example.com/o/demo.git"
-        monkeypatch.setattr(registry, "get_app", lambda name: {"sourceUrl": raw_url})
-        monkeypatch.setattr(registry, "_pinned_registry_entry", lambda name, meta: None)
-
-        entry, err = registry._resolve_install_entry("demo")
-
-        assert entry is None
-        assert secret not in err
-        assert raw_url not in err
-
-
-class TestRepoLookups:
-    def test_bundled_repo_wins_before_external(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_load_registry_file", lambda: [{"name": "demo", "repo": "o/demo"}]
-        )
-        assert registry.get_registry_app_by_repo("o/demo") == {
-            "name": "demo",
-            "repo": "o/demo",
-        }
-
-    def test_external_repo_is_resolved_from_the_sync_cache(self, monkeypatch, cache_dir):
-        monkeypatch.setattr(registry, "_load_registry_file", list)
-        reg = _reg("mine", "https://gitea.internal/idx.git")
-        _config_with(monkeypatch, [reg])
-        registry._write_external_registry_cache(
-            registry._external_registry_cache_identity(reg),
-            [{"name": "demo", "repo": "ext/demo", "branch": "trunk"}],
-        )
-        assert registry.get_registry_app_by_repo("ext/demo")["branch"] == "trunk"
-
-    def test_unknown_repo_resolves_to_none(self, monkeypatch, cache_dir):
-        monkeypatch.setattr(registry, "_load_registry_file", list)
-        _config_with(monkeypatch, [])
-        assert registry.get_registry_app_by_repo("nope/nope") is None
-
-    def test_external_lookup_fails_open_on_a_config_error(self, monkeypatch):
-        def _boom(cls):
-            raise RuntimeError("config exploded")
-
-        monkeypatch.setattr(
-            "kiro_crew.config.loader.KiroCrewConfig.load", classmethod(_boom)
-        )
-        assert registry._external_registry_app_by_repo("ext/demo") is None
-        assert registry._external_registry_repos() == set()
-
-    def test_known_repos_union_bundled_and_external(self, monkeypatch, cache_dir):
-        monkeypatch.setattr(
-            registry, "_load_registry_file", lambda: [{"name": "a", "repo": "core/a"}]
-        )
-        reg = _reg("mine", "https://gitea.internal/idx.git")
-        _config_with(monkeypatch, [reg])
-        registry._write_external_registry_cache(
-            registry._external_registry_cache_identity(reg),
-            [{"name": "b", "repo": "ext/b"}, {"name": "c"}],
-        )
-        assert registry.known_registry_repos() == {"core/a", "ext/b"}
-
-
-class TestExternalRegistryCacheIdentity:
-    """The index cache key is provenance (name|repo|branch), not display name."""
-
-    def test_repointing_repo_or_branch_changes_the_identity(self):
-        base = _reg("mine", "https://gitea.internal/idx.git", branch="main")
-        other_repo = _reg("mine", "https://gitea.internal/other.git", branch="main")
-        other_branch = _reg("mine", "https://gitea.internal/idx.git", branch="dev")
-        identities = {
-            registry._external_registry_cache_identity(base),
-            registry._external_registry_cache_identity(other_repo),
-            registry._external_registry_cache_identity(other_branch),
-        }
-        assert len(identities) == 3
-
-    def test_repointed_registry_stops_serving_the_old_index(self, monkeypatch, cache_dir):
-        # The ignore_ttl stale-fallback readers must MISS after a repoint —
-        # serving the old repository's index under the same display name is
-        # the defect this PR exists to close.
-        monkeypatch.setattr(registry, "_load_registry_file", list)
-        old = _reg("mine", "https://gitea.internal/old.git")
-        registry._write_external_registry_cache(
-            registry._external_registry_cache_identity(old),
-            [{"name": "demo", "repo": "old/demo"}],
-        )
-        _config_with(monkeypatch, [_reg("mine", "https://gitea.internal/new.git")])
-        assert registry.get_registry_app_by_repo("old/demo") is None
-        assert registry.known_registry_repos() == set()
-
-    def test_absent_none_and_empty_branch_share_one_identity(self):
-        # Duck-typed registry objects may not carry ``branch`` at all
-        # (regression: AttributeError from _registry_app_candidates). Absent,
-        # None, and "" all mean "default branch" and must agree — and must
-        # never collide with a real branch.
-        no_branch = SimpleNamespace(name="mine", repo="https://gitea.internal/idx.git")
-        ids = {
-            registry._external_registry_cache_identity(no_branch),
-            registry._external_registry_cache_identity(
-                _reg("mine", "https://gitea.internal/idx.git", branch="")
-            ),
-            registry._external_registry_cache_identity(
-                _reg("mine", "https://gitea.internal/idx.git", branch=None)
-            ),
-        }
-        assert len(ids) == 1
-        real = registry._external_registry_cache_identity(
-            _reg("mine", "https://gitea.internal/idx.git", branch="main")
-        )
-        assert real not in ids
-
-    def test_owner_count_reader_agrees_with_the_writer(self, monkeypatch, cache_dir):
-        # Regression: _repo_key_owner_count read the cache under the display
-        # name while every writer had moved to the coordinate identity, so an
-        # external source always counted 0 and the single-owner credential
-        # grant was silently disabled.
-        from kiro_crew.apps.routes import _repo_key_owner_count
-
-        monkeypatch.setattr(registry, "_load_registry_file", list)
-        reg = _reg("mine", "https://gitea.internal/idx.git")
-        _config_with(monkeypatch, [reg])
-        registry._write_external_registry_cache(
-            registry._external_registry_cache_identity(reg),
-            [{"name": "demo", "repo": "ext/demo"}],
-        )
-        assert _repo_key_owner_count("ext/demo") == 1
-
-    @pytest.mark.asyncio
-    async def test_fetch_reclaims_the_pre_identity_cache_file(self, monkeypatch, cache_dir):
-        # An upgrade orphans the name-keyed file (no reader derives that path
-        # any more); the first successful fetch reclaims it.
-        reg = _reg("mine", "https://gitea.internal/idx.git")
-        legacy_path = registry._external_registry_cache_path("mine")
-        registry._write_external_registry_cache("mine", [{"name": "demo"}])
-        assert legacy_path.is_file()
-
-        async def _fake_fetch(repo, branch):
-            return [{"name": "demo"}]
-
-        monkeypatch.setattr(registry, "_fetch_external_registry_index", _fake_fetch)
-        entries = await registry._fetch_and_cache_external_registry(reg)
-        assert entries is not None
-        assert not legacy_path.is_file()
-        assert registry._read_external_registry_cache(
-            registry._external_registry_cache_identity(reg), ignore_ttl=True
-        )
-
-    @pytest.mark.asyncio
-    async def test_failed_fetch_still_reclaims_legacy_files(self, monkeypatch, cache_dir):
-        # The legacy name-keyed file can embed URL userinfo in its FILENAME
-        # (raw form, written by an older release). It must be reclaimed even
-        # when the registry is unreachable — cleanup gated on fetch success
-        # would keep a credential-bearing artifact around indefinitely. The
-        # name's slug exceeds the current 120-char cap and the expected paths
-        # are constructed INLINE with the historical (uncapped) recipe, so a
-        # cleanup that switches to the capped derivation misses these files
-        # and fails this test.
-        import re as _re
-        from hashlib import sha256 as _sha256
-
-        secret = "LegacyFileSecret"
-        raw_name = (
-            f"https://user:{secret}@git.example.com/"
-            + "/".join(["deeply-nested-group"] * 8)
-            + "/org/apps.git"
-        )
-        reg = _reg(raw_name, raw_name)
-
-        def _historical_path(name: str):
-            slug = _re.sub(r"[^A-Za-z0-9_\-]+", "-", name).strip("-")
-            digest = _sha256(name.encode("utf-8")).hexdigest()[:8]
-            return cache_dir / f"_registry_{slug}-{digest}.json"
-
-        raw_path = _historical_path(raw_name)
-        sanitized_path = _historical_path(
-            registry._credential_free_external_registry_value(raw_name)
-        )
-        assert len(raw_path.name) > 140  # over the cap: only the uncapped derivation finds it
-        for p in {raw_path, sanitized_path}:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("[]", encoding="utf-8")
-        assert secret in raw_path.name
-
-        async def _fail_fetch(repo, branch):
-            return None
-
-        monkeypatch.setattr(registry, "_fetch_external_registry_index", _fail_fetch)
-        assert await registry._fetch_and_cache_external_registry(reg) is None
-        assert not raw_path.is_file()
-        assert not sanitized_path.is_file()
-
-    def test_long_identity_still_yields_a_writable_path(self, cache_dir):
-        # An URL-derived name repeats much of the repo URL inside the
-        # identity, so an over-long identity must not push the cache filename
-        # past the filesystem's ~255-byte component limit (a too-long name
-        # makes every write fail with ENAMETOOLONG and silently disables the
-        # stale-fallback).
-        long_repo = "https://gitlab.example.com/" + "/".join(["group"] * 40) + "/idx.git"
-        reg = _reg(long_repo, long_repo, branch="a-rather-long-branch-name")
-        identity = registry._external_registry_cache_identity(reg)
-        path = registry._external_registry_cache_path(identity)
-        assert len(path.name.encode("utf-8")) <= 255
-        registry._write_external_registry_cache(identity, [{"name": "demo"}])
-        assert registry._read_external_registry_cache(identity, ignore_ttl=True) == [
-            {"name": "demo"}
-        ]
-
-    def test_truncated_slugs_do_not_collide(self, cache_dir):
-        # Identity lives in the digest, not the readable prefix: two long
-        # identities sharing their first 120 slug characters still map to
-        # distinct cache files.
-        prefix = "https://gitlab.example.com/" + "x" * 200
-        a = registry._external_registry_cache_path(f"{prefix}/one|{prefix}/one|main")
-        b = registry._external_registry_cache_path(f"{prefix}/two|{prefix}/two|main")
-        assert a != b
-
-    def test_capped_identity_resists_a_32_bit_digest_collision(self, cache_dir):
-        # These branch values collide under the historical eight-hex digest.
-        # Because the long readable prefix is capped before the branch, the
-        # old current-path recipe mapped both identities to the same file and
-        # a repoint could serve the former branch's stale index.
-        from hashlib import sha256
-
-        long_repo = "https://gitlab.example.com/" + "/".join(["group"] * 40) + "/idx.git"
-        old_identity = registry._external_registry_cache_identity(
-            _reg(long_repo, long_repo, branch="b57262")
-        )
-        new_identity = registry._external_registry_cache_identity(
-            _reg(long_repo, long_repo, branch="b166188")
-        )
-        assert (
-            sha256(old_identity.encode("utf-8")).hexdigest()[:8]
-            == sha256(new_identity.encode("utf-8")).hexdigest()[:8]
-        )
-
-        old_path = registry._external_registry_cache_path(old_identity)
-        new_path = registry._external_registry_cache_path(new_identity)
-        assert old_path != new_path
-        assert len(old_path.name.encode("utf-8")) <= 255
-        assert len(new_path.name.encode("utf-8")) <= 255
-
-        registry._write_external_registry_cache(old_identity, [{"name": "old-app"}])
-        assert registry._read_external_registry_cache(new_identity, ignore_ttl=True) is None
-
-
-class TestSourceStrings:
-    def test_is_registry_source(self):
-        assert registry.is_registry_source("registry:demo") is True
-        assert registry.is_registry_source("git:demo") is False
-
-    def test_registry_name_from_source(self):
-        assert registry.registry_name_from_source("registry:demo") == "demo"
-
-    def test_app_source_dir_is_under_app_sources(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(registry, "config_dir", lambda: tmp_path)
-        assert registry.app_source_dir("demo") == tmp_path / "app-sources" / "demo"
-
-
-class TestServerPlatform:
-    def test_reports_os_and_arch(self):
-        info = registry.get_server_platform()
-        assert set(info) == {"os", "arch"}
-        assert info["os"] and info["arch"]
-
-
-# ---------------------------------------------------------------------------
-# Git provenance reader
-# ---------------------------------------------------------------------------
-
-
-class TestResolvedCloneCommit:
-    _SHA = "a" * 40
-
-    def test_missing_head_yields_no_commit(self, tmp_path):
-        assert registry._resolved_clone_commit(tmp_path) == ""
-
-    def test_detached_head_holds_the_sha_directly(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text(self._SHA + "\n", encoding="utf-8")
-        assert registry._resolved_clone_commit(tmp_path) == self._SHA
-
-    def test_detached_head_with_a_non_sha_is_rejected(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text("garbage", encoding="utf-8")
-        assert registry._resolved_clone_commit(tmp_path) == ""
-
-    def test_loose_ref_is_read(self, tmp_path):
-        git = tmp_path / ".git"
-        (git / "refs" / "heads").mkdir(parents=True)
-        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        (git / "refs" / "heads" / "main").write_text(self._SHA + "\n", encoding="utf-8")
-        assert registry._resolved_clone_commit(tmp_path) == self._SHA
-
-    def test_packed_refs_fallback_for_a_repacked_clone(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        (git / "packed-refs").write_text(
-            f"# pack-refs with: peeled\n{self._SHA} refs/heads/main\n", encoding="utf-8"
-        )
-        assert registry._resolved_clone_commit(tmp_path) == self._SHA
-
-    @pytest.mark.parametrize("ref", ["/etc/passwd", "../../escape", ""])
-    def test_a_ref_that_could_escape_the_git_dir_is_refused(self, tmp_path, ref):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text(f"ref: {ref}\n", encoding="utf-8")
-        assert registry._resolved_clone_commit(tmp_path) == ""
-
-    def test_unresolvable_ref_degrades_to_no_commit(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        assert registry._resolved_clone_commit(tmp_path) == ""
-
-    def test_short_sha_in_a_loose_ref_is_not_accepted(self, tmp_path):
-        git = tmp_path / ".git"
-        (git / "refs" / "heads").mkdir(parents=True)
-        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        (git / "refs" / "heads" / "main").write_text("abc123\n", encoding="utf-8")
-        assert registry._resolved_clone_commit(tmp_path) == ""
-
-
-class TestReadCloneBranch:
-    def test_missing_head_yields_none(self, tmp_path):
-        assert registry._read_clone_branch(tmp_path) is None
-
-    def test_branch_checkout_is_read(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text("ref: refs/heads/release/1.x\n", encoding="utf-8")
-        assert registry._read_clone_branch(tmp_path) == "release/1.x"
-
-    def test_detached_head_fails_closed(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text("a" * 40, encoding="utf-8")
-        assert registry._read_clone_branch(tmp_path) is None
-
-    def test_undecodable_head_fails_closed(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_bytes(b"\xff\xfe not utf8")
-        assert registry._read_clone_branch(tmp_path) is None
-
-    @pytest.mark.asyncio
-    async def test_branch_matches_requires_a_non_empty_branch(self, tmp_path):
-        assert await registry._clone_branch_matches(tmp_path, "") is False
-
-    @pytest.mark.asyncio
-    async def test_branch_matches_compares_exactly(self, tmp_path):
-        git = tmp_path / ".git"
-        git.mkdir()
-        (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-        assert await registry._clone_branch_matches(tmp_path, "main") is True
-        assert await registry._clone_branch_matches(tmp_path, "mainline") is False
-
-    @pytest.mark.asyncio
-    async def test_origin_matches_requires_a_url_to_compare(self, tmp_path):
-        assert await registry._clone_origin_matches(tmp_path, "") is False
-
-    @pytest.mark.asyncio
-    async def test_origin_matches_uses_credential_free_clone_identity(
-        self, tmp_path, monkeypatch
-    ):
-        async def _origin(dest):
-            return "https://github.com/o/demo.git"
-
-        monkeypatch.setattr(registry, "_clone_origin_url", _origin)
-        assert (
-            await registry._clone_origin_matches(tmp_path, "https://github.com/o/demo.git")
-            is True
-        )
-        assert (
-            await registry._clone_origin_matches(tmp_path, "https://github.com/o/demo")
-            is True
-        )
-        assert (
-            await registry._clone_origin_matches(
-                tmp_path, "https://rotated:new-secret@github.com/o/demo.git"
-            )
-            is True
-        )
-        assert (
-            await registry._clone_origin_matches(tmp_path, "https://github.com/o/Demo.git")
-            is False
-        )
-
-
-class TestCloneOriginUrl:
-    @pytest.mark.asyncio
-    async def test_non_git_directory_yields_none(self, tmp_path):
-        assert await registry._clone_origin_url(tmp_path) is None
-
-    @pytest.mark.asyncio
-    async def test_origin_is_returned_stripped(self, tmp_path, monkeypatch):
-        (tmp_path / ".git").mkdir()
-        _fake_sandbox(
-            monkeypatch, [_FakeProc(returncode=0, output=b"https://github.com/o/demo.git\n")]
-        )
-        assert await registry._clone_origin_url(tmp_path) == "https://github.com/o/demo.git"
-
-    @pytest.mark.asyncio
-    async def test_failed_git_yields_none(self, tmp_path, monkeypatch):
-        (tmp_path / ".git").mkdir()
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=1)])
-        assert await registry._clone_origin_url(tmp_path) is None
-
-    @pytest.mark.asyncio
-    async def test_spawn_failure_yields_none(self, tmp_path, monkeypatch):
-        (tmp_path / ".git").mkdir()
-
-        async def _boom(*argv, **kwargs):
-            raise OSError("no git binary")
-
-        monkeypatch.setattr(registry, "wrap_argv", lambda cmd, mode="": (list(cmd), None))
-        monkeypatch.setattr(registry, "cgroup_scope_argv", lambda cmd: list(cmd))
-        monkeypatch.setattr(registry, "create_subprocess_limited", _boom)
-        assert await registry._clone_origin_url(tmp_path) is None
-
-    @pytest.mark.asyncio
-    async def test_timeout_kills_the_group_and_yields_none(self, tmp_path, monkeypatch):
-        (tmp_path / ".git").mkdir()
-
-        class _Hang(_FakeProc):
-            async def communicate(self):
-                await asyncio.sleep(30)
-                return b"", b""
-
-        _fake_sandbox(monkeypatch, [_Hang()])
-        killed: list[int] = []
-
-        async def _kill(proc):
-            killed.append(proc.pid)
-
-        monkeypatch.setattr(registry, "_kill_process_group", _kill)
-        monkeypatch.setattr(registry.asyncio, "wait_for", _immediate_timeout)
-        assert await registry._clone_origin_url(tmp_path) is None
-        assert killed == [31337]
-
-
-async def _immediate_timeout(awaitable, timeout=None):
-    """Stand-in for ``asyncio.wait_for`` that times out without waiting.
-
-    The awaitable is closed so no "never awaited" warning escapes.
-    """
-    awaitable.close()
-    raise asyncio.TimeoutError
-
-
-# ---------------------------------------------------------------------------
-# Stale checkout sweep
-# ---------------------------------------------------------------------------
-
-
-class TestStaleCheckoutSweep:
-    @staticmethod
-    def _aged(path: Path) -> None:
-        past = time.time() - (registry._STALE_CHECKOUT_RETENTION_DAYS + 1) * 86400
-        os.utime(path, (past, past))
-
-    def test_missing_sources_dir_is_a_no_op(self, tmp_path):
-        assert registry._sweep_stale_checkouts_sync(tmp_path / "absent", time.time()) == []
-
-    def test_aged_stale_and_partial_dirs_are_removed(self, tmp_path):
-        for name in ("demo.stale-0123abcd", "demo.partial-89abcdef"):
-            d = tmp_path / name
-            d.mkdir()
-            (d / "file.txt").write_text("x", encoding="utf-8")
-            self._aged(d)
-        removed = registry._sweep_stale_checkouts_sync(tmp_path, time.time())
-        assert sorted(removed) == ["demo.partial-89abcdef", "demo.stale-0123abcd"]
-
-    def test_fresh_stale_dir_is_kept(self, tmp_path):
-        d = tmp_path / "demo.stale-0123abcd"
-        d.mkdir()
-        assert registry._sweep_stale_checkouts_sync(tmp_path, time.time()) == []
-        assert d.is_dir()
-
-    @pytest.mark.parametrize(
-        "name", ["demo", "demo.stale-xyz", "demo.stale-0123abc", ".stale-0123abcd"]
-    )
-    def test_names_outside_the_convention_are_never_touched(self, tmp_path, name):
-        d = tmp_path / name
-        d.mkdir()
-        self._aged(d)
-        assert registry._sweep_stale_checkouts_sync(tmp_path, time.time()) == []
-        assert d.is_dir()
-
-    def test_unlistable_sources_dir_degrades_to_no_removals(self, tmp_path, monkeypatch):
-        def _boom(self):
-            raise OSError("permission denied")
-
-        monkeypatch.setattr(Path, "iterdir", _boom)
-        assert registry._sweep_stale_checkouts_sync(tmp_path, time.time()) == []
-
-    @requires_symlinks
-    def test_symlink_pointing_outside_is_not_followed(self, tmp_path):
-        sources = tmp_path / "app-sources"
-        sources.mkdir()
-        outside = tmp_path / "precious"
-        outside.mkdir()
-        (outside / "keep.txt").write_text("keep", encoding="utf-8")
-        link = sources / "demo.stale-0123abcd"
-        os.symlink(str(outside), str(link))
-        self._aged(outside)
-        assert registry._sweep_stale_checkouts_sync(sources, time.time()) == []
-        assert (outside / "keep.txt").is_file()
-
-    @requires_symlinks
-    def test_dangling_symlink_is_skipped_rather_than_deleted(self, tmp_path):
-        link = tmp_path / "demo.stale-0123abcd"
-        os.symlink(str(tmp_path / "gone"), str(link))
-        assert registry._sweep_stale_checkouts_sync(tmp_path, time.time()) == []
-
-    @pytest.mark.asyncio
-    async def test_async_sweep_reports_removals(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(registry, "_app_sources_dir", lambda: tmp_path)
-        d = tmp_path / "demo.stale-0123abcd"
-        d.mkdir()
-        self._aged(d)
-        await registry._sweep_stale_checkouts()
-        assert not d.exists()
-
-    @pytest.mark.asyncio
-    async def test_async_sweep_never_fails_the_install(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(registry, "_app_sources_dir", lambda: tmp_path)
-
-        def _boom(sources_dir, now_ts):
-            raise RuntimeError("sweep exploded")
-
-        monkeypatch.setattr(registry, "_sweep_stale_checkouts_sync", _boom)
-        await registry._sweep_stale_checkouts()  # must not raise
-
-    def test_is_stale_candidate(self, tmp_path):
-        assert registry._is_stale_candidate(tmp_path / "a.stale-0123abcd") is True
-        assert registry._is_stale_candidate(tmp_path / "a.partial-0123abcd") is True
-        assert registry._is_stale_candidate(tmp_path / "a") is False
-
-
-# ---------------------------------------------------------------------------
-# Process-group kill
-# ---------------------------------------------------------------------------
-
-
-class TestKillProcessGroup:
-    @pytest.mark.asyncio
-    async def test_sigterm_then_reap_is_enough_for_a_cooperative_child(self, monkeypatch):
-        signals: list[object] = []
-
-        async def _tree_kill(pid, sig):
-            signals.append(sig)
-            return True
-
-        monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _tree_kill)
-        proc = _FakeProc(returncode=0)
-        await registry._kill_process_group(proc)
-        assert signals == [registry.platform_compat.SIGTERM]
-        assert proc.wait_calls == 1
-        assert proc.kill_calls == 0
-
-    @pytest.mark.asyncio
-    async def test_sigterm_os_error_still_reaps_the_child(self, monkeypatch):
-        """A child that already exited makes killpg raise; the reap must still run."""
-
-        async def _tree_kill(pid, sig):
-            raise OSError("no such process")
-
-        monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _tree_kill)
-        proc = _FakeProc(returncode=0)
-        await registry._kill_process_group(proc)
-        assert proc.wait_calls == 1
-        assert proc.kill_calls == 0
-
-    @pytest.mark.asyncio
-    async def test_failed_sigkill_falls_back_to_a_pid_scoped_kill(self, monkeypatch):
-        """If the group SIGKILL cannot be delivered the child is never left unreaped."""
-        sent: list[object] = []
-
-        async def _tree_kill(pid, sig):
-            sent.append(sig)
-            if sig == registry.platform_compat.SIGKILL:
-                raise OSError("not a group leader")
-            return True
-
-        monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _tree_kill)
-        monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0.01)
-
-        class _Stubborn(_FakeProc):
-            def __init__(self) -> None:
-                super().__init__(returncode=0)
-                self._reaped = False
-
-            async def wait(self) -> int:
-                self.wait_calls += 1
-                if not self._reaped:
-                    self._reaped = True
-                    await asyncio.sleep(5)
-                return 0
-
-        proc = _Stubborn()
-        await registry._kill_process_group(proc)
-        assert sent == [
-            registry.platform_compat.SIGTERM,
-            registry.platform_compat.SIGKILL,
-        ]
-        assert proc.kill_calls == 1
-
-    @pytest.mark.asyncio
-    async def test_an_unresponsive_child_is_escalated_to_sigkill(self, monkeypatch):
-        signals: list[object] = []
-
-        async def _tree_kill(pid, sig):
-            signals.append(sig)
-            return True
-
-        monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _tree_kill)
-        monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0.01)
-
-        class _Stubborn(_FakeProc):
-            def __init__(self) -> None:
-                super().__init__(returncode=0)
-                self._reaped = False
-
-            async def wait(self) -> int:
-                self.wait_calls += 1
-                if not self._reaped:
-                    self._reaped = True
-                    await asyncio.sleep(5)
-                return 0
-
-        proc = _Stubborn()
-        await registry._kill_process_group(proc)
-        assert signals == [
-            registry.platform_compat.SIGTERM,
-            registry.platform_compat.SIGKILL,
-        ]
-
+from kiro_crew.apps.manifest import AppManifest
 
 # ---------------------------------------------------------------------------
 # Build step selection + execution
@@ -2163,7 +45,7 @@ class TestRunAppBuild:
     @pytest.mark.asyncio
     async def test_no_recognized_ecosystem_means_no_build(self, tmp_path):
         log: list[str] = []
-        result = await registry._run_app_build(tmp_path, "demo", log)
+        result = await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False)
         assert result == {"ok": True}
         assert "No build step detected — using source as-is" in log
 
@@ -2172,7 +54,7 @@ class TestRunAppBuild:
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
         log: list[str] = []
-        result = await registry._run_app_build(tmp_path, "demo", log)
+        result = await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False)
         assert result == {"ok": True}
         assert any("npm not found on PATH" in line for line in log)
 
@@ -2184,7 +66,7 @@ class TestRunAppBuild:
         monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/npm")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
         log: list[str] = []
-        assert await registry._run_app_build(tmp_path, "demo", log) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [["/usr/bin/npm", "install"]]
         assert log[-1] == "build succeeded"
 
@@ -2197,7 +79,7 @@ class TestRunAppBuild:
         spawned = _fake_sandbox(
             monkeypatch, [_FakeProc(returncode=0), _FakeProc(returncode=0)]
         )
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [
             ["/usr/bin/npm", "install"],
             ["/usr/bin/npm", "run", "build"],
@@ -2208,7 +90,7 @@ class TestRunAppBuild:
         (tmp_path / "package.json").write_text("{ not json", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/npm")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [["/usr/bin/npm", "install"]]
 
     @pytest.mark.asyncio
@@ -2217,7 +99,7 @@ class TestRunAppBuild:
     ):
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
@@ -2227,7 +109,7 @@ class TestRunAppBuild:
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         (tmp_path / "requirements.txt").write_text("pytest\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
@@ -2236,7 +118,7 @@ class TestRunAppBuild:
     ):
         (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
@@ -2248,7 +130,7 @@ class TestRunAppBuild:
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: None)
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        assert await registry._run_app_build(tmp_path, "demo", []) == {"ok": True}
+        assert await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False) == {"ok": True}
         assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "."]]
 
     @pytest.mark.asyncio
@@ -2264,7 +146,7 @@ class TestRunAppBuild:
         build fails with an explicit error instead.
 
         Detection routes through ``platform_compat.is_bundled_interpreter()``;
-        the tests in ``test_platform_compat.py`` pin its sentinel to the
+        the tests in ``test_platform_compat_pinned_tools.py`` pin its sentinel to the
         packaging layer so a bundler rename cannot silently un-match this guard.
         """
         (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
@@ -2274,10 +156,1370 @@ class TestRunAppBuild:
         bundled.write_text("", encoding="utf-8")
         monkeypatch.setattr(registry.sys, "executable", str(bundled))
         spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        result = await registry._run_app_build(tmp_path, "demo", [])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
         assert result["ok"] is False
         assert "bundled interpreter" in result["error"]
         assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_backend_entry_point_requirements_pass_the_bundled_gate(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A root requirements.txt for an OUT-OF-PROCESS backend is not a
+        gateway-import dependency, so the desktop gate must let it through.
+
+        ``apps/backend_runtime/provisioning.py::provision_app_deps`` installs exactly this file with
+        ``pip install --target`` into the app's own deps dir at backend start,
+        which works on the bundled interpreter. Refusing it here blocked an app
+        class the runtime serves. Nothing is pip-installed AT INSTALL TIME — the
+        runtime owns it — so no build command may be planned either.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert any("provisioned at runtime" in line and "requirements.txt" in line for line in log)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("verb", ["install", "update"])
+    async def test_pyproject_still_refused_on_the_bundled_interpreter(
+        self, tmp_path, monkeypatch, bundled_interpreter, verb
+    ):
+        """A declared backend entry point does not rescue ``pyproject.toml``:
+        ``pip install .`` targets the GATEWAY's interpreter, which is the write
+        into the signed bundle the refusal exists to prevent. The refusal is
+        streamed into the install log like every other refusal, with the run's
+        verb -- this is the commonest path to it (an already-trusted app whose
+        checkout carries a build step), and the page shows the log."""
+        (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        log: list[str] = []
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend(), self_managed=False, verb=verb
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert log == [f"Refusing {verb}: {result['error']}"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_setup_py_still_refused_on_the_bundled_interpreter(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        (tmp_path / "setup.py").write_text("from setuptools import setup\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["run.sh", "server.js", "server.mjs", "server.cjs"])
+    async def test_a_shell_or_node_entry_point_with_requirements_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter, entry
+    ):
+        """The backend spawn runs ``provision_app_deps`` for ANY file-style entry,
+        so the file is pip-installed at spawn for a shell or node entry too -- but
+        the spawn hands the tree to a Python child only (the ``deps_boot`` shim on
+        the gateway interpreter, the shim under an ABI-matched shebang, or
+        ``PYTHONPATH`` on an ABI match); a shell or node child gets none of the
+        three. Waiving here would install an app whose declared dependencies land
+        beside a process that can never import them -- the silent-broken shape
+        the refusal exists to prevent -- so the gate counts such an entry as no
+        consumer and keeps the refusal, with the desktop code."""
+        (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+        (tmp_path / entry).write_text("", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        log: list[str] = []
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=AppManifest.from_dict({"name": "demo", "backend": {"entryPoint": entry}}), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert not any("provisioned at runtime" in line for line in log)
+
+    @pytest.mark.asyncio
+    async def test_a_shell_entry_point_without_requirements_is_untouched(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """No ``requirements.txt`` means nothing for the gate to judge: a shell
+        entry installs as it always did, with no build step."""
+        (tmp_path / "run.sh").write_text("", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        log: list[str] = []
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=AppManifest.from_dict({"name": "demo", "backend": {"entryPoint": "run.sh"}}), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert "No build step detected — using source as-is" in log
+
+    @pytest.mark.asyncio
+    async def test_a_stdio_server_still_waives_beside_a_shell_entry_point(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The stdio server is a consumer the deps reach (``bridges_mcp.py`` provisions
+        for it at registration and launches it as Python), so it waives the file
+        beside a shell entry exactly as it does beside an entry the spawn would
+        refuse."""
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        (tmp_path / "run.sh").write_text("", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {
+                "name": "demo",
+                "backend": {"entryPoint": "run.sh"},
+                "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}},
+            }
+        )
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=manifest, self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_an_absent_shell_entry_point_is_refused_at_the_build_pass_too(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The build pass defers a merely-absent PYTHON entry to the final pass
+        (the script window may create the file); a declared shell entry is refused
+        at once -- its suffix is the manifest's, and no script window changes what
+        the deps tree reaches."""
+        (tmp_path / "requirements.txt").write_text("requests\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo", "backend": {"entryPoint": "run.sh"}}), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_requirements_without_an_out_of_process_consumer_stay_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """No ``backend.entryPoint`` and no stdio ``mcpServers`` entry means
+        nothing spawns for this app, so neither runtime provisioner would ever
+        install the file — a pass would report success for an install that put
+        the dependencies nowhere, the broken-install shape the loud refusal
+        prevents.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo"}), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_requirements_beside_pyproject_stay_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The refusal wins when both are present: the non-bundled branch would
+        run ``pip install .`` for this layout, so the gateway-import dependency
+        is the one that decides."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_manifest_declaring_nothing_is_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Fail-closed: ``{}`` is what a caller passes for "declares nothing", and
+        it must not read as "no hooks declared, so allow"."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
+        assert result["ok"] is False
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_declared_hooks_keep_the_refusal_even_with_an_entry_point(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``backend.hooks`` runs INSIDE the gateway process.
+
+        A manifest may declare both an entry point and hooks, and the deps tree
+        the backend runner provisions never joins the gateway's import path
+        (module_loader loads a hook straight into this process). Waiving the
+        refusal on the entry point alone would install such an app "successfully"
+        with its hook imports broken and its routes degraded — the silent-broken
+        install the loud refusal exists to prevent.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        for hook in ("routes", "on_startup", "on_shutdown"):
+            spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+            result = await registry._run_app_build(
+                tmp_path,
+                "demo",
+                [],
+                manifest=_asgi_backend(hooks={hook: "backend.hooks:fn"}),
+                self_managed=False,
+            )
+            assert result["ok"] is False, hook
+            assert "bundled interpreter" in result["error"]
+            assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_blank_hook_fields_are_not_a_declared_hook(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``hooks: {}`` — and an EMPTY field — declares no in-gateway code, so
+        the waiver still applies: the check is on a declared hook, not on the key.
+
+        A whitespace-only field is the other way round and is refused: the typed
+        view keeps it, so ``lifecycle.py`` would take it as a hook path, fail to
+        resolve it and mark the app degraded. That app has in-gateway Python as
+        far as the runtime is concerned, so the gate must not waive for it.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path,
+            "demo",
+            [],
+            manifest=_asgi_backend(hooks={"routes": "", "on_startup": ""}),
+            self_managed=False,
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+        blank = _asgi_backend(hooks={"on_startup": "  "})
+        assert blank.backend.hooks.to_dict() == {"on_startup": "  "}
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=blank, self_managed=False)
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_the_gate_reads_hooks_the_way_the_loaders_are_fed(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A hooks value the manifest view drops is a hook that never loads.
+
+        ``manager_lookup.py`` hands the hook loaders
+        ``AppManifest.from_json_file(...).to_dict()``, and
+        ``BackendConfig.from_dict`` drops a non-object ``hooks`` — so for a
+        manifest like this one NOTHING is imported into the gateway, and the gate
+        must agree with that rather than refuse an app the runtime would run
+        hookless. Pinned because the opposite reading (refuse whatever looks
+        unreadable in the raw bytes) is the tempting one, and it would disagree
+        with the only view that decides.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        manifest = _asgi_backend(hooks="backend.hooks:fn")
+        assert manifest.backend.hooks.to_dict() == {}, "the typed view must drop it"
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=manifest, self_managed=False)
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_stdio_mcp_server_app_passes_the_bundled_gate(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The waiver is the runtime's OWN condition, not the entry point.
+
+        ``bridges_mcp.py::_maybe_provision_backendless_deps`` provisions a root
+        requirements.txt for an app whose only Python is a stdio ``mcpServers``
+        entry — the same ``pip install --target`` into the app's deps dir, so the
+        same out-of-process consumer. Refusing it while waiving the entry-point
+        shape would be a point patch on the reported symptom.
+        """
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {"name": "demo", "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}}}
+        )
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", log, manifest=manifest, self_managed=False)
+        assert result == {"ok": True}
+        assert spawned == []
+        assert any("requirements.txt" in line for line in log)
+
+    @pytest.mark.asyncio
+    async def test_a_url_only_mcp_server_is_not_an_out_of_process_consumer(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A ``url`` server is remote: nothing spawns for it, so the runtime
+        provisions nothing (``bridges_mcp.py`` counts only entries WITHOUT ``url``),
+        and the gate must agree — refused, like any requirements.txt with no
+        consumer."""
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {"name": "demo", "mcpServers": {"remote": {"url": "https://example.test/mcp"}}}
+        )
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=manifest, self_managed=False)
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_stdio_app_with_hooks_stays_refused(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Hooks import into the gateway process regardless of what else the app
+        ships, so a stdio server does not rescue an app that also declares one."""
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {
+                "name": "demo",
+                "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}},
+                "backend": {"hooks": {"on_startup": "backend.hooks:start"}},
+            }
+        )
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=manifest, self_managed=False)
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_module_style_entry_point_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Neither provisioner installs requirements.txt for a MODULE-style entry.
+
+        A dotted, extensionless ``backend.entryPoint`` with no file of that name
+        runs as ``python -m`` from trusted package code; ``backend.py`` skips
+        ``provision_app_deps`` for it and ``bridges_mcp.py`` returns before provisioning
+        (trust boundary: an app-dir requirements file must never load ahead of a
+        trusted module). Waiving on the entry point's mere presence would report a
+        successful install whose dependencies land nowhere -- the same silent-broken
+        install as a pass with no consumer at all -- so the shape the provisioners
+        refuse is refused here, by the predicate they share.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path,
+            "demo",
+            [],
+            manifest=_asgi_backend("kiro_crew.apps.builtins.demo.server"),
+            self_managed=False,
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_self_managed_entry_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Neither provisioner runs for a self-managed app, whatever it declares.
+
+        A registry entry with ``resources: "app"`` is registered from its manifest
+        alone: ``install_from_registry`` copies no source into the app directory,
+        ``bridges_register.py`` skips every registration for it, and the app launches
+        itself. On a source install the build step's ``pip install -r`` was the
+        only thing that installed its requirements.txt, and that step is what the
+        bundled interpreter cannot run -- so the very manifest that waives for a
+        gateway-managed entry (``test_backend_entry_point_requirements_pass_the_bundled_gate``)
+        refuses here. Ownership is a registry fact the manifest does not carry,
+        which is why it is a separate, required input to the verdict.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\nuvicorn\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=True
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @pytest.mark.parametrize("decided_by", ["self-managed", "hooks"])
+    @pytest.mark.asyncio
+    async def test_a_refusal_the_manifest_decides_takes_no_preview_copy(
+        self, tmp_path, monkeypatch, bundled_interpreter, decided_by
+    ):
+        """A self-managed entry and a declared `backend.hooks` are refused by the
+        manifest and the registry entry alone, in both passes; nothing of theirs
+        reads the tree, so the gate answers before it copies it -- otherwise every
+        such install would run two full copies (build pass and final pass) that no
+        predicate ever looked at."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        copies: list[Path] = []
+
+        def _counting_copy(source, dest, **kwargs):
+            copies.append(Path(dest))
+            pytest.fail("the preview copy must not be produced for a manifest-decided refusal")
+
+        monkeypatch.setattr(registry, "copy_app_tree_as_installed", _counting_copy)
+        if decided_by == "self-managed":
+            manifest, self_managed = _asgi_backend(), True
+        else:
+            manifest, self_managed = _asgi_backend(hooks={"on_startup": "backend.hooks:fn"}), False
+        for final in (False, True):
+            assert (
+                registry._desktop_build_refusal(
+                    tmp_path, manifest, self_managed=self_managed, final=final
+                )
+                == registry._DESKTOP_BUILD_REFUSAL
+            )
+        assert copies == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_requirements_symlink_escaping_the_app_root_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The runtime refuses to READ a requirements.txt that resolves outside the
+        app root (``provision_app_deps``: "out-of-root symlinked requirements are
+        not installed") and the backend spawns without its deps -- so the waiver,
+        which exists because the runtime provisions the file, must not apply to a
+        link the runtime will refuse. ``install_app`` copies with ``symlinks=True``,
+        so the link in the checkout is the link in the app directory. Waiving would
+        report a successful install with nothing installed, and let the gate
+        treat bytes outside the app directory as the app's own.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        app_root = tmp_path / "app"
+        app_root.mkdir()
+        (app_root / "server.py").write_text("", encoding="utf-8")
+        (app_root / "requirements.txt").symlink_to(outside / "requirements.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            app_root, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_an_in_tree_requirements_symlink_is_waived_like_the_runtime_reads_it(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``requirements.txt -> requirements/prod.txt`` is layout the provisioner
+        accepts (a link whose strict resolution stays inside the app root), so the
+        gate accepts it too: refusing it would re-create the refused-what-the-
+        runtime-serves defect for that layout."""
+        (tmp_path / "requirements").mkdir()
+        (tmp_path / "requirements" / "prod.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "requirements.txt").symlink_to(Path("requirements") / "prod.txt")
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert any("provisioned at runtime" in line for line in log)
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "target_dir",
+        ["data", "node_modules", ".venv", "vendor/node_modules"],
+        ids=["data (replaced on update)", "node_modules", ".venv", "nested node_modules"],
+    )
+    async def test_a_link_into_a_tree_the_install_does_not_carry_over_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter, target_dir
+    ):
+        """The provisioner reads requirements.txt in the APP DIRECTORY. The copy
+        keeps the link as a link but drops the build-input dirs at every depth
+        and, on an update, replaces ``data/`` with the preserved previous one --
+        so a link that resolves in this checkout dangles there, the provisioner
+        refuses it, and the install would already have reported success. The
+        copy itself decides: the gate judges a real copy of the checkout."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: True)  # an update
+        target = tmp_path / target_dir / "requirements.txt"
+        target.parent.mkdir(parents=True)
+        target.write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "requirements.txt").symlink_to(Path(target_dir) / "requirements.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_on_a_first_install_the_source_s_data_dir_is_carried_and_a_link_into_it_is_waived(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """With no preserved `data/` to put back, `install_app` copies the source's
+        `data/` and leaves it, so `requirements.txt -> data/requirements.txt`
+        resolves in the app directory exactly as it does here: the runtime reads it
+        and the gate waives it. The first UPDATE replaces `data/` and this same gate
+        then refuses the link, loudly, before the working install is touched."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: False)
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "requirements.txt").symlink_to(Path("data") / "requirements.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == ""
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_dangling_requirements_link_passes_the_build_pass_and_fails_the_final_one(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """``provision_app_deps`` treats a present-but-unreadable requirements.txt
+        (a dangling link) as a provisioning FAILURE; the backend then spawns
+        without its deps and dies on import, so the waiver -- granted because the
+        runtime provisions the file -- must not pass an app that cannot run. But
+        the link's target may be what ``setup.onInstall`` generates, so the build
+        pass lets a dangling link through and the final pass, on the post-script
+        checkout, is the one that refuses. Presence is the provisioner's
+        ``lexists``, not the build detector's ``is_file``, in both."""
+        (tmp_path / "requirements.txt").symlink_to(tmp_path / "gone.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_dangling_requirements_link_nothing_reads_is_no_file(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """With no consumer, nothing of ours ever reads the entry, and the build's
+        own detection (``is_file``, on every host) sees no Python build files: it
+        passes, exactly as the same checkout does on a source install."""
+        (tmp_path / "requirements.txt").symlink_to(tmp_path / "gone.txt")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo"}), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_requirements_file_over_the_provisioners_cap_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The provisioner reads requirements.txt through a bounded buffer and
+        refuses one over its cap ("exceeds the size cap"), after which the
+        backend never gets its deps -- so the waiver, granted because the
+        provisioner installs the file, does not apply to one it will refuse. The
+        cap is the provisioner's own constant, applied by the shared rule."""
+        from kiro_crew.apps.manifest import REQUIREMENTS_TXT_MAX_BYTES
+
+        (tmp_path / "requirements.txt").write_bytes(b"#" + b"x" * REQUIREMENTS_TXT_MAX_BYTES)
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert "bundled interpreter" in result["error"]
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_merely_absent_entry_point_passes_the_build_pass_pending_the_final_one(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The build pass runs BEFORE ``setup.onInstall``, whose documented window
+        ("after clone/build, before the installed copy is created") is exactly
+        where an app may generate its entry file. Refusing the declared name here
+        would refuse that app before its script ever ran, while a gateway host
+        installs it -- so absence is let through now, nothing pip-installed either
+        way, and the final pass (``final=True``, on the post-script checkout)
+        refuses if the file never appeared: see the end-to-end cases in
+        ``test_apps_registry_desktop_layout.py``.
+        """
+        (tmp_path / "server.py").unlink()  # the fixture's entry file: this case is about its absence
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        # The same absence IS refused by the final pass's strict verdict.
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["data/server.py", "node_modules/server.py"])
+    async def test_an_entry_point_the_install_does_not_carry_over_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter, entry
+    ):
+        """The spawn looks for the entry file in the APP DIRECTORY. `install_app`
+        drops the build-input dirs and an update replaces ``data/`` with the
+        preserved previous one, so an entry file that exists here under either is
+        stale or missing there -- the backend provisioner is no reason to waive,
+        in either pass. The copy itself (the gate judges a real copy)
+        decides; a stdio server beside it, which `bridges_mcp.py` provisions for on
+        its own, still can."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: True)  # an update
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        target = tmp_path / entry
+        target.parent.mkdir(parents=True)
+        target.write_text("", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(entry), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(entry), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+        with_stdio = AppManifest.from_dict(
+            {
+                "name": "demo",
+                "backend": {"entryPoint": entry, "type": "asgi"},
+                "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}},
+            }
+        )
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=with_stdio, self_managed=False
+        )
+        assert result == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_on_a_first_install_an_entry_point_under_data_is_the_source_s_and_waives(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """No preserved `data/` awaits on a first install, so `install_app` leaves the
+        source's `data/server.py` where the spawn will find it: the gate waives it,
+        while `node_modules/server.py`, dropped by the copy on every install, is
+        still refused."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: False)
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        for entry in ("data/server.py", "node_modules/server.py"):
+            target = tmp_path / entry
+            target.parent.mkdir(parents=True)
+            target.write_text("", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend("data/server.py"), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend("data/server.py"), self_managed=False, final=True
+            )
+            == ""
+        )
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend("node_modules/server.py"), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_an_entry_point_linked_into_a_tree_the_install_replaces_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The declared spelling can be clean while the FILE is not: `install_app`
+        keeps an in-tree link as a link, so a ``server.py -> data/server.py``
+        would run the preserved OLD data file after an update. The copy rule is
+        asked about where the entry resolves, not only what it is called."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: True)  # an update
+        (tmp_path / "server.py").unlink()  # the fixture's regular file; here it is a link
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "server.py").write_text("", encoding="utf-8")
+        (tmp_path / "server.py").symlink_to(Path("data") / "server.py")
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_requirements_link_that_climbs_out_and_re_enters_by_name_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The copy keeps a relative link's TEXT verbatim. A text that climbs above
+        the root and re-enters by naming the checkout resolves to an in-tree file
+        HERE and, from the app directory, to the checkout's file -- outside the
+        root the provisioner reads under, so it refuses what the gate waived."""
+        app_root = tmp_path / "app-sources" / "demo"
+        (app_root / "requirements").mkdir(parents=True)
+        (app_root / "requirements" / "prod.txt").write_text("fastapi\n", encoding="utf-8")
+        (app_root / "server.py").write_text("", encoding="utf-8")
+        (app_root / "requirements.txt").symlink_to(
+            Path("..") / ".." / "app-sources" / "demo" / "requirements" / "prod.txt"
+        )
+        assert (app_root / "requirements.txt").is_file()  # in-tree, in the checkout
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            app_root, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                app_root, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_an_entry_point_link_that_climbs_out_and_re_enters_by_name_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Same relocation rule for the declared entry: `server.py ->
+        ../../app-sources/demo/real/server.py` runs here and, in the app
+        directory, points back at the checkout -- outside the spawn's root."""
+        app_root = tmp_path / "app-sources" / "demo"
+        (app_root / "real").mkdir(parents=True)
+        (app_root / "real" / "server.py").write_text("", encoding="utf-8")
+        (app_root / "server.py").symlink_to(
+            Path("..") / ".." / "app-sources" / "demo" / "real" / "server.py"
+        )
+        (app_root / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            app_root, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @requires_symlinks
+    @pytest.mark.parametrize(
+        ("leaf", "waived"),
+        [
+            # A registry `subdirectory` named `app`: `../app/...` is in-tree in the
+            # checkout, whose leaf directory IS `app`, and lands in `apps/app/` --
+            # another app's directory, or nothing -- once installed under
+            # `apps/demo/`. The preview must resolve it the way the app directory
+            # will, not the way a temporary directory named `app` would.
+            pytest.param("app", False, id="re-enters-by-the-subdirectory-name"),
+            # The same shape naming the APP: `../demo/...` is in-tree in the
+            # checkout and in-tree under `apps/demo/` alike, so the runtime reads
+            # it and the gate waives it.
+            pytest.param("demo", True, id="re-enters-by-the-app-name"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_link_that_re_enters_by_the_leaf_name_resolves_as_it_will_in_the_app_dir(
+        self, tmp_path, monkeypatch, bundled_interpreter, leaf, waived
+    ):
+        """The copy keeps a relative link's TEXT verbatim, and a text that climbs one
+        level and re-enters by NAME resolves by the leaf name actually around it.
+        The preview is therefore written under the destination's own leaf name --
+        the manifest's app name, what `app_dir` joins -- so `../<leaf>/...` is
+        judged exactly as the runtime will judge it from `apps/<name>/`."""
+        app_root = tmp_path / "app-sources" / "demo" / leaf
+        (app_root / "requirements").mkdir(parents=True)
+        (app_root / "requirements" / "prod.txt").write_text("fastapi\n", encoding="utf-8")
+        (app_root / "server.py").write_text("", encoding="utf-8")
+        (app_root / "requirements.txt").symlink_to(
+            Path("..") / leaf / "requirements" / "prod.txt"
+        )
+        assert (app_root / "requirements.txt").is_file()  # in-tree, in the checkout
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            app_root, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        final = registry._desktop_build_refusal(
+            app_root, _asgi_backend(), self_managed=False, final=True
+        )
+        if waived:
+            assert result["ok"] is True
+            assert final == ""
+        else:
+            assert result["ok"] is False
+            assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+            assert spawned == []
+            assert final == registry._DESKTOP_BUILD_REFUSAL
+
+    @pytest.mark.asyncio
+    async def test_the_preview_is_written_beside_the_apps_root_under_the_app_s_name(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Where the preview lands is part of the model: under the destination's own
+        leaf name, in a `<name>.partial-<hex>` sibling of the checkout under
+        app-sources -- the filesystem the install writes to (the one the copy's
+        case-folding probe must answer for), and the one name the retention sweep
+        already retires, so a copy an unclean exit leaves behind is collected like
+        any abandoned partial tree -- and gone again once judged."""
+        home = tmp_path / "home"
+        source = home / "app-sources" / "demo"
+        source.mkdir(parents=True)
+        (source / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (source / "server.py").write_text("", encoding="utf-8")
+        monkeypatch.setattr(registry, "_app_sources_dir", lambda: home / "app-sources")
+        seen: list[Path] = []
+        real_copy = registry.copy_app_tree_as_installed
+
+        def _recording_copy(source, dest, **kwargs):
+            seen.append(Path(dest))
+            real_copy(source, dest, **kwargs)
+
+        monkeypatch.setattr(registry, "copy_app_tree_as_installed", _recording_copy)
+        assert (
+            registry._desktop_build_refusal(
+                source, _asgi_backend(), self_managed=False, final=True
+            )
+            == ""
+        )
+        assert len(seen) == 1
+        preview = seen[0]
+        assert preview.name == "demo"
+        assert preview.parent.parent == home / "app-sources"
+        assert preview.parent.name.startswith("demo.partial-")
+        assert registry._is_stale_candidate(preview.parent)
+        assert not preview.parent.exists()
+        assert [p.name for p in (home / "app-sources").iterdir()] == ["demo"]
+
+    async def _judge_a_deep_self_link(self, tmp_path, monkeypatch, depth):
+        """Declare `B -> .` plus ``backend.entryPoint: "B/B/.../B/server.py"`` with
+        *depth* components and put it through the three judgements the install
+        makes of a declared entry -- the runtime's own file check, the build gate
+        and the final gate -- timed together. Returns the runtime's refusal (``""``
+        when it accepts the path), the build result, the final refusal and the
+        elapsed seconds."""
+        from kiro_crew.apps.manifest import file_entry_point_refusal
+
+        (tmp_path / "B").symlink_to(Path("."))
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        deep = "/".join(["B"] * depth) + "/server.py"
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        started = time.monotonic()
+        runtime_refusal = file_entry_point_refusal(deep, tmp_path)
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(deep), self_managed=False
+        )
+        final = registry._desktop_build_refusal(
+            tmp_path, _asgi_backend(deep), self_managed=False, final=True
+        )
+        elapsed = time.monotonic() - started
+        assert spawned == []  # nothing planned either way
+        return runtime_refusal, result, final, elapsed
+
+    @requires_symlinks
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("depth", [30, 60])
+    @pytest.mark.asyncio
+    async def test_a_self_pointing_directory_link_under_a_deep_declared_path_is_judged_in_bounded_time(
+        self, tmp_path, monkeypatch, bundled_interpreter, depth
+    ):
+        """A registry app controls both the tree and the declared path: `B -> .`
+        plus ``backend.entryPoint: "B/B/.../B/server.py"``. The verdict is
+        derived from the install's own copy, which keeps `B` as one link and never
+        walks through it, and from the runtime's own file check, which the
+        kernel resolves in one pass -- so the judgment is linear in the path's
+        components, and on every host it comes back within the bound as one of
+        the verdicts each judge owns, never as an exception or an ordinary
+        install error. The final gate derives its verdict from the runtime's own
+        file check (`_requirements_owned_by_the_runtime` asks
+        `file_entry_point_refusal` of the install's preview copy), so on every
+        host the two agree: what the runtime accepts the final pass waives, what
+        it refuses the final pass refuses. WHICH way a 60-link path goes belongs
+        to the host -- the POSIX symlink budget refuses it (pinned by the
+        sibling below), and on Windows the shared path screen, which reads the
+        link chain hop by hop before anything follows it, refuses a chain past
+        its own hop budget -- so no single verdict is asserted here."""
+        runtime_refusal, result, final, elapsed = await self._judge_a_deep_self_link(
+            tmp_path, monkeypatch, depth
+        )
+        # Each judge answers with a verdict it owns -- never an escape, since the
+        # link points at its own directory, and never an ordinary install error.
+        assert runtime_refusal in (
+            "",
+            "not found",
+            "path resolution failed",
+            "refused by the path screen",
+        ), runtime_refusal
+        assert result["ok"] or result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED, result
+        assert final in ("", registry._DESKTOP_BUILD_REFUSAL)
+        # The final pass says exactly what the runtime's own file check says: the
+        # waiver it grants is the provisioning the runtime would perform, and the
+        # refusal is the entry the spawn would refuse -- whatever the kernel made
+        # of the link.
+        assert (final == "") is (runtime_refusal == ""), (runtime_refusal, final)
+        # The two gate passes differ in one respect only -- the build pass waives an
+        # entry that is merely absent, the final pass refuses it -- so a refusal
+        # from the build pass is always the final pass's desktop refusal.
+        assert result["ok"] or final == registry._DESKTOP_BUILD_REFUSAL, (result, final)
+        assert elapsed < 20, f"the desktop gate took {elapsed:.1f}s on a {depth}-component path"
+
+    @requires_symlinks
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="the symlink budget a deep self-link exhausts is POSIX ELOOP; Windows "
+        "reparse-point resolution has no per-walk budget to pin",
+    )
+    @pytest.mark.timeout(60)
+    @pytest.mark.parametrize("depth", [30, 60])
+    @pytest.mark.asyncio
+    async def test_the_desktop_gate_says_what_the_spawn_meets_at_the_kernel_symlink_budget(
+        self, tmp_path, monkeypatch, bundled_interpreter, depth
+    ):
+        """A POSIX kernel budgets the links one resolution may follow (40 on
+        Linux, 32 on macOS): 30 links through `B -> .` resolve to the root's
+        `server.py` (waived) and 60 exceed the budget (refused here, loudly,
+        instead of failing at spawn). Both gate passes say exactly what the
+        runtime's own file check says, because a budget the kernel refuses is a
+        layout no script window lifts, not an absent file the build pass waives."""
+        runtime_refusal, result, final, _ = await self._judge_a_deep_self_link(
+            tmp_path, monkeypatch, depth
+        )
+        runtime_accepts = runtime_refusal == ""
+        assert runtime_accepts is (depth == 30), runtime_refusal
+        assert result["ok"] is runtime_accepts, result
+        assert (final == "") is runtime_accepts
+
+    @pytest.mark.asyncio
+    async def test_a_preview_copy_the_install_copy_cannot_produce_is_an_ordinary_error(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The verdict is derived from the install's own copy of the checkout. When
+        that copy itself fails (disk full, a permission), the install would fail on
+        the very same call -- so the gate raises an ordinary error naming the cause,
+        never the permanent refusal: the UI keeps Try again, and the app's author is
+        not told to fix a layout that is fine."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+
+        def _copy_fails(source, dest, **kwargs):
+            raise OSError(28, "No space left on device", str(dest))
+
+        monkeypatch.setattr(registry, "copy_app_tree_as_installed", _copy_fails)
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        with pytest.raises(RuntimeError, match="could not preview the installed tree"):
+            await registry._run_app_build(
+                tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+            )
+        assert spawned == []
+        with pytest.raises(RuntimeError, match="No space left on device"):
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_root_data_file_is_refused_by_the_preview_with_the_install_s_own_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A first-install preview kept the source's root `data` whatever it was, so
+        a registry app shipping a FILE of that name passed the waiver; `install_app`
+        then wrote its record and raised at `app_data_dir()`, leaving a partial
+        installed record. The preview now asks the install's own question of the
+        copy and raises the install's own refusal -- in both passes, without the
+        desktop code (a browser install refuses it too) -- and the holder is gone.
+        An UPDATE puts the preserved directory back over the file: nothing to refuse."""
+        from kiro_crew.apps.manager import InstalledTreeRefused
+
+        home = tmp_path / "home"
+        source = home / "app-sources" / "demo"
+        source.mkdir(parents=True)
+        (source / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (source / "server.py").write_text("", encoding="utf-8")
+        (source / "data").write_text("a file\n", encoding="utf-8")
+        monkeypatch.setattr(registry, "_app_sources_dir", lambda: home / "app-sources")
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: False)
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        log: list[str] = []
+        result = await registry._run_app_build(
+            source, "demo", log, manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["error"] == _DATA_IS_A_FILE, result
+        assert "code" not in result  # not the desktop code: a browser install refuses it too
+        assert log == [f"Refusing install: {result['error']}"]
+        assert spawned == []
+        assert [p.name for p in (home / "app-sources").iterdir()] == ["demo"]
+        # The bare gate raises the install's own refusal; the final pass's caller
+        # converts it the same way (see test_apps_registry_desktop_layout.py, end to end).
+        with pytest.raises(InstalledTreeRefused, match=re.escape(_DATA_IS_A_FILE)):
+            registry._desktop_build_refusal(
+                source, _asgi_backend(), self_managed=False, final=True
+            )
+        assert [p.name for p in (home / "app-sources").iterdir()] == ["demo"]
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: True)
+        assert (
+            registry._desktop_build_refusal(
+                source, _asgi_backend(), self_managed=False, final=True
+            )
+            == ""
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_entry_point_under_a_case_variant_of_the_data_dir_is_judged_as_the_host_would(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """On a case-folding filesystem `Data/` IS the gateway's `data`, replaced on
+        update by the preserved previous one, so `Data/server.py` would run stale
+        code there and is refused; on a case-sensitive one (a Linux desktop) it is
+        the app's own directory, carried as itself, and is waived. The preview
+        removes by the install's own direct path, so the filesystem it stands on
+        decides -- checked here against a direct look at this host."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: True)  # an update
+        (tmp_path / "Data").mkdir()
+        (tmp_path / "Data" / "server.py").write_text("", encoding="utf-8")
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        folds = (tmp_path / "DATA").is_dir()  # the host's own answer for the same name
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend("Data/server.py"), self_managed=False
+        )
+        assert result["ok"] is (not folds), (folds, result)
+        if folds:
+            assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_requirements_link_to_a_file_the_copy_drops_by_name_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The copy's ``ignore`` callback drops by NAME, whatever the entry's type:
+        a regular file called ``node_modules`` is dropped like the directory would
+        be. So ``requirements.txt -> node_modules`` resolves to a real in-tree file
+        here and dangles in the app directory, where the provisioner reads it. The
+        copy rule is asked about every component of the target, the leaf included."""
+        (tmp_path / "node_modules").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "requirements.txt").symlink_to(Path("node_modules"))
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["node_modules", ".venv"])
+    async def test_an_entry_point_named_like_a_dropped_entry_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter, entry
+    ):
+        """A declared entry FILE whose own name is one the copy drops (``node_modules``,
+        ``.venv`` -- files, not directories, and not module-style since the file
+        exists) is a real regular file the spawn would run here and nothing in the
+        app directory: the leaf is judged like every other component, and only a
+        stdio server beside it can still waive."""
+        (tmp_path / entry).write_text("", encoding="utf-8")
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(entry), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(entry), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_requirements_txt_that_is_a_directory_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """A directory named ``requirements.txt`` beside a consumer: present, so the
+        build's detection sees a build file, and nothing the provisioner can read
+        (``requirements_in_tree`` is ``None`` for a non-file) -- refused in both
+        passes, never waived as "the runtime will install it"."""
+        (tmp_path / "requirements.txt").mkdir()
+        (tmp_path / "requirements.txt" / "prod.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_entry_point_that_is_a_directory_keeps_the_refusal_in_both_passes(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The build pass defers only ABSENCE -- the ``onInstall`` window is where a
+        file may appear. A directory standing at the entry path is not absent, and
+        no script window turns it into the regular file the spawn requires, so
+        the refusal stands in the build pass as in the final one."""
+        (tmp_path / "server.py").unlink()  # the fixture's regular file; here a directory
+        (tmp_path / "server.py").mkdir()
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_an_entry_point_link_escaping_the_app_root_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """An entry that resolves outside the app root is one the spawn refuses
+        ("escapes app root") before it provisions anything, on every host -- so the
+        backend provisioner never runs for it, and no script window changes where
+        the link points. Refused in both passes."""
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "server.py").write_text("", encoding="utf-8")
+        app_root = tmp_path / "app"
+        app_root.mkdir()
+        (app_root / "server.py").symlink_to(outside / "server.py")
+        (app_root / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            app_root, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                app_root, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    async def test_a_dangling_entry_point_link_defers_to_the_final_pass(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The one non-absent shape the build pass still defers: a link whose
+        target is not there YET (``server.py -> generated/server.py``, the script's
+        to produce). Like a dangling requirements link, it passes the build pass
+        and is refused by the final one if the target never appeared."""
+        (tmp_path / "server.py").unlink()  # the fixture's regular file; here a dangling link
+        (tmp_path / "server.py").symlink_to(Path("generated") / "server.py")
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @requires_symlinks
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("owned", ["data", ".app_secret"])
+    async def test_a_requirements_link_to_a_root_entry_the_gateway_owns_keeps_the_refusal(
+        self, tmp_path, monkeypatch, bundled_interpreter, owned
+    ):
+        """Three owners meet in the installed directory: the INSTALLER copies the
+        source tree, the RUNTIME provisions its artifacts afterwards, and the
+        GATEWAY writes a few root entries of its own -- ``data``, which an update
+        replaces with the preserved previous directory (and a source FILE so
+        named fails ``app_data_dir`` before an install completes), and
+        ``.app_secret``, written after the copy and preserved over it. A
+        ``requirements.txt`` linked at one of those resolves to a real file HERE
+        and to the gateway's own entry, or to nothing, in the app directory, where
+        the provisioner reads it -- so the copy rule answers "not carried" and the
+        gate refuses instead of waiving an install whose provisioning then fails.
+        ``data`` is the gateway's once a preserved directory awaits (an update);
+        ``.app_secret`` on every install."""
+        monkeypatch.setattr(registry, "preserved_data_awaits", lambda name: True)
+        (tmp_path / owned).write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "requirements.txt").symlink_to(Path(owned))
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result["ok"] is False
+        assert result["code"] == registry.DESKTOP_BUILD_STEP_UNSUPPORTED
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(
+                tmp_path, _asgi_backend(), self_managed=False, final=True
+            )
+            == registry._DESKTOP_BUILD_REFUSAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_runtime_provisioned_artifacts_are_neither_required_nor_examined(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The runtime's own leaves -- the provisioned deps tree, the install
+        metadata -- are provisioned AFTER the install and never copied by it, so
+        the gate neither requires them (their absence is the normal state of a
+        fresh checkout) nor judges them when a stale one is present: the waiver
+        is about the installer-copied ``requirements.txt`` and the runtime's
+        promise to read it, nothing else. Both shapes pass in both passes."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        # A stale provisioned tree and a source-shipped metadata file: dropped by
+        # the copy, replaced by the runtime, and not the gate's to refuse over.
+        (tmp_path / ".kirocrew-deps").mkdir()
+        (tmp_path / ".kirocrew-deps" / "fastapi.dist-info").mkdir()
+        (tmp_path / "installed.json").write_text("{}", encoding="utf-8")
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+        assert (
+            registry._desktop_build_refusal(tmp_path, _asgi_backend(), self_managed=False, final=True)
+            == ""
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stdio_server_still_waives_beside_an_entry_the_spawn_would_refuse(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """bridges_mcp.py provisions at registration for a stdio server whenever the
+        entry point is absent or file-style, with no existence requirement of its
+        own -- the server is the consumer it provisions for -- so the file is
+        installed and read even though the backend spawn would refuse."""
+        (tmp_path / "server.py").unlink()
+        (tmp_path / "requirements.txt").write_text("mcp\n", encoding="utf-8")
+        manifest = AppManifest.from_dict(
+            {
+                "name": "demo",
+                "backend": {"entryPoint": "server.py", "type": "asgi"},
+                "mcpServers": {"tool": {"command": "python3", "args": ["srv.py"]}},
+            }
+        )
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=manifest, self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_a_dotted_entry_point_that_names_a_file_is_file_style(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """The shape test is the spawn's own: a file with the literal dotted name
+        under the app root makes the entry a FILE, which the spawn provisions."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        (tmp_path / "server.main").write_text("", encoding="utf-8")
+        log: list[str] = []
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", log, manifest=_asgi_backend("server.main"), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == []
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_carries_its_machine_code(
+        self, tmp_path, monkeypatch, bundled_interpreter
+    ):
+        """Every desktop refusal names its condition by code, beside the sentence.
+
+        The dashboard's consent modal keys its plain-language copy on the code
+        (the condition is permanent for this gateway, so the retry instruction is
+        dropped), and a client is meant to act on a code rather than regex-match
+        prose. Pinned on both refusal layouts so neither can lose it.
+        """
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        no_consumer = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=AppManifest.from_dict({"name": "demo"}), self_managed=False
+        )
+        assert no_consumer["code"] == "desktop_build_step_unsupported"
+        (tmp_path / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        gateway_import = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert gateway_import["code"] == "desktop_build_step_unsupported"
+        assert gateway_import["error"] == no_consumer["error"]
+
+    @pytest.mark.asyncio
+    async def test_a_source_install_still_pip_installs_the_requirements(
+        self, tmp_path, monkeypatch, pip_importable
+    ):
+        """The gate change is scoped to the BUNDLED interpreter: an ordinary
+        source install keeps installing requirements.txt at install time, so a
+        hooks-only app on a normal host is unaffected."""
+        (tmp_path / "requirements.txt").write_text("fastapi\n", encoding="utf-8")
+        spawned = _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
+        result = await registry._run_app_build(
+            tmp_path, "demo", [], manifest=_asgi_backend(), self_managed=False
+        )
+        assert result == {"ok": True}
+        assert spawned == [[sys.executable, "-s", "-m", "pip", "install", "-r", "requirements.txt"]]
 
     @pytest.mark.asyncio
     async def test_build_output_is_streamed_into_the_log(self, tmp_path, monkeypatch):
@@ -2288,7 +1530,7 @@ class TestRunAppBuild:
             [_FakeProc(returncode=0, stdout_lines=[b"added 1 package\n", b"done\n"])],
         )
         log: list[str] = []
-        await registry._run_app_build(tmp_path, "demo", log)
+        await registry._run_app_build(tmp_path, "demo", log, manifest=AppManifest.from_dict({}), self_managed=False)
         assert "added 1 package" in log and "done" in log
 
     @pytest.mark.asyncio
@@ -2296,7 +1538,7 @@ class TestRunAppBuild:
         (tmp_path / "package.json").write_text("{}", encoding="utf-8")
         monkeypatch.setattr(registry.shutil, "which", lambda name: "/usr/bin/npm")
         _fake_sandbox(monkeypatch, [_FakeProc(returncode=7)])
-        result = await registry._run_app_build(tmp_path, "demo", [])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
         assert result["ok"] is False
         assert result["name"] == "demo"
         assert "build failed (exit 7)" in result["error"]
@@ -2319,471 +1561,7 @@ class TestRunAppBuild:
             killed.append(proc.pid)
 
         monkeypatch.setattr(registry, "_kill_process_group", _kill)
-        result = await registry._run_app_build(tmp_path, "demo", [])
+        result = await registry._run_app_build(tmp_path, "demo", [], manifest=AppManifest.from_dict({}), self_managed=False)
         assert result["ok"] is False
         assert "build timed out" in result["error"]
         assert killed == [31337]
-
-
-# ---------------------------------------------------------------------------
-# Post-rejection un-poison
-# ---------------------------------------------------------------------------
-
-
-class TestUnpoisonRejectedCheckout:
-    @pytest.mark.asyncio
-    async def test_fresh_checkout_is_deleted_without_residue(self, tmp_path):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-        (pkg / "app.json").write_text("{}", encoding="utf-8")
-        log: list[str] = []
-        await registry._unpoison_rejected_checkout(
-            "demo", pkg, log, checkout_preexisted=False, pre_pull_commit=""
-        )
-        assert not pkg.exists()
-
-    @pytest.mark.asyncio
-    async def test_previous_checkout_is_restored_into_the_slot(self, tmp_path):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-        stale = tmp_path / "demo.stale-0123abcd"
-        stale.mkdir()
-        (stale / "mine.txt").write_text("local edit", encoding="utf-8")
-        log: list[str] = []
-        await registry._unpoison_rejected_checkout(
-            "demo",
-            pkg,
-            log,
-            checkout_preexisted=False,
-            pre_pull_commit="",
-            restore_from=stale,
-        )
-        assert (pkg / "mine.txt").read_text(encoding="utf-8") == "local edit"
-        assert any("Restored the previous checkout" in line for line in log)
-
-    @pytest.mark.asyncio
-    async def test_failed_restore_tells_the_user_where_the_files_are(
-        self, tmp_path, monkeypatch
-    ):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-        stale = tmp_path / "demo.stale-0123abcd"
-        stale.mkdir()
-
-        def _boom(self, target):
-            raise OSError("locked")
-
-        monkeypatch.setattr(Path, "rename", _boom)
-        log: list[str] = []
-        await registry._unpoison_rejected_checkout(
-            "demo",
-            pkg,
-            log,
-            checkout_preexisted=False,
-            pre_pull_commit="",
-            restore_from=stale,
-        )
-        assert any("retained there for manual recovery" in line for line in log)
-
-    @pytest.mark.asyncio
-    async def test_preexisting_checkout_is_rolled_back_to_its_pre_pull_commit(
-        self, tmp_path, monkeypatch
-    ):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-        spawned = _fake_sandbox(
-            monkeypatch, [_FakeProc(returncode=0), _FakeProc(returncode=0)]
-        )
-        log: list[str] = []
-        await registry._unpoison_rejected_checkout(
-            "demo", pkg, log, checkout_preexisted=True, pre_pull_commit="b" * 40
-        )
-        assert spawned[0] == ["git", "reset", "--keep", "b" * 40]
-        assert spawned[1] == ["git", "--literal-pathspecs", "checkout", "--", "app.json"]
-        assert pkg.is_dir()  # the workspace is preserved
-        assert any("Rolled checkout back to pre-update commit" in line for line in log)
-
-    @pytest.mark.asyncio
-    async def test_failed_rollback_and_restore_both_warn(self, tmp_path, monkeypatch):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=1), _FakeProc(returncode=1)])
-        log: list[str] = []
-        await registry._unpoison_rejected_checkout(
-            "demo", pkg, log, checkout_preexisted=True, pre_pull_commit="c" * 40
-        )
-        assert any("could not roll the checkout back" in line for line in log)
-        assert any("could not restore app.json" in line for line in log)
-
-    @pytest.mark.asyncio
-    async def test_manifest_snapshot_restores_exact_pre_update_bytes(
-        self, tmp_path, monkeypatch
-    ):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-        (pkg / "app.json").write_text('{"name": "evil"}', encoding="utf-8")
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        log: list[str] = []
-        await registry._unpoison_rejected_checkout(
-            "demo",
-            pkg,
-            log,
-            checkout_preexisted=True,
-            pre_pull_commit="",
-            manifest_snapshot=b'{"name": "demo"}',
-        )
-        assert (pkg / "app.json").read_bytes() == b'{"name": "demo"}'
-        assert any("exact pre-update contents" in line for line in log)
-
-    @pytest.mark.asyncio
-    async def test_a_sandbox_failure_never_masks_the_refusal(self, tmp_path, monkeypatch):
-        pkg = tmp_path / "demo"
-        pkg.mkdir()
-
-        def _boom(cmd, mode=""):
-            raise RuntimeError("sandbox unavailable")
-
-        monkeypatch.setattr(registry, "wrap_argv", _boom)
-        await registry._unpoison_rejected_checkout(
-            "demo", pkg, [], checkout_preexisted=True, pre_pull_commit="d" * 40
-        )  # must not raise
-
-    @pytest.mark.asyncio
-    async def test_custom_manifest_relpath_is_used(self, tmp_path, monkeypatch):
-        pkg = tmp_path / "demo"
-        (pkg / "sub").mkdir(parents=True)
-        _fake_sandbox(monkeypatch, [_FakeProc(returncode=0)])
-        await registry._unpoison_rejected_checkout(
-            "demo",
-            pkg,
-            [],
-            checkout_preexisted=True,
-            pre_pull_commit="",
-            manifest_relpath="sub/app.json",
-            manifest_snapshot=b"{}",
-        )
-        assert (pkg / "sub" / "app.json").read_bytes() == b"{}"
-
-
-# ---------------------------------------------------------------------------
-# install_from_registry — pre-clone refusals
-# ---------------------------------------------------------------------------
-
-
-class TestInstallFromRegistryRefusals:
-    @pytest.fixture(autouse=True)
-    def _no_side_effects(self, monkeypatch, tmp_path):
-        """Every test here must return before any clone/build/registration.
-
-        ``app-sources`` is redirected at *tmp_path* as a belt-and-braces guard:
-        the refusals all return before the stale-checkout sweep, and this makes
-        a future regression fail loudly in the sandbox instead of quietly
-        touching the real Kiro Crew home.
-        """
-        monkeypatch.setattr(registry, "sel", lambda: MagicMock())
-        monkeypatch.setattr(registry, "_app_sources_dir", lambda: tmp_path / "app-sources")
-
-        async def _never_clone(*a, **k):
-            raise AssertionError("install must refuse before cloning")
-
-        monkeypatch.setattr(registry, "_clone_build_app", _never_clone)
-
-    @pytest.mark.asyncio
-    async def test_provenance_mismatch_is_refused_and_audited(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_resolve_install_entry", lambda name: (None, "pinned elsewhere")
-        )
-        result = await registry.install_from_registry("demo")
-        assert result == {"ok": False, "name": "demo", "error": "pinned elsewhere"}
-
-    @pytest.mark.asyncio
-    async def test_audit_failure_does_not_mask_the_refusal(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_resolve_install_entry", lambda name: (None, "pinned elsewhere")
-        )
-        broken = MagicMock()
-        broken.log_api_access.side_effect = RuntimeError("sel down")
-        monkeypatch.setattr(registry, "sel", lambda: broken)
-        result = await registry.install_from_registry("demo")
-        assert result["error"] == "pinned elsewhere"
-
-    @pytest.mark.asyncio
-    async def test_unknown_app_is_reported_as_not_found(self, monkeypatch):
-        monkeypatch.setattr(registry, "_resolve_install_entry", lambda name: (None, ""))
-        result = await registry.install_from_registry("demo")
-        assert result == {"ok": False, "error": "app 'demo' not found in registry"}
-
-    @pytest.mark.asyncio
-    async def test_entry_without_a_git_url_is_refused(self, monkeypatch):
-        monkeypatch.setattr(
-            registry, "_resolve_install_entry", lambda name: ({"name": "demo"}, "")
-        )
-        result = await registry.install_from_registry("demo")
-        assert result == {"ok": False, "error": "app 'demo' has no git URL configured"}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("git_url", "reason"),
-        [
-            (
-                "https://example.test/owner/repo.git?repo=A&access_token=secret-a",
-                "query",
-            ),
-            (
-                "https://example.test/owner/repo.git?repo=B&access_token=secret-b",
-                "query",
-            ),
-            ("ssh://deploy@example.test/owner/repo.git#private-ref", "query"),
-            (
-                "deploy:password@example.invalid:owner/repo.git",
-                "ambiguous Git transport",
-            ),
-            (
-                "ssh://deploy:password@example.invalid/owner/repo.git",
-                "ambiguous Git transport",
-            ),
-        ],
-    )
-    async def test_unsupported_clone_target_refuses_before_trust_or_fetch(
-        self, monkeypatch, git_url, reason
-    ):
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": name, "gitUrl": git_url}, ""),
-        )
-
-        async def _never_fetch(*args, **kwargs):
-            raise AssertionError("unsupported clone target must fail before fetch")
-
-        def _never_check_trust(*args, **kwargs):
-            raise AssertionError("unsupported clone target must fail before trust")
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _never_fetch)
-        monkeypatch.setattr(
-            registry, "repository_bound_grant_denied", _never_check_trust
-        )
-        result = await registry.install_from_registry("demo")
-
-        assert result["ok"] is False
-        assert result["code"] == "invalid_registry_source"
-        assert reason in result["error"]
-        assert "secret" not in result["error"]
-        assert git_url not in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_trust_repository_mismatch_refuses_before_fetch_or_clone(
-        self, monkeypatch
-    ):
-        granted = "https://User:GrantedSecret@example.test/owner/consented.git"
-        resolved = "https://User:ResolvedSecret@example.test/owner/rebound.git"
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": "demo", "gitUrl": resolved}, ""),
-        )
-        monkeypatch.setattr(registry, "trusted_app_repository", lambda name: granted)
-        monkeypatch.setattr(
-            registry,
-            "repository_bound_grant_denied",
-            lambda name, **kwargs: (
-                "execution trust does not match the current registry source; "
-                "revoke the existing grant and grant it again"
-            ),
-        )
-        audit = MagicMock()
-        monkeypatch.setattr(registry, "sel", lambda: audit)
-
-        result = await registry.install_from_registry("demo")
-
-        assert result["ok"] is False
-        assert result["code"] == "app_trust_repository_mismatch"
-        # Clone coordinates are comparison inputs, not API/log data: they may
-        # contain embedded credentials and must not be reflected on refusal.
-        assert granted not in result["error"]
-        assert resolved not in result["error"]
-        assert "GrantedSecret" not in result["error"]
-        assert "ResolvedSecret" not in result["error"]
-        assert "grant it again" in result["error"]
-        audit.log_api_access.assert_called_once_with(
-            caller="app_install_from_registry",
-            operation="trust_repository_mismatch",
-            outcome="rejected",
-            resources="name='demo'",
-            error=result["error"],
-        )
-
-    @pytest.mark.asyncio
-    async def test_legacy_name_grant_refuses_before_manifest_fetch_or_clone(
-        self, tmp_path, monkeypatch
-    ):
-        from kiro_crew.config.loader import _invalidate_config_cache
-
-        home = tmp_path / "home"
-        home.mkdir()
-        monkeypatch.setenv("KIROCREW_HOME", str(home))
-        (home / "config.json").write_text(
-            json.dumps({"agent": {"apps_trusted": ["demo"]}}),
-            encoding="utf-8",
-        )
-        _invalidate_config_cache()
-        secret = "ResolvedSecret"
-        resolved = f"https://User:{secret}@example.test/owner/rebound.git"
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": "demo", "gitUrl": resolved}, ""),
-        )
-
-        async def _never_fetch(*args, **kwargs):
-            raise AssertionError("legacy trust must refuse before manifest fetch")
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _never_fetch)
-        audit = MagicMock()
-        monkeypatch.setattr(registry, "sel", lambda: audit)
-
-        result = await registry.install_from_registry("demo")
-
-        assert result["ok"] is False
-        assert result["code"] == "app_execution_denied"
-        assert "predates repository binding" in result["error"]
-        assert secret not in result["error"]
-        assert resolved not in result["error"]
-        audit.log_api_access.assert_called_once_with(
-            caller="app_install_from_registry",
-            operation="trust_repository_binding_required",
-            outcome="rejected",
-            resources="name='demo'",
-            error=result["error"],
-        )
-        assert secret not in str(audit.log_api_access.call_args)
-
-    @pytest.mark.asyncio
-    async def test_admission_denial_stops_before_the_clone(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": "demo", "gitUrl": "https://github.com/o/demo.git"}, ""),
-        )
-
-        async def _manifest(*a, **k):
-            return {"name": "demo"}
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
-        monkeypatch.setattr(registry, "get_app", lambda name: None)
-        monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": "banned"
-        )
-        result = await registry.install_from_registry("demo")
-        assert result["ok"] is False
-        assert "blocked by admission policy: banned" in result["error"]
-
-    @pytest.mark.asyncio
-    async def test_client_only_app_asks_for_a_local_install(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": "demo", "gitUrl": "https://github.com/o/demo.git"}, ""),
-        )
-
-        async def _manifest(*a, **k):
-            # A platform this host is not: "haiku" is never sys.platform.
-            return {
-                "name": "demo",
-                "platform": {
-                    "os": ["haiku"],
-                    "installMode": "client",
-                    "clientInstall": {"cmd": "brew install demo"},
-                },
-            }
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
-        monkeypatch.setattr(registry, "get_app", lambda name: None)
-        monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": None
-        )
-        result = await registry.install_from_registry("demo")
-        assert result["needsClientInstall"] is True
-        assert result["clientInstall"] == {"cmd": "brew install demo"}
-        assert result["platform"]["required"] == ["haiku"]
-
-    @pytest.mark.asyncio
-    async def test_min_version_gate_refuses_an_old_gateway(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": "demo", "gitUrl": "https://github.com/o/demo.git"}, ""),
-        )
-
-        async def _manifest(*a, **k):
-            return {"name": "demo", "minKiroCrewVersion": "999.0.0"}
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
-        monkeypatch.setattr(registry, "get_app", lambda name: None)
-        monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": None
-        )
-        monkeypatch.setattr(
-            "kiro_crew.apps.version.check_min_version", lambda mv: "needs 999.0.0"
-        )
-        result = await registry.install_from_registry("demo")
-        assert result == {"ok": False, "name": "demo", "error": "needs 999.0.0"}
-
-    @pytest.mark.asyncio
-    async def test_execution_denial_carries_the_consent_error_code(self, monkeypatch):
-        monkeypatch.setattr(
-            registry,
-            "_resolve_install_entry",
-            lambda name: ({"name": "demo", "gitUrl": "https://github.com/o/demo.git"}, ""),
-        )
-
-        async def _manifest(*a, **k):
-            return {"name": "demo"}
-
-        monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
-        monkeypatch.setattr(registry, "get_app", lambda name: None)
-        monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": None
-        )
-        monkeypatch.setattr(
-            registry,
-            "app_execution_denied",
-            lambda name, action="", caller="", repository=None: "needs a trust grant",
-        )
-        result = await registry.install_from_registry("demo")
-        assert result["ok"] is False
-        assert result["code"] == "app_execution_denied"
-        assert "needs a trust grant" in result["error"]
-
-
-class TestForkUxRemovalsSurviveAnUpstreamSync:
-    """The two builtin-app removals this fork ships, pinned so a sync cannot undo them.
-
-    Both are deliberate fork divergences recorded in ``.fork-sync.yml`` under
-    ``divergences/fork-ux-removals``, and both were carried for several syncs with
-    NOTHING asserting them — an upstream merge that restored either would have gone
-    green and shipped an app the fork removed on purpose. Recording a divergence in
-    prose does not defend it; only an assertion does.
-
-    Deliberately read from the packaged tree rather than through ``registry``: what
-    ships is what is on disk, and the App Store grid reads ``hidden`` straight out of
-    the manifest.
-    """
-
-    def _builtins_dir(self) -> Path:
-        import kiro_crew
-
-        return Path(kiro_crew.__file__).parent / "apps" / "builtins"
-
-    def test_the_board_app_stays_removed(self) -> None:
-        assert not (self._builtins_dir() / "board").exists(), (
-            "the Board app is a deliberate fork removal; an upstream sync restored it"
-        )
-
-    def test_channels_stays_hidden_from_the_app_store(self) -> None:
-        manifest = self._builtins_dir() / "channels" / "app.json"
-        assert manifest.is_file(), "the Channels app manifest is missing"
-        assert json.loads(manifest.read_text(encoding="utf-8")).get("hidden") is True, (
-            "Channels is hidden from the App Store grid in this fork; "
-            "an upstream sync un-hid it"
-        )

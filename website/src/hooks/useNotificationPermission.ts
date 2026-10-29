@@ -13,11 +13,20 @@
  * by most browsers and by all of them once the user has dismissed the prompt.
  */
 import { useCallback, useEffect, useState } from 'react'
+import { relayTargetOrigin } from '../lib/nativeNotify'
 
 export type NotificationPermissionState = 'unsupported' | 'default' | 'granted' | 'denied'
 
+/**
+ * `unsupported` also covers an embedded instance pane whose banners are posted
+ * by the hub window (`lib/nativeNotify.ts`): this frame's own verdict is
+ * `denied` by design and is not the user's switch -- the hub's Settings row
+ * is -- so the pane shows no permission row or hint that would contradict the
+ * banners it relays, and offers no `request()` that could never succeed.
+ */
 export function readNotificationPermission(): NotificationPermissionState {
   if (typeof Notification === 'undefined') return 'unsupported'
+  if (relayTargetOrigin() !== null) return 'unsupported'
   const p = Notification.permission
   return p === 'granted' || p === 'denied' ? p : 'default'
 }

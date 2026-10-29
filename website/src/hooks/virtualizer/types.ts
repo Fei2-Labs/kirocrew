@@ -45,6 +45,9 @@ export interface UseVirtualChatOptions<T> {
    * detection stay on the pure sessionId.
    */
   heightScopeKey?: string
+  /** Whether live layout matches the height scope. Checked at every measurement
+   * write (observer, ref seed, farm); a changed callback remeasures mounted rows. */
+  canMeasure?: () => boolean
   /** Items to mount above and below the visible viewport. Default: 5. */
   overscan?: number
   /** Session ID — partitions the persisted height cache. */
@@ -176,6 +179,13 @@ export interface ScrollToIndexOptions {
   behavior?: ScrollBehavior
 }
 
+/** Inclusive-start, exclusive-end item range retained while native selection
+ * handles cross a virtualized transcript. */
+export interface RetainedVirtualRange {
+  start: number
+  end: number
+}
+
 export interface UseVirtualChatReturn<T> {
   /** True when row `index` has a real (render-based) measurement cached. */
   farmIsMeasured: (index: number) => boolean
@@ -196,6 +206,11 @@ export interface UseVirtualChatReturn<T> {
   topSentinelRef: React.RefObject<HTMLDivElement>
   /** Bottom sentinel — attach for downward expansion detection. */
   bottomSentinelRef: React.RefObject<HTMLDivElement>
+  /** Trailing chrome — attach to the wrapper around content rendered BELOW the
+   *  rows inside the scroller (a working footer, a survey card). The resize
+   *  observer watches it so growth there is followed like tail growth; it is
+   *  not a row and never enters the height cache. */
+  trailingRef: React.RefObject<HTMLDivElement>
   /** Items to render — both mounted React components and placeholder rows. */
   virtualItems: VirtualItem<T>[]
   /** Pixel offset of the first virtual item (top spacer height). */
@@ -229,6 +244,10 @@ export interface UseVirtualChatReturn<T> {
    * frame while steering toward an unmounted row. `null` with no scroller or
    * no items. */
   estimateRowTop: (index: number) => number | null
+  /** Keep every item in `range` mounted until the caller clears it. This is
+   * for a native text selection whose endpoints would otherwise be unmounted
+   * while the user scrolls a selection handle. */
+  retainRange: (range: RetainedVirtualRange | null) => void
   /** Ref callback used per-item to register ResizeObserver measurement. */
   measureRef: (index: number) => (el: HTMLElement | null) => void
   /** True while an anchored entry is still waiting for its row to hydrate, so a

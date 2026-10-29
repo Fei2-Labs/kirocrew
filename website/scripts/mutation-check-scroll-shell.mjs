@@ -38,11 +38,11 @@ const parses = (src) => {
 
 // The shell region may live in ChatPage or, post-extraction, in the shell
 // component; mutate whichever file currently holds each region's anchors.
-const FILES = ['src/pages/ChatPage.tsx', 'src/pages/chat/TranscriptScrollShell.tsx'].map(f => resolve(f))
+const FILES = ['src/pages/ChatPage.tsx', 'src/pages/chat/page/ChatTranscriptView.tsx', 'src/pages/chat/page/ChatTitleOverlay.tsx', 'src/pages/chat/page/ComposerDockView.tsx', 'src/pages/chat/TranscriptScrollShell.tsx'].map(f => resolve(f))
 const SUITES = [
   'src/test/ChatPage.scrollShell.recipe.test.tsx',
   'src/test/ChatPage.scrollShell.render.test.tsx',
-  'src/test/ChatPage.fadeClearance.test.tsx',
+  'src/test/ChatPage.dockClearance.test.tsx',
 ]
 
 const START = '{/* Header fade'
@@ -57,7 +57,7 @@ const REGIONS = [
   { name: 'header-fade', start: '<EdgeFade side="top"', end: '{/* Fold sentinel' },
   // The shell IMPORT on the page — one line, but deleting it is precisely the
   // "extraction silently undone" mutation, so it gets its own region.
-  { name: 'shell-import', start: "import TranscriptScrollShell", end: 'import { useVirtualChat' },
+  { name: 'shell-import', start: "import TranscriptScrollShell", end: 'import TurnNavigationMinimap' },
   // The prop-plumbing seam the split invented: the wiring interface, the
   // component signature, and the destructured parameter list. This block did
   // not exist pre-extraction — anchoring the skeleton region below it would
@@ -78,7 +78,10 @@ const REGIONS = [
   // boundary: the message-row body was NOT moved by the extraction and stays
   // pinned by the row-wrapper recipe tests and the page's own suites.
   { name: 'call-site-slots', start: 'aboveRows={', end: '{/* Message items' },
-  { name: 'bottom-mask', start: '{/* Transcript bottom mask', end: '<div className="relative">' },
+  // The floating dock root: the box `dockRef` measures for the scroller's
+  // bottom padding and the `right: dockGutter` inset that keeps the scrollbar
+  // column clear. Replaces the bottom-mask region the dock layout removed.
+  { name: 'dock-root', start: '{/* Composer dock', end: '<JumpToBottomButton' },
   { name: 'jump-pill', start: '<JumpToBottomButton', end: '{/* Status chrome' },
 ]
 

@@ -19,6 +19,21 @@ _MAX_EPISODIC_PER_CONSOLIDATION = 10
 # lessons array could occupy a worker thread for minutes.
 _MAX_LESSONS_PER_CONSOLIDATION = 10
 
+# Characters the ``## Current Semantic Memory`` block of ONE consolidation prompt
+# may hold. The block hands the model the active semantic table so it updates
+# or deletes the keys it already holds instead of minting near-duplicates, and
+# the table only grows: one long-lived store measured 1,977 active rows
+# rendering to about 2 million characters, 97% of the prompt, until a pass
+# failed as too large to send. The chat path reads the same table under
+# ``semantic_cap`` (12,000 characters per turn); consolidation runs rarely (a
+# 30-message threshold or a 3-hour idle) and reads the table as the context it
+# merges INTO, so its allowance is wider: 64 KiB, a few times the per-turn cap
+# and the scale of the transcript span beside it, which keeps the whole prompt
+# in the low hundreds of thousands of characters on a store of any size. At the
+# measured median row (856-character values) the cap keeps about 70 of the most
+# recently updated rows; a table that fits renders exactly as before.
+_SEMANTIC_PROMPT_CAP_PER_CONSOLIDATION = 65_536
+
 # Ceiling on episodic rows ONE semantic write may retire, and the reason it needs a
 # ceiling at all. `_retire_stale_episodic` tombstones episodes that reference a value
 # the semantic store just superseded, and consolidation rewrites the same keys every
@@ -41,7 +56,6 @@ _MAX_EPISODIC_RETIRED_PER_WRITE = 3
 _INJECTION_PATTERNS = [
     re.compile(p, re.IGNORECASE)
     for p in [
-        r"ignore\s+(all\s+)?previous\s+instructions",
         r"ignore\s+(all\s+)?above",
         r"you\s+are\s+now",
         r"new\s+instructions?:",
@@ -51,6 +65,11 @@ _INJECTION_PATTERNS = [
         r"IMPORTANT:\s*override",
         r"forget\s+(everything|all)",
         r"disregard\s+(all|previous|your)\s+instructions",
+        # Synonyms of "previous" for the ignore/disregard/forget directive.
+        # Each optional group opens on a distinct literal word followed by
+        # required whitespace, so matching stays linear.
+        r"(ignore|disregard|forget)\s+(all\s+)?(of\s+)?(the\s+|your\s+)?"
+        r"(previous|prior|earlier|preceding|above|foregoing)\s+instructions",
         r"act\s+as\s+if",
         r"pretend\s+you\s+are",
         r"new\s+persona",

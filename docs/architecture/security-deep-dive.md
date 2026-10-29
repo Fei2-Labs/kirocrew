@@ -15,7 +15,7 @@ from here rather than restated:
   ceilings (cgroup scope, RLIMIT, file descriptors).
 
 Counts are deliberately absent from this document. Every posture count is
-derived at runtime by `security_posture.py` and rendered in Settings → Security
+derived at runtime by `security_posture_controls.py` and rendered in Settings → Security
 from `GET /api/security/posture`; a number written into prose goes stale silently
 while the code it describes keeps changing.
 
@@ -93,23 +93,21 @@ on the way in. Windows has no Kiro Crew OS wrapper, so positively identified
 official Kiro CLI spawns delegate to the CLI's built-in sandbox; their environment
 is scrubbed by the parent before spawn. The parent gateway process is unaffected.
 
-**`agent.sandbox` defaults to `"auto"`, engaging OS-level isolation
-(namespace on Linux, sandbox-exec on macOS).** The only alternative value is
-`"off"` (`config/loader.py`, `AgentConfig.sandbox`, `enum=["auto", "off"]`;
-the same two-value enum gates the dashboard config editor in
-`dashboard/handlers/core.py`). `"off"` skips Kiro Crew's own sandbox but still
-delegates to `kiro-cli`'s internal agent sandbox on macOS when it is enabled,
-which cannot nest inside Kiro Crew's
-Seatbelt wrap (the macOS kernel returns EPERM even under an allow-all outer
-profile), so exactly one layer can own isolation per spawn. Setting `"auto"`
-re-enables Kiro Crew's own sandbox.
+**`agent.sandbox` defaults to `"auto"`** (OS-level isolation at the `standard`
+tier); `"strict"` is the opt-in that also masks the workflow credential stores,
+and `"off"` defers isolation. The enum, its lifecycle and the per-tier masks are
+specified once in
+[security](../system-specs/modules/security.md#sandbox-modes). The rationale for
+the split: standard keeps git-over-SSH and `credential_process` working, strict
+trades that for hiding the stores from every subprocess.
 
 `wrap_argv`'s internal tier vocabulary is wider than the config enum: `standard`
-(what `auto` resolves to), `cc`, `strict` and `off`. Those extra tiers are reached
-by internal callers and by the governance `sandbox.min_level` ordinal floor
+(what `auto` resolves to), `cc`, `strict` and `off`. `cc` and the `standard`
+spelling are reached by internal callers and by the governance `sandbox.min_level`
+ordinal floor
 (`_ORDINAL_SCALES["sandbox"] = ("off", "standard", "cc", "strict")`), which clamps
 a requested mode **up** before resolution, so an enterprise floor confines even a
-`mode="off"` call. They are not values an operator writes into `agent.sandbox`.
+`mode="off"` call. Those two are not values an operator writes into `agent.sandbox`.
 Per-tier hidden paths, the empirical backend probes, the nested-passthrough rule
 and the fail-closed/fail-open flags are specified in
 [`security.md` § OS-Level Sandbox](../system-specs/modules/security.md).
@@ -180,22 +178,46 @@ edition-resolved or user-writable target; it runs a fixed trusted system binary.
 ### Why the default is defensible
 
 The sandbox is the only optional layer, so the credential-read threat has to be
-covered without it. It is, three times over, at different altitudes:
+described honestly for the tier it runs at:
 
 - A tool read of `~/.aws` or `~/.ssh` is refused by the resolved-path gate
   (Layer 1), which follows symlinks before deciding.
-- A shell read of the same paths is refused by `is_sensitive_bash_command`
-  (Layer 2), which tokenizes and normalizes the command rather than pattern-
-  matching raw text, so quoting and expansion tricks do not evade it.
+- A shell command is **not** path-matched (Layer 2). The command gate denies
+  the environment-variable, SDK and exfiltration shapes (`env | grep AWS_`,
+  `boto3 ... get_credentials()`, `curl -d @~/.aws/credentials`), but
+  `is_sensitive_bash_command` deliberately matches no paths: a text matcher
+  cannot hold against `python -c open(...)`, `awk`, a variable or a `cd`, and
+  every spelling it did close denied ordinary commands whenever the fenced
+  spelling appeared as data. The path regexes were removed for that reason
+  (#9183), and the recovered command of a sandboxed shell is exempt from the
+  path tier (#11223). The enforcement point for a shell's `open()` is the OS
+  sandbox.
+- The OS sandbox's **default `standard` tier leaves `~/.aws`, `~/.ssh` and
+  `~/.kube` visible** (`sandbox._STANDARD_DIRS` omits them on purpose) so the
+  `aws` CLI, boto3 `credential_process`, git-over-SSH and `kubectl` work inside
+  the agent. So under the shipped default a shell read such as
+  `cat ~/.aws/credentials` succeeds — a read-only command auto-approves, and no
+  layer above the sandbox fences the path. `agent.sandbox="strict"` is the
+  opt-in tier that masks those directories (Linux bind mount, macOS Seatbelt
+  deny), at the cost of those same tools inside the agent; it does not tighten a
+  spawn Kiro Crew does not wrap (Windows, or a macOS spawn delegated to
+  kiro-cli's internal sandbox).
 - Anything that still reaches tool output is caught by redaction (Layer 4) before
-  it reaches a human or an external service.
+  it reaches a human or an external service — but that boundary is the human
+  and the wire, not the model's context.
 
-`SSH_AUTH_SOCK` is scrubbed whenever a Kiro Crew sandbox tier is active, so
-ssh-agent forwarding is unavailable inside a confined spawn. Operators who depend
-on passphrase-protected keys or hardware tokens use key files directly or leave
-`agent.sandbox` at `off`.
+Changing the default tier is the wrong fix for that gap: it trades every
+operator's credential tooling for the subset who want the fence, silently, on
+upgrade. The tier is the operator's to tighten (`agent.sandbox="strict"`), and
+this document names what the default leaves open so that choice is informed.
 
-## Layer 1: Filesystem gate (`security.py` + `hooks.py`)
+`SSH_AUTH_SOCK` is kept for an agent spawn whose tier leaves `~/.ssh` readable
+(`off`, `standard`, `cc`) and whose harness mask does not hide it, so the
+agent can use the operator's ssh-agent there, including a forwarded one. Under
+`strict`, or a harness mask over `~/.ssh`, it is scrubbed unless the operator
+records consent in the keystone leaf `ssh_auth_sock_consent.json`.
+
+## Layer 1: Filesystem gate (`security/` package + `hooks.py`)
 
 `is_sensitive_path()` is the shared read+write block, and
 `is_sensitive_write_path()` is its strict superset: it adds paths that stay
@@ -206,9 +228,12 @@ symlink-resolved target as well as the lexically normalized and raw forms, so a
 workspace symlink into a blocked directory is refused through the link.
 
 `hooks.safe_read_file()` is the guarded read used by Kiro Crew's own non-tool file
-access: it re-checks the resolved target and then opens the canonical path with
-`O_NOFOLLOW`, which closes the TOCTOU window where the final component is swapped
-for a symlink after the check.
+access. It lives in `hook_runtime/safe_reads.py` and `hooks.py` re-exports it. It
+re-checks the resolved target and then opens the canonical path through
+`jsonl_util.open_regular_nofollow` (`O_NOFOLLOW`), which closes the TOCTOU window
+where the final component is swapped for a symlink after the check. The open
+carries `max_bytes=MAX_FILE_BYTES`, charged against every read, so a file over the
+cap, or one that grows past it after the open, is refused with `EFBIG`.
 
 The text, byte and prefix readers also check the opened descriptor before consuming
 content. They require a regular file, a kernel-reported path matching the canonical
@@ -230,7 +255,9 @@ in place.
 The governance trust root (`security_policy.json`, `profiles/`,
 `admission_policy.json`), the denied-command opt-out state
 (`denied_commands.json`), the SEL HMAC key and event log, the dashboard token
-signing key, and the channel credential `.env` all sit on the read+write block.
+signing key, the App Kit registry trust grants (`registry_trust.json`, see
+[app-kit-platform](../system-specs/modules/app-kit-platform.md)), and the channel
+credential `.env` all sit on the read+write block.
 This is a single mechanism with an outsized consequence: it is what makes the
 enterprise ceiling **un-disableable from inside the agent**. An agent that could
 read these could forge tokens or impersonate internal callers; one that could
@@ -288,7 +315,8 @@ V1 keeps its existing Markdown/JSONL behavior. See
 
 ### Audited internal carve-out
 
-`safe_read_file_internal(read_id)` permits a small hardcoded allowlist of
+`safe_read_file_internal(read_id)` (in `hook_runtime/internal_reads.py`, re-exported
+by `hooks.py`) permits a small hardcoded allowlist of
 system-internal reads of otherwise-sensitive paths. It re-verifies
 `is_sensitive_path()` (a path that has stopped being sensitive means the
 configuration drifted, so it refuses rather than silently widening), opens with
@@ -297,7 +325,7 @@ a `success` whose audit cannot be persisted returns `None`, because a log warnin
 is not an audit event and the carve-out's validity depends on every successful
 read producing one. `read_id` is never constructed from untrusted input.
 
-## Layer 2: Command gate (`security.py` + `hooks.py`)
+## Layer 2: Command gate (`security/` package + `hooks.py`)
 
 Three independent checks run on every shell-bearing tool call, each against the
 model's title **and** the raw command:
@@ -311,10 +339,12 @@ model's title **and** the raw command:
   `commands` scope is the enterprise force-pin that cannot be opted out of
   (tightest-wins).
 - **Sensitive-bash detection** (`is_sensitive_bash_command`): refuses commands
-  that read credential paths, reach the cloud metadata endpoint under any IP
-  encoding, or dump credential environment variables. Regex fast-path first, then
-  a tokenizing pass that resolves quoting, empty-string concatenation, `$HOME`
-  and tilde before routing path-like tokens through `is_sensitive_path()`.
+  that reach the cloud metadata endpoint under any IP encoding or dump credential
+  environment variables (`env | grep`, `printenv`, `declare -p` and their kin),
+  after a size ceiling. It deliberately matches **no paths** in command text:
+  the credential stores are the OS sandbox's to hide (the default `standard`
+  tier leaves `~/.aws`/`~/.ssh`/`~/.kube` visible; `strict` masks them), and
+  `is_sensitive_path()` fences every resolved path a file tool opens.
 - **Exfiltration shapes** (`audit_bash_exfiltration`): data-egress and
   reverse-shell forms, narrowly scoped so it can be a hard deny at the gate
   without blocking benign local commands.
@@ -353,13 +383,13 @@ response truncation at `MAX_RESPONSE_LEN` (100 000 chars) so unbounded tool outp
 cannot be a DoS vector.
 
 The schema count is a runtime-derived posture value (`tool_schemas` in
-`security_posture.py`), surfaced in Settings; it is not stated here.
+`security_posture_controls.py`), surfaced in Settings; it is not stated here.
 
 ## Layer 4: Output redaction
 
 Redaction runs at **every** boundary where agent-derived output reaches a human or
 an external service. The authoritative list is the `redaction_paths` control in
-`security_posture.py`, whose registry is kept honest by an omission-detecting
+`security_posture_controls.py`, whose registry is kept honest by an omission-detecting
 test: every redactor call site in the package must be either a registered sink or
 on an explicit non-egress allowlist, so a new egress path cannot be added without
 someone deciding which bucket it belongs in.
@@ -368,17 +398,33 @@ The memory recovery, record editor, and member recall/copy APIs each register
 their own output boundary. Their response fields pass through the shared
 credential and exfiltration-URL chain before reaching the dashboard or MCP caller.
 
-- `redact_credentials()` recognizes credential families in plaintext and
-  base64-encoded form (it decodes base64-looking chunks and re-checks the decoded
-  bytes), including cloud access keys and secrets, private-key headers, chat and
-  forge tokens, package-registry tokens, and database connection URIs carrying
-  embedded credentials. Key-value matching is JSON-aware and value classes are
-  bounded at JSON structural delimiters, so a match in compact JSON cannot
-  over-capture and mask the next credential.
-- `redact_exfiltration_urls()` / `scan_exfiltration_urls()` are
-  **domain-agnostic**: they flag the payload, not the destination. A credential in
-  a URL is an unconditional floor; long query strings, base64 blobs and heavy
-  URL-encoding are heuristics. A flagged URL is replaced with a redaction marker.
+- `redact_credentials()` runs four passes:
+  1. Fixed patterns: cloud access key IDs and secret keys, private-key blocks,
+     chat and forge tokens, package-registry tokens, JWTs, `Authorization: Bearer`
+     headers, and database connection URIs carrying embedded credentials.
+  2. Base64: it decodes base64-looking chunks and re-runs pass 1 on the bytes.
+  3. Bare secret key: an entropy and shape heuristic for an unlabelled
+     40-character cloud secret key, with exemptions for shapes it would otherwise
+     misread (digests, document links, code literals and others).
+  4. Token parameter: the value of a `token` URL parameter, keyed on the name.
+
+  Key-value matching is JSON-aware and value classes stop at JSON structural
+  delimiters, so a match in compact JSON does not run into the next field. A
+  labelled match replaces the label together with the value, so
+  `{"AccessKeyId": "..."}` becomes `{"[REDACTED: credential]"}`.
+- `redact_exfiltration_urls()` / `scan_exfiltration_urls()` judge the payload
+  first. A credential in a URL is an unconditional floor; long query strings,
+  base64 blobs and heavy URL-encoding are heuristics. A flagged URL is replaced
+  with a redaction marker. Some destinations get narrower treatment: a valid S3
+  presigned URL is exempt; the ACP OAuth banner path spares standard OAuth
+  parameters at approved authorization endpoints; Kiro Crew's own Slack app-create
+  link keeps only its alias under the heuristics; and a companion's exact hosts and
+  a reader's allowed hosts (*Allow for this host*, kept per workspace in a
+  read-only leaf) skip only the length and base64 heuristics. The credential
+  checks still run on those last three.
+- The owner's switch (Settings → Security) applies only inside the Files view,
+  and there it turns all credential redaction off. A code-text scope spares two
+  source-code shapes from pass 3 and nothing else.
 - `redact()` composes both in order for a single call site.
 - `StreamRedactor` handles the case per-chunk redaction structurally cannot: a
   credential split across a streaming boundary, where neither fragment matches on
@@ -396,7 +442,10 @@ the decoded value makes every escape a bypass), and **redact before truncate**
 
 The Security Event Log is append-only and HMAC-chained, so tampering is
 detectable rather than merely discouraged; `GET /api/sel/verify` reports the
-chain's integrity and `GET /api/sel/events` returns recent records. Every event
+chain's integrity and `GET /api/sel/events` returns recent records to the
+dashboard OWNER alone -- the rows name the resources a decision was about, and a
+dashboard session is not by itself the owner, so any other caller is refused and
+the refusal is audited. Every event
 carries a `source` inferred from the session key (`sel._infer_source`, published
 via `sel.audit_sources()`), and a call site may stamp a more specific source, so
 the inferred set is a floor rather than a total.
@@ -419,9 +468,33 @@ filter from a sandbox torn down underneath it, so it can neither audit nor
 persist anything it goes on to do, and nobody is watching it -- its parent
 records the run as ok either way. Such a child refuses instead of proceeding
 (`sandbox.refuse_unaudited_on_dead_fs`, gated on a marker the cron launcher puts
-in the child's environment AND on that errno). Everything else, including the
+in the child's environment AND on that errno). The child's own tool-call audit
+(`ScriptContext._audit_tool_call`) writes synchronously for the same reason, so
+its `ENOSYS` reaches the same refusal. The launcher also probes the data home
+again after the script body, before it prints any non-error status, and the
+parent treats every non-zero child exit as a failure, so a teardown during the
+run cannot be recorded as ok. Everything else, including the
 gateway's own spawns and any other audit failure, keeps the log-and-proceed
 posture above. `test_sandbox_cron_child_audit.py` pins both halves.
+
+The converse rule covers refusals, and it runs the other way: **a denial's audit
+is best-effort**. Once a guard has refused -- a sensitive canonical target, a
+project directory inside a protected tree -- the refusal already stands on its
+own, so a failed SEL write must never be allowed to turn it into permission.
+Denial sites therefore pass no `critical=True` and degrade to a WARNING naming
+the operation, because for some surfaces the refusal is the process's first SEL
+use and an unwritable log would otherwise abort the caller on exactly the hostile
+path the guard exists to handle. `agent_discovery._audit_denied` is the pattern;
+`test_agent_spec_hardened_reads.py` pins that every denial path in that module
+keeps its never-raise promise under a broken SEL.
+
+Best-effort does not excuse the row's absence when SEL is healthy, which is the
+other half of the rule. Every refusal path emits one, and the caller names itself
+through `operation`/`source` so the trail attributes the probe to the request
+that made it rather than to the helper that caught it; a call-site ratchet
+enumerates those labels so a new caller cannot land silently behind the callee's
+defaults. A refusal that emits no audit call at all is the defect this rule
+names. A refusal whose audit call failed is the rule working.
 
 ## Governance: the enterprise ceiling
 
@@ -510,6 +583,24 @@ Dashboard tool approvals offer four decisions, in widening scope: `trust_command
 (this exact command, session-scoped), `trust_base` (the base command glob, e.g.
 `ls *`, plus the bare binary, session-scoped), `trust_reads` (read-only bash for
 the slot), and `trust` (all tools for the slot). `yolo` is the global escalation.
+
+`trust_command` and `trust_base` can also be timed. The chat approval prompt
+offers each one for an hour or for the rest of the user's day, beside the grant
+that lasts for the chat. The request carries `ttl_seconds`, a whole number from 1
+to 86400; any other value, or a lifetime on any other decision, is refused with
+no grant recorded and the call still pending. A timed grant is kept on the chat's
+slot in its own store, apart from the chat-long patterns, so no other writer of
+those patterns can end or extend it. Its deadline is held on both the wall clock
+and the monotonic clock and checked at decision time: a grant is dropped before
+matching once either deadline passes, so neither a suspended host nor a clock
+set backwards stretches it, and the next matching call prompts again. An
+approval that rests on a timed grant carries that grant's deadline down to the
+transport, which checks it once more under its write lock, after its own
+security-floor check and right before it writes the answer: if the deadline has
+passed, nothing is written, the request stays pending, and the user is asked. An
+approval with no timed grant behind it carries no deadline and is answered as
+before. A timed grant stays on the chat
+that made it and, like every per-slot grant, is gone after a restart.
 
 The security-relevant property is what the pattern is derived from: the **actual
 command in `tool_input`**, not the model-authored display title. Trust patterns
@@ -609,8 +700,13 @@ would not be noticed.
 
 **Base64 credential detection has a floor.** Only base64 chunks at or above the
 minimum length are decoded and re-checked, so a shorter encoded fragment, or one
-split across messages, can pass. Cross-message correlation and entropy-based
-detection would extend it.
+split across messages, can pass. Cross-message correlation would extend it.
+
+**A bare secret key is a guess.** Pass 3 judges an unlabelled 40-character run by
+entropy and shape, which cannot tell a random secret from a random digest, so it
+carries exemptions and still misreads some benign values. The recorded direction
+replaces it with case-insensitive labels and key-ID pairing; see
+[the redaction tier decision](../decisions/2026-10-20-redaction-classifies-by-what-a-value-can-do.md).
 
 **Write protection covers Kiro Crew's own trust root, not the user's shell
 startup files.** Credential directories and the keystone are read+write blocked,
@@ -658,3 +754,31 @@ install-layout decision, and any such gate must default **off** — the
 `KIROCREW_PROVIDER_BIN_STRICT` precedent
 (`github_runner.py:validate_provider_executable`) records that requiring a
 root-owned copy made every stock package-manager install fail.
+
+**Cross-origin subresource DNS rebinding in the Design Critique capture browser
+is bounded, not fully closed (design track:
+[#17748](https://github.com/kirodotdev/KiroCrew/issues/17748)).** The URL-render
+capture path launches headless Chromium against untrusted external pages and
+defends SSRF / DNS rebinding with two shipped layers: the backend vets the typed
+base host and launches with a `--host-resolver-rules=MAP <host> <vetted-ip>` pin
+(`capture-site.mjs`, from `_resolve_vetted` in the backend), and
+`installSsrfGuard` (`ssrf-guard.mjs`) re-resolves every request host and aborts
+internal / private / loopback / CGNAT / metadata addresses. These close the base
+host and all same-host subresources. The residual is a **cross-origin
+subresource** loaded from a host other than the pinned base: the guard resolves
+the host as public and hands the request on with `route.continue()`, after which
+Chromium performs its own resolution to connect. `route.continue()` in
+`playwright-core` exposes no option that pins the connection to the IP the guard
+validated, so a name that answers public then private across those two
+resolutions is the window. It cannot be closed at the route layer without
+aborting **all** cross-origin subresources, which would drop legitimate CDN
+fonts and images from the rendered screenshot. **Status: ACCEPTED, bounded.**
+Reaching it requires an attacker to control both a critiqued page and a rebinding
+DNS name; the base-host and same-host vectors are already closed. The complete
+fix is below-the-browser egress filtering independent of Chromium's resolver — a
+network namespace or host firewall allowlist (the same mechanism named under *No
+network egress control by default*, above, scoped to the capture browser), or a
+userland forward proxy that validates the socket after connect. Choosing the
+mechanism is a per-platform infrastructure decision (macOS vs Linux vs CI, the
+privilege model, and fail-open vs fail-closed when the layer is unavailable), so
+it is tracked as a design item on #17748 rather than shipped here.

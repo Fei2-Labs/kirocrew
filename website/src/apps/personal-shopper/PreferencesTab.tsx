@@ -17,6 +17,7 @@ import SimpleSelect from '../../components/SimpleSelect'
 import ErrorNotice from '../../components/ErrorNotice'
 
 import { i18nT } from '../../i18n/t'
+import { guideCaution } from '../../guide/trustRoot'
 // ── Types ──
 
 interface Preference {
@@ -228,6 +229,7 @@ export function PreferencesTab() {
                 className="text-[var(--muted)] hover:text-[var(--danger)] transition-colors"
                 title={i18nT('apps.personalShopper.preferencesTab.delete_group_keeps_preferences')}
                 aria-label={i18nT('apps.personalShopper.preferencesTab.delete_named_group', { name: group.name })}
+                {...guideCaution}
               >
                 <X size={12} />
               </button>
@@ -502,7 +504,7 @@ function PreferenceRow({
             {groupNames.get(t) ?? t}
           </span>
         ))}
-      <div className="opacity-0 group-hover:opacity-100 flex gap-1 transition-opacity">
+      <div className="opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 flex gap-1 transition-opacity">
         <button
           onClick={startEditing}
           className="text-[var(--muted)] hover:text-[var(--accent)]"
@@ -516,6 +518,7 @@ function PreferenceRow({
           className="text-[var(--muted)] hover:text-[var(--danger)]"
           title={i18nT('apps.personalShopper.preferencesTab.delete')}
           aria-label={i18nT('apps.personalShopper.preferencesTab.delete_named_preference', { text: pref.text })}
+          {...guideCaution}
         >
           <Trash2 size={12} />
         </button>

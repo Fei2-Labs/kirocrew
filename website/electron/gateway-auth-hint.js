@@ -79,4 +79,62 @@ function defaultedPort(rawUrl) {
   return u.protocol === "https:" ? "443" : "80";
 }
 
-module.exports = { classifyAuthBlock, defaultedPort };
+/**
+ * Whether `rawUrl`'s port is its scheme's default, so parsing yielded no port.
+ *
+ * The companion question to `defaultedPort`, and the one a reader needs to know
+ * whether the port was RESOLVED rather than read. Note that it cannot be asked
+ * of the URL text: `new URL("http://localhost:80").port` is `""` exactly as
+ * `new URL("http://localhost").port` is, so writing the default out makes no
+ * difference. That is why this asks about the parsed value and why the raw
+ * property -- whose emptiness is the whole defect -- stays inside this module.
+ *
+ * @param {string} rawUrl
+ * @returns {boolean} false for an unparseable URL, which has no scheme either
+ */
+function portIsSchemeDefault(rawUrl) {
+  try { return new URL(rawUrl).port === ""; } catch { return false; }
+}
+
+/**
+ * The bundled `kirocrew` launcher path to show on the token page, but ONLY when
+ * this shell is a packaged AppImage whose launcher is a real absolute bundled
+ * path. Returns "" otherwise — a normal install, a dev run, or a build whose
+ * resolver fell back to a bare `kirocrew` name — so the page keeps its on-PATH
+ * wording for every non-AppImage caller.
+ *
+ * The AppImage runtime exports `$APPIMAGE` (the image's own path); its absence
+ * means we are not an AppImage and must not claim a bundled launcher. The
+ * resolved launcher must be absolute (an AppImage mount path begins with "/"),
+ * because a bare `kirocrew` would be the very on-PATH assumption this is meant
+ * to avoid.
+ *
+ * This is the one new value the token page needs: the shell passes the result
+ * to token-prompt.html as `?cli=`, and the page builds its recovery command
+ * from it. Pure: no I/O. `resolveBin` is injected so this stays testable
+ * without the launch-preflight machinery.
+ *
+ * @param {object} [env=process.env]  the shell environment ($APPIMAGE lives here)
+ * @param {() => string} resolveBin   resolver for the gateway launcher path
+ * @returns {string} absolute bundled launcher path, or "" when not applicable
+ */
+function appImageBundledCliPath(env, resolveBin) {
+  const appImagePath = env && typeof env.APPIMAGE === "string" ? env.APPIMAGE.trim() : "";
+  if (appImagePath === "") return "";
+  if (typeof resolveBin !== "function") return "";
+  let bin = "";
+  try { bin = resolveBin(); } catch { return ""; }
+  if (typeof bin !== "string") return "";
+  bin = bin.trim();
+  // Absolute only: a bare `kirocrew` (the PATH fallback) is exactly what the
+  // AppImage user does not have, so forwarding it would reintroduce the defect.
+  if (!bin.startsWith("/")) return "";
+  return bin;
+}
+
+module.exports = {
+  classifyAuthBlock,
+  defaultedPort,
+  portIsSchemeDefault,
+  appImageBundledCliPath,
+};

@@ -60,32 +60,109 @@ def dead_pids(monkeypatch: pytest.MonkeyPatch) -> set[int]:
 
 class TestMarkers:
     def test_write_read_clear_round_trip(self, tmp_path: Path) -> None:
-        cron_inflight.write_marker(tmp_path, "caeb441a", "twb-refresh", 1000.0)
+        cron_inflight.write_marker(tmp_path, "caeb441a", "twb-refresh", 1000.0, run="aaaa")
         (marker,) = cron_inflight.read_markers(tmp_path)
-        assert (marker.job_id, marker.name, marker.started_at, marker.pid) == (
+        assert (marker.job_id, marker.name, marker.started_at, marker.pid, marker.path.name) == (
             "caeb441a",
             "twb-refresh",
             1000.0,
             os.getpid(),
+            "caeb441a.aaaa.json",
         )
+        # The token lives in the name only: the payload carries no copy of it.
+        assert "run" not in json.loads(marker.path.read_text(encoding="utf-8"))
         assert marker.owner_alive() is True
-        cron_inflight.clear_marker(tmp_path, "caeb441a")
+        cron_inflight.clear_marker(tmp_path, "caeb441a", "aaaa")
         assert cron_inflight.read_markers(tmp_path) == []
         # clearing twice is not an error
-        cron_inflight.clear_marker(tmp_path, "caeb441a")
+        cron_inflight.clear_marker(tmp_path, "caeb441a", "aaaa")
+
+    def test_a_clear_removes_only_its_own_runs_marker(self, tmp_path: Path) -> None:
+        """Two runs of one job are two files; a run's clear cannot reach the other's.
+
+        The finalizer of a cancelled run clears after an unwind that can span a
+        whole session teardown, by which time a replacement run of the same job
+        has written its own marker: a clear keyed by job id alone would take it.
+        """
+        cron_inflight.write_marker(tmp_path, "caeb441a", "twb-refresh", 1000.0, run="aaaa")
+        cron_inflight.write_marker(tmp_path, "caeb441a", "twb-refresh", 1010.0, run="bbbb")
+        assert [(m.path.name, m.started_at) for m in cron_inflight.read_markers(tmp_path)] == [
+            ("caeb441a.aaaa.json", 1000.0),
+            ("caeb441a.bbbb.json", 1010.0),
+        ]
+        cron_inflight.clear_marker(tmp_path, "caeb441a", "aaaa")
+        (survivor,) = cron_inflight.read_markers(tmp_path)
+        assert (survivor.path.name, survivor.started_at) == ("caeb441a.bbbb.json", 1010.0), (
+            "the first run's clear removed the replacement run's marker: "
+            f"{[m.path.name for m in cron_inflight.read_markers(tmp_path)]!r}"
+        )
+        cron_inflight.clear_marker(tmp_path, "caeb441a", "bbbb")
+        assert cron_inflight.read_markers(tmp_path) == []
+
+    def test_a_write_and_a_clear_name_a_run(self, tmp_path: Path) -> None:
+        """There is no token-less form left to write or clear."""
+        with pytest.raises(TypeError):
+            cron_inflight.write_marker(tmp_path, "caeb441a", "x", 1.0)  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            cron_inflight.clear_marker(tmp_path, "caeb441a")  # type: ignore[call-arg]
+        assert cron_inflight.read_markers(tmp_path) == []
+
+    @pytest.mark.parametrize("bad", ["", "a/b", "a\\b", "..", "a.b", "x" * 65])
+    def test_marker_path_refuses_tokens_that_are_not_a_nonce(
+        self, tmp_path: Path, bad: str
+    ) -> None:
+        with pytest.raises(ValueError):
+            cron_inflight.marker_path(tmp_path, "caeb441a", bad)
+        cron_inflight.write_marker(tmp_path, "caeb441a", "x", 1.0, run=bad)  # refused, no raise
+        assert cron_inflight.read_markers(tmp_path) == []
+
+    def test_a_marker_without_a_run_token_is_read(self, tmp_path: Path) -> None:
+        """A file written before the token existed still names its job, as does
+        one carrying the payload key an older build wrote beside the name."""
+        d = cron_inflight.running_dir(tmp_path)
+        d.mkdir(parents=True)
+        (d / "legacy1.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "legacy1",
+                    "name": "l",
+                    "started_at": 5.0,
+                    "pid": os.getpid(),
+                    "pid_domain": crash_dump_store._pid_domain(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (d / "legacy2.cccc.json").write_text(
+            json.dumps(
+                {
+                    "job_id": "legacy2",
+                    "name": "l",
+                    "started_at": 6.0,
+                    "pid": os.getpid(),
+                    "pid_domain": crash_dump_store._pid_domain(),
+                    "run": "cccc",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert [(m.job_id, m.path.name) for m in cron_inflight.read_markers(tmp_path)] == [
+            ("legacy1", "legacy1.json"),
+            ("legacy2", "legacy2.cccc.json"),
+        ]
 
     @pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "a\\b", "../x"])
     def test_marker_path_refuses_ids_that_leave_the_directory(
         self, tmp_path: Path, bad: str
     ) -> None:
         with pytest.raises(ValueError):
-            cron_inflight.marker_path(tmp_path, bad)
+            cron_inflight.marker_path(tmp_path, bad, "aaaa")
 
     def test_write_is_best_effort(self, tmp_path: Path) -> None:
         # A bad id raises inside; the writer swallows it -- a marker must never
         # fail a run.
-        cron_inflight.write_marker(tmp_path, "../escape", "x", 1.0)
-        assert not (tmp_path.parent / "escape.json").exists()
+        cron_inflight.write_marker(tmp_path, "../escape", "x", 1.0, run="aaaa")
+        assert not (tmp_path.parent / "escape.aaaa.json").exists()
 
     def test_unparseable_and_tmp_files_are_skipped(self, tmp_path: Path) -> None:
         d = cron_inflight.running_dir(tmp_path)
@@ -97,7 +174,7 @@ class TestMarkers:
         assert cron_inflight.read_markers(tmp_path) == []
 
     def test_abandoned_is_dead_owner_only(self, tmp_path: Path, dead_pids: set[int]) -> None:
-        cron_inflight.write_marker(tmp_path, "live", "l", 1.0)  # this process
+        cron_inflight.write_marker(tmp_path, "live", "l", 1.0, run="aaaa")  # this process
         d = cron_inflight.running_dir(tmp_path)
         (d / "dead.json").write_text(
             json.dumps(
@@ -152,10 +229,10 @@ class TestMarkers:
         ``cron-running`` would make a run's cleanup delete a file in its target."""
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
-        victim = elsewhere / "abc123.json"
+        victim = elsewhere / "abc123.aaaa.json"
         victim.write_text("{}", encoding="utf-8")
         os.symlink(elsewhere, cron_inflight.running_dir(tmp_path))
-        cron_inflight.clear_marker(tmp_path, "abc123")
+        cron_inflight.clear_marker(tmp_path, "abc123", "aaaa")
         assert victim.exists()
 
 
@@ -326,7 +403,7 @@ class TestAttribution:
         a = attribute_dump(dump, tmp_path)
         assert a.job is None and a.candidates == []
         # Nor written through: the linked parent refuses the marker write.
-        cron_inflight.write_marker(tmp_path, "w", "w", now)
+        cron_inflight.write_marker(tmp_path, "w", "w", now, run="aaaa")
         assert sorted(p.name for p in elsewhere.iterdir()) == [
             cron_inflight.BREAKER_CLAIM_FILE,
             "forged.json",
@@ -365,6 +442,39 @@ class TestAttribution:
         assert "2 jobs were in flight" in text
         assert "cannot name one job" in text
         assert "recommended:" not in text
+
+    def test_two_runs_of_one_job_are_one_candidate(
+        self, tmp_path: Path, dead_pids: set[int]
+    ) -> None:
+        """Markers are one file per RUN: a cancelled run's finalizer still pending
+        when the replacement wrote its own leaves two files for one job at a hard
+        exit. They name one job, and the newest start is the run in flight."""
+        now = time.time()
+        domain = crash_dump_store._pid_domain()
+        dump = write_dump(tmp_path / "dumps", 4_000_012, CRON_STACK, mtime=now)
+        cron_inflight.write_marker(tmp_path, "c3", "hourly", now - 30, run="aaaa")
+        cron_inflight.write_marker(tmp_path, "c3", "hourly", now - 5, run="bbbb")
+        # The writer is this (live) process; re-home both to the dead one.
+        for path in sorted(cron_inflight.running_dir(tmp_path).glob("c3.*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data.update({"pid": 4_000_012, "pid_domain": domain, "pid_start": None})
+            path.write_text(json.dumps(data), encoding="utf-8")
+        a = attribute_dump(dump, tmp_path)
+        assert a.job is not None and (a.job.job_id, a.job.path.name) == ("c3", "c3.bbbb.json"), (
+            "two markers of one job read as two jobs in flight: "
+            f"{[(m.job_id, m.path.name) for m in a.candidates]!r}"
+        )
+        assert "recommended: kirocrew cron pause c3" in describe(a)
+        # Both files are still swept once the verdict is recorded.
+        assert sorted(m.path.name for m in cron_inflight.abandoned_markers(tmp_path)) == [
+            "c3.aaaa.json",
+            "c3.bbbb.json",
+        ]
+        assert cron_inflight.record_attribution(tmp_path, dump.name, a.candidates, [])
+        recorded = cron_inflight.read_recorded_attribution(tmp_path, dump.name)
+        assert recorded is not None and [(m.job_id, m.started_at) for m in recorded[0]] == [
+            ("c3", now - 5)
+        ]
 
     def test_pid_mismatch_and_later_marker_are_unrelated(
         self, tmp_path: Path, dead_pids: set[int]

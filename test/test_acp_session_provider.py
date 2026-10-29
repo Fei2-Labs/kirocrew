@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -239,6 +240,23 @@ class TestAcpSessionProviderStream:
         assert collected[2].kind == EVENT_COMPLETE
 
     @pytest.mark.asyncio
+    async def test_stream_forwards_explicit_transport_timeout(self):
+        handle = _make_handle()
+        seen: list[tuple[str, float | None]] = []
+
+        async def mock_prompt(message, timeout=None):
+            seen.append((message, timeout))
+            yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
+
+        handle.prompt = mock_prompt
+        provider = AcpSessionProvider(handle, _make_runtime())
+
+        events = [event async for event in provider.stream("long run", timeout=21660.0)]
+
+        assert [event.kind for event in events] == [EVENT_COMPLETE]
+        assert seen == [("long run", 21660.0)]
+
+    @pytest.mark.asyncio
     async def test_stream_command_routes_through_handle_stream_command(self):
         """Slash commands go through the handle's NATIVE commands/execute path,
         never through prompt() — a prompt round-trip would hand the command to
@@ -447,6 +465,17 @@ class TestAcpSessionProviderErrorPropagation:
         provider.touch_activity()
         assert runtime._last_activity > 0.0
 
+    def test_touch_activity_stamps_its_own_handle(self):
+        """The keepalive also reaches this session's handle, the clock the
+        tool-stall watchdog reads (the runtime clock is process-wide)."""
+        handle = _make_handle()
+        runtime = _make_runtime()
+        provider = AcpSessionProvider(handle, runtime)
+
+        provider.touch_activity()
+
+        handle.note_keepalive.assert_called_once_with()
+
 
 class TestAcpSessionProviderClientCompat:
     """Tests for the AcpClient-compatible API surface."""
@@ -470,6 +499,33 @@ class TestAcpSessionProviderClientCompat:
         runtime = _make_runtime(acp_backend="kas")
         provider = AcpSessionProvider(handle, runtime)
         assert provider.backend == "kas"
+
+    def test_cwd_reports_the_sessions_bound_dir_not_the_shared_runtimes(self):
+        """A shared runtime carries sessions opened against different projects.
+
+        The task runtime is started once in workspace A; a task session then opens against
+        B. Answering with the runtime's directory reports a workspace this session never
+        bound, so reuse validation reads it as moved and evicts a live session -- losing
+        its conversation for failing to be somewhere it never was.
+        """
+        handle = _make_handle()
+        handle._bound_cwd = "/workspaces/b"
+        runtime = _make_runtime()
+        runtime._work_dir = Path("/workspaces/a")
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.cwd == "/workspaces/b", (
+            "the session bound to B must report B; reporting the runtime's A evicts it "
+            f"on every project-scoped claim; got {provider.cwd!r}"
+        )
+
+    def test_cwd_falls_back_to_the_runtime_when_no_bound_dir_was_recorded(self):
+        """A handle predating the record is the single-session case, where they agree."""
+        handle = _make_handle()
+        handle._bound_cwd = ""
+        runtime = _make_runtime()
+        runtime._work_dir = Path("/workspaces/a")
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.cwd == str(Path("/workspaces/a"))
 
     def test_has_active_turn(self):
         """has_active_turn is a METHOD (parity with AcpClient) delegating to
@@ -740,6 +796,15 @@ class TestAcpSessionProviderRound4Parity:
         assert stats.context_tokens_from_usage is False
         assert stats.context_pct_unknown is False
 
+    def test_rekey_drops_credits_held_between_turns(self):
+        """Credits held for the next turn belong to the session served before
+        the claim, so the claiming session's first turn must not bill them."""
+        handle = _make_handle()
+        handle._between_turn_credits = 0.5
+        provider = AcpSessionProvider(handle, _make_runtime())
+        provider.rekey("dashboard:slot9", "chan-7")
+        assert handle._between_turn_credits == 0.0
+
     def test_agent_reads_from_runtime(self):
         """#5 -- session.py session-info introspection reads
         provider.client._agent; mirror AcpClient._agent via the runtime."""
@@ -970,6 +1035,34 @@ class TestAcpSessionProviderContractParity:
         with pytest.raises(AcpProcessDied):
             await provider.steer("go")
 
+    @pytest.mark.parametrize("own_frame_buffered", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_steer_is_ambiguous_only_when_its_own_frame_was_buffered(
+        self, own_frame_buffered
+    ):
+        """The session's outstanding prompt makes a TURN's death ambiguous, but
+        not a steer that was refused before its first byte: marking that steer
+        possibly delivered would make the next turn skip an instruction the
+        backend never received."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.acp.runtime import AcpRuntimeStdinStalled
+
+        handle = _make_handle()
+        handle.prompt_outstanding_on_stall = True
+        handle.steer = AsyncMock(
+            side_effect=(
+                AcpRuntimeStdinStalled("stdin stalled", ambiguous_delivery=True)
+                if own_frame_buffered
+                else AcpRuntimeDead("runtime is dead")
+            )
+        )
+        runtime = _make_runtime()
+        runtime.saw_not_logged_in = lambda: False
+        provider = AcpSessionProvider(handle, runtime)
+        with pytest.raises(AcpProcessDied) as ei:
+            await provider.steer("also add tests")
+        assert ei.value.ambiguous_delivery is own_frame_buffered
+
     @pytest.mark.asyncio
     async def test_approve_tool_explicit_option_id(self):
         """approve_tool honors an explicit option_id (signature parity)."""
@@ -1007,11 +1100,35 @@ class TestNewConversation:
 
         # Fresh session/new on the SAME runtime (cwd+agent from the runtime).
         runtime.create_session.assert_awaited_once_with(
-            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent"
+            cwd="/tmp/ws", agent="kirocrew", memory_mode="persistent", session_key=""
         )
         # Handle swapped to the fresh session → next prompt starts clean.
         assert provider._handle is new_handle
         assert provider.session_id == "fresh-session-2"
+
+    @pytest.mark.asyncio
+    async def test_owning_shutdown_stops_in_flight_hook_executions(self):
+        handle = _make_handle(session_id="owned")
+        handle._cancel_hook_tasks = MagicMock()
+        runtime = _make_runtime()
+        runtime.kill = AsyncMock()
+        provider = AcpSessionProvider(handle, runtime, owns_runtime=True)
+
+        await provider.shutdown()
+
+        handle._cancel_hook_tasks.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_the_fresh_session_keeps_the_providers_owner(self):
+        # The hooks execute path keys its record and its governance by the owning
+        # session, so a fresh conversation must not come back unowned.
+        old = _make_handle(session_id="old-session-1")
+        runtime, _new_handle = self._runtime_with_new_session()
+        provider = AcpSessionProvider(old, runtime, session_key="slot:owner")
+
+        await provider.new_conversation()
+
+        assert runtime.create_session.await_args.kwargs["session_key"] == "slot:owner"
 
     @pytest.mark.asyncio
     async def test_destroys_old_session_to_free_context(self):
@@ -1219,7 +1336,8 @@ class TestLivePathModelEntitlement:
         # so a stale-snapshot refusal stands. Tests exercising the heal path
         # override this with a side_effect that also updates available_models.
         handle.refresh_available_models = AsyncMock(return_value=[])
-        return AcpSessionProvider(handle, MagicMock()), handle
+        # A kiro runtime: the refusal wording, sign-in hint included, is kiro's.
+        return AcpSessionProvider(handle, _make_runtime()), handle
 
     @pytest.mark.asyncio
     async def test_explicit_switch_refused_on_live_path(self):
@@ -1275,7 +1393,7 @@ class TestLivePathModelEntitlement:
             {"modelId": "claude-opus-5", "name": "claude-opus-5", "description": ""},
         ]
 
-        async def _refresh():
+        async def _refresh(*_a, **_kw):
             handle.available_models = fresh
             return fresh
 
@@ -1330,6 +1448,21 @@ class TestLivePathModelEntitlement:
 
         handle.refresh_available_models.assert_not_awaited()
         handle.set_model.assert_awaited_once_with("claude-opus-4.8")
+
+    @pytest.mark.asyncio
+    async def test_refusal_heal_forces_a_fresh_probe(self):
+        """D1: an explicit pick is a user action, so its revalidation passes
+        force=True — it must not be refused on a no-evidence failure the picker
+        read path may have cached in the shared attempt-clock window."""
+        from kiro_crew.acp.client import AcpModelUnavailable
+
+        provider, handle = self._provider(["claude-sonnet-4.6"])
+
+        with pytest.raises(AcpModelUnavailable):
+            await provider.set_model("claude-opus-4.8")
+
+        handle.refresh_available_models.assert_awaited_once()
+        assert handle.refresh_available_models.await_args.kwargs.get("force") is True
 
 
 class TestAdvertisedModelIds:

@@ -6,6 +6,7 @@ and SEL audit are exercised without spawning a real kiro-cli process.
 """
 import asyncio
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -47,6 +48,7 @@ class FakeHandle:
         self._script = script or []
         self._gate = gate
         self.approvals: list = []
+        self.rejections: list = []
         self.destroyed = False
 
     async def prompt(self, message, timeout=0):
@@ -58,6 +60,9 @@ class FakeHandle:
 
     async def approve_tool(self, request_id, option_id=None):
         self.approvals.append(request_id)
+
+    async def reject_tool(self, request_id):
+        self.rejections.append(request_id)
 
     async def destroy(self):
         self.destroyed = True
@@ -82,12 +87,13 @@ class FakeRuntime:
         self._seq = 0
         self.script = []
         self.gate = None
+        self.last_handle = None
         FakeRuntime.instances.append(self)
 
     def is_alive(self):
         return self.spawned and not self.killed
 
-    async def spawn(self):
+    async def spawn(self, start_priority=None):
         self.spawned = True
 
     async def kill(self, *, expected: bool = False, reason: str = ""):
@@ -100,6 +106,7 @@ class FakeRuntime:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         h = FakeHandle(self, sid, script=list(self.script), gate=self.gate)
+        self.last_handle = h
         self.sessions[sid] = h
         self._session_queues[sid] = object()
         # mirror the handle destroy -> pop from _session_queues too
@@ -234,9 +241,10 @@ class TestBatchLifecycle(unittest.IsolatedAsyncioTestCase):
             r = FakeRuntime(agent=agent, work_dir=work_dir)
             calls["n"] += 1
             if calls["n"] == 1:
-                async def _boom():
+                async def _boom(start_priority=None):
                     raise RuntimeError("spawn boom")
-                r.spawn = _boom  # type: ignore[method-assign]
+
+                r.spawn = _boom  # type: ignore[assignment]
             return r
         orig = rp.AcpRuntime
         rp.AcpRuntime = factory  # type: ignore[assignment]
@@ -291,6 +299,112 @@ class TestApprovalAndAudit(unittest.IsolatedAsyncioTestCase):
         # find it via the runtime's last created session id
         self.assertEqual(rt._seq, 1)
         await pool.end_batch()
+
+    async def test_policy_deny_is_rejected_before_auto_approval(self):
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        refusal_for = getattr(rp, "refusal_for", None)
+        self.assertIsNotNone(refusal_for, "review pool has no identity-bearing permission gate")
+        seen = {}
+
+        def _deny(event, **kwargs):
+            seen.update(kwargs)
+            return "policy"
+
+        with unittest.mock.patch.object(rp, "refusal_for", _deny):
+            pool = ReviewPool(agent="review-agent", work_dir=_work_dir(self))
+            expected_agent = pool._agent
+            await pool.begin_batch()
+            await pool.send("t")
+            handle = FakeRuntime.instances[0].last_handle
+            await pool.end_batch()
+
+        self.assertEqual(handle.approvals, [])
+        self.assertEqual(handle.rejections, ["r-policy"])
+        self.assertEqual(seen["session_key"], handle.session_id)
+        self.assertEqual(seen["agent"], expected_agent)
+        self.assertEqual(seen["app"], "code-review-sage")
+        self.assertFalse(seen["security_only"])
+
+    async def test_policy_deny_steers_the_host_notice_before_rejecting(self):
+        # No person reviews the reviewer's calls, so the deny is the host's:
+        # kiro-cli would tell the model "User denied tool execution", and the
+        # review text would blame a user. The notice must reach the session
+        # while the request is still unanswered -- steer, THEN reject.
+        trace: list = []
+
+        async def _steer(_handle, text):
+            trace.append(("steer", text))
+            return True
+
+        async def _reject(_handle, request_id):
+            trace.append(("reject", request_id))
+
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        with unittest.mock.patch.object(
+            rp, "refusal_for", lambda *_a, **_kw: "Blocked by security policy: private repo"
+        ), unittest.mock.patch.object(
+            FakeHandle, "supports_refusal_steer", True, create=True
+        ), unittest.mock.patch.object(
+            FakeHandle, "steer", _steer, create=True
+        ), unittest.mock.patch.object(FakeHandle, "reject_tool", _reject):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            await pool.send("t")
+            await pool.end_batch()
+
+        self.assertEqual([kind for kind, _ in trace], ["steer", "reject"])
+        notice = trace[0][1]
+        self.assertTrue(notice.startswith("[Kiro Crew host notice]"), notice)
+        self.assertIn("User denied tool execution", notice)
+        self.assertIn("private repo", notice)
+
+    async def test_policy_deny_audit_survives_reject_failure(self):
+        calls: list = []
+
+        class _FakeSel:
+            def log_tool_invocation(self, **kwargs):
+                calls.append(kwargs)
+
+        async def _reject(_handle, _request_id):
+            raise RuntimeError("wire closed")
+
+        script = [
+            _ev(
+                rp.EVENT_PERMISSION_REQUEST,
+                request_id="r-policy",
+                title="WorkspaceSearch",
+                tool_kind="other",
+            )
+        ]
+        _install_fake_runtime(self, script=script)
+        with unittest.mock.patch.object(rp, "refusal_for", lambda *_a, **_kw: "policy"), \
+                unittest.mock.patch.object(rp, "_sel", lambda: _FakeSel()), \
+                unittest.mock.patch.object(FakeHandle, "reject_tool", _reject):
+            pool = ReviewPool(work_dir=_work_dir(self))
+            await pool.begin_batch()
+            with self.assertRaisesRegex(RuntimeError, "wire closed"):
+                await pool.send("t")
+            await pool.end_batch()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["outcome"], "rejected_hook_deny")
+        self.assertEqual(calls[0]["request_id"], "r-policy")
 
     async def test_tool_call_emits_sel_audit(self):
         calls: list = []
@@ -476,6 +590,60 @@ class TestReviewEffort(unittest.TestCase):
     def test_write_effort_overlay_never_raises(self):
         _write_effort_overlay("/proc/nonexistent/\x00bad", "claude-sonnet-4.6")
 
+    def test_a_planted_link_at_the_overlay_name_takes_no_bytes(self):
+        """`work_dir` is the review worker's OWN cwd, so it is plantable.
+
+        A by-name `write_text` follows a link at the final component and
+        TRUNCATES whatever it points at, which turns this best-effort overlay
+        into an arbitrary-file-truncation primitive for a prompt-injected worker.
+        The staged replace lands on the NAME instead: the link is replaced, and
+        the file it aliased keeps its bytes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.txt"
+            victim.write_text("keep me\n", encoding="utf-8")
+            settings = Path(tmp) / ".kiro" / "settings"
+            settings.mkdir(parents=True)
+            cli = settings / "cli.json"
+            try:
+                cli.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("planting the attack needs symlink creation")
+
+            _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
+
+            self.assertEqual(victim.read_text(encoding="utf-8"), "keep me\n",
+                             "the aliased file was written through")
+            self.assertFalse(cli.is_symlink(), "the link survived the publish")
+
+    def test_a_planted_link_at_the_overlay_name_contributes_no_keys(self):
+        """The overlay READS `cli.json` before publishing the merged document.
+
+        The sibling case above covers the write: the publish lands on the name, so
+        the aliased file keeps its bytes. This covers the read, where the harm runs
+        the other way -- a following read copies the aliased document's keys INTO
+        the document published under this name, and the next worker loads that as
+        its own settings. The no-follow read refuses the plant, so the overlay is
+        built from "no settings yet".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            victim = Path(tmp) / "victim.json"
+            victim.write_text('{"borrowed_key": "not-from-this-file"}', encoding="utf-8")
+            settings = Path(tmp) / ".kiro" / "settings"
+            settings.mkdir(parents=True)
+            cli = settings / "cli.json"
+            try:
+                cli.symlink_to(victim)
+            except (OSError, NotImplementedError):
+                self.skipTest("planting the attack needs symlink creation")
+
+            _write_effort_overlay(tmp, "claude-sonnet-4.6", "high")
+
+            published = json.loads(cli.read_text(encoding="utf-8"))
+            self.assertNotIn("borrowed_key", published,
+                             "the aliased document's keys were republished")
+            self.assertEqual(list(published), ["chat.modelDefaults"])
+
     def test_reviewer_model_falls_back_to_default(self):
         self.assertEqual(
             _reviewer_model("definitely-not-installed-xyz"), _DEFAULT_REVIEW_MODEL)
@@ -530,3 +698,98 @@ class TestRuntimePreflight(unittest.TestCase):
                 unittest.mock.patch.object(rp, "resolve_kiro_cli", _resolver):
             rp.runtime_preflight()
         self.assertEqual(calls, ["resolve"])
+
+
+class TestReviewBackend(unittest.IsolatedAsyncioTestCase):
+    """The shared review runtime follows ``agent.acp_backend`` when that runtime
+    serves the backend, and otherwise stays on kiro-cli with one warning."""
+
+    def setUp(self):
+        rp._WARNED_FALLBACK_BACKENDS.clear()
+        self.addCleanup(rp._WARNED_FALLBACK_BACKENDS.clear)
+        self.calls: list[dict] = []
+        self.overlays: list[tuple] = []
+
+        def _record(**kwargs):
+            # A recording double, not a MagicMock: it keeps exactly what the
+            # pool passed so the test reads the real constructor kwargs.
+            self.calls.append(kwargs)
+            return FakeRuntime(agent=kwargs.get("agent"), work_dir=kwargs.get("work_dir"))
+
+        patcher = unittest.mock.patch.object(
+            rp, "AcpRuntime", unittest.mock.Mock(side_effect=_record))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        overlay = unittest.mock.patch.object(
+            rp, "_write_effort_overlay", lambda *a, **k: self.overlays.append(a))
+        overlay.start()
+        self.addCleanup(overlay.stop)
+
+    def _configure(self, value):
+        stored = rp._ABSENT_AGENT_KEY if value is None else value
+        patcher = unittest.mock.patch.object(
+            rp, "_stored_agent_value", lambda key: stored if key == "acp_backend" else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _spawn(self):
+        pool = ReviewPool(work_dir=_work_dir(self))
+        await pool.begin_batch()
+        await pool.end_batch()
+        self.assertEqual(len(self.calls), 1)
+        return self.calls[0]
+
+    async def test_kas_reaches_the_runtime_constructor(self):
+        self._configure("kas")
+        kwargs = await self._spawn()
+        self.assertEqual(kwargs["acp_backend"], "kas")
+        self.assertEqual(self.overlays, [])   # kas reads no cli.json overlay
+
+    async def test_unset_backend_stays_on_kiro(self):
+        self._configure(None)
+        with self.assertNoLogs(rp.logger, level="WARNING"):
+            kwargs = await self._spawn()
+        self.assertEqual(kwargs["acp_backend"], rp.ACP_BACKEND_KIRO)
+        self.assertEqual(len(self.overlays), 1)   # kiro still gets its effort overlay
+
+    async def test_stored_kiro_stays_on_kiro(self):
+        self._configure("kiro")
+        kwargs = await self._spawn()
+        self.assertEqual(kwargs["acp_backend"], rp.ACP_BACKEND_KIRO)
+
+    async def test_claude_falls_back_to_kiro_and_warns_once(self):
+        self._configure("claude")
+        with self.assertLogs(rp.logger, level="WARNING") as logs:
+            kwargs = await self._spawn()
+            self.assertEqual(rp.review_backend(), rp.ACP_BACKEND_KIRO)
+        self.assertEqual(kwargs["acp_backend"], rp.ACP_BACKEND_KIRO)
+        warnings = [r for r in logs.records if r.levelname == "WARNING"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("'claude'", warnings[0].getMessage())
+        self.assertIn("kiro-cli", warnings[0].getMessage())
+
+    def test_reads_agent_acp_backend_from_gateway_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.json").write_text(
+                json.dumps({"agent": {"acp_backend": "codex"}}), encoding="utf-8")
+            with unittest.mock.patch.dict(os.environ, {"KIROCREW_HOME": tmp}):
+                self.assertEqual(rp.review_backend(), "codex")
+
+    def test_config_local_overlay_wins_over_config_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "config.json").write_text(
+                json.dumps({"agent": {"acp_backend": "codex"}}), encoding="utf-8")
+            Path(tmp, "config.local.json").write_text(
+                json.dumps({"agent": {"acp_backend": "kiro"}}), encoding="utf-8")
+            with unittest.mock.patch.dict(os.environ, {"KIROCREW_HOME": tmp}):
+                self.assertEqual(rp.review_backend(), rp.ACP_BACKEND_KIRO)
+
+    def test_preflight_skips_kiro_cli_lookup_for_a_non_kiro_backend(self):
+        self._configure("kas")
+        with unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: None):
+            self.assertEqual(rp.runtime_preflight(), "")
+
+    def test_preflight_still_requires_kiro_cli_on_kiro(self):
+        self._configure(None)
+        with unittest.mock.patch.object(rp, "resolve_kiro_cli", lambda: None):
+            self.assertIn("kiro-cli", rp.runtime_preflight())

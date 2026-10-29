@@ -2,6 +2,11 @@ import { describe, it, expect } from 'vitest'
 import { screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from '../pages/chat/SubagentRunCard'
+import { NEVER_STARTED_PREFIX } from '../pages/chat/subagentQueuedReason'
+
+/** The gate's terminal for a start the low-memory wait ended past its bound
+ *  (`QUEUED_WAIT_EXPIRED_TEXT`, backend). */
+const LOW_MEMORY_EXPIRED = `${NEVER_STARTED_PREFIX} (not enough memory freed up in time); retry once memory frees up`
 import type { RootState } from '../store'
 import type { ChatMessage, SubagentActivity } from '../types'
 
@@ -63,6 +68,29 @@ describe('extractSpawnRunLaunch — MCP result envelope', () => {
     const bare = 'Spawned 1 subagent(s). Results will arrive as completion events:\n  aaaa1111 (kirocrew): do a thing\n'
     const msg = { role: 'tool', content: '🔧 spawn', cls: '', meta: { output: bare } } as ChatMessage
     expect(extractSpawnRunLaunch(msg)).toEqual({ ids: ['aaaa1111'], announced: 1 })
+  })
+
+  it('recognises a queued-only wave (the gate deferred every member) as a launch', () => {
+    // Without this the card never rendered for exactly the wave whose waiting
+    // it exists to show: spawn_run heads a deferred group with `Queued N
+    // subagent(s).` instead of `Spawned`.
+    const queued =
+      'Queued 1 subagent(s). Not started yet: low memory: 3.2 GB available, need 4 GB. ' +
+      'The gateway re-checks every admit wait and starts each one once the condition clears; only then does its result arrive:\n' +
+      '  aaaa1111 (kirocrew): do a thing\n'
+    const msg = { role: 'tool', content: '🔧 spawn', cls: '', meta: { output: queued } } as ChatMessage
+    expect(extractSpawnRunLaunch(msg)).toEqual({ ids: ['aaaa1111'], announced: 1 })
+  })
+
+  it('sums the announced count across a Spawned and a Queued group', () => {
+    const mixed =
+      'Spawned 1 subagent(s). Results will arrive as completion events:\n' +
+      '  aaaa1111 (kirocrew): started\n' +
+      'Queued 2 subagent(s). Not started yet: low memory: 3.2 GB available, need 4 GB. The gateway re-checks:\n' +
+      '  bbbb2222 (kirocrew): waits\n' +
+      '  cccc3333 (kirocrew): waits too\n'
+    const msg = { role: 'tool', content: '🔧 spawn', cls: '', meta: { output: mixed } } as ChatMessage
+    expect(extractSpawnRunLaunch(msg)).toEqual({ ids: ['aaaa1111', 'bbbb2222', 'cccc3333'], announced: 3 })
   })
 
   it('falls back to raw scanning when the envelope is truncated or malformed', () => {
@@ -242,6 +270,88 @@ describe('SubagentRunCard rendering', () => {
     expect(screen.queryByText('0 agents running')).toBeNull()
   })
 
+  it('keeps the concurrency tooltip when the gateway gave no reason', () => {
+    const store = createTestStore({
+      chat: { activeSlot: SLOT, subagents: {}, subagentQueued: { [SLOT]: 3 } } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByTestId('subagent-card-queued').getAttribute('title'))
+      .toBe('Waiting to start — queued behind the concurrency limit')
+  })
+
+  it('explains a memory-deferred wait in the queued chip tooltip', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: {},
+        subagentQueued: { [SLOT]: 1 },
+        subagentQueuedReason: { [SLOT]: { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 } },
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    const title = screen.getByTestId('subagent-card-queued').getAttribute('title') ?? ''
+    expect(title).toMatch(/4\.5\s?GB/)
+    expect(title).toMatch(/3\.2\s?GB/)
+    expect(title).not.toContain('concurrency limit')
+    // The visible chip is unchanged: the count and the word "waiting".
+    expect(screen.getByTestId('subagent-card-queued').textContent).toContain('1 waiting')
+  })
+
+  it('renders the deferral sentence as visible text on the card, not only in the tooltip', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: {},
+        subagentQueued: { [SLOT]: 1 },
+        subagentQueuedReason: { [SLOT]: { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 } },
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    const line = screen.getByTestId('subagent-card-wait-reason')
+    expect(line.textContent).toContain('free up memory to continue')
+    expect(line.getAttribute('role')).toBe('status')
+    // The one sentence the user must act on is not the quietest text on the card.
+    expect(line.className).toContain('text-warn')
+  })
+
+  it('keeps the wait line after one member finished while others still wait', () => {
+    // A mixed wave: one member done, two deferred. Gating the line on "nothing
+    // settled yet" hid an hours-long deferral the moment a sibling finished.
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: { a1: agent('a1', 'done') },
+        subagentQueued: { [SLOT]: 2 },
+        subagentQueuedReason: { [SLOT]: { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 } },
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByTestId('subagent-card-wait-reason').textContent).toContain('free up memory to continue')
+  })
+
+  it('drops the wait line once this whole wave has finished, even if the slot queues again', () => {
+    // The count is keyed by slot, not by launch: a later wave's queue must not
+    // be worn by a card whose own wave is over.
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: { a1: agent('a1', 'done'), a2: agent('a2', 'done'), a3: agent('a3', 'error') },
+        subagentQueued: { [SLOT]: 1 },
+        subagentQueuedReason: { [SLOT]: { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 } },
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.queryByTestId('subagent-card-wait-reason')).toBeNull()
+  })
+
+  it('renders no wait line for a bare count (older gateway)', () => {
+    const store = createTestStore({
+      chat: { activeSlot: SLOT, subagents: {}, subagentQueued: { [SLOT]: 3 } } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.queryByTestId('subagent-card-wait-reason')).toBeNull()
+  })
+
   it('reads a background slot from slotActivity, not the active map', () => {
     const store = createTestStore({
       chat: {
@@ -253,6 +363,95 @@ describe('SubagentRunCard rendering', () => {
     })
     renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
     expect(screen.getByText('1 agent running')).toBeTruthy()
+  })
+
+  it('says the wave never started when the hold ended every member', () => {
+    // The gate's terminal error for a start its macOS memory-pressure hold ended.
+    // "3 agents finished" over a wave that launched nothing read as success, so
+    // the header names what happened instead.
+    const ended = (id: string) => ({
+      ...agent(id, 'error'),
+      error: `${NEVER_STARTED_PREFIX} (macOS memory pressure did not ease in time)`,
+    })
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: { a1: ended('a1'), a2: ended('a2'), a3: ended('a3') },
+        subagentQueued: {},
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('3 agents never started')).toBeTruthy()
+    expect(screen.queryByText('3 agents finished')).toBeNull()
+    // The terminal card keeps the cause and the way out, as the waiting card did.
+    const reason = screen.getByTestId('subagent-card-never-started-reason').textContent ?? ''
+    expect(reason).toContain('3 never started')
+    expect(reason).toContain('macOS memory pressure did not ease in time')
+    // The way out names the control that does it, so it is not read as automatic.
+    expect(reason).toContain('Retry failed')
+    // A failure renders through the shared error surface, outside the card's
+    // button (errors-use-error-notice): an alert nested in a button is not read.
+    const notice = screen.getByTestId('subagent-card-never-started-reason')
+    expect(notice.getAttribute('role')).toBe('alert')
+    expect(screen.getByTestId('subagent-run-card').contains(notice)).toBe(false)
+  })
+
+  it('says how many ran and shows the cause when only some members never started', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: {
+          a1: agent('a1', 'done'),
+          a2: agent('a2', 'done'),
+          a3: { ...agent('a3', 'error'), error: LOW_MEMORY_EXPIRED },
+        },
+        subagentQueued: {},
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('2 of 3 agents ran')).toBeTruthy()
+    expect(screen.queryByText('3 agents finished')).toBeNull()
+    // The member that never started keeps its cause on the card all the same.
+    // Counted, so the line binds to the one failed member, not the whole wave.
+    // It names the reason that run ended with: a low-memory expiry is not a
+    // macOS pressure hold.
+    const reason = screen.getByTestId('subagent-card-never-started-reason').textContent ?? ''
+    expect(reason).toBe(
+      '1 never started — not enough memory freed up in time; free up memory, then use “Retry failed” in the Subagents panel',
+    )
+    expect(reason).not.toContain('macOS')
+  })
+
+  it('names each reason once when a wave ended both ways', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: {
+          a1: { ...agent('a1', 'error'), error: LOW_MEMORY_EXPIRED },
+          a2: { ...agent('a2', 'error'), error: LOW_MEMORY_EXPIRED },
+          a3: { ...agent('a3', 'error'), error: `${NEVER_STARTED_PREFIX} (macOS memory pressure did not ease in time)` },
+        },
+        subagentQueued: {},
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('3 agents never started')).toBeTruthy()
+    const notes = screen.getAllByTestId('subagent-card-never-started-reason').map(n => n.textContent ?? '')
+    expect(notes).toHaveLength(2)
+    expect(notes[0]).toContain('1 never started — macOS memory pressure did not ease in time')
+    expect(notes[1]).toContain('2 never started — not enough memory freed up in time')
+  })
+
+  it('renders no never-started line for an ordinary settled wave', () => {
+    const store = createTestStore({
+      chat: {
+        activeSlot: SLOT,
+        subagents: { a1: agent('a1', 'done'), a2: agent('a2', 'done'), a3: agent('a3', 'error') },
+        subagentQueued: {},
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.queryByTestId('subagent-card-never-started-reason')).toBeNull()
   })
 
   it('shows a finished summary once the wave settles', () => {
@@ -401,6 +600,15 @@ describe('SubagentRunCard — a run parked on a spawn approval is not running', 
     const store = storeWith({ a1: agent('a1', 'pending'), a2: agent('a2', 'running') })
     renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
     expect(screen.getByText('2 agents running')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-card-awaiting')).toBeNull()
+  })
+  it('neither awaits nor runs a member whose approval is gone', () => {
+    // A terminal refusal withdrew the decision everywhere it is offered, and no
+    // outcome is known: not owed to the user, and not yet proven running.
+    const gone = { ...parked('a1'), approvalGone: 'spawn:a1' } as SubagentActivity
+    const store = storeWith({ a1: gone, a2: agent('a2', 'running') })
+    renderWithProviders(<SubagentRunCard launch={launch} slot={SLOT} />, { store })
+    expect(screen.getByText('1 agent running')).toBeTruthy()
     expect(screen.queryByTestId('subagent-card-awaiting')).toBeNull()
   })
 })

@@ -42,9 +42,19 @@ def _make_state(tmp_path, **kwargs):
     return state
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    state = request.app.get("state")
+    if state is not None:
+        state.owner_id = ""
+    return await handler(request)
+
+
 def _make_api_app(state: DashboardState) -> web.Application:
     """Minimal app using only _register_mcp_routes (same as start_api_server)."""
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
     app["state"] = state
     app["port"] = 5476
     _register_mcp_routes(app)
@@ -79,9 +89,11 @@ class TestLocalTokenTransportAdmission:
 
     @staticmethod
     def _allow_owner_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.member_memory_auth import LocalOwnerProvenance
+
         monkeypatch.setattr(
-            "kiro_crew.member_memory_auth.local_owner_bootstrap_allowed",
-            lambda _request: True,
+            "kiro_crew.member_memory_auth.local_owner_bootstrap_provenance",
+            lambda _request: LocalOwnerProvenance(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
 
@@ -338,7 +350,7 @@ class TestApiServerSpawn:
         mock_mgr.get.return_value = old
         mock_mgr.spawn.return_value = MagicMock(id="retry-1", done=False, error="")
         state = _make_state(tmp_path, subagents=mock_mgr)
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_identity])
         app["state"] = state
         app.router.add_post("/api/spawn/{agent_id}/retry", api_spawn_retry)
         async with TestClient(TestServer(app)) as client:
@@ -462,6 +474,7 @@ class TestStartApiServerWiring:
         monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
         service = MagicMock()
         service.close = AsyncMock()
+        service.seed_sessions_baseline = AsyncMock(return_value=True)
         monkeypatch.setattr(
             _prerequisite, "KiroPrerequisiteService", MagicMock(return_value=service)
         )
@@ -501,6 +514,7 @@ class TestStartApiServerWiring:
         monkeypatch.setattr(_loader, "config_dir", lambda: tmp_path)
         service = MagicMock()
         service.close = AsyncMock()
+        service.seed_sessions_baseline = AsyncMock(return_value=True)
         service_factory = MagicMock(return_value=service)
         monkeypatch.setattr(
             _prerequisite,
@@ -569,7 +583,7 @@ class TestApiServerAuth:
         #  - server.py binds ``from kiro_crew.config import data_home`` at module
         #    scope (its own name) — used for the .local_secret write.
         #  - state.py binds ``from kiro_crew.config.loader import config_dir``.
-        #  - token_auth.py imports ``config_dir`` LAZILY inside functions from
+        #  - token_auth_tokens.py imports ``config_dir`` LAZILY inside functions from
         #    kiro_crew.config.loader, so patch the real ``loader.config_dir``.
         # All three are REAL module attributes (loader has no __getattr__), so
         # monkeypatch restores them cleanly. Do NOT patch
@@ -648,6 +662,23 @@ class TestApiServerAuth:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(f"{base}/api/lessons", json={"text": "injected"}) as resp:
+                    assert resp.status == 403
+        finally:
+            await runner.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_get_lessons_denied_without_secret(self, tmp_path, monkeypatch):
+        # The all-workspaces lesson union is served on the operator's own BROWSER
+        # branch of GET /api/lessons (no X-Internal-Secret). That branch is only
+        # ever reached AFTER the token-auth middleware authenticates the request:
+        # an anonymous GET is 403'd before the handler runs, so the union is not
+        # reachable without dashboard operator auth.
+        import aiohttp
+
+        runner, _state, base = await self._start(tmp_path, monkeypatch)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{base}/api/lessons") as resp:
                     assert resp.status == 403
         finally:
             await runner.cleanup()
@@ -805,7 +836,10 @@ class TestApiKirocrewConfig:
     def _make_app(tmp_path):
         from kiro_crew.dashboard import handlers
 
-        app = web.Application()
+        app = web.Application(middlewares=[_owner_identity])
+        state = MagicMock()
+        state.owner_id = ""
+        app["state"] = state
         app.router.add_get("/api/config/kirocrew", handlers.api_kirocrew_config)
         app.router.add_put("/api/config/kirocrew", handlers.api_kirocrew_config)
         return app

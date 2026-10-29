@@ -114,20 +114,17 @@ class TestGooseIsRoutedViaPermissionRequest:
     def test_verdict_is_routed(self, tmp_path: Path) -> None:
         verdict, reason = tool_gate.resolve_verdict(ACP_BACKEND_GOOSE, tmp_path)
         assert verdict is Verdict.ROUTED
-        assert "pins goose session mode approve" in reason
+        assert "GOOSE_MODE=approve" in reason
 
-    def test_enforce_succeeds_without_the_opt_out(self, tmp_path: Path) -> None:
-        tool_gate.enforce(ACP_BACKEND_GOOSE, tmp_path, allow_ungated=False)
-
-    def test_the_named_opt_out_still_permits_startup(self, tmp_path: Path) -> None:
-        tool_gate.enforce(ACP_BACKEND_GOOSE, tmp_path, allow_ungated=True)
+    def test_routed_start_needs_no_opt_out(self, tmp_path: Path) -> None:
+        tool_gate.enforce(ACP_BACKEND_GOOSE, tmp_path)
 
     def test_nothing_is_written_into_the_work_dir(self, tmp_path: Path) -> None:
         tool_gate.resolve_verdict(ACP_BACKEND_GOOSE, tmp_path)
         assert list(tmp_path.iterdir()) == []
 
 
-class TestUnverifiedAdapterFailsClosed:
+class TestUnverifiedRegistryAdapter:
     """The generic path for the adapters Kiro Crew has NOT verified.
 
     Exercised through a SYNTHESISED descriptor rather than a registered backend
@@ -167,19 +164,11 @@ class TestUnverifiedAdapterFailsClosed:
         assert verdict is Verdict.INDETERMINATE
         assert "not established" in reason
 
-    def test_enforce_refuses_by_default(self, unverified: str, tmp_path: Path) -> None:
-        with pytest.raises(tool_gate.ToolGateUnroutable) as excinfo:
-            tool_gate.enforce(unverified, tmp_path, allow_ungated=False)
-        message = str(excinfo.value)
-        # The refusal must say what is not being enforced and name the one opt-out,
-        # or an operator cannot tell a policy refusal from a crash.
-        assert "denied-command" in message
-        assert "sensitive-path" in message
-        assert "acp_backend_allow_ungated_tools" in message
-
-    def test_the_named_opt_out_still_works(self, unverified: str, tmp_path: Path) -> None:
-        """One documented escape hatch, so an operator is never simply stuck."""
-        tool_gate.enforce(unverified, tmp_path, allow_ungated=True)
+    def test_unenforced_registry_route_does_not_claim_a_guarantee(
+        self, unverified: str, tmp_path: Path
+    ) -> None:
+        """Registry selection is gated elsewhere; this core does not invent an enforcement."""
+        tool_gate.enforce(unverified, tmp_path)
 
     def test_remediation_does_not_invent_a_setting(self, unverified: str) -> None:
         """There is no config change that verifies an adapter, so promise none."""
@@ -324,14 +313,8 @@ async def test_unverified_adapter_skips_session_load_even_when_advertised(
     assert client._session_id == "fresh-unverified"
 
 
-def test_goose_spawn_continue_names_the_harness_when_resume_is_unavailable() -> None:
-    """spawn_continue fail-closes with a named reason, not a blank child."""
-    from kiro_crew.subagent import _resume_failed_message
-
-    client = MagicMock()
-    client.backend = ACP_BACKEND_GOOSE
-    message = _resume_failed_message(client, "subagent:child-1")
-    assert message.startswith("resume_failed:")
-    assert "does not support native resume" in message
-    assert "subagent:child-1" in message
-    assert "goose" in message.lower()
+def test_goose_resume_is_disabled_until_transcript_restore_is_verified() -> None:
+    """An advertised loadSession method alone does not establish resume support."""
+    assert (
+        backends.level(ACP_BACKEND_GOOSE, backends.CAP_NATIVE_RESUME) is backends.Level.UNAVAILABLE
+    )

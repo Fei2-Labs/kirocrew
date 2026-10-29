@@ -18,24 +18,15 @@ path of everything that touches any part of this package, including
 import X`` keeps working for every name in ``__all__``; it just resolves on first
 access instead of at package import.
 
-**A caller and anything that substitutes what it calls must name the SAME
-module.** ``__getattr__`` resolves a name fresh on every access, but only while
-the package does not itself hold that name, and a ``monkeypatch.setattr(stt,
-"x", ...)`` leaves the original behind as a real attribute on teardown. From then
-on that attribute shadows ``__getattr__``, and a patch applied to
-``stt.models.x`` is invisible to anyone reading ``stt.x``. The failure is silent
-and order-dependent: it needs a full-suite run and some unrelated file to have
-touched the name first.
-
-Either side is fine as long as they agree. ``transcribe.py`` reads
-``stt.transcribe_pcm`` and its tests patch the package, which works. A caller
-whose substitute lives on the submodule reads the submodule
-(``from kiro_crew.stt import models as stt_models``). Mixing the two is the bug,
-and it cost this package one: ``GET /api/stt/status`` read ``stt.is_present``
-while its test patched ``stt.models.is_present``, and reported every model absent
-on a host where the files were there.
-
-Constants and classes are safe either way, because nothing substitutes them.
+**A re-exported name lives in exactly one place: the submodule that defines it.**
+Reading ``stt.transcribe_pcm`` reads ``stt.session.transcribe_pcm``, and writing
+``stt.transcribe_pcm`` writes ``stt.session.transcribe_pcm``, so the two spellings
+of a name always hold the same value. A caller and anything that substitutes what
+it calls are therefore free to name either one: ``transcribe.py`` reads
+``stt.transcribe_pcm`` while a test patches the package, a caller whose substitute
+lives on the submodule reads the submodule
+(``from kiro_crew.stt import models as stt_models``), and mixing the two spellings
+resolves to the same object.
 
 Nothing here imports the recogniser binding itself. It is an optional extra, so a
 gateway installed without it starts normally and :func:`availability` reports why
@@ -44,7 +35,10 @@ voice input is unavailable.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import importlib
+import sys
+from types import ModuleType
+from typing import TYPE_CHECKING, Any
 
 #: Which submodule owns each public name, and the table :func:`__getattr__`
 #: resolves through, so a name absent here is genuinely not part of the surface.
@@ -55,9 +49,12 @@ _EXPORTS: dict[str, str] = {
     "CODE_DECODE_FAILED": "engine",
     "CODE_EXTRA_MISSING": "engine",
     "CODE_IMPORT_FAILED": "engine",
+    "CODE_LOAD_CRASHED": "engine",
     "CODE_MODEL_MISSING": "engine",
+    "CODE_NATIVE_PROBE_CRASHED": "engine",
     "CODE_NO_WHEEL": "engine",
     "CODE_OK": "engine",
+    "CODE_UNSUPPORTED_CPU": "engine",
     "DecodeFailed": "engine",
     "pcm_from_int16": "engine",
     "SAMPLE_RATE_HZ": "vad",
@@ -82,9 +79,12 @@ __all__ = [
     "CODE_DECODE_FAILED",
     "CODE_EXTRA_MISSING",
     "CODE_IMPORT_FAILED",
+    "CODE_LOAD_CRASHED",
     "CODE_MODEL_MISSING",
+    "CODE_NATIVE_PROBE_CRASHED",
     "CODE_NO_WHEEL",
     "CODE_OK",
+    "CODE_UNSUPPORTED_CPU",
     "DECODE_FAILED_ADVISORY",
     "DecodeFailed",
     "KIND_ERROR",
@@ -117,9 +117,12 @@ if TYPE_CHECKING:
         CODE_DECODE_FAILED,
         CODE_EXTRA_MISSING,
         CODE_IMPORT_FAILED,
+        CODE_LOAD_CRASHED,
         CODE_MODEL_MISSING,
+        CODE_NATIVE_PROBE_CRASHED,
         CODE_NO_WHEEL,
         CODE_OK,
+        CODE_UNSUPPORTED_CPU,
         Availability,
         DecodeFailed,
         pcm_from_int16,
@@ -177,16 +180,62 @@ def model_store() -> ModelStore:
     return _store()
 
 
-def __getattr__(name: str) -> object:
-    """Resolve a public name from its owning submodule (PEP 562)."""
-    module = _EXPORTS.get(name)
-    if module is not None:
-        # Imported here, not at module scope: a top-level import would defeat this
-        # seam entirely and put numpy back on the CLI's import path.
-        from importlib import import_module
+#: Package attribute -> ``(owning module, symbol on that module)``. Each owning
+#: submodule is imported on first access, not here: a top-level import would defeat
+#: this seam entirely and put numpy back on the CLI's import path.
+_OWNED: dict[str, tuple[str, str]] = {
+    name: (f"{__name__}.{module}", name) for name, module in _EXPORTS.items()
+}
 
-        return getattr(import_module(f"{__name__}.{module}"), name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+def _owner(name: str) -> ModuleType:
+    """Return the module that defines ``name``, importing it on first use.
+
+    ``importlib.import_module`` is the resolution rather than a mapping kept here.
+    It answers from :data:`sys.modules`, the one place a module is stored, so a
+    purged or replaced owner is seen at once; and it waits on that module's import
+    lock while its body is still running. A private mapping of resolved owners
+    would be a second storage location, and a bare ``sys.modules`` read would hand
+    a partially initialised module to a thread that asks for a name while another
+    thread is still importing its owner -- the STT engine is imported off the event
+    loop while the gateway keeps serving, so that window is a live one.
+    """
+    module_name = _OWNED[name][0]
+    return importlib.import_module(module_name)
+
+
+def __getattr__(name: str) -> Any:
+    """Read a re-exported name from the module that owns it (:pep:`562`)."""
+    if name not in _OWNED:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(_owner(name), _OWNED[name][1])
+
+
+class _ReExportModule(ModuleType):
+    """Send a write to a re-exported name to the module that owns it.
+
+    Binding the name in this package's own namespace instead would shadow the
+    owner permanently, because ``__getattr__`` runs only for a name the package
+    does not already hold: the shadow would win every later read, and the owner's
+    value would become unreachable through this package. Forwarding the write
+    leaves one value for a test harness to remember and one to put back, which is
+    what lets a caller and its test name either spelling.
+    """
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _OWNED:
+            setattr(_owner(name), _OWNED[name][1], value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in _OWNED:
+            delattr(_owner(name), _OWNED[name][1])
+        else:
+            super().__delattr__(name)
+
+
+sys.modules[__name__].__class__ = _ReExportModule
 
 
 def __dir__() -> list[str]:

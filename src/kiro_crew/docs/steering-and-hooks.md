@@ -8,7 +8,7 @@ Three ways to change what an agent does without editing its agent spec:
   starting, a prompt arriving, a tool about to run. Automation.
 - **Saved prompts** are reusable message bodies you call up by name. Shortcuts.
 
-All three live under Agent Capabilities in the dashboard, on the **Steering
+All three live under Customize in the dashboard, on the **Steering
 files**, **Hooks** and **Prompts** tabs. Hooks also have their own page at
 `/hooks`.
 
@@ -32,7 +32,7 @@ session subprocess runs with the chat slot's project directory as its working
 directory. On the Claude Code backend, which does not read an agent spec's
 `resources` array, the gateway loads the global root explicitly —
 `steering_target_admissible` and `_load_steering_resources` in
-`src/kiro_crew/context.py` glob the agent config's
+`src/kiro_crew/context_assembly/agent_spec.py` glob the agent config's
 `file://.kiro/steering/**/*.md` resource against `$HOME`.
 
 A workspace file therefore needs a project bound to the chat slot. With no
@@ -171,6 +171,98 @@ hook that merely records something from looping the session. Write that JSON onl
 when you mean "not done yet", and make the reason the instruction you want the
 agent to act on.
 
+### The six Kiro Agent triggers
+
+A Kiro Agent session has eleven triggers where the gateway has five. The other
+six can be authored and saved here, and a saved one reads back unchanged.
+
+**No event fires any of them.** The gateway has no lifecycle moment for the six,
+so nothing fires one on its own, and no other reader exists. Authoring one records
+the intent; it does not schedule a command.
+
+One thing does still run the command: the **Test** button on the hook's row, the
+same as for any other hook. Test is how you check a command works, and it is the
+only way one of these six runs at all today.
+
+The six do not all sit the same distance from running, and the table says which
+is which. A Kiro Agent asks its client for hooks by trigger name, and the names
+it can ask for are a fixed list — `preTaskExecution` and `postTaskExecution` are
+on it, and the file and manual triggers are not. So two of the six are waiting
+on Kiro Crew answering that request, and the other four are waiting on a Kiro
+Agent learning to ask at all. Save one of those four for the record, not for an
+imminent run.
+
+| Trigger | The agent's moment | Asked for | The row says |
+|---|---|---|---|
+| `PreTaskExecution` | before it starts a task | yes | `not fired yet` |
+| `PostTaskExecution` | after it finishes one | yes | `not fired yet` |
+| `FileCreated` | it created a file | no | `never fires` |
+| `FileEdited` | it saved an edit | no | `never fires` |
+| `FileDeleted` | it deleted a file | no | `never fires` |
+| `UserTriggered` | you ran the hook by hand | no | `never fires` |
+
+Each of the six is the PascalCase form of a trigger name Kiro's own hook schema
+carries, which is why all six are worth storing: the hook you write today is
+written against a documented name rather than a guess at one. The manual trigger
+is the furthest of the six from running — Kiro's current hook-file schema has no
+equivalent for it at all, so `Test` is its whole run path here.
+
+**A hook on one of the six is saved switched off.** Nothing runs it either way
+today, so that costs you nothing now, and it is what keeps a later release honest:
+the change that starts firing these events finds your hook already off, so it
+cannot run a command you wrote months ago and never looked at again. Switch it on
+when you want it live. **Test runs it whether it is on or off**, so you can check
+the command works today — for a trigger nothing fires, Test is not a rehearsal, it is
+the only way the hook runs at all. The form says so before you save, so a row that
+comes back with its switch off does not read as a save that failed.
+
+If you switch one on anyway, the switch itself says what that means — for the two the
+agent asks for, nothing fires them yet; for the other four, nothing ever fires them on
+their own. Both are true at once: the switch is your intent, the mark is what the
+gateway does.
+
+**Editing a working hook onto one of the six switches it off too.** That is the same
+rule, on the other write path: a hook that already runs on `PreToolUse` and is pointed
+at `FileEdited` is stored off, because nothing has reconfirmed that command for the new
+trigger. Switching it on in the same edit is honoured. A hook already on one of the six
+keeps whatever state you gave it, so editing its command does not switch it off again.
+
+**A hook on one of the six takes no matcher.** Saving one is refused. A matcher
+filters something in the event's payload — a tool name on the tool events, your
+message on the message ones — and these events have no payload, because nothing
+fires them. A filter stored now would be written against whatever you had in mind
+(`*.py` meaning a path, say) while the change that defines the payload is free to
+pick a different subject, and your hook would then fire on the wrong things or on
+nothing at all. So the field is refused until there is a payload to point it at,
+and the form says that where the field would have been rather than leaving you to
+guess why two fields disappeared. A matcher you already typed is not destroyed by
+the detour: it is dropped when the hook is SAVED against one of the six, so picking
+one of them and then picking a tool event again gives your filter back.
+
+**You can see this on the row without reading this page.** The Hooks tab marks a
+hook against one of the six in its Status column, and marks the trigger in the
+picker as you choose it — `not fired yet` for the two the agent supports, `never fires`
+for the four it does not. The two marks also LOOK different, because at pill size the
+wording alone was still being mixed up: a trigger the agent asks for gets a solid pill,
+one it does not gets a hollow dashed one. Both stay muted — neither is a fault. Choosing
+one spells the mark out in the form as ordinary text, and either mark also carries the
+same line as a tooltip on the row. The mark is read
+from the same two sets the table above states, so a trigger that gains delivery
+stops being marked without anyone editing the words. Once you Test such a hook the
+run's result appears BESIDE the mark rather than replacing it: whether anything
+fires the trigger and how the last run went are different facts, and a single Test
+should not delete the first one from the table for good.
+
+Two consequences worth knowing before you write one. There is no exit-code vote
+here — the deny contract belongs to `PreToolUse` and to nothing else — and a
+skills-only hook still pairs with `UserPromptSubmit` or `AgentSpawn` alone,
+because the "Load skills:" directive has no reader on any of these.
+
+These six also never travel in a generated kiro-cli agent spec. kiro-cli's hook
+map is a closed set of its own five names, and a spec carrying a sixth key does
+not load at all, so a hook saved against one of these triggers is kept here and
+left out of that file.
+
 ### What a hook runs
 
 A hook's `command` is one shell command line, stored in `~/.kiro/crew/hooks.json`.
@@ -180,7 +272,15 @@ Windows. Write `$KIROCREW_HOOK_EVENT` on one and `%KIROCREW_HOOK_EVENT%` on the
 other; single quotes group nothing under `cmd.exe`.
 
 Both platforms get `KIROCREW_HOOK_EVENT` and `KIROCREW_HOOK_CONTEXT` in the
-environment, and the hook-event JSON on stdin.
+environment, and the hook-event JSON on stdin. `KIROCREW_HOOK_CONTEXT` is capped
+at 500 characters on every event. Read the full text from stdin instead: `prompt`
+on `UserPromptSubmit`, `assistant_text` on `Stop`.
+
+The stdin JSON names who fired the event, each key only when known, so read
+them with a default: `session_key` is the firing session's own key (a dashboard
+chat, a channel thread); `subagent_id` and `parent_session_key` appear only on
+an event a spawned subagent fired. To tell a person's turn from a subagent's,
+check for `subagent_id`, not `parent_session_key`.
 
 **A hook does not inherit the gateway's environment.** The gateway process holds
 provider keys and tokens, so a hook subprocess gets an allowlisted slice instead
@@ -194,7 +294,7 @@ A hook's fields:
 
 | Field | Means |
 |---|---|
-| `event` | one of the five above |
+| `event` | one of the eleven above |
 | `matcher` | what the hook filters on; empty means every call, or every message |
 | `matcher_mode` | `glob` (default), `regex`, or `contains` — read only for the message events, never for a tool matcher |
 | `command` | the shell line |
@@ -259,6 +359,60 @@ Bundled hooks always come first and your entries are appended per event, deduped
 by command and matcher. A command must be an absolute path to an existing file
 outside sensitive locations, and only `command` and `matcher` are kept — extra
 keys are stripped.
+
+`kiro_hooks` also accepts the array of hook documents a kiro-agent profile uses,
+so a spec written for either tool loads here:
+
+```json
+{"agent": {"kiro_hooks": [
+  {"name": "guard", "trigger": "PreToolUse", "matcher": "*",
+   "action": {"type": "command", "command": "/path/to/hook.sh"}}
+]}}
+```
+
+Both shapes are held to the same bar: same command and matcher rules, same
+dedup, same per-event and total caps. Twelve triggers are accepted, each in
+kiro-agent's own PascalCase, its IDE camelCase spelling, or its CLI alias —
+the whole table from kiro-agent's `packages/kiro-agent/src/hooks/trigger-names.ts` at blob `2d4a3127e32e5e81e68d5c2ea406a6a5728f6d78`, matched without regard to case. Five map onto the five kiro-cli event
+names: `PreToolUse` to `preToolUse`, `PostToolUse` to `postToolUse`,
+`UserPromptSubmit` to `userPromptSubmit`, `SessionStart` to `agentSpawn`, `Stop`
+to `stop`. Only those five reach kiro-cli; a hook on `SessionEnd`, `PreTaskExec`,
+`PostTaskExec`, `PostFileCreate`, `PostFileSave`, `PostFileDelete` or `Manual`
+stays in your config and is not installed for that trigger. Autoimport is a
+separate path: a script sitting in your hooks directory is still discovered there
+on its own, on the event that scan infers, unless a hook you switched off names
+it. An `action` of type `agent` has no
+kiro-cli slot either, so it does not run there. Same for the per-hook `name`,
+`description` and `timeout`: kiro-cli is handed the command and the matcher, and
+the rest stays in your config. A `timeout` is the one of those three that asked
+for less, so it says so: the command still runs, under kiro-cli's own bound
+rather than yours, and a line names the hook when that happens.
+
+`enabled` and `confirm` are the two that change what runs, so they are not
+dropped. `enabled: false` means the hook is off, and `confirm: true` asks you
+first — a kiro-cli hook cannot ask. Either one keeps the hook out of the kiro-cli
+spec entirely, rather than handing over a command that runs unconditionally, and
+it says which in the log and in the security event log.
+
+Off stays off through autoimport too. A script under `~/.kiro/hooks` is normally
+picked up on its own, so a hook you switched off by naming that script would come
+back as a fresh discovery on autoimport's default event. The script named by a
+hook you switched off is left out of that scan.
+
+The Hooks page shows each of these hooks. In the **ACP Agent Hooks** table,
+after the hooks kiro-cli was handed, every hook in `agent.kiro_hooks` that was
+accepted but left out gets a row with no order number and the `never fires` mark.
+Under its command the row says why: kiro-cli has no event for the trigger, it
+cannot run an `agent` action, or the hook is set to `enabled: false` or
+`confirm: true` (and its script is also left out of the scan). The reason comes
+from the same function that builds the kiro-cli spec
+(`hook_document_unsent_reason`). The rows are read from `config.json` as it is
+now, while the rows above them are the spec as last written, so an edit you have
+not refreshed yet shows on this list first. A hook that fails validation is not
+listed; the log and the security event log name it.
+
+The standalone hook-file wrapper `{"version": "v1", "hooks": [...]}` is a file
+format, not a spec value, and is rejected.
 
 ## `register_hook` is a different thing
 

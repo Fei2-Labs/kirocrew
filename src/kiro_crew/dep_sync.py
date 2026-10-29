@@ -74,14 +74,17 @@ reachable.
 
 from __future__ import annotations
 
+import asyncio
 import configparser
+import functools
 import os
 import re
 import shlex
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 try:  # pragma: no cover - exercised by whichever interpreter runs this
     import tomllib as _toml
@@ -646,6 +649,39 @@ def _probe_interpreter(
     )
 
 
+def imports_gateway_entry_point(target_py: Path, *, env: Mapping[str, str], timeout: float) -> bool:
+    """Whether *target_py* imports the gateway's entry point the way a relaunch would.
+
+    Unlike :func:`_probe_interpreter`, NOT isolated: a service manager runs the
+    console script's interpreter without ``-I``, under the unit's own
+    environment, so an install reached through the user site or ``PYTHONPATH``
+    imports there and must import here too. *env* is that environment. The
+    working directory is ``/``, which holds no package, so ``-c`` putting it on
+    ``sys.path`` shadows nothing. ``kiro_crew.cli`` and ``kiro_crew.cli_server``
+    (what ``gateway`` dispatches into, numpy included) rather than the
+    stdlib-only package root, so a venv missing the gateway's own dependencies
+    fails.
+
+    Raises ``OSError`` when the interpreter cannot be run at all and
+    ``subprocess.TimeoutExpired`` when it does not answer in *timeout*; a caller
+    decides what an unanswered probe means.
+    """
+    return _probe_relaunch_import(Path(os.path.abspath(target_py)), env, timeout) == 0
+
+
+def _probe_relaunch_import(target: Path, env: Mapping[str, str], timeout: float) -> int:
+    return subprocess.run(
+        [str(target), "-X", "utf8", "-c", "import kiro_crew.cli, kiro_crew.cli_server"],
+        # Only the exit status answers; output is discarded, never buffered.
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=dict(env),
+        cwd=os.path.abspath(os.sep),
+        timeout=timeout,
+    ).returncode
+
+
 def interpreter_version(
     target_py: Path, timeout: float | None = None
 ) -> tuple[int, int, int] | None:
@@ -774,7 +810,7 @@ def project_table(repo: Path) -> dict[str, Any] | None:
     one: a hand-rolled reader answering a question only a parser can answer.
 
     So a parser answers it wherever one exists -- ``tomllib`` on 3.11+, ``tomli``
-    if the venv happens to carry it, exactly the ladder ``onboarding_import``
+    if the venv happens to carry it, exactly the ladder ``onboarding_scan``
     already uses. ``None`` means neither was importable (a 3.10 venv without
     ``tomli``), and each caller then falls back to its text reader, which is
     best-effort by nature; that residual is stated in the PR rather than hidden.
@@ -1128,6 +1164,7 @@ def sync_or_reinstall(
     timeout: float | None = None,
     *,
     allow_missing_package_repair: bool = False,
+    cancel: threading.Event | None = None,
 ) -> int:
     """Bring ``target_py``'s venv up to date with ``repo``. 0 when it succeeded.
 
@@ -1159,6 +1196,14 @@ def sync_or_reinstall(
     A foreign origin is never allowed, and an absent package at any other target
     remains unproven and refused. This keeps the general ownership guard fail-closed
     while allowing the half-built state this repair path exists to recover.
+
+    ``cancel``, when set by the time the probes here are done, stops the call
+    before it starts pip (the dependency-only branch probes again inside
+    :func:`sync`, after this check): the probes ahead of pip take seconds, and a caller that has already stopped waiting (a gateway
+    shutting down) must not have a fresh pip begin writing into the venv after it
+    is gone. That returns ``REFUSED``, because nothing was touched. A pip already
+    running is left to finish: killing it mid-install is what leaves the venv
+    half rewritten, so stopping it safely needs a staged install.
     """
     # Establish that the venv about to be written to serves THIS checkout BEFORE
     # the branch, so both paths are covered. `sync()` asks the same question again
@@ -1204,6 +1249,8 @@ def sync_or_reinstall(
             "substituting a dependency-only sync for the editable reinstall",
             False,
         )
+        if _cancelled(cancel, emit):
+            return REFUSED
         return sync(repo, target_py, emit, timeout=timeout)
 
     # The same requires-python gate the dependency-only substitute applies, and
@@ -1228,6 +1275,8 @@ def sync_or_reinstall(
     # `-e <repo>` rather than `-e .` with a cwd: the target is explicit in the argv
     # instead of implied by the working directory this happens to run in.
     argv = [str(target_py), "-m", "pip", "install", "-e", str(repo), "--quiet"]
+    if _cancelled(cancel, emit):
+        return REFUSED
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1274,6 +1323,50 @@ def sync_or_reinstall(
         )
         return 1
     return 0
+
+
+def _cancelled(cancel: threading.Event | None, emit: Emit) -> bool:
+    """True, after saying so, when *cancel* is set before pip has started."""
+    if cancel is None or not cancel.is_set():
+        return False
+    emit("dep-sync: the install was cancelled before pip started; nothing was changed", True)
+    return True
+
+
+async def sync_or_reinstall_supervised(
+    executor: Any,
+    repo: Path,
+    target_py: Path,
+    emit: Emit,
+    *,
+    timeout: float | None,
+) -> int:
+    """:func:`sync_or_reinstall` on *executor*, with a cancel that reaches it.
+
+    For the update routes, which move the checkout and then reinstall into the
+    venv of the running gateway. A cancelled await cannot stop an executor
+    thread, so cancelling the awaiting task (a gateway shutdown does) also sets
+    the install's cancel event: an install still queued, or cancelled before
+    :func:`sync_or_reinstall`'s last check ahead of pip, then never starts pip.
+    The dependency-only branch runs a few more probes inside :func:`sync` after
+    that check, and a cancel landing there still starts its pip. A pip already
+    running is left to finish (see
+    :func:`sync_or_reinstall`), and the cancel propagates at once rather than
+    spend the shutdown's budget waiting for it.
+    """
+    stop = threading.Event()
+    install = functools.partial(
+        sync_or_reinstall, repo, target_py, emit, timeout=timeout, cancel=stop
+    )
+
+    # A job still queued when the cancel lands is cancelled by ``run_in_executor``
+    # itself; the event reaches one already running.
+    fut = asyncio.get_running_loop().run_in_executor(executor, install)
+    try:
+        return int(await fut)
+    except asyncio.CancelledError:
+        stop.set()
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -5,20 +5,17 @@
  * page in its "See what it looks like" dialog. A visible change here makes that
  * picture stale — re-shoot with `scripts/capture-feature-previews.mjs`.
  *
- * The page realizes the B+C merged design: a member list on the left, the
- * selected member's pinned DM thread in the center (the real chat stack,
- * hosted the way split-view panes host it), and on the right the SAME tabbed
- * side panel the chat page docks — permanent, no close control — whose first
- * three tabs are the crewmate's own: Notes (what it learned — its standing
- * notes, read-only here), Work log (what it did) and Dashboard (how things
- * stand — the page it publishes itself), and whose + menu offers the chat
- * panel's own views (Files, Artifacts, Terminal, Browser…) against the member's
- * DM slot, because a member thread IS a chat slot. Settings — the template it
- * is built from, wake sources, memory, cloud — live on the crewmate's detail
- * page (the crew editor), never in the panel.
- * Configuration WRITES are deliberately absent — the header pencil
- * navigates to the existing crew manager (/capabilities?tab=crews), so this
- * page never becomes a second editor.
+ * While no thread is open the page shows the full roster. Once a thread opens,
+ * the roster folds into `CrewmateSwitcher` in the header and the conversation
+ * receives that width. The centred identity pill opens `CrewProfilePanel`: an
+ * in-flow 34% column while SidePanel is closed, or a rounded hover card centred
+ * over the remaining thread width while SidePanel is open or on a phone. The
+ * shared avatar moves between pill and card.
+ *
+ * The chat SidePanel has two standing entries here: the crewmate's generated
+ * Dashboard and the workspace-scoped Files browser. Side Chat remains dynamic.
+ * Profile owns Notes, Schedules, driven Sessions and browser-local Goals.
+ * Configuration still writes through CrewEditorModal.
  *
  * Identity is the exact CREW NAME, never the slug: slugification is lossy
  * (`Oncall` and `oncall` share a slug and therefore one thread directory),
@@ -31,556 +28,151 @@
  * thread, so the UI does not announce it — there is no unpinned state to
  * contrast against.
  *
- * Which member is open rides the URL (`?member=<name>`), and the last one
- * opened is remembered per browser: a visit that names no member lands on
- * the remembered one if it is still on the roster. A fresh visit with
- * nothing remembered lands on the roster with no member pre-opened (the
- * 'Pick a member' empty pane), matching the below-md two-level list rule, so
- * the user picks rather than being primed on whichever row the sort floated
- * to the top (#11763).
+ * Which crewmate is open rides the URL (`?member=<name>`). A visit that names
+ * no one lands like a messages app: on Mate (key `mate`, see
+ * lib/assistantMember) while no message has been exchanged with it, so a first
+ * visit lands on its welcome; else on the conversation last opened in this
+ * browser if it is still on the roster; else on the conversation holding the
+ * newest message (greatest `last_active_ts`, whoever sent it). The built-in
+ * `default` crewmate is a row like any other here. Only a roster with no
+ * crewmate beyond `default` opens nothing; it shows the New crewmate hero
+ * instead. The phone lands the same way: there the roster is a drawer over the
+ * open chat (with the shell's navigation rail beside it, the chat page's
+ * sessions drawer), revealed by a rightward drag or the header's drawer toggle,
+ * while a leftward drag reveals the side panel. Mate's first-visit landing (see
+ * `resolveMateLanding`) runs ahead of all of this, at every width.
+ *
+ * Creating a crewmate happens in place of the chat, on the New crewmate card,
+ * with the chat and side panel hidden but still MOUNTED. See `openCreate`.
+ *
+ * The page is composed from owners beside this file, called in the order the
+ * page registers its hooks (pinned by `MembersPage.owners.test.tsx`):
+ * `useMembersPageRoster` (roster data), `useMembersPageCrewEditor`,
+ * `useMembersPageTeams`, `useMembersPageLayout`, `MembersPageProfile`,
+ * `useMembersPageDrawers`, `MembersPageRoster` (roster column and its state),
+ * `MembersPageThread` (thread column and its state), `MembersPageSidePanel`,
+ * `useMembersPageNavigation`, with the pure rules in `membersPageModel`.
+ * Owners never import this file; it re-exports the page's original named
+ * exports from `membersPageModel`. It keeps
+ * the New crewmate card, the guide hand-offs, the page's exit guards and the
+ * crewmate's face flight overlay.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, Check, ChevronRight, Circle, Cloud, Goal, LayoutDashboard, ListChecks, MessageCircleQuestionMark, NotebookPen, Pencil, Plus, Route, Square, Star, Zap } from 'lucide-react'
-import { PanelRightSolid } from '../../components/icons/panels'
-import { CrewMemberMark } from '../../components/CrewMemberMark'
-import DeployMyCrewDialog from './DeployMyCrew'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router-dom'
+import CrewEditorChunkLoading from '../../components/crew/CrewEditorChunkLoading'
+import NewCrewmateDialog, { type CreatedCrewmate, type CrewmateDraft } from './NewCrewmateDialog'
 import { useTranslation } from 'react-i18next'
-import { api, type MemberActivityEntry, type MemberRosterRow } from '../../api/client'
-import {
-  MEMBERS_ROSTER_QUERY_KEY,
-  memberActivityQueryKey,
-  memberThreadQueryKey,
-  membersRosterQuery,
-  type MemberThreadOutcome,
-} from '../../api/membersQuery'
-import {
-  AUTONUDGE_LOOPS_QUERY_KEY,
-  type AutoNudgeLoop,
-  intervalText,
-  nextCycle,
-} from '../../components/autoNudgeLoop'
-import { skipToken, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { timeAgo } from '../../utils/timeAgo'
-import { fmtDateTimeNumeric, fmtList, fmtTime } from '../../i18n/format'
-import { usePersistedBool } from '../../hooks/usePersistedBool'
-import { usePersistedString } from '../../hooks/usePersistedString'
-import { findReport, type ErrorReport } from '../../utils/errorReport'
-import { useAppDispatch, useAppSelector } from '../../store'
-import { markSlotRead } from '../../store/dashboardSlice'
-import { emitSlotRead, flushSlotRead } from '../../lib/slotReadRelay'
-import { setViewedThreadSlot, clearViewedThreadSlot } from '../../lib/viewedThread'
-import CrewAvatar from '../../components/CrewAvatar'
-import CrewStateAvatar from '../../components/CrewStateAvatar'
-import ChatPane from '../../components/ChatPane'
-import CrewWebview from './CrewWebview'
-import ErrorBoundary from '../../components/ErrorBoundary'
-import ErrorNotice from '../../components/ErrorNotice'
-import { useGuardedLeave } from '../../components/NavigationLeaveGuard'
-import CrewNotesTab from './CrewNotesTab'
-import { CrewLogTab } from '../chat/CrewLogPanel'
-import { useIsMobile } from '../../hooks/useIsMobile'
-import { useConnected } from '../../hooks/useConnected'
-import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../../components/SearchFilterBar'
-import { DropdownMenu, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
-import {
-  countByFilter, narrowRoster, parseSort, parseSourceFilter, parseStatusFilters, queryNarrows, sortRoster,
-  SORT_OPTIONS, SOURCE_FILTERS, STATUS_FILTERS,
-  type MemberSignals, type MemberSort, type MemberSourceFilter, type MemberStatusFilter, type RosterQuery,
-} from './rosterFilter'
-import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { isSidePanelHidden, shouldMountSidePanel, sidePanelDockMotion } from '../chat/sidePanelMount'
-import SidePanel, { SIDE_PANEL_MIN_W, SIDE_PANEL_RESERVED_W, type SidePanelLeadingTab, type SidePanelWithholdable } from '../chat/SidePanel'
-import { CHAT_TRANSCRIPT_VIEWS, VIEW_DATA_SOURCE, useAnyLiveAppTab, usePanelTabs, type ViewKind } from '../../hooks/usePanelTabs'
-import { usePanelTabDescriptors } from '../../hooks/panelTabRegistry'
-import { usePanelDocumentActions } from '../../hooks/usePanelDocumentActions'
-import ResizeHandle from '../../components/ResizeHandle'
-import { cn } from '../../lib/utils'
-import { LIST_SHELL_CLS, LIST_HEADER_CLS, LIST_TITLE_CLS, LIST_BODY_CLS, ROW_BOX_CLS, ROW_IDLE_CLS, ROW_ACTIVE_CLS, ROW_TITLE_CLS, ROW_STATUS_CLS } from '../../components/listShell'
-import { useColumnResize } from '../../hooks/useColumnResize'
-import { loadColumnWidth } from '../../lib/columnWidth'
-import { tabStatus, type TabStatus } from '../../lib/sessionTabs'
-import { lastActivityEpoch } from '../chat/sessionOrder'
-import { activityDayLabel, floorCountText, groupActivityDays, projectLabel } from './activityDays'
-import { safeGetItem, safeSetItem } from '../../utils/safeStorage'
-import { useMemberProjection, useMemberRosterViews } from '../../state/useMemberProjection'
-import type { RosterView, ActivityView, WakeView } from '../../state/memberProjectionTypes'
+import { type MemberRosterRow } from '../../api/client'
+import { MEMBERS_ROSTER_QUERY_KEY, memberThreadQueryKey, type MemberThreadOutcome } from '../../api/membersQuery'
+import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useAppSelector } from '../../store'
+import CrewMonitoredAvatar from '../../components/crew/CrewMonitoredAvatar'
+import { PROFILE_FACE_PX } from './CrewProfilePanel'
+import { OverlayPortal } from '../../components/overlayRoot'
+import { useGuideOpenedSurface } from '../../guide/useGuideOpenedSurface'
+import { useGuideRevealScope } from '../../guide/GuideRevealScope'
+import { useGuidePredicate, useGuideSelection } from '../../guide/guidePredicates'
+import { useGuardedLeave, useMayLeaveForNavigation, usePublishNavigationStake, useRegisterNavigationLeaveGuard } from '../../components/NavigationLeaveGuard'
+import { hasNoCrewmates } from './rosterFilter'
+import { AnimatePresence, animate, motion } from 'framer-motion'
+import OverlayDrawer from '../../components/OverlayDrawer'
+import { isTrapEntry } from '../../lib/routeHistoryPosition'
+import { RunInTerminalScope } from '../../components/runInTerminalScope'
+import TeamDialog from './TeamDialog'
+import { TEAM_PARAM } from './teamGroups'
+import { SidePanelDockHost } from '../../components/SidePanelGlyph'
+import { FACE_FLIGHT_EASE, FACE_FLIGHT_SECS, MembersPageProfileCard, useMembersPageProfile, useMembersPageProfileFlight, useMembersPageSchedules, type FaceFlight } from './MembersPageProfile'
+import { MembersPageRosterColumn, useMembersPageRosterView } from './MembersPageRoster'
+import { MembersPageSidePanel, useMembersPageSidePanel } from './MembersPageSidePanel'
+import { MembersPageThreadColumn, useMembersPageThread, useMembersPageThreadView } from './MembersPageThread'
+import { MEMBER_PARAM, ROSTER_DRAWER_UNCOVERED_PX, type GoneNotice, type PostCreateFailure, type ProfileCardOpen } from './membersPageModel'
+import { useMembersPageCrewEditor } from './useMembersPageCrewEditor'
+import { useMembersPageDrawers, useMembersPageDrawerSwipes } from './useMembersPageDrawers'
+import { useMembersPageLayout } from './useMembersPageLayout'
+import { useMembersPageNavigation } from './useMembersPageNavigation'
+import { useMembersPageRoster, useMembersPageRosterSignals } from './useMembersPageRoster'
+import { useMembersPageTeams, useMembersPageTeamView } from './useMembersPageTeams'
 
-/** The crew manager surface — the ONLY write path for member configuration.
- *  The explicit tab wins over CapabilitiesPage's remembered last tab. */
-const CREW_MANAGER_PATH = '/capabilities?tab=crews'
+export {
+  resolveDefaultMember, resolveMateLanding, memberMemoryDisplay, CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS,
+  MEMBERS_UNFED_VIEWS, MEMBERS_WITHHELD_VIEWS, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, panelSitsBeside,
+  panelChrome, createDraftFromHref,
+} from './membersPageModel'
 
-/** Adding a member IS creating a crew, so "add" is a navigation into the crew
- *  manager — but straight into its create form (`?new=1`), not onto the list
- *  the form sits behind: the user pressed "+", and a second "New crew" click
- *  was the whole complaint (#9513). `from=members` tells the manager where the
- *  user came from, so a successful create lands on the new member's thread
- *  here instead of back on the crew list. Spelled out in full (not built from
- *  CREW_MANAGER_PATH) so the i18n lint reads it as the route it is. */
-const CREW_CREATE_PATH = '/capabilities?tab=crews&new=1&from=members'
+// Lazy so the editor's code (this dialog + the field components it re-exports)
+// splits out of the main App chunk — it is only needed once the identity pill
+// opens the modal, and keeping it eager pushed App over its bundle budget. The
+// hook stays eager: it is called every render to drive the pill's open state.
+const CrewEditorModal = lazy(() => import('../../components/crew/CrewEditorModal'))
 
-/** One member's editor, reached THROUGH the crew manager: the deep link opens
- *  that crew's full editor — name, template, model, workspace, triggers, and
- *  the avatar row that leads on to the builder (see KiroCrewAgentsPage's
- *  `?crew=` latch). This page stays read-only — the face is clickable here,
- *  but every write still happens in the one editor. It deliberately does NOT
- *  add `&avatar=1`: from a chat surface the user asked for "edit this member",
- *  and landing straight in the builder answered a narrower question. */
-const crewEditPath = (name: string) =>
-  `${CREW_MANAGER_PATH}&crew=${encodeURIComponent(name)}`
-/** The open member rides the URL (`?member=<name>`) so a reload keeps it
- *  and a link lands on one. Switching members REPLACES the entry — the page
- *  holds one history entry, so Back leaves it in one press (the Sessions
- *  sidebar's rule); only the below-md roster->thread step pushes. The value
- *  is the exact crew NAME, not the slug: the slug is lossy (see the header
- *  comment), and a link that resolved `Oncall` to `oncall`'s thread would be
- *  the silent misroute this page exists to prevent. */
-const MEMBER_PARAM = 'member'
-/** The last member opened, so returning to the page (or reloading) lands on
- *  the conversation the user left rather than the empty column. Stored by
- *  exact name for the same reason as the URL param. One key per origin is
- *  the right scope: the roster is the gateway's global crew list, and
- *  localStorage is already per-gateway. */
-const LAST_MEMBER_KEY = 'mc-members-last-member'
+/** Creating a crewmate happens in a modal over this page: the header
+ *  "+" New crewmate, the empty-state hero and the switcher's New crewmate open
+ *  `NewCrewmateDialog` as a modal with its Advanced settings folded; the
+ *  hero's Advanced link opens the same card with Advanced settings already
+ *  unfolded. A drafted proposal (a crewmate's proposal link carrying a name and
+ *  goal, a guide) opens the same card with that name and goal filled in. All
+ *  perform the same `POST /api/agents` write as the crew manager's create form
+ *  (one write path, several front doors); this page's card also asks for the
+ *  crewmate's first greeting.
+ *  Editing an existing crewmate also happens IN this page now (CREW-18688): the
+ *  Profile card's edit controls open `CrewEditorModal` as a modal, driven by the
+ *  shared `useCrewEditor` state machine — the SAME editor the crew manager
+ *  mounts, so there is still one write path, reached from two surfaces. */
 
-/** Which member to RESTORE when the URL names none, or to fall back to when
- *  it names one that is gone (deleted or renamed since the link/memory was
- *  written): the remembered member if it is still on the roster, else
- *  `undefined`. It deliberately does NOT fall back to the first row — a fresh
- *  visit with nothing remembered lands on the roster with no member pre-opened
- *  (the empty column, matching the below-md two-level list rule), so the user
- *  picks the member they want rather than being primed on whichever row the
- *  sort floated to the top (#11763). `undefined` therefore means both "empty
- *  roster" and "nothing remembered": either way there is nothing to auto-open.
- *  Pure, so the cases — restore, nothing-remembered, stale — are tested
- *  directly. */
-export function resolveDefaultMember(
-  remembered: string | null,
-  ordered: readonly MemberRosterRow[],
-): MemberRosterRow | undefined {
-  if (remembered) {
-    const hit = ordered.find((m) => m.name === remembered)
-    if (hit) return hit
-  }
-  return undefined
-}
-
-type MemberMemoryDisplay = 'global' | 'legacy' | 'private' | 'ownership_mismatch' | 'unavailable'
-
-export function memberMemoryDisplay(row: MemberRosterRow): MemberMemoryDisplay {
-  if (row.name === 'default') return row.memory_store === 'default' ? 'global' : 'unavailable'
-  if (row.memory_owner && row.memory_owner !== row.name) return 'ownership_mismatch'
-  if (row.memory_version === 2) return row.memory_owner === row.name ? 'private' : 'unavailable'
-  if (row.memory_version === 1 && !row.memory_owner) return 'legacy'
-  return 'unavailable'
-}
-
-/** Roster width bounds, persisted like the chat sidebar's (mc-sidebar-width). */
-const ROSTER_MIN = 200
-const ROSTER_MAX = 420
-const ROSTER_DEFAULT = 264
-const ROSTER_WIDTH_KEY = 'mc-members-roster-width'
-/** Size of the newest-first activity ring the members projection serves
- *  (mirrors the backend's `_ACTIVITY_RING` in members_projections.py). A full
- *  ring means older in-window events were dropped, so a count off it is a
- *  floor, not exact. */
-const ACTIVITY_RING = 50
-export const CREW_NOTES_TAB_ID = 'crew-notes'
-export const CREW_WORK_LOG_TAB_ID = 'crew-work-log'
-export const CREW_DASHBOARD_TAB_ID = 'crew-dashboard'
-/** Host tabs of the crewmate panel, in strip order. Notes is the default focus.
- *  Must not collide with a chat `TabKind` — `'summary'` is the chat page's
- *  session-summary view, a different thing. */
-export const CREW_PANEL_TAB_IDS: readonly string[] = [CREW_NOTES_TAB_ID, CREW_WORK_LOG_TAB_ID, CREW_DASHBOARD_TAB_ID]
-/** Chat-panel views this page withholds from the strip and the + menu
- *  (`SidePanel.hiddenViews`). The unfed half is DERIVED, not enumerated: every
- *  view `VIEW_DATA_SOURCE` classifies as `chat-transcript` (Changes / Issues /
- *  Links / Pins today) reads indexes ChatPage builds over the transcript, none
- *  of which runs here, so each would render an affirmative "none" — and a new
- *  transcript-fed view must be classified where kinds are defined before it can
- *  exist, so it cannot arrive here unwithheld. `summary` is the one addition
- *  by choice: the chat page's SESSION summary has data, but next to a "Work log"
- *  chip on the crewmate panel, the chat page's "Summary" view would be a second,
- *  unrelated summary of this same thread. Exported so the test pins the set. */
-export const MEMBERS_UNFED_VIEWS: readonly ViewKind[] = [...CHAT_TRANSCRIPT_VIEWS, 'summary']
-/** Everything this page withholds once the thread is confirmed. Today that is
- *  exactly the unfed set: Side chat IS offered — its composer draft lives in
- *  the chat-core store (`sideChatDrafts`, per slot, persisted), so `SidePanel`
- *  unmounting the body on a tab or member switch loses nothing, and the
- *  selection toolbar's "Ask about this" needs the tab as its landing
- *  (`openMemberSideChat`). Kept as its own name so the "withheld" and "unfed"
- *  reasons stay separable if they diverge again. Exported so the test pins
- *  the set. */
-export const MEMBERS_WITHHELD_VIEWS: readonly SidePanelWithholdable[] = [...MEMBERS_UNFED_VIEWS]
-/** Everything the panel withholds while the thread is UNCONFIRMED: every
- *  classified view, plus Terminal and app tabs. Derived from
- *  `VIEW_DATA_SOURCE` (the exhaustive `Record<ViewKind, …>`) rather than
- *  enumerated, so the same guarantee the unfed set has holds here too — a new
- *  `ViewKind` cannot arrive in this window offered; it is withheld by
- *  construction until the slot it would bind to exists. Exported so the test
- *  pins the set against the classification. */
-export const MEMBERS_UNCONFIRMED_WITHHELD_VIEWS: readonly SidePanelWithholdable[] = [
-  ...(Object.keys(VIEW_DATA_SOURCE) as ViewKind[]), 'terminal', 'app',
-]
-/** This page's three inter-column gap-2s (24px) — space the side panel must
- *  keep clear beside the roster so a drag can never fold the thread to zero.
- *  The thread's own minimum is already inside the panel's shell reserve
- *  (`SIDE_PANEL_RESERVED_W` budgets the nav rail plus a chat-pane minimum). */
-const PANEL_GAPS_W = 24
-/** Whether the side panel can sit BESIDE the thread as a permanent column,
- *  or must become an overlay the user opens. Beside needs the shell reserve
- *  (nav rail + a usable thread) plus the live roster width plus the panel's
- *  own minimum — the same arithmetic the chat page's `sidePanelFillWidth` does
- *  for its two columns, with the roster added. Pure, so the boundary is
- *  tested directly. Mobile always overlays (its viewport seats neither). */
-export function panelSitsBeside({ winW, rosterW, isMobile }: { winW: number; rosterW: number; isMobile: boolean }): boolean {
-  if (isMobile) return false
-  return winW - rosterW - PANEL_GAPS_W >= SIDE_PANEL_RESERVED_W + SIDE_PANEL_MIN_W
-}
-/** Punctuation, not prose: joins an activity label to its project name, and a
- *  driving row's title to its status word in the hover title. */
-const PROJECT_SEPARATOR = ' \u00b7 '
-/** Driving-sessions rows shown before the list folds behind "Show all". */
-const DRIVING_VISIBLE = 5
-/** Activity days shown before the list folds behind "Show N more days". */
-const ACTIVITY_DAYS_VISIBLE = 3
-/** Roster filter persistence — same `mc-` localStorage family as the rest of
- *  the dashboard's view preferences (ChatSidebar's session filters use the
- *  same idiom). Only the TOGGLES live here; the star mark itself is a crew
- *  field on the server. */
-const STARRED_ONLY_KEY = 'mc-members-starred-only'
-const SOURCE_FILTER_KEY = 'mc-members-source'
-const STATUS_FILTER_KEY = 'mc-members-status'
-const SORT_KEY = 'mc-members-sort'
-/** Static key per menu row — a map, not a template, so `check-i18n-keys` can
- *  resolve every reference (assembled keys are a counted blind spot there). */
-const SOURCE_LABEL_KEY: Record<Exclude<MemberSourceFilter, 'all'>, string> = {
-  mine: 'pages.membersPage.filter_source_mine',
-  builtin: 'pages.membersPage.filter_source_builtin',
-  package: 'pages.membersPage.filter_source_package',
-}
-/** Hover tooltip per origin row: the one-word labels ("From packages") are not
- *  self-explaining to a reader who has never installed a capability package. */
-const SOURCE_TITLE_KEY: Record<Exclude<MemberSourceFilter, 'all'>, string> = {
-  mine: 'pages.membersPage.filter_source_mine_description',
-  builtin: 'pages.membersPage.filter_source_builtin_description',
-  package: 'pages.membersPage.filter_source_package_description',
-}
-/** The two states the sessions menu also filters on reuse ITS labels, so the
- *  same slot state never reads as two different words across the two menus. */
-const STATUS_LABEL_KEY: Record<MemberStatusFilter, string> = {
-  working: 'pages.chatSidebar.filter_running',
-  needs_you: 'pages.membersPage.filter_status_needs_you',
-  unread: 'pages.chatSidebar.filter_unread',
-  patrolling: 'pages.membersPage.filter_status_patrolling',
-}
-const STATUS_TITLE_KEY: Record<MemberStatusFilter, string> = {
-  working: 'pages.membersPage.filter_status_working_description',
-  needs_you: 'pages.membersPage.filter_status_needs_you_description',
-  unread: 'pages.membersPage.filter_status_unread_description',
-  patrolling: 'pages.membersPage.filter_status_patrolling_description',
-}
-/** Each status row's marker — the same glyph the roster row and the sidebar's
- *  session filters use for that state, lit in the state's colour when active. */
-const STATUS_ICON: Record<MemberStatusFilter, (active: boolean) => React.ReactNode> = {
-  working: (active) => <Zap size={12} className={active ? 'text-[var(--warn)]' : 'text-muted'} {...(active ? { fill: 'var(--warn)', stroke: 'none' } : {})} />,
-  needs_you: (active) => <MessageCircleQuestionMark size={12} className={active ? 'text-[var(--info)]' : 'text-muted'} />,
-  unread: (active) => <Circle size={12} className={active ? 'text-accent' : 'text-muted'} {...(active ? { strokeWidth: 0, fill: 'var(--accent)' } : {})} />,
-  patrolling: (active) => <Goal size={12} className={active ? 'text-accent' : 'text-muted'} />,
-}
-/** The A–Z row reuses the sidebar menu's label. The activity row does NOT
- *  reuse the sidebar's "Newest": on a list of people that reads as "newest
- *  member", while the order is last activity — so it keeps a member-specific
- *  word for what it actually sorts by. */
-const SORT_LABEL_KEY: Record<MemberSort, string> = {
-  recent: 'pages.membersPage.sort_recent',
-  name: 'pages.chatSidebar.sort_name_asc',
-}
-/** How each shared tab status renders on a driving row. The ORDER lives in
- *  `tabStatus` (lib/sessionTabs.ts) — this only maps its verdict to a dot
- *  class, an i18n label, and whether the label is spoken aloud in the row.
- *  `unread` cannot occur here (no unread set is passed) and reads as idle. */
-const DRIVING_STATUS: Record<TabStatus, { cls: string; text: string; label: string; spoken: boolean }> = {
-  permission: { cls: 'fill-warn text-warn', text: 'text-warn', label: 'pages.chatSidebar.needs_approval', spoken: true },
-  question: { cls: 'fill-info text-info', text: 'text-info', label: 'pages.chatSidebar.needs_your_answer', spoken: true },
-  running: { cls: 'fill-ok text-ok', text: 'text-ok', label: 'pages.membersPage.drawer_working', spoken: false },
-  unread: { cls: 'fill-muted text-muted', text: 'text-muted', label: 'pages.membersPage.driving_idle', spoken: false },
-  idle: { cls: 'fill-muted text-muted', text: 'text-muted', label: 'pages.membersPage.driving_idle', spoken: false },
-}
-// Module-level so the resize hook's memoised resolver isn't invalidated every render.
-const loadRosterWidth = () => loadColumnWidth(ROSTER_WIDTH_KEY, ROSTER_MIN, ROSTER_MAX, ROSTER_DEFAULT)
-/** The chat side panel's right-dock mount preset — module-pure, so one
- *  constant serves every render. */
-const dockMotion = sidePanelDockMotion('right')
-/** The auto-nudge service's terminal codes (`NudgeLoop.stopped_reason`) a
- *  member slot can actually receive, each mapped to the sentence the patrol
- *  block shows for a stopped loop. A code not listed here — a future terminal
- *  condition, or `autonudge_stop`, which today only research loops are
- *  stamped with — falls back to the code itself rather than to a sentence
- *  nothing produces. */
-const PATROL_STOPPED_REASON: Record<string, string> = {
-  manual: 'pages.membersPage.patrol_stopped_manual',
-  cycle_cap: 'pages.membersPage.patrol_stopped_cycle_cap',
-  runtime_budget: 'pages.membersPage.patrol_stopped_runtime_budget',
-  approval_stalled: 'pages.membersPage.patrol_stopped_approval_stalled',
-  interrupted: 'pages.membersPage.patrol_stopped_interrupted',
-}
-/** How often the "next wake in …" countdown in the drawer re-reads the clock.
- *  Coarser than the popover's per-second tick on purpose: the drawer line is
- *  an at-a-glance status, and a per-second re-render of the whole drawer for
- *  a readout that already drops seconds above a minute buys nothing. */
-const PATROL_TICK_MS = 15_000
-/** Stable empty roster for the not-yet-answered read, so the memos keyed on
- *  `members` do not recompute on every render while the first fetch is out. */
-const EMPTY_ROSTER: readonly MemberRosterRow[] = []
-
-/** i18n translate function, taken from the hook so the row need not re-derive
- *  its type. */
-type TFn = ReturnType<typeof useTranslation>['t']
-
-/** One roster row. Extracted so `useMemberProjection` is called once PER ROW
- *  (a hook cannot run inside the parent's `.map`), letting a `member_projection`
- *  frame re-render just this row. The projected roster view overrides the
- *  server row field-by-field when present; a field the projection omits (or a
- *  gateway with no projections block) falls back to the row. Presence
- *  (`running`) and the driving list stay on live slots in the parent and are
- *  not projected here. */
-function MemberRow({
-  m,
-  t,
-  activeName,
-  openMember,
-  toggleStar,
-  starPending,
-  slotKeyOf,
-  isRunning,
-  isUnread,
-  activePatrolOf,
-  reduceMotion,
-  scrollActiveRowIntoView,
-  slugCollides,
-}: {
-  m: MemberRosterRow
-  t: TFn
-  activeName: string
-  openMember: (m: MemberRosterRow) => void
-  toggleStar: (m: MemberRosterRow) => void
-  starPending: Set<string>
-  slotKeyOf: (m: MemberRosterRow) => string
-  isRunning: (m: MemberRosterRow) => boolean | undefined
-  isUnread: (m: MemberRosterRow) => boolean
-  activePatrolOf: (m: MemberRosterRow) => AutoNudgeLoop | undefined
-  reduceMotion: boolean | null
-  scrollActiveRowIntoView: (el: HTMLButtonElement | null) => void
-  slugCollides: boolean
-}) {
-  // Withheld for a colliding slug, exactly as the page's merged list and drawer
-  // do: this row shares its slug with another member, so a slug-keyed frame
-  // cannot say which of the two it describes.
-  const roster = useMemberProjection<RosterView>(slugCollides ? null : m.slug, 'roster')
-  // The projected view over the server row: projection wins field-by-field
-  // when present, so slotKeyOf / isRunning / isUnread and the display read the
-  // pushed value. `running` is intentionally NOT overridden — it is live
-  // presence, resolved from slots in the parent.
-  //
-  // The two MESSAGE fields go the other way, and the direction is the point.
-  // Every other field here is config-derived, so the event log is where it is
-  // written and the projection IS the record. A message preview is not: the
-  // server row carries it from the conversation transcript, which is the store
-  // the message was persisted through, and the member/message event is a second
-  // copy appended afterwards on a best-effort hook. When that append is refused
-  // the projection keeps the PREVIOUS message, so giving it precedence renders a
-  // stale preview over the fresh transcript value sitting beside it in the same
-  // payload -- and nothing on the card says which of the two it is showing. The
-  // projection still fills in when the row has no transcript value at all, which
-  // is what a pushed frame is for.
-  const view: MemberRosterRow = roster
-    ? {
-        ...m,
-        kiro_agent: roster.kiro_agent ?? m.kiro_agent,
-        workspace: roster.workspace ?? m.workspace,
-        memory_store: roster.memory_store ?? m.memory_store,
-        model: roster.model ?? m.model,
-        source: roster.source ?? m.source,
-        starred: roster.starred ?? m.starred,
-        avatar: roster.avatar ?? m.avatar,
-        slot_key: roster.slot_key ?? m.slot_key,
-        last_active_ts: m.last_active_ts || roster.last_active_ts,
-        last_message: m.last_message || roster.last_message,
+function CrewFaceFlight({ flight, onDone }: { flight: FaceFlight; onDone: () => void }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    // The copy is drawn at the card face's side and scaled, so its pill-sized
+    // end is a scale-down of a sharp raster, not a blurry scale-up. The scale
+    // would shrink the face's corner radius and hairline border with it, while
+    // the real faces at either end draw both at their fixed CSS size — the
+    // corner visibly snapped on landing — so the two are counter-scaled to
+    // hold their on-screen size for the whole flight.
+    const img = el.querySelector('img')
+    const rest = img ? getComputedStyle(img) : null
+    const restRadius = rest ? parseFloat(rest.borderRadius) || 0 : 0
+    const restBorder = rest ? parseFloat(rest.borderWidth) || 0 : 0
+    const place = (left: number, top: number, side: number) => {
+      const k = side / PROFILE_FACE_PX
+      el.style.transform = `translate(${left}px, ${top}px) scale(${k})`
+      if (img) {
+        img.style.borderRadius = `${restRadius / k}px`
+        img.style.borderWidth = `${restBorder / k}px`
       }
-    : m
-  return (
-      <li key={view.name} className="group/row relative">
-        {/* ChatSidebar's own row recipe (components/listShell), so the
-            two conversation lists read as one family; pr-8 widens the
-            right padding over ROW_BOX_CLS's pr-3 to hold the star. The
-            star is a SIBLING of the row button, not a child: a button
-            inside a button is invalid HTML and breaks keyboard
-            activation. It is absolutely placed over the row's right
-            padding so the row keeps its single click target and the
-            label its width. */}
-        <button
-          onClick={() => openMember(view)}
-          // The open row keeps itself in view: a member opened by URL
-          // (a deep link, the crew manager's post-create landing) can sit
-          // below the fold of a long roster, and a thread with no visible
-          // row looks like a member that was never added (#9513).
-          ref={view.name === activeName ? scrollActiveRowIntoView : undefined}
-          className={cn(
-            'w-full flex items-center gap-2.5 text-sm text-left transition-all select-none',
-            ROW_BOX_CLS, 'pr-8',
-            view.name === activeName ? ROW_ACTIVE_CLS : ROW_IDLE_CLS,
-          )}
-          aria-current={view.name === activeName ? 'true' : undefined}
-        >
-          <span className="relative shrink-0">
-            {/* The face reacts: it animates while the member works and
-                flashes its finished / failed expression on the turn's
-                trailing edge. The dot below stays presence-only — a
-                finished turn is not presence. */}
-            <CrewStateAvatar
-              seed={view.name}
-              avatar={view.avatar}
-              slotKey={slotKeyOf(view)}
-              running={!!isRunning(view)}
-              size={36}
-              working="subtle"
-            />
-            {/* Presence dot renders only while the member is working —
-                an idle member shows nothing rather than a gray dot,
-                which read as a broken/disabled state. */}
-            {isRunning(view) && (
-              <span
-                className="absolute -right-0.5 -bottom-0.5 w-2.5 h-2.5 rounded-full border-2 border-bg bg-ok"
-                aria-hidden="true"
-                data-testid="member-presence-dot"
-              />
-            )}
-            {/* Patrol badge — the member has an ACTIVE auto-nudge loop
-                on its own thread. Rendered only while the loop patrols:
-                a stopped loop and a never-armed member both show
-                nothing, because "not patrolling" is a member's resting
-                state, not an incident — a standing warn mark on an
-                idle avatar read as "something is broken", and the
-                drawer's block already spells a stopped loop's reason.
-                Top-right corner of the avatar, the composer's goal-chip
-                glyph on a solid accent fill (the presence dot's own
-                idiom — an outline read as nothing at a glance): a
-                different corner from the presence dot (bottom-right,
-                ok-green, "working now") and a different edge from the
-                row's right-side markers, so all of them can show at
-                once without covering each other. Mount/unmount is
-                animated (the badge fades out when the loop ends rather
-                than vanishing): a badge that pops in or out mid-glance
-                is what a state change looks like when it is not a
-                glitch. Under prefers-reduced-motion the tween is
-                skipped and the badge cuts straight to its new state. */}
-            <AnimatePresence initial={false}>
-              {(() => {
-                const lp = activePatrolOf(view)
-                if (!lp) return null
-                // The tooltip spells the count the drawer's way ("3 of 24"
-                // / "61 · no limit"): the compact "3/24" alone read as a date.
-                const cycle =
-                  lp.max_cycles > 0
-                    ? t('pages.membersPage.patrol_cycles_of', { n: lp.cycle_count, max: lp.max_cycles })
-                    : t('pages.membersPage.patrol_cycles_unlimited', { n: lp.cycle_count })
-                const label = t('pages.membersPage.patrol_badge', { cycle })
-                return (
-                  <motion.span
-                    key="patrol"
-                    initial={reduceMotion ? false : { opacity: 0, scale: 0.6 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.6 }}
-                    transition={reduceMotion ? { duration: 0 } : { duration: 0.15, ease: [0.2, 0, 0, 1] }}
-                    className="absolute -right-1 -top-1 w-4 h-4 rounded-full border-2 border-bg flex items-center justify-center bg-accent text-accent-fg"
-                    role="img"
-                    aria-label={label}
-                    title={label}
-                    data-testid="member-patrol-dot"
-                    data-state="active"
-                  >
-                    <Goal size={10} aria-hidden="true" />
-                  </motion.span>
-                )
-              })()}
-            </AnimatePresence>
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className={`block ${ROW_TITLE_CLS} font-semibold text-text truncate`}>{view.name}</span>
-            {/* Last-message preview, like a session row — presence
-                already rides the avatar dot, so a textual Idle/Working
-                label says nothing the dot does not. A "Stopped" chip
-                leads the preview when the thread's NEWEST event is a
-                Stop press: the server skips the stop card's JSON, so the
-                preview is the last conversational line, which reads as
-                ongoing work on a thread the user has stopped — the chip
-                is the honest marker over it. It is localized HERE, not
-                sent as a word from the server, whose preview is computed
-                without the client's locale. The chip is `shrink-0` so
-                the preview, not the label, is what truncates. The server
-                flag is false once a newer real message lands, so the chip
-                cannot outlive the stop. */}
-            <span className={`flex items-center gap-1 ${ROW_STATUS_CLS} text-muted min-w-0`}>
-              {view.last_message_stopped && (
-                <span
-                  className="inline-flex items-center gap-0.5 shrink-0 font-medium text-danger"
-                  data-testid="member-stopped-indicator"
-                >
-                  <Square size={9} fill="currentColor" className="lucide-inline" aria-hidden="true" />
-                  {t('pages.membersPage.stopped_indicator')}
-                </span>
-              )}
-              <span className="block truncate min-w-0">{view.last_message || '\u00a0'}</span>
-            </span>
-          </span>
-          {/* Unread marker on the row's right edge — the IM convention
-              (and where the rail badge sits), vertically centered by the
-              row's items-center. Accent-filled w-2 h-2 like ChatSidebar's
-              unread dot, with a real accessible name: nothing else on
-              the row says "unread". The left side is taken — presence
-              rides the avatar. */}
-          {isUnread(view) && (
-            <span
-              className="w-2 h-2 rounded-full shrink-0"
-              style={{ background: 'var(--accent)' }}
-              role="img"
-              aria-label={t('pages.membersPage.unread_message')}
-              title={t('pages.membersPage.unread_message')}
-              data-testid="member-unread-dot"
-            />
-          )}
-        </button>
-        {/* Star: always rendered when starred. Unstarred: visible below md
-            (touch has no hover or keyboard focus to reveal it), hover /
-            focus-revealed at md+ so a desktop roster stays quiet. Never
-            hidden from AT — opacity, not display. */}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation()
-            toggleStar(view)
-          }}
-          aria-pressed={!!view.starred}
-          disabled={starPending.has(view.name)}
-          aria-label={t(view.starred ? 'pages.membersPage.unstar' : 'pages.membersPage.star', { name: view.name })}
-          title={t(view.starred ? 'pages.membersPage.unstar' : 'pages.membersPage.star', { name: view.name })}
-          // 24x24 minimum target (the icon is 13px): a touch that lands beside
-          // the glyph must hit the star, not the row button underneath.
-          className={`absolute right-1 top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded hover:bg-bg-hover transition-opacity ${
-            view.starred
-              ? 'opacity-100 text-accent'
-              : 'md:opacity-0 md:group-hover/row:opacity-100 md:focus-visible:opacity-100 text-muted'
-          }`}
-          data-testid={`member-star-${view.slug}`}
-        >
-          <Star
-            size={13}
-            {...(view.starred ? { fill: 'var(--accent)', stroke: 'none' } : {})}
-          />
-        </button>
-      </li>
-  )
+    }
+    const { from } = flight
+    place(from.left, from.top, from.width)
+    const ctrl = animate(0, 1, {
+      duration: FACE_FLIGHT_SECS,
+      ease: FACE_FLIGHT_EASE,
+      onUpdate: (p) => {
+        const to = flight.to() ?? from
+        place(from.left + (to.left - from.left) * p, from.top + (to.top - from.top) * p, from.width + (to.width - from.width) * p)
+      },
+      onComplete: onDone,
+    })
+    return () => ctrl.stop()
+  }, [flight, onDone])
+  return <OverlayPortal>
+    <div
+      ref={ref}
+      className="fixed left-0 top-0 z-[60] pointer-events-none origin-top-left will-change-transform"
+      aria-hidden="true"
+      data-testid="crew-face-flight"
+    >
+      <CrewMonitoredAvatar
+        seed={flight.seed}
+        avatar={flight.avatar}
+        slotKey={flight.slotKey}
+        running={flight.running}
+        automation={flight.automation}
+        size={PROFILE_FACE_PX}
+        working="full"
+      />
+    </div>
+  </OverlayPortal>
 }
 
 export default function MembersPage() {
@@ -589,89 +181,12 @@ export default function MembersPage() {
   const leave = useGuardedLeave()
   const location = useLocation()
   const queryClient = useQueryClient()
-  // The roster is a React Query read (issue #9418), not page state: a return
-  // to the page renders the cached list at once and refreshes it in the
-  // background, and a crew written anywhere else reaches it through the
-  // `['kirocrew-agents']` prefix invalidation (see membersQuery.ts). Three
-  // states, kept apart the way every block on this page keeps them: not yet
-  // answered, answered, failed with no answer to fall back on — a refetch
-  // error after a good read keeps showing the last roster.
-  const rosterQuery = useQuery(membersRosterQuery)
-  const rows = rosterQuery.data ?? EMPTY_ROSTER
-  const loaded = rosterQuery.data !== undefined || rosterQuery.isError
-  const loadError = rosterQuery.data === undefined && rosterQuery.isError
-  // ONE source of truth for the roster fields the page derives from (starred
-  // count, the Starred filter, search, sort, source chips): the react-query
-  // rows merged with each member's pushed `roster` projection, projection
-  // fields winning field-by-field when present. Keying the projection read on
-  // the slug list means a `member_projection` frame flips the merged row here
-  // WITHOUT a roster refetch, so a page-level count/filter and the row's own
-  // star button never disagree. `running` is not projected — it stays live
-  // presence, resolved from slots.
-  const slugs = useMemo(() => rows.map((r) => r.slug), [rows])
-  const rosterViews = useMemberRosterViews(slugs)
-  // Slugs carried by MORE THAN ONE row. A live `member_projection` frame is keyed
-  // by slug alone, so a colliding pair shares one entry in the store and both rows
-  // would render whichever member's state arrived last. The backend's roster read
-  // already withholds a projection for a colliding row; the live path reaches the
-  // store directly and needs the same rule, or the two surfaces disagree.
-  const collidingSlugs = useMemo(() => {
-    const counts = new Map<string, number>()
-    for (const r of rows) counts.set(r.slug, (counts.get(r.slug) ?? 0) + 1)
-    return new Set([...counts].filter(([, n]) => n > 1).map(([slug]) => slug))
-  }, [rows])
-  // Every projection read goes through this. A slug carried by two rows cannot
-  // say which member a frame describes, so the read is withheld rather than
-  // guessed -- and the hook already treats a null slug as "no projection", so
-  // withholding needs no change there. The merged list above applies the same
-  // rule; the drawer and each row read the SAME slug-keyed frames, so a guard on
-  // only one of them leaves the others rendering another member's state.
-  const projectionSlug = (slug: string | null | undefined): string | null =>
-    slug && !collidingSlugs.has(slug) ? slug : null
-  const members = useMemo<MemberRosterRow[]>(
-    () =>
-      rows.map((r) => {
-        // Withheld, not guessed: with two rows sharing a slug nothing in the frame
-        // says which member it describes, so the row keeps its own roster values.
-        if (collidingSlugs.has(r.slug)) return r
-        const v = rosterViews.get(r.slug)
-        if (!v) return r
-        // Field-by-field, like MemberRow: a value the projection OMITS
-        // (undefined) must not clobber the row's own field, so spreading the
-        // whole view is wrong — only defined projection fields win.
-        const merged: MemberRosterRow = { ...r }
-        for (const key of Object.keys(v) as (keyof RosterView)[]) {
-          // Identity fields are never taken from the projection: rows are keyed
-          // and selected by the exact crew NAME, and slug is lossy (two names
-          // can share one). The projection's own name/slug would rewrite a
-          // row's identity across a shared-slug pair (MemberRow excludes them
-          // for the same reason).
-          if (key === 'name' || key === 'slug') continue
-          // The two MESSAGE fields are the other exception, and the direction is
-          // the point. Every other key here is config-derived, so the event log is
-          // where it is written and the projection IS the record. A message preview
-          // is not: the row carries it from the conversation transcript, the store
-          // the message was persisted through, and the member/message event is a
-          // second copy appended afterwards on a best-effort hook. A refused append
-          // leaves the projection holding the PREVIOUS message, so letting it win
-          // renders a stale preview over the fresh value sitting beside it in the
-          // same payload. The projection still fills in when the row has no
-          // transcript value at all, which is what a pushed frame is for.
-          if (key === 'last_message' || key === 'last_active_ts') {
-            if (!r[key]) (merged as Record<string, unknown>)[key] = v[key]
-            continue
-          }
-          const pv = v[key]
-          if (pv !== undefined) (merged as Record<string, unknown>)[key] = pv
-        }
-        return merged
-      }),
-    [rows, rosterViews, collidingSlugs],
-  )
+  const rosterRead = useMembersPageRoster()
+  const { rosterQuery, existingNames, loaded, loadError, members } = rosterRead
   // Identity is the exact crew name (unique in the registry); the slug is not.
   const [activeName, setActiveName] = useState<string>('')
   // The member the LAST open asked for, written synchronously by `activate`.
-  // The URL sync effect below guards on this, not on `activeName`: the roster
+  // useMembersPageNavigation's URL sync effect guards on this, not on `activeName`: the roster
   // is a React Query read, so a store update (the thread endpoint confirming a
   // key patches the row) can re-render this component on React's sync lane
   // BEFORE the default-lane `setActiveName` from the open has committed —
@@ -687,20 +202,240 @@ export default function MembersPage() {
     el?.scrollIntoView?.({ block: 'nearest' })
   }, [])
   // The URL is the one source of WHICH member is open; activeName follows it
-  // (sync effect below). Clicks write the URL, never activeName directly, so
+  // (useMembersPageNavigation's sync effect). Clicks write the URL, never activeName directly, so
   // the phone's back gesture, a reload and a shallow link go through the same
   // path as a click.
   const [searchParams, setSearchParams] = useSearchParams()
   const urlMember = searchParams.get(MEMBER_PARAM) ?? ''
+
+  // CREW-18688: editing a bot opens the crew editor as a MODAL on this page,
+  // instead of navigating to /capabilities?tab=crews. The editor's whole
+  // state machine lives in useCrewEditor; CrewEditorModal renders it. The
+  // identity pill in the thread header sets `editingCrew`, which drives the hook.
+  const [editingCrew, setEditingCrew] = useState('')
+  // The profile card (crewmate-panel IA): a floating hover card centred over the
+  // thread, which tab it opened on. Every explicit open gets a nonce so asking
+  // for the same initial tab again still resets a card the user navigated within.
+  // The header pill hides while the card is up and the side panel is not (the
+  // card's head names the crewmate then).
+  const [profile, setProfile] = useState<ProfileCardOpen | null>(null)
+
+  const active = useMemo(
+    () => members.find((m) => m.name === activeName),
+    [members, activeName],
+  )
+
+  const activeSlug = active?.slug ?? ''
+  const activeMemberName = active?.name ?? ''
+  const crewEditing = useMembersPageCrewEditor({
+    rosterRead, leave, queryClient, activeName, setSearchParams, urlMember, editingCrew, setEditingCrew,
+  })
+  const { crewEditor, crewModalAtStake, crewModalAtStakeRef, crewModalBusy, crewModalBusyRef } = crewEditing
+  const teamsRead = useMembersPageTeams({ searchParams })
+  const { teams, urlTeam, setTeamDialog, teamDialog } = teamsRead
   // Set when a URL NAMED a member that is gone: the user asked for someone
-  // specific, so the outcome is said out loud — above the fallback thread on
-  // md+ (`shown` = who opened instead), above the roster below md (`shown` is
-  // '' — no thread opened). The remembered-member fallback never sets it —
+  // specific, so the outcome is said out loud — above the fallback thread
+  // (`shown` = who opened instead), or above the roster when nothing could
+  // open in their place (`shown` is ''). The remembered-member fallback never sets it —
   // there the user named nobody. Cleared once a different member opens.
-  const [gone, setGone] = useState<{ name: string; shown: string } | null>(null)
-  // Deploy my crew. Page-level because a launch is crew-wide, and the panel's
-  // own read is gated on this, so it stays false until someone asks for it.
-  const [deployOpen, setDeployOpen] = useState(false)
+  const [gone, setGone] = useState<GoneNotice | null>(null)
+  // The New crewmate card, shown in place of the chat.
+  const [createOpen, setCreateOpen] = useState(false)
+  // Whether the card opens with Advanced settings unfolded: folded for New
+  // crewmate, unfolded for the empty-state hero's Advanced link.
+  // A proposal carrying a goal unfolds it too (the card's own rule), so the
+  // goal is in view.
+  const [createExpanded, setCreateExpanded] = useState(false)
+  // The proposal an opening starts from (a create link's name and goal), or
+  // none. A NEW object per opening: the card re-fills from it by identity.
+  const [createDraft, setCreateDraft] = useState<CrewmateDraft>()
+  const mayLeave = useMayLeaveForNavigation()
+  // The card's own report of whether the user changed what it opened with,
+  // and whether a create is in flight.
+  const createEditedRef = useRef(false)
+  const createBusyRef = useRef(false)
+  const onCreateDraftState = useCallback(({ edited, busy }: { edited: boolean; busy: boolean }) => {
+    createEditedRef.current = edited
+    createBusyRef.current = busy
+  }, [])
+  const createOpenRef = useRef(false)
+  createOpenRef.current = createOpen
+  // Set when the user chose another chat or team while a create was in
+  // flight: that create's success must not replace the chat they picked.
+  const leftCreateRef = useRef(false)
+  /** Every door to the New crewmate card: the "+" menu, the hero and the
+   *  switcher (no draft), and a create link or guide (a proposed name and
+   *  goal). A card already open is left only if its guard agrees, which asks
+   *  only when the user changed it (a guide that brought us here already
+   *  asked: `leaveGranted`); refused, it stays as it is. The chat behind the card
+   *  stays mounted, so its unsent draft is there again on the way back. */
+  const openCreate = useCallback((expanded: boolean, draft?: CrewmateDraft, leaveGranted = false) => {
+    // A create in flight keeps its card as sent, open or left: a second
+    // opening would blank a form still locked on that create, and its
+    // settle would then close or error the card the user just opened.
+    if (createBusyRef.current) return
+    if (createOpenRef.current && !leaveGranted && !mayLeave()) return
+    createEditedRef.current = false
+    if (!createBusyRef.current) leftCreateRef.current = false
+    setLeftCreateFailure(null)
+    // Always a new object, even with no proposal: the card resets by the
+    // draft's identity, and a card already open must drop what was typed.
+    setCreateDraft(draft ? { ...draft } : { name: '', goal: '' })
+    setCreateExpanded(expanded)
+    setCreateOpen(true)
+  }, [mayLeave])
+  const draftRequest = searchParams.get('create') === '1'
+  // Set below, once the card's close exists: records the guide that opened it.
+  const markGuideOpenedRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    if (!draftRequest) return
+    const granted = (location.state as { leaveGranted?: boolean } | null)?.leaveGranted === true
+    markGuideOpenedRef.current()
+    openCreate(false, { name: searchParams.get('name') ?? '', goal: searchParams.get('goal') ?? '' }, granted)
+    const next = new URLSearchParams(searchParams)
+    next.delete('create'); next.delete('name'); next.delete('goal')
+    // A create link names no member, so the chat it was followed from stays
+    // the one behind the card (and the one its close returns to), rather than
+    // whatever the page's own landing would pick for a bare `/members`.
+    if (!next.get(MEMBER_PARAM) && !next.get(TEAM_PARAM) && activeNameRef.current) {
+      next.set(MEMBER_PARAM, activeNameRef.current)
+    }
+    setSearchParams(next, { replace: true })
+  }, [draftRequest, searchParams, setSearchParams, openCreate, location.state])
+  // A guide that opened the card and was then called off steps it aside so the
+  // chat (with the guide's result line) shows again -- only while the user has
+  // not touched the draft. An edited draft is theirs and stays open.
+  markGuideOpenedRef.current = useGuideOpenedSurface('crewmate.create', {
+    open: createOpen,
+    isPristine: () => !createEditedRef.current && !createBusyRef.current,
+    close: () => setCreateOpen(false),
+  })
+  // Choosing a chat or a team while the card is up means "show me that": the
+  // card is left only if its own guard agrees (a create in flight asks too).
+  // A card whose create just succeeded has already been stood down by
+  // `handleCreated`, so opening the new crewmate passes straight through.
+  const leaveCreate = useCallback((): boolean => {
+    if (createOpenRef.current) {
+      if (!mayLeave()) return false
+      if (createBusyRef.current) leftCreateRef.current = true
+      setCreateOpen(false)
+    }
+    return true
+  }, [mayLeave])
+  // The rail's Crewmates row (or a palette jump to `/members`) while the card
+  // is up means "show me the page", like choosing a chat does. The navigation
+  // lands on this same page, which stays mounted with `createOpen` still true,
+  // so without this the card stayed exactly where it was and the click read as
+  // dead -- even after the user answered Leave. Read off the location LANDING:
+  // a PUSH onto a bare `/members` while the card is open. Three marks tell that
+  // click from every other way this location changes -- this page's own URL
+  // writes (the remembered chat, a gone name cleared, a create link's cleanup)
+  // are replaces, the phone's drawer and team pushes name a member or a team,
+  // and the Back guard's own duplicate entry carries its marker.
+  //
+  // The URL is where the user landed, never proof that anyone asked. A caller
+  // that asked the guards just now says so with `leaveGranted` in the entry's
+  // state (the rail's `NavItem`, the palette, the guide's `enter`): then Leave
+  // was the answer and the card closes without a second question. Any other
+  // push here -- the rail row clicked while the address is already a bare
+  // `/members`, which asks nothing; a raw `navigate('/members')` -- goes through
+  // `leaveCreate`, which asks the card's own guard when there is text to lose
+  // and leaves the card standing when the user says Stay. Typed text is never
+  // dropped unasked. A create in flight is left, not blanked, and its settle
+  // must not replace the chat (`leftCreateRef`), exactly as `leaveCreate` does.
+  const navigationType = useNavigationType()
+  const landingKeyRef = useRef(location.key)
+  useEffect(() => {
+    if (location.key === landingKeyRef.current) return
+    landingKeyRef.current = location.key
+    if (navigationType !== 'PUSH' || isTrapEntry(location.state)) return
+    if (location.pathname !== '/members' || location.search !== '' || !createOpen) return
+    const granted = (location.state as { leaveGranted?: boolean } | null)?.leaveGranted === true
+    if (!granted) { leaveCreate(); return }
+    if (createBusyRef.current) leftCreateRef.current = true
+    setCreateOpen(false)
+  }, [location.key, location.pathname, location.search, location.state, navigationType, createOpen, leaveCreate])
+  const openAdvanced = useCallback(() => openCreate(true), [openCreate])
+  const openQuick = useCallback(() => openCreate(false), [openCreate])
+  /** The DM column, the containing block of the modal profile card. */
+  const threadColumnRef = useRef<HTMLElement>(null)
+  // Crewmates just created here whose first chat open has not answered yet,
+  // keyed by NAME: two creates can race inside one thread round trip. An
+  // entry lives until its own thread answers (confirmed, collision or failed
+  // open) and is what lets that answer release the create hold. The first
+  // greeting itself is not the page's: the server owes it to the crewmate
+  // (`first_greeting` on the create) and the greeting request every member
+  // thread open makes (`useFirstGreeting`) starts it, hidden.
+  const pendingOpens = useRef(new Set<string>())
+  // The post-create follow-up (`openCreated` → roster re-read → thread open)
+  // spans several awaits, and nothing above cancels them when the user leaves
+  // the page mid-way: a route change unmounts this component, but the roster
+  // refetch still resolves and `openThread`'s `onSuccess` still runs.
+  // Continuing would `setSearchParams` the page they navigated to back to
+  // `/members?member=<new name>`. Every post-await step checks this ref and,
+  // when the page is gone, drops the follow-up.
+  const pageMounted = useRef(true)
+  useEffect(() => {
+    pageMounted.current = true
+    return () => {
+      pageMounted.current = false
+    }
+  }, [])
+  // A step AFTER a successful create that failed: the roster re-read. The
+  // record is what the retry needs and the notice above the chat column says
+  // so; the create itself is never in doubt here (the server has the
+  // crewmate), so the dialog does not reopen.
+  const [postCreateError, setPostCreateError] = useState<PostCreateFailure | null>(null)
+  // Mirror for the thread mutation's callbacks, which must read the CURRENT
+  // record, not the one of the render that armed them.
+  const postCreateErrorRef = useRef(postCreateError)
+  postCreateErrorRef.current = postCreateError
+  // Whether the post-create notice may be closed without its retry: only
+  // when the CACHED roster is non-empty — below md the
+  // notice column replaces the roster, so an undismissable notice over a
+  // roster that has other crewmates would lock every existing chat behind a
+  // server that keeps failing (Opus, round 36). Closing it leaves the old
+  // list, missing the new name until the next read; that is the honest
+  // trade against a page with no way back. Over an EMPTY cached roster it
+  // stays undismissable: "No crewmates yet" under "Radar was created" would
+  // be two contradicting statements in one column. "Empty" is the hero's own
+  // predicate (`hasNoCrewmates`), so the two can never disagree about what
+  // counts as empty.
+  const postCreateDismissable =
+    postCreateError !== null && !hasNoCrewmates(members)
+  // The crewmate whose follow-up (roster re-read, chat open) is still in
+  // flight. One at a time, by design: `postCreateError` holds ONE record, so a
+  // second create started inside the first one's window could overwrite the
+  // first one's retry. While this is set the header "+" is held (the hero is
+  // already gone once a crewmate exists), so the window cannot be entered; it
+  // clears at every terminal point of the follow-up, a failed chat open
+  // included.
+  const [followUp, setFollowUp] = useState<CreatedCrewmate | null>(null)
+  // Mirror for the thread mutation's callbacks (same reason as
+  // `postCreateErrorRef`): an open's answer must read the follow-up that is
+  // in flight NOW, not the one of the render that armed the callback.
+  const followUpRef = useRef(followUp)
+  followUpRef.current = followUp
+  // The one reason every create door (header "+", both heroes) is held, or
+  // `null` when creating is open. The failed-step record wins the wording:
+  // it is the one with a retry the user can act on.
+  const createHeld: string | null = postCreateError
+    ? !postCreateDismissable
+      // A roster notice over an EMPTY cached roster has no dismiss (see its
+      // `onDismiss`), so its hold names only the retry; "retry or dismiss"
+      // is every dismissable notice's.
+      ? t('pages.membersPage.add_member_pending_roster', { name: postCreateError.created.name })
+      : t('pages.membersPage.add_member_pending', { name: postCreateError.created.name })
+    : followUp
+      ? t('pages.membersPage.add_member_settling', { name: followUp.name })
+      : loadError
+        // A failed arrival read leaves the dialog's exact-name check with
+        // nothing to check against (`existingNames` is empty), and the
+        // post-failure reconcile in the dialog is premised on the roster
+        // having been read. The door is held until a read lands; the
+        // notice's Try again is the way back.
+        ? t('pages.membersPage.roster_load_failed')
+        : null
   // The member the fallback is about to open in place of a gone one a link
   // named. Set right before the fallback's URL write, read (and cleared) by
   // the open that write triggers, so that open can skip the memory write. A
@@ -714,8 +449,8 @@ export default function MembersPage() {
   // message auto-create an ordinary UNPINNED slot on the member key.
   // POST /api/members/{slug}/thread is idempotent and is the only creator/
   // repairer of member slots — so every open goes through it (the mutation
-  // below), and its answer is cached per member NAME (memberThreadQueryKey)
-  // so a return to a member mounts the cached thread at once while the
+  // `openThread`, in MembersPageThread.tsx), and its answer is cached per member NAME
+  // (memberThreadQueryKey) so a return to a member mounts the cached thread at once while the
   // re-POST repairs in the background. Keying by the member the answer was
   // requested FOR makes a late completion of a previously selected member
   // harmless. `skipToken`: this entry is written by the mutation, never
@@ -735,41 +470,18 @@ export default function MembersPage() {
       (m.name === activeName ? threadOutcome?.slot_key : '') || m.slot_key,
     [activeName, threadOutcome],
   )
-  // Roster width is user-adjustable on md+ (drag handle on the right edge),
-  // mirroring the chat sidebar. Below md the roster is full-width single-pane
-  // and the stored width is simply unused. Clamp + persist live in the shared
-  // useColumnResize hook — the same primitive every resizable column uses.
-  const roster = useColumnResize(ROSTER_WIDTH_KEY, loadRosterWidth, ROSTER_MIN, ROSTER_MAX)
-  // Where the side panel lives. Wide enough (see panelSitsBeside) it is a
-  // permanent column beside the thread with no close control — the chat page's
-  // panel, docked. Narrower, it is an overlay the header button opens and the
-  // panel's own close control dismisses, because a column that cannot be
-  // dismissed would otherwise fold the thread to nothing. The window width is
-  // tracked live (not sampled at mount) so crossing the boundary re-docks.
-  const isMobile = useIsMobile()
-  const [winW, setWinW] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 0))
-  useEffect(() => {
-    const onResize = () => setWinW(window.innerWidth)
-    window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
-  }, [])
-  const beside = panelSitsBeside({ winW, rosterW: roster.width, isMobile })
-  // On a phone the overlay must FILL its scrim. SidePanel's own mobile
-  // fallback is `width: 100%`, which cannot resolve here: the overlay's inner
-  // wrapper is a shrink-to-fit flex item, so a percentage child falls back to
-  // the panel's max-content width and the panel lands at SIDE_PANEL_MIN_W
-  // with a dimmed sliver of the thread showing beside it (issue #9979). The
-  // chat page hands its panel an explicit px width for exactly this reason
-  // (sidePanelFillWidth's mobile branch); this is that branch. `undefined` off
-  // the phone, where the panel keeps its own resizable width in both
-  // placements — the docked/overlay split is panelSitsBeside's, not this.
-  const panelFillWidth = isMobile ? Math.max(SIDE_PANEL_MIN_W, winW) : undefined
-  const [overlayOpen, setOverlayOpen] = useState(false)
-  // `overlayOpen` is overlay-mode state only. Reset it whenever the panel docks
-  // (a widening window, a narrower roster), so an open overlay does not lie in
-  // wait and pop back over the thread the moment the window narrows again.
-  useEffect(() => { if (beside) setOverlayOpen(false) }, [beside])
-  const panelVisible = beside || overlayOpen
+  const layout = useMembersPageLayout({ rosterRead, teamsRead, activeName })
+  const { isMobile, winW, rosterShown } = layout
+  const profileCard = useMembersPageProfile({ layout, activeName, profile, setProfile })
+  const { schedGuardRef, schedAtStakeRef, openMemberRef } = profileCard
+  const drawers = useMembersPageDrawers({
+    teamsRead, layout, navigate, location, activeName, createOpen, navigationType, active,
+  })
+  const {
+    rosterDrawerOpen, rosterDrawerMounted, rosterDrawerX, rosterDrawerPanelRef, rosterDrawerScrimRef,
+    setRosterDrawerHost, mobileNavRail, vv, keyboardInset, rosterDrawerScrim, closeRosterDrawer,
+    rosterDrawerAvailable, sidePanelSwipeAvailable, placeRoster,
+  } = drawers
   // Live presence rides the already-subscribed WS `slots` frames — the roster
   // endpoint only fills the cold-start gap (its `running` is a snapshot).
   const liveSlots = useAppSelector((s) => s.dashboard.slots)
@@ -779,988 +491,238 @@ export default function MembersPage() {
   // driving" on a cold open or a WS reconnect — it shows a skeleton instead,
   // the same three-state discipline the Recent-activity section keeps.
   const slotsLoaded = useAppSelector((s) => s.dashboard.slotsLoaded)
-  const liveRunning = useMemo(() => {
-    const byKey: Record<string, boolean> = {}
-    for (const s of liveSlots) {
-      if (s.mode === 'member') byKey[s.key] = !!(s.running || s.subagents_running)
-    }
-    return byKey
-  }, [liveSlots])
-  const isRunning = useCallback(
-    (m: MemberRosterRow) => {
-      const key = slotKeyOf(m)
-      return key && key in liveRunning ? liveRunning[key] : m.running
-    },
-    [slotKeyOf, liveRunning],
-  )
-  // A member turn parked on the user — an approval or a question — read off
-  // the same slot frames; `tabStatus` is the shared ranking of those two.
-  const liveNeedsYou = useMemo(() => {
-    const byKey: Record<string, boolean> = {}
-    for (const sl of liveSlots) {
-      if (sl.mode !== 'member') continue
-      const st = tabStatus(sl, [], sl.key)
-      byKey[sl.key] = st === 'permission' || st === 'question'
-    }
-    return byKey
-  }, [liveSlots])
+  // What the panel gesture reads: the panel and its opener are both drawn only
+  // while a member is open, so the toggle is inert otherwise.
+  useEffect(() => { openMemberRef.current = !!active }, [active, openMemberRef])
+  // Guide facts: the roster picker's selection (whether a crewmate is open and
+  // whether any exists, never which), and whether the roster is shown, per
+  // layout: folded into the switcher on a wide screen (`members.roster`),
+  // behind the open chat on a phone, in the roster drawer (`members.roster-phone`).
+  useGuideSelection('crewmate_selected', { selected: !!active, available: loaded && !hasNoCrewmates(members), name: active?.name })
+  // The header "Add…" menu is drawn once the roster has a crewmate.
+  useGuidePredicate('has_crewmates', loaded ? !hasNoCrewmates(members) : null)
+  useGuideRevealScope(isMobile ? undefined : 'members.roster', rosterShown)
 
-  const active = useMemo(
-    () => members.find((m) => m.name === activeName),
-    [members, activeName],
-  )
-  // The active member's projected roster view over its server row: the drawer
-  // Configuration and header read config fields (kiro_agent/model/workspace/
-  // memory_store) and last_active_ts from the projection when present, the row
-  // otherwise. `running` stays live (isRunning), not projected.
-  const activeRoster = useMemberProjection<RosterView>(projectionSlug(active?.slug), 'roster')
-  const activeView = useMemo<MemberRosterRow | undefined>(() => {
-    if (!active) return undefined
-    if (!activeRoster) return active
-    return {
-      ...active,
-      kiro_agent: activeRoster.kiro_agent ?? active.kiro_agent,
-      workspace: activeRoster.workspace ?? active.workspace,
-      memory_store: activeRoster.memory_store ?? active.memory_store,
-      model: activeRoster.model ?? active.model,
-      source: activeRoster.source ?? active.source,
-      starred: activeRoster.starred ?? active.starred,
-      avatar: activeRoster.avatar ?? active.avatar,
-      slot_key: activeRoster.slot_key ?? active.slot_key,
-      // Transcript-first, for the reason the row above states: the projection's
-      // message copy is a second copy and a refused append leaves it behind.
-      last_active_ts: active.last_active_ts || activeRoster.last_active_ts,
-      last_message: active.last_message || activeRoster.last_message,
-    }
-  }, [active, activeRoster])
-  // Most-recently-active first (like any IM member list); never-talked
-  // members fall to the bottom alphabetically. Sorted from the cached roster,
-  // which changes only when the cache does — a return to the page, a focus
-  // after the stale window, a registry write elsewhere — never on a live
-  // message, so rows do not move under the cursor mid-conversation.
-  const [filter, setFilter] = useState('')
-  const [filterMenuOpen, setFilterMenuOpen] = useState(false)
-  // Persistent roster filters. The agent sync writes every package-installed
-  // agent spec into the roster, so a host with a few dozen installed packages
-  // shows dozens of crews the user never drives. Both toggles survive a page
-  // change (same localStorage idiom as ChatSidebar's session filters); the
-  // star itself is server-side (`starred` on the crew), so it survives a
-  // reinstall and follows the config to another dashboard.
-  const [starredOnly, setStarredOnly] = usePersistedBool(STARRED_ONLY_KEY, false)
-  const [rawSourceFilter, setRawSourceFilter] = usePersistedString(SOURCE_FILTER_KEY, 'all')
-  // Storage is hand-editable: an unknown stored value reads as "all".
-  const sourceFilter = parseSourceFilter(rawSourceFilter)
-  const toggleStarredOnly = useCallback(() => setStarredOnly((prev) => !prev), [setStarredOnly])
-  const pickSource = useCallback(
-    (next: MemberSourceFilter) => {
-      // Choosing the active origin clears it back to "all" — one radio-like
-      // group, no separate reset row.
-      setRawSourceFilter((prev) => (parseSourceFilter(prev) === next ? 'all' : next))
-    },
-    [setRawSourceFilter],
-  )
-  // Live-state filters (working / needs you / unread / patrolling) and the
-  // sort, persisted like the sidebar's session filters. Stored as strings so
-  // the parse is the single place junk from storage is rejected.
-  const [rawStatusFilter, setRawStatusFilter] = usePersistedString(STATUS_FILTER_KEY, '[]')
-  const statusFilter = useMemo(() => parseStatusFilters(rawStatusFilter), [rawStatusFilter])
-  const toggleStatus = useCallback(
-    (key: MemberStatusFilter) =>
-      setRawStatusFilter((prev) => {
-        const next = parseStatusFilters(prev)
-        if (next.has(key)) next.delete(key)
-        else next.add(key)
-        return JSON.stringify([...next])
-      }),
-    [setRawStatusFilter],
-  )
-  const [rawSort, setRawSort] = usePersistedString(SORT_KEY, 'recent')
-  const sort = parseSort(rawSort)
-  const clearFilters = useCallback(() => {
-    setStarredOnly(false)
-    setRawSourceFilter('all')
-    setRawStatusFilter('[]')
-  }, [setStarredOnly, setRawSourceFilter, setRawStatusFilter])
-  // Star toggle: optimistic flip, reverted if the PUT fails. The star lives
-  // on the crew record, not the DM thread, so it goes through the crew
-  // update endpoint rather than a members route. A failed write (403 for a
-  // non-owner, 500 on a failed config save) is SURFACED, not just reverted:
-  // a star that snaps back with no message reads as a broken button, and
-  // AUTOSDE's errors-use-error-notice forbids the silent catch-to-default.
-  // Display text is the localized `star_failed` copy; the structured report
-  // (endpoint, status, code, detail) is looked up from the thrown message
-  // and passed to ErrorNotice explicitly, so the agent hand-off keeps it.
-  const [starError, setStarError] = useState<{ message: string; report?: ErrorReport } | null>(null)
-  // Names with a star write in flight. The control is disabled while its
-  // write is pending, so two rapid toggles cannot race: without this, a
-  // second click whose write also fails would revert to the FIRST click's
-  // value and leave the row starred while the server is not.
-  const [starPending, setStarPending] = useState<Set<string>>(() => new Set())
-  // The optimistic flip and its revert are per-ROW functional patches on the
-  // roster cache, not a whole-roster snapshot restore: two members starred in
-  // quick succession must not have the second's failure undo the first.
-  const patchStar = useCallback(
-    (name: string, starred: boolean) =>
-      queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
-        rows?.map((r) => (r.name === name ? { ...r, starred } : r)),
-      ),
-    [queryClient],
-  )
-  const starMutation = useMutation({
-    mutationFn: ({ m, next }: { m: MemberRosterRow; next: boolean }) =>
-      api.updateKirocrewAgent(m.name, { starred: next }),
-    onMutate: async ({ m, next }) => {
-      // A roster refetch already in flight would land AFTER the optimistic
-      // patch and overwrite it with the pre-write row: stop it first. (The
-      // row's pending lock is taken synchronously in toggleStar, before this
-      // async hook, so a second click in the same tick finds it disabled.)
-      await queryClient.cancelQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
-      setStarError(null)
-      patchStar(m.name, next)
-    },
-    onSuccess: async (_data, { m, next }) => {
-      // Re-apply the CONFIRMED value — and first cancel any roster refetch
-      // that started after onMutate's cancel (focus, stale window, a refresh
-      // frame): such a GET can have read the pre-write row while the PUT was
-      // in flight, and resolving AFTER this patch it would overwrite the
-      // confirmed star with the stale one. After a 2xx the server holds
-      // `next`; the row must say so regardless of what was in flight.
-      await queryClient.cancelQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
-      patchStar(m.name, next)
-    },
-    onError: async (err: unknown, { m, next }) => {
-      // Same reason as onSuccess: a refetch that started after onMutate's
-      // cancel must not land its snapshot on top of the final row.
-      await queryClient.cancelQueries({ queryKey: MEMBERS_ROSTER_QUERY_KEY })
-      patchStar(m.name, !next)
-      // Localized copy, never the raw server text: the client throws the
-      // response body (or `HTTP 500`), which is neither translated nor
-      // meant for a user. The journaled report is recovered from that
-      // message and handed to ErrorNotice so "Ask the agent" still carries
-      // endpoint / status / code / detail.
-      setStarError({
-        message: t('pages.membersPage.star_failed'),
-        report: findReport(err instanceof Error ? err.message : undefined),
-      })
-    },
-    onSettled: (_data, _err, { m }) => {
-      setStarPending((prev) => {
-        const n = new Set(prev)
-        n.delete(m.name)
-        return n
-      })
-    },
-    // No invalidation on success, deliberately: the roster row is the only
-    // reader of `starred`, and after a 2xx the re-applied row IS the server's
-    // state — a refetch would re-render the whole list to change nothing.
+  // The phone drawers bind on the page root: a rightward drag reveals the
+  // roster drawer, a leftward one the side panel. Told apart by DIRECTION, and
+  // each is off while the other's panel is OPEN, because one's closing drag is
+  // the other's opening drag. The roster drawer exists only while something is
+  // open over the roster; the side panel only while a crewmate is.
+  const membersRootRef = useRef<HTMLDivElement | null>(null)
+  // Shown exactly where `placeRoster` draws it: on the page while no drawer
+  // exists, in the drawer only while it is open. A team keeps the drawer too,
+  // so `!activeName` alone would claim a roster that is not on screen.
+  useGuideRevealScope(isMobile ? 'members.roster-phone' : undefined, !rosterDrawerAvailable || rosterDrawerOpen)
+  const drawerSwipes = useMembersPageDrawerSwipes({
+    teamsRead, layout, drawers, activeName, createOpen, membersRootRef,
   })
-  const { mutate: mutateStar } = starMutation
-  const toggleStar = useCallback(
-    (m: MemberRosterRow) => {
-      // Lock the row NOW, synchronously: useMutation's onMutate runs a
-      // microtask later, and a second click landing before it would start a
-      // second write whose failure could revert the first's value.
-      setStarPending((prev) => new Set(prev).add(m.name))
-      mutateStar({ m, next: !m.starred })
-    },
-    [mutateStar],
-  )
-  // Display order before the search filter — this is the roster the rows
-  // render from and the list `resolveDefaultMember` searches for a remembered
-  // member, so a typed filter never changes the order or which member a
-  // return visit restores. The ORDER is committed per MEMBERSHIP and
-  // per chosen SORT, not per refetch: the roster query refetches on every
-  // server refresh frame, on window focus and on staleness, and re-sorting
-  // when a last_active_ts advances would move rows under the cursor mid-click
-  // — opening a different member's durable pinned thread. Row CONTENT (star,
-  // last-message preview, presence) still updates live from every refetch;
-  // only the ordering is held until a member is added, removed or renamed, or
-  // the user picks the other sort, which re-sorts from scratch.
-  const committedOrderRef = useRef<{ sort: MemberSort; names: string[] }>({ sort, names: [] })
-  const orderedMembers = useMemo(() => {
-    const byName = new Map(members.map((m) => [m.name, m]))
-    // Recency for the sort comes from the RAW query rows, not the merged
-    // member: the pushed `roster` projection freezes last_active_ts at its
-    // baseline seq (a plain roster refetch re-seeds at the same seq and is
-    // dropped by higher-seq-wins), so sorting the merged value would hold the
-    // order stale across a membership change. The fresh row carries the
-    // authoritative last_active_ts a re-sort must read.
-    const tsByName = new Map(rows.map((r) => [r.name, r.last_active_ts ?? 0]))
-    const prev = committedOrderRef.current
-    const sameMembership =
-      prev.sort === sort && prev.names.length === byName.size && prev.names.every((n) => byName.has(n))
-    // Sort on the raw-row recency (tsByName), not the projection-frozen merged
-    // value: sortRoster reads last_active_ts, and the merged member's is held
-    // stale by higher-seq-wins, so overlay the fresh row ts before sorting.
-    const forSort = members.map((m) => ({ ...m, last_active_ts: tsByName.get(m.name) ?? m.last_active_ts ?? 0 }))
-    const names = sameMembership ? prev.names : sortRoster(forSort, sort).map((m) => m.name)
-    committedOrderRef.current = { sort, names }
-    return names.map((n) => byName.get(n)).filter((m): m is MemberRosterRow => !!m)
-  }, [members, rows, sort])
-  // Named apart from `rosterQuery` above: that one is the React Query READ of
-  // the roster, this one is the user's filter/sort question asked of it.
-  const rosterFilterQuery = useMemo<RosterQuery>(
-    () => ({ search: filter, starredOnly, source: sourceFilter, status: statusFilter, sort }),
-    [filter, starredOnly, sourceFilter, statusFilter, sort],
-  )
-  const activeSlot = active ? threadOutcome?.slot_key ?? '' : ''
-  // Two distinct verdicts with two different sentences: a collision is a
-  // fact about the roster (the slug's thread belongs to another crew), a
-  // failed POST is a transport error. Both render through ErrorNotice so
-  // the structured report and the agent hand-off survive.
-  const activeCollision = active ? threadOutcome?.collision ?? '' : ''
-  const activeThreadFailed = !!active && !!threadOutcome?.failed
-  // The thread open. A mutation, not a query: the endpoint is a write (the
-  // idempotent creator/repairer of member slots), so it is issued on EVERY
-  // open — never served from cache — and its answer is what the cache holds.
-  // Outcomes are keyed by the member the POST was FOR, so a late answer for a
-  // member the user has already left lands in that member's entry, not the
-  // open one's. The roster row is patched with a freshly confirmed key so the
-  // row's live readings (presence dot, unread, patrol badge) resolve to the
-  // same slot the thread mounted on, without a roster refetch that would
-  // re-sort the list under the cursor.
-  const setThreadOutcome = useCallback(
-    (name: string, update: (prev: MemberThreadOutcome | undefined) => MemberThreadOutcome) =>
-      queryClient.setQueryData<MemberThreadOutcome>(memberThreadQueryKey(name), update),
-    [queryClient],
-  )
-  // Per-member sequence of thread POSTs. Within ONE member only the LATEST
-  // request may write its verdict back: an older answer arriving after a newer
-  // one (a re-click on a slow link) is dropped whole, because letting a stale
-  // success overwrite the refusal the newest POST just recorded would re-bind
-  // the side panel to a key the endpoint has since refused — aiming Side chat
-  // / Artifacts / Terminal at a foreign session. Dropping it loses nothing:
-  // every open re-POSTs. Across members the rule above stands untouched (a
-  // late answer for another member is that member's newest, so it lands).
-  const threadReqSeq = useRef<Record<string, number>>({})
-  const openThread = useMutation({
-    mutationFn: (m: MemberRosterRow) => api.memberThread(m.slug),
-    onMutate: (m) => {
-      // A previous verdict for this member is retired while the re-POST is
-      // out: a confirmed key keeps rendering (the cached thread stays up), a
-      // collision or failure line comes down until the new answer is in.
-      setThreadOutcome(m.name, (prev) => ({ slot_key: prev?.slot_key ?? '' }))
-      // The sequence number rides the mutation context to onSuccess/onError.
-      const seq = (threadReqSeq.current[m.name] ?? 0) + 1
-      threadReqSeq.current[m.name] = seq
-      return seq
-    },
-    onSuccess: (r, m, seq) => {
-      if (seq !== threadReqSeq.current[m.name]) return
-      if (r.member !== m.name) {
-        // The slug's thread belongs to another crew (lossy-slug collision,
-        // first-bound-wins). Mounting it would be a silent misroute — the
-        // defining failure for a page whose premise is identity.
-        setThreadOutcome(m.name, () => ({ slot_key: '', collision: r.member }))
-        return
-      }
-      setThreadOutcome(m.name, () => ({ slot_key: r.slot_key }))
-      if (m.slot_key !== r.slot_key) {
-        queryClient.setQueryData<MemberRosterRow[]>(MEMBERS_ROSTER_QUERY_KEY, (rows) =>
-          rows?.map((row) => (row.name === m.name ? { ...row, slot_key: r.slot_key, bound: true } : row)),
-        )
-      }
-    },
-    onError: (error, m, seq) => {
-      if (seq !== threadReqSeq.current[m.name]) return
-      setThreadOutcome(m.name, (prev) => ({
-        slot_key: prev?.slot_key ?? '',
-        failed: true,
-        errorReport: findReport(error instanceof Error ? error.message : undefined),
-      }))
-    },
+  const { rosterDrawerDragging } = drawerSwipes
+  // The profile card (opened from the header pill) holds the Permissions row a
+  // "crewmate tools" guide points at (`members.permissions`).
+  useGuideRevealScope('members.profile', !!profile)
+  const rosterView = useMembersPageRosterView({
+    rosterRead, teamsRead, t, queryClient, activeName, slotKeyOf, liveSlots, active,
   })
-  const { mutate: postThread } = openThread
-  // The cached key is trusted only for as long as the gateway is known not to
-  // have restarted. A dropped-then-restored socket is the one client-visible
-  // sign that it may have (a restart drops an unmessaged member slot while
-  // its binding survives), so on a RECONNECT the open member's thread is
-  // re-confirmed by the same idempotent POST every open makes — the mounted
-  // pane stays up meanwhile, exactly as during any other repair. The
-  // websocket hook forgets the entries nobody is looking at at the same
-  // moment. Only a true->false->true sequence seen by THIS mounted page
-  // counts: the first connect after a reload is not a reconnect, and the
-  // roster-driven open already confirms the thread then.
-  const connected = useConnected()
-  const hadConnectionRef = useRef(false)
-  const activeRowRef = useRef<MemberRosterRow | undefined>(undefined)
-  activeRowRef.current = active
-  useEffect(() => {
-    if (!connected) return
-    if (hadConnectionRef.current && activeRowRef.current) postThread(activeRowRef.current)
-    hadConnectionRef.current = true
-  }, [connected, postThread])
-
-  // The member whose thread POST is IN FLIGHT — the mutation's own pending
-  // reading, which follows the LATEST call: a fast re-click (two POSTs out)
-  // stays pending until the second answers, so the first one's completion
-  // cannot re-bind the panel while the second is still unanswered. While it
-  // is in flight the cached key is only a render hint for the thread column:
-  // the side panel must not bind to it, because the POST may come back
-  // refusing that very key (renamed / deleted member, a stale binding another
-  // session now occupies) and a panel action dispatched in the window — an
-  // artifact involvement write, a Side chat turn — cannot be recalled by the
-  // unbind that follows.
-  const pendingThreadFor = openThread.isPending ? openThread.variables?.name ?? '' : ''
-  // The slot the SIDE PANEL may bind: the cached key only once the CURRENT
-  // open's POST has confirmed it. Empty for the whole in-flight window, so no
-  // slot-bound view is offered and no document action can record against a
-  // key the endpoint is about to refuse — and empty again after a REFUSAL: a
-  // 409 means the canonical key is occupied by a session that is not this
-  // member's (or the endpoint could not repair it), so a cached key kept
-  // through it would leave every slot-bound panel view (Side chat, Artifacts,
-  // Files…) aimed at a foreign session. The panel falls back to the slot-free
-  // Notes / Work log / Dashboard tabs; the thread column keeps rendering the cached key under its
-  // own failure notice (its pre-existing contract, see activeThreadFailed).
-  const confirmedSlot =
-    active && (pendingThreadFor === active.name || activeThreadFailed) ? '' : activeSlot
-
-  // Sessions this member is driving: every live slot whose `created_by` is the
-  // member's DM slot key. A member dispatches its real work into worker
-  // sessions it opens via session_create and steers via session_send, and the
-  // backend fences a member caller to the slots it created — so "created by"
-  // IS "driven by", and the durable birth attribution is the whole source of
-  // truth (no transcript scraping for the `[sent by session …]` prefix). Rides
-  // the already-subscribed WS `slots` frames, which is also what gives each row
-  // its live status — the same running / needs-approval / needs-input signals
-  // the sidebar dot reads. Newest activity first; a closed worker leaves the
-  // live slots and therefore this list, which is the honest reading of
-  // "driving right now".
-  const activeMemberKey = activeSlot || active?.slot_key || ''
-  // The ORDER is committed per DRIVEN SET, not per frame. `liveSlots` refreshes
-  // on every WS slots frame and `lastActivityEpoch` advances whenever a worker
-  // does anything, so sorting per render moves rows under the cursor mid-click —
-  // and each row is a jump into a session, so a shifted row navigates into the
-  // WRONG one. It also decides which rows sit behind the DRIVING_VISIBLE fold,
-  // so a live re-sort can pull a row out from under the pointer entirely.
-  // Row CONTENT still updates from every frame (status dot, title, timestamp);
-  // only the positions hold, until the driven set changes (a worker opens or
-  // closes) or the member does, either of which re-sorts from scratch by
-  // recency. Same rule as the roster order above, and the same reason.
-  const committedDrivingRef = useRef<{ member: string; keys: string[] }>({ member: '', keys: [] })
-  // The side panel's tab strip, bucketed by the member's slot key exactly as
-  // the chat page buckets by chat slot: switching members swaps the whole strip
-  // and switching back restores it. Keyed on the POST-CONFIRMED `activeSlot`
-  // ONLY — never the roster's derived key. That key is a stale binding until
-  // the thread endpoint confirms it (see the `slots` comment above): an
-  // ordinary slot can occupy the canonical key after a restart, the POST then
-  // answers 409 and `activeSlot` stays empty, and a panel bound to the derived
-  // key would aim Side chat / Terminal / Summary at that unrelated session.
-  // While no confirmed slot exists the strip lives in the shared no-slot bucket
-  // and every slot-bound view is withheld (`hiddenViews` below); the Crew
-  // summary needs no slot and stays.
-  const panelTabDescriptors = usePanelTabDescriptors()
-  const tabsCtl = usePanelTabs(activeSlot || null, panelTabDescriptors, { leadingIds: CREW_PANEL_TAB_IDS })
-  // The member slot's project directory (the WS slots frame carries it) roots
-  // the Files tab and is the cwd a Terminal tab spawns in. Only a record from
-  // the CURRENT snapshot counts: a reconnect drops `slotsLoaded` but keeps the
-  // pre-disconnect `slots` until the fresh frame lands, and the thread POST
-  // can confirm inside that window — binding to the stale record would root
-  // Files / Terminal in whatever project the key had BEFORE the restart, and a
-  // save or command dispatched then would land in the wrong workspace. The
-  // record must also be the member's own (`mode === 'member'`): a 200 confirm
-  // names the member slot, never an ordinary session that happens to hold
-  // the canonical key (that case answers 409 and never confirms).
-  const activeLiveSlot = useMemo(
-    () => (confirmedSlot && slotsLoaded
-      ? liveSlots.find((s) => s.key === confirmedSlot && s.mode === 'member')
-      : undefined),
-    [liveSlots, slotsLoaded, confirmedSlot],
-  )
-  const projectDir = activeLiveSlot?.project || undefined
-  // Terminal needs the slot RECORD, not just the confirmed key: the thread
-  // POST answers before the WS `slots` frame that carries the slot's project,
-  // and a shell spawned in that window would take `cwd: undefined` — the
-  // backend's HOME fallback — with no re-rooting once the frame lands. Gate on
-  // the record being present, not on `project` being set: a member with no
-  // project legitimately opens its shell in the fallback cwd, exactly as a
-  // project-less chat does.
-  const slotRecordPresent = !!activeLiveSlot
-  // Views this host withdraws from the strip and the + menu. Always: the views
-  // fed by ChatPage-owned transcript indexes (pull-request / issue / link
-  // extraction, the pins query) — this page has none of those, and an empty
-  // Changes chip on the monitoring page would assert "nothing changed" while a
-  // member is editing. `summary` (the chat page's SESSION summary) is withheld
-  // too: next to the "Work log" chip it would be a second, unrelated summary
-  // of this same thread. Until the thread is confirmed, EVERY slot-bound view is
-  // withheld as well, per the binding rule above — and so is Terminal: while
-  // unconfirmed the strip sits in the shared no-slot bucket, so a PTY opened
-  // then would be orphaned (live shell, unreachable tab) the moment the
-  // confirmation re-keys the strip to the member's slot; app-contributed tabs
-  // (`'app'`) likewise, since the re-key would remount their `AppHost` and
-  // discard the app's own unsaved state. Terminal stays withheld a moment
-  // longer — until the WS slots frame carries the confirmed slot, so its cwd
-  // is known (see slotRecordPresent).
-  const hiddenViews = useMemo<ReadonlySet<SidePanelWithholdable>>(
-    () =>
-      new Set<SidePanelWithholdable>(
-        !confirmedSlot
-          ? MEMBERS_UNCONFIRMED_WITHHELD_VIEWS
-          : !slotRecordPresent
-            ? [...MEMBERS_WITHHELD_VIEWS, 'terminal']
-            : MEMBERS_WITHHELD_VIEWS,
-      ),
-    [confirmedSlot, slotRecordPresent],
-  )
-  // The selection toolbar's "Ask about this" on the thread: the Side Chat for
-  // this member lives in the panel's Side tab (the chat page's home for it),
-  // so opening it means focusing that tab — and, in overlay mode, revealing
-  // the panel, since a hidden tab is not "on screen". Only the endpoint-
-  // confirmed slot may host it (the pane is keyed on that same slot, so the
-  // two agree); `false` tells the selection seam the Ask did NOT happen, so
-  // it never seeds a quote into a Side Chat that never opened.
-  const openMemberSideChat = useCallback((slot: string): boolean => {
-    if (!confirmedSlot || slot !== confirmedSlot) return false
-    tabsCtl.openView('side')
-    if (!beside) setOverlayOpen(true)
-    return true
-  }, [confirmedSlot, tabsCtl, beside])
-  // Whether each leading tab's body is on screen — the gate for its data reads.
-  // Read from what the panel SHOWS (`onActiveTabChange`), not from the stored
-  // focus: a stored focus on a withheld view falls back to the first leading tab
-  // in the strip without moving the store, and that tab must load when it is the
-  // one on screen.
-  const [shownTabId, setShownTabId] = useState<string | null>(null)
-  const activeTabId = shownTabId ?? tabsCtl.activeId
-  const notesVisible = panelVisible && activeTabId === CREW_NOTES_TAB_ID
-  const workLogVisible = panelVisible && activeTabId === CREW_WORK_LOG_TAB_ID
-  const closeOverlay = useCallback(() => setOverlayOpen(false), [])
-  // Mount continuity — the chat page's rule, verbatim: a live Browser tab (its
-  // WebContentsView) or a body-owning app tab (any slot's) cannot survive a
-  // remount, so while one exists a closed overlay is kept mounted and hidden
-  // rather than unmounted. There is no find pane on this page.
-  const hasLiveAppTab = useAnyLiveAppTab()
-  const hasBrowserTab = tabsCtl.tabs.some((tab) => tab.kind === 'browser')
-  const mountInput = { activityOpen: panelVisible, hasLiveAppTab, hasBrowserTab, searchOpen: false }
-  const panelMounted = shouldMountSidePanel(mountInput)
-  const panelHidden = isSidePanelHidden(mountInput)
-  // File / artifact / save for the panel's Files, Artifacts and document tabs —
-  // the chat page's own implementation, not a copy. A failed read is reported
-  // above the thread; an open while the panel is an OVERLAY reveals it, since
-  // the tab it focused is otherwise hidden behind a closed panel. Docked, the
-  // open needs nothing — and must not arm `overlayOpen`, or a later narrowing
-  // of the window would find the overlay already open over the thread.
-  const activeSlotRef = useRef<string | null>(confirmedSlot || null)
-  activeSlotRef.current = confirmedSlot || null
-  const besideRef = useRef(beside)
-  besideRef.current = beside
-  const [actionError, setActionError] = useState('')
-  // A failed document read is reported above the thread. In overlay mode the
-  // open panel covers exactly that spot — the click that failed happened inside
-  // it — so the overlay closes as the notice appears; otherwise the failure is
-  // silent to the person who caused it.
-  const showActionError = useCallback((message: string) => {
-    setActionError(message)
-    if (!besideRef.current) setOverlayOpen(false)
-  }, [])
-  const revealPanelAfterOpen = useCallback(() => { if (!besideRef.current) setOverlayOpen(true) }, [])
-  const { openFile, openArtifact, saveFile } = usePanelDocumentActions({
-    tabsCtl,
-    slotRef: activeSlotRef,
-    queryClient,
-    showActionError,
-    onOpened: revealPanelAfterOpen,
+  const { orderedMembers } = rosterView
+  const thread = useMembersPageThread({
+    profileCard, t, queryClient, pendingOpens, setFollowUp, followUpRef, threadOutcome, active,
   })
-  const drivingSessions = useMemo(() => {
-    if (!activeMemberKey) return []
-    const mine = liveSlots.filter((s) => !!s.created_by && s.created_by === activeMemberKey)
-    const byKey = new Map(mine.map((s) => [s.key, s]))
-    const prev = committedDrivingRef.current
-    const sameSet =
-      prev.member === activeMemberKey &&
-      prev.keys.length === byKey.size &&
-      prev.keys.every((k) => byKey.has(k))
-    const keys = sameSet
-      ? prev.keys
-      : [...mine].sort((a, b) => lastActivityEpoch(b) - lastActivityEpoch(a)).map((s) => s.key)
-    committedDrivingRef.current = { member: activeMemberKey, keys }
-    return keys.map((k) => byKey.get(k)).filter((s): s is (typeof mine)[number] => !!s)
-  }, [liveSlots, activeMemberKey])
-  // Collapsed past DRIVING_VISIBLE rows. Keyed to the member: the fold is a
-  // reading position in ONE member's list, so switching members starts the
-  // next list folded rather than inheriting the previous member's expansion.
-  const [drivingExpandedFor, setDrivingExpandedFor] = useState('')
-  const drivingExpanded = drivingExpandedFor === activeMemberKey
-  const visibleDriving = drivingExpanded ? drivingSessions : drivingSessions.slice(0, DRIVING_VISIBLE)
-
-  // Recent-activity pointers for the Work log tab, read when it is on
-  // screen for a member and cached per exact member NAME, not slug — slugs are
-  // lossy, and the whole point of the backend's member filter is that two
-  // names sharing a slug have distinct histories. Real recorded signal only —
-  // the work log derives its counts from these instead of fabricating stats.
-  // Three states per member: no answer yet = still loading, failed with no
-  // answer = error, answered = loaded. A pending or failed read must not
-  // render the affirmative "no activity"; a refetch error after a good read
-  // keeps the last entries. The finite staleTime is the roster's: a return to
-  // the summary shows the cached pointers and refreshes them behind.
-  const activeSlug = active?.slug ?? ''
-  const activeMemberName = active?.name ?? ''
-  const activityQuery = useQuery({
-    queryKey: memberActivityQueryKey(activeSlug, activeMemberName),
-    queryFn: () => api.memberActivity(activeSlug, activeMemberName),
-    enabled: !!activeSlug && !!activeMemberName && workLogVisible,
-    staleTime: membersRosterQuery.staleTime,
+  const { freshStartConfirmDialog } = thread
+  const sidePanel = useMembersPageSidePanel({
+    layout, profileCard, drawers, rosterView, thread, navigate, location, queryClient, activeName, searchParams,
+    setSearchParams, profile, setProfile, liveSlots, slotsLoaded, active, activeMemberName,
   })
-  const activityLoading = activityQuery.data === undefined && !activityQuery.isError
-  const activityError = activityQuery.data === undefined && activityQuery.isError
-  // Records come from the pushed activity projection so a new engagement
-  // re-renders the block without a refetch; the day-folding rendering (#9564)
-  // is unchanged — it is fed the projection's `recent` instead of the query
-  // result. The activity QUERY is kept solely for `capped`, which the
-  // projection does not carry (the floor markers below depend on it), and for
-  // the loading/error three-state the drawer keeps. When no projection is held
-  // (an older gateway), fall back to the query's own entries.
-  const activityView = useMemberProjection<ActivityView>(projectionSlug(activeSlug), 'activity')
-  // Contributed `<app>/<key>` views for the open member. Nothing to fetch: they
-  // arrive in the same roster baseline and the same member_projection frames as
-  // the built-in keys, which is the whole point of §5 reusing that frame.
-  const activeEntries = useMemo(
-    () => (activityView?.recent as MemberActivityEntry[] | undefined) ?? activityQuery.data?.entries ?? [],
-    [activityView, activityQuery.data],
-  )
-  // A count is a floor ("N+") when the source may have dropped older in-window
-  // events. Two sources can do that: the query path sets `capped`, and the
-  // projection path serves a newest-first ring bounded at ACTIVITY_RING (the
-  // backend's `_ACTIVITY_RING`) — a full ring means older events fell off, so a
-  // busy member's tile must not assert its count as exact.
-  const fromProjectionRing = activityView?.recent !== undefined
-  const activityCapped =
-    !!activityQuery.data?.capped ||
-    (fromProjectionRing && activeEntries.length >= ACTIVITY_RING)
-
-  const { todayCount, weekCount, todayFloorTs, weekFloorTs } = useMemo(() => {
-    const midnight = new Date()
-    midnight.setHours(0, 0, 0, 0)
-    const todayFloor = midnight.getTime() / 1000
-    const weekFloor = Date.now() / 1000 - 7 * 86400
-    let today = 0
-    let week = 0
-    for (const e of activeEntries) {
-      if (e.ts >= todayFloor) today += 1
-      if (e.ts >= weekFloor) week += 1
-    }
-    return { todayCount: today, weekCount: week, todayFloorTs: todayFloor, weekFloorTs: weekFloor }
-  }, [activeEntries])
-  // When the display window is saturated (server capped the entries) AND the
-  // oldest returned entry still falls inside a counting window, more in-window
-  // events exist beyond the cap — the count is a floor, rendered as "N+"
-  // rather than asserted as exact.
-  const oldestTs = activeEntries.length ? activeEntries[activeEntries.length - 1].ts : 0
-  const todayIsFloor = activityCapped && oldestTs >= todayFloorTs
-  const weekIsFloor = activityCapped && oldestTs >= weekFloorTs
-
-  // Recent activity folded by calendar day: the log's rows are all alike
-  // ("conversation · <project>"), so eight of them say nothing that one
-  // "8 conversations" row does not. Each day carries how the member was
-  // reached (picked by a human vs routed by the orchestrator) and the projects
-  // it worked in; the rows themselves stay behind the day, as a time strip, for
-  // whoever wants the rhythm of the day. Local midnight is the boundary — the
-  // same "today" the stat card counts against.
-  const activityDays = useMemo(
-    () => groupActivityDays(activeEntries, activityCapped),
-    [activeEntries, activityCapped],
-  )
-  // Both folds are reading positions in ONE member's list (same idiom as the
-  // driving list): switching members starts the next list folded.
-  const [activityDaysExpandedFor, setActivityDaysExpandedFor] = useState('')
-  const activityDaysExpanded = activityDaysExpandedFor === activeMemberKey
-  const visibleActivityDays = activityDaysExpanded
-    ? activityDays
-    : activityDays.slice(0, ACTIVITY_DAYS_VISIBLE)
-  const [openActivityDay, setOpenActivityDay] = useState('')
-  // A day's count phrase; on a floor day the phrase is rendered for n+1 so it
-  // takes the plural, and the number is shown as `n+` (see floorCountText).
-  const countPhrase = (key: string, n: number, isFloor: boolean) =>
-    isFloor ? floorCountText(t(key, { count: n + 1 }), n + 1, n) : t(key, { count: n })
-
-  // Mounting a member thread IS reading it, but nothing on this page moves
-  // `chat.activeSlot` (that transition belongs to the Sessions page's
-  // switchSlot, the only other markSlotRead caller). Two things follow:
+  const { schedAtStake, schedulesMountedRef, runInTerminalScope } = sidePanel
+  const schedules = useMembersPageSchedules({
+    crewEditing, layout, rosterView, sidePanel, t, profile, activeSlug, activeMemberName,
+  })
+  const {
+    schedDraftDirty, schedSaving, confirmSched, schedConfirmDialog, releaseSchedRetention, mayLeaveSchedules,
+  } = schedules
+  // ONE guard for exits that unmount Profile. The ref is what lets callbacks declared
+  // in the owners (the header's panel reveal in MembersPageProfile.tsx, a roster
+  // crewmate switch in useMembersPageNavigation.ts) reach it.
   //
-  // 1. The websocket unread-marker must learn about the open thread another
-  //    way, or it flags every message that lands in it. It reads
-  //    `viewedThread` beside `chat.activeSlot`; the visible-view effect below
-  //    registers the mounted thread there. Before this, each arrival was
-  //    flagged and drained a render later, and both writes relayed to the
-  //    parent dashboard's crew tab -- a badge that lit and vanished on every
-  //    message.
-  // 2. A flag that was set while the thread was NOT on screen (closed, or
-  //    this window hidden) still has to be drained when it opens or is
-  //    revealed. Without this the rail badge is permanent -- no code path
-  //    clears a live member slot's unread until the slot itself is deleted.
-  const dispatch = useAppDispatch()
-  const activeSlotUnread = useAppSelector(
-    (s) => !!activeSlot && s.dashboard.unreadSlots.includes(activeSlot),
-  )
-  const activeSlotLastTs = useAppSelector(
-    (s) => (activeSlot ? s.dashboard.slots.find(sl => sl.key === activeSlot)?.last_ts : undefined),
-  )
-  // Reactive document visibility AND focus, so the read effect below re-runs
-  // when the user returns to a hidden tab or focuses the window — a plain
-  // document.hidden read would leave the effect settled and the reveal
-  // unnoticed, and Page Visibility alone calls occluded/unfocused windows
-  // "visible", which would let a parked window mark threads read.
-  const [pageVisible, setPageVisible] = useState(() => !document.hidden && document.hasFocus())
-  useEffect(() => {
-    const onVis = () => setPageVisible(!document.hidden && document.hasFocus())
-    document.addEventListener('visibilitychange', onVis)
-    window.addEventListener('focus', onVis)
-    window.addEventListener('blur', onVis)
-    return () => {
-      document.removeEventListener('visibilitychange', onVis)
-      window.removeEventListener('focus', onVis)
-      window.removeEventListener('blur', onVis)
-    }
+  // The gate is the section being MOUNTED, not visible. The dirty flag is only
+  // meaningful while the form exists, and a stale true would confirm-prompt over a tab
+  // with no form -- but draft-destroying exits must stay armed while a hidden Profile
+  // is being retained: hidden is exactly when the draft has nowhere else to live.
+  const schedulesMounted = !!profile
+  schedulesMountedRef.current = schedulesMounted
+  const goalsDraft = useRef({ dirty: false, busy: false })
+  const [goalsAtStake, setGoalsAtStake] = useState(false)
+  const onGoalsDraftChange = useCallback((dirty: boolean, busy: boolean) => {
+    goalsDraft.current = { dirty, busy }
+    setGoalsAtStake(dirty || busy)
   }, [])
-  useEffect(() => {
-    // Viewing the thread is the read — but only a VISIBLE view is a view. A
-    // hidden member tab neither clears its own badge nor relays one; on
-    // reveal this effect re-runs via pageVisible and does both. The relay is
-    // NOT gated on this window's own badge: this window may have read the
-    // thread earlier (locally clean) while another window's badge is still
-    // lit, and a visible view here retires that too. Throttled per slot by
-    // the relay module; watermarked at the slot's newest known message ts.
-    if (activeSlot && pageVisible) {
-      if (activeSlotUnread) dispatch(markSlotRead(activeSlot))
-      emitSlotRead(activeSlot, activeSlotLastTs)
-    }
-  }, [activeSlot, activeSlotUnread, pageVisible, activeSlotLastTs, dispatch])
-  // Tell the unread-marker which thread is on screen, for exactly as long as
-  // it is: registered while the thread is mounted AND this window is visible
-  // and focused, retired on switch, hide, blur and unmount. A hidden window's
-  // open thread therefore badges like any other slot, and the read effect
-  // above drains it on reveal -- same visibility bar for both directions.
-  useEffect(() => {
-    if (!activeSlot || !pageVisible) return
-    setViewedThreadSlot(activeSlot)
-    return () => {
-      // Like switchSlot, flush before retiring the view so its trailing read
-      // timer cannot outlive it and clear a later, unseen message's badge.
-      flushSlotRead(activeSlot)
-      clearViewedThreadSlot(activeSlot)
-    }
-  }, [activeSlot, pageVisible])
-
-  // Per-row unread marker: the rail badge says "1", this says WHICH member.
-  // Keyed the same way isRunning resolves a member's slot (thread-endpoint
-  // cache first, roster binding as the cold-start fallback), and read straight
-  // from unreadSlots so the drain effect above clears the dot the moment the
-  // thread is opened.
-  const unreadSlots = useAppSelector((s) => s.dashboard.unreadSlots)
-  const isUnread = useCallback(
-    (m: MemberRosterRow) => {
-      const key = slotKeyOf(m)
-      return !!key && unreadSlots.includes(key)
-    },
-    [slotKeyOf, unreadSlots],
+  const mayLeaveGoals = useCallback(async () => {
+    if (goalsDraft.current.busy) return false
+    if (!goalsDraft.current.dirty) return true
+    return confirmSched({
+      title: t('components.markdownPanel.discard_unsaved_changes'),
+      confirmLabel: t('components.markdownPanel.discard_changes_button'),
+    })
+  }, [confirmSched, t])
+  schedGuardRef.current = useCallback(async () => {
+    // An in-flight editor write must not be abandoned: refuse the leave outright
+    // until it settles (the request could still land and persist a "discarded"
+    // change), matching requestClose's mid-commit refusal.
+    if (crewModalBusyRef.current) return false
+    // The modal's unsaved panes are a second draft this page can lose on an
+    // exit it does not own. The async guard backs the in-app exits (sidebar
+    // clicks and session opens); confirm before discarding modal edits, the
+    // same question the Schedules draft asks.
+    if (crewModalAtStakeRef.current && !window.confirm(t('pages.membersPage.edit_leave_draft'))) return false
+    if (!schedulesMounted) return true
+    if (schedSaving.current || goalsDraft.current.busy) return false
+    return await mayLeaveGoals() && await mayLeaveSchedules()
+  }, [schedulesMounted, mayLeaveGoals, mayLeaveSchedules, t, crewModalAtStakeRef, crewModalBusyRef, schedSaving])
+  schedAtStakeRef.current = useCallback(
+    () => schedulesMounted && (schedSaving.current || schedDraftDirty.current || goalsDraft.current.dirty || goalsDraft.current.busy),
+    [schedulesMounted, schedDraftDirty, schedSaving],
   )
-
-  // Auto patrol: the auto-nudge loop (monitor / goal loop) bound to a member's
-  // own DM slot. This is the thing that wakes a standing member without anyone
-  // asking — so a member whose loop has silently stopped, or never armed, is a
-  // member that will not act again until someone notices. The roster badge
-  // and the drawer block both read from here, so the whole registry is read
-  // (the badge needs every member, not just the open drawer's) and filtered
-  // per member at render by slot key — the member's derived slot is
-  // `member-<slug>`, resolved the same way isRunning resolves it.
-  //
-  // One React Query read, not a private fetch + frame merge: the websocket
-  // hook invalidates AUTONUDGE_LOOPS_QUERY_KEY on every `autonudge_state`
-  // frame AND on every (re)connect, so a stop that landed while the socket was
-  // down is re-read the moment it comes back, and a transient mount-time
-  // failure is retried on the next signal rather than freezing the block in
-  // its failed state. The interval is a floor under that: frames fire only on
-  // change, and the one reading this block must never give is a stale
-  // "Patrolling" for a dead patrol.
-  const patrolQuery = useQuery({
-    queryKey: AUTONUDGE_LOOPS_QUERY_KEY,
-    queryFn: () => api.autonudgeList(),
-    refetchOnReconnect: true,
+  // Leaving the ROUTE is the last exit, and the registry that owns it is synchronous, so
+  // it cannot use the app's confirm dialog. `window.confirm`, exactly as the New crewmate
+  // dialog's own guard does on this page for the same reason. A create in flight refuses
+  // outright here too: the POST would land with the page gone.
+  useRegisterNavigationLeaveGuard(() => {
+    // Refuse a route leave while an editor write is in flight (see the async
+    // guard): the request could still persist a change the user discarded.
+    if (crewModalBusyRef.current) return false
+    // Leaving the route also abandons an open editor modal's unsaved panes.
+    // Same synchronous `window.confirm` the Schedules draft uses here, since
+    // the registry cannot await the app's confirm dialog.
+    if (crewModalAtStakeRef.current && !window.confirm(t('pages.membersPage.edit_leave_draft'))) return false
+    if (!schedulesMounted) return true
+    if (schedSaving.current || goalsDraft.current.busy) return false
+    if (goalsDraft.current.dirty && !window.confirm(t('components.markdownPanel.discard_unsaved_changes'))) return false
+    if (!schedDraftDirty.current) return true
+    const ok = window.confirm(t('pages.membersPage.schedules_leave_draft'))
+    if (ok) releaseSchedRetention()
+    return ok
   })
-  // `failed` is kept distinct from empty for the same reason the wake-sources
-  // block keeps it: a failed read must never render the affirmative "no patrol
-  // scheduled", which is precisely the false statement this block exists to
-  // prevent. A refetch error after a good read keeps showing the last data.
-  const patrol = useMemo(() => {
-    const data = patrolQuery.data
-    const loops: Record<string, AutoNudgeLoop> = {}
-    for (const lp of data?.loops || []) if (lp?.slot_key) loops[lp.slot_key] = lp
-    return {
-      loaded: data !== undefined || patrolQuery.isError,
-      failed: data === undefined && patrolQuery.isError,
-      loops,
-    }
-  }, [patrolQuery.data, patrolQuery.isError])
-  const patrolLoopOf = useCallback(
-    (m: MemberRosterRow) => {
-      const key = slotKeyOf(m)
-      return key ? patrol.loops[key] : undefined
-    },
-    [slotKeyOf, patrol.loops],
-  )
-  /** Roster-level reading of a member's loop record: the loop while it is
-   *  ACTIVE, nothing otherwise. A stopped record and a member that never
-   *  armed one look the same at the roster — "not patrolling" is the resting
-   *  state of a member, not an incident that needs a placeholder mark; the
-   *  drawer's block is where a stopped loop keeps its reason. The badge's
-   *  presence IS the signal, the way the presence dot and unread dot work. */
-  const activePatrolOf = useCallback(
-    (m: MemberRosterRow): AutoNudgeLoop | undefined => {
-      const lp = patrolLoopOf(m)
-      return lp?.active ? lp : undefined
-    },
-    [patrolLoopOf],
-  )
-  const activePatrol = activeMemberKey ? patrol.loops[activeMemberKey] : undefined
-  // The armed/stopped verdict and the stop reason now come from the pushed
-  // `wake` projection, so a stop that lands re-renders the block without a
-  // poll — that is why patrolQuery no longer carries a refetchInterval. The
-  // patrolQuery is kept only for the DETAIL fields wake does not carry
-  // (interval, cycle counts, last/next fire, the instruction banner) and for
-  // the roster badge's cycle tooltip. `since` and `slot_key` on wake are not
-  // rendered here yet.
-  const activeWake = useMemberProjection<WakeView>(projectionSlug(activeSlug), 'wake')
-  // The live facts the status filters read, resolved per row the same way the
-  // row's own markers are (isRunning / isUnread / activePatrolOf), so a filter
-  // can never disagree with the dot it filters on.
-  const signalsOf = useCallback(
-    (m: MemberRosterRow): MemberSignals => {
-      const key = slotKeyOf(m)
-      return {
-        running: !!isRunning(m),
-        needsYou: !!key && !!liveNeedsYou[key],
-        unread: isUnread(m),
-        patrolling: !!activePatrolOf(m),
-      }
-    },
-    [slotKeyOf, isRunning, liveNeedsYou, isUnread, activePatrolOf],
-  )
-  // Narrow the COMMITTED order (never re-sort here): a refetch that advances
-  // a last_active_ts must not move rows under the cursor — see orderedMembers.
-  const sortedMembers = useMemo(
-    () => narrowRoster(orderedMembers, rosterFilterQuery, signalsOf),
-    [orderedMembers, rosterFilterQuery, signalsOf],
-  )
-  // Per-row counts in the filter menu: the one-word labels do not explain
-  // themselves and a zero-count row is exactly the one that blanks the list.
-  const filterCounts = useMemo(() => countByFilter(members, signalsOf), [members, signalsOf])
-  const narrowed = queryNarrows(rosterFilterQuery)
-  // What the aggregate chip says: each active filter's menu label with its
-  // count (Starred (2), In progress (1), Mine (6)) — and the bare names for
-  // the chip's accessible "Clear … filter" name.
-  const activeFilterNames = useMemo(() => {
-    const out: string[] = []
-    if (starredOnly) out.push(t('pages.membersPage.filter_starred'))
-    for (const key of STATUS_FILTERS) if (statusFilter.has(key)) out.push(t(STATUS_LABEL_KEY[key]))
-    if (sourceFilter !== 'all') out.push(t(SOURCE_LABEL_KEY[sourceFilter]))
-    return out
-  }, [t, starredOnly, statusFilter, sourceFilter])
-  const activeFilterLabels = useMemo(() => {
-    const out: string[] = []
-    if (starredOnly) out.push(`${t('pages.membersPage.filter_starred')} (${filterCounts.starred})`)
-    for (const key of STATUS_FILTERS) if (statusFilter.has(key)) out.push(`${t(STATUS_LABEL_KEY[key])} (${filterCounts.status[key]})`)
-    if (sourceFilter !== 'all') out.push(`${t(SOURCE_LABEL_KEY[sourceFilter])} (${filterCounts.source[sourceFilter]})`)
-    return out
-  }, [t, starredOnly, statusFilter, sourceFilter, filterCounts])
-  // True when the filters (not the search) hid everything — the empty-roster
-  // copy would be wrong then, since the roster is not empty.
-  const filteredOut =
-    loaded && !loadError && members.length > 0 && sortedMembers.length === 0 && !filter.trim()
-  // Which of the block's three verdicts to render. Two sources, two roles:
-  // the live loop registry is PRESENCE — a loop it holds as active is active,
-  // full stop — while the pushed `wake` projection is the DURABLE record, so
-  // a stop (and its reason) survives the registry forgetting the loop. That
-  // is the case that used to read "nothing scheduled" after a restart killed
-  // a patrol mid-cycle; now the loader's synthesised stop is what renders.
-  const patrolState: 'active' | 'stopped' | 'none' = activePatrol?.active
-    ? 'active'
-    : activeWake?.patrol === 'stopped'
-      ? 'stopped'
-      : activePatrol
-        ? 'stopped'
-        : activeWake?.patrol === 'armed'
-          ? 'active'
-          : 'none'
-  // The stop reason feeds PATROL_STOPPED_REASON; from wake when it holds the
-  // stop, else the loop record's own field.
-  const patrolStoppedReason =
-    (activeWake?.patrol === 'stopped' ? activeWake.stopped_reason : undefined) ?? activePatrol?.stopped_reason
-  // Clock for the "next wake" countdown, ticking only while the summary shows
-  // an active loop — the same deadline-preserving reading the composer's goal
-  // chip renders (see nextCycleText), on a coarser tick.
-  const [nowTs, setNowTs] = useState(() => Date.now() / 1000)
-  const patrolTicking = workLogVisible && patrolState === 'active'
+  // Registering a guard is not enough on its own: `NavigationBackGuard` arms off the
+  // published STAKE, not off the guard, so without this the browser's own Back button
+  // discarded the draft silently while every wired in-app exit asked. The New crewmate
+  // dialog on this same page already publishes, which is what made the gap uneven rather
+  // than merely absent.
+  const anyDraftAtStake = schedAtStake || goalsAtStake || crewModalAtStake || crewModalBusy
+  usePublishNavigationStake(anyDraftAtStake)
+  // A reload or a tab close is not a route change, so the guard above never sees it; the
+  // browser's own prompt is the only thing that can. Registered while a Schedules draft,
+  // the editor modal's unsaved panes, or an in-flight editor write is at stake, since an always-on `beforeunload` nags on every ordinary close.
   useEffect(() => {
-    if (!patrolTicking) return
-    setNowTs(Date.now() / 1000)
-    const timer = setInterval(() => setNowTs(Date.now() / 1000), PATROL_TICK_MS)
-    return () => clearInterval(timer)
-  }, [patrolTicking])
-  // The roster badge's mount/unmount tween honours the OS motion preference:
-  // the state change still happens, it just cuts instead of fading.
-  const reduceMotion = useReducedMotion()
+    if (!anyDraftAtStake) return
+    const onUnload = (e: BeforeUnloadEvent) => { e.preventDefault(); e.returnValue = '' }
+    window.addEventListener('beforeunload', onUnload)
+    return () => window.removeEventListener('beforeunload', onUnload)
+  }, [anyDraftAtStake])
+  const threadView = useMembersPageThreadView({ layout, rosterView, thread, t, createOpen, active })
+  const rosterSignals = useMembersPageRosterSignals({ rosterRead, rosterView, slotKeyOf })
+  const profileFlight = useMembersPageProfileFlight({ profileCard, rosterView, rosterSignals, thread, activeName, profile, active })
+  const { faceFlight, endFaceFlight } = profileFlight
+  // A create the user walked away from that then FAILED: the card that says so
+  // is hidden, so the page says it instead, in the card's own words. Cleared by
+  // the next opening of the card, which shows its own state again.
+  const [leftCreateFailure, setLeftCreateFailure] = useState<string | null>(null)
+  const navigation = useMembersPageNavigation({
+    rosterRead, teamsRead, layout, profileCard, drawers, rosterView, thread, sidePanel, location, queryClient,
+    activeName, setActiveName, activeNameRef, searchParams, setSearchParams, urlMember, setGone, draftRequest,
+    leaveCreate, followUp, goneStandInRef, activeMemberName,
+  })
+  const { openMember } = navigation
 
-  // Open a member's thread and remember it as the last one opened. Called by
-  // the URL sync effect only (plus the same-member re-click below), so every
-  // way of arriving at a member — click, back/forward, shallow link, restore
-  // on return — runs one code path. `remember` is false only for the member
-  // opened IN PLACE OF one a link named that is gone: that open is the page's
-  // choice, not the user's, so one stale link must not overwrite the member
-  // they had actually chosen.
-  const activate = useCallback(
-    (m: MemberRosterRow, remember = true) => {
-      activeNameRef.current = m.name
-      setActiveName(m.name)
-      if (remember) safeSetItem(LAST_MEMBER_KEY, m.name)
-      // A Side Chat belongs to the member it was asked about; nothing to reset
-      // here — the panel's strip is bucketed per member slot, so switching
-      // members swaps the whole strip and a Side tab stays with its member.
-      // ALWAYS post, even when a slot key is already cached: the endpoint is
-      // the idempotent creator/repairer, and the backend can lose the live
-      // slot between opens (archive, restart with a stale binding) — a cached
-      // key mounted without the POST would point at nothing. The cache only
-      // decides what to render while the POST is in flight — and, for the side
-      // panel, not even that (see confirmedSlot).
-      postThread(m)
-    },
-    [postThread],
-  )
-
-  const openMember = useCallback(
-    (m: MemberRosterRow) => {
-      // Re-clicking the open member is the repair gesture (re-POST); the URL
-      // is unchanged so the sync effect would not fire — call through. It is
-      // also an explicit choice of that member, so a swap notice still
-      // standing over it (the user was routed here from a dead link) has
-      // been acknowledged: retire it.
-      if (m.name === activeName) {
-        activate(m)
-        setGone(null)
-        return
-      }
-      if (urlMember || !isMobile) {
-        // Switching between members while one is open REPLACES the entry, and
-        // so does opening one above md, where the roster and the thread sit
-        // side by side and an open is not a navigation step. Either way the
-        // page holds one history entry however many members are visited and
-        // Back leaves it in one press — the Sessions sidebar's rule. The
-        // breakpoint is named directly because the desktop half used to ride
-        // on `urlMember` always being set by the arrival auto-open: a fresh
-        // visit with nothing remembered now leaves the URL bare (#11763), and
-        // that first click must still replace.
-        setSearchParams({ [MEMBER_PARAM]: m.name }, { replace: true })
-        return
-      }
-      // Entering a thread from the roster below md — the one place where the
-      // roster IS the page and no member is open — is a step in a two-level
-      // navigation, so it is PUSHED. The state marks the entry as pushed from
-      // this page's roster, which is what lets the below-md back button pop
-      // instead of replace.
-      setSearchParams({ [MEMBER_PARAM]: m.name }, { state: { fromRoster: true } })
-    },
-    [activeName, urlMember, isMobile, activate, setSearchParams],
-  )
-
-  // URL -> open member. Once the roster is in: a URL that names a member
-  // opens it; a URL that names none (a fresh visit, the sidebar entry, a
-  // reload) is REPLACED with the remembered member if one is still on the
-  // roster, so returning users land back on the conversation they left. A
-  // fresh visit with NOTHING remembered does NOT auto-open the first row —
-  // the page stays on the roster with the empty column's 'Pick a member'
-  // pane, so the user chooses instead of being primed on whichever row the
-  // sort floated to the top (#11763). A URL naming a member that is gone
-  // (deleted or renamed) falls back to the remembered member if present, with
-  // a one-line notice above the thread naming the swap — the user asked for
-  // someone specific, and a silently mounted other thread is the misroute
-  // this page exists to prevent; with nothing remembered it returns to the
-  // roster with the notice rather than standing in the first row. Below md
-  // the page is a two-level list->detail navigation: no `?member=` IS the
-  // roster, so no auto-open there (same rule as SidePanelLayout's remembered
-  // tab), and a gone member in the URL returns to the roster instead of
-  // bouncing the phone user into a different member's thread.
-  useEffect(() => {
-    if (!loaded || loadError) return
-    if (urlMember) {
-      const hit = members.find((m) => m.name === urlMember)
-      if (hit) {
-        // Opened in place of a gone member a link named? Then it is not the
-        // user's choice and must not become the memory (see `activate`).
-        const standIn = goneStandInRef.current === hit.name
-        goneStandInRef.current = ''
-        if (hit.name !== activeNameRef.current) activate(hit, !standIn)
-        // The notice belongs to the member shown in place of the gone one;
-        // opening anyone else retires it. Functional updates throughout, and
-        // `gone` is NOT a dependency: the URL write below is a router
-        // transition, and a plain state write that re-armed this effect
-        // before the transition committed would re-issue both writes and
-        // keep interrupting the transition — the thread would never open.
-        setGone((prev) => (prev && prev.shown !== hit.name ? null : prev))
-        return
-      }
-      // Named but not (yet) on the roster while a refetch is in flight: a link
-      // may simply have outrun the cache — the crew manager's create lands
-      // here with the just-made member's name before the invalidated roster
-      // has re-read (#9513). Hold the "gone" verdict until the fetch answers;
-      // a member the fresh roster still lacks takes the fallback then.
-      if (rosterQuery.isFetching) return
-    }
-    if (isMobile) {
-      if (urlMember) {
-        // No thread to fall back to below md — the roster is the answer, so
-        // say where the member went above the list (shown: '' marks the
-        // roster variant of the notice).
-        setGone((prev) =>
-          prev && prev.name === urlMember && prev.shown === '' ? prev : { name: urlMember, shown: '' },
-        )
-        setSearchParams({}, { replace: true })
-      } else if (activeName) {
-        activeNameRef.current = ''
-        setActiveName('')
-      }
+  // A crewmate was just created in this page's dialog: close it and open its
+  // chat; the hold rides that open (openThread's outcome releases it). The
+  // roster is re-read BEFORE the URL names the new crewmate, so the URL sync
+  // effect finds it — a name not yet on the roster would read
+  // as "gone" and open someone else in its place. A FAILED re-read must not
+  // take that path either: react-query keeps the stale roster as `res.data`
+  // on error, so the name would be missing for the wrong reason. It is
+  // reported instead, with a retry that repeats exactly this step.
+  const openCreated = useCallback(async (created: CreatedCrewmate) => {
+    setPostCreateError(null)
+    setFollowUp(created)
+    // A re-read that did not actually land is a failed re-read. The star
+    // mutation's `cancelQueries` (MembersPageRoster.tsx) can cut this refetch short, and a
+    // cancelled query REVERTS to its previous successful state: `refetch()`
+    // then resolves without `isError`, carrying the pre-create roster, and
+    // the new name would read as absent and someone else's chat opened. Only
+    // a response newer than what we had counts as fresh.
+    const before = queryClient.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.dataUpdatedAt ?? 0
+    const res = await rosterQuery.refetch()
+    // The user left while the roster was re-reading: nothing below may run.
+    // The URL write would drag the page they chose back here.
+    if (!pageMounted.current) return
+    const fresh = !res.isError && res.dataUpdatedAt > before
+    if (!fresh) {
+      setFollowUp(null)
+      setPostCreateError({ kind: 'roster', created })
       return
     }
-    // Desktop, URL names no member (or names a gone one): restore the
-    // remembered member if it is still on the roster. A fresh visit with
-    // NOTHING remembered no longer opens the first row — there is no member
-    // the user chose, so the page lands on the roster with the empty column's
-    // 'Pick a member' pane (the same rule the phone already follows: no
-    // `?member=` IS the roster). Auto-opening whichever row the 'recent' sort
-    // floated to the top primed the user to believe it was the member they
-    // asked for, which is the #11763 friction; the sort itself is left as-is.
-    const target = resolveDefaultMember(safeGetItem(LAST_MEMBER_KEY), orderedMembers)
-    if (!target) {
-      // Named a gone member but nothing remembered to stand in for them: say
-      // where they went above the roster (shown: '' marks the roster variant
-      // of the notice, as below md) and clear the URL back to the bare list.
-      if (urlMember) {
-        setGone((prev) =>
-          prev && prev.name === urlMember && prev.shown === '' ? prev : { name: urlMember, shown: '' },
-        )
-        setSearchParams({}, { replace: true })
-      }
-      // Nothing to open means nothing may STAY open — the same clear the
-      // below-md branch does. A member can be open with nothing remembered:
-      // the write that remembers it is `safeSetItem`, which returns false when
-      // storage is denied, and then `safeGetItem` reads null. Returning to a
-      // bare `/members` from there (the crew editor's exit, the rail's Crew
-      // Members row) would otherwise leave the previous thread standing over a
-      // URL that names no one, next to the roster's 'Pick a member' pane.
-      if (activeName) {
-        activeNameRef.current = ''
-        setActiveName('')
-      }
+    const hit = res.data?.find((r) => r.name === created.name)
+    if (hit) {
+      // The hold now rides the thread open: released by openThread's
+      // onSuccess or onError.
+      pendingOpens.current.add(created.name)
+      if (await openMember(hit)) return
+      pendingOpens.current.delete(created.name)
+      // The Schedules guard refused: the user kept a dirty draft, so no thread
+      // opens and nothing is left to release the hold — the create button would
+      // stay disabled for the rest of the page's life. Drop the hold here; the
+      // crewmate IS on the roster now, and its first open asks for the
+      // greeting the server owes it.
+      setFollowUp(null)
       return
     }
-    if (urlMember) {
-      setGone((prev) =>
-        prev && prev.name === urlMember && prev.shown === target.name
-          ? prev
-          : { name: urlMember, shown: target.name },
-      )
-      goneStandInRef.current = target.name
+    // The re-read landed without the name (the server accepted a name the
+    // roster's read does not list). The URL write below lets the URL sync
+    // effect say "gone"; the hold is dropped rather than kept for a row that
+    // is not coming.
+    setFollowUp(null)
+    setSearchParams({ [MEMBER_PARAM]: created.name }, { replace: true })
+  }, [rosterQuery, openMember, setSearchParams, queryClient])
+
+  // The roster re-read for a create the user already left: the chat they
+  // chose stays open. A re-read that did not land (an error, or a cancelled
+  // refetch that reverted to the pre-create roster, see `openCreated`) is
+  // reported through the same notice, whose retry repeats only this read.
+  const listCreated = useCallback(async (created: CreatedCrewmate) => {
+    const before = queryClient.getQueryState(MEMBERS_ROSTER_QUERY_KEY)?.dataUpdatedAt ?? 0
+    const res = await rosterQuery.refetch()
+    if (!pageMounted.current) return
+    if (res.isError || res.dataUpdatedAt <= before) setPostCreateError({ kind: 'roster', created, stay: true })
+  }, [rosterQuery, queryClient])
+
+  const handleCreated = useCallback((created: CreatedCrewmate) => {
+    // The form's work is done: the open that follows must not ask to leave it.
+    createOpenRef.current = false
+    setCreateOpen(false)
+    if (leftCreateRef.current) {
+      // The user already chose another chat: list the new crewmate, stay put.
+      leftCreateRef.current = false
+      void listCreated(created)
+      return
     }
-    setSearchParams({ [MEMBER_PARAM]: target.name }, { replace: true })
-  }, [loaded, loadError, urlMember, members, orderedMembers, activeName, isMobile, activate, setSearchParams, rosterQuery.isFetching])
+    void openCreated(created)
+  }, [openCreated, listCreated])
+  const handleCreateFailed = useCallback((message: string) => {
+    if (!leftCreateRef.current) return
+    leftCreateRef.current = false
+    setLeftCreateFailure(message)
+  }, [])
+
+  const retryPostCreate = useCallback(() => {
+    const failed = postCreateError
+    if (!failed) return
+    setPostCreateError(null)
+    void (failed.stay ? listCreated(failed.created) : openCreated(failed.created))
+  }, [postCreateError, openCreated, listCreated])
+  const teamView = useMembersPageTeamView({
+    rosterRead, teamsRead, layout, profileCard, rosterView, rosterSignals, navigate, location, setSearchParams,
+    urlMember, leaveCreate, slotKeyOf,
+  })
+  const { openTeam } = teamView
 
   return (
     // No bottom inset on the root: the card columns carry their own pb-2 and
@@ -1769,7 +731,60 @@ export default function MembersPage() {
     // either — the panel docks FLUSH to the window's right edge, exactly as it
     // does in the chat page's actbar column; the card columns' pr-2 lives on
     // the inner wrapper below.
-    <div className="flex h-full min-h-0" data-testid="members-page">
+    // This page has no bottom row for the side panel, so every panel glyph
+    // in its transcripts draws the right-dock pane.
+    <SidePanelDockHost value={false}>
+    <RunInTerminalScope.Provider value={runInTerminalScope}>
+    <div
+      className="flex h-full min-h-0"
+      data-testid="members-page"
+      ref={membersRootRef}
+      // Claims both sides from the shell's nav-drawer swipe exactly while this
+      // page binds its own drawers, so one drag never arms two of them. With
+      // nothing open over the roster the page binds nothing, and the shell's
+      // gesture is left working.
+      data-owns-swipe={rosterDrawerAvailable || sidePanelSwipeAvailable ? 'left right' : undefined}
+    >
+      {isMobile && (
+        <>
+          <AnimatePresence>
+            {rosterDrawerMounted && (
+              <motion.div
+                key="roster-drawer-backdrop"
+                data-testid="roster-drawer-backdrop"
+                role="presentation"
+                className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-xs"
+                ref={rosterDrawerScrimRef}
+                style={{ opacity: rosterDrawerScrim, marginTop: vv.offsetTop, marginBottom: keyboardInset }}
+                // A drag's release lands here as a click: it must not run a
+                // second close over the settle.
+                onClick={() => { if (!rosterDrawerDragging) closeRosterDrawer() }}
+              />
+            )}
+          </AnimatePresence>
+          <OverlayDrawer
+            open={rosterDrawerMounted}
+            width={Math.max(0, winW - ROSTER_DRAWER_UNCOVERED_PX)}
+            slideX={rosterDrawerX}
+            slideRef={rosterDrawerPanelRef}
+            slideStyle={{ marginTop: vv.offsetTop, marginBottom: keyboardInset }}
+            // The full safe-area height, over the shell's bar, as the chat
+            // page's drawer does: the rail is sized for that height, and its
+            // brand mark then sits where the bar's logo was.
+            className="fixed top-safe bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg"
+          >
+            <div className="flex h-full min-h-0 w-full" data-testid="roster-drawer">
+              {mobileNavRail?.({ onActivate: () => closeRosterDrawer() })}
+              {/* The roster aside is portaled in here (`placeRoster`), with the
+                  card chrome reset the way the sessions drawer resets its pane. */}
+              <div
+                ref={setRosterDrawerHost}
+                className="flex-1 min-w-0 h-full min-h-0 flex flex-col overflow-hidden bg-bg-elevated [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0 [&>*]:!shadow-none"
+              />
+            </div>
+          </OverlayDrawer>
+        </>
+      )}
       {/* Card columns (roster + thread) keep the page's original insets. */}
       <div className="flex flex-1 min-w-0 gap-2 pr-2 pb-2">
       {/* Member list. Below md the page is single-pane: the roster IS the
@@ -1780,537 +795,45 @@ export default function MembersPage() {
           own recipes (components/listShell) so the two conversation lists read
           as one surface — including the kiro-light shell hook that steps the
           card back from the white canvas. */}
-      <aside
-        className={`${
-          activeName ? 'hidden md:flex' : 'flex'
-        } ${LIST_SHELL_CLS} relative w-full md:w-[var(--roster-w)] shrink-0 flex-col min-h-0`}
-        // CSS owns the breakpoint: the var is set unconditionally and only the
-        // md: class consumes it, so resizing the window across 768px reacts
-        // without any JS media-query snapshot going stale.
-        style={{ '--roster-w': `${roster.width}px` } as React.CSSProperties}
-        data-testid="member-roster"
-      >
-        <div className={LIST_HEADER_CLS}>
-          {/* pl-1.5 is the sidebar's title inset when no rail toggle sits
-              before it; the page icon leads the title where the sidebar's
-              reads bare, because this header names a page, not a pane.
-              The icon is the same two-ghost brand mark the nav rail draws
-              for this page (`components/CrewMemberMark.tsx`), so the rail
-              row and the page it opens name the thing with one glyph. */}
-          <div className="flex items-center gap-1.5 min-w-0 flex-1 pl-1.5">
-            <CrewMemberMark size={15} className="inline-block text-muted shrink-0" />
-            <h1 className={LIST_TITLE_CLS}>{t('pages.membersPage.title')}</h1>
-          </div>
-          {/* Adding a member IS creating a crew, and the crew manager is the
-              only write path — so this is a navigation, not an inline form.
-              It lands ON the create form, not on the crew list (#9513).
-              A bare `Plus`, not `UserPlus`: the page icon beside it already
-              says "members", and a person-figure here would be the one
-              Lucide person on a page whose members are drawn as ghosts. */}
-          {/* Crew-WIDE, so it sits in the page header rather than in a member's
-              own drawer: one launch ships the whole checkout to one machine and
-              names one stack, so there is no per-member deployment and a
-              per-row placement would draw the same one under every member.
-              Labelled, not icon-only: a bare cloud glyph names nothing a
-              first-time reader can guess, and this is the feature's only
-              entry. A plain `Cloud` glyph, not `CloudUpload`: the arrow-into-cloud
-              reads as "send something up", and a reader who takes the button for
-              an action never opens the read-only panel behind it. Bordered like
-              the secondary `Btn`, unlike its ghost `+`
-              sibling: an icon-plus-word with no edge reads as a status chip,
-              and a reader who takes it for a label never opens the panel.
-              The panel's actions lead into Settings > Remote Crew,
-              which owns the set-up flow. */}
-          <button
-            onClick={() => setDeployOpen(true)}
-            className="flex items-center gap-1 h-7 px-2 rounded-md transition-colors bg-transparent border border-border shrink-0 text-[12px] text-muted hover:text-text hover:border-border-strong hover:bg-bg-hover cursor-pointer"
-            title={t('pages.membersPage.deploy_title')}
-            data-testid="member-deploy-open"
-          >
-            <Cloud size={15} />
-            {t('pages.membersPage.deploy_trigger')}
-          </button>
-          <button
-            onClick={() => navigate(CREW_CREATE_PATH)}
-            className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-            aria-label={t('pages.membersPage.add_member')}
-            title={t('pages.membersPage.add_member')}
-            data-testid="member-add"
-          >
-            <Plus size={15} />
-          </button>
-        </div>
-        <div className={`px-4 pb-2 ${ROW_STATUS_CLS} text-muted`} data-testid="member-count">
-          {/* "N of M" while any filter (not the search) narrows the list, so
-              the header never contradicts a 1-row or empty view below it.
-              With no roster to count (the read failed) the line is a dash:
-              "0 members" above "Could not load the member roster" would
-              state as fact what is only unknown. */}
-          {loadError
-            ? '\u2014'
-            : narrowed
-              ? t('pages.membersPage.member_count_filtered', {
-                  shown: sortedMembers.length,
-                  count: members.length,
-                })
-              : t('pages.membersPage.member_count', { count: members.length })}
-        </div>
-        {/* A failed registry read blanks EVERY roster badge at once. That is
-            not "no member has a patrol" — it is a page-level unknown, so it
-            is said here, on the roster the badges live on, not only inside
-            whichever drawer happens to be open. Same shared notice as the
-            drawer block; a read failure on a page holding no draft is safe
-            to hand to the agent. */}
-        {patrol.failed && (
-          <div className="px-4 pb-2">
-            <ErrorNotice
-              message={t('pages.membersPage.patrol_error_roster')}
-              variant="inline"
-              askAgent
-              testId="member-roster-patrol-error"
-            />
-          </div>
-        )}
-        {/* The Sessions sidebar's search row (components/SearchFilterBar): the
-            same field, clear button and inline sort/filter menu. The menu holds
-            what the sidebar's holds for sessions, in the roster's terms — a
-            star toggle, the member's live state, its origin, and the sort.
-            Menu rows keep the menu open (preventDefault) so several can be
-            toggled in one visit, as the sidebar's do. */}
-        <SearchFilterBar
-          className="px-2 pb-1"
-          placeholder={t('pages.membersPage.search_members')}
-          clearLabel={t('pages.chatSidebar.clear_search')}
-          value={filter}
-          onChange={setFilter}
-          inputTestId="member-search"
-          trailing={(
-            <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
-              <DropdownMenuTrigger asChild>
-                {/* Badge = unread count, the same meaning the sidebar's
-                    trigger badge carries, so one learned reading serves both. */}
-                <FilterMenuButton
-                  title={t('pages.membersPage.sort_filter_members')}
-                  badge={filterCounts.status.unread}
-                  testId="member-filter-menu"
-                />
-              </DropdownMenuTrigger>
-              <FilterMenuContent align="end" data-testid="member-filters">
-                <FilterMenuLabel>{t('pages.chatSidebar.filter')}</FilterMenuLabel>
-                <DropdownMenuItem
-                  onSelect={(e) => { e.preventDefault(); toggleStarredOnly() }}
-                  role="menuitemcheckbox"
-                  aria-checked={starredOnly}
-                  title={t('pages.membersPage.filter_starred_description')}
-                  data-testid="member-filter-starred"
-                >
-                  <Star size={12} className={starredOnly ? 'text-accent' : 'text-muted'} {...(starredOnly ? { fill: 'var(--accent)', stroke: 'none' } : {})} />
-                  <span className="flex-1 truncate">{t('pages.membersPage.filter_starred')}</span>
-                  {/* Every filter row shows its count the same way, 0 included:
-                      a zero-count row is exactly the one that blanks the list
-                      when chosen, whichever section it sits in. */}
-                  <span className="text-muted text-[11px] shrink-0">{filterCounts.starred}</span>
-                  {starredOnly && <Check size={14} className="text-accent shrink-0" />}
-                </DropdownMenuItem>
-                {STATUS_FILTERS.map((key) => {
-                  const active = statusFilter.has(key)
-                  return (
-                    <DropdownMenuItem
-                      key={key}
-                      onSelect={(e) => { e.preventDefault(); toggleStatus(key) }}
-                      role="menuitemcheckbox"
-                      aria-checked={active}
-                      title={t(STATUS_TITLE_KEY[key])}
-                      data-testid={`member-filter-status-${key}`}
-                    >
-                      {STATUS_ICON[key](active)}
-                      <span className="flex-1 truncate">{t(STATUS_LABEL_KEY[key])}</span>
-                      <span className="text-muted text-[11px] shrink-0">{filterCounts.status[key]}</span>
-                      {active && <Check size={14} className="text-accent shrink-0" />}
-                    </DropdownMenuItem>
-                  )
-                })}
-                <DropdownMenuSeparator />
-                <FilterMenuLabel>{t('pages.membersPage.filter_origin')}</FilterMenuLabel>
-                {SOURCE_FILTERS.map((key) => {
-                  const active = sourceFilter === key
-                  return (
-                    <DropdownMenuItem
-                      key={key}
-                      onSelect={(e) => { e.preventDefault(); pickSource(key) }}
-                      role="menuitemradio"
-                      aria-checked={active}
-                      title={t(SOURCE_TITLE_KEY[key])}
-                      data-testid={`member-filter-source-${key}`}
-                    >
-                      <span className="flex-1 truncate">{t(SOURCE_LABEL_KEY[key])}</span>
-                      {/* 0 is rendered, not omitted: a zero-count origin is
-                          exactly the one that blanks the list when chosen. */}
-                      <span className="text-muted text-[11px] shrink-0">{filterCounts.source[key]}</span>
-                      {active && <Check size={14} className="text-accent shrink-0" />}
-                    </DropdownMenuItem>
-                  )
-                })}
-                <DropdownMenuSeparator />
-                <FilterMenuLabel>{t('pages.chatSidebar.sort_by')}</FilterMenuLabel>
-                {SORT_OPTIONS.map((key) => (
-                  <DropdownMenuItem
-                    key={key}
-                    onSelect={() => setRawSort(key)}
-                    role="menuitemradio"
-                    aria-checked={sort === key}
-                    data-testid={`member-sort-${key}`}
-                  >
-                    <span className="flex-1">{t(SORT_LABEL_KEY[key])}</span>
-                    {sort === key && <Check size={14} className="text-accent shrink-0" />}
-                  </DropdownMenuItem>
-                ))}
-              </FilterMenuContent>
-            </DropdownMenu>
-          )}
-        />
-        {/* The at-rest marker that the list is narrowed: ONE aggregate chip in
-            the sidebar's chip recipe (components/SearchFilterBar), naming every
-            active filter, so a returning user sees WHY the roster is short and
-            clears the lot with one click instead of reopening the menu. One
-            control, not one per filter — up to six sibling buttons would break
-            AUTOSDE max-two-buttons-per-row — and in the NEUTRAL aggregate shape
-            the sidebar's tag filter uses for "clears several": a coloured pill
-            means "clears this one filter" on both lists, a neutral pill means
-            "clears them all". The search text is not in it: it is visible in
-            the field, with its own clear button. */}
-        {narrowed && (
-          <div className={FILTER_CHIP_ROW_CLS} data-testid="member-filter-chips">
-            {/* The visible text IS the outcome of the click — "Clear Starred (2),
-                Mine (6) filter" — the same sentence the accessible name carries,
-                so a reader never has to guess whether the one ✕ drops one filter
-                or all of them. One existing key, one {{var}}: no glued strings. */}
-            <FilterChip
-              aggregate
-              label={t('pages.chatSidebar.clear_named_filter', { filter: fmtList(activeFilterLabels, { type: 'unit', style: 'short' }) })}
-              clearLabel={t('pages.chatSidebar.clear_named_filter', { filter: fmtList(activeFilterNames) })}
-              onClear={clearFilters}
-              testId="member-filter-chip"
-            />
-          </div>
-        )}
-        {/* Star-write failure. Falsy message renders nothing. askAgent is ON:
-            the roster holds no unsaved draft, so the hand-off's navigation
-            destroys nothing (AUTOSDE errors-use-error-notice). */}
-        <div className="px-2">
-          <ErrorNotice
-            message={starError?.message}
-            report={starError?.report}
-            title={t('pages.membersPage.star_failed_title')}
-            onDismiss={() => setStarError(null)}
-            askAgent
-            testId="member-star-error"
-          />
-        </div>
-        {gone && gone.shown === '' && (
-          /* The roster is the answer surface when there is no thread to stand
-             in the gone member's place: below md a stale link always lands
-             here, and on desktop a gone `?member=` with nothing remembered
-             now does too (#11763) rather than mounting a stranger's thread.
-             This is where the answer to "where did they go" has to live. Same
-             tone as the thread-side notice. */
-          <div className="px-4 py-1.5 text-[13px] text-warn" role="status" data-testid="member-gone-roster-notice">
-            {t('pages.membersPage.member_gone_roster', { name: gone.name })}
-          </div>
-        )}
-        <ul
-          className={`${LIST_BODY_CLS} list-none m-0`}
-          style={{ scrollbarWidth: 'none' }}
-          aria-label={t('pages.membersPage.title')}
-        >
-          {loaded && !loadError && members.length === 0 && (
-            <li className="px-4 py-6 text-xs text-muted">
-              <p>{t('pages.membersPage.empty_roster')}</p>
-              {/* The copy only says there is no one yet; this button IS the
-                  way to change that — the create form, same destination as
-                  the header "+". */}
-              <button
-                onClick={() => navigate(CREW_CREATE_PATH)}
-                className="mt-2 inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
-                data-testid="member-empty-cta"
-              >
-                <Plus size={12} className="lucide-inline" />
-                {t('pages.membersPage.add_member')}
-              </button>
-            </li>
-          )}
-          {loadError && (
-            /* The shared notice, not a bare alert: a read failure on a list
-               that holds no draft, so the agent hand-off is safe here. */
-            <li className="px-2 py-4">
-              <ErrorNotice
-                message={t('pages.membersPage.roster_load_failed')}
-                variant="inline"
-                askAgent
-                testId="member-roster-error"
-              />
-            </li>
-          )}
-          {filteredOut && (
-            <li className="px-4 py-6 text-xs text-muted" data-testid="member-filtered-out">
-              <p>{t('pages.membersPage.filters_hide_all')}</p>
-              <button
-                type="button"
-                onClick={clearFilters}
-                className="mt-2 inline-flex items-center gap-1 text-[11.5px] px-2 py-1 rounded border border-border hover:bg-accent/40"
-                data-testid="member-filters-clear"
-              >
-                {t('pages.membersPage.filters_clear')}
-              </button>
-            </li>
-          )}
-          {sortedMembers.map((m) => (
-            <MemberRow
-              key={m.name}
-              m={m}
-              t={t}
-              activeName={activeName}
-              openMember={openMember}
-              toggleStar={toggleStar}
-              starPending={starPending}
-              slotKeyOf={slotKeyOf}
-              isRunning={isRunning}
-              isUnread={isUnread}
-              activePatrolOf={activePatrolOf}
-              reduceMotion={reduceMotion}
-              scrollActiveRowIntoView={scrollActiveRowIntoView}
-              slugCollides={collidingSlugs.has(m.slug)}
-            />
-          ))}
-        </ul>
-        {/* Window-splitter between roster and thread: the same component as the
-            Sessions sidebar's grip, sitting on the card's right border the same
-            way (absolute, 12px rounded-xl corner inset), so the two pages' edges
-            read as one control. md+ only — below md the page is single-pane and
-            there is nothing to resize. */}
-        <div className="hidden md:block" data-testid="member-roster-resize">
-          <ResizeHandle
-            handleProps={roster.handleProps}
-            label={t('pages.membersPage.resize_roster')}
-            onNudge={roster.nudge}
-            value={roster.width}
-            min={ROSTER_MIN}
-            max={ROSTER_MAX}
-            inset={12}
-            className="absolute top-0 -right-[3px] h-full z-10"
-          />
-        </div>
-      </aside>
+      {placeRoster(<MembersPageRosterColumn
+        rosterRead={rosterRead} teamsRead={teamsRead} layout={layout} drawers={drawers}
+        rosterView={rosterView} rosterSignals={rosterSignals} profileFlight={profileFlight}
+        navigation={navigation} teamView={teamView} activeName={activeName}
+        scrollActiveRowIntoView={scrollActiveRowIntoView} gone={gone} createOpen={createOpen}
+        openAdvanced={openAdvanced} openQuick={openQuick} postCreateError={postCreateError}
+        createHeld={createHeld} slotKeyOf={slotKeyOf}
+        faceOnStageFor={thread.entranceFaceHidden && active ? active.name : ''}
+      />)}
 
       {/* DM thread */}
-      <section
-        className={`${activeName ? 'flex' : 'hidden md:flex'} flex-1 min-w-0 flex-col min-h-0`}
-      >
-        {!active && (
-          <div className="flex-1 flex items-center justify-center text-sm text-muted px-6 text-center">
-            {t('pages.membersPage.pick_a_member')}
-          </div>
-        )}
-        {active && (
-          <>
-            {/* No rule under the header: it shares the transcript's background
-                and is set off by spacing alone, the way ChatPage's session
-                header sits over its transcript (bg-bg, no border-b). A hairline
-                here read as a second frame inside the pane (issue #9425). */}
-            <header className="flex items-center gap-2.5 px-4 py-2" data-testid="member-thread-header">
-              <button
-                // Back to the roster. When this entry was pushed from the
-                // roster on this page, pop it — the browser's own Back then
-                // lands on whatever preceded the roster, with no duplicate
-                // roster entry. A deep link (no such state) has no roster
-                // entry behind it, so drop the param in place instead.
-                onClick={() => {
-                  if ((location.state as { fromRoster?: boolean } | null)?.fromRoster) navigate(-1)
-                  else setSearchParams({}, { replace: true })
-                }}
-                className="md:hidden inline-flex items-center p-1 -ml-1 rounded hover:bg-accent/40"
-                aria-label={t('pages.membersPage.title')}
-                data-testid="member-back"
-              >
-                <ArrowLeft size={16} className="lucide-inline" />
-              </button>
-              {/* The face is just the face on a chat surface — no hover
-                  scrim, no pencil badge: #9116 tried making the avatar the
-                  edit entry here and it read as an oversized "Edit avatar"
-                  control sitting in the conversation (issue #9425). It is the
-                  same reactive CrewStateAvatar as before. */}
-              <CrewStateAvatar
-                seed={active.name}
-                avatar={active.avatar}
-                slotKey={activeSlot || active.slot_key}
-                running={!!isRunning(active)}
-                size={30}
-                working="full"
-              />
-              {/* Title row = name + a small pencil to its RIGHT. That pencil is
-                  the member's edit entry: invisible at rest, it fades in when
-                  the pointer is over the title row (or the button has focus),
-                  and under (hover: none) it sits at low contrast permanently
-                  — a touch user can never hover it into view. The click opens
-                  the member's WHOLE editor in the crew manager — name,
-                  template, model, workspace, triggers, avatar — not just the
-                  avatar builder, so the label says "Edit member". It navigates
-                  rather than editing here: this page never becomes a second
-                  writer (issue #9103). `group/title` is scoped to this row so
-                  the drawer toggle to the right does not reveal it. */}
-              <div className="group/title min-w-0 flex-1 flex items-center gap-1.5" data-testid="member-title-row">
-                <div className="text-[13.5px] font-semibold truncate">{active.name}</div>
-                <button
-                  type="button"
-                  onClick={() => navigate(crewEditPath(active.name))}
-                  className="inline-flex shrink-0 items-center justify-center w-6 h-6 rounded-md text-muted hover:text-text hover:bg-bg-hover cursor-pointer focus-ring opacity-0 transition-opacity duration-150 motion-reduce:transition-none group-hover/title:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-60"
-                  aria-label={t('pages.membersPage.edit_member')}
-                  title={t('pages.membersPage.edit_member')}
-                  data-testid="member-edit-name-button"
-                >
-                  <Pencil size={13} className="lucide-inline" />
-                </button>
-              </div>
-              {/* The header carries NO panel control while the panel sits
-                  beside the thread: that panel is permanent, so a toggle would
-                  promise a close the strip does not offer. Only when the window
-                  is too narrow for a column (see panelSitsBeside) does the
-                  panel become an overlay, and then this is its opener — same
-                  icon and hit-target as the chat page's side-panel toggle, so
-                  the two surfaces teach one gesture. The pin chip was removed:
-                  every member thread is pinned by construction (a server
-                  invariant, not a per-thread state), so announcing it taught
-                  the user a term for a thing that can never be otherwise.
-                  The member's edit entry is not a peer of this toggle: it is
-                  the pencil inside the title row, revealed on hover. */}
-              {!beside && (
-                <button
-                  onClick={() => setOverlayOpen((v) => !v)}
-                  className="flex items-center justify-center w-7 h-7 rounded-md transition-colors bg-transparent border-none shrink-0 text-muted hover:text-text hover:bg-bg-hover cursor-pointer"
-                  aria-pressed={overlayOpen}
-                  aria-controls="member-side-panel"
-                  aria-label={t('pages.membersPage.details')}
-                  title={t('pages.membersPage.details')}
-                  data-testid="member-panel-toggle"
-                >
-                  <PanelRightSolid size={15} />
-                </button>
-              )}
-            </header>
-            {/* A failed document read from the panel's Files / Artifacts tabs.
-                Reported here, above the thread, rather than inside the tab
-                that failed to open — there is no such tab. Dismissable. No
-                hand-off: the ChatPane below holds the DM composer draft as
-                unsaved local state (its own notices say the same), and the
-                agent hand-off navigates away, which would unmount it. */}
-            {actionError && (
-              <ErrorNotice
-                message={actionError}
-                onDismiss={() => setActionError('')}
-                testId="member-panel-action-error"
-              />
-            )}
-            {gone && gone.shown === active.name && (
-              /* Decision-critical (the user is about to type into a thread they
-                 did not ask for), so it wears the warn tone at body size, not
-                 the drawer's muted timestamp style. A status, not an alert:
-                 the fallback did open something. */
-              <div className="px-4 py-2 text-[13px] text-warn" role="status" data-testid="member-gone-notice">
-                {t('pages.membersPage.member_gone', { name: gone.name, shown: gone.shown })}
-              </div>
-            )}
-            {activeCollision && (
-              /* Nothing is mounted under a collision (the slot is cleared), so
-                 there is no draft to lose: the hand-off is safe. */
-              <div className="px-4 py-2">
-                <ErrorNotice
-                  message={t('pages.membersPage.slug_collision', { name: activeCollision })}
-                  variant="inline"
-                  askAgent
-                  testId="member-thread-collision"
-                />
-              </div>
-            )}
-            {activeThreadFailed && (
-              /* No hand-off while a cached thread is mounted under this line:
-                 its DM composer still holds whatever the user typed (ChatPane
-                 keeps that draft in local state), and the hand-off navigates
-                 away, unmounting it. With nothing mounted (a cold open that
-                 failed) there is no draft to lose, so the hand-off is on —
-                 otherwise the column is a dead end. */
-              <div className="px-4 py-2">
-                {/* Two sentences for two situations: with no cached thread
-                    the column is empty and the open failed outright; with one
-                    still mounted below, "could not open" would contradict the
-                    conversation the user is looking at — it is the REPAIR
-                    that failed, and the copy says so. */}
-                <ErrorNotice
-                  message={t(
-                    activeSlot
-                      ? 'pages.membersPage.thread_repair_failed'
-                      : 'pages.membersPage.thread_open_failed',
-                  )}
-                  report={threadOutcome?.errorReport}
-                  variant="inline"
-                  askAgent={!activeSlot}
-                  testId="member-thread-error"
-                />
-                {threadOutcome?.errorReport && (
-                  <details className="mt-1.5 text-[12px] text-muted" data-testid="member-thread-error-details">
-                    <summary className="w-fit cursor-pointer rounded-sm focus-ring">{t('pages.membersPage.details')}</summary>
-                    {/* No hand-off here: the notice above owns the sole action
-                        and disables it while the cached conversation holds a draft. */}
-                    <ErrorNotice
-                      message={threadOutcome.errorReport.message}
-                      report={threadOutcome.errorReport}
-                      variant="inline"
-                      askAgent={false}
-                      className="mt-1"
-                      messageClassName="whitespace-pre-wrap"
-                    />
-                  </details>
-                )}
-              </div>
-            )}
-            {activeSlot ? (
-              <div className="flex-1 min-h-0">
-                <ErrorBoundary>
-                  {/* Same reading measure as the main chat transcript — the
-                      pane resolves the user's Content width setting itself
-                      (transcript and composer both). The DM column is the
-                      page's widest region, and an uncapped line length is
-                      unreadable on wide screens.
-
-                      steer-only: a DM is a conversation with one named
-                      member, not an operator console. Talking to a person has
-                      no "queue this until they finish" step, so a send while
-                      the member is working goes straight into its running
-                      turn — no Steer/Queue split, no queue stack. The main
-                      chat and split view keep the split button. */}
-                  <ChatPane
-                    slotKey={activeSlot}
-                    agentLocked
-                    frameless
-                    followContentWidth
-                    busyMode="steer-only"
-                    // The failure notice above owns the verdict on this thread
-                    // while a repair has failed; the pane's own "Session
-                    // ready" would contradict it one line down.
-                    hideEmptyHint={activeThreadFailed}
-                    openSideChat={openMemberSideChat}
-                  />
-                </ErrorBoundary>
-              </div>
-            ) : (
-              !activeCollision && !activeThreadFailed && (
-                <div className="flex-1 flex items-center justify-center text-xs text-muted">
-                  {t('pages.membersPage.opening_thread')}
-                </div>
-              )
-            )}
-          </>
-        )}
-      </section>
+      <MembersPageThreadColumn
+        rosterRead={rosterRead} crewEditing={crewEditing} teamsRead={teamsRead} layout={layout}
+        profileCard={profileCard} drawers={drawers} rosterView={rosterView} thread={thread}
+        sidePanel={sidePanel} threadView={threadView} rosterSignals={rosterSignals}
+        profileFlight={profileFlight} navigation={navigation} teamView={teamView} navigate={navigate}
+        location={location} activeName={activeName} setSearchParams={setSearchParams}
+        editingCrew={editingCrew} profile={profile} gone={gone} openCreate={openCreate}
+        openAdvanced={openAdvanced} openQuick={openQuick} threadColumnRef={threadColumnRef}
+        postCreateError={postCreateError} setPostCreateError={setPostCreateError}
+        postCreateDismissable={postCreateDismissable} createHeld={createHeld} threadOutcome={threadOutcome}
+        slotsLoaded={slotsLoaded} active={active} leftCreateFailure={leftCreateFailure}
+        setLeftCreateFailure={setLeftCreateFailure} retryPostCreate={retryPostCreate}
+      />
+      {/* New crewmate: a bounded modal (its own 90vh-capped scrim + glass
+          blur) over the chat it was opened from, which stays mounted and
+          marked not-viewed behind it (see threadShown). */}
+      <NewCrewmateDialog
+        open={createOpen}
+        startExpanded={createExpanded}
+        initialDraft={createDraft}
+        guided
+        onDraftStateChange={onCreateDraftState}
+        onFailed={handleCreateFailed}
+        firstGreeting
+        onClose={() => setCreateOpen(false)}
+        onCreated={handleCreated}
+        existingNames={existingNames}
+      />
       </div>
 
       {/* Side panel — the chat page's tabbed SidePanel, docked to this page.
@@ -2319,622 +842,68 @@ export default function MembersPage() {
           panel's own (Files / Artifacts / Terminal / Browser / Side chat …),
           all against the member's DM slot, and the strip is bucketed per
           member so it follows the roster selection. Wide windows dock it as a
-          column with NO close control (it is part of the page, like the roster);
-          narrow ones make it an overlay the header button opens, with the
-          panel's own close control, on the chat page's dock motion. */}
-      {active && (() => {
-          const activeLiveSlot = liveSlots.find((slot) => slot.key === slotKeyOf(active))
-          const delegatedOnly = activeLiveSlot?.subagents_running && !activeLiveSlot.running
-          // Identity + live status line — working now, or the last time
-          // anything happened on the thread. Shared by the three tab bodies
-          // (rendered once each; the chips wear kind glyphs, so this row is
-          // where the panel names WHOSE notes / log / dashboard these are).
-          const identityRow = (
-            <div className="flex items-center gap-2 mb-3 min-w-0" data-testid="member-identity-row">
-              <CrewAvatar seed={active.name} avatar={active.avatar} size={22} />
-              <span className="text-[13px] font-semibold truncate">{active.name}</span>
-              <span className="text-[11px] truncate ml-auto shrink-0" data-testid="member-summary-status">
-                {isRunning(active) ? (
-                  <span className="text-ok">{t(delegatedOnly
-                    ? 'pages.membersPage.drawer_delegated_working'
-                    : 'pages.membersPage.drawer_working')}</span>
-                ) : (activeView ?? active).last_active_ts ? (
-                  <span className="text-muted">{timeAgo((activeView ?? active).last_active_ts!)}</span>
-                ) : null}
-              </span>
-            </div>
-          )
-          // Work log — what the crewmate did: the counters and recent activity
-          // the backend can attest, the sessions it is driving, its patrol
-          // loop, and the thread's own session record. Nothing about settings
-          // lives here; that is the crewmate's detail page (the crew editor).
-          const workLogBody = (
-            <div className="px-3 py-3" data-testid="member-work-log" aria-label={t('pages.membersPage.work_log_tab')}>
-          {identityRow}
-          {/* Honest counters only — both derive from the recorded activity
-              log. Semantic stats the backend cannot attest (PRs, triages,
-              spend) are deliberately absent rather than fabricated. */}
-          <div className="grid grid-cols-2 gap-2 mb-4" data-testid="member-stats">
-            <div className="border border-border rounded-lg px-3 py-2">
-              <div className="text-lg font-semibold leading-tight">
-                {activityLoading || activityError ? '\u2013' : `${todayCount}${todayIsFloor ? '+' : ''}`}
-              </div>
-              <div className="text-[11px] text-muted">{t('pages.membersPage.stat_today')}</div>
-            </div>
-            <div className="border border-border rounded-lg px-3 py-2">
-              <div className="text-lg font-semibold leading-tight">
-                {activityLoading || activityError ? '\u2013' : `${weekCount}${weekIsFloor ? '+' : ''}`}
-              </div>
-              <div className="text-[11px] text-muted">{t('pages.membersPage.stat_week')}</div>
-            </div>
-          </div>
-          {/* Sessions this member is driving — the worker sessions it opened
-              and steers. Live rows off the WS slots frames (see the
-              drivingSessions memo); each row is a jump into that session.
-              The status dot is the sidebar's vocabulary: approval (warn) >
-              needs input (info) > running (ok) > idle (muted). */}
-          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
-            {t('pages.membersPage.driving_sessions')}
-          </div>
-          {drivingSessions.length === 0 && !slotsLoaded ? (
-            <div className="mb-4 space-y-1.5" data-testid="member-driving-loading" aria-hidden>
-              <div className="h-3 rounded bg-accent/40 animate-pulse" />
-              <div className="h-3 w-3/4 rounded bg-accent/40 animate-pulse" />
-            </div>
-          ) : drivingSessions.length === 0 ? (
-            <div className="text-[11px] text-muted mb-4" data-testid="member-driving-empty">
-              {t('pages.membersPage.driving_none')}
-            </div>
-          ) : (
-            <div className="mb-4">
-              <ul className="list-none m-0 p-0 space-y-0.5" data-testid="member-driving-sessions">
-                {visibleDriving.map((s) => {
-                  // Precedence is the shared tab-status contract (approval and
-                  // question outrank running); no unread set here, so the
-                  // fourth state is plain idle.
-                  const kind = tabStatus(s, [], s.key)
-                  const status = DRIVING_STATUS[kind]
-                  const label = t(status.label)
-                  // Slot timestamps are ISO strings; timeAgo wants epoch seconds.
-                  const activityTs = lastActivityEpoch(s)
-                  const title = s.title || s.key
-                  return (
-                    <li key={s.key}>
-                      <button
-                        type="button"
-                        onClick={() => navigate(`/chat?sid=${encodeURIComponent(s.key)}`)}
-                        className="w-full text-left flex items-center gap-2 text-[11px] px-1.5 py-1 -mx-1.5 rounded hover:bg-accent/40"
-                        title={title + PROJECT_SEPARATOR + label}
-                        data-testid="member-driving-row"
-                        data-status={kind}
-                      >
-                        <Circle size={8} className={`shrink-0 ${status.cls}`} aria-hidden />
-                        <span className="min-w-0 truncate flex-1">{title}</span>
-                        {/* The two states parked on the user get words, not
-                            just a colour — the sidebar's own idiom for the
-                            same signals; running/idle stay dot-only (the
-                            label is in the hover title and for AT). */}
-                        {status.spoken ? (
-                          <span className={`shrink-0 font-medium ${status.text}`}>{label}</span>
-                        ) : (
-                          <span className="sr-only">{label}</span>
-                        )}
-                        {activityTs > 0 && (
-                          <span className="text-muted shrink-0 whitespace-nowrap">{timeAgo(activityTs)}</span>
-                        )}
-                      </button>
-                    </li>
-                  )
-                })}
-              </ul>
-              {drivingSessions.length > DRIVING_VISIBLE && (
-                <button
-                  type="button"
-                  onClick={() => setDrivingExpandedFor(drivingExpanded ? '' : activeMemberKey)}
-                  className="mt-1 text-[11px] text-muted hover:text-text"
-                  aria-expanded={drivingExpanded}
-                  data-testid="member-driving-toggle"
-                >
-                  {drivingExpanded
-                    ? t('pages.membersPage.driving_show_less')
-                    : t('pages.membersPage.driving_show_all', { count: drivingSessions.length })}
-                </button>
-              )}
-            </div>
-          )}
-          {/* Auto patrol — the auto-nudge loop on this member's own thread,
-              beside the sessions it drives: together they answer "is this
-              member alive, and what is it doing". Three verdicts, never
-              conflated (see patrolState), plus the loading / failed states
-              every block in this drawer keeps. The readouts are the composer's
-              goal chip's: same cycle spelling, same deadline-preserving
-              countdown, same "last fire" wording — so a person who has read
-              one has read the other. The block cross-fades on a verdict
-              change; a stop that lands while the drawer is open must read as
-              a change, not a flicker. */}
-          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5 flex items-center gap-1.5">
-            <Goal
-              size={12}
-              className={`lucide-inline shrink-0 ${patrolState === 'active' ? 'text-accent' : 'text-muted'}`}
-              aria-hidden="true"
-            />
-            <span className="flex-1">{t('pages.membersPage.patrol_title')}</span>
-          </div>
-          {!patrol.loaded ? (
-            <div className="mb-4 space-y-1.5" data-testid="member-patrol-loading" aria-hidden>
-              <div className="h-3 rounded bg-bg-hover animate-pulse" />
-              <div className="h-3 w-3/4 rounded bg-bg-hover animate-pulse" />
-            </div>
-          ) : patrol.failed ? (
-            /* The shared notice, not a hand-rolled alert: it keeps the
-               structured error context and the agent hand-off. askAgent is
-               safe here — a read failure on a drawer that holds no draft. */
-            <div className="mb-4">
-              <ErrorNotice
-                message={t('pages.membersPage.patrol_error')}
-                variant="inline"
-                askAgent
-                testId="member-patrol-error"
-              />
-            </div>
-          ) : (
-            <motion.div
-              key={patrolState}
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-              className="mb-4"
-              data-testid="member-patrol"
-              data-state={patrolState}
-            >
-              {patrolState === 'active' && activePatrol ? (
-                <>
-                  <div className="text-[11px] font-medium text-text mb-1.5" data-testid="member-patrol-status">
-                    {t('pages.membersPage.patrol_active')}
-                  </div>
-                  {/* Same label/value idiom as the Configuration list below. */}
-                  <dl className="text-[11px] space-y-1 m-0">
-                    <div className="flex gap-2">
-                      <dt className="w-24 shrink-0 text-muted">{t('pages.membersPage.patrol_interval')}</dt>
-                      <dd className="min-w-0 truncate m-0" data-testid="member-patrol-interval">
-                        {intervalText(activePatrol.idle_secs)}
-                      </dd>
-                    </div>
-                    <div className="flex gap-2">
-                      <dt className="w-24 shrink-0 text-muted">{t('pages.membersPage.patrol_cycles')}</dt>
-                      <dd className="min-w-0 truncate m-0" data-testid="member-patrol-cycles">
-                        {/* Self-describing here ("3 of 24"); the chip keeps its
-                            compact "3/24", which alone read as a date. */}
-                        {activePatrol.max_cycles > 0
-                          ? t('pages.membersPage.patrol_cycles_of', { n: activePatrol.cycle_count, max: activePatrol.max_cycles })
-                          : t('pages.membersPage.patrol_cycles_unlimited', { n: activePatrol.cycle_count })}
-                      </dd>
-                    </div>
-                    <div className="flex gap-2">
-                      <dt className="w-24 shrink-0 text-muted">{t('pages.membersPage.patrol_last_wake')}</dt>
-                      <dd
-                        className="min-w-0 truncate m-0"
-                        title={activePatrol.last_fire_ts ? fmtDateTimeNumeric(activePatrol.last_fire_ts) : undefined}
-                      >
-                        {activePatrol.last_fire_ts
-                          ? timeAgo(activePatrol.last_fire_ts)
-                          : t('components.autoNudgePopover.never')}
-                      </dd>
-                    </div>
-                    <div className="flex gap-2">
-                      <dt className="w-24 shrink-0 text-muted">{t('pages.membersPage.patrol_next_wake')}</dt>
-                      <dd
-                        className="min-w-0 truncate m-0"
-                        title={activePatrol.next_due_ts > 0 ? fmtDateTimeNumeric(activePatrol.next_due_ts) : undefined}
-                        data-testid="member-patrol-next"
-                      >
-                        {(() => {
-                          // The row already says "Next wake", so the value is
-                          // the bare remainder; the due / unscheduled readings
-                          // are the composer chip's own sentences.
-                          const next = nextCycle(activePatrol, nowTs)
-                          switch (next.kind) {
-                            case 'in':
-                              return t('pages.membersPage.patrol_next_in', { time: next.time })
-                            case 'due':
-                              return t('components.autoNudgePopover.next_cycle_due')
-                            default:
-                              return t('components.autoNudgePopover.next_cycle_unscheduled')
-                          }
-                        })()}
-                      </dd>
-                    </div>
-                    {(activePatrol.banner || activePatrol.message) && (
-                      <div className="flex gap-2">
-                        <dt className="w-24 shrink-0 text-muted">{t('pages.membersPage.patrol_instruction')}</dt>
-                        {/* The banner is the SHORT stand-in the transcript row
-                            shows; without one, the instruction's first line.
-                            The full text sits in the hover title. */}
-                        <dd
-                          className="min-w-0 truncate m-0"
-                          title={activePatrol.banner || activePatrol.message}
-                          data-testid="member-patrol-instruction"
-                        >
-                          {(activePatrol.banner || activePatrol.message).split('\n')[0]}
-                        </dd>
-                      </div>
-                    )}
-                  </dl>
-                </>
-              ) : patrolState === 'active' ? (
-                // Armed by a wake projection that arrived ahead of the loop
-                // record (the registry no longer polls, so the projection can
-                // lead). It carries no interval/cycle/next-wake detail, so we
-                // render the same "Patrolling" verdict as the full block rather
-                // than the full detail (which it cannot fill) or, worse, "No
-                // patrol scheduled." beside the lit patrol icon. The verdict is
-                // rendered in body colour, not accent: accent marks LINKS in this
-                // drawer, and a static status word wearing it invites a click it
-                // cannot answer -- the row it sits in is what locates it. Reusing
-                // patrol_active means the label does not flip when the loop
-                // record lands right after.
-                <div className="text-[11px] text-text" data-testid="member-patrol-status">
-                  {t('pages.membersPage.patrol_active')}
-                </div>
-              ) : patrolState === 'stopped' ? (
-                <div className="text-[11px] text-muted" data-testid="member-patrol-status">
-                  <span className="text-text">{t('pages.membersPage.patrol_stopped')}</span>
-                  {patrolStoppedReason && (
-                    <span className="block mt-0.5" data-testid="member-patrol-reason">
-                      {PATROL_STOPPED_REASON[patrolStoppedReason]
-                        ? t(PATROL_STOPPED_REASON[patrolStoppedReason])
-                        : patrolStoppedReason}
-                    </span>
-                  )}
-                  {/* No rearm control here, deliberately. The state reads as a dead end
-                      that wants one, but what a control here could create is a
-                      SCHEDULE, which lives on the crewmate's detail page (the crew
-                      editor's Schedules pane) — and this block renders from the
-                      durable `wake` projection's `patrol` field, which a schedule
-                      writes nothing to. A button whose own remedy could not clear the
-                      notice above it would read as a remedy that failed. */}
-                  {activePatrol && activePatrol.last_fire_ts > 0 && (
-                    <span className="block mt-0.5" title={fmtDateTimeNumeric(activePatrol.last_fire_ts)}>
-                      {t('pages.membersPage.patrol_last_wake_ago', { when: timeAgo(activePatrol.last_fire_ts) })}
-                    </span>
-                  )}
-                </div>
-              ) : (
-                <div className="text-[11px] text-muted" data-testid="member-patrol-status">
-                  {t('pages.membersPage.patrol_none')}
-                </div>
-              )}
-            </motion.div>
-          )}
-          <div className="text-[11px] font-semibold tracking-wide text-muted mb-1.5">
-            {t('pages.membersPage.recent_activity')}
-          </div>
-          {/* Three states, never conflated: a pending or failed read must not
-              render the affirmative "no recorded activity". */}
-          {activityLoading ? (
-            <div className="mb-4 space-y-1.5" data-testid="member-activity-loading" aria-hidden>
-              <div className="h-3 rounded bg-accent/40 animate-pulse" />
-              <div className="h-3 w-3/4 rounded bg-accent/40 animate-pulse" />
-            </div>
-          ) : activityError ? (
-            <div className="mb-4">
-              <ErrorNotice
-                message={t('pages.membersPage.activity_error')}
-                variant="inline"
-                askAgent
-                testId="member-activity-error"
-              />
-            </div>
-          ) : activeEntries.length === 0 ? (
-            <div className="text-[11px] text-muted mb-4">
-              {t('pages.membersPage.activity_empty')}
-            </div>
-          ) : (
-            /* One row per calendar day, newest first, three days before the
-               list folds. A row opens into the day's time strip — the same
-               rows the old list showed, reduced to the one thing that varied
-               between them (the clock), with routed picks marked in accent. */
-            <div className="mb-4" data-testid="member-activity-days">
-              {/* A grid, not flex rows: the day column sizes to its widest
-                  label ("yesterday" in English, 「前天」 in Chinese) instead of
-                  a fixed width that gapes in one locale and clips the other. */}
-              <ul className="list-none m-0 p-0 -mx-1.5 grid grid-cols-[max-content_minmax(0,1fr)_auto] gap-y-0.5">
-                {visibleActivityDays.map((day) => {
-                  const dayKey = `${activeMemberKey}:${day.dayStart}`
-                  const open = openActivityDay === dayKey
-                  const first = day.projects[0] ? projectLabel(day.projects[0]) : ''
-                  const more = day.projects.length - 1
-                  return (
-                    <li key={day.dayStart} className="contents">
-                      <button
-                        type="button"
-                        onClick={() => setOpenActivityDay(open ? '' : dayKey)}
-                        className="col-span-3 grid grid-cols-subgrid items-center gap-x-2 text-left text-[11px] px-1.5 py-1 rounded hover:bg-accent/40"
-                        aria-expanded={open}
-                        data-testid="member-activity-day"
-                      >
-                        <span className="text-muted whitespace-nowrap">
-                          {activityDayLabel(day.dayStart)}
-                        </span>
-                        {/* Wraps rather than truncates: the project is the value
-                            the row exists to show, and it sits last — the first
-                            thing an ellipsis ate on a dense day. */}
-                        <span className="min-w-0 break-words">
-                          {/* `isFloor`: the server capped the log and this day holds
-                              its oldest returned entry, so older events may be
-                              missing — the count is "at least N", shown as N+.
-                              The footer under the list says so in words. */}
-                          {day.chats > 0 && countPhrase('pages.membersPage.activity_chat_count', day.chats, day.isFloor)}
-                          {day.chats > 0 && day.routed > 0 && PROJECT_SEPARATOR}
-                          {day.routed > 0 && (
-                            <>
-                              {/* The same glyph the time strip uses, introduced here
-                                  beside its name so the strip's bare icon is
-                                  already taught by the time a day is opened. */}
-                              <Route size={10} className="inline-block align-[-1px] mr-0.5" aria-hidden />
-                              {countPhrase('pages.membersPage.activity_routed_count', day.routed, day.isFloor)}
-                            </>
-                          )}
-                          {first && (
-                            <span className="text-muted" title={day.projects.join('\n')}>
-                              {PROJECT_SEPARATOR}
-                              {/* Spelled out, not "+1": the bare plus already
-                                  means "at least" on a floor count in this row. */}
-                              {more > 0
-                                ? t('pages.membersPage.activity_projects_more', { name: first, count: more })
-                                : first}
-                            </span>
-                          )}
-                        </span>
-                        <ChevronRight
-                          size={12}
-                          className={`shrink-0 text-muted transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
-                          aria-hidden
-                        />
-                      </button>
-                      {/* Plain muted text, not pills and not accent: these open
-                          nothing, and both a border and the accent colour read as
-                          something to click. The Route icon alone marks an
-                          orchestrator pick; the tooltip spells it out. */}
-                      {open && (
-                        <ul
-                          className="list-none m-0 p-0 col-start-2 col-span-2 flex flex-wrap gap-x-2.5 gap-y-0.5 pr-1.5 pt-0.5 pb-1.5"
-                          data-testid="member-activity-times"
-                        >
-                          {day.entries.map((e, i) => {
-                            const routed = e.via === 'select_crew'
-                            return (
-                              <li
-                                key={`${e.ts}-${i}`}
-                                className="inline-flex items-center gap-0.5 font-mono text-[10px] leading-4 text-muted"
-                                title={
-                                  (routed
-                                    ? t('pages.membersPage.activity_routed')
-                                    : t('pages.membersPage.activity_chat')) +
-                                  (e.project ? PROJECT_SEPARATOR + e.project : '')
-                                }
-                                data-routed={routed || undefined}
-                              >
-                                {routed && <Route size={10} className="shrink-0" aria-hidden />}
-                                {fmtTime(e.ts)}
-                              </li>
-                            )
-                          })}
-                        </ul>
-                      )}
-                    </li>
-                  )
-                })}
-              </ul>
-              {activityDays.length > ACTIVITY_DAYS_VISIBLE && (
-                <button
-                  type="button"
-                  onClick={() => setActivityDaysExpandedFor(activityDaysExpanded ? '' : activeMemberKey)}
-                  className="text-[11px] text-muted hover:text-text px-1.5 py-1 -mx-1.5 rounded hover:bg-accent/40"
-                  data-testid="member-activity-more"
-                >
-                  {activityDaysExpanded
-                    ? t('pages.membersPage.driving_show_less')
-                    : t('pages.membersPage.activity_more_days', {
-                        count: activityDays.length - ACTIVITY_DAYS_VISIBLE,
-                      })}
-                </button>
-              )}
-              {/* Says in words what the `N+` on the oldest day means, so the
-                  floor is explained where it is seen rather than on hover. */}
-              {activityCapped && (
-                <div className="text-[11px] text-muted mt-1" data-testid="member-activity-capped">
-                  {t('pages.membersPage.activity_capped')}
-                </div>
-              )}
-            </div>
-          )}
-          {/* The thread's own Crew Log — the same session record the chat
-              page's Crew log tab shows for any slot, here for the crewmate's
-              DM thread. Only once the thread endpoint has confirmed the slot:
-              a record read against an unconfirmed key would name whatever
-              session happens to hold it (see the `slots` comment above), so
-              until then the section is simply absent, not a notice. */}
-          {confirmedSlot ? (
-            <div className="-mx-3 border-t border-border" data-testid="member-session-record">
-              <div className="px-3 pt-2.5 text-[11px] font-semibold tracking-wide text-muted">
-                {t('pages.membersPage.session_record')}
-              </div>
-              <CrewLogTab slot={confirmedSlot} />
-            </div>
-          ) : null}
-            </div>
-          )
-          // Notes — the crewmate's own standing notes, read-only (no editor:
-          // see CrewNotesTab). Its briefing read is gated on the tab being on
-          // screen, like the work log's reads.
-          const notesBody = activeSlug && activeMemberName ? (
-            <CrewNotesTab
-              slug={activeSlug}
-              member={activeMemberName}
-              header={identityRow}
-              visible={notesVisible}
-            />
-          ) : null
-          // Dashboard — the page the crewmate publishes itself (CrewWebview,
-          // the shipped component: docked summary, expandable to full window).
-          // Its empty state's one action jumps to the crewmate's detail page,
-          // which is where setup lives.
-          const dashboardBody = (
-            <div className="px-3 py-3" data-testid="member-dashboard" aria-label={t('pages.membersPage.dashboard_tab')}>
-              {identityRow}
-              {activeSlug && activeMemberName ? (
-                <CrewWebview
-                  slug={activeSlug}
-                  member={activeMemberName}
-                  onSetUp={() => {
-                    const destination = crewEditPath(activeMemberName)
-                    leave(() => navigate(destination), destination)
-                  }}
-                />
-              ) : null}
-            </div>
-          )
-          // The panel's three host tabs, in strip order. Kind glyphs, not the
-          // member's face: the face sits in each body's identity row and in
-          // the DM header, and three faces in a row would name nothing.
-          const leadingTabs: SidePanelLeadingTab[] = [
-            {
-              id: CREW_NOTES_TAB_ID,
-              title: t('pages.membersPage.notes_tab'),
-              icon: <NotebookPen className="lucide-inline" aria-hidden="true" />,
-              render: () => notesBody,
-            },
-            {
-              id: CREW_WORK_LOG_TAB_ID,
-              title: t('pages.membersPage.work_log_tab'),
-              icon: <ListChecks className="lucide-inline" aria-hidden="true" />,
-              render: () => workLogBody,
-            },
-            {
-              id: CREW_DASHBOARD_TAB_ID,
-              title: t('pages.membersPage.dashboard_tab'),
-              icon: <LayoutDashboard className="lucide-inline" aria-hidden="true" />,
-              render: () => dashboardBody,
-            },
-          ]
-          // Everything both placements share. Two different keys do two
-          // different jobs here. `slot` is the IDENTITY of the panel's bodies —
-          // the key a Browser tab's native WebContentsView, an app frame and
-          // every document body are keyed by — so it is the same key the strip
-          // is bucketed on (`activeSlot`, the key the LAST successful open
-          // confirmed) and it holds steady through a re-POST: the transient
-          // withdrawal while a thread is being revalidated (a routine WS
-          // reconnect re-POSTs) must hide the slot-bound views, not re-key them
-          // — a Browser body re-keyed to '' and back would `close()` its live
-          // WebContentsView and lose history and form state. WHICH views may be
-          // offered is `hiddenViews`' job, gated on `confirmedSlot`: until the
-          // CURRENT open's POST confirms the key (and after a refusal) every
-          // slot-bound view is withheld, so nothing can be dispatched against a
-          // key the endpoint may refuse; the document actions above bind to
-          // `confirmedSlot` for the same reason. No bottom dock: this page has
-          // no bottom grid row for it to move into.
-          const panelProps = {
-            tabsCtl,
-            slot: activeSlot,
-            hiddenViews,
-            onActiveTabChange: setShownTabId,
-            projectDir,
-            onFileOpen: openFile,
-            onArtifactOpen: openArtifact,
-            onFileSave: saveFile,
-            leadingTabs,
-            slotTitle: active.name,
-            canDockBottom: false,
-          }
-          // ONE SidePanel instance for both placements. Docked and overlay differ
-          // only in the wrapper (an in-flow column vs a fixed sheet below the
-          // 42px app topbar) and in the motion axis (the chat page's width
-          // reveal vs a slide from the right edge), so they share one keyed
-          // element and the panel is never remounted by a placement flip — a
-          // live Browser tab's WebContentsView, like an app tab's frame, does
-          // not survive a remount. For the same reason a CLOSED overlay stays
-          // MOUNTED and hidden while such a tab exists (`shouldMountSidePanel`
-          // / `isSidePanelHidden`, the chat page's exact rule); with no live
-          // tab it unmounts on close, which preserves the exit motion. Both
-          // axes are named in every target — see sidePanelDockMotion for why an
-          // axis left out of `animate` freezes at its last value.
-          // Two nested motion elements in BOTH placements so the SidePanel
-          // instance is the same React subtree whichever way it is shown. Docked:
-          // the outer is the chat page's width reveal and the inner is inert.
-          // Overlay: the outer is a full-bleed SCRIM below the 42px app topbar
-          // (fades in; a click on it closes the overlay — the whole chat column
-          // is dimmed rather than left peeking out as a sliver beside the panel,
-          // which read as a rendering fault) and the inner slides the panel in
-          // from the right edge. Both axes are named in every target — see
-          // sidePanelDockMotion for why an axis left out of `animate` freezes.
-          const outerMotion = beside
-            ? dockMotion
-            : {
-              initial: { opacity: 0, width: 'auto', height: '100%' },
-              animate: { opacity: 1, width: 'auto', height: '100%' },
-              exit: { opacity: 0, width: 'auto', height: '100%' },
-            }
-          const innerMotion = beside
-            ? { initial: { x: 0 }, animate: { x: 0 }, exit: { x: 0 } }
-            : { initial: { x: '100%' }, animate: { x: 0 }, exit: { x: '100%' } }
-          return (
-            <AnimatePresence initial={false}>
-              {panelMounted && (
-                <motion.div
-                  key="member-side-panel"
-                  id="member-side-panel"
-                  initial={outerMotion.initial}
-                  animate={outerMotion.animate}
-                  exit={outerMotion.exit}
-                  transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-                  className={beside
-                    ? 'h-full overflow-visible flex justify-end shrink-0'
-                    /* The overlay MUST be dismissable, so it is the one placement
-                       that hands the panel an onClose — and the scrim is a second
-                       dismiss, the drawer convention. On a phone the panel is
-                       handed the window width (`fillWidth`) so it fills the
-                       scrim; on a tablet-width window the panel keeps its own
-                       (resizable, persisted) width against the dimmed chat. */
-                    : 'fixed top-safe-offset-[42px] bottom-safe left-safe right-safe z-40 flex justify-end bg-bg/60 backdrop-blur-xs'}
-                  style={panelHidden ? { display: 'none' } : undefined}
-                  onClick={beside ? undefined : (e) => { if (e.target === e.currentTarget) closeOverlay() }}
-                  data-testid="member-side-panel"
-                  data-placement={beside ? 'docked' : 'overlay'}
-                >
-                  <motion.div
-                    initial={innerMotion.initial}
-                    animate={innerMotion.animate}
-                    exit={innerMotion.exit}
-                    transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-                    className={beside ? 'h-full flex justify-end' : 'h-full flex justify-end max-w-full'}
-                  >
-                    <SidePanel
-                      {...panelProps}
-                      panelHidden={panelHidden}
-                      /* Docked: permanent — no onClose, so the strip renders no
-                         close control and Escape inside a view does nothing.
-                         `extraReserveW` keeps the live roster width plus the
-                         page's gaps clear on top of the shell reserve, so a drag
-                         can never fold the thread to nothing (the contract the
-                         old drawer's reserveWidth carried). Overlay: the panel
-                         covers the thread, so nothing to reserve. */
-                      onClose={beside ? undefined : closeOverlay}
-                      extraReserveW={beside ? roster.width + PANEL_GAPS_W : 0}
-                      /* Phone only (see panelFillWidth): the overlay fills the
-                         window. Off the phone this is undefined and the panel
-                         sizes itself. */
-                      fillWidth={panelFillWidth}
-                    />
-                  </motion.div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          )
-        })()}
-      {/* Crew-wide and read-only. It owns its own Dialog, and its launch read is
-          gated on `open`, so a visit that never opens it costs no request. */}
-      <DeployMyCrewDialog open={deployOpen} onClose={() => setDeployOpen(false)} members={members} />
+          column the strip's own close control hides, with the header opener
+          taking the gesture back while it is hidden; narrow ones make it an
+          overlay the header button opens, with the same close control, on the
+          chat page's dock motion. The create modal is an overlay, so the page
+          behind it (chat AND this panel) stays in place rather than reflowing. */}
+      <div className="contents">
+      {active && (<>
+        {faceFlight && <CrewFaceFlight key={faceFlight.key} flight={faceFlight} onDone={endFaceFlight} />}
+        <MembersPageProfileCard
+          crewEditing={crewEditing} profileCard={profileCard} rosterView={rosterView} thread={thread}
+          sidePanel={sidePanel} schedules={schedules} profileFlight={profileFlight} navigate={navigate}
+          leave={leave} setEditingCrew={setEditingCrew} profile={profile} threadColumnRef={threadColumnRef}
+          slotsLoaded={slotsLoaded} active={active} activeSlug={activeSlug}
+          activeMemberName={activeMemberName} onGoalsDraftChange={onGoalsDraftChange}
+        />
+        <MembersPageSidePanel
+          layout={layout} profileCard={profileCard} drawers={drawers} rosterView={rosterView} thread={thread}
+          sidePanel={sidePanel} profileFlight={profileFlight} navigation={navigation} activeName={activeName}
+          active={active} activeSlug={activeSlug} activeMemberName={activeMemberName}
+        />
+      </>)}
+      </div>
+      {/* Edit team (create is hidden for the phase). A saved team opens its
+          team view; a deleted one that was open drops `?team=` and the bare
+          URL falls to the page's default (the remembered or most recently used
+          crewmate, or the hero on an empty roster). */}
+      {teamDialog && (
+        <TeamDialog
+          open
+          team={teamDialog.team}
+          teams={teams}
+          members={orderedMembers}
+          onClose={() => setTeamDialog(null)}
+          onSaved={(saved) => {
+            setTeamDialog(null)
+            openTeam(saved.id)
+          }}
+          onDeleted={(removed) => {
+            setTeamDialog(null)
+            if (urlTeam === removed.id) setSearchParams({}, { replace: true })
+          }}
+        />
+      )}
+      {/* The Schedules tab's discard prompt. Raised from the strip's own guard and from
+          the section's collapse toggle, so it must sit outside the panel subtree the
+          answer may unmount. */}
+      {schedConfirmDialog}
+      {freshStartConfirmDialog}
+      {/* CREW-18688: the bot-edit modal, opened in place by the thread header's
+          identity pill (member-identity-pill). Renders nothing until editingCrew is
+          set; the hook returns open=false until its roster read resolves the
+          record. Lazy + Suspense so its code is not in the main App chunk. The
+          fallback is a small NON-lazy loading dialog shown only while a pill click
+          is pending and the chunk is still downloading (first open on a cold cache,
+          worst over remote access): without it that first click renders nothing,
+          because the hook's own loading dialog lives inside the lazy chunk. When no
+          edit is requested the fallback is null, so a closed dialog renders nothing. */}
+      <Suspense fallback={editingCrew ? <CrewEditorChunkLoading /> : null}>
+        <CrewEditorModal ctl={crewEditor} />
+      </Suspense>
     </div>
+    </RunInTerminalScope.Provider>
+    </SidePanelDockHost>
   )
 }

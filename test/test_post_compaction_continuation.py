@@ -329,7 +329,6 @@ def test_does_not_fire(field: str, value: object, why: str) -> None:
 @pytest.mark.parametrize(
     ("field", "value", "why"),
     [
-        ("in_stage_execution", True, "stage loop advances before the resume lands"),
         ("stop_in_progress", True, "a Stop is resolving"),
         ("stop_generation_unchanged", False, "a Stop pressed and resolved this turn"),
         ("queue_empty", False, "a user follow-up is queued and must win"),
@@ -381,17 +380,22 @@ def test_the_runner_gates_continuation_on_completed_not_on_any_terminal() -> Non
     `_broadcast_compaction_result` returns a message for BOTH terminals, so the
     turn-scoped `saw_compaction` is True after a FAILED compaction too. Passing it
     here would queue a continuation asserting a summary exists when none does.
-    Read from source because the branch lives inside the runner's single very long
-    turn function, which cannot be driven in a unit test -- the wiring is the whole
-    risk, so the wiring is what is pinned.
+    Read from source because the branch lives inside a turn phase, ``_turn_settle_answer``
+    in ``chat_turn/segment_flush.py``, which cannot be driven in a unit test -- the wiring
+    is the whole risk, so the wiring is what is pinned.
     """
-    src = (
+    runner = (
         pathlib.Path(__file__).resolve().parents[1]
         / "src"
         / "kiro_crew"
         / "dashboard"
         / "chat_runner.py"
-    ).read_text(encoding="utf-8")
+    )
+    src = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
+        if turn_file.name != "__init__.py"
+    )
 
     assert "compaction_settled=_compaction_completed," in src, (
         "the continuation gate must read the COMPLETED-only flag; "
@@ -424,10 +428,11 @@ def test_the_dispatch_path_flags_the_notice_chunk_it_forwards() -> None:
     Pinned in source because the yield sits inside a very long async generator,
     and the regression is exactly the flag going missing from the call.
     """
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "acp" / "client.py"
-    ).read_text(encoding="utf-8")
-    assert "yield AcpEvent(kind=kind, text=chunk, control_notice=_notice_chunk)" in src
+    acp_dir = pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "acp"
+    src = "".join(p.read_text(encoding="utf-8") for p in sorted(acp_dir.glob("client*.py")))
+    assert re.search(
+        r"yield AcpEvent\(\s*kind=kind,\s*text=chunk,\s*control_notice=_notice_chunk\b", src
+    ), "the forwarded chunk must carry the notice flag"
     assert re.search(
         r"if _compaction_event is not None:\s*\n"
         r"\s*yield _compaction_event\s*\n"
@@ -439,16 +444,21 @@ def test_the_dispatch_path_flags_the_notice_chunk_it_forwards() -> None:
 def _runner_source() -> str:
     """The runner's source text, for the invariants that can only be pinned there.
 
-    The terminal branch chain lives inside a ~5000-line async generator that no
-    unit test can drive, so the shape of the decision is what gets pinned.
+    The terminal branch chain lives in ``_turn_settle_answer`` (``segment_flush``), a
+    turn phase no unit test can drive, so the shape of the decision is what gets pinned.
     """
-    return (
+    runner = (
         pathlib.Path(__file__).resolve().parents[1]
         / "src"
         / "kiro_crew"
         / "dashboard"
         / "chat_runner.py"
-    ).read_text(encoding="utf-8")
+    )
+    return "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
+        if turn_file.name != "__init__.py"
+    )
 
 
 def test_a_notice_is_recorded_without_touching_the_text_path() -> None:
@@ -463,7 +473,7 @@ def test_a_notice_is_recorded_without_touching_the_text_path() -> None:
     """
     src = _runner_source()
     assert re.search(
-        r"\n\s*assistant_text \+= safe_chunk\n"
+        r"\n\s*(?:turn\.)?assistant_text \+= safe_chunk\n"
         r"\s*if event\.control_notice:\n"
         r"(?:\s*#[^\n]*\n)*"
         r"\s*_compaction_notice_chunks\.append\(safe_chunk\)",
@@ -472,20 +482,19 @@ def test_a_notice_is_recorded_without_touching_the_text_path() -> None:
 
 
 def test_the_answer_branch_tests_the_answer_not_the_raw_segment() -> None:
-    """The terminal chain head must test ``_answer_text``.
+    """The terminal chain tests only answer text emitted after compaction.
 
-    That branch is where "the turn answered" is decided and the post-compaction
-    continuation is an ``elif`` UNDER it, so testing the raw accumulator would
-    let a notice shadow the continuation and leave the request unanswered --
-    the hang this PR exists to fix.
+    Both the raw accumulator and ``_answer_text`` can contain a pre-compaction
+    fragment when the terminal is synthesized at turn end. Either would shadow
+    the continuation and leave the request unanswered.
     """
     src = _runner_source()
     assert re.search(
         r"\n\s*_answer_text = _answer_text_only\(\s*\n?"
-        r"\s*assistant_text, _compaction_notice_chunks\s*\n?\s*\)\n",
+        r"\s*(?:turn\.)?assistant_text, _compaction_notice_chunks\s*\n?\s*\)\n",
         src,
     ), "the answer text must be derived once, before the terminal chain"
-    chain_head = src.index("\n        if _answer_text:\n")
+    chain_head = re.search(r"\n(?:    ){1,2}if _branch_answer_text:\n", src).start()
     continuation_branch = src.index("should_continue_after_compaction(")
     assert chain_head < continuation_branch, (
         "the continuation branch is an elif below the answer branch -- if that "
@@ -494,7 +503,7 @@ def test_the_answer_branch_tests_the_answer_not_the_raw_segment() -> None:
     assert re.search(
         r"user_requested_compaction=\(first_word == \"/compact\"\),\n"
         r"(?:\s*#[^\n]*\n)*"
-        r"\s*final_segment_text=_answer_text,",
+        r"\s*final_segment_text=_continuation_answer_text,",
         src,
     ), "the post-compaction gate must be asked about the ANSWER text"
 
@@ -509,15 +518,15 @@ def test_a_notice_only_turn_is_still_flushed() -> None:
     """
     src = _runner_source()
     match = re.search(
-        r"\n\s*if assistant_text and not _answer_text:\n"
-        r"\s*_flush_text_stream\(\)\n"
-        r"\s*_flush_segment\(state, slot, assistant_text, broadcast=False\)\n",
+        r"\n\s*if (?:turn\.)?assistant_text and not _branch_answer_text:\n"
+        r"\s*_flush_text_stream\(turn\)\n"
+        r"\s*_flush_segment\(state, slot, (?:turn\.)?assistant_text, broadcast=False\)\n",
         src,
     )
     assert match, "a notice-only turn must flush its text in its own block"
     # ...and that block must sit ABOVE the chain, otherwise it is just another
     # branch competing with the continuation instead of falling through to it.
-    assert match.start() < src.index("\n        if _answer_text:\n"), (
+    assert match.start() < re.search(r"\n(?:    ){1,2}if _branch_answer_text:\n", src).start(), (
         "the notice-only flush must precede the terminal chain so the turn "
         "falls through to the post-compaction continuation"
     )
@@ -570,9 +579,8 @@ def test_no_chunk_path_drops_the_text_on_a_notice() -> None:
     pinned. Skipping the chunk means a misclassified line is discarded rather than
     discounted, and nothing downstream can recover it.
     """
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "acp" / "client.py"
-    ).read_text(encoding="utf-8")
+    acp = pathlib.Path(__file__).resolve().parents[1] / "src" / "kiro_crew" / "acp"
+    src = "".join(p.read_text(encoding="utf-8") for p in sorted(acp.glob("client*.py")))
     lines = src.splitlines()
     calls = [i for i, ln in enumerate(lines) if "_claude_compaction_event(chunk)" in ln]
     assert len(calls) == 3, f"expected the three chunk paths, found {len(calls)}"
@@ -590,28 +598,227 @@ def test_the_runner_only_clears_text_on_an_observed_terminal() -> None:
     It is yielded after every text chunk of the turn, so clearing
     ``assistant_text`` on it deletes whatever the backend produced after
     compacting -- the exact data loss this invariant rules out. Pinned in source
-    for the same reason as the sibling wiring test: the branch sits inside the
-    runner's single very long turn function.
+    for the same reason as the sibling wiring test: the branch sits inside a turn
+    phase, ``_on_compaction_status`` in ``chat_turn/session_events.py``.
 
     The window admits the leaked-tool-call scan that sits ahead of the reset (a
     leak streamed before the boundary is invisible to the turn-end gates once
     the accumulator is cleared, so the scan has to read it here). Only that
     named statement and comments are allowed through: an arbitrary statement
     between the guard and the reset still fails, which is what keeps this from
-    degrading into "the two lines appear somewhere in the file".
+    degrading into "the two lines appear somewhere in the file". The reset drops
+    the wire redactor's withheld tail first (``_drop_wire_tail``), which settles a
+    run held at an earlier tool call while the segment it may belong to is still
+    there to be cleared with it.
     """
-    src = (
+    runner = (
         pathlib.Path(__file__).resolve().parents[1]
         / "src"
         / "kiro_crew"
         / "dashboard"
         / "chat_runner.py"
-    ).read_text(encoding="utf-8")
+    )
+    src = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
+        if turn_file.name != "__init__.py"
+    )
     # A comment line, or a line of the boundary scan (its call is wrapped across
-    # three lines by the formatter, so each shape is named).
-    filler = r"(?:[ \t]*(?:#[^\n]*|_compaction_dropped_leak = [^\n]*|assistant_text|\))\n)*"
+    # three lines by the formatter, so each shape is named, and its result is copied
+    # onto the turn).
+    filler = (
+        r"(?:[ \t]*(?:#[^\n]*|(?:turn\.)?_compaction_dropped_leak = [^\n]*"
+        r"|(?:turn\.)?assistant_text|\))\n)*"
+    )
     assert re.search(
-        r"if not event\.synthesized:[ \t]*\n" + filler + r'[ \t]*assistant_text = ""[ \t]*\n'
-        r"[ \t]*_wsred\.reset\(\)",
+        r"if not event\.synthesized:[ \t]*\n" + filler + r"[ \t]*_drop_wire_tail\(turn\)[ \t]*\n"
+        r'[ \t]*(?:turn\.)?assistant_text = (?:""|_cleared_segment_text\(slot\))[ \t]*\n',
         src,
     ), "the compaction-terminal text reset must be guarded by `not event.synthesized`"
+
+
+_FRAGMENT = "The dashboard itself is current; nothing else outstanding and"
+
+
+async def _drive_compaction_turn(tmp_path: pathlib.Path, events: list[AcpEvent]):
+    """Run the real dashboard runner over *events*.
+
+    Returns the state, the slot and whether the one post-compaction
+    continuation was queued.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from test_dashboard_chat_empty_response import TestEmptyResponseRetry
+
+    from kiro_crew.dashboard.state import _ChatSlot
+
+    state, slot, client, run_chat = TestEmptyResponseRetry()._make_state_and_slot(tmp_path)
+
+    async def stream(_message: str):
+        for event in events:
+            yield event
+
+    client.stream = stream
+    client.stream_command = stream
+    queued: list[tuple[object, ...]] = []
+    original_queue_insert = _ChatSlot.queue_insert
+
+    def record_queue(self_slot, *args, **kwargs):
+        queued.append(args)
+        return original_queue_insert(self_slot, *args, **kwargs)
+
+    with (
+        patch.object(_ChatSlot, "queue_insert", record_queue),
+        patch(
+            "kiro_crew.dashboard.chat_runner._start_next_queued_turn",
+            new=AsyncMock(return_value=False),
+        ),
+    ):
+        await run_chat(state, slot, "finish the reply")
+        tasks = list(state._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    continued = any(len(args) > 1 and args[1] == _COMPACTION_CONTINUE_MSG for args in queued)
+    return state, slot, continued
+
+
+def _assistant_transcript(slot) -> str:
+    return "".join(
+        message.get("content", "")
+        for message in slot.messages
+        if message.get("role") == "assistant"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("post_compaction_text", "expects_continuation"),
+    [("", True), (" the rest of the answer.", False)],
+)
+async def test_runner_continues_a_pre_compaction_fragment(
+    tmp_path: pathlib.Path, post_compaction_text: str, expects_continuation: bool
+) -> None:
+    """The turn preserves every chunk and resumes an unfinished answer."""
+    from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+
+    events = [
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text=_FRAGMENT),
+        AcpEvent(kind=EVENT_COMPACTION_STATUS, text="started"),
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text="Compacting...", control_notice=True),
+    ]
+    if post_compaction_text:
+        events.append(AcpEvent(kind=EVENT_TEXT_CHUNK, text=post_compaction_text))
+    events += [
+        AcpEvent(kind=EVENT_COMPACTION_STATUS, text="completed", synthesized=True),
+        AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+    ]
+    state, slot, continued = await _drive_compaction_turn(tmp_path, events)
+
+    transcript = _assistant_transcript(slot)
+    assert _FRAGMENT in transcript
+    assert post_compaction_text in transcript
+    streamed = "".join(
+        call.args[1].get("content", "")
+        for call in state.broadcast_ws.call_args_list
+        if call.args and call.args[0] == "chat_chunk"
+    )
+    assert _FRAGMENT in streamed
+    assert post_compaction_text in streamed
+    assert continued is expects_continuation, slot.messages
+    if expects_continuation:
+        assert any(
+            "continuing automatically" in message.get("content", "") for message in slot.messages
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("post_tool_text", "expects_continuation"),
+    [("", True), ("Done.", False)],
+)
+async def test_a_segment_cut_after_compaction_is_judged_on_its_own_text(
+    tmp_path: pathlib.Path, post_tool_text: str, expects_continuation: bool
+) -> None:
+    """A tool call after the compaction starts a segment the gate judges whole.
+
+    The narration before the tool is flushed with the cut, so a turn that then
+    ends silently gave no answer after the compaction and is continued. An
+    answer after the tool counts in full, even one shorter than the fragment
+    that preceded the compaction.
+    """
+    from kiro_crew.acp.types import (
+        EVENT_COMPLETE,
+        EVENT_TEXT_CHUNK,
+        EVENT_TOOL_CALL,
+        EVENT_TOOL_RESULT,
+    )
+
+    assert len(post_tool_text) < len(_FRAGMENT)
+    events = [
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text=_FRAGMENT),
+        AcpEvent(kind=EVENT_COMPACTION_STATUS, text="started"),
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text="Compacting...", control_notice=True),
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text=" Let me run the tests."),
+        AcpEvent(
+            kind=EVENT_TOOL_CALL,
+            title="Reading test results",
+            tool_kind="read",
+            tool_input="{}",
+            tool_call_id="read-1",
+            tool_name="fs_read",
+            tool_identity_trusted=True,
+        ),
+        AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="read-1", tool_output="ok", tool_final=True),
+    ]
+    if post_tool_text:
+        events.append(AcpEvent(kind=EVENT_TEXT_CHUNK, text=post_tool_text))
+    events += [
+        AcpEvent(kind=EVENT_COMPACTION_STATUS, text="completed", synthesized=True),
+        AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN),
+    ]
+    _state, slot, continued = await _drive_compaction_turn(tmp_path, events)
+
+    transcript = _assistant_transcript(slot)
+    assert _FRAGMENT in transcript
+    assert "Let me run the tests." in transcript
+    assert post_tool_text in transcript
+    assert continued is expects_continuation, slot.messages
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_explained_before_compaction_takes_the_streamed_refusal_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refusal's explanation answers the turn wherever it streamed.
+
+    Streamed before a compaction, it still reaches the streamed-explanation refusal
+    card, which quotes it (``streamed_text``), not the no-text refusal branch, and
+    the turn is not continued.
+    """
+    from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_REFUSAL
+    from kiro_crew.dashboard import chat_runner
+
+    explanation = "I can't help with that request, because it asks for"
+    cards: list[dict] = []
+    real_card = chat_runner.refusal_card_text
+
+    def _recording_card(refusal, **kwargs):
+        cards.append(kwargs)
+        return real_card(refusal, **kwargs)
+
+    monkeypatch.setattr(chat_runner, "refusal_card_text", _recording_card)
+    events = [
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text=explanation),
+        AcpEvent(kind=EVENT_COMPACTION_STATUS, text="started"),
+        AcpEvent(kind=EVENT_TEXT_CHUNK, text="Compacting...", control_notice=True),
+        AcpEvent(kind=EVENT_COMPACTION_STATUS, text="completed", synthesized=True),
+        AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_REFUSAL),
+    ]
+    _state, slot, continued = await _drive_compaction_turn(tmp_path, events)
+
+    assert continued is False
+    assert [explanation in str(card.get("streamed_text") or "") for card in cards] == [True]
+    assert explanation in _assistant_transcript(slot)

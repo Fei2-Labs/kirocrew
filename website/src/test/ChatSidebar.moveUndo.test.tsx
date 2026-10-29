@@ -46,7 +46,16 @@ vi.mock('framer-motion', async () => {
       }
       return React.createElement(tag, { ...clean, ref }, props.children)
     })
-  const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
+  // ONE component per tag, as in framer-motion: a fresh `make(tag)` on every
+  // `motion.div` read is a new component type each render, which remounts the
+  // element and drops the focus the hold tests below put inside it.
+  const made = new Map<string, ReturnType<typeof make>>()
+  const motion = new Proxy({}, {
+    get: (_t, tag: string) => {
+      if (!made.has(tag)) made.set(tag, make(tag))
+      return made.get(tag)
+    },
+  })
   return {
     motion,
     AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
@@ -91,9 +100,9 @@ const folders: ChatFolder[] = [
   { id: OTHER, name: 'Later', order: 1 },
 ]
 
-function renderSidebar(folderId = '') {
+function renderSidebar(folderId = '', title = 'Session drag lands in the wrong folder') {
   const slot = {
-    key: SLOT_KEY, title: 'Session drag lands in the wrong folder', messages: 0,
+    key: SLOT_KEY, title, messages: 0,
     running: false, tags: [TAG], created: '', last_ts: '', folder_id: folderId,
   } as Slot
   const store = createTestStore({
@@ -168,6 +177,17 @@ describe('drag-to-folder undo', () => {
     await waitFor(() => expect(mocks.setSlotFolder).toHaveBeenCalledWith(SLOT_KEY, ARCHIVE))
     await waitFor(() => expect(barIn(container)).toBeTruthy())
     expect(barIn(container)!.textContent).toContain('Archive')
+  })
+
+  it('names an untitled session "Untitled session", never by its raw key (#23084)', async () => {
+    // The stored title of an untitled session can equal its key.
+    const { container } = renderSidebar('', SLOT_KEY)
+    dropSessionOnArchive(container)
+    await waitFor(() => expect(barIn(container)).toBeTruthy())
+    // The bar's hover sentence names the moved session.
+    const sentence = barIn(container)!.querySelector('[title]')!.getAttribute('title')
+    expect(sentence).toMatch(/Archive — Untitled session$/)
+    expect(sentence).not.toContain(SLOT_KEY)
   })
 
   it('undo posts the ORIGINAL folder back, then retires the offer', async () => {
@@ -349,6 +369,47 @@ describe('drag-to-folder undo', () => {
     expect(barIn(container)).toBeTruthy()
     act(() => { vi.advanceTimersByTime(600) })
     expect(barIn(container)).toBeNull()
+  })
+
+  // Pointer and focus are two owners of the hold. One flag for both let the
+  // pointer passing over the bar release a hold keyboard focus still owned, and
+  // a blur release one the resting pointer still owned.
+  it('keeps the bar while focus is on Undo after the pointer passes over it', async () => {
+    vi.useFakeTimers()
+    const { container } = renderSidebar()
+    dropSessionOnArchive(container)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    act(() => { undoButtonIn(container).focus() })
+    fireEvent.mouseEnter(barIn(container)!)
+    fireEvent.mouseLeave(barIn(container)!)
+    act(() => { vi.advanceTimersByTime(MOVE_UNDO_MS * 2) })
+    expect(barIn(container)).toBeTruthy()
+    expect(document.activeElement).toBe(undoButtonIn(container))
+    // Focus leaving is the release that remains, and it still works.
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    act(() => { outside.focus() })
+    act(() => { vi.advanceTimersByTime(MOVE_UNDO_MS + 50) })
+    expect(barIn(container)).toBeNull()
+    outside.remove()
+  })
+
+  it('keeps the bar while the pointer rests on it after focus leaves', async () => {
+    vi.useFakeTimers()
+    const { container } = renderSidebar()
+    dropSessionOnArchive(container)
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    fireEvent.mouseEnter(barIn(container)!)
+    act(() => { undoButtonIn(container).focus() })
+    act(() => { outside.focus() })
+    act(() => { vi.advanceTimersByTime(MOVE_UNDO_MS * 2) })
+    expect(barIn(container)).toBeTruthy()
+    fireEvent.mouseLeave(barIn(container)!)
+    act(() => { vi.advanceTimersByTime(MOVE_UNDO_MS + 50) })
+    expect(barIn(container)).toBeNull()
+    outside.remove()
   })
 
   it('sits above the Older sessions footer, not over it', async () => {

@@ -7,16 +7,20 @@
  * - Env var (kind='env'): <code> with popover showing per-shell export lines
  * - Unknown/malicious key: plain <code>, NO link
  */
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
+import type { MouseEvent } from 'react'
 import { Settings, Terminal } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import { resolveSettingRef } from './resolveSettingRef'
 import type { SchemaEntry } from './resolveSettingRef'
+import type { SettingEntry } from '../commandPalette/settingsTypes'
 import { useConfigSchema } from './useConfigSchema'
 import { i18nT } from '../../i18n/t'
-import { toPathSegment } from '../subNavParams'
+import { toPathSegment, SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS } from '../subNavParams'
 import { settingsPath } from '../settingsPath'
-import { CopyCommandButton } from './CopyCommandButton'
+import { CopyCommandButton, ConfigSetCommandRow } from './CopyCommandButton'
+import { useGuardedLeave } from '../NavigationLeaveGuard'
+import { useConfigSetHintsV1 } from '../../hooks/useGatewayPlatform'
 
 export interface SettingRefProps {
   /** The dotted config key (e.g. 'telemetry.beacon_enabled') or env var name. */
@@ -31,7 +35,7 @@ export interface SettingRefProps {
   valuePlaceholder?: string
 }
 
-import { ENV_SHELLS, cliValuePlaceholder, configSetCommand, VALID_ENV_KEY } from './envShellCommands'
+import { ENV_SHELLS, VALID_ENV_KEY } from './envShellCommands'
 import type { EnvIntent } from './envShellCommands'
 
 /**
@@ -43,12 +47,16 @@ import type { EnvIntent } from './envShellCommands'
  * Uses highlight=key:<configKey> format so the consumer (useSettingHighlight) can
  * resolve directly via data-setting-key attribute, avoiding the label round-trip.
  */
-function buildSettingsRoute(tab: string, configKey: string): string | null {
+function buildSettingsRoute(entry: SettingEntry, configKey: string): string | null {
   // toPathSegment rejects the dot-only values ('.', '..') whose percent-forms
   // the WHATWG URL parser still resolves as dot-segments — a crafted registry
   // tab must not mint a route that normalizes outside /settings.
-  if (!toPathSegment(tab)) return null
-  return settingsPath({ tab, highlight: `key:${configKey}` })
+  if (!toPathSegment(entry.tab)) return null
+  // Same second-level precedence settingsRoute applies: without it a SubNav
+  // tab opens its first page and the highlight never finds the control.
+  const params = entry.params ?? {}
+  const sub = params[SUBNAV_PARAM] ?? SUBNAV_LEGACY_PARAMS.map(k => params[k]).find(v => v != null) ?? null
+  return settingsPath({ tab: entry.tab, sub, highlight: `key:${configKey}` })
 }
 
 /**
@@ -69,9 +77,16 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
   // Use internal hook when no explicit schemaIndex prop is provided.
   // Hook is always called (React rules) but its result is only used when prop is absent.
   const hookSchema = useConfigSchema()
+  // The launcher prefixes the gateway resolved, read from the status the gate already
+  // cached; undefined for an older gateway, a non-owner, or a status not yet loaded.
+  const configSetHints = useConfigSetHintsV1()
   // When schemaIndexProp is passed (tests), treat it as the loaded schema.
   // When absent, use hook result (Map | undefined).
   const schemaIndex = schemaIndexProp !== undefined ? schemaIndexProp : hookSchema
+  // The UI-mode chip is a navigation surface like SettingsLink: a chip in a chat
+  // must ask the page first, or following it drops an unsent draft.
+  const navigate = useNavigate()
+  const guardedLeave = useGuardedLeave()
 
   // Env var mode: validate key at component boundary, then render popover
   if (kind === 'env') {
@@ -124,14 +139,21 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
   const resolution = resolveSettingRef(configKey, schemaIndex)
 
   if (resolution.mode === 'ui') {
-    const route = buildSettingsRoute(resolution.entry.tab, configKey)
+    const route = buildSettingsRoute(resolution.entry, configKey)
     if (!route) {
       // Safety fallback: cannot build a valid route
       return <code className="text-xs font-mono px-1 py-0.5 rounded bg-bg-accent border border-border">{configKey}</code>
     }
+    const onClick = (e: MouseEvent<HTMLAnchorElement>) => {
+      // A modified or non-primary click opens a new tab and unmounts nothing.
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+      e.preventDefault()
+      guardedLeave(() => navigate(route), route)
+    }
     return (
       <Link
         to={route}
+        onClick={onClick}
         className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs font-mono max-w-full [overflow-wrap:anywhere] bg-accent/10 border border-accent/30 text-accent hover:bg-accent/20 transition-colors no-underline"
         aria-label={i18nT('components.settingRef.openSettingsAriaLabel', { tab: translatedTabLabel(resolution.entry.tab), key: configKey })}
       >
@@ -142,8 +164,6 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
   }
 
   if (resolution.mode === 'file') {
-    const placeholder = cliValuePlaceholder(resolution.schemaEntry.type, valuePlaceholder)
-    const cliCommand = configSetCommand(configKey, placeholder)
     return (
       <Popover>
         <PopoverTrigger asChild>
@@ -156,13 +176,16 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
             <code>{configKey}</code>
           </button>
         </PopoverTrigger>
-        <PopoverContent className="w-72 p-3">
+        <PopoverContent className="w-96 max-w-[90vw] p-3">
           <p className="text-xs text-muted mb-2">{i18nT('components.settingRef.fileOnlyDescription')}</p>
-          <div className="flex items-center gap-1 mb-1.5">
-            <code className="text-xs bg-bg px-1.5 py-1 rounded border border-border block font-mono break-all flex-1">
-              {cliCommand}
-            </code>
-            <CopyCommandButton text={cliCommand} />
+          <div className="mb-1.5">
+            <ConfigSetCommandRow
+              configKey={configKey}
+              schemaType={resolution.schemaEntry.type}
+              initialValue={valuePlaceholder === 'value' ? undefined : valuePlaceholder}
+              valuePlaceholder={valuePlaceholder}
+              hints={configSetHints}
+            />
           </div>
           <p className="text-[11px] text-muted">{i18nT('components.settingRef.orEditConfigJson')}</p>
         </PopoverContent>

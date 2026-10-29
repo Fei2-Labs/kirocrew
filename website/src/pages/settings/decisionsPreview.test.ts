@@ -37,6 +37,8 @@ const OFF = {
   compaction: false,
   // And the recalled-memory scope.
   memoryText: false,
+  // And the wake-evidence scope.
+  nudgeEvidence: false,
   // And the prior-conversation ceiling reads 0, which is the least that can leave.
   historyBudget: 0,
 }
@@ -62,6 +64,9 @@ describe('readConsent', () => {
         compaction: false,
         // Nor to send the text of recalled memories.
         memoryText: false,
+        // Nor the evidence a waiting loop is watching, which comes from OTHER
+        // sessions and so is not covered by any yes about this one.
+        nudgeEvidence: false,
         // Nor does it consent to prior turns: an unmentioned ceiling is 0.
         historyBudget: 0,
       })
@@ -80,9 +85,17 @@ describe('readConsent', () => {
     // Independent fields: one granted must not read as the other.
     expect(readConsent({ ...base, tool_args: true }).memoryText).toBe(false)
     expect(readConsent({ ...base, memory_text: true }).toolArgs).toBe(false)
+    // The wake-evidence scope reads on the same terms, and is independent of every
+    // scope beside it: its rows come from sessions the loop WATCHES, so a yes about
+    // the owner's own conversation cannot stand for it.
+    expect(readConsent({ ...base, nudge_evidence: true }).nudgeEvidence).toBe(true)
+    expect(readConsent({ ...base, nudge_evidence: true }).compaction).toBe(false)
+    expect(readConsent({ ...base, compaction: true }).nudgeEvidence).toBe(false)
+    expect(readConsent({ ...base, tool_args: true }).nudgeEvidence).toBe(false)
     for (const sloppy of [undefined, false, 'true', 1, 0, null, [], {}]) {
       expect(readConsent({ ...base, tool_args: sloppy }).toolArgs).toBe(false)
       expect(readConsent({ ...base, memory_text: sloppy }).memoryText).toBe(false)
+      expect(readConsent({ ...base, nudge_evidence: sloppy }).nudgeEvidence).toBe(false)
     }
   })
 
@@ -146,6 +159,7 @@ describe('readDecisions', () => {
         toolArgs: false,
         compaction: false,
         memoryText: false,
+        nudgeEvidence: false,
         // Absent from this payload, so the ceiling reads as 0 — the shipped
         // default, and the least that can leave the machine.
         historyBudget: 0,

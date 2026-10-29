@@ -10,10 +10,14 @@
  * dispatches the same click as a discrete task OUTSIDE any render pass.
  *
  * So this script drives the real thing and fails loudly on any console error:
- *   open the crew editor -> open the Memory Store select -> pick the value another
- *   crew already uses -> assert the collision warning appears.
+ *   open a crewmate's editor -> open the Workspace select on General -> pick
+ *   another workspace -> assert the select committed it -> open the nested
+ *   Create Workspace dialog and assert Escape closes only that layer.
  *
- * Usage: node scripts/verify-crews-dialog-select.mjs
+ * Usage: npm run build && npm run verify:crews-dialog-select
+ *
+ * On demand only: no CI lane runs this script (a maintainer CI-policy decision,
+ * #10625). It guards nothing until someone runs it.
  */
 import { chromium } from 'playwright'
 import { serveDist } from './lib/serve-dist.mjs'
@@ -21,7 +25,7 @@ import { stubDashboardApi } from './lib/stub-dashboard-api.mjs'
 import { crewsApi } from './lib/crews-fixtures.mjs'
 
 const CREWS = [
-  { name: 'kirocrew', kiro_agent: 'kirocrew', workspace: 'core-ws', memory_store: 'core-mem' },
+  { name: 'default', kiro_agent: 'kirocrew', workspace: 'core-ws', memory_store: 'default' },
   { name: 'oncall', kiro_agent: 'kirocrew', workspace: 'oncall', memory_store: 'oncall-mem' },
 ]
 
@@ -37,35 +41,27 @@ async function main() {
   await stubDashboardApi(page, {
     extra: crewsApi({
       crews: CREWS,
-      defaultAgent: 'kirocrew',
-      memoryStores: ['core-mem', 'oncall-mem'],
+      defaultAgent: 'default',
+      memoryStores: ['default', 'oncall-mem'],
     }),
   })
 
   await page.goto(base + '/capabilities', { waitUntil: 'domcontentloaded' })
   await page.locator('[data-testid="crew-card"]').first().waitFor({ timeout: 15000 })
 
-  // Open the editor on the NON-default crew (it has a danger zone and its own stores).
-  await page.getByRole('button', { name: 'Edit crew oncall' }).click()
-  const dialog = page.getByRole('dialog', { name: 'Edit crew oncall' })
+  await page.getByRole('button', { name: 'Edit mate default' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Edit mate default' })
   await dialog.waitFor({ timeout: 15000 })
 
-  // No collision yet — oncall is on its own store.
-  if (await dialog.getByText(/Also used by/).count()) {
-    throw new Error('collision warning shown before any collision was created')
-  }
-
   // THE interaction under test: a Radix Select opened and committed from inside
-  // a Radix Dialog.
-  await dialog.getByRole('combobox', { name: 'Memory Store' }).click()
-  await page.getByRole('option', { name: 'core-mem' }).click()
-
-  // Picking the store kirocrew already uses must surface the warning, by name.
-  await dialog.getByText(/Also used by kirocrew/).waitFor({ timeout: 10000 })
+  // a Radix Dialog. The workspace picker is on General, the section the editor
+  // opens on (an existing crew's memory store is not editable).
+  await dialog.getByRole('combobox', { name: 'Workspace' }).click()
+  await page.getByRole('option', { name: 'oncall' }).click()
 
   // The select must have actually committed the new value, not just warned.
-  const committed = await dialog.getByRole('combobox', { name: 'Memory Store' }).textContent()
-  if (!committed?.includes('core-mem')) {
+  const committed = await dialog.getByRole('combobox', { name: 'Workspace' }).textContent()
+  if (!committed?.includes('oncall')) {
     throw new Error(`select did not commit: trigger reads "${committed}"`)
   }
 
@@ -75,15 +71,26 @@ async function main() {
   await page.getByText('+ New workspace…').click()
   const nested = page.getByRole('dialog', { name: 'Create Workspace' })
   await nested.waitFor({ timeout: 10000 })
+  // The closing select's menu is its own dismissable layer. Until it unmounts
+  // it can still be the top layer, and an Escape sent then closes it instead
+  // of the nested dialog, so the step failed at random.
+  await page.getByRole('listbox').waitFor({ state: 'detached', timeout: 10000 })
   await page.keyboard.press('Escape')
   await nested.waitFor({ state: 'detached', timeout: 10000 })
   if (!(await dialog.count())) {
     throw new Error('Escape on the nested dialog also closed the editor underneath')
   }
 
-  // And Escape again closes the editor itself.
+  // Escape again asks to close the editor itself. The workspace pick above is
+  // unsaved, so the editor first asks whether to discard it.
   await page.keyboard.press('Escape')
-  await dialog.waitFor({ state: 'detached', timeout: 10000 })
+  const discard = page.getByRole('dialog', { name: 'Discard unsaved changes and close the editor?' })
+  await discard.waitFor({ timeout: 10000 })
+  await discard.getByTestId('crew-sched-discard-confirm').click()
+  // A CSS locator, not getByRole: while another layer is open Radix marks the
+  // editor aria-hidden, and getByRole would then read it as already gone.
+  await page.locator('[data-testid="crew-editor-next-dialog"]')
+    .waitFor({ state: 'detached', timeout: 10000 })
 
   await browser.close()
   srv.close()
@@ -93,7 +100,7 @@ async function main() {
     console.error('CONSOLE ERRORS:\n' + real.join('\n'))
     process.exit(1)
   }
-  console.log('OK: select-in-dialog commits, collision warning fires, nested Escape scoped, 0 console errors')
+  console.log('OK: select-in-dialog commits, nested Escape scoped, discard confirm closes, 0 console errors')
 }
 
 main().catch(err => { console.error(err); process.exit(1) })

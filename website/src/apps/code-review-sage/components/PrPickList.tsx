@@ -31,7 +31,7 @@ import { i18nT } from '../../../i18n/t'
 import ErrorNotice from '../../../components/ErrorNotice'
 /** Reviewing / reviewed / stale / new, as a single honest chip. `reviewing`
  *  outranks the rest: it is what is happening to this PR right now. */
-function PrStateChip({ pr, reviewing }: { pr: RepoPr; reviewing?: boolean }) {
+function PrStateChip({ pr, reviewing, queued }: { pr: RepoPr; reviewing?: boolean; queued?: boolean }) {
   if (reviewing) {
     return (
       <span
@@ -53,12 +53,14 @@ function PrStateChip({ pr, reviewing }: { pr: RepoPr; reviewing?: boolean }) {
         title={pr.reviewed_at
       ? i18nT('apps.codeReviewSage.components.prPickList.reviewed_age', { age: relativeAge(pr.reviewed_at) })
       : i18nT('apps.codeReviewSage.components.prPickList.already_reviewed')}
-        className="inline-flex items-center text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-ok-subtle text-ok whitespace-nowrap"
+        className="inline-flex items-center text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-ok-subtle text-ok-text whitespace-nowrap"
       >
         {i18nT('apps.codeReviewSage.components.prPickList.reviewed')}
       </span>
     )
   }
+  // Queue rows carry no review history, so "new" would mark every one of them.
+  if (queued) return null
   if (pr.reviewed_stale) {
     return (
       <span
@@ -134,12 +136,26 @@ function PasteLinks() {
   )
 }
 
-export default function PrPickList() {
+/** Rows from outside the active repo (the review queue). When set, the list
+ *  needs no repo, filters on repo names too, and drops the repo-wide actions. */
+export interface PrSource {
+  prs: RepoPr[]
+  loading: boolean
+  error: Error | null
+  refresh: () => void
+  /** Shown under the actions, and in place of the repo list's empty text. */
+  note: string
+  emptyTitle: string
+}
+
+export default function PrPickList({ source }: { source?: PrSource }) {
+  const sage = useSage()
   const {
-    activeRepo, prs, prsLoading, prsError, refreshPrs,
-    startReview, startRepoReview, openAddRepos, selectedPr, selectPr,
-    reviewingChangeUrls,
-  } = useSage()
+    startReview, startRepoReview, openAddRepos, selectedPr, selectPr, reviewingChangeUrls,
+  } = sage
+  const activeRepo = source ? null : sage.activeRepo
+  const { prs, loading: prsLoading, error: prsError, refresh: refreshPrs } = source
+    ?? { prs: sage.prs, loading: sage.prsLoading, error: sage.prsError, refresh: sage.refreshPrs }
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const [query, setQuery] = useState('')
   const [labelFilter, setLabelFilter] = useState<Set<string>>(new Set())
@@ -149,7 +165,8 @@ export default function PrPickList() {
     if (!q) return prs
     return prs.filter((p) => p.title.toLowerCase().includes(q)
       || String(p.number).includes(q)
-      || (p.author ?? '').toLowerCase().includes(q))
+      || (p.author ?? '').toLowerCase().includes(q)
+      || (p.repo ?? '').toLowerCase().includes(q))
   }, [prs, query])
 
   // The label universe comes from the FULL list, never from the narrowed one, so
@@ -230,7 +247,7 @@ export default function PrPickList() {
     return next
   })
 
-  if (!activeRepo) {
+  if (!activeRepo && !source) {
     return (
       <div className="flex flex-col min-h-0 h-full">
         <EmptyState
@@ -260,7 +277,9 @@ export default function PrPickList() {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               aria-label={i18nT('apps.codeReviewSage.components.prPickList.filter_pull_requests')}
-              placeholder={i18nT('apps.codeReviewSage.components.prPickList.filter_pull_requests')}
+              placeholder={source
+                ? i18nT('apps.codeReviewSage.components.reviewQueue.filter_by_repo')
+                : i18nT('apps.codeReviewSage.components.prPickList.filter_pull_requests')}
               className="flex-1 min-w-0 bg-transparent border-0 py-1.5 text-[12.5px] text-text outline-hidden"
             />
           </div>
@@ -364,7 +383,7 @@ export default function PrPickList() {
             {i18nT('apps.codeReviewSage.components.prPickList.review_selected_count',
               { count: picked.size })}
           </button>
-          {confirmingAll ? (
+          {source ? null : confirmingAll ? (
             <>
               <span className="text-[12px] text-muted">
                 {i18nT('apps.codeReviewSage.components.prPickList.confirm_review_all',
@@ -407,7 +426,9 @@ export default function PrPickList() {
           )}
         </div>
 
-        <PasteLinks />
+        {source
+          ? <div className="text-[11.5px] text-muted">{source.note}</div>
+          : <PasteLinks />}
 
         {startRepoReview.data?.status === 'noop' && (
           <div className="text-[11.5px] text-muted">{startRepoReview.data?.message}</div>
@@ -427,7 +448,8 @@ export default function PrPickList() {
           style={{ scrollbarWidth: 'none' }}
         >
           {prsLoading && <ListSkeleton count={5} />}
-          {!prsLoading && filtered.length === 0 && (
+          {/* A queue that never loaded is not an empty one: the error says why. */}
+          {!prsLoading && filtered.length === 0 && !(source && prsError) && (
             <EmptyState
               icon={GitPullRequest}
               // Deliberately still keyed on the text box alone. Labels cannot be
@@ -446,7 +468,8 @@ export default function PrPickList() {
               // this line needs revisiting.
               title={query.trim()
                 ? i18nT('apps.codeReviewSage.components.prPickList.no_prs_match_filter')
-                : i18nT('apps.codeReviewSage.components.prPickList.no_open_prs_here')}
+                : source?.emptyTitle
+                  ?? i18nT('apps.codeReviewSage.components.prPickList.no_open_prs_here')}
             />
           )}
           {!prsLoading && filtered.map((pr) => {
@@ -458,8 +481,7 @@ export default function PrPickList() {
             const inputId = `sage-pr-${pr.number}`
             return (
               // The checkbox BATCHES; clicking the row OPENS the PR and its
-              // review. These were one <label> before, which meant there was no
-              // way to look at a PR without also queueing it.
+              // review, so a PR can be looked at without queueing it.
               <div
                 key={pr.url}
                 className={`flex items-start gap-2 rounded-lg border px-2.5 py-2 transition-colors ${
@@ -492,6 +514,7 @@ export default function PrPickList() {
                   className="flex-1 min-w-0 text-left bg-transparent cursor-pointer"
                 >
                   <span className="flex items-center gap-1.5 text-[11.5px] text-muted">
+                    {pr.repo && <span className="truncate">{pr.repo}</span>}
                     <span className="font-bold text-accent">#{pr.number}</span>
                     {pr.author && <span className="truncate">· {pr.author}</span>}
                     {pr.draft && (
@@ -505,7 +528,7 @@ export default function PrPickList() {
                     {pr.title}
                   </span>
                   <span className="block mt-1">
-                    <PrStateChip pr={pr} reviewing={reviewing} />
+                    <PrStateChip pr={pr} reviewing={reviewing} queued={!!source} />
                   </span>
                 </button>
               </div>

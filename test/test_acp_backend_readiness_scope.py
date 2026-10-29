@@ -28,7 +28,7 @@ class TestReadinessGateBackendScope:
         )
         consulted: list[bool] = []
 
-        async def _verified(_service: Any) -> bool:
+        async def _verified(_service: Any, **_kw: Any) -> bool:
             consulted.append(True)
             return False
 
@@ -49,7 +49,7 @@ class TestReadinessGateBackendScope:
         monkeypatch.setattr(kiro_readiness, "_configured_acp_backend", lambda: "", raising=True)
         consulted: list[bool] = []
 
-        async def _verified(_service: Any) -> bool:
+        async def _verified(_service: Any, **_kw: Any) -> bool:
             consulted.append(True)
             return False
 
@@ -71,7 +71,7 @@ class TestReadinessGateBackendScope:
         )
         consulted: list[bool] = []
 
-        async def _verified(_service: Any) -> bool:
+        async def _verified(_service: Any, **_kw: Any) -> bool:
             consulted.append(True)
             return False
 
@@ -93,7 +93,7 @@ class TestReadinessGateBackendScope:
         monkeypatch.setattr(kiro_readiness, "_configured_acp_backend", lambda: "", raising=True)
         consulted: list[bool] = []
 
-        async def _verified(_service: Any) -> bool:
+        async def _verified(_service: Any, **_kw: Any) -> bool:
             consulted.append(True)
             return False
 
@@ -120,7 +120,7 @@ class TestReadinessGateBackendScope:
         )
         probed: list[bool] = []
 
-        async def _verified(_service: Any) -> bool:
+        async def _verified(_service: Any, **_kw: Any) -> bool:
             probed.append(True)
             return False
 

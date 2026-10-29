@@ -1,4 +1,4 @@
-"""Malformed-entry preservation across the sibling JSON stores in state.py.
+"""Malformed-entry preservation across the sibling JSON stores in state_parts/sidebar_stores.py.
 
 The ``load_*`` functions drop rows the active list cannot
 use but must keep them verbatim in an ``_unparsed_*`` list so the next
@@ -255,7 +255,7 @@ class TestTagsPreservation:
         )
         st = self._fresh()
         st.load_tags()
-        # The chat_tags.py write path captures an active snapshot then persists.
+        # The chat_tags_store.py write path captures an active snapshot then persists.
         snapshot = [dict(t) for t in st._tags]
         st.save_tags_snapshot(snapshot)
         on_disk = json.loads(path.read_text(encoding="utf-8"))

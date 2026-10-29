@@ -25,6 +25,9 @@ import {
   PROVIDER_TRANSCRIBE,
   STREAM_ERROR_CODE_KEY,
   UNAVAILABLE_CODE_KEY,
+  downloadLabel,
+  localeLanguage,
+  nextTranscribeLanguages,
   streamErrorMessage,
 } from '../lib/sttProviders'
 import EN_MANUAL from '../i18n/locales/en.manual.json'
@@ -45,7 +48,7 @@ describe('provider labels', () => {
     // it exists to catch — including a retired provider left behind, which would
     // keep offering a label for something the backend refuses.
     expect(Object.keys(PROVIDER_LABEL_KEY).sort()).toEqual(
-      [PROVIDER_APPLE, PROVIDER_LOCAL, PROVIDER_TRANSCRIBE].sort(),
+      [PROVIDER_APPLE, PROVIDER_LOCAL, 'off', PROVIDER_TRANSCRIBE].sort(),
     )
   })
 
@@ -104,8 +107,12 @@ describe('availability reasons', () => {
       'stt_disabled',
       'stt_extra_missing',
       'stt_import_failed',
+      'stt_load_crashed',
       'stt_model_missing',
+      'stt_native_probe_crashed',
       'stt_no_wheel_for_platform',
+      'stt_provider_off',
+      'stt_unsupported_cpu',
     ])
   })
 
@@ -153,20 +160,64 @@ describe('the download prompt', () => {
   })
 })
 
+describe('the line for a model the session is waiting on', () => {
+  it('describes a load differently from a transfer', () => {
+    // Both reach the user on one channel, and the two sentences must not collapse
+    // into each other: a load has no bytes, so a shared label would report a
+    // permanent zero percent while the model was in fact coming up normally.
+    const loading = downloadLabel({ done: 0, total: 0, stage: 'preparing' })
+    const fetching = downloadLabel({ done: 0, total: 0, stage: 'downloading' })
+    expect(loading).not.toBe(fetching)
+    expect(loading).not.toContain('{{')
+  })
+
+  it('reads an absent stage as the transfer the settings panel polls', () => {
+    // That caller has real bytes and passes no stage, so the default has to stay
+    // the transfer sentence.
+    expect(downloadLabel({ done: 1, total: 2 })).toBe(
+      downloadLabel({ done: 1, total: 2, stage: 'downloading' }),
+    )
+  })
+
+  it('is written in every shipped catalog', () => {
+    // A missing key renders the dotted path into the recording chrome, at the one
+    // moment there is no transcript to look at instead.
+    const seen: string[] = []
+    for (const [code, bundle] of Object.entries(RUNTIME_CATALOGS)) {
+      const root = (bundle as { translation: unknown }).translation as {
+        lib?: { sttProviders?: Record<string, string> }
+      }
+      const value = root.lib?.sttProviders?.loading_speech_model
+      expect(value, code).toBeTruthy()
+      expect(value, code).not.toContain('{{')
+      seen.push(code)
+    }
+    // Guard the guard: an empty catalog map would make the loop vacuously pass.
+    expect(seen.length).toBeGreaterThanOrEqual(SUPPORTED_LANGUAGES.length)
+  })
+})
+
 describe('a streaming session that failed', () => {
   /** A key's leaf name under `lib.sttProviders`. */
   const streamLeaf = (key: string) => key.replace('lib.sttProviders.', '')
 
   it('names every code the streaming socket can only report itself', () => {
-    // `_CODE_MAX_DURATION` and `_CODE_SESSION_FAILED` in `dashboard/stt_stream.py`,
-    // `CODE_DECODE_FAILED` in `stt/engine.py`, plus `stt_model_missing`, which the
-    // socket also sends and which needs different words below the composer than in
-    // the settings panel. An omission renders the backend's English sentence.
+    // `_CODE_MAX_DURATION`, `_CODE_SESSION_FAILED`, `_CODE_VOCABULARY_REJECTED`,
+    // `_CODE_SDK_OUTDATED` and `_CODE_AWS_ACCESS_DENIED` in
+    // `dashboard/stt_stream.py`, `CODE_DECODE_FAILED` in
+    // `stt/engine.py`, plus `stt_model_missing`, which the socket also sends and which
+    // needs different words below the composer than in the settings panel, and
+    // `stt_consent_required`, the AWS consent gate's refusal of a Transcribe stream.
+    // An omission renders the backend's English sentence.
     expect(Object.keys(STREAM_ERROR_CODE_KEY).sort()).toEqual([
+      'stt_aws_access_denied',
+      'stt_consent_required',
       'stt_decode_failed',
       'stt_max_duration_exceeded',
       'stt_model_missing',
       'stt_session_failed',
+      'stt_transcribe_sdk_outdated',
+      'stt_transcribe_vocabulary_rejected',
     ])
   })
 
@@ -197,6 +248,15 @@ describe('a streaming session that failed', () => {
     expect(modelMissing).not.toBe(manualStt.unavailable_model_missing)
   })
 
+  it('localises the consent-gate refusal instead of showing the gateway reason', () => {
+    // The AWS consent gate refuses with an English reason as the frame's advisory
+    // `message`; it is re-checked live, so an expired credential lands here too, not
+    // only a first use. The localised notice has to win over that English detail.
+    expect(streamErrorMessage('stt_consent_required', 'AWS access was refused: foo')).toBe(
+      manualStreamErrors[streamLeaf(STREAM_ERROR_CODE_KEY.stt_consent_required)],
+    )
+  })
+
   it('falls back to the availability vocabulary for a setup failure', () => {
     // A missing extra or an unusable wheel travels through the socket unchanged, and
     // its remedy is the same sentence the settings panel already renders — so it is
@@ -219,5 +279,26 @@ describe('a streaming session that failed', () => {
     // The caller supplies the generic last resort, so an empty answer has to be
     // falsy for that `||` to reach it.
     expect(streamErrorMessage('', '')).toBe('')
+  })
+})
+
+describe('the mixed-language candidates', () => {
+  it('reads the language part of a locale, including a three-letter one', () => {
+    expect(localeLanguage('vi-VN')).toBe('vi')
+    expect(localeLanguage('ckb-IQ')).toBe('ckb')
+  })
+
+  it('appends a ticked language in the order it was ticked', () => {
+    expect(nextTranscribeLanguages(['vi-VN'], 'en-US', true)).toEqual(['vi-VN', 'en-US'])
+  })
+
+  it('swaps a second dialect of a picked language in, at the end', () => {
+    // A stream may carry one dialect per language: en-US beside en-GB fails it.
+    expect(nextTranscribeLanguages(['en-US', 'vi-VN'], 'en-GB', true)).toEqual(['vi-VN', 'en-GB'])
+  })
+
+  it('drops an unticked language and never duplicates a ticked one', () => {
+    expect(nextTranscribeLanguages(['vi-VN', 'en-US'], 'vi-VN', false)).toEqual(['en-US'])
+    expect(nextTranscribeLanguages(['vi-VN', 'en-US'], 'en-US', true)).toEqual(['vi-VN', 'en-US'])
   })
 })

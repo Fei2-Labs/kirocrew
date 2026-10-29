@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import stat
 from dataclasses import dataclass
@@ -12,13 +13,16 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from kiro_crew import platform_compat, windows_acl
-from kiro_crew.atomic_write import atomic_write, fsync_dir
+from kiro_crew.atomic_write import atomic_write, fsync_dir, read_bytes_with_retry
 from kiro_crew.execution_context import (
+    MEMBER_ON_GLOBAL_REASON,
+    MEMBER_WITHOUT_IDENTITY_REASON,
     ExecutionContext,
     MemoryStoreRef,
     bind_session_execution,
     execution_from_record,
     stricter_memory_mode,
+    unavailable_reason,
     validate_execution,
 )
 
@@ -27,15 +31,38 @@ class WorkflowMemoryError(RuntimeError):
     """A run's original execution context is unavailable."""
 
 
+class WorkflowAllocatorError(WorkflowMemoryError):
+    """The run-id allocator refused; no memory store was involved."""
+
+
 _RUN_ID_MAX = (1 << 64) - 1
 _RUN_ID_ENABLED = b"1"
 
+logger = logging.getLogger(__name__)
 
-def _allocator_path(path: Path) -> None:
+
+def _allocator_path(path: Path, anchor: Path) -> None:
+    """Refuse *path* when a link BELOW *anchor* bends where it lands.
+
+    *anchor* is the parent of the workflows directory. A link at or above it
+    is the operator's own layout -- a symlinked ``$HOME`` (``/home/u ->
+    /local/home/u``), a data home relocated onto another disk -- the same two
+    layouts ``atomic_write``'s parent-link guard trusts. Every directory below
+    the anchor is one the allocator creates itself, so a link there was
+    planted: the resolved path must equal the resolved anchor joined with the
+    lexical names below it. Containment would not do -- a link onto another
+    directory inside the same tree resolves to a contained path while still
+    landing the counter somewhere never named.
+    """
+    try:
+        below = path.relative_to(anchor).parts
+    except ValueError:
+        raise WorkflowAllocatorError("Workflow allocator path is redirected") from None
+    expected = anchor.resolve().joinpath(*below)
     if platform_compat.strip_extended_length_prefix(
         path.resolve()
-    ) != platform_compat.strip_extended_length_prefix(path):
-        raise WorkflowMemoryError("Workflow allocator path is redirected")
+    ) != platform_compat.strip_extended_length_prefix(expected):
+        raise WorkflowAllocatorError("Workflow allocator path is redirected")
 
 
 def _allocator_owner(path: Path, info: os.stat_result) -> None:
@@ -46,31 +73,33 @@ def _allocator_owner(path: Path, info: os.stat_result) -> None:
         try:
             security = windows_acl.describe(path)
             # Elevated Windows creation defaults to the local Administrators
-            # owner. The same SID on a share belongs to a different machine.
-            owned = bool(sid) and (
-                security.owner_sid == sid
-                or (security.owner_sid == "S-1-5-32-544" and security.volume_is_local)
+            # owner. The same SID on a share belongs to a different machine. The
+            # owner-trust rule is shared with the relocated scratch-root adoption
+            # (:func:`kiro_crew.config.paths.scratch_root_owner_refusal`) so the two
+            # cannot drift.
+            owned = windows_acl.owner_is_trusted_allocator(
+                security.owner_sid, security.volume_is_local, sid or ""
             )
         except windows_acl.AclUnavailable as exc:
-            raise WorkflowMemoryError("Workflow allocator owner is unavailable") from exc
+            raise WorkflowAllocatorError("Workflow allocator owner is unavailable") from exc
     if not owned:
-        raise WorkflowMemoryError("Workflow allocator owner is invalid")
+        raise WorkflowAllocatorError("Workflow allocator owner is invalid")
 
 
-def _allocator_file(path: Path, fd: int) -> None:
+def _allocator_file(path: Path, fd: int, anchor: Path) -> None:
     """Validate the opened object, not just its pre-open spelling."""
-    _allocator_path(path)
+    _allocator_path(path, anchor)
     info = os.fstat(fd)
     named = path.lstat()
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not os.path.samestat(info, named):
-        raise WorkflowMemoryError("Workflow allocator file identity is invalid")
+        raise WorkflowAllocatorError("Workflow allocator file identity is invalid")
     _allocator_owner(path, info)
     # On Windows owner-only access is a DACL, not synthesized st_uid/mode bits.
     platform_compat.restrict_to_owner(path)
 
 
-def _read_run_high_water(path: Path) -> int | None:
-    _allocator_path(path)
+def _read_run_high_water(path: Path, anchor: Path) -> int | None:
+    _allocator_path(path, anchor)
     try:
         fd = os.open(
             path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -78,7 +107,7 @@ def _read_run_high_water(path: Path) -> int | None:
     except FileNotFoundError:
         return None
     try:
-        _allocator_file(path, fd)
+        _allocator_file(path, fd, anchor)
         raw = os.read(fd, 257)
     finally:
         os.close(fd)
@@ -96,11 +125,11 @@ def _read_run_high_water(path: Path) -> int | None:
             raise ValueError("invalid high water")
         return row["high_water"]
     except (ValueError, TypeError) as exc:
-        raise WorkflowMemoryError("Workflow allocator counter is invalid") from exc
+        raise WorkflowAllocatorError("Workflow allocator counter is invalid") from exc
 
 
-def _write_run_high_water(path: Path, value: int) -> None:
-    _allocator_path(path)
+def _write_run_high_water(path: Path, value: int, anchor: Path) -> None:
+    _allocator_path(path, anchor)
     atomic_write(
         path,
         json.dumps({"version": 1, "high_water": value}),
@@ -120,37 +149,42 @@ def allocate_run_id(floor: int = 0) -> str:
     after the witness, missing/corrupt counters fail closed, never reseed.
     """
     if type(floor) is not int or not 0 <= floor <= _RUN_ID_MAX:
-        raise WorkflowMemoryError("Workflow allocator recovery floor is invalid")
+        raise WorkflowAllocatorError("Workflow allocator recovery floor is invalid")
     try:
         from kiro_crew.workflows.store import default_workflows_dir
 
         root = default_workflows_dir().absolute()
+        # Links at or above the workflows directory's parent are the operator's
+        # layout; the directory itself and both files below it must be real.
+        anchor = root.parent
         for directory in (root.parent, root):
-            _allocator_path(directory)
+            _allocator_path(directory, anchor)
             platform_compat.make_owner_only_dir(directory)
             _allocator_owner(directory, directory.stat())
             platform_compat.restrict_dir_to_owner(directory)
         lock = root / ".run-id.lock"
         counter = root / ".run-id.json"
-        _allocator_path(lock)
+        _allocator_path(lock, anchor)
         # Never truncate/replace/unlink the lock inode, including during init.
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = platform_compat.open_create_or_existing(
+            lock, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
         try:
             with platform_compat.file_lock(fd, exclusive=True, required=True):
-                _allocator_file(lock, fd)
+                _allocator_file(lock, fd, anchor)
                 os.lseek(fd, 0, os.SEEK_SET)
                 witness = os.read(fd, 2)
                 if witness not in (b"", _RUN_ID_ENABLED):
-                    raise WorkflowMemoryError("Workflow allocator witness is invalid")
-                high = _read_run_high_water(counter)
+                    raise WorkflowAllocatorError("Workflow allocator witness is invalid")
+                high = _read_run_high_water(counter, anchor)
                 if high is None:
                     if witness:
-                        raise WorkflowMemoryError("Workflow allocator counter is missing")
+                        raise WorkflowAllocatorError("Workflow allocator counter is missing")
                     high = floor
                 if not witness:
                     # Re-sync even an existing initial counter: its previous
                     # publisher may have died between replace and directory sync.
-                    _write_run_high_water(counter, high)
+                    _write_run_high_water(counter, high, anchor)
                     os.lseek(fd, 0, os.SEEK_SET)
                     if os.write(fd, _RUN_ID_ENABLED) != 1:
                         raise OSError("short workflow allocator witness write")
@@ -164,14 +198,14 @@ def allocate_run_id(floor: int = 0) -> str:
                 while high < _RUN_ID_MAX:
                     high += 1
                     candidate = f"wf_{high:06d}"
-                    _write_run_high_water(counter, high)
+                    _write_run_high_water(counter, high, anchor)
                     return candidate
-                _write_run_high_water(counter, high)
-                raise WorkflowMemoryError("Workflow run ID space is exhausted")
+                _write_run_high_water(counter, high, anchor)
+                raise WorkflowAllocatorError("Workflow run ID space is exhausted")
         finally:
             os.close(fd)
     except OSError as exc:
-        raise WorkflowMemoryError("Workflow allocator I/O failed") from exc
+        raise WorkflowAllocatorError("Workflow allocator I/O failed") from exc
 
 
 @overload
@@ -195,7 +229,7 @@ def read_binding(run_id: str, *, required: bool = False, record=None) -> dict[st
 
         path = WorkflowRunStore()._path_for(run_id)
         try:
-            record = json.loads(path.read_text(encoding="utf-8"))
+            record = json.loads(read_bytes_with_retry(path).decode("utf-8"))
         except FileNotFoundError:
             if required:
                 raise WorkflowMemoryError("Workflow run is unavailable") from None
@@ -260,10 +294,6 @@ class WorkflowScope:
     origin: str
     memory_mode: str = "persistent"
     execution_context: ExecutionContext | None = None
-
-    @property
-    def anchor(self) -> str:
-        return f"wf-scope:{self.run_id}"
 
     @classmethod
     async def admit(
@@ -390,17 +420,81 @@ def admission_errors(function):
     async def guarded(*args, **kwargs):
         try:
             return await function(*args, **kwargs)
-        except (WorkflowMemoryError, UnknownMemoryStore):
-            message = "Workflow memory is unavailable; no Global fallback was used."
-            return {
-                "ok": False,
-                "error": message,
-                "errors": [message],
-                "code": "workflow_memory_unavailable",
-                "admission_rejected": True,
-            }
+        except WorkflowAllocatorError as exc:
+            # The run-id counter refused before any memory store was consulted,
+            # so the memory refusal text below would misname the failure.
+            _log_refusal("Workflow run identity allocation refused", exc)
+            message = f"Workflow run identity could not be allocated: {exc}"
+            code = "workflow_allocator_unavailable"
+        except (WorkflowMemoryError, UnknownMemoryStore) as exc:
+            _log_refusal("Workflow admission refused", exc)
+            message = memory_refusal_message(exc)
+            code = "workflow_memory_unavailable"
+        return {
+            "ok": False,
+            "error": message,
+            "errors": [message],
+            "code": code,
+            "admission_rejected": True,
+        }
 
     return guarded
+
+
+_GENERIC_MEMORY_REFUSAL = "Workflow memory is unavailable; no Global fallback was used."
+_WORKFLOW_HEADLINE_REFUSAL = "Workflow memory is unavailable; Global was not used"
+_MEMBER_BINDING_REASONS = frozenset({MEMBER_ON_GLOBAL_REASON, MEMBER_WITHOUT_IDENTITY_REASON})
+_MEMBER_BINDING_REMEDY = (
+    "To run workflows here, start a chat with no mate picked, or pick a mate "
+    "that has its own memory (every new mate gets one)."
+)
+
+
+def _named_reason(exc: BaseException) -> str:
+    """The reason *exc* names when its raise site fixes the text, else ``""``.
+
+    A ``WorkflowMemoryError`` is raised with fixed text, and so is an
+    execution-context refusal (see ``unavailable_reason``). Any other
+    memory-store refusal can format an ``OSError`` or sqlite error, and the path
+    it names, into its text, so it answers ``""`` and stays in the log only.
+    """
+    if isinstance(exc, WorkflowMemoryError):
+        text = str(exc).strip().rstrip(".").strip()
+        return "" if text == _WORKFLOW_HEADLINE_REFUSAL else text
+    return unavailable_reason(exc)
+
+
+def memory_refusal_message(exc: BaseException) -> str:
+    """The caller-facing text of a memory-class admission refusal.
+
+    Names the refusal's own reason, then the no-Global-fallback guarantee. A
+    memory-store refusal it wraps adds its reason in parentheses, so a wrapper
+    such as "malformed execution context" still says what was wrong underneath.
+    Only a reason fixed at its raise site is named: any other cause, such as an
+    ``OSError`` or a memory-store refusal that formats one, stays in the log
+    only. A refusal caused by the crewmate's own memory binding also names the
+    two ways to run a workflow. A refusal that names no reason keeps the generic
+    text.
+    """
+    reasons = [_named_reason(exc), unavailable_reason(exc.__cause__)]
+    named = list(dict.fromkeys(reason for reason in reasons if reason))
+    if not named:
+        return _GENERIC_MEMORY_REFUSAL
+    reason = named[0] if len(named) == 1 else f"{named[0]} ({named[1]})"
+    message = f"Workflow memory is unavailable: {reason}. No Global fallback was used."
+    if _MEMBER_BINDING_REASONS.intersection(named):
+        message = f"{message} {_MEMBER_BINDING_REMEDY}"
+    return message
+
+
+def _log_refusal(what: str, exc: BaseException) -> None:
+    """Log the refusal with its cause; the caller's text names only a reason
+    fixed at its raise site."""
+    cause = exc.__cause__
+    if cause is not None:
+        logger.warning("%s: %s (%s: %s)", what, exc, type(cause).__name__, cause)
+    else:
+        logger.warning("%s: %s", what, exc)
 
 
 class TaskSnapshotError(OSError):
@@ -423,12 +517,38 @@ def write_task_snapshot(public_path: Path, payload: str, *, writer: Any = atomic
     writer(public_path, json.dumps(persistent), fsync=True)
 
 
-def read_task_snapshot(public_path: Path, *, public_payload=None) -> str:
+def _is_legacy_task_reference(row: dict) -> bool:
+    """The exact row 0.7.0-insider.1 to .5 wrote for a member task: an id and the marker."""
+    return (
+        set(row) == {"task_id", "private_payload"}
+        and row["private_payload"] is True
+        and isinstance(row["task_id"], str)
+        and bool(row["task_id"])
+    )
+
+
+def read_task_snapshot(
+    public_path: Path, *, public_payload=None, legacy_references: list[dict]
+) -> str:
+    """Return the restorable rows; a legacy ``private_payload`` row is never one.
+
+    0.7.0-insider.1 to .5 kept a member task's payload in a hidden sidecar and
+    left only ``{"task_id": ..., "private_payload": true}`` here. That row is
+    never hydrated and never run under Global. The caller's *legacy_references*
+    collects rows of exactly that shape, which are left out of the returned rows
+    instead of refusing the registry; any other ``private_payload`` row still
+    refuses it.
+    """
     rows = json.loads(read_task_registry(public_path) if public_payload is None else public_payload)
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ValueError("Task registry must contain records")
+    restorable = []
     for row in rows:
         if row.get("private_payload"):
-            raise TaskSnapshotError("Unsupported task record; Global was not used")
+            if not _is_legacy_task_reference(row):
+                raise TaskSnapshotError("Unsupported task record; Global was not used")
+            legacy_references.append(row)
+            continue
         execution_from_record(row, required=False)
-    return json.dumps(rows)
+        restorable.append(row)
+    return json.dumps(restorable)

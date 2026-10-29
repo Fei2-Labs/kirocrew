@@ -13,662 +13,62 @@ metadata address onto one dotted-quad, and the metadata check built on it.
 The environment tier lives in ``denied_rules``: it resolves catalog rule ids to
 row objects at import time, which is a dependency on the catalog rather than on
 anything here.
+
+The URL rule tables (``exfil_url_rules``), the OAuth endpoint set and shape
+diagnostics (``exfil_oauth``) and the data-egress command gate (``exfil_bash``)
+live in owner modules beside this one. This module is the import path of every
+name they define, and keeps the URL classifier, the blocked-link records, the
+URL redactor, the OAuth credential diagnosis and the IMDS folder and check.
+A read through this module answers with the owner's object, and a write
+reaches every owner that binds the name (:mod:`kiro_crew._facade_mirror`).
 """
 
 from __future__ import annotations
 
-import fnmatch
+import ast
+import contextlib
+import contextvars
+import importlib as _importlib
 import ipaddress
-import json
 import logging
 import re
 import socket
-import string
-import uuid
-from collections import Counter
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+import sys as _sys
+import time  # noqa: F401  (a test clock installs here and the mirror carries it to exfil_oauth)
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
-from kiro_crew.credential_patterns import AWS_KEY_ID
-from kiro_crew.sel import SecurityEvent, SecurityEventLog
-
-from .redaction import _contains_fixed_credential, _text_contains_bare_secret
+from .exfil_oauth import (  # noqa: F401
+    _OAUTH_EXTENSION_HOST_RE,
+    _OAUTH_QUERY_PARAMS,
+    OAuthUrlCredentialDiagnostic,
+    _approved_oauth_authorization_endpoint,
+    _oauth_diagnostic,
+    _oauth_query_diagnostic,
+    _oauth_url_payload_diagnostic,
+    _valid_oauth_extension_path,
+)
+from .exfil_url_rules import (
+    _EXFIL_PATTERNS,
+    _EXFIL_PERCENT_RE,
+    _EXFIL_QUERY_MIN_LEN,
+    _HARD_CREDENTIAL_RE,
+    _MAX_URL_DECODE_PASSES,
+    _URL_RE,
+    _heavy_percent_encoding,
+    _is_safe_presigned,
+)
+from .redaction import (
+    _contains_fixed_credential,
+    _text_contains_bare_secret,
+    redact_credentials,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
-
-
-def exfil_query_min_len() -> int:
-    """Public view of the long-query exfiltration threshold (chars)."""
-    return _EXFIL_QUERY_MIN_LEN
-
-
-# ── URL Exfiltration Detection ──
-# Detects URLs whose path/query contain credential-like data. We flag the
-# PAYLOAD, not the destination: any URL with secrets is suspicious regardless of
-# host. The general redactors have one narrow carve-out for companion-supplied
-# exact tenant hosts. A separate, opt-in carve-out for standard OAuth params is
-# available only to ``oauth_url_contains_credential`` on the ACP banner path.
-# Fixed/encoded credentials and heavy percent encoding remain unconditional.
-
-# Host group (group 1) matches THREE host shapes so a raw-IP exfil destination
-# is not silently skipped: a DNS name with a letter TLD, a raw
-# IPv4 literal (``192.168.1.1``, incl. link-local/metadata ``169.254.169.254``),
-# or a bracketed IPv6 literal (``[::1]``, ``[fd00::1]``). The prior regex required
-# a ``.<letters>`` TLD, so ``http://169.254.169.254/latest/…/<secret>`` never
-# matched _URL_RE and its path/query was never scanned. Group 3 stays the
-# path+query so the scan/redact call sites are unchanged.
-_URL_RE = re.compile(
-    r"https?://"
-    r"("
-    r"[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}"  # DNS name with a letter TLD
-    r"|\d{1,3}(?:\.\d{1,3}){3}"  # raw IPv4 literal
-    r"|\[[0-9A-Fa-f:.]+\]"  # bracketed IPv6 literal (incl. IPv4-mapped ::ffff:d.d.d.d)
-    # Group 3 = path AND/OR query. It must start with ``/`` (path) OR ``?``
-    # (a query attached directly to the host, no path segment). The prior
-    # ``/[...]*`` required a leading slash, so ``https://host?leak=<secret>``
-    # yielded group(3)=None and both scan/redact bailed on ``qmark == -1``,
-    # never inspecting the query — a real exfil bypass. ``[/?]`` admits both;
-    # the ``path_and_query.find("?")`` split at the call sites is unchanged.
-    r")(:\d+)?([/?][^\s)\"'>]*)?"
-)
-
-# Query string length threshold — normal URLs rarely exceed this
-_EXFIL_QUERY_MIN_LEN = 200
-
-# Patterns that indicate secrets or encoded data in query params
-_EXFIL_PATTERNS = re.compile(
-    r"(?:"
-    r"[A-Za-z0-9+/=]{40,}"  # base64-like blob (40+ chars)
-    r"|%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}"  # heavy URL-encoding (20+ encoded chars)
-    f"|{AWS_KEY_ID}"  # AWS access key ID (shared spelling: credential_patterns)
-    r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
-    r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
-    r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
-    r")",
-    re.IGNORECASE,
-)
-
-# Heavy URL-encoding detector — the same "20+ consecutive percent-encoded
-# octets" branch carved out of _EXFIL_PATTERNS. This stays UNCONDITIONAL: the
-# context-specific exemptions below skip only the base64-blob and query-length
-# heuristics (which false-positive on legitimate document pointers or banner
-# state/PKCE), NOT this detector, so a heavily encoded payload is still caught.
-_EXFIL_PERCENT_RE = re.compile(
-    r"%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){20,}",
-    re.IGNORECASE,
-)
-
-# Percent-decoding passes applied when re-scanning a URL for encoded
-# credentials. More than one is required because a double-encoded payload
-# survives a single pass; the bound stops a deliberately over-encoded URL from
-# making the scan loop indefinitely.
-_MAX_URL_DECODE_PASSES = 3
-
-_OAUTH_DIAGNOSTIC_PARAMETER_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
-_OAUTH_URL_SYMBOLS = frozenset("-._~:/?#[]@!$&'()*+,;=")
-
-
-@dataclass(frozen=True)
-class OAuthUrlShapeProfile:
-    """Non-sensitive character-class profile for one rejected URL component."""
-
-    length: int
-    ascii_uppercase: int
-    ascii_lowercase: int
-    digits: int
-    percent_signs: int
-    symbols: int
-    other: int
-
-
-@dataclass(frozen=True)
-class OAuthUrlCredentialDiagnostic:
-    """Privacy-safe explanation of the first OAuth URL rejection rule."""
-
-    rule: str
-    component: str
-    parameter: str | None
-    shape: OAuthUrlShapeProfile
-
-    def as_dict(self) -> dict[str, object]:
-        return asdict(self)
-
-
-def _oauth_char_class(char: str) -> str:
-    if char in string.ascii_uppercase:
-        return "ascii_uppercase"
-    if char in string.ascii_lowercase:
-        return "ascii_lowercase"
-    if char in string.digits:
-        return "digits"
-    if char == "%":
-        return "percent_signs"
-    if char in _OAUTH_URL_SYMBOLS:
-        return "symbols"
-    return "other"
-
-
-def _oauth_shape_profile(value: str) -> OAuthUrlShapeProfile:
-    counts = Counter(_oauth_char_class(char) for char in value)
-    return OAuthUrlShapeProfile(
-        length=len(value),
-        ascii_uppercase=counts["ascii_uppercase"],
-        ascii_lowercase=counts["ascii_lowercase"],
-        digits=counts["digits"],
-        percent_signs=counts["percent_signs"],
-        symbols=counts["symbols"],
-        other=counts["other"],
-    )
-
-
-def _safe_oauth_parameter_name(name: str | None) -> str | None:
-    if (
-        name is None
-        or name not in _OAUTH_QUERY_PARAMS
-        or not _OAUTH_DIAGNOSTIC_PARAMETER_RE.fullmatch(name)
-    ):
-        return None
-    if _contains_fixed_credential(name) or _text_contains_bare_secret(name):
-        return None
-    return name
-
-
-def _oauth_diagnostic(
-    rule: str,
-    component: str,
-    value: str,
-    *,
-    parameter: str | None = None,
-) -> OAuthUrlCredentialDiagnostic:
-    return OAuthUrlCredentialDiagnostic(
-        rule=rule,
-        component=component,
-        parameter=_safe_oauth_parameter_name(parameter),
-        shape=_oauth_shape_profile(value),
-    )
-
-
-def _oauth_query_diagnostic(
-    rule: str,
-    query: str,
-    *,
-    predicate: Callable[[str], bool] | None = None,
-    decoder: Callable[[str], str] | None = None,
-    fallback: bool = True,
-) -> OAuthUrlCredentialDiagnostic | None:
-    segments = query.split("&")
-    for segment in segments:
-        key, separator, value = segment.partition("=")
-        if not separator:
-            continue
-        candidate = decoder(value) if decoder is not None else value
-        if predicate is not None and predicate(candidate):
-            return _oauth_diagnostic(rule, "query_parameter", candidate, parameter=key)
-        if predicate is None and len(segments) == 1:
-            return _oauth_diagnostic(rule, "query_parameter", candidate, parameter=key)
-    if not fallback:
-        return None
-    target = decoder(query) if decoder is not None else query
-    return _oauth_diagnostic(rule, "query", target)
-
-
-def _oauth_url_payload_diagnostic(
-    rule: str,
-    url: str,
-    target: str,
-    predicate: Callable[[str], bool],
-    *,
-    decoder: Callable[[str], str] | None = None,
-) -> OAuthUrlCredentialDiagnostic:
-    try:
-        parsed = urlparse(url)
-        if parsed.query:
-            query_diagnostic = _oauth_query_diagnostic(
-                rule,
-                parsed.query,
-                predicate=predicate,
-                decoder=decoder,
-                fallback=False,
-            )
-            if query_diagnostic is not None:
-                return query_diagnostic
-        for component, value in (
-            ("scheme", parsed.scheme),
-            ("authority", parsed.netloc),
-            ("path", parsed.path),
-            ("path_params", parsed.params),
-            ("fragment", parsed.fragment),
-        ):
-            candidate = decoder(value) if decoder is not None else value
-            if candidate and predicate(candidate):
-                return _oauth_diagnostic(rule, component, candidate)
-    except Exception:
-        pass
-    return _oauth_diagnostic(rule, "url", target)
-
-
-# Exact, code-owned OAuth authorization endpoints whose standard front-channel
-# parameters may legitimately contain high-entropy state/PKCE values on the ACP
-# banner-safety path. This is deliberately NOT configurable and never uses
-# suffix matching: an agent-owned
-# setting or ``api.notion.com.attacker.example`` must not lower the redaction
-# ceiling. Paths are exact and case-sensitive; explicit ports and HTTP are not
-# exempted.
-_OAUTH_AUTHORIZATION_ENDPOINTS: frozenset[tuple[str, str]] = frozenset(
-    {
-        ("accounts.google.com", "/o/oauth2/v2/auth"),
-        ("api.notion.com", "/v1/oauth/authorize"),
-        ("app.asana.com", "/-/oauth_authorize"),
-        ("auth.atlassian.com", "/authorize"),
-        ("github.com", "/login/oauth/authorize"),
-        ("linear.app", "/oauth/authorize"),
-        ("login.microsoftonline.com", "/common/oauth2/v2.0/authorize"),
-        ("slack.com", "/oauth/v2/authorize"),
-        # MCP-server authorization servers. A provider's *MCP* server usually
-        # runs its own authorization server, distinct from the classic web-OAuth
-        # endpoint above -- so the pairs above are NOT sufficient for the
-        # Connections launch set. Each pair below was taken from the provider's
-        # own advertised `authorization_endpoint` (RFC 8414 metadata reached via
-        # RFC 9728 protected-resource discovery from the registry's mcp_url) and
-        # independently corroborated by an authorize URL kiro-cli actually
-        # minted. A launch provider missing from this set cannot be connected at
-        # all: its banner fails closed with "authentication failed: URL
-        # contained credential or exfiltration pattern", which is how the gap
-        # was found. Every entry added to the Connections registry needs its
-        # MCP authorization server here too.
-        ("access.stripe.com", "/mcp/oauth2/authorize"),
-        ("gitlab.com", "/oauth/authorize"),
-        ("mcp.auth.mail.superhuman.com", "/oauth2/authorize"),
-        ("mcp.linear.app", "/authorize"),
-        # Miro's authorization_endpoint per its RFC 8414 metadata at
-        # https://mcp.miro.com/.well-known/oauth-authorization-server. Also a
-        # Connections registry entry; without this pair the fail-closed banner
-        # blocks every attempt to connect the Miro remote MCP server.
-        ("mcp.miro.com", "/authorize"),
-        ("mcp.notion.com", "/authorize"),
-        ("vercel.com", "/oauth/authorize"),
-        # Industry-baseline batches (registry entries, all launch-gated). Each
-        # pair is the ``authorization_endpoint`` from the issuer's RFC 8414
-        # document, the issuer itself reached via RFC 9728 discovery from the
-        # registry ``mcp_url`` by the L0 probe. The kiro-cli-minted
-        # corroboration the launch set carries lands with each provider's
-        # manual launch-gate check.
-        ("airtable.com", "/oauth2/v1/authorize"),
-        ("api.supabase.com", "/v1/oauth/authorize"),
-        ("auth.prisma.io", "/authorize"),
-        ("bindings.mcp.cloudflare.com", "/oauth/authorize"),
-        ("huggingface.co", "/oauth/authorize"),
-        ("mcp.amplitude.com", "/authorize"),
-        ("mcp.canva.com", "/authorize"),
-        ("mcp.neon.tech", "/api/authorize"),
-        ("mcp.paypal.com", "/authorize"),
-        ("mcp.postman.com", "/authorize"),
-        ("mcp.sentry.dev", "/oauth/authorize"),
-        ("mcp.squareup.com", "/authorize"),
-        ("mcp.webflow.com", "/oauth/authorize"),
-        ("mcp.zapier.com", "/oauth/authorize"),
-        ("netlify-mcp.netlify.app", "/oauth-server/auth"),
-        ("www.dropbox.com", "/oauth2/authorize"),
-        # Two issuers advertise a consent page on a different host than the
-        # issuer itself: Figma's MCP authorization server (issuer api.figma.com)
-        # sends the user to www.figma.com, Mixpanel's (issuer
-        # mcp.mixpanel.com/mcp) to mixpanel.com. Only the consent host is
-        # listed, because the banner gate keys on the URL the browser opens;
-        # the registry test maps issuer host to consent host for these two.
-        ("www.figma.com", "/oauth/mcp"),
-        ("mixpanel.com", "/oauth/authorize"),
-    }
-)
-
-# OAuth 2.0 / OIDC front-channel parameters whose values are expected to be
-# opaque and high-entropy. The banner-only exemption is valid ONLY at an exact
-# endpoint above. Every unknown parameter still receives the full query
-# heuristics, even when it shares an otherwise-approved authorization URL.
-_OAUTH_QUERY_PARAMS = frozenset(
-    {
-        "access_type",
-        "acr_values",
-        "allow_signup",
-        "audience",
-        "client_id",
-        "code_challenge",
-        "code_challenge_method",
-        "display",
-        "domain_hint",
-        "id_token_hint",
-        "login",
-        "login_hint",
-        "max_age",
-        "nonce",
-        "prompt",
-        "redirect_uri",
-        "request_uri",
-        "resource",
-        "response_mode",
-        "response_type",
-        "scope",
-        "state",
-        "team",
-        "ui_locales",
-        "user_scope",
-    }
-)
-
-# ── Operator-owned OAuth endpoint extension (keystone oauth_endpoints.json) ──
-# ``_OAUTH_AUTHORIZATION_ENDPOINTS`` above is deliberately code-owned and
-# exact-match, but that leaves no remedy short of a code release when a user's
-# identity provider (Okta, Auth0, self-hosted OIDC, tenant-scoped Entra) is not
-# in the launch set: its real consent URL routinely exceeds the query-length
-# heuristic and the gate fails closed. The extension below restores an
-# OPERATOR-owned escape hatch without weakening the ceiling for the agent:
-#
-# * the file lives on ``_CREW_SECRET_LEAVES`` (read+write keystone), so the
-#   agent can neither read nor author its own trust widening;
-# * a missing/unreadable/corrupt/non-object file yields the EMPTY set — a
-#   mangled file must never widen trust (same posture as
-#   ``computer_use.enable_state.load_state``);
-# * every entry is strictly validated (exact host+path, no wildcards, no
-#   ports/userinfo/percent-escapes, no ``..``), and invalid entries are
-#   SKIPPED with a warning rather than failing the whole file;
-# * HTTPS-only / no-explicit-port stays enforced by the gate logic at both
-#   call sites and is NOT relaxable via the file;
-# * the exemption granted is identical to the builtin set's: only the
-#   base64-blob/query-length heuristics on known ``_OAUTH_QUERY_PARAMS`` are
-#   skipped — fixed-credential patterns, heavy percent-encoding, userinfo,
-#   fragments, backslashes, and unknown-param heuristics remain unconditional.
-_ENDPOINT_EXTENSION_ENTRIES_KEY = "additional_authorization_endpoints"
-
-# Bounds the accepted set AND the validation walk (the entry list is sliced to
-# this before iteration), so a pathological file cannot amplify into an
-# unbounded parse/warn loop or turn the endpoint check into a large probe.
-_ENDPOINT_EXTENSION_CAP = 50
-
-# Strict DNS-name shape for an operator entry, matched against the
-# lowercase-normalized host: dot-separated LDH labels ending in a letter TLD.
-# The letter-TLD requirement rejects raw IPv4 literals; the character class
-# rejects wildcards, schemes, ports, userinfo, percent-escapes, whitespace,
-# backslashes, and bracketed IPv6. Empty labels reject leading/trailing dots.
-# The lookahead bounds total length to the DNS maximum.
-_OAUTH_EXTENSION_HOST_RE = re.compile(
-    r"\A(?=.{1,253}\Z)"
-    r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
-    r"(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*"
-    r"\.[a-z]{2,}\Z"
-)
-
-# Paths are exact and case-sensitive (same semantics as the builtin set).
-_OAUTH_EXTENSION_PATH_MAX_LEN = 512
-
-# Rejected anywhere in an operator path entry: query/fragment/path-param
-# delimiters and percent-escapes would let one entry smuggle structure the
-# exact-match comparison is not built to normalize, and ``..`` plus backslash
-# invite parser-differential games. The comparison is byte-exact, so a benign
-# provider path never needs any of these.
-_OAUTH_EXTENSION_PATH_BAD = (";", "?", "#", "%", "\\", "..")
-
-
-def _valid_oauth_extension_path(path: str) -> bool:
-    """True when *path* is safe to compare exactly against a consent URL path."""
-    if not path.startswith("/") or len(path) > _OAUTH_EXTENSION_PATH_MAX_LEN:
-        return False
-    if any(marker in path for marker in _OAUTH_EXTENSION_PATH_BAD):
-        return False
-    return not any(ch.isspace() for ch in path)
-
-
-# Memo for the parsed extension file, keyed on the file's identity + stat
-# (path, mtime_ns, size) so a hand-edit takes effect on the next check without
-# a gateway restart, while repeated checks against an unchanged file cost one
-# ``stat`` instead of a read+parse+validate pass. (path, None) memoizes the
-# absent-file case; any stat/read error bypasses the memo and fails soft.
-_OAUTH_EXTENSION_MEMO: dict[tuple[str, tuple[int, int] | None], frozenset[tuple[str, str]]] = {}
-
-
-def _load_operator_oauth_endpoints() -> frozenset[tuple[str, str]]:
-    """Load the operator's OAuth-endpoint extension set (fail-soft to EMPTY).
-
-    Reads ``<config_dir>/oauth_endpoints.json`` and returns the validated
-    ``(lowercase host, exact path)`` pairs. Absent, unreadable, corrupt, or
-    non-object files — and any entry that fails the strict per-entry
-    validation — yield nothing: a mangled extension file must never widen
-    trust. The ``config.loader`` import stays function-local to keep this
-    module's import graph independent of the loader's: ``config/loader.py``
-    itself imports ``security`` symbols function-locally to avoid a cycle, and
-    a module-level import here would quietly re-arm that cycle the moment the
-    loader hoists its own.
-    """
-    from kiro_crew.config import loader as config_loader
-
-    try:
-        path = config_loader.oauth_endpoints_path()
-        try:
-            stat = path.stat()
-            stat_key: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
-        except FileNotFoundError:
-            stat_key = None
-        memo_key = (str(path), stat_key)
-        cached = _OAUTH_EXTENSION_MEMO.get(memo_key)
-        if cached is not None:
-            return cached
-        if stat_key is None:
-            _OAUTH_EXTENSION_MEMO.clear()
-            _OAUTH_EXTENSION_MEMO[memo_key] = frozenset()
-            return frozenset()
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.debug("oauth_endpoints.json unreadable; ignoring extension file", exc_info=True)
-        return frozenset()
-
-    approved = _validate_operator_oauth_entries(raw)
-    # One live entry per file: the memo never outgrows a handful of keys, but a
-    # test suite that rewrites the file hundreds of times should not accrete.
-    _OAUTH_EXTENSION_MEMO.clear()
-    _OAUTH_EXTENSION_MEMO[memo_key] = approved
-    return approved
-
-
-def _validate_operator_oauth_entries(raw: object) -> frozenset[tuple[str, str]]:
-    """Strictly validate a parsed extension document into ``(host, path)`` pairs."""
-    if not isinstance(raw, dict):
-        logger.warning("oauth_endpoints.json is not a JSON object; ignoring it")
-        return frozenset()
-    entries = raw.get(_ENDPOINT_EXTENSION_ENTRIES_KEY)
-    if not isinstance(entries, list):
-        if entries is not None:
-            logger.warning(
-                "oauth_endpoints.json: %r is not a list; ignoring it",
-                _ENDPOINT_EXTENSION_ENTRIES_KEY,
-            )
-        return frozenset()
-    if len(entries) > _ENDPOINT_EXTENSION_CAP:
-        logger.warning(
-            "oauth_endpoints.json: %d entries exceed the cap (%d); extra entries ignored",
-            len(entries),
-            _ENDPOINT_EXTENSION_CAP,
-        )
-
-    approved: set[tuple[str, str]] = set()
-    for entry in entries[:_ENDPOINT_EXTENSION_CAP]:
-        host = entry.get("host") if isinstance(entry, dict) else None
-        path = entry.get("path") if isinstance(entry, dict) else None
-        if not isinstance(host, str) or not isinstance(path, str):
-            logger.warning(
-                "oauth_endpoints.json: skipping malformed entry (need host+path strings)"
-            )
-            continue
-        host_norm = host.lower()
-        if not _OAUTH_EXTENSION_HOST_RE.fullmatch(host_norm) or not _valid_oauth_extension_path(
-            path
-        ):
-            # The host is operator-authored config, not secret material, and
-            # naming it is what makes the warning actionable.
-            logger.warning(
-                "oauth_endpoints.json: skipping invalid endpoint entry host=%r", host[:64]
-            )
-            continue
-        approved.add((host_norm, path))
-    return frozenset(approved)
-
-
-# Per-process dedupe for the extension-used audit event, so repeated checks of
-# the same URL (every banner emit/redraw re-validates) do not spam the SEL.
-_OAUTH_EXTENSION_AUDITED: set[tuple[str, str]] = set()
-
-
-def _emit_oauth_extension_used_event(host: str, path: str) -> None:
-    """SEL-audit that an OPERATOR extension entry approved a consent endpoint.
-
-    Best-effort: an audit failure must not break the user's ability to
-    authorize their MCP server — the operator explicitly allowlisted the
-    endpoint, so the approval stands regardless of audit success.
-    """
-    if (host, path) in _OAUTH_EXTENSION_AUDITED:
-        return
-    _OAUTH_EXTENSION_AUDITED.add((host, path))
-    try:
-        # Function-local for the same loader-cycle reason as
-        # _load_operator_oauth_endpoints.
-        from kiro_crew.config import loader as config_loader
-
-        SecurityEventLog().log(
-            SecurityEvent(
-                event_id=uuid.uuid4().hex[:16],
-                timestamp=datetime.now(tz=timezone.utc).isoformat(),
-                event_type="oauth_endpoint_extension_used",
-                caller_identity="",
-                agent="kirocrew",
-                source="security",
-                operation="oauth_banner_check",
-                outcome="allowed",
-                resources=f"{host}{path}",
-                metadata={
-                    "host": host,
-                    "path": path,
-                    "file": str(config_loader.oauth_endpoints_path()),
-                    "mechanism": "OAUTH_ENDPOINT_EXTENSION",
-                },
-            )
-        )
-    except Exception:
-        logger.debug(
-            "SEL audit failed for oauth_endpoint_extension_used (allow stands)",
-            exc_info=True,
-        )
-
-
-def _approved_oauth_authorization_endpoint(host: str, path: str) -> bool:
-    """Exact-match endpoint approval for the banner-only OAuth entropy carve-out.
-
-    Union of the code-owned builtin set and the operator's keystone extension,
-    computed at check time so a hand-edited file takes effect without a
-    restart. The builtin set is consulted first so the common providers never
-    touch the disk; an approval that came from an operator entry is SEL-audited
-    (deduped per process). Callers keep enforcing HTTPS-only / no-explicit-port
-    — this helper only answers endpoint identity.
-    """
-    key = (host.lower(), path)
-    if key in _OAUTH_AUTHORIZATION_ENDPOINTS:
-        return True
-    if key in _load_operator_oauth_endpoints():
-        _emit_oauth_extension_used_event(*key)
-        return True
-    return False
-
-
-# S3 presigned URLs contain X-Amz-Signature (a 64-char hex string) that
-# matches the base64-like blob pattern above.  These are intentional
-# time-limited access tokens, not leaked credentials.  Skip the exfil
-# check when ALL standard presigned-URL query params are present on an
-# amazonaws.com domain.  Values are validated to prevent spoofing.
-_S3_PRESIGNED_RE = re.compile(
-    r"X-Amz-Algorithm=AWS4-HMAC-SHA256"
-    f".*X-Amz-Credential={AWS_KEY_ID}"  # shared spelling: credential_patterns
-    r"(?:%2F|/)"
-    r".*X-Amz-Expires=\d{1,6}"
-    r".*X-Amz-Signature=[0-9a-f]{64}",
-    re.IGNORECASE,
-)
-
-# Only these parameter keys are allowed in a presigned URL.  Any extra
-# keys cause the fast-path to reject, falling through to normal checks.
-_S3_PRESIGNED_PARAMS = frozenset(
-    {
-        "X-Amz-Algorithm",
-        "X-Amz-Credential",
-        "X-Amz-Date",
-        "X-Amz-Expires",
-        "X-Amz-SignedHeaders",
-        "X-Amz-Signature",
-        "X-Amz-Security-Token",
-    }
-)
-
-
-# Structural validators for presigned param values that would otherwise
-# false-positive against _EXFIL_PATTERNS.  Each value is validated rather
-# than exempted, so attacker-controlled data cannot be smuggled through.
-_STS_TOKEN_RE = re.compile(r"^(?:FwoGZX|IQoJb3JpZ2lu)[A-Za-z0-9+/=%]{1,2000}$")
-_CREDENTIAL_RE = re.compile(
-    f"^{AWS_KEY_ID}"  # shared spelling: credential_patterns
-    r"(?:%2F|/)[0-9]{8}"
-    r"(?:%2F|/)[a-z0-9-]+(?:%2F|/)s3(?:%2F|/)aws4_request$"
-)
-_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
-
-_STRUCTURAL_VALIDATORS = {
-    "X-Amz-Credential": _CREDENTIAL_RE,
-    "X-Amz-Signature": _SIGNATURE_RE,
-    "X-Amz-Security-Token": _STS_TOKEN_RE,
-}
-
-
-def _is_safe_presigned(domain: str, query: str) -> bool:
-    """Return True if the URL is a valid S3 presigned URL with no extra parameters."""
-    if not domain.endswith(".amazonaws.com"):
-        return False
-    if not _S3_PRESIGNED_RE.search(query):
-        return False
-    params = parse_qs(query, keep_blank_values=True)
-    if not _S3_PRESIGNED_PARAMS.issuperset(params.keys()):
-        return False
-    # Structurally validate params that would false-positive against
-    # _EXFIL_PATTERNS.  No values are fully exempt — each is checked.
-    for key, values in params.items():
-        validator = _STRUCTURAL_VALIDATORS.get(key)
-        if validator:
-            for val in values:
-                if not validator.match(val):
-                    return False
-        else:
-            for val in values:
-                if _EXFIL_PATTERNS.search(val):
-                    return False
-    return True
-
-
-# Hard, unambiguous credential markers scanned across the FULL URL path+query
-# — a real AWS key / SSH-or-PEM header / Slack token in a URL is
-# exfil even to an otherwise-safe host, and even with no ``?`` query (secret in
-# the PATH). Distinct from the broader _EXFIL_PATTERNS base64/length heuristics,
-# which stay query-only (long base64 PATH segments — CDN asset ids, git object
-# hashes — are benign).
-_HARD_CREDENTIAL_RE = re.compile(
-    r"(?:"
-    f"{AWS_KEY_ID}"  # AWS access key ID (shared spelling: credential_patterns)
-    r'|(?:SecretAccessKey|aws_secret_access_key)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    r'|(?:SessionToken|aws_session_token)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    r'|(?:AccessKeyId|aws_access_key_id)["\']?\s*[:=]\s*["\']?[^\s"\',}]+'
-    r"|(?:ssh-rsa|ssh-ed25519)[\s+%]"  # SSH public key
-    r"|BEGIN[\s+%](?:RSA|DSA|EC|OPENSSH)[\s+%]PRIVATE[\s+%]KEY"  # private key header
-    r"|xox[bpas]-[0-9a-zA-Z-]+"  # Slack token
-    r")",
-    re.IGNORECASE,
-)
 
 
 def _exempt_exact_hosts() -> frozenset[str]:
@@ -793,9 +193,9 @@ def _slack_manifest_payload_re() -> re.Pattern[str] | None:
 
     Derived from ``slack_manifest.stripped_template()`` — the SAME procedure both
     emitters use to build the payload — so the accepted payload cannot drift from
-    the emitted one. Every ``{{ALIAS}}`` after the first must be the same alias
-    (backreference), so a payload that varies them is rejected. Returns None when
-    the template cannot be read, which fails closed (no exemption).
+    the emitted one. Every ``{{ALIAS}}`` after the first is a backreference, and
+    ``{{COMMAND}}`` a group the caller pins to ``slash_command(alias)``, so neither
+    can vary. Returns None when the template cannot be read (fails closed).
     """
     if _slack_manifest_re_slot:
         return _slack_manifest_re_slot[0]
@@ -806,17 +206,16 @@ def _slack_manifest_payload_re() -> re.Pattern[str] | None:
         rendered = slack_manifest.stripped_template()
         placeholder_token = slack_manifest.ALIAS_PLACEHOLDER
         alias_body = slack_manifest.ALIAS_PATTERN
+        command_slot = (re.escape(slack_manifest.COMMAND_PLACEHOLDER), "(?P<command>[a-z0-9_-]+)")
     except Exception:
-        rendered = ""
-        placeholder_token = ""
-        alias_body = ""
+        rendered = placeholder_token = alias_body = ""
     if rendered and placeholder_token in rendered:
         parts = rendered.split(placeholder_token)
-        pattern = re.escape(parts[0])
+        pattern = re.escape(parts[0]).replace(*command_slot)
         for index, part in enumerate(parts[1:]):
             slot = f"(?P<alias>{alias_body})" if index == 0 else "(?P=alias)"
-            pattern += slot + re.escape(part)
-        compiled = re.compile(pattern)
+            pattern += slot + re.escape(part).replace(*command_slot)
+        compiled = re.compile(pattern) if command_slot[1] in pattern else None
     _slack_manifest_re_slot.append(compiled)
     return compiled
 
@@ -860,7 +259,7 @@ def _kirocrew_slack_app_link_alias(
     if pattern is None:
         return None
     match = pattern.fullmatch(payloads[0])
-    if match is None:
+    if match is None or match["command"] != slack_manifest.slash_command(match["alias"]):
         return None
     return match.group("alias")
 
@@ -950,8 +349,9 @@ def _exfil_url_warning(
 
     # Heavy percent-encoding is always suspicious, including inside a standard
     # OAuth parameter at an approved endpoint. It runs before either
-    # host-sensitive heuristic exemption below.
-    if _EXFIL_PERCENT_RE.search(path_and_query):
+    # host-sensitive heuristic exemption below. Words encoded in the PATH are
+    # not counted, except on the OAuth admission gate, which stays strict.
+    if _heavy_percent_encoding(path_and_query, allow_path_text=not allow_oauth_entropy):
         trace("exfil_percent_encoding")
         return f"Suspicious URL with credential-like query data: {domain}"
 
@@ -1078,45 +478,524 @@ def scan_exfiltration_urls(text: str) -> list[str]:
 EXFILTRATION_REDACTION_TAG_PREFIX = "[REDACTED: suspicious URL to "
 
 
-def redact_exfiltration_urls(text: str) -> tuple[str, list[str]]:
-    """Scan and redact suspicious exfiltration URLs from text.
+#: What one message may retain about blocked links. The bound belongs at the
+#: RETENTION points rather than at a render site, because the store IS the
+#: transcript line: a record is cheap to write there, and every render of that
+#: message re-validates and re-serializes whatever the line holds. A path longer
+#: than this is dropped rather than truncated, which keeps the rule "only what
+#: the removers pass is kept" from acquiring a second, weaker branch. Records
+#: past the count are not recorded and the overflow is counted in one log line.
+MAX_BLOCKED_LINKS_PER_MESSAGE = 32
+MAX_BLOCKED_LINK_PATH_CHARS = 256
+#: A query longer than this did not come from a message a client can render, so
+#: a count above it marks the record as malformed rather than merely large.
+MAX_BLOCKED_LINK_QUERY_CHARS = 100_000
+#: The longest full address a record keeps for Open once / Copy. A longer one is
+#: withheld with the reason ``length`` rather than truncated, because a truncated
+#: address opens a different page than the one the agent wrote.
+MAX_BLOCKED_LINK_URL_CHARS = 8192
+#: Why a record carries no full address. ``credential``: some decoded form of it
+#: is changed by the credential remover, so opening it would send that secret,
+#: which is the one request the gate exists to stop. ``length``: it is longer
+#: than ``MAX_BLOCKED_LINK_URL_CHARS``.
+_BLOCKED_LINK_URL_WITHHELD = frozenset({"credential", "length"})
 
-    Returns (cleaned_text, list_of_warnings).
+
+def _credential_clean(value: str) -> bool:
+    """Whether the credential remover leaves *value* unchanged in every form.
+
+    Checked as written AND in every bounded percent-decoded form. A partially
+    encoded credential (``ghp%5F...``) is unchanged by the remover as literal text
+    while a browser decodes it back into the secret the moment it is requested.
+    Saturation fails closed: a value still decodable when the budget runs out was
+    never seen in plaintext by anything.
     """
-    warnings = scan_exfiltration_urls(text)
-    if not warnings:
-        return text, []
+    if redact_credentials(value)[0] != value:
+        return False
+    decoded = value
+    for _ in range(_MAX_URL_DECODE_PASSES):
+        nxt = unquote_plus(decoded)
+        if nxt == decoded:
+            return True
+        decoded = nxt
+        if redact_credentials(decoded)[0] != decoded:
+            return False
+    return unquote_plus(decoded) == decoded
 
-    exempt_hosts = _exfil_exempt_hosts()
+
+def _blocked_link_url_verdict(url: object, domain: str) -> tuple[str | None, str | None]:
+    """Return ``(url, None)`` to keep a full address, or ``(None, reason)``.
+
+    The address is kept so a wrongly blocked link can be opened by the person
+    reading it. It is kept only when opening it cannot send a credential, it is an
+    http(s) address on exactly the host the record names with no userinfo, and it
+    fits the bound. A value that is not an address at all yields ``(None, None)``,
+    which the caller treats as a malformed record.
+    """
+    if not isinstance(url, str):
+        return None, None
+    if len(url) > MAX_BLOCKED_LINK_URL_CHARS:
+        return None, "length"
+    lower = url.lower()
+    for scheme in ("https://", "http://"):
+        if lower.startswith(scheme):
+            rest = url[len(scheme) :]
+            break
+    else:
+        return None, None
+    # The host must be the record's own, followed by a port, path, query or
+    # fragment delimiter, so the chip's domain and the address that opens agree.
+    if not rest.startswith(domain) or rest[len(domain) : len(domain) + 1] not in (
+        "",
+        ":",
+        "/",
+        "?",
+        "#",
+    ):
+        return None, None
+    authority = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if "@" in authority:
+        return None, "credential"
+    if not _credential_clean(url):
+        return None, "credential"
+    return url, None
+
+
+def _exfil_retained_path(
+    domain: str,
+    path: str,
+    exempt_hosts: frozenset[str],
+    *,
+    port: str = "",
+    is_https: bool = True,
+) -> str | None:
+    """Return *path* only when both removers leave it as written, else None.
+
+    A path can smuggle data as readily as a query, so the rule is "keep only
+    what the redactors themselves pass": the path alone must not trip the URL
+    warning, and it must survive credential redaction unchanged in every bounded
+    decoded form (``_credential_clean``).
+    """
+    if not path:
+        return None
+    if len(path) > MAX_BLOCKED_LINK_PATH_CHARS:
+        return None
+    if _exfil_url_warning(domain, path, exempt_hosts, port=port, is_https=is_https) is not None:
+        return None
+    return path if _credential_clean(path) else None
+
+
+#: The keys a blocked-link record carries, and nothing besides.
+_BLOCKED_LINK_RECORD_KEYS = frozenset(
+    {"domain", "rule", "path", "query_chars", "url", "url_withheld"}
+)
+#: Every STRING a record may retain, with the bound that applies to it. The
+#: validator reads this table rather than each field by name, so a field added to
+#: the record without an entry here is not retained at all: being bounded is a
+#: property of the record's shape instead of a check someone has to remember to
+#: write for each new field. 253 is the DNS maximum, so a longer host cannot
+#: resolve and is not a host this collector saw.
+_BLOCKED_LINK_STRING_BOUNDS = {
+    "domain": 253,
+    "rule": 64,
+    "path": MAX_BLOCKED_LINK_PATH_CHARS,
+    "url": MAX_BLOCKED_LINK_URL_CHARS,
+    "url_withheld": 16,
+}
+#: A host in the forms ``_URL_RE`` group 1 emits: a DNS name, an IPv4 literal,
+#: or a bracketed IPv6 literal. Quantifiers are bounded so the pattern and the
+#: table above cannot disagree about what length is acceptable.
+_BLOCKED_LINK_DOMAIN_RE = re.compile(
+    r"(?:[a-zA-Z0-9._-]{1,253}\.[a-zA-Z]{2,63}"
+    r"|\d{1,3}(?:\.\d{1,3}){3}"
+    r"|\[[0-9A-Fa-f:.]{1,45}\])"
+)
+#: A stable rule id, as ``_exfil_url_warning`` reports through ``_rule_out``.
+_BLOCKED_LINK_RULE_RE = re.compile(r"[a-z0-9_]{1,64}")
+
+
+def _blocked_link_safe_domain(domain: object) -> bool:
+    """Whether a host is safe to RETAIN in a record, by the rule the path obeys.
+
+    The retained path is kept only when both removers pass it unchanged; the host
+    is a retained string too, so it answers to the same rule. A DNS label can be
+    shaped like a credential, and a record carrying one would walk that secret
+    past the text redaction into meta and onto the chip.
+    """
+    if not isinstance(domain, str) or len(domain) > _BLOCKED_LINK_STRING_BOUNDS["domain"]:
+        return False
+    if _BLOCKED_LINK_DOMAIN_RE.fullmatch(domain) is None:
+        return False
+    return redact_credentials(domain)[0] == domain
+
+
+def _blocked_link_fields_ok(domain: object, rule: object, query_chars: object) -> bool:
+    """Whether the posture-INDEPENDENT fields of a record may be retained.
+
+    One function for the collection point and the read-back re-check, because a
+    record's fields answer to the same bounds wherever it comes from. Splitting
+    them produced a bound present on one side and absent on the other every time:
+    a host the collector kept and the reload dropped, which makes an explanation
+    vanish under the reader, and a field bound the reader's path enforced while
+    the writer's did not. Only the retained PATH differs between the two callers,
+    because its check is the one that depends on the posture the URL arrived
+    under, so it stays with each caller.
+    """
+    if not _blocked_link_safe_domain(domain):
+        return False
+    if not isinstance(rule, str) or _BLOCKED_LINK_RULE_RE.fullmatch(rule) is None:
+        return False
+    if len(rule) > _BLOCKED_LINK_STRING_BOUNDS["rule"]:
+        return False
+    # bool is an int subclass; a True/False char count is malformed input.
+    if isinstance(query_chars, bool) or not isinstance(query_chars, int) or query_chars < 0:
+        return False
+    return query_chars <= MAX_BLOCKED_LINK_QUERY_CHARS
+
+
+def revalidate_blocked_link(record: object) -> dict | None:
+    """Return a blocked-link record safe to keep, or None to drop it.
+
+    A persisted transcript line is attacker-writable, so a record read back from
+    meta is re-checked against the shape the collector emits before it reaches a
+    client: exactly the known keys, every retained string within the bound
+    ``_BLOCKED_LINK_STRING_BOUNDS`` gives it, a host both removers pass, a rule id
+    of ``[a-z0-9_]``, a bounded non-negative int char count, a retained path
+    that still passes BOTH removers, and EXACTLY one of a full address that still
+    passes ``_blocked_link_url_verdict`` or a known reason it was withheld. The
+    address is re-checked here, on every serve, so a remover rule that changed
+    since the message was written applies before anyone can open it. A record
+    that fails is dropped on its own; its siblings stand.
+    """
+    if not isinstance(record, dict) or set(record.keys()) != _BLOCKED_LINK_RECORD_KEYS:
+        return None
+    domain = record["domain"]
+    rule = record["rule"]
+    path = record["path"]
+    query_chars = record["query_chars"]
+    url = record["url"]
+    url_withheld = record["url_withheld"]
+    # Length first and from the table, so the cheap bound runs before any regex
+    # and no field can be retained without one.
+    for field, limit in _BLOCKED_LINK_STRING_BOUNDS.items():
+        value = record[field]
+        if value is None:
+            continue
+        if not isinstance(value, str) or len(value) > limit:
+            return None
+    if not _blocked_link_fields_ok(domain, rule, query_chars):
+        return None
+    if path is not None:
+        # The strictest posture available, not the one the URL was collected
+        # under: `is_https` and `port` only ever UNLOCK exemptions inside the
+        # warning (the Slack app-create alias needs https and no port), so
+        # re-checking as plain http with no port can only reject more. A
+        # legitimate record dropped here degrades the chip to host and reason,
+        # which is the fail-closed direction for attacker-writable input.
+        if _exfil_retained_path(domain, path, _exfil_exempt_hosts(), is_https=False) != path:
+            return None
+    if url is not None:
+        if url_withheld is not None or _blocked_link_url_verdict(url, domain) != (url, None):
+            return None
+    elif url_withheld not in _BLOCKED_LINK_URL_WITHHELD:
+        return None
+    return {
+        "domain": domain,
+        "rule": rule,
+        "path": path,
+        "query_chars": query_chars,
+        "url": url,
+        "url_withheld": url_withheld,
+    }
+
+
+def bounded_blocked_links(raw: object) -> list[dict]:
+    """Turn attacker-writable meta into a bounded, validated record list.
+
+    This is the ONE way to build a list of blocked-link records from something
+    read back off a transcript line, which is what makes the count bound a
+    property of the operation rather than a rule each retention point has to
+    remember. Every field bound already lives in the record shape
+    (``_BLOCKED_LINK_STRING_BOUNDS``); the COUNT bound lives here, so a new site
+    that reads records cannot retain an unbounded number of them by forgetting to
+    slice. A forged line can carry any number of well-formed records, and the
+    cap bounds what is DESCRIBED, never what is removed -- the text's
+    placeholders are unaffected by anything dropped here.
+    """
+    if not isinstance(raw, list):
+        return []
+    kept: list[dict] = []
+    for record in raw[:MAX_BLOCKED_LINKS_PER_MESSAGE]:
+        checked = revalidate_blocked_link(record)
+        if checked is not None:
+            kept.append(checked)
+    omitted = len(raw) - MAX_BLOCKED_LINKS_PER_MESSAGE
+    if omitted > 0:
+        # Counted and said, as the birth site does: a silently dropped tail reads
+        # exactly like a message that never had those links. The birth site never
+        # writes more than the cap, so a longer list came from an edited line.
+        logger.warning(
+            "blocked-link records on a transcript line exceed the cap of %d; %d further "
+            "record(s) are not described (their placeholders stay redacted in the text)",
+            MAX_BLOCKED_LINKS_PER_MESSAGE,
+            omitted,
+        )
+    return kept
+
+
+def redact_exfiltration_urls_with_records(
+    text: str,
+    *,
+    extra_exempt_hosts: frozenset[str] = frozenset(),
+    removed_out: list[tuple[str, str]] | None = None,
+    exempt_hosts: frozenset[str] | None = None,
+) -> tuple[str, list[str], list[dict]]:
+    """Redact suspicious URLs and, in the SAME pass, describe each one.
+
+    ``removed_out``, when given, receives ``(address, placeholder)`` for every
+    address the pass replaced (memory only: never store, log or send it).
+
+    ``exempt_hosts`` is a SNAPSHOT of the exempt-host set that stands in for
+    both the live platform read and the ``scoped_exempt_hosts`` override. A
+    caller that keys a cache on the host set passes the set it keyed on, so the
+    output is computed under exactly that set: the platform read can move
+    between two reads, and degrades a failure to the empty set. ``None``, the
+    default, is the live read. ``extra_exempt_hosts`` joins either way.
+
+    ``extra_exempt_hosts`` joins the platform's exact-host exemption for this
+    call: the hosts a reader allowed for one workspace from the dashboard
+    (``security.redaction_allow``). Like the platform's set, it relaxes only
+    the query-length and base64 heuristics; every credential check still runs.
+
+    Returns ``(cleaned_text, warnings, records)``. The redaction and the records
+    come out of one loop on purpose: two independent scans can disagree, and a
+    single collector feeding every consumer makes that class of drift
+    unrepresentable. :func:`redact_exfiltration_urls` is a thin wrapper that
+    drops the third element, so callers needing only the text are untouched.
+
+    A record retains the link's structure and, when opening it cannot send a
+    credential, the full address, so a wrongly blocked link can be opened by the
+    person reading it::
+
+        {"domain": str, "rule": str, "path": str | None, "query_chars": int,
+         "url": str | None, "url_withheld": "credential" | "length" | None}
+
+    Exactly one of ``url`` and ``url_withheld`` is set. The text is redacted the
+    same way either way: the address lives only in meta, which is never replayed
+    to the model.
+
+    A URL string appearing more than once yields ONE record, in first-appearance
+    order. There is deliberately no positional index: the placeholder carries
+    only the domain, so two URLs on one domain redact to byte-identical text and
+    a position could pair one link's path with another's.
+    """
+    # The warnings come from the same loop, under the same exempt hosts, so a
+    # link on a host the reader allowed is neither redacted nor reported. A
+    # snapshot is the whole set, so neither source is read again; hosts compare
+    # lowercase either way (RFC 4343).
+    if exempt_hosts is None:
+        exempt_hosts = _exfil_exempt_hosts() | _SCOPED_EXEMPT_HOSTS.get()
+    else:
+        exempt_hosts = frozenset(h.lower() for h in exempt_hosts)
+    exempt_hosts |= frozenset(h.lower() for h in extra_exempt_hosts)
+    warnings: list[str] = []
     result = text
+    records: list[dict] = []
+    seen: set[str] = set()
+    blocked: dict[str, str] = {}
+    overflow = 0
     for match in _URL_RE.finditer(text):
         domain = match.group(1)
-        if _exfil_url_warning(
+        path_and_query = match.group(3) or ""
+        port = match.group(2) or ""
+        is_https = match.group(0).lower().startswith("https://")
+        rules: list[str] = []
+        warning = _exfil_url_warning(
             domain,
-            match.group(3) or "",
+            path_and_query,
             exempt_hosts,
-            port=match.group(2) or "",
-            is_https=match.group(0).lower().startswith("https://"),
+            port=port,
+            is_https=is_https,
+            _rule_out=rules,
+        )
+        if not warning:
+            continue
+        warnings.append(warning)
+        matched = match.group(0)
+        placeholder = f"{EXFILTRATION_REDACTION_TAG_PREFIX}{domain}]"
+        if removed_out is not None:
+            removed_out.append((matched, placeholder))
+        # Every occurrence of this exact URL is rewritten after the loop, and the
+        # loop can revisit it, so the record set is keyed by the matched string.
+        blocked[matched] = placeholder
+        if matched in seen:
+            continue
+        qmark = path_and_query.find("?")
+        query = path_and_query[qmark + 1 :] if qmark != -1 else ""
+        path_only = path_and_query[:qmark] if qmark != -1 else path_and_query
+        # Every rejection happens BEFORE `seen` grows, because `seen` holds whole
+        # URLs and is bounded only by the record cap beside it: a dedupe row for a
+        # match that produces no record is state nothing bounds. The fields answer
+        # to the one shared check, so a host or a rule the reload would drop is
+        # never retained here either -- an explanation that vanishes on reload is
+        # worse than one that never appeared. The URL is redacted from the text
+        # regardless: a dropped record costs the reader an explanation, never the
+        # removal.
+        if not _blocked_link_fields_ok(domain, rules[0] if rules else None, len(query)):
+            continue
+        if len(records) >= MAX_BLOCKED_LINKS_PER_MESSAGE:
+            # Before `seen` grows, not after: a dedupe row for a match the cap
+            # already refused is state the cap was supposed to bound.
+            overflow += 1
+            continue
+        seen.add(matched)
+        kept_url, url_withheld = _blocked_link_url_verdict(matched, domain)
+        if kept_url is None and url_withheld is None:
+            # Not reachable for a _URL_RE match, which is always an http(s)
+            # address on its own host; fail closed so the record keeps its
+            # "exactly one of url / url_withheld" shape regardless.
+            url_withheld = "credential"
+        records.append(
+            {
+                "domain": domain,
+                "rule": rules[0],
+                "path": _exfil_retained_path(
+                    domain, path_only, exempt_hosts, port=port, is_https=is_https
+                ),
+                "query_chars": len(query),
+                "url": kept_url,
+                "url_withheld": url_withheld,
+            }
+        )
+    # Longest first: a blocked URL that is a prefix of a longer blocked one (a base
+    # link, then the same link with a session token appended) would otherwise
+    # rewrite the longer one's head, so the longer one's own replace finds nothing
+    # and its token-bearing tail stays in the text.
+    for matched in sorted(blocked, key=len, reverse=True):
+        result = result.replace(matched, blocked[matched])
+    if overflow:
+        logger.info(
+            "blocked-link records capped at %d for this message; %d further blocked "
+            "link match(es) are redacted in the text but carry no record",
+            MAX_BLOCKED_LINKS_PER_MESSAGE,
+            overflow,
+        )
+    return result, warnings, records
+
+
+def redact_exfiltration_urls(
+    text: str, *, exempt_hosts: frozenset[str] | None = None
+) -> tuple[str, list[str]]:
+    """Scan and redact suspicious exfiltration URLs from text.
+
+    ``exempt_hosts`` is the host-set snapshot described on
+    :func:`redact_exfiltration_urls_with_records`; ``None`` is the live read.
+    Returns (cleaned_text, list_of_warnings).
+    """
+    cleaned, warnings, _ = redact_exfiltration_urls_with_records(text, exempt_hosts=exempt_hosts)
+    return cleaned, warnings
+
+
+#: Hosts a reader allowed for the workspace whose message is being redacted,
+#: set only by :func:`scoped_exempt_hosts` around one render. The display pass
+#: re-redacts what the segment flush kept, so it must relax the same hosts or an
+#: allowed link would be removed again on the way to the page.
+_SCOPED_EXEMPT_HOSTS: contextvars.ContextVar[frozenset[str]] = contextvars.ContextVar(
+    "kiro_crew_scoped_exempt_hosts", default=frozenset()
+)
+
+
+@contextlib.contextmanager
+def scoped_exempt_hosts(hosts: frozenset[str]) -> Iterator[None]:
+    """Relax the length and base64 checks for ``hosts`` inside the block only."""
+    token = _SCOPED_EXEMPT_HOSTS.set(frozenset(h.lower() for h in hosts))
+    try:
+        yield
+    finally:
+        _SCOPED_EXEMPT_HOSTS.reset(token)
+
+
+#: The rules an allowed host relaxes (see :func:`scoped_exempt_hosts`): a long
+#: query and a base64-looking one. A link blocked for anything else stays
+#: blocked whatever the reader allowed.
+ALLOWABLE_BLOCKED_LINK_RULES = frozenset({"exfil_query_length", "exfil_query_pattern"})
+
+_PLACEHOLDER_RE = re.compile(re.escape(EXFILTRATION_REDACTION_TAG_PREFIX) + r"([^\]\s]+)\]")
+
+
+def restore_allowed_links(
+    text: str, records: list[dict], hosts: frozenset[str]
+) -> tuple[str, list[dict]]:
+    """Put back the address of each blocked link whose host the reader allowed.
+
+    Every saved message carries each blocked link as a placeholder, allowed host
+    or not, and its records keep the full address. For each placeholder
+    whose record is kept (``url`` set), was blocked only by a rule an allowed
+    host relaxes, and names a host in ``hosts``, the placeholder becomes the
+    address again and the record is dropped, so the reply shows the link it
+    was written with. A placeholder carries only its host, so it cannot say
+    which of several addresses on that host it stood for: a host is restored
+    only when every record for it keeps the same address, and otherwise its
+    placeholders stay. It is also restored only when the text holds exactly one
+    placeholder per record for it, so a placeholder with no record behind it
+    (one the model echoed in prose, or one whose record was dropped) never
+    becomes a link to an address that did not stand there. Returns the text and
+    the records left.
+    """
+    if not hosts or not records or EXFILTRATION_REDACTION_TAG_PREFIX not in text:
+        return text, records
+    by_domain: dict[str, list[int]] = {}
+    for i, rec in enumerate(records):
+        by_domain.setdefault(str(rec.get("domain", "")).lower(), []).append(i)
+    placeholders: dict[str, int] = {}
+    for m in _PLACEHOLDER_RE.finditer(text):
+        placeholders[m.group(1).lower()] = placeholders.get(m.group(1).lower(), 0) + 1
+    address: dict[str, str] = {}
+    restored: set[int] = set()
+    for domain, indexes in by_domain.items():
+        if domain not in hosts:
+            continue
+        urls = {records[i].get("url") for i in indexes}
+        rules_ok = all(records[i].get("rule") in ALLOWABLE_BLOCKED_LINK_RULES for i in indexes)
+        url = next(iter(urls)) if len(urls) == 1 else None
+        if (
+            rules_ok
+            and isinstance(url, str)
+            and url
+            and placeholders.get(domain, 0) == len(indexes)
         ):
-            result = result.replace(match.group(0), f"{EXFILTRATION_REDACTION_TAG_PREFIX}{domain}]")
-    return result, warnings
+            address[domain] = url
+            restored.update(indexes)
+    if not address:
+        return text, records
+
+    def swap(m: re.Match[str]) -> str:
+        return address.get(m.group(1).lower(), m.group(0))
+
+    out = _PLACEHOLDER_RE.sub(swap, text)
+    return out, [r for i, r in enumerate(records) if i not in restored]
+
+
+def current_scoped_exempt_hosts() -> frozenset[str]:
+    """The hosts :func:`scoped_exempt_hosts` has in effect here, for cache keys."""
+    return _SCOPED_EXEMPT_HOSTS.get()
 
 
 # Markerless 40-character values collide with OAuth entropy only for these
-# authorization-request fields. ``code_verifier`` is intentionally absent: it
-# is sent to the token endpoint, not on this front channel.
-_OAUTH_ENTROPY_QUERY_PARAMS = frozenset({"code_challenge", "nonce", "state"})
+# authorization-request fields (``code_verifier`` goes to the token endpoint;
+# a dynamically registered public ``client_id`` may be 43-char base64url).
+_OAUTH_ENTROPY_QUERY_PARAMS = frozenset({"client_id", "code_challenge", "nonce", "state"})
 
 # The exemption is bounded to shapes the protocol itself can emit, so an
 # AWS-secret-shaped run cannot ride a front-channel parameter into the blanked
-# set. base64url (RFC 4648 s5) emits `-`/`_` and never `+`/`/`, and an S256
-# challenge is base64url of a 32-byte digest -- exactly 43 characters.
+# set. base64url (RFC 4648 s5) emits `-`/`_` and never `+`/`/`; an S256
+# challenge and a dynamic client id must be exactly 43 base64url characters.
 _OAUTH_S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
 
 
 def _oauth_entropy_form_is_protocol_shaped(key: str, form: str) -> bool:
     """Return True when ONE decoded form of a value keeps a protocol shape."""
-    if key == "code_challenge":
+    if key in {"client_id", "code_challenge"}:
         return bool(_OAUTH_S256_CHALLENGE_RE.fullmatch(form))
     return "+" not in form and "/" not in form
 
@@ -1156,7 +1035,7 @@ def _oauth_credential_scan_target(
 
     Fixed credential signatures are checked against the raw and decoded URL
     before this target is built. At an exact approved endpoint, only the
-    code-owned state, nonce, and PKCE challenge fields are omitted from the
+    code-owned state, nonce, PKCE challenge and client_id fields are omitted from the
     markerless bare-secret heuristic, and only when the value carries a shape
     the protocol can emit (see
     :func:`_oauth_entropy_value_is_protocol_shaped`). Other recognized values,
@@ -1423,177 +1302,6 @@ def oauth_rejection_is_endpoint_exemptible(url: str) -> bool:
     return diagnose_oauth_url_credential(url, assume_approved_endpoint=True) is None
 
 
-# Data-egress / reverse-shell command shapes — the exfiltration-specific subset
-# of SUSPICIOUS_BASH_PATTERNS. These are enforced at the
-# tool-invocation gate (denied), unlike the full SUSPICIOUS_BASH_PATTERNS list
-# which stays advisory: that list also carries destructive-but-local shapes
-# (rm -rf, dd if=, chmod on system dirs, DROP TABLE) that a user may legitimately
-# run in their own workspace, so hard-denying all of them at the gate would break
-# ordinary use. This subset is narrowly the "push local data OUT / open a shell
-# to a remote" shapes, where a hijacked-agent block is worth the rare false
-# positive.
-#
-# Entries containing `*` are fnmatch globs (`*<pat>*`); the rest are
-# case-insensitive substrings, so they fire regardless of intervening flags /
-# token layout — `curl -d @f`, `curl -s -d @f`, `curl --data-binary @f` all
-# match. The `@` sigil on curl body/upload flags means "read from a local file"
-# (the tell-tale of egress); a bare `-d 'x=1'` inline body has no `@` and is not
-# matched. curl long options accept BOTH ` @` and `=@` separators, so both are
-# listed. `--data-raw` is deliberately EXCLUDED: it is the one --data variant
-# that does NOT interpret a leading `@` as a file reference, so `--data-raw @x`
-# posts the literal string `@x` (never reads a file) — including it would only
-# add false positives. Multipart uploads use a glob (`-F *=@`) so ANY field name
-# matches, not just a field literally named `file` (`curl -F x=@secret` exfils
-# just as well).
-_BASH_EXFIL_PATTERNS: list[str] = [
-    "-d @",  # curl POST body read from a local file (space + `=` separators)
-    "-d@",
-    "-d=@",
-    "--data @",
-    "--data=@",
-    "--data-binary @",
-    "--data-binary=@",
-    "--data-ascii @",
-    "--data-ascii=@",
-    "--data-urlencode @",  # also reads a local file when the value starts with @
-    "--data-urlencode=@",
-    "-F *=@",  # curl multipart file upload, any field name (glob)
-    "--form *=@",
-    "--upload-file",  # curl upload, long form
-    "wget --post-file",  # wget file upload
-    "/dev/tcp/",  # bash builtin reverse shell (>/dev/tcp/host/port)
-    "/dev/udp/",
-]
-
-# Exfil shapes where whitespace or flag CASE around an operator matters, so a
-# plain lowercased substring/glob would either miss a no-space variant or
-# false-positive. Matched via regex against the ORIGINAL (non-lowercased)
-# command. Each entry is (compiled pattern, human label).
-_BASH_EXFIL_RES: list[tuple[re.Pattern[str], str]] = [
-    # netcat reading a local file via input redirect — `nc host port < file` AND
-    # `nc host port <file` (no space after `<`, a valid shell redirect that the
-    # old `nc * < ` glob missed). `nc`/`ncat` is anchored at a word boundary so
-    # `sync`/`func` etc. do not match. Case-insensitive (command name).
-    (re.compile(r"(?:^|\s)nc(?:at)?\s+\S.*<", re.IGNORECASE), "nc/ncat file redirect"),
-    # netcat reverse shell `nc -e <prog>` / `ncat -e <prog>`. `nc`/`ncat` is
-    # anchored at a word boundary so `rsync -e ssh` (contains `nc -e`) and
-    # `vnc -e` do NOT match; a plain substring `"nc -e"` false-positived on them.
-    (re.compile(r"(?:^|\s)nc(?:at)?\s+-e\b", re.IGNORECASE), "nc/ncat reverse shell"),
-    # curl upload short form `-T <file>` / `-Tfile` (no space). CASE-SENSITIVE
-    # `-T`: curl's upload flag is uppercase, so this does NOT match lowercase long
-    # options such as `--trace-time`. `-T` must begin at a word boundary.
-    (re.compile(r"\bcurl\b.*(?:^|\s)-T\s*\S"), "curl -T upload"),
-]
-
-
-# Which catalog rule each always-on exfil branch enforces, so a denial maps back
-# to a rule id and an operator opt-out is honoured. Patterns/labels absent from
-# these maps stay unconditional.
-_BASH_EXFIL_RULE_BY_PATTERN: dict[str, str] = {
-    "-d @": "data-exfil-curl-file-body",
-    "-d@": "data-exfil-curl-file-body",
-    "-d=@": "data-exfil-curl-file-body",
-    "--data @": "data-exfil-curl-file-body",
-    "--data=@": "data-exfil-curl-file-body",
-    "--data-binary @": "data-exfil-curl-file-body",
-    "--data-binary=@": "data-exfil-curl-file-body",
-    "--data-ascii @": "data-exfil-curl-file-body",
-    "--data-ascii=@": "data-exfil-curl-file-body",
-    "--data-urlencode @": "data-exfil-curl-file-body",
-    "--data-urlencode=@": "data-exfil-curl-file-body",
-    "-F *=@": "data-exfil-curl-multipart-upload",
-    "--form *=@": "data-exfil-curl-multipart-upload",
-    "--upload-file": "data-exfil-curl-upload",
-    "wget --post-file": "data-exfil-wget-post-file",
-    "/dev/tcp/": "reverse-shell-devtcp",
-    "/dev/udp/": "reverse-shell-devtcp",
-}
-
-# A single regex can span more than one catalog row, so this maps to a TUPLE. The
-# gate attributes each MATCH to one of those rows and honours that row's own
-# toggle — see _exfil_rule_id_for_match.
-_BASH_EXFIL_RULE_BY_LABEL: dict[str, tuple[str, ...]] = {
-    "nc/ncat file redirect": ("data-exfil-nc-file-redirect",),
-    "nc/ncat reverse shell": ("reverse-shell-nc", "reverse-shell-ncat"),
-    "curl -T upload": ("data-exfil-curl-upload",),
-}
-
-#: For a label whose regex spans several catalog rows, the token that identifies
-#: WHICH row a given match belongs to. Ordered longest-first so ``ncat`` is tested
-#: before ``nc`` — the reverse would classify every ``ncat`` hit as ``nc``.
-_BASH_EXFIL_ROW_DISCRIMINATORS: dict[str, tuple[tuple[str, str], ...]] = {
-    "nc/ncat reverse shell": (("ncat", "reverse-shell-ncat"), ("nc", "reverse-shell-nc")),
-}
-
-
-def _exfil_rule_id_for_match(label: str, matched: str, rule_ids: tuple[str, ...]) -> str:
-    """The catalog row a single exfil match belongs to.
-
-    One regex can cover more than one row, and the operator toggles rows, not
-    regexes — so a match has to be attributed before its toggle can be honoured.
-    Falls back to the label's first row when nothing discriminates, which keeps the
-    single-row labels (the common case) on their existing behaviour and never
-    returns an id outside ``rule_ids``.
-    """
-    low = matched.lower()
-    for token, rid in _BASH_EXFIL_ROW_DISCRIMINATORS.get(label, ()):
-        if token in low and rid in rule_ids:
-            return rid
-    return rule_ids[0]
-
-
-def audit_bash_exfiltration(
-    command: str, *, enabled_ids: "frozenset[str] | None" = None
-) -> str | None:
-    """Return a denial reason if *command* matches a data-egress / reverse-shell
-    shape that must be blocked at the tool-invocation gate, else None.
-
-    Scoped to _BASH_EXFIL_PATTERNS / _BASH_EXFIL_RES (exfil/reverse-shell only) so
-    it can be wired into the deny path in ``hooks.on_tool_call`` without blocking
-    benign local commands. The broader :func:`audit_bash_command` stays advisory.
-
-    Every branch carries the id of the catalog rule it enforces, so *enabled_ids*
-    lets the caller honour an operator opt-out: a branch whose rule the operator
-    disabled is skipped. ``None`` (the default) means ALL enabled — fail-closed,
-    which is what keeps the callers that hold no effective set (cron command
-    vetting, computer-use input vetting) at full strength without a change.
-    """
-    lower = command.lower()
-
-    def _on(rule_id: str) -> bool:
-        return enabled_ids is None or rule_id in enabled_ids
-
-    for pattern in _BASH_EXFIL_PATTERNS:
-        rule_id = _BASH_EXFIL_RULE_BY_PATTERN.get(pattern, "")
-        if rule_id and not _on(rule_id):
-            continue
-        pat = pattern.lower()
-        if "*" in pat:
-            if fnmatch.fnmatch(lower, f"*{pat}*"):
-                return f"Blocked: command matches data-exfiltration pattern '{pattern}'"
-        elif pat in lower:
-            return f"Blocked: command matches data-exfiltration pattern '{pattern}'"
-    for rx, label in _BASH_EXFIL_RES:
-        rule_ids = _BASH_EXFIL_RULE_BY_LABEL.get(label, ())
-        if not rule_ids:
-            if rx.search(command):
-                return f"Blocked: command matches data-exfiltration pattern ({label})"
-            continue
-        # A label can span more than one catalog row (one regex covers both the nc
-        # and ncat rules). Denying while EITHER is enabled defeats the operator:
-        # switching `reverse-shell-nc` off left `nc` blocked by its sibling. So
-        # resolve each MATCH to the row it actually belongs to and honour that
-        # row's own toggle. Every match is examined, not just the first, because a
-        # command can carry both spellings and the leading one may be the disabled
-        # row while the other is still enforced.
-        for m in rx.finditer(command):
-            matched_id = _exfil_rule_id_for_match(label, m.group(0), rule_ids)
-            if _on(matched_id):
-                return f"Blocked: command matches data-exfiltration pattern ({label})"
-        continue
-    return None
-
-
 # ── IP Canonicalization (IMDS bypass prevention) ──
 # Attackers bypass IMDS checks by encoding 169.254.169.254 in alternate forms:
 #   - Decimal:   2852039166 (single 32-bit integer)
@@ -1602,6 +1310,33 @@ def audit_bash_exfiltration(
 #   - IPv6-mapped: ::ffff:169.254.169.254 or ::ffff:a9fe:a9fe
 #   - Mixed:     169.254.0xa9.0376
 # canonicalize_ip converts ALL these to dotted-quad for uniform matching.
+
+
+def _octet_literal_value(part: str) -> "int | None":
+    """Value of ONE literal dotted-quad octet in the OS resolver's bases, or None.
+
+    ``inet_aton`` and ``curl`` read a leading-zero octet as C-style OCTAL (``0251``
+    is 169, not 251) and ``0x`` as hex; ``int(part, 0)`` does not accept the bare
+    ``0NNN`` octal spelling, so it is handled first. Returns None for an empty or
+    non-numeric octet. This is the ONE octet parser -- ``canonicalize_ip`` and the
+    IMDS shell-expansion gate both call it, so a leading-zero or hex octet reads the
+    same way on every path.
+
+    EVERY conversion runs inside the try: a very long digit string trips CPython's
+    integer-string length limit with ValueError, and that must read as "not a
+    numeric octet" (None), never crash the gate -- the same fail-soft the inline
+    parser in ``canonicalize_ip`` had before this was extracted.
+    """
+    try:
+        if len(part) > 1 and part[0] == "0" and part[1:].isdigit():
+            # Octal only when every trailing digit is octal; a stray 8/9 is
+            # decimal, exactly as inet_aton reads it.
+            if all(c in "01234567" for c in part[1:]):
+                return int(part, 8)
+            return int(part)
+        return int(part, 0)  # decimal, or 0x-prefixed hex
+    except (ValueError, OverflowError):
+        return None
 
 
 def canonicalize_ip(s: str) -> str:
@@ -1640,23 +1375,13 @@ def canonicalize_ip(s: str) -> str:
         octets: list[int] = []
         valid = True
         for part in parts:
-            try:
-                # Handle C-style octal (0NNN without 'o' prefix) which Python 3
-                # int(x, 0) doesn't recognize. Must check before int(x, 0).
-                if len(part) > 1 and part[0] == "0" and part[1:].isdigit():
-                    # Could be octal (0251) or just "00" etc.
-                    if all(c in "01234567" for c in part[1:]):
-                        val = int(part, 8)
-                    else:
-                        # Has 8 or 9 -- not valid octal, treat as decimal
-                        val = int(part)
-                else:
-                    # int() with base=0 handles: decimal, 0x hex
-                    val = int(part, 0)
-                octets.append(val)
-            except (ValueError, OverflowError):
+            # The ONE octet parser (reads octal/hex in the resolver's bases); None
+            # is an unparseable octet, so this candidate is not a dotted IP.
+            val = _octet_literal_value(part)
+            if val is None:
                 valid = False
                 break
+            octets.append(val)
 
         if valid:
             if len(octets) == 1:
@@ -1755,6 +1480,217 @@ _IMDS_IP = "169.254.169.254"
 # SSRF gate which also blocks it (CWE-918 dual-stack parity).
 _IMDS_IPV6 = "fd00:ec2::254"
 
+# ── IMDS via shell EXPANSION (CWE-185 / CWE-693) ──
+# The deny view deliberately stops BEFORE shell expansion, so a dotted token that
+# splices an expansion into an octet -- ``169.254.169.25$((2+2))``,
+# ``169.254.169.$((100+154))`` -- reaches this gate with that octet UNEXPANDED, and
+# the literal ``169.254.169.254`` the canonicalizer looks for never appears, while
+# bash still produces the real bytes at run time.
+#
+# This gate refuses ONLY what it can resolve STATICALLY, without running anything: an
+# octet made of literal digits and pure-ARITHMETIC expansions (``$((..))`` / ``$[..]``,
+# evaluated by ``_safe_arith`` -- ``+ - * / %`` over PLAIN-DECIMAL and ``0x``-HEX int
+# constants only, via a Python ``ast``, size-bounded). If the four octets resolve to
+# exactly ``169.254.169.254`` the token is refused. Any octet whose value is UNKNOWN
+# without running the shell -- a ``$VAR``, ``${..}``, a ``$(..)`` command substitution,
+# a backtick -- does not resolve and is LEFT ALONE. Unknown value means allow: a benign
+# ``for o in 123 253; do ping 169.254.169.$o; done`` reachability check, a subnet
+# gateway (``${A}.${B}.${C}.254``), a version string (``${MAJOR}.${MINOR}.${PATCH}``)
+# and a regex end-anchor (``grep '^nameserver 169.254.169.253$'``) all pass.
+#
+# ``_safe_arith`` reads a Python ``ast``, NOT a bash arithmetic emulator, so three
+# arithmetic forms that bash DOES resolve statically to ``.254`` are deliberately NOT
+# emulated and are documented RESIDUALS alongside the ``$VAR`` / ``$(..)`` / backtick
+# spellings: a leading-zero OCTAL literal (``$((0376))``), a base-N literal
+# (``$((16#fe))``, ``$((2#11111110))``), and a value that only reaches 254 by 64-bit
+# wraparound (``$((18446744073709551870))``). Emulating bash arithmetic faithfully
+# (octal, base-N, two's-complement overflow, C division) would grow this evaluator
+# without bound and trade a new divergence either way; the agreed scope is the plain
+# decimal / ``0x``-hex arithmetic a Python ``ast`` computes identically to bash. The
+# literal deny tier still catches a fully-resolved literal octet (``169.254.169.0376``
+# is read as octal by ``_octet_literal_value`` and blocked); only the ARITHMETIC
+# spelling of these bases is the residual. An octet holding any unresolvable expansion
+# (``169.254.169.$x``) is allowed, not blocked, so the gate refuses no benign command.
+# The dotted-quad octets of _IMDS_IP, as ints, for positional comparison.
+_IMDS_OCTETS = tuple(int(o) for o in _IMDS_IP.split("."))
+#: Characters of a dotted IP token (decimal, hex digits, ``x``, the dot); never ``$``.
+_IP_TOKEN_CHARS = frozenset("0123456789abcdefABCDEFxX.")
+#: Cap on an arithmetic expression fed to the safe evaluator, so a crafted
+#: ``$((...))`` cannot drive parse/eval cost up; a real IMDS octet needs a few chars.
+_ARITH_MAX_LEN = 256
+
+
+def _arith_span(command: str, i: int) -> "tuple[int, str] | None":
+    """If a bash arithmetic expansion starts at *i*, return ``(end, expr)``, else None.
+
+    Handles ``$((expr))`` (balanced parens, so a nested ``$((100+(154)))`` is spanned
+    whole) and the older ``$[expr]`` form. *end* is the index just past the span;
+    *expr* is the inner text handed to the safe evaluator. A command substitution
+    ``$(..)`` (single paren) is NOT arithmetic and returns None.
+    """
+    n = len(command)
+    if i + 1 >= n or command[i] != "$":
+        return None
+    # Bound every lookahead to the arithmetic cap: an unbalanced ``$((`` must not
+    # scan to end-of-string, or a command of many ``$((`` would be quadratic.
+    limit = min(n, i + _ARITH_MAX_LEN + 4)
+    if command[i + 1 : i + 3] == "((":
+        depth = 0
+        j = i + 1
+        while j < limit:
+            if command[j] == "(":
+                depth += 1
+            elif command[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return (j + 1, command[i + 3 : j - 1])  # strip ``$((`` and ``))``
+            j += 1
+        return None  # unbalanced within the cap -> not a resolvable span
+    if command[i + 1] == "[":
+        close = command.find("]", i + 2, limit)
+        if close == -1:
+            return None
+        return (close + 1, command[i + 2 : close])
+    return None
+
+
+def _eval_arith(node: ast.AST) -> "int | None":
+    """Evaluate a parsed arithmetic node to an int, or None if it is not pure integer
+    arithmetic over ``+ - * / %`` (shell ``$((..))`` is integer, truncating)."""
+    if (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+    ):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        v = _eval_arith(node.operand)
+        if v is None:
+            return None
+        return v if isinstance(node.op, ast.UAdd) else -v
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod)
+    ):
+        left = _eval_arith(node.left)
+        right = _eval_arith(node.right)
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if right == 0:
+            return None  # shell errors on /0; treat as unresolvable
+        # Truncate toward zero in INTEGERS only. ``int(left / right)`` goes through a
+        # float and loses precision above 2**53, so a large plain-decimal expression
+        # bash resolves to .254 would not (over- or under-resolving the octet); this
+        # matches bash's C-style integer division and remainder exactly.
+        q = abs(left) // abs(right)
+        if (left < 0) != (right < 0):
+            q = -q
+        if isinstance(node.op, ast.Mod):
+            return left - right * q  # C-style remainder, matches shell
+        return q  # truncating integer division toward zero, like the shell
+    return None
+
+
+def _safe_arith(expr: str) -> "int | None":
+    """Value of a plain-decimal / ``0x``-hex integer expression over ``+ - * / %``, or
+    None otherwise. This is a Python ``ast``, NOT a bash arithmetic emulator: a leading-
+    zero octal literal, a base-N (``N#..``) literal and 64-bit wraparound are NOT read
+    (they are documented residuals -- see the module note). No names, calls, attributes
+    or other operators run."""
+    expr = expr.strip()
+    if not expr or len(expr) > _ARITH_MAX_LEN:
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError):
+        return None
+    return _eval_arith(tree.body)
+
+
+def _resolve_octet(octet: str) -> "int | None":
+    """Resolve one dotted octet to its int value, substituting arithmetic spans; None
+    if any non-arithmetic expansion (``$VAR``/``${..}``/``$(..)``/backtick) leaves it
+    with an UNKNOWN run-time value, or the result is not a valid octet literal."""
+    out: list[str] = []
+    i, n = 0, len(octet)
+    while i < n:
+        span = _arith_span(octet, i)
+        if span is not None:
+            end, expr = span
+            value = _safe_arith(expr)
+            if value is None:
+                return None
+            out.append(str(value))
+            i = end
+        elif octet[i] == "$" or octet[i] == "`":
+            return None  # unknown run-time value -> do not block
+        else:
+            out.append(octet[i])
+            i += 1
+    return _octet_literal_value("".join(out))
+
+
+def _arith_ip_tokens(command: str) -> "list[str]":
+    """Maximal dotted tokens made of IP characters and whole arithmetic spans. A token
+    stops at the first character that is neither (so a ``$VAR``/``$(..)``/backtick ends
+    it); the scan is one linear pass, each arithmetic span one balanced lookahead."""
+    tokens: list[str] = []
+    n = len(command)
+    i = 0
+    while i < n:
+        if command[i] in _IP_TOKEN_CHARS or _arith_span(command, i) is not None:
+            start = i
+            while i < n:
+                span = _arith_span(command, i)
+                if span is not None:
+                    i = span[0]
+                elif command[i] in _IP_TOKEN_CHARS:
+                    i += 1
+                else:
+                    break
+            tokens.append(command[start:i])
+        else:
+            i += 1
+    return tokens
+
+
+def _imds_access_via_expansion(command: str) -> str | None:
+    """Refuse a dotted token that STATICALLY resolves to ``169.254.169.254``.
+
+    See the module note above. Only literals and pure-arithmetic ``$((..))`` / ``$[..]``
+    expansions resolve; a ``$VAR`` / ``${..}`` / ``$(..)`` / backtick octet has an
+    unknown value and is LEFT ALONE (unknown -> allow). The denial names the
+    UNEXPANDED token, never any expanded bytes. Returns the reason or None.
+
+    Scope: the four-part dotted form, per GHSA-x2m8-5ff9-f479. The 2-/3-part inet_aton
+    short forms are outside this check.
+    """
+    if "$((" not in command and "$[" not in command:
+        return None  # nothing statically resolvable here -> the canonicalizer owns it
+    for token in _arith_ip_tokens(command):
+        octets = token.split(".")  # arithmetic spans carry no dot, so this is safe
+        if len(octets) == 5 and octets[-1] == "":
+            octets = octets[:-1]  # a single trailing dot (FQDN root) the resolver drops
+        if len(octets) != 4:
+            continue
+        values: list[int] = []
+        for octet in octets:
+            value = _resolve_octet(octet)
+            if value is None:
+                break
+            values.append(value)
+        if values == list(_IMDS_OCTETS):
+            return (
+                f"Blocked: command accesses IMDS endpoint "
+                f"(169.254.169.254 via shell expansion '{token}')"
+            )
+    return None
+
 
 def _check_imds_access(command: str, *, enabled_ids: "frozenset[str] | None" = None) -> str | None:
     """Detect attempts to access the IMDS endpoint via any encoding.
@@ -1769,10 +1705,12 @@ def _check_imds_access(command: str, *, enabled_ids: "frozenset[str] | None" = N
     """
     if enabled_ids is not None and "credential-exfil-imds-any" not in enabled_ids:
         return None
-    # Quick reject: no IP-like candidate in command
+    # Quick reject: no literal IP candidate. A token whose octets are ALL shell
+    # expansions (``$A.$B.$C.254``) still has no literal candidate, so the
+    # expansion check runs even on this path rather than short-circuiting None.
     candidates = _IP_CANDIDATE_RE.findall(command)
     if not candidates:
-        return None
+        return _imds_access_via_expansion(command)
 
     try:
         imds_v6: ipaddress.IPv6Address | None = ipaddress.ip_address(_IMDS_IPV6)  # type: ignore[assignment]
@@ -1799,4 +1737,94 @@ def _check_imds_access(command: str, *, enabled_ids: "frozenset[str] | None" = N
                     )
             except ValueError:
                 pass
-    return None
+    # No literal encoding matched; a per-octet shell-expansion spelling still can.
+    return _imds_access_via_expansion(command)
+
+
+# This module is the import path of every name the egress layer offers. The URL classifier,
+# the blocked-link records, the URL redactor, the OAuth credential diagnosis and the IMDS
+# check above stay here; the rule tables, the OAuth endpoint set and the command gate live
+# in the owner modules below, and a write through this module (a patch) reaches every
+# module holding the name (:mod:`kiro_crew._facade_mirror`). The header also binds the
+# owner names ``display_safety`` reads here.
+# Owners never import this module. New work goes to the owner of its responsibility:
+#   ``exfil_url_rules`` -- the URL and query patterns and the presigned-URL validator
+#   ``exfil_oauth`` -- the OAuth endpoint set, its audit events and the shape diagnostics
+#   ``exfil_bash`` -- the data-egress and reverse-shell command gate
+from kiro_crew import _facade_mirror  # noqa: E402
+
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.security.exfil_url_rules",
+    "kiro_crew.security.exfil_oauth",
+    "kiro_crew.security.exfil_bash",
+)  # the loop below imports them in this order
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+#: What a star import binds: every public name of the unsplit module's namespace.
+__all__ = sorted(n for n in set(globals()) | set(_EXPORTS) if not n.startswith("_"))
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.security.exfil_bash import (  # noqa: F401
+        _BASH_BLANKS_RE,
+        _BASH_EXFIL_PATTERNS,
+        _BASH_EXFIL_RES,
+        _BASH_EXFIL_ROW_DISCRIMINATORS,
+        _BASH_EXFIL_RULE_BY_LABEL,
+        _BASH_EXFIL_RULE_BY_PATTERN,
+        _CARVEOUT_VERBS,
+        _DATA_EXFIL_FILE_BODY_RULE,
+        _data_at_carveout_allows,
+        _exfil_rule_id_for_match,
+        audit_bash_exfiltration,
+    )
+    from kiro_crew.security.exfil_oauth import (  # noqa: F401
+        _ENDPOINT_EXTENSION_CAP,
+        _ENDPOINT_EXTENSION_ENTRIES_KEY,
+        _OAUTH_AUTHORIZATION_ENDPOINTS,
+        _OAUTH_DIAGNOSTIC_PARAMETER_RE,
+        _OAUTH_DISCOVERED_CAP,
+        _OAUTH_DISCOVERED_ENDPOINTS,
+        _OAUTH_DISCOVERED_MCP_URL_MAX_LEN,
+        _OAUTH_DISCOVERED_TTL_SECONDS,
+        _OAUTH_EXTENSION_AUDITED,
+        _OAUTH_EXTENSION_MEMO,
+        _OAUTH_EXTENSION_PATH_BAD,
+        _OAUTH_EXTENSION_PATH_MAX_LEN,
+        _OAUTH_URL_SYMBOLS,
+        OAuthUrlShapeProfile,
+        _discovered_oauth_endpoint_approved,
+        _emit_oauth_discovered_endpoint_event,
+        _emit_oauth_extension_used_event,
+        _load_operator_oauth_endpoints,
+        _oauth_char_class,
+        _oauth_shape_profile,
+        _safe_oauth_parameter_name,
+        _validate_operator_oauth_entries,
+        record_discovered_oauth_endpoint,
+    )
+    from kiro_crew.security.exfil_url_rules import (  # noqa: F401
+        _CREDENTIAL_RE,
+        _S3_PRESIGNED_PARAMS,
+        _S3_PRESIGNED_RE,
+        _SIGNATURE_RE,
+        _STRUCTURAL_VALIDATORS,
+        _STS_TOKEN_RE,
+        _is_encoded_path_text,
+        exfil_query_min_len,
+    )
+if TYPE_CHECKING:  # project names it serves from outside its owners, from their homes
+    from kiro_crew.credential_patterns import (  # noqa: F401
+        AWS_KEY_ID,
+    )
+    from kiro_crew.security.denied_rules import (  # noqa: F401
+        _INERT_SEARCH_VERBS,
+        _exception_eligible,
+    )
+    from kiro_crew.sel import (  # noqa: F401
+        SecurityEvent,
+        SecurityEventLog,
+    )

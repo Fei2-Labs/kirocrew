@@ -9,6 +9,7 @@ on any specific bundled service (the former ``secretary`` builtin was removed).
 from __future__ import annotations
 
 import ast
+import importlib
 import inspect
 import json
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from dashboard_owner_helpers import NoConfiguredOwner, owner_claims
 
 from kiro_crew.apps import routes
 from kiro_crew.apps.routes import (
@@ -189,7 +191,7 @@ class TestSyncBuiltinConfig:
         ``TestBuiltinConfigSyncHoldsBothConfigLocks`` for that half, and
         ``TestBuiltinConfigDispatchRatchet`` for the guard against regressing to
         the one-lock dispatch."""
-        src = inspect.getsource(routes)
+        src = "".join(inspect.getsource(m) for m in (routes, *map(importlib.import_module, routes._OWNERS)))
         assert not re.findall(
             r"(?<!def )_sync_builtin_config\(", src
         ), "found a bare on-loop _sync_builtin_config call"
@@ -254,6 +256,7 @@ class TestHandleDisableBuiltin:
         request = AsyncMock()
         request.match_info = {"name": _TEST_BUILTIN}
         request.app = {"state": state}
+        owner_claims(request)
 
         with (
             patch("kiro_crew.apps.routes.get_app", return_value={
@@ -285,7 +288,8 @@ class TestHandleDisableBuiltin:
 
         request = AsyncMock()
         request.match_info = {"name": "my-app"}
-        request.app = {}
+        request.app = {"state": NoConfiguredOwner()}
+        owner_claims(request)
 
         with (
             patch("kiro_crew.apps.routes.get_app", return_value={
@@ -365,7 +369,7 @@ class TestBuiltinConfigSyncHoldsBothConfigLocks:
         request.app = {"state": state} if state is not None else {}
         # No app identity: the enable route refuses app tokens outright.
         request.get = lambda key, default=None: default
-        return request
+        return owner_claims(request)
 
     @staticmethod
     def _probe():
@@ -499,8 +503,8 @@ class TestBuiltinConfigDispatchRatchet:
 
     @staticmethod
     def _offending_sites():
-        source = Path(inspect.getsourcefile(routes)).read_text(encoding="utf-8")
-        tree = ast.parse(source)
+        parts = (routes, *map(importlib.import_module, routes._OWNERS))
+        tree = ast.Module([n for part in parts for n in ast.parse(inspect.getsource(part)).body], [])
         bad = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):

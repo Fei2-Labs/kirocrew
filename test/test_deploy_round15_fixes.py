@@ -16,9 +16,15 @@ from pathlib import Path
 import pytest
 
 SRC = Path(__file__).parent.parent / "src" / "kiro_crew"
-HANDLERS = (SRC / "deploy" / "handlers.py").read_text(encoding="utf-8")
+HANDLERS = "".join(
+    (SRC / "deploy" / name).read_text(encoding="utf-8")
+    for name in ("handlers_guards.py", "handlers_content.py", "handlers_sites.py", "handlers.py")
+)
 VALIDATION = (SRC / "validation.py").read_text(encoding="utf-8")
-MCP_CORE = (SRC / "mcp_core.py").read_text(encoding="utf-8")
+MCP_CORE = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in [SRC / "mcp_core.py", *sorted((SRC / "mcp_core_parts").glob("*.py"))]
+)
 DEPLOY_INIT = (SRC / "deploy" / "__init__.py").read_text(encoding="utf-8")
 
 
@@ -103,7 +109,7 @@ class TestDeploySkillsCopyNotSymlink:
         """Existing links are detached and replaced with copies.
 
         Through the junction-aware pair, not ``is_symlink()`` / ``unlink()``:
-        ``<home>/skills/<name>`` is also published by ``apps/bridges.py`` via
+        ``<home>/skills/<name>`` is also published by ``apps/bridges_skills.py`` via
         ``symlink_or_junction``, a directory JUNCTION on unelevated Windows,
         which ``is_symlink()`` reports as a plain directory.
         """

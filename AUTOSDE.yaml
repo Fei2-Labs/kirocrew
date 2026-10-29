@@ -15,6 +15,14 @@ custom-rules:
       - "docs/feature-map/README.md"
       - "website/src/pages/**"
       - "src/kiro_crew/dashboard/handlers/**"
+      - "src/kiro_crew/dashboard/chat_api/**"
+      - "src/kiro_crew/dashboard/messaging_api/**"
+      - "src/kiro_crew/dashboard/file_api/**"
+      - "src/kiro_crew/dashboard/agent_admin/**"
+      - "src/kiro_crew/dashboard/routes/**"
+      - "src/kiro_crew/dashboard/server.py"
+      - "src/kiro_crew/dashboard/server_*.py"
+      - "src/kiro_crew/dashboard/server_runtime/**/*.py"
       - "website/src/App.tsx"
     rule: |
       Keep the feature map semantically aligned with every structural dashboard
@@ -44,11 +52,14 @@ custom-rules:
       Enforce KiroCrew backend security controls, based on real vulnerabilities
       found and fixed in this codebase.
 
-      - Never read sensitive credential paths (~/.aws, ~/.ssh, ~/.gnupg,
-        ~/.docker, ~/.kube, ~/.npmrc, ~/.pypirc, ~/.netrc, ~/.git-credentials,
-        ~/.kiro/crew/.env and the pre-move ~/.kirocrew/.env). File reads of
+      - Never read sensitive credential paths (for example ~/.aws, ~/.ssh,
+        ~/.gnupg, ~/.docker, ~/.kube, ~/.npmrc, ~/.pypirc, ~/.netrc,
+        ~/.git-credentials, ~/.kiro/crew/.env and the pre-move ~/.kirocrew/.env;
+        the canonical list is `_SENSITIVE_HOME_DIRS` in security/paths_lists.py, and
+        this list is illustrative, not the enforcement scope). File reads of
         user- or LLM-influenced paths MUST go
-        through hooks.py, which enforces is_sensitive_path(); trusted
+        through hooks.py, which enforces is_sensitive_path()
+        (security/paths.py); trusted
         fixed-path internal config/package reads are exempt. Never weaken that
         keystone.
       - Never trust LLM output. Scan with redact_exfiltration_urls() AND
@@ -64,8 +75,9 @@ custom-rules:
         provider spawn helpers), which apply an OS-level sandbox via wrap_argv().
       - The dashboard binds to 127.0.0.1 by default (local-only). Binding to
         0.0.0.0 is permitted ONLY when token-auth middleware is active. Never
-        bind to 0.0.0.0 without token auth — see origin.py:is_local_only() and
-        token_auth.py:token_auth_middleware().
+        bind to 0.0.0.0 without token auth — see dashboard/urls.py:is_local_only()
+        (re-exported by dashboard/origin.py) and
+        dashboard/token_auth.py:token_auth_middleware().
       - All tool invocations and permission decisions MUST emit a SEL audit
         event via sel.py.
       - Never hardcode secrets. Store them in ~/.kiro/crew/.env with chmod 600,
@@ -130,9 +142,24 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/slack/gateway.py"
+      - "src/kiro_crew/slack/gateway_runtime/**/*.py"
       - "src/kiro_crew/dashboard/server.py"
+      - "src/kiro_crew/dashboard/server_*.py"
+      - "src/kiro_crew/dashboard/server_runtime/**/*.py"
       - "src/kiro_crew/dashboard/handlers/**/*.py"
+      - "src/kiro_crew/dashboard/messaging_api/**/*.py"
+      - "src/kiro_crew/dashboard/file_api/**/*.py"
+      - "src/kiro_crew/dashboard/agent_admin/**/*.py"
       - "src/kiro_crew/cli.py"
+      - "src/kiro_crew/cli_gateway_boot.py"
+      - "src/kiro_crew/cli_jail.py"
+      - "src/kiro_crew/cli_knowledge.py"
+      - "src/kiro_crew/cli_logging.py"
+      - "src/kiro_crew/cli_parser_*.py"
+      - "src/kiro_crew/cli_server.py"
+      - "src/kiro_crew/cli_server_*.py"
+      - "src/kiro_crew/dashboard/routes/**/*.py"
+      - "src/kiro_crew/deploy/handlers.py"
     rule: |
       Do NOT add work to the gateway boot path. Everything between process
       start and the moment the dashboard socket accepts requests runs once, in
@@ -144,16 +171,22 @@ custom-rules:
 
       The boot path means, specifically:
       - `GatewayOrchestrator.run()` up to the `KIROCREW_READY` print
-      - `start_dashboard()` up to `await _start_site(site, port)`
-      - any `_init_*()` or `setup_*_routes()` reached from those
-      - `cli.py`'s gateway command before `asyncio.run()`
+      - `start_dashboard()` (the gateway's default dashboard) up to
+        `await site.start()` on the reserved `SockSite`
+      - `start_api_server()` (the `--no-dashboard` API-only path) up to
+        `await _start_site(site, port)`
+      - any `_init_*()`, `setup_*_routes()`, `register()` / `register_all()` /
+        `register_routes()` route registrar reached from those
+      - `cli.py`'s gateway command before `asyncio.run()`, and
+        `cli_server._gateway()` up to `run_gateway()`
 
       Reject a diff that puts any of these on that path:
 
       1. A new awaited or synchronous step before the socket binds. Adding one
          is a product decision about startup latency, not a detail.
       2. Subsystem construction as a side effect of route registration. A
-         `setup_*_routes()` function must only register routes
+         `setup_*_routes()` / `register(app)` / `register_routes()` registrar
+         must only register routes
          (`app.router.add_*`). Building a pipeline, opening a store, or
          constructing a client there drags that subsystem's whole init onto the
          boot path, where nobody looking at the route file will find it.
@@ -194,7 +227,11 @@ custom-rules:
     file-patterns:
       - "test/**/*.py"
       - "tests/**/*.py"
+      - "packages/**/tests/**/*.py"
       - "src/kiro_crew/apps/builtins/**/tests/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/*_tests/**/*.py"
+      - "conftest.py"
+      - "**/conftest.py"
     rule: |
       A test must have no side effects outside its own tmp dir. Never register a
       real cron job, write into the operator's real ~/.kiro/crew or HOME, start
@@ -269,13 +306,16 @@ custom-rules:
         bindings via `_isolate_shared_kiro_paths`, scrubs the inherited
         shell-preload and exported-function variables `name_grant` refuses on
         (`BASH_ENV`/`ENV`/..., `BASH_FUNC_*`), pins the SEL default dir
-        session-wide, redirects `tempfile`'s base with residue reported, and
-        fails the run on residue at the repository root.
-      - `test/conftest.py` adds ~20 MORE autouse fixtures, and it applies ONLY to
-        `test/`. Tests under `src/kiro_crew/apps/builtins/*/tests/` see the
+        session-wide, redirects `tempfile`'s base with residue reported,
+        restores the session CWD in a `tryfirst` teardown hook before fixture
+        finalizers run, and fails the run on residue at the repository root.
+      - `test/conftest.py` adds ~40 MORE autouse fixtures, and it applies ONLY to
+        `test/`. Tests under `src/kiro_crew/apps/builtins/**/tests/` see the
         rootdir conftest plus that app's own
         `tests/conftest.py` where one exists (`auto_improvement`,
-        `code_review_sage`, `spec_builder` have one; the other five apps do not).
+        `code_review_sage`, `spec_builder` have one; the other apps do not), and
+        `aws_control/crew/runtime/container_tests/` sees the rootdir conftest
+        plus its own.
         So a test there gets the host floor -- which now includes the data home,
         the import-time `~/.kiro` bindings, the SEL dir, the subagent registry,
         the model-download block and the agent-state sidecar -- but NOT the
@@ -297,7 +337,11 @@ custom-rules:
       Assert against the tmp dir, not the real one, and clean up anything you
       create. If a test genuinely needs a host-level effect, it must be opt-in
       and named in the corresponding conftest allowlist with a comment saying
-      why.
+      why. One scoped exception: the rootdir `conftest.py` keeps two per-user
+      caches across runs on purpose, the hypothesis example database
+      (`~/.cache/kirocrew/hypothesis`) and the bytecode mirror
+      (`~/.cache/kirocrew/pycache`), both under `$XDG_CACHE_HOME` when set. Those
+      two are not a test's side effect; nothing else in a conftest is exempt.
 
       NEVER use bare `tempfile.mkdtemp()` or `tempfile.TemporaryDirectory()`
       without cleanup. These create directories that survive the test run and
@@ -322,6 +366,120 @@ custom-rules:
       established in test_builtin_app_assets.py, test_platform_compat.py, and
       test_skill_home_paths.py.
 
+  - id: tests-are-deterministic
+    blocking: true
+    file-patterns:
+      - "test/**/*.py"
+      - "packages/**/tests/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/tests/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/*_tests/**/*.py"
+      - "conftest.py"
+      - "**/conftest.py"
+    rule: |
+      A test must give the same verdict on every run, on every platform, in any
+      order and beside any neighbour. The suite runs `-n auto --dist loadgroup`
+      on Linux, macOS and Windows runners under load, so a test that is only
+      usually right reds unrelated pull requests. The contract is
+      `docs/system-specs/common/testing-conventions.md` § Determinism contract
+      (D1-D12, named on each item below); each shape below has burned this
+      repository before.
+
+      FLAG, on added or changed test lines:
+      1. (D1) A fixed sleep (`time.sleep(N)` / `await asyncio.sleep(N)` with
+         N > 0) used as a barrier before an assertion: "long enough for the
+         other side to get there". Wait on the state, event or future the
+         assertion reads, under a bounded deadline that raises naming what it
+         last saw. A sleep before an ABSENCE assertion is a barrier too unless
+         a positive signal first proved the other side reached the point where
+         it would act (the waiter registered, the product's own tick counter
+         reached N): without one the negative passes for the trivial reason.
+      2. (D3) A sleep that exists to make two timestamps differ, or an ORDER
+         assertion between records whose order comes from a stamp read off a
+         clock the test did not set. Windows' `time.time()` ticks ~15.6 ms
+         through Python 3.12 and some filesystems store mtimes in whole
+         seconds, so the stamps can tie. Set the stamps, assert the order
+         strictly (an exact list or `<`, not `>=`, which also accepts the
+         tie), and pin a time-sorted output's tie-break with an equal-stamp
+         pair. Do not flag a `<=` / `>=` on an invariant a tie satisfies
+         (start <= finish), or an order of stamps the product mints strictly
+         increasing.
+      3. (D2) A clock read at module level (`NOW = time.time()`) compared with
+         a value production derives from its own live clock. Either both sides
+         read one clock or neither does.
+      4. (D5) A `datetime.now()`, `date.today()` or `time.localtime()` read at
+         test time in an expectation, when the product stamps in another zone
+         or the two reads can straddle a midnight the test does not control.
+         Read the zone the product reads, and freeze the instant. A
+         `time.localtime(<fixed instant>)` that mirrors a product defined in
+         local time is correct; do not flag it.
+      5. (D7) An UPPER bound on a measured wall or CPU duration, a rate or a
+         sample count (`assert elapsed < 0.5`, "about 125 samples"). Assert the
+         work, the schedule or the order. Do not flag: a LOWER bound that proves
+         a deadline or backoff was honoured ("did not fire early") with a margin
+         of at least one clock tick; a bound relative to a span the test
+         measured itself; an existing complexity guard's thread-CPU budget kept
+         at its original constant.
+      6. (D8) An await, `join` or `communicate` the test itself must unblock,
+         with no timeout. On Windows a hang kills the xdist worker and aborts
+         the run; bound it so a miss fails by name at that line. A literal bound
+         on a condition wait (`wait_for`, `join`, `communicate`, a poll
+         deadline) is NOT flagged when its expiry fails the test loudly. Flag a
+         timeout only when the diff RAISES a literal, raises a named ceiling
+         without a cited measurement, or makes the pass depend on time elapsing
+         (a sleep standing in for a sync).
+      7. (D4) Sequence equality over a `set`, a dict built from one, `listdir` /
+         `iterdir` / `glob`, `as_completed` iteration, or side effects appended
+         in completion order, without `sorted()` or a `set` / `Counter`
+         comparison. `gather`'s return list is in argument order; do not flag
+         it.
+      8. (D6) `os.urandom` or the module-level `random.*` feeding an assertion,
+         instead of `random.Random(SEED)`.
+      9. (D9) A literal TCP port passed to a real bind or listen, or a
+         bind-close-return port handed to a listener that could bind port 0 and
+         report the port it got. A port number used only as data (a config
+         value, a fake socket's address, a URL under test) is not flagged.
+      10. (D10) A non-loopback network call that is not stubbed at the seam
+          the product calls.
+      11. (D2, D11) `setattr` or `patch` that rebinds a stdlib clock or sleep
+          for the whole worker (`time.time`, `time.monotonic`,
+          `time.perf_counter`, `time.sleep`), including through an alias such
+          as `"<mod>.time.monotonic"`, where `<mod>.time` is the stdlib module
+          itself: every event loop and thread in the worker reads it. Replace
+          the module-under-test's own `time` binding with a namespace that
+          delegates every other name to the real module. Also any in-process
+          `importlib.reload` of a shared module (load a private copy with
+          `importlib.util.spec_from_file_location` under a unique name,
+          registered under that name in `sys.modules` before `exec_module`,
+          never under the real name), and a
+          `sys.modules` eviction without restoring both the entry and the
+          parent package's attribute in the same scope.
+      12. (D11) A NEWLY ADDED autouse fixture that requests the shared
+          `monkeypatch` (use `_floor_monkeypatch`), or a bare
+          `monkeypatch.undo()` in a test body (scope the patch with
+          `monkeypatch.context()`).
+
+      Allowed (do NOT flag):
+      - a sleep inside a stub that simulates slow work while the test waits
+        on a signal;
+      - the interval of a bounded poll that re-reads the asserted state and
+        raises at its deadline (D1);
+      - a sleep that IS the subject, with the schedule asserted;
+      - a sleep inside a string literal: a spawned stand-in's keep-alive
+        payload (`"import time; time.sleep(120)"`) or source text fed to a
+        scanner;
+      - a named `UPPER_CASE` lost-run ceiling as testing-conventions defines
+        it (sized from a cited measurement, at most half the module's
+        `pytest.mark.timeout`, which the file may raise with its derivation);
+      - a line carrying `# flake-ok: <reason>` with a concrete reason.
+
+      A fix to a flaky test is held to the same bar. A retry, a rerun marker, a
+      skip, an xfail, a longer sleep, a raised timeout or a weakened assertion is
+      never the fix, except a module `pytest.mark.timeout` raised with its
+      derivation so a measured lost-run ceiling fits, or a too-tight bound
+      replaced by a NAMED lost-run ceiling sized from a cited measurement. FLAG
+      the rest on every path this rule covers (`a-ratchet-may-only-tighten`
+      covers the same loosening under `test/`).
+
   - id: top-level-imports
     blocking: false
     file-patterns:
@@ -336,6 +494,9 @@ custom-rules:
       - TYPE_CHECKING blocks: `if TYPE_CHECKING: from ...` (zero runtime cost).
       - Genuine circular-import avoidance — add a `# circular import` comment
         explaining why.
+      - A deliberately deferred import that `no-new-work-on-gateway-boot-path`
+        requires, or an import-weight deferral a test pins, with a comment naming
+        the reason. The blocking boot-path rule outranks this advisory one.
       - Optional dependencies: `try: import foo except ImportError: foo = None`
 
   - id: harness-parity
@@ -345,12 +506,46 @@ custom-rules:
       - "src/kiro_crew/providers/**/*.py"
       - "src/kiro_crew/platform/**/*.py"
       - "src/kiro_crew/config/loader.py"
+      - "src/kiro_crew/config/loader_*.py"
       - "src/kiro_crew/session.py"
+      - "src/kiro_crew/session_parts/*.py"
       - "src/kiro_crew/subagent.py"
+      - "src/kiro_crew/subagent_parts/*.py"
       - "src/kiro_crew/sandbox.py"
+      - "src/kiro_crew/sandbox_leaves.py"
+      - "src/kiro_crew/sandbox_tiers.py"
+      - "src/kiro_crew/sandbox_precreate.py"
+      - "src/kiro_crew/sandbox_seals.py"
+      - "src/kiro_crew/sandbox_aliases.py"
+      - "src/kiro_crew/sandbox_staging.py"
+      - "src/kiro_crew/sandbox_workspace.py"
+      - "src/kiro_crew/sandbox_argv.py"
+      - "src/kiro_crew/sandbox_delegation.py"
+      - "src/kiro_crew/sandbox_probe.py"
+      - "src/kiro_crew/sandbox_unavailable.py"
+      - "src/kiro_crew/sandbox_wrap.py"
+      - "src/kiro_crew/sandbox_cgroup.py"
+      - "src/kiro_crew/sandbox_slice.py"
+      - "src/kiro_crew/sandbox_rlimit.py"
+      - "src/kiro_crew/sandbox_spawn.py"
+      - "src/kiro_crew/sandbox_plan.py"
+      - "src/kiro_crew/sandbox_launcher.py"
+      - "src/kiro_crew/sandbox_launcher_program.py"
+      - "src/kiro_crew/sandbox_launcher_parts/*.py"
+      - "src/kiro_crew/sandbox_seatbelt.py"
+      - "src/kiro_crew/acp_backends.py"
+      - "src/kiro_crew/mcp_hot_reload.py"
+      - "src/kiro_crew/agent_sdk/backends.py"
+      - "src/kiro_crew/agent_sdk/backends_launch.py"
+      - "src/kiro_crew/agent_sdk/backends_mcp.py"
+      - "src/kiro_crew/agent_sdk/backends_members.py"
+      - "src/kiro_crew/agent_sdk/backends_models.py"
+      - "src/kiro_crew/agent_sdk/backends_routing.py"
+      - "src/kiro_crew/agent_sdk/backends_sessions.py"
+      - "src/kiro_crew/agent_sdk/backends_turns.py"
     rule: |
       Kiro Crew drives ONE first-class agent harness — kiro-cli
-      (ACP_BACKEND_KIRO, spelled "") — and ADAPTS the others (the dormant
+      (ACP_BACKEND_KIRO, spelled "") — and ADAPTS the others (the
       ACP_BACKEND_CLAUDE seam, KAS, and any bring-your-own harness). An added
       harness may only adapt itself to the seams the Kiro harness already runs
       through. It may not move, widen, generalize, or add a branch to them. The
@@ -386,7 +581,8 @@ custom-rules:
         lookup, or that makes an unusable persisted acp_backend raise instead of
         degrading to kiro with a logged reason.
       - H6/H7 — capability grants. A new capability predicate must be membership
-        in a named ACP_BACKENDS_* set in acp/types.py, and every existing
+        in a named ACP_BACKENDS_* set (defined in agent_sdk/backends.py or a backends_* owner,
+        re-exported by agent_sdk/backends.py and acp/types.py), and every existing
         harness's membership must be an explicit decision in the diff. FLAG a
         new predicate that grants a capability to a harness the PR never
         mentions. For is_kiro_cli specifically the failure is OPEN — it makes
@@ -395,7 +591,7 @@ custom-rules:
         security finding.
 
       Allowed (do NOT flag):
-      - The dormant ACP_BACKEND_CLAUDE / _is_claude seam and its existing
+      - The ACP_BACKEND_CLAUDE / _is_claude seam and its existing
         negative call sites. They predate this rule, the whole-tree backlog is a
         non-failing report by design, and converting them is a separate change.
       - A pre-existing negative test on a line the PR merely moved or reindented.
@@ -409,22 +605,38 @@ custom-rules:
     blocking: true
     file-patterns:
       - "src/kiro_crew/context.py"
+      - "src/kiro_crew/context_assembly/**/*.py"
       - "src/kiro_crew/memory.py"
       - "src/kiro_crew/vector_memory.py"
+      - "src/kiro_crew/vector_memory_*.py"
+      - "src/kiro_crew/vector_memory_runtime/**/*.py"
       - "src/kiro_crew/suggestions.py"
       - "src/kiro_crew/tips.py"
       - "src/kiro_crew/task_executor.py"
       - "src/kiro_crew/task_planner.py"
       - "src/kiro_crew/history_consolidation.py"
+      - "src/kiro_crew/history_consolidation_*.py"
       - "src/kiro_crew/messaging/**/*.py"
       - "src/kiro_crew/subagent_manager/**/*.py"
       - "src/kiro_crew/slack/**/*.py"
       - "src/kiro_crew/telegram/**/*.py"
       - "src/kiro_crew/discord/**/*.py"
+      - "src/kiro_crew/feishu/**/*.py"
+      - "src/kiro_crew/imessage/**/*.py"
+      - "src/kiro_crew/teams/**/*.py"
+      - "src/kiro_crew/webex/**/*.py"
+      - "src/kiro_crew/wecom/**/*.py"
+      - "src/kiro_crew/weixin/**/*.py"
+      - "src/kiro_crew/dashboard/chat_api/**/*.py"
       - "src/kiro_crew/dashboard/chat_runner.py"
+      - "src/kiro_crew/dashboard/chat_turn/**/*.py"
       - "src/kiro_crew/dashboard/handlers/**/*.py"
+      - "src/kiro_crew/dashboard/messaging_api/**/*.py"
+      - "src/kiro_crew/dashboard/file_api/**/*.py"
+      - "src/kiro_crew/dashboard/agent_admin/**/*.py"
       - "src/kiro_crew/eval/runner.py"
       - "src/kiro_crew/config/loader.py"
+      - "src/kiro_crew/config/loader_*.py"
       - "scripts/check_memory_store_seam.py"
     rule: |
       A named memory store is a SILO: cfg.agents[<crew>].memory_store
@@ -478,10 +690,11 @@ custom-rules:
         or backfills, and any fallback read of Global Memory or another store when
         the selected store is missing or unreadable. Explicit owner-selected
         copies must satisfy the allowed case below.
-      - THE GATE ITSELF WIDENED. FLAG an added ALLOWLIST entry (the table is
-        intended empty and its size is printed on every run), a rule made
-        conditional, or a `# memory-store-ok:` marker whose reason does not
-        survive reading — the reason exists so a reviewer can decide whether the
+      - THE GATE ITSELF WIDENED. FLAG an added exemption table or ALLOWLIST
+        (scripts/check_memory_store_seam.py has none today; a reintroduced one
+        is the widening), a rule made conditional, or a `# memory-store-ok:`
+        marker whose reason does not survive reading — the reason exists so a
+        reviewer can decide whether the
         call really has no store to name.
 
       Allowed (do NOT flag):
@@ -564,12 +777,76 @@ custom-rules:
 
       Allowed (do NOT flag):
       - A release PR that prepends one new `## [X.Y.Z] - YYYY-MM-DD` section
-        and, in the same commit, bumps src/kiro_crew/__init__.py.
+        and, in the same commit, bumps the version files docs/build/release.md
+        lists (src/kiro_crew/__init__.py, pyproject.toml,
+        website/electron/package.json).
       - Correcting a genuine factual error inside an already-shipped section,
         when the PR body says that is what it is doing. Say it out loud; an
         unexplained edit to shipped history is the defect this rule exists for.
       - Porting an already-written section verbatim between main and a release
         branch, where the diff adds a section and removes nothing.
+
+  - id: recorded-decisions-are-not-regressions
+    blocking: true
+    file-patterns:
+      - "docs/decisions/**"
+      - "website/src/**"
+      - "src/kiro_crew/**"
+    rule: |
+      docs/decisions/ is the team's record of product and design decisions a
+      person made: one immutable file per decision, indexed by its README. The
+      rules are in docs/decisions/README.md. This rule exists because a
+      recorded decision was reversed by a pull request that read as an ordinary
+      fix: a single nightly friction row asked for a longer button label, the
+      PR changed it, and nothing in review knew the short label had been chosen
+      on purpose. A decision that has to be re-made every time a report
+      disagrees with it was never recorded at all.
+
+      - FLAG any diff that EDITS, RENAMES or DELETES an existing file under
+        docs/decisions/ other than README.md. An entry is written once. A
+        change of mind is a NEW entry carrying a `Supersedes:` line that names
+        the old one, and the old file stays byte-identical.
+        `scripts/check_decisions_history.py` refuses this mechanically in Fast
+        Gate, so spend your attention on the next three points; report it only
+        if the gate somehow did not.
+      - FLAG a change to a user-facing label, wording, placement or behaviour
+        that an entry under docs/decisions/ records, when the PR adds no
+        superseding entry. Grep the directory for the control, key or
+        behaviour the diff touches. That the change closes an issue, answers a
+        friction report, satisfies a review finding or makes a test read
+        better is not a reason: an entry outranks all of those. A report that
+        collides with an entry is a feature request against a settled
+        decision, linked to the entry by its file path and left to a
+        maintainer; no fix is made from the report itself. Treat the reversal
+        as a regression, whatever the PR title says.
+      - FLAG a PR that carries an entry with a `Supersedes:` line, with or
+        without the code change it authorizes. This flag is by design: the one
+        way a decision changes is a dedicated PR carrying the superseding
+        entry, and a maintainer's override of this flag is what lets it land.
+        The entry is not a license to un-flag the code change beside it; the
+        maintainer's override is the approval, and it covers both.
+      - FLAG a new entry, superseding or not, whose Evidence links no
+        on-record artifact carrying the human decision it records — an issue,
+        a pull-request comment or a commit, checkable by anyone. "Decided in
+        chat" with no link is not evidence; the person restates the decision
+        on the PR and the entry cites that comment. An entry that decides on
+        the agent's own authority is refused.
+      - FLAG a new entry whose linked on-record statement was made by someone
+        not listed in MAINTAINERS.md. A contributor's stated preference, cited
+        by a contributor's own entry, is not a settled decision; a maintainer
+        restates it on the PR and the entry cites that comment instead.
+
+      Allowed (do NOT flag):
+      - Adding a new entry that names the person who decided and links the
+        evidence, with the matching index row in docs/decisions/README.md.
+      - Adding a founding entry (one with no `Supersedes:` line) that records
+        the outcome a person already decided AND links that person's on-record
+        statement of it, in the SAME PR as a change that RESTORES that outcome
+        after an unrecorded reversal. Nothing is being changed; the ledger is
+        catching up with what was decided, and the link is what keeps this
+        path from being a way to write a decision nobody made.
+      - Editing docs/decisions/README.md itself (index rows, rule wording).
+      - A change to a label, placement or behaviour that no entry records.
 
   - id: recurring-defect-patterns
     blocking: false
@@ -647,7 +924,8 @@ custom-rules:
 
       A durable store owns a single connection behind a single lock and a
       dedicated writer thread. Route the DATABASE phase through that writer
-      (`await store.run(...)`, or the surface's existing `*_async` seam) and keep
+      (for `TaskStore`, `await store.run(...)`; other stores expose an existing
+      `*_async` seam or an `OnLoopDBGuard`) and keep
       Futures, Events, slot counts, wake callbacks and in-memory run state ON the
       loop. Do not hand a whole coordinator that touches asyncio primitives to a
       thread: split the site explicitly into a DB phase and a loop-apply phase.
@@ -660,7 +938,7 @@ custom-rules:
       `try/except Exception` SWALLOWS the on-loop guard's exception, so the site
       is invisible to an armed run and the suite goes green over it. When a
       caller swallows, pin the site on the store's on-loop COUNTER
-      (`loop_thread_calls` before/after) instead, or narrow the `except` to the
+      (for `TaskStore`, `loop_thread_calls` before/after) instead, or narrow the `except` to the
       exceptions it actually means.
 
       FLAG a new store call reachable from a coroutine. FLAG an `except
@@ -677,6 +955,29 @@ custom-rules:
       - a site provably unreachable with a live store (constructed and called in
         one statement block with no await between), stated as such;
       - CLI / one-shot paths that run with no loop, and test code.
+
+  - id: an-async-test-respects-the-on-loop-lock
+    blocking: false
+    file-patterns:
+      - "test/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/tests/**/*.py"
+    rule: |
+      `no-sync-store-call-from-a-coroutine` exempts test code, and for most
+      stores that is right. It is wrong for a store behind
+      `platform_lock_compat.file_lock`, whose acquire on the event-loop thread is a
+      single non-blocking attempt by design: an `async def` test that seeds or
+      reads such a store directly (a crew-log-backed ledger, the issue-radar
+      crew store) is refused whenever an eager folder or writer thread holds
+      the unit lock for a moment, which a Windows runner does often. FLAG an
+      added direct call to a file_lock-backed store inside an `async def`
+      test; ask for `await asyncio.to_thread(...)`, the store's `*_async`
+      seam, or a seed done before the loop starts, and for the test to settle
+      prior crew-log work before a negative control.
+      Measured: `test_issue_radar_crew_runtime.py` failed on main
+      (37016758395/1/110870301307) and in a merge group
+      (37053522199/1/110993309643) with `could not acquire exclusive file lock:
+      still held after waiting 0.00s (one attempt)` until #16102 and #16465.
+      Allowed (do NOT flag): a test that asserts the on-loop refusal itself.
 
   - id: persist-before-you-publish
     blocking: true
@@ -717,9 +1018,23 @@ custom-rules:
     blocking: true
     file-patterns:
       - "test/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/tests/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/container_tests/**/*.py"
       - "website/src/test/**"
       - "website/src/**/*.test.ts"
       - "website/src/**/*.test.tsx"
+      - "website/electron/**/*.test.*"
+      - ".github/black-baseline.txt"
+      - ".github/subprocess-encoding-baseline.txt"
+      - ".github/sync-io-in-async-baseline.txt"
+      - ".github/sync-io-in-async-fs-baseline.txt"
+      - ".github/agent-sdk-boundary-baseline.txt"
+      - ".github/docs-lint-baseline.txt"
+      - "website/src/i18n/untranslated-baseline.json"
+      - "website/src/i18n/untranslated-strict-baseline.json"
+      - "website/src/i18n/render-baseline.json"
+      - "website/src/i18n/dynamic-keys-baseline.json"
+      - "website/scripts/restyle-baseline.json"
     rule: |
       A test that pins a COUNT, an exact set, or a universal property over every
       site is a ratchet: it exists so that adding an unreviewed instance of some
@@ -738,7 +1053,12 @@ custom-rules:
         that the production path actually resolves, and bound it only as a
         lost-run ceiling;
       - a newly added `skip` / `xfail`, a broadened `except`, or a deleted
-        assertion in a file the diff otherwise only extends.
+        assertion in a file the diff otherwise only extends;
+      - an entry ADDED to one of the shrink-only baseline files listed above, or
+        a count in one RAISED: each lists debt a gate tolerates, so growing it
+        loosens the gate. A gate that reads such a file accepts a hand-added
+        entry, so review is where it is caught. Removing a stale entry tightens
+        and is not a finding.
 
       Allowed (do NOT flag): the count MOVES to the new true value and the
       comment naming the roles moves with it; a slice/region marker is widened so
@@ -748,12 +1068,63 @@ custom-rules:
       When a ratchet cannot be satisfied without loosening it, that is the
       finding — say so on the PR instead of editing the ratchet.
 
+  - id: a-stopwatch-is-not-a-barrier
+    blocking: false
+    file-patterns:
+      - "test/**/*.py"
+      - "src/kiro_crew/apps/builtins/**/tests/**/*.py"
+    rule: |
+      A test must not use real elapsed time as the PROOF that something
+      happened. FLAG an added line that asserts a LOWER bound on a measured
+      duration (`assert elapsed >= hold_secs`, `assert waited > 0.1`), or that
+      compares a float budget to its cap exactly, and ask for the signal the
+      production path resolves instead: the event, the store row, the future,
+      a fake clock that only the code's own sleep advances.
+      Windows' `time.monotonic()` ticks every ~15.6 ms and a loaded shard
+      stretches every sleep, so the same correct code measures differently on
+      a different runner. In 2026-09 `test_history_index_worker`'s
+      `assert elapsed >= hold_secs, "the write did not actually contend"`
+      failed on 18 PR runs (e.g. 35958461916/2/107768444738) until #15709,
+      and `test_session_keepalive`'s call-count fake clock failed on main
+      (36308851008/1/108591002408) until #14935.
+      A pre-filter that finds the candidates on added lines:
+      `^\+\s*assert\s+\(?\s*\w*(?:elapsed|duration|took|waited)\w*\s*>=?(?!=)`.
+      UPPER bounds are `tests-are-deterministic` item 5 (D7), not this rule.
+      Allowed (do NOT flag): a lower bound that proves a deadline or backoff
+      was honoured ("did not fire early") with a margin of at least one clock
+      tick, or one relative to a span the test measured itself, both of which
+      D7 keeps; a duration read from a fake clock the test drives.
+
   - id: a-sandbox-widening-is-not-incidental-scope
     blocking: true
     file-patterns:
       - "src/kiro_crew/sandbox.py"
-      - "src/kiro_crew/security.py"
+      - "src/kiro_crew/sandbox_leaves.py"
+      - "src/kiro_crew/sandbox_tiers.py"
+      - "src/kiro_crew/sandbox_precreate.py"
+      - "src/kiro_crew/sandbox_seals.py"
+      - "src/kiro_crew/sandbox_aliases.py"
+      - "src/kiro_crew/sandbox_staging.py"
+      - "src/kiro_crew/sandbox_workspace.py"
+      - "src/kiro_crew/sandbox_argv.py"
+      - "src/kiro_crew/sandbox_delegation.py"
+      - "src/kiro_crew/sandbox_probe.py"
+      - "src/kiro_crew/sandbox_unavailable.py"
+      - "src/kiro_crew/sandbox_wrap.py"
+      - "src/kiro_crew/sandbox_cgroup.py"
+      - "src/kiro_crew/sandbox_slice.py"
+      - "src/kiro_crew/sandbox_rlimit.py"
+      - "src/kiro_crew/sandbox_spawn.py"
+      - "src/kiro_crew/sandbox_plan.py"
+      - "src/kiro_crew/sandbox_launcher.py"
+      - "src/kiro_crew/sandbox_launcher_program.py"
+      - "src/kiro_crew/sandbox_launcher_parts/*.py"
+      - "src/kiro_crew/sandbox_seatbelt.py"
+      - "src/kiro_crew/sandbox_mount_sweep.py"
+      - "src/kiro_crew/security/**"
       - "src/kiro_crew/hooks.py"
+      - "src/kiro_crew/hook_runtime/**"
+      - "src/kiro_crew/agent_sdk/tool_gate.py"
     rule: |
       What the OS sandbox seals, masks, no-follow pins or refuses is an
       OPERATOR-FACING contract: it decides which of their own files their agent can
@@ -881,7 +1252,8 @@ custom-rules:
       membership test — is load-bearing exactly to the extent that deleting it
       reds a test. Most of them here red nothing.
 
-      Measured on this PR: deleting `generation=record.generation` from the task
+      Measured on the PR that introduced this rule: deleting
+      `generation=record.generation` from the task
       panel's `answer_input` call reds ZERO of 225 tests, and so does deleting it
       from the `cancel_wait` call beside it. Both are the only thing standing
       between an operator's answer and a DIFFERENT question the row asked after a
@@ -944,9 +1316,8 @@ custom-rules:
   - id: an-operator-facing-string-states-what-was-measured
     blocking: false
     file-patterns:
-      - "src/kiro_crew/config/sections.py"
       - "config-baseline.json"
-      - "docs/system-specs/**/*.md"
+      - "docs/**/*.md"
       - "src/kiro_crew/**/*.py"
     rule: |
       `recurring-defect-patterns` already flags a docstring that contradicts the
@@ -978,3 +1349,61 @@ custom-rules:
       FLAG a changed help/spec sentence naming a threshold, a default equality or
       a cap relationship with no test that measures it. Do NOT flag ordinary
       descriptive copy that states no consequence.
+
+  - id: keep-modules-small
+    blocking: false
+    file-patterns:
+      - "src/kiro_crew/**/*.py"
+      - "test/**/*.py"
+      - "scripts/**"
+      - "packages/**/*.py"
+      - ".github/scripts/**/*.py"
+      - "conftest.py"
+      - "xdist_budget.py"
+      - "**/*.sh"
+      - "**/*.ps1"
+      - "**/*.swift"
+    rule: |
+      A hand-written code file holds at most 2,000 lines:
+      `scripts/check_file_line_cap.py` fails the lint jobs when a change leaves a
+      file it touches past the cap and `.github/file-line-cap-baseline.txt` does
+      not list it. The working target is 1,600, so the next change has room. How
+      to split safely is `docs/system-specs/common/code-style.md` § Splitting a
+      file.
+
+      FLAG, each with what to ask for instead:
+      - A change that takes a hand-written code file past 1,600 lines, or that
+        adds a new responsibility (a class with its own job, a handler family, a
+        group of related functions) to a file already over 1,600. Ask for a new
+        module named for that responsibility, or for the split in this PR or one
+        before it.
+      - A split that reaches moved code through a plain re-export of a name
+        tests patch: `from kiro_crew.<owner> import name` in the original module
+        with nothing that carries the patch to the moved code (no
+        `kiro_crew._facade_mirror` install, no `kiro_crew._facade_compose.compose`
+        call running that owner on the facade's globals, no facade-class
+        `__setattr__` fan-out like `apps/backend.py`'s). The patch then rebinds
+        the facade alone and silently stops reaching the owners that read the
+        name. Ask for the mirror facade plus a patch-reach test over the names
+        the test trees patch.
+      - A new facade or binding test that freezes an exact namespace or member
+        list (`set(vars(module)) - BASE_NAMES == {...}`, `set(dir(module)) ==
+        {...}`, a symmetric difference against a frozen member set). It fails the
+        next unrelated change that adds a name, and two such changes that each
+        passed can merge into a red main. Ask for "every public name bound before
+        the split still resolves to the same object" plus a subset check for the
+        names the split adds (`added <= names`).
+      - A split that moves a sink's redactor calls out of the module its
+        `security_posture._REDACTION_SINKS` row names and leaves the row on the
+        facade. `test_every_named_sink_module_actually_redacts` also counts calls
+        in the facade's declared owners, so the row can stay green while it no
+        longer says where the sink is redacted. Ask for the row to be re-keyed to
+        the owner that now redacts, and for every module the omission test's
+        text scan matches to be a sink row or listed in
+        `NON_EGRESS_REDACTION_MODULES`. Facade rows older splits left behind
+        (`dashboard/handlers/files.py`) are not precedent.
+
+      Allowed (do NOT flag): files the script's `EXEMPTIONS` table names; a
+      baselined file that shrinks; a re-export of a name no test patches; owners
+      that look a patched name up on the facade at call time; code a facade
+      keeps because a gate pins it to that path.

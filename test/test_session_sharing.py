@@ -19,16 +19,23 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import AcpEvent
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 # ``SubagentManager.spawn`` refuses -- registering no task -- while the host
 # looks short of memory, which is the runner's state, not this test's input.
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(close_subagent_managers) -> None:
+    """Every manager built here opens tasks.db; close it at teardown, not at GC."""
+
+
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py`` — no per-file fixture needed.
 
 
-async def _wait_until_done(info, *, timeout: float = 30.0) -> None:
+async def _wait_until_done(info) -> None:
     """Wait for a spawned subagent to finish, deterministically.
 
     ``manager.spawn`` runs the subagent as a background asyncio task that flips
@@ -39,17 +46,12 @@ async def _wait_until_done(info, *, timeout: float = 30.0) -> None:
     is race-free: it returns as soon as the task settles and only fails if the
     task genuinely never completes.
     """
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while not info.done:
-        if loop.time() >= deadline:
-            raise AssertionError(
-                f"subagent {info.id} did not complete within {timeout}s"
-            )
-        await asyncio.sleep(0.01)
+    await async_wait_until(
+        lambda: info.done, describe=lambda: f"subagent {info.id} has not completed"
+    )
 
 
-async def _wait_until_awaited(mock_attr, label: str, *, timeout: float = 30.0) -> None:
+async def _wait_until_awaited(mock_attr, label: str) -> None:
     """Wait for an async mock to have been awaited, deterministically.
 
     Companion to :func:`_wait_until_done`, for assertions about TEARDOWN rather
@@ -63,12 +65,9 @@ async def _wait_until_awaited(mock_attr, label: str, *, timeout: float = 30.0) -
     this half racing. Polling the await against a deadline closes it: it returns
     as soon as teardown lands, and still fails if teardown never happens.
     """
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while not mock_attr.await_count:
-        if loop.time() >= deadline:
-            raise AssertionError(f"{label} was not awaited within {timeout}s")
-        await asyncio.sleep(0.01)
+    await async_wait_until(
+        lambda: mock_attr.await_count, describe=lambda: f"{label} has not been awaited"
+    )
 
 
 def _mock_sessions(*, sharing_eligible: bool = True) -> MagicMock:
@@ -106,7 +105,7 @@ def _mock_sessions(*, sharing_eligible: bool = True) -> MagicMock:
     mock_handle.is_turn_active = False
     mock_handle.destroy = AsyncMock()
 
-    async def _handle_prompt(msg):
+    async def _handle_prompt(msg, timeout=None):
         yield AcpEvent(kind=EVENT_TEXT_CHUNK, text="shared response")
         yield AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")
 
@@ -148,10 +147,21 @@ class TestSessionSharingDecision:
 
     def test_private_crew_target_cannot_share_a_global_parent(self):
         sessions = _mock_sessions(sharing_eligible=True)
-        manager = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True)
+        manager = SubagentManager(
+            sessions=sessions, ctx_builder=_mock_ctx_builder_auto(), is_yolo=lambda: True
+        )
         from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
-        execution = ExecutionContext("review", MemoryStoreRef("member-review", "review"), "member", "kirocrew")
-        info = SubagentInfo(id="private-review", task="review", parent_session_key="dashboard:global", memory_store="member-review", execution_context=execution)
+
+        execution = ExecutionContext(
+            "review", MemoryStoreRef("member-review", "review"), "member", "kirocrew"
+        )
+        info = SubagentInfo(
+            id="private-review",
+            task="review",
+            parent_session_key="dashboard:global",
+            memory_store="member-review",
+            execution_context=execution,
+        )
         with _cfg_patch(session_sharing=True):
             assert manager._should_use_session_sharing(info) is False
         sessions.is_session_sharing_eligible.assert_not_called()
@@ -221,7 +231,8 @@ class TestSessionSharingDecision:
 
         # model override forces CC path
         info = SubagentInfo(
-            id="test4", task="hello",
+            id="test4",
+            task="hello",
             parent_session_key="dashboard:slot1",
             model="opus-4",
         )
@@ -289,6 +300,7 @@ class TestSessionSharingSpawn:
         async def stream(*args, **kwargs):
             worker = sessions.get_or_create.call_args.args[0]
             from kiro_crew.execution_context import read_session_execution
+
             published = await asyncio.to_thread(read_session_execution, worker, required=True)
             assert published.store.store_id == store
             observed.append(worker)
@@ -297,13 +309,64 @@ class TestSessionSharingSpawn:
 
         provider.stream.side_effect = stream
         try:
-            info = manager.spawn("Read private context", parent_session_key=parent, memory_store=store)
+            info = manager.spawn(
+                "Read private context", parent_session_key=parent, memory_store=store
+            )
             assert info is not None
-            await asyncio.wait_for(asyncio.gather(*list(manager._tasks.values())), timeout=10)
+            await await_until(
+                asyncio.gather(*list(manager._tasks.values())), what="every subagent task finishes"
+            )
             assert info.done and not info.error, info.error
             assert observed == [f"subagent:{info.id}"]
         finally:
             await manager.cancel_all()
+
+    @pytest.mark.asyncio
+    async def test_dedicated_cleanup_identity_is_published_before_the_timeout_capture(
+        self, monkeypatch
+    ):
+        """A Stop landing on the ``capture_prompt_timeout`` await finds the live
+        cleanup identity already published. That capture is the dedicated path's
+        first await after the claim; were it to run ahead of the path's only
+        ``_publish_identity`` call, a cancel there would leave the tombstone
+        without the identity provider-file reclamation requires."""
+        from test_subagent import _mock_ctx_builder_auto_spawn
+        from test_subagent import _mock_sessions as dedicated_sessions
+
+        from kiro_crew.subagent_manager.run import RunEventCoordinator
+
+        sessions = dedicated_sessions()
+        provider = sessions.get_or_create.return_value[0]
+        provider.session_id = "sess-dedicated-capture"
+        manager = SubagentManager(sessions=sessions, ctx_builder=_mock_ctx_builder_auto_spawn())
+        published: list[str] = []
+        monkeypatch.setattr(
+            RunEventCoordinator,
+            "_publish_identity",
+            staticmethod(lambda agent_id, **kw: published.append(kw["session_id"])),
+        )
+        loop = asyncio.get_running_loop()
+        seen_at_capture: list[list[str]] = []
+
+        def _capture(client, default):
+            # In the to_thread worker: record what the publish had done by now,
+            # then land a Stop on the await this call is running under. The
+            # cancel is queued before this returns, so it is processed ahead of
+            # the worker's result and the run is cancelled at that exact await.
+            seen_at_capture.append(list(published))
+            info.user_stopped = True
+            loop.call_soon_threadsafe(manager._tasks[info.id].cancel)
+            return None
+
+        monkeypatch.setattr("kiro_crew.agent_sdk.capture_prompt_timeout", _capture)
+        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+            info = manager.spawn("stopped during the timeout capture")
+            assert info is not None
+            await asyncio.gather(manager._tasks[info.id], return_exceptions=True)
+
+        assert seen_at_capture == [["sess-dedicated-capture"]]
+        assert info.done and info.error == "cancelled"
+        provider.stream.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_shared_session_creates_on_runtime(self):
@@ -315,16 +378,19 @@ class TestSessionSharingSpawn:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             assert info is not None
             # Wait for the subagent to complete
             await _wait_until_done(info)
 
         # Verify runtime.create_session was called (not get_or_create)
-        sessions.get_subagent_runtime.assert_awaited_once_with("dashboard:slot1")
+        sessions.get_subagent_runtime.assert_awaited_once()
+        assert sessions.get_subagent_runtime.await_args.args == ("dashboard:slot1",)
         runtime = await sessions.get_subagent_runtime("dashboard:slot1")
         runtime.create_session.assert_awaited_once()
         # get_or_create should NOT have been called
@@ -340,10 +406,14 @@ class TestSessionSharingSpawn:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"), \
-             patch("kiro_crew.messaging.identity.publish_turn_identity", new_callable=AsyncMock) as publish:
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+            patch(
+                "kiro_crew.messaging.identity.publish_turn_identity", new_callable=AsyncMock
+            ) as publish,
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             await _wait_until_done(info)
 
@@ -381,10 +451,13 @@ class TestSessionSharingSpawn:
                 return ""
             raise identity_error
 
-        with patch(
-            "kiro_crew.subagent.asyncio.to_thread",
-            AsyncMock(side_effect=fail_identity_write),
-        ), patch("kiro_crew.subagent.update_state", side_effect=OSError("disk full")):
+        with (
+            patch(
+                "kiro_crew.subagent.asyncio.to_thread",
+                AsyncMock(side_effect=fail_identity_write),
+            ),
+            patch("kiro_crew.subagent.update_state", side_effect=OSError("disk full")),
+        ):
             provider = await manager._create_shared_session(
                 info,
                 "subagent:shared-persist-fail",
@@ -481,9 +554,11 @@ class TestSessionSharingSpawn:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             await _wait_until_done(info)
 
@@ -509,9 +584,11 @@ class TestSessionSharingSpawn:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=False), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=False),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             await _wait_until_done(info)
 
@@ -529,9 +606,7 @@ class TestSessionSharingFallback:
         """When runtime dies during create_session, falls back to legacy path."""
         sessions = _mock_sessions(sharing_eligible=True)
         # Make get_subagent_runtime raise AcpRuntimeDead
-        sessions.get_subagent_runtime = AsyncMock(
-            side_effect=AcpRuntimeDead("process died")
-        )
+        sessions.get_subagent_runtime = AsyncMock(side_effect=AcpRuntimeDead("process died"))
 
         manager = SubagentManager(
             sessions=sessions,
@@ -539,9 +614,11 @@ class TestSessionSharingFallback:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             await _wait_until_done(info)
 
@@ -552,6 +629,43 @@ class TestSessionSharingFallback:
         assert info._shared_provider is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("eligible", [True, False], ids=["fallback", "dedicated-arm"])
+    async def test_a_dedicated_start_is_repriced_before_its_process_launches(self, eligible):
+        """Admission may have priced the start shared; both dedicated launches --
+        the fallback from a dead shared runtime and the plain dedicated arm --
+        reserve the process BEFORE ``get_or_create`` starts it."""
+        sessions = _mock_sessions(sharing_eligible=eligible)
+        sessions.get_subagent_runtime = AsyncMock(side_effect=AcpRuntimeDead("process died"))
+        order: list[str] = []
+        launch = sessions.get_or_create
+
+        async def _launch(*a, **kw):
+            order.append("launch")
+            return await launch(*a, **kw)
+
+        sessions.get_or_create = AsyncMock(side_effect=_launch)
+        manager = SubagentManager(
+            sessions=sessions,
+            ctx_builder=_mock_ctx_builder_auto(),
+            is_yolo=lambda: True,
+        )
+
+        async def _reprice(info):
+            order.append("reprice")
+
+        manager._ensure_dedicated_start_priced = _reprice  # type: ignore[method-assign]
+
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
+            info = manager.spawn("test task", parent_session_key="dashboard:slot1")
+            await _wait_until_done(info)
+
+        assert order[:2] == ["reprice", "launch"]
+
+    @pytest.mark.asyncio
     async def test_fallback_on_create_session_error(self):
         """When create_session fails, falls back to legacy path."""
         sessions = _mock_sessions(sharing_eligible=True)
@@ -559,9 +673,7 @@ class TestSessionSharingFallback:
         mock_runtime = MagicMock()
         mock_runtime.is_alive.return_value = True
         mock_runtime.pid = 99999
-        mock_runtime.create_session = AsyncMock(
-            side_effect=RuntimeError("session limit reached")
-        )
+        mock_runtime.create_session = AsyncMock(side_effect=RuntimeError("session limit reached"))
         sessions.get_subagent_runtime = AsyncMock(return_value=mock_runtime)
 
         manager = SubagentManager(
@@ -570,9 +682,11 @@ class TestSessionSharingFallback:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             await _wait_until_done(info)
 
@@ -662,9 +776,11 @@ class TestSessionSharingMultiAgent:
         # Disable stagger so both spawns start immediately
         manager._spawn_stagger_secs = 0.0
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info1 = manager.spawn("task A", parent_session_key="dashboard:slot1")
             info2 = manager.spawn("task B", parent_session_key="dashboard:slot1")
             await _wait_until_done(info1)
@@ -691,9 +807,11 @@ class TestSessionSharingMultiAgent:
         )
         manager._spawn_stagger_secs = 0.0
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info1 = manager.spawn("task A", parent_session_key="dashboard:slot1")
             info2 = manager.spawn("task B", parent_session_key="dashboard:slot2")
             await _wait_until_done(info1)
@@ -716,9 +834,11 @@ class TestSessionSharingMultiAgent:
             is_yolo=lambda: True,
         )
 
-        with _cfg_patch(session_sharing=True), \
-             patch("kiro_crew.subagent.Stats"), \
-             patch("kiro_crew.subagent.sel"):
+        with (
+            _cfg_patch(session_sharing=True),
+            patch("kiro_crew.subagent.Stats"),
+            patch("kiro_crew.subagent.sel"),
+        ):
             info = manager.spawn("test task", parent_session_key="dashboard:slot1")
             await _wait_until_done(info)
 
@@ -833,7 +953,7 @@ class TestSessionSharingParentReset:
             def __init__(self, agent=None, **kwargs):
                 pass
 
-            async def spawn(self):
+            async def spawn(self, start_priority=None):
                 pass
 
             def is_alive(self):
@@ -882,7 +1002,7 @@ class TestSessionSharingParentReset:
             def __init__(self, agent=None):
                 self._alive = False
 
-            async def spawn(self):
+            async def spawn(self, start_priority=None):
                 calls["n"] += 1
                 if calls["n"] == 1:
                     raise AcpRuntimeDead("transient spawn failure")
@@ -917,7 +1037,7 @@ class TestSessionSharingParentReset:
             def __init__(self, agent=None):
                 pass
 
-            async def spawn(self):
+            async def spawn(self, start_priority=None):
                 calls["n"] += 1
                 raise AcpRuntimeDead("permanent spawn failure")
 
@@ -929,3 +1049,100 @@ class TestSessionSharingParentReset:
             await sm.get_subagent_runtime("dashboard:slot1")
         assert calls["n"] == 2  # initial attempt + one retry
         assert "dashboard:slot1" not in sm._subagent_runtimes
+
+    @pytest.mark.asyncio
+    async def test_get_subagent_runtime_brackets_only_its_waits(self, monkeypatch):
+        """A waiting start's clock pair brackets the per-parent lock wait and is
+        handed to the spawn (which brackets its own admission wait); the spawn's
+        own work runs between the brackets, on the caller's running clock, so a
+        companion spawn that hangs is still reaped at the startup deadline."""
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.session import SessionManager
+        from kiro_crew.start_priority import START_QUEUE_COMPANION, StartPriority
+
+        sm = SessionManager(KiroCrewConfig.load())
+        sm._get_session_agent = lambda k: "kirocrew"  # type: ignore[assignment]
+        events: list[str] = []
+        paused = {"now": False}
+
+        def _queued(queue):
+            events.append(f"queued:{queue}")
+            paused["now"] = True
+
+        def _acquired(_wait_ms, queue):
+            events.append(f"acquired:{queue}")
+            paused["now"] = False
+
+        class _Runtime:
+            def __init__(self, agent=None, **kwargs):
+                self._alive = False
+
+            async def spawn(self, **kwargs):
+                assert kwargs == {
+                    "start_priority": StartPriority.BACKGROUND,
+                    "on_gate_queued": _queued,
+                    "on_gate_acquired": _acquired,
+                }
+                events.append(f"spawn work, paused={paused['now']}")
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+        monkeypatch.setattr("kiro_crew.acp.runtime.AcpRuntime", _Runtime)
+        lock = sm._subagent_runtime_locks.setdefault("dashboard:slot1", asyncio.Lock())
+        await lock.acquire()  # a sibling is spawning the runtime
+        waiter = asyncio.ensure_future(
+            sm.get_subagent_runtime(
+                "dashboard:slot1", on_gate_queued=_queued, on_gate_acquired=_acquired
+            )
+        )
+        await asyncio.sleep(0)
+        assert events == [f"queued:{START_QUEUE_COMPANION}"]
+        lock.release()
+        runtime = await await_until(waiter, what="the queued runtime start acquires the lock")
+        assert runtime.is_alive()
+        assert events == [
+            f"queued:{START_QUEUE_COMPANION}",
+            f"acquired:{START_QUEUE_COMPANION}",
+            "spawn work, paused=False",
+        ]
+        assert not lock.locked()
+
+    @pytest.mark.parametrize("via_task_run", [False, True])
+    @pytest.mark.asyncio
+    async def test_the_companion_spawn_keeps_the_callers_start_priority(
+        self, monkeypatch, via_task_run
+    ):
+        """A task run a person opened reaches the companion runtime when no
+        bootstrap provider is configured; its cold start must queue at the spawn
+        admission as FOREGROUND, not fall back to the spawn's BACKGROUND default
+        behind every subagent start ahead of it."""
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.session import SessionManager
+        from kiro_crew.start_priority import StartPriority
+
+        sm = SessionManager(KiroCrewConfig.load())
+        sm._get_session_agent = lambda k: "kirocrew"  # type: ignore[assignment]
+        sm._provider_factory = None
+        seen: list[StartPriority] = []
+
+        class _Runtime:
+            def __init__(self, agent=None, **kwargs):
+                self._alive = False
+
+            async def spawn(self, *, start_priority, **_kwargs):
+                seen.append(start_priority)
+                self._alive = True
+
+            def is_alive(self):
+                return self._alive
+
+        monkeypatch.setattr("kiro_crew.acp.runtime.AcpRuntime", _Runtime)
+        if via_task_run:
+            await sm._get_or_bootstrap_run_runtime(
+                "taskrunner:run", start_priority=StartPriority.FOREGROUND
+            )
+        else:
+            await sm.get_subagent_runtime("taskrunner:run", start_priority=StartPriority.FOREGROUND)
+        assert seen == [StartPriority.FOREGROUND]

@@ -10,8 +10,9 @@
  * 2. Focus — a fresh strip opens on the FIRST one (not on the first pinned view,
  *    which is what `syncPinned` would otherwise pick), a stored focus on any of
  *    them survives, a stored focus on an id the host no longer offers falls back
- *    to the first, and closing the last dynamic tab lands back on the first
- *    rather than on `null`.
+ *    to the first, closing the focused tab returns to the tab viewed before it
+ *    (a leading one included) or to the first when none was, and an emptied
+ *    bucket lands back on the first rather than on `null`.
  * 3. The panel's close control follows `onClose`: absent means permanent (no
  *    button), present means the button renders — the Crewmates page relies on
  *    the former for its docked column and the latter for its overlay.
@@ -177,15 +178,20 @@ describe('SidePanel leading tab', () => {
     expect(screen.getByRole('menuitem', { name: 'Terminal' })).toBeTruthy()
   })
 
-  it('closing the last dynamic tab returns focus to the leading tab, not to null', () => {
+  it('closing the focused tab returns to the tab viewed before it, and to the leading tab when none was', () => {
     renderPanel({ closable: false })
     act(() => { ctl!.openView('workflows') })
     expect(screen.getByRole('tab', { name: /Workflows/ })).toHaveAttribute('aria-selected', 'true')
     expect(queryLeadingBody()).toBeNull()
     act(() => { ctl!.closeTab('workflows') })
-    // `closeTab` refocuses a neighbour first (the pinned Files view sits to the
-    // left), so the fallback-to-leading arm is reached by emptying the bucket.
-    // A pinned view remains, so this is the neighbour case: Files is focused.
+    // The fresh strip was showing the leading tab, and nothing was viewed
+    // since: focus rests there, not on Files, the closed tab's left neighbour.
+    expect(ctl?.activeId).toBe(LEADING_ID)
+    expect(leadingBody()).toBeInTheDocument()
+    // A tab viewed in between is the one focus returns to.
+    act(() => { ctl!.setActive('files') })
+    act(() => { ctl!.openView('workflows') })
+    act(() => { ctl!.closeTab('workflows') })
     expect(ctl?.activeId).toBe('files')
     // Empty the bucket entirely and the leading tab is the resting focus.
     act(() => { ctl!.closeAll() })
@@ -266,7 +272,7 @@ describe('SidePanel leading tab', () => {
     expect(shown).toBe(LEADING_ID)
   })
 
-  it('a document tab follows its parent view: withholding Files withdraws a persisted file editor, Artifacts an artifact preview', () => {
+  it("every document tab follows 'files': withholding it withdraws a persisted file editor AND an artifact preview; withholding only the Artifacts list leaves the preview", () => {
     // A file opened on the chat page (kind 'file', not a ViewKind) is left
     // focused; the Members page then withholds every slot-bound view because
     // the slot is unconfirmed. A document tab that ignored the withdrawal would
@@ -287,12 +293,23 @@ describe('SidePanel leading tab', () => {
     expect(shown).toBe(LEADING_ID)
     // Stored, not deleted — same contract as any withheld view.
     expect(ctl?.tabs.some(t => t.id === 'file:/srv/notes.md')).toBe(true)
-    // Withholding Files alone leaves the artifact preview in place: the mapping
-    // is per parent view, not a blanket "no documents".
+    // 'files' alone withholds the artifact preview too: documents are
+    // slot-bound content as such, keyed together, not per list view.
     cleanup()
     renderPanel({ closable: false, hidden: new Set<SidePanelWithholdable>(['files']) })
     expect(screen.queryByRole('tab', { name: /notes\.md/ })).toBeNull()
-    expect(screen.getByRole('tab', { name: /plan/ })).toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: /plan/ })).toBeNull()
+    // Withholding only the Artifacts LIST leaves the preview in place: the
+    // Crewmates page keeps its strip at Dashboard + Files and still opens one
+    // artifact from a reply link into its own tab (#18320). Before, the preview
+    // was keyed to 'artifacts' and so appeared and vanished in one frame.
+    cleanup()
+    renderPanel({ closable: false, hidden: new Set<SidePanelWithholdable>(['artifacts']) })
+    expect(chips().map(nameOf)).toEqual(['Notes', 'Changes', 'Files', 'plan', 'notes.md'])
+    act(() => { ctl!.openArtifact({ slug: 'queue-badge', kind: 'html' }, '', 'member-radar') })
+    expect(screen.getByRole('tab', { name: /queue-badge/ })).toBeInTheDocument()
+    expect(ctl?.activeId).toBe('artifact:queue-badge')
+    expect(shown).toBe('artifact:queue-badge')
   })
 
   it('a focus on the leading tab survives persistence: reload restores it, not the last stored tab', async () => {
@@ -306,6 +323,24 @@ describe('SidePanel leading tab', () => {
     const raw = localStorage.getItem('mc-panel-tabs:member-radar')
     expect(raw).toBeTruthy()
     expect(JSON.parse(raw as string).activeId).toBe(LEADING_ID)
+  })
+
+  it('the DERIVED default focus is never persisted: a fresh strip stores no focus at all', async () => {
+    // `syncPinned` reconciles the pinned block on mount and used to write its
+    // fallback focus into the bucket. That froze whichever tab led on the build
+    // that first opened the strip: changing the default later would reach only
+    // strips nobody had opened. The default is resolved on READ instead, so the
+    // strip renders the leading tab while the bucket stays unfocused.
+    renderPanel({ closable: false })
+    // Rendered focus IS the leading tab; the BUCKET is what must stay unwritten.
+    expect(ctl?.activeId).toBe(LEADING_ID)
+    await new Promise(r => setTimeout(r, 400))
+    const raw = localStorage.getItem('mc-panel-tabs:member-radar')
+    if (raw !== null) expect(JSON.parse(raw).activeId).toBeNull()
+    // A CLICK is a choice, and that is what gets stored.
+    act(() => { ctl!.setActive(LEADING_ID) })
+    await new Promise(r => setTimeout(r, 400))
+    expect(JSON.parse(localStorage.getItem('mc-panel-tabs:member-radar') as string).activeId).toBe(LEADING_ID)
   })
 
   it('a withheld body-owning tab (Browser) stays MOUNTED and hidden, not unmounted', () => {
@@ -383,7 +418,40 @@ describe('SidePanel leading tabs — three host tabs', () => {
     expect(screen.queryByTestId('side-panel-leading-tab-crew-dashboard')).toBeNull()
   })
 
-  it('closing the last dynamic tab lands on the first leading tab, whichever was focused before', () => {
+  it('the fixed-chip group scrolls instead of pushing its own chips and the strip controls off the edge', () => {
+    // At 320px the Crewmates overlay is handed the whole window, and the panel
+    // root clips (`overflow-hidden`). A `shrink-0` group of leading + pinned
+    // chips would then carry its last chip and the trailing controls (+ menu,
+    // dock toggle, close) past that edge with no way back at that width. The
+    // group must therefore be allowed to shrink and to scroll, exactly like the
+    // dynamic tablist — while the chips inside it stay unsqueezed.
+    renderPanel({ closable: true, leading: THREE_LEADING })
+    const fixed = screen.getByTestId('side-panel-fixed-tabs')
+    // Every non-closable chip lives in this one group: three leading + pinned.
+    expect(fixed.querySelectorAll('[role="tab"]')).toHaveLength(3 + PINNED_VIEWS.length)
+    expect(fixed.className).toContain('overflow-x-auto')
+    expect(fixed.className).toContain('min-w-0')
+    expect(fixed.className).not.toContain('shrink-0')
+    // Same overflow contract as the dynamic group it sits beside.
+    expect(screen.getByRole('tablist').className).toContain('overflow-x-auto')
+    // The chips themselves do not squeeze — they scroll.
+    expect(screen.getByTestId('side-panel-leading-tabs').className).toContain('shrink-0')
+    // The trailing controls are still rendered as siblings of the group, not
+    // inside the scroller where they would scroll away with the chips.
+    const close = screen.getByRole('button', { name: 'Close panel' })
+    expect(fixed.contains(close)).toBe(false)
+  })
+
+  it('closing the focused tab returns to the leading tab viewed before it, not to the first', () => {
+    renderPanel({ closable: false, leading: THREE_LEADING })
+    fireEvent.click(chipFor('crew-work-log'))
+    act(() => { ctl!.openView('workflows') })
+    act(() => { ctl!.closeTab('workflows') })
+    expect(ctl?.activeId).toBe('crew-work-log')
+    expect(chipFor('crew-work-log')).toHaveAttribute('aria-selected', 'true')
+  })
+
+  it('emptying the bucket lands on the first leading tab, whichever was focused before', () => {
     renderPanel({ closable: false, leading: THREE_LEADING })
     fireEvent.click(chipFor('crew-work-log'))
     act(() => { ctl!.openView('workflows') })

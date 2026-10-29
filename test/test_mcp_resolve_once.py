@@ -555,6 +555,22 @@ class TestInstall:
         assert _sandbox_calls[0]["mode"] == "standard"
         assert _sandbox_calls[0]["strip_python_env"] is True
 
+    async def test_install_stages_outside_the_sealed_store_then_publishes(self, tmp_path) -> None:
+        home = str(tmp_path / "home")
+        spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
+
+        rec = await R.install(home, spec, npm=_fake_npm(tmp_path, bin_field="cli.js"))
+
+        assert rec is not None
+        argv = _sandbox_calls[0]["argv"]
+        prefix = argv[argv.index("--prefix") + 1]
+        sealed_store = os.path.realpath(R.store_root(home))
+        assert os.path.commonpath((os.path.realpath(prefix), sealed_store)) != sealed_store
+        assert os.path.join("run", "mcp-resolve") in prefix
+        assert _sandbox_calls[0]["extra_writable_dirs"] == (prefix,)
+        assert not os.path.exists(prefix)
+        assert os.path.isfile(os.path.join(R.spec_dir(home, spec), rec.entrypoint))
+
     async def test_commits_a_record_pointing_at_the_bin(self, tmp_path) -> None:
         home = str(tmp_path / "home")
         spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
@@ -723,6 +739,26 @@ class TestInstall:
         # the two halves have to stay together.
         source = inspect.getsource(R.install)
         assert "start_new_session=True" in source
+
+    async def test_published_tree_does_not_share_staging_inodes(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        async def keep_staging(_path: str) -> None:
+            return None
+
+        monkeypatch.setattr(R, "_rmtree_off_loop", keep_staging)
+        home = str(tmp_path / "home")
+        spec = R.NpmSpec(package="foo@1.0.0", passthrough=())
+        rec = await R.install(home, spec, npm=_fake_npm(tmp_path, bin_field="cli.js"))
+        assert rec is not None
+
+        published = os.path.join(R.spec_dir(home, spec), rec.entrypoint)
+        staged = os.path.join(R._staging_spec_dir(home, spec), rec.entrypoint)
+        assert os.stat(published).st_ino != os.stat(staged).st_ino
+        published_bytes = open(published, "rb").read()
+        with open(staged, "wb") as fh:
+            fh.write(b"staging changed after publish")
+        assert open(published, "rb").read() == published_bytes
 
     async def test_cancellation_reaps_the_tree_too(self, tmp_path, monkeypatch) -> None:
         # Broker shutdown cancels the prefetch task. Without a cancel handler the

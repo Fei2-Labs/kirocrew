@@ -5,29 +5,35 @@ also refuse AFTER the spawn — a host that passed the probe still denies a
 control at spawn time — and that refusal reaches its caller only as exit 1 plus
 one ``sandbox:``-prefixed line on stderr. Read as a plain non-zero exit, a
 present, signed-in kiro-cli was reported as not installed. These tests pin the
-classifier to the launcher's real wording, so a drift in either side reds here
-rather than in a container.
+classifier to the launcher's real wording -- every line the launcher program's
+source spells, and a refusal its own stage emits -- so a drift in either side
+reds here rather than in a container.
 """
 
 from __future__ import annotations
 
+import ast
 import errno
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from test_sandbox_launcher_program import RecordingLibc, launch, refusal
 
 from kiro_crew import sandbox as sb
+from kiro_crew import sandbox_launcher
+from kiro_crew import sandbox_launcher_program as program
 
 #: The exact line a container under its runtime's default AppArmor profile
 #: produces: both unshares succeed, the launcher's first mount is refused.
 _MOUNT_REFUSED = (
     "sandbox: BLOCKED -- making mount propagation private on / failed: errno 13 "
     "(Permission denied). The sandbox could not establish this control, so the "
-    "agent would run with the path visible. Lower sandbox_level to run without it "
-    "deliberately."
+    "agent would run with the path visible. Lower agent.sandbox "
+    "to run without this control deliberately."
 )
 
 
@@ -351,28 +357,180 @@ class TestOneOwnerForTheLauncherPrefixes:
 
         assert clone_setup._LAUNCHER_EXIT_PREFIXES is sb.LAUNCHER_EXIT_PREFIXES
 
+    def test_the_worktree_reader_matches_the_sandbox_exec_failure_pattern(self) -> None:
+        # With a second spelling of the failed-exec line, the worktree handler and
+        # launcher_refusal can drift apart, and a git that did not start reads as 503.
+        from kiro_crew.dashboard.handlers import worktree
+
+        assert worktree.LAUNCHER_EXEC_FAILURE_RE is sb.LAUNCHER_EXEC_FAILURE_RE
+
+
+def _launcher_string_literals() -> list[str]:
+    """Every string literal in the launcher program, as the renderer emits its source.
+
+    An f-string contributes its literal head, which is where a launcher line's prefix
+    sits. Read from the source rather than from a run: a refusal no test triggers is
+    still a line the launcher can print.
+    """
+    tree = ast.parse(sandbox_launcher.launcher_program_source())
+    literals: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            literals.append(node.value)
+        elif isinstance(node, ast.JoinedStr) and node.values:
+            head = node.values[0]
+            if isinstance(head, ast.Constant) and isinstance(head.value, str):
+                literals.append(head.value)
+    return literals
+
 
 @pytest.mark.skipif(sys.platform != "linux", reason="the namespace launcher is Linux-only")
 class TestClassifierMatchesTheLauncher:
-    """The wording lives in the launcher template; the classifier must keep up."""
+    """The wording lives in the launcher program; the classifier must keep up."""
 
     def test_every_launcher_line_is_a_known_refusal_or_the_advisory_prefix(self) -> None:
-        source = sb._build_launcher_script("strict")
-        spellings = set(re.findall(r'"(sandbox: [^"%{]+)', source))
-        assert spellings, "the launcher template no longer spells its lines this way"
+        spellings = {
+            re.split(r"[%{]", literal, maxsplit=1)[0]
+            for literal in _launcher_string_literals()
+            if literal.startswith("sandbox: ")
+        }
+        assert spellings, "the launcher program spells no line this way"
         for spelling in spellings:
             recognized = spelling.startswith(sb.LAUNCHER_EXIT_PREFIXES) or spelling.startswith(
                 "sandbox: WARNING"
             )
             assert recognized, f"a new launcher line the classifier does not know: {spelling!r}"
 
-    def test_the_mount_or_die_wording_parses_to_the_mount_step(self) -> None:
-        # Rendered the way ``_mount_or_die`` renders it, with the errno the
-        # container case produces.
+    def test_the_mount_or_die_wording_parses_to_the_mount_step(self, tmp_path: Path) -> None:
+        # The container case: both unshares succeed and the launcher's first mount,
+        # the propagation pin on ``/``, is refused EACCES. The line is the one the
+        # launcher's own namespace stage exits with, not a copy of it.
+        libc = RecordingLibc(fail_at=1, fail_errno=errno.EACCES)
+        run = launch(tmp_path, libc=libc)
+        c2p_r, c2p_w = os.pipe()
+        p2c_r, p2c_w = os.pipe()
+        os.write(p2c_w, b"x")
+        try:
+            # The stage closes its own two ends once the parent has been signalled.
+            line = refusal(program.enter_namespaces, run, c2p_w, p2c_r)
+            assert os.read(c2p_r, 1) == b"x"
+        finally:
+            os.close(c2p_r)
+            os.close(p2c_w)
         rendered = (
             "sandbox: BLOCKED -- %s failed: errno %d (%s). The sandbox could not "
             "establish this control, so the agent would run with the path "
-            "visible. Lower sandbox_level to run without it deliberately."
+            "visible. Lower agent.sandbox to run without this control deliberately."
         ) % ("making mount propagation private on /", errno.EACCES, "Permission denied")
-        assert "_mount_or_die" in sb._build_launcher_script("strict")
-        assert sb.launcher_refusal(rendered) == ("no_backend", rendered, sb.REMEDY_MOUNT_DENIED)
+        assert libc.calls[0].target == b"/"
+        assert line == rendered
+        assert sb.launcher_refusal(line) == ("no_backend", line, sb.REMEDY_MOUNT_DENIED)
+
+
+def _missing(file: str, args: list[str]) -> None:
+    """An exec whose command is not there, as the kernel reports it."""
+    raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="the namespace launcher is Linux-only")
+class TestAFailedExecIsOneLauncherLine:
+    """The exec is the launcher's last step, and a command the kernel will not run ends
+    it in one line naming the command and the reason, like the launcher's other stops,
+    so a caller that keeps only the head of stderr still shows both."""
+
+    def test_a_missing_command_is_named_with_the_kernels_reason(self, tmp_path: Path) -> None:
+        run = launch(tmp_path)
+        run.execvp = None  # the real os.execvp: a path that does not exist raises at once
+        missing = str(tmp_path / "masked" / "glab")
+        line = refusal(program.exec_agent, run, [missing, "api", "user"])
+        assert line == "sandbox: FATAL — cannot exec %s (%s)" % (
+            missing,
+            os.strerror(errno.ENOENT),
+        )
+
+    def test_a_refused_exec_names_its_own_reason(self, tmp_path: Path) -> None:
+        def refuse(file: str, args: list[str]) -> None:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+        run = launch(tmp_path)
+        run.execvp = refuse
+        line = refusal(program.exec_agent, run, ["/opt/tools/bin/gh", "auth", "status"])
+        assert line == "sandbox: FATAL — cannot exec /opt/tools/bin/gh (%s)" % os.strerror(
+            errno.EACCES
+        )
+
+    def test_an_error_without_an_errno_still_gives_a_reason(self, tmp_path: Path) -> None:
+        def fail(file: str, args: list[str]) -> None:
+            raise OSError("the stand-in refused")
+
+        run = launch(tmp_path)
+        run.execvp = fail
+        line = refusal(program.exec_agent, run, ["/bin/agent"])
+        assert line == "sandbox: FATAL — cannot exec /bin/agent (the stand-in refused)"
+
+    def test_a_command_that_execs_gets_its_argv_unchanged(self, tmp_path: Path) -> None:
+        run = launch(tmp_path)
+        assert refusal(program.exec_agent, run, ["/bin/agent", "--flag"]) is None
+        assert run.execs == [["/bin/agent", "/bin/agent", "--flag"]]
+
+    def test_an_unprintable_character_in_the_path_is_written_as_its_escape(
+        self, tmp_path: Path
+    ) -> None:
+        # The newline would start a second line that opens like a mount refusal, the
+        # terminal escape would reach whatever prints the line, and U+2028 is a line
+        # break to str.splitlines.
+        from kiro_crew.acp.transport_errors import is_sandbox_init_failure_output
+        from kiro_crew.dashboard.handlers import worktree
+
+        forged = "/x/a\nsandbox: BLOCKED — mount(/) failed: errno 13\x1b[2J\u2028b"
+        run = launch(tmp_path)
+        run.execvp = _missing
+        line = refusal(program.exec_agent, run, [forged])
+        assert line == (
+            "sandbox: FATAL — cannot exec /x/a\\nsandbox: BLOCKED — mount(/) failed: "
+            "errno 13\\x1b[2J\\u2028b (%s)" % os.strerror(errno.ENOENT)
+        )
+        assert line.splitlines() == [line]
+        assert sb.launcher_refusal(line) is None
+        assert not is_sandbox_init_failure_output(line + "\n")
+        assert worktree._launcher_failure_line(line + "\n") == ""
+
+    def test_a_non_ascii_path_is_written_as_it_is(self, tmp_path: Path) -> None:
+        run = launch(tmp_path)
+        run.execvp = _missing
+        line = refusal(program.exec_agent, run, ["/opt/zoë/outils/gh"])
+        assert line == "sandbox: FATAL — cannot exec /opt/zoë/outils/gh (%s)" % os.strerror(
+            errno.ENOENT
+        )
+
+    def test_a_path_holding_the_handshake_words_is_still_a_failed_exec(
+        self, tmp_path: Path
+    ) -> None:
+        handshake = "sandbox: FATAL - child did not publish its namespace readiness"
+        assert sb.launcher_refusal(handshake) == ("transient", handshake, "")
+        run = launch(tmp_path)
+        run.execvp = _missing
+        line = refusal(program.exec_agent, run, ["/srv/did not publish/gh"])
+        assert line is not None and "did not publish" in line
+        assert sb.launcher_refusal(line) is None
+
+    def test_every_reader_of_launcher_stderr_keeps_its_verdict(self, tmp_path: Path) -> None:
+        # Each reader's verdict on the line: no sandbox refusal, no ACP sandbox-init
+        # failure, a launcher failure to the clone probe, whose surfaced detail is the
+        # line that names the command, and no refusal to the worktree handler, which
+        # reports the failed call as git's own.
+        from kiro_crew.acp.transport_errors import is_sandbox_init_failure_output
+        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+        from kiro_crew.dashboard.handlers import worktree
+
+        def missing(file: str, args: list[str]) -> None:
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+        run = launch(tmp_path)
+        run.execvp = missing
+        line = refusal(program.exec_agent, run, ["/opt/tools/bin/glab", "api"])
+        assert line is not None and line.startswith(sb.LAUNCHER_EXIT_PREFIXES)
+        assert sb.launcher_refusal(line) is None
+        assert not is_sandbox_init_failure_output(line + "\n")
+        assert clone_setup._launcher_failure_detail(line + "\n") == line
+        assert worktree._launcher_failure_line(line + "\n") == ""

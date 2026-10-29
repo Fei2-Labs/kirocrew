@@ -467,6 +467,121 @@ def _pid_alive(pid: int) -> bool:
 
 
 class TestRegistryIntegration:
+    def test_unregister_ecs_task_removes_the_matching_record(self, monkeypatch, tmp_path):
+        """Teardown holds a task ARN, which carries the cluster and the task id but
+        never the runtime id, so the row cannot be found by its whole target."""
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+        runtime = f"{'a' * 32}-1234567890"
+        task_id = "0" * 32
+        reg.add(
+            name="Cloud",
+            ssm_target=f"ecs:crews_{task_id}_{runtime}",
+            connection_method="fargate",
+            instance_id="cloud",
+        )
+
+        assert connect.unregister_ecs_task("crews", task_id) == connect.UNREGISTER_REMOVED
+        assert reg.list() == []
+
+    def test_unregister_ecs_task_does_not_match_a_look_alike_cluster(self, monkeypatch, tmp_path):
+        """A cluster name may contain an underscore, so a
+        ``f"ecs:{cluster}_{task}_"`` prefix test would let cluster ``crews`` remove
+        a row belonging to cluster ``crews_eu``. Splitting with the registry's own
+        reader compares the cluster as a whole."""
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+        runtime = f"{'a' * 32}-1234567890"
+        task_id = "0" * 32
+        reg.add(
+            name="Other region",
+            ssm_target=f"ecs:crews_eu_{task_id}_{runtime}",
+            connection_method="fargate",
+            instance_id="eu",
+        )
+
+        assert connect.unregister_ecs_task("crews", task_id) == connect.UNREGISTER_ABSENT
+        assert [i.id for i in reg.list()] == ["eu"]
+
+    def test_unregister_ecs_task_ignores_an_ec2_record(self, monkeypatch, tmp_path):
+        """An SSM target is not an ECS target, so it must not be parsed as one."""
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+        reg.add(name="EC2", ssm_target="i-0abc1234", connection_method="ssm", instance_id="ec2")
+
+        assert connect.unregister_ecs_task("crews", "0" * 32) == connect.UNREGISTER_ABSENT
+        assert [i.id for i in reg.list()] == ["ec2"]
+
+    def test_unregister_ecs_task_removes_every_duplicate_row(self, monkeypatch, tmp_path):
+        """Two rows can name one task under distinct ids. Returning on the first
+        leaves the other addressing a stopped task, and no sweep prunes it because
+        a stopped task is not listed for teardown at all."""
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+        task_id = "0" * 32
+        reg.add(
+            name="Launched",
+            ssm_target=f"ecs:crews_{task_id}_{'a' * 32}-1234567890",
+            connection_method="fargate",
+            instance_id="launched",
+        )
+        # A hand-added Remote crew row naming the same task with a different
+        # runtime id: the launcher's own writer cannot produce this pair.
+        reg.add(
+            name="Hand added",
+            ssm_target=f"ecs:crews_{task_id}_{'b' * 32}-9876543210",
+            connection_method="fargate",
+            instance_id="handadded",
+        )
+
+        assert connect.unregister_ecs_task("crews", task_id) == connect.UNREGISTER_REMOVED
+        assert reg.list() == []
+
+    def test_unregister_ecs_task_reports_a_failure_apart_from_an_absence(
+        self, monkeypatch, tmp_path
+    ):
+        """ "No row" and "could not remove the row" are both falsy, and a caller
+        that reports a teardown as complete has to tell them apart: the first means
+        nothing is left behind, the second means something is."""
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+        runtime = f"{'a' * 32}-1234567890"
+        task_id = "0" * 32
+        reg.add(
+            name="Cloud",
+            ssm_target=f"ecs:crews_{task_id}_{runtime}",
+            connection_method="fargate",
+            instance_id="cloud",
+        )
+
+        def _boom(_instance_id):
+            raise OSError("registry is read-only")
+
+        monkeypatch.setattr(reg, "remove", _boom)
+        assert connect.unregister_ecs_task("crews", task_id) == connect.UNREGISTER_FAILED
+        # The row is still there, which is exactly why the answer is not "absent".
+        assert [i.id for i in reg.list()] == ["cloud"]
+
     def test_register_instance(self, monkeypatch, tmp_path):
         from kiro_crew.instances.registry import InstancesRegistry
 
@@ -515,6 +630,41 @@ class TestRegistryIntegration:
         assert rec.local_port == 5599
         assert rec.was_connected is True
         assert rec.provisioner_id == "aws_ec2"
+
+    def test_register_instance_carries_the_callers_provisioner_id(self, monkeypatch, tmp_path):
+        """A non-EC2 lane must be able to stamp its own id, on BOTH writes.
+
+        The registry record's ``provisioner_id`` is what resolves an engine and
+        the lifecycle guidance shown for the box, so a Fargate task left with the
+        EC2 default is handed to the EC2 engine. The update path is asserted too:
+        a re-launch that reset the id to the default would reintroduce the same
+        mislabelling on exactly the boxes that had been registered correctly.
+        """
+        from kiro_crew.instances.registry import InstancesRegistry
+
+        reg = InstancesRegistry(path=tmp_path / "instances.json")
+        import kiro_crew.instances.registry as regmod
+
+        monkeypatch.setattr(regmod, "InstancesRegistry", lambda *a, **k: reg)
+
+        target = "ecs:crews_0123456789abcdef0123456789abcdef_" + "a" * 32 + "-1234567890"
+        first = connect.register_instance(
+            target,
+            name="Kiro Crew Cloud (t)",
+            connection_method="fargate",
+            provisioner_id="aws_fargate",
+        )
+        assert first is not None
+        assert next(i for i in reg.list() if i.id == first).provisioner_id == "aws_fargate"
+
+        second = connect.register_instance(
+            target,
+            name="Kiro Crew Cloud (t)",
+            connection_method="fargate",
+            provisioner_id="aws_fargate",
+        )
+        assert second == first
+        assert next(i for i in reg.list() if i.id == first).provisioner_id == "aws_fargate"
 
     def test_unregister_instance_empty_arg_is_noop(self, monkeypatch, tmp_path):
         from kiro_crew.instances.registry import InstancesRegistry
@@ -639,14 +789,14 @@ class TestIsLaunchedInstance:
         store.save(keep)
 
         victim = store.root / f"{gone.id}.json"
-        real_read_text = Path.read_text
+        real_read_bytes = Path.read_bytes
 
-        def _read_text(self, *a, **k):
+        def _read_bytes(self):
             if self == victim:
                 raise FileNotFoundError(str(victim))
-            return real_read_text(self, *a, **k)
+            return real_read_bytes(self)
 
-        monkeypatch.setattr(Path, "read_text", _read_text)
+        monkeypatch.setattr(Path, "read_bytes", _read_bytes)
 
         assert connect.is_launched_instance("i-stillhere") is True
         assert connect.is_launched_instance("i-vanishing") is False
@@ -656,26 +806,6 @@ class TestIsLaunchedInstance:
 
 _TASK = "0123456789abcdef0123456789abcdef"
 _ECS_TARGET = f"ecs:crews_{_TASK}_{_TASK}-1234567890"
-
-
-class _LiveProc:
-    def poll(self):
-        return None
-
-
-class _ExitedProc:
-    returncode = 1
-
-    def poll(self):
-        return 1
-
-    def terminate(self):
-        pass
-
-
-def _ready(monkeypatch):
-    """Make the preflight pass, so a test can exercise what comes after it."""
-    monkeypatch.setattr(ssm, "task_exec_readiness", lambda *a, **k: ssm.TaskExecReadiness(True))
 
 
 class TestEcsTargetSplit:
@@ -791,104 +921,6 @@ class TestTaskExecReadiness:
         assert len(reason) < 400, f"unbounded stderr tail: {len(reason)} chars"
 
 
-class TestConnectFargate:
-    def test_the_preflight_runs_before_any_tunnel_is_opened(self, monkeypatch):
-        """A failed prerequisite must not leave a child process behind."""
-        monkeypatch.setattr(
-            ssm,
-            "task_exec_readiness",
-            lambda *a, **k: ssm.TaskExecReadiness(False, "no channel"),
-        )
-        opened = []
-        monkeypatch.setattr(ssm, "open_port_forward", lambda *a, **k: opened.append(1))
-        conn = connect.connect_fargate(_ECS_TARGET, local_port=5599, remote_port=8080)
-        assert conn.ready is False
-        assert conn.error == "no channel"
-        assert opened == [], "the tunnel was opened despite a failed preflight"
-
-    def test_the_forward_goes_through_the_shared_opener(self, monkeypatch):
-        """R8/R9: the shared opener carries assert_human_action and every guard.
-
-        Asserted by observing that THIS function is what the lane calls, because a
-        Fargate-specific child would silently drop the human-action gate, the
-        free-port check, the process-group teardown, the resolved ``aws`` head and
-        the withheld PATH -- none of which a passing happy-path test would notice.
-        """
-        _ready(monkeypatch)
-        seen = {}
-
-        def fake_open(target, remote, local, profile, region):
-            seen.update(target=target, remote=remote, local=local)
-            return _LiveProc()
-
-        monkeypatch.setattr(ssm, "open_port_forward", fake_open)
-        monkeypatch.setattr(ssm, "port_is_free", lambda *a, **k: True)
-        monkeypatch.setattr(ssm, "wait_for_local_port", lambda *a, **k: True)
-        conn = connect.connect_fargate(_ECS_TARGET, local_port=5599, remote_port=8080)
-        assert conn.ready is True
-        assert seen == {"target": _ECS_TARGET, "remote": 8080, "local": 5599}
-
-    def test_a_ready_connection_names_the_local_turn_endpoint(self, monkeypatch):
-        _ready(monkeypatch)
-        monkeypatch.setattr(ssm, "open_port_forward", lambda *a, **k: _LiveProc())
-        monkeypatch.setattr(ssm, "port_is_free", lambda *a, **k: True)
-        monkeypatch.setattr(ssm, "wait_for_local_port", lambda *a, **k: True)
-        conn = connect.connect_fargate(_ECS_TARGET, local_port=5599, remote_port=8080)
-        assert conn.url == "http://127.0.0.1:5599"
-        assert conn.turn_url == "http://127.0.0.1:5599/v1/chat/completions"
-
-    def test_nothing_is_minted_and_no_browser_is_opened(self, monkeypatch):
-        """This lane has no dashboard, so a token or a browser would be a bug.
-
-        Asserted as ABSENT: the connection carries no token field at all, and
-        webbrowser.open is never reached. A later change that routes this lane back
-        through the gateway flow fails here rather than opening a window onto a
-        JSON API.
-        """
-        _ready(monkeypatch)
-        monkeypatch.setattr(ssm, "open_port_forward", lambda *a, **k: _LiveProc())
-        monkeypatch.setattr(ssm, "port_is_free", lambda *a, **k: True)
-        monkeypatch.setattr(ssm, "wait_for_local_port", lambda *a, **k: True)
-        minted = []
-        monkeypatch.setattr(connect, "mint_token", lambda *a, **k: minted.append(1) or "tok")
-        opened = []
-        monkeypatch.setattr(connect.webbrowser, "open", lambda *a, **k: opened.append(1))
-
-        conn = connect.connect_fargate(_ECS_TARGET, local_port=5599, remote_port=8080)
-        assert minted == [] and opened == []
-        assert not hasattr(conn, "token")
-        assert not hasattr(conn, "browser_opened")
-
-    def test_a_foreign_listener_winning_the_bind_is_refused(self, monkeypatch):
-        """A listener answering while our child is dead is not the crew.
-
-        This lane sends no dashboard token, so the stake is lower than the gateway
-        lane's -- but reporting a stranger's listener as ready would point the
-        user's turn requests, which carry their prompts, at that process.
-        """
-        _ready(monkeypatch)
-        monkeypatch.setattr(ssm, "open_port_forward", lambda *a, **k: _ExitedProc())
-        monkeypatch.setattr(ssm, "port_is_free", lambda *a, **k: True)
-        monkeypatch.setattr(ssm, "wait_for_local_port", lambda *a, **k: True)
-        conn = connect.connect_fargate(_ECS_TARGET, local_port=5599, remote_port=8080)
-        assert conn.ready is False
-        assert conn.process is None
-
-    def test_an_occupied_local_port_is_refused_before_the_tunnel(self, monkeypatch):
-        _ready(monkeypatch)
-        opened = []
-        monkeypatch.setattr(ssm, "port_is_free", lambda *a, **k: False)
-        monkeypatch.setattr(ssm, "open_port_forward", lambda *a, **k: opened.append(1))
-        conn = connect.connect_fargate(_ECS_TARGET, local_port=5599, remote_port=8080)
-        assert conn.ready is False and opened == []
-
-    def test_a_target_that_is_not_an_ecs_task_is_refused(self, monkeypatch):
-        opened = []
-        monkeypatch.setattr(ssm, "open_port_forward", lambda *a, **k: opened.append(1))
-        conn = connect.connect_fargate("i-0123456789abcdef0", local_port=5599, remote_port=8080)
-        assert conn.ready is False and opened == []
-
-
 def test_the_printed_paths_match_the_containers_own_constants():
     """The drift guard the module comment promises.
 
@@ -916,3 +948,108 @@ def test_the_printed_paths_match_the_containers_own_constants():
         "CUSTOMER_TURN_PATH": connect.FARGATE_TURN_PATH,
         "HEALTH_PATH": connect.FARGATE_HEALTH_PATH,
     }
+
+
+class TestPortForwardError:
+    """_port_forward_error names a failed tunnel's cause from a classified notice.
+
+    The sibling of the instances-layer forward: both pipe and drain the plugin's
+    stdout, and both run that captured stdout through the same close-notice
+    classifier. The service-supplied reason text is a classification signal only
+    — this path composes its own wording from the recognised shape and never
+    quotes the raw notice. Without capture, or on an unrecognised shape, the exit
+    shape alone drives the reason.
+    """
+
+    # Real plugin close-notice fixtures (see test_fargate_closed_forward_remedy).
+    _SESSION_ID = "user-0123456789abcdef"
+    _IDLE = (
+        f"\nStarting session with SessionId: {_SESSION_ID}\n\n\nSessionId: "
+        f"{_SESSION_ID} : Your session timed out due to inactivity and has "
+        "been terminated.\n\n"
+    )
+    _CLOSED_OTHER = (
+        f"\nStarting session with SessionId: {_SESSION_ID}\n\n\nSessionId: "
+        f"{_SESSION_ID} : Session terminated by operator.\n\n"
+    )
+
+    def _exited(self, rc: int, stdout_buf=None):
+        class _Proc:
+            returncode = rc
+
+            def poll(self):
+                return rc
+
+        p = _Proc()
+        if stdout_buf is not None:
+            p.stdout_buf = stdout_buf  # type: ignore[attr-defined]
+        return p
+
+    def test_none_proc_reports_did_not_start(self):
+        assert "did not start" in connect._port_forward_error(None, 5476)
+
+    def test_still_running_reports_not_ready(self):
+        class _Running:
+            returncode = None
+
+            def poll(self):
+                return None
+
+        msg = connect._port_forward_error(_Running(), 5476)
+        assert "did not become ready" in msg
+
+    def test_exited_without_capture_is_bare_reason(self):
+        # No stdout_buf attribute at all (capture off / nothing written).
+        msg = connect._port_forward_error(self._exited(1), 5476)
+        assert "exited (rc=1)" in msg
+        assert msg.strip().endswith(".")
+
+    def test_idle_shape_names_inactivity_without_quoting(self):
+        msg = connect._port_forward_error(self._exited(0, [self._IDLE]), 5476)
+        assert "exited (rc=0)" in msg
+        assert "no activity" in msg
+        # The service-supplied reason text is a classification signal only — it
+        # must not be quoted into the surfaced reason.
+        assert "timed out due to inactivity" not in msg
+
+    def test_closed_shape_names_aws_close_without_quoting(self):
+        msg = connect._port_forward_error(self._exited(0, [self._CLOSED_OTHER]), 5476)
+        assert "AWS ended the session" in msg
+        assert "terminated by operator" not in msg
+
+    def test_unrecognised_notice_falls_back_to_bare_reason(self):
+        noisy = "ok\r\n" + ("x" * 5000) + "\x07\x00trailer"
+        msg = connect._port_forward_error(self._exited(0, [noisy]), 5476)
+        # Nothing classified, so no cause is appended and no raw bytes leak.
+        assert "exited (rc=0)" in msg
+        assert "x" * 50 not in msg
+        assert "\r" not in msg and "\x07" not in msg and "\x00" not in msg
+        assert msg.strip().endswith(".")
+
+    def test_empty_capture_falls_back_to_bare_reason(self):
+        msg = connect._port_forward_error(self._exited(2, [""]), 5476)
+        assert "exited (rc=2)" in msg
+        assert msg.strip().endswith(".")
+
+    def test_join_waits_for_the_drain_to_land_the_last_chunk(self):
+        # The plugin writes its notice just before exit, so the drain thread may
+        # not have landed it when poll() returns. _classified_cause joins the
+        # drain before reading, so a notice written by a still-running drain is
+        # still classified. The buffer starts empty and a real thread fills it;
+        # the join (not a sleep) is what makes this deterministic — if the join
+        # were absent the read would race an empty buffer.
+        import threading
+
+        buf: list[str] = [""]
+        proc = self._exited(0, buf)
+
+        def _late_fill() -> None:
+            buf[0] = self._IDLE
+
+        thread = threading.Thread(target=_late_fill)
+        proc.stdout_drain = thread  # type: ignore[attr-defined]
+        thread.start()
+
+        msg = connect._port_forward_error(proc, 5476)
+        assert "no activity" in msg
+        assert "timed out due to inactivity" not in msg

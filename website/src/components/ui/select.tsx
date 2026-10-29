@@ -1,7 +1,9 @@
 import * as React from 'react'
+import { useGuideTrustRootAttrs } from '../../guide/trustRoot'
 import * as SelectPrimitive from '@radix-ui/react-select'
 import { Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { cn } from '../../lib/utils'
+import { MountAfterCommit, useCloseWhenCrewHidden, useOverlayRoot } from '../overlayRoot'
 
 /**
  * shadcn-style wrapper around Radix Select, themed to match ui/dropdown-menu.tsx.
@@ -12,7 +14,21 @@ import { cn } from '../../lib/utils'
  * match.
  */
 
-const Select = SelectPrimitive.Root
+/** Radix `Select.Root`. An open list closes when its Crew is hidden behind a
+ *  remote one, as a click outside would close it (see components/overlayRoot). The
+ *  value is untouched. */
+function Select({ open: openProp, defaultOpen, onOpenChange, ...rest }: React.ComponentProps<typeof SelectPrimitive.Root>) {
+  const isControlled = openProp !== undefined
+  const [inner, setInner] = React.useState(defaultOpen ?? false)
+  const open = isControlled ? openProp : inner
+  const handleOpenChange = React.useCallback((next: boolean) => {
+    if (!isControlled) setInner(next)
+    onOpenChange?.(next)
+  }, [isControlled, onOpenChange])
+  const close = React.useCallback(() => handleOpenChange(false), [handleOpenChange])
+  useCloseWhenCrewHidden(open, close)
+  return <SelectPrimitive.Root open={open} onOpenChange={handleOpenChange} {...rest} />
+}
 const SelectGroup = SelectPrimitive.Group
 const SelectValue = SelectPrimitive.Value
 
@@ -71,13 +87,26 @@ const SelectScrollDownButton = React.forwardRef<
 ))
 SelectScrollDownButton.displayName = SelectPrimitive.ScrollDownButton.displayName
 
+// Portals into the owning pane's overlay root, so content opened in the local
+// dashboard hides with it behind a remote Crew (see components/overlayRoot).
+function SelectPortal(props: React.ComponentProps<typeof SelectPrimitive.Portal>) {
+  return (
+    <MountAfterCommit>
+      <SelectPrimitive.Portal container={useOverlayRoot()} {...props} />
+    </MountAfterCommit>
+  )
+}
+
 const SelectContent = React.forwardRef<
   React.ComponentRef<typeof SelectPrimitive.Content>,
   React.ComponentPropsWithoutRef<typeof SelectPrimitive.Content>
->(({ className, children, position = 'popper', onEscapeKeyDown, ...props }, ref) => (
-  <SelectPrimitive.Portal>
+>(({ className, children, position = 'popper', onEscapeKeyDown, ...props }, ref) => {
+  const trustRoot = useGuideTrustRootAttrs()
+  return (
+  <SelectPortal>
     <SelectPrimitive.Content
       ref={ref}
+      {...trustRoot}
       position={position}
       sideOffset={4}
       // Escape must dismiss ONLY the select, not the surface hosting it. Radix
@@ -113,8 +142,9 @@ const SelectContent = React.forwardRef<
       </SelectPrimitive.Viewport>
       <SelectScrollDownButton />
     </SelectPrimitive.Content>
-  </SelectPrimitive.Portal>
-))
+  </SelectPortal>
+  )
+})
 SelectContent.displayName = SelectPrimitive.Content.displayName
 
 const SelectItem = React.forwardRef<

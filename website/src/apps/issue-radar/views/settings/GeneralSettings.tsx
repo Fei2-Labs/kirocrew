@@ -13,6 +13,7 @@ import {
 } from '../../lib/format'
 import { activeLocale, fmtUnit } from '../../../../i18n/format'
 import { languageLabel } from '../../../../i18n/languages'
+import GitLabGroupsSection from './GitLabGroupsSection'
 
 import { i18nT } from '../../../../i18n/t'
 /** General (app-wide) settings — full width. The GitHub identity and the list
@@ -28,9 +29,10 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
   const terms = providerTerms(active)
   const accountRef = useRef<HTMLElement>(null)
   const reposRef = useRef<HTMLElement>(null)
+  const gitlabGroupsRef = useRef<HTMLElement>(null)
 
   useEffect(() => {
-    const ref = anchor === 'repos' ? reposRef : accountRef
+    const ref = anchor === 'repos' ? reposRef : anchor === 'gitlabGroups' ? gitlabGroupsRef : accountRef
     ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }, [anchor])
 
@@ -64,7 +66,7 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
           ) : (
             <div className="text-[13px] text-muted">
               {i18nT('apps.issueRadar.views.settings.generalSettings.not_signed_in_the')} <code>{terms.cli}</code> {i18nT('apps.issueRadar.views.settings.generalSettings.cli_has_no_active_session_run')}{' '}
-              <code>{terms.cli} {i18nT('apps.issueRadar.views.settings.generalSettings.auth_login')}</code> {i18nT('apps.issueRadar.views.settings.generalSettings.in_your_terminal')}
+              <code>{terms.loginCommand}</code> {i18nT('apps.issueRadar.views.settings.generalSettings.in_your_terminal')}
             </div>
           )}
         </div>
@@ -187,6 +189,8 @@ export default function GeneralSettings({ anchor }: { anchor: GeneralAnchor }) {
           </button>
         </div>
       </section>
+
+      <GitLabGroupsSection sectionRef={gitlabGroupsRef} />
     </div>
   )
 }

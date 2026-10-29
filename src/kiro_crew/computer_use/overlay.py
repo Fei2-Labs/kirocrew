@@ -308,7 +308,7 @@ class CursorOverlay:
         repo's spawn-isolation contract, so the child sits in its own process group
         and :func:`platform_compat.kill_process_tree` can reap it.
         """
-        argv = platform_compat.isolated_python_argv("-m", OVERLAY_MODULE)
+        argv = platform_compat.isolated_python_argv("-P", "-m", OVERLAY_MODULE)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,

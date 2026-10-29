@@ -16,7 +16,8 @@ One asyncio task on the gateway event loop. Every ``controller_sample_secs``
    ``SubagentManager.set_effective_cap`` (natural shrink -- in-flight work
    finishes, nothing is killed) and the spawn-gate capacity through
    ``GatewayManager.set_spawn_capacity`` (the daemon clamps to its own
-   floor/ceiling and lets in-flight spawns finish).
+   floor/ceiling and lets in-flight spawns finish). The execution cap moves on
+   work evidence only; loop lag and free memory shape the spawn gate alone.
 
 The controller never blocks the loop and never raises out of its task: a
 failed sample is logged and the previous caps stand. Its state is a plain dict
@@ -39,22 +40,36 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
-from kiro_crew.metrics.events import ADAPTIVE_DECISIONS, emit_counter
+from kiro_crew.metrics.events import (
+    ADAPTIVE_DECISIONS,
+    LOOP_LAG_MS,
+    NON_MS_HISTOGRAM_UNITS,
+    PROCESS_CPU_UTILIZATION,
+    PROCESS_RSS_SAMPLED,
+    emit_counter,
+    emit_histogram,
+)
+from kiro_crew.metrics.process_gauges import cpu_utilization, read_logical_cores
 
+from .busy import LoopBusySampler
 from .policy import (
+    ACTION_DECREASE,
     ACTION_FIXED,
     ACTION_HOLD,
+    ACTION_PAUSE,
+    ACTION_RESUME,
     AdaptivePolicy,
     Decision,
     PolicyParams,
     params_from_config,
 )
-from .signals import Sample, SpawnGateStats
+from .signals import SIGNAL_LOOP_LAG, Sample, SpawnGateStats
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +78,8 @@ DEFAULT_SAMPLE_SECS = 5.0
 SAMPLE_RING = 60
 #: Evidence window the per-tick rates are computed over.
 WINDOW_SECS = 60.0
+#: Cap-changing decisions kept for the state snapshot, newest last.
+RECENT_DECISIONS = 32
 
 #: Substrings of a run's ``error`` that mark a CONGESTION failure: a start or
 #: turn that timed out, a stall, a backend that never initialised. Anything
@@ -109,6 +126,16 @@ class ExecActuator(Protocol):
 
 GateSetter = Callable[[int], Awaitable[Optional[int]]]
 StatsReader = Callable[[], Awaitable[dict[str, Any]]]
+#: Reads the runner lane's ``stats()`` frame (running / waiting / settled_ok),
+#: or ``None`` when no runner admission is wired. Synchronous and non-blocking:
+#: the lane keeps those counts in memory, so no thread hop is needed.
+LaneReader = Callable[[], Optional[dict[str, Any]]]
+
+# The ``process`` attribute every sample this controller publishes carries. One
+# spelling for all three series (loop lag, resident set, CPU share): a dashboard
+# that splits on this attribute would otherwise report them as separate
+# processes, and they are readings of the same one.
+_PROCESS = "gateway"
 
 
 @dataclass
@@ -119,6 +146,18 @@ class HostSample:
     rss_mb: float = -1.0
     fd_count: int = -1
     fd_limit: int = 0
+    #: Process-lifetime CPU seconds, a monotonic total rather than a rate. Read
+    #: here so the share-of-machine figure can be differenced between two ticks
+    #: without a second probe on a different cadence.
+    cpu_seconds: float = -1.0
+    #: The monotonic instant ``cpu_seconds`` was read at, taken in the same probe
+    #: so the two travel together. The share divides one difference by the other,
+    #: and an instant taken after the worker thread resumes belongs to a later
+    #: moment than the total it would be paired with: the resumption delay varies
+    #: from tick to tick, so it does not cancel, and at the one-second floor of
+    #: ``controller_sample_secs`` a few hundred milliseconds of it is a
+    #: double-digit-percent error published as a measured value.
+    cpu_clock: float = -1.0
 
 
 def probe_host() -> HostSample:
@@ -141,6 +180,13 @@ def probe_host() -> HostSample:
         out.rss_mb = platform_compat.proc_rss_bytes() / (1024.0 * 1024.0)
     except Exception:
         logger.debug("adaptive: rss probe failed", exc_info=True)
+    try:
+        from kiro_crew import platform_compat
+
+        out.cpu_seconds = platform_compat.proc_cpu_seconds()
+        out.cpu_clock = time.monotonic()
+    except Exception:
+        logger.debug("adaptive: cpu seconds probe failed", exc_info=True)
     try:
         from kiro_crew.mcp_gateway.host_budget import _nofile_soft_limit
 
@@ -186,7 +232,6 @@ class AdaptiveController:
         "agent.adaptive_concurrency",
         "agent.adaptive_concurrency_mode",
         "agent.adaptive_floor",
-        "agent.adaptive_initial",
         "agent.adaptive_slow_start",
         "agent.controller_sample_secs",
         "agent.resource_pressure_gb",
@@ -200,6 +245,7 @@ class AdaptiveController:
         cfg: object,
         set_gate_capacity: Optional[GateSetter] = None,
         read_gate_stats: Optional[StatsReader] = None,
+        read_runner_lane: Optional[LaneReader] = None,
         host_probe: Optional[Callable[[], HostSample]] = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -211,6 +257,7 @@ class AdaptiveController:
         self._manager = manager
         self._set_gate_capacity = set_gate_capacity
         self._read_gate_stats = read_gate_stats
+        self._read_runner_lane = read_runner_lane
         self._host_probe = host_probe
         self._clock = clock
         self._sleep = sleep
@@ -230,14 +277,49 @@ class AdaptiveController:
         self._evidence = _Evidence()
         self._seen_done: dict[str, bool] = {}
         self._seen_activity: dict[str, float] = {}
+        #: The runner lane's cumulative ``settled_ok`` as of the previous tick.
+        #: Lane completions are the delta against this; ``-1`` means no lane has
+        #: been read yet, so the first reading seeds the base without crediting
+        #: a run that finished before the controller was watching. A counter
+        #: that went DOWN is a fresh admission (a re-wire built a new lane): the
+        #: base is reset to it, never read as a negative delta.
+        self._lane_completions_base: int = -1
+        #: Lane completions the controller has credited so far. Added to the
+        #: manager's own ``completions_total`` for the one ``Sample.completions``
+        #: the policy diffs, so workflow and sub-agent completions earn under
+        #: the same rule and neither population is counted in the other's.
+        self._lane_completions_total: int = 0
         self._samples: deque[Sample] = deque(maxlen=SAMPLE_RING)
         self._task: Optional[asyncio.Task[None]] = None
         self._applied_exec: Optional[int] = None
         self._applied_gate: Optional[int] = None
         self._gate_pending: Optional[int] = None
+        #: Reads the loop thread's frame when a sample's timer is late; built by
+        #: :meth:`start`.
+        self._busy_sampler: Optional[LoopBusySampler] = None
+        #: What the loop was running during this tick's lag, ``""`` if it was on
+        #: time or nothing was read.
+        self._last_busy = ""
+        #: The open throttled period: clock time of its first cut and the caps the
+        #: policy held just before it. ``None`` while no cut is outstanding.
+        self._cut_since: Optional[float] = None
+        self._cut_from: tuple[int, int] = (0, 0)
+        #: The caps of the previous applied decision, ``None`` before the first.
+        self._decided_caps: Optional[tuple[int, int]] = None
         self._last_error: str = ""
         self._ticks = 0
+        # Previous CPU-seconds reading and the clock time it was taken at. A
+        # share-of-machine figure is a RATE, and the probe returns a
+        # process-lifetime total, so it takes two readings to make one sample --
+        # which is why the first tick of a process publishes no utilization.
+        # ``-1.0`` distinguishes "no predecessor yet" from a measured 0.0.
+        self._prev_cpu_seconds: float = -1.0
+        self._prev_cpu_clock: float = -1.0
+        # Logical core count, resolved once: it is the denominator of every
+        # utilization sample and does not change while the process runs.
+        self._cores: Optional[int] = None
         self._counts = {"decrease": 0, "increase": 0, "pause": 0, "probe": 0, "resume": 0}
+        self._recent: deque[dict[str, Any]] = deque(maxlen=RECENT_DECISIONS)
         self._config_sub: Any = None
         try:
             from kiro_crew.config import live
@@ -247,10 +329,10 @@ class AdaptiveController:
             )
         except Exception:
             logger.debug("AdaptiveController could not subscribe to live config", exc_info=True)
-        # Fresh process: the exec cap starts at min(user_max, initial) and
-        # earns its way up. Applied synchronously so the first spawn already
-        # sees it; the gate capacity follows on the first tick (the daemon may
-        # not be up yet).
+        # Fresh process: the exec cap starts at the user's ceiling (memory is
+        # the spawn floor's to bound, not this cap's). Applied synchronously so
+        # the first spawn already sees it; the gate capacity follows on the
+        # first tick (the daemon may not be up yet).
         self._apply_exec(self._policy.exec_cap if self._enabled else None)
 
     # -- configuration -------------------------------------------------------
@@ -343,11 +425,18 @@ class AdaptiveController:
     def start(self) -> None:
         if not self._enabled:
             return
+        if self._busy_sampler is None:
+            self._busy_sampler = LoopBusySampler()
+        # Called on the loop thread: that is the thread a late timer means is busy.
+        self._busy_sampler.start(threading.get_ident())
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self.run(), name="adaptive-controller")
 
     async def stop(self) -> None:
         task, self._task = self._task, None
+        if self._busy_sampler is not None:
+            # Off the loop: the stop joins the sampler's thread.
+            await asyncio.to_thread(self._busy_sampler.stop)
         if task is not None and not task.done():
             task.cancel()
             try:
@@ -357,28 +446,111 @@ class AdaptiveController:
 
     async def run(self) -> None:
         while True:
-            t0 = self._clock()
-            await self._sleep(self._sample_secs)
-            lag_ms = max(0.0, (self._clock() - t0 - self._sample_secs) * 1000.0)
-            try:
-                await self.tick(loop_lag_ms=lag_ms)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # the loop must outlive any one bad sample
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                logger.debug("adaptive controller tick failed", exc_info=True)
+            await self._sample_and_tick()
+
+    async def _sample_and_tick(self) -> None:
+        """One cycle of :meth:`run`: wait, measure how late the timer fired,
+        publish that lag, tick. Separate from ``tick`` so tests can drive the
+        measured path while ``tick`` keeps taking synthetic lag."""
+        t0 = self._clock()
+        # Read the period once: a hot-reload of controller_sample_secs that
+        # lands during the sleep must not be measured as loop lag.
+        secs = self._sample_secs
+        sampler = self._busy_sampler
+        if sampler is not None:
+            # Look at the loop only once it is late by as much as counts as
+            # pressure, so a punctual tick reads no frame.
+            lag_secs = self._policy.params.thresholds.lag_decrease_ms / 1000.0
+            sampler.arm(secs + lag_secs)
+        try:
+            await self._sleep(secs)
+        finally:
+            busy = sampler.disarm() if sampler is not None else ""
+        lag_ms = max(0.0, (self._clock() - t0 - secs) * 1000.0)
+        emit_histogram(LOOP_LAG_MS, lag_ms, {"process": _PROCESS}, unit="ms")
+        try:
+            await self.tick(loop_lag_ms=lag_ms, loop_busy=busy)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # the loop must outlive any one bad sample
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            logger.debug("adaptive controller tick failed", exc_info=True)
 
     # -- one cycle -----------------------------------------------------------
 
-    async def tick(self, *, loop_lag_ms: float = 0.0) -> Decision:
-        """Sample, decide, apply. Public so tests drive one cycle at a time."""
+    def _emit_process_histograms(self, host: HostSample) -> None:
+        """Publish this tick's resident-set and CPU-share distributions.
+
+        Recorded from this loop rather than from the instrument module that owns
+        the matching gauges, because a histogram is RECORDED and not observed:
+        OTEL has no observable histogram, so the two series need a caller on a
+        timer, and adding one to a module whose instruments are all callbacks
+        would put a second sampler and a second cadence in the process. This loop
+        already probes both readings for its own decisions.
+
+        Each unit is read from the same mapping the dashboard resolves, so the
+        value published and the unit declared for it cannot drift apart.
+        """
+        # ``proc_rss_bytes`` answers 0 on failure rather than raising, so the probe's
+        # try/except never fires and a failed read arrives as a plain 0.0 -- which a
+        # live process never truly has. Admitting it would put a fabricated zero in a
+        # CUMULATIVE distribution, where it stays for the process's lifetime and no
+        # later sample can correct it. Same gap-over-fake-zero rule the CPU share
+        # below follows.
+        if host.rss_mb > 0.0:
+            emit_histogram(
+                PROCESS_RSS_SAMPLED,
+                host.rss_mb * 1024.0 * 1024.0,
+                {"process": _PROCESS},
+                unit=NON_MS_HISTOGRAM_UNITS[PROCESS_RSS_SAMPLED],
+            )
+        prev_seconds = self._prev_cpu_seconds
+        prev_clock = self._prev_cpu_clock
+        # Both endpoints come from ``probe_host``, never from this loop's clock:
+        # the share divides a CPU-total difference by a time difference, so the
+        # two instants have to be the ones the totals were read at.
+        #
+        # A failed probe reads 0.0, which must not become the next interval's
+        # baseline: leaving the old pair in place differences a longer interval
+        # against the reading it was actually taken with, which stays correct.
+        if host.cpu_seconds > 0.0 and host.cpu_clock >= 0.0:
+            self._prev_cpu_seconds = host.cpu_seconds
+            self._prev_cpu_clock = host.cpu_clock
+        if prev_seconds <= 0.0 or prev_clock < 0.0:
+            return  # first measured tick of this process: no predecessor to difference
+        if host.cpu_clock < 0.0:
+            return  # a total with no instant of its own is not a measurement
+        if self._cores is None:
+            self._cores = read_logical_cores()
+        share = cpu_utilization(
+            prev_cpu_seconds=prev_seconds,
+            cpu_seconds=host.cpu_seconds,
+            elapsed_seconds=host.cpu_clock - prev_clock,
+            cores=self._cores,
+        )
+        if share is None:
+            return  # a gap in the series, never a fake zero
+        emit_histogram(
+            PROCESS_CPU_UTILIZATION,
+            share,
+            {"process": _PROCESS},
+            unit=NON_MS_HISTOGRAM_UNITS[PROCESS_CPU_UTILIZATION],
+        )
+
+    async def tick(self, *, loop_lag_ms: float = 0.0, loop_busy: str = "") -> Decision:
+        """Sample, decide, apply. Public so tests drive one cycle at a time.
+
+        ``loop_busy`` is what the loop was running while this sample's timer was
+        late (see :class:`LoopBusySampler`); a cut caused by loop lag names it."""
         self._ticks += 1
+        self._last_busy = loop_busy
         if not self._enabled:
             return await self.step(Sample(t=self._clock()))
         if self._host_probe is None:
             host = await asyncio.to_thread(probe_host)
         else:
             host = await asyncio.to_thread(self._host_probe)
+        self._emit_process_histograms(host)
         gate_snap: dict[str, Any] = {}
         budget_snap: dict[str, Any] = {}
         if self._read_gate_stats is not None:
@@ -441,9 +613,37 @@ class AdaptiveController:
                 failures=ev.gate_outcomes["failure"],
                 neutral=ev.gate_outcomes["neutral"],
             )
-        running = int(getattr(self._manager, "running_count", 0) or 0)
-        queued = len(getattr(self._manager, "_queue", ()) or ())
-        healthy = max(0, running - self._stalled_running())
+        mgr_running = int(getattr(self._manager, "running_count", 0) or 0)
+        mgr_queued = len(getattr(self._manager, "_queue", ()) or ())
+        healthy = max(0, mgr_running - self._stalled_running())
+
+        # The runner lane is a second admission point on the same effective
+        # cap: its occupancy is demand and its committed completions earn an
+        # increase under the exec track's own rules. Lane completions this tick
+        # mark the lane's running slots as progressing -- fresh work finishing
+        # is the "stream activity" signal a lane with no per-row stream exposes.
+        lane_running, lane_waiting, lane_done = self._ingest_runner_lane()
+        running = mgr_running + lane_running
+        queued = mgr_queued + lane_waiting
+        # ``healthy_in_flight`` is the cut floor: a decrease never targets below
+        # it. The lane exposes no stall signal, so a stuck lane slot must not
+        # count as healthy -- that would prop the floor up and turn a
+        # corroborated halving into a one-slot trim. Only stall-detected manager
+        # runs are healthy here; lane occupancy still reaches demand above.
+        #
+        # The at-cap tests are PER admission point, never the sum: each point is
+        # bounded by the same effective cap on its own. ``saturating`` is the
+        # busiest point's running (the progress probe needs a point whose own
+        # slots fill the cap); ``saturating_demand`` is the busiest point's
+        # demand (the earn gate's pressure test). Reading the max of the two,
+        # not the sum, keeps two manager plus two lane runs at cap 4 from
+        # earning -- neither point is saturated -- while a deep queue at one
+        # point still carries that point's demand, so a slow-start increase
+        # earned by a completion with running below the cap holds.
+        saturating = max(mgr_running, lane_running)
+        saturating_demand = max(mgr_running + mgr_queued, lane_running + lane_waiting)
+        if lane_done > 0:
+            progressing += min(lane_running, lane_done) if lane_running else lane_done
 
         sample = Sample(
             t=now,
@@ -459,7 +659,7 @@ class AdaptiveController:
             attributable_timeout_rate=timeout_rate,
             completion_rate=completion_rate,
             admitted_in_window=admitted,
-            completions=ev.completions_total,
+            completions=ev.completions_total + self._lane_completions_total,
             slow_or_failing_keys=len(slow_keys),
             per_provider_429=throttles,
             spawn_gate=gate,
@@ -467,6 +667,8 @@ class AdaptiveController:
             queued=queued,
             healthy_in_flight=healthy,
             progressing=progressing,
+            saturating=saturating,
+            saturating_demand=saturating_demand,
         )
         self._samples.append(sample)
         return sample
@@ -495,23 +697,133 @@ class AdaptiveController:
         return decision
 
     async def apply(self, decision: Decision) -> None:
+        prev_exec, prev_gate = self._applied_exec, self._applied_gate
         if decision.effective_exec_cap != self._applied_exec:
             self._apply_exec(decision.effective_exec_cap)
         if decision.spawn_gate_capacity != self._applied_gate:
             self._gate_pending = decision.spawn_gate_capacity
         await self._flush_gate()
+        # Movement is judged on what the actuators confirmed, after they ran:
+        # a gate update the daemon did not answer stays pending and is not a
+        # move. A cap's first application (``None`` before) is not one either.
+        moved = (prev_exec is not None and self._applied_exec != prev_exec) or (
+            prev_gate is not None and self._applied_gate != prev_gate
+        )
         if decision.action in self._counts:
             self._counts[decision.action] += 1
         if decision.changed and decision.action not in (ACTION_HOLD, ACTION_FIXED):
             emit_counter(ADAPTIVE_DECISIONS, {"action": decision.action})
-            logger.info(
-                "adaptive concurrency %s: exec_cap=%d gate_cap=%d paused=%s (%s)",
+            # gateway.log keeps WARNING and above, and a cap reduction, and
+            # the resume that closes a pause, are the events an operator later
+            # needs to explain; growth stays at INFO.
+            log = (
+                logger.warning
+                if decision.action in (ACTION_DECREASE, ACTION_PAUSE, ACTION_RESUME)
+                else logger.info
+            )
+            # A cut that loop lag caused names what the loop was running during
+            # that lag, so the cut's cause can be read back from gateway.log.
+            busy = (
+                f" busy={self._last_busy}"
+                if self._last_busy
+                and SIGNAL_LOOP_LAG in decision.signals
+                and decision.action in (ACTION_DECREASE, ACTION_PAUSE)
+                else ""
+            )
+            log(
+                "adaptive concurrency %s: exec_cap=%d gate_cap=%d paused=%s (%s)%s",
                 decision.action,
                 decision.effective_exec_cap,
                 decision.spawn_gate_capacity,
                 decision.paused,
                 decision.reason,
+                busy,
             )
+        self._track_throttled_period(decision)
+        if moved or (decision.changed and decision.action not in (ACTION_HOLD, ACTION_FIXED)):
+            # Any confirmed move belongs in the history, whatever the decision
+            # said: a hold after a live ``agent.max_subagents`` drop clamps the
+            # cap, a fixed-mode hot-reload from a reduced AIMD cap restores it,
+            # and a restarted daemon accepting a long-pending gate cap moves it
+            # under an unchanged decision. A changed non-hold decision is
+            # recorded even when its actuator has not confirmed yet. The first
+            # fixed decision pins caps applied at construction: not a move.
+            last = self._samples[-1] if self._samples else None
+            # Wall-clock, not ``self._clock``: the entry is read from outside
+            # the process, to line a cap drop up against gateway.log. The caps
+            # are the CONFIRMED ones: what the actuators hold after this
+            # decision, not what it asked for (a gate update the daemon did
+            # not answer is still pending and shows the previous value).
+            self._recent.append(
+                {
+                    "at": time.time(),
+                    "action": decision.action,
+                    "reason": decision.reason,
+                    "exec_cap": self._applied_exec,
+                    "gate_cap": self._applied_gate,
+                    "paused": decision.paused,
+                    "loop_lag_ms": round(last.loop_lag_ms, 1) if last else None,
+                }
+            )
+
+    def _track_throttled_period(self, decision: Decision) -> None:
+        """Open a throttled period at its first cut, and close it with one
+        WARNING once the policy's caps are back where they were before it.
+
+        gateway.log keeps WARNING and above. The cut that opens a period is
+        logged there, while each growth step stays at INFO, so without this
+        line the end of a throttled period, and so its length, is not in that
+        log. A ceiling lowered meanwhile lowers the target with it, and a switch
+        to fixed mode, which pins both caps, ends the period too.
+        """
+        # Before the first decision the policy holds its start caps, so a cut on
+        # the very first tick opens a period too.
+        params = self._policy.params
+        prev = self._decided_caps or (params.exec_start, params.gate_start)
+        self._decided_caps = (decision.effective_exec_cap, decision.spawn_gate_capacity)
+        if self._cut_since is None:
+            if decision.action in (ACTION_DECREASE, ACTION_PAUSE) and (
+                decision.paused
+                or decision.effective_exec_cap < prev[0]
+                or decision.spawn_gate_capacity < prev[1]
+            ):
+                self._cut_since = self._clock()
+                self._cut_from = prev
+            return
+        if decision.paused:
+            return
+        from_exec, from_gate = self._cut_from
+        ceiling = max(1, int(self._manager.user_max_concurrent))
+        # Demand can grow a cap past where the policy starts it, and with no
+        # demand left the policy only restores toward that start, so an idle
+        # return to it ends the period too; otherwise it would stay open and
+        # fold every later episode into one length.
+        last = self._samples[-1] if self._samples else None
+        idle = last is not None and last.demand == 0
+        back = (
+            decision.action == ACTION_FIXED
+            or (
+                decision.effective_exec_cap >= min(from_exec, ceiling)
+                and decision.spawn_gate_capacity >= min(from_gate, self._gate_bounds[2])
+            )
+            or (
+                idle
+                and decision.effective_exec_cap >= min(from_exec, params.exec_start)
+                and decision.spawn_gate_capacity >= min(from_gate, params.gate_start)
+            )
+        )
+        if not back:
+            return
+        logger.warning(
+            "adaptive concurrency restored: exec_cap=%d gate_cap=%d after %ds "
+            "(before the cut: exec_cap=%d gate_cap=%d)",
+            decision.effective_exec_cap,
+            decision.spawn_gate_capacity,
+            round(max(0.0, self._clock() - self._cut_since)),
+            from_exec,
+            from_gate,
+        )
+        self._cut_since = None
 
     def _apply_exec(self, cap: Optional[int]) -> None:
         try:
@@ -533,7 +845,10 @@ class AdaptiveController:
         if applied is None:
             # Daemon not answering: keep it pending, retry next tick.
             return
-        self._applied_gate = wanted
+        # What the daemon answered, not what was asked: an adopted daemon with
+        # narrower bounds clamps the request, and the history and
+        # ``applied_gate_cap`` must report the capacity actually in force.
+        self._applied_gate = applied
         self._gate_pending = None
 
     # -- manager observation -------------------------------------------------
@@ -583,6 +898,45 @@ class AdaptiveController:
             if not getattr(info, "done", False) and getattr(info, "stalled", False)
         )
 
+    def _ingest_runner_lane(self) -> tuple[int, int, int]:
+        """Fold the runner lane (workflow ``ctx.agent()`` / TaskRunner steps)
+        into the exec track's evidence.
+
+        Returns ``(running, waiting, completions_delta)``: lane occupancy as
+        demand and the lane completions since the previous tick. The lane is a
+        SEPARATE admission point from the sub-agent manager -- a workflow agent
+        holds a lane slot, a sub-agent holds a manager slot, never both -- so
+        this evidence adds to the manager's rather than overlapping it, and the
+        issue's "nothing counted twice" holds by construction.
+
+        A lane completion is a committed ``done`` (``RunnerLane.settled_ok``),
+        never a grant; attributable lane failures reach the controller through
+        ``record_start`` already, so this never feeds the timeout signal.
+        """
+        if self._read_runner_lane is None:
+            return (0, 0, 0)
+        try:
+            stats = self._read_runner_lane()
+        except Exception:
+            logger.debug("adaptive: runner lane read failed", exc_info=True)
+            return (0, 0, 0)
+        if not isinstance(stats, dict):
+            return (0, 0, 0)
+        running = max(0, _as_int(stats.get("running"), 0))
+        waiting = max(0, _as_int(stats.get("waiting"), 0))
+        settled_ok = max(0, _as_int(stats.get("settled_ok"), 0))
+        base = self._lane_completions_base
+        if base < 0 or settled_ok < base:
+            # First reading, or a fresh lane after a re-wire: seed the base and
+            # credit nothing this tick -- a completion from before the
+            # controller watched is not evidence about the present.
+            self._lane_completions_base = settled_ok
+            return (running, waiting, 0)
+        delta = settled_ok - base
+        self._lane_completions_base = settled_ok
+        self._lane_completions_total += delta
+        return (running, waiting, delta)
+
     # -- observability -------------------------------------------------------
 
     @property
@@ -596,6 +950,15 @@ class AdaptiveController:
     def state(self) -> dict[str, Any]:
         """Structured state for ``resource_status`` and the dashboard."""
         last = self._samples[-1] if self._samples else None
+        snapshot = self._policy.snapshot()
+        cut = snapshot.get("last_cut")
+        if isinstance(cut, dict):
+            # The policy stamps a cut with the SAMPLE clock (this controller's
+            # ``_clock``, monotonic); a reader outside the process needs an age.
+            try:
+                cut["age_secs"] = round(max(0.0, self._clock() - float(cut["t"])), 1)
+            except (KeyError, TypeError, ValueError):
+                pass
         return {
             "enabled": self._enabled,
             "sample_secs": self._sample_secs,
@@ -620,7 +983,8 @@ class AdaptiveController:
                 if last
                 else None
             ),
-            **self._policy.snapshot(),
+            "recent_decisions": list(self._recent),
+            **snapshot,
         }
 
 
@@ -674,6 +1038,7 @@ __all__ = [
     "AdaptiveController",
     "ExecActuator",
     "HostSample",
+    "LaneReader",
     "classify_run_outcome",
     "current",
     "current_state",

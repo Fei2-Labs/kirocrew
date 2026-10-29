@@ -1,10 +1,11 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import Strands, { strandsSupported } from './Strands'
 import { useReducedMotion } from '../hooks/useReducedMotion'
 import type { AudioSample } from '../hooks/mic'
 import MicSourceMenu from './MicSourceMenu'
 import { downloadLabel } from '../lib/sttProviders'
+import type { SttModelProgress } from '../lib/sttProviders'
 import { i18nT } from '../i18n/t'
 
 /** One tracked token of the in-flight partial hypothesis. */
@@ -169,8 +170,11 @@ interface Props {
    * same time as the button saying it is noise.
    */
   gestureDriven?: boolean
-  /** Byte progress of the one-time speech-model download this session waits on. */
-  download?: { done: number; total: number } | null
+  /** `stt.submit_on_release`: clicking the mic sends in either transport, so
+   *  the hint says so and names Shift-click as the way to keep a draft. */
+  submitOnRelease?: boolean
+  /** What the speech model this session waits on is doing: fetching, or loading. */
+  download?: SttModelProgress | null
 }
 
 /**
@@ -180,13 +184,24 @@ interface Props {
  * backend is solid, the in-flight partial hypothesis is muted. Both come from
  * the composer's own value, so what is shown here is exactly what will be sent.
  */
-export default function VoiceDictationPanel({ sampleRef, value, partial, deviceLabel, deviceId, onSelectDevice, deviceSwitchIsLive, streaming, gestureDriven, download }: Props) {
+export default function VoiceDictationPanel({ sampleRef, value, partial, deviceLabel, deviceId, onSelectDevice, deviceSwitchIsLive, streaming, gestureDriven, submitOnRelease, download }: Props) {
   // Split committed vs partial without coupling to STT internals: the partial
   // is appended to the composer value, so it is the suffix — but only trust
   // that when it actually matches (the user may have typed since).
   const hasPartial = !!partial && value.endsWith(partial)
   const committed = hasPartial ? value.slice(0, value.length - partial.length) : value
   const tokens = useWordRevisions(committed, hasPartial ? partial : '')
+
+  // The transcript is height-capped (see max-h-20 below), so pin it to the
+  // bottom as text grows — the newest words are what a dictating user is
+  // confirming, and they sit at the growing edge. Scrolling up to reread
+  // pauses the pin; scrolling back to the bottom resumes it.
+  const transcriptRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)
+  useEffect(() => {
+    const el = transcriptRef.current
+    if (el && followRef.current) el.scrollTop = el.scrollHeight
+  }, [committed, partial])
 
   return (
     <div
@@ -233,9 +248,13 @@ export default function VoiceDictationPanel({ sampleRef, value, partial, deviceL
               theme the muted token over the glow read as blank. */}
           {!gestureDriven && (
             <span className="ml-auto whitespace-nowrap text-text font-normal font-mono text-[11px] [text-shadow:0_1px_12px_var(--bg),0_0_3px_var(--bg)]">
-              {streaming
-                ? i18nT('components.voiceDictationPanel.esc_to_cancel_enter_to_send')
-                : i18nT('components.voiceDictationPanel.esc_to_cancel_click_mic_to_finish')}
+              {/* Submit-on-release first: with it on, stopping sends in either
+                  transport, so the hint has to name the way to keep a draft. */}
+              {submitOnRelease
+                ? i18nT('components.voiceDictationPanel.esc_to_cancel_click_mic_to_send')
+                : streaming
+                  ? i18nT('components.voiceDictationPanel.esc_to_cancel_enter_to_send')
+                  : i18nT('components.voiceDictationPanel.esc_to_cancel_click_mic_to_finish')}
             </span>
           )}
         </div>
@@ -245,8 +264,15 @@ export default function VoiceDictationPanel({ sampleRef, value, partial, deviceL
         <div className="flex flex-col gap-1">
           {/* Text sits over a live shader, so it carries its own shadow floor
               rather than relying on the background staying dark. */}
+          {/* Scrollable, so it opts back into pointer events like the picker;
+              `overscroll-contain` keeps a wheel at either end out of the chat. */}
           <div
-            className="text-[17px] leading-[1.45] text-text-strong max-h-20 overflow-hidden [text-shadow:0_1px_12px_var(--bg),0_0_3px_var(--bg)]"
+            ref={transcriptRef}
+            onScroll={e => {
+              const el = e.currentTarget
+              followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 4
+            }}
+            className="pointer-events-auto text-[17px] leading-[1.45] text-text-strong max-h-20 overflow-y-auto overscroll-contain scrollbar-none [text-shadow:0_1px_12px_var(--bg),0_0_3px_var(--bg)]"
             data-testid="voice-dictation-transcript"
           >
             {committed}

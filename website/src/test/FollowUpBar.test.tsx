@@ -1,8 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
 import FollowUpBar, { FOLLOWUP_CHIP_DEBOUNCE_MS } from '../components/FollowUpBar'
+import { readIndexCss } from './indexCssSource'
 
 // jsdom polyfill: scroll-layout uses ResizeObserver to track when the chip
 // strip can scroll left/right.
@@ -32,6 +31,25 @@ describe('FollowUpBar', () => {
       expect(onSelect).toHaveBeenCalledWith('Ship it', expect.any(Object))
     })
 
+    it('a touch tap selects on the first tap and mounts no tooltip (iOS drops a click whose tap reveals one)', () => {
+      vi.useFakeTimers()
+      try {
+        const onSelect = vi.fn()
+        render(<FollowUpBar options={['Ship it']} picked={new Set()} onSelect={onSelect} />)
+        const chip = screen.getByRole('button', { name: 'Ship it' })
+        fireEvent.pointerEnter(chip, { pointerType: 'touch' })
+        fireEvent.pointerDown(chip, { pointerType: 'touch' })
+        fireEvent.pointerUp(chip, { pointerType: 'touch' })
+        fireEvent.mouseEnter(chip)
+        fireEvent.click(chip)
+        act(() => { vi.advanceTimersByTime(500) })
+        expect(onSelect).toHaveBeenCalledTimes(1)
+        expect(screen.queryByRole('tooltip')).toBeNull()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
     it('fires onSelect for both picked and unpicked chips', () => {
       const onSelect = vi.fn()
       render(<FollowUpBar options={['A', 'B']} picked={new Set(['A'])} onSelect={onSelect} />)
@@ -46,14 +64,18 @@ describe('FollowUpBar', () => {
       render(<FollowUpBar options={['Picked', 'Unpicked']} picked={new Set(['Picked'])} onSelect={() => {}} />)
       const pickedBtn = screen.getByRole('button', { name: 'Picked' })
       const unpickedBtn = screen.getByRole('button', { name: 'Unpicked' })
-      expect(pickedBtn.className).toContain('border-accent')
+      // Glass pill: the button IS the Liquid Glass pane (components/Glass.tsx
+      // rendered as the button), and the accent is mixed INTO the material
+      // (`glass-accent`) rather than an opaque wash.
+      expect(pickedBtn.className).toContain('liquid-glass')
+      expect(pickedBtn.className).toContain('glass-accent')
       expect(pickedBtn.className).toContain('text-accent')
-      expect(pickedBtn.className).toContain('bg-accent-subtle')
       fireEvent.focus(pickedBtn)
       expect(screen.getByRole('tooltip').textContent).toMatch(/remove/i)
       fireEvent.blur(pickedBtn)
       expect(unpickedBtn.className).toContain('text-muted')
-      expect(unpickedBtn.className).toContain('bg-bg-elevated')
+      expect(unpickedBtn.className).toContain('liquid-glass')
+      expect(unpickedBtn.className).not.toContain('glass-accent')
       fireEvent.focus(unpickedBtn)
       expect(screen.getByRole('tooltip').textContent).toMatch(/add to input/i)
       fireEvent.blur(unpickedBtn)
@@ -68,7 +90,7 @@ describe('FollowUpBar', () => {
       fireEvent.click(btn)
       expect(btn.className).toContain('text-muted')
       rerender(<FollowUpBar options={['X']} picked={new Set(['X'])} onSelect={() => {}} />)
-      expect(screen.getByRole('button', { name: 'X' }).className).toContain('bg-accent-subtle')
+      expect(screen.getByRole('button', { name: 'X' }).className).toContain('glass-accent')
     })
   })
 
@@ -240,6 +262,68 @@ describe('FollowUpBar', () => {
     })
   })
 
+  // ─── Single-select [OPTION:] rows: tooltip must not promise multi-select ──
+  // A single-select pick REPLACES the previous one, so "Shift+Click to select
+  // multiple" / "Click to add to selection" would describe a gesture whose
+  // result is silently dropped.
+  describe('quickSend tooltip wording by selection mode', () => {
+    const tipFor = (label: string) => {
+      fireEvent.focus(screen.getByRole('button', { name: label }))
+      return screen.getByRole('tooltip').textContent ?? ''
+    }
+
+    it('single-select with no picks says Shift+Click adds without sending', () => {
+      render(<FollowUpBar options={['Deploy']} picked={new Set()} onSelect={() => {}} onSend={() => {}} quickSend multi={false} />)
+      const tip = tipFor('Deploy')
+      expect(tip).toContain('Click to send instantly, Shift+Click to add to the message without sending')
+      expect(tip).not.toMatch(/select multiple/i)
+    })
+
+    it('single-select with a pick says the click replaces the selection', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} quickSend multi={false} />)
+      const tip = tipFor('Roll back')
+      expect(tip).toContain('Click to replace selection')
+      expect(tip).not.toMatch(/add to selection/i)
+    })
+
+    it('multi omitted keeps the multi-select wording (control)', () => {
+      const { unmount } = render(<FollowUpBar options={['Deploy']} picked={new Set()} onSelect={() => {}} onSend={() => {}} quickSend />)
+      expect(tipFor('Deploy')).toContain('Shift+Click to select multiple')
+      unmount()
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} quickSend />)
+      expect(tipFor('Roll back')).toContain('Click to add to selection')
+    })
+  })
+
+  // ─── Quick Send off: a single-select pick still REPLACES ─────────────────
+  // selectSingleFollowUpOption swaps the pick whether or not Quick Send is on,
+  // so "Click to add to input" would promise an add that never happens.
+  describe('non-quickSend tooltip wording by selection mode', () => {
+    const tipFor = (label: string) => {
+      fireEvent.focus(screen.getByRole('button', { name: label }))
+      return screen.getByRole('tooltip').textContent ?? ''
+    }
+
+    it('single-select with a pick and onSend says the click replaces (double-click sends)', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} multi={false} />)
+      const tip = tipFor('Roll back')
+      expect(tip).toContain('Click to replace selection (double-click to send)')
+      expect(tip).not.toMatch(/add to input/i)
+    })
+
+    it('single-select with a pick and no onSend says the click replaces', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} multi={false} />)
+      const tip = tipFor('Roll back')
+      expect(tip).toContain('Click to replace selection')
+      expect(tip).not.toMatch(/add to input/i)
+    })
+
+    it('multi omitted with a pick keeps the add-to-input wording (control)', () => {
+      render(<FollowUpBar options={['Roll back']} picked={new Set(['Deploy'])} onSelect={() => {}} onSend={() => {}} />)
+      expect(tipFor('Roll back')).toContain('Click to add to input (double-click to select and send)')
+    })
+  })
+
   // ─── Quick-send instant-send state preserves no-lag UX ───────────────────
   describe('with onSend + quickSend (instant-send state)', () => {
     beforeEach(() => { vi.useFakeTimers() })
@@ -284,6 +368,10 @@ describe('FollowUpBar', () => {
   // own text out of the visible box.
   describe('long option labels', () => {
     const LONG = 'Implement blockers 3 & 4 plus the safe follow-ups and push, but leave blocker 1 (team access) and blocker 2 (CI) for me to handle myself'
+    // The chip IS a Glass host (components/Glass.tsx): its first <span>s are the
+    // material layers (empty), so the label is the leaf span carrying the text.
+    const labelSpan = (chip: HTMLElement) =>
+      [...chip.querySelectorAll('span')].find(s => s.children.length === 0 && s.textContent === chip.textContent)
 
     it('caps chip width and clamps the label in the scroll layout', () => {
       render(<FollowUpBar options={[LONG]} picked={new Set()} onSelect={() => {}} layout="scroll" />)
@@ -291,7 +379,7 @@ describe('FollowUpBar', () => {
       expect(chip.className).toContain('followup-chip')
       // The clamp must sit on an unpadded inner element, not on the padded
       // button — otherwise a sliver of the next line shows in the padding.
-      const label = chip.querySelector('span')
+      const label = labelSpan(chip)
       expect(label?.className).toContain('truncate')
       expect(label?.className).toContain('block')
       expect(chip.className).not.toContain('truncate')
@@ -327,7 +415,7 @@ describe('FollowUpBar', () => {
     it('backs the cap class with a real max-width rule', () => {
       // jsdom does not load index.css, so the class assertions above would pass
       // with the rule deleted. Read the stylesheet directly.
-      const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+      const css = readIndexCss()
       expect(css).toMatch(
         /\.followup-chip\s*\{[^}]*max-width:\s*min\(100%,\s*clamp\(18rem,\s*calc\(50% - 0\.1875rem\),\s*26rem\)\)/,
       )
@@ -345,7 +433,7 @@ describe('FollowUpBar', () => {
     // reshaped rule fails both tests below with this message instead of a
     // TypeError on a null match.
     const chipCapPreferred = (): { pct: number, halfGapRem: number } => {
-      const css = readFileSync(resolve(process.cwd(), 'src/index.css'), 'utf-8')
+      const css = readIndexCss()
       const m = css.match(/\.followup-chip\s*\{[^}]*calc\((\d+)% - ([\d.]+)rem\)/)
       expect(m, '.followup-chip must cap width relative to the row (calc(<pct>% - <half-gap>rem))').not.toBeNull()
       return { pct: Number(m![1]), halfGapRem: Number(m![2]) }
@@ -383,7 +471,7 @@ describe('FollowUpBar', () => {
       render(<FollowUpBar options={[LONG]} picked={new Set()} onSelect={() => {}} />)
       const chip = screen.getByRole('button', { name: LONG })
       expect(chip.className).toContain('followup-chip')
-      expect(chip.querySelector('span')?.className).toContain('truncate')
+      expect(labelSpan(chip)?.className).toContain('truncate')
     })
 
     it('clamps to ONE line so a long label cannot make its chip taller than its neighbours', () => {
@@ -396,7 +484,7 @@ describe('FollowUpBar', () => {
           <FollowUpBar options={[LONG, 'Ship it']} picked={new Set()} onSelect={() => {}} onSend={() => {}} layout={layout} />,
         )
         for (const label of [LONG, 'Ship it']) {
-          const span = screen.getByRole('button', { name: label }).querySelector('span')
+          const span = labelSpan(screen.getByRole('button', { name: label }))
           expect(span?.className).toContain('truncate')
           expect(span?.className).not.toContain('line-clamp-2')
         }
@@ -584,6 +672,241 @@ describe('FollowUpBar', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Send now: Go' }))
       expect(onSend).toHaveBeenCalledWith('Go', 'row-1')
       expect(onSelect).not.toHaveBeenCalled()
+    })
+  })
+  /* Dispatch states (#6056). A plan chip dispatches a state-changing action, so
+   * the bar has to say the click landed: without this a slow or failed dispatch
+   * is a dead button, and the held-until-ack latch makes a re-click silently
+   * refused on top of that.
+   *
+   * Four states, one visual vocabulary: idle, in-flight, latched-awaiting-ack
+   * (deliberately the SAME spinner as in-flight — the two differ in duration,
+   * not in what the user can do), and failed. */
+  describe('dispatch states (#6056)', () => {
+    const PLAN = ['Go', 'Go All', 'Cancel']
+    const FAILED = 'Could not send that plan action.'
+    const bar = (extra: Record<string, unknown> = {}) =>
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={() => {}} {...extra} />)
+
+    it('idle: a bar given neither prop is exactly what it was', () => {
+      // This is also the SideChat / ChatEmbed contract: those surfaces render
+      // chips but dispatch no plan action, so they pass nothing and draw nothing.
+      const { container } = bar()
+      expect(container.querySelector('.animate-spin')).toBeNull()
+      expect(screen.queryByRole('alert')).toBeNull()
+      for (const o of PLAN) {
+        const b = screen.getByRole('button', { name: o })
+        expect(b).not.toHaveAttribute('aria-disabled')
+        expect(b.className).not.toContain('opacity-70')
+      }
+    })
+
+    it('in-flight: the clicked chip spins and stops taking clicks', () => {
+      bar({ pendingOptions: new Set(['Go']), refusedOptions: new Set(['Go', 'Go All']) })
+      const go = screen.getByRole('button', { name: 'Go' })
+      expect(go.querySelector('.animate-spin')).toBeTruthy()
+      expect(go).toHaveAttribute('aria-disabled', 'true')
+      expect(go).toHaveAttribute('aria-busy', 'true')
+    })
+
+    it('in-flight: only REFUSED chips dim, and live Cancel stays at full strength', () => {
+      // `dim` means "this click is refused", not "a sibling is busy". Go and Go All
+      // share one latch, so Go All dims; Cancel keeps its own and must not, because
+      // a cold reader told us the dimmed stop control reads as locked — the dead
+      // control this whole affordance exists to remove.
+      const onSelect = vi.fn()
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} pendingOptions={new Set(['Go'])} refusedOptions={new Set(['Go', 'Go All'])} />)
+      const cancel = screen.getByRole('button', { name: 'Cancel' })
+      const goAll = screen.getByRole('button', { name: 'Go All' })
+      // Refused by the shared Go latch: dimmed, AND announced unavailable, because
+      // its activation really is dropped. A dim that assistive tech could not see
+      // would have left the dead button intact for anyone not looking at pixels.
+      expect(goAll.className).toContain('opacity-70')
+      expect(goAll).toHaveAttribute('aria-disabled', 'true')
+      // Not refused: full strength, no spinner, and still live.
+      expect(cancel.className).not.toContain('opacity-70')
+      expect(cancel).not.toHaveAttribute('aria-disabled')
+      expect(goAll).not.toBeDisabled()  // announced, never actually disabled
+      expect(cancel.querySelector('.animate-spin')).toBeNull()
+      fireEvent.click(cancel)
+      expect(onSelect).toHaveBeenCalledWith('Cancel', expect.any(Object))
+    })
+
+    it('latched-awaiting-ack reuses the in-flight visual: exactly one spinner, no second affordance', () => {
+      // `pendingOptions` is the bar's ONLY busy input. The host drives it from
+      // the latch, which outlives the HTTP response, so the spinner covers the
+      // silent window too — there is no third state for the user to decode.
+      const { container } = bar({ pendingOptions: new Set(['Go All']), refusedOptions: new Set(['Go', 'Go All']) })
+      expect(container.querySelectorAll('.animate-spin')).toHaveLength(1)
+      expect(screen.getByRole('button', { name: 'Go All' }).querySelector('.animate-spin')).toBeTruthy()
+    })
+
+    it('two chips can spin at once, because Go and Cancel latch independently', () => {
+      // Cancel is deliberately never blocked by a pending Go, so both classes can
+      // be outstanding together. One busy LABEL could not say that: whichever
+      // dispatch came second would un-spin the first chip, and an idle-looking
+      // chip over a held latch is the dead button this whole affordance removes.
+      const { container } = bar({ pendingOptions: new Set(['Go', 'Cancel']), refusedOptions: new Set(['Go', 'Go All', 'Cancel']) })
+      expect(container.querySelectorAll('.animate-spin')).toHaveLength(2)
+      expect(screen.getByRole('button', { name: 'Go' })).toHaveAttribute('aria-disabled', 'true')
+      expect(screen.getByRole('button', { name: 'Cancel' })).toHaveAttribute('aria-disabled', 'true')
+      // Go All dispatched nothing but shares Go's latch, so it is refused: it dims
+      // AND is announced unavailable, while never being actually `disabled`.
+      expect(screen.getByRole('button', { name: 'Go All' }).className).toContain('opacity-70')
+      expect(screen.getByRole('button', { name: 'Go All' })).toHaveAttribute('aria-disabled', 'true')
+      expect(screen.getByRole('button', { name: 'Go All' })).not.toBeDisabled()
+    })
+
+    it('a busy chip refuses clicks WITHOUT the disabled attribute, so its tooltip can still dismiss', () => {
+      // A disabled control dispatches no mouse or focus events, so `InstantTip`'s
+      // onMouseLeave / onBlur — its only pointer and keyboard dismissals — would
+      // never fire, and a chip hovered then clicked would strand its tooltip over
+      // the strip for as long as the latch is held.
+      // BOTH chip shapes: without `onSend` the chip is a plain button, with it the
+      // chip is a split button on a different code path — and the split one is
+      // what both chat hosts actually render, so an attribute check that covered
+      // only the plain shape would leave production unpinned.
+      vi.useFakeTimers()
+      for (const onSend of [undefined, vi.fn()]) {
+        const onSelect = vi.fn()
+        const { unmount } = render(
+          <FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={onSend} pendingOptions={new Set(['Go'])} refusedOptions={new Set(['Go', 'Go All'])} />,
+        )
+        const go = screen.getByRole('button', { name: 'Go' })
+        expect(go).toHaveAttribute('aria-disabled', 'true')
+        expect(go).not.toBeDisabled()
+        if (onSend) expect(screen.getByRole('button', { name: 'Send now: Go' })).not.toBeDisabled()
+        // Still inert: the refusal lives in the handler, not the attribute.
+        fireEvent.click(go)
+        act(() => { vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 30) })
+        expect(onSelect).not.toHaveBeenCalled()
+        if (onSend) { fireEvent.dblClick(go); expect(onSend).not.toHaveBeenCalled() }
+        unmount()
+      }
+      vi.useRealTimers()
+    })
+
+    it('a DIMMED chip cannot dispatch even if its latch is released mid-debounce', () => {
+      // The refused chip's click is DEBOUNCED, so the dispatch happens when the
+      // timer fires and not at the click. Releasing the refusal inside that window
+      // is the ordinary case, not a corner: a definitive 4xx on the sibling frees
+      // the shared latch for retry. So the guard has to reject at CLICK time —
+      // the hook's own `latch.has(vars.slot)` check cannot help, because by the
+      // time the timer runs the latch it would have tested is gone.
+      vi.useFakeTimers()
+      // Both shapes: the split one is what the hosts render, and it is the one
+      // whose handler owns the timer.
+      for (const onSend of [undefined, vi.fn()]) {
+        const onSelect = vi.fn()
+        const { rerender, unmount } = render(
+          <FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={onSend} pendingOptions={new Set(['Go'])} refusedOptions={new Set(['Go', 'Go All'])} />,
+        )
+        const goAll = screen.getByRole('button', { name: 'Go All' })
+        // The dim sits on whichever element is the flex item: the button when the
+        // chip is standalone, the WRAPPER when it is a split button.
+        const dimHost = onSend ? goAll.parentElement! : goAll
+        expect(dimHost.className).toContain('opacity-70')
+        // Dimmed means refused, so it must also read as refused to the pointer —
+        // on the button itself, which is what the cursor is resolved against.
+        expect(goAll.className).toContain('cursor-default')
+        expect(goAll.className).not.toContain('cursor-pointer')
+        fireEvent.click(goAll)
+        // Go's dispatch is rejected 400 and releases the shared latch: nothing is
+        // pending or refused any more, and the chip is live again...
+        rerender(
+          <FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={onSend} error="unknown action for this plan stage" />,
+        )
+        // ...and only NOW does the armed timer fire.
+        act(() => { vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 30) })
+        expect(onSelect).not.toHaveBeenCalled()
+        unmount()
+      }
+      vi.useRealTimers()
+    })
+
+    it('failed: the row renders through ErrorNotice, with the agent hand-off', () => {
+      // A hand-rolled red div is banned by AUTOSDE `errors-use-error-notice`:
+      // ErrorNotice is the one place that recovers the structured context and
+      // offers it to the agent, so a bare role="alert" box is a dead end.
+      bar({ error: 'bad action' })
+      const row = screen.getByRole('alert')
+      // The detail is the journal lookup key, so it must arrive UNPREFIXED.
+      expect(row.querySelector('strong')).toHaveTextContent(FAILED)
+      expect(row).toHaveTextContent('bad action')
+      expect(screen.getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    })
+
+    it('failed: one error row carries the sentence and the detail, and every chip is idle again', () => {
+      bar({ error: 'bad action' })
+      const row = screen.getByRole('alert')
+      expect(row).toHaveTextContent(FAILED)
+      expect(row).toHaveTextContent('bad action')
+      for (const o of PLAN) {
+        expect(screen.getByRole('button', { name: o })).not.toHaveAttribute('aria-disabled')
+        expect(screen.getByRole('button', { name: o }).className).not.toContain('opacity-70')
+      }
+    })
+
+    it('failed with no readable message still draws the row', () => {
+      // `''` is a failure that said nothing, not the absence of a failure. It has
+      // no structured context to look up, so the bar's sentence becomes the
+      // message — ErrorNotice renders nothing at all for a falsy one.
+      bar({ error: '' })
+      const row = screen.getByRole('alert')
+      expect(row).toHaveTextContent(FAILED)
+      expect(row.querySelector('strong')).toBeNull()
+    })
+
+    it('draws at most ONE error row, and none without an error', () => {
+      const { unmount } = bar({ error: 'bad action' })
+      expect(screen.getAllByRole('alert')).toHaveLength(1)
+      unmount()
+      bar({ error: null })
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('the scroll layout draws the same states as the multiline one', () => {
+      const { container } = bar({ layout: 'scroll', pendingOptions: new Set(['Go']), refusedOptions: new Set(['Go', 'Go All']), error: 'bad action' })
+      expect(screen.getByRole('button', { name: 'Go' }).querySelector('.animate-spin')).toBeTruthy()
+      expect(screen.getByRole('alert')).toHaveTextContent(FAILED)
+      // Go All, refused by Go's latch. Cancel is untouched in either layout.
+      expect(screen.getByRole('button', { name: 'Go All' }).className).toContain('opacity-70')
+      expect(screen.getByRole('button', { name: 'Cancel' }).className).not.toContain('opacity-70')
+      void container
+    })
+
+    it('a split chip dims as one piece and its Send-now segment goes inert', () => {
+      // With onSend the WRAPPER is the flex item, so the dim has to sit there or
+      // the arrow segment would stay bright beside a faded label.
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={() => {}} onSend={() => {}} pendingOptions={new Set(['Go'])} refusedOptions={new Set(['Go', 'Go All'])} />)
+      const go = screen.getByRole('button', { name: 'Go' })
+      expect(go).toHaveAttribute('aria-disabled', 'true')
+      expect(screen.getByRole('button', { name: 'Send now: Go' })).toHaveAttribute('aria-disabled', 'true')
+      // The refused sibling dims on its WRAPPER, which is the split chip's flex item.
+      expect(screen.getByRole('button', { name: 'Go All' }).parentElement?.className).toContain('opacity-70')
+      // Cancel is not refused, so neither its wrapper nor its button dims.
+      expect(screen.getByRole('button', { name: 'Cancel' }).parentElement?.className).not.toContain('opacity-70')
+      expect(screen.getByRole('button', { name: 'Cancel' })).not.toHaveAttribute('aria-disabled')
+      expect(go.parentElement?.className).not.toContain('opacity-70')
+      // Item 2: the pending SPLIT chip must not keep the pointer hand. Asserting
+      // `cursor-default` is PRESENT proves nothing on its own — both utilities at
+      // equal specificity means Tailwind's emission order decides, and
+      // `cursor-default` loses it. The load-bearing assertion is that
+      // `cursor-pointer` is ABSENT, i.e. the two are mutually exclusive.
+      expect(go.className).toContain('cursor-default')
+      expect(go.className).not.toContain('cursor-pointer')
+      // ...and that an idle chip still gets the pointer hand at all.
+      const cancel = screen.getByRole('button', { name: 'Cancel' })
+      expect(cancel.className).toContain('cursor-pointer')
+      // The ARROW half of the same split chip refuses the click too
+      // (`handleImmediateSend` opens with `if (pending) return`), so it must not
+      // keep the pointer hand either. Same exclusivity rule as the body.
+      const goSend = screen.getByRole('button', { name: 'Send now: Go' })
+      expect(goSend.className).toContain('cursor-default')
+      expect(goSend.className).not.toContain('cursor-pointer')
+      // A live chip's arrow is still a pointer, so the assertion above is about
+      // refusal and not about arrows in general.
+      expect(screen.getByRole('button', { name: 'Send now: Cancel' }).className).toContain('cursor-pointer')
     })
   })
 })

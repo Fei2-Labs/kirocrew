@@ -1,8 +1,32 @@
 import { describe, expect, it } from 'vitest'
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 const src = () => readFile(join(__dirname, '..', 'apps', 'papyrus', 'PapyrusPage.tsx'), 'utf8')
+
+describe('papyrus at short heights', () => {
+  it('keeps the editor floor and lower controls reachable', async () => {
+    const [page, app, routes] = await Promise.all([
+      src(),
+      readFile(join(__dirname, '..', 'App.tsx'), 'utf8'),
+      readFile(join(__dirname, '..', 'shell', 'nav', 'routeActive.ts'), 'utf8'),
+    ])
+    const workspace = page.slice(page.indexOf('Source column:'), page.indexOf('{/* PDF column.'))
+    const floor = "flex flex-1 ${isMobile ? 'min-h-0 flex-col' : 'min-h-[180px] [contain:size]'}"
+    expect(workspace.split(floor)).toHaveLength(2)
+    expect(workspace.indexOf(floor)).toBeLessThan(workspace.indexOf('<PapyrusEditor'))
+    expect(page).toContain("flex flex-col flex-1 ${isMobile ? 'min-h-0' : ''}")
+    expect(page).toContain("flex flex-1 ${isMobile ? 'min-h-0 flex-col' : ''}")
+    expect(page, 'the co-author transcript must not size the desktop row')
+      .toContain("isMobile ? 'flex-1' : 'shrink-0 [contain:size]'")
+    expect(workspace).toMatch(
+      /\/\* Status bar \*\/[\s\S]*?shrink-0[\s\S]*?overflow-hidden shrink-0[\s\S]*?max-h-56 overflow-x-hidden overflow-y-auto/,
+    )
+    expect(app).toContain("needsFixedHeight ? 'overflow-hidden p-0' : 'overflow-y-auto'")
+    const fixedHeight = routes.match(/const needsFixedHeight = ([^\n]+)/)?.[1] ?? ''
+    expect(fixedHeight).not.toContain('/papyrus')
+  })
+})
 
 // Four surfaces competed for one row: a 50% source column holding a 176px `w-44`
 // file tree beside the editor, a PDF column, and a 420px co-author panel that
@@ -11,7 +35,9 @@ const src = () => readFile(join(__dirname, '..', 'apps', 'papyrus', 'PapyrusPage
 describe('papyrus at phone widths', () => {
   it('turns both nested rows into columns', async () => {
     const s = await src()
-    const rows = s.match(/flex flex-1 min-h-0 \$\{isMobile \? 'flex-col' : ''\}/g) || []
+    const rows = s.match(
+      /flex flex-1 \$\{isMobile \? 'min-h-0 flex-col' : (?:''|'min-h-\[180px\] \[contain:size\]')\}/g,
+    ) || []
     expect(rows.length, 'both the outer and the inner row must stack').toBe(2)
   })
 
@@ -21,7 +47,9 @@ describe('papyrus at phone widths', () => {
     // persisted pixel widths and the source column is `flex-1`, so it is never a
     // fixed fraction of a phone viewport.
     expect(s, 'no fixed percentage share may survive').not.toMatch(/SOURCE_PANE_PERCENT/)
-    expect(s).toMatch(/className=\{`flex flex-col flex-1 min-h-0 min-w-0 \$\{narrowChat \? 'hidden' : ''\}`\}/)
+    expect(s).toMatch(
+      /className=\{`flex flex-col flex-1 min-w-0 \$\{isMobile \? 'min-h-0' : ''\} \$\{narrowChat \? 'hidden' : ''\}`\}/,
+    )
   })
 
   it('reaches the file tree from a top bar instead of a 176px side pane', async () => {
@@ -66,7 +94,7 @@ describe('papyrus at phone widths', () => {
     expect(s, 'the inner fixed width must move too')
       .toMatch(/style=\{\{ width: isMobile \? '100%' : chatWidth \}\}/)
     expect(s, 'the wrapper must own the pane while narrow')
-      .toMatch(/isMobile \? 'flex-1' : 'shrink-0'/)
+      .toMatch(/min-h-0 overflow-hidden \$\{isMobile \? 'flex-1'/)
   })
 
   it('lets the co-author panel own the pane by stepping the others aside', async () => {
@@ -85,7 +113,15 @@ describe('papyrus at phone widths', () => {
   })
 
   it('keeps the viewport-anchored sessions opener out of an embedded host', async () => {
-    const s = await readFile(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+    // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pin reads the page and those owners.
+    const pages = join(__dirname, '..', 'pages')
+    const ownerDir = join(pages, 'chat', 'page')
+    const files = [
+      join(pages, 'ChatPage.tsx'),
+      ...(await readdir(ownerDir)).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => join(ownerDir, f)),
+      ...(await readdir(pages)).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => join(pages, f)),
+    ]
+    const s = (await Promise.all(files.map(f => readFile(f, 'utf8')))).join('\n')
     // The floating opener is `fixed top-[42px] left-2`, i.e. anchored to the
     // VIEWPORT rather than to the host's pane, so inside Papyrus's co-author panel
     // it lands on the toolbar's back button -- two overlapping tap targets on the

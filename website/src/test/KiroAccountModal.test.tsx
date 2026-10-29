@@ -1,10 +1,45 @@
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import KiroAccountModal from '../components/KiroAccountModal'
+import KiroAccountModal, { type KiroAccountUsage } from '../components/KiroAccountModal'
+import { api } from '../api/client'
 import type { KiroCreditUsage } from '../api/client'
+import type { KiroUsageState } from '../api/kiroUsage'
+import { parseKiroUsagePayload } from '../api/kiroUsage'
+import { providerLabelFromWire } from '../components/kasProviderLabel'
 import { installSoftNavigate, __resetNavSeamForTests } from '../utils/errorReport'
 import { renderWithProviders } from './helpers'
+import { i18nT } from '../i18n/t'
+
+const { KIRO_USAGE_EMPTY } = vi.hoisted(() => ({
+  KIRO_USAGE_EMPTY: {
+    sessions: {
+      total_sessions: 0,
+      today: { sessions: 0, messages: 0, tool_calls: 0 },
+      this_week: { sessions: 0, messages: 0, tool_calls: 0 },
+      this_month: { sessions: 0, messages: 0, tool_calls: 0 },
+      avg_msgs_per_session: 0,
+      daily_history: [],
+    },
+    billing: {},
+  },
+}))
+
+vi.mock('../api/client', async importOriginal => {
+  const mod = await importOriginal<typeof import('../api/client')>()
+  return {
+    ...mod,
+    api: {
+      ...mod.api,
+      sessionsUsageRefresh: vi.fn(),
+      kiroUsage: vi.fn(async () => KIRO_USAGE_EMPTY),
+    },
+  }
+})
+
+const refreshMock = vi.mocked(api.sessionsUsageRefresh)
+const kiroUsageMock = vi.mocked(api.kiroUsage)
 
 const BASE_USAGE: KiroCreditUsage = {
   used: 10,
@@ -75,6 +110,113 @@ describe('KiroAccountModal', () => {
     expect(manage).toHaveAttribute('rel', 'noopener noreferrer')
   })
 
+  describe('run-out forecast', () => {
+    beforeEach(() => {
+      // Only Date is faked: React Query and testing-library keep real timers.
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date(2026, 9, 14))
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+      kiroUsageMock.mockReset()
+      kiroUsageMock.mockImplementation(async () => KIRO_USAGE_EMPTY)
+    })
+
+    it('names the projected run-out date under the meter', async () => {
+      // 1,300 used over 13 days of an Oct 1 -> Nov 1 cycle: 100/day, 1,700 left.
+      renderWithProviders(
+        <KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, used: 1_300, limit: 3_000, resets: '2026-11-01' }} />,
+      )
+      expect(await screen.findByTestId('kiro-credit-forecast')).toHaveTextContent(
+        "At this cycle's pace, you'll run out around Oct 30, before the reset.",
+      )
+    })
+
+    it('reads the weekday shape from the Usage report and can say it lasts', async () => {
+      // Same 1,300 used, but all history spend sits on Tuesdays: two Tuesdays
+      // remain before the reset, so the shaped projection lasts.
+      const days = []
+      for (let i = 1; i <= 28; i++) {
+        const d = new Date(2026, 9, 14 - i)
+        const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+        days.push({ date, sessions: 0, messages: 0, tool_calls: 0, credits: d.getDay() === 2 ? 700 : 0 })
+      }
+      kiroUsageMock.mockImplementation(async () => ({
+        ...KIRO_USAGE_EMPTY,
+        sessions: { ...KIRO_USAGE_EMPTY.sessions, daily_history: days },
+      }))
+      renderWithProviders(
+        <KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, used: 1_300, limit: 3_000, resets: '2026-11-01' }} />,
+      )
+      expect(await screen.findByTestId('kiro-credit-forecast')).toHaveTextContent(
+        "At this cycle's pace, your credits should last until the reset.",
+      )
+    })
+
+    it('shows no line while the Usage report is still refreshing', async () => {
+      kiroUsageMock.mockImplementation(async () => ({ ...KIRO_USAGE_EMPTY, refreshing: true }))
+      const { queryClient } = renderWithProviders(
+        <KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, used: 1_300, limit: 3_000, resets: '2026-11-01' }} />,
+      )
+      // Wait until the refreshing report is actually in the cache, so the
+      // absence below is the guard's doing and not a still-pending fetch.
+      await waitFor(() => {
+        const cached = queryClient.getQueriesData<{ refreshing?: boolean }>({ queryKey: ['provider-usage'] })
+        expect(cached.some(([, d]) => d?.refreshing === true)).toBe(true)
+      })
+      expect(screen.queryByTestId('kiro-credit-forecast')).toBeNull()
+    })
+
+    it('says the plan lasts when the pace reaches the reset', async () => {
+      renderWithProviders(
+        <KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, used: 1_300, limit: 5_000, resets: '2026-11-01' }} />,
+      )
+      expect(await screen.findByTestId('kiro-credit-forecast')).toHaveTextContent(
+        "At this cycle's pace, your credits should last until the reset.",
+      )
+    })
+
+    it('reports a failed refetch even while an earlier report is cached', async () => {
+      const { queryClient } = renderWithProviders(
+        <KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, used: 1_300, limit: 3_000, resets: '2026-11-01' }} />,
+      )
+      expect(await screen.findByTestId('kiro-credit-forecast')).toBeInTheDocument()
+      kiroUsageMock.mockImplementation(async () => { throw new Error('boom') })
+      await queryClient.refetchQueries({ queryKey: ['provider-usage'] })
+      expect(await screen.findByText("Could not load recent usage, so the run-out date can't be shown.")).toBeInTheDocument()
+      expect(screen.queryByTestId('kiro-credit-forecast')).toBeNull()
+    })
+
+    it('retries the forecast read from the modal Refresh', async () => {
+      refreshMock.mockResolvedValue({ usage: { credits_plan: 3000, credits_used: 1300, resets: '2026-11-01' } })
+      kiroUsageMock.mockImplementation(async () => { throw new Error('boom') })
+      renderWithProviders(
+        <KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, used: 1_300, limit: 3_000, resets: '2026-11-01' }} />,
+      )
+      expect(await screen.findByText("Could not load recent usage, so the run-out date can't be shown.")).toBeInTheDocument()
+      kiroUsageMock.mockImplementation(async () => KIRO_USAGE_EMPTY)
+      fireEvent.click(screen.getByRole('button', { name: /^Refresh$/ }))
+      expect(await screen.findByTestId('kiro-credit-forecast')).toBeInTheDocument()
+    })
+
+    it('reports a failed per-day read through ErrorNotice with the hand-off', async () => {
+      kiroUsageMock.mockImplementation(async () => { throw new Error('boom') })
+      const onClose = vi.fn()
+      renderWithProviders(
+        <KiroAccountModal open onClose={onClose} usage={{ ...BASE_USAGE, used: 1_300, limit: 3_000, resets: '2026-11-01' }} />,
+      )
+      expect(await screen.findByText(
+        "Could not load recent usage, so the run-out date can't be shown.",
+        {}, { timeout: 10_000 },
+      )).toBeInTheDocument()
+      expect(screen.queryByTestId('kiro-credit-forecast')).toBeNull()
+      expect(screen.getByText(/Remaining credit balance/)).toBeInTheDocument()
+      const dialog = screen.getByRole('dialog')
+      fireEvent.click(within(dialog).getByRole('button', { name: /Ask the agent/i }))
+      expect(onClose).toHaveBeenCalled()
+    }, 15_000)
+  })
+
   it('caps the bar and remaining credits when usage exceeds the plan', async () => {
     renderWithProviders(
       <KiroAccountModal
@@ -95,7 +237,7 @@ describe('KiroAccountModal', () => {
       <KiroAccountModal
         open
         onClose={vi.fn()}
-        usage={{ ...BASE_USAGE, email: undefined, account: undefined }}
+        usage={{ ...BASE_USAGE, email: undefined, account: undefined, accountType: undefined }}
       />,
     )
 
@@ -139,11 +281,115 @@ describe('KiroAccountModal', () => {
     expect(await screen.findByText('Signed in with Social login')).toBeInTheDocument()
   })
 
+  // An external identity provider sign-in: whoami answers
+  // {"accountType":"ExternalIdP","email":""}, so the published reading carries
+  // an account type and no name. The pill renders, and the unavailable notice
+  // does not replace it.
+  it('shows the provider of an account that reports a type and no name', async () => {
+    const usage = parseKiroUsagePayload({
+      usage: {
+        credits_used: 2480.1,
+        credits_plan: 10000,
+        credits_overage: 0,
+        source: 'text',
+        account_type: 'ExternalIdP',
+      },
+    })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    expect(await screen.findByText('Signed in with Company SSO')).toBeInTheDocument()
+    expect(screen.queryByText('Account details unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show email' })).not.toBeInTheDocument()
+    expect(screen.getByText(/Remaining credit balance/)).toBeInTheDocument()
+  })
+
+  // One name for one provider: the modal labels an external identity provider
+  // with the sign-in flow's own mapping, whatever spelling whoami used.
+  it.each(['ExternalIdP', 'ExternalIdp', 'External-IdP'])(
+    'labels %s with the sign-in flow provider name',
+    async (accountType) => {
+      const usage = parseKiroUsagePayload({
+        usage: { available: false, reason: 'account_unproven', account_type: accountType },
+      })
+      renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+      expect(
+        await screen.findByText(`Signed in with ${providerLabelFromWire('ExternalIdp')}`),
+      ).toBeInTheDocument()
+    },
+  )
+
+  // The notice names the provider through the badge's own mapping, so the two
+  // can never disagree: a state that ever carries another type names that type
+  // in both places, not "Company SSO" under a different badge.
+  it('names the same provider in the notice as in the badge', async () => {
+    const usage = parseKiroUsagePayload({
+      usage: { available: false, reason: 'account_unproven', account_type: 'IamIdentityCenter' },
+    })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    const provider = i18nT('app.iam_identity_center')
+    expect(await screen.findByText(`Signed in with ${provider}`)).toBeInTheDocument()
+    expect(
+      screen.getByText(i18nT('components.kiroAccountModal.credit_usage_sign_in_type', { provider })),
+    ).toBeInTheDocument()
+  })
+
+  // The gateway cannot tie a reading to this sign-in (nothing names the user,
+  // only the provider): it reports who is signed in and no balance. That holds
+  // until the sign-in changes, so the modal says so from the first view and
+  // offers no Refresh, which would only answer the same.
+  it('shows the account and the sign-in-type notice with no Refresh', async () => {
+    const usage = parseKiroUsagePayload({
+      usage: { available: false, reason: 'account_unproven', account_type: 'ExternalIdP' },
+    })
+    // The state carries the account type and nothing else: the gateway
+    // publishes it only when no field names the user.
+    expect(usage).toEqual({ accountOnly: true, accountType: 'ExternalIdP' })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    expect(await screen.findByText('Signed in with Company SSO')).toBeInTheDocument()
+    expect(screen.queryByText('Account details unavailable')).not.toBeInTheDocument()
+    const notice = i18nT('components.kiroAccountModal.credit_usage_sign_in_type', { provider: 'Company SSO' })
+    expect(screen.getByText(notice)).toBeInTheDocument()
+    // The notice names the provider the badge shows and the one cause the
+    // gateway can prove: kiro-cli reports no user for this sign-in. It promises
+    // nothing about what a fresh sign-in or the account page would show; the
+    // Manage account link still stands below it.
+    expect(notice).toContain('this Company SSO sign-in')
+    expect(notice).toContain('kiro-cli doesn’t report which user is signed in')
+    expect(notice).not.toContain('signing in again')
+    expect(notice).not.toContain(i18nT('app.manage_account'))
+    expect(screen.getByRole('link', { name: new RegExp(i18nT('app.manage_account')) })).toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
+    expect(screen.queryByText('No balance reading is available for this account yet.')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Remaining credit balance/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Refresh/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  // The gateway always sends the type for this state. A state that arrives
+  // without one still names a provider in the notice, so the sentence never
+  // reads "this  sign-in".
+  it('names Company SSO in the notice when the state carries no type', async () => {
+    const usage = parseKiroUsagePayload({ usage: { available: false, reason: 'account_unproven' } })
+    expect(usage).toEqual({ accountOnly: true, accountType: undefined })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+
+    const notice = i18nT('components.kiroAccountModal.credit_usage_sign_in_type', {
+      provider: providerLabelFromWire('externalidp'),
+    })
+    expect(notice).toContain('this Company SSO sign-in')
+    expect(await screen.findByText(notice)).toBeInTheDocument()
+  })
+
   it('renders independent identity and usage failure states', async () => {
     renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="none" />)
 
     expect(await screen.findByText('Account details unavailable')).toBeInTheDocument()
-    expect(screen.getByText('Credit usage unavailable')).toBeInTheDocument()
+    // `none` names the absence of a reading; only `failed` reports a read that failed.
+    expect(screen.getByText('No balance reading is available for this account yet.')).toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
   })
 
   it('states the failure instead of spinning when the fetch failed cold', async () => {
@@ -153,9 +399,25 @@ describe('KiroAccountModal', () => {
     renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="failed" />)
 
     expect(await screen.findByText('Account details unavailable')).toBeInTheDocument()
-    expect(screen.getByText('Credit usage unavailable')).toBeInTheDocument()
+    expect(screen.getByText('Could not read your balance.')).toBeInTheDocument()
     expect(screen.queryByText('Checking account…')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
+  })
+
+  it('renders a cold failure through ErrorNotice with the agent hand-off, Refresh under it', async () => {
+    // 'failed' is a failure to recover from, not a configuration the account is
+    // in, so it takes the shared error surface. The hand-off opens the chat this
+    // modal sits over, so the modal closes with it; Refresh stays as the retry.
+    const onClose = vi.fn()
+    renderWithProviders(<KiroAccountModal open onClose={onClose} usage="failed" />)
+
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    const alert = within(dialog).getByRole('alert')
+    expect(alert).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).getByRole('button', { name: /^Refresh$/ })).toBeEnabled()
+    const handoff = within(dialog).getByRole('button', { name: /Ask the agent/i })
+    fireEvent.click(handoff)
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
   })
 
   it('keeps spinning only while the reading is genuinely still in flight', async () => {
@@ -174,42 +436,20 @@ describe('KiroAccountModal', () => {
     expect(
       await screen.findByText('Credit usage isn’t available for API key authentication'),
     ).toBeInTheDocument()
-    expect(screen.queryByText('Credit usage unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
     expect(screen.queryByText('Checking account…')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
   })
 
-  it('explains the opted-out scrape and names the knob instead of a generic failure', async () => {
-    // 'scrape-disabled' is terminal until the user flips
-    // dashboard.usage_text_scrape_enabled (#7623): the free API returned no
-    // plan and the billed fallback is off by default. The panel must name the
-    // knob — a generic unavailable line reads as a transient error and gives
-    // the user nothing to act on (the v0.1.3→v0.4.1 "pill silently vanished"
-    // report was exactly this gap).
-    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="scrape-disabled" />)
-
-    expect(
-      await screen.findByText(/dashboard\.usage_text_scrape_enabled/),
-    ).toBeInTheDocument()
-    expect(screen.queryByText('Credit usage unavailable')).not.toBeInTheDocument()
-    expect(screen.queryByText('Checking account…')).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
-  })
-
-  it('tells the user to sign in again instead of blaming the opted-out scrape', async () => {
-    // 'signin-required' is terminal until the user re-authenticates (#11602). It
-    // must NOT render the scrape-disabled copy: that asserts the free API
-    // returned no plan for this account (it was never called) and points at a
-    // knob whose billed /usage turn needs the same lapsed sign-in, so acting on
-    // it spends credits on attempts that cannot succeed.
+  it('tells the user to sign in again and offers no Refresh for it', async () => {
+    // 'signin-required' is terminal until the user re-authenticates. The /usage
+    // read needs the same sign-in, so a Refresh here could only fail again.
     renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="signin-required" />)
 
     expect(await screen.findByText(/Sign in to Kiro again/)).toBeInTheDocument()
-    // The remedy the user must not be sent to.
-    expect(
-      screen.queryByText(/Set dashboard\.usage_text_scrape_enabled to true/),
-    ).not.toBeInTheDocument()
-    expect(screen.queryByText('Credit usage unavailable')).not.toBeInTheDocument()
+    expect(screen.queryByText(/usage_text_scrape_enabled/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Refresh$/ })).not.toBeInTheDocument()
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
     expect(screen.queryByText('Checking account…')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Checking credit usage')).not.toBeInTheDocument()
   })
@@ -233,12 +473,12 @@ describe('KiroAccountModal', () => {
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
   })
 
-  it('leaves the hand-off off the states that report a configuration, not a failure', async () => {
-    // 'api-key' and 'scrape-disabled' describe how the account is set up; there
-    // is no error for the agent to act on, so they keep the passive notice. This
-    // pins the split — a blanket migration would put a recovery button next to a
-    // line that needs no recovery.
-    for (const usage of ['api-key', 'scrape-disabled'] as const) {
+  it('leaves the hand-off off the state that reports a configuration, not a failure', async () => {
+    // 'api-key' describes how the account is set up; there is no error for the
+    // agent to act on, so it keeps the passive notice. This pins the split — a
+    // blanket migration would put a recovery button next to a line that needs
+    // no recovery.
+    for (const usage of ['api-key'] as const) {
       const { unmount } = renderWithProviders(
         <KiroAccountModal open onClose={vi.fn()} usage={usage} />,
       )
@@ -270,5 +510,392 @@ describe('KiroAccountModal', () => {
     // aria-labelledby default, so it cannot fall out of sync with the header.
     const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
     expect(dialog).toHaveAttribute('aria-modal', 'true')
+  })
+})
+
+/**
+ * Mirrors App.tsx: the modal's `usage` prop is derived from the `['kiro-usage']`
+ * query, and the Refresh button writes its result into that same query. So a
+ * successful click must re-render the meter through the prop, not through
+ * component-local state — this harness is what makes that path testable.
+ */
+function QueryFedModal({ initial, onClose = vi.fn() }: { initial: KiroAccountUsage; onClose?: () => void }) {
+  const qc = useQueryClient()
+  const { data } = useQuery<KiroUsageState>({
+    queryKey: ['kiro-usage'],
+    // The refetch an invalidation triggers must not undo the written value.
+    queryFn: () => (qc.getQueryData<KiroUsageState>(['kiro-usage']) ?? null),
+    initialData: initial === 'failed' ? null : initial,
+  })
+  // A 'failed' start seeds the query with null (nothing cached) and shows the
+  // failed notice until a refresh writes a reading into the query.
+  return <KiroAccountModal open onClose={onClose} usage={data ?? (initial === 'failed' ? 'failed' : null)} />
+}
+
+const REFUSAL = (status: number, body: string) =>
+  Object.assign(new Error(`HTTP ${status}`), { status, body })
+
+const REFRESH = { name: /^Refresh$/ }
+const REFRESHING = { name: 'Refreshing…' }
+
+describe('KiroAccountModal refresh', () => {
+  // The refresh-outcome tests start from the passive 'none' state: 'failed'
+  // renders its own ErrorNotice, which would shadow the refresh's notice.
+  beforeEach(() => {
+    refreshMock.mockReset()
+  })
+
+  // A refresh out of a failed read that comes back account_unproven adds no
+  // outcome notice of its own: the state it lands in carries its notice.
+  it('adds no outcome notice when a refresh returns account_unproven', async () => {
+    const payload = { available: false, reason: 'account_unproven', account_type: 'ExternalIdP' }
+    refreshMock.mockResolvedValue({ usage: payload })
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage="failed" />)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    fireEvent.click(within(dialog).getByRole('button', REFRESH))
+    await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
+    expect(await within(dialog).findByRole('button', REFRESH)).toBeEnabled()
+    expect(within(dialog).getAllByRole('alert')).toHaveLength(1)
+  })
+
+  it('reports an unreadable gateway config through ErrorNotice and retries the config read', async () => {
+    // The top bar could not learn which harness runs, so nothing about the
+    // balance is established. The failure takes the shared error surface with
+    // its hand-off, and Refresh under it re-asks for BOTH the config and the
+    // balance; opening on this state already re-asks for the config once.
+    refreshMock.mockResolvedValue({ usage: { available: false } })
+    const onClose = vi.fn()
+    // Mounted closed first so the spy is in place before the content (and its
+    // opening re-ask) mounts: Modal renders its children only while open.
+    const { queryClient, rerender } = renderWithProviders(
+      <KiroAccountModal open={false} onClose={onClose} usage="config-unreadable" />,
+    )
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+    rerender(<KiroAccountModal open onClose={onClose} usage="config-unreadable" />)
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kirocrewConfig'] }))
+    const dialog = screen.getByRole('dialog', { name: 'Kiro Account' })
+    const alert = within(dialog).getByRole('alert')
+    expect(alert).toHaveTextContent('Could not load settings, so your balance can’t be shown.')
+    expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+    expect(within(dialog).queryByRole('progressbar')).not.toBeInTheDocument()
+
+    invalidate.mockClear()
+    fireEvent.click(within(dialog).getByRole('button', REFRESH))
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kirocrewConfig'] })
+    await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
+
+    // The hand-off opens the chat under this overlay, so it closes the modal.
+    fireEvent.click(within(alert).getByRole('button', { name: /Ask the agent/i }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+  })
+
+  it('offers Refresh under the no-reading notice and beside a live reading, nowhere else', () => {
+    // The two no-reading states a refresh can fill: primary action under the
+    // notice, each state with its own sentence.
+    for (const [usage, notice] of [['failed', 'Could not read your balance.'], ['none', 'No balance reading is available for this account yet.']] as const) {
+      const { unmount } = renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+      expect(screen.getByText(notice)).toBeInTheDocument()
+      expect(screen.getByRole('button', REFRESH)).toBeEnabled()
+      unmount()
+    }
+    // A live reading keeps a compact Refresh beside the meter.
+    {
+      const { unmount } = renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={BASE_USAGE} />)
+      expect(screen.getByRole('progressbar')).toBeInTheDocument()
+      expect(screen.getByRole('button', REFRESH)).toBeEnabled()
+      unmount()
+    }
+    // API-key auth has no credit readout to refresh; an expired sign-in would
+    // fail again; a loading cache has nothing to refresh yet.
+    for (const usage of ['api-key', 'signin-required', null] as const) {
+      const { unmount } = renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+      expect(screen.queryByRole('button', REFRESH)).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('uses the one verb and no cost words anywhere in the modal', () => {
+    for (const usage of ['failed', BASE_USAGE] as const) {
+      const { unmount } = renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={usage} />)
+      const dialog = screen.getByRole('dialog', { name: 'Kiro Account' })
+      expect(within(dialog).getAllByRole('button', REFRESH)).toHaveLength(1)
+      expect(dialog.textContent).not.toMatch(/credits?\)|spend|spent|Check balance|only the person/i)
+      unmount()
+    }
+  })
+
+  it('disables the button and says it is refreshing while the POST is in flight', async () => {
+    let settle: (v: { usage: Record<string, unknown> }) => void = () => {}
+    refreshMock.mockImplementation(() => new Promise(resolve => { settle = resolve }))
+    renderWithProviders(<QueryFedModal initial="failed" />)
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    const pending = await screen.findByRole('button', REFRESHING)
+    expect(pending).toBeDisabled()
+    expect(pending).toHaveAttribute('aria-busy', 'true')
+    expect(refreshMock).toHaveBeenCalledTimes(1)
+    // A second click while pending cannot reach the mutation: the button is
+    // disabled, so one click storm is one refresh.
+    fireEvent.click(pending)
+    expect(refreshMock).toHaveBeenCalledTimes(1)
+
+    settle({ usage: { credits_plan: 1000, credits_used: 41 } })
+    await screen.findByRole('progressbar', { name: 'Kiro credit usage' })
+  })
+
+  it('renders the meter from the refreshed payload and keeps Refresh beside it', async () => {
+    refreshMock.mockResolvedValue({
+      usage: { credits_plan: 2000, credits_used: 636, plan: 'KIRO PRO+', resets: '2026-08-01' },
+    })
+    const { queryClient } = renderWithProviders(<QueryFedModal initial="failed" />)
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    const progress = await screen.findByRole('progressbar', { name: 'Kiro credit usage' })
+    expect(progress).toHaveAttribute('aria-valuenow', '636')
+    expect(progress).toHaveAttribute('aria-valuemax', '2000')
+    expect(screen.getByText('KIRO PRO+')).toBeInTheDocument()
+    // The notice is gone; the compact Refresh and the check time take its place.
+    expect(screen.queryByText('Could not read your balance.')).not.toBeInTheDocument()
+    expect(screen.getByText(/Checked at/)).toBeInTheDocument()
+    expect(screen.getByRole('button', REFRESH)).toBeEnabled()
+    // The pill's query holds the same reading, so the top bar updates too.
+    const cached = queryClient.getQueryData<KiroUsageState>(['kiro-usage'])
+    expect(cached).toMatchObject({ used: 636, limit: 2000 })
+  })
+
+  it('states a stale reading as a fact, with Refresh beside it', () => {
+    renderWithProviders(<KiroAccountModal open onClose={vi.fn()} usage={{ ...BASE_USAGE, stale: true }} />)
+    expect(
+      screen.getByText('Showing an earlier reading; the latest refresh did not return one.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/may be/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', REFRESH)).toBeEnabled()
+  })
+
+  it('reports a 409 through the error surface with the hand-off, holds Refresh, and re-reads the query once it settles', async () => {
+    // The gateway is already refreshing. The refusal is surfaced like every
+    // other refresh outcome -- an ErrorNotice with the agent hand-off -- and
+    // the modal re-reads the pill's query once after the other refresh has had
+    // time to finish, so its result shows without another press.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      refreshMock.mockRejectedValue(REFUSAL(409, '{"code":"refresh_in_flight"}'))
+      const onClose = vi.fn()
+      const { queryClient } = renderWithProviders(<QueryFedModal initial="none" onClose={onClose} />)
+      const invalidate = vi.spyOn(queryClient, 'invalidateQueries')
+
+      fireEvent.click(screen.getByRole('button', REFRESH))
+
+      const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+      const alert = await within(dialog).findByRole('alert')
+      expect(alert).toHaveTextContent('A refresh is already running.')
+      expect(within(dialog).queryByRole('status')).not.toBeInTheDocument()
+      expect(within(alert).getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+      // Refresh is held while the notice shows: pressing it would only get the
+      // same 409 again. Held, not pending -- the other refresh is the one running.
+      const refreshButton = screen.getByRole('button', REFRESH)
+      expect(refreshButton).toBeDisabled()
+      expect(refreshButton).not.toHaveAttribute('aria-busy')
+      fireEvent.click(refreshButton)
+      expect(refreshMock).toHaveBeenCalledTimes(1)
+
+      // The click retries the forecast's Usage report; the pill's reading is
+      // not re-read until the other refresh has had time to finish.
+      expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['kiro-usage'] })
+      await vi.advanceTimersByTimeAsync(3100)
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['kiro-usage'] })
+      // The re-read has landed: the notice has done its job and Refresh is offered again.
+      await waitFor(() => expect(within(dialog).queryByRole('alert')).not.toBeInTheDocument())
+      expect(screen.getByRole('button', REFRESH)).toBeEnabled()
+      expect(onClose).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('closes the modal from the 409 notice\'s hand-off', async () => {
+    refreshMock.mockRejectedValue(REFUSAL(409, '{"code":"refresh_in_flight"}'))
+    const onClose = vi.fn()
+    renderWithProviders(<QueryFedModal initial="none" onClose={onClose} />)
+    fireEvent.click(screen.getByRole('button', REFRESH))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('A refresh is already running.')
+    // The hand-off opens the chat under this overlay, so it closes the modal.
+    fireEvent.click(within(alert).getByRole('button', { name: /Ask the agent/i }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+  })
+
+  it('does not stamp a refresh that returned the earlier reading as checked now', async () => {
+    // The gateway answered with its dimmed prior reading: nothing new was
+    // fetched. The meter renders it (dimmed), but "Checked at" would claim a
+    // freshness the numbers do not have, so the outcome is reported instead.
+    refreshMock.mockResolvedValue({
+      usage: { credits_plan: 2000, credits_used: 636, stale: true },
+    })
+    const onClose = vi.fn()
+    renderWithProviders(<QueryFedModal initial="none" onClose={onClose} />)
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    // Surfaced as an error: the refresh the user asked for fetched nothing new,
+    // so it takes the shared error surface with its hand-off, not a status line.
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent('The refresh did not return a new reading. Showing the earlier one.')
+    expect(within(dialog).queryByRole('status')).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('progressbar')).toHaveAttribute('aria-valuenow', '636')
+    expect(within(dialog).queryByText(/Checked at/)).not.toBeInTheDocument()
+    // One statement of the fact: the gray stale line yields to the notice that
+    // says the same thing, instead of both rendering under the same meter.
+    expect(within(dialog).queryByText(/Showing an earlier reading; the latest refresh/)).not.toBeInTheDocument()
+    expect(within(dialog).getAllByText(/earlier/)).toHaveLength(1)
+    // Not a hold: the user may press again at once.
+    expect(within(dialog).getByRole('button', REFRESH)).toBeEnabled()
+    // The hand-off opens the chat under this overlay, so it closes the modal.
+    fireEvent.click(within(dialog).getByRole('button', { name: /Ask the agent/i }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+  })
+
+  it('reports any other failure plainly, as nothing more than a failed refresh', async () => {
+    refreshMock.mockRejectedValue(REFUSAL(500, 'boom'))
+    renderWithProviders(<QueryFedModal initial="none" />)
+    fireEvent.click(screen.getByRole('button', REFRESH))
+    // The one failure sentence: a refresh that failed leaves the user where
+    // "could not read your balance" already had them.
+    const alert = (await screen.findByText('Could not read your balance.')).closest('[role="alert"]')
+    expect(alert).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    // A plain failure is not a hold: the user can try again at once.
+    expect(screen.getByRole('button', REFRESH)).toBeEnabled()
+  })
+
+  it('replaces the standing failure notice with the refresh outcome instead of stacking them', async () => {
+    // The `failed` state already says "could not read"; a refresh that fails
+    // too must not add a second banner under it. One alert, one hand-off --
+    // the fact is stated once, in the one sentence both share.
+    refreshMock.mockRejectedValue(REFUSAL(500, 'boom'))
+    renderWithProviders(<QueryFedModal initial="failed" />)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not read your balance.')
+
+    fireEvent.click(within(dialog).getByRole('button', REFRESH))
+
+    await waitFor(() => expect(refreshMock).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(within(dialog).queryByRole('button', REFRESHING)).not.toBeInTheDocument())
+    const alerts = within(dialog).getAllByRole('alert')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).getAllByText('Could not read your balance.')).toHaveLength(1)
+    expect(within(dialog).getAllByRole('button', { name: /Ask the agent/i })).toHaveLength(1)
+    // Refresh still sits under the (one) notice it can retry.
+    expect(within(dialog).getByRole('button', REFRESH)).toBeEnabled()
+  })
+
+  it('replaces the standing failure notice with the 409 notice instead of stacking them', async () => {
+    // The 409 is an outcome notice like the others: one alert at a time, so it
+    // takes the standing "could not read" notice's place while it shows, and
+    // Refresh under it is held.
+    refreshMock.mockRejectedValue(REFUSAL(409, '{"code":"refresh_in_flight"}'))
+    renderWithProviders(<QueryFedModal initial="failed" />)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not read your balance.')
+
+    fireEvent.click(within(dialog).getByRole('button', REFRESH))
+
+    await within(dialog).findByText('A refresh is already running.')
+    const alerts = within(dialog).getAllByRole('alert')
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toHaveTextContent('A refresh is already running.')
+    expect(within(dialog).queryByText('Could not read your balance.')).not.toBeInTheDocument()
+    expect(within(dialog).getAllByRole('button', { name: /Ask the agent/i })).toHaveLength(1)
+    expect(within(dialog).getByRole('button', REFRESH)).toBeDisabled()
+  })
+
+  it('explains a parked scrape from the skipped marker and writes its payload into the query', async () => {
+    refreshMock.mockResolvedValue({ usage: { available: false }, skipped: 'scrape_parked', retry_after: 3600 })
+    const { queryClient } = renderWithProviders(<QueryFedModal initial="none" />)
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    const paused = await screen.findByText(
+      'Balance checks are paused because recent ones failed. Try again in about 60 min.',
+    )
+    expect(paused.closest('[role="alert"]')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Ask the agent/i })).toBeInTheDocument()
+    expect(queryClient.getQueryData(['kiro-usage'])).toBe('none')
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    // Refresh is held while the notice says when to try again: pressing it
+    // would only produce the same parked answer. Held, not pending.
+    const refreshButton = screen.getByRole('button', REFRESH)
+    expect(refreshButton).toBeDisabled()
+    expect(refreshButton).not.toHaveAttribute('aria-busy')
+    expect(screen.queryByRole('button', REFRESHING)).not.toBeInTheDocument()
+  })
+
+  it("drops the previous account's reading when a parked refresh comes back without one", async () => {
+    // Account A's reading is on screen; the user switched accounts and the
+    // scrape is parked, so the refresh answers the parked marker with an
+    // unavailable payload. That payload must land in the pill's query NOW, not
+    // after its next poll, so neither the modal nor the pill keeps showing A.
+    refreshMock.mockResolvedValue({ usage: { available: false }, skipped: 'scrape_parked', retry_after: 3600 })
+    const { queryClient } = renderWithProviders(<QueryFedModal initial={BASE_USAGE} />)
+    expect(screen.getByText('owner@example.com')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    await waitFor(() => expect(queryClient.getQueryData(['kiro-usage'])).toBe('none'))
+    await waitFor(() => expect(screen.queryByText('owner@example.com')).not.toBeInTheDocument())
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.getByText(/Balance checks are paused because recent ones failed/)).toBeInTheDocument()
+    expect(screen.getByRole('button', REFRESH)).toBeDisabled()
+  })
+
+  it('treats a refresh that produced no plan as a failure and writes that state into the query', async () => {
+    refreshMock.mockResolvedValue({ usage: { available: false } })
+    const { queryClient } = renderWithProviders(<QueryFedModal initial="none" />)
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    const failed = await screen.findByText('Could not read your balance.')
+    expect(failed.closest('[role="alert"]')).toBeInTheDocument()
+    expect(queryClient.getQueryData(['kiro-usage'])).toBe('none')
+  })
+
+  it('puts the refresh outcome above Refresh in the no-reading state too, replacing the standing box', async () => {
+    // Same shape as `failed`: the outcome notice takes the standing box's
+    // place above the button, so the notice is in one position whichever
+    // no-reading state the modal opened in.
+    refreshMock.mockRejectedValue(REFUSAL(500, 'boom'))
+    renderWithProviders(<QueryFedModal initial="none" />)
+    const dialog = await screen.findByRole('dialog', { name: 'Kiro Account' })
+    expect(within(dialog).getByText('No balance reading is available for this account yet.')).toBeInTheDocument()
+
+    fireEvent.click(within(dialog).getByRole('button', REFRESH))
+
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent('Could not read your balance.')
+    expect(within(dialog).queryByText('No balance reading is available for this account yet.')).not.toBeInTheDocument()
+    const button = within(dialog).getByRole('button', REFRESH)
+    expect(alert.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('drops the previous account\'s reading the moment a refresh comes back without one', async () => {
+    // Account A's reading (email + balance) is on screen. The user switched
+    // kiro-cli to an account with no live credential; the refresh answers
+    // signin_required. The pill's query must hold that state NOW -- not after
+    // its next poll -- so neither the modal nor the pill keeps showing A.
+    refreshMock.mockResolvedValue({ usage: { available: false, reason: 'signin_required' } })
+    const { queryClient } = renderWithProviders(<QueryFedModal initial={BASE_USAGE} />)
+    expect(screen.getByText('owner@example.com')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', REFRESH))
+
+    await waitFor(() => expect(queryClient.getQueryData(['kiro-usage'])).toBe('signin-required'))
+    await waitFor(() => expect(screen.queryByText('owner@example.com')).not.toBeInTheDocument())
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    expect(screen.getByText(/Sign in to Kiro again/)).toBeInTheDocument()
   })
 })

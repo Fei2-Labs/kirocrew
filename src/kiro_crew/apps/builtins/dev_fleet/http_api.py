@@ -90,8 +90,9 @@ async def api_dev_fleet_fleet(request: web.Request) -> web.Response:
         # instead of rendering a failure against a path the user never chose.
         return web.json_response({"worktrees": [], "needs_setup": True})
     except repository.RepoUnreadable as exc:
-        # A checkout WAS named and git cannot read it: the page renders this as the
-        # Discovery Error banner, naming the path because the user chose it.
+        # A checkout WAS named and git cannot read it, OR a present config file
+        # would not parse: either way the page renders this as the Discovery Error
+        # banner, naming the path the user chose or the config file they can fix.
         # Redacted like every other display string this module emits (and like the
         # middleware's copy of the same exception) — git stderr can carry a remote
         # URL with credentials in it.
@@ -513,7 +514,7 @@ async def api_dev_fleet_rebase(request: web.Request) -> web.Response:
 async def hmac_proxy_middleware(request: web.Request, handler) -> web.Response:
     """Verify X-KiroCrew-Proxy HMAC on every request except /health.
 
-    Message format matches routes.py signing:
+    Message format matches routes_proxy.py signing:
       msg = "<timestamp>:<METHOD>:<raw request-target>:<sha256(body)>"
     Fail-closed: missing/invalid/expired signature -> 401.
     """
@@ -562,7 +563,7 @@ async def hmac_proxy_middleware(request: web.Request, handler) -> web.Response:
     if abs(now - ts) > _PROXY_HMAC_MAX_AGE_S:
         return _deny("proxy signature expired")
 
-    # Reconstruct the signed message exactly as routes.py builds it
+    # Reconstruct the signed message exactly as routes_proxy.py builds it
     body = await request.read() if request.can_read_body else b""
     body_hash = hashlib.sha256(body).hexdigest()
     # The gateway signs the RAW percent-encoded request-target; recompute over
@@ -571,7 +572,17 @@ async def hmac_proxy_middleware(request: web.Request, handler) -> web.Response:
     msg = f"{ts_str}:{request.method}:{raw_request_target(request)}:{body_hash}"
 
     expected_sig = _hmac_mod.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    if not _hmac_mod.compare_digest(sig_received, expected_sig):
+    # Compared as BYTES, never as ``str``: ``hmac.compare_digest`` raises
+    # ``TypeError`` for a non-ASCII argument, and ``sig_received`` is the
+    # attacker-chosen header (aiohttp turns a non-UTF-8 header byte into a lone
+    # surrogate). Raising would drop the connection instead of writing the SEL
+    # denial above. ``surrogatepass`` so every value compares; ``expected_sig`` is
+    # a hexdigest, so a signature that matched before still matches. Same reason
+    # as ``apps/proxy_auth.verify_proxy_request``.
+    if not _hmac_mod.compare_digest(
+        sig_received.encode("utf-8", "surrogatepass"),
+        expected_sig.encode("utf-8", "surrogatepass"),
+    ):
         return _deny("invalid proxy signature")
 
     try:

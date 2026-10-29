@@ -142,7 +142,8 @@ const SUMMARY = [
 const NOTICE_COMPACTED = '\u{1F504} Auto-compacted at 85%.'
 const NOTICE_RECYCLED =
   '\u267B\uFE0F Compaction didn\u2019t succeed at 91%, so the session was restarted '
-  + 'instead. The conversation above is still here; the agent no longer remembers it.'
+  + 'instead. The conversation above is still here, and the agent\u2019s next reply starts '
+  + 'from a recent excerpt of it rather than the whole thing.'
 const NOTICE_FAILED =
   '\u26A0 Auto-compact failed at 88% \u2014 will retry after cooldown. '
   + 'You can run `/compact` manually.'
@@ -524,7 +525,7 @@ async function main() {
         await page.getByTitle('compaction.keep').count() > 0,
         `consent ${theme}: the point is named while its scope is granted`,
       )
-      const card = row.locator('xpath=ancestor::*[contains(@class,"rounded")][1]')
+      const card = row.locator('xpath=ancestor::*[@data-settings-card][1]')
       const file = `${OUT}/07-consent-${theme}.png`
       await card.screenshot({ path: file })
       shot.push(`07-consent-${theme}.png`)

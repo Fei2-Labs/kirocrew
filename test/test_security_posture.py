@@ -254,23 +254,41 @@ def _gate_side_baseline_log_sites(
 #: nets to zero (both edits land in one reviewed diff), and the scan is
 #: single-scope (see :func:`_gate_side_baseline_log_sites`).
 _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
+    "acp/client_lifecycle.py": 1,
     # +1: model-unavailable warning log in the rejected-model path
-    "acp/client.py": 8,
+    "acp/client_model_selection.py": 2,
+    "acp/client_permissions.py": 1,
+    "acp/client_start.py": 2,
+    "acp/client_transport.py": 1,
+    # _format_acp_error's scrubbed-content warning, in the same gateway process as
+    # the client owners' sites.
+    "acp/transport_errors.py": 1,
     "apps/builtins/pptx_maker/backend/routes.py": 1,
     "dashboard/chat_nav.py": 1,
-    "dashboard/chat_orchestrator.py": 1,
-    "dashboard/chat_runner.py": 9,
     "dashboard/chat_title.py": 1,
+    # The native sub-agent card sync's gate-side log, moved out of chat_runner.py with
+    # its helper; the same gateway process as the runner's sites.
+    "dashboard/chat_turn/native_cards.py": 1,
+    # The permission, tool and session-event arms' gate-side logs, moved out of
+    # chat_runner.py with their phases; the same gateway process as the runner's sites.
+    "dashboard/chat_turn/permission_prompt.py": 1,
+    "dashboard/chat_turn/session_events.py": 2,
+    "dashboard/chat_turn/tool_approval.py": 4,
+    "dashboard/chat_turn/tool_rows.py": 1,
+    # The outbox owner composed into dashboard/handlers/files.py: api_outbox_notify's
+    # refusal audit, in the same gateway process as the facade.
+    "dashboard/file_api/outbox.py": 1,
     "dashboard/handlers/discover.py": 3,
-    "dashboard/handlers/files.py": 1,
     "dashboard/handlers/hooks.py": 1,
-    "dashboard/handlers/messaging.py": 12,
-    "dashboard/handlers/updates.py": 1,
-    "dashboard/session_control.py": 1,
-    "dashboard/session_transfer.py": 1,
-    "dashboard/state.py": 1,
+    "dashboard/handlers/messaging.py": 2,
+    # The Slack pins, reactions and profile routes' sites, composed into
+    # dashboard/handlers/messaging.py: the gateway process, as the facade's two.
+    "dashboard/messaging_api/slack_workspace.py": 10,
+    "dashboard/session_control_parts/target_authorization.py": 1,
+    "dashboard/session_transfer_install.py": 1,
+    "dashboard/state_parts/slot_turns.py": 1,
     "knowledge/agent_fetch.py": 1,
-    "mcp_cron.py": 1,
+    "mcp_cron_vet.py": 1,
     # The pooled-backend daemon never composes a companion context. Its
     # declared-temp warnings therefore use the baseline pass deliberately.
     "mcp_gateway/backend.py": 3,
@@ -279,9 +297,22 @@ _BASELINE_LOG_SITE_CENSUS: dict[str, int] = {
     "mcp_tools/messaging.py": 1,
     "mcp_tools/skills.py": 2,
     "messaging/sessions_view.py": 1,
-    "slack/events.py": 2,
-    "slack/gateway.py": 7,
-    "slack/handler.py": 3,
+    # The sessions slash command and the Home tab, moved out of slack/events.py to the
+    # owners behind that facade: the same gateway process.
+    "slack/events_home_tab.py": 1,
+    "slack/events_slash.py": 1,
+    # Owners composed into slack/gateway.py (the cron script arm, boot-time install
+    # repair, the unattended result delivery, a sub-agent completion's injection
+    # into its parent, the tool-approval callbacks): the gateway process.
+    "slack/gateway_runtime/cron_exec.py": 1,
+    "slack/gateway_runtime/install_repair.py": 2,
+    "slack/gateway_runtime/result_egress.py": 1,
+    "slack/gateway_runtime/subagent_injection.py": 1,
+    "slack/gateway_runtime/turn_approvals.py": 2,
+    # Owners composed into slack/handler.py (the reply decorator's re-redaction, the
+    # sessions keyword's collector failure): the same handler process as the facade.
+    "slack/handler_runtime/delivery.py": 2,
+    "slack/handler_runtime/dispatch.py": 1,
     "voice_reply.py": 4,
 }
 
@@ -523,9 +554,12 @@ class TestDisclosureContract:
         # Pinning the module as governance-free is the property that actually
         # holds the boundary: if this module cannot reach the governance
         # machinery, it cannot republish its rules under any key name.
+        import importlib
         import inspect
 
-        src = inspect.getsource(security_posture)
+        src = inspect.getsource(security_posture) + "".join(
+            inspect.getsource(importlib.import_module(owner)) for owner in security_posture._OWNERS
+        )
         for forbidden in (
             "platform.governance",
             "platform import governance",
@@ -730,7 +764,12 @@ class TestOmissionDetection:
         # The ``security`` package DEFINES the redactors; security_posture.py only
         # names them. The whole package is skipped, not one file, because the
         # definitions are spread across its submodules.
-        self_referential = {"security_posture.py"}
+        self_referential = {
+            "security_posture.py",
+            "security_posture_controls.py",
+            "security_posture_sinks_delivery.py",
+            "security_posture_sinks_gateway.py",
+        }
 
         unclassified: list[str] = []
         for path in sorted(pkg.rglob("*.py")):
@@ -899,7 +938,13 @@ class TestOmissionDetection:
         pkg = Path(security_posture.__file__).resolve().parent
         explicit: set[str] = set()
         for path in pkg.rglob("*.py"):
-            if path.name in {"sel.py", "security_posture.py"}:
+            if path.name in {
+                "sel.py",
+                "security_posture.py",
+                "security_posture_controls.py",
+                "security_posture_sinks_delivery.py",
+                "security_posture_sinks_gateway.py",
+            }:
                 continue
             explicit |= set(
                 re.findall(
@@ -915,10 +960,13 @@ class TestOmissionDetection:
     def test_token_auth_controls_name_live_mechanisms(self):
         """Each advertised auth control must have its enforcement present."""
         import inspect
+        import sys
 
         from kiro_crew.dashboard import token_auth
 
-        src = inspect.getsource(token_auth)
+        # The facade and the owner modules it serves the moved code from.
+        family = (token_auth.__name__, *token_auth._OWNERS)
+        src = "\n".join(inspect.getsource(sys.modules[name]) for name in family)
         for marker in (
             "hmac.new",  # HMAC-SHA256 signature
             "bind_peer",  # session pinning (peer-keyed: ip:<addr> / ts:… identity)
@@ -928,6 +976,79 @@ class TestOmissionDetection:
             "app_token_path_allowed",  # app-token scoping
         ):
             assert marker in src, f"advertised auth control's mechanism is gone: {marker}"
+
+
+#: Callees that count as a redactor call although no ``_``-separated word of their
+#: name is ``redact``/``redacted``/``redactor``: the rolling stream redactor and the
+#: display wrapper that runs both scanners.
+_REDACTOR_CALLEES = frozenset({"StreamRedactor", "display_safe"})
+_REDACTOR_WORDS = frozenset({"redact", "redacted", "redactor"})
+
+
+def _called_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+    return names
+
+
+def _is_redactor_call(name: str) -> bool:
+    # ``redact``, ``redact_credentials``, ``_redact_frame``, ``prepare_redacted_copy``
+    # count; ``count_redaction_tags``, ``needs_redaction``, ``redaction_notice`` do not.
+    if name in _REDACTOR_CALLEES:
+        return True
+    return any(word.lower() in _REDACTOR_WORDS for word in name.split("_"))
+
+
+def _declared_owner_modules(tree: ast.Module) -> list[str]:
+    """Dotted owner modules a split module's facade declares.
+
+    Two declarations count, both module-level: an ``_OWNERS`` tuple of dotted names,
+    and ``from <pkg> import <owner> as _owner_<owner>``. Any other import does not, so
+    a facade cannot borrow a redactor call from a module it merely imports.
+    """
+    owners: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_OWNERS" for t in node.targets
+        ):
+            if isinstance(node.value, (ast.Tuple, ast.List)):
+                owners.extend(
+                    e.value
+                    for e in node.value.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                )
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for alias in node.names:
+                if alias.asname and alias.asname.startswith("_owner_"):
+                    owners.append(f"{node.module}.{alias.name}")
+    return owners
+
+
+def _sink_module_calls_a_redactor(pkg, module: str) -> bool:
+    """True when ``module`` (relative to the ``kiro_crew`` package dir ``pkg``) calls
+    a redactor, or, as a split module's facade, one of its declared owners does."""
+    path = pkg / module
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    if any(_is_redactor_call(n) for n in _called_names(tree)):
+        return True
+    for dotted in _declared_owner_modules(tree):
+        parts = dotted.split(".")
+        if parts[0] != "kiro_crew":
+            continue
+        owner = pkg.joinpath(*parts[1:])
+        candidates = (owner.with_suffix(".py"), owner / "__init__.py")
+        for candidate in candidates:
+            if candidate.is_file():
+                owner_tree = ast.parse(candidate.read_text(encoding="utf-8"))
+                if any(_is_redactor_call(n) for n in _called_names(owner_tree)):
+                    return True
+    return False
 
 
 class TestRedactionSinkRegistry:
@@ -943,10 +1064,63 @@ class TestRedactionSinkRegistry:
 
         pkg = Path(security_posture.__file__).resolve().parent
         for label, module, _detail in security_posture._REDACTION_SINKS:
-            text = (pkg / module).read_text(encoding="utf-8")
             # The claim "this is an output path where redaction is applied" must be
-            # true of the module named, or the count is fiction.
-            assert "redact" in text or "StreamRedactor" in text, label
+            # true of the module named, or the count is fiction. A CALL is required:
+            # an import, a docstring or a comment that mentions a redactor is not one.
+            assert _sink_module_calls_a_redactor(pkg, module), (
+                f"{label} ({module}) names no call to a redactor, in the module or "
+                "in the owner modules its facade declares"
+            )
+
+    def test_a_module_that_only_imports_a_redactor_fails_the_sink_check(self, tmp_path):
+        """The check above must be able to fail: a mention is not a call."""
+        (tmp_path / "mention.py").write_text(
+            '"""Output is redacted before it is sent."""\n'
+            "from kiro_crew.security import redact_credentials  # noqa: F401\n"
+            "from kiro_crew.security import StreamRedactor  # noqa: F401\n"
+            "def send(text):\n"
+            "    # redact(text) used to run here\n"
+            "    return text\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "calls.py").write_text(
+            "from kiro_crew.security import redact_credentials\n"
+            "def send(text):\n"
+            "    return redact_credentials(text)\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "helper_only.py").write_text(
+            "def send(text):\n    return count_redaction_tags(text), needs_redaction(text)\n",
+            encoding="utf-8",
+        )
+        assert not _sink_module_calls_a_redactor(tmp_path, "mention.py")
+        assert not _sink_module_calls_a_redactor(tmp_path, "helper_only.py")
+        assert _sink_module_calls_a_redactor(tmp_path, "calls.py")
+
+    def test_a_facade_counts_only_through_the_owners_it_declares(self, tmp_path):
+        """A split module's facade keeps its sink row; its declared owners must call."""
+        pkg = tmp_path / "kiro_crew"
+        (pkg / "fam").mkdir(parents=True)
+        (pkg / "fam" / "owner.py").write_text(
+            "def send(text):\n    return redact(text)\n", encoding="utf-8"
+        )
+        (pkg / "fam" / "silent.py").write_text(
+            "def send(text):\n    return text\n", encoding="utf-8"
+        )
+        (pkg / "by_owners.py").write_text(
+            '_OWNERS = ("kiro_crew.fam.silent", "kiro_crew.fam.owner")\n', encoding="utf-8"
+        )
+        (pkg / "by_alias.py").write_text(
+            "from kiro_crew.fam import owner as _owner_owner  # noqa: F401\n", encoding="utf-8"
+        )
+        (pkg / "silent_family.py").write_text(
+            '_OWNERS = ("kiro_crew.fam.silent",)\n'
+            "from kiro_crew.fam import owner  # noqa: F401  (not an _owner_ alias)\n",
+            encoding="utf-8",
+        )
+        assert _sink_module_calls_a_redactor(pkg, "by_owners.py")
+        assert _sink_module_calls_a_redactor(pkg, "by_alias.py")
+        assert not _sink_module_calls_a_redactor(pkg, "silent_family.py")
 
     def test_a_partially_covered_sink_says_so(self):
         """A sink running only ONE scanner must disclose that on its own row.
@@ -981,7 +1155,7 @@ class TestRedactionSinkRegistry:
             # scanner followed by the credential scanner for every text value.
             "_redact_memory_field(",
             # redact_mcp_error runs redact_exfiltration_urls THEN redact_credentials
-            # (mcp_discovery.py) and then scrubs the exact configured header values
+            # (mcp_discovery_server_info.py) and then scrubs the exact configured header values
             # the generic scanners cannot know about — strictly more than either
             # scanner alone, so a sink using it is fully covered.
             "redact_mcp_error",
@@ -989,6 +1163,20 @@ class TestRedactionSinkRegistry:
             # exfil scanner THEN the credential scanner over every string in a
             # projection view or event `data`, so a sink using it is fully covered.
             "_redact_projection_value",
+            # redact_peer_text (dashboard/peer_redaction.py) IS the pair: it runs
+            # redact_exfiltration_urls THEN redact_credentials in the repo's fixed
+            # order. Its two wrappers reach it for a whole JSON document and for one
+            # SSE event respectively, so a sink calling any of the three is fully
+            # covered. Named here because that module exists so its callers "share
+            # one registered sink instead of each inventing a redactor pair" -- which
+            # means a covered sink need not mention either scanner itself.
+            "redact_peer_text",
+            "_redact_peer_payload",
+            "_redact_sse_event_async",
+            # _redact_for_display (dashboard/chat_utils_display.py) runs redact_exfiltration_urls
+            # THEN redact_credentials, cached by content hash, so a sink calling it is
+            # fully covered; test_the_display_redactor_runs_both_scanners pins that.
+            "_redact_for_display(",
         )
         for label, module, detail in security_posture._REDACTION_SINKS:
             text = (pkg / module).read_text(encoding="utf-8")
@@ -1002,6 +1190,18 @@ class TestRedactionSinkRegistry:
                 "does not disclose that — either say which scanner it runs, or fix "
                 "the sink to run both"
             )
+
+    def test_the_display_redactor_runs_both_scanners(self):
+        """Why ``_redact_for_display(`` is a dual pass above: one input carrying a
+        credential and an exfiltration URL comes back with both removed."""
+        from kiro_crew.dashboard import chat_utils
+
+        chat_utils._clear_display_redaction_cache()
+        url = "https://collect.attacker.example/?token=" + "aB3" * 70 + "&host=corp-laptop"
+        out = chat_utils._redact_for_display(f"key AKIAIOSFODNN7EXAMPLE then {url}")
+        chat_utils._clear_display_redaction_cache()
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+        assert "corp-laptop" not in out and "attacker.example/?token" not in out
 
     def test_sink_prose_claims_are_true_of_the_named_module(self):
         """A sink's `detail` makes testable claims — pin them to the call site.

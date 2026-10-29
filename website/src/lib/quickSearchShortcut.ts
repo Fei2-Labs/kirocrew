@@ -1,5 +1,7 @@
 import { isMac } from '../utils/platform'
-import { safeGetItem, safeSetItem } from '../utils/safeStorage'
+import { safeGetItem } from '../utils/safeStorage'
+import { CODE_TOKENS } from './shortcutRegistry'
+import { savePrefExplicitly } from './uiPrefs'
 
 /**
  * Configurable activation shortcut for the Search Everywhere command palette.
@@ -17,12 +19,12 @@ import { safeGetItem, safeSetItem } from '../utils/safeStorage'
  *    their own, so it is now opt-in — only users who select it are exposed.
  *  - **`custom`**: a user-recorded chord toggles it; double-Shift is disabled.
  *
- * `⌘K` / `Ctrl+K` stays available as a built-in alias in every mode EXCEPT
- * `custom` with a recorded chord — see {@link isModKEvent} and
- * {@link matchesQuickSearchShortcut}. It is the near-universal command-palette
- * gesture and is page-safe, so it is the escape hatch that guarantees the
- * palette is always reachable from the keyboard until the user deliberately
- * binds their own chord.
+ * `⌘K` / `Ctrl+K` toggles the palette ONLY in `mod-k` mode, where it is the
+ * selected gesture — see {@link isModKEvent} and {@link useCommandPalette}. In
+ * `double-shift` and `custom` the user picked a different trigger specifically
+ * to reclaim this chord (Ctrl+K is the terminal "clear to end of line" and many
+ * inputs' own binding), so it is NOT intercepted there and falls through to the
+ * focused input. The palette's nav button keeps it reachable in every mode.
  *
  * The preference is persisted to localStorage and read live per keystroke (no
  * listener re-registration), mirroring the `SHORTCUTS_ENABLED_KEY` pattern in
@@ -81,9 +83,21 @@ export function isValidChord(c: Partial<QuickSearchChord> | null | undefined): c
   return c.mod === true || c.ctrl === true || c.alt === true
 }
 
+/**
+ * US-layout shifted glyph → the unshifted key it sits on. Before
+ * {@link eventKeyToken} read punctuation from `code`, a Shift+punctuation chord
+ * was recorded with the SHIFTED glyph (Ctrl+Shift+` stored as `~`); mapping it
+ * back keeps those stored chords matching the positional token.
+ */
+const LEGACY_SHIFTED_GLYPHS: Readonly<Record<string, string>> = {
+  '~': '`', '<': ',', '>': '.', '?': '/', '|': '\\', '{': '[', '}': ']',
+  '_': '-', '+': '=', ':': ';', '"': "'",
+}
+
 /** Lowercase the key token so matching is case-insensitive and Shift-stable. */
 export function normalizeChord(c: QuickSearchChord): QuickSearchChord {
-  const out: QuickSearchChord = { key: c.key.toLowerCase() }
+  const lowered = c.key.toLowerCase()
+  const out: QuickSearchChord = { key: (c.shift && LEGACY_SHIFTED_GLYPHS[lowered]) || lowered }
   if (c.mod) out.mod = true
   if (c.ctrl) out.ctrl = true
   if (c.alt) out.alt = true
@@ -126,7 +140,7 @@ export function saveQuickSearchConfig(config: QuickSearchConfig): boolean {
   } else {
     toStore = { mode: config.mode }
   }
-  const ok = safeSetItem(QUICK_SEARCH_SHORTCUT_KEY, JSON.stringify(toStore))
+  const ok = savePrefExplicitly(QUICK_SEARCH_SHORTCUT_KEY, JSON.stringify(toStore))
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event(QUICK_SEARCH_SHORTCUT_EVENT))
   }
@@ -136,9 +150,10 @@ export function saveQuickSearchConfig(config: QuickSearchConfig): boolean {
 /**
  * The stable physical key token for a keydown, or `null` when the event carries
  * no usable key (a bare modifier press, or a dead key). Prefers
- * `KeyboardEvent.code` for letters/digits so the token is independent of Shift
- * state and the macOS Option layer; falls back to `KeyboardEvent.key` for named
- * keys (`ArrowUp`, `Enter`, punctuation).
+ * `KeyboardEvent.code` for letters, digits and punctuation so the token is
+ * independent of Shift state and the macOS Option layer — Ctrl+Shift+` reads as
+ * `` ` ``, not the `~` that `key` reports — and falls back to `KeyboardEvent.key`
+ * for named keys (`ArrowUp`, `Enter`).
  */
 export function eventKeyToken(e: Pick<KeyboardEvent, 'code' | 'key'>): string | null {
   const code = e.code
@@ -146,10 +161,28 @@ export function eventKeyToken(e: Pick<KeyboardEvent, 'code' | 'key'>): string | 
     if (/^Key[A-Z]$/.test(code)) return code.slice(3).toLowerCase()
     if (/^Digit\d$/.test(code)) return code.slice(5)
     if (/^Numpad\d$/.test(code)) return code.slice(6)
+    const punct = CODE_TOKENS[code]
+    if (punct) return punct
   }
   const key = e.key
   if (!key || key === 'Shift' || key === 'Control' || key === 'Alt' || key === 'Meta') return null
   return key.length === 1 ? key.toLowerCase() : key
+}
+
+/**
+ * The token a keydown matches, folded through {@link LEGACY_SHIFTED_GLYPHS}
+ * while Shift is held — the same fold {@link normalizeChord} applies to the
+ * stored side. Only a token read from `key` can carry a shifted glyph (an ISO
+ * `IntlBackslash` reporting `|`, or `~` on a Mac ISO board), so the fold leaves
+ * positional tokens alone. The typed glyph of a key that HAS a positional token
+ * is never matched: on many layouts it is another key's glyph (Italian
+ * Backquote types `\`), and matching it would hand one key's binding to another.
+ */
+function eventToken(e: Pick<KeyboardEvent, 'code' | 'key' | 'shiftKey'>): string | null {
+  const token = eventKeyToken(e)
+  if (token === null) return null
+  const lowered = token.toLowerCase()
+  return (e.shiftKey && LEGACY_SHIFTED_GLYPHS[lowered]) || lowered
 }
 
 /**
@@ -175,8 +208,7 @@ export function chordMatchesEvent(
   chord: QuickSearchChord,
   mac: boolean = isMac,
 ): boolean {
-  const token = eventKeyToken(e)
-  if (token === null || token.toLowerCase() !== chord.key.toLowerCase()) return false
+  if (eventToken(e) !== chord.key.toLowerCase()) return false
   if (mac) {
     if (!!chord.mod !== e.metaKey || !!chord.ctrl !== e.ctrlKey) return false
   } else {
@@ -189,9 +221,11 @@ export function chordMatchesEvent(
 }
 
 /**
- * Whether a recorded custom chord is currently the exclusive binding. When true,
- * the ⌘K/Ctrl+K alias is suppressed (the user has taken explicit control);
- * otherwise the alias stays live as the universal escape hatch.
+ * Whether a valid custom chord is bound (mode `custom` with a well-formed
+ * chord). A type guard: when true, {@link useCommandPalette} matches the
+ * recorded chord. ⌘K/Ctrl+K is no longer a cross-mode alias — it fires only in
+ * `mod-k` mode — so this does not gate an alias; the palette's nav button is the
+ * mode-independent route.
  */
 export function hasCustomChord(config: QuickSearchConfig): config is QuickSearchConfig & { custom: QuickSearchChord } {
   return config.mode === 'custom' && isValidChord(config.custom)

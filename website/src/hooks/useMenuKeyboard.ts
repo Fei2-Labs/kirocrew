@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useDocumentImeLatch, type ImeLatch } from './useImeGuard'
 import { deepActiveElement, isEditableElement } from '../utils/editableTarget'
+import { useLocalCrewHidden } from '../components/overlayRoot'
 
 /**
  * Shared keyboard contract for `role="menu"` surfaces (WAI-ARIA menu pattern):
@@ -12,7 +13,7 @@ import { deepActiveElement, isEditableElement } from '../utils/editableTarget'
  * (and what "close" means — restore focus, toggle state — differs per host).
  *
  * This is the extraction of `MenuBtn`'s roving-focus keydown logic
- * (DevFleetPage.tsx, landed via #6226) so the sibling `role="menu"` surfaces
+ * (DevFleetPageMenus.tsx, landed via #6226) so the sibling `role="menu"` surfaces
  * can honour the same contract without a per-surface re-spelling (#6231).
  * `MenuBtn` itself consumes `handleMenuKeydown` from its existing
  * document-level listener; popover-style hosts use the `useMenuKeyboard` hook.
@@ -155,8 +156,11 @@ export function useMenuKeyboard(opts: {
 }): void {
   const { enabled, containerRef, focusFirstOnOpen = true } = opts
   const imeLatch = useDocumentImeLatch(enabled)
+  // Behind a remote Crew the menu is hidden with its Crew (components/overlayRoot)
+  // and its keys belong to the Crew in front.
+  const crewHidden = useLocalCrewHidden()
   useEffect(() => {
-    if (!enabled) return
+    if (!enabled || crewHidden) return
     const items = () => menuItemsOf(containerRef.current)
     if (focusFirstOnOpen) items()[0]?.focus()
     const onKey = (e: KeyboardEvent) => {
@@ -171,5 +175,5 @@ export function useMenuKeyboard(opts: {
     // `imeLatch` is identity-stable (useDocumentImeLatch); `containerRef` is a
     // stable ref object. Only open/close (and the static focusFirstOnOpen)
     // should re-run this effect.
-  }, [enabled, focusFirstOnOpen, containerRef, imeLatch])
+  }, [enabled, crewHidden, focusFirstOnOpen, containerRef, imeLatch])
 }

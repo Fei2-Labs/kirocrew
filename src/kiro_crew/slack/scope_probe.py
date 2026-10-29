@@ -19,6 +19,7 @@ never produces a false "reinstall your app" alarm.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Callable, Iterable
 
@@ -38,8 +39,22 @@ UNREADABLE_ERRORS = frozenset({"missing_scope", "channel_not_found"})
 _REINSTALL_HINT = (
     "the Slack app install likely predates the current OAuth scopes "
     "(groups:history / message.groups) — reinstall the Slack app from the "
-    "bundled manifest to restore private-channel message delivery."
+    "bundled manifest to restore private-channel message delivery. A manifest "
+    "from `kirocrew manifest` renames the slash command to /kirocrew-<alias>; "
+    "run the `kirocrew config set slack.command` line it prints, then restart "
+    "the gateway."
 )
+
+
+def log_probe_failure(task: asyncio.Task[dict[str, str]]) -> None:
+    """Done-callback for a dispatched probe task: retrieve and log its failure.
+
+    A callback that only discards the task leaves a raised exception
+    unretrieved, and asyncio then reports it from the task's finalizer at
+    whatever later moment the garbage collector runs.
+    """
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Tracked-channel scope probe failed", exc_info=task.exception())
 
 
 async def warn_unreadable_tracked_channels(

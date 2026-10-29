@@ -6,12 +6,18 @@ import hashlib
 import json
 import uuid
 from dataclasses import replace as dataclass_replace
-from typing import Any
+from typing import Any, NamedTuple
 
-from kiro_crew.config.loader import ResolvedBindings, resolve_agent_bindings
+from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+from kiro_crew.config.loader import (
+    ResolvedBindings,
+    dispatch_kiro_agent,
+    resolve_agent_bindings,
+)
 from kiro_crew.execution_context import (
     ExecutionContext,
     MemoryStoreRef,
+    adopt_removed_synced_crewmate,
     bind_session_execution,
     member_config_for_id,
     read_session_execution,
@@ -19,7 +25,35 @@ from kiro_crew.execution_context import (
 )
 from kiro_crew.memory_stores import UnknownMemoryStore
 
-SelectionChange = tuple[dict[str, Any] | None, dict[str, Any]]
+_LEGACY_BINDING_FIELDS = ("memory_store", "memory_mode")
+
+
+class SelectionChange(NamedTuple):
+    """What one selection write replaced, so a rollback can put it back.
+
+    ``prior`` is the execution record the session carried before the write and
+    ``published`` the one the write committed. A session with no execution
+    record can still carry a binding of its own in the metadata line's
+    ``memory_store`` / ``memory_mode`` fields (a transcript written before the
+    execution record existed). The write overwrites both, so ``legacy`` keeps
+    their raw pre-write values; a field the line did not carry is absent from it.
+    """
+
+    prior: dict[str, Any] | None
+    published: dict[str, Any]
+    legacy: dict[str, Any] | None = None
+
+
+def _legacy_binding(session_key: str) -> dict[str, Any] | None:
+    """The metadata line's own binding fields, read before a write replaces them."""
+    if not session_key or session_key.startswith("subagent:"):
+        return None
+    from kiro_crew.history import ConversationLog
+
+    metadata, readable = ConversationLog().get_metadata_status(session_key)
+    if not readable:
+        return None
+    return {field: metadata[field] for field in _LEGACY_BINDING_FIELDS if field in metadata}
 
 
 def _revision(execution: ExecutionContext | None) -> str:
@@ -44,11 +78,60 @@ def session_agent_selection_kind(session_key: str, agent_name: str) -> str:
     )
 
 
+def _source_of_view(name: str) -> str:
+    """The agent a stored skill-view name was built from, or *name* unchanged.
+
+    A conversation recorded while the native skill projection was on can hold a
+    generated ``kirocrew-skill-view-<digest>`` name as its agent. That name is a
+    file the projection wrote, and a boot drain or an operator may have removed
+    it since, so resolving it by name finds nothing and the turn is refused.
+    The projection records which agent each view was built from (its ownership
+    sidecar, or the view ledger), and :func:`source_agent_name` reads that record
+    even after the view file is gone. A view nothing records stays as it is, so
+    it resolves to nothing and is refused rather than guessed.
+
+    Blocking: it may read one sidecar. Every caller of
+    :func:`resolve_session_agent_bindings` runs it off the event loop.
+    """
+    if not name.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return name
+    # Deferred: the driver module pulls in the ACP stack, which a plain agent
+    # name never needs.
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    source = acp_driver.skill_view_source_agent(name)
+    return name if source is None else source
+
+
 def resolve_session_agent_bindings(
-    resolver, config, session_key: str, agent_name: str | None, *project_dir
+    resolver,
+    config,
+    session_key: str,
+    agent_name: str | None,
+    *project_dir,
+    agent_kind: str = "",
 ) -> ResolvedBindings:
+    """Bindings for a session: its execution record when one exists, else the
+    slot's own name resolved in the namespace the slot was STAMPED in.
+
+    *agent_kind* is the slot's ``agent_kind`` (``"member"`` / ``"template"`` /
+    ``""``). It decides only the record-less resolve: a record carries its own
+    kind and stays authoritative. Without it a template-stamped slot whose name a
+    crewmate also uses resolves member-first and binds that crewmate's store and
+    pin to a chat that never picked it; the owner's create writes the record at
+    once, but a non-owner create (an app token) leaves the first send to resolve
+    from the stamp alone.
+    """
     execution = read_session_execution(session_key)
-    selected = agent_name or config.default_agent
+    # A crewmate's worker runs on its crewmate's backend: publishing the key here,
+    # on the read every turn and resume prefetch makes before allocating, is what
+    # the backend selection then reads (``members.select_provider_backend``).
+    from kiro_crew.mate_worker import note_worker_session
+
+    note_worker_session(session_key, execution)
+    # No name and no record is the default TEMPLATE, not the default crewmate
+    # alias: the resolver answers an empty name with that session.
+    selected = agent_name or ""
     if execution is not None:
         # Member display labels may change; the durable ID and store do not.
         if execution.member_id is not None and execution.selection_kind == "member":
@@ -58,23 +141,37 @@ def resolve_session_agent_bindings(
                 selected = execution.selection_name or execution.member_id
         else:
             selected = execution.selection_name or execution.template_id
+    selected = _source_of_view(selected)
+    if execution is not None:
+        # The decoder already re-reads a record bound to a pruned synced
+        # crewmate as its template; answering against the CALLER's config
+        # snapshot keeps this resolve consistent with the config it is given.
+        execution = adopt_removed_synced_crewmate(execution, config)
+    if execution is not None:
+        kind_kwargs = {"selection_kind": execution.selection_kind, "execution_context": execution}
+    elif agent_kind in ("member", "template"):
+        kind_kwargs = {"selection_kind": agent_kind}
+    else:
+        kind_kwargs = {}
     try:
         bindings = resolver(
             config,
             selected,
             *project_dir,
             validate_memory_files=False,
-            **(
-                {"selection_kind": execution.selection_kind, "execution_context": execution}
-                if execution
-                else {}
-            ),
+            **kind_kwargs,
         )
     except StopIteration as exc:
         raise UnknownMemoryStore("Conversation agent selection is unavailable") from exc
     if execution is not None:
         bindings.memory_store_name = execution.store.store_id
-        bindings.kiro_agent = execution.template_id
+        # Both recorded kinds can need a skill-view repair. Only a MEMBER's
+        # template id came from a crewmate row that may hold a package filename;
+        # a template id is already the provider selection and must stay exact.
+        kiro_agent = _source_of_view(execution.template_id)
+        if execution.selection_kind == "member":
+            kiro_agent = dispatch_kiro_agent(kiro_agent)
+        bindings.kiro_agent = kiro_agent
         bindings.execution_context = execution
     bindings.selection_revision = _revision(execution)
     return bindings
@@ -88,10 +185,18 @@ def record_provider_agent_switch(config, session_key, prior_agent, new_agent, pr
     selected.selection_revision = _revision(prior)
     if prior is not None:
         # A provider template event changes behavior, never the memory owner.
+        # A session with no member id (an ordinary chat on the default template,
+        # or a legacy one recorded as the default alias with kind "member")
+        # selects the TEMPLATE, so its kind must say so too.
+        # Left as "member", the next turn resolves the template name in the
+        # member namespace, where an agent that is only a spec file (not a
+        # config.agents key) is unresolvable, and the turn is refused.
+        unowned = prior.member_id is None
         selected.execution_context = dataclass_replace(
             prior,
             template_id=selected.kiro_agent,
-            selection_name=new_agent if prior.member_id is None else prior.selection_name,
+            selection_name=new_agent if unowned else prior.selection_name,
+            selection_kind="template" if unowned else prior.selection_kind,
         )
     # Carrying the owner over means carrying it out of the session's OWN record,
     # which the session can rewrite, so this publication must not vouch for it.
@@ -102,11 +207,21 @@ def record_provider_agent_switch(config, session_key, prior_agent, new_agent, pr
     return record_agent_selection(session_key, new_agent, selected, vouch=prior is None)
 
 
+def _template_selection(bindings, kind: str) -> str:
+    """What a template session with no name of its own selected: its template.
+
+    A plain session is the default template; it reports no alias, so the
+    template it runs IS the selection, and recording it keeps the conversation
+    on that template even if a crewmate of the same name is discovered later.
+    """
+    return bindings.kiro_agent if kind == "template" else ""
+
+
 def record_agent_selection(
     session_key, agent_name, bindings, *, replace=False, memory_mode=None, vouch=False
 ):
     kind = getattr(bindings, "selection_kind", "")
-    selected = agent_name or bindings.resolved_alias
+    selected = agent_name or bindings.resolved_alias or _template_selection(bindings, kind)
     if kind not in ("member", "template") or not selected or not bindings.requested_resolved:
         return None
     prior = read_session_execution(session_key)
@@ -164,12 +279,15 @@ def record_agent_selection(
         # a stated property rather than something rediscovered later.
         return None
     execution = dataclass_replace(execution, selection_revision=uuid.uuid4().hex)
+    # With no execution record, the line's own store and mode are the binding the
+    # publication below overwrites, so they are captured first for the rollback.
+    legacy = _legacy_binding(session_key) if prior is None else None
     # The comparison above is backed by the session record CAS during publication.
     bind_session_execution(
         session_key, execution, replace_existing=True, expected=prior, vouch=vouch
     )
     bindings.execution_context = execution
-    return prior.to_record() if prior else None, execution.to_record()
+    return SelectionChange(prior.to_record() if prior else None, execution.to_record(), legacy)
 
 
 def restore_agent_selection(session_key: str, change: SelectionChange | None) -> None:
@@ -178,7 +296,7 @@ def restore_agent_selection(session_key: str, change: SelectionChange | None) ->
     from kiro_crew.atomic_write import atomic_write
     from kiro_crew.history import ConversationLog
 
-    prior, published = change
+    prior, published, legacy = change
     from kiro_crew.execution_context import restore_live_session_execution
 
     if restore_live_session_execution(session_key, prior, published):
@@ -204,7 +322,13 @@ def restore_agent_selection(session_key: str, change: SelectionChange | None) ->
             return
         path = log._path(session_key)
         rows = path.read_text(encoding="utf-8").splitlines(keepends=True)
-        for field in ("execution_context", "memory_store", "memory_mode"):
-            metadata.pop(field, None)
+        metadata.pop("execution_context", None)
+        # The line's own pre-write binding comes back exactly as it was read: a
+        # field it carried is restored, a field it did not carry is removed.
+        for field in _LEGACY_BINDING_FIELDS:
+            if legacy and field in legacy:
+                metadata[field] = legacy[field]
+            else:
+                metadata.pop(field, None)
         rows[0] = json.dumps(metadata, ensure_ascii=False) + "\n"
         atomic_write(path, "".join(rows))

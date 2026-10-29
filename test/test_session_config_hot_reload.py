@@ -29,6 +29,7 @@ from kiro_crew.config.live import ConfigWatch
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.session import SessionManager, _watchdog_handle_of
 from kiro_crew.session_cleanup import SessionCleanup
+from kiro_crew.testing.wait import finished
 
 
 def _make_cfg(
@@ -91,6 +92,7 @@ _TICK_SWEEPS = (
     "_sweep_session_roots",
     "_sweep_sandbox_artifacts",
     "_sweep_session_pid_mappings",
+    "_sweep_shell_audit_log",
     "_maybe_prune_pycache",
     "_sweep_periodic_pids",
     "_sweep_untracked_mcps",
@@ -109,6 +111,8 @@ class TestSubscription:
             "agents",
             "workspaces",
             "default_workspace",
+            "aws",
+            "apps",
         )
         assert mgr._config_sub is subs[0]
 
@@ -188,6 +192,7 @@ class TestAdoptOnChange:
             "agent.role_efforts.background",
             "agent.tool_search",
             "agent.sandbox",
+            "agent.env.HTTPS_PROXY",
             "session.pool_size",
             "session.pool_agent",
             "session.pool_ttl_secs",
@@ -450,7 +455,7 @@ class TestCleanupLoopRereadsPolicy:
             patch.object(SessionCleanup, "_adopt_idle_policy", side_effect=adopt),
             patch.multiple(SessionCleanup, **quiet),
         ):
-            await asyncio.wait_for(cleanup._run_cleanup_ticks(0.01), timeout=5)
+            await finished(cleanup._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown")
         assert calls >= 3
 
     @pytest.mark.asyncio
@@ -506,7 +511,9 @@ class TestCleanupLoopRereadsPolicy:
                 patch.object(SessionCleanup, "_adopt_idle_policy", side_effect=adopt),
                 patch.multiple(SessionCleanup, **quiet),
             ):
-                await asyncio.wait_for(cleanup._run_cleanup_ticks(0.01), timeout=5)
+                await finished(
+                    cleanup._run_cleanup_ticks(0.01), "the tick loop stopping on shutdown"
+                )
         finally:
             pool.shutdown(wait=True)
 

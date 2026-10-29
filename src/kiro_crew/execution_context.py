@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from threading import RLock
 from typing import Any, Literal, Mapping, overload
 
-from kiro_crew.validation import MAX_SHORT_STRING
+from kiro_crew.constants import MAX_SHORT_STRING
 
 EXECUTION_CONTEXT_KEY = "execution_context"
 MEMORY_MODES = ("persistent", "incognito", "temporary")
@@ -34,7 +34,7 @@ _LIVE_EXECUTIONS: dict[tuple[str, str], ExecutionContext] = {}
 # Insertion-ordered and BOUNDED, because the population is not the set of live
 # sessions: every persistent `bind_session_execution` vouches, and several of its
 # callers mint a fresh key per request rather than per session -- a webhook with
-# no `sessionKey` gets `hook:default:<unix seconds>`, and a task runner refine run
+# no `sessionKey` gets `hook:default:<unix seconds>-<random hex>`, and a task runner refine run
 # gets one per run. Those keys are released by their own turn's teardown where one
 # exists, so the cap is the backstop for uptime, not the primary release: an entry
 # whose producer has no teardown would otherwise live until the process restarts.
@@ -217,18 +217,70 @@ def clear_session_execution(
             # compare-and-set actually matched has shrunk anything, and a clear
             # whose key was absent must not re-arm on another episode's behalf.
             _withdraw_vouched(key)
+    # The restart-surviving copy follows the same withdrawal, or every withdrawn
+    # key (one per hook request, one per failed fork) leaves a file behind for good
+    # and a later gate-verified re-vouch could restore what was just withdrawn.
+    # Outside the lock: it is file IO, and its own compare keeps it exact.
+    from kiro_crew._durable_vouch import forget_durable_vouch
+
+    if expected is ...:
+        forget_durable_vouch(session_key)
+    elif isinstance(expected, ExecutionContext):
+        forget_durable_vouch(session_key, only_if=expected.to_record())
+
+
+_UNAVAILABLE_PREFIX = "Execution memory is unavailable: "
+_UNAVAILABLE_SUFFIX = "; Global was not used"
+
+#: The two refusals a crewmate's own memory binding produces. Callers that turn
+#: a refusal into user-facing text key a remedy on these exact reasons.
+MEMBER_ON_GLOBAL_REASON = "a member cannot use the Global store"
+MEMBER_WITHOUT_IDENTITY_REASON = "member has no persisted identity"
 
 
 def _unavailable(message: str):
+    """An execution-context refusal. *message* is fixed text, never formatted
+    from an exception or a path, so a caller may show it to the user."""
     from kiro_crew.memory_stores import UnknownMemoryStore
 
-    return UnknownMemoryStore(f"Execution memory is unavailable: {message}; Global was not used")
+    return UnknownMemoryStore(f"{_UNAVAILABLE_PREFIX}{message}{_UNAVAILABLE_SUFFIX}")
+
+
+def unavailable_reason(exc: BaseException | None) -> str:
+    """The reason an execution-context refusal names, without its shared wrapper.
+
+    Answers the text inside the "Execution memory is unavailable: ...; Global
+    was not used" framing, so a caller can put the reason in its own sentence
+    without the wording doubling up. Only this module's refusals carry that
+    framing, and their reasons are fixed text, so the answer names no path or
+    exception detail. Answers ``""`` for any other exception, including a
+    memory-store refusal that formats an ``OSError`` into its own text, and for
+    ``None``.
+    """
+    text = str(exc).strip()
+    if not (text.startswith(_UNAVAILABLE_PREFIX) and text.endswith(_UNAVAILABLE_SUFFIX)):
+        return ""
+    return text[len(_UNAVAILABLE_PREFIX) : -len(_UNAVAILABLE_SUFFIX)].strip()
+
+
+def canonical_memory_mode(mode: object) -> str:
+    """Canonicalise a persisted privacy mode, defaulting unknown values safely."""
+    canonical = str(mode or "persistent").lower()
+    return canonical if canonical in MEMORY_MODES else "persistent"
 
 
 def stricter_memory_mode(*modes: str) -> str:
     if not modes or any(mode not in MEMORY_MODES for mode in modes):
         raise _unavailable("invalid privacy mode")
     return max(modes, key=MEMORY_MODES.index)
+
+
+#: The mode no line can be stricter than. A writer that must rewrite a metadata
+#: line whose own ``memory_mode`` it cannot read (a corrupt first line) stamps
+#: this, because the ratchet forbids relabelling a line looser than it was and
+#: the strictest mode is the only value that is never looser than an unknown
+#: one. Derived from the order above rather than spelled out twice.
+STRICTEST_MEMORY_MODE = stricter_memory_mode(*MEMORY_MODES)
 
 
 @dataclass(frozen=True)
@@ -245,7 +297,7 @@ class MemoryStoreRef:
 
             validate_slug(self.member_id)
             if self.store_id == "default":
-                raise _unavailable("a member cannot use the Global store")
+                raise _unavailable(MEMBER_ON_GLOBAL_REASON)
 
     @property
     def legacy_name(self) -> str:
@@ -286,6 +338,23 @@ class ExecutionContext:
     def with_mode(self, mode: str) -> ExecutionContext:
         return replace(self, memory_mode=stricter_memory_mode(self.memory_mode, mode))
 
+    def with_template(self, template_id: str, selection_name: str) -> ExecutionContext:
+        """Run this record's store under an explicitly selected TEMPLATE.
+
+        The store, the identity bound to it and the memory mode stay; the selection
+        namespace becomes the template's. A member with no persisted ``member_id``
+        is named by ``selection_kind == "member"`` and ``selection_name`` alone, so
+        this rewrite leaves such a record attributed to no member -- the shape the
+        spawn gate mints for that caller. A caller that must keep that member
+        instead (the ``session_create`` arm) does not call this.
+        """
+        return replace(
+            self,
+            selection_kind="template",
+            template_id=template_id,
+            selection_name=selection_name,
+        )
+
 
 @overload
 def execution_from_record(
@@ -320,7 +389,7 @@ def execution_from_record(
         store = payload["store"]
         if not isinstance(store, dict):
             raise ValueError("invalid store")
-        return ExecutionContext(
+        execution = ExecutionContext(
             member_id=payload["member_id"],
             store=MemoryStoreRef(store_id=store["store_id"], member_id=store["member_id"]),
             selection_kind=payload["selection_kind"],
@@ -332,6 +401,92 @@ def execution_from_record(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise _unavailable("malformed execution context") from exc
+    return adopt_removed_synced_crewmate(execution)
+
+
+def _same_agent(name: str, template_id: str) -> bool:
+    """Whether *name* and *template_id* name one agent, a skill view mapped back.
+
+    A record written while the native skill projection was on can carry a
+    ``kirocrew-skill-view-<digest>`` template; the projection's own record says
+    which agent it was built from, even once the view file is gone.
+    """
+    if name == template_id:
+        return True
+    from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+
+    if not template_id.startswith(NATIVE_SKILL_ALIAS_PREFIX):
+        return False
+    from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+    return acp_driver.skill_view_source_agent(template_id) == name
+
+
+def is_removed_synced_crewmate(
+    config: Any, execution: ExecutionContext, removed: frozenset[str] | set[str]
+) -> bool:
+    """Whether *execution* names an identity-less crewmate the prune deleted.
+
+    ``crewmate_prune_migration`` removes the ``config.agents`` rows an older
+    agent sync generated: no ``member_id``, the shared ``default`` store, and a
+    name equal to its ``kiro_agent`` (a skill view counts as the agent it was
+    built from). The agent itself stays installed. A record
+    that picked one carries exactly that shape. Both halves must hold: the
+    shape, and the name in *removed* (the prune's own record of what it
+    deleted) while still absent from ``config.agents``. A member deleted by any
+    other route keeps refusing, and so does one with an identity or its own
+    store.
+    """
+    name = execution.selection_name
+    return (
+        execution.selection_kind == "member"
+        and execution.member_id is None
+        and execution.store.store_id == "default"
+        and bool(name)
+        and name in removed
+        and name not in config.agents
+        and _same_agent(name, execution.template_id)
+    )
+
+
+def adopt_removed_synced_crewmate(
+    execution: ExecutionContext, config: Any = None
+) -> ExecutionContext:
+    """Re-read a record bound to a pruned synced crewmate as its template.
+
+    The removed row had no identity and sat on the shared ``default`` store, so
+    the installed agent of the same name on that same store is exactly the
+    binding the row carried. :func:`execution_from_record` applies this to every
+    record it decodes, so a resumed or forked chat, a continued subagent, a cron
+    job and the prompt builder all see one answer instead of each one refusing a
+    member whose row the prune deleted. Any other record is returned unchanged,
+    including when the marker or the config cannot be read.
+    """
+    if (
+        execution.selection_kind != "member"
+        or execution.member_id is not None
+        or execution.store.store_id != "default"
+        or not execution.selection_name
+    ):
+        return execution
+    try:
+        from kiro_crew.crewmate_prune_migration import removed_crewmate_names
+
+        removed = removed_crewmate_names()
+        if execution.selection_name not in removed:
+            return execution
+        if config is None:
+            from kiro_crew.config.loader import KiroCrewConfig
+
+            config = KiroCrewConfig.load()
+        adopt = is_removed_synced_crewmate(config, execution, removed)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "prune record or config unreadable; keeping the member record as stored",
+            exc_info=True,
+        )
+        return execution
+    return replace(execution, selection_kind="template") if adopt else execution
 
 
 def member_config_for_id(config: Any, member_id: str) -> tuple[str, Any]:
@@ -355,6 +510,7 @@ def resolve_member_execution(
     validate_memory_files: bool = False,
 ) -> ExecutionContext:
     """Capture an explicitly selected existing member and its store together."""
+    from kiro_crew.config.loader import member_template_id
     from kiro_crew.memory_stores import require_member_memory_store
 
     alias, agent = (
@@ -366,12 +522,12 @@ def resolve_member_execution(
     declaration = config.memory_stores.get(store)
     member_id = getattr(agent, "member_id", "") or None
     if getattr(declaration, "memory_version", 1) == 2 and not member_id:
-        raise _unavailable("member has no persisted identity")
+        raise _unavailable(MEMBER_WITHOUT_IDENTITY_REASON)
     return ExecutionContext(
         member_id=member_id,
         store=MemoryStoreRef(store, member_id),
         selection_kind="member",
-        template_id=agent.kiro_agent or "kirocrew",
+        template_id=member_template_id(agent),
         memory_mode=memory_mode,
         app=app,
         selection_name=alias,
@@ -479,10 +635,204 @@ def read_vouched_session_execution(session_key: str) -> ExecutionContext | None:
         return _VOUCHED_EXECUTIONS.get(_live_key(session_key))
 
 
+def revouch_at_verified_admission(
+    verified_session_key: str, execution: ExecutionContext, config: Any
+) -> bool:
+    """Re-establish own-store authority for a rehydrated member session.
+
+    The recovery this process cannot do from the durable record alone. A restart
+    (or a cap eviction) empties `_VOUCHED_EXECUTIONS` while the durable record
+    survives, so a rehydrated member session's own-store dispatch is refused --
+    `read_vouched_session_execution` answers None -- until its owner re-selects the
+    agent and re-binds through the durable path. This restores the vouch WITHOUT
+    that owner action, at the session's next gate-verified admission.
+
+    The trust source is the VERIFIED session key AND config, never the durable
+    record. The caller passes ``verified_session_key`` only after the admission
+    gate has authenticated it (the HTTP gate's ``X-Session-Key``), and this
+    function re-vouches ONLY when that key is a member DM key -- ``member-<slug>``,
+    whose ``<slug>`` IS the member id, derived from the key itself and NOT from the
+    record -- AND the store the vouch would grant is the one CONFIG says that
+    member owns. Two shape checks the record alone cannot be trusted on: its
+    ``member_id`` must equal the key's slug, and its ``store.store_id`` must equal
+    the store ``resolve_member_execution`` derives for that slug from config. The
+    second is load-bearing: ``MemoryStoreRef`` shape-checks the store NAME only and
+    ``ExecutionContext`` requires just ``store.member_id == member_id``, so a member
+    may leave both member-id fields as its own slug while pointing
+    ``store.store_id`` at a PEER's store -- and only the config comparison catches
+    that. A session whose key is NOT a member DM key takes the durable-record
+    branch instead (:func:`_revouch_from_durable_record`): it is re-vouched only
+    from a copy of its own earlier vouch that no session can write, so a forger's
+    ordinary ``chat-`` slot with no such copy gets nothing.
+
+    ``config`` is a ``KiroCrewConfig`` the caller has already loaded OFF the event
+    loop and threads in, so this helper performs no blocking config read of its
+    own; the caller runs it off the loop too, since the store resolution it does
+    is filesystem-backed.
+
+    Returns True when a vouch was (re-)established, False otherwise. Idempotent:
+    an entry the record already agrees with is refreshed rather than duplicated.
+    Callable only where the key is genuinely gate-verified; every other reader of
+    the vouched map stays read-only.
+    """
+    from kiro_crew.members import is_member_session_key, slug_from_dm_slot_key
+
+    if not verified_session_key:
+        return False
+    if execution.member_id is None or execution.store.member_id != execution.member_id:
+        return False
+    if not is_member_session_key(verified_session_key):
+        return _revouch_from_durable_record(verified_session_key, execution, config)
+    # The member id the VERIFIED key names, taken from the key's own slug rather
+    # than from any field the session writes. `is_member_session_key` accepts the
+    # `dashboard_`/`dashboard:` layer prefixes, so strip the same set before the
+    # canonical `slug_from_dm_slot_key`, which drops the `.memory-<store>` slot
+    # suffix so a key that carries it still reads the bare slug.
+    key = verified_session_key
+    for prefix in ("dashboard_", "dashboard:"):
+        if key.startswith(prefix):
+            key = key[len(prefix) :]
+            break
+    verified_member_id = slug_from_dm_slot_key(key)
+    if not verified_member_id or verified_member_id != execution.member_id:
+        # The record claims a member the verified key does not name -- the forgery
+        # shape. Vouch for nothing.
+        return False
+    # The record's store is verified against CONFIG, not accepted from the record.
+    # `ExecutionContext.__post_init__` requires only `store.member_id == member_id`
+    # and `MemoryStoreRef` shape-checks the store NAME alone, so a member may leave
+    # both member-id fields as its own slug while pointing `store.store_id` at a
+    # PEER's store. Resolving the member's own execution from config -- the same
+    # independent source the legacy-record backfill trusts -- and requiring the
+    # record's `store_id` to equal it closes that: the store the vouch is for is
+    # the one config says the verified member owns, never the one the record
+    # asserts. A config that cannot resolve the member, or resolves it to a
+    # different store, vouches for nothing. ``config`` is passed in already loaded
+    # off the event loop by the caller, so no blocking read happens here.
+    try:
+        alias, _ = member_config_for_id(config, verified_member_id)
+        canonical = resolve_member_execution(config, alias)
+    except Exception:
+        # Fail closed: any resolution or ambiguity failure withholds the vouch.
+        # The session recovers on its owner's next agent re-select.
+        return False
+    if canonical.store.store_id != execution.store.store_id:
+        return False
+    with _EXECUTION_LOCK:
+        _vouch(_live_key(verified_session_key), execution)
+        return _VOUCHED_EXECUTIONS.get(_live_key(verified_session_key)) is not None
+
+
+def _revouch_from_durable_record(
+    verified_session_key: str, execution: ExecutionContext, config: Any
+) -> bool:
+    """Re-vouch a non-DM session from what this gateway committed before a restart.
+
+    A session a member CREATED (the nested conductor's worker) has an ordinary
+    ``chat-`` key that names no member, so the DM branch above has nothing to
+    check its record against. Its second source is the durable copy of its own
+    vouch, written by ``bind_session_execution`` when the gateway vouched for it
+    and kept in a directory every sandbox masks and no agent file tool opens
+    (see ``kiro_crew._durable_vouch``).
+
+    Three agreements, each failing closed: the durable copy exists for this
+    VERIFIED key; it names the same member and store as the session's record, so
+    a record rewritten to a peer's store is refused; and config still gives that
+    member that store, so a member deleted or re-pointed since is refused too.
+    What is re-vouched is the durable copy, the gateway's own word, never the
+    record.
+    """
+    from kiro_crew._durable_vouch import read_durable_vouch
+
+    record = read_durable_vouch(verified_session_key)
+    if record is None:
+        return False
+    try:
+        durable = execution_from_record({EXECUTION_CONTEXT_KEY: record})
+    except Exception:
+        return False
+    if (
+        durable.member_id is None
+        or durable.member_id != execution.member_id
+        or durable.store != execution.store
+        or durable.memory_mode != execution.memory_mode
+    ):
+        return False
+    try:
+        alias, _ = member_config_for_id(config, durable.member_id)
+        canonical = resolve_member_execution(config, alias)
+    except Exception:
+        return False
+    if canonical.store.store_id != durable.store.store_id:
+        return False
+    with _EXECUTION_LOCK:
+        _vouch(_live_key(verified_session_key), durable)
+        return _VOUCHED_EXECUTIONS.get(_live_key(verified_session_key)) is not None
+
+
 def read_live_session_execution(session_key: str) -> ExecutionContext | None:
     """Snapshot the live carrier for generation-safe restricted-session cleanup."""
     with _EXECUTION_LOCK:
         return _LIVE_EXECUTIONS.get(_live_key(session_key))
+
+
+def tighten_live_session_execution(
+    session_key: str,
+    memory_mode: str,
+    *,
+    expected: ExecutionContext | None | object = ...,
+) -> ExecutionContext | None:
+    """Tighten an existing live carrier without reading or writing its transcript.
+
+    Turn-start binding has already read the transcript off the event loop when it
+    reaches this helper. Keeping the carrier update under ``_EXECUTION_LOCK`` makes
+    that read-back generation-safe without making every synchronous
+    :func:`read_session_execution` caller perform file I/O. A missing live carrier
+    is a no-op; an unexpected replacement refuses rather than tightening another
+    execution that took over the same key.
+    """
+    key = _live_key(session_key)
+    with _EXECUTION_LOCK:
+        current = _LIVE_EXECUTIONS.get(key)
+        if expected is not ... and current != expected:
+            raise _unavailable("session changed during privacy tightening")
+        if current is None:
+            return None
+        tightened = current.with_mode(memory_mode)
+        if tightened == current:
+            return tightened
+        _LIVE_EXECUTIONS[key] = tightened
+        _withdraw_vouched(key)
+    # A tightening withdraws authority for good (rollback never re-grants it),
+    # so the restart-surviving copy goes too.
+    from kiro_crew._durable_vouch import forget_durable_vouch
+
+    forget_durable_vouch(session_key)
+    return tightened
+
+
+def rollback_live_session_tightening(
+    session_key: str,
+    previous: ExecutionContext | None,
+    *,
+    expected: ExecutionContext | None,
+) -> bool:
+    """Restore a live carrier only while the tightening generation still owns it.
+
+    This is the rollback half of a pre-write privacy tightening. It never restores
+    a vouched entry: tightening withdraws that authority, and rollback cannot safely
+    re-grant it. A later binding can vouch again from independently established
+    identity.
+    """
+    key = _live_key(session_key)
+    with _EXECUTION_LOCK:
+        if _LIVE_EXECUTIONS.get(key) != expected:
+            return False
+        if previous is None:
+            _LIVE_EXECUTIONS.pop(key, None)
+        else:
+            _LIVE_EXECUTIONS[key] = previous
+        return True
 
 
 @overload
@@ -520,22 +870,213 @@ def read_session_execution(session_key: str, *, required: bool = False) -> Execu
     if not readable:
         raise _unavailable("session record is unreadable")
     execution = execution_from_record(record, required=required)
-    if execution is None:
-        from kiro_crew.memory_stores import MissingExecutionIdentity
+    if execution is not None:
+        # The line's own ``memory_mode`` is the file's privacy contract and a
+        # ratchet every writer folds; the record carried beside it holds a mode
+        # of its own and can lag a tightening of the line (a hand-edited
+        # ``Incognito`` header on a member chat, a line ratcheted by a save that
+        # could not also rewrite the record). A reader that answers from the
+        # record alone would hand back the looser mode, so the line is folded in
+        # here, at the one seam every carrier-first reader and every binder goes
+        # through. ``with_mode`` only ever tightens.
+        return execution.with_mode(canonical_memory_mode(record.get("memory_mode")))
+    if record.get("member_id") or record.get("selection_kind") == "member":
+        raise _missing_identity(_OPEN_A_NEW_CHAT_REMEDY)
+    store = record.get("memory_store")
+    if store and store != "default":
+        from kiro_crew.memory_stores import memory_store_version
 
-        missing = MissingExecutionIdentity(
-            "Execution memory is unavailable: session has no canonical member identity; "
-            "Global was not used"
-        )
-        if record.get("member_id") or record.get("selection_kind") == "member":
-            raise missing
-        store = record.get("memory_store")
-        if store and store != "default":
-            from kiro_crew.memory_stores import memory_store_version
+        if memory_store_version(store) == 2:
+            backfilled = _backfill_legacy_member_record(session_key, record, store)
+            if backfilled is not None:
+                return backfilled
+            raise _missing_identity(_legacy_store_remedy(store))
+    return None
 
-            if memory_store_version(store) == 2:
-                raise missing
+
+_OPEN_A_NEW_CHAT_REMEDY = (
+    "open a new chat with the same member (its memory is intact) or archive this one"
+)
+
+
+def _missing_identity(remedy: str):
+    from kiro_crew.memory_stores import MissingExecutionIdentity
+
+    return MissingExecutionIdentity(
+        "Execution memory is unavailable: session has no canonical member identity "
+        f"(this chat predates 0.7.0.6 and lacks a member binding); {remedy}; "
+        "Global was not used"
+    )
+
+
+def _legacy_store_remedy(store: str) -> str:
+    """The step that actually works for a refused legacy record on *store*.
+
+    A store the start-of-process migration attributed has an owner, so a new chat
+    with that member resolves and the old chat's memory is reachable there. A
+    store it could NOT attribute has no owner at all: a new chat with the member
+    fails the same way this one does, so the remedy is the store repair the boot
+    log and ``kirocrew doctor`` already name -- after which the next read of this
+    very chat backfills it.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.memory_stores import LEGACY_MEMBER_STORE_REMEDY
+
+    declaration = KiroCrewConfig.load().memory_stores.get(store)
+    if getattr(declaration, "owner_member_id", ""):
+        return _OPEN_A_NEW_CHAT_REMEDY
+    return (
+        "its memory store has no attributed owner, so to repair it "
+        f"{LEGACY_MEMBER_STORE_REMEDY}, then restart and reopen this chat"
+    )
+
+
+class LegacyMemberAttributionRefused(ValueError):
+    """One attribution step of :func:`attribute_legacy_member` did not hold.
+
+    The message is the step's reason, phrased for no particular caller; each
+    subclass names the step so a caller can keep its own wording and remedy.
+    Failures raised by the resolvers the steps call (``UnknownMemoryStore``, a
+    slug error) are NOT wrapped: they propagate as they always did, so each
+    caller's handling of them is unchanged.
+    """
+
+
+class LegacyStoreHasNoOwner(LegacyMemberAttributionRefused):
+    """The store's declaration carries no ``owner_member_id``."""
+
+
+class LegacyStoreOwnerDeleted(LegacyMemberAttributionRefused):
+    """No configured member carries the store's ``owner_member_id``."""
+
+
+class LegacyOwnerNotNamed(LegacyMemberAttributionRefused):
+    """The record names neither the owner's alias nor its id."""
+
+
+class LegacyOwnerBoundElsewhere(LegacyMemberAttributionRefused):
+    """The owner resolves to a store other than the one the record names."""
+
+
+def attribute_legacy_member(
+    config: Any, store: str, named: str, *, memory_mode: str = "persistent", app: str = ""
+) -> ExecutionContext:
+    """Attribute a pre-identity record on V2 *store* that names *named* to the store's owner.
+
+    The ONE spelling of the attribution a 0.7.0.5 member record admits, shared
+    by the chat backfill (:func:`_backfill_legacy_member_record`) and the
+    schedule capture (``cron_service.identity.legacy_member_cron_execution``)
+    so the two cannot drift. Nothing here guesses a member: the store's declared
+    ``owner_member_id`` must be exactly one configured member
+    (:func:`member_config_for_id`), *named* must be that member's alias or id,
+    and the member must still resolve (:func:`resolve_member_execution`) to this
+    very store. Each step that does not hold raises its own
+    :class:`LegacyMemberAttributionRefused` subclass; what the resolvers raise
+    propagates unwrapped. The caller has already decided *store* is a declared
+    V2 store.
+    """
+    declaration = config.memory_stores.get(store)
+    owner_member_id = getattr(declaration, "owner_member_id", "")
+    if not isinstance(owner_member_id, str) or not owner_member_id:
+        raise LegacyStoreHasNoOwner("the memory store has no attributed owner")
+    if not any(
+        getattr(member, "member_id", "") == owner_member_id for member in config.agents.values()
+    ):
+        # The store outlives a deleted member on purpose (its id stays reserved).
+        raise LegacyStoreOwnerDeleted("the store's member was deleted")
+    alias, _ = member_config_for_id(config, owner_member_id)
+    if named not in (alias, owner_member_id):
+        raise LegacyOwnerNotNamed("the record does not name the store's owner")
+    execution = resolve_member_execution(config, alias, memory_mode=memory_mode, app=app)
+    if execution.store.store_id != store:
+        raise LegacyOwnerBoundElsewhere("the member is bound to another store")
     return execution
+
+
+def _backfill_legacy_member_record(
+    session_key: str, record: Mapping[str, Any], store: str
+) -> ExecutionContext | None:
+    """Derive and persist the carrier a pre-``execution_context`` member record lacks.
+
+    0.7.0.5 wrote a member chat as ``{agent, memory_store}``. The start-of-process
+    store migration (``migrate_legacy_member_stores``) gives the config and the V2
+    store their identity but never touches session records, so without this every
+    such chat is refused at the read above. This is the missing half of that
+    backfill, done once at first read: the derived carrier is written into the
+    record, and every later read decodes it like any other session.
+
+    Nothing here guesses a member. The derivation is admitted only when the
+    attribution is unambiguous and mirrors what the store migration itself
+    required -- the five steps of :func:`attribute_legacy_member`: the store is a
+    declared V2 store whose ``owner_member_id`` names exactly one configured
+    member (`member_config_for_id`), that member resolves to this store
+    (`resolve_member_execution`), and the record's own ``agent`` names that
+    member by alias or by id. The record's own ``app`` attribution is
+    carried into the carrier. A record with no ``agent``, an ``agent`` naming
+    anyone else, a template pick, a store the migration could not attribute, a
+    restricted mode or a malformed ``app`` is left untouched and the caller keeps
+    refusing. None of these conditions widens who may reach the store: they are
+    the same facts a fresh member selection resolves through.
+
+    The write is a compare-and-set against the exact legacy shape that was read,
+    not `bind_session_execution`, which would re-enter this read. The store came
+    from the session's own record, so the result is never vouched: the migrated
+    session is on the same footing as a member session after a restart and
+    re-establishes own-store authority the same way, by re-selecting its agent.
+    """
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.memory_stores import UnknownMemoryStore
+
+    agent = record.get("agent")
+    if not isinstance(agent, str) or not agent:
+        return None
+    # A name-only pick writes no ``agent_kind``; only an explicit template pick
+    # says this was never a member session.
+    if record.get("agent_kind") not in (None, "", "member"):
+        return None
+    mode = record.get("memory_mode", "persistent")
+    if mode != "persistent":
+        return None
+    # The record's own app attribution travels with the derived carrier. An
+    # app-owned member chat wrote ``app`` beside ``agent``, and ``/api/spawn`` reads
+    # app identity only from the carrier, where an empty value skips the per-app
+    # profile half of governance -- so dropping it here would widen what the
+    # migrated session may do, not merely mislabel it.
+    app = record.get("app", "")
+    if app is None:
+        app = ""
+    if not isinstance(app, str):
+        return None
+    try:
+        execution = attribute_legacy_member(
+            KiroCrewConfig.load(), store, agent, memory_mode=mode, app=app
+        )
+    except (LegacyMemberAttributionRefused, UnknownMemoryStore):
+        return None
+    committed = ConversationLog().update_metadata_if(
+        session_key,
+        {
+            EXECUTION_CONTEXT_KEY: execution.to_record(),
+            "memory_store": execution.store.legacy_name,
+            "memory_mode": execution.memory_mode,
+        },
+        lambda meta: EXECUTION_CONTEXT_KEY not in meta
+        and meta.get("memory_store") == store
+        and meta.get("agent") == agent
+        and (meta.get("app") or "") == app,
+    )
+    if committed:
+        logging.getLogger(__name__).info(
+            "Backfilled the member binding of session %r from its store's declared owner",
+            session_key,
+        )
+        return execution
+    # Another reader committed first: its record is the authority, not this derivation.
+    current, readable = ConversationLog().get_metadata_status(session_key)
+    if not readable:
+        raise _unavailable("session record is unreadable")
+    return execution_from_record(current, required=False)
 
 
 def capture_session_execution(session_key: str, *, template_id: str = "") -> ExecutionContext:
@@ -557,6 +1098,29 @@ def capture_session_execution(session_key: str, *, template_id: str = "") -> Exe
     if store and store != "default":
         return execution_for_store(store, memory_mode=mode, template_id=template_id)
     return ExecutionContext(None, MemoryStoreRef("default"), "template", template_id, mode)
+
+
+def _carrier_still(meta: Mapping[str, Any], expected: ExecutionContext | None) -> bool:
+    """Whether the carrier stored in *meta* still decodes to *expected*.
+
+    *expected* is a DECODED record, and the decoder re-reads a record bound to a
+    pruned synced crewmate as its template (:func:`adopt_removed_synced_crewmate`).
+    Its ``to_record()`` therefore differs from the bytes still on disk, and a
+    compare-and-set of one against the other refuses every such session as
+    concurrently changed. So the stored side is decoded the same way: two values
+    of one kind. Identical bytes are answered first, without the decode. A
+    stored carrier that does not decode, or decodes to anything else, is a
+    change.
+    """
+    payload = meta.get(EXECUTION_CONTEXT_KEY)
+    if expected is None:
+        return payload is None
+    if payload == expected.to_record():
+        return True
+    try:
+        return execution_from_record(meta) == expected
+    except ValueError:
+        return False
 
 
 def bind_session_execution(
@@ -586,6 +1150,11 @@ def bind_session_execution(
     Vouching does not withdraw an existing entry: a legitimate template switch
     republishes the store the owner already established, so leaving that entry keeps
     the capability while a forged store still disagrees with it.
+
+    The metadata line's canonical ``memory_mode`` is also a ratchet: when no
+    execution carrier exists, it is folded into the candidate before this function
+    chooses a publication branch. A persistent replacement of a restricted record
+    therefore takes the live-only restricted branch and writes no store identity.
     """
     from kiro_crew.history import ConversationLog
 
@@ -595,6 +1164,7 @@ def bind_session_execution(
     current = read_session_execution(session_key)
     if expected is not ... and current != expected:
         raise _unavailable("session changed during admission")
+    metadata: dict[str, Any] | None = None
     if current is not None:
         execution = execution.with_mode(current.memory_mode)
     if current is not None and not replace_existing:
@@ -605,10 +1175,20 @@ def bind_session_execution(
 
         update_execution_context(session_key.split(":", 1)[1], execution, expected=current)
         return
-    if execution.memory_mode != "persistent":
+    if current is None:
         metadata, readable = log.get_metadata_status(session_key)
         if not readable:
             raise _unavailable("session record is unreadable")
+        retained_mode = stricter_memory_mode(
+            canonical_memory_mode(metadata.get("memory_mode")), execution.memory_mode
+        )
+        if retained_mode != execution.memory_mode:
+            execution = execution.with_mode(retained_mode)
+    if execution.memory_mode != "persistent":
+        if metadata is None:
+            metadata, readable = log.get_metadata_status(session_key)
+            if not readable:
+                raise _unavailable("session record is unreadable")
         durable = execution_from_record(metadata, required=False)
         if durable is not None:
             # Only retained identity/mode metadata is tightened. Never write a
@@ -617,12 +1197,12 @@ def bind_session_execution(
             if retained != durable and not log.update_metadata_if(
                 session_key,
                 {EXECUTION_CONTEXT_KEY: retained.to_record(), "memory_mode": retained.memory_mode},
-                lambda meta: meta.get(EXECUTION_CONTEXT_KEY) == durable.to_record(),
+                lambda meta: _carrier_still(meta, durable),
             ):
                 raise _unavailable("session changed during privacy tightening")
         elif metadata:
             retained_mode = stricter_memory_mode(
-                metadata.get("memory_mode", "persistent"), execution.memory_mode
+                canonical_memory_mode(metadata.get("memory_mode")), execution.memory_mode
             )
             if not log.update_metadata_if(
                 session_key,
@@ -641,16 +1221,16 @@ def bind_session_execution(
             # persistent-era entry behind would leave this map disagreeing with
             # the record it exists to corroborate.
             _withdraw_vouched(_live_key(session_key))
+        from kiro_crew._durable_vouch import forget_durable_vouch
+
+        forget_durable_vouch(session_key)
         return
-    expected = current.to_record() if current is not None else None
     fields = {
         EXECUTION_CONTEXT_KEY: execution.to_record(),
         "memory_store": execution.store.legacy_name,
         "memory_mode": execution.memory_mode,
     }
-    if not log.update_metadata_if(
-        session_key, fields, lambda meta: meta.get(EXECUTION_CONTEXT_KEY) == expected
-    ):
+    if not log.update_metadata_if(session_key, fields, lambda meta: _carrier_still(meta, current)):
         raise _unavailable("session changed during admission")
     # Vouch for what was just committed, AFTER the compare-and-set above, so this
     # process never vouches for an identity the durable record does not carry.
@@ -669,6 +1249,23 @@ def bind_session_execution(
     if vouch and execution.member_id:
         with _EXECUTION_LOCK:
             _vouch(_live_key(session_key), execution)
+            held = _VOUCHED_EXECUTIONS.get(_live_key(session_key)) == execution
+        if held:
+            # The restart-surviving copy, written only when the in-memory vouch
+            # took, so the two never disagree about what was committed.
+            from kiro_crew._durable_vouch import record_durable_vouch
+
+            record = execution.to_record()
+            record_durable_vouch(session_key, record)
+            # The write ran outside the lock, so a withdrawal may have landed
+            # between the vouch and the file (its forget then found nothing to
+            # remove). Re-check and take the file back if the vouch is gone.
+            with _EXECUTION_LOCK:
+                still_held = _VOUCHED_EXECUTIONS.get(_live_key(session_key)) == execution
+            if not still_held:
+                from kiro_crew._durable_vouch import forget_durable_vouch
+
+                forget_durable_vouch(session_key, only_if=record)
     # A member-less execution is NOT vouched even when the caller asks. The own-store
     # admission identifies the caller by ``member_id`` and refuses before the store
     # question when there is none, so such an entry could never be admitted -- it
@@ -680,6 +1277,12 @@ def bind_session_execution(
 
 def restore_live_session_execution(session_key: str, prior, published) -> bool:
     """CAS rollback a restricted admission; False means use the durable owner."""
+    from kiro_crew._durable_vouch import forget_durable_vouch
+
+    # Same compare-and-set as the in-memory withdrawal below, and for the same
+    # reason: a restart-surviving copy of an abandoned vouch would let the
+    # gate-verified re-vouch restore it.
+    forget_durable_vouch(session_key, only_if=published)
     with _EXECUTION_LOCK:
         key = _live_key(session_key)
         # The vouched entry rolls back on its OWN terms, before and regardless of

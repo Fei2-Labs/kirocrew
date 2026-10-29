@@ -6,6 +6,9 @@ event-loop + best-effort fallback logic is exercised without a real provider.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +18,8 @@ from chat_test_helpers import move_transcript_past
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.dashboard.handlers import api_sessions_summarize
-from kiro_crew.history import ConversationLog
+from kiro_crew.dashboard.handlers import sessions as sessions_handlers
+from kiro_crew.history import ConversationLog, HistoryLockTimeout, TranscriptBusy
 
 
 class _FakeBgSession:
@@ -28,7 +32,7 @@ class _FakeBgSession:
     async def set_model(self, model):  # noqa: D401 — best-effort no-op
         return None
 
-    async def prompt(self, _prompt):
+    async def prompt(self, _prompt, *, allow_image=True):
         yield SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=self._reply)
         yield SimpleNamespace(kind=EVENT_COMPLETE, text="")
 
@@ -40,7 +44,7 @@ class _FakeBgSession:
 
 
 def _make_app(log: ConversationLog, reply: str, created: list) -> web.Application:
-    async def _get_bg_session():
+    async def _get_bg_session(start_priority=None):
         s = _FakeBgSession(reply)
         created.append(s)
         return s
@@ -158,3 +162,196 @@ class TestSessionsSummarizeHandler:
         assert session_path.stat().st_mtime == before_mtime
         # The summary was cached in a sidecar and is reusable.
         assert log.get_cached_summary("alpha") == "Tuning redis timeout"
+
+    @pytest.mark.asyncio
+    async def test_restricted_line_never_serves_a_cached_summary(self, tmp_path):
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "private topic")
+        sig = log.session_mtime("alpha")
+        assert sig is not None
+        log.set_cached_summary("alpha", "Private cached summary", sig)
+        log.update_metadata("alpha", {"memory_mode": "incognito"})
+        created: list = []
+
+        async with TestClient(TestServer(_make_app(log, "unused", created))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert resp.status == 200
+            assert (await resp.json())["summaries"] == {}
+
+        assert created == []
+
+    @pytest.mark.asyncio
+    async def test_lock_timeout_while_reading_cache_returns_empty(self, tmp_path, monkeypatch):
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "private topic")
+        created: list = []
+        state = _make_app(log, "unused", created)["state"]
+
+        @contextlib.contextmanager
+        def _timeout(self, stems):
+            raise HistoryLockTimeout("summary cache read lock held")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(type(log), "locked_stems", _timeout)
+        assert await sessions_handlers._summarize_one(state, "alpha") == ""
+        assert created == []
+
+    @pytest.mark.asyncio
+    async def test_lock_timeout_while_publishing_withholds_summary_and_cache(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Contention at publication withholds the unverifiable summary and cache."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "private topic")
+        created: list = []
+        state = _make_app(log, "Private derived summary", created)["state"]
+        real_locked_stems = type(log).locked_stems
+        calls = {"n": 0}
+
+        @contextlib.contextmanager
+        def _timeout_on_publish(self, stems):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise HistoryLockTimeout("summary publication lock held")
+            with real_locked_stems(self, stems):
+                yield
+
+        monkeypatch.setattr(type(log), "locked_stems", _timeout_on_publish)
+        with caplog.at_level(logging.DEBUG, logger=sessions_handlers.__name__):
+            assert await sessions_handlers._summarize_one(state, "alpha") == ""
+        assert calls["n"] == 3
+        assert created and created[0].destroyed
+        assert not log._summary_cache_path("alpha").exists()
+        assert (
+            "Summary for alpha withheld: the transcript lock was busy at publication" in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_busy_publish_uses_the_busy_arm_and_fails_closed(self, tmp_path, monkeypatch):
+        """Busy and Withheld use distinct arms but both fail closed."""
+
+        @contextlib.contextmanager
+        def _busy(self, key):
+            raise TranscriptBusy("held elsewhere")
+            yield  # pragma: no cover
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "private topic")
+        state = _make_app(log, "Private derived summary", [])["state"]
+        monkeypatch.setattr(type(log), "publication_hold", _busy)
+        assert await sessions_handlers._summarize_one(state, "alpha") == ""
+        assert not log._summary_cache_path("alpha").exists()
+
+    @pytest.mark.asyncio
+    async def test_line_tightening_during_model_call_discards_summary(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "private topic")
+        cache_path = log._summary_cache_path("alpha")
+        model_called: list[str] = []
+
+        async def tighten_then_reply(*_args, **_kwargs):
+            model_called.append("yes")
+            await asyncio.to_thread(log.update_metadata, "alpha", {"memory_mode": "incognito"})
+            return "Private derived summary"
+
+        monkeypatch.setattr(sessions_handlers, "run_bg_oneliner", tighten_then_reply)
+        with caplog.at_level(logging.DEBUG, logger=sessions_handlers.__name__):
+            async with TestClient(TestServer(_make_app(log, "unused", []))) as c:
+                resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+                assert resp.status == 200
+                assert (await resp.json())["summaries"] == {}
+
+        assert model_called == ["yes"]
+        assert not cache_path.exists()
+        assert (
+            "Discarding summary for alpha: the transcript became restricted during "
+            "summarisation" in caplog.text
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "I cannot summarize this conversation without more context",
+            "Sorry, the transcript does not contain enough information",
+            "As an AI, I do not have access to the linked document",
+            "SKIP, the topic is unclear",
+            "SKIP - only a greeting so far",
+            "SKIP\n\nThe topic is unclear.",
+            "The conversation is too vague to summarize",
+            "This conversation does not contain enough information",
+            "Based on the transcript, I cannot determine a topic",
+        ],
+    )
+    async def test_a_refusal_or_verdict_reason_is_not_served_or_cached(self, tmp_path, reply):
+        """An exact ``summary.upper() == "SKIP"`` test lets a refusal sentence
+        (or ``SKIP, <reason>``) through to the sidecar cache, where it is served
+        on every later list until the transcript changes. Neither may be
+        returned NOR cached. Mutation:
+        drop the ``looks_like_prose`` branch / restore the exact-equality test
+        -- red on the response AND on the cache read."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        created: list = []
+        async with TestClient(TestServer(_make_app(log, reply, created))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert resp.status == 200
+            assert (await resp.json())["summaries"] == {}
+        assert created, "the model was consulted"
+        assert not log.get_cached_summary("alpha")
+
+    @pytest.mark.asyncio
+    async def test_only_the_first_line_of_a_multi_line_reply_is_the_summary(self, tmp_path):
+        """The prompt asks for ONE line; an unasked-for explanation after it is
+        not part of the summary. Mutation: keep the whole reply -- red."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        reply = "Tuning the redis client timeout\n\nThe user also mentioned retries."
+        async with TestClient(TestServer(_make_app(log, reply, []))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert (await resp.json())["summaries"]["alpha"] == "Tuning the redis client timeout"
+
+    @pytest.mark.asyncio
+    async def test_a_legitimate_long_summary_is_still_stored(self, tmp_path):
+        """The summary contract is 18 words, three times the title's, so the
+        title's 12-word ceiling must NOT apply here. Mutation: call the guard
+        with its title defaults -- red."""
+        reply = (
+            "User and assistant tune the redis client timeout, add retry with "
+            "backoff and verify against staging"
+        )
+        assert 12 < len(reply.split()) <= 18
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        async with TestClient(TestServer(_make_app(log, reply, []))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert (await resp.json())["summaries"]["alpha"] == reply
+        assert log.get_cached_summary("alpha") == reply
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "The conversation covers tuning the redis client timeout",
+            "This conversation is about a Tailwind v4 migration",
+            "Based on the transcript, user and assistant debug a flaky login test",
+            "User tunes the redis timeout. Assistant adds retry with backoff",
+            "\uc0ac\uc6a9\uc790\uac00 redis \ud0c0\uc784\uc544\uc6c3\uc744 \uc870\uc815\ud569\ub2c8\ub2e4",
+        ],
+    )
+    async def test_a_summary_shaped_reply_is_stored_and_cached(self, tmp_path, reply):
+        """A summary DESCRIBES the conversation, so the title guard's narration
+        openers, mid-line terminator and Korean polite ending are its legitimate
+        shape here. Rejecting one loses the summary AND re-asks the model on
+        every later list, because "" is never cached. The exemption is for the
+        affirmative shape only: a refusal opening the same way is still
+        rejected (see the refusal rows above). Mutation: pass the title
+        defaults for ``openers`` / ``sentence_shape`` -- red."""
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("alpha", "user", "help me tune the redis timeout")
+        async with TestClient(TestServer(_make_app(log, reply, []))) as c:
+            resp = await c.post("/api/sessions/summarize", json={"keys": ["alpha"]})
+            assert (await resp.json())["summaries"]["alpha"] == reply
+        assert log.get_cached_summary("alpha") == reply

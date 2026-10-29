@@ -82,9 +82,8 @@ async function openChat(page: Page, baseURL: string) {
             download: { stage: 'idle', artifact: '', downloaded_bytes: 0, total_bytes: 0,
               error_code: '', error_detail: '' } } })
       } else if (path === '/api/voice/config') {
-        await json(route, { enabled: true, autoSpeak: true, provider: 'piper',
+        await json(route, { enabled: true, autoSpeak: true, provider: 'system',
           voice: 'Ruth', engine: 'generative', rate: '100%', aws_profile: '', region: '',
-          piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1,
           system_voice: '' })
       } else if (path === '/api/tips/status') {
         await json(route, { enabled: false })
@@ -163,8 +162,9 @@ for (const touch of [false, true]) {
       if (touch) await more.tap(); else await more.click()
       await expect(page.getByTestId('speak-message')).toHaveText(label('pages.chat.assistantMessage.speak'))
       await expect(page.getByTestId('speak-message')).toHaveAttribute('aria-description', label('pages.chat.assistantMessage.speak_message'))
-      await expect(page.getByTestId('copy-message-menu-item')).toHaveText(label('pages.chat.assistantMessage.copy_text'))
-      await expect(page.getByTestId('copy-message-menu-item')).toBeVisible()
+      // Copy stays a row button beside More (it is never inside the menu while Quote is offered).
+      await expect(more.locator('..').getByRole('button', { name: label('pages.chat.assistantMessage.copy'), exact: true })).toBeVisible()
+      await expect(page.getByTestId('copy-message-menu-item')).toHaveCount(0)
       await expect(composer).toHaveValue(draft)
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
       await capture('copy-menu-open', touch)
@@ -187,7 +187,7 @@ test('failed playback links to and highlights the text-to-speech provider', asyn
   await settings.click()
   const provider = page.locator('[data-setting-id="voice.provider-2"]')
   await expect(provider).toBeVisible()
-  await expect(provider).toContainText(label('pages.settings.voicePanel.piper_local_offline'))
+  await expect(provider).toContainText(label('pages.settings.voicePanel.system_built_in'))
   // The URL is cleared after highlighting; observing the target proves arrival.
   await expect(provider).toHaveCSS('outline-style', 'solid')
   await expect(provider).toHaveCSS('outline-width', '2px')

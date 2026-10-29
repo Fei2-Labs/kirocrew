@@ -20,6 +20,10 @@
 import { useEffect, useState, useMemo } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+// By path, not from the app-sdk barrel: that barrel is published to third-party
+// apps through the vendor stub, and a host-namespaced cache client is not part
+// of that contract.
+import { useAppQuery, useAppQueryKey } from '../../app-sdk/appQuery'
 import {
   Cloud, RefreshCw, ChevronDown, ChevronRight, ChevronsUpDown, Check,
   FolderClosed, Library, Archive, Share2, Users, Wallet, MoreHorizontal, Trash2,
@@ -264,14 +268,15 @@ function AccountRow({ account, current, onUse, askAgent, variant = 'pane' }: {
   const [showReconnect, setShowReconnect] = useState(false)
   const [confirming, setConfirming] = useState(false)
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const removeM = useMutation({
     mutationFn: () => awsControlApi.unregisterProfiles(account.profiles.map((p) => p.name)),
     onSuccess: () => {
       setConfirming(false)
       // The accounts list and the Add-accounts disclosure are two views of one
       // registry, and a withdrawn grant must leave the usage receipts too.
-      void qc.invalidateQueries({ queryKey: ['aws-control', 'accounts'] })
-      void qc.invalidateQueries({ queryKey: ['aws-control', 'profiles-available'] })
+      void qc.invalidateQueries({ queryKey: appKey(['accounts']) })
+      void qc.invalidateQueries({ queryKey: appKey(['profiles-available']) })
       void qc.invalidateQueries({ queryKey: ['awsConsent'] })
     },
   })
@@ -475,6 +480,7 @@ function AddAccounts({ onDraftChange, autoOpen = false }: {
   autoOpen?: boolean
 }) {
   const queryClient = useQueryClient()
+  const appKey = useAppQueryKey()
   const [open, setOpen] = useState(autoOpen)
   // The list arrives after mount, so the empty-list signal can flip from
   // false to true later; open on that edge only, never force closed — a reader
@@ -497,10 +503,10 @@ function AddAccounts({ onDraftChange, autoOpen = false }: {
   const registerM = useMutation({
     mutationFn: (names: string[]) => awsControlApi.registerProfiles(names),
     onSuccess: () => {
-      // The account list is keyed ['aws-control','accounts']; invalidating it is
-      // what makes the just-registered profile show up without a manual refresh.
-      queryClient.invalidateQueries({ queryKey: ['aws-control', 'accounts'] })
-      queryClient.invalidateQueries({ queryKey: ['aws-control', 'profiles-available'] })
+      // Invalidating the account list is what makes the just-registered profile
+      // show up without a manual refresh.
+      queryClient.invalidateQueries({ queryKey: appKey(['accounts']) })
+      queryClient.invalidateQueries({ queryKey: appKey(['profiles-available']) })
       setChecked(new Set())
     },
   })
@@ -939,6 +945,7 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
   onAddAccount: () => void
 }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const id = selected.account
   const data = accountsQ.data
   const accounts = data?.accounts ?? []
@@ -956,22 +963,23 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
   const driveNeedsConsent = driveErr?.status === 409 && driveErr.message === 'aws_consent_required'
   const driveFailed = driveQ.isError && !driveNeedsConsent
 
-  const costsQ = useQuery({
-    queryKey: ['aws-control', 'costs', id],
+  const costsQ = useAppQuery(['costs', id], {
     queryFn: () => awsControlApi.costs(id),
     // A dead bill read (CE not enabled, throttled) should settle to the quiet
     // em-dash in seconds, not skeleton through three backoffs. Same as the
     // usage pane, which shares this cache entry.
     retry: 1,
   })
-  const backupQ = useQuery({
+  const backupQ = useAppQuery(
     // Same key the Backup pane uses with its remote list CLOSED, so the two
     // share one cache entry rather than each paying for its own read.
-    queryKey: ['aws-control', 'backup', id, false],
-    queryFn: () => awsControlApi.backup(id, { remote: false }),
-    // Nothing to schedule before the bucket exists, and the request would 409.
-    enabled: Boolean(live),
-  })
+    ['backup', id, false],
+    {
+      queryFn: () => awsControlApi.backup(id, { remote: false }),
+      // Nothing to schedule before the bucket exists, and the request would 409.
+      enabled: Boolean(live),
+    },
+  )
 
   const costs = costsQ.data
   // A consent-required 409 from the bill read is the reader's pending decision
@@ -1010,10 +1018,10 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
   /** Everything this pane reads, re-read at once. */
   const refreshAll = () => {
     void accountsQ.refetch()
-    void qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })
-    void qc.invalidateQueries({ queryKey: ['aws-control', 'costs', id] })
-    void qc.invalidateQueries({ queryKey: ['aws-control', 'shares', id] })
-    void qc.invalidateQueries({ queryKey: ['aws-control', 'backup', id] })
+    void qc.invalidateQueries({ queryKey: appKey(['drive', id]) })
+    void qc.invalidateQueries({ queryKey: appKey(['costs', id]) })
+    void qc.invalidateQueries({ queryKey: appKey(['shares', id]) })
+    void qc.invalidateQueries({ queryKey: appKey(['backup', id]) })
   }
 
   return (
@@ -1136,21 +1144,21 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
             : costsStale
               ? i18nT('apps.awsControl.console.costs_refresh_failed')
               : null}
-          onRetry={() => qc.invalidateQueries({ queryKey: ['aws-control', 'costs', id] })}
+          onRetry={() => qc.invalidateQueries({ queryKey: appKey(['costs', id]) })}
           testId="overview-costs-error"
         />
         <AwsErrorNotice
           askAgent
           error={sharesQ.error}
           message={sharesQ.isError ? i18nT('apps.awsControl.console.access_list_failed') : null}
-          onRetry={() => qc.invalidateQueries({ queryKey: ['aws-control', 'shares', id] })}
+          onRetry={() => qc.invalidateQueries({ queryKey: appKey(['shares', id]) })}
           testId="overview-shares-error"
         />
         <AwsErrorNotice
           askAgent
           error={backupQ.error}
           message={backupQ.isError ? i18nT('apps.awsControl.console.backup_status_failed') : null}
-          onRetry={() => qc.invalidateQueries({ queryKey: ['aws-control', 'backup', id] })}
+          onRetry={() => qc.invalidateQueries({ queryKey: appKey(['backup', id]) })}
           testId="overview-backup-error"
         />
       </div>
@@ -1240,7 +1248,7 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
               message={i18nT(driveErr?.status === 409
                 ? 'apps.awsControl.console.account_unavailable'
                 : 'apps.awsControl.console.drive_status_failed')}
-              onRetry={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })}
+              onRetry={() => qc.invalidateQueries({ queryKey: appKey(['drive', id]) })}
               testId="overview-drive-error"
               className="mx-1"
             />
@@ -1281,13 +1289,13 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
             service="s3"
             compact
             askAgent
-            onConsentChange={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })}
+            onConsentChange={() => qc.invalidateQueries({ queryKey: appKey(['drive', id]) })}
           />
           <AwsConsentGate
             service="ce"
             compact
             askAgent
-            onConsentChange={() => qc.invalidateQueries({ queryKey: ['aws-control', 'costs', id] })}
+            onConsentChange={() => qc.invalidateQueries({ queryKey: appKey(['costs', id]) })}
           />
         </div>
       </Card>
@@ -1299,8 +1307,7 @@ function OverviewPane({ accountsQ, selected, drive, driveQ, sharesQ, onUse, onOp
 
 /** The accounts query, named so `AccountsPane` can type its prop off it. */
 function useAccountsQuery() {
-  return useQuery({
-    queryKey: ['aws-control', 'accounts'],
+  return useAppQuery(['accounts'], {
     queryFn: () => awsControlApi.accounts(),
   })
 }
@@ -1317,8 +1324,7 @@ function useAccountsQuery() {
  * no request.
  */
 function useAvailableProfilesQuery() {
-  return useQuery({
-    queryKey: ['aws-control', 'profiles-available'],
+  return useAppQuery(['profiles-available'], {
     queryFn: () => awsControlApi.availableProfiles(),
   })
 }
@@ -1339,6 +1345,7 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
   children: (bucket: string) => React.ReactNode
 }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const id = account.account
   const Icon = PANE_ICON[pane]
   const driveErr = driveQ.error instanceof AwsControlError ? driveQ.error : null
@@ -1365,10 +1372,10 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
             <AwsConsentGate
               askAgent
               service="s3"
-              onConsentChange={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })}
+              onConsentChange={() => qc.invalidateQueries({ queryKey: appKey(['drive', id]) })}
             />
             <div className="mt-2">
-              <Btn onClick={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })} data-testid="console-consent-recheck">
+              <Btn onClick={() => qc.invalidateQueries({ queryKey: appKey(['drive', id]) })} data-testid="console-consent-recheck">
                 <RefreshCw size={13} />{i18nT('apps.awsControl.page.refresh')}
               </Btn>
             </div>
@@ -1389,7 +1396,7 @@ function DrivePaneGate({ pane, account, drive, driveQ, children }: {
         askAgent
         error={driveQ.error}
         message={driveQ.isError && !drive409 ? i18nT('apps.awsControl.console.drive_status_failed') : null}
-        onRetry={() => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })}
+        onRetry={() => qc.invalidateQueries({ queryKey: appKey(['drive', id]) })}
         testId="drive-status-error"
       />
       {/* No bucket yet, so the pane carries the one action that changes that. */}
@@ -1486,16 +1493,14 @@ export default function AwsControlPage() {
   const selected = resolved.find((a) => a.account === storedId) ?? resolved[0] ?? null
   const id = selected?.account ?? ''
 
-  const driveQ = useQuery({
-    queryKey: ['aws-control', 'drive', id],
+  const driveQ = useAppQuery(['drive', id], {
     queryFn: () => awsControlApi.drive(id),
     enabled: Boolean(id),
   })
   const drive = driveQ.data
   // The share ledger's own query key, shared with `AccessSection`, so the rail
   // count and the pane listing can never disagree.
-  const sharesQ = useQuery({
-    queryKey: ['aws-control', 'shares', id],
+  const sharesQ = useAppQuery(['shares', id], {
     queryFn: () => awsControlApi.shares(id),
     enabled: Boolean(id),
   })

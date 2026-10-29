@@ -12,12 +12,18 @@ Focused on the guarantees a transport depends on:
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import importlib.util
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+from source_corpus import parsed_candidates
 
+from conftest import requires_symlinks
 from kiro_crew import image_artifacts
 from kiro_crew.messaging.outbound_files import (
     REASON_MISSING,
@@ -29,9 +35,12 @@ from kiro_crew.messaging.outbound_files import (
     REASON_SENSITIVE,
     REASON_SYMLINK,
     REASON_UNREADABLE,
+    ApprovedRoot,
     ExtractLimits,
     OutboundFile,
     Rejection,
+    approved_roots,
+    containing_root,
     extract_local_refs,
     extract_local_refs_off_loop,
     is_remote_destination,
@@ -42,6 +51,7 @@ from kiro_crew.messaging.outbound_files import (
     strip_url_syntax,
     unescape_md,
 )
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.messaging.split import iter_fence_spans
 
 _PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -398,19 +408,27 @@ class TestOutboundSecurity:
         assert result.rewritten_text == text
         assert result.rejections[0].reason == REASON_SENSITIVE
 
-    @pytest.mark.parametrize("scanner", ["redact_credentials", "redact_exfiltration_urls"])
-    def test_a_payload_scanner_failure_rejects_the_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner: str
+    def test_a_payload_scan_failure_rejects_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A scan that cannot answer refuses, and refuses without raising.
+
+        Both halves matter and they pull in opposite directions. Fail-closed is
+        why the answer is a rejection: bytes whose safety is unknown stay on the
+        host. Not raising is the other half of the contract -- ``extract_local_refs``
+        must return even when nothing about an attachment can be decided, so the
+        reply still goes out carrying the markup instead of dying with it. A
+        composed host whose credential policy fails to load arrives here.
+        """
         from kiro_crew.messaging import outbound_files as module
 
         p = _png(tmp_path)
         text = f"![x]({p})"
 
-        def fail(_text: str) -> tuple[str, list[str]]:
+        def fail(_raw: bytes) -> bool:
             raise RuntimeError("scanner unavailable")
 
-        monkeypatch.setattr(module, scanner, fail, raising=False)
+        monkeypatch.setattr(module, "binary_content_is_flagged", fail, raising=True)
         result = extract_local_refs(text)
 
         assert result.files == []
@@ -858,6 +876,174 @@ class TestOffLoop:
         assert len(result.rejections) == 1
 
 
+#: What a linked ANCESTOR under an admitted root, aimed at a LOCAL directory
+#: outside it, is refused as. Windows rewrites a local linked prefix to its
+#: target (``screen_windows_linked_ancestors``) and POSIX resolves through it;
+#: on both the descriptor-pinned read then finds the bytes outside the root and
+#: answers ``REASON_UNREADABLE``. Either way the bytes stay on the host.
+_LINKED_ANCESTOR_REASON = REASON_UNREADABLE
+
+
+class TestBrowserSnapshotRoot:
+    """The browser CLI's output directory is an approved root beside the cwd.
+
+    ``playwright-cli`` is forced to write under the data home
+    (``snapshot_dir()``), never under a working directory, so without this
+    second root no screenshot the agent just took could ever travel inline.
+    The root is narrow: the directory itself, lexically, with the read pinned to
+    its canonical spelling -- its parent, its siblings, anything reached through
+    a link, and the directory itself once it is a link, all stay refused.
+    """
+
+    @pytest.fixture
+    def roots(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        from kiro_crew.browser_cli.snapshots import snapshot_dir
+
+        snap = snapshot_dir()
+        snap.mkdir(parents=True, exist_ok=True)
+        return cwd, snap
+
+    def test_the_browser_root_is_listed_after_the_authorized_cwd(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        cwd, snap = roots
+        first, second = approved_roots(str(cwd))
+        assert first == ApprovedRoot(lexical=str(cwd), read_root=str(cwd))
+        assert second.lexical == str(snap)
+        assert second.read_root_is_canonical is True
+
+    def test_the_browser_roots_read_pin_resolves_the_home_but_not_the_leaf(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        """The data home may be reached through an alias; the leaf is literal."""
+        cwd, snap = roots
+        _, browser = approved_roots(str(cwd))
+        assert browser.read_root == os.path.join(os.path.realpath(snap.parent), snap.name)
+        assert Path(browser.read_root).name == snap.name
+
+    def test_no_authorized_cwd_means_no_roots_at_all(self, roots: tuple[Path, Path]) -> None:
+        """The browser root never stands in for an authorization that was withheld."""
+        _, snap = roots
+        assert approved_roots("") == ()
+        assert containing_root(snap / "page-2026-10-13T07-00-00-000Z.png", "") is None
+
+    def test_a_screenshot_in_the_browser_root_is_uploaded(self, roots: tuple[Path, Path]) -> None:
+        cwd, snap = roots
+        shot = _png(snap, "page-2026-10-13T07-00-00-000Z.png")
+        result = extract_local_refs(f"![shot]({shot})", within_root=str(cwd))
+        assert result.rejections == []
+        assert [f.path for f in result.files] == [str(shot)]
+        assert result.files[0].data == _PNG
+
+    def test_the_cwd_still_wins_for_its_own_files(self, roots: tuple[Path, Path]) -> None:
+        cwd, _ = roots
+        shot = _png(cwd, "chart.png")
+        admitted = containing_root(shot, str(cwd))
+        assert admitted is not None and admitted.lexical == str(cwd)
+        assert admitted.read_root_is_canonical is False
+        result = extract_local_refs(f"![x]({shot})", within_root=str(cwd))
+        assert [f.path for f in result.files] == [str(shot)]
+
+    def test_the_browser_roots_parent_is_still_refused(self, roots: tuple[Path, Path]) -> None:
+        """The data home around the snapshot directory holds config and tokens."""
+        cwd, snap = roots
+        outside = _png(snap.parent, "config.png")
+        result = extract_local_refs(f"![x]({outside})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == REASON_SENSITIVE
+        assert "outside the approved workspace" in str(result.rejections[0])
+
+    def test_a_sibling_of_the_browser_root_is_still_refused(self, roots: tuple[Path, Path]) -> None:
+        cwd, snap = roots
+        sibling = _png(snap.parent / "playwright-snapshots-2", "page.png")
+        assert containing_root(sibling, str(cwd)) is None
+        result = extract_local_refs(f"![x]({sibling})", within_root=str(cwd))
+        assert result.files == [] and result.rejections[0].reason == REASON_SENSITIVE
+
+    def test_a_traversal_spelled_through_the_browser_root_is_refused(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        """``..`` is collapsed before comparison, so the spelling buys nothing."""
+        cwd, snap = roots
+        outside = _png(snap.parent, "config.png")
+        spelled = snap / ".." / outside.name
+        assert containing_root(spelled, str(cwd)) is None
+        result = extract_local_refs(f"![x]({spelled})", within_root=str(cwd))
+        assert result.files == [] and result.rejections[0].reason == REASON_SENSITIVE
+
+    @requires_symlinks
+    def test_a_symlink_inside_the_browser_root_is_refused(
+        self, roots: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """A leaf link under the admitted root is refused, not resolved."""
+        cwd, snap = roots
+        real = _png(tmp_path / "elsewhere", "secret.png")
+        link = snap / "page-2026-10-13T07-00-00-000Z.png"
+        link.symlink_to(real)
+        result = extract_local_refs(f"![x]({link})", within_root=str(cwd))
+        assert result.files == [] and result.rejections[0].reason == REASON_SYMLINK
+
+    @requires_symlinks
+    def test_a_linked_ancestor_inside_the_browser_root_cannot_escape_it(
+        self, roots: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """The read is pinned to the browser root, so the descriptor must sit in it."""
+        cwd, snap = roots
+        real = _png(tmp_path / "elsewhere", "secret.png")
+        (snap / "alias").symlink_to(real.parent, target_is_directory=True)
+        through = snap / "alias" / real.name
+        # Lexically inside the admitted root: this is exactly the case the
+        # descriptor recheck exists for.
+        admitted = containing_root(through, str(cwd))
+        assert admitted is not None and admitted.lexical == str(snap)
+        result = extract_local_refs(f"![x]({through})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == _LINKED_ANCESTOR_REASON
+
+    @requires_symlinks
+    def test_a_linked_snapshot_directory_does_not_move_the_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The snapshot directory itself as a link admits nothing.
+
+        The lexical check admits the spelled path -- that is the spelling the
+        agent was handed -- but the read is pinned to the canonical spelling with
+        the leaf kept literal, so the opened descriptor resolves outside it.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(home))
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        from kiro_crew.browser_cli.snapshots import snapshot_dir
+
+        snap = snapshot_dir()
+        elsewhere = tmp_path / "elsewhere"
+        shot = _png(elsewhere, "page-2026-10-13T07-00-00-000Z.png")
+        snap.symlink_to(elsewhere, target_is_directory=True)
+        spelled = snap / shot.name
+        admitted = containing_root(spelled, str(cwd))
+        assert admitted is not None and admitted.lexical == str(snap)
+        result = extract_local_refs(f"![x]({spelled})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == _LINKED_ANCESTOR_REASON
+
+    @pytest.mark.asyncio
+    async def test_the_async_form_admits_the_browser_root_too(
+        self, roots: tuple[Path, Path]
+    ) -> None:
+        """Every channel renderer reaches extraction through the off-loop form."""
+        cwd, snap = roots
+        shot = _png(snap, "page-2026-10-13T07-00-00-000Z.png")
+        result = await extract_local_refs_off_loop(f"![shot]({shot})", within_root=str(cwd))
+        assert [f.path for f in result.files] == [str(shot)]
+
+
 class TestOutboundFile:
     def test_it_is_immutable(self, tmp_path: Path) -> None:
         """A transport must not be able to retarget a validated path."""
@@ -892,7 +1078,7 @@ class TestLinkedAncestorGate:
 
         p = _png(tmp_path)
         self._windows(monkeypatch)
-        monkeypatch.setattr(module, "first_linked_ancestor", lambda _p: str(tmp_path))
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", lambda _p: None)
 
         def _boom_lstat(self: Path) -> bool:  # pragma: no cover
             raise AssertionError("is_symlink ran before the ancestor walk")
@@ -919,7 +1105,7 @@ class TestLinkedAncestorGate:
 
         p = _png(tmp_path)
         self._windows(monkeypatch)
-        monkeypatch.setattr(module, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", Path)
         got = module._inspect(str(p), p, "alt", 10_000, None, None)
         assert isinstance(got, OutboundFile)
         assert got.path == str(p)
@@ -937,7 +1123,7 @@ class TestLinkedAncestorGate:
         def _boom(_p: object) -> None:  # pragma: no cover
             raise AssertionError("ancestor walk ran on POSIX")
 
-        monkeypatch.setattr(module, "first_linked_ancestor", _boom)
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", _boom)
         p = _png(tmp_path)
         got = module._inspect(str(p), p, "alt", 10_000, None, None)
         assert isinstance(got, OutboundFile)
@@ -973,7 +1159,7 @@ class TestLinkedAncestorGate:
 
         p = _png(tmp_path)
         self._windows(monkeypatch)
-        monkeypatch.setattr(module, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(module, "screen_windows_linked_ancestors", Path)
         monkeypatch.setattr(module, "is_link_or_junction", lambda _p: True)
 
         def _boom_sensitive(_p: str) -> bool:  # pragma: no cover
@@ -984,3 +1170,463 @@ class TestLinkedAncestorGate:
         assert isinstance(got, Rejection)
         assert got.reason == REASON_SYMLINK
         assert got.detail == "symlinks are not uploaded"
+
+    def test_the_probes_run_on_the_screened_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An admitted linked prefix is rewritten: every check and the read use
+        the REWRITTEN path (the linked one is never created, so only it can
+        supply the bytes), and the result keeps the caller's spelling as
+        provenance."""
+        from kiro_crew.messaging import outbound_files as module
+
+        real = _png(tmp_path / "target")
+        linked = tmp_path / "Tasks" / real.name
+        self._windows(monkeypatch)
+        monkeypatch.setattr(
+            module,
+            "screen_windows_linked_ancestors",
+            lambda p: real if Path(p) == linked else None,
+        )
+        got = module._inspect(str(linked), linked, "alt", 10_000, None, None)
+        assert isinstance(got, OutboundFile)
+        assert got.path == str(linked)
+        assert got.data == real.read_bytes()
+
+    def test_an_ancestor_link_aimed_at_unc_is_refused_before_any_resolving_call(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The real shared screen, with only the link metadata stubbed: an
+        ancestor whose reparse target is a UNC share is refused before the
+        sensitive-path check or the leaf lstat could follow it."""
+        from kiro_crew import platform_compat
+        from kiro_crew.messaging import outbound_files as module
+
+        linked = tmp_path / "Tasks"
+        leaf = linked / "shot.png"
+        self._windows(monkeypatch)
+        monkeypatch.setattr(
+            platform_compat,
+            "first_linked_ancestor",
+            lambda p: str(linked) if Path(p) == leaf else None,
+        )
+        monkeypatch.setattr(os, "readlink", lambda _p: r"\\evil-host\share")
+
+        def _boom_lstat(self: Path) -> bool:  # pragma: no cover
+            raise AssertionError("is_symlink ran before the ancestor screen")
+
+        def _boom_sensitive(_p: str) -> bool:  # pragma: no cover
+            raise AssertionError("is_sensitive_path ran before the ancestor screen")
+
+        monkeypatch.setattr(Path, "is_symlink", _boom_lstat)
+        monkeypatch.setattr(module, "is_sensitive_path", _boom_sensitive)
+        got = module._inspect(str(leaf), leaf, "alt", 10_000, None, None)
+        assert isinstance(got, Rejection)
+        assert got.reason == REASON_SYMLINK
+        assert got.detail == "symlinks are not uploaded"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("_winapi") is None, reason="directory junctions are Windows-only"
+)
+class TestRealLocalJunctionAncestor:
+    """No stubs: a junction made with ``_winapi.CreateJunction`` on this host."""
+
+    def test_a_file_below_a_local_junction_inside_the_root_is_uploaded(
+        self, tmp_path: Path
+    ) -> None:
+        import _winapi
+
+        target = tmp_path / "workflow-takeover-tasks"
+        real = _png(target)
+        junction = tmp_path / "Tasks"
+        _winapi.CreateJunction(str(target), str(junction))
+        through = junction / real.name
+        result = extract_local_refs(f"![x]({through})", within_root=str(tmp_path))
+        assert result.rejections == []
+        assert [f.path for f in result.files] == [str(through)]
+        assert result.files[0].data == real.read_bytes()
+
+    def test_a_local_junction_leading_out_of_the_root_is_still_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """The pinned read, not the ancestor screen, keeps the bytes in the root."""
+        import _winapi
+
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        real = _png(tmp_path / "elsewhere", "secret.png")
+        junction = cwd / "alias"
+        _winapi.CreateJunction(str(real.parent), str(junction))
+        result = extract_local_refs(f"![x]({junction / real.name})", within_root=str(cwd))
+        assert result.files == []
+        assert result.rejections[0].reason == REASON_UNREADABLE
+
+    def test_a_junction_leaf_is_still_refused(self, tmp_path: Path) -> None:
+        import _winapi
+
+        target = tmp_path / "target"
+        target.mkdir()
+        junction = tmp_path / "shot.png"
+        _winapi.CreateJunction(str(target), str(junction))
+        result = extract_local_refs(f"![x]({junction})", within_root=str(tmp_path))
+        assert result.files == []
+        assert result.rejections[0].reason == REASON_SYMLINK
+
+
+# ---------------------------------------------------------------- generators
+#
+# Every credential-shaped value below is SYNTHESIZED AT RUNTIME from a small
+# grammar rather than checked in as a literal, for the reason
+# ``test_file_delivery_consent`` states at length: a diff carrying working token
+# strings reads as an exfiltration recipe to a review provider. The scanner sees
+# identical bytes either way, so the assertions are exactly as strong.
+
+
+def _synth_aws_key() -> str:
+    """An AWS-access-key-SHAPED token: fixed public prefix plus synthetic body."""
+    prefix = "A" + "KIA"
+    return prefix + hashlib.sha256(b"kc-outbound-wide").hexdigest().upper()[:16]
+
+
+#: Wide encodings a credential can be written in inside a raster container. Both
+#: widths and both byte orders: an explicit ``-le``/``-be`` spelling is used so no
+#: byte-order mark is prepended and the run starts where the builder says it does.
+_WIDE_ENCODINGS = ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be")
+
+
+def _wide_png(encoding: str) -> bytes:
+    """PNG bytes whose metadata carries the synthetic key at WIDE spacing.
+
+    The leading magic is what ``sniff_raster_mime`` reads, so these bytes get past
+    the raster gate and reach the content scan. The key's characters then arrive
+    separated by NUL, which is what a single-byte projection cannot see.
+    """
+    return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + _synth_aws_key().encode(encoding) + b"\x80\x81"
+
+
+def _wide_clean_png(encoding: str) -> bytes:
+    """Wide-encoded text in the same container with no credential in it."""
+    innocent = "the quick brown fox jumps over the lazy dog"
+    return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + innocent.encode(encoding) + b"\x80\x81"
+
+
+#: The bytes a standard baseline JPEG writes on either side of its symbol table's
+#: printable tail. Both are outside printable ASCII, which is what makes the tail
+#: a region of its own in a real container: ``\x16``-``\x1a`` closes the preceding
+#: ``HUFFVAL`` entries and ``\x83`` opens the following ones.
+_DHT_LEAD_OUT, _DHT_LEAD_IN = b"\x16\x17\x18\x19\x1a", b"\x83\x84\x85"
+
+
+def _default_table_jpeg() -> bytes:
+    """JPEG-shaped bytes carrying the standard symbol table and nothing sensitive.
+
+    ``\\xff\\xd8\\xff\\xe0`` is the SOI/APP0 head a JPEG opens with; ``\\xff\\xc4``
+    opens the ``DHT`` segment, and the table sits between the same non-printable
+    ``HUFFVAL`` entries a real baseline image puts around it. The table is taken
+    from the product constant rather than restated, so this cannot pass against a
+    table the scanner does not pin itself to.
+    """
+    from kiro_crew.security.redaction import _BASELINE_SYMBOL_TABLE
+
+    return (
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\xff\xc4\x00\xb5\x00"
+        + _DHT_LEAD_OUT
+        + _BASELINE_SYMBOL_TABLE.encode("latin-1")
+        + _DHT_LEAD_IN
+        + b"\xff\xd9"
+    )
+
+
+class TestSynthesizedMaterialActuallyTrips:
+    """A generator the scanner ignores would make every case below vacuous."""
+
+    def test_the_synth_key_is_detected_at_narrow_spacing(self) -> None:
+        from kiro_crew import security
+
+        key = _synth_aws_key()
+        assert security.redact(key) != key
+
+    def test_the_default_table_jpeg_is_a_raster_and_carries_the_table(self) -> None:
+        from kiro_crew.security.redaction import _BASELINE_SYMBOL_TABLE
+
+        raw = _default_table_jpeg()
+        assert sniff_raster_mime(raw[:SNIFF_BYTES]) == "image/jpeg"
+        assert _BASELINE_SYMBOL_TABLE.encode("latin-1") in raw
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_the_wide_payload_is_a_raster_and_is_invisible_to_narrow_detectors(
+        self, encoding: str
+    ) -> None:
+        """Both halves, or the wide cases below prove nothing.
+
+        The bytes must reach the content scan at all, and the key must genuinely
+        be invisible to a single-byte projection -- otherwise a plain narrow scan
+        would have caught it and the wide pass is not what the refusal measures.
+        """
+        from kiro_crew import security
+
+        raw = _wide_png(encoding)
+        assert sniff_raster_mime(raw[:SNIFF_BYTES]) == "image/png"
+        narrow = raw.decode("latin-1")
+        assert security.redact(narrow) == narrow
+
+
+class TestOneEgressScanOnEveryOutboundPath:
+    """Every outbound file path asks the SHARED egress scan, and asks only it.
+
+    Enumerated from the source by CONDITION rather than from a list of known
+    sites, and that is the whole point of the shape. This defect class recurs by
+    someone adding the NEXT outbound leg and hand-rolling its scan again, and a
+    named list cannot police a leg nobody has written yet. A condition can: the
+    new leg matches it the day it is written.
+
+    Two conditions, because the recurrence has two shapes -- a leg that scans with
+    its own code, and a leg that does not scan at all.
+    """
+
+    #: Every entry point that runs a credential / exfiltration detector over text.
+    _DETECTORS = frozenset(
+        {
+            "redact",
+            "redact_via_context",
+            "redact_credentials",
+            "redact_exfiltration_urls",
+            "redact_with_findings",
+        }
+    )
+    _CANONICAL = frozenset({"binary_content_is_flagged", "wide_content_is_flagged"})
+
+    @staticmethod
+    def _called_names(node: ast.AST) -> set[str]:
+        """Every callee name reachable in *node*, by attribute or bare name."""
+        names: set[str] = set()
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            if isinstance(child.func, ast.Name):
+                names.add(child.func.id)
+            elif isinstance(child.func, ast.Attribute):
+                names.add(child.func.attr)
+        return names
+
+    @staticmethod
+    def _decodes_latin1(node: ast.AST) -> bool:
+        """Whether *node* decodes a bytes object with the total ``latin-1`` codec."""
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Call):
+                continue
+            func = child.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "decode"):
+                continue
+            first = child.args[0] if child.args else None
+            if isinstance(first, ast.Constant) and first.value in {"latin-1", "latin1"}:
+                return True
+        return False
+
+    def test_no_outbound_path_hand_rolls_a_binary_egress_scan(self) -> None:
+        """The invariant: a function that decodes bytes with ``latin-1`` and hands
+        the result to a credential detector IS one of the two shared scanners.
+
+        That pair of operations is the signature of a hand-rolled binary egress
+        scan, and a second implementation of an egress decision is the defect
+        being pinned -- it drifts behind the shared one by construction, because
+        every improvement to the shared scan has to be remembered here too.
+
+        The shared scanners in ``platform/context.py`` match the condition
+        literally and must: they ARE the implementation, so they are named as the
+        one permitted category rather than silently excluded.
+        """
+        offenders = []
+        for path, _text, tree in parsed_candidates(require_all=("latin-1",)):
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if node.name in self._CANONICAL:
+                    continue  # the permitted category: the shared implementation
+                if self._decodes_latin1(node) and (self._called_names(node) & self._DETECTORS):
+                    offenders.append(f"{path.name}:{node.lineno} {node.name}")
+        assert offenders == [], (
+            "these decode bytes and run a detector themselves instead of calling "
+            f"platform.binary_content_is_flagged: {offenders}"
+        )
+
+    def test_the_hand_rolled_scan_condition_still_finds_the_shared_scanners(self) -> None:
+        """A guard on the gate above, which asserts an EMPTY set.
+
+        An empty result is what a passing run and a broken matcher look like
+        alike. The shared scanners satisfy the condition by construction, so
+        finding them proves the walk reached real code and the matcher fires.
+        """
+        found = set()
+        for _path, _text, tree in parsed_candidates(require_all=("latin-1",)):
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if self._decodes_latin1(node) and (self._called_names(node) & self._DETECTORS):
+                    found.add(node.name)
+        assert self._CANONICAL <= found, found
+
+    def test_every_leg_that_reads_bytes_for_upload_reaches_the_shared_scan(self) -> None:
+        """The second invariant: a function that reads file bytes off the
+        filesystem and puts them in an ``OutboundFile`` reaches
+        ``platform.binary_content_is_flagged``.
+
+        This is the other recurrence -- a new leg with no scan at all rather than
+        a duplicate one. Reachability is resolved through the module's own
+        helpers, because a leg is free to keep its fail-closed conversion in a
+        helper; what it is not free to do is skip the scan.
+
+        Two constructors elsewhere in the tree do NOT match this condition, and
+        naming why is what keeps the condition honest rather than merely
+        convenient. One builds a carrier around audio synthesized in process, so
+        no filesystem byte is involved. The other receives bytes a different gate
+        already read AND scanned, so it reads nothing here either. Both differ in
+        the antecedent -- reading the filesystem -- not in the obligation.
+        """
+        for path, _text, tree in parsed_candidates(require_all=("OutboundFile",)):
+            defs = {
+                node.name: node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            for name, node in defs.items():
+                direct = self._called_names(node)
+                if not ("OutboundFile" in direct and "safe_read_file_bytes_nolink" in direct):
+                    continue
+                reachable, seen = set(direct), {name}
+                while frontier := {n for n in reachable if n in defs and n not in seen}:
+                    seen |= frontier
+                    for helper in frontier:
+                        reachable |= self._called_names(defs[helper])
+                assert "binary_content_is_flagged" in reachable, (
+                    f"{path.name}:{node.lineno} {name} reads file bytes into an "
+                    "OutboundFile without reaching the shared binary egress scan"
+                )
+
+    def test_this_leg_is_in_the_population_the_upload_gate_polices(self) -> None:
+        """A guard on the gate above, which asserts over a population it derives.
+
+        A condition that matched nothing would pass in silence, so the leg that
+        exists today is asserted to be inside it.
+        """
+        from kiro_crew.messaging import outbound_files as module
+
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        matched = [
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and {"OutboundFile", "safe_read_file_bytes_nolink"} <= self._called_names(node)
+        ]
+        assert matched == ["_inspect"], matched
+
+
+class TestSharedScanDecidesThisLeg:
+    """What routing through the shared scan changes, in both directions."""
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_a_wide_encoded_credential_is_refused(self, encoding: str) -> None:
+        """A credential at UTF-16 / UTF-32 spacing does not leave on this leg.
+
+        This leg uploads to a third-party messaging service, so these bytes reach
+        someone else's host: the refusal is the whole purpose of the gate. The
+        shared scan ends in ``platform.wide_content_is_flagged``, which lifts the
+        run back out of its NUL padding and hands real characters to the
+        detectors.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "shot.png"
+            p.write_bytes(_wide_png(encoding))
+            text = f"![x]({p})"
+
+            result = extract_local_refs(text)
+
+            assert result.files == []
+            assert result.rewritten_text == text  # the path stays visible
+            assert result.rejections[0].reason == REASON_SENSITIVE
+
+    def test_a_default_table_jpeg_is_accepted(self) -> None:
+        """An ordinary photo uploads, and the container's own table is why.
+
+        A standard baseline JPEG's Huffman symbol table reads as six digits, a
+        colon and thirty-two letters -- the shape of an unlabelled bot token --
+        and essentially every image written with the default tables carries it.
+        This leg reads no consent store and refuses unconditionally, so a
+        false positive here has no remedy at all: the owner is told the file
+        failed a security check with nothing they can do about it. The shared
+        scan re-asks its positive with those tables masked, which is what makes
+        the difference.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "photo.jpg"
+            p.write_bytes(_default_table_jpeg())
+
+            result = extract_local_refs(f"![x]({p})")
+
+            assert result.rejections == []
+            assert [f.mime for f in result.files] == ["image/jpeg"]
+            assert result.files[0].data == _default_table_jpeg()
+
+    def test_a_narrow_credential_is_still_refused(self) -> None:
+        """The control for both cases above: nothing was traded away.
+
+        Closing a miss and clearing a false positive are opposite motions, and
+        either one overshooting shows up here -- a narrow credential in raster
+        metadata is the case that was always refused and must stay refused.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "shot.png"
+            p.write_bytes(_PNG + b"tEXtComment\0" + _synth_aws_key().encode())
+
+            result = extract_local_refs(f"![x]({p})")
+
+            assert result.files == []
+            assert result.rejections[0].reason == REASON_SENSITIVE
+
+    @pytest.mark.parametrize("encoding", _WIDE_ENCODINGS)
+    def test_innocent_wide_text_is_accepted(self, encoding: str) -> None:
+        """The control for the wide pass: it refuses credentials, not NUL bytes.
+
+        Wide-encoded text is ordinary in a media container, so a gate that
+        refused every buffer holding a wide run would refuse ordinary files while
+        looking like it had closed the miss.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "shot.png"
+            p.write_bytes(_wide_clean_png(encoding))
+
+            result = extract_local_refs(f"![x]({p})")
+
+            assert result.rejections == []
+            assert [f.mime for f in result.files] == ["image/png"]
+
+    def test_a_companion_credential_pattern_applies_on_this_leg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A host's own extra credential patterns decide this leg too.
+
+        The shared scan runs its detectors through
+        ``platform.redact_via_context``, so a composed host's additional
+        credential and cookie patterns apply here exactly as they do at every
+        ``file_send`` gate. A leg calling the bare module-level detectors instead
+        gets the baseline pattern set and nothing else, which on such a host is a
+        narrower answer than the gate beside it gives.
+        """
+        from kiro_crew.platform import context as platform_context
+
+        marker = "house-internal-token-" + hashlib.sha256(b"kc-outbound-house").hexdigest()[:12]
+
+        def _house_redact(text: str) -> str:
+            return text.replace(marker, "<redacted>")
+
+        monkeypatch.setattr(platform_context, "redact_via_context", _house_redact, raising=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "shot.png"
+            p.write_bytes(_PNG + b"tEXtComment\0" + marker.encode())
+
+            result = extract_local_refs(f"![x]({p})")
+
+            assert result.files == []
+            assert result.rejections[0].reason == REASON_SENSITIVE

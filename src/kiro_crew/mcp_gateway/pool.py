@@ -4,12 +4,82 @@ Two sessions sharing a single backend MUST produce the same answers as if
 each had its own backend. Every attribute that changes backend behavior
 MUST be in :class:`PoolKey`, or two sessions can see cross-tenant state.
 
-The 12 dimensions captured below are the union of every spawn-time input
-that influences a Kiro MCP subprocess: identity (``server_name``,
-``agent_name``), execution (``command_args_hash``, ``effective_env_hash``,
-``work_dir``, ``binary_version``), security (``os_uid``, ``sandbox_mode``,
-``autoapprove_set_hash``, ``approval_mode``, ``trust_all_tools``), and
-config drift (``config_snapshot_hash``).
+The 6 dimensions captured below are the spawn-time inputs that influence a
+Kiro MCP subprocess: identity (``server_name``), execution
+(``command_args_hash``, ``effective_env_hash``, ``work_dir``,
+``binary_version``), and security (``os_uid``).
+
+The rule cuts both ways. An attribute that does NOT change backend
+behavior must stay OUT of the key: the hash is injective over every field,
+so a difference in one that isolates nothing still forks a process. Four
+fields labeled "security boundary" are in that class and are not key
+dimensions: ``sandbox_mode``, ``autoapprove_set_hash``, ``approval_mode``
+and ``trust_all_tools``.
+
+* **The sandbox is not applied to a pooled backend at all.** ``gatewayd``
+  spawns backends outside any mount namespace by design (see the security
+  boundary note in ``backend.spawn_backend``); the per-session sandbox wraps
+  kiro-cli, not a gateway-spawned server. Two sessions configured for
+  different sandbox tiers therefore get processes confined identically --
+  partitioning them buys a second unsandboxed process, not a second sandbox.
+* **Approval is decided before a call reaches the gateway.** Tool visibility,
+  the autoApprove list, the approval mode and trust-all are kiro-cli's own
+  per-agent decision, taken against the agent's overlay entry. What arrives
+  at the stub is a ``tools/call`` kiro-cli has already authorised, so a
+  backend never reads these values and cannot act on them. The rewriter keeps
+  each agent's ``autoApprove`` on its own wrapped entry, so the per-agent
+  surface survives sharing.
+* **Keying on them costs a process and buys nothing.** The split they
+  produce today is per agent, across a change to ``agent.approval_mode`` or
+  ``agent.sandbox`` or that agent's own autoApprove list, since the first two
+  are host-wide (``launch_resolve.rewrite_kwargs``). Two agents whose only
+  difference is approval posture are interchangeable from the backend's side,
+  so once agent identity stops being a dimension they share one process; the
+  four fields must be out of the key for that to be true.
+
+``os_uid`` stays. The cross-OS-user boundary is real and is independently
+enforced (the socket is ``0600`` and the daemon checks the peer uid), so the
+dimension costs nothing it does not also deliver.
+
+Those four fields are still ACCEPTED on a register payload and simply
+ignored, the same wire-compat treatment ``user_identity`` and ``channel_id``
+get: a stub and a daemon are upgraded separately, and a rejected register
+silently un-pools an install.
+
+There is deliberately NO agent dimension. The agent name never reaches the
+backend process: the spawn is decided by ``command_args_hash``,
+``effective_env_hash``, ``work_dir`` and ``binary_version``, all of which
+already differ whenever two agents declare a server differently. Two agents
+that declare one server IDENTICALLY therefore asked for the same process,
+and giving each its own was pure duplication — on a host running several
+agents a common server ran up to five indistinguishable backends. What the
+name was still reached for is answered per call or per content instead:
+
+* The MCP Apps governance check reads the agent ``gatewayd`` stamped on the
+  render's own spool record at interception, taken from the producing stub's
+  Register frame (``app_call._agent_for_call``), and fails closed when the
+  record names none. So each call is governed by the agent that actually made
+  it rather than the producing registrant's, and the answer comes from a
+  record only ``gatewayd`` writes rather than from a store the governed agent
+  could edit.
+* The declared-env sidecar keeps its ``(agent, server)`` file name, and the
+  daemon reads the agent off the Register frame instead of off this key. That
+  file holds one declaration's full env, rotating secrets included, and
+  ``effective_env_hash`` deliberately excludes those keys -- so naming it from
+  this key would put two agents' different credentials on one file name. One
+  name per declaration keeps that substitution unrepresentable while leaving
+  pool identity agent-free: two agents declaring a server identically still
+  share one backend and read byte-identical copies of their own file.
+* The status page's metrics row drops its ``agent`` key rather than replacing
+  it. Nothing in ``src/kiro_crew`` read that key and the dashboard card
+  rendered no column for it, so a row that names the process it describes --
+  server, pid, stubs -- loses nothing an operator had.
+
+There is deliberately NO config-snapshot dimension either. A
+``config_snapshot_hash`` the stub still sends is ignored: its value is a
+constant run of 64 zero bytes, so it partitions nothing. Real config drift is
+carried by the execution-shape fields, which are recomputed from the spec the
+stub was launched with.
 
 There is deliberately NO channel dimension. A channel is not a trust
 boundary and never was a usable proxy for one:
@@ -55,7 +125,9 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Optional
 
 from kiro_crew import platform_compat
+from kiro_crew.mcp_gateway import read_limits
 from kiro_crew.mcp_gateway.breaker import CircuitBreaker
+from kiro_crew.mcp_gateway.hashing import format_pool_label
 
 if TYPE_CHECKING:
     from kiro_crew.mcp_gateway.backend import Backend
@@ -63,44 +135,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Per-stream byte ceiling for ``readuntil(b"\n")`` across the gateway.
-# Passed as ``limit=`` to every asyncio reader the module creates
-# (subprocess pipes, unix sockets). Default 64 MiB — generous enough for
-# any real MCP tool response (ReadInternalWebsites can return 1-5 MiB pages).
-# Config-driven via ``mcp_gateway.read_buffer_limit_bytes`` / env var
-# ``KIROCREW_MCP_READ_LIMIT``. Asyncio's stdlib default is 64 KiB which is
-# too small, and even a 1 MiB limit silently drops legitimate large responses.
-_DEFAULT_READ_BUFFER_LIMIT = 64 * 1024 * 1024  # 64 MiB
+# Per-stream byte ceiling for ``readuntil(b"\n")`` across the gateway, passed
+# as ``limit=`` to every asyncio reader this module creates (subprocess pipes,
+# unix sockets). The value and its resolution order live in the stdlib-only
+# ``read_limits`` leaf so ``mcp_gateway.stub`` can read the same ceiling without
+# importing this module and the config package behind it; the names below are
+# the surface callers of this module already use.
+_DEFAULT_READ_BUFFER_LIMIT = read_limits._DEFAULT_READ_BUFFER_LIMIT
+_resolve_read_buffer_limit = read_limits.resolve_read_buffer_limit
 
-
-def _resolve_read_buffer_limit() -> int:
-    """Resolve the read buffer limit.
-
-    Precedence: env var ``KIROCREW_MCP_READ_LIMIT`` (bytes) → config key
-    ``mcp_gateway.read_buffer_limit_bytes`` → hard-coded default. Config read is
-    function-level to avoid an import cycle and is best-effort (config
-    unavailable at import → default).
-    """
-    raw = os.environ.get("KIROCREW_MCP_READ_LIMIT")
-    if raw:
-        try:
-            val = int(raw)
-            if val >= 1024:
-                return val
-        except (ValueError, TypeError):
-            pass
-    try:
-        from kiro_crew.config.loader import _raw_config
-
-        cfg_val = (_raw_config().get("mcp_gateway") or {}).get("read_buffer_limit_bytes")
-        if isinstance(cfg_val, int) and not isinstance(cfg_val, bool) and cfg_val >= 1024:
-            return cfg_val
-    except Exception:
-        logger.debug("mcp read limit: config unavailable, using default", exc_info=True)
-    return _DEFAULT_READ_BUFFER_LIMIT
-
-
-READ_BUFFER_LIMIT_BYTES: int = _resolve_read_buffer_limit()
+READ_BUFFER_LIMIT_BYTES: int = read_limits.resolve_read_buffer_limit()
 
 
 # Default spill threshold — responses larger than this (but under the read
@@ -139,8 +183,15 @@ def _resolve_spill_threshold() -> int:
 RESPONSE_SPILL_THRESHOLD_BYTES: int = _resolve_spill_threshold()
 
 
-def _proc_rss_kb(pid: Optional[int]) -> int:
+def backend_rss_kb(pid: Optional[int]) -> int:
     """Resident set size (KiB) for ``pid`` **and all its descendants**.
+
+    The one RSS probe for a pooled backend, shared by
+    :meth:`BackendPool.metrics_snapshot_async` and the exported pool gauges
+    (``metrics/mcp_gateway_gauges.py``), with
+    :meth:`BackendPool.live_pooled_backends` as the shared population, so both
+    report the same memory figure. Linux only (the subtree walk reads
+    ``/proc``); elsewhere it returns -1. Blocking: call it off the event loop.
 
     A pooled MCP backend is frequently a thin launcher (e.g.
     a ``slack-mcp`` launcher or an ``example-mcp`` shim) whose real
@@ -176,7 +227,6 @@ class PoolKey:
 
     # Identity
     server_name: str
-    agent_name: str
 
     # Execution shape
     command_args_hash: str
@@ -186,13 +236,6 @@ class PoolKey:
 
     # Security boundary
     os_uid: int
-    sandbox_mode: str
-    autoapprove_set_hash: str
-    approval_mode: str
-    trust_all_tools: bool
-
-    # Config drift
-    config_snapshot_hash: str
 
     # --- Constructors ------------------------------------------------------
 
@@ -201,10 +244,9 @@ class PoolKey:
         """Build a :class:`PoolKey` from a stub's ``Register`` payload.
 
         The caller is responsible for providing pre-computed content hashes
-        for the structured fields (command_args, env, auto-approve,
-        config_snapshot). This mirrors the Rust stub's ``build_pool_key``
-        helper: the stub has the raw inputs and knows how to hash them, the
-        gateway just validates and stores.
+        for the structured fields (command_args, env). This mirrors the Rust
+        stub's ``build_pool_key`` helper: the stub has the raw inputs and
+        knows how to hash them, the gateway just validates and stores.
 
         Raises :class:`ValueError` on missing or malformed fields.
         """
@@ -220,34 +262,36 @@ class PoolKey:
         # stub still reports it because gatewayd threads it into the per-call
         # caller identity (see ``_build_caller_block``), and an older stub
         # against a newer daemon must keep registering cleanly. It is simply
-        # not a pool dimension — see the module docstring. The same applies
-        # to ``user_identity``, which older stubs still send: it was deleted
-        # as a pool dimension (it never isolated anything) and is ignored.
-        # Security-boundary dims: type-check rather than coerce. bool("false")
-        # is True and int() on a bool silently passes, so a stub sending a JSON
-        # string/number for these could land in the wrong trust/uid partition.
-        # Reject a non-matching type rather than coercing it.
+        # not a pool dimension — see the module docstring. The same applies to
+        # ``user_identity`` and to the four approval/sandbox fields
+        # (``sandbox_mode``, ``autoapprove_set_hash``, ``approval_mode``,
+        # ``trust_all_tools``): stubs send them, nothing here reads them, and
+        # the module docstring records why none of them isolates anything.
+        #
+        # ``agent_name`` and ``config_snapshot_hash`` join that list. Both are
+        # still SENT (see ``stub.build_register_payload``), and ``agent_name``
+        # is still READ off this frame by ``daemon.connection``'s
+        # ``stub_agent`` — which names a private backend's declared-env sidecar
+        # and is stamped onto an app render's spool record — but gatewayd
+        # threads it nowhere near pool identity. Neither partitions the pool:
+        # the agent never reaches the backend process, and the snapshot hash is
+        # a constant run of zeros.
+        #
+        # ``os_uid`` IS a dimension, so it is type-checked rather than coerced:
+        # ``int()`` on a bool silently passes, and a stub sending a JSON string
+        # or a bool could otherwise land in the wrong uid partition.
         os_uid = register["os_uid"]
         if isinstance(os_uid, bool) or not isinstance(os_uid, int):
             raise ValueError(f"os_uid must be int, got {type(os_uid).__name__}")
-        trust_all_tools = register["trust_all_tools"]
-        if not isinstance(trust_all_tools, bool):
-            raise ValueError(f"trust_all_tools must be bool, got {type(trust_all_tools).__name__}")
 
         try:
             return cls(
                 server_name=str(register["server_name"]),
-                agent_name=str(register["agent_name"]),
                 command_args_hash=str(register["command_args_hash"]),
                 effective_env_hash=str(register["effective_env_hash"]),
                 work_dir=str(register["work_dir"]),
                 binary_version=str(register["binary_version"]),
                 os_uid=os_uid,
-                sandbox_mode=str(register["sandbox_mode"]),
-                autoapprove_set_hash=str(register["autoapprove_set_hash"]),
-                approval_mode=str(register["approval_mode"]),
-                trust_all_tools=trust_all_tools,
-                config_snapshot_hash=str(register["config_snapshot_hash"]),
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Register payload has malformed field: {exc}") from exc
@@ -268,22 +312,12 @@ class PoolKey:
     def human_readable(self) -> str:
         """Short log-friendly label. NOT collision-resistant — use
         :meth:`stable_hash` as the actual pool dict key.
+
+        Delegates to :func:`kiro_crew.mcp_gateway.hashing.format_pool_label`, which
+        reads the same fields off a Register payload, so the stub's log line
+        and the daemon's name one identity the same way.
         """
-        cmd_short = (
-            (self.command_args_hash[:8] + "…")
-            if len(self.command_args_hash) > 8
-            else self.command_args_hash
-        )
-        env_short = (
-            (self.effective_env_hash[:8] + "…")
-            if len(self.effective_env_hash) > 8
-            else self.effective_env_hash
-        )
-        return (
-            f"{self.agent_name}:{self.server_name} "
-            f"uid={self.os_uid} sbx={self.sandbox_mode} "
-            f"cmd={cmd_short} env={env_short} ws={self.work_dir}"
-        )
+        return format_pool_label(asdict(self))
 
 
 # --- BackendPool skeleton ---------------------------------------------------
@@ -500,6 +534,16 @@ class BackendPool:
         ``asyncio.to_thread``. Snapshotting first is load-bearing: iterating
         ``_backends`` in the worker thread can race a concurrent add/evict
         ("dict changed size during iteration").
+
+        ``stubs`` is ``refcount``, which is ``len(_stub_inboxes)`` — the number
+        of attached stub CONNECTIONS. It is named for what it counts because it
+        is not a session count and cannot be read as one: an agent runtime opens
+        ONE stub per MCP server however many sessions it hosts, so a runtime
+        serving several sessions contributes 1. As a session count it is a lower
+        bound, and every figure derived from it (the pool's own "what this would
+        cost unpooled" estimate) inherits that. The session count is not
+        derivable here: the pool knows stub uuids and caller identities pushed to
+        it, not the set of sessions riding each stub.
         """
         now = time.monotonic()
         async with self._lock:
@@ -507,19 +551,21 @@ class BackendPool:
                 (
                     {
                         "server": b.pool_key.server_name,
-                        "agent": b.pool_key.agent_name,
+                        # No agent key. The agent is not a pool dimension, so a
+                        # row describes a process one or several agents share and
+                        # there is no single agent to name. Dropped rather than
+                        # replaced by a list: nothing read the old key.
                         "pid": b.pid,
-                        "sessions": b.refcount,
+                        "stubs": b.refcount,
                         "idle_s": round(max(0.0, now - b.last_used_at), 1),
                     },
                     b.pid,
                 )
-                for b in self._backends.values()
-                if b.is_alive
+                for b in self.live_pooled_backends()
             ]
             base = self.stats()
         pids = [pid for _, pid in entries]
-        rss_by_pid = await asyncio.to_thread(lambda: {pid: _proc_rss_kb(pid) for pid in pids})
+        rss_by_pid = await asyncio.to_thread(lambda: {pid: backend_rss_kb(pid) for pid in pids})
         rows: list[dict[str, Any]] = []
         for row, pid in entries:
             row["rss_kb"] = rss_by_pid.get(pid, -1)
@@ -551,26 +597,26 @@ class BackendPool:
         if self._breaker is not None:
             self._breaker.record_healthy(breaker_key)
 
-    def live_backend_pids(self) -> list[int]:
-        """PIDs of all currently-pooled backends **and draining backends**. Each
-        backend is spawned as a session leader (``start_new_session=True``), so
-        ``pid == pgid``. Persisted out-of-band so a supervising manager can
-        ``killpg`` these survivors if it has to SIGKILL a wedged gatewayd (which
-        then never runs :meth:`shutdown_all`).
+    def live_backend_identities(self) -> list[tuple[int, Optional[str]]]:
+        """``(pid, start_id)`` of every pooled, draining and connection-private
+        backend. Each is a session leader (``start_new_session=True``, so
+        ``pid == pgid``), and the heartbeat persists these out-of-band so a
+        supervising manager or the next daemon can reap survivors of a gatewayd
+        that died without running :meth:`shutdown_all`.
 
         Draining backends (blue-green cutover) keep running as live session
-        leaders for up to :data:`DRAIN_DEADLINE_SECS` after being removed from
-        the active index, so they MUST appear here too — otherwise a gatewayd
-        SIGKILLed during the drain window leaves them orphaned, the exact leak
-        this pidfile mechanism exists to prevent.
+        leaders for up to :data:`DRAIN_DEADLINE_SECS` after leaving the active
+        index, so they MUST appear here too, or a gatewayd SIGKILLed during the
+        drain window leaves them orphaned. The start id is the one each backend
+        captured at spawn (:attr:`Backend.start_id`), never re-read here.
         """
-        pids = [b.pid for b in self._backends.values() if b.pid is not None]
-        pids.extend(e.backend.pid for e in self._draining if e.backend.pid is not None)
+        backends = list(self._backends.values())
+        backends.extend(e.backend for e in self._draining)
         # Connection-private backends are ordinary child processes; being outside
         # the reuse index and the capacity budget does not make them any less
         # orphanable by a SIGKILLed gatewayd.
-        pids.extend(b.pid for b in self._exclusive.values() if b.pid is not None)
-        return pids
+        backends.extend(self._exclusive.values())
+        return [(b.pid, b.start_id) for b in backends if b.pid is not None]
 
     async def add(
         self,
@@ -837,13 +883,17 @@ class BackendPool:
             return backend
         return None
 
-    def _spawn_shutdown(self, backend: "Backend") -> None:
+    def spawn_shutdown(self, backend: "Backend") -> None:
         """Reap ``backend`` on the event loop without awaiting it here.
 
         Used where the caller may itself be cancelled: an ``await`` on a
         cancelled task re-raises before the shutdown runs, leaking the child.
         The task is strongly referenced until done, since the loop holds only a
-        weak reference to a bare ``create_task``.
+        weak reference to a bare ``create_task`` -- and :meth:`shutdown_all`
+        joins it, so a reap the daemon's teardown interrupted is still finished
+        before the daemon returns. The stub-disconnect path in ``gatewayd`` reaps
+        a connection-private backend this way for exactly that reason: the
+        connection handler is what teardown cancels.
         """
         task = asyncio.create_task(_safe_shutdown(backend))
         self._shutdown_tasks.add(task)
@@ -882,7 +932,7 @@ class BackendPool:
             # here would leak the process. Reap it on the way out, as a tracked
             # task rather than an await — this handler may itself be cancelled,
             # and an await would re-raise before the shutdown ran.
-            self._spawn_shutdown(backend)
+            self.spawn_shutdown(backend)
             raise
         if existing is not None:
             # stub_uuid is a fresh uuid4 per connection, so this means the same
@@ -1215,6 +1265,23 @@ class BackendPool:
         """
         async with self._lock:
             return [(b.pool_key, b) for b in self._backends.values()]
+
+    def live_pooled_backends(self) -> list["Backend"]:
+        """The population every pool memory figure counts: pooled backends that are alive.
+
+        One rule for both readers of "what pooling costs and saves": the control
+        snapshot (:meth:`metrics_snapshot_async`, served to the dashboard) and the
+        exported pool gauges (``metrics/mcp_gateway_gauges.py``), so the two
+        cannot disagree. DRAINING backends (a credential-rotation cutover's old
+        process, finishing in-flight calls) and connection-private backends (held
+        apart from the reuse index, never shared) are left out: neither is a
+        process a session could be pooled onto. :meth:`all_backends` is the
+        lifecycle view that includes them.
+
+        Synchronous and lock-free (a list copy of the index, safe to call from the
+        metric reader's thread); the async snapshot calls it under the pool lock.
+        """
+        return [b for b in list(self._backends.values()) if b.is_alive]
 
     def all_backends(self) -> list["Backend"]:
         """Return all current backends (non-async, lock-free snapshot).

@@ -13,7 +13,8 @@ Security: :meth:`authorize` is **deny-by-default** and owner-only.  An empty
 Group-chat access is an explicit opt-in gated on both ``allow_group=True``
 AND the group's ``chat_id`` appearing in ``allowed_group_ids``; every other
 context (unknown group, or a group chat when ``allow_group`` is False) is
-denied with a SEL audit record.
+denied with a SEL audit record. Inside an allowed group a message is served
+only when it @-mentions this app's bot (``LarkInbound.bot_mentioned``).
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
 from kiro_crew.feishu.client import CHAT_GROUP, CHAT_P2P, LarkClient, LarkInbound
+from kiro_crew.messaging.attachments import channel_reads_no_attachments
+from kiro_crew.messaging.dispatch import inbound_permitted
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
     InboundMessage,
@@ -295,13 +298,19 @@ class FeishuTransport(MessagingTransport):
         The low-level client parses inbound WS frames into ``LarkInbound`` and
         routes them here (already in the async event loop via
         ``run_coroutine_threadsafe``).  We apply the group-chat gate first
-        (fail-closed for non-p2p contexts), then the user allow-list, and
-        finally hand an authorised message to the dispatcher.
+        (fail-closed for non-p2p contexts, and for a group message that does
+        not mention the bot), then the user allow-list, and finally hand an
+        authorised message to the dispatcher.
         """
         if not isinstance(raw_envelope, LarkInbound):
             return
         inbound = raw_envelope
-        if not inbound.text:
+        # An unreadable message (``unsupported_type`` set, ``text`` empty) is
+        # NOT dropped here: it runs the same gates a turn would and is answered
+        # at the bottom. Everything else with no text still stops -- a frame
+        # whose body resolved to nothing has no instruction and nothing to say
+        # about it.
+        if not inbound.text and not inbound.unsupported_type:
             return
 
         # Chat-type gate (fail closed). The two served contexts are named
@@ -328,6 +337,20 @@ class FeishuTransport(MessagingTransport):
                     operation="feishu_transport.receive",
                     outcome="denied_group_not_allowed",
                     source="feishu",
+                )
+                return
+            # Addressed-to-the-bot gate (fail closed). An app that holds a
+            # broader read grant receives every message in the group, and the
+            # sender allow-list says who MAY drive a turn, not that this
+            # message asked for one. Only a message whose mentions name this
+            # bot's open_id is served; an unresolved bot id reads as "not
+            # mentioned". Chatter not addressed to the bot is no access
+            # attempt, so it is dropped before ``authorize`` and leaves no
+            # audit record.
+            if not inbound.bot_mentioned:
+                logger.debug(
+                    "Feishu group message ignored: the bot is not mentioned (message_id=%s)",
+                    inbound.message_id,
                 )
                 return
 
@@ -368,5 +391,44 @@ class FeishuTransport(MessagingTransport):
                 while len(self._seen) > _SEEN_KEEP:
                     self._seen.popitem(last=False)
 
+        # Answered here, and only here, for three reasons that are each a gate
+        # above this line: an unauthorised sender learns nothing (``authorize``
+        # already returned), a group the bot merely sits in stays silent (the
+        # group gate), and a redelivered frame does not answer twice (the dedup
+        # window, which this deliberately sits after).
+        if inbound.unsupported_type:
+            if not self.capabilities.files_inbound:
+                # Per-message governance ceiling. The reply ``return``s before
+                # ``self._dispatch``, so it never reaches the dispatcher's own
+                # ``inbound_permitted("feishu")`` gate -- without this an
+                # administratively-disabled channel would still emit a reply.
+                # Rechecked here (not just at connect) so a host-profile deny
+                # added while the transport is live silences the reply too.
+                if not await inbound_permitted("feishu"):
+                    return
+                try:
+                    await self.send_message(
+                        inbound.message_id,
+                        channel_reads_no_attachments(inbound.unsupported_type),
+                    )
+                except Exception:
+                    # LOG the failure -- do not re-raise. ``_deliver`` dispatches
+                    # us through ``run_coroutine_threadsafe`` without awaiting the
+                    # future, so the WS frame is acked the moment that handler
+                    # returns; a re-raise here would surface only in a future
+                    # nothing reads, and no redelivery is held back for it to
+                    # drive. Re-dropping ``_seen[msg_id]`` to court a redelivery
+                    # would therefore chase a frame that never comes. Logging is
+                    # the one trace a failed reply can actually leave.
+                    logger.exception(
+                        "feishu: failed to answer unreadable attachment "
+                        "(message_id=%s, type=%s)",
+                        msg_id,
+                        inbound.unsupported_type,
+                    )
+            return
+
         if self._dispatch is not None:
+            # Received from a person: its start is FOREGROUND (kiro_crew.start_priority).
+            inbound.person_origin = True
             await self._dispatch(inbound)

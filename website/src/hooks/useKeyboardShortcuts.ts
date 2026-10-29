@@ -1,11 +1,10 @@
 import { useEffect, useCallback, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppDispatch, useAppStore } from '../store'
-import { switchSlot, deleteSlot, openActivityToTab, selectSidebarSubagentCounts, selectSidebarApprovalCounts, selectSidebarWorkflowActive, selectSidebarAutomationRunningKeys } from '../store/chatSlice'
-import { inferLane } from '../pages/chat/sessionLane'
-import { normalizeRunSessionKey } from '../apps/workflows/runModel'
+import { switchSlot, deleteSlot, openActivityToTab } from '../store/chatSlice'
+import { closeConfirmPrompt } from '../lib/closeConfirmPrompt'
 import { loadChatConfig } from '../pages/chat/ChatSettings'
-import { queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
+import { focusComposerElement, queryComposerOrExpand, queryPendingApprovalAction, releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { reportSeamCollision } from '../apps/seamCollision'
 import {
   loadPanelToggleOverrides,
@@ -38,6 +37,15 @@ import { canGoBack, canGoForward } from '../lib/routeHistoryPosition'
 import { useGuardedHistoryStep } from '../components/NavigationLeaveGuard'
 import { MOBILE_BREAKPOINT } from './useIsMobile'
 import { isEditableTarget } from '../utils/editableTarget'
+import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
+import { stepTurn } from '../pages/chat/turnStep'
+
+/** Shortcuts scoped to the session on screen (see the crew-window guard). */
+const CREW_WINDOW_SCOPED: ReadonlySet<string> = new Set([
+  'close-chat', 'focus-input', 'focus-approval',
+  'cycle-agent', 'cycle-prev-agent', 'cycle-reasoning', 'cycle-prev-reasoning',
+  'cycle-approval', 'cycle-prev-approval', 'cycle-model', 'cycle-prev-model',
+])
 
 /**
  * Group ids + ordering live in the registry (`lib/shortcutRegistry`); re-exported
@@ -248,6 +256,8 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'chat-next-bracket': 'hooks.useKeyboardShortcuts.next_chat',
   'chat-mru': 'hooks.useKeyboardShortcuts.last_visited_chat_mru',
   'chat-mru-back': 'hooks.useKeyboardShortcuts.walk_back_mru_history',
+  'turn-prev': 'hooks.useKeyboardShortcuts.previous_prompt',
+  'turn-next': 'hooks.useKeyboardShortcuts.next_prompt',
   'nav-chat': 'hooks.useKeyboardShortcuts.chats_panel',
   'nav-notifications': 'hooks.useKeyboardShortcuts.notifications_panel',
   'nav-projects': 'hooks.useKeyboardShortcuts.projects_panel',
@@ -275,8 +285,11 @@ export const SHORTCUT_LABEL_KEY: Record<string, string> = {
   'toggle-focus-mode': 'hooks.useKeyboardShortcuts.toggle_focus_mode',
   // Reused: the ChatInput control this chord fires.
   'optimize-prompt': 'components.chatInput.optimize_prompt',
+  'edit-last-message': 'hooks.useKeyboardShortcuts.edit_last_message',
   'agent-monitor': 'hooks.useKeyboardShortcuts.open_agent_monitor',
   'stop-speaking': 'hooks.useKeyboardShortcuts.stop_speaking',
+  'notification-prev': 'hooks.useKeyboardShortcuts.previous_notification',
+  'notification-next': 'hooks.useKeyboardShortcuts.next_notification',
   'instance-1': 'hooks.useKeyboardShortcuts.switch_to_local',
   'instance-2': 'hooks.useKeyboardShortcuts.switch_to_remote_crew',
   'instance-3': 'hooks.useKeyboardShortcuts.switch_to_remote_crew',
@@ -369,6 +382,11 @@ export const RESERVED_PANEL_CODES: ReadonlySet<string> = new Set<string>([
   'Backquote', // MRU toggle (Alt+`)
   'ArrowLeft',
   'ArrowRight', // prev/next chat
+  // prev/next turn of the open chat (Alt+↑/↓), read off the registry: a named
+  // key's chord token is its code
+  ...SHORTCUT_REGISTRY
+    .filter(e => e.id === 'turn-prev' || e.id === 'turn-next')
+    .flatMap(e => (e.defaults.other ? [e.defaults.other.key] : [])),
   'Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5',
   'Digit6', 'Digit7', 'Digit8', 'Digit9', // chat jump
 ])
@@ -623,7 +641,7 @@ export function formatShortcut(def: ShortcutDef): string {
   if (def.ctrl) parts.push(mac ? '\u2303' : 'Ctrl')
   if (def.alt) parts.push(mac ? '\u2325' : 'Alt')
   if (def.shift) parts.push(mac ? '\u21e7' : 'Shift')
-  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key.toUpperCase()
+  const keyLabel = def.key === 'ArrowLeft' ? '\u2190' : def.key === 'ArrowRight' ? '\u2192' : def.key === 'ArrowUp' ? '\u2191' : def.key === 'ArrowDown' ? '\u2193' : def.key === '`' ? '`' : def.key === 'Enter' ? (mac ? '\u23ce' : 'Enter') : def.key === ',' ? ',' : def.key === 'Escape' ? '\u238b' : def.key.toUpperCase()
   parts.push(keyLabel)
   return parts.join(mac ? '' : ' + ')
 }
@@ -698,20 +716,19 @@ interface UseKeyboardShortcutsOpts {
    * nav row disappears.
    */
   onToggleTerminal?: () => void
+  /** Add a docked terminal tab (VS Code's Create New Terminal), opening the
+   *  panel if needed. Same ownership and unbound-when-undefined rule as
+   *  `onToggleTerminal`. */
+  onNewTerminal?: () => void
   disabled?: boolean
 }
 
-export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, disabled }: UseKeyboardShortcutsOpts) {
+export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const guardedHistoryStep = useGuardedHistoryStep()
   const appStore = useAppStore()
   const mruIndexRef = useRef(-1)
-  // Set true right after a char-producing Alt shortcut (Alt+`) fires inside a
-  // text field. On macOS those combos are dead keys (Option+` = grave accent),
-  // and keydown.preventDefault() cannot cancel the composed character — it
-  // arrives via beforeinput. The guard below eats it.
-  const suppressNextInputRef = useRef(false)
   const [enabled, setEnabled] = useState(() => localStorage.getItem(SHORTCUTS_ENABLED_KEY) !== '0')
   const [ctrlDigits, setCtrlDigits] = useState(() => getCtrlDigitsEnabled())
   // In state, not read per keystroke, to keep the hot keydown path off localStorage.
@@ -750,20 +767,6 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     return () => document.removeEventListener('keyup', onKeyUp)
   }, [])
 
-  // Cancel the stray character a macOS dead-key Alt shortcut would otherwise
-  // insert (e.g. Alt+` switching the slot AND typing a backtick). Capture phase
-  // so it runs before the focused field handles the input. No-op on
-  // Linux/Windows where keydown.preventDefault() already suppresses it.
-  useEffect(() => {
-    const onBeforeInput = (e: Event) => {
-      if (suppressNextInputRef.current) {
-        suppressNextInputRef.current = false
-        e.preventDefault()
-      }
-    }
-    document.addEventListener('beforeinput', onBeforeInput, true)
-    return () => document.removeEventListener('beforeinput', onBeforeInput, true)
-  }, [])
 
   /**
    * Panel-toggle id → the action that toggles it, or `undefined` when the host
@@ -785,7 +788,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     'session-panel': onToggleSessionPanel,
     'side-panel': onToggleSidePanel,
     'terminal': onToggleTerminal,
-  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal])
+    'terminal-new': onNewTerminal,
+  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal])
 
   const handler = useCallback((e: KeyboardEvent) => {
     const isInput = isEditableTarget(e)
@@ -968,8 +972,13 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // walked a stack the visible UI does not reflect is the same wrong in
         // native form. Only the text-field gate unclaims (see the hit-null
         // above): the field consumes the caret chord and never navigates.
-        'history-back': () => { if (!isNarrowViewport() && canGoBack()) guardedHistoryStep(-1) },
-        'history-forward': () => { if (!isNarrowViewport() && canGoForward()) guardedHistoryStep(1) },
+        // An allowed step arms the composer release (after the draft ask, so
+        // the one-shot's clock starts when the step commits), so the
+        // destination's autofocus skips once and the NEXT press is not eaten
+        // by the text field. Not Mac-gated: the text-field unclaim is
+        // platform-wide.
+        'history-back': () => { if (!isNarrowViewport() && canGoBack()) guardedHistoryStep(-1, releaseComposerForKeyboardSwitch) },
+        'history-forward': () => { if (!isNarrowViewport() && canGoForward()) guardedHistoryStep(1, releaseComposerForKeyboardSwitch) },
         'cycle-agent': () => onCycleAgent?.(),
         'cycle-prev-agent': () => onCyclePrevAgent?.(),
         'cycle-reasoning': () => onCycleReasoningEffort?.(),
@@ -996,52 +1005,72 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
         // composer was COLLAPSED and had to be asked back — without that, "focus
         // text input" silently did nothing for as long as the user left it
         // collapsed, which outlives a reload.
-        'focus-input': () => queryComposerOrExpand(ta => ta.focus()),
+        'focus-input': () => queryComposerOrExpand(focusComposerElement),
         // ⌘N / Ctrl+N (alias Option/Alt+Shift+N): new session.
-        'new-chat': () => onNewChat(),
+        // A held chord's auto-repeat is not another press: without this
+        // filter, holding the keys creates one session per repeat tick. The
+        // repeat is still claimed (preventDefault below), so the browser's own
+        // binding does not fire either. Two separate presses are two requests
+        // and still make two sessions.
+        'new-chat': () => { if (!e.repeat) onNewChat() },
         // ⌘W / Ctrl+W (alias Option/Alt+Shift+W): close the current session —
-        // same semantics as the header-menu close (gated by confirmCloseSession,
-        // dispatches deleteSlot). One addition for the NEW chord surface: a
-        // session that is not IDLE always confirms. ⌘W/Ctrl+W is the most
-        // habitual chord there is (it closed the WINDOW in the previous desktop
-        // release on Windows/Linux), and `confirmCloseSession` defaults off — a
-        // default calibrated for the hard-to-mispress ⌥⇧W. An idle session is
-        // losslessly reopenable from the sidebar's older-sessions list, so it
-        // keeps the user's confirm setting; anything else is where a stray
-        // keystroke costs work, so it asks.
-        //
-        // "Not idle" is the sidebar's own lane inference, not `slot.running`: that
-        // flag covers only the slot's own turn and reads FALSE between the cycles
-        // of an armed goal loop, during a dynamic workflow, and while background
-        // sub-agents run — all of which `deleteSlot` retires. Reusing `inferLane`
-        // with the same extras the sidebar computes keeps this gate and the
-        // Working/Waiting/Needs-approval lanes from ever disagreeing.
+        // same semantics as the header-menu / sidebar close (gated by
+        // confirmCloseSession, dispatches deleteSlot, and a session with live work
+        // always confirms — `closeBusyReasons`; the prompt text comes from
+        // `closeConfirmPrompt` so every path says why it asked). ⌘W/Ctrl+W is the
+        // most habitual chord there is (it closed the WINDOW in the previous
+        // desktop release on Windows/Linux). The ⌥⇧W alias keeps its shipped
+        // behaviour: only the user's confirm setting gates it.
         'close-chat': () => {
           if (!activeSlot) return
-          const slot = slots.find(s => s.key === activeSlot)
-          const state = appStore.getState()
-          const subagentsRunning = selectSidebarSubagentCounts(state)[activeSlot] || 0
-          const lane = slot ? inferLane(slot, {
-            subagentAwaiting: Math.min(selectSidebarApprovalCounts(state)[activeSlot] || 0, subagentsRunning),
-            workflowActive: normalizeRunSessionKey(activeSlot) in selectSidebarWorkflowActive(state),
-            goalLoopActive: selectSidebarAutomationRunningKeys(state).includes(activeSlot),
-            detailedSubagentsRunning: subagentsRunning > 0,
-          }) : 'idle'
           const modChord = e.metaKey || e.ctrlKey
-          const mustConfirm = loadChatConfig().confirmCloseSession || (modChord && lane !== 'idle')
-          if (!mustConfirm || confirm(i18nT('hooks.useKeyboardShortcuts.close_this_session'))) {
+          const prompt = closeConfirmPrompt(appStore.getState(), activeSlot, {
+            settingOn: loadChatConfig().confirmCloseSession,
+            checkBusy: modChord,
+          })
+          if (prompt === null || confirm(prompt)) {
             dispatch(deleteSlot(activeSlot))
           }
         },
       }
       // Every `registry` entry has an action here (shortcutRegistry.test pins the
       // two sets). An id without one is left unclaimed rather than swallowed.
+      // A crew window covers the local session: shortcuts that act on "the
+      // current session" must not reach the hidden one. Close closes the
+      // window; the rest do nothing there.
+      if (crewWindowShown() && CREW_WINDOW_SCOPED.has(hit)) {
+        e.preventDefault()
+        if (hit === 'close-chat') closeShownCrewWindow()
+        return
+      }
       const action = Object.prototype.hasOwnProperty.call(actions, hit) ? actions[hit] : undefined
       if (action) {
         e.preventDefault()
         action()
         return
       }
+    }
+
+    // MRU walk: ⌃⌥` / ⌃⌥⇧` on macOS, Alt+` / Alt+Shift+` elsewhere (see the
+    // registry rows for why the Mac chord carries Control). Literal Control is
+    // REQUIRED on macOS and FORBIDDEN elsewhere, where Ctrl+Alt is AltGr. A
+    // plain Option+` on macOS falls through untouched so the accent composes.
+    // Before the Alt gate because the Mac chord carries Control.
+    if (code === 'Backquote' && e.altKey && !e.metaKey && e.ctrlKey === isMacPlatform()) {
+      if (!enabled || disabled) return
+      e.preventDefault()
+      if (e.shiftKey) {
+        // Walk back MRU history
+        if (slotHistory.length === 0) return
+        mruIndexRef.current = Math.min(mruIndexRef.current + 1, slotHistory.length - 1)
+        const target = slotHistory[slotHistory.length - 1 - mruIndexRef.current]
+        if (target) kbSwitch(target)
+        return
+      }
+      // MRU toggle (last visited)
+      const prev = slotHistory.length > 0 ? slotHistory[slotHistory.length - 1] : null
+      if (prev && prev !== activeSlot) kbSwitch(prev)
+      return
     }
 
     // The code-driven families below all use Alt (Option on Mac)
@@ -1052,28 +1081,6 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
 
     // Suppress all other shortcuts when disabled (e.g. modal open)
     if (disabled) return
-
-    // Alt+Shift+`: Walk back MRU history
-    if (e.shiftKey && code === 'Backquote') {
-      e.preventDefault()
-      suppressNextInputRef.current = true
-      setTimeout(() => { suppressNextInputRef.current = false }, 0)
-      if (slotHistory.length === 0) return
-      mruIndexRef.current = Math.min(mruIndexRef.current + 1, slotHistory.length - 1)
-      const target = slotHistory[slotHistory.length - 1 - mruIndexRef.current]
-      if (target) kbSwitch(target)
-      return
-    }
-
-    // Alt+`: MRU toggle (last visited)
-    if (code === 'Backquote' && !e.shiftKey) {
-      e.preventDefault()
-      suppressNextInputRef.current = true
-      setTimeout(() => { suppressNextInputRef.current = false }, 0)
-      const prev = slotHistory.length > 0 ? slotHistory[slotHistory.length - 1] : null
-      if (prev && prev !== activeSlot) kbSwitch(prev)
-      return
-    }
 
     // Alt+1-9 / Alt+letter: Jump to chat N (when NOT in Ctrl+digit mode).
     // Letters cover sessions 10+; an excluded letter (c/g/k/n/p/s or a
@@ -1099,7 +1106,11 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       // the old isInput gate, so this exclusion preserves, not adds, the
       // shipped terminal behavior). The composer chained-jump fix above is
       // about ordinary text fields, never the PTY.
-      if (jumpIdx >= 0 && (jumpIdx < 9 || (mapped && (!isInput || !IS_MAC) && !isTerminalTarget(e.target)))) {
+      // On macOS digits get the same text-field gate as letters: Option+digit
+      // types a character (Option+3 = # on a UK layout, Option+4 = ¢ on US),
+      // so claiming it while a field has focus ate the typed character.
+      const typingOnMac = IS_MAC && isInput
+      if (jumpIdx >= 0 && ((jumpIdx < 9 && !typingOnMac) || (mapped && !typingOnMac && !isTerminalTarget(e.target)))) {
         e.preventDefault()
         if (mapped) kbSwitch(orderedSlots[jumpIdx].key)
         return
@@ -1113,6 +1124,18 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       const nextIdx = wrapIndex(orderedSlots.length, curIdx, code === 'ArrowLeft' ? -1 : 1)
       if (nextIdx < 0) return
       kbSwitch(orderedSlots[nextIdx].key)
+      return
+    }
+
+    // Alt+↑/↓: previous/next turn of the open chat (turn-prev / turn-next).
+    // Kept out of text fields like Alt+←/→ (Option+↑/↓ moves the caret by
+    // paragraph on macOS) and out of a keystroke a focused control already
+    // claimed (the turn minimap steps its own selection on any ↑/↓).
+    // Claimed only when a transcript took the step, so on any other page the
+    // browser keeps the chord. The chat page does not register its stepper
+    // while a crew window covers its transcript. Shift is left free.
+    if ((code === 'ArrowUp' || code === 'ArrowDown') && !e.shiftKey && !isInput && !e.defaultPrevented) {
+      if (stepTurn(code === 'ArrowUp' ? -1 : 1)) e.preventDefault()
       return
     }
 
@@ -1136,8 +1159,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
   // speech kept playing. Does NOT preventDefault/stopPropagation: Escape must
   // still close whatever it normally closes. Fires the existing `voice-stop`
   // window event (handled by useWebSocket's stopVoice: pause active <audio>,
-  // drop queued chunks, clear voicePlaying). No-op unless audio is actually
-  // playing and shortcuts are enabled; voicePlaying is read live from the store,
+  // drop queued chunks, clear voicePlaying). No-op unless speech is being
+  // prepared or played and shortcuts are enabled; both flags are read live from the store,
   // and this hook mounts once at the App root, so one listener covers every page.
   // Deliberately ignores `disabled` (set while the shortcuts modal is open):
   // Escape should stop speech consistently from any overlay, including the
@@ -1146,7 +1169,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     if (!enabled) return
     const onEsc = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
-      if (!appStore.getState().chat.voicePlaying) return
+      const { voicePlaying, voicePreparing } = appStore.getState().chat
+      if (!voicePlaying && !voicePreparing) return
       window.dispatchEvent(new Event('voice-stop'))
     }
     document.addEventListener('keydown', onEsc, true)

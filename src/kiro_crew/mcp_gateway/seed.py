@@ -118,6 +118,8 @@ def apply_seed(plan: SeedPlan, section: dict, cache: VerdictCache) -> bool:
         if merged != current:
             section["stub_overrides"] = {name: merged[name] for name in sorted(merged)}
             changed = True
+            # A cached recommendation selects routing only. The launch remains
+            # unapproved until the operator reviews its command in MCP Management.
             logger.info(
                 "mcp seeding: stubbing %s on first evaluation (edit "
                 "mcp_gateway.stub_overrides to change)",

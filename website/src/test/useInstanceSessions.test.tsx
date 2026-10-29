@@ -42,7 +42,7 @@ vi.mock('../api/client', () => ({
   api: { listInstances: listInstancesMock, instanceChatSlots: instanceChatSlotsMock },
 }))
 
-import { useInstanceSessions } from '../hooks/useInstanceSessions'
+import { crewBadge, crewGroupsFor, useInstanceSessions } from '../hooks/useInstanceSessions'
 import { lastActivityEpoch } from '../pages/chat/sessionOrder'
 import type { InstanceView } from '../api/client'
 
@@ -128,6 +128,76 @@ describe('useInstanceSessions', () => {
     // asserted through the function the list actually ranks on.
     expect(lastActivityEpoch(row)).toBe(Date.parse('2026-08-31T14:35:00Z') / 1000)
     expect(result.current.failed).toEqual([])
+    // No citation on the wire stays ABSENT, not `parent: undefined` or `null`, so
+    // the row reads the way a citation-less local slot does to a presence test.
+    expect(row).not.toHaveProperty('parent')
+    expect(row).not.toHaveProperty('lineage_pending')
+  })
+
+  it('forwards the creator citation so the conductor lane can nest a peer row', async () => {
+    // The lane resolves `parent.key` against rows of the same `peer_id`. Without
+    // this field every session a peer's conductor opened rendered top-level here
+    // as a stray while the peer's own sidebar nested it.
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'lead', title: 'Lead' },
+      { key: 'w1', title: 'Worker', parent: { slot: 'lead', key: 'lead' } },
+      { key: 'w2', title: 'Provisional', parent: { key: 'lead' }, lineage_pending: true },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(3))
+    const byKey = new Map(result.current.rows.map(r => [r.key, r]))
+    // Both halves cross when present: `key` is what the lane nests on, `slot` is
+    // what the orphan glyph and the move baseline read.
+    expect(byKey.get('w1')?.parent).toEqual({ slot: 'lead', key: 'lead' })
+    expect(byKey.get('w1')).not.toHaveProperty('lineage_pending')
+    expect(byKey.get('w2')?.parent).toEqual({ key: 'lead' })
+    expect(byKey.get('w2')?.lineage_pending).toBe(true)
+    expect(byKey.get('lead')).not.toHaveProperty('parent')
+  })
+
+  it('drops a citation with no string half instead of letting the lane dereference it', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'a', parent: 'lead' },
+      { key: 'b', parent: { key: { nested: 1 } } },
+      { key: 'c', parent: { slot: 7, key: null } },
+      { key: 'd', parent: null },
+      { key: 'e', lineage_pending: 'yes' },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(5))
+    for (const r of result.current.rows) {
+      expect(r).not.toHaveProperty('parent')
+      expect(r).not.toHaveProperty('lineage_pending')
+    }
+  })
+
+  it('keeps the orphan citation (slot without key) so the lane can draw who opened the row', async () => {
+    instanceChatSlotsMock.mockResolvedValue([{ key: 'w', parent: { slot: 'gone' } }])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(1))
+    expect(result.current.rows[0].parent).toEqual({ slot: 'gone' })
+  })
+
+  it('forwards ancestor, which is what tells the pair apart on a re-parented peer row', async () => {
+    // Without it the lane gets a key and a slot that disagree and no reason they do,
+    // so it reads the nesting as ordinary and drops the closed-creator glyph: a
+    // peer's crew looks like sessions the lead opened itself, and the cross-gateway
+    // lane answers differently from the local one about the same fact.
+    instanceChatSlotsMock.mockResolvedValue([
+      { key: 'lead', title: 'Lead' },
+      { key: 'w1', title: 'Worker', parent: { slot: 'mid', key: 'lead', ancestor: true } },
+      // Not a literal `true`, so it does not survive the boundary.
+      { key: 'w2', title: 'Other', parent: { slot: 'mid', key: 'lead', ancestor: 'yes' } },
+    ])
+    const { result } = renderInstanceSessions(true, [CONNECTED])
+
+    await waitFor(() => expect(result.current.rows).toHaveLength(3))
+    const byKey = new Map(result.current.rows.map(r => [r.key, r]))
+    expect(byKey.get('w1')?.parent).toEqual({ slot: 'mid', key: 'lead', ancestor: true })
+    expect(byKey.get('w2')?.parent).toEqual({ slot: 'mid', key: 'lead' })
   })
 
   it('preserves row identity across unrelated rerenders after query data settles', async () => {
@@ -235,6 +305,7 @@ describe('useInstanceSessions', () => {
         agent: 42 as unknown as string,
         created: ['nope'] as unknown as string,
         pending_approval: {} as unknown as boolean,
+        needs_input: 'yes' as unknown as boolean,
         last_turn_ts: '2026-08-31T14:00:00Z',
       },
     ])
@@ -245,8 +316,9 @@ describe('useInstanceSessions', () => {
     expect(row.title).toBeUndefined()
     expect(row.agent).toBeUndefined()
     expect(row.created).toBeUndefined()
-    // A truthy non-boolean must not raise a badge the peer never claimed.
+    // A truthy non-boolean must not raise a badge or a question the peer never claimed.
     expect(row.pending_approval).toBe(false)
+    expect(row.needs_input).toBe(false)
     // The one well-formed field still lands.
     expect(row.last_turn_ts).toBe('2026-08-31T14:00:00Z')
   })
@@ -272,5 +344,56 @@ describe('useInstanceSessions', () => {
     const row = result.current.rows[0]
     expect(row.last_turn_ts).toBeUndefined()
     expect(lastActivityEpoch(row)).toBe(new Date('2026-08-31T14:36:00Z').getTime() / 1000)
+  })
+
+  it('keeps a crew\'s last rows after it disconnects, and stops asking it', async () => {
+    instanceChatSlotsMock.mockResolvedValue([{ key: 'chat-1', title: 'cached row', running: true, pending_approval: true, needs_input: true }])
+    const { result, rerender } = renderHook(
+      ({ list }: { list: unknown[] }) => useInstanceSessions(true, list as InstanceView[]),
+      { wrapper, initialProps: { list: [CONNECTED] } },
+    )
+    await waitFor(() => expect(result.current.rows).toHaveLength(1))
+    const calls = instanceChatSlotsMock.mock.calls.length
+
+    expect(result.current.rows[0].running).toBe(true)
+    expect(result.current.rows[0].needs_input).toBe(true)
+
+    rerender({ list: [{ ...CONNECTED, status: { state: 'disconnected' } }] })
+    expect(result.current.rows.map(r => r.title)).toEqual(['cached row'])
+    // A cached answer carries no live state.
+    expect(result.current.rows[0].running).toBe(false)
+    expect(result.current.rows[0].pending_approval).toBe(false)
+    expect(result.current.rows[0].needs_input).toBe(false)
+    expect(result.current.failed).toEqual([])
+    expect(instanceChatSlotsMock.mock.calls.length).toBe(calls)
+  })
+})
+
+describe('crew groups', () => {
+  it('badges the tunnel states it can name, with disconnected and stopped as offline', () => {
+    expect(crewBadge('connected')).toBe('online')
+    expect(crewBadge('connecting')).toBe('reconnecting')
+    expect(crewBadge('error')).toBe('error')
+    expect(crewBadge('disconnected')).toBe('offline')
+    expect(crewBadge('stopped')).toBe('offline')
+    expect(crewBadge(undefined)).toBeNull()
+  })
+
+  it('groups a listable crew, and an offline one only while a row belongs to it', () => {
+    const list = [CONNECTED, OFFLINE] as unknown as InstanceView[]
+    expect(crewGroupsFor(list, []).map(g => g.id)).toEqual(['astro'])
+    const relay = { executor: 'remote', instance_id: 'chick' }
+    expect(crewGroupsFor(list, [relay])).toEqual([
+      { id: 'astro', name: 'astro', badge: 'online', offline: false, disabled: false },
+      { id: 'chick', name: 'chick', badge: 'offline', offline: true, disabled: false },
+    ])
+    expect(crewGroupsFor([], [relay, { peer_id: 'astro' }])).toEqual([])
+  })
+
+  it('keeps a group for a disabled crew with no rows, badged disabled', () => {
+    const list = [{ ...OFFLINE, disabled: true }] as unknown as InstanceView[]
+    expect(crewGroupsFor(list, [])).toEqual([
+      { id: 'chick', name: 'chick', badge: 'disabled', offline: true, disabled: true },
+    ])
   })
 })

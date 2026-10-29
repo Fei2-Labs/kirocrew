@@ -45,7 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,6 +54,8 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
 )
+from kiro_crew.apps.manager import TASK_RUNNER_APP, TASK_RUNNER_DISABLED_MESSAGE, app_disabled
+from kiro_crew.config.sections import CONTEXT_WARN_MARGIN_PCT
 from kiro_crew.cron import (
     CronStoreBusy,
     CronStoreUnreadable,
@@ -61,10 +63,19 @@ from kiro_crew.cron import (
     format_schedule,
     get_local_tz,
 )
+from kiro_crew.messaging.queue_drain import entries_queued_by
 from kiro_crew.messaging.queue_receipt import ReceiptQueue, ReceiptSurface
 from kiro_crew.safety_override import describe_grant_lifetime, safety_override
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+    force_stop_keeping_others,
+)
+from kiro_crew.subagent_wait_reasons import DEFERRED_QUEUED_REASONS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import edge
     from kiro_crew.cron import CronService
@@ -79,9 +90,15 @@ logger = logging.getLogger(__name__)
 #: Sent when the cooperative cancel reached a live turn.
 STOP_REPLY_CANCELLED = "🛑 Stopped."
 
-#: Sent when there was no live turn -- the queue is still cleared, and saying so
-#: is what distinguishes "nothing to stop" from "the stop did not work".
+#: Sent when there was no live turn -- the caller's own queued messages are still
+#: cleared, and saying so is what distinguishes "nothing to stop" from "the stop did
+#: not work".
 STOP_REPLY_IDLE = "🛑 Nothing was running — queue cleared."
+#: The Stop was declined: the session's own automatic ``/compact`` turn holds it,
+#: and cancelling that turn would fail the compaction and restart the session.
+#: Nothing is cancelled and the queue is KEPT -- the caller's messages run after
+#: the compaction, which is what they were waiting for anyway.
+STOP_REPLY_COMPACTING = STOP_DECLINED_COMPACTING_TEXT
 
 
 def note_user_stop(sessions: Any, session_key: str) -> None:
@@ -109,11 +126,36 @@ async def stop_running_turn(
     *,
     queue: ReceiptQueue,
     surface: ReceiptSurface,
+    owner: str,
+    deliver: Callable[[str], Awaitable[Any]],
 ) -> str:
-    """Abort the in-flight turn, drop the queue, finalize the receipt.
+    """Abort the in-flight turn, drop the caller's queued messages, finalize the receipt.
 
-    Returns the reply text the channel should send; the send itself is the only
-    address-shaped part and stays with the caller.
+    *deliver* sends one reply to the caller's own address, which is the only
+    address-shaped part; it is awaited here, and the text is returned as well so
+    a channel can log it. The send is REQUIRED, with no default, because the
+    compaction decline below arms an escalation that must not outlive an
+    undelivered warning: see :func:`~kiro_crew.session_lifecycle.decline_stop`.
+    For that reason it must hand back WHAT LANDED -- a message id, a ts, a bool --
+    since a falsy result is how a transport that swallows its own send error says
+    the caller was never told, and the escalation then stays unarmed.
+
+    **The queue clear is the CALLER's, not the session's.** ``owner`` is the token
+    :func:`kiro_crew.messaging.queue_drain.owner_token` builds for the person who typed
+    the command, and only entries carrying it are dropped. Under
+    ``messaging.dm_scope = "unified"`` ``build_dm_session_key`` reduces a direct chat's
+    bucket to ``unified:{agent}``, dropping the channel and the user, so every
+    allow-listed person's DM on every transport resolves to one key and one queue: a
+    whole-queue clear here discards messages other people sent and are still owed an
+    answer to, and flips their receipt to a cancellation they never asked for. The
+    argument is REQUIRED, with no default, so a channel wired up later cannot inherit
+    that by leaving it out; a channel that genuinely cannot name its principal passes
+    ``""``, which clears nothing rather than everything.
+
+    The RUNNING turn is still cancelled whoever it belongs to, which is what the caller
+    asked for and what every transport's Stop has always done. Telling one person's turn
+    from another's is not possible from here: a session records the asyncio task holding
+    it, not the sender the task is answering.
 
     **The cancel is cooperative before it is fatal.** ``cancel(wait_ack_timeout=0)``
     writes an ACP ``session/cancel`` notification and returns without waiting, so
@@ -133,9 +175,46 @@ async def stop_running_turn(
     queue is still cleared, so claiming a stop that did not happen would be the
     worse lie.
     """
+    force = False
+    if compaction_in_flight(sessions, session_key):
+        # Before the Stop record and before the queue clear: a Stop the
+        # compaction declines ends nothing, so it must destroy nothing either.
+        # A repeat within the window is the user's second press and FORCES,
+        # so a live turn sharing the session with a compaction stays stoppable
+        # from a channel that has no force button.
+        # Keyed by ``owner`` as well as the session: on a shared key another
+        # person's declined Stop must not arm THIS person's first press.
+        if not consume_stop_declined(session_key, owner):
+            # Sent before the marker is armed, never after: an undelivered
+            # warning plus an armed escalation is a retry that hard-resets the
+            # session with the user never told it would.
+            async def _say_declined() -> bool:
+                # ``deliver`` hands back what landed -- a message id, a ts, a
+                # bool -- so a falsy result is a send that did not reach the
+                # caller, and an unreached caller arms nothing.
+                return bool(await deliver(STOP_REPLY_COMPACTING))
+
+            await decline_stop(session_key, owner, _say_declined)
+            return STOP_REPLY_COMPACTING
+        force = True
     note_user_stop(sessions, session_key)
     cancelled_turn = False
-    if sessions.is_busy(session_key):
+    if force:
+        if getattr(sessions, "stop_turn", None) is not None:
+            try:
+                # The reset is the caller's, the queue is everyone's: the hard
+                # stop pops the session and its queue, so the other people's
+                # entries are carried across to the successor and only the
+                # caller's are dropped (``force_stop_keeping_others``), which is
+                # what the docstring above requires of a shared key.
+                cancelled_turn = await force_stop_keeping_others(
+                    sessions, session_key, entries_queued_by(owner)
+                )
+            except Exception:
+                logger.warning(
+                    "%s: force stop failed for %s", surface.label, session_key, exc_info=True
+                )
+    elif sessions.is_busy(session_key):
         provider = sessions.get_provider(session_key)
         cancel = getattr(provider, "cancel", None)
         if cancel is not None:
@@ -150,9 +229,17 @@ async def stop_running_turn(
                     exc_info=True,
                 )
     async with queue.lock:
-        sessions.clear_queue(session_key)
-        await queue.finish_cancelled_locked(session_key, surface)
-    return STOP_REPLY_CANCELLED if cancelled_turn else STOP_REPLY_IDLE
+        # On the forced repeat the helper above already dropped exactly the
+        # caller's entries that were queued WHEN STOP WAS PRESSED and carried the
+        # rest to the successor; a second owner-scoped clear here would take a
+        # message the same person sent during the stop's awaits, which is newer
+        # intent the Stop was never aimed at. The receipt is still finalized.
+        if not force:
+            sessions.clear_queue(session_key, entries_queued_by(owner))
+        await queue.finish_cancelled_locked(session_key, surface, owner)
+    reply = STOP_REPLY_CANCELLED if cancelled_turn else STOP_REPLY_IDLE
+    await deliver(reply)
+    return reply
 
 
 # ── /yolo (the process-wide auto-approve grant) ──────────────────────────────
@@ -308,10 +395,10 @@ def parse_dashboard_ttl(arg: str, *, parse_duration: DurationParser) -> int:
     ignored rather than making the whole argument unparseable.
 
     *parse_duration* supplies the duration vocabulary and is injected rather than
-    imported: it lives in ``dashboard/token_auth.py``, and ``kiro_crew.messaging``
+    imported: it lives in ``dashboard/token_auth_tokens.py``, and ``kiro_crew.messaging``
     imports nothing from ``kiro_crew.dashboard`` -- that one-way direction is what
     keeps the transport layer independent of the surfaces built on top of it.
-    Callers already import that module for ``generate_token``.
+    Callers already import its facade, ``dashboard/token_auth.py``, for ``generate_token``.
 
     Returns :data:`DEFAULT_DASHBOARD_TTL_SECS` when *arg* names no duration or the
     duration does not parse: a mistyped TTL should still hand the user a working
@@ -485,6 +572,84 @@ def compact_unsupported_reply(backend: str) -> str:
     )
 
 
+def recycle_backend(provider: Any) -> str | None:
+    """Backend id when Crew will RECYCLE *provider*'s session at the threshold.
+
+    The one population the soft-threshold nudge must not stay silent for: a
+    backend in ``ACP_BACKENDS_CONTEXT_RECYCLE`` cannot take ``/compact``, so the
+    ordinary nudge is wrong for it -- but its session IS about to be restarted,
+    so silence is wrong too. A harness-managed backend answers ``None`` here and
+    keeps its suppression: its context shrinks on its own and nothing is lost.
+    """
+    backend = compact_unsupported_backend(provider)
+    if backend is None or compact_refusal_arm(backend) != COMPACT_ARM_RECYCLED:
+        return None
+    return backend
+
+
+def recycle_warning_due(sessions: Any, session_key: str, pct: float) -> bool:
+    """Is *pct* in the band where a recycle is near but has not fired yet?
+
+    The band is ``[threshold - CONTEXT_WARN_MARGIN_PCT, threshold)``, where the
+    threshold is the session's live ``session.autocompact_pct`` -- the reading the
+    recycle fires at. NOT the channel's ``soft_threshold_pct``: that defaults to
+    80 while the recycle defaults to 70, so a warning keyed to it would arrive
+    after the restart it warns about. At or past the threshold the recycle is
+    already under way and the post-restart notice speaks instead; promising
+    "soon" then would be false.
+    """
+    try:
+        threshold = float(sessions.effective_autocompact_pct(session_key))
+    except Exception:  # noqa: BLE001 -- a context notice must never fail a turn
+        logger.debug("recycle warning: threshold unreadable for %s", session_key, exc_info=True)
+        return False
+    return threshold - CONTEXT_WARN_MARGIN_PCT <= pct < threshold
+
+
+def recycle_warning_should_send(
+    sessions: Any, conv: Any, conv_key: Any, session_key: str, pct: float, *, may_speak: bool = True
+) -> bool:
+    """Decide the recycle warning for one turn, latch included; send iff ``True``.
+
+    The one copy of the band-and-latch rule every surface follows: inside the band
+    the warning goes out once per conversation (*conv*'s awaiting flag), and outside
+    it the flag is cleared so the next fill after a restart warns again. A surface
+    that may not speak this turn (*may_speak* false) keeps its one warning unspent.
+    """
+    if not recycle_warning_due(sessions, session_key, pct):
+        conv.clear_awaiting(conv_key)
+        return False
+    if not may_speak or conv.is_awaiting(conv_key):
+        return False
+    conv.set_awaiting(conv_key)
+    return True
+
+
+def context_recycle_warning(new_command: str = "/new") -> str:
+    """The advance warning for a recycle backend, in English.
+
+    The same facts the recycle arm of :func:`compact_unsupported_reply` states --
+    no compaction, a fresh session when the context fills, the agent forgets --
+    said BEFORE it happens, with the one action that helps. *new_command* is the
+    surface's own spelling (``!new`` on Discord, a code span where the surface
+    renders one).
+    """
+    return (
+        "⚠️ This conversation's context is getting long. This backend can't compact "
+        "it, so Kiro Crew will start a fresh session when the context fills up: the "
+        "chat keeps working, but the agent stops remembering the earlier turns. "
+        f"Send {new_command} to start fresh on your own terms first."
+    )
+
+
+def context_recycle_warning_zh() -> str:
+    """:func:`context_recycle_warning` for the three Chinese surfaces, said once."""
+    return (
+        "⚠️ 对话上下文已较长。当前后端无法压缩上下文，上下文快满时 Kiro Crew 会替你开一个新会话："
+        "对话可以继续，但助手不再记得之前的内容。你也可以先发 /new 自己开新会话。"
+    )
+
+
 def compact_unsupported_reply_zh(backend: str) -> str:
     """The same three refusals as :func:`compact_unsupported_reply`, in Chinese.
 
@@ -512,6 +677,14 @@ def compact_unsupported_reply_zh(backend: str) -> str:
         "ℹ️ 当前后端不支持手动 /compact，Kiro Crew 也无法替它压缩上下文。"
         "上下文快满之前，请发 /new 开始新会话。"
     )
+
+
+#: The manual ``/compact`` receipt for a compaction that timed out, on the three
+#: Chinese-language surfaces. ``wait_for_compaction()`` reports a timeout as a
+#: returned ``{"type": "timeout"}`` rather than an exception, so it is a receipt
+#: of its own; held here, once, for the same reason as
+#: :func:`compact_unsupported_reply_zh`.
+COMPACT_TIMED_OUT_REPLY_ZH = "⚠️ 压缩超时。"
 
 
 #: How much of a cron job's message body a list row shows.
@@ -689,6 +862,27 @@ async def spawn_task_reply(
         return f"⚠️ {_redact(str(exc))}"
     if not info:
         return f"⚠️ Subagent capacity reached ({manager.max_concurrent}). Try again later."
+    # A refusal comes back as a terminal record, not as None: it never ran, and
+    # a non-batch refusal is announced nowhere else, so this reply is the only
+    # place the user learns why.
+    refusal = str(getattr(info, "error", "") or "")
+    if getattr(info, "done", False) is True and refusal:
+        # A refusal's own leading verdict ("spawn refused: ", "never started: ")
+        # would stack a second clause on "was not started: ".
+        reason = refusal.removeprefix("spawn refused: ").removeprefix("never started: ")
+        return f"⚠️ Subagent `{info.id}` was not started: {_redact(reason)}"
+    # A row the gate DEFERRED (memory floor, critical posture, paused cap) is
+    # accepted under its id but not running, and may not run for a long time;
+    # say so with the gate's own sentence instead of announcing a start. The
+    # kinds come from the leaf module, never from ``kiro_crew.subagent`` (see
+    # the module docstring: that import would reintroduce the slack edge).
+    queued_reason = str(getattr(info, "queued_reason", "") or "")
+    if queued_reason in DEFERRED_QUEUED_REASONS:
+        detail = _redact(str(getattr(info, "queued_reason_detail", "") or queued_reason))
+        return (
+            f"⏳ Queued subagent `{info.id}` — not started yet: {detail}\n"
+            f"_{_redact(task)[:_SPAWN_ECHO_CHARS]}_"
+        )
     return f"🚀 Spawned subagent `{info.id}`\n_{_redact(task)[:_SPAWN_ECHO_CHARS]}_"
 
 
@@ -908,6 +1102,9 @@ async def task_arg_reply(
         runner.cancel()
         return "🛑 Task cancelled."
 
+    # Same switch as POST /api/taskrunner: disabled in Library means no new runs.
+    if await asyncio.to_thread(app_disabled, TASK_RUNNER_APP):
+        return f"❌ {TASK_RUNNER_DISABLED_MESSAGE}"
     if runner.running:
         return "⚠️ Task runner is already running. Use `task run cancel` first."
     # The spec is READ and its contents reach the model, so an arbitrary path is

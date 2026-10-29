@@ -36,6 +36,7 @@ const storeState: {
 vi.mock('../../store', () => ({
   useAppDispatch: () => dispatch,
   useAppSelector: (fn: (s: unknown) => unknown) => fn(storeState),
+  useAppStore: () => ({ getState: () => storeState }),
 }))
 vi.mock('../../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
@@ -66,10 +67,17 @@ vi.mock('../../hooks/useTheme', () => ({ useTheme: () => ({ cycle: vi.fn() }) })
 /** Every network call the overlay could make, so a request is observable. */
 const listApps = vi.fn(async () => [])
 const chatFolders = vi.fn(async () => [] as unknown[])
+const kirocrewConfig = vi.fn(async () => ({}) as unknown)
+// The settings-search governance reads: the root must answer from cache, never fetch.
+const dashboardConfig = vi.fn(async () => ({}) as unknown)
+const tipsStatus = vi.fn(async () => ({}) as unknown)
 vi.mock('../../api/client', () => ({
   api: {
     listApps: (...a: unknown[]) => listApps(...(a as [])),
     chatFolders: (...a: unknown[]) => chatFolders(...(a as [])),
+    kirocrewConfig: (...a: unknown[]) => kirocrewConfig(...(a as [])),
+    dashboardConfig: (...a: unknown[]) => dashboardConfig(...(a as [])),
+    tipsStatus: (...a: unknown[]) => tipsStatus(...(a as [])),
   },
 }))
 
@@ -85,22 +93,65 @@ const FOLDERS = [
 ]
 
 /**
+ * Roots whose stored order (`Zulu, alpha, Mike`) agrees with neither view order
+ * (`alpha, Mike, Zulu` by name; `Mike, Zulu, alpha` newest first), so a mode that
+ * never reached the engine shows as a wrong list rather than hiding behind a
+ * fixture that happens to agree with it.
+ */
+const MODE_FOLDERS = [
+  { id: 'f-zulu', name: 'Zulu', parent_id: '', order: 0, collapsed: false, hidden: false, created_at: 200 },
+  { id: 'f-alpha', name: 'alpha', parent_id: '', order: 1, collapsed: false, hidden: false, created_at: 100 },
+  { id: 'f-mike', name: 'Mike', parent_id: '', order: 2, collapsed: false, hidden: false, created_at: 300 },
+]
+
+/** The folder rows on screen, top to bottom, by the name each row shows. */
+const folderRowOrder = (names: string[]): string[] =>
+  screen
+    .queryAllByRole('option')
+    .map(r => names.find(n => (r.textContent || '').includes(n)))
+    .filter((n): n is string => !!n)
+
+/**
  * Mount the bar with the folder list already in the shared cache, which is where
  * the sidebar's own read (or the WebSocket) leaves it in production.
  *
  * Pass `seed: false` for the cold-cache case: nothing is in the key, so the view's
  * own fetch is what produces the list.
+ *
+ * `config` seeds the shared `['kirocrewConfig']` entry the way the shell's own read
+ * leaves it: a body puts the entry in its success state; `'failed'` runs one
+ * rejecting read through the client first, so the entry is in its ERROR state
+ * before the bar mounts — the bar itself never fetches that key.
+ *
+ * Pass `client` to reuse one cache across two mounts, which is what the bar does in
+ * production: `QuickSearchSurface` mounts the overlay only while it is open, so a
+ * close and a reopen are an unmount and a remount against the app's one
+ * `QueryClient`.
  */
-function mount(folders: unknown[] = FOLDERS, opts: { seed?: boolean } = {}) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+async function mount(
+  folders: unknown[] = FOLDERS,
+  opts: { seed?: boolean; config?: Record<string, unknown> | 'failed'; client?: QueryClient } = {},
+) {
+  const client =
+    opts.client ?? new QueryClient({ defaultOptions: { queries: { retry: false } } })
   if (opts.seed !== false) client.setQueryData(['chat-folders'], folders)
+  if (opts.config === 'failed') {
+    await client
+      .fetchQuery({
+        queryKey: ['kirocrewConfig'],
+        queryFn: () => Promise.reject(new Error('settings read refused: 503')),
+      })
+      .catch(() => undefined)
+  } else if (opts.config) {
+    client.setQueryData(['kirocrewConfig'], opts.config)
+  }
   const onClose = vi.fn()
-  render(
+  const { unmount } = render(
     <QueryClientProvider client={client}>
       <CommandBarOverlay open onClose={onClose} />
     </QueryClientProvider>,
   )
-  return { onClose, client }
+  return { onClose, client, unmount }
 }
 
 const type = (text: string) => {
@@ -140,12 +191,20 @@ const hasRow = (text: string): boolean =>
  * cold-cache cases legitimately have no rows yet, and a helper that waited for one
  * would hang on exactly the states those tests exist to pin.
  */
-const openFoldersView = async (folders: unknown[] = FOLDERS, opts: { seed?: boolean } = {}) => {
-  const mounted = mount(folders, opts)
+const openFoldersView = async (
+  folders: unknown[] = FOLDERS,
+  opts: { seed?: boolean; config?: Record<string, unknown> | 'failed'; client?: QueryClient } = {},
+) => {
+  const mounted = await mount(folders, opts)
+  await enterFoldersView()
+  return mounted
+}
+
+/** Walk an ALREADY-MOUNTED bar from the root into the folders view. */
+const enterFoldersView = async () => {
   await waitFor(() => expect(hasRow('Search Folders')).toBe(true))
   fireEvent.mouseDown(rowByText('Search Folders'))
   await waitFor(() => expect(screen.getByPlaceholderText('Search all folders…')).toBeTruthy())
-  return mounted
 }
 
 beforeEach(() => {
@@ -210,6 +269,105 @@ describe('command bar — the root', () => {
     // endpoint's synchronous on-disk session walk is never paid for a keystroke.
     expect(chatFolders).not.toHaveBeenCalled()
     expect(listApps).not.toHaveBeenCalled()
+    // The folder ORDER's settings read is a cache subscription too: the shell holds
+    // that entry, and opening the bar must not refetch it.
+    expect(kirocrewConfig).not.toHaveBeenCalled()
+    // Nor do the settings rows' governance reads, whatever their age.
+    expect(dashboardConfig).not.toHaveBeenCalled()
+    expect(tipsStatus).not.toHaveBeenCalled()
+  })
+})
+
+describe('command bar — folders view, sort mode', () => {
+  it('lists in the sidebar\'s own mode, read from the shared settings entry', async () => {
+    // `dashboard.folder_sort` is what the sidebar draws with; the view's promise is
+    // the sidebar's order, so a name-mode setting has to reach the engine.
+    await openFoldersView(MODE_FOLDERS, { config: { dashboard: { folder_sort: 'name' } } })
+    await waitFor(() => expect(hasRow('Zulu')).toBe(true))
+    expect(folderRowOrder(['Zulu', 'alpha', 'Mike'])).toEqual(['alpha', 'Mike', 'Zulu'])
+    // Read from the cache, not fetched: the launcher invariant holds in the view too.
+    expect(kirocrewConfig).not.toHaveBeenCalled()
+  })
+
+  it('draws the stored order when the setting is absent or unknown', async () => {
+    // An older gateway without the field, or a value this build does not know,
+    // reads as Custom — the order every earlier build drew — never as nothing.
+    await openFoldersView(MODE_FOLDERS, { config: { dashboard: { folder_sort: 'sideways' } } })
+    await waitFor(() => expect(hasRow('Zulu')).toBe(true))
+    expect(folderRowOrder(['Zulu', 'alpha', 'Mike'])).toEqual(['Zulu', 'alpha', 'Mike'])
+  })
+
+  it('re-lists when the mode changes under an open view, not after a stale window', async () => {
+    // The sidebar menu writes the new mode into the SAME cache entry. The view is a
+    // subscriber to it, and the mode is part of the list's query identity, so the
+    // switch shows at once rather than being served from the previous order for
+    // the rest of the list's stale time.
+    const { client } = await openFoldersView(MODE_FOLDERS, {
+      config: { dashboard: { folder_sort: 'custom' } },
+    })
+    await waitFor(() => expect(hasRow('Zulu')).toBe(true))
+    expect(folderRowOrder(['Zulu', 'alpha', 'Mike'])).toEqual(['Zulu', 'alpha', 'Mike'])
+    client.setQueryData(['kirocrewConfig'], { dashboard: { folder_sort: 'created' } })
+    await waitFor(() =>
+      expect(folderRowOrder(['Zulu', 'alpha', 'Mike'])).toEqual(['Mike', 'Zulu', 'alpha']),
+    )
+  })
+
+  it('says the order could not be read when the shared settings read has failed, and still lists', async () => {
+    // The list is the stored order whatever mode the person chose, which is the
+    // dead end the notice exists to name — the same one the sidebar reports over
+    // its own tree. The failure is the shared entry's, so the bar never re-fetches
+    // to learn it.
+    await openFoldersView(MODE_FOLDERS, { config: 'failed' })
+    const notice = await screen.findByTestId('command-bar-folder-order-unavailable')
+    expect(notice.textContent).toContain('Folder order could not be read')
+    // The raw server string is the message: it is what the notice's journal lookup
+    // matches on, and what the sidebar's own notice shows for the same failure --
+    // but under the plain title as a smaller line, not as the lead.
+    expect(notice.textContent).toContain('settings read refused: 503')
+    const raw = [...notice.querySelectorAll('span')].find(el => el.textContent === 'settings read refused: 503')
+    expect(raw?.className).toContain('basis-full')
+    expect(raw?.className).toContain('text-[11px]')
+    // Passive: no hand-off, since the query typed into the bar is unsaved.
+    expect(notice.querySelector('button, a')).toBeNull()
+    // The plain line under it: what the list is showing (a picker: "listed", not
+    // the sidebar's "arrangement"), that nothing is asked (the shell's read
+    // retries on its own), and where the hand-off this notice lacks lives.
+    expect(screen.getByTestId('command-bar-folder-order-unavailable-detail').textContent)
+      .toBe('All folders are shown, in your Custom order; retries automatically. Open the chat sidebar to ask the agent about it.')
+    // Outside the listbox, like the search-failed notice: no option owns it.
+    expect(notice.closest('[role="option"]')).toBeNull()
+    // The list itself is still there, in the stored order.
+    await waitFor(() => expect(hasRow('Zulu')).toBe(true))
+    expect(folderRowOrder(['Zulu', 'alpha', 'Mike'])).toEqual(['Zulu', 'alpha', 'Mike'])
+    expect(kirocrewConfig).not.toHaveBeenCalled()
+  })
+
+  it('says nothing when a body is on hand, even if the shell\'s last refetch of it failed', async () => {
+    // react-query keeps the previous body across a failed refetch and retries
+    // on its own; the view knows the mode from that body and lists in it.
+    const { client } = await openFoldersView(MODE_FOLDERS, {
+      config: { dashboard: { folder_sort: 'name' } },
+    })
+    await waitFor(() => expect(hasRow('Zulu')).toBe(true))
+    await client
+      .fetchQuery({
+        queryKey: ['kirocrewConfig'],
+        queryFn: () => Promise.reject(new Error('settings read refused: 503')),
+        staleTime: 0,
+      })
+      .catch(() => undefined)
+    expect(client.getQueryState(['kirocrewConfig'])?.status).toBe('error')
+    await waitFor(() => expect(folderRowOrder(['Zulu', 'alpha', 'Mike'])).toEqual(['alpha', 'Mike', 'Zulu']))
+    expect(screen.queryByTestId('command-bar-folder-order-unavailable')).toBeNull()
+  })
+
+  it('shows no order notice on the root or in another view', async () => {
+    // The failure is about the folder LIST's order; a root or a sessions view that
+    // carried it would name a problem the reader is not looking at.
+    await mount(MODE_FOLDERS, { config: 'failed' })
+    await waitFor(() => expect(hasRow('Search Folders')).toBe(true))
+    expect(screen.queryByTestId('command-bar-folder-order-unavailable')).toBeNull()
   })
 })
 
@@ -280,6 +438,50 @@ describe('command bar — folders view', () => {
     )
   })
 
+  it('latches a debounce-window Enter and reveals the folder on the live rows', async () => {
+    // This view ranks from the DEBOUNCED query like every other scoped one, so for one
+    // debounce interval after a keystroke its rows answer the previous query. An Enter
+    // in that window is held, never acting on the row selected against the old query,
+    // and fired once the rows answer what the reader typed. Reported first in the
+    // crewmates view; the latch is on the activation path all four share.
+    await openFoldersView()
+    type('sydney')
+    await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
+    dispatch.mockClear()
+    navigate.mockClear()
+    const input = screen.getByRole('combobox')
+    fireEvent.change(input, { target: { value: 'trading' } })
+    // No debounce tick: the row on screen is still Sydney Property.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(navigate).not.toHaveBeenCalled()
+    expect(dispatch).not.toHaveBeenCalledWith({
+      type: 'requestFolderReveal',
+      folderId: 'f-syd',
+    })
+    // The latched Enter reveals what was typed on its own, never the stale folder.
+    await waitFor(() =>
+      expect(dispatch).toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-trade' }),
+    )
+    expect(dispatch).not.toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-syd' })
+  })
+
+  it('still opens the row a POINTER pressed inside that same window', async () => {
+    // A pointer names its own target: the reader pressed the row they could read, and
+    // that row reveals what it says. Only Enter names an index, and only an index means
+    // a different folder once the rows move under it — so the guard is on the keyboard
+    // path alone. Blocking the click instead made a visible row simply not respond.
+    await openFoldersView()
+    type('sydney')
+    await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
+    dispatch.mockClear()
+    const input = screen.getByRole('combobox')
+    fireEvent.change(input, { target: { value: 'trading' } })
+    fireEvent.mouseDown(rowByText('Sydney Property'))
+    await waitFor(() =>
+      expect(dispatch).toHaveBeenCalledWith({ type: 'requestFolderReveal', folderId: 'f-syd' }),
+    )
+  })
+
   it('names the Enter action "Open" on a folder row, not "Open Session"', async () => {
     // The footer's job is to say what Enter does, and what it does here is reveal a
     // folder. The sessions view's own verb would promise a conversation.
@@ -326,6 +528,54 @@ describe('command bar — folders view', () => {
     await openFoldersView(FOLDERS, { seed: false })
     await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
     expect(chatFolders).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops a folder the sidebar deleted, instead of re-listing it from the view cache', async () => {
+    // The view's corpus IS the sidebar's `['chat-folders']` cache, and every folder
+    // write ends in `invalidateQueries({ queryKey: ['chat-folders'] })`
+    // (`ChatSidebar.tsx` create/delete/update). That invalidation has to reach the
+    // rows this view derives from the corpus, or a deleted folder stays on screen
+    // and stays actionable — activating it reveals an id the sidebar no longer has.
+    //
+    // The sequence is the production one: `QuickSearchSurface` mounts the overlay
+    // only while it is open, so closing the bar unmounts the view and reopening it
+    // remounts against the SAME `QueryClient`. A remount refetches only what is
+    // stale, which is why the invalidation is the whole mechanism here.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    chatFolders.mockResolvedValue(FOLDERS)
+    const { unmount } = await openFoldersView(FOLDERS, { client })
+    await waitFor(() => expect(hasRow('Trading Desk')).toBe(true))
+    unmount()
+
+    // The sidebar deletes `Trading Desk`: the gateway now answers without it, and
+    // the mutation invalidates the shared corpus key.
+    const remaining = FOLDERS.filter(f => f.id !== 'f-trade')
+    chatFolders.mockResolvedValue(remaining)
+    await client.invalidateQueries({ queryKey: ['chat-folders'] })
+
+    mount(FOLDERS, { client, seed: false })
+    await enterFoldersView()
+    await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
+    expect(hasRow('Trading Desk')).toBe(false)
+  })
+
+  it('still serves the view from cache when nothing invalidated the corpus', async () => {
+    // The control for the test above: reopening the bar must not re-derive the list
+    // just because it was reopened. Without this, a fix that simply dropped the
+    // view's `staleTime` would pass the regression while paying for a folder read
+    // on every open — the cost the shared key exists to avoid.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    chatFolders.mockResolvedValue(FOLDERS)
+    const { unmount } = await openFoldersView(FOLDERS, { client })
+    await waitFor(() => expect(hasRow('Trading Desk')).toBe(true))
+    unmount()
+    chatFolders.mockClear()
+
+    mount(FOLDERS, { client, seed: false })
+    await enterFoldersView()
+    await waitFor(() => expect(hasRow('Sydney Property')).toBe(true))
+    expect(hasRow('Trading Desk')).toBe(true)
+    expect(chatFolders).not.toHaveBeenCalled()
   })
 
   it('reports a failed folder read through ErrorNotice, with Retry still in the list', async () => {

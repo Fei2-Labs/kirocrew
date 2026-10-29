@@ -542,6 +542,7 @@ class TestTheRoute:
             tool_args=False,
             compaction=False,
             memory_text=False,
+            nudge_evidence=False,
         ):
             seen.append(memory_text)
             return real(
@@ -551,6 +552,7 @@ class TestTheRoute:
                 tool_args=tool_args,
                 compaction=compaction,
                 memory_text=memory_text,
+                nudge_evidence=nudge_evidence,
             )
 
         monkeypatch.setattr(consent, "save_enabled", _spy)

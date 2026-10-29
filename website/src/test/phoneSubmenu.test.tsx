@@ -164,15 +164,19 @@ describe('PhoneSubContentDiv', () => {
     expect(screen.getByText('picker')).toBeTruthy()
   })
 
-  it('keeps tall inline submenus reachable via vertical scroll', () => {
+  it('grows to its full height so the enclosing menu scroll reaches every row', () => {
+    // A nested scroll box inside the already-scrolling menu ends at a row
+    // boundary with no cue, so the inline body must never clip or scroll itself,
+    // even when a caller passes the cap it uses for the desktop flyout.
     const { container } = render(
-      <PhoneSubContentDiv>
+      <PhoneSubContentDiv className="min-w-[170px] max-h-[280px] overflow-y-auto">
         <span>picker</span>
       </PhoneSubContentDiv>,
     )
     const body = container.firstElementChild as HTMLElement
-    expect(body.className).toContain('overflow-y-auto')
-    expect(body.className).not.toContain('overflow-hidden')
+    expect(body).toHaveClass('min-w-[170px]')
+    expect(body.style.maxHeight).toBe('none')
+    expect(body.style.overflow).toBe('visible')
   })
 })
 

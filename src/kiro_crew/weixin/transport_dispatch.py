@@ -40,9 +40,13 @@ from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
 from kiro_crew.messaging.commands import (
+    COMPACT_TIMED_OUT_REPLY_ZH,
     compact_unsupported_backend,
     compact_unsupported_reply_zh,
+    context_recycle_warning_zh,
     note_user_stop,
+    recycle_backend,
+    recycle_warning_should_send,
 )
 from kiro_crew.messaging.conversation import reserve_new_generation
 from kiro_crew.messaging.dispatch import (
@@ -55,8 +59,17 @@ from kiro_crew.messaging.dispatch import (
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.inbound_spool import InboundRoute
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
+from kiro_crew.messaging.queue_drain import entries_queued_by, owner_token
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.safety_override import safety_override
+from kiro_crew.session_lifecycle import (
+    STOP_DECLINED_COMPACTING_TEXT,
+    compaction_in_flight,
+    consume_stop_declined,
+    decline_stop,
+    force_stop_keeping_others,
+)
+from kiro_crew.start_priority import person_priority
 from kiro_crew.weixin.attachments import process_weixin_attachments
 from kiro_crew.weixin.commands import ConversationState, build_help, parse_command
 from kiro_crew.weixin.transport import WEIXIN_CAPABILITIES
@@ -376,6 +389,7 @@ class WeixinDispatcher:
         # messaging.dispatch. Only the weixin-specific pieces are injected.
         await drive_turn(
             ChannelTurn(
+                start_priority=person_priority(inbound.person_origin),
                 channel_type="weixin",
                 session_key=session_key,
                 # Durable inbound spool: the peer id IS the reply
@@ -470,6 +484,40 @@ class WeixinDispatcher:
         the session while its turn is still unwinding.
         """
         session_key = self._session_key(user_id)
+        # Before the Stop record and the queue clear: a Stop the session's own
+        # automatic compaction declines ends nothing and must destroy nothing.
+        if compaction_in_flight(self.sessions, session_key):
+            # A repeat within the window is the second press and forces. Keyed
+            # by the presser too: under a unified ``dm_scope`` one session key
+            # is every user's, and another user's declined Stop must not arm
+            # this user's first press.
+            if not consume_stop_declined(session_key, user_id):
+                # Sent before the marker is armed: an undelivered warning plus an
+                # armed escalation is a retry that hard-resets the session with
+                # this user never told that it would.
+                await decline_stop(
+                    session_key,
+                    user_id,
+                    lambda: self._say(user_id, STOP_DECLINED_COMPACTING_TEXT),
+                )
+                return
+            note_user_stop(self.sessions, session_key)
+            try:
+                # Through the queue-keeping helper: this channel queues nothing
+                # itself, but under a unified ``dm_scope`` the key is shared
+                # with channels that do, and the hard reset would pop their
+                # queued messages and unlink their attachments. The presser's
+                # own token matches none of those entries, so all are carried.
+                forced = await force_stop_keeping_others(
+                    self.sessions,
+                    session_key,
+                    entries_queued_by(owner_token("weixin", (user_id,))),
+                )
+            except Exception:
+                logger.warning("weixin /stop: force stop failed for %s", session_key, exc_info=True)
+                forced = False
+            await self._say(user_id, _STOPPING if forced else _STOP_FAILED)
+            return
         # Recorded before the busy check, so a Stop landing while the session is
         # between an abandoned attempt and its replay still counts (see
         # ``note_user_stop``).
@@ -510,8 +558,15 @@ class WeixinDispatcher:
                         )
         await self._say(user_id, ack)
 
-    async def _say(self, user_id: str, text: str) -> None:
-        """One-shot out-of-band message (command ack / notice)."""
+    async def _say(self, user_id: str, text: str) -> bool:
+        """One-shot out-of-band message (command ack / notice); did it land?
+
+        Most callers ignore the answer -- an ack is cosmetic beside the command's
+        effect. One does not: the compaction decline arms an escalation that
+        resets the session on the next press, and this text is the only thing
+        that makes that press informed, so a send whose error is logged here
+        returns ``False`` and arms nothing.
+        """
         assert self.client is not None
         try:
             await self.client.send_message(
@@ -522,6 +577,8 @@ class WeixinDispatcher:
             )
         except Exception:
             logger.warning("weixin: out-of-band send failed", exc_info=True)
+            return False
+        return True
 
     def _resolve_agent(self) -> str:
         return self.agent or self.cfg.agent.default_agent or _DEFAULT_KIROCREW_AGENT
@@ -588,6 +645,12 @@ class WeixinDispatcher:
         """
         pct = self.sessions.check_context_usage(session_key, provider)
         soft, hard = self._thresholds()
+        if recycle_backend(provider):
+            # Crew restarts this backend's session at the threshold; warn once
+            # before it, offering a fresh start instead of a compaction.
+            if recycle_warning_should_send(self.sessions, self._conv, user_id, session_key, pct):
+                await self._say(user_id, context_recycle_warning_zh())
+            return
         if pct >= soft:
             # Capability gate: no forced compaction to run and the
             # soft nudge's /compact advice cannot work — the backend compacts
@@ -600,8 +663,15 @@ class WeixinDispatcher:
             self._conv.clear_awaiting(user_id)
             try:
                 await provider.compact()
-                await provider.wait_for_compaction()
-                await self._say(user_id, _AUTO_COMPACTED)
+                # A failed or timed-out compaction is a RETURNED result, not an
+                # exception, so the notice is posted only for a completed one.
+                cr = await provider.wait_for_compaction(
+                    timeout=self.sessions.compact_wait_budget_secs()
+                )
+                if cr["type"] == "completed":
+                    await self._say(user_id, _AUTO_COMPACTED)
+                else:
+                    logger.warning("weixin hard-threshold compaction reported %s", cr["type"])
             except Exception:
                 logger.debug("weixin hard-threshold compaction failed", exc_info=True)
         elif pct >= soft and not self._conv.is_awaiting(user_id):
@@ -634,8 +704,17 @@ class WeixinDispatcher:
                 await self._say(user_id, compact_unsupported_reply_zh(unsupported))
                 return
             await provider.compact()
-            await provider.wait_for_compaction()
-            await self._say(user_id, _COMPACT_DONE)
+            # Failure and timeout come back as the result's ``type``, not as an
+            # exception, so the receipt is read off it rather than assumed.
+            cr = await provider.wait_for_compaction(
+                timeout=self.sessions.compact_wait_budget_secs()
+            )
+            if cr["type"] == "completed":
+                await self._say(user_id, _COMPACT_DONE)
+            elif cr["type"] == "failed":
+                await self._say(user_id, _COMPACT_FAILED)
+            else:
+                await self._say(user_id, COMPACT_TIMED_OUT_REPLY_ZH)
         except Exception:
             logger.exception("weixin /compact failed for %s", session_key)
             await self._say(user_id, _COMPACT_FAILED)

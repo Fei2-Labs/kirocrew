@@ -12,6 +12,7 @@ shrink -- no operation may add a path or raise a count.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -33,7 +34,7 @@ PROFILE = (
     / "kiro_crew"
     / "builtin_skills"
     / "kirocrew-dev"
-    / "prepare-pr"
+    / "kirocrew-prepare-pr"
     / "profiles"
     / "kirocrew.json"
 )
@@ -142,7 +143,7 @@ class TestRuleFamilies:
         ), f"families without a probe: {set(gate.FAMILY_REMEDY) - seen}"
 
     def test_each_family_classifies_to_its_own_name(self) -> None:
-        # The corpus proves "flagged"; these four pin WHICH family, which is what
+        # The corpus proves "flagged"; these pin WHICH family, which is what
         # selects the remedy text a contributor is shown.
         assert self._families("async def f(store):\n    store.db.execute('SELECT 1')\n") == ["db"]
         assert self._families(
@@ -152,6 +153,46 @@ class TestRuleFamilies:
             "import requests\nasync def f():\n    requests.get('http://x')\n"
         ) == ["http"]
         assert self._families("import time\nasync def f():\n    time.sleep(5)\n") == ["sleep"]
+        assert self._families("import os\nasync def f(p):\n    os.path.isdir(p)\n") == ["fs"]
+        # os.system stays subprocess even though os now carries fs entries too.
+        assert self._families("import os\nasync def f():\n    os.system('true')\n") == [
+            "subprocess"
+        ]
+
+    def test_a_path_method_is_matched_only_without_a_positional_argument(self) -> None:
+        # Arity is the whole precision story for a receiver a name scan cannot
+        # type: `p.exists()` probes a path, `store.exists(key)` asks a store.
+        source = "async def f(p, store, key):\n    p.exists()\n    store.exists(key)\n"
+        assert gate._violations_in_source(source) == [(2, "fs", None)]
+
+    def test_pathlib_reads_and_writes_are_matched_by_their_own_arity(self) -> None:
+        # Reads and `.open()` take no positional argument on a Path, the
+        # writes take exactly one (the data). Any other count is some other API.
+        source = (
+            "async def f(p, s, b, r, k):\n"
+            "    p.read_text()\n"
+            "    p.read_bytes()\n"
+            "    p.open()\n"
+            "    p.write_text(s)\n"
+            "    p.write_bytes(b)\n"
+            "    r.read_text(k)\n"
+            "    r.read_bytes(k)\n"
+            "    r.open(k)\n"
+            "    r.write_text()\n"
+            "    r.write_bytes()\n"
+            "    r.write_text(k, s)\n"
+        )
+        assert gate._violations_in_source(source) == [
+            (2, "fs", None),
+            (3, "fs", None),
+            (4, "fs", None),
+            (5, "fs", None),
+            (6, "fs", None),
+        ]
+
+    def test_only_a_bare_open_is_the_builtin(self) -> None:
+        source = "async def f(p, z):\n    open(p)\n    z.open(p)\n"
+        assert gate._violations_in_source(source) == [(2, "fs", None)]
 
     def test_flags_multiline_calls_once(self) -> None:
         source = (
@@ -350,6 +391,21 @@ class TestBaselineRatchet:
             f"baseline entry: {entries}"
         )
 
+    def test_the_fs_ledger_never_counts_another_familys_site(self) -> None:
+        # The fs baseline is a SEPARATE ledger, so no fs entry can stand in for
+        # a db / subprocess / http / sleep call in the same file.
+        found = {"a.py": [(1, "fs", None), (2, "db", None)], "b.py": [(3, "fs", None)]}
+        assert gate._split(found, fs=True) == {
+            "a.py": [(1, "fs", None)],
+            "b.py": [(3, "fs", None)],
+        }
+        assert gate._split(found, fs=False) == {"a.py": [(2, "db", None)]}
+
+    def test_committed_fs_baseline_is_byte_identical_to_a_refresh(self, tmp_path: Path) -> None:
+        path = tmp_path / gate.FS_BASELINE.name
+        gate._write_baseline(path, gate._read_baseline(gate.FS_BASELINE))
+        assert path.read_text(encoding="utf-8") == gate.FS_BASELINE.read_text(encoding="utf-8")
+
     def test_missing_baseline_refuses_rather_than_absorbs(self, tmp_path: Path) -> None:
         with pytest.raises(SystemExit):
             gate._read_baseline(tmp_path / "nope.txt")
@@ -412,7 +468,17 @@ class TestExemplarStaysClean:
         # dashboard/handlers/memory.py is the control case: it wraps every
         # store call in asyncio.to_thread while handlers/knowledge.py next door
         # does not. It must never appear in the baseline.
+        # The facade's owners (its ``_OWNERS``) hold the moved handlers, so each is read too.
         rel = "src/kiro_crew/dashboard/handlers/memory.py"
-        source = (ROOT / rel).read_text(encoding="utf-8")
-        assert gate._violations_in_source(source) == []
-        assert rel not in gate._read_baseline(BASELINE)
+        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
+        owners = next(
+            ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(getattr(target, "id", "") == "_OWNERS" for target in node.targets)
+        )
+        assert owners, "the memory facade names no owners -- the join went blind"
+        for path in (rel, *(f"src/{owner.replace('.', '/')}.py" for owner in owners)):
+            source = (ROOT / path).read_text(encoding="utf-8")
+            assert gate._violations_in_source(source) == []
+            assert path not in gate._read_baseline(BASELINE)

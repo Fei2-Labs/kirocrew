@@ -45,6 +45,7 @@ function loadCompanion(wiring) {
     closePanelWindow() { calls.closePanel += 1; },
     closeGalleryWindow() { calls.closeGallery += 1; },
     petWindowCount: () => (windowOpen ? 1 : 0),
+    rearmBlankedCompanionWindows: () => 0,
     startHitboxPoll() {}, stopHitboxPoll() {},
   };
 
@@ -94,7 +95,7 @@ test("suspend closes the overlays and latches the reconcile loop", async () => {
   const mod = loadCompanion({ status: [200] });
   mod.initCrewCompanion({
     backendUrl: "http://127.0.0.1:5476",
-    fetchLocalToken: async () => "tok",
+    fetchGatewayAuth: async () => ({ value: "tok" }),
     glog: () => {},
   });
   await settle();
@@ -118,7 +119,7 @@ test("resume lets the loop reopen the overlay after a failed install", async () 
   const mod = loadCompanion({ status: [200, 200] });
   mod.initCrewCompanion({
     backendUrl: "http://127.0.0.1:5476",
-    fetchLocalToken: async () => "tok",
+    fetchGatewayAuth: async () => ({ value: "tok" }),
     glog: () => {},
   });
   await settle();
@@ -141,7 +142,7 @@ test("a reconcile already in flight when suspend fires does not reopen the overl
   const mod = loadCompanion({ status: [200, 200] });
   mod.initCrewCompanion({
     backendUrl: "http://127.0.0.1:5476",
-    fetchLocalToken: async () => "tok",
+    fetchGatewayAuth: async () => ({ value: "tok" }),
     glog: () => {},
   });
   await settle();

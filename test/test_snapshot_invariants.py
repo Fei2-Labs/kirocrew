@@ -8,15 +8,15 @@ instance cannot appear quietly.
 from __future__ import annotations
 
 import ast
+import inspect
 import json
+import re
 from pathlib import Path
 
 import pytest
-from test_snapshot import _setup_fake_kirocrew, unpinnable_argv
+from test_snapshot import _setup_fake_kirocrew, snapshot_family_paths, unpinnable_argv
 
-from kiro_crew.snapshot import restore_main, snapshot_main
-
-SNAPSHOT_SRC = Path(__file__).resolve().parents[1] / "src/kiro_crew/snapshot.py"
+from kiro_crew.snapshot import _merge_memory, restore_main, snapshot_main
 
 
 @pytest.fixture
@@ -59,15 +59,17 @@ class TestMergeReleasesItsSourceHandles:
     """
 
     def test_the_integrity_check_connection_is_closed(self):
-        src = (Path(__file__).resolve().parents[1] / "src/kiro_crew/snapshot.py").read_text(
-            encoding="utf-8"
-        )
-        body = src.split("def _merge_memory(")[1].split("\ndef ")[0]
-        assert "closing(sqlite3.connect(str(src_db)))" in body, (
+        body = inspect.getsource(_merge_memory)
+        # The driver is read through the facade (`_facade().sqlite3`) or bound directly.
+        assert re.search(
+            r"closing\((?:_facade\(\)\.|facade\.)?sqlite3\.connect\(str\(src_db\)\)\)", body
+        ), (
             "the integrity-check connection must be wrapped in closing(); a bare "
             "`with sqlite3.connect(...)` leaves it open and holds the source file"
         )
-        assert "with sqlite3.connect(str(src_db))" not in body
+        assert not re.search(
+            r"with\s+(?:_facade\(\)\.|facade\.)?sqlite3\.connect\(str\(src_db\)\)", body
+        )
 
 
 def _snapshot(out: Path, extra: list[str]) -> Path:
@@ -87,7 +89,22 @@ class TestEveryTreeRootSiteUsesTheChokepoint:
     """
 
     def test_each_trees_loop_is_guarded(self):
-        tree = ast.parse(SNAPSHOT_SRC.read_text(encoding="utf-8"))
+        unguarded: list[str] = []
+        scanned = 0
+        for path in snapshot_family_paths():
+            found, bad = self._unguarded_trees_loops(path)
+            scanned += found
+            unguarded.extend(f"{path.name}:{line}" for line in bad)
+        assert scanned, "no `.trees` loop was found at all, so this scan proved nothing"
+        assert unguarded == [], (
+            f"trees loop(s) at {unguarded} neither call safe_tree_root nor sit in "
+            f"a function that refused unsafe roots first -- a symlinked root would be "
+            f"dereferenced"
+        )
+
+    @staticmethod
+    def _unguarded_trees_loops(path: Path) -> tuple[int, list[int]]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         # A loop is guarded either by calling the chokepoint itself, or by sitting in a
         # function that already REFUSED every unsafe root before the loop runs. The second
         # form is not a loophole: `_refuse_unsafe_destination_roots` iterates the same
@@ -109,6 +126,7 @@ class TestEveryTreeRootSiteUsesTheChokepoint:
                     return fn.name
             return None
 
+        found = 0
         unguarded: list[int] = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.For):
@@ -117,17 +135,14 @@ class TestEveryTreeRootSiteUsesTheChokepoint:
             it = node.iter
             if not (isinstance(it, ast.Attribute) and it.attr == "trees"):
                 continue
+            found += 1
             body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
             if "safe_tree_root" in body:
                 continue
             if _enclosing(node) in hoisted:
                 continue
             unguarded.append(node.lineno)
-        assert unguarded == [], (
-            f"trees loop(s) at line(s) {unguarded} neither call safe_tree_root nor sit in "
-            f"a function that refused unsafe roots first -- a symlinked root would be "
-            f"dereferenced"
-        )
+        return found, unguarded
 
     def test_the_chokepoint_admits_paths_inside_the_home_and_refuses_escapes(self, tmp_path):
         """Containment of the RESOLVED path, not 'is this node a link'.

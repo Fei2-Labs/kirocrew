@@ -55,7 +55,6 @@ vi.mock('../pages/chat/SidePanel', () => ({
 }))
 
 // --- Stub hooks ---
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
 vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))
@@ -71,7 +70,7 @@ vi.mock('../api/client', () => ({
   api: Object.fromEntries(
     ['sessions', 'chatSlotDetail', 'createChatSlot', 'deleteChatSlot', 'resumeChatSlot',
      'deleteSession', 'agentDetail', 'approveChatSlot', 'chatSlotAgent', 'chatSlotModel',
-     'chatSlotWorkspace', 'models', 'planAction', 'planFromChat', 'renameSlot',
+     'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
      'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
      'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
      'notifications', 'status', 'generateTitle'].map(k => [k, vi.fn().mockResolvedValue(
@@ -299,6 +298,14 @@ describe('ChatPage — session-header activity toggle (relocated from the top ba
     expect(store.getState().chat.activityOpen).toBe(true)
   })
 
+  it('names the toggle in an instant tip on keyboard focus, not a native title', async () => {
+    renderWithSlot()
+    const btn = await screen.findByLabelText('Open activity panel')
+    expect(btn).not.toHaveAttribute('title')
+    act(() => { btn.focus() })
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Open activity panel')
+  })
+
   it('stays live in the 768-880 band that used to disable it, and opens beside the chat', async () => {
     const { store } = renderWithSlot()
     await screen.findByLabelText('Open activity panel')
@@ -348,7 +355,7 @@ describe('ChatPage — session-header activity toggle (relocated from the top ba
 /**
  * Mobile: the toggle must NOT be gated on `!isMobile` — a phone still needs a
  * way to open the activity panel, since SidePanel renders full-width there and
- * ChatPage keeps an inline (non-portal) render path specifically for mobile.
+ * ChatSidePanels keeps an inline (non-portal) render path specifically for mobile.
  */
 describe('ChatPage — activity toggle on mobile', () => {
   beforeEach(() => { mockIsMobile = true; setWindowWidth(390); localStorage.clear() })

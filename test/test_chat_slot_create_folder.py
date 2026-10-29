@@ -30,7 +30,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew.dashboard.chat_utils import slot_history_key
-from kiro_crew.dashboard.state import _SLOTS_BROADCAST_INTERVAL_S, DashboardState
+from kiro_crew.dashboard.state import (
+    _DEFERRED_SLOTS_FLUSH_DELAY_S,
+    _SLOTS_BROADCAST_INTERVAL_S,
+    DashboardState,
+)
 from kiro_crew.history import ConversationLog
 
 FOLDER_ID = "f-design"
@@ -161,46 +165,271 @@ class TestCreateInFolder:
             )
 
     @pytest.mark.asyncio
-    async def test_create_with_project_announces_that_project_first(self, tmp_path):
-        """Project scope reaches eager ACP startup before the first slots frame."""
+    async def test_create_without_folder_defers_one_complete_broadcast(
+        self, tmp_path, monkeypatch
+    ):
+        """The ordinary response wins the race with its full-list announcement."""
         state = _make_state(tmp_path)
         seen = _record_broadcasts(state)
-        project = tmp_path / "project"
-        project.mkdir()
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+        armed_timer = MagicMock()
+        state._slots_broadcast_timer = armed_timer
 
-        async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post(
-                "/api/chat/slots", json={"name": "s1", "project": str(project)}
-            )
-            assert resp.status == 200
-            assert (await resp.json())["project"] == str(project)
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
 
-        assert len(seen) == 1
-        entry = next(s for s in seen[0] if s["key"] == "s1")
-        assert entry["project"] == str(project)
-
-    @pytest.mark.asyncio
-    async def test_create_with_null_project_keeps_the_slot_unscoped(self, tmp_path):
-        """An explicit clear differs from omitting project and taking the default."""
-        state = _make_state(tmp_path)
-        async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat/slots", json={"name": "s1", "project": None})
-            assert resp.status == 200
-            assert (await resp.json())["project"] == ""
-        assert state._slots["s1"].project == ""
-
-    @pytest.mark.asyncio
-    async def test_create_without_folder_still_emits_one_broadcast(self, tmp_path):
-        """Guard the ordinary path: coalescing must not drop the announcement."""
-        state = _make_state(tmp_path)
-        seen = _record_broadcasts(state)
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots", json={"name": "s1"})
             assert resp.status == 200
             assert (await resp.json())["folder_id"] == ""
 
+        # The response completed without serializing every open slot, and the old
+        # trailing timer cannot publish during the fixed handoff delay.
+        assert seen == []
+        armed_timer.cancel.assert_called_once_with()
+        assert state._slots_broadcast_timer is None
+        assert len(scheduled) == 1
+        delay, callback, args = scheduled.pop()
+        assert delay == pytest.approx(_DEFERRED_SLOTS_FLUSH_DELAY_S)
+        assert args == ("create slot 's1'", 1)
+
+        # Other windows still receive exactly one complete snapshot immediately after.
+        callback(*args)
+        assert scheduled == []
         assert len(seen) == 1
         assert any(s["key"] == "s1" for s in seen[0])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("memory_mode", ["incognito", "temporary"])
+    async def test_private_memory_create_publishes_synchronously(
+        self, tmp_path, monkeypatch, memory_mode
+    ):
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "private", "memory_mode": memory_mode},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["memory_mode"] == memory_mode
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "private" for s in seen[0])
+
+    @pytest.mark.asyncio
+    async def test_unknown_create_field_publishes_synchronously(
+        self, tmp_path, monkeypatch
+    ):
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots",
+                json={"name": "future", "future_metadata": "present"},
+            )
+            assert resp.status == 200
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "future" for s in seen[0])
+
+    @pytest.mark.asyncio
+    async def test_deferred_flush_waits_for_active_persistence_suspension(
+        self, tmp_path, monkeypatch
+    ):
+        """A delayed plain-create callback cannot cross a metadata save barrier."""
+        state = _make_state(tmp_path)
+        broadcasts: list[str] = []
+        persistence = {"durable": False}
+
+        def broadcast_after_persistence():
+            broadcasts.append("published")
+            assert persistence["durable"], "published before the slot mutation was durable"
+
+        monkeypatch.setattr(state, "_do_slots_broadcast", broadcast_after_persistence)
+
+        with state.suspend_slots_push():
+            assert state._slots_push_pending is False
+
+            state._deferred_slots_flush("create slot 'plain-create'", 1)
+
+            assert broadcasts == []
+            assert state._slots_push_pending is True
+            persistence["durable"] = True
+
+        assert broadcasts == ["published"]
+        assert state._slots_push_pending is False
+
+    @pytest.mark.asyncio
+    async def test_overlapping_suspension_disables_outer_deferral(
+        self, tmp_path, monkeypatch
+    ):
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+
+        with state.suspend_slots_push() as defer_flush:
+            state.get_or_create_slot("overlap")
+            defer_flush("create slot 'overlap'")
+            with pytest.raises(LookupError, match="inner failed"):
+                with state.suspend_slots_push():
+                    raise LookupError("inner failed")
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "overlap" for s in seen[0])
+        assert state._slots_push_overlapped is False
+
+    @pytest.mark.asyncio
+    async def test_successful_deferred_flush_starts_coalescing_window(
+        self, tmp_path, monkeypatch
+    ):
+        state = _make_state(tmp_path)
+        broadcasts: list[str] = []
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        armed_timer = MagicMock()
+        trailing_timer = MagicMock()
+        state._slots_broadcast_timer = armed_timer
+
+        monkeypatch.setattr(
+            state, "_do_slots_broadcast", lambda: broadcasts.append("published")
+        )
+        monkeypatch.setattr("kiro_crew.dashboard.state.time.monotonic", lambda: 100.0)
+
+        def capture_callback(delay, callback, *args, **kwargs):
+            scheduled.append((delay, callback, args))
+            return trailing_timer
+
+        monkeypatch.setattr(loop, "call_later", capture_callback)
+
+        state._deferred_slots_flush("create slot 's1'", 1)
+        assert broadcasts == ["published"]
+        assert state._slots_broadcast_last == 100.0
+        armed_timer.cancel.assert_called_once_with()
+        assert state._slots_broadcast_timer is None
+
+        state.push_slots_update()
+
+        assert broadcasts == ["published"]
+        assert len(scheduled) == 1
+        assert state._slots_broadcast_timer is trailing_timer
+        delay, callback, args = scheduled[0]
+        assert delay == pytest.approx(_SLOTS_BROADCAST_INTERVAL_S)
+        assert callback == state._trailing_slots_flush
+        assert args == ()
+
+    @pytest.mark.asyncio
+    async def test_defer_then_body_error_flushes_synchronously_and_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        """An in-flight body error must disable deferral while unwinding."""
+        state = _make_state(tmp_path)
+        seen = _record_broadcasts(state)
+        scheduled = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def capture_deferred_flush(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(loop, "call_later", capture_deferred_flush)
+
+        with pytest.raises(LookupError, match="body failed"):
+            with state.suspend_slots_push() as defer_flush:
+                state.get_or_create_slot("s1")
+                defer_flush("create slot 's1'")
+                raise LookupError("body failed")
+
+        assert scheduled == []
+        assert len(seen) == 1
+        assert any(s["key"] == "s1" for s in seen[0])
+
+    @pytest.mark.asyncio
+    async def test_failed_deferred_publication_logs_and_retries_once(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        state = _make_state(tmp_path)
+        attempts = 0
+        scheduled: list[tuple[float, object, tuple[object, ...]]] = []
+        loop = asyncio.get_running_loop()
+        real_call_later = loop.call_later
+
+        def fail_broadcast():
+            nonlocal attempts
+            attempts += 1
+            raise TypeError("not serializable")
+
+        def capture_retry(delay, callback, *args, **kwargs):
+            if callback == state._deferred_slots_flush:
+                scheduled.append((delay, callback, args))
+                return MagicMock()
+            return real_call_later(delay, callback, *args, **kwargs)
+
+        monkeypatch.setattr(state, "_do_slots_broadcast", fail_broadcast)
+        monkeypatch.setattr(loop, "call_later", capture_retry)
+        caplog.set_level("ERROR", logger="kiro_crew.dashboard.state")
+
+        state._deferred_slots_flush("create slot 's1'", 1)
+        assert attempts == 1
+        assert len(scheduled) == 1
+        delay, callback, args = scheduled.pop()
+        assert delay == pytest.approx(_SLOTS_BROADCAST_INTERVAL_S)
+        assert args == ("create slot 's1'", 0)
+
+        callback(*args)
+        assert attempts == 2
+        assert scheduled == []
+        failures = [
+            record
+            for record in caplog.records
+            if "Deferred slots publication failed" in record.message
+        ]
+        assert len(failures) == 2
+        assert all("create slot 's1'" in record.message for record in failures)
 
     @pytest.mark.asyncio
     async def test_refiling_an_existing_slot_name_is_broadcast(self, tmp_path):
@@ -582,4 +811,147 @@ class TestDurableWriteOrdering:
         assert meta.get("title") == "Pinned", (
             "the pinned title never reached disk — a restart rehydrates the old "
             "title with a refreshable 'auto' origin"
+        )
+
+
+class TestFreshFolderCreateStaysOffTheExecutor:
+    """A brand-new session filed into a project-less folder skips the project probe.
+
+    The sidebar's "New chat" inside a folder sends ``folder_id`` and no ``name``.
+    Validating a folder's project ``stat``s the directory, so it belongs on a
+    worker thread; but most folders declare no project, and a thread hop that
+    resolves to ``""`` queues on the gateway's shared default executor inside the
+    process-wide ``suspend_slots_push``, before the response. The chain walk runs
+    on the loop and only a declared project's ``stat`` is sent to a thread.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_folder_create_makes_no_project_probe(self, tmp_path):
+        from kiro_crew.dashboard import chat_folders
+
+        state = _make_state(tmp_path)
+        real_validate = chat_folders._validate_project_dir
+        with patch.object(
+            chat_folders, "_validate_project_dir", MagicMock(side_effect=real_validate)
+        ) as validate:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post("/api/chat/slots", json={"folder_id": FOLDER_ID})
+                assert resp.status == 200
+                assert (await resp.json())["folder_id"] == FOLDER_ID
+        assert validate.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_folder_with_a_project_still_validates_it(self, tmp_path):
+        """The shortcut only skips folders that declare no project anywhere up the chain."""
+        from kiro_crew.dashboard.chat_folders import _folder_declared_project
+
+        folders = [
+            {"id": "root", "name": "Root", "project_dir": str(tmp_path)},
+            {"id": "child", "name": "Child", "parent_id": "root"},
+            {"id": "plain", "name": "Plain"},
+            {"id": "typed", "name": "Typed", "project_dir": 7},
+            {"id": "loop-a", "name": "A", "parent_id": "loop-b"},
+            {"id": "loop-b", "name": "B", "parent_id": "loop-a"},
+        ]
+        assert _folder_declared_project(folders, "child") == (str(tmp_path), None)
+        assert _folder_declared_project(folders, "root") == (str(tmp_path), None)
+        assert _folder_declared_project(folders, "plain") == (None, None)
+        assert _folder_declared_project(folders, "missing") == (None, None)
+        assert _folder_declared_project(folders, "typed") == ("", "project_dir must be a string")
+        # A parent cycle terminates rather than spinning.
+        assert _folder_declared_project(folders, "loop-a") == (None, None)
+
+    @pytest.mark.asyncio
+    async def test_project_validation_runs_off_the_loop_only_when_declared(self, tmp_path):
+        """One chain walk on the loop; the ``stat`` hops to a thread, and only when there is one."""
+        import threading
+
+        from kiro_crew.dashboard import chat_folders as cf
+
+        target = tmp_path / "repo"
+        target.mkdir()
+        folders = [
+            {"id": "root", "name": "Root", "project_dir": str(target)},
+            {"id": "child", "name": "Child", "parent_id": "root"},
+            {"id": "plain", "name": "Plain"},
+        ]
+        real_validate = cf._validate_project_dir
+        ran_on: list[int] = []
+
+        def spy(raw: str) -> tuple[str, str | None]:
+            ran_on.append(threading.get_ident())
+            return real_validate(raw)
+
+        with patch.object(cf, "_validate_project_dir", spy):
+            assert await cf.resolve_folder_project_dir_off_loop(folders, "plain") == ("", None)
+            assert ran_on == [], "a project-less chain must not validate anything"
+            resolved, error = await cf.resolve_folder_project_dir_off_loop(folders, "child")
+        assert (resolved, error) == (str(target.resolve()), None)
+        assert len(ran_on) == 1
+        assert ran_on[0] != threading.get_ident(), "the stat must not run on the loop thread"
+
+
+class TestOwnerFolderCreatePersistsTheFiling:
+    """A fresh owner-dashboard create in a folder has a durable writer for its filing.
+
+    On the owner path the member assignment publishes the newborn's execution
+    context through ``bind_session_execution``, whose ``update_metadata_if``
+    UPSERTS the session's metadata line. From then on the forced birth save has
+    a line to merge into, and it is the only writer of ``folder_id`` (and the
+    inherited tags, pinned title, project and colour) before the first message:
+    ``slot._dirty`` stays False, so no periodic flush would write them later. A
+    restart before the first message must rehydrate the tab filed, not at root.
+    """
+
+    @pytest.mark.asyncio
+    async def test_owner_folder_create_writes_folder_id_to_the_metadata_line(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+        from kiro_crew.dashboard.chat import api_chat_slot_create
+        from kiro_crew.history import _sessions_dir
+        from kiro_crew.memory_stores import provision_member_memory
+
+        config = KiroCrewConfig()
+        config.agents["local-only-crew"] = KiroCrewAgentConfig(kiro_agent="local-only-crew")
+        config.default_agent = "local-only-crew"
+        provision_member_memory(config, "local-only-crew")
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_handlers.KiroCrewConfig.load",
+            staticmethod(lambda: config),
+        )
+        state = _make_state(tmp_path)
+        # A newborn has no live or resumable kiro-cli session; a bare MagicMock
+        # would answer "yes" to both and read as V1 history the member cannot take.
+        state.sessions.get_provider = MagicMock(return_value=None)
+        state.sessions.resumable_sid = MagicMock(return_value=None)
+        # `bind_session_execution` publishes through ``ConversationLog()`` at the
+        # default sessions dir, so the state's log must be that same log for the
+        # birth save to see the line the assignment created.
+        state.conversation_log = ConversationLog(base_dir=_sessions_dir())
+
+        async def owner_handler(request: web.Request) -> web.Response:
+            request["app"] = ""
+            request["user"] = "local-app"
+            return await api_chat_slot_create(request)
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots", owner_handler)
+        async with TestClient(TestServer(app)) as client:
+            # The private crewmate is PICKED: an agent-less create is the default
+            # template on Global and publishes no private store.
+            resp = await client.post(
+                "/api/chat/slots", json={"folder_id": FOLDER_ID, "agent": "local-only-crew"}
+            )
+            assert resp.status == 200, await resp.text()
+            body = await resp.json()
+        assert body["folder_id"] == FOLDER_ID
+        slot = state._slots[body["key"]]
+        assert not slot.messages
+        meta = state.conversation_log._read_metadata(slot_history_key(slot)) or {}
+        assert meta.get("memory_store"), f"the owner assignment must have published a line: {meta}"
+        assert meta.get("folder_id") == FOLDER_ID, (
+            "the folder filing never reached the metadata line -- a restart before "
+            "the first message rehydrates the tab unfiled"
         )

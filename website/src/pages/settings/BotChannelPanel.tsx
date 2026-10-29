@@ -3,7 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Lock } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsInput, SettingsSelect, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
-import { CopyCommandButton } from '../../components/settingRef/CopyCommandButton'
+import { OptionalSdkCard } from './OptionalSdkCard'
 import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { TagListEditor } from './SlackPanel'
@@ -344,13 +344,11 @@ function draftFrom(c: BotChannelConfigData): Draft {
 
 /** Status pill mirroring the run state of the channel. */
 function StatusBadge({ config }: { config: BotChannelConfigData }) {
-  /* eslint-disable shadcn/no-unknown-classes -- shadcn-ui/lint#38: the rule reads every member of a destructured initializer as a class */
   const [dot, text, cls] = config.connected
     ? ['var(--ok)', 'Connected', 'text-ok']
     : config.configured
       ? ['var(--warn)', 'Not connected', 'text-warn']
       : ['var(--muted)', 'Needs setup', 'text-muted']
-  /* eslint-enable shadcn/no-unknown-classes */
   return (
     <span className={`inline-flex items-center gap-1.5 text-[12px] font-medium ${cls}`}>
       <span className="w-1.5 h-1.5 rounded-full" style={{ background: dot }} />
@@ -367,6 +365,10 @@ function StatusBadge({ config }: { config: BotChannelConfigData }) {
  */
 function connectError(spec: BotChannelSpec, config: BotChannelConfigData): string {
   if (config.connected || !config.connect_error) return ''
+  // While the SDK is missing, the OptionalSdkCard explains the failure with
+  // this gateway's own install command. The badge would only repeat it, and
+  // its "check the bot token" advice points at the wrong fix.
+  if (config.sdk_installed === false) return ''
   return i18nT('pages.settings.botChannelPanel.channel_failed_to_start', { channel: spec.name, error: config.connect_error, host: spec.host })
 }
 
@@ -589,41 +591,8 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
       </SettingsSection>
 
       {/* ── Missing optional SDK ── */}
-      {/*
-        Strictly `=== false`: an older gateway omits the field entirely, and
-        treating undefined as "missing" would tell every user of one to install a
-        package they may already have.
-      */}
-      {spec.sdkExtra && data.sdk_installed === false && (
-        <SettingsSection title={i18nT('pages.settings.botChannelPanel.sdk_missing', { channel: spec.name })}>
-          <SettingsCard>
-            {data.sdk_install_supported && data.sdk_install_command ? (
-              <>
-                <p className="text-[13px] text-text m-0">
-                  {i18nT('pages.settings.botChannelPanel.sdk_missing_body', { channel: spec.name, package: spec.sdkExtra.packageLabel })}
-                </p>
-                {/*
-                  The command names the gateway's own interpreter rather than a
-                  bare `pip`, because installing into a different environment is
-                  the failure this card exists to prevent — so it must stay
-                  copyable verbatim: break-all, never truncated.
-                */}
-                <div className="flex items-start gap-2 mt-2 rounded-md border border-border bg-bg-elevated px-3 py-2">
-                  <code className="flex-1 text-[12px] font-mono text-text break-all">{data.sdk_install_command}</code>
-                  <CopyCommandButton text={data.sdk_install_command} />
-                </div>
-                <p className="text-[12px] text-muted mt-2 mb-0">
-                  {i18nT('pages.settings.botChannelPanel.sdk_restart_after_install', { channel: spec.name })}
-                </p>
-              </>
-            ) : (
-              <p className="text-[13px] text-warn m-0 flex items-start gap-1.5">
-                <AlertTriangle size={13} className="flex-none mt-0.5" />
-                {i18nT('pages.settings.botChannelPanel.sdk_install_unsupported', { package: spec.sdkExtra.packageLabel })}
-              </p>
-            )}
-          </SettingsCard>
-        </SettingsSection>
+      {spec.sdkExtra && (
+        <OptionalSdkCard channel={spec.name} packageLabel={spec.sdkExtra.packageLabel} status={data} />
       )}
 
       {/* ── Required ── */}

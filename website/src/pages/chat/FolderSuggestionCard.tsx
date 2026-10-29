@@ -4,8 +4,9 @@ import { motion } from 'framer-motion'
 
 import { i18nT } from '../../i18n/t'
 import type { ChatFolder } from '../../types'
-import { orderFoldersWithPaths } from '../../utils/folderTree'
+import { orderFoldersWithPaths, type FolderSortMode } from '../../utils/folderTree'
 import { NativeSelect, NativeSelectOption } from '../../components/ui/native-select'
+import { Glass } from '../../components/Glass'
 
 export interface FolderSuggestionCardProps {
   /** The folder the backend suggested — preselected in the dropdown. */
@@ -27,6 +28,10 @@ export interface FolderSuggestionCardProps {
   onAccept: (folderId: string) => void
   /** Leave the session where it is. The card is not re-offered either way. */
   onDecline: () => void
+  /** The sidebar's folder sort mode, so the option list reads in the order the
+   *  sidebar draws the same tree. A prop, passed by ChatPage from
+   *  `useFolderSortMode`, so this card stays a pure function of its props. */
+  folderSortMode?: FolderSortMode
 }
 
 /**
@@ -60,6 +65,7 @@ export interface FolderSuggestionCardProps {
  */
 export default function FolderSuggestionCard({
   suggestedFolderId, suggestedFolderName, suggestedFolderBreadcrumb, folders, onAccept, onDecline,
+  folderSortMode = 'custom',
 }: FolderSuggestionCardProps) {
   const selectId = useId()
   const [selectedId, setSelectedId] = useState(suggestedFolderId)
@@ -70,7 +76,7 @@ export default function FolderSuggestionCard({
   // closed <select> shows ONLY the chosen option's text, so the path is what
   // keeps same-named subfolders under different parents unambiguous — and it
   // replaces the old card's separate breadcrumb line.
-  const options = orderFoldersWithPaths(folders).map(o => ({
+  const options = orderFoldersWithPaths(folders, folderSortMode).map(o => ({
     id: o.folder.id,
     label: o.depth > 0 ? o.path : o.folder.name,
   }))
@@ -91,21 +97,23 @@ export default function FolderSuggestionCard({
 
   return (
     <motion.div
-      // flex-wrap is the narrow-viewport provision (AUTOSDE narrow-viewport-
-      // required): when label + select + actions exceed the row — a 320px
-      // viewport leaves ~288px inside the padding — the overflowing pieces
-      // wrap to their own line instead of clipping. Content-driven on purpose:
-      // the card tracks the composer's width, not the viewport's, so a media
-      // query would misfire in narrow side-by-side panes.
-      className="w-full flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-4 py-2 rounded-md text-xs shadow-lg"
-      style={{
-        background: 'color-mix(in srgb, var(--accent) 6%, var(--bg-elevated))',
-        border: '1px solid color-mix(in srgb, var(--accent) 12%, transparent)',
-      }}
+      className="w-full"
       initial={{ y: 6, opacity: 0 }}
       animate={{ y: 0, opacity: 1 }}
       exit={{ y: 4, opacity: 0 }}
       transition={{ duration: 0.25, ease: [0.2, 0.8, 0.2, 1] }}
+    >
+    {/* flex-wrap is the narrow-viewport provision (AUTOSDE narrow-viewport-
+        required): when label + select + actions exceed the row — a 320px
+        viewport leaves ~288px inside the padding — the overflowing pieces
+        wrap to their own line instead of clipping. Content-driven on purpose:
+        the card tracks the composer's width, not the viewport's, so a media
+        query would misfire in narrow side-by-side panes.
+        Glass card, same material and primitive as TipCard (components/Glass.tsx). */}
+    <Glass
+      variant="chip"
+      radius={6}
+      className="glass-accent glass-shadow w-full flex flex-wrap items-center gap-x-2.5 gap-y-1.5 px-4 py-2 rounded-md text-xs"
       role="complementary"
       aria-label={i18nT('components.folderSuggestionCard.folder_suggestion')}
       data-testid="folder-suggestion-card"
@@ -170,6 +178,7 @@ export default function FolderSuggestionCard({
           {i18nT('components.folderSuggestionCard.no_thanks')}
         </button>
       </div>
+    </Glass>
     </motion.div>
   )
 }

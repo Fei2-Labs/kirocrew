@@ -17,8 +17,12 @@ See ``docs/system-specs/modules/platform-context.md``.
 
 from __future__ import annotations
 
+import functools
+import hashlib
 import logging
+import re
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Tuple, TypeVar
 
@@ -39,12 +43,14 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         EmbeddingSource,
         ExternalAccessPolicy,
         FeatureApp,
+        FeedbackTrackerProvider,
         GatewayLifecycleProvider,
         IdentityProvider,
         ImportSourceProvider,
         JailProvider,
         KnowledgeProvider,
         McpToolingProvider,
+        MemoryFilesProvider,
         MobileConnectProvider,
         PackageManager,
         PromptSourceProvider,
@@ -54,6 +60,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         SandboxPolicy,
         SkillDiscoveryProvider,
         SlackEnterpriseGate,
+        SpeechProviderRegistry,
         TelemetryProvider,
         TipsProvider,
         TunnelProvider,
@@ -128,9 +135,9 @@ RESERVED_SLOTS: "dict[str, str]" = {
         "embeddings.register_embedding_backend() instead."
     ),
     "package_manager": (
-        "no core call site: install paths (ollama, ffmpeg, whisper) are inline "
-        "step-by-step brew/curl/pip logic in cli_doctor.py, not a single "
-        "plan-resolution point this seam could own."
+        "no core call site: external-tool install hints (ffmpeg, faiss, the voice-aws "
+        "extra) are inline brew/winget/pip text in doctor_checks/features.py, not a "
+        "single plan-resolution point this seam could own."
     ),
     "feature_apps": (
         "no core call site: bundled apps are discovered through "
@@ -280,7 +287,7 @@ class PlatformContext:
     # ── boot-layer extension points ──
     providers: "ProviderRegistry"
     publish: "PublishRegistry"
-    # ``run_first_run_setup`` is wired (slack/gateway.py); ``managed_mcp_servers``
+    # ``run_first_run_setup`` is wired (slack/gateway_runtime/service_boot.py); ``managed_mcp_servers``
     # is [RESERVED] — see RESERVED_METHODS.
     agent_runtime: "AgentRuntime"
     agent_executable: "AgentExecutableResolver"
@@ -318,6 +325,13 @@ class PlatformContext:
     apps_loader: "AppsLoader"
     package_manager: "PackageManager"  # [RESERVED] — see RESERVED_SLOTS
     knowledge: "KnowledgeProvider"
+    # Where memory's markdown SOURCE text is read and written. Consumed by
+    # ``MemoryStore`` and by the vector store's document ingestion; memory's
+    # DERIVED state (the FTS index, the SQLite stores, the FAISS vectors) stays on
+    # local disk and does not travel through this seam, because it is rebuilt from
+    # the source text and a cache behind a possibly-remote boundary would cost a
+    # round trip per row to reconstruct something reconstructible by definition.
+    memory_files: "MemoryFilesProvider"
 
     # ── runtime-service / frontend extension points ──
     tunnel: "TunnelProvider"
@@ -329,6 +343,16 @@ class PlatformContext:
     # plus whatever the edition adds), each backed by a ``LaunchEngine`` the
     # core's launch job drives. v1 addition (no CONTRACT_VERSION bump).
     remote_provisioners: "RemoteProvisionerProvider"
+    # Where Report a Problem / `kirocrew doctor` send the user to file the
+    # bundle. REPLACE-capable like ``tips``: the public pre-filled GitHub link
+    # or the edition's own URL, never a merge of the two. The backend half of
+    # the dashboard's ``setFeedbackTracker`` seam. v1 addition (no
+    # CONTRACT_VERSION bump).
+    feedback: "FeedbackTrackerProvider"
+    # Edition-registered STT / TTS providers and the edition's default choice.
+    # ADD-only: a name colliding with a built-in or ``off`` fails boot. Read by
+    # ``kiro_crew.speech_providers``. v1 addition (no CONTRACT_VERSION bump).
+    speech: "SpeechProviderRegistry"
 
     # ── bundled feature apps ──
     feature_apps: "Tuple[FeatureApp, ...]"  # [RESERVED] — see RESERVED_SLOTS
@@ -599,6 +623,12 @@ def set_context(ctx: PlatformContext) -> None:
 # must contain the phrase ``no-context answer`` so the justification is greppable
 # and cannot dodge the question it exists to answer.
 PEEK_CALLERS: "dict[str, str]" = {
+    "security/redaction.py::_token_param_exempt_prefixes": (
+        "no-context answer is the empty prefix set, which means MORE redaction: "
+        "pass 4 redacts every `token=` URL value. The lookup can only skip a "
+        "value no earlier credential pass claimed, so an absent context cannot "
+        "be the reason a credential survives."
+    ),
     "security/exfil.py::_exempt_exact_hosts": (
         "no-context answer is the empty exempt-host set, which means MORE "
         "redaction: every host runs the base64-blob / query-length heuristics. "
@@ -615,7 +645,16 @@ PEEK_CALLERS: "dict[str, str]" = {
         "its policy failed to compose — is handled separately by withholding "
         "the line's text (LOG_WITHHELD_PLACEHOLDER)."
     ),
-    "platform/governance.py::active_policy_distribution": (
+    "speech_providers.py::_installed_speech": (
+        "no-context answer is 'no registered speech providers and no edition "
+        "default', which is the standalone answer: the built-in STT and TTS sets. "
+        "An unknown stored name then keeps its built-in fallback (STT fails closed "
+        "to off, TTS falls back to the local default), so an absent context can only "
+        "NARROW what is selectable, never route audio anywhere. It must peek: the STT "
+        "half runs inside KiroCrewConfig.load(), and current_context() with nothing "
+        "installed loads config, which would re-enter that load."
+    ),
+    "platform/governance_parts/carriers.py::active_policy_distribution": (
         "no-context answer is an unconfigured PolicyDistribution, i.e. no "
         "central fetch. It is reached only when boot never installed a context, "
         "and then this process holds no ceiling to refresh and runs no refresher "
@@ -862,7 +901,9 @@ def redact_via_context(text: str) -> str:
 
     No logging on the degrade path: this shim runs inside stdio MCP servers
     (``mcp_core`` / ``mcp_cron``) whose stray writes would corrupt the JSON-RPC
-    stream.
+    stream. The degrade is COUNTED instead (:func:`_redact_degrades`), so the
+    content-scan verdict cache never keeps an answer the baseline gave in the
+    companion's place.
     """
     # Deferred import: keep ``security`` (which pulls the redaction regex stack)
     # off the platform module-load path; only the fallback path needs it, and
@@ -874,7 +915,314 @@ def redact_via_context(text: str) -> str:
     except Exception:
         from kiro_crew.security import redact as _security_redact
 
+        _REDACT_DEGRADES.count = _redact_degrades() + 1
         return _security_redact(text)
+
+
+#: Per-thread count of :func:`redact_via_context` falling back to the bare
+#: ``security.redact``. Per THREAD because a content scan runs on one thread and
+#: brackets only its own detector calls: another egress site degrading during a
+#: 12-second scan says nothing about that scan's verdict.
+_REDACT_DEGRADES = threading.local()
+
+
+def _redact_degrades() -> int:
+    """This thread's :data:`_REDACT_DEGRADES`; comparison-only, like
+    :func:`governance_generation`. A content scan reads it before and after, and a
+    change means the verdict may be the baseline's rather than the active
+    context's, so it is not cached."""
+    count: int = getattr(_REDACT_DEGRADES, "count", 0)
+    return count
+
+
+#: Wide-encoding projections :func:`binary_content_is_flagged` scans beside its
+#: ``latin-1`` pass, each as ``(pattern, offset, stride)``.
+#:
+#: A credential written as UTF-16 or UTF-32 inside an allow-listed container --
+#: an ID3v2 UTF-16 tag in ``audio/mpeg``, a UTF-16BE string in
+#: ``application/pdf`` -- carries NUL bytes between its characters, so a
+#: single-byte projection reads ``K\x00E\x00Y`` and no detector matches. Each
+#: pattern finds a run of printable ASCII at one encoding's spacing and the
+#: stride lifts those characters back out; both byte orders and both widths are
+#: covered, and a run at any alignment falls inside one of them.
+#:
+#: Matching a RUN, rather than striding the whole buffer, is what keeps this from
+#: handing the detectors a second stream of high-entropy bytes: random binary
+#: almost never holds a long alternating-NUL sequence, so a media file with no
+#: wide text in it contributes nothing to scan and pays only the search.
+_WIDE_PROJECTIONS: Tuple[Tuple["re.Pattern[bytes]", int, int], ...] = (
+    (re.compile(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00){8,}"), 0, 2),
+    (re.compile(rb"(?:\x00[\x09\x0a\x0d\x20-\x7e]){8,}"), 1, 2),
+    (re.compile(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00\x00\x00){8,}"), 0, 4),
+    (re.compile(rb"(?:\x00\x00\x00[\x09\x0a\x0d\x20-\x7e]){8,}"), 3, 4),
+)
+
+
+def _baseline_symbol_tables_masked(raw_text: str) -> str:
+    """*raw_text* with the standard container symbol tables blanked, for a scan.
+
+    Deferred import for the reason :func:`redact_via_context` states: keep the
+    redaction regex stack off the platform module-load path. Only the narrow binary
+    scan below reaches here, and a gate that is already scanning content pays that
+    import willingly.
+
+    Returns the argument ITSELF when nothing is masked -- both when the helper
+    masks no table and when it cannot be imported at all. The caller reads that
+    identity as "the unmasked answer stands", so a broken import weakens no
+    refusal and costs no second scan.
+    """
+    try:
+        from kiro_crew.security.redaction import mask_baseline_symbol_tables
+    except Exception:
+        return raw_text
+    return mask_baseline_symbol_tables(raw_text)
+
+
+#: Verdicts of the two content scans below, keyed on everything that decides one:
+#: which scan, the bytes (by SHA-256 digest), and the ceiling that scanned them
+#: (:func:`governance_generation`, so installing a context retires every verdict
+#: the old one gave). A bounded LRU holding a digest and a bool per entry.
+#:
+#: The same bytes reach these scans again and again: ``POST /api/outbox/notify``
+#: scans a file at send time, then ``GET /api/outbox/{filename}`` scans it on every
+#: render of its file card and on every Range request the card's ``<video>`` issues.
+#: Each pass is GIL-bound regex work over up to the 50 MB read cap -- a 44 MB MP4
+#: measures about 12 s -- and the answer cannot change while the bytes and the
+#: detectors do not, so every pass after the first is pure cost.
+_SCAN_VERDICTS: "OrderedDict[Tuple[str, bytes, int], bool]" = OrderedDict()
+_SCAN_VERDICTS_MAX = 256
+_SCAN_VERDICTS_LOCK = threading.Lock()
+
+#: Serializes the scans themselves. CPython's ``re`` holds the GIL for the whole of
+#: a match call, so scans in several ``asyncio.to_thread`` workers gain no
+#: parallelism: they pass the GIL between each other while the event loop waits
+#: behind all of them, and the loop's worst gap grows with every pass in flight.
+#: One at a time bounds it by the longest single pass. Measured over four outbox
+#: MP4s of 24-44 MB: worst loop gap 18.7 s concurrent, 7.7 s serialized, both
+#: done in about 38 s. Re-entrant because the binary scan's last leg IS the wide
+#: scan, on the same thread. Never acquired while :data:`_SCAN_VERDICTS_LOCK` is held.
+_SCAN_LOCK = threading.RLock()
+
+
+def _scan_verdict(kind: str, raw: bytes, scan: "Callable[[bytes], bool]") -> bool:
+    """``scan(raw)``, answered from :data:`_SCAN_VERDICTS` when it can be.
+
+    A miss runs the scan under :data:`_SCAN_LOCK` and re-checks the cache once the
+    lock is held, so concurrent callers holding the same bytes pay one scan between
+    them. A verdict is stored only when nothing it depended on moved while it ran:
+    neither the governance generation nor this thread's :func:`_redact_degrades`,
+    whose change means the bare baseline may have answered in the active context's
+    place. An exception -- a :class:`PlatformCompositionError` on a host that could
+    not compose -- propagates and stores nothing, so the scan still fails closed.
+
+    ``hashlib`` releases the GIL while it digests a large buffer, so computing the
+    key costs the event loop nothing even at the read cap.
+    """
+    generation = governance_generation()
+    # Content-addressed cache key, not a security digest: ``raw`` is hashed only to
+    # recognize the same bytes again, never stored or compared as a credential, so
+    # ``usedforsecurity=False`` states that intent and the strength of the hash
+    # guards nothing here -- a collision would at worst reuse a verdict, which the
+    # generation and degrade guards already retire. CodeQL's ``py/weak-sensitive-
+    # data-hashing`` flow heuristic flags the sink because a scanned buffer can
+    # carry credential bytes (that is what these functions exist to FIND); the same
+    # false-positive class is suppressed the repo-standard ``lgtm`` way elsewhere
+    # (see ``auto_improvement/spine/archive.py``).
+    digest = hashlib.sha256(  # noqa: S324 -- content key, not a security digest
+        raw, usedforsecurity=False
+    ).digest()  # lgtm[py/weak-sensitive-data-hashing]
+    key = (kind, digest, generation)
+    with _SCAN_VERDICTS_LOCK:
+        cached = _SCAN_VERDICTS.get(key)
+        if cached is not None:
+            _SCAN_VERDICTS.move_to_end(key)
+            return cached
+    with _SCAN_LOCK:
+        with _SCAN_VERDICTS_LOCK:
+            cached = _SCAN_VERDICTS.get(key)
+        if cached is not None:
+            return cached
+        degrades = _redact_degrades()
+        verdict = scan(raw)
+        if _redact_degrades() == degrades and governance_generation() == generation:
+            with _SCAN_VERDICTS_LOCK:
+                _SCAN_VERDICTS[key] = verdict
+                while len(_SCAN_VERDICTS) > _SCAN_VERDICTS_MAX:
+                    _SCAN_VERDICTS.popitem(last=False)
+    return verdict
+
+
+_Scan = Callable[[bytes], bool]
+
+
+def _kept_and_serialized(kind: str) -> "Callable[[_Scan], _Scan]":
+    """Route a content scan through :func:`_scan_verdict` under the name *kind*.
+
+    A decorator rather than a wrapper call inside each scan, so the scan's own body
+    -- the ``latin-1`` decode and the detector call that make it THE shared egress
+    scan -- stays in the one function every gate imports.
+    """
+
+    def decorate(scan: _Scan) -> _Scan:
+        @functools.wraps(scan)
+        def scan_once(raw: bytes) -> bool:
+            return _scan_verdict(kind, raw, scan)
+
+        return scan_once
+
+    return decorate
+
+
+@_kept_and_serialized("wide")
+def wide_content_is_flagged(raw: bytes) -> bool:
+    """Whether *raw* carries credential material written at UTF-16/UTF-32 spacing.
+
+    Every file-delivery gate runs this over every buffer it decides on, and it is
+    deliberately behind neither a UTF-8 decode failure nor a MIME check. Both
+    conditions are unsound gates for it: NUL-interleaved ASCII is itself valid
+    UTF-8, so a buffer holding ``K\\x00E\\x00Y`` decodes cleanly and takes the
+    text branch, where the detectors match contiguous ASCII and so match nothing;
+    and a file needs no media extension to hold wide text, so a MIME allow-list
+    does not bound which buffers can carry it.
+
+    Cheap on a buffer that holds no wide text: :data:`_WIDE_PROJECTIONS` searches
+    for a RUN of printable ASCII at each encoding's spacing, and with no run found
+    this returns before any detector runs. Ordinary text and ordinary media both
+    take that path. Searching for runs rather than striding the whole buffer is
+    also what keeps the detectors from being handed a second stream of
+    high-entropy bytes, which would widen the false-positive surface.
+
+    This leg does NOT ask the narrow pass's table-masked second question, because
+    no container reaches it carrying a table. A symbol table is written as
+    contiguous bytes at single-byte spacing, so it matches none of
+    :data:`_WIDE_PROJECTIONS`, whose patterns require printable ASCII alternating
+    with NUL; measured over baseline, grayscale, progressive and optimised JPEGs
+    from 692 bytes to 1.6 MB, and over palette and truecolour PNGs, every one of
+    them yields zero projections here. What does reach this leg is wide-encoded
+    TEXT -- an ID3v2 UTF-16 title, a UTF-16BE PDF string -- and a credential is
+    exactly what this leg exists to find in it.
+
+    Synchronous, like :func:`binary_content_is_flagged`: an async gate calls it
+    through ``asyncio.to_thread`` rather than on the event loop, and the verdict is
+    serialized and kept the same way (:func:`_scan_verdict`).
+    """
+    lifted = [
+        match.group()[offset::stride]
+        for pattern, offset, stride in _WIDE_PROJECTIONS
+        for match in pattern.finditer(raw)
+    ]
+    if not lifted:
+        return False
+    wide = b"\n".join(lifted).decode("latin-1")
+    return redact_via_context(wide) != wide
+
+
+@_kept_and_serialized("binary")
+def binary_content_is_flagged(raw: bytes) -> bool:
+    """Whether non-UTF-8 *raw* carries credential material the scanner finds.
+
+    The ONE binary-content scan for every file-delivery gate. A credential can
+    sit inside an allow-listed media type -- base64 key material in a PDF, an
+    exported token in image metadata -- and a UTF-8 decode raises before the text
+    pass ever runs, so those bytes need a pass of their own. ``latin-1`` is the
+    decode used because it is total: every byte maps to a code point, so no input
+    can escape the scan by failing to decode.
+
+    Totality is not enough on its own, because a single-byte projection reads a
+    wide-encoded credential as characters separated by NUL and matches nothing.
+    :func:`wide_content_is_flagged` covers that, and every gate calls it on its
+    text branch too: a buffer whose bytes ARE valid UTF-8 never reaches here, and
+    NUL-interleaved ASCII is valid UTF-8, so the wide pass cannot live behind this
+    function's decode-failure entry condition alone.
+
+    Latin-1 also splits a UTF-8 multi-byte space after ``Bearer``, so the
+    ``errors="replace"`` UTF-8 projection is joined on and scanned in the same
+    pass, mask and all.
+
+    Four gates guard the ``file_send`` delivery path -- the MCP tool before any
+    byte is copied, ``POST /api/outbox/notify``, ``GET /api/outbox/{filename}``,
+    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. All
+    four must agree on what counts as flagged content, for two different reasons.
+    The three owner-facing gates each read the one durable grant
+    :mod:`kiro_crew.file_delivery_consent` records, so a disagreement among them
+    turns that grant into "delivered, card rendered, download refused". The upload
+    legs read no grant at all and refuse regardless, so a disagreement there
+    splits one file's verdict across two delivery legs instead. Agreement is why
+    this lives here as one function rather than as the same three lines written
+    out four times.
+
+    Routed through :func:`redact_via_context`, so a loaded companion's extra
+    credential regexes apply here exactly as they do on the text path. What a
+    gate DOES with a positive answer is the gate's own decision, and differs:
+    the owner-facing three honour the owner's recorded grant, the upload legs
+    refuse unconditionally.
+
+    A positive answer is re-asked with the standard container symbol tables
+    masked, for the reason ``mask_baseline_symbol_tables`` documents: the standard
+    baseline Huffman table's printable tail reads as an unlabelled bot token, so
+    without the second question essentially every JPEG written with the default
+    tables is refused here. Masking is pinned to that one fixed constant, so the
+    re-ask cannot clear anything else.
+
+    The order is what keeps the cost off the common path. A buffer the detectors do
+    not flag is answered by the same single scan as ever; and when the masker finds
+    no table it returns the buffer ITSELF, which the identity test below reads as
+    "the unmasked answer stands" rather than paying the credential alternation a
+    second time over up to the read cap.
+
+    Synchronous, and deliberately: the scan is CPU work over up to the 50 MB read
+    cap, so an async gate must call it through ``asyncio.to_thread`` rather than
+    on the event loop. A worker thread keeps the call off the loop's thread but not
+    off the GIL, which the regex engine holds for a whole match call; that is why
+    scans run one at a time and a verdict is kept (:func:`_scan_verdict`).
+    """
+    text = raw.decode("latin-1") + "\n" + raw.decode("utf-8", errors="replace")
+    if redact_via_context(text) != text:
+        masked = _baseline_symbol_tables_masked(text)
+        if masked is text or redact_via_context(masked) != masked:
+            return True
+    return wide_content_is_flagged(raw)
+
+
+def redact_owner_view_via_context(text: str) -> str:
+    """:func:`redact_via_context` for the DASHBOARD OWNER'S own view with the switch OFF.
+
+    Runs the same context-aware redaction -- a loaded companion's exfiltration
+    carve-outs and extra patterns apply -- inside a ``redaction_switch.owner_view``
+    scope, so the CORE credential pass stands down while everything else in the
+    chain is unchanged. The caller has already established both facts that
+    justify the scope (owner requester, switch read OFF the event loop and found
+    disabled -- ``handlers/files.py`` ``_owner_view_bypasses_credential_pass``);
+    when either is missing it calls :func:`redact_via_context` or ``redact``
+    instead, so there is no ``bypass`` flag to thread. Use it at the file
+    viewer's two handlers only; every other egress never consults the switch.
+    """
+    from kiro_crew.security.redaction_switch import owner_view
+
+    with owner_view():
+        return redact_via_context(text)
+
+
+def redact_code_via_context(text: str) -> str:
+    """:func:`redact_via_context` for text known to be CODE: it spares an alphabet and a data URI.
+
+    Runs the same context-aware redaction -- a loaded companion's extra patterns and
+    exfiltration carve-outs apply -- inside a ``redaction_switch.code_text`` scope, where pass 3
+    of the core credential pass leaves alone an ordered alphabet and a data URI payload of 64
+    characters or more, and judges every other run as it does anywhere. That pass reads a run
+    of letters and digits as a key by its entropy and shape: in prose it errs towards masking,
+    in code it rewrites an alphabet or a base64 data URI that the program reads back, which
+    breaks the program with no error. Every other rule still runs, so a key id, a PEM block,
+    a JWT or a prefixed token written into code is masked as anywhere else, and so is a key in
+    any shape a script holds it. Only text that is code may be served as this returns it.
+    ``member_dashboard._template_text_safe`` takes :func:`redact_via_context` over a whole
+    page as its baseline and puts this function's result in place of the baseline's for the
+    text of the page's ``<script>`` and ``<style>`` elements.
+    """
+    from kiro_crew.security.redaction_switch import code_text
+
+    with code_text():
+        return redact_via_context(text)
 
 
 #: Substituted for a log line's text when redaction could not be composed. Names

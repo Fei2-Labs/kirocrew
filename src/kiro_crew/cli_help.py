@@ -21,7 +21,7 @@ import argparse
 from typing import Any, Iterable, Iterator, Mapping
 
 # The dashboard port a default install binds. Duplicated as a STRING for help
-# text only; the runtime value is config/loader.py's ``_DEFAULT_PORT``.
+# text only; the runtime value is config/loader_credentials.py's ``_DEFAULT_PORT``.
 _DEFAULT_PORT_TEXT = "5476"
 
 # Ordered sections -> ordered (command, one-line summary) pairs. Order here is
@@ -41,6 +41,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("status", "Show runtime stats"),
             ("restart", "Restart a running gateway (service-aware)"),
             ("stop", "Stop a running gateway"),
+            ("gateway-pid", "Print the PID holding this home's gateway lock (JSON)"),
             ("logs", "Show gateway logs"),
             ("token", "Print a dashboard access URL with auth token"),
             ("logout", "Revoke all active dashboard sessions"),
@@ -54,6 +55,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("setup", "Install agent config and run the setup wizard"),
             ("config", "Get or set configuration values"),
             ("sandbox", "Manage the AppArmor profile the agent sandbox needs (Linux)"),
+            ("kas", "Install Kiro Crew's own KAS engine bundle (no kiro-cli needed)"),
             ("manifest", "Generate a Slack app manifest with your alias"),
         ),
     ),
@@ -150,9 +152,10 @@ gateway vs. service -- the same server, two lifetimes:
                             `kirocrew restart`, `kirocrew logs`.
   Run only one of them at a time -- both bind the same port.
 
-Ports: the dashboard is the only port Kiro Crew opens, and it binds loopback
-  only -- http://localhost:{_DEFAULT_PORT_TEXT}. Messaging channels (Slack, Discord, ...)
-  connect outbound, so nothing else needs to be reachable. Override the port
+Ports: the dashboard is the only port a client needs, and by default it binds
+  loopback only -- http://localhost:{_DEFAULT_PORT_TEXT}. App backends listen on local
+  loopback ports (9100-9199). Messaging channels (Slack, Discord, ...) connect
+  outbound, so nothing else needs to be reachable. Override the port
   with `kirocrew gateway --port N`, KIROCREW_PORT=N, or the `dashboard.url`
   config value; for the service, set KIROCREW_PORT when you run
   `service install` (later, edit /etc/kirocrew/kirocrew.env and restart)."""

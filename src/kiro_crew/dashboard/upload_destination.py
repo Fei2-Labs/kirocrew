@@ -83,7 +83,7 @@ TrackedProbe = Callable[[str], bool]
 #: as distinct from the extraction upload whose filename sanitizer maps any
 #: non-raster mime to ``.bin``. A channel joins this list only once it has that
 #: verb; every other channel is a skip.
-DOCUMENT_CHANNELS = ("telegram", "discord")
+DOCUMENT_CHANNELS = ("telegram", "discord", "wecom")
 
 _DASHBOARD_PREFIX = "dashboard:"
 
@@ -264,6 +264,23 @@ async def resolve_slack(
             if not target_channel and link_ch:
                 target_channel = link_ch
                 channel_from_session_map = True
+        elif (
+            not link_ts
+            and link_ch
+            and not target_channel
+            and session_key == f"{SLACK_NAMESPACE}:{link_ch}"
+        ):
+            # A flat 1:1 DM (slack.dm_single_session) is keyed BY its channel and
+            # deliberately claims no thread, so the branch above finds a channel
+            # with no thread and would fall through to the owner's DM -- sending
+            # the file to a different conversation than the one that asked for
+            # it. Deliver at the root of that DM, which is where the flat
+            # conversation itself lives. Narrow on purpose: only when the key IS
+            # this channel's key, so a thread-scoped or dashboard session that
+            # merely knows a channel keeps failing closed to the owner DM rather
+            # than broadcasting at channel root.
+            target_channel = link_ch
+            channel_from_session_map = True
     channel = ""
     if target_channel:
         try:
@@ -308,7 +325,7 @@ async def resolve_slack(
         channel = target_channel
     else:
         try:
-            creds = KiroCrewConfig.load().load_credentials()
+            creds = await asyncio.to_thread(KiroCrewConfig.load().load_credentials)
             owner_id = creds.get("KIROCREW_OWNER_ID", "")
             if owner_id:
                 channel = await slack.open_dm(owner_id)

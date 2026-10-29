@@ -1,5 +1,5 @@
 /**
- * AgentTemplatesTab — the Agent templates tab under Agent Capabilities.
+ * AgentTemplatesTab — the Custom agents tab under Customize.
  *
  * Pins what a management page must not get wrong: the roster groups by origin
  * (Mine / Private copies / From packages / Built-in), a read-only row explains
@@ -7,14 +7,14 @@
  * definition keys through the detail PATCH and refuses to leave a dirty draft
  * silently (including under a background refetch), a delete that the server
  * refuses as referenced opens the reference list instead of a bare error, create
- * sends `from` only for a duplicate, and "Chat with this template" creates a
+ * sends `from` only for a duplicate, and "Chat with this custom agent" creates a
  * slot in the TEMPLATE namespace. The secondary actions live in one overflow
  * menu (the row holds two controls), so the tests open it the way Radix lets
  * jsdom: keyboard activation of the trigger.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, within } from '@testing-library/react'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { render, screen, waitFor, fireEvent, within, act } from '@testing-library/react'
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 
 const mockApi = vi.hoisted(() => ({
@@ -24,6 +24,9 @@ const mockApi = vi.hoisted(() => ({
   agentTemplateCreate: vi.fn(),
   agentTemplateDelete: vi.fn(),
   createKirocrewAgent: vi.fn(),
+  kirocrewAgents: vi.fn(),
+  defaultAgent: vi.fn(),
+  setDefaultAgent: vi.fn(),
   skillsCatalog: vi.fn(),
   skills: vi.fn(),
 }))
@@ -71,19 +74,20 @@ vi.mock('../components/AgentSkillsEditor', () => ({
 }))
 
 import AgentTemplatesTab from '../pages/overview/AgentTemplatesTab'
+import { defaultAgentQuery, type DefaultAgentReadout } from '../api/defaultAgentQuery'
 import type { TemplateRow } from '../pages/overview/AgentTemplatesTab'
 
 const row = (over: Partial<TemplateRow>): TemplateRow => ({
   name: 'x', filename: 'x.json', description: '', model: '', skills: [], mcp_servers: [],
   source: 'builtin', package: '', scope: 'global', kirocrew_owned: false, forked_from: '', private_to: '',
-  read_only: null, used_by: [], ...over,
+  read_only: null, default_eligible: true, used_by: [], ...over,
 })
 const MINE = row({ name: 'reviewer', filename: 'reviewer.json', description: 'Careful reviewer', model: 'claude-x', used_by: [{ kind: 'crew', id: 'pr-bot', label: 'pr-bot' }, { kind: 'private_copy', id: 'pr-bot', label: 'pr-bot' }] })
 // The same template with nothing pointing at it: the row a delete can go through for.
 const FREE = { ...MINE, used_by: [] }
 const PKG = row({ name: 'atlas', filename: 'Pkg-atlas.json', source: 'package', package: 'Pkg', read_only: 'package' })
 const RUNTIME = row({ name: 'kirocrew-worker', filename: 'kirocrew-worker.json', kirocrew_owned: true, read_only: 'runtime' })
-const COPY = row({ name: 'pr-bot', filename: 'pr-bot.json', forked_from: 'reviewer', private_to: 'pr-bot', read_only: 'private_copy' })
+const COPY = row({ name: 'pr-bot', filename: 'pr-bot.json', forked_from: 'reviewer', private_to: 'pr-bot', read_only: 'private_copy', default_eligible: false })
 
 function renderTab() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
@@ -93,6 +97,16 @@ function renderTab() {
     </QueryClientProvider>,
   )
 }
+
+/** The spawn tests wait on a CHAINED load: the roster query, the auto-select
+ *  effect, the detail query, then the draft effect that seeds the editor (and,
+ *  after Save, the patch mutation). Each of those waits is bounded by this rather
+ *  than RTL's 1000ms default, which a loaded coverage shard can exceed. */
+const EDITOR_CHAIN_TIMEOUT_MS = 5000
+const EDITOR_CHAIN = { timeout: EDITOR_CHAIN_TIMEOUT_MS }
+
+/** The six background-subagent refs the one-click button adds, in order. */
+const SPAWN_FAMILY = ['spawn_run', 'spawn_list', 'spawn_status', 'spawn_steer', 'spawn_continue', 'spawn_release'].map(t => `@kirocrew-core/${t}`)
 
 const option = (name: string) => screen.getByRole('option', { name: new RegExp(`^${name}\\b`) })
 
@@ -116,6 +130,9 @@ beforeEach(() => {
   mockApi.agentTemplateCreate.mockResolvedValue({ ok: true, name: 'pr-summarizer', filename: 'pr-summarizer.json' })
   mockApi.agentTemplateDelete.mockResolvedValue({ ok: true })
   mockApi.createKirocrewAgent.mockResolvedValue({ ok: true })
+  mockApi.kirocrewAgents.mockResolvedValue({ agents: [], default_agent: 'kirocrew' })
+  mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'kirocrew', overridden: false })
+  mockApi.setDefaultAgent.mockResolvedValue({ ok: true, default_agent: 'default' })
   mockDispatch.mockImplementation(() => ({ unwrap: () => Promise.resolve({ key: 'chat-1' }) }))
 })
 
@@ -124,16 +141,16 @@ describe('AgentTemplatesTab roster', () => {
     renderTab()
     await screen.findByRole('option', { name: /^reviewer/ })
     const groups = screen.getAllByRole('group').map(g => g.getAttribute('aria-label'))
-    expect(groups).toEqual(['Mine', 'Crewmate overrides', 'From packages', 'Built-in'])
+    expect(groups).toEqual(['Mine', 'Mates with their own copy', 'From packages', 'Built-in'])
     expect(within(screen.getByRole('group', { name: 'Mine' })).getByRole('option', { name: /^reviewer/ })).toBeInTheDocument()
-    // The overrides group is glossed, and its row is described in the tab's
+    // The own-copy group is glossed, and its row is described in the tab's
     // own word rather than the fork-written "private copy" sentence.
-    const overrides = screen.getByRole('group', { name: 'Crewmate overrides' })
-    expect(within(overrides).getByText(/One crewmate’s edited version/)).toBeInTheDocument()
-    expect(within(overrides).getByRole('option', { name: /^pr-bot/ })).toHaveTextContent('Crewmate pr-bot’s override of reviewer')
-    // One fact, one word: the count badge on the source row says "override"
-    // the way the group heading and the banner do, not "Overridden by".
-    expect(within(screen.getByRole('group', { name: 'Mine' })).getByText('1 crewmate override')).toBeInTheDocument()
+    const overrides = screen.getByRole('group', { name: 'Mates with their own copy' })
+    expect(within(overrides).getByText(/One mate’s edited version/)).toBeInTheDocument()
+    expect(within(overrides).getByRole('option', { name: /^pr-bot/ })).toHaveTextContent('Mate pr-bot’s own copy of reviewer')
+    // One fact, one phrase: the count badge uses the same own-copy term as
+    // the group heading and the banner.
+    expect(within(screen.getByRole('group', { name: 'Mine' })).getByText('1 mate with its own copy')).toBeInTheDocument()
     expect(within(screen.getByRole('group', { name: 'From packages' })).getByRole('option', { name: /atlas/ })).toBeInTheDocument()
     // The first row is auto-selected and its detail read fires.
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
@@ -147,11 +164,11 @@ describe('AgentTemplatesTab roster', () => {
     expect(within(row).getAllByRole('button')).toHaveLength(2)
     let items = await openMore()
     expect(items.map(i => i.textContent)).toEqual([
-      expect.stringContaining('Enroll as crewmate'), 'Duplicate', 'Delete',
+      expect.stringContaining('Enroll as mate'), 'Duplicate', 'Delete',
     ])
     // The enroll item says what enrolling starts. `pr-bot` runs this template
     // under its own name, so a crewmate NAMED reviewer can still be enrolled.
-    expect(items[0]).toHaveTextContent('Adds a crewmate with its own memory')
+    expect(items[0]).toHaveTextContent('Adds a mate with its own memory')
     expect(items[0]).not.toHaveAttribute('data-disabled')
     fireEvent.keyDown(items[0], { key: 'Escape' })
 
@@ -159,7 +176,7 @@ describe('AgentTemplatesTab roster', () => {
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('atlas'))
     items = await openMore()
     expect(items.map(i => i.textContent)).toEqual([
-      expect.stringContaining('Adds a crewmate with its own memory'), 'Duplicate to edit',
+      expect.stringContaining('Adds a mate with its own memory'), 'Duplicate to edit',
     ])
     fireEvent.keyDown(items[0], { key: 'Escape' })
     // The read-only banner carries the reason once and the remedy beside it;
@@ -196,7 +213,7 @@ describe('AgentTemplatesTab roster', () => {
     // The usage line names every holder kind the guard counts, up front, and
     // each is a drill-in to where that holder lives. One fact, one phrasing:
     // the line says "Runs 1 crewmate" exactly as the list badge does.
-    expect(screen.getAllByText(/Runs 1 crewmate/).length).toBeGreaterThanOrEqual(2)
+    expect(screen.getAllByText(/Runs 1 mate/).length).toBeGreaterThanOrEqual(2)
     expect(screen.queryByText(/Runs as/)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '1 chat folder' }))
     expect(mockNavigate).toHaveBeenLastCalledWith('/chat')
@@ -205,7 +222,7 @@ describe('AgentTemplatesTab roster', () => {
     fireEvent.click(screen.getByRole('button', { name: '1 webhook' }))
     expect(mockNavigate).toHaveBeenLastCalledWith('/webhooks')
     const items = await openMore()
-    expect(items[0]).toHaveTextContent('Already enrolled as a crewmate.')
+    expect(items[0]).toHaveTextContent('Already enrolled as a mate.')
     expect(items[0]).toHaveAttribute('data-disabled')
     fireEvent.click(items.find(i => i.textContent === 'Delete')!)
     // The row already shows holders, so the "nothing points at it" confirm is
@@ -218,12 +235,20 @@ describe('AgentTemplatesTab roster', () => {
     // A private copy is named by the copy with its crew as a gloss, and links to
     // that crew's pane -- it is not a dead end.
     expect(within(dialog).getByText('pr-bot-copy')).toBeInTheDocument()
-    expect(within(dialog).getByText('crewmate pr-bot')).toBeInTheDocument()
+    expect(within(dialog).getByText('mate pr-bot')).toBeInTheDocument()
     fireEvent.click(within(dialog).getAllByRole('button', { name: /Open/ }).at(-1)!)
     expect(mockNavigate).toHaveBeenCalledWith('/members?member=pr-bot')
   })
 
-  it('sends a private copy to its crewmate instead of offering Duplicate to edit', async () => {
+  it('says plainly when no mate runs a template', async () => {
+    renderTab()
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
+    fireEvent.click(option('atlas'))
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('atlas'))
+    expect((await screen.findAllByText('No mate runs this')).length).toBeGreaterThan(0)
+  })
+
+  it('sends a private copy to its mate instead of offering Duplicate to edit', async () => {
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
     fireEvent.click(option('pr-bot'))
@@ -231,9 +256,9 @@ describe('AgentTemplatesTab roster', () => {
     expect(screen.queryByRole('button', { name: /Duplicate to edit/ })).toBeNull()
     // Said as what it is, not as a template nobody enrolled -- in the list row
     // and again in the detail's usage line.
-    expect(screen.getAllByText('Crewmate pr-bot’s override of reviewer')).toHaveLength(2)
-    expect(screen.queryByText('Not enrolled as a crewmate')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: /Open crewmate/ }))
+    expect(screen.getAllByText('Mate pr-bot’s own copy of reviewer')).toHaveLength(2)
+    expect(screen.queryByText('No mate runs this')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Open mate/ }))
     expect(mockNavigate).toHaveBeenCalledWith('/members?member=pr-bot')
     expect(mockLeave).toHaveBeenLastCalledWith(expect.any(Function), '/members?member=pr-bot')
   })
@@ -252,7 +277,7 @@ describe('AgentTemplatesTab editing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'fs_read: asks first', pressed: false }))
     expect(screen.getByRole('button', { name: 'fs_read: auto-approve ✓', pressed: true })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Remove fs_read' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Save template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
     // Only the keys that changed travel: tools and their marks together, the
     // prompt, and NOT the untouched description or model.
     await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', {
@@ -261,7 +286,7 @@ describe('AgentTemplatesTab editing', () => {
       allowedTools: ['@docs/search', 'fs_read'],
     }))
     await waitFor(() => expect(screen.queryByText(/Unsaved changes/)).toBeNull())
-    expect(screen.getByRole('status')).toHaveTextContent('Template saved.')
+    expect(screen.getByRole('status')).toHaveTextContent('Custom agent saved.')
   })
 
   it('never resends an unchanged model, which the server would read as a pin', async () => {
@@ -273,7 +298,7 @@ describe('AgentTemplatesTab editing', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'prompt only' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
     await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledTimes(1))
     expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', { prompt: 'prompt only' })
     expect(mockApi.agentPatch.mock.calls[0][1]).not.toHaveProperty('model')
@@ -319,8 +344,12 @@ describe('AgentTemplatesTab editing', () => {
     await qc.invalidateQueries({ queryKey: ['agent-templates'] })
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledTimes(2))
     expect(screen.getByRole('textbox', { name: 'Prompt' })).toHaveValue('still typing')
-    expect(screen.getByText(/Unsaved changes · affects 1 crewmate/)).toBeInTheDocument()
-    expect(screen.getByText(/new chats use them at once; chats already running pick them up after Apply & Restart/)).toBeInTheDocument()
+    expect(screen.getByText(/Unsaved changes · affects 1 mate/)).toBeInTheDocument()
+    // No restart control on Customize: the hint names the limit and points at
+    // the remedy where it now lives (Apply & Restart on Connections) instead of
+    // at a header button here.
+    expect(screen.getByText(/New chats use them at once; chats already running keep what they started with — relaunch them with Apply & Restart on Connections/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /apply & restart/i })).not.toBeInTheDocument()
   })
 
   it('asks before a row switch discards a dirty draft', async () => {
@@ -343,7 +372,7 @@ describe('AgentTemplatesTab editing', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'x' } })
-    const saveBtn = screen.getByRole('button', { name: 'Save template' })
+    const saveBtn = screen.getByRole('button', { name: 'Save custom agent' })
     fireEvent.click(saveBtn)
     // The pane above scrolls and the bar does not: the error must share the
     // bar with the button that produced it, not sit at the top of the pane.
@@ -381,7 +410,7 @@ describe('AgentTemplatesTab detail robustness', () => {
     mockApi.agentDetail.mockRejectedValue(new StubApiError(500, 'boom'))
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
-    await screen.findByText('This template could not be read.')
+    await screen.findByText('This custom agent could not be read.')
     expect(screen.queryByText('Loading…')).toBeNull()
   })
 
@@ -426,7 +455,7 @@ describe('AgentTemplatesTab actions', () => {
   it('starts a chat in the template namespace', async () => {
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
-    fireEvent.click(screen.getByRole('button', { name: /Chat with this template/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Chat with this custom agent/ }))
     await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/chat'))
     expect(mockCreateSlot).toHaveBeenCalledWith({ agent: 'reviewer', agent_kind: 'template' })
   })
@@ -437,7 +466,7 @@ describe('AgentTemplatesTab actions', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'dirty' } })
-    const chat = screen.getByRole('button', { name: /Chat with this template/ })
+    const chat = screen.getByRole('button', { name: /Chat with this custom agent/ })
     expect(chat).toBeEnabled()
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     fireEvent.click(chat)
@@ -471,6 +500,49 @@ describe('AgentTemplatesTab actions', () => {
     expect(option('reviewer')).toBeInTheDocument()
   })
 
+  it('names a reserved template id in the create dialog when the server refuses it', async () => {
+    // The KAS engine keeps `default`, `vibe`, `plan`, ... for itself; the
+    // server refuses them as 400 template_name_reserved_by_engine and the dialog must
+    // say which word to change rather than relay the server's English text.
+    mockApi.agentTemplateCreate.mockRejectedValue(
+      new StubApiError(400, "'plan' is reserved", { error: "'plan' is reserved", code: 'template_name_reserved_by_engine' }),
+    )
+    renderTab()
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'plan' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Create and edit' }))
+    await waitFor(() => expect(mockApi.agentTemplateCreate).toHaveBeenCalledWith({ name: 'plan', description: '' }))
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent('“plan” is reserved for a built-in agent. Pick another name.')
+    // Still open with the typed name: nothing was created, nothing to reopen.
+    expect(within(dialog).getByRole('textbox', { name: 'Name' })).toHaveValue('plan')
+    // Editing the name clears the refusal: the live "Create and edit" button then
+    // reads as a fresh attempt, not as a press that would fail the same way.
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'planner' } })
+    await waitFor(() => expect(within(dialog).queryByRole('alert')).toBeNull())
+    expect(within(dialog).getByRole('button', { name: 'Create and edit' })).toBeEnabled()
+  })
+
+  it('does not blame the engine for a runtime-owned reserved name', async () => {
+    // `kirocrew` and the Windows device names answer the plain
+    // template_name_reserved code; that refusal keeps the server's own text
+    // rather than the engine sentence, which would name the wrong owner.
+    mockApi.agentTemplateCreate.mockRejectedValue(
+      new StubApiError(400, "'kirocrew' is reserved", { error: "'kirocrew' is reserved", code: 'template_name_reserved' }),
+    )
+    renderTab()
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
+    fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'kirocrew' } })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Create and edit' }))
+    const alert = await within(dialog).findByRole('alert')
+    expect(alert).toHaveTextContent("'kirocrew' is reserved")
+    expect(alert).not.toHaveTextContent('built-in agent')
+  })
+
   it('creates a blank template, and a duplicate sends `from`', async () => {
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
@@ -481,8 +553,8 @@ describe('AgentTemplatesTab actions', () => {
       mockApi.agentTemplates.mockResolvedValue({ templates: [MINE, CREATED, PKG, RUNTIME, COPY] })
       return { ok: true, name: 'pr-summarizer', filename: 'pr-summarizer.json' }
     })
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'New template' })
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'pr-summarizer' } })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Description' }), { target: { value: 'Sums up PRs' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Create and edit' }))
@@ -510,7 +582,7 @@ describe('AgentTemplatesTab actions', () => {
     fireEvent.change(prompt, { target: { value: 'edited reviewer prompt' } })
     // New template is a row switch: the dirty guard asks first.
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(confirmSpy).toHaveBeenCalled()
     confirmSpy.mockReturnValue(true)
@@ -519,15 +591,15 @@ describe('AgentTemplatesTab actions', () => {
       mockApi.agentTemplates.mockResolvedValue({ templates: [MINE, CREATED, PKG, RUNTIME, COPY] })
       return { ok: true, name: 'fresh', filename: 'fresh.json' }
     })
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'New template' })
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'fresh' } })
     fireEvent.click(within(dialog).getByRole('button', { name: 'Create and edit' }))
     await waitFor(() => expect(option('fresh')).toHaveAttribute('aria-selected', 'true'))
     // The editor reseeds from the NEW template; the abandoned draft is gone and
     // nothing is dirty, so a Save here could not write reviewer's edits as fresh.
     await waitFor(() => expect(screen.getByRole('textbox', { name: 'Prompt' })).toHaveValue('prompt of fresh'))
-    expect(screen.queryByRole('button', { name: 'Save template' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Save custom agent' })).toBeNull()
   })
 
   it('confirms a save where the bar stood, and the Add tool label stays visible while typing', async () => {
@@ -536,17 +608,107 @@ describe('AgentTemplatesTab actions', () => {
     const prompt = await screen.findByRole('textbox', { name: 'Prompt' })
     await waitFor(() => expect(prompt).toHaveValue('prompt of reviewer'))
     fireEvent.change(prompt, { target: { value: 'edited' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Save template' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
     // The bar unmounts on success; the confirmation takes its place rather
     // than landing at the top of the scrolling pane.
     const status = await screen.findByRole('status')
-    expect(status).toHaveTextContent('Template saved.')
+    expect(status).toHaveTextContent('Custom agent saved.')
     expect(status.className).toContain('bottom-4')
     // Opening the Add tool input keeps its words on screen.
     fireEvent.click(screen.getByRole('button', { name: /Add tool/ }))
     const input = screen.getByRole('combobox', { name: 'Add tool' })
     expect(input.closest('label')).toHaveTextContent('Add tool')
     expect(input).toHaveAttribute('placeholder', 'e.g. fs_write or @github/…')
+  })
+
+  it('names the spawn tool on an editable template until the template grants it', async () => {
+    renderTab()
+    // roster -> detail -> draft: the editor is seeded only at the end of the chain.
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'), EDITOR_CHAIN)
+    const hint = await screen.findByText(/run other agents in the background/, {}, EDITOR_CHAIN)
+    expect(hint).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Add tool' }))
+    const input = screen.getByRole('combobox', { name: 'Add tool' })
+    // The datalist offers the spawn refs beside kiro-cli's own tool names.
+    const listId = input.getAttribute('list')
+    expect(listId).toBeTruthy()
+    const values = Array.from(document.getElementById(listId!)!.querySelectorAll('option')).map(o => o.getAttribute('value'))
+    expect(values).toEqual(expect.arrayContaining(['fs_read', '@kirocrew-core/spawn_run', '@kirocrew-core/spawn_list']))
+    // One click on the hint's button grants the whole spawn family, so the
+    // agent can also check on and release what it started; the hint then goes.
+    // The refs are the tooltip, not part of the label.
+    const add = screen.getByRole('button', { name: 'Allow background agents' })
+    expect(add).toHaveAttribute('title', '@kirocrew-core/spawn_*')
+    fireEvent.click(add)
+    for (const ref of SPAWN_FAMILY) {
+      expect(screen.getByRole('button', { name: `${ref}: asks first`, pressed: false })).toBeInTheDocument()
+    }
+    await waitFor(() => expect(screen.queryByText(/run other agents in the background/)).toBeNull(), EDITOR_CHAIN)
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
+    await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', {
+      tools: ['fs_read', '@docs/search', ...SPAWN_FAMILY],
+      allowedTools: ['@docs/search'],
+    }), EDITOR_CHAIN)
+  })
+
+  it('adds only the spawn refs a template still lacks', async () => {
+    mockApi.agentDetail.mockImplementation(async (name: string) => ({
+      name, description: '', model: '', prompt: '', tools: ['fs_read', '@kirocrew-core/spawn_run'], allowedTools: [],
+      resources: [], mcpServers: { 'kirocrew-core': { command: 'kirocrew' } }, skills: [],
+    }))
+    renderTab()
+    // roster -> detail -> draft: the editor is seeded only at the end of the chain.
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'), EDITOR_CHAIN)
+    fireEvent.click(await screen.findByRole('button', { name: /Allow background agents/ }, EDITOR_CHAIN))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
+    await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', {
+      tools: ['fs_read', '@kirocrew-core/spawn_run', ...SPAWN_FAMILY.slice(1)],
+      allowedTools: [],
+    }), EDITOR_CHAIN)
+  })
+
+  it('offers the spawn family under * only while the spec does not declare the server', async () => {
+    // `*` grants every DECLARED server: with kirocrew-core undeclared it mounts
+    // nothing, so the button stays and its explicit refs make the save declare it.
+    mockApi.agentDetail.mockImplementation(async (name: string) => ({
+      name, description: '', model: '', prompt: '', tools: ['*'], allowedTools: [],
+      resources: [], mcpServers: {}, skills: [],
+    }))
+    const { unmount } = renderTab()
+    // roster -> detail -> draft: the editor is seeded only at the end of the chain.
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'), EDITOR_CHAIN)
+    fireEvent.click(await screen.findByRole('button', { name: /Allow background agents/ }, EDITOR_CHAIN))
+    fireEvent.click(screen.getByRole('button', { name: 'Save custom agent' }))
+    await waitFor(() => expect(mockApi.agentPatch).toHaveBeenCalledWith('reviewer', {
+      tools: ['*', ...SPAWN_FAMILY],
+      allowedTools: [],
+    }), EDITOR_CHAIN)
+    unmount()
+    // Declared, `*` already mounts the whole server: nothing to offer.
+    mockApi.agentDetail.mockImplementation(async (name: string) => ({
+      name, description: '', model: '', prompt: '', tools: ['*'], allowedTools: [],
+      resources: [], mcpServers: { 'kirocrew-core': { command: 'kirocrew' } }, skills: [],
+    }))
+    renderTab()
+    await screen.findByRole('button', { name: 'Add tool' }, EDITOR_CHAIN)
+    expect(screen.queryByRole('button', { name: /Allow background agents/ })).toBeNull()
+  })
+
+  it('reports a spawn grant the server cannot declare in the save bar', async () => {
+    const reason = "Could not add kirocrew-core: the MCP servers section of this agent's file is malformed, so the tool would never load. Fix that section in the file, then save again."
+    mockApi.agentPatch.mockRejectedValue(new StubApiError(409, reason, { error: reason, code: 'control_plane_not_declarable' }))
+    renderTab()
+    // roster -> detail -> draft: the editor is seeded only at the end of the chain.
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'), EDITOR_CHAIN)
+    fireEvent.click(await screen.findByRole('button', { name: /Allow background agents/ }, EDITOR_CHAIN))
+    const saveBtn = screen.getByRole('button', { name: 'Save custom agent' })
+    fireEvent.click(saveBtn)
+    // The refusal names the server and the fix beside the button that was
+    // pressed, and the draft is kept so nothing looks saved.
+    const alert = await screen.findByRole('alert', {}, EDITOR_CHAIN)
+    expect(alert).toHaveTextContent(reason)
+    expect(alert.closest('div')).toBe(saveBtn.closest('div'))
+    expect(screen.getByRole('button', { name: '@kirocrew-core/spawn_run: asks first', pressed: false })).toBeInTheDocument()
   })
 
   it('names the deleted template in the closure line over the next row', async () => {
@@ -617,9 +779,362 @@ describe('AgentTemplatesTab actions', () => {
   it('refuses a name the server would refuse before sending it', async () => {
     renderTab()
     await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
-    fireEvent.click(screen.getByRole('button', { name: /New template/ }))
-    const dialog = await screen.findByRole('dialog', { name: 'New template' })
+    fireEvent.click(screen.getByRole('button', { name: /New custom agent/ }))
+    const dialog = await screen.findByRole('dialog', { name: 'New custom agent' })
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'Name' }), { target: { value: 'has space' } })
     expect(within(dialog).getByRole('button', { name: 'Create and edit' })).toBeDisabled()
+  })
+})
+
+describe('AgentTemplatesTab — enrolling reaches the crew registry', () => {
+  /* Enrolling POSTs /api/agents: the same config.json write the Crews tab's own
+     create makes, which #12740 paired with `['kirocrewConfig']` because both
+     records land together. This tab is the Crews tab's SIBLING under
+     Agent Capabilities (CapabilitiesPage.tsx renders `crews` and `templates`
+     off one rail), and the dashboard's QueryClient sets `staleTime: Infinity`
+     (api/queryClient.ts) — "queries never go stale on their own. Freshness is
+     driven exclusively by WebSocket push". `POST /api/agents` pushes nothing:
+     the only `push_refresh("agents")` in the backend is the MCP capability
+     install. So while the registry entry is live -- another consumer mounted,
+     or within its `gcTime` of the Crews tab unmounting, which is what opening
+     Capabilities on Crews and coming back here buys -- nothing refetches it,
+     and a remount serves the cached roster rather than asking again.
+
+     The consumer mounted beside the tab is the Crews tab's own query, spelled
+     exactly as KiroCrewAgentsPage.tsx:810-813 spells it. */
+  const CrewsRosterProbe = () => {
+    const { data } = useQuery({ queryKey: ['kirocrew-agents'], queryFn: () => mockApi.kirocrewAgents() })
+    return <ul data-testid="crews-roster">{(data?.agents ?? []).map((a: { name: string }) => <li key={a.name}>{a.name}</li>)}</ul>
+  }
+
+  function renderWithCrews() {
+    // Production defaults, not the per-test client the other blocks use: with
+    // the library default (staleTime 0) a remount would refetch and hide this.
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } })
+    return render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter><AgentTemplatesTab /><CrewsRosterProbe /></MemoryRouter>
+      </QueryClientProvider>,
+    )
+  }
+
+  it('shows the enrolled mate on the Crews roster', async () => {
+    // Pre-write world first, post-write world after: only a second registry
+    // read can reach the crewmate the enroll just created (#12740's idiom).
+    mockApi.kirocrewAgents
+      .mockResolvedValueOnce({ agents: [{ name: 'pr-bot' }], default_agent: 'kirocrew' })
+      .mockResolvedValue({ agents: [{ name: 'pr-bot' }, { name: 'reviewer' }], default_agent: 'kirocrew' })
+    mockApi.agentTemplates.mockResolvedValue({ templates: [FREE, PKG, RUNTIME, COPY] })
+
+    renderWithCrews()
+    await waitFor(() => expect(mockApi.agentDetail).toHaveBeenCalledWith('reviewer'))
+    await waitFor(() => expect(screen.getByTestId('crews-roster')).toHaveTextContent('pr-bot'))
+
+    const items = await openMore()
+    fireEvent.click(items[0])
+    await waitFor(() => expect(mockApi.createKirocrewAgent).toHaveBeenCalled())
+    // Enrolling defaults the crewmate to a name-seeded ICON, the same default
+    // the New-crewmate dialog applies — never the trait ghost a missing avatar
+    // falls back to on render (#18616). Headless create paths (CLI, raw API)
+    // are tracked separately for backend seeding.
+    expect(mockApi.createKirocrewAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'reviewer', avatar: expect.objectContaining({ kind: 'icon' }) }),
+    )
+
+    await waitFor(() => expect(screen.getByTestId('crews-roster')).toHaveTextContent('reviewer'))
+  })
+})
+
+describe('AgentTemplatesTab — the default custom agent bar (#18411)', () => {
+  const BAR_LABEL = 'New sessions use'
+  const trigger = () => within(screen.getByTestId('default-template-bar')).getByRole('combobox', { name: BAR_LABEL })
+  afterEach(() => { vi.useRealTimers() })
+
+  it('shows what actually starts, as the shared default-agent readout answers it', async () => {
+    renderTab()
+    await waitFor(() => expect(mockApi.defaultAgent).toHaveBeenCalled())
+    // The route answers the effective name; the bar shows it as is.
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+  })
+
+  it('offers only rows the server would accept, and writes the pick', async () => {
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    // The open Radix list is the one listbox that is not the roster.
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    const names = within(list).getAllByRole('option').map(o => o.textContent)
+    // A private copy is never offered; a package template is (editability is a
+    // different question from reachability).
+    expect(names).toContain('reviewer')
+    expect(names).toContain('atlas')
+    expect(names).not.toContain('pr-bot')
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    await waitFor(() => expect(mockApi.setDefaultAgent).toHaveBeenCalledWith('reviewer', 'template'))
+    // The roster carries the "Default custom agent" marker, so it is re-read.
+    await waitFor(() => expect(mockApi.agentTemplates.mock.calls.length).toBeGreaterThan(1))
+  })
+
+  const pick = async (name: string) => {
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name }))
+  }
+
+  it("sends every pick by its own name as a template, the runtime's own included", async () => {
+    const MAIN = row({ name: 'kirocrew', filename: 'kirocrew.json', kirocrew_owned: true, read_only: 'runtime' })
+    mockApi.agentTemplates.mockResolvedValue({ templates: [MINE, PKG, RUNTIME, MAIN] })
+    mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'reviewer', overridden: false })
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('reviewer'))
+    // The re-read after each write answers what the server now holds.
+    mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'kirocrew', overridden: false })
+    // Never "": on this route an empty name would write the default crewmate.
+    await pick('kirocrew')
+    await waitFor(() => expect(mockApi.setDefaultAgent).toHaveBeenLastCalledWith('kirocrew', 'template'))
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    await waitFor(() => expect(trigger()).not.toBeDisabled())
+    mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'atlas', overridden: false })
+    await pick('atlas')
+    await waitFor(() => expect(mockApi.setDefaultAgent).toHaveBeenLastCalledWith('atlas', 'template'))
+    await waitFor(() => expect(trigger()).not.toBeDisabled())
+    await pick('kirocrew-worker')
+    await waitFor(() => expect(mockApi.setDefaultAgent).toHaveBeenLastCalledWith('kirocrew-worker', 'template'))
+    expect(mockApi.setDefaultAgent).not.toHaveBeenCalledWith('', expect.anything())
+  })
+
+  it('shows the saved pick before the re-read lands', async () => {
+    mockApi.defaultAgent
+      .mockResolvedValueOnce({ default_agent: 'default', default_template: 'kirocrew', overridden: false })
+      .mockImplementation(() => new Promise(() => {}))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    await pick('reviewer')
+    await waitFor(() => expect(screen.getByTestId('default-template-saved')).toBeInTheDocument())
+    // The refetch never answers here, and the write's answer carries no
+    // `default_template`: the picked name seeded into the cache is what the select shows.
+    expect(mockApi.defaultAgent.mock.calls.length).toBeGreaterThan(1)
+    expect(mockApi.setDefaultAgent).toHaveBeenCalledWith('reviewer', 'template')
+    expect(trigger()).toHaveTextContent('reviewer')
+  })
+
+  it('reads and seeds the one shared default-agent cache, no second key', async () => {
+    // The bar reads GET /api/config/default-agent through `defaultAgentQuery`:
+    // a readout already in that cache (another consumer fetched it) paints the
+    // bar without a second request, and a pick seeds that same entry.
+    mockApi.defaultAgent.mockImplementation(() => new Promise(() => {}))
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    qc.setQueryData<DefaultAgentReadout>(defaultAgentQuery.queryKey, { default_agent: 'default', default_template: 'atlas', overridden: false })
+    render(<QueryClientProvider client={qc}><MemoryRouter><AgentTemplatesTab /></MemoryRouter></QueryClientProvider>)
+    await waitFor(() => expect(trigger()).toHaveTextContent('atlas'))
+    expect(mockApi.defaultAgent).not.toHaveBeenCalled()
+    await pick('reviewer')
+    await waitFor(() => expect(screen.getByTestId('default-template-saved')).toBeInTheDocument())
+    // The refetch never answers: the seeded shared entry is what the select shows.
+    expect(qc.getQueryData<DefaultAgentReadout>(defaultAgentQuery.queryKey)).toEqual({ default_agent: 'default', default_template: 'reviewer', overridden: false })
+    expect(trigger()).toHaveTextContent('reviewer')
+    const defaultKeys = qc.getQueryCache().getAll().map(q => q.queryHash).filter(h => h.includes('default'))
+    expect(defaultKeys).toEqual([JSON.stringify(defaultAgentQuery.queryKey)])
+  })
+
+  it('confirms a pick that saved beside the select, then clears it', async () => {
+    // The write is held open so fake timers can be installed before it lands:
+    // the confirmation's timer then starts on the fake clock.
+    let land: (v: unknown) => void = () => {}
+    mockApi.setDefaultAgent.mockImplementation(() => new Promise(resolve => { land = resolve }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    await waitFor(() => expect(mockApi.setDefaultAgent).toHaveBeenCalledWith('reviewer', 'template'))
+    // Nothing claims success while the write is still in flight.
+    expect(screen.queryByTestId('default-template-saved')).toBeNull()
+    vi.useFakeTimers()
+    await act(async () => {
+      land({ ok: true, default_agent: 'default' })
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    const saved = within(screen.getByTestId('default-template-bar')).getByTestId('default-template-saved')
+    expect(saved).toHaveTextContent(/^Saved$/)
+    act(() => { vi.advanceTimersByTime(2400) })
+    expect(screen.getByTestId('default-template-saved')).toBeInTheDocument()
+    act(() => { vi.advanceTimersByTime(200) })
+    expect(screen.queryByTestId('default-template-saved')).toBeNull()
+  })
+
+  it('shows no confirmation when a pick is refused', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code: 'foreign_private_copy' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    await screen.findByTestId('default-template-error')
+    expect(screen.queryByTestId('default-template-saved')).toBeNull()
+  })
+
+  it('reports a refusal in the bar, in plain words', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code: 'foreign_private_copy' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    // The open Radix list is the one listbox that is not the roster.
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    const err = await screen.findByTestId('default-template-error')
+    // Opens with the failed action, then names what still starts: the select
+    // snaps back to it, so the sentence must not read as if reviewer had been
+    // the default.
+    expect(err).toHaveTextContent(/^Couldn’t switch to reviewer: it’s a mate’s private copy\. New sessions still use kirocrew\.$/)
+  })
+
+  it('lets the reader put a refusal away, and keeps the read failure without a dismiss', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code: 'foreign_private_copy' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    const err = await screen.findByTestId('default-template-error')
+    // A refusal is a one-time report: it has a dismiss and goes away on click.
+    fireEvent.click(within(err).getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByTestId('default-template-error')).toBeNull())
+  })
+
+  it('re-reads the roster after a refusal so the refused agent drops out of the picker', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code: 'foreign_private_copy' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    const before = mockApi.agentTemplates.mock.calls.length
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    await screen.findByTestId('default-template-error')
+    // The list the pick came from was stale; it is fetched again, not trusted.
+    await waitFor(() => expect(mockApi.agentTemplates.mock.calls.length).toBeGreaterThan(before))
+  })
+
+  it('shows a stored name that is no longer offered rather than the first option', async () => {
+    mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'gone', overridden: false })
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('gone'))
+  })
+
+  it('reports a failed read of the default in the bar and disables the picker', async () => {
+    mockApi.defaultAgent.mockRejectedValue(new StubApiError(500, 'boom', { code: 'config_unreadable' }))
+    renderTab()
+    const err = await screen.findByTestId('default-template-error', {}, { timeout: 5000 })
+    expect(err).toHaveTextContent(/^Couldn’t read which custom agent new sessions use\.$/)
+    expect(trigger()).toBeDisabled()
+  })
+
+  it('re-reads the default from the Retry beside a failed read', async () => {
+    // The shared default-agent query retries an answered failure once on its
+    // own (`retryThroughRestart`), so the read fails twice before the notice.
+    mockApi.defaultAgent
+      .mockRejectedValueOnce(new StubApiError(500, 'boom', { code: 'config_unreadable' }))
+      .mockRejectedValueOnce(new StubApiError(500, 'boom', { code: 'config_unreadable' }))
+    renderTab()
+    await screen.findByTestId('default-template-error', {}, { timeout: 5000 })
+    expect(mockApi.defaultAgent).toHaveBeenCalledTimes(2)
+    fireEvent.click(within(screen.getByTestId('default-template-bar')).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(mockApi.defaultAgent).toHaveBeenCalledTimes(3))
+    // The second read lands: the notice and the Retry go, the picker opens up.
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    await waitFor(() => expect(trigger()).not.toBeDisabled())
+    expect(screen.queryByTestId('default-template-error')).toBeNull()
+    expect(within(screen.getByTestId('default-template-bar')).queryByRole('button', { name: 'Retry' })).toBeNull()
+  })
+
+  it('says a config.local.json pin up front and disables the picker before any pick', async () => {
+    mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'atlas', overridden: true, override_path: '/home/u/.kiro/crew/config.local.json' })
+    renderTab()
+    const note = await screen.findByTestId('default-template-overridden')
+    // The fact leads; the file is a second, smaller line under it.
+    expect(note.firstElementChild).toHaveTextContent(/^Set by a local config file, so it can’t be changed here\. New sessions use atlas\.$/)
+    expect(within(note).getByTestId('default-template-overridden-file')).toHaveTextContent(/^File: \/home\/u\/\.kiro\/crew\/config\.local\.json$/)
+    expect(trigger()).toBeDisabled()
+    expect(mockApi.setDefaultAgent).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('default-template-error')).toBeNull()
+  })
+
+  it('falls back to the bare file name when the pin carries no path', async () => {
+    mockApi.defaultAgent.mockResolvedValue({ default_agent: 'default', default_template: 'atlas', overridden: true })
+    renderTab()
+    const note = await screen.findByTestId('default-template-overridden')
+    expect(within(note).getByTestId('default-template-overridden-file')).toHaveTextContent(/^File: config\.local\.json$/)
+  })
+
+  it('names the pinning file when a pick is refused as overridden', async () => {
+    // The read said "not pinned" (stale), the write finds the pin: the refusal
+    // carries the path the server reported.
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'pinned', { code: 'default_template_overlaid', override_path: '/home/u/.kiro/crew/config.local.json' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    const err = await screen.findByTestId('default-template-error')
+    expect(err).toHaveTextContent(/^Couldn’t switch to reviewer: a local config file sets this\. New sessions still use kirocrew\. File: \/home\/u\/\.kiro\/crew\/config\.local\.json$/)
+  })
+
+  it('names the pick in a refusal it has no specific words for', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(500, 'boom', { code: 'config_write_failed' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    fireEvent.click(trigger())
+    const list = await waitFor(() => screen.getAllByRole('listbox').find(l => l.getAttribute('aria-label') !== 'Custom agents')!)
+    fireEvent.click(within(list).getByRole('option', { name: 'reviewer' }))
+    const err = await screen.findByTestId('default-template-error')
+    expect(err).toHaveTextContent(/^Couldn’t switch to reviewer\. New sessions still use kirocrew\.$/)
+  })
+
+  it.each([
+    ['default_template_not_installed', 400],
+    ['stale_binding', 409],
+  ])('names a deleted pick and what still runs (%s)', async (code, status) => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(status, 'gone', { code }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    await pick('reviewer')
+    const err = await screen.findByTestId('default-template-error')
+    expect(err).toHaveTextContent(/^Couldn’t switch to reviewer: it was deleted\. New sessions still use kirocrew\.$/)
+  })
+
+  it('names an app-installed pick and what still runs', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code: 'app_registered_template' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    await pick('reviewer')
+    const err = await screen.findByTestId('default-template-error')
+    expect(err).toHaveTextContent(/^Couldn’t switch to reviewer: it was installed by an app\. New sessions still use kirocrew\.$/)
+  })
+
+  it('names a scheduled-job-only pick and what still runs', async () => {
+    mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code: 'default_template_background_only' }))
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    await pick('reviewer')
+    const err = await screen.findByTestId('default-template-error')
+    expect(err).toHaveTextContent(/^Couldn’t switch to reviewer: it only runs scheduled jobs\. New sessions still use kirocrew\.$/)
+  })
+
+  it.each(['lineage_unverifiable', 'config_unreadable', 'invalid_agent_type', 'invalid_agent_kind'])(
+    'gives the generic sentence for a refusal with no specific words (%s)', async code => {
+      mockApi.setDefaultAgent.mockRejectedValue(new StubApiError(409, 'refused', { code }))
+      renderTab()
+      await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+      await pick('reviewer')
+      const err = await screen.findByTestId('default-template-error')
+      expect(err).toHaveTextContent(/^Couldn’t switch to reviewer\. New sessions still use kirocrew\.$/)
+    },
+  )
+
+  it('explains hidden picker rows only when the roster has some', async () => {
+    renderTab()
+    await waitFor(() => expect(trigger()).toHaveTextContent('kirocrew'))
+    // The fixture roster carries a private copy, so the note shows.
+    expect(screen.getByText('Not offered here: mates’ own copies, scheduled-job-only agents, agents an app installed. Agents under “From packages” can be picked.')).toBeInTheDocument()
   })
 })

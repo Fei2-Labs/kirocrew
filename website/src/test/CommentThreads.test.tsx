@@ -240,21 +240,6 @@ describe('writing', () => {
     expect(await screen.findByText(/gh api said no/)).toBeTruthy()
   })
 
-  it('explains what to configure when resolve is refused for a missing owner', async () => {
-    // A standalone local install: reads pass, so the Resolve button renders live,
-    // and the backend refuses the mutation with the coded 403. The refusal must
-    // name the remedy and link the settings pane, not dead-end on "forbidden".
-    mockApi.resolvePullRequestThread.mockRejectedValue(Object.assign(
-      new Error('forbidden'),
-      { body: JSON.stringify({ error: 'forbidden', code: 'owner_not_configured' }) },
-    ))
-    mount(source([comment({ threadId: 'T1' })]))
-    await userEvent.click(screen.getByRole('button', { name: /Resolve/ }))
-    expect(await screen.findByText(/Set .Owner Slack member ID. in Settings/)).toBeTruthy()
-    const link = screen.getByRole('link', { name: /Slack settings/i })
-    expect(link.getAttribute('href')).toBe('/settings/channels/slack')
-  })
-
   it('keeps the draft when the post fails, so nothing typed is lost', async () => {
     mockApi.replyToPullRequestThread.mockRejectedValue(new Error('gh api said no'))
     mount(source([comment({ threadId: 'T1' })]))
@@ -275,9 +260,26 @@ describe('writing', () => {
     await waitFor(() => expect(screen.queryByRole('textbox', { name: /Reply/ })).toBeNull())
   })
 
-  it('says replying is GitHub-only on a GitLab merge request', () => {
-    mount(source([comment({ threadId: '' })], { provider: 'gitlab' }))
-    expect(screen.getByText(/GitHub-only for now/)).toBeTruthy()
-    expect(screen.queryByRole('button', { name: /^Reply$/ })).toBeNull()
+  it('offers reply on a GitLab merge request thread', () => {
+    mount(source([comment({ threadId: 'a1b2c3' })], { provider: 'gitlab' }))
+    expect(screen.queryByText(/GitHub-only for now/)).toBeNull()
+    expect(screen.getByRole('button', { name: /^Reply$/ })).toBeTruthy()
+  })
+
+  it('offers reply but no resolve on a GitLab plain comment', () => {
+    // GitLab gives every comment a discussion id, but only diff and review
+    // threads are resolvable; a plain comment is published resolvable: false.
+    mount(source(
+      [comment({ kind: 'comment', threadId: 'd4e5f6', path: '', resolvable: false })],
+      { provider: 'gitlab' },
+    ))
+    expect(screen.getByRole('button', { name: /^Reply$/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Resolve/ })).toBeNull()
+  })
+
+  it('labels the top-level comment box in merge-request words on GitLab', () => {
+    mount(source([comment({ threadId: 'a1b2c3' })], { provider: 'gitlab' }))
+    expect(screen.getByRole('button', { name: /Comment on this merge request/ })).toBeTruthy()
+    expect(screen.queryByText(/pull request/i)).toBeNull()
   })
 })

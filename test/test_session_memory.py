@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from kiro_crew import resource_status as sm_rs
 from kiro_crew.dashboard import session_memory as sm
 
 
@@ -167,7 +168,7 @@ def stub_proc(monkeypatch: pytest.MonkeyPatch) -> None:
         sm, "_get_rss_tree_mb", lambda pid, **kw: {7: 3238.0, 8: 843.0}.get(pid, 0.0)
     )
     monkeypatch.setattr(sm, "_iter_descendant_pids", lambda pid, **kw: [pid, pid + 100, pid + 200])
-    monkeypatch.setattr(sm, "_read_cmdline", lambda pid: "python -m kiro_crew.mcp_gateway.stub")
+    monkeypatch.setattr(sm, "process_matches", lambda pid, needles: True)
     monkeypatch.setattr(sm, "_subtree_cpu_jiffies", lambda pid, **kw: 0)
     # The poll builds the host's parent map once; keep that off real /proc too.
     monkeypatch.setattr(sm, "proc_child_map", lambda: {})
@@ -232,6 +233,60 @@ async def test_co_tenants_split_the_shared_runtime_measurement(stub_proc: None) 
     # The TOTAL is a measurement, so it stays whole: the runtime really does
     # occupy 3238 MB regardless of how many sessions claim it.
     assert out["totals"]["rss_mb"] == 3238.0  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_co_tenant_rows_carry_the_sharer_count(stub_proc: None) -> None:
+    """Every row on a shared runtime says how many sessions are on it.
+
+    ``owns_runtime`` cannot answer this. It is false only on the JOINERS, so a
+    consumer reading it as "is this runtime shared?" misses the founder, and a
+    consumer aggregating per-runtime figures has no key to de-duplicate on
+    beyond the pid. The count is published because the sampler already computes
+    it to divide rss/cpu -- withholding it made each consumer re-derive it, or
+    guess.
+    """
+    sessions = _FakeSessions(
+        [
+            _row("dashboard:a", 7),
+            _row("dashboard:b", 7, owns=False),
+            _row("dashboard:solo", 9),
+        ]
+    )
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    assert rows["dashboard:a"]["sharers"] == 2  # the FOUNDER is on a shared runtime too
+    assert rows["dashboard:b"]["sharers"] == 2
+    assert rows["dashboard:solo"]["sharers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_procs_and_mcp_stay_the_runtimes_own_totals(stub_proc: None) -> None:
+    """``procs`` and ``mcp`` are counts of real objects on the runtime, so they
+    are reported whole on every co-tenant row -- unlike rss/cpu, which are
+    divided.
+
+    Dividing a count of 3 processes between 3 sessions yields 1 each, and
+    between 4 yields 0.75 of a process, which describes nothing. The row states
+    the runtime's true figure and carries ``sharers`` so an aggregate can add it
+    once per runtime instead of once per session.
+    """
+    sessions = _FakeSessions(
+        [
+            _row("dashboard:a", 7),
+            _row("dashboard:b", 7, owns=False),
+        ]
+    )
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    rows = {r["key"]: r for r in out["sessions"]}  # type: ignore[union-attr]
+    for key in ("dashboard:a", "dashboard:b"):
+        assert rows[key]["procs"] == 3, f"{key} procs divided"
+        assert rows[key]["mcp"] == 3, f"{key} mcp divided"
+        # The measurements ARE divided, which is what makes the pair asymmetric
+        # and worth pinning together.
+        assert rows[key]["rss_mb"] == pytest.approx(3238.0 / 2)
 
 
 @pytest.mark.asyncio
@@ -456,7 +511,7 @@ def test_runtime_pids_skips_dead_manager_runtimes() -> None:
     assert "Background runtime" not in keys
 
 
-# ── credits / turns (slot_spend — unified aggregator in usage.py) ──────────
+# ── credits / turns (slot_spend — unified aggregator in usage_spend.py) ────
 
 
 def test_slot_spend_sums_credits_and_counts_turns(
@@ -896,10 +951,10 @@ async def test_with_the_crew_log_off_no_scan_runs_and_no_row_has_a_parent(
     stub_proc: None, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
     # The store is optional and this module is on the boot path: with the flag
-    # unset the scanner is never built, so the storage package is never loaded
-    # on its account (the launch-level pin is test_crew_log_emit's).
+    # off the scanner is never built, so the storage package is never loaded
+    # on its account (the launch-level pin is test_crew_log_emit_redaction_and_flag's).
     _crew_log_with_parent(monkeypatch, tmp_path, creator_running=True)
-    monkeypatch.delenv("KIROCREW_CREW_LOG", raising=False)
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "0")
     sampler = sm.SessionMemorySampler()
     sessions = _FakeSessions([_row("dashboard:p", 7), _row("dashboard:c", 8)])
     out = await sampler.sample(sessions, None)
@@ -907,3 +962,203 @@ async def test_with_the_crew_log_off_no_scan_runs_and_no_row_has_a_parent(
     assert out["totals"]["lineage_over_cap"] is False  # type: ignore[index]
     assert out["totals"]["lineage_cap"] == 0  # type: ignore[index]
     assert sampler._tree is None
+
+
+# ── slice ownership SLI on the payload ──
+
+
+@pytest.mark.asyncio
+async def test_the_payload_publishes_the_slice_ownership_sli(stub_proc: None) -> None:
+    """The SLI rides this poll rather than a second one, so it must be on the
+    payload the page already reads."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert set(sli) == {
+        "unowned_alive",
+        "owned_dead",
+        "owned_alive",
+        "readable",
+        # `confirmed` is the alarm; `healthy` is its negation, kept so a reader
+        # of the older shape is not broken by the addition.
+        "confirmed",
+        "healthy",
+    }
+
+
+@pytest.mark.asyncio
+async def test_every_claim_source_reaches_the_ownership_probe(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """A claim source missing here reads as a LEAKED process.
+
+    The union must carry the session rows plus the warm pool plus in-flight
+    spawns plus companion runtimes -- the same four the sweep protects with.
+    Dropping one turns a well-owned runtime into a false alarm, which is how an
+    SLI whose whole point is "non-zero means investigate" becomes noise.
+    """
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    sessions._pool_pids = lambda: {101}  # type: ignore[attr-defined]
+    sessions._in_flight_pids = lambda: {102}  # type: ignore[attr-defined]
+    sessions._companion_runtime_pids = lambda: {103}  # type: ignore[attr-defined]
+    seen: dict[str, object] = {}
+
+    def _probe(claimed, **_kw):
+        seen["claimed"] = set(claimed)
+        return sm_rs.SliceOwnership(
+            unowned_alive=0, owned_dead=0, owned_alive=len(set(claimed)), readable=True
+        )
+
+    monkeypatch.setattr(sm_rs, "slice_ownership", _probe)
+    await sm.SessionMemorySampler().sample(sessions, None)
+
+    assert seen["claimed"] == {7, 101, 102, 103}
+
+
+@pytest.mark.asyncio
+async def test_a_failing_claim_source_does_not_fail_the_poll(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """An unreadable claim source is skipped, not fatal: the whole System page
+    must not go dark because one pid accessor raised."""
+
+    def _boom() -> set[int]:
+        raise RuntimeError("pool lock held")
+
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    sessions._pool_pids = _boom  # type: ignore[attr-defined]
+    seen: dict[str, object] = {}
+
+    def _probe(claimed, **_kw):
+        seen["claimed"] = set(claimed)
+        return sm_rs.SliceOwnership(unowned_alive=0, owned_dead=0, owned_alive=0, readable=True)
+
+    monkeypatch.setattr(sm_rs, "slice_ownership", _probe)
+    out = await sm.SessionMemorySampler().sample(sessions, None)
+
+    assert seen["claimed"] == {7}  # the row's own pid survived the failure
+    assert out["totals"]["slice_ownership"]["readable"] is True  # type: ignore[index]
+
+
+def test_the_claim_union_matches_the_sweeps_own_sources() -> None:
+    """The SLI and the periodic sweep must draw claims from the SAME sources.
+
+    A source the sweep protects with and this does not read turns a well-owned
+    runtime into a reported leak -- the exact noise mode that makes an alarm
+    whose contract is "non-zero means investigate" unusable. Read out of
+    ``_active_pids``'s source, so adding a fifth source there without adding it
+    to ``_CLAIM_SOURCES`` fails here rather than in production.
+    """
+    import inspect
+    import re
+
+    from kiro_crew import session_cleanup
+
+    body = inspect.getsource(session_cleanup.SessionCleanup._active_pids)
+    sweep_sources = set(re.findall(r"_owner\.(_\w+)\(\)", body))
+    # ``collect_active_pids`` is the sweep's per-session provider scan; the SLI
+    # covers that ground through ``runtime_pids()`` rows instead, so it is the one
+    # source that is legitimately reached differently.
+    assert "collect_active_pids" in body
+    assert sweep_sources == set(
+        sm._CLAIM_SOURCES
+    ), f"sweep reads {sorted(sweep_sources)}, SLI reads {sorted(sm._CLAIM_SOURCES)}"
+
+
+# ── the ownership SLI's single-sample reading is transient ──
+
+
+@pytest.mark.asyncio
+async def test_a_single_non_zero_ownership_reading_is_not_yet_an_alarm(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """The claim set and the slice are read at different instants, so ordinary
+    churn produces a one-sample fault.
+
+    A session spawning between the two reads is in the slice and not in the
+    claims (reads as leaked); one exiting between them is claimed and not alive
+    (reads as a stale claim). Neither is a fault. An alarm that fires on those
+    trains an operator to ignore the one signal built to mean "investigate", so a
+    single non-zero reading is reported as suspected, not confirmed.
+    """
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    monkeypatch.setattr(
+        sm_rs,
+        "slice_ownership",
+        lambda claimed, **_kw: sm_rs.SliceOwnership(
+            unowned_alive=1, owned_dead=0, owned_alive=1, readable=True
+        ),
+    )
+    sampler = sm.SessionMemorySampler()
+    out = await sampler.sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert sli["unowned_alive"] == 1  # the count is reported as measured
+    assert sli["confirmed"] is False  # but not yet an alarm
+    assert sli["healthy"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_fault_that_persists_across_samples_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """A leak does not heal, so it survives the next poll. Churn does not."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    monkeypatch.setattr(
+        sm_rs,
+        "slice_ownership",
+        lambda claimed, **_kw: sm_rs.SliceOwnership(
+            unowned_alive=1, owned_dead=0, owned_alive=1, readable=True
+        ),
+    )
+    sampler = sm.SessionMemorySampler()
+    await sampler.sample(sessions, None)
+    out = await sampler.sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert sli["confirmed"] is True
+    assert sli["healthy"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_clean_reading_clears_the_suspicion(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """Churn's one-sample fault must not accumulate across unrelated polls into a
+    confirmation it never earned."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    readings = iter(
+        [
+            sm_rs.SliceOwnership(unowned_alive=1, owned_dead=0, owned_alive=1, readable=True),
+            sm_rs.SliceOwnership(unowned_alive=0, owned_dead=0, owned_alive=1, readable=True),
+            sm_rs.SliceOwnership(unowned_alive=1, owned_dead=0, owned_alive=1, readable=True),
+        ]
+    )
+    monkeypatch.setattr(sm_rs, "slice_ownership", lambda claimed, **_kw: next(readings))
+    sampler = sm.SessionMemorySampler()
+    await sampler.sample(sessions, None)
+    await sampler.sample(sessions, None)
+    out = await sampler.sample(sessions, None)
+
+    assert out["totals"]["slice_ownership"]["confirmed"] is False  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_slice_is_never_confirmed_healthy_or_faulted(
+    monkeypatch: pytest.MonkeyPatch, stub_proc: None
+) -> None:
+    """A slice that cannot be enumerated has not been shown clean OR faulted, so
+    it must not accumulate a confirmation from repeated unreadable polls."""
+    sessions = _FakeSessions([_row("dashboard:a", 7)])
+    monkeypatch.setattr(
+        sm_rs, "slice_ownership", lambda claimed, **_kw: sm_rs.UNREADABLE_SLICE_OWNERSHIP
+    )
+    sampler = sm.SessionMemorySampler()
+    await sampler.sample(sessions, None)
+    out = await sampler.sample(sessions, None)
+
+    sli = out["totals"]["slice_ownership"]  # type: ignore[index]
+    assert sli["readable"] is False
+    assert sli["confirmed"] is False
+    assert sli["healthy"] is False

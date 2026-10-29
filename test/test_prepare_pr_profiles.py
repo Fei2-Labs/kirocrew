@@ -1,4 +1,4 @@
-"""Tests for the prepare-pr project-profile mechanism.
+"""Tests for the kirocrew-prepare-pr project-profile mechanism.
 
 Covers:
   * resolve_profile.py resolution order (config / kirocrew markers /
@@ -23,7 +23,7 @@ import pytest
 from skill_script_helpers import load_skill_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr"
+SKILL_DIR = REPO_ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "kirocrew-prepare-pr"
 SCRIPTS_DIR = SKILL_DIR / "scripts"
 PROFILES_DIR = SKILL_DIR / "profiles"
 
@@ -162,7 +162,14 @@ def test_cli_without_base_ref_pins_to_the_remote_default_branch(tmp_path, monkey
     _git(upstream, "add", ".prepare-pr.toml")
     _git(upstream, "commit", "-qm", "base")
     clone = tmp_path / "clone"
-    _git(tmp_path, "clone", "-q", str(upstream), str(clone))
+    # ``--no-local`` forces the ordinary pack-transfer path instead of git's
+    # same-filesystem clone optimization, which hardlinks/copies pack files into
+    # ``clone/.git/objects/pack/`` via a ``.tmp-*-pack`` staging file. On a
+    # shared CI runner's ``/tmp`` that cross-directory copy raced a basetemp
+    # reaper and failed ``git clone`` with exit 128 ("failed to copy file to
+    # '.../.tmp-*-pack': No such file or directory"), flaking this test. The
+    # transfer path builds the object store in place and does not do that copy.
+    _git(tmp_path, "clone", "-q", "--no-local", str(upstream), str(clone))
     (clone / ".prepare-pr.toml").write_text("[project]\nsingle_commit = false\n")
 
     # The script as a process, from the clone it is handed rather than from
@@ -228,14 +235,14 @@ def test_kirocrew_markers_load_bundled_profile(tmp_path):
     assert all("playwright install" not in gate for gate in prof["gates"])
     assert prof["readiness"]["status_context"] == "PR Readiness"
     models = {r["name"]: r["model"] for r in prof["reviewers"]}
-    assert models["gpt"] == "gpt-5.6-sol"
-    assert models["opus"] == "claude-opus-5"
+    assert models["gpt"] == "gpt-6.1-sol"
+    assert models["opus"] == "claude-opus-5.5"
 
 
 def test_opus_profile_model_matches_the_ci_workflow():
     """The local reviewer must mirror the model CI actually runs.
 
-    prepare-pr's whole value is that local-green predicts server-green. When the
+    kirocrew-prepare-pr's whole value is that local-green predicts server-green. When the
     profile pinned claude-opus-5 while claude-review.yml had moved to
     opus-4-8, the local gate was reviewing with a different model than the gate
     it claims to mirror. This test fails the next time they diverge.
@@ -269,13 +276,13 @@ def test_opus_profile_model_matches_the_ci_workflow():
         return re.sub(r"-(\d)-(\d)$", r"-\1.\2", tail)
 
     assert _normalize(ci_model) == _normalize(local_model), (
-        f"prepare-pr opus reviewer ({local_model}) no longer mirrors "
+        f"kirocrew-prepare-pr opus reviewer ({local_model}) no longer mirrors "
         f"claude-review.yml ({ci_model})"
     )
 
 
 def test_charter_budgets_match_the_ci_workflows():
-    """The budget numbers restated in SKILL.md must match the workflows.
+    """The budget numbers restated in the fallback charters must match the workflows.
 
     The charter hand-copies CI's budgets. That copy is exactly what drifted
     before -- the skill still claimed ≤2 BLOCKING long after CI moved to 5 --
@@ -284,7 +291,7 @@ def test_charter_budgets_match_the_ci_workflows():
     numeric cap encouraged staging discoveries across review rounds), so its
     charter must NOT restate a numeric cap.
     """
-    skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    skill = (SKILL_DIR / "references" / "fallback-charters.md").read_text(encoding="utf-8")
 
     # The Opus lane's budgets live with the contract that applies them -- the
     # validation prompt -- not in the workflow that merely invokes it.
@@ -294,23 +301,18 @@ def test_charter_budgets_match_the_ci_workflows():
     assert opus_match, f"no BLOCKING budget in {opus_contract.name}"
     opus_blocking = opus_match.group(1)
 
-    advisory_match = re.search(r"At most (\d+) advisory FINDING", claude)
-    assert advisory_match, f"no advisory-FINDING budget in {opus_contract.name}"
-    opus_advisory = advisory_match.group(1)
-
-    assert (
-        f"≤{opus_blocking} BLOCKING, ≤{opus_advisory} advisory FINDING" in skill
-    ), (
-        "the opus charter's budget no longer matches claude-review.yml "
-        f"({opus_blocking} BLOCKING / {opus_advisory} advisory)"
+    assert f"≤{opus_blocking} BLOCKING" in skill, (
+        "the opus charter's budget no longer matches the validation prompt "
+        f"({opus_blocking} BLOCKING)"
     )
+    assert "advisory FINDING" not in claude, "the soft tier is gone from the opus prompt"
 
     # The GPT lane's budget lives with the contract that applies it -- the
     # shared review-core prompt -- not in the workflow that splices it.
     gpt_contract = (
         REPO_ROOT / ".github" / "review-prompts" / "gpt-review-core.md"
     ).read_text(encoding="utf-8")
-    assert "BUDGET: report ALL findings that genuinely meet WHAT BLOCKS" in gpt_contract, (
+    assert "BUDGET: report ALL defects that genuinely pass the BLOCK BAR" in gpt_contract, (
         "gpt-review-core.md's BUDGET is expected to be report-ALL; if a numeric "
         "cap returned, restore the numeric charter assertions here"
     )
@@ -422,13 +424,13 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
     # Only repeatable verdict-producing gates satisfy the CI floor. A command
     # filed under setup runs once per worktree, so counting it here would let a
-    # future blocking CI check disappear from later prepare-pr passes.
+    # future blocking CI check disappear from later kirocrew-prepare-pr passes.
     floor = "\n".join(data["gates"])
 
     # CI-only capability gate: "Require real FAISS edit invalidation regressions"
     # installs an optional native accelerator in an isolated Linux venv and
     # requires all four versioned cases to pass. The local scoped-test gate
-    # retains those tests with their declared capability skips; prepare-pr does
+    # retains those tests with their declared capability skips; kirocrew-prepare-pr does
     # not provision optional native runtimes, just as it does not grant Linux
     # namespaces or supply the Darwin kernel. Its absence is not FAISS evidence.
     exempt_scripts = {
@@ -444,6 +446,17 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # Resolves the diff base inside Actions (it lives under .github/scripts).
         # The floor resolves the same base with `git merge-base` inline.
         "scripts/resolve-i18n-base.sh",
+        # Polls the GitHub API for the Fast Gate run's verdict on the commit
+        # under test (it lives under .github/scripts). It produces no verdict of
+        # its own -- it reads another workflow's result over the network -- so it
+        # is a CI orchestration barrier, not a pre-push static gate; the floor
+        # cannot poll Actions for a run that only exists once CI starts.
+        "scripts/await-fast-gate.sh",
+        # Runs await-fast-gate.sh as a probe on a push to main and, on its proof
+        # that the commit's Fast Gate run was evicted, cancels that CI run (it
+        # lives under .github/scripts). Network orchestration with no verdict of
+        # its own, for the same reason as the barrier it probes.
+        "scripts/cancel-superseded-run.sh",
         # Installs the built Linux packages in Ubuntu and Amazon Linux containers.
         # It needs docker AND a completed electron-builder run, so it cannot be a
         # pre-push gate: the floor would then demand a ~10-minute desktop build
@@ -454,7 +467,7 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         "scripts/stamp-distribution.sh",
         # Optional synthetic Qwen measurement, not a blocking score gate. The
         # bounded CI step records unavailable evidence on failure; local
-        # prepare-pr must not download a model or claim a calibration score.
+        # kirocrew-prepare-pr must not download a model or claim a calibration score.
         "scripts/ci-member-memory-benchmark.py",
         # Reports Python advisories against a baseline and cannot fail a build on
         # what it finds, so by this floor's own rule -- only repeatable
@@ -463,6 +476,17 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # pre-push floor would make every contributor's push depend on that
         # service being up in order to print a number nobody is blocked on.
         "scripts/check_python_audit.py",
+        # Reports route coverage from the dumps the Linux-only `integration` job
+        # writes while booting real gateways in-process; it has no verdict
+        # without that run, and kirocrew-prepare-pr does not boot gateways in its
+        # repeated static floor -- the layer's proof stays in CI, like E2E.
+        "scripts/check_integration_route_coverage.py",
+        # Lives under .github/scripts. It runs the same `gen:ui -- --check` the
+        # floor already runs, and only adds a second run on the PR's base
+        # (`base.sha` from the Actions event) to tell a PR that caused a stale
+        # index from one that inherited it. The floor has no event and no base
+        # to compare, so the local verdict is the plain check it already holds.
+        "scripts/ui_index_freshness.py",
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))
@@ -486,7 +510,7 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
 
     missing = sorted(s for s in invoked - exempt_scripts if s not in floor)
     assert not missing, (
-        "ci.yml/fast-gate.yml run these scripts but the prepare-pr floor does not: "
+        "ci.yml/fast-gate.yml run these scripts but the kirocrew-prepare-pr floor does not: "
         f"{missing}. Add them to profiles/kirocrew.json gates[] in their "
         "CI-exact form, or exempt them here with a reason."
     )
@@ -720,7 +744,7 @@ def test_named_project_is_the_root_tsconfigs_only_reference():
 
     `tsc -b` on the solution root followed every reference. `-p` does not, so if
     a second project is ever added to `website/tsconfig.json` every caller here
-    (package.json build/typecheck, ci.yml, the prepare-pr floor) would skip it
+    (package.json build/typecheck, ci.yml, the kirocrew-prepare-pr floor) would skip it
     without any of them failing. This test turns that silent skip into a
     decision: extend the callers, or go back to a spelling that follows
     references and re-examine the cache.

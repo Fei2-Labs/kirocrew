@@ -61,16 +61,16 @@ def test_steering_is_still_the_backend_gated_half(doc_text: str) -> None:
     that module, so a token match anywhere would keep this green with the steering
     gate's own condition dropped.
     """
-    source = (Path(__file__).parent.parent / "src" / "kiro_crew" / "context.py").read_text(
-        encoding="utf-8"
-    )
+    source = (
+        Path(__file__).parent.parent / "src" / "kiro_crew" / "context_assembly" / "session_start.py"
+    ).read_text(encoding="utf-8")
     gate = (
-        "            not essentials\n"
-        "            and not is_custom\n"
-        "            and is_cc\n"
-        "            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)\n"
-        "        ):\n"
-        "            steering_ctx = _load_steering_resources()\n"
+        "        not essentials\n"
+        "        and not is_custom\n"
+        "        and is_cc\n"
+        "        and ctx._group_included(context_groups, ctx.CONTEXT_GROUP_PROJECT)\n"
+        "    ):\n"
+        "        steering_ctx = ctx._load_steering_resources()\n"
     )
     assert gate in source, (
         "the steering block's gate no longer reads is_cc together with the default-agent "
@@ -164,3 +164,135 @@ def test_mirror_note_names_the_real_return_expression(doc_text: str) -> None:
     )
     assert "return (bool(globs) or not is_custom), globs" in source
     assert "`bool(globs) or not is_custom`" in doc_text
+
+
+def test_inherited_trees_are_promised_for_kiro_cli_only(doc_text: str) -> None:
+    """The inherited-trees cell sits in a column that names kiro-cli and no other harness.
+
+    ``_skills_injection_plan`` lends the trees only when ``provider_type`` is
+    ``PROVIDER_ACP``, and a KAS session's label is ``kas``. The behaviour is pinned by
+    ``test_inherited_skill_scope.py``; this pins that the table's column for the
+    inherited row does not also promise it to KAS.
+    """
+    from kiro_crew.acp.types import PROVIDER_LABEL_KAS
+    from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP
+
+    assert PROVIDER_LABEL_KAS != PROVIDER_ACP
+    table = doc_text.split("### Resources", 1)[1].split("## Per-surface summary", 1)[0]
+    lines = table.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("| custom | none |"))
+    start = at
+    while start > 0 and lines[start - 1].startswith("|"):
+        start -= 1
+    header = [cell.strip() for cell in lines[start].strip("|").split("|")]
+    inherited = lines[at]
+    cells = [cell.strip() for cell in inherited.strip("|").split("|")]
+    column = header[cells.index("inherited skill trees, injected by Crew")]
+    assert column == "kiro-cli", (
+        f"the inherited-trees cell sits under {column!r}; only a kiro-cli session gets "
+        "the trees, so the column must not name KAS or any other harness"
+    )
+    kas_column = next(name for name in header if "KAS" in name)
+    assert cells[header.index(kas_column)] == "nothing"
+
+
+def test_app_skill_mapping_names_the_namespaced_path(
+    doc_text, tmp_path, monkeypatch, opened
+) -> None:
+    """The page's app-skill rule: one namespaced entry per skill, never the flat link.
+
+    Driven through ``_register_skills`` for every case the page lists: a plain skill
+    gets both links, while a skill named after its app, the reserved ``auto`` and a
+    name a real directory already holds get the namespaced link only. The ``~/`` half
+    is driven through ``expand_skill_uri``, which must expand against the home and
+    ignore ``KIROCREW_HOME``. The mapping half is driven through the loader's
+    ``_scoped_entries``, the selection a session's skill block is built from.
+    """
+    import json
+
+    from kiro_crew import platform_compat
+    from kiro_crew.agent_discovery import expand_skill_uri
+    from kiro_crew.apps import execution as execution_mod
+    from kiro_crew.apps.bridges import _register_skills
+    from kiro_crew.apps.manager import APP_MANIFEST_FILENAME, install_app
+    from kiro_crew.apps.manifest import AppManifest
+    from kiro_crew.skill_runtime import catalog as catalog_mod
+    from kiro_crew.skills import SkillsLoader
+
+    home = tmp_path / "kirocrew-home"
+    home.mkdir()
+    monkeypatch.setenv("KIROCREW_HOME", str(home))
+    monkeypatch.setattr(execution_mod, "third_party_execution_allowed", lambda: True)
+    skills_root = home / "skills"
+    (skills_root / "taken").mkdir(parents=True)
+    (skills_root / "taken" / "keep.txt").write_text("mine", encoding="utf-8")
+
+    src = tmp_path / "source" / "design-critique"
+    names = ["design-critique", "auto", "taken", "plain", "a-first"]
+    for name in names:
+        (src / "skills" / name).mkdir(parents=True)
+        (src / "skills" / name / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\n---\n# {name}\n", encoding="utf-8"
+        )
+    manifest = {
+        "name": "design-critique",
+        "version": "1.0.0",
+        "displayName": "Design Critique",
+        "description": "d",
+        "author": "t",
+        "skills": [f"skills/{n}" for n in names],
+    }
+    (src / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest), encoding="utf-8")
+    install_app(src)
+    app_root = home / "apps" / "design-critique"
+    registered = _register_skills(
+        "design-critique", AppManifest.from_json_file(app_root / APP_MANIFEST_FILENAME), app_root
+    )
+
+    assert sorted(registered) == sorted(f"design-critique/{n}" for n in names)
+    for name in names:
+        assert (skills_root / "design-critique" / name / "SKILL.md").is_file(), name
+    assert platform_compat.is_link_or_junction(skills_root / "plain")
+    assert platform_compat.is_link_or_junction(skills_root / "a-first")
+    assert not (skills_root / "auto").exists()
+    assert not platform_compat.is_link_or_junction(skills_root / "taken")
+    assert (skills_root / "taken" / "keep.txt").is_file()
+    assert not platform_compat.is_link_or_junction(skills_root / "design-critique")
+    assert not (
+        skills_root / "design-critique" / "SKILL.md"
+    ).exists(), "a flat skills/<skill>/SKILL.md exists for a skill named after its app"
+
+    uri = "skill://~/.kiro/crew/skills/design-critique/plain/SKILL.md"
+    assert expand_skill_uri(uri, tmp_path / "a.json") == str(
+        Path.home() / ".kiro/crew/skills/design-critique/plain/SKILL.md"
+    )
+
+    # Per-skill entries select every skill. The app-wide wildcard drops ``a-first``,
+    # whose flat link sorts before the app's directory and is the path the catalog
+    # keeps. The second assertion pins that wrong answer, which the page warns about.
+    monkeypatch.setattr(catalog_mod, "_disabled_app_names", lambda: frozenset())
+    loader = opened(SkillsLoader(skills_path=skills_root, install_builtins=False))
+    walked = loader._request_catalog_refresh("")
+    assert walked is not None and walked.wait(30)
+    per_skill = [str(skills_root / "design-critique" / n / "SKILL.md") for n in names]
+    wildcard = [str(skills_root / "design-critique" / "*" / "SKILL.md")]
+
+    def selected(only: list[str]) -> list[str]:
+        return sorted(Path(e[1]).parent.name for e in loader._scoped_entries(None, only))
+
+    assert selected(per_skill) == sorted(names)
+    assert selected(wildcard) == sorted(set(names) - {"a-first"})
+
+    paragraph = doc_text.split("To map an installed app's skills", 1)[1]
+    paragraph = paragraph.split("`file://<glob>`", 1)[0]
+    for claim in (
+        "`skill://~/.kiro/crew/skills/<app>/<skill>/SKILL.md`",
+        "Do not map an app with the wildcard\n`<app>/*/SKILL.md` yet",
+        "left out with no error",
+        "home, not `KIROCREW_HOME`",
+        "same name as its app",
+        "reserved\n(`auto`)",
+        "real directory of that name already exists",
+        "Never map an app skill by its flat path.",
+    ):
+        assert claim in paragraph, f"§Resources app-skill rule lost {claim!r}"

@@ -115,7 +115,22 @@ def test_manager_without_a_coordinator_leaves_the_handle_empty(clean_sources) ->
 def test_adaptive_controller_is_not_started_during_subagent_init():
     import inspect
 
-    source = inspect.getsource(GatewayOrchestrator._init_subagents)
+    from kiro_crew.slack.gateway import _compose_subagent_completion
+
+    # ``_init_subagents`` and the completion consumer's phases it calls, which the
+    # facade composes from its sub-agent owners.
+    source = "\n".join(
+        inspect.getsource(fn)
+        for fn in (
+            GatewayOrchestrator._init_subagents,
+            _compose_subagent_completion,
+            GatewayOrchestrator._subagent_wave_digest,
+            GatewayOrchestrator._route_subagent_to_tab,
+            GatewayOrchestrator._inject_subagent_into_channel_parent,
+            GatewayOrchestrator._finish_subagent_cron_or_notify,
+            GatewayOrchestrator._inject_with_retry,
+        )
+    )
     assert "_start_adaptive_controller" not in source
 
 
@@ -219,10 +234,17 @@ async def test_run_starts_adaptive_only_after_dashboard_and_taskq_ready(
 
     orch = GatewayOrchestrator.__new__(GatewayOrchestrator)
     orch._background_tasks = set()
+    # The boot work-dir sweep reads this flag before the adaptive controller
+    # starts; True skips it, as the offline E2E gate does.
+    orch._test_mode = True
     orch._no_dashboard = no_dashboard
     orch._json_ready = True
     orch._owner_id = ""
     orch._dashboard_port = 0
+    # ``run`` reads the dashboard state before the memory-backed writers start
+    # (the crewmate-prune barrier); a bare orchestrator has none, as the
+    # ``__init__`` this test skips would have set.
+    orch.dashboard_state = None
     order = []
 
     async def bind_dashboard():

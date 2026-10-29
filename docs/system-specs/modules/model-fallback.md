@@ -3,13 +3,18 @@
 `agent.fallback_model` controls an optional retry after an active model exhausts
 its transient-error budget before activity begins. The implementation is
 Kiro Crew-side: `llm_helpers.advance_fallback_candidate` changes the model through
-the substitute `set_model` seam, and `test/test_llm_helpers.py` pins that a
+the substitute `set_model` seam, and `test/test_llm_helpers_fallback_chain.py` pins that a
 successful swap is observable before it is recorded.
+
+On the ACP provider that seam is `AcpProvider.set_model`, so every fallback swap
+and every primary restore re-applies the slot's reasoning effort to the newly
+selected model (`reapply_live_effort`); an effort re-apply that fails is logged as a
+warning and does not fail the model change.
 
 ## Configuration
 
 `AgentConfig.fallback_model` is normalized by
-`config/sections.py:coerce_fallback_model`. `llm_helpers.configured_fallback_chain`
+`config/sections_agent.py:coerce_fallback_model`. `llm_helpers.configured_fallback_chain`
 is the shared derivation used by the fallback callers:
 
 - The automatic-routing sentinel is the field default; its configured value
@@ -19,13 +24,14 @@ is the shared derivation used by the fallback callers:
 - An empty value produces an empty chain, so the fallback branch remains inert
   and the existing terminal error path handles the failure.
 
-`TestFallbackModelLoad` in `test/test_config_loader.py` and
+`TestFallbackModelLoad` in `test/test_config_loader_agent_section.py` and
 `TestCoerceFallbackModel` in `test/test_role_models.py` pin the default,
 normalization, concrete-value ordering, and empty-value opt-out. The dashboard
-PATCH schema in `dashboard/handlers/core.py` applies the model-id grammar and
+PATCH schema in `dashboard/handlers/core_config_schema.py` applies the model-id grammar and
 `_validate_role_model`; that validator allows the automatic and empty values,
 rejects a known unusable concrete value, and permits a concrete value when no
-advertised-model set is available.
+advertised-model set is available, except that on an `acp`-namespace backend it
+refuses a registered model with no kiro id (`model_registry.lacks_acp_id`).
 
 ## Trigger and candidate walk
 
@@ -33,7 +39,7 @@ The fallback path is eligible only after the normal transient retry budget is
 spent on a transient error with no qualifying prior activity. Each surface
 tracks that condition in its own stream loop: `llm_helpers.stream_and_collect`
 requires no result text or tool activity, `dashboard/chat_runner.py` requires
-no emitted or thought activity, and `subagent_manager/run.py::RunEventCoordinator._run_impl`'s nested `_stream_with_transient_retry`
+no emitted or thought activity, and `subagent_manager/run_turn.py::_run_inner_impl`'s nested `_stream_with_transient_retry`
 requires no activity. Post-activity recovery does not enter the model-fallback
 walk.
 
@@ -41,10 +47,12 @@ walk.
 paths. It preserves the original primary from an existing provider marker when
 available, otherwise from the active model. It then skips the primary, the
 currently active model, and candidates absent from a known advertised-model
-set. Membership and both skips are judged through `resolve_pin_spelling`, so a
-persisted chain entry carrying a stale `<namespace>::<bare-id>` qualifier still
-matches a backend that advertises the bare id; an entry absent under both
-spellings stays skipped. An unavailable advertised set does not reject a
+set. Membership and both skips are judged through `resolve_pin_spelling_on` with
+the provider's backend, so on a backend that advertises pair ids a bare chain entry
+folds to the advertised spelling, and without a backend the generic fold applies (a
+persisted entry carrying a stale `<namespace>::<bare-id>` qualifier still matches a
+backend that advertises the bare id); an entry absent under both spellings stays
+skipped. An unavailable advertised set does not reject a
 candidate; this is load-bearing because entitlement cannot be determined
 without that set.
 
@@ -57,12 +65,12 @@ walked/active records all carry the advertised spelling of the candidate
 bookkeeping. `TestSetModelWitness`,
 `TestAdvanceFallbackCandidateAutoPrimary`,
 `TestAdvanceFallbackCandidateNamespacedChain`, and `TestFallbackState` in
-`test/test_llm_helpers.py` cover no-op handling, marker-seeded primary
+`test/test_llm_helpers_fallback_chain.py` cover no-op handling, marker-seeded primary
 selection, advertised-model filtering, spelling folds, and chain progress.
 
 `FallbackState.should_retry_active` owns the per-candidate retry allowance, and
 `fallback_rewound_transient_budget` derives the dashboard counter from the same
-allowance. The pinning tests in `test/test_llm_helpers.py` and
+allowance. The pinning tests in `test/test_llm_helpers_fallback_restore.py` and
 `TestRunChatModelFallback` in `test/test_dashboard_chat.py` prevent the three
 surfaces from granting different candidate budgets.
 
@@ -81,11 +89,13 @@ and each error surface must receive the same safe text.
   The Slack gateway passes `configured_fallback_chain()` for its cron and
   heartbeat work, then `annotate_model_fallback` prefixes a delivered result
   while the provider marker remains active.
-- `dashboard/chat_runner.py` swaps through `_fallback_swap_for_turn` after its
-  pre-activity transient branch, persists a notice, and requeues the same
-  message as a synthetic recovery item. Its fallback condition excludes nested
-  prompts. On exhaustion it renders the slot-local walk in the terminal error.
-- `subagent_manager/run.py::RunEventCoordinator._run_impl`'s nested `_stream_with_transient_retry` follows the zero-activity branch,
+- `dashboard/chat_runner.py` swaps through `_fallback_swap_for_turn`
+  (`dashboard/chat_turn/model_fallback.py`, which owns the dashboard's four swap and restore
+  helpers named below) after its pre-activity transient branch; `_on_acp_transient_exhausted`
+  (`chat_turn/acp_recovery.py`) persists a notice and requeues the same message as a synthetic
+  recovery item. The swap's condition excludes nested prompts. On exhaustion `_on_acp_error_card`
+  (`chat_turn/turn_failures.py`) renders the slot-local walk in the terminal error.
+- `subagent_manager/run_turn.py::_run_inner_impl`'s nested `_stream_with_transient_retry` follows the zero-activity branch,
   uses the shared candidate helper, and applies `annotate_model_fallback` to
   the completed result.
 
@@ -102,7 +112,7 @@ if the session no longer serves the recorded fallback, it clears stale state
 without selecting a model.
 
 The dashboard adapter,
-`chat_runner._probe_fallback_restore_for_slot_locked`, applies the same probe to
+`chat_turn/model_fallback._probe_fallback_restore_for_slot_locked`, applies the same probe to
 slot-held state. It snapshots `slot.model` and `_model_pick_gen` when fallback
 activates. Explicit single-slot and bulk model picks, plus a provider switch,
 increment the generation; a rejected single-slot pick restores its prior
@@ -112,9 +122,10 @@ override an explicit user choice. When automatic provider backfill changes
 activation snapshot before clearing fallback state. This prevents an automatic
 fallback selection from becoming a persistent user pin.
 
-`TestRunChatModelFallback` and `TestSlotProbeWrapsSharedRestoreBody` in
-`test/test_dashboard_chat.py`, together with the restore tests in
-`test/test_llm_helpers.py`, pin the stale-record, explicit-pick, and backfill
+`TestRunChatModelFallback` in `test/test_dashboard_chat.py` and
+`TestSlotProbeWrapsSharedRestoreBody` in `test/test_dashboard_chat_model_pick.py`,
+together with the restore tests in
+`test/test_llm_helpers_fallback_restore.py`, pin the stale-record, explicit-pick, and backfill
 invariants.
 
 ## Refusal fallback (`agent.refusal_fallback_model`)
@@ -127,19 +138,17 @@ families — a different model routinely accepts what another's filter declined
 — so the dashboard retries the declined message once on a configured model.
 
 - `AgentConfig.refusal_fallback_model` is normalized by
-  `config/sections.py:coerce_refusal_fallback_model`: the empty default
+  `config/sections_agent_fields.py:coerce_refusal_fallback_model`: the empty default
   disables the feature (junk input collapses to disabled, never to enabled);
   the automatic sentinel defers to the `recommended_model` the provider's
   refusal envelope names, resolving to disabled when it names none; a concrete
   id is used directly. The dashboard PATCH schema applies the same grammar and
   validator as `agent.fallback_model`.
-- `chat_runner._refusal_fallback_retry` (nested in `_run_chat`) gates the
+- `chat_turn.model_fallback._refusal_fallback_retry` (called with the turn) gates the
   retry: interactive prompts only (no nested depth, and only a turn whose
   ledger actor is `user` — a cron, autonudge, or sub-agent wake keeps the
   terminal refusal, since nobody attends its announced swap), not while a
-  Stop is suppressing requeues, never after the turn dispatched a tool
-  (`_turn_tool_calls > 0` — replaying the whole message would run the side
-  effect twice; streamed text alone stays retryable), never while a USER
+  Stop is suppressing requeues, never while a USER
   follow-up is already queued (`_has_user_queued_followup` — user speech in
   the queue is the user's next
   intent, often a correction of the refused message, and the replay's
@@ -156,7 +165,7 @@ families — a different model routinely accepts what another's filter declined
   the turn (or during the swap await itself) still suppresses the retry —
   the state check alone would miss it, and the enqueue-time stop-generation
   snapshots would bake the moved counter in, blinding the drain purge.
-- `chat_runner._refusal_fallback_swap` performs one explicit hop through the
+- `chat_turn/model_fallback._refusal_fallback_swap` performs one explicit hop through the
   substitute `set_model` seam with the same silent-no-op witness as the chain
   walk, records `(primary, candidate)` on the SLOT (deliberately not
   `TURN_FALLBACK_ATTR`, whose start-of-turn probe would restore the primary
@@ -173,15 +182,22 @@ families — a different model routinely accepts what another's filter declined
   preserves that recorded primary instead of overwriting it with the stale
   fallback the session is stranded on, so the eventual restore returns to the
   user's real model rather than to fallback A. While the record is live,
-  both `slot.model` backfill sites treat the
+  both `slot.model` backfill sites (which write only a slot whose mate
+  pins a model, see model-selection.md) treat the
   session like an active throttle fallback: the provider's resolved model is
   the temporary candidate and must never be persisted into the durable pin,
   and usage rows attribute to the model that actually served the turn.
-- The declined message is requeued verbatim at queue index 0 as a synthetic
-  recovery item, carrying the refused turn's attachment lists in their
-  original typed form (`files` and `dirs` stay distinct meta keys, so a
-  folder attachment retries as a folder). Because the replay is the user's
-  own words, it cannot be
+- The retry is requeued at queue index 0 as a synthetic recovery item, in one
+  of two shapes decided by `_turn_tool_calls`. A turn refused before it
+  dispatched any tool replays the declined message verbatim, carrying its
+  attachment lists in their original typed form (`files` and `dirs` stay
+  distinct meta keys, so a folder attachment retries as a folder); streamed
+  text alone does not change that. A turn refused AFTER dispatching a tool is
+  continued instead: the fallback model, in the same session, receives
+  `_REFUSAL_FALLBACK_RESUME_MSG` as a CONTINUATION payload with no attachments
+  (the original turn already delivered them), because replaying the message
+  would run its side effects twice. Because a verbatim replay is the
+  user's own words, it cannot be
   recognized by the fixed synthetic-recovery texts — and not by text at
   all: the drain redacts credentials and exfiltration URLs after the swap
   records the raw message, so string equality breaks for exactly the
@@ -195,7 +211,45 @@ families — a different model routinely accepts what another's filter declined
   correction, or rebind can land in that window; a tripped check aborts
   the replay with the same cancellation notice the drain purge uses, the
   allowance stays spent, and the model swap is unwound by the next genuine
-  turn's restore probe. A genuine new message drops a stale record (a Stop
+  turn's restore probe. The abort returns before the turn's `try`, so
+  `_run_chat`'s exit guard runs the turn's tail (learn-cron-dashboard.md,
+  "Every turn exit runs the turn's tail"): the superseding message
+  dispatches unless the sub-agent hold or the admission sweep keeps it, and
+  otherwise `_finish_queue_cycle` starts an armed synthesis or sends the
+  terminal `chat_done`. The later pre-stream supersession abort sits inside
+  the `try` and leaves the tail to the turn's `finally`. The model-access
+  and image-history replays carry the same consume-seam check and the same
+  exit, and all three families revoke by one rule
+  (`RecoveryReplays.revalidate` in `dashboard/recovery_replays.py`: a
+  rebind away from the recorded
+  session, a Stop past the enqueue snapshots or in flight, or user input
+  queued behind the replay), at the drain and again at the consume seam,
+  each posting its family's cancellation notice. The model-access replay is
+  identified only by the queue id its swap recorded: the drain matches the
+  drained entry against it and claims it for the turn (`_run_chat`'s
+  `_replay`), which keeps
+  the spent one-shot for that replay alone, so a record whose entry left the
+  queue another way (a hard kill's clear, the admission sweep) can never
+  make a later turn read as the replay. A sub-agent completion the model
+  never consumed is classified once, at the requeue
+  (`_replay_owes_delivery`), and only when the turn's message IS the
+  completion: dispatched as one, or a recovery entry `_queue_recovery`
+  marked as its verbatim requeue (`_replays_completion`). It is a result the
+  parent is still owed, so a
+  model-access or image-history requeue queues it as the completion it is
+  (`SUBAGENT_COMPLETION_KIND`, as the sign-in retry does), with no family
+  record, and a soft Stop in flight does not skip the model-access swap
+  for it; a hard kill (`_stop_state == "killing"`) discards it like the rest
+  of the queue. Nothing else revokes it, the admission sweep exempts it like any queued
+  completion, and a newer user message runs after it. Without a family
+  record its turn refreshes the model-access one-shot like any completion
+  turn; the bound on a second swap is then the candidate selector itself,
+  because a swap fires only for a model absent from the advertised list and
+  its candidate is always taken from that list. The synthesis turn (actor
+  `subagent`, runner-authored), a runner-written continuation or retry
+  prompt queued for the completion, and a turn after the completion was
+  consumed owe nothing and stay ordinary, cancellable recoveries. A
+  genuine new message drops a stale record (a Stop
   can purge the queued replay) and re-arms the one-retry allowance —
   GENUINE meaning user-origin: a kind-tagged recovery requeue of the
   user's own words (a pre-output process failure re-queueing the turn)
@@ -209,7 +263,7 @@ families — a different model routinely accepts what another's filter declined
 - Restore is single-message: at the start of the first turn that is neither
   the replay nor a synthetic recovery continuation (a runner-authored
   continuation of the fallback turn must finish on the model that produced
-  it), `chat_runner._restore_refusal_fallback` moves the session back to the
+  it), `chat_turn/model_fallback._restore_refusal_fallback` moves the session back to the
   recorded primary — a definite restore, not a probe, because the primary is
   not throttled. The record is applied only under the binding the swap
   recorded: when the slot has since rebound to a different session, the
@@ -278,18 +332,19 @@ sub-agents) keep the terminal refusal behavior.
 
 - Swapping models after activity has begun on the transient/throttle path;
   the existing continuation recovery handles that path. (The refusal fallback
-  above is a distinct trigger and replays the whole message instead of
-  continuing mid-turn.)
+  above is a distinct trigger: it replays the whole message when no tool ran
+  and continues from the completed work when one did.)
 - Per-crew, per-cron, or per-role fallback chains.
 - A dedicated per-turn model field on the ACP wire.
 - kiro-cli changes.
 
 ## Tests
 
-`test/test_llm_helpers.py` covers chain derivation, candidate selection, retry
-state, story handling, and unattended restore. `test/test_dashboard_chat.py`
-covers dashboard fallback and slot restore. `test/test_subagent_turn_resilience.py`
-and `test/test_cron_gateway_integration.py` cover sub-agent and gateway wiring.
-`test/test_config_loader.py`, `test/test_role_models.py`, and
-`test/test_dashboard_handlers_core_coverage.py` cover configuration loading and
-PATCH validation.
+`test/test_llm_helpers_fallback_chain.py` and
+`test/test_llm_helpers_fallback_restore.py` cover chain derivation, candidate
+selection, retry state, story handling, and unattended restore. `test/test_dashboard_chat.py`
+covers dashboard fallback and slot restore. `test/test_subagent_turn_resilience_retry.py`
+and `test/test_cron_gateway_integration_llm.py` cover sub-agent and gateway wiring.
+`test/test_config_loader_agent_section.py`, `test/test_role_models.py`, and
+`test/test_dashboard_handlers_core_coverage_agent_settings.py` cover configuration
+loading and PATCH validation.

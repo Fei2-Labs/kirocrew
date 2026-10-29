@@ -60,6 +60,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import sys
 import time
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -101,6 +102,7 @@ from kiro_crew.adaptive.signals import SIGNAL_TIMEOUTS, classify
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.mcp_gateway.host_budget import HostBudget, HostBudgetExhausted, HostBudgetLimits
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED
+from kiro_crew.testing.wait import finished
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -276,7 +278,11 @@ def test_session_handle_never_reaches_the_scheduler():
     imports neither the task store nor admission, so the native seam has no
     way to mint either. The only scheduler-facing surface is a read
     (``native_child_sessions``) and a report (``report_native_children``)."""
-    src = inspect.getsource(sh_mod)
+    # The facade and every owner its code moved to, as one text.
+    src = "\n".join(
+        inspect.getsource(sys.modules[name])
+        for name in (sh_mod.__name__, *sh_mod._SESSION_HANDLE_OWNERS)
+    )
     for forbidden in ("kiro_crew.taskq", "subagent_manager.admission", "yield_slot("):
         assert forbidden not in src, forbidden
 
@@ -876,7 +882,7 @@ async def _await_frame(queue: asyncio.Queue, method: str) -> JsonRpcMessage:
     and nothing to settle. The method is asserted because an EARLIER frame
     arriving instead would satisfy the wait while proving nothing.
     """
-    msg = await asyncio.wait_for(queue.get(), timeout=_FRAME_CEILING_SECS)
+    msg = await finished(queue.get(), "the owner's next frame", timeout=_FRAME_CEILING_SECS)
     assert msg.method == method, f"the owner's next frame was {msg.method}, not {method}"
     return msg
 

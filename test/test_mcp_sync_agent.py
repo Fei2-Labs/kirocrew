@@ -1,4 +1,4 @@
-"""Tests for _sync_mcp_to_agent and _sync_mcp_to_agent_batch in mcp.py."""
+"""Tests for _sync_mcp_to_agent and _sync_mcp_to_agent_batch in mcp_agent_sync.py."""
 
 from __future__ import annotations
 
@@ -1448,9 +1448,18 @@ class TestOffloadedSyncHoldsTheConfigLock:
 
     def test_every_offloaded_sync_is_under_the_config_lock(self) -> None:
 
-        lines = (
-            (_REPO_ROOT / "src/kiro_crew/dashboard/handlers/mcp.py").read_text(encoding="utf-8").splitlines()
-        )
+        import importlib
+
+        from kiro_crew.dashboard.handlers import mcp
+
+        # The handler facade and its owners, each file's lines in turn.
+        lines = [
+            line
+            for m in (mcp.__name__, *mcp._OWNERS)
+            for line in Path(importlib.import_module(m).__file__)
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
         offenders: list[str] = []
         for i, ln in enumerate(lines):
             if "asyncio.to_thread(" in ln and "_sync_mcp_to_agent" in ln:
@@ -1735,3 +1744,69 @@ class TestSyncDiscoveredServers:
             t1.start(), t2.start()
             t1.join(), t2.join()
         assert not overlap, "the sync mutex must serialize concurrent callers"
+
+
+def _seed_per_tool_grants(agent_cfg: Path) -> None:
+    """Give builder-mcp per-tool grants next to its bare ref, plus a duplicate
+    and a prefix-sharing sibling the removal must leave alone."""
+    cfg = _load(agent_cfg)
+    cfg["mcpServers"]["builder-mcp-extra"] = {"command": "extra"}
+    cfg["tools"] = ["@builder-mcp", "@builder-mcp/search", "@builder-mcp-extra"]
+    cfg["allowedTools"] = [
+        "@builder-mcp",
+        "@builder-mcp/search",
+        "@builder-mcp/search",
+        "@builder-mcp/read",
+        "@builder-mcp-extra",
+        "@builder-mcp-extra/run",
+        "fs_read",
+    ]
+    agent_cfg.write_text(json.dumps(cfg))
+
+
+class TestRemovalDropsPerToolGrants:
+    """Disabling or removing a server drops its ``@server/tool`` grants from
+    ``allowedTools`` as well as the bare ``@server`` ref."""
+
+    @pytest.mark.parametrize("remove", [False, True])
+    def test_single_server_path(self, mcp_env, remove):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent
+
+        _sync_mcp_to_agent("builder-mcp", enabled=False, remove=remove)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+        assert "@builder-mcp" not in cfg["tools"]
+        assert "@builder-mcp-extra" in cfg["tools"]
+
+    def test_batch_path(self, mcp_env):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        from kiro_crew.dashboard.handlers.mcp import _sync_mcp_to_agent_batch
+
+        _sync_mcp_to_agent_batch(["builder-mcp"], enabled=False)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+
+    def test_withheld_auto_approve_drops_per_tool_grants(self, mcp_env, monkeypatch):
+        agent_cfg, _ = mcp_env
+        _seed_per_tool_grants(agent_cfg)
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.handlers.mcp.may_skip_gate_now",
+            lambda ref: not ref.startswith("@builder-mcp") or ref.startswith("@builder-mcp-"),
+        )
+        from kiro_crew.dashboard.handlers.mcp import (
+            _sync_mcp_to_agent,
+            _sync_mcp_to_agent_batch,
+        )
+
+        _sync_mcp_to_agent("builder-mcp", enabled=True)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]
+        assert "@builder-mcp" in cfg["tools"]
+
+        _seed_per_tool_grants(agent_cfg)
+        _sync_mcp_to_agent_batch(["builder-mcp"], enabled=True)
+        cfg = _load(agent_cfg)
+        assert cfg["allowedTools"] == ["@builder-mcp-extra", "@builder-mcp-extra/run", "fs_read"]

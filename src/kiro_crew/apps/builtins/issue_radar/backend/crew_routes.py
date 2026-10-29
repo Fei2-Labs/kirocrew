@@ -2,12 +2,11 @@
 
 Registered from ``routes.register_routes`` (one import, one call) rather than by
 the app manifest, so this app still has exactly ONE place that lists its routes.
-It lives in its own module because ``routes.py`` is already 200KB and the crew
-surface is a separate feature with its own store; the shared request plumbing
-(``_key_from_request``, ``_str_field``, ``_st``, ``_require_enabled``,
-``_pr_action_preamble``, ``_audit``) is imported from ``routes`` rather than
-re-derived, because a second copy of a gate is how one of them eventually ships
-without the check.
+It lives in its own module because the crew surface is a separate feature with
+its own store; the shared request plumbing (``_key_from_request``,
+``_str_field``, ``_st``, ``_require_enabled``, ``_pr_action_preamble``,
+``_audit``) is imported from ``routes`` rather than re-derived, because a second
+copy of a gate is how one of them eventually ships without the check.
 
 Routes, all under ``/api/apps/issue-radar``:
 
@@ -43,10 +42,13 @@ WRITE-PERMISSION DECISION (the one this module had to make). Two tiers:
     same button.
 
   * Every LOCAL crew route (crews, crew, work, pause, settings) requires the repo
-    to be CONNECTED but **not** writable. Three reasons, in the order they
-    mattered:
+    to be CONNECTED but **not** writable. Its dashboard caller must also be the
+    dashboard OWNER (``_body_preamble``): a live crew runs under the owner's
+    auto-approve grant, so only the owner may create or steer one. Three reasons
+    for connected-not-writable, in the order they mattered:
       1. Precedent: ``_handle_put_investigation`` is the same shape — per-repo
-         local state, nothing reaches the forge — and is gated on connected only.
+         local state, nothing reaches the forge — and checks owner and connected,
+         never the forge permission.
       2. ``_repo_can_write`` FAILS CLOSED, and these writes are how a crew records
          work it has ALREADY done. Gating them on a remote permission read means a
          network blip leaves a crew holding a dirty worktree with no way to persist
@@ -56,9 +58,9 @@ WRITE-PERMISSION DECISION (the one this module had to make). Two tiers:
          suggest-only there, and a crew that investigates and records what it found
          without pushing is a legitimate configuration. Permissions can also be
          granted later without recreating the crew.
-    The exposure this accepts is bounded and local: a user who can reach the
-    dashboard can create crew records on a repo they cannot write to. Those records
-    cannot mutate the repo — the first forge write refuses.
+    The exposure this accepts is bounded and local: the owner can create crew
+    records on a repo they cannot write to. Those records cannot mutate the repo —
+    the first forge write refuses.
 
 ``crew_store.CrewStoreError`` maps to **409**, never 500: every raise is a
 user-visible condition (a duplicate crew name, a second item trying to enter an
@@ -100,7 +102,7 @@ from typing import Any
 
 from aiohttp import web
 
-from . import crew_runtime, crew_store, provider, routes, store
+from . import crew_model, crew_runtime, crew_store, provider, routes, store
 
 logger = logging.getLogger("kirocrew.app.issue-radar.crews")
 
@@ -471,8 +473,16 @@ async def _json_object(request: web.Request) -> tuple[dict, web.Response | None]
 
 async def _body_preamble(
     request: web.Request,
+    operation: str,
 ) -> tuple[dict, provider.RepoKey, web.Response | None]:
-    """JSON body + owner/repo + the connected-repo gate, for the mutating routes.
+    """Owner gate + JSON body + owner/repo + the connected-repo gate, for the
+    mutating routes.
+
+    The owner gate runs first, before the body is read. Every route that calls
+    this preamble writes crew state the watchdog acts on (a live crew is launched
+    with an auto-approve grant in the owner's name), so only the dashboard owner
+    may reach it. An app token and a non-owner dashboard subject get the shared
+    403 ``owner_only``. ``operation`` names the route in that denial's audit row.
 
     Deliberately NOT ``routes._pr_action_preamble``: that one also demands
     ``_repo_can_write``, which these local-state writes intentionally do not
@@ -480,6 +490,11 @@ async def _body_preamble(
     non-object 400, the not-connected 404 — is the same, in the same order, so a
     caller cannot tell the two preambles apart except by the gate that differs.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, operation)
+    if owner_denied is not None:
+        return {}, provider.RepoKey(), owner_denied
     raw, early = await _json_object(request)
     if early is not None:
         return {}, provider.RepoKey(), early
@@ -706,7 +721,7 @@ async def _handle_crew_create(request: web.Request) -> web.Response:
     duplicate comes back as the store's own 409 message, which names the taken
     name rather than a generic conflict.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_create")
     if early is not None:
         return early
     if not routes._str_field(body, "name"):
@@ -779,6 +794,24 @@ async def _handle_crew_read(request: web.Request) -> web.Response:
     page = await asyncio.to_thread(
         partial(_crew_page, key.owner, key.repo, crew_id, limit, routes._scope(key))
     )
+    # Process memory, not the store: the verdict comes from the crew's live session.
+    page_crew = page.get("crew") or {}
+    page["triage_model_unavailable"] = crew_model.unavailable_triage_model(page_crew)
+    # A person's pick holds the crew's session model, so the page says so and names
+    # it rather than letting the crew look as if it still triages. The held model is
+    # the slot's own: a slot the gateway does not hold leaves it unnamed. Only a
+    # RECORDED hold is shown, so what the page offers to release is what a restart
+    # would keep. The watchdog pass and the wake both write a hold they see at once,
+    # and the release patch clears it on the record and in process memory alike.
+    held = bool(crew_model.triage_model(page_crew)) and page_crew.get("model_held") is True
+    state = request.app.get("state")
+    slot = (
+        state.get_slot(crew_runtime._slot_key(page_crew))
+        if held and state is not None and hasattr(state, "get_slot")
+        else None
+    )
+    page["model_held"] = held
+    page["held_model"] = str(getattr(slot, "model", "") or "") if slot is not None else ""
     return web.json_response({**routes._identity(key), **page})
 
 
@@ -809,7 +842,7 @@ async def _handle_crew_update(request: web.Request) -> web.Response:
     nudge firing before the watchdog's next sweep would take one whole auto-approved
     turn under a setting the human had already switched off.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_update")
     if early is not None:
         return early
     crew_id = routes._str_field(body, "id")
@@ -825,6 +858,17 @@ async def _handle_crew_update(request: web.Request) -> web.Response:
     if was_armed and not _auto_approve_armed(crew):
         withdrawn = "unattended off" if not crew.get("unattended") else "not live"
         await _revoke_execution(request, crew, withdrawn)
+    state = request.app.get("state")
+    # A triage model switched off may still be on the slot; the watchdog's next
+    # pass puts the work model back. A changed triage model also clears the crew's
+    # withheld verdict, so the new setting gets a fresh try. Run with no slot too:
+    # releasing a hold this process holds does not depend on the slot being here.
+    slot = (
+        state.get_slot(crew_runtime._slot_key(crew))
+        if state is not None and hasattr(state, "get_slot")
+        else None
+    )
+    crew_model.note_triage_change(slot, before, crew, released=body.get("model_held") is False)
     return web.json_response({"crew": crew})
 
 
@@ -836,7 +880,7 @@ async def _handle_crew_retire(request: web.Request) -> web.Response:
     make an old comment look like a live claim. Idempotent — retiring a retired
     crew re-stamps it rather than 409ing, so a double-click is not an error.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_retire")
     if early is not None:
         return early
     crew_id = routes._str_field(body, "id")
@@ -947,7 +991,7 @@ async def _handle_crew_work(request: web.Request) -> web.Response:
             return early
         crew_id = str(crew.get("id") or "")
     else:
-        body, key, early = await _body_preamble(request)
+        body, key, early = await _body_preamble(request, "issue_radar.crew_work")
         if early is not None:
             return early
         crew_id = routes._str_field(body, "crew_id")
@@ -1124,7 +1168,7 @@ async def _handle_crew_pause(request: web.Request) -> web.Response:
     resuming does not re-arm here, because the watchdog relaunches a live crew on
     its next cycle and doing it twice would arm two loops for one slot.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crew_pause")
     if early is not None:
         return early
     paused = body.get("paused")
@@ -1226,7 +1270,7 @@ async def _handle_crews_settings_put(request: web.Request) -> web.Response:
     partial patch cannot discard a key it did not send and there is nothing for an
     optimistic-concurrency check to protect.
     """
-    body, key, early = await _body_preamble(request)
+    body, key, early = await _body_preamble(request, "issue_radar.crews_settings_put")
     if early is not None:
         return early
     patch = body.get("settings")

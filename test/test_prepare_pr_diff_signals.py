@@ -27,7 +27,7 @@ from skill_script_helpers import load_skill_script
 from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
 
 ROOT = Path(__file__).resolve().parent.parent
-PREPARE_PR = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr"
+PREPARE_PR = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "kirocrew-prepare-pr"
 SCRIPT = PREPARE_PR / "scripts" / "diff_signals.py"
 SKILL = PREPARE_PR / "SKILL.md"
 
@@ -244,10 +244,49 @@ def test_check_body_missing_area_is_twenty_even_when_prose_is_short(capsys) -> N
 
 
 def test_check_body_without_what_changed_still_runs_accounting(capsys) -> None:
+    # check_body alone does not gate a missing section; the template check does
+    # (test_end_to_end_body_missing_what_changed_exits_twenty_two).
     rc = ds.check_body("## Problem\n\nnames src/kiro_crew/x\n", "M\tsrc/kiro_crew/x/y.py\n", 400)
     out = capsys.readouterr().out
     assert rc == 0
     assert "length check skipped" in out
+
+
+def _table_body(rows: int) -> str:
+    table = "| file | Before | After |\n|---|:--:|---|\n"
+    table += "".join("| x/y.py | 🟥 r{0} | 🟩 r{0} |\n".format(i) for i in range(rows))
+    # A fenced table is code, not a table row the reader scans.
+    fence = "```\n" + "| fenced | row |\n" * 20 + "```\n"
+    return (
+        "## What changed\n\nx/y.py sends once.\n\n" + table + "\n" + fence + "\n## Tests\n\n| a |\n"
+    )
+
+
+def test_table_rows_exclude_headers_separators_fences_and_other_sections() -> None:
+    assert ds.what_changed_table_rows(_table_body(3)) == 3
+    assert ds.what_changed_table_rows(BODY) == 1
+    assert ds.what_changed_table_rows("## Problem\n\n| a |\n") is None
+
+
+def test_check_body_nine_table_rows_is_twenty_one(capsys) -> None:
+    assert ds.TABLE_ROW_LIMIT == 8
+    rc = ds.check_body(_table_body(9), "M\tsrc/kiro_crew/x/y.py\n")
+    out = capsys.readouterr().out
+    assert rc == 21
+    assert "TOO MANY ROWS: What changed has 9 table rows (limit 8)" in out
+
+
+def test_check_body_eight_table_rows_is_zero(capsys) -> None:
+    rc = ds.check_body(_table_body(8), "M\tsrc/kiro_crew/x/y.py\n")
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "TOO MANY ROWS" not in out
+
+
+def test_row_limit_matches_the_body_picture_ceiling() -> None:
+    picture = _flat(SKILL.parent / "references" / "body-picture.md")
+    words = {8: "eight"}
+    assert "or {} rows, is the ceiling".format(words[ds.TABLE_ROW_LIMIT]) in picture
 
 
 # --------------------------------------------------------------- end to end
@@ -372,7 +411,8 @@ def _flat(path: Path) -> str:
 
 
 def test_skill_wires_the_check_at_every_body_write_and_gates_both_checks() -> None:
-    flat = _flat(SKILL)
+    # The contract's section 3 and 4 text lives in a reference SKILL.md points to.
+    flat = _flat(SKILL) + " " + _flat(PREPARE_PR / "references" / "pr-description-contract.md")
     # Phase 1.5, Phase 2 amend, Phase 3 publish -- each names the flag.
     assert flat.count("diff_signals.py --check-body") >= 3
     assert "<body-file>" not in flat
@@ -432,3 +472,76 @@ def test_skill_has_a_cold_reader_step_after_the_check_and_outside_local_review()
     local_review = (PREPARE_PR / "scripts" / "local_review.py").read_text(encoding="utf-8")
     assert "Cold reader" not in local_review
     assert "two sentences" not in local_review
+
+
+# ------------------------------------------------------ the template check
+
+TEMPLATE_CHECK = ROOT / ".github" / "scripts" / "pr-description-check.sh"
+TEMPLATE_BODY = (
+    "## Problem / Motivation\n\n**Goal:** send once.\n\n## Why it matters\n\nx\n\n"
+    "## Not a goal\n\nx\n\n## What changed\n\nchat/send.py sends once. security.py "
+    "allows it. .github is weakened.\n\n## Tests\n\nx\n"
+)
+
+
+# Same predicate as the repo's other bash-executing suites: on Windows the
+# `bash` on PATH may be the WSL launcher, which is not a shell.
+needs_bash = pytest.mark.skipif(
+    os.name == "nt" or shutil.which("bash") is None,
+    reason="executes bash; needs a POSIX bash on PATH",
+)
+
+
+@pytest.fixture
+def templated_repo(repo: Path) -> Path:
+    """``repo`` rebased on a base that carries CI's real template check, with a
+    branch commit that weakens its own copy to always pass."""
+    _git(repo, "checkout", "-q", "--detach", "origin/main")
+    (repo / ".github" / "scripts").mkdir(parents=True)
+    shutil.copy(TEMPLATE_CHECK, repo / ".github" / "scripts" / TEMPLATE_CHECK.name)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base with check")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    _git(repo, "rebase", "-q", "origin/main")
+    weak = 'echo "conclusion=success" >> "$GITHUB_OUTPUT"\n'
+    (repo / ".github" / "scripts" / TEMPLATE_CHECK.name).write_text(weak)
+    _git(repo, "commit", "-q", "-am", "weaken")
+    return repo
+
+
+@needs_bash
+def test_end_to_end_body_missing_a_template_section_exits_twenty_two(templated_repo: Path) -> None:
+    """The base ref's script runs, not the branch's weakened copy."""
+    _body(templated_repo).write_text(TEMPLATE_BODY.replace("## Not a goal\n", ""))
+    rc, out = _run(templated_repo, "--check-body")
+    assert rc == 22
+    assert "TEMPLATE: 1 required description section is missing" in out
+    assert "- `## Not a goal`" in out
+
+
+@needs_bash
+def test_end_to_end_body_missing_what_changed_exits_twenty_two(templated_repo: Path) -> None:
+    """A body with no What changed never passes --check-body: the template check stops it."""
+    body = TEMPLATE_BODY.replace("## What changed\n\n", "## Notes\n\n")
+    _body(templated_repo).write_text(body)
+    rc, out = _run(templated_repo, "--check-body")
+    assert rc == 22
+    assert "length check skipped" in out
+    assert "- `## What changed`" in out
+
+
+@needs_bash
+def test_end_to_end_template_shaped_body_exits_zero(templated_repo: Path) -> None:
+    _body(templated_repo).write_text(TEMPLATE_BODY)
+    rc, out = _run(templated_repo, "--check-body")
+    assert rc == 0, out
+    assert "PR template: required sections present" in out
+
+
+def test_end_to_end_base_without_the_template_check_skips_it(repo: Path) -> None:
+    _body(repo).write_text("## What changed\n\nchat/send.py sends once. security.py allows it.\n")
+    rc, out = _run(repo, "--check-body")
+    assert rc == 0
+    assert "TEMPLATE" not in out
+    assert "PR template" not in out

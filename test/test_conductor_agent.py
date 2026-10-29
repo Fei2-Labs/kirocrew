@@ -48,7 +48,7 @@ _INHERITED_PERMISSIONS = {"rules": [{"capability": "web_fetch", "effect": "deny"
 def _pin_spec_permissions_cli(monkeypatch, which):
     """Pin what the writer's version gate believes the installed kiro-cli is.
 
-    The five spec writers share one gate (``_write_derived_permissions``), which
+    The generated spec writers share one gate (``_write_derived_permissions``), which
     reads ``installed_kiro_cli_version`` function-locally from
     ``kiro_crew.kiro_cli``, so the patch lands in the owning module. Without it
     the answer is whatever the test HOST has, which on CI is nothing and reads
@@ -178,7 +178,7 @@ class TestConductorInstaller:
         Pinned as literal names rather than by importing the tuple: the point is
         that WIDENING the tuple fails a test, which a tautological assertion
         against the tuple itself could never catch. Each withheld verb below is
-        withheld for a reason recorded next to it in ``agent.py``:
+        withheld for a reason recorded next to it in ``agent_parts/spec_grants.py``:
         ``chat_folder_move_session`` PATCHes another session's ``folder_id``
         (target comes from the arguments, not the caller), ``session_send`` runs
         text as a peer's turn, ``session_stop`` discards a peer's in-flight work,
@@ -188,7 +188,13 @@ class TestConductorInstaller:
         for verb in (
             "chat_folder_move_session",
             "chat_folder_move",
+            # Renames or restyles an existing folder, which may be the person's.
+            "chat_folder_update",
             "session_send",
+            # The fan-out write, withheld on `session_send`'s reason multiplied by
+            # the fleet: one call runs ingested text as a user-role turn in every
+            # session this agent created, and nothing bounds what is sent.
+            "session_broadcast",
             "session_stop",
         ):
             assert f"@kirocrew-dashboard/{verb}" not in granted, verb
@@ -198,6 +204,11 @@ class TestConductorInstaller:
             "chat_folder_file_self",
             "session_create",
             "session_read_message",
+            # A pure read, narrower than `session_read_message` beside it (a
+            # liveness word per child, no transcript content), and asked on every
+            # unattended patrol cycle -- so gating it would put an approval prompt
+            # in a loop with nobody at the keyboard.
+            "session_status",
         ):
             assert f"@kirocrew-dashboard/{verb}" in granted, verb
 
@@ -217,6 +228,7 @@ class TestConductorInstaller:
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
         }
         # The bare server must never appear: it would grant every verb, including
         # the four the test above withholds.
@@ -236,8 +248,7 @@ class TestConductorInstaller:
         case, because they reach ``allowed_tools_to_permissions`` as separate
         patterns and a family could classify differently: persistent work
         (``task_run``, the ``workflow_*`` group), agent fan-out (the ``spawn_*``
-        group), session and workspace mutation (``set_project``,
-        ``reset_conversation``), egress (``deploy_artifact``, ``browser``,
+        group), workspace mutation (``set_project``), egress (``deploy_artifact``, ``browser``,
         ``ops_mission_control_api``) and the ``artifact_*`` writes.
 
         Spelled as literals, deliberately: deriving the expectation from
@@ -261,6 +272,11 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/nothing_to_do",
+            # Granted on purpose: the conductor drops its own chat at a round
+            # close. The directive consumer still refuses it from any wake it
+            # cannot vouch for (test_conductor_wake_reset.py).
+            "@kirocrew-core/reset_conversation",
         }
         # The bare server is what this test exists to keep out: it would re-grant
         # all 74 registered core tools, including every verb named below.
@@ -277,9 +293,9 @@ class TestConductorInstaller:
             "spawn_sub_agents",
             "spawn_steer",
             "spawn_continue",
-            # Mutating the caller's own session or project out from under it.
+            # Mutating the caller's own project out from under it.
+            # (``reset_conversation`` moved to the granted set above, on purpose.)
             "set_project",
-            "reset_conversation",
             # Egress and machine reach.
             "deploy_artifact",
             "browser",
@@ -457,7 +473,7 @@ class TestConductorInstaller:
         filter, because the agent copies whichever it read last.
         """
         prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "Filter the returned" in prompt
+        assert "Filter the `accept_batch`" in prompt
         assert "whose status is `done`" in prompt
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
         assert "keep only the entries whose item is currently `status: done`" in body
@@ -482,14 +498,81 @@ class TestConductorInstaller:
         assert "`work_report` at round boundaries" in body
         assert "root conductor gets `not_bound`" in body
 
-    def test_prompt_notes_the_patrol_gate_is_still_a_timer(self, tmp_path, monkeypatch):
-        """``monitor_start`` gates on one pull-request URL and nothing else today, so
-        a cycle fires whether or not anything was reported. The prompt says so, and
-        says what to switch to, rather than implying a gate that does not exist.
+    def test_prompt_and_skill_require_the_ledger_watch_and_the_interval_band(
+        self, tmp_path, monkeypatch
+    ):
+        """A loop without ``watch="work-ledger"`` is a plain timer that pays a turn
+        every interval, and a 30-minute interval leaves a worker's report unread
+        for half an hour. Both the prompt and the skill must make the watch
+        mandatory and keep the interval inside the band ``patrol_budget.py``
+        enforces.
         """
-        prompt = self._install(tmp_path, monkeypatch)["prompt"]
-        assert "monitor_start" in prompt
-        assert 'watch: "work-ledger"' in prompt
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert 'Always pass `watch="work-ledger"`' in prompt
+        assert '`watch="work-ledger"` is mandatory' in body
+        for text in (prompt, body):
+            assert 'monitor_update(watch="work-ledger")' in text
+            assert "300..900" in text
+            assert "interval_secs=1800" not in text
+            assert "on a timer today" not in text
+
+    def test_prompt_and_skill_run_rounds_back_to_back_and_stop_on_two_signals(
+        self, tmp_path, monkeypatch
+    ):
+        """A finished round must not wait on the user: the Round-0 go-ahead covers
+        every round. Patrol ends only when every item is terminal or the user
+        stops it, and a question parks one item instead of stopping the loop.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        assert "Rounds run back to back" in prompt
+        assert "Do not wait for the user between rounds" in body
+        assert "propose the next round. Then wait." not in body
+        assert "Patrol ends on two signals only" in prompt
+        assert "Patrol ends on exactly two signals" in body
+        assert "Needs-human checklist" in body
+        for text in (prompt, body):
+            assert "Round-0 go-ahead" in text
+            assert "runaway backstop, not a stop signal" in text
+            assert "credentials, spend, deleting or overwriting someone's work" in text
+            assert "Park just this item" in text
+
+    def test_needs_human_checklist_puts_the_risk_check_before_the_default(
+        self, tmp_path, monkeypatch
+    ):
+        """A model stops at the first step that applies. If "pick a default"
+        came first, a spend, delete or force-overwrite choice with an obvious
+        default would be taken unattended, so the risk check must lead.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        for text in (prompt, body):
+            assert text.index("Is it credentials, spend") < text.index("Not risky? Pick a default")
+            assert "Can you pick a default?" not in text
+            assert "Can I pick a default?" not in text
+
+    def test_back_to_back_rounds_keep_a_spend_bound(self, tmp_path, monkeypatch):
+        """Without a pause between rounds, a default concurrency cap and a no-progress
+        back-off are the only hard spend gates when the user set no bound; the item
+        total is a line the conductor reports, not a refusal it asks about.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        for text in (prompt, body):
+            assert "spend is bounded" in text
+            assert "two rounds in a row" in text
+            assert "goal_concurrency_cap_reached" in text
+            assert "concurrency_cap=<N>" in text
+            assert "items used: N of <item_cap>" in text
+            assert "cap_exceeded" in text
+            # The old refusal is gone from both, so neither tells the conductor to
+            # stop and ask when the total is passed.
+            assert "goal_item_cap_reached" not in text
+        assert "at most 6 ledger items OPEN at once" in prompt
+        assert "at most 20 ledger items in all" in prompt
+        assert "at most **6 ledger items open at once**" in body
+        assert "at most **20 ledger items** in total" in body
 
     def test_prompt_names_its_own_skill_and_not_the_deprecated_alias(self, tmp_path, monkeypatch):
         """The procedure lives in ``goal-conductor``. ``goal-ledger-conductor`` is a
@@ -500,16 +583,49 @@ class TestConductorInstaller:
         assert "`goal-conductor`" in prompt
         assert "goal-ledger-conductor" not in prompt
 
-    def test_skill_body_matches_the_prompt_on_the_load_bearing_rules(self):
+    def test_skill_body_matches_the_prompt_on_the_load_bearing_rules(self, tmp_path, monkeypatch):
         """The prompt is the summary and the skill is the procedure; a disagreement
         between them is resolved nondeterministically by whichever the model weighs
         more. These four are the rules that make this flow what it is.
+
+        The read-first rule is asserted on BOTH sides, because that is the one a
+        wake can contradict: a wake carries a pointer to the ledger rather than a
+        copy of it, so a surface telling the conductor a turn may arrive holding the
+        board has it act on a one-line notification as if it were the state.
         """
         body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         assert "Bind BEFORE you seed" in body
         assert "Never leave `agent` unset" in body
-        assert "work_ledger_read` first, every cycle" in body
         assert "action=accept" in body
+        for surface, text in (("skill", body), ("prompt", prompt)):
+            assert "Read the ledger first, every cycle" in text, surface
+            assert "already carries the board" not in text, (
+                f"the {surface} still tells the conductor a turn can arrive holding "
+                "the board; a wake carries a pointer to work_ledger_read"
+            )
+
+    def test_prompt_and_skill_name_the_template_dispatch_for_a_shadowed_worker(
+        self, tmp_path, monkeypatch
+    ):
+        """On installs where an older agent sync enrolled ``kirocrew-worker`` as a crew
+        member with private memory, a conductor running as a crew member on the
+        shared store (or a child a parent conductor created) is refused
+        ``memory_delegation_denied`` for every leaf dispatch. Left unsaid, the
+        conductor invents a remedy that does not exist (a memory-store setting), so
+        both the summary and the procedure name the real one -- ``agent_kind:
+        "template"`` -- as the way EVERY worker is dispatched, not as a retry after
+        the refusal, and say the binding is not a setting.
+        """
+        prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
+        body = " ".join((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8").split())
+        for text in (prompt, body):
+            assert 'Always dispatch `kirocrew-worker` with `agent_kind: "template"`' in text
+            assert "Re-send" not in text
+            assert "memory_delegation_denied" in text
+            assert "needs no memory of its own" in text
+        assert "no setting can change" in prompt
+        assert "immutable and Settings offers no control" in body
 
     def test_prompt_and_skill_close_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
         """A conductor that stops an item's loop and leaves its session open leaves a
@@ -609,11 +725,14 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/nothing_to_do",
+            "@kirocrew-core/reset_conversation",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
             "@kirocrew-work/work_ledger_rebuild",
@@ -638,6 +757,8 @@ class TestConductorInstaller:
             "kirocrew-core/list_sessions",
             "kirocrew-core/monitor_start",
             "kirocrew-core/monitor_update",
+            "kirocrew-core/nothing_to_do",
+            "kirocrew-core/reset_conversation",
             "kirocrew-core/resource_status",
             "kirocrew-core/select_crew",
             "kirocrew-core/send_message",
@@ -654,6 +775,7 @@ class TestConductorInstaller:
             "kirocrew-dashboard/chat_folder_tree",
             "kirocrew-dashboard/session_create",
             "kirocrew-dashboard/session_read_message",
+            "kirocrew-dashboard/session_status",
         ]
         work_resources = [
             "kirocrew-work/work_brief",
@@ -801,11 +923,14 @@ class TestConductorInstaller:
             "@kirocrew-core/send_message",
             "@kirocrew-core/send_notification",
             "@kirocrew-core/ask_question",
+            "@kirocrew-core/nothing_to_do",
+            "@kirocrew-core/reset_conversation",
             "@kirocrew-dashboard/chat_folder_tree",
             "@kirocrew-dashboard/chat_folder_create",
             "@kirocrew-dashboard/chat_folder_file_self",
             "@kirocrew-dashboard/session_create",
             "@kirocrew-dashboard/session_read_message",
+            "@kirocrew-dashboard/session_status",
             "@kirocrew-work/work_ledger_read",
             "@kirocrew-work/work_ledger_record",
             "@kirocrew-work/work_ledger_rebuild",
@@ -936,18 +1061,18 @@ class TestConductorInstaller:
         assert "2. `session_create`" in dispatch
 
     def test_pr_checks_seed_may_name_the_prepare_pr_skill_by_path(self):
-        """A ``pr_checks`` seed can point the worker at prepare-pr's SKILL.md.
+        """A ``pr_checks`` seed can point the worker at kirocrew-prepare-pr's SKILL.md.
 
         ``kirocrew-worker`` is a custom agent: ``_skills_injection_plan`` gives it
         no catalog and no trigger matching, so however a seed is worded nothing
-        auto-loads ``prepare-pr`` in the worker session. The conductor naming the
+        auto-loads ``kirocrew-prepare-pr`` in the worker session. The conductor naming the
         file is the only route. Pinned as an OPTIONAL hint, not a mandate: a user
-        who does not want prepare-pr must not have it forced on every worker.
+        who does not want kirocrew-prepare-pr must not have it forced on every worker.
         """
         text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
         dispatch = text.split("### Dispatch a round")[1].split("### Patrol")[0]
         flat = " ".join(dispatch.split())
-        assert "`<crew-home>/skills/kirocrew-dev/prepare-pr/SKILL.md`" in flat
+        assert "`<crew-home>/skills/kirocrew-dev/kirocrew-prepare-pr/SKILL.md`" in flat
         assert "may name the PR procedure" in flat
         # Optional, by design.
         assert "Optional" in flat

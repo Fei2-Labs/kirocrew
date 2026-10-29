@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Eye, Image as ImageIcon, ImageOff, RotateCw } from 'lucide-react'
 import { useTheme } from '../hooks/useTheme'
 import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useFrameSrc } from '../hooks/useFrameSrc'
 import { useSilentLoadWatch } from '../hooks/useSilentLoadWatch'
 import { useScrollMemory } from '../hooks/useScrollMemory'
 import { useCommentBridge, type IframeSelection } from '../hooks/useCommentBridge'
@@ -9,6 +10,7 @@ import { InlineCommentOverlay } from './InlineCommentOverlay'
 import { Btn } from './ui'
 import ErrorNotice from './ErrorNotice'
 import { buildSrcdoc, readThemeVars } from '../lib/widgetSrcdoc'
+import { artifactFrame } from '../lib/artifactFrame'
 import {
   widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight,
   clampFrameHeight,
@@ -73,6 +75,14 @@ export function fileTypeForKind(kind: Artifact['kind']): FileType {
     // content — it never flows through ContentRenderer, but map it explicitly
     // so a stray call can't misroute image bytes into the markdown path.
     case 'image':    return 'image'
+    // A dashboard artifact's content is a layout PACKAGE, not a document:
+    // `artifact_store/dashboard_package.py` canonicalises every dashboard write
+    // into a JSON object (`bound_to` / `model` / `view` / `theme`), so the
+    // stored bytes are always JSON and the json view is the renderer that
+    // already matches them. Without this case it took the default branch and
+    // the package was flowed through the prose renderer, which collapsed its
+    // newlines and interpreted markup inside a label instead of showing it.
+    case 'dashboard': return 'json'
     // widget / html shouldn't reach here, but fall back to markdown rather
     // than throwing — keeps the page survivable for unexpected enum values.
     default:         return 'markdown'
@@ -278,14 +288,19 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
     window.addEventListener('message', onMessage)
     return () => window.removeEventListener('message', onMessage)
   }, [heightKey])
+  // A crewmate's report opens in the crewmate Dashboard page's sandbox; every
+  // other artifact keeps the library frame (lib/artifactFrame.ts).
+  const frame = artifactFrame(artifact)
   const srcdoc = useMemo(
     () => artifact.content
       ? buildSrcdoc({
         html: artifact.content, themeVars, mode: theme, enableComments: true,
         includeHeightReporter: true,
+        offlineScripts: frame.offlineScripts, rewriteBareLinks: frame.rewriteBareLinks,
+        pageScripts: frame.pageScripts,
       })
       : null,
-    [artifact.content, themeVars, theme],
+    [artifact.content, themeVars, theme, frame.offlineScripts, frame.rewriteBareLinks, frame.pageScripts],
   )
   // One shared hook rather than this effect in four components: the previous
   // document survives both an in-flight and a failed re-mint, and `failed`
@@ -294,6 +309,9 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
   // See hooks/useSandboxDoc.ts for why each rule
   // exists.
   const { url: blobUrl, failed, pending, retry } = useSandboxDoc(srcdoc)
+  // Later documents replace the first in place: an attribute change would leave
+  // the spent url in the page's history for Back to 404 on (hooks/useFrameSrc.ts).
+  const frameSrc = useFrameSrc(iframeRef, blobUrl)
   // ArtifactBody has always carried `docSilent`, but it covers a DIFFERENT
   // silent condition: a frame that loaded and then never reported its height
   // (its timer arms only once `loadedUrlRef.current === blobUrl`, i.e. after
@@ -439,7 +457,7 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
           {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onLoad is a document-load lifecycle handler (it arms the silent-document watch and reveals the frame), not a user interaction; the frame's own content is what a keyboard reaches, and nothing here can be triggered from one */}
           <iframe
             ref={iframeRef}
-            src={blobUrl}
+            src={frameSrc}
             onLoad={() => {
               loadedUrlRef.current = blobUrl
               // Every load restarts the observation, not just a new url. The case
@@ -454,7 +472,7 @@ export const ArtifactBodyIframe = memo(function ArtifactBodyIframe({
               onFrameLoaded()
               onIframeLoad?.()
             }}
-            sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+            sandbox={frame.sandbox}
             // NO clipboard-write delegation here, deliberately. These frames host
             // agent-generated HTML whose scripts run on load, so a delegated
             // permission would let one overwrite the user's clipboard with no Copy

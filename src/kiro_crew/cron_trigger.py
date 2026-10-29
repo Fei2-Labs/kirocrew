@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 
 from kiro_crew.instances import run_marker
-from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.loopback_http import deadline_expired, loopback_urlopen
 
 _JOB_ID_RE = re.compile(r"[a-f0-9]{6,12}")
 _TIMEOUT_SECS = 10  # endpoint returns immediately after starting execution
@@ -39,12 +39,29 @@ def trigger_cron_job(job_id: str, port: int, secret_path: Path) -> tuple[bool, s
     # credential for a port this home once served would send the stale one. No
     # caller does that; closing it means this parameter going away, not the order
     # flipping.
-    secret = run_marker.read_secret(port)
-    if not secret:
-        try:
-            secret = secret_path.read_text().strip()
-        except FileNotFoundError:
-            pass
+    #
+    # This dials the IPv4 loopback literal, so the credential is resolved for THAT
+    # listener first (``read_listener_secret``): a port names a SET of listeners,
+    # and the address-keyed read refuses to hand the credential to whatever else
+    # holds the port. When the gateway published listener entries but none covers
+    # the dialled family, that is the desync -- fail closed, do NOT fall back. When
+    # it published NONE (an older gateway, or one that could not name its bound
+    # address), fall back to the port-keyed read, then the named path -- but only
+    # when absence is PROVEN (``has_listener_entries(port) is False``); an
+    # enumeration error returns ``None``, absence is unproven, so fail closed
+    # rather than downgrade to the port-keyed credential over an unreadable run/.
+    # The named path is never outranked by the home-wide ``.local_secret`` here,
+    # which is why this does its own resolution rather than delegating to
+    # ``read_local_secret``: that helper's tail is the very home-wide file a
+    # second generation replaces.
+    secret = run_marker.read_listener_secret(port, "127.0.0.1")
+    if not secret and run_marker.has_listener_entries(port) is False:
+        secret = run_marker.read_secret(port)
+        if not secret:
+            try:
+                secret = secret_path.read_text().strip()
+            except FileNotFoundError:
+                pass
     if secret:
         headers["X-Internal-Secret"] = secret
     try:
@@ -60,5 +77,10 @@ def trigger_cron_job(job_id: str, port: int, secret_path: Path) -> tuple[bool, s
         if e.code == 404:
             return False, f"Job not found: {job_id}"
         return False, f"Error: HTTP {e.code}"
-    except (urllib.error.URLError, OSError):
+    except (urllib.error.URLError, OSError) as e:
+        # A timeout means the gateway took the trigger and is still working, so
+        # it is up but busy, not gone. The trigger POST is not idempotent, so
+        # the message does not invite a blind retry.
+        if deadline_expired(e):
+            return False, "Error: gateway is busy (up but did not answer); the trigger may have run"
         return False, "Error: cannot reach gateway. Is `kirocrew gateway` running?"

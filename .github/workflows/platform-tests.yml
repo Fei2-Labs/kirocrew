@@ -23,7 +23,7 @@ name: Platform Tests
 # WHAT REPLACES IT ON THE PULL REQUEST PATH
 #   - macos-on-demand.yml -- THIS workflow, called against a pull request's own
 #     head when the diff touches a darwin-sensitive path, the PR carries the
-#     `ci:macos` label, or the head SHA falls in a 1-in-20 sample. Outside
+#     `ci:macos` label, or the head SHA falls in a 1-in-50 sample. Outside
 #     readiness' lane list, so it can never hold a merge.
 #   - ci.yml's `e2e-boot-matrix` still boots a real gateway on macos-15, on the
 #     push-to-main path.
@@ -60,7 +60,7 @@ jobs:
   #
   # It shipped SCOPED to a 51-file glob (gateway, socketsec, platform-compat, pod,
   # MCP-apps) because a full run needed its own exclusion burn-down first. That
-  # burn-down is done, so this job now runs the WHOLE suite in duration-balanced
+  # burn-down is done, so this job now runs the WHOLE suite in file-assigned
   # shards, the same shape as backend-test-windows. 51 of 2094 test files was 2.4
   # percent of the tree: a POSIX-but-not-Linux regression outside that glob (the
   # `ru_maxrss` unit difference, BSD `ps`/`stat` argv, case-insensitive HFS+ path
@@ -70,26 +70,61 @@ jobs:
   # deprecated by GitHub, and macos-latest moves under us, which would turn an image
   # rollout into an unexplained red on an unrelated pull request.
   #
-  # 3 shards, not Windows' 4. macOS bills at 10x Linux per minute, so the shard
-  # count is the billing knob; 3 is the smallest count that keeps the slowest shard
-  # inside a budget comparable to the Windows job.
+  # macOS bills at 10x Linux per minute, so the shard count is the billing knob and
+  # the count is the SMALLEST that keeps the slowest shard inside the cap with room
+  # to spare -- see the cap's own derivation below for the measurement that sets it.
+  # Raising it is what absorbs suite growth; raising the cap would only spend more
+  # on a lane that already outgrew its budget.
   backend-test-macos:
     name: Backend Tests (macOS)
     runs-on: macos-15
-    # 40, matching backend-test-windows. MEASURED on the first full-suite run of
-    # this branch (run 34288884863): shards 1 and 2 finished their pytest step in
-    # 20.3 and 20.1 minutes, and shard 3 was still running past 27, so a 30-minute
-    # cap cancelled it. 1.5x the slowest observed shard is therefore at least 40.
-    # This is still a spend guard, not just a hang guard: a runaway macOS shard
-    # costs about ten times a Linux one.
+    # 40, matching backend-test-windows, and it is a SPEND guard as much as a hang
+    # guard: a runaway macOS shard costs about ten times a Linux one. The cap is
+    # only meaningful while the slowest shard sits well inside it, so it is the
+    # SHARD COUNT that absorbs suite growth, not this number.
+    #
+    # MEASURED on run 36223077241, at 3 shards: the pytest step took 33.0 and 32.2
+    # minutes on shards 1 and 3, and shard 2 was 98% through its progress line when
+    # the cap cancelled it at 40.0 (run 36200630682 lost the same shard the same
+    # way). So 3 shards no longer leave any headroom at all, let alone the 1.5x the
+    # cap was originally derived from. Two things restore it, and both are measured
+    # rather than guessed:
+    #
+    #   * 4 shards instead of 3 -- one more runner costs the fixed per-shard
+    #     overhead, measured on run 36223077241 as job wall MINUS the pytest step, so
+    #     it bounds everything outside the tests at once: 40 s, 43 s and 39 s on
+    #     shards 1, 2 and 3 (the `uv` install inside those is 3-5 s). Shard 1 is not
+    #     the cheap case -- it also runs the peer-identity canary and the terminal
+    #     handler suite -- so an added shard pays the 39 s shape. Under a minute
+    #     against a cancelled 40-minute shard.
+    #   * the file-sharding plugin below instead of pytest-split. pytest-split
+    #     collects the WHOLE suite in every shard and deselects the rest: measured
+    #     warm on Linux, `--splits 3 --group 2` spends 94.8 s collecting 137,829
+    #     tests to run 45,943 of them, where `--file-shards 3 --file-shard 2`
+    #     spends 29.8 s collecting only the 46,744 it owns. Every shard was paying
+    #     that import twice over for tests it then threw away.
+    #
+    # MEASURED AGAIN at 4 shards, once the suite had grown into them: on run
+    # 39459787319 shards 2, 3 and 4 took 29, 32 and 33 minutes of job wall and
+    # shard 1 was cancelled at 40:00; on run 39451202841 shards 1, 3 and 4 took
+    # 27, 30 and 31 and shard 2 was cancelled at 40:00. A passing shard at 33 of
+    # 40 is 1.2x headroom, and the cancelled ones show the file-hash assignment
+    # can land a heavier mix on any one shard. So 5 shards: the same suite
+    # spread one way further is about 26 minutes a shard at the 33-minute shape,
+    # 1.5x inside the cap, for one more runner's sub-minute fixed overhead.
+    # The 5 shards run 4 at a time (test_workflow_matrix_max_parallel.py holds
+    # every matrix job to that shared-pool rule), so the fifth starts when the
+    # first finishes: each JOB stays inside the cap, which is the invariant,
+    # for about one more shard of lane wall time.
     timeout-minutes: 40
     strategy:
+      max-parallel: 4
       # Full failure picture across shards, same as backend-test.
       fail-fast: false
       matrix:
-        group: [1, 2, 3]
+        group: [1, 2, 3, 4, 5]
     env:
-      SHARD_COUNT: 3
+      SHARD_COUNT: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,11 +186,12 @@ jobs:
           }
 
       - name: Terminal handler suite (verbose, so a darwin PTY hang names its test)
-        # test/macos-collect-ignore.txt keeps this file out of the shards and this
-        # step runs it instead: -v -n0 so every test name streams to the log the
+        # test/macos-collect-ignore.txt keeps these files (test_terminal_handler.py
+        # and its topic parts) out of the shards and this step runs them instead:
+        # -v -n0 so every test name streams to the log the
         # moment it starts, and a 90 s per-test timeout so a PTY read that darwin
         # never wakes fails by name in the log rather than as 180 s of silence
-        # inside a -q shard. Runs on shard 1 only; the file is one process either way.
+        # inside a -q shard. Runs on shard 1 only; the files are one process either way.
         if: matrix.group == 1
         env:
           PYTHONUNBUFFERED: "1"
@@ -163,10 +199,17 @@ jobs:
           set -o pipefail
           echo "::remove-matcher owner=python::"
           pytest -v -n0 --no-cov --timeout=90 -o faulthandler_timeout=75 \
-            -p no:cacheprovider test/test_terminal_handler.py 2>&1 | tee terminal.log
-          # A FLOOR, not "at least one pass". This file carries ~277 tests and this
-          # step is its only execution on macOS (test/macos-collect-ignore.txt keeps
-          # it out of every shard, and test/windows-collect-ignore.txt out of the
+            -p no:cacheprovider test/test_terminal_handler.py \
+            test/test_terminal_handler_session_routes.py \
+            test/test_terminal_handler_completion.py \
+            test/test_terminal_handler_ws.py \
+            test/test_terminal_handler_pty_integration.py \
+            test/test_terminal_handler_session_state.py \
+            test/test_terminal_handler_pty_writes.py \
+            test/test_terminal_handler_child_process.py 2>&1 | tee terminal.log
+          # A FLOOR, not "at least one pass". These files carry ~277 tests and this
+          # step is their only execution on macOS (test/macos-collect-ignore.txt keeps
+          # them out of every shard, and test/windows-collect-ignore.txt out of the
           # Windows ones), so what has to be caught here is a COLLECTION COLLAPSE --
           # and `[1-9][0-9]* passed` was satisfied by "1 passed, 276 skipped". The
           # count is read numerically instead: growth is fine, a handful of
@@ -189,11 +232,29 @@ jobs:
         # platform-independent, and a burnt cap costs 10x here. --no-cov because
         # coverage-combine merges ubuntu shards only.
         #
-        # No surface selector and nothing deselected, same as the Windows job:
-        # `-n auto` already saturates the runner, so a shorter file list does not
-        # shorten a shard. Residual darwin gaps are node ids in
-        # test/macos-expected-failures.txt, applied by the rootdir conftest through
-        # the same matcher as the Windows list.
+        # `-n 2`, NOT `-n auto`. The budget plugin behind `auto`
+        # (xdist_budget.py, registered in the rootdir conftest) sizes workers by
+        # free memory, and on a macos-15 runner (3 cores, 7 GiB, ~3 GiB free
+        # after the OS and toolchain) it answered ONE worker on every nightly
+        # from at least 09-16 to 09-26 -- the log's own line is
+        #   xdist worker budget: 1 of 3 workers (3.0 GiB free, 7 GiB installed)
+        # so each shard ran its tests serially on a 3-core machine at ~23 tests
+        # a second. MEASURED with two workers on the 3-shard shape (dispatch run
+        # 36228922099): 21-27 minutes a shard against 32-39 the same day at one.
+        # The plugin is right for a developer laptop it does not know; this
+        # runner is a fixed shape the lane can state outright, and an explicit
+        # count skips the budget (it hooks pytest_xdist_auto_num_workers only).
+        # 2 rather than 3: each worker imports its shard's files and holds them,
+        # and the 16 GiB/worker figure the plugin carries for macOS (#10061) was
+        # measured on a 36 GiB laptop, not here. Swap pressure or a jetsam kill
+        # in a shard log means back to 1; two workers holding well under the cap
+        # makes 3 the next measurement. test_macos_platform_tests_gate.py pins
+        # the explicit count so a revert to `auto` is visible.
+        #
+        # No surface selector and nothing deselected, same as the Windows job.
+        # Residual darwin gaps are node ids in test/macos-expected-failures.txt,
+        # applied by the rootdir conftest through the same matcher as the
+        # Windows list.
         # PYTHONUNBUFFERED plus faulthandler_timeout: the first full run of shard
         # 3 on macos-15 hit the 40-minute cap having printed NOTHING after the
         # pytest command line, and the runner then reaped nine orphan bash and two
@@ -214,9 +275,14 @@ jobs:
           # traceback in the log, including one printed inside a warning, and
           # never matches a pytest failure.
           echo "::remove-matcher owner=python::"
-          pytest -q -n auto --timeout=180 --no-cov --max-worker-restart=0 \
+          # `python -m pytest`, not bare `pytest`, and that is what makes the
+          # plugin loadable: `-m` puts the working directory on sys.path, where the
+          # console script does not, so `-p scripts.ci_file_shards` resolves here
+          # exactly as it does in backend-test and backend-test-windows.
+          python -m pytest -p scripts.ci_file_shards -q -n 2 --timeout=180 \
+            --no-cov --max-worker-restart=0 \
             -o faulthandler_timeout=150 \
-            --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
+            --file-shards "$SHARD_COUNT" --file-shard ${{ matrix.group }} \
             2>&1 | tee "shard-macos-${{ matrix.group }}.log"
 
       # The log carries pytest's own `FAILED <nodeid> - <msg>` summary lines, so a

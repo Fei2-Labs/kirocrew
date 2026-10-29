@@ -3,9 +3,9 @@
 
 What this buys
 --------------
-The ``prepare-pr`` loop runs its gate up to ten times per PR, and the full local
-suites are enormous: 62,108 collected backend tests (collection alone takes ~100s
-before a single test runs) and ~1,444 frontend spec files. CI runs the touched
+The ``kirocrew-prepare-pr`` loop runs its gate up to ten times per PR, and the full local
+suites are enormous: collecting the backend suite alone takes noticeable time
+before a single test runs, and the frontend has thousands of spec files. CI runs the touched
 surface's full suite on ``refs/pull/<N>/merge`` regardless of what ran here, and
 for the other surface the same cross-surface set this runner includes (``ci.yml``
 ``changes`` job; the only other narrowing is ``leaf_test_scope.py``, which is sound
@@ -254,8 +254,18 @@ def _tree_files(root: Path, rel_roots: tuple[str, ...], name_re: re.Pattern[str]
     return tuple(sorted(out))
 
 
-@functools.lru_cache(maxsize=None)
 def _read_text(root: Path, rel: str) -> str:
+    """One test file's text, read for the scan that asked and then dropped.
+
+    Deliberately NOT memoised, unlike `_tree_files` above. `_referencing_tests`
+    reads each file exactly once per `related_targets` call, so a cache buys the
+    gate nothing; what it cost was the whole test tree resident for the life of
+    the process -- ~3,200 files, ~100 MB of `str` -- for a 0.4 s re-read. In the
+    gate process that is wasted memory; imported into a pytest worker (as
+    `test_local_gate.py` does) it was a +190 MiB high-water mark that outlived
+    the test. The self-test's dozen `related_targets` calls pay the re-read; the
+    regex scan they also repeat costs more than the read does.
+    """
     try:
         return (root / rel).read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -617,6 +627,30 @@ def frontend_argv(targets: list[str] | None) -> list[str]:
 # per-argument quoting Windows adds that a plain `" ".join` does not see.
 ARGV_CHAR_LIMIT = 24_000
 
+# 32,767 is the CreateProcess ceiling, and the backend runner (`sys.executable
+# -m pytest`) is launched that way -- but the frontend runner is `npx`, and what
+# `shutil.which("npx")` returns on a Windows checkout is `npx.cmd`, a batch-file
+# shim. A `.cmd`/`.bat` shim is run THROUGH cmd.exe, whose command line is
+# capped at ~8,191 chars, far below CreateProcess's. A batch sized by
+# ARGV_CHAR_LIMIT (24,000) sails under CreateProcess but blows through cmd.exe,
+# so the whole selected set lands in one argv and the gate dies with "The
+# command line is too long." before Vitest even starts (#22727). When the
+# resolved launcher is such a shim the batch budget drops to this cmd-safe bound
+# -- the complete selected set and its order are kept, just split into more,
+# smaller batches. The margin below 8,191 covers the per-argument quoting cmd.exe
+# adds that a plain `" ".join` does not see, same reasoning as ARGV_CHAR_LIMIT.
+CMD_ARGV_CHAR_LIMIT = 7_000
+
+# Launcher suffixes that route a command line through cmd.exe rather than being
+# executed directly by CreateProcess. Lower-cased for a case-insensitive match,
+# because Windows paths are case-insensitive (`NPX.CMD` is the same shim).
+_CMD_SHIM_SUFFIXES = (".cmd", ".bat")
+
+
+def _launcher_through_cmd(launcher: str) -> bool:
+    """True when ``launcher`` is a cmd.exe batch shim (``*.cmd`` / ``*.bat``)."""
+    return Path(launcher).suffix.lower() in _CMD_SHIM_SUFFIXES
+
 
 def argv_batches(
     build: Callable[[list[str] | None], list[str]],
@@ -630,10 +664,19 @@ def argv_batches(
     fixed cost of the argv is measured from one real build rather than guessed,
     so a change to the runner's flags cannot silently push a batch over the
     limit.
+
+    The ``limit`` is further clamped to :data:`CMD_ARGV_CHAR_LIMIT` when the
+    resolved launcher is a cmd.exe batch shim (a Windows ``npx.cmd`` / ``npm.cmd``),
+    because that launcher's command line is bounded by cmd.exe's ~8,191, not by
+    CreateProcess's 32,767. The clamp is driven by the launcher the ``build``
+    callable actually resolved, so a POSIX checkout (bare ``npx``) and the
+    backend runner (``sys.executable``) are untouched (#22727).
     """
     if not targets:
         return []
     probe = build([targets[0]])
+    if probe and _launcher_through_cmd(probe[0]):
+        limit = min(limit, CMD_ARGV_CHAR_LIMIT)
     fixed = len(" ".join(probe)) - len(targets[0])
     batches: list[list[str]] = []
     current: list[str] = []
@@ -817,9 +860,13 @@ def main(argv: list[str]) -> int:
         )
         return 0
     if len(cmds) > 1:
+        # argv_batches is the sole owner of the limit, so report the bound it
+        # actually held the batches under -- their widest joined argv -- rather
+        # than recomputing a limit here (#22727).
+        widest = max(len(" ".join(cmd)) for cmd in cmds)
         print(
             f"run_scoped_tests[{args.surface}]: {len(targets)} target(s) in {len(cmds)} "
-            f"batch(es) so no argv exceeds {ARGV_CHAR_LIMIT} chars"
+            f"batch(es), widest argv {widest} chars"
         )
     for cmd in cmds:
         print(f"run_scoped_tests[{args.surface}]: $ {' '.join(cmd[:12])}{' ...' if len(cmd) > 12 else ''}")
@@ -1100,6 +1147,106 @@ def _self_test() -> int:
     fe_batches = argv_batches(frontend_argv, ["src/test/i18nGateTable.test.ts"])
     check("frontend batching goes through frontend_argv", len(fe_batches) == 1 and "vitest" in fe_batches[0])
 
+    # #22727: the frontend launcher on Windows is `npx.cmd`, a batch-file shim run
+    # through cmd.exe, whose command line is capped at ~8,191 -- far below
+    # CreateProcess's 32,767. A related set that fits in ONE batch under the
+    # 24,000 CreateProcess budget would still crash the shim, so when the resolved
+    # launcher is a `.cmd`/`.bat` the budget must drop to CMD_ARGV_CHAR_LIMIT and
+    # the SAME set split into more, smaller batches -- never trimmed, never a
+    # full-suite fallback. The clamp is driven by the launcher the builder
+    # resolves, so POSIX (`npx`) and the backend runner (`sys.executable`) are
+    # untouched.
+    check(
+        "the cmd-shim budget is strictly below the CreateProcess budget",
+        CMD_ARGV_CHAR_LIMIT < ARGV_CHAR_LIMIT,
+    )
+    check("the cmd-shim budget leaves margin under cmd.exe's ~8,191", CMD_ARGV_CHAR_LIMIT < 8_191)
+    check(
+        "a `.cmd` launcher is recognised as a cmd.exe shim",
+        _launcher_through_cmd(r"C:\\nodejs\\npx.cmd"),
+    )
+    check(
+        "a `.CMD` launcher is recognised case-insensitively",
+        _launcher_through_cmd(r"C:\\nodejs\\NPX.CMD"),
+    )
+    check(
+        "a `.bat` launcher is recognised as a cmd.exe shim",
+        _launcher_through_cmd(r"C:\\nodejs\\npx.bat"),
+    )
+    check(
+        "a bare posix `npx` launcher is NOT a cmd.exe shim",
+        not _launcher_through_cmd("/usr/bin/npx"),
+    )
+    check(
+        "the python backend launcher is NOT a cmd.exe shim",
+        not _launcher_through_cmd(sys.executable),
+    )
+    # Real website-relative specs, enough that one CreateProcess-budget batch
+    # overflows cmd.exe but many cmd-budget batches do not.
+    fe_tree = [
+        p[len("website/") :]
+        for p in _tree_files(REPO_ROOT, _FRONTEND_SPEC_ROOTS, _FRONTEND_SPEC_NAME)
+    ]
+    check("enough real frontend specs to exercise the cmd clamp", len(fe_tree) > 200)
+
+    def _fe_build(launcher: str):
+        """A frontend_argv variant whose launcher is ``launcher`` verbatim.
+
+        The launcher is substituted EXPLICITLY rather than taken from
+        ``_node_launcher``: on a real Windows host `shutil.which("npx")` returns
+        `npx.cmd`, so a build that relied on host resolution would clamp on
+        Windows and not on Linux, and the assertions below would hold on one host
+        and fail on the other (#22727). Pinning the launcher makes the verdict the
+        same on every host.
+        """
+
+        def build(targets: list[str] | None) -> list[str]:
+            return [launcher, *frontend_argv(targets)[1:]]
+
+        return build
+
+    # Pick a prefix of the real specs that is one batch under 24,000 but over
+    # cmd.exe's limit -- exactly the #22727 shape.
+    fe_subset: list[str] = []
+    for spec in fe_tree:
+        trial = fe_subset + [spec]
+        if len(" ".join(frontend_argv(trial))) > ARGV_CHAR_LIMIT:
+            break
+        fe_subset = trial
+    check("the repro subset is a realistic size", len(fe_subset) > 50)
+    bare_batches = argv_batches(_fe_build("/usr/bin/npx"), fe_subset)
+    check(
+        "a non-shim launcher keeps the set in one CreateProcess-budget batch",
+        len(bare_batches) == 1,
+    )
+    cmd_batches = argv_batches(_fe_build(r"C:\\nodejs\\npx.cmd"), fe_subset)
+    check("a cmd-shim launcher splits the same set into several batches", len(cmd_batches) > 1)
+    check(
+        "every cmd-shim batch's joined argv stays under cmd.exe's budget",
+        all(len(" ".join(b)) <= CMD_ARGV_CHAR_LIMIT for b in cmd_batches),
+    )
+    cmd_flat = [t for b in cmd_batches for t in b[b.index("run") + 1 :]]
+    check("the cmd clamp keeps every target exactly once, in order", cmd_flat == fe_subset)
+    check(
+        "the cmd clamp never trims or falls back to the full suite",
+        "--prefix" not in [tok for b in cmd_batches for tok in b],
+    )
+    # Patch the launcher RESOLVER so the real `frontend_argv` resolves `npx` to a
+    # `.cmd` shim, as it would on a native Windows checkout, and confirm the clamp
+    # fires through the production path rather than only through the fake-launcher
+    # builder above.
+    _real_which = shutil.which
+    shutil.which = lambda name: rf"C:\\nodejs\\{name}.cmd"  # noqa: E731
+    try:
+        resolved_batches = argv_batches(frontend_argv, fe_subset)
+    finally:
+        shutil.which = _real_which
+    check(
+        "a resolved `.cmd` launcher clamps the real frontend_argv path",
+        len(resolved_batches) > 1
+        and all(len(" ".join(b)) <= CMD_ARGV_CHAR_LIMIT for b in resolved_batches),
+    )
+
     # Reference tokens: a python module contributes its stem (that is what an
     # import or an importlib string spells), a non-python file does not, because a
     # bare `SKILL.md` matches nearly everything that mentions a skill.
@@ -1107,9 +1254,9 @@ def _self_test() -> int:
     check("python tokens carry the stem", "session" in py_tokens)
     check("python tokens carry the dotted path", "kiro_crew.session" in py_tokens)
     check("python tokens carry the repo path", "src/kiro_crew/session.py" in py_tokens)
-    md_tokens = reference_tokens("src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/SKILL.md")
+    md_tokens = reference_tokens("src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/SKILL.md")
     check("a non-python file does not contribute a bare basename", "SKILL.md" not in md_tokens)
-    check("a non-python file contributes its last two components", "prepare-pr/SKILL.md" in md_tokens)
+    check("a non-python file contributes its last two components", "kirocrew-prepare-pr/SKILL.md" in md_tokens)
     check(
         "a bare stem is word-bounded, not a substring",
         not _reference_matcher({"session"}).search("sessions_view"),

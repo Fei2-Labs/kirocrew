@@ -10,7 +10,11 @@
  * the text, because the verdict decides whether the panel offers an editor at
  * all. It is read from the `X-File-Binary` header, not from the body: a `.json`
  * TEXT file is served as `application/json` too, so the content type cannot
- * tell the two apart.
+ * tell the two apart. The same goes for the two PARTIAL verdicts -- the body
+ * was cut at the gateway's cap (`X-Truncated`) or had credentials redacted
+ * (`X-Redacted`): a body cannot tell either about itself (a whole file may
+ * quote the redaction tag verbatim), so they ride in headers, and the panel
+ * that keeps the last copy of a deleted file names a partial one as partial.
  */
 import { fileReadUrl } from './fileReadUrl'
 
@@ -23,6 +27,21 @@ export interface FileReadResult {
   status: number
   /** The backend's verdict for the bytes THIS read saw. */
   binary: boolean
+  /** The body is a prefix: the gateway cut the read at its character cap. */
+  truncated: boolean
+  /** The body is not the file as written: the credential pass rewrote it. */
+  redacted: boolean
+  /** The body is not the file as written: the bytes were not valid UTF-8 and
+   *  the decode substituted replacement characters (`X-Lossy-Decode`). */
+  lossy: boolean
+}
+
+/** Whether a read handed over less than the file as written -- the verdict a
+ *  tab carries as `partial`, so a copy of a deleted file is never offered under
+ *  the file's own name as if whole. One predicate for every caller that stamps
+ *  a tab, so no site can forget a header the gateway adds. */
+export function isPartialRead(r: Pick<FileReadResult, 'truncated' | 'redacted' | 'lossy'>): boolean {
+  return r.truncated || r.redacted || r.lossy
 }
 
 /** How long a read of one path stays fresh. Shared by every caller of the key
@@ -46,5 +65,8 @@ export async function fetchFileRead(filePath: string, signal?: AbortSignal): Pro
     ok: res.ok,
     status: res.status,
     binary,
+    truncated: res.headers.get('X-Truncated') === 'true',
+    redacted: res.headers.get('X-Redacted') === 'true',
+    lossy: res.headers.get('X-Lossy-Decode') === 'true',
   }
 }

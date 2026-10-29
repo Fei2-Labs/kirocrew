@@ -6,31 +6,48 @@ HTTPS model download from the CDN (``ModelDownloadManager``). These tests
 never load a real model and never hit the network: the vendored Llama class
 is replaced with fakes and ``urllib.request.urlopen`` is monkeypatched (on
 ``asset_downloader``, which owns the transfer).
+
+This file holds model paths, the GGUF context policy, ``LlamaCppEmbedder``, the
+download manager, ``make_sync_embed_fn``, the background download and the singletons.
+The bundled-library loader gates are in ``test_embeddings_bundled_libs.py``, thread
+pinning and the inference queue in ``test_embeddings_threads.py``, and idle eviction
+and the cold load in ``test_embeddings_idle_eviction.py``. ``embeddings_helpers.py``
+holds the fakes and the autouse singleton reset the four share.
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import io
+import mmap
 import os
-import sys
+import struct
 import threading
-import time
 import urllib.error
-from functools import lru_cache
+from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import embeddings_helpers
 import pytest
+from embeddings_helpers import (
+    _DIM,
+    _MODEL_SIZE,
+    _live_embed_threads,
+    _make_failing_llama_class,
+    _make_fake_llama_class,
+    _model_bytes,
+    _write_model_file,
+)
 
 import kiro_crew.embeddings as embeddings_mod
 from kiro_crew.embeddings import (
     _DOWNLOAD_MAX_ATTEMPTS,
     LlamaCppEmbedder,
     ModelDownloadManager,
-    _platform_libs_dirname,
     default_model_path,
     get_shared_embedder,
     make_sync_embed_fn,
@@ -41,278 +58,65 @@ from kiro_crew.embeddings import (
     reset_shared_embedder,
     start_background_model_download,
 )
+from kiro_crew.testing.wait import wait_until
 
-# Captured at import so the lru_cache can always be cleared even while a test
-# has monkeypatched the module attribute ``_load_llama_class``.
-_REAL_LOAD_LLAMA = embeddings_mod._load_llama_class
-
-_DIM = 1024
-# Wider than the production floor so model_file_present() does not read the file
-# as a truncated placeholder.
-_MODEL_SIZE = embeddings_mod._GGUF_MIN_BYTES + 100_000
+# The shared autouse fixture, bound here by name so pytest registers it for this module.
+_reset_embedding_singletons = embeddings_helpers._reset_embedding_singletons
 
 
-@lru_cache(maxsize=1)
-def _model_bytes() -> bytes:
-    """Stand-in GGUF payload, built on first use rather than at import.
-
-    These tests assert on the bytes (sha256 pins, byte-identity after salvage),
-    so the payload cannot shrink. Building it at module scope instead would
-    allocate it while the module is IMPORTED, so every xdist worker would pay it
-    during collection and hold it for the session -- including the workers that
-    never run this file.
-    """
-    return b"g" * _MODEL_SIZE
+def _gguf_string(value: str) -> bytes:
+    """Pack one GGUF string: a little-endian uint64 byte length, then UTF-8."""
+    encoded = value.encode("utf-8")
+    return struct.pack("<Q", len(encoded)) + encoded
 
 
-@pytest.fixture(autouse=True)
-def _reset_embedding_singletons():
-    """Isolate the shared embedder / download manager singletons per test."""
-    reset_shared_embedder()
-    reset_download_manager()
-    _REAL_LOAD_LLAMA.cache_clear()
-    yield
-    reset_shared_embedder()
-    reset_download_manager()
-    _REAL_LOAD_LLAMA.cache_clear()
+def _gguf_header(
+    architecture: str,
+    *,
+    pooling_type: int | None = None,
+    causal: bool | None = None,
+    context_length: int | None = None,
+) -> bytes:
+    """Pack a minimal GGUF v3 KV header: magic, version, no tensors, the KV list."""
+    metadata = [("general.architecture", 8, _gguf_string(architecture))]
+    if pooling_type is not None:
+        metadata.append((f"{architecture}.pooling_type", 4, struct.pack("<I", pooling_type)))
+    if causal is not None:
+        # GGUF_TYPE_BOOL, the type gguf-py's add_causal_attention() writes.
+        metadata.append((f"{architecture}.attention.causal", 7, struct.pack("<?", causal)))
+    if context_length is not None:
+        # GGUF_TYPE_UINT32, the type gguf-py's add_context_length() writes.
+        metadata.append((f"{architecture}.context_length", 4, struct.pack("<I", context_length)))
+    payload = bytearray(struct.pack("<4sIQQ", b"GGUF", 3, 0, len(metadata)))
+    for key, value_type, value in metadata:
+        payload.extend(_gguf_string(key))
+        payload.extend(struct.pack("<I", value_type))
+        payload.extend(value)
+    return bytes(payload)
 
 
-def _write_model_file(path: Path, payload: bytes | None = None) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_model_bytes() if payload is None else payload)
-    return path
-
-
-def _make_fake_llama_class(dim: int = _DIM):
-    """Return a fresh fake Llama class recording constructor + embed calls."""
-
-    class _FakeLlama:
-        instances: list = []
-        init_attempts: int = 0
-        embed_error: Exception | None = None
-        response_override: dict | None = None
-
-        def __init__(self, **kwargs):
-            type(self).init_attempts += 1
-            self.kwargs = kwargs
-            self.embed_calls: list[list[str]] = []
-            type(self).instances.append(self)
-
-        def create_embedding(self, texts):
-            error = type(self).embed_error
-            if error is not None:
-                raise error
-            self.embed_calls.append(list(texts))
-            if type(self).response_override is not None:
-                return type(self).response_override
-            return {"data": [{"embedding": [0.1] * dim} for _ in texts]}
-
-    return _FakeLlama
-
-
-def _make_failing_llama_class():
-    """Return a fake Llama class whose constructor always raises."""
-
-    class _FailLlama:
-        init_attempts: int = 0
-
-        def __init__(self, **kwargs):
-            type(self).init_attempts += 1
-            raise RuntimeError("corrupt model file")
-
-    return _FailLlama
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# _platform_libs_dirname
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestPlatformLibsDirname:
-    @pytest.mark.parametrize(
-        ("platform_str", "machine", "expected"),
-        [
-            ("linux", "x86_64", "linux_x86_64"),
-            ("linux", "amd64", "linux_x86_64"),
-            ("linux", "aarch64", "linux_aarch64"),
-            ("linux", "arm64", "linux_aarch64"),
-            ("linux", "AARCH64", "linux_aarch64"),  # machine is lowercased
-            ("darwin", "arm64", "macos_arm64"),
-            ("darwin", "x86_64", "macos_x86_64"),  # Intel Mac (universal DMG x64 slice)
-            ("win32", "amd64", "win_amd64"),
-            ("win32", "x86_64", "win_amd64"),
-        ],
+def _write_gguf_model(
+    path: Path,
+    *,
+    architecture: str,
+    pooling_type: int | None = None,
+    causal: bool | None = None,
+    context_length: int | None = None,
+    size: int = _MODEL_SIZE,
+) -> Path:
+    """Write a minimal GGUF v3 KV header padded past the production size gate."""
+    header = _gguf_header(
+        architecture, pooling_type=pooling_type, causal=causal, context_length=context_length
     )
-    def test_supported_platforms(
-        self, monkeypatch, platform_str: str, machine: str, expected: str
-    ) -> None:
-        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", platform_str)
-        monkeypatch.setattr("kiro_crew.embeddings.platform.machine", lambda: machine)
-        assert _platform_libs_dirname() == expected
-
-    @pytest.mark.parametrize(
-        ("platform_str", "machine"),
-        [
-            ("linux", "ppc64le"),
-            ("darwin", "ppc"),
-            ("win32", "arm64"),
-            ("sunos5", "x86_64"),
-            ("aix", "aarch64"),
-        ],
-    )
-    def test_unsupported_combos_return_none(
-        self, monkeypatch, platform_str: str, machine: str
-    ) -> None:
-        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", platform_str)
-        monkeypatch.setattr("kiro_crew.embeddings.platform.machine", lambda: machine)
-        assert _platform_libs_dirname() is None
+    return _write_model_file(path, header.ljust(size, b"\0"))
 
 
-def _stub_bundled_linux_libs(root: Path) -> None:
-    libs = root / embeddings_mod._LIBS_DIR_NAME / "linux_x86_64"
-    libs.mkdir(parents=True)
-    for name in embeddings_mod._REQUIRED_VENDORED_LIBS["linux_x86_64"]:
-        (libs / name).write_bytes(b"\x7fELF")
-
-
-def _load_bundled_linux_llama(monkeypatch, vendor: Path, cpu_probe):
-    env_was_set = embeddings_mod._LIB_PATH_ENV in os.environ
-    prior_env = os.environ.get(embeddings_mod._LIB_PATH_ENV)
-    monkeypatch.setattr(embeddings_mod, "_VENDOR_DIR", vendor)
-    monkeypatch.setattr(embeddings_mod, "_platform_libs_dirname", lambda: "linux_x86_64")
-    monkeypatch.setattr(embeddings_mod, "_linux_x86_64_cpu_flags", cpu_probe)
-    embeddings_mod._load_llama_class.cache_clear()
-    try:
-        result = embeddings_mod._load_llama_class()
-        active_lib_path = os.environ.get(embeddings_mod._LIB_PATH_ENV)
-        return result, active_lib_path
-    finally:
-        embeddings_mod._load_llama_class.cache_clear()
-        if env_was_set:
-            assert prior_env is not None
-            os.environ[embeddings_mod._LIB_PATH_ENV] = prior_env
-        else:
-            os.environ.pop(embeddings_mod._LIB_PATH_ENV, None)
-
-
-class TestBundledLinuxX86CpuGate:
-    def test_cpuinfo_parser_normalizes_sse3_and_intersects_processors(self, tmp_path: Path) -> None:
-        cpuinfo = tmp_path / "cpuinfo"
-        cpuinfo.write_text(
-            "processor: 0\nflags: pni ssse3 avx avx2 bmi2 f16c fma\n\n"
-            "processor: 1\nflags: pni ssse3 avx bmi2 f16c fma\n",
-            encoding="utf-8",
-        )
-
-        flags = embeddings_mod._linux_x86_64_cpu_flags(cpuinfo)
-
-        assert flags is not None
-        assert "sse3" in flags
-        assert "avx" in flags
-        assert "avx2" not in flags
-
-    def test_unreadable_cpuinfo_is_unknown(self, tmp_path: Path) -> None:
-        assert embeddings_mod._linux_x86_64_cpu_flags(tmp_path / "missing") is None
-
-    def test_compatible_cpu_continues_to_native_import(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
-        _stub_bundled_linux_libs(tmp_path)
-        fake_llama_cpp = ModuleType("llama_cpp")
-        expected = object()
-        setattr(fake_llama_cpp, "Llama", expected)
-        monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
-
-        result, active_lib_path = _load_bundled_linux_llama(
-            monkeypatch,
-            tmp_path,
-            lambda: embeddings_mod._LINUX_X86_64_REQUIRED_CPU_FLAGS,
-        )
-
-        assert result is expected
-        assert active_lib_path is not None
-        assert Path(active_lib_path).parts[-2:] == ("llama_cpp_libs", "linux_x86_64")
-        assert embeddings_mod._LIB_PATH_ENV not in os.environ
-
-    def test_runtime_import_hardens_locale_encoded_null_streams(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
-        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
-        _stub_bundled_linux_libs(tmp_path)
-        fake_llama_cpp = ModuleType("llama_cpp")
-        expected = object()
-        setattr(fake_llama_cpp, "Llama", expected)
-        monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
-
-        fake_utils = ModuleType("llama_cpp._utils")
-        stdout_sink = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
-        stderr_sink = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
-        setattr(fake_utils, "outnull_file", stdout_sink)
-        setattr(fake_utils, "errnull_file", stderr_sink)
-        monkeypatch.setitem(sys.modules, "llama_cpp._utils", fake_utils)
-
-        result, _active_lib_path = _load_bundled_linux_llama(
-            monkeypatch,
-            tmp_path,
-            lambda: embeddings_mod._LINUX_X86_64_REQUIRED_CPU_FLAGS,
-        )
-
-        assert result is expected
-        assert stdout_sink.encoding == "utf-8"
-        assert stderr_sink.encoding == "utf-8"
-        stdout_sink.write("👻")
-        stderr_sink.write("👻")
-
-    def test_missing_cpu_features_refuse_before_native_import(
-        self, tmp_path: Path, monkeypatch, caplog
-    ) -> None:
-        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
-        _stub_bundled_linux_libs(tmp_path)
-
-        with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
-            result, active_lib_path = _load_bundled_linux_llama(
-                monkeypatch, tmp_path, lambda: frozenset({"sse3", "ssse3"})
-            )
-
-        assert result is None
-        assert active_lib_path is None
-        assert "missing avx, avx2, bmi2, f16c, fma" in caplog.text
-        assert "SIGILL" in caplog.text
-        assert embeddings_mod._LIB_PATH_ENV not in os.environ
-
-    def test_unknown_cpu_features_fail_closed(self, tmp_path: Path, monkeypatch, caplog) -> None:
-        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
-        _stub_bundled_linux_libs(tmp_path)
-
-        with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
-            result, active_lib_path = _load_bundled_linux_llama(monkeypatch, tmp_path, lambda: None)
-
-        assert result is None
-        assert active_lib_path is None
-        assert "Cannot verify CPU compatibility" in caplog.text
-        assert embeddings_mod._LIB_PATH_ENV not in os.environ
-
-    def test_operator_override_bypasses_the_bundled_cpu_gate(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
-        _stub_bundled_linux_libs(tmp_path)
-        override = tmp_path / "operator-libs"
-        override.mkdir()
-        monkeypatch.setenv(embeddings_mod._LIB_PATH_ENV, str(override))
-        fake_llama_cpp = ModuleType("llama_cpp")
-        expected = object()
-        setattr(fake_llama_cpp, "Llama", expected)
-        monkeypatch.setitem(sys.modules, "llama_cpp", fake_llama_cpp)
-
-        def unexpected_cpu_probe():
-            raise AssertionError("operator runtime must not use the bundled CPU gate")
-
-        result, active_lib_path = _load_bundled_linux_llama(
-            monkeypatch, tmp_path, unexpected_cpu_probe
-        )
-
-        assert result is expected
-        assert active_lib_path == str(override)
-        assert os.environ[embeddings_mod._LIB_PATH_ENV] == str(override)
+# (n_ctx, n_batch, n_ubatch) the policy hands llama.cpp. Every file's window is
+# clamped to the trained position count its GGUF declares (at most _N_CTX);
+# decoder files keep the shipped micro-batch, bounded by the batch, and a
+# non-causal file gets one micro-batch the size of its whole batch.
+_DECODER_SIZES = (embeddings_mod._N_CTX, embeddings_mod._N_CTX, embeddings_mod._N_UBATCH)
+_ENCODER_SIZES = (embeddings_mod._N_CTX,) * 3
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -349,6 +153,463 @@ class TestModelPaths:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# GGUF context policy
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestModelContextPolicy:
+    @pytest.mark.parametrize(
+        "architecture",
+        [
+            "bert",
+            "dream",
+            "eurobert",
+            "gemma-embedding",
+            "jina-bert-v2",
+            "jina-bert-v3",
+            "llada",
+            "llada-moe",
+            "modern-bert",
+            "neo-bert",
+            "nomic-bert",
+            "nomic-bert-moe",
+            "rnd1",
+            "t5encoder",
+            "wavtokenizer-dec",
+        ],
+    )
+    def test_known_encoder_architecture_uses_full_micro_batch(
+        self, tmp_path: Path, architecture: str
+    ) -> None:
+        # Membership in the cache-less set decides the context sizes only.
+        model = _write_gguf_model(tmp_path / f"{architecture}.gguf", architecture=architecture)
+        assert embeddings_mod._model_context_policy(model) == _ENCODER_SIZES
+
+    def test_unknown_architecture_keeps_decoder_sizes(self, tmp_path: Path) -> None:
+        model = _write_gguf_model(tmp_path / "unknown.gguf", architecture="qwen3")
+        assert embeddings_mod._model_context_policy(model) == _DECODER_SIZES
+
+    def test_declared_non_causal_llama_embed_uses_full_micro_batch(self, tmp_path: Path) -> None:
+        # llama.cpp's LLaMA-shaped bidirectional embedder keeps a KV cache, so
+        # its decode() path asserts `n_ubatch >= n_tokens` exactly when the GGUF
+        # declares `<architecture>.attention.causal = false`.
+        model = _write_gguf_model(
+            tmp_path / "llama-embed.gguf", architecture="llama-embed", causal=False
+        )
+        assert embeddings_mod._model_context_policy(model) == _ENCODER_SIZES
+
+    def test_declared_non_causal_unlisted_architecture_uses_full_micro_batch(
+        self, tmp_path: Path
+    ) -> None:
+        # The runtime reads the causal key for every architecture, so a decoder
+        # family re-tagged as bidirectional trips the same assertion.
+        model = _write_gguf_model(
+            tmp_path / "llama-bidirectional.gguf", architecture="llama", causal=False
+        )
+        assert embeddings_mod._model_context_policy(model) == _ENCODER_SIZES
+
+    def test_llama_embed_without_causal_key_keeps_decoder_path(self, tmp_path: Path) -> None:
+        # Without the key the vendored runtime defaults causal_attn to true and
+        # runs llama-embed causally, so the assertion cannot fire and the
+        # lower-RSS micro-batch stays.
+        model = _write_gguf_model(tmp_path / "llama-embed-causal.gguf", architecture="llama-embed")
+        assert embeddings_mod._model_context_policy(model) == _DECODER_SIZES
+
+    def test_declared_causal_encoder_architecture_still_uses_full_micro_batch(
+        self, tmp_path: Path
+    ) -> None:
+        # Cache-less encoder families run through encode(), which asserts on
+        # the token count whatever the causal key says.
+        model = _write_gguf_model(tmp_path / "bert-causal.gguf", architecture="bert", causal=True)
+        assert embeddings_mod._model_context_policy(model) == _ENCODER_SIZES
+
+    def test_unreadable_metadata_keeps_decoder_sizes(self, tmp_path: Path, caplog) -> None:
+        # A file that is not GGUF at all (or is truncated) loads exactly as
+        # before: the shipped sizes, with the failed read named once.
+        model = _write_model_file(tmp_path / "not-gguf.gguf")
+        with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
+            assert embeddings_mod._model_context_policy(model) == _DECODER_SIZES
+        assert "Could not read GGUF metadata" in caplog.text
+        assert model.name in caplog.text
+
+    @pytest.mark.parametrize(
+        ("kv_count", "kv_section", "message"),
+        [
+            pytest.param(
+                100_001,
+                # 100,001 complete entries: an empty key and a one-byte uint8.
+                lambda: struct.pack("<QIB", 0, 0, 0) * 100_001,
+                "oversized GGUF metadata table",
+                id="100001-metadata-items",
+            ),
+            pytest.param(
+                1,
+                # One uint8 array of 2,000,001 elements, every element present.
+                lambda: (
+                    _gguf_string("tokenizer.ggml.token_type")
+                    + struct.pack("<IIQ", 9, 0, 2_000_001)
+                    + bytes(2_000_001)
+                ),
+                "oversized GGUF metadata array",
+                id="2000001-array-items",
+            ),
+            pytest.param(
+                1,
+                # A captured string value of 1,000,001 bytes, every byte present.
+                lambda: (
+                    _gguf_string("general.architecture")
+                    + struct.pack("<IQ", 8, 1_000_001)
+                    + b"a" * 1_000_001
+                ),
+                "oversized GGUF metadata string",
+                id="1000001-string-bytes",
+            ),
+        ],
+    )
+    def test_header_one_past_each_cap_is_rejected_by_that_cap(
+        self,
+        tmp_path: Path,
+        kv_count: int,
+        kv_section: Callable[[], bytes],
+        message: str,
+    ) -> None:
+        # The limits are the contract, so they are spelled out here instead of
+        # read from the module. Each header sits one past a cap and is otherwise
+        # complete -- every byte it declares is in the file -- so a loosened or
+        # removed cap lets the reader walk it to a successful return and this
+        # fails with DID NOT RAISE rather than matching some other error.
+        model = tmp_path / "oversized.gguf"
+        model.write_bytes(struct.pack("<4sIQQ", b"GGUF", 3, 0, kv_count) + kv_section())
+        with pytest.raises(ValueError, match=message):
+            embeddings_mod._read_gguf_embedding_metadata(model)
+
+    # A complete header whose cut points the truncation cases below share:
+    # 24 preamble bytes, then general.architecture, bert.attention.causal and
+    # bert.context_length (a uint32, so the last four bytes are its value).
+    _CUTTABLE_HEADER = _gguf_header("bert", causal=False, context_length=512)
+
+    @pytest.mark.parametrize(
+        "cut",
+        [
+            pytest.param(0, id="empty-file"),
+            pytest.param(3, id="inside-magic"),
+            pytest.param(20, id="inside-preamble-kv-count"),
+            pytest.param(24 + 8 + 7, id="inside-first-key"),
+            pytest.param(len(_CUTTABLE_HEADER) - 2, id="inside-last-value"),
+        ],
+    )
+    def test_header_cut_mid_metadata_is_reported_as_truncated(
+        self, tmp_path: Path, cut: int
+    ) -> None:
+        # A file shorter than its header declares is refused with the one
+        # truncation error, wherever the cut falls -- the empty file included,
+        # which a mapping cannot even be built over. _model_context_policy
+        # turns the ValueError into the decoder sizes plus one WARNING.
+        model = tmp_path / "cut.gguf"
+        model.write_bytes(self._CUTTABLE_HEADER[:cut])
+        with pytest.raises(ValueError, match="^truncated GGUF header$"):
+            embeddings_mod._read_gguf_embedding_metadata(model)
+
+    @pytest.mark.parametrize(
+        "cut",
+        [
+            pytest.param(20, id="inside-preamble-kv-count"),
+            pytest.param(24 + 8 + 7, id="inside-first-key"),
+            pytest.param(len(_CUTTABLE_HEADER) - 2, id="inside-last-value"),
+        ],
+    )
+    def test_header_that_shrinks_under_the_parse_is_reported_as_truncated(self, cut: int) -> None:
+        # The file size sampled when the file was opened says the header is
+        # complete, but the bytes are gone by the time they are read -- the
+        # shape of an in-place truncation during the parse. A read that comes
+        # up short is the same ValueError, where a mapping built over the
+        # original length would take SIGBUS on the vanished page.
+        source = io.BytesIO(self._CUTTABLE_HEADER[:cut])
+        with pytest.raises(ValueError, match="^truncated GGUF header$"):
+            embeddings_mod._parse_gguf_embedding_metadata(source, len(self._CUTTABLE_HEADER))
+
+    def test_header_reader_never_maps_the_file(self, tmp_path: Path, monkeypatch) -> None:
+        # Plain bounded reads only: a mapping's length is fixed when it is
+        # built, and a file truncated in place afterwards turns an access past
+        # the new end into an uncatchable SIGBUS in the gateway process.
+        def _refuse_mapping(*args, **kwargs):
+            raise AssertionError("the GGUF header reader must not map the file")
+
+        monkeypatch.setattr(mmap, "mmap", _refuse_mapping)
+        model = _write_gguf_model(tmp_path / "bert.gguf", architecture="bert", context_length=512)
+        assert embeddings_mod._read_gguf_embedding_metadata(model) == ("bert", None, 512, None)
+
+    @pytest.mark.parametrize(
+        ("architecture", "causal", "context_length", "expected_sizes"),
+        [
+            # bge-small-en-v1.5 / multilingual-e5: 512 learned positions.
+            ("bert", None, 512, (512, 512, 512)),
+            # A declared-non-causal cached model is clamped the same way.
+            ("llama-embed", False, 1024, (1024, 1024, 1024)),
+            # nomic-embed-text: exactly the ceiling.
+            ("nomic-bert", None, 2048, _ENCODER_SIZES),
+            # A longer trained window never raises the ceiling.
+            ("bert", None, 8192, _ENCODER_SIZES),
+            # No key: the ceiling, as before.
+            ("bert", None, None, _ENCODER_SIZES),
+        ],
+        ids=["bert-512", "llama-embed-1024", "nomic-2048", "bert-8192", "bert-absent"],
+    )
+    def test_non_causal_context_is_clamped_to_the_trained_position_count(
+        self,
+        tmp_path: Path,
+        architecture: str,
+        causal: bool | None,
+        context_length: int | None,
+        expected_sizes: tuple[int, int, int],
+    ) -> None:
+        # An encoder with learned absolute positions indexes a table of
+        # n_ctx_train rows; a token past it aborts the process in ggml's
+        # get_rows. Sizing the logical batch to that count makes the vendored
+        # binding truncate a longer input instead.
+        model = _write_gguf_model(
+            tmp_path / f"{architecture}-{context_length}.gguf",
+            architecture=architecture,
+            causal=causal,
+            context_length=context_length,
+        )
+        assert embeddings_mod._model_context_policy(model) == expected_sizes
+
+    @pytest.mark.parametrize(
+        ("architecture", "context_length", "expected_sizes"),
+        [
+            # gpt2: 1,024 learned absolute positions; the micro-batch stays 256.
+            ("gpt2", 1024, (1024, 1024, 256)),
+            # A decoder trained for twice the micro-batch count.
+            ("starcoder", 512, (512, 512, 256)),
+            # A decoder trained for exactly the micro-batch count.
+            ("gpt2", 256, (256, 256, 256)),
+            # Below the micro-batch: n_ubatch may never exceed n_batch.
+            ("gpt2", 128, (128, 128, 128)),
+            # Qwen3-Embedding declares 32,768: the ceiling, the shipped sizes.
+            ("qwen3", 32768, _DECODER_SIZES),
+            ("qwen3", 8192, _DECODER_SIZES),
+            ("qwen3", None, _DECODER_SIZES),
+        ],
+        ids=[
+            "gpt2-1024",
+            "starcoder-512",
+            "gpt2-256",
+            "gpt2-128",
+            "qwen3-32768",
+            "qwen3-8192",
+            "qwen3-absent",
+        ],
+    )
+    def test_decoder_context_is_clamped_to_the_trained_position_count(
+        self,
+        tmp_path: Path,
+        architecture: str,
+        context_length: int | None,
+        expected_sizes: tuple[int, int, int],
+    ) -> None:
+        # Causal architectures with learned absolute positions (gpt2, starcoder)
+        # index the same position table an encoder does, so the clamp applies
+        # to every file; only the micro-batch shape differs by causality.
+        model = _write_gguf_model(
+            tmp_path / f"{architecture}-{context_length}.gguf",
+            architecture=architecture,
+            context_length=context_length,
+        )
+        assert embeddings_mod._model_context_policy(model) == expected_sizes
+
+    def test_encoder_sizes_reach_llama_constructor_with_last_token_pooling(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        # The file declares mean pooling (1); the constructor still receives the
+        # explicit last-token value, so the runtime never reads the GGUF's key
+        # and every model keeps the pooling earlier releases requested.
+        fake_cls = _make_fake_llama_class()
+        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
+        model = _write_gguf_model(tmp_path / "bert.gguf", architecture="bert", pooling_type=1)
+        embedder = LlamaCppEmbedder(model_path=model)
+        try:
+            assert embedder.wait_ready(timeout=5)
+        finally:
+            embedder.close()
+        kwargs = fake_cls.instances[0].kwargs
+        assert kwargs["pooling_type"] == embeddings_mod._POOLING_TYPE_LAST
+        assert (kwargs["n_ctx"], kwargs["n_batch"], kwargs["n_ubatch"]) == _ENCODER_SIZES
+
+    @pytest.mark.parametrize(
+        ("architecture", "expected_sizes"),
+        [("bert", (512, 512, 512)), ("gpt2", (512, 512, 256))],
+        ids=["encoder", "decoder"],
+    )
+    def test_trained_position_count_reaches_llama_constructor_with_one_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        caplog,
+        architecture: str,
+        expected_sizes: tuple[int, int, int],
+    ) -> None:
+        # The WARNING follows the clamp, whatever the model's causality.
+        fake_cls = _make_fake_llama_class()
+        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
+        model = _write_gguf_model(
+            tmp_path / f"{architecture}-512.gguf", architecture=architecture, context_length=512
+        )
+        threads_before = _live_embed_threads()
+        embedder = LlamaCppEmbedder(model_path=model)
+        try:
+            with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
+                assert embedder.wait_ready(timeout=5)
+                # Two embed calls, each over the model's window: the rule is
+                # stated by the load, never per call.
+                assert embedder.embed_batch(["x" * 6_000]) is not None
+                assert embedder.embed_batch(["y" * 6_000]) is not None
+        finally:
+            embedder.close()
+        # The embed calls started the inference worker; close() joined it, so
+        # this test leaves no kc-embed-* thread behind.
+        assert not (_live_embed_threads() - threads_before)
+        kwargs = fake_cls.instances[0].kwargs
+        assert (kwargs["n_ctx"], kwargs["n_batch"], kwargs["n_ubatch"]) == expected_sizes
+        truncation_warnings = [
+            record
+            for record in caplog.records
+            if record.levelname == "WARNING"
+            and "truncated to its first 512 tokens" in record.message
+        ]
+        assert len(truncation_warnings) == 1
+        assert model.name in truncation_warnings[0].message
+        assert "trained for 512 positions" in truncation_warnings[0].message
+
+    @pytest.mark.parametrize(
+        ("architecture", "context_length"),
+        [("qwen3", 32768), ("qwen3", None), ("bert", 2048), ("bert", None)],
+        ids=["decoder-32768", "decoder-absent", "encoder-at-ceiling", "encoder-absent"],
+    )
+    def test_no_truncation_warning_when_the_context_is_not_reduced(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        caplog,
+        architecture: str,
+        context_length: int | None,
+    ) -> None:
+        fake_cls = _make_fake_llama_class()
+        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
+        model = _write_gguf_model(
+            tmp_path / "model.gguf", architecture=architecture, context_length=context_length
+        )
+        embedder = LlamaCppEmbedder(model_path=model)
+        try:
+            with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
+                assert embedder.wait_ready(timeout=5)
+        finally:
+            embedder.close()
+        assert "truncated" not in caplog.text
+        assert fake_cls.instances[0].kwargs["n_ctx"] == embeddings_mod._N_CTX
+
+    def test_model_replaced_between_header_read_and_open_is_not_published(
+        self, tmp_path: Path, monkeypatch, caplog
+    ) -> None:
+        """The context is sized from the header of the file the runtime maps.
+
+        The loader reads the GGUF header once (the sizing policy) and the native
+        constructor opens the path again. An operator who replaces a custom model
+        at the same path between the two would otherwise get a context sized from
+        the OLD header on the NEW weights -- decoder sizes on an encoder here,
+        which is the >512-token abort this PR removes. The load must discard that
+        context; the retry after the failure cooldown sizes from the new header.
+        """
+        fake_cls = _make_fake_llama_class()
+        model = _write_gguf_model(tmp_path / "model.gguf", architecture="qwen3")
+
+        class _SwappingLlama(fake_cls):  # type: ignore[valid-type,misc]
+            """The first construction stands in for a native open that maps a
+            file atomically replaced after the header read; later ones do not."""
+
+            def __init__(self, **kwargs) -> None:
+                if not type(self).instances:
+                    replacement = _write_gguf_model(
+                        tmp_path / "replacement.gguf",
+                        architecture="bert",
+                        context_length=512,
+                        size=_MODEL_SIZE + 4096,
+                    )
+                    os.replace(replacement, model)
+                super().__init__(**kwargs)
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: _SwappingLlama)
+        monkeypatch.setattr("kiro_crew.embeddings._LLM_LOAD_RETRY_SECS", 0.0)
+        embedder = LlamaCppEmbedder(model_path=model)
+        try:
+            with caplog.at_level("WARNING", logger=embeddings_mod.__name__):
+                embedder.wait_ready(timeout=5)
+            stale = _SwappingLlama.instances[0]
+            stale_sizes = (stale.kwargs["n_ctx"], stale.kwargs["n_batch"], stale.kwargs["n_ubatch"])
+            assert stale_sizes == _DECODER_SIZES  # sized from the replaced header
+            assert not embedder.is_ready(), (
+                f"stale context published: sizes {stale_sizes} came from the replaced "
+                "file's header while the mapped file declares a 512-position encoder"
+            )
+            assert stale.closed
+            assert "changed on disk while it was being loaded" in caplog.text
+            assert model.name in caplog.text
+            # The cooldown (zeroed above) has elapsed: the retry re-reads the
+            # header of the file that is now on disk and publishes that context.
+            assert embedder.wait_ready(timeout=5)
+            fresh = _SwappingLlama.instances[1]
+            assert (fresh.kwargs["n_ctx"], fresh.kwargs["n_batch"], fresh.kwargs["n_ubatch"]) == (
+                512,
+                512,
+                512,
+            )
+            assert embedder._llm is fresh
+        finally:
+            embedder.close()
+        assert len(_SwappingLlama.instances) == 2
+
+    def test_vendored_embed_truncates_to_the_logical_batch_by_default(self) -> None:
+        """Pin the binding behaviour the trained-window clamp relies on.
+
+        ``_model_context_policy`` sizes ``n_batch`` to the trained position count
+        so that ``create_embedding()`` cuts a longer input to its first
+        ``n_batch`` tokens instead of indexing past the position table. That
+        only holds while the vendored ``Llama.embed`` defaults ``truncate`` to
+        True and ``create_embedding`` does not override it. Read as source, not
+        imported: importing the binding loads the native library.
+        """
+        source = (embeddings_mod._VENDOR_DIR / "llama_cpp" / "llama.py").read_text(encoding="utf-8")
+        llama_class = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "Llama"
+        )
+        methods = {
+            node.name: node for node in llama_class.body if isinstance(node, ast.FunctionDef)
+        }
+        embed = methods["embed"]
+        positional = embed.args.args
+        defaults = [None] * (len(positional) - len(embed.args.defaults)) + list(embed.args.defaults)
+        truncate_default = dict(zip((arg.arg for arg in positional), defaults))["truncate"]
+        assert isinstance(truncate_default, ast.Constant) and truncate_default.value is True
+        embed_calls = [
+            node
+            for node in ast.walk(methods["create_embedding"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "embed"
+        ]
+        assert embed_calls, "create_embedding no longer delegates to Llama.embed"
+        for call in embed_calls:
+            assert all(keyword.arg != "truncate" for keyword in call.keywords)
+        assert "tokens = tokens[:n_batch]" in source
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # LlamaCppEmbedder
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -362,13 +623,14 @@ class TestLlamaCppEmbedder:
         fake_cls = _make_fake_llama_class()
         monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
         emb = self._embedder(tmp_path)
-        # First embed never blocks: it kicks the background load and returns None.
-        assert emb.embed("hello world") is None
-        assert emb.wait_ready(timeout=5)
+        # Bulk work never blocks on the load: it kicks it and returns None.
+        assert emb.embed("hello world", priority=embeddings_mod.PRIORITY_BULK) is None
+        # An interactive caller off the event loop waits for that load instead.
         vec = emb.embed("hello world")
         assert vec is not None
         assert len(vec) == _DIM
         assert emb.is_ready()
+        emb.close()
 
     def test_embed_returns_none_when_model_file_missing(self, tmp_path: Path, monkeypatch) -> None:
         """No model file → None without ever constructing the Llama class."""
@@ -474,12 +736,14 @@ class TestLlamaCppEmbedder:
         assert emb.is_ready()
         emb.close()
         assert not emb.is_ready()
-        # Safe to call repeatedly; the next embed kicks a fresh background load.
+        # Safe to call repeatedly; the next embed loads the model again.
         emb.close()
-        assert emb.embed("hello again") is None  # not loaded yet — reload kicked
+        bulk = embeddings_mod.PRIORITY_BULK
+        assert emb.embed("hello again", priority=bulk) is None  # reload kicked, not awaited
         assert emb.wait_ready(timeout=5)
         assert emb.embed("hello again") is not None
         assert len(fake_cls.instances) == 2
+        emb.close()
 
     def test_concurrent_embeds_are_safe(self, tmp_path: Path, monkeypatch) -> None:
         """Lock-serialized embeds from many threads all succeed.
@@ -582,12 +846,15 @@ class TestLlamaCppEmbedder:
         # Both claims are read WHILE the worker is held, which is the only window in
         # which a refusal is distinguishable from a completed embed: after release
         # every admitted job succeeds and returns a vector too.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
+
+        def _a_refusal_landed() -> bool:
             with lock:
-                if any(r is None for r in outcomes.values()):
-                    break
-            time.sleep(0.02)
+                return any(r is None for r in outcomes.values())
+
+        wait_until(
+            _a_refusal_landed,
+            describe=lambda: f"no refusal while the worker was held; outcomes so far: {outcomes}",
+        )
         with lock:
             refused_while_held = sorted(i for i, r in outcomes.items() if r is None)
         depth = emb._jobs.qsize()
@@ -1223,472 +1490,3 @@ class TestSingletons:
         first = model_download_manager()
         reset_download_manager()
         assert model_download_manager() is not first
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Embedding thread pinning (memory.embedding_threads)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestEmbedThreads:
-    """llama.cpp must not size its compute pools from the host core count.
-
-    Left unset, ``n_threads_batch`` defaults to the CPU count, so even a
-    few-token embed fans out across every core and competes with the rest of the
-    gateway for CPU. These lock the resolver's clamping and prove the resolved
-    value actually reaches the ``Llama`` constructor.
-    """
-
-    def test_default_when_unset(self, monkeypatch) -> None:
-        # The resolver clamps to the core count, so a host with fewer cores than
-        # the default answers with its own core count and the assertion would pin
-        # the runner. Pinned above the default, the same way
-        # ``test_clamped_to_the_core_count`` below pins it under one.
-        monkeypatch.setattr("os.cpu_count", lambda: 8)
-        monkeypatch.setattr(embeddings_mod, "_read_memory_config", lambda: {})
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: 8)
-        assert embeddings_mod._DEFAULT_EMBED_THREADS == 4
-        assert embeddings_mod._embed_threads() == 4
-
-    def test_configured_value_is_used(self, monkeypatch) -> None:
-        monkeypatch.setattr(embeddings_mod, "_read_memory_config", lambda: {"embedding_threads": 6})
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: 8)
-        assert embeddings_mod._embed_threads() == 6
-
-    @pytest.mark.parametrize("bad", [0, -1, True, False, "4", 2.5, None])
-    def test_invalid_values_fall_back_to_the_default(self, monkeypatch, bad) -> None:
-        """Booleans are rejected explicitly: ``True`` would coerce to 1 thread."""
-        monkeypatch.setattr("os.cpu_count", lambda: 8)
-        monkeypatch.setattr(
-            embeddings_mod, "_read_memory_config", lambda: {"embedding_threads": bad}
-        )
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: 8)
-        assert embeddings_mod._embed_threads() == 4
-
-    @pytest.mark.parametrize("cores,expected", [(1, 1), (8, 8)])
-    def test_clamped_to_core_count(self, monkeypatch, cores, expected) -> None:
-        monkeypatch.setattr(
-            embeddings_mod, "_read_memory_config", lambda: {"embedding_threads": 9999}
-        )
-        monkeypatch.setattr("os.cpu_count", lambda: cores)
-        assert embeddings_mod._embed_threads() == expected
-
-    @pytest.mark.parametrize("cores,expected", [(1, 1), (2, 1), (4, 3), (16, 4)])
-    def test_unset_leaves_one_core_free(self, monkeypatch, cores, expected) -> None:
-        """Unset means llama.cpp never gets the whole box.
-
-        Handing every core to the batch pool starves the event loop the gateway
-        answers on, which a 2-vCPU host feels hardest. The 16-core expectation
-        is the one that matters twice: the cap is a CEILING on the four-thread
-        default, so a big host answers 4, not 15.
-        """
-        monkeypatch.setattr(embeddings_mod, "_read_memory_config", lambda: {})
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: cores)
-        assert embeddings_mod._embed_threads() == expected
-        if cores > 1:
-            assert embeddings_mod._embed_threads() < cores
-
-    @pytest.mark.parametrize("cores,expected", [(1, 1), (2, 1), (4, 3), (16, 4)])
-    def test_the_declared_default_in_config_is_not_operator_intent(
-        self, monkeypatch, cores, expected
-    ) -> None:
-        """A whole-document config save materializes the declared default.
-
-        ``MemoryConfig.embedding_threads`` is a dataclass field defaulting to 4
-        and ``KiroCrewConfig.save()`` publishes every field, so a fresh
-        install's ``config.json`` carries a 4 nobody typed. Reading that as a
-        choice hands the whole box to the very hosts the cap protects, so a raw
-        value equal to the default takes the same ceiling as an absent one.
-        """
-        assert embeddings_mod._DEFAULT_EMBED_THREADS == 4, (
-            "Raising this past 4 reinterprets every config.json already carrying 4: "
-            "it stops matching the declared default, becomes an explicit choice, and "
-            "hands back the full core count on the small hosts this cap protects. "
-            "Migrate those files before changing it."
-        )
-        monkeypatch.setattr(
-            embeddings_mod,
-            "_read_memory_config",
-            lambda: {"embedding_threads": embeddings_mod._DEFAULT_EMBED_THREADS},
-        )
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: cores)
-        assert embeddings_mod._embed_threads() == expected
-
-    @pytest.mark.parametrize("cores,configured", [(1, 1), (2, 2), (4, 3), (16, 8)])
-    def test_a_value_other_than_the_default_is_honoured_unclamped(
-        self, monkeypatch, cores, configured
-    ) -> None:
-        """An operator asking for every core on a small host still gets it."""
-        monkeypatch.setattr(
-            embeddings_mod, "_read_memory_config", lambda: {"embedding_threads": configured}
-        )
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: cores)
-        assert embeddings_mod._embed_threads() == configured
-
-    def test_unknown_core_count_keeps_the_flat_default(self, monkeypatch) -> None:
-        """No count means no core to subtract, so the default is not reduced."""
-        monkeypatch.setattr(embeddings_mod, "_read_memory_config", lambda: {})
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: None)
-        assert embeddings_mod._embed_threads() == embeddings_mod._DEFAULT_EMBED_THREADS
-
-    def test_threads_reach_the_llama_constructor(self, tmp_path: Path, monkeypatch) -> None:
-        """BOTH pools are pinned, not only the batch pool that runs inference."""
-        fake_cls = _make_fake_llama_class()
-        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
-        monkeypatch.setattr(embeddings_mod, "_read_memory_config", lambda: {"embedding_threads": 3})
-        monkeypatch.setattr(embeddings_mod.os, "cpu_count", lambda: 8)
-        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"))
-        assert emb.wait_ready(timeout=5)
-        kwargs = fake_cls.instances[0].kwargs
-        assert kwargs["n_threads"] == 3
-        assert kwargs["n_threads_batch"] == 3
-
-    def test_physical_batch_bounds_scratch_without_reducing_context(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
-        fake_cls = _make_fake_llama_class()
-        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
-        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"))
-        assert emb.wait_ready(timeout=5)
-        kwargs = fake_cls.instances[0].kwargs
-        assert kwargs["n_ctx"] == embeddings_mod._N_CTX
-        assert kwargs["n_batch"] == embeddings_mod._N_CTX
-        assert kwargs["n_ubatch"] == embeddings_mod._N_UBATCH
-        assert kwargs["n_ubatch"] < kwargs["n_batch"]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Embed timing + inference queue priority
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestEmbedQueueTiming:
-    """Queue wait must be reported separately from the model's own cost.
-
-    The process shares ONE model on ONE thread, so a short embed can be slow
-    purely because it queued behind a long one. That is a different defect from
-    slow inference, with a different fix, and these assert the instrumentation
-    tells the two apart.
-    """
-
-    def test_a_queued_embed_reports_wait_not_inference(self, tmp_path: Path, monkeypatch) -> None:
-        fake_cls = _make_fake_llama_class()
-        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
-        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"))
-        assert emb.wait_ready(timeout=5)
-
-        emitted: list[tuple[float, float, int]] = []
-        real_emit = embeddings_mod._emit_embed_timing
-
-        def _spy(t0, t_started, texts, *, priority=embeddings_mod.PRIORITY_NORMAL, failed=False):
-            emitted.append(
-                (
-                    (t_started - t0) * 1000.0,
-                    (time.monotonic() - t_started) * 1000.0,
-                    sum(len(t) for t in texts),
-                )
-            )
-            real_emit(t0, t_started, texts, priority=priority, failed=failed)
-
-        monkeypatch.setattr(embeddings_mod, "_emit_embed_timing", _spy)
-
-        holding = threading.Event()
-        release = threading.Event()
-
-        def _create(texts):
-            if sum(len(t) for t in texts) > 100:
-                holding.set()
-                release.wait(timeout=5)
-            return {"data": [{"embedding": [0.1] * _DIM} for _ in texts]}
-
-        fake_cls.instances[0].create_embedding = _create
-
-        bulk = threading.Thread(target=lambda: emb.embed("x" * 4000))
-        bulk.start()
-        assert holding.wait(timeout=5), "bulk embed never started"
-
-        # Patch the queue only NOW: the first submission REPLACES self._jobs with
-        # a fresh PriorityQueue when it spawns the worker, so a wrapper installed
-        # before that point lands on the discarded original and never fires.
-        # Deterministic barrier: a fixed sleep here would race a loaded CI runner,
-        # releasing before the short embed enqueued and collapsing its wait.
-        queued = threading.Event()
-        real_put = emb._jobs.put
-
-        def _put(item):
-            real_put(item)
-            _prio, _seq, job = item
-            if job is not None and sum(len(t) for t in job.texts) == 2:
-                queued.set()
-
-        monkeypatch.setattr(emb._jobs, "put", _put)
-
-        short = threading.Thread(target=lambda: emb.embed("hi"))
-        short.start()
-        assert queued.wait(timeout=5), "short embed never reached the queue"
-        # Hold deliberately, so the measured wait is this duration rather than a
-        # scheduling artifact.
-        time.sleep(0.5)
-        release.set()
-        bulk.join(timeout=10)
-        short.join(timeout=10)
-
-        big = [e for e in emitted if e[2] == 4000]
-        small = [e for e in emitted if e[2] == 2]
-        assert len(big) == 1 and len(small) == 1
-        assert big[0][0] < 200, f"bulk should not have queued: {big[0]}"
-        assert small[0][0] >= 300, f"queued embed should report wait: {small[0]}"
-        assert small[0][1] < 200, f"queued embed's own inference was fast: {small[0]}"
-
-    def test_chars_bucket_is_low_cardinality(self) -> None:
-        assert embeddings_mod._chars_bucket(2) == "<=128"
-        assert embeddings_mod._chars_bucket(400) == "<=512"
-        assert embeddings_mod._chars_bucket(4000) == "<=6000"
-        assert embeddings_mod._chars_bucket(99_999) == ">6000"
-
-
-class TestEmbedPriority:
-    """A short interactive embed must not wait behind a queued bulk sweep.
-
-    A CALLER that holds ``_lock`` across submit+wait makes this impossible:
-    every other caller blocks before it can enqueue and at most one job is
-    ever queued. The lock moved to the worker precisely so ordering can exist.
-    """
-
-    def _gated(self, tmp_path: Path, monkeypatch):
-        """Start a gated worker and return (emb, order, release, queued, threads).
-
-        The gate job is already RUNNING on return, which matters for two reasons:
-        the first submission replaces ``self._jobs`` with a fresh queue when it
-        spawns the worker (so the recording wrapper has to be installed after
-        that, not before), and ``queued`` then counts only the submissions a test
-        actually cares about. ``queued`` is what lets a test release on a
-        deterministic barrier instead of a fixed sleep: on a loaded runner a sleep
-        can release before every submitter has enqueued, and the ordering
-        assertion would then measure scheduling rather than priority.
-        """
-        fake_cls = _make_fake_llama_class()
-        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
-        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"))
-        assert emb.wait_ready(timeout=5)
-        order: list[str] = []
-        holding = threading.Event()
-        release = threading.Event()
-
-        def _create(texts):
-            label = texts[0]
-            if label == "gate":
-                holding.set()
-                release.wait(timeout=5)
-            order.append(label)
-            return {"data": [{"embedding": [0.1] * _DIM} for _ in texts]}
-
-        fake_cls.instances[0].create_embedding = _create
-
-        threads = [threading.Thread(target=lambda: emb.embed("gate"))]
-        threads[0].start()
-        assert holding.wait(timeout=5), "worker never entered the gate job"
-
-        queued: list[str] = []
-        queued_lock = threading.Lock()
-        real_put = emb._jobs.put
-
-        def _put(item):
-            real_put(item)
-            _prio, _seq, job = item
-            if job is not None:
-                with queued_lock:
-                    queued.append(job.texts[0])
-
-        monkeypatch.setattr(emb._jobs, "put", _put)
-        return emb, order, release, queued, threads
-
-    @staticmethod
-    def _await_queued(queued: list, expected: int, timeout: float = 5.0) -> None:
-        """Block until *expected* submissions have reached the queue."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if len(queued) >= expected:
-                return
-            time.sleep(0.01)
-        raise AssertionError(f"only {len(queued)} of {expected} enqueued: {queued}")
-
-    def test_interactive_preempts_queued_bulk(self, tmp_path: Path, monkeypatch) -> None:
-        emb, order, release, queued, threads = self._gated(tmp_path, monkeypatch)
-
-        # Bulk is submitted FIRST and still must lose to the later query.
-        for i in range(3):
-            t = threading.Thread(
-                target=lambda i=i: emb.embed(f"bulk{i}", priority=embeddings_mod.PRIORITY_BULK)
-            )
-            t.start()
-            threads.append(t)
-        self._await_queued(queued, 3)
-        q = threading.Thread(
-            target=lambda: emb.embed("query", priority=embeddings_mod.PRIORITY_INTERACTIVE)
-        )
-        q.start()
-        threads.append(q)
-        self._await_queued(queued, 4)
-        release.set()
-        for t in threads:
-            t.join(timeout=10)
-
-        assert order[0] == "gate"
-        assert order[1] == "query", f"interactive must preempt queued bulk: {order}"
-        assert set(order[2:]) == {"bulk0", "bulk1", "bulk2"}
-
-    def test_equal_priority_stays_fifo(self, tmp_path: Path, monkeypatch) -> None:
-        """The seq tiebreaker keeps ordering stable, so priority is not a lottery."""
-        emb, order, release, queued, threads = self._gated(tmp_path, monkeypatch)
-        for i in range(4):
-            t = threading.Thread(target=lambda i=i: emb.embed(f"n{i}"))
-            t.start()
-            threads.append(t)
-            # Confirm each submission is enqueued before starting the next, so
-            # FIFO order is well-defined: with all four racing, any interleaving
-            # is a legal seq order and the assertion would be testing the
-            # scheduler rather than the tiebreaker.
-            self._await_queued(queued, i + 1)
-        release.set()
-        for t in threads:
-            t.join(timeout=10)
-        assert order == ["gate", "n0", "n1", "n2", "n3"], order
-
-    def test_close_does_not_abandon_a_queued_caller(self, tmp_path: Path, monkeypatch) -> None:
-        """A job already queued when the sentinel arrives is failed, not hung.
-
-        Retirement and dispatch now share a lock, so a LATE submission fails fast
-        instead of queueing. This covers the other half: a job legally enqueued
-        before ``close()`` still has to be failed by the drain.
-        """
-        emb, _order, release, queued, threads = self._gated(tmp_path, monkeypatch)
-        results: list[object] = []
-        late = threading.Thread(target=lambda: results.append(emb.embed("late")))
-        late.start()
-        self._await_queued(queued, 1)  # 'late' is genuinely on the queue now
-
-        release.set()
-        closer = threading.Thread(target=emb.close)
-        closer.start()
-        closer.join(timeout=15)
-        assert not closer.is_alive(), "close() must not block on the in-flight job"
-        late.join(timeout=10)
-        assert not late.is_alive(), "a queued caller must never wait forever"
-        for t in threads:
-            t.join(timeout=10)
-        assert len(results) == 1
-
-    def test_a_retired_backend_fails_fast_instead_of_hanging(
-        self, tmp_path: Path, monkeypatch
-    ) -> None:
-        """A submission after close() must not queue into a space nothing drains.
-
-        This is the hang the dispatch lock exists to prevent: close() swaps BOTH
-        the worker and the queue, so a caller that passed the liveness check and
-        then enqueued would wait on ``job.done`` forever.
-        """
-        fake_cls = _make_fake_llama_class()
-        monkeypatch.setattr("kiro_crew.embeddings._load_llama_class", lambda: fake_cls)
-        emb = LlamaCppEmbedder(model_path=_write_model_file(tmp_path / "model.gguf"))
-        assert emb.wait_ready(timeout=5)
-        llm = fake_cls.instances[0]
-        emb.close()
-
-        # Submitting the STALE llm handle is exactly what a caller holding a
-        # pre-close reference does; it must fail, not block.
-        done = threading.Event()
-        out: list = []
-
-        def _submit():
-            out.append(emb._submit_infer(llm, ["stale"]))
-            done.set()
-
-        threading.Thread(target=_submit, daemon=True).start()
-        assert done.wait(timeout=5), "_submit_infer hung on a retired backend"
-        assert out[0].error is not None
-        assert "retired" in str(out[0].error)
-
-
-class TestBundledWindowsMsvcRuntimeGate:
-    """The vendored Windows libs import an MSVC runtime that is not shipped with them.
-
-    All four DLLs in ``win_amd64`` import ``MSVCP140``, ``VCRUNTIME140`` and
-    ``VCRUNTIME140_1``; ``ggml-base``/``ggml-cpu`` add ``VCOMP140`` (MSVC OpenMP).
-    Both Linux payloads DO vendor their OpenMP equivalent, so the omission is on the
-    Windows lane rather than a deliberate asymmetry — and on a host without the
-    redistributable the load failed as a bare ``WinError 126`` naming the library
-    being opened rather than the runtime it needs, which reads as an unsupported
-    platform. CI cannot see any of this: the ``windows-latest`` runner ships the
-    redistributable preinstalled.
-    """
-
-    def test_the_probe_is_a_no_op_off_windows(self, monkeypatch) -> None:
-        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", "linux")
-        assert embeddings_mod._missing_windows_msvc_runtime() == []
-
-    def test_every_named_runtime_dll_is_probed(self, monkeypatch) -> None:
-        """Absence is reported per DLL, so the message can name what to install."""
-        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", "win32")
-        asked: list[str] = []
-
-        def _fail(name):
-            asked.append(name)
-            raise OSError("[WinError 126] The specified module could not be found")
-
-        monkeypatch.setattr(embeddings_mod.ctypes, "WinDLL", _fail, raising=False)
-        missing = embeddings_mod._missing_windows_msvc_runtime()
-        assert asked == list(embeddings_mod._WINDOWS_MSVC_RUNTIME_DLLS)
-        assert missing == list(embeddings_mod._WINDOWS_MSVC_RUNTIME_DLLS)
-
-    def test_a_present_runtime_reports_nothing_missing(self, monkeypatch) -> None:
-        monkeypatch.setattr("kiro_crew.embeddings.sys.platform", "win32")
-        monkeypatch.setattr(embeddings_mod.ctypes, "WinDLL", lambda name: object(), raising=False)
-        assert embeddings_mod._missing_windows_msvc_runtime() == []
-
-    def test_the_loader_refuses_and_names_the_redistributable(
-        self, monkeypatch, tmp_path: Path, caplog
-    ) -> None:
-        """Refused BEFORE the import, so the log carries the fix rather than a WinError."""
-        libs = tmp_path / embeddings_mod._LIBS_DIR_NAME / "win_amd64"
-        libs.mkdir(parents=True)
-        for name in embeddings_mod._REQUIRED_VENDORED_LIBS["win_amd64"]:
-            (libs / name).write_bytes(b"MZ")
-        monkeypatch.setattr(embeddings_mod, "_VENDOR_DIR", tmp_path)
-        monkeypatch.setattr(embeddings_mod, "_platform_libs_dirname", lambda: "win_amd64")
-        monkeypatch.setattr(
-            embeddings_mod, "_missing_windows_msvc_runtime", lambda: ["VCOMP140.DLL"]
-        )
-        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
-        embeddings_mod._load_llama_class.cache_clear()
-        try:
-            with caplog.at_level("WARNING"):
-                assert embeddings_mod._load_llama_class() is None
-        finally:
-            embeddings_mod._load_llama_class.cache_clear()
-            os.environ.pop(embeddings_mod._LIB_PATH_ENV, None)
-        assert "VCOMP140.DLL" in caplog.text
-        assert "Visual C++" in caplog.text
-        assert "keyword search" in caplog.text
-
-    def test_a_complete_runtime_does_not_refuse_on_the_windows_branch(
-        self, monkeypatch, tmp_path: Path
-    ) -> None:
-        """Mutation guard: the refusal must be conditional on something real."""
-        libs = tmp_path / embeddings_mod._LIBS_DIR_NAME / "win_amd64"
-        libs.mkdir(parents=True)
-        for name in embeddings_mod._REQUIRED_VENDORED_LIBS["win_amd64"]:
-            (libs / name).write_bytes(b"MZ")
-        monkeypatch.setattr(embeddings_mod, "_VENDOR_DIR", tmp_path)
-        monkeypatch.setattr(embeddings_mod, "_platform_libs_dirname", lambda: "win_amd64")
-        monkeypatch.setattr(embeddings_mod, "_missing_windows_msvc_runtime", lambda: [])
-        monkeypatch.delenv(embeddings_mod._LIB_PATH_ENV, raising=False)
-        embeddings_mod._load_llama_class.cache_clear()
-        try:
-            # Reaches the import (which then resolves the real vendored copy on this
-            # host); the point is only that the runtime gate did not short-circuit it.
-            embeddings_mod._load_llama_class()
-            assert os.environ.get(embeddings_mod._LIB_PATH_ENV) == str(libs)
-        finally:
-            embeddings_mod._load_llama_class.cache_clear()
-            os.environ.pop(embeddings_mod._LIB_PATH_ENV, None)

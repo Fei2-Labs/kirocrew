@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path
 
 import pytest
-from test_snapshot import _setup_fake_kirocrew, unpinnable_argv
+from test_snapshot import _setup_fake_kirocrew, snapshot_family_source, unpinnable_argv
 
 from kiro_crew import snapshot as snap
 
@@ -192,7 +192,7 @@ class TestAFailedDatabaseCopyIsNotSilentlyDowngraded:
         import inspect
         import re
 
-        src = inspect.getsource(snap)
+        src = snapshot_family_source()
         calls = len(re.findall(r"src_conn\.backup\(dst_conn\)", src))
         wrapped = len(re.findall(r"raise DatabaseCopyFailed\(src, e\) from e", src))
         assert calls == 1, (

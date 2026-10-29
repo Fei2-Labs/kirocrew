@@ -8,9 +8,9 @@ concrete provider.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from functools import cached_property
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, AsyncContextManager, Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -32,13 +32,20 @@ from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.essential_delivery import EssentialDelivery
 
+# The abort address a provider mints. Safe at module scope despite this module's
+# import-light rule: ``abort`` imports only ``mcp_gateway.transport`` outside the
+# standard library, and that module is already loaded by the time this one is.
+from kiro_crew.mcp_gateway.abort import RuntimeAbortTarget
+from kiro_crew.start_priority import StartPriority
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    # Type-only: this module's runtime imports are deliberately just acp.types
-    # and constants, and recovery.ladder pulls in mcp_gateway + metrics.
+    # Type-only: this module's runtime imports are deliberately narrow, and
+    # recovery.ladder pulls in metrics.
     from pathlib import Path
 
     from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
     from kiro_crew.recovery.ladder import InfraError
+    from kiro_crew.trust_patterns import GrantDeadline
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -90,9 +97,35 @@ class SessionMcpReport(Protocol):
         self, kind: str, server_name: str, error: str = "", *, fanout_no_owner: bool = False
     ) -> bool: ...
 
+    #: The agent spec's enabled servers this session cannot use: failed,
+    #: awaiting authorization, or never reported. Decides an unattended run's
+    #: outcome.
+    def declared_not_ready(self) -> tuple[str, ...]: ...
+
+    #: The declared servers that never reported, which ``problem_summary`` does
+    #: not name. An unattended run's notice names them.
+    def declared_never_reported(self) -> tuple[str, ...]: ...
+
 
 class LLMProvider(ABC):
     """Abstract LLM backend."""
+
+    #: The priority of this provider's next ``start()``, set by ``SessionManager``
+    #: just before it starts the provider (rule: ``kiro_crew.start_priority``); a
+    #: provider started anywhere else starts BACKGROUND.
+    start_priority: StartPriority = StartPriority.BACKGROUND
+
+    #: True only on a provider whose ``supports_effort()`` reports the live
+    #: model. The base ``supports_effort()`` returns a placeholder False, so a
+    #: caller that acts on a False answer must check this first.
+    reports_effort_support: bool = False
+
+    #: True only on a provider whose ``approve_tool`` takes ``withdraw_if``, a
+    #: predicate its transport reads again after the security floor and under
+    #: the write lock right before the approval is written; once it holds,
+    #: nothing is written and ``permission_floor.ApprovalWithdrawn`` is raised.
+    #: Read from the provider's TYPE, so a loose mock cannot opt in by accident.
+    approval_withdrawable: bool = False
 
     @cached_property
     def essential_delivery(self) -> EssentialDelivery:
@@ -119,6 +152,16 @@ class LLMProvider(ABC):
         """Exact documents supplied at native startup, empty without evidence."""
         return {}
 
+    @property
+    def member_dispatch_mounted(self) -> bool | None:
+        """Whether this session holds the member session-control tools.
+
+        ``None`` means no evidence: the context builder then falls back to the
+        configured member backend's capability. A provider that composes a
+        session's MCP array answers True/False from that composition.
+        """
+        return None
+
     @abstractmethod
     async def start(self) -> None:
         """Initialize the provider (spawn process, create client, etc.)."""
@@ -128,19 +171,49 @@ class LLMProvider(ABC):
         """Gracefully shut down."""
 
     @abstractmethod
-    async def stream(self, message: str) -> AsyncIterator[LLMEvent]:
-        """Send a message and yield events."""
+    async def stream(
+        self, message: str, timeout: float | None = None, *, allow_image: bool = True
+    ) -> AsyncIterator[LLMEvent]:
+        """Send a message and yield events.
+
+        ``timeout`` is an optional transport budget captured by an outer owner;
+        ``None`` keeps the provider's normal live-config resolution.
+        ``allow_image=False`` sends *message* as text only: no image path in it
+        is read or inlined as an image block.
+        """
         yield LLMEvent(kind=EVENT_COMPLETE)  # pragma: no cover
 
+    def prompt_timeout_for_deadline(self, deadline: float) -> float | None:
+        """Transport budget for an immutable outer deadline, if supported.
+
+        ``None`` preserves the legacy ``stream(message)`` call shape. Providers
+        that can honor an explicit immutable budget override this method; callers
+        resolve it through ``kiro_crew.agent_sdk.capture_prompt_timeout``.
+        """
+        return None
+
     @abstractmethod
-    async def approve_tool(self, request_id: str | int, *, always: bool = False) -> None:
-        """Approve a pending tool permission request.
+    async def approve_tool(
+        self,
+        request_id: str | int,
+        *,
+        always: bool = False,
+        deadline: GrantDeadline | None = None,
+    ) -> bool:
+        """Approve a pending tool permission request and report whether it was sent.
+
+        Return ``True`` after sending an allow answer. Return ``False`` when the
+        transport rejected the request instead.
 
         ``always=True`` signals the user picked the "always allow" option
         (e.g. trust mode). Providers that distinguish between one-shot and
         persistent approval (ACP backends echoing optionId, claude-agent-acp
         emitting an addRules suggestion) should honor it; others may treat
         it as a synonym for one-shot allow.
+
+        ``deadline`` is set only by an approval a timed grant backs. Once it has
+        passed, send nothing, leave the request pending, and raise
+        :class:`~kiro_crew.trust_patterns.GrantEnded` so the caller prompts.
         """
 
     @abstractmethod
@@ -303,50 +376,113 @@ class LLMProvider(ABC):
         return "no_turn"
 
     def is_alive(self) -> bool:
-        """Return True if the provider's backing process/connection is alive."""
+        """Return True if the provider's backing runtime/connection is alive.
+
+        RUNTIME-level, not session-level: a runtime is one process, and it may
+        serve several sessions at once. So this answers "is the process behind me
+        standing", which a co-tenant's activity can keep true after this
+        session's own work is over. A caller that needs to know whether THIS
+        session may still be served asks the registry for its lease, not this.
+        """
         return True
 
     def is_process_alive(self) -> bool:
-        """Process-level liveness check (skips activity-staleness heuristics).
+        """Runtime liveness read off the OS, skipping activity-staleness heuristics.
 
         Defaults to ``is_alive``. Providers backed by a child process (ACP)
         override this to inspect the OS-level state directly.
+
+        Same scope caveat as ``is_alive``, and sharper here because the reading is
+        the operating system's: the answer describes one process, so on a shared
+        runtime every tenant gets the same True and no tenant learns anything
+        about its own standing from it.
         """
         return self.is_alive()
 
     @property
     def process_instance(self) -> str:
-        """Identity of the provider's CURRENT child process instance.
+        """Identity of the CURRENT runtime process serving this provider.
 
         ``""`` for providers not backed by a child process, and for a
-        process-backed provider whose child is gone. Process-backed providers
-        override this with a per-spawn token so a resource minted by one child
-        (an MCP OAuth authorize link, whose loopback listener and PKCE verifier
-        live in that process) can be recognized as dead once the child is —
+        process-backed provider whose process is gone. Process-backed providers
+        override this with a per-spawn token so a resource minted inside one
+        process (an MCP OAuth authorize link, whose loopback listener and PKCE
+        verifier live there) can be recognized as dead once the process is —
         equality across spawns must be impossible, which is why the ACP session
         id (reused by resume on a new process) can never serve here.
+
+        A process fact, so every session on a shared runtime reads the SAME
+        token. That is what makes it sound for "is this still the process I
+        observed" and unsound for "is this my session": it answers the first
+        question and must never be folded into a session identity.
         """
         return ""
 
     @property
     def member_capabilities_supported(self) -> bool:
-        """Whether a dedicated startup can load a complete member agent spec."""
+        """Whether a dedicated startup can verify native loading or a saved projection."""
+
+        return False
+
+    @property
+    def member_tool_limits_supported(self) -> bool:
+        """Whether a saved member spec's per-tool ``disabledTools`` is honoured."""
+        return False
+
+    @property
+    def mate_worker_kit_supported(self) -> bool:
+        """Whether a crewmate's worker session here runs with its per-session kit."""
         return False
 
     @property
     def loaded_capability_template(self) -> str:
-        """Confirmed active full-spec template; empty means no loading evidence."""
+        """Confirmed saved template; projection gaps are reported separately."""
         return ""
 
     @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        """Saved fields this runtime cannot demonstrate applying."""
+        return ()
+
+    @property
     def exit_code(self) -> int | None:
-        """Last child-process exit code, or None if no process or still running."""
+        """The runtime process's last exit code; None with no process or still running.
+
+        A runtime fact: the code describes how one process ended, which is the
+        same answer for every session that was being served on it. So it explains
+        a runtime's death, never why one particular session stopped — a session
+        that merely lost its lease has no exit code of its own.
+        """
         return None
 
     @property
     def cwd(self) -> str:
         """Working directory the provider operates in. Default: empty string."""
         return ""
+
+    def set_work_dir_claim_probe(
+        self,
+        probe: Callable[[], AsyncContextManager[bool]],
+    ) -> None:
+        """Install the registry claim held across a work-directory reclaim.
+
+        The yielded answer is evaluated while the session registry lock remains
+        held through the reclaim operation, so a successor cannot register
+        between the ownership decision and deletion. Default no-op for a
+        provider that never reclaims a directory.
+        """
+        return None
+
+    def disown_work_dir(self) -> None:
+        """Declare that this provider does not own its work directory for reclaim.
+
+        The session registry calls this before shutting down a provider whose
+        session KEY another live provider already holds: both derived the same
+        work directory from that key, so the one being discarded must not
+        remove it at shutdown (``session_work_dir``). Default no-op for a
+        provider that never reclaims a directory.
+        """
+        return None
 
     @property
     def served_model(self) -> str:
@@ -359,17 +495,76 @@ class LLMProvider(ABC):
         """
         return ""
 
+    @property
+    def model_pin_refused(self) -> str:
+        """The pinned model the backend refused at session start, or ``""``.
+
+        A refusal on a non-strict model push leaves the session on the backend
+        default without raising, so this is how a caller billing or labelling a
+        turn by the pin learns the pin never ran. Default: ``""``, no refusal.
+        """
+        return ""
+
+    @property
+    def model_pin_partial(self) -> str:
+        """The bare model a ``<model>[<effort>]`` pin landed as, or ``""``.
+
+        Set when the model half of a pair pin applied and the effort half did
+        not: the session runs this bare model, not the pin and not the default.
+        Default: ``""``, no partial application.
+        """
+        return ""
+
+    def settings_withheld_cause(self) -> str:
+        """Why Crew's MCP tools are withheld from this session, or ``""``.
+
+        ``"session"`` when another open Crew session's settings seed holds the
+        session's settings file, ``"project"`` when the project's own file does.
+        May read a file: call it off the event loop. Default: ``""``, nothing
+        withheld.
+        """
+        return ""
+
     def touch_activity(self) -> None:
-        """Refresh provider activity timestamp without I/O. Default no-op."""
+        """Refresh the RUNTIME's activity timestamp without I/O. Default no-op.
+
+        The stamp lives on the process, so on a shared runtime one session
+        touching it marks every session on that process active. Idle-expiry
+        therefore reads a runtime's idleness, not a session's, and a surface that
+        needs the latter keeps its own clock.
+        """
         return None
 
-    def runtime_info(self) -> tuple[int | None, str | None]:
-        """Return (runtime_pid, gateway_socket_path) for abort propagation.
+    def runtime_abort_target(self) -> RuntimeAbortTarget | None:
+        """This session's runtime as an opaque abort address, or ``None``.
 
-        Subclasses that manage a child process override this to return the
-        real values. Base returns (None, None) which disables abort push.
+        Handed to ``mcp_gateway.abort.schedule_abort_for`` unopened. The target is
+        deliberately opaque because a runtime is one process serving possibly
+        several sessions: a session that could read its pid here could also
+        attribute that process to itself, and the abort seam is the one place the
+        pid legitimately reaches a wire.
+
+        ``None`` means no runtime of this provider's own is reachable, and the
+        abort push is skipped. The default walks the private process fields a
+        provider outside this tree may expose (``_client._pid`` with
+        ``_client._mcp_gateway_socket``) so such a provider keeps its abort push
+        without declaring anything; a provider in this tree overrides instead.
+
+        A provider whose runtime is reached some OTHER way overrides this. The
+        default only knows the ``_client`` shape, so an override is how a provider
+        with a different one keeps its abort push.
+
+        Scope note carried from the wire: the frame names a PROCESS, so aborting
+        it cancels in-flight tool calls for every session on that process. At a
+        runtime cap of 1 the process has one tenant and the two scopes coincide.
         """
-        return (None, None)
+        client = getattr(self, "_client", None)
+        if client is None:
+            return None
+        return RuntimeAbortTarget.build(
+            getattr(client, "_pid", None),
+            getattr(client, "_mcp_gateway_socket", None),
+        )
 
     def billing_stats(self) -> object | None:
         """The live per-turn billing stats object, or None when unmetered.
@@ -419,6 +614,13 @@ class LLMProvider(ABC):
         of cancel state (drives the shutdown drain). Default False."""
         return False
 
+    def background_launch(self) -> tuple[float, str] | None:
+        """``(seconds since, description)`` of the newest work this session's
+        harness launched to run on after the prompt returned (a backgrounded
+        command, a Workflow), or ``None``. Read by the session watchdog, which
+        cannot otherwise see that work. Default ``None``: nothing launched."""
+        return None
+
     async def wait_turn_done(self, timeout: float) -> str:
         """Wait for the current native turn's done boundary and return its stop
         reason. Default: no turn to wait for — return immediately with ``""``."""
@@ -429,9 +631,39 @@ class LLMProvider(ABC):
         provider with no steer extension (granted by opt-in, never inherited)."""
         return False
 
+    async def discard_unanswered_prompt(self) -> bool:
+        """Remove the last prompt, which got no answer, from the backend's history.
+
+        For a caller about to re-send it, so the model does not read the failed
+        copy beside the new one. True only when the backend confirmed it. Default
+        False: the backend keeps the failed copy.
+        """
+        return False
+
     @property
     def supports_steer(self) -> bool:
         """True when the provider implements mid-turn steer. Default False."""
+        return False
+
+    @property
+    def supports_refusal_steer(self) -> bool:
+        """True when a deny notice steered mid-turn reaches the refused turn's model.
+
+        Narrower than :attr:`supports_steer`: a harness can take a user's mid-turn
+        message and still discard one sent while a refused tool call is being
+        answered. Default False, granted by opt-in like the steer itself.
+        """
+        return False
+
+    @property
+    def steer_needs_loss_recovery(self) -> bool:
+        """True when a steer this provider accepted can still be dropped.
+
+        codex drops injected text when a later approval in the turn is denied or
+        the turn is cancelled, so only a caller that keeps and requeues the text
+        (the dashboard composer) may steer it; other callers queue instead of
+        steering such a provider. Default False.
+        """
         return False
 
     @property
@@ -459,6 +691,29 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def kas_auto_approved_capabilities(self) -> frozenset[str] | None:
+        """The capabilities this session's registered agent batch auto-approves.
+
+        ``None`` means the session registered no batch: a host that took its agent
+        at spawn time, or a provider that has not started a session yet. Only a
+        wire-registered host (KAS) answers with a set; see
+        :func:`kiro_crew.agent_sdk.spec_hooks.hook_projection_stale`, whose answer
+        for ``None`` is "not stale", because such a session has nothing a later
+        hook could have been left out of.
+        """
+        return None
+
+    @property
+    def kas_projected_agent(self) -> str:
+        """The agent this session's registered agent batch was built for.
+
+        ``""`` when no batch was registered. A turn that names no agent of its own
+        runs this one, so this is whose spec hooks it meets (see
+        :func:`kiro_crew.agent_sdk.spec_hooks.turn_spec_hooks`).
+        """
+        return ""
+
+    @property
     def tool_search_settings(self) -> "ToolSearchSettings | None":
         """The operator's MCP Tool Search choice this provider spawned with, or
         ``None`` when it carries none.
@@ -475,8 +730,14 @@ class LLMProvider(ABC):
 
     @property
     def work_scratch_dir(self) -> "Path | None":
-        """The ``$KIROCREW_SCRATCH`` directory the process serving this session
+        """The ``$KIROCREW_SCRATCH`` directory the RUNTIME serving this session
         exposes, or ``None`` when it has none.
+
+        A runtime fact: the directory was allocated for a process, so every
+        session sharing that process answers with the same path and the tree they
+        form has one work directory between them. That is the intent — a spawned
+        child joins the directory it was given — and it is also why the path is
+        not a place to keep anything scoped to a single session.
 
         Read by whoever spawns a process on this session's behalf (a companion
         runtime, a dedicated sub-agent process) so that process mounts the SAME
@@ -524,6 +785,19 @@ class LLMProvider(ABC):
         the ACP implementations answer from
         ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` membership."""
         return True
+
+    @property
+    def harness_managed_compaction_backend(self) -> str | None:
+        """Backend id when the harness compacts on its own initiative, else ``None``.
+
+        Asked by the automatic threshold, never by a manual ``/compact``. A
+        harness that summarizes unasked and reports it is left to do so at the
+        threshold, even when Crew can also hand it a manual ``/compact``.
+        Default ``None``: a provider that has not named one is compacted by
+        Crew at the threshold as before. The ACP implementations answer from
+        ``ACP_BACKENDS_HARNESS_MANAGED_COMPACTION`` membership. Consumers must
+        act only on a non-empty ``str`` value."""
+        return None
 
     @property
     def compaction_unmanaged_backend(self) -> str | None:
@@ -582,6 +856,25 @@ class LLMProvider(ABC):
         picker. Default empty for a provider that advertises none."""
         return []
 
+    async def maybe_refresh_available_models(self, catalog_ids: list[str]) -> list[dict[str, str]]:
+        """Revalidate the advertised-model snapshot before the picker narrows with it.
+
+        The model list (`/api/models`) narrows the catalog through the newest live
+        session's snapshot. When that snapshot is a startup-race default it hides
+        models the account actually has, and no explicit pick is refused to
+        trigger the refusal-path heal, so the read path must ask to revalidate.
+
+        Declared HERE rather than probed with ``getattr`` at the consumer: a probe
+        answers "cannot revalidate" for a provider that simply spells the accessor
+        differently, which is indistinguishable from a provider that genuinely has
+        no probe — and the consumer would then silently narrow on a stale snapshot,
+        the exact failure this revalidation exists to remove. A provider with no
+        way to revalidate returns its current snapshot unchanged (fail open), which
+        this default does; ``catalog_ids`` is the unfiltered catalog the picker
+        would otherwise offer, and the keep/drop verdict stays with the caller.
+        """
+        return self.available_models()
+
     def mcp_session_report(self) -> SessionMcpReport | None:
         """This session's own MCP registration report, or None if it keeps none.
 
@@ -592,6 +885,15 @@ class LLMProvider(ABC):
         remove. A provider without one returns None explicitly.
         """
         return None
+
+    async def wait_for_declared_mcp(self, timeout: float) -> tuple[str, ...]:
+        """Wait, at most *timeout* seconds, for the agent spec's MCP servers to report.
+
+        For an unattended run (webhook, cron) before its first prompt. Returns
+        the declared servers that are still not ready, empty when all are. A
+        provider that keeps no MCP report has nothing to wait for or name.
+        """
+        return ()
 
     def get_valid_effort_levels(self) -> list[str]:
         """Reasoning-effort levels the provider accepts. Default empty for a

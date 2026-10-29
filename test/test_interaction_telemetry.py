@@ -240,7 +240,7 @@ class _FakeSessionManager:
         self.success_calls: list[str] = []
         self._is_new = True
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         was_new = self._is_new
         self._is_new = False
         return self._provider, was_new, False
@@ -308,7 +308,7 @@ class _FakeSessionManager:
     def dequeue(self, key):
         return None
 
-    def clear_queue(self, key):
+    def clear_queue(self, key, owned_by=None):
         pass
 
     async def stop_turn(self, key, *, force=False, on_soft=None, on_hard=None):

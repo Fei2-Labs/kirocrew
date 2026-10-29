@@ -18,6 +18,12 @@ import { lazy, type ComponentType } from 'react'
 export interface OverlayProps {
   open: boolean
   onClose: () => void
+  /**
+   * What the reader typed between the gesture and the overlay's mount, while its chunk
+   * was still loading. The overlay starts with it as its query, so keys pressed right
+   * after the gesture are kept instead of lost. Read at mount only.
+   */
+  initialQuery?: string
 }
 
 export type LazyOverlay = React.LazyExoticComponent<ComponentType<OverlayProps>>

@@ -15,9 +15,12 @@ RFC's §3 reduced to invariants:
   been a symlink. The legacy fixed directory ``crew-venv`` is never renamed,
   moved, or converted: renaming it would break its own absolute shebangs while
   a gateway may still be running from it. It remains a functional fallback.
-* **No tree a live process might be using is ever moved or deleted.** Pruning
-  skips the stable link's target, the tree serving this process, and the
-  legacy directory.
+* **No tree a live process might be using is ever moved or deleted.** Every
+  process started from an engine-built tree holds a shared lock on it
+  (:mod:`kiro_crew.platform.tree_liveness`); pruning, after a promotion, deletes
+  a superseded tree only while it holds that lock exclusively, and always keeps
+  the stable link's target, the previous tree, the tree serving this process,
+  and the legacy directory.
 
 Authenticity comes from the same offline trust root ``cli.sh`` pins: the
 channel feed serves an RSA-signed manifest, the signature is verified against
@@ -36,30 +39,83 @@ doing for the installer and this engine together, not here alone.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
+import importlib as _importlib
 import json
 import logging
 import os
 import platform
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
-import urllib.error
-import urllib.request
-from dataclasses import dataclass
+import time
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
-from kiro_crew.config.paths import data_home
-from kiro_crew.platform_compat import (
+from kiro_crew.config.paths import data_home  # noqa: F401 - re-export
+from kiro_crew.platform.tree_liveness import LIVENESS_LOCK, TREE_MARKER
+from kiro_crew.platform_compat import (  # noqa: F401 - re-export
     IS_POSIX,
+    kill_popen_tree,
     make_owner_only_dir,
+    open_create_or_existing,
     release_lock,
     trusted_system_bin,
     try_acquire_lock,
+    try_acquire_lock_or_raise,
 )
+from kiro_crew.subprocess_utf8 import utf8_stdout
+
+# isort: split
+from kiro_crew import _facade_mirror
+from kiro_crew.platform.wheel_engine_build_child import (
+    FAILURE_TEXT_CHARS,
+    _redacted_detail,
+    _run,
+    _spawn_build_child,
+)
+from kiro_crew.platform.wheel_engine_contract import (
+    _ALLOW_SOURCE_BUILDS_ENV,
+    _CLI_MANIFEST_SCHEMA,
+    _FETCH_TIMEOUT_SECS,
+    _MANIFEST_EXPECTED_FIELDS,
+    _MANIFEST_MAX_BYTES,
+    _MANIFEST_OPTIONAL_FIELDS,
+    _MIN_VERSION_RE,
+    _NO_CONTEXT,
+    _OPENSSL_TIMEOUT_SECS,
+    _PIP_INSTALL_TIMEOUT_SECS,
+    _PROBE_TIMEOUT_SECS,
+    _PUB_DATE_RE,
+    _REMOVE_PARTIAL_TREE_REASONS,
+    _SHA256_RE,
+    _SHADOW_MIN_FREE_BYTES,
+    _VENV_CREATE_TIMEOUT_SECS,
+    _WHEEL_FETCH_TIMEOUT_SECS,
+    _WHEEL_MAX_BYTES,
+    ApplyCancel,
+    WheelUpdateBusy,
+    WheelUpdateCancelled,
+    WheelUpdateError,
+    WheelUpdateIncompatible,
+    _BuildContext,
+    _pip_binary_policy,
+    _raise_if_cancelled,
+    check_release_version,
+)
+from kiro_crew.platform.wheel_engine_layout import (
+    _SHADOW_SENTINEL,
+    _TOMBSTONE_INFIX,
+    ManagedVenvLayout,
+    _interpreter_in,
+    _is_owned_tree,
+    _is_stable_target,
+    _realpath,
+    managed_venv_layout,
+)
+from kiro_crew.platform.wheel_engine_transfer import _download_to_file, _fetch_bytes, _staging_dir
 
 logger = logging.getLogger(__name__)
 
@@ -83,411 +139,8 @@ CLI_MANIFEST_PUBLIC_KEY_B64 = (
     "LS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg=="
 )
 
-#: Same schema string cli.sh and the dashboard check enforce.
-_CLI_MANIFEST_SCHEMA = "kirocrew-cli-artifact-manifest-v1"
-
-#: Same ceiling cli.sh applies to the manifest with ``--max-filesize``.
-_MANIFEST_MAX_BYTES = 65536
-
-#: Received-bytes ceiling for the wheel download. The wheel is tens of MB
-#: today; the cap exists so a misbehaving origin cannot fill the disk, not as
-#: a tight bound. Enforced against received bytes, never Content-Length.
-_WHEEL_MAX_BYTES = 500 * 1024 * 1024
-
-#: Free-space floor on the venv parent before a shadow build is attempted.
-#: A shadow tree is a full second install; failing before pip half-fills the
-#: disk beats an ENOSPC mid-build. Sized to a current install (~350 MiB with
-#: dependencies) plus headroom.
-_SHADOW_MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
-
-_FETCH_TIMEOUT_SECS = 30
-_WHEEL_FETCH_TIMEOUT_SECS = 300
-_OPENSSL_TIMEOUT_SECS = 30
-_VENV_CREATE_TIMEOUT_SECS = 120
-#: pip resolves and downloads the full dependency set into a tree that has
-#: never seen it — the same bound dep_sync uses for a cold reinstall, doubled
-#: for a slow index on a cold cache, and for the compile fallback a host can
-#: opt back into below.
-_PIP_INSTALL_TIMEOUT_SECS = 900
-_PROBE_TIMEOUT_SECS = 60
-#: Dependencies are installed from prebuilt wheels only (the same policy as
-#: cli.sh's `PIP_BINARY_ONLY`). Without it pip builds any dependency that has
-#: no wheel for this host from its sdist, which needs a C toolchain the gateway
-#: host was never required to have; with it, such a host fails fast with pip's
-#: "No matching distribution found" naming the dependency.
-_PIP_BINARY_ONLY = "--only-binary=:all:"
-#: cli.sh's opt-in for a host that has the toolchain and wants the compile
-#: fallback back; read from this (gateway) process's environment, so a service
-#: unit has to carry it for an update to honour it.
-_ALLOW_SOURCE_BUILDS_ENV = "KIROCREW_ALLOW_SOURCE_BUILDS"
-
-
-def _pip_binary_policy() -> list[str]:
-    """The pip flags that keep dependency resolution binary-only (see above)."""
-    if os.environ.get(_ALLOW_SOURCE_BUILDS_ENV, "0") == "1":
-        return []
-    return [_PIP_BINARY_ONLY]
-
-
-# Signed-but-optional, mirroring cli.sh: a breaking release adds a fleet
-# floor (`min_version`). The signature still covers it (it stays in the
-# canonical payload), so the set check tolerates exactly this key and
-# nothing else. The floor is metadata for RUNNING installs; this engine
-# always installs the signed version itself, so format is all it checks.
-_MANIFEST_OPTIONAL_FIELDS = frozenset({"min_version"})
-_MIN_VERSION_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
-
-_MANIFEST_EXPECTED_FIELDS = {
-    "algorithm",
-    "channel",
-    "key_id",
-    "pub_date",
-    "python_requires",
-    "schema",
-    "sha256",
-    "signature",
-    "version",
-    "wheel_url",
-}
-
-_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+]{0,127}$")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_PUB_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-
-
-class WheelUpdateError(Exception):
-    """A wheel update step failed; the message is operator-facing.
-
-    Every raise site leaves the install exactly as it found it: the stable
-    link is only ever touched by :func:`promote`, which is the last step and
-    is atomic.
-    """
-
-
-@dataclass(frozen=True)
-class ManagedVenvLayout:
-    """Where the managed install's trees live for this data home."""
-
-    #: The legacy fixed venv cli.sh installs into (``crew-venv``). Never
-    #: written by this engine; functional fallback per the first-migration
-    #: protocol.
-    legacy: Path
-    #: The stable symlink (``crew-venv-current``) every launch path should
-    #: resolve through. May not exist yet on an unmigrated install.
-    stable_link: Path
-
-    def versioned_tree(self, version: str) -> Path:
-        """The sibling tree a given version installs into."""
-        return self.stable_link.with_name(f"{self.legacy.name}-{version}")
-
-    def is_managed_tree(self, path: Path) -> bool:
-        """Is *path* inside one of this layout's trees (legacy or versioned)?"""
-        try:
-            resolved = path.resolve()
-        except OSError:
-            return False
-        prefix = f"{self.legacy.name}-"
-        # Identity trust extends ONLY to the legacy root — the one path this
-        # layout owns unconditionally. Every versioned sibling (a genuinely
-        # promoted tree included) goes through the convention-plus-artifacts
-        # branch below, which every real install satisfies (bin/kirocrew ships
-        # with every completed build, the sentinel with every in-flight one).
-        # The stable link's TARGET is deliberately NOT an identity root: the
-        # respawn guard uses this predicate to detect a link repointed OUTSIDE
-        # the layout, and trusting the target by identity would make that
-        # check vacuously true.
-        try:
-            legacy_resolved = self.legacy.resolve()
-            if resolved == legacy_resolved or resolved.is_relative_to(legacy_resolved):
-                return True
-        except OSError:
-            pass
-        # A tree created after this snapshot: matched by naming convention in
-        # the same parent — but POSITIVELY identified, never by prefix alone.
-        # `KIROCREW_VENV=/srv/crew` makes the prefix "crew-", which a sibling
-        # like /srv/crew-dev (someone's unrelated venv) satisfies by name; a
-        # restart would then resolve through /srv/crew-current and switch an
-        # unmanaged process's runtime. A managed versioned tree additionally
-        # carries this engine's own artifacts: the kirocrew console script
-        # (every completed install ships it) or the build sentinel (every
-        # in-flight build does).
-        parent = self.legacy.parent
-        try:
-            if resolved.is_relative_to(parent.resolve()):
-                rel = resolved.relative_to(parent.resolve())
-                head = rel.parts[0] if rel.parts else ""
-                if head == self.legacy.name:
-                    return True
-                if not head.startswith(prefix):
-                    return False
-                candidate = parent / head
-                return (candidate / "bin" / "kirocrew").exists() or (
-                    candidate / _SHADOW_SENTINEL
-                ).exists()
-        except OSError:
-            pass
-        return False
-
-
-def managed_venv_layout() -> ManagedVenvLayout:
-    """Resolve the managed-venv layout for this install.
-
-    Mirrors cli.sh's path rule exactly: ``KIROCREW_VENV`` wins, else the venv
-    lives BESIDE the data home (``${KIROCREW_HOME%/}-venv``) — never inside
-    it, for the blast-radius reason cli.sh documents.
-    """
-    override = os.environ.get("KIROCREW_VENV", "").strip()
-    if override:
-        legacy = Path(os.path.abspath(override))
-    else:
-        legacy = Path(f"{str(data_home()).rstrip('/')}-venv")
-    return ManagedVenvLayout(
-        legacy=legacy,
-        stable_link=legacy.with_name(f"{legacy.name}-current"),
-    )
-
-
-def running_from_managed_venv(layout: ManagedVenvLayout | None = None) -> bool:
-    """Is THIS process served by the managed venv (legacy or versioned tree)?
-
-    The dispatch predicate for the shadow path: a pipx install, a system
-    Python, or a dev venv must never take it — their bytes are owned by
-    something else, and building a sibling tree beside a data home they do not
-    use would be litter at best. POSIX-only by construction: cli.sh is a POSIX
-    installer, so on Windows there is no managed venv to detect.
-
-    Identity comes from the interpreter's ``bin/`` directory, not the file:
-    ``python -m venv`` symlinks ``bin/python3`` to the base interpreter, so
-    resolving that file leaves the venv before the layout can recognize it.
-    """
-    if not IS_POSIX:
-        return False
-    if layout is None:
-        layout = managed_venv_layout()
-    return layout.is_managed_tree(Path(sys.executable).parent)
-
-
-def _legacy_nested_venv() -> Path:
-    """The venv an earlier ``cli.sh`` created INSIDE the data home.
-
-    Mirrors cli.sh's ``_OLD_VENV`` (``<data home>/venv``) exactly. The current
-    installer retires it: a re-run that lands a working tree beside the data
-    home repoints the stable link and the launcher at that tree, then
-    ``rm -rf``s this one. The gateway's own wheel auto-update drives that
-    re-run, so the deletion can happen underneath the running process.
-    """
-    return data_home() / "venv"
-
-
-def _respawn_tree_is_managed(layout: ManagedVenvLayout) -> bool:
-    """Is the tree serving THIS process one a restart may re-route?
-
-    Identity is read from the interpreter's ``bin/`` directory, not from the
-    interpreter file: ``python -m venv`` writes ``bin/python3`` as a symlink
-    to the base interpreter, so resolving the file lands outside every venv
-    and would answer "not managed" for every real install. The directory
-    resolves through the layout's own links (stable link -> versioned tree)
-    and stops there.
-
-    Two identities qualify. A tree of this layout (legacy or versioned), and
-    the retired in-data-home venv — our own environment from an earlier
-    installer, which the same cli.sh re-run that lands the new tree deletes
-    from under the running gateway; without the stable link that process has
-    no interpreter left to exec. This is the respawn identity only: the
-    dispatch predicate for the shadow-build path is
-    :func:`running_from_managed_venv`, which keeps its own rule.
-    """
-    bin_dir = Path(sys.executable).parent
-    if layout.is_managed_tree(bin_dir):
-        return True
-    try:
-        resolved = bin_dir.resolve()
-        nested = _legacy_nested_venv().resolve()
-    except OSError:
-        return False
-    return resolved == nested or resolved.is_relative_to(nested)
-
-
-def _interpreter_in(tree: Path) -> str | None:
-    """The usable interpreter inside *tree*'s ``bin/``, or ``None``.
-
-    Prefers this process's own interpreter name so a restart keeps the version
-    it was launched under, and falls back to ``python3``, which every venv
-    ships.
-    """
-    for name in (os.path.basename(sys.executable), "python3"):
-        candidate = tree / "bin" / name
-        try:
-            if candidate.exists() and os.access(candidate, os.X_OK):
-                return str(candidate)
-        except OSError:
-            continue
-    return None
-
-
-def _respawn_fallback(layout: ManagedVenvLayout) -> str:
-    """The answer when the stable link cannot carry the restart.
-
-    ``sys.executable`` whenever it still exists — a broken, absent, or
-    outside-the-layout link must never take the restart path away from a
-    process whose own interpreter is fine.
-
-    When it does NOT exist, the cached path names nothing and the exec would
-    raise ENOENT. That is reachable: the installer re-run that retires the
-    in-data-home venv deletes it on the NEW tree's own import check, which is
-    independent of the stable-link repoint — the repoint is skipped when a real
-    directory sits at the stable name, and its failure is non-fatal. So the
-    nested venv is gone while the link is unusable. The legacy fixed tree is
-    the interpreter that re-run just built and import-verified, and this engine
-    never prunes it, so it is the honest last resort. Validated the same way as
-    the stable link's: inside the layout, present, executable.
-    """
-    if os.path.exists(sys.executable):
-        return sys.executable
-    if layout.is_managed_tree(layout.legacy):
-        candidate = _interpreter_in(layout.legacy)
-        if candidate is not None:
-            return candidate
-    return sys.executable
-
-
-def respawn_executable() -> str:
-    """The interpreter a gateway restart should exec.
-
-    ``sys.executable`` is the answer for every install shape EXCEPT a managed
-    venv that has been promoted past the tree this process started from: there
-    the cached path resolves into the OLD versioned tree (still on disk, so
-    the exec would succeed — and silently resurrect the old version). Routing
-    through the stable link is what makes a restart pick up a promotion, and
-    it is one of the four persisted launch paths RFC §3 requires to resolve
-    through the stable name.
-
-    Falls back to ``sys.executable`` whenever the stable link does not exist
-    or does not carry a usable interpreter, so a broken or absent link can
-    never take the restart path away — except when ``sys.executable`` itself is
-    already gone, where :func:`_respawn_fallback` reaches the legacy tree
-    instead of handing back a path that does not exist.
-
-    One more shape routes here: a process still served by the retired
-    in-data-home venv (:func:`_legacy_nested_venv`). The installer re-run that
-    migrates it deletes that venv after repointing the stable link, so
-    ``sys.executable`` is gone and the stable link is the only interpreter
-    left; before that re-run there is no stable link and the fallback keeps
-    the restart on the nested venv, unchanged.
-    """
-    if not IS_POSIX:
-        return sys.executable
-    layout = managed_venv_layout()
-    if not _respawn_tree_is_managed(layout):
-        return sys.executable
-    # The link's TARGET must resolve inside this layout's own trees before it
-    # is trusted with an exec: a stable link repointed outside the managed
-    # parent answers sys.executable instead. Scope honestly stated: this pins
-    # WHERE the interpreter may live, not WHO wrote it — an actor with shell
-    # as the gateway's user can rewrite the trees themselves (sys.executable's
-    # own tree included), which is the RFC's accepted local-code-execution gap
-    # and is not widened by the link.
-    if not layout.is_managed_tree(layout.stable_link):
-        return _respawn_fallback(layout)
-    candidate = _interpreter_in(layout.stable_link)
-    if candidate is not None:
-        return candidate
-    return _respawn_fallback(layout)
-
 
 # ── Manifest fetch and verification ─────────────────────────────────────────
-
-
-def _staging_dir() -> Path:
-    """Per-run staging area under the data home's ``trust/`` keystone directory.
-
-    The verified wheel sits on disk between its SHA-256 check and the pip
-    install, and a TMPDIR staging file is writable by the agent (same uid, and
-    TMPDIR is deliberately agent-reachable scratch) — a swap in that window
-    would promote unverified code. ``trust/`` is the existing whole-directory
-    keystone leaf: the agent's file gate and every bash form refuse it, while
-    this engine (the gateway or the operator's CLI) writes directly. Same
-    accepted residual as every keystone leaf: arbitrary local code as the
-    user is out of scope, the AGENT's tool surface is what is fenced.
-    """
-    root = data_home() / "trust" / "update-staging"
-    make_owner_only_dir(root)
-    return root
-
-
-def _download_to_file(url: str, dest: Path, cap: int, timeout: float, expected_sha: str) -> None:
-    """Stream *url* into *dest*, enforcing *cap* and the digest INCREMENTALLY.
-
-    Chunked rather than buffered: the wheel ceiling is 500 MiB, and one
-    ``resp.read()`` of that size doubles as a memory spike on the very gateway
-    the update is trying to keep alive. The hash is folded in as chunks land,
-    so the verify step never re-reads the file it just wrote — and the digest
-    therefore covers the exact bytes on disk.
-    """
-    if not url.startswith("https://"):
-        raise WheelUpdateError(f"refusing non-HTTPS URL: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "kirocrew-update/1"})
-    digest = hashlib.sha256()
-    received = 0
-    try:
-        with (
-            urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected
-                req, timeout=timeout
-            ) as resp,
-            open(dest, "wb") as out,
-        ):
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                received += len(chunk)
-                if received > cap:
-                    raise WheelUpdateError(f"{url} exceeded the {cap}-byte ceiling")
-                digest.update(chunk)
-                out.write(chunk)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        try:
-            dest.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise WheelUpdateError(f"could not fetch {url}: {exc}") from exc
-    except WheelUpdateError:
-        try:
-            dest.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-    got = digest.hexdigest()
-    if got != expected_sha:
-        try:
-            dest.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise WheelUpdateError(
-            f"wheel SHA-256 mismatch (expected {expected_sha}, got {got}) — refusing to install"
-        )
-
-
-def _fetch_bytes(url: str, cap: int, timeout: float) -> bytes:
-    """GET *url*, refusing more than *cap* received bytes.
-
-    The single network seam of this module, so tests stub one function. HTTPS
-    is asserted here as defence in depth — the callers validate the CDN base
-    before composing the URL, but this function must hold on its own.
-    """
-    if not url.startswith("https://"):
-        raise WheelUpdateError(f"refusing non-HTTPS URL: {url}")
-    req = urllib.request.Request(url, headers={"User-Agent": "kirocrew-update/1"})
-    try:
-        with urllib.request.urlopen(  # nosemgrep: dynamic-urllib-use-detected
-            req, timeout=timeout
-        ) as resp:
-            raw = resp.read(cap + 1)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise WheelUpdateError(f"could not fetch {url}: {exc}") from exc
-    if len(raw) > cap:
-        raise WheelUpdateError(f"{url} exceeded the {cap}-byte ceiling")
-    return raw
 
 
 def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -499,62 +152,190 @@ def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def _verify_signature(canonical: bytes, signature: bytes, workdir: Path) -> None:
-    """Verify *signature* over *canonical* against the pinned trust root.
-
-    Delegates the RSA math to the ``openssl`` binary — the same verifier
-    cli.sh uses, resolved through :func:`trusted_system_bin` so a planted
-    PATH shim cannot stand in for it. The pinned key's fingerprint is
-    self-checked first (SHA-256 of its SubjectPublicKeyInfo DER must equal
-    :data:`CLI_MANIFEST_KEY_ID`), so an accidental edit to either constant
-    fails closed before any signature is considered.
-    """
+def _openssl_bin() -> str:
     openssl = trusted_system_bin("openssl")
     if openssl is None:
         raise WheelUpdateError(
             "openssl is required to verify the signed manifest and was not "
             "found in a trusted system directory"
         )
-    pem = workdir / "cli-manifest-public.pem"
-    try:
-        pem.write_bytes(base64.b64decode(CLI_MANIFEST_PUBLIC_KEY_B64, validate=True))
-    except (ValueError, OSError) as exc:
-        raise WheelUpdateError("embedded manifest public key is malformed") from exc
+    return openssl
 
-    der = workdir / "cli-manifest-public.der"
+
+def _check_key_fingerprint(openssl: str, *, ctx: _BuildContext = _NO_CONTEXT) -> bytes:
+    """Return the embedded public key PEM after self-checking its fingerprint.
+
+    The PEM goes to ``openssl pkey`` on STDIN and the DER comes back on STDOUT —
+    no file is written by name, so there is no name for a concurrent same-uid
+    process to pre-plant as a symlink and have the gateway follow. The DER's
+    SHA-256 must equal :data:`CLI_MANIFEST_KEY_ID`, so an accidental edit to
+    either constant fails closed before any signature is considered.
+    """
     try:
-        proc = subprocess.run(
-            [openssl, "pkey", "-pubin", "-in", str(pem), "-outform", "DER", "-out", str(der)],
-            capture_output=True,
-            timeout=_OPENSSL_TIMEOUT_SECS,
-            # Explicit paths carry every output, but the child's CWD is pinned
-            # to the step's own workdir anyway so nothing an openssl build
-            # chooses to drop (an .rnd seed file, a debug artifact) can land in
-            # the gateway's working directory.
-            cwd=str(workdir),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WheelUpdateError(f"openssl could not read the pinned key: {exc}") from exc
-    if proc.returncode != 0:
+        pem = base64.b64decode(CLI_MANIFEST_PUBLIC_KEY_B64, validate=True)
+    except ValueError as exc:
+        raise WheelUpdateError("embedded manifest public key is malformed") from exc
+    rc, der, _err = _spawn_build_child(
+        [openssl, "pkey", "-pubin", "-outform", "DER"],
+        _OPENSSL_TIMEOUT_SECS,
+        "reading the pinned manifest key with openssl",
+        ctx=ctx,
+        want_stdout=True,
+        stdin_data=pem,
+    )
+    if rc != 0:
         raise WheelUpdateError("embedded manifest public key is invalid")
-    fingerprint = "sha256:" + hashlib.sha256(der.read_bytes()).hexdigest()
+    fingerprint = "sha256:" + hashlib.sha256(der).hexdigest()
     if fingerprint != CLI_MANIFEST_KEY_ID:
         raise WheelUpdateError("embedded manifest public key fingerprint mismatch")
+    return pem
 
-    payload = workdir / "signed-payload.json"
-    sig = workdir / "manifest-signature.bin"
-    payload.write_bytes(canonical)
-    sig.write_bytes(signature)
+
+def _verify_signature(
+    canonical: bytes, signature: bytes, workdir: Path, *, ctx: _BuildContext = _NO_CONTEXT
+) -> None:
+    """Verify *signature* over *canonical* against the pinned trust root.
+
+    Delegates the RSA math to the ``openssl`` binary — the same verifier
+    cli.sh uses, resolved through :func:`trusted_system_bin` so a planted
+    PATH shim cannot stand in for it. The pinned key's fingerprint is
+    self-checked first. Each openssl child runs through
+    :func:`_spawn_build_child`, so only a genuine refusal reads "signature
+    verification failed"; an openssl that cannot run or times out says so in
+    its own words.
+
+    No verification INPUT is ever written to a predictable, shared, or
+    agent-reachable path. The gateway runs OUTSIDE the sandbox, so writing the
+    PEM/signature/payload to a named file in an agent-writable directory (the
+    SEL ``trust`` keystone is sandbox read-write) would let a concurrent
+    same-uid agent pre-plant that name as a symlink to an operator file and have
+    this process clobber it through the write. So on POSIX the key and signature
+    are handed to openssl over anonymous pipe FDs (``/dev/fd/N``) the gateway
+    created, and the payload over stdin — no file exists to plant against.
+    ``workdir`` is used only as a Windows fallback (no ``/dev/fd`` there), and
+    then every file is opened ``O_CREAT|O_EXCL|O_NOFOLLOW`` so a pre-planted
+    symlink is refused rather than followed.
+    """
+    openssl = _openssl_bin()
+    pem = _check_key_fingerprint(openssl, ctx=ctx)
+
+    devfd = IS_POSIX and os.path.isdir("/dev/fd")
+    if devfd:
+        _verify_over_fds(openssl, pem, signature, canonical, ctx=ctx)
+    else:
+        _verify_over_nofollow_files(openssl, pem, signature, canonical, workdir, ctx=ctx)
+
+
+def _verify_over_fds(
+    openssl: str,
+    pem: bytes,
+    signature: bytes,
+    canonical: bytes,
+    *,
+    ctx: _BuildContext = _NO_CONTEXT,
+) -> None:
+    """POSIX path: key + signature over anonymous pipe FDs, payload over stdin.
+
+    Nothing is written to any directory, so there is no attacker-plantable name.
+    """
+    key_r, key_w = os.pipe()
+    sig_r, sig_w = os.pipe()
     try:
-        proc = subprocess.run(
-            [openssl, "dgst", "-sha256", "-verify", str(pem), "-signature", str(sig), str(payload)],
-            capture_output=True,
-            timeout=_OPENSSL_TIMEOUT_SECS,
-            cwd=str(workdir),
+        try:
+            # Write both inputs fully before the child reads them. They are small
+            # (a 2048-bit key, a 256-byte signature), well under a pipe's buffer,
+            # so a single write cannot block against a reader that has not started.
+            os.write(key_w, pem)
+            os.write(sig_w, signature)
+        finally:
+            os.close(key_w)
+            os.close(sig_w)
+        rc, _out, _err = _spawn_build_child(
+            [
+                openssl,
+                "dgst",
+                "-sha256",
+                "-verify",
+                f"/dev/fd/{key_r}",
+                "-signature",
+                f"/dev/fd/{sig_r}",
+                "/dev/stdin",
+            ],
+            _OPENSSL_TIMEOUT_SECS,
+            "checking the manifest signature with openssl",
+            ctx=ctx,
+            stdin_data=canonical,
+            extra_fds=(key_r, sig_r),
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WheelUpdateError(f"openssl signature verification failed: {exc}") from exc
-    if proc.returncode != 0:
+    finally:
+        for fd in (key_r, sig_r):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if rc != 0:
+        raise WheelUpdateError("manifest signature verification failed — refusing to install")
+
+
+def _create_exclusive_nofollow(path: Path, data: bytes) -> None:
+    """Write *data* to *path*, refusing to follow or clobber anything there.
+
+    ``O_CREAT|O_EXCL`` fails if the name already exists (a pre-planted file or
+    symlink), and ``O_NOFOLLOW`` refuses a symlink at the final component — so
+    the gateway never follows an agent-planted link out of the staging dir.
+
+    ``O_BINARY`` (Windows only; 0 elsewhere) keeps the write byte-exact: in text
+    mode Windows translates the canonical payload's trailing ``\\n`` to ``\\r\\n``,
+    which changes the signed bytes and makes verification fail closed.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _verify_over_nofollow_files(
+    openssl: str,
+    pem: bytes,
+    signature: bytes,
+    canonical: bytes,
+    workdir: Path,
+    *,
+    ctx: _BuildContext = _NO_CONTEXT,
+) -> None:
+    """Fallback (no ``/dev/fd``, e.g. Windows): stage in *workdir*, but create
+    every file ``O_CREAT|O_EXCL|O_NOFOLLOW`` so a pre-planted symlink or file is
+    refused rather than followed, and read none of them back by name after."""
+    pem_path = workdir / "cli-manifest-public.pem"
+    payload_path = workdir / "signed-payload.json"
+    sig_path = workdir / "manifest-signature.bin"
+    try:
+        _create_exclusive_nofollow(pem_path, pem)
+        _create_exclusive_nofollow(payload_path, canonical)
+        _create_exclusive_nofollow(sig_path, signature)
+    except OSError as exc:
+        raise WheelUpdateError(f"could not stage verification inputs: {exc}") from exc
+    rc, _out, _err = _spawn_build_child(
+        [
+            openssl,
+            "dgst",
+            "-sha256",
+            "-verify",
+            str(pem_path),
+            "-signature",
+            str(sig_path),
+            str(payload_path),
+        ],
+        _OPENSSL_TIMEOUT_SECS,
+        "checking the manifest signature with openssl",
+        ctx=ctx,
+        cwd=str(workdir),
+    )
+    if rc != 0:
         raise WheelUpdateError("manifest signature verification failed — refusing to install")
 
 
@@ -601,8 +382,7 @@ def parse_and_validate_manifest(
             f"manifest channel {manifest['channel']!r} does not match {channel!r}"
         )
     version = manifest["version"]
-    if not _VERSION_RE.match(version):
-        raise WheelUpdateError("manifest version fails validation")
+    check_release_version(version)
     if not _SHA256_RE.match(manifest["sha256"]):
         raise WheelUpdateError("manifest sha256 fails validation")
     if not _PUB_DATE_RE.match(manifest["pub_date"]):
@@ -637,136 +417,173 @@ def fetch_verified_manifest(
     feed_base: str,
     artifact_base: str,
     workdir: Path,
+    ctx: _BuildContext = _NO_CONTEXT,
 ) -> dict[str, str]:
     """Fetch the channel manifest and return its AUTHENTICATED payload."""
     url = f"{feed_base}/feed/{channel}/latest-cli.json"
-    raw = _fetch_bytes(url, _MANIFEST_MAX_BYTES, _FETCH_TIMEOUT_SECS)
+    raw = _fetch_bytes(url, _MANIFEST_MAX_BYTES, _FETCH_TIMEOUT_SECS, cancel=ctx.cancel)
     payload, canonical, signature = parse_and_validate_manifest(
         raw, channel=channel, artifact_base=artifact_base
     )
-    _verify_signature(canonical, signature, workdir)
+    _raise_if_cancelled(ctx.cancel)
+    _verify_signature(canonical, signature, workdir, ctx=ctx)
     return payload
 
 
-def download_verified_wheel(payload: dict[str, str], dest_dir: Path) -> Path:
+def download_verified_wheel(
+    payload: dict[str, str], dest_dir: Path, *, cancel: ApplyCancel | None = None
+) -> Path:
     """Download the wheel the SIGNED payload names and verify its SHA-256."""
     url = payload["wheel_url"]
     expected_sha = payload["sha256"]
     wheel_path = dest_dir / f"kirocrew-{payload['version']}-py3-none-any.whl"
-    _download_to_file(url, wheel_path, _WHEEL_MAX_BYTES, _WHEEL_FETCH_TIMEOUT_SECS, expected_sha)
+    _download_to_file(
+        url,
+        wheel_path,
+        _WHEEL_MAX_BYTES,
+        _WHEEL_FETCH_TIMEOUT_SECS,
+        expected_sha,
+        cancel=cancel,
+    )
     return wheel_path
 
 
 # ── Shadow build, verification, promotion ───────────────────────────────────
 
 
-def _run(argv: list[str], timeout: float, step: str, cwd: str | None = None) -> None:
-    # Every build child writes into the shadow tree, so all of them run under
-    # the owner-only build umask (see _BUILD_UMASK below).
+def _owned_siblings(layout: ManagedVenvLayout) -> list[Path]:
+    """Every engine-built tree (and tombstone) of this layout beside it."""
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, timeout=timeout, cwd=cwd, umask=_BUILD_UMASK
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise WheelUpdateError(f"{step} timed out after {timeout:.0f}s") from exc
-    except OSError as exc:
-        raise WheelUpdateError(f"{step} could not run: {exc}") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
-        raise WheelUpdateError(
-            f"{step} exited {proc.returncode}" + (f": {detail[-2000:]}" if detail else "")
-        )
+        entries = list(layout.legacy.parent.iterdir())
+    except OSError:
+        return []
+    return [entry for entry in entries if _is_owned_tree(layout, entry)]
 
 
-#: Owner-only umask for the venv/pip build children (POSIX; -1 = leave unchanged).
-#: ``kirocrew service install`` refuses to attach the AppArmor unprivileged-userns
-#: profile to a launcher that is group- or world-writable (service/apparmor.py), and
-#: ``python -m venv``/pip create ``bin/`` under the process umask — so a permissive
-#: umask (``002``, common on shared dev hosts) would otherwise birth the tree ``0775``
-#: and the profile install would refuse, recurring on every update. ``subprocess``
-#: applies ``umask`` in the child between fork and exec (thread-safe, unlike a
-#: ``preexec_fn`` in this threaded gateway), so bin/ and the launcher are born
-#: owner-only with no window and the profile attaches.
-_BUILD_UMASK = 0o077 if IS_POSIX else -1
+def _is_unpromoted_debris(layout: ManagedVenvLayout, tree: Path) -> bool:
+    """An owned tree whose build never completed.
 
-
-#: Ownership sentinel: written into a shadow directory the moment this engine
-#: creates it, removed only after the tree passes verification. Its PRESENCE
-#: proves two things at once — the directory is OURS (an unrelated venv that
-#: happens to carry a versioned name never has it) and the build never
-#: completed (a completed tree had it removed before promotion). Those are
-#: exactly the two conditions under which deletion is safe.
-_SHADOW_SENTINEL = ".kirocrew-shadow-incomplete"
-
-
-def build_shadow_venv(wheel_path: Path, shadow_dir: Path, stable_link: Path | None = None) -> None:
-    """Build a FRESH venv at *shadow_dir* and install *wheel_path* into it.
-
-    The interpreter is this process's own Python: the update replaces Kiro
-    Crew's code, not the interpreter, so the shadow tree is built on the same
-    base the current tree runs on (``python -m venv`` from inside a venv
-    creates the new environment against that venv's base interpreter).
-
-    A leftover shadow from a previous FAILED attempt is removed first, but
-    "leftover" is proven, not assumed: a directory that is currently the
-    stable link's target is a PROMOTED tree — re-running an update for a
-    version that is already live reaches this path with ``shadow_dir`` naming
-    the live tree, and removing it would leave the stable link dangling for
-    the whole rebuild window. That case is refused. Single-writer exclusion
-    against a concurrent update run is the caller's job (see
-    :func:`apply_wheel_update`'s update lock).
+    Shared by the sweep and a failed apply's cleanup, which both remove it only
+    through :func:`_discard_if_unheld`, so a tree a process holds is kept. Never
+    the stable link's target (a promoted tree keeps its sentinel for a moment
+    after the flip, and for good if that unlink failed).
     """
-    if stable_link is not None:
-        try:
-            if stable_link.is_symlink() and stable_link.resolve() == shadow_dir.resolve():
-                raise WheelUpdateError(
-                    f"{shadow_dir} is the stable link's current target — it is "
-                    "already promoted, not a leftover. Nothing to do."
-                )
-        except OSError:
-            # An unreadable stable link cannot prove the directory safe to
-            # remove, so it does not: fall through to the venv-marker guard
-            # below, which still refuses anything that is not a plain venv.
-            pass
-    if shadow_dir.exists() or shadow_dir.is_symlink():
-        if shadow_dir.is_symlink() or not shadow_dir.is_dir():
-            raise WheelUpdateError(
-                f"refusing to reuse {shadow_dir}: it exists and is not a plain directory"
-            )
-        if not (shadow_dir / "pyvenv.cfg").exists():
-            raise WheelUpdateError(
-                f"refusing to remove {shadow_dir}: it exists but is not a virtual "
-                "environment (no pyvenv.cfg)"
-            )
-        # A pre-existing directory is removed ONLY on proof of ownership:
-        # the sentinel this engine writes at build start and removes after
-        # verification. Present = our own incomplete debris, the one case a
-        # retry must clear. Absent = either a COMPLETED tree (might be
-        # serving a gateway whose restart failed — sys.executable vouches
-        # only for THIS process) or an UNRELATED venv that happens to carry
-        # a versioned name (a custom KIROCREW_VENV shares a parent with
-        # whatever else lives there). Both are refused, never deleted.
-        try:
-            if stable_link is not None and stable_link.is_symlink():
-                if stable_link.resolve() == shadow_dir.resolve():
-                    raise WheelUpdateError(
-                        f"{shadow_dir} is the stable link's current target — it is "
-                        "already promoted, not a leftover. Nothing to do."
-                    )
-        except OSError:
-            # An unreadable stable link cannot prove the directory safe to
-            # remove, so it does not: fall through to the sentinel guard,
-            # which still refuses anything not provably ours-and-incomplete.
-            pass
-        if not (shadow_dir / _SHADOW_SENTINEL).exists():
-            raise WheelUpdateError(
-                f"{shadow_dir} already exists and was not left by an "
-                "interrupted update — refusing to remove it. If you are "
-                "certain nothing needs it, remove the directory and re-run."
-            )
-        shutil.rmtree(shadow_dir)
+    try:
+        unfinished = (tree / _SHADOW_SENTINEL).exists()
+    except OSError:
+        return False
+    return unfinished and _is_owned_tree(layout, tree) and not _is_stable_target(layout, tree)
 
-    free = shutil.disk_usage(shadow_dir.parent).free
+
+def _remove_tombstone(tombstone: Path) -> None:
+    """Delete *tombstone*, its ownership proofs last. Best effort; never raises.
+
+    :func:`_is_owned_tree` recognises a tombstone by :data:`TREE_MARKER` (or, for
+    an earlier engine's unfinished build, :data:`_SHADOW_SENTINEL`), and the build
+    writes the marker first, so a plain ``rmtree`` unlinks it first too. An
+    interrupted removal would then leave a tree nothing can identify as ours,
+    which no sweep ever deletes.
+    """
+    proofs = (_SHADOW_SENTINEL, TREE_MARKER)
+    try:
+        entries = [entry for entry in tombstone.iterdir() if entry.name not in proofs]
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            with contextlib.suppress(OSError):
+                entry.unlink()
+    for name in proofs:
+        with contextlib.suppress(OSError):
+            (tombstone / name).unlink()
+    with contextlib.suppress(OSError):
+        tombstone.rmdir()
+
+
+def _discard_tree(tree: Path, *, remove: bool = True) -> None:
+    """Rename *tree* to a tombstone, then (when *remove*) delete the tombstone.
+
+    The rename is atomic, so the versioned name is free the moment it returns.
+    A removal that is interrupted leaves only the tombstone, still carrying its
+    ownership marker, which the next locked apply's sweep
+    (:func:`_sweep_layout_debris`) deletes.
+    """
+    tombstone = tree.with_name(f".{tree.name}{_TOMBSTONE_INFIX}{os.getpid()}")
+    try:
+        os.replace(str(tree), str(tombstone))
+    except OSError as exc:
+        raise WheelUpdateError(f"could not clear {tree}: {exc}") from exc
+    if remove:
+        _remove_tombstone(tombstone)
+
+
+def _release_takes_liveness_lock(tree: Path) -> bool:
+    """Does the release installed in *tree* hold its liveness lock while it runs?
+
+    The engine stamps its ownership marker on every tree it builds, whatever
+    release goes inside, and an older release (an approved channel downgrade)
+    never takes the lock -- so a free lock proves nothing about such a tree.
+    Read off the installed package: the lock arrived with
+    ``kiro_crew/platform/tree_liveness.py``. ``False`` when that cannot be read.
+    """
+    try:
+        return any(tree.glob("lib/python*/site-packages/kiro_crew/platform/tree_liveness.py"))
+    except OSError:
+        return False
+
+
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of the directory at *path*, or ``None`` when absent."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _may_run_without_the_lock(tree: Path) -> bool:
+    """Could a process be running from *tree* without holding its liveness lock?
+
+    True when a release is installed there (its ``kiro_crew`` package exists)
+    and that release predates the lock. A leftover build sentinel does not
+    prove such a tree never ran: an apply killed between its promotion and the
+    sentinel's removal leaves both. A build that stopped before the install
+    leaves no package, and is still debris.
+    """
+    try:
+        installed = any(tree.glob("lib/python*/site-packages/kiro_crew/__init__.py"))
+    except OSError:
+        return True
+    return installed and not _release_takes_liveness_lock(tree)
+
+
+def _discard_if_unheld(tree: Path, *, remove: bool = True) -> bool:
+    """Discard *tree* (see :func:`_discard_tree`) while holding its liveness lock exclusively.
+
+    ``False``, and nothing touched, when some process holds the lock (or it
+    cannot be opened); a tree with no lock file has no holder. Raises
+    :class:`WheelUpdateError` when the tombstone rename fails.
+    """
+    try:
+        fd: int | None = os.open(str(tree / LIVENESS_LOCK), os.O_RDWR)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return False
+    try:
+        if fd is not None and not try_acquire_lock(fd, exclusive=True):
+            return False
+        _discard_tree(tree, remove=remove)
+        return True
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _require_free_space(parent: Path) -> None:
+    free = shutil.disk_usage(parent).free
     if free < _SHADOW_MIN_FREE_BYTES:
         raise WheelUpdateError(
             f"not enough free disk space for a shadow install "
@@ -774,9 +591,86 @@ def build_shadow_venv(wheel_path: Path, shadow_dir: Path, stable_link: Path | No
             f"{_SHADOW_MIN_FREE_BYTES // (1024 * 1024)} MiB required)"
         )
 
-    # Claim ownership BEFORE any build step: the sentinel is what a future
-    # retry's reuse guard keys on, so it must exist from the first moment a
-    # partial tree can. `python -m venv` tolerates a non-empty directory.
+
+def build_shadow_venv(
+    wheel_path: Path,
+    shadow_dir: Path,
+    stable_link: Path | None = None,
+    *,
+    ctx: _BuildContext = _NO_CONTEXT,
+) -> None:
+    """Build a FRESH venv at *shadow_dir* and install *wheel_path* into it.
+
+    The interpreter is this process's own Python: the update replaces Kiro
+    Crew's code, not the interpreter, so the shadow tree is built on the same
+    base the current tree runs on (``python -m venv`` from inside a venv
+    creates the new environment against that venv's base interpreter).
+
+    A tree already at *shadow_dir* is replaced only on proof nothing needs it:
+    this layout's engine built it (:func:`_is_owned_tree`), it is none of the
+    trees :func:`_pinned_trees` names (the stable link's target, this
+    process's, the launcher's), and no process holds its liveness lock, which
+    is held exclusively while it is set aside. That covers an interrupted
+    build and also a completed tree the prune kept as the previous one, which a
+    channel move back to that version would otherwise refuse on every attempt.
+    Anything else is refused: the stable link's target (re-running an update
+    for the live version must not leave the link dangling for the rebuild), a
+    tree in use, and a directory this engine did not build. Single-writer
+    exclusion against a concurrent update run is the caller's job (see
+    :func:`apply_wheel_update`'s update lock).
+
+    The tree is claimed with :data:`TREE_MARKER` (naming the layout),
+    :data:`_SHADOW_SENTINEL` and the liveness lock file before any build step.
+    ``ctx.cancel`` kills the build child in flight and is re-checked after a
+    leftover is cleared, so a cancel that lands during that clear claims nothing.
+    """
+    # The layout this tree belongs to, read off its own name: the version never
+    # contains "-", so everything before the last one names the legacy venv.
+    legacy = shadow_dir.with_name(shadow_dir.name.rsplit("-", 1)[0])
+    layout = ManagedVenvLayout(
+        legacy=legacy, stable_link=stable_link or legacy.with_name(f"{legacy.name}-current")
+    )
+    if shadow_dir.exists() or shadow_dir.is_symlink():
+        if shadow_dir.is_symlink() or not shadow_dir.is_dir():
+            raise WheelUpdateError(
+                f"refusing to reuse {shadow_dir}: it exists and is not a plain directory"
+            )
+        if stable_link is not None and _is_stable_target(layout, shadow_dir):
+            raise WheelUpdateError(
+                f"{shadow_dir} is the stable link's current target — it is "
+                "already promoted, not a leftover. Nothing to do."
+            )
+        if not _is_owned_tree(layout, shadow_dir):
+            if (
+                not (shadow_dir / _SHADOW_SENTINEL).exists()
+                and not (shadow_dir / "pyvenv.cfg").exists()
+            ):
+                raise WheelUpdateError(
+                    f"refusing to remove {shadow_dir}: it exists but is not a virtual "
+                    "environment (no pyvenv.cfg)"
+                )
+            raise WheelUpdateError(
+                f"{shadow_dir} already exists and was not built by this install's "
+                "update engine — refusing to remove it. If you are certain nothing "
+                "needs it, remove the directory and re-run."
+            )
+        if (
+            _realpath(shadow_dir) in _pinned_trees(layout)
+            or _may_run_without_the_lock(shadow_dir)
+            or not _discard_if_unheld(shadow_dir)
+        ):
+            raise WheelUpdateError(
+                f"{shadow_dir} already exists and a running kirocrew process uses it — "
+                "refusing to remove it. Stop that process and re-run."
+            )
+
+    _require_free_space(shadow_dir.parent)
+    _raise_if_cancelled(ctx.cancel)
+
+    # Claim ownership BEFORE any build step: the marker and the sentinel are
+    # what a future retry's reuse guard and the sweep key on, so they must exist
+    # from the first moment a partial tree can. `python -m venv` tolerates a
+    # non-empty directory.
     #
     # The root is created OWNER-ONLY (mode=0o700). It is mkdir'd here in the gateway
     # process under that process's own umask, so a permissive umask (002) would
@@ -786,32 +680,35 @@ def build_shadow_venv(wheel_path: Path, shadow_dir: Path, stable_link: Path | No
     # user, and no other account needs to traverse the tree.
     try:
         shadow_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (shadow_dir / TREE_MARKER).write_text(f"{layout.legacy}\n", encoding="utf-8")
         (shadow_dir / _SHADOW_SENTINEL).write_text(
-            "created by kiro_crew.platform.wheel_engine; removed after verification\n",
+            "created by kiro_crew.platform.wheel_engine; removed after promotion\n",
             encoding="utf-8",
         )
+        (shadow_dir / LIVENESS_LOCK).touch(mode=0o600)
     except OSError as exc:
         raise WheelUpdateError(f"could not claim the shadow directory: {exc}") from exc
-    # _run applies the owner-only build umask (see _BUILD_UMASK), so bin/kirocrew
-    # and its dirs are born non-group-writable and the AppArmor profile can attach.
+    # Every interpreter child runs isolated (`-I`), the way the gateway's own
+    # respawn runs, so an inherited PYTHONPATH never reaches pip's resolution.
     _run(
-        [sys.executable, "-m", "venv", str(shadow_dir)],
+        [sys.executable, "-I", "-m", "venv", str(shadow_dir)],
         _VENV_CREATE_TIMEOUT_SECS,
         "venv creation",
-        cwd=str(shadow_dir.parent),
+        ctx=ctx,
     )
-    shadow_python = shadow_dir / "bin" / "python3"
+    shadow_pip = [str(shadow_dir / "bin" / "python3"), "-I", "-m", "pip"]
     try:
         # Best-effort pip refresh, exactly as cli.sh does; a failure here is
-        # not a failed update.
-        subprocess.run(
-            [str(shadow_python), "-m", "pip", "install", "--quiet", "--upgrade", "pip"],
-            capture_output=True,
-            timeout=_VENV_CREATE_TIMEOUT_SECS,
-            cwd=str(shadow_dir),
-            umask=_BUILD_UMASK,
+        # not a failed update (a cancel is, and propagates).
+        _run(
+            shadow_pip + ["install", "--quiet", "--upgrade", "pip"],
+            _VENV_CREATE_TIMEOUT_SECS,
+            "pip refresh",
+            ctx=ctx,
         )
-    except (OSError, subprocess.SubprocessError):
+    except WheelUpdateCancelled:
+        raise
+    except WheelUpdateError:
         pass
     # Binary-only, exactly as cli.sh installs: a dependency with no wheel for
     # this host fails the update up front instead of being compiled from its
@@ -820,18 +717,19 @@ def build_shadow_venv(wheel_path: Path, shadow_dir: Path, stable_link: Path | No
     policy = _pip_binary_policy()
     try:
         _run(
-            [str(shadow_python), "-m", "pip", "install", "--quiet"] + policy + [str(wheel_path)],
+            shadow_pip + ["install", "--quiet"] + policy + [str(wheel_path)],
             _PIP_INSTALL_TIMEOUT_SECS,
             "pip install into the shadow venv",
-            cwd=str(shadow_dir),
+            ctx=ctx,
         )
+    except WheelUpdateCancelled:
+        raise
     except WheelUpdateError as exc:
         # Same classification cli.sh's _report_pip_failure applies: under the
         # binary-only policy, pip's "No matching distribution found" means no
-        # release it may install has a wheel for this host, so the refusal
-        # names the platform, the usual cause and the way out (and the index
-        # as the other cause) rather than leaving the operator with pip's raw
-        # text alone.
+        # release it may install has a wheel for this host, OR the index could
+        # not be reached, so the refusal names both, the platform and the way
+        # out rather than leaving the operator with pip's raw text alone.
         missing = _no_wheel_packages(str(exc)) if policy else []
         if not missing:
             raise
@@ -865,9 +763,9 @@ def _no_wheel_message(missing: list[str]) -> str:
 
     Mirrors cli.sh's message so an install and its later update describe the
     same platform floor and the same two causes; adds the one fact that is
-    specific to the update path: the opt-in is read from the gateway process's
-    environment, so a host that installed with it has to carry it in the
-    service unit for updates to honour it.
+    specific to the update path: only ``kirocrew update`` run from the
+    operator's shell honours the opt-in with that shell's toolchain, because the
+    gateway's own build steps run on the trusted system ``PATH``.
     """
     host = f"{platform.system()} {platform.machine()}"
     if platform.system() == "Linux":
@@ -881,50 +779,61 @@ def _no_wheel_message(missing: list[str]) -> str:
         "set needs a newer Linux (Amazon Linux 2023, RHEL/Rocky 8+, Ubuntu 22.04+, Debian "
         "12+) on x86_64/aarch64, or macOS. It can also mean the package index could not be "
         "reached or does not carry these releases; pip's own words follow. To compile on "
-        f"this host instead, install a C/C++ toolchain and the -dev headers, then set "
-        f"{_ALLOW_SOURCE_BUILDS_ENV}=1 in the environment the gateway runs under "
-        "(the service unit for a service install) and run `kirocrew update` again"
+        f"this host instead, install a C/C++ toolchain and the -dev headers, then run "
+        f"`{_ALLOW_SOURCE_BUILDS_ENV}=1 kirocrew update` from a shell where that "
+        "toolchain is on PATH: that command builds with the shell's own environment, "
+        "while the gateway's automatic update runs its build steps on the trusted "
+        "system PATH only"
     )
 
 
-def verify_shadow_venv(shadow_dir: Path, expected_version: str) -> None:
+#: What the import probe loads: the package and the module the ``kirocrew``
+#: console script imports first, so a tree whose dependencies are missing fails
+#: here rather than at the next start.
+_PROBE_SOURCE = "import kiro_crew, kiro_crew.cli; print(kiro_crew.__version__)"
+
+
+def verify_shadow_venv(
+    shadow_dir: Path, expected_version: str, *, ctx: _BuildContext = _NO_CONTEXT
+) -> None:
     """Prove the shadow tree serves the promised version before promotion.
 
-    ``-I`` isolates the probe from this process's CWD and environment (same
-    reasoning as ``dep_sync._probe_interpreter``), so the answer describes the
-    shadow tree rather than the caller. A tree that cannot import the package,
-    or imports a different version, is never promoted.
+    Three checks, all against the shadow interpreter run isolated (``-I``), so
+    the answer describes the shadow tree rather than the caller: ``pip check``
+    (every installed distribution's requirements are met inside the tree), an
+    import of the package and of the CLI entry module that prints the version,
+    and the console script's presence. A tree that fails any of them is never
+    promoted.
     """
-    shadow_python = shadow_dir / "bin" / "python3"
-    try:
-        proc = subprocess.run(
-            [
-                str(shadow_python),
-                "-I",
-                # -B: -I implies -E, so PYTHONPYCACHEPREFIX cannot reach this
-                # child. See ``sandbox._LAUNCHER_INTERPRETER_FLAGS``.
-                "-B",
-                "-X",
-                "utf8",
-                "-c",
-                "import kiro_crew; print(kiro_crew.__version__)",
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(shadow_dir),
-            timeout=_PROBE_TIMEOUT_SECS,
+    shadow_python = str(shadow_dir / "bin" / "python3")
+    rc, out, err = _spawn_build_child(
+        [shadow_python, "-I", "-m", "pip", "check"],
+        _PROBE_TIMEOUT_SECS,
+        "the shadow venv dependency check",
+        ctx=ctx,
+        want_stdout=True,
+    )
+    if rc != 0:
+        # pip check names each unmet requirement on stdout.
+        detail = _redacted_detail(out or err, FAILURE_TEXT_CHARS)
+        raise WheelUpdateError(
+            "shadow venv has unmet dependencies — not promoting" + (f": {detail}" if detail else "")
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WheelUpdateError(f"shadow venv verification could not run: {exc}") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or "").strip()
+    rc, out, err = _spawn_build_child(
+        [shadow_python, "-I", "-X", "utf8", "-c", _PROBE_SOURCE],
+        _PROBE_TIMEOUT_SECS,
+        "the shadow venv import probe",
+        ctx=ctx,
+        want_stdout=True,
+    )
+    if rc != 0:
+        detail = _redacted_detail(err, FAILURE_TEXT_CHARS)
         raise WheelUpdateError(
             "shadow venv cannot import kiro_crew — not promoting"
-            + (f": {detail[-500:]}" if detail else "")
+            + (f": {detail}" if detail else "")
         )
-    got = proc.stdout.strip()
+    # `-X utf8` makes the probe write UTF-8 whatever the host locale is.
+    got = utf8_stdout(out).strip()
     if got != expected_version:
         raise WheelUpdateError(
             f"shadow venv reports version {got!r}, expected {expected_version!r} — not promoting"
@@ -963,22 +872,29 @@ def repoint_launcher_symlink(layout: ManagedVenvLayout) -> bool:
     Only rewrites a symlink that already resolves into one of OUR trees — a
     launcher the operator pointed somewhere else (pipx, a wrapper script) is
     not this engine's to move. Returns whether the launcher now resolves
-    through the stable link.
+    through the stable link; every ``False`` is logged, because a launcher left
+    behind keeps new shells and a service start on the previous version.
     """
     launcher = Path.home() / ".local" / "bin" / "kirocrew"
     target = layout.stable_link / "bin" / "kirocrew"
     if not launcher.is_symlink():
+        logger.warning(
+            "Launcher %s is missing or not a symlink; it was not repointed at %s",
+            launcher,
+            target,
+        )
         return False
     try:
         current = Path(os.readlink(launcher))
-    except OSError:
+    except OSError as exc:
+        logger.warning("Could not read the launcher %s: %s", launcher, exc)
         return False
     if not current.is_absolute():
         current = launcher.parent / current
     if current == target:
         return True
     if not layout.is_managed_tree(current):
-        logger.info("Launcher %s points outside the managed trees; leaving it", launcher)
+        logger.warning("Launcher %s points outside the managed trees; leaving it", launcher)
         return False
     tmp = launcher.with_name(f"{launcher.name}.{os.getpid()}.new")
     try:
@@ -995,6 +911,173 @@ def repoint_launcher_symlink(layout: ManagedVenvLayout) -> bool:
     return True
 
 
+# ── Debris and pruning ──────────────────────────────────────────────────────
+
+#: How many completed versioned trees survive a prune besides the stable link's
+#: target: the most recent previous one, kept as a recovery target.
+_KEEP_PREVIOUS_TREES = 1
+
+#: A staging directory this old belongs to an apply that is gone (the process
+#: exited mid-download). Well past every step's own bound.
+_STAGING_STALE_SECS = 3600.0
+
+
+def _pid_alive(pid: int) -> bool:
+    from kiro_crew.platform_compat import pid_exists, pid_is_zombie
+
+    return pid_exists(pid) and pid_is_zombie(pid) is not True
+
+
+def _sweep_layout_debris(layout: ManagedVenvLayout, cancel: ApplyCancel | None = None) -> None:
+    """Remove what earlier applies left: tombstones, unpromoted trees, staging.
+
+    Runs under the update lock, so no other apply of this layout is writing.
+    Deletes only what is provably this layout's debris (:func:`_is_owned_tree`):
+    a tombstone; an owned tree whose build never completed and that nothing uses
+    (:func:`_is_unpromoted_debris`) and that holds no installed release older
+    than the liveness lock (:func:`_may_run_without_the_lock`); a
+    ``crew-venv-current.<pid>.new`` link whose
+    writer is gone; a staging directory past :data:`_STAGING_STALE_SECS`. An
+    entry that cannot be read is skipped and kept.
+    """
+    for entry in _owned_siblings(layout):
+        _raise_if_cancelled(cancel)
+        if entry.name.startswith("."):
+            _remove_tombstone(entry)
+        elif _is_unpromoted_debris(layout, entry) and not _may_run_without_the_lock(entry):
+            with contextlib.suppress(WheelUpdateError):
+                _discard_if_unheld(entry)
+    temp_link = re.compile(re.escape(f"{layout.stable_link.name}.") + r"(\d+)\.new")
+    try:
+        entries = list(layout.legacy.parent.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        match = temp_link.fullmatch(entry.name)
+        if match and entry.is_symlink() and not _pid_alive(int(match.group(1))):
+            with contextlib.suppress(OSError):
+                entry.unlink()
+    try:
+        staging = list(_staging_dir().iterdir())
+    except OSError:
+        staging = []
+    now = time.time()
+    for entry in staging:
+        try:
+            stale = now - entry.stat().st_mtime > _STAGING_STALE_SECS
+        except OSError:
+            continue
+        if entry.name.startswith("kirocrew-update-") and stale:
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+def _completed_trees(layout: ManagedVenvLayout) -> list[Path]:
+    """Every owned, completed versioned tree, most recently installed first."""
+    found: list[tuple[float, Path]] = []
+    for entry in _owned_siblings(layout):
+        if entry.name.startswith("."):
+            continue
+        try:
+            if (entry / _SHADOW_SENTINEL).exists():
+                continue
+            found.append(((entry / "bin" / "kirocrew").stat().st_mtime, entry))
+        except OSError:
+            continue
+    return [tree for _mtime, tree in sorted(found, key=lambda item: item[0], reverse=True)]
+
+
+def _launcher_tree(layout: ManagedVenvLayout) -> Path | None:
+    """The tree ``~/.local/bin/kirocrew`` (the persisted launcher) resolves into."""
+    launcher = _realpath(Path.home() / ".local" / "bin" / "kirocrew")
+    parent = _realpath(layout.legacy.parent)
+    if launcher is None or parent is None:
+        return None
+    for tree in launcher.parents:
+        if tree.parent == parent:
+            return tree
+    return None
+
+
+def _pinned_trees(layout: ManagedVenvLayout) -> set[Path]:
+    """What no prune or rebuild may remove, resolved: the stable link's target,
+    the tree serving this process, and the one the persisted launcher resolves into.
+    """
+    trees = (_realpath(layout.stable_link), _realpath(Path(sys.prefix)), _launcher_tree(layout))
+    return {path for path in trees if path is not None}
+
+
+def _prune_superseded_trees(layout: ManagedVenvLayout) -> None:
+    """Delete owned versioned trees nothing needs; keep the current and one previous.
+
+    Runs after a promotion, under the update lock. Never deleted: the legacy
+    directory, the stable link's target, the tree serving this process, the one
+    the persisted launcher resolves into, the most recent
+    :data:`_KEEP_PREVIOUS_TREES` others, any tree whose liveness lock some
+    process holds (every process started from an engine-built tree holds it,
+    see :mod:`kiro_crew.platform.tree_liveness`), and any tree whose installed
+    release predates that lock (:func:`_release_takes_liveness_lock`), whose
+    free lock proves nothing. A tree is deleted only while this call holds
+    that lock exclusively, through a tombstone.
+    """
+    stable = _realpath(layout.stable_link)
+    others = [tree for tree in _completed_trees(layout) if _realpath(tree) != stable]
+    keep = _pinned_trees(layout)
+    keep.update(path for path in map(_realpath, others[:_KEEP_PREVIOUS_TREES]) if path)
+    for tree in others:
+        if _realpath(tree) in keep or not _release_takes_liveness_lock(tree):
+            continue
+        with contextlib.suppress(WheelUpdateError):
+            if _discard_if_unheld(tree):
+                logger.info("Pruned the superseded tree %s", tree)
+
+
+# ── The update lock ─────────────────────────────────────────────────────────
+
+
+def _update_lock_path(layout: ManagedVenvLayout) -> Path:
+    # BESIDE the trees it serializes, so every writer for this layout (this
+    # engine in any process, and cli.sh's managed-venv branch) contends on the
+    # same file whatever data home spawned it.
+    return layout.stable_link.with_name(f"{layout.legacy.name}.update.lock")
+
+
+def hold_update_lock() -> int:
+    """Take this layout's update lock now; return the held descriptor.
+
+    Raises :class:`WheelUpdateBusy` when another writer holds it, and
+    :class:`WheelUpdateError` when the lock cannot be taken at all (a
+    filesystem that cannot lock is never mistaken for a busy one). The caller
+    owns the descriptor: pass it to :func:`apply_wheel_update` as ``held_lock_fd``
+    and close it afterwards (closing releases the lock).
+    """
+    path = _update_lock_path(managed_venv_layout())
+    try:
+        fd = open_create_or_existing(path, os.O_RDWR, 0o600)
+    except OSError as exc:
+        raise WheelUpdateError(f"could not open the update lock {path}: {exc}") from exc
+    try:
+        taken = try_acquire_lock_or_raise(fd, exclusive=True)
+    except OSError as exc:
+        os.close(fd)
+        raise WheelUpdateError(f"cannot lock {path}: {exc.strerror or exc}") from exc
+    if not taken:
+        os.close(fd)
+        raise WheelUpdateBusy(
+            "another kirocrew update is already in progress — wait for it to finish and re-run"
+        )
+    return fd
+
+
+def release_update_lock(fd: int) -> None:
+    """Release and close a descriptor :func:`hold_update_lock` returned."""
+    with contextlib.suppress(OSError):
+        release_lock(fd)
+    os.close(fd)
+
+
+# ── The apply ───────────────────────────────────────────────────────────────
+
+
 def apply_wheel_update(
     *,
     channel: str,
@@ -1002,45 +1085,111 @@ def apply_wheel_update(
     artifact_base: str,
     expected_version: str,
     progress: Callable[[str], None] = lambda _msg: None,
+    cancel: ApplyCancel | None = None,
+    on_locked: Callable[[], None] = lambda: None,
+    preflight: Callable[[], None] = lambda: None,
+    before_promote: Callable[[], None] = lambda: None,
+    held_lock_fd: int | None = None,
+    trusted_env: bool = True,
 ) -> Path:
     """Run the full shadow flow; return the promoted tree's path.
 
-    Fetch + verify the signed manifest, download + verify the wheel, build the
-    shadow tree, prove it imports the promised version, promote the stable
-    link, repoint the launcher, prune stale trees. Every failure before
-    :func:`promote` leaves the install untouched; promote itself is atomic.
+    Under the update lock (taken here, or *held_lock_fd* when the caller already
+    holds it): sweep earlier debris, repoint a dangling stable link at a tree that
+    exists, run *preflight*, fetch + verify the signed
+    manifest, refuse a release the signed metadata excludes, download + verify
+    the wheel, build the shadow tree, prove it serves the promised version, run
+    *before_promote*, promote the stable link, repoint the launcher, then prune
+    superseded trees. Every failure before :func:`promote` leaves the install
+    untouched; promote itself is atomic.
+
+    *on_locked* runs once the lock is held, so a caller reports progress only
+    for an apply that is actually running; a held lock raises
+    :class:`WheelUpdateBusy` before anything is touched.
+
+    *cancel* lets a caller whose thread it cannot stop withdraw the apply: it is
+    checked before the lock, before every fetch, spawn and download read, and
+    immediately before :func:`promote`, and setting it kills a child in flight.
+    Once set, the call raises :class:`WheelUpdateCancelled` and nothing is
+    promoted. A cancel that lands after promotion has begun is too late by
+    design: the update completed.
+
+    *trusted_env* chooses the children's environment (see
+    :attr:`_BuildContext.trusted_env`).
     """
-    layout = managed_venv_layout()
-    # One update in flight, ever (RFC §5's lease, scoped to what this PR
-    # ships): two concurrent runs would interleave rmtree/venv/pip into the
-    # same shadow directory and one could promote what the other is deleting.
-    # The lock file lives BESIDE the trees it serializes, so every writer for
-    # this layout contends on the same file whatever data home spawned it.
-    lock_path = layout.stable_link.with_name(f"{layout.legacy.name}.update.lock")
+    _raise_if_cancelled(cancel)
+    lock_fd = held_lock_fd if held_lock_fd is not None else hold_update_lock()
     try:
-        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as exc:
-        raise WheelUpdateError(f"could not open the update lock: {exc}") from exc
-    try:
-        if not try_acquire_lock(lock_fd, exclusive=True):
-            raise WheelUpdateError(
-                "another kirocrew update is already in progress — wait for it "
-                "to finish and re-run"
-            )
+        _raise_if_cancelled(cancel)
+        on_locked()
         return _apply_locked(
-            layout,
+            managed_venv_layout(),
             channel=channel,
             feed_base=feed_base,
             artifact_base=artifact_base,
             expected_version=expected_version,
             progress=progress,
+            ctx=_BuildContext(cancel=cancel, lock_fd=lock_fd, trusted_env=trusted_env),
+            preflight=preflight,
+            before_promote=before_promote,
         )
     finally:
+        if held_lock_fd is None:
+            release_update_lock(lock_fd)
+
+
+def _check_buildable(payload: dict[str, str]) -> None:
+    """Refuse, before any download, a release the SIGNED metadata excludes here."""
+    from kiro_crew.dep_sync import python_floor_breach
+
+    floor = python_floor_breach(payload.get("python_requires", ""), sys.version_info[:3])
+    if floor:
+        running = ".".join(str(part) for part in sys.version_info[:3])
+        raise WheelUpdateIncompatible(
+            f"kirocrew {payload['version']} requires Python >= {floor}, and this install "
+            f"runs Python {running}, so the update cannot be built on it. It needs an "
+            f"install on Python {floor} or newer",
+            version=payload["version"],
+            sha256=payload["sha256"],
+        )
+
+
+def _usable_promoted_tree(layout: ManagedVenvLayout, tree: Path) -> bool:
+    """Does the stable link resolve, strictly, to *tree*, with a working interpreter?"""
+    try:
+        target = layout.stable_link.resolve(strict=True)
+        return target == tree.resolve(strict=True) and _interpreter_in(target) is not None
+    except (OSError, RuntimeError):
+        return False
+
+
+def _repair_dangling_stable_link(layout: ManagedVenvLayout) -> None:
+    """Point a stable link whose target is gone back at a tree that exists.
+
+    A dangling ``crew-venv-current`` breaks every launch path that resolves
+    through it (the ``~/.local/bin/kirocrew`` launcher, a service ``ExecStart``)
+    until something repoints it, and it must never be read as "promoted".
+    ``cli.sh`` repoints it at the tree it just installed; here the target is the
+    tree serving this process, else the legacy venv, whichever is this layout's
+    and carries an interpreter. The apply that follows promotes its own tree over
+    it as usual; one that fails leaves a link that at least starts something.
+    """
+    link = layout.stable_link
+    try:
+        if not link.is_symlink() or link.exists():
+            return
+    except OSError:
+        return
+    for tree in (_realpath(Path(sys.prefix)), layout.legacy):
+        if tree is None or not layout.is_managed_tree(tree) or _interpreter_in(tree) is None:
+            continue
         try:
-            release_lock(lock_fd)
-        except OSError:
-            pass
-        os.close(lock_fd)
+            promote(tree, link)
+        except WheelUpdateError as exc:
+            logger.warning("Could not repair the dangling stable link %s: %s", link, exc)
+            return
+        logger.warning("The stable link %s named a missing tree; repointed it at %s", link, tree)
+        return
 
 
 def _apply_locked(
@@ -1051,28 +1200,30 @@ def _apply_locked(
     artifact_base: str,
     expected_version: str,
     progress: Callable[[str], None],
+    ctx: _BuildContext,
+    preflight: Callable[[], None],
+    before_promote: Callable[[], None],
 ) -> Path:
     """The lock-held body of :func:`apply_wheel_update`."""
+    _sweep_layout_debris(layout, ctx.cancel)
+    _repair_dangling_stable_link(layout)
     # Idempotent recovery for a handoff interrupted AFTER promote but BEFORE
     # the launcher was repointed: the stable link already targets this
     # version's tree, so a fresh build would hit build_shadow_venv's
     # stable-target refusal ("already promoted, not a leftover") and abort,
     # stranding the launcher on the old venv forever. Detect that state up
-    # front and finish the one remaining step — repoint — rather than
-    # refusing. Guarded on the RESOLVED target matching this exact version so
-    # it never short-circuits a real version change.
+    # front and finish what remains — the sentinel, the launcher — rather than
+    # refusing. Strict: a DANGLING link, or a target with no interpreter, is not
+    # promoted, and falls through to a rebuild.
     expected_tree = layout.versioned_tree(expected_version)
-    try:
-        already_promoted = (
-            layout.stable_link.is_symlink()
-            and layout.stable_link.resolve() == expected_tree.resolve()
-        )
-    except OSError:
-        already_promoted = False
-    if already_promoted:
+    if _usable_promoted_tree(layout, expected_tree):
+        _raise_if_cancelled(ctx.cancel)
         progress(f"{expected_version} is already promoted; completing the launcher handoff…")
+        with contextlib.suppress(OSError):
+            (expected_tree / _SHADOW_SENTINEL).unlink(missing_ok=True)
         repoint_launcher_symlink(layout)
         return expected_tree
+    preflight()
     with tempfile.TemporaryDirectory(prefix="kirocrew-update-", dir=str(_staging_dir())) as tmp:
         workdir = Path(tmp)
         progress("Verifying the signed release manifest…")
@@ -1081,6 +1232,7 @@ def _apply_locked(
             feed_base=feed_base,
             artifact_base=artifact_base,
             workdir=workdir,
+            ctx=ctx,
         )
         version = payload["version"]
         if version != expected_version:
@@ -1091,62 +1243,157 @@ def _apply_locked(
                 f"the feed now serves {version}, not the {expected_version} the "
                 "check reported — re-run the update"
             )
+        _check_buildable(payload)
+        _require_free_space(layout.legacy.parent)
         progress(f"Downloading kirocrew {version}…")
-        wheel_path = download_verified_wheel(payload, workdir)
+        wheel_path = download_verified_wheel(payload, workdir, cancel=ctx.cancel)
         progress("Wheel SHA-256 verified against the signed digest.")
 
         shadow_dir = layout.versioned_tree(version)
+        # Which directory, if any, sat at the tree's name before this attempt.
+        # A rebuild that replaces it creates a new one; a rebuild that refuses
+        # leaves it as it was, and then it is not this attempt's to clean up.
+        found_before = _dir_identity(shadow_dir)
         progress(f"Building the new environment at {shadow_dir}…")
-        build_shadow_venv(wheel_path, shadow_dir, stable_link=layout.stable_link)
-        progress("Verifying the new environment…")
-        verify_shadow_venv(shadow_dir, version)
-        progress("Promoting…")
-        promote(shadow_dir, layout.stable_link)
-        # The sentinel comes off only AFTER promotion: a crash in the window
-        # between verify and promote would otherwise leave a verified,
-        # unpromoted tree with no ownership marker — which the reuse guard
-        # then refuses forever. Until the link flips, the tree is still OURS
-        # to clear on retry; once it flips, the guard's stable-target refusal
-        # covers the brief window in which a promoted tree still carries the
-        # sentinel. A failure to unlink after a successful promote is
-        # reported, not raised — the update itself already happened.
         try:
-            (shadow_dir / _SHADOW_SENTINEL).unlink(missing_ok=True)
-        except OSError as exc:
-            logger.warning("Could not clear the build sentinel in %s: %s", shadow_dir, exc)
-            progress(f"Note: could not clear the build sentinel in {shadow_dir}: {exc}")
-        if not repoint_launcher_symlink(layout):
-            # The stable link is promoted, so restarts pick the new tree up,
-            # but a launcher still aimed elsewhere keeps NEW shells on the old
-            # version. Surfaced rather than swallowed — the operator can
-            # repoint it by re-running the installer.
-            progress(
-                "Note: the ~/.local/bin/kirocrew launcher was not repointed; "
-                "new shells keep the previous version until the installer is re-run."
-            )
-        # Deliberately NO pruning here. A versioned tree can be deleted only
-        # with proof no process is running from it, and this engine cannot
-        # prove liveness yet: the gateway may still be serving from a tree
-        # older than the one this CLI runs from, and sys.executable only
-        # vouches for THIS process. Old trees stay as manual recovery targets
-        # until an ownership/liveness protocol lands (tracked as follow-up).
-        return shadow_dir
+            build_shadow_venv(wheel_path, shadow_dir, stable_link=layout.stable_link, ctx=ctx)
+            progress("Verifying the new environment…")
+            verify_shadow_venv(shadow_dir, version, ctx=ctx)
+            before_promote()
+            # The last point a cancel is honoured: past it the stable link flips.
+            _raise_if_cancelled(ctx.cancel)
+            progress("Promoting…")
+            promote(shadow_dir, layout.stable_link)
+        except BaseException:
+            # Nothing was promoted (a tree the link already names is never
+            # touched), so a tree this attempt claimed is debris. A tree it did
+            # not claim (the rebuild refused it) is left exactly as it was. When the
+            # process is ending (a shutdown or exec cancel), only the rename
+            # runs and the next sweep deletes the tombstone.
+            claimed = found_before is None or _dir_identity(shadow_dir) != found_before
+            if claimed and _is_unpromoted_debris(layout, shadow_dir):
+                cancel = ctx.cancel
+                ending = (
+                    cancel is not None
+                    and cancel.is_set()
+                    and cancel.reason not in _REMOVE_PARTIAL_TREE_REASONS
+                )
+                with contextlib.suppress(WheelUpdateError):
+                    _discard_if_unheld(shadow_dir, remove=not ending)
+            raise
+    # The sentinel comes off only AFTER promotion: a crash in the window between
+    # verify and promote would otherwise leave a verified, unpromoted tree with
+    # no ownership marker. Until the link flips, the tree is still OURS to clear
+    # on retry; once it flips, the stable-target rules protect it. A failure to
+    # unlink after a successful promote is reported, not raised — the update
+    # itself already happened, and the already-promoted path clears it later.
+    try:
+        (shadow_dir / _SHADOW_SENTINEL).unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("Could not clear the build sentinel in %s: %s", shadow_dir, exc)
+        progress(f"Note: could not clear the build sentinel in {shadow_dir}: {exc}")
+    if not repoint_launcher_symlink(layout):
+        # The stable link is promoted, so restarts pick the new tree up, but a
+        # launcher still aimed elsewhere keeps NEW shells on the old version.
+        # repoint_launcher_symlink logged why.
+        progress(
+            "Note: the ~/.local/bin/kirocrew launcher was not repointed; "
+            "new shells keep the previous version until the installer is re-run."
+        )
+    _prune_superseded_trees(layout)
+    return shadow_dir
 
 
 __all__ = [
     "CLI_MANIFEST_KEY_ID",
     "CLI_MANIFEST_PUBLIC_KEY_B64",
+    "FAILURE_TEXT_CHARS",
+    "ApplyCancel",
     "ManagedVenvLayout",
+    "WheelUpdateBusy",
+    "WheelUpdateCancelled",
     "WheelUpdateError",
+    "WheelUpdateIncompatible",
+    "WheelUpdateNotReady",
+    "WheelUpdateSnapshotFailed",
     "apply_wheel_update",
     "build_shadow_venv",
+    "check_release_version",
     "download_verified_wheel",
     "fetch_verified_manifest",
+    "hold_update_lock",
     "managed_venv_layout",
     "parse_and_validate_manifest",
     "promote",
+    "release_update_lock",
     "repoint_launcher_symlink",
     "respawn_executable",
     "running_from_managed_venv",
+    "runs_through_stable_link",
+    "stable_launch_path",
     "verify_shadow_venv",
 ]
+
+
+# This module is the facade of the managed-venv update engine: every name is reached
+# through it as ``kiro_crew.platform.wheel_engine.<name>``. A read is served by the owner that binds
+# the name, and a write -- ``monkeypatch.setattr``, ``mock.patch`` -- reaches every owner
+# holding it (:mod:`kiro_crew._facade_mirror`). Owners never import this module. The
+# offline trust root and the manifest signature check that reads it, the shadow build and
+# promotion, debris pruning, the update lock and the apply stay here, and so does
+# ``download_verified_wheel``, the one caller of the transfer owner's
+# ``_download_to_file``, which compares the wheel's SHA-256 to the signed digest. New work
+# goes to the owner of its responsibility:
+#
+#   ``wheel_engine_contract`` -- the bounds, the manifest grammar, the errors, the cancel flag
+#   ``wheel_engine_layout`` -- where the trees live, and what a restart re-executes
+#   ``wheel_engine_build_child`` -- running one child process of the apply
+#   ``wheel_engine_transfer`` -- the bounded download of a release's bytes and its digest
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.platform.wheel_engine_contract",
+    "kiro_crew.platform.wheel_engine_layout",
+    "kiro_crew.platform.wheel_engine_build_child",
+    "kiro_crew.platform.wheel_engine_transfer",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(sys.modules[__name__], _OWNERS, excluded=()).served)
+sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.platform.wheel_engine_build_child import (  # noqa: F401
+        _BUILD_UMASK,
+        _ERROR_DETAIL_CHARS,
+        _KEPT_LOADER_PATHS,
+        _REAP_POLL_SECS,
+        _STDERR_TAIL_BYTES,
+        _STDOUT_MAX_BYTES,
+        _build_child_env,
+    )
+    from kiro_crew.platform.wheel_engine_contract import (  # noqa: F401
+        _PIP_BINARY_ONLY,
+        _VERSION_RE,
+        _WHEEL_FETCH_TOTAL_SECS,
+        WheelUpdateNotReady,
+        WheelUpdateSnapshotFailed,
+    )
+    from kiro_crew.platform.wheel_engine_layout import (  # noqa: F401
+        _PIPX_METADATA_NAME,
+        _legacy_nested_venv,
+        _respawn_fallback,
+        _respawn_tree_is_managed,
+        _versioned_name,
+        respawn_executable,
+        running_from_managed_venv,
+        running_from_pipx,
+        runs_through_stable_link,
+        stable_launch_path,
+    )
+    from kiro_crew.platform.wheel_engine_transfer import (  # noqa: F401
+        _read_bounded,
+        _response_socket,
+        _SinkWriteError,
+    )

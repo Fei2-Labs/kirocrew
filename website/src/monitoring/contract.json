@@ -2,8 +2,8 @@
   "monitorStateVersion": 1,
   "limits": {
     "cadenceSecs": { "minimum": 15, "maximum": 86400, "defaultValue": 300 },
-    "maxRuntimeSecs": { "minimum": 1, "maximum": 604800, "defaultValue": 14400 },
-    "maxAgentTurns": { "minimum": 1, "maximum": 8, "defaultValue": 8 },
+    "maxRuntimeSecs": { "minimum": 1, "maximum": 2592000, "defaultValue": 14400 },
+    "maxAgentTurns": { "minimum": 0, "maximum": 1000, "defaultValue": 0 },
     "maxTokens": { "minimum": 1, "maximum": 1000000, "defaultValue": 250000 },
     "maxProviderErrors": { "minimum": 1, "maximum": 20, "defaultValue": 3 },
     "wakeInstructions": { "maximumLength": 1000 }

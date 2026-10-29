@@ -7,8 +7,16 @@ and cycle-free.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
+
+#: The ``configured_targets()`` prefix every transport gives a DIRECT (1:1)
+#: conversation: ``user:<identity>``. A ``thread:`` or room target is a different
+#: audience and is never the owner's DM. Spelled once, here, because two readers
+#: infer "the owner" from it (:func:`sole_direct_target`'s callers) and a second
+#: spelling would let them disagree about which targets are direct at all.
+DM_TARGET_PREFIX = "user:"
 
 
 @dataclass(frozen=True)
@@ -28,6 +36,33 @@ class ConfiguredChannelTarget:
             "available": self.available,
             "unavailable_reason": self.unavailable_reason,
         }
+
+
+def sole_direct_target(targets: Iterable[Any]) -> str:
+    """The ONE available direct target id among *targets*, or ``""``.
+
+    The single rule by which a channel NAMES its owner. No channel carries an
+    owner field the way Slack's ``owner_id`` does, and an allow-list is a list of
+    people permitted to talk to the agent rather than a claim that any of them is
+    the operator — so an owner can only be inferred, and this refuses to infer one
+    from an ambiguous list: a target is returned only when the channel advertises
+    exactly one available ``user:`` target. Unavailable targets (WeCom may only
+    reply to an inbound message) and thread or room targets (a wider audience than
+    a DM) are not candidates.
+
+    Shared by the proactive owner DM (``send_message``'s channel ``session``) and
+    by session control's owner-DM audience predicate, so the two cannot disagree
+    about who the owner of a channel is. Reads only the neutral target shape, so a
+    caller may hand it a transport's live ``configured_targets()`` list or any
+    duck-typed equivalent.
+    """
+    direct = [
+        str(getattr(target, "target_id", "") or "")
+        for target in targets
+        if str(getattr(target, "target_id", "") or "").startswith(DM_TARGET_PREFIX)
+        and getattr(target, "available", False)
+    ]
+    return direct[0] if len(direct) == 1 else ""
 
 
 @dataclass
@@ -166,11 +201,12 @@ class TransportCapabilities:
     supports_session_resume: bool = False
     # Whether ``send_message`` returns a real message id. Most platforms answer a
     # send with one, so a caller can read an EMPTY id as "refused or exhausted" and
-    # not mistake a dropped message for a delivered one. Two platforms return no id
-    # at all (WeCom's proactive command, Feishu's reply), so for them an empty
-    # string is the SUCCESS value and failure raises — and a caller applying the
-    # empty-id test there reports a delivered message as lost, which for a cron
-    # result means the dedup hash never advances and the same result repeats.
+    # not mistake a dropped message for a delivered one. WeCom's proactive command
+    # and Feishu's reply return no id at all, and iMessage's bridge reports one only
+    # best-effort, so for them an empty string is the SUCCESS value and failure
+    # raises — and a caller applying the empty-id test there reports a delivered
+    # message as lost, which for a cron result means the dedup hash never advances
+    # and the same result repeats.
     # Default True because that is the majority contract and the conservative
     # direction: a transport that forgets to declare it is read strictly, which
     # over-reports failure rather than inventing success.
@@ -219,10 +255,11 @@ def delivery_confirmed(capabilities: TransportCapabilities, message_id: str) -> 
     delivery, and treating it as delivery is a silent loss with consequences
     downstream: cron stands its Slack fallback down and advances its dedup hash on a
     confirmed delivery, so one false success loses the result on every surface at
-    once. WeCom's proactive command and Feishu's reply carry no id at all, so for
-    them the empty string is the SUCCESS value and failure raises -- and applying the
-    empty-id test there turns every delivered cron result into a reported loss whose
-    dedup hash never advances, repeating the same result on every tick.
+    once. WeCom's proactive command and Feishu's reply carry no id at all, and
+    iMessage's bridge reports one only best-effort, so for them the empty string is
+    the SUCCESS value and failure raises -- and applying the empty-id test there
+    turns every delivered cron result into a reported loss whose dedup hash never
+    advances, repeating the same result on every tick.
 
     ``returns_message_id`` is each transport's own answer about which one it follows.
     This function exists so the three proactive-send call sites ask it the same way:
@@ -243,6 +280,10 @@ class InboundMessage:
     thread_id: str | None = None
     attachments: list[Any] = field(default_factory=list)
     is_mention: bool = False
+    # Set by a transport's ``receive`` on a message a person sent; a message the
+    # gateway built itself (a nudge or monitor wake) leaves it False. The channel
+    # dispatchers start a person's turn FOREGROUND from it (kiro_crew.start_priority).
+    person_origin: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -319,8 +360,8 @@ class MessagingTransport(ABC):
         :meth:`authorize` gates a turn the user drove; this gates a message
         nobody asked for -- a cron result, a compaction notice, a subagent
         completion. Those resolve their destination from a **persisted**
-        ``ChannelLink``, which records a conversation but not the principal that
-        authorized it, so removing a recipient from the roster and restarting
+        ``ChannelLink``, and a persisted record cannot re-check the roster that
+        admitted it, so removing a recipient from the roster and restarting
         leaves the link intact and the sends still flowing. Revocation has to be
         re-decided at egress, and only the transport can decide it: the roster
         holds principals while the link holds a conversation id, and whether
@@ -328,13 +369,19 @@ class MessagingTransport(ABC):
         ``chat_id`` IS the ``user_id``; a Discord DM channel id is not).
 
         *principal* is the peer's platform id when the session key positively
-        names one (a 1:1 DM under the default scope), else ``""``. It is what
-        makes the answer reachable for a transport whose conversation id is
-        opaque: check it against the same roster :meth:`authorize` uses. Empty
-        means "the key does not name one principal" -- a room-audience route or a
-        unified bucket -- NOT that nobody is authorized, so a transport that can
-        only answer via the principal should permit rather than deny when it is
-        absent, or it would refuse every group and unified-scope send.
+        names one (a 1:1 DM under the default scope); else, when the key names
+        nobody, the peer the gateway admitted on the link
+        (``ChannelLink.principal``) -- handed in only when the row's gateway-minted
+        admission verifies (``ChannelLink.admission``) and this transport's own
+        record of the conversation (:meth:`direct_peer_of`), if it has one, agrees;
+        else ``""``. It is what makes the answer reachable for a transport whose
+        conversation id is opaque: check it against the same roster
+        :meth:`authorize` uses. Empty means "nothing names one principal the
+        gateway or the transport can vouch for" -- a room-audience route, a unified
+        bucket bound in-channel, an unsigned or rewritten row -- NOT that nobody is
+        authorized, so a transport that can only answer via the principal should
+        permit rather than deny when it is absent, or it would refuse every group
+        and unified-scope send.
 
         A transport whose conversation id already IS the roster identity (Telegram,
         iMessage, WeCom, Weixin) can ignore *principal* and answer from
@@ -365,6 +412,44 @@ class MessagingTransport(ABC):
         overrides synchronously and in memory, matching :meth:`may_send_to`.
         """
         return bool(self.capabilities.supports_session_resume)
+
+    def direct_peer_of(self, conversation_id: str) -> str:
+        """The platform identity of the ONE human in *conversation_id*, or ``""``.
+
+        Answers only when this transport can attest FROM ITS OWN STATE that
+        *conversation_id* is a 1:1 direct conversation and which person it is
+        with: the DM it opened for that person (:meth:`resolve_conversation`), or
+        one an authorized message arrived from. ``""`` means "cannot attest" and
+        covers a room, a thread, a group, an id this process never placed, and a
+        transport that keeps no such record -- never "nobody is authorized".
+
+        The reader is the cross-surface send ladder's per-send recipient leg
+        (``dashboard.chat_runner._recipient_principal``), as defense in depth. A
+        persisted mirror ``ChannelLink`` records a conversation id and, when its
+        writer could name one, the peer it was admitted for
+        (``ChannelLink.principal``) under a MAC only the gateway can mint
+        (``ChannelLink.admission``, :mod:`kiro_crew.mirror_admission`); the ladder
+        hands :meth:`may_send_to` that peer only when the MAC verifies AND this hook,
+        if it names anyone for the conversation, names the same person. Whether a
+        conversation id and a user id are the same string is a per-platform fact (a
+        Telegram private ``chat_id`` IS the ``user_id``; a Discord DM channel id is
+        not). This hook names the peer and decides nothing about authorization
+        itself; the roster does.
+
+        A second reader is session control's owner-DM audience predicate
+        (``dashboard.session_control.owner_dm_refusal``), which places a dashboard
+        tab's persisted mirror ``ChannelLink`` as the owner's own DM by comparing
+        this answer against the roster's sole ``user:`` target. Same contract --
+        the hook names the peer, the predicate decides -- but that reader REFUSES
+        on ``""`` (``MIRROR_PEER_NOT_ON_RECORD``) where the recipient leg lets the
+        verified record stand: an admission to drive a session is not a delivery.
+
+        Synchronous and in-memory like :meth:`may_send_to`: it runs inside gates
+        that must not suspend, so a transport that would need a round trip to
+        answer returns ``""`` instead. Default ``""`` is the fail-closed answer, so
+        a transport that does not override it confirms nothing.
+        """
+        return ""
 
     # -- Inbound adapter ----------------------------------------------------
     @abstractmethod

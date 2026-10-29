@@ -31,6 +31,7 @@ from kiro_crew.taskq.dependency import (
 )
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
 from kiro_crew.taskq.waits import WaitRecord
+from kiro_crew.testing.wait import await_until
 
 T0 = 1_000_000.0
 GH = "github:api"
@@ -1095,6 +1096,17 @@ def test_a_wait_that_did_not_persist_is_not_reported_as_a_wait(
     assert _coord(store, clock).rebuild() == 0
 
 
+def test_a_report_with_no_row_at_all_says_so(store: TaskStore, clock: Clock) -> None:
+    """A task the store holds no row for (a run whose memory mode keeps none) is
+    answered ``no_row``: nothing records the wait, and nothing else owns the work."""
+    coord = _coord(store, clock)
+    verdict = coord.report("sa-none", _signal(), generation=None, from_state=model.RUNNING)
+    assert verdict.outcome == "no_row"
+    assert verdict.retry_at is not None
+    assert store.state_of("sa-none") is None
+    assert coord.schedule(GH) is None
+
+
 def test_the_wake_event_names_the_state_the_row_actually_reached(
     store: TaskStore, clock: Clock
 ) -> None:
@@ -1202,7 +1214,7 @@ async def test_a_report_driven_give_up_releases_a_parked_run_on_the_loop(
     assert sorted(coord.waiters(GH)) == ["reporter", "victim"]
 
     clock.advance(31.0)  # past the scope's wall-clock deadline
-    parked = asyncio.create_task(asyncio.wait_for(released.wait(), timeout=10.0))
+    parked = asyncio.create_task(await_until(released, what="the give-up hooks' release"))
     verdict = await store.run(coord.report, "reporter", _signal(), generation=reporter)
     # Handed to the loop DURING the call, so it is queued ahead of this
     # coroutine's own resumption: the awaiting caller never sees a give-up whose

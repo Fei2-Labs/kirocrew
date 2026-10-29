@@ -12,6 +12,8 @@
  */
 import type { BaseCodeOptions, BaseDiffOptions, HunkSeparators, ThemesType, ThemeTypes } from '@pierre/diffs'
 
+import { STATE_ROW_ACTION_ICON, STATE_ROW_ICON } from './treeStateRows'
+
 /** Diff options as our surfaces use them: the deprecated `custom` hunk
  *  separator (a function renderer) is excluded so the shape stays assignable
  *  to Pierre's component-level `FileDiffOptions`. */
@@ -49,6 +51,29 @@ export const PIERRE_COMPACT_HEADER_CSS = `
 [data-diffs-header]{--diffs-gap-block:6px;font-size:12px;line-height:18px}
 [data-change-icon]{width:13px;height:13px}
 `
+
+/** The chat file-row header look, shared by the two places that draw it.
+ *
+ *  `FileChangeChips` injects these into Pierre's shadow header through
+ *  `unsafeCSS` (`ROW_CSS_BASE` in components/fileChangeChipsCss.ts), and the
+ *  light-DOM header rows the oversized pair draws for itself — its plain
+ *  fallback and its opted-in line-by-line state (`PlainFilePairHeader`) — apply
+ *  the same values inline, because a shadow-scoped stylesheet cannot reach
+ *  them. One source for the numbers, so a card's header reads the same
+ *  whether Pierre or this code draws it, and an oversized row's header cannot
+ *  drift from the within-budget row above it.
+ *
+ *  Background: half-way between the chat canvas and --bg-elevated — the full
+ *  elevated tone reads as prominently as the composer and pulls the eye to the
+ *  header instead of the change it labels. Metadata group: a fixed width so the
+ *  diffstat indicator starts at the SAME x on every row (the counts are 1–3
+ *  digits wide and Pierre omits a count span entirely when its side is zero,
+ *  so an unfixed group narrows on an additions-only file); sized for two 4ch
+ *  counts, the 46px indicator and the gaps between them. */
+export const DIFF_HEADER_BG_CSS = 'color-mix(in srgb,var(--bg-elevated) 50%,var(--bg))'
+export const DIFF_HEADER_PADDING_INLINE_PX = 10
+export const DIFF_HEADER_COUNT_MIN_WIDTH_CH = 4
+export const DIFF_HEADER_META_W_PX = 124
 
 /** Gives every collapsed-region separator the separator tint.
  *
@@ -92,6 +117,50 @@ export const PIERRE_WRAP_NO_HSCROLL_CSS = `
  *  (`scripts/capture-pierre-caret-align.mjs` prints both). */
 export const PIERRE_EDIT_CARET_ALIGN_CSS = `
 [data-code]{padding-top:0}
+`
+
+/** Styles the workspace tree's STATE rows -- the one row the tree puts under a
+ *  childless expanded folder (see `./treeStateRows`). Pierre has no slot for
+ *  such a row, so the tree feeds each one to the model as a synthetic child
+ *  whose basename is the label followed by `STATE_ROW_MARKER`. This sheet does
+ *  NOT select by that marker: a real file can end in U+200B as well (an agent
+ *  wrote it, a clone brought it), and a sheet keyed on the path would paint it
+ *  inert. It selects by the decoration the wrapper's `renderRowDecoration`
+ *  emits for a planned row only (`STATE_ROW_ICON`, an `<svg data-icon-name>`
+ *  with no symbol behind it) -- the same plan its selection and context-menu
+ *  guards consult -- and never by the label, which follows the active language
+ *  while this sheet is fixed at model construction. It makes the row read as a
+ *  status line rather than a file: muted text, no file glyph (the lane stays,
+ *  so the label keeps the child indentation), and no pointer response -- no
+ *  hover wash, no click, no "..." menu affordance. Keyboard focus still
+ *  reaches the row like any treeitem; the wrapper's selection guard keeps
+ *  Enter from opening it. Applied through `unsafeCSS` (`@layer unsafe`,
+ *  outranking the library's `@layer base`).
+ *
+ *  Deliberately NOT italic: Pierre paints a label as two `overflow: hidden`
+ *  spans around its middle-truncation point, and an oblique glyph's overhang is
+ *  clipped at each span's edge -- "file" rendered as "tile" in the capture. */
+// The last rule is the row badge's truncation. Pierre lays a decoration's text
+// out as an end-aligned inline-flex span, which cannot ellipsize, so a narrow
+// row (a folded "packages / core" chain) cut the badge from its START
+// ("me items not shown"). As a block it ends in an ellipsis instead.
+const STATE_ROW_ICON_SVG = `[data-item-section="decoration"] [data-icon-name="${STATE_ROW_ICON}"]`
+const STATE_ROW = `[data-type="item"]:has(${STATE_ROW_ICON_SVG})`
+// The `truncated` row a host can act on (open that folder in a folder tab): styled as a link
+// in the accent colour, not the muted status tone, and it takes the pointer,
+// because activating it IS its job.
+const STATE_ROW_ACTION_ICON_SVG = `[data-item-section="decoration"] [data-icon-name="${STATE_ROW_ACTION_ICON}"]`
+const STATE_ACTION_ROW = `[data-type="item"]:has(${STATE_ROW_ACTION_ICON_SVG})`
+export const PIERRE_TREE_STATE_ROW_CSS = `
+${STATE_ROW}{pointer-events:none;color:var(--trees-fg-muted)}
+${STATE_ROW} [data-item-section="icon"]{visibility:hidden}
+${STATE_ROW} [data-item-section="action"]{display:none}
+${STATE_ROW_ICON_SVG}{display:none}
+${STATE_ACTION_ROW}{cursor:pointer;color:var(--trees-accent);text-decoration:underline;text-underline-offset:2px}
+${STATE_ACTION_ROW} [data-item-section="icon"]{visibility:hidden}
+${STATE_ACTION_ROW} [data-item-section="action"]{display:none}
+${STATE_ROW_ACTION_ICON_SVG}{display:none}
+[data-item-section="decoration"] > span{display:block}
 `
 
 /** Highlighting worker pool size. Each worker is spawned eagerly at pool

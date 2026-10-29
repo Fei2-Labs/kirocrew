@@ -56,6 +56,20 @@ def _png_bytes(w: int, h: int) -> bytes:
     return buf.getvalue()
 
 
+def _mpo_bytes(w: int, h: int) -> bytes:
+    """A two-frame MPO (what Pillow reports for a phone photo carrying MPF
+    data): a ``w``x``h`` primary frame plus a half-size second frame."""
+    pil = pytest.importorskip("PIL.Image")
+    buf = io.BytesIO()
+    primary = pil.new("RGB", (w, h), (10, 20, 30))
+    second = pil.new("RGB", (max(1, w // 2), max(1, h // 2)), (40, 50, 60))
+    primary.save(buf, format="MPO", save_all=True, append_images=[second])
+    raw = buf.getvalue()
+    with pil.open(io.BytesIO(raw)) as im:
+        assert im.format == "MPO"  # the fixture must be what the test claims
+    return raw
+
+
 def _noise_png_bytes(w: int, h: int) -> bytes:
     """A PNG that resists compression, so encoded size tracks pixel count.
 
@@ -393,6 +407,14 @@ class TestNonMatchingPassthrough:
         line = b'not json "image" at all\n'
         assert enforce_image_budget(line, "test-server") is line
 
+    def test_a_line_nested_past_the_decoder_is_not_an_image_frame(self):
+        """``RecursionError`` is not a ``ValueError``: unlisted, the confirm
+        stage raised instead of answering "no image here"."""
+        from stray_line_helpers import too_deep_result_line
+
+        line = too_deep_result_line()
+        assert parse_image_bearing_frame(line) is None
+
     def test_non_dict_content_items_tolerated(self):
         line = _result_line(["bare-string", 42, {"type": "text", "text": "ok"}])
         assert enforce_image_budget(line, "test-server") is line
@@ -454,6 +476,60 @@ class TestDownscaleImageBlock:
         with pil.open(io.BytesIO(out_bytes)) as im:
             assert im.format == "PNG"
             assert im.size == (300, 200)  # conversion, not a resize
+
+    def test_within_cap_mpo_passes_through_as_jpeg(self):
+        """Pillow reports a JPEG carrying MPF data (a phone photo) as ``MPO``.
+        Its first frame is a complete baseline JPEG, so a within-cap MPO is a
+        known-good format: byte-identical pass-through, labelled by what the
+        header IS (``image/jpeg``), not re-encoded to PNG."""
+        raw = _mpo_bytes(800, 600)
+        assert downscale_image_block(raw, "image/jpeg") == (raw, "image/jpeg")
+
+    def test_oversized_mpo_reencodes_as_jpeg(self):
+        """The other direction: an over-cap MPO shrinks and is WRITTEN as JPEG
+        (single frame), not as the far larger PNG a format outside the table
+        converts to, which costs extra encoded-budget shrink passes."""
+        pil = pytest.importorskip("PIL.Image")
+        fitted = downscale_image_block(_mpo_bytes(3000, 1000), "image/jpeg")
+        assert fitted is not None
+        out_bytes, out_mime = fitted
+        assert out_mime == "image/jpeg"
+        assert out_bytes.startswith(b"\xff\xd8\xff")
+        with pil.open(io.BytesIO(out_bytes)) as im:
+            assert im.format == "JPEG"
+            assert im.size == (2000, 667)
+
+    @pytest.mark.parametrize("fmt", ["TIFF", "PPM"])
+    @pytest.mark.parametrize("max_edge", [0, -1])
+    def test_nonpositive_edge_is_no_limit_for_nontable_formats(self, fmt, max_edge):
+        """A non-positive cap means "no limit" everywhere in the module. The
+        byte-identical fast path reads it that way, but a format OUTSIDE the
+        known-good table never reaches that path: it goes straight to the
+        re-encode, which must apply the same reading -- a bare
+        ``long_edge > max_edge`` holds for every edge <= 0 and floors the
+        image to 1x1. Tested with formats that are NOT MPO, so MPO's own
+        table entry cannot mask the re-encode branch's guard."""
+        pil = pytest.importorskip("PIL.Image")
+        buf = io.BytesIO()
+        pil.new("RGB", (300, 200), (9, 8, 7)).save(buf, format=fmt)
+        fitted = downscale_image_block(buf.getvalue(), "image/x-test", max_edge=max_edge)
+        assert fitted is not None
+        out_bytes, out_mime = fitted
+        assert out_mime == "image/png"  # conversion still happens
+        with pil.open(io.BytesIO(out_bytes)) as im:
+            assert im.size == (300, 200)  # ... at the ORIGINAL dimensions
+
+    def test_mpo_at_zero_edge_is_not_a_one_pixel_png(self):
+        """The compound case: an MPO at ``max_edge=0`` exercises both guards
+        at once (table membership AND the re-encode branch's non-positive
+        edge). Missing either yields a PNG; missing both yields a 1x1 PNG. It
+        must ride through untouched."""
+        pil = pytest.importorskip("PIL.Image")
+        raw = _mpo_bytes(800, 600)
+        fitted = downscale_image_block(raw, "image/jpeg", max_edge=0)
+        assert fitted == (raw, "image/jpeg")
+        with pil.open(io.BytesIO(fitted[0])) as im:
+            assert im.size == (800, 600)
 
     def test_oversized_is_downscaled(self):
         pil = pytest.importorskip("PIL.Image")

@@ -2,7 +2,7 @@
 
 ``scripts/docs_lint.py`` gates a doc's links, its reachability from an index, and the
 paths it cites. None of that asks the question this page's whole value rests on: does
-it still describe the 14 tools the server actually advertises? A tool added to
+it still describe every tool the server actually advertises? A tool added to
 ``_tool_definitions`` and absent from the page is a capability an agent reading the
 shipped docs cannot find, and a tool the page names after the server drops it is worse
 — the agent calls it and gets ``Error: unknown tool``.
@@ -17,6 +17,7 @@ Deliberately NOT pinned here: the prose. A page that may only say what a test ca
 phrase is a page nobody improves.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -62,7 +63,9 @@ def test_the_page_names_every_advertised_tool(doc_text: str, advertised_tools: l
     tool_half = doc_text.split("## What you cannot reach", 1)[0]
     claimed = {
         match.group(1)
-        for match in re.finditer(r"`((?:session|chat_folder|chat_tag)_[a-z_]+)`", tool_half)
+        for match in re.finditer(
+            r"`((?:session|chat_folder|chat_tag|chat_session)_[a-z_]+)`", tool_half
+        )
     }
     assert claimed, "found no backticked tool names at all — the scan anchor moved"
     assert claimed <= advertised, (
@@ -139,28 +142,40 @@ def test_the_page_matches_the_session_control_group_and_the_channel_block(
     from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_TOOLS
     from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
 
-    assert len(SESSION_CONTROL_TOOLS) == 5
+    assert len(SESSION_CONTROL_TOOLS) == 21
     for tool in SESSION_CONTROL_TOOLS:
         assert f"`{tool}`" in doc_text
         assert tool in CHANNEL_AGENT_BLOCKED_TOOLS, (
             f"{tool} left the channel containment list; the page tells a channel agent "
-            "it is blocked from all five"
+            "it is blocked from every session tool"
         )
-    assert "all five\nsession tools" in doc_text or "all five session tools" in doc_text
+    # The claim is phrased WITHOUT a number on purpose: a count in the prose is a
+    # second place to update when a tool is added, and the page was already stale
+    # once that way. The set equality above is what pins the membership.
+    assert "blocked from every\nsession tool" in doc_text or (
+        "blocked from every session tool" in doc_text
+    )
+
+
+def _session_control_source() -> str:
+    """The facade and every owner module it composes, where the refusal codes live."""
+    dashboard = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard"
+    paths = [dashboard / "session_control.py"]
+    paths += sorted((dashboard / "session_control_parts").glob("*.py"))
+    return "\n".join(path.read_text(encoding="utf-8") for path in paths)
 
 
 def test_every_tabulated_refusal_code_is_one_the_source_raises(doc_text: str) -> None:
     """The refusal table is the codes a caller reads back, so each must exist.
 
-    ``session_control.py`` is the only place that mints them, and the table is the
+    ``session_control.py`` and its ``session_control_parts`` owners are the only place
+    that mints them, and the table is the
     part of the page an agent consults while handling an error rather than while
     learning the surface -- so a code renamed there and left here sends the caller
     looking for a string it will never see. Asserted as literals rather than by
     importing a set, because the module keeps no enumeration of them.
     """
-    source = (
-        Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "session_control.py"
-    ).read_text(encoding="utf-8")
+    source = _session_control_source()
     section = doc_text.split("## What you cannot reach", 1)[1].split("### Switches", 1)[0]
     # ROWS only. The prose around the table backticks plenty of non-codes
     # (``list_sessions``, a slot key), so a section-wide scan would assert those
@@ -187,9 +202,7 @@ def test_the_three_target_forms_match_the_resolver(doc_text: str) -> None:
     asserted, because a resolver that returned on the first key hit would make the
     page's advice pointless rather than wrong.
     """
-    source = (
-        Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "session_control.py"
-    ).read_text(encoding="utf-8")
+    source = _session_control_source()
     assert 'code="ambiguous_target"' in source
     assert "address it by its session key instead" in source
     assert (
@@ -199,7 +212,9 @@ def test_the_three_target_forms_match_the_resolver(doc_text: str) -> None:
         assert form in doc_text, f"the page no longer shows the {form} target form"
 
 
-def test_the_queue_row_matches_what_each_verb_does_to_the_queue(doc_text: str) -> None:
+def test_the_queue_row_matches_what_each_verb_does_to_the_queue(
+    doc_text: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Stop and close treat the queue differently, and in neither case simply.
 
     Both halves are asserted against the code that decides them, because the row is a
@@ -210,21 +225,27 @@ def test_the_queue_row_matches_what_each_verb_does_to_the_queue(doc_text: str) -
 
     The stop half lives in the force branch of ``stop_slot_turn`` (a first, soft stop
     leaves the queue alone; the escalation clears it). The close half is the durable
-    queue: ``queued_prompts`` is written with the archived conversation and handed
-    back by ``sanitize_restored_queue`` when the slot is rehydrated.
+    queue: ``queued_prompts`` is written with the conversation and handed back,
+    sanitized, when its tab is rehydrated from disk. (A History resume of an archived
+    conversation does not read the queue back -- an asymmetry the codec's table
+    declares -- so this checks the rehydrate, which is the path that does.)
     """
-    handlers = (
-        Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_handlers.py"
-    ).read_text(encoding="utf-8")
-    persistence = (
-        Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_persistence.py"
-    ).read_text(encoding="utf-8")
+    from chat_test_helpers import _make_state
+
+    from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
+
+    # The handlers facade and every ``chat_api`` owner it composes, read as one text.
+    dashboard = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard"
+    handlers = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (dashboard / "chat_handlers.py", *sorted((dashboard / "chat_api").glob("*.py")))
+    )
 
     assert (
         "slot._queue.clear()" in handlers
     ), "the escalated stop no longer clears the queue; the row says it does"
     # The soft-stop branch is pinned by SHAPE: exactly one ``_queue.clear()`` exists in
-    # this module and it sits in the hard-kill branch, so "the first stop preserves the
+    # these files and it sits in the hard-kill branch, so "the first stop preserves the
     # queue" IS the absence of a second one. A comment string would go stale in both
     # directions -- outliving the behaviour, or reworded while the behaviour holds.
     assert (
@@ -235,9 +256,18 @@ def test_the_queue_row_matches_what_each_verb_does_to_the_queue(doc_text: str) -
     assert (
         "_queue.clear()" in hard_kill[0].rsplit("if force", 1)[-1]
     ), "the single _queue.clear() is no longer inside the force branch"
-    assert (
-        'sanitize_restored_queue(meta.get("queued_prompts"))' in persistence
-    ), "a reopened conversation no longer restores its queued prompts; the row says it does"
+    # A tab rehydrated from disk hands its queued prompts back, sanitized: a
+    # hand-added ``kind`` is not carried, and an entry the writer never emits is
+    # dropped.
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    state = _make_state(tmp_path)
+    queued = [{"id": "q-1", "content": "still waiting", "kind": "steer"}, {"content": 7}]
+    line = {"_type": "metadata", "created_at": "2026-01-01T00:00:00", "queued_prompts": queued}
+    (tmp_path / "dashboard_reopened.jsonl").write_text(json.dumps(line) + "\n", encoding="utf-8")
+    slot = _rehydrate_slot_from_history(state, "reopened")
+    assert slot is not None and [(q["id"], q["content"], q["kind"]) for q in slot._queue] == [
+        ("q-1", "still waiting", "")
+    ], "a rehydrated conversation no longer restores its queued prompts; the row says it does"
 
     row = next(
         (ln for ln in doc_text.splitlines() if ln.startswith("| Queued messages |")),
@@ -252,18 +282,21 @@ def test_the_queue_row_matches_what_each_verb_does_to_the_queue(doc_text: str) -
 
 
 def test_the_documented_switch_defaults_match_config(doc_text: str) -> None:
-    """``agent.session_control`` and ``agent.member_dispatch`` defaults, from the section."""
+    """The agent switches the doc's table states, each read off ``AgentConfig``."""
     from kiro_crew.config.sections import AgentConfig
 
     agent_cfg = AgentConfig()
-    assert agent_cfg.session_control is True
-    assert agent_cfg.member_dispatch is True
-    for key in ("agent.session_control", "agent.member_dispatch"):
-        assert f"`{key}`" in doc_text
+    switches = ("session_control", "member_dispatch", "crew_panel")
+    for name in switches:
+        assert getattr(agent_cfg, name) is True, name
+        assert f"`agent.{name}`" in doc_text, name
     switch_table = doc_text.split("### Switches and ceilings", 1)[1]
-    assert (
-        switch_table.count("| `true` |") == 2
-    ), "the switches table must state both defaults as true, matching AgentConfig"
+    # Counted from the tuple above rather than written as a literal, so adding a
+    # fourth switch to the section fails on the missing ROW rather than on a
+    # number nobody updated.
+    assert switch_table.count("| `true` |") == len(
+        switches
+    ), "the switches table must state every default as true, matching AgentConfig"
 
 
 def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
@@ -272,6 +305,7 @@ def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
     from kiro_crew.dashboard.create_rate_limit import (
         MAX_FOLDER_CREATES_PER_WINDOW,
         MAX_SESSION_CREATES_PER_WINDOW,
+        MAX_TAG_COLUMN_CREATES_PER_WINDOW,
         MAX_TAG_CREATES_PER_WINDOW,
         WINDOW_SECS,
     )
@@ -282,6 +316,7 @@ def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
     assert f"**{MAX_SESSION_CREATES_PER_WINDOW}** session" in doc_text
     assert f"**{MAX_FOLDER_CREATES_PER_WINDOW}** folder" in doc_text
     assert f"**{MAX_TAG_CREATES_PER_WINDOW}** tag" in doc_text
+    assert f"**{MAX_TAG_COLUMN_CREATES_PER_WINDOW}** board-column" in doc_text
     assert (
         f"{MAX_LIVE_SLOTS} live sessions, {MAX_SLOTS_PER_CREATOR} per creator, "
         f"{MAX_CHAT_FOLDERS} folders" in doc_text
@@ -289,3 +324,14 @@ def test_the_documented_limits_match_their_constants(doc_text: str) -> None:
     assert (
         f"({int(STOP_WINDOW_SECS)} seconds)" in doc_text
     ), "the stop-retry window the page quotes must be stop_retry.WINDOW_SECS"
+    # The broadcast cap is quoted TWICE -- once in prose, once in the refusal
+    # table -- and both are pinned, because this page shipped `32` after the
+    # constant rose to 50: an agent reading it named a subset it never needed.
+    from kiro_crew.validation import MAX_BROADCAST_TARGETS
+
+    assert (
+        f"at most **{MAX_BROADCAST_TARGETS}** sessions are reachable" in doc_text
+    ), "the prose cap must be validation.MAX_BROADCAST_TARGETS"
+    assert (
+        f"A broadcast reaches at most {MAX_BROADCAST_TARGETS} sessions" in doc_text
+    ), "the refusal table's cap must be validation.MAX_BROADCAST_TARGETS"

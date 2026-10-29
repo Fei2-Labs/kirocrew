@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import VoiceDictationPanel from '../components/VoiceDictationPanel'
 import { createAudioSample } from '../hooks/mic'
 
@@ -33,6 +33,14 @@ describe('VoiceDictationPanel', () => {
   it('advertises the keyboard affordances that actually exist (batch: click the mic to finish)', () => {
     render(<VoiceDictationPanel sampleRef={sampleRef} value="" />)
     expect(screen.getByText('Esc to cancel, click the mic to finish')).toBeTruthy()
+  })
+
+  // With submit-on-release on, stopping sends in either transport, so the hint
+  // names the send and the way to keep a draft instead of the Enter shortcut.
+  it.each([true, false])('names the send and Shift-click under submit-on-release (streaming=%s)', streaming => {
+    render(<VoiceDictationPanel sampleRef={sampleRef} value="" streaming={streaming} submitOnRelease />)
+    expect(screen.getByText('Esc to cancel, Shift-click keeps a draft, click the mic to send')).toBeTruthy()
+    expect(screen.queryByText('Esc to cancel, Enter to send')).toBeNull()
   })
 
   it('promises Enter-to-send only in streaming mode (live transcript in composer)', () => {
@@ -231,5 +239,77 @@ describe('word revision tracking', () => {
     const t = screen.getByTestId('voice-dictation-transcript')
     expect(t.textContent).toBe('summarize the fix  and   tell me')
     expect(t.querySelector('.text-muted')?.textContent).toBe('  and   tell me')
+  })
+})
+
+describe('transcript auto-scroll', () => {
+  // jsdom does no layout, so scrollHeight stays 0. Stub it tall and capture
+  // scrollTop to assert the effect pins the transcript to its bottom.
+  function tallScroll() {
+    let scrollTop = 0
+    Object.defineProperty(HTMLDivElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get() { return 999 },
+    })
+    Object.defineProperty(HTMLDivElement.prototype, 'scrollTop', {
+      configurable: true,
+      get() { return scrollTop },
+      set(v: number) { scrollTop = v },
+    })
+    return () => {
+      delete (HTMLDivElement.prototype as unknown as Record<string, unknown>).scrollHeight
+      delete (HTMLDivElement.prototype as unknown as Record<string, unknown>).scrollTop
+    }
+  }
+
+  it('pins the transcript to its bottom so the newest dictated text stays visible', () => {
+    const restore = tallScroll()
+    try {
+      const { rerender } = render(
+        <VoiceDictationPanel sampleRef={sampleRef} value="line one" partial="line one" streaming />,
+      )
+      const t = screen.getByTestId('voice-dictation-transcript')
+      expect(t.scrollTop).toBe(999)
+      // More text arrives (past the 3-line clip); it must scroll to the new bottom.
+      rerender(
+        <VoiceDictationPanel
+          sampleRef={sampleRef}
+          value="line one two three four five six"
+          partial="line one two three four five six"
+          streaming
+        />,
+      )
+      expect(t.scrollTop).toBe(999)
+    } finally {
+      restore()
+    }
+  })
+
+  it('stops following while the user has scrolled up, and resumes at the bottom', () => {
+    const restore = tallScroll()
+    Object.defineProperty(HTMLDivElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() { return 80 },
+    })
+    const panel = (v: string) => (
+      <VoiceDictationPanel sampleRef={sampleRef} value={v} partial={v} streaming />
+    )
+    try {
+      const { rerender } = render(panel('one'))
+      const t = screen.getByTestId('voice-dictation-transcript')
+      // Scrolled up to reread: new text must not yank the view back down.
+      t.scrollTop = 300
+      fireEvent.scroll(t)
+      rerender(panel('one two'))
+      expect(t.scrollTop).toBe(300)
+      // Back at the bottom (999 - 80): following resumes.
+      t.scrollTop = 919
+      fireEvent.scroll(t)
+      rerender(panel('one two three'))
+      expect(t.scrollTop).toBe(999)
+    } finally {
+      delete (HTMLDivElement.prototype as unknown as Record<string, unknown>).clientHeight
+      restore()
+    }
   })
 })

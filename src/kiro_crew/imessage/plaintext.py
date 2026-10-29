@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 import unicodedata
 
+from kiro_crew.constants import md_link_destination
+
 #: Fence delimiter line: three or more backticks or tildes, optional info string.
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})\s*(\S*)\s*$")
 
@@ -39,11 +41,19 @@ _ORDERED_RE = re.compile(r"^(\s*)(\d{1,9})[.)]\s+")
 _QUOTE_RE = re.compile(r"^\s{0,3}(?:>\s?)+")
 
 #: Image before link, so the "!" is consumed rather than left dangling.
-#: The label class excludes "[" and "]" so the match cannot span two links,
-#: and the target class excludes whitespace and parens -- both keep the
-#: pattern linear-time on adversarial input.
-_IMAGE_RE = re.compile(r"!\[([^\][]*)\]\(([^\s()]*)\)")
-_LINK_RE = re.compile(r"\[([^\][]*)\]\(([^\s()]*)\)")
+#: The label class excludes "[", "]" and the line break, the display-safety
+#: screen's class, so the match cannot span two links; the target class
+#: excludes whitespace -- both keep the pattern linear-time on adversarial
+#: input. A parenthesis may appear in the target only as a balanced pair
+#: (``.../Python_(programming_language)``); see
+#: :func:`kiro_crew.constants.md_link_destination`.
+_LINK_DESTINATION_CHAR_CLASS = r"[^\s()]"
+_IMAGE_RE = re.compile(
+    rf"!\[([^\[\]\n]*)\]\(({md_link_destination(_LINK_DESTINATION_CHAR_CLASS)}*)\)"
+)
+_LINK_RE = re.compile(
+    rf"\[([^\[\]\n]*)\]\(({md_link_destination(_LINK_DESTINATION_CHAR_CLASS)}*)\)"
+)
 
 #: Inline code span. Non-greedy over a single backtick pair.
 _CODE_SPAN_RE = re.compile(r"`([^`]*)`")
@@ -70,6 +80,17 @@ _SKIN_TONES = range(0x1F3FB, 0x1F400)
 _REGIONAL_INDICATORS = range(0x1F1E6, 0x1F200)
 _KEYCAP = 0x20E3
 _TAG_RANGE = range(0xE0020, 0xE0080)
+
+#: General categories that carry Grapheme_Extend. ``unicodedata.combining``
+#: reports the canonical combining CLASS, which is 0 for a large share of real
+#: marks -- every Thai vowel sign above the baseline (U+0E31 MAO EK, U+0E34,
+#: U+0E47), Khmer and the Indic matras -- so testing the class alone declared
+#: those marks safe to cut after and split a grapheme the reader sees as one
+#: character. Testing the CATEGORY is the property that actually holds: a mark
+#: belongs to the preceding base whatever its class. Erring wide here can only
+#: move a cut earlier, never split a cluster, so the whole file's guarantee
+#: ("never separate a mark from its base") gets stronger, not weaker.
+_MARK_CATEGORIES = frozenset({"Mn", "Mc", "Me"})
 
 
 def to_plaintext(text: str) -> str:
@@ -225,6 +246,7 @@ def _joins_previous(text: str, index: int) -> bool:
     if (
         following == _ZWJ
         or unicodedata.combining(following)
+        or unicodedata.category(following) in _MARK_CATEGORIES
         or code in _VARIATION_SELECTORS
         or code in _VARIATION_SUPPLEMENT
         or code in _SKIN_TONES

@@ -8,24 +8,36 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.constants import DENY_CAUSE_POLICY, DENY_CAUSE_SURFACE_POLICY
+from kiro_crew.executors import run_in_embed_pool, run_in_tool_gate_pool
 from kiro_crew.hooks import TOOL_DENY, hook_gate_kwargs
-from kiro_crew.llm_helpers import _extract_json_of_type
+from kiro_crew.llm_helpers import _extract_json_of_type, _steer_host_deny
+from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR
 from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
 from kiro_crew.sel import sel
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.task_models import (
     SESSION_PREFIX,
     Project,
     Task,
     TaskStatus,
 )
+from kiro_crew.tool_gate_busy import hook_gate_busy
 
 if TYPE_CHECKING:
     from kiro_crew.context import ContextBuilder
     from kiro_crew.session import SessionManager
 
 logger = logging.getLogger(__name__)
+
+#: What the model is told when the planning (decomposition) phase refuses a tool
+#: call it has no hook store to gate. Says what the surface permits -- nothing --
+#: and nothing about the call itself, which was never judged.
+_DECOMPOSITION_DENY_REASON = (
+    "the planning phase runs no tools: it only decomposes the spec into steps and "
+    "has no hook store to gate a tool call, so every call is refused here"
+)
 
 
 # ── Name Resolution ──
@@ -240,8 +252,13 @@ async def decompose(
     work_dir: str = "",
     task_id: str = "",
     agent: str = "",
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> list[Task]:
-    """Use LLM to break a spec into ordered implementation tasks."""
+    """Use LLM to break a spec into ordered implementation tasks.
+
+    ``start_priority`` orders the decompose session's start: FOREGROUND only when a
+    person is waiting on the plan (rule: ``kiro_crew.start_priority``).
+    """
     prompt = (
         "You are a task decomposition agent. Break this specification "
         "into concrete, ordered implementation steps. Each step should "
@@ -289,7 +306,11 @@ async def decompose(
     memory_store = await inherit_session_memory(ctx, parent_key, session_key)
     try:
         client, is_new, _resumed = await sessions.open_task_session(
-            parent_key, session_key, agent=agent or None, cwd=work_dir or None
+            parent_key,
+            session_key,
+            agent=agent or None,
+            cwd=work_dir or None,
+            start_priority=start_priority,
         )
         if ctx:
             # Off-loop: build_message embeds the episodic query (blocking urllib).
@@ -318,14 +339,20 @@ async def decompose(
                 # spec content could otherwise trigger dangerous tools (fs/exec)
                 # during the planning phase, bypassing the execution-phase gate.
                 if ctx is not None and getattr(ctx, "hooks", None) is not None:
-                    hook_result = ctx.hooks.on_tool_call(
+                    hook_result = await run_in_tool_gate_pool(
+                        ctx.hooks.on_tool_call,
                         event.title,
+                        on_queue_timeout=hook_gate_busy,
                         session_key=session_key,
                         agent=agent,
                         **hook_gate_kwargs(event),
                     )
                     if hook_result.action == TOOL_DENY:
-                        await client.reject_tool(event.request_id)
+                        # Audit FIRST, then tell the model in-band that the
+                        # HOST refused this (a rejected permission reaches it
+                        # as kiro-cli's "User denied tool execution"), then
+                        # answer the wire. The hook judged the call itself: a
+                        # policy verdict, with the hook's own reason.
                         sel().log_tool_invocation(
                             session_key=session_key,
                             agent=agent or "kirocrew",
@@ -337,13 +364,21 @@ async def decompose(
                             error="hook_deny",
                             metadata={"phase": "decomposition"},
                         )
+                        await _steer_host_deny(
+                            client,
+                            event,
+                            hook_result.reason or "",
+                            cause=DENY_CAUSE_POLICY,
+                        )
+                        await client.reject_tool(event.request_id)
                         continue
                 else:
                     # Deny-by-default: with no hook store there is nothing to
                     # gate the request, so reject rather than fall through to
                     # approve. Decomposition normally only emits JSON (no tool
                     # calls), so this blocks only the anomalous/injection case.
-                    await client.reject_tool(event.request_id)
+                    # The SURFACE refuses the call (nothing about it was
+                    # judged), so the notice says what this phase permits.
                     sel().log_tool_invocation(
                         session_key=session_key,
                         agent=agent or "kirocrew",
@@ -355,15 +390,26 @@ async def decompose(
                         error="no_hook_store",
                         metadata={"phase": "decomposition"},
                     )
+                    await _steer_host_deny(
+                        client,
+                        event,
+                        _DECOMPOSITION_DENY_REASON,
+                        cause=DENY_CAUSE_SURFACE_POLICY,
+                    )
+                    await client.reject_tool(event.request_id)
                     continue
-                await client.approve_tool(event.request_id)
+                approval_sent = await client.approve_tool(event.request_id)
                 sel().log_tool_invocation(
                     session_key=session_key,
                     agent=agent or "kirocrew",
                     source="taskrunner",
                     tool_name=event.title,
                     tool_kind=event.tool_kind,
-                    outcome="auto_approved",
+                    outcome=(
+                        "auto_approved"
+                        if approval_sent is not False
+                        else OUTCOME_REJECTED_TRANSPORT_FLOOR
+                    ),
                     request_id=event.request_id,
                     metadata={"phase": "decomposition"},
                 )

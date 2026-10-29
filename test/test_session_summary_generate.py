@@ -8,17 +8,20 @@ the trap wiring rather than any model behavior.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 
 import pytest
 from chat_test_helpers import move_transcript_past
 
+from kiro_crew import history as history_mod
 from kiro_crew.config.loader import KiroCrewConfig, SessionSummaryConfig
 from kiro_crew.dashboard import chat_summary
 from kiro_crew.dashboard.chat_persistence import _save_slot_to_history
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.state import _ChatSlot
-from kiro_crew.history import ConversationLog
+from kiro_crew.history import ConversationLog, HistoryLockTimeout
 from kiro_crew.session_summary import (
     count_user_turns,
     count_user_turns_in_records,
@@ -161,9 +164,9 @@ class TestGating:
         assert called == []
 
     async def test_temporary_is_refused_before_any_model_call(self, env, monkeypatch):
-        """A temporary session's transcript is discarded; persisting a summary
-        of it would leave conversation content on disk after the conversation
-        itself is gone (mirrors history.INCOGNITO_MEMORY_MODES)."""
+        """A temporary session's transcript is kept for History, but the summary
+        is a derived artifact the mode does not produce, so it is refused before
+        any model call (mirrors history.INCOGNITO_MEMORY_MODES)."""
         state, slot = env
         slot.memory_mode = "temporary"
         called = []
@@ -171,6 +174,85 @@ class TestGating:
         assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
         assert called == []
         assert state.conversation_log.get_cached_intent_summary(state.hkey) is None
+
+    @pytest.mark.parametrize("line_mode", ["incognito", "temporary", "Incognito"])
+    async def test_a_restricted_on_disk_line_refuses_a_slot_that_still_reads_persistent(
+        self, env, monkeypatch, line_mode
+    ):
+        """The rows come from DISK, so the file's own contract gates them.
+
+        Another writer -- a second gateway on this data home, a same-key
+        hand-over, a subagent appending -- can tighten the line while this slot
+        still reads persistent in memory. The slot gate passes; the file must not.
+        """
+        state, slot = env
+        assert slot.memory_mode == "persistent"
+        state.conversation_log.update_metadata(state.hkey, {"memory_mode": line_mode})
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+        assert state.conversation_log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_a_line_tightened_during_the_transcript_read_is_refused(self, env, monkeypatch):
+        """The gate is asked again AFTER the read, so a tightening in between is caught."""
+        state, slot = env
+        log = state.conversation_log
+        real_locked_stems = type(log).locked_stems
+        fired = {"done": False}
+
+        def _tighten_then_lock(self, stems):
+            # The tightening writer takes the transcript locks the seam holds, so
+            # it lands before the seam's hold (modelled here) or after -- never
+            # inside. Landing first, it is what the seam's own check sees. The
+            # chained seam locks the whole chain through ``locked_stems``.
+            if not fired["done"]:
+                fired["done"] = True
+                with history_mod.allow_on_loop_persist():
+                    self.update_metadata(state.hkey, {"memory_mode": "incognito"})
+            return real_locked_stems(self, stems)
+
+        monkeypatch.setattr(type(log), "locked_stems", _tighten_then_lock)
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+        assert log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_an_unreadable_on_disk_line_refuses(self, env, monkeypatch):
+        """Fail closed: a reader that cannot see the contract does not act on the rows."""
+        state, slot = env
+        log = state.conversation_log
+        monkeypatch.setattr(log, "get_metadata_status", lambda _key: ({}, False))
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert called == []
+
+    async def test_a_line_tightened_during_the_model_call_refuses_publication(
+        self, env, monkeypatch, caplog
+    ):
+        state, slot = env
+        log = state.conversation_log
+        sidecar = log._intent_summary_cache_path(state.hkey)
+        model_called: list[str] = []
+
+        async def tighten_then_reply(*_args, **_kwargs):
+            model_called.append("yes")
+            await asyncio.to_thread(log.update_metadata, state.hkey, {"memory_mode": "incognito"})
+            return _GOOD_REPLY
+
+        monkeypatch.setattr(chat_summary, "run_bg_oneliner", tighten_then_reply)
+        with caplog.at_level(logging.DEBUG, logger=chat_summary.__name__):
+            stored = await chat_summary.generate_session_summary(state, slot, cfg=_cfg())
+
+        assert stored is False
+        assert model_called == ["yes"]
+        assert not sidecar.exists()
+        assert (
+            f"Discarding session summary for {state.hkey}: the transcript became "
+            "restricted during summarisation" in caplog.text
+        )
 
     async def test_an_unclean_stop_reason_skips(self, env, monkeypatch):
         """A turn cut short by a timeout or stall did not really finish."""
@@ -298,7 +380,7 @@ class TestGating:
         be stored and served as fresh."""
         state, slot = env
         log = state.conversation_log
-        real_read = log.read_messages_chained
+        real_read = log._read_messages
         # Production captures the signature at generation start; the racing
         # append below must provably land PAST it, not merely after it in time.
         pre_read_sig = log.session_mtime(state.hkey)
@@ -310,10 +392,36 @@ class TestGating:
             move_transcript_past(log, key, pre_read_sig)  # don't rely on the OS tick
             return records
 
-        monkeypatch.setattr(log, "read_messages_chained", racing_read)
+        monkeypatch.setattr(log, "_read_messages", racing_read)
         _stub_llm(monkeypatch, _GOOD_REPLY)
         assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
         assert log.get_cached_intent_summary(state.hkey) is None
+
+    async def test_a_lock_timeout_at_publication_refuses_the_write(self, env, monkeypatch, caplog):
+        state, slot = env
+        log = state.conversation_log
+        real_locked_stems = type(log).locked_stems
+        calls = {"n": 0}
+
+        @contextlib.contextmanager
+        def _timeout_on_publish(self, stems):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise HistoryLockTimeout("publication lock held")
+            with real_locked_stems(self, stems):
+                yield
+
+        monkeypatch.setattr(type(log), "locked_stems", _timeout_on_publish)
+        _stub_llm(monkeypatch, _GOOD_REPLY)
+
+        with caplog.at_level(logging.DEBUG, logger=chat_summary.__name__):
+            stored = await chat_summary.generate_session_summary(state, slot, cfg=_cfg())
+
+        assert stored is False
+        assert calls["n"] == 2
+        assert "the transcript was busy during summarisation" in caplog.text
+        assert log.get_cached_intent_summary(state.hkey) is None
+        assert not log._intent_summary_cache_path(state.hkey).exists()
 
     async def test_a_turn_starting_during_the_model_call_refuses_the_forced_write(
         self, env, monkeypatch
@@ -662,6 +770,70 @@ class TestPromptCarriesTheTraps:
         assert '"verified"' in p and "independent of status" in p
 
 
+class TestPromptFollowsTheUiLanguage:
+    """The summary text is panel content beside chrome in ``dashboard.language``."""
+
+    pytestmark = pytest.mark.asyncio
+
+    @staticmethod
+    async def _prompt(env, monkeypatch, language) -> str:
+        state, slot = env
+        prompts: list[str] = []
+
+        async def fake(_sessions, prompt, **_kwargs):
+            prompts.append(prompt)
+            return _GOOD_REPLY
+
+        monkeypatch.setattr(chat_summary, "run_bg_oneliner", fake)
+        cfg = _cfg()
+        cfg.dashboard.language = language
+        assert await chat_summary.generate_session_summary(state, slot, cfg=cfg) is True
+        [prompt] = prompts
+        return prompt
+
+    async def test_prompt_carries_the_configured_ui_language(self, env, monkeypatch):
+        prompt = await self._prompt(env, monkeypatch, "zh-CN")
+
+        assert "BCP-47 tag zh-CN" in prompt
+        assert (
+            prompt.index("BCP-47 tag zh-CN")
+            < prompt.index("TRANSCRIPT")
+            < prompt.index("request 0")
+        )
+        assert "{language}" not in prompt
+
+    async def test_the_json_keys_and_status_values_stay_out_of_the_ui_language(
+        self, env, monkeypatch
+    ):
+        # ``normalize_payload`` coerces an unknown status to "active", so a translated
+        # status word would silently turn every intent active.
+        prompt = await self._prompt(env, monkeypatch, "zh-CN")
+
+        assert 'The JSON keys and the "status" values stay exactly as written above' in prompt
+
+    @pytest.mark.parametrize("language", ["", "ar"])
+    async def test_prompt_is_unchanged_without_a_usable_ui_language(
+        self, env, monkeypatch, language
+    ):
+        # "" is the follow-the-browser sentinel; "ar" names no shipped catalog.
+        prompt = await self._prompt(env, monkeypatch, language)
+
+        assert "BCP-47" not in prompt and "{language}" not in prompt
+        assert prompt.startswith(chat_summary._PROMPT.replace("{language}", ""))
+        assert "request 0" in prompt
+
+    async def test_a_transcript_quoting_the_slot_cannot_restate_the_ui_language_line(
+        self, env, monkeypatch
+    ):
+        state, _slot = env
+        state.conversation_log.append(state.hkey, "user", "what does {language} mean here")
+
+        prompt = await self._prompt(env, monkeypatch, "zh-CN")
+
+        assert prompt.count("BCP-47 tag zh-CN") == 1
+        assert "what does {language} mean here" in prompt
+
+
 class _GateSlot:
     """The attributes ``_should_summarize`` reads, and nothing else.
 
@@ -916,10 +1088,31 @@ class TestForcedGeneration:
         # clear it on the way out.
         assert slot._summary_in_flight is True
 
+    async def test_a_flush_that_tightens_the_line_refuses_before_the_model(self, env, monkeypatch):
+        state, slot = env
+        state._slots = {slot.key: slot}
+        state._restricted_keys = set()
+        await asyncio.to_thread(
+            state.conversation_log.update_metadata,
+            state.hkey,
+            {"memory_mode": "incognito"},
+        )
+        slot.messages = list(slot.messages) + [
+            {"role": "assistant", "content": "a reply on the restricted line"}
+        ]
+        slot._dirty = True
+        called = []
+        _stub_llm(monkeypatch, _GOOD_REPLY, called)
+
+        assert await chat_summary.generate_session_summary(state, slot, cfg=_cfg()) is False
+        assert slot.memory_mode == "incognito"
+        assert "dashboard:s1" in state._restricted_keys
+        assert called == []
+
     async def test_force_does_not_override_incognito(self, env, monkeypatch):
-        """An incognito transcript is discarded, so a forced summary would leave
-        conversation content on disk after the conversation is gone -- consent to
-        spend tokens is not consent to persist."""
+        """An incognito transcript is kept for History, but the summary is a
+        derived artifact the mode does not produce -- consent to spend tokens is
+        not consent to derive."""
         state, slot = env
         called = []
         _stub_llm(monkeypatch, _GOOD_REPLY, called)

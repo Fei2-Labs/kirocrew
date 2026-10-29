@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+from kiro_crew import skill_trust
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.skills import (
     _FAMILY_LINE_MAX_LABELS,
+    PROJECT_SKILL_BODY_CAP,
+    SkillBodyPage,
     SkillContextCapacityError,
     SkillsLoader,
     _family_line,
@@ -30,37 +34,79 @@ def _skill(root: Path, key: str) -> str:
     return str(path)
 
 
-def _loader(tmp_path: Path) -> SkillsLoader:
-    return SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+def _project_loader(
+    tmp_path: Path, bodies: dict[str, str], *, opened, monkeypatch
+) -> tuple[SkillsLoader, Path]:
+    """A loader plus a trusted project holding one ``always: true`` skill per name.
+
+    Where the descriptor-pinned walk is unavailable (Windows) the project cannot be
+    granted, so the trust verdict and the enumeration are stood in for; every body
+    and metadata read below that seam still goes through the real confined reader
+    on the real project bytes.
+    """
+    project = tmp_path / "project"
+    rows: list[tuple[str, Path]] = []
+    for name, body in bodies.items():
+        path = project / ".kiro" / "skills" / name / "SKILL.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"---\nname: {name}\ndescription: desc for {name}\nalways: true\n---\n{body}\n",
+            encoding="utf-8",
+        )
+        rows.append((name, path))
+    loader = _loader(tmp_path, opened=opened)
+    if skill_trust.project_skill_traversal_supported():
+        skill_trust.grant_project_trust(project)
+        return loader, project
+    root = str(project)
+    real_iter = loader._iter
+
+    def trusted(project_dir) -> str:
+        return root if project_dir is not None and Path(project_dir) == project else ""
+
+    def enumerate_with_project(project_dir=None):
+        # The real walk's precedence: a project key a global one already holds is dropped.
+        global_rows = real_iter(None)
+        taken = {name for name, _path, _within in global_rows}
+        confined = [(name, path, root) for name, path in rows if name not in taken]
+        return global_rows + (confined if trusted(project_dir) else [])
+
+    monkeypatch.setattr(loader, "_trusted_project_key", trusted)
+    monkeypatch.setattr(loader, "_iter", enumerate_with_project)
+    return loader, project
+
+
+def _loader(tmp_path: Path, *, opened) -> SkillsLoader:
+    return opened(SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False))
 
 
 class TestLazyLoadDefault:
     def test_bounded_index_is_the_default(self):
         assert KiroCrewConfig().skills.lazy_load is True
 
-    def test_default_entry_is_the_ranked_index_with_paths(self, tmp_path):
+    def test_default_entry_is_the_ranked_index_with_paths(self, tmp_path, opened):
         skills_dir = tmp_path / "skills"
         for n in range(3):
             _skill(skills_dir, f"web-{n}")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         text = loader.get_context(budget=4000)
         assert "## Available Skills" in text
         assert "## Skill discovery" not in text
         assert str(skills_dir / "web-0" / "SKILL.md") in text
 
-    def test_short_entry_still_reachable_when_the_flag_is_false(self, tmp_path):
+    def test_short_entry_still_reachable_when_the_flag_is_false(self, tmp_path, opened):
         """`discovery_only` is what the false setting selects; it must still work."""
         skills_dir = tmp_path / "skills"
         for n in range(3):
             _skill(skills_dir, f"web-{n}")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         text = loader.get_context(budget=4000, discovery_only=True)
         assert "## Skill discovery" in text
         assert "## Available Skills" not in text
 
 
 class TestFamiliesInTheIndex:
-    def test_truncated_index_names_the_families_it_drops(self, tmp_path):
+    def test_truncated_index_names_the_families_it_drops(self, tmp_path, opened):
         """A count says how much is missing; a family says what it is about.
 
         Every label's number is that family's HIDDEN members, and a family with
@@ -72,7 +118,7 @@ class TestFamiliesInTheIndex:
             _skill(skills_dir, f"alpha-{n}")
         for n in range(6):
             _skill(skills_dir, f"beta-{n}")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         text = loader.get_context(budget=1500)
 
         assert "more skill(s) not shown here" in text
@@ -90,12 +136,12 @@ class TestFamiliesInTheIndex:
             else:
                 assert f"{label}*" not in families[0]
 
-    def test_complete_index_names_no_families(self, tmp_path):
+    def test_complete_index_names_no_families(self, tmp_path, opened):
         """Nothing is hidden, so a family line would only repeat the rows."""
         skills_dir = tmp_path / "skills"
         for n in range(3):
             _skill(skills_dir, f"web-{n}")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         text = loader.get_context(budget=4000)
         assert "Families not shown" not in text
         assert "more skill(s) not shown here" not in text
@@ -191,7 +237,7 @@ class TestTheFamiliesLineNamesTheRowsActuallyOmitted:
     would name skills the reader can already see while hiding ones it cannot.
     """
 
-    def test_an_oversized_early_row_does_not_shift_the_families_line(self, tmp_path):
+    def test_an_oversized_early_row_does_not_shift_the_families_line(self, tmp_path, opened):
         skills_dir = tmp_path / "skills"
         # A row carries the skill's PATH, so a deeply nested key makes a row too
         # long to admit while shorter later rows still fit. Nested rather than one
@@ -208,7 +254,7 @@ class TestTheFamiliesLineNamesTheRowsActuallyOmitted:
             )
         for n in range(12):
             _skill(skills_dir, f"zzz-{n:02d}")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         text = loader.get_context(budget=900)
 
         named = {
@@ -235,7 +281,7 @@ class TestTheFamiliesLineNamesTheRowsActuallyOmitted:
 
 class TestScopedDiscovery:
     def test_ancestor_mapping_prunes_untrusted_project_tree_before_descent(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, opened
     ):
         import os
         from contextlib import contextmanager
@@ -244,7 +290,7 @@ class TestScopedDiscovery:
         project_skills = project / ".kiro" / "skills"
         _skill(project_skills, "hidden")
         _skill(project / ".kiro" / "external", "allowed")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         monkeypatch.setattr(loader, "_trusted_project_key", lambda project: None)
         scanned = []
         original = os.scandir
@@ -282,10 +328,12 @@ class TestScopedDiscovery:
                 rows[0]["key"], project_dir=project, only=only
             )
 
-    def test_ancestor_mapping_cannot_readmit_filtered_global_rows(self, tmp_path, monkeypatch):
+    def test_ancestor_mapping_cannot_readmit_filtered_global_rows(
+        self, tmp_path, monkeypatch, opened
+    ):
         _skill(tmp_path / "skills", "hidden")
         _skill(tmp_path / "external", "allowed")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         monkeypatch.setattr(loader, "_get_disabled_app_names", lambda: frozenset({"disabled"}))
         monkeypatch.setattr(loader, "_owning_app", lambda *args: "disabled")
         rows = loader.scoped_skills(only=[str(tmp_path / "**" / "SKILL.md")])
@@ -293,7 +341,7 @@ class TestScopedDiscovery:
 
     @pytest.mark.asyncio
     async def test_gateway_list_and_exact_read_share_the_session_mapping(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, opened
     ):
         import json
         from types import SimpleNamespace
@@ -307,7 +355,7 @@ class TestScopedDiscovery:
         root = tmp_path / "skills"
         paths = [_skill(root, f"team/s{n}") for n in range(3)]
         _skill(root, "outside")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         state = SimpleNamespace(sessions=None)
         monkeypatch.setattr(prompts, "_read_session_key", lambda request: "dashboard:scoped")
         monkeypatch.setattr(prompts, "_deny_foreign_app_skill_slot", lambda *args: None)
@@ -327,6 +375,7 @@ class TestScopedDiscovery:
         page = await call(action="list", limit=2)
         assert [row["key"] for row in page["matches"]] == ["team/s0", "team/s1"]
         assert page["next_offset"] == 2
+        assert page["scoped"] is True
         tail = await call(action="list", limit=2, offset=2)
         assert [row["key"] for row in tail["matches"]] == ["team/s2"]
         assert tail["next_offset"] is None
@@ -335,16 +384,59 @@ class TestScopedDiscovery:
         # Clearing the custom mapping must not widen any discovery surface.
         paths.clear()
         assert (await call(action="list"))["matches"] == []
-        assert (await call(action="search", q="outside"))["matches"] == []
+        cleared = await call(action="search", q="outside")
+        assert cleared["matches"] == []
+        assert cleared["scoped"] is True
         assert (await call(action="read", key="outside"))["matches"] == []
 
-    def test_mapping_bounds_every_surface_and_keeps_the_tail_loadable(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_gateway_wildcard_mapping_reports_scope_without_a_count(
+        self, tmp_path, monkeypatch, opened
+    ):
+        """One `skill://.../*/SKILL.md` glob maps many skills, so the route must
+        say the search was scoped without counting glob entries as skills."""
+        import json
+        from types import SimpleNamespace
+        from urllib.parse import urlencode
+
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from kiro_crew.dashboard.handlers import prompts
+
+        root = tmp_path / "skills"
+        for n in range(3):
+            _skill(root, f"team/s{n}")
+        loader = _loader(tmp_path, opened=opened)
+        monkeypatch.setattr(prompts, "_read_session_key", lambda request: "dashboard:scoped")
+        monkeypatch.setattr(prompts, "_deny_foreign_app_skill_slot", lambda *args: None)
+        monkeypatch.setattr(prompts, "_get_skills", lambda state: loader)
+        monkeypatch.setattr(prompts, "requesting_slot_project", lambda *args: None)
+        monkeypatch.setattr(prompts, "_named_slot", lambda *args: SimpleNamespace(agent="custom"))
+        wildcard = [str(root / "team" / "*" / "SKILL.md")]
+        monkeypatch.setattr(prompts, "session_skill_globs", lambda *args, **kw: wildcard)
+        app = web.Application()
+        app["state"] = SimpleNamespace(sessions=None)
+
+        async def call(**query):
+            request = make_mocked_request(
+                "GET", "/api/skills?" + urlencode({"q": "", **query}), app=app
+            )
+            return json.loads((await prompts.api_skills(request)).body)
+
+        listed = await call(action="list")
+        assert len(listed["matches"]) == 3
+        missed = await call(action="search", q="zzz-nothing")
+        assert missed["matches"] == []
+        assert missed["scoped"] is True
+
+    def test_mapping_bounds_every_surface_and_keeps_the_tail_loadable(self, tmp_path, opened):
         root = tmp_path / "skills"
         for n in range(80):
             _skill(root, f"team/skill-{n:03}")
         _skill(root, "other/hidden")
         only = [str(root / "team" / "*" / "SKILL.md")]
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         startup = loader.get_context(budget=1500, only=only)
         assert len(startup) <= 1500
         assert _BODY_MARKER not in startup
@@ -360,17 +452,17 @@ class TestScopedDiscovery:
         assert loader.read_scoped_skill("other/hidden", only=only) is None
         assert loader.resolve_dollar_skills("$other/hidden", only=only) == []
 
-    def test_namespace_is_exact_and_ambiguous_leaf_does_not_pick_a_winner(self, tmp_path):
+    def test_namespace_is_exact_and_ambiguous_leaf_does_not_pick_a_winner(self, tmp_path, opened):
         for key in ("team-a/review", "team-b/review"):
             _skill(tmp_path / "skills", key)
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         assert loader.resolve_dollar_skills("$team-b/review")[0][1] == "team-b/review"
         assert loader.resolve_dollar_skills("$review") == []
         assert loader.resolve_dollar_skills("$missing/review") == []
         only = [str(tmp_path / "skills" / "team-b" / "review" / "SKILL.md")]
         assert loader.resolve_dollar_skills("$review", only=only)[0][1] == "team-b/review"
 
-    def test_external_literal_mappings_do_not_rescan_siblings(self, tmp_path, monkeypatch):
+    def test_external_literal_mappings_do_not_rescan_siblings(self, tmp_path, monkeypatch, opened):
         import kiro_crew.skills as module
 
         paths = [_skill(tmp_path / "external", f"skill-{n:03}") for n in range(40)]
@@ -383,26 +475,29 @@ class TestScopedDiscovery:
                 yield entry
 
         monkeypatch.setattr(module, "_iter_skill_files", counting_walk)
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         rows = loader.scoped_skills(only=paths)
         assert len(rows) == len(paths)
         assert len(visited) == len(paths)
         assert {str(path) for path in visited} == set(paths)
         assert _BODY_MARKER in loader.read_scoped_skill(rows[-1]["key"], only=paths)
 
-    def test_external_mapping_uses_a_stable_loadable_full_key(self, tmp_path):
+    def test_external_mapping_uses_a_stable_loadable_full_key(self, tmp_path, opened):
         mapped = _skill(tmp_path / "external", "team/review")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         rows = loader.search_skills("", only=[mapped], browse=True)
         assert len(rows) == 1
         key = rows[0]["key"]
         assert key.startswith("mapped/")
         assert _BODY_MARKER in loader.read_scoped_skill(key, only=[mapped])
-        assert _loader(tmp_path).search_skills("", only=[mapped], browse=True)[0]["key"] == key
+        assert (
+            _loader(tmp_path, opened=opened).search_skills("", only=[mapped], browse=True)[0]["key"]
+            == key
+        )
         assert loader.read_scoped_skill(key, only=[]) is None
 
     def test_pinned_capacity_refuses_instead_of_truncating_required_instructions(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, opened
     ):
         import kiro_crew.skills as module
 
@@ -413,11 +508,11 @@ class TestScopedDiscovery:
                 "---\nname: required\nalways: true\n---\n" + str(n) * 900, encoding="utf-8"
             )
         with pytest.raises(SkillContextCapacityError, match="startup instruction capacity"):
-            _loader(tmp_path).get_context(budget=1000)
+            _loader(tmp_path, opened=opened).get_context(budget=1000)
 
-    def test_deleted_mapping_never_inherits_global_catalog(self, tmp_path):
+    def test_deleted_mapping_never_inherits_global_catalog(self, tmp_path, opened):
         _skill(tmp_path / "skills", "other")
-        loader = _loader(tmp_path)
+        loader = _loader(tmp_path, opened=opened)
         only = [str(tmp_path / "skills" / "gone" / "SKILL.md")]
         assert loader.get_context(budget=4000, only=only) == ""
         assert loader.search_skills("", only=only, browse=True) == []
@@ -427,7 +522,7 @@ class TestScopedDiscovery:
 @pytest.mark.parametrize("indexed", [False, True])
 @pytest.mark.parametrize("swap_root", [False, True])
 def test_external_mapping_retains_admitted_root_after_swap(
-    tmp_path, monkeypatch, indexed, swap_root
+    tmp_path, monkeypatch, indexed, swap_root, opened
 ):
     """Swap after enumeration; metadata, index/fallback, exact and $ stay confined."""
     root = tmp_path / "external"
@@ -437,7 +532,7 @@ def test_external_mapping_retains_admitted_root_after_swap(
     escaped.write_text(
         "---\nname: stolen\ndescription: zirconium\n---\nzirconium secret", encoding="utf-8"
     )
-    loader = _loader(tmp_path)
+    loader = _loader(tmp_path, opened=opened)
     try:
         only = [str(root / "**" / "SKILL.md")]
         entries = loader._scoped_entries(None, only)
@@ -462,7 +557,7 @@ def test_external_mapping_retains_admitted_root_after_swap(
 
 
 @pytest.mark.asyncio
-async def test_installed_post_exact_read_long_keys_and_scope_errors(tmp_path, monkeypatch):
+async def test_installed_post_exact_read_long_keys_and_scope_errors(tmp_path, monkeypatch, opened):
     """Exercise real HTTP JSON parsing beyond the default request-line ceiling."""
     from types import SimpleNamespace
 
@@ -476,7 +571,7 @@ async def test_installed_post_exact_read_long_keys_and_scope_errors(tmp_path, mo
     from kiro_crew.dashboard.token_auth import token_auth_middleware
     from kiro_crew.validation import MAX_SKILL_KEY_CHARS
 
-    loader = _loader(tmp_path)
+    loader = _loader(tmp_path, opened=opened)
     seen = []
     scope = ["admitted/SKILL.md"]
     monkeypatch.setattr(prompts, "_get_skills", lambda state: loader)
@@ -485,11 +580,11 @@ async def test_installed_post_exact_read_long_keys_and_scope_errors(tmp_path, mo
     monkeypatch.setattr(prompts, "session_skill_globs", lambda *args, **kw: scope)
     monkeypatch.setattr(prompts, "_deny_foreign_app_skill_slot", lambda *args: None)
 
-    def read(key, *, only, project_dir):
+    def read(key, *, only, project_dir, offset, limit, capacity):
         seen.append((key, only, project_dir))
-        return "reference body"
+        return SkillBodyPage("reference body", 0, 1, 1, 14, None)
 
-    monkeypatch.setattr(loader, "read_scoped_skill", read)
+    monkeypatch.setattr(loader, "read_scoped_skill_page", read)
     app = web.Application(
         middlewares=[
             _make_csrf_middleware("mcp_tool"),
@@ -556,7 +651,67 @@ async def test_installed_post_exact_read_long_keys_and_scope_errors(tmp_path, mo
         loader.close()
 
 
-def test_external_provider_target_keeps_global_budget_and_admitted_root(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_installed_exact_read_credits_the_usage_ledger(tmp_path, monkeypatch, opened):
+    """An exact read hands the model the body, so it credits the ledger once.
+
+    A miss, a search and a list are not loads, so they credit nothing, and a
+    paged read credits only the page that starts at the body's first line. The
+    GET read is not the tool's route, so it credits nothing either.
+    """
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.dashboard.handlers import prompts
+    from kiro_crew.dashboard.routes import skills as routes
+
+    _skill(tmp_path / "skills", "alpha")
+    loader = _loader(tmp_path, opened=opened)
+    # An armed debounce keeps the credit from starting the background flush
+    # thread, which would otherwise write after the test ends.
+    loader._usage._last_flush = time.time()
+    monkeypatch.setattr(prompts, "_get_skills", lambda state: loader)
+    monkeypatch.setattr(prompts, "requesting_slot_project", lambda *args: None)
+    monkeypatch.setattr(prompts, "_named_slot", lambda *args: SimpleNamespace(agent="custom"))
+    monkeypatch.setattr(prompts, "session_skill_globs", lambda *args, **kw: None)
+    monkeypatch.setattr(prompts, "_deny_foreign_app_skill_slot", lambda *args: None)
+    app = web.Application()
+    app["state"] = SimpleNamespace(sessions=None)
+    app["allowed_origins"] = set()
+    routes.register(app)
+    read = {"scope": "installed", "action": "read"}
+    async with TestClient(TestServer(app), headers={"X-Session-Key": "dashboard:scoped"}) as client:
+        response = await client.post("/api/skills/-/discover", json={**read, "key": "alpha"})
+        assert response.status == 200
+        assert _BODY_MARKER in (await response.json())["matches"][0]["content"]
+
+        missing = await client.post("/api/skills/-/discover", json={**read, "key": "absent"})
+        assert (await missing.json())["matches"] == []
+        for query in ("q=alpha&scope=installed&action=search", "q=&scope=installed&action=list"):
+            assert (await client.get(f"/api/skills/-/discover?{query}")).status == 200
+
+        # A paged read is one load: the page at line 0 credits it, the next page does not.
+        for offset in (0, 1):
+            page = await client.post(
+                "/api/skills/-/discover",
+                json={**read, "key": "alpha", "offset": offset, "limit": 1},
+            )
+            assert page.status == 200
+            assert (await page.json())["matches"][0]["page"]
+
+        # The GET read serves the body but is not the tool's route, so it credits nothing.
+        legacy = await client.get("/api/skills/-/discover?q=&scope=installed&action=read&key=alpha")
+        assert legacy.status == 200
+        assert _BODY_MARKER in (await legacy.json())["matches"][0]["content"]
+
+    assert {key: hits for key, (hits, _seen) in loader._usage.snapshot().items()} == {"alpha": 2}
+
+
+def test_external_provider_target_keeps_global_budget_and_admitted_root(
+    tmp_path, monkeypatch, opened
+):
     import os
 
     from conftest import make_dir_link
@@ -573,7 +728,7 @@ def test_external_provider_target_keeps_global_budget_and_admitted_root(tmp_path
         skills_module, "_trusted_skill_roots", lambda: (os.path.realpath(provider),)
     )
     only = [str(external / "*" / "SKILL.md")]
-    loader = _loader(tmp_path)
+    loader = _loader(tmp_path, opened=opened)
     try:
         rows = loader.scoped_skills(only=only)
         assert len(rows) == 1
@@ -597,18 +752,17 @@ def test_external_provider_target_keeps_global_budget_and_admitted_root(tmp_path
 
 
 @pytest.mark.parametrize("key", ["mapped/foo", "mapped/0123456789abcdef/foo"])
-def test_catalog_name_does_not_change_admitted_project_provenance(tmp_path, monkeypatch, key):
+def test_catalog_name_does_not_change_admitted_project_provenance(
+    tmp_path, monkeypatch, key, opened
+):
     """Start at the admitted enumeration seam, preserving real descriptor reads."""
-    from kiro_crew import skill_trust
-    from kiro_crew.skills import PROJECT_SKILL_BODY_CAP
-
     project = tmp_path / "project"
     path = Path(_skill(project / ".kiro" / "skills", key))
     path.write_text(
         "---\nname: scoped\ndescription: zirconium\n---\n" + "x" * PROJECT_SKILL_BODY_CAP,
         encoding="utf-8",
     )
-    loader = _loader(tmp_path)
+    loader = _loader(tmp_path, opened=opened)
     # Windows cannot admit projects via the pinned walk. Isolate that earlier
     # gate while exercising all downstream readers with real project bytes.
     if skill_trust.project_skill_traversal_supported():
@@ -628,19 +782,19 @@ def test_catalog_name_does_not_change_admitted_project_provenance(tmp_path, monk
         loader.close()
 
 
-def test_regular_global_mapped_namespace_keeps_normal_reader(tmp_path, monkeypatch):
-    from unittest.mock import Mock
+def test_regular_global_mapped_namespace_keeps_normal_reader(tmp_path, monkeypatch, opened):
+    from unittest.mock import ANY, Mock
 
     key = "mapped/foo"
     _skill(tmp_path / "skills", key)
-    loader = _loader(tmp_path)
+    loader = _loader(tmp_path, opened=opened)
     reader = Mock(wraps=loader.load_skill)
     monkeypatch.setattr(loader, "load_skill", reader)
     try:
         row = loader.scoped_skills()[0]
         assert row["confine_root"] is None and row["mapping_root"] is None
         assert _BODY_MARKER in loader.read_scoped_skill(key)
-        reader.assert_called_once_with(key, None, max_bytes=99_000)
+        reader.assert_called_once_with(key, None, max_bytes=99_000, refusal_reasons=ANY)
         loader._search_index.close()
         loader._search_index = None
         reader.reset_mock()
@@ -648,3 +802,229 @@ def test_regular_global_mapped_namespace_keeps_normal_reader(tmp_path, monkeypat
         reader.assert_called_once_with(key, None, max_bytes=None)
     finally:
         loader.close()
+
+
+class TestAProjectAlwaysSkillCannotFailTheSession:
+    """A checked-out repository's ``always: true`` skill degrades instead of raising.
+
+    The operator's own pinned skills keep their refuse-rather-than-trim contract;
+    a project's are delivered on their own budget, and one that cannot be
+    delivered is skipped with a warning and stays discoverable.
+    """
+
+    def test_bodies_past_the_project_budget_are_skipped_and_stay_discoverable(
+        self, tmp_path, monkeypatch, opened, caplog
+    ):
+        """Five 20,000-character bodies: each fits the per-file cap, together they
+        pass the shared startup capacity a repository must not be able to spend."""
+        loader, project = _project_loader(
+            tmp_path,
+            {f"big-{n}": str(n) * 20_000 for n in range(5)},
+            opened=opened,
+            monkeypatch=monkeypatch,
+        )
+        required: list[str] = []
+        with caplog.at_level("WARNING", logger="kiro_crew.skills"):
+            context = loader.get_context(
+                budget=4000,
+                project_dir=project,
+                project_body_budget=PROJECT_SKILL_BODY_CAP,
+                required_parts_out=required,
+            )
+        delivered = [n for n in range(5) if str(n) * 20_000 in "".join(required)]
+        assert len(delivered) == 1, "the project budget did not bound its own bodies"
+        warned = " ".join(record.getMessage() for record in caplog.records)
+        for n in range(5):
+            if n in delivered:
+                continue
+            assert f"'big-{n}'" in warned
+            assert (
+                f"skill_search('big-{n}')" in context
+            ), "a skipped project skill left the directory"
+            # Visible in the prompt itself, inside the required block.
+            assert f"skill_search(action='read', key='big-{n}')" in "".join(required)
+
+    def test_the_warning_names_the_skill_and_the_revocable_trust_grant(
+        self, tmp_path, monkeypatch, opened, caplog
+    ):
+        """The operator's way out has to be in the message: the skill to shrink
+        and the project whose trust grant they can revoke."""
+        loader, project = _project_loader(
+            tmp_path,
+            {"one": "a" * 20_000, "two": "b" * 20_000},
+            opened=opened,
+            monkeypatch=monkeypatch,
+        )
+        with caplog.at_level("WARNING", logger="kiro_crew.skills"):
+            loader.get_context(
+                budget=4000, project_dir=project, project_body_budget=PROJECT_SKILL_BODY_CAP
+            )
+        [message] = [
+            r.getMessage() for r in caplog.records if "were not injected" in r.getMessage()
+        ]
+        assert "'two'" in message
+        assert repr(loader._trusted_project_key(project)) in message
+        assert "revoke the project-skill trust grant" in message
+        assert f"project skill budget of {PROJECT_SKILL_BODY_CAP}" in message
+
+    def test_an_unreadable_body_is_skipped_and_stays_discoverable(
+        self, tmp_path, monkeypatch, opened, caplog
+    ):
+        loader, project = _project_loader(
+            tmp_path, {"gone": "the body"}, opened=opened, monkeypatch=monkeypatch
+        )
+        # Enumerated and listed, then refused at the body read (a file swapped or
+        # removed after the walk).
+        monkeypatch.setattr(loader, "load_skill", lambda *args, **kwargs: None)
+        with caplog.at_level("WARNING", logger="kiro_crew.skills"):
+            context = loader.get_context(
+                budget=4000, project_dir=project, project_body_budget=PROJECT_SKILL_BODY_CAP
+            )
+        assert "skill_search('gone')" in context
+        assert any("'gone'" in record.getMessage() for record in caplog.records)
+
+    def test_a_fitting_body_has_its_own_budget_beside_a_full_operator_cap(
+        self, tmp_path, monkeypatch, opened
+    ):
+        import kiro_crew.skills as module
+
+        monkeypatch.setattr(module, "PINNED_SKILL_BODIES_CAP", 2000)
+        Path(_skill(tmp_path / "skills", "operator")).write_text(
+            "---\nname: operator\nalways: true\n---\n" + "o" * 1800, encoding="utf-8"
+        )
+        loader, project = _project_loader(
+            tmp_path, {"proj": "PROJECT BODY " + "p" * 1000}, opened=opened, monkeypatch=monkeypatch
+        )
+        required: list[str] = []
+        loader.get_context(
+            budget=4000,
+            project_dir=project,
+            project_body_budget=PROJECT_SKILL_BODY_CAP,
+            required_parts_out=required,
+        )
+        delivered = "".join(required)
+        assert "o" * 1800 in delivered
+        assert "### Skill: proj" in delivered and "PROJECT BODY" in delivered
+
+    def test_operator_capacity_still_refuses_beside_a_project_skill(
+        self, tmp_path, monkeypatch, opened
+    ):
+        """Only the project's rows degrade; the operator's own still fail loudly."""
+        import kiro_crew.skills as module
+
+        loader, project = _project_loader(
+            tmp_path, {"proj": "small body"}, opened=opened, monkeypatch=monkeypatch
+        )
+        monkeypatch.setattr(module, "PINNED_SKILL_BODIES_CAP", 2000)
+        for n in range(3):
+            Path(_skill(tmp_path / "skills", f"required-{n}")).write_text(
+                "---\nname: required\nalways: true\n---\n" + str(n) * 900, encoding="utf-8"
+            )
+        with pytest.raises(SkillContextCapacityError, match="startup instruction capacity"):
+            loader.get_context(budget=4000, project_dir=project)
+
+    def test_the_notice_and_warning_stay_bounded_however_many_rows_are_skipped(
+        self, tmp_path, monkeypatch, opened, caplog
+    ):
+        """The repository chooses how many always: true rows it ships."""
+        loader, project = _project_loader(
+            tmp_path,
+            {f"k-{n:03d}": "x" * 400 for n in range(120)},
+            opened=opened,
+            monkeypatch=monkeypatch,
+        )
+        required: list[str] = []
+        with caplog.at_level("WARNING", logger="kiro_crew.skills"):
+            loader.get_context(
+                budget=4000,
+                project_dir=project,
+                project_body_budget=PROJECT_SKILL_BODY_CAP,
+                required_parts_out=required,
+            )
+        notice = "".join(required).split("### Project skills not injected", 1)[1]
+        assert "more not named here." in notice
+        assert len(notice) < 2600
+        warnings = [r.getMessage() for r in caplog.records if "were not injected" in r.getMessage()]
+        assert len(warnings) == 1, "one warning per context build, not one per skipped row"
+        assert "more." in warnings[0] and len(warnings[0]) < 4000
+
+    def test_skipped_rows_are_bounded_where_they_are_retained(self):
+        """Bounding only the rendered notice would still hold every skipped key."""
+        from kiro_crew.skill_runtime import delivery
+
+        cap = delivery._SKIPPED_PROJECT_KEYS_MAX_CHARS
+        reason = f"past the room left in the project skill budget of {PROJECT_SKILL_BODY_CAP}"
+        skipped = delivery.SkippedProjectSkills()
+        for n in range(5000):
+            skipped.add(f"k-{n:04d}-" + "x" * 100, reason)
+        assert skipped.count == 5000
+        assert 0 < len(skipped.notice) < 5000 and 0 < len(skipped.logged) < 5000
+        assert sum(len(line) + 2 for line in skipped.notice) <= cap
+        assert sum(len(item) + 2 for item in skipped.logged) <= cap
+
+    def test_each_list_names_only_the_rows_skipped_first(self):
+        """A key too long for the notice closes the notice, not the warning."""
+        from kiro_crew.skill_runtime import delivery
+
+        skipped = delivery.SkippedProjectSkills()
+        keys = ["short-0", "long/" + "y" * 3000] + [f"short-{n}" for n in range(1, 31)]
+        for key in keys:
+            skipped.add(key, "reason")
+        assert skipped.notice == ["- skill_search(action='read', key='short-0')"]
+        named = [item.split("'", 2)[1] for item in skipped.logged]
+        assert named[:2] == ["short-0", keys[1][: delivery._SKIPPED_PROJECT_KEY_LOG_CHARS]]
+        assert named[2:] == keys[2 : len(named)], "the warning names a prefix of the rows"
+        assert len(named) > 2
+
+        oversized = delivery.SkippedProjectSkills()
+        oversized.add("z" * 10_000, "reason")
+        assert oversized.notice == []
+        assert oversized.logged == [f"{'z' * delivery._SKIPPED_PROJECT_KEY_LOG_CHARS!r} (reason)"]
+
+    def test_a_key_whose_repr_expands_is_still_bounded_where_it_is_kept(self):
+        """``repr`` renders a non-printable code point as up to ten characters, so a
+        key cut to its first 200 characters can still render past the whole bound.
+        The kept item is capped after rendering, the first one included."""
+        from kiro_crew.skill_runtime import delivery
+
+        cap = delivery._SKIPPED_PROJECT_KEYS_MAX_CHARS
+        per_key = delivery._SKIPPED_PROJECT_KEY_LOG_CHARS
+        skipped = delivery.SkippedProjectSkills()
+        skipped.add("\U000e0001" * 1000, "reason")
+        assert len(skipped.logged) == 1
+        assert len(skipped.logged[0]) <= per_key + len("'' (reason)")
+        assert sum(len(item) + 2 for item in skipped.logged) <= cap
+
+    def test_every_skipped_row_rejoins_the_directory_named_or_not(self, tmp_path, opened):
+        """The pinned set loses each skipped key as it is skipped, past the bound too."""
+        loader = _loader(tmp_path, opened=opened)
+        rows = [{"key": f"k-{n:03d}-" + "z" * 100, "size_bytes": 10**6} for n in range(200)]
+        pinned = {row["key"] for row in rows} | {"operator-skill"}
+        parts: list[str] = []
+        skipped = loader._append_project_skill_bodies(parts, rows, None, 100, pinned)
+        assert parts == []
+        assert skipped.count == 200 and len(skipped.notice) < 200
+        assert pinned == {"operator-skill"}
+
+    def test_a_body_whose_repo_scope_changed_after_listing_is_not_delivered(
+        self, tmp_path, monkeypatch, opened, caplog
+    ):
+        """The scope is re-checked on the bytes delivered, not only on the listing read."""
+        loader, project = _project_loader(
+            tmp_path, {"scoped": "SCOPED BODY"}, opened=opened, monkeypatch=monkeypatch
+        )
+        rescoped = (
+            "---\nname: scoped\ndescription: d\nalways: true\n"
+            "repo_scope: somewhere/else\n---\nSCOPED BODY\n"
+        )
+        monkeypatch.setattr(loader, "load_skill", lambda *args, **kwargs: rescoped)
+        required: list[str] = []
+        with caplog.at_level("WARNING", logger="kiro_crew.skills"):
+            loader.get_context(
+                budget=4000,
+                project_dir=project,
+                project_body_budget=PROJECT_SKILL_BODY_CAP,
+                required_parts_out=required,
+            )
+        assert "SCOPED BODY" not in "".join(required)
+        assert not [r for r in caplog.records if "were not injected" in r.getMessage()]

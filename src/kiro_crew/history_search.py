@@ -1,39 +1,150 @@
-"""Pure transcript-search parsing and the composed session catalog projection.
+"""The composed session catalog projection, and the facade of the transcript-search family.
 
-The query helpers in this module have no storage side effects.  The projection
+Query parsing and the shared search memos live in owner modules.  The projection
 is deliberately composed with a ConversationLog facade instead of inheriting
 from it: calls back through the facade preserve the narrow monkeypatch seams
 used by the history race and cost tests while keeping one owner for each cache,
 lock, and path.
+
+What a query means lives in :mod:`kiro_crew.history_search_query`, pure parsing with
+no storage side effects, and what every search over one directory shares in
+:mod:`kiro_crew.history_search_memo`. Every name they define stays importable from
+here; the family block at the end of this file says what new work goes where.
 """
 
 from __future__ import annotations
 
+import heapq
+import importlib as _importlib
 import itertools
 import json
-import logging
 import math
 import os
-import re
+import sys as _sys
+import threading
 import time as _time
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Container, Iterable, Iterator
 from datetime import datetime
-from typing import TYPE_CHECKING, NamedTuple
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from kiro_crew._sqlite_compat import is_cjk_char, script_runs
-from kiro_crew.history_index import INDEX_FILENAME, SessionSearchIndex
+from kiro_crew import _facade_mirror
+from kiro_crew._sqlite_compat import is_cjk_char, script_runs  # noqa: F401 - facade re-exports
+from kiro_crew.history_cache import _GroupRecencyMemo
+from kiro_crew.history_index import (
+    INDEX_FILENAME,
+    ChunkDecodeError,
+    IndexRow,
+    SessionSearchIndex,
+    fold_texts,
+)
+from kiro_crew.history_search_memo import (  # noqa: F401 - facade re-exports
+    _DIGEST_HEX_CHARS,
+    _MEMO_ENTRY_OVERHEAD,
+    _SEARCH_COUNT_MEMO_BYTES,
+    _SEARCH_FOLD_BUDGET_BYTES,
+    _SEARCH_SNIPPET_BUDGET_BYTES,
+    _SEARCH_SNIPPET_MEMO_BYTES,
+    _SHARED_MEMO_DIRS,
+    _ContentCounts,
+    _Flight,
+    _flights,
+    _flights_lock,
+    _LiveDigests,
+    _memo_entry_cost,
+    _memo_group,
+    _MemoGate,
+    _MemoPair,
+    _memos_for,
+    _MemoValue,
+    _needle_memo_key,
+    _new_memo,
+    _phrase_memo_key,
+    _pinned,
+    _shared_memos,
+    _shared_memos_lock,
+)
+from kiro_crew.history_search_query import (  # noqa: F401 - facade re-exports
+    _CJK_CHAR_WEIGHT,
+    _CJK_SEGMENTER_BACKOFF_SECS,
+    _CJK_WORDS_MEMO_RUNS,
+    _FORGE_CHAIN_ONLY_WORDS,
+    _FORGE_LEAD_PUNCT,
+    _FORGE_MR_WORDS,
+    _FORGE_REF_WEIGHT,
+    _FORGE_REF_WORDS,
+    _FORGE_REQUEST_WORDS,
+    _FORGE_SIGIL_RE,
+    _FORGE_TRAIL_PUNCT,
+    _FORGE_TYPE_WORDS,
+    _FORGE_URL_RE,
+    _FORGE_URL_REPO_RE,
+    _FORGE_WORD_NUM_RE,
+    _MAX_SEARCH_REF_SPELLINGS,
+    _SEARCH_MAX_FORGE_REFS,
+    _SEARCH_MAX_SCORING_EXTRAS,
+    _SHORT_NEEDLE_MAX_CHARS,
+    _TITLE_SCOPE_PREFIX,
+    CJK_SEGMENT_MAX_RUN_CHARS,
+    CJK_SEGMENT_MAX_RUNS,
+    SEARCH_MAX_TOKENS,
+    CjkSegmenter,
+    SearchNeedle,
+    TitleScope,
+    _cjk_slot,
+    _cjk_words,
+    _cjk_words_lock,
+    _cjk_words_memo,
+    _CjkSegmenterSlot,
+    _forge_lead_in,
+    _forge_spellings,
+    _forge_type_suffix,
+    _ForgeRef,
+    _is_cjk_char,
+    _is_short_term,
+    _lead_names_a_type,
+    _lead_names_merge_request,
+    _parse_forge_ref,
+    _provider_search_ref,
+    _saturates,
+    _script_runs,
+    _snippet_tiers,
+    _valid_words,
+    count_needle,
+    is_han_run,
+    logger,
+    needles_match_text,
+    parse_search_query,
+    register_cjk_segmenter,
+    register_search_ref_resolver,
+    reset_cjk_segmenter_for_tests,
+    reset_search_ref_resolver_for_tests,
+    snippet_needle_tiers,
+    snippet_needles,
+    split_title_scope,
+    tiered_first_hit,
+)
 from kiro_crew.jsonl_util import bounded_records
 
 if TYPE_CHECKING:
     from kiro_crew.history import ConversationLog
 
+#: ``_scan_head_title`` outcome for a head that raised while being read; never cached.
+_UNREADABLE = object()
+
 
 SEARCH_MIN_CHARS = 2  # shortest query string that triggers backend search
-SEARCH_MAX_TOKENS = 12  # distinct REQUIRED needles per query — see parse_search_query
-_SEARCH_MAX_SCORING_EXTRAS = 12  # distinct scoring-only needles (CJK bigrams) per query
 _TITLE_BOOST = 10  # field-boost multiplier for title matches in search_sessions
 _PHRASE_BOOST = 4  # extra weight per exact whole-query hit in a multi-word search
 _SEARCH_SCAN_WINDOW = 500  # cap files scanned per search to bound I/O
+
+#: Seconds a session's transcript must have gone unmodified before the backfill
+#: pass indexes it. A session that is being written changes on every turn, and
+#: every change re-reads, re-folds and re-walks the whole file — O(n^2) work
+#: over the session's life. Deferring until the file goes quiet indexes it once
+#: instead. Until then the session is simply not vouched for, so search scans
+#: it directly — the same superset guarantee un-indexed sessions already have.
+_INDEX_QUIET_WINDOW_SECS = 120.0
 # Recency boost bounds for search_sessions: a session modified now scores
 # ×(1 + _RECENCY_MAX_BOOST); the extra weight halves every
 # _RECENCY_HALF_WEIGHT_DAYS of age and decays toward ×1.0 — never a penalty
@@ -45,849 +156,6 @@ _SEARCH_SCAN_WINDOW = 500  # cap files scanned per search to bound I/O
 # unfixed.
 _RECENCY_MAX_BOOST = 1.5
 _RECENCY_HALF_WEIGHT_DAYS = 30.0
-# Weight of a single CJK character needle that came from a longer run. Individual
-# han/kana/hangul characters are extremely common (a function character like "的"
-# can appear hundreds of times in one transcript), so counting them at full weight
-# would let character noise drown out the bigram adjacency signal that actually
-# ranks CJK results. They still gate the AND match at full strength — the weight
-# only dampens their contribution to the relevance score.
-_CJK_CHAR_WEIGHT = 0.25
-# Weight of one forge-reference spelling hit contributed for RANKING a bare
-# number query ("4411"). Such a query keeps its plain substring needle, so
-# recall is untouched — the spellings only move the session that actually
-# references pull request 4411 above one that happens to contain those digits
-# inside a run id. Sized like _PHRASE_BOOST: strong enough that a single real
-# reference outranks incidental digit noise, not so strong that a session
-# repeating the digits many times can never win.
-_FORGE_REF_WEIGHT = 4.0
-# Forge expansions per query. Each one costs one substring scan of every scanned
-# session PER SPELLING it carries — up to eight for a reference the query named,
-# and up to thirteen for a bare number's ranking needle, which carries both
-# families. Three expansions therefore top out around 39 substring scans per
-# field over the scan window, each a single C-level ``str.count`` against
-# already-folded, memoized text — which is why the cap stays at three rather
-# than shrinking as the spelling sets grew: a query naming three references
-# ("compare #1 #2 #3") is legitimate, and the scans it costs are not the
-# expensive part of a search. A fourth forge-shaped token degrades to a plain
-# needle.
-_SEARCH_MAX_FORGE_REFS = 3
-# ALTERNATIVE spellings ONE resolver answer may contribute for a single token.
-# The collector returns the FIRST plugin to recognize the token, for every token
-# shape, so exactly one provider's answer ever arrives here — this bounds that
-# one answer, not a fan-in across providers. The unit of cost is the same as
-# above: one ``str.count`` per spelling per scanned session per field, so an
-# unbounded contribution would let a plugin multiply every search by a number
-# nothing in core chose. Sized to the sibling per-plugin ceiling
-# (_MAX_PLUGIN_PATH_MARKERS, also 8), which bounds the same kind of thing: what
-# one plugin may hand core for one lookup. Lives here rather than beside the
-# collector because the cost it bounds is this module's.
-_MAX_SEARCH_REF_SPELLINGS = 8
-
-
-def _is_cjk_char(ch: str) -> bool:
-    """True for characters that written Chinese/Japanese/Korean does not space-separate.
-
-    Whitespace tokenization silently degrades for these scripts — a whole CJK
-    clause arrives as ONE "token" — so :func:`parse_search_query` segments runs
-    of them instead. The ranges cover the Han ideograph blocks (unified,
-    extension A, the astral extensions, compatibility) and the kana blocks:
-    Chinese and Japanese are written without spaces, which is the named defect.
-    Deliberately NOT Hangul — modern Korean IS space-separated, so its words
-    already arrive as ordinary whitespace tokens and the substring rule serves
-    them; segmenting them would change Korean ranking to fix a failure nobody
-    has reported. Likewise not full-width forms, punctuation, or symbols.
-
-    The ranges themselves live in :mod:`kiro_crew._sqlite_compat`, which the
-    knowledge FTS dialect also segments by, so the set has ONE owner: two
-    hand-maintained copies of it drifted apart silently, and this module and that
-    one must agree on what "a spaceless script" means or the same query segments
-    differently in session search and knowledge search.
-    """
-    return is_cjk_char(ch)
-
-
-class SearchNeedle(NamedTuple):
-    """One substring a session search scans for.
-
-    ``required=True`` needles form the AND gate — a session missing one (in
-    both title and content) is disqualified. ``required=False`` needles only
-    contribute to the relevance score. ``weight`` scales each occurrence's
-    contribution to that score.
-
-    ``alts`` are ALTERNATIVE SPELLINGS of the same reference: the needle is
-    satisfied by ``text`` or by any alt, and occurrences of every spelling
-    count toward the score. That is a bounded OR *inside* one needle, not an OR
-    over the query — it exists because one forge reference has several written
-    forms (``#4411`` and ``…/pull/4411`` name the same pull request), and a
-    transcript may carry any of them.
-
-    ``digit_bounded`` rejects a match that sits inside a LONGER number, on
-    either side — so ``4411`` matches ``PR 4411.`` but not ``#44110`` and not
-    the run id ``1544110293``. Only meaningful for a spelling made of digits or
-    ending in one.
-
-    ``adjacency`` marks a needle as ADJACENCY EVIDENCE (a CJK bigram) — the only
-    kind the adjacency floor in :meth:`ConversationLog.search_sessions` counts.
-    Scoring-only needles that are not adjacency evidence (the forge spellings
-    added for ranking a bare number) therefore cannot arm that floor, which
-    would otherwise turn a ranking hint into a hidden gate.
-    """
-
-    text: str
-    weight: float
-    required: bool
-    alts: tuple[str, ...] = ()
-    digit_bounded: bool = False
-    adjacency: bool = False
-
-
-def count_needle(needle: SearchNeedle, folded_text: str) -> int:
-    """Occurrences of any of *needle*'s spellings in *folded_text*.
-
-    The single counter every matcher and ranker shares, so the alternation and
-    the digit boundary cannot be honored by one caller and dropped by another.
-    *folded_text* must already be casefolded (needle spellings are).
-
-    An ordinary needle (no alts, unbounded) costs exactly one :meth:`str.count`,
-    the same as before spellings existed — the scan cost that
-    :func:`parse_search_query`'s needle caps are sized against. A needle with
-    alts costs one scan per spelling, which is why forge expansions carry their
-    own cap.
-    """
-    if not folded_text:
-        return 0
-    total = 0
-    for text in (needle.text, *needle.alts):
-        if not text:
-            continue
-        if not needle.digit_bounded:
-            total += folded_text.count(text)
-            continue
-        # Non-overlapping scan, matching str.count, skipping a hit that sits
-        # inside a longer number (``4411`` in ``1544110293``, ``#4411`` in
-        # ``#44110``). The LEFT guard applies only to a spelling that starts with
-        # a digit: for a delimited spelling the character before it says nothing
-        # about the number's length, and demanding a non-digit there would refuse
-        # ``#4411`` inside ``owner/repo2#4411`` — a repository whose name ends in
-        # a digit, matched against the very reference the query named.
-        left_bounded = text[0].isdigit()
-        start = 0
-        while True:
-            found = folded_text.find(text, start)
-            if found < 0:
-                break
-            end = found + len(text)
-            before_ok = not left_bounded or found == 0 or not folded_text[found - 1].isdigit()
-            after_ok = end >= len(folded_text) or not folded_text[end].isdigit()
-            if before_ok and after_ok:
-                total += 1
-            start = end
-    return total
-
-
-# One owner for splitting text into same-script runs. The name stays because
-# `history.py` re-exports it as part of its facade; only the duplicated body is
-# gone. The shared version returns a list instead of yielding, which the single
-# caller below (a plain `for`) cannot tell apart, and it tolerates an empty
-# string where this copy raised IndexError on `token[0]`.
-_script_runs = script_runs
-
-
-# Words that only NAME a reference type in front of its number ("PR 4411",
-# "merge request !12"). They are dropped from the gate when they introduce a
-# number, because they are not part of the reference: requiring the literal
-# "pr" would disqualify the very transcripts this expansion exists to find —
-# one that names the pull request only by URL never contains those letters.
-_FORGE_MR_WORDS = frozenset({"mr", "merge-request", "merge_request", "mergerequest"})
-# "merge" and "request" name no type on their own: "merge 1234" and "requests 12"
-# are ordinary prose, and treating either as a reference would drop the word from
-# the gate and pull in every session mentioning that number. They qualify only
-# TOGETHER ("merge request 12"), which does name GitLab's type.
-_FORGE_REQUEST_WORDS = frozenset({"request", "requests"})
-_FORGE_CHAIN_ONLY_WORDS = _FORGE_REQUEST_WORDS | frozenset({"merge"})
-# Words that DO name a type by themselves, so one of them in the lead-in run is
-# what makes a following number a reference.
-_FORGE_TYPE_WORDS = (
-    frozenset({"pr", "prs", "pull", "pulls", "pull-request", "pull_request", "pullrequest"})
-    | frozenset({"issue", "issues"})
-    | _FORGE_MR_WORDS
-)
-# The full lead-in vocabulary: type words plus the chain-only members, which must
-# be droppable and visible to the family test even though neither names a type.
-_FORGE_REF_WORDS = _FORGE_TYPE_WORDS | _FORGE_CHAIN_ONLY_WORDS
-
-
-def _lead_names_merge_request(lead: tuple[str, ...]) -> bool:
-    """True when the words introducing a number name a GitLab merge request.
-
-    Either an unambiguous word ("MR 12", "merge_request 12") or the two-word
-    form "merge request 12".
-    """
-    if any(word in _FORGE_MR_WORDS for word in lead):
-        return True
-    return "merge" in lead and any(word in _FORGE_REQUEST_WORDS for word in lead)
-
-
-def _lead_names_a_type(lead: tuple[str, ...]) -> bool:
-    """True when the lead-in run actually names a forge type.
-
-    A run of chain-only words does not: "requests 12" is prose about requests,
-    not a reference to item 12, and reading it as one would drop "requests" from
-    the gate and admit every session mentioning ``#12``.
-    """
-    return any(word in _FORGE_TYPE_WORDS for word in lead) or _lead_names_merge_request(lead)
-
-
-# Punctuation a reference collects from surrounding prose ("(#4411)," / "PR
-# #4411."). Stripped before the shapes below are tried, and only from the edges,
-# so the token's own delimiters survive. '!' is NOT in the leading set: it is
-# GitLab's merge-request sigil, not decoration.
-_FORGE_LEAD_PUNCT = "([{<\"'“‘"
-_FORGE_TRAIL_PUNCT = ")]}>,.;:?\"'”’"
-# A path-shaped reference, with or without a scheme/host: ``pull/4411``,
-# ``https://github.com/o/r/pull/4411/files``, ``…/-/merge_requests/12``.
-_FORGE_URL_RE = re.compile(
-    r"^(?:\S*/)?(?P<kind>pull|pulls|merge_requests|merge-requests|issues)"
-    r"/(?P<number>\d{1,9})(?:/\S*)?$"
-)
-# The owner/repo slug inside such a URL, used only for ranking.
-_FORGE_URL_REPO_RE = re.compile(
-    r"^(?:https?://)?[^/\s]+\.[^/\s]+"
-    r"/(?P<repo>[a-z0-9._-]+(?:/[a-z0-9._-]+)+?)"
-    r"(?:/-)?/(?:pull|pulls|merge_requests|merge-requests|issues)/\d"
-)
-# A sigil reference: ``#4411``, ``!12``, ``owner/repo#4411``, ``pr#4411``.
-_FORGE_SIGIL_RE = re.compile(
-    r"^(?:(?P<repo>[a-z0-9._-]+(?:/[a-z0-9._-]+)+)|(?P<word>pr|mr|pull|issue))?"
-    r"(?P<sigil>[#!])(?P<number>\d{1,9})$"
-)
-# A glued word+number reference: ``pr4411``, ``pr-4411``, ``mr-12``.
-_FORGE_WORD_NUM_RE = re.compile(r"^(?P<word>pr|mr|pull|issue)-?(?P<number>\d{1,9})$")
-
-
-class _ForgeRef(NamedTuple):
-    """A forge item (pull request / merge request / issue) named by a query.
-
-    ``bare`` records that the QUERY spelled the number with no sigil ("PR 4411",
-    "issue 42", "pr4411"). That decides whether plain digits are one of the
-    item's spellings — see :func:`_forge_spellings`.
-
-    """
-
-    number: str
-    merge_request: bool
-    repo: str | None
-    bare: bool = False
-
-
-def _forge_spellings(ref: _ForgeRef) -> tuple[str, tuple[str, ...]]:
-    """Return ``(canonical, alts)`` — how *ref* can be written in a transcript.
-
-    The families are kept apart because the sigils are not interchangeable:
-    GitHub draws pull requests and issues from ONE number sequence (``#4411``,
-    ``/pull/4411`` and ``/issues/4411`` are the same item), while GitLab numbers
-    merge requests separately from issues, which is why it spells them ``!12``
-    and ``#12``. For a SIGIL query that separation is a guarantee — ``!12`` never
-    matches ``#12``, a different object. A sigil-free query ("merge request 12")
-    also carries the bare digits, which a ``#12`` mention satisfies, so there the
-    separation governs ranking rather than exclusion.
-
-    Path spellings carry no leading slash so they match both ``/pull/4411`` in a
-    URL and a bare ``pull/4411`` written on its own.
-
-    The prose spellings ("pr 4411", "pull request 4411", "pr4411") are included
-    because a transcript often names the item in words rather than with a sigil,
-    and a query that typed the sigil should still find it. They match as plain
-    substrings, so a glued form can hit inside a longer word (``expr4411``
-    satisfies ``pr4411``). That is deliberate: this module matches every other
-    needle as a substring — ``cont`` hits ``contention`` — and adding word
-    boundaries for some spellings and not others would make the rule harder to
-    predict than the false positive it avoids, which ranks last anyway on a
-    single hit. The digit boundary still bounds the numeric side.
-
-    A bare digit spelling is a substring of its own sigil and glued spellings, so
-    one mention of ``#4411`` counts twice inside a bare reference's needle. That
-    only lifts the relevance score of a session that really does reference the
-    item, and never gates.
-
-    Plain digits are a spelling only for a ``bare`` reference, and that
-    asymmetry is deliberate. A query that typed no sigil ("issue 42") is looking
-    for the number as written, so the digits belong; a query that typed one
-    ("#4411", a PR URL) was explicit, and admitting bare digits there would make
-    ``!12`` match every session that mentions a standalone 12 — ordinary prose
-    (a count, a date, a version).
-
-    Recall relative to the plain substring gate this replaces does not rest on
-    the list being exhaustive by inspection — three shapes slipped past that
-    reasoning — but on a property test that drives every shape the parser
-    accepts against a transcript quoting it verbatim. Concretely: a sigil shape
-    contains its own canonical spelling (``owner/repo2#4411`` contains
-    ``#4411``), a path or URL shape contains a path spelling, and a glued or
-    two-token shape contains the bare digits. The one session the expansion can
-    still drop is one whose only claim to the old match was the digits sitting
-    INSIDE a longer number ("4411" within run id 1544110293) — and excluding that
-    is the point of the digit boundary, since such a session never referenced
-    the item.
-    """
-    number = ref.number
-    bare = (number,) if ref.bare else ()
-    if ref.merge_request:
-        return (
-            f"!{number}",
-            (
-                f"merge_requests/{number}",
-                f"merge-requests/{number}",
-                f"mr {number}",
-                f"merge request {number}",
-                f"mr{number}",
-                *bare,
-            ),
-        )
-    return (
-        f"#{number}",
-        (
-            f"pull/{number}",
-            f"pulls/{number}",
-            f"issues/{number}",
-            f"pr {number}",
-            f"pull request {number}",
-            f"pr{number}",
-            *bare,
-        ),
-    )
-
-
-def _forge_lead_in(parts: list[str], index: int) -> tuple[str, ...]:
-    """The contiguous run of reference-vocabulary words before ``parts[index]``.
-
-    Raw material for :func:`_forge_type_suffix`, which decides how much of the
-    run is actually part of the reference.
-    """
-    back = index - 1
-    while back >= 0 and parts[back] in _FORGE_REF_WORDS:
-        back -= 1
-    return tuple(parts[back + 1 : index])
-
-
-def _forge_type_suffix(lead: tuple[str, ...]) -> tuple[str, ...]:
-    """The part of *lead* that names the reference's type — its SHORTEST naming suffix.
-
-    Only the words adjacent to the number belong to the reference; anything
-    before them is the user's own search term. "merge issue 42" is a query about
-    ``merge`` AND issue 42, so the reference is ``issue 42`` and ``merge`` stays
-    in the gate — taking the whole run would drop it and return every session
-    mentioning #42.
-
-    SHORTEST, not longest: a longer suffix can still contain a type word without
-    that word being the head of the phrase ("merge issue" would qualify on
-    ``issue`` alone and swallow ``merge``). The shortest naming suffix is the
-    complete type phrase and no more — which still admits the two-word forms,
-    since neither "request" nor "merge" names a type by itself and only
-    ("merge", "request") together qualify.
-
-    Returns ``()`` when no suffix names a type, i.e. the number is not a
-    reference at all.
-
-    Two known limitations, accepted rather than special-cased. A chain-only word
-    wedged BETWEEN the type word and the number ("issue merge 42") is swallowed,
-    because the shortest naming suffix is ``("issue", "merge")``; the mirror case
-    ("merge issue 42") is handled. And because the gate is keyed by term text, a
-    query repeating a suffix word as its own search term ("pull the pull request
-    12") loses that term when the suffix is dropped. Both need a query nobody
-    writes, both only widen the result set, and closing them means keying the
-    gate by token position rather than by text — a redesign of the needle map,
-    not a fix here.
-    """
-    for size in range(1, len(lead) + 1):
-        suffix = lead[len(lead) - size :]
-        if _lead_names_a_type(suffix):
-            return suffix
-    return ()
-
-
-def _parse_forge_ref(token: str, lead: tuple[str, ...]) -> _ForgeRef | None:
-    """Parse *token* as a forge reference, or return ``None``.
-
-    *token* is one casefolded whitespace-separated term; *lead* is the run of
-    type-naming words before it (:func:`_forge_lead_in`), which is what makes
-    the two-token form ("PR 4411", "merge request 12") a reference rather than a
-    bare number, and which names the family when the token itself does not. A
-    bare number with no such lead-in is NOT a reference — treating every number
-    in a query as one would rewrite ordinary numeric content search (ports,
-    error codes, dates).
-    """
-    token = token.lstrip(_FORGE_LEAD_PUNCT).rstrip(_FORGE_TRAIL_PUNCT)
-    if not token:
-        return None
-    url = _FORGE_URL_RE.match(token)
-    if url:
-        repo_match = _FORGE_URL_REPO_RE.match(token)
-        return _ForgeRef(
-            url.group("number"),
-            url.group("kind").startswith("merge"),
-            repo_match.group("repo") if repo_match else None,
-        )
-    sigil = _FORGE_SIGIL_RE.match(token)
-    if sigil:
-        # The TYPED sigil decides the family, not the word before it: "#" names
-        # the shared pull/issue sequence and "!" names GitLab's merge requests,
-        # so letting a word override the sigil produced a reference ("mr#12")
-        # none of whose spellings was the string the user typed.
-        return _ForgeRef(
-            sigil.group("number"),
-            sigil.group("sigil") == "!",
-            sigil.group("repo"),
-        )
-    glued = _FORGE_WORD_NUM_RE.match(token)
-    if glued:
-        return _ForgeRef(
-            glued.group("number"),
-            glued.group("word") in _FORGE_MR_WORDS,
-            None,
-            bare=True,
-        )
-    if token.isdigit() and len(token) <= 9:
-        suffix = _forge_type_suffix(lead)
-        if suffix:
-            return _ForgeRef(token, _lead_names_merge_request(suffix), None, bare=True)
-    return None
-
-
-#: The resolver that recognizes a query token as some REGISTERED source
-#: provider's item and answers with that item's spellings. The built-in forge
-#: shapes above are tried first, so it can only ever claim a token no built-in
-#: recognized.
-#:
-#: ONE slot, not a list: the only production registrant is
-#: ``register_source_provider``, and the per-plugin fan-out already lives inside
-#: the collector it publishes. A list would have bought ordered consultation
-#: nothing in-tree can exercise.
-#:
-#: Deliberately a plain module-level callable: this module imports nothing but
-#: the standard library, and the provider registry it serves lives in
-#: ``kiro_crew.dashboard.handlers.source_providers`` — a 7k-line module that
-#: imports aiohttp at module scope. Reaching UP to ask it would put the whole
-#: dashboard HTTP stack on every search, including the CLI and the Discord
-#: title-only gate, neither of which runs a web server. The dashboard therefore
-#: PUSHES its collector down here at registration time instead.
-_search_ref_resolver: Callable[[str], tuple[str, Sequence[str]] | None] | None = None
-
-logger = logging.getLogger(__name__)
-
-
-def register_search_ref_resolver(
-    resolve: Callable[[str], tuple[str, Sequence[str]] | None],
-) -> None:
-    """Install the token -> ``(canonical, alts)`` resolver. Idempotent.
-
-    Called at provider registration time, from the side that owns the provider
-    registry. Re-registration is the expected case, not an error — the registry
-    publishes the same collector on every provider registration — and the slot
-    simply holds the latest.
-
-    A resolver must be PURE and allocation-cheap: it is consulted for every term
-    of every query, and both :func:`snippet_needles` and
-    :meth:`ConversationLog.search_sessions` re-parse, so a search costs at least
-    two passes over the tokens. Any I/O, config read or lock in a resolver
-    becomes per-keystroke latency in the dashboard's search box. Nothing enforces
-    that beyond this contract.
-    """
-    global _search_ref_resolver
-    _search_ref_resolver = resolve
-
-
-def reset_search_ref_resolver_for_tests() -> None:
-    """Drop the resolver. Test-only: the slot is module state."""
-    global _search_ref_resolver
-    _search_ref_resolver = None
-
-
-def _provider_search_ref(token: str) -> tuple[str, tuple[str, ...]] | None:
-    """Ask the registered resolver to recognize *token*.
-
-    Returns ``(canonical, alts)`` NORMALIZED — casefolded, de-duplicated, empties
-    dropped, alts capped at :data:`_MAX_SEARCH_REF_SPELLINGS` — or ``None``.
-
-    This is the ONLY normalizer. The dashboard collector hands the first answer
-    through without judging it, so casefolding, the shape checks, the cap and the
-    dedup all happen once, here, where the cost they bound is paid. It matters
-    because the failure is SILENT — :func:`parse_search_query` casefolds its input
-    and :func:`count_needle` requires already-folded needles, so a spelling that
-    arrives with a capital letter produces a needle that matches nothing, with no
-    error and no log; it just returns zero results.
-
-    Every way a resolver can fail is contained, because a plugin defect must not
-    make the search box stop working: raising when CALLED, returning a malformed
-    answer, and raising while its ``alts`` are READ — the hook promises a
-    ``Sequence``, which cannot do that, but a resolver ignoring the contract can,
-    so the read sits inside a ``try`` and the answer is dropped whole. Every case
-    logs — a traceback where an exception was raised, the offending value where a
-    shape was merely wrong. None of them is silent: silence is the defect above.
-    """
-    resolve = _search_ref_resolver
-    if resolve is None:
-        return None
-    try:
-        found = resolve(token)
-    except Exception:
-        logger.debug("search ref resolver %r failed on %r", resolve, token, exc_info=True)
-        return None
-    if found is None:
-        return None
-    try:
-        canonical, alts = found
-    except Exception:
-        # `Exception`, not just TypeError/ValueError: the ANSWER may itself be lazy,
-        # so unpacking it runs plugin code that can raise anything at all.
-        logger.debug("search ref resolver %r returned a malformed answer", resolve, exc_info=True)
-        return None
-    if not isinstance(canonical, str) or not canonical.strip():
-        logger.debug("search ref resolver %r returned an invalid canonical %r", resolve, canonical)
-        return None
-    if isinstance(alts, str) or not isinstance(alts, Iterable):
-        logger.debug("search ref resolver %r returned invalid alts %r", resolve, alts)
-        return None
-    folded = canonical.casefold()
-    try:
-        # islice, not tuple(alts): a resolver ignoring the `Sequence` contract can
-        # hand back an endless iterable, and materializing it would hang the parse.
-        candidates = tuple(itertools.islice(alts, _MAX_SEARCH_REF_SPELLINGS))
-    except Exception:
-        # A `Sequence` cannot raise here; a resolver ignoring the contract can,
-        # and its answer is dropped whole rather than read half-way.
-        logger.debug(
-            "search ref resolver %r raised while its alts were read", resolve, exc_info=True
-        )
-        return None
-    spellings: dict[str, None] = {}
-    for alt in candidates:
-        if isinstance(alt, str) and alt.strip():
-            spellings[alt.casefold()] = None
-        else:
-            logger.debug("search ref resolver %r returned an invalid alt %r", resolve, alt)
-    spellings.pop(folded, None)
-    # Containment: at least one spelling must actually carry the token the user
-    # typed, or the answer describes some other item and would gate (or rank) a
-    # query on text it never named.
-    typed = token.casefold()
-    if typed not in folded and not any(typed in spelling for spelling in spellings):
-        logger.debug("search ref resolver %r answered %r without the typed token", resolve, folded)
-        return None
-    return (folded, tuple(spellings))
-
-
-def parse_search_query(query: str) -> tuple[list[SearchNeedle], str, bool]:
-    """Return ``(needles, phrase, adjacency_floor)`` for a search *query*, casefolded.
-
-    ``phrase`` is the whole normalized query. ``needles`` are derived from the
-    DISTINCT whitespace-separated terms in first-seen order; every caller that
-    matches (:meth:`ConversationLog.search_sessions`) or locates
-    (:func:`snippet_needles` for the snippet builders) query text derives from
-    this one parse so the halves of a query cannot drift apart.
-
-    Non-CJK terms become one required, weight-1.0 needle each — the classic
-    substring-AND behavior (``"cont"`` hits ``"contention"``). A run of CJK
-    characters cannot keep that rule: CJK text is written without spaces, so
-    requiring the run verbatim demands the user's exact sentence and a
-    multi-word query like ``"修复内存泄漏"`` would only ever match transcripts
-    containing that literal string. Each CJK run therefore expands to:
-
-    * its individual characters as REQUIRED needles at :data:`_CJK_CHAR_WEIGHT`
-      — maximal recall, since a document discussing all the query's words
-      contains all of its characters regardless of word order; and
-    * its overlapping character bigrams as ADJACENCY needles at weight 1.0 —
-      the standard dictionary-free CJK adjacency signal. They are not
-      individually required, but when a query carries any, a session must hit
-      AT LEAST ONE to qualify (see :meth:`ConversationLog.search_sessions`):
-      individual han/kana characters are so common that a pure character
-      scatter is noise, so the adjacency floor keeps the character gate's
-      recall (words apart still match — each word IS a bigram hit) without
-      letting scatter-only sessions fill the result page. Each occurrence also
-      scores, so documents keeping more of the query adjacent rank higher.
-      A single-character run stays one required, weight-1.0 needle: it IS the
-      whole term.
-
-    Precision moves from the gate into the ranking, which is the module's
-    existing philosophy for the substring-prefix looseness on ASCII terms.
-
-    A term that names a FORGE ITEM — a pull request, merge request or issue —
-    becomes ONE required needle carrying every spelling of that item instead of
-    the literal term (see :func:`_parse_forge_ref`). ``#4411``, ``pr 4411``,
-    ``pull/4411``, a full PR URL and ``owner/repo#4411`` therefore all find the
-    same sessions, whichever form each transcript happens to use, and the
-    spellings are digit-bounded so ``#4411`` never matches ``#44110``. A naming
-    word that introduces a number ("PR 4411") is dropped from the gate: it is
-    not part of the reference, and requiring the letters "pr" would disqualify a
-    transcript that names the pull request only by URL. When the query spelled
-    the number with no sigil, plain digits stay one of the spellings, so the
-    expansion keeps the recall of the literal AND it replaces — the one session
-    it can drop is a session whose digits merely sat inside a longer number,
-    which is what the digit boundary is for. Only a run of words that actually
-    NAMES a type makes a following number a reference: "requests 12" and
-    "merge 1234" stay literal terms, since dropping such a word from the gate
-    would trade a real term for every session mentioning that number. A BARE
-    number with no naming word at all is not a reference either: it keeps its
-    plain substring needle, so numeric content search is unchanged, and gains
-    the spellings as scoring-only needles, so the session that actually
-    references pull request 4411 outranks one that merely contains those digits
-    inside a run id.
-
-    Bounds (both exist because **every needle costs one full scan** of a
-    session's text): required needles cap at :data:`SEARCH_MAX_TOKENS` and
-    scoring extras at :data:`_SEARCH_MAX_SCORING_EXTRAS`. Deduplication is free
-    correctness — a repeated term cannot change an AND match. Truncation in
-    EITHER set makes the query only LOOSER — fewer required terms, and a
-    truncated adjacency set additionally WAIVES the adjacency floor (the third
-    tuple element comes back ``False``), because enforcing "at least one bigram
-    hit" against a partial bigram set would EXCLUDE a session that matches only
-    a dropped bigram — turning a cost cap into a hidden gate for exactly the
-    long spaceless queries this parse exists to serve. Looser can admit extra
-    results but never hide a session that would have matched — the safe
-    direction when the alternative is a keystroke-driven search stalling for
-    seconds.
-
-    A whitespace-only query yields ``([], "", False)``; callers treat that as
-    "matches nothing" rather than "matches everything".
-    """
-    parts = query.casefold().split()
-    if not parts:
-        return ([], "", False)
-    phrase = " ".join(parts)
-    required: dict[str, SearchNeedle] = {}
-    extras: dict[str, SearchNeedle] = {}
-    ranking: dict[str, SearchNeedle] = {}
-    forge_budget = _SEARCH_MAX_FORGE_REFS
-    # One ledger keyed by the item's canonical spelling, so a slot is charged per
-    # ITEM rather than per needle. "#4411 4411" names one pull request twice — as
-    # a required reference and as a bare number's ranking hint — and charging
-    # both spent a phantom slot that could push a later distinct reference past
-    # the cap. Keyed rather than counted so the order the two forms appear in
-    # cannot change the outcome.
-    charged: set[str] = set()
-    for index, part in enumerate(parts):
-        lead = _forge_lead_in(parts, index)
-        ref = _parse_forge_ref(part, lead)
-        if ref is None and not part.isdigit():
-            # Built-ins always win: only a token no forge shape recognized is
-            # offered to a registered provider. The extra `isdigit` guard is what
-            # keeps a provider from turning a BARE NUMBER into a gate — the same
-            # rule _parse_forge_ref applies to itself, and for the same reason.
-            # Gating "987654321" on a provider spelling would demand that
-            # spelling of every result, silently narrowing ordinary numeric
-            # content search. So a bare number is never offered to a provider at
-            # all, and the built-in ranking hint below carries built-in
-            # spellings only.
-            #
-            # A provider contributes SPELLINGS ONLY, never lead-in vocabulary:
-            # _forge_type_suffix's words are popped from the gate, and the common
-            # English words a provider would want ("review", "cr") are far more
-            # frequent in transcripts than "pr"/"mr", so admitting them would
-            # trade a real search term for every session mentioning that number.
-            # A prefixed token carries its own type and needs no lead-in.
-            provider_ref = _provider_search_ref(part)
-            if provider_ref is not None:
-                canonical, alts = provider_ref
-                if canonical in required:
-                    # Already gated by an earlier spelling of the same item; the
-                    # needle carries the whole set, so there is nothing to merge.
-                    continue
-                if canonical in charged or forge_budget:
-                    if canonical not in charged:
-                        charged.add(canonical)
-                        forge_budget -= 1
-                    required.setdefault(canonical, SearchNeedle(canonical, 1.0, True, alts, True))
-                    # Continue like the built-in path does: the literal token must
-                    # not ALSO survive into the gate through _script_runs, or a
-                    # provider query would carry two required needles.
-                    continue
-                # Budget exhausted and this item has no slot — fall through and
-                # degrade to a plain literal needle, exactly as an over-budget
-                # forge token does.
-        if ref is not None:
-            canonical, alts = _forge_spellings(ref)
-            if canonical in required:
-                # The item is already gated, but this occurrence still carries
-                # information: its own naming words must leave the gate, and a
-                # sigil-free spelling contributes the bare digits the first
-                # occurrence may not have had. Skipping outright let
-                # "#42 issue 42" keep `issue` required AND lose the bare-digit
-                # spelling — narrowing a query that named the item twice, which
-                # the loosen-only contract forbids.
-                for word in _forge_type_suffix(lead):
-                    required.pop(word, None)
-                if ref.bare:
-                    seen = required[canonical]
-                    if ref.number not in seen.alts:
-                        required[canonical] = seen._replace(alts=(*seen.alts, ref.number))
-                continue
-            if canonical not in charged and not forge_budget:
-                ref = None
-        if ref is not None:
-            if canonical not in charged:
-                charged.add(canonical)
-                forge_budget -= 1
-            # The words that NAME the reference's type are not part of the search
-            # text, and requiring them would disqualify a transcript that names
-            # the item only by URL — one that never spells the letters "pr". Only
-            # that naming suffix is dropped: in "merge issue 42" the reference is
-            # "issue 42" and `merge` is the user's own term, so popping the whole
-            # run would return every session mentioning #42.
-            for word in _forge_type_suffix(lead):
-                required.pop(word, None)
-            required.setdefault(canonical, SearchNeedle(canonical, 1.0, True, alts, True))
-            if ref.repo:
-                # Ranking only: the repo slug appears in a URL mention but not in
-                # a prose "#4411" one, so requiring it would hide real hits. It
-                # breaks the tie between the same number in two repos.
-                ranking.setdefault(ref.repo, SearchNeedle(ref.repo, 1.0, False))
-            continue
-        if part.isdigit() and len(part) <= 9:
-            gh_text, gh_alts = _forge_spellings(_ForgeRef(part, False, None))
-            # Charged against the shared ledger, so a number already gated as a
-            # reference does not spend a second slot on a hint the dedup below
-            # will discard anyway. This branch deliberately does NOT `continue` —
-            # the plain digit needle added below is what keeps numeric content
-            # search working, and it belongs in the gate whether or not the hint
-            # fits in the budget.
-            if gh_text not in charged and forge_budget:
-                charged.add(gh_text)
-                forge_budget -= 1
-                mr_text, mr_alts = _forge_spellings(_ForgeRef(part, True, None))
-                # Every sigil spelling of the number, both families: these only
-                # score, so a wrong-family hit costs a little rank rather than
-                # admitting a wrong object into the results.
-                spellings = tuple(
-                    dict.fromkeys(s for s in (gh_text, *gh_alts, mr_text, *mr_alts) if s != part)
-                )
-                ranking[gh_text] = SearchNeedle(
-                    spellings[0], _FORGE_REF_WEIGHT, False, spellings[1:], True
-                )
-        for run, is_cjk in _script_runs(part):
-            if not is_cjk or len(run) == 1:
-                required.setdefault(run, SearchNeedle(run, 1.0, True))
-                continue
-            for ch in run:
-                required.setdefault(ch, SearchNeedle(ch, _CJK_CHAR_WEIGHT, True))
-            for i in range(len(run) - 1):
-                bigram = run[i : i + 2]
-                extras.setdefault(bigram, SearchNeedle(bigram, 1.0, False, adjacency=True))
-    # A spelling that is already REQUIRED must not also score as a ranking hint:
-    # a query naming the same item twice — the bare number and then its GitHub
-    # sigil form — would count its hits twice over. The by-key sweep catches the
-    # SAME-FAMILY repeat, where the hint's own key is the required spelling.
-    for text in [t for t in ranking if t in required]:
-        del ranking[text]
-    # A CROSS-FAMILY repeat ("4411 !4411") slips past that sweep: the sigil
-    # gates the GitLab spelling while the bare number's hint stays keyed on the
-    # GitHub form, so the required spelling survives inside the hint's ALTS and
-    # one mention would be scored by the required needle AND the hint. Required
-    # needles carry alts of their own (count_needle scores every spelling), so
-    # the purge covers those too, not only the keys. A hint whose every
-    # spelling is already required contributes nothing and is dropped whole —
-    # built-in spellings alone cannot get there (the hint's canonical form is
-    # only ever a required KEY, which the by-key sweep already handled), but a
-    # provider's alts can blanket the rest. A hint that keeps any spelling
-    # still ranks on what survives.
-    required_spellings = {s for n in required.values() for s in (n.text, *n.alts)}
-    for key, needle in list(ranking.items()):
-        spellings = tuple(s for s in (needle.text, *needle.alts) if s not in required_spellings)
-        if not spellings:
-            del ranking[key]
-        elif spellings != (needle.text, *needle.alts):
-            ranking[key] = needle._replace(text=spellings[0], alts=spellings[1:])
-    needles = list(required.values())[:SEARCH_MAX_TOKENS]
-    needles.extend(list(extras.values())[:_SEARCH_MAX_SCORING_EXTRAS])
-    needles.extend(ranking.values())
-    adjacency_floor = 0 < len(extras) <= _SEARCH_MAX_SCORING_EXTRAS
-    return (needles, phrase, adjacency_floor)
-
-
-def snippet_needles(query: str) -> list[str]:
-    """Return *query*'s needles ordered for snippet centering, phrase first.
-
-    The snippet builders try needles in order and center the excerpt on the
-    first hit, so ordering is a display-quality decision: the exact phrase is
-    the most meaningful anchor, then full-weight needles (whole terms and CJK
-    bigrams) in first-seen order — preserving the pre-CJK behavior for ASCII
-    queries, where a predictable first-typed-term fallback is part of the
-    contract — and down-weighted lone CJK characters last, the anchor of last
-    resort. Returns ``[]`` for a whitespace-only query.
-
-    A forge-reference needle contributes every spelling it carries, right after
-    its canonical form: the transcript that matched may name the item any of
-    those ways, and centering the snippet on the mention is the whole point.
-    """
-    needles, phrase, _ = parse_search_query(query)
-    if not needles:
-        return []
-    # Stable sort on weight only: within a weight class the parse's insertion
-    # order (required terms first-seen, then bigrams) is the display order.
-    ordered = sorted(needles, key=lambda n: -n.weight)
-    out: list[str] = []
-    for text in (phrase, *(t for n in ordered for t in (n.text, *n.alts))):
-        if text not in out:
-            out.append(text)
-    return out
-
-
-def needles_match_text(
-    needles: list[SearchNeedle], folded_text: str, adjacency_floor: bool = True
-) -> bool:
-    """True when *folded_text* satisfies the query gate that *needles* encode.
-
-    The single-string form of :meth:`ConversationLog.search_sessions`' match
-    rule, for callers that filter one text field (e.g. Discord session
-    resume's title-only fallback) and must not grow a second spelling of
-    tokenization: every REQUIRED needle must appear as a substring, and when
-    the query carries adjacency (bigram) needles at least one must hit — the
-    same adjacency floor that keeps character scatter out of content search.
-    Pass :func:`parse_search_query`'s ``adjacency_floor`` element: it is
-    ``False`` when the bigram set was truncated, which WAIVES the floor here
-    exactly as in ``search_sessions`` (a partial bigram set cannot prove
-    "no adjacency anywhere"). *folded_text* must already be casefolded
-    (needle texts are).
-
-    Satisfaction is per NEEDLE, not per literal: a needle carrying alternative
-    spellings (a forge reference) is satisfied by any one of them, via the
-    shared :func:`count_needle`.
-    """
-    if not needles:
-        return False
-    adjacency_hit = False
-    has_adjacency = False
-    for needle in needles:
-        if needle.required:
-            if not count_needle(needle, folded_text):
-                return False
-        elif needle.adjacency:
-            has_adjacency = True
-            if count_needle(needle, folded_text):
-                adjacency_hit = True
-    return adjacency_hit or not has_adjacency or not adjacency_floor
-
-
-# Hard ceilings on the memory the two search memos may hold, in real retained
-# bytes as reported by ``str.__sizeof__`` — NOT in characters.
-#
-# ``len()`` is the wrong unit and dangerously so: CPython stores a ``str`` in the
-# narrowest width its contents allow, so one character is 1 byte for latin-1, 2
-# for the BMP, and 4 for astral planes. A ceiling of 160 MB counted in characters
-# retains 168 MB of ASCII, 336 MB of CJK, or 671 MB of emoji — and CJK is the
-# ordinary case for a non-English corpus, not a pathological one. The sizers
-# therefore call ``__sizeof__`` per string, and the snippet memo also charges for
-# its list container.
-#
-# Why bytes and not an entry count: a session is read up to
-# ``_SESSION_MAX_BYTES`` (2 MB), so ``_SEARCH_SCAN_WINDOW`` entries is anywhere
-# from a few MB to ~1 GB depending on the corpus. An entry count therefore
-# bounds nothing that matters; it only *looked* safe because real sessions are
-# small (a 171 MB / 230-session corpus folds to ~8 MB).
-#
-# The two are separate rather than one shared pool so a corpus that blows the
-# snippet budget cannot starve the fold, which is the one that keeps matching
-# off the critical path. Their sum is the ceiling to reason about.
-_SEARCH_FOLD_BUDGET_BYTES = 96 * 1024 * 1024
-_SEARCH_SNIPPET_BUDGET_BYTES = 64 * 1024 * 1024
 
 
 def _facade_search_scan_window() -> int:
@@ -914,12 +182,51 @@ def _history_lock_timeout() -> type[BaseException]:
     return history_facade.HistoryLockTimeout
 
 
+def _jsonl_stem(name: str) -> str:
+    """``Path(name).stem`` for a directory entry name ending in ``.jsonl``.
+
+    The final suffix is everything from the last dot, unless that dot starts
+    the name, so only a name longer than the six-character suffix loses it.
+    """
+    return name[:-6] if len(name) > 6 else name
+
+
+#: Session files whose stat failed with something other than ENOENT, already
+#: warned about. One such file marks every listing incomplete, which keeps the
+#: dashboard's unread drain held for the process lifetime, so the warning must
+#: be visible; the listing runs every few seconds, so it is also logged only
+#: once per path per process rather than on every pass.
+_unreadable_session_files_warned: set[str] = set()
+#: Listings run on executor threads, so the check and the add share one lock.
+_unreadable_session_files_lock = threading.Lock()
+
+
+def _warn_unreadable_session_file(path: str, error: OSError) -> None:
+    with _unreadable_session_files_lock:
+        if path in _unreadable_session_files_warned:
+            return
+        _unreadable_session_files_warned.add(path)
+    logger.warning(
+        "Session file %s cannot be stat'd (%s); the session list is reported "
+        "incomplete and unread dots stay held until it is readable or removed",
+        path,
+        error,
+    )
+
+
 class SessionCatalogProjection:
     """List, aggregate, search, and snippet-project conversation sessions."""
 
     def __init__(self, log: "ConversationLog") -> None:
         self._log = log
         self._index: "SessionSearchIndex | None" = None
+        #: ``digest + needle key -> (count, cost)`` over the folded text of a
+        #: session the index vouches for, and ``digest + repr(snippet tiers) ->
+        #: (snippet, cost)`` for the same sessions; each ``None`` when switched
+        #: off. Shared with every projection over this directory.
+        self._count_memo: "_GroupRecencyMemo[_MemoValue] | None"
+        self._snippet_memo: "_GroupRecencyMemo[_MemoValue] | None"
+        self._count_memo, self._snippet_memo = _memos_for(str(log._dir))
 
     @property
     def search_index(self) -> "SessionSearchIndex":
@@ -958,33 +265,137 @@ class SessionCatalogProjection:
             stripped = stripped[len("dashboard_") :]
         return f"dashboard_{stripped}" if stripped else key
 
-    def list_sessions(self) -> list[dict]:
-        """Return metadata for all session files, newest first.
+    @staticmethod
+    def _scan_head_title(path: "str | Path") -> object:
+        """The first user message's content[:80] within the first 21 lines.
+
+        Returns the title, ``None`` when the head holds none, or ``_UNREADABLE``
+        when reading or interpreting the head raised -- that outcome is not
+        cached, so a transient error is retried on the next listing exactly as
+        the uncached read always was.
+        """
+        try:
+            with open(path, encoding="utf-8") as f:
+                for i, ln in enumerate(f):
+                    if i > 20:
+                        break
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        d = json.loads(ln)
+                    except json.JSONDecodeError:
+                        continue
+                    if d.get("role") == "user" and d.get("content"):
+                        return d["content"][:80]
+        except Exception:
+            return _UNREADABLE
+        return None
+
+    def newest_session_stems(self, max_entries: int) -> tuple[list[tuple[str, float]], bool]:
+        """Return up to *max_entries* ``(stem, mtime)`` pairs, newest first.
+
+        A bounded catalog read for callers that walk the archive under a cap.
+        It stats each transcript and keeps only the newest *max_entries* in a
+        heap, so what it holds is bounded by *max_entries* however large the
+        directory is. It reads no file content: no title, no metadata line.
+        Symlinked handoff aliases are skipped, as in :meth:`list_sessions`.
+        Stacked ``dashboard_`` duplicates are NOT folded here; a caller that
+        folds keys and keeps the first one it sees gets the newest copy, which
+        is what :meth:`list_sessions` keeps. The second value is True when more
+        transcripts existed than were returned.
+        """
+        if max_entries < 1 or not self._log._dir.exists():
+            return [], False
+        counted = 0
+
+        def _stats() -> Iterator[tuple[float, str]]:
+            nonlocal counted
+            for path in self._log._dir.glob("*.jsonl"):
+                try:
+                    if path.is_symlink():
+                        continue
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                counted += 1
+                yield mtime, path.stem
+
+        newest = heapq.nlargest(max_entries, _stats())
+        return [(stem, mtime) for mtime, stem in newest], counted > max_entries
+
+    def list_sessions(self, *, keys: Iterable[str] | None = None) -> list[dict]:
+        return self._list_sessions_status(keys=keys)[0]
+
+    def list_sessions_status(self) -> tuple[list[dict], bool]:
+        """Return sessions plus whether the directory listing was complete."""
+        return self._list_sessions_status()
+
+    def _list_sessions_status(
+        self, *, keys: Iterable[str] | None = None
+    ) -> tuple[list[dict], bool]:
+        """Return metadata for session files, newest first.
 
         Deduplicates stacked ``dashboard_`` prefix files, keeping the
-        most recently modified version.  Uses mtime-based metadata cache
+        most recently modified version. Uses the metadata cache
         when available, falling back to reading only the first line for
-        title extraction.
+        title extraction. Explicit *keys* read only those files, so a caller
+        holding one transcript lock can refresh its row without a directory scan.
         """
         sessions: list[dict] = []
-        if not self._log._dir.exists():
-            return sessions
+        try:
+            self._log._dir.stat()
+        except FileNotFoundError:
+            return sessions, True
+        except OSError:
+            return sessions, False
+        complete = True
         # Deduplicate stacked dashboard_ prefixes by canonical key, keeping newer
         by_canon: dict[str, dict] = {}
-        for path in self._log._dir.glob("*.jsonl"):
-            key = path.stem
+        if keys is None:
+            # One scandir pass: the entry's d_type answers is_symlink without an
+            # lstat, and the order is the same directory order glob() used
+            # (glob iterates scandir), so ties in the final mtime sort resolve
+            # exactly as before. The suffix test is glob("*.jsonl")'s match:
+            # pathlib matches dot-names and directories, and folds case only
+            # where the platform's paths do (Windows). Entries carry their
+            # path as a string and their stem from the name, so a listing
+            # builds no ``Path`` per file.
+            base = os.fspath(self._log._dir)
+            try:
+                with os.scandir(base) as it:
+                    entries: list[tuple[str, str, os.DirEntry[str] | None]] = [
+                        (e.path, _jsonl_stem(e.name), e)
+                        for e in it
+                        if os.path.normcase(e.name).endswith(".jsonl")
+                    ]
+            except OSError:
+                return [], False
+        else:
+            entries = []
+            for key in keys:
+                p = self._log._path(key)
+                entries.append((os.fspath(p), p.stem, None))
+        for path, key, entry in entries:
             # Snapshot the invalidation generation BEFORE the stat: the
-            # first-line fill below publishes under this stat's mtime, and a
-            # housekeeping rewrite restores the pre-write mtime
-            # (``_restore_mtime``), so only the generation can prove the
-            # stat → read → publish window stayed write-free for this key.
+            # The first-line fill records this stat's cache identity. The
+            # generation independently proves the stat → read → publish window
+            # stayed write-free for this process.
             gen = self._log._cache_gen(key)
             try:
-                stat = path.stat()
-            except OSError:
+                # Windows DirEntry.stat() reports st_ino as 0, so its cache
+                # identity would never equal the one every other reader takes
+                # from path.stat(); there the entry answers only is_symlink.
+                stat = os.stat(path) if entry is None or os.name == "nt" else entry.stat()
+            except FileNotFoundError:
                 continue
+            except OSError as exc:
+                _warn_unreadable_session_file(path, exc)
+                complete = False
+                continue
+            identity = self._log._cache_identity(stat)
             # Skip symlinks — these are handoff aliases pointing to the real session
-            if path.is_symlink():
+            if os.path.islink(path) if entry is None else entry.is_symlink():
                 continue
             meta: dict = {
                 "key": key,
@@ -996,7 +407,7 @@ class SessionCatalogProjection:
             cached_meta = self._log._meta_cache.get(key)
             if (
                 cached_meta
-                and cached_meta[0] == stat.st_mtime
+                and cached_meta[0] == identity
                 and cached_meta[1] == self._log._cache_gen(key)
             ):
                 d = cached_meta[2]
@@ -1032,7 +443,19 @@ class SessionCatalogProjection:
                             self._log._publish_if_current(
                                 self._log._meta_cache,
                                 key,
-                                (stat.st_mtime, gen, d),
+                                (identity, gen, d),
+                                key=key,
+                                gen=gen,
+                            )
+                        elif isinstance(d, dict):
+                            # A first line that is an object but not metadata
+                            # reads as no metadata, the same ``{}`` that
+                            # ``_read_metadata`` caches for it, so the next
+                            # listing answers from the cache instead of the file.
+                            self._log._publish_if_current(
+                                self._log._meta_cache,
+                                key,
+                                (identity, gen, {}),
                                 key=key,
                                 gen=gen,
                             )
@@ -1045,7 +468,7 @@ class SessionCatalogProjection:
                 msg_cached = self._log._msg_cache.get(key)
                 if (
                     msg_cached
-                    and msg_cached[0] == stat.st_mtime
+                    and msg_cached[0] == identity
                     and msg_cached[1] == self._log._cache_gen(key)
                 ):
                     for m in msg_cached[2]:
@@ -1053,23 +476,27 @@ class SessionCatalogProjection:
                             meta["title"] = m["content"][:80]
                             break
                 else:
-                    try:
-                        with open(path, encoding="utf-8") as f:
-                            for i, ln in enumerate(f):
-                                if i > 20:
-                                    break
-                                ln = ln.strip()
-                                if not ln:
-                                    continue
-                                try:
-                                    d = json.loads(ln)
-                                except json.JSONDecodeError:
-                                    continue
-                                if d.get("role") == "user" and d.get("content"):
-                                    meta["title"] = d["content"][:80]
-                                    break
-                    except Exception:
-                        pass
+                    scanned = self._log._title_scan_cache.get(key)
+                    if (
+                        scanned is not None
+                        and scanned[0] == (identity, stat.st_size)
+                        and scanned[1] == self._log._cache_gen(key)
+                    ):
+                        if scanned[2] is not None:
+                            meta["title"] = scanned[2]
+                    else:
+                        found = self._scan_head_title(path)
+                        if found is not _UNREADABLE:
+                            if found is not None:
+                                meta["title"] = found
+                            # Guarded like the metadata fill above.
+                            self._log._publish_if_current(
+                                self._log._title_scan_cache,
+                                key,
+                                ((identity, stat.st_size), gen, found),
+                                key=key,
+                                gen=gen,
+                            )
             if "title" not in meta:
                 meta["title"] = key
             # Deduplicate: keep newer entry per canonical key
@@ -1079,7 +506,7 @@ class SessionCatalogProjection:
                 by_canon[canon] = meta
         sessions = list(by_canon.values())
         sessions.sort(key=lambda s: s.get("modified", 0), reverse=True)
-        return sessions
+        return sessions, complete
 
     def agent_usage(self) -> dict[str, tuple[int, float]]:
         """Return ``{agent_name: (session_count, last_used_mtime)}`` per agent.
@@ -1098,7 +525,61 @@ class SessionCatalogProjection:
             usage[agent] = (count + 1, max(last_used, meta.get("modified", 0.0)))
         return usage
 
-    def search_sessions(self, query: str, limit: int = 50) -> list[dict]:
+    def search_sessions(
+        self, query: str, limit: int = 50, *, keys: Container[str] | None = None
+    ) -> list[dict]:
+        """Return session metadata for files whose message content matches *query*.
+
+        Ranking, gating and *keys* are documented on :meth:`_search_sessions`.
+
+        Unrestricted callers asking the same *query* and *limit* while one such
+        search is running wait for it and get its rows, rather than each paying
+        the same cold pass in turn on one GIL. A caller joins only while no write
+        has landed in this process since the running search began, so a search
+        that starts after a write never returns rows computed before it.
+        """
+        if keys is not None or not query or limit <= 0:
+            return self._search_sessions(query, limit, keys=keys)
+        slot = (str(self._log._dir), query, limit)
+        epoch = self._log._dir_write_epoch()
+        with _flights_lock:
+            running = _flights.get(slot)
+            if running is None or running.epoch != epoch:
+                flight = _Flight(epoch)
+                _flights[slot] = flight
+                running = None
+        if running is not None:
+            running.done.wait()
+            if running.result is not None:
+                return [dict(row) for row in running.result]
+            return self._search_sessions(query, limit)
+        try:
+            rows = self._search_sessions(query, limit)
+            # A private copy, so a caller editing the rows it was handed cannot
+            # change what a waiting caller receives.
+            flight.result = [dict(row) for row in rows]
+            return rows
+        finally:
+            with _flights_lock:
+                if _flights.get(slot) is flight:
+                    del _flights[slot]
+            flight.done.set()
+
+    def warm_search(self) -> None:
+        """Do the query-independent part of a first search ahead of it.
+
+        Reads every window session's metadata into the log's cache and opens
+        the index with one shortlist read, which together are most of what a
+        first query costs beyond any later new query. Blocking; run off the loop.
+        """
+        if not self._log._dir.exists():
+            return
+        window = self._log.list_sessions()[: _facade_search_scan_window()]
+        self._index_shortlist(window, [])
+
+    def _search_sessions(
+        self, query: str, limit: int = 50, *, keys: Container[str] | None = None
+    ) -> list[dict]:
         """Return session metadata for files whose message content matches *query*.
 
         This is the ONE ranking every transcript-search consumer shares — the
@@ -1136,24 +617,47 @@ class SessionCatalogProjection:
         Ranking (higher is better)::
 
             score = ((title_hits * _TITLE_BOOST)
-                  + (content_hits / sqrt(1 + doc_chars / 1024))) * recency
+                  + (content_hits / sqrt(1 + doc_chars / 1024))
+                  + saturated_hits) * recency
 
         where ``*_hits`` sum the per-needle weighted counts, plus
         ``_PHRASE_BOOST`` per occurrence of the exact whole query when it
-        carries more than a single needle. The phrase bonus rewards adjacency:
+        carries more than a single needle. A short ASCII needle (``5``,
+        ``s3``; one or two characters, see ``_SHORT_NEEDLE_MAX_CHARS``)
+        contributes to ``saturated_hits`` instead of
+        ``content_hits``: ``log1p`` of its length-normalized body count. As a
+        substring it matches timestamps,
+        ids and hashes far more often than prose about the thing does, and
+        unsaturated a long transcript's thousands of incidental digit hits
+        out-score the session whose title IS the query. Saturating the
+        NORMALIZED count keeps body-only matches in frequency order (a
+        substantive long discussion still beats one stray mention in a short
+        session) without dividing by the length norm a second time. Its title
+        hits and its place in the AND gate are unchanged, and longer terms,
+        digit runs of three or more (``4411``) included,
+        keep raw frequency. The phrase bonus rewards adjacency:
         at comparable term frequency, the session containing the words TOGETHER
         as typed ranks above one that merely mentions them far apart.  It is
         deliberately a bonus and not an override — a session repeating one term
         far more often still wins on raw term frequency, exactly as it already
-        did for a single-token query.  (Saturating term frequency, BM25-style,
-        would change that; it would also re-rank every existing single-token
-        query, so it is out of scope here.)
+        did for a single-token query.  (Saturating term frequency generally,
+        BM25-style, would change that and re-rank every existing single-token
+        query, so it stays out of scope; only the short needles above
+        are saturated, because for them frequency was measuring digit density,
+        not relevance.)
 
         ``recency`` is a bounded multiplicative boost — ``1 +
         _RECENCY_MAX_BOOST / (1 + age_days / _RECENCY_HALF_WEIGHT_DAYS)`` — so
         at comparable relevance today's session outranks last year's, while a
         decisively better old match still wins (the boost tops out at ×2.5 and
         never drops below ×1).
+
+        Rows sort by the number of ``verbatim`` needles they hold first and by
+        score second. Only a pure-Han run the dictionary split into words carries
+        one (see :func:`parse_search_query`): the run is the user's own term, and
+        the split words are how a session WITHOUT it still matches. So a session
+        holding the run as typed ranks above one holding its words apart, however
+        often those words repeat. Every other query sorts by score alone.
 
         Title matches get a strong field boost - titles are short and
         intentional, so a hit there is strong evidence.  Content matches
@@ -1165,9 +669,33 @@ class SessionCatalogProjection:
         ``list_sessions`` order - newest first).  Caps results at *limit*.
         Only the ``_SEARCH_SCAN_WINDOW`` most recent files are scored, so
         I/O stays bounded even with hundreds of sessions.
+
+        *keys*, when given, restricts scoring to those session keys (as
+        ``list_sessions`` spells them) inside that same window. It is applied
+        BEFORE ranking and the *limit* cap, so sessions outside it can never
+        crowd an allowed one off the page; an app-token caller passes the keys
+        it owns. Membership is re-judged under the transcript lock through snippet
+        extraction for each output row; a failed check or lock timeout drops the row.
+
+        A query that starts with ``title:`` (see :func:`split_title_scope`) is
+        scoped to titles: only sessions whose title matches its term qualify, and
+        any text after the term is searched as above among them. With nothing after
+        the term, :meth:`_search_titles` answers from titles alone. A bare
+        ``title:`` names no title yet and matches nothing.
         """
         if not query or limit <= 0 or not self._log._dir.exists():
             return []
+        title_filter: Callable[[str], bool] | None = None
+        scope = split_title_scope(query)
+        if scope is not None:
+            if not scope.term:
+                return []
+            title_filter = scope.title_filter()
+            if not scope.rest:
+                return self._search_titles(title_filter, limit, keys)
+            # The rest is the query from here on: it is what the content gate
+            # and the snippet look for, and the term only narrows the window.
+            query = scope.rest
         needles, phrase, adjacency_floor = parse_search_query(query)
         if not needles:
             # Whitespace-only query: no needles to require, so nothing can match.
@@ -1181,12 +709,88 @@ class SessionCatalogProjection:
         # a single CJK term expands to several needles while the phrase is what
         # rewards its characters appearing together.
         multi = [n.text for n in required] != [phrase]
+        gate = _MemoGate(needles, phrase, multi)
+        # Pinned for the whole query: a memo full of other terms evicts those,
+        # never the terms this query is reading and filling right now.
+        snippet_group = repr(_snippet_tiers(needles, phrase))
+        with (
+            _pinned(self._count_memo, gate.memo_keys),
+            _pinned(self._snippet_memo, [snippet_group]),
+        ):
+            return self._search_parsed(
+                query, limit, keys, needles, phrase, adjacency_floor, gate, title_filter
+            )
+
+    def _search_titles(
+        self, title_filter: Callable[[str], bool], limit: int, keys: Container[str] | None
+    ) -> list[dict]:
+        """A ``title:`` query with nothing after its term: match on titles alone.
+
+        Reads no transcript: ``list_sessions`` already carries every title, so
+        this skips the index shortlist, the content folds and the snippets a
+        content search pays for. For the same reason it is not held to the scan
+        window, so a known chat older than the newest ``_SEARCH_SCAN_WINDOW``
+        sessions is still found by its name. Rows keep ``list_sessions`` order,
+        newest first, and carry no snippet. *keys* restricts the rows exactly as
+        in :meth:`_search_parsed`, re-judged under the lock for each output row.
+        """
+        picked = [
+            (meta, False)
+            for meta in self._log.list_sessions()
+            # The title first: it is a string test, while an app caller's *keys*
+            # judges ownership per key.
+            if title_filter(meta.get("title") or "") and (keys is None or meta["key"] in keys)
+        ]
+        return self._result_rows(picked[:limit], keys, "")
+
+    def _search_parsed(
+        self,
+        query: str,
+        limit: int,
+        keys: Container[str] | None,
+        needles: list[SearchNeedle],
+        phrase: str,
+        adjacency_floor: bool,
+        gate: "_MemoGate",
+        title_filter: Callable[[str], bool] | None = None,
+    ) -> list[dict]:
+        """The scoring and snippet half of :meth:`_search_sessions`.
+
+        *title_filter*, when given (a ``title:`` query's term), makes the window
+        the newest ``_SEARCH_SCAN_WINDOW`` sessions whose title it accepts, chosen
+        from every session after the memo prune. Judging a title reads no
+        transcript, so an older session that ``title:x`` finds is still searched
+        for ``title:x more``, and the cap still bounds the transcripts scored.
+        Like *keys*, it skips the content-memo prune, which must see every
+        window session's row; the per-session cache prune still sees the usual
+        window. What an older match adds to the caches and memos stays inside
+        their byte budgets, and the next unrestricted search under pressure
+        releases it.
+        """
+        multi = gate.multi
         now = _time.time()
-        # (score, -rank, meta, needs_snippet)
-        scored: list[tuple[float, int, dict, bool]] = []
-        window = self._log.list_sessions()[: _facade_search_scan_window()]
+        # (verbatim runs hit, score, -rank, meta, needs_snippet)
+        scored: list[tuple[int, float, int, dict, bool]] = []
+        sessions = self._log.list_sessions()
+        scan_window = _facade_search_scan_window()
+        window = sessions[:scan_window]
         self._log._prune_search_memos({m["key"] for m in window})
+        if title_filter is not None:
+            window = [m for m in sessions if title_filter(m.get("title") or "")]
+        if keys is not None:
+            # After the prune, which must see the whole window: the memos are
+            # shared with every unrestricted search.
+            window = [m for m in window if m["key"] in keys]
+        if title_filter is not None:
+            window = window[:scan_window]
         allowed, rowids = self._index_shortlist(window, needles)
+        if keys is None and title_filter is None:
+            # Only an unrestricted search sees every live session's row; one
+            # restricted by *keys* or by a title would prune entries other
+            # callers still reach.
+            self._prune_content_memos(rowids)
+        needle_keys = gate.needle_keys
+        phrase_key = gate.phrase_key
         for rank, meta in enumerate(window):
             key = meta["key"]
             if allowed is not None and key not in allowed:
@@ -1196,25 +800,45 @@ class SessionCatalogProjection:
                 # line below is the unchanged exact evaluation, run on far fewer
                 # sessions.
                 continue
-            doc_chars, folded = self._folded_for(key, rowids)
             title_folded = (meta.get("title") or "").casefold()
+            content = _ContentCounts(self, key, rowids, gate, title_folded)
+            doc_chars = content.doc_chars
+            length_norm = math.sqrt(1 + doc_chars / 1024)
             content_hits = 0.0
+            saturated_hits = 0.0
             title_hits = 0.0
             adjacency_hits = 0
+            verbatim_runs = 0
             disqualified = False
-            for needle in needles:
-                in_content = count_needle(needle, folded)
+            for needle, needle_key in zip(needles, needle_keys):
+                in_content = content.count(needle, needle_key)
                 in_title = count_needle(needle, title_folded)
                 if needle.required and not in_content and not in_title:
                     # AND semantics: one absent required needle disqualifies the
                     # session, so stop counting the rest.
                     disqualified = True
                     break
+                if needle.verbatim:
+                    # Ranks by the sort key below, not by score: its repeats
+                    # already score through the words it is made of.
+                    verbatim_runs += bool(in_content or in_title)
+                    continue
                 if needle.adjacency:
                     adjacency_hits += in_content + in_title
-                content_hits += in_content * needle.weight
+                if needle.saturate_body:
+                    # A short substring's body frequency is mostly
+                    # incidental text. Saturate the length-NORMALIZED count (hit
+                    # density), so order among body-only matches is kept
+                    # (1 < 10 < 1000 hits at equal length; one stray hit in a
+                    # long transcript still loses to one in a short one) while
+                    # thousands of digit hits cannot outrank a title. Kept
+                    # apart from content_hits: it is already normalized, and
+                    # dividing it again would compound the two penalties.
+                    saturated_hits += math.log1p(in_content / length_norm) * needle.weight
+                else:
+                    content_hits += in_content * needle.weight
                 title_hits += in_title * needle.weight
-            if disqualified or (not content_hits and not title_hits):
+            if disqualified or not (content_hits or saturated_hits or title_hits):
                 continue
             if adjacency_floor and not adjacency_hits:
                 # Adjacency floor: a CJK query whose characters ALL appear but
@@ -1227,15 +851,15 @@ class SessionCatalogProjection:
                 # each word is itself a bigram hit. The parse WAIVES the floor
                 # (adjacency_floor=False) when its bigram set was truncated —
                 # judging "no adjacency anywhere" against a partial set would
-                # hide long-query matches (see parse_search_query).
+                # hide long-query matches — and when a required dictionary word
+                # of 2+ characters already proves adjacency (see
+                # parse_search_query).
                 continue
             if multi:
                 # Reward the words appearing together, in order, as typed.
-                if folded:
-                    content_hits += folded.count(phrase) * _PHRASE_BOOST
+                content_hits += content.count_phrase(phrase, phrase_key) * _PHRASE_BOOST
                 title_hits += title_folded.count(phrase) * _PHRASE_BOOST
-            length_norm = math.sqrt(1 + doc_chars / 1024)
-            score = title_hits * _TITLE_BOOST + content_hits / length_norm
+            score = title_hits * _TITLE_BOOST + content_hits / length_norm + saturated_hits
             # Recency boost: multiplicative and bounded to (1.0, 2.5], so a
             # fresh session with comparable relevance outranks a stale one, but
             # an old session with a decisively better match still wins — the
@@ -1243,8 +867,12 @@ class SessionCatalogProjection:
             # extra weight every _RECENCY_HALF_WEIGHT_DAYS of age.
             age_days = max(0.0, now - meta.get("modified", 0.0)) / 86400
             score *= 1.0 + _RECENCY_MAX_BOOST / (1.0 + age_days / _RECENCY_HALF_WEIGHT_DAYS)
-            # Negate rank so a smaller (newer) rank wins ties after score desc sort.
-            scored.append((score, -rank, meta, content_hits > 0))
+            # Verbatim runs first: a session holding more of the query's split
+            # runs exactly as typed outranks every session holding fewer, at any
+            # score. Zero for every query with no dictionary split, so their
+            # order is the score order it always was. Negate rank so a smaller
+            # (newer) rank wins ties after the descending sort.
+            scored.append((verbatim_runs, score, -rank, meta, (content_hits or saturated_hits) > 0))
         scored.sort(reverse=True)
 
         # Snippets are attached AFTER the sort+slice, so the cost is proportional
@@ -1253,9 +881,38 @@ class SessionCatalogProjection:
         # original text, so offsets line up), so building one per match put a
         # full re-read back on the hot path — dominating the query once the fold
         # itself was memoized.
+        picked = [(meta, needs_snippet) for _v, _s, _r, meta, needs_snippet in scored[:limit]]
+        return self._result_rows(picked, keys, query)
+
+    def _result_rows(
+        self, picked: list[tuple[dict, bool]], keys: Container[str] | None, query: str
+    ) -> list[dict]:
+        """The output rows for ranked *picked* ``(meta, needs_snippet)`` pairs.
+
+        A row flagged for a snippet gets the excerpt of *query* from its transcript.
+        With *keys*, each row is re-judged under its transcript lock first.
+        """
         out: list[dict] = []
-        for _score, _rank, meta, needs_snippet in scored[:limit]:
-            snippet = self._log._content_snippet(meta["key"], query) if needs_snippet else ""
+        for meta, needs_snippet in picked:
+            if keys is not None:
+                # Scoring-time folds may race ownership and affect ranking/inclusion
+                # only; the lock-held re-judge keeps foreign rows/snippets out of output.
+                try:
+                    with self._log._locked(meta["key"]):
+                        if meta["key"] not in keys:
+                            continue
+                        # The scored title/count may predate the owned incarnation.
+                        current = self._log.list_sessions(keys=(meta["key"],))
+                        if not current:
+                            continue
+                        meta = current[0]
+                        snippet = (
+                            self._log._content_snippet(meta["key"], query) if needs_snippet else ""
+                        )
+                except _history_lock_timeout():
+                    continue
+            else:
+                snippet = self._log._content_snippet(meta["key"], query) if needs_snippet else ""
             out.append({**meta, "snippet": snippet} if snippet else meta)
         return out
 
@@ -1314,6 +971,14 @@ class SessionCatalogProjection:
         half-indexed, and a row that describes half a file is exactly the kind of
         lie this design refuses to store.
 
+        A session whose file changed within the last ``_INDEX_QUIET_WINDOW_SECS``
+        is deferred, not indexed: it is still being written, and indexing it now
+        buys a row the next turn invalidates. Deferred sessions are reported in
+        their own ``deferred`` count, NOT in ``remaining`` — the caller's pass
+        cadence keys on ``remaining``, and a deferral cannot be serviced by
+        coming straight back, only by waiting out the window. They are picked up
+        by the caller's idle-paced passes once quiet.
+
         Rows for sessions that have left the search window are dropped in the
         same pass. They are unreachable by search (the window is the only thing
         scored) so keeping them would grow the index without bound while
@@ -1321,7 +986,7 @@ class SessionCatalogProjection:
         """
         index = self.search_index
         if not index.available:
-            return {"indexed": 0, "dropped": 0, "remaining": 0}
+            return {"indexed": 0, "dropped": 0, "remaining": 0, "deferred": 0}
         window = self._log.list_sessions()[: _facade_search_scan_window()]
         window_keys = {meta["key"] for meta in window}
         stats: dict[str, os.stat_result] = {}
@@ -1331,7 +996,18 @@ class SessionCatalogProjection:
             except OSError:
                 continue
         fresh = index.fresh_keys(stats)
-        pending = [meta["key"] for meta in window if meta["key"] not in fresh]
+        quiet_cutoff_ns = _time.time_ns() - int(_INDEX_QUIET_WINDOW_SECS * 1e9)
+        pending: list[str] = []
+        deferred = 0
+        for meta in window:
+            key = meta["key"]
+            if key in fresh:
+                continue
+            st = stats.get(key)
+            if st is not None and st.st_mtime_ns > quiet_cutoff_ns:
+                deferred += 1
+                continue
+            pending.append(key)
         departed = index.indexed_keys() - window_keys
         index.drop(departed)
         deadline = _time.monotonic() + budget_secs
@@ -1345,11 +1021,12 @@ class SessionCatalogProjection:
             "indexed": indexed,
             "dropped": len(departed),
             "remaining": len(pending) - indexed,
+            "deferred": deferred,
         }
 
     def _index_shortlist(
         self, window: list[dict], needles: list[SearchNeedle]
-    ) -> tuple[set[str] | None, dict[str, int]]:
+    ) -> tuple[set[str] | None, "dict[str, IndexRow]"]:
         """Narrow *window* to the sessions that could satisfy the gate.
 
         Returns ``(allowed, rowids)``. ``allowed`` is ``None`` when the index
@@ -1377,7 +1054,7 @@ class SessionCatalogProjection:
         stats: dict[str, os.stat_result] = {}
         for meta in window:
             try:
-                stats[meta["key"]] = self._log._path(meta["key"]).stat()
+                stats[meta["key"]] = self._stat_key(meta["key"])
             except OSError:
                 continue
         # One snapshot for both answers: read separately, a row dropped by the
@@ -1395,7 +1072,7 @@ class SessionCatalogProjection:
         for key in list(rowids):
             before = stats.get(key)
             try:
-                after = self._log._path(key).stat()
+                after = self._stat_key(key)
             except OSError:
                 del rowids[key]
                 continue
@@ -1422,7 +1099,24 @@ class SessionCatalogProjection:
             allowed = satisfied if allowed is None else (allowed & satisfied)
         return (allowed, rowids)
 
-    def _folded_for(self, key: str, rowids: dict[str, int]) -> tuple[int, str]:
+    def _stat_key(self, key: str) -> os.stat_result:
+        """``self._log._path(key).stat()`` without building a ``Path`` per call.
+
+        A key that is already a safe file name names ``<dir>/<key>.jsonl``
+        whenever that file exists, which is the only case ``_path`` returns it
+        without its legacy fallback; any failure defers to ``_path``, which
+        owns that fallback.
+        """
+        from kiro_crew import history as history_facade
+
+        if history_facade._safe_key(key) == key:
+            try:
+                return os.stat(os.path.join(self._log._dir, key + ".jsonl"))
+            except OSError:
+                pass
+        return self._log._path(key).stat()
+
+    def _folded_for(self, key: str, rowids: "dict[str, IndexRow]") -> tuple[int, str]:
         """Folded text for *key*, from the index when it vouches for the file.
 
         One index read replaces a whole-file read plus a ``json.loads`` per line —
@@ -1435,32 +1129,34 @@ class SessionCatalogProjection:
         whenever the row is missing, unreadable, or belongs to a different
         session, so a degraded or recycled index costs speed and never results.
         """
-        rowid = rowids.get(key)
-        if rowid is not None:
-            doc = self.search_index.document(rowid, key)
+        row = rowids.get(key)
+        if row is not None:
+            doc = self.search_index.document(row.rowid, key)
             if doc is not None:
                 return doc
         return self._log._folded_content(key)
 
     def _folded_content(self, key: str) -> tuple[int, str]:
         """Return ``(doc_chars, casefolded_content)`` for *key*, memoized by
-        mtime plus invalidation generation.
+        cache identity plus invalidation generation.
 
         ``doc_chars`` counts the ORIGINAL (unfolded) characters, because it
         feeds the length normalizer in :meth:`search_sessions` and folding can
         change a string's length (``ß`` -> ``ss``).
 
         The folded blob joins the messages' string ``content`` fields in file
-        order with ``\\x00``. That separator cannot appear in a user query, so
-        it prevents a match spanning two messages while still allowing one
-        ``count`` call over the whole session instead of one per message.
+        order with ``FOLD_SEPARATOR``. A user cannot type that character, so it
+        prevents a match spanning two messages while still allowing one
+        ``count`` call over the whole session instead of one per message. It is
+        deliberately not ``\\x00``, which additionally ends the string for
+        SQLite's tokenizers — see the constant for what that cost.
 
         Returns ``(0, "")`` for a missing/unreadable file or a session with no
         textual content. A read failure is deliberately NOT cached — see below.
         """
         path = self._log._path(key)
         try:
-            mtime = path.stat().st_mtime
+            identity = self._log._cache_identity(path.stat())
         except OSError:
             self._log._folded_cache.pop(key, None)
             self._log._snippet_cache.pop(key, None)
@@ -1469,18 +1165,15 @@ class SessionCatalogProjection:
         # The hit wants the LATEST generation (a moved counter means a write
         # landed, so a miss is the correct answer), so it is read at check
         # time rather than snapshotted earlier — matching ``_snippet_texts``.
-        if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+        if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
             return (cached[2], cached[3])
         # Cold: serialize against this key's writers for the whole
         # stat -> read -> store sequence.
         #
-        # The mtime guard cannot protect this window, because the housekeeping
-        # rewrites deliberately RESTORE the pre-write mtime (``_restore_mtime``,
-        # so compaction does not reorder ``list_sessions``). A fold that started
-        # before such a rewrite and stored after its ``_invalidate_cache`` would
-        # sit in the cache holding pre-rewrite text under a mtime the file still
-        # has — undetectable, so the newly saved messages would be missing from
-        # every later search for the life of the process.
+        # The cache identity catches normal atomic housekeeping rewrites even
+        # when they restore the pre-write mtime. The generation protects this
+        # fill window too: a local writer can invalidate while a cache miss is
+        # being built, so the store must not publish under its older generation.
         #
         # ``_file_lock`` is the same process-wide, path-keyed RLock every writer
         # takes first in ``_locked`` — shared across every ``ConversationLog``
@@ -1491,28 +1184,27 @@ class SessionCatalogProjection:
         # (the re-check below). What the lock CANNOT fix is invalidation reach:
         # a writer's ``_invalidate_cache`` pops only its own instance's caches,
         # so an entry already sitting warm in THIS instance survives a rewrite
-        # performed through a different instance, mtime restored and all. That
+        # performed through a different instance. That
         # is why entries carry the generation and the warm-hit checks above and
         # below require it to match.
         with self._log._file_lock(key):
-            # Snapshot the fill baseline under the lock and BEFORE the stat:
-            # the mtime that stat returns can survive a housekeeping rewrite
-            # (``_restore_mtime``), so only an unmoved generation can prove the
-            # stat → read → publish window stayed write-free. A writer that ran
+            # Snapshot the fill baseline under the lock and BEFORE the stat.
+            # An unmoved generation proves the stat → read → publish window
+            # stayed write-free for this process. A writer that ran
             # between the lock-free probe and the acquire already bumped the
             # counter, and the fold below is ordered AFTER it, so its result is
             # current for this newer generation.
             gen = self._log._cache_gen(key)
             try:
-                mtime = path.stat().st_mtime
+                identity = self._log._cache_identity(path.stat())
             except OSError:
                 self._log._folded_cache.pop(key, None)
                 self._log._snippet_cache.pop(key, None)
                 return (0, "")
             cached = self._log._folded_cache.get(key)
-            if cached and cached[0] == mtime and cached[1] == self._log._cache_gen(key):
+            if cached and cached[0] == identity and cached[1] == self._log._cache_gen(key):
                 return (cached[2], cached[3])
-            built = self._log._build_folded(key, mtime, gen)
+            built = self._log._build_folded(key, identity, gen)
             if built is None:
                 # The read failed rather than finding no content. Caching that
                 # would be keyed by an mtime the file still has, so a session
@@ -1523,9 +1215,25 @@ class SessionCatalogProjection:
                 # report empty for this query and retry on the next one.
                 return (0, "")
             self._log._publish_if_current(
-                self._log._folded_cache, key, (mtime, gen, built[0], built[1]), key=key, gen=gen
+                self._log._folded_cache, key, (identity, gen, built[0], built[1]), key=key, gen=gen
             )
             return built
+
+    def _prune_content_memos(self, rowids: "dict[str, IndexRow]") -> None:
+        """Free count and snippet entries whose content no window session has.
+
+        Only runs for a memo whose budget is binding (it refused or evicted since
+        the last prune), like :meth:`_prune_search_memos`. *rowids* holds every
+        window session the index vouches for, so a digest absent from it belongs
+        to text that has changed or left the window, and no search can ask for
+        it again until that exact text returns.
+        """
+        live: _LiveDigests | None = None
+        for memo in (self._count_memo, self._snippet_memo):
+            if memo is not None and memo.refused_since_prune():
+                if live is None:
+                    live = _LiveDigests({row.digest for row in rowids.values()})
+                memo.retain(live)
 
     def _prune_search_memos(self, live_keys: set[str]) -> None:
         """Free budget held by sessions that have left the scan window.
@@ -1547,7 +1255,12 @@ class SessionCatalogProjection:
             if cache.refused_since_prune():
                 cache.retain(live_keys)
 
-    def _build_folded(self, key: str, mtime: float, gen: int) -> tuple[int, str] | None:
+    def _build_folded(
+        self,
+        key: str,
+        identity: tuple[int, int, int, int],
+        gen: int,
+    ) -> tuple[int, str] | None:
         """Parse *key* and fold its content — the cache-miss half of
         :meth:`_folded_content`.
 
@@ -1565,25 +1278,18 @@ class SessionCatalogProjection:
         dicts versus ~37 MB for the folded strings this actually needs.
 
         Correctness: ``_msg_cache`` is filled by callers that do not hold this
-        key's write lock, so an entry can be a pre-rewrite parse stored under a
-        restored (unchanged) mtime. Folding from it would launder that staleness
-        into the search cache, which the caller's lock cannot prevent. Reading
-        the file makes the fold a function of the file alone.
+        key's write lock. Reading the file makes the fold a function of the file
+        alone, rather than coupling it to another cache's fill timing.
 
         The caller holds ``_file_lock``, which orders this read against writers
         in THIS process — the lock table is class-level and path-keyed, so that
         includes writers using other ``ConversationLog`` instances. A writer in
         another process holds only the cross-process flock, so it can still
-        interleave; if it bumps the mtime, the caller's pre-read stat leaves the
-        cached mtime older than the file's and the next access re-folds. A
-        cross-process PRESERVED-mtime rewrite, however, is caught by neither
-        the lock nor the generation (the counter lives in this process) — a
-        known residual gap shared with every memo in this class. *gen* is the
-        invalidation-generation snapshot the caller took alongside its stat;
-        the snippet store below publishes under it and records it in the entry,
-        which is what lets a warm hit notice an in-process rewrite performed
-        through a different instance (whose ``_invalidate_cache`` pops only its
-        own instance's caches).
+        interleave. The cache identity catches the normal atomic rewrite even
+        when it restores mtime; the process-local generation covers writers
+        through another in-process instance. *gen* is the invalidation-generation
+        snapshot the caller took alongside its stat; the snippet store below
+        publishes under it and records it in the entry.
 
         Separated from :meth:`_folded_content` so the memoization is observable:
         a caller (or a test) can count how often the expensive fold actually
@@ -1597,7 +1303,7 @@ class SessionCatalogProjection:
         if not texts:
             return (0, "")
         # Hand the same list to the snippet memo. The caller has already stat'ed
-        # under ``_file_lock`` and passes that mtime and its generation
+        # under ``_file_lock`` and passes that identity and its generation
         # snapshot, so both memos are keyed by one observation of the file and
         # cannot disagree about which revision they hold. Storing here is why
         # the second corpus costs no extra read. The publish guard here is
@@ -1606,9 +1312,9 @@ class SessionCatalogProjection:
         # already-superseded generation — the recorded generation is what the
         # warm-hit checks compare against.
         self._log._publish_if_current(
-            self._log._snippet_cache, key, (mtime, gen, texts), key=key, gen=gen
+            self._log._snippet_cache, key, (identity, gen, texts), key=key, gen=gen
         )
-        return (sum(len(t) for t in texts), "\x00".join(texts).casefold())
+        return (sum(len(t) for t in texts), fold_texts(texts))
 
     def _iter_message_texts(self, key: str) -> Iterator[str]:
         """Yield each message's non-empty string ``content`` from *key*'s file.
@@ -1652,17 +1358,15 @@ class SessionCatalogProjection:
         Prefers ``_snippet_cache`` — filled by :meth:`_build_folded` from the same
         read that produced the fold — and falls back to re-reading the file.
 
-        The memo is validated against the file's current mtime AND the current
+        The memo is validated against the file's current cache identity AND the current
         invalidation generation (:meth:`_cache_gen`), so it degrades to the
-        file read rather than serving a stale snippet. The mtime alone cannot
-        catch a preserved-mtime rewrite performed through a DIFFERENT
-        ``ConversationLog`` instance (its ``_invalidate_cache`` pops only its
-        own instance's caches); the generation clause is what unhits such an
-        entry. Both checks are cheap relative to the parse they avoid, and
-        unlike the fold this path does NOT need ``_file_lock``: a snippet is
-        display-only, so the worst case for a preserved-mtime rewrite racing
-        here is one stale preview line, not a session that stops matching. The
-        fold — which decides whether a row appears at all — keeps the lock.
+        file read rather than serving a stale snippet. The generation clause
+        covers a rewrite through a different in-process ``ConversationLog``
+        instance (its ``_invalidate_cache`` pops only its own instance's caches).
+        Both checks are cheap relative to the parse they avoid, and unlike the
+        fold this path does NOT need ``_file_lock``: a snippet is display-only,
+        so a racing rewrite can produce at most one stale preview line. The fold
+        — which decides whether a row appears at all — keeps the lock.
 
         Falls back for four reasons, all of which must stay non-fatal: the entry
         was refused admission by the byte budget, the fold cached ``(0, "")`` for
@@ -1674,8 +1378,8 @@ class SessionCatalogProjection:
         cached = self._log._snippet_cache.get(key)
         if cached is not None:
             try:
-                mtime_now = self._log._path(key).stat().st_mtime
-                if cached[0] == mtime_now and cached[1] == self._log._cache_gen(key):
+                identity_now = self._log._cache_identity(self._stat_key(key))
+                if cached[0] == identity_now and cached[1] == self._log._cache_gen(key):
                     return iter(cached[2])
             except OSError:
                 # Let the fallback read raise the OSError the caller handles,
@@ -1688,18 +1392,30 @@ class SessionCatalogProjection:
         # snippets are built for the returned rows only, and taking one from the
         # file costs a whole-transcript read and parse: 858 ms of a 947 ms query
         # once matching itself is indexed. Freshness is re-checked
-        # inside ``raw_texts`` against this stat, so a file that moved on since
+        # inside ``iter_raw_texts`` against this stat, so a file that moved on since
         # the scoring pass falls through to the read below.
         if self._index is not None and self._index.available:
             try:
-                st = self._log._path(key).stat()
+                st = self._stat_key(key)
             except OSError:
                 st = None
             if st is not None:
-                texts = self._index.raw_texts(key, st)
+                texts = self._index.iter_raw_texts(key, st)
                 if texts is not None:
-                    return iter(texts)
+                    return self._texts_or_file(key, texts)
         return self._log._iter_message_texts(key)
+
+    def _texts_or_file(self, key: str, texts: Iterator[str]) -> Iterator[str]:
+        """Yield *texts*, continuing from the transcript if a stored chunk is unreadable."""
+        served = 0
+        try:
+            for text in texts:
+                served += 1
+                yield text
+            return
+        except ChunkDecodeError:
+            pass
+        yield from itertools.islice(self._log._iter_message_texts(key), served, None)
 
     def _content_snippet(self, key: str, query: str) -> str:
         """Return a match-centered window of *key*'s content around *query*.
@@ -1714,7 +1430,8 @@ class SessionCatalogProjection:
 
         The window is confined to the matching message, which keeps a snippet from
         reading as one sentence when it actually spans two — consistent with
-        :meth:`_folded_content`, where the ``\\x00`` join stops a match from
+        :meth:`_folded_content`, where the
+        :data:`~kiro_crew.history_index.FOLD_SEPARATOR` join stops a match from
         bridging messages in the first place.
 
         Display-only and best effort: ``casefold`` is used for the search so it
@@ -1724,33 +1441,114 @@ class SessionCatalogProjection:
         string's length, so the window may be off by a character or two.
 
         For a multi-word query the exact phrase is tried first and each needle
-        is tried as a fallback (via :func:`snippet_needles`, highest-signal
+        is tried as a fallback (via :func:`snippet_needle_tiers`, highest-signal
         first), mirroring :meth:`search_sessions`' AND-over-needles matching —
         otherwise every session that matched on scattered words would come back
-        with no snippet at all. Needles are tried per message, so the first
-        MESSAGE containing any of them wins rather than the best needle overall;
-        that preserves the streaming early-exit above, and this string is
-        display-only.
+        with no snippet at all. Within a tier needles are tried per message, so
+        the first MESSAGE containing any of them wins rather than the best
+        needle overall; that preserves the streaming early-exit above. A query
+        with no dictionary words is one tier. A query with them reads on past a
+        lower-tier hit until a message holds the phrase, a verbatim run or a
+        longer word, so a lone character in an early message cannot take the
+        snippet from the phrase later on.
 
         Returns ``''`` when no needle is locatable in any single message, or
         when the file cannot be read (display-only — never raises at the caller).
+
+        For a session the index vouches for, the result is memoized under the
+        row's content digest, and a memoized snippet is built only from the
+        stored text that the same read confirms still carries that digest.
         """
-        needles = snippet_needles(query)
-        if not needles:
+        tiers = snippet_needle_tiers(query)
+        if not tiers:
             return ""
+        memo = self._snippet_memo
+        index = self._index
+        if memo is None or index is None or not index.available:
+            return self._build_snippet(key, tiers)
         try:
-            for text in self._log._snippet_texts(key):
-                folded = text.casefold()
-                for needle in needles:
-                    pos = folded.find(needle)
-                    if pos < 0:
-                        continue
-                    start = max(0, pos - self._log._SNIPPET_LEAD)
-                    end = min(len(text), pos + len(needle) + self._log._SNIPPET_TRAIL)
-                    frag = " ".join(text[start:end].split())
-                    prefix = "…" if start > 0 else ""
-                    suffix = "…" if end < len(text) else ""
-                    return (prefix + frag + suffix)[: self._log._SNIPPET_MAX]
+            st = self._stat_key(key)
+        except OSError:
+            return self._build_snippet(key, tiers)
+        digest = index.fresh_digest(key, st)
+        if digest is None:
+            return self._build_snippet(key, tiers)
+        # Keyed by the tiers, not the query: the snippet is a function of the
+        # text and the tiers, and one query's tiers change when a segmenter
+        # starts or stops answering.
+        mkey = digest + repr(tiers)
+        hit = memo.get(mkey)
+        if hit is not None:
+            return hit[0]  # type: ignore[return-value]
+        texts = index.iter_raw_texts(key, st, digest)
+        if texts is None:
+            return self._build_snippet(key, tiers)
+        try:
+            snippet = self._snippet_from(texts, tiers)
+        except ChunkDecodeError:
+            return self._build_snippet(key, tiers)
+        memo[mkey] = (snippet, _memo_entry_cost(mkey, snippet))
+        return snippet
+
+    def _build_snippet(self, key: str, tiers: list[list[str]]) -> str:
+        """The match-centered window :meth:`_content_snippet` returns, uncached."""
+        try:
+            return self._snippet_from(self._log._snippet_texts(key), tiers)
         except OSError:
             return ""
-        return ""
+
+    def _snippet_from(self, texts: Iterable[str], tiers: list[list[str]]) -> str:
+        """The window around the best anchor :func:`tiered_first_hit` finds.
+
+        An ``OSError`` while reading *texts* keeps the best hit read so far (none
+        reports as no snippet); any other error propagates.
+        """
+        found = tiered_first_hit(texts, tiers)
+        if found is None:
+            return ""
+        text, pos, needle = found
+        start = max(0, pos - self._log._SNIPPET_LEAD)
+        end = min(len(text), pos + len(needle) + self._log._SNIPPET_TRAIL)
+        frag = " ".join(text[start:end].split())
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(text) else ""
+        return (prefix + frag + suffix)[: self._log._SNIPPET_MAX]
+
+
+# --------------------------------------------------------------------------- #
+# This module is the facade of the transcript-search family. Every name it defined,
+# or bound from the rest of kiro_crew, before the owners existed is still reachable
+# here -- bound, or, for the one global an owner rebinds at run time
+# (``_SERVED_ONLY``), served from that owner --
+# and a write through it (``monkeypatch.setattr``, ``mock.patch``) reaches every
+# owner that binds the same object (:mod:`kiro_crew._facade_mirror`).
+# ``SessionCatalogProjection`` stays here. Owners never import this module at run
+# time. New work goes to the owner of its responsibility:
+#
+#   ``history_search_query`` -- query parsing: needles, forge references, provider
+#                               spellings, the one-string match rule
+#   ``history_search_memo``  -- the shared count and snippet memos, their byte
+#                               ceilings, the single-flight table, memo-gated counts
+#
+# ``test/test_history_search_bindings.py`` pins the binding and the reach.
+# --------------------------------------------------------------------------- #
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = ("kiro_crew.history_search_query", "kiro_crew.history_search_memo")
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Globals an owner rebinds at run time: the facade serves them and never binds them.
+_SERVED_ONLY = frozenset({"_search_ref_resolver"})
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(
+    _facade_mirror.install(
+        _sys.modules[__name__],
+        _OWNERS,
+        excluded=(),
+        surface=frozenset(globals()) | _SERVED_ONLY,
+    ).served
+)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.history_search_query import _search_ref_resolver  # noqa: F401

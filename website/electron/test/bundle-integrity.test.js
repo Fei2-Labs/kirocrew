@@ -6,7 +6,12 @@ const {
   SPAWN_MARKER,
   currentAttemptLog,
   findMissingBundleParts,
+  launchBlockingBundleParts,
   describeIncompleteBundle,
+  nextInstallingDialogState,
+  INSTALLING_DIALOG_TITLE,
+  PRUNED_BACKEND_MESSAGE,
+  PRUNED_DIALOG_TITLE,
   shouldReclassifyAsInstalling,
 } = require("../bundle-integrity");
 
@@ -488,5 +493,170 @@ describe("describeIncompleteBundle", () => {
     assert.match(msg, /still being installed/i);
     assert.match(msg, /Some components are/);
     assert.ok(!/\b0 components?\b/.test(msg), `message claimed a zero count: ${msg}`);
+  });
+
+  // A pre-spawn refusal's dialog retries by itself once the parts land, so copy
+  // that only says "wait, then retry" would leave the user clicking at a dialog
+  // about to close on its own. The manual Retry stays available and is named.
+  it("with autoRetry, tells the user the app starts on its own and keeps Retry named", () => {
+    const msg = describeIncompleteBundle(["urllib"], { autoRetry: true });
+    assert.match(msg, /starts on its own/i);
+    assert.match(msg, /click Retry/);
+    assert.ok(!/Wait, then retry/.test(msg), `manual-only copy survived: ${msg}`);
+  });
+
+  // A reclassified crash's dialog has no probe (the missing module is one the
+  // probe never inspects), so promising an automatic start there would be false.
+  it("without autoRetry, keeps the manual wait-then-retry instruction", () => {
+    const msg = describeIncompleteBundle(["urllib"]);
+    assert.match(msg, /Wait, then retry/);
+    assert.ok(!/starts on its own/i.test(msg), `auto-retry promise leaked: ${msg}`);
+  });
+
+  it("gives the five-minute advice a referent and names the button that does it", () => {
+    for (const options of [undefined, { autoRetry: true }]) {
+      const msg = describeIncompleteBundle(["urllib"], options);
+      assert.match(msg, /If the install is still unfinished after five minutes/);
+      assert.match(msg, /quit and reopen Kiro Crew \(the Quit button below\)/);
+      assert.ok(!/restart the app/.test(msg), `names a control the dialog lacks: ${msg}`);
+      assert.match(msg, /reinstall the Kiro Crew app/, "says what 'reinstall' means");
+    }
+  });
+});
+
+// The dialog's probe must be at least as strict as spawnGateway's refusal, or
+// the two chase each other: probe says complete, launcher refuses, dialog
+// reopens, probe says complete... These cases mirror the launcher's two
+// refusal conditions and its "not a bundle" bypass.
+describe("launchBlockingBundleParts", () => {
+  const WIN_BIN = path.join(ROOT, "bin", "kirocrew.cmd");
+  const POSIX_BIN = path.join(ROOT, "bin", "kirocrew");
+  const POSIX_LIB = path.join(ROOT, "lib", "python3.12");
+  const posixDirs = () => ({
+    [path.join(ROOT, "bin")]: ["python3", "kirocrew"],
+    [path.join(ROOT, "lib")]: ["python3.12"],
+  });
+
+  it("is null for a launcher outside any bundled tree (unknown, not complete)", () => {
+    const fs = fakeFs(completeWindows());
+    assert.equal(launchBlockingBundleParts(fs, path, "/usr/local/bin/kirocrew"), null);
+    assert.equal(launchBlockingBundleParts(fs, path, "kirocrew"), null);
+    assert.equal(launchBlockingBundleParts(fs, path, undefined), null);
+  });
+
+  it("is empty for a complete Windows bundle, so the launcher would spawn", () => {
+    const fs = fakeFs(completeWindows(), { [path.join(ROOT, "Lib")]: [] });
+    assert.deepEqual(launchBlockingBundleParts(fs, path, WIN_BIN), []);
+  });
+
+  it("names the interpreter AND the stdlib when the .cmd shim landed before python.exe", () => {
+    // findMissingBundleParts is silent here by design (no interpreter = not a
+    // tree it understands); the launcher still refuses, so the probe must too.
+    // The count includes every required package still absent, so it does not
+    // read "1 component" now and eighteen once the interpreter lands.
+    const fs = fakeFs([WIN_BIN]);
+    assert.deepEqual(findMissingBundleParts(fs, path, ROOT), []);
+    assert.deepEqual(
+      launchBlockingBundleParts(fs, path, WIN_BIN),
+      ["python.exe", ...REQUIRED_STDLIB_PARTS],
+    );
+  });
+
+  it("with the shim and a partial Lib but no python.exe, the count only falls as parts land", () => {
+    const lib = path.join(ROOT, "Lib");
+    const partialLib = allPkgPaths(lib).filter((p) => !/zipfile|zoneinfo/.test(p));
+    const fs = fakeFs([WIN_BIN, lib, ...partialLib], { [lib]: [] });
+    assert.deepEqual(
+      launchBlockingBundleParts(fs, path, WIN_BIN),
+      ["python.exe", "zipfile", "zoneinfo"],
+    );
+    // python.exe lands: the interpreter leaves the list, nothing new appears.
+    const withPython = fakeFs([WIN_BIN, WIN_PY, lib, ...partialLib], { [lib]: [] });
+    assert.deepEqual(launchBlockingBundleParts(withPython, path, WIN_BIN), ["zipfile", "zoneinfo"]);
+  });
+
+  it("reports the same missing packages the pre-spawn refusal reports", () => {
+    const partial = completeWindows().filter((p) => !p.includes("zoneinfo"));
+    const fs = fakeFs(partial, { [path.join(ROOT, "Lib")]: [] });
+    const expected = findMissingBundleParts(fs, path, ROOT);
+    assert.deepEqual(expected, ["zoneinfo"]);
+    assert.deepEqual(launchBlockingBundleParts(fs, path, WIN_BIN), expected);
+  });
+
+  it("derives the backend root from a POSIX bin/kirocrew launcher", () => {
+    const partial = [
+      path.join(ROOT, "bin"), path.join(ROOT, "lib"), POSIX_LIB,
+      ...allPkgPaths(POSIX_LIB).filter((p) => !p.includes("urllib")),
+    ];
+    const fs = fakeFs(partial, posixDirs());
+    assert.deepEqual(launchBlockingBundleParts(fs, path, POSIX_BIN), ["urllib"]);
+    const complete = fakeFs([path.join(ROOT, "bin"), path.join(ROOT, "lib"), POSIX_LIB, ...allPkgPaths(POSIX_LIB)], posixDirs());
+    assert.deepEqual(launchBlockingBundleParts(complete, path, POSIX_BIN), []);
+  });
+});
+
+describe("nextInstallingDialogState", () => {
+  it("is complete only for an empty part list, and title and message both say so", () => {
+    const state = nextInstallingDialogState([]);
+    assert.equal(state.complete, true);
+    assert.equal(state.title, "Kiro Crew — installation finished");
+    assert.match(state.message, /Installation finished/);
+    assert.match(state.message, /starting Kiro Crew/i);
+  });
+
+  it("carries the falling count while parts remain, in the auto-retry voice", () => {
+    const three = nextInstallingDialogState(["a", "b", "c"]);
+    assert.equal(three.complete, false);
+    assert.equal(three.title, INSTALLING_DIALOG_TITLE);
+    assert.match(three.message, /3 components are/);
+    assert.match(three.message, /starts on its own/i);
+    const one = nextInstallingDialogState(["zoneinfo"]);
+    assert.equal(one.complete, false);
+    assert.match(one.message, /1 component is/);
+    assert.ok(!/zoneinfo/.test(one.message), `leaked a package name: ${one.message}`);
+  });
+
+  // An unresolvable launcher means extraction has not written it yet. Reading
+  // that as complete would fire a retry into a tree with nothing to run.
+  it("treats an unknown probe result as still installing, never complete", () => {
+    for (const unknown of [null, undefined]) {
+      const state = nextInstallingDialogState(unknown);
+      assert.equal(state.complete, false);
+      assert.match(state.message, /Some components are/);
+      // The probe is still armed, so the copy must not flip to the manual voice.
+      assert.match(state.message, /starts on its own/i);
+      assert.ok(!/Wait, then retry/.test(state.message), `manual voice leaked: ${state.message}`);
+    }
+  });
+
+  // After a stale-bundle incident the backend tree was removed, not half
+  // written: the copy leads with quit-and-reopen and promises no install.
+  it("names the removed backend and leads with quit and reopen when pruned", () => {
+    for (const unknown of [null, undefined]) {
+      const state = nextInstallingDialogState(unknown, { pruned: true });
+      assert.equal(state.complete, false);
+      assert.equal(state.title, PRUNED_DIALOG_TITLE);
+      assert.equal(state.message, PRUNED_BACKEND_MESSAGE);
+      assert.match(state.message, /^Some of Kiro Crew's app files were removed/);
+      assert.ok(!/backend|Quit button below/.test(state.message), `developer wording leaked: ${state.message}`);
+      assert.ok(!/backend/.test(state.title), `developer wording leaked: ${state.title}`);
+      assert.ok(
+        state.message.indexOf("Quit and reopen") < state.message.indexOf("reinstall"),
+        "quit and reopen comes before reinstall",
+      );
+      assert.ok(!/being installed|five minutes|few minutes/.test(state.message), `install wait leaked: ${state.message}`);
+      assert.ok(!/starts on its own|wait/i.test(state.message), `a second, waiting option leaked: ${state.message}`);
+      assert.match(state.message, /If it still doesn't start after reopening, reinstall Kiro Crew the same way you installed it; your chats and settings are kept\./);
+    }
+  });
+
+  // A pruned tree keeps the pruned copy while parts arrive; only a complete
+  // tree paints the ordinary completion frame.
+  it("keeps the pruned copy until the tree is complete", () => {
+    const partial = nextInstallingDialogState(["a", "b"], { pruned: true });
+    assert.equal(partial.complete, false);
+    assert.equal(partial.title, PRUNED_DIALOG_TITLE);
+    assert.equal(partial.message, PRUNED_BACKEND_MESSAGE);
+    assert.deepEqual(nextInstallingDialogState([], { pruned: true }), nextInstallingDialogState([]));
   });
 });

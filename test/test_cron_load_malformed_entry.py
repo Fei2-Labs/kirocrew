@@ -608,10 +608,12 @@ _NUMERIC_FIELD_DEFAULTS = {
     "last_failure_at": 0.0,
     "secret_env_pending_ts": 0.0,
     "last_retry_run_ts": 0.0,
+    "run_generation": 0,
     "consecutive_dupes": 0,
     "consecutive_failures": 0,
     "last_retry_count": 0,
     "timeout_secs": 1800,  # _JOB_TIMEOUT_SECS
+    "auto_pause_after_failures": 5,  # _AUTO_PAUSE_THRESHOLD
     "timeout": 0,
 }
 

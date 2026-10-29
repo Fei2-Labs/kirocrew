@@ -58,7 +58,7 @@ export const LS = {
 
 /**
  * Keys that USED to hold auto-sync settings, kept only so an existing choice can
- * be migrated into the backend once (see the settings seed in MdNotebookPage).
+ * be migrated into the backend once (see the settings seed in useMdNotebookPageState).
  *
  * Auto-sync moved server-side because the backend runs the sync loop itself and
  * cannot read a browser's storage, so a value here could never be honoured — and
@@ -137,7 +137,7 @@ export const PANEL_DEFAULT_WIDTH = 260
  * Left-rail type ramp — the Sessions list's scale, not a second one.
  *
  * The dashboard declares no global type scale, so the rail borrows the one
- * surface that does declare one: the session-row ramp in `pages/ChatSidebar.tsx`
+ * surface that does declare one: the session-row ramp in `pages/chat-sidebar/SessionRow.tsx`
  * (`ROW_TITLE_CLS` / `ROW_STATUS_CLS` / `ROW_META_CLS`), quantized to a 4px
  * baseline grid, plus that panel's own `text-sm` header. Four sizes carry the
  * whole rail — 14 panel title, 13 row, 11 secondary, 10 meta.

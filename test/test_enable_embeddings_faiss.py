@@ -27,11 +27,19 @@ _MOD = "kiro_crew.dashboard.handlers.memory"
 _EMB = "kiro_crew.embeddings"
 
 
+@web.middleware
+async def _as_owner(request: web.Request, handler):
+    """Carry the dashboard owner's claims: setup is owner-gated."""
+    request["app"] = ""
+    request["user"] = "local-app"
+    return await handler(request)
+
+
 def _make_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[_as_owner])
     app.router.add_post("/api/memory/enable-embeddings", mem_mod.api_memory_enable_embeddings)
     app.router.add_get("/api/memory/embedding-status", mem_mod.api_memory_embedding_status)
-    app["state"] = MagicMock(consolidator=None)
+    app["state"] = MagicMock(consolidator=None, owner_id="")
     return app
 
 
@@ -123,25 +131,57 @@ class TestFaissInstallSuccess:
 
 
 class TestFaissInstallFailure:
+    """A failed faiss-cpu install (no loadable wheel, e.g. an old glibc host) must
+    not fail setup: faiss is an accelerator, so setup finishes on the cosine
+    fallback and the response names why faiss is missing."""
+
     @pytest.mark.asyncio
-    async def test_returns_500_and_resets_status(self, tmp_path: Path) -> None:
+    async def test_setup_finishes_and_names_the_failure(
+        self, tmp_path: Path, _pin_active_embedder: MagicMock
+    ) -> None:
+        _pin_active_embedder.model_id = "qwen3-embedding:0.6b"
+        _pin_active_embedder.is_ready.return_value = True
         cfg_path = tmp_path / "kirocrew.json"
         cfg_path.write_text("{}", encoding="utf-8")
-        patches, store, proc, mgr = _common_patches(
-            cfg_path, faiss_available=False, proc_rc=1, proc_stderr=b"No matching distribution"
-        )
+        patches, store, proc, mgr = _common_patches(cfg_path, faiss_available=False)
+        spawned: list[tuple] = []
+
+        async def _pip_without_wheel(*argv, **kw):
+            # Contract of the install seam: a faiss-cpu install on a host with
+            # no compatible wheel exits 1 with pip's resolver error on stderr.
+            spawned.append(argv)
+            assert "faiss-cpu" in argv
+            return _mock_proc(
+                1,
+                b"ERROR: Could not find a version that satisfies the requirement faiss-cpu\n"
+                b"ERROR: No matching distribution found for faiss-cpu\n",
+            )
 
         with patches["mgr"], patches["model_present"], patches["cfg_load"], \
-             patches["cfg_path"], patches["subprocess"], patches["faiss"], \
-             patches["store"], patches["wrap_argv"]:
+             patches["cfg_path"], patches["embed_fn"], patches["faiss"], \
+             patches["store"], patches["wrap_argv"], \
+             patch("asyncio.create_subprocess_exec", side_effect=_pip_without_wheel):
             async with TestClient(TestServer(_make_app())) as c:
                 resp = await c.post("/api/memory/enable-embeddings")
-                assert resp.status == 500
-                body = await resp.json()
-                assert "faiss-cpu installation failed" in body["error"]
+                assert resp.status == 200
+                assert (await resp.json())["ok"] is True
 
-        assert mem_mod._embedding_setup_status["step"] == "idle"
-        assert "faiss-cpu" in str(mem_mod._embedding_setup_status["error"])
+        with patch("kiro_crew.config.loader.KiroCrewConfig.load", return_value=MagicMock()), \
+             patch(f"{_MOD}.model_download_manager", return_value=mgr), \
+             patch(f"{_MOD}.model_file_present", return_value=True):
+            async with TestClient(TestServer(_make_app())) as c:
+                status = await (await c.get("/api/memory/embedding-status")).json()
+
+        assert len(spawned) == 1
+        # The card polls embedding-status, so the reason must surface there.
+        warning = status["setup_warning"]
+        assert warning.startswith("faiss install failed:")
+        assert "No matching distribution found for faiss-cpu" in warning
+        # The embed wiring and index load still ran.
+        assert store.embed_fn is not None
+        store.load_faiss_index.assert_called_once()
+        assert mem_mod._embedding_setup_status["step"] == "done"
+        assert mem_mod._embedding_setup_status["warning"] == warning
 
 
 class TestFaissAlreadyInstalled:
@@ -644,7 +684,8 @@ class TestPipStderrRedaction:
              caplog.at_level(logging.WARNING, logger=_MOD):
             async with TestClient(TestServer(_make_app())) as c:
                 resp = await c.post("/api/memory/enable-embeddings")
-                assert resp.status == 500
+                assert resp.status == 200
+                assert self._SECRET not in await resp.text()
 
         messages = [r.getMessage() for r in caplog.records if "faiss-cpu install failed" in r.getMessage()]
         assert messages, "expected the faiss-cpu install-failed warning to be logged"
@@ -718,3 +759,40 @@ class TestPipStderrRedaction:
             # No prefix of the token may appear (the old slice leaked one).
             for n in range(3, len(self._SECRET) + 1):
                 assert self._SECRET[:n] not in msg
+
+
+class TestAppTokenRefused:
+    """An App Kit app token is not the owner: setup is refused before any side effect."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_present", [False, True])
+    async def test_app_token_gets_403_and_setup_not_reached(
+        self, tmp_path: Path, model_present: bool
+    ) -> None:
+        cfg_path = tmp_path / "kirocrew.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        patches, _store, _proc, mgr = _common_patches(cfg_path, model_present=model_present)
+
+        @web.middleware
+        async def _as_app_token(request: web.Request, handler):
+            request["app"] = "some-app"
+            request["user"] = "local-app"
+            return await handler(request)
+
+        app = web.Application(middlewares=[_as_app_token])
+        app.router.add_post("/api/memory/enable-embeddings", mem_mod.api_memory_enable_embeddings)
+        app["state"] = MagicMock(consolidator=None, owner_id="")
+
+        with patches["mgr"], patches["model_present"], patches["cfg_load"], \
+             patches["cfg_path"], patches["subprocess"] as mock_exec, \
+             patches["embed_fn"], patches["faiss"], patches["store"], \
+             patches["wrap_argv"]:
+            async with TestClient(TestServer(app)) as c:
+                resp = await c.post("/api/memory/enable-embeddings")
+                assert resp.status == 403
+                assert (await resp.json()).get("code") == "owner_only"
+
+            mgr.ensure_model.assert_not_called()
+            mock_exec.assert_not_called()
+        assert cfg_path.read_text(encoding="utf-8") == "{}"
+        assert mem_mod._embedding_setup_status == {"step": "idle", "error": ""}

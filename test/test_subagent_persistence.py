@@ -1,18 +1,31 @@
-"""Tests for subagent_persistence — agent folder CRUD."""
+"""Tests for subagent_persistence — agent folder CRUD.
+
+This module pins the folder primitives: creating a folder with its canonical run agent and
+app, its state, result and tombstone files, deleting it, listing orphans, the stale
+tombstone prune and the delivered mark, plus path-traversal refusal, the slow-command log
+and its rotation, a run's memory mode, and a runtime session's memory-mode binding, which
+only tightens. The folder a ``SubagentManager`` run writes
+from spawn to its end lives in ``test_subagent_persistence_spawn_lifecycle.py``, and what
+a restart does with the folders it finds in ``test_subagent_persistence_orphans.py``; the
+shared ``agent_root`` fixture in ``subagent_persistence_helpers.py``.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import threading
 import time
 
 import pytest
+from subagent_persistence_helpers import (  # noqa: F401 -- the fixture is requested by name
+    agent_root_fixture,
+)
 
 from kiro_crew.subagent_persistence import (
     _CLEANUP_IDENTITY_LOCK,
     _LIVE_CLEANUP_IDENTITIES,
+    classify_persisted_ending,
     create_agent_folder,
     delete_agent_folder,
     list_orphans,
@@ -35,15 +48,6 @@ from kiro_crew.subagent_persistence import (
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 
-@pytest.fixture()
-def agent_root(tmp_path, monkeypatch):
-    """Point persistence at a registry below this test's temp directory."""
-    root = tmp_path / "subagents"
-    root.mkdir()
-    monkeypatch.setattr("kiro_crew.subagent_persistence._SUBAGENTS_DIR", root)
-    return root
-
-
 # ── create_agent_folder ──────────────────────────────────────────────
 
 
@@ -60,7 +64,9 @@ class TestCreateAgentFolder:
         assert state["id"] == "abc123"
         assert state["task"] == "do stuff"
         assert state["agent"] == "kirocrew"
-        assert state["status"] == "running"
+        # No ending writes a run status back to this file, so it carries none
+        # that would read as running afterwards (the tombstone records it).
+        assert "status" not in state
         assert state["max_turns"] == 100
         assert "started" in state
 
@@ -69,6 +75,15 @@ class TestCreateAgentFolder:
         path = create_agent_folder("abc123", task="t2")
         state = json.loads((path / "state.json").read_text(encoding="utf-8"))
         assert state["task"] == "t2"
+
+    def test_a_stopped_run_does_not_read_as_running(self, agent_root):
+        """The folder a user stop leaves: the tombstone records the stop and the
+        run record says nothing that contradicts it."""
+        path = create_agent_folder("stop0001", task="t", parent_session="dashboard:default")
+        write_tombstone("stop0001", cause="user_stop", recovery_action="none", outcome="stopped")
+        state = json.loads((path / "state.json").read_text(encoding="utf-8"))
+        assert state.get("status") != "running"
+        assert classify_persisted_ending(path) == ("stopped", "", True)
 
 
 class TestCanonicalRunAgent:
@@ -160,6 +175,55 @@ class TestUpdateState:
         # Should not raise
         update_state("nonexistent", pid=1)
 
+    @pytest.mark.parametrize("contended", ["read", "rename"])
+    def test_a_windows_sharing_violation_is_ridden_out(self, agent_root, monkeypatch, contended):
+        """Off the loop, another handle holding state.json as ``update_state``
+        reads it, or as its rewrite renames over it, is retried rather than a
+        skipped or failed write: what lets a flag with a durability contract
+        (``result_complete``) land with no retry loop of its own."""
+        from pathlib import Path
+
+        import kiro_crew.atomic_write as aw
+        from kiro_crew import platform_compat
+
+        create_agent_folder("u-win", task="t")
+        target = agent_root / "u-win" / "state.json"
+        contentions: list[str] = []
+
+        def _contend(path) -> None:
+            if Path(path) == target and not contentions:
+                contentions.append(str(path))
+                raise PermissionError(13, "The process cannot access the file")
+
+        if contended == "read":
+            real_read = aw._read_bytes
+
+            def _read(path, max_bytes):
+                _contend(path)
+                return real_read(path, max_bytes)
+
+            monkeypatch.setattr(aw, "_read_bytes", _read)
+        else:
+            real_replace = os.replace
+
+            def _replace(src, dst):
+                _contend(dst)
+                return real_replace(src, dst)
+
+            monkeypatch.setattr(aw.os, "replace", _replace)
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(aw, "_REPLACE_BACKOFF_SECONDS", 0.0)
+
+        assert update_state("u-win", result_complete=True) is True
+        assert contentions, "the contention was never exercised"
+        assert (read_state("u-win") or {}).get("result_complete") is True
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+    def test_the_state_file_stays_owner_only(self, agent_root):
+        create_agent_folder("u-mode", task="t")
+        update_state("u-mode", pid=1)
+        assert (agent_root / "u-mode" / "state.json").stat().st_mode & 0o777 == 0o600
+
 
 # ── read_state ───────────────────────────────────────────────────────
 
@@ -233,6 +297,125 @@ class TestWriteResultChunk:
         write_result_chunk("w1", "world")
         content = (agent_root / "w1" / "result.txt").read_text(encoding="utf-8")
         assert content == "hello world"
+
+    def test_a_fresh_chunk_starts_the_file_over_and_nothing_is_translated(self, agent_root):
+        """An attempt's first chunk replaces what an earlier attempt left, and
+        the bytes land as written, LF on every platform."""
+        create_agent_folder("w2", task="t")
+        assert write_result_chunk("w2", "earlier attempt ")
+        assert write_result_chunk("w2", "line\n", fresh=True)
+        assert write_result_chunk("w2", "next\r\n")
+        assert (agent_root / "w2" / "result.txt").read_bytes() == b"line\nnext\r\n"
+
+    def test_a_fresh_chunk_that_cannot_be_written_keeps_the_earlier_partial(
+        self, agent_root, monkeypatch
+    ):
+        """The fresh write stages its text before replacing the file, so a disk
+        that refuses it (full, quota) costs nothing: the earlier attempt's
+        partial is still there to read, and the call says nothing was written."""
+        import kiro_crew.atomic_write as aw
+
+        create_agent_folder("w3", task="t")
+        assert write_result_chunk("w3", "an earlier attempt's partial")
+
+        def _disk_full(fd, data, path):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(aw, "_write_all", _disk_full)
+        assert write_result_chunk("w3", "the respawn's first chunk", fresh=True) is False
+        assert (agent_root / "w3" / "result.txt").read_text(
+            encoding="utf-8"
+        ) == "an earlier attempt's partial"
+        assert [p.name for p in (agent_root / "w3").iterdir() if p.suffix == ".tmp"] == []
+
+    def test_a_failed_write_says_so(self, agent_root):
+        assert write_result_chunk("never-created", "text") is False
+        assert write_result_chunk("never-created", "text", fresh=True) is False
+        assert not (agent_root / "never-created").exists()
+
+
+# ── write_finished_result ────────────────────────────────────────────
+
+
+class TestWriteFinishedResult:
+    def test_a_whole_answer_is_rewritten_from_memory_and_flagged(self, agent_root, monkeypatch):
+        import kiro_crew.context_management as cm
+        from kiro_crew.subagent_persistence import write_finished_result
+
+        monkeypatch.setattr(cm, "RESULT_FILE_MAX_BYTES", 2_000)
+        create_agent_folder("f1", task="t")
+        write_result_chunk("f1", "a fragment with a hole")
+        answer = "x" * 5_000
+
+        assert write_finished_result("f1", answer, update_state) is True
+        assert (agent_root / "f1" / "result.txt").read_bytes() == cm.cap_result_bytes(
+            answer.encode("utf-8")
+        )
+        assert (read_state("f1") or {}).get("result_complete") is True
+
+    def test_an_empty_whole_answer_leaves_no_file(self, agent_root):
+        from kiro_crew.subagent_persistence import write_finished_result
+
+        create_agent_folder("f2", task="t")
+        write_result_chunk("f2", "an earlier attempt's partial")
+
+        assert write_finished_result("f2", "", update_state) is True
+        assert not (agent_root / "f2" / "result.txt").exists()
+        assert (read_state("f2") or {}).get("result_complete") is True
+
+    def test_any_other_ending_is_capped_in_place_and_not_flagged(self, agent_root, monkeypatch):
+        import kiro_crew.context_management as cm
+        from kiro_crew.subagent_persistence import write_finished_result
+
+        monkeypatch.setattr(cm, "RESULT_FILE_MAX_BYTES", 2_000)
+        create_agent_folder("f3", task="t")
+        write_result_chunk("f3", "y" * 9_000)
+
+        assert write_finished_result("f3", None, update_state) is True
+        on_disk = (agent_root / "f3" / "result.txt").read_bytes()
+        assert on_disk == cm.cap_result_bytes(b"y" * 9_000)
+        assert (read_state("f3") or {}).get("result_complete") is False
+
+    @pytest.mark.parametrize("text", ["z" * 9_000, None], ids=["whole", "partial"])
+    def test_a_refused_rename_still_leaves_the_file_capped(self, agent_root, monkeypatch, text):
+        """A rename result.txt cannot take -- a Windows reader holding it, a
+        full disk refusing the temp file -- still leaves it within the bound:
+        the cap is written in place, and the whole answer stays unflagged."""
+        from pathlib import Path
+
+        import kiro_crew.context_management as cm
+        import kiro_crew.subagent_persistence as sp
+        from kiro_crew.subagent_persistence import write_finished_result
+
+        monkeypatch.setattr(cm, "RESULT_FILE_MAX_BYTES", 2_000)
+        real_replace = os.replace
+
+        def _refuse_result(src, dst, *a, **kw):
+            if Path(dst).name == "result.txt":
+                raise PermissionError(13, "The process cannot access the file")
+            return real_replace(src, dst, *a, **kw)
+
+        def _refuse_whole(path, *a, **kw):
+            if Path(path).name == "result.txt":
+                raise PermissionError(13, "The process cannot access the file")
+            return real_atomic(path, *a, **kw)
+
+        real_atomic = sp.atomic_write
+        monkeypatch.setattr(os, "replace", _refuse_result)
+        monkeypatch.setattr(sp, "atomic_write", _refuse_whole)
+        create_agent_folder("f4", task="t")
+        write_result_chunk("f4", "z" * 9_000)
+
+        assert write_finished_result("f4", text, update_state) is True
+        on_disk = (agent_root / "f4" / "result.txt").read_bytes()
+        assert on_disk == cm.cap_result_bytes(b"z" * 9_000)
+        assert (read_state("f4") or {}).get("result_complete") is False
+
+    def test_a_cleared_folder_is_not_recreated_or_flagged(self, agent_root):
+        from kiro_crew.subagent_persistence import write_finished_result
+
+        assert write_finished_result("gone1", "the answer", update_state) is False
+        assert not (agent_root / "gone1").exists()
 
 
 # ── write_tombstone ──────────────────────────────────────────────────
@@ -752,1151 +935,17 @@ class TestMarkDelivered:
         assert ts["recovery_action"] == "delivered"
         assert ts["result_available"] is True
 
+    def test_preserves_terminal_usage(self, agent_root):
+        create_agent_folder("mv-usage", task="t")
+        mark_delivered("mv-usage", elapsed=12.5, credits=0.75)
+        ts = json.loads((agent_root / "mv-usage" / "tombstone.json").read_text(encoding="utf-8"))
+        assert ts["elapsed"] == 12.5
+        assert ts["credits"] == 0.75
+
     def test_delivered_excluded_from_orphans(self, agent_root):
         create_agent_folder("mv2", task="t")
         mark_delivered("mv2")
         assert "mv2" not in [o["id"] for o in list_orphans()]
-
-
-# ── Slice 2: spawn() creates agent folder ────────────────────────────
-
-
-class TestSpawnCreatesFolder:
-    """Verify SubagentManager.spawn() creates an agent folder on disk."""
-
-    @pytest.mark.asyncio
-    async def test_spawn_creates_agent_folder(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-
-        async def _empty_stream(*_a, **_kw):
-            return
-            yield
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _empty_stream())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("built_message", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("test task", parent_session_key="dashboard:default")
-            assert info is not None
-            assert not info.done
-            await manager._tasks[info.id]
-
-        # Agent folder should exist with state.json
-        state_path = agent_root / info.id / "state.json"
-        assert state_path.exists(), f"Expected {state_path} to exist"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        assert state["id"] == info.id
-        assert state["status"] == "running"
-        assert state["parent_session"] == "dashboard:default"
-
-    @pytest.mark.asyncio
-    async def test_rejected_spawn_no_folder(self, agent_root):
-        """Rejected spawns should NOT leave orphaned folders."""
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=None)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("rejected task")
-
-        assert info is not None
-        assert info.done
-        # No folder should exist for rejected agents
-        assert not (agent_root / info.id).exists()
-
-    @pytest.mark.asyncio
-    async def test_queued_spawn_no_folder(self, agent_root):
-        """Queued spawns should NOT get a folder until actually spawned."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-
-        async def _empty_stream(*_a, **_kw):
-            return
-            yield
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _empty_stream())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("built_message", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, max_concurrent=1)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            # First spawn takes the slot
-            info1 = manager.spawn("task1", parent_session_key="dashboard:default")
-            # Second spawn gets queued
-            info2 = manager.spawn("task2", parent_session_key="dashboard:default")
-
-            # Assert the invariant WHILE info2 is still queued — a queued agent has no
-            # folder, because the sandbox is created when the agent actually STARTS, not
-            # when it is accepted. This MUST run before draining info1: completing info1's
-            # task frees the slot, which promotes info2 and lets it create its folder. The
-            # earlier version awaited first and then asserted "no folder", which is a
-            # wall-clock race — it passed only when info2's promotion had not finished yet,
-            # and failed on a slow (Windows) runner where it had. Asserted against info2's
-            # real id, which does not carry a `q<n>` sentinel name to filter on.
-            assert info2 is not None
-            assert info2.queued is True
-            folders = list(agent_root.iterdir()) if agent_root.exists() else []
-            assert not any(f.name == info2.id for f in folders)
-            assert not (agent_root / info2.id).exists()
-
-            # Now drain BOTH tasks under the active patches: info1 to release the slot, then
-            # info2 which its release promotes. Draining both avoids a "task was destroyed
-            # but it is pending" warning that pytest reports against a LATER test.
-            await manager._tasks[info1.id]
-            for task in list(manager._tasks.values()):
-                await task
-
-
-# ── Slice 3: Result streaming to agent folder ────────────────────────
-
-
-class TestResultStreamingToAgentFolder:
-    """Verify result text is written to agent folder, not session_workspace."""
-
-    @pytest.mark.asyncio
-    async def test_result_written_to_agent_folder(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-
-        async def _stream_chunks(*_a, **_kw):
-            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="hello ")
-            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="world")
-            yield LLMEvent(kind=EVENT_COMPLETE)
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream_chunks())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("built_message", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("stream test", parent_session_key="dashboard:default")
-            assert info is not None
-            await manager._tasks[info.id]
-
-        # Result should be in agent folder
-        result_path = agent_root / info.id / "result.txt"
-        assert result_path.exists()
-        assert result_path.read_text(encoding="utf-8") == "hello world"
-        # info.result_path should point to agent folder
-        assert info.result_path == str(result_path)
-
-
-# ── Slice 4: Per-turn state.json updates ─────────────────────────────
-
-
-class TestPerTurnStateUpdates:
-    """Verify PID and turn count are persisted to state.json."""
-
-    @pytest.mark.asyncio
-    async def test_pid_recorded_after_session_create(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.providers.base import EVENT_COMPLETE, LLMEvent
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=42)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-        provider.session_id = "session-live"
-
-        async def _stream(*_a, **_kw):
-            yield LLMEvent(kind=EVENT_COMPLETE)
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("msg", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("pid test", parent_session_key="dashboard:default")
-            await manager._tasks[info.id]
-
-        state = json.loads((agent_root / info.id / "state.json").read_text(encoding="utf-8"))
-        assert state["pid"] == 42
-        assert state["session_id"] == "session-live"
-        assert info._session_id == "session-live"
-        assert info._session_provider == state["provider"]
-        assert "pid_recorded_at" in state
-        assert isinstance(state["pid_recorded_at"], float)
-
-    @pytest.mark.asyncio
-    async def test_turns_and_last_tool_updated(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.hooks import TOOL_AUTO_APPROVE, ToolHookResult
-        from kiro_crew.providers.base import (
-            EVENT_COMPLETE,
-            EVENT_PERMISSION_REQUEST,
-            EVENT_TEXT_CHUNK,
-            LLMEvent,
-        )
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-        provider.approve_tool = AsyncMock()
-
-        async def _stream(*_a, **_kw):
-            yield LLMEvent(
-                kind=EVENT_PERMISSION_REQUEST, title="shell", request_id=1, tool_kind="mcp"
-            )
-            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="result")
-            yield LLMEvent(kind=EVENT_COMPLETE)
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _stream())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("msg", None))
-        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("tool test", parent_session_key="dashboard:default")
-            await manager._tasks[info.id]
-
-        state = json.loads((agent_root / info.id / "state.json").read_text(encoding="utf-8"))
-        assert state["turns"] == 1
-        assert state["last_tool"] == "shell"
-
-
-# ── Slice 5: Tombstone on abnormal exit ──────────────────────────────
-
-
-class TestTombstoneOnAbnormalExit:
-    """Verify tombstone.json is written on timeout, reap, turn_limit, cancel, error."""
-
-    @pytest.mark.asyncio
-    async def test_tombstone_on_timeout(self, agent_root):
-        """Timeout in _run writes tombstone with cause=timeout."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentInfo, SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder
-
-        sessions = MagicMock()
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
-
-        info = SubagentInfo(id="timeout1", task="t", parent_session_key="dashboard:default")
-        info._session_id = "session-live"
-        info._session_provider = "claude_code"
-        info._session_cwd = "/project"
-        info.keep = True
-        create_agent_folder("timeout1", task="t")
-        from kiro_crew.subagent_persistence import remember_live_cleanup_identity
-
-        remember_live_cleanup_identity(
-            "timeout1",
-            session_id="session-live",
-            provider="claude_code",
-            cwd="/project",
-        )
-        manager._agents["timeout1"] = info
-        manager._running_count = 1
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            # Simulate what _run does on TimeoutError
-            manager._write_tombstone(info, "timeout")
-
-        ts = json.loads((agent_root / "timeout1" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "timeout"
-        assert ts["session_id"] == "session-live"
-        assert ts["provider"] == "claude_code"
-        assert ts["cwd"] == "/project"
-        assert "keep" not in ts
-
-    @pytest.mark.asyncio
-    async def test_timeout_skipped_when_already_reaped(self, agent_root):
-        """TimeoutError path must not overwrite reaped tombstone or double-count stats."""
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentInfo, SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_tombstone
-
-        sessions = MagicMock()
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
-
-        info = SubagentInfo(id="reaped_timeout", task="t", parent_session_key="dashboard:default")
-        info.reaped = True
-        info.error = "reaped by reaper"
-        create_agent_folder("reaped_timeout", task="t")
-        write_tombstone("reaped_timeout", cause="reaped", recovery_action="notification_pending")
-        manager._agents["reaped_timeout"] = info
-        manager._running_count = 1
-
-        async def _hang(*a, **kw):
-            await asyncio.sleep(999)
-
-        with (
-            patch.object(manager, "_run_inner", _hang),
-            patch.object(manager, "_default_timeout", 0.01),
-            patch("kiro_crew.subagent.Stats"),
-            patch("kiro_crew.subagent.sel"),
-            patch.object(manager, "_fire_event", new_callable=AsyncMock),
-            patch.object(manager, "_on_done", new_callable=AsyncMock),
-        ):
-            await manager._run(info)
-
-        # Tombstone should still say "reaped", not "timeout"
-        ts = json.loads(
-            (agent_root / "reaped_timeout" / "tombstone.json").read_text(encoding="utf-8")
-        )
-        assert ts["cause"] == "reaped"
-        # Error should not be overwritten
-        assert info.error == "reaped by reaper"
-
-    @pytest.mark.asyncio
-    async def test_tombstone_on_turn_limit(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.hooks import TOOL_AUTO_APPROVE, ToolHookResult
-        from kiro_crew.providers.base import EVENT_PERMISSION_REQUEST, LLMEvent
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-        provider.approve_tool = AsyncMock()
-
-        async def _many_tools(*_a, **_kw):
-            for i in range(5):
-                yield LLMEvent(
-                    kind=EVENT_PERMISSION_REQUEST, title=f"tool{i}", request_id=i, tool_kind="mcp"
-                )
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _many_tools())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("msg", None))
-        ctx.hooks.on_tool_call = MagicMock(return_value=ToolHookResult(action=TOOL_AUTO_APPROVE))
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        # Turn limit of 2 — will exceed on 3rd tool
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, default_turn_limit=2)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("turn limit test", parent_session_key="dashboard:default")
-            await manager._tasks[info.id]
-
-        ts_path = agent_root / info.id / "tombstone.json"
-        assert ts_path.exists()
-        ts = json.loads(ts_path.read_text(encoding="utf-8"))
-        assert ts["cause"] == "turn_limit"
-
-    @pytest.mark.asyncio
-    async def test_tombstone_on_error(self, agent_root):
-        """Error in _run writes tombstone with cause=error."""
-        from unittest.mock import MagicMock
-
-        from kiro_crew.subagent import SubagentInfo, SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        info = SubagentInfo(id="error1", task="t", parent_session_key="dashboard:default")
-        create_agent_folder("error1", task="t")
-
-        manager._write_tombstone(info, "error")
-
-        ts = json.loads((agent_root / "error1" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "error"
-
-    @pytest.mark.asyncio
-    async def test_no_abnormal_tombstone_on_success(self, agent_root):
-        """Successful completion records only the delivered tombstone."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-
-        async def _ok(*_a, **_kw):
-            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="done")
-            yield LLMEvent(kind=EVENT_COMPLETE)
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _ok())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("msg", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        # An ``on_done`` callback is what makes the terminal report's return the
-        # delivery confirmation. Without one the dashboard route hands off
-        # asynchronously and the tombstone is owed to the parent's consumption
-        # instead, so it is not on disk when this test reads it.
-        on_done = AsyncMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, on_done=on_done)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("success test", parent_session_key="dashboard:default")
-            await manager._tasks[info.id]
-            await asyncio.gather(*manager._report_tasks)
-
-        ts_path = agent_root / info.id / "tombstone.json"
-        tombstone = json.loads(ts_path.read_text(encoding="utf-8"))
-        assert tombstone["cause"] == "delivered"
-
-
-# ── Slice 6: Folder cleanup on normal completion ─────────────────────
-
-
-class TestFolderCleanupOnSuccess:
-    """Verify agent folder is retained (delivered tombstone) after successful
-    delivery, so the parent can read the transcript during the TTL grace window."""
-
-    @pytest.mark.asyncio
-    async def test_folder_retained_on_success(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-
-        async def _ok(*_a, **_kw):
-            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="done")
-            yield LLMEvent(kind=EVENT_COMPLETE)
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _ok())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("msg", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        on_done = AsyncMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, on_done=on_done)
-
-        with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
-            info = manager.spawn("cleanup test", parent_session_key="dashboard:default")
-            await manager._tasks[info.id]
-
-        # Folder is RETAINED after successful delivery (TTL grace window) so the
-        # parent can read the full transcript via spawn_status / read / grep. A
-        # "delivered" tombstone marks it for deferred prune by the reaper.
-        agent_dir = agent_root / info.id
-        assert agent_dir.exists()
-        ts = json.loads((agent_dir / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "delivered"
-        on_done.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_folder_kept_on_delivery_failure(self, agent_root):
-        """If on_done times out, folder should NOT be deleted (for recovery)."""
-        import asyncio
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
-        from kiro_crew.subagent import SubagentManager
-
-        sessions = MagicMock()
-        sessions.get_pid = MagicMock(return_value=None)
-        provider = AsyncMock()
-        provider.start = AsyncMock()
-        provider.shutdown = AsyncMock()
-        provider.context_usage_pct = lambda: 0.0
-        # Read synchronously after every turn; as AsyncMock children they
-        # would hand back coroutines nobody awaits.
-        provider.context_window_tokens = lambda: 0
-        provider.context_used_tokens = lambda: 0
-
-        async def _ok(*_a, **_kw):
-            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="done")
-            yield LLMEvent(kind=EVENT_COMPLETE)
-
-        provider.stream = MagicMock(side_effect=lambda *a, **kw: _ok())
-        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
-        sessions.release = MagicMock()
-        sessions.reset = AsyncMock()
-        sessions.record_success = MagicMock()
-        sessions.get_agent = MagicMock(return_value="")
-        sessions.get_agent_selection = MagicMock(return_value=("template", ""))
-        sessions.get_approval_policy = MagicMock(return_value="auto")
-
-        ctx = MagicMock()
-        ctx.build_message = MagicMock(return_value=("msg", None))
-        ctx.hooks.on_tool_call = MagicMock()
-        ctx.hooks.auto_approve_subagent_spawn = True
-
-        async def _slow_on_done(_info):
-            await asyncio.sleep(999)
-
-        manager = SubagentManager(sessions=sessions, ctx_builder=ctx, on_done=_slow_on_done)
-
-        with (
-            patch("kiro_crew.subagent._ON_DONE_TIMEOUT", 0.01),
-            patch("kiro_crew.subagent.Stats"),
-            patch("kiro_crew.subagent.sel"),
-        ):
-            info = manager.spawn("delivery failure test", parent_session_key="dashboard:default")
-            await manager._tasks[info.id]
-
-        # Folder must survive when delivery times out
-        assert (agent_root / info.id).exists()
-
-
-# ── Slice 7: Orphan reconciliation on startup ────────────────────────
-
-
-class TestOrphanReconciliation:
-    """Verify _reconcile_orphans handles all three branches."""
-
-    @pytest.mark.asyncio
-    async def test_dead_pid_with_complete_result_tombstoned_as_delivered(self, agent_root):
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
-
-        sessions = MagicMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
-
-        # Simulate orphan from prior run: dead PID, has a result its run
-        # finished writing (result_complete recorded at the complete event).
-        create_agent_folder("orphan1", task="old task", parent_session="dashboard:default")
-        write_result_chunk("orphan1", "some result")
-        from kiro_crew.subagent_persistence import update_state
-
-        update_state("orphan1", pid=99999, result_complete=True)  # dead PID
-
-        with patch.object(manager, "_is_pid_alive", return_value=False):
-            await manager._reconcile_orphans()
-
-        ts = json.loads((agent_root / "orphan1" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "gateway_restart"
-        assert ts["recovery_action"] == "result_available"
-
-    @pytest.mark.asyncio
-    async def test_dead_pid_with_partial_result_is_not_offered_as_a_result(self, agent_root):
-        """Streamed bytes without a complete event are a fragment, not an answer.
-
-        ``write_result_chunk`` appends per streamed chunk, so result.txt is
-        non-empty from the agent's first token. A restart landing mid-turn
-        therefore leaves a file that looks exactly like a finished result to
-        anyone measuring its size — which is what the parent is told to go read.
-        """
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("orphan1p", task="old task", parent_session="dashboard:default")
-        # An opening sentence, nothing more — no complete event ever arrived.
-        write_result_chunk("orphan1p", "I'll start by opening a scratch worktree")
-        from kiro_crew.subagent_persistence import update_state
-
-        update_state("orphan1p", pid=99999)
-
-        with patch.object(manager, "_is_pid_alive", return_value=False):
-            await manager._reconcile_orphans()
-
-        ts = json.loads((agent_root / "orphan1p" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "gateway_restart"
-        assert ts["recovery_action"] == "partial_result"
-
-    @pytest.mark.asyncio
-    async def test_partial_orphan_notice_does_not_promise_a_result(self, agent_root):
-        """The notice is the only thing standing between a fragment and a parent."""
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-        create_agent_folder("orphan1n", task="old task", parent_session="dashboard:default")
-        write_result_chunk("orphan1n", "I'll start by opening a scratch worktree")
-        state = {"id": "orphan1n", "task": "old task", "parent_session": ""}
-
-        with patch.object(
-            manager, "_try_inject_orphan_notification", AsyncMock(return_value=False)
-        ):
-            partial = await manager._notify_orphan("orphan1n", state, "partial_result", True)
-            whole = await manager._notify_orphan("orphan1n", state, "result_available", True)
-
-        assert partial is not None and whole is not None
-        assert "Partial output saved at" in partial
-        assert "unfinished fragment" in partial
-        # The complete-result wording must not leak onto the partial notice.
-        assert "Use the read tool to retrieve it." not in partial
-        assert "Use the read tool to retrieve it." in whole
-
-    @pytest.mark.asyncio
-    async def test_dead_pid_no_result_tombstoned_as_notified(self, agent_root):
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, update_state
-
-        sessions = MagicMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
-
-        create_agent_folder("orphan2", task="old task")
-        update_state("orphan2", pid=99999)
-
-        with patch.object(manager, "_is_pid_alive", return_value=False):
-            await manager._reconcile_orphans()
-
-        ts = json.loads((agent_root / "orphan2" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "gateway_restart"
-        assert ts["recovery_action"] == "notification_pending"
-
-    @pytest.mark.asyncio
-    async def test_alive_pid_killed_and_tombstoned(self, agent_root):
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, update_state
-
-        sessions = MagicMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
-
-        create_agent_folder("orphan3", task="stuck task")
-        update_state("orphan3", pid=99999)
-
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=True),
-            patch.object(manager, "_is_orphan_process", return_value=True),
-            patch.object(manager, "_kill_orphan_pid") as mock_kill,
-        ):
-            await manager._reconcile_orphans()
-
-        mock_kill.assert_called_once_with(99999)
-        ts = json.loads((agent_root / "orphan3" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "gateway_restart"
-        assert ts["recovery_action"] == "notification_pending"
-
-    @pytest.mark.asyncio
-    async def test_recycled_pid_not_killed(self, agent_root):
-        """A live PID that doesn't belong to the original agent must not be killed."""
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, update_state
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("recycled1", task="old task")
-        update_state("recycled1", pid=99999)
-
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=True),
-            patch.object(manager, "_is_orphan_process", return_value=False),
-            patch.object(manager, "_kill_orphan_pid") as mock_kill,
-        ):
-            await manager._reconcile_orphans()
-
-        mock_kill.assert_not_called()
-        ts = json.loads((agent_root / "recycled1" / "tombstone.json").read_text(encoding="utf-8"))
-        assert ts["cause"] == "gateway_restart"
-
-    @pytest.mark.asyncio
-    async def test_reconcile_uses_pid_recorded_at(self, agent_root):
-        """pid_recorded_at (not started) is passed to _is_orphan_process."""
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, update_state
-
-        sessions = MagicMock()
-        manager = SubagentManager(sessions=sessions, ctx_builder=MagicMock())
-
-        create_agent_folder("orphan_ts", task="ts task")
-        update_state("orphan_ts", pid=88888, pid_recorded_at=1234567890.5)
-
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=True),
-            patch.object(manager, "_is_orphan_process", return_value=True) as mock_check,
-            patch.object(manager, "_kill_orphan_pid"),
-        ):
-            await manager._reconcile_orphans()
-
-        mock_check.assert_called_once_with(88888, 1234567890.5)
-
-    @pytest.mark.asyncio
-    async def test_already_tombstoned_skipped(self, agent_root):
-        from unittest.mock import MagicMock
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_tombstone
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("already_dead", task="t")
-        write_tombstone("already_dead", cause="timeout", recovery_action="delivered")
-
-        # Should not re-tombstone
-        await manager._reconcile_orphans()
-        ts = json.loads(
-            (agent_root / "already_dead" / "tombstone.json").read_text(encoding="utf-8")
-        )
-        assert ts["cause"] == "timeout"  # unchanged
-
-    @pytest.mark.asyncio
-    async def test_tracked_agents_skipped(self, agent_root):
-        from unittest.mock import MagicMock
-
-        from kiro_crew.subagent import SubagentInfo, SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("tracked1", task="t")
-        # Simulate this agent being tracked in current run
-        manager._agents["tracked1"] = SubagentInfo(id="tracked1", task="t")
-
-        await manager._reconcile_orphans()
-        # No tombstone — it's tracked
-        assert not (agent_root / "tracked1" / "tombstone.json").exists()
-
-
-# ── Slice 8: Notification — injection + Slack DM fallback ────────────
-
-
-class TestOrphanNotification:
-    """Verify orphan notification with injection attempt and Slack DM fallback."""
-
-    @pytest.mark.asyncio
-    async def test_notification_called_for_orphan_with_result(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import (
-            create_agent_folder,
-            update_state,
-            write_result_chunk,
-        )
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("notif1", task="important task", parent_session="dashboard:default")
-        write_result_chunk("notif1", "the answer is 42")
-        # The run finished writing before the restart, so it recorded completion.
-        update_state("notif1", pid=99999, result_complete=True)
-
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch.object(manager, "_notify_orphan", new_callable=AsyncMock) as mock_notify,
-        ):
-            await manager._reconcile_orphans()
-
-        mock_notify.assert_awaited_once()
-        call_args = mock_notify.call_args
-        assert call_args[0][0] == "notif1"  # agent_id
-        assert call_args[0][2] == "result_available"  # recovery
-        assert call_args[0][3] is True  # has_result
-
-    @pytest.mark.asyncio
-    async def test_notification_called_for_orphan_without_result(self, agent_root):
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, update_state
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("notif2", task="lost task")
-        update_state("notif2", pid=99999)
-
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch.object(manager, "_notify_orphan", new_callable=AsyncMock) as mock_notify,
-        ):
-            await manager._reconcile_orphans()
-
-        mock_notify.assert_awaited_once()
-        call_args = mock_notify.call_args
-        assert call_args[0][2] == "notification_pending"  # recovery
-        assert call_args[0][3] is False  # has_result
-
-    @pytest.mark.asyncio
-    async def test_slack_dm_fallback_called(self, agent_root):
-        """When injection returns False, the message is returned for the caller's digest.
-
-        _notify_orphan does not DM per orphan — undelivered messages are
-        handed back so _reconcile_orphans can batch them into ONE digest DM
-        (a restart with N in-flight agents must never produce N pings).
-        """
-        from unittest.mock import AsyncMock, MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("notif3", task="fallback task", parent_session="dashboard:default")
-        write_result_chunk("notif3", "result data")
-
-        state = {"id": "notif3", "task": "fallback task", "parent_session": "dashboard:default"}
-
-        with (
-            patch.object(
-                manager,
-                "_try_inject_orphan_notification",
-                new_callable=AsyncMock,
-                return_value=False,
-            ),
-            patch.object(manager, "_send_orphan_slack_dm", new_callable=AsyncMock) as mock_dm,
-        ):
-            msg = await manager._notify_orphan("notif3", state, "delivered", True)
-
-        mock_dm.assert_not_awaited()  # DM happens once, at digest time
-        assert msg is not None
-        assert "notif3" in msg
-        assert "orphaned by gateway restart" in msg
-
-    @pytest.mark.asyncio
-    async def test_msg_redacted_before_injection_path(self, agent_root):
-        """msg must be redacted before _try_inject_orphan_notification (not just Slack DM)."""
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder, write_result_chunk
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-        create_agent_folder("notif_redact", task="secret task")
-        write_result_chunk("notif_redact", "result")
-
-        state = {"id": "notif_redact", "task": "secret task", "parent_session": "dashboard:default"}
-
-        injected_msg = None
-        injected_meta = None
-
-        async def _capture_inject(_session, msg, meta=None):
-            nonlocal injected_msg, injected_meta
-            injected_msg = msg
-            injected_meta = meta
-            return True
-
-        with (
-            patch.object(manager, "_try_inject_orphan_notification", side_effect=_capture_inject),
-            patch(
-                "kiro_crew.subagent._redact", side_effect=lambda m: f"[REDACTED]{m}"
-            ) as mock_redact,
-        ):
-            await manager._notify_orphan("notif_redact", state, "delivered", True)
-
-        # _redact must have been called before injection
-        mock_redact.assert_called()
-        assert injected_msg is not None
-        assert injected_msg.startswith("[REDACTED]")
-        # has_result=True → interrupted, with the header's only explanation as
-        # the structured note. The card reads this, not the prose.
-        assert injected_meta is not None
-        assert injected_meta["kind"] == "single"
-        assert injected_meta["outcome"] == "interrupted"
-        assert injected_meta["note"] == "orphaned by gateway restart"
-
-    @pytest.mark.asyncio
-    async def test_notification_failure_doesnt_crash(self, agent_root):
-        """Notification failure should not prevent reconciliation of other orphans."""
-        from unittest.mock import MagicMock, patch
-
-        from kiro_crew.subagent import SubagentManager
-        from kiro_crew.subagent_persistence import create_agent_folder
-
-        manager = SubagentManager(sessions=MagicMock(), ctx_builder=MagicMock())
-
-        create_agent_folder("notif4", task="t1")
-        create_agent_folder("notif5", task="t2")
-
-        call_count = 0
-
-        async def _failing_notify(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise RuntimeError("notification failed")
-
-        with (
-            patch.object(manager, "_is_pid_alive", return_value=False),
-            patch.object(manager, "_notify_orphan", side_effect=_failing_notify),
-        ):
-            await manager._reconcile_orphans()
-
-        # Both orphans should be tombstoned despite notification failure
-        assert (agent_root / "notif4" / "tombstone.json").exists()
-        assert (agent_root / "notif5" / "tombstone.json").exists()
-
-
-# ── Slice 9: Reaper prunes tombstoned folders > 7 days ───────────────
-
-
-class TestReaperPrunesTombstones:
-    """Verify the reaper loop calls prune_stale_tombstones."""
-
-    @pytest.mark.asyncio
-    async def test_reaper_prunes_old_tombstones(self, agent_root):
-        """Old tombstoned folders are pruned during reaper sweep."""
-        from kiro_crew.subagent_persistence import (
-            create_agent_folder,
-            prune_stale_tombstones,
-            write_tombstone,
-        )
-
-        # Create an old tombstoned folder (8 days)
-        create_agent_folder("old_tomb", task="t")
-        write_tombstone("old_tomb", cause="timeout", recovery_action="delivered")
-        ts_path = agent_root / "old_tomb" / "tombstone.json"
-        ts = json.loads(ts_path.read_text(encoding="utf-8"))
-        ts["died"] = time.time() - (8 * 86400)
-        ts_path.write_text(json.dumps(ts))
-
-        # Create a recent tombstoned folder (1 day)
-        create_agent_folder("new_tomb", task="t")
-        write_tombstone("new_tomb", cause="timeout", recovery_action="delivered")
-
-        pruned = prune_stale_tombstones(max_age_days=7)
-        assert pruned == 1
-        assert not (agent_root / "old_tomb").exists()
-        assert (agent_root / "new_tomb").exists()
-
-
-# ── Slice 10: spawn_status reads from agent folder ───────────────────
-
-
-class TestSpawnStatusReadsFromAgentFolder:
-    """Verify spawn_status falls back to persistence layer for orphaned agents."""
-
-    def test_result_path_points_to_agent_folder(self, agent_root):
-        """After spawn+run, info.result_path should point to agent folder."""
-        from kiro_crew.subagent_persistence import (
-            _agent_dir,
-            create_agent_folder,
-            write_result_chunk,
-        )
-
-        create_agent_folder("status1", task="t")
-        write_result_chunk("status1", "full result text")
-
-        expected = str(_agent_dir("status1") / "result.txt")
-        actual = (agent_root / "status1" / "result.txt").read_text(encoding="utf-8")
-        assert actual == "full result text"
-        assert str(agent_root / "status1" / "result.txt") == expected
-
-    def test_read_state_for_orphaned_agent(self, agent_root):
-        """read_state returns data for orphaned agents (not in memory)."""
-        from kiro_crew.subagent_persistence import create_agent_folder, read_state, write_tombstone
-
-        create_agent_folder(
-            "orphan_status", task="orphaned task", parent_session="dashboard:default"
-        )
-        write_tombstone("orphan_status", cause="gateway_restart", recovery_action="delivered")
-
-        state = read_state("orphan_status")
-        assert state is not None
-        assert state["task"] == "orphaned task"
-
-    @pytest.mark.asyncio
-    async def test_api_spawn_status_fallback_to_disk(self, agent_root):
-        """api_spawn_status returns disk data when agent not in memory."""
-        from unittest.mock import MagicMock
-
-        from kiro_crew.dashboard.handlers.messaging import api_spawn_status
-        from kiro_crew.subagent_persistence import (
-            create_agent_folder,
-            write_result_chunk,
-            write_tombstone,
-        )
-
-        create_agent_folder("disk_agent", task="disk task")
-        write_result_chunk("disk_agent", "disk result")
-        write_tombstone("disk_agent", cause="gateway_restart", recovery_action="delivered")
-
-        # subagents must be truthy (not None/empty) but missing the agent_id
-        subagents = MagicMock()
-        subagents.get = MagicMock(return_value=None)
-        request = MagicMock()
-        request.match_info = {"agent_id": "disk_agent"}
-        request.query = {}  # real mapping so _apply_result_view reads no paging params
-        request.app = {"state": MagicMock(subagents=subagents)}
-
-        resp = await api_spawn_status(request)
-        body = json.loads(resp.body)
-
-        assert resp.status == 200
-        assert body["id"] == "disk_agent"
-        assert body["done"] is True
-        assert "disk result" in body["result"]
-        assert "gateway_restart" in body["error"]
-        assert "started" in body
-
-    @pytest.mark.asyncio
-    async def test_api_spawn_status_404_when_not_on_disk(self, agent_root):
-        """api_spawn_status returns 404 when agent not in memory or on disk."""
-        from unittest.mock import MagicMock
-
-        from kiro_crew.dashboard.handlers.messaging import api_spawn_status
-
-        subagents = MagicMock()
-        subagents.get = MagicMock(return_value=None)
-        request = MagicMock()
-        request.match_info = {"agent_id": "nonexistent"}
-        request.app = {"state": MagicMock(subagents=subagents)}
-
-        resp = await api_spawn_status(request)
-        assert resp.status == 404
 
 
 # ── Path traversal protection ────────────────────────────────────────
@@ -1969,6 +1018,7 @@ class TestRecordSlowCommandRotation:
     CAP = 400  # bytes — small enough to cross with a handful of records
 
     @pytest.fixture(autouse=True)
+    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- pre-existing autouse size cap left as is; no test in this module calls monkeypatch.undo()
     def small_cap(self, monkeypatch):
         monkeypatch.setattr("kiro_crew.subagent_persistence._SLOW_LOG_MAX_BYTES", self.CAP)
 

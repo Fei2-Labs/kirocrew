@@ -3,37 +3,80 @@
 from __future__ import annotations
 
 import asyncio
+import heapq
 import json
 import logging
 import sys
 import time
-from typing import Any
+from collections.abc import Collection
+from typing import Any, Callable
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
 from kiro_crew import __version__ as _local_version
 from kiro_crew import shutdown_event
+from kiro_crew.constants import crew_log_enabled
 from kiro_crew.dashboard.chat_utils import effective_session_key, subagent_event_slot
 from kiro_crew.dashboard.origin import check_origin
+from kiro_crew.dashboard.slot_retention import note_foreground
 from kiro_crew.dashboard.state import (
+    PERSISTED_SUBAGENT_REPLAY_KEEP,
+    PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
     DashboardState,
     _safe_folder_tree,
     _slots_serialization_note,
 )
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.warm_task_brief import handle_focus_frame, note_view_closed
+from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_CAPABILITY, SLOT_PATCH_WS_FLAG
 from kiro_crew.dashboard.ws_event_scope import (
+    DASHBOARD_USER_AUDITEE,
     _audit_allow,
     _audit_deny,
     effective_allowed_events,
     filter_slots_for_app,
+    global_event_declared,
     load_declared_events_for_connect,
+    persisted_precap_denial_reason,
+    persisted_precap_readings,
+    persisted_replay_denial_reason,
     slots_envelope_extras,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.subagent_persistence import read_panel_records
 
 logger = logging.getLogger(__name__)
 
 _WS_STATUS_INTERVAL = 5  # seconds between dashboard status pushes
+
+#: What a card says about a child whose closer recorded no usable ending. The same
+#: wording the run-folder reader gives an orphan, because it is the same fact: the
+#: writer went away without recording how the run ended.
+_ORPHANED_UNKNOWN = "Orphaned (unknown cause)"
+
+
+async def _send_slot_projection_subscribed(ws: web.WebSocketResponse) -> None:
+    """Send the one-shot ``slot_projection/subscribed`` floor to a NEW owner socket.
+
+    Carries ``{"revisions": {slot: {fold: revision}}}`` -- the newest revision the
+    crew-log publisher has pushed for each cell. The client records it as a floor BEFORE
+    it issues any baseline read, which is what keeps a read already on the wire from
+    resolving later and replacing a value the client was handed first.
+
+    No publisher means no eager fold has run in this process, so there is no floor to
+    state and no frame is sent; a client with no floor keeps its own rule of "accept the
+    first revision you see", which is correct because nothing has been pushed to it.
+
+    The import is function-local so this module's own import pulls in no crew-log
+    submodule, which is the gate the crew-log handler states for itself.
+    """
+    from kiro_crew.dashboard.handlers.crew_log import SLOT_SUBSCRIBED_FRAME, live_publisher
+
+    publisher = live_publisher()
+    if publisher is None:
+        return
+    revisions = publisher.known_revisions()
+    await ws.send_str(json.dumps({"type": SLOT_SUBSCRIBED_FRAME, "data": {"revisions": revisions}}))
 
 
 async def _status_frame(state: DashboardState) -> dict[str, Any]:
@@ -61,6 +104,8 @@ async def _status_frame(state: DashboardState) -> dict[str, Any]:
 SUBAGENT_REPLAY_BATCH_THRESHOLD = 8
 
 SIDE_RESULT_EVENT = "chat.side_result"
+#: A reply landing in a thread on a crewmate chat message (``chat_threads``).
+THREAD_REPLY_EVENT = "chat.thread_reply"
 SIDE_QUEUE_EVENT = "chat.side_queue"
 SIDE_KIND = "side"
 
@@ -81,6 +126,365 @@ def _subagent_replay_has_owner(frame: object) -> bool:
         return False
     slot = data.get("slot")
     return isinstance(slot, str) and bool(slot.strip())
+
+
+def build_persisted_subagent_frame(record: dict, *, redact: Callable[[str], str]) -> dict:
+    """Build the ``subagent_done`` replay frame for one durable run record.
+
+    Separate from the reconnect handler for the same reason
+    :func:`build_subagent_snapshot` is: the handler around it needs a live
+    aiohttp WebSocket, so a field that goes missing in here is hard to catch
+    from the outside.
+
+    The caller's own redactor is passed in rather than imported, so these frames
+    carry exactly the treatment the live frames beside them get.
+
+    ``credits``, ``model`` and ``task`` are OMITTED when the record has none, never
+    sent as ``0`` or ``""``. A child that reported no charge and a child that cost
+    nothing are different facts, only one of them a measurement; and a log that
+    does not say what a child was asked -- which is every log written before the
+    field -- is not a child asked to do nothing. The client's reducer reads an
+    absent key as "this frame does not say" and keeps any value it already held,
+    which a zero or an empty string would overwrite, and the card draws no task
+    line at all rather than a blank one.
+    """
+    error = str(record.get("error") or "")
+    credits = record.get("credits")
+    model = str(record.get("model") or "")
+    task = str(record.get("task") or "")
+    data: dict = {
+        "id": str(record.get("id") or ""),
+        # The record's own slot when it carries one -- a folded record does, since
+        # its unit id is an ACP session id a slot cannot be derived from. Otherwise
+        # the session key is mapped, the same mapping the live frames use; a raw
+        # prefix-strip tags a card with a slot no tab reads.
+        "slot": str(record.get("slot") or "")
+        or subagent_event_slot(str(record.get("parent_session") or "")),
+        "elapsed": float(record.get("elapsed") or 0.0),
+        "error": redact(error) if error else None,
+        # The record carries the run's own outcome, so a user stop stays a
+        # stop here rather than being flattened into a failure.
+        "stopped": bool(record.get("stopped")),
+        "outcome": str(record.get("outcome") or ""),
+        "agent": redact(str(record.get("agent") or "")),
+    }
+    if task:
+        data["task"] = redact(task)
+    if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+        data["credits"] = float(credits)
+    if model:
+        data["model"] = model
+    return {"type": "subagent_done", "data": data}
+
+
+def fold_subagent_outcome(outcome: str, reason: str) -> tuple[str, str, bool]:
+    """One fold row's ending as the ``(outcome, error, stopped)`` a card draws.
+
+    The fold keeps the subagent runtime's OWN outcome string, deliberately: that
+    enum is open, so enforcing a set at the fold would turn "the upstream
+    vocabulary grew" into a lost record. A card cannot draw an open set, and the
+    client's terminal classification falls through to ``done`` for a value it does
+    not recognise -- so a child whose ending the log recorded as ``unknown`` would
+    be drawn as a success. That is the one mapping this does: a value outside the
+    three the client reads becomes ``failed``, which is what the persisted reader
+    this replaced answered for an ending it could not classify either.
+
+    The error text follows the same rule. The closer's own ``reason`` is used when
+    it wrote one; crash-repair writes none, and its row gets the wording the
+    folder reader gave an orphan, because that is the same fact -- the writer went
+    away without recording an ending.
+
+    A stop is not an error, so it carries no text: the consumers drop it for a
+    stop anyway, and a stop drawn with error text reads as a failure.
+    """
+    if outcome == "stopped":
+        return "stopped", "", True
+    if outcome == "completed":
+        return "completed", "", False
+    if outcome == "failed":
+        return "failed", reason, False
+    return "failed", reason or _ORPHANED_UNKNOWN, False
+
+
+def _replay_record_slot(record: dict) -> str:
+    """The slot a durable panel record routes to, from whichever key it carries.
+
+    The two durable sources name the owning conversation differently, and the gate
+    that reads this cannot tell which one it is holding. A folded record carries
+    ``slot`` outright, because its unit id is an ACP session id a slot cannot be
+    derived from. A folder record carries ``parent_session``, the raw session key,
+    which :func:`subagent_event_slot` maps -- the same mapping the live frames use,
+    and not a prefix-strip, which tags a card with a slot no tab reads.
+
+    ``""`` only when the record names no conversation at all, which both gates
+    refuse. Reading an absent key as an empty slot would refuse every record from
+    the source that uses the other name.
+    """
+    return str(record.get("slot") or "") or subagent_event_slot(
+        str(record.get("parent_session") or "")
+    )
+
+
+def crew_log_panel_units(slot_names: Collection[str]) -> list[tuple[str, str]]:
+    """``(slot, unit)`` pairs to fold for *slot_names*, excluding deleted units.
+
+    A slot's units come from the store's own slot-naming headers, not from its
+    session key: a unit is the ACP session id the log was opened under, a slot owns
+    one id at a time, and a finished child can sit in any unit the slot has run
+    under. The slot is carried alongside its unit because it is what a frame is
+    routed by and what the ownership gate asks about, and a unit id is not
+    something a slot can be derived back from.
+
+    Resolved through :func:`session_ledger.crew_log_units`, which is the resolver
+    that applies the slot's PERMANENT-DELETE exclusion list -- the raw store index
+    does not. A slot key is reused: the person who holds it now may not be the one
+    whose conversation was deleted, and folding an excluded unit hands them that
+    conversation's finished subagent cards, task text included, for the whole
+    retention window. It also fails CLOSED per slot: a slot whose exclusion list
+    cannot be read contributes no units rather than all of them, so an unreadable
+    list costs one slot's cards instead of serving a deleted conversation's.
+
+    The crew-log import is local so this module's own import pulls in no crew-log
+    machinery: the log is an optional subsystem behind a flag, and this module is
+    on the gateway's boot path.
+
+    Blocking. A caller on the event loop must wrap this in
+    :func:`asyncio.to_thread`, passing a snapshot of the names taken on the loop.
+    Each name costs a cached index lookup plus its own exclusion-list read.
+    """
+    from kiro_crew.session_ledger import crew_log_units
+
+    return [(name, unit) for name in slot_names for unit in crew_log_units(name)]
+
+
+def backfill_legacy_panel_dismissals(units: Collection[tuple[str, str]]) -> frozenset[str]:
+    """Write the log the dismissals only the legacy folder registry holds.
+
+    Returns the ids corrected, which the caller must ALSO exclude from the read it
+    is about to make: the append is queued, so the fold that follows it in the
+    same breath may not carry it yet, and a card hidden on the next reconnect but
+    drawn on this one is the failure this whole path exists to prevent.
+
+    A dismissal is a fact about the session, so the log is where the panel reads it
+    from. Dismissals made before that entry type existed are held only in the
+    folder registry, and a reader that just consulted the registry alongside the
+    fold would keep two records of the same fact -- which is the arrangement this
+    panel path exists to end. So the RECORD is corrected instead: a child the
+    registry marks dismissed, whose log carries no dismissal, gets one appended to
+    the unit that holds it.
+
+    Idempotent, and that is the point rather than a convenience. The fold's render
+    stops offering a row once the log carries its dismissal, so the corrected child
+    is not among the rows this walks on any later pass -- the registry is read at
+    most once per child, ever. It is never written here either: it stays a
+    read-only legacy input that a later prune can take away without resurrecting
+    anything.
+
+    A child still in flight is skipped. Its card is live, the user has not been
+    offered a dismissal of a row this reads, and a registry entry for it predates
+    nothing.
+
+    Blocking. A caller on the event loop must wrap this in :func:`asyncio.to_thread`.
+    """
+    from kiro_crew.crew_log import emit as crew_log_emit
+    from kiro_crew.crew_log import projection as _projection
+    from kiro_crew.subagent_persistence import panel_dismissal_recorded
+
+    corrected: set[str] = set()
+    for _slot_key, unit_id in units:
+        if not unit_id:
+            continue
+        try:
+            rows = _projection.fold_session(unit_id, ("subagents",)).projection("subagents")
+            for agent_id, row in (rows.value.get("by_id") or {}).items():
+                if not isinstance(row, dict) or not row.get("outcome"):
+                    continue
+                if not panel_dismissal_recorded(str(agent_id)):
+                    continue
+                crew_log_emit.on_subagent_dismissed(unit_id, agent_id=str(agent_id))
+                corrected.add(str(agent_id))
+        except Exception:
+            # The fold or the append failed for this unit. The read that follows
+            # draws whatever the log does hold, so the cost is a card the user has
+            # to clear again -- not a run hidden from them, which is the direction
+            # that must never happen by accident.
+            logger.debug("crew log: correcting %s's panel dismissals failed", unit_id)
+            continue
+    return frozenset(corrected)
+
+
+def read_fold_subagent_records(
+    units: list[tuple[str, str]],
+    *,
+    keep: int,
+    max_age_secs: float,
+    exclude_ids: Collection[str],
+    admit: Callable[[dict], bool],
+    now: float | None = None,
+) -> tuple[list[dict], int]:
+    """Bounded, newest-first panel records folded out of the CREW LOG.
+
+    The durable half of the Subagents panel, and the crew log is where it comes
+    from: the log is the record, so every count, outcome, duration and cost a card
+    draws is a fold of it rather than a second store kept in step by hand. What
+    this reads is the ``subagents`` fold's rows plus the ``class`` fold's ``app``,
+    both folded in ONE pass per unit.
+
+    *units* is ``(slot_key, unit_id)`` per crew-log UNIT, resolved on the event
+    loop by the caller. A unit id is the ACP session id the log was opened under,
+    which is NOT the slot's session key: a slot owns one id at a time, so its
+    history is spread over a unit per id it ran under and a finished child can sit
+    in any of them (``session_ledger.crew_log_units``). The slot is carried
+    alongside because it is what a frame is routed by and what the ownership gate
+    asks about, and deriving it back from a unit id is not possible.
+
+    ``app`` comes from the ``class`` fold, which keeps the FIRST owner the session
+    ever had and never moves off it. That is what the cross-app guard needs: a
+    slot key is caller-supplied and not namespaced, so the key a run was recorded
+    under can later be minted by a different app, and comparing the live slot's
+    owner against the log's own recorded owner is what refuses the old run to the
+    new one.
+
+    A dismissed run never reaches here: the user's dismissal is an entry in this
+    same log, so the ``subagents`` fold stops offering the row and this read has
+    no dismissal store to consult. The log is where it has to be recorded, because
+    a store beside the log is reclaimed on its own schedule: a registry keyed on
+    the run's folder at both ends drops its record when that folder is pruned,
+    while this read still finds the child the log kept.
+
+    Only a CLOSED child is returned. A row with no outcome is a child still in
+    flight, and this process is not the one tracking it: a card drawn from it
+    would wear a running pill nothing will ever advance. The fold's own ``running``
+    count is what states those, and the panel section draws it.
+
+    Ordered newest-first on each row's ``started_ms``, which is why the fold keeps
+    it: ``seq_spawned`` orders rows inside one log and says nothing across two.
+    What ``keep`` cut is COUNTED and returned, never silently dropped.
+
+    Blocking. A caller on the event loop must wrap this in
+    :func:`asyncio.to_thread`.
+    """
+    from kiro_crew.crew_log import projection as _projection
+    from kiro_crew.crew_log import read as _crew_log_read
+
+    if keep <= 0:
+        return [], 0
+    stamp = time.time() if now is None else now
+    cutoff = (stamp - max_age_secs) * 1000.0 if max_age_secs > 0 else float("-inf")
+    skip = set(exclude_ids)
+    # A bounded min-heap on the dispatch stamp, so the working set is capped
+    # whatever the folds hold.
+    #
+    # The two keys after the stamp are what make the order TOTAL, and a heap
+    # needs that: on any tie the tuple comparison falls through to the next key,
+    # and a dict as the next key raises ``TypeError``. Neither earlier key is
+    # enough on its own. ``started_ms`` is a millisecond clock, so a host whose
+    # granularity is coarser gives every child of one burst the same stamp.
+    # ``seq`` then orders them -- but only within ONE unit, since seqs are per
+    # log and a row the fold could not date reads 0, so two units tie on both.
+    # ``order`` is the position this row was pushed in, unique by construction,
+    # so the fall-through always stops before the record. It says nothing about
+    # time; it is there to be an arbitrary order that is at least the SAME one
+    # on every read of the same logs.
+    newest: list[tuple[float, int, int, dict]] = []
+    order = 0
+    overflow = 0
+    for slot_key, unit_id in units:
+        if not slot_key or not unit_id:
+            # No slot is no card to route to, and no unit is no log to fold.
+            continue
+        try:
+            # The OWNER comes from ``crew_log.read.recorded_class``, not from this
+            # unit's class projection directly, because an absent answer and an
+            # unowned session are different facts that the projection's own ``app``
+            # cannot tell apart: both read as "". A unit whose class history has a
+            # hole in it, or whose front was trimmed by retention, or that never
+            # recorded a class at all, would then be published as owned by nobody --
+            # which compares EQUAL to a slot with no owning app, so the cross-app
+            # guard admits the records and the old app's runs, task text included,
+            # reach the slot's new holder. That function owns all three refusals and
+            # answers None for each, so an untrustworthy history skips the unit
+            # instead of lowering the guard. Its fold is incremental and its bundle
+            # is held, so an unchanged log consumes no entries on a later read.
+            recorded = _crew_log_read.recorded_class(unit_id)
+            if recorded is None:
+                logger.debug(
+                    "crew log: %s's class history is not readable, so its subagent "
+                    "rows are skipped rather than published as owned by nobody",
+                    unit_id,
+                )
+                continue
+            app = str(recorded.get("app") or "")
+            rows = (
+                _projection.fold_session(unit_id, ("subagents",))
+                .projection("subagents")
+                .value.get("by_id")
+                or {}
+            )
+        except Exception:
+            logger.debug("crew log: folding %s for the subagent panel failed", unit_id)
+            continue
+        for agent_id, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            agent_id = str(agent_id)
+            outcome = row.get("outcome")
+            if not outcome or not isinstance(outcome, str):
+                continue
+            if agent_id in skip:
+                continue
+            started_ms = row.get("started_ms")
+            started_ms = float(started_ms) if isinstance(started_ms, (int, float)) else 0.0
+            if started_ms < cutoff:
+                continue
+            ending, error, stopped = fold_subagent_outcome(outcome, str(row.get("reason") or ""))
+            ms = row.get("ms")
+            credits = row.get("credits")
+            record = {
+                "id": agent_id,
+                "task": str(row.get("task") or ""),
+                "agent": str(row.get("agent") or ""),
+                "model": str(row.get("model") or ""),
+                "app": app,
+                "slot": slot_key,
+                "unit": unit_id,
+                "started": started_ms / 1000.0,
+                "elapsed": ms / 1000.0 if isinstance(ms, int) and not isinstance(ms, bool) else 0.0,
+                "outcome": ending,
+                "error": error,
+                "stopped": stopped,
+            }
+            # Absent, not zero: ``usage`` owns the session's credit aggregate and a
+            # row carries only what THIS child reported, so a child that was never
+            # billed must not be published as one that cost nothing.
+            if isinstance(credits, (int, float)) and not isinstance(credits, bool):
+                record["credits"] = float(credits)
+            # The caller's own visibility and ownership bounds, BEFORE the cap.
+            # Filtering afterwards lets a record the caller may not see occupy a
+            # slot its own runs need, and makes the cut count describe a
+            # population that is not the caller's.
+            if not admit(record):
+                continue
+            seq = row.get("seq_spawned")
+            seq = seq if isinstance(seq, int) and not isinstance(seq, bool) else 0
+            order += 1
+            if len(newest) < keep:
+                heapq.heappush(newest, (started_ms, seq, order, record))
+                continue
+            overflow += 1
+            # Displaced on the SAME total order the sort below reports, so what the
+            # cap keeps is the prefix of the order it publishes. Comparing the stamp
+            # alone refuses to displace on a tie, so a burst of children sharing one
+            # millisecond keeps whichever arrived FIRST and then reports them
+            # newest-first -- a list that is ordered but is not the newest runs.
+            if newest[0][:3] < (started_ms, seq, order):
+                heapq.heappushpop(newest, (started_ms, seq, order, record))
+    # Newest first on the SAME total order the heap used, so a tie resolves the
+    # same way here as it did there. Sorting on the stamp alone leaves tied rows
+    # in whatever order the heap happened to hold them, which is a different
+    # order on a different platform for identical logs.
+    ordered = sorted(newest, key=lambda item: item[:3], reverse=True)
+    return [item[3] for item in ordered], overflow
 
 
 def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
@@ -122,6 +526,7 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
         "child_session": getattr(a, "conversation_key", "") or f"subagent:{a.id}",
         "task": _r(a.task),
         "agent": _r(a.agent),
+        "label": _r(getattr(a, "label", "") or ""),
         "model": a.resolved_model,
         "requested_model": _r(a.requested_model),
         "streaming": _r(a.streaming_text),
@@ -129,6 +534,12 @@ def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
         "tool_count": a.tool_count,
         "stalled": a.stalled,
     }
+    # The wave this agent belongs to, when it is part of one. Mirrors the live
+    # ``_subagent_event`` stamp so a reconnect replay keeps the panel's batch
+    # chip; omitted for a solo spawn so the client reads "no wave", not "".
+    _bid = getattr(a, "batch_id", "")
+    if isinstance(_bid, str) and _bid:
+        data["batch_id"] = _bid
     if a.stalled:
         data["idle_secs"] = max(0, int(ts - a.last_activity))
     data["started"] = a.started
@@ -143,7 +554,11 @@ def _audit_grant_quietly(app: str, event: str) -> None:
     envelope field), the periodic ``dashboard`` status frame, and the
     ``subscribe_logs`` ring replay -- so ``ws_event_allowed`` never sees them
     and none of them would otherwise leave an SEL record, even though each is
-    a permission decision ``AUTOSDE.yaml`` requires one for.
+    a permission decision ``AUTOSDE.yaml`` requires one for. The same three
+    sends reach a dashboard-user socket on identical grounds, so each site
+    records the grant for BOTH socket kinds, under :func:`_grant_auditee`'s
+    label -- a dashboard user has an empty app claim, and recording it as the
+    app would file the owner's grants under ``<unknown>``.
 
     One helper rather than the same ``try``/``except`` inlined at each site:
     the swallow is the load-bearing part and needs to behave identically
@@ -158,6 +573,21 @@ def _audit_grant_quietly(app: str, event: str) -> None:
         logger.debug("ws: SEL audit for %s grant failed", event, exc_info=True)
 
 
+def _grant_auditee(ws: web.WebSocketResponse, ws_app: str) -> str:
+    """Return the SEL ``caller`` a grant on this socket is recorded under.
+
+    A dashboard-user socket is identified by the positive ``_is_dashboard_user``
+    flag and carries an empty app claim, so it gets the reserved
+    ``DASHBOARD_USER_AUDITEE`` label -- the same one the broadcast chokepoint
+    (``WebSocketHub._ws_client_allowed``) uses, so one socket kind has one
+    identity in the trail whichever path delivered the frame. Every other
+    socket is recorded as its app.
+    """
+    if ws.get("_is_dashboard_user", False):
+        return DASHBOARD_USER_AUDITEE
+    return ws_app
+
+
 def broadcast_side_result(
     state: DashboardState,
     *,
@@ -169,6 +599,7 @@ def broadcast_side_result(
     final: bool = False,
     ts: float | None = None,
     steer: bool = False,
+    message_id: str = "",
 ) -> None:
     """Broadcast a side conversation event on the dedicated side channel.
 
@@ -186,6 +617,11 @@ def broadcast_side_result(
     Set final=True on the terminal frame of a side turn so the frontend
     can flip the streaming flag off cleanly.
 
+    ``message_id`` names the sidecar row the frame announces (a question, a
+    steer, a final answer, a stop row). A panel restored from ``GET .../side``
+    already holds that row, and the id is how it knows. Streaming deltas and
+    the error notices the sidecar does not store carry none.
+
     No payload field is persisted — sidecar-only, ephemeral.
     """
     payload: dict[str, object] = {
@@ -202,10 +638,66 @@ def broadcast_side_result(
         payload["final"] = True
     if steer:
         payload["steer"] = True
+    if message_id:
+        payload["message_id"] = message_id
     # Owner-only, matching the queue frame and `_check_slot_ownership`: side answers and
     # steer echoes are the owner's own conversation, and an app that asks the HTTP API
     # about a slot it does not own gets a 404.
     state.broadcast_ws_owners(SIDE_RESULT_EVENT, payload)
+
+
+def broadcast_thread_reply(
+    state: DashboardState,
+    *,
+    slot_key: str,
+    mid: str,
+    run_id: str,
+    role: str,
+    content: str,
+    is_error: bool = False,
+    final: bool = False,
+    ts: float | None = None,
+    reply: dict[str, object] | None = None,
+) -> None:
+    """Broadcast one frame of a reply thread (``dashboard/chat_threads.py``).
+
+    ``{type: "chat.thread_reply", data: payload}``: ``mid`` names the parent
+    message the thread hangs off, ``run_id`` groups the streamed deltas of one
+    crewmate reply, and the terminal frame (``final``) carries the stored
+    ``reply`` record so the panel can replace its streamed text with the row the
+    store holds. Owner-only, like the side chat: a thread is the owner's own
+    conversation. Same channel discipline as ``chat.side_result`` -- a receiver
+    that does not subscribe never sees it, so thread frames stay out of the main
+    transcript by construction.
+
+    Sent only while ``dashboard.crewmate_threads`` is on. The routes refuse
+    before any turn starts, so this guard covers the one turn that was already
+    running when the flag went off: its frames are dropped, and the reply it
+    stores is served again once the flag is back on. The watcher's snapshot is
+    the read (a plain attribute, never a disk load on the loop); before the
+    watcher has one, the frame is dropped too -- the flag is off by default and
+    a frame nobody can act on is the cheaper mistake.
+    """
+    from kiro_crew.config import live
+
+    cfg = live.snapshot()
+    if cfg is None or not cfg.dashboard.crewmate_threads:
+        return
+    payload: dict[str, object] = {
+        "slot": slot_key,
+        "mid": mid,
+        "run_id": run_id,
+        "role": role,
+        "content": redact_credentials(redact_exfiltration_urls(content)[0])[0],
+        "ts": ts if ts is not None else time.time(),
+    }
+    if is_error:
+        payload["is_error"] = True
+    if final:
+        payload["final"] = True
+    if reply is not None:
+        payload["reply"] = reply
+    state.broadcast_ws_owners(THREAD_REPLY_EVENT, payload)
 
 
 def broadcast_side_queue(
@@ -375,7 +867,9 @@ def _check_ws_origin(request: web.Request) -> None:
         raise web.HTTPForbidden(text="WebSocket origin not allowed")
 
 
-async def api_ws(request: web.Request) -> web.WebSocketResponse:
+async def _serve_ws(
+    request: web.Request, registered: list[web.WebSocketResponse]
+) -> web.WebSocketResponse:
     """GET /api/ws — single multiplexed WebSocket for all real-time events."""
     _check_ws_origin(request)
 
@@ -388,9 +882,9 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         ensure_gitlab_hosts_loaded,
         gitlab_hosts_generation,
         is_owner_dashboard_request,
-        schedule_check_refresh,
         schedule_visibility_refresh,
     )
+    from kiro_crew.dashboard.source_providers.chip_refresh import schedule_tiered_check_refresh
     from kiro_crew.platform.governance_profiles import (
         governance_answer_generation,
         poll_profiles_fresh,
@@ -452,6 +946,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             return ws
 
     state.register_ws(ws, owner=owner_request)
+    registered.append(ws)
 
     # Store app identity on the WS connection so the broadcast chokepoint can
     # filter. ``_is_dashboard_user`` comes from a POSITIVE signal produced by
@@ -462,6 +957,16 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     ws["_app"] = ws_app
     ws["_is_dashboard_user"] = request.get("is_dashboard_user", False)
     ws["_allowed_events"] = allowed_events
+    # A tab whose bundle applies ``slot_patch`` frames says so in ``?caps=``;
+    # without the declaration (an older bundle, a companion window, an app
+    # token) the socket keeps receiving the full ``slots`` list for every
+    # metadata edit. Dashboard users only: the frame bypasses the app scope gate.
+    # ``getattr``: request doubles in the suite are plain dicts with no query.
+    query = getattr(request, "query", None) or {}
+    declared_caps = {cap.strip() for cap in str(query.get("caps", "")).split(",")}
+    ws[SLOT_PATCH_WS_FLAG] = bool(ws["_is_dashboard_user"]) and (
+        SLOT_PATCH_CAPABILITY in declared_caps
+    )
 
     # Push current slots immediately so sidebar populates without waiting.
     # App tokens get only the slots their manifest scope allows.
@@ -520,12 +1025,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # never receives the tree, so its generation would describe data the
             # app does not have.
             envelope_extras["foldersGeneration"] = state.folders_generation()
-        if not ws.get("_is_dashboard_user", False) and "yolo" in envelope_extras:
-            # Handing an app token the live blanket-approval override is a
-            # grant of operator security posture, not slot data, and this
-            # initial push writes to the socket directly -- so record it here
-            # or it goes unrecorded entirely.
-            _audit_grant_quietly(ws_app, "slots_yolo")
+        if "yolo" in envelope_extras:
+            # Handing a socket the live blanket-approval override is a grant
+            # of operator security posture, not slot data, and this initial
+            # push writes to the socket directly -- so record it here or it
+            # goes unrecorded entirely. Dashboard users included: they always
+            # receive the field, and until this was ungated the owner's own
+            # socket was the one kind whose grant left no record.
+            _audit_grant_quietly(_grant_auditee(ws, ws_app), "slots_yolo")
         snapshot_frame = {
             "type": "slots",
             "data": slots_data,
@@ -534,7 +1041,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             # detectable as a change rather than as a first sighting.
             "gitlabHostsGeneration": gitlab_hosts_generation(),
             "governanceGeneration": initial_answer_generation,
+            "slotsPartial": getattr(state, "slot_list_rebuilding", False) is True,
         }
+        if is_dashboard_user:
+            held_keys = list(state.slot_list_held_keys())
+            if held_keys:
+                snapshot_frame["slotsHeldKeys"] = held_keys
+            if state.slot_list_hold_channels() is True:
+                snapshot_frame["slotsHoldChannels"] = True
         # Same offender diagnostic as the slots broadcast.
         # ``send_json`` is ``send_str(dumps(data))``, so dumping here is
         # byte-identical on the healthy path. This whole connect block sits
@@ -554,15 +1068,28 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         # after the connect snapshot and before any later broadcast can reach
         # it -- so the client's held member_projection frames can be pruned
         # against a lastSeqs baseline it received first. Owner surface only:
-        # app tokens never receive member_projection / members_subscribed (both
-        # are classified owner-only in ws_event_scope), so skip them here too.
-        if is_dashboard_user:
+        # app tokens and non-owner dashboard sessions never receive
+        # member_projection / members_subscribed (the hub's per-socket gate refuses
+        # them), so the baseline goes to the owner's socket alone.
+        if owner_request:
+            # A direct send, so the grant is recorded here: the hub's per-socket
+            # gate, which audits broadcast frames, never sees it.
+            _audit_grant_quietly(_grant_auditee(ws, ws_app), "members_subscribed")
             # Isolated: a failure to send this baseline must not take the
             # provider refresh scheduling below down with it.
             try:
                 await state.send_members_subscribed(ws)
             except Exception:
                 logger.debug("members_subscribed baseline not sent", exc_info=True)
+        if is_dashboard_user:
+            # The same shape for SLOT folds, and the same reason: a revision floor the
+            # client holds BEFORE it issues a baseline read, so a read already on the
+            # wire cannot resolve later and overwrite a newer pushed value. Isolated for
+            # the same reason as the one above.
+            try:
+                await _send_slot_projection_subscribed(ws)
+            except Exception:
+                logger.debug("slot_projection/subscribed baseline not sent", exc_info=True)
         if owner_request or is_dashboard_user:
             # Issue links carry no check status — skip them so the scheduler
             # never hands an issue URL to the pull-request-only chip fetch.
@@ -589,7 +1116,12 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 # (fail closed) — no non-owner-driven credentialed probe.
                 if owner_request:
                     schedule_visibility_refresh(urls, state.push_slots_update)
-                    schedule_check_refresh(urls, state.push_slots_update)
+                    # Idle slots' chips (every restored tab, until it is opened
+                    # or runs a turn) go to the slow tier, so a reconnect does
+                    # not re-read the whole sidebar history.
+                    schedule_tiered_check_refresh(
+                        urls, state.idle_source_link_urls(), state.push_slots_update
+                    )
     except Exception:
         pass
 
@@ -624,12 +1156,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # dashboard-user tokens and keep the full snapshot.
                     for _owner_only in ("branch", "commit", "harness"):
                         data.pop(_owner_only, None)
-                    # Tier 0 admits every app unconditionally, but the decision
-                    # is still a grant per ``AUTOSDE.yaml`` -- this frame is
-                    # sent directly rather than through the broadcast
-                    # chokepoint, so nothing else records it. The dedup window
-                    # already bounds the 5-second interval to one record.
-                    _audit_grant_quietly(ws_app, "dashboard")
+                # Tier 0 admits every socket unconditionally, but the decision
+                # is still a grant per ``AUTOSDE.yaml`` -- this frame is sent
+                # directly rather than through the broadcast chokepoint, so
+                # nothing else records it. Outside the app-token narrowing
+                # above on purpose: the dashboard user receives the full frame
+                # and that is a grant too. The dedup window already bounds the
+                # 5-second interval to one record.
+                _audit_grant_quietly(_grant_auditee(ws, ws_app), "dashboard")
                 try:
                     await ws.send_json({"type": "dashboard", "data": data})
                 except Exception:
@@ -713,7 +1247,15 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     # read-only via is_repo_public. No non-owner-driven
                     # credentialed provider read.
                     schedule_visibility_refresh(urls, state.push_slots_update)
-                    schedule_check_refresh(urls, state.push_slots_update)
+                    # Two tiers. Chips on slots in use (a turn running, or a turn
+                    # ended / the owner opened it recently) keep the chip TTL.
+                    # Chips only idle slots link -- a restored history of tabs --
+                    # go to the idle tier: a slower clock and a small per-TTL
+                    # budget shared by every owner socket, so their cost does
+                    # not grow with the number of tabs ever left open.
+                    schedule_tiered_check_refresh(
+                        urls, state.idle_source_link_urls(), state.push_slots_update
+                    )
                 refresh_round += 1
             except asyncio.CancelledError:
                 raise
@@ -730,6 +1272,73 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
     # provider subprocess. App tokens never render status either way.
     _run_status_driver = owner_request
     check_task = asyncio.create_task(_refresh_check_loop()) if _run_status_driver else None
+
+    # Background task, ONLY for a connection that declared the `sessions` scope:
+    # recompute session health on a timer so `session_health_changed` fires for a
+    # verdict that moves with the CLOCK. Same shape of bug as the frozen PR chips
+    # above: the verdict is computed only when `GET /api/sessions/health` is
+    # requested, so a turn crossing the stall threshold, a queue draining, or a
+    # cap being cut produces no signal unless somebody happens to poll -- and the
+    # subscriber that most needs the signal is exactly the one whose manifest does
+    # not list that path, so it cannot poll.
+    #
+    # Gated on the declaration rather than started for every socket because the
+    # driver exists solely to feed this event: a host where no app declared
+    # `sessions` has no possible recipient, so it should run no driver at all
+    # instead of recomputing health forever for nobody. A dashboard user carries
+    # no declaration set (it is not gated by declarations) and no dashboard
+    # surface subscribes to this signal -- it reads the endpoint directly, which
+    # it is entitled to -- so it drives nothing either.
+    #
+    # This is work avoidance, not the permission decision: delivery is still
+    # judged per frame by `_send_ws_all` -> `ws_event_allowed` against the LIVE
+    # scope, so a declaration revoked mid-connection stops the frames even though
+    # this connect-time reading already started the driver.
+    #
+    # refresh_session_health is TTL-gated and single-flighted, so every declaring
+    # socket together still costs at most one computation per interval; it spends
+    # no credentials and reads no provider, which is why this is not owner-only
+    # like the check driver.
+    async def _refresh_health_loop() -> None:
+        # Function-local import: ws.py is imported by handlers/side.py (via the
+        # handlers package), so importing handlers.sessions at module scope closes
+        # a ws -> handlers.sessions -> handlers/__init__ -> handlers.side -> ws
+        # cycle. The cadence is the handler's OWN cache TTL rather than a second
+        # constant, so the driver cannot drift out of step with the gate it
+        # depends on for single-flighting.
+        from kiro_crew.dashboard.handlers.sessions import (
+            _HEALTH_REFRESH_SECS,
+            refresh_session_health,
+        )
+
+        while not ws.closed and not shutdown_event.is_set():
+            # Guard the BODY, not the loop: one transient failure must log and
+            # keep the driver alive rather than silently reverting to the
+            # signal-only-on-poll behaviour this loop exists to fix.
+            #
+            # Refresh FIRST, then sleep. The first computation in a process is
+            # the silent baseline, so a driver that slept before its first tick
+            # would let a verdict that moved during that sleep BECOME the
+            # baseline and never signal it; computing at connect time pins the
+            # baseline to what the subscriber sees when it connects. TTL-gated,
+            # so a burst of connects still costs one computation. The sleep sits
+            # OUTSIDE the guard so a refresh that keeps failing waits out the
+            # interval like a successful one instead of spinning.
+            try:
+                await refresh_session_health(state)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("session health refresh tick failed; continuing", exc_info=True)
+            await asyncio.sleep(_HEALTH_REFRESH_SECS)
+
+    # Function-local import for the same boot-path reason the loop above imports
+    # its handler seam locally: `session_health` is not otherwise on ws.py's
+    # import graph, and ws.py is imported while the gateway is starting.
+    from kiro_crew.dashboard.session_health import SESSION_HEALTH_EVENT
+
+    _run_health_driver = global_event_declared(SESSION_HEALTH_EVENT, allowed_events)
+    health_task = asyncio.create_task(_refresh_health_loop()) if _run_health_driver else None
     # The resume prefetch this socket's most recent slot_focused frame armed.
     # Tracked per connection so a focus change (or blur/disconnect) cancels
     # only this socket's speculation, never another window's.
@@ -755,7 +1364,7 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                         # this replays the whole ring, so a scope revoked (or an
                         # app disabled) after connect must not be able to pull
                         # the buffered history. Mirrors the per-send re-check in
-                        # handlers/updates._safe_ws_send.
+                        # handlers/updates_streams._safe_ws_send.
                         _live = effective_allowed_events(ws_app, allowed_events)
                         if not ws.get("_is_dashboard_user", False) and not (
                             "log" in _live or "log:all" in _live
@@ -772,11 +1381,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     exc_info=True,
                                 )
                             continue
-                        if not ws.get("_is_dashboard_user", False):
-                            # Mirror the deny branch above: the grant is a
-                            # permission decision too, and only the deny side
-                            # left an SEL record before this.
-                            _audit_grant_quietly(ws_app, "subscribe_logs")
+                        # Mirror the deny branch above: the grant is a
+                        # permission decision too, and only the deny side left
+                        # an SEL record before this. Not gated on the socket
+                        # kind: the dashboard user is admitted to the ring
+                        # replay on the same grounds, and skipping the record
+                        # for that socket left the privileged log history the
+                        # one hand-over the trail never showed.
+                        _audit_grant_quietly(_grant_auditee(ws, ws_app), "subscribe_logs")
                         state.subscribe_logs(ws)
                         # Replay log ring buffer
                         for entry in list(_log_ring):
@@ -897,11 +1509,13 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                                 "child_session": getattr(a, "conversation_key", "")
                                                 or f"subagent:{a.id}",
                                                 "elapsed": a.elapsed,
+                                                "credits": a.credits,
                                                 "error": _r(a.error) if a.error else None,
                                                 "stopped": a.user_stopped,
                                                 "outcome": a.outcome,
                                                 "task": _r(a.task),
                                                 "agent": _r(a.agent),
+                                                "label": _r(getattr(a, "label", "") or ""),
                                                 "model": a.resolved_model,
                                                 "requested_model": _r(a.requested_model),
                                             },
@@ -909,6 +1523,188 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                     )
                                 except Exception:
                                     pass
+                        # Durable rebuild source. Every frame above comes from
+                        # gateway memory, so a replacement process has none to
+                        # replay and the tab stays empty until something new
+                        # spawns. The CREW LOG answers for the runs this process
+                        # never tracked: it is the record, so a card's outcome,
+                        # duration and cost are a fold of it rather than a second
+                        # store. Ids already collected are excluded, so a live
+                        # frame is never displaced by a folded one, and the folded
+                        # frames join THIS list rather than a parallel send: the
+                        # owner check, the per-socket scope gate and the batch
+                        # packaging below then apply to them on the same terms.
+                        try:
+                            _seen = {
+                                str(_f["data"]["id"])
+                                for _f in _replay
+                                if isinstance(_f.get("data"), dict) and _f["data"].get("id")
+                            }
+
+                            # Slot ownership is read on the LOOP, twice, and never
+                            # from the worker thread. Once here as a snapshot, so
+                            # the row cap is sized over the records this socket may
+                            # actually see; then again after the thread returns,
+                            # which is the authoritative check. A slot's owner can
+                            # flip while the fold runs -- keys are caller-supplied
+                            # and not app-namespaced, so another app can reclaim
+                            # one -- and a decision taken off-loop would be read
+                            # from state this socket does not describe.
+                            # Ownership and visibility are two INDEPENDENT live
+                            # bounds, and both belong before the cap: a record
+                            # this socket may not see, or whose run another app
+                            # owns, would otherwise spend a slot its own visible
+                            # runs need, and the cut count would be computed over
+                            # records that were never this socket's to receive.
+                            # Taken together on the loop, at one instant.
+                            _owner_now, _visible_now = persisted_precap_readings(
+                                state,
+                                ws_app,
+                                ws.get("_allowed_events", frozenset()),
+                                dashboard_user=bool(ws.get("_is_dashboard_user", False)),
+                            )
+
+                            # Only the NAMES are taken here. Resolving each one to
+                            # its units reads the store -- a root listing, a stat,
+                            # and on a cold cache a header read per unit -- so it
+                            # belongs in the worker below with the fold, not on the
+                            # loop that is also carrying chat and heartbeats.
+                            _slot_names = list(getattr(state, "_slots", {}))
+
+                            def _admit_folded(_rec: dict) -> bool:
+                                """Both pre-cap bounds, sizing the cap.
+
+                                Withholding is itself the permission decision, so
+                                it audits under the reason it had. The records
+                                that survive are decided again on the loop, and
+                                the two sets are disjoint, so nothing is audited
+                                twice.
+                                """
+                                _reason = persisted_precap_denial_reason(
+                                    _owner_now,
+                                    _visible_now,
+                                    _replay_record_slot(_rec),
+                                    _rec,
+                                )
+                                if _reason:
+                                    _audit_deny(ws_app or "<dashboard>", "subagent_done", _reason)
+                                    return False
+                                return True
+
+                            if crew_log_enabled():
+
+                                def _fold_durable() -> tuple[list[dict], int]:
+                                    """Resolve, correct, then fold -- all off the loop.
+
+                                    A slot's units come from the store's own
+                                    slot-naming headers, NOT from its session key: a
+                                    unit is the ACP session id the log was opened
+                                    under, a slot owns one id at a time, and a
+                                    finished child can sit in any unit the slot has
+                                    run under.
+                                    """
+                                    _pairs = crew_log_panel_units(_slot_names)
+                                    _already = backfill_legacy_panel_dismissals(_pairs)
+                                    return read_fold_subagent_records(
+                                        _pairs,
+                                        keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+                                        max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+                                        exclude_ids=set(_seen) | _already,
+                                        admit=_admit_folded,
+                                    )
+
+                                _folded, _overflow = await asyncio.to_thread(_fold_durable)
+                                # The fold reads every row of every unit it was
+                                # given, so its overflow is the exact count past
+                                # the cap and never a floor.
+                                _saturated = False
+                            else:
+                                # An install that switched the record off has no
+                                # fold to read, and the rebuild is not what it opted
+                                # out of: the run folders still describe the runs
+                                # this process never tracked, on the same bounds and
+                                # through the same gates. Reading them here is what
+                                # keeps the opt-out costing the panel nothing.
+                                _records = await asyncio.to_thread(
+                                    read_panel_records,
+                                    keep=PERSISTED_SUBAGENT_REPLAY_KEEP,
+                                    max_age_secs=PERSISTED_SUBAGENT_REPLAY_MAX_AGE_SECS,
+                                    exclude_ids=_seen,
+                                    admit=_admit_folded,
+                                )
+                                _folded, _overflow = _records.records, _records.overflow
+                                # The folder scan has its OWN candidate window, and
+                                # a window that filled means admissible runs past it
+                                # were never inspected. Carried because the count
+                                # cannot describe them: a window full of records this
+                                # socket then rejected reports an overflow of zero
+                                # while still having left older eligible runs unseen.
+                                _saturated = _records.overflow_is_lower_bound
+                        except Exception:
+                            logger.debug("Folded subagent replay failed", exc_info=True)
+                            _folded, _overflow, _saturated = [], 0, False
+                        if _overflow or _saturated:
+                            # Said out loud once per rebuild, to the operator
+                            # rather than the client: a cut tail otherwise reads
+                            # as a population that never held those runs. The
+                            # WARNING carries the count and is the whole report:
+                            # a truncation refuses nobody, so it is not a
+                            # permission decision and stays out of the SEL deny
+                            # stream, where an operator has to be able to see the
+                            # ownership refusals. No client reads a count it
+                            # cannot act on, so it stays off the wire too.
+                            # A saturated window reports even at a count of zero,
+                            # because that is the case where the count itself
+                            # cannot see what was left out.
+                            logger.warning(
+                                "subagent replay truncated: %s%d eligible run(s) "
+                                "past the %d cap%s",
+                                "at least " if _saturated else "",
+                                _overflow,
+                                PERSISTED_SUBAGENT_REPLAY_KEEP,
+                                (
+                                    " (scan window saturated, older admissible runs "
+                                    "may be uninspected)"
+                                    if _saturated
+                                    else ""
+                                ),
+                            )
+                        for _rec in _folded:
+                            try:
+                                # The authoritative gate, on the loop, against
+                                # state as it is NOW rather than as the snapshot
+                                # found it. A record the snapshot admitted and
+                                # this rejects had its slot reclaimed mid-scan.
+                                _slot = _replay_record_slot(_rec)
+                                _why = persisted_replay_denial_reason(state, _slot, _rec)
+                                if _why:
+                                    _audit_deny(ws_app or "<dashboard>", "subagent_done", _why)
+                                    continue
+                                # The grant leaves a record too, at the point the
+                                # decision is made and under the same identity its
+                                # refusals use. This replay writes to the socket
+                                # directly, so ``ws_event_allowed`` never sees the
+                                # frame, and a dashboard user short-circuits
+                                # ``_ws_client_allowed`` unconditionally -- the two
+                                # places a grant would otherwise be recorded. Left
+                                # out, the deny reasons above are the only trace the
+                                # check ran at all, so an operator cannot tell a
+                                # rebuild that delivered a run from one that never
+                                # considered it.
+                                #
+                                # Unconditional rather than dashboard-user only,
+                                # because this records THIS check's decision, not
+                                # the per-slot scope gate's below: the two are
+                                # different questions and an app socket legitimately
+                                # produces one record for each. ``api_spawn_list``
+                                # already records its grant unconditionally for this
+                                # same ownership decision, and a surface that
+                                # recorded it on one reader and not the other would
+                                # make the trail depend on which reader asked.
+                                _audit_grant_quietly(ws_app or "<dashboard>", "subagent_done")
+                                _replay.append(build_persisted_subagent_frame(_rec, redact=_r))
+                            except Exception:
+                                pass
                         # Per-slot scope gate on the reconnect replay. The
                         # broadcast chokepoint covers live events, but this
                         # replay writes to the socket directly, so it must
@@ -940,7 +1736,10 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                                 # and cost the app its whole replay, so keep
                                 # this send and the per-item filter together.
                                 await ws.send_json(
-                                    {"type": "subagent_snapshot_batch", "data": {"items": _replay}}
+                                    {
+                                        "type": "subagent_snapshot_batch",
+                                        "data": {"items": _replay},
+                                    }
                                 )
                             else:
                                 for _frame in _replay:
@@ -964,6 +1763,16 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                         _focus_task = _handle_slot_focused(
                             state, data.get("slot"), _focus_task, owner=owner_request
                         )
+                        if owner_request:
+                            # The warm brief reads the registry's PREVIOUS row, so
+                            # it must run before retention applies this frame.
+                            handle_focus_frame(
+                                state,
+                                id(ws),
+                                data.get("slot"),
+                                announce=data.get("announce") is True,
+                            )
+                            note_foreground(state, id(ws), data.get("slot"))
                     elif msg_type == "slot_read":
                         _relayed = _handle_slot_read(
                             state,
@@ -1005,10 +1814,33 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         status_task.cancel()
         if check_task is not None:
             check_task.cancel()
+        if health_task is not None:
+            health_task.cancel()
         # A prefetch still debouncing for a closed dashboard serves nobody.
         if _focus_task is not None and not _focus_task.done():
             _focus_task.cancel()
+        note_view_closed(state, id(ws))
+        note_foreground(state, id(ws), None)
         state.unsubscribe_logs(ws)
         state.unsubscribe_subagents(ws)
-        state.unregister_ws(ws)
     return ws
+
+
+async def api_ws(request: web.Request) -> web.WebSocketResponse:
+    """GET /api/ws: serve the socket, and unregister it on every exit.
+
+    ``_serve_ws`` registers the socket before it sends the connect-time frames and
+    hands it back through *registered*. Those frames are awaited before the
+    handler's own ``try``/``finally``, so the release lives here, around the whole
+    handler: it runs on a clean close, on an exception, on the ``CancelledError`` a
+    cancelled handler raises at any of its awaits, and on the ``GeneratorExit``
+    that closes a suspended one.
+    """
+    registered: list[web.WebSocketResponse] = []
+    try:
+        return await _serve_ws(request, registered)
+    finally:
+        if registered:
+            state: DashboardState = request.app["state"]
+            for ws in registered:
+                state.unregister_ws(ws)

@@ -3,14 +3,14 @@
 What `platform.os` IS, for a builtin, is a user-facing CLAIM: the sole non-test
 consumer of a builtin's value is `website/src/pages/AppDetailPage.tsx`, which
 renders it on the App Store detail page. What it is NOT is an enable gate.
-`apps/routes.py` reads it once, through `_client_install_manifest()`, which
+`apps/routes_enable.py` reads it once, through `_client_install_manifest()`, which
 returns None unless `platform.installMode == "client"` — and no builtin sets
 that. `handle_enable_app`'s own docstring says it outright: "nothing else on the
 enable path consults that field". A builtin whose block is absent is therefore
 enableable on every platform the gateway runs on, Windows included.
 
 That is why the invariant pinned here is about HONESTY, not access. The default is
-`["macos", "linux"]` (`apps/manifest.py`), so an app that omits the block
+`["macos", "linux"]` (`apps/manifest_sections.py`), so an app that omits the block
 silently publishes "does not run on Windows" — indistinguishable, to a reader,
 from a deliberate statement. Twenty-two of twenty-four builtins were publishing
 exactly that, and none of them meant it.

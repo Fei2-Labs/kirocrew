@@ -60,7 +60,9 @@ function renderActions(opts: {
   rows?: ChatMessage[]
   /** Rows QueueStack would draw. Defaults to every row (all interactive). */
   visible?: ChatMessage[]
-  restoreDraft?: (text: string, files: string[]) => void
+  restoreDraft?: (text: string, files: string[], aliases?: Record<string, string[]>) => void
+  stagedFiles?: () => readonly string[]
+  project?: () => string | undefined
 }) {
   const rows = opts.rows ?? [queued('q1', 'run the tests'), queued('q2', 'then deploy')]
   const slot = opts.slot === undefined ? 'chat-1' : opts.slot
@@ -73,6 +75,8 @@ function renderActions(opts: {
       allQueued: queue,
       visibleQueued: opts.visible ?? queue,
       restoreDraft: opts.restoreDraft,
+      stagedFiles: opts.stagedFiles,
+      project: opts.project,
     })
     return null
   }
@@ -104,7 +108,7 @@ describe('useQueuedMessageActions — cancel', () => {
     const { get, store } = renderActions({ restoreDraft })
     act(() => { get().onCancel('q1') })
     // Plain text round-trips the parser unchanged, with nothing to re-stage.
-    expect(restoreDraft).toHaveBeenCalledWith('run the tests', [])
+    expect(restoreDraft).toHaveBeenCalledWith('run the tests', [], undefined)
     expect(apiMocks.cancelQueuedMessage).toHaveBeenCalledWith('chat-1', 'q1')
     // Optimistic: the card is gone without waiting for the WS echo.
     expect(queueIdsIn(store)).toEqual(['q2'])
@@ -122,9 +126,56 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'summarize this', files: [spaced], sent })
     const { get } = renderActions({ rows, restoreDraft })
     act(() => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced])
+    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined)
     // Consumed: a record restores exactly once.
     expect(queuedSendStash.has('q1')).toBe(false)
+  })
+
+  it('without a stash, the row\'s own meta.quote is restored as the quote and its block comes off the text', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't1' }
+    const sent = '> the quoted reply\n> — quoting an earlier message from the assistant\n\nwhy?'
+    const restoreDraft = vi.fn()
+    const row = queued('q1', sent)
+    const rows = [{ ...row, meta: { ...(row.meta ?? {}), quote } }]
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote)
+  })
+
+  it('a row whose text was edited past its quote block restages no quote from the stale record', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't1' }
+    const restoreDraft = vi.fn()
+    const row = queued('q1', 'why?')
+    const rows = [{ ...row, meta: { ...(row.meta ?? {}), quote } }]
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined)
+  })
+
+  it('a stash hit hands the consumed whole-message quote back, so the host restages the card', () => {
+    const quote = { role: 'assistant' as const, text: 'the quoted reply', ts: 't1' }
+    const sent = '> the quoted reply\n> — quoting an earlier message from the assistant\n\nwhy?'
+    const restoreDraft = vi.fn()
+    const rows = [queued('q1', sent)]
+    queuedSendStash.set('q1', { raw: 'why?', files: [], sent, quote })
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('why?', [], undefined, quote)
+  })
+
+  it('a stash hit hands the alias map back so restored mentions stay reconciled (fork GPT review)', () => {
+    // Restoring text + files WITHOUT the recorded aliases re-created the
+    // pre-fix stuck chip: the restored mention was invisible to the
+    // reconciliation, so hand-deleting it left a stale chip the next send
+    // silently re-attached.
+    const sent = 'check\n[attached_file 1] /repo/src/main.ts'
+    const aliases = { '/repo/src/main.ts': ['@src/main.ts'] }
+    const restoreDraft = vi.fn()
+    const rows = [queued('q1', sent)]
+    queuedSendStash.set('q1', { raw: 'check @src/main.ts', files: ['/repo/src/main.ts'], sent, aliases })
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('check @src/main.ts', ['/repo/src/main.ts'], aliases)
   })
 
   it('an entry edited after send fails the `sent` guard and falls to the parser', () => {
@@ -135,7 +186,7 @@ describe('useQueuedMessageActions — cancel', () => {
     queuedSendStash.set('q1', { raw: 'summarize this', files: ['/tmp/a.pdf'], sent: 'summarize this\n[attached_file 1] /tmp/a.pdf' })
     const { get } = renderActions({ rows, restoreDraft })
     act(() => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('actually, deploy instead', [])
+    expect(restoreDraft).toHaveBeenCalledWith('actually, deploy instead', [], undefined)
   })
 
   it('a foreign card (no stash record) decomposes producer markers via the parser', () => {
@@ -145,7 +196,97 @@ describe('useQueuedMessageActions — cancel', () => {
     const rows = [queued('q1', 'summarize the report\n[attached_file 1] /tmp/report.docx')]
     const { get } = renderActions({ rows, restoreDraft })
     act(() => { get().onCancel('q1') })
-    expect(restoreDraft).toHaveBeenCalledWith('summarize the report', ['/tmp/report.docx'])
+    expect(restoreDraft).toHaveBeenCalledWith('summarize the report', ['/tmp/report.docx'], undefined)
+  })
+
+  it('a foreign card carrying the entry\'s attachment list restores a spaced path whole', () => {
+    // After a reload (or on another tab) there is no stash, but the row's
+    // `meta.files` is the server's echo of the entry's own list — so the
+    // parser claims the own-line marker by exact text, spaces included, and
+    // the chip comes back instead of a truncated `/Users/me/Desktop/My` or
+    // the marker sitting in the composer verbatim.
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `summarize this\n[attached_file 1] ${spaced}`
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: [spaced] } } as ChatMessage]
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('summarize this', [spaced], undefined)
+  })
+
+  it('the same foreign card WITHOUT the list keeps the marker verbatim (legacy entry)', () => {
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `summarize this\n[attached_file 1] ${spaced}`
+    const restoreDraft = vi.fn()
+    const { get } = renderActions({ rows: [queued('q1', sent)], restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith(sent, [], undefined)
+  })
+
+  it('a foreign card with an inline mention restores the mention, the chip and its alias (#14617)', () => {
+    // After a reload there is no stash. The row's list proves the inline
+    // marker's path, so the composer gets a readable mention instead of raw
+    // wire text, the file re-stages, and the alias rides along so the chip
+    // and the mention stay reconciled the way a picked file's do.
+    const sent = 'check [attached_file 1] /repo/a.txt\u200a, please'
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: ['/repo/a.txt'] } } as ChatMessage]
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('check @a.txt, please', ['/repo/a.txt'], { '/repo/a.txt': ['@a.txt'] })
+  })
+
+  it('spells a restored mention past the files the host composer already stages', () => {
+    // The restore merges into the host composer, so the host's staged files
+    // count when the parser picks a suffix: `@a.txt` would collide with the
+    // staged `/repo/x/a.txt` on the next send.
+    const sent = 'against [attached_file 1] /repo/y/a.txt'
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: ['/repo/y/a.txt'] } } as ChatMessage]
+    const { get } = renderActions({ rows, restoreDraft, stagedFiles: () => ['/repo/x/a.txt'] })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('against @y/a.txt', ['/repo/y/a.txt'], { '/repo/y/a.txt': ['@y/a.txt'] })
+  })
+
+  it('spells a restored mention of a project file relative to the host project', () => {
+    // The host composer revives a chip on undo only for the project-relative
+    // spelling, so the hook reads the host's project at cancel time.
+    const sent = 'check [attached_file 1] /repo/main/src/a.ts'
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', sent), meta: { queueId: 'q1', files: ['/repo/main/src/a.ts'] } } as ChatMessage]
+    const { get } = renderActions({ rows, restoreDraft, project: () => '/repo/main' })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('check @src/a.ts', ['/repo/main/src/a.ts'], { '/repo/main/src/a.ts': ['@src/a.ts'] })
+  })
+
+  it('an entry edited to drop its first attachment restores the renumbered survivor from the replaced list', () => {
+    // Two attachments; the edit removed marker 1, so the server renumbered
+    // the survivor to 1 and pruned the list to match, and the `queue_edit`
+    // frame replaced the row's list. The stash misses on `sent`, and the
+    // parser's exact-line claim must be made against the CURRENT list --
+    // the pre-edit list would index nothing and drop the chip.
+    const other = '/tmp/other.txt'
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `[attached_file 1] ${other}\n[attached_file 2] ${spaced}`
+    const edited = `[attached_file 1] ${spaced}`
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', edited), meta: { queueId: 'q1', files: [spaced] } } as ChatMessage]
+    queuedSendStash.set('q1', { raw: '', files: [other, spaced], sent })
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith('', [spaced], undefined)
+  })
+
+  it('the stash still wins over the row list — it holds the typed text itself', () => {
+    const spaced = '/Users/me/Desktop/My Report.pdf'
+    const sent = `see @My Report.pdf please`
+    const wire = `see [attached_file 1] ${spaced} please`
+    const restoreDraft = vi.fn()
+    const rows = [{ ...queued('q1', wire), meta: { queueId: 'q1', files: [spaced] } } as ChatMessage]
+    queuedSendStash.set('q1', { raw: sent, files: [spaced], sent: wire })
+    const { get } = renderActions({ rows, restoreDraft })
+    act(() => { get().onCancel('q1') })
+    expect(restoreDraft).toHaveBeenCalledWith(sent, [spaced], undefined)
   })
 
   it('restores nothing when the host supplies no composer sink', () => {

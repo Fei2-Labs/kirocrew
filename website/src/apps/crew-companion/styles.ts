@@ -56,8 +56,12 @@ export const CC_CSS = `
 .cc-rem-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .cc-rem-tag { color:var(--muted); font-size:12px; margin-left:auto; }
 .cc-rem-done { opacity:.55; }
+.cc-rem-edit { flex:1; min-width:0; }
+.cc-rem-edit .cc-add-input { width:100%; }
+/* Narrow screens: the text takes its own line so the time, tag and actions cannot squeeze it to nothing. */
+@media (max-width: 480px) { .cc-rem-row { flex-wrap:wrap; } .cc-rem-text, .cc-rem-edit { order:1; flex-basis:100%; } }
 .cc-icon-btn { font-size:12px; background:transparent; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:2px 8px; cursor:pointer; }
-.cc-icon-btn.is-remove { border:none; padding:2px 7px; }
+.cc-icon-btn.is-remove, .cc-icon-btn.cc-edit { border:none; padding:2px 7px; }
 .cc-icon-btn:hover { border-color:var(--accent); }
 
 /* Memories */

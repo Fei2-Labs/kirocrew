@@ -5,7 +5,7 @@ Ported from Nous Research's Hermes Agent ``gateway/platforms/weixin.py``
 imported lazily inside :meth:`WeixinClient.connect` so a missing extra never
 breaks boot.
 
-This module owns ONLY protocol I/O + credential persistence + the small
+This module owns ONLY protocol I/O + the small
 context-token / typing-ticket caches. Turn handling, authorization, rendering
 and chunking live in the sibling transport / dispatch / renderer modules.
 """
@@ -25,8 +25,6 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
 import aiohttp
-
-from kiro_crew.atomic_write import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -135,51 +133,11 @@ def _atomic_json_write(path: Path, payload: Dict[str, Any]) -> None:
 # PUT) lands with outbound media rather than sitting here unreachable.
 
 
-# --- Credential + ephemeral state persistence ---------------------------------
+# --- Ephemeral state persistence ----------------------------------------------
 def _account_dir(home: str) -> Path:
     path = Path(home) / "weixin" / "accounts"
     path.mkdir(parents=True, exist_ok=True)
     return path
-
-
-def save_weixin_account(home: str, *, account_id: str, token: str, base_url: str, user_id: str = "") -> None:
-    """Persist account credentials owner-only.
-
-    The file holds the bot credential, so ``atomic_write(restrict_to_owner=True)``
-    applies :func:`platform_compat.restrict_to_owner` to the temp file BEFORE any
-    content byte reaches it — a bare ``chmod(0o600)`` is a no-op against Windows
-    ACLs, and locking down only after the write left the token readable under the
-    directory's inherited DACL for the whole write window.
-    ``restrict_on_error="warn"`` keeps this site's existing policy: a lockdown
-    failure must not cost the credential write, but it must be visible. That
-    policy covers the lockdown only — the linked-parent refusal implied by
-    ``restrict_to_owner=True`` raises unconditionally, which is the right
-    behavior for a credential writer: a pre-planted link under
-    ``<home>/weixin/accounts`` (a directory this code creates) is hostile.
-    """
-    path = _account_dir(home) / f"{account_id}.json"
-    payload = {
-        "token": token,
-        "base_url": base_url,
-        "user_id": user_id,
-        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    atomic_write(
-        path,
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        restrict_to_owner=True,
-        restrict_on_error="warn",
-    )
-
-
-def load_weixin_account(home: str, account_id: str) -> Optional[Dict[str, Any]]:
-    path = _account_dir(home) / f"{account_id}.json"
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 class ContextTokenStore:
@@ -289,14 +247,26 @@ class WeixinClient:
         self.account_id = account_id
         self._session: Any = None  # aiohttp.ClientSession, created in connect()
         self._handler_tasks: set[asyncio.Task[Any]] = set()
+        # The transport's long-poll task. This client is the gateway's channel
+        # handle and the only thing a restart or shutdown closes, so close()
+        # must stop the poll too, or it outlives the session it polls.
+        self._poll_task: asyncio.Task[Any] | None = None
 
     async def connect(self) -> None:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
     async def close(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
+        task, self._poll_task = self._poll_task, None
+        try:
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
+                # Shielded: a caller's bound on close() must not cancel the poll a
+                # second time while its inline turn is still releasing the session.
+                await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        finally:
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
 
     # -- core request helpers --------------------------------------------------
     async def _post(self, endpoint: str, payload: Dict[str, Any], *, timeout_ms: int) -> Dict[str, Any]:

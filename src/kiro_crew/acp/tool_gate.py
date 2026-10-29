@@ -14,7 +14,6 @@ one.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,8 +21,7 @@ from typing import Any, Protocol
 from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.codex import Verdict
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_GOOSE, ACP_BACKEND_OPENCODE
-
-logger = logging.getLogger(__name__)
+from kiro_crew.agent_sdk.tool_gate import is_enforced
 
 
 class _SeededSettings(Protocol):
@@ -133,14 +131,12 @@ def routing_verdict(
         # structural ROUTED.
         #
         # goose 1.47+ defaults every session to mode ``auto`` (auto-approve).
-        # Kiro Crew has no such permission mode. The client pins
-        # ``session/set_mode`` to ``approve`` after session/new — this probe
-        # names that pin so doctor/GET do not claim a structural ask that
-        # the unpinned default would skip.
+        # The launch adapter seeds GOOSE_MODE=approve on the session environment,
+        # and the client verifies the resolved mode in the session response.
         if backend == ACP_BACKEND_GOOSE:
             return (
                 Verdict.ROUTED,
-                "the client pins goose session mode approve after session/new "
+                "the launch seeds GOOSE_MODE=approve and verifies the session response "
                 "(goose defaults to auto, which auto-approves tools)",
             )
         return (
@@ -192,8 +188,7 @@ def remediation_for(backend: str, work_dir: Path | str) -> str:
         )
     if descriptor.routing is acp_backends.Routing.UNVERIFIED:
         # There is no setting the operator can change to make this true, so do not
-        # invent one. The honest remedy is that the adapter has to be verified —
-        # and the alternative is the named opt-out, which `enforce` already names.
+        # invent one. The honest remedy is that the adapter has to be verified.
         return (
             f"{descriptor.label} has not been verified to route tool calls through "
             "Kiro Crew. Verifying an adapter means establishing that it either "
@@ -205,17 +200,8 @@ def remediation_for(backend: str, work_dir: Path | str) -> str:
 def enforce(
     backend: str,
     work_dir: Path | str,
-    *,
-    allow_ungated: bool,
-    session_key: str = "",
 ) -> None:
     """Refuse to start a session whose tool calls would bypass the gate.
-
-    ``allow_ungated`` is the single named opt-out
-    (``agent.acp_backend_allow_ungated_tools``). When it is on, the session starts
-    and every start logs which controls are not being enforced — a warning per
-    session rather than one at startup, because the exposure is per session and a
-    single boot line scrolls away.
 
     INDETERMINATE refuses alongside BYPASSED. A guarantee that lapses whenever a
     file is unreadable is not a guarantee, and the alternative — proceeding when
@@ -229,8 +215,6 @@ def enforce(
     enforce_runtime_routing(
         backend,
         reason,
-        allow_ungated=allow_ungated,
-        session_key=session_key,
         verdict=verdict,
         remedy=remediation_for(backend, work_dir),
     )
@@ -274,63 +258,24 @@ def enforce_runtime_routing(
     backend: str,
     reason: str,
     *,
-    allow_ungated: bool,
-    session_key: str = "",
     verdict: Verdict = Verdict.BYPASSED,
     remedy: str = "",
-) -> bool:
+) -> None:
     """Enforce a routing fact learned after the adapter process starts.
 
-    Returns False only for the named operator opt-out. Otherwise raises before
-    the first prompt can run.
+    Raises before the first prompt can run when routing is not established.
     """
+    if not is_enforced(backend):
+        return
     label = acp_backends.descriptor_for(backend).label
     unenforced = (
         "the bundled denied-command rules, the sensitive-path block and the governance ceiling"
     )
-    if allow_ungated:
-        logger.warning(
-            "%s tool calls may bypass Kiro Crew's PreToolUse gate (%s), so %s are "
-            "NOT consulted for them. Starting anyway because "
-            "agent.acp_backend_allow_ungated_tools is enabled.",
-            label,
-            reason,
-            unenforced,
-        )
-        _audit_ungated_start(backend, verdict, reason, session_key)
-        return False
     suffix = f" {remedy}" if remedy else ""
     raise ToolGateUnroutable(
         f"{label} tool calls would not reach Kiro Crew's security gate ({reason}), "
-        f"so {unenforced} would not be consulted for them.{suffix} "
-        "To start anyway, set agent.acp_backend_allow_ungated_tools to true."
+        f"so {unenforced} would not be consulted for them.{suffix}"
     )
-
-
-def _audit_ungated_start(backend: str, verdict: Verdict, reason: str, session_key: str) -> None:
-    """Record the ungated start in the security event log.
-
-    Uses ``log_governance_degraded`` because that is precisely what this is: a
-    chokepoint degrading to permit, with the operator's narrowing silently not
-    applied to the tool calls the backend self-approves. ``failed_closed`` stays
-    False — the session was permitted, not denied.
-
-    Best-effort: an audit-backend failure must not become the reason a session the
-    operator explicitly permitted cannot start. The warning above is emitted
-    unconditionally, so the event is never the only trace.
-    """
-    try:
-        from kiro_crew.sel import sel
-
-        sel().log_governance_degraded(
-            session_key=session_key,
-            chokepoint="acp_tool_gate",
-            scope=f"acp_backend:{backend}",
-            reason=f"{verdict.value}: {reason}",
-            failed_closed=False,
-        )
-    except Exception:  # pragma: no cover - audit must not break startup
-        logger.debug("Could not record ungated-start audit event", exc_info=True)
 
 
 __all__ = [

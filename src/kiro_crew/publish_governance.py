@@ -10,7 +10,7 @@ where it started) because there is more than one publish surface and they must
 share ONE decision, not each grow their own:
 
 * ``api_artifact_publish`` and its sharing/review siblings — the artifact
-  registry destinations (``dashboard/handlers/artifacts.py``).
+  registry destinations (``dashboard/handlers/artifacts_parts/``).
 * ``/api/deploy/deploy`` and the ``deploy-web-aws`` row of
   ``GET /api/publish-providers`` — the public-web deploy path, whose destination
   id is :data:`DEPLOY_WEB_PROVIDER_ID`.
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 #: Destination id of the core public-web deploy provider (S3 + CloudFront in the
 #: user's own AWS account).  Declared here so the provider registry
-#: (``apps/routes.py``), the deploy handler (``deploy/handlers.py``) and any
+#: (``apps/routes_listing.py``), the deploy handler (``deploy/handlers.py``) and any
 #: operator allowlist all name the same string.
 DEPLOY_WEB_PROVIDER_ID = "deploy-web-aws"
 
@@ -172,10 +172,11 @@ def publish_denied_reason(request: web.Request, provider_name: str) -> str | Non
     # import exception") is that a lower module never reaches ``platform`` at
     # module-LOAD time, only at call time — ``platform/defaults.py`` imports these
     # lower modules itself. This module is imported at module scope by
-    # ``deploy/handlers.py``, ``apps/routes.py`` and ``handlers/artifacts.py``, so a
-    # module-scope ``platform`` import here would put the whole platform tree on
-    # every gateway boot and invert that direction. ``sel`` and ``KiroCrewConfig``
-    # carry no such constraint and ARE imported at module scope above.
+    # ``deploy/handlers.py``, ``apps/routes.py`` and
+    # ``handlers/artifacts_parts/route_plumbing.py``, so a module-scope ``platform``
+    # import here would put the whole platform tree on every gateway boot and invert
+    # that direction. ``sel`` and ``KiroCrewConfig`` carry no such constraint and ARE
+    # imported at module scope above.
     from kiro_crew.platform.context import PlatformCompositionError
 
     session_key = request.headers.get("X-Session-Key") or ""

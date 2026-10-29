@@ -29,7 +29,8 @@ import {
 } from '../hooks/useTheme'
 import { safeSetItem } from '../utils/safeStorage'
 // Consent contract lives in ONE module so the token format can't drift between
-// the write/strict-read side (this layer) and the wire-flag reader (client.ts).
+// the write/strict-read side (this layer) and the wire-flag reader
+// (api/client/chat.ts).
 import { grantConsent, getStoredConsent, revokeConsent } from '../utils/themeConsent'
 // App-event → theme-audio bridge: real chat/notification events route to the
 // active theme's manifest sounds (message-received / notification triggers).
@@ -37,7 +38,7 @@ import { MC_THEME_SOUND_EVENT, type ThemeSoundDetail } from '../hooks/themeSound
 import { MC_NOTIFICATION_EVENT } from '../hooks/notificationEvent'
 import { useIsNarrowViewport } from '../hooks/useIsMobile'
 import { useReducedMotion } from '../hooks/useReducedMotion'
-import { OVERLAY_Z_MAX, useThemeDecorSlot } from '../lib/themeDecorLayer'
+import { OVERLAY_Z_MAX, useThemeDecorBehindSlot, useThemeDecorSlot } from '../lib/themeDecorLayer'
 import { useAppSelector } from '../store'
 
 import { i18nT } from '../i18n/t'
@@ -98,6 +99,7 @@ function normalizeOverlay(raw: unknown): ThemeOverlayDecl | null {
       position: 'fullscreen',
       zIndex: 40,
       pointerEvents: false,
+      layer: 'above',
       animation: 'continuous',
       trigger: 'continuous',
     }
@@ -117,7 +119,9 @@ function normalizeOverlay(raw: unknown): ThemeOverlayDecl | null {
   const trigger = typeof o.trigger === 'string' && OVERLAY_TRIGGER_RE.test(o.trigger)
     ? o.trigger
     : 'continuous'
-  return { id, position, zIndex, pointerEvents: o.pointerEvents === true, animation, trigger }
+  const layer = o.layer === 'behind' ? 'behind' : 'above'
+  // Content covers a behind overlay everywhere, so it is click-through even if a stale descriptor says otherwise.
+  return { id, position, zIndex, pointerEvents: layer === 'above' && o.pointerEvents === true, layer, animation, trigger }
 }
 
 /** Map a `position` enum value to a fixed-position CSS box. theme:resize may
@@ -183,6 +187,7 @@ export default function ThemeExperienceLayer() {
   // (onboarding, bootstrap), in which case they render inline at the root —
   // there is no chrome to sit under yet.
   const decorSlot = useThemeDecorSlot()
+  const behindSlot = useThemeDecorBehindSlot()
 
   const active = colorTheme.startsWith('custom-')
     ? customThemeDataMap.get(colorTheme.slice('custom-'.length))
@@ -244,9 +249,20 @@ export default function ThemeExperienceLayer() {
   // it without a re-read hack. A stored grant is honoured ONLY if it matches the
   // current consentToken — so a changed persona (new sha256) re-prompts, and
   // legacy '1' grants (which never equal the token) re-prompt once.
+  //
+  // Level-2 only. The render cache (themeRenderCache.ts) seeds a Level-1
+  // projection of the active pack before the server detail arrives: level is
+  // capped to 1 and personaInfo is stripped, so on that seed consentToken is
+  // the sentinel while the stored grant is the persona sha256. Consent is read,
+  // honoured and revoked only against the server-confirmed Level-2 detail, so a
+  // seed can neither validate a grant (GPT, head 6856a77997) nor revoke one
+  // (Opus, head 1d002b0c7b). When the real detail lands, isL2 flips true and
+  // consentToken becomes the real sha256 in the same commit, and this effect
+  // then compares the stored grant against that hash.
   const [consented, setConsented] = useState(false)
   useEffect(() => {
-    if (!slug) {
+    if (!slug || !isL2) {
+      // A Level-1 entry (incl. a render-cache seed) has no consent to read or revoke.
       setConsented(false)
       return
     }
@@ -257,13 +273,13 @@ export default function ThemeExperienceLayer() {
     // Revoke-on-mismatch hygiene: if a grant is stored but no longer matches the
     // current content fingerprint — persona re-installed with a new sha256, or a
     // legacy '1' token — DELETE it now, before the user answers the re-prompt, so
-    // the stale grant can't be transmitted on the wire (client.ts reads the raw
-    // token) in the window before they decide.
+    // the stale grant can't be transmitted on the wire (api/client/chat.ts reads
+    // the raw token) in the window before they decide.
     if (stored !== null && stored !== consentToken) {
       revokeConsent(slug)
     }
     setConsented(stored !== null && stored === consentToken)
-  }, [slug, consentToken])
+  }, [slug, isL2, consentToken])
   const featuresOn = anyExperience && (!needsConsent || consented)
 
   const reduced = useReducedMotion()
@@ -753,35 +769,34 @@ export default function ThemeExperienceLayer() {
 
   // Decorative overlays — manifest-driven placement/behaviour. mountedOverlays
   // is already [] under reduced-motion, so motion overlays stay suppressed.
-  // Built once here because they render in one of two places (see below).
-  const overlays = (
-    <>
-      {mountedOverlays.map((decl) => (
-        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
-        <iframe
-          key={decl.id}
-          data-theme-frame="1"
-          data-theme-pointer={decl.pointerEvents ? '1' : '0'}
-          title={i18nT('components.themeExperienceLayer.theme_overlay', { id: decl.id })}
-          src={overlayUrl(slug, decl.id)}
-          sandbox="allow-scripts"
-          onLoad={(e) => postThemeState((e.currentTarget as HTMLIFrameElement).contentWindow)}
-          style={{
-            position: 'fixed',
-            border: 'none',
-            background: 'transparent',
-            // See topbar note: opt out of the parent's dark color-scheme so a
-            // full-viewport transparent overlay (e.g. Bikini's `bubbles`) does
-            // not composite an opaque backdrop that hides the entire dashboard.
-            colorScheme: 'normal',
-            pointerEvents: decl.pointerEvents ? 'auto' : 'none',
-            zIndex: decl.zIndex,
-            ...overlayPlacement(decl.position),
-          }}
-        />
-      ))}
-    </>
+  // Built here because they render in one of two places per layer (see below).
+  const overlayFrame = (decl: ThemeOverlayDecl) => (
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
+    <iframe
+      key={decl.id}
+      data-theme-frame="1"
+      data-theme-pointer={decl.pointerEvents ? '1' : '0'}
+      data-theme-layer={decl.layer}
+      title={i18nT('components.themeExperienceLayer.theme_overlay', { id: decl.id })}
+      src={overlayUrl(slug, decl.id)}
+      sandbox="allow-scripts"
+      onLoad={(e) => postThemeState((e.currentTarget as HTMLIFrameElement).contentWindow)}
+      style={{
+        position: 'fixed',
+        border: 'none',
+        background: 'transparent',
+        // See topbar note: opt out of the parent's dark color-scheme so a
+        // full-viewport transparent overlay (e.g. Bikini's `bubbles`) does
+        // not composite an opaque backdrop that hides the entire dashboard.
+        colorScheme: 'normal',
+        pointerEvents: decl.pointerEvents ? 'auto' : 'none',
+        zIndex: decl.zIndex,
+        ...overlayPlacement(decl.position),
+      }}
+    />
   )
+  const overlays = <>{mountedOverlays.filter((d) => d.layer !== 'behind').map(overlayFrame)}</>
+  const behindOverlays = <>{mountedOverlays.filter((d) => d.layer === 'behind').map(overlayFrame)}</>
 
   return (
     <>
@@ -829,6 +844,8 @@ export default function ThemeExperienceLayer() {
       {/* Decorative overlays portal into the shell's decor slot so the header
           outranks them (#7377); inline at the root only while no shell exists. */}
       {decorSlot ? createPortal(overlays, decorSlot) : overlays}
+      {/* Without a shell (popout, embed) nothing sits on top to cover them, so they are skipped. */}
+      {behindSlot && createPortal(behindOverlays, behindSlot)}
 
       {/* Mute toggle — only when the active theme actually ships audio. */}
       {hasAudio && (

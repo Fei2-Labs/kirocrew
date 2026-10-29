@@ -11,6 +11,7 @@ vi.mock('../utils/errorReport', async importOriginal => {
 vi.mock('./AskAgentButton', () => ({
   default: ({ message }: { message?: string }) => <button type="button">zzq-ask|{message}</button>,
   askAgentHard: vi.fn(),
+  askAgentLabel: () => 'Ask the agent',
 }))
 
 const { askAgentHard } = await import('./AskAgentButton')
@@ -88,6 +89,16 @@ describe('ErrorBoundary', () => {
       <ErrorBoundary fallback={<div>zzq-custom</div>}><Boom shouldThrow /></ErrorBoundary>,
     )
     expect(screen.getByText('zzq-custom')).toBeInTheDocument()
+    expect(screen.queryByText('Something went wrong')).not.toBeInTheDocument()
+  })
+
+  it('a function fallback receives the caught error', () => {
+    // For a custom fallback that mounts AskAgentButton itself: the button keys
+    // its journal lookup on the error's message, which a static node cannot see.
+    render(
+      <ErrorBoundary fallback={error => <div>zzq-custom|{error.message}</div>}><Boom shouldThrow /></ErrorBoundary>,
+    )
+    expect(screen.getByText('zzq-custom|zzq-render-broke')).toBeInTheDocument()
     expect(screen.queryByText('Something went wrong')).not.toBeInTheDocument()
   })
 

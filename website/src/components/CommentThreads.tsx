@@ -19,10 +19,9 @@ import { api } from '../api/client'
 import MarkdownRenderer from './MarkdownRenderer'
 import type { PullRequestComment, PullRequestSource } from '../types'
 import { platformShortcut } from '../utils/platform'
-import { OWNER_SETTINGS_TARGET, pullRequestErrorDetails } from '../utils/pullRequestErrors'
-import { SettingsLink } from './SettingsLink'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
-import { sourceProviderCapabilities } from '../utils/sourceProviderMeta'
+import { sourceProviderCapabilities, sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { timeAgo } from '../utils/timeAgo'
 
 import { i18nT } from '../i18n/t'
@@ -147,14 +146,14 @@ function ThreadComment(
  *  submit would throw away what the user typed the moment the provider refused,
  *  and leave the error with nowhere to appear. */
 function ReplyBox({
-  onSubmit, pending, error, errorAction, label = 'Reply',
+  onSubmit, pending, error, label = 'Reply', submitPaused = false,
 }: {
   onSubmit: (body: string) => Promise<unknown>
   pending: boolean
   error: string | null
-  /** Recovery affordance rendered beside the error (e.g. a settings link). */
-  errorAction?: React.ReactNode
   label?: string
+  /** The draft stays editable, but nothing is sent while this is true. */
+  submitPaused?: boolean
 }) {
   const ime = useImeGuard()
   const [open, setOpen] = useState(false)
@@ -175,7 +174,7 @@ function ReplyBox({
   }
 
   const send = async () => {
-    if (!trimmed || pending) return
+    if (!trimmed || pending || submitPaused) return
     try {
       await onSubmit(trimmed)
     } catch {
@@ -213,10 +212,13 @@ function ReplyBox({
         <button
           type="button"
           onClick={() => { void send() }}
-          disabled={!trimmed || pending}
+          disabled={!trimmed || pending || submitPaused}
+          // While paused, Send shows the same spinner as a send in flight and
+          // reports busy, so the disabled button reads as waiting.
+          aria-busy={submitPaused || undefined}
           className="inline-flex items-center gap-1.5 rounded-md border border-accent bg-accent-subtle px-2.5 py-1 text-[12.5px] font-medium text-accent disabled:opacity-50 cursor-pointer disabled:cursor-default"
         >
-          {pending && (
+          {(pending || submitPaused) && (
             <Loader2 size={12} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
           )}
           {label}
@@ -232,7 +234,6 @@ function ReplyBox({
           <span className="inline-flex items-center gap-1 text-[12px]">
             {/* No hand-off: the reply/comment textarea draft above is unsaved. */}
             <ErrorNotice variant="inline" testId="comment-reply-error" message={error} />
-            {errorAction && <> {errorAction}</>}
           </span>
         )}
       </div>
@@ -240,18 +241,16 @@ function ReplyBox({
   )
 }
 
-/** The owner-not-configured recovery link, shared by every refusal surface here. */
-function OwnerSettingsLink() {
-  return (
-    <SettingsLink {...OWNER_SETTINGS_TARGET}>
-      {i18nT('components.pullRequestPanel.open_slack_settings')}
-    </SettingsLink>
-  )
-}
-
 export default function CommentThreads(
-  { src, onAddToChat }:
-  { src: PullRequestSource; onAddToChat?: (c: PullRequestComment) => void },
+  { src, onAddToChat, writesPaused = false }:
+  {
+    src: PullRequestSource
+    onAddToChat?: (c: PullRequestComment) => void
+    /** True while `src` is a stand-in for a payload still loading: every write
+     *  here targets `src.url`, so replies, comments and resolve wait for the
+     *  real payload. Open drafts stay mounted with their text. */
+    writesPaused?: boolean
+  },
 ) {
   const qc = useQueryClient()
   const threads = useMemo(() => groupThreads(src.comments), [src.comments])
@@ -295,8 +294,8 @@ export default function CommentThreads(
   // Which write affordances this provider's gateway plugin can actually serve.
   // Previously a single `src.provider === 'github'` boolean, which made every
   // non-GitHub provider read-only by construction — including one a downstream
-  // edition registers. The built-in flags reproduce that exactly (GitHub: both;
-  // GitLab: neither, hence the read-only notice below on a merge request).
+  // edition registers. Both built-in providers serve both; a registered provider
+  // that serves neither gets the read-only notice below.
   const capabilities = sourceProviderCapabilities(src.provider)
   const canResolve = capabilities.resolveThreads
   const canComment = capabilities.comment
@@ -354,20 +353,23 @@ export default function CommentThreads(
                 </span>
               )}
               {t.resolved && (
-                <span className="inline-flex items-center gap-1 text-[10.5px] px-1.5 py-0.5 rounded-full bg-ok-subtle text-ok">
+                <span className="inline-flex items-center gap-1 text-[10.5px] px-1.5 py-0.5 rounded-full bg-ok-subtle text-ok-text">
                   <Check size={10} aria-hidden="true" /> {i18nT('components.commentThreads.resolved')}
                 </span>
               )}
               {/* Resolve is only offered on real threads: standalone comments and
-                  review summaries have nothing to resolve. */}
-              {canResolve && t.threadId && (
+                  review summaries have nothing to resolve. A GitLab plain comment
+                  carries a discussion id (it can be replied to) but is published
+                  with `resolvable: false`, so that flag hides the control too. */}
+              {canResolve && t.threadId && t.root.resolvable !== false && (
                 <button
                   type="button"
                   onClick={() => setResolved.mutate({
                     threadId: t.threadId, resolved: !t.resolved,
                   })}
-                  disabled={setResolved.isPending
-                    && setResolved.variables?.threadId === t.threadId}
+                  disabled={writesPaused || (setResolved.isPending
+                    && setResolved.variables?.threadId === t.threadId)}
+                  aria-busy={writesPaused || undefined}
                   className="ml-auto inline-flex items-center gap-1 rounded-md bg-transparent px-1.5 py-0.5 text-[11.5px] text-muted hover:text-accent disabled:opacity-50 cursor-pointer disabled:cursor-default"
                 >
                   {t.resolved
@@ -392,7 +394,6 @@ export default function CommentThreads(
                         message={resolveErr.message
                           || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
                       />
-                      {resolveErr.ownerNotConfigured && <> <OwnerSettingsLink /></>}
                     </span>
                   )
                 })()}
@@ -406,6 +407,7 @@ export default function CommentThreads(
               {canResolve && t.threadId && (
                 <ReplyBox
                   onSubmit={(body) => reply.mutateAsync({ threadId: t.threadId, body })}
+                  submitPaused={writesPaused}
                   pending={reply.isPending
                     && reply.variables?.threadId === t.threadId}
                   // `|| null` collapses an empty derived message to null on
@@ -414,10 +416,6 @@ export default function CommentThreads(
                   error={reply.isError && reply.variables?.threadId === t.threadId
                     ? pullRequestErrorDetails(reply.error).message || null
                     : null}
-                  errorAction={reply.isError && reply.variables?.threadId === t.threadId
-                    && pullRequestErrorDetails(reply.error).ownerNotConfigured
-                    ? <OwnerSettingsLink />
-                    : undefined}
                 />
               )}
             </div>
@@ -429,13 +427,13 @@ export default function CommentThreads(
       {canComment && (
         <div className="border-t border-border pt-2.5">
           <ReplyBox
-            label={i18nT('components.commentThreads.comment_on_this_pull_request')}
+            label={sourceProviderMeta(src.provider).pullRequestWording
+              ? i18nT('components.commentThreads.comment_on_this_pull_request')
+              : i18nT('components.commentThreads.comment_on_this_merge_request')}
             onSubmit={(body) => comment.mutateAsync(body)}
+            submitPaused={writesPaused}
             pending={comment.isPending}
             error={comment.isError ? pullRequestErrorDetails(comment.error).message || null : null}
-            errorAction={comment.isError && pullRequestErrorDetails(comment.error).ownerNotConfigured
-              ? <OwnerSettingsLink />
-              : undefined}
           />
         </div>
       )}

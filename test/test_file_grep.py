@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import zipfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -32,6 +33,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 from pdf_test_helpers import flate_bomb_pdf, text_pdf
 
 from kiro_crew.dashboard.handlers import api_file_grep
@@ -70,8 +72,9 @@ def _make_app() -> web.Application:
     app.router.add_post("/api/file-grep", api_file_grep)
     state = MagicMock()
     state.file_indexes.get.return_value = None
+    state.owner_id = ""
     app["state"] = state
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture(autouse=True)
@@ -599,9 +602,15 @@ class TestDocumentPass:
         assert "bomb.pdf skipped: extractor memory" in caplog.text
 
     @pytest.mark.asyncio
-    async def test_a_pdf_the_parser_refuses_is_a_settled_answer(self, tmp_path):
+    async def test_a_pdf_the_parser_refuses_is_a_settled_answer(self, tmp_path, monkeypatch):
         """Not a PDF under a .pdf name: no hit, no skip, no partial flag -- the
         same shape as a workbook that is not a zip."""
+        # The refusal still costs an extractor child (an interpreter start), and
+        # the .docx beside it is opened only after that child answers. Under
+        # the default budget a slow runner spends the whole deadline on the
+        # spawn, reports the PDF as a timeout skip and never reaches spec.docx
+        # -- the budget under test is the parser's verdict, not spawn latency.
+        monkeypatch.setattr(f, "_GREP_TIME_BUDGET_SECS", 30.0)
         root = tmp_path / "mixed"
         root.mkdir()
         (root / "paper.pdf").write_bytes(b"%PDF-1.4\n\x00 the WIDGET plan\n")
@@ -898,7 +907,7 @@ class TestTrustedRipgrep:
     What belongs here is the DELEGATION -- that the chokepoint is consulted and
     that its refusal degrades to the python engine. Which binaries it clears is
     its own contract, tested against real security descriptors and real mode
-    bits in ``test_source_providers.py`` and ``test_windows_acl.py``; asserting
+    bits in ``test_source_providers_provider_cli.py`` and ``test_windows_acl.py``; asserting
     that here a second time is what produced a subset that disagreed with it.
     """
 
@@ -1599,6 +1608,24 @@ class TestHelpers:
         # and a slash-less `!.aws` matches at any depth under gitignore semantics.
         assert "!**/.aws" not in patterns
         assert "!.aws" not in patterns
+
+    def test_a_resolver_stall_routes_the_grep_to_the_python_engine(self, monkeypatch):
+        """The target list resolves the home and override roots through the resolver
+        child; when that cannot complete it raises the resolver's own stall class.
+        The exclusion builder must NOT swallow it into an empty list (ripgrep would
+        then read the credential stores before the per-hit filter sees them): the
+        stall propagates out of the argv build, ``_grep_rg`` catches it as the
+        ``RuntimeError`` it is, and the search takes the fail-closed python engine."""
+        from kiro_crew.security import PathResolutionStalled
+
+        def _stalled(exclude_leaves=()):
+            raise PathResolutionStalled("/home/u", "/home/u")
+
+        monkeypatch.setattr(f, "sandbox_credential_targets", _stalled)
+        with pytest.raises(PathResolutionStalled):
+            f._grep_sensitive_globs(os.path.expanduser("~"))
+        monkeypatch.setattr(f, "_grep_rg_executable", lambda: "/usr/bin/rg")
+        assert f._grep_rg(os.path.expanduser("~"), "needle", time.monotonic() + 5.0) is None
 
     def test_the_two_engines_agree_about_a_project_local_credential_name(self):
         """The parity claim stated over the pair rather than over one engine: no

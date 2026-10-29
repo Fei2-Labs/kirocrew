@@ -85,7 +85,6 @@ vi.mock('../pages/chat/SidePanel', () => ({
   CHAT_PANE_MIN_W: 320,
   sidePanelFillWidth: () => undefined,
 }))
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => {
   const AGENTS = { agents: [], defaultAgent: null }
@@ -101,7 +100,7 @@ vi.mock('../api/client', () => ({
   api: Object.fromEntries(
     ['sessions', 'chatSlotDetail', 'createChatSlot', 'deleteChatSlot', 'resumeChatSlot',
       'deleteSession', 'agentDetail', 'approveChatSlot', 'chatSlotAgent', 'chatSlotModel',
-      'chatSlotWorkspace', 'models', 'planAction', 'planFromChat', 'renameSlot',
+      'chatSlotWorkspace', 'models', 'planFromChat', 'renameSlot',
       'resolveApproval', 'screenshot', 'slackChannels', 'slackLink', 'spawnList',
       'stopChatSlot', 'uploadFiles', 'voiceSynthesize', 'workspaces', 'chatSlots',
       'notifications', 'status', 'generateTitle'].map(k => [k, vi.fn().mockResolvedValue(

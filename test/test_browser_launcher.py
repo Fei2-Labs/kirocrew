@@ -466,10 +466,39 @@ class TestOpenUrlArgv:
 
     def test_missing_cli_is_an_honest_error(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(launcher, "cli_path", lambda: None)
+        monkeypatch.setattr(launcher, "legacy_launcher_refused", lambda: False)
         fake, calls = _runs([])
         with patch.object(launcher, "_run_cli", fake):
             result = launcher.open_url(URL, "chat-1")
         assert result.ok is False and "not installed" in (result.error or "")
+        assert calls == []
+
+    def test_a_refused_legacy_launcher_explains_the_reinstall(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The open path reports the same migration explanation the view status
+        surface does when a user's own PATH launcher is present but refused."""
+        monkeypatch.setattr(launcher, "cli_path", lambda: None)
+        monkeypatch.setattr(launcher, "legacy_launcher_refused", lambda: True)
+        fake, calls = _runs([])
+        with patch.object(launcher, "_run_cli", fake):
+            result = launcher.open_url(URL, "chat-1")
+        assert result.ok is False
+        assert result.error == launcher.CLI_LEGACY_UNTRUSTED_REASON
+        assert calls == []
+
+    def test_nothing_installed_keeps_the_plain_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no launcher present at all (not a refusal), the open path keeps
+        the plain not-installed message, not the reinstall explanation."""
+        monkeypatch.setattr(launcher, "cli_path", lambda: None)
+        monkeypatch.setattr(launcher, "legacy_launcher_refused", lambda: False)
+        fake, calls = _runs([])
+        with patch.object(launcher, "_run_cli", fake):
+            result = launcher.open_url(URL, "chat-1")
+        assert result.ok is False
+        assert result.error == launcher.CLI_NOT_INSTALLED_REASON
         assert calls == []
 
     def test_windows_batch_wrapper_never_receives_the_url(
@@ -760,18 +789,17 @@ class TestReveal:
 
     @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets only")
     def test_sends_one_reveal_line_to_the_running_dashboard(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+        self, short_sock_dir: Path, request: pytest.FixtureRequest
     ):
-        # An AF_UNIX sun_path is capped at ~104 bytes. That cap is on the STRING
-        # handed to bind()/connect(), not on where the file lands, so the socket
-        # lives under tmp_path and both ends reach it through a RELATIVE path
-        # with the CWD pinned there: ``_dashboard_socket_path`` joins the root it
-        # is given without resolving it, so a relative root is a valid input.
-        # Nothing is written outside the sandbox (the earlier mkdtemp(dir="/tmp")
-        # left ``/tmp/pw-*`` on the operator's host on any cleanup miss).
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "dashboard").mkdir(parents=True)
-        sock_path = os.path.join("dashboard", "app.sock")
+        # An AF_UNIX sun_path is capped at ~104 bytes, and that cap is on the
+        # STRING handed to bind()/connect(). Production hands ``_reveal`` an
+        # ABSOLUTE root -- the gateway's socket root under the data home -- so
+        # the test does the same, from the suite's run-owned short root
+        # (``short_sock_dir``), rather than pinning the CWD and connecting to a
+        # cwd-relative ``./dashboard/app.sock`` that no production caller ever
+        # spells. Nothing is written outside the run's own roots.
+        (short_sock_dir / "dashboard").mkdir(parents=True)
+        sock_path = os.path.join(str(short_sock_dir), "dashboard", "app.sock")
         received: list[bytes] = []
         serve_error: list[BaseException] = []
         ready = threading.Event()
@@ -799,9 +827,12 @@ class TestReveal:
         # Joined unconditionally: a failed reveal must not leave the listener blocked in accept().
         request.addfinalizer(lambda: thread.join(6))
         assert ready.wait(5), f"listener never became ready: {serve_error}"
-        # The listener's endpoint landed under tmp_path, not under a host root.
-        assert (tmp_path / sock_path).is_socket()
-        assert REAL_REVEAL("panel-0a1b2c-1234abcd", {launcher.SOCKETS_ENV: "."}) is True
+        # The listener's endpoint landed under the run's short root, not a host root.
+        assert Path(sock_path).is_socket()
+        assert (
+            REAL_REVEAL("panel-0a1b2c-1234abcd", {launcher.SOCKETS_ENV: str(short_sock_dir)})
+            is True
+        )
         thread.join(5)
         assert json.loads(received[0].decode().strip()) == {"sessionName": "panel-0a1b2c-1234abcd"}
 

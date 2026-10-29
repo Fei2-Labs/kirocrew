@@ -73,7 +73,7 @@ const record = (turnId, tool, tier, p) => ({
 })
 
 const RISKY = record('tr-9d41c7', 'bash', 'risky', 0.88)
-const CAUTION = record('tr-2b07fa', 'fsWrite', 'caution', 0.64)
+const CAUTION = record('tr-2b07fa', 'fsWrite', 'caution', 0.86)
 
 const now = Math.floor(Date.now() / 1000)
 

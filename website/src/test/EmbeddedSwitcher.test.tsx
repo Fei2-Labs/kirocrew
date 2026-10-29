@@ -5,9 +5,11 @@ import { fileURLToPath } from 'node:url'
 import { screen, waitFor, act } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
+import { readIndexCss } from './indexCssSource'
 import InstanceTabBar from '../components/InstanceTabBar'
 import EmbeddedHostBridge from '../components/EmbeddedHostBridge'
 import type { HostModel } from '../store/instancesSlice'
+import { noteHostOrigin } from '../lib/hostRelay'
 
 // Embedded panes never hit the instances API; mock it to a no-op so the import
 // is inert and any accidental call is observable.
@@ -30,11 +32,17 @@ const model = (over: Partial<HostModel> = {}): HostModel => ({
   ...over,
 })
 
+// The hub that embeds this pane. The origin its model came from is the only
+// postMessage target a pane relay may use (see lib/hostRelay.ts).
+const HUB = 'http://127.0.0.1:7777'
+
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(isEmbeddedPane).mockReturnValue(true)
+  noteHostOrigin(HUB)
 })
 afterEach(() => {
+  noteHostOrigin(null)
   document.documentElement.classList.remove('embedded-mac-inset')
   document.documentElement.classList.remove('embedded-win-inset')
 })
@@ -56,14 +64,14 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     await userEvent.click(cloud)
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-switch-instance', id: 'cd-1' }),
-      '*',
+      HUB,
     )
 
     await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
     await userEvent.click(screen.getByRole('menuitemradio', { name: /Local/ }))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-switch-instance', id: null }),
-      '*',
+      HUB,
     )
   })
 
@@ -151,7 +159,7 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     await userEvent.click(await screen.findByTestId('crew-stable-order-toggle'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-stable-order', on: true }),
-      '*',
+      HUB,
     )
   })
 
@@ -195,8 +203,85 @@ describe('EmbeddedInstanceTabBar (option B)', () => {
     await userEvent.click(await screen.findByTestId('crew-pin-cd-1'))
     expect(post).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'mc-set-crew-pin', id: 'cd-1' }),
-      '*',
+      HUB,
     )
+  })
+})
+
+// #21822: every relay the embedded tab bar sends up goes ONLY to
+// the hub's exact origin. With no known hub origin nothing is sent at all.
+describe('EmbeddedInstanceTabBar relay targetOrigin', () => {
+  // Fire all three relays: switch, pin toggle, stable-order toggle.
+  const fireAll = async () => {
+    const store = createTestStore({
+      instances: { warm: {}, activeId: null, mru: [], unread: {}, host: model({ activeId: null }) },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    await userEvent.click(screen.getByRole('button', { name: /Switch crew/i }))
+    await userEvent.click(await screen.findByTestId('crew-pin-cd-1'))
+    await userEvent.click(await screen.findByTestId('crew-stable-order-toggle'))
+    await userEvent.click(screen.getByRole('menuitemradio', { name: /Cloud One/ }))
+  }
+
+  it('posts each of the three message types to the exact hub origin, never "*"', async () => {
+    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    await fireAll()
+    const types = post.mock.calls.map(c => (c[0] as { type: string }).type)
+    expect(types).toEqual(expect.arrayContaining(['mc-set-crew-pin', 'mc-set-stable-order', 'mc-switch-instance']))
+    for (const call of post.mock.calls) expect(call[1]).toBe(HUB)
+  })
+
+  it.each([
+    ['no hub origin known', null],
+    ['a model from a non-loopback framer', 'https://evil.example'],
+    ['a model from an opaque origin', 'null'],
+  ])('sends nothing with %s', async (_label, origin) => {
+    noteHostOrigin(origin)
+    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    await fireAll()
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  it('sends nothing when not embedded (no parent frame)', async () => {
+    vi.mocked(isEmbeddedPane).mockReturnValue(false)
+    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore({
+      instances: { warm: {}, activeId: null, mru: [], unread: {}, host: model({ activeId: null }) },
+    })
+    renderWithProviders(<InstanceTabBar variant="inline" />, { store })
+    // The top-level bar renders the local switcher; any interaction stays local.
+    const btn = screen.queryByRole('button', { name: /Switch crew/i })
+    if (btn) await userEvent.click(btn)
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['the hub', HUB, HUB],
+    ['a non-loopback framer', 'https://evil.example', null],
+  ])('through the bridge: relays go to the model sender only when it is %s', async (_label, origin, want) => {
+    noteHostOrigin(null)
+    const post = vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    renderWithProviders(<><EmbeddedHostBridge /><InstanceTabBar variant="inline" /></>, { store })
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', { source: window.parent, origin, data: { type: 'mc-host-model', ...model({ activeId: null }) } }),
+      )
+    })
+    await userEvent.click(await screen.findByRole('button', { name: /Switch crew/i }))
+    post.mockClear()
+    await userEvent.click(screen.getByRole('menuitemradio', { name: /Cloud One/ }))
+    if (want === null) expect(post).not.toHaveBeenCalled()
+    else expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'mc-switch-instance', id: 'cd-1' }), want)
+  })
+
+  it('InstanceTabBar.tsx and useInstanceShortcuts.ts hold no wildcard postMessage', () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    for (const rel of ['../components/InstanceTabBar.tsx', '../hooks/useInstanceShortcuts.ts']) {
+      const src = readFileSync(join(here, rel), 'utf8')
+      expect(src).not.toMatch(/postMessage\([^)]*,\s*['"]\*['"]\s*\)/)
+      expect(src).not.toMatch(/wildcard-postmessage/)
+    }
   })
 })
 
@@ -243,20 +328,78 @@ describe('EmbeddedHostBridge (option B relay)', () => {
   })
 
   it('keeps the embedded Windows reserves in lock-step with the local .win-electron rule (CSS pin)', () => {
-    // jsdom applies no stylesheet, so the widths are pinned against the
+    // jsdom applies no stylesheet, so the reserve is pinned against the
     // index.css source, the same way App.focusMode.test.tsx pins the local
-    // pair. 142 lives in four rules; the local two already have a drift check,
-    // and this is the drift check for the embedded two.
-    const css = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'index.css'), 'utf8')
-    const localHeader = css.match(/\.win-electron header\.topbar-glass\{[\s\S]*?padding-right:(\d+)px/)
-    const embeddedHeader = css.match(/\.embedded-win-inset header\.topbar-glass\{padding-right:(\d+)px\}/)
-    const embeddedReserve = css.match(/\.embedded-win-inset \.mc-focus-mode \.focus-caption-reserve\{padding-right:(\d+)px\}/)
-    expect(embeddedHeader).not.toBeNull()
-    expect(embeddedReserve).not.toBeNull()
-    // Same band the LOCAL header clears: the embedded header is the same
-    // surface rendered by a different document, so the two must not drift.
-    expect(embeddedHeader![1]).toBe(localHeader![1])
-    expect(embeddedReserve![1]).toBe(embeddedHeader![1])
+    // pair. The caption reserve is now zoom-aware: all four
+    // .win-electron/.embedded-win-inset rules reference the single
+    // --mc-win-caption-reserve custom property, so they cannot drift by
+    // construction. The main process sets that property inline on <html>
+    // (= :root) from its own zoom factor (142/zoom px); the static 142px
+    // default on :root covers the first paint and non-Electron contexts; the
+    // cross-origin embedded pane does not inherit the host var, so the bridge
+    // sets the relayed winCaptionReserve on the pane's own <html> and the
+    // :root default covers a host that relays none. This asserts both halves: the shared variable is used
+    // everywhere, and the 142px default lives on :root (NOT on .win-electron,
+    // which sits on the inner shell div and would shadow the inline <html>
+    // value for the header subtree). */
+    const css = readIndexCss()
+    const reserveRule = /padding-right:var\(--mc-win-caption-reserve\)/g
+    const rootDefault = css.match(/:root\{--mc-win-caption-reserve:142px\}/)
+    const localHeader = css.match(/\.win-electron header\.topbar-glass\{\s*padding-right:var\(--mc-win-caption-reserve\)/)
+    const embeddedHeader = css.match(/\.embedded-win-inset header\.topbar-glass\{padding-right:var\(--mc-win-caption-reserve\)\}/)
+    const embeddedReserve = css.match(/\.embedded-win-inset \.mc-focus-mode \.focus-caption-reserve\{padding-right:var\(--mc-win-caption-reserve\)\}/)
+    expect(rootDefault, 'the 142px default is on :root, not .win-electron (so the inline <html> value is not shadowed)').not.toBeNull()
+    // The property must be DECLARED exactly once, and on :root — not
+    // re-declared on .win-electron / .embedded-win-inset, which would shadow
+    // the inherited <html> value for the header subtree.
+    const declarations = css.match(/\{--mc-win-caption-reserve:/g) || []
+    expect(declarations.length, 'the reserve property is declared exactly once').toBe(1)
+    expect(css).toMatch(/:root\{--mc-win-caption-reserve:142px\}/)
+    expect(localHeader, 'local .win-electron header uses the shared reserve var').not.toBeNull()
+    expect(embeddedHeader, 'embedded header uses the shared reserve var').not.toBeNull()
+    expect(embeddedReserve, 'embedded focus reserve uses the shared reserve var').not.toBeNull()
+    // Every reserve rule reads the bare shared variable; the single :root
+    // default (asserted above) means a context without the main-process var
+    // lays out exactly as the previous static rule did.
+    expect((css.match(reserveRule) || []).length, 'all reserve rules read the shared var').toBeGreaterThanOrEqual(3)
+  })
+
+  it('adopts the host window\'s zoom-aware caption reserve on its own <html>', async () => {
+    // The pane is a separate document: the --mc-win-caption-reserve the main
+    // process sets on the HOST <html> is not inherited, but the pane is painted
+    // at the host's page zoom. Without the relayed value the pane header keeps
+    // the static 142px default, which paints narrower than the caption buttons
+    // below 100% zoom and puts the bell under Minimize.
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    const { unmount } = renderWithProviders(<EmbeddedHostBridge />, { store })
+    const send = (over: Partial<HostModel>) => act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: window.parent,
+          data: { type: 'mc-host-model', ...model(over) },
+        }),
+      )
+    })
+    const reserve = () => document.documentElement.style.getPropertyValue('--mc-win-caption-reserve')
+
+    send({ winInset: true, winCaptionReserve: '178px' })
+    await waitFor(() => expect(reserve()).toBe('178px'))
+
+    // A malformed value from across the postMessage boundary is never applied.
+    send({ winInset: true, winCaptionReserve: '1px; color: red' as string })
+    expect(reserve()).toBe('')
+
+    send({ winInset: true, winCaptionReserve: '142px' })
+    expect(reserve()).toBe('142px')
+    // No Windows inset: the pane falls back to its own :root default.
+    send({ winInset: false, winCaptionReserve: '178px' })
+    expect(reserve()).toBe('')
+
+    send({ winInset: true, winCaptionReserve: '178px' })
+    expect(reserve()).toBe('178px')
+    unmount()
+    expect(reserve()).toBe('')
   })
 
   it('reads a model without winInset as false — an older host has no Windows inset to relay', async () => {
@@ -289,6 +432,33 @@ describe('EmbeddedHostBridge (option B relay)', () => {
       )
     })
     expect(store.getState().instances.host).toBeNull()
+  })
+
+  it('records the image-copy relay only for a host that advertises it, at the origin it spoke from', async () => {
+    // #14854: the pane relays image copies to its host. It must relay only to a
+    // host that answers (an older host never sends `clipboardRelay`), at the
+    // exact origin that host's own model came from, and forget it on unmount.
+    const { clipboardRelayAvailable } = await import('../lib/paneClipboardRelay')
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {})
+    const store = createTestStore()
+    const view = renderWithProviders(<EmbeddedHostBridge />, { store })
+    const sendModel = (extra: Record<string, unknown>, origin = 'http://localhost:8080') =>
+      act(() => {
+        window.dispatchEvent(new MessageEvent('message', {
+          source: window.parent, origin, data: { type: 'mc-host-model', ...model(), ...extra },
+        }))
+      })
+
+    sendModel({})
+    expect(clipboardRelayAvailable()).toBe(false)
+    sendModel({ clipboardRelay: 1 })
+    expect(clipboardRelayAvailable()).toBe(true)
+    // A model from a non-loopback origin never becomes a relay target.
+    sendModel({ clipboardRelay: 1 }, 'https://example.com')
+    expect(clipboardRelayAvailable()).toBe(false)
+    sendModel({ clipboardRelay: 1 })
+    view.unmount()
+    expect(clipboardRelayAvailable()).toBe(false)
   })
 
   it('keeps the pane\'s own focus mode when an older host sends a model without the field', async () => {

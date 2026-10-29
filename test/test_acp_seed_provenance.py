@@ -22,106 +22,47 @@ Defect 3 is why the first two could not be fixed on their own: without a
 cross-session ownership credential, no later session is ever allowed to write.
 The credential is provenance, not permission -- a record of the bytes Crew wrote,
 where adoption additionally requires the file to still hash to them.
+
+This module pins the sidecar record, cross-session adoption and the post-capture model
+resolution. The shared permission surface lives in
+``test_acp_seed_provenance_sibling_sharing.py`` and
+``test_acp_seed_provenance_sharer_teardown.py``; the write floors, the claim that tracks
+the filesystem and the transactional grant live in
+``test_acp_seed_provenance_durable_grant.py``. Fixtures and helpers shared across these
+modules live in ``acp_seed_provenance_helpers.py``; this module re-exports the four that
+``test_cc_permission_mode_seed.py`` imports from it.
 """
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import os
 import sys
 import threading
-import time
 from pathlib import Path
 
 import pytest
+from acp_seed_provenance_helpers import _pinned_kiro_cli_version  # noqa: F401
+from acp_seed_provenance_helpers import isolated_records  # noqa: F401
+from acp_seed_provenance_helpers import (
+    _OWN_START_ID,
+    _OWNER,
+    _SERVED,
+    _client,
+    _fp,
+    _pin_holder_identities,
+    _seed,
+    _settings,
+    _teardown,
+    _the_owning_process_died,
+    _write_durable_holder,
+)
 
 from kiro_crew import model_registry as mr
-from kiro_crew import sandbox, security
 from kiro_crew.acp import client as acp_client
 from kiro_crew.acp import seed_provenance as sp
 from kiro_crew.acp.client import AcpClient
-from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
-
-_SERVED = [
-    "global.anthropic.claude-opus-5[1m]",
-    "global.anthropic.claude-opus-4-8[1m]",
-]
-
-# The owner token a bare-sidecar test records under. A client uses its own
-# ``_seed_owner``; these tests only need one stable identity.
-_OWNER = "owner-under-test"
-
-
-@pytest.fixture(autouse=True)
-def isolated_records(monkeypatch):
-    """Per-test provenance state.
-
-    ``_RECORDS`` and ``_LIVE`` are process-wide runtime state (like
-    ``model_registry._ADVERTISED_MODELS``); the sidecar itself already lands in a
-    per-test ``KIROCREW_HOME``.
-    """
-    monkeypatch.setattr(sp, "_RECORDS", {})
-    monkeypatch.setattr(sp, "_LIVE", {})
-
-
-def _client(tmp_path: Path, **kw) -> AcpClient:
-    return AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE, **kw)
-
-
-def _settings(tmp_path: Path) -> Path:
-    return tmp_path / ".claude" / "settings.local.json"
-
-
-def _seed(tmp_path: Path) -> dict:
-    return json.loads(_settings(tmp_path).read_text(encoding="utf-8"))
-
-
-def _teardown(client: AcpClient) -> None:
-    """Tear a client down the way every real caller does.
-
-    The seed's removal is a DISK operation -- a durable revoke, then an unlink -- so
-    it lives in the async ``_discard_claude_settings_seed`` and reaches the
-    filesystem through ``asyncio.to_thread``. ``_reset_state`` stays synchronous and
-    keeps only the in-memory claim release, so calling it alone leaves the file
-    behind on purpose. Every production caller awaits the discard first and then
-    resets, and this helper is that pair, so a test that drifts from the real
-    ordering fails here rather than passing on a shape nothing uses.
-    """
-    asyncio.run(client._discard_claude_settings_seed())
-    client._reset_state()
-
-
-def _unwritable_sidecar(*_args, **_kwargs):
-    """What a read-only data home (or a full disk) does to the sidecar publish.
-
-    Patched over ``seed_provenance.atomic_write`` specifically, which is a DIFFERENT
-    binding from the one ``acp.client`` uses for the settings file itself -- so the
-    seed still lands and only its durable grant fails, which is the case under test.
-    """
-    raise OSError("EROFS: read-only file system")
-
-
-def _attribute_calls(node: ast.AST, name: str) -> list[ast.Attribute]:
-    """Every ``<something>.name`` attribute reference inside *node*.
-
-    Attribute rather than Call so a reference through a decorator, an
-    ``ensure_future`` or a ``to_thread`` counts too: the question these tests ask is
-    which method a region of source reaches, not how it spells the invocation.
-    """
-    return [n for n in ast.walk(node) if isinstance(n, ast.Attribute) and n.attr == name]
-
-
-def _the_owning_process_died() -> None:
-    """What a ``kill -9`` leaves behind: the sidecar, but no live claims.
-
-    ``_LIVE`` is process memory, so it dies with the process; ``_RECORDS`` mirrors
-    the sidecar on disk, which does not. Every cross-session test has to go
-    through here rather than just constructing a second client, because a sibling
-    that is still LIVE is deliberately not adoptable.
-    """
-    sp._LIVE.clear()
 
 
 class TestProvenanceRecord:
@@ -131,6 +72,81 @@ class TestProvenanceRecord:
         path = tmp_path / "settings.local.json"
         sp.record(path, '{"a": 1}\n', _OWNER)
         assert sp.recorded(path, _OWNER) == (len('{"a": 1}\n'), sp.digest('{"a": 1}\n'))
+
+    def test_record_refuses_a_live_foreign_owner(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        path.write_text("foreign-bytes", encoding="utf-8")
+        foreign = _pin_holder_identities(monkeypatch, foreign_live=True)
+        _write_durable_holder(
+            path,
+            "foreign-bytes",
+            kind=sp._HOLDER_OWNERS,
+            owner="foreign-owner",
+            identity=foreign,
+        )
+        before = sp._read_disk_seeds()[os.fspath(path)]
+
+        assert sp.record(path, "our-bytes", _OWNER) is False
+
+        assert sp._read_disk_seeds()[os.fspath(path)] == before
+        assert sp._LIVE.get(os.fspath(path)) is None
+
+    def test_record_reclaims_a_dead_owner_lease(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        path.write_text("foreign-bytes", encoding="utf-8")
+        foreign = _pin_holder_identities(monkeypatch, foreign_live=False)
+        _write_durable_holder(
+            path,
+            "foreign-bytes",
+            kind=sp._HOLDER_OWNERS,
+            owner="dead-owner",
+            identity=foreign,
+        )
+
+        assert sp.record(path, "our-bytes", _OWNER) is True
+
+        entry = sp._read_disk_seeds()[os.fspath(path)]
+        assert (entry["size"], entry["sha256"]) == _fp("our-bytes")
+        assert set(entry["holders"][sp._HOLDER_OWNERS]) == {_OWNER}
+
+    def test_record_recreates_under_a_live_foreign_sharer(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        path.write_text("shared-bytes", encoding="utf-8")
+        foreign = _pin_holder_identities(monkeypatch, foreign_live=True)
+        _write_durable_holder(
+            path,
+            "shared-bytes",
+            kind=sp._HOLDER_SHARERS,
+            owner="foreign-reader",
+            identity=foreign,
+        )
+
+        assert sp.record(path, "shared-bytes", _OWNER) is True
+
+        holders = sp._read_disk_seeds()[os.fspath(path)]["holders"]
+        assert set(holders[sp._HOLDER_OWNERS]) == {_OWNER}
+        assert set(holders[sp._HOLDER_SHARERS]) == {"foreign-reader"}
+
+    def test_record_promotes_this_process_reader_lease(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        path.write_text("shared-bytes", encoding="utf-8")
+        _pin_holder_identities(monkeypatch, foreign_live=False)
+        identity = {"pid": os.getpid(), "start_id": _OWN_START_ID}
+        _write_durable_holder(
+            path,
+            "shared-bytes",
+            kind=sp._HOLDER_SHARERS,
+            owner=_OWNER,
+            identity=identity,
+        )
+        sp._SHARERS[os.fspath(path)] = {_OWNER}
+
+        assert sp.record(path, "shared-bytes", _OWNER) is True
+
+        holders = sp._read_disk_seeds()[os.fspath(path)]["holders"]
+        assert set(holders[sp._HOLDER_OWNERS]) == {_OWNER}
+        assert _OWNER not in holders[sp._HOLDER_SHARERS]
+        assert _OWNER not in sp._SHARERS[os.fspath(path)]
 
     def test_an_unrecorded_path_is_unowned(self, tmp_path):
         assert sp.recorded(tmp_path / "settings.local.json", _OWNER) is None
@@ -181,11 +197,146 @@ class TestProvenanceRecord:
         # Adoptable again, and still described by its recorded bytes.
         assert sp.recorded(path, "a-later-session") == (len("payload"), sp.digest("payload"))
 
+    def test_loop_safe_release_and_unshare_never_lock_or_persist(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        key = sp._key(path)
+        sp._LIVE[key] = _OWNER
+        sp._SHARERS[key] = {_OWNER, "another-reader"}
+
+        class _RefusingLock:
+            def __enter__(self):
+                pytest.fail("loop-safe teardown must not take the persistence lock")
+
+            def __exit__(self, *_args):
+                return False
+
+        def _refuse_persist(*_args, **_kwargs):
+            pytest.fail("loop-safe teardown must not persist")
+
+        monkeypatch.setattr(sp, "_LOCK", _RefusingLock())
+        monkeypatch.setattr(sp, "_persist", _refuse_persist)
+
+        sp.release_local(path, _OWNER)
+        sp.unshare_local(path, _OWNER)
+
+        assert key not in sp._LIVE
+        assert sp._SHARERS[key] == {"another-reader"}
+
+    def test_unshare_never_readds_the_in_memory_lease_on_a_refused_persist(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        key = sp._key(path)
+        assert sp.record(path, "payload", "writer") is True
+        assert sp.share(path, "payload", _OWNER) is True
+        monkeypatch.setattr(sp, "_persist", lambda **_kwargs: False)
+
+        assert sp.unshare(path, _OWNER) is False
+        assert _OWNER not in sp._SHARERS[key]
+        persisted = sp._read_disk_seeds()[key]["holders"][sp._HOLDER_SHARERS]
+        assert _OWNER in persisted
+
+    def test_release_never_readds_the_live_slot_on_a_refused_persist(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        key = sp._key(path)
+        assert sp.record(path, "payload", _OWNER) is True
+        monkeypatch.setattr(sp, "_persist", lambda **_kwargs: False)
+
+        assert sp.release(path, _OWNER) is False
+        assert key not in sp._LIVE
+        persisted = sp._read_disk_seeds()[key]["holders"][sp._HOLDER_OWNERS]
+        assert _OWNER in persisted
+
+    def test_forget_drops_the_live_slot_but_keeps_the_record_on_a_refused_persist(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        key = sp._key(path)
+        assert sp.record(path, "payload", _OWNER) is True
+        entry = sp._RECORDS[key]
+        monkeypatch.setattr(sp, "_persist", lambda **_kwargs: False)
+
+        assert sp.forget(path, _OWNER) is False
+        assert sp._RECORDS[key] is entry
+        assert key not in sp._LIVE
+
+    def test_forget_proves_disk_agreement_when_the_local_record_is_absent(self, tmp_path):
+        """A local cache miss cannot revoke a record protected by a durable sharer."""
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        assert sp.release(path, _OWNER) is True
+        assert sp.share(path, "payload", "cross-process-reader") is True
+        key = sp._key(path)
+
+        sp._RECORDS.clear()
+        sp._LIVE.clear()
+        sp._SHARERS.clear()
+
+        assert sp.forget(path, _OWNER) is False
+        assert key not in sp._RECORDS
+        durable = sp._read_disk_seeds()[key]
+        assert "cross-process-reader" in durable["holders"]["sharers"]
+
+    @pytest.mark.asyncio
+    async def test_windows_dead_process_withdraws_the_durable_holder_off_loop(
+        self, tmp_path, monkeypatch
+    ):
+        client = _client(tmp_path, permission_mode="default")
+        await asyncio.to_thread(client._write_claude_local_settings)
+        path = _settings(tmp_path)
+        key = sp._key(path)
+        assert key in sp._read_disk_seeds()
+
+        class _Process:
+            def __init__(self, returncode):
+                self.returncode = returncode
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+
+        client._process = _Process(1)  # type: ignore[assignment]
+        client._pid = None
+        client._child_pids = {}
+        loop_thread = threading.get_ident()
+        forget_threads: list[int] = []
+        real_forget = sp.forget
+
+        def _watch_forget(*args, **kwargs):
+            forget_threads.append(threading.get_ident())
+            return real_forget(*args, **kwargs)
+
+        async def _kill_process(*, force):
+            assert force is True
+
+        async def _spawn():
+            client._process = _Process(None)  # type: ignore[assignment]
+
+        async def _initialize_session():
+            client._session_id = "replacement-session"
+
+        monkeypatch.setattr(sp, "forget", _watch_forget)
+        monkeypatch.setattr(acp_client.platform_compat, "IS_WINDOWS", True)
+        monkeypatch.setattr(client, "_kill_process", _kill_process)
+        monkeypatch.setattr(client, "_spawn", _spawn)
+        monkeypatch.setattr(client, "_initialize_session", _initialize_session)
+        monkeypatch.setattr(client, "_snapshot_process_tree", lambda: asyncio.sleep(0))
+
+        await client.ensure_ready()
+
+        assert forget_threads and all(thread != loop_thread for thread in forget_threads)
+        assert key not in sp._read_disk_seeds()
+        assert key not in sp._LIVE
+        assert not path.exists()
+
     def test_release_cannot_evict_the_winner(self, tmp_path):
         path = tmp_path / "settings.local.json"
-        assert sp.claim(path, "winner") is True
+        assert sp.claim(path, "winner", expect_digest=None) is True
         sp.release(path, "loser")
-        assert sp.claim(path, "someone-else") is False
+        assert sp.claim(path, "someone-else", expect_digest=None) is False
 
     def test_a_live_owners_record_is_invisible_to_a_sibling(self, tmp_path):
         """A record proves "Crew wrote it", not "any Crew client may take it".
@@ -226,12 +377,227 @@ class TestProvenanceRecord:
         """
         path = tmp_path / "settings.local.json"
         assert sp.recorded(path, "first") is None  # an orphan nobody holds yet
-        assert sp.claim(path, "first") is True
-        assert sp.claim(path, "second") is False
+        assert sp.claim(path, "first", expect_digest=None) is True
+        assert sp.claim(path, "second", expect_digest=None) is False
         # ...and the winner may re-claim its own slot, so re-seeding is not a
         # self-refusal.
-        assert sp.claim(path, "first") is True
+        assert sp.claim(path, "first", expect_digest=None) is True
         assert sp.recorded(path, "second") is None
+
+    def test_adoption_is_refused_while_a_persisted_reader_is_live(self, tmp_path):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        sp.release(path, _OWNER)
+        assert sp.share(path, "payload", "reader") is True
+
+        sp._RECORDS.clear()
+        sp._LIVE.clear()
+        sp._SHARERS.clear()
+        sp._load()
+
+        assert sp.claim(path, "second-process", expect_digest=_fp("payload")) is False
+
+    def test_a_stale_persisted_reader_is_reclaimable(self, tmp_path):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        sp.release(path, _OWNER)
+        assert sp.share(path, "payload", "reader") is True
+
+        sidecar = json.loads(sp._sidecar_path().read_text(encoding="utf-8"))
+        holder = sidecar["seeds"][os.fspath(path)]["holders"]["sharers"]["reader"]
+        holder["start_id"] = "a-different-process-incarnation"
+        sp._sidecar_path().write_text(json.dumps(sidecar), encoding="utf-8")
+        sp._RECORDS.clear()
+        sp._LIVE.clear()
+        sp._SHARERS.clear()
+        sp._load()
+
+        assert sp.claim(path, "second-process", expect_digest=_fp("payload")) is True
+
+    def test_identity_unprovable_owner_persists_digest_only_but_sibling_declines_sharing(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
+        monkeypatch.setattr(sp.platform_compat, "get_process_start_id", lambda _pid: None)
+
+        owner = _client(tmp_path, permission_mode="default")
+        owner._write_claude_local_settings()
+        path = _settings(tmp_path)
+        entry = json.loads(sp._sidecar_path().read_text(encoding="utf-8"))["seeds"][os.fspath(path)]
+
+        assert owner._claude_settings_authored is True
+        assert entry["holders"] == {"owners": {}, "sharers": {}}
+
+        sibling = _client(tmp_path, permission_mode="default")
+        sibling._write_claude_local_settings()
+
+        assert sibling._claude_settings_shared is False
+        assert sibling._permission_surface_governed is False
+        assert sibling._seed_owner not in sp._SHARERS.get(os.fspath(path), set())
+
+    def test_share_declines_when_identity_is_unprovable(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        assert sp.release(path, _OWNER) is True
+        monkeypatch.setattr(sp.platform_compat, "get_process_start_id", lambda _pid: None)
+
+        assert sp.share(path, "payload", "reader") is False
+        assert "reader" not in sp._SHARERS.get(os.fspath(path), set())
+
+    def test_record_refuses_a_digest_change_under_a_live_foreign_sharer(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "settings.local.json"
+        original = '{"permissions": {"defaultMode": "default"}}\n'
+        replacement = '{"permissions": {"defaultMode": "acceptEdits"}}\n'
+        path.write_text(original, encoding="utf-8")
+        foreign = _pin_holder_identities(monkeypatch, foreign_live=True)
+        _write_durable_holder(
+            path,
+            original,
+            kind=sp._HOLDER_SHARERS,
+            owner="reader",
+            identity=foreign,
+        )
+        path.write_text(replacement, encoding="utf-8")
+
+        assert sp.record(path, replacement, "replacement-owner") is False
+
+        entry = sp._read_disk_seeds()[os.fspath(path)]
+        assert (entry["size"], entry["sha256"]) == _fp(original)
+        assert set(entry["holders"][sp._HOLDER_SHARERS]) == {"reader"}
+
+    def test_record_allows_a_same_digest_write_under_a_live_sharer(self, tmp_path, monkeypatch):
+        path = tmp_path / "settings.local.json"
+        payload = '{"permissions": {"defaultMode": "default"}}\n'
+        path.write_text(payload, encoding="utf-8")
+        foreign = _pin_holder_identities(monkeypatch, foreign_live=True)
+        _write_durable_holder(
+            path,
+            payload,
+            kind=sp._HOLDER_SHARERS,
+            owner="reader",
+            identity=foreign,
+        )
+
+        assert sp.record(path, payload, "reader") is True
+
+        entry = sp._read_disk_seeds()[os.fspath(path)]
+        assert (entry["size"], entry["sha256"]) == _fp(payload)
+        assert set(entry["holders"][sp._HOLDER_OWNERS]) == {"reader"}
+        assert entry["holders"][sp._HOLDER_SHARERS] == {}
+
+    def test_record_allows_a_digest_change_when_no_sharer(self, tmp_path):
+        path = tmp_path / "settings.local.json"
+        path.write_text("original", encoding="utf-8")
+        assert sp.record(path, "original", _OWNER) is True
+        assert sp.release(path, _OWNER) is True
+        path.write_text("replacement", encoding="utf-8")
+
+        assert sp.record(path, "replacement", "replacement-owner") is True
+        assert sp.recorded(path, "replacement-owner") == _fp("replacement")
+
+    def test_release_clears_the_persisted_reader(self, tmp_path):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        sp.release(path, _OWNER)
+        assert sp.share(path, "payload", "reader") is True
+        sp.unshare(path, "reader")
+
+        sp._RECORDS.clear()
+        sp._LIVE.clear()
+        sp._SHARERS.clear()
+        sp._load()
+
+        assert sp.claim(path, "second-process", expect_digest=_fp("payload")) is True
+
+    def test_a_claim_with_a_stale_cached_digest_is_refused(self, tmp_path):
+        """A stale in-memory digest cannot authorize adopting a user's file.
+
+        The reviewer's interleaving: this process caches the digest of Crew's
+        old seed; ANOTHER process records new bytes, so the durable entry moves
+        on; the user then restores the old bytes at the path. The cached digest
+        still matches the file, but the record stopped vouching for those bytes
+        -- an adoption here would rewrite, and its teardown later delete, the
+        user's restoration. The claim revalidates the digest against the
+        durable entry under the cross-process lock and refuses.
+        """
+        path = tmp_path / "settings.local.json"
+        path.write_text("old-bytes", encoding="utf-8")
+        assert sp.record(path, "old-bytes", _OWNER) is True
+        sp.release(path, _OWNER)
+        stale = _fp("old-bytes")
+
+        # Another process records new bytes: only the durable sidecar sees it;
+        # this process's in-memory cache stays where it was.
+        sidecar = json.loads(sp._sidecar_path().read_text(encoding="utf-8"))
+        entry = sidecar["seeds"][os.fspath(path)]
+        entry["size"], entry["sha256"] = _fp("new-bytes")
+        sp._sidecar_path().write_text(json.dumps(sidecar), encoding="utf-8")
+
+        # The user restores the old bytes at the path.
+        path.write_text("old-bytes", encoding="utf-8")
+
+        # The stale-digest claim refuses, leaves no live slot behind, and the
+        # user's file is untouched.
+        assert sp.claim(path, "adopter", expect_digest=stale) is False
+        assert sp._LIVE.get(os.fspath(path)) is None
+        assert path.read_text(encoding="utf-8") == "old-bytes"
+
+    def test_a_claim_matching_the_durable_entry_still_lands(self, tmp_path):
+        """The digest gate refuses staleness, not adoption itself."""
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        sp.release(path, _OWNER)
+        assert sp.claim(path, "adopter", expect_digest=_fp("payload")) is True
+
+    def test_a_cross_process_revoke_is_not_resurrected_from_local_memory(self, tmp_path):
+        """A revoked durable record cannot vouch for a claim or a share.
+
+        Another process forgets the record, so the sidecar entry is gone;
+        this process's in-memory cache still holds it. The digest requirement
+        is a claim about the DURABLE record -- both the adoption claim and a
+        new share must refuse, rather than resurrect provenance from local
+        memory that nothing durable stands behind.
+        """
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        sp.release(path, _OWNER)
+
+        # Another process revokes: the durable entry vanishes; this process's
+        # cache keeps the stale copy.
+        sidecar = json.loads(sp._sidecar_path().read_text(encoding="utf-8"))
+        del sidecar["seeds"][os.fspath(path)]
+        sp._sidecar_path().write_text(json.dumps(sidecar), encoding="utf-8")
+        assert sp._RECORDS.get(os.fspath(path))
+
+        assert sp.claim(path, "adopter", expect_digest=_fp("payload")) is False
+        assert sp.share(path, "payload", "reader") is False
+
+    def test_a_persisted_reader_exempts_a_missing_file_from_prune(self, tmp_path):
+        path = tmp_path / "settings.local.json"
+        path.write_text("payload", encoding="utf-8")
+        assert sp.record(path, "payload", _OWNER) is True
+        sp.release(path, _OWNER)
+        assert sp.share(path, "payload", "reader") is True
+
+        sp._RECORDS.clear()
+        sp._LIVE.clear()
+        sp._SHARERS.clear()
+        sp._load()
+        path.unlink()
+        other = tmp_path / "other.json"
+        other.write_text("other", encoding="utf-8")
+        assert sp.record(other, "other", "other-owner") is True
+
+        persisted = json.loads(sp._sidecar_path().read_text(encoding="utf-8"))["seeds"]
+        assert os.fspath(path) in persisted
 
     def test_a_record_outlives_the_process(self, tmp_path, monkeypatch):
         """The whole point: the claim has to survive a kill.
@@ -313,10 +679,6 @@ class TestProvenanceRecord:
 
         monkeypatch.setattr(sp, "_sidecar_path", _boom)
         assert sp.recorded(path, _OWNER) is not None
-        # ``release`` is on a loop-side failure path, so it is memory-only too.
-        # ``forget`` is NOT: it revokes a grant whose file has just been unlinked,
-        # and a grant that outlives its file has to stop existing on disk as well.
-        sp.release(path, _OWNER)
 
     def test_the_publish_happens_under_the_record_lock(self, tmp_path, monkeypatch):
         """Mutate -> prune -> snapshot -> publish is ONE transaction.
@@ -400,25 +762,13 @@ class TestProvenanceRecord:
         # process treat a live sibling's seed as an adoptable orphan.
         assert sp.recorded(sibling, "a-later-session") is None
 
-    def test_the_lookup_and_the_claim_do_not_take_the_lock(self, tmp_path):
-        """``_LOCK`` is held across a disk write, so a loop-side READER must not want it.
-
-        ``_reset_state`` consults ownership synchronously ON the event loop; if
-        :func:`recorded` or :func:`release` took the lock, a worker thread mid-persist
-        would stall the gateway's one loop. Holding it here would deadlock outright
-        (a plain, non-reentrant ``threading.Lock``) if either did.
-
-        :func:`forget` deliberately DOES take it -- it publishes -- which is why it is
-        exercised separately below rather than here.
-        """
+    def test_the_digest_lookup_does_not_take_the_record_lock(self, tmp_path):
+        """Loop-side fingerprint reads remain memory-only and lock-free."""
         path = tmp_path / "settings.local.json"
         sp.record(path, "payload", _OWNER)
 
         with sp._LOCK:
             assert sp.recorded(path, _OWNER) is not None
-            assert sp.claim(path, _OWNER) is True
-            sp.release(path, _OWNER)
-        assert sp.recorded(path, "a-later-session") is not None
 
     def test_forget_publishes_under_the_same_lock_record_uses(self, tmp_path, monkeypatch):
         """The revoke is a publish, so it is the same transaction ``record`` is.
@@ -460,9 +810,11 @@ class TestProvenanceRecord:
 
         monkeypatch.setattr(sp, "atomic_write", _boom)
         assert sp.forget(path, _OWNER) is False
-        # Put back, so this process agrees with the sidecar a restart would read --
-        # and so the file the caller was told to keep is still adoptable.
-        assert sp.recorded(path, "a-later-session") is not None
+        # The record stays visible, while the retained durable holder prevents a
+        # sibling from claiming bytes the failed revoke still protects.
+        assert sp.recorded(path, _OWNER) is not None
+        assert sp.recorded(path, "a-later-session") == _fp("payload")
+        assert sp.claim(path, "a-later-session", expect_digest=_fp("payload")) is False
 
     def test_forget_refuses_to_revoke_a_live_siblings_claim(self, tmp_path, monkeypatch):
         """A client that could not adopt a seed cannot revoke its grant either."""
@@ -476,14 +828,32 @@ class TestProvenanceRecord:
         assert sp.forget(path, "a-sibling") is False
         assert sp.recorded(path, "the-live-session") is not None
 
-    def test_forgetting_an_unrecorded_path_writes_nothing(self, tmp_path, monkeypatch):
-        """No entry, no publish: a reset for a path Crew never seeded stays free."""
+    def test_forget_refused_under_sharer_then_release_succeeds(self, tmp_path, monkeypatch):
+        """The mechanism an owner falls back to when a live sharer refuses its revoke.
 
-        def _boom(*args, **kwargs):
-            raise AssertionError("forget() must not publish when it removed nothing")
+        ``forget`` is the whole-record revoke and fails closed (``require_unheld``)
+        while any other live holder protects the path -- a sibling's reader lease
+        included. ``release`` drops only THIS owner's holder, with no unheld
+        requirement, and leaves the record and the sharer's lease standing. The
+        owner's replaced-after-create path relies on exactly that asymmetry; a
+        ``require_unheld`` creeping into ``release`` would leak the owner slot again.
+        """
+        _pin_holder_identities(monkeypatch, foreign_live=False)
+        path = tmp_path / "settings.local.json"
+        assert sp.record(path, "payload", _OWNER) is True
+        assert sp.share(path, "payload", "sib") is True
 
-        monkeypatch.setattr(sp, "atomic_write", _boom)
-        sp.forget(tmp_path / "settings.local.json", _OWNER)
+        assert sp.forget(path, _OWNER) is False
+        assert sp.release(path, _OWNER) is True
+
+        assert sp.has_sharers(path) is True
+        assert sp.held_by_another(path, "a-later-session") is False
+        assert sp.recorded_durable(path) == _fp("payload")
+
+    def test_forgetting_an_unrecorded_path_still_proves_disk_agreement(self, tmp_path):
+        """No local entry still requires a durable empty-record agreement."""
+        assert sp.forget(tmp_path / "settings.local.json", _OWNER) is True
+        assert sp._read_disk_seeds() == {}
 
     def test_an_entry_whose_file_is_gone_is_pruned(self, tmp_path):
         """The one prune, and the whole bound: no file, nothing to be owner of.
@@ -494,13 +864,14 @@ class TestProvenanceRecord:
         which is the only bound that means anything here.
         """
         for i in range(10):
-            sp.record(tmp_path / f"gone-{i}.json", "x", _OWNER)
+            path = tmp_path / f"gone-{i}.json"
+            sp.record(path, "x", _OWNER)
+            sp.release(path, _OWNER)
 
         # Only the most recent survives: each ``record`` exempts its own key (see
-        # ``_persist``'s ``keep``) and prunes every other path with no file.
+        # ``_persist``'s ``keep``) and prunes every other path with no file or holder.
         assert list(sp._RECORDS) == [os.fspath(tmp_path / "gone-9.json")]
-        # The live map is pruned with it, so it cannot outlive the records.
-        assert list(sp._LIVE) == [os.fspath(tmp_path / "gone-9.json")]
+        assert sp._LIVE == {}
         persisted = json.loads(sp._sidecar_path().read_text(encoding="utf-8"))
         assert list(persisted["seeds"]) == [os.fspath(tmp_path / "gone-9.json")]
 
@@ -754,621 +1125,6 @@ class TestCrossSessionAdoption:
         assert first._claude_settings_is_still_ours() is False
 
 
-class TestTheRecordIsOnEveryWriteFloor:
-    """An entry in the sidecar IS the grant, so the agent must not be able to add one.
-
-    The forgery chain the floors close, end to end: an agent writes
-    ``{"seeds": {"<repo>/.claude/settings.local.json": {size, sha256}}}`` for a
-    settings file the USER hand-wrote, the next gateway start loads it, the digest
-    matches, and Crew's own trusted writer adopts the file -- replacing the user's
-    ``permissions.defaultMode`` with this session's and unlinking the file on reset.
-    The digest check is doing exactly what it was designed to do; what must not be
-    forgeable is the record it checks against. Read stays allowed: the record holds
-    work-dir paths and digests, not a secret.
-    """
-
-    LEAF = "settings_seeds.json"
-
-    def test_the_sidecar_is_the_leaf_the_floors_name(self):
-        # The floors are spelled as a filename, so they only hold if that is the name
-        # the module actually publishes.
-        assert sp._sidecar_path().name == self.LEAF
-
-    def test_the_file_edit_gate_refuses_a_write_and_allows_a_read(self):
-        for prefix in security.crew_home_prefixes():
-            path = f"~/{prefix}/{self.LEAF}"
-            assert security.is_sensitive_write_path(path) is True, path
-            assert security.is_sensitive_path(path) is False, path
-
-    def test_the_sandbox_seals_it_readonly_even_when_absent(self):
-        # The kernel floor under the deny rules, which a runtime-constructed spelling
-        # (``$(printf ...)``) walks past. READONLY, not hidden -- the write is the
-        # risk. Precreated because ``mount(2)`` cannot seal a path that is not there,
-        # and this sidecar does not exist until a claude session has seeded a work
-        # dir: on every install that has not, the name is writable.
-        assert self.LEAF in sandbox._CREW_READONLY_LEAVES
-        assert self.LEAF in sandbox._CREW_PRECREATE_READONLY_FILE_LEAVES
-        assert self.LEAF not in sandbox._CREW_SANDBOX_VISIBLE_LEAVES
-
-    def test_an_empty_materialized_ceiling_means_what_an_absent_one_means(
-        self, tmp_path, monkeypatch
-    ):
-        """The precondition for precreating it: ``{}`` must read as "Crew owns nothing".
-
-        A stale pinned read of the stub is the same answer, which is the direction
-        that refuses -- the writer takes its leave-it-alone branch, so nothing is
-        overwritten and nothing is unlinked.
-        """
-        sidecar = tmp_path / self.LEAF
-        sidecar.write_bytes(sandbox._EMPTY_CEILING_DOCUMENT)
-        monkeypatch.setattr(sp, "_sidecar_path", lambda: sidecar)
-
-        sp._load()
-        assert sp._RECORDS == {}
-        assert sp.recorded(_settings(tmp_path), _OWNER) is None
-
-
-class TestOwnershipTracksTheFilesystem:
-    """A claim moves only when the write or the unlink actually happened.
-
-    Ownership is a statement about bytes on disk, so every place it is recorded or
-    dropped has to be ordered against the syscall that made it true. Both
-    directions were wrong: the re-seed truncated the recorded bytes before writing
-    the new ones (a failure mid-write left a file no session could ever claim
-    again), and reset dropped the claim before knowing the unlink succeeded (a
-    failure left Crew's own file behind as an unrecognizable orphan).
-    """
-
-    def test_a_failed_reseed_leaves_the_recorded_bytes_and_the_claim(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        first = _client(tmp_path, permission_mode="bypassPermissions")
-        first._write_claude_local_settings()
-        path = _settings(tmp_path)
-        before = path.read_text(encoding="utf-8")
-        _the_owning_process_died()
-
-        def _boom(*args, **kwargs):
-            raise OSError("ENOSPC")
-
-        monkeypatch.setattr(acp_client, "atomic_write", _boom)
-        second = _client(tmp_path, permission_mode="default")
-        with pytest.raises(OSError):
-            second._write_claude_local_settings()
-
-        # Staging and renaming is what makes this hold: the old bytes are still the
-        # bytes the record names, so the path is STILL adoptable. Truncating first
-        # destroyed them before the new ones landed, leaving a file whose digest
-        # matched nothing -- unclaimable by this session and by every later one.
-        assert path.read_text(encoding="utf-8") == before
-        assert sp.recorded(path, second._seed_owner) is not None
-        assert second._claude_settings_is_still_ours() is True
-
-        # And the instance flag did not move either, so this session's reset cannot
-        # delete a file whose current bytes Crew never wrote.
-        assert second._claude_settings_authored is False
-        _teardown(second)
-        assert path.read_text(encoding="utf-8") == before
-
-    def test_the_path_is_still_adoptable_after_a_failed_reseed(self, tmp_path, monkeypatch):
-        # The consequence of the above, stated as the user-visible outcome: the
-        # ENOSPC session is a no-op, not a permanent loss of the work dir.
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        _client(tmp_path, permission_mode="bypassPermissions")._write_claude_local_settings()
-        _the_owning_process_died()
-
-        real = acp_client.atomic_write
-        disk_is_full = True
-
-        def _boom(*args, **kwargs):
-            if disk_is_full:
-                raise OSError("ENOSPC")
-            return real(*args, **kwargs)
-
-        monkeypatch.setattr(acp_client, "atomic_write", _boom)
-        with pytest.raises(OSError):
-            _client(tmp_path, permission_mode="default")._write_claude_local_settings()
-        _the_owning_process_died()
-
-        disk_is_full = False
-        third = _client(tmp_path, permission_mode="default")
-        third._write_claude_local_settings()
-        assert _seed(tmp_path)["permissions"]["defaultMode"] == "default"
-        assert third._claude_settings_authored is True
-
-    def test_a_failed_adoption_hands_the_claim_back_within_the_process(self, tmp_path, monkeypatch):
-        """The claim has to be released, not just survive a process restart.
-
-        ``claim`` is the race arbiter, so it is taken BEFORE the write -- it cannot
-        wait for one to succeed without letting two clients both decide the same
-        orphan is theirs. But a winner that then fails to write still holds the live
-        slot, and every later client in this process therefore reads the orphan as a
-        LIVE session's file: unadoptable, so the stale ``bypassPermissions`` in it
-        can be neither rewritten nor removed for the lifetime of the gateway. Note
-        there is no ``_the_owning_process_died()`` below -- that is the point.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        _client(tmp_path, permission_mode="bypassPermissions")._write_claude_local_settings()
-        path = _settings(tmp_path)
-        _the_owning_process_died()  # the seed is an orphan; the adopter is next
-
-        real = acp_client.atomic_write
-        disk_is_full = True
-
-        def _boom(*args, **kwargs):
-            if disk_is_full:
-                raise OSError("ENOSPC")
-            return real(*args, **kwargs)
-
-        monkeypatch.setattr(acp_client, "atomic_write", _boom)
-        failed = _client(tmp_path, permission_mode="default")
-        with pytest.raises(OSError):
-            failed._write_claude_local_settings()
-
-        # Handed back: the record still describes the file (that is what keeps it
-        # adoptable at all), and no live holder stands in the next client's way.
-        assert sp.recorded(path, "a-sibling-in-this-process") is not None
-
-        disk_is_full = False
-        repaired = _client(tmp_path, permission_mode="default")
-        repaired._write_claude_local_settings()
-        assert _seed(tmp_path)["permissions"]["defaultMode"] == "default"
-
-    def test_a_failed_adoption_does_not_evict_a_live_sibling(self, tmp_path, monkeypatch):
-        """Only the winner may release. A loser's failure is not a lever on the slot."""
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        live = _client(tmp_path, permission_mode="bypassPermissions")
-        live._write_claude_local_settings()
-        path = _settings(tmp_path)
-
-        # A sibling reaches the orphan check, loses the claim, and leaves it alone.
-        loser = _client(tmp_path, permission_mode="default")
-        loser._write_claude_local_settings()
-        assert _seed(tmp_path)["permissions"]["defaultMode"] == "bypassPermissions"
-        assert loser._claude_settings_authored is False
-        assert sp.recorded(path, live._seed_owner) is not None
-        assert sp.recorded(path, loser._seed_owner) is None
-
-    def test_the_create_path_still_refuses_to_clobber_a_racing_sibling(self, tmp_path):
-        # A rename REPLACES whatever sits at the name, so it cannot arbitrate a
-        # create race at all. The create branch therefore keeps its O_EXCL open --
-        # the loser must see the winner's file, not overwrite it.
-        opened: list[int] = []
-        real_open = os.open
-
-        def _record_flags(path, flags, *rest):
-            if str(path).endswith("settings.local.json"):
-                opened.append(flags)
-            return real_open(path, flags, *rest)
-
-        client = _client(tmp_path, permission_mode="default")
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(os, "open", _record_flags)
-            client._write_claude_local_settings()
-
-        assert opened, "the create branch must open the path itself"
-        assert opened[-1] & os.O_EXCL
-
-    def test_a_failed_unlink_keeps_the_claim(self, tmp_path, monkeypatch):
-        """The file is still there, so the claim on it is still true.
-
-        Dropping it made Crew's own file unrecognizable to every later session --
-        exactly the orphan this module exists to end, manufactured by the cleanup
-        path. Keeping it means the next session re-seeds or removes it.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        # Teardown inode-pins the delete: it moves the file to a fresh ``*.crew-gc``
-        # temp and deletes THAT, so a delete failure is a failure to remove the moved
-        # inode. The temp name is randomized (mkstemp), so match on the suffix.
-        real_unlink = Path.unlink
-
-        def _refuse(self, *args, **kwargs):
-            if str(self).endswith(".crew-gc"):
-                raise OSError("EACCES")
-            return real_unlink(self, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "unlink", _refuse)
-        _teardown(client)
-
-        # The moved inode could not be deleted, so it is restored under the pathname
-        # and re-recorded rather than left as a frozen ``.crew-gc`` no session names.
-        assert path.exists()
-        assert not list(path.parent.glob("*.crew-gc"))
-        _the_owning_process_died()
-        assert sp.recorded(path, "a-later-session") is not None
-
-        monkeypatch.setattr(Path, "unlink", real_unlink)
-        later = _client(tmp_path, permission_mode="default")
-        later._write_claude_local_settings()
-        assert _seed(tmp_path)["permissions"]["defaultMode"] == "default"
-
-    def test_a_successful_unlink_revokes_the_grant_for_good(self, tmp_path, monkeypatch):
-        """The mirror of the above: the file is gone, so the grant must be too.
-
-        Dropping it from memory alone left the SIDECAR naming a path Crew had just
-        deleted, and re-verifying the digest does not neutralize that -- a file can
-        hash to the recorded bytes again quite legitimately, most plainly when a user
-        committed the generated seed and later restored it. The next process would
-        then read that user's file as Crew's own: overwritten with this install's
-        permission mode, and unlinked on reset.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        seeded = path.read_text(encoding="utf-8")
-        _teardown(client)
-        assert not path.exists()
-
-        # A fresh process reads only what the sidecar kept.
-        monkeypatch.setattr(sp, "_RECORDS", {})
-        monkeypatch.setattr(sp, "_LIVE", {})
-        sp._load()
-        # The user restores the file they had committed -- byte for byte Crew's seed.
-        path.write_text(seeded, encoding="utf-8")
-        later = _client(tmp_path, permission_mode="default")
-        later._write_claude_local_settings()
-
-        assert path.read_text(encoding="utf-8") == seeded
-        assert later._claude_settings_authored is False
-        _teardown(later)
-        assert path.exists()
-
-    def test_the_revoke_lands_before_the_unlink(self, tmp_path, monkeypatch):
-        """Ordering, not just presence: the grant dies BEFORE the file it described.
-
-        Both steps can fail independently, so "revoke and unlink" is not enough --
-        unlink-then-revoke leaves a window in which the file is gone while the
-        sidecar still names it, and a crash inside that window is exactly the state
-        :func:`forget` exists to prevent: the next process reloads the entry and
-        adopts whatever appears at the path next.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        # The delete is inode-pinned: the file is moved to a fresh ``*.crew-gc`` temp
-        # first and THAT is what gets unlinked, so the ordering is watched on the moved
-        # inode. The temp name is randomized (mkstemp), so match on the suffix.
-
-        order: list[str] = []
-        real_forget = sp.forget
-        real_unlink = Path.unlink
-
-        def _watch_forget(*args, **kwargs):
-            order.append("revoke")
-            return real_forget(*args, **kwargs)
-
-        def _watch_unlink(self, *args, **kwargs):
-            if str(self).endswith(".crew-gc"):
-                order.append("unlink")
-            return real_unlink(self, *args, **kwargs)
-
-        monkeypatch.setattr(sp, "forget", _watch_forget)
-        monkeypatch.setattr(Path, "unlink", _watch_unlink)
-        _teardown(client)
-
-        assert order == ["revoke", "unlink"]
-        assert not path.exists()
-        assert not list(path.parent.glob("*.crew-gc"))
-
-    def test_a_failed_revoke_keeps_the_file_and_the_record(self, tmp_path, monkeypatch):
-        """A revoke that did not reach the disk must not authorize a deletion.
-
-        The sidecar write can fail on its own (a full disk, a read-only data home).
-        Unlinking anyway leaves the durable grant naming a path whose file is gone,
-        which is the exact state that makes a user's restored copy adoptable. So the
-        file stays, the record stays, and a later session repairs the orphan --
-        strictly better than a deletion whose revocation never landed.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        seeded = path.read_text(encoding="utf-8")
-
-        real = sp.atomic_write
-        data_home_is_read_only = True
-
-        def _boom(*args, **kwargs):
-            if data_home_is_read_only:
-                raise OSError("EROFS")
-            return real(*args, **kwargs)
-
-        monkeypatch.setattr(sp, "atomic_write", _boom)
-        _teardown(client)
-
-        assert path.read_text(encoding="utf-8") == seeded
-        # In memory the record is back, so this process agrees with what a restart
-        # would read off the un-rewritten sidecar.
-        _the_owning_process_died()
-        assert sp.recorded(path, "a-later-session") is not None
-
-        data_home_is_read_only = False
-        later = _client(tmp_path, permission_mode="default")
-        later._write_claude_local_settings()
-        assert _seed(tmp_path)["permissions"]["defaultMode"] == "default"
-
-    def test_a_replacement_the_user_wrote_is_left_alone_on_teardown(self, tmp_path, monkeypatch):
-        """Teardown re-checks the bytes, so an edited file is not this session's.
-
-        The user may replace the seed while the session runs. Crew wrote the ORIGINAL
-        bytes, so its ``_claude_settings_authored`` flag is set -- but the file on
-        disk is now the user's, and deleting it is data loss.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        path.write_text('{"permissions": {"defaultMode": "acceptEdits"}}', encoding="utf-8")
-
-        _teardown(client)
-
-        assert json.loads(path.read_text(encoding="utf-8"))["permissions"] == {
-            "defaultMode": "acceptEdits"
-        }
-
-    def test_the_teardown_never_touches_the_disk_on_the_event_loop(self, tmp_path, monkeypatch):
-        """Both disk steps are off the loop, which is what makes the revoke durable.
-
-        ``forget`` publishes the sidecar and takes :data:`_LOCK` across the write, so
-        calling it inline would put a synchronous write -- and a wait on a lock a
-        worker thread holds across one -- on the gateway's single event loop. The
-        unlink is the same kind of call. Asserting on the running loop from inside
-        each one is what pins that: a version that calls either directly fails here.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-
-        on_loop: list[str] = []
-        real_forget = sp.forget
-        real_unlink = Path.unlink
-
-        def _note(step: str) -> None:
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                return  # a worker thread has no loop, which is the point
-            on_loop.append(step)
-
-        def _watch_forget(*args, **kwargs):
-            _note("forget")
-            return real_forget(*args, **kwargs)
-
-        def _watch_unlink(self, *args, **kwargs):
-            if self == path:
-                _note("unlink")
-            return real_unlink(self, *args, **kwargs)
-
-        monkeypatch.setattr(sp, "forget", _watch_forget)
-        monkeypatch.setattr(Path, "unlink", _watch_unlink)
-        _teardown(client)
-
-        assert on_loop == []
-        assert not path.exists()
-
-
-class TestTheGrantIsATransaction:
-    """Neither half of a provenance mutation may land without the other.
-
-    A grant is only real once it is on disk, so both directions have to commit or
-    roll back together: a seed with no durable record is a permission mode nothing
-    can clean up, and a revoked record with the file still there is a grant that
-    outlives what it described. These pin the two cases where the pairing can
-    come apart -- a sidecar publish that fails, and a teardown that is cancelled.
-    """
-
-    def test_a_seed_whose_grant_is_not_durable_is_withdrawn(self, tmp_path, monkeypatch):
-        """No record, no seed. The write is undone rather than left unowned.
-
-        Ownership IS the record, so a settings file written while the sidecar cannot
-        be published is the one state nothing on the host can repair: this session
-        would still remove it, but a kill before teardown leaves a
-        ``permissions.defaultMode`` the user never approved behind a file no later
-        session is permitted to re-seed or remove. Withdrawing it costs this session
-        the allowlist and the deny rules -- exactly what a cold advertised-model
-        cache already costs -- which is the strictly smaller harm.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        monkeypatch.setattr(sp, "atomic_write", _unwritable_sidecar)
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-
-        assert not _settings(tmp_path).exists()
-        # No instance claim either, so teardown has nothing to act on and a
-        # replacement client in this process starts from a clean path.
-        assert client._claude_settings_authored is False
-        _the_owning_process_died()
-        assert sp.recorded(_settings(tmp_path), "a-later-session") is None
-
-    def test_a_failed_record_rolls_the_memory_back_to_the_sidecar(self, tmp_path):
-        """A refused publish leaves this process reading what a restart would read.
-
-        The rollback restores the DISPLACED entry rather than dropping the key: the
-        sidecar on disk still names the previous digest, and on a re-seed the bytes
-        that digest describes may still be the ones on disk, because ``atomic_write``
-        publishes by rename and so leaves the old file intact when it fails.
-        """
-        path = tmp_path / "settings.local.json"
-        assert sp.record(path, "first", _OWNER) is True
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(sp, "atomic_write", _unwritable_sidecar)
-            assert sp.record(path, "second", _OWNER) is False
-
-        assert sp.recorded(path, _OWNER) == (len("first"), sp.digest("first"))
-        # And the live slot is the one the failed call found, not the one it took:
-        # an adopter arrives here already holding it, so a rollback that popped it
-        # would hand a live path to a sibling.
-        assert sp._LIVE.get(str(path)) == _OWNER
-
-    def test_a_cancelled_teardown_still_settles_the_seed(self, tmp_path, monkeypatch):
-        """Cancellation cannot land between the revoke and the unlink.
-
-        Teardown runs on paths that are themselves being cancelled -- a turn cancel, a
-        session close, a shutdown. As a sequence of awaited steps this had a
-        suspension point between the ownership check, the revoke and the unlink, and a
-        cancellation on any of them cleared the flags with the file still on disk and
-        its grant already gone: unrecoverable. As one shielded thread the transaction
-        has either not started or run to completion, which is what this asserts.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        assert path.exists()
-
-        entered = threading.Event()
-        real_settle = client._settle_claude_settings_seed
-
-        def _slow_settle(*args, **kwargs):
-            entered.set()
-            # Long enough that the cancel below lands while this is mid-transaction,
-            # which is the window the awaited-sequence version could not survive.
-            time.sleep(0.2)
-            return real_settle(*args, **kwargs)
-
-        monkeypatch.setattr(client, "_settle_claude_settings_seed", _slow_settle)
-
-        async def _cancel_mid_teardown() -> None:
-            task = asyncio.ensure_future(client._discard_claude_settings_seed())
-            await asyncio.to_thread(entered.wait, 5)
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-
-        # ``asyncio.run`` shuts the default executor down on the way out, so by the
-        # time it returns the shielded thread has finished -- no polling needed.
-        asyncio.run(_cancel_mid_teardown())
-
-        assert not path.exists()
-        _the_owning_process_died()
-        assert sp.recorded(path, "a-later-session") is None
-
-    def test_every_discard_call_site_resets_in_a_finally(self):
-        """The in-memory reset must survive a cancelled discard, at every call site.
-
-        The mirror image of the test above, and it is a source-shape assertion for the
-        same reason the loop-bound-locks and to_thread gates are: the defect is a
-        MISSING ``finally``, so no runtime path exercises it. Before the discard was
-        async, ``_reset_state`` was a plain synchronous statement that always ran;
-        awaiting something in front of it means a cancellation on that await skips the
-        PID untracking and the pipe closes entirely. Any call site that reaches both
-        must therefore pair them.
-        """
-        tree = ast.parse(Path(acp_client.__file__).read_text(encoding="utf-8"))
-
-        paired: set[int] = set()
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Try):
-                continue
-            if not any(_attribute_calls(stmt, "_reset_state") for stmt in node.finalbody):
-                continue
-            for stmt in node.body:
-                for call in _attribute_calls(stmt, "_discard_claude_settings_seed"):
-                    paired.add(id(call))
-
-        unpaired: list[str] = []
-        for fn in ast.walk(tree):
-            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if not _attribute_calls(fn, "_reset_state"):
-                continue  # nothing to pair with in this function
-            unpaired += [
-                f"{fn.name}:{call.lineno}"
-                for call in _attribute_calls(fn, "_discard_claude_settings_seed")
-                if id(call) not in paired
-            ]
-
-        assert unpaired == [], (
-            "await _discard_claude_settings_seed() must sit in the `try` of a "
-            "try/finally whose `finally` calls _reset_state(), or a cancelled "
-            f"teardown skips the reset entirely: {unpaired}"
-        )
-
-    def test_claim_pathname_moves_ours_aside_and_leaves_a_stranger(self, tmp_path):
-        """The inode-pin primitive: ours is captured, a stranger is left untouched.
-
-        ``_claim_pathname_if_ours`` is what closes the TOCTOU between an ownership
-        check and the delete/overwrite that acts on it -- it moves the pathname's
-        current content aside in one atomic step and hands it back ONLY when the moved
-        inode is still Crew's. A stranger's file is restored exactly as found, never
-        deleted or clobbered.
-        """
-        path = tmp_path / "settings.local.json"
-        path.write_text("crew-bytes", encoding="utf-8")
-        expectation = (len(b"crew-bytes"), sp.digest("crew-bytes"))
-
-        aside = acp_client.AcpClient._claim_pathname_if_ours(path, expectation)
-        assert aside is not None
-        assert aside.read_text(encoding="utf-8") == "crew-bytes"
-        assert not path.exists()  # the pathname is now free
-
-        # A file that is NOT Crew's is left exactly in place, not moved or removed.
-        path.write_text("USER-OWNED", encoding="utf-8")
-        assert acp_client.AcpClient._claim_pathname_if_ours(path, expectation) is None
-        assert path.read_text(encoding="utf-8") == "USER-OWNED"
-
-    def test_a_replacement_that_races_the_teardown_delete_survives(self, tmp_path, monkeypatch):
-        """A user save landing after the ownership check but before the delete is kept.
-
-        The delete is inode-pinned: teardown moves Crew's file to ``<name>.crew-gc`` in
-        one atomic step and deletes THAT, so a replacement written at the pathname
-        afterwards is a different inode this never touches. The race is made
-        deterministic by writing the user's file at the freed pathname the instant
-        Crew's file is moved aside -- the exact window the inode-pin closes. A teardown
-        that unlinked the pathname would delete the user's file here.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-
-        real_replace = os.replace
-
-        def _race(src, dst, *args, **kwargs):
-            real_replace(src, dst, *args, **kwargs)
-            # Only the move-aside frees the pathname; the sidecar's own renames must
-            # not trip this. The user saves their settings the instant it is free.
-            if str(dst).endswith(".crew-gc"):
-                Path(path).write_text('{"user": true}\n', encoding="utf-8")
-
-        monkeypatch.setattr(os, "replace", _race)
-        _teardown(client)
-
-        # Crew removed only its own moved inode; the racing replacement is intact.
-        assert path.exists()
-        assert path.read_text(encoding="utf-8") == '{"user": true}\n'
-
-    def test_a_project_file_at_the_move_aside_name_is_not_clobbered(self, tmp_path, monkeypatch):
-        """A file already at the fixed ``.crew-gc`` name must survive the capture.
-
-        The move-aside destination must not be a FIXED sibling (``<name>.crew-gc``),
-        which is itself a pathname a project can own -- and ``os.replace`` onto it
-        clobbers it atomically, relocating the very data loss the inode-pin exists to
-        prevent. The capture now lands on a fresh ``mkstemp`` name that provably did
-        not pre-exist, so a project's own ``<name>.crew-gc`` is left untouched. Against
-        a fixed-name capture this file would be destroyed by the teardown.
-        """
-        monkeypatch.setattr(mr, "_ADVERTISED_MODELS", {"claude_code": list(_SERVED)})
-        client = _client(tmp_path, permission_mode="bypassPermissions")
-        client._write_claude_local_settings()
-        path = _settings(tmp_path)
-        squatter = path.with_name(path.name + ".crew-gc")
-        squatter.write_text("PROJECT-OWNED", encoding="utf-8")
-
-        _teardown(client)
-
-        # Crew deleted only its own freshly-named temp; the project's file is intact.
-        assert squatter.exists()
-        assert squatter.read_text(encoding="utf-8") == "PROJECT-OWNED"
-        assert not path.exists()
-
-
 class TestPostCaptureModelResolution:
     """The ordering half: the fold and the re-seed happen AFTER the capture."""
 
@@ -1441,19 +1197,20 @@ class TestPostCaptureModelResolution:
         sets are independent opt-ins, so the caller's gate is not a substitute.
         """
         import inspect
+        import textwrap
 
-        source = inspect.getsource(AcpClient._initialize_session)
+        source = textwrap.dedent(inspect.getsource(AcpClient._initialize_session))
         assert "if self._seeds_local_settings:" not in source
         assert source.count("await self._reseed_after_capture()") == 2
         rode_along = (
             "if self._uses_advertised_model_selection:\n"
-            "                await self._persist_advertised_models_if_changed()\n"
-            "                await self._reseed_after_capture()"
+            "            await self._persist_advertised_models_if_changed()\n"
+            "            await self._reseed_after_capture()"
         )
         assert rode_along in source
 
-        method = inspect.getsource(AcpClient._reseed_after_capture)
-        assert "if not self._seeds_local_settings:\n            return" in method
+        method = textwrap.dedent(inspect.getsource(AcpClient._reseed_after_capture))
+        assert "if not self._seeds_local_settings:\n        return" in method
 
     @pytest.mark.asyncio
     async def test_a_harness_that_seeds_no_settings_file_writes_nothing(
@@ -1515,7 +1272,10 @@ class TestPostCaptureModelResolution:
         """
         import inspect
 
-        source = inspect.getsource(AcpClient._write_claude_local_settings)
+        # The payload is rendered by ``_render_claude_settings_payload`` (split out
+        # so the shared-reader check can compare bytes before deciding to write);
+        # the fold lives there, on the write path itself either way.
+        source = inspect.getsource(AcpClient._render_claude_settings_payload)
         assert 'data["model"] = self._model' not in source
         assert "resolve_wire_model_id" in source
 

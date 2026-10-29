@@ -278,10 +278,15 @@ class TestKnowledgeSearchToolDefinition:
 
 class TestKnowledgeSearchSourceFilter:
     def test_source_id_rejects_non_string(self):
-        from kiro_crew.mcp_core import _call_tool_inner
+        from kiro_crew.mcp_core import _validate_args
 
+        # At the MCP entry point: a genuinely wrong type (list) on a string
+        # field is still rejected, while a number is defensively converted to
+        # its string form (the re-typed-numeric-string repair).
         with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "source_id": 7})
+            _validate_args("local_knowledge_search", {"query": "q", "source_id": [7]})
+        coerced = _validate_args("local_knowledge_search", {"query": "q", "source_id": 7})
+        assert coerced["source_id"] == "7"
 
     def test_source_id_rejects_overlong_value(self):
         from kiro_crew.mcp_core import _call_tool_inner
@@ -309,10 +314,15 @@ class TestKnowledgeSearchSourceFilter:
         )
 
     def test_namespace_rejects_non_string(self):
-        from kiro_crew.mcp_core import _call_tool_inner
+        from kiro_crew.mcp_core import _validate_args
 
+        # At the MCP entry point: a genuinely wrong type (list) on a string
+        # field is still rejected, while a number is defensively converted to
+        # its string form (the re-typed-numeric-string repair).
         with pytest.raises(ValidationError):
-            _call_tool_inner("local_knowledge_search", {"query": "q", "namespace": 7})
+            _validate_args("local_knowledge_search", {"query": "q", "namespace": [7]})
+        coerced = _validate_args("local_knowledge_search", {"query": "q", "namespace": 7})
+        assert coerced["namespace"] == "7"
 
     def test_namespace_rejects_overlong_value(self):
         from kiro_crew.mcp_core import _call_tool_inner
@@ -440,3 +450,86 @@ class TestKnowledgeListSources:
 
         with pytest.raises(ValidationError):
             _call_tool_inner("knowledge_list_sources", {"filter": "x"})
+
+
+# The correlated reference shape: IN (SELECT ...) inside the JOIN. It is the
+# answer the linear query must agree with, and the shape the plan guard must
+# recognise.
+_CORRELATED_COUNTS_SQL = (
+    "SELECT s.id, s.name, COUNT(DISTINCT i.id) AS item_count "
+    "FROM sources s LEFT JOIN items i ON i.status = 'active' AND ("
+    "  i.source_id = s.id"
+    "  OR i.id IN (SELECT sl.item_id FROM source_locations sl WHERE sl.source_id = s.id)"
+    ") GROUP BY s.id, s.name ORDER BY s.name"
+)
+
+
+class TestKnowledgeListSourcesCountQuery:
+    """The per-source count is linear and matches the correlated answer."""
+
+    @staticmethod
+    def _seed(path, seed: int):
+        import random
+
+        from kiro_crew.knowledge.store import KnowledgeStore
+
+        rng = random.Random(seed)
+        store = KnowledgeStore(str(path))
+        sources = [
+            store.add_source(f"S{n}", "local_folder", f"/tmp/s{seed}-{n}")
+            for n in range(rng.randint(1, 5))
+        ]
+        items = []
+        for n in range(rng.randint(0, 25)):
+            owner = rng.choice(sources + [None])
+            items.append(store.add_item(f"I{n}", f"body {seed} {n}", "note", source_id=owner))
+        for item in items:
+            if rng.random() < 0.3:
+                store.db.execute("UPDATE items SET status = 'deleted' WHERE id = ?", (item,))
+            for src in sources:
+                if rng.random() < 0.3:
+                    store.add_source_location(item, src)
+        store.db.commit()
+        return store
+
+    def test_item_owned_and_located_in_same_source_counts_once(self, tmp_path):
+        from kiro_crew.knowledge.store import KnowledgeStore
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = KnowledgeStore(str(tmp_path / "k.db"))
+        try:
+            src = store.add_source("Only", "local_folder", "/tmp/only")
+            item = store.add_item("Doc", "content", "note", source_id=src)
+            store.add_source_location(item, src)
+            rows = [tuple(r) for r in store.db.execute(_SOURCE_COUNTS_SQL)]
+        finally:
+            store.close()
+        assert rows == [(src, "Only", 1)]
+
+    @pytest.mark.parametrize("seed", range(12))
+    def test_matches_correlated_query_on_random_libraries(self, tmp_path, seed):
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = self._seed(tmp_path / "k.db", seed)
+        try:
+            new = [tuple(r) for r in store.db.execute(_SOURCE_COUNTS_SQL)]
+            old = [tuple(r) for r in store.db.execute(_CORRELATED_COUNTS_SQL)]
+        finally:
+            store.close()
+        assert new == old
+
+    def test_query_plan_has_no_correlated_subquery(self, tmp_path):
+        from kiro_crew.mcp_tools.knowledge import _SOURCE_COUNTS_SQL
+
+        store = self._seed(tmp_path / "k.db", 0)
+        try:
+
+            def plan(sql: str) -> str:
+                return " | ".join(str(r[-1]) for r in store.db.execute(f"EXPLAIN QUERY PLAN {sql}"))
+
+            # Probe: this SQLite reports the old shape as correlated, so the
+            # guard below can see the regression it is meant to catch.
+            assert "CORRELATED" in plan(_CORRELATED_COUNTS_SQL)
+            assert "CORRELATED" not in plan(_SOURCE_COUNTS_SQL)
+        finally:
+            store.close()

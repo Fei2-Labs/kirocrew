@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kiro_crew.skill_providers import _http
-from kiro_crew.skill_providers.base import SkillSearchResult
+from kiro_crew.skill_providers.base import SkillProviderError, SkillSearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,14 @@ _USER_AGENT = _http.USER_AGENT
 
 # Maximum response body size (1 MiB). Rationale in ``_http.MAX_RESPONSE_BYTES``.
 _MAX_RESPONSE_BYTES = _http.MAX_RESPONSE_BYTES
+
+# Read ceiling for the install-bundle download only. The discover handler refuses
+# a bundle whose decoded files total over 5 MiB, but this ceiling counts the raw
+# JSON body, which JSON escaping makes larger than the files it carries, so it
+# sits above that guard: a bundle the handler would accept is read whole instead
+# of being cut short and reported as "not found or empty". Search and every
+# other fetch keep the 1 MiB default.
+_MAX_BUNDLE_RESPONSE_BYTES = 6 * 1024 * 1024
 
 # Per-chunk read size while draining a response body (64 KiB).
 _HTTP_READ_CHUNK_BYTES = _http.READ_CHUNK_BYTES
@@ -99,7 +107,10 @@ class SkillsShProvider:
             return []
 
         url = f"{self._config.api_base}/search?q={urllib.parse.quote(query)}&limit={limit}"
-        data = await _fetch_json(url)
+        try:
+            data = await _fetch_json(url)
+        except _http.FetchError as exc:
+            raise _fetch_failure(exc, "search") from None
         if data is None:
             return []
 
@@ -172,7 +183,9 @@ class SkillsShProvider:
     async def fetch_skill_bundle(self, skill_id: str) -> list[tuple[str, str]] | None:
         """Fetch the full skill bundle (all files) from skills.sh.
 
-        Returns a list of (relative_path, content) tuples, or None on failure.
+        Returns a list of (relative_path, content) tuples, or None when there is
+        nothing to install (a malformed id, or a bundle with no usable file). A
+        fetch that fails raises ``SkillProviderError`` with the reason.
         Uses GET /api/download/{id} which returns all skill files.
         """
         # The skills.sh id is an "owner/repo/skill" path whose slashes are real
@@ -189,7 +202,10 @@ class SkillsShProvider:
             logger.debug("Rejecting malformed skill_id for download: %r", skill_id)
             return None
         url = f"{self._config.api_base}/download/{urllib.parse.quote(skill_id, safe='/')}"
-        data = await _fetch_json(url)
+        try:
+            data = await _fetch_json(url, bundle=True)
+        except _http.FetchError as exc:
+            raise _fetch_failure(exc, "download") from None
         # skills.sh is untrusted external input: an error/maintenance payload (or
         # a CDN interposing its SPA HTML) can be valid JSON that is not an object,
         # so guard the shape before .get() — a bare data.get() on a list/str/number
@@ -227,23 +243,48 @@ class SkillsShProvider:
         return result if result else None
 
 
-async def _fetch_json(url: str) -> Any | None:
-    """Fetch JSON from a URL. Returns None on any failure.
+def _fetch_failure(exc: _http.FetchError, what: str) -> SkillProviderError:
+    """Turn a failed skills.sh fetch into the reason the user reads.
+
+    Built from fixed text and the status code only -- never the response body
+    or the URL. *what* is ``search`` or ``download``.
+    """
+    if exc.rate_limited:
+        return SkillProviderError(
+            "rate_limited", "skills.sh is limiting requests. Try again in a few minutes."
+        )
+    if exc.status == 404 and what == "download":
+        return SkillProviderError("not_found", "skills.sh has no skill with that id.")
+    if exc.reason == "too_large":
+        return SkillProviderError("refused", "skills.sh sent a bundle over the size limit.")
+    if exc.reason == "decode":
+        return SkillProviderError("unavailable", "skills.sh sent an answer that could not be read.")
+    detail = f" (HTTP {exc.status})" if exc.status else ""
+    return SkillProviderError("unavailable", f"Could not reach skills.sh{detail}.")
+
+
+async def _fetch_json(url: str, *, bundle: bool = False) -> Any | None:
+    """Fetch JSON from a URL. Raises ``_http.FetchError`` when the fetch fails.
 
     Calls the module-global ``_sync_fetch_json`` so a test may patch this
-    provider's fetch without reaching into ``_http``.
+    provider's fetch without reaching into ``_http``. ``bundle`` selects the
+    larger install-bundle read ceiling and is forwarded only when set, so a
+    fetch that is not a bundle download calls ``_sync_fetch_json(url)`` as before.
     """
+    if bundle:
+        return await _http.run_off_loop(lambda: _sync_fetch_json(url, bundle=True))
     return await _http.run_off_loop(lambda: _sync_fetch_json(url))
 
 
-def _sync_fetch_json(url: str) -> Any | None:
+def _sync_fetch_json(url: str, *, bundle: bool = False) -> Any | None:
     """Synchronous JSON fetch (for the executor), bounded and SSRF-screened."""
     return _http.sync_fetch_json(
         url,
         allowed_hosts=_ALLOWED_HOSTS,
         internal_check=_is_internal_url,
         headers={"User-Agent": _USER_AGENT},
-        max_bytes=_MAX_RESPONSE_BYTES,
+        max_bytes=_MAX_BUNDLE_RESPONSE_BYTES if bundle else _MAX_RESPONSE_BYTES,
+        raise_on_failure=True,
     )
 
 
@@ -295,9 +336,7 @@ def _is_allowed_host(url: str) -> bool:
 
 def _open_no_internal_redirect(req):  # type: ignore[no-untyped-def]
     """Open a request with redirects held to ``_ALLOWED_HOSTS``. None if blocked."""
-    return _http.open_guarded(
-        req, allowed_hosts=_ALLOWED_HOSTS, internal_check=_is_internal_url
-    )
+    return _http.open_guarded(req, allowed_hosts=_ALLOWED_HOSTS, internal_check=_is_internal_url)
 
 
 def _read_bounded(resp, max_bytes: int) -> bytes | None:

@@ -107,7 +107,7 @@ export function usePaletteActions(): PaletteActions {
   const hasActiveChat = useAppSelector((s) => s.chat.activeSlot !== null)
 
   const { mutate: doCreateSlot } = useMutation({
-    mutationFn: () => dispatch(createSlot(undefined)).unwrap(),
+    mutationFn: () => dispatch(createSlot({ defaultFolder: true })).unwrap(),
     onError: (err: unknown) => {
       // The palette has already closed by the time this settles, so there is no
       // surface left to render the failure on and no other record of it.
@@ -134,8 +134,12 @@ export function usePaletteActions(): PaletteActions {
       resolveInvokableEnter(hasActiveChat, token, { insertToken, newSessionWithToken })(),
     navigate: (route: string) => {
       // A jump to where we already are unmounts nothing, so it must not ask.
-      if (!isCurrentUrl(route) && !mayLeave()) return
-      navigate(route)
+      const asked = !isCurrentUrl(route)
+      if (asked && !mayLeave()) return
+      // `leaveGranted` (the guide's `enter` and the rail's `NavItem` write the
+      // same mark): the guards were asked in this step, so a page that stays
+      // mounted through the jump and acts on it must not ask again.
+      navigate(route, asked ? { state: { leaveGranted: true } } : undefined)
     },
   }), [hasActiveChat, insertToken, newSessionWithToken, navigate, mayLeave, isCurrentUrl])
 }

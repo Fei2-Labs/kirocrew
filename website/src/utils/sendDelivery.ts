@@ -6,6 +6,11 @@ export interface SendReceiptBody {
   queued?: boolean
   /** A steer-flagged send was injected into the running turn. */
   steered?: boolean
+  /** A crewmate DM send's priority path (`steered`, `queued`, `cancel_requested`,
+   *  `waiting_for_input`, `stopping`, `compacting`). Informational: `ok`,
+   *  `queued` and `steered` alone decide the receipt, so `steered` here is
+   *  the same success as a steer and the steer echo owns the one bubble. */
+  responsive?: string
   /** The server-minted stable id (`meta.mid`) of the user row this send
    *  appended. Present only on a confirmed immediate dispatch; the client
    *  stamps it onto the optimistic bubble so message-pinning works before the
@@ -185,4 +190,17 @@ export async function readSendReceipt(response: SendResponseLike): Promise<SendR
  */
 export function confirmedDelivered(body: { ok?: boolean; queued?: boolean }): boolean {
   return !!body.ok && !body.queued
+}
+
+/** Client-generated one-shot correlation id for an optimistic user bubble.
+ *  The server preserves meta fields on the user row it appends, so an echo or
+ *  transcript page carries this id back and the bubble is matchable without
+ *  relying on content equality (#2845). One minter for the plain send path,
+ *  the mid-turn steer path (#6075) and the header's "Request a Feature" seed
+ *  (#13342), so the id shape cannot drift between them. Lives here, beside the
+ *  receipt contract every send already imports, rather than in the message
+ *  renderer module: `App.tsx` needs it, and pulling the renderer into the shell
+ *  chunk for one line would be the wrong trade. */
+export function mintSendId(): string {
+  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }

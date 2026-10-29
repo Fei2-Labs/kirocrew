@@ -819,16 +819,32 @@ describe('ChatPanel pointer feedback', () => {
   })
 })
 
-describe('PinnedSidePanel chip hover', () => {
-  it('withdraws the unpin dot when the pointer leaves the chip', async () => {
+describe('PinnedSidePanel chip unpin control', () => {
+  it('always renders a self-describing unpin control, revealed by CSS not by mount', async () => {
+    // Post-#13818 the unpin control is a real keyboard tab stop: it is ALWAYS in
+    // the DOM (a pin-off button named "Unpin <file>"), and the reveal is a CSS
+    // :hover/:focus-within opacity rule — not a hover-gated React mount — so it
+    // is reachable by keyboard and discoverable by a screen reader. It must be
+    // present without any hover, keep its name after the pointer leaves, and
+    // only unpin on activation.
     const pin = { path: '/home/u/src/a.ts', label: '', pinnedAt: 1 }
     render(
       <PinnedSidePanel pins={[pin]} updatedPaths={new Set()} deletedPaths={new Set()} visible />,
     )
+    const unpin = screen.getByRole('button', { name: 'Unpin a.ts' })
+    expect(unpin).toBeInTheDocument()
+    // Hover / unhover does not add or remove it (CSS handles visibility).
     await userEvent.hover(screen.getByText('a.ts'))
-    expect(screen.getByRole('button', { name: 'Unpin' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Unpin a.ts' })).toBeInTheDocument()
     await userEvent.unhover(screen.getByText('a.ts'))
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Unpin a.ts' })).toBeInTheDocument()
+    // It fires only on activation, never on mere hover. (The control carries
+    // `pointer-events: none` until the CSS :hover/:focus-within reveal, which
+    // happy-dom does not paint, so drive the handler with fireEvent rather than
+    // userEvent's pointer-events-aware click — in a real browser focus/hover
+    // flips it to `pointer-events: auto`, exercised via the harness screenshots.)
     expect(unpinFile).not.toHaveBeenCalled()
+    fireEvent.click(unpin)
+    expect(unpinFile).toHaveBeenCalledWith(pin.path)
   })
 })

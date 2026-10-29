@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Container
+from collections.abc import Callable, Container, Iterable
 from typing import TYPE_CHECKING, Generic, NamedTuple, TypeVar
 
 if TYPE_CHECKING:
@@ -27,6 +29,46 @@ logger = logging.getLogger(__name__)
 #: This bound does not cover the METADATA cache, which is sized separately by
 #: ``_METADATA_CACHE_MAX`` below for the reasons documented there.
 _TRANSCRIPT_CACHE_MAX = 256
+
+#: Parsed transcripts unread this long are dropped from the message caches. A
+#: boot scan or a restore parses hundreds of transcripts once; holding them all
+#: for the life of the gateway was ~150 MB on an idle copy of a real data home.
+#: A dropped entry is re-parsed on its next read, as on a cold cache.
+_TRANSCRIPT_CACHE_IDLE_TTL = 600.0
+_IDLE_SWEEP_SECS = 60.0
+
+_idle_caches: "weakref.WeakSet[_LRUCache]" = weakref.WeakSet()
+_idle_sweeper_lock = threading.Lock()
+_idle_sweeper: threading.Thread | None = None
+
+
+def _register_idle_cache(cache: "_LRUCache") -> None:
+    """Track a cache for the idle sweep and start the sweeper once per process."""
+    global _idle_sweeper
+    with _idle_sweeper_lock:
+        _idle_caches.add(cache)
+        if _idle_sweeper is None or not _idle_sweeper.is_alive():
+            _idle_sweeper = threading.Thread(
+                target=_idle_sweep_loop, name="kc-history-cache-sweep", daemon=True
+            )
+            _idle_sweeper.start()
+
+
+def sweep_idle_caches(now: float | None = None) -> int:
+    """Drop idle entries from every registered cache. Returns how many."""
+    with _idle_sweeper_lock:
+        caches = list(_idle_caches)
+    return sum(cache.drop_idle(now) for cache in caches)
+
+
+def _idle_sweep_loop() -> None:
+    while True:
+        time.sleep(_IDLE_SWEEP_SECS)
+        try:
+            sweep_idle_caches()
+        except Exception:  # noqa: BLE001 - a cache sweep must never kill its thread
+            logger.debug("transcript cache idle sweep failed", exc_info=True)
+
 
 #: Upper bound for ``ConversationLog._meta_cache`` specifically, kept separate
 #: from ``_TRANSCRIPT_CACHE_MAX`` above.
@@ -47,6 +89,51 @@ _TRANSCRIPT_CACHE_MAX = 256
 #: applied to the memo every sidebar page fetch depends on. Still bounded, so a
 #: gateway touching an unbounded number of sessions cannot grow without limit.
 _METADATA_CACHE_MAX = 8192
+
+
+#: ``(mtime_ns, ctime_ns, size, inode, device)`` identifying one file revision.
+#: ``ctime_ns`` cannot be set from user space, so a same-size in-place rewrite
+#: that restores ``mtime`` still changes the stamp.
+FileStamp = tuple[int, int, int, int, int]
+
+
+class _TranscriptRowIndexEntry(NamedTuple):
+    """Sparse byte offsets for one immutable transcript revision.
+
+    ``checkpoints`` stores ``(logical_row, byte_offset)`` pairs for valid,
+    non-metadata message rows. The file stamp and process-wide generation are
+    both required: atomic replacement changes the inode, while a rewrite that
+    restores mtime is exposed by the generation. A key with no transcript file
+    carries ``stamp=None``: the same value a re-stat returns, so a not-yet-flushed
+    slot is a stable, empty revision rather than a perpetually changing one.
+    """
+
+    stamp: FileStamp | None
+    generation: int
+    row_count: int
+    checkpoints: tuple[tuple[int, int], ...]
+
+
+class _TranscriptIndexBase(NamedTuple):
+    """A row index kept across invalidation so an append-only file is not rescanned.
+
+    ``ConversationLog.append`` drops the cached :class:`_TranscriptRowIndexEntry`
+    on every write, so without this the next bounded page re-parses the whole
+    file. The base records the index of bytes ``[0, scanned_end)``, where
+    ``scanned_end`` is a record boundary, plus the file identity and a digest of
+    the last bytes before it. It is trusted only after the file is re-checked
+    (same device and inode, grown past ``scanned_end``, same digest), so it needs
+    no invalidation of its own: atomic rewrites change the inode, and an edit
+    that moves those bytes changes the digest.
+    """
+
+    dev: int
+    ino: int
+    scanned_end: int
+    digest: bytes
+    row_count: int
+    checkpoints: tuple[tuple[int, int], ...]
+
 
 _V = TypeVar("_V")
 
@@ -89,10 +176,36 @@ class _LRUCache(Generic[_V]):
     another locked method, so the lock is never re-entered.
     """
 
-    def __init__(self, maxsize: int = _TRANSCRIPT_CACHE_MAX) -> None:
+    def __init__(self, maxsize: int = _TRANSCRIPT_CACHE_MAX, *, idle_ttl: float = 0.0) -> None:
         self._maxsize = maxsize
         self._data: "OrderedDict[str, _V]" = OrderedDict()
         self._lock = threading.Lock()
+        #: Seconds an entry may sit unread before the idle sweeper drops it;
+        #: 0 keeps entries until LRU pressure evicts them. Stamps are kept in
+        #: the same LRU order as ``_data``, so the oldest entry is always first.
+        self._idle_ttl = idle_ttl
+        self._stamps: dict[str, float] = {}
+        if idle_ttl > 0:
+            _register_idle_cache(self)
+
+    def _touch(self, key: str) -> None:
+        if self._idle_ttl > 0:
+            self._stamps[key] = time.monotonic()
+
+    def drop_idle(self, now: float | None = None) -> int:
+        """Drop entries unread for ``idle_ttl`` seconds. Returns how many."""
+        if self._idle_ttl <= 0:
+            return 0
+        cutoff = (time.monotonic() if now is None else now) - self._idle_ttl
+        dropped = 0
+        with self._lock:
+            for key in list(self._data):
+                if self._stamps.get(key, 0.0) > cutoff:
+                    break  # LRU order: everything after this is newer
+                del self._data[key]
+                self._stamps.pop(key, None)
+                dropped += 1
+        return dropped
 
     def get(self, key: str, default: _V | None = None) -> _V | None:
         with self._lock:
@@ -100,24 +213,29 @@ class _LRUCache(Generic[_V]):
                 self._data.move_to_end(key)
             except KeyError:
                 return default
+            self._touch(key)
             return self._data[key]
 
     def __getitem__(self, key: str) -> _V:
         with self._lock:
             self._data.move_to_end(key)
+            self._touch(key)
             return self._data[key]
 
     def __setitem__(self, key: str, value: _V) -> None:
         with self._lock:
             self._data[key] = value
             self._data.move_to_end(key)
+            self._touch(key)
             # Evict least-recently-used entries until within the bound.
             if self._maxsize > 0:
                 while len(self._data) > self._maxsize:
-                    self._data.popitem(last=False)
+                    old, _ = self._data.popitem(last=False)
+                    self._stamps.pop(old, None)
 
     def pop(self, key: str, default: _V | None = None) -> _V | None:
         with self._lock:
+            self._stamps.pop(key, None)
             return self._data.pop(key, default)
 
     def pop_prefix(self, prefix: str) -> None:
@@ -131,6 +249,7 @@ class _LRUCache(Generic[_V]):
             doomed = [k for k in self._data if isinstance(k, str) and k.startswith(prefix)]
             for key in doomed:
                 del self._data[key]
+                self._stamps.pop(key, None)
 
     def __contains__(self, key: object) -> bool:
         with self._lock:
@@ -143,6 +262,7 @@ class _LRUCache(Generic[_V]):
     def clear(self) -> None:
         with self._lock:
             self._data.clear()
+            self._stamps.clear()
 
 
 class _SearchTextCache(Generic[_V]):
@@ -175,7 +295,14 @@ class _SearchTextCache(Generic[_V]):
     method calls another locked method.
     """
 
-    def __init__(self, max_bytes: int, sizer: Callable[[_V], int], label: str = "") -> None:
+    def __init__(
+        self,
+        max_bytes: int,
+        sizer: Callable[[_V], int],
+        label: str = "",
+        *,
+        warn_on_refusal: bool = True,
+    ) -> None:
         self._max_bytes = max_bytes
         self._sizer = sizer
         self._label = label
@@ -184,7 +311,9 @@ class _SearchTextCache(Generic[_V]):
         self._admitted = 0
         self._refused = 0
         self._refused_since_prune = 0
-        self._warned = False
+        # A memo whose refusals cost only recomputation, never a file read,
+        # turns the warning off: reaching its ceiling is its normal state.
+        self._warned = not warn_on_refusal
         self._lock = threading.Lock()
 
     def get(self, key: str, default: _V | None = None) -> _V | None:
@@ -293,6 +422,150 @@ class _SearchTextCache(Generic[_V]):
             }
 
 
+class _GroupRecencyMemo(_SearchTextCache[_V]):
+    """A :class:`_SearchTextCache` that admits by recency, one key group at a time.
+
+    Plain admission control keeps whatever filled the budget first, so a memo
+    whose keys name a query term stops learning once full: every term first seen
+    later is refused for the life of the process. Plain per-entry LRU fixes that
+    but brings back the cyclic-scan cliff: a query walks its window in the same
+    order every time, so its next entry evicts the oldest entry of the same
+    query, which is the one it reads next.
+
+    The eviction unit is therefore a GROUP of keys, named by ``group_of(key)``
+    (here: the query term, every session's entry for it together). A full memo
+    evicts whole least-recently-used groups, and never a group that a running
+    query has pinned with :meth:`pinned`, so a query can only evict other
+    queries' terms. When nothing evictable is left, the entry is refused exactly
+    as the base class would, which keeps a single query larger than the budget
+    at a stable partial hit rate instead of thrashing. An eviction counts toward
+    :meth:`refused_since_prune` like a refusal: both mean the budget is binding.
+    """
+
+    def __init__(
+        self,
+        max_bytes: int,
+        sizer: Callable[[_V], int],
+        group_of: Callable[[str], str],
+        label: str = "",
+    ) -> None:
+        super().__init__(max_bytes, sizer, label, warn_on_refusal=False)
+        self._group_of = group_of
+        #: group -> its keys, least recently used group first.
+        self._groups: OrderedDict[str, set[str]] = OrderedDict()
+        self._pins: dict[str, int] = {}
+        self._evicted = 0
+
+    def pinned(self, groups: Iterable[str]) -> _PinnedGroups:
+        """Context manager keeping *groups* from eviction while a query runs."""
+        return _PinnedGroups(self, tuple(dict.fromkeys(groups)))
+
+    def _pin(self, groups: tuple[str, ...], delta: int) -> None:
+        with self._lock:
+            for group in groups:
+                count = self._pins.get(group, 0) + delta
+                if count > 0:
+                    self._pins[group] = count
+                else:
+                    self._pins.pop(group, None)
+
+    def get(self, key: str, default: _V | None = None) -> _V | None:
+        with self._lock:
+            value = self._data.get(key)
+            if value is None:
+                return default
+            group = self._group_of(key)
+            if group in self._groups:
+                self._groups.move_to_end(group)
+            return value
+
+    def _drop(self, key: str) -> None:
+        """Remove *key* and its group bookkeeping. Caller holds the lock."""
+        self._bytes -= self._sizer(self._data.pop(key))
+        group = self._group_of(key)
+        members = self._groups.get(group)
+        if members is not None:
+            members.discard(key)
+            if not members:
+                del self._groups[group]
+
+    def __setitem__(self, key: str, value: _V) -> None:
+        cost = self._sizer(value)
+        group = self._group_of(key)
+        with self._lock:
+            if key in self._data:
+                self._drop(key)
+            if self._max_bytes > 0 and self._bytes + cost > self._max_bytes:
+                for victim in list(self._groups):
+                    if victim == group or self._pins.get(victim):
+                        continue
+                    for member in list(self._groups[victim]):
+                        self._drop(member)
+                        self._evicted += 1
+                    # Pressure, like a refusal: the signal to spend a prune.
+                    self._refused_since_prune += 1
+                    if self._bytes + cost <= self._max_bytes:
+                        break
+                if self._bytes + cost > self._max_bytes:
+                    self._refused += 1
+                    self._refused_since_prune += 1
+                    return
+            self._data[key] = value
+            self._bytes += cost
+            self._admitted += 1
+            members = self._groups.get(group)
+            if members is None:
+                self._groups[group] = {key}
+            else:
+                members.add(key)
+                self._groups.move_to_end(group)
+
+    def pop(self, key: str, default: _V | None = None) -> _V | None:
+        with self._lock:
+            if key in self._data:
+                value = self._data[key]
+                self._drop(key)
+                return value
+            return default
+
+    def retain(self, live_keys: Container[str]) -> int:
+        with self._lock:
+            doomed = [key for key in self._data if key not in live_keys]
+            for key in doomed:
+                self._drop(key)
+            self._refused_since_prune = 0
+            return len(doomed)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self._groups.clear()
+            self._bytes = 0
+
+    def stats(self) -> dict[str, int]:
+        out = super().stats()
+        with self._lock:
+            out["evicted"] = self._evicted
+            out["groups"] = len(self._groups)
+        return out
+
+
+class _PinnedGroups:
+    """``with memo.pinned(groups):`` -- see :meth:`_GroupRecencyMemo.pinned`."""
+
+    __slots__ = ("_memo", "_groups")
+
+    def __init__(self, memo: _GroupRecencyMemo, groups: tuple[str, ...]) -> None:
+        self._memo = memo
+        self._groups = groups
+
+    def __enter__(self) -> None:
+        self._memo._pin(self._groups, 1)
+
+    def __exit__(self, *exc: object) -> None:
+        self._memo._pin(self._groups, -1)
+
+
 class HistoryCacheCoordinator:
     """Coordinate facade-held history caches and invalidation generations.
 
@@ -340,6 +613,17 @@ class HistoryCacheCoordinator:
                 self._registry_owner._cache_gens[gen_key] = (
                     self._registry_owner._cache_gens.get(gen_key, 0) + 1
                 )
+            epochs = self._registry_owner._dir_write_epochs
+            epochs[base] = epochs.get(base, 0) + 1
+
+    def _dir_write_epoch(self) -> int:
+        """How many invalidations any instance over this directory has made.
+
+        Moves whenever any session's generation does, so an unmoved value proves
+        no write landed in this process between two reads of it.
+        """
+        with self._registry_owner._cache_gens_guard:
+            return self._registry_owner._dir_write_epochs.get(str(self._log._dir), 0)
 
     def _publish_if_current(
         self,
@@ -364,19 +648,26 @@ class HistoryCacheCoordinator:
             cache.pop(entry_key, None)
 
     def _invalidate_cache(self, key: str) -> None:
-        """Invalidate every facade-held cache spelling after a write."""
+        """Invalidate content caches and advance generations after a write.
+
+        Sparse page indexes are revision-specific derived state, so they are
+        invalidated with content caches. A later bounded read rebuilds from byte
+        zero unless the exact file stamp and generation still match.
+        """
         idents = self._log._cache_key_identities(key)
         # Bump BEFORE dropping entries: a fill publishing between a pop and a
         # later bump would pass its re-check and resurrect the entry just
         # dropped. Bump-first makes every fill storing after a pop self-discard.
         self._log._bump_cache_gen(key, idents)
-        # Pops must be exactly as wide as the generation bump. The writer and
-        # reader may use different logical, sanitized, canonical, or legacy
-        # spellings for the same transcript; under-popping one spelling leaves
-        # a warm entry permanently stale after an mtime-preserving rewrite.
+        # Content-cache pops must be exactly as wide as the generation bump. The
+        # writer and reader may use different logical, sanitized, canonical, or
+        # legacy spellings for the same transcript; under-popping one spelling
+        # leaves content or derived offsets stale after a rewrite.
         for ident in idents:
             self._log._msg_cache.pop(ident, None)
+            self._log._page_index_cache.pop(ident, None)
             self._log._meta_cache.pop(ident, None)
+            self._log._title_scan_cache.pop(ident, None)
             self._log._file_change_cache.pop(ident, None)
             self._log._tab_id_by_key.pop(ident, None)
             self._log._folded_cache.pop(ident, None)

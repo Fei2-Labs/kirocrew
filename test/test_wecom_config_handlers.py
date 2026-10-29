@@ -10,6 +10,14 @@ from pathlib import Path
 from aiohttp.test_utils import make_mocked_request
 
 import kiro_crew.config.loader as loader
+from kiro_crew.secrets import SecretVault
+
+
+def _vault_value(env: Path, key: str) -> str | None:
+    """The vault secret a channel save stored beside *env* under *key*."""
+    stored = SecretVault(env.parent).get(key)
+    return stored.reveal() if stored is not None else None
+
 
 BOT_ID = "wxb-1234567890abcdef"
 SECRET = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd"
@@ -89,10 +97,11 @@ def test_save_persists_credentials_and_config(tmp_path: Path, monkeypatch) -> No
     assert body["restart_required"] is True
     env_text = env.read_text(encoding="utf-8")
     assert f"WECOM_BOT_ID={BOT_ID}" in env_text
-    assert f"WECOM_SECRET={SECRET}" in env_text
+    assert "WECOM_SECRET=secret://WECOM_SECRET" in env_text
+    assert _vault_value(env, "WECOM_SECRET") == SECRET
     assert (env.stat().st_mode & 0o077) == 0
     assert os.environ["WECOM_BOT_ID"] == BOT_ID
-    assert os.environ["WECOM_SECRET"] == SECRET
+    assert os.environ["WECOM_SECRET"] == "secret://WECOM_SECRET"
     cfg = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert cfg["wecom"]["enabled"] is True
     assert cfg["wecom"]["allowed_users"] == [
@@ -212,7 +221,8 @@ def test_env_line_paste_is_stripped(tmp_path: Path, monkeypatch) -> None:
     )
     status, _body = status_body
     assert status == 200
-    assert f"WECOM_SECRET={SECRET}\n" in env.read_text(encoding="utf-8")
+    assert "WECOM_SECRET=secret://WECOM_SECRET\n" in env.read_text(encoding="utf-8")
+    assert _vault_value(env, "WECOM_SECRET") == SECRET
     assert f"WECOM_SECRET=WECOM_SECRET={SECRET}" not in env.read_text(encoding="utf-8")
 
 
@@ -416,7 +426,6 @@ def test_the_config_and_env_writes_run_under_the_live_config_hold(
     Webex and Feishu savers -- so the watcher cannot apply the widened roster
     to the running transport while the .env write is still in flight (and may
     yet fail and roll the config back)."""
-    import kiro_crew.agent as _agent
     import kiro_crew.dashboard.handlers.messaging as mod
     from kiro_crew.config import live
 
@@ -427,18 +436,20 @@ def test_the_config_and_env_writes_run_under_the_live_config_hold(
 
     held_at: list[str] = []
     watcher = live.watch()
-    real_json_write = _agent._atomic_json_write
+    real_json_write = loader.write_config_atomically
     real_env_write = mod._write_env_off_loop
 
-    def _json_write(path, data):
+    def _json_write(path, data, **kw):
         held_at.append(f"config:{watcher._hold_depth}")
-        real_json_write(path, data)
+        real_json_write(path, data, **kw)
 
     async def _env_write(updates):
         held_at.append(f"env:{watcher._hold_depth}")
         await real_env_write(updates)
 
-    monkeypatch.setattr(_agent, "_atomic_json_write", _json_write)
+    # The save writes through ``update_config_locked``, whose file write is the
+    # loader's ``write_config_atomically``.
+    monkeypatch.setattr(loader, "write_config_atomically", _json_write)
     monkeypatch.setattr(mod, "_write_env_off_loop", _env_write)
     monkeypatch.delenv("WECOM_SECRET", raising=False)
     monkeypatch.delenv("WECOM_BOT_ID", raising=False)
@@ -467,7 +478,6 @@ def test_set_config_write_failure_leaves_consistent_pair(
     (i.e. at least one config field differs from stored).  This test includes
     ``enabled: True`` in the body to ensure `staged` has an entry and the
     config-write failure path is exercised."""
-    import kiro_crew.agent as _agent
     import kiro_crew.dashboard.handlers.messaging as mod
 
     env = tmp_path / ".env"
@@ -485,7 +495,7 @@ def test_set_config_write_failure_leaves_consistent_pair(
     def _boom(*_a, **_k):
         raise OSError("disk full during config write")
 
-    monkeypatch.setattr(_agent, "_atomic_json_write", _boom)
+    monkeypatch.setattr(loader, "write_config_atomically", _boom)
     try:
         _client_put(
             mod,
@@ -521,13 +531,12 @@ def test_set_config_write_failure_preserves_process_only_credential(
       - os.environ["WECOM_BOT_ID"]  = "env-only-bot-id"  (process-only)
       - os.environ["WECOM_SECRET"]  = "env-only-secret"   (process-only)
       - .env file has no WECOM_* entries at all
-      - _atomic_json_write raises (disk full)
+      - the config.json write raises (disk full)
 
     With config-first ordering: the config write fails before
     _commit_env_wecom() is called, so os.environ is never mutated by the
     handler.  Both process-only credentials are trivially preserved.
     """
-    import kiro_crew.agent as _agent
     import kiro_crew.dashboard.handlers.messaging as mod
 
     env = tmp_path / ".env"
@@ -548,7 +557,7 @@ def test_set_config_write_failure_preserves_process_only_credential(
     def _boom(*_a, **_k):
         raise OSError("disk full during config write")
 
-    monkeypatch.setattr(_agent, "_atomic_json_write", _boom)
+    monkeypatch.setattr(loader, "write_config_atomically", _boom)
     try:
         _client_put(
             mod,
@@ -576,3 +585,20 @@ def test_set_config_write_failure_preserves_process_only_credential(
     assert SECRET not in env_text, ".env must not be written when config write fails (WECOM_SECRET)"
     monkeypatch.delenv("WECOM_BOT_ID", raising=False)
     monkeypatch.delenv("WECOM_SECRET", raising=False)
+
+
+def test_save_survives_wrong_typed_stored_allowed_users(tmp_path: Path, monkeypatch) -> None:
+    """A hand-edited non-list ``allowed_users`` in config.json degrades to
+    empty, so the saver's comprehension and ``list(...)`` comparison do not run
+    on a non-iterable and the save still applies."""
+    import kiro_crew.dashboard.handlers.messaging as mod
+
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"wecom": {"allowed_users": 123}}), encoding="utf-8")
+    (status_body, _env) = _client_put(
+        mod, monkeypatch, tmp_path, {"allowed_user_ids": ["zhangsan"]}
+    )
+    status, _ = status_body
+    assert status == 200
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved["wecom"]["allowed_users"] == [{"userid": "zhangsan", "name": ""}]

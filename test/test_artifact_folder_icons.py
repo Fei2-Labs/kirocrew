@@ -29,6 +29,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from body_stream_helpers import attach_json_body
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactFolderStore, ArtifactStore
@@ -76,7 +77,7 @@ def _request(
     req.match_info = match or {}
     req.query = query or {}
     encoded = json.dumps(body).encode() if isinstance(body, dict) else b""
-    req.read = AsyncMock(return_value=encoded)
+    attach_json_body(req, encoded)
     req.app = {"state": MagicMock(), "_restricted_session": False}
     return req
 
@@ -498,10 +499,14 @@ class TestIconRacesThroughHandlers:
             async def _hooked(fn):  # type: ignore[no-untyped-def]
                 out = await real_off_loop(fn)
                 # Land a manual pick the instant _apply_updates has committed,
-                # i.e. inside the arming window.
+                # i.e. inside the arming window. The handler offloads several
+                # reads before the commit, so key off the rename having landed
+                # rather than off which call this is.
                 if not fired["done"]:
-                    fired["done"] = True
-                    folders.set_icon(fid, "🧪")
+                    current = folders.get(fid)
+                    if current is not None and current["name"] == "Chemistry":
+                        fired["done"] = True
+                        folders.set_icon(fid, "🧪")
                 return out
 
             monkeypatch.setattr(art_handlers, "_run_off_loop", _hooked)

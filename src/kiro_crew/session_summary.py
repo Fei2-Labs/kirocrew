@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kiro_crew.security import redact
+from kiro_crew.warm_task_brief_contract import is_warm_task_brief_message
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ _INJECTED_PREFIXES = (
     "[subagent batch completion event]",
     "[auto-nudge cycle",
     "[monitor wake]",
+    "[work-ledger wake]",
     "[tool refusal",
     "[tool stall",
     "=== restored context",
@@ -52,7 +54,7 @@ _INJECTED_PREFIXES = (
 # A pasted stack trace or log dump under role "user" is not a goal either, but
 # it is only recognizable by shape. Cap user text so one paste cannot crowd out
 # the rest of the session; intent survives truncation, volume does not help.
-_MAX_USER_CHARS = 4000
+MAX_USER_CHARS = 4000
 
 
 @dataclass
@@ -106,11 +108,16 @@ def _is_injected(text: str) -> bool:
     return any(head.startswith(p) for p in _INJECTED_PREFIXES)
 
 
+def is_injected_text(text: str) -> bool:
+    """True when a role-``user`` row's *text* came from automation."""
+    return _is_injected(text)
+
+
 def extract_turns(
     records: list[dict],
     *,
     assistant_excerpt_chars: int = 400,
-    max_user_chars: int = _MAX_USER_CHARS,
+    max_user_chars: int = MAX_USER_CHARS,
 ) -> list[TranscriptTurn]:
     """Reduce raw transcript *records* to the rows a summarization pass reads.
 
@@ -125,6 +132,8 @@ def extract_turns(
 
     for rec in records:
         if not isinstance(rec, dict):
+            continue
+        if is_warm_task_brief_message(rec):
             continue
         role = rec.get("role")
         if role not in _READ_ROLES:
@@ -242,6 +251,40 @@ def render_input(turns: list[TranscriptTurn]) -> str:
             lines.append(turn.text)
         lines.append("")
     return "\n".join(lines).strip()
+
+
+# Over budget, a session keeps what fits of its opening goals and newest turns.
+_MAX_INPUT_CHARS = 40_000
+_KEEP_FIRST_TURNS = 3
+
+
+def render_bounded_input(turns: list[TranscriptTurn], max_chars: int = _MAX_INPUT_CHARS) -> str:
+    """:func:`render_input` under *max_chars*: a marker for the middle, long turns cut."""
+    whole = render_input(turns)
+    if len(whole) <= max_chars:
+        return whole
+    blocks = [_excerpt(render_input([turn]), max_chars // 8) for turn in turns]
+    head: list[str] = []
+    used = 64  # the marker and its separators
+    for turn, block in zip(turns, blocks):
+        if (turn.user_turn or 0) > _KEEP_FIRST_TURNS or used + len(block) > max_chars // 2:
+            break
+        head.append(block)
+        used += len(block) + 2
+    tail: list[str] = []
+    for block in reversed(blocks[len(head) :]):
+        if used + len(block) > max_chars:
+            break
+        tail.append(block)
+        used += len(block) + 2
+    tail.reverse()
+    if len(head) + len(tail) == len(blocks):
+        return "\n\n".join(blocks)
+    cut = [t.user_turn for t in turns[len(head) : len(turns) - len(tail)] if t.user_turn]
+    marker = "[... replies omitted ...]"
+    if cut:
+        marker = f"[... user turns {cut[0]}-{cut[-1]} omitted ...]"
+    return "\n\n".join([*head, marker, *tail])
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@
  * props) with the find pane open and asserts the find input disappears and the
  * target panel appears.
  *
- * Uses the REAL usePanelState / useDiffPanel / useMessageSearch hooks so the
+ * Uses the REAL useMessageSearch hook so the
  * single-dock precedence + close-on-open wiring is exercised end to end.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
@@ -56,8 +56,8 @@ vi.mock('../components/DiffPanel', async () => {
 })
 
 // Everything else ChatPage pulls in that is irrelevant to dock/search wiring.
-// NOTE: usePanelState / useDiffPanel / useMessageSearch are intentionally NOT
-// mocked — the test exercises the real hooks. DetailPanel + SearchBar are also
+// NOTE: useMessageSearch is intentionally NOT
+// mocked — the test exercises the real hook. DetailPanel + SearchBar are also
 // real so the find pane and diff pane actually mount/unmount.
 vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
 // The real message list uses a custom virtualizer (useVirtualChat) driven by
@@ -80,6 +80,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(),
+      retainRange: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -119,7 +120,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -165,16 +167,20 @@ const ASSISTANT_MSG = {
   meta: { file_changes: [{ path: '/f.txt', status: 'modified' }] },
 }
 
-const renderChatPage = () => {
+const renderChatPage = ({ withWorker = false } = {}) => {
   const slot = { key: 'chat-1', title: 'chat-1', messages: 1, running: false, mode: '', created: '', last_ts: '' }
-  apiMocks.chatSlots = vi.fn().mockResolvedValue([slot])
+  // A subagent slot the active chat spawned makes the Dashboard dock
+  // `relevant` (useCommandCenter scopes more than one slot to this root).
+  const worker = { key: 'worker-1', title: 'worker', messages: 0, running: true, mode: '', created: '', last_ts: '', created_by: 'chat-1' }
+  const slots = withWorker ? [slot, worker] : [slot]
+  apiMocks.chatSlots = vi.fn().mockResolvedValue(slots)
   // On mount ChatPage loads the active slot's detail; return the seeded
   // message so the post-mount reconcile keeps it (an empty list would wipe it).
   apiMocks.chatSlotDetail = vi.fn().mockResolvedValue({ messages: [ASSISTANT_MSG], has_more: false, total: 1 })
   const store = createTestStore({
     dashboard: {
       status: { platform: 'darwin' }, connected: false,
-      slots: [slot], approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
+      slots, approvalMode: 'normal', channelTrusted: false, refreshTrigger: 0,
       unreadSlots: [], updateProgress: null,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
@@ -269,6 +275,14 @@ describe('ChatPage – opening a dock panel closes the find pane', () => {
       expect(screen.queryByPlaceholderText(FIND_PLACEHOLDER)).toBeNull()
     })
   })
+
+  it('draws no status-tile HUD above the composer', async () => {
+    localStorage.clear()
+    renderChatPage({ withWorker: true })
+    // A worker makes a team, which is exactly what used to raise the tiles.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    expect(screen.queryByTestId('command-center-dock')).toBeNull()
+  })
 })
 
 
@@ -359,10 +373,10 @@ describe('virtualKeyFor — #253 stability extended to the virtualizer/HeightCac
   it('two sibling groups whose leads share a coarse-clock ts get DISTINCT keys (mid tie-break)', () => {
     const msgKey = makeMsgKey()
     // The reducer explicitly supports distinct rows stamped in the same OS
-    // tick (see isRedeliveredMessage in chatSlice) — row identity is meta.mid.
-    // The index key this change replaces was unique by construction; the mid
-    // tie-break keeps that property so sibling groups never alias each
-    // other's HeightCache entry or React key.
+    // tick (see isRedeliveredMessage in transcript.ts under store/chat) — row
+    // identity is meta.mid. The index key this change replaces was unique by
+    // construction; the mid tie-break keeps that property so sibling groups
+    // never alias each other's HeightCache entry or React key.
     const a: DisplayItem = {
       kind: 'group',
       msgs: [{ role: 'tool', content: '🔧 grep', cls: '', ts: 'tick-7', meta: { mid: 'm-1' } }],

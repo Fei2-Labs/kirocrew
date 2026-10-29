@@ -1,17 +1,20 @@
 // Regression for #1196: after browsing/drilling into a directory, the browse
 // combobox input should carry a trailing path delimiter so the user can start
 // typing the next path segment immediately.
-import { render, screen, waitFor, fireEvent } from '@testing-library/react'
+import { screen, waitFor, fireEvent } from '@testing-library/react'
+import { renderWithProviders } from './helpers'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import ProjectPicker from '../components/ProjectPicker'
 
 const browseDirs = vi.fn()
 const recentProjects = vi.fn()
+const favoriteProjects = vi.fn()
 
 vi.mock('../api/client', () => ({
   api: {
     browseDirs: (path?: string) => browseDirs(path),
     recentProjects: () => recentProjects(),
+    favoriteProjects: () => favoriteProjects(),
   },
 }))
 
@@ -21,7 +24,7 @@ const anchorRect = {
 } as DOMRect
 
 function open() {
-  render(
+  renderWithProviders(
     <ProjectPicker open onOpenChange={() => {}} anchorRect={anchorRect} onSelect={() => {}} />,
   )
 }
@@ -30,8 +33,12 @@ describe('ProjectPicker path delimiter (#1196)', () => {
   beforeEach(() => {
     browseDirs.mockReset()
     recentProjects.mockReset()
+    favoriteProjects.mockReset()
     // No recent projects -> the picker opens straight on the Browse tab.
     recentProjects.mockResolvedValue({ dirs: [] })
+    // Nor favourites: the landing tab is chosen from both lists, so Browse is only
+    // reached when neither has rows.
+    favoriteProjects.mockResolvedValue({ dirs: [] })
   })
 
   it('appends a trailing slash to the browsed directory path', async () => {
@@ -85,7 +92,7 @@ describe('ProjectPicker path delimiter (#1196)', () => {
       parent: '/home/user',
       dirs: [{ name: 'src', path: '/home/user/project/src' }],
     })
-    render(
+    renderWithProviders(
       <ProjectPicker open onOpenChange={() => {}} anchorRect={anchorRect} onSelect={onSelect} />,
     )
     const input = await screen.findByRole('combobox')
@@ -110,7 +117,7 @@ describe('ProjectPicker path delimiter (#1196)', () => {
   it('preserves a Windows drive root on commit (C:\\ must not become C:)', async () => {
     const onSelect = vi.fn()
     browseDirs.mockResolvedValue({ path: 'C:\\', parent: 'C:\\', dirs: [] })
-    render(
+    renderWithProviders(
       <ProjectPicker open onOpenChange={() => {}} anchorRect={anchorRect} onSelect={onSelect} />,
     )
     const input = await screen.findByRole('combobox')
@@ -126,7 +133,7 @@ describe('ProjectPicker path delimiter (#1196)', () => {
       parent: 'C:\\Users\\me',
       dirs: [],
     })
-    render(
+    renderWithProviders(
       <ProjectPicker open onOpenChange={() => {}} anchorRect={anchorRect} onSelect={onSelect} />,
     )
     const input = await screen.findByRole('combobox')
@@ -141,7 +148,7 @@ describe('ProjectPicker path delimiter (#1196)', () => {
     // appended `/` is stripped at commit.
     const onSelect = vi.fn()
     browseDirs.mockResolvedValue({ path: '/home/weird\\', parent: '/home', dirs: [] })
-    render(
+    renderWithProviders(
       <ProjectPicker open onOpenChange={() => {}} anchorRect={anchorRect} onSelect={onSelect} />,
     )
     const input = await screen.findByRole('combobox')

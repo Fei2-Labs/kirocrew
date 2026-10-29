@@ -8,22 +8,6 @@
     }
   },
   {
-    "action": "compaction",
-    "frame": "_kiro.dev/compaction/status",
-    "params": {
-      "sessionId": "kiro-session-0001",
-      "status": "started"
-    }
-  },
-  {
-    "action": "compaction",
-    "frame": "_kiro.dev/compaction/status",
-    "params": {
-      "sessionId": "kiro-session-0001",
-      "status": "completed"
-    }
-  },
-  {
     "action": "clear",
     "frame": "_kiro.dev/clear/status",
     "params": {
@@ -108,6 +92,12 @@
         "tool_final": true,
         "tool_output": "{\"content\": \"the deploy key is [REDACTED: credential]\"}",
         "tool_output_bytes": 55,
+        "tool_output_credentials": [
+          [
+            "<fingerprint>",
+            null
+          ]
+        ],
         "tool_output_digest": "a4794d0ce0319c03fe14037082f367633d91b9ab8d85cf066f3deedc892fed2a",
         "tool_status": "completed"
       }

@@ -37,8 +37,16 @@ class FakeHandle:
 class FakeEngine:
     """Records calls; each step is individually configurable to raise/return."""
 
-    def __init__(self, *, handle=None, preflight_exc=None, provision_exc=None, register_exc=None,
-                 teardown_exc=None, teardown_confirms=True):
+    def __init__(
+        self,
+        *,
+        handle=None,
+        preflight_exc=None,
+        provision_exc=None,
+        register_exc=None,
+        teardown_exc=None,
+        teardown_confirms=True,
+    ):
         self.handle = handle or FakeHandle(already=True)
         self.preflight_exc = preflight_exc
         self.provision_exc = provision_exc
@@ -222,8 +230,13 @@ class TestRunLaunch:
             seen["code"] = mid.signin.code if mid.signin else None
 
         eng = FakeEngine(
-            handle=FakeHandle(url="https://x/verify", code="BQTZ-XKFD", ports=[54123], signed=True,
-                              on_wait=on_wait)
+            handle=FakeHandle(
+                url="https://x/verify",
+                code="BQTZ-XKFD",
+                ports=[54123],
+                signed=True,
+                on_wait=on_wait,
+            )
         )
         out = lj.run_launch(job, s, eng)
         assert seen["status"] == lj.AWAITING_SIGNIN
@@ -277,6 +290,163 @@ class TestRunLaunch:
         assert out.status == lj.FAILED
         assert out.step(lj.STEP_PROVISION).state == lj.STEP_DONE
         assert not any(c[0] == "teardown" for c in eng.calls)
+
+    def test_registration_unavailable_never_persists_a_reapable_intermediate(self, tmp_path):
+        """No save may leave a failed connect step beside a non-terminal status.
+
+        That pair is exactly what ``reap_orphans`` reads as an interrupted launch,
+        and it rewrites the status to FAILED. A restart in such a window would turn
+        the DONE this path is heading for into a red card over a running crew. This
+        watches every save and asserts the combination is never on disk, so the
+        window does not exist rather than being merely narrow.
+        """
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+
+        seen: list[tuple[str, str]] = []
+        real_save = s.save
+
+        def _watched_save(j):
+            real_save(j)
+            # Read it BACK, so this asserts what a restart would find, not what the
+            # in-memory object happens to hold.
+            reloaded = lj.LaunchJobStore(root=s.root).get(j.id)
+            assert reloaded is not None
+            seen.append((reloaded.status, reloaded.step(lj.STEP_CONNECT).state))
+
+        s.save = _watched_save  # type: ignore[method-assign]
+        eng = FakeEngine(
+            handle=FakeHandle(already=True),
+            register_exc=lj.RegistrationUnavailable("registry write raised"),
+        )
+        out = lj.run_launch(job, s, eng)
+
+        assert out.status == lj.DONE
+        assert out.step(lj.STEP_CONNECT).state == lj.STEP_FAILED
+        trap = [
+            (status, step)
+            for status, step in seen
+            if step == lj.STEP_FAILED and status not in (lj.DONE, lj.FAILED)
+        ]
+        assert trap == [], f"a restart here would be reaped to FAILED: {trap}"
+        # And the end state a restart would find IS terminal, carrying both facts.
+        assert seen[-1] == (lj.DONE, lj.STEP_FAILED)
+
+    def test_a_reaped_restart_after_the_terminal_save_keeps_the_launch_done(self, tmp_path):
+        """The consequence side of the same invariant, through the reaper itself.
+
+        Once the single save has landed, the job is terminal, so ``reap_orphans``
+        skips it and the DONE with its registration reason survives the restart.
+        """
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        eng = FakeEngine(
+            handle=FakeHandle(already=True),
+            register_exc=lj.RegistrationUnavailable("registry write raised"),
+        )
+        lj.run_launch(job, s, eng)
+
+        # A fresh process: new store over the same root, then the reap it runs once.
+        restarted = lj.LaunchJobStore(root=s.root)
+        restarted.reap_orphans()
+
+        after = restarted.get(job.id)
+        assert after is not None
+        assert after.status == lj.DONE
+        assert after.step(lj.STEP_CONNECT).state == lj.STEP_FAILED
+        assert "registry write raised" in after.error
+
+    def test_registration_unavailable_keeps_the_launch_done_and_says_why(self, tmp_path):
+        """The Fargate lane's case: the task launched, only the row is missing.
+
+        DONE is what reports the task as launched, which is the thing that actually
+        happened and the thing its owner is paying for. The reason is on the connect
+        step AND on the job, because a red card over a running crew would leave them
+        with nothing to act on while the crew keeps billing.
+        """
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        eng = FakeEngine(
+            handle=FakeHandle(already=True),
+            register_exc=lj.RegistrationUnavailable(
+                "The crew is running (task arn:aws:ecs:...:task/crews/abc) but could not be "
+                "added to your crews: the task was still PROVISIONING after 180s"
+            ),
+        )
+        out = lj.run_launch(job, s, eng)
+
+        assert out.status == lj.DONE
+        assert out.step(lj.STEP_PROVISION).state == lj.STEP_DONE
+        assert out.step(lj.STEP_CONNECT).state == lj.STEP_FAILED
+        assert "could not be added to your crews" in out.step(lj.STEP_CONNECT).detail
+        assert "PROVISIONING" in out.error
+        # The crew exists: a launch that got this far is never rolled back.
+        assert not any(c[0] == "teardown" for c in eng.calls)
+
+    def test_a_registration_failure_never_claims_the_crew_was_added(self, tmp_path):
+        """The connect step's detail is the sentence under the card's icon. Leaving
+        the success wording on a failed registration would tell the user to look for
+        a crew that is not in the list."""
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        eng = FakeEngine(
+            handle=FakeHandle(already=True),
+            register_exc=lj.RegistrationUnavailable(
+                "could not read the task to register it: AccessDeniedException"
+            ),
+        )
+        out = lj.run_launch(job, s, eng)
+        assert "Added to Your crews" not in out.step(lj.STEP_CONNECT).detail
+
+    def test_a_refused_signin_still_outranks_a_registration_failure(self, tmp_path):
+        """Two things went wrong and only one is reported as the job's status. The
+        sign-in refusal wins: it means the crew serves chats under an identity the
+        launch did not ask for, which is worse than being absent from a list.
+        """
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        handle = FakeHandle(already=True)
+        handle.error = "this box holds a session for a different identity"
+        eng = FakeEngine(
+            handle=handle,
+            register_exc=lj.RegistrationUnavailable(
+                "could not read the task to register it: AccessDeniedException"
+            ),
+        )
+        out = lj.run_launch(job, s, eng)
+
+        assert out.status == lj.FAILED
+        assert "different identity" in out.error
+        assert out.step(lj.STEP_CONNECT).state == lj.STEP_FAILED
+
+    def test_a_cancel_during_the_registration_wait_is_not_dropped(self, tmp_path):
+        """The register step can block for minutes now, so a cancel can land inside it.
+
+        The Fargate engine polls DescribeTasks for up to three minutes waiting for a
+        runtime id, and the cancel route only sets the event -- it tears nothing down.
+        Without a check after the step the launch falls straight through to DONE and
+        the cancelled crew keeps billing with its cancel silently dropped.
+        """
+        s = _store(tmp_path)
+        job = s.create(profile="dev", region="us-east-1", size_key="balanced")
+        cancel = threading.Event()
+
+        class _CancelDuringRegister(FakeEngine):
+            def register(self, *, instance_id, tag, profile, region):
+                # Stands in for the user pressing Cancel while the poll is waiting.
+                cancel.set()
+                super().register(instance_id=instance_id, tag=tag, profile=profile, region=region)
+
+        eng = _CancelDuringRegister(handle=FakeHandle(already=True))
+        out = lj.run_launch(job, s, eng, cancel=cancel)
+
+        assert out.status == lj.CANCELLED
+        # The whole point: the compute that was created does not survive the cancel.
+        assert any(c[0] == "teardown" for c in eng.calls), eng.calls
+        # And the state a restart would read is the cancelled one, not a DONE.
+        reloaded = lj.LaunchJobStore(root=s.root).get(job.id)
+        assert reloaded is not None
+        assert reloaded.status == lj.CANCELLED
 
     def test_cancel_before_provision(self, tmp_path):
         s = _store(tmp_path)
@@ -362,7 +532,8 @@ class TestRealSigninHandleFailures:
         from kiro_crew.cloud import launch_engine as le
 
         monkeypatch.setattr(
-            le.login, "start_device_login",
+            le.login,
+            "start_device_login",
             lambda *a, **k: SimpleNamespace(
                 already_logged_in=False, url="u", code="c", ports=[], close=lambda: None
             ),
@@ -423,11 +594,15 @@ class TestRealEngineGatewayPort:
         from kiro_crew.cloud import launch_engine as le
 
         seen = {}
-        monkeypatch.setattr(le.ec2, "deploy", lambda **kw: (
-            seen.update(kw) or SimpleNamespace(instance_id="i-0abc")))
+        monkeypatch.setattr(
+            le.ec2,
+            "deploy",
+            lambda **kw: (seen.update(kw) or SimpleNamespace(instance_id="i-0abc")),
+        )
         monkeypatch.setattr(le.sizes, "get_tier", lambda k: SimpleNamespace(key=k))
         monkeypatch.setattr(
-            le.connect_mod, "register_instance",
+            le.connect_mod,
+            "register_instance",
             lambda iid, **kw: seen.update({"reg": kw}) or "inst-1",
         )
         return le, seen
@@ -704,7 +879,9 @@ class TestProvisionerOnTheJob:
         """Another provisioner's ``size_key`` is its own vocabulary; refusing it here
         against ``sizes.py`` would refuse every non-EC2 launch."""
         job = _store(tmp_path).create(
-            profile="", region="us-west-2", size_key="dev.standard1.large",
+            profile="",
+            region="us-west-2",
+            size_key="dev.standard1.large",
             provider_id="devspace",
         )
         assert job.provider_id == "devspace"
@@ -712,14 +889,20 @@ class TestProvisionerOnTheJob:
 
     def test_step_labels_override_only_known_keys(self, tmp_path):
         job = _store(tmp_path).create(
-            profile="", region="", size_key="s", provider_id="devspace",
+            profile="",
+            region="",
+            size_key="s",
+            provider_id="devspace",
             step_labels={lj.STEP_PROVISION: "Create the DevSpace", "bogus": "ignored"},
         )
         labels = {st.key: st.label for st in job.steps}
         assert labels[lj.STEP_PROVISION] == "Create the DevSpace"
         assert labels[lj.STEP_PREFLIGHT] == "Check your AWS setup"  # untouched core label
         assert [st.key for st in job.steps] == [
-            lj.STEP_PREFLIGHT, lj.STEP_PROVISION, lj.STEP_SIGNIN, lj.STEP_CONNECT,
+            lj.STEP_PREFLIGHT,
+            lj.STEP_PROVISION,
+            lj.STEP_SIGNIN,
+            lj.STEP_CONNECT,
         ]
 
     def test_default_steps_with_no_overrides_are_the_core_labels(self):
@@ -788,3 +971,54 @@ class TestTargetCompatibilityIsDecidedBeforeProvisioning:
         out = lj.run_launch(job, s, eng)
         assert out.status == lj.DONE
         assert [c[0] for c in eng.calls] == ["preflight", "provision", "begin_signin", "register"]
+
+
+class TestTheRegionIsDefaulted:
+    """A launch with no region must not reach preflight with an empty one.
+
+    Every provisioner's preflight refuses it, and the Fargate identity check
+    reports it as ``region='' is not a region`` -- which reads as a malformed
+    value rather than an absent one, so the reader looks for a bad setting
+    instead of a missing one. A dashboard form that has no region field of its
+    own posts an empty string, so the default belongs here, where every caller
+    passes through, rather than at each call site.
+    """
+
+    def test_an_empty_region_takes_the_configured_one(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(lj, "_default_region", lambda: "eu-west-2")
+        job = _store(tmp_path).create(profile="dev", region="", size_key="balanced")
+        assert job.region == "eu-west-2"
+
+    def test_a_named_region_is_never_overridden(self, tmp_path, monkeypatch):
+        """The reader's choice wins. A default that replaced a supplied value
+        would silently launch in a region nobody picked."""
+        monkeypatch.setattr(lj, "_default_region", lambda: "eu-west-2")
+        job = _store(tmp_path).create(profile="dev", region="us-east-1", size_key="balanced")
+        assert job.region == "us-east-1"
+
+    def test_the_default_reads_the_operators_configured_region(self, monkeypatch):
+        """Sourced from the same config the other lanes read, so the two cannot
+        disagree about which region the operator chose."""
+        import kiro_crew.cloud.config as cloud_config_mod
+
+        monkeypatch.setattr(
+            cloud_config_mod.CloudConfig,
+            "load",
+            staticmethod(lambda: SimpleNamespace(region="ap-southeast-1")),
+        )
+        assert lj._default_region() == "ap-southeast-1"
+
+    def test_an_unreadable_config_leaves_the_region_empty(self, monkeypatch):
+        """A launch must not fail on a bad config file here.
+
+        An empty region means the preflight refusal stands, which is the same
+        outcome as before this default existed and names the real problem --
+        whereas raising would replace a readable refusal with a traceback.
+        """
+        import kiro_crew.cloud.config as cloud_config_mod
+
+        def _boom():
+            raise OSError("cloud.json is unreadable")
+
+        monkeypatch.setattr(cloud_config_mod.CloudConfig, "load", staticmethod(_boom))
+        assert lj._default_region() == ""

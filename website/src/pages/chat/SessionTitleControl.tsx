@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { EyeOff, Loader, Pen, Sparkles, Undo2, VenetianMask } from 'lucide-react'
+import { useEffect, useId, useRef, useState } from 'react'
+import { EyeOff, Loader, Pen, Pin, Sparkles, Undo2, VenetianMask } from 'lucide-react'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import useHeldWindow from '../../hooks/useHeldWindow'
 import { Btn, Input } from '../../components/ui'
@@ -12,6 +12,8 @@ import { sseSlotTitle } from '../../store/dashboardSlice'
 import { api } from '../../api/client'
 import { errMessage } from '../../utils/thunkError'
 import { i18nT } from '../../i18n/t'
+import { uiLocation } from '../../uiLocations/uiLocation'
+import { isUntitledSession, sessionDisplayTitle } from '../../utils/sessionDisplayTitle'
 
 /**
  * SessionTitleControl — the session title as ONE editable control: the
@@ -19,7 +21,7 @@ import { i18nT } from '../../i18n/t'
  * reveals on `group/header` hover, and the Sparkles button that asks the LLM
  * for a new title (spinner while it runs).
  *
- * Shared by the single-session header (ChatPage) and every split-view pane
+ * Shared by the single-session header (ChatTitleOverlay) and every split-view pane
  * header (ChatPane) so the two cannot drift again — the pane header used to
  * render a bare title span with neither affordance (#9727). The HOST supplies
  * the `group/header` hover target; this control only renders the row.
@@ -100,6 +102,10 @@ export default function SessionTitleControl({
   const store = useAppStore()
   const queryClient = useQueryClient()
   const memoryMode = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.memory_mode)
+  // Pinning from the header menu moves the row to the sidebar's pinned group,
+  // often out of view, so the header itself has to show the state: without
+  // it a pin or unpin from the chevron gave no visible sign it took.
+  const pinned = useAppSelector((s) => !!s.dashboard.slots.find((x) => x.key === slotKey)?.pinned)
   const [localEditing, setLocalEditing] = useState(false)
   const editing = editingProp ?? localEditing
   const setEditing = (next: boolean) => { setLocalEditing(next); onEditingChange?.(next) }
@@ -133,8 +139,44 @@ export default function SessionTitleControl({
   // offer outright, and a generation that completes for a slot this instance
   // no longer shows must not create one: the offer is for the title the user
   // is looking at when it lands.
+  // Polite confirmation of a CONFIRMED rename. Focus returns to the renamed
+  // trigger, whose accessible name is the new title, but focus does not move
+  // (the trigger was focused before the editor opened), so no engine
+  // re-announces it; nothing else would say the rename took. One always-mounted
+  // region whose text changes (mounting a region pre-filled is not announced),
+  // written only when the server accepted the write and this control still
+  // shows that slot -- never from the optimistic dispatch or the failure path,
+  // whose existing notice is the host's.
+  const [renameAnnouncement, setRenameAnnouncement] = useState('')
   const slotRef = useRef(slotKey)
-  useEffect(() => { slotRef.current = slotKey; setUndoable(null) }, [slotKey])
+  useEffect(() => { slotRef.current = slotKey; setUndoable(null); setRenameAnnouncement('') }, [slotKey])
+  // Where focus goes when the editor closes. Closing unmounts the focused
+  // input, and a browser then drops focus to `document.body`: the next Tab
+  // restarts the header's tab sequence and a screen reader hears nothing
+  // (ARIA APG: focus must not fall to body when the focused element goes).
+  // Enter and Escape both return focus to the title trigger, the element the
+  // editor was opened from (the APG edit-in-place pattern). It is NOT the
+  // composer: the composer sends on Enter keydown and a posted turn has no
+  // undo, so any design that hands the caret to it right after the Enter that
+  // committed the rename gives a held key, a double tap or an IME commit a
+  // path to post an unfinished draft (three review rounds found one each;
+  // #13533). The trigger is inert, so nothing that reaches it can send.
+  // A pointer blur (the user clicked somewhere) moves nothing: redirecting
+  // focus off the element they chose would be the unexpected context change
+  // WCAG 3.2.2 forbids.
+  //
+  // The commit runs on Enter's KEYDOWN and the trigger activates on Enter
+  // keydown too, so the key still held from the commit must not reopen the
+  // editor on auto-repeat. The trigger's onClick ignores a repeat keydown
+  // (e.repeat is set on every auto-repeat event and never on a fresh press),
+  // which covers the whole hold without a clock: a timed latch let a hold
+  // longer than its grace period reopen the editor once per period.
+  const titleTriggerRef = useRef<HTMLDivElement | null>(null)
+  const closeEditor = (reason: 'enter' | 'escape' | 'blur') => {
+    setEditing(false)
+    if (reason === 'blur') return
+    requestAnimationFrame(() => titleTriggerRef.current?.focus({ preventScroll: true }))
+  }
   // The offer is a WINDOW, not a permanent state: while it stands it occupies
   // the Auto-title button's place (two-action row), so a user who wants to
   // re-roll a disliked name must otherwise Undo first. It closes on its own
@@ -165,6 +207,10 @@ export default function SessionTitleControl({
     if (!refused || refused === title) return
     onAttempt?.()
     setUndoable(null)
+    // Cleared at the START of every attempt: a live region announces text
+    // CHANGES, so a confirmed rename back to a name it already holds (rename,
+    // Auto-title, Undo) would otherwise write the identical string and say nothing.
+    setRenameAnnouncement('')
     const key = slotKey
     const slotTitle = () => store.getState().dashboard.slots.find((s) => s.key === key)?.title
     const rec = renameRecovery.get(key) ?? { baseline: title, inflight: new Map<string, number>(), gen: 0, confirmedGen: 0 }
@@ -196,6 +242,7 @@ export default function SessionTitleControl({
       if (myGen > rec.confirmedGen) {
         rec.confirmedGen = myGen
         rec.baseline = refused
+        if (slotRef.current === key) setRenameAnnouncement(i18nT('pages.chatPage.session_renamed_to', { title: refused }))
       }
       settle()
     }, async (e) => {
@@ -236,6 +283,10 @@ export default function SessionTitleControl({
     if (generating) return
     onAttempt?.()
     setUndoable(null)
+    // Same region, same rule as `commit`: emptied when the attempt starts,
+    // written when the server answers. A typed rename and Auto-title are the
+    // one control's two rename paths, so a screen reader hears both confirmed.
+    setRenameAnnouncement('')
     const slot = slotKey
     const slotTitleNow = () => store.getState().dashboard.slots.find((s) => s.key === slot)?.title ?? title
     const atClick = slotTitleNow()
@@ -254,38 +305,101 @@ export default function SessionTitleControl({
         const landing = slotTitleNow()
         const previous = landing !== r.title ? landing : atClick
         dispatch(sseSlotTitle({ key: slot, title: r.title }))
-        if (r.title !== previous && slotRef.current === slot) setUndoable({ slot, previous, next: r.title })
+        // Same gate as the Undo offer: a generated name identical to the one
+        // on screen renamed nothing, so it announces nothing.
+        if (r.title !== previous && slotRef.current === slot) {
+          setRenameAnnouncement(i18nT('pages.chatPage.session_renamed_to', { title: r.title }))
+          setUndoable({ slot, previous, next: r.title })
+        }
       }
     }).catch((e) => {
       report(e, 'pages.chatPage.could_not_generate_title')
     }).finally(() => setGeneratingSlots((prev) => { const next = new Set(prev); next.delete(slot); return next }))
   }
 
-  const glyphs = (
+  // The memory-mode glyph's tooltip text. Beside the editor the glyph names
+  // itself (`role="img"`). In the display render it stays INSIDE the trigger,
+  // so a click on it still opens the editor as it always did, and its text is
+  // folded into the trigger's `aria-label`, since that label replaces
+  // name-from-content and would otherwise prune the glyph's name.
+  const modeText = memoryMode === 'incognito'
+    ? i18nT('pages.chatPage.incognito_memory_writes_disabled')
+    : memoryMode === 'temporary'
+      ? i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')
+      : ''
+  const glyphIcon = memoryMode === 'incognito'
+    ? <EyeOff size={13} className="shrink-0 text-warn" />
+    : memoryMode === 'temporary'
+      ? <VenetianMask size={13} className="shrink-0 text-aim" />
+      : null
+  // The pin marker: the sidebar row's glyph and tooltip, so the two surfaces
+  // name the state the same way. It leads the row, right after the header
+  // menu chevron that toggles it, and like the memory glyph it is folded into
+  // the trigger's accessible name in the display render.
+  const pinnedText = pinned ? i18nT('pages.chatSidebar.pinned') : ''
+  const pinIcon = pinned ? <Pin size={compact ? 11 : 12} className={glyphIcon ? 'mr-1 shrink-0 text-accent' : 'shrink-0 text-accent'} /> : null
+  const glyphs = (pinIcon || glyphIcon) && (
     <>
-      {memoryMode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
-      {memoryMode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
+      {pinIcon && <span role="img" aria-label={pinnedText} title={pinnedText} data-testid="session-pinned-glyph">{pinIcon}</span>}
+      {glyphIcon && <span role="img" aria-label={modeText} title={modeText}>{glyphIcon}</span>}
     </>
+  )
+  // What the header SHOWS: "Untitled session" for an untitled slot, never its
+  // key (#20871). `title` itself stays the raw value every rename, rollback and
+  // Undo comparison above works on.
+  const untitled = isUntitledSession({ key: slotKey, title })
+  const shownTitle = sessionDisplayTitle({ key: slotKey, title })
+  const renameLabel = i18nT('pages.chatPage.rename_session_title', { title: shownTitle })
+  const triggerLabel = [renameLabel, pinnedText, modeText].filter(Boolean).join(', ')
+  // The SAME element in both renders (last child of a fragment in each), so
+  // React keeps it mounted across the editor opening and closing: a live
+  // region announces text CHANGES, and a region that remounts with its text
+  // already in place says nothing.
+  const renameStatus = (
+    <span className="sr-only" role="status" aria-live="polite" aria-atomic="true" data-testid="rename-status">{renameAnnouncement}</span>
   )
 
   if (editing) {
+    // While editing, the title is UNMISTAKABLY a text input (#13050, #12772,
+    // #13325): three nightly GUI testers read the previous editor -- the Input
+    // with every piece of its chrome stripped, sitting inside the same hover
+    // pill the read-only title shows, the whole name selected -- as
+    // "highlighted, not editable". So the editor now keeps the Input's own
+    // border, background and focus ring (its tokens, no colours of its own)
+    // and IS the box: no pill is painted behind it.
+    //
+    // The box is the read-only pill's box, so the header does not move when
+    // editing starts or ends: the pill's `py-0.5 px-1.5` (2px / 6px) becomes
+    // the editor's 1px border plus `py-px px-[5px]`, the editing wrapper adds
+    // no padding of its own, and the type classes (size, weight, colour) are
+    // the read-only title's. `rounded-l-[2px] rounded-r-md` mirrors the pill
+    // too: its flat left corners meet the header menu's pill across the row
+    // gap. Both hosts share this render, so the split-view pane header gets
+    // the same editing look (#10140).
     return (
-      <div className="flex min-w-0 flex-1 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
-        {glyphs}
-        <TitleEditor
-          initial={title}
-          className={compact
-            ? 'text-[13px] font-semibold text-text-strong font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-hidden focus:!shadow-none focus-visible:border-b focus-visible:border-accent'
-            : 'session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-hidden md:max-w-[50vw] focus:!shadow-none focus-visible:border-b focus-visible:border-accent'}
-          onCommit={commit}
-          onClose={() => setEditing(false)}
-        />
-      </div>
+      <>
+        <div className={compact ? "@container flex min-w-0 flex-1 items-center gap-1" : "flex min-w-0 flex-1 items-center gap-1"}>
+          {glyphs}
+          <TitleEditor
+            // An untitled session opens the editor empty, as the sidebar's
+            // rename does, so neither the key nor the label is saved as a name.
+            initial={untitled ? '' : title}
+            compact={!!compact}
+            className={compact
+              ? 'text-[13px] font-semibold text-text-strong font-body rounded-l-[2px] rounded-r-md border-accent px-[5px] py-px m-0 min-w-0 flex-1'
+              : 'session-header-title text-sm font-semibold text-muted font-body rounded-l-[2px] rounded-r-md border-accent px-[5px] py-px m-0 min-w-0 flex-1 md:max-w-[50vw]'}
+            onCommit={commit}
+            onClose={closeEditor}
+          />
+        </div>
+        {renameStatus}
+      </>
     )
   }
 
   return (
-    // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- the handlers hold the Undo window open and perform no action a role could announce; the pointer pair is the hover hold, the focus pair its keyboard parity (any focus inside the row holds the same clock), as on the session-move undo bar
+    <>
+    {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- the handlers hold the Undo window open and perform no action a role could announce; the pointer pair is the hover hold, the focus pair its keyboard parity (any focus inside the row holds the same clock), as on the session-move undo bar */}
     <div
       className="cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover focus-within:bg-bg-hover transition-colors"
       onMouseEnter={() => setHovered(true)}
@@ -297,10 +411,25 @@ export default function SessionTitleControl({
           focus-visible, the Auto-title button when it does -- a keyboard user
           tabbing through the header otherwise gets a focus ring around
           nothing. Same one-line rule for both hosts (UX round). */}
-      <Clickable className="group/title flex min-w-0 items-center gap-1" onClick={() => { if (generating) return; setUndoable(null); setEditing(true) }}>
-        {glyphs}
+      {/* The name says what pressing it DOES, not just what it shows: the
+          content-derived name was the bare title, so a screen reader listed a
+          button called "Alpha session" with no hint that it renames. The
+          visible title comes FIRST (WCAG 2.5.3, label in name), so a buttons
+          list of split-view panes reads as titles, not as N identical verbs.
+          The memory-mode text follows, so the glyph's meaning survives the
+          label and a click on the glyph still opens the editor. */}
+      <Clickable className="group/title flex min-w-0 items-center gap-1" aria-label={triggerLabel} {...uiLocation('chat.session-title', titleTriggerRef)} onClick={(e) => {
+        // An auto-repeat keydown from the Enter still held since the commit is
+        // not a request to rename again (Clickable passes the keyboard event
+        // through; a pointer click has no `repeat`).
+        if (generating || (e && 'repeat' in e && (e as { repeat?: boolean }).repeat)) return
+        setUndoable(null); setEditing(true)
+      }}>
+        {pinIcon && <span aria-hidden="true" title={pinnedText} data-testid="session-pinned-glyph">{pinIcon}</span>}
+        {glyphIcon && <span aria-hidden="true" title={modeText} data-testid="memory-mode-glyph">{glyphIcon}</span>}
         <TypewriterText
-          text={title}
+          text={shownTitle}
+          placeholder={untitled}
           className={compact
             ? 'text-[13px] font-semibold text-text-strong font-body truncate min-w-0'
             : 'session-header-title text-sm font-semibold text-muted font-body truncate min-w-0 md:max-w-[50vw]'}
@@ -315,8 +444,11 @@ export default function SessionTitleControl({
              generated title is the one on screen: the way back must be seen
              without knowing to hover. */
           <Btn
-            aria-label={`${i18nT('pages.chatPage.undo_auto_title')}: ${undo.previous}`}
-            title={undo.previous}
+            // Named by the label the header showed, "Untitled session" when the
+            // previous name was empty or the key (#20871); the commit below still
+            // restores the raw previous value.
+            aria-label={`${i18nT('pages.chatPage.undo_auto_title')}: ${sessionDisplayTitle({ key: slotKey, title: undo.previous })}`}
+            title={sessionDisplayTitle({ key: slotKey, title: undo.previous })}
             className={`shrink-0 flex items-center gap-1 text-accent hover:underline cursor-pointer bg-transparent border-none p-0 ${compact ? 'text-[11px]' : 'text-xs'} leading-none whitespace-nowrap`}
             onClick={(e) => { e.stopPropagation(); commit(undo.previous) }}
           >
@@ -326,20 +458,22 @@ export default function SessionTitleControl({
         )
         : generating
         ? (
-          /* Busy-naming is NAMED: the spinner keeps the action's label beside
-             it (with an ellipsis), so the swap from the Auto-title button to a
+          /* Busy-naming is NAMED: the spinner carries a progress label beside
+             it (with an ellipsis), so the swap from the regenerate button to a
              bare glyph does not read as "something unknown is happening" --
-             and the status is announced, not just drawn. */
+             and the status is announced, not just drawn. The label is its own
+             progressive phrase, not the button's verb: an imperative with an
+             ellipsis reads as one more button to press. */
           <span role="status" aria-live="polite" className="shrink-0 flex items-center gap-1 text-accent">
             <Loader size={compact ? 14 : 16} className="shrink-0 animate-spin" />
-            <span className={compact ? 'text-[11px] leading-none whitespace-nowrap' : 'text-xs leading-none whitespace-nowrap'}>{i18nT('pages.chatPage.auto_title')}…</span>
+            <span className={compact ? 'text-[11px] leading-none whitespace-nowrap' : 'text-xs leading-none whitespace-nowrap'}>{i18nT('pages.chatPage.regenerating_title')}…</span>
           </span>
         )
         : (
           <Btn
             aria-label={i18nT('pages.chatPage.regenerate_title_with_llm')}
             title={i18nT('pages.chatPage.regenerate_title_with_llm')}
-            className="shrink-0 flex items-center gap-1 text-muted opacity-0 group-hover/header:opacity-70 focus-visible:opacity-100 focus-visible:text-accent hover:!opacity-100 hover:text-accent transition-all cursor-pointer bg-transparent border-none p-0"
+            className="shrink-0 flex items-center gap-1 text-muted opacity-0 group-hover/header:opacity-70 [@media(hover:none)]:opacity-70 focus-visible:opacity-100 focus-visible:text-accent hover:!opacity-100 hover:text-accent transition-all cursor-pointer bg-transparent border-none p-0"
             onClick={(e) => { e.stopPropagation(); regenerate() }}
           >
             <Sparkles size={compact ? 14 : 16} />
@@ -352,6 +486,8 @@ export default function SessionTitleControl({
           </Btn>
         )}
     </div>
+    {renameStatus}
+    </>
   )
 }
 
@@ -360,11 +496,14 @@ export default function SessionTitleControl({
  * from the title the editor opened on and dies with it, so no stale draft can
  * survive a close and commit against a title that changed in the meantime.
  */
-function TitleEditor({ initial, className, onCommit, onClose }: {
+function TitleEditor({ initial, className, compact, onCommit, onClose }: {
   initial: string
   className: string
+  /** The pane header's variant: decides when the key hint steps aside. */
+  compact: boolean
   onCommit: (draft: string) => void
-  onClose: () => void
+  /** How the editor closed; the host decides where focus goes from each. */
+  onClose: (reason: 'enter' | 'escape' | 'blur') => void
 }) {
   // Both seeded ONCE at mount: `initial` is the live title prop and moves when
   // a remote / generated rename lands while the editor is open, but the seed
@@ -374,44 +513,83 @@ function TitleEditor({ initial, className, onCommit, onClose }: {
   // Escape closes without committing. The flag (not just the close) is needed
   // because the browser may still fire blur on the unmounting input.
   const cancelRef = useRef(false)
+  // Enter commits by blurring, so the blur handler is the one place the close
+  // runs; this flag is what tells it that blur apart from a pointer blur, and
+  // it is set BEFORE the blur() call so the handler already sees it.
+  const enterRef = useRef(false)
   // Enter-to-commit input: the guard owns both the composition latch and the
   // keypress, so the rename cannot fire on the Enter that commits an IME candidate.
   const ime = useImeGuard()
+  // The keys that end the edit, said once beside the box (#15808): a tester
+  // could not tell what typing would do or how to finish, and nothing on
+  // screen named Enter or Escape. It is the input's description too, so a
+  // screen reader hears it on open. Touch-only devices hide it: their
+  // keyboard has no Escape and its Enter is labelled by the platform. Where
+  // room runs out the hint steps aside so the box holding the title keeps
+  // it (the description stays: a hidden element still describes). A pane's
+  // editing row is `flex-1` and splits the pane's free space with the pane
+  // header's own `flex-1` spacer, so its width never comes from its content:
+  // it is the `@container`, and the hint hides while that share is under
+  // 420px (room for a typical title plus the longest translation). The
+  // main header sizes to its content, which an
+  // inline-size container would collapse to nothing, so there the hint shows
+  // only from `md` up; below it the narrow-window header takes over. Above
+  // either threshold it truncates and shrinks faster than the box.
+  const hintId = useId()
   return (
+    <>
     <Input
       className={className}
+      aria-describedby={hintId}
       size={Math.min(Math.max(draft.length + 2, 6), 80)}
       autoFocus
       maxLength={TITLE_MAX_LENGTH}
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
       {...ime.bindComposition<HTMLInputElement>({
-        // Select the whole title on open, anchored BACKWARD. Caret-at-end
-        // autofocus scrolls a long title so only its tail shows, which reads
-        // as "part of the name is already gone" in a narrow pane. A plain
-        // select() keeps the selection focus at the end, so the browser still
-        // scrolls to the tail; with the focus at the start the input scrolls
-        // to 0 and the beginning of the name is what shows. Retype and
-        // append-after-End stay one keystroke each. Routed through the IME
-        // guard, whose spread owns the input's focus handler.
+        // A caret at the END on open, nothing selected, field scrolled to its
+        // START. The editor used to select the whole title, anchored backward
+        // so a long name showed its start: typing replaced the name in one
+        // keystroke, but a range selection paints no caret in any engine --
+        // Chromium, Gecko and WebKit draw it only for a collapsed selection --
+        // so with the Input chrome stripped as well, the highlight was the
+        // only cue, and three nightly testers read it as "highlighted, not
+        // editable" (#13050, #12772, #13325). The caret is the one cue that
+        // says "type here", and it sits at the end, where a focused text
+        // field puts it; replacing the whole name is Ctrl/Cmd+A. `scrollLeft
+        // = 0` keeps the old rule that a name wider than its box opens
+        // showing its beginning, not its tail (which read as "part of the
+        // name is already gone" in a narrow pane): for such a name the caret
+        // sits past the right edge until the first keystroke or End scrolls
+        // to it, and the box's border and ring carry the affordance
+        // meanwhile. Set explicitly: engines disagree on where a programmatic
+        // focus leaves the caret. Routed through the IME guard, whose spread
+        // owns the input's focus handler.
         onFocus: (e) => {
           const el = e.currentTarget
-          el.setSelectionRange(0, el.value.length, 'backward')
+          el.setSelectionRange(el.value.length, el.value.length)
           el.scrollLeft = 0
         },
         onBlur: () => {
+          const cancelled = cancelRef.current
+          const viaEnter = enterRef.current
+          cancelRef.current = false
+          enterRef.current = false
           // An untouched editor writes nothing: it was seeded from the title
           // at open, and the live title may have moved on since (a generated
           // or remote rename), so committing the seed would overwrite that.
-          if (!cancelRef.current && draft.trim() !== seed.trim()) onCommit(draft)
-          cancelRef.current = false
-          onClose()
+          if (!cancelled && draft.trim() !== seed.trim()) onCommit(draft)
+          onClose(cancelled ? 'escape' : viaEnter ? 'enter' : 'blur')
         },
       })}
       onKeyDown={(e) => {
-        if (e.key === 'Enter' && ime.claimEnter(e)) (e.target as HTMLInputElement).blur()
-        if (e.key === 'Escape') { ime.reset(); cancelRef.current = true; onClose() }
+        if (e.key === 'Enter' && ime.claimEnter(e)) { enterRef.current = true; (e.target as HTMLInputElement).blur() }
+        if (e.key === 'Escape') { ime.reset(); cancelRef.current = true; onClose('escape') }
       }}
     />
+    <span id={hintId} className={`ml-1 min-w-0 shrink-[4] truncate text-[11px] leading-none text-muted ${compact ? '@max-[420px]:hidden' : 'hidden md:block'} [@media(hover:none)]:hidden`}>
+      {i18nT('pages.chatPage.rename_title_hint')}
+    </span>
+    </>
   )
 }

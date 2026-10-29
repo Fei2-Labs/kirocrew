@@ -13,21 +13,16 @@ import json
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 
 import pytest
 
 from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import emit, lease
+from kiro_crew.crew_log.writer import WriterLimits
 
 SESSION = "acp-exhaust-0001"
 SESSION_B = "acp-exhaust-0002"
-
-
-def _pending(job, what: str) -> emit._PendingJob:
-    """Wrap *job* in the record the writer's buffer holds."""
-    return emit._PendingJob(job=job, what=what)
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +42,7 @@ def _isolated_home(tmp_path, monkeypatch):
     # the drain: release rides the handle's refcount, so a lease still held here is
     # a retention, not a frame that has not finished unwinding. The table is
     # process-wide, so the key it names may belong to an EARLIER file on this
-    # worker (the macOS run of this PR caught ``test_crew_log_core.py``'s
+    # worker (the macOS run of this PR caught ``test_crew_log_core_segments.py``'s
     # chmod-refusal test that way); the path in the message says whose it is.
     assert not lease._held, f"a lease outlived its test on this worker: {sorted(lease._held)}"
 
@@ -94,88 +89,24 @@ def _open_session(session_id: str = SESSION) -> None:
     )
 
 
+#: The writer's batching pause for a test that must see a whole burst BUFFERED. The
+#: writer claims a unit's bucket after ``batch_deadline_seconds`` (20 ms by default) and
+#: the claim takes the entries OUT of the pending count, so a burst that submits slower
+#: than that pause -- a loaded Windows xdist worker does -- is split across two claims
+#: and the ceiling is crossed by fewer entries than the test counted on
+#: (``overflow_writes() == 2``, not 6). This value is not waited out: the burst ends with
+#: ``drain_for_shutdown``, which wakes the writer and skips the pause; it is the backstop
+#: if that release never comes, the same budget as the drain's own.
+_HOLD_DRAINER_SECONDS = 20.0
+
+
+def _held_drain_limits(**limits: int) -> WriterLimits:
+    return WriterLimits(batch_deadline_seconds=_HOLD_DRAINER_SECONDS, **limits)
+
+
 # ===================================================================== #
 # 1.  ENOSPC and EIO on the WRITE path (not fsync)
 # ===================================================================== #
-
-
-@pytest.mark.parametrize("code", _WRITE_ERRNOS)
-def test_write_error_retains_then_drops_after_attempt_cap(code, monkeypatch, caplog):
-    """ENOSPC / EIO on the write (not fsync) is a transient failure: the entry
-    is retained and retried, the attempt cap eventually gives up, dropped_writes
-    counts it, and a log line names the failure exactly once.
-    """
-    _open_session()
-    assert emit.flush()
-
-    def _raise(self, *a, **kw):
-        raise _write_error(code)
-
-    monkeypatch.setattr(lg.CrewLog, "append", _raise)
-
-    async def _emit():
-        emit.on_turn_started(SESSION, 1, "user")
-        assert not emit.flush(
-            timeout=0.5
-        ), "flush reported quiet while the failed filesystem still owed a loss marker"
-
-    with caplog.at_level(logging.WARNING, logger=emit.logger.name):
-        asyncio.run(_emit())
-
-    with emit._drained:
-        writer_counted_loss = emit._drained.wait_for(
-            lambda: emit.dropped_writes() == 2 and emit.buffered_writes() == 0,
-            timeout=20.0,
-        )
-    assert writer_counted_loss, "writer never finished counting the entry and failed marker"
-    assert emit.dropped_writes() == 2, "the entry and its failed marker were not counted"
-    assert emit.buffered_writes() == 0
-    gave_up = [r for r in caplog.records if "gave up on" in r.getMessage()]
-    assert len(gave_up) == 1, f"expected one loss report, got {len(gave_up)}"
-
-
-@pytest.mark.parametrize("code", _WRITE_ERRNOS)
-def test_a_write_error_raised_while_handling_another_holds_no_lease(code, monkeypatch, caplog):
-    """The failure the writer keeps must not reach a frame through ANY chain.
-
-    Same shape as the test above, but the injected error is raised inside an
-    ``except`` block, so it carries the first exception as ``__context__`` -- and
-    that one's traceback holds the job frames just as the outer one's does. The
-    emit logger is captured at DEBUG for the whole test, so the records of every
-    failure after the first (the debug arm of ``_report``) are held by the harness
-    when the pin reads. The file's teardown pin (``lease._held`` empty) is the
-    assertion: a writer that stripped only the outer ``__traceback__``, or that
-    put the exception or its ``exc_info`` on a record, still keeps the handle --
-    and with it the lease -- alive until a collector pass.
-    """
-    _open_session()
-    assert emit.flush()
-
-    def _raise_while_handling(self, *a, **kw):
-        try:
-            raise RuntimeError("the state the write was attempted in")
-        except RuntimeError:
-            raise _write_error(code)
-
-    monkeypatch.setattr(lg.CrewLog, "append", _raise_while_handling)
-
-    async def _emit():
-        emit.on_turn_started(SESSION, 1, "user")
-        assert not emit.flush(timeout=0.5)
-
-    with caplog.at_level(logging.DEBUG, logger=emit.logger.name):
-        asyncio.run(_emit())
-        with emit._drained:
-            assert emit._drained.wait_for(
-                lambda: emit.dropped_writes() == 2 and emit.buffered_writes() == 0, timeout=20.0
-            ), "writer never finished counting the entry and failed marker"
-    rendered = [
-        r for r in caplog.records if r.levelno == logging.DEBUG and "failed:" in r.getMessage()
-    ]
-    assert rendered, "the debug arm never logged a later failure"
-    # Full diagnostics survive as TEXT: the rendered chain, not an exc_info triple.
-    assert "Traceback (most recent call last)" in rendered[0].getMessage()
-    assert all(r.exc_info is None for r in rendered), "a record carried the exception object"
 
 
 @pytest.mark.parametrize("code", _WRITE_ERRNOS)
@@ -220,129 +151,6 @@ def test_cleared_error_lands_entries_in_order_with_contiguous_seq(code, monkeypa
 # ===================================================================== #
 
 
-def test_hung_write_starves_another_session_until_cleared():
-    """While session A's write hangs, session B's entries are HELD -- not
-    dropped and not written.  This confirms the documented residual: one
-    writer thread drains all sessions, so a hung write delays every other
-    session.  Bucketing protects order and content, not latency.
-    """
-    _open_session(SESSION)
-    _open_session(SESSION_B)
-    assert emit.flush()
-
-    took_it = threading.Event()
-    release = threading.Event()
-
-    def _hangs():
-        took_it.set()
-        release.wait(30.0)
-
-    try:
-        emit._buffer(SESSION, _pending(_hangs, "a write that hangs"))
-        assert took_it.wait(20.0), "writer never picked up the job"
-
-        for n in range(3):
-            emit._buffer(
-                SESSION_B,
-                _pending(
-                    lambda idx=n: lg.CrewLog.open(lg.KIND_SESSION, SESSION_B).append(
-                        "turn/started", {"turn": idx + 1, "actor": "user", "depth": 0}, src="acp"
-                    ),
-                    f"B turn {n + 1}",
-                ),
-            )
-        assert emit.buffered_writes() >= 3
-        assert emit.dropped_writes() == 0
-
-        b_turns = [e for e in _body(SESSION_B) if e["type"] == "turn/started"]
-        assert not b_turns, "B wrote during the hang"
-    finally:
-        release.set()
-
-    assert emit.drain_for_shutdown(timeout=20.0)
-    b_turns = [e["data"]["turn"] for e in _body(SESSION_B) if e["type"] == "turn/started"]
-    assert b_turns == [1, 2, 3]
-    assert emit.dropped_writes() == 0
-
-
-def test_stall_is_reported_after_threshold():
-    """_note_stall_if_any fires when a write exceeds _WRITE_STALL_SECS,
-    and fires only once.
-    """
-    _open_session()
-    assert emit.flush()
-
-    with emit._lock:
-        emit._inflight_since = time.monotonic() - emit._WRITE_STALL_SECS - 1.0
-        emit._inflight_what = "test stalled write"
-        emit._stall_reported = False
-
-    try:
-        logged = []
-        real_error = logging.Logger.error
-
-        def _spy(self, msg, *a, **kw):
-            if "stalled" in str(msg):
-                logged.append(msg)
-            return real_error(self, msg, *a, **kw)
-
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(logging.Logger, "error", _spy)
-            emit._note_stall_if_any()
-
-        assert logged, "the stall was not reported"
-
-        # A second call must be silent.
-        logged2: list[str] = []
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(
-                logging.Logger,
-                "error",
-                lambda self, msg, *a, **kw: logged2.append(msg) if "stalled" in str(msg) else None,
-            )
-            emit._note_stall_if_any()
-        assert not logged2, "the stall was reported twice"
-    finally:
-        with emit._lock:
-            emit._inflight_since = 0.0
-            emit._inflight_what = ""
-
-
-def test_shutdown_is_bounded_under_a_hung_write():
-    """A stuck write makes the shutdown drain REFUSE, not hang.
-
-    The guarantee is in the return value, not in how long the call took: a drain that
-    could not finish reports False, and the caller decides what to do about the loss.
-    Asserting on elapsed time instead would be a wall-clock race -- on a loaded
-    machine the same correct code takes longer, and the test would fail for being
-    slow rather than for being wrong.
-    """
-    _open_session()
-    assert emit.flush()
-
-    took_it = threading.Event()
-    release = threading.Event()
-
-    def _hangs():
-        took_it.set()
-        release.wait(300.0)
-
-    try:
-        emit._buffer(SESSION, _pending(_hangs, "a write that hangs forever"))
-        assert took_it.wait(20.0)
-        emit._buffer(SESSION, _pending(lambda: None, "queued behind hang"))
-
-        # Returns rather than blocking on the stuck write, and says it did not finish.
-        assert (
-            emit.drain_for_shutdown(timeout=1.0) is False
-        ), "the drain claimed it finished while a write was still stuck"
-        # And the entry behind the hang is still HELD, not discarded, so the loss is
-        # the stuck write's alone.
-        assert emit.buffered_writes() >= 1, "the entry queued behind the hang was dropped"
-    finally:
-        release.set()
-
-
 # ===================================================================== #
 # 3.  Buffer under sustained pressure
 # ===================================================================== #
@@ -353,10 +161,10 @@ def test_no_drops_under_sustained_pressure_and_peak_reflects_truth(monkeypatch, 
     never-drop-for-backpressure rule holds, peak_buffered_writes reflects
     the true peak, and the high-water warning fires exactly once.
     """
+    emit.reset_caches(limits=WriterLimits(pending_high_water=4))
     _open_session()
     assert emit.flush()
 
-    monkeypatch.setattr(emit, "_PENDING_HIGH_WATER", 4)
     release = threading.Event()
     real_append = lg.CrewLog.append
 
@@ -399,13 +207,13 @@ def test_buffer_overflow_is_rejected_at_the_tail_and_counted(monkeypatch, caplog
     overflow_writes, the queued prefix keeps its order, and the loss is
     named exactly once at error level.
     """
+    # A ceiling low enough to cross deterministically. The high-water warning
+    # stays well below it so the two thresholds do not collide in this test. The
+    # drainer is HELD for the burst (see ``_HOLD_DRAINER_SECONDS``): every entry
+    # meets the ceiling in the pending count, none is claimed out of it mid-burst.
+    emit.reset_caches(limits=_held_drain_limits(pending_high_water=2, max_pending_count=4))
     _open_session()
     assert emit.flush()
-
-    # A ceiling low enough to cross deterministically. The high-water warning
-    # stays well below it so the two thresholds do not collide in this test.
-    monkeypatch.setattr(emit, "_PENDING_HIGH_WATER", 2)
-    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 4)
 
     release = threading.Event()
     real_append = lg.CrewLog.append
@@ -420,18 +228,27 @@ def test_buffer_overflow_is_rejected_at_the_tail_and_counted(monkeypatch, caplog
     async def _flood():
         for n in range(count):
             emit.on_tool_called(SESSION, 1, name="fs_read", call_id=f"tc-{n}")
-        # The ceiling holds while the writer is blocked: only the first entries fit.
-        assert emit.buffered_writes() <= 4
-        assert emit.overflow_writes() >= count - 4
+        # The ceiling holds while the writer is held: exactly the first entries fit.
+        assert emit.buffered_writes() == 4
+        assert emit.overflow_writes() == count - 4
         release.set()
-        assert emit.flush(timeout=20.0)
+        # Wakes the held writer and skips its batching pause; ``flush`` would wait
+        # the pause out.
+        assert emit.drain_for_shutdown(timeout=20.0)
 
-    with caplog.at_level(logging.ERROR, logger=emit.logger.name):
-        asyncio.run(_flood())
+    try:
+        with caplog.at_level(logging.ERROR, logger=emit.logger.name):
+            asyncio.run(_flood())
+    finally:
+        # A failed assertion above leaves the writer's thread parked in ``_slow``
+        # holding the log handle -- and with it the unit's write lease, which the
+        # autouse teardown reads as a lease that outlived its test and the NEXT test
+        # on this worker inherits as an error. Open the gate on every exit.
+        release.set()
 
     # The counter moved past what the cap allowed: the rejection is observable,
     # not a constant nobody reads.
-    assert emit.overflow_writes() >= count - 4
+    assert emit.overflow_writes() == count - 4
     assert emit.buffered_writes() == 0
 
     # The prefix that fit kept its order -- the tail was rejected, the head was not
@@ -439,85 +256,10 @@ def test_buffer_overflow_is_rejected_at_the_tail_and_counted(monkeypatch, caplog
     # middle.
     calls = [e for e in _body() if e["type"] == "tool/called"]
     ids = [e["data"]["call_id"] for e in calls]
-    assert ids == [f"tc-{n}" for n in range(len(ids))]
-    assert len(ids) <= 4
+    assert ids == [f"tc-{n}" for n in range(4)]
 
     over = [r for r in caplog.records if "buffer full" in r.getMessage()]
     assert len(over) == 1, f"overflow reported {len(over)} times, expected 1"
-
-
-def test_process_byte_ceiling_spans_session_buckets(monkeypatch):
-    monkeypatch.setattr(emit, "_MAX_PENDING_BYTES", 10)
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(emit, "_start_drain", lambda: None)
-        emit._buffer("bytes-a", emit._PendingJob(lambda: None, "bytes-a", nbytes=4))
-        emit._buffer("bytes-b", emit._PendingJob(lambda: None, "bytes-b", nbytes=4))
-        emit._buffer("bytes-c", emit._PendingJob(lambda: None, "bytes-c", nbytes=3))
-
-    try:
-        assert emit.overflow_writes() == 1, "aggregate session bytes did not hit the global ceiling"
-        assert emit._pending_bytes == {"bytes-a": 4, "bytes-b": 4}
-        assert emit._pending_total_bytes == 8
-    finally:
-        emit._drain_loop()
-
-
-def test_claimed_bytes_still_count_toward_process_ceiling(monkeypatch):
-    monkeypatch.setattr(emit, "_MAX_PENDING_BYTES", 10)
-    entered = threading.Event()
-    release = threading.Event()
-
-    def _block() -> None:
-        entered.set()
-        release.wait(20.0)
-
-    emit._buffer("claimed", emit._PendingJob(_block, "claimed", nbytes=8))
-    try:
-        assert entered.wait(5.0), "writer did not claim the first byte-counted job"
-        assert emit.buffered_writes() == 0
-        assert emit._pending_total_bytes == 8, "claimed batch bytes left the process total"
-
-        emit._buffer("behind", emit._PendingJob(lambda: None, "behind", nbytes=3))
-        assert emit.overflow_writes() == 1, "claimed bytes disappeared from the global ceiling"
-    finally:
-        release.set()
-        emit.flush(timeout=20.0)
-
-
-def test_the_process_byte_total_never_counts_a_job_it_did_not_add():
-    """The inline path runs a job without buffering it, so its bytes are not in
-    the process total. Releasing them anyway drove the total NEGATIVE, which
-    loosens the ceiling instead of enforcing it -- and a retained inline job is
-    entering the total for the first time, so it must be added exactly once.
-
-    Mutation guard: dropping the ``job.counted`` test in ``_drop`` reddens the
-    first assertion at -5; dropping the ``not job.counted`` filter in ``_retain``
-    reddens the third by double-counting to 12.
-    """
-    emit.reset_caches()
-    never_buffered = emit._PendingJob(lambda: None, "never buffered", nbytes=5)
-    emit._drop("inline-drop", [never_buffered])
-    assert (
-        emit._pending_total_bytes == 0
-    ), f"released bytes the total never held: {emit._pending_total_bytes}"
-
-    emit.reset_caches()
-    retained = emit._PendingJob(lambda: None, "inline retained", nbytes=6)
-    emit._retain("inline-retain", [retained])
-    assert (
-        emit._pending_total_bytes == 6
-    ), f"an inline job entering memory was miscounted: {emit._pending_total_bytes}"
-    emit._retain("inline-retain", [retained])
-    assert (
-        emit._pending_total_bytes == 6
-    ), f"an already-counted job was added twice: {emit._pending_total_bytes}"
-
-
-def test_process_byte_total_returns_to_zero_after_normal_drain():
-    emit._buffer(SESSION, emit._PendingJob(lambda: None, "normal drain", nbytes=7))
-    assert emit.flush(timeout=20.0)
-    assert emit._pending_total_bytes == 0, "landed bytes leaked from the process total"
 
 
 def test_a_ceiling_above_the_load_sheds_nothing(monkeypatch):
@@ -525,10 +267,9 @@ def test_a_ceiling_above_the_load_sheds_nothing(monkeypatch):
     overflows zero. Proves the counter tracks the cap, not the mere act of
     buffering -- raise the bound and the red assertion above goes green.
     """
+    emit.reset_caches(limits=_held_drain_limits(max_pending_count=100_000))
     _open_session()
     assert emit.flush()
-
-    monkeypatch.setattr(emit, "_MAX_PENDING_COUNT", 100_000)
 
     release = threading.Event()
     real_append = lg.CrewLog.append
@@ -543,10 +284,16 @@ def test_a_ceiling_above_the_load_sheds_nothing(monkeypatch):
     async def _flood():
         for n in range(count):
             emit.on_tool_called(SESSION, 1, name="fs_read", call_id=f"tc-{n}")
+        # The same held flood as the test above: the whole burst is buffered when
+        # the ceiling is judged, so the only difference between the two is the cap.
+        assert emit.buffered_writes() == count
         release.set()
-        assert emit.flush(timeout=20.0)
+        assert emit.drain_for_shutdown(timeout=20.0)
 
-    asyncio.run(_flood())
+    try:
+        asyncio.run(_flood())
+    finally:
+        release.set()
 
     assert emit.overflow_writes() == 0
     assert emit.dropped_writes() == 0
@@ -620,7 +367,6 @@ def test_shutdown_drains_buffered_entries_within_deadline():
         emit.on_turn_started(SESSION, 1, "user")
         emit.on_tool_called(SESSION, 1, name="fs_read", call_id="tc-1")
         emit.on_turn_completed(SESSION, 1, stop_reason="end_turn")
-        assert emit.buffered_writes() > 0 or emit._draining
 
     asyncio.run(_emit())
     assert emit.drain_for_shutdown(timeout=20.0)
@@ -629,37 +375,6 @@ def test_shutdown_drains_buffered_entries_within_deadline():
     assert "turn/started" in types
     assert "turn/completed" in types
     assert emit.dropped_writes() == 0
-
-
-def test_shutdown_deadline_exceeded_reports_loss(caplog):
-    """When the drain deadline is exceeded, drain returns False and a
-    warning says how many are still buffered.
-    """
-    _open_session()
-    assert emit.flush()
-
-    took_it = threading.Event()
-    release = threading.Event()
-
-    def _stuck():
-        took_it.set()
-        release.wait(300.0)
-
-    try:
-        emit._buffer(SESSION, _pending(_stuck, "write that never finishes"))
-        assert took_it.wait(20.0)
-
-        for n in range(5):
-            emit._buffer(SESSION, _pending(lambda: None, f"queued {n}"))
-
-        with caplog.at_level(logging.WARNING, logger=emit.logger.name):
-            drained = emit.drain_for_shutdown(timeout=0.5)
-
-        assert drained is False
-        warnings = [r for r in caplog.records if "did not finish" in r.getMessage()]
-        assert warnings, "shutdown did not warn about unfinished entries"
-    finally:
-        release.set()
 
 
 def test_a_retained_batch_is_written_at_shutdown_not_abandoned(monkeypatch):

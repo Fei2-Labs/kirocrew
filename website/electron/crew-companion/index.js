@@ -15,6 +15,7 @@
 
 const { ipcMain } = require("electron");
 const http = require("http");
+const { sessionCookieHeader } = require("../mochi-session-token");
 
 const {
   closePanelWindow,
@@ -35,9 +36,11 @@ const {
 } = require("./galleryWindow");
 const {
   broadcastToPets,
+  overlayMayBeNonActivatable,
   openPetWindow,
   closePetWindow,
   petWindowCount,
+  rearmBlankedCompanionWindows,
   setOverlayLogger,
   setOverlayTarget,
   registerOverlayIpc,
@@ -50,7 +53,19 @@ const APP_NAME = "crew-companion";
 const TICK_MS = 5_000
 
 let backendUrl = "";
-let fetchLocalToken = null;
+/**
+ * Resolve a gateway credential as `{ value, viaCookie }`.
+ *
+ * Supplied by main.js as the SAME chain the dashboard window and Mochi use:
+ * local-secret mint, then the SSH-fetched token of a configured remote crew,
+ * then the session credential the dashboard window already holds. The local
+ * mint alone is not enough: it deliberately refuses for a port a remote crew is
+ * configured on and for any gateway this process did not spawn itself, and in
+ * both cases the dashboard still signs in by another route. With the mint as the
+ * only source the reconcile can never ask, reads "no credential" as unknown,
+ * and leaves an enabled companion closed indefinitely.
+ */
+let fetchGatewayAuth = null;
 let log = () => {};
 let timer = null;
 let reconciling = false;
@@ -73,26 +88,80 @@ let suspended = false;
  * live, full-privilege sign-in links existed at any moment purely as a
  * side-effect of asking whether an app is enabled.
  *
- * The token outlives the tick by hours, so reuse is the normal path and a
- * re-mint is the exception: only an actual auth refusal invalidates it.
+ * Reuse is the normal path and a re-resolve the exception: only an actual auth
+ * refusal invalidates the cache. A link token (local mint or ssh fetch) is
+ * refused once its short first-load expiry passes, which costs one re-resolve
+ * every few minutes; a borrowed session cookie lasts until the session expires.
  */
-let cachedToken = "";
+const NO_AUTH = Object.freeze({ value: "", viaCookie: false });
+let cachedAuth = NO_AUTH;
 
 /**
- * The token to probe with, minting only when there is nothing usable cached.
+ * How long an EMPTY answer from the credential chain is trusted before asking again.
  *
- * @param {boolean} forceMint Re-mint even if a token is cached — for the one
- *   retry after the gateway refused the cached one.
- * @returns {Promise<string>}
+ * The chain is not free when it finds nothing: with a remote crew whose ssh is
+ * failing, every attempt starts an ssh process and posts a status line to the
+ * dashboard window. Asking every 5s tick would do that a dozen times a minute
+ * for a companion that cannot open anyway. A refusal-driven re-resolve (the
+ * gateway rejected a credential we HAD) is not throttled.
  */
-async function tokenForProbe(forceMint) {
-  if (!forceMint && cachedToken) return cachedToken;
-  try {
-    cachedToken = (fetchLocalToken && (await fetchLocalToken())) || "";
-  } catch {
-    cachedToken = "";
+const EMPTY_AUTH_RETRY_MS = 30_000;
+let emptyAuthAt = 0;
+
+/**
+ * The credential to probe with, resolving only when there is nothing usable cached.
+ *
+ * @param {boolean} forceMint Re-resolve even if a credential is cached — for the
+ *   one retry after the gateway refused the cached one.
+ * @returns {Promise<{value: string, viaCookie: boolean}>}
+ */
+async function authForProbe(forceMint) {
+  if (!forceMint && cachedAuth.value) return cachedAuth;
+  if (!forceMint && emptyAuthAt && Date.now() - emptyAuthAt < EMPTY_AUTH_RETRY_MS) {
+    return NO_AUTH;
   }
-  return cachedToken;
+  try {
+    const auth = fetchGatewayAuth && (await fetchGatewayAuth());
+    cachedAuth = auth && typeof auth.value === "string" && auth.value
+      ? { value: auth.value, viaCookie: Boolean(auth.viaCookie) }
+      : NO_AUTH;
+  } catch {
+    cachedAuth = NO_AUTH;
+  }
+  emptyAuthAt = cachedAuth.value ? 0 : Date.now();
+  return cachedAuth;
+}
+
+/**
+ * Point every companion window at this credential.
+ *
+ * A borrowed session credential is the dashboard window's own cookie, already in
+ * the shared cookie jar the companion windows load with, so it is NOT put on the
+ * page URL: its link-token `exp` froze when that session was first exchanged, and
+ * as `?token=` it would be refused. The windows load bare and ride the cookie.
+ */
+function targetWindows(auth) {
+  const pageToken = auth.viaCookie ? "" : auth.value;
+  setOverlayTarget(backendUrl, pageToken, auth.viaCookie);
+  setPanelTarget(backendUrl, pageToken);
+  setGalleryTarget(backendUrl, pageToken);
+}
+
+/**
+ * Say once that the companion cannot ask the gateway, and once when it can again.
+ *
+ * An enabled companion that cannot ask would otherwise leave nothing to look at
+ * in any log.
+ */
+let reportedNoCredential = false;
+function noteCredential(present) {
+  if (!present && !reportedNoCredential) {
+    reportedNoCredential = true;
+    log("crew-companion: no gateway credential — cannot check whether the app is enabled");
+  } else if (present && reportedNoCredential) {
+    reportedNoCredential = false;
+    log("crew-companion: gateway credential available again");
+  }
 }
 
 /**
@@ -113,10 +182,21 @@ let getDashboardWindow = null;
  *
  * @returns {Promise<"enabled"|"disabled"|"unauthorized"|"unknown">}
  */
-function probeEnabled(token) {
+function probeEnabled(auth) {
+  const { value, viaCookie } = auth || NO_AUTH;
   return new Promise((resolve) => {
-    const url = `${backendUrl}/api/apps?token=${encodeURIComponent(token)}`;
-    const req = http.get(url, { timeout: 5_000 }, (res) => {
+    let url = `${backendUrl}/api/apps`;
+    const headers = {};
+    if (viaCookie) {
+      // A borrowed session credential is checked as the cookie it came from
+      // (against its session expiry), exactly as the dashboard window sends it.
+      const cookie = sessionCookieHeader(backendUrl, value);
+      if (!cookie) return resolve("unknown");
+      headers.Cookie = cookie;
+    } else {
+      url += `?token=${encodeURIComponent(value)}`;
+    }
+    const req = http.get(url, { timeout: 5_000, headers }, (res) => {
       let body = "";
       res.on("data", (c) => (body += c));
       res.on("end", () => {
@@ -214,11 +294,11 @@ function showsForeignOrigin(wc) {
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   if (!backendUrl) return true; // a web page with no backend to compare against
-  try {
-    return url.origin !== new URL(backendUrl).origin;
-  } catch {
-    return true;
-  }
+  // Same rule as the routing check above, and the same rule the mint dials by, so
+  // a window this app opened at the minted origin is never read as foreign while
+  // the configured URL still spells the host `localhost`. A v6 spelling is NOT
+  // covered: that is a different listener.
+  return url.origin !== new URL(backendUrl).origin;
 }
 
 /**
@@ -289,30 +369,27 @@ async function reconcileOnce() {
   if (reconciling) return;
   reconciling = true;
   try {
-    let token = await tokenForProbe(false);
-    if (!token) {
+    const auth = await authForProbe(false);
+    noteCredential(Boolean(auth.value));
+    if (!auth.value) {
       // No credential means we cannot ask, which is unknown — not disabled.
       return;
     }
 
-    setOverlayTarget(backendUrl, token);
-    setPanelTarget(backendUrl, token);
-    setGalleryTarget(backendUrl, token);
-    let state = await probeEnabled(token);
+    targetWindows(auth);
+    let state = await probeEnabled(auth);
 
     if (state === "unauthorized") {
-      // The cached token was refused. Re-mint ONCE and retry; a second refusal
-      // is left as unknown rather than retried in a loop, so a genuinely broken
-      // credential path cannot turn this poll back into a mint-per-tick.
-      cachedToken = "";
-      token = await tokenForProbe(true);
-      if (!token) return;
-      setOverlayTarget(backendUrl, token);
-      setPanelTarget(backendUrl, token);
-      setGalleryTarget(backendUrl, token);
-      state = await probeEnabled(token);
+      // The cached credential was refused. Re-resolve ONCE and retry; a second
+      // refusal is left as unknown rather than retried in a loop, so a genuinely
+      // broken credential path cannot turn this poll back into a mint-per-tick.
+      cachedAuth = NO_AUTH;
+      const reminted = await authForProbe(true);
+      if (!reminted.value) return;
+      targetWindows(reminted);
+      state = await probeEnabled(reminted);
       if (state === "unauthorized") {
-        cachedToken = "";
+        cachedAuth = NO_AUTH;
         return;
       }
     }
@@ -336,6 +413,17 @@ async function reconcileOnce() {
       openPetWindow();
       log("crew-companion: enabled — overlays opened");
     }
+    // A display overlay or hidden notification owner latched on an error document
+    // is reloaded here and nowhere else: this tick's probe was just answered with
+    // the credential set above, so the reload carries one the gateway accepts,
+    // and a reload per 5s tick is the whole retry budget. "unknown" returned
+    // before this line on purpose — a gateway that cannot answer the probe cannot
+    // serve the page either. Freshly opened windows are still loading and have
+    // nothing latched, so this is a no-op right after openPetWindow.
+    const rearmed = rearmBlankedCompanionWindows();
+    if (rearmed > 0) {
+      log(`crew-companion: re-armed ${rearmed} window(s) hidden on an error document`);
+    }
   } finally {
     reconciling = false;
   }
@@ -344,12 +432,20 @@ async function reconcileOnce() {
 /**
  * Start following the app's enabled state.
  *
- * @param {{backendUrl: string, fetchLocalToken: () => Promise<string>, glog: (m: string) => void,
+ * @param {{backendUrl: string,
+ *   fetchGatewayAuth?: () => Promise<{value: string, viaCookie?: boolean}>,
+ *   glog: (m: string) => void,
  *   getDashboardWindow?: () => (object | null)}} deps
+ *   `fetchGatewayAuth` is the full credential chain main.js passes.
  */
 function initCrewCompanion(deps) {
   backendUrl = (deps && deps.backendUrl) || "";
-  fetchLocalToken = deps && deps.fetchLocalToken;
+  if (deps && typeof deps.fetchGatewayAuth === "function") {
+    fetchGatewayAuth = deps.fetchGatewayAuth;
+  } else {
+    fetchGatewayAuth = null;
+  }
+  reportedNoCredential = false;
   log = (deps && deps.glog) || (() => {});
   getDashboardWindow = (deps && deps.getDashboardWindow) || null;
   setOverlayLogger(log);
@@ -386,7 +482,15 @@ function initCrewCompanion(deps) {
   ipcMain.on("crew-companion:focusable", (event, focusable) => {
     const win = event.sender && require("electron").BrowserWindow.fromWebContents(event.sender);
     if (!win || win.isDestroyed()) return;
-    win.setFocusable(Boolean(focusable));
+    if (overlayMayBeNonActivatable()) {
+      win.setFocusable(Boolean(focusable));
+    } else if (!focusable) {
+      // Windows keeps the overlay activatable (see overlayMayBeNonActivatable), so
+      // hand focus back the way setFocusable(false) would have. setFocusable is not
+      // called at all there: it also flips skipTaskbar, putting the overlay in the
+      // taskbar.
+      win.blur();
+    }
     // setFocusable alone does not move focus; without this the panel opens focusable
     // but still unfocused, so the first keystroke goes to the previous app.
     if (focusable) win.focus();
@@ -439,8 +543,9 @@ function shutdownCrewCompanion() {
   }
   // Drop the reused credential with the poll that reused it, so a later
   // initCrewCompanion starts from a fresh mint instead of a token that may have
-  // been minted against a gateway that is no longer the one we will talk to.
-  cachedToken = "";
+  // been minted against a gateway other than the one we will talk to.
+  cachedAuth = NO_AUTH;
+  emptyAuthAt = 0;
   stopHitboxPoll();
   closePetWindow();
 }

@@ -10,7 +10,7 @@ remaining seventeen had to follow it.
 The prose is kept and keeps its meaning — demoted to advisory, not removed — so
 a client that only reads ``error`` is unaffected. This is backend-only because
 all three frontend callers of ``forkChatSlot`` (``useSessionActions.ts``,
-``SessionGridView.tsx``, ``chatSlice.ts``) branch on ``ok``/``key`` and none
+``SessionGridView.tsx``, ``store/chat/lifecycle.ts``) branch on ``ok``/``key`` and none
 declares an ``onError`` or reads ``res.error`` at all.
 
 **The one refusal that must NOT become distinguishable.** ``api_chat_slot_fork``
@@ -26,10 +26,14 @@ is the assertion that keeps it that way.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
+
+from kiro_crew.dashboard import chat_fork
 
 _TARGET = "dashboard/chat_fork.py"
 
@@ -69,10 +73,16 @@ def test_the_ratchet_can_actually_fail() -> None:
     is no ``slot_not_persistent`` site: an incognito or temporary session forks
     and the child inherits its mode. The one memory-mode refusal in the module is
     ``fork_source_memory_mode_invalid``, for a parent whose persisted mode is
-    outside the allowlist.
+    outside the allowlist. The two app-isolation refusals answer through
+    `slot_ownership.deny_app_slot_access`, the shared per-slot decision, which
+    returns ``slot_not_found`` by construction, so the scan finds those two
+    sites in that module rather than here. The no-such-slot 404 answers through
+    `slot_ownership.slot_not_found`, the same response, so it is counted there
+    too. The over-capacity corpus refusal (``fork_corpus_too_large``) adds one
+    site, and so does the read-only remote-crew refusal (``relay_archive_read_only``).
     """
     coded = [f for f in _findings() if f.bucket == "compliant"]
-    assert len(coded) == 27, f"scanner reached {len(coded)} coded sites, expected 27"
+    assert len(coded) == 26, f"scanner reached {len(coded)} coded sites, expected 26"
     assert all(f.code_value for f in coded)
 
 
@@ -385,3 +395,77 @@ def test_an_unreadable_mid_rotation_corpus_refuses_instead_of_approximating() ->
     assert (
         "_rotated_head + all_messages" not in block
     ), "the flat prepend must not run after a failed full read"
+
+
+# ── an over-capacity corpus must refuse, never half-copy ──
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_over_slot_capacity_refuses(tmp_path, monkeypatch) -> None:
+    """A fork it cannot carry whole must refuse, not answer success minus the oldest rows.
+
+    The destination's append path trims from the FRONT once the slot exceeds
+    capacity, and during the copy loop nothing has reached disk yet, so
+    `persisted_trim` is 0 and the evicted rows are unrecoverable. Answering
+    success there loses the start of the conversation with no signal to the caller.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_fork._MAX_SLOT_MESSAGES", 5)
+    state = _seeded_state(tmp_path)
+    slot = state._slots["forkable"]
+    for n in range(4):
+        slot.append("user", f"q{n}", "msg msg-u")
+    status, body = await _fork(state, "forkable", {})
+    assert status == 400
+    assert body["code"] == "fork_corpus_too_large"
+
+
+@pytest.mark.asyncio
+async def test_the_over_capacity_refusal_names_no_numbers(tmp_path, monkeypatch) -> None:
+    """The body carries `error` + `code` only, and the prose carries no counts.
+
+    A row number is not an affordance in a transcript that numbers nothing, and the
+    client copy deliberately advises the ACTION instead, so a count in the wire text
+    is a bound no reader can act on and a second contract for the frontend to drift
+    against.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_fork._MAX_SLOT_MESSAGES", 5)
+    state = _seeded_state(tmp_path)
+    slot = state._slots["forkable"]
+    for n in range(4):
+        slot.append("user", f"q{n}", "msg msg-u")
+    status, body = await _fork(state, "forkable", {})
+    assert status == 400
+    assert body["code"] == "fork_corpus_too_large"
+    digits = [ch for ch in body["error"] if ch.isdigit()]
+    assert not digits, f"refusal leaks numbers {digits}: {body['error']!r}"
+    assert set(body) == {"error", "code"}, f"body grew beyond the contract: {sorted(body)}"
+
+
+@pytest.mark.asyncio
+async def test_a_corpus_within_capacity_still_forks(tmp_path, monkeypatch) -> None:
+    """Negative control: the guard must fire on size alone, not on every fork."""
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    monkeypatch.setattr("kiro_crew.dashboard.chat_fork._MAX_SLOT_MESSAGES", 5)
+    state = _seeded_state(tmp_path)
+    status, body = await _fork(state, "forkable", {})
+    assert status == 200, body
+    assert body.get("code") != "fork_corpus_too_large"
+
+
+def test_the_over_capacity_refusal_carries_no_retry_parameter():
+    """The refusal is the 400 and its code; the fitting index defers to its own change.
+
+    Deliberate subtraction rather than an oversight, pinned so it is not reintroduced by
+    halves: the index had ONE consumer and cost a permanent field on a wire body plus two
+    keys across thirteen catalogs. What removes the data-loss harm is the REFUSAL, which
+    stays, together with the prose naming the parameters a caller can retry with.
+    """
+    source = pathlib.Path(chat_fork.__file__).read_text(encoding="utf-8")
+
+    assert "at_message_index_that_fits" not in source, "the retry field is back"
+    assert "_largest_fitting_index" not in source, "the fitting-index helper is back"
+    # The refusal itself, and the advice that replaces the index, both survive.
+    assert '"code": "fork_corpus_too_large"' in source, "the refusal lost its code"
+    assert "at_message_index or at_message_id" in source, "the prose advice was dropped"

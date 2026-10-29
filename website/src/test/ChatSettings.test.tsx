@@ -117,6 +117,44 @@ describe('loadChatConfig', () => {
     expect(loadChatConfig().showFullPastes).toBe(false)
   })
 
+  it('keeps double-click-to-edit off until the user opts in', () => {
+    // OFF is the contract: the gesture replaces native double-click word
+    // selection on the bubble, so a client with no stored config (or one
+    // stored before the key existed) must never inherit it.
+    expect(loadChatConfig().doubleClickToEdit).toBe(false)
+    localStorage.setItem('mc-chat-config', JSON.stringify({ showTimestamps: false }))
+    expect(loadChatConfig().doubleClickToEdit).toBe(false)
+  })
+
+  it('respects stored doubleClickToEdit=true', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ doubleClickToEdit: true }))
+    expect(loadChatConfig().doubleClickToEdit).toBe(true)
+  })
+
+  it('repairs a non-boolean doubleClickToEdit value to the disabled default', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ doubleClickToEdit: 'yes' }))
+    expect(loadChatConfig().doubleClickToEdit).toBe(false)
+  })
+
+  it('keeps a sidebar click replacing the active tab until the user opts in', () => {
+    // OFF is the contract: the replace is what keeps the tab strip hidden for
+    // a user who never opened a second tab, so a client with no stored config
+    // (or one stored before the key existed) must never inherit the opt-in.
+    expect(loadChatConfig().sidebarClickOpensTab).toBe(false)
+    localStorage.setItem('mc-chat-config', JSON.stringify({ showTimestamps: false }))
+    expect(loadChatConfig().sidebarClickOpensTab).toBe(false)
+  })
+
+  it('respects stored sidebarClickOpensTab=true', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ sidebarClickOpensTab: true }))
+    expect(loadChatConfig().sidebarClickOpensTab).toBe(true)
+  })
+
+  it('repairs a non-boolean sidebarClickOpensTab value to the replace default', () => {
+    localStorage.setItem('mc-chat-config', JSON.stringify({ sidebarClickOpensTab: 'yes' }))
+    expect(loadChatConfig().sidebarClickOpensTab).toBe(false)
+  })
+
   it('defaults messageFontSize to the pre-setting text-sm size', () => {
     expect(loadChatConfig().messageFontSize).toBe(DEFAULT_MESSAGE_FONT_SIZE)
   })

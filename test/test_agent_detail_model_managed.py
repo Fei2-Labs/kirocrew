@@ -13,6 +13,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import agent_state
+from kiro_crew.dashboard.handlers._shared import SkillCatalogSnapshot
 from kiro_crew.dashboard.handlers.agents import api_agent_detail
 
 
@@ -179,3 +180,238 @@ async def test_patch_merge_preserves_concurrent_writer_changes(tmp_path):
     # ...while the concurrent writer's changes to untouched keys survive.
     assert written["hooks"] == {"refreshed": True}
     assert "staleGrant" not in written
+
+
+def _mapping_stub(uris: list[str]):
+    """Stand in for ``apply_skill_mapping``, rewriting ``resources`` to *uris*.
+
+    The unit under test is the delta merge, so the mapping's own catalog walk is not
+    what is being exercised; stubbing it lets a test state the before/after resource
+    sets directly instead of provisioning a skill tree to imply them. The snapshot it
+    hands back is empty for the same reason: the reply resolved against it is not what
+    these tests read.
+    """
+
+    def _apply(data, agent_path, state, keys, session_key=""):
+        existing = data.get("resources")
+        kept = [
+            r
+            for r in (existing if isinstance(existing, list) else [])
+            if not (isinstance(r, str) and r.startswith("skill://"))
+        ]
+        merged = kept + [u for u in uris if u not in kept]
+        if merged:
+            data["resources"] = merged
+        else:
+            data.pop("resources", None)
+        return list(keys), [], list(uris), SkillCatalogSnapshot({}, {}, 0)
+
+    return _apply
+
+
+@pytest.mark.asyncio
+async def test_a_patch_that_names_no_resource_change_leaves_a_malformed_value_alone(tmp_path):
+    """An unrelated PATCH must not rewrite ``resources`` -- valid or not.
+
+    A non-list ``resources`` is a state this codebase guards for in its readers and in the
+    skill-mapping writer, so it reaches the delta merge in real operation. Iterating a string
+    yields characters, each of them a ``str``, so an unguarded merge persists the value split
+    per character -- silent on-disk corruption on the most common PATCH path, driven by a
+    request that never mentioned resources.
+    """
+    cfg = tmp_path / "kirocrew.json"
+    cfg.write_text(
+        json.dumps({"name": "kirocrew", "model": "claude-old", "resources": "skill://not-a-list"})
+    )
+    request = _patch_request("kirocrew", {"model": "claude-new"})
+
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    written = json.loads(cfg.read_text(encoding="utf-8"))
+    assert written["model"] == "claude-new", "the patch's own field did not apply"
+    assert (
+        written["resources"] == "skill://not-a-list"
+    ), f"an unrelated patch rewrote a malformed resources value: {written.get('resources')!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_skills_patch_keeps_a_uri_a_concurrent_writer_added(tmp_path):
+    """A URI added between this writer's snapshot and the lock must survive its write.
+
+    The mapped set is computed against a snapshot read BEFORE the spec lock, so assigning
+    that list whole publishes a resources value that predates any co-owner's addition --
+    deleting it durably, on a key the request only meant to add one entry to.
+    """
+    cfg = tmp_path / "kirocrew.json"
+    cfg.write_text(json.dumps({"name": "kirocrew", "resources": ["skill://old/mapped"]}))
+    request = _patch_request("kirocrew", {"skills": ["kiro-user/one"]})
+
+    from kiro_crew.dashboard.handlers import agents as agents_mod
+
+    real_read = agents_mod._read_agent_spec
+    calls = {"n": 0}
+    concurrent_uri = "skill://concurrently-added"
+
+    def racing_read(path, **kwargs):
+        calls["n"] += 1
+        result = real_read(path, **kwargs)
+        # After the pre-lock re-read, a co-owner maps another URI. The locked read that
+        # follows sees it; this writer's own snapshot never did.
+        if calls["n"] == 2:
+            concurrent = dict(result)
+            concurrent["resources"] = list(result.get("resources") or []) + [concurrent_uri]
+            cfg.write_text(json.dumps(concurrent))
+        return result
+
+    with (
+        patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path),
+        # Isolate the mate scope (``_agent_detail_candidates``'s second walked
+        # root) from whatever this machine's real ``~/.kiro/mates/agents/``
+        # holds; without this an unrelated file there would add extra
+        # ``_read_agent_spec`` calls and desync the ``calls["n"] == 2`` race.
+        patch("kiro_crew.config.paths.mate_agents_dir", lambda: tmp_path / "mates-empty"),
+        patch("kiro_crew.dashboard.handlers.agents._read_agent_spec", side_effect=racing_read),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.apply_skill_mapping",
+            new=_mapping_stub(["skill://new/mapped"]),
+        ),
+    ):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    landed = json.loads(cfg.read_text(encoding="utf-8")).get("resources") or []
+    assert concurrent_uri in landed, f"the write dropped a concurrent writer's URI: {landed!r}"
+    assert "skill://new/mapped" in landed, f"this patch's own addition did not apply: {landed!r}"
+    assert "skill://old/mapped" not in landed, f"the replaced mapping was not removed: {landed!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_skills_patch_preserves_resource_entries_it_cannot_read(tmp_path):
+    """A merge that speaks about URI strings must not delete entries of other shapes.
+
+    Rebuilding the kept list from the string view of the persisted resources drops a dict or
+    a number sitting in that list the first time any skill PATCH touches the agent -- silent,
+    permanent, and on entries the request never named.
+    """
+    cfg = tmp_path / "kirocrew.json"
+    opaque = {"kind": "future-entry", "value": 7}
+    cfg.write_text(
+        json.dumps(
+            {
+                "name": "kirocrew",
+                "resources": ["skill://old/mapped", opaque, "file://steering/*.md"],
+            }
+        )
+    )
+    request = _patch_request("kirocrew", {"skills": ["kiro-user/one"]})
+
+    with (
+        patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.apply_skill_mapping",
+            new=_mapping_stub(["skill://new/mapped"]),
+        ),
+    ):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    landed = json.loads(cfg.read_text(encoding="utf-8")).get("resources") or []
+    assert opaque in landed, f"an entry this merge cannot read was deleted: {landed!r}"
+    assert "file://steering/*.md" in landed, f"a non-skill resource was dropped: {landed!r}"
+    assert "skill://new/mapped" in landed, f"this patch's own addition did not apply: {landed!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_resource_change_over_a_malformed_fresh_value_does_not_split_it(tmp_path):
+    """When a patch DOES name a resource change, a malformed value must not be iterated.
+
+    The early return only covers a patch with no resource delta. Here the patch names one, so
+    the merge runs against a ``fresh`` whose ``resources`` is a string -- and iterating that
+    yields characters, every one of them a ``str``.
+    """
+    cfg = tmp_path / "kirocrew.json"
+    cfg.write_text(json.dumps({"name": "kirocrew", "resources": ["skill://old/mapped"]}))
+    request = _patch_request("kirocrew", {"skills": ["kiro-user/one"]})
+
+    from kiro_crew.dashboard.handlers import agents as agents_mod
+
+    real_read = agents_mod._read_agent_spec
+    calls = {"n": 0}
+
+    def racing_read(path, **kwargs):
+        calls["n"] += 1
+        result = real_read(path, **kwargs)
+        # The locked re-read finds a malformed value this writer's snapshot never saw.
+        if calls["n"] == 2:
+            cfg.write_text(json.dumps({"name": "kirocrew", "resources": "skill://not-a-list"}))
+        return result
+
+    with (
+        patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path),
+        patch("kiro_crew.dashboard.handlers.agents._read_agent_spec", side_effect=racing_read),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.apply_skill_mapping",
+            new=_mapping_stub(["skill://new/mapped"]),
+        ),
+    ):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    landed = json.loads(cfg.read_text(encoding="utf-8")).get("resources", [])
+    assert not (
+        isinstance(landed, list) and any(len(r) == 1 for r in landed)
+    ), f"a malformed value was split into characters: {landed!r}"
+
+
+# --------------------------------------------------------------------------- #
+# GPT 6.1 / Opus 5.5 F2 (security): the dashboard PATCH re-records the
+# dashboard-author ownership digest only for a PRE-confirmed managed spec, so a
+# routine edit does not freeze it against a tightened ceiling, and a user file
+# at the stem is never stamped managed.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_patch_renews_digest_for_a_confirmed_dashboard_author(tmp_path):
+    """A model edit on the managed dashboard-author spec rewrites its bytes. The PATCH must
+    re-record the ownership digest to match -- otherwise the next rebuild sees a mismatch,
+    stops re-filtering the spec's grants against a tightened ceiling, and reports success
+    anyway. The pre-edit file is our confirmed managed write, so the renewal fires."""
+    name = "kirocrew-dashboard-author"
+    cfg = tmp_path / f"{name}.json"
+    spec = {"name": name, "model": "claude-old", "mcpServers": {"kirocrew-core": {}}}
+    cfg.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+    # Record the digest of exactly these bytes -> the pre-edit file is confirmed ours.
+    agent_state.set_managed_digest(name, agent_state.spec_digest(spec))
+
+    request = _patch_request(name, {"model": "claude-new"})
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    written = json.loads(cfg.read_text(encoding="utf-8"))
+    # The digest was renewed to the WRITTEN bytes -> the file still confirms as ours.
+    assert agent_state.get_managed_digest(name) == agent_state.spec_digest(written)
+
+
+@pytest.mark.asyncio
+async def test_patch_does_not_stamp_a_user_file_at_the_dashboard_author_stem(tmp_path):
+    """A user authored their own spec at the once-user-creatable stem (NO recorded digest).
+    A PATCH that edits it must NOT record the managed digest for the user's bytes -- doing
+    so would make the next rebuild overwrite their charter. The renewal is gated on the
+    pre-edit content already being our confirmed managed write."""
+    name = "kirocrew-dashboard-author"
+    cfg = tmp_path / f"{name}.json"
+    user = {"name": name, "model": "claude-old", "prompt": "the user's own charter"}
+    cfg.write_text(json.dumps(user, indent=2) + "\n", encoding="utf-8")
+    assert agent_state.get_managed_digest(name) is None  # user file, no record
+
+    request = _patch_request(name, {"model": "claude-new"})
+    with patch("kiro_crew.agent.KIRO_AGENTS_DIR", tmp_path):
+        resp = await api_agent_detail(request)
+
+    assert resp.status == 200, resp.text
+    # No digest recorded for the user's bytes -> the file is still NOT ours.
+    assert agent_state.get_managed_digest(name) is None

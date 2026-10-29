@@ -16,8 +16,8 @@ These tests pin:
   flips BOTH gates -- so they cannot drift;
 * the structural route matcher: the member routes are admitted for exactly the
   verbs a member can use, while the write verbs no member fence covers -- tag
-  POST/PATCH/DELETE and folder DELETE -- plus ``/tag-columns`` and every other
-  ``/api/chat/*`` route are NOT;
+  POST/PATCH/DELETE, folder DELETE and every ``/tag-columns`` write -- plus every
+  other ``/api/chat/*`` route are NOT (the column LIST is admitted read-only);
 * the folder-tree fence generalised to a principal: a member owns the folders it
   creates (``owner_app == "member:<store>"``), and cannot rename/delete the
   person's; a member's tree READ is scoped to its own folders;
@@ -54,8 +54,11 @@ class TestAdmittedChatRouteMethods:
             ("/api/chat/folders", "POST"),
             ("/api/chat/folders/abc123", "PATCH"),  # rename/reparent own folder
             ("/api/chat/tags", "GET"),  # READ the shared vocabulary
+            ("/api/chat/tag-columns", "GET"),  # READ the shared board layout
             ("/api/chat/slots/chat-1-2/folder", "PATCH"),
             ("/api/chat/slots/chat-1-2/tags", "PUT"),
+            ("/api/chat/slots/chat-1-2/pin", "PATCH"),  # pin own or created session
+            ("/api/chat/slots/chat-1-2/drop", "POST"),  # move own card to a column
             ("/api/chat/slots", "GET"),  # read-only session list for folder tools
         ],
     )
@@ -76,6 +79,8 @@ class TestAdmittedChatRouteMethods:
             # A member cannot delete folders (delete is refused for every agent
             # principal), so the gate does not forward it.
             ("/api/chat/folders/abc123", "DELETE"),
+            # The board layout is read-only for a member, like the vocabulary.
+            ("/api/chat/tag-columns", "POST"),
         ],
     )
     def test_write_verbs_the_member_cannot_do_are_refused(self, path, method):
@@ -87,10 +92,10 @@ class TestAdmittedChatRouteMethods:
         "path",
         [
             "/api/chat/tags/t1",  # tags/{id} is not an admitted route at all
-            "/api/chat/tag-columns",  # different prefix, not /tags/{id}
-            "/api/chat/tag-columns/c1",
+            "/api/chat/tag-columns/c1",  # column rename/retag/delete
+            "/api/chat/tag-columns/order",  # column reorder
             "/api/chat/slots/chat-1-2",  # slot detail
-            "/api/chat/slots/chat-1-2/pin",  # a different slot sub-resource
+            "/api/chat/slots/chat-1-2/mode",  # a different slot sub-resource
             "/api/chat/pins",
             "/api/chat/folders/abc/deeper",  # deeper than one segment
         ],
@@ -114,6 +119,8 @@ class TestAdmittedChatRouteMethods:
         )
         # The tag vocabulary is READ-only for a member.
         assert _shared._admitted_chat_route_methods("/api/chat/tags") == frozenset({"GET"})
+        # So is the board's column list.
+        assert _shared._admitted_chat_route_methods("/api/chat/tag-columns") == frozenset({"GET"})
         # POST on the session list is not admitted (GET only).
         assert "POST" not in _shared._admitted_chat_route_methods("/api/chat/slots")
         # reorder admits POST only.
@@ -228,13 +235,22 @@ class TestChatRouteGate:
         assert json.loads(refusal.text)["code"] == "member_scope_denied"
 
     @pytest.mark.asyncio
+    async def test_member_admitted_to_slot_pin(self, monkeypatch):
+        # ``api_chat_slot_pin`` carries the member_owns_slot fence, so the gate
+        # forwards the PATCH and the handler decides which session it may pin.
+        _stub_scope(monkeypatch, scope=MEMBER_STORE)
+        monkeypatch.setattr(sc, "member_admitted_to_scoped_surface", lambda k, s: True)
+        req = _internal_request("PATCH", "/api/chat/slots/chat-1-2/pin")
+        assert await _shared.private_chat_route_refusal(req) is None
+
+    @pytest.mark.asyncio
     async def test_member_still_refused_on_a_non_admitted_chat_route(self, monkeypatch):
-        # A slot SUB-resource (pin) is NOT one of the admitted routes -- the
+        # A slot SUB-resource (mode) is NOT one of the admitted routes -- the
         # owner-only refusal stands even for a caller the shared predicate would
         # otherwise admit.
         _stub_scope(monkeypatch, scope=MEMBER_STORE)
         monkeypatch.setattr(sc, "member_admitted_to_scoped_surface", lambda k, s: True)
-        req = _internal_request("PATCH", "/api/chat/slots/chat-1-2/pin")
+        req = _internal_request("PATCH", "/api/chat/slots/chat-1-2/mode")
         refusal = await _shared.private_chat_route_refusal(req)
         assert refusal is not None and refusal.status == 403
         assert json.loads(refusal.text)["code"] == "member_scope_denied"

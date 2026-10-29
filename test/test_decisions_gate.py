@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
+import logging
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -31,12 +32,14 @@ from kiro_crew.config.sections import (
     DECISION_PROVIDER_ENDPOINT_DEFAULT,
     DecisionProviderConfig,
     DecisionsConfig,
+    NudgeWakeConfig,
 )
 from kiro_crew.decisions import consent as consent_mod
 from kiro_crew.decisions import gate as gate_mod
 from kiro_crew.decisions import log as log_mod
 from kiro_crew.decisions.gate import DECISION_POINT_NAMES, decide, in_bucket, is_enabled
-from kiro_crew.decisions.types import Answer, Choice
+from kiro_crew.decisions.types import Answer, Choice, Noul, Score
+from kiro_crew.testing.wait import async_wait_until
 
 # ---------------------------------------------------------------------------
 # Fixtures and doubles
@@ -59,9 +62,22 @@ _EXFIL_URL = "see https://collector.example.invalid/x?sess" + "ion=" + "b" * 40
 POINT = "skills.select"
 QUESTIONS = [Choice(id="verdict", prompt="Which skill?", options=["NONE", "DUP"])]
 
+#: Lost-run ceiling on a ``decide`` whose append never lands. Measured: the call
+#: returns in under 0.6 s with every off-loop hop starved (a 0.3 s executor delay,
+#: or a GIL hog), so only a call that waited off the loop on the append -- or on a
+#: bound the test lifts past this, the commit grace or the provider budget --
+#: reaches it. Well under half the suite's ``--timeout=120``, so reaching it is a
+#: named failure, never a dead worker.
+_STALLED_APPEND_CEILING_SECS = 10.0
+
 
 def _config(
-    *, bucket: int = 100, timeout_ms: int = 1000, endpoint: str = "", model: str | None = None
+    *,
+    bucket: int = 100,
+    timeout_ms: int = 1000,
+    endpoint: str = "",
+    model: str | None = None,
+    judge_provider: str | None = None,
 ):
     """A config object shaped like the one ``decide`` reads off the live snapshot.
 
@@ -71,6 +87,9 @@ def _config(
     it is the keystone, patched by the ``consent`` fixture. An empty *endpoint*
     keeps the dataclass default, which is the one the fixture consents to; a
     ``None`` *model* keeps the dataclass default too.
+
+    *judge_provider* selects which lane serves :data:`gate.JUDGE_POINT`, whose
+    authority is a lane rather than a scope. ``None`` keeps the dataclass default.
     """
     kwargs: dict = {"timeout_ms": timeout_ms}
     if endpoint:
@@ -78,7 +97,10 @@ def _config(
     if model is not None:
         kwargs["model"] = model
     provider = DecisionProviderConfig(**kwargs)
-    return SimpleNamespace(decisions=DecisionsConfig(bucket=bucket, provider=provider))
+    decisions_kwargs: dict = {"bucket": bucket, "provider": provider}
+    if judge_provider is not None:
+        decisions_kwargs["nudge_wake"] = NudgeWakeConfig(provider=judge_provider)
+    return SimpleNamespace(decisions=DecisionsConfig(**decisions_kwargs))
 
 
 @pytest.fixture(autouse=True)
@@ -417,7 +439,9 @@ class TestGovernanceWithdrawsTheSeam:
 
         calls: list[str] = []
 
-        def _probe(surface_key: str = capability.DASHBOARD_SURFACE_KEY) -> bool:
+        def _probe(
+            surface_key: str = capability.DASHBOARD_SURFACE_KEY, *, local: bool = False
+        ) -> bool:
             calls.append(surface_key)
             return denied
 
@@ -661,13 +685,22 @@ class TestPointName:
         """The state every install consented before the scopes existed is in.
 
         Driven off the gate's own table so a point added with a new scope is covered
-        without this test being touched.
+        without this test being touched, and with NO point exempted: the assertion is
+        universal or it is not a ratchet.
+
+        :data:`gate.JUDGE_POINT` reaches it by pinning the lane whose authority IS the
+        scope. That point carries two lanes (``is_enabled`` resolves them through
+        ``_judge_authority``): the small-model lane needs no scope, so under the default
+        ``auto`` the point is authorized with nothing recorded, while the Jev lane sends
+        to a third party and needs this point's own scope. Pinning ``jev`` therefore asks
+        the question this ratchet exists to ask, and answers it for the same reason every
+        other row answers it.
         """
         install_impl(_RecordingOracle())
         assert is_enabled("skills.select", config=_config()) is True
         assert is_enabled("message.steer", config=_config()) is True
         for name in gate_mod._POINT_SCOPES:
-            assert is_enabled(name, config=_config()) is False, name
+            assert is_enabled(name, config=_config(judge_provider=gate_mod.LANE_JEV)) is False, name
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +830,74 @@ class TestScrub:
     def test_a_credential_in_a_choice_option_is_found(self, install_impl, log_home):
         oracle = install_impl(_ExplodingOracle())
         questions = [Choice(id="q", prompt="which?", options=["fine", _AWS_KEY_SAMPLES[0]])]
+        assert asyncio.run(decide(POINT, "clean state", questions, config=_config())) is None
+        assert oracle.entered is False
+        assert log_home()[0]["scrubbed"] is True
+
+    def test_a_credential_in_a_choice_criteria_value_is_found(self, install_impl, log_home):
+        """A rubric authored ONLY in ``Choice.criteria`` -- the field this PR adds --
+        leaves the machine in the request, so a credential there is refused before
+        the network like any other wire text. The prompt and options are clean, so
+        the only path to the finding is ``criteria``."""
+        oracle = install_impl(_ExplodingOracle())
+        questions = [
+            Choice(
+                id="q",
+                prompt="which?",
+                options=["fine", "also-fine"],
+                criteria={"fine": f"the key is {_AWS_KEY_SAMPLES[0]}"},
+            )
+        ]
+        assert asyncio.run(decide(POINT, "clean state", questions, config=_config())) is None
+        assert oracle.entered is False
+        assert log_home()[0]["scrubbed"] is True
+
+    def test_the_criteria_scrub_depends_on_criteria_reaching_question_texts(
+        self, install_impl, log_home, monkeypatch
+    ):
+        """Pins that the coverage above rides on ``criteria`` being included in
+        ``question_texts``: with the criteria values dropped from what the scanner
+        sees, the same credential-bearing question reaches the provider. So the
+        green of the test above is load-bearing on the criteria line, not incidental
+        to the prompt or options -- which are clean here."""
+        from kiro_crew.decisions import types as types_mod
+
+        real_question_texts = types_mod.question_texts
+
+        def _without_criteria(question):
+            texts = real_question_texts(question)
+            if isinstance(question, Choice) and question.criteria:
+                dropped = {str(v) for v in question.criteria.values() if v}
+                return [t for t in texts if t not in dropped]
+            return texts
+
+        # ``gate`` imports ``question_texts`` by name, so patch where it is bound.
+        monkeypatch.setattr(gate_mod, "question_texts", _without_criteria)
+        oracle = install_impl(_RecordingOracle(value="fine"))
+        questions = [
+            Choice(
+                id="q",
+                prompt="which?",
+                options=["fine", "also-fine"],
+                criteria={"fine": f"the key is {_AWS_KEY_SAMPLES[0]}"},
+            )
+        ]
+        assert asyncio.run(decide(POINT, "clean state", questions, config=_config())) is not None
+        assert len(oracle.calls) == 1
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda key: Noul(id="q", prompt="yes?", true_means=f"the key is {key}"),
+            lambda key: Noul(id="q", prompt="yes?", false_means=f"the key is {key}"),
+            lambda key: Score(id="q", prompt="how?", levels=["fine", f"the key is {key}"]),
+        ],
+        ids=["noul-true", "noul-false", "score-level"],
+    )
+    def test_a_credential_in_a_noul_or_score_rubric_is_found(self, install_impl, log_home, make):
+        """Every rubric field the wire carries is scanned, whatever its type."""
+        oracle = install_impl(_ExplodingOracle())
+        questions = [make(_AWS_KEY_SAMPLES[0])]
         assert asyncio.run(decide(POINT, "clean state", questions, config=_config())) is None
         assert oracle.entered is False
         assert log_home()[0]["scrubbed"] is True
@@ -948,6 +1049,20 @@ class TestErrors:
             (Choice(id="q", prompt="?", options=["A"]), Answer(id="q", value="A", p=True)),
             # An answer keyed to a question that was not asked.
             (Choice(id="q", prompt="?", options=["A"]), Answer(id="other", value="A", p=0.5)),
+            # A Noul whose value is not a probability.
+            (Noul(id="q", prompt="?"), Answer(id="q", value=1.2, p=0.9)),
+            (Noul(id="q", prompt="?"), Answer(id="q", value=True, p=0.9)),
+            (Noul(id="q", prompt="?"), Answer(id="q", value="yes", p=0.9)),
+            # A Score outside its own level range, or not a number.
+            (Score(id="q", prompt="?", levels=["lo", "hi"]), Answer(id="q", value=1.5, p=0.9)),
+            (Score(id="q", prompt="?", levels=["lo", "hi"]), Answer(id="q", value=-0.1, p=0.9)),
+            (Score(id="q", prompt="?", levels=["lo", "hi"]), Answer(id="q", value="hi", p=0.9)),
+            (
+                Score(id="q", prompt="?", levels=["lo", "hi"]),
+                Answer(id="q", value=float("nan"), p=0.9),
+            ),
+            # A Score with fewer than two levels has no valid value at all.
+            (Score(id="q", prompt="?", levels=["only"]), Answer(id="q", value=0.0, p=0.9)),
         ],
     )
     def test_an_out_of_domain_answer_is_recorded_as_an_error(
@@ -960,6 +1075,40 @@ class TestErrors:
         install_impl(_Fixed())
         assert asyncio.run(decide(POINT, "hi", [question], config=_config())) is None
         assert log_home()[0]["error"] == gate_mod.ERROR_INVALID_RESULT
+
+    @pytest.mark.parametrize(
+        "question,answer",
+        [
+            (Noul(id="q", prompt="?"), Answer(id="q", value=0.2, p=0.8)),
+            (Noul(id="q", prompt="?"), Answer(id="q", value=1, p=1.0)),
+            (Score(id="q", prompt="?", levels=["a", "b", "c"]), Answer(id="q", value=1.05, p=0.95)),
+            (Score(id="q", prompt="?", levels=["a", "b", "c"]), Answer(id="q", value=2, p=1.0)),
+        ],
+    )
+    def test_an_in_domain_noul_or_score_answer_is_returned(self, install_impl, question, answer):
+        class _Fixed:
+            async def ask(self, state, questions):
+                return {question.id: answer}
+
+        install_impl(_Fixed())
+        assert asyncio.run(decide(POINT, "hi", [question], config=_config())) == {"q": answer}
+
+    def test_a_choice_value_does_not_satisfy_a_noul_or_score(self):
+        """Each type is checked against its own domain; no type borrows another's."""
+        assert not gate_mod._answers_are_valid(
+            {"q": Answer(id="q", value="A", p=0.9)}, [Noul(id="q", prompt="?")]
+        )
+        assert not gate_mod._answers_are_valid(
+            {"q": Answer(id="q", value=0.5, p=0.9)}, [Choice(id="q", prompt="?", options=["A"])]
+        )
+
+    def test_a_question_of_no_known_type_is_out_of_domain_not_an_exception(self):
+        """``_answers_are_valid`` runs outside ``decide``'s ``try``, so it must not raise."""
+        stranger = SimpleNamespace(id="q", prompt="?")
+        assert (
+            gate_mod._answers_are_valid({"q": Answer(id="q", value="A", p=0.5)}, [stranger])
+            is False
+        )
 
     def test_cancellation_propagates_and_writes_no_row(self, install_impl, log_home):
         """A caller going away is not a provider failure."""
@@ -1022,25 +1171,184 @@ class TestLoggingCannotCostTheResult:
         budget, so an outer wait sized at ``timeout_secs() + _LOG_BUDGET_SECS``
         covers a ``decide`` whose log write never lands.
 
-        Timed INSIDE the loop deliberately. The worker thread is not cancellable,
-        so a loop being CLOSED still joins it -- ``asyncio.run`` would pay the
-        whole stall at shutdown and hide the property under test. The bound is on
-        what ``decide`` holds its caller for, which is what an outer wait sizes
-        against; a gateway's loop is long-lived, so the abandoned thread finishes
-        its one append in the background.
+        The stall is an append parked on an event only this test sets, so nothing
+        here is timed: ``decide`` returning while that append is still held is the
+        property. Every other bound on the path -- the commit grace a caller with no
+        receipt never pays, and the provider budget -- is lifted past the ceiling,
+        so a call that waited off the loop on the append or on the wrong bound runs
+        into the ceiling and fails there by name, and one that ran the append ON the
+        loop returns only after the hold, which ``returned`` records.
+
+        Released INSIDE the loop deliberately. The worker thread is not
+        cancellable, so a loop being CLOSED still joins it, and a release left
+        until after ``asyncio.run`` would hold that join on itself. A gateway's
+        loop is long-lived, so the abandoned thread finishes its one append in
+        the background.
         """
+        import threading
+
         install_impl(_RecordingOracle())
-        monkeypatch.setattr(gate_mod, "_LOG_BUDGET_SECS", 0.02)
-        monkeypatch.setattr(log_mod, "append", lambda row: time.sleep(0.4))
+        entered = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+        past_ceiling = 1.5 * _STALLED_APPEND_CEILING_SECS
 
-        async def _timed():
-            started = time.monotonic()
-            answers = await decide(POINT, "hi", QUESTIONS, config=_config())
-            return answers, time.monotonic() - started
+        def _stalled(row, *, commit_event=None):
+            entered.set()
+            # Bounded past the ceiling, so even an append run ON the loop cannot wedge it.
+            release.wait(2 * _STALLED_APPEND_CEILING_SECS)
+            returned.set()
+            if commit_event is not None:
+                commit_event.set()
+            return True
 
-        answers, elapsed = asyncio.run(_timed())
+        # Zero, not a small value: the write budget expires on its first await.
+        monkeypatch.setattr(gate_mod, "_LOG_BUDGET_SECS", 0)
+        monkeypatch.setattr(gate_mod, "_LOG_COMMIT_GRACE_SECS", past_ceiling)
+        monkeypatch.setattr(log_mod, "append", _stalled)
+        config = _config(timeout_ms=int(past_ceiling * 1000))
+
+        async def _drive():
+            loop = asyncio.get_running_loop()
+            asked_at = loop.time()
+            try:
+                answers = await asyncio.wait_for(
+                    decide(POINT, "hi", QUESTIONS, config=config), _STALLED_APPEND_CEILING_SECS
+                )  # flake-ok: the ceiling IS the assertion: decide must return before the stalled append releases
+                assert not returned.is_set(), "decide held the append it should have handed off"
+                # Nothing has released the append yet: the ``finally`` is the only release.
+                return answers, await asyncio.to_thread(entered.wait, _STALLED_APPEND_CEILING_SECS)
+            except asyncio.TimeoutError:
+                pytest.fail(
+                    "decide held its caller past _STALLED_APPEND_CEILING_SECS "
+                    f"({_STALLED_APPEND_CEILING_SECS:.0f}s, {loop.time() - asked_at:.1f}s spent): "
+                    "it waited on the stalled append or on a bound other than the write budget"
+                )
+            finally:
+                release.set()
+
+        answers, handed_off = asyncio.run(_drive())
         assert answers is not None, "a log that never lands must not cost the answers"
-        assert elapsed < 0.3, f"the write held the caller for {elapsed:.3f}s"
+        assert handed_off, "the row never reached the append, so nothing was stalled"
+
+    def test_a_row_committed_after_the_grace_is_reported_unknown_and_logged(
+        self, install_impl, log_home, monkeypatch, caplog
+    ):
+        """The receipt stays ``None``, and one warning names the point, the row and the wait.
+
+        The append is held until ``decide`` has returned, with a zero grace, so the
+        grace always runs out first: nothing here races a clock. The held append
+        still runs to its end afterwards, which is the case a reader of the receipt
+        alone cannot see.
+        """
+        import threading
+
+        install_impl(_RecordingOracle())
+        release = threading.Event()
+        landed = threading.Event()
+        real_append = log_mod.append
+
+        def _late(row, *, commit_event=None):
+            release.wait(_STALLED_APPEND_CEILING_SECS)
+            try:
+                return real_append(row, commit_event=commit_event)
+            finally:
+                landed.set()
+
+        monkeypatch.setattr(gate_mod, "_LOG_BUDGET_SECS", 0)
+        monkeypatch.setattr(gate_mod, "_LOG_COMMIT_GRACE_SECS", 0)
+        monkeypatch.setattr(log_mod, "append", _late)
+        receipt: dict = {}
+
+        async def _drive():
+            try:
+                return await decide(
+                    POINT,
+                    "hi",
+                    QUESTIONS,
+                    config=_config(),
+                    extra={"verdict_id": "v-late"},
+                    receipt=receipt,
+                )
+            finally:
+                release.set()
+                await async_wait_until(landed.is_set)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.decisions.gate"):
+            answers = asyncio.run(_drive())
+
+        assert answers is not None
+        assert receipt["row_written"] is None, "a commit nobody observed is unknown, not refused"
+        warnings = [r for r in caplog.records if "commit unconfirmed" in r.getMessage()]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert POINT in message and "v-late" in message
+        assert re.search(r"after \d+\.\d{3}s", message), message
+        assert [row.get("verdict_id") for row in log_home()] == ["v-late"]
+
+    @pytest.mark.parametrize("committed", [True, False], ids=["committed", "refused"])
+    def test_an_outcome_the_grace_observes_is_definite_and_silent(
+        self, install_impl, log_home, monkeypatch, caplog, committed
+    ):
+        """A commit or a refusal seen inside the grace is that value, and logs nothing.
+
+        The append starts only once the grace wait has begun, so its outcome is
+        always seen by the grace and never by the write budget. A refused append
+        returns while the grace is still parked on the commit signal, so the
+        refused case reads the finished append, not the signal.
+        """
+        import threading
+
+        install_impl(_RecordingOracle())
+        grace_started = threading.Event()
+        commit_events: list[threading.Event] = []
+        real_append = log_mod.append
+
+        class _GraceEvent(threading.Event):
+            def __init__(self):
+                super().__init__()
+                commit_events.append(self)
+
+            def wait(self, timeout=None):
+                if timeout and not self.is_set():
+                    grace_started.set()
+                return super().wait(timeout)
+
+        class _Threading(SimpleNamespace):
+            """``threading`` with ``Event`` swapped; every other name is the real one."""
+
+            def __getattr__(self, name):
+                return getattr(threading, name)
+
+        def _after_grace_starts(row, *, commit_event=None):
+            assert grace_started.wait(_STALLED_APPEND_CEILING_SECS), "no grace wait began"
+            if not committed:
+                return False
+            return real_append(row, commit_event=commit_event)
+
+        monkeypatch.setattr(gate_mod, "_LOG_BUDGET_SECS", 0)
+        monkeypatch.setattr(gate_mod, "_LOG_COMMIT_GRACE_SECS", _STALLED_APPEND_CEILING_SECS)
+        monkeypatch.setattr(gate_mod, "threading", _Threading(Event=_GraceEvent))
+        monkeypatch.setattr(log_mod, "append", _after_grace_starts)
+        receipt: dict = {}
+
+        async def _drive():
+            try:
+                return await decide(POINT, "hi", QUESTIONS, config=_config(), receipt=receipt)
+            finally:
+                # A refusal leaves the grace's own wait parked on the commit signal.
+                # Setting it once the receipt is settled ends that worker thread.
+                for event in commit_events:
+                    event.set()
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.decisions.gate"):
+            answers = asyncio.run(_drive())
+
+        assert answers is not None
+        assert receipt["row_written"] is committed
+        assert not [r for r in caplog.records if "commit unconfirmed" in r.getMessage()]
+        assert len(commit_events) == 1, "the receipt path made exactly one commit signal"
+        assert len(log_home()) == 1
 
     def test_no_provider_message_reaches_the_application_log(self, install_impl, log_home, caplog):
         """Not the row and not the logger: a provider can quote the request back."""
@@ -1141,3 +1449,85 @@ class TestExtraRowFields:
             is None
         )
         assert log_home() == []
+
+
+# ---------------------------------------------------------------------------
+# Provider-stamped response metadata on the row
+# ---------------------------------------------------------------------------
+
+
+class _MetaOracle:
+    """A passing oracle that exposes ``last_response_meta`` the way ``JevOracle`` does."""
+
+    def __init__(self, meta):
+        self.last_response_meta = meta
+
+    async def ask(self, state, questions):
+        return {q.id: Answer(id=q.id, value="DUP", p=0.9, confidence=0.8) for q in questions}
+
+
+class TestResponseMetadataOnRow:
+    """``last_response_meta`` from the lane's oracle rides onto the success row."""
+
+    @pytest.mark.asyncio
+    async def test_model_usage_and_request_id_land_on_the_success_row(self, install_impl, log_home):
+        install_impl(
+            _MetaOracle(
+                {
+                    "provider_model": "jev-1.13",
+                    "input_tokens": 312,
+                    "output_tokens": 48,
+                    "request_id": "req_abc",
+                }
+            )
+        )
+        answers = await decide(POINT, {"q": "x"}, QUESTIONS, config=_config())
+        assert answers is not None
+        row = log_home()[0]
+        assert row["provider_model"] == "jev-1.13"
+        assert row["input_tokens"] == 312
+        assert row["output_tokens"] == 48
+        assert row["request_id"] == "req_abc"
+        assert row["answers"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_lane_that_stamps_no_metadata_writes_a_plain_row(self, install_impl, log_home):
+        """An oracle without the attribute (the LLM judge lane) leaves the row plain."""
+        install_impl(_RecordingOracle())  # no last_response_meta attribute at all
+        answers = await decide(POINT, {"q": "x"}, QUESTIONS, config=_config())
+        assert answers is not None
+        row = log_home()[0]
+        assert "provider_model" not in row
+        assert "request_id" not in row
+
+    @pytest.mark.asyncio
+    async def test_a_none_metadata_adds_nothing(self, install_impl, log_home):
+        install_impl(_MetaOracle(None))
+        await decide(POINT, {"q": "x"}, QUESTIONS, config=_config())
+        row = log_home()[0]
+        assert "provider_model" not in row
+
+    @pytest.mark.asyncio
+    async def test_a_callers_extra_wins_a_name_collision(self, install_impl, log_home):
+        """The point's own field wins; metadata only ever adds, never overwrites."""
+        install_impl(_MetaOracle({"provider_model": "from-provider", "request_id": "req_x"}))
+        await decide(
+            POINT,
+            {"q": "x"},
+            QUESTIONS,
+            config=_config(),
+            extra={"provider_model": "from-point"},
+        )
+        row = log_home()[0]
+        assert row["provider_model"] == "from-point"
+        assert row["request_id"] == "req_x"
+
+    @pytest.mark.asyncio
+    async def test_metadata_does_not_ride_a_failure_row(self, install_impl, log_home):
+        """An error row carries no metadata: the oracle sets it only on success,
+        and a failing oracle never ran the attribute set."""
+        install_impl(_RaisingOracle(RuntimeError("transport")))
+        assert await decide(POINT, {"q": "x"}, QUESTIONS, config=_config()) is None
+        row = log_home()[0]
+        assert row["error"] == gate_mod.ERROR_PROVIDER
+        assert "provider_model" not in row

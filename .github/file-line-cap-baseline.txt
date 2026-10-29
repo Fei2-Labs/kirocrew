@@ -1,0 +1,15 @@
+# Code files already over the 2,000-line cap, as `<lines> <path>`, sorted by
+# path. scripts/check_file_line_cap.py fails on any OTHER file over the cap, so
+# this list can only shrink: a file that drops to 2,000 lines or fewer must
+# leave it, and from then on it is capped like any other file.
+#
+# Do NOT add a line or raise a count to make a red check green: split the file
+# instead, moving whole definitions into a new sibling module. A listed file
+# must not grow; the check reports one that did.
+#
+# Delete only your own rows, never someone else's. The refresh below edits only
+# the rows of files your change touches, and only deletes lines and lowers counts;
+# where it cannot tell which files those are, it refuses unless --whole-tree asks
+# it to rewrite every row:
+#   python3 scripts/check_file_line_cap.py --update-baseline
+18473 src/kiro_crew/dashboard/chat_runner.py

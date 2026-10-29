@@ -102,7 +102,7 @@ describe('LinkedSurfacesSection menu error hand-offs', () => {
     mocks.pauseMirror.mockRejectedValue(new Error('channel refused'))
     mount([link()])
 
-    const row = await screen.findByRole('menuitem', { name: /disconnect from discord/i })
+    const row = await screen.findByRole('menuitem', { name: /pause replies to discord/i })
     row.focus()
     await user.keyboard('{Enter}')
     const alert = await screen.findByTestId('linked-surfaces-error-discord')

@@ -36,19 +36,22 @@ The owning session applies it only after the turn ends. At the start of a later
 user turn or monitor wake, the agent can call `monitor_inspect` to read the
 authoritative retained state.
 
-Unless you choose different positive limits, the monitor uses:
+Unless you choose different limits, the monitor uses:
 
 | Limit | Default |
 |---|---:|
 | Probe interval | 5 minutes |
 | Runtime | 4 hours |
-| Completed agent turns | 8 |
+| Completed agent turns | 0 (no limit) |
 | Reported aggregate input and output tokens | 250,000 |
 | Consecutive provider errors | 3 |
 
 The token cap applies only to usage reported by the model provider.
 `token_usage_known` tells you whether every completed turn included usage. The
-runtime and completed-turn limits remain hard fallbacks when usage is unknown.
+runtime limit is the hard fallback when usage is unknown; it always applies. The
+completed-turn limit is a fallback only when it is a positive number -- pass 0
+to mean the monitor is never retired on a count of wakes. Every other limit must
+be positive.
 
 ## Understand when the agent runs
 

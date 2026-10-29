@@ -21,9 +21,15 @@ import { useAppDispatch } from '../store'
 import { setHostModel, type HostModel } from '../store/instancesSlice'
 import { isEmbeddedPane } from '../lib/embedded'
 import { setFocusModeEnabled } from '../hooks/useFocusMode'
+import { noteClipboardRelayHost, PANE_CLIPBOARD_VERSION } from '../lib/paneClipboardRelay'
+import { noteHostOrigin } from '../lib/hostRelay'
 
 const MAC_INSET_CLASS = 'embedded-mac-inset'
 const WIN_INSET_CLASS = 'embedded-win-inset'
+const WIN_CAPTION_RESERVE_PROP = '--mc-win-caption-reserve'
+// Whole-pixel lengths only: the value crosses a postMessage boundary and is
+// written into this document's inline style.
+const WIN_CAPTION_RESERVE_RE = /^\d{1,4}px$/
 
 // Backoff (ms) between re-announcements of `mc-embedded-ready`, applied AFTER
 // the initial announce. The handshake is: child posts `mc-embedded-ready`, the
@@ -42,7 +48,7 @@ const WIN_INSET_CLASS = 'embedded-win-inset'
 const HANDSHAKE_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 4000]
 
 /** Narrow an untrusted payload to a HostModel, dropping anything malformed. */
-function parseHostModel(data: unknown): HostModel | null {
+export function parseHostModel(data: unknown): HostModel | null {
   if (!data || typeof data !== 'object') return null
   const d = data as Record<string, unknown>
   if (d.type !== 'mc-host-model') return null
@@ -55,6 +61,26 @@ function parseHostModel(data: unknown): HostModel | null {
       sshHost: String(t.sshHost ?? ''),
       state: typeof t.state === 'string' ? t.state : undefined,
       unread: Number(t.unread) || 0,
+      // Element-wise, like every other field here: a malformed depth must degrade
+      // to "no indent" rather than putting a non-number into the row's padding.
+      // `undefined` is also what an older host sends (no field at all), and the
+      // bar reads that as the flat list it always rendered.
+      depth: typeof t.depth === 'number' && Number.isFinite(t.depth) && t.depth >= 0
+        ? Math.floor(t.depth)
+        : undefined,
+      // Only an explicit `false` greys a row out. Absence must not: an older host
+      // sends no field, and reading that as unreachable would grey out every crew.
+      reachable: typeof t.reachable === 'boolean' ? t.reachable : undefined,
+      pathName: typeof t.pathName === 'string' ? t.pathName : undefined,
+      // The parent segment travels too. Without it a pane's chip falls back to
+      // ellipsising the joined label from the right, which eats the crew's own
+      // name -- the very thing the two-box chip exists to stop -- and it would do
+      // so in every pane while looking correct in the window.
+      pathParent: typeof t.pathParent === 'string' ? t.pathParent : undefined,
+      // The row's reason travels with its `reachable`, or a pane would dim a row
+      // and have nothing to say about it. Absent is legitimate -- an older host,
+      // and a healthy chain -- so the label falls back to the bare word.
+      brokenAt: typeof t.brokenAt === 'string' ? t.brokenAt : undefined,
     }))
     .filter(t => t.id)
   const rawSelf = d.self && typeof d.self === 'object' ? (d.self as Record<string, unknown>) : null
@@ -73,6 +99,9 @@ function parseHostModel(data: unknown): HostModel | null {
     // Absence -> false is correct here (unlike `focusMode`): an older host that
     // omits the field simply has no Windows caption inset to relay.
     winInset: !!d.winInset,
+    winCaptionReserve: typeof d.winCaptionReserve === 'string' && WIN_CAPTION_RESERVE_RE.test(d.winCaptionReserve)
+      ? d.winCaptionReserve
+      : undefined,
     // Tri-state on purpose: `false` and "the host never sent the field" must
     // not collapse. An older host omits it AND ignores the pane's echoed
     // `mc-set-focus-mode`, so coercing absence to `false` would revert a
@@ -149,8 +178,24 @@ export default function EmbeddedHostBridge() {
       const model = parseHostModel(e.data)
       if (!model) return
       dispatch(setHostModel(model))
+      // Where the tab bar's switch / pin / stable-order relays go: exactly the
+      // origin this model came from, never '*'.
+      noteHostOrigin(e.origin)
+      // Whether this host performs image copies for us, and where to ask. Read
+      // off the raw payload: it is a pane-side capability, not header state.
+      noteClipboardRelayHost(
+        e.origin,
+        (e.data as { clipboardRelay?: unknown }).clipboardRelay === PANE_CLIPBOARD_VERSION,
+      )
       document.documentElement.classList.toggle(MAC_INSET_CLASS, model.macInset)
       document.documentElement.classList.toggle(WIN_INSET_CLASS, model.winInset)
+      // Adopt the host's zoom-aware reserve; without one the pane's own :root
+      // default (142px) applies.
+      if (model.winInset && model.winCaptionReserve) {
+        document.documentElement.style.setProperty(WIN_CAPTION_RESERVE_PROP, model.winCaptionReserve)
+      } else {
+        document.documentElement.style.removeProperty(WIN_CAPTION_RESERVE_PROP)
+      }
       // Adopt the host window's focus mode. `echo: false` because this IS the
       // relayed value — sending it back up is what would make the two frames
       // ping-pong. A toggle the user drives inside this pane still echoes.
@@ -177,7 +222,9 @@ export default function EmbeddedHostBridge() {
       for (const t of retryTimers) window.clearTimeout(t)
       document.documentElement.classList.remove(MAC_INSET_CLASS)
       document.documentElement.classList.remove(WIN_INSET_CLASS)
+      document.documentElement.style.removeProperty(WIN_CAPTION_RESERVE_PROP)
       setFocusModeEnabled(false, { echo: false })
+      noteClipboardRelayHost(null, false)
       dispatch(setHostModel(null))
     }
   }, [dispatch])

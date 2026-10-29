@@ -401,7 +401,7 @@ class TestManagerRefusesUnknownAgent:
         monkeypatch.setattr(
             disc,
             "project_agent_files",
-            lambda p, include_legacy=False: pytest.fail("globbed on the event loop"),
+            lambda p, include_legacy=False, **kw: pytest.fail("globbed on the event loop"),
         )
         assert subagent._validate_agent("repobot", "/some/project") == ("repobot", "", "")
 

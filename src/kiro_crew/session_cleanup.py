@@ -22,10 +22,51 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.process_identity import (
+    audit_kill_decision,
+    audit_kill_phase,
+    teardown_barriers,
+)
+from kiro_crew.runtime_ownership import authorize_runtime_kill
+from kiro_crew.runtime_reconcile import build_reconciler
 from kiro_crew.watchdog import SessionWatchdog
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMProvider
+
+
+#: Caller name on this module's kill-decision audit rows.
+_SWEEP = "session_cleanup sweep"
+
+#: How long after a session's harness launched work that outlives the prompt
+#: the RSS recycle and the idle sweep still treat that session as busy. Claude
+#: Code runs a backgrounded command or a Workflow in the session's own process
+#: tree after the prompt returns, and reports the launch on the launching tool
+#: call; it reports nothing a client can read while that work runs, nor when it
+#: ends. So the hold is bounded by time: long enough for an ordinary workflow,
+#: short enough that a launch cannot exempt a runaway tree from the memory
+#: ceiling for the rest of the session's life.
+HARNESS_BACKGROUND_WORK_HOLD_SECS = 3600.0
+
+#: Hard ceiling multiplier on ``rss_max_mb`` that the hold cannot override.
+#: The hold's clock restarts on every launch, so an agent that keeps launching
+#: background work -- possibly steered to by injected content -- renews it
+#: forever and the time bound alone does not bound memory. Inside the hold
+#: the RSS recycle therefore still proceeds once the tree exceeds this multiple
+#: of the configured ceiling, and the notice names the launched work that may
+#: have been stopped (only this recycle does: one let through past the hold
+#: presumed the work finished, so its notice stays plain).
+#: Why 2x: the reported workflow trees read 2398-2641 MB against
+#: a 1536 MB ceiling, so the hold must survive an ordinary workflow
+#: at ~1.6-1.7x while still cutting off a runaway before it grows unbounded.
+HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR = 2
+
+#: How long after an RSS recycle a session crossing the ceiling again counts as
+#: the replacement climbing straight back. A recycled session restarts its
+#: process on its next message, which can be hours after an idle recycle, so
+#: the window spans a day. A crossing inside it suggests the ceiling sits below
+#: the workload's steady footprint rather than one session leaking.
+RSS_REBOUND_WINDOW_SECS = 86400.0
 
 
 class ShutdownSignal(Protocol):
@@ -108,9 +149,8 @@ ActivePidCollector = Callable[
     [MutableMapping[str, SessionEntry]],
     tuple[set[int], bool],
 ]
-PidCandidate = tuple[int, str | None]
-PeriodicPidSweep = Callable[[int, set[int]], tuple[set[str], list[PidCandidate]]]
-PidWriteback = Callable[[int, list[PidCandidate], set[str]], int]
+PeriodicPidSweep = Callable[[int, set[int]], tuple[set[str], list[int]]]
+PidWriteback = Callable[[int, list[int], set[str]], int]
 
 
 def _no_attached_subagents(key: str) -> bool:
@@ -121,6 +161,11 @@ def _no_attached_subagents(key: str) -> bool:
 def _no_pending_injection(key: str) -> bool:
     """Default injection probe: a manager with no gateway injects nothing."""
     return False
+
+
+def _no_background_launch(provider: LLMProvider) -> tuple[float, str] | None:
+    """Default background-launch probe: no provider reports a launch."""
+    return None
 
 
 @dataclass(slots=True)
@@ -134,6 +179,20 @@ class CleanupState:
     # The (timeout_secs, watchdog_rss_max_mb) pair the policy was last derived
     # from, as configured; transitions are logged only when it moves.
     idle_policy_source: tuple[int, int] | None = None
+    # When the work probe last failed loudly. A probe that raises keeps every
+    # candidate it is asked about, on the idle sweep and the RSS recycle alike,
+    # so a probe raising system-wide holds every reap; that is visible at WARNING
+    # at most once per ``PROBE_FAILURE_WARN_INTERVAL_SECS`` across all keys,
+    # never once per candidate per tick.
+    probe_failure_warned_at: float | None = None
+    # Session key -> (monotonic time, tree RSS in MiB) of its last RSS recycle,
+    # kept for ``RSS_REBOUND_WINDOW_SECS``. The next crossing by that key pops
+    # its entry, so the rebound warning fires once per recycle cycle.
+    rss_recycled: dict[str, tuple[float, int]] = field(default_factory=dict)
+    # When the agent-scope reap hook last failed loudly. A failure there stops
+    # every scope from being reclaimed, so it surfaces at WARNING at most once
+    # per ``PROBE_FAILURE_WARN_INTERVAL_SECS``; a clean pass re-arms it.
+    scope_reap_failure_warned_at: float | None = None
     stuck_reported: dict[str, float] = field(default_factory=dict)
     last_pycache_gc: float | None = None
     active_dashboard_slots: set[str] | None = None
@@ -151,6 +210,28 @@ class CleanupState:
     # linked key before the first turn creates that session.
     slot_owned_keys: set[str] = field(default_factory=set)
     watchdog: SessionWatchdog | None = None
+    # The runtime reconciler, retained across ticks because its two-pass
+    # confirmation IS its state: a process unowned once is remembered, and only
+    # one remembered from the previous pass may be killed. Rebuilding it per tick
+    # would make every pass a first pass and nothing would ever be reclaimed.
+    # Typed loosely so this module need not import the reconciler at load.
+    runtime_reconciler: Any = None
+    # The pid union for the CURRENT reconcile pass, taken on the event loop and
+    # frozen before the pass is dispatched to a worker thread. It is stored rather
+    # than passed because the reconciler outlives any one tick: the pass reads
+    # whatever this tick put here, so the union is still re-read every pass, but
+    # the read that gathers it happens where it is legal. Reading it from the
+    # worker would drain the warm pool's asyncio.Queue off-loop.
+    runtime_reconcile_active: frozenset[int] = frozenset()
+    # When the reconciler last refused a pass at WARNING, and the reason it
+    # carried, so a persistent refusal surfaces once instead of once per tick
+    # while a NEW reason re-warns at once and a resumed supported pass logs a
+    # recovery. A refusal disables reclamation and stops the SLI publishing;
+    # reported only at debug (the previous behaviour) it left the reconciler
+    # silently inert behind one debug line. ``None`` reason means "not currently
+    # refusing"; the two move together.
+    reconcile_refusal_warned_at: float | None = None
+    reconcile_refusal_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +247,9 @@ class CleanupDeps:
     cleanup_stale_sandbox_profiles: Callable[[], int]
     prune_session_pid_mappings: Callable[[], int]
     prune_member_pid_bindings: Callable[[], int]
+    # Rotates the bundled shell-audit hook's ``audit.log`` once it reaches its
+    # cap; answers whether this call moved it aside. See ``shell_audit_log``.
+    rotate_shell_audit_log: Callable[[], bool]
     prune_pycache: Callable[[], tuple[int, int]]
     collect_active_pids: ActivePidCollector
     periodic_pid_sweep: PeriodicPidSweep
@@ -207,6 +291,14 @@ class CleanupDeps:
     # and defaults to "nothing injecting" so a manager without a gateway keeps
     # its existing behaviour.
     has_pending_injection: Callable[[str], bool] = _no_pending_injection
+    # ``(seconds since, description)`` of the newest work the session's harness
+    # launched to keep running after the prompt returned, or ``None``. A free
+    # semaphore only proves Kiro Crew's own prompt returned, and this is the only
+    # witness to that work. Synchronous -- it reads one record -- and defaults
+    # to "nothing launched" so a manager without ACP providers is unchanged.
+    provider_background_launch: Callable[[LLMProvider], tuple[float, str] | None] = (
+        _no_background_launch
+    )
 
 
 class SessionCleanup:
@@ -215,6 +307,20 @@ class SessionCleanup:
     # Upper bound on one sleep of the cleanup loop, so a lowered idle timeout
     # is adopted within this many seconds regardless of the previous interval.
     POLICY_REFRESH_SECS = 60.0
+    # Floor between two WARNING lines about a work probe that cannot answer.
+    # Fail-closed means a broken probe silently holds every idle, orphan and
+    # RSS reap, so it must surface above debug -- but one line per candidate
+    # per tick is the noise this bound exists to prevent.
+    PROBE_FAILURE_WARN_INTERVAL_SECS = 3600.0
+
+    # Floor between two WARNING lines about a reconcile pass that refuses. A
+    # refusal disables both reclamation directions and stops the liveness SLI
+    # publishing for as long as the unreadable source stays unreadable, so it
+    # must surface above debug -- but the reconciler ticks on the cleanup
+    # cadence, so one line per tick for a condition that persists for minutes is
+    # the noise this bound exists to prevent. A CHANGE of reason bypasses the
+    # floor and re-warns at once, because a new failure is a new event.
+    RECONCILE_REFUSAL_WARN_INTERVAL_SECS = 3600.0
 
     # Ceiling on the tick interval itself.
     #
@@ -228,7 +334,7 @@ class SessionCleanup:
     # asking for long-lived sessions buys slower orphan cleanup than switching
     # the idle sweep off entirely.
     #
-    # ``session.py``'s module map states the intended cadence --
+    # ``session_parts/sweeps.py``'s module map states the intended cadence --
     # "``_expire_idle()`` -- **periodic** (every ~5 min)" -- which is this
     # ceiling. Capping cannot expire a session early: ``_expire_idle_hook``
     # passes ``state.idle_timeout``, so the timeout decides WHEN a session is
@@ -395,6 +501,7 @@ class SessionCleanup:
                 self._deps.reap_agent_scopes,
                 active_pids,
             )
+            self.state.scope_reap_failure_warned_at = None
             reclaimed = int(getattr(summary, "reclaimed", 0) or 0)
             if reclaimed:
                 self._deps.logger.info(
@@ -402,12 +509,257 @@ class SessionCleanup:
                     reclaimed,
                 )
         except Exception:
-            # Best-effort, like the orphan-MCP sweep: never promote severity.
-            self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+            # Best-effort, like the orphan-MCP sweep, but not silent: an escape
+            # here skips every scope, so it reaches WARNING, rate-limited.
+            self._note_scope_reap_failure()
+
+    def _sessions_on_pid(self, pid: int) -> list[str]:
+        """The session keys whose provider is running on *pid*.
+
+        Read WITHOUT the registry lock, from the reconciler's worker thread. The
+        lock is an ``asyncio`` lock and cannot be taken off-loop at all, and a
+        reporting question must not be the thing that queues behind a live turn's
+        registration. ``list()`` takes a snapshot so a concurrent registration
+        cannot resize the mapping mid-iteration; a key that changes hands inside
+        the read costs one misaddressed notification and never a signal.
+        """
+        keys: list[str] = []
+        for key in list(self._owner._sessions):
+            try:
+                if self._owner.get_pid(key) == pid:
+                    keys.append(key)
+            except Exception:
+                continue
+        return keys
+
+    def _reconcile_kill_budget(self) -> int:
+        """``session.reconcile_max_kills`` as this tick should act on it.
+
+        The field can only LOWER the arm's shipped budget, never raise it, and at 0
+        it leaves the kill arm observing: the arm still publishes the leak reading
+        and audits the processes it would have signalled. Read from the owner's
+        CURRENT config on every tick, so turning the budget down on a host that
+        shares its data home with another install, or putting it back, takes effect
+        on the next pass instead of at the next restart.
+
+        Defensive about the type for the reason ``_adopt_idle_policy`` is about the
+        RSS ceiling: ``config.json`` is agent-writable, and the value authorizes
+        signals. Anything that is not a plain non-negative int reads as zero, which
+        is the answer that does not kill.
+        """
+        raw = getattr(self._owner._cfg.session, "reconcile_max_kills", 0)
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            return 0
+        return max(0, raw)
+
+    async def _reconcile_runtimes_hook(self) -> None:
+        """Compare the kernel's process list with this gateway's records.
+
+        Every other sweep on this tick asks a record whether a pid is still
+        needed. This one asks the kernel what exists and acts on the two
+        disagreements: a live process no record claims, and a record naming a
+        process that is gone. It publishes both counts whether or not it acted,
+        because a leak that is merely counted is still a leak an operator can see.
+
+        The reconciler object is built once and kept on the cleanup state: the
+        two-pass confirmation that stops it killing a process whose registration
+        is still in flight is that object's memory of the previous pass.
+
+        Blocking work -- ``cgroup.procs`` reads, ``/proc`` reads, the signals --
+        runs on the maintenance executor, exactly like the scope reaper and for
+        the same reason: these are filesystem reads over same-uid agent-writable
+        paths, and doing them on the event loop parks the gateway.
+
+        The pid union is therefore taken HERE, on the loop, and handed to the pass
+        as a frozen set. It cannot be read from the worker: ``_pool_pids`` drains
+        the warm pool's ``asyncio.Queue`` with ``get_nowait`` and puts every entry
+        back, which is safe only on the loop that owns the queue. From a thread it
+        races the refill check, and a refill that sees a momentarily empty pool
+        spawns runtimes to fill one that was never empty.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            # On the loop, before anything is dispatched to the executor.
+            active_now, union_complete = self._active_pids()
+            if not union_complete:
+                # The same completeness rule the membership read inside the pass
+                # imposes on itself: a partial union makes a live runtime look
+                # unowned, and that is the one input that turns this reconciler
+                # into the leak it exists to report. Housekeeping deferred one
+                # tick costs nothing that killing a live runtime would not cost
+                # more.
+                #
+                # This is the SAME silent-inert condition a ``run_once`` refusal
+                # is -- the pass produces no reading and publishes no counts -- so
+                # it goes through the same warn-once ledger and not a bare debug
+                # line. Its reason is distinct, so it is its own transition: a
+                # gateway stuck here and a gateway stuck on an unreadable source
+                # are two different faults an operator must tell apart, and the
+                # next supported pass clears whichever one was standing.
+                self._note_reconcile_refusal("the active-pid union is incomplete")
+                return
+            snapshot = frozenset(active_now)
+            self.state.runtime_reconcile_active = snapshot
+            reconciler = self.state.runtime_reconciler
+            if reconciler is None:
+                # Both seams are bound to THIS cleanup service rather than
+                # captured values: the union seam reads whatever snapshot this
+                # tick stored, and the notification resolves the session keys as
+                # they are at the moment a death is found. The loop is captured
+                # because the notification is raised from a worker thread and has
+                # to be handed back to the loop that owns the callback.
+                reconciler = build_reconciler(
+                    active_pids=lambda: set(self.state.runtime_reconcile_active),
+                    notify_dead=lambda pid: self._note_dead_runtime(pid, loop),
+                )
+                self.state.runtime_reconciler = reconciler
+            # Adopted before every pass, not frozen into the instance that is
+            # retained for the gateway's life: the two-pass confirmation is that
+            # instance's state, so it cannot be rebuilt to pick up a config write,
+            # and arming or disarming the kill arm must not need a restart. Same
+            # schedule and same live-config source as ``_adopt_idle_policy``.
+            reconciler.set_max_kills(self._reconcile_kill_budget())
+            reading = await loop.run_in_executor(
+                self._deps.get_maintenance_executor(),
+                reconciler.run_once,
+            )
+            if not reading.supported:
+                self._note_reconcile_refusal(reading.reason or "unsupported")
+                return
+            self._clear_reconcile_refusal()
+            self._deps.emit_counter(
+                "session.runtime_reconcile",
+                reading.as_counter_fields(),
+            )
+            if reading.unowned_alive or reading.owned_dead:
+                # ``would_kill`` belongs beside the other four: it is the number an
+                # operator reads to decide whether to change the budget, and a
+                # summary that published the whole unclaimed population without it
+                # cannot tell "nothing to reclaim" from "candidates are sitting
+                # here and the budget is withholding them".
+                #
+                # WARNING only when the pass acted or is withholding an action: a
+                # kill, a would-be kill, or a retracted record. A population that is
+                # all permanently withheld (long-lived tool work, app backends) or
+                # all "not mine to retract" reads the same every tick, and at
+                # WARNING it was a line per tick for the gateway's life. The
+                # counter above still carries every field on every pass.
+                acted = reading.killed or reading.would_kill or reading.forgotten
+                self._deps.logger.log(
+                    logging.WARNING if acted else logging.DEBUG,
+                    "Runtime reconcile: unowned_alive=%d owned_dead=%d "
+                    "(killed %d, would_kill %d, retracted %d)",
+                    reading.unowned_alive,
+                    reading.owned_dead,
+                    reading.killed,
+                    reading.would_kill,
+                    reading.forgotten,
+                )
+        except Exception:
+            # Best-effort, like the sweeps either side of it.
+            self._deps.logger.debug("runtime reconcile hook failed", exc_info=True)
+
+    def _note_reconcile_refusal(self, reason: str) -> None:
+        """Report a refused reconcile pass: the reason at debug, the fact at a bounded WARNING.
+
+        A refused pass (``ReconcileReading.supported`` false) reclaims nothing and
+        publishes no ``unowned_alive``/``owned_dead`` reading, and it goes on
+        refusing for as long as the source it could not read stays unreadable -- a
+        corrupt MCP backend pidfile, an incomplete tracked-pid snapshot. Reported
+        only at debug (the previous behaviour) that left the reconciler silently
+        inert: an operator watching the liveness SLI sees the counts stop and
+        nothing above debug says the pass is refusing rather than reading zero.
+
+        So the fact surfaces at WARNING. It must NOT surface once per tick for a
+        condition that persists for minutes, so a steady refusal repeats at most
+        once per :data:`RECONCILE_REFUSAL_WARN_INTERVAL_SECS`; a CHANGE of reason
+        bypasses the floor, because a different unreadable source is a different
+        event worth its own line. The exact reason (which source, which error)
+        stays at debug every tick for a reader who wants the detail.
+        """
+        self._deps.logger.debug("runtime reconcile skipped: %s", reason)
+        now = self._deps.monotonic()
+        last = self.state.reconcile_refusal_warned_at
+        if (
+            last is not None
+            and reason == self.state.reconcile_refusal_reason
+            and now - last < self.RECONCILE_REFUSAL_WARN_INTERVAL_SECS
+        ):
+            return
+        self.state.reconcile_refusal_warned_at = now
+        self.state.reconcile_refusal_reason = reason
+        self._deps.logger.warning(
+            "Runtime reconcile refused a pass and is reclaiming nothing and "
+            "publishing no counts until its sources read again: %s. This warning "
+            "repeats at most once per %.0fs while the condition persists (reason "
+            "detail at debug).",
+            reason,
+            self.RECONCILE_REFUSAL_WARN_INTERVAL_SECS,
+        )
+
+    def _clear_reconcile_refusal(self) -> None:
+        """Log recovery once when a supported pass follows a refused one, then re-arm.
+
+        Without this the first refusal after boot would consume the only WARNING
+        the process emits for this condition, and a LATER refusal that arrived
+        while the flag was still set (within the re-warn floor) would be silent --
+        the original defect back in a subtler form. Clearing on the first supported
+        pass says the reconciler is working again and re-arms the warn-once so the
+        next outage warns immediately, exactly as ``kiro_readiness`` clears its own
+        refusal flag on recovery.
+        """
+        if self.state.reconcile_refusal_reason is None:
+            return
+        recovered_from = self.state.reconcile_refusal_reason
+        self.state.reconcile_refusal_warned_at = None
+        self.state.reconcile_refusal_reason = None
+        self._deps.logger.warning(
+            "Runtime reconcile is reading its sources again and has resumed "
+            "reclaiming and publishing counts (previously refusing: %s)",
+            recovered_from,
+        )
+
+    def _note_dead_runtime(self, pid: int, loop: asyncio.AbstractEventLoop) -> None:
+        """Tell whoever still holds *pid* that the process behind it is gone.
+
+        The reconciler retracts the record; this says so to the sessions that were
+        using it, which is the difference between a tidy registry and a session
+        that learns its runtime died only when its next turn times out. Reuses the
+        recycle callback the RSS path already fires, so the notification a user
+        sees is the one they already know.
+
+        Called from the reconciler's worker thread, so the callback is SCHEDULED
+        on *loop* rather than awaited here: a slow consumer must not hold the
+        reconciliation open, and a coroutine cannot be awaited off-loop anyway.
+        """
+        keys = self._sessions_on_pid(pid)
+        if not keys:
+            return
+        for key in keys:
+            self._deps.logger.warning(
+                "Runtime reconcile: session %s was on pid %s, which no longer exists",
+                key,
+                pid,
+            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._owner._fire_recycle_callback(key, reason="runtime process is gone"),
+                    loop,
+                )
+            except Exception:
+                self._deps.logger.debug(
+                    "Runtime reconcile: could not notify %s", key, exc_info=True
+                )
 
     async def _rss_threshold_check(self) -> None:
         if not self.state.rss_max_mb:
             return
+
+        now = self._deps.monotonic()
+        last_recycles = self.state.rss_recycled
+        for stale, (at, _) in list(last_recycles.items()):
+            if now - at > RSS_REBOUND_WINDOW_SECS:
+                del last_recycles[stale]
 
         candidates: list[tuple[str, int, SessionEntry]] = []
         persistent_keys = self._deps.get_persistent_keys()
@@ -422,7 +774,7 @@ class SessionCleanup:
                 if pid is not None:
                     candidates.append((key, pid, session))
 
-        victims: list[tuple[str, int, SessionEntry]] = []
+        victims: list[tuple[str, int, int, SessionEntry]] = []
         if candidates:
             loop = asyncio.get_running_loop()
             measure: Callable[[int], int]
@@ -442,16 +794,52 @@ class SessionCleanup:
                 def measure(pid: int) -> int:
                     return self._deps.rss_mb_from_tree(pid, child_map)
 
+            # The figure is a RUNTIME's tree, so it is measured per runtime, not
+            # per session: co-tenants would otherwise pay N identical tree walks
+            # to read one number. Cached within the tick only -- the next tick
+            # re-measures, because the tree grows.
+            rss_by_pid: dict[int, int] = {}
             for key, pid, session in candidates:
-                rss = await loop.run_in_executor(
-                    self._deps.get_maintenance_executor(),
-                    measure,
-                    pid,
-                )
+                rss = rss_by_pid.get(pid)
+                if rss is None:
+                    rss = await loop.run_in_executor(
+                        self._deps.get_maintenance_executor(),
+                        measure,
+                        pid,
+                    )
+                    rss_by_pid[pid] = rss
                 if rss > self.state.rss_max_mb:
-                    victims.append((key, rss, session))
+                    previous = last_recycles.pop(key, None)
+                    if previous is not None:
+                        self._deps.logger.warning(
+                            "RSS recycle rebound: session %s tree rss=%dMB is back above "
+                            "%dMB %.0fs after a recycle at %dMB; "
+                            "session.watchdog_rss_max_mb may be set too low for this workload",
+                            key,
+                            rss,
+                            self.state.rss_max_mb,
+                            now - previous[0],
+                            previous[1],
+                        )
+                    victims.append((key, pid, rss, session))
 
-        for key, rss, session in victims:
+        # One RECLAIM per runtime per tick. The threshold was crossed by a
+        # process, and every session on it reads the same figure, so recycling
+        # all of them would discard N sessions' work for one process -- which
+        # survives anyway while any tenant remains, so the next tick would find
+        # the same crossing with fewer sessions left to spend. Budgeted on a
+        # reset that actually happened, not on an attempt: a victim the guards
+        # below decline has reclaimed nothing, so a co-tenant is still eligible.
+        recycled_pids: set[int] = set()
+        for key, pid, rss, session in victims:
+            if pid in recycled_pids:
+                self._deps.logger.debug(
+                    "RSS recycle: runtime %d already recycled a session this tick; "
+                    "leaving co-tenant %s alone",
+                    pid,
+                    key,
+                )
+                continue
             try:
                 # A free semaphore only proves the parent's OWN turn is over.
                 # Sub-agents spawned by that turn keep running on this session's
@@ -482,6 +870,33 @@ class SessionCleanup:
                         key,
                     )
                     continue
+                # The harness's own background work, which neither the
+                # semaphore nor the sub-agent probe can see: Claude Code keeps a
+                # backgrounded command or Workflow running in this tree after
+                # the prompt returned. A launch inside the hold keeps the
+                # session; an older one recycles with the plain memory-limit
+                # notice (letting it through presumes the work finished).
+                # The hold yields to the hard ceiling: every new launch
+                # refreshes the hold's clock, so without a memory bound of its
+                # own, a session that keeps launching work would keep this
+                # check off forever while its tree grows without limit.
+                # Synchronous, so the no-suspend window to ``reset`` holds.
+                launch = self._harness_background_launch(session)
+                if (
+                    launch is not None
+                    and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS
+                    and rss <= self.state.rss_max_mb * HARNESS_BACKGROUND_WORK_HARD_CEILING_FACTOR
+                ):
+                    self._deps.logger.info(
+                        "RSS recycle: session %s tree rss=%dMB exceeds %dMB but its "
+                        "harness launched background work %.0fs ago (%s); skipping",
+                        key,
+                        rss,
+                        self.state.rss_max_mb,
+                        launch[0],
+                        launch[1],
+                    )
+                    continue
                 # reset revalidates both object identity and the busy semaphore
                 # under its own lock after the unlocked RSS measurement, and
                 # ``skip_if_injecting`` puts the counter read under that same
@@ -496,6 +911,8 @@ class SessionCleanup:
                 )
                 if not recycled:
                     continue
+                recycled_pids.add(pid)
+                self.state.rss_recycled[key] = (self._deps.monotonic(), rss)
                 self._deps.logger.warning(
                     "RSS recycle: session %s tree rss=%dMB exceeds %dMB",
                     key,
@@ -503,13 +920,40 @@ class SessionCleanup:
                     self.state.rss_max_mb,
                 )
                 self._deps.stats_factory().inc_session_cleaned()
-                await self._owner._fire_recycle_callback(
-                    key,
-                    reason=f"memory limit ({rss}MB)",
-                )
+                reason = f"memory limit ({rss}MB)"
+                # Name the launched work only while the launch is still inside
+                # the hold — in practice, a hard-ceiling recycle. A recycle let
+                # through PAST the hold just presumed that work finished (that
+                # is what ending the hold means), and the record is never
+                # cleared while the process lives, so warning "may have been
+                # stopped" about a launch from hours ago would be permanent
+                # noise on every later recycle.
+                if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                    reason += (
+                        "; background work its agent started earlier may have been "
+                        f"stopped: {launch[1]}"
+                    )
+                await self._owner._fire_recycle_callback(key, reason=reason)
             except Exception:
                 # One victim cannot suppress the rest of this tick.
                 self._deps.logger.exception("RSS recycle failed for session %s", key)
+
+    def _harness_background_launch(self, session: SessionEntry) -> tuple[float, str] | None:
+        """*session*'s newest background launch as ``(seconds since, description)``.
+
+        ``None`` means its harness launched nothing, or the provider cannot say.
+        Not fail-closed, unlike the two probes below: no launch is the normal
+        answer for every session that started no background work, and an
+        unreadable one must not hold the memory ceiling off.
+        """
+        provider = getattr(session, "provider", None)
+        if provider is None:
+            return None
+        try:
+            return self._deps.provider_background_launch(provider)
+        except Exception:
+            self._deps.logger.debug("Background-launch probe failed", exc_info=True)
+            return None
 
     def _injection_pending(self, key: str) -> bool:
         """Fail-closed read of "is a completion injection in flight for *key*?".
@@ -552,8 +996,20 @@ class SessionCleanup:
         That read happens BEFORE the probe below suspends, so it cannot see an
         injection that starts inside the await. It is therefore not sufficient on
         its own: a caller that resets after awaiting this wrapper re-asks
-        ``_injection_pending`` immediately before the act. Both such callers do
-        -- the idle sweep's orphan branch and the RSS recycle.
+        ``_injection_pending`` immediately before the act. Every such caller does
+        -- the idle sweep on both its axes and the RSS recycle.
+
+        Fail-closed has a cost: a probe that RAISES system-wide keeps EVERY
+        candidate on every path, so the idle sweep, the orphan axis and the RSS
+        recycle all stop reaping until it recovers. That must be visible above
+        debug, but not once per candidate per tick, so the warning is bounded
+        to one per ``PROBE_FAILURE_WARN_INTERVAL_SECS`` across all keys and each
+        failure keeps its traceback at debug. The warning covers only an
+        exception that escapes the probe: an unreadable task store does not
+        raise here, because ``subagents_attached_async`` absorbs it one layer
+        down and answers "attached" (``taskq_bridge.UNKNOWN_PENDING``), so that
+        cause reaches the sweep as an ordinary attached verdict and its
+        per-key "still has sub-agent work" line, not as this warning.
         """
         try:
             if self._injection_pending(key):
@@ -563,12 +1019,42 @@ class SessionCleanup:
                 answer = await answer
             return bool(answer)
         except Exception:
-            self._deps.logger.debug(
-                "Work probe failed for session %s; keeping it",
-                key,
-                exc_info=True,
-            )
+            self._note_probe_failure(key)
             return True
+
+    def _note_scope_reap_failure(self) -> None:
+        """Log an agent-scope reap escape: the traceback at debug, the fact at a bounded WARNING."""
+        self._deps.logger.debug("agent-scope reap hook failed", exc_info=True)
+        now = self._deps.monotonic()
+        last = self.state.scope_reap_failure_warned_at
+        if last is not None and now - last < self.PROBE_FAILURE_WARN_INTERVAL_SECS:
+            return
+        self.state.scope_reap_failure_warned_at = now
+        self._deps.logger.warning(
+            "Agent-scope reap failed, so no abandoned scope was reclaimed this tick "
+            "(details at debug; this warning repeats at most once per %.0fs)",
+            self.PROBE_FAILURE_WARN_INTERVAL_SECS,
+        )
+
+    def _note_probe_failure(self, key: str) -> None:
+        """Log a work-probe failure: the traceback at debug, the fact at a bounded WARNING."""
+        self._deps.logger.debug(
+            "Work probe failed for session %s; keeping it",
+            key,
+            exc_info=True,
+        )
+        now = self._deps.monotonic()
+        last = self.state.probe_failure_warned_at
+        if last is not None and now - last < self.PROBE_FAILURE_WARN_INTERVAL_SECS:
+            return
+        self.state.probe_failure_warned_at = now
+        self._deps.logger.warning(
+            "Sub-agent work probe failed for session %s; every idle, orphan and "
+            "RSS reap is held until it answers again (details at debug; this "
+            "warning repeats at most once per %.0fs)",
+            key,
+            self.PROBE_FAILURE_WARN_INTERVAL_SECS,
+        )
 
     async def _stuck_turn_check(self) -> None:
         try:
@@ -728,9 +1214,16 @@ class SessionCleanup:
             await self._sweep_sandbox_artifacts()
             await self._sweep_session_pid_mappings()
             await self._sweep_member_pid_bindings()
+            await self._sweep_shell_audit_log()
             await self._maybe_prune_pycache()
             await self._sweep_periodic_pids()
             await self._sweep_untracked_mcps()
+            # LAST on the tick, deliberately. Every sweep above may retract a
+            # record or end a process, so running the comparison after them means
+            # it reconciles the state they left rather than the state they were
+            # about to change -- and a disagreement it still finds is one no sweep
+            # was able to resolve, which is exactly what the two counts are for.
+            await self._reconcile_runtimes_hook()
 
     async def _sweep_session_roots(self) -> None:
         try:
@@ -766,17 +1259,18 @@ class SessionCleanup:
     async def _sweep_session_pid_mappings(self) -> None:
         """Retract ``session_pid_<pid>`` mappings whose pid is dead or names no process.
 
-        Those two are the whole of what the pass removes: an unsignalable pid, or
-        one absent from the thread-group-leaders snapshot whose per-pid re-read
-        confirms it names no process. A pid that is LIVE keeps its mapping even
-        when the number has been recycled away from the session that published
-        it -- that mapping is already refused at read time by
-        ``session_pid_sig._pid_recycled`` on both the strict and the lenient
-        resolution path, so it carries no identity, and its file goes when the
-        unrelated process exits.
+        The pass removes an unsignalable pid's mapping, one absent from the
+        thread-group-leaders snapshot whose per-pid re-read confirms it names no
+        process, and one whose pid is LIVE but recycled: its recorded start token
+        differs from the live one. Both resolvers refuse that last record at read
+        time (``session_pid_sig._pid_recycled``), but the lenient client one
+        cannot tell it from a planted file, so it counts the record as unusable
+        and refuses a caller that has no other identity source. Only the
+        publisher can tell the two apart, so this pass retires it, and the
+        refusal lasts at most one tick instead of the unrelated process's life.
 
         ``session_pid._prune_stale_session_pid_files`` is otherwise reached only
-        from ``cleanup_orphaned_sessions``, which ``session.py``'s module map
+        from ``cleanup_orphaned_sessions``, which ``session_parts/sweeps.py``'s module map
         records as startup + shutdown, so a gateway that keeps running holds
         every mapping it publishes until it restarts — one per released session,
         and a recycled pid number goes on carrying a dashboard slot's key. The
@@ -840,6 +1334,35 @@ class SessionCleanup:
                 type(exc).__name__,
             )
 
+    async def _sweep_shell_audit_log(self) -> None:
+        """Bound the bundled shell-audit hook's ``audit.log``.
+
+        The hook in ``config/defaults.json`` is one shell append with no size
+        check, so nothing on the writing side ever bounds the file. The bound is
+        ``shell_audit_log.rotate_shell_audit_log`` (one ``.1`` generation at a
+        named cap, try-locked, never raises); it needs a caller on a bounded
+        cadence, which is what this tick is -- the same cadence that retracts
+        session-pid mappings, capped by :data:`MAX_TICK_INTERVAL_SECS`, so the
+        live file can overshoot the cap by at most one tick's worth of shell
+        activity. On the maintenance executor for the same reason as its
+        siblings: the data home is same-uid agent-writable, and a stat plus a
+        rename over such a path is filesystem work the event loop must not do.
+        """
+        try:
+            rotated = await asyncio.get_running_loop().run_in_executor(
+                self._deps.get_maintenance_executor(),
+                self._deps.rotate_shell_audit_log,
+            )
+            if rotated:
+                self._deps.logger.info(
+                    "Periodic sweep: rotated the shell audit log; one previous generation kept"
+                )
+        except Exception as exc:
+            self._deps.logger.debug(
+                "shell audit log sweep failed: %s",
+                type(exc).__name__,
+            )
+
     async def _maybe_prune_pycache(self) -> None:
         now = self._deps.monotonic()
         last = self.state.last_pycache_gc
@@ -867,11 +1390,64 @@ class SessionCleanup:
             )
 
     def _active_pids(self) -> tuple[set[int], bool]:
+        """Every pid something in this gateway still needs. Shields all three sweeps.
+
+        The lease table is deliberately NOT a fifth source here, and the reason is
+        about position rather than completeness. This set is gathered before the
+        candidate scan and an event-loop hop before any signal, so a claim taken
+        inside that window is missing from it however many sources it has -- and
+        a cold-starting session's claim lands in exactly that window. The lease is
+        therefore consulted where it can be authoritative: per pid, at the last
+        read before the kill, in :meth:`_kill_authorized`, which every sweep's
+        kill phase passes through.
+        """
         active_pids, safe = self._deps.collect_active_pids(self._owner._sessions)
         active_pids.update(self._owner._pool_pids())
         active_pids.update(self._owner._in_flight_pids())
         active_pids.update(self._owner._companion_runtime_pids())
         return active_pids, safe
+
+    def _kill_authorized(self, pid: int, reason: str) -> bool:
+        """Whether the ownership gate permits signalling *pid* on a sweep path.
+
+        The last read before a sweep hands a pid to its killer, and a different
+        question from the shield above: that one asks a set gathered an
+        event-loop hop ago, this one asks the lease table about one pid at the
+        decision point. It is also what writes the attribution line naming the
+        sweep as the caller, so a sweep kill stops being an anonymous one.
+
+        BOTH outcomes are audited. The gate itself writes only a log line, so an
+        allow that is not audited leaves a signalled process with no record of who
+        decided it, and a refusal that is not audited leaves an operator staring at
+        a leak reading with nothing saying why nothing was done about it.
+
+        The allow is audited as ``allowed``, NOT as ``killed``, and the difference
+        is the whole point: this is the decision point, and the kill phase that
+        follows it drops any candidate whose file entry has gone, whose live token
+        cannot be read, or whose token proves the number was reused -- "prune,
+        never kill". Writing ``killed`` here would put kills of still-running
+        processes in the SEL trail, which is the standard this same change states
+        for the sub-agent path: never ``killed`` for a process the kill left
+        standing. The kill phase owns the ``killed``/``failed`` row, because only it
+        knows what the signal did.
+        """
+        try:
+            allowed = authorize_runtime_kill(pid, reason=reason, caller="session_cleanup sweep")
+        except Exception:
+            # An unanswerable gate is a refusal. A sweep is housekeeping, so
+            # deferring one pid to the next tick costs nothing that killing a
+            # live runtime would not cost more.
+            self._deps.logger.debug(
+                "Sweep: ownership gate could not answer for pid %s; not signalling it",
+                pid,
+                exc_info=True,
+            )
+            audit_kill_decision(
+                pid, "refused", f"{reason}: the ownership gate could not answer", tool_name=_SWEEP
+            )
+            return False
+        audit_kill_decision(pid, "allowed" if allowed else "refused", reason, tool_name=_SWEEP)
+        return allowed
 
     async def _sweep_periodic_pids(self) -> None:
         try:
@@ -888,19 +1464,41 @@ class SessionCleanup:
                 gateway_pid,
                 active_pids,
             )
-            confirmed: list[PidCandidate] = []
+            confirmed: list[int] = []
             if candidates:
                 current_pids, phase2_safe = self._active_pids()
                 if phase2_safe:
                     confirmed = [
-                        candidate for candidate in candidates if candidate[0] not in current_pids
+                        pid
+                        for pid in candidates
+                        if pid not in current_pids
+                        and self._kill_authorized(pid, "orphan pid sweep")
                     ]
             if confirmed or killed_or_dead:
-                orphan_killed = await asyncio.to_thread(
-                    self._deps.kill_confirmed_and_writeback,
-                    gateway_pid,
-                    confirmed,
-                    killed_or_dead,
+                # The gate's verdict above is separated from the signal by a thread
+                # hop, a pid-file read, token reads and a descendant walk. A shared
+                # turn can claim a tenancy anywhere in there, and neither the kill
+                # phase's token re-check nor the live-pid set gathered before that
+                # claimant registered its shield can see it. The barrier makes the
+                # verdict current and shuts the window; a pid it does not grant is
+                # left for the next tick.
+                with teardown_barriers(confirmed, who="Sweep") as barriered:
+                    orphan_killed = await asyncio.to_thread(
+                        self._deps.kill_confirmed_and_writeback,
+                        gateway_pid,
+                        barriered,
+                        killed_or_dead,
+                    )
+                confirmed = barriered
+                # What the phase DID, now that the signal's result is known. The
+                # decision rows above say only that a signal was permitted; this
+                # phase re-judges every candidate against the file as it reads then
+                # and prunes rather than kills, so the two counts differ routinely.
+                audit_kill_phase(
+                    allowed=len(confirmed),
+                    killed=orphan_killed,
+                    reason="orphan pid sweep kill phase",
+                    tool_name=_SWEEP,
                 )
                 if orphan_killed:
                     self._deps.logger.warning(
@@ -922,12 +1520,32 @@ class SessionCleanup:
                 if candidates:
                     fresh_pids, fresh_safe = self._active_pids()
                     if fresh_safe:
-                        confirmed = [pid for pid in candidates if pid not in fresh_pids]
+                        confirmed = [
+                            pid
+                            for pid in candidates
+                            if pid not in fresh_pids
+                            and self._kill_authorized(pid, "orphan MCP sweep")
+                        ]
                         if confirmed:
-                            await asyncio.get_running_loop().run_in_executor(
-                                self._deps.get_maintenance_executor(),
-                                self._deps.kill_orphan_mcps,
-                                confirmed,
+                            # Same window as the periodic sweep: an executor hop and a
+                            # cmdline re-read sit between the gate and the signal, and
+                            # a tenant claiming in there is invisible to both.
+                            with teardown_barriers(confirmed, who="Sweep") as barriered:
+                                mcp_killed = await asyncio.get_running_loop().run_in_executor(
+                                    self._deps.get_maintenance_executor(),
+                                    self._deps.kill_orphan_mcps,
+                                    barriered,
+                                )
+                            confirmed = barriered
+                            # As above: this phase re-verifies each cmdline
+                            # immediately before the signal and skips any that
+                            # fails to match, so the permitted count is an upper
+                            # bound on the killed one.
+                            audit_kill_phase(
+                                allowed=len(confirmed),
+                                killed=mcp_killed if isinstance(mcp_killed, int) else 0,
+                                reason="orphan MCP sweep kill phase",
+                                tool_name=_SWEEP,
                             )
                     else:
                         self._deps.logger.warning(
@@ -995,6 +1613,15 @@ class SessionCleanup:
             return False
         return key.startswith("dashboard:") or key in self.state.slot_owned_keys
 
+    def _idle_exempt_keys(self) -> frozenset[str]:
+        """The keys ``session.idle_exempt_keys`` takes off the idle clock.
+
+        Read at every sweep, so a config write applies at the next one. Only the
+        idle axis asks: a listed session whose slot has closed is still reaped as
+        orphaned, and the RSS recycle never consults the list.
+        """
+        return frozenset(self._owner._cfg.session.idle_exempt_keys)
+
     async def _expire_idle(self, timeout_secs: int) -> None:
         now = self._deps.monotonic()
         # The session object travels with its key: every judgement below is
@@ -1004,6 +1631,7 @@ class SessionCleanup:
         total_checked = 0
         persistent_keys = self._deps.get_persistent_keys()
         channel_prefix = self._deps.get_channel_prefix()
+        idle_exempt_keys = self._idle_exempt_keys()
         async with self._owner._lock:
             for key, session in self._owner._sessions.items():
                 if key in persistent_keys or key.startswith(channel_prefix):
@@ -1011,7 +1639,7 @@ class SessionCleanup:
                 total_checked += 1
                 if session.semaphore.locked():
                     continue
-                idle = now - session.last_used > timeout_secs
+                idle = key not in idle_exempt_keys and now - session.last_used > timeout_secs
                 orphaned = self._owner_is_gone(key)
                 if idle or orphaned:
                     expired.append((key, orphaned, session))
@@ -1046,37 +1674,102 @@ class SessionCleanup:
             # session says nothing about that: the idle clock can elect a
             # never-tabbed ``cron:`` parent whose ``last_used`` went stale during
             # a long sub-agent run, exactly while that sub-agent's completion
-            # injection is suspended on its store read. Cheap, synchronous, and
-            # for the idle branch this is also the last read before its reset.
+            # injection is suspended on its store read. Cheap and synchronous.
             if self._injection_pending(key):
                 self._deps.logger.info(
                     "Idle sweep: %s has a completion injection in flight - left running",
                     key,
                 )
                 continue
+            # Also BOTH axes: a free semaphore only proves the parent's OWN turn
+            # is over. With session sharing on, sub-agents dispatched by that
+            # turn keep running on this session's runtime after it ends, so the
+            # semaphore cannot see them and the probe is the only witness. The
+            # idle clock reaches this point too, because a long sub-agent run is
+            # exactly what lets a parent's ``last_used`` go stale; expiring it
+            # here (and firing on_session_expire ahead of the reset) discards
+            # the children's work. Fail-closed: a probe that cannot answer keeps
+            # the session.
+            if await self._has_attached_subagents(key):
+                self._deps.logger.info(
+                    "Idle sweep: %s looks %s but still has sub-agent work - left running",
+                    key,
+                    "orphaned" if is_orphan else "idle",
+                )
+                continue
+            # Everything above was concluded BEFORE that await, and the probe
+            # reads the task store off-loop, so the loop ran while this sweep
+            # was suspended. Re-judge the candidate now, on BOTH axes, before
+            # any side effect. ``on_session_expire`` below consolidates the
+            # transcript, and a turn that began inside the await has already
+            # flushed its user row into it; ``reset`` declining on the busy
+            # semaphore afterwards does not undo a consolidation that has
+            # already run over an unanswered prompt. Everything from here to
+            # ``reset`` is synchronous, so these are the last reads before the
+            # act.
+            #
+            # The counter first: an injection that STARTS inside the await is
+            # invisible to the read above, which is the closed-tab case that
+            # guard exists for.
+            if self._injection_pending(key):
+                self._deps.logger.info(
+                    "Idle sweep: %s began an injection mid-sweep - left running",
+                    key,
+                )
+                continue
+            # Then the incarnation: a different session under the key is not
+            # the one this sweep judged, and its transcript is not the one to
+            # consolidate. ``reset`` would decline on the mismatch, but only
+            # after the callback had already run. When the key is still absent
+            # from the live set, its record described only the departed
+            # incarnation's slot claim and must go so the newcomer cannot
+            # inherit it. A live key was freshly republished by its reopened
+            # slot, so that current claim must survive the stale verdict.
+            if self._owner._sessions.get(key) is not scanned:
+                live = self.state.active_dashboard_slots
+                if is_orphan and (live is None or key not in live):
+                    self.state.slot_owned_keys.discard(key)
+                self._deps.logger.info(
+                    "Idle sweep: %s changed hands mid-sweep - left running",
+                    key,
+                )
+                continue
+            # Then the turn: the scan skipped a held semaphore, and a turn that
+            # took it during the await is exactly as live.
+            if scanned.semaphore.locked():
+                self._deps.logger.info(
+                    "Idle sweep: %s began a turn mid-sweep - left running",
+                    key,
+                )
+                continue
+            # Then the harness, on BOTH axes, for the reason the RSS recycle
+            # asks it: a free semaphore and no attached sub-agent do not mean
+            # the harness stopped working for this session. Work it launched to
+            # run after the prompt keeps going with no turn and no tab, which is
+            # what makes it look idle to ``last_used`` and abandoned to the
+            # orphan axis. Synchronous, like every read from here to ``reset``.
+            launch = self._harness_background_launch(scanned)
+            if launch is not None and launch[0] <= HARNESS_BACKGROUND_WORK_HOLD_SECS:
+                self._deps.logger.info(
+                    "Idle sweep: %s looks %s but its harness launched background "
+                    "work %.0fs ago (%s) - left running",
+                    key,
+                    "orphaned" if is_orphan else "idle",
+                    launch[0],
+                    launch[1],
+                )
+                continue
+            # Then the clock, on the idle axis only. A turn that started AND
+            # finished inside the await released the semaphore again but bumped
+            # ``last_used`` on its way in, so the session is not idle now.
+            # The orphan axis ignores the clock and re-asks the live set below.
+            if not is_orphan and self._deps.monotonic() - scanned.last_used <= timeout_secs:
+                self._deps.logger.info(
+                    "Idle sweep: %s took a turn mid-sweep - left running",
+                    key,
+                )
+                continue
             if is_orphan:
-                # A closed tab is not the same as finished work. With session
-                # sharing on, sub-agents run on the parent's runtime after the
-                # parent's own turn ends, so the busy semaphore cannot see them
-                # and the probe is the only witness. Fail-closed: a probe that
-                # cannot answer keeps the session.
-                if await self._has_attached_subagents(key):
-                    self._deps.logger.info(
-                        "Idle sweep: %s still has sub-agent work - left running",
-                        key,
-                    )
-                    continue
-                # Ask the injection counter AGAIN, here. The read above happened
-                # before the sub-agent probe suspended, and an injection that
-                # STARTS inside that await would be invisible to it -- which is
-                # the closed-tab case this guard exists for. Everything from here
-                # to ``reset`` is synchronous.
-                if self._injection_pending(key):
-                    self._deps.logger.info(
-                        "Idle sweep: %s began an injection mid-sweep - left running",
-                        key,
-                    )
-                    continue
                 # Re-ask against the CURRENT live set, not the one the scan
                 # read. Two awaits stand between them: the scan drops the lock,
                 # and the probe above reads the task store off-loop. A slot can
@@ -1153,35 +1846,32 @@ class SessionCleanup:
             if is_orphan:
                 self.state.slot_owned_keys.discard(key)
 
-            # Pin the reset to the incarnation this sweep actually judged, on the
-            # orphan path. Every test above -- idle or orphaned, the probe, the
-            # live-set re-assert -- was asked about ``scanned``, and two awaits
-            # separate the first of them from here, so the key may by now hold a
-            # DIFFERENT session: a fire under the same cron key, or a tab
-            # reopened and a turn taken. ``reset`` revalidates identity under its
-            # own lock and declines on a mismatch, so a fresh incarnation keeps
-            # its runtime instead of inheriting a verdict about its predecessor.
+            # Pin the reset to the incarnation this sweep actually judged, on
+            # BOTH paths. Every test above -- idle or orphaned, the probe, the
+            # live-set re-assert -- was asked about ``scanned``, and the probe
+            # suspends on each axis, so the key may by now hold a DIFFERENT
+            # session: a fire under the same cron key, or a tab reopened and a
+            # turn taken. ``reset`` revalidates identity under its own lock and
+            # declines on a mismatch, so a fresh incarnation keeps its runtime
+            # instead of inheriting a verdict about its predecessor. A key-only
+            # idle reset would shut down exactly that replacement runtime.
             #
-            # The idle path is spelled separately rather than passing
-            # ``expect_session=None``, so it keeps asking nothing about identity:
-            # that axis is not what this change touches. Both paths DO pass
-            # ``skip_if_injecting``, because both reach ``reset`` and ``reset``
-            # suspends on the registry lock, so on either one an injection can
-            # begin after this sweep's own read and before the pop.
-            if is_orphan:
-                reset_done = await self._owner.reset(
-                    key,
-                    expect_session=scanned,
-                    skip_if_busy=True,
-                    skip_if_injecting=True,
-                )
-            else:
-                # Expiry recycles a PROCESS; the conversation survives on disk and
-                # resumes through ``session/load``. So this is not a parent end, and the
-                # session's in-flight sub-agent runs are left alone -- they have a
-                # conversation to deliver into, and their own run timeout bounds them.
-                # That is why neither call here passes ``ends_conversation``.
-                reset_done = await self._owner.reset(key, skip_if_busy=True, skip_if_injecting=True)
+            # Both paths also pass ``skip_if_injecting``, because both reach
+            # ``reset`` and ``reset`` suspends on the registry lock, so on either
+            # one an injection can begin after this sweep's own read and before
+            # the pop.
+            #
+            # Expiry recycles a PROCESS; the conversation survives on disk and
+            # resumes through ``session/load``. So this is not a parent end, and
+            # the session's in-flight sub-agent runs are left alone -- they have
+            # a conversation to deliver into, and their own run timeout bounds
+            # them. That is why the call does not pass ``ends_conversation``.
+            reset_done = await self._owner.reset(
+                key,
+                expect_session=scanned,
+                skip_if_busy=True,
+                skip_if_injecting=True,
+            )
             if not reset_done:
                 # The release above ran BEFORE the reset, so a reset that
                 # DECLINED leaves the record stripped from a session that is

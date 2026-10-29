@@ -47,11 +47,14 @@ SCRIPT = Path(__file__).parent.parent / "packaging" / "build-desktop.sh"
 def _extract_step() -> str:
     """Pull the marker handling out of the shipped script: the unconditional
     stale-marker cleanup (which sits ahead of the SKIP_ELECTRON early exit),
-    the SKIP_ELECTRON branch itself, and step 3b, up to the step-4 header."""
+    the SKIP_ELECTRON branch itself, and step 3b, up to the header of whatever
+    section follows it. The window ends at the NEXT section header rather than
+    at a named one so a step inserted between 3b and packaging (the bundled
+    kiro-cli staging, which reads ``$OS``) stays out of the extracted fragment,
+    which runs here without the script's preamble."""
     text = SCRIPT.read_text(encoding="utf-8")
     m = re.search(
-        r"(# A leftover staged marker from an earlier interrupted build.*?)"
-        r"\n# --- 4\. Package the desktop app",
+        r"(# A leftover staged marker from an earlier interrupted build.*?)" r"\n# --- (?!3b\. )",
         text,
         re.DOTALL,
     )
@@ -139,6 +142,7 @@ def test_empty_value_means_unset(tmp_path: Path) -> None:
         (json.dumps({**VALID, "extra": "x"}), "unknown field"),
         (json.dumps({**VALID, "updateCommand": 7}), "must be a string"),
         (json.dumps({"managedBy": "x"}), "no updateCommand"),
+        (json.dumps({"managedBy": "x", "updateCommand": "/usr/bin/update"}), "no checkCommand"),
         (json.dumps({**VALID, "managedBy": "x" * 9000}), "caps at 8192"),
         # The reader trims and caps each field; the value it would SEE is what
         # is validated, or a whitespace-only command turns the marker bare and
@@ -154,6 +158,7 @@ def test_empty_value_means_unset(tmp_path: Path) -> None:
         "unknown-field",
         "non-string",
         "no-updateCommand",
+        "no-checkCommand",
         "over-cap",
         "whitespace-only-command",
         "padded-command",

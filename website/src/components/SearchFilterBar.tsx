@@ -1,7 +1,7 @@
 import { forwardRef, type ComponentProps, type ReactNode } from 'react'
-import { ListFilter, X } from 'lucide-react'
+import { ListFilter, Pause, Search, X } from 'lucide-react'
 
-import { SearchInput } from './ui'
+import { Glass } from './Glass'
 import { DropdownMenuContent, DropdownMenuLabel } from './ui/dropdown-menu'
 import { cn } from '../lib/utils'
 
@@ -13,6 +13,14 @@ import { cn } from '../lib/utils'
  * roster so both lists carry the same field; `src/test/searchFilterBar.parity.test.tsx`
  * pins both pages to it.
  *
+ * The field is a Liquid Glass pane (components/Glass.tsx, the chip recipe at a
+ * 10px radius) and floats over the list inside a `ListDock`,
+ * so the rows scroll under it the way the transcript scrolls under the
+ * composer. The `<input>` inside is transparent: the pane IS the field's
+ * surface. Like every glass pane (the composer, the mobile Settings capsule)
+ * it does not change on focus -- maintainer decision, no ring, no tint or edge
+ * step; the caret is the indicator -- so the input carries no ring of its own.
+ *
  * Trailing controls are 24px (`w-6`) buttons in a `gap-0.5` row 4px from the
  * field's right edge. The input's right padding and the clear button's
  * offset step with how many there are — these are the sidebar's own values,
@@ -23,6 +31,9 @@ import { cn } from '../lib/utils'
 const INPUT_PAD_RIGHT = [12, 36, 56] as const
 const CLEAR_RIGHT = [8, 32, 56] as const
 const CLEAR_WIDTH = 20
+/** Rounded, not a capsule: the list rows under it are `rounded-md` boxes, and a
+ *  32px field at the composer's 16px would read as a pill among rectangles. */
+const FIELD_RADIUS = 10
 
 export function SearchFilterBar({
   value, onChange, placeholder, clearLabel, trailing, trailingCount, className, inputTestId, ...inputProps
@@ -36,17 +47,21 @@ export function SearchFilterBar({
    *  friends. Pass `trailingCount` when the count is not one control per child. */
   trailing?: ReactNode
   trailingCount?: number
-  /** Wrapper spacing; the sidebar's `px-2 pt-2 pb-1` by default. */
+  /** Wrapper spacing; `px-2 pt-2` by default. No bottom padding: inside the
+   *  ListDock the pane's bottom edge IS the dock's edge, so rows scrolling
+   *  under emerge at the glass, not from a strip of gap below it. */
   className?: string
   inputTestId?: string
 } & Omit<React.InputHTMLAttributes<HTMLInputElement>, 'value' | 'onChange' | 'placeholder' | 'className'>) {
   const n = Math.min(trailingCount ?? (trailing ? 1 : 0), INPUT_PAD_RIGHT.length - 1)
   const padRight = INPUT_PAD_RIGHT[n] + (value ? CLEAR_WIDTH : 0)
   return (
-    <div className={cn('px-2 pt-2 pb-1', className)}>
-      <div className="relative">
-        <SearchInput
-          className="w-full"
+    <div className={cn('px-2 pt-2', className)}>
+      <Glass variant="chip" radius={FIELD_RADIUS} className="glass-shadow w-full" data-testid="search-field-glass">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted pointer-events-none" aria-hidden="true" />
+        <input
+          /* focus-cue-ok: maintainer decision -- the Glass host does not change on focus (no ring, no tint or edge step, never the accent), the same rule as the composer and the mobile Settings capsule; the caret is the indicator, and a ring on the input itself is not wanted. */
+          className="w-full bg-transparent border-none rounded-full pl-8 py-1.5 text-text text-[13px] font-body outline-hidden placeholder:text-muted/70"
           placeholder={placeholder}
           value={value}
           onChange={e => onChange(e.target.value)}
@@ -71,7 +86,7 @@ export function SearchFilterBar({
             {trailing}
           </div>
         )}
-      </div>
+      </Glass>
     </div>
   )
 }
@@ -138,12 +153,16 @@ export const FILTER_CHIP_ROW_CLS = 'px-3 pb-1 flex items-center gap-1.5 flex-wra
  *  `label` is the caller's — the sidebar appends its window and count, the
  *  roster its counts — so one recipe carries whatever a list has to say about
  *  the filter without knowing what it is. */
-export function FilterChip({ label, color, aggregate, clearLabel, onClear, testId }: {
+export function FilterChip({ label, color, aggregate, paused, clearLabel, onClear, testId }: {
   label: string
   /** The filter's colour token, e.g. `var(--accent)` or `var(--warn)`; omit for an aggregate chip. */
   color?: string
   /** Neutral clear-all pill (see above). */
   aggregate?: boolean
+  /** The filter is still set but lifted, so it is not narrowing the list right
+   *  now (the sidebar's menu can pause every status filter at once). A mark on
+   *  the chip, never a second meaning for the click: the click still clears. */
+  paused?: boolean
   /** Accessible name and tooltip: what the click does ("Clear Starred filter"). */
   clearLabel: string
   onClear: () => void
@@ -155,6 +174,10 @@ export function FilterChip({ label, color, aggregate, clearLabel, onClear, testI
       className={cn(
         'inline-flex items-center gap-1 pl-2 pr-1 py-0.5 rounded-full text-[11px] cursor-pointer transition-colors',
         aggregate && 'max-w-full bg-bg-elevated/60 border border-border text-muted hover:text-text',
+        // Same colour token paused or not, so the chip still reads as ITS
+        // filter; the glyph and the dashed border say "not narrowing right
+        // now" without leaning on contrast alone.
+        paused && 'border-dashed',
       )}
       style={aggregate || !color ? undefined : { background: `color-mix(in srgb, ${color} 10%, transparent)`, color, borderWidth: 1, borderColor: `color-mix(in srgb, ${color} 30%, transparent)` }}
       onClick={onClear}
@@ -162,6 +185,7 @@ export function FilterChip({ label, color, aggregate, clearLabel, onClear, testI
       aria-label={clearLabel}
       data-testid={testId}
     >
+      {paused && <Pause size={11} className="shrink-0" aria-hidden="true" />}
       {aggregate ? <span className="truncate">{label}</span> : label}
       <X size={11} className="shrink-0" />
     </button>

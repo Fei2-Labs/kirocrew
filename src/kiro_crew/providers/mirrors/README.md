@@ -25,9 +25,12 @@ A mirror is the fix for one backend. `agent_sdk/mcp_refs.py` is the detector, so
 fourth occurrence cannot be silent. At each point where the
 `session/new` / `session/load` `mcpServers` array is final — spec projection plus
 the gateway's broker stubs — `acp/mcp_ref_guard.py` compares the spec's `@server`
-refs against what the session is actually about to receive, and logs ONE structured
-warning naming the backend, the agent, the unresolved refs and whether the shared
-gateway is on. It also records them on the session's MCP report
+refs against Crew's projection for the session (the array it is about to send), and
+logs ONE structured warning naming the backend, the agent, the unresolved refs and
+whether the shared gateway is on. The line claims only what the wire proves: Crew's
+projection delivers none of those servers, and the harness may mount a same-named
+server from its own configuration, so a listed ref may still be served and the line
+cannot tell which. It also records them on the session's MCP report
 (`unresolved_refs`), beside the buckets saying what a configured server reported —
 a different claim, because a server nothing configured has no row there to be
 missing from.
@@ -67,11 +70,15 @@ register it in `registry.py`.
   point to kiro-cli's construction path (harness-parity H13). Warm a cache on the
   spawn path.
 - **`session_projection()`** — the structured face the CLIENT actually calls:
-  the wire params plus any obligation the same spec parse hands the client
-  (`SessionProjection.denied_tools`, the `(server, tool)` pairs the client must
-  refuse when the backend asks permission for them). The default returns the
-  wire params with nothing off-wire, so a mirror that has no such obligation
-  implements only `session_params()`. A mirror that does (codex) overrides this
+  the wire params plus every obligation the same spec parse hands the client:
+  `SessionProjection.denied_tools` (the `(server, tool)` pairs the client must
+  refuse when the backend asks permission for them), `disabled_servers` (servers
+  switched off whole) and `restricted_servers` (servers withheld because the spec
+  narrows them per tool). The client's member dispatch and panel appends read the
+  last two so they never re-add a server the projection withheld. The default
+  returns the wire params with nothing off-wire, so a mirror relying on it reports
+  neither set and that append fails open for it; a mirror that has no such
+  obligation implements only `session_params()`. A mirror that does (codex) overrides this
   and defines `session_params()` as its `.params`, so the two faces cannot drift.
   Also the seam the gateway's pooled stubs come through (`stub_elements`): the
   client's shared append is inert for every mirrored backend, so a mirror that
@@ -197,7 +204,7 @@ says nothing rather than a card that is quietly wrong.
 It renders in two places, from one projection, and they carry DIFFERENT amounts of
 it — the card is narrower than the record on purpose:
 
-- **Developer > Agent Backend**, in the detail for the highlighted harness, and only
+- **Settings > Agent Harness**, in the detail for the highlighted harness, and only
   where switching costs the reader something: the deny reach as a rule with its
   exception, and the spec settings that will not take effect. Not the projection KIND
   — `native`/`mirror`/`external` names the route Crew takes, which no reader can act
@@ -225,7 +232,7 @@ maintainer, and stays in `kirocrew doctor` and this file.
 |---|---|---|
 | **Not** the projection kind | `McpProjection.kind` | the route Crew takes — no feature lost, no risk taken, no setting of theirs stopped. `kirocrew doctor` states it |
 | The per-tool deny reach | `McpProjection.per_tool_deny` | what switching ONE tool off costs here — that tool, or the whole server |
-| Whether that reach costs a whole server | `COSTS_WHOLE_SERVER` in `backend_mcp_ability.py`, shipped beside the reach as `costs_whole_server` | which reaches earn the prominent slot, decided once for every surface rather than re-derived per renderer — true of `whole-server` and of `per-call`, which withholds any non-Crew server whole |
+| Whether that reach costs a whole server | `PerToolDeny.costs_whole_server`, declared by each reach in its own definition and shipped beside it as `costs_whole_server` | which reaches earn the prominent slot, decided once by the reach itself rather than re-derived per renderer, so a reach added to the vocabulary declares its cost in the same line and cannot be built without one — true of `whole-server` and of `per-call`, which withholds any non-Crew server whole |
 | Whether it costs CREW's servers | `McpAbility.costs_control_plane` in `backend_mcp_ability.py`, read by the terminal report and not shipped | the narrower question: only `whole-server` takes `kirocrew-core` with it, which is what leaves a session unable to report back. `per-call` refuses per tool on Crew's own servers, so it costs a third-party server and not the channel |
 | Concerns ruled `withheld` | the mirror's `rulings()` | a settled decision that a part of the spec is not sent |
 | Concerns ruled `no-channel` | the mirror's `rulings()` | a gap the transport cannot carry yet, with an address recorded for it |
@@ -236,8 +243,8 @@ per-backend constant and must not be rendered as one: they are read from the liv
 session's `initialize` answer (`codex.drop_unadvertised_transports`), precisely so a
 released adapter that gains or drops one is not silently contradicted by a table.
 And the card is **advisory** — it does not refuse a selection. Per-tool MCP deny is
-not a requirement on every provider, so declaring the `whole-server` form before a
-session runs is the whole obligation; enforcing a per-call deny on a transport that
+not a requirement on every provider, so declaring which form a harness carries before
+a session runs is the whole obligation; enforcing a per-call deny on a transport that
 has no per-call identity is not.
 
 `test/test_backend_mcp_ability.py` holds this: every selectable backend answers,
@@ -287,10 +294,9 @@ a tool they switched off answers anyway.
 | `claude` | `mirror` | `settings-file` | `claude_code.py`, both faces; `hooks` is its one open `no-channel` disposition |
 | `codex` | `mirror` | `per-call` | `codex.py`, wire face only — Crew writes no codex file, so the `session/new` array is its whole channel. `hooks` is its one open `no-channel` disposition; `disabledTools` is honoured by withholding a third-party server it narrows, and by refusing the call at the approval request for Crew's own control plane; the array, the withhold set and the deny pairs all come from one spec parse |
 | `kas` | `external` | — | `acp/kas_agents.py` (+ `acp/kas_permissions.py`), travelling as `_meta.kiro.customAgents`. The most complete projection of any backend, down a real channel — what is outstanding is only WHERE the code sits, and the RFC schedules that as a pure relocation of its own so a live harness's projection is not moved and changed in one diff |
-| `opencode` | `mirror` | `whole-server` | `opencode.py`, wire face only — the `session/new` array is its whole channel, because Crew's one config write there (the permission routing) MERGES with the user's config and declaring a server in both channels double-mounts it. `hooks` is its one open `no-channel` disposition. This entry read `no-channel` until the claim was MEASURED: its `initialize` advertises `http` and `sse` and no stdio, which was taken as a refusal — but ACP's `McpCapabilities` has only those two fields, so no conforming agent can advertise stdio and the array carries them fine. The stdio `type` tag the shared translator emits is DROPPED here rather than left to the adapter to discard: its mapping branches on whether `type` is present, so a tag surviving a schema change would be routed as a remote server and fail the whole `session/new`. `disabledTools` is honoured by withholding the server it narrows — and unlike codex that includes Crew's own control plane, because codex's exemption for it rests on a per-call refusal keyed on `rawInput.server`/`tool` that this harness does not emit. The cost is paid only by an operator who narrowed the control plane deliberately |
-| `copilot` | `no-channel` | — | SELECTABLE here, so this is a decision and not a gap. Its routing is `PERMISSION_REQUEST`: it asks Kiro Crew per tool call, so the PreToolUse gate sees the operations themselves. The `session/new` array is the channel a projection would use. |
-| `pi` | `no-channel` | — | `pi-acp` accepts the session array but does not forward it to the pi process, so the session receives none of Crew's tools; the required channel and tracking pointer are declared in `registry.py` |
-| `goose` | `mirror` | `whole-server` | `goose.py`, wire face only — a live adapter round trip proves stdio tools are reachable; narrowed servers are withheld whole until a per-tool projection exists |
+| `opencode` | `mirror` | `settings-file` | `opencode.py`, wire face plus the permission routing — the `session/new` array is its whole channel, because Crew's one config write there (the permission routing) MERGES with the user's config and declaring a server in both channels double-mounts it. `hooks` is `translated`: Crew's turn loop runs the spec's hooks on every permission request, and `harness_tool_names.py` maps its tool names back to kiro-cli's. This entry read `no-channel` until the claim was MEASURED: its `initialize` advertises `http` and `sse` and no stdio, which was taken as a refusal — but ACP's `McpCapabilities` has only those two fields, so no conforming agent can advertise stdio and the array carries them fine. The stdio `type` tag the shared translator emits is DROPPED here rather than left to the adapter to discard: its mapping branches on whether `type` is present, so a tag surviving a schema change would be routed as a remote server and fail the whole `session/new`. `disabledTools` becomes a `deny` rule in that same routing block, `{"*": "ask", "<server>_<tool>": {"*": "deny"}}` (the map form, because `debug config` masks a string under a sensitive-looking key), keyed on the id the harness gives an MCP tool (`opencode_tool_id`): it hides that one tool while the server, Crew's control plane included, stays mounted and its other tools still ask. The harness lets the LAST matching rule win, and a lower config source that already names the tool keeps its earlier place behind the seed's `*`, so the routing read-back evaluates the resolved rules the way the harness does (`_opencode_unenforced_denies`), the in-force set is derived from the seed Crew actually wrote, and a server whose rule did not hold is withheld whole, with a warning. An id the harness re-maps to a builtin rule (`apply_patch` and five more) is withheld the same way |
+| `pi` | `broker-only` | — | `pi-acp` accepts the session array but does not forward it to the pi process, so Crew's gate extension carries the same composition in through a per-session handoff file and registers it with pi's built-in MCP support; the shared broker's stubs are reachable, the agent spec's own servers and per-tool deny set are not projected, and `registry.py` tracks the missing projection |
+| `goose` | `mirror` | `whole-server` | `goose.py`, wire face only — a live adapter round trip proves stdio tools are reachable; narrowed servers are withheld whole, Crew's control plane included. A per-call refusal by `_meta.goose.toolCall` is reachable but not yet safe: it must trust only that `_meta` pair, and the sandbox must deny writes to goose's config directory, because a `permission.yaml` `always_allow` entry written mid-session makes goose run the tool without asking. `hooks` is `translated`: Crew's turn loop runs the spec's hooks on every permission request, and `harness_tool_names.py` maps its tool names back to kiro-cli's |
 | `deepseek` | `broker-only` | — | the shared broker's stdio stubs are reachable, but the agent spec's own servers and per-tool deny set are not projected; `registry.py` tracks the missing projection |
 
 ## Verify against the adapter, not against the last mirror

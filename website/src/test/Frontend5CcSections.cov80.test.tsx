@@ -180,6 +180,7 @@ describe('crew-companion/RemindersSection', () => {
   const base = {
     onSkip: vi.fn(),
     onRemove: vi.fn(),
+    onEdit: vi.fn(),
   }
 
   beforeEach(() => {
@@ -188,7 +189,7 @@ describe('crew-companion/RemindersSection', () => {
 
   function renderSection(rem: RemindersPayload | null, remError: string | null, onAdd = vi.fn()) {
     const utils = render(
-      <RemindersSection rem={rem} remError={remError} onAdd={onAdd} onSkip={base.onSkip} onRemove={base.onRemove} />,
+      <RemindersSection rem={rem} remError={remError} onAdd={onAdd} onSkip={base.onSkip} onRemove={base.onRemove} onEdit={base.onEdit} />,
     )
     const input = utils.container.querySelector('.cc-add-input') as HTMLInputElement
     const form = utils.container.querySelector('.cc-add') as HTMLFormElement
@@ -196,9 +197,9 @@ describe('crew-companion/RemindersSection', () => {
   }
 
   it('disables the add box and reports offline when the app is unreachable', () => {
-    const { input, container } = renderSection(null, 'offline')
+    const { input } = renderSection(null, 'offline')
     expect(input.disabled).toBe(true)
-    expect(container.querySelector('.cc-muted')).not.toBeNull()
+    expect(screen.getByRole('alert')).toHaveTextContent('Couldn’t refresh your reminders.')
   })
 
   it('distinguishes loading from an empty list', () => {
@@ -255,7 +256,7 @@ describe('crew-companion/RemindersSection', () => {
     expect(container.querySelectorAll('.cc-rem-done').length).toBe(2)
   })
 
-  it('offers Skip only where there is a next occurrence, and always Remove', () => {
+  it('offers Skip only where there is a next occurrence, and always Remove', async () => {
     const { container } = renderSection(
       payload({
         reminders: [
@@ -271,12 +272,12 @@ describe('crew-companion/RemindersSection', () => {
       null,
     )
     const removes = container.querySelectorAll('.cc-icon-btn.is-remove')
-    const skips = Array.from(container.querySelectorAll('.cc-icon-btn')).filter(
-      (b) => !b.classList.contains('is-remove'),
-    )
     expect(removes.length).toBe(2)
-    expect(skips.length).toBe(1)
-    fireEvent.click(skips[0])
+    // Only the recurring row folds Skip (with Edit) into a More menu.
+    const more = screen.getAllByRole('button', { name: 'More actions' })
+    expect(more.length).toBe(1)
+    fireEvent.keyDown(more[0], { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Skip just the next one' }))
     // Rows are chronological, so the sooner one-time reminder is listed first.
     fireEvent.click(removes[0])
     expect(base.onSkip).toHaveBeenCalledWith('rec')

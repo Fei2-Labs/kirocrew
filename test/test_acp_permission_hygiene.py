@@ -36,8 +36,9 @@ from kiro_crew.acp.types import (
     [
         "src/kiro_crew/task_executor.py",
         "src/kiro_crew/task_planner.py",
-        "src/kiro_crew/llm_helpers.py",
-        "src/kiro_crew/slack/handler.py",
+        "src/kiro_crew/llm_helpers_parts/tool_approval.py",
+        "src/kiro_crew/slack/handler_runtime/permission_ladder.py",
+        "src/kiro_crew/slack/transport_dispatch.py",
     ],
 )
 def test_background_hook_calls_forward_verified_mcp_identity(relative_path: str) -> None:
@@ -59,9 +60,19 @@ def test_background_hook_calls_forward_verified_mcp_identity(relative_path: str)
     tree = ast.parse((repo_root / relative_path).read_text(encoding="utf-8"))
     checked = 0
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        if not isinstance(node, ast.Call):
             continue
-        if node.func.attr != "on_tool_call":
+        direct_hook_call = (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "on_tool_call"
+            and ast.unparse(node.func.value).endswith(".hooks")
+        )
+        forwarded_hook = any(
+            isinstance(child, ast.Attribute) and child.attr == "on_tool_call"
+            for arg in node.args
+            for child in ast.walk(arg)
+        )
+        if not direct_hook_call and not forwarded_hook:
             continue
         # ``slack/handler.py``'s EVENT_TOOL_CALL branch is a REVIEWED
         # informational site (test_hooks.INFORMATIONAL_SITES): the tool is
@@ -151,8 +162,12 @@ def test_crew_mcp_forwarding_stays_unverified_on_pi() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_always_true_sends_the_advertised_always_id(tmp_path) -> None:
+async def test_client_always_true_sends_the_advertised_always_id(tmp_path, monkeypatch) -> None:
+    from kiro_crew import permission_floor
+
+    monkeypatch.setattr(permission_floor, "refusal_for", lambda _event: None)
     client = AcpClient(work_dir=tmp_path)
+    client._permission_gate_events[1] = object()
     client._permission_options[1] = {"once": "allow", "always": "allow_always"}
     client._send_response = AsyncMock()
     await client.approve_tool(1, always=True)
@@ -163,12 +178,16 @@ async def test_client_always_true_sends_the_advertised_always_id(tmp_path) -> No
 
 
 @pytest.mark.asyncio
-async def test_client_allow_always_only_still_approves(tmp_path) -> None:
+async def test_client_allow_always_only_still_approves(tmp_path, monkeypatch) -> None:
     """An adapter that advertises ONLY allow_always gets that id for a one-shot
     approval rather than a ``cancelled`` outcome, which kiro-cli maps to
     cancelling the whole turn. The dispatch recorder folds the single allow id
     onto both keys, which is what this seeds."""
+    from kiro_crew import permission_floor
+
+    monkeypatch.setattr(permission_floor, "refusal_for", lambda _event: None)
     client = AcpClient(work_dir=tmp_path)
+    client._permission_gate_events[2] = object()
     client._permission_options[2] = {"once": "allow_always", "always": "allow_always"}
     client._send_response = AsyncMock()
     await client.approve_tool(2)
@@ -179,10 +198,14 @@ async def test_client_allow_always_only_still_approves(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_always_true_sends_the_advertised_always_id() -> None:
+async def test_handle_always_true_sends_the_advertised_always_id(monkeypatch) -> None:
+    from kiro_crew import permission_floor
+
+    monkeypatch.setattr(permission_floor, "refusal_for", lambda _event: None)
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
+    handle._permission_gate_events[3] = object()
     handle._permission_options[3] = {"once": "allow", "always": "allow_always"}
     await handle.approve_tool(3, always=True)
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())

@@ -84,8 +84,9 @@ def _kirocrew_argv() -> tuple[str, ...]:
       1. ``KIROCREW_POD_BIN`` — explicit override (used when installing a unit that
          must boot a specific build, e.g. a worktree's own ``.venv``).
       2. the console-script on PATH.
-      3. ``<this python> [-s] -m kiro_crew`` so it works from a bare checkout
-         under the parent interpreter's effective user-site policy.
+      3. ``<this python> [-s] -P -m kiro_crew`` so it works from a bare checkout
+         under the parent interpreter's effective user-site policy, with the
+         unit's working directory kept off ``sys.path``.
     """
     override = os.environ.get("KIROCREW_POD_BIN")
     if override:
@@ -93,7 +94,7 @@ def _kirocrew_argv() -> tuple[str, ...]:
     found = shutil.which("kirocrew")
     if found:
         return (found,)
-    return tuple(platform_compat.isolated_python_argv("-m", "kiro_crew"))
+    return tuple(platform_compat.isolated_python_argv("-P", "-m", "kiro_crew"))
 
 
 def _environment_block(cfg: PodConfig) -> str:

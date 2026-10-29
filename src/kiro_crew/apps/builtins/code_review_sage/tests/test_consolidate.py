@@ -26,10 +26,24 @@ from aiohttp import web
 from backend import routes
 from sage_lib import learning, store
 
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import OwnerRequest
+
 
 def _pattern(title: str) -> dict:
     return {"title": title, "scope": "common", "impact": "high",
             "guidance": f"Guidance for {title}."}
+
+
+def _close_coro(coro):
+    """Stand in for ``asyncio.create_task`` without leaving a live coroutine.
+
+    The real handler passes ``_consolidate_bg(ns)`` straight to ``create_task``;
+    a bare mock would never run OR close it, so the coroutine would be reported
+    "never awaited" at collection. Close it and return a mock that supports
+    ``add_done_callback`` -- a real task does, and the handler registers one.
+    """
+    coro.close()
+    return unittest.mock.Mock()
 
 
 class _Base(unittest.IsolatedAsyncioTestCase):
@@ -40,6 +54,14 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         store.ensure_layout()
         routes._CONSOLIDATING.clear()
         routes._CONSOLIDATE_STATE.clear()
+        # Several endpoint tests patch ``asyncio.create_task`` with mocks, which
+        # ``_handle_consolidate`` registers in the module-global ``routes._TASKS``.
+        # Those non-awaitable handles would otherwise outlive the test and break a
+        # later test that ``asyncio.gather``s the registry. Snapshot and restore it
+        # so each test leaves ``_TASKS`` exactly as it found it.
+        _tasks_snapshot = set(routes._TASKS)
+        self.addCleanup(
+            lambda: (routes._TASKS.clear(), routes._TASKS.update(_tasks_snapshot)))
 
     def tearDown(self):
         if self._old is None:
@@ -49,10 +71,11 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 
-class _FakeRequest:
+class _FakeRequest(OwnerRequest):
     """Minimal stand-in: the handler reads only the JSON body."""
 
     def __init__(self, body: dict | None = None, bad: bool = False):
+        super().__init__()
         self._body = body or {}
         self._bad = bad
 
@@ -124,7 +147,8 @@ class TestConsolidateEndpoint(_Base):
 
     async def test_starts_a_merge_when_candidates_exist(self):
         learning.stage_learning(_pattern("A"), "fix_introduce")
-        with patch.object(routes.asyncio, "create_task") as spawn:
+        with patch.object(routes.asyncio, "create_task",
+                          side_effect=_close_coro) as spawn:
             resp = await routes._handle_consolidate(
                 _FakeRequest({"namespace": "default"}))  # type: ignore[arg-type]
             self.assertEqual(resp.status, 200)
@@ -133,7 +157,7 @@ class TestConsolidateEndpoint(_Base):
 
     async def test_a_missing_body_defaults_to_the_default_namespace(self):
         learning.stage_learning(_pattern("A"), "fix_introduce")
-        with patch.object(routes.asyncio, "create_task"):
+        with patch.object(routes.asyncio, "create_task", side_effect=_close_coro):
             resp = await routes._handle_consolidate(
                 _FakeRequest(bad=True))  # type: ignore[arg-type]
         self.assertEqual(resp.status, 200)

@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -46,7 +46,13 @@ def _request(body: object) -> web.Request:
     state = MagicMock()
     state._gateway_restart_task = None
     state._gateway_restart_in_progress = False
+    state.owner_id = ""  # no owner configured: the local bootstrap subject is the owner
     req.app = {"state": state}
+    # Both routes are owner-gated: model the dashboard owner's claims.
+    claims = {"app": "", "user": "local-app"}
+    req.__contains__.side_effect = lambda key: key in claims
+    req.__getitem__.side_effect = lambda key: claims[key] if key in claims else DEFAULT
+    req.get.side_effect = lambda key, *default: claims[key] if key in claims else DEFAULT
     return req
 
 
@@ -494,6 +500,187 @@ class TestChannelEndpoint:
         assert resp.status == 500
 
 
+class TestUpdateRevalidate:
+    """``POST /api/update/revalidate`` — the CLI's post-update badge reconcile.
+
+    Authenticated over loopback + the local secret (the CLI path), NOT the
+    browser owner gate — a raw ``X-Local-Secret`` request carries no owner
+    identity, so an owner-gated endpoint would 403 the CLI and the fix would be
+    inert. These rows pin that the auth the CLI actually sends is accepted and
+    that a wrong/absent secret or a non-loopback origin is refused.
+    """
+
+    @staticmethod
+    def _cli_request(secret: str, *, remote: str = "127.0.0.1", header: str | None = None):
+        """A request stub carrying the CLI's loopback origin + local-secret header."""
+        req = MagicMock()
+        req.remote = remote
+        req.headers = {"X-Local-Secret": header if header is not None else secret}
+        state = MagicMock()
+        req.app = {"state": state, "local_secret": secret}
+        return req
+
+    def test_invalidates_then_rechecks_in_order(self, _isolated_channel_home):
+        """On valid CLI auth the endpoint drops the cache, THEN re-runs the check.
+
+        Order matters: a re-check that ran before the invalidation would just
+        re-pin the stale verdict. The check re-derives against the channel this
+        install follows, so the invalidation is passed that same channel.
+        """
+        update_layout.set_release_channel("stable")
+        calls: list[str] = []
+
+        def _fake_invalidate(channel: str) -> None:
+            calls.append(f"invalidate:{channel}")
+
+        async def _fake_check() -> None:
+            calls.append("recheck")
+            updates._set_update_info(
+                channel="stable",
+                update_available=False,
+                latest_version="",
+                check_status="succeeded",
+            )
+
+        with (
+            patch.object(updates, "_invalidate_update_check", _fake_invalidate),
+            patch.object(updates, "_do_update_check", _fake_check),
+        ):
+            resp = asyncio.run(updates.api_update_revalidate(self._cli_request("s3cret")))
+
+        assert resp.status == 200
+        assert calls == ["invalidate:stable", "recheck"]
+        payload = json.loads(resp.body.decode())
+        assert payload == {"ok": True}
+
+    def test_wrong_secret_is_refused_without_rechecking(self, _isolated_channel_home):
+        called: list[str] = []
+
+        async def _fake_check() -> None:
+            called.append("recheck")
+
+        with (
+            patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")),
+            patch.object(updates, "_do_update_check", _fake_check),
+        ):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header="wrong"))
+            )
+        assert resp.status == 403
+        assert called == [], "a refused caller still reached the cache"
+
+    def test_non_loopback_is_refused(self, _isolated_channel_home):
+        called: list[str] = []
+        with patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", remote="10.0.0.5"))
+            )
+        assert resp.status == 403
+        assert called == []
+
+    def test_kernel_attested_unix_peer_is_admitted(self, _isolated_channel_home):
+        """The CLI's owner-verified send prefers the owner-only AF_UNIX socket,
+        where ``request.remote`` is empty; a same-user peer the kernel confirms
+        (``check_peer_is_self`` MATCH) is admitted, the secret still required."""
+        from kiro_crew.mcp_gateway.socketsec import PeerCredResult
+
+        called: list[str] = []
+
+        async def _fake_check() -> None:
+            called.append("recheck")
+
+        with (
+            patch("kiro_crew.dashboard.token_auth.request_is_unix_socket", lambda _r: True),
+            patch(
+                "kiro_crew.dashboard.handlers.core.check_peer_is_self",
+                lambda _s: PeerCredResult.MATCH,
+            ),
+            patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")),
+            patch.object(updates, "_do_update_check", _fake_check),
+        ):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", remote=""))
+            )
+        assert resp.status == 200
+        assert called == ["inv", "recheck"]
+
+    def test_foreign_unix_peer_is_refused(self, _isolated_channel_home):
+        from kiro_crew.mcp_gateway.socketsec import PeerCredResult
+
+        called: list[str] = []
+        with (
+            patch("kiro_crew.dashboard.token_auth.request_is_unix_socket", lambda _r: True),
+            patch(
+                "kiro_crew.dashboard.handlers.core.check_peer_is_self",
+                lambda _s: PeerCredResult.MISMATCH,
+            ),
+            patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")),
+        ):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", remote=""))
+            )
+        assert resp.status == 403
+        assert json.loads(resp.body.decode())["code"] == "loopback_only"
+        assert called == []
+
+    def test_non_ascii_secret_is_refused_not_crashed(self, _isolated_channel_home):
+        """A non-ASCII X-Local-Secret must be an audited 403, never a TypeError/500.
+
+        hmac.compare_digest raises TypeError on a str carrying a non-ASCII char,
+        and this header is attacker-controllable on the tokenless bypass path, so
+        a str compare would turn the auditable denial into an unaudited 500.
+        """
+        called: list[str] = []
+        with patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header="wröng"))
+            )
+        assert resp.status == 403
+        assert called == [], "a refused non-ASCII secret still reached the cache"
+
+    @pytest.mark.parametrize(
+        "header",
+        ["s3cret\udcff", "\udcff", "wröng\udc80"],
+        ids=["trailing-surrogate", "only-surrogate", "non-ascii-and-surrogate"],
+    )
+    def test_a_lone_surrogate_secret_is_refused_and_audited(self, _isolated_channel_home, header):
+        """aiohttp decodes a header value with ``surrogateescape``, so a non-UTF-8
+        byte in ``X-Local-Secret`` arrives as a lone surrogate. A strict encode
+        raises on it; the endpoint must answer its own audited 403 instead."""
+        called: list[str] = []
+        audited: list[dict[str, object]] = []
+
+        async def fake_audit(request: object, **kwargs: object) -> None:
+            audited.append(kwargs)
+
+        with (
+            patch.object(updates, "_invalidate_update_check", lambda ch: called.append("inv")),
+            patch.object(updates, "_audit_update_event", fake_audit),
+        ):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header=header))
+            )
+        assert resp.status == 403
+        assert json.loads(resp.body.decode())["code"] == "invalid_secret"
+        assert audited == [
+            {"operation": "update.revalidate", "outcome": "denied", "resources": "invalid-secret"}
+        ]
+        assert called == [], "a refused surrogate secret still reached the cache"
+
+    def test_an_empty_secret_is_refused_and_audited(self, _isolated_channel_home):
+        audited: list[dict[str, object]] = []
+
+        async def fake_audit(request: object, **kwargs: object) -> None:
+            audited.append(kwargs)
+
+        with patch.object(updates, "_audit_update_event", fake_audit):
+            resp = asyncio.run(
+                updates.api_update_revalidate(self._cli_request("s3cret", header=""))
+            )
+        assert resp.status == 403
+        assert [a["resources"] for a in audited] == ["invalid-secret"]
+
+
 class TestRestartEndpoint:
     """``POST /api/restart``."""
 
@@ -565,3 +752,62 @@ class TestRestartEndpoint:
         first, second = asyncio.run(_run())
         assert first.status == 200
         assert second.status == 200
+
+    @staticmethod
+    def _refused(**patches: object) -> tuple[web.Response, MagicMock]:
+        """POST /api/restart with the pre-drain checks patched.
+
+        Returns the state as the handler leaves it: whether a restart task was
+        recorded is settled when the handler returns, so no sleep is needed.
+        """
+
+        async def _no_restart(_state: object) -> None:
+            raise AssertionError("a refused restart reached _restart_gateway")
+
+        async def _run() -> tuple[web.Response, MagicMock]:
+            req = _request({})
+            req.app["state"]._background_tasks = set()
+            with (
+                patch.object(updates, "_restart_gateway", _no_restart),
+                patch.multiple(updates, create=False, **patches),
+            ):
+                resp = await updates.api_gateway_restart(req)
+            return resp, req.app["state"]
+
+        return asyncio.run(_run())
+
+    def test_a_broken_launcher_is_refused_before_the_200(self):
+        """A refusal after the 200 would reach a restart control only as a
+        progress step it never reads, so the endpoint answers it on the request."""
+
+        def _broken() -> str:
+            raise ValueError("launcher is not executable")
+
+        resp, state = self._refused(resolve_restart_launcher=_broken)
+        assert resp.status == 409
+        body = json.loads(resp.body)
+        assert body["error"] == "Cannot restart: invalid gateway launcher path"
+        assert body["code"] == "restart_launcher_invalid"
+        assert state._gateway_restart_task is None, "a refused restart still recorded a task"
+        assert not state._background_tasks
+
+    def test_a_missing_interpreter_is_refused_before_the_200(self):
+        platform_compat = MagicMock()
+        platform_compat.execv_target_available.return_value = False
+        with (
+            patch("kiro_crew.platform.wheel_engine.respawn_executable", lambda: "/gone/python"),
+            patch.object(updates.update_ownership, "clear_restart_deferral") as cleared,
+        ):
+            resp, state = self._refused(
+                resolve_restart_launcher=lambda: None, platform_compat=platform_compat
+            )
+        assert resp.status == 409
+        body = json.loads(resp.body)
+        assert body["error"] == "Cannot restart: invalid Python executable path"
+        assert body["code"] == "restart_interpreter_missing"
+        platform_compat.execv_target_available.assert_called_once_with("/gone/python")
+        # The same refusal `_restart_gateway` makes, with the same release of a
+        # deferred restart whose bundle went with the pruned tree.
+        cleared.assert_called_once_with()
+        assert state._gateway_restart_task is None
+        assert not state._background_tasks

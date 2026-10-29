@@ -103,7 +103,7 @@ vi.mock('../components/FolderConfigModal', async () => {
 })
 
 const cfg = vi.hoisted(() => ({
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
@@ -123,6 +123,7 @@ const mocks = vi.hoisted(() => ({
   chatTags: vi.fn(),
   tagColumns: vi.fn(),
   kirocrewConfig: vi.fn(),
+  patchConfig: vi.fn(),
 }))
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
@@ -250,7 +251,7 @@ beforeEach(() => {
   // earlier test's calls.
   vi.clearAllMocks()
   localStorage.clear()
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   modal.props = null
   modal.submitError = null
   modal.draft = { name: 'Gamma', color: '', projectDir: '', defaultAgent: '', touched: [] }
@@ -266,6 +267,7 @@ beforeEach(() => {
   mocks.chatTags.mockResolvedValue([])
   mocks.tagColumns.mockResolvedValue([])
   mocks.kirocrewConfig.mockResolvedValue({ dashboard: { recent_tint_count: 3 } })
+  mocks.patchConfig.mockResolvedValue({ ok: true })
 })
 afterEach(() => {
   vi.clearAllTimers()
@@ -277,7 +279,7 @@ afterEach(() => {
 describe('ChatSidebar — list-view folder header', () => {
   it('collapses the folder through the row toggle', async () => {
     renderSidebar()
-    fireEvent.click(screen.getByLabelText('Collapse folder Alpha'))
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse folder Alpha' }))
     await waitFor(() => expect(mocks.updateChatFolder).toHaveBeenCalledWith('f1', { collapsed: true }))
   })
 
@@ -415,6 +417,31 @@ describe('ChatSidebar — list-view folder header', () => {
     await waitFor(() => expect(mocks.deleteChatFolder).toHaveBeenCalledWith('f1'))
   })
 
+  it('opens the same menu on a right-click of the row, and its items act', async () => {
+    renderSidebar()
+    const row = screen.getByRole('group', { name: 'Folder Alpha' })
+    fireEvent.contextMenu(row, { clientX: 40, clientY: 20 })
+    // Every ⋯-menu item is here under its `-ctx` twin id; the ⋯ copy stays closed.
+    for (const name of ['rename', 'new-subfolder', 'settings', 'visibility', 'delete']) {
+      expect(screen.getByTestId(`folder-${name}-f1-ctx`)).toBeTruthy()
+    }
+    expect(screen.queryByTestId('folder-settings-f1')).toBeNull()
+    fireEvent.click(screen.getByTestId('folder-rename-f1-ctx'))
+    fireEvent.change(folderRenameField(), { target: { value: 'ViaRightClick' } })
+    fireEvent.keyDown(folderRenameField(), { key: 'Enter' })
+    await waitFor(() => expect(mocks.updateChatFolder).toHaveBeenCalledWith('f1', { name: 'ViaRightClick' }))
+  })
+
+  it('right-click deletes only through the same confirm as the ⋯ menu', async () => {
+    const confirmFn = vi.fn().mockReturnValue(true)
+    vi.stubGlobal('confirm', confirmFn)
+    renderSidebar()
+    fireEvent.contextMenu(screen.getByRole('group', { name: 'Folder Alpha' }), { clientX: 40, clientY: 20 })
+    fireEvent.click(screen.getByTestId('folder-delete-f1-ctx'))
+    expect(confirmFn).toHaveBeenCalledWith('Delete “Alpha”? Sessions will be ungrouped.')
+    await waitFor(() => expect(mocks.deleteChatFolder).toHaveBeenCalledWith('f1'))
+  })
+
   it('starts a chat inside the folder from the row button', async () => {
     renderSidebar()
     fireEvent.click(screen.getByLabelText('New chat in Alpha'))
@@ -515,7 +542,24 @@ describe('ChatSidebar — sort and filter menu', () => {
     renderSidebar()
     await openFilterMenu()
     fireEvent.click(screen.getByText('A → Z'))
-    await waitFor(() => expect(localStorage.getItem('mc-session-sort')).toBe('name-asc'))
+    // Stored on the gateway, not in this browser.
+    await waitFor(() => expect(mocks.patchConfig).toHaveBeenCalledWith('dashboard.session_sort', 'name-asc'))
+    expect(localStorage.getItem('mc-session-sort')).toBeNull()
+  })
+
+  it('reports a refused sort save on its own notice, not the folder one', async () => {
+    mocks.patchConfig.mockRejectedValueOnce(new Error('failed to write config file'))
+    renderSidebar()
+    await openFilterMenu()
+    fireEvent.click(screen.getByText('A → Z'))
+    const notice = await screen.findByTestId('session-sort-error')
+    expect(notice.textContent).toContain('Sort update failed')
+    expect(notice.textContent).toContain('failed to write config file')
+    // Names the refused sort, the order the list is drawn on now, and the next step.
+    expect(notice.textContent).toContain(
+      '“A → Z” wasn’t saved, so the list is back on “Newest”. Pick it again to retry.',
+    )
+    expect(screen.queryByTestId('folder-action-error')).toBeNull()
   })
 
   it('restores every hidden folder in one action', async () => {

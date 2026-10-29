@@ -11,6 +11,7 @@ from aiohttp import web
 
 from kiro_crew.acp_backends import ACP_BACKEND_KIRO
 from kiro_crew.agent_sdk.host_auth import backends_retired_by_host_logout
+from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.kiro_prerequisite import (
     KIRO_CLI_LOGIN_COMMAND,
     KIRO_CLI_SSO_LOGIN_COMMAND,
@@ -23,7 +24,6 @@ from kiro_crew.kiro_prerequisite import (
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
-_LOCAL_DASHBOARD_OWNER_SUBJECTS = frozenset({"local-app", "local-startup"})
 
 
 def _configured_acp_backend() -> str:
@@ -118,15 +118,14 @@ def _caller(request: web.Request) -> str:
 
 
 def _is_dashboard_owner(request: web.Request) -> bool:
-    """Return whether a signed dashboard identity may operate host setup."""
+    """Return whether a signed dashboard identity may operate host setup.
 
-    state = request.app["state"]
-    owner_id = str(getattr(state, "owner_id", "") or "")
-    caller = str(request.get("user") or "")
-    return request.get("app") == "" and (
-        (owner_id and caller == owner_id)
-        or (not owner_id and caller in _LOCAL_DASHBOARD_OWNER_SUBJECTS)
-    )
+    Delegates to the shared predicate rather than re-deriving it: the rule (a
+    configured owner matched exactly, or a signed machine-local bootstrap subject
+    when none is configured) belongs in one place, and a second copy is how the
+    two drift apart.
+    """
+    return is_owner_dashboard_request(request)
 
 
 async def _dashboard_owner_only(request: web.Request) -> web.Response | None:
@@ -244,6 +243,9 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
             "docs_url": OFFICIAL_INSTALL_DOCS_URL,
             "login_command": KIRO_CLI_LOGIN_COMMAND,
             "sso_login_command": KIRO_CLI_SSO_LOGIN_COMMAND,
+            # Redacted and present for shape stability: non-owners never learn
+            # which executable the gateway host resolved.
+            "bundled_cli": False,
             "setup_allowed": False,
             # Redacted like the rest of this block: the failure kind and probe
             # detail describe the HOST's sandbox posture (kernel knobs, errnos),
@@ -259,6 +261,9 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
             # it. Present rather than omitted because a consumer that reads
             # ``undefined`` branches on it as though the absence meant something.
             "probe_timed_out": False,
+            # Same redaction, same shape-stability reason: whether the gateway host
+            # has ``unzip`` is host state, and only the owner installs it.
+            "unzip_missing": False,
             # Redacted for the same reason as the block above, and kept present
             # for the same shape-stability reason: only the owner can act on a
             # missing spec (the repair is an owner-gated POST). A non-owner on an

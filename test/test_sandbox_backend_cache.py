@@ -29,6 +29,10 @@ import pytest
 
 import kiro_crew.sandbox as sb
 
+# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+# so the shared macOS handle caches are put back after each one (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
+
 _EAGAIN_REASON = "fork failed with errno 11 (EAGAIN)"
 # The probe now mirrors the launcher's SPLIT sequence and names the failing
 # step, so a permanent denial reads as the NEWNS call rather than a combined
@@ -54,11 +58,37 @@ def clean_backend(monkeypatch):
     monkeypatch.setattr(
         sb, "_KIRO_INTERNAL_SETTINGS_PATH", "/nonexistent/kirocrew-test/amazon-internal.json"
     )
+    _join_warm_thread()
     sb.reset_backend()
-    sb._warm_thread = None
     monkeypatch.setattr(sb.time, "sleep", lambda _s: None)
     yield
+    _join_warm_thread()
     sb.reset_backend()
+
+
+def _join_warm_thread() -> None:
+    """Join any background warm thread before clearing module state.
+
+    Nulling ``sb._warm_thread`` only drops the handle — a probe thread a prior
+    test started keeps running and later writes ``_backend`` / the failure record
+    directly. Dropped into the next test's window it lands AFTER ``reset_backend()``:
+    on a user-namespace-capable worker it sets ``_backend == "namespace"``, so
+    ``_probe_unshare``'s warm-cache fast path returns early and the off-loop retry
+    (``time.sleep``) never runs — the order-dependent flake. The sibling
+    ``test_sandbox_remedy.py`` fixture joins for the same reason; mirror it here so
+    no stray thread survives into the next test.
+
+    Duck-typed on purpose: some tests plant a lightweight stand-in (a
+    ``SimpleNamespace`` with ``start``/``is_alive`` but no ``join``, or a faked
+    ``threading.Thread``) as the handle. Those never run a real probe, so there is
+    nothing to join — only a handle that exposes a callable ``join`` is waited on.
+    """
+    thread = sb._warm_thread
+    join = getattr(thread, "join", None)
+    is_alive = getattr(thread, "is_alive", None)
+    if callable(join) and callable(is_alive) and is_alive():
+        join(timeout=10)
+        assert not is_alive(), "sandbox warm thread did not finish"
     sb._warm_thread = None
 
 
@@ -228,12 +258,61 @@ def test_fail_closed_permanent_message_includes_optout_and_detail(monkeypatch):
 # ── Finding 2: signal-killed probe child classified transient ──
 
 
+class _FakePoll:
+    """Stand-in for ``select.poll`` where the platform has none (Windows).
+
+    Always reports the fd readable, so the probe's own ``os.read`` decides: the
+    parent closed the pipe's write end, so that read returns EOF at once.
+    """
+
+    def register(self, fd, mask):
+        pass
+
+    def unregister(self, fd):
+        pass
+
+    def poll(self, timeout=None):
+        return [(0, 1)]
+
+
+def _provide_posix_probe_apis(monkeypatch):
+    """Supply the POSIX names the fork probe touches, only where they are missing.
+
+    On Linux and macOS every name already exists and nothing is replaced. On
+    Windows ``os.fork``, ``os.getuid``/``getgid``, ``os.WNOHANG``, the wait-status
+    macros and ``select.poll`` are absent, so stand-ins with POSIX semantics are
+    added for this test only (``raising=False`` lets monkeypatch add a name).
+    """
+    import select
+
+    def _missing(mod, name, value):
+        if not hasattr(mod, name):
+            monkeypatch.setattr(mod, name, value, raising=False)
+
+    _missing(os, "getuid", lambda: 1000)
+    _missing(os, "getgid", lambda: 1000)
+    _missing(os, "WNOHANG", 1)
+    # POSIX wait-status layout: low 7 bits are the terminating signal (0 = exited,
+    # 0x7f = stopped), the next byte is the exit status.
+    _missing(os, "WIFSIGNALED", lambda s: (s & 0x7F) not in (0, 0x7F))
+    _missing(os, "WTERMSIG", lambda s: s & 0x7F)
+    _missing(os, "WIFEXITED", lambda s: (s & 0x7F) == 0)
+    _missing(os, "WEXITSTATUS", lambda s: (s >> 8) & 0xFF)
+    _missing(select, "POLLIN", 1)
+    _missing(select, "poll", _FakePoll)
+
+
 def test_probe_child_killed_by_signal_is_transient(monkeypatch):
-    """A probe child killed by a signal (WIFEXITED=False) must be transient."""
+    """A probe child killed by a signal (WIFEXITED=False) must be transient.
+
+    Runs on every platform: fork, waitpid and libc are faked, and the POSIX names
+    Windows lacks are supplied, so the parent's verdict logic is what is tested.
+    """
+    _provide_posix_probe_apis(monkeypatch)
     # Simulate fork -> child killed by SIGKILL (signal 9).
     # Status word for signal-killed: signal number in low 7 bits, no exit.
     signal_status = 9  # WIFSIGNALED(9)=True, WTERMSIG(9)=9, WIFEXITED(9)=False
-    monkeypatch.setattr(os, "fork", lambda: 12345)
+    monkeypatch.setattr(os, "fork", lambda: 12345, raising=False)
     monkeypatch.setattr(os, "waitpid", lambda pid, flags: (pid, signal_status))
     # Stub out the libc loading so we don't actually fork
     import ctypes as _ct

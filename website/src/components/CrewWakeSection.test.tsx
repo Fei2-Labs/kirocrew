@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
 import type { ReactNode } from 'react'
 
 /**
@@ -38,10 +39,13 @@ vi.mock('../api/client', () => ({
 vi.mock('react-router-dom', () => ({ useNavigate: () => H.navigate }))
 
 import CrewWakeSection from './CrewWakeSection'
+import { createTestStore } from '../test/helpers'
 
+// `useCronActions` reads the store's dispatch (its open-in-chat lists the tab),
+// so the section renders inside a Provider as it does in the app.
 function wrap(node: ReactNode) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{node}</QueryClientProvider>)
+  return render(<QueryClientProvider client={qc}><Provider store={createTestStore()}>{node}</Provider></QueryClientProvider>)
 }
 
 const JOB = {
@@ -64,7 +68,7 @@ afterEach(cleanup)
 describe('CrewWakeSection', () => {
   it('lists a cron bound to this crew', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText('gh-autofix-dispatcher')).toBeTruthy()
     expect(screen.getByText('every 15m')).toBeTruthy()
     expect(screen.getAllByTestId('wake-row')).toHaveLength(1)
@@ -73,14 +77,14 @@ describe('CrewWakeSection', () => {
 
   it('shows the empty state when nothing is bound to this crew', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
-    wrap(<CrewWakeSection crew="kirocrew-research" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-research" memberId="kirocrew-research" isDefaultCrew={false} />)
     expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
     expect(screen.queryAllByTestId('wake-row')).toHaveLength(0)
   })
 
   it('keeps a legacy schedule visible and identifies its Global V1 memory', async () => {
     H.crons.mockResolvedValue({ jobs: [{ ...JOB, member_id: '', agent: 'kirocrew-autofix' }] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText('gh-autofix-dispatcher')).toBeTruthy()
     expect(screen.getByText('Uses Global Memory V1')).toBeTruthy()
   })
@@ -89,39 +93,39 @@ describe('CrewWakeSection', () => {
     H.crons.mockResolvedValue({ jobs: [{
       ...JOB, member_id: '', agent: '', agent_sequence: ['ops-triage', 'kirocrew-autofix'],
     }] })
-    wrap(<CrewWakeSection crew="ops-triage" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="ops-triage" memberId="ops-triage" isDefaultCrew={false} />)
     expect(await screen.findByText('gh-autofix-dispatcher')).toBeTruthy()
     expect(screen.getByText('Uses Global Memory V1')).toBeTruthy()
   })
 
   it('keeps an unnamed legacy schedule on a configured non-reserved default crew', async () => {
     H.crons.mockResolvedValue({ jobs: [{ ...JOB, member_id: '', agent: '' }] })
-    wrap(<CrewWakeSection crew="my-assistant" isDefaultCrew />)
+    wrap(<CrewWakeSection crew="my-assistant" memberId="my-assistant" isDefaultCrew />)
     expect(await screen.findByText('gh-autofix-dispatcher')).toBeTruthy()
     expect(screen.getByText('Uses Global Memory V1')).toBeTruthy()
   })
 
   it("claims an agent-less cron for the default crew only", async () => {
     H.crons.mockResolvedValue({ jobs: [{ ...JOB, id: 'j2', name: 'start a day', agent: '', member_id: '' }] })
-    wrap(<CrewWakeSection crew="default" isDefaultCrew />)
+    wrap(<CrewWakeSection crew="default" memberId="default" isDefaultCrew />)
     expect(await screen.findByText('start a day')).toBeTruthy()
 
     cleanup()
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     await screen.findByText(/No schedules run this agent automatically/i)
     expect(screen.queryAllByTestId('wake-row')).toHaveLength(0)
   })
 
   it('pauses a running job through the cron API', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByLabelText(/Pause gh-autofix-dispatcher/))
     await waitFor(() => expect(H.toggleCron).toHaveBeenCalledWith('j1', false))
   })
 
   it('resumes a paused job and reports it as paused', async () => {
     H.crons.mockResolvedValue({ jobs: [{ ...JOB, enabled: false, next_run_ts: null }] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText('paused')).toBeTruthy()
     fireEvent.click(screen.getByLabelText(/Resume gh-autofix-dispatcher/))
     await waitFor(() => expect(H.toggleCron).toHaveBeenCalledWith('j1', true))
@@ -129,14 +133,14 @@ describe('CrewWakeSection', () => {
 
   it('runs a job now', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByLabelText(/Run gh-autofix-dispatcher now/))
     await waitFor(() => expect(H.runCron).toHaveBeenCalledWith('j1'))
   })
 
   it('refuses to run a paused job, matching the Schedule page', async () => {
     H.crons.mockResolvedValue({ jobs: [{ ...JOB, enabled: false, next_run_ts: null }] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     const run = await screen.findByLabelText(/Run gh-autofix-dispatcher now/)
     expect((run as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(run)
@@ -145,7 +149,7 @@ describe('CrewWakeSection', () => {
 
   it('sends the reader to the Schedule page, which owns creation and editing', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Open Schedule' }))
     expect(H.navigate).toHaveBeenCalledWith('/schedule')
   })
@@ -157,7 +161,7 @@ describe('CrewWakeSection', () => {
       { ...JOB, id: 's1', name: 'nightly-cleanup', agent: '', command: 'echo hi' },
       { ...JOB, id: 's2', name: 'poller', agent: '', script: '~/.kiro/crew/crons/p.py:run' },
     ] })
-    wrap(<CrewWakeSection crew="default" isDefaultCrew />)
+    wrap(<CrewWakeSection crew="default" memberId="default" isDefaultCrew />)
     expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
     expect(screen.queryAllByTestId('wake-row')).toHaveLength(0)
   })
@@ -165,7 +169,7 @@ describe('CrewWakeSection', () => {
   it('surfaces a failed pause instead of swallowing it', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
     H.toggleCron.mockResolvedValue({ error: 'cron store busy, please retry' })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByLabelText(/Pause gh-autofix-dispatcher/))
     expect(await screen.findByRole('alert')).toHaveTextContent(/cron store busy/)
   })
@@ -175,11 +179,11 @@ describe('CrewWakeSection', () => {
   it('attributes a sequence job through its explicit member identity', async () => {
     const seq = { ...JOB, id: 'q1', name: 'nightly-chain', agent: '', agent_sequence: ['ops-triage', 'kirocrew-autofix'] }
     H.crons.mockResolvedValue({ jobs: [seq] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText('nightly-chain')).toBeTruthy()
 
     cleanup()
-    wrap(<CrewWakeSection crew="default" isDefaultCrew />)
+    wrap(<CrewWakeSection crew="default" memberId="default" isDefaultCrew />)
     expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
   })
 
@@ -188,11 +192,11 @@ describe('CrewWakeSection', () => {
   it('resolves a one-element sequence through the bound agent, not the sequence', async () => {
     const one = { ...JOB, id: 'q2', name: 'single-chain', agent: 'kirocrew-autofix', agent_sequence: ['ops-triage'] }
     H.crons.mockResolvedValue({ jobs: [one] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText('single-chain')).toBeTruthy()
 
     cleanup()
-    wrap(<CrewWakeSection crew="ops-triage" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="ops-triage" memberId="ops-triage" isDefaultCrew={false} />)
     expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
   })
 
@@ -200,21 +204,21 @@ describe('CrewWakeSection', () => {
     H.crons.mockResolvedValue({ jobs: [
       { ...JOB, id: 'x1', name: 'stale-script', script: '~/.kiro/crew/crons/p.py:run' },
     ] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
   })
 
   // Absence of an answer and an answer of "none" must not render the same.
   it('says the answer is unknown when the fetch fails, not that nothing wakes it', async () => {
     H.crons.mockRejectedValue(new Error('gateway down'))
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByRole('alert')).toHaveTextContent(/what wakes it is unknown/i)
     expect(screen.queryByText(/No schedules run this agent automatically/i)).toBeNull()
   })
 
   it('reports a job that is running right now', async () => {
     H.crons.mockResolvedValue({ jobs: [{ ...JOB, is_running: true }] })
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByText('running')).toBeTruthy()
     expect((await screen.findByLabelText(/Run gh-autofix-dispatcher now/) as HTMLButtonElement).disabled).toBe(true)
   })
@@ -222,7 +226,7 @@ describe('CrewWakeSection', () => {
   it('surfaces a thrown pause failure too', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
     H.toggleCron.mockRejectedValue(new Error('network down'))
-    wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="kirocrew-autofix" memberId="kirocrew-autofix" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByLabelText(/Pause gh-autofix-dispatcher/))
     expect(await screen.findByRole('alert')).toHaveTextContent(/network down/)
   })
@@ -231,7 +235,7 @@ describe('CrewWakeSection', () => {
 describe('CrewWakeSection — inline schedule creation', () => {
   async function openForm(crew = 'kirocrew-autofix') {
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew={crew} agentTemplate="shared-template" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew={crew} memberId={crew} agentTemplate="shared-template" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     return screen.getByTestId('crew-wake-create')
   }
@@ -254,6 +258,23 @@ describe('CrewWakeSection — inline schedule creation', () => {
     // because identifier-like names have no natural break points.
     expect(chip.className).toContain('max-w-full')
     expect(chip.className).toContain('break-all')
+  })
+
+  it('a host with its own noun hands in the pinned hint, and only that host sees it', async () => {
+    // The crewmate Profile card's pushed New schedule page says "crewmate"; the
+    // editor's sentence names a surface that reader is not on. The sentence is
+    // the host's (like `heading` / `blurb` / `emptyLine`), so the editor's own
+    // copy is untouched by the override existing.
+    H.crons.mockResolvedValue({ jobs: [] })
+    wrap(
+      <CrewWakeSection
+        crew="radar" memberId="radar" agentTemplate="shared-template" ownedOnly initialAdding
+        pinnedHint="Created from this mate's profile, so the job runs as this mate."
+      />,
+    )
+    await screen.findByTestId('crew-wake-create')
+    expect(screen.getByText("Created from this mate's profile, so the job runs as this mate.")).toBeTruthy()
+    expect(screen.queryByText(/this crew's editor/)).toBeNull()
   })
 
   it('creates the job carrying member identity separately from its template', async () => {
@@ -291,7 +312,7 @@ describe('CrewWakeSection — inline schedule creation', () => {
 describe('CrewWakeSection — draft accounting and the visible Create', () => {
   it('submits through the always-visible header Create button', async () => {
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'n' } })
     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'm' } })
@@ -305,7 +326,7 @@ describe('CrewWakeSection — draft accounting and the visible Create', () => {
     H.crons.mockResolvedValue({ jobs: [] })
     const onDraftChange = vi.fn()
     const { unmount } = wrap(
-      <CrewWakeSection crew="oncall" isDefaultCrew={false} onDraftChange={onDraftChange} />,
+      <CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} onDraftChange={onDraftChange} />,
     )
     // Opening the form is not work: whoever opens it to look and backs out
     // must never meet a "what you typed will be lost" confirm.
@@ -332,7 +353,7 @@ describe('CrewWakeSection — draft accounting and the visible Create', () => {
 
   it('hides the Schedule-page jump while the form is open — it would discard the draft', async () => {
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     expect(await screen.findByText('Open Schedule')).toBeTruthy()
     fireEvent.click(screen.getByTestId('crew-wake-add'))
     expect(screen.queryByText('Open Schedule')).toBeNull()
@@ -343,7 +364,7 @@ describe('CrewWakeSection — draft accounting and the visible Create', () => {
     // at the same time; two controls announced identically with different
     // blast radii is the trap this name exists to avoid.
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     expect(screen.getByRole('button', { name: 'Cancel new schedule' })).toBeTruthy()
   })
@@ -355,7 +376,7 @@ describe('CrewWakeSection — a second create works after the first', () => {
     // section must clear the flag itself or the SECOND create in the same
     // pane visit renders a permanently disabled "Saving…" button.
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'first' } })
     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'm' } })
@@ -373,6 +394,41 @@ describe('CrewWakeSection — a second create works after the first', () => {
   })
 })
 
+describe('CrewWakeSection — chromeless host', () => {
+  it('withholds its header row and, after a save, lands focus on the section rather than the body', async () => {
+    // The Profile card's pushed New schedule page draws its own title and Back,
+    // so the section renders no heading, no New / Cancel toggle and no Open
+    // Schedule. That toggle is also where focus went after a save collapsed
+    // the form; with it absent the restore must still land somewhere on the
+    // page the host drew — the section itself — not fall to document.body.
+    H.crons.mockResolvedValue({ jobs: [] })
+    wrap(<CrewWakeSection crew="radar" memberId="radar" agentTemplate="shared-template" ownedOnly initialAdding chromeless />)
+    await screen.findByTestId('crew-wake-create')
+    expect(screen.queryByTestId('crew-wake-add')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Open Schedule' })).toBeNull()
+    const section = screen.getByTestId('crew-wake-section')
+    expect(section).toHaveAttribute('data-chromeless', 'true')
+    expect(section).toHaveAttribute('tabindex', '-1')
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'n' } })
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'm' } })
+    fireEvent.click(screen.getByTestId('crew-wake-create-submit'))
+    await waitFor(() => expect(screen.queryByTestId('crew-wake-create')).toBeNull())
+    await waitFor(() => expect(document.activeElement).toBe(section))
+  })
+
+  it('with its own header, the collapse-after-save still returns focus to the toggle', async () => {
+    H.crons.mockResolvedValue({ jobs: [] })
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
+    fireEvent.click(await screen.findByTestId('crew-wake-add'))
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'n' } })
+    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'm' } })
+    fireEvent.click(screen.getByTestId('crew-wake-create-submit'))
+    await waitFor(() => expect(screen.queryByTestId('crew-wake-create')).toBeNull())
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByTestId('crew-wake-add')))
+    expect(screen.getByTestId('crew-wake-section')).not.toHaveAttribute('tabindex')
+  })
+})
+
 describe('CrewWakeSection — a discard cannot outrun an in-flight create', () => {
   it('locks the cancel toggle while the create request is in flight', async () => {
     // Cancelling mid-flight unmounts the form but does NOT cancel the POST:
@@ -382,7 +438,7 @@ describe('CrewWakeSection — a discard cannot outrun an in-flight create', () =
     let resolveCreate!: (v: unknown) => void
     H.createCron.mockReturnValue(new Promise(res => { resolveCreate = res }))
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'n' } })
     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'm' } })
@@ -402,7 +458,7 @@ describe('CrewWakeSection — a discard cannot outrun an in-flight create', () =
     H.createCron.mockReturnValue(new Promise(res => { resolveCreate = res }))
     H.crons.mockResolvedValue({ jobs: [] })
     const onSavingChange = vi.fn()
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} onSavingChange={onSavingChange} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} onSavingChange={onSavingChange} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'n' } })
     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'm' } })
@@ -421,7 +477,7 @@ describe('CrewWakeSection — the header survives a 216px pane', () => {
     // both controls to nothing. The class pins the collapse mechanism; the
     // role queries pin that the names survive it.
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     const add = await screen.findByRole('button', { name: 'New schedule' })
     const open = screen.getByRole('button', { name: 'Open Schedule' })
     for (const btn of [add, open]) {
@@ -439,7 +495,7 @@ describe('CrewWakeSection — the header survives a 216px pane', () => {
     const scrolled = vi.fn()
     Element.prototype.scrollIntoView = scrolled
     H.crons.mockResolvedValue({ jobs: [] })
-    wrap(<CrewWakeSection crew="oncall" isDefaultCrew={false} />)
+    wrap(<CrewWakeSection crew="oncall" memberId="oncall" isDefaultCrew={false} />)
     fireEvent.click(await screen.findByTestId('crew-wake-add'))
     fireEvent.click(screen.getByTestId('crew-wake-create-submit'))
     expect(await screen.findByText('Name is required')).toBeTruthy()

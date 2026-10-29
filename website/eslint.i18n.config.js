@@ -100,11 +100,23 @@ export default [
       // to this module will not be reported. Keep it stylesheet-only; anything a
       // person reads belongs in the component with `i18nT`.
       'src/components/fileChangeChipsCss.ts',
+      // The Liquid Glass surface: SVG path data, an inline SVG displacement-map
+      // document, `url("data:image/svg+xml…")`, `linear-gradient(…)`, `path("…")`
+      // and `color-mix(…)` values, every one built as a string and handed to the
+      // CSS or SVG parser. It renders no copy of its own: `children` is the only
+      // text on screen, and that text belongs to (and is gated at) the caller.
+      //
+      // Stated as a false-negative class, per this file's convention: any copy
+      // added to this module will not be reported. Keep it effect-only.
+      'src/components/ui/liquid-glass.tsx',
       // Synthesizes the `diff --git` / `---` / `+++` headers Pierre needs to
       // identify a file in a bare patch body: git wire format handed to Pierre's
       // parser, never read as words. Extracted from `PullRequestPanel.tsx` so that
       // panel -- which does carry copy -- stays fully covered.
       'src/components/unifiedPatchHeaders.ts',
+      // Parses the ask_question tool result that mcp_tools/control.py writes: wire
+      // format matched verbatim, never shown. Keep it parse-only; copy goes in AskAnswersCard.tsx.
+      'src/utils/askQuestionTool.ts',
       // Per-shell env-var export command builders for SettingRef's env popover:
       // every string is CLI syntax handed to a terminal (`export`, `$env:`,
       // `set`, `=1`), never user-visible copy — translating a fragment would
@@ -189,6 +201,13 @@ export default [
       // keep both modules parser-facing only.
       'src/lib/widgetSrcdoc.ts',
       'src/lib/mcpAppSrcdoc.ts',
+      // Same parser-only boundary as the srcdoc builders above: this module
+      // sanitizes model markup and injects CSP, a DOCTYPE and theme CSS. None
+      // of its literals are human-facing copy; translating them breaks the
+      // policy or the frame. SessionStatusFrame.tsx stays fully gated.
+      // False-negative class: copy added here would not be checked. Keep this
+      // exact module parser-only, with all host text in its translated consumer.
+      'src/pages/chat/command-center/dashboardDocument.ts',
       // Per-app scoped CSS, injected as `<style>{APP_CSS}</style>`. Each module is
       // ONE template literal of stylesheet text handed to the CSS parser -- selectors,
       // lengths and `var(--…)` references. None of it is read as words, and the
@@ -255,8 +274,20 @@ export default [
       // Key glyphs / key-cap names only (⌘ ⇧ ⌥ / Ctrl Win Alt) — a machine
       // grammar the OS parses, not translatable copy. Same rationale as above.
       'src/apps/mochi/src/shared/shortcut.ts',
+      // Two DOM `KeyboardEvent.key` protocol values ('Backspace'/'Delete') the
+      // composer's atomic @mention delete compares against (#18186) — physical
+      // key names, never rendered copy. Same key-name do-not-translate rationale
+      // as `shortcut.ts` above; the module is export-only (imports nothing, no DOM
+      // or render path), so the filename IS the boundary and its consumer
+      // `LexicalComposerInput.tsx` stays fully covered.
+      'src/components/domDeleteKeys.ts',
       // CSS text injected through <style>; a stylesheet is not translatable copy.
       'src/apps/spec-builder/inlineStyles.ts',
+      // Inline `style.cssText` declarations for the fixed auth banners in
+      // `api/client.ts`. The module imports nothing and touches no DOM; the
+      // banners' words stay in `client.ts`, still gated. False-negative class:
+      // copy added here would not be checked, so keep it declaration-only.
+      'src/api/authBannerStyles.ts',
       // The theme stylesheet builders, extracted out of `hooks/useTheme.tsx` so
       // they COULD be exempted by path. Every literal in the module is handed to
       // the CSS parser: the `--*` custom-property allowlist, the
@@ -286,6 +317,18 @@ export default [
       // module parser-facing only, and keep it DOM-free, which is the property
       // that makes that easy to check.
       'src/hooks/themeCss.ts',
+      // The Paste CSS tab's parser and serialiser: every literal is stylesheet
+      // text (the `.dark` / `.light` block template, the placeholder's sample
+      // values) or a CSS pattern, handed to a CSS reader, never shown as words.
+      // The parse result carries property NAMES and counts, not sentences; the
+      // tab's messages are resolved from the catalog in `themeEditor.tsx`, which
+      // stays fully gated.
+      //
+      // Verified copy-free by the same mechanical boundary as `themeCss.ts`
+      // above: no `i18nT` / `useTranslation` import, no JSX, no DOM access.
+      // Stated as a false-negative class: copy added to THIS path will not be
+      // reported, so keep it data in, data out.
+      'src/lib/themeCssImport.ts',
       // The Kiro-ghost avatar generator's art tables. Every literal in the module
       // is SVG handed to the SVG parser: the shipped mark's `d` path data, the
       // per-part fragments built from it, and the hex tile colors. Translating any
@@ -303,6 +346,17 @@ export default [
       // user-visible copy ever added to THIS path will not be reported — keep the
       // module parser-facing only, and keep it DOM-free.
       'src/lib/kiroGhostAvatar.ts',
+      // The icon-tier pose composer, by the same boundary: its literals are the
+      // SVG group wrapper that puts a pose under the ghost's body motion
+      // (`<g class="kg-bob">…`) and a background fill — markup handed to the SVG
+      // parser, where a translated tag name renders a blank tile. It imports the
+      // pose art as raw text, imports no `i18nT` / `useTranslation`, and touches
+      // no DOM; every export is data in, SVG `string` out, consumed by the same
+      // fully gated `components/CrewAvatar.tsx` behind `alt=""` / `aria-hidden`.
+      //
+      // Same false-negative class as the ghost: copy added to THIS path is not
+      // reported, so keep it parser-facing and DOM-free.
+      'src/lib/avatarPoses.ts',
       // Same rationale, different convention: this app keeps its seed prompts in a
       // dedicated `lib/prompts.ts` rather than a `*Prompt.ts` file. Also prompt
       // payload sent over the wire, never rendered.
@@ -646,15 +700,17 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
-              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
-              // as copyable recovery text (`pullRequestErrorDetails` returns one
-              // verbatim and the panel renders it in a <code> block). A command
-              // typed into a terminal is a wire string: translating it breaks
-              // it. Enumerated rather than shaped, like the key codes above — a
-              // "lowercase words" shape would exempt exactly the prose this
-              // config fights hardest, and this is a closed two-member set that
-              // grows only when a new provider CLI is wired in on purpose.
+              // The provider-CLI LOGIN COMMANDS: the pull-request panel offers
+              // one as copyable recovery text (`pullRequestErrorDetails` returns
+              // it verbatim and the panel renders it in a <code> block), and Issue
+              // Radar's `providerTerms().loginCommand` shows one in its sign-in
+              // hint. A command typed into a terminal is a wire string:
+              // translating it breaks it. Enumerated rather than shaped, like the
+              // key codes above — a "lowercase words" shape would exempt exactly
+              // the prose this config fights hardest, and this is a closed set
+              // that grows only when a new provider CLI is wired in on purpose.
               '^(?:gh|glab) auth login$',
+              '^az login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -844,6 +900,10 @@ export default [
               // splits into `data:`, `;base64,` and `` — the first matches the data-URI
               // pattern above, the second needs this.
               '[;,]?base64,?$',
+              // The `U+` of Unicode code-point notation (`U+${hex}`), which every
+              // locale writes the same way. Only the bare two-character quasi is
+              // exempt, so no sentence can pass as one.
+              'U\\+$',
               // API paths with an optional query string: `/api/file-raw?path=`. The
               // `^[.~]?/` entry above cannot match these — the plugin full-anchors every
               // pattern, so a prefix-only one is inert.
@@ -880,18 +940,19 @@ export default [
               // per-channel settings panels. Enumerated and whole-value-anchored,
               // so a sentence merely mentioning a channel is still reported —
               // only the bare name is exempt.
-              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp)$',
+              '^(Slack|Discord|Telegram|Teams|Webex|WeCom|WeChat|WhatsApp|iMessage|Feishu)$',
               // The code-forge product brands, in the do-not-translate glossary for
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
               // product that does not exist. They reach the UI as the provider name in
-              // Issue Radar's connect picker and as the `{{provider}}` value
-              // interpolated into its refresh tooltips, so the bare brand is the whole
+              // Issue Radar's connect picker, as the `{{provider}}` value
+              // interpolated into its refresh tooltips, and as the source provider's
+              // name in the pull-request panel header, so the bare brand is the whole
               // literal. Whole-value-anchored like the entry above, so a sentence that
               // merely mentions a forge is still reported — only the bare name is
               // exempt, and the sentences AROUND it stayed in the catalog (that is
               // what `{{provider}}` is for).
-              '^(GitHub|GitLab|Azure DevOps)$',
+              '^(GitHub|GitLab|Azure DevOps|Bitbucket Server)$',
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal
@@ -908,6 +969,14 @@ export default [
               // presses, so translating it would mislabel their keyboard. Anchored and
               // enumerated, not a pattern: ordinary copy cannot match it.
               '^(Ctrl|Alt|Shift|Cmd|Win)$',
+              // A PyPI distribution name the optional-SDK card shows beside the
+              // install command (`OptionalSdkCard`'s `packageLabel`). It names the
+              // package the user installs, so it is do-not-translate on the same
+              // grounds as the key caps above. The lowercase names (`lark-oapi`,
+              // `neonize`) already pass as identifiers; this one carries an
+              // interior run of capitals no identifier pattern admits. Exact, not a
+              // shape: ordinary copy cannot match it.
+              '^PyJWT$',
               // Wire-protocol marker, not copy: the backend stamps `QUEUED:<fp>` onto a
               // `pr` value that was queued rather than drafted
               // (`spine/profile.py`: `return f"QUEUED:{fingerprint}"`), and the client only
@@ -1033,6 +1102,13 @@ export default [
               // its argument is an attribute/type selector walked up the tree,
               // never rendered copy.
               'querySelector(All)?', 'closest', 'getElementById', 'createElement',
+              // App-local builder for `[data-setting-*="…"]` anchor selectors
+              // (`src/hooks/useSettingHighlight.ts`). Its first argument is one of
+              // three machine anchor names and its second a resolved id/key/label;
+              // the string it returns is handed to `querySelector`/`matches` and
+              // never rendered — same CSS-selector contract as `querySelector`
+              // directly above. Uniquely named so the exclusion masks no other callee.
+              '^settingAnchorSelector$',
               'addEventListener', 'removeEventListener', 'matchMedia',
               // WebGL/DOM capability lookups take registry identifiers
               // (`WEBGL_lose_context`), which are mixed-case and so escape the
@@ -1139,6 +1215,10 @@ export default [
               'autoComplete', 'inputMode', 'enterKeyHint', 'spellCheck',
               'viewBox', 'xmlns', 'fill', 'stroke', 'd', 'points', 'transform',
               'encType', 'accept', 'pattern', 'lang', 'dir',
+              // `ErrorNotice`'s `noHandoffReason`: a sentence for the code reviewer
+              // saying why the notice has no agent hand-off. The component never
+              // renders it, so it is not copy.
+              'noHandoffReason',
             ],
           },
 
@@ -1252,6 +1332,22 @@ export default [
     },
   },
 
+  // Debug-only developer diagnostics, same class as `commitProfiler.tsx` above:
+  // `startDashboardLoadTiming` emits the Dashboard-tab load step timers (#20952)
+  // to the browser console and the User Timing panel for whoever is profiling,
+  // never to a user through the UI. The format of each line IS the interface
+  // (`[dashboard-timing] member:oncall step2-sandbox-post +18ms (t=42ms)`), so a
+  // localised copy would destroy the only property that makes it useful, exactly
+  // as it would for a `console.log`. Whole-file and scoped to this one module,
+  // which renders nothing and holds only these diagnostics; product copy added
+  // here later belongs in the catalog, not under this exemption.
+  {
+    files: ['src/lib/dashboardTiming.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // A pure-CSS module: one template literal of scoped style rules (hover/focus
   // states inline styles cannot express) injected via a <style> tag. It contains
   // selectors and declarations, never user-visible copy. The Tailwind/CSS shape
@@ -1308,13 +1404,18 @@ export default [
   // into the calls to earn the callee exemption would duplicate its branch logic
   // three times — a worse module for a lint technicality.
   //
-  // Scoped to this one file for the same reason as the two above: the module is the
-  // SDK's protocol surface (event tables, hooks, provider) and holds no other prose.
-  // The pieces that DO render copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` —
-  // are separate files and stay covered. Copy added here later belongs in the
-  // catalog, not under this exemption; keep this module protocol-and-diagnostics.
+  // Scoped to these two files for the same reason as the two above: they are the
+  // SDK's protocol surface (event tables, hooks, provider, the permission-fenced
+  // client) and hold no other prose. `scopedApi.ts` is the half the barrel split
+  // out; its one flagged literal is the permission-denied diagnostic that quotes the
+  // API path the author must add to `permissions.api`, passed to
+  // `AppApiPermissionError` (a typed `Error` the send wire matches by class, so the
+  // `^(Type)?Error$` callee exemption does not reach it). The pieces that DO render
+  // copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` — are separate files and stay
+  // covered. Copy added here later belongs in the catalog, not under this
+  // exemption; keep these modules protocol-and-diagnostics.
   {
-    files: ['src/app-sdk/index.ts'],
+    files: ['src/app-sdk/index.ts', 'src/app-sdk/scopedApi.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -1454,6 +1555,17 @@ export default [
     },
   },
 
+  // HOOK EVENT NAMES ONLY: matched BY VALUE against the backend's event
+  // allowlist, and rendered verbatim on the hook's own row, so a translated one is
+  // rejected on save and disagrees with its row. Extracted so the page keeps its
+  // gate. See the module's own header.
+  {
+    files: ['src/pages/hookEventWireValues.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
   // SEARCH-KEYWORD SYNONYMS ONLY: a manual overlay of extra query terms merged
   // into the Settings search corpus so a query like "dark mode" finds a setting
   // whose label does not contain those words. Every value is a term matched
@@ -1465,6 +1577,24 @@ export default [
   // and any real copy later added elsewhere still belongs in the catalog.
   {
     files: ['src/components/commandPalette/settingsKeywords.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // FIND_UI LOCATION DATA ONLY: the registered UI locations the find_ui index is
+  // generated from (scripts/gen-ui-index.mjs). Three kinds of string live here,
+  // and none is ever rendered: per-locale search terms (`terms`, `SEARCH_TERMS`:
+  // the words a newcomer types, matched against the query in THAT locale, the
+  // same job as settingsKeywords.ts above, which is why each locale's list is
+  // already written in its own language), catalog KEY names (`label.key`,
+  // `aliasKeys`, ids), and the English condition descriptions in conditions.ts,
+  // which the index hands to the assistant, not to the screen. Every label a
+  // person sees is read from the render site's catalog key; a descriptor that
+  // wrote one would be refused by the generator. Scoped to these files because
+  // a shape rule cannot express "search terms and key names, but only here".
+  {
+    files: ['src/uiLocations/areas/*.ts', 'src/uiLocations/conditions.ts', 'src/uiLocations/descriptors.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },
@@ -1504,6 +1634,46 @@ export default [
   // tight.
   {
     files: ['src/utils/fontFamilyOptions.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // CUSTOM FONT PICKER CANDIDATES: the sibling of monoFontCandidates.ts for the
+  // "Custom" Font Family option's picker. Same names-only rationale — every
+  // literal is a font family name matched by value against the machine's font
+  // book, so a translated name resolves to nothing. Kept in its own module so the
+  // exemption stays tight; the picker's own copy (label, description, free-text
+  // row) lives in the catalog.
+  {
+    files: ['src/utils/customFontCandidates.ts'],
+    rules: {
+      'i18next/no-literal-string': 'off',
+    },
+  },
+
+  // PASTE-TOKEN FORMAT ONLY, same "format IS the interface" category as
+  // `scrollInspector.ts` above: the one words-shaped literal in this module is
+  // `formatToken`'s `[ Paste #N · M lines ]` serialization (which also carries
+  // the block's stable id between two invisible U+2063 fences). It is a protocol
+  // token embedded verbatim in composer/message text and matched back by
+  // `PASTE_TOKEN_REGEX`; translating it would break that round-trip — the regex
+  // would stop recognising the token and the paste would be sent as literal
+  // text. The chip label the USER reads is a separate, translated string
+  // (`i18nT('components.pastedChip.paste_lines', …)`) rendered by the chip
+  // components; this module renders nothing (no JSX, no i18nT, pure
+  // serialization plus the localStorage side-table) and holds no other prose.
+  // The file passed the gate until #13851 touched `formatToken` to add the
+  // stable id, which moved the long-standing literal onto a line this branch
+  // wrote; [added-lines] then charged a format string that was never copy.
+  //
+  // Scoped to this one file for the reason the exemptions above are: a
+  // `words.exclude` shape for the token's `[ Paste #` / ` lines ]` quasis would
+  // also release that prose anywhere else in the tree. Copy added here later
+  // belongs in the catalog, not under this exemption; keep this module
+  // serialization-only.
+  {
+    files: ['src/utils/pasteTokens.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

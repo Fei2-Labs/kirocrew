@@ -1,26 +1,39 @@
-"""Title generation — auto-title, rename, plan rephrase."""
+"""Title generation — auto-title and rename."""
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import re
-import unicodedata
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import web
 
-from kiro_crew.config.loader import KiroCrewConfig, config_dir
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context import ui_language_tag
-from kiro_crew.context_management import extract_plan_metadata, rephrase_plan
+from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
 from kiro_crew.dashboard.chat_folder_suggest import maybe_suggest_folder
 from kiro_crew.dashboard.chat_utils import (
+    apply_pending_slot_memory_mode,
     effective_session_key,
+    restore_replacement_if_handover_did_not_land,
     slot_history_key,
+    tighten_replacement_to_restricted_original,
 )
+from kiro_crew.dashboard.slot_ownership import slot_not_found
 from kiro_crew.dashboard.state import NEW_SESSION_TITLE, DashboardState, _ChatSlot
-from kiro_crew.llm_helpers import background_turn, run_bg_oneliner
+from kiro_crew.execution_context import canonical_memory_mode, stricter_memory_mode
+from kiro_crew.history import HUMAN_TURN_META_KEY, is_incognito_transcript
+from kiro_crew.imessage.plaintext import _grapheme_end
+from kiro_crew.label_guard import (
+    ends_like_sentence,
+    is_verdict_reply,
+    looks_like_prose,
+    unspaced_script_chars,
+)
+from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.members import DM_SLOT_MODE
+from kiro_crew.memory_stores import UnknownMemoryStore
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -34,19 +47,104 @@ _TITLE_MAX_ATTEMPTS = 5
 # rename — final: the background refresh never touches it. Persisted as
 # ``title_origin`` next to the title and rehydrated in chat_persistence; a
 # legacy title with no stored origin rehydrates as "user" so a possibly-manual
-# name is never rewritten.
+# name is never rewritten. "member" marks the crewmate name stored on its own DM
+# thread (``name_member_thread``): final for every background path like "user",
+# but opening the thread may replace it, so a renamed crewmate's thread follows.
 _TITLE_ORIGIN_AUTO = "auto"
 _TITLE_ORIGIN_USER = "user"
-_TITLE_ORIGINS = frozenset({_TITLE_ORIGIN_AUTO, _TITLE_ORIGIN_USER})
+_TITLE_ORIGIN_MEMBER = "member"
+_TITLE_ORIGINS = frozenset({_TITLE_ORIGIN_AUTO, _TITLE_ORIGIN_USER, _TITLE_ORIGIN_MEMBER})
+
+# Leading marker a fork child's title carries (``chat_fork.fork_slot``). The
+# sidebar renders no separate fork glyph, so the marker is how a fork stays
+# recognisable; ``refresh_forked_title`` and ``maybe_refresh_title`` keep it in
+# front of a name they replace.
+FORK_TITLE_MARKER = "↳ "
+
+# Generations one fork's title pass may spend. The second exists only for a
+# question the user typed into the child while the first was generating, so
+# the name follows the newest question instead of a stale one; a third newer
+# question leaves the fork title as it is and the ordinary refresh takes over.
+_FORK_TITLE_MAX_PASSES = 2
 
 # User-message counts at which an AUTO title is re-examined in the background.
 # The first title is generated from the very first message, before the real
 # task has emerged; by turn 8 the session's actual topic is visible, and 24
-# catches long sessions that pivoted. Two milestones cap the whole feature at
-# TWO extra background one-liner calls per session lifetime — attempt-counted
-# (a KEEP/SKIP/error consumes the milestone; see maybe_refresh_title), and the
-# consumed mark is persisted so restarts cannot re-spend it.
+# catches long sessions that pivoted. This built-in schedule spends at most TWO
+# extra background one-liner calls per session lifetime. The opt-in
+# ``dashboard.title_refresh_every_turns`` cadence replaces it with one call per
+# N user turns, bounded only by the turns the session holds (see
+# ``_title_refresh_due``). Either way a milestone is attempt-counted (a
+# KEEP/SKIP/error consumes it; see maybe_refresh_title), and the consumed mark
+# is persisted so restarts cannot re-spend it.
 _TITLE_REFRESH_MILESTONES: tuple[int, ...] = (8, 24)
+
+
+def _title_refresh_due(mark: int, user_count: int, every: int, milestones: tuple[int, ...]) -> bool:
+    """Whether an AUTO title is due a refresh at ``user_count`` user turns.
+
+    ``milestones`` is the fixed schedule for this slot: the built-in
+    ``_TITLE_REFRESH_MILESTONES``, plus the early milestone for a low-signal
+    title. ``every > 0`` is the ``dashboard.title_refresh_every_turns`` cadence,
+    which REPLACES the built-in milestones with N, 2N, 3N, ... while keeping the
+    early one: due when the latest multiple of N at or below ``user_count`` has
+    not been consumed yet. Like the milestones it is attempt-counted through
+    ``mark``, and a session that crossed several multiples since its last
+    attempt gets one refresh, not a catch-up burst.
+    """
+    if every > 0:
+        milestones = tuple(m for m in milestones if m not in _TITLE_REFRESH_MILESTONES)
+        if (user_count // every) * every > mark:
+            return True
+    return any(mark < m <= user_count for m in milestones)
+
+
+def _rehydrated_refresh_mark(mark: int, user_count: int) -> int:
+    """Re-base a persisted refresh mark against the user turns a reload holds.
+
+    A rehydrated slot holds only its latest rows (500 per loader), so its user
+    count restarts below the count the session had reached, while ``mark`` is
+    restored verbatim. Left alone, a cadence mark above the restored count
+    keeps ``_title_refresh_due`` silent until the count climbs past the mark
+    again, one turn at a time. Pulling the mark down to the restored count lets
+    the ``title_refresh_every_turns`` cadence continue from that count, at the
+    next multiple of N above it; when the floor below holds the mark above the
+    restored count, the cadence resumes after that fixed milestone instead, not
+    after the restored count.
+
+    The floor is the largest fixed milestone at or below ``mark``, including
+    the low-signal early milestone, or zero when none qualifies. It keeps every
+    fixed milestone covered by ``mark`` spent while allowing a cadence mark
+    between fixed milestones to follow the restored count. A mark at or below
+    the restored count is returned unchanged.
+
+    Applied once, at rehydrate, over the loaded window. Never re-applied lazily
+    from ``maybe_refresh_title``: ``_ChatSlot.append`` trims the live window one
+    row at a time at ``_MAX_SLOT_MESSAGES``, so a mark re-based against a count
+    that oscillates there would fire on every dip.
+    """
+    fixed_milestones = (_TITLE_EARLY_REFRESH_MILESTONE, *_TITLE_REFRESH_MILESTONES)
+    floor = max(
+        (milestone for milestone in fixed_milestones if milestone <= mark),
+        default=0,
+    )
+    return max(min(mark, user_count), floor)
+
+
+def _title_refresh_every() -> int:
+    """Read ``dashboard.title_refresh_every_turns``; 0 on any failure.
+
+    Read per turn (the load is mtime-cached) so a change in Settings applies to
+    the next turn without a restart. **Call this OFF the event loop**, for the
+    same reason as :func:`_ui_language`. A failed read falls back to the
+    built-in schedule, the bounded one, never to an unbounded cadence.
+    """
+    try:
+        return int(KiroCrewConfig.load().dashboard.title_refresh_every_turns)
+    except Exception:
+        logger.debug("title_refresh_every_turns lookup failed; using built-in milestones")
+        return 0
+
 
 # Extra refresh milestone for a title born LOW-SIGNAL (see
 # ``_is_low_signal_title``): a first message dominated by a pasted link or an
@@ -97,6 +195,9 @@ _TITLE_SOURCE_SCAN_LIMIT = _TITLE_TEXT_LIMIT + _TITLE_MAX_ATTACHMENT_FILES * (
 # set_model override for auto, so titling runs on the backend-resolved entitled
 # model instead of a literal the account may not have.
 _TITLE_MODEL = "auto"
+#: Bound on one title call, initial or refresh: the same 30 s the folder icon and
+#: folder suggestion one-liners use. A title that misses it falls back as on error.
+_TITLE_TIMEOUT_SECS = 30.0
 
 # Per-word delay for the word-by-word title reveal animation. LLM chunk
 # streaming arrives in a sub-second burst (too fast to perceive), so the reveal
@@ -218,168 +319,18 @@ _TITLE_LANGUAGE_TEMPLATE = (
     "ASCII SKIP, never a translation of it.\n\n"
 )
 
-# A title is 3-6 words by contract. Anything materially longer is the model
-# answering instead of naming, so the ceiling sits above any plausible real
-# title and below a sentence.
-_TITLE_MAX_WORDS = 12
-
-#: Codepoint ranges of scripts written WITHOUT spaces between words: kana, Han
-#: (+ extension A and the compatibility block) and Thai. A title in one of them
-#: is a single whitespace token, so ``_TITLE_MAX_WORDS`` can never fire for it —
-#: it needs the character ceiling below instead. Hangul and Cyrillic are
-#: deliberately absent: Korean and Russian do space their words, so the word
-#: ceiling bounds a long sentence in them. A SHORT Korean refusal clears that
-#: ceiling, so it is caught by sentence shape instead -- see
-#: ``_TITLE_KO_SENTENCE_ENDINGS``.
-_UNSPACED_SCRIPT_RANGES = (
-    (0x0E00, 0x0E7F),  # Thai
-    (0x3040, 0x30FF),  # Hiragana + Katakana
-    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
-    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
-    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
-)
-
-#: Ceiling on characters of unspaced script in a title. The prompt asks for
-#: ~4-14 characters in those languages, so this leaves headroom for a long name
-#: while a refusal or an answer runs well past it. Counting only the unspaced
-#: characters (not the whole string) keeps latin identifiers free: "修复
-#: PrivacyPanel 的动态键" spends 8 against the budget, not 24.
-_TITLE_MAX_UNSPACED_CHARS = 24
-
-#: Sentence terminators that are NOT followed by a space in the scripts that use
-#: them, so the ASCII rule's whitespace requirement would never fire on them.
-_TITLE_WIDE_TERMINATORS = "。！？"
-
 #: Punctuation an LLM wraps a name in, or ends it with. The full-width and CJK
 #: quote forms matter because titles are generated in the UI language: a zh/ja
 #: reply wraps in 「」 or “” and ends with 。, none of which an ASCII-only strip
 #: removes, so those titles would reach the sidebar still quoted.
 _TITLE_WRAP_CHARS = "\"'“”‘’「」『』《》.。．"
 
-# Openers that mark the reply as prose about the model rather than a name. The
-# observed failure was a pasted URL producing "I cannot access external URLs
-# like Quip documents. Based solely on the message c…" as the session name.
-_TITLE_PROSE_OPENERS = (
-    "i cannot",
-    "i can not",
-    "i can't",
-    "i cant",
-    "i am unable",
-    "i'm unable",
-    "i am not able",
-    "i'm not able",
-    "i do not have",
-    "i don't have",
-    "i dont have",
-    "i was unable",
-    "i will not",
-    "i won't",
-    "i need ",
-    "i would need",
-    "unable to",
-    "cannot access",
-    "can't access",
-    "cannot fetch",
-    "can't fetch",
-    "sorry",
-    "apologies",
-    "unfortunately",
-    "as an ai",
-    "based solely",
-    "based on the",
-    "it seems",
-    "it looks like",
-    "here is",
-    "here's",
-    "the conversation",
-    "this conversation",
-    "note:",
-)
-
-#: Korean refusal/prose shape. Hangul spaces its words, so the word ceiling
-#: bounds a long Korean sentence -- but a refusal is SHORT (five words in the
-#: observed case), and ``_TITLE_PROSE_OPENERS`` is English-only, so a short
-#: Korean refusal clears every other check. Korean
-#: is SOV: the verb that marks a sentence as a sentence comes LAST, so prefix
-#: openers cannot catch it -- match the sentence-final conjugation instead.
-#: The polite declarative endings close the sentence forms a titling model
-#: actually emits: "-nida" (U+B2C8 U+B2E4, the hamnida/seumnida/imnida
-#: family) and the informal-polite "-eoyo"/"-ayo"/"-haeyo" (U+C5B4/U+C544/
-#: U+D574 + U+C694). A noun-phrase title carries none of them; a plain-form
-#: (banmal) refusal stays a documented false negative. The one useful prefix
-#: is "joesong" (U+C8C4 U+C1A1, "sorry"), the apology opener. Both signals
-#: trade deliberately toward rejection: a sentence-form Korean title ("the
-#: login does not work") loses to the fallback name, which is the cheaper
-#: failure -- a fallback name is still the user's own words, a refusal stored
-#: as the name is the bug. Escapes keep the source ASCII; the runtime values
-#: are the Hangul strings.
-_TITLE_KO_PROSE_OPENERS = ("\uc8c4\uc1a1",)
-_TITLE_KO_SENTENCE_ENDINGS = (
-    "\ub2c8\ub2e4",
-    "\uc5b4\uc694",
-    "\uc544\uc694",
-    "\ud574\uc694",
-)
-
-
-def _unspaced_script_chars(s: str) -> int:
-    """Count characters belonging to a script written without word spaces."""
-    return sum(1 for ch in s if any(lo <= ord(ch) <= hi for lo, hi in _UNSPACED_SCRIPT_RANGES))
-
-
-def _looks_like_prose(title: str) -> bool:
-    """True when an LLM title reply is a sentence about the task, not a name.
-
-    The titling call is tool-free by contract (``run_bg_oneliner`` rejects every
-    permission request), so a message containing a URL can make the model
-    narrate the denial instead of naming the chat — and that narration was being
-    persisted as the session title. Prompt wording alone cannot guarantee the
-    shape of a generation, so the reply is also validated here and treated as
-    SKIP when it fails, which routes to the existing fallback title.
-
-    Five signals, each independently sufficient:
-
-    - a refusal/narration opener (see ``_TITLE_PROSE_OPENERS``);
-    - more words than any real title carries;
-    - more unspaced-script characters than any real title carries. Chinese,
-      Japanese and Thai put no spaces between words, so a whole sentence in them
-      is ONE word by ``str.split`` and slips past the word ceiling entirely;
-    - sentence-terminating punctuation with text after it. The ASCII terminator
-      must be followed by whitespace so "Node.js upgrade plan" and "Ship v1.2 to
-      prod" stay valid; the full-width forms must not, because the scripts that
-      use them do not space after punctuation.
-    - Korean sentence shape (see ``_TITLE_KO_SENTENCE_ENDINGS``). Hangul spaces
-      its words, but a refusal is short enough to clear the word ceiling, and a
-      prefix opener cannot catch an SOV language whose refusal verb comes last
-      -- so the sentence-final polite conjugation is matched instead, a grammar
-      fact rather than a phrase list.
-
-    Known false negative: a SHORT refusal in an unspaced script with no
-    terminator ("无法访问该链接") clears every ceiling and lands as the title.
-    That class is inherent to matching prose by shape — the openers list is the
-    only signal that catches it, and maintaining one per shipped locale is
-    whack-a-mole. It fails to a wrong-but-short name, never to a paragraph.
-    """
-    stripped = title.strip()
-    if not stripped:
-        return False
-    lowered = stripped.lower()
-    if lowered.startswith(_TITLE_PROSE_OPENERS):
-        return True
-    if stripped.startswith(_TITLE_KO_PROSE_OPENERS):
-        return True
-    if stripped.endswith(_TITLE_KO_SENTENCE_ENDINGS):
-        return True
-    if len(stripped.split()) > _TITLE_MAX_WORDS:
-        return True
-    if _unspaced_script_chars(stripped) > _TITLE_MAX_UNSPACED_CHARS:
-        return True
-    for index, char in enumerate(stripped[:-1]):
-        if char in ".!?" and stripped[index + 1].isspace():
-            return True
-        if char in _TITLE_WIDE_TERMINATORS:
-            return True
-    return False
+# The refusal/prose and verdict checks are shared with every other label path
+# (Slack/Telegram title, nav link chips, session summary) so they cannot drift;
+# the private names are kept because the reveal and the tests use them.
+_unspaced_script_chars = unspaced_script_chars
+_looks_like_prose = looks_like_prose
+_is_verdict_reply = is_verdict_reply
 
 
 def _strip_markdown_images(content: str, *, drop_trailing_partial: bool = False) -> str:
@@ -697,8 +648,7 @@ def _build_title_prompt(
     """Build a title generation prompt from conversation messages.
 
     ``ui_language`` is a validated BCP-47 tag (see ``_ui_language``); ``""``
-    omits the language directive entirely, leaving the prompt byte-identical to
-    the one workspaces on the default (auto) language have always sent. The
+    omits the language directive entirely (the default auto-language prompt). The
     directive is placed OUTSIDE the delimited transcript, so a message that
     quotes it cannot restate it as data.
     """
@@ -736,94 +686,6 @@ def _build_refresh_prompt(
     )
 
 
-def _reset_auto_run_for_new_plan(slot: "_ChatSlot") -> None:
-    """Clear auto-run state so a new plan requires fresh user approval."""
-    session_dir = config_dir() / "sessions" / slot.key
-    if session_dir.exists():
-        for f in session_dir.glob("stage_*_result.md"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
-    slot._orch_tracker = None
-    slot._auto_run = False
-    # A freshly armed plan starts un-cancelled. This is the ONLY clear site for
-    # the latch — deliberately not Go (api_chat_plan_action): clearing on Go
-    # would let a Go racing a Cancel resurrect the cancelled plan, which is the
-    # same race inverted.
-    slot._plan_cancelled = False
-
-
-def _extract_and_redact_plan_metadata(text: str) -> tuple[list[str], str, list[list[str]]]:
-    """Extract stage titles, goal, and descriptions from plan text, redacted."""
-    titles, goal, descriptions = extract_plan_metadata(text)
-    titles = [redact_credentials(redact_exfiltration_urls(t)[0])[0] for t in titles]
-    if goal:
-        goal = redact_credentials(redact_exfiltration_urls(goal)[0])[0]
-    descriptions = [
-        [redact_credentials(redact_exfiltration_urls(d)[0])[0] for d in stage_descs]
-        for stage_descs in descriptions
-    ]
-    return titles, goal, descriptions
-
-
-#: Bound on the plan-reformat round-trip. The rephrase is cosmetic: when it
-#: does not return inside this window the turn keeps the model's original text
-#: rather than holding the answer -- and the turn's own finalize -- behind a
-#: second LLM call that a slow or flaky backend can stall indefinitely.
-_PLAN_REPHRASE_TIMEOUT = 20.0
-
-
-async def _rephrase_plan_lite(
-    state: DashboardState,
-    text: str,
-    issues: list[str],
-    *,
-    might_not_be_plan: bool = False,
-) -> str | None:
-    """Rephrase a plan using the cheap background session (kirocrew-lite).
-
-    Bounded END TO END. Acquiring the shared background session can itself
-    block behind another background turn, so a bound around only the prompt
-    left the caller held at the acquire: the rephrase logged "asking LLM to
-    reformat" and then produced nothing until a manual Stop, and the
-    prompt-level timeout never fired.
-    """
-    try:
-        return await asyncio.wait_for(
-            _rephrase_plan_turn(state, text, issues, might_not_be_plan=might_not_be_plan),
-            timeout=_PLAN_REPHRASE_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Plan rephrase timed out after %.0fs; keeping the original text",
-            _PLAN_REPHRASE_TIMEOUT,
-        )
-        return None
-
-
-async def _rephrase_plan_turn(
-    state: DashboardState,
-    text: str,
-    issues: list[str],
-    *,
-    might_not_be_plan: bool,
-) -> str | None:
-    async with contextlib.AsyncExitStack() as stack:
-        try:
-            bg = await stack.enter_async_context(
-                background_turn(state.sessions, task="plan_rephrase")
-            )
-        except Exception:
-            logger.warning("Failed to get background session for plan rephrase", exc_info=True)
-            return None
-        result = await rephrase_plan(text, issues, bg, might_not_be_plan=might_not_be_plan)
-    if result:
-        result, _ = redact_exfiltration_urls(result)
-        result, _ = redact_credentials(result)
-    return result
-
-
 def _clean_title(s: str) -> str:
     """Normalize a (partial or final) LLM title: keep the first line only,
     then trim whitespace and wrapping quotes/period, in their ASCII and
@@ -852,10 +714,12 @@ def _title_reveal_prefixes(title: str) -> list[str]:
     two characters at a time instead, so a 12-character zh name reveals in about
     as many steps as a 6-word en one rather than 12.
 
-    A cut is extended past any combining marks that follow it, so a frame never
-    shows a Thai consonant whose tone mark has not arrived yet (``แก`` then
-    ``แก้``): the mark would appear to pop onto an already-drawn glyph. Chinese
-    and Japanese have no combining marks, so this only ever fires for Thai.
+    A cut is extended to the end of the grapheme cluster it lands in, so a
+    frame never shows an incomplete glyph: not a Thai consonant whose tone
+    mark has not arrived yet (``แก`` then ``แก้`` — the mark would appear to
+    pop onto an already-drawn glyph), and not half of a ZWJ family, flag,
+    skin-tone, keycap or accented sequence either. Chinese and Japanese have
+    no combining marks, so the combining case only ever fires for Thai.
     """
     words = title.split()
     if len(words) > 1:
@@ -866,12 +730,11 @@ def _title_reveal_prefixes(title: str) -> list[str]:
     prefixes: list[str] = []
     cut = _TITLE_REVEAL_CHAR_CHUNK
     while cut < len(single):
-        while cut < len(single) and unicodedata.combining(single[cut]):
-            cut += 1
-        if cut >= len(single):
+        end = _grapheme_end(single, cut)
+        if end >= len(single):
             break
-        prefixes.append(single[:cut])
-        cut += _TITLE_REVEAL_CHAR_CHUNK
+        prefixes.append(single[:end])
+        cut = end + _TITLE_REVEAL_CHAR_CHUNK
     return prefixes
 
 
@@ -890,55 +753,16 @@ async def _reveal_title(
     explicit title (manual rename) that lands mid-reveal is never clobbered by
     an animation frame. When *epoch* is given, the reveal also stops the moment
     ``slot._title_epoch`` moves — an explicit title is landing, so there is
-    nothing left to animate.
+    nothing left to animate — or the moment *slot* is not the one holding its key, so
+    a session reopened under the same key never shows this title.
     """
     for prefix in _title_reveal_prefixes(title):
-        if epoch is not None and slot._title_epoch != epoch:
+        if epoch is not None and (
+            slot._title_epoch != epoch or state._slots.get(slot.key) is not slot
+        ):
             return
         state.push_slot_title(slot.key, prefix, full=False)
         await asyncio.sleep(_TITLE_REVEAL_STEP_SECS)
-
-
-#: Characters that read as a verdict-reason separator right after a control
-#: word ("SKIP: too vague", "SKIP (too vague)"). Deliberately NOT every
-#: non-alphanumeric: "-" and "." separate only when spaced away from the next
-#: word, so identifier titles the prompt tells the model to keep verbatim
-#: ("KEEP-ALIVE header bug", "SKIP.md parser fix") survive, and "_" never
-#: separates ("SKIP_TESTS env var flag").
-_TITLE_VERDICT_TRAILERS = ":,;!?("
-
-
-def _is_verdict_reply(title: str, control_words: tuple[str, ...]) -> bool:
-    """True when *title* is a control word, alone or followed by a reason.
-
-    The word is matched case-insensitively on every shape: the words are
-    taught as literal ASCII, but a lowercased echo is still a verdict, with
-    or without a reason attached ("skip", "Skip: greetings only", "keep - the
-    title still fits"). What separates a verdict-plus-reason from a real
-    title OPENING with the word is the separator: punctuation (or a spaced
-    dash / spaced period) means verdict, while a plain following word or an
-    identifier joiner means title ("SKIP and KEEP handling", "Keep alive
-    timer bug", "SKIPPED frames in reveal", "KEEP-ALIVE header bug").
-    """
-    upper = title.upper()
-    if upper in control_words:
-        return True
-    for word in control_words:
-        if not upper.startswith(word):
-            continue
-        rest = title[len(word) :]
-        head = rest.lstrip()
-        spaced = len(head) != len(rest)
-        if not head:
-            return True
-        char = head[0]
-        if char in _TITLE_VERDICT_TRAILERS:
-            return True
-        if char == "-" and (spaced or len(head) < 2 or head[1].isspace()):
-            return True
-        if char == "." and (len(head) < 2 or head[1].isspace()):
-            return True
-    return False
 
 
 def _validate_title_reply(
@@ -960,9 +784,12 @@ def _validate_title_reply(
     title = _clean_title(text)
     if not title or _is_verdict_reply(title, control_words):
         return ""
+    # ``_clean_title`` strips a final period, so the end-of-sentence shape is
+    # read from the reply's first line before that strip.
+    ends_as_sentence = ends_like_sentence(text.strip().split("\n", 1)[0])
     title, _ = redact_exfiltration_urls(title)
     title, _ = redact_credentials(title)
-    if _looks_like_prose(title):
+    if ends_as_sentence or _looks_like_prose(title):
         # The model answered/refused instead of naming (a pasted URL is the
         # common trigger). Treat it as SKIP so the caller uses the fallback
         # title rather than persisting a sentence as the session name.
@@ -1003,6 +830,7 @@ async def _generate_title_via_kiro(
         state.sessions,
         prompt,
         model=_TITLE_MODEL,
+        timeout=_TITLE_TIMEOUT_SECS,
         crew_log_kind="title",
         crew_log_session_key=session_key,
     )
@@ -1037,6 +865,7 @@ async def _generate_refreshed_title(
         state.sessions,
         prompt,
         model=_TITLE_MODEL,
+        timeout=_TITLE_TIMEOUT_SECS,
         crew_log_kind="title",
         crew_log_session_key=session_key,
     )
@@ -1048,7 +877,12 @@ async def _generate_refreshed_title(
     return title
 
 
-async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
+async def _persist_title(
+    state: DashboardState,
+    slot: _ChatSlot,
+    *,
+    still_current: Callable[[], bool] | None = None,
+) -> bool:
     """Save the slot title (and its provenance) to the conversation history file.
 
     ``update_metadata`` -> ``_locked`` (cross-process flock acquire +
@@ -1066,7 +900,10 @@ async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
     conversation log to write to — in which case there is nothing a restart
     could reload either), ``False`` when the off-thread write failed. Callers
     that must not proceed on a non-durable mark (the refresh's token budget)
-    check the result; best-effort callers ignore it.
+    check the result; best-effort callers ignore it. ``still_current`` is the
+    caller's slot-identity predicate, checked inside the metadata write lock so
+    a write for a slot that has left its key is refused; the app request and
+    the auto-title and refresh tasks pass it, other callers leave it unset.
 
     WRITE-ORDER GUARD: two concurrent persists (a background titler's and a
     manual rename's) race on worker threads, and flock acquisition order is
@@ -1081,26 +918,101 @@ async def _persist_title(state: DashboardState, slot: _ChatSlot) -> bool:
 
     if not state.conversation_log:
         return True
+    from kiro_crew.dashboard.chat_persistence import (
+        _record_pending_memory_mode,  # circular import: persistence imports channel_slots
+    )
+
     history_key = slot_history_key(slot)
-    while True:
-        epoch = slot._title_epoch
-        fields: dict[str, Any] = {"title": slot.title}
-        origin = slot._title_origin
-        if origin in _TITLE_ORIGINS:
-            fields["title_origin"] = origin
-        if slot._title_refresh_mark:
-            fields["title_refresh_mark"] = slot._title_refresh_mark
-        # Written unconditionally (unlike the mark, which only grows): the flag
-        # goes True -> False when the early refresh consumes it, and a stale
-        # True on disk would re-arm the early milestone on every restart.
-        fields["title_low_signal"] = slot._title_low_signal
+    pending_mode_slot = slot
+    current = state._slots.get(slot.key)
+    if current is not None and slot_history_key(current) == history_key:
+        pending_mode_slot = current
+    slot_mode = canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+    tightening = None
+    if is_incognito_transcript(slot_mode):
         try:
-            await asyncio.to_thread(state.conversation_log.update_metadata, history_key, fields)
+            tightening = tighten_replacement_to_restricted_original(state, slot.key, slot)
+        except UnknownMemoryStore:
+            logger.warning(
+                "Slot %s: replacement rebound twice during tightening; writing the tail "
+                "under the ratcheted line without tightening the live replacement",
+                slot.key,
+            )
+    while True:
+        # A one-element list so the lock-held fold can move the epoch this
+        # write is checked against when it re-snapshots the title.
+        epoch = [slot._title_epoch]
+        fields: dict[str, Any] = {}
+
+        def _snapshot_title_fields() -> None:
+            fields["title"] = slot.title
+            origin = slot._title_origin
+            if origin in _TITLE_ORIGINS:
+                fields["title_origin"] = origin
+            else:
+                fields.pop("title_origin", None)
+            if slot._title_refresh_mark:
+                fields["title_refresh_mark"] = slot._title_refresh_mark
+            else:
+                fields.pop("title_refresh_mark", None)
+            # Written unconditionally (unlike the mark, which only grows): the flag
+            # goes True -> False when the early refresh consumes it, and a stale
+            # True on disk would re-arm the early milestone on every restart.
+            fields["title_low_signal"] = slot._title_low_signal
+
+        _snapshot_title_fields()
+        # An upsert can be the FIRST write of this session's line: the on-send
+        # titling attempt runs before the turn-end save and before the periodic
+        # flush. A restricted slot's line must never exist without its mode, and
+        # a title update on an existing restricted line must not loosen its mode.
+        # Fold both values under the transcript lock; a persistent slot still
+        # leaves an ordinary line's mode to the transcript save.
+
+        def _fold_memory_mode(metadata: dict) -> bool:
+            # App-triggered generation must still own the live slot when the
+            # worker obtains the transcript lock, not only when it is queued.
+            if still_current is not None and not still_current():
+                return False
+            # Runs under the transcript lock. If an explicit title landed after
+            # this write was snapshotted, write the CURRENT values instead: of
+            # two racing writes, the one the lock lets through last then always
+            # carries the newest title, so the disk is right even when the
+            # loop's corrective re-write below fails.
+            if slot._title_epoch != epoch[0]:
+                epoch[0] = slot._title_epoch
+                _snapshot_title_fields()
+            retained_mode = stricter_memory_mode(
+                canonical_memory_mode(metadata.get("memory_mode")), slot_mode
+            )
+            if is_incognito_transcript(retained_mode):
+                fields["memory_mode"] = retained_mode
+            return True
+
+        try:
+            persisted = await asyncio.to_thread(
+                state.conversation_log.update_metadata_if,
+                history_key,
+                fields,
+                _fold_memory_mode,
+                after_commit_under_lock=lambda: _record_pending_memory_mode(
+                    pending_mode_slot, fields.get("memory_mode", "persistent")
+                ),
+            )
+            if not persisted:
+                logger.debug("Failed to persist title for slot %s", slot.key)
+                await restore_replacement_if_handover_did_not_land(
+                    state, slot.key, tightening, history_key
+                )
+                return False
+            apply_pending_slot_memory_mode(state, pending_mode_slot)
             logger.debug("Persisted title %r for slot %s", slot.title, slot.key)
         except Exception:
             logger.debug("Failed to persist title for slot %s", slot.key)
+            await restore_replacement_if_handover_did_not_land(
+                state, slot.key, tightening, history_key
+            )
             return False
-        if slot._title_epoch == epoch:
+        if slot._title_epoch == epoch[0]:
             return True
         logger.debug("Explicit title landed during persist for slot %s; re-persisting", slot.key)
 
@@ -1171,6 +1083,148 @@ def _is_low_signal_title(title: str, messages: list[dict[str, Any]]) -> bool:
     return title == _fallback_title_from_messages(messages)
 
 
+# ``dashboard.title_ticket_prefix``: a ticket key in the session's opening
+# message leads its AUTO title as ``KEY: summary``. The model's job is unchanged
+# (it still writes the 3-6 word summary with no punctuation); the key is copied
+# from the user's own text and wrapped on deterministically, so it can be
+# neither hallucinated nor mistranscribed.
+#
+# Two key shapes, matched case-sensitively as whole tokens:
+# - a tracker key, ``PROJ-1234``: a 2-10 character upper-case project key
+#   starting with a letter, a hyphen, and at least two digits. The two-digit
+#   floor keeps ``UTF-8`` and ``GPT-4`` out; standard names with a longer
+#   number (``SHA-256``, ``ISO-8601``) still match, which is why the setting is
+#   opt-in;
+# - a GitHub reference, ``#123``, not preceded by a word character, ``/``,
+#   ``&`` or ``#`` (so URL fragments, HTML entities and ``##`` headings are
+#   not read as one).
+# The first match in the opening message wins.
+_TITLE_TRACKER_KEY = r"(?<![A-Za-z0-9_-])[A-Z][A-Z0-9]{1,9}-\d{2,10}(?![A-Za-z0-9_-])"
+_TITLE_GITHUB_REF = r"(?<![\w/&#])#\d{1,9}(?!\w)"
+_TITLE_TICKET_KEY_RE = re.compile(f"{_TITLE_TRACKER_KEY}|{_TITLE_GITHUB_REF}")
+_TITLE_TICKET_SEPARATOR = ": "
+
+
+def _title_ticket_prefix_enabled() -> bool:
+    """Read ``dashboard.title_ticket_prefix``; False on any failure.
+
+    **Call this OFF the event loop**, for the same reason as
+    :func:`_ui_language`. A failed read leaves titles exactly as they were
+    before the setting existed.
+    """
+    try:
+        return bool(KiroCrewConfig.load().dashboard.title_ticket_prefix)
+    except Exception:
+        logger.debug("title_ticket_prefix lookup failed; titling without a ticket key")
+        return False
+
+
+def _ticket_key_from_messages(messages: list[dict[str, Any]]) -> str:
+    """The first ticket key in the first user message, or ``""``.
+
+    Only the OPENING message is read: it is where a session that exists to work
+    one ticket names it, and a key mentioned later in passing must not relabel
+    the session. Attachment paths are stripped first, as for the prompt, so a
+    key inside an uploaded file's name is not taken for the session's own.
+    """
+    for m in messages:
+        if m.get("role") != "user":
+            continue
+        text = _title_text(m.get("content", ""), _message_attachment_paths(m))
+        match = _TITLE_TICKET_KEY_RE.search(text)
+        return match.group(0) if match else ""
+    return ""
+
+
+def _split_ticket_prefix(title: str) -> tuple[str, str]:
+    """Split ``KEY: summary`` into ``(KEY, summary)``; ``("", title)`` otherwise."""
+    key, sep, summary = title.partition(_TITLE_TICKET_SEPARATOR)
+    if sep and summary and _TITLE_TICKET_KEY_RE.fullmatch(key):
+        return key, summary
+    return "", title
+
+
+async def _ticket_key_if_enabled(key: str) -> str:
+    """*key* when ``dashboard.title_ticket_prefix`` is on, else ``""``.
+
+    The setting is read (one thread hop, off the event loop) only when there is
+    a key to apply, so a session that names no ticket costs nothing and its
+    titling runs exactly as it did before the setting existed.
+    """
+    if not key:
+        return ""
+    return key if await asyncio.to_thread(_title_ticket_prefix_enabled) else ""
+
+
+def _current_ticket_key(title: str, messages: list[dict[str, Any]]) -> str:
+    """The key an existing title leads with, else the opening message's."""
+    return _split_ticket_prefix(title)[0] or _ticket_key_from_messages(messages)
+
+
+def _with_ticket_prefix(summary: str, key: str) -> str:
+    """``KEY: summary``, or *summary* unchanged when there is no key to add.
+
+    A summary that already names the key is left alone rather than repeating
+    it: the key is visible either way.
+    """
+    if not key or not summary or key in summary:
+        return summary
+    return f"{key}{_TITLE_TICKET_SEPARATOR}{summary}"
+
+
+# The drain records lost provenance, not a restored claim about who sent it.
+RESTORED_TURN_META_KEY = "turnProvenanceRestored"
+
+
+def _is_member_thread(slot: Any) -> bool:
+    """Whether *slot* is a crewmate's own DM thread (``mode == "member"``).
+
+    That thread is one long-lived conversation with one crewmate, and the
+    sidebar names it after the crewmate, so no background path may produce or
+    overwrite a title for it. A session a crewmate opens for its workers is an
+    ordinary slot (its mode is not ``member``) and is titled as usual.
+    """
+    return getattr(slot, "mode", "") == DM_SLOT_MODE
+
+
+def _counts_as_user_turn(slot: _ChatSlot, message: dict[str, Any]) -> bool:
+    """Whether *message* is a turn of the session's own user, for titling.
+
+    A user row an app sent counts only on that app's own slot. On a user's
+    session an app reaches through ``permissions.sessionApproval`` it is the
+    app's turn, and titling from it would let the app name the user's session.
+    A restored queue row has lost that attribution, so it is excluded too,
+    rather than trusting a disk stamp as proof of a human turn.
+    """
+    if message.get("role") != "user":
+        return False
+    meta = message.get("meta")
+    not_user_owned = isinstance(meta, dict) and (
+        meta.get(TURN_ACTOR_META_KEY) == "app" or meta.get(RESTORED_TURN_META_KEY) is True
+    )
+    return not not_user_owned or bool(slot._app)
+
+
+def _titling_messages(slot: _ChatSlot) -> list[dict[str, Any]]:
+    """``slot.messages`` without the turns :func:`_counts_as_user_turn` skips.
+
+    A skipped turn is the user row and every row after it up to the next user
+    row that counts, so the reply to an app's turn goes with it. What the
+    auto-title and its refresh read: the prompt, the truncated fallback, the
+    low-signal check and whether the user's turn was answered, so an app's
+    text never becomes or seeds the automatic name of a session it does not
+    own. The user-initiated regenerate reads every row.
+    """
+    kept: list[dict[str, Any]] = []
+    in_skipped_turn = False
+    for m in slot.messages:
+        if m.get("role") == "user":
+            in_skipped_turn = not _counts_as_user_turn(slot, m)
+        if not in_skipped_turn:
+            kept.append(m)
+    return kept
+
+
 async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
     """Background task: attempt to LLM-title a slot.
 
@@ -1191,6 +1245,8 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
     already writes ``meta_line["title"]`` for temporary slots regardless of
     this path — those sessions keep a transcript on disk for tab recovery.
     """
+    if _is_member_thread(slot):
+        return
     if slot._titled:
         return
     if slot._title_in_flight:
@@ -1199,17 +1255,23 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
         if any(m.get("role") == "assistant" and m.get("content") for m in slot.messages):
             slot._title_retry_pending = True
         return
-    user_count = sum(1 for m in slot.messages if m.get("role") == "user")
+    user_count = sum(1 for m in slot.messages if _counts_as_user_turn(slot, m))
     if user_count < 1 or user_count > _TITLE_MAX_ATTEMPTS:
         if user_count > _TITLE_MAX_ATTEMPTS and not slot._titled:
             # Gave up after repeated attempts — fall back to the truncated
             # first message with an ellipsis.
-            slot.title = _fallback_title_from_messages(slot.messages)
+            messages = _titling_messages(slot)
+            key = await _ticket_key_if_enabled(_ticket_key_from_messages(messages))
+            # A title may have landed during the config hop; it outranks ours.
+            if slot._titled or slot._title_in_flight:
+                return
+            summary = _fallback_title_from_messages(messages)
+            slot.title = _with_ticket_prefix(summary, key)
             slot._titled = True
             slot._title_origin = _TITLE_ORIGIN_AUTO
             # The fallback is an echo of the first message — flag it so the
             # refresh becomes due immediately rather than at the next milestone.
-            slot._title_low_signal = _is_low_signal_title(slot.title, slot.messages)
+            slot._title_low_signal = _is_low_signal_title(summary, messages)
             await _persist_title(state, slot)
             state.push_slot_title(slot.key, slot.title)
         return
@@ -1219,31 +1281,44 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
     # synchronously, so a moved epoch (or a set ``_titled``) means a
     # higher-precedence title is already in place and this attempt stands down.
     epoch = slot._title_epoch
-    messages = list(slot.messages)
+
+    def still_current() -> bool:
+        return state._slots.get(slot.key) is slot
+
+    messages = _titling_messages(slot)
     attempt_has_assistant = any(m.get("role") == "assistant" and m.get("content") for m in messages)
     logger.info("Auto-title: attempting for slot %s (turn %d)", slot.key, user_count)
 
     cancelled = False
     try:
+        # Read before generation, so every write below stays behind the race
+        # guard that follows the generation await.
+        key = await _ticket_key_if_enabled(_ticket_key_from_messages(messages))
         title = await _generate_title_via_kiro(
             state, messages, session_key=effective_session_key(slot)
         )
         logger.info("Auto-title: kiro returned %r for slot %s", title, slot.key)
         # RACE GUARD: an explicit title (manual rename / manual generate) may
         # have landed while we awaited generation. Keep it and discard ours.
-        if slot._titled or slot._title_epoch != epoch:
+        # A session closed and reopened under the same key is a NEW slot with
+        # its own epoch, so only identity tells it apart.
+        if slot._titled or slot._title_epoch != epoch or not still_current():
             logger.info(
                 "Auto-title: explicit title landed during generation for slot %s; keeping it",
                 slot.key,
             )
             return
         if title:
+            # The low-signal test reads the model's own summary: a key this
+            # wrapper adds is the user's chosen label, not an echo.
+            summary = title
+            title = _with_ticket_prefix(summary, key)
             # Animate the title in word-by-word, then finalize with the
             # complete title (full push + persist). The reveal is cosmetic-only
             # (it never assigns ``slot.title``) and stops if the epoch moves.
             await _reveal_title(state, slot, title, epoch=epoch)
             # Re-check after the reveal's awaits for the same reason.
-            if slot._titled or slot._title_epoch != epoch:
+            if slot._titled or slot._title_epoch != epoch or not still_current():
                 logger.info(
                     "Auto-title: explicit title landed during reveal for slot %s; keeping it",
                     slot.key,
@@ -1255,8 +1330,10 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
             # A title generated from a link/ticket-key opener can only restate
             # the link; flag it so the background refresh re-examines it as
             # soon as the first turn's transcript names the real topic.
-            slot._title_low_signal = _is_low_signal_title(title, messages)
-            await _persist_title(state, slot)
+            slot._title_low_signal = _is_low_signal_title(summary, messages)
+            await _persist_title(state, slot, still_current=still_current)
+            if not still_current():
+                return
             state.push_slot_title(slot.key, title)
         else:
             # LLM returned SKIP/empty. Show the truncated fallback name right
@@ -1267,7 +1344,9 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
             # definitive failure); on the on-send attempt leave it unlocked so
             # the end-of-turn retry can still upgrade the truncation to a real
             # LLM title.
-            slot.title = _fallback_title_from_messages(slot.messages)
+            current = _titling_messages(slot)
+            summary = _fallback_title_from_messages(current)
+            slot.title = _with_ticket_prefix(summary, key)
             slot._titled = attempt_has_assistant
             if attempt_has_assistant:
                 slot._title_origin = _TITLE_ORIGIN_AUTO
@@ -1275,8 +1354,10 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
                 # it so the refresh prompt (which reads the conversational tail
                 # and frames the task as keep-or-rename rather than
                 # title-or-SKIP) gets one immediate shot at a real name.
-                slot._title_low_signal = _is_low_signal_title(slot.title, slot.messages)
-            await _persist_title(state, slot)
+                slot._title_low_signal = _is_low_signal_title(summary, current)
+            await _persist_title(state, slot, still_current=still_current)
+            if not still_current():
+                return
             state.push_slot_title(slot.key, slot.title)
             logger.info(
                 "Auto-title: fell back to truncated message for slot %s (locked=%s)",
@@ -1304,7 +1385,7 @@ async def _maybe_auto_title(state: DashboardState, slot: _ChatSlot) -> None:
         # (chat_runner/chat_handlers create it), the title has been pushed by the
         # time we get here, so the wait costs the user nothing — and it keeps the
         # suggestion from becoming an unreferenced task the loop may drop.
-        if slot._titled and not cancelled:
+        if slot._titled and not cancelled and still_current():
             try:
                 await maybe_suggest_folder(state, slot)
             except asyncio.CancelledError:
@@ -1335,19 +1416,39 @@ async def title_then_refresh(state: DashboardState, slot: _ChatSlot) -> None:
     if pending is not None and not pending.done():
         await asyncio.wait([pending])
     await _maybe_auto_title(state, slot)
+    # A slot replaced at its key during the attempt is not refreshed: the
+    # refresh's mark write would land on the line its successor shares.
+    if state._slots.get(slot.key) is not slot:
+        return
     await maybe_refresh_title(state, slot)
+
+
+def _refresh_blocked(slot: _ChatSlot) -> bool:
+    """True when a background refresh must not start for ``slot``.
+
+    It needs an AUTO title (a manual rename locks it out) and no attempt already
+    in flight.
+    """
+    return (
+        _is_member_thread(slot)
+        or not slot._titled
+        or slot._title_origin != _TITLE_ORIGIN_AUTO
+        or slot._title_in_flight
+    )
 
 
 async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     """Background task: re-examine an AUTO title as the conversation evolves.
 
     The initial title is generated from the first message, before the session's
-    real task has emerged — so a long session's name often describes its
+    real task has emerged, so a long session's name often describes its
     opening pleasantry, and a session that fell back to the truncated first
     message keeps that truncation forever. Fired from ``chat_done`` (same
     call site as the initial titling), this re-runs the background ``_bg``
-    one-liner at the ``_TITLE_REFRESH_MILESTONES`` user-turn marks and swaps
-    the sidebar title when the model says the old one no longer fits.
+    one-liner at the ``_TITLE_REFRESH_MILESTONES`` user-turn marks, or every
+    ``dashboard.title_refresh_every_turns`` user turns when that cadence is
+    set, and swaps the sidebar title when the model says the old one no
+    longer fits.
 
     Token discipline (the whole point of doing this in the background instead
     of exposing a title tool to every chat):
@@ -1356,11 +1457,14 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
       rename is final; legacy titles with no stored origin rehydrate as "user"
       and are equally final.
     - Each milestone fires at most ONCE, attempt-counted: a KEEP/SKIP/prose
-      reply or an error consumes it (no retries). Two ordinary milestones plus
-      the low-signal early milestone = at most three extra one-liner calls over
-      a session's whole lifetime, and the early one only exists for sessions
-      whose title locked as a URL/ticket-key echo or as the truncated
-      first-message fallback (see ``_is_low_signal_title``).
+      reply or an error consumes it (no retries). On the built-in schedule the
+      two ordinary milestones plus the low-signal early milestone are at most
+      three extra one-liner calls over a session's whole lifetime, and the
+      early one only exists for sessions whose title locked as a URL/ticket-key
+      echo or as the truncated first-message fallback (see
+      ``_is_low_signal_title``). The opt-in cadence has no such cap: it spends
+      one call per N user turns, attempt-counted the same way, for as many
+      turns as the session holds (see ``_title_refresh_due``).
     - The consumed mark is persisted (``title_refresh_mark``) so a gateway
       restart cannot re-spend it.
     - The prompt is bounded exactly like the initial titling prompt (ten
@@ -1371,11 +1475,18 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     manual rename landing mid-generation is detected via ``_title_epoch`` and
     the refresh stands down.
     """
-    if not slot._titled or slot._title_origin != _TITLE_ORIGIN_AUTO:
+    if _refresh_blocked(slot):
         return
-    if slot._title_in_flight:
+    # Count first: the config thread hop below yields to the event loop, and a
+    # queued follow-up that lands during it opens the NEXT turn, which this
+    # refresh must not count.
+    user_count = sum(1 for m in slot.messages if _counts_as_user_turn(slot, m))
+    every = await asyncio.to_thread(_title_refresh_every)
+    # A manual rename or another turn's refresh may also have landed during the
+    # hop, and either must stand this attempt down BEFORE it consumes the
+    # milestone or spends the call.
+    if _refresh_blocked(slot):
         return
-    user_count = sum(1 for m in slot.messages if m.get("role") == "user")
     # A low-signal title (URL/ticket-key echo — see _is_low_signal_title) adds
     # the early milestone: the first turn's transcript is the FIRST moment the
     # session's real topic is visible, and a one-message "investigate this
@@ -1387,8 +1498,7 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     # below user_count (the mark jumps past them all). A session that first
     # becomes refresh-eligible at turn >= 24 — e.g. rehydrated mid-life — gets
     # ONE refresh, not a catch-up burst. The budget is a ceiling, not a quota.
-    due = any(slot._title_refresh_mark < m <= user_count for m in milestones)
-    if not due:
+    if not _title_refresh_due(slot._title_refresh_mark, user_count, every, milestones):
         return
     slot._title_in_flight = True
     # Consume the milestone up-front: a failed/KEEP attempt must not be retried
@@ -1399,6 +1509,10 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
     # ``_persist_title`` writes below).
     slot._title_low_signal = False
     epoch = slot._title_epoch
+
+    def still_current() -> bool:
+        return state._slots.get(slot.key) is slot
+
     logger.info("Title refresh: attempting for slot %s (turn %d)", slot.key, user_count)
     try:
         # Persist the consumed mark BEFORE the generation await, so neither an
@@ -1415,15 +1529,34 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
                 slot.key,
             )
             return
+        messages = _titling_messages(slot)
+        # A fork keeps its marker in front of whatever name replaces this one;
+        # the model judges the name without it.
+        marker = FORK_TITLE_MARKER if slot.title.startswith(FORK_TITLE_MARKER) else ""
+        base_title = slot.title.removeprefix(marker)
+        # The model judges the summary alone, as it wrote it; the key is
+        # carried over unchanged, so a long session keeps the label it opened
+        # with even after its opening message leaves the window.
+        key = await _ticket_key_if_enabled(_current_ticket_key(base_title, messages))
+        current_title = base_title
+        if key:
+            current_title = _split_ticket_prefix(base_title)[1]
         title = await _generate_refreshed_title(
-            state, list(slot.messages), slot.title, session_key=effective_session_key(slot)
+            state, messages, current_title, session_key=effective_session_key(slot)
         )
         if not title:
             # KEEP/SKIP/prose/error — the current title stands.
             return
+        title = f"{marker}{_with_ticket_prefix(title, key)}"
         # RACE GUARD: a manual rename landing during generation bumps the epoch
         # and flips the origin to "user" — its title outranks ours, keep it.
-        if slot._title_epoch != epoch or slot._title_origin != _TITLE_ORIGIN_AUTO:
+        # A session closed and reopened under the same key is a NEW slot with
+        # its own epoch, so only identity tells it apart.
+        if (
+            slot._title_epoch != epoch
+            or slot._title_origin != _TITLE_ORIGIN_AUTO
+            or not still_current()
+        ):
             logger.info(
                 "Title refresh: explicit title landed during generation for slot %s; keeping it",
                 slot.key,
@@ -1432,13 +1565,17 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
         if title == slot.title:
             return
         slot.title = title
-        await _persist_title(state, slot)
+        await _persist_title(state, slot, still_current=still_current)
         # RE-CHECK after the persist await: a rename landing during the write
         # has already pushed ITS name — pushing our now-stale local ``title``
         # would overwrite it in the sidebar (the disk is already correct via
         # the persist loop; this guards the broadcast). Push the slot's
         # CURRENT title only if no explicit title superseded ours.
-        if slot._title_epoch != epoch or slot._title_origin != _TITLE_ORIGIN_AUTO:
+        if (
+            slot._title_epoch != epoch
+            or slot._title_origin != _TITLE_ORIGIN_AUTO
+            or not still_current()
+        ):
             logger.info(
                 "Title refresh: explicit title landed during persist for slot %s; keeping it",
                 slot.key,
@@ -1453,16 +1590,142 @@ async def maybe_refresh_title(state: DashboardState, slot: _ChatSlot) -> None:
         slot._title_in_flight = False
 
 
-async def api_chat_slot_generate_title(request: web.Request) -> web.Response:
-    """POST /api/chat/slots/{slot}/generate-title — manually trigger title generation."""
-    state: DashboardState = request.app["state"]
-    name = request.match_info["slot"]
-    slot = state._slots.get(name)
-    if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+def _latest_human_question(slot: _ChatSlot) -> dict[str, Any] | None:
+    """The newest user row a PERSON typed into *slot* that has titleable text.
 
-    logger.info("Manual title generation requested for slot %s", name)
-    fallback_is_placeholder = False
+    An allowlist, not an exclusion list: only a row carrying
+    ``history.HUMAN_TURN_META_KEY`` counts, so an automation envelope (a cron
+    report, an auto-nudge, a session_send, a subagent completion), an app's
+    turn and a restored queue row can never name the session. A copied row
+    keeps its ``meta``, so the marker survives a fork.
+    """
+    for message in reversed(_titling_messages(slot)):
+        if message.get("role") != "user":
+            continue
+        meta = message.get("meta")
+        if not (isinstance(meta, dict) and meta.get(HUMAN_TURN_META_KEY) is True):
+            continue
+        if _title_text(message.get("content", ""), _message_attachment_paths(message)):
+            return message
+    return None
+
+
+async def refresh_forked_title(state: DashboardState, slot: _ChatSlot) -> None:
+    """Background task: rename a fork child after the latest question it holds.
+
+    A fork is born titled ``↳ Fork of <parent>``, which names the PARENT's
+    topic; once the fork is acknowledged, ``chat_fork.fork_slot`` schedules this
+    one pass so the child is named for the question the user branched at.
+    Only an AUTO title is touched (``_refresh_blocked``): a fork whose parent
+    carried a manual name keeps ``↳ Fork of <that name>`` as a final title, and
+    an agent fork given an explicit title is "user" too.
+
+    One initial-title generation over the latest person-typed question alone
+    (``_latest_human_question``), never the copied opening turns. The fork
+    marker stays in front of the generated name, because the sidebar shows no
+    other sign that a session is a fork. The parent is never read or written.
+
+    Bounded: at most ``_FORK_TITLE_MAX_PASSES`` generations, no retry on a
+    SKIP or an error, and ``_title_in_flight`` keeps the background refresh off
+    the slot meanwhile. A manual rename or a generate-title click landing during
+    generation bumps the epoch and wins. A newer question typed into the child
+    while a pass generates makes that pass's result stale: it is discarded and
+    the next pass names the child from the newer question. With no usable
+    question the fork title stays. Never raises.
+    """
+    if _refresh_blocked(slot):
+        return
+    question = _latest_human_question(slot)
+    if question is None:
+        return
+    slot._title_in_flight = True
+    epoch = slot._title_epoch
+
+    history_key = slot_history_key(slot)
+
+    def still_current() -> bool:
+        # A permanent delete unlinks the transcript and then awaits before it
+        # removes the slot, so slot identity alone would let the metadata upsert
+        # recreate the deleted fork as a title-only line during that window.
+        if state._slots.get(slot.key) is not slot:
+            return False
+        log = state.conversation_log
+        return log is None or not log.delete_in_flight(history_key)
+
+    def superseded() -> bool:
+        return (
+            slot._title_epoch != epoch
+            or slot._title_origin != _TITLE_ORIGIN_AUTO
+            or not still_current()
+        )
+
+    try:
+        for _ in range(_FORK_TITLE_MAX_PASSES):
+            key = await _ticket_key_if_enabled(_ticket_key_from_messages([question]))
+            summary = await _generate_title_via_kiro(
+                state, [question], session_key=effective_session_key(slot)
+            )
+            if superseded():
+                logger.info(
+                    "Fork title: explicit title landed during generation for slot %s; keeping it",
+                    slot.key,
+                )
+                return
+            newest = _latest_human_question(slot)
+            if newest is not question:
+                # The user asked something new in the child meanwhile; a name
+                # for the question it branched at would already be stale.
+                if newest is None:
+                    return
+                question = newest
+                continue
+            if not summary:
+                return
+            title = f"{FORK_TITLE_MARKER}{_with_ticket_prefix(summary, key)}"
+            if title == slot.title:
+                return
+            prior = (slot.title, slot._title_low_signal, slot._title_refresh_mark)
+            slot.title = title
+            slot._title_low_signal = False
+            # This pass names the session for where it stands now, so the
+            # refresh milestones the copied turns already crossed are spent,
+            # exactly as one ``maybe_refresh_title`` attempt spends them.
+            user_count = sum(1 for m in slot.messages if _counts_as_user_turn(slot, m))
+            slot._title_refresh_mark = max(slot._title_refresh_mark, user_count)
+            durable = await _persist_title(state, slot, still_current=still_current)
+            if superseded():
+                return
+            if not durable:
+                # Persist before publish: a reload would restore the inherited
+                # title and the old mark, so memory must not run ahead of disk.
+                slot.title, slot._title_low_signal, slot._title_refresh_mark = prior
+                logger.warning(
+                    "Fork title: rename not durable for slot %s; keeping the fork title",
+                    slot.key,
+                )
+                return
+            state.push_slot_title(slot.key, slot.title)
+            logger.info("Fork title: renamed slot %s to %r", slot.key, title[:80])
+            return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Fork title refresh failed for slot %s", slot.key, exc_info=True)
+    finally:
+        slot._title_in_flight = False
+
+
+async def generate_manual_title(state: DashboardState, slot: _ChatSlot) -> str:
+    """The title "Regenerate title" would give *slot* now, or ``""`` for none.
+
+    Shared by the sidebar route and the ``session_generate_title`` verb. Makes
+    one titling-model call and changes nothing on the slot. ``""`` means the
+    model and the heuristic fallback both had nothing better than the
+    placeholder, so the caller keeps the current title. A crewmate's own DM
+    thread always answers ``""``: its name is the crewmate's, not generated.
+    """
+    if _is_member_thread(slot):
+        return ""
     try:
         # Window the RECENT conversational tail: the user reaches for
         # "Regenerate title" when the current name no longer fits, so the
@@ -1475,29 +1738,186 @@ async def api_chat_slot_generate_title(request: web.Request) -> web.Response:
         # auto-title path (which passes the full list and wants the opening
         # messages) is unaffected.
         convo = [m for m in slot.messages if m.get("role") in _TITLE_PROMPT_ROLES]
+        # Same label as the automatic paths: the key the title already leads
+        # with, else the opening message's.
+        key = await _ticket_key_if_enabled(_current_ticket_key(slot.title, convo))
         title = await _generate_title_via_kiro(
             state, convo[-_TITLE_PROMPT_WINDOW:], session_key=effective_session_key(slot)
         )
+        return _with_ticket_prefix(title, key)
     except Exception:
-        logger.debug("Title generation failed for slot %s", name, exc_info=True)
+        logger.debug("Title generation failed for slot %s", slot.key, exc_info=True)
         title = _fallback_title_from_messages(slot.messages)
-        fallback_is_placeholder = title == NEW_SESSION_TITLE
+        return "" if title == NEW_SESSION_TITLE else title
 
-    if title and not fallback_is_placeholder:
-        slot.title = title
-        slot._titled = True
-        # Still an LLM-generated name, so it stays refreshable ("auto"). The
-        # epoch bump makes any in-flight background attempt stand down instead
-        # of clobbering the title the user just asked for.
-        slot._title_origin = _TITLE_ORIGIN_AUTO
-        # Generated from the recent conversational tail, so it is not a
-        # first-message echo — the early low-signal refresh must not re-fire.
-        slot._title_low_signal = False
-        slot._title_epoch += 1
-        await _persist_title(state, slot)
+
+async def apply_regenerated_title(
+    state: DashboardState,
+    slot: _ChatSlot,
+    title: str,
+    *,
+    still_current: Callable[[], bool] | None = None,
+) -> bool:
+    """Set a freshly generated *title* on *slot*, save it, and show it.
+
+    Every field is assigned BEFORE the first await, so a caller that gates the
+    target synchronously and then awaits this coroutine has no suspension
+    between its gate and the change, as with :func:`apply_manual_title`.
+
+    The title stays refreshable (``auto``) and replaces a hand-set one, which
+    is what the sidebar's "Regenerate title" has always done. The sidebar push
+    is skipped when an explicit title landed during the save (its own push
+    already ran) or when the slot left its key, so a successor opened under the
+    same key never shows this session's title. Returns whether the save landed.
+    """
+    slot.title = title
+    slot._titled = True
+    # Still an LLM-generated name, so it stays refreshable ("auto"). The
+    # epoch bump makes any in-flight background attempt stand down instead
+    # of clobbering the title the user just asked for.
+    slot._title_origin = _TITLE_ORIGIN_AUTO
+    # Generated from the recent conversational tail, so it is not a
+    # first-message echo — the early low-signal refresh must not re-fire.
+    slot._title_low_signal = False
+    slot._title_epoch += 1
+    epoch = slot._title_epoch
+    saved = await _persist_title(state, slot, still_current=still_current)
+    # RE-CHECK after the persist await, mirroring the refresh path: a rename
+    # landing during the write has already pushed ITS name, so pushing our
+    # now-stale local ``title`` would overwrite it in the sidebar (the disk
+    # is already correct via the persist loop; this guards the broadcast).
+    if slot._title_epoch == epoch and state._slots.get(slot.key) is slot:
         state.push_slot_title(slot.key, title)
+    return saved
 
-    return web.json_response({"ok": True, "title": "" if fallback_is_placeholder else title})
+
+async def api_chat_slot_generate_title(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/generate-title — manually trigger title generation."""
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return slot_not_found()
+
+    logger.info("Manual title generation requested for slot %s", name)
+    epoch = slot._title_epoch
+    title = await generate_manual_title(state, slot)
+
+    if request.get("app", "") and state._slots.get(name) is not slot:
+        return slot_not_found()
+
+    # RACE GUARD: a manual rename landing during the generation await bumps the
+    # epoch, and its name outranks ours -- stand down instead of overwriting it,
+    # the same contract ``maybe_refresh_title`` states in its docstring. The
+    # empty title is this endpoint's existing "nothing was applied" answer, so
+    # the user keeps their own name with no client change.
+    if slot._title_epoch != epoch:
+        logger.info(
+            "Manual title generation: explicit title landed during generation "
+            "for slot %s; keeping it",
+            name,
+        )
+        return web.json_response({"ok": True, "title": ""})
+
+    if title:
+        is_app = bool(request.get("app", ""))
+
+        def _still_current() -> bool:
+            return state._slots.get(name) is slot
+
+        applied_epoch = slot._title_epoch + 1
+        await apply_regenerated_title(
+            state, slot, title, still_current=_still_current if is_app else None
+        )
+        if is_app and state._slots.get(name) is not slot:
+            return slot_not_found()
+        if slot._title_epoch != applied_epoch:
+            logger.info(
+                "Manual title generation: explicit title landed during persist "
+                "for slot %s; keeping it",
+                name,
+            )
+            return web.json_response({"ok": True, "title": ""})
+
+    return web.json_response({"ok": True, "title": title})
+
+
+def name_member_thread(state: DashboardState, slot: Any, name: str) -> bool:
+    """Give a crewmate's own DM thread its crewmate's name as a final title.
+
+    A member thread is never titled by the background paths (``_is_member_thread``),
+    so without this it would have no stored title at all and every surface that
+    reads the title (header, tab title, command palette, history) would fall back
+    to the slot key. The origin is ``member``: the refresh is locked out like for a
+    rename, but this function may replace the title again, so a thread follows its
+    crewmate's display name the next time it is opened.
+
+    A title a person set (origin ``user``, whatever its text) is kept. An
+    untitled thread, a generated (``auto``) one and an earlier stored name take
+    the name. It runs each time the thread is opened, and it does not persist: a
+    write here would create a history line for a thread that has no turn yet, so
+    the new title reaches disk with the slot's next save. Returns whether the
+    title changed.
+    """
+    # A display name is config text: redact it like every other title before it is
+    # stored or broadcast (the roster masks a credential-shaped name the same way).
+    name, _ = redact_exfiltration_urls((name or "").strip()[:200])
+    name, _ = redact_credentials(name)
+    if not name:
+        return False
+    if slot._titled and slot._title_origin == _TITLE_ORIGIN_USER:
+        return False
+    if slot._titled and slot._title_origin == _TITLE_ORIGIN_MEMBER and slot.title == name:
+        return False
+    slot.title = name
+    slot._titled = True
+    slot._title_origin = _TITLE_ORIGIN_MEMBER
+    slot._title_low_signal = False
+    slot._title_epoch += 1
+    state.push_slot_title(slot.key, slot.title, full=False)
+    state.push_slot_patch(slot.key, ("title",))
+    return True
+
+
+async def apply_manual_title(state: DashboardState, slot: Any, title: str) -> bool:
+    """Set *title* on *slot* as a final, manual name, persist it and broadcast it.
+
+    Shared by the sidebar rename route, the ``session_rename`` session-control
+    verb and a channel's ``/title`` on a live slot
+    (``channel_slots.rename_channel_title_live``), so every rename lands exactly
+    like a person's. The caller has already validated *title*.
+
+    Every field is assigned BEFORE the first await, so a caller that gates the
+    target synchronously and then awaits this coroutine has no suspension between
+    its gate and the write.
+
+    Returns whether the title reached the conversation history. Saving is
+    best-effort by dashboard contract: on
+    a failed write the slot keeps the new title and stays authoritative, it is
+    still broadcast, and the slot's next full save writes it to disk. Nothing is
+    rolled back, so a newer rename that overlaps this one never gets an older
+    title restored over it. A caller that reports the outcome to someone who
+    acts on it (``session_rename``) must say the title is live but not yet saved
+    rather than report plain success.
+    """
+    slot.title = title
+    slot._titled = True
+    # A manual rename is final: origin "user" locks the background refresh out
+    # permanently, and the synchronous epoch bump makes any in-flight
+    # background attempt stand down instead of clobbering this name.
+    slot._title_origin = _TITLE_ORIGIN_USER
+    slot._title_epoch += 1
+    saved = await _persist_title(state, slot)
+    if not saved:
+        logger.warning("Rename of slot %s is live but not yet saved", slot.key)
+    # ``slot_title`` keeps every consumer's title current; the patch carries the
+    # projected (redacted) title to patch-capable tabs in place of a full list.
+    # Published from the slot, not from *title*: a rename that overlapped this
+    # write has already replaced it, and a stale broadcast would undo that on
+    # screen.
+    state.push_slot_title(slot.key, slot.title, full=False)
+    state.push_slot_patch(slot.key, ("title",))
+    return saved
 
 
 async def api_chat_slot_rename(request: web.Request) -> web.Response:
@@ -1506,7 +1926,7 @@ async def api_chat_slot_rename(request: web.Request) -> web.Response:
     name = request.match_info["slot"]
     slot = state._slots.get(name)
     if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
@@ -1516,17 +1936,12 @@ async def api_chat_slot_rename(request: web.Request) -> web.Response:
     title = body.get("title", "").strip()[:200]
     if not title:
         return web.json_response({"error": "title required", "code": "title_required"}, status=400)
-    slot.title = title
-    slot._titled = True
-    # A manual rename is final: origin "user" locks the background refresh out
-    # permanently, and the synchronous epoch bump makes any in-flight
-    # background attempt stand down instead of clobbering this name.
-    slot._title_origin = _TITLE_ORIGIN_USER
-    slot._title_epoch += 1
-    await _persist_title(state, slot)
-    state.push_slot_title(slot.key, title)
+    # Best-effort save, as on main: the live slot stays authoritative and its
+    # next full save writes the title (see ``apply_manual_title``).
+    await apply_manual_title(state, slot, title)
+    request_app = request.get("app", "")
     sel().log_api_access(
-        caller="dashboard",
+        caller=request_app or "dashboard",
         operation="chat.slot_rename",
         outcome="allowed",
         source="dashboard",

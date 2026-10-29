@@ -283,12 +283,49 @@ def test_main_passes_the_capped_env_to_every_command(gate, monkeypatch) -> None:
     seen: list[dict] = []
 
     def fake_run(cmd, cwd, env=None, **_kwargs):
-        seen.append(env or {})
+        if cmd[0] != "git":
+            seen.append(env or {})
         return subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(gate.subprocess, "run", fake_run)
     assert gate.main([]) == 0
     assert seen and 2 <= int(seen[0]["PYTEST_XDIST_AUTO_NUM_WORKERS"]) <= 12
+
+
+def test_gate_env_supplies_the_i18n_base_ref(gate, monkeypatch) -> None:
+    """Without I18N_BASE_REF the [changed-values] style tests skip green, so a
+    local run passed catalog values CI failed. The gate supplies the merge-base."""
+    monkeypatch.delenv("I18N_BASE_REF", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="abc123\n", stderr="")
+
+    monkeypatch.setattr(gate.subprocess, "run", fake_run)
+    env = gate.gate_env("origin/main")
+    assert env["I18N_BASE_REF"] == "abc123"
+    assert calls == [["git", "merge-base", "HEAD", "origin/main"]]
+    assert 2 <= int(env["PYTEST_XDIST_AUTO_NUM_WORKERS"]) <= 12
+
+
+def test_gate_env_keeps_an_explicit_i18n_base_ref(gate, monkeypatch) -> None:
+    monkeypatch.setenv("I18N_BASE_REF", "deadbeef")
+
+    def fail_run(*_a, **_k):
+        raise AssertionError("must not resolve a base the caller already set")
+
+    monkeypatch.setattr(gate.subprocess, "run", fail_run)
+    assert gate.gate_env("origin/main")["I18N_BASE_REF"] == "deadbeef"
+
+
+def test_gate_env_leaves_the_ref_unset_when_the_base_cannot_resolve(gate, monkeypatch) -> None:
+    monkeypatch.delenv("I18N_BASE_REF", raising=False)
+    monkeypatch.setattr(
+        gate.subprocess, "run",
+        lambda cmd, **_k: subprocess.CompletedProcess(cmd, 128, stdout="", stderr="bad"),
+    )
+    assert "I18N_BASE_REF" not in gate.gate_env("origin/nope")
 
 
 def test_unreadable_diff_fails_closed(gate, monkeypatch) -> None:
@@ -656,3 +693,21 @@ def test_dry_run_against_the_real_repo_never_plans_a_full_suite(gate, monkeypatc
         # Every rc==0 plan names CI as the full suite's owner, in one of two
         # spellings depending on whether there was anything related to select.
         assert "full suite deferred to CI" in err or "the full suite runs in CI" in err, err
+
+
+def test_the_reference_scan_reads_each_test_file_once_and_drops_it(gate) -> None:
+    """The selector streams the test tree; it must not memoise what it read.
+
+    ``related_targets`` reads every collectable test file once per call to match
+    it against the diff's tokens. An earlier revision wrapped that read in
+    ``functools.lru_cache(maxsize=None)``, so the whole tree -- ~3,200 files,
+    ~100 MB of ``str`` -- stayed resident for the life of whichever process had
+    imported the selector: the gate itself, or the pytest worker running the
+    end-to-end dry run above (+190 MiB high-water, outliving the test). The
+    re-read it saved is 0.4 s. Pinned by shape: the read seam is a plain function.
+    """
+    selector = importlib.import_module("run_scoped_tests")
+    assert not hasattr(selector._read_text, "cache_info"), (
+        "run_scoped_tests._read_text is memoised again; the reference scan must "
+        "read each file once and drop it, not retain the test tree's text"
+    )

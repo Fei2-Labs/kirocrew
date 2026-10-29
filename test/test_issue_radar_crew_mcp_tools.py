@@ -6,8 +6,9 @@ these two MCP tools are the crew's memory, and every property asserted here is
 load-bearing for a cold resume:
 
   * the ledger must be REACHABLE from an agent session, which has no dashboard
-    credential (httpOnly cookie, ``KIROCREW_INTERNAL_SECRET`` stripped from agent
-    env, ``.local_secret`` on the sensitive-path denylist) — hence the
+    credential (httpOnly cookie, an internal secret the gateway mints in-process
+    and never puts in an agent's env, ``.local_secret`` on the sensitive-path
+    denylist) — hence the
     internal-secret allowlist entries, and hence a raw HTTP call earning 403;
   * a partial write must never erase what an earlier write stored, or a resume
     reads back a ledger emptier than the work it describes;
@@ -26,8 +27,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from turn_harness import SlotSpec, TurnScript, run_turn
 
 from kiro_crew import mcp_core
+from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, STOP_REASON_END_TURN, AcpEvent
 from kiro_crew.dashboard.token_auth import token_auth_middleware
 from kiro_crew.validation import MCP_CORE_SCHEMAS, ValidationError, validate_tool_args
 
@@ -58,6 +61,9 @@ CREW_PAYLOAD = {
     "recent_skips": [{"number": 91, "reason": "needs a design decision", "scope": "needs-design"}],
     "counts": {"open": 1},
 }
+
+_ANSWER = AcpEvent(kind=EVENT_TEXT_CHUNK, text="swept the queue")
+_LANDED = AcpEvent(kind=EVENT_COMPLETE, stop_reason=STOP_REASON_END_TURN)
 
 
 async def _ok_handler(request: web.Request) -> web.Response:
@@ -198,6 +204,17 @@ class TestGatewayPathsAreReachableWithTheInternalSecret(unittest.TestCase):
 
 
 class TestToolRegistration(unittest.TestCase):
+    def setUp(self):
+        # The listing follows app enablement, and the isolated test home
+        # has no app installed, so Issue Radar is switched on at the one seam the
+        # listing reads. The descriptor CONTENT asserted below is the same either
+        # way; this only makes the tools visible to ``_list_tools``.
+        from kiro_crew.mcp_tools import apps as apps_tools
+
+        patcher = patch.object(apps_tools, "app_enabled_state", lambda name: name == "issue-radar")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_both_schemas_are_registered(self):
         # An unregistered tool's args pass through raw and its ValidationError
         # escapes the stdio loop, killing kirocrew-core for the whole session.
@@ -496,7 +513,6 @@ class TestAnAutoNudgeTurnResolvesTheSameIdentityAsADirectTurn:
         slot = MagicMock()
         slot.key = slot_key
         slot.running = False
-        slot._in_stage_execution = False
         slot._closing = False
         slot.mode = ""
         slot.memory_mode = "persistent"
@@ -549,7 +565,7 @@ class TestAnAutoNudgeTurnResolvesTheSameIdentityAsADirectTurn:
         async def _fake_run_chat(state, target_slot, message, **kwargs):
             # Stand in for the runner's identity step verbatim: the real
             # _run_chat computes session_key = effective_session_key(slot) and
-            # hands THAT to publish_turn_identity (chat_runner.py). Recording the
+            # hands THAT to publish_turn_identity (chat_turn/turn_admission.py). Recording the
             # key the shared writer receives is recording the identity the crew
             # tools will resolve.
             published.append(effective_session_key(target_slot))
@@ -607,27 +623,30 @@ class TestAnAutoNudgeTurnResolvesTheSameIdentityAsADirectTurn:
             "relies on is broken at the source"
         )
 
-    def test_the_shared_identity_writer_is_still_the_one_run_chat_calls(self):
-        """The construction the refutation rests on: ONE writer, called by _run_chat.
+    @pytest.mark.asyncio
+    async def test_a_dashboard_turn_publishes_the_slots_own_identity(self):
+        """The construction the refutation rests on: the real turn publishes it.
 
-        If ``_run_chat`` stopped importing/calling ``publish_turn_identity``, the
-        nudge turn (and the human turn) would publish no identity at all and the
-        crew tools would fail closed. Asserting the wiring by source keeps the
-        "correct by construction" claim honest: the property tests above stub the
-        writer, so only this guards the real edge between the runner and the one
-        shared writer.
+        Through the real ``_run_chat``: one turn on the crew's slot publishes
+        exactly ``effective_session_key(slot)`` -- the key the strict gate reads
+        back -- through the session manager's pid mapping. If ``_run_chat``
+        stopped calling the shared writer, a nudge or human turn would publish no
+        identity and every crew tool would refuse; if it passed the bare slot key,
+        the mapping would name a session nothing resolves.
         """
+        record = await run_turn(
+            TurnScript(events=[_ANSWER, _LANDED]), slot=SlotSpec(key="crew-c_7f3a")
+        )
+        published = [call.args[0] for call in record.session_calls if call.name == "get_pid"]
+        assert published == ["dashboard:crew-c_7f3a"]
+        assert record.stop_reason == STOP_REASON_END_TURN
+
+    def test_the_shared_writer_maps_the_key_it_is_handed(self):
+        """The writer keys off the session key it is handed, not a re-resolve."""
         import inspect
 
-        from kiro_crew.dashboard import chat_runner
         from kiro_crew.messaging import identity
 
-        src = inspect.getsource(chat_runner._run_chat)
-        assert "publish_turn_identity" in src, (
-            "_run_chat no longer calls the shared identity writer; a nudge or "
-            "human turn would publish no session identity and crew tools refuse"
-        )
-        # The writer keys off the slot's session key it is handed, not a re-resolve.
         writer_src = inspect.getsource(identity.publish_turn_identity)
         assert "session_key" in inspect.signature(identity.publish_turn_identity).parameters
         assert "get_pid" in writer_src, (

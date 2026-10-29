@@ -1,16 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 // The title cluster moved into the shared SessionTitleControl (also mounted in
 // every split-view pane header); the row and its trailing controls stay in
-// ChatPage. The contract spans both files.
+// ChatTitleOverlay. The contract spans both files.
+// The page composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page, those owners and the control.
+const PAGES_DIR = join(__dirname, '..', 'pages')
+const OWNER_DIR = join(PAGES_DIR, 'chat', 'page')
 const src = async () => {
-  const [page, control] = await Promise.all([
-    readFile(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8'),
-    readFile(join(__dirname, '..', 'pages', 'chat', 'SessionTitleControl.tsx'), 'utf8'),
+  const ownerFiles = (await readdir(OWNER_DIR)).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+  const siblingFiles = (await readdir(PAGES_DIR)).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
+  const [page, owners, siblings, control] = await Promise.all([
+    readFile(join(PAGES_DIR, 'ChatPage.tsx'), 'utf8'),
+    Promise.all(ownerFiles.map(f => readFile(join(OWNER_DIR, f), 'utf8'))),
+    Promise.all(siblingFiles.map(f => readFile(join(PAGES_DIR, f), 'utf8'))),
+    readFile(join(PAGES_DIR, 'chat', 'SessionTitleControl.tsx'), 'utf8'),
   ])
-  return page + '\n' + control
+  return [page, ...owners, ...siblings, control].join('\n')
 }
 
 // A long session title pushed the trailing header controls off screen: measured at
@@ -36,8 +43,10 @@ describe('session header at phone widths', () => {
 
   it('lets the editing input shrink too', async () => {
     const s = await src()
-    // `flex-none` plus a `size` attribute refuses to shrink at all.
-    expect(s).toMatch(/session-header-title[^"]*min-w-0 flex-1 outline-hidden md:max-w-\[50vw\]/)
+    // `flex-none` plus a `size` attribute refuses to shrink at all. (The
+    // editor keeps the shared Input's own chrome now -- #13050 -- so its
+    // outline handling comes from the primitive, not from this class list.)
+    expect(s).toMatch(/session-header-title[^"]*min-w-0 flex-1 md:max-w-\[50vw\]/)
     expect(s, 'flex-none would pin the input at its size attribute')
       .not.toMatch(/session-header-title[^"]*flex-none/)
   })
@@ -55,6 +64,9 @@ describe('session header at phone widths', () => {
     // `group/title` is the keyboard-reveal hook for the Pen; the squeeze
     // contract is the flex/min-w-0 pair that follows it.
     expect(s, 'the clickable wrapper').toMatch(/<Clickable className="(?:group\/title )?flex min-w-0 items-center gap-1"/)
-    expect(s, 'the editing cluster').toMatch(/flex min-w-0 flex-1 items-center gap-1 px-1\.5/)
+    // Closing quote included: the editing wrapper carries NO padding of its
+    // own -- the editor's border and padding stand in for the pill's, so the
+    // header keeps its height while editing (#13050).
+    expect(s, 'the editing cluster').toMatch(/flex min-w-0 flex-1 items-center gap-1"/)
   })
 })

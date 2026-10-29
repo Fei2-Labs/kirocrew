@@ -93,10 +93,11 @@ class _WaitsMixin(ManagerComponent):
             # only FROM ``running``, the run's own ``running`` mark is itself
             # posted (``taskq_mark``), and a posted write is not ordered against
             # an inline one. Written inline here, a wait carried by the run's
-            # FIRST stream frame reaches the row while it is still ``starting``,
-            # is refused, and the late ``running`` write then leaves the row
-            # ``running`` with no durable wait reason at all. On the store's one
-            # writer thread the two land in submission order instead.
+            # first stream frame on its own session reaches the row while it is
+            # still ``starting``, is refused, and the late ``running`` write
+            # then leaves the row ``running`` with no durable wait reason at
+            # all. On the store's one writer thread the two land in submission
+            # order instead.
             self._post_store_write(
                 store,
                 f"wait write {info.id}",
@@ -396,6 +397,16 @@ class _WaitsMixin(ManagerComponent):
             )
         except RuntimeError:
             pass
+        # A granted resume is a point the parent's wave settles, so it re-publishes
+        # the parent's queued depth like a terminal does. The resume entry itself
+        # was never counted (``entry_is_resident_resume``), but the wait that just
+        # ended -- a dependency, a permission answer, an input -- has no terminal of
+        # its own to answer a card that missed a frame. Guarded: an advisory emit
+        # must never cost the run its slot.
+        try:
+            self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
+        except Exception:
+            _glue_logger.debug("queue-depth re-emit failed after a resume grant", exc_info=True)
         _glue_logger.info("Subagent %s: resumed (slot re-admitted)", info.id)
         return True
 
@@ -673,7 +684,9 @@ class _WaitsMixin(ManagerComponent):
         if outcome.fail_parent:
             for sibling in outcome.cancel_siblings:
                 self._cancel_live_or_row(sibling, reason=_waits.WAIT_REASON_CHILD_FAILED)
-            if parent is not None and not parent.done:
+            # A parent that claimed its completed ending is ``done`` here too:
+            # its success is already counted, so no error is stamped on it.
+            if parent is not None and not parent.done and not parent._ending_claimed:
                 parent.error = parent.error or (
                     f"child {child.id} {state} (on_child_failure=fail_parent)"
                 )
@@ -690,8 +703,11 @@ class _WaitsMixin(ManagerComponent):
             self.request_resume(parent, reason=f"last awaited child {child.id} {state}")
 
     def _cancel_live_or_row(self, agent_id: str, *, reason: str) -> None:
-        info = self._manager._agents.get(agent_id)
-        if info is not None and not info.done:
+        """Cancel a row this process runs through ``cancel``, any other through
+        the ledger. A row with its start in flight (``_live_agent_ids``) is
+        this process's: ``cancel`` joins the start and reaps what it registers,
+        where ``cancel_tree`` would cancel the row under a taken start."""
+        if agent_id in self._live_agent_ids():
             self._schedule_cancel(agent_id)
             return
         store = self.taskq_store()
@@ -716,8 +732,18 @@ class _WaitsMixin(ManagerComponent):
             pass
 
     def _live_agent_ids(self) -> frozenset[str]:
-        """The ids this process is still running, read on the loop that owns them."""
-        return frozenset(i.id for i in self._manager._agents.values() if not i.done)
+        """The ids this process is still running, read on the loop that owns them.
+
+        A row whose start is in flight (``_starting_claims``: its ``admitted ->
+        starting`` write posted, its run not yet registered) counts as live too.
+        The ledger's unconditional ``cancel_tree`` would otherwise cancel that
+        row under a start the store has already taken, and the run the claimer
+        then registers would be reaped by nothing; handed to ``cancel`` on the
+        loop instead, it joins the start's answer and reaps what it registered.
+        """
+        running = (i.id for i in self._manager._agents.values() if not i.done)
+        starting = self._manager.__dict__.get("_starting_claims", {})
+        return frozenset(running).union(starting)
 
     @staticmethod
     def _cancel_children_db(
@@ -812,6 +838,7 @@ class _WaitsMixin(ManagerComponent):
         expired waits belonged to (schedules tasks, so it runs on the loop)."""
         for agent_id in expired:
             info = self._manager._agents.get(agent_id)
-            if info is not None and not info.done:
+            # A claimed completed ending is ``done`` here, as on every stop path.
+            if info is not None and not info.done and not info._ending_claimed:
                 info.error = info.error or "wait deadline passed"
                 self._schedule_cancel(agent_id)

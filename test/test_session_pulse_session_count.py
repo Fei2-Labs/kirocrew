@@ -82,7 +82,7 @@ def test_user_origin_without_flag_does_not_increment(tmp_path) -> None:
     state.get_or_create_slot(None, agent="some-agent", origin=SlotOrigin.USER)
     assert spc.get_user_session_count() == 0
     # Mutation guard: dropping the ``count_user_session`` conjunct from the
-    # increment condition in state.py makes this fail.
+    # increment condition in state_parts/slot_directory.py makes this fail.
     state.get_or_create_slot(origin=SlotOrigin.USER)
     assert spc.get_user_session_count() == 0
 
@@ -164,13 +164,14 @@ def _opted_in_call_counts() -> dict[str, int]:
 
 def test_only_human_request_paths_opt_in() -> None:
     # Exactly the three human request-layer paths carry the flag: the chat-send
-    # auto-create and the new-chat tab (chat_handlers.py), and fork
+    # auto-create and the new-chat tab (chat_api/chat_send.py, chat_api/slot_create.py), and fork
     # (chat_fork.py). This sweeps every module under src/kiro_crew, so an
     # opt-in appearing anywhere else -- most importantly the session-control
     # create verb, whose absence is required -- or disappearing from
     # these two files is a deliberate decision: update this pin alongside it.
     assert _opted_in_call_counts() == {
-        "dashboard/chat_handlers.py": 2,
+        "dashboard/chat_api/chat_send.py": 1,
+        "dashboard/chat_api/slot_create.py": 1,
         "dashboard/chat_fork.py": 1,
     }
 
@@ -180,4 +181,6 @@ def test_session_control_create_does_not_opt_in() -> None:
     # subsumes it: the session-control create verb mints USER-origin slots
     # (privacy semantics) but must not count toward the survey. Passing
     # count_user_session=True there re-introduces the bug.
-    assert "dashboard/session_control.py" not in _opted_in_call_counts()
+    counts = _opted_in_call_counts()
+    assert "dashboard/session_control.py" not in counts
+    assert not [path for path in counts if path.startswith("dashboard/session_control_parts/")]

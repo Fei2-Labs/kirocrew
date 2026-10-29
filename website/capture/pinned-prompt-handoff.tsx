@@ -12,9 +12,9 @@
  *   - `PinnedPrompt` is the REAL banner card.
  *   - `UserMessage` is the REAL bubble.
  *   - Rows are wrapped in the literal host wrapper (`px-4 mx-auto w-full py-1`
- *     under `--mc-content-width`, ChatPage.tsx:7066) and hidden by the literal
- *     host rule (`visibility: 'hidden'` matched on message ts, ChatPage.tsx:7089).
- *   - The fold sentinel sits directly under an opaque title row, as in ChatPage.
+ *     under `--mc-content-width`, ChatTranscriptView.tsx) and hidden by the literal
+ *     host rule (`visibility: 'hidden'` matched on message ts, ChatTranscriptView.tsx).
+ *   - The fold sentinel sits directly under an opaque title row, as in ChatTitleOverlay.
  * Nothing about the hand-off decision is reimplemented here.
  *
  *   ?theme=dark|light
@@ -119,7 +119,7 @@ function PinnedHost() {
 
   return (
     <div data-capture-root className="relative h-screen w-screen flex flex-col bg-bg text-text overflow-hidden">
-      {/* Overlay band: title row, fold sentinel, banner — the ChatPage stack. */}
+      {/* Overlay band: title row, fold sentinel, banner — the ChatTitleOverlay stack. */}
       <div className="absolute inset-x-0 top-0 z-20 pointer-events-none">
         <div className="pointer-events-auto bg-bg border-b border-border px-4 py-2 text-sm text-muted">
           Pinned prompt hand-off
@@ -183,11 +183,18 @@ function PinnedHost() {
               key={idx}
               data-display-index={idx}
               className="px-4 mx-auto w-full py-1"
+              // The literal host rule: mark and hide the row the banner is standing
+              // in for, by message IDENTITY (ts), so the bubble appears to stop
+              // travelling and stick rather than being replaced. The marker lets
+              // index.css re-show the row's action strip under the card — its
+              // value is `folding` while the hook reports that strip still
+              // uncovered (some of it below the card's resting bottom, on screen)
+              // and empty once it has slid under the card.
+              data-pinned-standin={pinned && pinned.ts != null && msg.ts === pinned.ts
+                ? (pinned.stripUncovered ? 'folding' : '')
+                : undefined}
               style={{
                 maxWidth: 'var(--mc-content-width, 900px)',
-                // The literal host rule: hide the row the banner is standing in
-                // for, by message IDENTITY (ts), so the bubble appears to stop
-                // travelling and stick rather than being replaced.
                 visibility: pinned && pinned.ts != null && msg.ts === pinned.ts ? 'hidden' : undefined,
               }}
             >

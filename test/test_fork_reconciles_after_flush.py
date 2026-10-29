@@ -15,6 +15,8 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
 
+from kiro_crew.testing.wait import async_wait_until
+
 
 @pytest.mark.asyncio
 async def test_fork_sees_the_tail_when_a_flush_clears_dirty_mid_read(tmp_path, monkeypatch):
@@ -62,10 +64,7 @@ async def test_fork_sees_the_tail_when_a_flush_clears_dirty_mid_read(tmp_path, m
     monkeypatch.setattr(log, "read_messages_chained", racing_read)
 
     async def racer():
-        for _ in range(200):
-            if read_entered.is_set():
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(read_entered.is_set)
         # Exactly what the flush executor does: persist the tail, then clear _dirty.
         original(key)  # touch, mirroring the flush's own read path
         log.append(key, "user", "tail-prompt")
@@ -135,11 +134,8 @@ async def test_a_reread_does_not_duplicate_a_tail_the_flush_already_persisted(
     monkeypatch.setattr(log, "read_messages_chained", racing_read)
 
     async def _await_gate(ev):
-        for _ in range(300):
-            if ev.is_set():
-                return True
-            await asyncio.sleep(0.01)
-        return False
+        await async_wait_until(ev.is_set)
+        return True
 
     async def racer():
         # While read 1 is parked: the flush persists the tail and clears _dirty,
@@ -222,11 +218,8 @@ async def test_fork_does_not_duplicate_when_an_append_re_dirties_during_the_read
     monkeypatch.setattr(log, "read_messages_chained", racing_read)
 
     async def _await_gate(ev):
-        for _ in range(300):
-            if ev.is_set():
-                return True
-            await asyncio.sleep(0.01)
-        return False
+        await async_wait_until(ev.is_set)
+        return True
 
     async def racer():
         assert await _await_gate(entered), "read 1 never entered"
@@ -437,9 +430,10 @@ async def test_a_pending_rewrite_does_not_fork_discarded_turns(tmp_path, monkeyp
     post-await re-check PASSES because nothing moved during the read: it measures
     stability, not correctness.
 
-    ``session_transfer._guard_snapshot`` refuses on exactly this flag for exactly
-    this reason; ``chat_fork`` had no equivalent. The fork lock does not help --
-    ``chat_fork.py:147`` is its only acquirer, so no rewind path takes it.
+    The transfer's snapshot rules (``transcript_snapshot.TRANSFER``) refuse on
+    exactly this flag for exactly this reason; the fork's save it instead. The fork
+    lock does not help -- ``fork_slot`` is its only acquirer, so no rewind path
+    takes it.
     """
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
     state = _make_state(tmp_path)
@@ -548,11 +542,7 @@ async def test_a_pending_rewrite_arriving_during_the_read_forces_a_retry(tmp_pat
     monkeypatch.setattr(log, "read_messages_chained", racing_read)
 
     async def racer():
-        for _ in range(300):
-            if entered.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert entered.is_set(), "read 1 never entered"
+        await async_wait_until(entered.is_set, describe=lambda: "read 1 never entered")
         # A failed in-place rewrite: the flag is set and NOTHING else moves, so the
         # counter equality check below cannot detect it.
         slot._pending_rewrite = True
@@ -651,11 +641,15 @@ async def test_the_fork_does_not_mutate_the_shared_message_cache(tmp_path, monke
     # and Windows for exactly that reason.
     #
     # The WARM path (~:4609-4612) is lock-free and unconditional: it returns the
-    # cached list by identity whenever the stored mtime and generation both still
-    # match. Publishing the entry here makes that hit deterministic, which is what
-    # puts the fork on the shared-object path it is being tested against.
+    # cached list by identity whenever the stored identity and generation both
+    # still match. Publishing the entry here makes that hit deterministic, which
+    # is what puts the fork on the shared-object path it is being tested against.
     cached_obj = list(log.read_messages_chained(key))
-    log._msg_cache[key] = (log._path(key).stat().st_mtime, log._cache_gen(key), cached_obj)
+    log._msg_cache[key] = (
+        log._cache_identity(log._path(key).stat()),
+        log._cache_gen(key),
+        cached_obj,
+    )
     # FIXTURE GUARD: the hit is live, so a reader really is handed THIS object.
     assert log.read_messages_chained(key) is cached_obj, (
         "fixture failed to establish a cache hit: a read did not return the entry "
@@ -935,6 +929,52 @@ async def test_a_pending_rewrite_fork_without_a_concurrent_rewind_still_succeeds
     new_slot = state._slots.get(data["key"])
     visible = [m["content"] for m in new_slot.messages if m["role"] in ("user", "assistant")]
     assert visible[0] == "p0" and visible[-1] == "p7", f"forked transcript wrong: {visible}"
+
+
+@pytest.mark.asyncio
+async def test_the_pending_rewrite_flush_pins_its_slot_identity(tmp_path, monkeypatch):
+    """The flush is a truncating rewrite, so both axes must decide its commit.
+
+    It is dispatched off the loop and awaited, which frees the loop until the
+    worker commits. ``expected_history_key`` refuses a RENAMED replacement; a
+    same-name close-and-recreate resumes the same transcript and keeps that key
+    identical, so ``expected_slot_name`` is what refuses it -- re-read inside
+    the transcript lock with no await before the write. This caller is the one
+    that then republishes the file it wrote, so an unrefused commit here is
+    copied under a fresh key.
+    """
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    state = _make_state(tmp_path)
+
+    slot = state.get_or_create_slot("pendpin")
+    for i in range(8):
+        slot.append("user" if i % 2 == 0 else "assistant", f"p{i}", "msg")
+    slot.drain()
+    from kiro_crew.dashboard.chat import _save_slot_to_history
+
+    _save_slot_to_history(state, slot)
+    slot._pending_rewrite = True
+    slot._dirty = True
+
+    seen: list[dict] = []
+    from kiro_crew.dashboard import chat_fork as chat_fork_mod
+
+    real_save = chat_fork_mod.save_slot_off_loop
+
+    async def _record(*args, **kwargs):
+        seen.append(kwargs)
+        return await real_save(*args, **kwargs)
+
+    monkeypatch.setattr(chat_fork_mod, "save_slot_off_loop", _record)
+
+    async with TestClient(TestServer(_make_app(state))) as client:
+        resp = await client.post("/api/chat/slots/pendpin/fork", json={})
+        assert resp.status == 200, await resp.text()
+
+    flushes = [kw for kw in seen if kw.get("rewrite")]
+    assert len(flushes) == 1, f"expected exactly one pending-rewrite flush, saw {seen}"
+    assert flushes[0]["expected_history_key"]
+    assert flushes[0]["expected_slot_name"] == "pendpin"
 
 
 @pytest.mark.asyncio

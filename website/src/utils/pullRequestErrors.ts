@@ -6,31 +6,22 @@
  * single place that reads the machine-readable markers back out of it. Every
  * surface that renders a provider-mutation failure (the Changes panel actions,
  * review threads, Code Review Sage publishing) routes through here so a coded
- * refusal gets the same localized guidance everywhere instead of only on the
- * surface that happened to be fixed first.
+ * refusal reads the same everywhere instead of only on the surface that
+ * happened to be fixed first.
  */
-import { i18nT } from '../i18n/t'
-import type { SettingsTarget } from '../components/settingsPath'
-
-/** Where the owner-not-configured guidance sends the user — rendered via
- *  <SettingsLink {...OWNER_SETTINGS_TARGET}> so every refusal surface mints
- *  the same route through the shared settingsPath builder. */
-export const OWNER_SETTINGS_TARGET: SettingsTarget = { tab: 'channels', sub: 'slack' }
-
 export function pullRequestErrorDetails(error: unknown): {
   message: string
-  loginCommand: 'gh auth login' | 'glab auth login' | ''
+  /** The command to run: `gh auth login`, `glab auth login`, or `<gh|glab> auth login --hostname <host>` for a GitHub Enterprise or self-managed GitLab host. */
+  loginCommand: string
   /** The server refused pending an acknowledgement the client may now offer. */
   confirmationRequired: boolean
   /** The gateway was at its concurrent-fetch ceiling; the same request may succeed later. */
   sourceBusy: boolean
-  /** Provider mutations need a configured owner and this install has none. */
-  ownerNotConfigured: boolean
 } {
   let message = error instanceof Error ? error.message : String(error || '')
   let confirmationRequired = false
   let sourceBusy = false
-  let ownerNotConfigured = false
+  let hostScoped = ''
   // ApiError already unwraps the human message, which discards every other
   // field, so the structured marker is read from the raw body it preserves.
   const raw = typeof (error as { body?: unknown })?.body === 'string'
@@ -41,27 +32,36 @@ export function pullRequestErrorDetails(error: unknown): {
       error?: unknown
       confirmationRequired?: unknown
       code?: unknown
+      loginCommand?: unknown
     }
     if (typeof payload.error === 'string') message = payload.error
+    if (
+      typeof payload.loginCommand === 'string'
+      && (payload.loginCommand.startsWith('glab auth login --hostname ')
+        || payload.loginCommand.startsWith('gh auth login --hostname '))
+    ) {
+      hostScoped = payload.loginCommand
+    }
     confirmationRequired = payload.confirmationRequired === true
     sourceBusy = payload.code === 'source_busy'
-    ownerNotConfigured = payload.code === 'owner_not_configured'
   } catch {
     // Provider and network errors may already be plain text.
   }
-  if (ownerNotConfigured) {
-    // The server's English remedy is replaced with the localized one; the
-    // machine-readable code, not the prose, is the contract.
-    message = i18nT('components.pullRequestPanel.owner_not_configured_guidance')
-  }
-  const authenticationFailure = /\b(?:not logged in(?:to)?|unauthenticated|authentication (?:failed|required)|requires authentication)\b/i.test(message)
-  // The command literals pass the i18n gate via the enumerated
+  // `401 Unauthorized` / `HTTP 401` is GitLab's wording for an expired sign-in;
+  // the server only appends a sign-in hint to a glab failure carrying it.
+  const authenticationFailure = /\b(?:not logged in(?:to)?|unauthenticated|authentication (?:failed|required)|requires authentication|401 unauthorized|http 401)\b/i.test(message)
+  // The bare command literals pass the i18n gate via the enumerated
   // `^(?:gh|glab) auth login$` exclusion in eslint.i18n.config.js — terminal
-  // commands are wire strings, never display copy.
-  const loginCommand = authenticationFailure && /(?:`|\b)gh auth login(?:`|\b)/i.test(message)
-    ? 'gh auth login'
-    : authenticationFailure && /(?:`|\b)glab auth login(?:`|\b)/i.test(message)
-      ? 'glab auth login'
-      : ''
-  return { message, loginCommand, confirmationRequired, sourceBusy, ownerNotConfigured }
+  // commands are wire strings, never display copy. A GitHub Enterprise or
+  // self-managed GitLab host-scoped command arrives as its own `loginCommand`
+  // field instead: the gateway builds it from the allowlisted host, so nothing
+  // is parsed out of provider-controlled message text.
+  const loginCommand: string = hostScoped
+    ? hostScoped
+    : authenticationFailure && /(?:`|\b)gh auth login(?:`|\b)/i.test(message)
+      ? 'gh auth login'
+      : authenticationFailure && /(?:`|\b)glab auth login(?:`|\b)/i.test(message)
+        ? 'glab auth login'
+        : ''
+  return { message, loginCommand, confirmationRequired, sourceBusy }
 }

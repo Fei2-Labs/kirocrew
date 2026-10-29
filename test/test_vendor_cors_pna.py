@@ -72,11 +72,8 @@ class TestVendorPreflight:
     so a preflight would 405 and Chrome fails the fetch closed).
 
     Each test opens an in-test ``TestClient`` with ``async with`` (matching
-    ``test_api_kiro_hooks.py``) rather than an async-gen fixture: the CI-pinned
-    ``pytest-asyncio==0.20.3`` is incompatible with the pinned ``pytest==8.4.1``
-    for async fixtures (its wrapper reads the ``fixturedef.unittest`` attribute
-    removed in pytest 8.1), so the whole suite avoids
-    ``@pytest_asyncio.fixture`` by convention.
+    ``test_api_kiro_hooks.py``) rather than an async-gen fixture, following
+    the suite's convention for teardown that must await on the test's own loop.
     """
 
     @pytest.fixture
@@ -169,7 +166,10 @@ def test_middleware_uses_the_request_path() -> None:
     """
     from kiro_crew.dashboard import server as server_mod
 
+    # The middleware is built by the chain installer start_dashboard calls.
     source = inspect.getsource(server_mod.start_dashboard)
+    assert "_install_dashboard_middlewares(" in source
+    source += inspect.getsource(server_mod._install_dashboard_middlewares)
     assert "_apply_security_headers(resp, request.app, request.path, request)" in source, (
         "start_dashboard's header middleware no longer calls "
         "_apply_security_headers(resp, request.app, request.path, request); "

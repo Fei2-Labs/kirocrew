@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import platform
 import re
 from collections.abc import Iterator
 
@@ -10,7 +12,7 @@ from collections.abc import Iterator
 # tree KiroCrew spawns (the ACP provider, MCP probes, gateway pool backends).
 # Children inherit the environment, so marking the provider process
 # transitively marks every MCP server it launches. The untracked-orphan sweep
-# (``session_pid.py``) reads it back from ``/proc/<pid>/environ`` to positively
+# (``session_pid_orphan_scan.py``) reads it back from ``/proc/<pid>/environ`` to positively
 # identify escaped MCP launcher processes whose *cmdline* carries no KiroCrew
 # fingerprint (e.g. ``npx @playwright/mcp`` -> node) without ever risking a
 # kill of a user's own identically-named processes. Constant by design: it must
@@ -25,6 +27,46 @@ KIROCREW_SPAWNED_VALUE = "1"
 # this one says WHICH spawn, so a teardown that has lost its root can still tell
 # the root's own tree from a fresh spawn that took the root's recycled pid.
 KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
+# The data home of the gateway that spawned an agent runtime, set beside the
+# instance and inherited the same way. KIROCREW_SPAWNED is install-agnostic, so
+# this is what tells this install's runtime from a sibling install's on the same
+# uid. Read only to WITHHOLD a kill: absent or different means not ours.
+KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
+# The authored agent an ``AcpRuntime`` child is spawned for, set beside the
+# instance and inherited the same way. A host that takes its agent on the command
+# line shows it in argv; a host that binds the agent over the wire (the KAS relay)
+# shows nothing there, so this is the one carrier that names the agent for every
+# runtime regardless of host. Read back out of ``/proc/<pid>/environ`` by the
+# process-leak gate to tell the gateway's own background runtime from a session's.
+KIROCREW_RUNTIME_AGENT_ENV = "KIROCREW_RUNTIME_AGENT"
+# Set on every tree spawned through ``sandbox.sandboxed_spawn_argv`` -- a build, an
+# ``npx`` install, a ``git``/``gh`` read, a provisioning run -- and inherited by that
+# whole tree exactly as KIROCREW_SPAWNED is. It says what KIROCREW_SPAWNED does not:
+# this tree was spawned as TOOL work rather than as a session leader Kiro Crew owns
+# and tears down. ``session_pid._env_is_sandbox_tool`` reads it back out of the
+# kernel's exec-time copy, which lets the runtime reconciler leave such a tree out of
+# its kill-candidate population on evidence a same-uid process cannot forge on
+# another process, where an argv0 basename is merely a name.
+#
+# It is a claim about the TREE, not about each process in it. The chokepoint has
+# callers whose argv0 is itself a managed harness -- a pod child probe, an unattended
+# fix-authoring agent -- and the marker is inherited, so a harness can carry it
+# without being tool work. The reconciler therefore pairs this marker with the
+# managed-argv test and excludes only a pid that is marked AND is not a harness.
+#
+# Kept DISTINCT from KIROCREW_SPAWNED because that marker is the reconciler's
+# kill-ENABLING condition: an exclusion overloaded onto the same flag would have to
+# weaken the ownership test to express itself.
+KIROCREW_SANDBOX_TOOL_ENV = "KIROCREW_SANDBOX_TOOL"
+KIROCREW_SANDBOX_TOOL_VALUE = "1"
+
+#: The desktop app's staged KAS engine root, exported by the Electron shell when
+#: the build staged the pinned engine for this architecture
+#: (``website/electron/gateway-env.js``, ``bundledKasEnvironment``). Lives here
+#: rather than in ``acp.kas_bundle`` because ``sandbox`` seals the directory it
+#: names (:func:`sandbox_tiers._resolved_install_root_targets`) and must not import the
+#: ACP tree to learn the env name.
+BUNDLED_KAS_DIR_ENV = "KIROCREW_BUNDLED_KAS_DIR"
 
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
 # KIROCREW_DEV_MODE, …).  Use ``env_flag_enabled`` rather than ``bool(os.environ
@@ -32,14 +74,166 @@ KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 # security toggle (e.g. KIROCREW_NO_JAIL) is a silent-bypass footgun.
 ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+# Canonical falsy set, the explicit opt-out for the crew log, which defaults ON. See
+# ``crew_log_enabled``.
+ENV_FALSY = frozenset({"0", "false", "no", "off"})
 
-# Minimum supported Node.js MAJOR version for every Python-side check
-# (``kirocrew doctor``, the frontend-build probe in ``cli.py``, the TUI
-# launcher in ``cli_chat.py``). Single source of truth so doctor and chat can
-# never disagree about the floor. 22 is the oldest non-EOL line the frontend
-# bundler supports (``ensure-node.sh`` enforces the finer-grained 22.12 floor;
-# ``.nvmrc`` pins the recommended 24 LTS).
-MIN_NODE_MAJOR = 22
+# Longest prefix a generated Coder workspace name may carry: names are at most 32
+# characters and the registry adds two separators and an 8-character binding id,
+# so 21 leaves one owner character. Homed here so every boundary refuses at one number.
+CODER_WORKSPACE_PREFIX_MAX_CHARS = 21
+
+
+# Minimum supported Node.js version (major, minor, patch), shared by the startup
+# probe in ``cli.py`` and ``kirocrew doctor``. Below it, doctor fails and the
+# startup probe logs a warning; the probe's yes/no answer (which gates the
+# ensure-node repair at gateway boot) stays on ``MIN_NODE_VERSION[0]`` only. A
+# FULL version because a major-only compare admits an early 22.x that cannot
+# run the code:
+#
+# - ``worker_threads.markAsUncloneable`` first shipped in Node 22.10.0
+#   (nodejs/node#55234, CHANGELOG_V22.md). A recent undici fetch client calls
+#   it and fails with "webidl.util.markAsUncloneable is not a function" below.
+# - The frontend bundler (vite 8 / rolldown) declares engines.node
+#   "^20.19.0 || >=22.12.0"; 20.x is end-of-life, leaving 22.12.0.
+#
+# The floor is the stricter of the two. ``ensure-node.sh`` and ``make.ps1``
+# enforce the same 22.12 cutoff; ``.nvmrc`` pins the recommended 24 LTS.
+MIN_NODE_VERSION: tuple[int, int, int] = (22, 12, 0)
+
+_NODE_VERSION_RE = re.compile(r"^\s*v?(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_node_version(text: str | None) -> tuple[int, int, int] | None:
+    """Parse ``node -v`` output (``v22.12.0``) into a tuple; None if unreadable."""
+    m = _NODE_VERSION_RE.match(text or "")
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def format_node_version(version: tuple[int, int, int]) -> str:
+    """Render a version tuple as ``22.12.0``."""
+    return ".".join(str(part) for part in version)
+
+
+def node_version_meets_floor(
+    version: tuple[int, int, int], floor: tuple[int, int, int] = MIN_NODE_VERSION
+) -> bool:
+    """True iff *version* is at or above *floor*, comparing major.minor.patch."""
+    return tuple(version) >= tuple(floor)
+
+
+# Minimum glibc the OFFICIAL Node.js >= 18 Linux binaries (nodejs.org and the
+# prebuilt tarballs nvm/mise fetch) are linked against. Amazon Linux 2 ships
+# glibc 2.26, so those binaries are present on PATH but fail to LOAD with
+# "GLIBC_2.28 not found" -- which means the usual "install from nodejs.org / nvm
+# install" advice sends an AL2 user in a circle. ``ensure-node.sh`` already
+# resolves this by unpacking the nodejs "unofficial-builds" glibc-217 variant
+# (compiled against glibc 2.17); the message below points there instead on a
+# host whose glibc is below this floor.
+_OFFICIAL_NODE_GLIBC_FLOOR: tuple[int, int] = (2, 28)
+
+
+def _host_glibc_version() -> tuple[int, int] | None:
+    """This host's glibc (major, minor), or ``None`` when it cannot be read.
+
+    ``None`` on any non-glibc or unreadable host (macOS, Windows, musl, or an
+    unparseable version string) so the caller stays with the default remedy
+    rather than guessing. Uses ``platform.libc_ver`` -- the same reader
+    ``wheel_engine._no_wheel_message`` relies on -- and never raises.
+    """
+    if platform.system() != "Linux":
+        return None
+    try:
+        name, ver = platform.libc_ver()
+    except Exception:
+        return None
+    if name != "glibc" or not ver:
+        return None
+    m = re.match(r"^(\d+)\.(\d+)", ver)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)))
+
+
+def _glibc217_ensure_node_path() -> str | None:
+    """Path to the bundled ``ensure-node.sh`` when it ships here, else ``None``.
+
+    Returns ``None`` on a pip/wheel install, which ships no shell script
+    (``env._ensure_node_script`` returns ``None`` there). Independent of CPU --
+    the caller gates the x86_64 requirement separately -- so a path here means
+    "the auto-provisioner is available", not "it will succeed". Never raises.
+    """
+    try:
+        from kiro_crew.env import _ensure_node_script
+
+        script = _ensure_node_script()
+    except Exception:
+        return None
+    return str(script) if script is not None else None
+
+
+def node_too_old_message(
+    version: tuple[int, int, int], floor: tuple[int, int, int] = MIN_NODE_VERSION
+) -> str:
+    """User-facing line naming the found version, the exact floor, and the fix.
+
+    On a host whose glibc is older than the official Node binaries' floor
+    (Amazon Linux 2 ships glibc 2.26), the usual nodejs.org / nvm advice fails
+    to LOAD -- the binaries exist but raise "GLIBC_2.28 not found". The remedy
+    then depends on the host, and the action is stated FIRST:
+
+    * x86_64 with the bundled script -> ``bash <path>`` auto-installs the
+      glibc-2.17 Node build.
+    * x86_64 without the script (pip/wheel install) -> that same glibc-2.17
+      build DOES run here, so install it from unofficial-builds.nodejs.org (or
+      move to a newer base image).
+    * aarch64/Graviton -> no glibc-2.17 build is published for ARM, so move to a
+      newer base image (Amazon Linux 2023, Ubuntu 22.04+) or build from source.
+    """
+    base = (
+        f"Node.js v{format_node_version(version)} is too old: Kiro Crew needs "
+        f"v{format_node_version(floor)} or newer."
+    )
+    glibc = _host_glibc_version()
+    if glibc is not None and glibc < _OFFICIAL_NODE_GLIBC_FLOOR:
+        # Official Node binaries will not load here. The remedy is per-host, and
+        # the ACTION comes first; the glibc explanation trails it.
+        why = (
+            f"This host's glibc ({glibc[0]}.{glibc[1]}) is older than the official "
+            f"Node.js builds require (glibc {_OFFICIAL_NODE_GLIBC_FLOOR[0]}."
+            f"{_OFFICIAL_NODE_GLIBC_FLOOR[1]}+), so a nodejs.org / nvm install "
+            'would fail to run with "GLIBC_... not found".'
+        )
+        if platform.machine() == "x86_64":
+            script = _glibc217_ensure_node_path()
+            if script is not None:
+                action = (
+                    f"Run `bash {script}` to install the glibc-2.17 Node build "
+                    "that runs here, or move to a newer base image "
+                    "(Amazon Linux 2023, Ubuntu 22.04+)."
+                )
+            else:
+                # pip/wheel install: no bundled script, but the x64 glibc-2.17
+                # build still runs -- point at it directly, not a migration.
+                action = (
+                    "Install the glibc-2.17 Node build from "
+                    "https://unofficial-builds.nodejs.org, or move to a newer "
+                    "base image (Amazon Linux 2023, Ubuntu 22.04+)."
+                )
+        else:
+            # aarch64/Graviton: upstream publishes no arm64 glibc-2.17 build.
+            action = (
+                "No glibc-2.17 Node build is published for this CPU; move to a "
+                "newer base image (Amazon Linux 2023, Ubuntu 22.04+) or build "
+                "Node from source."
+            )
+        return f"{base} {action} ({why})"
+    return (
+        f"{base} Update Node.js: install 24 LTS "
+        "from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`."
+    )
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -47,22 +241,65 @@ def env_flag_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ENV_TRUTHY
 
 
-DATA_WARNING = (
-    "⚠️  Do not enter sensitive, secret, or regulated data into KiroCrew.\n"
-    "   Treat anything you send as potentially logged or processed by the\n"
-    "   configured model provider."
-)
+def env_file_display() -> str:
+    """The ``.env`` the gateway reads, as an operator would type it (``~`` for home).
+
+    Resolved through ``config.loader.env_path``, so it follows ``KIROCREW_HOME``: a
+    refusal that tells an operator which file to edit must name the one that is read.
+    """
+    from pathlib import Path
+
+    from kiro_crew.config.loader import env_path
+
+    path = env_path()
+    try:
+        return "~/" + path.relative_to(Path.home()).as_posix()
+    except (ValueError, RuntimeError):
+        return str(path)
+
+
+#: The variable that switches the crew log off. It lives here, beside its reader,
+#: so the gateway boot path can ask whether the crew log is wanted without importing
+#: the emitter.
+CREW_LOG_ENV = "KIROCREW_CREW_LOG"
+
+#: ``KIROCREW_CREW_LOG`` values :func:`crew_log_enabled` has already warned about.
+_WARNED_UNRECOGNISED: set[str] = set()
+
+
+def crew_log_enabled() -> bool:
+    """Whether the crew log records: ``KIROCREW_CREW_LOG`` unset, empty or truthy.
+
+    Read per call, case- and space-insensitive. Unset, empty and a value in
+    ``ENV_TRUTHY`` leave it on, and a value in ``ENV_FALSY`` turns it off. Any other
+    value fails CLOSED -- the only reason to set the variable is to opt out, so a
+    typo'd opt-out such as ``disable`` or ``fasle`` turns it off too, and is logged
+    once per value so the unrecognised spelling is visible.
+    """
+    value = os.environ.get(CREW_LOG_ENV, "").strip().lower()
+    if not value or value in ENV_TRUTHY:
+        return True
+    if value not in ENV_FALSY and value not in _WARNED_UNRECOGNISED:
+        _WARNED_UNRECOGNISED.add(value)
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a recognised value, so it is OFF; unset it, or set it to "
+            "1, true, yes or on, to switch it on",
+            CREW_LOG_ENV,
+            value,
+        )
+    return False
+
 
 # Outer wall-clock cap on a single ``_run_chat`` invocation (any dispatch site:
 # primary user turn, queue-drain, cron injection, subagent injection, Slack first
 # turn). Sized to match the inner ACP ``_DEFAULT_PROMPT_TIMEOUT`` (14400s) in
-# ``acp/client.py`` so the dashboard layer doesn't bound below the transport.
+# ``acp/client_timeouts.py`` so the dashboard layer doesn't bound below the transport.
 # Four hours is the longest single turn the shipped budgets can legitimately
 # produce (the task runner's 90-minute test command plus a fix and a re-run, or a
 # blocking subagent wave at its 2h wait cap plus synthesis); work that outlives
 # it belongs to the loop mechanisms, which end the turn between cycles.
 # Wedged-session detection is handled by ``_STALE_TURN_TIMEOUT`` (90s, also in
-# ``acp/client.py``); this cap is the upper safety ceiling for genuinely runaway
+# ``acp/client_timeouts.py``); this cap is the upper safety ceiling for genuinely runaway
 # work, not a "this turn took too long" guard.
 CHAT_TURN_TIMEOUT = 14400.0
 
@@ -76,12 +313,15 @@ CHAT_TURN_TIMEOUT = 14400.0
 # overrides it and is clamped below the turn ceiling at load time.
 TOOL_APPROVAL_TIMEOUT = 600.0
 
-# How long any caller waits for a compaction to report completed/failed —
-# the default of ``LLMProvider.wait_for_compaction`` and the cap on the
-# automatic context-threshold compaction in ``session.py``. Manual (/compact,
-# !compact) and automatic compaction deliberately share this single budget:
-# the operation is identical, so a shorter manual budget only reports
-# "timed out" on work that is still running and subsequently succeeds.
+# How long any caller waits for a compaction to report completed/failed when
+# ``session.compact_wait_secs`` is unset (0) -- the default of
+# ``LLMProvider.wait_for_compaction``. Manual (/compact, !compact, channel
+# commands) and automatic compaction deliberately share one budget: the
+# operation is identical, so a shorter manual budget only reports "timed out"
+# on work that is still running and subsequently succeeds. A configured key
+# raises both: every caller -- the automatic coordinator, the task runner,
+# the dashboard and each chat channel -- resolves it through the one
+# ``SessionManager.compact_wait_budget_secs()``.
 COMPACT_WAIT_TIMEOUT_SECS = 300.0
 
 # Wall-clock ceiling on one subagent execution: the default of
@@ -96,10 +336,36 @@ COMPACT_WAIT_TIMEOUT_SECS = 300.0
 # investigation); the reaper still force-kills at the deadline.
 SUBAGENT_TIMEOUT_SECS = 10800
 
+# Budget for an agent backend's ``initialize`` handshake, in seconds. Spent by
+# ``acp.runtime_spawn_launch`` (which binds it as ``_INITIALIZE_TIMEOUT`` and documents why
+# the value is what it is), and read by the subagent startup watchdog, whose window
+# has to cover a handshake that spends all of it
+# (``SubagentManager._startup_deadline``). Owned here because that second reader is
+# outside the ACP layer, and may not import it.
+INITIALIZE_TIMEOUT_SECS = 90.0
+
 # Tool-call budget for long subagent work. Shared by the config default, loader,
 # manager fallback and tool description; the wall-clock deadline still bounds a
 # run that makes little progress or spends a long time inside one tool.
 DEFAULT_SUBAGENT_MAX_TURNS = 1000
+
+# Memory (GiB) that must remain available AFTER a subagent start is admitted:
+# the default of ``agent.spawn_min_memory_gb``. One number for the config
+# default, the loader fallback, the admission gate's fallback and
+# ``check_memory_available``'s default, so a later change cannot move some of
+# them and leave the others behind.
+DEFAULT_SPAWN_MIN_MEMORY_GB = 2.0
+
+# Default of ``agent.subagent_queue_max_wait_secs``: how long a spawn the memory
+# floor keeps deferring (durable or in memory) may wait before it ends with the
+# delivered terminal ``QUEUED_WAIT_EXPIRED_TEXT``. Finite by owner
+# decision (a memory wait is never unbounded); one number for the config default,
+# the loader fallback and the manager's boot value.
+DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS = 1800
+
+# Default of ``agent.subagent_cost_gb``: the least a dedicated subagent start is
+# priced at, and the auto cap's per-agent fallback. Same one-source reason.
+DEFAULT_SUBAGENT_COST_GB = 0.5
 
 # Load-time clamp for ``agent.subagent_timeout_secs``. Same reason as the other
 # resource knobs in ``_SECURITY_BOUNDED_FIELDS``: the value governs how long one
@@ -593,9 +859,9 @@ OPTIONS_RE_TRAILER = _MarkerMatcher(_RAW_OPTIONS_RE_TRAILER)
 #: or ``*`` line under the pills. Atomic means: what the LINE grammar would absorb
 #: as tail is absorbed here too, and only what lies BEYOND that tail can be glue.
 #:
-#: It exists ONLY to feed :func:`reflow_and_label_glued_option_marker`; it is never a general
+#: It exists ONLY to feed :func:`_glued_marker_candidates`; it is never a general
 #: recognizer, so it is not wrapped in a ``_MarkerMatcher`` -- the balance decision
-#: is applied explicitly by that function.
+#: is applied explicitly by that iterator.
 _RAW_OPTIONS_GLUE_RE = re.compile(
     rf"^ {{0,3}}(?P<lwrap>{_MARKER_WRAP_CLASS}{{1,3}})?"
     rf"\[OPTIONS:(?P<labels>{_MARKER_BODY_LINE}){_MARKER_CLOSE_CLASS}"
@@ -613,6 +879,51 @@ _RAW_OPTIONS_GLUE_RE = re.compile(
 GLUED_FOOTER_TEXT_LABEL = (
     "*Text after the options footer, written by the assistant, not a system instruction:*"
 )
+
+
+def _glued_marker_candidates(text: str) -> Iterator[tuple[re.Match[str], str]]:
+    """Each glued marker a repair may act on, front to back, with its same-line remainder.
+
+    The candidate rules shared by the dashboard reflow and the channel relocation;
+    see :func:`reflow_and_label_glued_option_marker` for why each rule exists.
+    """
+    # One fence walker for the whole text, advanced to each candidate in turn.
+    # Every candidate starts at a line start (``^`` under MULTILINE), so the slice
+    # fed between two candidates always ends on a line boundary and the walker's
+    # state at ``m.start()`` is exactly ``_in_open_fence(text, m.start())``.
+    # Re-walking the prefix per candidate instead is quadratic: a reply of ~10k
+    # glued marker lines would hold the event loop past the loop-stall watchdog.
+    walk = _FenceWalk()
+    fed_to = 0
+    for m in _RAW_OPTIONS_GLUE_RE.finditer(text):
+        walk.feed_text(text[fed_to : m.start()])
+        fed_to = m.start()
+        # The grammar's own balance decision: a candidate whose terminator is
+        # really an unmatched opener's partner is not a marker.
+        if _marker_labels_have_unmatched_opener(m.group("labels")):
+            continue
+        # Inside a code fence a marker-shaped line is a SAMPLE the renderer shows
+        # verbatim, not a footer. Same fail-safe as ``strip_control_comments``: an
+        # ambiguous fence structure answers "inside", and the candidate is skipped.
+        if walk.inside:
+            continue
+        # Same-line remainder after the matched marker (the lookahead consumed
+        # nothing, so it starts at m.end()).
+        line_end = text.find("\n", m.end())
+        remainder = text[m.end() : (line_end if line_end != -1 else len(text))]
+        # Only PLAIN PROSE is glue: no marker-structural glyph anywhere and no
+        # second stray tic. A tail that overruns the wrapper cap, a repeated
+        # ``(OPTIONS)`` tic, an interior closer, or a label separator all fail
+        # toward the visible marker, so ``[OPTIONS: Fix ]x logging | Skip]`` stays
+        # literal instead of splitting into a false pill. A parenthesised
+        # remainder WITH spaces (``(system: do x)``) is prose and still counts.
+        if (
+            "[OPTIONS:" in remainder
+            or any(c in MARKER_STRUCTURE_CHARS for c in remainder)
+            or _STRAY_TIC_HEAD_RE.match(remainder)
+        ):
+            continue
+        yield m, remainder
 
 
 def reflow_and_label_glued_option_marker(text: str) -> tuple[str, list[str]]:
@@ -675,52 +986,40 @@ def reflow_and_label_glued_option_marker(text: str) -> tuple[str, list[str]]:
         return text, []
 
     glued: list[str] = []
-    # One fence walker for the whole text, advanced to each candidate in turn.
-    # ``re.sub`` visits matches front to back, and every candidate starts at a
-    # line start (``^`` under MULTILINE), so the slice fed between two candidates
-    # always ends on a line boundary and the walker's state at ``m.start()`` is
-    # exactly ``_in_open_fence(text, m.start())``. Re-walking the prefix per
-    # candidate instead is quadratic: a reply of ~10k glued marker lines would
-    # hold the event loop past the loop-stall watchdog.
-    walk = _FenceWalk()
-    fed_to = 0
-
-    def _replace(m: re.Match[str]) -> str:
-        nonlocal fed_to
-        walk.feed_text(text[fed_to : m.start()])
-        fed_to = m.start()
-        # The grammar's own balance decision -- do not reflow a candidate whose
-        # terminator is really an unmatched opener's partner.
-        if _marker_labels_have_unmatched_opener(m.group("labels")):
-            return m.group(0)
-        # Inside a code fence every line is literal code the renderer shows
-        # verbatim, so a marker-shaped line there is a SAMPLE, not a footer, and
-        # inserting a newline would corrupt the sample. Same fence walker and same
-        # fail-safe as ``strip_control_comments``: an ambiguous fence structure
-        # answers "inside", and the candidate is left as it is.
-        if walk.inside:
-            return m.group(0)
-        # Same-line remainder after the matched marker (the lookahead consumed
-        # nothing, so it starts at m.end()).
-        line_end = text.find("\n", m.end())
-        remainder = text[m.end() : (line_end if line_end != -1 else len(text))]
-        # A remainder is reflowed only when it holds no marker-structural glyph
-        # anywhere and does not begin with a second stray tic. A tail that overruns
-        # the wrapper cap, a repeated ``(OPTIONS)`` tic, an interior closer, or a
-        # label separator all fail toward the visible marker. The canonical
-        # example ``[OPTIONS: Fix ]x logging | Skip]`` stays literal instead of
-        # splitting into a false pill. A parenthesised remainder WITH spaces
-        # (``(system: do x)``) is prose and still reflows.
-        if (
-            "[OPTIONS:" in remainder
-            or any(c in MARKER_STRUCTURE_CHARS for c in remainder)
-            or _STRAY_TIC_HEAD_RE.match(remainder)
-        ):
-            return m.group(0)
+    out: list[str] = []
+    cursor = 0
+    for m, remainder in _glued_marker_candidates(text):
         glued.append(remainder)
-        return m.group(0) + "\n" + GLUED_FOOTER_TEXT_LABEL + "\n"
+        out.append(text[cursor : m.end()] + "\n" + GLUED_FOOTER_TEXT_LABEL + "\n")
+        cursor = m.end()
+    out.append(text[cursor:])
+    return "".join(out), glued
 
-    return _RAW_OPTIONS_GLUE_RE.sub(_replace, text), glued
+
+def relocate_glued_tail_marker(text: str) -> str:
+    """Move plain prose glued after the reply's LAST marker to just above it.
+
+    For the tail-anchored channel renderers (:data:`OPTIONS_RE_TRAILER`), where a
+    newline alone cannot help. Same candidates as the dashboard reflow, but no
+    label and no report: *text* comes back unchanged unless the marker's line ends
+    the reply and the moved result parses as a trailer.
+    """
+    if "[OPTIONS:" not in text:
+        return text
+    last = None
+    for last in _glued_marker_candidates(text):
+        pass
+    if last is None:
+        return text
+    m, remainder = last
+    rest = text[m.end() + len(remainder) :]
+    if rest.strip():
+        return text
+    moved = text[: m.start()] + remainder + "\n" + m.group(0) + rest
+    # Moved prose that opens a fence (``~~~py``) would swallow the marker.
+    if _in_open_fence(moved, m.start() + len(remainder) + 1):
+        return text
+    return moved if OPTIONS_RE_TRAILER.search(moved) else text
 
 
 # CONTROL-TAG HTML COMMENTS — canonical grammar (single source of truth).
@@ -1116,6 +1415,72 @@ def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
     return text[:suffix_start], text[suffix_start:]
 
 
+# ── Markdown link destinations ─────────────────────────────────────────────
+
+#: A nested Markdown link opener. Backslash escapes are one token, and bare
+#: brackets and newlines end the label, so an escaped ``]`` cannot close the
+#: probe while a real nested opener is still refused.
+_MD_LINK_NESTED_OPENER = r"\[(?:\\.|[^\[\]\\\n])*\]\("
+
+
+def md_link_destination(char_class: str) -> str:
+    """Regex for one unit of a Markdown link destination, the ``HERE`` in ``[label](HERE)``.
+
+    *char_class* is a negated character class for one destination character, and it
+    MUST exclude both parentheses (``r"[^()\\s]"``). A unit is one such character or a
+    parenthesised run of them, so repeating it (``+`` or ``*``) matches a destination
+    whose parentheses come in balanced pairs one level deep.
+
+    That is what CommonMark allows (a destination "includes parentheses only if ...
+    they are part of a balanced pair"), and it is the shape real URLs have:
+    ``https://en.wikipedia.org/wiki/Python_(programming_language)``,
+    ``.../ms123401(v=vs.85)``. A ``[^)]+`` destination ends that URL at its first
+    ``)`` instead: the link opens a page that does not exist and a stray ``)``
+    follows the label. Deeper nesting is left unlinked rather than cut.
+
+    This is the parenthesis grammar of ``messaging.outbound_files._walk_destination``
+    bounded to one nesting level. A backslash escape is one token, as it is to the
+    walker: a backslash and the destination character after it are consumed as a
+    pair, so ``a\\\\)`` closes at that ``)`` where the walker closes, and ``\\[`` is an
+    escaped bracket rather than the ``[`` of a nested link. An unescaped backslash
+    directly before ``(`` or ``)`` is refused: neither is a destination character, so
+    a destination carrying ``\\)`` or ``\\(`` is left unlinked rather than cut at the
+    escape. A ``[`` that opens a nested ``[label](`` is refused,
+    because that starts a link of its own; this keeps an outer destination from
+    swallowing an inner link. Without the refusal ``[x](a [AKIA](u)REST)`` is one link
+    to the display-safety screen, which collapses it to ``x`` and scans no key, while
+    a CommonMark reader (an unbracketed destination admits no space) links only
+    ``[AKIA](u)`` and shows ``AKIAREST`` joined. A ``](`` that opens no link, as in
+    ``https://x/a](b)``, stays part of the URL. Wherever the unit matches, it closes
+    at the same ``)`` as the walker; otherwise it does not match. Only the destination
+    text can differ: the walker drops the backslash of an escaped non-parenthesis
+    character as it walks, and ``messaging.outbound_files._finish_destination`` then
+    rewrites or rejects what it collected. Neither moves the end: the dropped
+    backslash escapes no parenthesis, and the rewrite runs after the close is found.
+    It is a regex rather than a call to the walker because four channel renderers
+    compose it into one ``re.sub`` pass and the display-safety screen must stay
+    linear-time: a walk started from every ``[label](`` opener is quadratic on
+    repeated openers. ``test/test_markdown_link_parentheses.py`` pins the shared end.
+
+    Linear on adversarial text: the three alternatives start on disjoint characters
+    (a backslash, a *char_class* character other than a backslash, ``(``), and the
+    escape is two characters wide. The nested-opener lookahead is not fixed-width,
+    but it scans only to the next bracket or newline, so the lookaheads of one
+    attempt never cover the same text twice. A group closes only on ``)``, so a
+    doomed match never re-partitions what it already consumed.
+
+    Every channel renderer that turns a Markdown link into a platform link builds its
+    destination from this unit, and so does the display-safety screen
+    (``messaging.display_safety``), which has to collapse exactly the links a reader
+    will see as links.
+    """
+    escape = rf"\\{char_class}"
+    return (
+        rf"(?:{escape}|(?!\\|{_MD_LINK_NESTED_OPENER}){char_class}"
+        rf"|\((?:{escape}|(?!\\|{_MD_LINK_NESTED_OPENER}){char_class})*\))"
+    )
+
+
 # Wire markers opening an injected sub-agent completion turn. They live in this
 # leaf module rather than beside the dashboard's other transcript prefixes so a
 # CORE module can import them at module scope: `subagent.py` composes them too,
@@ -1125,6 +1490,22 @@ def split_trailing_protocol_suffix(text: str) -> tuple[str, str]:
 # a `startswith` written against one silently misses the other.
 SUBAGENT_COMPLETION_PREFIX = "[Subagent completion event]"
 SUBAGENT_BATCH_COMPLETION_PREFIX = "[Subagent batch completion event]"
+
+#: What a parent is told beside the result of a sub-agent run that completed
+#: without making a single tool call. Such a run wrote no file, ran no command
+#: and made no commit, yet it can still answer a task that asked for one by
+#: narrating the steps as though it had taken them -- the usual shape for a
+#: reasoning-only agent (``"tools": []``) handed write work, and possible for any
+#: agent that answered from memory. The signal is the run's own observed tool
+#: activity (``SubagentInfo.made_no_tool_calls``), so the note needs no reading
+#: of specs or backends. The dispatch is not refused, because whether a task needs writes is
+#: not decidable from its prose; the parent is told instead to treat any reported
+#: change as a claim and check it. Prefixed with the agent's label by each caller.
+NO_TOOL_CALLS_NOTE = (
+    "made no tool calls in this run, so it did not itself write a file, run a "
+    "command or make a commit. Treat any such change it reports as a claim: check "
+    "it on disk before relying on it."
+)
 
 # Key under a completion message's ``meta`` where the gateway stamps the
 # structured header facts (outcome, tallies, chunk index, agent id) the
@@ -1319,3 +1700,65 @@ MAX_BANNER_CHARS = 500
 # process whose first ``kiro_crew`` import reached ``artifacts`` before
 # ``validation``. ``artifacts.MAX_CONTENT_BYTES`` is this name, re-exported.
 ARTIFACT_MAX_CONTENT_BYTES = 26_214_400  # 25 MiB
+
+#: Why a tool call was denied, for the in-band notice's cause-specific wording
+#: (``dashboard.state.build_refusal_steer_notice``). Defined in this leaf rather
+#: than in ``dashboard.state`` because the messaging core (``messaging.driver``
+#: and the channel approval deciders) has to name a cause without importing the
+#: dashboard: a decider that lets its prompt expire records
+#: ``DENY_CAUSE_APPROVAL_TIMEOUT`` and the TurnDriver steers that cause before
+#: it rejects. ``dashboard.state`` re-exports every name, so its importers are
+#: unchanged.
+DENY_CAUSE_POLICY = "policy"
+#: The SURFACE the turn runs on refuses the call -- a reject-all or read-only
+#: tool policy, a tool-free background one-liner -- as opposed to a safety rule
+#: judging the call itself (``DENY_CAUSE_POLICY``). Kept apart because the
+#: policy notice appends class-specific remediation keyed off the reason AND
+#: the model's own tool title; on a surface where no tool can run, naming a
+#: sanctioned command the model should run instead would be a second wall.
+DENY_CAUSE_SURFACE_POLICY = "surface_policy"
+DENY_CAUSE_INVALID_NAME = "invalid_name"
+DENY_CAUSE_HOOK_ERROR = "hook_error"
+DENY_CAUSE_BATCH_CASCADE = "batch_cascade"
+DENY_CAUSE_APPROVAL_TIMEOUT = "approval_timeout"
+DENY_CAUSE_APPROVAL_NO_BUDGET = "approval_no_budget"
+DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
+#: A channel approval card refused because the request was too long for the
+#: channel to show in full. A reader who cannot see the whole command cannot
+#: approve it, so the host declines without judging the action; the model can
+#: split the request into steps that fit. Distinct from
+#: ``DENY_CAUSE_APPROVAL_UNDELIVERABLE`` (the card could not be posted at all):
+#: here the fix is in the model's hands, and the notice must say so.
+DENY_CAUSE_APPROVAL_OVERSIZE = "approval_oversize"
+#: An UNATTENDED surface refused a call it would otherwise have auto-approved
+#: because its audit record could not be written (audit-or-deny: an approval
+#: that leaves no trace is what the Security Event Log exists to prevent).
+#: Nothing judged the action; the host could not record it. Distinct from
+#: ``DENY_CAUSE_HOOK_ERROR`` (a PreToolUse hook raised while deciding the call):
+#: naming a hook here would send the model looking at a gate that never ran.
+DENY_CAUSE_AUDIT_UNAVAILABLE = "audit_unavailable"
+
+#: Upper bound on the best-effort in-band deny notice steered into a running
+#: turn before a permission rejection goes back on the wire. Every deny site
+#: (dashboard chat runner, native Slack handler, messaging TurnDriver) runs
+#: ``reject_tool`` plus a SEL audit write AFTER the steer, and an unbounded await
+#: on a backpressured ACP stdin would stall the reject that unblocks the turn.
+#: One number so the three surfaces cannot drift apart.
+STEER_NOTICE_BOUND_SECS = 5.0
+
+# The longest ``seconds`` the kirocrew-core ``wait`` tool accepts and sleeps. One
+# name bounds the tool's schema (``validation.WAIT_SCHEMA``), its handler's clamp
+# (``mcp_tools.control.wait``) and the liveness contract that trusts a declared
+# wait (``acp.liveness.ToolCallState.declared_wait_verdict``), so raising it in one
+# place cannot leave a long wait badged as stalled.
+WAIT_TOOL_MAX_SECS = 1800
+
+# Longest retained STRING for a name, id or category. It lives here rather than
+# beside the other length caps in ``validation`` because ``execution_context``
+# needs exactly this one: ``validation`` reaches ``artifact_store``,
+# ``computer_use``, ``config.sections``, ``monitoring`` and ``project_scope``
+# (and ``security`` behind it), which is about 8 MB and 86 modules to learn one
+# integer -- and ``execution_context`` is on the identity path every MCP stub
+# takes at startup, so that graph lands once per session per server.
+# ``validation`` re-exports it, so every other reader is unaffected.
+MAX_SHORT_STRING = 500  # names, IDs, categories

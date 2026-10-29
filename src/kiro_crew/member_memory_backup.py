@@ -37,6 +37,10 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 _STAGE_NAME = re.compile(r"restore-[0-9a-f]{32}\Z")
 _ASIDE_NAME = re.compile(r"superseded-[0-9a-f]{32}\Z")
 _FILES = frozenset({"memory.db", "memory/preferences.md", "memory/projects.md"})
+# What the pre-identity layout (0.7.0-insider.1 to .5) also bundled. Accepted
+# only inside a manifest of that layout, never in one this build writes.
+_LEGACY_FILES = frozenset({"lessons.jsonl"})
+_LEGACY_HISTORY = re.compile(r"memory/history/\d{4}-\d{2}-\d{2}\.md\Z")
 _STORE_USE_LOCK = ".store-use.lock"
 
 
@@ -132,10 +136,60 @@ def release_store_use_lock(fd: int | None) -> None:
         os.close(fd)
 
 
+def _acquire_store_use_lock_for_read(db_path: Path, *, read_only_view: bool) -> int | None:
+    """Hold one store generation for a reader whose view may refuse the lock's write.
+
+    Unless *read_only_view* confirms a read-only mount, :func:`acquire_store_use_lock`
+    runs first, exactly as an opener's does. Where the view refuses its write, the same
+    shared lock is taken through a read-only descriptor on the existing file. A store
+    with no lock file there is read without one: the paths that take this lock
+    exclusively, replacement and pending-restore activation, hold the namespace lock as
+    well, and the reader already holds that. A lock file this path refuses raises
+    :class:`memory_stores.UnknownMemoryStore`, the namespace lock's own refusal, so a
+    command boundary handles both the same way.
+    """
+    if not read_only_view:
+        try:
+            return acquire_store_use_lock(db_path)
+        except OSError as exc:
+            if not memory_stores.is_lock_write_refusal(exc):
+                raise
+    lock_path = backup_directory(db_path) / _STORE_USE_LOCK
+    if lock_path.resolve() != lock_path.absolute():
+        raise memory_stores.UnknownMemoryStore("Member memory use lock is redirected")
+    fd = memory_stores.open_existing_lock_read_only(
+        lock_path,
+        refusal=memory_stores.UnknownMemoryStore,
+        defect="Member memory use lock is not a private regular file",
+    )
+    if fd is None:
+        logger.warning(
+            "memory store use lock %s does not exist and this process cannot create it; "
+            "reading the store without it",
+            lock_path,
+        )
+        return None
+    try:
+        platform_compat.acquire_lock(fd, exclusive=False)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 @contextmanager
 def hold_stores_for_read(stores_root: Path) -> Iterator[None]:
-    """Keep enumerated store generations in place until every file has been copied."""
-    with memory_stores.memory_store_namespace_lock(stores_root), ExitStack() as locks:
+    """Keep enumerated store generations in place until every file has been copied.
+
+    Works on a view of the tree this process cannot write, such as the read-only
+    ``memory_stores/`` a script cron's sandbox binds: both locks are then taken through
+    read-only descriptors on the files the gateway's writers lock, where those exist.
+    """
+    read_only_view = platform_compat.is_readonly_filesystem(stores_root)
+    with (
+        memory_stores.memory_store_namespace_lock(stores_root, read_only_ok=True),
+        ExitStack() as locks,
+    ):
         if stores_root.is_dir():
             for entry in sorted(stores_root.iterdir()):
                 if (
@@ -144,7 +198,9 @@ def hold_stores_for_read(stores_root: Path) -> Iterator[None]:
                     or memory_stores.memory_store_name_defect(entry.name) is not None
                 ):
                     continue
-                fd = acquire_store_use_lock(entry / memory_stores.MEMORY_DB_FILE)
+                fd = _acquire_store_use_lock_for_read(
+                    entry / memory_stores.MEMORY_DB_FILE, read_only_view=read_only_view
+                )
                 locks.callback(release_store_use_lock, fd)
         yield
 
@@ -265,17 +321,58 @@ def _read_json(path: Path) -> dict:
     return value
 
 
-def _allowed(name: str) -> bool:
-    return name in _FILES
+def _allowed(name: str, *, legacy: bool = False) -> bool:
+    if name in _FILES:
+        return True
+    return legacy and (name in _LEGACY_FILES or _LEGACY_HISTORY.fullmatch(name) is not None)
+
+
+def _is_legacy(value: dict) -> bool:
+    """A manifest or journal from the pre-identity layout names its owner by alias."""
+    return "member_id" not in value and "owner_member" in value
+
+
+def _names_owner(value: dict, name: str, owner: str) -> bool:
+    """Whether a manifest or journal belongs to member *owner* of store *name*.
+
+    The pre-identity layout wrote ``owner_member``, the member's alias. It is
+    read back through the attribution the start-of-process store upgrade made:
+    the store record's ``owner_member`` is that alias, and the member under that
+    alias is bound to this store and carries *owner* as its identity. Anything
+    else is another member's.
+    """
+    if not _is_legacy(value):
+        return value.get("member_id") == owner
+    alias = value.get("owner_member")
+    if not isinstance(alias, str) or not alias:
+        return False
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    config = KiroCrewConfig.load()
+    record = config.memory_stores.get(name)
+    agent = config.agents.get(alias)
+    return (
+        record is not None
+        and getattr(record, "owner_member", "") == alias
+        and getattr(record, "owner_member_id", "") == owner
+        and agent is not None
+        and agent.memory_store == name
+        and agent.member_id == owner
+    )
 
 
 def _discard_unpublished_stage(stage: Path, out: Path) -> None:
     """Clean only this verified temporary tree, never a current/prior member."""
+    if not (out / PENDING).exists():
+        _remove_stage_tree(stage, out)
+
+
+def _remove_stage_tree(stage: Path, out: Path) -> None:
+    """Remove a verified restore stage the caller knows no journal names."""
     if (
         stage.resolve() != stage.absolute()
         or stage.parent.resolve() != out.resolve()
         or not _STAGE_NAME.fullmatch(stage.name)
-        or (out / PENDING).exists()
     ):
         return
     try:
@@ -302,21 +399,116 @@ def _check_database(path: Path, name: str, owner: str) -> None:
         raise ValueError("Member snapshot database is missing, damaged, or unsupported") from exc
 
 
+def _check_snapshot_database(path: Path, manifest: dict, name: str, owner: str) -> None:
+    """Check a staged database against the layout its manifest was written in.
+
+    A pre-identity database has no ``member_database`` row yet. It must carry
+    this store's ``store_name`` stamp, as that layout's own restore required, and
+    no stamp or identity naming anyone else; it is completed in its stage before
+    it goes live (:func:`_normalize_legacy_stage`).
+    """
+    if not _is_legacy(manifest):
+        _check_database(path, name, owner)
+        return
+    from kiro_crew.memory_schema import STORE_NAME_META_KEY
+
+    try:
+        recorded = memory_stores._legacy_member_database_identity(
+            path, name, manifest["owner_member"]
+        )
+        with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True)) as db:
+            intact = db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            stamp = db.execute(
+                "SELECT value FROM memory_meta WHERE key=?", (STORE_NAME_META_KEY,)
+            ).fetchone()
+    except memory_stores.UnknownMemoryStore as exc:
+        raise ValueError(
+            f"Member snapshot database is unsupported or belongs to a different member ({exc})"
+        ) from exc
+    except sqlite3.Error as exc:
+        raise ValueError("Member snapshot database is missing, damaged, or unsupported") from exc
+    if recorded not in ("", owner) or stamp != (name,):
+        raise ValueError("Member snapshot database belongs to a different member or store")
+    if not intact:
+        raise ValueError("Member snapshot database failed integrity checking")
+
+
+def _normalize_legacy_stage(stage: Path, manifest: dict, name: str, owner: str) -> dict:
+    """Complete a staged pre-identity copy and return its manifest in the current layout.
+
+    Done before live memory is touched: at staging, before any journal exists,
+    and, for a restore the old build staged, at activation on a fresh copy of
+    its stage (:func:`_restage_legacy`) before the live tree is moved aside. So a
+    completion that cannot succeed refuses the restore with live memory
+    untouched. The old layout's own files stay in the stage,
+    undeclared: they are carried, not read.
+    """
+    try:
+        memory_stores.complete_legacy_member_directory(stage, member_id=owner, store=name)
+    except (memory_stores.UnknownMemoryStore, sqlite3.Error, OSError) as exc:
+        raise ValueError(f"Member snapshot database could not be upgraded ({exc})") from exc
+    _check_database(stage / "memory.db", name, owner)
+    current = {key: value for key, value in manifest.items() if key != "owner_member"}
+    current["member_id"] = owner
+    current["files"] = {
+        relative: _digest(stage / relative)
+        for relative in sorted(_FILES)
+        if (stage / relative).is_file()
+    }
+    return current
+
+
+def _restage_legacy(
+    out: Path, stage: Path, journal: dict, manifest: dict, name: str, owner: str
+) -> tuple[Path, dict]:
+    """Complete a restore the old build staged in a fresh stage, then repoint its journal.
+
+    The verified legacy stage is never written. A copy of it, links copied as
+    links, is completed and given a current-layout manifest, and the atomic
+    journal rewrite is the switch-over: a failure or an interruption before it
+    leaves the journal naming the untouched legacy stage, so the next start
+    repeats the completion, and one after it finds a current-layout stage and
+    journal.
+    """
+    fresh = out / ("restore-" + uuid4().hex)
+    fresh.mkdir(mode=0o700)
+    try:
+        platform_compat.restrict_dir_to_owner(fresh)
+        shutil.copytree(stage, fresh, symlinks=True, dirs_exist_ok=True)
+        current = _normalize_legacy_stage(fresh, manifest, name, owner)
+        atomic_write(fresh / MANIFEST, json.dumps(current), restrict_to_owner=True)
+    except BaseException:
+        _remove_stage_tree(fresh, out)
+        raise
+    translated = {key: value for key, value in journal.items() if key != "owner_member"}
+    translated.update(member_id=owner, stage=fresh.name)
+    atomic_write(out / PENDING, json.dumps(translated), restrict_to_owner=True)
+    _remove_stage_tree(stage, out)
+    return fresh, current
+
+
+def _complete_if_legacy(target: Path, manifest: dict, name: str, owner: str) -> None:
+    """Give a tree the old build itself activated, then was interrupted, its identity."""
+    if _is_legacy(manifest):
+        memory_stores.complete_legacy_member_directory(target, member_id=owner, store=name)
+
+
 def _manifest_valid(manifest: dict, name: str, owner: str) -> dict[str, str]:
     if (
         manifest.get("format") != BUNDLE_FORMAT
         or manifest.get("version") != BUNDLE_VERSION
         or manifest.get("store") != name
-        or manifest.get("member_id") != owner
+        or not _names_owner(manifest, name, owner)
     ):
         raise ValueError("Snapshot belongs to another member or uses an unsupported format")
+    legacy = _is_legacy(manifest)
     files = manifest.get("files")
     if not isinstance(files, dict) or "memory.db" not in files or len(files) > MAX_BUNDLE_FILES:
         raise ValueError("Snapshot file inventory is invalid")
     for filename, digest in files.items():
         if (
             not isinstance(filename, str)
-            or not _allowed(filename)
+            or not _allowed(filename, legacy=legacy)
             or not isinstance(digest, str)
             or not re.fullmatch(r"[0-9a-f]{64}", digest)
         ):
@@ -450,7 +642,9 @@ def stage_restore(backup: Path, db_path: Path) -> Path:
                                 raise ValueError("Snapshot file checksum does not match")
                 except (zipfile.BadZipFile, KeyError, json.JSONDecodeError) as exc:
                     raise ValueError("Member snapshot is invalid") from exc
-                _check_database(stage / "memory.db", name, owner)
+                _check_snapshot_database(stage / "memory.db", manifest, name, owner)
+                if _is_legacy(manifest):
+                    manifest = _normalize_legacy_stage(stage, manifest, name, owner)
                 (stage / MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
                 journal = {
                     "store": name,
@@ -481,7 +675,7 @@ def _pending_journal(db_path: Path, *, validate_owner: bool = True) -> tuple[Pat
         raise ValueError("Pending restore ownership no longer matches")
     if validate_owner:
         _, owner = _identity(db_path, allow_missing=True)
-        if journal.get("member_id") != owner:
+        if not _names_owner(journal, name, owner):
             raise ValueError("Pending restore ownership no longer matches")
     for field, pattern in (("stage", _STAGE_NAME), ("aside", _ASIDE_NAME)):
         value = journal.get(field)
@@ -596,8 +790,15 @@ def cancel_pending_restore(db_path: Path) -> bool:
             if db_path.exists():
                 from kiro_crew.vector_memory import read_member_database_identity
 
-                owner, store = read_member_database_identity(db_path)
-                if owner != journal.get("member_id") or store != journal.get("store"):
+                try:
+                    owner, store = read_member_database_identity(db_path)
+                except sqlite3.Error as exc:
+                    # A refusal the caller can report, not a raw driver error:
+                    # the journal stays, so nothing is lost by refusing.
+                    raise ValueError(
+                        "Live member memory is unreadable, so the pending restore was kept"
+                    ) from exc
+                if store != journal.get("store") or not _names_owner(journal, store, owner):
                     raise ValueError("Pending restore member no longer matches")
             stage, aside = out / journal["stage"], out / journal["aside"]
             if aside.exists() or not stage.is_dir():
@@ -628,7 +829,7 @@ def apply_pending_restore(db_path: Path) -> str | None:
                 return None
             name, owner = _identity(db_path, allow_missing=True)
             journal = _read_json(pending)
-            if journal.get("store") != name or journal.get("member_id") != owner:
+            if journal.get("store") != name or not _names_owner(journal, name, owner):
                 raise ValueError("Pending restore ownership no longer matches")
             stage_name, aside_name = journal.get("stage", ""), journal.get("aside", "")
             if (
@@ -649,6 +850,7 @@ def apply_pending_restore(db_path: Path) -> str | None:
             if not stage.exists() and target.exists() and (aside.exists() or not prior_existed):
                 manifest = _read_json(target / MANIFEST)
                 _manifest_valid(manifest, name, owner)
+                _complete_if_legacy(target, manifest, name, owner)
                 pending.unlink()
                 return aside.name if prior_existed else ""
             manifest = _read_json(stage / MANIFEST)
@@ -657,7 +859,12 @@ def apply_pending_restore(db_path: Path) -> str | None:
                 path = stage / relative
                 if path.resolve() != path or not path.is_file() or _digest(path) != checksum:
                     raise ValueError("Staged restore content changed; activation refused")
-            _check_database(stage / "memory.db", name, owner)
+            _check_snapshot_database(stage / "memory.db", manifest, name, owner)
+            if _is_legacy(manifest):
+                # A restore the old build staged: completed while live memory is
+                # still in place, so a completion that fails refuses activation
+                # and the restore can still be retried or cancelled.
+                stage, manifest = _restage_legacy(out, stage, journal, manifest, name, owner)
             if target.exists():
                 if not prior_existed:
                     raise ValueError(

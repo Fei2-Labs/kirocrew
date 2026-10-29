@@ -1,118 +1,29 @@
-"""Detection, install sequencing, and the capability-availability probe."""
+"""Detection, install sequencing, and the capability-availability probe.
+
+This file also holds the per-engine downloads, failure-detail redaction, the CLI
+environment and which launcher path is trusted. Browser revisions and status live in
+``test_browser_cli_install_browser_revisions.py``, the gateway command in
+``test_browser_cli_install_gateway_command.py``, stage reporting, the installer's
+process tree and the standalone installer command ``detect()`` offers in
+``test_browser_cli_install_run_control.py``, and the shared autouse pins and fakes in
+``browser_cli_install_helpers.py``.
+"""
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
+from browser_cli_install_helpers import _clear_node_bin_dir_caches  # noqa: F401
+from browser_cli_install_helpers import _default_no_os_deps  # noqa: F401
+from browser_cli_install_helpers import isolated_browser_cache_fixture  # noqa: F401
+from browser_cli_install_helpers import _complete, _wire
 
 from kiro_crew import env as env_mod
 from kiro_crew.browser_cli import install as mod
-
-# The real implementation, captured before the autouse fixture below replaces
-# ``mod._required_revisions`` with a degradation stub. Revision-aware tests
-# restore THIS (re-reading ``mod._required_revisions`` there would just re-bind
-# the stub to itself, silently leaving every test on the fallback path).
-_REAL_REQUIRED_REVISIONS = mod._required_revisions
-
-
-@pytest.fixture(autouse=True)
-def _clear_node_bin_dir_caches() -> None:
-    """Clear the Node-tool search caches used by ``_node_version`` and npm install.
-
-    ``cli_path()`` uses a separate absolute managed/system resolver. Node and npm
-    still resolve through ``find_node_tool`` and must not inherit a real-machine version-manager path
-    from an earlier test in the worker.
-    """
-    env_mod.node_bin_dirs.cache_clear()
-    env_mod._node_all_bin_dirs.cache_clear()
-    yield
-    env_mod.node_bin_dirs.cache_clear()
-    env_mod._node_all_bin_dirs.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-def isolated_browser_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Keep ``browser_ok`` off the developer's real Playwright cache.
-
-    Also defaults ``_required_revisions`` to ``None`` so a test that does not
-    opt into revision-awareness exercises the documented degradation path
-    (presence-only prefix match) deterministically, independent of any vetted
-    CLI install on the host. Tests that assert revision-exact behaviour override
-    this explicitly.
-    """
-    cache = tmp_path / "ms-playwright"
-    cache.mkdir()
-    monkeypatch.setattr(mod, "_browsers_cache_dir", lambda: cache)
-    monkeypatch.setattr(mod, "_required_revisions", lambda: None)
-    return cache
-
-
-@pytest.fixture(autouse=True)
-def _default_no_os_deps(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Default every test to a host with no OS-package step.
-
-    The browser step now asks :mod:`kiro_crew.browser_cli.os_deps` what this host
-    allows, and the answer is read from the DEVELOPER's ``/etc/os-release``
-    otherwise -- which would make the argv assertions here pass on macOS and fail
-    on Ubuntu. Tests that care about the flag opt in explicitly.
-    """
-    monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: False)
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "")
-
-
-def _wire(
-    monkeypatch: pytest.MonkeyPatch,
-    tools: dict[str, str],
-    results: dict[str, tuple[int, str, str]] | None = None,
-) -> list[list[str]]:
-    """Fake tool resolution and subprocess layer; return the recorded argv list.
-
-    *results* is keyed on the argv's first token so a test states only the
-    outcomes it cares about; anything unlisted succeeds silently.
-    """
-    calls: list[list[str]] = []
-    outcomes = results or {}
-
-    monkeypatch.setattr(
-        mod,
-        "find_node_tool",
-        lambda name, base_path=None: tools.get(name)
-        or ("/n/node" if name == "node" and tools.get("npm") else None),
-    )
-    monkeypatch.setattr(mod, "cli_path", lambda: tools.get(mod.CLI_BIN))
-    monkeypatch.setattr(
-        mod,
-        "_pinned_managed_cli_root",
-        lambda: contextlib.nullcontext(mod._managed_cli_root()),
-    )
-    monkeypatch.setattr(
-        mod,
-        "_node_runtime_executable",
-        lambda node: node,
-    )
-    monkeypatch.setattr(
-        mod,
-        "_stage_managed_node",
-        lambda source: Path("/managed/gateway-node"),
-    )
-    monkeypatch.setattr(
-        mod,
-        "cli_command",
-        lambda cli=None: (
-            [resolved] if (resolved := cli or tools.get(mod.CLI_BIN)) is not None else None
-        ),
-    )
-
-    def fake_run(argv: list[str], timeout: float) -> tuple[int, str, str]:
-        calls.append(list(argv))
-        return outcomes.get(argv[0], (0, "", ""))
-
-    monkeypatch.setattr(mod, "_run", fake_run)
-    return calls
 
 
 def test_detect_reports_absent_when_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -233,10 +144,10 @@ def test_detect_browser_ok_requires_chromium_build(
     assert mod.detect()["browser_ok"] is False
 
     # A non-chromium engine is not enough: attach/extension mode is chromium-only.
-    (isolated_browser_cache / "firefox-1489").mkdir()
+    _complete(isolated_browser_cache / "firefox-1489")
     assert mod.detect()["browser_ok"] is False
 
-    (isolated_browser_cache / "chromium-1200").mkdir()
+    _complete(isolated_browser_cache / "chromium-1200")
     assert mod.detect()["browser_ok"] is True
 
 
@@ -396,7 +307,7 @@ def test_install_adds_with_deps_only_where_the_host_honours_it(
 ) -> None:
     """``--with-deps`` drives the system package manager, and Playwright's
     implementation of it is apt-only, so the flag is gated on the host family
-    rather than on "is Linux"."""
+    rather than on "is Linux". The engine is always named explicitly."""
     monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: True)
     apt_calls = _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
     mod.install()
@@ -414,21 +325,18 @@ def test_install_falls_back_without_deps_when_the_package_step_is_refused(
 ) -> None:
     """A refused ``apt-get`` must not cost the operator the browser.
 
-    ``--with-deps`` shells out to
-    ``apt-get`` as root, sudo policy refuses it, and because the flag and the
-    download are one CLI invocation the download failed too -- even though it
-    needs no privilege at all.
+    ``--with-deps`` shells out to ``apt-get`` as root, sudo policy refuses it,
+    and because the flag and the download are one CLI invocation the download
+    failed too -- even though it needs no privilege at all. The remedy rides only
+    on the retry, the attempt a human has to act on.
     """
     monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: True)
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "run this: sudo apt-get ...")
-    calls = _wire(
-        monkeypatch,
-        {"npm": "/n/npm", "playwright-cli": "/n/pw"},
-        # Keyed on argv[0], so this fails BOTH browser attempts and the skills
-        # step too; the with-deps branch is distinguished below by argv content.
+    monkeypatch.setattr(
+        mod.os_deps, "missing_deps_hint", lambda engine="chromium": "run this: sudo apt-get ..."
     )
+    calls = _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
 
-    def fake_run(argv: list[str], timeout: float) -> tuple[int, str, str]:
+    def fake_run(argv: list[str], timeout: float, **_kw: Any) -> tuple[int, str, str]:
         calls.append(list(argv))
         if "--with-deps" in argv:
             return (
@@ -453,10 +361,50 @@ def test_install_falls_back_without_deps_when_the_package_step_is_refused(
     ]
     # The refused attempt stays visible rather than being swallowed...
     assert result["steps"][2]["ok"] is False
+    assert result["steps"][2]["hint"] == ""
     # ...but it must not veto an install the retry completed.
     assert result["steps"][3]["ok"] is True
     assert ["/n/pw", "install-browser", "chromium", "--with-deps"] in calls
     assert ["/n/pw", "install-browser", "chromium"] in calls
+
+
+def test_a_failed_retry_after_a_refused_with_deps_carries_the_engine_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both attempts fail, the last step decides the job, so it is the one
+    that must name the engine's remedy."""
+    monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: True)
+    monkeypatch.setattr(
+        mod.os_deps, "missing_deps_hint", lambda engine="chromium": f"install-deps {engine}"
+    )
+    _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"}, {"/n/pw": (1, "", "boom")})
+
+    steps = mod.install_browser("firefox")["steps"]
+
+    assert [s["name"] for s in steps] == [
+        "install-browser-firefox",
+        "install-browser-firefox-no-deps",
+    ]
+    assert steps[0]["hint"] == ""
+    assert steps[1]["hint"] == "install-deps firefox"
+
+
+def test_the_browser_step_hint_is_asked_for_the_engine_it_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Chromium package list does not make Firefox launch, so the remedy is
+    composed per engine."""
+    asked: list[str] = []
+
+    def hint(engine: str = "chromium") -> str:
+        asked.append(engine)
+        return f"hint for {engine}"
+
+    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", hint)
+    _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
+    mod.install()
+    mod.install_browser("webkit")
+    assert asked == ["chromium", "webkit"]
 
 
 def test_a_zero_exit_carrying_the_host_validation_warning_is_a_failure(
@@ -469,7 +417,9 @@ def test_a_zero_exit_carrying_the_host_validation_warning_is_a_failure(
     error arrives at the user's first browse as an opaque stack trace. The step
     must fail, and must carry the remedy.
     """
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "sudo dnf install -y nss")
+    monkeypatch.setattr(
+        mod.os_deps, "missing_deps_hint", lambda engine="chromium": "sudo dnf install -y nss"
+    )
     warning = (
         "Playwright Host validation warning: \n"
         "Host system is missing dependencies to run browsers.\n"
@@ -539,45 +489,15 @@ def test_an_ordinary_zero_exit_browser_step_still_succeeds(
     ]
 
 
-def test_install_still_fails_when_the_no_deps_retry_also_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The fallback is a retry, not a guarantee: a real download failure stays fatal.
-
-    Also pins WHERE the remedy lands. It belongs on the retry, which is the
-    attempt that actually ran without the package step; putting it on the
-    with-deps attempt would hang a remediation command on a failure the retry may
-    well have recovered from.
-    """
-    monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: True)
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "sudo dnf install -y nss")
-    calls = _wire(
-        monkeypatch,
-        {"npm": "/n/npm", "playwright-cli": "/n/pw"},
-        {"/n/pw": (1, "", "network unreachable")},
-    )
-
-    result = mod.install()
-
-    assert result["ok"] is False
-    assert [s["name"] for s in result["steps"]] == [
-        "npm-install-global",
-        "stage-node",
-        "install-browser",
-        "install-browser-no-deps",
-    ]
-    assert "sudo dnf install -y nss" not in result["steps"][2]["stderr"]
-    assert "sudo dnf install -y nss" in result["steps"][3]["stderr"]
-    assert all("--skills" not in argv for argv in calls)
-
-
 def test_a_failed_browser_step_carries_the_manual_remedy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """On a host whose libraries only root can install, the failure detail must
     carry the command that resolves it -- the settings panel shows that detail
     verbatim, so this is the whole remediation surface."""
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "sudo dnf install -y nss")
+    monkeypatch.setattr(
+        mod.os_deps, "missing_deps_hint", lambda engine="chromium": "sudo dnf install -y nss"
+    )
     _wire(
         monkeypatch,
         {"npm": "/n/npm", "playwright-cli": "/n/pw"},
@@ -592,26 +512,32 @@ def test_a_failed_browser_step_carries_the_manual_remedy(
     assert "sudo dnf install -y nss" in detail
 
 
-def test_the_remedy_survives_a_stderr_long_enough_to_hit_the_cap(
+def test_the_remedy_and_stderr_tail_survive_output_long_enough_to_hit_the_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The hint is appended AFTER truncation. Appending before it would let a
-    verbose package manager push the one actionable line out of view."""
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "sudo dnf install -y nss")
+    """The library list and remedy stay visible after verbose download output."""
+    hint = "sudo dnf install -y nss"
+    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda engine="chromium": hint)
+    stderr = "x" * 50_000 + "\nMissing libraries:\n    libgtk-4.so.1"
     _wire(
         monkeypatch,
         {"npm": "/n/npm", "playwright-cli": "/n/pw"},
-        {"/n/pw": (1, "", "x" * 50_000)},
+        {"/n/pw": (1, "", stderr)},
     )
 
     result = mod.install()
 
-    assert "sudo dnf install -y nss" in result["steps"][-1]["stderr"]
+    step = result["steps"][-1]
+    assert step["hint"] == hint
+    assert "Missing libraries:\n    libgtk-4.so.1" in step["stderr"]
+    assert step["stderr"].endswith(hint)
 
 
 def test_a_successful_step_carries_no_remedy(monkeypatch: pytest.MonkeyPatch) -> None:
     """The hint is failure-only: on a green install it would read as a warning."""
-    monkeypatch.setattr(mod.os_deps, "missing_deps_hint", lambda: "sudo dnf install -y nss")
+    monkeypatch.setattr(
+        mod.os_deps, "missing_deps_hint", lambda engine="chromium": "sudo dnf install -y nss"
+    )
     _wire(monkeypatch, {"npm": "/n/npm", "playwright-cli": "/n/pw"})
 
     result = mod.install()
@@ -700,6 +626,23 @@ def test_cli_env_layers_node_dirs_over_the_broad_path(monkeypatch: pytest.Monkey
     assert mod.cli_env()["PATH"] == "/node/bin:/home/.local/bin:/usr/bin"
 
 
+def test_cli_env_trusts_the_os_certificate_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Node children verify TLS against the OS store as well as Node's bundled roots.
+
+    A GUI-launched gateway has no shell profile, so a corporate proxy CA that the
+    OS already trusts would otherwise never reach the browser-download child.
+    """
+    monkeypatch.delenv("NODE_USE_SYSTEM_CA", raising=False)
+
+    assert mod.cli_env()["NODE_USE_SYSTEM_CA"] == "1"
+
+
+def test_cli_env_keeps_a_user_set_system_ca_choice(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("NODE_USE_SYSTEM_CA", "0")
+
+    assert mod.cli_env()["NODE_USE_SYSTEM_CA"] == "0"
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX ~ expansion and the ~/.local/bin (mise) layout; Windows uses a different PATH set",
@@ -756,8 +699,8 @@ class TestPerEngineDownloads:
     def test_engines_are_reported_individually(self, monkeypatch, tmp_path):
         cache = tmp_path / "ms-playwright"
         cache.mkdir(exist_ok=True)
-        (cache / "chromium-1208").mkdir()
-        (cache / "webkit-2248").mkdir()
+        _complete(cache / "chromium-1208")
+        _complete(cache / "webkit-2248")
         monkeypatch.setattr(mod, "_browsers_cache_dir", lambda: cache)
 
         assert mod.browsers_present() == {
@@ -794,7 +737,9 @@ class TestPerEngineDownloads:
         monkeypatch.setattr(mod, "cli_command", lambda cli=None: [cli or str(fake_cli)])
         seen: list[list[str]] = []
 
-        def _fake_step(name, argv, timeout, hint="", failure_signal=None):
+        def _fake_step(
+            name, argv, timeout, hint="", failure_signal=None, hint_requires_signal=False
+        ):
             seen.append(argv)
             return {"name": name, "ok": True, "returncode": 0}
 
@@ -811,35 +756,23 @@ class TestPerEngineDownloads:
         assert result["ok"] is False
         assert result["steps"][0]["name"] == "resolve-binary"
 
-    def test_a_refused_package_step_falls_back_to_a_plain_retry(self, monkeypatch, tmp_path):
-        """The per-engine path shares `_download_browser` with `install()`, so a
-        host that refuses the package manager must not cost it the download here
-        either."""
-        monkeypatch.setattr(mod.os_deps, "with_deps_supported", lambda: True)
+    def test_install_browser_reports_its_stages_around_the_download(self, monkeypatch, tmp_path):
         fake_cli = tmp_path / "playwright-cli"
         fake_cli.write_text("")
         monkeypatch.setattr(mod, "cli_path", lambda: str(fake_cli))
         monkeypatch.setattr(mod, "cli_command", lambda cli=None: [cli or str(fake_cli)])
-
-        seen: list[list[str]] = []
+        events: list[str] = []
 
         def fake_run(argv, timeout):
-            seen.append(list(argv))
-            if "--with-deps" in argv:
-                return (1, "", "not allowed to execute ... as root")
+            events.append("spawn:" + argv[-1])
             return (0, "", "")
 
         monkeypatch.setattr(mod, "_run", fake_run)
 
-        result = mod.install_browser("firefox")
+        result = mod.install_browser("firefox", on_stage=events.append)
 
         assert result["ok"] is True
-        assert [s["name"] for s in result["steps"]] == [
-            "install-browser-firefox",
-            "install-browser-firefox-no-deps",
-        ]
-        assert [str(fake_cli), "install-browser", "firefox", "--with-deps"] in seen
-        assert [str(fake_cli), "install-browser", "firefox"] in seen
+        assert events == ["downloading_browser", "spawn:firefox", "finishing"]
 
     def test_the_engine_still_reaches_argv_once_on_a_host_without_the_flag(
         self, monkeypatch, tmp_path
@@ -887,6 +820,79 @@ class TestFailureDetailIsRedactedAtTheSource:
         monkeypatch.setattr(mod, "_run", lambda argv, timeout: (1, "", "x" * 50_000))
         step = mod._step("npm-install-global", ["npm", "install"], 1.0)
         assert len(step["stderr"]) <= mod._STDERR_CAP
+
+    @pytest.mark.parametrize(
+        ("rc", "reason"),
+        [
+            (mod.INTERRUPTED_RC, mod._INTERRUPTED_REASON),
+            (mod.TIMEOUT_RC, "timed out after 1s: pw install-browser chromium"),
+        ],
+        ids=["interrupted", "timed-out"],
+    )
+    def test_an_interrupted_or_timed_out_step_carries_no_missing_deps_hint(
+        self, monkeypatch, rc, reason
+    ):
+        """A stopped or expired download did not fail for want of OS libraries,
+        so the remediation line must not be attached to it."""
+        hint = "sudo dnf install -y nss"
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (rc, "", reason))
+
+        step = mod._step("install-browser", ["pw", "install-browser", "chromium"], 1.0, hint=hint)
+
+        assert step["ok"] is False
+        assert step["returncode"] == rc
+        assert step["hint"] == ""
+        assert hint not in step["stderr"]
+        assert step["stderr"] == reason
+
+    def test_an_ordinary_failure_still_ends_with_the_hint(self, monkeypatch):
+        hint = "sudo dnf install -y nss"
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (1, "", "Missing libraries"))
+
+        step = mod._step("install-browser", ["pw", "install-browser", "chromium"], 1.0, hint=hint)
+
+        assert step["hint"] == hint
+        assert step["stderr"] == f"Missing libraries\n\n{hint}"
+
+    def test_a_hint_that_requires_the_signal_is_withheld_from_an_unrelated_failure(
+        self, monkeypatch
+    ):
+        """A verdict about the host is evidenced by the missing-library report
+        alone; a download that failed for another reason keeps its own error."""
+        hint = "WebKit is not supported on this operating system"
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (1, "", "server returned code 503"))
+
+        step = mod._step(
+            "install-browser",
+            ["pw", "install-browser", "webkit"],
+            1.0,
+            hint=hint,
+            failure_signal=mod.os_deps.host_deps_unsatisfied,
+            hint_requires_signal=True,
+        )
+
+        assert step["ok"] is False
+        assert step["hint"] == ""
+        assert step["stderr"] == "server returned code 503"
+
+    @pytest.mark.parametrize("rc", [0, 1], ids=["exit-0", "exit-1"])
+    def test_a_hint_that_requires_the_signal_rides_on_a_signalled_failure(self, monkeypatch, rc):
+        hint = "WebKit is not supported on this operating system"
+        stderr = "Host system is missing dependencies to run browsers.\n    libgtk-4.so.1"
+        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (rc, "", stderr))
+
+        step = mod._step(
+            "install-browser",
+            ["pw", "install-browser", "webkit"],
+            1.0,
+            hint=hint,
+            failure_signal=mod.os_deps.host_deps_unsatisfied,
+            hint_requires_signal=True,
+        )
+
+        assert step["ok"] is False
+        assert step["hint"] == hint
+        assert step["stderr"] == f"{stderr}\n\n{hint}"
 
     def test_credential_straddling_truncation_boundary_is_still_redacted(self, monkeypatch, caplog):
         """A URL credential whose ``@`` anchor sits past the display cap.
@@ -1086,6 +1092,106 @@ class TestCliPathTrust:
 
         assert mod.cli_path() == str(cli.resolve())
 
+    def test_install_refuses_up_front_when_the_workspace_contains_the_data_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, crew = self._isolate(tmp_path, monkeypatch)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (home.resolve(),))
+        calls = _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["ok"] is False
+        assert [s["name"] for s in result["steps"]] == ["check-install-boundary"]
+        detail = result["steps"][0]["stderr"]
+        assert f"{home.resolve()} contains the Kiro Crew data home ({crew})" in detail
+        assert "agent-writable" in detail
+        assert calls == []
+
+    def test_install_proceeds_over_the_data_home_when_a_vetted_system_launcher_resolves(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        system = self._executable(tmp_path / "opt" / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (home.resolve(),))
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (system,))
+        monkeypatch.setattr(mod, "_gateway_writable_component", lambda candidate, resolved: None)
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["steps"][0]["name"] == "npm-install-global"
+
+    def test_install_proceeds_when_the_workspace_is_beside_the_data_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._isolate(tmp_path, monkeypatch)
+        workspace = tmp_path / "workplace" / "kirocrew-workspace"
+        workspace.mkdir(parents=True)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (workspace.resolve(),))
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        assert result["steps"][0]["name"] == "npm-install-global"
+
+    def test_a_refused_launcher_found_after_install_names_it_and_the_reason(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _home, crew = self._isolate(tmp_path, monkeypatch)
+        leaf = crew / "playwright-cli"
+        cli = self._executable(leaf / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (leaf.resolve(),))
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        step = result["steps"][-1]
+        assert step["name"] == "resolve-binary"
+        assert step["stderr"] == (
+            f"{mod.CLI_BIN} was installed at {cli} but refused: "
+            f"the resolved executable is inside the agent-writable tree {leaf.resolve()}"
+        )
+
+    def test_install_reports_an_absent_managed_launcher_as_not_found(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        self._isolate(tmp_path, monkeypatch)
+        _wire(monkeypatch, {"npm": "/n/npm"})
+
+        result = mod.install()
+
+        step = result["steps"][-1]
+        assert step["name"] == "resolve-binary"
+        assert step["stderr"] == (
+            f"{mod.CLI_BIN} was not found in the managed tools leaf after a successful install"
+        )
+
+    def test_a_user_local_refusal_names_the_boundary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        crew = home / ".local" / "share" / "crew"
+        crew.mkdir(parents=True)
+        monkeypatch.setattr(mod, "config_dir", lambda: crew)
+        self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
+
+        reason = mod._managed_leaf_unresolved_reason()
+
+        assert "under the user-local tree" in reason
+
     def test_a_path_first_shim_is_not_resolved(
         self,
         tmp_path: Path,
@@ -1157,6 +1263,133 @@ class TestCliPathTrust:
         assert repr(str(candidate.resolve())) in warning
         assert "writable by the gateway user" in warning
 
+    def test_legacy_user_local_launcher_is_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """User-local upgrade journey: a ``~/.local/bin`` launcher is present but
+        declined, so the surface can explain the one-time managed reinstall."""
+        home, _crew = self._isolate(tmp_path, monkeypatch)
+        shim = self._executable(home / ".local" / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is True
+
+    def test_version_manager_launcher_is_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Version-manager upgrade journey: a PATH-resolved launcher (as a mise,
+        nvm, or Volta shim dir would contribute) is present but declined."""
+        self._isolate(tmp_path, monkeypatch)
+        shim = self._executable(tmp_path / "vm-shims" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is True
+
+    def test_no_launcher_at_all_is_not_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nothing on disk or PATH: not a refusal, so the plain not-installed
+        message stays, not the reinstall explanation."""
+        self._isolate(tmp_path, monkeypatch)
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is False
+
+    def test_a_trusted_managed_launcher_is_not_reported_refused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A resolvable managed launcher is not a refusal even if a legacy shim
+        also sits on PATH -- the trusted copy wins and the panel is available."""
+        home, crew = self._isolate(tmp_path, monkeypatch)
+        self._executable(crew / "playwright-cli" / "bin" / mod.CLI_BIN)
+        shim = self._executable(home / ".local" / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        assert mod.cli_path() is not None
+        assert mod.legacy_launcher_refused() is False
+
+    def test_a_trusted_system_launcher_resolves_and_is_not_a_refusal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When no managed leaf exists, a trusted fixed system candidate resolves
+        -- the panel is available, so this is not a refusal."""
+        self._isolate(tmp_path, monkeypatch)
+        candidate = self._executable(tmp_path / "system-bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (candidate,))
+        # The fixed system location is trusted here; only the agent-writable and
+        # user-local floors reject, and this candidate is under neither.
+        monkeypatch.setattr(mod, "_gateway_writable_component", lambda c, r: None)
+
+        assert mod.cli_path() == str(candidate.resolve())
+        assert mod.legacy_launcher_refused() is False
+
+    def test_an_agent_writable_path_shim_is_not_reported_as_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A planted shim on PATH that resolves inside an agent-writable tree is
+        refused, but it is NOT a user's legacy install -- a reinstall would not
+        address it -- so the plain refusal message stays, not the reinstall copy."""
+        self._isolate(tmp_path, monkeypatch)
+        project = tmp_path / "project"
+        shim = self._executable(project / "bin" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: (project.resolve(),))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is False
+
+    def test_a_user_owned_system_install_refused_as_writable_is_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A user's own machine install -- a Homebrew ``/opt/homebrew/bin`` or an
+        npm-global ``/usr/local/bin`` launcher -- is a fixed system candidate
+        refused as writable by the gateway user. It IS the user's own install, so
+        a one-time managed reinstall is the remedy and the surface explains it."""
+        self._isolate(tmp_path, monkeypatch)
+        candidate = self._executable(tmp_path / "homebrew" / "bin" / mod.CLI_BIN)
+        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: (candidate,))
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is True
+
+    def test_agent_writable_roots_unverifiable_is_not_reported_as_legacy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When the agent-writable roots cannot be verified the candidate is
+        refused as an anomaly, not a user install -- a reinstall would not
+        address it -- so the plain refusal message stays, not the reinstall copy.
+        This case does not carry the ``agent-writable tree`` substring, which the
+        earlier reason-string classification would have mis-read as legacy."""
+        self._isolate(tmp_path, monkeypatch)
+        shim = self._executable(tmp_path / "vm-shims" / mod.CLI_BIN)
+        monkeypatch.setenv("PATH", str(shim.parent))
+
+        def _boom() -> tuple[Path, ...]:
+            raise RuntimeError("roots backend unavailable")
+
+        monkeypatch.setattr(mod, "_agent_writable_roots", _boom)
+
+        assert mod.cli_path() is None
+        assert mod.legacy_launcher_refused() is False
+
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink and permission semantics")
 class TestGatewayWritableComponentWalksEveryDirectory:
@@ -1225,7 +1458,7 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         entry, writable, _target = self._hop_chain(tmp_path)
         self._writable_only(monkeypatch, writable)
 
-        resolved, reason = mod._system_candidate(entry)
+        resolved, reason, _kind = mod._system_candidate(entry)
 
         assert resolved is None
         assert reason is not None
@@ -1243,7 +1476,7 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         entry, prefix, _leaf = self._symlinked_component_chain(tmp_path)
         self._writable_only(monkeypatch, prefix)
 
-        resolved, reason = mod._system_candidate(entry)
+        resolved, reason, _kind = mod._system_candidate(entry)
 
         assert resolved is None
         assert reason is not None
@@ -1257,7 +1490,7 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         entry, _writable, target = self._hop_chain(tmp_path)
         self._writable_only(monkeypatch, None)
 
-        assert mod._system_candidate(entry) == (target.resolve(), None)
+        assert mod._system_candidate(entry) == (target.resolve(), None, None)
 
     def test_the_direct_launcher_file_walk_uses_the_same_enumeration(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1296,1061 +1529,3 @@ class TestGatewayWritableComponentWalksEveryDirectory:
         monkeypatch.setattr(mod.platform_compat, "traversed_components", never)
 
         assert mod._gateway_writable_component(leaf, leaf.resolve()) == leaf.parent.resolve()
-
-
-class TestWindowsGatewayCommand:
-    @staticmethod
-    def _managed_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
-        crew = tmp_path / "crew"
-        root = crew / "playwright-cli"
-        package = root / "node_modules" / "@playwright" / "cli"
-        package.mkdir(parents=True)
-        cmd = root / "playwright-cli.cmd"
-        cmd.write_text("@echo off\n", encoding="utf-8")
-        cmd.chmod(0o755)
-        node = root / "node.exe"
-        node.write_bytes(b"node")
-        node.chmod(0o755)
-        entry = package / "playwright-cli.js"
-        entry.write_text("// cli\n", encoding="utf-8")
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: ())
-        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: ())
-        monkeypatch.setattr(mod, "_warned_cli_refusals", set())
-        return root, node, entry
-
-    def test_gateway_invocation_uses_node_and_javascript_not_cmd(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _root, node, entry = self._managed_tree(tmp_path, monkeypatch)
-
-        command = mod.cli_command()
-
-        assert command == [str(node.resolve()), str(entry.resolve())]
-        assert not any(part.casefold().endswith((".cmd", ".bat")) for part in command)
-
-    def test_javascript_entrypoint_cannot_escape_the_sealed_root(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _root, _node, entry = self._managed_tree(tmp_path, monkeypatch)
-        outside = tmp_path / "outside.js"
-        outside.write_text("// attacker\n", encoding="utf-8")
-        entry.unlink()
-        entry.symlink_to(outside)
-
-        assert mod.cli_command() is None
-
-    def test_install_stages_node_inside_the_managed_root(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        crew = tmp_path / "crew"
-        source = tmp_path / "node.exe"
-        source.write_bytes(b"trusted node")
-        source.chmod(0o755)
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        probed: list[str] = []
-        monkeypatch.setattr(
-            mod, "_run", lambda argv, timeout: (probed.append(argv[0]), (0, "v24.18.0\n", ""))[1]
-        )
-
-        staged = mod._stage_managed_node(str(source))
-
-        assert staged == crew / "playwright-cli" / "node.exe"
-        assert staged.read_bytes() == b"trusted node"
-        # The smoke run exercised the staged copy inside the leaf, not the source.
-        assert probed and Path(probed[-1]).parent == staged.parent
-        assert Path(probed[-1]) != source
-
-        source.write_bytes(b"replacement node")
-        replaced = mod._stage_managed_node(str(source))
-
-        assert replaced == staged
-        assert replaced.read_bytes() == b"replacement node"
-
-
-def test_the_standalone_command_writes_no_fixed_name_into_the_working_directory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The operator pastes this into whatever shell is open, so the download
-    destination is a directory the command does not own. A fixed
-    `playwright-cli.sh` in the working directory would be truncated -- their own
-    copy, or an unrelated file that merely shares the name."""
-    monkeypatch.setattr(mod.os, "name", "posix")
-    posix = mod._standalone_install_command()
-    assert "mktemp -d" in posix
-    assert "-fsSLO" not in posix, "-O derives the name from the URL, into the cwd"
-    assert 'sh "$_pwcli_dir/playwright-cli.sh"' in posix
-    assert "d=$(mktemp" not in posix, "must not clobber a common scratch variable"
-
-    monkeypatch.setattr(mod.os, "name", "nt")
-    windows = mod._standalone_install_command()
-    assert "$env:TEMP" in windows
-    assert "NewGuid" in windows
-    assert "-OutFile $p" in windows
-    assert ".\\playwright-cli.ps1" not in windows
-
-
-def test_detect_offers_the_os_appropriate_standalone_installer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The panel's Node-blocked state must not end at "Download Node.js", which is
-    the one thing the operator it describes often cannot do -- no admin rights, or a
-    registry that needs a login. `detect()` therefore carries the standalone
-    installer command, and composes it HERE because only the gateway knows which OS
-    it runs on: the dashboard may be open on a different machine, and offering two
-    commands to choose between puts that guess on the user.
-
-    It is also the only place it can live. A shell command must not enter the i18n
-    catalogs -- the pseudolocale accents every Latin character, which would corrupt
-    the URL -- and the dashboard's untranslated-literal gate forbids holding it in
-    the component.
-    """
-    # Both `os.name` patches live in their OWN throwaway instance, because the
-    # `detect()` call below needs the REAL platform back and `monkeypatch.undo()`
-    # on the shared instance is not a way to get there: it reverts every record on
-    # that instance, including the two module-level autouse fixtures that patched
-    # through it. That would send `_browsers_cache_dir` and `_required_revisions`
-    # back to production for the rest of the test, and `detect()` would iterdir the
-    # developer's real ~/.cache/ms-playwright -- exactly what
-    # `isolated_browser_cache` exists to prevent. Exiting the context restores
-    # `os.name` alone.
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(mod.os, "name", "posix")
-        posix = mod._standalone_install_command()
-        assert "playwright-cli.sh" in posix
-        assert "powershell" not in posix
-        # Download-then-run rather than a pipe into a shell: a machine locked down
-        # enough to need this usually forbids piping the network into `sh`.
-        assert "| sh" not in posix
-        assert "curl -fsSL" in posix
-
-        patched.setattr(mod.os, "name", "nt")
-        windows = mod._standalone_install_command()
-        assert "playwright-cli.ps1" in windows
-        assert "playwright-cli.sh" not in windows
-
-    # `detect()` is exercised under the REAL platform: with `os.name` patched to
-    # "nt", pathlib refuses to build a WindowsPath on Linux and the call dies
-    # before the payload exists. The Windows branch above is the helper's job.
-    # `_wire` for the same reason every other `detect()` call site here uses it --
-    # unwired, `detect()` resolves the real `cli_path()` and spawns the host's own
-    # `playwright-cli --version` and `node --version` with the repo root as cwd.
-    _wire(monkeypatch, {})
-    assert mod.detect()["standalone_install"] == mod._standalone_install_command()
-
-
-# A trimmed real browsers.json, same shape playwright-core ships. chromium and
-# chromium-headless-shell share a revision; firefox/webkit differ, which is what
-# lets a test prove the match is per-engine and not a single global number.
-_MANIFEST = {
-    "comment": "Do not edit this file",
-    "browsers": [
-        {"name": "chromium", "revision": "1232", "installByDefault": True},
-        {"name": "chromium-headless-shell", "revision": "1232", "installByDefault": True},
-        {"name": "firefox", "revision": "1534", "installByDefault": True},
-        {"name": "webkit", "revision": "2327", "installByDefault": True},
-        {"name": "ffmpeg", "revision": "1011", "installByDefault": True},
-    ],
-}
-
-
-def _write_manifest(node_modules: Path, data: object) -> Path:
-    """Write *data* as ``<node_modules>/playwright-core/browsers.json``."""
-    core = node_modules / "playwright-core"
-    core.mkdir(parents=True, exist_ok=True)
-    path = core / "browsers.json"
-    path.write_text(json.dumps(data), encoding="utf-8")
-    return path
-
-
-def _install_root(root: Path, data: object) -> str:
-    """Model an `npm install -g` tree under *root*; return the CLI entry path.
-
-    ``<root>/lib/node_modules/@playwright/cli/playwright-cli.js`` with
-    ``playwright-core`` hoisted beside it in the same ``node_modules``. That is
-    the layout the manifest resolution anchors on, and the entry point is a real
-    on-disk file so ``Path(cli).resolve()`` canonicalises the same tree the
-    manifest was written into.
-    """
-    node_modules = root / "lib" / "node_modules"
-    _write_manifest(node_modules, data)
-    package = node_modules / "@playwright" / "cli"
-    package.mkdir(parents=True, exist_ok=True)
-    entry = package / "playwright-cli.js"
-    entry.write_text("// entry\n", encoding="utf-8")
-    return str(entry)
-
-
-class TestRequiredRevisionMatch:
-    """`browsers_present` compares cached revision to the CLI's required one.
-
-    The regression that must never return: a stale cache dir whose engine prefix
-    matches but whose revision is wrong reads as present, `browser_ok` goes true,
-    the launch fails "Browser ... is not installed", and the panel never offers
-    the download that fixes it.
-    """
-
-    def test_matching_revision_reads_ready(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        root = tmp_path / "cli-root"
-        launcher = _install_root(root, _MANIFEST)
-        # ``_wire`` pins ``cli_path`` to the launcher AND fakes the version probes, so
-        # ``detect()`` below never runs the host's ``node``/``playwright-cli``.
-        _wire(monkeypatch, {mod.CLI_BIN: launcher})
-        monkeypatch.setattr(
-            mod, "_required_revisions", _REAL_REQUIRED_REVISIONS
-        )  # use the real one
-        (isolated_browser_cache / "chromium-1232").mkdir()
-
-        assert mod.browsers_present()["chromium"] is True
-        assert mod._browser_present() is True
-        assert mod.detect()["browser_ok"] is True
-
-    def test_stale_revision_is_not_ready(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """THE regression. chromium-1208 is present, 1232 is required."""
-        root = tmp_path / "cli-root"
-        launcher = _install_root(root, _MANIFEST)
-        _wire(monkeypatch, {mod.CLI_BIN: launcher})
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium-1208").mkdir()
-
-        assert mod.browsers_present()["chromium"] is False
-        assert mod._browser_present() is False
-        # The gate is honest, so the panel can offer the download.
-        assert mod.detect()["browser_ok"] is False
-
-    def test_headless_shell_underscore_variant_does_not_satisfy_chromium(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """`chromium_headless_shell-1232` starts with "chromium", so the old
-        prefix match counted it as a Chromium build. It is a different artifact;
-        only a real `chromium-<rev>` dir satisfies the attach engine."""
-        root = tmp_path / "cli-root"
-        launcher = _install_root(root, _MANIFEST)
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium_headless_shell-1232").mkdir()
-
-        assert mod.browsers_present()["chromium"] is False
-        assert mod._browser_present() is False
-
-    def test_cache_dir_name_is_the_hyphenated_revision_form(self) -> None:
-        """One name per engine-revision pair, and never an underscore variant.
-
-        The only caller passes engines from `BROWSER_ENGINES`, none of which
-        contains a hyphen, so an underscored form of the same name could not
-        match any directory -- and accepting one would let
-        `chromium_headless_shell-<rev>` satisfy `chromium`, which is the very
-        false positive this gate exists to reject.
-        """
-        assert mod._cache_dir_name_for("chromium", "1232") == "chromium-1232"
-        assert "_" not in mod._cache_dir_name_for("chromium", "1232")
-
-    def test_an_underscored_cache_dir_does_not_satisfy_the_engine(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """The same rejection asserted through `browsers_present`, not the helper.
-
-        Testing only `_cache_dir_name_for` would still pass if a future change
-        re-added an underscore fallback in the caller instead of the helper, which
-        is where the original prefix match lived.
-        """
-        launcher = _install_root(tmp_path / "cli-root", _MANIFEST)
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium_1232").mkdir()
-
-        assert mod.browsers_present()["chromium"] is False
-        assert mod._browser_present() is False
-
-    def test_each_engine_matched_against_its_own_revision(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """firefox at its required 1534 is ready; webkit at a wrong revision is
-        not -- proving the check is per-engine, not one shared number."""
-        root = tmp_path / "cli-root"
-        launcher = _install_root(root, _MANIFEST)
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "firefox-1534").mkdir()
-        (isolated_browser_cache / "webkit-9999").mkdir()
-
-        present = mod.browsers_present()
-        assert present["firefox"] is True
-        assert present["webkit"] is False
-
-    @pytest.mark.parametrize("required_rev", ["1232", "1300", "1208", "9999"])
-    def test_ready_iff_cached_revision_equals_required(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        isolated_browser_cache: Path,
-        tmp_path: Path,
-        required_rev: str,
-    ) -> None:
-        """Property: for ANY required revision, a single cached chromium-1232 dir
-        reads ready exactly when 1232 is what is required -- never on a mismatch.
-
-        This is the property the prefix match violated: it answered "ready" for
-        every one of these required revisions. A mutation reintroducing
-        `startswith` fails on the three mismatched cases below.
-        """
-        root = tmp_path / "cli-root"
-        launcher = _install_root(
-            root,
-            {"browsers": [{"name": "chromium", "revision": required_rev}]},
-        )
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium-1232").mkdir()
-
-        assert mod.browsers_present()["chromium"] is (required_rev == "1232")
-
-
-class TestRevisionDegradation:
-    """When the required revision cannot be determined, a working browser must
-    not be reported broken. Missing metadata is an unknown, not a stale cache."""
-
-    def test_absent_manifest_falls_back_to_presence_only(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path
-    ) -> None:
-        """No resolvable manifest -> today's prefix behaviour, so any chromium-*
-        dir still reads ready rather than flipping to broken."""
-        monkeypatch.setattr(mod, "_browsers_manifest_path", lambda: None)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium-1208").mkdir()
-
-        assert mod.browsers_present()["chromium"] is True
-        assert mod._browser_present() is True
-
-    def test_unreadable_manifest_falls_back_to_presence_only(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """A manifest that is not valid JSON is treated as unknown, not fatal."""
-        root = tmp_path / "cli-root"
-        core = root / "node_modules" / "playwright-core"
-        core.mkdir(parents=True)
-        (core / "browsers.json").write_text("{ not json", encoding="utf-8")
-        bindir = root / "bin"
-        bindir.mkdir()
-        launcher = bindir / "playwright-cli"
-        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-        monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium-1208").mkdir()
-
-        assert _REAL_REQUIRED_REVISIONS() is None
-        assert mod.browsers_present()["chromium"] is True
-
-    def test_manifest_missing_an_engine_degrades_only_that_engine(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """A manifest that lists chromium but not webkit: chromium is matched by
-        revision, webkit degrades to presence-only rather than reading broken."""
-        root = tmp_path / "cli-root"
-        launcher = _install_root(root, {"browsers": [{"name": "chromium", "revision": "1232"}]})
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium-1208").mkdir()  # stale -> not ready
-        (isolated_browser_cache / "webkit-2248").mkdir()  # no required rev -> present
-
-        present = mod.browsers_present()
-        assert present["chromium"] is False
-        assert present["webkit"] is True
-
-    def test_malformed_rows_are_skipped_not_fatal(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        root = tmp_path / "cli-root"
-        launcher = _install_root(
-            root,
-            {
-                "browsers": [
-                    "not-a-dict",
-                    {"name": "chromium"},  # no revision
-                    {"revision": "1"},  # no name
-                    {"name": "webkit", "revision": 2327},  # int revision -> skipped
-                    {"name": "firefox", "revision": "1534"},
-                ]
-            },
-        )
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-
-        rev = _REAL_REQUIRED_REVISIONS()
-        # playwright-core ships string revisions, so a non-string is a malformed
-        # row like any other rather than a value to coerce. Skipping it leaves the
-        # engine without a required revision, which degrades to presence-only for
-        # that engine -- the safe direction.
-        assert rev == {"firefox": "1534"}
-
-    def test_manifest_without_browsers_list_is_none(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        root = tmp_path / "cli-root"
-        launcher = _install_root(root, {"comment": "empty"})
-        monkeypatch.setattr(mod, "cli_path", lambda: launcher)
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-
-        assert _REAL_REQUIRED_REVISIONS() is None
-
-
-class TestManifestResolution:
-    """The manifest is attributed to a `@playwright/cli` package, never searched for.
-
-    Anchoring is the correctness property. An unbounded walk up from the launcher
-    passes through `$HOME` on the standalone layout, where one unrelated
-    `~/node_modules/playwright-core` would supply a revision from a DIFFERENT
-    install -- reporting a WORKING browser broken, and continuing to after the
-    download the panel offers, because the gate keeps reading the foreign file.
-    """
-
-    def test_npm_global_hoisted_sibling_layout(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """`playwright-core` hoisted beside `@playwright/cli` in one node_modules."""
-        root = tmp_path / "cli-root"
-        entry = _install_root(root, _MANIFEST)
-        monkeypatch.setattr(mod, "cli_path", lambda: entry)
-
-        assert mod._browsers_manifest_path() == (
-            root / "lib" / "node_modules" / "playwright-core" / "browsers.json"
-        )
-
-    def test_nested_playwright_core_layout(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """npm nests a conflicting version under the package's own node_modules.
-
-        The nested copy is the one that serves this CLI, so it wins over a
-        hoisted sibling.
-        """
-        root = tmp_path / "cli-root"
-        entry = Path(_install_root(root, {"browsers": [{"name": "chromium", "revision": "1"}]}))
-        nested = _write_manifest(entry.parent / "node_modules", _MANIFEST)
-        monkeypatch.setattr(mod, "cli_path", lambda: str(entry))
-
-        assert mod._browsers_manifest_path() == nested
-
-    def test_npm_global_symlinked_bin_resolves_into_the_package(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """`npm install -g` leaves a symlink; resolving it lands in the tree."""
-        root = tmp_path / "cli-root"
-        entry = _install_root(root, _MANIFEST)
-        bindir = tmp_path / "bin"
-        bindir.mkdir()
-        link = bindir / "playwright-cli"
-        try:
-            link.symlink_to(entry)
-        except (OSError, NotImplementedError):
-            pytest.skip("symlinks not supported on this host")
-        monkeypatch.setattr(mod, "cli_path", lambda: str(link))
-
-        assert mod._browsers_manifest_path() == (
-            root / "lib" / "node_modules" / "playwright-core" / "browsers.json"
-        )
-
-    def test_standalone_wrapper_resolves_via_its_known_prefix(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """The standalone installer generates a WRAPPER SCRIPT, not a symlink.
-
-        The package tree is therefore not an ancestor of the launcher on PATH, so
-        no walk up from it can reach the manifest. The prefix is known, so it is
-        probed by path -- without which this install shape could never read a
-        revision and would silently keep the presence-only false positives.
-        """
-        prefix = tmp_path / "standalone"
-        _install_root(prefix, _MANIFEST)
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(prefix))
-        wrapper = tmp_path / "elsewhere" / "bin" / "playwright-cli"
-        wrapper.parent.mkdir(parents=True)
-        wrapper.write_text("#!/bin/sh\nexec node ...\n", encoding="utf-8")
-        monkeypatch.setattr(mod, "cli_path", lambda: str(wrapper))
-
-        assert mod._browsers_manifest_path() == (
-            prefix / "lib" / "node_modules" / "playwright-core" / "browsers.json"
-        )
-
-    def test_windows_npm_global_cmd_wrapper_finds_the_sibling_package(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """`npm install -g` writes a .cmd BATCH WRAPPER on Windows, not a symlink.
-
-        It resolves to itself, so nothing in its ancestry is the package dir and
-        the package sits at <prefix>/node_modules/@playwright/cli beside it. Left
-        unreachable, this shape reads no revision and silently falls back to the
-        presence-only match the gate exists to replace.
-        """
-        prefix = tmp_path / "npm-prefix"
-        node_modules = prefix / "node_modules"
-        manifest = _write_manifest(node_modules, _MANIFEST)
-        package = node_modules / "@playwright" / "cli"
-        package.mkdir(parents=True)
-        (package / "playwright-cli.js").write_text("// entry\n", encoding="utf-8")
-        wrapper = prefix / "playwright-cli.cmd"
-        wrapper.write_text("@echo off\r\nnode ...\r\n", encoding="utf-8")
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "absent-prefix"))
-        monkeypatch.setattr(mod, "cli_path", lambda: str(wrapper))
-
-        assert mod._browsers_manifest_path() == manifest
-
-    def test_posix_bin_wrapper_finds_the_lib_node_modules_package(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """A non-symlink launcher at <prefix>/bin resolves to itself too."""
-        prefix = tmp_path / "posix-prefix"
-        manifest_root = prefix / "lib" / "node_modules"
-        manifest = _write_manifest(manifest_root, _MANIFEST)
-        package = manifest_root / "@playwright" / "cli"
-        package.mkdir(parents=True)
-        wrapper = prefix / "bin" / "playwright-cli"
-        wrapper.parent.mkdir(parents=True)
-        wrapper.write_text("#!/bin/sh\nexec node ...\n", encoding="utf-8")
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "absent-prefix"))
-        monkeypatch.setattr(mod, "cli_path", lambda: str(wrapper))
-
-        assert mod._browsers_manifest_path() == manifest
-
-    def test_standalone_windows_prefix_without_lib_resolves(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """`npm --global --prefix` writes <prefix>/node_modules on Windows.
-
-        The POSIX form is <prefix>/lib/node_modules, so both are probed.
-        """
-        prefix = tmp_path / "standalone-win"
-        node_modules = prefix / "node_modules"
-        manifest = _write_manifest(node_modules, _MANIFEST)
-        (node_modules / "@playwright" / "cli").mkdir(parents=True)
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(prefix))
-        monkeypatch.setattr(mod, "cli_path", lambda: None)
-
-        assert mod._browsers_manifest_path() == manifest
-
-    def test_a_foreign_manifest_up_the_tree_is_never_adopted(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """THE false-broken regression, and the inverse of the stale-cache one.
-
-        A stray `playwright-core` from an unrelated `npm i playwright` sits in an
-        ANCESTOR of the launcher, with no `@playwright/cli` beside it. Adopting it
-        would hand the gate a revision from a different install and flip a working
-        browser to reported-broken. Unattributable means None, which takes the
-        documented presence-only fallback instead.
-        """
-        home = tmp_path / "home"
-        _write_manifest(
-            home / "node_modules", {"browsers": [{"name": "chromium", "revision": "9"}]}
-        )
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "absent-prefix"))
-        wrapper = home / "bin" / "playwright-cli"
-        wrapper.parent.mkdir(parents=True)
-        wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-        monkeypatch.setattr(mod, "cli_path", lambda: str(wrapper))
-
-        assert mod._browsers_manifest_path() is None
-        assert _REAL_REQUIRED_REVISIONS() is None
-
-    def test_a_working_browser_is_not_reported_broken_by_a_foreign_manifest(
-        self, monkeypatch: pytest.MonkeyPatch, isolated_browser_cache: Path, tmp_path: Path
-    ) -> None:
-        """The invariant the anchoring protects, asserted end to end."""
-        home = tmp_path / "home"
-        _write_manifest(
-            home / "node_modules", {"browsers": [{"name": "chromium", "revision": "9999"}]}
-        )
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "absent-prefix"))
-        wrapper = home / "bin" / "playwright-cli"
-        wrapper.parent.mkdir(parents=True)
-        wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
-        monkeypatch.setattr(mod, "cli_path", lambda: str(wrapper))
-        monkeypatch.setattr(mod, "_required_revisions", _REAL_REQUIRED_REVISIONS)
-        (isolated_browser_cache / "chromium-1232").mkdir()
-
-        assert mod.browsers_present()["chromium"] is True
-
-    def test_no_cli_means_no_manifest(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mod, "cli_path", lambda: None)
-        monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", "/nonexistent-prefix")
-        assert mod._browsers_manifest_path() is None
-        assert _REAL_REQUIRED_REVISIONS() is None
-
-
-def _attributed_lifecycle_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """A launcher, and the registry/bundle of the package attributable to it.
-
-    A real-FILE launcher beside its install prefix's ``node_modules``, which is
-    the shape ``_launcher_node_modules`` resolves. Deliberately not a symlink, so
-    the seam tests need no symlink privilege and run on every platform.
-    """
-    prefix = tmp_path / "prefix"
-    package = prefix / "node_modules" / "@playwright" / "cli"
-    core = package / "node_modules" / "playwright-core"
-    (core / "lib" / "tools" / "cli-client").mkdir(parents=True)
-    (core / "browsers.json").write_text('{"browsers": []}', encoding="utf-8")
-    launcher = prefix / "bin" / "playwright-cli"
-    launcher.parent.mkdir(parents=True)
-    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-    return (
-        launcher,
-        core / "lib" / "tools" / "cli-client" / "registry.js",
-        core / "lib" / "coreBundle.js",
-    )
-
-
-def _lifecycle_contract_tree(tmp_path: Path) -> tuple[Path, Path]:
-    package = tmp_path / "node_modules" / "@playwright" / "cli"
-    core = package / "node_modules" / "playwright-core"
-    (core / "lib" / "tools" / "cli-client").mkdir(parents=True)
-    (core / "browsers.json").write_text('{"browsers": []}', encoding="utf-8")
-    registry = core / "lib" / "tools" / "cli-client" / "registry.js"
-    bundle = core / "lib" / "coreBundle.js"
-    return package, registry, bundle
-
-
-def test_lifecycle_env_contract_is_confirmed_from_serving_cli_package(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    launcher, registry, bundle = _attributed_lifecycle_tree(tmp_path)
-    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
-    bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-    mod._source_contains.cache_clear()
-
-    assert mod.cli_lifecycle_env_support() == (mod.SeamSupport.SUPPORTED, "")
-
-
-def test_lifecycle_env_contract_fails_when_upstream_hook_disappears(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    launcher, registry, bundle = _attributed_lifecycle_tree(tmp_path)
-    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
-    bundle.write_text("// lifecycle socket override removed upstream", encoding="utf-8")
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-    mod._source_contains.cache_clear()
-
-    assert mod.cli_lifecycle_env_support()[0] is mod.SeamSupport.UNSUPPORTED
-
-
-def test_lifecycle_contract_never_falls_through_to_a_stale_package(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A launcher's own package answers for it, or nothing does.
-
-    The standalone install prefix is a legitimate fallback for a revision lookup
-    but not for a seam verdict: it describes a DIFFERENT install, so letting it
-    answer for an unattributable launcher would put the original misreport back
-    in a narrower case. Here the standalone package is healthy and the launcher
-    is unattributable -- the verdict must be UNVERIFIED, not SUPPORTED.
-    """
-    _launcher, standalone_registry, standalone_bundle = _attributed_lifecycle_tree(tmp_path)
-    standalone_registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
-    standalone_bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
-    monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "prefix"))
-    orphan = tmp_path / "elsewhere" / "playwright-cli"
-    orphan.parent.mkdir(parents=True)
-    orphan.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(mod, "cli_path", lambda: str(orphan))
-    mod._source_contains.cache_clear()
-
-    # The standalone package on its own would answer SUPPORTED.
-    assert mod._cli_package_dirs()
-    support, detail = mod.cli_lifecycle_env_support()
-
-    assert support is mod.SeamSupport.UNVERIFIED
-    assert str(orphan) in detail
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink launcher shape")
-def test_a_symlink_launcher_resolving_into_the_package_is_confirmed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The shape that DOES attribute by ANCESTRY: an ``npm install -g`` symlink.
-
-    The launcher resolves INTO the package tree, so an ancestor is the package
-    and no ``node_modules`` probe is needed. Its sibling above covers the
-    real-file shape, which reaches the package the other way.
-    """
-    package, registry, bundle = _lifecycle_contract_tree(tmp_path)
-    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
-    bundle.write_text("process.env.PWTEST_SOCKETS_DIR || os.tmpdir()", encoding="utf-8")
-    entrypoint = package / "cli.js"
-    entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-    launcher = tmp_path / "bin" / "playwright-cli"
-    launcher.parent.mkdir(parents=True)
-    launcher.symlink_to(entrypoint)
-    monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "absent-prefix"))
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-    mod._source_contains.cache_clear()
-
-    assert mod.cli_lifecycle_env_support() == (mod.SeamSupport.SUPPORTED, "")
-
-
-def test_an_unattributable_launcher_is_unverified_and_names_the_launcher(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A version-manager shim resolves to itself, not into any package tree.
-
-    No bundle is read, so the CLI's capability is unknown. Reporting that as
-    UNSUPPORTED is what sent an operator to upgrade a CLI that carried both
-    hooks; the verdict must name the launcher it could not attribute instead.
-    """
-    shim = tmp_path / "shims" / "playwright-cli"
-    shim.parent.mkdir(parents=True)
-    shim.write_text('#!/bin/sh\nexec versionctl exec -- "$0" "$@"\n', encoding="utf-8")
-    monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", str(tmp_path / "absent-prefix"))
-    monkeypatch.setattr(mod, "cli_path", lambda: str(shim))
-
-    support, detail = mod.cli_lifecycle_env_support()
-
-    assert support is mod.SeamSupport.UNVERIFIED
-    assert str(shim) in detail
-    assert "attributable" in detail
-
-
-def test_no_resolved_launcher_is_unverified_rather_than_a_capability_claim(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(mod, "cli_path", lambda: None)
-    monkeypatch.setenv("KIROCREW_PLAYWRIGHT_CLI_HOME", "/nonexistent-prefix")
-
-    support, detail = mod.cli_lifecycle_env_support()
-
-    assert support is mod.SeamSupport.UNVERIFIED
-    assert "no trusted playwright-cli launcher" in detail
-
-
-def test_a_package_without_a_serving_core_tree_is_unverified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Attribution reached the CLI package but no ``playwright-core`` serves it."""
-    prefix = tmp_path / "prefix"
-    package = prefix / "node_modules" / "@playwright" / "cli"
-    package.mkdir(parents=True)
-    launcher = prefix / "bin" / "playwright-cli"
-    launcher.parent.mkdir(parents=True)
-    launcher.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-
-    support, detail = mod.cli_lifecycle_env_support()
-
-    assert support is mod.SeamSupport.UNVERIFIED
-    assert str(package) in detail
-
-
-def test_an_unreadable_bundle_is_unverified_rather_than_unsupported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A bundle that cannot be stat'd was never searched for the hook."""
-    launcher, registry, _bundle = _attributed_lifecycle_tree(tmp_path)
-    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-    mod._source_contains.cache_clear()
-
-    support, detail = mod.cli_lifecycle_env_support()
-
-    assert support is mod.SeamSupport.UNVERIFIED
-    assert "could not be read" in detail
-
-
-@pytest.mark.parametrize(
-    ("size", "why"),
-    [(0, "an empty bundle is not a bundle without the needle"), (None, "past the size ceiling")],
-)
-def test_a_bundle_the_reader_refuses_is_unverified_not_unsupported(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, size: int | None, why: str
-) -> None:
-    """The size guard REFUSES to read; a refusal measures nothing.
-
-    Reporting it as UNSUPPORTED is the same defect as an unattributable
-    launcher: a claim about bytes that were never searched.
-    """
-    launcher, registry, bundle = _attributed_lifecycle_tree(tmp_path)
-    registry.write_text("process.env.PWTEST_DAEMON_SESSION_DIR", encoding="utf-8")
-    bundle.write_text("" if size == 0 else "process.env.PWTEST_SOCKETS_DIR || x", encoding="utf-8")
-    if size is None:
-        monkeypatch.setattr(mod, "_LIFECYCLE_SOURCE_MAX_BYTES", 1)
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-    mod._source_contains.cache_clear()
-
-    support, detail = mod.cli_lifecycle_env_support()
-
-    assert support is mod.SeamSupport.UNVERIFIED, why
-    assert "could not be read" in detail
-
-
-def test_the_dashboard_layout_gate_separates_attribution_from_capability(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The sibling gate carries the same three-valued contract."""
-    launcher, _registry, bundle = _attributed_lifecycle_tree(tmp_path)
-    monkeypatch.setattr(mod, "cli_path", lambda: str(launcher))
-
-    bundle.write_text(
-        'makeSocketPath("dashboard", "app"); process.env.PWTEST_SOCKETS_DIR || x',
-        encoding="utf-8",
-    )
-    mod._source_contains.cache_clear()
-    assert mod.cli_dashboard_socket_support() == (mod.SeamSupport.SUPPORTED, "")
-
-    bundle.write_text("// dashboard socket layout renamed upstream", encoding="utf-8")
-    mod._source_contains.cache_clear()
-    assert mod.cli_dashboard_socket_support()[0] is mod.SeamSupport.UNSUPPORTED
-
-    monkeypatch.setattr(mod, "cli_path", lambda: None)
-    assert mod.cli_dashboard_socket_support()[0] is mod.SeamSupport.UNVERIFIED
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX executable and permission semantics")
-class TestPosixGatewayCommand:
-    @staticmethod
-    def _managed_tree(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> tuple[Path, Path, Path, Path]:
-        crew = tmp_path / "crew"
-        root = crew / "playwright-cli"
-        package = root / "lib" / "node_modules" / "@playwright" / "cli"
-        package.mkdir(parents=True)
-        wrapper = root / "managed-bin" / "playwright-cli"
-        wrapper.parent.mkdir(parents=True)
-        wrapper.write_text("#!/bin/sh\nexec /agent/node ...\n", encoding="utf-8")
-        wrapper.chmod(0o755)
-        node = root / "gateway-node"
-        node.write_bytes(b"node")
-        node.chmod(0o755)
-        entry = package / "playwright-cli.js"
-        entry.write_text("// cli\n", encoding="utf-8")
-        attacker_node = tmp_path / "agent-bin" / "node"
-        attacker_node.parent.mkdir(parents=True)
-        attacker_node.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
-        attacker_node.chmod(0o755)
-        monkeypatch.setenv("PATH", str(attacker_node.parent))
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(mod, "_system_cli_candidates", lambda: ())
-        monkeypatch.setattr(mod, "_agent_writable_roots", lambda: ())
-        monkeypatch.setattr(mod, "_warned_cli_refusals", set())
-        return wrapper, node, entry, attacker_node
-
-    def test_gateway_invocation_uses_sealed_node_and_javascript_not_the_wrapper(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        wrapper, node, entry, attacker_node = self._managed_tree(tmp_path, monkeypatch)
-
-        command = mod.cli_command()
-
-        assert command == [str(node.resolve()), str(entry.resolve())]
-        assert str(wrapper.resolve()) not in command
-        assert str(attacker_node.resolve()) not in command
-
-    def test_javascript_entrypoint_cannot_escape_the_sealed_root(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _wrapper, _node, entry, _attacker_node = self._managed_tree(tmp_path, monkeypatch)
-        outside = tmp_path / "outside.js"
-        outside.write_text("// attacker\n", encoding="utf-8")
-        entry.unlink()
-        entry.symlink_to(outside)
-
-        assert mod.cli_command() is None
-
-    def test_install_stages_node_inside_the_managed_root(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        crew = tmp_path / "crew"
-        source = tmp_path / "node"
-        source.write_bytes(b"trusted node")
-        source.chmod(0o755)
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "v24.18.0\n", ""))
-
-        staged = mod._stage_managed_node(str(source))
-
-        assert staged == crew / "playwright-cli" / "gateway-node"
-        assert staged.read_bytes() == b"trusted node"
-        assert staged.stat().st_mode & 0o777 == 0o500
-
-    def test_install_refuses_a_launcher_script_that_cannot_run_from_the_leaf(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A ``bin/node`` that is a shell script locates the binary it starts
-        relative to its own path. It copies cleanly and passes the mode checks,
-        but a copy in the managed leaf points at a file that is not there. The
-        smoke run is a REAL process here: the copied script runs from the leaf,
-        its target is missing, and the install refuses, naming the source."""
-        crew = tmp_path / "crew"
-        bin_dir = tmp_path / "node" / "bin"
-        bin_dir.mkdir(parents=True)
-        wrapper = bin_dir / "node"
-        wrapper.write_text('#!/bin/sh\nexec "$(dirname "$0")/node_real" "$@"\n')
-        wrapper.chmod(0o755)
-        real = bin_dir / "node_real"
-        real.write_text("#!/bin/sh\necho v24.18.0\n")
-        real.chmod(0o755)
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-
-        # In place the wrapper works; that is what fooled the mode checks.
-        assert mod._run([str(wrapper), "--version"], 20.0)[0] == 0
-
-        with pytest.raises(OSError) as excinfo:
-            mod._stage_managed_node(str(wrapper))
-
-        message = str(excinfo.value)
-        assert str(wrapper) in message
-        assert "does not run from the managed leaf" in message
-        # The copied script looked for its sibling next to ITSELF, i.e. inside
-        # the leaf. The shell's wording differs (dash: "not found", bash: "No such
-        # file or directory"); the path it names is the shell-independent fact.
-        assert str(crew / "playwright-cli" / "node_real") in message
-
-        leaf = crew / "playwright-cli"
-        assert not (leaf / "gateway-node").exists()
-        assert not list(leaf.glob(".gateway-node-*.incoming")), "dead copy left in the leaf"
-
-    def test_install_refuses_a_binary_that_only_runs_under_its_wrapper_environment(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Some distributions wrap Node to inject ``LD_LIBRARY_PATH`` for a
-        bundled ``libstdc++``. The kernel names the real binary, it is a plain
-        executable with no ``#!``, and it still cannot run outside the wrapper.
-        Only running the staged copy catches that class, so the smoke run is
-        what refuses it; a magic-bytes check would have staged a dead file."""
-        crew = tmp_path / "crew"
-        binary = tmp_path / "node_real"
-        binary.write_bytes(b"\x7fELF needs the wrapper's LD_LIBRARY_PATH")
-        binary.chmod(0o755)
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(
-            mod,
-            "_run",
-            lambda argv, timeout: (127, "", "error while loading shared libraries: libstdc++.so.6"),
-        )
-
-        with pytest.raises(
-            OSError, match=r"does not run from the managed leaf \(exit 127: .*libstdc\+\+"
-        ):
-            mod._stage_managed_node(str(binary))
-
-        assert not (crew / "playwright-cli" / "gateway-node").exists()
-
-    def test_install_refuses_a_copy_that_runs_but_is_not_node(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Exit 0 with no version banner is not a Node either."""
-        crew = tmp_path / "crew"
-        binary = tmp_path / "node"
-        binary.write_bytes(b"\x7fELF something else")
-        binary.chmod(0o755)
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(mod, "config_dir", lambda: crew)
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "usage: not-node\n", ""))
-
-        with pytest.raises(OSError, match=r"did not report a version"):
-            mod._stage_managed_node(str(binary))
-
-        assert not (crew / "playwright-cli" / "gateway-node").exists()
-
-
-class TestNodeRuntimeExecutableProbe:
-    """The staged binary is the one the KERNEL says is running, not the one
-    Node names: ``process.execPath`` is argv[0], and a launcher script that
-    starts the binary with ``exec -a <script>`` makes Node report the script."""
-
-    def _resolved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        binary = tmp_path / "bin" / "node_real"
-        binary.parent.mkdir(parents=True)
-        binary.write_bytes(b"\x7fELF native node")
-        binary.chmod(0o755)
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, f"{binary}\n", ""))
-        return binary
-
-    def test_probe_asks_the_kernel_first_and_falls_back_to_execpath(self) -> None:
-        probe = mod._NODE_EXECUTABLE_PROBE
-        assert "realpathSync('/proc/self/exe')" in probe
-        assert probe.index("/proc/self/exe") < probe.index("process.execPath")
-
-    def test_probe_output_is_resolved_as_an_executable_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        binary = self._resolved(tmp_path, monkeypatch)
-        seen: list[list[str]] = []
-
-        def run(argv: list[str], timeout: float) -> tuple[int, str, str]:
-            seen.append(argv)
-            return (0, f"{binary}\n", "")
-
-        monkeypatch.setattr(mod, "_run", run)
-
-        assert mod._node_runtime_executable("node") == str(binary.resolve())
-        assert seen == [["node", "-p", mod._NODE_EXECUTABLE_PROBE]]
-
-    def test_probe_rejects_a_relative_or_multiline_answer(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "node_real\n", ""))
-        assert mod._node_runtime_executable("node") is None
-        monkeypatch.setattr(mod, "_run", lambda argv, timeout: (0, "/a\n/b\n", ""))
-        assert mod._node_runtime_executable("node") is None
-
-
-class TestSystemGatewayCommand:
-    def test_posix_node_candidates_never_consume_path(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        launcher = tmp_path / "system" / "playwright-cli"
-        package = tmp_path / "system" / "lib" / "node_modules" / "@playwright" / "cli"
-        package.mkdir(parents=True)
-        launcher.parent.mkdir(parents=True, exist_ok=True)
-        launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-        attacker = tmp_path / "agent-bin" / "node"
-        attacker.parent.mkdir()
-        attacker.write_text("#!/bin/sh\n", encoding="utf-8")
-        monkeypatch.setenv("PATH", str(attacker.parent))
-        monkeypatch.setattr(mod.platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(mod.platform_compat, "trusted_system_path", lambda: "/usr/bin")
-        monkeypatch.setattr(mod.github_runner, "PROVIDER_EXECUTABLE_DIRS", ())
-
-        candidates = mod._system_node_candidates(launcher, package)
-
-        assert Path("/usr/bin/node") in candidates
-        assert attacker not in candidates
-
-    def test_a_path_only_node_cannot_complete_a_system_command(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        launcher = tmp_path / "system" / "playwright-cli"
-        launcher.parent.mkdir()
-        launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
-        launcher.chmod(0o755)
-        package = tmp_path / "system" / "package"
-        package.mkdir()
-        entry = package / "playwright-cli.js"
-        entry.write_text("// cli\n", encoding="utf-8")
-        attacker = tmp_path / "agent-bin" / "node"
-        attacker.parent.mkdir()
-        attacker.write_text("#!/bin/sh\n", encoding="utf-8")
-        attacker.chmod(0o755)
-        monkeypatch.setenv("PATH", str(attacker.parent))
-        monkeypatch.setattr(mod, "_cli_package_for_launcher", lambda _launcher: package)
-        monkeypatch.setattr(mod, "_managed_cli_root", lambda: tmp_path / "absent-managed")
-        monkeypatch.setattr(mod, "_system_node_candidates", lambda _launcher, _package: ())
-        monkeypatch.setattr(
-            mod,
-            "_resolve_executable_file_for_system",
-            lambda _entry: (entry.resolve(), None),
-        )
-
-        command, reason = mod._direct_cli_command(str(launcher))
-
-        assert command is None
-        assert reason is not None and "no fixed non-writable Node" in reason
-        assert str(attacker) not in reason

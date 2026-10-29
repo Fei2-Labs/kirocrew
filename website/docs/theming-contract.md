@@ -44,7 +44,7 @@ streaming glow. So are the shipped gradient mechanisms — the appstore gradient
 art in `components/appstore/gradient.ts` (which reads as content, not chrome)
 and the session `'gradient'` color mode. The UX review lane
 (`.github/workflows/ux-review.yml` and its fork variant) applies this rule.
-Theme blocks in `index.css` also set a few non-color properties that are
+Theme blocks in `src/styles/design-tokens.css` and `src/styles/theme-palettes.css` also set a few non-color properties that are
 deliberately NOT on the allowlist: the font tokens (`--font-body`, `--mono`)
 and radii are injected as fixed defaults by `buildCustomThemeCss` (fonts are a
 pack-level L1 surface, not per-color-mode data), and the `--search-highlight*`
@@ -53,7 +53,7 @@ trio is an internal find-in-page surface not exposed to theme packs.
 **`buildCustomThemeCss` also fills the allowlisted colors a pack OMITS.** Fonts
 and radii are not the only thing it emits. Because `variables.json` requires only
 `--bg`, `--text` and `--accent`, a valid pack can leave ~50 tokens unset, and an
-unset token inherits from the bare `:root` in `index.css` — which carries the DARK
+unset token inherits from the bare `:root` in `src/styles/design-tokens.css` — which carries the DARK
 palette and has no light counterpart. A pack with a light `--bg` would therefore
 paint dark-mode surfaces under its own light palette. So the builder derives the
 gap from the pack's own palette: surfaces and borders as small steps from `--bg`
@@ -71,15 +71,55 @@ surface that sits directly on the page and has no `border`, `ring`, or `shadow`
 paints nothing visible there — it "works" in every other theme and ships invisible
 in that one, with no gate failing. The rule for a new component: a `bg-card` box on
 `--bg` gets a `border-border`, a `ring-1 ring-border`, or a `shadow-*`, the way the
-top-bar search field and the settings cards already do. The three surfaces that
-deliberately stay borderless (the user bubble, the two top-bar capsules) are
-handled by kiro-light-scoped hooks in `index.css`, and
+settings cards already do. The one surface that deliberately stays borderless (the
+user bubble) is handled by a kiro-light-scoped hook in `src/styles/chat-transcript.css`, and
 `src/test/kiroLightShellHooks.test.ts` pins that list; a new borderless card is a
-fourth hook there, not an unmarked exception. The inverse holds too: a `bg-bg`
+second hook there, not an unmarked exception. A Liquid Glass pane (`components/Glass.tsx`,
+below) is not one: the top bar's search trigger, readout capsule and Request a Feature
+pill are glass, and the material draws its own lit edge on every canvas. The inverse
+holds too: a `bg-bg`
 well nested inside a `bg-card` container is the same pair of values seen from the
 other side, so a code or output block that relies on the well being darker than its
 card gets the same `border-border` — and a `hover:bg-card` on a row that sits on
 the page is not a hover at all in this theme; hover states use `bg-bg-hover`.
+
+**Polarity-fixed variables are not roles.** A few `src/styles/liquid-glass.css` variables are read
+from `data-mode` (the polarity `useTheme` paints), not from the theme, and a pack
+cannot override them: `--glass-tint`, `--glass-band` (and its plain base
+`--glass-band-plain`),
+`--glass-edge` and `--glass-hairline` — the fill, the top/bottom light bands, the
+side-line / in-pane-divider hairline, and the half-pixel dark sliver outside each
+lit band (none has a focus form: a pane looks the same whether or not a control
+inside it has focus) that
+the Liquid Glass surfaces (the composer dock and everything in it, the mobile
+Settings search capsule, the session list's and the crew roster's search field,
+the top bar's search trigger, readout capsule and Request a Feature pill)
+lay over their blurred backdrop (the pane draws no ring:
+lit top and bottom, a line down each side). The tint is a ladder of five
+thicknesses, `--glass-tint-ultrathin` / `-thin` / `-regular` / `-thick` /
+`-ultrathick`, each a polarity-fixed `rgba()`: a pane picks one with the
+`thickness` prop on `components/Glass.tsx`, which puts `glass-<step>` on the
+host, and that class sets `--glass-tint` (what the primitive paints) and
+`--glass-tint-step` (the step's plain tint). Blur moves with it (2 / 4 / 8 / 14 /
+28px, owned by `Glass.tsx`), so a thickness is one material step, never a blur or
+an alpha chosen at a call site; `thin` is the default and the pre-ladder recipe.
+The colours are tuned so a pane over the plain page keeps one overall colour
+across the ladder (light `#f8f8f8` over white): the tint whitens as the alpha
+rises. The hue modifiers `glass-accent` / `glass-warn` / `glass-danger` /
+`glass-hover` / `glass-faded` (the picked chip, the incognito chip, the offline
+readout capsule, a hovered pane, a receding row) mix into `--glass-tint-step` on
+the host, so they land on the pane's own thickness and follow the polarity too.
+The three hue modifiers also mix the same hue, at the same share, into
+`--glass-band-plain` (the polarity's plain band) and set `--glass-band`, so the
+lit top and bottom edges of a tinted pane are lit in its hue; a white band on
+an accent pane read as a white frame in light mode and a grey edge in dark.
+And
+the `--tile-*` set behind the Settings section icons. They are fixed on purpose —
+the glass must read as a lit pane on any light palette and as smoked glass on any
+dark one, and a section's tile is an identity mark that must look the same in
+every theme — the same reasoning as the neutral `glass-shadow` rest shadow. Adding one
+of these takes a `:root` line plus a `[data-mode="light"]` line and no allowlist
+work; adding a color a pack should be able to change takes the role path below.
 
 ## Adding a new color role
 
@@ -96,7 +136,7 @@ Both sides are checked from Python: in `test/test_theme_css_security.py`,
 `TestAllowlistParity` parses `ALLOWED_CSS_VARS` out of `themeCss.ts` and
 asserts set equality with the backend `_THEME_CSS_VARS_SET`;
 `TestCssVarsSetSync` asserts the required roles and the shadow roles are in the
-backend set and that an unknown name is not, and `TestThemeVarsFilter` asserts the
+backend set and that an unknown name is not, and `TestStripToAllowedVars` asserts the
 filter keeps known keys, drops unknown ones, and drops unsafe values. The CSS
 parsers on the two sides are pinned against each other by a shared fixture,
 `test/fixtures/theme_css_corpus.json`: `test/test_theme_install.py`
@@ -107,7 +147,7 @@ two parsers differ by design (install-time is a denylist, runtime is a positive
 allowlist), which is exactly why the corpus pins both verdicts.
 
 `src/test/PhasedViewTheme.test.tsx` guards the other drift direction: it parses
-`index.css` for every custom property any theme block defines, and asserts a view
+`index.css` and its `src/styles/` partials for every custom property any theme block defines, and asserts a view
 references no token that does not exist. A `var(--nope, #16213e)` fallback would
 otherwise always win and silently ignore the active theme.
 
@@ -146,14 +186,10 @@ that mode actually renders. Where a mode NAME travels beside the palette, keep
 both in one memoized value so they cannot be read independently
 (`McpAppFrame`'s `themeSnapshot`).
 
-Seven sites still key on the three-dep spelling and are **not** fixed here — find
-them with `grep -rn '\[theme, colorTheme, themeVersion\]' src/`, which lists
-`components/WidgetFrame.tsx`, `components/ArtifactBody.tsx`,
-`components/library/ArtifactThumbs.tsx`, `pages/ArtifactDetailPage.tsx`,
-`pages/RemoteArtifactDetailPage.tsx`, and `pages/members/CrewWebview.tsx`, plus
-`hooks/useSessionPalette.ts` (a `useLayoutEffect` on
-`[themeMode, colorTheme, themeVersion]`, same ordering). A
-grep rather than line numbers on purpose: a cited line goes stale silently, and
+Some sites still key on the three-dep spelling and are **not** fixed here — find
+them with `grep -rn '\[theme, colorTheme, themeVersion\]' src/`, plus
+`hooks/useSessionPalette.ts`, which spells it `[themeMode, colorTheme, themeVersion]`
+(a `useLayoutEffect`, same ordering). A grep rather than a list on purpose: a cited line goes stale silently, and
 the dep array IS the defect, so the pattern is the honest locator. Each takes an
 extra early read that the `themeVersion` re-read then corrects, and none pairs a
 mode name into a wire payload, so the residue is a transient frame rather than a
@@ -180,7 +216,7 @@ cannot shrink.
 | Tier | Surface |
 |---|---|
 | **L0 Color** | the 56 CSS vars (dark + light) |
-| **L1 Brand** | logo, favicon, wordmark, botName, fonts, scoped `overrides.css` |
+| **L1 Brand** | logo, favicon, welcome image, wordmark, botName, fonts, scoped `overrides.css` |
 | **L2 Experience** | sandboxed overlays, topbar, audio, persona |
 
 Out of contract: app structure/routing, functional-control behavior, security
@@ -213,15 +249,19 @@ packaged asset names:
 ```text
 branding/logo.svg       # left command-palette mark
 branding/favicon.svg    # browser-tab icon
+branding/welcome.svg    # brand mark on a new chat's welcome screen
 branding/wordmark.svg   # reserved brand artwork for supporting surfaces
 ```
 
-`logo` accepts `.svg` or `.png`; `favicon` accepts `.ico`, `.png`, or `.svg`.
+`logo` accepts `.svg` or `.png`; `favicon` accepts `.ico`, `.png`, or `.svg`;
+`welcome` accepts `.svg`, `.png`, `.webp`, or `.gif` (256 KB), and an animated
+WebP/GIF/SVG plays in place. The welcome screen shows `welcome`, else `logo`,
+else the stock ghost, in the 48px hero slot.
 The backend serves only validated files from the installed pack, and the label is
 trimmed to 48 printable characters. When an asset or label is absent, the shell
 falls back independently to its configured Kiro Crew branding. Compiled edition
 branding registered through `registerThemeBranding()` has precedence over an
-installed pack.
+installed pack. `useShellBranding` in `src/shell/branding.ts` owns that order.
 
 ## Fonts
 
@@ -248,11 +288,13 @@ Settings → Display → **Font Family** reads through them:
 | Sans | the pack's `sans` face, else Kiro Crew's own proportional stack |
 | Mono | the pack's `mono` face, else Kiro Crew's own monospace stack |
 | System | the OS face — no token, so a pack cannot reach the body font here |
+| OpenDyslexic | the bundled OpenDyslexic stack — no token, so a pack cannot take this accessibility choice away; it supplies its own monospace face too |
+| Custom | the family the user types (`resolveCustomFontFamily`), bypassing the pack's sans token |
 
 `--mono` reads the mono token too, so code blocks, inline code and diffs follow a
 pack's monospace face without the user having to switch the whole UI to
-monospace. That applies under every option, System included — System governs the
-body font, not the code font. The terminal is separate: it reads its family from a
+monospace. That applies under every option except OpenDyslexic, System included —
+System governs the body font, not the code font. The terminal is separate: it reads its family from a
 Settings field, not from CSS, so a pack never changes it.
 
 **`overrides.css` must not declare a font.** Declaring `--font-body`, `--mono`,
@@ -274,20 +316,20 @@ what to change.
 
 An L1 pack's `overrides.css` may only target the surfaces below. This is the list
 that the source comments citing this file point at, and it is the runtime
-boundary, not a style suggestion: `_scopeOverridesCss` in
-`src/hooks/useTheme.tsx` DROPS every rule whose selector group does not pass, so a
+boundary, not a style suggestion: `scopeOverridesCss` in
+`src/hooks/themeCss.ts` DROPS every rule whose selector group does not pass, so a
 rule aimed at anything else never reaches the document.
 
 **Six class hooks** (`_ALLOWED_CLASSES`):
 
 | Class | Where it is applied |
 |---|---|
-| `topbar` | the header shell (`App.tsx`) |
-| `sidebar` | the conversation-list cards: the chat session list (`ChatSidebar.tsx`) and the Crew Members roster (`members/MembersPage.tsx`), both via `LIST_SHELL_CLS` in `components/listShell.ts` |
-| `chat-container` | the chat scroll region (`ChatPane.tsx`, `ChatPage.tsx`) |
+| `topbar` | the header shell (`shell/topbar/shellHeader.tsx`) |
+| `sidebar` | the conversation-list cards: the chat session list (`ChatSidebar.tsx`) and the Crew Members roster (`members/MembersPageRoster.tsx`), both via `LIST_SHELL_CLS` in `components/listShell.ts` |
+| `chat-container` | the chat scroll region (`pages/chat/TranscriptScrollShell.tsx`) |
 | `message-bubble` | a user or assistant turn (`chat/UserMessage.tsx`, `chat/AssistantMessage.tsx`) |
 | `input-area` | the composer (`ChatInput.tsx`) |
-| `code-block` | a rendered fenced block (`CodeBlock.tsx`, `MonacoCodeBlock.tsx`) |
+| `code-block` | a rendered fenced block (`CodeBlock.tsx`) |
 
 Do not rename or drop one of these classes when refactoring the component that
 carries it. There is no compiler reference to break, so the only signal is a
@@ -396,11 +438,14 @@ from your pool (never repeating the set it replaces or the other layer). Supply 
 least 4; more gives more variety. You inherit the cross-fade, the cascade timing
 and the reduced-motion handling for free.
 
-**`loader`** replaces the whole indicator with your component: a mascot
-animation, a progress bar, a canvas, anything. It renders with no wrapper beyond
-the footer's padding, so it owns its size, layout and motion. Keep it small (the
-band is ~32px tall), mark it `aria-hidden` (it is decorative), and honour
-`prefers-reduced-motion` yourself.
+**`loader`** fills the indicator's artwork slot with your component: a mascot
+animation, a progress bar, a canvas, anything. `ChatFooter` renders it inside its
+`role="status"` wrapper, beside the localized "Thinking" label, which is always
+visible so a sighted user can read what the row means. Your component owns its
+size, layout and motion. Keep it small (the band is ~32px tall), mark it
+`aria-hidden` (it is decorative — the status's `aria-label` carries the single
+spoken name), and honour `prefers-reduced-motion` yourself. Leave room for the
+label beside your artwork.
 
 Resolution is `loader` → `loaderIcons` → artwork bundled for a core theme → the
 default icons, so a theme that registers neither renders exactly what it does
@@ -485,8 +530,9 @@ npm run lint:theme-colors          # report raw literals in src/ (exit 0)
 node scripts/check-theme-colors.mjs --strict   # exit 1 if any (future ratchet)
 ```
 
-The checker excludes the five files where a raw literal is legitimate
-(`src/hooks/useTheme.tsx`, `src/components/themeEditor.tsx`, `src/index.css`,
+The checker excludes the files where a raw literal is legitimate
+(`src/hooks/useTheme.tsx`, `src/components/themeEditor.tsx`, `src/index.css` and
+the partials it imports from `src/styles/`,
 `src/lib/cssSanitize.ts`, `src/utils/sessionColors.ts`), plus tests, generated
 code, and type declarations. It is **advisory** (the existing tree has legitimate
 literals in themes, icons and palettes) and is **not** wired into the blocking CI

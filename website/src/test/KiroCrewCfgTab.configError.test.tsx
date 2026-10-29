@@ -9,6 +9,8 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { Provider } from 'react-redux'
+import { createTestStore } from './helpers'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -32,9 +34,11 @@ beforeEach(async () => {
 function mount() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
-    <QueryClientProvider client={qc}>
-      <KiroCrewCfgTab />
-    </QueryClientProvider>,
+    <Provider store={createTestStore()}>
+      <QueryClientProvider client={qc}>
+        <KiroCrewCfgTab />
+      </QueryClientProvider>
+    </Provider>,
   )
 }
 

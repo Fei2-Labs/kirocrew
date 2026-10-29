@@ -14,13 +14,14 @@ import { Suspense, lazy, useMemo, useState, useCallback, useEffect } from 'react
 import React from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, RefreshCw, PowerOff, AlertTriangle, Package, Bot } from 'lucide-react'
-import { AppApiProvider } from '../app-sdk'
+import { AppApiProvider, type AppUpdate } from '../app-sdk'
 import { ContentSkeleton, Btn, PageHeader } from './ui'
 import ErrorNotice from './ErrorNotice'
 import { errMessage } from '../utils/thunkError'
 
 import { i18nT } from '../i18n/t'
 import { appDisplayName, appDescription } from './appstore/appManifest'
+import { withBase } from '@/lib/basePath'
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -33,6 +34,11 @@ export interface AppHostProps {
     displayName?: string
     enabled?: boolean
     origin?: string
+    /** Cached update state, carried by both `GET /api/apps` and
+     *  `GET /api/apps/{name}` so a routed page and a side-panel tab publish the
+     *  same answer. Absent whenever no cache has seen this app, so the SDK
+     *  publishes nothing rather than an unfounded "up to date". */
+    update?: AppUpdate
     manifest?: {
       name?: string
       version?: string
@@ -245,7 +251,7 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
   const permissions = app.manifest?.permissions || {}
   const allowedApi = permissions.api || []
   const allowedEvents = permissions.events || []
-  const bundlePath = `/apps/${app.name}/ui/${entry}`
+  const bundlePath = withBase(`/apps/${app.name}/ui/${entry}`)
 
   // Dynamically import the app bundle. Keyed on resetKey so retry works.
   const LazyApp = useMemo(
@@ -301,7 +307,9 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
     <AppErrorBoundary appName={app.name} onReset={() => setResetKey(k => k + 1)}>
       <AppApiProvider
         appName={app.name}
+        appDisplayName={appDisplayName(app)}
         appVersion={app.manifest?.version || app.version}
+        appUpdate={app.update}
         // Provenance verbatim from `GET /api/apps`, which is the one claim an app
         // cannot forge: `builtin` is assigned only by register_builtin_apps() and
         // is refused on the self-registration path. Anything else is external, and

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import tarfile
-from pathlib import Path
 
 import pytest
+from test_snapshot import snapshot_family_source
 
 from kiro_crew import snapshot as snap
 
@@ -110,7 +110,7 @@ class TestTheRuleCoversEveryArchiveDerivedPrint:
         filter, the manifest reader and the root-selection refusal -- three places that
         do not otherwise look alike, which is how two of them were missed.
         """
-        source = Path(snap.__file__).read_text(encoding="utf-8")
+        source = snapshot_family_source()
         assert "{info.name}" not in source, "a tar member name is interpolated without _safe_name"
         assert "', '.join(dropped)" not in source, "manifest keys are joined without _safe_name"
         assert (

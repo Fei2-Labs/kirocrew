@@ -4,7 +4,7 @@ Two halves, deliberately:
 
 **Platform-independent.** Rendering, the pid record's start-time binding, the
 ``unit_state`` result mapping, the runtime dispatch and the teardown contract all
-run on EVERY platform — like ``test_pod.py`` fakes ``systemctl`` and
+run on EVERY platform — like ``test_pod_systemd.py`` fakes ``systemctl`` and
 ``test_pod_launchd.py`` fakes ``launchctl``, these fake ``schtasks`` at the module
 boundary and pin the argv. That is what gives the backend coverage on the Linux
 matrix, where the bulk of CI lives.
@@ -106,22 +106,24 @@ def test_the_wrapper_boots_the_named_pod_through_python(cfg):
     assert 'pod _run "smoke"' in body
 
 
-def test_the_wrapper_records_the_exit_code_because_there_is_no_restart_policy(cfg):
-    """``unit_state``'s crash signal is derived from this file, so it is required.
+def test_the_wrapper_writes_no_sidecar_and_the_producer_records_the_exit_code(cfg):
+    """``unit_state``'s crash signal is the result file, written by ``pod _run``.
 
     Task Scheduler retries a failed START, not a non-zero exit, and exposes no
     per-exit-code state in any locale-independent form. The recorded code is the
-    only crash signal ``_wait_healthy`` can stop on.
+    only crash signal ``_wait_healthy`` can stop on. It is written by the claimed
+    producer, whose identity the run record carries, never by the surrounding
+    ``cmd.exe``: a wrapper write would have no identity for ``stop`` to retire and
+    could land after teardown removed the sidecars.
     """
     body = win.render_task_script(cfg, "smoke")
     result = str(win.result_path(cfg, "smoke"))
-    # Cleared BEFORE the boot so the previous run's failure cannot be read as
-    # this one's, and captured into RC before anything else can clobber
-    # ERRORLEVEL.
-    assert f'del /q "{result}" 2>nul' in body
-    assert 'set "RC=%ERRORLEVEL%"' in body
-    assert f'> "{result}" echo %RC%' in body
-    assert body.rstrip().endswith("exit /b %RC%")
+    assert result not in body
+    assert "del " not in body
+    assert body.rstrip().endswith("exit /b %ERRORLEVEL%")
+    win.record_result(cfg, "smoke", 3)
+    assert win.last_result(cfg, "smoke") == 3
+    assert win.unit_state(cfg, "smoke") == ("failed", 1)
 
 
 def test_the_wrapper_routes_logs_to_files_since_there_is_no_journal(cfg):
@@ -317,6 +319,58 @@ def test_recent_journal_tails_the_pod_log_files(cfg):
 
 def test_recent_journal_says_why_it_is_empty(cfg):
     assert "no pod log yet" in win.recent_journal(cfg, "smoke")
+
+
+def _earlier_failed_start(cfg) -> tuple:
+    """Log files as an earlier refused boot left them (the wrapper appends)."""
+    out, err = win.log_paths(cfg, "smoke")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"kirocrew-pod: name=smoke earlier boot\r\n")
+    err.write_bytes(b"FATAL: no built dist for smoke (build the worktree first)\r\n")
+    return out, err
+
+
+def test_journal_since_mark_leaves_out_an_earlier_starts_fatal(cfg):
+    """A start that wrote nothing is not blamed on an earlier start's FATAL."""
+    _earlier_failed_start(cfg)
+    mark = win.journal_mark(cfg, "smoke")
+    text = win.recent_journal(cfg, "smoke", since=mark)
+    assert "FATAL" not in text and "earlier boot" not in text
+    assert "no pod log from this start" in text
+    assert "kirocrew pod logs smoke" in text
+    # Negative control: without the mark the same files still yield the stale line.
+    assert "FATAL: no built dist" in win.recent_journal(cfg, "smoke")
+
+
+def test_journal_since_mark_keeps_this_starts_fatal(cfg):
+    """A FATAL this start wrote is still shown, and only this start's lines."""
+    out, err = _earlier_failed_start(cfg)
+    mark = win.journal_mark(cfg, "smoke")
+    with out.open("ab") as fh:
+        fh.write(b"kirocrew-pod: name=smoke this boot\r\n")
+    with err.open("ab") as fh:
+        fh.write(b"FATAL: venv missing for smoke\r\n")
+    text = win.recent_journal(cfg, "smoke", since=mark)
+    assert "FATAL: venv missing for smoke" in text and "this boot" in text
+    assert "no built dist" not in text and "earlier boot" not in text
+
+
+def test_journal_mark_of_absent_logs_reads_a_first_start_whole(cfg):
+    """No log yet marks at 0, so the first start's own output is all shown."""
+    mark = win.journal_mark(cfg, "smoke")
+    assert mark == {"pod.out.log": 0, "pod.err.log": 0}
+    out, err = win.log_paths(cfg, "smoke")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    err.write_bytes(b"FATAL: first boot\r\n")
+    assert "FATAL: first boot" in win.recent_journal(cfg, "smoke", since=mark)
+
+
+def test_journal_since_mark_reads_a_replaced_file_whole(cfg):
+    """A log that shrank since the mark was replaced; all of it is this start's."""
+    _out, err = _earlier_failed_start(cfg)
+    mark = win.journal_mark(cfg, "smoke")
+    err.write_bytes(b"FATAL: new\r\n")
+    assert "FATAL: new" in win.recent_journal(cfg, "smoke", since=mark)
 
 
 # --------------------------------------------------------------------------
@@ -531,12 +585,33 @@ def test_runtime_dispatches_to_the_windows_backend_on_win32(cfg, monkeypatch):
     monkeypatch.setattr(win, "main_pid", lambda c, n: 4242)
     monkeypatch.setattr(win, "unit_state", lambda c, n: ("active", 0))
     monkeypatch.setattr(win, "active_names", lambda c: {"smoke"})
-    monkeypatch.setattr(win, "recent_journal", lambda c, n, lines=30: "log")
+    monkeypatch.setattr(win, "recent_journal", lambda c, n, lines=30, since=None: "log")
     assert rt.is_active(cfg, "smoke") is True
     assert rt.main_pid(cfg, "smoke") == 4242
     assert rt.unit_state(cfg, "smoke") == ("active", 0)
     assert rt.active_names(cfg) == {"smoke"}
     assert rt.recent_journal(cfg, "smoke") == "log"
+
+
+def test_runtime_threads_the_journal_mark_to_the_windows_backend(cfg, monkeypatch):
+    monkeypatch.setattr(rt, "IS_MACOS", False)
+    monkeypatch.setattr(rt, "IS_WINDOWS", True)
+    mark = {"pod.out.log": 5, "pod.err.log": 0}
+    seen: list = []
+    monkeypatch.setattr(win, "journal_mark", lambda c, n: mark)
+    monkeypatch.setattr(
+        win, "recent_journal", lambda c, n, lines=30, since=None: (seen.append(since), "log")[1]
+    )
+    assert rt.journal_mark(cfg, "smoke") is mark
+    assert rt.recent_journal(cfg, "smoke", since=mark) == "log"
+    assert seen == [mark]
+
+
+def test_journal_mark_does_not_touch_the_windows_backend_off_win32(cfg, monkeypatch):
+    monkeypatch.setattr(rt, "IS_WINDOWS", False)
+    monkeypatch.setattr(rt, "IS_MACOS", False)
+    monkeypatch.setattr(win, "journal_mark", lambda c, n: pytest.fail("windows only"))
+    assert set(rt.journal_mark(cfg, "smoke")) == {rt.JOURNAL_SINCE_USEC}
 
 
 def test_runtime_does_not_touch_the_windows_backend_off_win32(cfg, monkeypatch):

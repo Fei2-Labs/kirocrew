@@ -18,6 +18,7 @@ import pytest
 
 from kiro_crew import perf_sampler
 from kiro_crew.diag import threads as dt
+from kiro_crew.testing.wait import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -169,10 +170,15 @@ def test_a_window_longer_than_the_ring_reports_only_the_span_it_covers() -> None
             probe._readings.append((now - span + (span * i / count), 4.0))
 
     stats = probe.window()
+    after = time.time()
 
     assert stats["samples"] == count
     assert stats["window_truncated"] is True
-    assert 4.0 <= stats["window_secs"] <= 6.0, stats["window_secs"]
+    # ``window()`` reads the real clock, which has moved on since ``now`` by
+    # however long seeding took. That gap is measured, not guessed, so the
+    # bound holds on a runner of any speed.
+    eps = 0.01  # window_secs is rounded to the millisecond
+    assert span - eps <= stats["window_secs"] <= span + (after - now) + eps, stats["window_secs"]
 
 
 def test_a_window_inside_the_ring_reports_the_full_span() -> None:
@@ -184,9 +190,13 @@ def test_a_window_inside_the_ring_reports_the_full_span() -> None:
         probe._readings.append((now - 29.0, 4.0))
 
     stats = probe.window()
+    after = time.time()
 
     assert stats["window_truncated"] is False
-    assert 29.0 <= stats["window_secs"] <= 31.0, stats["window_secs"]
+    # The requested span runs from the boundary to the real clock ``window()``
+    # read, so it is 30 s plus the gap measured around the call.
+    eps = 0.01  # window_secs is rounded to the millisecond
+    assert 30.0 - eps <= stats["window_secs"] <= 30.0 + (after - now) + eps, stats["window_secs"]
 
 
 def test_an_empty_window_reports_none_not_zero() -> None:
@@ -233,9 +243,10 @@ def test_stat_is_parsed_when_the_thread_name_contains_spaces_and_parentheses() -
     """
     # Fields: pid comm state ppid pgrp session tty tpgid flags minflt cminflt
     # majflt cmajflt utime stime ...
-    text = "4242 (worker (pool 2)) R 1 1 1 0 -1 0 0 0 0 0 " "700 300 0 0 20 0 5 0 900 0 0\n"
+    text = "4242 (worker (pool 2)) R 1 1 1 0 -1 0 0 0 37 0 " "700 300 0 0 20 0 5 0 900 0 0\n"
     parsed = dt._parse_stat(text)
     assert parsed["state"] == "R"
+    assert parsed["major_faults"] == 37
     assert parsed["cpu_ticks"] == 1000  # utime 700 + stime 300
 
 
@@ -468,9 +479,10 @@ def test_a_recovered_heartbeat_allows_a_later_episode_to_be_captured() -> None:
     # the beat puts drift seconds past it rather than milliseconds.
     dt.start_probe(emit_event=lambda kind, _p: events.append(kind), stall_after=0.5)
     try:
-        for _ in range(2):
+        for episode in (1, 2):
             dt._probe._beat_at = time.monotonic() - 5.0
-            time.sleep(0.3)
+            # The probe thread captures the stall on its next tick.
+            wait_until(lambda n=episode: events.count("loop_stall") >= n, describe=lambda: events)
             _beat_steadily(0.3)  # a healthy loop again: closes the episode
     finally:
         dt.stop_probe()

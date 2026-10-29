@@ -4,8 +4,9 @@ The only backend that needs BOTH faces:
 
 * **Wire** — MCP servers arrive as the ``mcpServers`` parameter of
   ``session/new`` / ``session/load``. The adapter reads no agent file, so that
-  array is the session's entire MCP surface: empty means the harness works and
-  every Crew tool is absent, with no error.
+  array is the only channel Crew has onto the session's MCP surface (the harness
+  mounts its own user- and project-scope ``mcpServers`` and plugins beside it):
+  empty means the harness works and every Crew tool is absent, with no error.
 * **File** — ``<work_dir>/.claude/settings.local.json``, which the adapter loads
   itself, carries the model allowlist, the resolved model, the permission mode
   and the deny rules derived from ``disabledTools``.
@@ -52,12 +53,14 @@ class ClaudeCodeMirror(AgentConfigMirror):
                 "acp.session_mcp.session_mcp_servers, with the shared gateway's "
                 "pooled broker stubs placed HERE beside the translation so one "
                 "withhold rule covers both halves of the array -- codex parity. "
-                "The adapter reads no agent file, so this array is the session's "
-                "whole MCP surface. Delivered ONLY when Crew authored "
-                "settings.local.json: that file is this backend's permission "
-                "surface, and a tool Crew cannot gate must not be handed to the "
-                "session at all -- stubs included, since a stub is the same "
-                "server under the same name",
+                "The adapter reads no agent file, so this array is the only channel "
+                "Crew has onto the session's MCP surface. Delivered ONLY when Crew governs "
+                "settings.local.json -- authored it, verified it is a sibling "
+                "session's byte-identical seed, or left a project-owned one out of "
+                "the session's setting sources: that file is this backend's "
+                "permission surface, and a tool Crew cannot gate must not be "
+                "handed to the session at all -- stubs included, since a stub is "
+                "the same server under the same name",
             ),
             Concern.TOOL_ALLOWLIST: Ruling(
                 _D.TRANSLATED,
@@ -88,13 +91,18 @@ class ClaudeCodeMirror(AgentConfigMirror):
             ),
             Concern.MODEL: Ruling(
                 _D.DELIVERED,
-                "settings.local.json `model` when the session pinned one, plus the "
+                "settings.local.json `model` when the session pinned one and the "
+                "provider-advertised model cache is warm (omitted, with "
+                "availableModels, on a cold cache), plus the "
                 "session/set_config_option verb. DEFAULT_MODEL ('auto') is omitted "
                 "so the adapter picks the allowlist head",
             ),
             Concern.MODEL_ALLOWLIST: Ruling(
                 _D.DELIVERED,
-                "settings.local.json `availableModels` from model_registry. Not "
+                "settings.local.json `availableModels` from "
+                "model_registry.seed_available_models: the provider-advertised ids, "
+                "never the static registry, so the key is written only when that "
+                "cache is warm and omitted on a cold cache. Not "
                 "cosmetic: the adapter merges availableModels across every settings "
                 "source, so a user ~/.claude carrying a short list collapses a "
                 "versioned [1m] id back to the 200K window",
@@ -153,16 +161,21 @@ class ClaudeCodeMirror(AgentConfigMirror):
         fact and cannot withhold it. The seed Crew authors carries
         ``defaultMode`` plus the spec's ``permissions.deny``, which is what puts a
         session under the gate — but the writer is create-or-decline, so a project
-        that already has its own ``settings.local.json`` gets no seed and Crew
-        governs nothing there. Handing THAT session the array would deliver
+        that already has its own ``settings.local.json`` gets no seed. Handing a
+        session the array while that file still loads would deliver
         ``spawn_run``, ``cron_add``, ``send_message`` and every configured server
         into a permission surface Crew does not control.
 
-        So the array is withheld unless Crew authored the file. The cost is
-        stated rather than hidden: such a session runs with no Crew MCP tools,
-        which is exactly how every claude session behaved before this array
-        existed, so nothing regresses — it simply does not gain tools Crew could
-        not take back.
+        So the array is withheld unless Crew governs the file -- authored it
+        this session, verified byte-for-byte that it is a sibling Crew
+        session's live seed identical to what this session would have written,
+        or left a project-owned file out of the session's setting sources and
+        carried its own settings inline (the caller's
+        ``_permission_surface_governed``). The cost is
+        stated rather than hidden: a session where neither holds runs with no
+        Crew MCP tools, which is exactly how every claude session behaved before
+        this array existed, so nothing regresses — it simply does not gain tools
+        Crew could not take back.
 
         ``work_dir`` is the session's project checkout, and it is required for
         CORRECTNESS rather than convenience: kiro-cli resolves ``--agent`` against
@@ -230,21 +243,21 @@ class ClaudeCodeMirror(AgentConfigMirror):
         :meth:`session_params` (H13).
         """
         del kwargs
-        if not permission_surface_owned:
-            logger.warning(
-                "session MCP: withholding the whole mcpServers array, pooled broker stubs "
-                "included -- Crew does not own this session's settings.local.json, so a "
-                "permissions.allow entry there could pre-approve a Crew tool and skip "
-                "session/request_permission entirely. This session runs without Crew's MCP "
-                "tools; remove or rename the project's own .claude/settings.local.json to "
-                "restore them.",
-            )
-            return SessionProjection(params={"mcpServers": []})
         projection = session_mcp_projection(
             agent,
             stub_server_names=stub_server_names,
             work_dir=work_dir,  # type: ignore[arg-type]
         )
+        if not permission_surface_owned:
+            logger.warning(
+                "session MCP: withholding the whole mcpServers array, pooled broker stubs "
+                "included -- Crew does not govern this session's .claude/settings.local.json, "
+                "and a tool approved in a file Crew does not govern would never reach Crew's "
+                "permission check. This session runs without Crew's MCP tools. The ACP "
+                "client's log lines for that file name the cause and its fix; removing the "
+                "file does not help while another Crew session holds it.",
+            )
+            return SessionProjection(params={"mcpServers": []}, zero_tools=projection.zero_tools)
         out: list[dict[str, Any]] = list(projection.servers)
         for stub in stub_elements:
             if not isinstance(stub, Mapping):
@@ -270,4 +283,6 @@ class ClaudeCodeMirror(AgentConfigMirror):
             # caller that appends an element of its own must still see it.
             disabled_servers=projection.disabled_servers,
             derived_spec_snapshot=projection.derived_spec_snapshot,
+            zero_tools=projection.zero_tools,
+            agent_spec=projection.agent_spec,
         )

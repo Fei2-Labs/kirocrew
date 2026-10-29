@@ -2,6 +2,7 @@ import { safeSetItem } from '../../utils/safeStorage'
 import { STORAGE_KEY } from './constants'
 import { fmtBytes, fmtDateTimeNumeric } from '../../i18n/format'
 import { hasCommandModifier } from '../../utils/commandModifier'
+import { pathBasename, stripTrailingSeparators } from '../../utils/pathBasename'
 
 export const extOf = (p: string) => {
   const slash = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
@@ -11,11 +12,7 @@ export const extOf = (p: string) => {
   return base.slice(i).toLowerCase()
 }
 
-export const basename = (p: string) => {
-  const s = p.replace(/\/+$/, '')
-  const i = s.lastIndexOf('/')
-  return i < 0 ? s : s.slice(i + 1)
-}
+export const basename = (p: string) => pathBasename(stripTrailingSeparators(p))
 
 export const dirname = (p: string) => {
   const s = p.replace(/\/+$/, '')
@@ -23,6 +20,12 @@ export const dirname = (p: string) => {
   if (i <= 0) return '/'
   return s.slice(0, i)
 }
+
+/** Label for one `parentChain` crumb. The chain is built by splitting on `/`
+ *  only, so its label splits on `/` only too: a Windows root stays one crumb
+ *  showing the whole path, exactly as before #14581. Breadcrumb navigation for
+ *  Windows roots is a separate change. */
+export const crumbLabel = (p: string) => p.replace(/\/+$/, '').split('/').at(-1) ?? ''
 
 export const parentChain = (p: string) => {
   const out: string[] = []
@@ -63,8 +66,24 @@ const SENSITIVE_PATTERNS = [
   /\/\.docker\/config\.json$/, /\/\.kube\/config$/,
 ]
 
+/**
+ * Whether viewing this file warrants the screen-sharing warning.
+ *
+ * Matched against a slash-normalized copy, not the raw string. Paths reach the
+ * UI exactly as the backend printed them — `str(p)` on a `pathlib.Path` in
+ * `file_explorer/server.py` — so on Windows every separator is a backslash and
+ * the `/`-anchored patterns above match nothing at all. `extOf` already splits
+ * on both separators for the same reason; this is the rest of that contract.
+ *
+ * Normalizing rather than widening each pattern to `[/\\]` keeps one readable
+ * pattern list and cannot drop a leading-separator anchor by hand. A POSIX file
+ * whose NAME legitimately contains a backslash (`a\.ssh\k`) can now match, which
+ * is the fail-safe direction here: the only consequence is an advisory banner
+ * shown when it need not be, and this caller does nothing else with the verdict.
+ */
 export function isSensitivePath(path: string): boolean {
-  return SENSITIVE_PATTERNS.some(p => p.test(path))
+  const normalized = path.replace(/\\/g, '/')
+  return SENSITIVE_PATTERNS.some(p => p.test(normalized))
 }
 
 export const loadState = () => {

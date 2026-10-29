@@ -27,7 +27,7 @@ review runs silently.
 
 The executor is async; the (synchronous, threaded) review driver bridges to it
 via ``asyncio.run_coroutine_threadsafe`` on the gateway event loop, and brackets
-each run with ``begin_batch()`` / ``end_batch()``. See ``backend/routes.py``.
+each run with ``begin_batch()`` / ``end_batch()``. See ``backend/routes_parts/review_runs.py``.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 # The app root holds ``sage_lib/``; put it on sys.path so ``from sage_lib import store``
 # resolves on import (mirrors the sys.path setup in sibling ``review_driver.py``).
@@ -47,6 +47,8 @@ if _APP_ROOT not in sys.path:
     sys.path.insert(0, _APP_ROOT)
 
 try:
+    # The backend registry ships with the runtime, so it has no fallback of its
+    # own: without ``AcpRuntime`` the pool refuses before any backend is read.
     from kiro_crew.acp.runtime import AcpRuntime
     from kiro_crew.acp.types import (
         EVENT_COMPLETE,
@@ -56,8 +58,28 @@ try:
         STOP_REASON_STALE_RECOVER,
         STOP_REASON_TOOL_STALL,
     )
+    from kiro_crew.acp_backends import (
+        ACP_BACKEND_KIRO,
+        ACP_BACKENDS_ACP_RUNTIME,
+        ACP_BACKENDS_EFFORT_OVERLAY,
+        backend_from_stored,
+        resolve_selected_backend,
+    )
+    from kiro_crew.permission_floor import OUTCOME_REJECTED_TRANSPORT_FLOOR, refusal_for
 except ImportError:  # pragma: no cover - standalone / test fallback
     AcpRuntime = None  # type: ignore[assignment,misc]
+    OUTCOME_REJECTED_TRANSPORT_FLOOR = "rejected_transport_floor"
+
+    def refusal_for(
+        event: Any,
+        *,
+        session_key: str = "",
+        agent: str = "",
+        app: str = "",
+        security_only: bool = True,
+    ) -> str | None:
+        return "Blocked: the tool security gate could not be consulted"
+
     EVENT_TEXT_CHUNK = "text_chunk"  # type: ignore[assignment]
     EVENT_TOOL_CALL = "tool_call"  # type: ignore[assignment]
     EVENT_PERMISSION_REQUEST = "permission_request"  # type: ignore[assignment]
@@ -90,10 +112,23 @@ try:  # SEL audit — the runtime layer has no audit_source, so the pool emits i
 except Exception:  # pragma: no cover - standalone / test fallback
     _sel = None  # type: ignore[assignment]
 
+try:  # the in-band notice every headless host deny steers before it rejects
+    from kiro_crew.constants import DENY_CAUSE_POLICY
+    from kiro_crew.llm_helpers import _steer_host_deny
+except Exception:  # pragma: no cover - standalone / test fallback
+    DENY_CAUSE_POLICY = "policy"
+    _steer_host_deny = None  # type: ignore[assignment]
+
 try:  # same resolver the AcpRuntime spawn path uses to locate the agent CLI
     from kiro_crew.kiro_cli import resolve_kiro_cli
 except Exception:  # pragma: no cover - standalone / test fallback
     resolve_kiro_cli = None  # type: ignore[assignment]
+
+try:  # the loader's own stored-value reader: config.local.json first, then config.json
+    from kiro_crew.config.loader import _ABSENT_AGENT_KEY, _stored_agent_value
+except Exception:  # pragma: no cover - standalone / test fallback
+    _ABSENT_AGENT_KEY = None
+    _stored_agent_value = None  # type: ignore[assignment]
 
 try:  # the fail-close a backend-less host raises instead of running unaudited
     from kiro_crew.sandbox import SandboxUnavailableError
@@ -116,16 +151,53 @@ from sage_lib import followup, store  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+# Configured backends already warned about: the pool respawns once per batch, so
+# without this the same fallback line would repeat on every review run.
+_WARNED_FALLBACK_BACKENDS: set[str] = set()
+
+
+def review_backend() -> str:
+    """The ACP backend the shared review runtime spawns under.
+
+    The pool drives ONE multiplexed ``AcpRuntime``, so it can follow
+    ``agent.acp_backend`` only for a backend that runtime serves
+    (``ACP_BACKENDS_ACP_RUNTIME``). No declared backend means kiro-cli.
+    Any other declared backend (e.g. ``claude``, which needs a
+    per-session client) also runs on kiro-cli, with one warning naming the
+    configured backend so a review failure can be traced to the right provider.
+
+    The stored value is read by the loader's own reader (``config.local.json``
+    first, then ``config.json``). Synchronous disk read: callers on the event
+    loop offload it to a thread.
+    """
+    stored = _stored_agent_value("acp_backend") if _stored_agent_value is not None else None
+    selection = backend_from_stored(None if stored is _ABSENT_AGENT_KEY else stored)
+    if selection is None:
+        return ACP_BACKEND_KIRO
+    resolved = resolve_selected_backend(selection)
+    if resolved in ACP_BACKENDS_ACP_RUNTIME:
+        return resolved
+    key = resolved if isinstance(resolved, str) else repr(resolved)
+    if key not in _WARNED_FALLBACK_BACKENDS:
+        _WARNED_FALLBACK_BACKENDS.add(key)
+        logger.warning(
+            "Code Review Sage: agent.acp_backend=%r is not served by the shared "
+            "review runtime; reviews run on kiro-cli instead",
+            resolved,
+        )
+    return ACP_BACKEND_KIRO
+
 
 def runtime_preflight() -> str:
     """Cheap, read-only check that a reviewer session could actually be spawned.
 
     Returns ``""`` when the runtime looks usable, else a message naming exactly
     what is missing. Mirrors what ``_ensure_runtime_locked`` needs to spawn the
-    shared runtime — an importable ``AcpRuntime`` driving a ``kiro-cli``
-    subprocess — using the same resolver (``resolve_kiro_cli``) the runtime's
-    own spawn path goes through, so the answer here matches what a real spawn
-    would find. Without this check a review on a host with no usable agent CLI
+    shared runtime — an importable ``AcpRuntime`` and, when ``review_backend()``
+    is kiro-cli, a ``kiro-cli`` executable found by the same resolver
+    (``resolve_kiro_cli``) the runtime's own spawn path goes through, so the
+    answer here matches what a real spawn would find. A kas or codex runtime
+    resolves its own executable at spawn. Without this check a review on a host with no usable agent CLI
     completes with nothing written and reports an undiscriminated "no result
     record", which cannot be triaged.
 
@@ -138,7 +210,10 @@ def runtime_preflight() -> str:
     if AcpRuntime is None:
         return ("the reviewer cannot run: the ACP runtime "
                 "(kiro_crew.acp.runtime) is not importable in this install")
-    if resolve_kiro_cli is not None and resolve_kiro_cli() is None:
+    # Only a kiro-cli runtime looks for kiro-cli; a kas or codex runtime
+    # resolves its own executable at spawn and reports a miss there.
+    if (resolve_kiro_cli is not None and review_backend() == ACP_BACKEND_KIRO
+            and resolve_kiro_cli() is None):
         return ("the reviewer cannot run: no kiro-cli executable was found on "
                 "this host (the reviewer session is driven by kiro-cli — "
                 "install it or add it to PATH)")
@@ -172,11 +247,13 @@ def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
 
     Windows gets its own wording because the cause there is structural rather
     than a misconfiguration: Kiro Crew has no native Windows sandbox backend at
-    all (macOS uses Seatbelt, Linux uses user namespaces), so the only confined
-    path is kiro-cli's own internal sandbox taking the spawn. When that
-    delegation does not apply, the spawn fail-closes — which is correct, and is
-    why this names the one config key that changes the answer instead of leaving
-    the user with a bare exception or an empty review.
+    all (macOS uses Seatbelt, Linux uses user namespaces). An undeclared
+    ``agent.sandbox_allow_unsandboxed_exec`` already resolves true on Windows
+    (``config.loader.unsandboxed_exec_platform_default``), so reaching this
+    refusal there means the key was declared false or a governance
+    ``sandbox.min_level`` floor requires a sandbox. The spawn fail-closes, which
+    is correct; the message names both causes instead of leaving the user with a
+    bare exception or an empty review.
     """
     detail = str(exc).strip() if exc is not None else ""
     if _is_windows():
@@ -186,9 +263,10 @@ def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
             "(Seatbelt) and Linux (user namespaces) only, so a review is confined "
             "on Windows solely when kiro-cli's own internal sandbox takes the "
             "spawn — and it is refused rather than run unaudited when that does "
-            "not apply. To allow an unsandboxed review worker explicitly, set "
-            "agent.sandbox_allow_unsandboxed_exec=true in ~/.kiro/crew/config.json "
-            "and restart the gateway. Everything that does not spawn a reviewer "
+            "not apply. On Windows an unsandboxed worker is allowed by default, so "
+            "this refusal means agent.sandbox_allow_unsandboxed_exec is set to "
+            "false in config, or a governance sandbox.min_level floor requires a "
+            "sandbox. Everything that does not spawn a reviewer "
             "still works: adding repositories, listing and opening pull requests, "
             "reading past reports, and publishing an already-staged draft review."
         )
@@ -206,7 +284,7 @@ def sandbox_unavailable_message(exc: BaseException | None = None) -> str:
 def _is_abnormal_stop(reason: str) -> bool:
     """True when an EVENT_COMPLETE stop_reason means the turn did NOT finish
     cleanly — timeout, stale-recovery, tool-stall, or any ``error: *`` (see
-    acp/session_handle.py / acp/types.py). A review that ended this way must be
+    acp/session_handle_dispatch.py / acp/types.py). A review that ended this way must be
     reported as a failure, not silently returned as partial success (which would
     wrongly mark the PR reviewed / post incomplete findings). The known abnormal
     reason CONSTANTS are matched explicitly (not just by an ``error`` prefix) so a
@@ -363,7 +441,7 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
     on session/new; workspace settings override the global ``~/.kiro/settings/cli.json``,
     so this is scoped to the review worker's cwd (the app root) and NEVER changes the
     user's own interactive sessions. Schema (canonical impl:
-    ``kiro_crew/providers/acp.py:_write_cli_overlay``)::
+    ``kiro_crew/providers/acp_cli_overlay.py:_write_cli_overlay``)::
 
         {"chat.modelDefaults": {"<model>": {"output_config": {"effort": "<level>"}}}}
 
@@ -372,16 +450,15 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
     bad overlay write never breaks a review)."""
     try:
         with workspace_cli_settings_lock(Path(work_dir)) as cli_json:
-            try:
-                existing = (
-                    json.loads(cli_json.read_text(encoding="utf-8"))
-                    if cli_json.exists()
-                    else {}
-                )
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-            if not isinstance(existing, dict):
-                existing = {}
+            # Through `read_json_nolink`, not `read_text`: `cli.json` sits under
+            # the review worker's own `work_dir`, and the settings lock verifies
+            # the LOCK file, never this one. A plain read dereferences a link
+            # planted at this name, and the merged document is published straight
+            # back under it -- so the read is the leg that would copy a foreign
+            # document's bytes into a file the next worker loads as its settings.
+            # Missing, a plant, oversize and a non-object all arrive as None and
+            # mean "no overlay yet", which is what an empty file means here too.
+            existing = store.read_json_nolink(cli_json, cli_json.parent) or {}
             defaults = existing.get("chat.modelDefaults")
             if not isinstance(defaults, dict):
                 defaults = {}
@@ -395,7 +472,15 @@ def _write_effort_overlay(work_dir: str, model: str, effort: str = REVIEW_EFFORT
             model_cfg["output_config"] = output_cfg
             defaults[model] = model_cfg
             existing["chat.modelDefaults"] = defaults
-            cli_json.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            # Not `write_text`: that follows a link at the final name and
+            # TRUNCATES what it points at, and `work_dir` is the review worker's
+            # own cwd -- the one tree a prompt-injected worker can plant in. The
+            # shared helper refuses a linked PARENT and stages the write, then
+            # renames over the final name -- so a link sitting at that name is
+            # REPLACED by a real file rather than written through, and the file it
+            # pointed at keeps its bytes. A reader never sees a half-written
+            # overlay either, because the rename publishes it whole.
+            store.atomic_write_text(cli_json, json.dumps(existing, indent=2))
     except Exception:
         logger.debug("could not write review effort overlay (work_dir=%s)", work_dir, exc_info=True)
 
@@ -466,10 +551,12 @@ class _BatchRuntimeHolder:
             await self._kill(rt)
         if AcpRuntime is None:
             raise RuntimeError("AcpRuntime unavailable (kiro_crew.acp.runtime not importable)")
+        backend = await asyncio.to_thread(review_backend)
         # Effort overlay is read by kiro-cli at each session/new, so it must be on
         # disk before spawn. Keyed on the resolved model (config override -> agent
-        # default). Best-effort — a bad overlay never blocks the review.
-        if self._work_dir:
+        # default). Best-effort — a bad overlay never blocks the review. Only a
+        # backend that reads the cli.json overlay gets one.
+        if self._work_dir and backend in ACP_BACKENDS_EFFORT_OVERLAY:
             try:
                 _write_effort_overlay(
                     self._work_dir, _reviewer_model(self._agent),
@@ -480,7 +567,8 @@ class _BatchRuntimeHolder:
         # OS sandbox scrubs credential paths/env for this LLM-directed subprocess
         # (GitHub fetch/post run via the `gh` CLI's own auth; the worker only
         # writes data/results and runs `python3 sage_lib/pipeline.py`).
-        rt = AcpRuntime(agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto")
+        rt = AcpRuntime(agent=self._agent, work_dir=self._work_dir, sandbox_mode="auto",
+                        acp_backend=backend)
         try:
             await rt.spawn()
         except _SANDBOX_UNAVAILABLE as exc:
@@ -492,8 +580,8 @@ class _BatchRuntimeHolder:
             # caught to retry unsandboxed: the refusal is the correct outcome.
             raise ReviewRuntimeUnavailable(sandbox_unavailable_message(exc)) from exc
         self._runtime = rt
-        logger.info("code-review-sage runtime spawned (agent=%s, cwd=%s)",
-                    self._agent, self._work_dir)
+        logger.info("code-review-sage runtime spawned (agent=%s, backend=%s, cwd=%s)",
+                    self._agent, backend or "kiro", self._work_dir)
         return rt
 
     async def _kill(self, rt: "AcpRuntime") -> None:
@@ -626,14 +714,40 @@ class ReviewPool:
                             # requires every permission decision to emit an SEL event, and
                             # the EVENT_TOOL_CALL audit carries no decision/request id.
                             req_id = getattr(ev, "request_id", "")
+                            reason = await asyncio.to_thread(
+                                refusal_for,
+                                ev,
+                                session_key=getattr(handle, "session_id", "") or "",
+                                agent=self._agent,
+                                app="code-review-sage",
+                                security_only=False,
+                            )
+                            if reason is not None:
+                                await self._audit_tool(
+                                    handle,
+                                    ev,
+                                    request_id=req_id,
+                                    outcome="rejected_hook_deny",
+                                )
+                                # No person reviews these calls, so the deny is
+                                # the host's: tell the reviewer model which rule
+                                # refused it before kiro-cli reports a user denial.
+                                if _steer_host_deny is not None:
+                                    await _steer_host_deny(
+                                        handle, ev, reason, cause=DENY_CAUSE_POLICY
+                                    )
+                                await handle.reject_tool(req_id)
+                                continue
                             try:
-                                await handle.approve_tool(req_id)
+                                approval_sent = await handle.approve_tool(req_id)
                             except Exception:
                                 logger.debug("tool approve failed", exc_info=True)
                             else:
                                 await self._audit_tool(
                                     handle, ev, request_id=req_id,
-                                    outcome="auto_approved")
+                                    outcome=("auto_approved"
+                                             if approval_sent is not False
+                                             else OUTCOME_REJECTED_TRANSPORT_FLOOR))
                         elif kind == EVENT_COMPLETE:
                             stop_reason = getattr(ev, "stop_reason", "") or ""
                             break
@@ -655,7 +769,11 @@ class ReviewPool:
                 # Keep the transcript AFTER the health gate above: a session whose
                 # turn died has no findings to be asked about, and recording it
                 # would leave a file nothing will ever load.
-                if keep_session_key:
+                # Only kiro-cli keeps a terminated session on disk where
+                # ``followup`` looks for it; KAS deletes it and codex keeps its
+                # own store, so no follow-up is offered on those runtimes.
+                if keep_session_key and getattr(
+                        runtime, "acp_backend", ACP_BACKEND_KIRO) == ACP_BACKEND_KIRO:
                     self._keep_resumable(handle, keep_session_key)
                 return "".join(parts)
             finally:

@@ -76,7 +76,8 @@ SKIP_PATHS = frozenset(
     }
 )
 
-# The one module allowed to DEFINE harness identifiers and membership sets.
+# The vocabulary module, the one import path for harness identifiers and membership
+# sets; the files allowed to DEFINE them are VOCABULARY_PATHS below.
 #
 # Moved out of ``acp/types.py`` deliberately: importing anything under
 # ``kiro_crew.acp`` executes that package's ``__init__`` (client + runtime), so the
@@ -94,6 +95,23 @@ SKIP_PATHS = frozenset(
 # rule. Pointing the rule at the shim instead would be the drift it exists to
 # prevent -- a second place a definition could legally live.
 VOCABULARY_PATH = "src/kiro_crew/agent_sdk/backends.py"
+
+# The files that may define it: the vocabulary module and the owners it re-exports every
+# name from, one owner per question. Callers still import from one path, so this does not
+# reopen the shim question above -- an owner is where a definition lives behind that path,
+# never a second path a consumer imports. Named file by file rather than by pattern, so a
+# file added beside them is not exempt until it is listed here; ``test_harness_parity``
+# pins this tuple to the vocabulary module's own owner imports.
+VOCABULARY_PATHS = (
+    VOCABULARY_PATH,
+    "src/kiro_crew/agent_sdk/backends_launch.py",
+    "src/kiro_crew/agent_sdk/backends_mcp.py",
+    "src/kiro_crew/agent_sdk/backends_members.py",
+    "src/kiro_crew/agent_sdk/backends_models.py",
+    "src/kiro_crew/agent_sdk/backends_routing.py",
+    "src/kiro_crew/agent_sdk/backends_sessions.py",
+    "src/kiro_crew/agent_sdk/backends_turns.py",
+)
 
 SUPPRESSION = re.compile(r"harness-ok")
 
@@ -169,7 +187,7 @@ RULES: tuple[Rule, ...] = (
         message="harness identifier or membership set defined outside the " "vocabulary module",
         fix=f"define it in {VOCABULARY_PATH} and add every new identifier to "
         "ACP_BACKENDS_KNOWN, or provider construction will not reject a typo",
-        exempt=frozenset({VOCABULARY_PATH}),
+        exempt=frozenset(VOCABULARY_PATHS),
     ),
     Rule(
         rule_id="non-kiro-default",
@@ -360,6 +378,332 @@ def added_lines(frm: str, path: str) -> set[int]:
 
 
 # ---------------------------------------------------------------------------
+# X-feature captures (whole tree, shrink-only allowlist)
+# ---------------------------------------------------------------------------
+#
+# A non-standard (X) capability -- an underscore method, a ``_meta`` field, a
+# harness-native verb -- is proven once, on one adapter version. These sets are
+# where that proof decides behaviour, so every member must cite, in the comment
+# block directly above the set, a live capture under
+# ``test/fixtures/acp_frames/<backend>/`` that a test under ``test/`` loads. KAS
+# cites ``kas/``: a ``kiro/`` capture proves kiro-cli, not KAS.
+# A value of None checks every member; a frozenset checks only those members.
+X_FEATURE_SETS: dict[str, frozenset[str] | None] = {
+    "ACP_BACKENDS_STEER": None,
+    "ACP_BACKENDS_STEERING_REQUEST": None,
+    "ACP_BACKENDS_STEER_CONCURRENT_PROMPT": None,
+    "ACP_BACKENDS_COMPACT": None,
+    "ACP_BACKENDS_SIDE_READONLY": None,
+    "ACP_BACKENDS_MEMBER_CAPABILITIES": None,
+    "ACP_BACKENDS_MARKDOWN_AGENT_SPECS": None,
+    "ACP_BACKENDS_KIRO_SLASH_COMMANDS": None,
+    "ACP_BACKENDS_MEMBER_DISPATCH": frozenset({"kas"}),
+    # pi's membership rides its gate extension's confirm dialog, not a mirror.
+    "ACP_BACKENDS_HONOR_ZERO_TOOL_BAN": frozenset({"pi"}),
+}
+
+# ``initialize.agentInfo.name`` (or the ``_meta.agent_name`` header) a capture
+# must carry when it carries one, so a capture of a different adapter package
+# cannot stand in for the one Crew installs (``@openma/pi-acp`` for pi).
+# A backend absent here is not name-checked.
+EXPECTED_AGENT_NAMES: dict[str, frozenset[str]] = {
+    "kiro": frozenset({"Kiro CLI Agent"}),
+    "claude": frozenset({"@agentclientprotocol/claude-agent-acp"}),
+    "codex": frozenset({"@agentclientprotocol/codex-acp"}),
+    "opencode": frozenset({"OpenCode"}),
+    "goose": frozenset({"goose"}),
+    "pi": frozenset({"pi-acp"}),
+    "deepseek": frozenset({"deepseek-harness-acp"}),
+}
+
+# kiro-cli and KAS are one binary speaking one ``_kiro`` dialect, and KAS's
+# ``initialize`` carries no ``agentInfo``, so a header cannot tell them apart. Every
+# capture either one cites must hold its own ``initialize`` response, read off the
+# wire: KAS 0.66.43 answers with ``agentCapabilities._meta.kiro.extensionMethods`` and
+# no ``agentInfo``; kiro-cli 2.32.0 with ``agentInfo`` "Kiro CLI Agent" and no such
+# list. A capture of either relabeled as the other fails here.
+HANDSHAKE_IDENTITY: dict[str, str] = {
+    "kiro": "kiro-cli initialize (agentInfo 'Kiro CLI Agent', no _meta.kiro.extensionMethods)",
+    "kas": "KAS initialize (agentCapabilities._meta.kiro.extensionMethods, no agentInfo)",
+}
+
+
+def handshake_matches(d: str, meta: dict) -> bool:
+    """Whether a capture's own ``initialize`` names the engine its directory claims."""
+    if d == "kas":
+        return bool(meta.get("wire_marked")) and meta.get("agent_info") is None
+    if d == "kiro":
+        info = meta.get("agent_info")
+        return not meta.get("wire_marked") and info in EXPECTED_AGENT_NAMES["kiro"]
+    return True
+
+
+# (set, fixture dir) -> the capture that is missing. Shrink-only: an entry not on
+# the base ref fails, and an entry whose member now passes fails until removed.
+X_CAPTURE_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("ACP_BACKENDS_STEERING_REQUEST", "claude"): (
+        "live 0.94.0 steer during Bash ends the turn early and starts an unowned turn; "
+        "under investigation"
+    ),
+    ("ACP_BACKENDS_STEERING_REQUEST", "goose"): "goose _goose/unstable/session/steer turn",
+    ("ACP_BACKENDS_STEER_CONCURRENT_PROMPT", "opencode"): "opencode second session/prompt",
+    ("ACP_BACKENDS_SIDE_READONLY", "kiro"): "live capture pending",
+    ("ACP_BACKENDS_SIDE_READONLY", "goose"): "goose side session read-only turn",
+    ("ACP_BACKENDS_MEMBER_CAPABILITIES", "codex"): "codex saved member spec session",
+    ("ACP_BACKENDS_MEMBER_CAPABILITIES", "deepseek"): "deepseek saved member spec session",
+    ("ACP_BACKENDS_MARKDOWN_AGENT_SPECS", "kas"): (
+        "live KAS 0.66.43 registers a markdown agent but ignores its prompt; "
+        "membership decided separately"
+    ),
+}
+
+# Sets holding exactly one of kiro-cli and KAS whose comment does not name the
+# other. Same shrink-only contract.
+KIRO_KAS_PAIR_ALLOWLIST: frozenset[str] = frozenset()
+
+_CITE = re.compile(r"acp_frames/([\w.-]+)/([\w.-]+\.jsonl)")
+_NAMES_KAS = re.compile(r"\bKAS\b|\bkas\b")
+_NAMES_KIRO = re.compile(r"\bkiro\b|kiro-cli|Kiro CLI")
+_FIXTURES = "test/fixtures/acp_frames"
+
+
+def fixture_dir(backend: str) -> str:
+    return backend or "kiro"
+
+
+def set_comments(root: str = REPO_ROOT) -> dict[str, str]:
+    """Each ``ACP_BACKENDS_*`` set -> the ``#`` block directly above its definition."""
+    import ast
+
+    out: dict[str, str] = {}
+    for rel in VOCABULARY_PATHS:
+        with open(os.path.join(root, rel), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+        for node in ast.parse("\n".join(lines)).body:
+            target = (
+                node.targets[0] if isinstance(node, ast.Assign) else getattr(node, "target", None)
+            )
+            if not isinstance(target, ast.Name) or not target.id.startswith("ACP_BACKENDS_"):
+                continue
+            i, block = node.lineno - 2, []
+            while i >= 0 and lines[i].lstrip().startswith("#"):
+                block.append(lines[i].lstrip().lstrip("#").strip())
+                i -= 1
+            out[target.id] = " ".join(reversed(block))
+    return out
+
+
+def live_sets(root: str = REPO_ROOT) -> dict[str, frozenset[str]]:
+    sys.path.insert(0, os.path.join(root, "src"))
+    try:
+        from kiro_crew.agent_sdk import backends
+    finally:
+        sys.path.pop(0)
+    return {
+        k: frozenset(v)
+        for k, v in vars(backends).items()
+        if k.startswith("ACP_BACKENDS_") and isinstance(v, frozenset)
+    }
+
+
+def read_capture(root: str, rel: str) -> tuple[dict, str | None] | None:
+    """(header ``_meta``, agent name) of a capture, or None when it does not exist.
+
+    The ``replayed`` key says whether the capture has its ``.expected.json``
+    snapshot: ``test_acp_frame_replay`` replays every corpus file through the
+    real dispatch parsers and fails without one, so a snapshot is the replay.
+    ``wire_marked`` says whether an ``initialize`` response carries
+    ``agentCapabilities._meta.kiro.extensionMethods``, and ``agent_info`` is the name
+    in its ``agentInfo`` (header names never count; see ``HANDSHAKE_IDENTITY``).
+    """
+    import json
+
+    path = os.path.join(root, _FIXTURES, rel)
+    if not os.path.isfile(path):
+        return None
+    meta: dict = {}
+    name = None
+    info_name = None
+    marked = False
+    replayed = os.path.isfile(path[: -len(".jsonl")] + ".expected.json")
+    with open(path, encoding="utf-8") as fh:
+        for n, line in enumerate(fh):
+            try:
+                frame = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(frame, dict):
+                continue
+            if n == 0 and isinstance(frame.get("_meta"), dict) and "jsonrpc" not in frame:
+                meta = frame["_meta"]
+                name = meta.get("agent_name")
+            result = frame.get("result") if isinstance(frame.get("result"), dict) else {}
+            info = result.get("agentInfo")
+            if isinstance(info, dict):
+                info_name = info.get("name") if info_name is None else info_name
+                name = info.get("name") if name is None else name
+            # Only the initialize response carries both of these.
+            caps = result.get("agentCapabilities") if "protocolVersion" in result else None
+            caps_meta = caps.get("_meta") if isinstance(caps, dict) else None
+            kiro = caps_meta.get("kiro") if isinstance(caps_meta, dict) else None
+            if isinstance(kiro, dict) and isinstance(kiro.get("extensionMethods"), list):
+                marked = True
+    return dict(meta, replayed=replayed, wire_marked=marked, agent_info=info_name), name
+
+
+def check_x_captures(
+    sets: dict[str, frozenset[str]],
+    comments: dict[str, str],
+    capture=None,
+    root: str = REPO_ROOT,
+) -> dict[tuple[str, str], str]:
+    """(set, fixture dir) -> why the member has no replayed live capture."""
+    capture = capture or (lambda rel: read_capture(root, rel))
+    gaps: dict[tuple[str, str], str] = {}
+    for name, scope in X_FEATURE_SETS.items():
+        if name not in sets:
+            gaps[(name, "*")] = "X-feature set no longer defined; update X_FEATURE_SETS"
+            continue
+        cites = _CITE.findall(comments.get(name, ""))
+        for backend in sorted(sets[name]):
+            d = fixture_dir(backend)
+            if scope is not None and d not in scope:
+                continue
+            own = [f for cd, f in cites if cd == d]
+            if not own:
+                kiro_only = d == "kas" and any(cd == "kiro" for cd, _ in cites)
+                gaps[(name, d)] = (
+                    "KAS cites a kiro/ capture; kiro-cli is not KAS, cite kas/"
+                    if kiro_only
+                    else f"comment cites no acp_frames/{d}/*.jsonl"
+                )
+                continue
+            why = []
+            for f in own:
+                got = capture(f"{d}/{f}")
+                if got is None:
+                    why.append(f"{d}/{f} does not exist")
+                    continue
+                meta, agent = got
+                expected = EXPECTED_AGENT_NAMES.get(d)
+                if meta.get("recorded") != "live" or meta.get("backend") != backend:
+                    why.append(f"{d}/{f} header is not recorded=live, backend={backend!r}")
+                elif not meta.get("agent_version"):
+                    why.append(f"{d}/{f} header has no agent_version")
+                elif agent is not None and expected and agent not in expected:
+                    why.append(f"{d}/{f} is a capture of {agent!r}, not {sorted(expected)}")
+                elif d in HANDSHAKE_IDENTITY and not handshake_matches(d, meta):
+                    why.append(f"{d}/{f} holds no {HANDSHAKE_IDENTITY[d]}")
+                elif not meta.get("replayed"):
+                    why.append(f"{d}/{f} has no .expected.json, so no test replays it")
+                else:
+                    why = []
+                    break
+            if why:
+                gaps[(name, d)] = "; ".join(why)
+    return gaps
+
+
+def check_kiro_kas_pairs(sets: dict[str, frozenset[str]], comments: dict[str, str]) -> set[str]:
+    """Sets holding exactly one of kiro-cli/KAS whose comment never names the other."""
+    out = set()
+    for name, members in sets.items():
+        has_kiro, has_kas = "" in members, "kas" in members
+        if has_kiro != has_kas:
+            other = _NAMES_KAS if has_kiro else _NAMES_KIRO
+            if not other.search(comments.get(name, "")):
+                out.add(name)
+    return out
+
+
+def _literal(node):
+    """A literal, reading ``frozenset(...)`` (empty included) as a set."""
+    import ast
+
+    if isinstance(node, ast.Call):
+        return set(ast.literal_eval(node.args[0])) if node.args else set()
+    if isinstance(node, ast.Dict):
+        return {ast.literal_eval(k): _literal(v) for k, v in zip(node.keys, node.values)}
+    return ast.literal_eval(node)
+
+
+def _base_allowlists(base: str) -> tuple[set, set, dict] | None:
+    """The base ref's two allowlists and X-set scopes, or None when it predates them."""
+    import ast
+
+    try:
+        src = git(["show", f"{base}:scripts/check_harness_parity.py"])
+    except subprocess.CalledProcessError:
+        return None
+    names = ("X_CAPTURE_ALLOWLIST", "KIRO_KAS_PAIR_ALLOWLIST", "X_FEATURE_SETS")
+    found = {}
+    for node in ast.parse(src).body:
+        target = node.target if isinstance(node, ast.AnnAssign) else None
+        if isinstance(target, ast.Name) and target.id in names:
+            found[target.id] = _literal(node.value)
+    if len(found) != len(names):
+        return None
+    return set(found[names[0]]), set(found[names[1]]), found[names[2]]
+
+
+def _narrowed(prior: dict) -> list[str]:
+    """X sets the base checks that this tree drops, or checks for fewer members."""
+    out = []
+    for name, was in sorted(prior.items()):
+        if name not in X_FEATURE_SETS:
+            out.append(f"{name}: dropped from X_FEATURE_SETS; that registry only grows")
+            continue
+        now = X_FEATURE_SETS[name]
+        if now is not None and (was is None or set(was) - now):
+            out.append(f"{name}: X_FEATURE_SETS scope narrowed; it only widens")
+    return out
+
+
+def enforce_x_captures(base: str | None) -> int:
+    sets, comments = live_sets(), set_comments()
+    gaps = check_x_captures(sets, comments)
+    pairs = check_kiro_kas_pairs(sets, comments)
+    errors = [
+        f"{s} [{d}]: {why}"
+        for (s, d), why in sorted(gaps.items())
+        if (s, d) not in X_CAPTURE_ALLOWLIST
+    ]
+    errors += [
+        f"{s} [{d}]: allowlisted but now proven; delete the entry"
+        for s, d in sorted(set(X_CAPTURE_ALLOWLIST) - set(gaps))
+    ]
+    errors += [
+        f"{s}: holds one of kiro-cli/KAS and never names the other"
+        for s in sorted(pairs - KIRO_KAS_PAIR_ALLOWLIST)
+    ]
+    errors += [
+        f"{s}: allowlisted but now names both; delete the entry"
+        for s in sorted(KIRO_KAS_PAIR_ALLOWLIST - pairs)
+    ]
+    prior = _base_allowlists(base) if base else None
+    if prior is not None:
+        added = sorted(set(X_CAPTURE_ALLOWLIST) - prior[0]) + sorted(
+            KIRO_KAS_PAIR_ALLOWLIST - prior[1]
+        )
+        errors += [f"{e}: allowlist entry added; the allowlist only shrinks" for e in added]
+        errors += _narrowed(prior[2])
+    if not errors:
+        print(
+            f"x-capture gate: every X-feature member cites a replayed live capture "
+            f"({len(X_CAPTURE_ALLOWLIST)} + {len(KIRO_KAS_PAIR_ALLOWLIST)} allowlisted) ✓"
+        )
+        return 0
+    print(
+        "::error::x-capture gate: a non-standard capability set must cite, above "
+        "the set, a live capture under test/fixtures/acp_frames/<backend>/ that a "
+        "test replays. See docs/ci/harness-parity-gate.md."
+    )
+    for e in errors:
+        print(f"  {e}")
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
@@ -438,6 +782,12 @@ PROBES: tuple[tuple[str, str, str, str | None], ...] = (
         "vocabulary-home",
     ),
     (
+        "membership-set-beside-the-vocabulary-owners",
+        "src/kiro_crew/agent_sdk/backends_extra.py",
+        "ACP_BACKENDS_FAST = frozenset({ACP_BACKEND_KIRO})",
+        "vocabulary-home",
+    ),
+    (
         "non-kiro-default",
         "src/kiro_crew/acp/runtime.py",
         "        acp_backend: str = ACP_BACKEND_KAS,",
@@ -485,6 +835,15 @@ PROBES: tuple[tuple[str, str, str, str | None], ...] = (
         VOCABULARY_PATH,
         'ACP_BACKEND_BYO = "byo"',
         None,
+    ),
+    *(
+        (
+            f"membership-set-at-{os.path.basename(path)}",
+            path,
+            "ACP_BACKENDS_FAST = frozenset({ACP_BACKEND_KIRO})",
+            None,
+        )
+        for path in VOCABULARY_PATHS[1:]
     ),
     (
         "kiro-default",
@@ -553,8 +912,145 @@ def self_test() -> int:
     else:
         print(f"  ok   rule-coverage ({len(RULES)} rules)")
 
+    failures += _x_capture_self_test()
     print("self-test passed" if not failures else f"self-test FAILED ({failures})")
     return 1 if failures else 0
+
+
+def _x_capture_self_test() -> int:
+    """Plant each shape the X-capture rule exists for and assert its verdict."""
+    live = {"recorded": "live", "agent_version": "0.0.34", "replayed": True}
+    pi_capture = {"pi/steer-live.jsonl": (dict(live, backend="pi"), "pi-acp")}
+    openma = {"pi/steer-live.jsonl": (dict(live, backend="pi"), "@openma/pi-acp")}
+    unreplayed = {"pi/steer-live.jsonl": (dict(live, backend="pi", replayed=False), "pi-acp")}
+    synthesized = {
+        "pi/steer-live.jsonl": (dict(live, backend="pi", recorded="synthesized"), "pi-acp")
+    }
+    kas_capture = {"kas/steering-live.jsonl": (dict(live, backend="kas", wire_marked=True), None)}
+    kas_unmarked = {"kas/steering-live.jsonl": (dict(live, backend="kas"), None)}
+    kiro_info = dict(live, agent_info="Kiro CLI Agent")
+    kiro_relabeled = {"kas/steering-live.jsonl": (dict(kiro_info, backend="kas"), "Kiro CLI Agent")}
+    kiro_capture = {"kiro/compaction-live.jsonl": (dict(kiro_info, backend=""), "Kiro CLI Agent")}
+    kas_relabeled = {"kiro/compaction-live.jsonl": (dict(live, backend="", wire_marked=True), None)}
+    # One clause each: a kas capture that also names kiro-cli, a kiro capture that also marks KAS.
+    kas_with_info = {
+        "kas/steering-live.jsonl": (dict(kiro_info, backend="kas", wire_marked=True), None)
+    }
+    kiro_with_marker = {
+        "kiro/compaction-live.jsonl": (dict(kiro_info, backend="", wire_marked=True), None)
+    }
+    steer_req = "ACP_BACKENDS_STEERING_REQUEST"
+    cite_pi = "proof: ``test/fixtures/acp_frames/pi/steer-live.jsonl``."
+    probes = (
+        # label, set, members, comment, captures, expected gap key or None
+        (
+            "pi-joins-steering-request-with-no-capture",
+            steer_req,
+            {"pi"},
+            "pi steers, measured live.",
+            {},
+            (steer_req, "pi"),
+        ),
+        ("capture-of-another-package", steer_req, {"pi"}, cite_pi, openma, (steer_req, "pi")),
+        ("cited-capture-missing", steer_req, {"pi"}, cite_pi, {}, (steer_req, "pi")),
+        ("capture-not-replayed", steer_req, {"pi"}, cite_pi, unreplayed, (steer_req, "pi")),
+        ("synthesized-capture", steer_req, {"pi"}, cite_pi, synthesized, (steer_req, "pi")),
+        (
+            "pi-joins-side-with-no-capture",
+            "ACP_BACKENDS_SIDE_READONLY",
+            {"pi"},
+            "",
+            {},
+            ("ACP_BACKENDS_SIDE_READONLY", "pi"),
+        ),
+        (
+            "kas-cites-kiro",
+            "ACP_BACKENDS_STEER",
+            {"kas"},
+            "``acp_frames/kiro/compaction-live.jsonl``",
+            kiro_capture,
+            ("ACP_BACKENDS_STEER", "kas"),
+        ),
+        (
+            "kas-capture-without-its-initialize",
+            "ACP_BACKENDS_STEER",
+            {"kas"},
+            "``acp_frames/kas/steering-live.jsonl``",
+            kas_unmarked,
+            ("ACP_BACKENDS_STEER", "kas"),
+        ),
+        (
+            "kiro-capture-relabeled-kas",
+            "ACP_BACKENDS_STEER",
+            {"kas"},
+            "``acp_frames/kas/steering-live.jsonl``",
+            kiro_relabeled,
+            ("ACP_BACKENDS_STEER", "kas"),
+        ),
+        (
+            "kas-capture-relabeled-kiro",
+            "ACP_BACKENDS_STEER",
+            {""},
+            "``acp_frames/kiro/compaction-live.jsonl``",
+            kas_relabeled,
+            ("ACP_BACKENDS_STEER", "kiro"),
+        ),
+        (
+            "kas-capture-with-an-agentinfo",
+            "ACP_BACKENDS_STEER",
+            {"kas"},
+            "``acp_frames/kas/steering-live.jsonl``",
+            kas_with_info,
+            ("ACP_BACKENDS_STEER", "kas"),
+        ),
+        (
+            "kiro-capture-with-the-kas-marker",
+            "ACP_BACKENDS_STEER",
+            {""},
+            "``acp_frames/kiro/compaction-live.jsonl``",
+            kiro_with_marker,
+            ("ACP_BACKENDS_STEER", "kiro"),
+        ),
+        (
+            "kiro-proven",
+            "ACP_BACKENDS_STEER",
+            {""},
+            "``acp_frames/kiro/compaction-live.jsonl``",
+            kiro_capture,
+            None,
+        ),
+        ("pi-proven", steer_req, {"pi"}, cite_pi, pi_capture, None),
+        (
+            "kas-proven",
+            "ACP_BACKENDS_STEER",
+            {"kas"},
+            "``acp_frames/kas/steering-live.jsonl``",
+            kas_capture,
+            None,
+        ),
+    )
+    failures = 0
+    for label, name, members, comment, captures, expected in probes:
+        sets = {s: frozenset() for s in X_FEATURE_SETS}
+        sets[name] = frozenset(members)
+        gaps = check_x_captures(sets, {name: comment}, captures.get)
+        ok = (expected in gaps) if expected else not gaps
+        if label == "kas-cites-kiro":
+            ok = ok and "kiro-cli is not KAS" in gaps.get(expected, "")
+        print(f"  {'ok  ' if ok else 'FAIL'} x-capture {label}: {sorted(gaps.items()) or 'no gap'}")
+        failures += not ok
+    pair_probes = (
+        ("kas-only-names-no-kiro", {"S": frozenset({"kas"})}, {"S": "Only KAS."}, {"S"}),
+        ("kiro-only-names-no-kas", {"S": frozenset({""})}, {"S": "Only kiro-cli."}, {"S"}),
+        ("kas-only-names-kiro", {"S": frozenset({"kas"})}, {"S": "kiro-cli lacks it."}, set()),
+        ("both-held", {"S": frozenset({"", "kas"})}, {"S": ""}, set()),
+    )
+    for label, sets, comments, expected in pair_probes:
+        got = check_kiro_kas_pairs(sets, comments)
+        ok = got == expected
+        print(f"  {'ok  ' if ok else 'FAIL'} kiro-kas-pair {label}: {sorted(got) or 'no gap'}")
+        failures += not ok
+    return failures
 
 
 # ---------------------------------------------------------------------------
@@ -658,10 +1154,15 @@ def main(argv: list[str]) -> int:
 
     base = os.environ.get("HARNESS_BASE_REF", "").strip()
     if base:
-        return enforce_diff(base)
+        lines = enforce_diff(base)
+        # The merge-base, as enforce_diff measures: main proving a member after this
+        # branch forked must not read as this branch adding an allowlist entry.
+        return enforce_x_captures(diff_base(base)) or lines
 
     found = [v for path in tracked_files() for v in scan_file(path)]
-    return report(found, enforcing=False, base=None)
+    lines = report(found, enforcing=False, base=None)
+    # Whole-tree with an allowlist, so it is enforced in this mode too.
+    return enforce_x_captures(None) or lines
 
 
 if __name__ == "__main__":

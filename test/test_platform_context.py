@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import string
+
 import pytest
 
 from kiro_crew import security
@@ -236,6 +238,34 @@ class TestBootstrapAndDiscovery:
         with pytest.raises(PlatformCompositionError):
             bootstrap_context(cfg)
 
+    def test_bootstrap_reuses_its_entry_point_snapshot(
+        self, cfg: KiroCrewConfig, monkeypatch
+    ) -> None:
+        from kiro_crew.platform import bootstrap as bootstrap_mod
+
+        entry_point = object()
+        scans: list[int] = []
+        received: list[object] = []
+        companion = build_default_context(cfg, profile=PROFILE_ENTERPRISE)
+
+        def _entry_points():
+            scans.append(1)
+            return [entry_point]
+
+        def _discover(profile, discovered_cfg, *, entry_points, **_kwargs):
+            assert profile == PROFILE_ENTERPRISE
+            assert discovered_cfg is cfg
+            received.extend(entry_points)
+            return companion
+
+        monkeypatch.setenv("KIROCREW_PROFILE", "enterprise")
+        monkeypatch.setattr(bootstrap_mod, "plugin_entry_points", _entry_points)
+        monkeypatch.setattr(bootstrap_mod, "discover_companion_context", _discover)
+
+        assert bootstrap_mod.bootstrap_context(cfg) is companion
+        assert scans == [1]
+        assert received == [entry_point]
+
     def test_contract_version_mismatch_rejected(self, cfg: KiroCrewConfig, monkeypatch) -> None:
         import dataclasses
 
@@ -247,7 +277,9 @@ class TestBootstrapAndDiscovery:
         )
         monkeypatch.setenv("KIROCREW_PROFILE", "enterprise")
         monkeypatch.setattr(bootstrap_mod, "plugin_entry_points", lambda: [object()])
-        monkeypatch.setattr(bootstrap_mod, "discover_companion_context", lambda profile, cfg: bad)
+        monkeypatch.setattr(
+            bootstrap_mod, "discover_companion_context", lambda profile, cfg, **_kwargs: bad
+        )
         with pytest.raises(PlatformCompositionError):
             bootstrap_context(cfg)
 
@@ -261,7 +293,9 @@ class TestBootstrapAndDiscovery:
 
         monkeypatch.setenv("KIROCREW_PROFILE", "enterprise")
         monkeypatch.setattr(bootstrap_mod, "plugin_entry_points", lambda: [object()])
-        monkeypatch.setattr(bootstrap_mod, "discover_companion_context", lambda profile, cfg: None)
+        monkeypatch.setattr(
+            bootstrap_mod, "discover_companion_context", lambda profile, cfg, **_kwargs: None
+        )
         with pytest.raises(PlatformCompositionError):
             bootstrap_context(cfg)
 
@@ -438,6 +472,11 @@ class TestRedactLogViaContext:
         "task_planner.py",
         "name_grant.py",
     )
+    #: A converged site split into owner modules is judged with them: the facade keeps
+    #: the call, and no owner may reach the baseline components either.
+    CONVERGED_SITE_OWNERS = {
+        "name_grant.py": ("name_grant_refusals.py", "name_grant_tables.py", "name_grant_lookup.py"),
+    }
 
     def test_converged_log_sites_do_not_drift_back_to_the_baseline(self) -> None:
         """Each converged site must CALL the helper and not the raw components.
@@ -459,7 +498,10 @@ class TestRedactLogViaContext:
 
         root = pathlib.Path(kiro_crew.__file__).parent
         for rel in self.CONVERGED_LOG_SITES:
-            lines = (root / rel).read_text(encoding="utf-8").splitlines()
+            files = (rel, *self.CONVERGED_SITE_OWNERS.get(rel, ()))
+            lines = [
+                ln for f in files for ln in (root / f).read_text(encoding="utf-8").splitlines()
+            ]
             body = [ln for ln in lines if not ln.lstrip().startswith(("import ", "from "))]
             calls = sum(1 for ln in body if "redact_log_via_context(" in ln)
             assert calls >= 1, (
@@ -477,3 +519,67 @@ class TestRedactLogViaContext:
                 "A converged site routes its gate-side text through the context spelling, "
                 "so a companion host is not scanned with the weaker pass."
             )
+
+
+class TestRedactCodeViaContext:
+    """``redact_code_via_context`` -- ``redact_via_context`` minus the bare-secret guess.
+
+    It must stay the SAME shim underneath: a companion's extra reach still applies to
+    code text, and a policy that cannot be composed still refuses rather than
+    degrading. Only core pass 3 differs, and ``test_redaction_code_text_scope`` pins
+    that half.
+    """
+
+    COMPANION_SHAPE = "SSO-COOKIE"
+
+    #: 62 distinct letters and digits: a literal pass 3 reads as a key.
+    PALETTE = string.ascii_lowercase + string.ascii_uppercase + string.digits
+
+    @staticmethod
+    def _install(policy, cfg: KiroCrewConfig):
+        import dataclasses
+
+        from kiro_crew.platform import set_context
+
+        set_context(
+            dataclasses.replace(
+                build_default_context(cfg, profile=PROFILE_ENTERPRISE),
+                credentials=policy,
+            )
+        )
+
+    @pytest.fixture(autouse=True)
+    def _restore_context(self):
+        from kiro_crew.platform import reset_context
+
+        yield
+        reset_context()
+
+    def test_a_companion_pattern_still_applies_to_code_and_the_literal_is_kept(
+        self, cfg: KiroCrewConfig
+    ) -> None:
+        from kiro_crew.platform.context import redact_code_via_context, redact_via_context
+
+        class _Policy:
+            def redact(self, text: str) -> str:
+                return security.redact(text).replace(
+                    TestRedactCodeViaContext.COMPANION_SHAPE, "[REDACTED-SSO]"
+                )
+
+        self._install(_Policy(), cfg)
+        code = f"var cookie = '{self.COMPANION_SHAPE}'; var A = '{self.PALETTE}';"
+        assert self.PALETTE not in redact_via_context(code), "the premise: pass 3 fires"
+        out = redact_code_via_context(code)
+        assert self.COMPANION_SHAPE not in out
+        assert f"var A = '{self.PALETTE}';" in out
+
+    def test_a_policy_that_cannot_be_composed_still_refuses(self, cfg: KiroCrewConfig) -> None:
+        from kiro_crew.platform.context import redact_code_via_context
+
+        class _Unprovable:
+            def redact(self, text: str) -> str:
+                raise PlatformCompositionError("companion could not be composed")
+
+        self._install(_Unprovable(), cfg)
+        with pytest.raises(PlatformCompositionError):
+            redact_code_via_context("var a = 1;")

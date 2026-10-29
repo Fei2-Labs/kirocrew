@@ -2,6 +2,7 @@
 // sidebar, and (once it has ended) the task-review gate.
 
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   AlertTriangle,
@@ -9,6 +10,7 @@ import {
   Languages,
   ListChecks,
   MoreHorizontal,
+  NotebookPen,
   Pause as PauseIcon,
   Play,
   RefreshCw,
@@ -17,6 +19,7 @@ import {
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
+import { settingsPath } from '../../components/settingsPath'
 import { Badge, Btn, SendBtn, Skeleton } from '../../components/ui'
 import {
   DropdownMenu,
@@ -29,7 +32,9 @@ import type { MeetingsConfig } from './api'
 import AgentPanel from './components/AgentPanel'
 import AgentPillBar from './components/AgentPillBar'
 import BroadcastBar from './components/BroadcastBar'
+import MeetingTitle from './components/MeetingTitle'
 import MeetingWorkspace from './components/MeetingWorkspace'
+import NoteSidebar from './components/NoteSidebar'
 import TaskSidebar from './components/TaskSidebar'
 import TranscriptPanel from './components/TranscriptPanel'
 import TranslationSidebar from './components/TranslationSidebar'
@@ -55,6 +60,19 @@ export default function MeetingView({
 }: Props) {
   const session = useMeetingSession({ eventId, fallbackTitle, config, notify })
   const [sidebarOpen, setSidebarOpen] = useState(false)
+
+  // Every way out of this view goes through here. The note draft lives in the
+  // session hook and unmounts with this view, so the exit first waits for its save
+  // and navigates only once the note is on disk; a refusal keeps the user here, where
+  // the panel is showing that refusal, instead of navigating away from the only copy.
+  // Browser-level navigation is not intercepted — see `useNoteDraft` for what covers it.
+  // `to` is where the exit goes: the meeting list by default, or settings from the
+  // agent bar, which unmounts this view just the same.
+  const leave = async (to: () => void = onBack) => {
+    if (await session.leaveNote()) to()
+    // A refusal opens the note panel; the task sidebar closes so only one shows.
+    else setSidebarOpen(false)
+  }
   const [attachMenuOpen, setAttachMenuOpen] = useState(false)
 
   const {
@@ -65,6 +83,12 @@ export default function MeetingView({
     enabledIds,
     mutedAgents,
     outputs,
+    startError,
+    startErrorMessage,
+    transcriptionErrorMessage,
+    transcriptionErrorCode,
+    dismissStartError,
+    dismissTranscriptionError,
     outputEdits,
     editingOutput,
     tasks,
@@ -81,6 +105,7 @@ export default function MeetingView({
     actions,
     pending,
     translation,
+    note,
   } = session
 
   if (loading) return <Skeleton className="h-40 m-6" />
@@ -110,7 +135,7 @@ export default function MeetingView({
         onBack={actions.backToMeeting}
         onClose={() => {
           actions.stop()
-          onBack()
+          void leave()
         }}
         onFile={actions.fileTask}
         onArchive={actions.archiveTask}
@@ -145,13 +170,11 @@ export default function MeetingView({
       <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
         <div className="flex-none px-4 md:px-6 py-4 border-b border-border flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
-            <Btn onClick={onBack} aria-label={i18nT('apps.meetings.meeting.back')}>
+            <Btn onClick={() => { void leave() }} aria-label={i18nT('apps.meetings.meeting.back')}>
               <ArrowLeft className="lucide-inline" />
               {i18nT('apps.meetings.meeting.back')}
             </Btn>
-            <h2 className="text-lg font-semibold text-text-strong truncate">
-              {meta?.title || i18nT('apps.meetings.session.untitled')}
-            </h2>
+            <MeetingTitle title={meta?.title ?? ''} onRename={actions.rename} />
             {status === 'active'
               && pending.settingStatus !== 'paused'
               && pending.settingStatus !== 'reviewing' && (
@@ -268,6 +291,17 @@ export default function MeetingView({
                   />
                   <span>{i18nT('apps.meetings.meeting.refresh')}</span>
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    // One side panel at a time (see the translation item below).
+                    setSidebarOpen(false)
+                    session.setTranslationOpen(false)
+                    session.setNoteOpen(open => !open)
+                  }}
+                >
+                  <NotebookPen size={13} className="shrink-0 text-muted" />
+                  <span>{i18nT('apps.meetings.meeting.toggleNote')}</span>
+                </DropdownMenuItem>
                 {/* Offered only when a target language is configured: with translation
                     off (the default) the item would open a panel that can never fill.
                     Settings is where it gets turned on. */}
@@ -278,6 +312,7 @@ export default function MeetingView({
                       // panels' 260px height floors together exceed a short
                       // viewport and squeeze the transcript out entirely.
                       setSidebarOpen(false)
+                      session.setNoteOpen(false)
                       session.setTranslationOpen(open => !open)
                     }}
                   >
@@ -288,6 +323,7 @@ export default function MeetingView({
                 <DropdownMenuItem
                   onSelect={() => {
                     session.setTranslationOpen(false)
+                    session.setNoteOpen(false)
                     setSidebarOpen(open => !open)
                   }}
                 >
@@ -302,6 +338,34 @@ export default function MeetingView({
           </div>
         </div>
 
+        {/* The one surface for a refused start or a transcription error while
+             the meeting is open (no toast as well). Streaming-off links to its
+             setting; the start notice's copy names the button to use.
+             No hand-off: the minutes drafts in the AgentPanel below are unsaved
+             local state, and capture is live. Navigating to chat would unmount
+             this view, discard those drafts and stop the microphone. */}
+        {transcriptionErrorMessage && (
+          <ErrorNotice
+            message={transcriptionErrorMessage}
+            onDismiss={dismissTranscriptionError}
+            className="mx-4 mt-2 animate-rise"
+            footer={
+              transcriptionErrorCode === 'stt_streaming_disabled' ? (
+                <Link to={settingsPath({ tab: 'voice' })} className="underline">
+                  {i18nT('apps.meetings.session.openVoiceSettings')}
+                </Link>
+              ) : null
+            }
+          />
+        )}
+        {/* No hand-off: the minutes drafts in the AgentPanel below are unsaved. */}
+        {startError && startErrorMessage && (
+          <ErrorNotice
+            message={startErrorMessage}
+            onDismiss={dismissStartError}
+            className="mx-4 mt-2 animate-rise"
+          />
+        )}
         <AgentPillBar
           agents={agents}
           enabledIds={enabledIds}
@@ -314,7 +378,7 @@ export default function MeetingView({
           attachMenuOpen={attachMenuOpen}
           onPresetChange={session.setSelectedPreset}
           onToggleAgent={actions.toggleAgent}
-          onOpenSettings={onOpenSettings}
+          onOpenSettings={() => { void leave(onOpenSettings) }}
           onToggleAttachMenu={() => setAttachMenuOpen(open => !open)}
           onAddAttachment={promptForLink}
           onRemoveAttachment={actions.removeAttachment}
@@ -406,6 +470,25 @@ export default function MeetingView({
           />
         )}
       </div>
+
+      {note.open && (
+        <NoteSidebar
+          draft={note.draft}
+          dirty={note.dirty}
+          loaded={note.loaded}
+          updatedAt={note.updatedAt}
+          path={note.path}
+          saving={note.saving}
+          saveFailed={note.saveFailed}
+          loadFailed={note.loadFailed}
+          uploading={note.uploading}
+          uploadError={note.uploadError}
+          onChange={session.changeNote}
+          onFlush={session.flushNote}
+          onPasteImage={session.pasteNoteImage}
+          onClose={() => session.setNoteOpen(false)}
+        />
+      )}
 
       {translation.open && translation.language && (
         <TranslationSidebar

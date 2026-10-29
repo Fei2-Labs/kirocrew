@@ -50,6 +50,11 @@ scope = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(scope)
 
 
+#: Config a ``git -c ...`` that ran the suite (a pre-push hook) exports to its children.
+#: git reads it after ``GIT_CONFIG_COUNT``, so it would override any pin set there.
+_GIT_COMMAND_LINE_CONFIG = ("GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT")
+
+
 def _fixture_git_env() -> dict[str, str]:
     """Env for a fixture git call: no inherited location, templates, hooks, or identity.
 
@@ -73,6 +78,7 @@ def _fixture_git_env() -> dict[str, str]:
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_SYSTEM": os.devnull,
     }
+    env.pop("GIT_CONFIG_PARAMETERS", None)  # see _GIT_COMMAND_LINE_CONFIG
     count = int(env["GIT_CONFIG_COUNT"])
     env[f"GIT_CONFIG_KEY_{count}"] = "init.templateDir"
     env[f"GIT_CONFIG_VALUE_{count}"] = ""
@@ -146,7 +152,7 @@ def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _repo_template: Path) 
     # repository. Delete the whole location family -- monkeypatch restores it
     # after the test -- using the same canonical list the production env
     # builder strips.
-    for var in _GIT_LOCATION_VARS:
+    for var in (*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG):
         monkeypatch.delenv(var, raising=False)
     fixture_repo = tmp_path / "repo"
     shutil.copytree(_repo_template, fixture_repo)
@@ -295,6 +301,21 @@ class TestWholeTreeOverride:
         _, label = scope.changed_paths()
 
         assert scope.added_lines(label) is None
+
+    def test_base_ref_names_the_commit_each_label_diffs_against(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # check_black_formatting reads the baseline at this commit; a second
+        # copy of the label mapping there is how the two would come to disagree.
+        _set_origin_main(repo)
+        merge_base = _git(repo, "merge-base", "origin/main", "HEAD")
+        assert scope.base_ref("origin/main...HEAD") == merge_base.strip()
+        assert scope.base_ref("merge HEAD^1..HEAD") == "HEAD^1"
+        assert scope.base_ref("merge parents") == "HEAD^1"
+        assert scope.base_ref("nosuchref...HEAD") is None
+        monkeypatch.setenv(scope.WHOLE_TREE_ENV, "1")
+        _, label = scope.changed_paths()
+        assert scope.base_ref(label) is None
 
     def test_the_audit_lane_opts_in(self) -> None:
         # The wiring, not the mechanism: without this env the Main Ratchet Audit
@@ -568,239 +589,214 @@ def test_env_base_gates_delegate_to_the_shared_plumbing() -> None:
         assert r"\+(\d+)(?:,(\d+))?" not in source, f"{name} grew a private hunk parser back"
 
 
-class TestMergeInheritsTwoAncestries:
-    """A merge is judged against BOTH parents, and a truly-new line still fails.
+# ── fork-aware helpers (change_merge_base / change_files / show_at) ────
 
-    The correction and the hole it must not become are the same code path, so
-    every test here comes in a pair: an inherited line is accepted, and a line
-    no ancestry carried, in the same file of the same merge, is still reported.
+
+def _drop_ambient_git_location(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The helpers under test run git with the ambient env, so an exported ``GIT_DIR``
+    or ``GIT_INDEX_FILE`` (pytest run from a git hook) would answer for the wrong
+    repository, and an exported ``git -c`` config would change what they read. Delete
+    both, as the ``repo`` fixture above does."""
+    for var in (*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG):
+        monkeypatch.delenv(var, raising=False)
+
+
+def assert_fixture_ignores_ambient_git(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fixture: str,
+) -> None:
+    """Build *fixture* under an inherited ``GIT_INDEX_FILE`` and a ``GIT_TEMPLATE_DIR``
+    whose post-commit hook writes a marker: the foreign index stays untouched and the
+    hook never runs. A commit on the scrubbed env with only the template's hooks put
+    back proves the hook would run on this host, so the absence means something."""
+    template = tmp_path / "template"
+    (template / "hooks").mkdir(parents=True)
+    marker = tmp_path / "hook-ran"
+    hook = template / "hooks" / "post-commit"
+    # LF on every host: Git for Windows' sh would read a CRLF line's redirect target as
+    # "hook-ran\r" and the marker would never appear under its real name.
+    hook.write_text(
+        f'#!/bin/sh\necho ran > "{marker.as_posix()}"\n', encoding="utf-8", newline="\n"
+    )
+    hook.chmod(0o755)
+    index = tmp_path / "foreign-index"
+    index.write_bytes(b"not an index")
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(template))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(index))
+    hooks = (template / "hooks").as_posix()
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'core.hooksPath'='{hooks}'")
+    scrubbed = _fixture_git_env()
+    assert "GIT_INDEX_FILE" not in scrubbed, "the fixture env keeps a foreign index"
+    assert "GIT_CONFIG_PARAMETERS" not in scrubbed, "the fixture env keeps git -c options"
+    request.getfixturevalue(fixture)
+    # The helpers under test read the ambient env: the fixture must have dropped both.
+    ambient = sorted({*_GIT_LOCATION_VARS, *_GIT_COMMAND_LINE_CONFIG} & set(os.environ))
+    assert not ambient, f"the fixture left {ambient} for the helpers under test"
+    assert index.read_bytes() == b"not an index", "a fixture git call used the foreign index"
+    assert not marker.exists(), "a fixture commit ran an inherited template hook"
+    copied = [path for path in tmp_path.rglob("post-commit") if template not in path.parents]
+    assert not copied, f"git init copied the inherited template's hook: {copied}"
+    control = tmp_path / "control"
+    control.mkdir()
+    env = _fixture_git_env()
+    env["GIT_TEMPLATE_DIR"] = str(template)
+    count = int(env["GIT_CONFIG_COUNT"])  # undo the scrubbed env's core.hooksPath pin
+    env[f"GIT_CONFIG_KEY_{count}"] = "core.hooksPath"
+    env[f"GIT_CONFIG_VALUE_{count}"] = ".git/hooks"
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    for argv in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "control"]):
+        subprocess.run(["git", *argv], cwd=control, env=env, check=True, capture_output=True)
+    assert marker.exists(), "the inherited hook never runs here, so this proves nothing"
+
+
+class _RepoHelper:
+    """A tiny ``Repo`` wrapper holding a ``git(*argv)`` runner so a fixture can keep both."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def git(self, *argv: str) -> str:
+        # The scrubbed fixture env: no inherited location, template hooks or identity.
+        return _git(self.root, *argv)
+
+    def __truediv__(self, name: str) -> Path:
+        return self.root / name
+
+
+class TestChangeMergeBase:
+    """The change-shaped base resolver, for a per-file comparison that must handle a
+    forked ``origin`` and a shallow CI checkout.
     """
 
-    @staticmethod
-    def _import_merge(repo: Path) -> None:
-        """A fork-sync shape: a real merge on main, both sides having edited one file.
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepoHelper:
+        _drop_ambient_git_location(monkeypatch)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        root = tmp_path / "repo"
+        root.mkdir()
+        repo = _RepoHelper(root)
+        (root / "a.txt").write_text("one\n", encoding="utf-8")
+        repo.git("init", "-q")
+        repo.git("checkout", "-q", "-b", "main")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "base")
+        repo.git("checkout", "-q", "-b", "change")
+        (root / "b.txt").write_text("two\n", encoding="utf-8")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "add b.txt")
+        return repo
 
-        ``consumer.py`` starts with one line. ``main`` inserts a line ABOVE it,
-        which is what makes the untouched line MOVE, and the imported branch
-        adds a line of its own below.
-        """
-        (repo / "consumer.py").write_text("original = 1\n", encoding="utf-8")
-        _git(repo, "add", "consumer.py")
-        _git(repo, "commit", "-m", "seed the consumer")
-        _git(repo, "checkout", "-b", "imported")
-        (repo / "consumer.py").write_text("original = 1\nfrom_upstream = 2\n", encoding="utf-8")
-        _git(repo, "commit", "-am", "upstream adds a line")
-        _git(repo, "checkout", "main")
-        (repo / "consumer.py").write_text("inserted_above = 0\noriginal = 1\n", encoding="utf-8")
-        _git(repo, "commit", "-am", "the fork inserts above")
-        _git(repo, "merge", "--no-ff", "-m", "sync", "imported", "--no-edit")
+    def test_the_fixture_ignores_ambient_git_state(self, request, monkeypatch, tmp_path) -> None:
+        assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "repo")
 
-    def test_a_line_only_moved_by_the_merge_is_not_reported_as_added(self, repo: Path) -> None:
-        self._import_merge(repo)
-        # The union of both sides: every line came from one or the other, so
-        # nothing was written by the merge. git resolves this one itself, and
-        # the merge commit is left as HEAD -- committing past it would make HEAD
-        # an ordinary commit and change the scope shape under test.
-
-        _, label = scope.changed_paths()
-        assert label == "merge HEAD^1..HEAD"
-        assert scope.added_lines(label).get("consumer.py", set()) == set()
-
-    def test_a_line_no_ancestry_carried_is_still_reported(self, repo: Path) -> None:
-        self._import_merge(repo)
-        # Left UNCOMMITTED on purpose: the merge scope diffs to the working
-        # tree, so this is what a resolver's own edit looks like to the gate
-        # while they are still fixing it.
-        (repo / "consumer.py").write_text(
-            "inserted_above = 0\noriginal = 1\nfrom_upstream = 2\nwritten_by_hand = 3\n",
-            encoding="utf-8",
-        )
-
-        _, label = scope.changed_paths()
-        # Only the hand-written line: line 4. Accepting it too would make the
-        # merge case a blanket exemption, which is the failure this pairs with.
-        assert scope.added_lines(label).get("consumer.py") == {4}
-
-    def test_the_imported_ancestry_is_named_and_the_own_history_is_not(self, repo: Path) -> None:
-        self._import_merge(repo)
-        imported = _git(repo, "rev-parse", "HEAD^2")
-        base = _git(repo, "rev-parse", "HEAD^1")
-
-        _, label = scope.changed_paths()
-        parents = scope.imported_parents(label)
-
-        assert parents == [imported]
-        # The base is not "imported" -- it is where the change started. It is
-        # a ceiling for the count rule, hence its presence in scope_bases.
-        assert base not in parents
-        assert scope.scope_bases(label) == [base, imported]
-
-    def test_a_range_with_no_merge_in_it_imports_no_ancestry(self, repo: Path) -> None:
-        # The fast-forward shape every ordinary PR takes. Nothing was imported,
-        # so `imported_parents` is empty -- but the BASE is still a ceiling,
-        # because it is a real commit predating the change that cannot contain
-        # anything the change wrote.
-        _set_origin_main(repo)
-        _git(repo, "checkout", "feature")
-        base = _git(repo, "merge-base", "origin/main", "HEAD")
-
-        _, label = scope.changed_paths()
-
-        assert label == "origin/main...HEAD"
-        assert scope.imported_parents(label) == []
-        assert scope.scope_bases(label) == [base]
-
-    def test_a_non_merge_scope_still_reports_a_plain_added_line(self, repo: Path) -> None:
-        # The counterpart: the added-line answer for a non-merge scope is the
-        # raw diff, with no content narrowing applied to it at all.
-        _set_origin_main(repo)
-        _git(repo, "checkout", "feature")
-        (repo / "feature.py").write_text("feature.py\nnovel = 1\n", encoding="utf-8")
-        _git(repo, "commit", "-am", "add a line")
-
-        _, label = scope.changed_paths()
-
-        # feature.py is wholly new against merge-base(main, HEAD), so BOTH of
-        # its lines are added -- the raw diff answer, unnarrowed.
-        assert scope.added_lines(label).get("feature.py") == {1, 2}
-
-    def test_a_ci_merge_ref_does_not_treat_the_pr_head_as_pre_existing(self, repo: Path) -> None:
-        # The dangerous direction. On GitHub's pull_request merge ref the second
-        # parent is the PR itself, so taking both parents as pre-existing
-        # history would accept every line the PR adds -- the gate deleted. The
-        # PR head must NOT appear as an imported ancestry.
-        _set_origin_main(repo)
-        _git(repo, "checkout", "--detach", "main")
-        _git(repo, "merge", "--no-ff", "-m", "merge ref", "feature", "--no-edit")
-        pr_head = _git(repo, "rev-parse", "HEAD^2")
-
-        _, label = scope.changed_paths()
-
-        assert label == "merge HEAD^1..HEAD"
-        assert pr_head not in scope.imported_parents(label)
-        assert pr_head not in scope.scope_bases(label)
-        # And the PR's own file is still judged as added.
-        assert scope.added_lines(label).get("feature.py") == {1}
-
-    def test_a_merge_nested_inside_a_ci_merge_ref_is_still_imported(self, repo: Path) -> None:
-        # The shape a fork-sync PR actually presents to CI: the PR head is
-        # itself a merge that imported foreign history. The walk must descend
-        # THROUGH the PR head -- own history -- and still name the ancestry it
-        # brought in, or the gate charges the PR with every upstream line.
-        _git(repo, "checkout", "-b", "imported-upstream", "main")
-        _commit_file(repo, "upstream.py", "foreign history")
-        upstream = _git(repo, "rev-parse", "HEAD")
-        _git(repo, "checkout", "feature")
-        _git(repo, "merge", "--no-ff", "-m", "sync upstream", upstream, "--no-edit")
-        _git(repo, "checkout", "main")
-        _set_origin_main(repo)
-        _git(repo, "checkout", "--detach", "main")
-        _git(repo, "merge", "--no-ff", "-m", "merge ref", "feature", "--no-edit")
-
-        _, label = scope.changed_paths()
-
-        assert label == "merge HEAD^1..HEAD"
-        assert scope.imported_parents(label) == [upstream]
-
-    def test_the_pull_request_env_signal_alone_forces_the_strict_direction(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    def test_the_local_base_branch_is_used_when_nothing_else_resolves(
+        self, repo: _RepoHelper
     ) -> None:
-        # A real merge ON a branch, so the detachment signal says "not a merge
-        # ref" -- but GITHUB_BASE_REF is set, which only a pull_request event
-        # does. Either signal is enough, and the strict reading must win: the
-        # second parent is then the change, never pre-existing history.
-        monkeypatch.setenv("GITHUB_BASE_REF", "main")
-        self._import_merge(repo)
+        base, how = scope.change_merge_base(cwd=repo.root, env={})
+        assert base == repo.git("rev-parse", "main") and "main" in how
 
-        _, label = scope.changed_paths()
+    def test_a_fork_s_stale_origin_loses_to_a_newer_upstream(self, repo: _RepoHelper) -> None:
+        # upstream/main picks up a commit origin/main has not (the fork lags).
+        repo.git("checkout", "-q", "main")
+        stale_main = repo.git("rev-parse", "main")
+        (repo / "c.txt").write_text("three\n", encoding="utf-8")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "merged upstream")
+        new_main = repo.git("rev-parse", "main")
+        # change rebases onto the new main so its merge-base with upstream/main is new_main.
+        repo.git("checkout", "-q", "change")
+        repo.git("rebase", "-q", "main")
+        repo.git("update-ref", "refs/remotes/origin/main", stale_main)
+        repo.git("update-ref", "refs/remotes/upstream/main", new_main)
+        base, how = scope.change_merge_base(cwd=repo.root, env={})
+        assert base == new_main and "upstream/main" in how
 
-        assert label == "merge HEAD^1..HEAD"
-        assert scope.imported_parents(label) == []
-
-    @staticmethod
-    def _import_merge_on_a_side_branch(repo: Path) -> str:
-        """The same fork-sync shape, but on a branch ``main`` never reaches.
-
-        The on-main variant above cannot express a merge buried in the RANGE:
-        committing on main afterwards moves the base past the merge, so the base
-        contains it and every commit of interest is between it and the tip.
-
-        ``consumer.py`` is seeded ON MAIN, so it predates the base: a line only
-        MOVED by the merge has to be a line the base already had, and a file
-        created inside the range is wholly new to it. Returns the imported
-        branch's tip; ``main`` is left where the seed put it, so a caller sets
-        ``origin/main`` AFTER calling this.
-        """
-        (repo / "consumer.py").write_text("original = 1\n", encoding="utf-8")
-        _git(repo, "add", "consumer.py")
-        _git(repo, "commit", "-m", "seed the consumer on the base")
-        _git(repo, "checkout", "-b", "work", "main")
-        _git(repo, "checkout", "-b", "imported-upstream")
-        (repo / "consumer.py").write_text("original = 1\nfrom_upstream = 2\n", encoding="utf-8")
-        _git(repo, "commit", "-am", "upstream adds a line")
-        imported = _git(repo, "rev-parse", "HEAD")
-        _git(repo, "checkout", "work")
-        (repo / "consumer.py").write_text("inserted_above = 0\noriginal = 1\n", encoding="utf-8")
-        _git(repo, "commit", "-am", "the fork inserts above")
-        _git(repo, "merge", "--no-ff", "-m", "sync", "imported-upstream", "--no-edit")
-        return imported
-
-    def test_a_non_merge_tip_still_inherits_a_merge_inside_its_range(self, repo: Path) -> None:
-        # The defect that survived keying on "HEAD is a merge": one ordinary
-        # commit on top of a fork-sync merge makes HEAD single-parent, and the
-        # whole imported diff was attributed to the change again. The merge is
-        # still in the range, so the ancestry it imported is still inherited.
-        imported = self._import_merge_on_a_side_branch(repo)
-        _set_origin_main(repo)
-        _commit_file(repo, "afterwards.txt", "an ordinary commit on top of the merge")
-        assert len(_git(repo, "log", "-1", "--format=%p").split()) == 1, "tip must be non-merge"
-
-        _, label = scope.changed_paths()
-
-        assert label == "origin/main...HEAD"
-        assert scope.imported_parents(label) == [imported]
-
-    def test_the_narrowing_still_applies_through_a_non_merge_tip(self, repo: Path) -> None:
-        # The same generalization, end to end, with the merge buried behind an
-        # ordinary commit instead of sitting at the tip. `consumer.py` ends as
-        #   1 inserted_above = 0   <- written on this branch, inside the range
-        #   2 original = 1         <- the base's line, only MOVED down by (1)
-        #   3 from_upstream = 2    <- the imported ancestry's line
-        # so exactly one of the three is this change's to answer for. Line 2 is
-        # the one the correction exists for: nothing but its position changed.
-        self._import_merge_on_a_side_branch(repo)
-        _set_origin_main(repo)
-        _commit_file(repo, "afterwards.txt", "an ordinary commit on top of the merge")
-
-        _, label = scope.changed_paths()
-
-        assert scope.added_lines(label).get("consumer.py") == {1}
-
-        # And a line no ancestry carried is still reported when it lands beside
-        # them, which is what stops this being an exemption.
-        (repo / "consumer.py").write_text(
-            "inserted_above = 0\noriginal = 1\nfrom_upstream = 2\nwritten_by_hand = 3\n",
-            encoding="utf-8",
+    def test_the_env_override_wins_and_an_unresolvable_value_is_rejected(
+        self, repo: _RepoHelper
+    ) -> None:
+        change = repo.git("rev-parse", "change")
+        base, how = scope.change_merge_base(cwd=repo.root, env={"FLAKE_RATCHET_BASE": "change"})
+        assert base == change and "FLAKE_RATCHET_BASE" in how
+        assert (
+            scope.change_merge_base(cwd=repo.root, env={"FLAKE_RATCHET_BASE": "no-such-ref"})[0]
+            is None
         )
-        assert scope.added_lines(label).get("consumer.py") == {1, 4}
 
-    def test_a_merge_deep_in_the_range_is_found_from_a_ci_merge_ref_too(self, repo: Path) -> None:
-        # Both generalizations at once: a fork-sync merge, an ordinary commit on
-        # top of it, and THEN GitHub's merge ref over that. The walk must
-        # descend through the PR head, past the ordinary commit, and still name
-        # the imported ancestry -- while never treating the PR head itself as
-        # pre-existing.
-        imported = self._import_merge_on_a_side_branch(repo)
-        _commit_file(repo, "afterwards.txt", "the PR's own commit")
-        pr_head = _git(repo, "rev-parse", "HEAD")
-        _git(repo, "checkout", "main")
-        _commit_file(repo, "base-moved.txt", "the base moves after the branch point")
-        _set_origin_main(repo)
-        _git(repo, "checkout", "--detach", "main")
-        _git(repo, "merge", "--no-ff", "-m", "merge ref", "work", "--no-edit")
+    def test_a_pull_request_merge_commit_s_first_parent_is_the_base(
+        self, repo: _RepoHelper
+    ) -> None:
+        before = repo.git("rev-parse", "main")
+        repo.git("checkout", "-q", "main")
+        repo.git("merge", "-q", "--no-ff", "-m", "merge", "change")
+        base, how = scope.change_merge_base(cwd=repo.root, env={"GITHUB_BASE_REF": "main"})
+        assert base == before and "first parent" in how
 
-        _, label = scope.changed_paths()
+    def test_a_push_event_uses_the_first_parent_too(self, repo: _RepoHelper) -> None:
+        before = repo.git("rev-parse", "HEAD")
+        (repo / "a.txt").write_text("edited\n", encoding="utf-8")
+        repo.git("commit", "-q", "-am", "another")
+        base, how = scope.change_merge_base(cwd=repo.root, env={"GITHUB_EVENT_NAME": "push"})
+        assert base == before and "push" in how
 
-        assert label == "merge HEAD^1..HEAD"
-        assert scope.imported_parents(label) == [imported]
-        assert pr_head not in scope.scope_bases(label)
+    def test_an_unreadable_merge_base_returns_none(self, tmp_path: Path, monkeypatch) -> None:
+        _drop_ambient_git_location(monkeypatch)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+        root = tmp_path / "bare"
+        root.mkdir()
+        assert scope.change_merge_base(cwd=root, env={})[0] is None
+
+
+class TestChangeFilesAndShowAt:
+    """``change_files`` reports (base path, now path) for each file the working tree
+    changes against *base*, and ``show_at`` reads a file's bytes at that base."""
+
+    @pytest.fixture
+    def repo(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _RepoHelper:
+        _drop_ambient_git_location(monkeypatch)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        root = tmp_path / "repo"
+        root.mkdir()
+        repo = _RepoHelper(root)
+        (root / "a.txt").write_text("one\n", encoding="utf-8")
+        (root / "b.txt").write_text("two\n", encoding="utf-8")
+        (root / "to_delete.txt").write_text("gone\n", encoding="utf-8")
+        repo.git("init", "-q")
+        repo.git("checkout", "-q", "-b", "main")
+        repo.git("add", "-A")
+        repo.git("commit", "-q", "-m", "base")
+        repo.git("checkout", "-q", "-b", "change")
+        return repo
+
+    def test_the_fixture_ignores_ambient_git_state(self, request, monkeypatch, tmp_path) -> None:
+        assert_fixture_ignores_ambient_git(request, monkeypatch, tmp_path, "repo")
+
+    def _base(self, repo: _RepoHelper) -> str:
+        return repo.git("rev-parse", "main")
+
+    def test_adds_deletes_renames_copies_and_untracked_are_paired_right(
+        self, repo: _RepoHelper
+    ) -> None:
+        # one of each kind that change_files pairs: modify, rename, delete, add, untracked.
+        (repo / "a.txt").write_text("edited\n", encoding="utf-8")  # modify
+        repo.git("mv", "b.txt", "c.txt")  # rename
+        (repo / "e.txt").write_text("tracked add\n", encoding="utf-8")
+        repo.git("add", "e.txt")  # tracked add
+        repo.git("rm", "-q", "to_delete.txt")  # delete
+        (repo / "untracked.txt").write_text("outside git\n", encoding="utf-8")  # untracked
+        pairs = scope.change_files(self._base(repo), cwd=repo.root)
+        assert ("a.txt", "a.txt") in pairs
+        assert ("b.txt", "c.txt") in pairs
+        assert ("to_delete.txt", None) in pairs
+        assert (None, "e.txt") in pairs
+        assert (None, "untracked.txt") in pairs
+
+    def test_show_at_reads_bytes_at_the_base_and_returns_none_for_absent(
+        self, repo: _RepoHelper
+    ) -> None:
+        assert scope.show_at(self._base(repo), "a.txt", cwd=repo.root) == "one\n"
+        assert scope.show_at(self._base(repo), "nope.txt", cwd=repo.root) is None

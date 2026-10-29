@@ -165,8 +165,10 @@ class TestClassifyAgainstRealProducers:
 #: thing it was refused for, which is the defect this file's census guards.
 _AWS_READ_TELL = "AWS CLI calls themselves are NOT blocked"
 
-#: Categories whose rules have a sanctioned path, and so must all resolve.
-_REMEDIATION_CATEGORIES = ("sensitive-file-read", "credential-exfil", "self-protection")
+#: Categories whose rules carry guidance, and so must all resolve. The first three
+#: have a sanctioned path; ``sql`` is routed because its text match reaches prose
+#: the agent is writing, and the bare pattern line does not say so.
+_REMEDIATION_CATEGORIES = ("sensitive-file-read", "credential-exfil", "self-protection", "sql")
 
 
 def _rule_by_id(rule_id: str) -> security.DeniedCommandRule:
@@ -233,6 +235,10 @@ class TestRuleIdentityRoutesTheRegexTier:
             ("data-exfil-curl-file-body", dg.DENY_CLASS_EXFIL_SHAPE),
             ("self-protection-kill", dg.DENY_CLASS_SELF_PROTECTION),
             ("self-protection-cron-adopt", dg.DENY_CLASS_SELF_PROTECTION),
+            # The three text-matched SQL rows, resolved by their category.
+            ("sql-drop-database", dg.DENY_CLASS_STATEMENT_TEXT),
+            ("sql-drop-table", dg.DENY_CLASS_STATEMENT_TEXT),
+            ("sql-truncate-table", dg.DENY_CLASS_STATEMENT_TEXT),
         ],
     )
     def test_each_pairing(self, rule_id, expected):
@@ -588,6 +594,130 @@ class TestCatalogCensus:
                 assert dg.REMEDIATION.get(deny_class)
 
 
+#: Shell commands that only WRITE prose mentioning a destructive statement, each
+#: with the rule its text trips. Drawn from the reported shapes: a heredoc into a
+#: notes file, a heredoc fed to a comment body, ``tee``, a ``printf`` fixture and
+#: an inline program -- none of which invokes a database client.
+_PROSE_MENTIONS: tuple[tuple[str, str], ...] = (
+    (
+        "cat > notes.md <<'EOF'\nThe migration will DROP TABLE users after a backup.\nEOF",
+        "sql-drop-table",
+    ),
+    (
+        "gh issue comment 1 --body-file - <<'EOF'\nWe must never run DROP DATABASE prod.\nEOF",
+        "sql-drop-database",
+    ),
+    ("tee x.txt <<EOF\nTRUNCATE TABLE logs is unsafe here.\nEOF", "sql-truncate-table"),
+    ("printf '%s\\n' 'drop table if exists public.zzz;' > bad_fixture.sql", "sql-drop-table"),
+    (
+        "python3 - <<'PY'\nopen('notes.md', 'w').write('never DROP TABLE users')\nPY",
+        "sql-drop-table",
+    ),
+)
+
+#: The same statements where a database client WOULD run them.
+_STATEMENTS_THAT_RUN: tuple[tuple[str, str], ...] = (
+    ('psql -c "DROP TABLE users"', "sql-drop-table"),
+    ("mysql -e 'DROP DATABASE prod'", "sql-drop-database"),
+    ("psql <<EOF\nTRUNCATE TABLE logs;\nEOF", "sql-truncate-table"),
+)
+
+
+class TestStatementTextMatchedInProse:
+    """The ``sql`` rules match text, so prose that mentions a statement is refused.
+
+    That reach is deliberate and is NOT narrowed here: which prose consumers would
+    be safe to exempt is a decision on a built-in deny rule and belongs to a
+    maintainer. What this class pins is the two halves of leaving the match alone
+    honestly -- the refusal is byte-identical to what it always was, and the
+    guidance attached to it now says what matched and what to do about it.
+    """
+
+    @pytest.mark.parametrize("command,rule_id", _PROSE_MENTIONS + _STATEMENTS_THAT_RUN)
+    def test_the_refusal_is_unchanged(self, command, rule_id):
+        """Prose and a real statement are refused alike, by the same bare line.
+
+        The deny decision is the floor this change promised not to move: every
+        reported shape is still refused, by the same rule, and the reason is
+        exactly one line -- the prefix and the pattern -- with nothing appended
+        that a reader of the wire format could trip on.
+        """
+        rule = _rule_by_id(rule_id)
+        reason = security.is_denied(command, denied_regexes=_builtin_regexes())
+        assert reason == f"{security.DENY_REASON_PREFIX}{rule.pattern}"
+        assert reason == _rule_tier_reason(rule)
+
+    @pytest.mark.parametrize("command,rule_id", _PROSE_MENTIONS)
+    def test_prose_that_mentions_a_statement_gets_the_text_match_guidance(self, command, rule_id):
+        reason = security.is_denied(command, denied_regexes=_builtin_regexes())
+        assert reason
+        assert dg.classify_deny(reason, command) == dg.DENY_CLASS_STATEMENT_TEXT
+        text = dg.remediation_for(reason, command)
+        assert text == dg.REMEDIATION[dg.DENY_CLASS_STATEMENT_TEXT]
+
+    @pytest.mark.parametrize("command,rule_id", _STATEMENTS_THAT_RUN)
+    def test_a_statement_that_would_run_gets_the_same_guidance(self, command, rule_id):
+        """One class for both readings, because the producer cannot tell them apart.
+
+        The guidance therefore has to carry both next steps itself (the running
+        statement is the user's, the prose is written with the file tool), rather
+        than the classifier guessing from the command which one applies.
+        """
+        reason = security.is_denied(command, denied_regexes=_builtin_regexes())
+        assert reason
+        assert dg.classify_deny(reason, command) == dg.DENY_CLASS_STATEMENT_TEXT
+
+    def test_the_guidance_says_what_matched_and_both_next_steps(self):
+        text = dg.REMEDIATION[dg.DENY_CLASS_STATEMENT_TEXT]
+        lowered = text.lower()
+        # Why: the match is on text, and reaches a heredoc body.
+        assert "text" in lowered
+        assert "heredoc" in lowered
+        # Not a spelling problem.
+        assert "re-spelling" in lowered
+        # A statement meant to run is the user's step, never re-routed.
+        assert "let the user run it" in lowered
+        # Prose or data goes through the file-editing tool, which this rule never reads.
+        assert "file-editing tool" in lowered
+        assert "not a shell command" in lowered
+        # The path is handed to PROSE readers only, named, and a database client
+        # is forbidden by name: "run the command that takes the path" would fit
+        # `psql -f` and read as a route around the rule.
+        assert "prose reader" in lowered
+        assert "--body-file" in lowered and "commit -f" in lowered
+        assert "database client" in lowered and "must never be handed" in lowered
+        # The honest third answer for text the agent did not author.
+        assert "over-block" in lowered
+
+    def test_the_guidance_does_not_narrow_or_promise_to(self):
+        """Guidance explains the rule; it must not read as a carve-out or a knob."""
+        lowered = dg.REMEDIATION[dg.DENY_CLASS_STATEMENT_TEXT].lower()
+        for phrase in ("disable", "opt out", "opt-out", "is allowed", "will be allowed"):
+            assert phrase not in lowered, phrase
+
+    def test_the_rule_descriptions_say_the_match_is_on_text(self):
+        """The Settings catalog is where an operator looks the rule up."""
+        for rule in security.BUILTIN_DENIED_RULES:
+            if rule.category != "sql":
+                continue
+            assert "anywhere on the command line" in rule.description, rule.id
+            assert "heredoc" in rule.description, rule.id
+            assert "file-editing tool" in rule.description, rule.id
+
+    def test_the_two_agent_facing_documents_carry_the_same_answer(self):
+        """The prose lives in three places and must agree on the two next steps."""
+        root = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
+        for path in (
+            root / "builtin_skills" / "blocked-by-policy" / "SKILL.md",
+            root / "docs" / "blocked-commands.md",
+        ):
+            lowered = path.read_text(encoding="utf-8").lower()
+            assert "heredoc" in lowered, path.name
+            assert "file-editing tool" in lowered, path.name
+            assert "let the user run it" in lowered or "belongs to you" in lowered, path.name
+            assert "database client" in lowered and "never" in lowered, path.name
+
+
 class TestWireReasonFirstLineIsUnchanged:
     """The first line of a refusal is a parsed contract, and routing must not move it.
 
@@ -650,10 +780,16 @@ class TestNonAwsCredentialStoresGetProviderNeutralGuidance:
 
 class TestRemediationText:
     def test_every_class_has_text(self):
-        # The unverified-path class is classified structurally (a fixed-prefix test
-        # in ``classify_deny``), not by an anchor row, so it is the one class with
-        # remediation text and no anchors.
-        classes = {name for name, _anchors in dg._CLASS_ANCHORS} | {dg.DENY_CLASS_PATH_UNVERIFIED}
+        # Two classes have remediation text and no anchor row: the unverified-path
+        # class is classified structurally (a fixed-prefix test in
+        # ``classify_deny``), and the statement-text class is reached only through
+        # a rule's identity (the ``sql`` category) -- an anchor for it would let a
+        # command that merely MENTIONS the statement pull a rule-less refusal onto
+        # SQL prose that has nothing to do with it.
+        classes = {name for name, _anchors in dg._CLASS_ANCHORS} | {
+            dg.DENY_CLASS_PATH_UNVERIFIED,
+            dg.DENY_CLASS_STATEMENT_TEXT,
+        }
         assert classes == set(dg.REMEDIATION)
         assert all(text.strip() for text in dg.REMEDIATION.values())
 
@@ -759,6 +895,9 @@ class TestRemediationText:
             dg.DENY_CLASS_TRUST_ROOT,
             dg.DENY_CLASS_SELF_PROTECTION,
             dg.DENY_CLASS_EXFIL_SHAPE,
+            # Any "example" command here would carry the statement's text and be
+            # refused by the very rule the guidance is explaining.
+            dg.DENY_CLASS_STATEMENT_TEXT,
         ):
             assert deny_class not in dg.SUGGESTED_COMMANDS
 
@@ -1342,3 +1481,88 @@ class TestNoticeIntegration:
 
     def test_empty_refusals_still_yield_nothing(self):
         assert build_refusal_recovery_prompt([]) == ""
+
+
+# The permission verb, spelled in halves so this file's own text does not trip the
+# rows under test.
+_PERM_VERB = "ch" + "mod"
+_SSH_EQUIVALENT = (
+    "-o StrictHostKeyChecking=yes -o NumberOfPasswordPrompts=0 "
+    "-o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
+)
+_CONTACTS_REMOTE = (
+    '"/usr/bin/osascript -e \'tell application \\"Contacts\\" to count every person\'"'
+)
+
+
+def _ssh_hook_result(monkeypatch, options: str):
+    from kiro_crew.hooks import HookManager
+    from kiro_crew.security import argv_floor
+
+    # Fixture host is remote. Isolate DNS; no SSH or osascript is executed.
+    monkeypatch.setattr(argv_floor, "_resolved_host_verdict", lambda host, **kwargs: False)
+    monkeypatch.setattr(argv_floor, "_NETLINK_ADDRS_PUBLISHED", True)
+    command = f"/usr/bin/ssh {options} -o ConnectTimeout=8 user@remote.example {_CONTACTS_REMOTE}"
+    return command, HookManager().on_tool_call("Run command", command=command, is_shell=True)
+
+
+class TestSshBatchModeRefusalHint:
+    """``BatchMode`` spells a permission verb once case is folded.
+
+    The deny rows are unchanged, so that spelling is still refused. What changes is
+    the text: the refusal names the equivalent options, and those pass the same
+    floor untouched.
+    """
+
+    def test_equivalent_options_pass_the_deny_floor_unchanged(self, monkeypatch):
+        from kiro_crew.hooks import TOOL_DENY
+
+        _, result = _ssh_hook_result(monkeypatch, _SSH_EQUIVALENT)
+        assert result.action != TOOL_DENY, result.reason
+
+    def test_batchmode_is_still_refused_and_the_hint_names_the_equivalent(self, monkeypatch):
+        from kiro_crew.hooks import TOOL_DENY
+
+        command, result = _ssh_hook_result(monkeypatch, "-o BatchMode=yes")
+        assert result.action == TOOL_DENY
+        assert dg.remediation_for(result.reason, command) == dg.SSH_BATCHMODE_REMEDIATION
+        assert _SSH_EQUIVALENT in dg.SSH_BATCHMODE_REMEDIATION
+
+    def test_the_stall_hint_proposes_the_same_equivalent(self):
+        from kiro_crew.acp import liveness
+
+        assert liveness._SSH_NONINTERACTIVE_OPTIONS == _SSH_EQUIVALENT
+        assert _SSH_EQUIVALENT in liveness.non_interactive_hint("ssh host uptime")
+
+    def test_the_hint_needs_both_a_permission_row_and_batchmode(self):
+        row = next(
+            r for r in security.BUILTIN_DENIED_RULES if r.id.startswith("local-destructive-ch")
+        )
+        reason = security.DENY_REASON_PREFIX + row.pattern
+        real = f"{_PERM_VERB} 777 /usr/bin/x"
+        assert dg.remediation_for(reason, real) != dg.SSH_BATCHMODE_REMEDIATION
+        other = security.DENY_REASON_PREFIX + "rm -rf /"
+        assert dg.remediation_for(other, "ssh -o BatchMode=yes h rm -rf /") == ""
+
+    def test_the_hint_is_withheld_when_the_command_also_holds_a_real_verb(self):
+        # The prose says nothing changes permissions; a real remote verb makes that false.
+        row = next(
+            r
+            for r in security.BUILTIN_DENIED_RULES
+            if r.id.startswith("local-destructive-ch") and "/usr" in r.pattern
+        )
+        reason = security.DENY_REASON_PREFIX + row.pattern
+        real = f"ssh -o BatchMode=yes host '{row.pattern.split('.')[0]} 777 /usr/bin/x'"
+        assert dg.remediation_for(reason, real) != dg.SSH_BATCHMODE_REMEDIATION
+        only_key = "ssh -o BatchMode=yes host /usr/bin/x"
+        assert dg.remediation_for(reason, only_key) == dg.SSH_BATCHMODE_REMEDIATION
+
+    def test_the_rows_still_refuse_batchmode(self):
+        # The hint is display text: the same command is refused with or without it.
+        patterns = [
+            r.pattern
+            for r in security.BUILTIN_DENIED_RULES
+            if r.id.startswith("local-destructive-ch")
+        ]
+        command = "ssh -o BatchMode=yes remote.example /usr/bin/example"
+        assert security.is_denied(command, denied_regexes=patterns) is not None

@@ -44,6 +44,7 @@ vi.mock('../../utils/errorReport', async (importOriginal) => ({
 vi.mock('../../store', () => ({
   useAppDispatch: () => dispatch,
   useAppSelector: (fn: (s: unknown) => unknown) => fn(storeState),
+  useAppStore: () => ({ getState: () => storeState }),
 }))
 vi.mock('../../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
@@ -238,6 +239,49 @@ describe('command bar — artifacts view', () => {
     fireEvent.mouseDown(rowByText('Onboarding Runbook'))
     expect(navigate).toHaveBeenCalledWith('/artifacts/onboarding-runbook')
     await waitFor(() => expect(onClose).toHaveBeenCalled())
+  })
+
+  it('latches a debounce-window Enter and fires it on the live artifact rows', async () => {
+    // Every scoped view ranks from the DEBOUNCED query, so for one debounce interval
+    // after a keystroke its rows answer the previous query. An Enter in that window is
+    // held, never acting on the row selected against the old query, and fired once the
+    // rows answer what the reader typed. Reported in the crewmates view; the latch is
+    // on the activation path all four views share, so each one pins it.
+    // The narrowing happens server-side, so each query's result set is the mock's next
+    // answer rather than a filter over one fixture.
+    artifacts.mockResolvedValue({ artifacts: ARTIFACTS })
+    mount()
+    await enterView()
+    artifacts.mockResolvedValue({ artifacts: [ARTIFACTS[1]] })
+    type('runbook')
+    await waitFor(() => {
+      expect(hasRow('Onboarding Runbook')).toBe(true)
+      expect(hasRow('Q3 Revenue Chart')).toBe(false)
+    })
+    navigate.mockClear()
+    artifacts.mockResolvedValue({ artifacts: [ARTIFACTS[0]] })
+    const input = screen.getByRole('combobox')
+    fireEvent.change(input, { target: { value: 'revenue' } })
+    // No debounce tick: the row on screen is still the runbook.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(navigate).not.toHaveBeenCalled()
+    // The latched Enter fires on the revenue rows on its own, never on the runbook.
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/artifacts/q3-revenue-chart'))
+  })
+
+  it('still opens on Enter while a query sits BELOW the search floor', async () => {
+    // The guard compares what the view would ASK for the live query against what it did
+    // ask, not the two query strings. Below ARTIFACTS_MIN_CHARS every query asks for the
+    // same listing, so those rows answer a one-character query too — and a string
+    // comparison would have frozen Enter on rows that were the correct answer to it.
+    artifacts.mockResolvedValue({ artifacts: ARTIFACTS })
+    mount()
+    await enterView()
+    await waitFor(() => expect(hasRow('Q3 Revenue Chart')).toBe(true))
+    const input = screen.getByRole('combobox')
+    fireEvent.change(input, { target: { value: 'q' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(navigate).toHaveBeenCalledWith('/artifacts/q3-revenue-chart')
   })
 
   it('names the Enter action "Open Artifact", not "Open Session"', async () => {

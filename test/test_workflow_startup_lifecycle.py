@@ -11,6 +11,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard import server
 from kiro_crew.taskrunner import TaskRunner, WorkflowInitializing
+from kiro_crew.testing.wait import await_until, finished
 from kiro_crew.workflows.service import WorkflowService
 from kiro_crew.workflows.store import WorkflowRunStore
 
@@ -90,7 +91,7 @@ async def test_listener_serves_during_full_restore_then_publishes(monkeypatch, t
         task = state.workflow_startup_task
         server._kick_workflow_initialization(state)
         assert state.workflow_startup_task is task
-        await asyncio.wait_for(entered.wait(), 3)
+        await await_until(entered, what="entered")
         headers = {"X-Test-Auth": "yes"}
         assert (await client.get("/api/health", headers=headers)).status == 200
         assert (await client.get("/api/workflows/runs")).status == 401
@@ -103,7 +104,7 @@ async def test_listener_serves_during_full_restore_then_publishes(monkeypatch, t
         assert state.task_runner._runs == {} and state.task_runner._tasks == {}
         assert not state.task_runner._start_ids_in_flight
         release.set()
-        await asyncio.wait_for(task, 3)
+        await await_until(task, what="startup task")
         assert state.workflow_startup_status == "ready"
         assert state.task_runner._workflow_service is state.workflow_service
         response = await client.get("/api/workflows/runs", headers=headers)
@@ -190,8 +191,8 @@ async def test_shutdown_cancels_recovery_and_prevents_late_publication(
     runner = web.AppRunner(app)
     await runner.setup()
     server._kick_workflow_initialization(state)
-    await asyncio.wait_for(entered.wait(), 3)
-    await asyncio.wait_for(runner.cleanup(), 3)
+    await await_until(entered, what="entered")
+    await finished(runner.cleanup(), "runner cleanup")
     assert state.workflow_startup_task.done()
     assert state.workflow_startup_stopping
     assert state.workflow_startup_status == "stopped"
@@ -210,9 +211,15 @@ async def test_shutdown_cancels_recovery_and_prevents_late_publication(
 def test_both_entrypoints_kick_after_credentials_not_during_setup():
     for entry in (server.start_dashboard, server.start_api_server):
         source = inspect.getsource(entry)
-        assert source.index("_start_site(site, port)") < source.index(
-            "_write_instance_credentials,"
+        # The serve anchor differs per entrypoint: the dashboard serves via
+        # SockSite.start() on the pre-bound reserved socket, the headless
+        # entrypoint still binds through _start_site.
+        serve_anchor = (
+            "_start_site(site, port)"
+            if "_start_site(site, port)" in source
+            else "await site.start()"
         )
+        assert source.index(serve_anchor) < source.index("_write_instance_credentials,")
         assert source.index("_write_instance_credentials,") < source.index(
             "_kick_workflow_initialization(state)"
         )
@@ -370,7 +377,7 @@ async def test_canonical_gate_preserves_reads_and_cancel_and_reports_failure(
     server._register_workflow_lifecycle(app, state)
     async with TestClient(TestServer(app, host="127.0.0.1")) as client:
         server._kick_workflow_initialization(state)
-        await asyncio.wait_for(entered.wait(), 3)
+        await await_until(entered, what="entered")
         assert state.workflow_startup_task.get_name() == "workflow-initialization"
         assert (await client.get("/api/taskrunner")).status == 200
         assert (await client.post("/api/taskrunner/cancel", json={})).status == 200
@@ -426,3 +433,76 @@ def test_canonical_explicit_none_releases_standalone_fallback(tmp_path):
     driver.attach_workflow_service(None)
     driver._require_workflow_ready()
     assert not hasattr(driver, "_workflow_recovery_pending")
+
+
+# Each boot below wraps the real factory, so a second boot in one test must not
+# wrap the first boot's wrapper.
+_ORIGINAL_CREATE = WorkflowService.create
+
+
+def _persist_run(store, run_id, *, finished=False):
+    from kiro_crew.workflows.registry import RunHandle, RunRegistry
+
+    registry = RunRegistry(store=store)
+    registry.register(RunHandle(run_id=run_id, name="research", session_key="dashboard:chat-1"))
+    if finished:
+        registry.mark_terminal(run_id, "finished", result={"ok": True})
+
+
+async def _start_and_collect_notices(monkeypatch, store):
+    """Run the real startup over *store*; return the completion notices it sent."""
+    from kiro_crew.dashboard import workflow_inject
+
+    notices = []
+
+    async def _record(_state, run_id, snapshot, **_kwargs):
+        notices.append((run_id, snapshot.get("status"), snapshot.get("error")))
+
+    monkeypatch.setattr(workflow_inject, "inject_bound_workflow_result", _record)
+    state = _state()
+
+    async def create_on_store(**kwargs):
+        return await _ORIGINAL_CREATE(store=store, **kwargs)
+
+    monkeypatch.setattr(WorkflowService, "create", create_on_store)
+    server._kick_workflow_initialization(state)
+    await asyncio.wait_for(state.workflow_startup_task, 30)
+    assert state.workflow_startup_status == "ready"
+    await asyncio.wait_for(asyncio.gather(*list(state._background_tasks)), 30)
+    return notices
+
+
+@pytest.mark.asyncio
+async def test_a_run_cut_off_by_a_restart_is_reported_to_its_chat_once(monkeypatch, tmp_path):
+    """The chat that started a run is promised its result on completion. A run the
+    restart ended is failed at load, and its chat gets that outcome once, on the
+    first boot only."""
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    store = WorkflowRunStore(tmp_path / "runs")
+    _persist_run(store, "wf_000001")
+    first = await _start_and_collect_notices(monkeypatch, store)
+    assert first == [("wf_000001", "failed", "interrupted: gateway restarted while running")]
+    second = await _start_and_collect_notices(monkeypatch, store)
+    assert second == [], "a second boot reported the same interrupted run again"
+
+
+@pytest.mark.asyncio
+async def test_a_run_finished_before_the_restart_is_not_reported_again(monkeypatch, tmp_path):
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    store = WorkflowRunStore(tmp_path / "runs")
+    _persist_run(store, "wf_000002", finished=True)
+    assert await _start_and_collect_notices(monkeypatch, store) == []
+
+
+def test_a_run_that_finishes_is_reported_to_its_chat_once(tmp_path):
+    from kiro_crew.workflows.registry import RunHandle, RunRegistry
+
+    notices = []
+    registry = RunRegistry(store=WorkflowRunStore(tmp_path / "runs"))
+    registry.set_on_done(lambda run_id, snapshot: notices.append((run_id, snapshot["status"])))
+    registry.register(
+        RunHandle(run_id="wf_000003", name="research", session_key="dashboard:chat-1")
+    )
+    registry.mark_terminal("wf_000003", "finished", result={"ok": True})
+    registry.mark_terminal("wf_000003", "failed", error="late")
+    assert notices == [("wf_000003", "finished")]

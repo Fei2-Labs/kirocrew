@@ -6,10 +6,13 @@ both start.
 """
 
 import errno
+import importlib.util
 import json
 import os
+import socket
 import stat
 import sys
+import threading
 from itertools import islice
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -23,14 +26,29 @@ from kiro_crew.gateway_lock import (
     LOCK_FILENAME,
     GatewayLock,
     GatewayLockError,
+    LockFileError,
     LockHolder,
+    LockPathError,
+    LockPathProbeError,
     LockProbeError,
     _directory_locks_supported,
     _DirectoryLockSupport,
     _is_same_file,
+    _lock_is_held,
+    _open_probe_descriptor,
     _read_pid,
     lock_holder,
 )
+
+
+def _listeners(*pids, address="127.0.0.1", family="4"):
+    """LISTEN sockets on the probed port for *pids*, bound where the probe reaches them.
+
+    The predicate reads ``platform_compat.find_port_listeners`` (pid AND bound
+    address); the default binds each pid at IPv4 loopback, the address an
+    unconfigured gateway probes, so the host's ``lsof`` never decides a verdict.
+    """
+    return [platform_compat.PortListener(pid, address, family) for pid in pids]
 
 
 @pytest.fixture
@@ -245,6 +263,55 @@ def test_second_acquire_refused_and_names_holder(tmp_path):
         first.release()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="relies on /proc/locks")
+@pytest.mark.parametrize("answers_http", [True, False])
+def test_a_refusal_by_a_live_acquirer_on_the_port_is_a_live_holder_only_when_it_answers(
+    kernel_lock_home, monkeypatch, answers_http
+):
+    """The verdict a supervisor acts on, read off a REAL held lock.
+
+    ``/proc/locks`` names this process as the acquirer and it is alive -- that
+    half is real kernel state. The port half is pinned: the listener scan names
+    this pid (the host's ``lsof`` must not decide the verdict -- a Linux runner
+    without it folds the scan to ``[]``), and the HTTP probe is the parameter.
+    Answering HTTP on the port makes the refusal terminal: a relaunch would meet
+    it again for as long as the holder serves. Listening WITHOUT answering is a
+    wedged gateway -- a hung process keeps its socket bound -- so that refusal
+    stays restartable, and the relaunch is what takes over once it dies. Without
+    the port fact at all the same held lock is only a hedge.
+    """
+    from kiro_crew import gateway_lock, platform_compat
+
+    monkeypatch.setattr(platform_compat, "find_port_listeners", lambda _p: _listeners(os.getpid()))
+    monkeypatch.setattr(gateway_lock, "_port_answers_http", lambda *_a, **_k: answers_http)
+    held = GatewayLock(kernel_lock_home).acquire()
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        with pytest.raises(GatewayLockError) as excinfo:
+            GatewayLock(kernel_lock_home, port=port).acquire()
+        assert excinfo.value.holder_pid == os.getpid()
+        text = str(excinfo.value)
+        assert f"holds port {port}" in text
+        if answers_http:
+            assert "answering HTTP" in text and "not answering" not in text
+        else:
+            assert "not answering HTTP" in text and "wedged" in text
+            assert "not treated as permanent" in text
+        assert excinfo.value.live_holder is answers_http, _lock_failure_evidence(
+            kernel_lock_home / LOCK_FILENAME, (os.getpid(),)
+        )
+        with pytest.raises(GatewayLockError) as portless:
+            GatewayLock(kernel_lock_home).acquire()
+        assert portless.value.holder_pid == os.getpid()
+        assert portless.value.live_holder is False
+    finally:
+        listener.close()
+        held.release()
+
+
 def test_stale_lock_is_reclaimed(tmp_path):
     # A leftover lock file with a dead holder's pid but no held flock (the prior
     # process died -> the kernel released its lock). Acquire must succeed and
@@ -257,6 +324,88 @@ def test_stale_lock_is_reclaimed(tmp_path):
         assert lock_file.read_text(encoding="utf-8").strip() == str(os.getpid())
     finally:
         lock.release()
+
+
+def test_posix_dead_holder_contention_is_retried(tmp_path, monkeypatch):
+    """A dying POSIX gateway may release its flock just after our first probe."""
+    from kiro_crew import gateway_lock
+
+    lock_file = tmp_path / LOCK_FILENAME
+    lock_file.write_text("999999\n", encoding="utf-8")
+    attempts = 0
+
+    def acquire_after_teardown(_fd, *, exclusive):
+        nonlocal attempts
+        assert exclusive is True
+        attempts += 1
+        return attempts > 1
+
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_compat, "try_acquire_lock", acquire_after_teardown)
+    monkeypatch.setattr(
+        platform_compat,
+        "pid_liveness",
+        lambda _pid: platform_compat.PID_DEAD,
+    )
+    monkeypatch.setattr(gateway_lock.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(GatewayLock, "_acquire_home_anchor", lambda _self: os.dup(0))
+
+    lock = GatewayLock(tmp_path).acquire()
+    try:
+        assert attempts == 2
+    finally:
+        lock.release()
+
+
+@pytest.mark.parametrize(
+    "liveness",
+    [platform_compat.PID_ALIVE, platform_compat.PID_UNSIGNALABLE],
+)
+def test_posix_contention_without_confirmed_dead_holder_is_not_retried(
+    tmp_path, monkeypatch, liveness
+):
+    lock_file = tmp_path / LOCK_FILENAME
+    lock_file.write_text("4242\n", encoding="utf-8")
+    attempts = 0
+
+    def always_busy(_fd, *, exclusive):
+        nonlocal attempts
+        assert exclusive is True
+        attempts += 1
+        return False
+
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_compat, "try_acquire_lock", always_busy)
+    monkeypatch.setattr(platform_compat, "pid_liveness", lambda _pid: liveness)
+
+    with pytest.raises(GatewayLockError):
+        GatewayLock(tmp_path).acquire()
+
+    assert attempts == 1
+
+
+def test_posix_out_of_range_holder_is_refused_without_retry(tmp_path, monkeypatch):
+    """A corrupt numeric stamp must fail closed without crashing or retrying."""
+    lock_file = tmp_path / LOCK_FILENAME
+    out_of_range_pid = 10**40
+    lock_file.write_text(f"{out_of_range_pid}\n", encoding="utf-8")
+    attempts = 0
+
+    def always_busy(_fd, *, exclusive):
+        nonlocal attempts
+        assert exclusive is True
+        attempts += 1
+        return False
+
+    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform_compat, "IS_POSIX", True)
+    monkeypatch.setattr(platform_compat, "try_acquire_lock", always_busy)
+
+    with pytest.raises(GatewayLockError) as excinfo:
+        GatewayLock(tmp_path).acquire()
+
+    assert attempts == 1
+    assert excinfo.value.holder_pid == out_of_range_pid
 
 
 def test_distinct_homes_both_acquire(tmp_path):
@@ -369,6 +518,95 @@ class TestLockFileIdentity:
         finally:
             held.release()
 
+    @pytest.mark.skipif(sys.platform != "linux", reason="relies on /proc/locks")
+    @pytest.mark.parametrize("answers_http", [True, False])
+    def test_a_home_still_held_by_a_live_gateway_is_a_live_holder_only_when_it_answers(
+        self, kernel_lock_home, monkeypatch, answers_http
+    ):
+        """Deleting the lock file changes the wording, not the verdict.
+
+        The home anchor's acquirer is this process, alive and on the port (the
+        listener scan is pinned to this pid, so the host's ``lsof`` does not
+        decide the verdict). Answering HTTP makes the refusal as terminal as the
+        ordinary one -- the same sibling keeps serving whether or not the lock
+        file still names it; listening without answering is a wedged gateway,
+        and that refusal stays restartable here too.
+        """
+        from kiro_crew import gateway_lock, platform_compat
+
+        if _directory_locks_supported(kernel_lock_home)[0] is not _DirectoryLockSupport.SUPPORTED:
+            pytest.skip("this filesystem does not implement directory locks")
+        monkeypatch.setattr(
+            platform_compat, "find_port_listeners", lambda _p: _listeners(os.getpid())
+        )
+        monkeypatch.setattr(gateway_lock, "_port_answers_http", lambda *_a, **_k: answers_http)
+        held = GatewayLock(kernel_lock_home).acquire()
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            os.unlink(kernel_lock_home / LOCK_FILENAME)
+            with pytest.raises(GatewayLockError) as excinfo:
+                GatewayLock(kernel_lock_home, port=port).acquire()
+            text = str(excinfo.value)
+            assert "no longer names it" in text
+            assert excinfo.value.holder_pid == os.getpid()
+            if answers_http:
+                assert f"holds port {port}, answering HTTP" in text
+            else:
+                assert f"holds port {port}, not answering HTTP" in text
+                assert "wedged" in text and "not treated as permanent" in text
+            assert excinfo.value.live_holder is answers_http, _lock_failure_evidence(
+                kernel_lock_home, (os.getpid(),)
+            )
+        finally:
+            listener.close()
+            held.release()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="relies on /proc/locks")
+    def test_the_home_anchor_holder_is_named_when_the_proc_locks_scan_misses_its_row(
+        self, kernel_lock_home, monkeypatch
+    ):
+        """The verdict above must not depend on one ``/proc/locks`` read.
+
+        ``/proc/locks`` is handed out a page at a time and resumed by ordinal
+        index, so a lock any process on the host releases between two reads
+        hides the row that lands on the boundary; on a busy test shard that was
+        this process's own anchor lock, once in a while (``assert None == pid``
+        at the holder-pid check above). The fdinfo corroboration names the
+        holder from the descriptor itself, so the refusal carries the pid and
+        stays terminal even when the global scan comes back empty.
+        """
+        from kiro_crew import gateway_lock, platform_compat
+
+        if _directory_locks_supported(kernel_lock_home)[0] is not _DirectoryLockSupport.SUPPORTED:
+            pytest.skip("this filesystem does not implement directory locks")
+        monkeypatch.setattr(
+            platform_compat, "find_port_listeners", lambda _p: _listeners(os.getpid())
+        )
+        monkeypatch.setattr(gateway_lock, "_port_answers_http", lambda *_a, **_k: True)
+        monkeypatch.setattr(platform_compat, "_flock_acquirer_in_proc_locks", lambda _want: None)
+        held = GatewayLock(kernel_lock_home).acquire()
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            os.unlink(kernel_lock_home / LOCK_FILENAME)
+            with pytest.raises(GatewayLockError) as excinfo:
+                GatewayLock(kernel_lock_home, port=port).acquire()
+            assert excinfo.value.holder_pid == os.getpid(), _lock_failure_evidence(
+                kernel_lock_home, (os.getpid(),)
+            )
+            assert f"held by pid {os.getpid()} (holds port {port}, answering HTTP" in str(
+                excinfo.value
+            )
+            assert excinfo.value.live_holder is True
+        finally:
+            listener.close()
+            held.release()
+
     @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="no home anchor on Windows")
     def test_release_frees_the_home_anchor_so_the_home_can_be_reacquired(self, tmp_path):
         # flock is per open file description, so a leaked anchor descriptor would
@@ -425,8 +663,11 @@ class TestLockFileIdentity:
             return fd
 
         monkeypatch.setattr(GatewayLock, "_open_lock_file", always_replace)
-        with pytest.raises(GatewayLockError, match="being replaced faster"):
+        with pytest.raises(GatewayLockError, match="being replaced faster") as excinfo:
             GatewayLock(tmp_path).acquire()
+        # A race, not an incumbent: the next attempt may well succeed, so this
+        # refusal must stay one a supervisor retries.
+        assert excinfo.value.live_holder is False
 
     @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="no home anchor on Windows")
     def test_a_filesystem_without_directory_locks_still_starts(self, tmp_path, monkeypatch):
@@ -678,6 +919,22 @@ class TestLockFileIdentity:
         assert isinstance(error, OSError)
 
 
+def _record_anchor_readings(monkeypatch) -> list[bool]:
+    """Wrap the real home-anchor probe; the returned list collects every reading it gives."""
+    from kiro_crew import gateway_lock
+
+    real_probe = gateway_lock._home_is_anchored
+    readings: list[bool] = []
+
+    def recorded(home, path):
+        anchored = real_probe(home, path)
+        readings.append(anchored)
+        return anchored
+
+    monkeypatch.setattr(gateway_lock, "_home_is_anchored", recorded)
+    return readings
+
+
 class TestLockHolder:
     """The non-destructive lock-owner oracle: a caller that must not ACQUIRE
     (``cli_perf``'s profiler target, and the CLI ``_stop``/``_restart``
@@ -700,6 +957,30 @@ class TestLockHolder:
             assert holder.alive is True
             assert holder.source == "flock_owner", _lock_failure_evidence(
                 tmp_path / LOCK_FILENAME, (os.getpid(),)
+            )
+        finally:
+            held.release()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="relies on /proc/locks")
+    def test_a_proc_locks_scan_that_misses_the_held_row_is_corroborated_by_fdinfo(
+        self, kernel_lock_home, monkeypatch
+    ):
+        # /proc/locks resumes by ordinal index across its page-sized reads, so a
+        # lock released elsewhere on the host between two reads hides the row at
+        # the boundary. The held lock is still in this descriptor's fdinfo.
+        from kiro_crew import platform_compat
+
+        monkeypatch.setattr(platform_compat, "_flock_acquirer_in_proc_locks", lambda _want: None)
+        held = GatewayLock(kernel_lock_home).acquire()
+        try:
+            path = kernel_lock_home / LOCK_FILENAME
+            assert platform_compat.flock_owner_pid(path) == os.getpid(), _lock_failure_evidence(
+                path, (os.getpid(),)
+            )
+            assert platform_compat.flock_owner_pid(os.stat(path)) == os.getpid()
+            assert platform_compat.flock_owner_pid(kernel_lock_home) == os.getpid()
+            assert lock_holder(kernel_lock_home) == LockHolder(
+                pid=os.getpid(), alive=True, source="flock_owner"
             )
         finally:
             held.release()
@@ -750,6 +1031,9 @@ class TestLockHolder:
         assert excinfo.value.path == tmp_path / LOCK_FILENAME
         assert "could not determine whether a gateway holds the lock" in str(excinfo.value)
         assert "flock unsupported" in str(excinfo.value)
+        # The probe could NOT establish whether the lock is held, so held=False:
+        # a caller must treat this as unknown, not as a gateway to wait out.
+        assert excinfo.value.held is False
 
     def test_probe_error_still_names_a_live_proc_locks_acquirer(self, tmp_path, monkeypatch):
         # /proc/locks naming a LIVE acquirer is positive ownership on its own;
@@ -797,8 +1081,11 @@ class TestLockHolder:
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: 222
         )
         monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.pid_exists", lambda pid: False)
-        with pytest.raises(LockProbeError, match="pid 222"):
+        with pytest.raises(LockProbeError, match="pid 222") as excinfo:
             lock_holder(tmp_path)
+        # A forked inheritor holds it, and an orphan need never exit: held=False,
+        # so no caller waits for a release that may never come.
+        assert excinfo.value.held is False
 
     def test_held_lock_with_a_dead_recorded_pid_is_indeterminate(self, tmp_path, monkeypatch):
         # Held, no /proc/locks, and the file names a pid that is gone: somebody
@@ -806,36 +1093,55 @@ class TestLockHolder:
         # (stop/restart would report nothing running on a lock `kirocrew
         # gateway` refuses to start on) nor a holder to act on.
         (tmp_path / LOCK_FILENAME).write_text("4242\n")
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: True)
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: True)
         monkeypatch.setattr(
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
         )
         monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.pid_exists", lambda pid: False)
-        with pytest.raises(LockProbeError):
+        with pytest.raises(LockProbeError) as excinfo:
             lock_holder(tmp_path)
+        # A readable stamp naming a dead pid is an inheritor, not a gateway
+        # hiding its pid: held=False, so no caller waits on it.
+        assert excinfo.value.held is False
 
     def test_unreadable_lock_file_is_still_probed(self, tmp_path, monkeypatch):
-        # The Windows shape: the gateway's mandatory lock makes the file
-        # unreadable. Not being able to read it is not evidence of "nobody"; the
-        # probe decides. Free -> nobody; held with no nameable holder ->
-        # indeterminate.
-        (tmp_path / LOCK_FILENAME).write_text("4242\n")
-        real_open = os.open
+        # The Windows shape: the gateway's mandatory lock makes the file's
+        # bytes unreadable while it opens fine. Not being able to read it is not
+        # evidence of "nobody"; the probe decides. Free -> nobody; held with no
+        # nameable holder -> indeterminate, even though the bytes name a live pid.
+        lock_file = tmp_path / LOCK_FILENAME
+        lock_file.write_text("4242\n")
+        identity = os.stat(lock_file)
+        owned = (identity.st_dev, identity.st_ino)
+        real_read = os.read
+        denied_reads: list[int] = []
 
-        def denied(path, *a, **k):
-            if str(path).endswith(LOCK_FILENAME) and a and a[0] == os.O_RDONLY:
-                raise OSError("sharing violation")
-            return real_open(path, *a, **k)
+        def denied(fd, *args, **kwargs):
+            # Process-global stub: refuse only a read of THIS lock file, matched by
+            # inode, and forward every other thread's read untouched.
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                return real_read(fd, *args, **kwargs)
+            if (info.st_dev, info.st_ino) != owned:
+                return real_read(fd, *args, **kwargs)
+            denied_reads.append(fd)
+            raise OSError(errno.EACCES, "sharing violation")
 
-        monkeypatch.setattr(os, "open", denied)
+        monkeypatch.setattr(os, "read", denied)
         monkeypatch.setattr(
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
         )
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: False)
+        monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.pid_exists", lambda _p: True)
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: False)
         assert lock_holder(tmp_path) == LockHolder(pid=None, alive=False, source="none")
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: True)
-        with pytest.raises(LockProbeError):
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: True)
+        with pytest.raises(LockProbeError) as excinfo:
             lock_holder(tmp_path)
+        # The Windows mandatory-lock shape: held, but the lock hides the pid.
+        # held=True so recovery waits for release instead of giving up.
+        assert excinfo.value.held is True
+        assert len(denied_reads) == 2, "the read itself must have been refused both times"
 
     def test_missing_lock_file_is_nobody(self, tmp_path):
         assert lock_holder(tmp_path) == LockHolder(pid=None, alive=False, source="none")
@@ -849,15 +1155,15 @@ class TestLockHolder:
         monkeypatch.setattr(
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
         )
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: False)
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: False)
         assert lock_holder(tmp_path).pid is None
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: True)
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: True)
         with pytest.raises(LockProbeError):
             lock_holder(tmp_path)
 
     def test_recorded_pid_used_only_when_flock_owner_is_unavailable(self, tmp_path, monkeypatch):
         (tmp_path / LOCK_FILENAME).write_text("4242\n")
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: True)
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: True)
         monkeypatch.setattr(
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
         )
@@ -891,7 +1197,7 @@ class TestLockHolder:
         # A forked inheritor keeps the flock alive under a DIFFERENT pid than
         # the one last written to the file -- the authoritative source wins.
         (tmp_path / LOCK_FILENAME).write_text("111\n")
-        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda _p: True)
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: True)
         monkeypatch.setattr(
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: 222
         )
@@ -902,57 +1208,511 @@ class TestLockHolder:
         assert holder == LockHolder(pid=222, alive=True, source="flock_owner")
 
     @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="no home anchor on Windows")
-    def test_a_transiently_anchored_home_is_reprobed_and_reads_as_nobody(
+    def test_two_overlapping_read_probes_of_an_idle_home_both_read_nobody(
         self, tmp_path, monkeypatch
     ):
-        # Two non-destructive readers on an idle home (`stop` beside `cli_perf`)
-        # each hold the anchor for two syscalls, so either can see the other's
-        # hold. One anchored reading is a candidate, not a verdict: a later free
-        # reading is positive evidence and the answer is nobody.
-        readings: list[bool] = []
+        # Two non-destructive readers on an idle home (`stop` beside `cli_perf`),
+        # each probing while the other still holds its probe of the anchor:
+        # neither reads the other as a holder, so both answer nobody on their one
+        # reading and neither ends in an indeterminate probe.
+        if _directory_locks_supported(tmp_path)[0] is not _DirectoryLockSupport.SUPPORTED:
+            pytest.skip("this filesystem does not implement directory locks")
+        real_try = platform_compat.try_acquire_lock
+        both_probing = threading.Barrier(2, timeout=30)
+        parked = threading.local()
 
-        def anchored_once(_home, _path):
-            readings.append(True)
-            return len(readings) == 1
+        def held_until_both_probed(fd, *, exclusive=False):
+            taken = real_try(fd, exclusive=exclusive)
+            if not getattr(parked, "done", False):
+                # Each reader's first probe keeps what it took until the other
+                # has probed too, so the second probe lands inside the first.
+                parked.done = True
+                both_probing.wait()
+            return taken
 
-        monkeypatch.setattr("kiro_crew.gateway_lock._home_is_anchored", anchored_once)
-        monkeypatch.setattr("kiro_crew.gateway_lock.time.sleep", lambda _s: None)
-        holder = lock_holder(tmp_path)
-        assert holder == LockHolder(pid=None, alive=False, source="none")
-        assert len(readings) > 1  # the first reading was re-probed, not believed
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", held_until_both_probed)
+        readings = _record_anchor_readings(monkeypatch)
+        answers: list[LockHolder] = []
+        errors: list[Exception] = []
+
+        def read():
+            try:
+                answers.append(lock_holder(tmp_path))
+            except Exception as exc:
+                errors.append(exc)
+
+        readers = [threading.Thread(target=read) for _ in range(2)]
+        for reader in readers:
+            reader.start()
+        for reader in readers:
+            reader.join(timeout=30)
+            assert not reader.is_alive()
+        assert errors == []
+        assert answers == [LockHolder(pid=None, alive=False, source="none")] * 2
+        assert readings == [False, False]
 
     @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="no home anchor on Windows")
-    def test_a_home_anchored_on_every_probe_is_still_indeterminate(self, tmp_path, monkeypatch):
-        # The other half: an incumbent holds the anchor for its lifetime, so
-        # every probe reads held. Re-probing must not soften that into nobody
-        # when no surface can name the holder.
-        readings: list[bool] = []
+    def test_a_shared_probe_still_reads_a_held_home_as_held(self, tmp_path, monkeypatch):
+        # An incumbent holds the anchor exclusive for its lifetime, which the
+        # shared probe cannot take: its one reading says held. With no surface
+        # naming the holder that is indeterminate, never nobody, and nothing the
+        # lock file names will release the anchor, so it is not ``held`` either.
+        anchor = os.open(tmp_path, os.O_RDONLY)
+        try:
+            if not platform_compat.try_acquire_lock(anchor, exclusive=True):
+                pytest.skip("this filesystem does not implement directory locks")
+            readings = _record_anchor_readings(monkeypatch)
+            monkeypatch.setattr(
+                "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
+            )
+            with pytest.raises(LockProbeError, match="no longer names") as excinfo:
+                lock_holder(tmp_path)
+            assert readings == [True]
+            assert excinfo.value.held is False
+        finally:
+            platform_compat.release_lock(anchor)
+            os.close(anchor)
 
-        def always_anchored(_home, _path):
-            readings.append(True)
-            return True
+    @pytest.mark.skipif(
+        importlib.util.find_spec("fcntl") is None, reason="needs a shared flock (POSIX)"
+    )
+    def test_two_overlapping_probes_of_a_free_lock_file_both_read_nobody(
+        self, tmp_path, monkeypatch
+    ):
+        # The idle home `release()` leaves: `gateway.lock` exists and is free.
+        # Each reader keeps its probe of the lock FILE until the other has
+        # probed it too, so the second probe lands inside the first. Neither
+        # reads the other as a holder, nor names the other's pid.
+        (tmp_path / LOCK_FILENAME).write_text("", encoding="utf-8")
+        real_try = platform_compat.try_acquire_lock
+        both_probing = threading.Barrier(2, timeout=30)
+        parked = threading.local()
 
-        monkeypatch.setattr("kiro_crew.gateway_lock._home_is_anchored", always_anchored)
+        def held_until_both_probed(fd, *, exclusive=False):
+            taken = real_try(fd, exclusive=exclusive)
+            if not getattr(parked, "done", False):
+                parked.done = True
+                both_probing.wait()
+            return taken
+
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", held_until_both_probed)
+        answers: list[LockHolder] = []
+        errors: list[Exception] = []
+
+        def read():
+            try:
+                answers.append(lock_holder(tmp_path))
+            except Exception as exc:
+                errors.append(exc)
+
+        readers = [threading.Thread(target=read) for _ in range(2)]
+        for reader in readers:
+            reader.start()
+        for reader in readers:
+            reader.join(timeout=30)
+            assert not reader.is_alive()
+        assert errors == []
+        assert answers == [LockHolder(pid=None, alive=False, source="none")] * 2
+
+    def test_the_shared_lock_file_probe_still_reads_a_held_lock_as_held(self, tmp_path):
+        # A gateway holds `gateway.lock` exclusive for its lifetime, which the
+        # probe's shared attempt cannot take.
+        held = GatewayLock(tmp_path).acquire()
+        try:
+            fd = _open_probe_descriptor(tmp_path / LOCK_FILENAME)
+            try:
+                assert _lock_is_held(fd, tmp_path / LOCK_FILENAME) is True
+            finally:
+                os.close(fd)
+        finally:
+            held.release()
+
+    def test_the_windows_arm_answers_without_probing_the_home(self, tmp_path, monkeypatch):
+        # Windows takes no home anchor, so the read side answers before it opens
+        # or locks the home directory.
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+
+        def no_lock_expected(*_args, **_kwargs):
+            raise AssertionError("the Windows arm locked the home")
+
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", no_lock_expected)
+        assert lock_holder(tmp_path) == LockHolder(pid=None, alive=False, source="none")
+
+
+class TestTheLockFileIsARegularFile:
+    """The lock never opens, creates, locks or writes through a link at its name.
+
+    See the module docstring, *The lock file is a regular file, never a link*:
+    anything but a regular file at ``gateway.lock`` is refused with a remedy, the
+    same entry reads as indeterminate to :func:`lock_holder`, and a regular file
+    with another hard link is locked but neither stamped nor believed. The tests
+    that plant a real symlink are listed in ``test/requires-real-symlinks.txt``.
+    """
+
+    @staticmethod
+    def _assert_refused(home: Path) -> LockPathError:
+        with pytest.raises(LockPathError) as excinfo:
+            GatewayLock(home).acquire()
+        refusal = excinfo.value
+        assert refusal.live_holder is False and refusal.holder_pid is None
+        assert refusal.path == home / LOCK_FILENAME
+        assert "is not a regular file" in str(refusal) and "remove it" in str(refusal)
+        return refusal
+
+    def test_a_link_to_a_file_is_refused_and_its_target_is_untouched(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        target = tmp_path / "elsewhere.txt"
+        target.write_text("keep me\n", encoding="utf-8")
+        os.symlink(target, home / LOCK_FILENAME)
+
+        # Every acquirer is refused, not just the first: no acquire rewrites the
+        # name, so the second meets the same link the first did.
+        self._assert_refused(home)
+        self._assert_refused(home)
+
+        assert target.read_text(encoding="utf-8") == "keep me\n"
+        assert (home / LOCK_FILENAME).is_symlink()
+
+    def test_a_dangling_link_is_refused_without_creating_its_target(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        target = tmp_path / "never-created"
+        os.symlink(target, home / LOCK_FILENAME)
+
+        self._assert_refused(home)
+
+        assert not os.path.lexists(target)
+
+    def test_a_directory_at_the_lock_path_is_refused(self, tmp_path):
+        (tmp_path / LOCK_FILENAME).mkdir()
+
+        self._assert_refused(tmp_path)
+
+        assert (tmp_path / LOCK_FILENAME).is_dir()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+    def test_a_fifo_at_the_lock_path_is_refused_without_waiting_for_a_writer(self, tmp_path):
+        os.mkfifo(tmp_path / LOCK_FILENAME)
+
+        self._assert_refused(tmp_path)
+
+    def test_a_regular_lock_file_is_reused_in_place(self, tmp_path):
+        lock_file = tmp_path / LOCK_FILENAME
+        # Our own (live) pid, so the Windows stale-pid reclaim keeps the file too.
+        lock_file.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        before = os.lstat(lock_file)
+
+        GatewayLock(tmp_path).acquire().release()
+
+        after = os.lstat(lock_file)
+        assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+        assert stat.S_ISREG(after.st_mode)
+        assert lock_file.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    def test_an_open_failure_is_a_refusal_never_a_raw_os_error(self, tmp_path, monkeypatch):
+        (tmp_path / LOCK_FILENAME).write_text("", encoding="utf-8")
+        failure: list[int] = []
+
+        def refuse(_path, _mode=0o600):
+            raise OSError(failure[0], os.strerror(failure[0]))
+
+        monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.open_create_no_reparse", refuse)
+        # A link that appeared between a sibling's look and this open: the errno
+        # alone classifies it, whatever the name now holds.
+        failure.append(errno.ELOOP)
+        self._assert_refused(tmp_path)
+        # Anything else is still a GatewayLockError the CLI renders, not a crash,
+        # and typed as the lock file's own failure: nothing says another process
+        # owns the home, so no caller may tell the operator to stop a gateway.
+        failure[0] = errno.EACCES
+        with pytest.raises(LockFileError, match="could not open") as excinfo:
+            GatewayLock(tmp_path).acquire()
+        assert not isinstance(excinfo.value, LockPathError)
+        assert excinfo.value.live_holder is False and excinfo.value.holder_pid is None
+
+    def test_a_name_that_keeps_vanishing_ends_in_the_bounded_refusal(self, tmp_path, monkeypatch):
+        opens: list[object] = []
+
+        def vanished(path, _mode=0o600):
+            opens.append(path)
+            raise FileNotFoundError(errno.ENOENT, "gone", os.fspath(path))
+
+        monkeypatch.setattr(
+            "kiro_crew.gateway_lock.platform_compat.open_create_no_reparse", vanished
+        )
         monkeypatch.setattr("kiro_crew.gateway_lock.time.sleep", lambda _s: None)
+        with pytest.raises(GatewayLockError, match="replaced faster than it can be locked"):
+            GatewayLock(tmp_path).acquire()
+        assert len(opens) == _IDENTITY_ATTEMPTS
+
+    def test_a_home_that_cannot_be_created_is_a_refusal(self, tmp_path):
+        home = tmp_path / "home"
+        home.write_text("a file, not a directory", encoding="utf-8")
+
+        with pytest.raises(LockFileError, match="could not create"):
+            GatewayLock(home).acquire()
+
+    @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="the POSIX open flags")
+    def test_the_read_write_open_waits_rather_than_failing_non_blocking(
+        self, tmp_path, monkeypatch
+    ):
+        # O_NONBLOCK on a read-write open makes a Linux lease break fail at once
+        # instead of being waited out; a FIFO opened read-write never blocks, so
+        # nothing needs it. The ``fstat`` after the open classifies instead.
+        opened: list[int] = []
+        real_open = os.open
+
+        def spy(path, flags, *a, **k):
+            if os.fspath(path).endswith(LOCK_FILENAME):
+                opened.append(flags)
+            return real_open(path, flags, *a, **k)
+
+        monkeypatch.setattr(os, "open", spy)
+        GatewayLock(tmp_path).acquire().release()
+
+        read_write = [f for f in opened if f & os.O_ACCMODE == os.O_RDWR]
+        assert read_write, "acquire must open the lock file read-write"
+        assert all(f & os.O_NOFOLLOW for f in read_write)
+        assert not any(f & os.O_NONBLOCK for f in read_write)
+
+    def test_a_hard_linked_lock_file_is_locked_but_never_stamped_or_believed(
+        self, tmp_path, monkeypatch
+    ):
+        lock_file = tmp_path / LOCK_FILENAME
+        lock_file.write_text("4242\n", encoding="utf-8")
+        backup = tmp_path / "backup-of-the-lock"
+        os.link(lock_file, backup)
+        # The non-Linux shape: no kernel owner surface, and the recorded number
+        # belongs to some live process, as a reused pid would.
         monkeypatch.setattr(
             "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
         )
-        with pytest.raises(LockProbeError, match="no longer names"):
+        monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.pid_exists", lambda _p: True)
+
+        held = GatewayLock(tmp_path).acquire()
+        try:
+            # Held, but nothing names the holder: the stale stamp is not trusted.
+            with pytest.raises(LockProbeError, match="no live holder"):
+                lock_holder(tmp_path)
+            with pytest.raises(GatewayLockError) as excinfo:
+                GatewayLock(tmp_path).acquire()
+            assert excinfo.value.holder_pid != 4242
+        finally:
+            held.release()
+
+        assert backup.read_text(encoding="utf-8") == "4242\n"
+        fd = os.open(lock_file, os.O_RDONLY)
+        try:
+            assert _read_pid(fd) is None
+        finally:
+            os.close(fd)
+
+    def test_a_stamp_is_distrusted_only_while_the_file_has_another_link(
+        self, tmp_path, monkeypatch
+    ):
+        # The macOS shape: no kernel owner surface, so the stamp is the only name
+        # the holder has. A metadata change (a same-mode chmod, a backup tool
+        # putting the times back) moves the change time past the modification
+        # time and must not cost the holder that name; another hard link does,
+        # and only for as long as it exists.
+        lock_file = tmp_path / LOCK_FILENAME
+        lock_file.write_text("4242\n", encoding="utf-8")
+        backup = tmp_path / "backup-of-the-lock"
+        monkeypatch.setattr("kiro_crew.gateway_lock._lock_is_held", lambda *_a: True)
+        monkeypatch.setattr(
+            "kiro_crew.gateway_lock.platform_compat.flock_owner_pid", lambda _p: None
+        )
+        monkeypatch.setattr(
+            "kiro_crew.gateway_lock.platform_compat.pid_exists", lambda pid: pid == 4242
+        )
+        named = LockHolder(pid=4242, alive=True, source="recorded_pid")
+
+        stamped = os.stat(lock_file)
+        os.utime(lock_file, ns=(stamped.st_atime_ns, stamped.st_mtime_ns - 10**9))
+        os.chmod(lock_file, stamped.st_mode & 0o7777)
+        if platform_compat.IS_POSIX:
+            changed = os.stat(lock_file)
+            assert changed.st_ctime_ns > changed.st_mtime_ns, "the witness needs ctime > mtime"
+        assert lock_holder(tmp_path) == named
+
+        os.link(lock_file, backup)
+        with pytest.raises(LockProbeError, match="no live holder"):
             lock_holder(tmp_path)
-        assert len(readings) == _IDENTITY_ATTEMPTS
+        os.unlink(backup)
+        assert lock_holder(tmp_path) == named
 
-    @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="no home anchor on Windows")
-    def test_an_anchor_probe_error_propagates_without_a_retry(self, tmp_path, monkeypatch):
-        # An unopenable home or an unmeasurable filesystem is a different fact
-        # from a held anchor: it is not a transient another reader will release,
-        # so it is raised on the attempt that produced it.
-        readings: list[bool] = []
+    @pytest.mark.skipif(platform_compat.IS_WINDOWS, reason="the POSIX open flags")
+    def test_lock_holder_probes_through_a_read_write_descriptor(self, tmp_path, monkeypatch):
+        # Read-write so a FIFO swapped in never blocks the open without
+        # O_NONBLOCK, which would fail a lease break. No-follow, never
+        # non-blocking and never creating; read-only only when writing is
+        # refused, which the shared probe can still lock.
+        lock_file = tmp_path / LOCK_FILENAME
+        lock_file.write_text("", encoding="utf-8")
+        real_open = os.open
+        opened: list[int] = []
+        refuse_write = [False]
 
-        def probe_fails(_home, path):
-            readings.append(True)
-            raise LockProbeError(path, OSError(errno.EMFILE, "cannot open home anchor"))
+        def spy(path, flags, *args, **kwargs):
+            if os.fspath(path) == os.fspath(lock_file):
+                opened.append(flags)
+                if refuse_write[0] and flags & os.O_ACCMODE == os.O_RDWR:
+                    raise PermissionError(errno.EACCES, "denied", os.fspath(path))
+            return real_open(path, flags, *args, **kwargs)
 
-        monkeypatch.setattr("kiro_crew.gateway_lock._home_is_anchored", probe_fails)
-        with pytest.raises(LockProbeError, match="cannot open home anchor"):
+        monkeypatch.setattr(os, "open", spy)
+        assert lock_holder(tmp_path) == LockHolder(pid=None, alive=False, source="none")
+        assert len(opened) == 1
+        assert opened[0] & os.O_ACCMODE == os.O_RDWR
+        assert opened[0] & os.O_NOFOLLOW
+        assert not opened[0] & (os.O_NONBLOCK | os.O_CREAT)
+
+        opened.clear()
+        refuse_write[0] = True
+        assert lock_holder(tmp_path) == LockHolder(pid=None, alive=False, source="none")
+        assert [f & os.O_ACCMODE for f in opened] == [os.O_RDWR, os.O_RDONLY]
+        assert opened[1] & os.O_NOFOLLOW
+
+    def test_a_windows_refusal_is_narrowed_to_links_only_when_asked(self, monkeypatch):
+        # A regular file carrying a non-link reparse tag (a cloud-files
+        # placeholder) holds its own data and is the lock file; a link or a
+        # junction is refused; a tag that cannot be read counts as a link.
+        refused = platform_compat._win_reparse_refused
+        reparse = platform_compat._WIN_FILE_ATTRIBUTE_REPARSE_POINT
+        is_link = [False]
+        monkeypatch.setattr(platform_compat, "win_fd_is_link", lambda _fd: is_link[0])
+        assert refused(3, 0, links_only=True) is False
+        assert refused(3, reparse, links_only=False) is True
+        assert refused(3, reparse, links_only=True) is False
+        is_link[0] = True
+        assert refused(3, reparse, links_only=True) is True
+
+    @pytest.mark.skipif(not platform_compat.IS_WINDOWS, reason="Windows reparse tags")
+    def test_the_reparse_tag_of_an_ordinary_file_is_not_a_link(self, tmp_path):
+        path = tmp_path / "ordinary"
+        path.write_text("x", encoding="utf-8")
+        fd = platform_compat.open_file_no_reparse(path, links_only=True)
+        try:
+            assert platform_compat.win_fd_is_link(fd) is False
+        finally:
+            os.close(fd)
+
+    @pytest.mark.skipif(not platform_compat.IS_WINDOWS, reason="Windows reparse tags")
+    def test_the_reparse_tag_of_a_symlink_is_a_link(self, tmp_path):
+        target = tmp_path / "target"
+        target.write_text("x", encoding="utf-8")
+        link = tmp_path / "link"
+        os.symlink(target, link)
+        fd = platform_compat._win_open_without_following(link)
+        try:
+            assert platform_compat.win_fd_is_link(fd) is True
+        finally:
+            os.close(fd)
+        with pytest.raises(OSError) as excinfo:
+            platform_compat.open_file_no_reparse(link, links_only=True)
+        assert excinfo.value.errno == errno.ELOOP
+
+    def test_lock_holder_reports_a_directory_as_typed_indeterminate(self, tmp_path):
+        (tmp_path / LOCK_FILENAME).mkdir()
+
+        with pytest.raises(LockPathProbeError, match="remove it") as excinfo:
             lock_holder(tmp_path)
-        assert len(readings) == 1
+
+        assert isinstance(excinfo.value, LockProbeError), "callers catch the base class"
+
+    def test_lock_holder_reports_a_link_as_typed_indeterminate(self, tmp_path):
+        target = tmp_path / "elsewhere.txt"
+        target.write_text("4242\n", encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+        os.symlink(target, home / LOCK_FILENAME)
+
+        with pytest.raises(LockPathProbeError, match="is not a regular file"):
+            lock_holder(home)
+
+    def test_lock_holder_turns_an_unreadable_entry_into_a_probe_error(self, tmp_path, monkeypatch):
+        # ``Path.exists()`` re-raises PermissionError, ENAMETOOLONG or EIO, which
+        # stop/restart (catching only LockProbeError) would show as a traceback.
+        lock_file = tmp_path / LOCK_FILENAME
+        lock_file.write_text("", encoding="utf-8")
+        real_lstat = os.lstat
+
+        def denied(path, *a, **k):
+            if os.fspath(path) == os.fspath(lock_file):
+                raise PermissionError(errno.EACCES, "denied", os.fspath(path))
+            return real_lstat(path, *a, **k)
+
+        monkeypatch.setattr(os, "lstat", denied)
+        with pytest.raises(LockProbeError, match="denied"):
+            lock_holder(tmp_path)
+
+    def test_lock_holder_probe_never_follows_a_link_swapped_in_after_its_check(
+        self, tmp_path, monkeypatch
+    ):
+        # The classification ``lstat`` saw a regular file; by the open a link is
+        # there. The probe's own no-follow open is what refuses it, so the owner
+        # lookups never get to name the holder of whatever the link points at.
+        home = tmp_path / "home"
+        home.mkdir()
+        target = tmp_path / "elsewhere.txt"
+        target.write_text("4242\n", encoding="utf-8")
+        os.symlink(target, home / LOCK_FILENAME)
+        regular = os.lstat(target)
+        real_lstat = os.lstat
+        looked_up: list[object] = []
+
+        def stale_check(path, *a, **k):
+            if os.fspath(path) == os.fspath(home / LOCK_FILENAME):
+                return regular
+            return real_lstat(path, *a, **k)
+
+        monkeypatch.setattr(os, "lstat", stale_check)
+        monkeypatch.setattr(
+            "kiro_crew.gateway_lock.platform_compat.flock_owner_pid",
+            lambda p: looked_up.append(p),
+        )
+        with pytest.raises(LockPathProbeError):
+            lock_holder(home)
+        assert looked_up == []
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="owner lookups read /proc")
+    def test_owner_lookups_match_the_probed_descriptor_not_the_name(self, tmp_path, monkeypatch):
+        lock_file = tmp_path / LOCK_FILENAME
+        held = GatewayLock(tmp_path).acquire()
+        try:
+            identity = os.lstat(lock_file)
+            asked: list[object] = []
+
+            def record(target):
+                asked.append(target)
+                return None
+
+            monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.flock_owner_pid", record)
+            monkeypatch.setattr("kiro_crew.gateway_lock.platform_compat.pids_holding_file", record)
+            with pytest.raises(GatewayLockError):
+                GatewayLock(tmp_path).acquire()
+            # The kernel names nobody here, so this falls back to the stamp (our
+            # own live pid); what matters is what the lookup was handed.
+            assert lock_holder(tmp_path).source == "recorded_pid"
+        finally:
+            held.release()
+
+        file_lookups = [a for a in asked if not isinstance(a, Path)]
+        assert file_lookups, "the lock file's owner must have been looked up"
+        assert all(
+            isinstance(a, os.stat_result)
+            and (a.st_dev, a.st_ino) == (identity.st_dev, identity.st_ino)
+            for a in file_lookups
+        ), asked
+        assert all(a == tmp_path for a in asked if isinstance(a, Path)), "only the home by name"
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc/*/fd")
+    def test_an_owner_lookup_by_stat_result_finds_the_holder(self, tmp_path):
+        path = tmp_path / "held"
+        path.write_text("", encoding="utf-8")
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            assert os.getpid() in (platform_compat.pids_holding_file(os.fstat(fd)) or [])
+        finally:
+            os.close(fd)

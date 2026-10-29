@@ -2,16 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
+import threading
 from copy import deepcopy
 
 import pytest
 
 from kiro_crew.acp.types import TurnUsage
-from kiro_crew.autonudge import AutoNudgeService, NudgeLoop
+from kiro_crew.autonudge import (
+    AutoNudgeService,
+    NudgeAdmissionRefused,
+    NudgeLoop,
+)
+from kiro_crew.autonudge_service import monitor_records as monitor_records_mod
 from kiro_crew.monitoring import models
+from kiro_crew.monitoring.completion import MonitorCompletionHook
+from kiro_crew.monitoring.decision import monitor_budget_reason
 from kiro_crew.monitoring.models import MonitorBudgets, MonitorOutcome, MonitorState
+from kiro_crew.testing.wait import async_wait_until
+
+#: Lost-run ceiling for synchronization the test itself must release.
+_LOST_RUN_SECS = 30.0
 
 
 def _structured_loop() -> NudgeLoop:
@@ -26,6 +39,25 @@ def _structured_loop() -> NudgeLoop:
             created_ts=1_000.0,
         ),
     )
+
+
+def _completion() -> models.MonitorActionCompletion:
+    return models.MonitorActionCompletion(
+        monitor_id="monitor1",
+        fingerprint="failure-a",
+        disposition=models.MonitorActionDisposition.SUCCESS,
+        completed_ts=1_120.0,
+        input_tokens=1_200,
+        output_tokens=300,
+    )
+
+
+async def _wait_for_accounting_owner(service: AutoNudgeService) -> None:
+    for _ in range(100):
+        if service._inflight_adds:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("completion accounting never entered the mutation drain")
 
 
 def test_monitor_completion_contract_is_typed() -> None:
@@ -102,6 +134,325 @@ async def test_dispatch_charges_nothing_until_the_action_turn_completes(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_MUTATION_started_completion_drains_before_shutdown_and_session_close(
+    tmp_path,
+) -> None:
+    """A dashboard callback admitted before closure owns shutdown ordering."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+
+    await asyncio.wait_for(service._lock.acquire(), timeout=_LOST_RUN_SECS)
+    completion = asyncio.create_task(service.record_monitor_turn_completion(_completion()))
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        await _wait_for_accounting_owner(service)
+        shutdown = asyncio.create_task(service.shutdown())
+        await asyncio.sleep(0)
+        assert not service._accepting_mutations
+        assert not shutdown.done(), "shutdown passed accounting still waiting on the service lock"
+        service._lock.release()
+        await asyncio.wait_for(completion, timeout=_LOST_RUN_SECS)
+        await asyncio.wait_for(shutdown, timeout=_LOST_RUN_SECS)
+    finally:
+        if service._lock.locked():
+            service._lock.release()
+        pending = [task for task in (completion, shutdown) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=_LOST_RUN_SECS
+            )
+
+    restored = AutoNudgeService(base_dir=tmp_path)
+    await asyncio.to_thread(restored._load)
+    restored_loop = restored.get_by_id(loop.id)
+    assert restored_loop is not None and restored_loop.monitor is not None
+    assert restored_loop.monitor.agent_turns == 1
+    assert restored_loop.monitor.input_tokens == 1_200
+    assert restored_loop.monitor.output_tokens == 300
+    assert not restored_loop.monitor.wake_in_flight
+
+
+@pytest.mark.asyncio
+async def test_MUTATION_accepted_dashboard_completion_after_shutdown_is_durable(
+    tmp_path,
+) -> None:
+    """An accepted dashboard TURN_END keeps its one-wake admission after closure.
+
+    Shutdown does not wait on the running provider turn (a gateway stop never
+    waits on a delivery). The completion that turn emits after ``shutdown()``
+    returned still persists under its captured lease, and
+    ``settle_admitted_writes`` drains that write, as the gateway does once it has
+    closed the sessions.
+    """
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+
+    accepted = asyncio.Event()
+    complete_turn = asyncio.Event()
+    hook = MonitorCompletionHook(
+        loop.id,
+        "failure-a",
+        service.record_monitor_turn_completion,
+        acceptance_callback=lambda: service.mark_monitor_turn_accepted(loop.id, "failure-a"),
+    )
+
+    async def dashboard_turn() -> None:
+        hook.mark_accepted()
+        accepted.set()
+        await complete_turn.wait()
+        await hook.complete(
+            models.MonitorActionDisposition.SUCCESS,
+            TurnUsage(input_tokens=1_200, output_tokens=300),
+            completed_ts=1_120.0,
+        )
+
+    turn = asyncio.create_task(dashboard_turn())
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=_LOST_RUN_SECS)
+        # On a build that drains the whole turn task this wait is a lost run.
+        await asyncio.wait_for(service.shutdown(), timeout=_LOST_RUN_SECS)
+        assert not turn.done(), "shutdown waited on the accepted dashboard turn"
+        complete_turn.set()
+        await asyncio.wait_for(turn, timeout=_LOST_RUN_SECS)
+        deadline = asyncio.get_running_loop().time() + _LOST_RUN_SECS
+        assert await service.settle_admitted_writes(deadline) == 0
+    finally:
+        complete_turn.set()
+        if not turn.done():
+            turn.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(turn, return_exceptions=True), timeout=_LOST_RUN_SECS
+            )
+
+    restored = AutoNudgeService(base_dir=tmp_path)
+    await asyncio.to_thread(restored._load)
+    restored_loop = restored.get_by_id(loop.id)
+    assert restored_loop is not None and restored_loop.monitor is not None
+    assert restored_loop.monitor.agent_turns == 1
+    assert restored_loop.monitor.input_tokens == 1_200
+    assert restored_loop.monitor.output_tokens == 300
+    assert not restored_loop.monitor.wake_in_flight
+
+
+@pytest.mark.asyncio
+async def test_MUTATION_completion_cancellation_propagates_after_durable_restart_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Caller cancellation cannot release completion accounting before fsync."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+
+    real_write = service._write_state
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    def blocking_write(payload):
+        write_started.set()
+        assert release_write.wait(timeout=5)
+        real_write(payload)
+
+    monkeypatch.setattr(service, "_write_state", blocking_write)
+    completion = asyncio.create_task(service.record_monitor_turn_completion(_completion()))
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        await async_wait_until(write_started.is_set)
+
+        completion.cancel()
+        shutdown = asyncio.create_task(service.shutdown())
+        await asyncio.sleep(0)
+        assert not completion.done(), "cancellation escaped before the accounting write settled"
+        assert not shutdown.done(), "shutdown abandoned the cancelled accounting owner"
+        release_write.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(completion, timeout=_LOST_RUN_SECS)
+        await asyncio.wait_for(shutdown, timeout=_LOST_RUN_SECS)
+    finally:
+        release_write.set()
+        pending = [task for task in (completion, shutdown) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=_LOST_RUN_SECS
+            )
+
+    restored = AutoNudgeService(base_dir=tmp_path)
+    await asyncio.to_thread(restored._load)
+    restored_loop = restored.get_by_id(loop.id)
+    assert restored_loop is not None and restored_loop.monitor is not None
+    assert restored_loop.monitor.agent_turns == 1
+    assert restored_loop.monitor.total_tokens == 1_500
+    assert not restored_loop.monitor.wake_in_flight
+
+
+@pytest.mark.asyncio
+async def test_completion_cancellation_wins_when_the_inner_write_fails(
+    tmp_path, monkeypatch
+) -> None:
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+
+    write_entered = asyncio.Event()
+    release_write = asyncio.Event()
+
+    async def fail_snapshot(_payload=None, *, admission=None):
+        write_entered.set()
+        await asyncio.wait_for(release_write.wait(), timeout=_LOST_RUN_SECS)
+        raise OSError("completion store unavailable")
+
+    warnings: list[tuple[str, object]] = []
+    warning_seen = asyncio.Event()
+
+    def record_warning(message: str, *args: object, **kwargs: object) -> None:
+        warnings.append((message, kwargs.get("exc_info")))
+        warning_seen.set()
+
+    monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
+    monkeypatch.setattr(monitor_records_mod.logger, "warning", record_warning)
+    completion = asyncio.create_task(service.record_monitor_turn_completion(_completion()))
+    try:
+        await asyncio.wait_for(write_entered.wait(), timeout=_LOST_RUN_SECS)
+        completion.cancel()
+        release_write.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(completion, timeout=_LOST_RUN_SECS)
+        await asyncio.wait_for(warning_seen.wait(), timeout=_LOST_RUN_SECS)
+    finally:
+        release_write.set()
+        if not completion.done():
+            completion.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(completion, return_exceptions=True), timeout=_LOST_RUN_SECS
+            )
+
+    assert len(warnings) == 1, "the failed inner write was not logged exactly once"
+    assert warnings[0][0] == "detached monitor completion accounting failed"
+    assert isinstance(warnings[0][1], OSError)
+
+
+@pytest.mark.asyncio
+async def test_completion_cancellation_stops_waiting_on_a_wedged_write_after_the_grace(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A cancelled caller waits for the accounting write only as long as the drain's
+    post-cancellation window. Past it the CancelledError reaches the caller while the
+    owned transaction keeps running, still registered, so shutdown drains what the
+    caller has stopped waiting for and the write lands when the thread frees."""
+    from kiro_crew import autonudge as _an
+
+    monkeypatch.setattr(_an, "_DRAIN_CANCEL_GRACE_SECS", 0.05)
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+
+    real_write = service._write_state
+    write_started = threading.Event()
+    release_write = threading.Event()
+    write_finished = threading.Event()
+
+    def blocking_write(payload):
+        write_started.set()
+        assert release_write.wait(timeout=10)
+        real_write(payload)
+        write_finished.set()
+
+    monkeypatch.setattr(service, "_write_state", blocking_write)
+    completion = asyncio.create_task(service.record_monitor_turn_completion(_completion()))
+    try:
+        await async_wait_until(write_started.is_set)
+        owners = set(service._inflight_adds)
+        assert owners
+
+        completion.cancel()
+        done, _ = await asyncio.wait({completion}, timeout=2)
+        assert completion in done, "the caller kept absorbing cancellation on a wedged write"
+        assert not write_finished.is_set()
+        with pytest.raises(asyncio.CancelledError):
+            completion.result()
+        # The transaction was not released with the caller: its owner task is
+        # alive, uncancelled, and still where shutdown will find it.
+        assert all(not owner.done() for owner in owners)
+        assert owners <= service._inflight_adds
+    finally:
+        release_write.set()
+
+    for owner in owners:
+        await asyncio.wait_for(owner, timeout=_LOST_RUN_SECS)
+    assert write_finished.is_set()
+    restored = AutoNudgeService(base_dir=tmp_path)
+    await asyncio.to_thread(restored._load)
+    restored_loop = restored.get_by_id(loop.id)
+    assert restored_loop is not None and restored_loop.monitor is not None
+    assert restored_loop.monitor.agent_turns == 1
+    assert not restored_loop.monitor.wake_in_flight
+
+
+@pytest.mark.asyncio
+async def test_completion_without_captured_authority_is_refused_after_shutdown(tmp_path) -> None:
+    """A foreign task cannot borrow authority from an accepted wake."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+
+    accepted = asyncio.Event()
+    release_turn = asyncio.Event()
+
+    async def accepted_turn() -> None:
+        service.mark_monitor_turn_accepted(loop.id, "failure-a")
+        accepted.set()
+        await release_turn.wait()
+
+    turn = asyncio.create_task(accepted_turn())
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=_LOST_RUN_SECS)
+        shutdown = asyncio.create_task(service.shutdown())
+        await async_wait_until(
+            lambda: not service.accepting_mutations,
+            describe=lambda: f"accepting={service.accepting_mutations}",
+        )
+        with pytest.raises(NudgeAdmissionRefused, match="gateway is restarting"):
+            await service.record_monitor_turn_completion(_completion())
+        release_turn.set()
+        await asyncio.wait_for(turn, timeout=_LOST_RUN_SECS)
+        await asyncio.wait_for(shutdown, timeout=_LOST_RUN_SECS)
+    finally:
+        release_turn.set()
+        pending = [task for task in (turn, shutdown) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=_LOST_RUN_SECS
+            )
+
+    restored = AutoNudgeService(base_dir=tmp_path)
+    await asyncio.to_thread(restored._load)
+    restored_loop = restored.get_by_id(loop.id)
+    assert restored_loop is not None and restored_loop.monitor is not None
+    assert restored_loop.monitor.agent_turns == 0
+    assert not restored_loop.monitor.wake_in_flight
+    assert restored_loop.monitor.outcome is MonitorOutcome.BLOCKED
+    assert restored_loop.monitor.stopped_reason == "completion_evidence_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_completion_persistence_failure_leaves_live_accounting_unchanged(
     tmp_path, monkeypatch
 ) -> None:
@@ -115,7 +466,7 @@ async def test_completion_persistence_failure_leaves_live_accounting_unchanged(
     before = deepcopy(loop)
     persisted_before = service._path.read_bytes()
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -146,7 +497,7 @@ async def test_claim_persistence_failure_leaves_live_monitor_unchanged(
     service._loops[loop.id] = loop
     before = deepcopy(loop)
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -169,7 +520,7 @@ async def test_budget_stop_persistence_failure_leaves_live_monitor_armed(
     service._loops[loop.id] = loop
     before = deepcopy(loop)
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -301,7 +652,7 @@ async def test_dispatch_failure_persistence_failure_keeps_live_claim(tmp_path, m
     before = deepcopy(loop)
     persisted_before = service._path.read_bytes()
 
-    async def fail_snapshot(_payload=None):
+    async def fail_snapshot(_payload=None, *, admission=None):
         raise OSError("disk full")
 
     monkeypatch.setattr(service, "_write_monitor_snapshot_locked", fail_snapshot)
@@ -358,7 +709,119 @@ async def test_completion_stops_on_the_first_exhausted_budget(
 def test_agent_turn_budget_above_universal_bound_is_rejected() -> None:
     """Persisted configuration and enforcement must expose the same ceiling."""
     with pytest.raises(ValueError, match="max_agent_turns"):
-        MonitorBudgets(max_agent_turns=9)
+        MonitorBudgets(max_agent_turns=models.MAX_MONITOR_AGENT_TURNS + 1)
+
+
+def test_agent_turn_budget_at_the_universal_bound_is_accepted() -> None:
+    """The ceiling itself is a legal configuration, not one past the edge."""
+    budgets = MonitorBudgets(max_agent_turns=models.MAX_MONITOR_AGENT_TURNS)
+
+    assert budgets.max_agent_turns == models.MAX_MONITOR_AGENT_TURNS
+
+
+def test_unlimited_agent_turns_is_the_default() -> None:
+    """A watch nobody configured carries no wake ceiling."""
+    assert models.DEFAULT_MONITOR_AGENT_TURNS == 0
+    assert MonitorBudgets().max_agent_turns == 0
+
+
+def test_the_explicit_wake_ceiling_matches_the_legacy_cycle_cap() -> None:
+    """The two reachable cycle caps agree, so neither is a freely chosen number.
+
+    The default must NOT equal the maximum: when it did, ``max_agent_turns`` could
+    only ever be lowered, which is the defect this budget's semantics exist to fix.
+    """
+    assert models.MAX_MONITOR_AGENT_TURNS == 1_000
+    assert models.DEFAULT_MONITOR_AGENT_TURNS != models.MAX_MONITOR_AGENT_TURNS
+    with pytest.raises(ValueError, match="max_agent_turns"):
+        MonitorBudgets(max_agent_turns=1_001)
+    assert MonitorBudgets(max_agent_turns=1_000).max_agent_turns == 1_000
+
+
+def test_zero_agent_turns_never_exhausts_the_turn_budget() -> None:
+    """Zero means unlimited, so no turn count may satisfy the turn bound.
+
+    The bound is a ``>=`` comparison, so a zero ceiling read as a number rather
+    than as the unlimited sentinel is satisfied by a fresh monitor that has run
+    no turns at all -- every watch would stop on its first wake.
+    """
+    state = MonitorState(
+        kind="github_pull_request",
+        target="owner/repo#123",
+        objective="review_ready",
+        created_ts=1_000.0,
+        budgets=MonitorBudgets(max_agent_turns=0),
+    )
+
+    assert monitor_budget_reason(state, now=1_000.0) == ""
+
+    for turns in (1, 8, 9, 1_000, 10_000):
+        state.agent_turns = turns
+        assert monitor_budget_reason(state, now=1_000.0) == ""
+
+
+def test_zero_agent_turns_still_lets_the_other_budgets_stop_the_watch() -> None:
+    """Unlimited wakes are still bounded by runtime, tokens and provider errors."""
+
+    def _state() -> MonitorState:
+        return MonitorState(
+            kind="github_pull_request",
+            target="owner/repo#123",
+            objective="review_ready",
+            created_ts=1_000.0,
+            budgets=MonitorBudgets(
+                max_agent_turns=0,
+                max_runtime_secs=100,
+                max_tokens=500,
+                max_provider_errors=3,
+            ),
+        )
+
+    runtime = _state()
+    runtime.agent_turns = 10_000
+    assert monitor_budget_reason(runtime, now=1_100.0) == "runtime_budget"
+
+    tokens = _state()
+    tokens.agent_turns = 10_000
+    tokens.input_tokens = 300
+    tokens.output_tokens = 200
+    assert monitor_budget_reason(tokens, now=1_000.0) == "token_budget"
+
+    errors = _state()
+    errors.agent_turns = 10_000
+    errors.provider_error_count = 3
+    assert monitor_budget_reason(errors, now=1_000.0) == "provider_error_budget"
+
+
+@pytest.mark.asyncio
+async def test_unlimited_turn_completions_never_stop_the_monitor(tmp_path) -> None:
+    """A zero turn ceiling survives more completed wakes than the old bound allowed."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    assert loop.monitor is not None
+    loop.monitor.budgets = MonitorBudgets(max_agent_turns=0)
+    service._loops[loop.id] = loop
+
+    for index in range(12):
+        fingerprint = f"failure-{index}"
+        assert await service.mark_monitor_action_in_flight(loop.id, fingerprint, now=1_050.0)
+        await service.record_monitor_turn_completion(
+            models.MonitorActionCompletion(
+                monitor_id=loop.id,
+                fingerprint=fingerprint,
+                disposition=models.MonitorActionDisposition.FAILURE,
+                completed_ts=1_050.0 + index,
+                input_tokens=1,
+                output_tokens=1,
+            )
+        )
+
+    assert loop.active
+    assert loop.monitor.outcome is None
+    assert loop.monitor.agent_turns == 12
+    # The twelfth completion re-arms the timer, so the service owns a background
+    # task bound to this test's directory until it is stopped.
+    service.stop()
 
 
 @pytest.mark.asyncio
@@ -524,3 +987,41 @@ async def test_completion_hook_delivers_one_typed_record_with_explicit_unknown_u
             output_tokens=None,
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_can_lift_a_finite_wake_ceiling_to_unlimited(tmp_path) -> None:
+    """A watch armed with a finite wake ceiling can be patched to unlimited.
+
+    The end of the write path: a budget patch merges into the stored budgets and
+    re-runs ``MonitorBudgets`` validation, so 0 has to survive that round trip or
+    a caller can reach the new semantics on arm but not on update.
+    """
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    assert loop.monitor is not None
+    loop.monitor.budgets = MonitorBudgets(max_agent_turns=4)
+    service._loops[loop.id] = loop
+
+    await service.update_monitor(loop.id, budget_patch={"max_agent_turns": 0})
+
+    assert loop.monitor.budgets.max_agent_turns == 0
+    # The sibling budgets are untouched by the patch.
+    assert loop.monitor.budgets.max_runtime_secs == models.DEFAULT_MONITOR_RUNTIME_SECS
+    assert loop.monitor.budgets.max_tokens == models.DEFAULT_MONITOR_TOKENS
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_update_still_refuses_an_over_ceiling_wake_budget(tmp_path) -> None:
+    """Raising the ceiling on arm must not open a back door on update."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+
+    with pytest.raises(ValueError, match="max_agent_turns"):
+        await service.update_monitor(
+            loop.id,
+            budget_patch={"max_agent_turns": models.MAX_MONITOR_AGENT_TURNS + 1},
+        )
+    service.stop()

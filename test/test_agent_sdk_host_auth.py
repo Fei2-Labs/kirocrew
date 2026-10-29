@@ -41,9 +41,10 @@ import pytest
 
 from kiro_crew import acp_backends, security
 from kiro_crew.acp import types as acp_types
-from kiro_crew.agent_sdk import host_auth, tool_gate
+from kiro_crew.agent_sdk import host_auth, native_allow_stores, tool_gate
 from kiro_crew.agent_sdk.backends import ACP_BACKEND_KAS, ACP_BACKEND_KIRO
 from kiro_crew.security import paths as security_paths
+from kiro_crew.security import paths_targets
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -304,7 +305,7 @@ def test_the_logout_recycle_set_is_projected_not_copied() -> None:
     # Published as a FUNCTION and nowhere as an ``ACP_BACKENDS_*`` set. That naming is
     # harness vocabulary, whose home is the backends module, and a derived answer is
     # not vocabulary -- ``scripts/check_harness_parity.py`` fails on a set defined
-    # outside that module, and the set could not be defined inside it either (it
+    # outside that module and its owners, and the set could not be defined inside it either (it
     # supplies the ids this table is keyed by). Asserted so the alias does not come
     # back as a convenience.
     for module in (host_auth, acp_types, acp_backends):
@@ -326,7 +327,9 @@ def test_the_override_pairing_is_the_declaration_projection() -> None:
     relocated token is still fenced. The pairing has to name the same leaf the
     floor fences and the same variable the resolver reads -- it was a third
     hand-maintained copy of both."""
-    assert security_paths._OVERRIDE_ANCHORED_LEAVES == host_auth.override_anchored_leaves()
+    assert security_paths._OVERRIDE_ANCHORED_LEAVES == (
+        host_auth.override_anchored_leaves() + native_allow_stores.override_anchored_leaves()
+    )
     assert security._OVERRIDE_ANCHORED_LEAVES is security_paths._OVERRIDE_ANCHORED_LEAVES
     assert security_paths._OVERRIDE_ANCHORED_LEAVES, "no leaf is override-anchored; vacuous"
 
@@ -335,7 +338,7 @@ def test_every_anchored_variable_is_a_declared_override() -> None:
     """The resolver only resolves variables the declarations name, so a variable
     that appears in the pairing but not in that list anchors on a root nobody ever
     resolved -- an entry describing protection that does not exist."""
-    resolved = set(host_auth.home_override_env_vars())
+    resolved = set(paths_targets._ADAPTER_ROOT_ENVS)
     for leaf, env_vars, _under_root in security_paths._OVERRIDE_ANCHORED_LEAVES:
         for env_var in env_vars:
             assert env_var in resolved, (
@@ -455,7 +458,7 @@ def test_an_own_leaf_from_its_own_declaration_is_accepted() -> None:
 
 @pytest.mark.parametrize(
     "source",
-    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE],
+    [host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE, host_auth.ENTITLEMENT_HOST_VAULT],
 )
 def test_logout_recycling_is_refused_off_the_host_store(source: str) -> None:
     """A host logout says nothing about a store the harness never reads, so
@@ -609,7 +612,7 @@ def test_no_current_driver_implements_the_login_protocol() -> None:
 def _no_adapter_overrides(monkeypatch):
     """Clear every declared override so a developer machine that exports one
     cannot make a default-location assertion pass for the wrong reason."""
-    for env_var in host_auth.home_override_env_vars():
+    for env_var in paths_targets._ADAPTER_ROOT_ENVS:
         monkeypatch.delenv(env_var, raising=False)
     security._home_targets_cache.clear()
     yield
@@ -624,7 +627,7 @@ def test_the_resolved_root_key_is_still_hashable(_no_adapter_overrides, tmp_path
     roots = security._resolve_root_anchors(str(tmp_path))
     assert isinstance(hash(roots), int)
     assert isinstance(roots.adapter_roots, tuple)
-    assert {env for env, _root in roots.adapter_roots} == set(host_auth.home_override_env_vars())
+    assert {env for env, _root in roots.adapter_roots} == set(paths_targets._ADAPTER_ROOT_ENVS)
 
 
 def test_a_changed_declared_override_changes_the_key(monkeypatch, tmp_path) -> None:
@@ -771,18 +774,18 @@ def test_the_kiro_signed_out_message_is_unchanged() -> None:
     )
     assert host_auth.signed_out_message("") == expected
     # KAS may draw its access token from Crew's own vault (the dashboard's Kiro
-    # sign-in card, under Developer > Agent Backend) OR from kiro-cli's store,
+    # sign-in card, under Settings > Agent Harness) OR from kiro-cli's store,
     # and the formatter cannot see which one a process had, so its sentence
     # names both sign-ins rather than repeating kiro's. The kiro-cli remedy
     # stays in it verbatim.
     kas = host_auth.signed_out_message("kas")
     assert kas != expected
     assert "`kiro-cli login`" in kas
-    assert "Developer → Agent Backend → Kiro sign-in" in kas
+    assert "Settings → Agent Harness → Kiro sign-in" in kas
     assert "start a new chat" in kas
     # The standing (unprobed) remedy names the same two paths, in plain prose.
     remedy = host_auth.declaration_for("kas").sign_in_remedy
-    assert "Developer → Agent Backend → Kiro sign-in" in remedy and "kiro-cli login" in remedy
+    assert "Settings → Agent Harness → Kiro sign-in" in remedy and "kiro-cli login" in remedy
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
@@ -826,3 +829,49 @@ def test_every_entitlement_source_has_an_operator_facing_label() -> None:
         assert "_" not in label, f"{source!r} labels itself with a code identifier"
     for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
         assert "_" not in host_auth.entitlement_label(declaration.backend)
+
+
+def test_the_host_vault_source_is_declared_and_labelled() -> None:
+    """The third source the module always anticipated, now that it exists.
+
+    The comment above :data:`ENTITLEMENT_LABELS` said a harness entitled some other
+    way "would add a third here, with its label, when it exists". Adding the
+    identifier without adding it to both the source set and the label map is the one
+    way to land a source that ``__post_init__`` refuses (unknown source) or that
+    doctor prints raw -- so both memberships are asserted, not just one.
+    """
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_SOURCES
+    assert host_auth.ENTITLEMENT_HOST_VAULT in host_auth.ENTITLEMENT_LABELS
+    assert host_auth.ENTITLEMENT_HOST_VAULT not in (
+        host_auth.ENTITLEMENT_HOST_IDENTITY_STORE,
+        host_auth.ENTITLEMENT_OWN_CREDENTIAL_FILE,
+    )
+    # A harness entitled from Crew's vault signs in somewhere other than the host
+    # identity store, so the panel still shows its standing caveat: the operator has
+    # to put a key in the vault and map it, which is an action doctor has not
+    # measured.
+    for declaration in host_auth.AGENT_AUTH_DECLARATIONS:
+        if declaration.entitlement_source != host_auth.ENTITLEMENT_HOST_VAULT:
+            continue
+        assert host_auth.signs_in_separately(declaration.backend)
+        assert declaration.backend not in host_auth.backends_retired_by_host_logout()
+
+
+def test_a_host_vault_harness_names_the_config_surface_that_feeds_it() -> None:
+    """Its remedy must send the operator to the vault, not to the harness's own file.
+
+    ``sign_in_remedy`` is rendered VERBATIM in the backend panel and printed by
+    doctor, and for this source the action is Crew's own -- store a secret, map it
+    in config. A remedy inherited from the file-based harnesses would tell the
+    operator to write a credential file that the child mask now hides, which is
+    advice that cannot work.
+    """
+    declarations = [
+        d
+        for d in host_auth.AGENT_AUTH_DECLARATIONS
+        if d.entitlement_source == host_auth.ENTITLEMENT_HOST_VAULT
+    ]
+    assert declarations, "no harness declares the host-vault source; this would be vacuous"
+    for declaration in declarations:
+        for text in (declaration.sign_in_remedy, declaration.signed_out_message):
+            assert "Secrets" in text, declaration.backend

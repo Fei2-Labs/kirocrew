@@ -70,8 +70,8 @@ export const BANNER_EXPANDED_MAX = 4
 
 /** The chat surfaces, where `chat.activeSlot` is the conversation on screen.
  *  The ONE spelling of that set: the socket layer's `isChatSurfaceVisible`
- *  (useWebSocket.ts) applies it to `window.location`, this gate to the router's
- *  pathname. */
+ *  (websocket/attention.ts) applies it to `window.location`, this gate to the
+ *  router's pathname. */
 export function isChatPath(pathname: string): boolean {
   return pathname === '/' || pathname === '/chat' || pathname.startsWith('/chat/')
     || pathname.startsWith('/popout/chat') || pathname.startsWith('/embed/chat')
@@ -89,7 +89,14 @@ export interface BannerGateContext {
   activeSlot: string | null | undefined
   /** `document.hasFocus() && !document.hidden`: the user can see the view. */
   windowFocused: boolean
+  /** The thread a non-chat surface (the Members page) registered as on screen
+   *  (`lib/viewedThread`); registration already implies a focused window. */
+  viewedThread?: string | null
 }
+
+/** The channel of a crewmate's message in its DM thread
+ *  (`dashboard/member_message_notes.py`). */
+export const MEMBER_MESSAGE_CHANNEL = 'system.member'
 
 /**
  * True when *n* describes something already on the user's screen. A note for
@@ -97,10 +104,15 @@ export interface BannerGateContext {
  * a note whose deep link IS the current route likewise. Re-announcing either
  * is noise, so the gate refuses it. Away from the window nothing is "on
  * screen", and the note banners.
+ *
+ * A crewmate's message is on screen only when its own thread is: its deep link
+ * is the Members page, which shows one thread at a time, so matching the route
+ * would hide every other crewmate's message while the page is open.
  */
-export function targetsCurrentView(n: Notification, ctx: Pick<BannerGateContext, 'pathname' | 'activeSlot' | 'windowFocused'>): boolean {
+export function targetsCurrentView(n: Notification, ctx: Pick<BannerGateContext, 'pathname' | 'activeSlot' | 'windowFocused' | 'viewedThread'>): boolean {
   if (!ctx.windowFocused) return false
   if (n.slot && ctx.activeSlot && n.slot === ctx.activeSlot && isChatPath(ctx.pathname)) return true
+  if (n.channel === MEMBER_MESSAGE_CHANNEL) return !!n.slot && n.slot === ctx.viewedThread
   if (n.url) {
     const path = n.url.split(/[?#]/)[0]
     if (path === ctx.pathname) return true

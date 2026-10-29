@@ -1,114 +1,103 @@
 """External kiro-cli logout / account switch must invalidate running state.
 
-Covers the three properties that together let a signed-out account keep
-answering: the fingerprint must ignore token rotation, an ordinary status poll
-must re-probe when the account changes, and a turn must retire the children that
-still hold the old credential.
+Three properties together stop a signed-out account from answering: the
+fingerprint must ignore token rotation, an ordinary status poll must re-probe when
+the account changes, and a turn must retire the children that still hold the old
+credential. This module pins what the fingerprint reads. The baseline, latch and
+turn gate are in ``test_external_logout_detection_baseline.py``, retirement in
+``test_external_logout_detection_retirement.py``, and spawn-time identity in
+``test_external_logout_detection_spawn_identity.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
+import errno
 import json
 import os
 import sqlite3
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from external_logout_detection_helpers import _private_sel_root_per_test  # noqa: F401
+from external_logout_detection_helpers import _write_store
 
 from kiro_crew import kiro_prerequisite as kp
-from kiro_crew.session import _MAX_CONCURRENT_COLD_STARTS as _MAX_COLD_STARTS_FOR_TEST
 
 
-@pytest.fixture(autouse=True)
-def _private_sel_root_per_test(sel_private_root):
-    """Every test in this module gets its OWN SEL root.
+def _simulate_unsearchable_directory(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    """Answer for every path inside ``directory`` as the OS does when the gateway may not look in it.
 
-    ``identity_fingerprint`` is audit-or-deny: it returns "absent" unless a
-    CRITICAL SEL event lands first. On the event-loop thread the chain-lock
-    acquire is a single non-blocking attempt that refuses rather than stall the
-    loop -- correct product behaviour -- so on the worker's SHARED SEL root an
-    async test asserting a NON-EMPTY fingerprint is racing writers it never
-    created (another test still flushing, another xdist worker on the same
-    path). It then reads "" and fails on a property it never meant to test.
-    ``sel_private_root`` removes the concurrent writer: a fresh per-test,
-    per-worker directory nothing else writes.
-    """
-    yield
-
-
-def _write_store(
-    path: Path,
-    *,
-    token_value: str = "access-token-v1",
-    start_url: str = "https://company.awsapps.com/start",
-    profile: str = "arn:aws:codewhisperer:us-east-1:1111:profile/COMPANY",
-    auth_keys: tuple[str, ...] = ("kirocli:odic:device-registration", "kirocli:odic:token"),
-    client_id: str = "client-registration-aaa",
-    region: str = "us-east-1",
-    state_rows: bool = True,
-) -> None:
-    """Write a minimal store shaped like kiro-cli's real one.
-
-    ``state_rows=False`` models a Builder ID login: no Identity Center marker rows
-    and no CodeWhisperer profile, so the identity has to come from the credential
-    blob's stable claims instead.
+    A stub rather than ``chmod(0)``, so the scenario also runs as root and on Windows, where a
+    mode-0 directory blocks nothing. ``Path.exists`` and ``Path.is_symlink`` answer through
+    ``os.path`` as CPython 3.14's do; 3.12 and 3.13 raise there instead.
     """
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path))
-    with con:
-        con.execute("CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT)")
-        con.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)")
-        con.execute("DELETE FROM auth_kv")
-        con.execute("DELETE FROM state")
-        for key in auth_keys:
-            if key.endswith(":device-registration"):
-                blob = {
-                    "client_id": client_id,
-                    "client_secret": "SECRET-must-never-be-fingerprinted",
-                    "client_secret_expires_at": "2099-01-01T00:00:00Z",
-                    "oauth_flow": "device_code",
-                    "region": region,
-                    "scopes": ["codewhisperer:completions", "codewhisperer:analysis"],
-                }
-            else:
-                blob = {
-                    "access_token": token_value,
-                    "refresh_token": f"refresh-of-{token_value}",
-                    "expires_at": "2099-01-01T00:00:00Z",
-                    "oauth_flow": "device_code",
-                    "region": region,
-                    "scopes": ["codewhisperer:completions", "codewhisperer:analysis"],
-                    "start_url": start_url,
-                }
-            con.execute("INSERT INTO auth_kv (key, value) VALUES (?, ?)", (key, json.dumps(blob)))
-        if state_rows:
-            con.execute(
-                "INSERT INTO state (key, value) VALUES (?, ?)", ("auth.idc.start-url", start_url)
+    denied_directory = os.path.normcase(os.path.abspath(os.fsdecode(directory)))
+
+    def is_strictly_inside(candidate: object) -> bool:
+        try:
+            candidate_path = os.fspath(candidate)
+        except TypeError:
+            return False
+        try:
+            candidate_name = os.path.normcase(os.path.abspath(os.fsdecode(candidate_path)))
+            return (
+                candidate_name != denied_directory
+                and os.path.commonpath((candidate_name, denied_directory)) == denied_directory
             )
-            con.execute("INSERT INTO state (key, value) VALUES (?, ?)", ("auth.idc.region", region))
-            con.execute(
-                "INSERT INTO state (key, value) VALUES (?, ?)",
-                ("api.codewhisperer.profile", profile),
-            )
-        # Unrelated local state must not participate in the fingerprint.
-        con.execute("INSERT INTO state (key, value) VALUES (?, ?)", ("telemetry.client-id", "abc"))
-    con.close()
+        except (OSError, TypeError, ValueError):
+            return False
 
+    real_stat = os.stat
+    real_lstat = os.lstat
+    real_exists = os.path.exists
+    real_lexists = os.path.lexists
+    real_islink = os.path.islink
+    real_open_identity_db_readonly = kp._open_identity_db_readonly
 
-def _expire_identity_cache(service: "kp.KiroPrerequisiteService") -> None:
-    """Drop the reader's real-time cache.
+    def permission_denied(candidate: object) -> PermissionError:
+        return PermissionError(
+            errno.EACCES,
+            os.strerror(errno.EACCES),
+            os.fspath(candidate),
+        )
 
-    The fingerprint is cached for a few seconds so a dashboard poll storm cannot
-    turn into one SQLite read and one SEL audit event per poll. A test that
-    rewrites the store and immediately re-reads is outside that design, so it
-    expires the cache explicitly rather than sleeping.
-    """
+    def stat(candidate: object, *args: object, **kwargs: object) -> os.stat_result:
+        if is_strictly_inside(candidate):
+            raise permission_denied(candidate)
+        return real_stat(candidate, *args, **kwargs)
 
-    service._identity_cache_at = 0.0
+    def lstat(candidate: object, *args: object, **kwargs: object) -> os.stat_result:
+        if is_strictly_inside(candidate):
+            raise permission_denied(candidate)
+        return real_lstat(candidate, *args, **kwargs)
+
+    def exists(candidate: object) -> bool:
+        return False if is_strictly_inside(candidate) else real_exists(candidate)
+
+    def lexists(candidate: object) -> bool:
+        return False if is_strictly_inside(candidate) else real_lexists(candidate)
+
+    def islink(candidate: object) -> bool:
+        return False if is_strictly_inside(candidate) else real_islink(candidate)
+
+    def path_exists(self: Path, *, follow_symlinks: bool = True) -> bool:
+        return os.path.exists(self) if follow_symlinks else os.path.lexists(self)
+
+    def open_identity_db_readonly(path: Path):
+        if is_strictly_inside(path):
+            return None
+        return real_open_identity_db_readonly(path)
+
+    monkeypatch.setattr(os, "stat", stat)
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os.path, "exists", exists)
+    monkeypatch.setattr(os.path, "lexists", lexists)
+    monkeypatch.setattr(os.path, "islink", islink)
+    monkeypatch.setattr(Path, "exists", path_exists)
+    monkeypatch.setattr(Path, "is_symlink", lambda self: os.path.islink(self))
+    monkeypatch.setattr(kp, "_open_identity_db_readonly", open_identity_db_readonly)
 
 
 class TestIdentityFingerprint:
@@ -308,6 +297,53 @@ class TestIdentityFingerprint:
         con.close()
         assert kp.identity_fingerprint(db) == before
 
+    @staticmethod
+    def _set_oauth_flow(db: Path, flow: str) -> None:
+        con = sqlite3.connect(str(db))
+        with con:
+            for key, value in con.execute("SELECT key, value FROM auth_kv").fetchall():
+                blob = json.loads(value)
+                blob["oauth_flow"] = flow
+                con.execute("UPDATE auth_kv SET value=? WHERE key=?", (json.dumps(blob), key))
+        con.close()
+
+    def test_oauth_flow_casing_is_not_an_account_change(self, tmp_path: Path) -> None:
+        """kiro-cli's refreshers write the same flow as `PKCE` or `Pkce`.
+
+        A refresh that only re-spells the flow must not read as a new account,
+        or every refresh retires healthy sessions.
+        """
+
+        db = tmp_path / "data.sqlite3"
+        _write_store(db)
+        self._set_oauth_flow(db, "PKCE")
+        before = kp.identity_fingerprint(db)
+        self._set_oauth_flow(db, "Pkce")
+        assert kp.identity_fingerprint(db) == before
+        self._set_oauth_flow(db, "pkce")
+        assert kp.identity_fingerprint(db) == before
+
+    def test_an_oauth_flow_change_is_still_detected(self, tmp_path: Path) -> None:
+        """Case-folding must not hide a genuine change of sign-in flow."""
+
+        db = tmp_path / "data.sqlite3"
+        _write_store(db)
+        self._set_oauth_flow(db, "PKCE")
+        before = kp.identity_fingerprint(db)
+        self._set_oauth_flow(db, "device_code")
+        assert kp.identity_fingerprint(db) != before
+
+    def test_start_url_and_client_id_stay_case_sensitive(self, tmp_path: Path) -> None:
+        """Only the flow label is case-folded; identifiers keep exact comparison."""
+
+        db = tmp_path / "data.sqlite3"
+        _write_store(db, state_rows=False, client_id="client-registration-aaa")
+        before = kp.identity_fingerprint(db)
+        _write_store(db, state_rows=False, client_id="CLIENT-REGISTRATION-AAA")
+        assert kp.identity_fingerprint(db) != before
+        _write_store(db, state_rows=False, start_url="https://COMPANY.awsapps.com/start")
+        assert kp.identity_fingerprint(db) != before
+
     def test_an_unknown_blob_field_never_joins_the_fingerprint(self, tmp_path: Path) -> None:
         """Allowlist, not denylist: a field a future kiro-cli adds stays out.
 
@@ -411,9 +447,9 @@ class TestFingerprintCaching:
         reads: list[int] = []
         real = kp.identity_fingerprint
 
-        def _counted(path):
+        def _counted(path, **kwargs):
             reads.append(1)
-            return real(path)
+            return real(path, **kwargs)
 
         monkeypatched = pytest.MonkeyPatch()
         monkeypatched.setattr(kp, "identity_fingerprint", _counted)
@@ -454,6 +490,640 @@ class TestFingerprintCaching:
         changed, live_now = await service.identity_changed_since_sessions()
         assert changed is True, "the cached pre-logout value was served to a turn"
         assert live_now == ""
+
+
+class TestApiKeyIdentity:
+    """A host authenticated by KIRO_API_KEY must not read as signed out.
+
+    kiro-cli keeps no identity row for an API key in its store, so a
+    store-only fingerprint came out ABSENT on every read. Absent is never
+    reconciled as a baseline, so every dashboard send retired idle sessions
+    and cancelled their running subagents although the CLI was authenticated.
+    """
+
+    _KEY_1 = "test-api-key-value-one-0123456789"
+    _KEY_2 = "test-api-key-value-two-9876543210"
+
+    @staticmethod
+    def _write_empty_store(home: Path) -> Path:
+        """A store shaped like an API-key host's: the schema, no identity rows."""
+
+        db = kp.kiro_identity_store_path("linux", home, {})
+        db.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(db))
+        with con:
+            con.execute("CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value BLOB)")
+        con.close()
+        return db
+
+    @staticmethod
+    def _service(home: Path, environ: dict[str, str]) -> "kp.KiroPrerequisiteService":
+        return kp.KiroPrerequisiteService(home=home, environ=environ, platform_name="linux")
+
+    def test_the_store_alone_reads_as_signed_out(self, tmp_path: Path) -> None:
+        """The repro: the store reader cannot see the key at all."""
+
+        db = self._write_empty_store(tmp_path)
+        assert kp.identity_fingerprint(db) == ""
+
+    @pytest.mark.asyncio
+    async def test_an_api_key_host_fingerprints_non_empty_and_stable(self, tmp_path: Path) -> None:
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+
+        first = await service.current_identity_fingerprint(allow_cached=False)
+        second = await service.current_identity_fingerprint(allow_cached=False)
+
+        assert first != ""
+        assert first == second
+
+    @pytest.mark.asyncio
+    async def test_a_key_read_from_the_data_home_env_file_counts(self, tmp_path: Path) -> None:
+        """Post-scrub Docker moves the key into the data home's .env; the
+        fingerprint must find it there, as the whoami probe does."""
+
+        self._write_empty_store(tmp_path)
+        env_file = tmp_path / ".kiro" / "crew" / ".env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text(f"KIRO_API_KEY={self._KEY_1}\n")
+        from_file = await self._service(tmp_path, {}).current_identity_fingerprint(
+            allow_cached=False
+        )
+        from_environ = await self._service(
+            tmp_path, {"KIRO_API_KEY": self._KEY_1}
+        ).current_identity_fingerprint(allow_cached=False)
+
+        assert from_file != ""
+        assert from_file == from_environ
+
+    @pytest.mark.asyncio
+    async def test_a_key_change_changes_the_fingerprint(self, tmp_path: Path) -> None:
+        self._write_empty_store(tmp_path)
+        environ = {"KIRO_API_KEY": self._KEY_1}
+        service = self._service(tmp_path, environ)
+
+        before = await service.current_identity_fingerprint(allow_cached=False)
+        environ["KIRO_API_KEY"] = self._KEY_2
+        after = await service.current_identity_fingerprint(allow_cached=False)
+
+        assert before != "" and after != ""
+        assert before != after
+
+    @pytest.mark.asyncio
+    async def test_no_key_and_no_store_identity_is_still_absent(self, tmp_path: Path) -> None:
+        """The unchanged contract: nothing anywhere still reads as \"\"."""
+
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+
+    @pytest.mark.asyncio
+    async def test_store_login_plus_key_differs_from_either_alone(self, tmp_path: Path) -> None:
+        """The key is its own component beside the store's, so no precedence
+        between them has to be assumed: adding or removing either reads as a
+        change."""
+
+        store_home = tmp_path / "store"
+        _write_store(kp.kiro_identity_store_path("linux", store_home, {}))
+        key_home = tmp_path / "key"
+        self._write_empty_store(key_home)
+
+        store_only = await self._service(store_home, {}).current_identity_fingerprint(
+            allow_cached=False
+        )
+        both = await self._service(
+            store_home, {"KIRO_API_KEY": self._KEY_1}
+        ).current_identity_fingerprint(allow_cached=False)
+        key_only = await self._service(
+            key_home, {"KIRO_API_KEY": self._KEY_1}
+        ).current_identity_fingerprint(allow_cached=False)
+
+        assert "" not in (store_only, both, key_only)
+        assert len({store_only, both, key_only}) == 3
+        # A host without a key keeps the store-only fingerprint byte-for-byte.
+        assert store_only == kp.identity_fingerprint(
+            kp.kiro_identity_store_path("linux", store_home, {})
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_store_account_switch_is_seen_while_a_key_is_set(self, tmp_path: Path) -> None:
+        """A harness that strips the key (KAS) authenticates from the store, so a
+        store account switch must still prove a mismatch and arm the latch on a
+        host that also carries a key."""
+
+        db = kp.kiro_identity_store_path("linux", tmp_path, {})
+        _write_store(db)
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+        assert await service.seed_sessions_baseline() is True
+        before = await service.current_identity_fingerprint(allow_cached=False)
+
+        _write_store(db, start_url="https://other.awsapps.com/start", client_id="other-client")
+        after = await service.current_identity_fingerprint(allow_cached=False)
+
+        assert after != before
+        assert kp.identity_stamp_mismatch(before, after) is True
+        assert service._interim_identity_observed is True
+
+    @pytest.mark.asyncio
+    async def test_a_store_read_blip_is_not_proof_of_a_new_account_on_a_key_host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A store read that fails (here: the database is not openable) must not
+        present as a DIFFERENT nonempty identity: the interim latch and the
+        spawn-stamp mismatch treat that as proof of a new account and would
+        retire healthy sessions with their running children."""
+
+        _write_store(kp.kiro_identity_store_path("linux", tmp_path, {}))
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+        assert await service.seed_sessions_baseline() is True
+        healthy = await service.current_identity_fingerprint(allow_cached=False)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(kp, "_open_identity_db_readonly", lambda _path: None)
+            blipped = await service.current_identity_fingerprint(allow_cached=False)
+
+        assert kp.identity_stamp_mismatch(healthy, blipped) is False
+        assert service._interim_identity_observed is False
+        # Once the store reads again nothing is left over to force a sweep.
+        changed, _ = await service.identity_changed_since_sessions()
+        assert changed is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure", ["audit_unavailable", "unreadable", "sqlite_error"], ids=str
+    )
+    async def test_a_key_never_stands_in_for_an_unknowable_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        """A child can still authenticate from the store (a harness that strips
+        the key), so a store read that could not be audited or completed must
+        not let a key-only fingerprint become the baseline -- a later store
+        account switch would then compare equal. Such a read stays absent and
+        the seed is refused, exactly as before the key was counted."""
+
+        _write_store(kp.kiro_identity_store_path("linux", tmp_path, {}))
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+        if failure == "audit_unavailable":
+            monkeypatch.setattr(kp.hooks, "emit_internal_read_audit", lambda *_a, **_k: False)
+        elif failure == "unreadable":
+            monkeypatch.setattr(kp, "_open_identity_db_readonly", lambda _path: None)
+        else:
+
+            class _BrokenConnection:
+                def execute(self, *_a: object) -> object:
+                    raise sqlite3.OperationalError("database is locked")
+
+                def close(self) -> None:
+                    pass
+
+            monkeypatch.setattr(kp, "_open_identity_db_readonly", lambda _p: _BrokenConnection())
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert await service.seed_sessions_baseline() is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_sso_row", [False, True], ids=["social-only", "social-plus-sso"])
+    async def test_a_key_never_stands_in_for_an_unidentifiable_store_login(
+        self, tmp_path: Path, with_sso_row: bool
+    ) -> None:
+        """A social login (GitHub, Google) carries no stable claim, so the store
+        reader skips its row. A KAS child still authenticates as that login, so
+        a switch between two social accounts must not compare equal under an
+        unchanged key: the key is withheld and the fingerprint is exactly what
+        it was before the key was counted."""
+
+        db = kp.kiro_identity_store_path("linux", tmp_path, {})
+        if with_sso_row:
+            _write_store(db, state_rows=False)
+        else:
+            self._write_empty_store(tmp_path)
+        con = sqlite3.connect(str(db))
+        with con:
+            con.execute(
+                "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+                ("kirocli:social:token", json.dumps({"access_token": "social-a"})),
+            )
+        con.close()
+        keyed = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+        keyless = self._service(tmp_path, {})
+
+        with_key = await keyed.current_identity_fingerprint(allow_cached=False)
+        assert with_key == await keyless.current_identity_fingerprint(allow_cached=False)
+        if not with_sso_row:
+            assert with_key == ""
+            assert await keyed.seed_sessions_baseline() is False
+
+    @pytest.mark.asyncio
+    async def test_a_key_never_stands_in_for_a_relocated_store(self, tmp_path: Path) -> None:
+        """With the store relocated the gateway cannot see the store a child
+        may authenticate from, so the key must not make that read definitive."""
+
+        service = self._service(
+            tmp_path,
+            {"KIRO_API_KEY": self._KEY_1, "XDG_DATA_HOME": str(tmp_path / "elsewhere")},
+        )
+        assert kp.identity_store_is_relocated("linux", tmp_path, service._environ)
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+
+    @pytest.mark.asyncio
+    async def test_an_empty_store_proves_nobody_is_signed_in(self, tmp_path: Path) -> None:
+        """No credential row, no key, no vault identity: a sign-out, not a guess."""
+
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is True
+
+    @pytest.mark.asyncio
+    async def test_a_social_login_reads_absent_without_proving_a_sign_out(
+        self, tmp_path: Path
+    ) -> None:
+        """Its row carries no stable claim, so someone is signed in behind an empty
+        fingerprint: a caller that takes this for a sign-out recycles healthy work."""
+
+        self._write_empty_store(tmp_path)
+        con = sqlite3.connect(str(kp.kiro_identity_store_path("linux", tmp_path, {})))
+        with con:
+            con.execute(
+                "INSERT INTO auth_kv (key, value) VALUES (?, ?)",
+                ("kirocli:social:token", json.dumps({"access_token": "social-a"})),
+            )
+        con.close()
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_relocated_store_reads_absent_without_proving_a_sign_out(
+        self, tmp_path: Path
+    ) -> None:
+        service = self._service(tmp_path, {"XDG_DATA_HOME": str(tmp_path / "elsewhere")})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_signed_in_store_is_no_absence(self, tmp_path: Path) -> None:
+        _write_store(kp.kiro_identity_store_path("linux", tmp_path, {}))
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) != ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_an_env_file_that_will_not_read_proves_no_sign_out(self, tmp_path: Path) -> None:
+        """The key reader reports an unreadable .env as holding no key, so an empty
+        store beside one is no sign-out: the key may be in it."""
+
+        self._write_empty_store(tmp_path)
+        # A directory where the .env belongs: no platform will read it as a file.
+        (tmp_path / ".kiro" / "crew" / ".env").mkdir(parents=True)
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_env_read_is_no_proof_even_when_a_reread_would_find_the_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The proof comes from the key claim's own read: a later read that succeeds
+        cannot vouch for the one that failed, because the key may be in the file."""
+
+        from kiro_crew.config import loader
+
+        self._write_empty_store(tmp_path)
+        env_file = tmp_path / ".kiro" / "crew" / ".env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        env_file.write_text(f"KIRO_API_KEY={self._KEY_1}\n")
+        real_read = loader.read_env_text
+        reads: list[Path] = []
+
+        def _fails_once(ep: Path, encoding: str | None = None) -> str:
+            reads.append(ep)
+            if len(reads) == 1:
+                raise PermissionError("transient")
+            return real_read(ep, encoding)
+
+        monkeypatch.setattr(loader, "read_env_text", _fails_once)
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_vault_that_will_not_read_proves_no_sign_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The token store reads a corrupt vault as empty; the proof must not."""
+
+        from kiro_crew.auth import bridge
+        from kiro_crew.auth.store import TokenStore
+
+        vault = TokenStore(tmp_path / "vault-home")
+        entries = tmp_path / "vault-home" / "kas" / ".vault" / "secrets.enc"
+        entries.parent.mkdir(parents=True)
+        entries.write_text("not a vault")
+        monkeypatch.setattr(bridge, "default_token_store", lambda: vault)
+        # The reader the fingerprint uses takes this vault for an empty one.
+        assert vault.resolve() is None
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_store_the_gateway_may_not_look_at_proves_no_sign_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``os.path.lexists`` answers False for a missing store and for one it may not see."""
+
+        store_dir = self._write_empty_store(tmp_path).parent
+        service = self._service(tmp_path, {})
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is True
+
+        _simulate_unsearchable_directory(monkeypatch, store_dir)
+        denied_service = self._service(tmp_path, {})
+        assert await denied_service.current_identity_fingerprint(allow_cached=False) == ""
+        assert denied_service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_windows_store_the_gateway_may_not_look_at_proves_no_sign_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Windows chooses between two store anchors; skipping one it cannot see is no proof."""
+
+        roaming = tmp_path / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3"
+        roaming.parent.mkdir(parents=True)
+        con = sqlite3.connect(str(roaming))
+        with con:
+            con.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value BLOB)")
+        con.close()
+        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="win32")
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is True
+
+        _simulate_unsearchable_directory(monkeypatch, roaming.parent)
+        denied_service = kp.KiroPrerequisiteService(
+            home=tmp_path, environ={}, platform_name="win32"
+        )
+        # The store choice reads the missing Local anchor, which says "no store file".
+        assert await denied_service.current_identity_fingerprint(allow_cached=False) == ""
+        assert denied_service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_two_windows_stores_prove_no_sign_out(self, tmp_path: Path) -> None:
+        """With both stores present the choice rests on write times that may not read."""
+
+        def write_empty(path: Path) -> None:
+            path.parent.mkdir(parents=True)
+            con = sqlite3.connect(str(path))
+            with con:
+                con.execute("CREATE TABLE auth_kv (key TEXT PRIMARY KEY, value BLOB)")
+            con.close()
+
+        write_empty(tmp_path / "AppData" / "Local" / "kiro-cli" / "data.sqlite3")
+        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="win32")
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is True
+
+        write_empty(tmp_path / "AppData" / "Roaming" / "kiro-cli" / "data.sqlite3")
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_vault_the_gateway_may_not_look_at_proves_no_sign_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a missing entry map is an empty vault, not one the gateway may not see."""
+
+        from kiro_crew.auth import bridge
+        from kiro_crew.auth.store import TokenStore
+
+        vault = TokenStore(tmp_path / "vault-home")
+        vault_dir = tmp_path / "vault-home" / "kas" / ".vault"
+        vault_dir.mkdir(parents=True)
+        (vault_dir / "secrets.enc").write_text('{"version": 1, "backend": "file", "entries": {}}')
+        monkeypatch.setattr(bridge, "default_token_store", lambda: vault)
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {})
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is True
+
+        _simulate_unsearchable_directory(monkeypatch, vault_dir)
+        denied_service = self._service(tmp_path, {})
+        assert await denied_service.current_identity_fingerprint(allow_cached=False) == ""
+        assert denied_service.identity_absence_is_definitive is False
+
+    @pytest.mark.asyncio
+    async def test_a_finished_sweep_covers_one_unbroken_sign_out(self, tmp_path: Path) -> None:
+        """Any other reading in between makes the next sign-out a new one to sweep."""
+
+        self._write_empty_store(tmp_path)
+        environ: dict[str, str] = {}
+        service = self._service(tmp_path, environ)
+
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_already_swept is False
+        service.note_absence_swept(service.identity_absence_run)
+        await service.current_identity_fingerprint(allow_cached=False)
+        assert service.identity_absence_already_swept is True
+
+        environ["KIRO_API_KEY"] = self._KEY_1
+        assert await service.current_identity_fingerprint(allow_cached=False) != ""
+        assert service.identity_absence_already_swept is False
+        del environ["KIRO_API_KEY"]
+        assert await service.current_identity_fingerprint(allow_cached=False) == ""
+        assert service.identity_absence_is_definitive is True
+        assert service.identity_absence_already_swept is False
+
+        newer = service.identity_absence_run
+        service.note_absence_swept(newer)
+        # A slower sweep that began under the earlier sign-out finishes last.
+        service.note_absence_swept(newer - 1)
+        assert service.identity_absence_already_swept is True
+
+    @pytest.mark.asyncio
+    async def test_a_key_host_with_no_store_file_at_all_fingerprints(self, tmp_path: Path) -> None:
+        """A container that never ran `kiro-cli login` has no store file; that
+        is a definitive "nobody signed in there", so the key alone counts."""
+
+        assert not kp.kiro_identity_store_path("linux", tmp_path, {}).exists()
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+
+        assert await service.current_identity_fingerprint(allow_cached=False) != ""
+        assert await service.seed_sessions_baseline() is True
+
+    @pytest.mark.asyncio
+    async def test_the_key_value_never_appears_in_the_fingerprint(self, tmp_path: Path) -> None:
+        _write_store(kp.kiro_identity_store_path("linux", tmp_path / "both", {}))
+        self._write_empty_store(tmp_path / "key")
+        for home in (tmp_path / "both", tmp_path / "key"):
+            fingerprint = await self._service(
+                home, {"KIRO_API_KEY": self._KEY_1}
+            ).current_identity_fingerprint(allow_cached=False)
+            assert fingerprint != ""
+            assert self._KEY_1 not in fingerprint
+            # Not even a recognisable fragment of it.
+            assert self._KEY_1[:12] not in fingerprint
+
+    @pytest.mark.asyncio
+    async def test_a_seeded_api_key_host_reports_unchanged(self, tmp_path: Path) -> None:
+        """The reported bug end to end: the boot seed succeeds, so a turn no
+        longer reads as an identity change and nothing is retired."""
+
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+
+        assert await service.seed_sessions_baseline() is True
+
+        changed, live = await service.identity_changed_since_sessions()
+        assert changed is False
+        assert live != ""
+
+    @pytest.mark.asyncio
+    async def test_a_per_session_key_overlay_is_never_stamped(self, tmp_path: Path) -> None:
+        """A cron ``env`` block can hand a child its OWN ``KIRO_API_KEY``. The
+        gateway read fingerprints the ambient key, so stamping it would certify a
+        possibly different account as live and the sweep would spare it."""
+
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+        live = await service.current_identity_fingerprint(allow_cached=False)
+        assert live != ""
+
+        async def reader() -> str:
+            return live
+
+        for overlay in ({"KIRO_API_KEY": "kiro_other_key"}, {"kiro_api_key": ""}):
+            provider = SimpleNamespace(spawn_identity="", _extra_env=overlay)
+            await kp.stamp_spawn_identity(reader, provider, pre_spawn=live)
+            assert provider.spawn_identity == ""
+            assert kp.spawned_under(provider, live) is False
+
+        # The same overlay on the shared runtime a demuxed session rides.
+        runtime = SimpleNamespace(spawn_identity="", _extra_env={"KIRO_API_KEY": "x"})
+        demuxed = SimpleNamespace(_runtime=runtime)
+        await kp.stamp_spawn_identity(reader, runtime, pre_spawn=live)
+        assert runtime.spawn_identity == ""
+        assert kp.spawned_under(demuxed, live) is False
+
+        # A real ``AcpProvider`` keeps the overlay on the client it wraps, and
+        # that client's shared runtime may carry it instead.
+        wrapped = [
+            SimpleNamespace(
+                spawn_identity="", _client=SimpleNamespace(_extra_env={"KIRO_API_KEY": "b"})
+            ),
+            SimpleNamespace(
+                spawn_identity="", client=SimpleNamespace(_extra_env={"KIRO_API_KEY": "b"})
+            ),
+            SimpleNamespace(
+                spawn_identity="",
+                _client=SimpleNamespace(
+                    _extra_env={}, _runtime=SimpleNamespace(_extra_env={"KIRO_API_KEY": "b"})
+                ),
+            ),
+        ]
+        for provider in wrapped:
+            await kp.stamp_spawn_identity(reader, provider, pre_spawn=live)
+            assert provider.spawn_identity == ""
+            assert kp.spawned_under(provider, live) is False
+
+    @pytest.mark.asyncio
+    async def test_a_child_without_a_key_overlay_is_still_stamped(self, tmp_path: Path) -> None:
+        self._write_empty_store(tmp_path)
+        service = self._service(tmp_path, {"KIRO_API_KEY": self._KEY_1})
+        live = await service.current_identity_fingerprint(allow_cached=False)
+
+        async def reader() -> str:
+            return live
+
+        provider = SimpleNamespace(
+            spawn_identity="",
+            _extra_env={"OTHER": "1"},
+            _client=SimpleNamespace(
+                _extra_env={"OTHER": "1"}, _runtime=SimpleNamespace(_extra_env={})
+            ),
+        )
+        await kp.stamp_spawn_identity(reader, provider, pre_spawn=live)
+        assert provider.spawn_identity == live
+        assert kp.spawned_under(provider, live) is True
+
+    def test_a_stale_stamp_with_a_key_overlay_is_not_spared(self) -> None:
+        """Defence in depth: even a holder that somehow carries a stamp is not
+        spared while its overlay names the key."""
+
+        holder = SimpleNamespace(spawn_identity="fp", _extra_env={"KIRO_API_KEY": "b"})
+        assert kp.spawned_under(holder, "fp") is False
+
+    def test_the_overlay_guard_sees_the_real_acp_classes(self) -> None:
+        """Couples the guard to the REAL provider/client/runtime shapes, so a
+        rename of the attributes it reads fails here instead of failing open."""
+
+        from kiro_crew.acp.runtime import AcpRuntime
+        from kiro_crew.providers.acp import AcpProvider
+
+        overlay = {"KIRO_API_KEY": "b"}
+        assert kp.overlay_sets_api_key(AcpProvider(extra_env=overlay)) is True
+        assert kp.overlay_sets_api_key(AcpRuntime(extra_env=overlay)) is True
+        assert kp.overlay_sets_api_key(AcpProvider(extra_env={"OTHER": "1"})) is False
+        assert kp.overlay_sets_api_key(AcpRuntime()) is False
+
+    def test_a_key_rotation_alone_is_not_proof_of_a_wrong_account(self) -> None:
+        """KAS strips the key and authenticates from the store, so a key
+        rotation must not condemn its children; store and vault still prove."""
+
+        sep, vault = kp._API_KEY_FINGERPRINT_SEP, kp._CREW_VAULT_FINGERPRINT_SEP
+        assert kp.identity_stamp_mismatch(f"s1{sep}k1{vault}v1", f"s1{sep}k2{vault}v1") is False
+        assert kp.identity_stamp_mismatch(f"s1{sep}k1", f"s2{sep}k1") is True
+        assert kp.identity_stamp_mismatch(f"s1{sep}k1{vault}v1", f"s1{sep}k1{vault}v2") is True
+
+    def test_a_key_rotation_spares_a_key_stripping_child_only(self) -> None:
+        """A Crew-owned KAS relay (and every foreign backend) has the key
+        stripped at spawn, so a key rotation alone must not un-spare it -- that
+        would retire its idle parent and cancel running children. A kiro-cli
+        child and a cli-owned KAS relay ARE handed the key, so they keep the
+        whole-fingerprint spare."""
+
+        from kiro_crew.acp.runtime import AcpRuntime
+        from kiro_crew.providers.acp import AcpProvider
+
+        sep, vault = kp._API_KEY_FINGERPRINT_SEP, kp._CREW_VAULT_FINGERPRINT_SEP
+        stamp, rotated = f"s1{sep}k1{vault}v1", f"s1{sep}k2{vault}v1"
+
+        def holder(backend: object, **runtime: object) -> SimpleNamespace:
+            return SimpleNamespace(
+                spawn_identity=stamp,
+                _runtime=SimpleNamespace(acp_backend=backend, **runtime),
+            )
+
+        crew_owned_kas = holder("kas", _kas_host_auth=True)
+        assert kp.spawned_under(crew_owned_kas, rotated) is True
+        assert kp.spawned_under(holder("claude"), rotated) is True
+        assert kp.spawned_under(holder(""), rotated) is False
+        # A cli-owned KAS relay authenticated with the key, so a rotation un-spares it.
+        assert kp.spawned_under(holder("kas", _kas_host_auth=False), rotated) is False
+        # A KAS holder whose auth owner cannot be read keeps the stricter spare.
+        assert kp.spawned_under(holder("kas"), rotated) is False
+        # An unreadable backend keeps the stricter spare.
+        assert kp.spawned_under(SimpleNamespace(spawn_identity=stamp), rotated) is False
+        # A store or vault change still un-spares a key-stripping child.
+        assert kp.spawned_under(crew_owned_kas, f"s2{sep}k2{vault}v1") is False
+        assert kp.spawned_under(crew_owned_kas, f"s1{sep}k2{vault}v2") is False
+
+        # The backend and auth owner are read off the real classes.
+        crew_owned = AcpRuntime(acp_backend="kas")
+        crew_owned._kas_host_auth = True
+        assert kp.receives_kiro_cli_api_key(crew_owned) is False
+        assert kp.receives_kiro_cli_api_key(AcpRuntime(acp_backend="kas")) is True
+        assert kp.receives_kiro_cli_api_key(AcpRuntime()) is True
+        assert kp.receives_kiro_cli_api_key(AcpProvider(acp_backend="kas")) is True
+        assert kp.receives_kiro_cli_api_key(AcpProvider()) is True
 
 
 class TestStorePathSelection:
@@ -605,83 +1275,6 @@ class TestStorePathSelection:
         assert any(".aws/sso/cache" in s.replace("\\", "/") for s in sources)
 
 
-class _FakeSemaphore:
-    def __init__(self, locked: bool) -> None:
-        self._locked = locked
-
-    def locked(self) -> bool:
-        return self._locked
-
-
-class _FakeProvider:
-    def __init__(self, backend: str, *, sid: str = "") -> None:
-        self.backend = backend
-        self.client = SimpleNamespace(_session_id=sid, backend=backend)
-        self.cwd = ""
-        self.shutdown_calls = 0
-
-    @property
-    def uses_kiro_identity_store(self) -> bool:
-        from kiro_crew.acp.types import backends_retired_by_host_logout
-
-        return self.backend in backends_retired_by_host_logout()
-
-    def is_process_alive(self) -> bool:
-        return True
-
-    def is_alive(self) -> bool:
-        return True
-
-    async def shutdown(self) -> None:
-        self.shutdown_calls += 1
-
-
-class _DeadProvider(_FakeProvider):
-    """A provider whose child has already exited.
-
-    Drives the dead-provider removal branch in ``_get_or_create_impl``, the one
-    path that pops a session without going through ``_evict_stale_session``.
-    """
-
-    def is_process_alive(self) -> bool:
-        return False
-
-    def is_alive(self) -> bool:
-        return False
-
-
-class _FakeRuntime:
-    """Stands in for AcpRuntime in the retirement sweep."""
-
-    def __init__(
-        self, backend: str = "", *, active: bool = False, initializing: bool = False
-    ) -> None:
-        self._acp_backend = backend
-        self._active = active
-        self._initializing = initializing
-        self.killed = 0
-        self.kill_reasons: list[str] = []
-
-    @property
-    def uses_kiro_identity_store(self) -> bool:
-        from kiro_crew.acp.types import backends_retired_by_host_logout
-
-        return self._acp_backend in backends_retired_by_host_logout()
-
-    def has_active_sessions(self) -> bool:
-        return self._active
-
-    def has_active_or_initializing_sessions(self) -> bool:
-        return self._active or self._initializing
-
-    async def kill(self, *, expected: bool = False, reason: str = "") -> None:
-        # Mirrors the real signature: a double that refuses ``reason`` turns an
-        # attributed kill into a swallowed TypeError, which the sweep logs as a
-        # failed teardown instead of performing one.
-        self.killed += 1
-        self.kill_reasons.append(reason)
-
-
 class TestStoreRelocation:
     """A redirected store must report absent, not read a leftover default DB."""
 
@@ -781,1584 +1374,3 @@ class TestStoreRelocation:
         _write_store(kp.kiro_identity_store_path("linux", tmp_path, {}))
         service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
         assert await service.current_identity_fingerprint(allow_cached=False) != ""
-
-
-class TestProviderMembership:
-    def test_kiro_backend_is_a_member(self) -> None:
-        from kiro_crew.session import _provider_uses_kiro_identity_store
-
-        assert _provider_uses_kiro_identity_store(_FakeProvider(""))
-
-    def test_unknown_backend_fails_closed(self) -> None:
-        """An object that declares nothing must be left running, not recycled."""
-
-        from kiro_crew.session import _provider_uses_kiro_identity_store
-
-        assert not _provider_uses_kiro_identity_store(object())
-        assert not _provider_uses_kiro_identity_store(_FakeProvider("claude"))
-
-    def test_the_capability_is_declared_on_the_provider_abc(self) -> None:
-        """harness-parity H14: the session layer reads a declared capability.
-
-        Probing private shapes (``_client``, ``_acp_backend``) would silently
-        misclassify an adapted provider. The base declares it with a safe default
-        so a harness that never states the claim cannot inherit it.
-        """
-
-        from kiro_crew.providers.base import LLMProvider
-
-        assert "uses_kiro_identity_store" in vars(LLMProvider)
-        assert LLMProvider.uses_kiro_identity_store.fget(object()) is False  # type: ignore[attr-defined]
-
-    def test_a_non_declaring_provider_is_not_swept(self) -> None:
-        from kiro_crew.session import _provider_uses_kiro_identity_store
-
-        class _Bare:
-            pass
-
-        assert _provider_uses_kiro_identity_store(_Bare()) is False
-
-
-class TestIdentityChangePredicate:
-    @pytest.mark.asyncio
-    async def test_no_change_before_the_first_probe(self, tmp_path: Path) -> None:
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        assert await service.identity_changed_since_probe() is False
-
-    @pytest.mark.asyncio
-    async def test_change_detected_against_the_recorded_identity(self, tmp_path: Path) -> None:
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        # Stand in for a completed probe: the latch was written while the store
-        # named this account.
-        service._stamp_probe(await service.current_identity_fingerprint())
-        assert await service.identity_changed_since_probe() is False
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        _expire_identity_cache(service)
-        assert await service.identity_changed_since_probe() is True
-
-    @pytest.mark.asyncio
-    async def test_a_logout_before_the_first_turn_is_still_detected(self, tmp_path: Path) -> None:
-        """A child can exist before any turn (eager spawn / warm pool)."""
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-
-        con = sqlite3.connect(str(db))
-        with con:
-            con.execute("DELETE FROM auth_kv")
-            con.execute("DELETE FROM state")
-        con.close()
-        _expire_identity_cache(service)
-
-        changed, live = await service.identity_changed_since_sessions()
-        assert changed is True
-        assert live == ""
-
-    @pytest.mark.asyncio
-    async def test_an_unset_baseline_reports_changed(self, tmp_path: Path) -> None:
-        """ "We do not know" must not resolve to "the children match".
-
-        Readiness is probed a few seconds AFTER boot while a session can be
-        spawned eagerly before it. A logout landing in that gap would otherwise be
-        adopted as the starting point, and the pre-logout child would keep
-        answering as the previous account with nothing left to detect it.
-        """
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-
-        # No probe has run and nothing has been reconciled.
-        changed, live = await service.identity_changed_since_sessions()
-        assert changed is True
-        assert live != ""
-
-    @pytest.mark.asyncio
-    async def test_a_logout_before_the_delayed_probe_is_detected(self, tmp_path: Path) -> None:
-        """The eager-spawn-before-probe window GPT identified.
-
-        Child spawns under account A, the terminal logs out, and only THEN does
-        the delayed boot probe run. Seeding the baseline from that probe would
-        record the post-logout identity and strand the child.
-        """
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-
-        # Logout happens BEFORE the probe.
-        con = sqlite3.connect(str(db))
-        with con:
-            con.execute("DELETE FROM auth_kv")
-            con.execute("DELETE FROM state")
-        con.close()
-
-        # The delayed probe now runs and sees the signed-out store.
-        service._stamp_probe(await service.current_identity_fingerprint())
-
-        # The pre-logout child must still be swept.
-        changed, _ = await service.identity_changed_since_sessions()
-        assert changed is True
-
-    @pytest.mark.asyncio
-    async def test_probes_never_move_the_session_baseline(self, tmp_path: Path) -> None:
-        """Only a completed sweep advances it; a probe never does."""
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-        assert service._session_identity is None
-
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        service._stamp_probe(await service.current_identity_fingerprint())
-        assert service._session_identity is None
-
-        changed, live = await service.identity_changed_since_sessions()
-        assert changed is True
-        service.note_sessions_reconciled(live)
-        changed_after, _ = await service.identity_changed_since_sessions()
-        assert changed_after is False
-
-    @pytest.mark.asyncio
-    async def test_assume_ready_never_reports_a_change(self, tmp_path: Path) -> None:
-        service = kp.KiroPrerequisiteService(
-            home=tmp_path, environ={}, platform_name="linux", assume_ready=True
-        )
-        service._stamp_probe("something")
-        assert await service.identity_changed_since_probe() is False
-
-
-class TestBaselinesAreIndependent:
-    """The status consumer must not be able to consume the retirement signal."""
-
-    @pytest.mark.asyncio
-    async def test_a_status_reprobe_does_not_hide_the_change_from_retirement(
-        self, tmp_path: Path
-    ) -> None:
-        """The defect this pair of baselines exists to prevent.
-
-        With ONE shared baseline: logout -> a status poll re-probes and stamps the
-        new identity -> the next turn sees no change -> the stale child is never
-        retired. The dashboard polls every few seconds and turns are minutes
-        apart, so the poll essentially always wins that race.
-        """
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-        # Reconcile the retirement baseline explicitly -- an unset one now reports
-        # changed, so the sweep has to have happened before this scenario starts.
-        _, live0 = await service.identity_changed_since_sessions()
-        service.note_sessions_reconciled(live0)
-        assert await service.identity_changed_since_probe() is False
-        changed, _ = await service.identity_changed_since_sessions()
-        assert changed is False
-
-        # The account changes.
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        _expire_identity_cache(service)
-
-        # The status consumer observes it FIRST and advances its own baseline,
-        # exactly as an ordinary poll's re-probe does.
-        assert await service.identity_changed_since_probe() is True
-        service._stamp_probe(await service.current_identity_fingerprint())
-        assert await service.identity_changed_since_probe() is False
-
-        # Retirement must STILL see the change.
-        changed, live = await service.identity_changed_since_sessions()
-        assert changed is True
-        assert live != ""
-
-    @pytest.mark.asyncio
-    async def test_the_session_baseline_advances_only_when_told(self, tmp_path: Path) -> None:
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-        await service.identity_changed_since_sessions()  # adopt
-
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        changed, live = await service.identity_changed_since_sessions()
-        assert changed is True
-        # Re-asking without reconciling keeps reporting the change, so a failed
-        # retirement is retried rather than silently recorded as handled.
-        changed_again, _ = await service.identity_changed_since_sessions()
-        assert changed_again is True
-
-        service.note_sessions_reconciled(live)
-        changed_after, _ = await service.identity_changed_since_sessions()
-        assert changed_after is False
-
-    @pytest.mark.asyncio
-    async def test_an_unreconciled_baseline_never_reads_as_matching(self, tmp_path: Path) -> None:
-        """Repeated asks keep reporting changed until a sweep reconciles.
-
-        Replaces an earlier "first call adopts" behaviour, which was the hole GPT
-        found: adopting on first read trusts children that may predate the read.
-        """
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-
-        first, live = await service.identity_changed_since_sessions()
-        second, _ = await service.identity_changed_since_sessions()
-        assert first is True
-        assert second is True
-
-        service.note_sessions_reconciled(live)
-        after, _ = await service.identity_changed_since_sessions()
-        assert after is False
-
-
-class TestLatchNarrowingPolicy:
-    """Narrowing readiness is right for a sign-out and wrong for a switch."""
-
-    class _State:
-        def __init__(self, service: object, sessions: object) -> None:
-            self.kiro_prerequisite_service = service
-            self.sessions = sessions
-
-    class _Sessions:
-        def __init__(self, complete: bool = True) -> None:
-            self._complete = complete
-            self.calls = 0
-
-        async def retire_kiro_identity_sessions(self, fingerprint: str = ""):
-            self.calls += 1
-            return ([], self._complete)
-
-    @pytest.mark.asyncio
-    async def test_a_switch_to_a_valid_account_does_not_narrow_readiness(
-        self, tmp_path: Path
-    ) -> None:
-        """The stuck-readiness sequence.
-
-        A status poll observes the switch FIRST and stamps the new identity. If the
-        turn path then narrowed unconditionally, readiness would go false while the
-        fingerprints now MATCH -- so no ordinary poll re-probes and the card sits
-        at "not signed in" until someone presses Check again.
-        """
-
-        from kiro_crew.dashboard import chat_runner
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-
-        # Switch to another VALID account, then let a poll observe it first.
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        service._stamp_probe(await service.current_identity_fingerprint())
-        service._status = type(service._status)(  # type: ignore[misc]
-            **{**vars(service._status), "authenticated": True, "ready": True}
-        )
-
-        state = self._State(service, self._Sessions())
-        await chat_runner._retire_sessions_on_identity_change(state)
-
-        assert service._status.ready is True, "readiness was narrowed on a valid switch"
-
-    @pytest.mark.asyncio
-    async def test_an_actual_sign_out_does_narrow_readiness(self, tmp_path: Path) -> None:
-        from kiro_crew.dashboard import chat_runner
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-        service._status = type(service._status)(  # type: ignore[misc]
-            **{**vars(service._status), "authenticated": True, "ready": True}
-        )
-
-        con = sqlite3.connect(str(db))
-        with con:
-            con.execute("DELETE FROM auth_kv")
-            con.execute("DELETE FROM state")
-        con.close()
-        _expire_identity_cache(service)
-
-        state = self._State(service, self._Sessions())
-        await chat_runner._retire_sessions_on_identity_change(state)
-
-        assert service._status.ready is False
-        assert service._status.authenticated is False
-
-    @pytest.mark.asyncio
-    async def test_an_incomplete_sweep_leaves_the_change_pending(self, tmp_path: Path) -> None:
-        """A skipped holder must not be recorded as reconciled."""
-
-        from kiro_crew.dashboard import chat_runner
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        sessions = self._Sessions(complete=False)
-        state = self._State(service, sessions)
-
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 1
-
-        # Still pending, so the next turn tries again.
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 2
-
-    @pytest.mark.asyncio
-    async def test_a_complete_sweep_reconciles_once(self, tmp_path: Path) -> None:
-        from kiro_crew.dashboard import chat_runner
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        service._stamp_probe(await service.current_identity_fingerprint())
-
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        sessions = self._Sessions(complete=True)
-        state = self._State(service, sessions)
-
-        await chat_runner._retire_sessions_on_identity_change(state)
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 1
-
-    @pytest.mark.asyncio
-    async def test_an_unreadable_store_is_never_reconciled(self, tmp_path: Path) -> None:
-        """ "Cannot tell" must not become the accepted steady state.
-
-        Reconciling an empty fingerprint would make every LATER account switch
-        compare equal to "" and go undetected, while children keep running. Staying
-        unreconciled re-sweeps each turn, bounding how long a child can outlive the
-        account it loaded to one turn.
-        """
-
-        from kiro_crew.dashboard import chat_runner
-
-        # No store on disk at all: the fingerprint is absent.
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        sessions = self._Sessions(complete=True)
-        state = self._State(service, sessions)
-
-        await chat_runner._retire_sessions_on_identity_change(state)
-        await chat_runner._retire_sessions_on_identity_change(state)
-        await chat_runner._retire_sessions_on_identity_change(state)
-
-        # Every turn re-sweeps rather than accepting the unreadable state.
-        assert sessions.calls == 3
-        assert service._session_identity is None
-
-
-class TestReturnToBaselineAfterIncompleteSweep:
-    """A switch BACK to the reconciled account must still retire interim holders.
-
-    The baseline advances only on a COMPLETE sweep. So after an A->B sweep left a
-    busy session behind, returning to A compares equal to the baseline and the
-    identity check would see no change -- while successors that registered under B
-    keep answering on B's credential, with no auth failure to report it.
-    """
-
-    class _State:
-        def __init__(self, service: object, sessions: object) -> None:
-            self.kiro_prerequisite_service = service
-            self.sessions = sessions
-
-    class _Sessions:
-        """Mirrors the lifecycle service's pending-fingerprint bookkeeping."""
-
-        def __init__(self, complete: bool = True) -> None:
-            self._complete = complete
-            self.calls = 0
-            self.swept_with: list[str] = []
-            self.pending_identity_sweep_fingerprint = ""
-
-        async def retire_kiro_identity_sessions(self, fingerprint: str = ""):
-            self.calls += 1
-            self.swept_with.append(fingerprint)
-            # Kept while a sweep stays incomplete; cleared the moment one completes.
-            self.pending_identity_sweep_fingerprint = "" if self._complete else fingerprint
-            return ([], self._complete)
-
-    @pytest.mark.asyncio
-    async def test_returning_to_the_baseline_account_still_sweeps(self, tmp_path: Path) -> None:
-        from kiro_crew.dashboard import chat_runner
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        fp_a = await service.current_identity_fingerprint()
-        service._stamp_probe(fp_a)
-        # Children already match A.
-        service.note_sessions_reconciled(fp_a)
-
-        # A -> B, and the sweep cannot finish (a busy session survives it).
-        _write_store(db, start_url="https://personal.awsapps.com/start")
-        sessions = self._Sessions(complete=False)
-        state = self._State(service, sessions)
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 1
-        # Incomplete, so the baseline stayed at A while B is outstanding.
-        assert service._session_identity == fp_a
-        pending_b = sessions.pending_identity_sweep_fingerprint
-        assert pending_b and pending_b != fp_a
-
-        # Back to A. The baseline now MATCHES the live account, so the identity
-        # predicate reports no change -- the B successors are reachable only
-        # through the outstanding sweep.
-        _write_store(db)
-        assert (await service.identity_changed_since_sessions())[0] is False
-
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 2, "the B holders were left serving under B"
-        # The retry is captured afresh under the account now in use, not B's.
-        assert sessions.swept_with[-1] != pending_b
-
-    @pytest.mark.asyncio
-    async def test_an_incomplete_sweep_retries_even_for_the_live_account(
-        self, tmp_path: Path
-    ) -> None:
-        """Completion is the stop condition, not a fingerprint match.
-
-        This trigger sweeps with the LIVE fingerprint while the baseline equals it,
-        so the pending fingerprint an incomplete one records is the live account's.
-        Stopping on that equality would abandon the retry with holders still to
-        retire; only a sweep that COMPLETES clears the pending fingerprint.
-        """
-
-        from kiro_crew.dashboard import chat_runner
-
-        db = kp.kiro_identity_store_path("linux", tmp_path, {})
-        _write_store(db)
-        service = kp.KiroPrerequisiteService(home=tmp_path, environ={}, platform_name="linux")
-        fp_a = await service.current_identity_fingerprint()
-        service._stamp_probe(fp_a)
-        service.note_sessions_reconciled(fp_a)
-
-        # An outstanding sweep FOR the live account, still incomplete.
-        sessions = self._Sessions(complete=False)
-        sessions.pending_identity_sweep_fingerprint = fp_a
-        state = self._State(service, sessions)
-
-        await chat_runner._retire_sessions_on_identity_change(state)
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 2, "an incomplete sweep stopped retrying"
-
-        # A sweep that completes clears the pending fingerprint, which stops it.
-        sessions._complete = True
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 3
-        assert sessions.pending_identity_sweep_fingerprint == ""
-        await chat_runner._retire_sessions_on_identity_change(state)
-        assert sessions.calls == 3, "it kept sweeping after completion"
-
-
-class TestRetirementCoverage:
-    """Every holder of a kiro child must be reachable by retirement."""
-
-    @staticmethod
-    def _manager():
-        from kiro_crew.config import KiroCrewConfig
-        from kiro_crew.session import SessionManager
-
-        # pool_size 0 so construction never pre-spawns; the pool is populated
-        # explicitly by the test that cares about it.
-        return SessionManager(KiroCrewConfig())
-
-    @staticmethod
-    def _stored_sid(smap, key: str) -> str:
-        """Read the stored sid WITHOUT ``get``'s transcript-file check.
-
-        ``SessionMap.get`` stats ``<sid>.json`` and prunes an entry whose
-        transcript is missing, which would answer "no pointer" for a reason this
-        test is not about. The question here is only whether the retirement
-        dropped the pointer, so read the entry.
-        """
-
-        from kiro_crew.session_map import canonical_key
-
-        entry = smap._session_map._data.get(canonical_key(key)) or {}
-        return entry.get("sid", "")
-
-    @staticmethod
-    def _session(provider: object, *, busy: bool = False):
-        from kiro_crew.session import _Session
-
-        sess = _Session(provider=provider)  # type: ignore[arg-type]
-        if busy:
-            # Retirement reads semaphore.locked(); drain the permit to say "busy".
-            sess.semaphore._value = 0  # type: ignore[attr-defined]
-        return sess
-
-    @pytest.mark.asyncio
-    async def test_idle_kiro_sessions_are_retired_and_others_left_alone(self) -> None:
-        smap = self._manager()
-        kiro = _FakeProvider("")
-        claude = _FakeProvider("claude")
-        smap._sessions["kiro-key"] = self._session(kiro)
-        smap._sessions["claude-key"] = self._session(claude)
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == ["kiro-key"]
-        assert complete is True
-        assert "kiro-key" not in smap._sessions
-        assert "claude-key" in smap._sessions
-        assert kiro.shutdown_calls == 1
-        assert claude.shutdown_calls == 0
-
-    @pytest.mark.asyncio
-    async def test_a_busy_kiro_session_is_not_retired(self) -> None:
-        smap = self._manager()
-        busy = _FakeProvider("")
-        smap._sessions["busy"] = self._session(busy, busy=True)
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == []
-        # A skipped session means the change is NOT reconciled.
-        assert complete is False
-        assert "busy" in smap._sessions
-        assert busy.shutdown_calls == 0
-
-    @pytest.mark.asyncio
-    async def test_selection_and_unregistration_are_one_atomic_step(self) -> None:
-        """A session busy at DECISION time is never unregistered or shut down.
-
-        The TOCTOU GPT flagged is closed by doing the idle check and the
-        unregistration in a single lock hold. The acquire path takes the
-        semaphore OUTSIDE the lock and then validates registration INSIDE it, so
-        the two orderings are both safe: acquire-first is visible here as
-        ``locked()`` and skipped, while pop-first is caught by that validation
-        (covered by the next test).
-        """
-
-        smap = self._manager()
-        idle = _FakeProvider("")
-        busy = _FakeProvider("")
-        smap._sessions["idle"] = self._session(idle)
-        smap._sessions["busy"] = self._session(busy, busy=True)
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == ["idle"]
-        assert complete is False  # the busy one was left running
-        assert "busy" in smap._sessions
-        assert busy.shutdown_calls == 0
-
-    @pytest.mark.asyncio
-    async def test_a_turn_can_never_stream_on_a_retired_provider(self) -> None:
-        """The other half of the race: a turn that acquires AFTER the pop.
-
-        It re-validates registration under the same lock, finds the entry gone,
-        releases its semaphore and reports invalid -- so the caller cold starts a
-        replacement on the current account instead of streaming on the retired
-        child. Without that, retirement would be racing every in-flight acquire.
-        """
-
-        smap = self._manager()
-        provider = _FakeProvider("")
-        sess = self._session(provider)
-        smap._sessions["key"] = sess
-
-        await smap.retire_kiro_identity_sessions()
-        assert "key" not in smap._sessions
-
-        # A turn that had not yet acquired when the sweep ran now tries to.
-        still_valid = await smap._reacquire_and_validate("key", sess)
-
-        assert still_valid is False
-        # The contract is that an invalid result has ALREADY released the
-        # semaphore; a leaked permit would deadlock the key forever.
-        assert not sess.semaphore.locked()
-
-    @pytest.mark.asyncio
-    async def test_pooled_kiro_providers_are_discarded(self) -> None:
-        """A warm provider spawned pre-change would otherwise be handed to a
-        brand-new session, running it as the previous account."""
-
-        smap = self._manager()
-        pooled_kiro = _FakeProvider("")
-        pooled_other = _FakeProvider("claude")
-        smap._warm_pool.put_nowait((pooled_kiro, 0.0))
-        smap._warm_pool.put_nowait((pooled_other, 0.0))
-
-        await smap.retire_kiro_identity_sessions()
-
-        assert pooled_kiro.shutdown_calls == 1
-        assert pooled_other.shutdown_calls == 0
-        # The non-kiro entry is put back, not dropped on the floor.
-        assert smap._warm_pool.qsize() == 1
-        survivor, _ = smap._warm_pool.get_nowait()
-        assert survivor is pooled_other
-
-    @pytest.mark.asyncio
-    async def test_kiro_subagent_runtimes_are_retired(self) -> None:
-        smap = self._manager()
-
-        kiro_runtime = _FakeRuntime("")
-        other_runtime = _FakeRuntime("claude")
-        smap._subagent_runtimes["parent-kiro"] = kiro_runtime  # type: ignore[assignment]
-        smap._subagent_runtimes["parent-other"] = other_runtime  # type: ignore[assignment]
-
-        await smap.retire_kiro_identity_sessions()
-
-        assert kiro_runtime.killed == 1
-        assert kiro_runtime.kill_reasons == ["subagent runtime released"]
-        assert other_runtime.killed == 0
-        assert "parent-other" in smap._subagent_runtimes
-
-    @pytest.mark.asyncio
-    async def test_the_shared_background_runtime_is_retired(self) -> None:
-        """One process serves all background work and outlives every session, so
-        the session sweep cannot reach it."""
-
-        smap = self._manager()
-
-        bg = _FakeRuntime("")
-        smap._bg_runtime = bg  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert bg.killed == 1
-        assert smap._bg_runtime is None
-        assert complete is True
-
-    @pytest.mark.asyncio
-    async def test_a_non_kiro_background_runtime_is_left_alone(self) -> None:
-        smap = self._manager()
-
-        bg = _FakeRuntime("claude")
-        smap._bg_runtime = bg  # type: ignore[assignment]
-
-        await smap.retire_kiro_identity_sessions()
-
-        assert bg.killed == 0
-        assert smap._bg_runtime is bg
-
-    @pytest.mark.asyncio
-    async def test_an_active_background_runtime_is_spared_and_reported_incomplete(self) -> None:
-        """One process serves every background caller, so killing it mid-flight
-        drops work belonging to callers unrelated to the account change.
-
-        Same principle as a busy session: spare it, report the sweep incomplete so
-        the change stays pending, and retire it once it drains.
-        """
-
-        smap = self._manager()
-        bg = _FakeRuntime("", active=True)
-        smap._bg_runtime = bg  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert bg.killed == 0
-        assert smap._bg_runtime is bg
-        assert complete is False
-
-    @pytest.mark.asyncio
-    async def test_an_active_subagent_runtime_is_spared_and_reported_incomplete(self) -> None:
-        smap = self._manager()
-        busy_runtime = _FakeRuntime("", active=True)
-        smap._subagent_runtimes["parent"] = busy_runtime  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert busy_runtime.killed == 0
-        assert "parent" in smap._subagent_runtimes
-        assert complete is False
-
-    @pytest.mark.asyncio
-    async def test_a_provider_mid_start_makes_the_sweep_incomplete(self) -> None:
-        """A provider between start() and registration is in none of the maps.
-
-        It already holds whatever the store said when it spawned, so reconciling
-        while it is in flight would advance the baseline over it and leave it
-        reusable under the previous account once it registers.
-        """
-
-        smap = self._manager()
-        smap._starting_pids.add(4242)
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == []
-        assert complete is False
-
-    @pytest.mark.asyncio
-    async def test_no_in_flight_start_allows_a_complete_sweep(self) -> None:
-        smap = self._manager()
-        assert not smap._starting_pids
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert complete is True
-
-    @pytest.mark.asyncio
-    async def test_an_in_flight_runtime_spawn_makes_the_sweep_incomplete(self) -> None:
-        """`get_subagent_runtime` holds the per-parent lock across its spawn.
-
-        A runtime being created right now is in no map at all, while it already
-        holds whatever the store said when it started. Reconciling would advance
-        the baseline over it and leave later subagents running as the previous
-        account.
-        """
-
-        smap = self._manager()
-        lock = asyncio.Lock()
-        await lock.acquire()
-        smap._subagent_runtime_locks["parent"] = lock
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-        assert complete is False
-
-        lock.release()
-        _, complete_after = await smap.retire_kiro_identity_sessions()
-        assert complete_after is True
-
-    @pytest.mark.asyncio
-    async def test_an_idle_runtime_lock_does_not_block_reconciliation(self) -> None:
-        """A lock that merely EXISTS is not a spawn in flight."""
-
-        smap = self._manager()
-        smap._subagent_runtime_locks["parent"] = asyncio.Lock()
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-        assert complete is True
-
-    @pytest.mark.asyncio
-    async def test_a_busy_session_is_marked_so_its_next_turn_cannot_reuse_it(self) -> None:
-        """Skipping a busy session protected its turn but not the NEXT one.
-
-        `get_or_create` would simply wait for that turn's semaphore and hand the
-        same old-account provider to the following turn. Marking it makes the
-        post-semaphore re-validate report invalid, so the caller's existing
-        stale-provider path evicts and cold starts -- no blocking, no refusal.
-        """
-
-        smap = self._manager()
-        busy = _FakeProvider("")
-        sess = self._session(busy, busy=True)
-        smap._sessions["busy"] = sess
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert complete is False
-        assert sess.retire_on_identity_change is True
-        assert busy.shutdown_calls == 0, "the in-flight turn must not be killed"
-
-        # The next turn releases and re-validates: the mark makes it invalid.
-        sess.semaphore.release()
-        still_valid = await smap._reacquire_and_validate("busy", sess)
-        assert still_valid is False
-        assert not sess.semaphore.locked(), "an invalid result must release the permit"
-
-    @pytest.mark.asyncio
-    async def test_an_unmarked_session_still_validates_normally(self) -> None:
-        """The mark must not make every re-validate fail."""
-
-        smap = self._manager()
-        provider = _FakeProvider("claude")
-        sess = self._session(provider)
-        smap._sessions["ok"] = sess
-
-        assert sess.retire_on_identity_change is False
-        still_valid = await smap._reacquire_and_validate("ok", sess)
-        assert still_valid is True
-        smap.release("ok")
-
-    @pytest.mark.asyncio
-    async def test_a_runtime_surviving_the_sweep_reports_incomplete(self) -> None:
-        """Post-condition, not a window enumeration.
-
-        A companion spawn that COMPLETES between the runtime snapshot and the final
-        lock check is in neither -- its lock is released and it was not in the
-        snapshot. Asserting that no kiro-backed runtime is LEFT catches anything
-        installed while we swept, whatever the timing.
-        """
-
-        smap = self._manager()
-        survivor = _FakeRuntime("")
-        smap._subagent_runtimes["parent"] = survivor  # type: ignore[assignment]
-
-        # Simulate a release that does not actually remove it (equivalently: a
-        # runtime installed after the snapshot was taken).
-        async def _noop_release(key: str) -> None:
-            return None
-
-        smap.release_subagent_runtime = _noop_release  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert "parent" in smap._subagent_runtimes
-        assert complete is False, "a surviving kiro-backed runtime must not reconcile"
-
-    @pytest.mark.asyncio
-    async def test_a_non_kiro_runtime_surviving_is_fine(self) -> None:
-        """The post-condition must only count runtimes this sweep owns."""
-
-        smap = self._manager()
-        smap._subagent_runtimes["parent"] = _FakeRuntime("claude")  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert complete is True
-
-    @pytest.mark.asyncio
-    async def test_an_initializing_session_protects_a_runtime(self) -> None:
-        """`create_session` registers its queue OUTSIDE the runtime lock.
-
-        So a session whose `session/new` is in flight is invisible to
-        `has_active_sessions()`, and killing the runtime under it surfaces as
-        `AcpRuntimeDead` on work the user never connected to an account change.
-        The stale-runtime recycle path tolerates that window because a respawn
-        loop backstops it; this sweep has no such backstop, so it must not.
-        """
-
-        smap = self._manager()
-        initializing = _FakeRuntime("", initializing=True)
-        smap._subagent_runtimes["parent"] = initializing  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert initializing.killed == 0
-        assert "parent" in smap._subagent_runtimes
-        assert complete is False
-
-    @pytest.mark.asyncio
-    async def test_an_initializing_session_protects_the_background_runtime(self) -> None:
-        smap = self._manager()
-        bg = _FakeRuntime("", initializing=True)
-        smap._bg_runtime = bg  # type: ignore[assignment]
-
-        _, complete = await smap.retire_kiro_identity_sessions()
-
-        assert bg.killed == 0
-        assert smap._bg_runtime is bg
-        assert complete is False
-
-    @pytest.mark.asyncio
-    async def test_the_runtime_predicate_counts_inits_in_flight(self) -> None:
-        """Pins the real AcpRuntime property, not just the test double."""
-
-        from kiro_crew.acp.runtime import AcpRuntime
-
-        runtime = AcpRuntime.__new__(AcpRuntime)
-        runtime._session_queues = {}  # type: ignore[attr-defined]
-        runtime._session_inits_in_flight = 0  # type: ignore[attr-defined]
-        assert runtime.has_active_sessions() is False
-        assert runtime.has_active_or_initializing_sessions() is False
-
-        runtime._session_inits_in_flight = 1  # type: ignore[attr-defined]
-        # The old predicate still reports idle -- that is the window.
-        assert runtime.has_active_sessions() is False
-        assert runtime.has_active_or_initializing_sessions() is True
-
-    @pytest.mark.asyncio
-    async def test_two_concurrent_sweeps_do_not_deadlock(self) -> None:
-        """The hold-and-wait deadlock two unserialized sweeps would reach.
-
-        Each sweep drains all four cold-start permits one at a time. With a third
-        party holding one (a warm-pool fill or eager spawn at boot -- routine),
-        sweep A can hold 3 waiting for its 4th while sweep B holds 1 waiting for
-        its 2nd: four taken, none free, and neither releases until it reaches four.
-        The releases live in a `finally` that never runs, and the wait is un-timed,
-        so both turns hang forever AND every later cold start blocks on a drained
-        semaphore.
-
-        Two concurrent sweeps are the common boot case, not an exotic one: with
-        `_session_identity` unset, every in-flight turn sees a change at once.
-        """
-
-        smap = self._manager()
-        # Hold ALL permits first, so both sweeps are queued as waiters before any
-        # permit is free. This is what makes them interleave: `acquire()` has a
-        # non-yielding fast path, so a lone sweep would otherwise grab every free
-        # permit atomically and never give a peer the chance to take one.
-        for _ in range(_MAX_COLD_STARTS_FOR_TEST):
-            await smap._start_sem.acquire()
-
-        first = asyncio.create_task(smap.retire_kiro_identity_sessions())
-        second = asyncio.create_task(smap.retire_kiro_identity_sessions())
-        await asyncio.sleep(0.05)
-        assert not first.done() and not second.done()
-
-        # Hand the permits back one at a time. Unserialized, the two sweeps
-        # alternate as FIFO waiters -- each takes one and re-queues behind the
-        # other -- until all four are split between them with none free and neither
-        # at its required four. Their `finally` releases never run, so both hang.
-        for _ in range(_MAX_COLD_STARTS_FOR_TEST):
-            smap._start_sem.release()
-            await asyncio.sleep(0)
-
-        results = await asyncio.wait_for(asyncio.gather(first, second), timeout=5.0)
-        assert all(complete for _, complete in results)
-        # Every permit returned, so later cold starts are unaffected.
-        assert smap._start_sem._value == _MAX_COLD_STARTS_FOR_TEST
-
-    @pytest.mark.asyncio
-    async def test_the_barrier_waits_for_an_in_flight_cold_start(self) -> None:
-        """The scan must be authoritative, so it WAITS for every permit.
-
-        A partial barrier is not enough: reporting "incomplete" defers the baseline
-        but does not stop the current turn, so an eager session spawned under the
-        previous account would still win registration and serve it.
-        """
-
-        smap = self._manager()
-        await smap._start_sem.acquire()
-
-        task = asyncio.create_task(smap.retire_kiro_identity_sessions())
-        await asyncio.sleep(0.05)
-        assert not task.done(), "the sweep scanned while a cold start was in flight"
-
-        smap._start_sem.release()
-        retired, complete = await asyncio.wait_for(task, timeout=2.0)
-        assert complete is True
-        assert retired == []
-
-    @pytest.mark.asyncio
-    async def test_the_barrier_releases_every_permit_it_took(self) -> None:
-        """A leaked permit would shrink cold-start concurrency for the process."""
-
-        smap = self._manager()
-        before = smap._start_sem._value
-        await smap.retire_kiro_identity_sessions()
-        assert smap._start_sem._value == before
-
-    @pytest.mark.asyncio
-    async def test_permits_are_released_even_when_the_scan_raises(self) -> None:
-        """The release must be in a `finally`, or one failure degrades the process."""
-
-        smap = self._manager()
-        before = smap._start_sem._value
-
-        class _Boom(Exception):
-            pass
-
-        async def _explode() -> bool:
-            raise _Boom()
-
-        smap._retire_kiro_warm_pool = _explode  # type: ignore[assignment]
-        with pytest.raises(_Boom):
-            await smap.retire_kiro_identity_sessions()
-        assert smap._start_sem._value == before
-
-    @pytest.mark.asyncio
-    async def test_the_pool_drain_holds_the_fill_lock(self) -> None:
-        """An in-flight fill must not land a pre-change child behind the sweep.
-
-        Without the lock the sweep reads an empty queue, the outstanding spawn
-        completes, and a provider authenticated as the old account is enqueued for
-        a later session to claim.
-        """
-
-        smap = self._manager()
-        observed: list[bool] = []
-
-        original = smap._retire_kiro_warm_pool
-
-        async def watched() -> bool:
-            observed.append(smap._pool_fill_lock.locked())
-            return await original()
-
-        smap._retire_kiro_warm_pool = watched  # type: ignore[assignment]
-
-        # Hold the fill lock as an in-flight fill would, and confirm the drain
-        # cannot proceed until it is released.
-        await smap._pool_fill_lock.acquire()
-        task = asyncio.create_task(smap.retire_kiro_identity_sessions())
-        await asyncio.sleep(0.05)
-        assert not task.done(), "drain proceeded while a fill held the lock"
-        smap._pool_fill_lock.release()
-        await task
-
-        assert observed, "the drain never ran"
-
-    @pytest.mark.asyncio
-    async def test_a_retired_session_loses_its_native_conversation_pointer(self) -> None:
-        """The successor must not ``session/load`` the previous account's history.
-
-        An extended-thinking model's stored thinking blocks carry a provider
-        signature bound to the conversation they were minted in. Reload one under
-        a different account and the provider rejects the whole request with
-        "Invalid `signature` in `thinking` block ... bound to a different
-        conversation", and it repeats on every later turn because the cold start
-        keeps resuming the same sid. Clearing the pointer is what makes the
-        replacement child start a NEW native conversation.
-        """
-
-        smap = self._manager()
-        kiro = _FakeProvider("")
-        claude = _FakeProvider("claude")
-        smap._sessions["kiro-key"] = self._session(kiro)
-        smap._sessions["claude-key"] = self._session(claude)
-        smap._session_map.set("kiro-key", "sid-old-account")
-        smap._session_map.set("claude-key", "sid-untouched")
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == ["kiro-key"]
-        assert complete is True
-        assert self._stored_sid(smap, "kiro-key") == ""
-        # Only the pointer is dropped: the conversation stays recoverable.
-        assert smap._session_map.get_discarded_sid("kiro-key") == "sid-old-account"
-        # A provider that does not read the kiro identity store is untouched.
-        assert self._stored_sid(smap, "claude-key") == "sid-untouched"
-
-    @pytest.mark.asyncio
-    async def test_a_busy_session_loses_its_pointer_during_the_sweep(self) -> None:
-        """The running child keeps its in-process sid, but the map drops it now."""
-
-        smap = self._manager()
-        busy = _FakeProvider("")
-        session = self._session(busy, busy=True)
-        smap._sessions["busy"] = session
-        smap._session_map.set("busy", "sid-old-account")
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == []
-        assert complete is False
-        assert session.retire_on_identity_change is True
-        assert self._stored_sid(smap, "busy") == ""
-        assert smap._session_map.get_discarded_sid("busy") == "sid-old-account"
-        assert "busy" in smap._sessions
-        assert busy.shutdown_calls == 0
-
-    @pytest.mark.asyncio
-    async def test_retry_sweep_retires_the_successor_too(self) -> None:
-        """A retry retires every Kiro session, successors included.
-
-        Registration order cannot say which account a session authenticated
-        under: a cold start that began before the switch registers after it, so
-        sparing "whatever registered later" hands the old account a session the
-        sweep was asked to retire. Retiring the successor costs it a fresh native
-        conversation; its previous pointer stays recoverable.
-        """
-
-        smap = self._manager()
-        old = _FakeProvider("")
-        old_session = self._session(old, busy=True)
-        smap._sessions["shared"] = old_session
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-old-account")
-
-        _, complete = await smap.retire_kiro_identity_sessions("fp-b")
-        assert complete is False
-        assert self._stored_sid(smap, "shared") == ""
-        assert smap._session_map.get_discarded_sid("shared") == "sid-old-account"
-
-        old_session.semaphore.release()
-        await smap._evict_stale_session("shared", old_session)
-        successor = self._session(_FakeProvider("", sid="sid-new-account"))
-        smap._sessions["shared"] = successor
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-new-account")
-
-        retired, complete = await smap.retire_kiro_identity_sessions("fp-b")
-
-        assert retired == ["shared"]
-        assert complete is True
-        assert "shared" not in smap._sessions
-        assert self._stored_sid(smap, "shared") == ""
-        assert smap._session_map.get_discarded_sid("shared") == "sid-new-account"
-
-    @pytest.mark.asyncio
-    async def test_retry_sweep_still_clears_a_marked_busy_holder(self) -> None:
-        """A busy holder keeps its mark and loses its pointer on every retry."""
-
-        smap = self._manager()
-        old = _FakeProvider("")
-        old_session = self._session(old, busy=True)
-        smap._sessions["shared"] = old_session
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-old-account")
-
-        _, complete = await smap.retire_kiro_identity_sessions("fp-b")
-        assert complete is False
-
-        # Model the marked generation trying to republish before the retry.
-        smap._session_map.set("shared", "sid-old-account")
-        _, complete = await smap.retire_kiro_identity_sessions("fp-b")
-
-        assert complete is False
-        assert old_session.retire_on_identity_change is True
-        assert self._stored_sid(smap, "shared") == ""
-        assert smap._session_map.get_discarded_sid("shared") == "sid-old-account"
-
-    @pytest.mark.asyncio
-    async def test_complete_sweep_releases_the_pending_marker(self) -> None:
-        """A completed sweep clears the marker, so a later change is not a retry."""
-
-        smap = self._manager()
-        first = self._session(_FakeProvider(""))
-        smap._sessions["shared"] = first
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-first-account")
-
-        _, complete = await smap.retire_kiro_identity_sessions("fp-b")
-        assert complete is True
-
-        second = self._session(_FakeProvider(""))
-        smap._sessions["shared"] = second
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-second-account")
-
-        retired, complete = await smap.retire_kiro_identity_sessions("fp-c")
-
-        assert retired == ["shared"]
-        assert complete is True
-        assert self._stored_sid(smap, "shared") == ""
-        assert smap._session_map.get_discarded_sid("shared") == "sid-second-account"
-
-    @pytest.mark.asyncio
-    async def test_a_second_switch_during_an_incomplete_sweep_retires_the_successor(
-        self,
-    ) -> None:
-        """A -> B with a busy A-session, then B -> C before it goes idle.
-
-        The consumer baseline is still A, so the sweep re-fires. The successor
-        registered under B holds a B-account conversation that account C would
-        reject exactly like the original bug, so it is retired rather than spared
-        for having registered later.
-        """
-
-        smap = self._manager()
-        busy_a = self._session(_FakeProvider(""), busy=True)
-        smap._sessions["busy"] = busy_a
-        smap._advance_session_generation("busy")
-        smap._session_map.set("busy", "sid-account-a")
-        smap._sessions["shared"] = self._session(_FakeProvider(""))
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-account-a")
-
-        retired, complete = await smap.retire_kiro_identity_sessions("fp-b")
-        assert retired == ["shared"]
-        assert complete is False
-
-        successor_b = self._session(_FakeProvider("", sid="sid-account-b"))
-        smap._sessions["shared"] = successor_b
-        smap._advance_session_generation("shared")
-        smap._session_map.set("shared", "sid-account-b")
-
-        retired, complete = await smap.retire_kiro_identity_sessions("fp-c")
-
-        assert retired == ["shared"]
-        assert complete is False
-        assert "shared" not in smap._sessions
-        assert self._stored_sid(smap, "shared") == ""
-        assert smap._session_map.get_discarded_sid("shared") == "sid-account-b"
-        assert busy_a.retire_on_identity_change is True
-        assert self._stored_sid(smap, "busy") == ""
-
-    @pytest.mark.asyncio
-    async def test_a_sweep_back_to_the_baseline_retires_the_interim_holders(self) -> None:
-        """A -> B incomplete, back to A, then a genuine A -> B.
-
-        The return to A is itself swept, because an outstanding change is its own
-        trigger and the reconciled baseline says nothing about it. A session
-        started under A in between therefore loses its A-account pointer at the
-        later genuine A -> B, instead of surviving as something the sweep decided
-        was already on the new account.
-        """
-
-        smap = self._manager()
-        busy_a = self._session(_FakeProvider(""), busy=True)
-        smap._sessions["busy"] = busy_a
-        smap._advance_session_generation("busy")
-        smap._session_map.set("busy", "sid-account-a")
-
-        # A -> B, left incomplete by the busy A-session: fence armed for B.
-        _, complete = await smap.retire_kiro_identity_sessions("fp-b")
-        assert complete is False
-
-        # Back to A. The consumer baseline never advanced, so this fires only
-        # because an outstanding sweep is a trigger in its own right.
-        await smap.retire_kiro_identity_sessions("fp-a")
-
-        # A session started under A AFTER that return.
-        later = self._session(_FakeProvider("", sid="sid-account-a"))
-        smap._sessions["later"] = later
-        smap._advance_session_generation("later")
-        smap._session_map.set("later", "sid-account-a")
-
-        # The genuine A -> B. `later` holds an A conversation and must lose it.
-        retired, _ = await smap.retire_kiro_identity_sessions("fp-b")
-
-        assert "later" in retired, "an A-account holder escaped the sweep"
-        assert self._stored_sid(smap, "later") == ""
-        assert smap._session_map.get_discarded_sid("later") == "sid-account-a"
-
-    @pytest.mark.asyncio
-    async def test_an_older_sweep_does_not_retire_a_newer_sweeps_fence(self) -> None:
-        """A -> B whose shutdowns straddle a B -> C sweep.
-
-        The shutdown loop runs outside ``identity_sweep_lock``, so a second
-        account change can acquire that lock and recapture the fence while the
-        first sweep is still awaiting a child's exit. The first sweep's own work
-        succeeded while the pending change belongs to C: clearing the fence
-        would drop the successor generations C recorded, and reporting complete
-        would let the caller reconcile its baseline with C's busy holder still
-        serving turns on B's credential -- and with no pending fingerprint left
-        for the next turn to retry from.
-        """
-
-        released = asyncio.Event()
-        entered = asyncio.Event()
-
-        class _SlowProvider(_FakeProvider):
-            async def shutdown(self) -> None:
-                self.shutdown_calls += 1
-                entered.set()
-                await released.wait()
-
-        smap = self._manager()
-        smap._sessions["doomed"] = self._session(_SlowProvider(""))
-        smap._advance_session_generation("doomed")
-        smap._session_map.set("doomed", "sid-account-a")
-
-        first = asyncio.create_task(smap.retire_kiro_identity_sessions("fp-b"))
-        await asyncio.wait_for(entered.wait(), timeout=5.0)
-
-        # A busy successor registers under B while that shutdown is pending, then
-        # the account moves on to C.
-        busy_b = self._session(_SlowProvider(""), busy=True)
-        smap._sessions["busy"] = busy_b
-        smap._advance_session_generation("busy")
-        smap._session_map.set("busy", "sid-account-b")
-
-        _, second_complete = await smap.retire_kiro_identity_sessions("fp-c")
-        assert second_complete is False
-        assert smap.pending_identity_sweep_fingerprint == "fp-c"
-
-        released.set()
-        retired, first_complete = await asyncio.wait_for(first, timeout=5.0)
-
-        assert retired == ["doomed"]
-        assert first_complete is False, "an older sweep claimed a newer change was handled"
-        assert smap.pending_identity_sweep_fingerprint == "fp-c"
-        assert busy_b.retire_on_identity_change is True
-
-    @pytest.mark.asyncio
-    async def test_an_ordinary_stale_eviction_keeps_the_conversation(self) -> None:
-        """Only an identity change invalidates the sid.
-
-        A dead or unresponsive provider is replaced under the SAME account, where
-        resuming the native conversation is the behaviour that preserves it.
-        """
-
-        smap = self._manager()
-        dead = _FakeProvider("")
-        session = self._session(dead)
-        smap._sessions["stale"] = session
-        smap._session_map.set("stale", "sid-same-account")
-
-        await smap._evict_stale_session("stale", session)
-
-        assert self._stored_sid(smap, "stale") == "sid-same-account"
-        assert smap._session_map.get_discarded_sid("stale") == ""
-
-    @pytest.mark.asyncio
-    async def test_a_marked_session_whose_process_died_first_still_loses_its_pointer(
-        self,
-    ) -> None:
-        """A child that dies after the sweep cannot restore its old pointer."""
-
-        smap = self._manager()
-        dead = _DeadProvider("")
-        session = self._session(dead, busy=True)
-        smap._sessions["marked"] = session
-        smap._session_map.set("marked", "sid-old-account")
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == []
-        assert complete is False
-        assert session.retire_on_identity_change is True
-        assert self._stored_sid(smap, "marked") == ""
-
-        # No factory: the cold start after the removal raises, which keeps this
-        # test on the removal itself rather than on provider construction.
-        smap._provider_factory = None
-        with pytest.raises(RuntimeError, match="No provider factory"):
-            await smap.get_or_create("marked")
-
-        assert "marked" not in smap._sessions
-        assert self._stored_sid(smap, "marked") == ""
-        assert smap._session_map.get_discarded_sid("marked") == "sid-old-account"
-
-    @pytest.mark.asyncio
-    async def test_an_unmarked_dead_session_keeps_its_conversation(self) -> None:
-        """A dead provider outside the changed identity store keeps its pointer."""
-
-        smap = self._manager()
-        dead = _DeadProvider("claude")
-        smap._sessions["stale"] = self._session(dead)
-        smap._session_map.set("stale", "sid-same-account")
-
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == []
-        assert complete is True
-        assert self._stored_sid(smap, "stale") == "sid-same-account"
-
-        smap._provider_factory = None
-        with pytest.raises(RuntimeError, match="No provider factory"):
-            await smap.get_or_create("stale")
-
-        assert self._stored_sid(smap, "stale") == "sid-same-account"
-        assert smap._session_map.get_discarded_sid("stale") == ""
-
-    @pytest.mark.asyncio
-    async def test_shutdown_skips_marked_sid_but_persists_unmarked_sid(self, monkeypatch) -> None:
-        """Shutdown must not undo the sweep's old-account pointer clear."""
-
-        smap = self._manager()
-        marked = _FakeProvider("", sid="sid-old-account")
-        marked_session = self._session(marked, busy=True)
-        smap._sessions["marked"] = marked_session
-        smap._session_map.set("marked", "sid-old-account")
-
-        await smap.retire_kiro_identity_sessions()
-        assert marked_session.retire_on_identity_change is True
-        assert self._stored_sid(smap, "marked") == ""
-
-        unmarked = _FakeProvider("", sid="sid-current-account")
-        smap._sessions["unmarked"] = self._session(unmarked)
-        monkeypatch.setattr("kiro_crew.session._load_acp_provider_type", lambda: _FakeProvider)
-
-        await smap.close_all()
-
-        assert self._stored_sid(smap, "marked") == ""
-        assert smap._session_map.get_discarded_sid("marked") == "sid-old-account"
-        assert self._stored_sid(smap, "unmarked") == "sid-current-account"
-
-    def test_marked_replay_settlement_consumes_lease_without_republishing_sid(self) -> None:
-        """A landed replay cannot restore the identity sweep's discarded sid."""
-
-        from kiro_crew.providers.acp import AcpProvider
-
-        smap = self._manager()
-        provider = object.__new__(AcpProvider)
-        provider._client = SimpleNamespace(
-            _session_id="sid-old-account-replayed",
-            _work_dir="/old-workspace",
-            backend="kiro",
-        )
-        session = self._session(provider)
-        session.provider_switch_replay = True
-        session.retire_on_identity_change = True
-        smap._sessions["marked"] = session
-        smap._session_map.set("marked", "sid-old-account")
-        smap._session_map.clear_sid("marked")
-
-        assert smap.commit_provider_switch_replay_sid("marked") is True
-        assert session.provider_switch_replay is False
-        assert self._stored_sid(smap, "marked") == ""
-        assert smap._session_map.get_discarded_sid("marked") == "sid-old-account"
-
-    def test_every_sid_writer_is_registration_or_identity_fenced(self) -> None:
-        """A future non-registration writer must respect the identity marker."""
-
-        import ast
-
-        source_root = Path(__file__).parents[1] / "src" / "kiro_crew"
-        registration_paths = {
-            ("session_allocation.py", "seed_conversation"),
-            ("session_allocation.py", "_get_or_create_impl"),
-        }
-        writers: list[str] = []
-        offenders: list[str] = []
-
-        def is_session_map_set(node: ast.AST) -> bool:
-            return (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "set"
-                and isinstance(node.func.value, ast.Attribute)
-                and node.func.value.attr == "_session_map"
-            )
-
-        def has_prior_identity_guard(
-            call: ast.Call,
-            parents: dict[ast.AST, ast.AST],
-        ) -> bool:
-            child: ast.AST = call
-            while child in parents:
-                parent = parents[child]
-                for _, value in ast.iter_fields(parent):
-                    if not isinstance(value, list) or child not in value:
-                        continue
-                    for sibling in value[: value.index(child)]:
-                        if not isinstance(sibling, ast.If):
-                            continue
-                        tests_identity_marker = (
-                            isinstance(sibling.test, ast.Attribute)
-                            and sibling.test.attr == "retire_on_identity_change"
-                        )
-                        exits_writer_path = bool(sibling.body) and isinstance(
-                            sibling.body[-1], (ast.Continue, ast.Return)
-                        )
-                        if tests_identity_marker and exits_writer_path:
-                            return True
-                child = parent
-            return False
-
-        for path in sorted(source_root.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            parents = {
-                child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
-            }
-            for call in (node for node in ast.walk(tree) if is_session_map_set(node)):
-                assert isinstance(call, ast.Call)
-                function: ast.AST = call
-                while function in parents and not isinstance(
-                    function, (ast.FunctionDef, ast.AsyncFunctionDef)
-                ):
-                    function = parents[function]
-                function_name = getattr(function, "name", "<module>")
-                relative_path = path.relative_to(source_root).as_posix()
-                location = f"{relative_path}:{call.lineno}:{function_name}"
-                writers.append(location)
-                if (relative_path, function_name) in registration_paths:
-                    continue
-                if not has_prior_identity_guard(call, parents):
-                    offenders.append(location)
-
-        assert len(writers) >= 7, f"session-map writer scan found only {writers}"
-        assert (
-            not offenders
-        ), "session-map sid writer lacks a retire_on_identity_change fence: " + ", ".join(offenders)
-
-
-class TestWarmPoolIdentityFence:
-    """A pooled process that authenticated as the previous account is unusable.
-
-    Pool claims take no cold-start permit, so the sweep's permit barrier cannot
-    hold one back, and the pool teardown cannot run inside that barrier without
-    deadlocking on the fill lock. The claim-time age check is the fence.
-    """
-
-    @staticmethod
-    def _manager():
-        from kiro_crew.config import KiroCrewConfig
-        from kiro_crew.session import SessionManager
-
-        return SessionManager(KiroCrewConfig())
-
-    @staticmethod
-    def _record_discards(smap) -> list:
-        discarded: list = []
-
-        async def _discard(provider, context: str) -> None:
-            discarded.append((provider, context))
-
-        smap._discard_pool_provider = _discard  # type: ignore[method-assign]
-        smap._schedule_replenish = lambda: None  # type: ignore[method-assign]
-        return discarded
-
-    @pytest.mark.asyncio
-    async def test_a_provider_queued_before_the_switch_is_discarded_not_claimed(self) -> None:
-        smap = self._manager()
-        discarded = self._record_discards(smap)
-        stale = _FakeProvider("")
-        smap._warm_pool.put_nowait((stale, time.monotonic()))
-
-        # The sweep stamps the pool before any key becomes claimable.
-        smap._mark_identity_epoch()
-
-        assert await smap._drain_and_claim(None) is None
-        assert [p for p, _ in discarded] == [stale]
-
-    @pytest.mark.asyncio
-    async def test_a_pool_start_spanning_the_switch_is_discarded(self) -> None:
-        """The enqueue timestamp records when startup began, not when it ended."""
-
-        smap = self._manager()
-        discarded = self._record_discards(smap)
-        started = asyncio.Event()
-        finish_start = asyncio.Event()
-
-        class _StraddlingProvider(_FakeProvider):
-            async def start(self) -> None:
-                started.set()
-                await finish_start.wait()
-
-        provider = _StraddlingProvider("")
-        smap._pool._pool_size = 1
-        smap._provider_factory = lambda *args, **kwargs: provider
-
-        fill = asyncio.create_task(smap._fill_warm_pool())
-        await started.wait()
-        smap._mark_identity_epoch()
-        finish_start.set()
-        await fill
-
-        assert await smap._drain_and_claim(None) is None
-        assert [item for item, _ in discarded] == [provider]
-
-    @pytest.mark.asyncio
-    async def test_a_provider_spawned_after_the_switch_is_still_claimable(self) -> None:
-        """The fence is an age check, not a pool-wide off switch.
-
-        The replenish that follows a sweep spawns under the NEW account, and
-        refusing those would leave the pool permanently useless.
-        """
-
-        smap = self._manager()
-        discarded = self._record_discards(smap)
-        smap._mark_identity_epoch()
-        fresh = _FakeProvider("")
-        # Strictly after the epoch: the stamp is taken before this spawn.
-        smap._warm_pool.put_nowait((fresh, smap._pool._pool_identity_epoch + 0.001))
-
-        assert await smap._drain_and_claim(None) is fresh
-        assert discarded == []
-
-    @pytest.mark.asyncio
-    async def test_a_provider_on_another_identity_store_is_not_fenced(self) -> None:
-        """Only providers that read the Kiro identity store are affected."""
-
-        smap = self._manager()
-        discarded = self._record_discards(smap)
-        other = _FakeProvider("claude")
-        assert other.uses_kiro_identity_store is False
-        smap._warm_pool.put_nowait((other, time.monotonic()))
-
-        smap._mark_identity_epoch()
-
-        assert await smap._drain_and_claim(None) is other
-        assert discarded == []
-
-    @pytest.mark.asyncio
-    async def test_an_untouched_pool_claims_normally(self) -> None:
-        """With no sweep having run there is no epoch, so nothing is fenced."""
-
-        smap = self._manager()
-        discarded = self._record_discards(smap)
-        provider = _FakeProvider("")
-        smap._warm_pool.put_nowait((provider, time.monotonic()))
-
-        assert smap._pool._pool_identity_epoch == 0.0
-        assert await smap._drain_and_claim(None) is provider
-        assert discarded == []
-
-    @pytest.mark.asyncio
-    async def test_the_sweep_stamps_the_pool_even_when_it_retires_nothing(self) -> None:
-        """The stamp is the sweep's first act, not a consequence of a retirement.
-
-        A sweep that finds no session to pop still has a pool full of previous
-        account processes, and the claim path is what must learn about it.
-        """
-
-        smap = self._manager()
-        retired, complete = await smap.retire_kiro_identity_sessions()
-
-        assert retired == []
-        assert complete is True
-        assert smap._pool._pool_identity_epoch > 0.0

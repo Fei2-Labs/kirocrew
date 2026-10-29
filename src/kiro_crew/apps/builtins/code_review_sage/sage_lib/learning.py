@@ -8,8 +8,9 @@ ruleset?) is the LLM's job in the `learn-from-sage` skill. This module is the
 deterministic backbone for the file-centric flow:
 
 - pattern <-> markdown (the on-disk pattern format),
-- ``stage_learning`` — cheap append of a new learning to the **candidate** file
-  (``learned-patterns.candidate.md``); no model call, admissible-sources only,
+- ``stage_learning`` — cheap staging of a new learning in the **candidate** file
+  (``learned-patterns.candidate.md``); an exact equivalent bumps a ``seen``
+  count instead of appending; no model call, admissible-sources only,
 - ``consolidate_apply`` — atomically replace ``learned-patterns.md`` with the
   AI-merged result and clear the candidate (the AI does the one-shot merge),
 - ``learned-patterns.md`` is the ONLY file reviews load as heuristics; the
@@ -34,7 +35,7 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 _APP_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,7 @@ if _APP_ROOT not in sys.path:  # allow `python3 sage_lib/learning.py` (run as sc
 from sage_lib import store  # noqa: E402
 
 from kiro_crew import platform_compat  # noqa: E402
+from kiro_crew.slugs import refused_slug_char  # noqa: E402
 
 # Learning is mined ONLY from human-validated, ground-truth signals.
 ADMISSIBLE_SOURCES = {"fix_introduce", "human_comment", "design_outcome", "import"}
@@ -53,6 +55,11 @@ DEFAULT_NAMESPACE = "default"
 # A valid user namespace token: lowercase alphanumeric start/end, with hyphens,
 # dots and underscores in between, 2-64 chars. Deliberately excludes path
 # separators and ".." so a namespace name can NEVER escape the namespaces/ dir.
+# ASCII on purpose: the name IS the directory, so it must mean one thing on every
+# platform and filesystem. A refusal names the offending character
+# (`create_namespace`'s `char`) so the dashboard can explain the rule in the
+# user's own language. The class is `kiro_crew.slugs.SLUG_CHARS`, which tests
+# pin it to.
 _NS_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}[a-z0-9]$")
 
 
@@ -116,7 +123,7 @@ def _candidate_lock(root: Path | None, namespace: str | None):
         if lock is None:
             lock = _CANDIDATE_LOCKS[key] = threading.Lock()
     ns_dir = _namespace_dir(namespace, root)
-    ns_dir.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(ns_dir)
     # A dedicated lock file, never the catalog itself: locking the file being
     # atomically REPLACED would hold a lock on an inode the rename discards.
     lock_path = ns_dir / "candidate.md.lock"
@@ -172,17 +179,31 @@ def list_namespaces(root: Path | None = None) -> list[str]:
 
 def create_namespace(name: str, root: Path | None = None) -> dict:
     """Create a new namespace with an empty learnings file."""
+    typed = name
     name = name.strip().lower().replace(" ", "-")
     if not _is_valid_ns_name(name):
-        return {"ok": False, "error": f"invalid namespace name: {name!r} (use lowercase alphanumeric, hyphens, dots, 2-64 chars)"}
+        # `code` + `char` are what the dashboard renders, in the user's language;
+        # the English `error` is for logs and catalog-less callers. `char` comes
+        # from what the user typed, before lowercasing, so it is a character they
+        # will recognize -- not a lowercase stand-in that can look like an
+        # allowed Latin letter.
+        return {
+            "ok": False,
+            "code": "invalid_namespace_name",
+            "char": refused_slug_char(typed),
+            "error": (
+                f"invalid namespace name: {name!r} (use lowercase a-z, 0-9, '.', '_' "
+                "or '-', starting and ending with a letter or digit, 2-64 chars)"
+            ),
+        }
     if name == DEFAULT_NAMESPACE:
         return {"ok": False, "error": "'default' namespace already exists (it maps to common/)"}
     ns_path = _namespace_dir(name, root)
     if (ns_path / "learned-patterns.md").exists():
         return {"ok": False, "error": f"namespace {name!r} already exists"}
-    ns_path.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(ns_path)
     header = f"# Learned patterns — namespace: {name}\n\n"
-    (ns_path / "learned-patterns.md").write_text(header, encoding="utf-8")
+    store.atomic_write_text(ns_path / "learned-patterns.md", header)
     return {"ok": True, "namespace": name, "path": str(ns_path)}
 
 
@@ -223,32 +244,66 @@ def pattern_id(title: str, scope: str) -> str:
     return hashlib.sha256(f"{title.strip().lower()}|{scope}".encode()).hexdigest()[:16]
 
 
+def equivalence_key(title: str, scope: str, impact: str, guidance: str) -> str:
+    """Exact content equivalence, stricter than ``pattern_id``.
+
+    Two entries coalesce on staging only when title, scope, impact AND guidance
+    all match after whitespace normalisation. The same identity with a changed
+    guidance or impact is a different key, so both versions reach consolidation
+    and nothing silently picks a winner. Like ``pattern_id`` it is recomputed on
+    every load and never read from the file, so a hand edit changes it."""
+    parts = [" ".join(str(v or "").split()) for v in (title, scope, impact, guidance)]
+    return hashlib.sha256("\x1f".join(parts).encode()).hexdigest()[:16]
+
+
 def render_pattern(p: dict) -> str:
     """Render a pattern as guidance-only markdown. A learned pattern is a single
     high-level, code-agnostic review heuristic: the title + guidance are the
     whole rule. If a rule needs a symptom anecdote or a concrete example to be
-    understood, the guidance is underspecified — sharpen it instead."""
+    understood, the guidance is underspecified — sharpen it instead.
+
+    ``seen`` and ``last_seen_at`` are written only when they carry information:
+    a single sighting renders exactly as it did before recurrence existed, so an
+    old file round-trips byte for byte."""
+    seen = int(p.get("seen") or 1)
+    last = str(p.get("last_seen_at") or "").strip()
     return (
         f"### {p['title']} <!-- scope:{p.get('scope', 'common')} -->"
         f" <!-- impact:{p.get('impact', 'medium')} -->"
-        f" <!-- added:{p.get('added_at', '')} -->\n"
-        f"{' '.join(p.get('guidance', '').split())}\n"
+        f" <!-- added:{p.get('added_at', '')} -->"
+        + (f" <!-- seen:{seen} -->" if seen > 1 else "")
+        + (f" <!-- last:{last} -->" if last else "")
+        + f"\n{' '.join(p.get('guidance', '').split())}\n"
     )
 
 
+# `seen` is bounded to nine digits so a crafted count can never reach int()'s
+# huge-string limit; a longer one fails the optional group like any other
+# unrecognised comment.
+_SEEN_MAX = 999_999_999
+_ISO_STAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
+# The two metadata labels of the retired pattern format, in their label form
+# (`**Symptom ...:**`, `**Example:**`), nothing broader: guidance that merely
+# opens with the bold word "Example" is guidance.
+_LEGACY_META = re.compile(r"\*\*(?:Symptom\b[^*\n]*|Example):\*\*")
 _HDR = re.compile(
     r"###\s+(?P<title>.*?)\s*(?:<!--\s*scope:(?P<scope>\w+)\s*-->)?"
     r"\s*(?:<!--\s*impact:(?P<impact>\w+)\s*-->)?"
-    r"\s*(?:<!--\s*added:(?P<added>[^>]*?)\s*-->)?\s*$"
+    r"\s*(?:<!--\s*added:(?P<added>[^>]*?)\s*-->)?"
+    r"\s*(?:<!--\s*seen:(?P<seen>\d{1,9})\s*-->)?"
+    r"\s*(?:<!--\s*last:(?P<last>[^>]*?)\s*-->)?\s*$"
 )
 
 
 def parse_patterns(md: str) -> list[dict]:
     """Parse a learned-patterns(.candidate).md file into pattern dicts (tolerant).
 
-    Patterns are guidance-only. Any legacy ``**Symptom ...:**`` / ``**Example:**``
-    lines from the old format are ignored (they start with ``**``), so existing
-    files keep parsing cleanly until the next consolidation rewrites them lean."""
+    Patterns are guidance-only. Legacy ``**Symptom ...:**`` / ``**Example:**``
+    lines from the old format are ignored, so existing files keep parsing
+    cleanly until the next consolidation rewrites them lean. Only those two
+    labels are skipped: guidance that merely opens in bold is guidance, and
+    dropping it would also make two different rules look equivalent."""
     out: list[dict] = []
     for block in re.split(r"^(?=### )", md or "", flags=re.M):
         if not block.startswith("### "):
@@ -262,15 +317,22 @@ def parse_patterns(md: str) -> list[dict]:
         guidance_lines: list[str] = []
         for ln in lines[1:]:
             s = ln.strip()
-            # Accumulate every non-empty, non-metadata line as guidance (matches
-            # the JS parser); legacy Symptom/Example lines (prefixed with **) are
-            # skipped, so the round-trip stays lossless for multi-line guidance.
-            if s and not s.startswith("**"):
+            # Accumulate every non-empty, non-metadata line as guidance; legacy
+            # Symptom/Example lines are skipped, so the round-trip stays lossless
+            # for multi-line guidance.
+            if s and not _LEGACY_META.match(s):
                 guidance_lines.append(s)
+        impact = m.group("impact") or "medium"
+        guidance = " ".join(guidance_lines)
         out.append({
             "id": pattern_id(title, scope), "title": title, "scope": scope,
-            "impact": m.group("impact") or "medium", "added_at": (m.group("added") or "").strip(),
-            "guidance": " ".join(guidance_lines),
+            "impact": impact, "added_at": (m.group("added") or "").strip(),
+            "guidance": guidance,
+            "key": equivalence_key(title, scope, impact, guidance),
+            # Absent means one sighting, so files written before counts existed
+            # parse unchanged.
+            "seen": max(1, int(m.group("seen") or 1)),
+            "last_seen_at": (m.group("last") or "").strip(),
         })
     return out
 
@@ -302,7 +364,7 @@ def list_patterns_for_review(root: Path | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(path.parent)
     store.atomic_write_text(path, text)
 
 
@@ -330,17 +392,52 @@ _CANDIDATE_HEADER = (
 
 def stage_learning(pattern: dict, source: str, root: Path | None = None,
                    namespace: str | None = None) -> dict:
-    """Append one new learning to the candidate file. Admissible-sources only
+    """Stage one new learning in the candidate file. Admissible-sources only
     (no self-poisoning). Deterministic; the AI merge happens later in
-    ``consolidate_apply``."""
+    ``consolidate_apply``.
+
+    An exact equivalent of an entry already staged (same ``equivalence_key``)
+    bumps that entry's ``seen`` count and ``last`` date instead of appending, and
+    only its header line is rewritten. Anything else, including the same title
+    and scope with different guidance or impact, is appended as its own entry."""
     if source not in ADMISSIBLE_SOURCES:
         raise ValueError(
             f"inadmissible learning source {source!r}; allowed: {sorted(ADMISSIBLE_SOURCES)} "
             "(the reviewer never learns from its own unpublished findings)")
     store.ensure_layout(root)
     ns_dir = _namespace_dir(namespace, root)
-    ns_dir.mkdir(parents=True, exist_ok=True)
+    store.mkdir_refusing_links(ns_dir)
     p = _normalize_pattern(pattern)
+    # Recurrence is the store's to count, never the caller's to claim: the pattern
+    # JSON is worker-written, and a supplied count would either inflate one
+    # sighting or render outside the header grammar.
+    p.pop("seen", None)
+    p.pop("last_seen_at", None)
+    # `added_at` is rendered into the header verbatim, so a worker-written value
+    # could smuggle its own `seen`/`last` comments in. Keep only a plain ISO-8601
+    # date or timestamp; anything else is replaced by the staging time.
+    if not _ISO_STAMP.fullmatch(str(p.get("added_at") or "")):
+        p["added_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # One learning must stage as exactly one entry. A title or guidance that
+    # renders its own `### ` heading would land as a second block whose header
+    # (and `seen` count) the worker wrote, so it is refused, not stored.
+    # Title, scope and impact are written into the header line verbatim, so any
+    # line break there (`\r`, `\u2028` and friends, not only `\n`) would start a
+    # line that a text-mode reader takes as a heading of its own.
+    for field in ("title", "scope", "impact"):
+        value = str(p.get(field) or "")
+        if "".join(value.splitlines()) != value:
+            raise ValueError(f"a learning's {field} must be a single line")
+    staged = parse_patterns(render_pattern(p))
+    if len(staged) != 1:
+        raise ValueError(
+            "a learning must stage as exactly one pattern; its title or guidance "
+            "starts a new '### ' heading")
+    # A fresh learning is one sighting with no later date. Anything else means
+    # caller text reached the header's own comments, so refuse rather than store
+    # a count the store did not make.
+    if staged[0]["seen"] != 1 or staged[0]["last_seen_at"]:
+        raise ValueError("a learning's text must not carry seen/last comments")
     cf = candidate_file(root, namespace)
     # Read and write under one lock: see _candidate_lock.
     with _candidate_lock(root, namespace):
@@ -350,15 +447,68 @@ def stage_learning(pattern: dict, source: str, root: Path | None = None,
         # instead of dereferencing it into the catalog. Reading once also removes the
         # window where the file changes between the emptiness test and the append.
         existing = (store.read_text_nolink(cf, ns_dir) or "") if cf.exists() else ""
-        if existing.strip():
-            body = (existing.rstrip() + "\n\n"
-                    + render_pattern(p) + "\n")
-        else:
-            body = _CANDIDATE_HEADER + render_pattern(p) + "\n"
+        body = _coalesce(existing, p) if existing.strip() else None
+        coalesced = body is not None
+        if body is None:
+            if existing.strip():
+                body = (existing.rstrip() + "\n\n"
+                        + render_pattern(p) + "\n")
+            else:
+                body = _CANDIDATE_HEADER + render_pattern(p) + "\n"
         _atomic_write(cf, body)
     return {"ok": True, "path": str(cf), "source": source,
             "namespace": namespace or DEFAULT_NAMESPACE,
-            "staged": len(parse_patterns(body))}
+            "staged": len(parse_patterns(body)), "coalesced": coalesced}
+
+
+def _coalesce(existing: str, p: dict) -> str | None:
+    """``existing`` with the first exact equivalent of ``p`` counted once more.
+
+    Returns None when nothing is equivalent. The new pattern's key is taken from
+    what it would look like ON DISK (rendered, then parsed), so the comparison
+    sees the same normalisation a later load applies. Only the matching block's
+    header line changes; every other byte, including hand curation, is kept."""
+    rendered = parse_patterns(render_pattern(p))
+    # Coalesce only what survives the round trip intact. A count bump stores
+    # nothing of the new learning, so if parsing would lose or reshape any of
+    # its text (a title or impact the header grammar cannot hold), appending is
+    # the only choice that loses nothing. `stage_learning` has already refused a
+    # learning that renders as more than one block.
+    if len(rendered) != 1:
+        return None
+    new = rendered[0]
+    if (new["title"] != str(p.get("title") or "").strip()
+            or new["guidance"] != " ".join(str(p.get("guidance") or "").split())
+            or new["scope"] != p["scope"] or new["impact"] != p["impact"]):
+        return None
+    blocks = re.split(r"^(?=### )", existing, flags=re.M)
+    for i, block in enumerate(blocks):
+        parsed = parse_patterns(block) if block.startswith("### ") else []
+        if not parsed or parsed[0]["key"] != new["key"]:
+            continue
+        hit = parsed[0]
+        # Saturate at the header grammar's nine-digit bound so the count can
+        # never render as a comment the parser folds into the title.
+        hit["seen"] = min(hit["seen"] + 1, _SEEN_MAX)
+        hit["last_seen_at"] = new["added_at"]
+        # Split on the same line boundaries the parser used (`splitlines`), so a
+        # hand-edited block with CR or other line endings keeps its body intact.
+        first, *rest = block.splitlines(keepends=True)
+        ending = first[len(first.splitlines()[0]):]
+        blocks[i] = render_pattern(hit).split("\n", 1)[0] + ending + "".join(rest)
+        return "".join(blocks)
+    return None
+
+
+def candidate_snapshot(root: Path | None = None,
+                       namespace: str | None = None) -> list[dict]:
+    """What a consolidation may later clear: each entry's key and count.
+
+    Taken before the merge worker is dispatched and handed back to
+    ``clear_candidate`` (via ``consolidate_apply``), which subtracts these counts,
+    so a sighting staged while the merge runs is kept."""
+    return [{"id": p["id"], "key": p["key"], "seen": p["seen"]}
+            for p in list_candidate(root, namespace)]
 
 
 def list_candidate(root: Path | None = None, namespace: str | None = None) -> list[dict]:
@@ -376,7 +526,7 @@ def candidate_count(root: Path | None = None, namespace: str | None = None) -> i
 
 
 def clear_candidate(root: Path | None = None, namespace: str | None = None,
-                    only_ids: Sequence[str] | None = None) -> bool:
+                    only_ids: Sequence[str | Mapping[str, object]] | None = None) -> bool:
     """Clear staged candidates.
 
     With ``only_ids``, keep every entry the snapshot did not account for instead of
@@ -387,10 +537,16 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
     leaves the newer staging intact, which is cheaper and less disruptive than
     serialising every review behind the merge.
 
-    ``only_ids`` is a MULTISET, not a set: pass one element per snapshotted entry.
-    Ids are a content hash of title|scope, and staging appends without deduping, so
-    duplicates are expected and the count is what distinguishes "the two entries
-    the merge saw" from "a third staged behind its back".
+    ``only_ids`` is a MULTISET, not a set. Each element is either a
+    ``candidate_snapshot`` entry (``{"key", "seen"}``) or a bare id:
+
+    - A snapshot entry subtracts its ``seen`` count from the entries with that
+      equivalence key. An entry keeps ``seen_now - seen_at_snapshot`` and goes
+      only when that reaches zero, so a recurrence staged after dispatch survives.
+    - A bare id accounts for exactly one occurrence of that identity, as before
+      counts existed. Ids hash only title|scope, so the SAME id can carry several
+      entries; the count is what distinguishes "the two the merge saw" from "a
+      third staged behind its back".
 
     With ``only_ids=None`` the whole file goes, which is what an explicit
     "discard the staged learnings" action means.
@@ -408,29 +564,43 @@ def clear_candidate(root: Path | None = None, namespace: str | None = None,
         if only_ids is None:
             cf.unlink()
             return True
-        # Remove at most as many entries per id as the snapshot held, oldest
-        # first. Ids are a content hash of title|scope (`pattern_id`) and
-        # `add_candidate` appends without deduping, so the SAME id can legitimately
-        # appear more than once — a later review re-learning the same lesson for the
-        # same scope produces a second entry. A set-membership filter deleted every
-        # occurrence, including one staged after the snapshot that the merge never
-        # saw, which is the loss this whole `only_ids` path exists to prevent.
-        # Entries are appended, so consuming the budget in file order keeps the
-        # newest duplicate.
-        budget: collections.Counter[str] = collections.Counter(
-            str(i) for i in only_ids)
+        # Subtract at most what the snapshot accounted for, oldest entry first.
+        # A set-membership filter deleted every occurrence, including one staged
+        # after the snapshot that the merge never saw, which is the loss this
+        # whole `only_ids` path exists to prevent. Entries are appended, so
+        # consuming the budget in file order keeps the newest duplicate.
+        id_budget: collections.Counter[str] = collections.Counter()
+        key_budget: collections.Counter[str] = collections.Counter()
+        for item in only_ids:
+            if isinstance(item, Mapping):
+                key = str(item.get("key") or "")
+                try:
+                    count = int(str(item.get("seen") or 1))
+                except ValueError:
+                    count = 1
+                if key:
+                    key_budget[key] += max(1, count)
+            else:
+                id_budget[str(item)] += 1
         kept = []
         # Same guard as the staging read: a worker can swap this catalog for a
         # symlink, and re-serializing the target would publish it to the
         # dashboard-readable candidate file.
         for p in parse_patterns(
                 store.read_text_nolink(cf, _namespace_dir(namespace, root)) or ""):
-            # An entry with no id has no budget entry, so it is kept — the safe
-            # direction when the snapshot cannot account for it.
+            # An entry neither budget names is kept — the safe direction when the
+            # snapshot cannot account for it.
+            seen = int(p["seen"])
+            take = min(seen, key_budget[p["key"]])
+            key_budget[p["key"]] -= take
+            seen -= take
             pid = str(p.get("id") or "")
-            if budget.get(pid, 0) > 0:
-                budget[pid] -= 1
+            if seen and id_budget[pid] > 0:
+                id_budget[pid] -= 1
+                seen -= 1
+            if seen <= 0:
                 continue
+            p["seen"] = seen
             kept.append(p)
         if not kept:
             cf.unlink()
@@ -450,8 +620,20 @@ def _record_consolidation(consolidated: int, namespace: str | None = None,
     entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "consolidated": consolidated, "namespace": ns}
     path = _consolidations_log(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as fh:
+    store.mkdir_refusing_links(path.parent)
+    # An APPEND, not a staged replace. ``atomic_write_text`` would have to read
+    # the whole log, add this line and rename a fresh file over it, and two
+    # consolidations racing that sequence each publish a file missing the other's
+    # entry, so a completed consolidation disappears from the log. ``O_APPEND``
+    # keeps each record's write indivisible instead.
+    #
+    # The chain is resolved ONCE, inside the helper, and the leaf is opened
+    # relative to that pinned parent. Opening the full path by name here would
+    # re-resolve every ancestor after the guard above had already passed, so a
+    # component swapped in between would redirect the append; and the leaf's own
+    # name needs a check of its own either way, because an append FOLLOWS a link
+    # at the final component and writes into whatever it points at.
+    with os.fdopen(store.open_append_nolink(path), "a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry) + "\n")
 
 
@@ -472,10 +654,11 @@ def _redact(text: str) -> str:
 
 def consolidate_apply(merged_md: str, root: Path | None = None,
                       namespace: str | None = None,
-                      candidate_ids: Sequence[str] | None = None) -> dict:
+                      candidate_ids: Sequence[str | Mapping[str, object]] | None = None,
+                      ) -> dict:
     """Atomically replace learned-patterns.md with the AI-merged content, then
-    clear the candidate. Refuses to write empty content (never wipes the ruleset
-    on a bad merge).
+    clear the candidate. Refuses to write empty, unparseable or duplicate-ID
+    content (never wipes the ruleset on a bad merge).
 
     The content is redacted here rather than at the caller because THIS is the
     persistence chokepoint. ``merged_md`` is written by the merge worker, which
@@ -488,6 +671,9 @@ def consolidate_apply(merged_md: str, root: Path | None = None,
     """
     if not merged_md or not merged_md.strip():
         return {"ok": False, "error": "merged content is empty; refusing to overwrite learned-patterns.md"}
+    # Shape is judged on the worker's text as written: redaction is a storage
+    # transformation, and scrubbing a credential out of a heading must not be what
+    # decides whether the merge is a ruleset at all.
     if not parse_patterns(merged_md):
         # Non-empty prose is not a ruleset. Writing it would replace every pattern
         # with commentary and clear the candidate file in the same call, so the
@@ -495,15 +681,38 @@ def consolidate_apply(merged_md: str, root: Path | None = None,
         return {"ok": False,
                 "error": "merged content has no recognizable patterns; "
                          "refusing to overwrite learned-patterns.md"}
-    merged_md = _redact(merged_md)
+    stored_md = _redact(merged_md)
+    stored_patterns = parse_patterns(stored_md)
+    if not stored_patterns:
+        # The redacted text is what gets stored, so a scrub that leaves no
+        # recognizable pattern is refused here rather than written and cleared.
+        return {"ok": False,
+                "error": "redaction left no recognizable patterns; "
+                         "refusing to overwrite learned-patterns.md"}
+    # Uniqueness is judged on the STORED text, not the worker's: redaction can erase
+    # the only difference between two titles (two distinct credentials both become
+    # the same tag), so a pre-redaction count can pass two patterns that land as one
+    # duplicate pair on disk.
+    counts = collections.Counter(p["id"] for p in stored_patterns)
+    duplicate_ids = sorted(pid for pid, count in counts.items() if count > 1)
+    if duplicate_ids:
+        # Titles, not just the content hashes: the caller's retry prompt and a human
+        # both need to know WHICH rules collided before they can merge them.
+        duplicate_set = set(duplicate_ids)
+        duplicate_titles = sorted({p["title"] for p in stored_patterns if p["id"] in duplicate_set})
+        named = "; ".join(duplicate_titles) if duplicate_titles else "see duplicate_ids"
+        return {"ok": False, "duplicate_ids": duplicate_ids,
+                "duplicate_titles": duplicate_titles,
+                "error": "merged content has duplicate pattern IDs; merge each "
+                         f"repeated title and scope into one rule and retry ({named})"}
     store.ensure_layout(root)
     staged = candidate_count(root, namespace)
-    # Which candidates this merge is entitled to clear. The caller passes the set
-    # it snapshotted BEFORE dispatching the worker; without one, snapshot now,
-    # which still protects anything staged after this instant.
+    # Which candidates this merge is entitled to clear. The caller passes the
+    # `candidate_snapshot` it took BEFORE dispatching the worker; without one,
+    # snapshot now, which still protects anything staged after this instant.
     if candidate_ids is None:
-        candidate_ids = [p["id"] for p in list_candidate(root, namespace)]
-    body = merged_md if merged_md.endswith("\n") else merged_md + "\n"
+        candidate_ids = candidate_snapshot(root, namespace)
+    body = stored_md if stored_md.endswith("\n") else stored_md + "\n"
     # The guards above check the merged text's shape, not that it kept every rule, so
     # keep the pre-merge ruleset: a merge that parses and still loses lessons is
     # recoverable from this copy and from nowhere else.
@@ -584,7 +793,8 @@ def _main(argv: list[str] | None = None) -> int:
     lp.add_argument("--namespace", default=None, help="namespace to list (default: 'default')")
     lc = sub.add_parser("list-candidate")
     lc.add_argument("--namespace", default=None)
-    sp = sub.add_parser("stage", help="append a new learning to the candidate file")
+    sp = sub.add_parser("stage", help="stage a new learning in the candidate file "
+                                      "(an exact equivalent bumps its seen count)")
     sp.add_argument("--file", required=True, help="JSON pattern file")
     sp.add_argument("--source", required=True, choices=sorted(ADMISSIBLE_SOURCES))
     sp.add_argument("--namespace", default=None)

@@ -13,6 +13,7 @@ import { queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { __resetPaneDraftsForTests } from '../utils/chatPaneDrafts'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
+import { i18nT } from '../i18n/t'
 
 /* Draft / recovery hardening for ChatPane, surfaced by review of the
  * steer-only DM composer (#8852). A pane can be rebound to another slot
@@ -214,6 +215,35 @@ describe('ChatPane draft & recovery hardening (steer-only DM thread)', () => {
     queuedSendStash.delete('q-inlined')
   })
 
+  it('an idle plain send whose receipt never came keeps its bubble pending, marks it, and warns under it', async () => {
+    // Idle pane: the send mints an optimistic bubble, then the deadline fires.
+    // The bubble stays (a restore could duplicate a turn that did run), so the
+    // pane must say so: the deadline mark draws the bubble's pending line and
+    // a WARN notice lands under it, as the main chat page does.
+    forcedReceipt = { status: 'response-late', body: {} }
+    const { store } = renderPane('member-idle-late', { running: false })
+    const box = await composer()
+    fireEvent.change(box, { target: { value: 'did this arrive?' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    await waitFor(() => expect(lastSendTurnOpts).not.toBeNull())
+    expect(lastSendTurnOpts?.steer).toBeFalsy()
+    const rows = () => selectSlotMessages(store.getState() as RootState, 'member-idle-late')
+    const notice = await waitFor(() => {
+      const row = rows().find(m => m.role === 'notice')
+      expect(row).toBeDefined()
+      return row!
+    })
+    expect(notice.content).toBe('\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed_pending'))
+    const bubbles = rows().filter(m => m.role === 'user' && m.content === 'did this arrive?')
+    expect(bubbles).toHaveLength(1)
+    expect(bubbles[0].meta?.optimistic).toBe(true)
+    expect(bubbles[0].meta?.deliveryUnconfirmed).toBe(true)
+    expect(rows().indexOf(notice)).toBe(rows().indexOf(bubbles[0]) + 1)
+    // No restore: nothing proved the send failed.
+    expect((box as HTMLTextAreaElement).value).toBe('')
+    expect(rows().some(m => m.role === 'error')).toBe(false)
+  })
+
   it('an identical queue entry does not stand in for the unconfirmed send — the draft still comes back', async () => {
     // "ok" is already parked on the slot's queue. The user sends "ok" again;
     // the receipt never arrives. Queue cards carry no sendId, so NO card may be
@@ -390,5 +420,34 @@ describe('ChatPane draft & recovery hardening (steer-only DM thread)', () => {
     const again = await composer()
     await waitFor(() => expect((again as HTMLTextAreaElement).value).toContain('still typing'))
     expect((again as HTMLTextAreaElement).value).toContain('sent, then I left')
+  })
+
+  it('a staged quote survives the pane unmounting before the refusal lands: it comes back in the parked text, not on a stage that no longer exists', async () => {
+    let refuse!: () => void
+    vi.mocked(api.sendChat).mockReturnValue(new Promise((resolve) => {
+      refuse = () => resolve({ ok: false, status: 409, json: () => Promise.resolve({ error: 'slot agent mismatch' }) } as unknown as Response)
+    }) as ReturnType<typeof api.sendChat>)
+    // A reply on the transcript to quote from.
+    // A reply with a later user turn under it, so its action row is drawn
+    // (the newest reply hides its footer while the turn runs).
+    vi.mocked(api.chatSlotDetail).mockResolvedValue({ messages: [
+      { role: 'assistant', content: 'the quoted reply', ts: '2026-09-30T00:00:00Z' },
+      { role: 'user', content: 'go on', ts: '2026-09-30T00:00:01Z' },
+    ], running: true, has_more: false, total: 2 } as never)
+    const first = renderPane('member-a', { running: true, busyMode: 'steer-only' })
+    fireEvent.click((await screen.findAllByTestId('quote-message'))[0])
+    const box = await composer()
+    fireEvent.change(box, { target: { value: 'about that' } })
+    fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    expect(lastSendTurnOpts?.message).toContain('> the quoted reply')
+    // Leave the page with the send in flight, then the refusal lands.
+    first.unmount()
+    await act(async () => { refuse() })
+    // Back on the page: the quote is in the text (no stage survived the unmount).
+    renderPane('member-a', { running: false, busyMode: 'steer-only' })
+    const again = await composer()
+    await waitFor(() => expect((again as HTMLTextAreaElement).value).toContain('about that'))
+    expect((again as HTMLTextAreaElement).value).toContain('> the quoted reply')
   })
 })

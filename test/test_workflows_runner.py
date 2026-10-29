@@ -11,9 +11,13 @@ See ``docs/system-specs/modules/workflows.md`` and GATES.md (A7, B5, A4, B6).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
+import types
 
 import pytest
 
+from kiro_crew.testing.wait import async_wait_until, await_until
 from kiro_crew.workflows.runner import RunResult, WorkflowRunner
 
 pytestmark = pytest.mark.asyncio
@@ -190,6 +194,138 @@ async def test_caller_cancellation_yields_run_cancelled() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# B5 — the run's one deadline covers in-run authoring
+# --------------------------------------------------------------------------- #
+
+_AUTHORED_HANG = (
+    'META = {"name": "authored-hang"}\n'
+    "async def workflow(ctx):\n"
+    "    await ctx.agent('spin')\n"
+    "    return 'never'\n"
+)
+
+
+async def _hang_forever(prompt: str, opts: dict):
+    await asyncio.Event().wait()  # only a cancel breaks it
+    return "unreachable"
+
+
+async def _run_within(coro, guard: float = 5.0):
+    """Await *coro* for at most *guard* seconds; ``None`` when it is still running.
+
+    The guard sits far above every ceiling these tests set, so it fires only when
+    a run outlives its own ceiling; the leftover task is cancelled and drained.
+    """
+    task = asyncio.ensure_future(coro)
+    done, _pending = await asyncio.wait({task}, timeout=guard)
+    if task in done:
+        return task.result()
+    task.cancel()
+    with contextlib.suppress(BaseException):
+        await await_until(task, what="the cancelled run drains")
+    return None
+
+
+async def test_wall_clock_timeout_covers_in_run_authoring() -> None:
+    """An author step that never answers is ended by the run's own ceiling, as a
+    clean ``run_failed(where="ceiling")``, and the author task is cancelled."""
+    author_cancelled = asyncio.Event()
+
+    async def _hung_author(intent: str, *, on_progress=None):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            author_cancelled.set()
+            raise
+
+    res = await _run_within(
+        _runner(agent_fn=_hang_forever, timeout_secs=0.05).run(
+            "", run_id="wf_ac1", now=NOW, intent="x", author_fn=_hung_author
+        )
+    )
+    assert res is not None, "the run outlived its ceiling while authoring"
+    assert res.ok is False
+    assert res.error == "timeout"
+    assert res.events[-1].type == "run_failed"
+    assert res.events[-1].data["where"] == "ceiling"
+    assert author_cancelled.is_set()
+
+
+async def test_in_run_authoring_and_its_script_share_one_deadline(monkeypatch) -> None:
+    """Authoring spends the run's budget: an author that answers only after the
+    ceiling has passed leaves the script no time, so the run ends at the ceiling
+    instead of giving the script a second full ceiling."""
+    from kiro_crew.workflows import runner as runner_mod
+
+    clock = {"now": 1000.0}
+    fake_time = types.SimpleNamespace(**vars(time))  # every other name is the real one
+    fake_time.monotonic = lambda: clock["now"]
+    monkeypatch.setattr(runner_mod, "time", fake_time)
+
+    async def _slow_author(intent: str, *, on_progress=None):
+        clock["now"] += 31.0  # answers after the 30s ceiling has passed
+        return {"ok": True, "source": _AUTHORED_HANG}
+
+    res = await _run_within(
+        _runner(agent_fn=_hang_forever, timeout_secs=30).run(
+            "", run_id="wf_ac2", now=NOW, intent="x", author_fn=_slow_author
+        )
+    )
+    assert res is not None, "the script got a fresh ceiling after authoring"
+    assert res.error == "timeout"
+    assert res.events[-1].data["where"] == "ceiling"
+
+
+async def test_cancel_during_in_run_authoring_returns_a_result() -> None:
+    """A caller cancel that lands while the run is authoring is answered like one
+    that lands mid-script: ``run()`` returns ``error == "cancelled"`` with a final
+    ``run_cancelled`` event, and the author task is cancelled."""
+    author_started = asyncio.Event()
+    author_cancelled = asyncio.Event()
+
+    async def _hung_author(intent: str, *, on_progress=None):
+        author_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            author_cancelled.set()
+            raise
+
+    run_task = asyncio.ensure_future(
+        _runner(timeout_secs=3600).run(
+            "", run_id="wf_ac3", now=NOW, intent="x", author_fn=_hung_author
+        )
+    )
+    await await_until(author_started, what="the hung author starts")
+    run_task.cancel()
+    try:
+        res = await await_until(run_task, what="run() returns after the cancel")
+    except asyncio.CancelledError:
+        pytest.fail("CancelledError escaped run() during authoring")
+    assert res.ok is False
+    assert res.error == "cancelled"
+    assert res.events[-1].type == "run_cancelled"
+    assert author_cancelled.is_set()
+
+
+async def test_wall_clock_timeout_still_ends_an_authored_script() -> None:
+    """Control: once authoring answers, the authored script runs under the same
+    ceiling and a hung script still ends at it."""
+
+    async def _author(intent: str, *, on_progress=None):
+        return {"ok": True, "source": _AUTHORED_HANG}
+
+    res = await _run_within(
+        _runner(agent_fn=_hang_forever, timeout_secs=0.05).run(
+            "", run_id="wf_ac4", now=NOW, intent="x", author_fn=_author
+        )
+    )
+    assert res is not None
+    assert res.error == "timeout"
+    assert res.events[-1].data["where"] == "ceiling"
+
+
+# --------------------------------------------------------------------------- #
 # A4 / B6 — ceilings enforced THROUGH the runner
 # --------------------------------------------------------------------------- #
 
@@ -296,9 +432,7 @@ async def test_author_in_run_failure_becomes_run_failed() -> None:
     async def _bad_author(intent: str, *, on_progress=None):
         return {"ok": False, "errors": ["no META", "no workflow()"]}
 
-    res = await _runner().run(
-        "", run_id="wf_a2", now=NOW, intent="nonsense", author_fn=_bad_author
-    )
+    res = await _runner().run("", run_id="wf_a2", now=NOW, intent="nonsense", author_fn=_bad_author)
     assert not res.ok
     failed = [e for e in res.events if e.type == "run_failed"]
     assert failed and failed[-1].data["where"] == "author"
@@ -310,9 +444,7 @@ async def test_author_in_run_exception_is_captured() -> None:
     async def _explode(intent: str, *, on_progress=None):
         raise RuntimeError("model down")
 
-    res = await _runner().run(
-        "", run_id="wf_a3", now=NOW, intent="x", author_fn=_explode
-    )
+    res = await _runner().run("", run_id="wf_a3", now=NOW, intent="x", author_fn=_explode)
     assert not res.ok
     assert "model down" in (res.error or "")
     assert any(e.type == "run_failed" for e in res.events)
@@ -344,15 +476,18 @@ async def test_author_in_run_publishes_source_before_execution() -> None:
     runner = WorkflowRunner(agent_fn=_blocking_agent)
     task = asyncio.ensure_future(
         runner.run(
-            "", run_id="wf_src", now=NOW, intent="x", author_fn=_author_fn,
+            "",
+            run_id="wf_src",
+            now=NOW,
+            intent="x",
+            author_fn=_author_fn,
             on_source=published.append,
         )
     )
-    # Yield until the blocked agent step is reached; source must already be set.
-    for _ in range(50):
-        if published:
-            break
-        await asyncio.sleep(0.01)
+    # Wait until the blocked agent step is reached; source must already be set.
+    await async_wait_until(
+        lambda: published, describe=lambda: "source not published before execution blocked"
+    )
     assert published == [authored], "source not published before execution blocked"
     gate.set()
     res = await task

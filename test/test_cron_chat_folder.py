@@ -53,6 +53,7 @@ from kiro_crew.dashboard.cron_inject import (
 )
 from kiro_crew.dashboard.handlers.cron import api_cron_update, api_crons, api_crons_create
 from kiro_crew.session_surface import set_dashboard_surfaced
+from kiro_crew.testing.wait import await_until
 
 FOLDER = "f00dcafe"
 OTHER_FOLDER = "beadfeed"
@@ -1021,7 +1022,7 @@ class TestMovingTheTabAtTheSave:
 
         async def _save(state, slot, *a, **kw):
             started.set()
-            await asyncio.wait_for(release.wait(), timeout=5)
+            await await_until(release, what="the test releases the held save")
             raise OSError("disk full")
 
         monkeypatch.setattr(persistence, "save_slot_off_loop", _save)
@@ -1030,13 +1031,13 @@ class TestMovingTheTabAtTheSave:
         state.push_slots_update.reset_mock()
         move = asyncio.create_task(move_cron_job_tab(state, _job(), FOLDER, ""))
         try:
-            await asyncio.wait_for(started.wait(), timeout=5)
+            await await_until(started, what="the held save starts")
             assert slot.folder_id == ""
             state.push_slots_update.assert_not_called()
             slot.folder_id = OTHER_FOLDER
         finally:
             release.set()
-            await asyncio.wait_for(move, timeout=5)
+            await await_until(move, what="the move finishes")
         assert slot.folder_id == OTHER_FOLDER
         state.push_slots_update.assert_called_once_with()
 
@@ -1094,7 +1095,7 @@ class TestMovingTheTabAtTheSave:
                 await asyncio.sleep(0)
             save.assert_not_awaited()
             assert slot.folder_id == FOLDER
-        await asyncio.wait_for(move, timeout=5)
+        await await_until(move, what="the move finishes once the lock is released")
         save.assert_awaited_once()
         assert slot.folder_id == OTHER_FOLDER
 
@@ -1112,9 +1113,16 @@ def _app(handler, route: str, *, folders=(FOLDER,), **store) -> web.Application:
     # AsyncMock rather than a bare attribute: an auto-mock would return a coroutine
     # nobody awaits and the prior value would read as a mock.
     store.setdefault("get_job_async", AsyncMock(return_value=_job()))
+    folder_rows = [{"id": fid, "name": f"folder-{fid}"} for fid in folders]
+
+    async def hold_folders(section):
+        # A save naming a folder re-checks it and writes inside the folder lock.
+        return await section([dict(f) for f in folder_rows])
+
     app["state"] = SimpleNamespace(
         crons=SimpleNamespace(**store),
-        _folders=[{"id": fid, "name": f"folder-{fid}"} for fid in folders],
+        _folders=folder_rows,
+        hold_folders=hold_folders,
         push_refresh=MagicMock(),
         ack_notification=AsyncMock(),
         has_slot=MagicMock(return_value=False),
@@ -1159,6 +1167,23 @@ class TestRestCreate:
         async with TestClient(TestServer(app)) as client:
             assert (await client.post("/api/crons", json=_BODY)).status == 200
         assert add.await_args.kwargs["chat_folder_id"] == ""
+
+    async def test_a_folder_deleted_before_the_write_commits_is_refused(self) -> None:
+        """The save re-checks its folder inside the folder lock, the lock the
+        folder cleanup deletes under, so it cannot persist a folder the cleanup
+        just removed."""
+        add = AsyncMock(return_value=_job(chat_folder_id=FOLDER))
+        app = _app(api_crons_create, "/api/crons", add_job_async=add)
+
+        async def hold_folders(section):  # the cleanup won the lock first
+            return await section([])
+
+        app["state"].hold_folders = hold_folders
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post("/api/crons", json={**_BODY, "chat_folder_id": FOLDER})
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "unknown_chat_folder"
+        add.assert_not_awaited()
 
     async def test_an_unknown_folder_is_refused_at_save_time(self) -> None:
         """A save is the one moment a person is present to be told."""

@@ -5,237 +5,40 @@ a projection resumed from a checkpoint must equal the same projection folded fro
 the start of the file, at EVERY split point. That is what makes a checkpoint safe
 to store and a push safe to send incrementally, and it is the property a second
 batch implementation would be free to break.
+
+This module pins the fold contract and the status, usage, timeline, tools and approvals
+folds. Reading a session (``fold_session``, bundle reuse, the order a slot's units fold in)
+lives in ``test_crew_log_projection_session_reads.py``, the bounds on what a fold retains in
+``test_crew_log_projection_bounds.py``, and the ``class`` fold in
+``test_crew_log_projection_class.py``; the shared logs, entries and fixture writers in
+``crew_log_projection_helpers.py``.
 """
 
 from __future__ import annotations
 
+import copy
 import json
-import os
-from dataclasses import replace
+import math
 from typing import Any
 
 import pytest
+from crew_log_projection_helpers import (  # noqa: F401 -- fixtures are used by name
+    GATEWAY,
+    SESSION,
+    _append_grouped,
+    _busy_log,
+    _entries,
+    _isolated_home,
+    _log,
+    _opened,
+    _tool,
+    _tool_items,
+    _turn,
+)
 
 from kiro_crew import crew_log as lg
-from kiro_crew.crew_log import CrewLog, CrewLogError, Ref
+from kiro_crew.crew_log import CrewLogError
 from kiro_crew.crew_log import projection as crew_log
-from kiro_crew.crew_log import store
-
-SESSION = "s-fold"
-GATEWAY = "gateway"
-
-
-@pytest.fixture(autouse=True)
-def _isolated_home(tmp_path, monkeypatch):
-    """Every test writes into its own data home, never the live one."""
-    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
-    yield
-
-
-def _log(unit_id: str = SESSION, **fields) -> CrewLog:
-    fields.setdefault("owner", "raymond")
-    fields.setdefault("agent", "kirocrew")
-    return CrewLog.create(lg.KIND_SESSION, unit_id, **fields)
-
-
-def _opened(handle: CrewLog, *, resumed: bool = False, model: str = "opus") -> None:
-    handle.append(
-        "session/opened",
-        {
-            "agent": "kirocrew",
-            "slot": "dashboard:1",
-            "model": model,
-            "cwd": "/w",
-            "owner": "raymond",
-            "resumed": resumed,
-        },
-        src=GATEWAY,
-    )
-
-
-def _turn(
-    handle: CrewLog,
-    turn: int,
-    *,
-    credits: float | None = 0.5,
-    tokens: dict[str, int] | None = None,
-    stop_reason: str = "end_turn",
-    attempt: int | None = None,
-    model: str = "opus",
-) -> None:
-    """A whole turn: started, one step, completed."""
-    for item in _turn_items(
-        turn,
-        credits=credits,
-        tokens=tokens,
-        stop_reason=stop_reason,
-        attempt=attempt,
-        model=model,
-    ):
-        handle.append(item["type"], item["data"], src=GATEWAY)
-
-
-def _tool(
-    handle: CrewLog, turn: int, call_id: str, name: str, *, status: str = "completed"
-) -> None:
-    for item in _tool_items(turn, call_id, name, status=status):
-        handle.append(item["type"], item["data"], src=GATEWAY)
-
-
-# --- writing a fixture that has to be LONG --------------------------------- #
-#
-# A bound in this module is a bound on retained state, so reaching one costs as
-# many entries as the bound itself, and ``FOLD_CHUNK_ENTRIES`` is 1024 -- 2049
-# entries to cross it twice. One ``append`` per entry is one cross-process lock,
-# one tail scan and one ``os.fsync`` EACH, which measures 76-90 ms per entry on
-# the Windows CI runner: that puts a 2049-entry fixture at 156-185 s against a
-# 180 s per-test cap. A breach there does not fail one test. Windows has no
-# SIGALRM, so pytest-timeout falls back to the thread method and terminates the
-# whole xdist worker, and the shard runs ``--max-worker-restart=0`` deliberately,
-# so one fixture can fail a shard of 1600 tests in a file its author never opened.
-#
-# So a fixture past a few hundred entries is written with ``append_many``, the
-# production group write: the same validation, the same consecutive seqs, the same
-# file, one fsync per group. A group shares one ``time`` -- which is what a
-# production group write does as well -- and no bound here is a bound on wall
-# clock. ``test_a_grouped_fixture_is_the_log_one_append_at_a_time_writes`` pins
-# that equivalence, so this stays a change in what the fixture COSTS.
-
-_GROUP_ENTRIES = 512
-
-
-def _append_grouped(
-    handle: CrewLog, items: list[dict[str, Any]], *, group: int = _GROUP_ENTRIES
-) -> None:
-    """Append *items* with one lock and one fsync per bounded group.
-
-    Bounded rather than one write of everything, so a long fixture still crosses
-    the tail scan and the ``needs_newline`` path more than once. *group* is only
-    for the test that pins this helper, which must cross a group boundary without
-    paying for a long fixture to do it.
-    """
-    for start in range(0, len(items), group):
-        handle.append_many(items[start : start + group], src=GATEWAY)
-
-
-def _turn_items(
-    turn: int,
-    *,
-    credits: float | None = 0.5,
-    tokens: dict[str, int] | None = None,
-    stop_reason: str = "end_turn",
-    attempt: int | None = None,
-    model: str = "opus",
-) -> list[dict[str, Any]]:
-    """The four entries of one whole turn, unwritten."""
-    start: dict[str, Any] = {"turn": turn, "actor": "user", "depth": 0}
-    if attempt is not None:
-        start["attempt"] = attempt
-    done: dict[str, Any] = {
-        "turn": turn,
-        "stop_reason": stop_reason,
-        "depth": 0,
-        "duration_ms": 900,
-        "model": model,
-        "provider": "kiro",
-    }
-    if credits is not None:
-        done["credits"] = credits
-        done["tokens"] = tokens or {
-            "input": 100,
-            "output": 20,
-            "cache_read": 5,
-            "cache_write": 1,
-        }
-    return [
-        {"type": "turn/started", "data": start},
-        {"type": "step/started", "data": {"turn": turn, "step": 1}},
-        {"type": "step/completed", "data": {"turn": turn, "step": 1, "ms": 120}},
-        {"type": "turn/completed", "data": done},
-    ]
-
-
-def _tool_items(
-    turn: int, call_id: str, name: str, *, status: str = "completed"
-) -> list[dict[str, Any]]:
-    """The call and the completion of one tool frame, unwritten."""
-    return [
-        {
-            "type": "tool/called",
-            "data": {
-                "turn": turn,
-                "call_id": call_id,
-                "name": name,
-                "server": "core",
-                "kind": "mcp",
-            },
-        },
-        {
-            "type": "tool/completed",
-            "data": {
-                "turn": turn,
-                "call_id": call_id,
-                "name": name,
-                "server": "core",
-                "status": status,
-                "elapsed_ms": 42,
-            },
-        },
-    ]
-
-
-def _busy_log() -> CrewLog:
-    """A session with something for every fold to see."""
-    handle = _log()
-    _opened(handle)
-    handle.append("model/selected", {"model": "opus", "source": "config"}, src=GATEWAY)
-    handle.append(
-        "request/configured",
-        {"turn": 1, "model": "opus", "provider": "kiro", "context_window": 200000},
-        src=GATEWAY,
-    )
-    handle.append(
-        "context/composed",
-        {
-            "turn": 1,
-            "step": 1,
-            "sources": [
-                {"kind": "system", "chars": 400, "tokens": 100},
-                {"kind": "memory", "chars": 800, "tokens": 200},
-            ],
-            "chars": 1200,
-            "tokens": 300,
-            "tokens_estimated": True,
-        },
-        src=GATEWAY,
-    )
-    _turn(handle, 1)
-    _tool(handle, 1, "c1", "fs_read")
-    _tool(handle, 1, "c2", "fs_write", status="refused")
-    handle.append(
-        "approval/requested",
-        {"turn": 1, "approval_id": "a1", "tool": "shell", "reason": "run tests"},
-        src=GATEWAY,
-    )
-    handle.append(
-        "approval/decided",
-        {"turn": 1, "approval_id": "a1", "decision": "allow", "by": "raymond"},
-        src=GATEWAY,
-    )
-    handle.append(
-        "compaction/applied",
-        {"pct_before": 82.0, "pct_after": 41.0, "freed_pct": 41.0},
-        src=GATEWAY,
-    )
-    _turn(handle, 2, credits=None, stop_reason="interrupted")
-    handle.append("write/dropped", {"dropped_count": 3, "dropped_bytes": 900}, src=GATEWAY)
-    handle.append("session/closed", {"reason": "reset"}, src=GATEWAY)
-    return handle
-
-
-def _entries(handle: CrewLog) -> tuple:
-    return tuple(handle.iter_from(1))
-
 
 # --- the contract ---------------------------------------------------------
 
@@ -268,6 +71,90 @@ def test_incremental_matches_from_scratch_at_every_split(name):
         resumed = crew_log.advance(first, entries[cut:])
         assert crew_log.projection_of(resumed).value == whole, f"{name} disagrees at cut {cut}"
         assert resumed.last_seq == (entries[-1].seq if entries else 0)
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_the_kernel_definition_folds_to_what_advance_folds(name):
+    """The wrapper the kernel drives and the ``advance`` surface reach one value.
+
+    ``advance`` deep-copies once and steps the whole span; the kernel drives one entry
+    at a time through a copy the fold declared. Two ways of arriving at the same fold,
+    so they are pinned against each other -- a copier or an ``affects`` set that was
+    wrong would show up here as a different number.
+    """
+    entries = _entries(_busy_log())
+    definition = crew_log._SessionFold(crew_log._FOLDS[name])
+    state = definition.init()
+    for entry in entries:
+        state = definition.apply(state, entry)
+
+    assert definition.view(state) == crew_log.fold(name, entries)
+    # The version the kernel is handed is THIS fold's, not the module maximum: a bump
+    # to one fold must retire that fold's savepoints and leave the others standing, and
+    # comparing against the maximum here would pass while the wrapper published the
+    # wrong number for every fold below it.
+    assert definition.state_version == crew_log.fold_state_version(name)
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_a_fold_never_reaches_into_the_state_it_was_handed(name):
+    """MUTATION-SENSITIVE: ``apply`` copies before it steps, so its input is intact.
+
+    This is what keeps each fold's declared ``copy_state`` honest. A copier that misses
+    a nested container still produces the RIGHT value -- the step edits the object it
+    meant to edit -- but it edits the caller's state along with it, and a caller holding
+    an earlier bundle would then watch its value move underneath it. Nothing raises
+    either way, so this test is the only thing that catches the miss.
+
+    Checked at every position, because the container a copier misses often does not
+    exist until the fold has something in it: ``tools`` has no per-name row to share
+    until a tool has been called.
+    """
+    entries = _entries(_busy_log())
+    definition = crew_log._SessionFold(crew_log._FOLDS[name])
+    state = definition.init()
+    for entry in entries:
+        before = copy.deepcopy(state)
+        grown = definition.apply(state, entry)
+        assert state == before, f"{name} edited the state it was handed at seq {entry.seq}"
+        state = grown
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_an_entry_a_fold_declares_untouched_really_moves_nothing(name):
+    """MUTATION-SENSITIVE: ``affects`` may be wider than the truth, never narrower.
+
+    Returning the state unchanged is how ``apply`` tells the kernel this entry moved
+    nothing, and the kernel believes it: a type wrongly left out of ``affects`` drops a
+    real change and serves a stale value for as long as the fold sits there. So for
+    every entry the wrapper skipped, the step is run on a copy to prove it would indeed
+    have changed nothing.
+
+    The opposite error is not a bug and is not asserted against: a type wrongly
+    INCLUDED costs a copy, and a spurious frame to a client watching the change feed.
+    """
+    entries = _entries(_busy_log())
+    fold_spec = crew_log._FOLDS[name]
+    definition = crew_log._SessionFold(fold_spec)
+    state = definition.init()
+    skipped = 0
+    for entry in entries:
+        grown = definition.apply(state, entry)
+        if grown is state:
+            skipped += 1
+            probe = fold_spec.copied(state)
+            fold_spec.step(probe, entry)
+            assert probe == state, (
+                f"{name} treats {entry.type} as untouched, but its step moves the "
+                f"state at seq {entry.seq}"
+            )
+        state = grown
+    # Only a NARROWED set can skip anything. ``status`` and ``class`` declare the whole
+    # vocabulary -- ``KNOWN_TYPES`` -- because every entry moves them, and that is a
+    # statement about them rather than a set left undeclared: a fold whose ``affects`` is
+    # the vocabulary skips nothing, and there is nothing for it to prove here.
+    if fold_spec.affects is not None and fold_spec.affects != crew_log.KNOWN_TYPES:
+        assert skipped > 0, f"{name} declares a narrowed type set but skipped nothing"
 
 
 @pytest.mark.parametrize("name", crew_log.PROJECTION_NAMES)
@@ -423,6 +310,69 @@ def test_usage_sums_every_token_dimension_and_its_total():
     }
 
 
+def test_usage_does_not_count_an_all_zero_tokens_block_as_reported():
+    """A block of four zeros is an absence written as a block.
+
+    Logs on disk carry it on every turn whose provider sent no counts, so the fold --
+    not only the writer -- has to know that a completed turn cannot have cost zero
+    tokens. The credits beside it were genuinely billed and stay counted, which is
+    the difference a reader sees: a real bill beside ``tokens_reported: 0``, and the
+    panel dashes the tokens instead of printing a measured ``0``.
+    """
+    handle = _log()
+    _opened(handle)
+    for turn in range(1, 5):
+        _turn(
+            handle,
+            turn,
+            credits=0.3725,
+            tokens={"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        )
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["completed"] == 4
+    assert value["turns"]["credits_reported"] == 4
+    assert value["credits"] == 1.49
+    assert value["turns"]["tokens_reported"] == 0
+    assert value["tokens"]["total"] == 0
+
+
+def test_usage_counts_a_block_reported_once_any_dimension_is_above_zero():
+    """One measured dimension is a report; the rule is not "input above zero"."""
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, tokens={"input": 0, "output": 0, "cache_read": 7, "cache_write": 0})
+    _turn(handle, 2, tokens={"input": 0, "output": 0, "cache_read": 0, "cache_write": 0})
+    _turn(handle, 3, tokens={"input": 5, "output": 1, "cache_read": 0, "cache_write": 0})
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["completed"] == 3
+    assert value["turns"]["tokens_reported"] == 2
+    assert value["tokens"]["total"] == 13
+    assert value["by_model"]["opus"] == {
+        "turns": 3,
+        "credits": 1.5,
+        "credits_reported": 3,
+        "tokens": 13,
+    }
+
+
+def test_usage_still_counts_a_recorded_zero_credit_charge_as_reported():
+    """Pins what the token rule deliberately leaves alone.
+
+    ``credits: 0.0`` on a closer is counted as a report, and the fold keeps doing so:
+    the writer omits an unbilled charge, but a zero already on disk cannot be told
+    from a turn a provider genuinely billed at nothing, and ``_bill_credits`` lets a
+    zero through on purpose. Tokens are different -- a completed turn cannot cost
+    zero of them -- which is why only ``tokens_reported`` carries the rule.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=0.0)
+    value = crew_log.fold_usage(_entries(handle))
+    assert value["turns"]["credits_reported"] == 1
+    assert value["credits_by_source"]["turn"]["reported"] == 1
+    assert value["credits"] == 0.0
+
+
 def test_usage_bills_injected_context_per_source():
     handle = _log()
     _opened(handle)
@@ -456,6 +406,563 @@ def test_usage_bills_injected_context_per_source():
     assert context["estimated_turns"] == 1
     assert context["by_source"]["memory"] == {"blocks": 2, "tokens": 25, "chars": 100}
     assert context["by_source"]["system"] == {"blocks": 1, "tokens": 25, "chars": 100}
+    assert context["sources_omitted"] == 0
+
+
+def test_usage_counts_the_sources_a_row_leaves_out():
+    """A row past the per-turn source cap says so, and keeps adding to labels it holds.
+
+    Two NEW labels past the cap are left out and counted. A label the row already
+    holds, arriving again at the cap, still adds to that label rather than being
+    dropped, so a kept figure is never cut short.
+    """
+    limit = crew_log.CONTEXT_SOURCES_PER_TURN_LIMIT
+    sources = [{"kind": f"src{i}", "chars": 1, "tokens": 0} for i in range(limit + 2)]
+    sources.append({"kind": "src0", "chars": 5, "tokens": 0})
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "context/composed",
+        {"turn": 1, "sources": sources, "chars": limit + 7, "tokens": 0, "tokens_estimated": True},
+        src=GATEWAY,
+    )
+    context = crew_log.fold_usage(_entries(handle))["context"]
+    (row,) = context["turns"]
+    assert len(row["sources"]) == limit
+    assert row["sources"]["src0"] == 6
+    assert context["sources_omitted"] == 2
+
+
+def test_usage_a_retry_attempts_reading_does_not_stamp_the_first_attempts_rows():
+    """MUTATION-SENSITIVE: a rerun of one turn ordinal is a separate attempt.
+
+    A regenerate or rewind reruns a turn the ordinal already names, so one ordinal can
+    carry two attempts, each with its own compositions and its own closer. Matching a
+    reading to rows by TURN NUMBER alone conflates them: attempt 2's closer walking the
+    tail back would reach attempt 1's rows -- same ordinal -- and stamp them with
+    attempt 2's occupancy. It bites hardest when attempt 1 reported NO occupancy, so
+    its rows are unstamped and nothing else marks them closed. Each closer sealing its
+    own run is what keeps the two apart, whether or not attempt 1 measured anything.
+    """
+
+    def _completed(reading: dict[str, int] | None) -> dict[str, Any]:
+        done: dict[str, Any] = {
+            "turn": 1,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+        }
+        if reading is not None:
+            done["context"] = reading
+        return done
+
+    def _composed(kind: str, chars: int) -> dict[str, Any]:
+        return {
+            "turn": 1,
+            "sources": [{"kind": kind, "chars": chars, "tokens": chars // 4}],
+            "chars": chars,
+            "tokens": chars // 4,
+            "tokens_estimated": True,
+        }
+
+    handle = _log()
+    _opened(handle)
+    # Attempt 1 at ordinal 1 composes, then completes WITHOUT an occupancy reading.
+    handle.append("context/composed", _composed("memory", 40), src=GATEWAY)
+    handle.append("turn/completed", _completed(None), src=GATEWAY)
+    # Attempt 2 reruns ordinal 1, composes fresh rows, and completes WITH a reading.
+    handle.append("context/composed", _composed("system", 90), src=GATEWAY)
+    handle.append(
+        "turn/started", {"turn": 1, "actor": "user", "depth": 0, "attempt": 2}, src=GATEWAY
+    )
+    handle.append("turn/completed", _completed({"used": 8_000, "window": 200_000}), src=GATEWAY)
+    turns = crew_log.fold_usage(_entries(handle))["context"]["turns"]
+    # Attempt 1's row keeps NO reading; only attempt 2's row carries the 8_000. The
+    # reading did not walk back across the attempt boundary onto the earlier run.
+    assert [("used" in row) for row in turns] == [False, True]
+    assert [row.get("used") for row in turns] == [None, 8_000]
+
+
+def test_usage_each_attempt_of_one_turn_keeps_its_own_reading():
+    """MUTATION-SENSITIVE: two attempts that BOTH measured keep their own readings.
+
+    When each attempt reports occupancy the seal still matters: attempt 2's closer
+    must not overwrite attempt 1's already-stamped reading, and attempt 1's must not be
+    left for attempt 2 to claim.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "memory", "chars": 40, "tokens": 10}],
+            "chars": 40,
+            "tokens": 10,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    _turn(handle, 1)  # the helper's closer carries a used=4_200 reading
+    handle.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "system", "chars": 90, "tokens": 22}],
+            "chars": 90,
+            "tokens": 22,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    handle.append(
+        "turn/started", {"turn": 1, "actor": "user", "depth": 0, "attempt": 2}, src=GATEWAY
+    )
+    handle.append(
+        "turn/completed",
+        {
+            "turn": 1,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+            "context": {"used": 8_000, "window": 200_000},
+        },
+        src=GATEWAY,
+    )
+    turns = crew_log.fold_usage(_entries(handle))["context"]["turns"]
+    assert [row.get("used") for row in turns] == [4_200, 8_000]
+
+
+def test_usage_snapshot_row_is_not_stamped_by_a_later_completion():
+    """MUTATION-SENSITIVE: a copied snapshot's rows are independent of the base's.
+
+    The ``turn/completed`` closer stamps the provider's occupancy reading onto the
+    rows of the turn it closes, AFTER those rows were appended. ``copy_state`` ships a
+    snapshot of the fold to socket owners, so if that snapshot shared the row objects
+    a later completion would stamp a reading into a snapshot a reader is still holding
+    -- an occupancy from a turn the snapshot was taken BEFORE. The copy must be deep
+    enough at the row level that the base can be stamped without touching it.
+    """
+    from kiro_crew.crew_log.schema import Entry
+
+    state = crew_log._usage_start()
+    crew_log._usage_step(
+        state,
+        Entry(
+            seq=1,
+            time=1000,
+            type="request/configured",
+            src=GATEWAY,
+            data={"turn": 1, "context_window": 200_000},
+        ),
+    )
+    crew_log._usage_step(
+        state,
+        Entry(
+            seq=2,
+            time=1001,
+            type="context/composed",
+            src=GATEWAY,
+            data={"turn": 1, "sources": [{"kind": "memory", "chars": 40}], "chars": 40},
+        ),
+    )
+    snapshot = crew_log._usage_copy(state)
+    assert "used" not in snapshot["context_turns"][0]
+    # The turn now closes with a reading. It must land on the base state's row only.
+    crew_log._usage_step(
+        state,
+        Entry(
+            seq=3,
+            time=1002,
+            type="turn/completed",
+            src=GATEWAY,
+            data={"turn": 1, "context": {"used": 9_000, "window": 200_000}},
+        ),
+    )
+    assert state["context_turns"][0]["used"] == 9_000
+    assert "used" not in snapshot["context_turns"][0]
+
+
+def test_usage_the_ordinal_memo_stays_bounded_over_a_long_session():
+    """MUTATION-SENSITIVE: the (unit, turn) memo must not grow without bound.
+
+    The memo lets a rewound turn reuse its ordinal, but it is checkpointed state, so it
+    is capped at ``CONTEXT_ORDINAL_MEMO_LIMIT`` keys and evicts oldest-first. Driving
+    more distinct turns than the cap must leave it at the cap, never larger -- while the
+    counter keeps advancing so each new turn still gets its true session-global ordinal
+    (the cap bounds the memory, not the numbering).
+    """
+    state = crew_log._usage_start()
+    limit = crew_log.CONTEXT_ORDINAL_MEMO_LIMIT
+    overflow = limit + 50
+    for turn in range(1, overflow + 1):
+        ordinal = crew_log._count_turn_ordinal(state, "acp-1", turn)
+        # Each distinct turn advances the counter, so its ordinal is its true position.
+        assert ordinal == turn
+    keys = state["context_turn_keys"]
+    # The memo never exceeds its cap, no matter how many turns passed through it.
+    assert keys.count(",") - 1 == limit
+    # The retained keys are the MOST RECENT ones; the oldest turns were evicted.
+    assert f",acp-1:{overflow}," in keys
+    assert f",acp-1:{overflow - limit + 1}," in keys
+    assert f",acp-1:{overflow - limit}," not in keys
+    # Retained turns at both ends still read back their own ordinal after eviction,
+    # and reading one back does not advance the counter.
+    assert crew_log._count_turn_ordinal(state, "acp-1", overflow) == overflow
+    assert crew_log._count_turn_ordinal(state, "acp-1", overflow - limit + 1) == (
+        overflow - limit + 1
+    )
+    assert state["context_turns_seq"] == overflow
+
+
+def test_usage_a_rewind_past_400_turns_keeps_the_turns_ordinal():
+    """MUTATION-SENSITIVE: a rewind deep into a long session reuses the turn's ordinal.
+
+    ``chat_rewind`` can re-run any user message in the slot's live list, which holds far
+    more than the fold's 200 rows. The memo once kept 400 keys, so rewinding to a turn
+    older than that counted it again: its label and every later ordinal moved up by one,
+    for good. A rewind to turn 10 after 1,000 turns must read ordinal 10 and advance
+    nothing.
+    """
+    state = crew_log._usage_start()
+    for turn in range(1, 1_001):
+        crew_log._count_turn_ordinal(state, 7, turn)
+    assert crew_log._count_turn_ordinal(state, 7, 10) == 10
+    assert state["context_turns_seq"] == 1_000
+    # The next NEW turn still takes the next ordinal.
+    assert crew_log._count_turn_ordinal(state, 7, 1_001) == 1_001
+    # The same turn number in another unit is a different turn.
+    assert crew_log._count_turn_ordinal(state, 8, 10) == 1_002
+
+
+def test_usage_a_regenerate_after_a_reattach_keeps_the_turns_ordinal():
+    """MUTATION-SENSITIVE: a re-attachment is the same unit, so its key space continues.
+
+    A gateway restart re-attaches to the same crew log and writes another
+    ``session/opened`` with ``resumed`` true. The conversation and its turn numbers are
+    the same unit's, so a regenerate of turn 1 after it is still turn 1: it must read
+    back ordinal 1 and count no extra turn. Keyed by the per-attachment counter, the
+    regenerate missed its key and took ordinal 2.
+    """
+
+    def _composed(turn: int) -> dict[str, Any]:
+        return {
+            "turn": turn,
+            "sources": [{"kind": "memory", "chars": 40, "tokens": 10}],
+            "chars": 40,
+            "tokens": 10,
+            "tokens_estimated": True,
+        }
+
+    def _completed(turn: int) -> dict[str, Any]:
+        return {
+            "turn": turn,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+        }
+
+    handle = _log()
+    _opened(handle)
+    handle.append("context/composed", _composed(1), src=GATEWAY)
+    handle.append("turn/completed", _completed(1), src=GATEWAY)
+    # The gateway process died and a new one re-attached to the same crew log.
+    _opened(handle, resumed=True)
+    handle.append(
+        "turn/started", {"turn": 1, "actor": "user", "depth": 0, "attempt": 2}, src=GATEWAY
+    )
+    handle.append("context/composed", _composed(1), src=GATEWAY)
+    handle.append("turn/completed", _completed(1), src=GATEWAY)
+    handle.append("context/composed", _composed(2), src=GATEWAY)
+
+    state = crew_log._usage_start()
+    for entry in _entries(handle):
+        crew_log._usage_step(state, entry)
+    assert [row["ordinal"] for row in state["context_turns"]] == [1, 1, 2]
+    assert state["context_turns_seq"] == 2
+
+
+def test_usage_the_ordinal_memo_covers_the_rewindable_range():
+    """The memo bound is the slot's live message cap, the range a rewind can reach.
+
+    ``crew_log`` cannot import the dashboard, so the figure is restated there and pinned
+    here: if the live cap grows, a rewind could again reach a turn the memo evicted.
+    """
+    from kiro_crew.dashboard import state as dashboard_state
+
+    assert crew_log.CONTEXT_ORDINAL_MEMO_LIMIT == dashboard_state._MAX_SLOT_MESSAGES
+
+
+def test_usage_an_interrupted_units_open_row_is_not_stamped_by_the_next_unit():
+    """MUTATION-SENSITIVE: the seal alone cannot close the unit boundary.
+
+    A slot's window merges every UNIT it ran under and turn ordinals restart in each
+    one, so a matching ordinal is not proof a row belongs to the turn now closing. The
+    ``_closed`` seal tells two FINISHED runs of one ordinal apart, because each closer
+    marks its own tail run. It cannot see a unit cut off mid-turn: that unit composed a
+    row and then died, so no closer ever sealed it, and the next unit's turn 1 walks
+    straight onto it and stamps an unmeasured turn with its own reading.
+    """
+    handle_a = _log("unit-a")
+    _opened(handle_a)
+    handle_a.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "memory", "chars": 400, "tokens": 100}],
+            "chars": 400,
+            "tokens": 100,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    # No closer: the gateway died mid-turn, so nothing seals that row.
+    handle_b = _log("unit-b")
+    _opened(handle_b)
+    handle_b.append(
+        "context/composed",
+        {
+            "turn": 1,
+            "sources": [{"kind": "memory", "chars": 800, "tokens": 200}],
+            "chars": 800,
+            "tokens": 200,
+            "tokens_estimated": True,
+        },
+        src=GATEWAY,
+    )
+    handle_b.append(
+        "turn/completed",
+        {
+            "turn": 1,
+            "stop_reason": "end_turn",
+            "depth": 0,
+            "duration_ms": 100,
+            "model": "opus",
+            "provider": "kiro",
+            "credits": 0.1,
+            "tokens": {"input": 1, "output": 1, "cache_read": 0, "cache_write": 0},
+            "context": {"used": 90_000, "window": 200_000},
+        },
+        src=GATEWAY,
+    )
+    turns = crew_log.fold_slot("usage", ["unit-a", "unit-b"], slot="dashboard:1").value["context"][
+        "turns"
+    ]
+    assert [row.get("used") for row in turns] == [None, 90_000]
+    # The counter is the fold's own bookkeeping and never reaches a reader.
+    assert all("unit" not in row for row in turns)
+
+
+def test_usage_bills_every_source_that_spends_and_says_which_spent_what():
+    """A session's bill is its turns PLUS its children PLUS its helpers.
+
+    A total that billed turns alone would read a session that spent most of its
+    budget on subagents as cheap, and would fold none of the credits
+    ``background/completed`` carries. The split beside the total is what keeps the
+    total readable: one number cannot say whether the spend was the user's turns or
+    a wave of children.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7, "credits": 1.0}, src=GATEWAY)
+    handle.append(
+        "background/completed", {"kind": "title", "model": "haiku", "credits": 0.5}, src=GATEWAY
+    )
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 3.5
+    assert value["credits_by_source"] == {
+        "turn": {"credits": 2.0, "reported": 1},
+        "subagent": {"credits": 1.0, "reported": 1},
+        "background": {"credits": 0.5, "reported": 1},
+    }
+    # The turn-scoped count still answers for turns alone: it is what tells a reader
+    # how many of the session's turns the turn bucket covers.
+    assert value["turns"]["credits_reported"] == 1
+
+
+def test_usage_bills_a_child_that_failed_against_the_subagent_bucket():
+    """A run the user stopped still billed for the turns it attempted."""
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append(
+        "subagent/failed",
+        {"agent_id": "sub-1", "outcome": "stopped", "ms": 3, "credits": 0.75},
+        src=GATEWAY,
+    )
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.75
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.75, "reported": 1}
+
+
+#: Every charge shape the fold refuses, and why each one is not a measurement of
+#: spend. They are one list because they are one rule: a charge is billed only when
+#: it is a real number this fold can add to a running total and defend afterwards.
+#: ``nan`` and the infinities cannot be added -- every later sum is non-finite too,
+#: ``round`` keeps it so, and the savepoint persists it, so the total is poisoned for
+#: the life of the unit. A negative can be added, and that is the problem: it REDUCES
+#: a total, so a session reads as having spent less than it did, and no later entry
+#: corrects it. ``json`` round-trips all five without complaint.
+_UNUSABLE_CHARGES = [float("nan"), float("inf"), float("-inf"), -0.5, -1.0e9]
+
+
+@pytest.mark.parametrize("source", ["subagent/completed", "subagent/failed"])
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_child(bad, source):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append(source, {"agent_id": "sub-1", "credits": bad}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_background_helper(bad):
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("background/completed", {"kind": "title", "credits": bad}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["background"] == {"credits": 0.0, "reported": 0}
+
+
+@pytest.mark.parametrize("bad", _UNUSABLE_CHARGES)
+def test_usage_refuses_an_unusable_credit_charge_from_a_turn(bad):
+    """One rule for all three spenders, including the one that predates the buckets.
+
+    The turn path is where a charge has always been read, so leaving it out would
+    make the rule depend on which spender wrote the line -- and the poisoned total it
+    produces is the same total.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    _turn(handle, 2, credits=bad)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["turn"] == {"credits": 2.0, "reported": 1}
+    assert value["turns"]["credits_reported"] == 1
+    assert value["by_model"]["opus"]["credits"] == 2.0
+
+
+def test_usage_survives_a_charge_too_large_to_be_a_float():
+    """A JSON integer is unbounded, so a charge can be unrepresentable, not just wrong.
+
+    ``float()`` raises ``OverflowError`` on a 400-digit int, and nothing between
+    ``_usage_step`` and ``fold_session`` catches it, so the whole fold would fail on
+    one bad entry rather than skipping it. The fold's contract is that a line it
+    cannot interpret costs that line, never the projection.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=2.0)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "credits": 10**400}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 2.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+def test_usage_refuses_a_charge_that_would_overflow_the_running_total():
+    """Two charges that are each finite can still sum to infinity.
+
+    This is the case an input check cannot see: both values pass every test that
+    looks at them alone. Only the RESULT of the addition is wrong, and once it is
+    stored the savepoint keeps it, so the invariant has to be checked after the add
+    rather than before it.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=1.0e308)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "credits": 1.0e308}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert math.isfinite(value["credits"])
+    assert value["credits"] == 1.0e308
+    assert value["credits_by_source"]["turn"] == {"credits": 1.0e308, "reported": 1}
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+    assert math.isfinite(value["by_model"]["opus"]["credits"])
+
+
+def test_usage_counts_a_charge_of_exactly_zero_as_measured():
+    """Zero is the one falsy charge that IS a measurement, so it stays counted.
+
+    A provider that reports ``0.0`` explicitly measured zero, which is a different
+    fact from a closer that reported nothing -- and ``reported`` is the field that
+    tells those two apart. The refusals above are values that cannot be summed or
+    that move a total the wrong way; zero is neither.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1, credits=0.0)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.0
+    assert value["credits_by_source"]["turn"] == {"credits": 0.0, "reported": 1}
+
+
+def test_usage_does_not_read_an_unmetered_child_as_a_free_one():
+    """A closer with no ``credits`` key measured nothing, which is not zero."""
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7}, src=GATEWAY)
+
+    value = crew_log.fold_usage(_entries(handle))
+
+    assert value["credits"] == 0.0
+    assert value["credits_by_source"]["subagent"] == {"credits": 0.0, "reported": 0}
+
+
+def test_timeline_keeps_a_child_run_duration():
+    """``ms`` is what subagent and step entries call their measured duration.
+
+    ``duration_ms`` is the turn entry's spelling, so a copied-key list carrying only
+    that one keeps a child's run time out of the timeline entirely.
+    """
+    handle = _log()
+    _opened(handle)
+    handle.append("subagent/spawned", {"turn": 1, "agent_id": "sub-1"}, src=GATEWAY)
+    handle.append("subagent/completed", {"agent_id": "sub-1", "ms": 7, "credits": 1.0}, src=GATEWAY)
+
+    moments = crew_log.fold_timeline(_entries(handle))["moments"]
+    closer = [m for m in moments if m["type"] == "subagent/completed"]
+    assert len(closer) == 1
+    assert closer[0]["ms"] == 7
+    assert closer[0]["credits"] == 1.0
 
 
 def test_usage_splits_cost_by_model():
@@ -533,6 +1040,56 @@ def test_timeline_moments_are_oldest_first_and_carry_their_seq():
         "turn/started",
         "turn/completed",
     ]
+
+
+def test_timeline_folds_one_session_unaffected_by_the_single_unit_guard():
+    """The reachable path -- one session's log -- renders every moment as before.
+
+    One session holds exactly one succession unit, so a seq that only ever climbs is
+    the normal case the guard leaves untouched.
+    """
+    handle = _log()
+    _opened(handle)
+    _turn(handle, 1)
+    _turn(handle, 2)
+    value = crew_log.fold_timeline(_entries(handle))
+    assert [moment["type"] for moment in value["moments"]] == [
+        "session/opened",
+        "turn/started",
+        "turn/completed",
+        "turn/started",
+        "turn/completed",
+    ]
+    seqs = [moment["seq"] for moment in value["moments"]]
+    assert seqs == sorted(seqs)
+    assert value["first_seq"] == seqs[0]
+    assert value["last_seq"] == seqs[-1]
+
+
+def test_timeline_refuses_rows_from_a_second_succession_unit():
+    """A slot-wide fold of two units crosses a seq restart, and the guard names it.
+
+    ``fold_slot_checkpoint`` folds the units a slot ran under back to back, re-basing
+    the seq per unit so the second starts at 1 again. Nothing reads ``timeline`` over a
+    slot today; this pins that the day one does, it fails loudly at the unit boundary
+    rather than concatenating two units into one timestamp-scrambled timeline.
+    """
+    first = _log("u-first", slot="chat-tl")
+    _opened(first)
+    _turn(first, 1)
+    second = _log("u-second", slot="chat-tl")
+    _opened(second)
+    _turn(second, 1)
+
+    # One unit folds cleanly, the hazard is only the join of a second.
+    one = crew_log.fold_slot_checkpoint("timeline", ["u-first"], slot="chat-tl")
+    one_seqs = [moment["seq"] for moment in one.state["moments"]]
+    assert one_seqs == sorted(one_seqs) and len(one_seqs) == 3
+
+    with pytest.raises(crew_log.CrewLogError) as excinfo:
+        crew_log.fold_slot_checkpoint("timeline", ["u-first", "u-second"], slot="chat-tl")
+    assert excinfo.value.field == "seq"
+    assert "one succession unit" in str(excinfo.value)
 
 
 # --- tools ----------------------------------------------------------------
@@ -708,1413 +1265,3 @@ def test_approvals_counts_a_decision_with_no_request_before_it():
     value = crew_log.fold_approvals(_entries(handle))
     assert value["unmatched_decisions"] == 1
     assert value["by_decision"] == {"deny": 1}
-
-
-# --- reading a session ----------------------------------------------------
-
-
-def test_a_session_with_no_crew_log_folds_to_the_empty_projections():
-    bundle = crew_log.fold_session("s-absent")
-    assert bundle.last_seq == 0
-    assert set(bundle.checkpoints) == set(crew_log.PROJECTION_NAMES)
-    assert bundle.projection("status").value["lifecycle"] == "unknown"
-    assert crew_log.read_projection("s-absent", "usage").seq == 0
-
-
-def test_fold_session_serves_every_projection_from_one_pass():
-    _busy_log()
-    bundle = crew_log.fold_session(SESSION)
-    assert set(bundle.checkpoints) == set(crew_log.PROJECTION_NAMES)
-    for name in crew_log.PROJECTION_NAMES:
-        assert bundle.projection(name).value == crew_log.read_projection(SESSION, name).value
-
-
-def test_fold_session_continues_from_an_earlier_bundle():
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-    first = crew_log.fold_session(SESSION)
-    _turn(handle, 2, credits=2.0)
-    second = crew_log.fold_session(SESSION, since=first)
-    assert second.last_seq > first.last_seq
-    assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
-
-
-def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_start():
-    """A non-advancing seq in the tail refuses BOTH ways -- never one way only.
-
-    The append-only writer cannot produce a duplicate or backward seq, so one
-    in the file is external damage. A fold from the start refuses it in
-    ``advance``. Without the walked-entry guard, an incremental read drops the
-    record below its resume seq unexamined and folds on -- two reads of the
-    same bytes disagree and a reader cannot tell which answer it is getting.
-    The guard in ``iter_from`` makes the incremental read refuse the same
-    damage with the same code.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    bundle = crew_log.fold_session(SESSION)
-
-    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
-    last_line = path.read_bytes().splitlines(keepends=True)[-1]
-    with open(path, "ab") as damaged:
-        damaged.write(last_line)  # byte-identical copy: the last seq appears twice
-    _turn(handle, 2)  # a real turn past the damage, so the incremental read walks over it
-
-    with pytest.raises(CrewLogError) as from_start:
-        crew_log.fold_session(SESSION)
-    with pytest.raises(CrewLogError) as incremental:
-        crew_log.fold_session(SESSION, since=bundle)
-
-    assert from_start.value.code == lg.CODE_BAD_DATA
-    assert incremental.value.code == lg.CODE_BAD_DATA
-
-
-def test_fold_session_incremental_refuses_a_backward_tail_after_real_growth():
-    """A regressed physical tail cannot hide valid growth from a cached fold."""
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    bundle = crew_log.fold_session(SESSION)
-
-    _turn(handle, 2)
-    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
-    earlier_line = next(
-        line
-        for line in path.read_bytes().splitlines(keepends=True)
-        if json.loads(line).get("seq") == bundle.last_seq
-    )
-    with open(path, "ab") as damaged:
-        damaged.write(earlier_line)
-
-    with pytest.raises(CrewLogError) as from_start:
-        crew_log.fold_session(SESSION)
-    with pytest.raises(CrewLogError) as incremental:
-        crew_log.fold_session(SESSION, since=bundle)
-
-    assert from_start.value.code == lg.CODE_BAD_DATA
-    assert incremental.value.code == lg.CODE_BAD_DATA
-
-
-def test_fold_session_incremental_refuses_same_size_rewrite_of_folded_seq():
-    """A same-size rewrite behind the resume point must invalidate the cache."""
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    bundle = crew_log.fold_session(SESSION)
-
-    path = lg.crew_log_path(lg.KIND_SESSION, SESSION)
-    before = path.stat()
-    lines = path.read_bytes().splitlines(keepends=True)
-    damaged = json.loads(lines[-2])
-    damaged["seq"] = json.loads(lines[-3])["seq"]
-    replacement = (
-        json.dumps(damaged, ensure_ascii=True, separators=(",", ":"), sort_keys=False).encode()
-        + b"\n"
-    )
-    assert len(replacement) == len(lines[-2])
-    lines[-2] = replacement
-    path.write_bytes(b"".join(lines))
-    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
-    assert path.stat().st_size == before.st_size
-
-    with pytest.raises(CrewLogError) as incremental:
-        crew_log.fold_session(SESSION, since=bundle)
-
-    assert incremental.value.code == lg.CODE_BAD_DATA
-
-
-def test_fold_session_incremental_refuses_older_segment_seq_regression():
-    """A seq regression in a NON-newest segment must invalidate the fast path.
-
-    ``handle.path`` names only the newest segment, so a fingerprint taken from
-    it alone never sees an older segment move -- the fast return would serve the
-    cached bundle while a cold fold refuses the log. The fingerprint covers the
-    whole segment set for exactly this case.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    _turn(handle, 2)
-    del handle
-
-    # Split the single-segment log into two valid segments: the head keeps the
-    # early records, ``log.<first_seq>.jsonl`` carries the tail. Each segment
-    # begins with the header line, as the raw walks expect.
-    head = lg.crew_log_path(lg.KIND_SESSION, SESSION)
-    lines = head.read_bytes().splitlines(keepends=True)
-    header, records = lines[0], lines[1:]
-    keep, moved = records[: len(records) // 2], records[len(records) // 2 :]
-    first_moved_seq = json.loads(moved[0])["seq"]
-    head.write_bytes(header + b"".join(keep))
-    (head.parent / f"log.{first_moved_seq}.jsonl").write_bytes(header + b"".join(moved))
-
-    handle = CrewLog.open(lg.KIND_SESSION, SESSION)
-    bundle = crew_log.fold_session(SESSION, log=handle)
-
-    # Regress a seq INSIDE the older segment, same byte length, and touch only
-    # that older file -- the newest segment never changes, which is what the
-    # newest-only fingerprint could not see.
-    before = head.stat()
-    old_lines = head.read_bytes().splitlines(keepends=True)
-    damaged = json.loads(old_lines[-1])
-    damaged["seq"] = json.loads(old_lines[-2])["seq"] if len(old_lines) > 2 else damaged["seq"]
-    replacement = (
-        json.dumps(damaged, ensure_ascii=True, separators=(",", ":"), sort_keys=False).encode()
-        + b"\n"
-    )
-    assert len(replacement) == len(old_lines[-1])
-    old_lines[-1] = replacement
-    head.write_bytes(b"".join(old_lines))
-    os.utime(head, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
-
-    with pytest.raises(CrewLogError) as incremental:
-        crew_log.fold_session(SESSION, since=bundle)
-
-    assert incremental.value.code == lg.CODE_BAD_DATA
-
-
-def test_fold_session_unchanged_fast_path_does_not_walk_entries(monkeypatch):
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    bundle = crew_log.fold_session(SESSION)
-    calls = 0
-    original = CrewLog.iter_from
-
-    def counting(self, *args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(CrewLog, "iter_from", counting)
-    unchanged = crew_log.fold_session(SESSION, since=bundle)
-
-    assert unchanged == bundle
-    assert calls == 0
-
-
-def test_fold_session_old_bundle_without_size_walks_once(monkeypatch):
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    bundle = crew_log.fold_session(SESSION)
-    old_bundle = replace(bundle, size=None)
-    calls = 0
-    original = CrewLog.iter_from
-
-    def counting(self, *args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(CrewLog, "iter_from", counting)
-    refreshed = crew_log.fold_session(SESSION, since=old_bundle)
-
-    assert refreshed.projection("usage") == bundle.projection("usage")
-    assert refreshed.size is not None
-    assert refreshed.mtime_ns is not None
-    assert calls == 1
-
-
-def test_fold_session_old_bundle_without_mtime_walks_once(monkeypatch):
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    bundle = crew_log.fold_session(SESSION)
-    old_bundle = replace(bundle, mtime_ns=None)
-    calls = 0
-    original = CrewLog.iter_from
-
-    def counting(self, *args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(CrewLog, "iter_from", counting)
-    refreshed = crew_log.fold_session(SESSION, since=old_bundle)
-
-    assert refreshed.projection("usage") == bundle.projection("usage")
-    assert refreshed.mtime_ns is not None
-    assert calls == 1
-
-
-def test_fold_session_rebuilds_when_the_log_is_shorter_than_the_bundle():
-    """A recreated unit restarts seq, so continuing would swallow the new log.
-
-    The stale bundle carries a DIFFERENT session's state under this session's id
-    and a seq beyond this file's end, which is the shape a cache holds after the
-    unit it was folded from is removed and recreated. Reusing it returns the other
-    session's totals and reports them at this file's seq.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-
-    busier = _log("s-busier")
-    _opened(busier)
-    for turn in (1, 2, 3):
-        _turn(busier, turn, credits=5.0)
-    foreign = crew_log.fold_session("s-busier")
-    ahead = handle.last_seq + 100
-    stale = crew_log.SessionProjections(
-        session_id=SESSION,
-        last_seq=ahead,
-        checkpoints={
-            name: crew_log.Checkpoint(name=name, last_seq=ahead, state=checkpoint.state)
-            for name, checkpoint in foreign.checkpoints.items()
-        },
-    )
-
-    rebuilt = crew_log.fold_session(SESSION, since=stale)
-    honest = crew_log.fold_usage(_entries(handle))
-    assert rebuilt.last_seq == handle.last_seq
-    assert rebuilt.projection("usage").value == honest
-    assert honest["turns"]["completed"] == 1
-
-
-def test_fold_session_ignores_a_bundle_belonging_to_another_session():
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-    other = _log("s-other")
-    _opened(other)
-    foreign = crew_log.fold_session("s-other")
-    folded = crew_log.fold_session(SESSION, since=foreign)
-    assert folded.projection("usage").value == crew_log.fold_usage(_entries(handle))
-
-
-def test_fold_session_rebuilds_when_the_bundle_lacks_a_name_it_is_asked_for():
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-    partial = crew_log.fold_session(SESSION, ("status",))
-    full = crew_log.fold_session(SESSION, crew_log.PROJECTION_NAMES, since=partial)
-    assert full.projection("usage").value == crew_log.fold_usage(_entries(handle))
-
-
-def test_fold_session_refuses_an_entry_type_it_cannot_interpret():
-    """A required unknown type stops the fold rather than skewing a total."""
-    handle = _log()
-    _opened(handle)
-    path = handle.path
-    line = json.dumps(
-        {
-            "type": "turn/teleported",
-            "seq": handle.last_seq + 1,
-            "time": 1789000000000,
-            "src": GATEWAY,
-            "data": {"turn": 1},
-        }
-    )
-    with path.open("a", encoding="utf-8") as sink:
-        sink.write(line + "\n")
-    with pytest.raises(CrewLogError) as excinfo:
-        crew_log.fold_session(SESSION)
-    assert excinfo.value.code == lg.CODE_UNKNOWN_ENTRY_TYPE
-
-
-def test_fold_session_skips_an_ignorable_type_it_cannot_interpret():
-    handle = _log()
-    _opened(handle)
-    line = json.dumps(
-        {
-            "type": "sample/taken",
-            "seq": handle.last_seq + 1,
-            "time": 1789000000000,
-            "src": GATEWAY,
-            "ignorable": True,
-            "data": {},
-        }
-    )
-    with handle.path.open("a", encoding="utf-8") as sink:
-        sink.write(line + "\n")
-    assert crew_log.fold_session(SESSION).projection("status").value["lifecycle"] == "open"
-
-
-def test_open_session_log_reads_without_claiming_write_ownership():
-    """A read must not refuse just because the live writer holds the lease."""
-    writer = _log()
-    _opened(writer)
-    reader = crew_log.open_session_log(SESSION)
-    assert reader is not None
-    assert reader.last_seq == writer.last_seq
-    # The writer still owns its unit: the read took nothing away from it.
-    writer.append("session/closed", {"reason": "reset"}, src=GATEWAY)
-
-
-def test_open_session_log_is_none_for_a_session_that_has_none():
-    assert crew_log.open_session_log("s-nothing") is None
-
-
-def test_known_types_is_the_declared_session_vocabulary():
-    assert crew_log.KNOWN_TYPES == frozenset(lg.SESSION_ENTRY_TYPES)
-
-
-def test_the_fold_registry_and_the_public_name_list_agree():
-    assert tuple(crew_log._FOLDS) == crew_log.FOLD_NAMES
-
-
-def test_a_ref_on_a_session_entry_is_left_to_the_page_path():
-    """A fold reads its own crew log only (FR-4), so a ref changes no fold's value."""
-    handle = _log()
-    _opened(handle)
-    handle.append(
-        "subagent/spawned",
-        {"turn": 1, "agent_id": "sub-1", "agent": "worker", "model": "opus"},
-        src=GATEWAY,
-        ref=Ref(unit=lg.KIND_SESSION, id="s-child", from_seq=1, to_seq=4),
-    )
-    value = crew_log.fold_timeline(_entries(handle))
-    assert value["moments"][-1]["type"] == "subagent/spawned"
-    assert "ref" not in value["moments"][-1]
-
-
-# --------------------------------------------------------------------------- #
-# bounded state (a-bound-bounds-every-field-it-retains)
-# --------------------------------------------------------------------------- #
-
-
-def test_tools_open_map_is_bounded_when_calls_are_never_completed():
-    """Never-matched open tool calls do not grow the checkpoint without bound.
-
-    A session that opens far more distinct calls than it completes must keep the
-    retained ``open`` map bounded and count the ones it dropped, the same way the
-    render already caps the listed window.
-    """
-    handle = _log()
-    _opened(handle)
-    overflow = crew_log.OPEN_RETAIN_LIMIT + 25
-    _append_grouped(
-        handle,
-        [
-            {
-                "type": "tool/called",
-                "data": {
-                    "turn": 1,
-                    "call_id": f"open-{index}",
-                    "name": "fs_read",
-                    "server": "core",
-                    "kind": "mcp",
-                },
-            }
-            for index in range(overflow)
-        ],
-    )
-    bundle = crew_log.fold_session(SESSION, ("tools",))
-    state = bundle.checkpoints["tools"].state
-    assert len(state["open"]) == crew_log.OPEN_RETAIN_LIMIT
-    assert state["open_omitted"] == overflow - crew_log.OPEN_RETAIN_LIMIT
-    value = bundle.projection("tools").value
-    assert value["open"] == crew_log.OPEN_RETAIN_LIMIT
-    assert value["open_dropped"] == overflow - crew_log.OPEN_RETAIN_LIMIT
-
-
-def test_approvals_pending_map_is_bounded_when_requests_are_never_decided():
-    """Never-decided approval requests keep the retained ``pending`` map bounded."""
-    handle = _log()
-    _opened(handle)
-    overflow = crew_log.OPEN_RETAIN_LIMIT + 10
-    _append_grouped(
-        handle,
-        [
-            {
-                "type": "approval/requested",
-                "data": {"turn": 1, "approval_id": f"ap-{index}", "tool": "shell", "reason": "x"},
-            }
-            for index in range(overflow)
-        ],
-    )
-    bundle = crew_log.fold_session(SESSION, ("approvals",))
-    state = bundle.checkpoints["approvals"].state
-    assert len(state["pending"]) == crew_log.OPEN_RETAIN_LIMIT
-    assert state["pending_omitted"] == overflow - crew_log.OPEN_RETAIN_LIMIT
-    assert bundle.projection("approvals").value["pending_dropped"] == (
-        overflow - crew_log.OPEN_RETAIN_LIMIT
-    )
-
-
-def test_usage_by_model_is_bounded_when_many_models_appear():
-    """Many distinct models keep the retained ``by_model`` map bounded while the
-    whole-session totals stay exact."""
-    handle = _log()
-    _opened(handle)
-    overflow = crew_log.MODEL_LIMIT + 15
-    _append_grouped(
-        handle,
-        [
-            item
-            for turn in range(1, overflow + 1)
-            for item in _turn_items(turn, credits=1.0, model=f"model-{turn}")
-        ],
-    )
-    value = crew_log.fold_session(SESSION, ("usage",)).projection("usage").value
-    assert len(value["by_model"]) == crew_log.MODEL_LIMIT
-    assert value["models_omitted"] == overflow - crew_log.MODEL_LIMIT
-    # The whole-session totals count every turn, budget or not.
-    assert value["turns"]["completed"] == overflow
-    assert value["turns"]["credits_reported"] == overflow
-    assert value["credits"] == float(overflow)
-
-
-def test_tool_row_servers_are_bounded_per_name():
-    """One tool called through many distinct servers bounds its ``servers`` list."""
-    handle = _log()
-    _opened(handle)
-    overflow = crew_log.SERVERS_PER_TOOL_LIMIT + 8
-    for index in range(overflow):
-        handle.append(
-            "tool/called",
-            {
-                "turn": 1,
-                "call_id": f"c{index}",
-                "name": "fs_read",
-                "server": f"srv-{index}",
-                "kind": "mcp",
-            },
-            src=GATEWAY,
-        )
-    row = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value["by_name"]["fs_read"]
-    assert len(row["servers"]) == crew_log.SERVERS_PER_TOOL_LIMIT
-    assert row["servers_omitted"] == overflow - crew_log.SERVERS_PER_TOOL_LIMIT
-
-
-def test_servers_omitted_counts_distinct_servers_not_repeated_calls():
-    """Repeated calls through one over-budget server count as one omitted server."""
-    handle = _log()
-    _opened(handle)
-    # Fill the listed budget with distinct servers, then call ONE extra server
-    # many times: it is one omitted server, not many.
-    for index in range(crew_log.SERVERS_PER_TOOL_LIMIT):
-        handle.append(
-            "tool/called",
-            {
-                "turn": 1,
-                "call_id": f"c{index}",
-                "name": "fs_read",
-                "server": f"srv-{index}",
-                "kind": "mcp",
-            },
-            src=GATEWAY,
-        )
-    for repeat in range(5):
-        handle.append(
-            "tool/called",
-            {
-                "turn": 1,
-                "call_id": f"x{repeat}",
-                "name": "fs_read",
-                "server": "overflow",
-                "kind": "mcp",
-            },
-            src=GATEWAY,
-        )
-    row = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value["by_name"]["fs_read"]
-    assert row["servers_omitted"] == 1
-
-
-# --------------------------------------------------------------------------- #
-# recreated-then-grown reuse (residual/crash-data-loss-corruption)
-# --------------------------------------------------------------------------- #
-
-
-def test_fold_session_rebuilds_when_the_bundle_origin_does_not_match_the_file():
-    """A bundle whose origin differs from the current file is not reused.
-
-    This is the removed-and-recreated case that has already grown PAST the cached
-    seq: the seq guard (``since.last_seq <= last_seq``) passes because the file is
-    longer than the stale bundle, so without the file-identity check the old
-    file's state would be folded over the new file's bytes. A recreated log has a
-    different origin (a fresh ``created_at`` and/or inode), so the reuse is
-    refused and the fold rebuilds from the start. Filesystem-free so it behaves
-    the same on every platform.
-    """
-    handle = _log()
-    _opened(handle)
-    for turn in range(1, 6):
-        _turn(handle, turn, credits=1.0)
-
-    # A stale bundle from a DIFFERENT file: real checkpoints (so a wrong reuse
-    # would fold visibly wrong totals) but a foreign origin and a seq below the
-    # current head, the exact recreated-then-grown shape.
-    other = _log("s-other-origin")
-    _opened(other)
-    for turn in (1, 2):
-        _turn(other, turn, credits=99.0)
-    foreign = crew_log.fold_session("s-other-origin")
-    stale = crew_log.SessionProjections(
-        session_id=SESSION,
-        last_seq=foreign.last_seq,
-        checkpoints=foreign.checkpoints,
-        origin="not-this-file",
-    )
-    assert stale.last_seq < handle.last_seq  # seq guard alone would pass
-
-    rebuilt = crew_log.fold_session(SESSION, since=stale)
-    honest = crew_log.fold_usage(_entries(handle))
-    assert rebuilt.projection("usage").value == honest
-    assert rebuilt.origin is not None and rebuilt.origin != stale.origin
-
-
-def test_fold_session_reuses_the_bundle_when_the_file_is_the_same():
-    """The origin guard does not defeat a legitimate incremental reuse."""
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-    first = crew_log.fold_session(SESSION, log=handle)
-    _turn(handle, 2, credits=1.0)
-    second = crew_log.fold_session(SESSION, since=first, log=handle)
-    assert second.origin == first.origin
-    assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
-
-
-def _rewrite_in_place(target, lines: list[str]) -> None:
-    """Replace *target*'s whole content, keeping its device and inode.
-
-    A removal and a create would hand the new file a new inode on most runs, and
-    then device and inode refuse the reuse on their own -- so a test written that
-    way is decided by whether the filesystem recycled the inode, and passes
-    without the identity it means to exercise. Truncating in place is the
-    recycled-inode case made deterministic: same device, same inode, different
-    file. The assertion below is what keeps it that way.
-    """
-    before = target.stat()
-    with target.open("w", encoding="utf-8") as handle:
-        for line in lines:
-            handle.write(line + "\n")
-    after = target.stat()
-    assert (after.st_dev, after.st_ino) == (
-        before.st_dev,
-        before.st_ino,
-    ), "the rewrite moved the file, so device and inode alone would refuse it"
-
-
-def test_the_file_identity_reads_the_creation_stamp_from_disk_not_from_the_handle():
-    """A handle's own header describes the file that existed when it was opened.
-
-    The identity exists to separate a recreated log from the one a reader started
-    on. Taken from the open handle, the stamp cannot do that: it is parsed once at
-    open and keeps answering for the replaced file, leaving device and inode as the
-    only live signal -- and those agree whenever the new file landed on the freed
-    inode, which is the common case. Here they are held IDENTICAL on purpose, so
-    only a stamp read from disk can tell the two files apart.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-    before = crew_log.log_origin(handle)
-    assert before is not None
-
-    lines = handle.path.read_text(encoding="utf-8").splitlines()
-    header = json.loads(lines[0])
-    header["createdAt"] = header["createdAt"] + 1
-    _rewrite_in_place(handle.path, [json.dumps(header), *lines[1:]])
-
-    after = crew_log.log_origin(handle)
-    assert after is not None, "a readable header is a provable identity"
-    assert after != before
-
-
-def test_a_log_recreated_under_a_held_handle_is_folded_again_rather_than_spliced():
-    """The caller passes its handle back in, so the reuse must not trust it.
-
-    ``fold_session`` takes ``log=`` from a caller that already holds one, which is
-    what makes this reachable without any race: the handle was opened before the
-    recreation, so a stamp read from it still names the retired file. The seq guard
-    passes because the new file is longer, so nothing else stands between the old
-    file's folded state and the new file's bytes -- the totals below are the old
-    turn plus part of the new ones, a number no file on disk ever held.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1, credits=1.0)
-    first = crew_log.fold_session(SESSION, log=handle)
-
-    # A different, longer log, written over the first one's bytes: the same id, a
-    # fresh creation stamp, and turns whose credits could not come from the file
-    # the bundle was folded from.
-    donor = _log("s-recreated")
-    _opened(donor)
-    for turn in (1, 2, 3):
-        _turn(donor, turn, credits=99.0)
-    body = donor.path.read_text(encoding="utf-8").splitlines()
-    header = json.loads(body[0])
-    header["id"] = SESSION
-    retired = json.loads(handle.path.read_text(encoding="utf-8").splitlines()[0])
-    header["createdAt"] = retired["createdAt"] + 1
-    _rewrite_in_place(handle.path, [json.dumps(header), *body[1:]])
-
-    settled = CrewLog.open(lg.KIND_SESSION, SESSION)
-    assert first.last_seq <= settled.last_seq, "the seq guard alone would allow the reuse"
-    honest = crew_log.fold_usage(_entries(settled))
-
-    rebuilt = crew_log.fold_session(SESSION, since=first, log=handle)
-
-    assert rebuilt.projection("usage").value == honest
-    assert rebuilt.origin is not None and rebuilt.origin != first.origin
-
-
-# --------------------------------------------------------------------------- #
-# bounds on what a fold RETAINS, and on what one pass holds
-# --------------------------------------------------------------------------- #
-
-
-def test_a_cold_fold_crossing_the_chunk_boundary_matches_the_whole_file(monkeypatch):
-    """Folding a span in chunks is the same value as folding it whole.
-
-    ``fold_session`` reads the log one bounded chunk at a time so a cold fold of a
-    long log does not hold the whole thing in memory. That is only safe if the
-    chunk boundary is invisible in the result, so this drives a log well past
-    ``FOLD_CHUNK_ENTRIES``, compares against the from-scratch fold, AND counts the
-    passes -- otherwise the test would still pass if the chunking were removed.
-    """
-    handle = _log()
-    _opened(handle)
-    # Two entries per tool, so this clears the chunk boundary several times over.
-    items: list[dict[str, Any]] = []
-    for index in range(crew_log.FOLD_CHUNK_ENTRIES):
-        items.extend(_tool_items(1, f"c{index}", "fs_read"))
-    _append_grouped(handle, items)
-    assert handle.last_seq > crew_log.FOLD_CHUNK_ENTRIES
-
-    passes = []
-    real_advance_all = crew_log._advance_all
-
-    def counting(checkpoints, chunk):
-        passes.append(len(chunk))
-        return real_advance_all(checkpoints, chunk)
-
-    monkeypatch.setattr(crew_log, "_advance_all", counting)
-    chunked = crew_log.fold_session(SESSION, ("tools",)).projection("tools").value
-    whole = crew_log.fold_tools(_entries(handle))
-    assert chunked == whole
-    assert chunked["calls"] == crew_log.FOLD_CHUNK_ENTRIES
-    # More than one pass, and no pass bigger than the chunk bound.
-    assert len(passes) > 1
-    assert max(passes) <= crew_log.FOLD_CHUNK_ENTRIES
-
-
-def test_a_grouped_fixture_is_the_log_one_append_at_a_time_writes(monkeypatch):
-    """Writing a fixture in groups changes its COST, not the log a fold reads.
-
-    The fixtures above reach bounds that are themselves in the hundreds or
-    thousands, and one ``append`` per entry is one ``os.fsync`` per entry. The
-    cold-fold fixture's 2049 of those measure 156-185 s on the Windows runner
-    against a 180 s per-test cap, and a breach there terminates the whole xdist
-    worker instead of failing one test, so a shard of 1600 tests dies on a file its
-    author never opened. Substituting ``append_many`` is only SAFE if the entries
-    are the same ones, and only WORTH it if the durable writes stop scaling with
-    the entry count -- so this pins both halves. Without it, an edit can quietly
-    restore the per-entry cost, and the only signal is an intermittent Windows
-    worker death with no assertion to read.
-    """
-    monkeypatch.setattr(store, "now_ms", lambda: 1_700_000_000_000)
-    syncs = {"n": 0}
-    real_write_then_sync = store._write_then_sync
-
-    def counting(path, blob):
-        syncs["n"] += 1
-        return real_write_then_sync(path, blob)
-
-    monkeypatch.setattr(store, "_write_then_sync", counting)
-
-    # Small, and a group size to match: this test must cross a group boundary
-    # without paying the cost it exists to remove.
-    tools, group = 10, 8
-    items = [item for index in range(tools) for item in _tool_items(1, f"c{index}", "fs_read")]
-
-    one_at_a_time = _log("s-one-at-a-time")
-    syncs["n"] = 0
-    for index in range(tools):
-        _tool(one_at_a_time, 1, f"c{index}", "fs_read")
-    per_entry_syncs = syncs["n"]
-
-    grouped = _log("s-grouped")
-    syncs["n"] = 0
-    _append_grouped(grouped, items, group=group)
-    grouped_syncs = syncs["n"]
-
-    # The same entries, in the same order, with the same seqs and bodies.
-    assert [entry.to_dict() for entry in _entries(grouped)] == [
-        entry.to_dict() for entry in _entries(one_at_a_time)
-    ]
-    assert grouped.last_seq == one_at_a_time.last_seq == len(items)
-
-    # One durable write per entry becomes one per group.
-    assert per_entry_syncs == len(items)
-    assert grouped_syncs == -(-len(items) // group)
-    assert grouped_syncs < per_entry_syncs
-
-
-def test_an_over_long_call_id_is_counted_and_not_retained():
-    """An id too big to retain identifies nothing, exactly like an absent one.
-
-    A ``call_id`` comes off the wire and nothing on that path caps its length, so
-    retaining it raw would let a few frames outweigh the whole entry budget the
-    ``open`` map is counted against. It cannot be TRUNCATED to fit -- two distinct
-    ids sharing a head would become one identity and a completion would close the
-    wrong frame -- so it takes the unidentified path instead.
-    """
-    handle = _log()
-    _opened(handle)
-    handle.append(
-        "tool/called",
-        {
-            "turn": 1,
-            "call_id": "x" * (crew_log.ID_LIMIT + 1),
-            "name": "fs_read",
-            "server": "core",
-            "kind": "mcp",
-        },
-        src=GATEWAY,
-    )
-    value = crew_log.fold_tools(_entries(handle))
-    assert value["calls"] == 1
-    assert value["unidentified_calls"] == 1
-    assert value["open"] == 0
-
-    state = crew_log.fold_session(SESSION, ("tools",)).checkpoints["tools"].state
-    assert state["open"] == {}
-    # An id one character shorter is ordinary and IS retained, so the refusal is
-    # the length and not the shape.
-    other = _log("s-id-edge")
-    _opened(other)
-    other.append(
-        "tool/called",
-        {
-            "turn": 1,
-            "call_id": "x" * crew_log.ID_LIMIT,
-            "name": "fs_read",
-            "server": "core",
-            "kind": "mcp",
-        },
-        src=GATEWAY,
-    )
-    kept = crew_log.fold_tools(_entries(other))
-    assert kept["unidentified_calls"] == 0
-    assert kept["open"] == 1
-
-
-def test_an_over_long_call_id_on_a_completion_does_not_inflate_unmatched():
-    """The completion side coerces the id the same way the call side does.
-
-    If a completion paired on the raw id while the call retained a coerced one,
-    the two would disagree about what an identity is: the same frame would be
-    unbounded on one side and reported unmatched on the other.
-    """
-    handle = _log()
-    _opened(handle)
-    handle.append(
-        "tool/completed",
-        {
-            "turn": 1,
-            "call_id": "y" * (crew_log.ID_LIMIT + 1),
-            "name": "fs_read",
-            "server": "core",
-            "status": "completed",
-        },
-        src=GATEWAY,
-    )
-    value = crew_log.fold_tools(_entries(handle))
-    assert value["completed"] == 1
-    assert value["unmatched_completions"] == 0
-
-
-def test_an_over_long_approval_id_is_counted_and_not_retained():
-    """The pending-approval map bounds its identity the same way tools do."""
-    handle = _log()
-    _opened(handle)
-    handle.append(
-        "approval/requested",
-        {
-            "turn": 1,
-            "approval_id": "z" * (crew_log.ID_LIMIT + 1),
-            "tool": "execute_bash",
-            "reason": "writes a file",
-        },
-        src=GATEWAY,
-    )
-    value = crew_log.fold_approvals(_entries(handle))
-    assert value["requested"] == 1
-    assert value["unidentified_requests"] == 1
-    assert value["pending"] == 0
-
-
-def test_names_omitted_stops_counting_rather_than_counting_a_name_twice():
-    """Past the dedup budget the count says it is a floor instead of inflating.
-
-    ``names_omitted`` is a count of DISTINCT names left out of the detail, and it
-    is deduplicated against a list that is itself capped. A name arriving once the
-    list is full is not recognised as already-seen, so counting it again would
-    count one name once per appearance -- a call and its completion both reach
-    here -- and the figure would climb past the number of names that exist.
-    """
-    handle = _log()
-    _opened(handle)
-    distinct = crew_log.TOOL_NAME_LIMIT * 3
-    _append_grouped(
-        handle,
-        [
-            item
-            for index in range(distinct)
-            for item in _tool_items(1, f"c{index}", f"tool_{index:05d}")
-        ],
-    )
-    value = crew_log.fold_tools(_entries(handle))
-
-    omitted_names = distinct - crew_log.TOOL_NAME_LIMIT
-    assert len(value["by_name"]) == crew_log.TOOL_NAME_LIMIT
-    # The count never exceeds the number of names actually left out -- the whole
-    # point -- and stops at the dedup budget, saying so.
-    assert value["names_omitted"] <= omitted_names
-    assert value["names_omitted"] == crew_log.TOOL_NAME_LIMIT
-    assert value["names_omitted_saturated"] is True
-    # Totals stay exact regardless.
-    assert value["calls"] == distinct
-    assert value["completed"] == distinct
-
-
-def test_names_omitted_is_exact_and_unsaturated_inside_the_dedup_budget():
-    """Below the budget the count is a total, not a floor."""
-    handle = _log()
-    _opened(handle)
-    extra = 4
-    _append_grouped(
-        handle,
-        [
-            item
-            for index in range(crew_log.TOOL_NAME_LIMIT + extra)
-            for item in _tool_items(1, f"c{index}", f"tool_{index:05d}")
-        ],
-    )
-    value = crew_log.fold_tools(_entries(handle))
-    assert value["names_omitted"] == extra
-    assert value["names_omitted_saturated"] is False
-
-
-def test_a_retained_label_is_cut_to_the_text_limit():
-    """A label is retained, so its SIZE is part of the bound on the state.
-
-    This is about a label that is pure display and never distinguishes one thing
-    from another -- an approval's reason -- so cutting it is safe and is the
-    honest bound: the entry stays, bounded. A label used as a KEY takes the other
-    path and is refused rather than cut, because two cut keys could merge.
-    """
-    handle = _log()
-    _opened(handle)
-    handle.append(
-        "approval/requested",
-        {
-            "turn": 1,
-            "approval_id": "a1",
-            "tool": "execute_bash",
-            "reason": "r" * (crew_log.TEXT_LIMIT * 20),
-        },
-        src=GATEWAY,
-    )
-    value = crew_log.fold_approvals(_entries(handle))
-    (pending,) = value["pending_requests"]
-    assert len(pending["reason"]) == crew_log.TEXT_LIMIT
-    assert value["pending"] == 1
-
-
-def test_two_names_sharing_a_cut_head_do_not_merge_their_totals():
-    """A label at the cut length is not keyed, so distinct tools stay distinct.
-
-    A retained label is cut to ``TEXT_LIMIT``, which means a label sitting exactly
-    at that length cannot be told apart from one that was cut. Keying on it would
-    put two unrelated tools in one row reporting each other's calls -- a wrong
-    answer, not merely a big value -- so such a label gets no detail row and is
-    counted as omitted instead.
-    """
-    handle = _log()
-    _opened(handle)
-    head = "t" * crew_log.TEXT_LIMIT
-    _tool(handle, 1, "c1", head + "-alpha")
-    _tool(handle, 1, "c2", head + "-beta")
-    value = crew_log.fold_tools(_entries(handle))
-
-    # Neither name is detailed, and no row claims both calls.
-    assert value["by_name"] == {}
-    # The two names are indistinguishable ONCE CUT, so the omitted count reports
-    # one label rather than claiming two it cannot tell apart. The load-bearing
-    # property is above -- no row carrying both tools' calls -- and below: the
-    # whole-session totals stay exact whatever the detail can and cannot separate.
-    assert value["names_omitted"] == 1
-    assert value["calls"] == 2
-    assert value["completed"] == 2
-
-
-def test_a_name_just_under_the_cut_length_still_gets_its_row():
-    """The refusal is the cut length, not long names in general."""
-    handle = _log()
-    _opened(handle)
-    name = "u" * (crew_log.TEXT_LIMIT - 1)
-    _tool(handle, 1, "c1", name)
-    value = crew_log.fold_tools(_entries(handle))
-    assert list(value["by_name"]) == [name]
-    assert value["names_omitted"] == 0
-
-
-def test_models_omitted_counts_models_not_the_turns_they_ran():
-    """One omitted model running many turns is one omitted model.
-
-    The per-model detail is capped, and the count beside it is a count of MODELS.
-    Counting it per turn would make it climb past the number of models that exist,
-    which is the same defect the tool-name count avoids.
-    """
-    handle = _log()
-    _opened(handle)
-    _append_grouped(
-        handle,
-        [
-            item
-            for index in range(crew_log.MODEL_LIMIT)
-            for item in _turn_items(index + 1, credits=1.0, model=f"model_{index:04d}")
-        ],
-    )
-    # One further model, run over MANY turns.
-    turns = 25
-    _append_grouped(
-        handle,
-        [
-            item
-            for index in range(turns)
-            for item in _turn_items(
-                crew_log.MODEL_LIMIT + index + 1, credits=1.0, model="one-extra"
-            )
-        ],
-    )
-    value = crew_log.fold_usage(_entries(handle))
-
-    assert len(value["by_model"]) == crew_log.MODEL_LIMIT
-    assert value["models_omitted"] == 1
-    assert value["models_omitted_saturated"] is False
-    # The whole-session totals still count every turn exactly.
-    assert value["turns"]["completed"] == crew_log.MODEL_LIMIT + turns
-
-
-def test_models_omitted_saturates_rather_than_counting_a_model_twice():
-    """Past the dedup budget the model count says it is a floor."""
-    handle = _log()
-    _opened(handle)
-    distinct = crew_log.MODEL_LIMIT * 3
-    _append_grouped(
-        handle,
-        [
-            item
-            for index in range(distinct)
-            for item in _turn_items(index + 1, credits=1.0, model=f"model_{index:05d}")
-        ],
-    )
-    value = crew_log.fold_usage(_entries(handle))
-    omitted = distinct - crew_log.MODEL_LIMIT
-    assert value["models_omitted"] <= omitted
-    assert value["models_omitted"] == crew_log.MODEL_LIMIT
-    assert value["models_omitted_saturated"] is True
-
-
-def test_a_server_label_is_bounded_and_not_listed_at_full_length():
-    """A server name is retained per tool, so its size is part of the bound."""
-    handle = _log()
-    _opened(handle)
-    handle.append(
-        "tool/called",
-        {
-            "turn": 1,
-            "call_id": "c1",
-            "name": "fs_read",
-            "server": "s" * (crew_log.TEXT_LIMIT * 20),
-            "kind": "mcp",
-        },
-        src=GATEWAY,
-    )
-    row = crew_log.fold_tools(_entries(handle))["by_name"]["fs_read"]
-    # Nothing retained at full length: a label at the cut length cannot be told
-    # apart from a cut one, so it is counted rather than listed.
-    assert all(len(server) < crew_log.TEXT_LIMIT for server in row["servers"])
-    assert row["servers"] == []
-    assert row["servers_omitted"] == 1
-
-    state = crew_log.fold_session(SESSION, ("tools",)).checkpoints["tools"].state
-    assert all(
-        len(server) <= crew_log.TEXT_LIMIT
-        for detail in state["by_name"].values()
-        for server in detail["servers"] + detail["servers_over"]
-    )
-
-
-def test_servers_omitted_counts_distinct_servers_and_says_when_it_saturates():
-    """The omitted-server count is exact to its budget, then says it is a floor."""
-    handle = _log()
-    _opened(handle)
-    total = crew_log.SERVERS_PER_TOOL_LIMIT * 3
-    for index in range(total):
-        handle.append(
-            "tool/called",
-            {
-                "turn": 1,
-                "call_id": f"c{index}",
-                "name": "fs_read",
-                "server": f"server_{index:04d}",
-                "kind": "mcp",
-            },
-            src=GATEWAY,
-        )
-    row = crew_log.fold_tools(_entries(handle))["by_name"]["fs_read"]
-    omitted = total - crew_log.SERVERS_PER_TOOL_LIMIT
-    assert len(row["servers"]) == crew_log.SERVERS_PER_TOOL_LIMIT
-    # Never more than the servers actually left out, and it says it stopped.
-    assert row["servers_omitted"] <= omitted
-    assert row["servers_omitted"] == crew_log.SERVERS_PER_TOOL_LIMIT
-    assert row["servers_omitted_saturated"] is True
-    # Calling repeatedly through one already-counted server adds nothing.
-    before = row["servers_omitted"]
-    handle.append(
-        "tool/called",
-        {
-            "turn": 1,
-            "call_id": "again",
-            "name": "fs_read",
-            "server": "server_0100",
-            "kind": "mcp",
-        },
-        src=GATEWAY,
-    )
-    assert crew_log.fold_tools(_entries(handle))["by_name"]["fs_read"]["servers_omitted"] == before
-
-
-def test_a_retained_status_string_is_bounded():
-    """A status echo is retained too, and a nullable one keeps its absence."""
-    handle = _log()
-    _opened(handle)
-    handle.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src=GATEWAY)
-    handle.append(
-        "turn/completed",
-        {
-            "turn": 1,
-            "stop_reason": "x" * (crew_log.TEXT_LIMIT * 20),
-            "error": "e" * (crew_log.TEXT_LIMIT * 20),
-            "model": "m" * (crew_log.TEXT_LIMIT * 20),
-            "depth": 0,
-        },
-        src=GATEWAY,
-    )
-    value = crew_log.fold_status(_entries(handle))
-    assert len(value["last_stop_reason"]) == crew_log.TEXT_LIMIT
-    assert len(value["last_error"]) == crew_log.TEXT_LIMIT
-    assert len(value["model"]) == crew_log.TEXT_LIMIT
-    # Absence still reads as absence, not as a reason of no characters.
-    assert crew_log.fold_status(_entries(_log("s-no-close")))["close_reason"] is None
-
-
-def test_a_close_mid_turn_still_reports_the_turn_as_open():
-    """A close is not a turn ending, and the fold must not claim it was.
-
-    A session cut off mid-turn writes ``session/closed`` with no
-    ``turn/completed``. Clearing the open turn here would assert the turn finished
-    when nothing recorded it doing so, and would erase the one fact a reader wants:
-    this session died with work in flight. Only ``turn/completed`` closes a turn.
-    """
-    handle = _log()
-    _opened(handle)
-    handle.append("turn/started", {"turn": 4, "actor": "user", "depth": 0}, src=GATEWAY)
-    handle.append("session/closed", {"reason": "crashed"}, src=GATEWAY)
-
-    value = crew_log.fold_status(_entries(handle))
-    assert value["lifecycle"] == "closed"
-    assert value["close_reason"] == "crashed"
-    assert value["turn_open"] is True, "a turn nothing completed is still open"
-
-
-# --------------------------------------------------------------------------- #
-# class
-# --------------------------------------------------------------------------- #
-
-
-def _opened_with_class(handle: CrewLog, **members: Any) -> None:
-    """``session/opened`` carrying a ``class`` object, the shape the emitter writes."""
-    handle.append(
-        "session/opened",
-        {
-            "agent": "kirocrew",
-            "slot": "dashboard:1",
-            "model": "opus",
-            "cwd": "/w",
-            "owner": "raymond",
-            "resumed": False,
-            "class": {"memory": "persistent", **members},
-        },
-        src=GATEWAY,
-    )
-
-
-def _class_moved(handle: CrewLog, **members: Any) -> None:
-    handle.append("session/class", {"memory": "persistent", **members}, src=GATEWAY)
-
-
-def test_a_class_that_never_moved_folds_to_the_opening_one():
-    """The ordinary session: recorded, complete, and nothing restrictive.
-
-    This is the admitting case, so it is what stops the fold being satisfied by
-    something that simply reports every log as restricted.
-    """
-    handle = _log()
-    _opened_with_class(handle)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["recorded"] is True
-    assert value["complete"] is True
-    assert value["channel"] is False
-    assert value["app"] == ""
-    assert value["memory"] == "persistent"
-
-
-def test_a_class_folds_to_the_most_restrictive_value_it_ever_held():
-    """MUTATION-SENSITIVE: restrictive-ever, not latest.
-
-    The log is published to a channel for one turn and then unpublished. Those turns
-    are still in this file, so a fold taking the LATEST value would report a log that
-    holds a third party's words as readable. Each member is checked separately
-    because they latch by different rules: ``channel`` is a flag, ``app`` keeps its
-    first owner, ``memory`` keeps its first non-persistent mode.
-    """
-    handle = _log()
-    _opened_with_class(handle)
-    _class_moved(handle, channel=True, app="travel-desk", memory="incognito")
-    _class_moved(handle)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["channel"] is True, "a channel the log ever had stays recorded"
-    assert value["app"] == "travel-desk", "an app that ever owned it stays recorded"
-    assert value["memory"] == "incognito", "a non-persistent mode stays recorded"
-
-
-def test_a_history_with_only_moves_is_recorded_but_not_complete():
-    """MUTATION-SENSITIVE: ``complete`` is what says the history has a BEGINNING.
-
-    Retention can take the segment carrying the opening entry. What survives states a
-    class, so ``recorded`` is true and a reader keying on that alone would admit --
-    while the earliest class this log held is unknown. ``complete`` is separately
-    false, which is what a reader refuses on.
-    """
-    handle = _log()
-    _class_moved(handle)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["recorded"] is True
-    assert value["complete"] is False
-
-
-def test_an_opener_with_no_class_object_records_nothing():
-    """A log written before the class was recorded, which must not read as unrestricted."""
-    handle = _log()
-    _opened(handle)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["recorded"] is False
-    assert value["complete"] is False
-
-
-def test_a_class_object_with_no_memory_mode_is_refused_at_append():
-    """``memory`` is required INSIDE the object, so a fragment never reaches a log.
-
-    This is the strong half of the guarantee: the declaration enforces it, so a
-    well-formed log cannot carry a class whose memory mode is unknown.
-    """
-    handle = _log()
-    with pytest.raises(CrewLogError) as caught:
-        handle.append(
-            "session/opened",
-            {
-                "agent": "kirocrew",
-                "slot": "dashboard:1",
-                "model": "opus",
-                "cwd": "/w",
-                "owner": "raymond",
-                "resumed": False,
-                "class": {"channel": True},
-            },
-            src=GATEWAY,
-        )
-    assert "class.memory" in str(caught.value)
-
-
-def test_a_recorded_dropped_write_marks_the_history_damaged():
-    """MUTATION-SENSITIVE: the log's own admission that an append was lost.
-
-    The writer sheds nothing on backpressure, but it has hard ceilings for a
-    filesystem that has stopped answering, and an entry refused there is recorded as
-    ``write/dropped``. For a fold whose answer is an authorization ceiling that is a
-    hole: the lost append may have been the class move that restricted this session,
-    and nothing else records it.
-
-    This is what lets the RECORDER be best-effort where it is called. A class move is
-    handed to the writer without waiting, matching the listener contract it runs
-    under, and if it never reaches the file the log says so here -- so a move that was
-    lost cannot leave the log reading as permissive.
-    """
-    handle = _log()
-    _opened_with_class(handle)
-    handle.append("write/dropped", {"dropped_count": 1, "dropped_bytes": 120}, src=GATEWAY)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["damaged"] is True
-    assert value["complete"] is True, "the beginning is intact; what is lost came later"
-
-
-def test_a_gap_in_the_seqs_marks_the_history_damaged():
-    """MUTATION-SENSITIVE: a hole in the MIDDLE, which the short-fold check cannot see.
-
-    The store skips an unreadable interior line on purpose and does not check interior
-    seq continuity -- one damaged record must not make a whole file unreadable. That is
-    right for a fold accumulating totals and wrong for this one: the skipped line can be
-    the sole record of a restriction, and the fold still reaches the file's tail, so
-    nothing stopped early and the short-fold refusal never fires. Only this fold's own
-    contiguity check sees it.
-
-    The entries are handed to the fold directly because a skipped line is exactly what
-    no writer produces: the seq that is missing was never delivered.
-    """
-    from kiro_crew.crew_log.schema import Entry
-
-    opener = Entry(
-        seq=1,
-        time=1000,
-        type="session/opened",
-        src=GATEWAY,
-        data={"class": {"memory": "persistent"}},
-    )
-    after_the_hole = Entry(
-        seq=3,
-        time=1002,
-        type="session/class",
-        src=GATEWAY,
-        data={"memory": "persistent"},
-    )
-
-    value = crew_log.fold("class", [opener, after_the_hole])
-    assert value["damaged"] is True, "seq 2 was never delivered, so a record is missing"
-    assert value["complete"] is True, "the log's beginning is intact; the hole is later"
-    assert value["channel"] is False, (
-        "the fold cannot invent what the lost line said -- which is why the reader "
-        "refuses on damage rather than on the value"
-    )
-
-
-def test_a_class_move_that_cannot_be_read_marks_the_history_damaged():
-    """MUTATION-SENSITIVE: a move whose content is unreadable is a hole, not a no-op.
-
-    Append validation refuses a fragment, so this line can only come from damage -- and
-    what a move entry says is its whole content, so skipping it discards the transition.
-    The direction it discards is always toward permissive, because a class move is worth
-    writing only when it restricts.
-    """
-    from kiro_crew.crew_log.schema import Entry
-
-    opener = Entry(
-        seq=1,
-        time=1000,
-        type="session/opened",
-        src=GATEWAY,
-        data={"class": {"memory": "persistent"}},
-    )
-    unreadable_move = Entry(
-        seq=2,
-        time=1001,
-        type="session/class",
-        src=GATEWAY,
-        data={"channel": True},
-    )
-
-    value = crew_log.fold("class", [opener, unreadable_move])
-    assert value["damaged"] is True
-    assert value["channel"] is False, "the unreadable move was not absorbed"
-
-
-def test_an_absent_class_object_is_a_date_not_a_hole():
-    """MUTATION-SENSITIVE: the control that keeps damage from swallowing AGE.
-
-    An opener with no ``class`` object at all is a log written before the field existed.
-    That is answered by ``complete`` staying false, and it must not also read as damaged:
-    if it did, every pre-field log would report a hole and the two reasons a reader
-    refuses -- too old to say, and missing a record -- would be indistinguishable in the
-    log. An unreadable object that is PRESENT is the damaged case, and the test above
-    covers it.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["damaged"] is False, "an absent object is a date, not a hole"
-    assert value["complete"] is False
-
-
-def test_the_reader_treats_a_memory_less_class_as_nothing_stated():
-    """MUTATION-SENSITIVE: the reader defends itself rather than trusting the writer.
-
-    Append validation binds the WRITER, and a damaged segment or a planted line is
-    exactly the input that ignores it -- so the entries are handed to the fold
-    directly here, which is the only way to reach that line. A fragment must read as
-    nothing stated rather than as a class whose memory mode is unknown, otherwise it
-    would satisfy a reader's recorded-and-complete test.
-    """
-    from kiro_crew.crew_log.schema import Entry
-
-    planted = Entry(
-        seq=1,
-        time=1000,
-        type="session/opened",
-        src=GATEWAY,
-        data={"class": {"channel": True}},
-    )
-
-    value = crew_log.fold("class", [planted])
-    assert value["recorded"] is False
-    assert value["complete"] is False
-    assert value["channel"] is False, "no member is read off an object with no memory mode"
-    assert value["damaged"] is True, (
-        "the object is present and unreadable, which is a hole rather than a date -- "
-        "so a reader refuses on it even though nothing was stated"
-    )
-
-
-def test_a_later_opener_cannot_date_a_log_whose_first_one_stated_no_class():
-    """MUTATION-SENSITIVE: only the log's FIRST opener may supply its beginning.
-
-    A log carries an opening entry PER RE-ATTACHMENT, so an old log written before the
-    class was recorded gains a later opener that does state one the moment a current
-    build re-attaches to it. Reading that as the beginning would date the log by an
-    entry written long after the stretch whose class is unknown -- and everything in
-    that stretch is still in this file. ``complete`` therefore stays false, and the
-    reader refuses, even though the log now visibly states a class.
-    """
-    handle = _log()
-    _opened(handle)
-    _turn(handle, 1)
-    _opened_with_class(handle)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["recorded"] is True, "the later opener did state a class"
-    assert (
-        value["complete"] is False
-    ), "a later opener must not supply a beginning the log's own first one did not"
-
-
-def test_a_resume_cannot_widen_a_class_the_log_already_moved_away_from():
-    """A re-attach writes ``session/opened`` again, and it must not reset the history.
-
-    The same file gets a second opener with a clean class, which is truthful about the
-    session as re-attached and says nothing about the turns already in the log. The
-    fold is ever-held, so the earlier channel survives it.
-    """
-    handle = _log()
-    _opened_with_class(handle)
-    _class_moved(handle, channel=True)
-    _opened_with_class(handle)
-
-    value = crew_log.fold("class", _entries(handle))
-    assert value["channel"] is True
-    assert value["complete"] is True

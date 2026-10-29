@@ -51,6 +51,7 @@ from kiro_crew.sandbox import (
     kiro_internal_sandbox_switch,
     wrapped_by_crew_sandbox,
 )
+from kiro_crew.testing.wait import await_until
 
 # The reported three-line burst, verbatim. Only the first line is sandbox-specific.
 HARNESS_SANDBOX_STDERR = [
@@ -496,6 +497,9 @@ def _runtime(lines):
     runtime._stderr_lines = []
     runtime._saw_auth_failure = False
     runtime._saw_sandbox_init_failure = False
+    # Same sink, same startup-window guard: the drain reads it per line, so a
+    # missing attribute ends the drain early under its broad ``except Exception``.
+    runtime._saw_delegate_launch_failure = False
     runtime._sandbox_wrapped_by_crew = False
     # The sandbox latch arms only while startup is unfinished, so the window has
     # to be open for a startup corpus to land. Startup ends at the first session
@@ -595,11 +599,16 @@ def test_the_first_session_clears_the_latch_in_the_source():
     migrating back to the handshake and re-opening the gap, and both are properties
     of the file.
     """
+    import sys
     from pathlib import Path
 
     import kiro_crew.acp.runtime as runtime_mod
 
-    source = Path(runtime_mod.__file__).read_text()
+    # runtime.py's owner modules (runtime_*.py) hold code that was its own.
+    source = "".join(
+        Path(sys.modules[name].__file__).read_text()
+        for name in (runtime_mod.__name__, *runtime_mod._RUNTIME_OWNERS)
+    )
     marker = "self._first_session_ready = True"
     assert source.count(marker) == 1, "more than one startup completion to keep in step"
     after = source.split(marker, 1)[1][:400]
@@ -750,11 +759,16 @@ def test_every_shared_runtime_startup_site_consults_the_latch():
     path without the sandbox check fails here.
     """
     import re
+    import sys
     from pathlib import Path
 
     import kiro_crew.providers.acp as provider_mod
 
-    source = Path(provider_mod.__file__).read_text()
+    # The facade and the owner modules its members live in.
+    source = "\n".join(
+        Path(sys.modules[name].__file__).read_text()
+        for name in (provider_mod.__name__, *provider_mod._ACP_PROVIDER_OWNERS)
+    )
     auth_sites = len(re.findall(r"runtime\.saw_not_logged_in\(\)", source))
     sandbox_sites = len(re.findall(r"sandbox_init_failure_for_runtime\(runtime\)", source))
     assert auth_sites == 3, f"the auth latch is read at {auth_sites} sites, not 3"
@@ -826,14 +840,321 @@ async def test_a_wedged_drain_cannot_hold_the_failure_path():
         # An OUTER deadline, generously above the inner one: an unbounded settle
         # would otherwise hang this test rather than fail it, and a hang in CI is
         # a timeout nobody attributes.
-        await asyncio.wait_for(runtime.settle_stderr(timeout=0.05), timeout=5)
-    except asyncio.TimeoutError:  # pragma: no cover - the defect this pins
+        await await_until(
+            asyncio.ensure_future(runtime.settle_stderr(timeout=0.05)),
+            timeout=5,
+            what="the stderr settle",
+        )
+    except (TimeoutError, AssertionError):  # pragma: no cover - the defect this pins
         raise AssertionError(
             "the stderr settle is unbounded, so a wedged drain holds a failure "
             "path open instead of letting it report"
         ) from None
     finally:
         runtime._stderr_task.cancel()
+
+
+async def _wedged() -> None:
+    await asyncio.sleep(3600)
+
+
+async def _settled(task: "asyncio.Task[object]") -> None:
+    # Bounded: a task that never finishes fails the assertion after this, it
+    # does not hang the worker.
+    await asyncio.wait({task}, timeout=5)
+    assert task.done(), "the settle never finished, so this test proves nothing"
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_of_the_caller_is_not_swallowed_by_the_settle():
+    """A Stop, shutdown or outer deadline that lands inside the settle reaches the caller.
+
+    The settle swallows what the DRAIN does; a cancel of the task waiting on it is
+    not that, and absorbing it is how a cancelled startup went on to respawn.
+    """
+    runtime = _runtime([])
+    runtime._stderr_task = asyncio.ensure_future(_wedged())
+    waiter = asyncio.ensure_future(runtime.settle_stderr(timeout=30))
+    try:
+        await asyncio.sleep(0)  # the waiter is now parked inside the bounded wait
+        waiter.cancel()
+        await _settled(waiter)
+        assert waiter.cancelled(), (
+            "the runtime's stderr settle swallowed a cancel of its caller, so a "
+            "Stop or shutdown during the settle is lost"
+        )
+        assert not runtime._stderr_task.done(), "the drain is shielded from the caller's cancel"
+    finally:
+        runtime._stderr_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_the_drains_own_cancellation_is_still_absorbed():
+    """A teardown cancelling the DRAIN mid-settle is the drain's outcome, not the caller's."""
+    runtime = _runtime([])
+    runtime._stderr_task = asyncio.ensure_future(_wedged())
+    waiter = asyncio.ensure_future(runtime.settle_stderr(timeout=30))
+    await asyncio.sleep(0)
+    runtime._stderr_task.cancel()
+    await _settled(waiter)
+    assert not waiter.cancelled() and waiter.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_the_eof_settle_ends_a_drain_held_open_past_its_budget():
+    """The child is gone, so a drain still running is held open by a descendant.
+
+    Left running, it would make every later settle on the same failure wait its
+    full budget again; the EOF branch ends it instead.
+    """
+    client = _client([], crew_wrap=True)
+    process = MagicMock()
+    process.returncode = 1
+    process.stdout.readline = AsyncMock(return_value=b"")
+    client._process = process
+    client._stderr_task = asyncio.ensure_future(_wedged())
+    try:
+        with pytest.raises(AcpError, match="ACP process exited"):
+            await await_until(asyncio.ensure_future(client._read_message(timeout=5)))
+        assert client._stderr_task.done()
+    finally:
+        client._stderr_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_task_that_absorbed_an_earlier_cancel_still_absorbs_the_drains():
+    """The caller's cancel is told apart by its count GROWING, not by its being non-zero.
+
+    A task that once caught and absorbed a cancel keeps ``cancelling() >= 1``, so an
+    absolute test would misread a teardown cancelling the drain as the caller's own.
+    """
+    runtime = _runtime([])
+    runtime._stderr_task = asyncio.ensure_future(_wedged())
+    cancelled_once = asyncio.Event()
+
+    async def _caller() -> None:
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled_once.set()  # absorbed, and nothing calls uncancel()
+        await runtime.settle_stderr(timeout=30)
+
+    waiter = asyncio.ensure_future(_caller())
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await await_until(cancelled_once)
+    await asyncio.sleep(0)  # the waiter is now parked inside the settle
+    runtime._stderr_task.cancel()
+    await _settled(waiter)
+    assert not waiter.cancelled() and waiter.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_the_failed_start_cleanup_still_kills_when_it_is_cancelled_in_the_settle():
+    """The cleanup task absorbs its own cancel (loop shutdown) so the kill still runs."""
+    runtime = _runtime([])
+    runtime._stderr_task = asyncio.ensure_future(_wedged())
+    runtime._child_pids = {}
+    runtime._record_tree_before_failed_start_kill = AsyncMock(return_value={})
+    runtime.kill = AsyncMock()
+    entered = asyncio.Event()
+    real_settle = runtime.settle_stderr
+
+    async def _spy(timeout: float = 0.5) -> None:
+        entered.set()
+        await real_settle(timeout=30)
+
+    runtime.settle_stderr = _spy
+    cleanup = asyncio.ensure_future(runtime._failed_start_cleanup())
+    try:
+        await await_until(entered)
+        await asyncio.sleep(0.1)
+        cleanup.cancel()
+        await _settled(cleanup)
+        runtime.kill.assert_awaited_once()
+    finally:
+        runtime._stderr_task.cancel()
+        if not cleanup.done():
+            cleanup.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_shared_translation_is_not_a_generic_death():
+    """The runtime's startup sites ask this first: a swallowed cancel became a crash error."""
+    from kiro_crew.acp.client import sandbox_init_failure_for_runtime
+
+    runtime = _runtime([])
+    runtime._stderr_task = asyncio.ensure_future(_wedged())
+    waiter = asyncio.ensure_future(sandbox_init_failure_for_runtime(runtime))
+    try:
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await _settled(waiter)
+        assert waiter.cancelled()
+    finally:
+        runtime._stderr_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_startup_settle_spawns_no_second_child():
+    """The defect end to end: ``ensure_ready`` must stop, not move on to attempt two.
+
+    The first attempt times out, the classifier settles the stderr drain for up to
+    0.5 s, and the session is stopped 0.1 s into that wait. Swallowing the cancel
+    let the retry arm clean up and spawn a fresh kiro-cli nobody wanted any more.
+    """
+    from kiro_crew.acp.client import AcpTimeoutError
+
+    client = _client([], crew_wrap=True)
+    attempts: list[int] = []
+    client._spawn = _counting_spawn(client, attempts)
+
+    async def _times_out() -> None:
+        raise AcpTimeoutError(message="initialize timed out")
+
+    client._initialize_session = _times_out
+    client._stderr_task = asyncio.ensure_future(_wedged())
+    real_settle = client._settle_stderr
+    entered = asyncio.Event()
+
+    async def _spy(timeout: float = 0.5) -> None:
+        entered.set()
+        # Long, so the cancel below cannot race the budget on a loaded runner.
+        await real_settle(timeout=30)
+
+    client._settle_stderr = _spy
+    startup = asyncio.ensure_future(client.ensure_ready())
+    try:
+        await await_until(entered)
+        # Timers fire in deadline order, so this lands inside the 0.5 s settle.
+        await asyncio.sleep(0.1)
+        startup.cancel()
+        await _settled(startup)
+        assert startup.cancelled(), (
+            f"ensure_ready ended with {startup.exception()!r} instead of the cancel "
+            "that arrived during its stderr settle"
+        )
+        assert len(attempts) == 1, (
+            f"a startup cancelled during its stderr settle spawned {len(attempts)} "
+            "children; the cancel must end it"
+        )
+        # The failure arm had already condemned this child: the cancel must not
+        # leave it live for the next ensure_ready's warm path to reuse.
+        client._cleanup_failed_live_spawn.assert_awaited_once()
+        assert client._process is None and client._session_id is None
+    finally:
+        client._stderr_task.cancel()
+        if not startup.done():
+            startup.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_last_attempts_settle_also_cleans_up():
+    """The second classifier on the failure arm, read after the retry is spent."""
+    from kiro_crew.acp.client import AcpTimeoutError
+
+    client = _client([], crew_wrap=True)
+    attempts: list[int] = []
+    client._spawn = _counting_spawn(client, attempts)
+
+    async def _times_out() -> None:
+        raise AcpTimeoutError(message="initialize timed out")
+
+    client._initialize_session = _times_out
+    # Attempt 0 classifies without waiting, so the wait under test is attempt 1's
+    # throttle read, which settles only before any prompt or tool was seen.
+    client._sandbox_init_failure = AsyncMock(return_value=None)
+    # The delegate-launch classifier sits beside it on the same arm and settles
+    # too, so it is stubbed for the same reason.
+    client._delegate_launch_failure = AsyncMock(return_value=None)
+    client._prompt_or_tool_seen = False
+    client._stderr_task = asyncio.ensure_future(_wedged())
+    real_settle = client._settle_stderr
+    entered = asyncio.Event()
+
+    async def _spy(timeout: float = 0.5) -> None:
+        entered.set()
+        # Long, so the cancel below cannot race the budget on a loaded runner.
+        await real_settle(timeout=30)
+
+    client._settle_stderr = _spy
+    startup = asyncio.ensure_future(client.ensure_ready())
+    try:
+        await await_until(entered)
+        await asyncio.sleep(0.1)
+        startup.cancel()
+        await _settled(startup)
+        assert startup.cancelled(), f"ensure_ready ended with {startup.exception()!r}"
+        assert len(attempts) == 2, "the retry before the throttle read is legitimate"
+        # Once for attempt 0's retry, once for the cancelled attempt 1.
+        assert client._cleanup_failed_live_spawn.await_count == 2
+        assert client._process is None and client._session_id is None
+    finally:
+        client._stderr_task.cancel()
+        if not startup.done():
+            startup.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_throttle_read_is_not_reported_as_a_death():
+    """The per-turn death check in ``_prompt_loop`` reads the same classifier.
+
+    A turn stopped while that read settles ends as the cancel, not as
+    ``AcpProcessDied`` or a throttled-registration verdict.
+    """
+    client = _client([], crew_wrap=True)
+    client._prompt_or_tool_seen = False
+    client._stderr_task = asyncio.ensure_future(_wedged())
+    real_settle = client._settle_stderr
+    entered = asyncio.Event()
+
+    async def _spy(timeout: float = 0.5) -> None:
+        entered.set()
+        await real_settle(timeout=30)
+
+    client._settle_stderr = _spy
+    reader = asyncio.ensure_future(client._registration_throttle_line())
+    try:
+        await await_until(entered)
+        reader.cancel()
+        await _settled(reader)
+        assert reader.cancelled()
+    finally:
+        client._stderr_task.cancel()
+        if not reader.done():
+            reader.cancel()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_eof_settle_is_not_reported_as_a_death():
+    """The read path's own settle, on the EOF a dead child leaves behind.
+
+    Turned into ``AcpError("ACP process exited")``, a cancel that lands here sends
+    ``ensure_ready`` to the same retry arm as a real death.
+    """
+    client = _client([], crew_wrap=True)
+    process = MagicMock()
+    process.returncode = 1
+    process.stdout.readline = AsyncMock(return_value=b"")
+    client._process = process
+    client._stderr_task = asyncio.ensure_future(_wedged())
+    reader = asyncio.ensure_future(client._read_message(timeout=5))
+    try:
+        # One step: the reader runs first in this iteration and parks in the
+        # settle (the mocked EOF read never suspends), and the cancel lands in
+        # the same iteration, so the settle's 0.5 s timer cannot fire first.
+        await asyncio.sleep(0)
+        assert not reader.done()
+        reader.cancel()
+        await _settled(reader)
+        assert reader.cancelled(), (
+            f"the EOF read ended with {reader.exception()!r} instead of the cancel "
+            "that arrived during its stderr settle"
+        )
+    finally:
+        client._stderr_task.cancel()
+        if not reader.done():
+            reader.cancel()
 
 
 @pytest.mark.asyncio
@@ -868,13 +1189,16 @@ def test_the_failed_handshake_settles_the_drain_before_teardown():
     Asserted on the file because what can go wrong is the two statements swapping
     places, which no behavioural double can pin without driving a whole real spawn.
     """
+    import sys
     from pathlib import Path
 
     import kiro_crew.acp.runtime as runtime_mod
 
-    source = Path(runtime_mod.__file__).read_text()
+    # The spawn and its failed-start cleanup live in the owner that binds _spawn_admitted.
+    owner = sys.modules[runtime_mod.AcpRuntime._spawn_admitted.__module__]
+    source = Path(owner.__file__).read_text()
     handler = source.split("await self._snapshot_descendants(retry_when_empty=True)", 1)[1]
-    handler = handler.split("    #: One retry for a descendant scan", 1)[0]
+    handler = handler.split("\nasync def _handshake_client_capabilities(", 1)[0]
 
     settle = handler.index("await self.settle_stderr()")
     teardown = handler.index('reason="failed init handshake cleanup"')

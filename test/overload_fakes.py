@@ -9,8 +9,11 @@ A plain module, imported explicitly (``from overload_fakes import Clock``) like
 * :func:`backoff` -- the coordinator's recovery-ladder schedule with a test-sized base and cap.
 * :func:`task_record` -- a minimal ``TaskRecord`` for one id.
 * :func:`open_task_store` -- the store a fixture yields, closed on teardown.
+* :func:`wait_taskq_open` -- a manager's off-loop store open, attached or failed by name.
 * :func:`settle_store_writes` / :func:`settle_dependency_park` -- the two
   barriers: the store's writer thread, and a step reaching its dependency wait.
+* :func:`settle_depth_emits` -- wait out every in-flight queued-depth emit.
+* :func:`memory_below_floor` -- the memory floor's reading of a host short of memory, for deferring a spawn.
 * :class:`ManagerHarness` -- a real ``SubagentManager`` whose runs finish when
   the test says so, with the mocks it needs (:func:`mock_sessions`, :func:`mock_ctx`).
 """
@@ -33,6 +36,7 @@ from kiro_crew.taskq.adapters.runner import RunnerAdmission
 from kiro_crew.taskq.dependency import dependency_backoff
 from kiro_crew.taskq.store import TaskStore
 from kiro_crew.taskq.waits import WaitLedger
+from kiro_crew.testing.wait import finished
 
 #: The tool a parent blocks in while it waits for its children.
 BLOCKING_TOOL = "@kirocrew-core/spawn_sub_agents"
@@ -89,11 +93,41 @@ def open_task_store(
         s.close()
 
 
+#: How long :func:`wait_taskq_open` waits for a manager's off-loop store open.
+#: A guard against an open that never returns, never a pass condition. The open
+#: is a config load, SQLite create, schema and boot reconcile on a worker thread:
+#: about 15 ms on an idle Linux host, and inside a test call of about 0.3 s on a
+#: hosted Windows runner. That runner stalls for several seconds at a time,
+#: sometimes every xdist worker at once and sometimes one worker alone, and calls
+#: that take 0.3 s there have been measured at 5.5 to 6.9 s. The ceiling is more
+#: than twice that and under the ``timeout(30)`` these tests carry, so a wedged
+#: open fails here, by name, instead of taking the xdist worker down with the
+#: pytest-timeout kill.
+STORE_OPEN_CEILING_SECS = 20.0
+
+
+async def wait_taskq_open(mgr: SubagentManager, ceiling: float = STORE_OPEN_CEILING_SECS) -> None:
+    """Wait for *mgr*'s startup store open to attach, or fail by name.
+
+    ``SubagentManager`` opens its task store on a worker thread when it is
+    built on a running loop, and every spawn answers ``task_store_unavailable``
+    until that open attaches. This awaits the open itself (a signal, not a
+    poll); *ceiling* only bounds an open that never returns.
+    """
+    try:
+        await asyncio.wait_for(mgr.wait_taskq_ready(), ceiling)
+    except asyncio.TimeoutError:
+        raise AssertionError(
+            f"the task store did not open within {ceiling:.1f}s "
+            f"(state: {mgr._taskq_unavailable!r})"
+        ) from None
+
+
 def _noop() -> None:
     return None
 
 
-async def settle_store_writes(store: TaskStore) -> None:
+async def settle_store_writes(store: TaskStore, rounds: int = 1) -> None:
     """Barrier for the store's off-loop writes -- a SIGNAL, never a sleep.
 
     ``TaskStore.run`` submits to an executor with exactly ONE worker, so a job
@@ -101,9 +135,31 @@ async def settle_store_writes(store: TaskStore) -> None:
     loop then resumes the waiters in the order their futures completed. One
     ``sleep(0)`` first, so a task that was only just created reaches its own
     submission before this one is queued behind it.
+
+    *rounds* repeats the barrier for a chain of hops: work a waiter queues only
+    after its own write returned (a report task's settle after its terminal, a
+    depth emit's re-read) needs one barrier per hop.
     """
-    await asyncio.sleep(0)
-    await store.run(_noop)
+    for _ in range(rounds):
+        await asyncio.sleep(0)
+        await finished(store.run(_noop), "the store's write barrier", timeout=10)
+
+
+async def settle_depth_emits(mgr: SubagentManager, timeout: float = 5.0) -> None:
+    """Wait until no ``subagent_queued`` emit is in flight -- a signal, never a sleep.
+
+    An emit reads when its own task runs and may hand off to a fresh read
+    task, so this waits on the tasks themselves until the per-parent table is
+    empty, and fails by name rather than hanging when one never finishes.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while mgr._queue_depth_emits:
+        left = deadline - loop.time()
+        if left <= 0:
+            raise AssertionError(f"depth emits never finished: {sorted(mgr._queue_depth_emits)}")
+        await asyncio.wait([e.task for e in mgr._queue_depth_emits.values()], timeout=left)
+        await asyncio.sleep(0)  # the tasks' done-callbacks drop their entries
 
 
 async def settle_dependency_park(
@@ -158,6 +214,18 @@ def mock_ctx() -> MagicMock:
     return ctx
 
 
+def memory_below_floor(*_args: Any, **_kwargs: Any) -> tuple[bool, float]:
+    """The memory floor's reading of a host with 0.5 GB free: below any floor.
+
+    Patch ``kiro_crew.subagent.check_memory_available`` with it inside
+    ``monkeypatch.context()`` (or ``patch.object``), never with a bare
+    ``monkeypatch.setattr`` followed by ``monkeypatch.undo()``: the test and
+    ``healthy_host_memory`` share ONE ``monkeypatch``, so a blanket undo also
+    reverts the fixture's pins and later spawns read the runner's real memory.
+    """
+    return False, 0.5
+
+
 class ManagerHarness:
     """A real manager whose runs finish when the test says so.
 
@@ -197,21 +265,22 @@ class ManagerHarness:
 
         self._patch = patch.object(SubagentManager, "_run", new=_run)
         self._patch.start()
-        # Pin the host-memory readings ``SubagentManager.spawn`` consults, the
-        # same way conftest's ``healthy_host_memory`` fixture does: the
-        # harness is the fake host, so a memory-pressured runner must not turn
-        # a spawn into a refusal that surfaces as a bare KeyError one line on.
-        import kiro_crew.resource_status as resource_status
+        # Pin the host-memory reading ``SubagentManager.spawn`` consults, the
+        # same way conftest's ``healthy_host_memory`` fixture does: an 8 GB
+        # host that honours the floor it is asked about. The harness is the
+        # fake host, so a memory-pressured runner must not turn a spawn into a
+        # deferral that surfaces as a bare KeyError one line on; and it answers
+        # the sync gate (which reads the boolean) exactly as the off-loop one
+        # (which compares the figure against its own bar).
         import kiro_crew.subagent as subagent_mod
+        from kiro_crew.constants import DEFAULT_SPAWN_MIN_MEMORY_GB
 
-        def _admit() -> resource_status.AdmissionDecision:
-            return resource_status.AdmissionDecision(
-                admitted=True, posture=resource_status.POSTURE_AMPLE, available_gb=8.0
-            )
+        def _host(min_gb: float | None = None, **_kw: Any) -> tuple[bool, float]:
+            floor = DEFAULT_SPAWN_MIN_MEMORY_GB if min_gb is None else min_gb
+            return 8.0 >= floor, 8.0
 
         self._memory_patches = [
-            patch.object(subagent_mod, "check_memory_available", lambda *a, **k: (True, 8.0)),
-            patch.object(subagent_mod, "cached_admission_check", _admit),
+            patch.object(subagent_mod, "check_memory_available", _host),
         ]
         for mp in self._memory_patches:
             mp.start()

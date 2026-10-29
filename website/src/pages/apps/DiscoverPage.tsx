@@ -20,6 +20,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { AlertTriangle, CheckCircle2, RefreshCw, ShoppingBag, X } from 'lucide-react'
 import { EmptyState, IconButton, PageHeader, SearchInput } from '../../components/ui'
+import { uiLocation } from '../../uiLocations/uiLocation'
 import SimpleSelect from '../../components/SimpleSelect'
 import { Tabs, TabsContent, TabsCount, TabsList, TabsTrigger } from '../../components/ui/tabs'
 import { TABS_RAIL_ROW_CLASS } from '../../components/ui/tabsPill'
@@ -40,6 +41,7 @@ import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
 import UpdatesList from './UpdatesList'
 import { cardDataKey } from './cardDataKey'
+import { registryRefreshFailureMessage } from '../../components/appstore/registryRefreshMessage'
 
 /**
  * Which app in a featured card has an action in flight, or null.
@@ -127,6 +129,7 @@ function DiscoverPageBody() {
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState<Category | 'all'>('all')
   const [source, setSource] = useState<string | null>(null)
+  const [installedOnly, setInstalledOnly] = useState(false)
   const [sort, setSort] = useState<'name' | 'category'>('name')
   const [sourcesOpen, setSourcesOpen] = useState(false)
   const [successMsg, setSuccessMsg] = useState('')
@@ -155,7 +158,7 @@ function DiscoverPageBody() {
   const {
     apps, appsError, registryError, loading,
     browseApps, featuredSections, categories, sources, updatables,
-    announceAppsChanged,
+    announceAppsChanged, registriesUnknown,
   } = useAppsData()
 
   useEffect(() => {
@@ -166,8 +169,10 @@ function DiscoverPageBody() {
 
   const {
     setError, displayError, dismissError,
-    openDetail, getApp, updateApp, trustTarget, runEnable, trust,
-  } = useAppActions({ apps, browseApps, appsError, registryError, announceAppsChanged })
+    openDetail, getApp, updateApp, trustTarget, consentTarget, runEnable, trust,
+  } = useAppActions({
+    apps, browseApps, appsError, registryError, announceAppsChanged, sources, registriesUnknown,
+  })
 
   // Transient success surface for the shared update hook: the hook reports
   // outcomes, this page owns display + auto-dismiss (the Library's 4s).
@@ -251,16 +256,10 @@ function DiscoverPageBody() {
         reportRefreshOutcome(rejection.reason instanceof Error && rejection.reason.message
           ? rejection.reason.message
           : i18nT('components.registryManager.failed_to_refresh_registries'))
-      } else if (
-        registriesResult.status === 'fulfilled'
-        && registriesResult.value.ok === false
-        && registriesResult.value.failed && registriesResult.value.failed.length > 0
-      ) {
-        reportRefreshOutcome(
-          i18nT('components.registryManager.could_not_refresh_still_showing_last_synced',
-            { names: registriesResult.value.failed.join(', ') }))
       } else {
-        reportRefreshOutcome('')
+        reportRefreshOutcome(registriesResult.status === 'fulfilled'
+          ? registryRefreshFailureMessage(registriesResult.value)
+          : '')
       }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['registry'] }),
@@ -298,12 +297,23 @@ function DiscoverPageBody() {
     return categories.map(row => ({ ...row, count: counts.get(row.category) || 0 }))
   }, [categories, sourceBrowse])
 
+  /* The install-state facet narrows the registry shelf only: an installed
+     app the catalog does not list is never added here (Library lists it). */
+  const categoryBrowse = useMemo(
+    () => sourceBrowse.filter(a => category === 'all' || categoryFor(a.tags) === category),
+    [sourceBrowse, category],
+  )
+  const installedBrowse = useMemo(
+    () => categoryBrowse.filter(a => installedByName.has(a.name)),
+    [categoryBrowse, installedByName],
+  )
+
   const filteredBrowse = useMemo(() => {
-    const list = sourceBrowse.filter(a => category === 'all' || categoryFor(a.tags) === category)
+    const list = [...(installedOnly ? installedBrowse : categoryBrowse)]
     return list.sort((a, b) => sort === 'category'
       ? compareText(categoryFor(a.tags), categoryFor(b.tags)) || compareText(a.displayName, b.displayName)
       : compareText(a.displayName, b.displayName))
-  }, [sourceBrowse, category, sort])
+  }, [categoryBrowse, installedBrowse, installedOnly, sort])
 
   /* Editorial placements survive category picks, but not a search or source
      filter: unrelated featured apps would contradict the selected source. */
@@ -359,6 +369,7 @@ function DiscoverPageBody() {
               degraded-catalog state it repairs also starves the Updates
               worklist, whose update map derives from the same registry rows. */}
           <IconButton
+            {...uiLocation('apps.refresh-store')}
             aria-label={i18nT('pages.appsPage.refresh_store')}
             title={i18nT('pages.appsPage.refresh_store')}
             onClick={handleRefresh}
@@ -450,9 +461,11 @@ function DiscoverPageBody() {
             refused with code `app_execution_denied`, instead of surfacing the
             raw backend string in the error card above. */}
         <TrustAppModal
-          app={trust.target}
+          app={consentTarget}
           pending={trust.pending}
           failed={trust.failed}
+          detail={trust.detail}
+          detailCode={trust.detailCode}
           granted={trust.granted}
           onCancel={trust.cancel}
           onConfirm={trust.confirm}
@@ -615,6 +628,9 @@ function DiscoverPageBody() {
                   total={sourceBrowse.length}
                   selected={category}
                   onSelect={setCategory}
+                  installedOnly={installedOnly}
+                  installedCount={installedBrowse.length}
+                  onSelectInstalledOnly={setInstalledOnly}
                   sources={sources}
                   selectedSource={source}
                   onSelectSource={setSource}

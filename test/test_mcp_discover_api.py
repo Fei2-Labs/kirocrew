@@ -112,6 +112,14 @@ def fake_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _rebuild_that_writes(**kwargs) -> Path:
+    """A rebuild that wrote the spec: it reports the write the way the real one does."""
+    wrote_out = kwargs.get("_wrote_out")
+    if wrote_out is not None:
+        wrote_out.append(True)
+    return Path("/dev/null")
+
+
 @pytest.fixture
 def sandbox(fake_home, monkeypatch):
     """Sandbox the mcp.py module-level config paths + collaborator seams.
@@ -132,7 +140,7 @@ def sandbox(fake_home, monkeypatch):
 
     import kiro_crew.agent as agent_mod
 
-    rebuild = MagicMock()
+    rebuild = MagicMock(side_effect=_rebuild_that_writes)
     monkeypatch.setattr(agent_mod, "rebuild_agent_config", rebuild)
 
     return SimpleNamespace(
@@ -154,6 +162,20 @@ def fake_sel(monkeypatch):
     return instance
 
 
+#: The subject ``_owner_identity`` presents, and the id the state reports as its
+#: owner. Installing an MCP server is owner-only, so a suite about registry
+#: translation and collision handling models the owner's own session.
+_OWNER_SUBJECT = "U0OWNER0000"
+
+
+@web.middleware
+async def _owner_identity(request, handler):
+    """What ``token_auth`` publishes for the owner's own dashboard session."""
+    request["user"] = _OWNER_SUBJECT
+    request["app"] = ""
+    return await handler(request)
+
+
 def _make_app(provider) -> web.Application:
     from kiro_crew.dashboard.handlers import mcp_discover as mod
 
@@ -161,8 +183,8 @@ def _make_app(provider) -> web.Application:
     registry.register(provider)
     mod._registry = registry  # inject the fake registry
 
-    state = MagicMock()
-    app = web.Application()
+    state = MagicMock(owner_id=_OWNER_SUBJECT)
+    app = web.Application(middlewares=[_owner_identity])
     app["state"] = state
     app.router.add_get("/api/mcp/discover", mod.api_mcp_discover)
     app.router.add_get("/api/mcp/discover/detail", mod.api_mcp_discover_detail)
@@ -426,6 +448,7 @@ class TestDiscoverInstall:
                 "required_env": ["WEATHER_API_KEY"],
                 "method": "npx",
                 "enabled": False,
+                "agent_spec_rewritten": True,
             }
             # The translated spec landed in the KiroCrew scope — DISABLED,
             # because required env is unset: enabling after configuration is
@@ -442,6 +465,24 @@ class TestDiscoverInstall:
             # SEL-logged with the install operation.
             ops = [c.kwargs.get("operation") for c in fake_sel.log_api_access.call_args_list]
             assert "mcp_discover_install" in ops
+        finally:
+            await client.close()
+
+    async def test_install_reports_a_declined_rebuild(self, sandbox, fake_sel, reset_registry):
+        """The shared-home guard refused the write: saved, but not live yet."""
+        sandbox.rebuild.side_effect = lambda **_: Path("/dev/null")
+        client = await _client(FakeOfficialProvider())
+        try:
+            resp = await client.post(
+                "/api/mcp/discover/install",
+                json={"provider": "official", "id": _WEATHER_ID},
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["name"] == "weather"
+            assert data["agent_spec_rewritten"] is False
+            written = json.loads(sandbox.kirocrew_json.read_text(encoding="utf-8"))
+            assert "weather" in written["mcpServers"], "the install must stay saved"
         finally:
             await client.close()
 
@@ -658,8 +699,8 @@ class TestDiscoverInstall:
         registry.register(capability_provider)
         mod._registry = registry
 
-        app = web.Application()
-        app["state"] = MagicMock()
+        app = web.Application(middlewares=[_owner_identity])
+        app["state"] = MagicMock(owner_id=_OWNER_SUBJECT)
         app.router.add_post("/api/mcp/discover/install", mod.api_mcp_discover_install)
         client = TestClient(TestServer(app))
         await client.start_server()

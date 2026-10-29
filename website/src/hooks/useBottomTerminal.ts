@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react'
-import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage'
+import { safeGetItem, safeGetSessionItem, safeRemoveItem, safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { secureRandomId } from '../utils/secureId'
+import { createTerminalHydrateRuling } from '../utils/terminalHydrateRuling'
 
 /* ── App-wide bottom terminal panel ───────────────────────────────────────
  * A single docked terminal panel shared by the ENTIRE app (every route), as
@@ -15,7 +16,14 @@ import { secureRandomId } from '../utils/secureId'
  * (backend orphan-reaper window), the same way activity-bar terminal tabs do —
  * once the backend has confirmed which of those PTYs still exist (see the
  * hydrate-time reconciliation below). Tab session ids are persisted; the
- * running shell is not. */
+ * running shell is not.
+ *
+ * The `open` flag is the one field that is NOT shared: it lives in
+ * sessionStorage, so it belongs to this window alone. The tab list is shared
+ * so the popout and the dock agree on which shells exist, but whether the
+ * panel is showing is a per-window choice. Sharing it meant opening the panel
+ * in one tab opened it in every same-origin tab, and the mount in an idle tab
+ * attached to the same PTY and took it over (#7638). */
 
 export interface TermTab {
   /** PTY session id — one live shell per tab. */
@@ -41,6 +49,8 @@ function normalizeTabName(name: unknown): string | undefined {
 export type TerminalPosition = 'bottom' | 'right'
 
 interface BottomTerminalState {
+  /** Whether THIS window shows the panel. Per window (sessionStorage), never
+   *  adopted from another window; see the module note above. */
   open: boolean
   /** Panel height in px (resizable via the top grip, used when position = 'bottom'). */
   height: number
@@ -55,6 +65,15 @@ interface BottomTerminalState {
 }
 
 const STORAGE_KEY = 'mc-bottom-terminal'
+/** sessionStorage key for this window's `open` flag. A per-browsing-context
+ *  store: a reload of this tab restores it, a new tab starts closed. Two
+ *  exceptions follow from the platform, not from this code: a tab opened via
+ *  `window.open` from this one (the terminal popout) and a duplicated tab both
+ *  start with a COPY of this window's sessionStorage. The popout never reads
+ *  the flag, so the copy is inert there; a duplicate of an open window opens
+ *  too, the one residual of #7638 this slice does not remove (RFC #7649,
+ *  "duplicated tabs"). */
+const OPEN_KEY = 'mc-bottom-terminal-open'
 const NAME_KEY_PREFIX = 'mc-terminal-name:'
 /** Dropped writes stay local until a successful rename, a foreign label event,
  *  or removal. Keep the fallback separate so layout writes cannot persist them. */
@@ -162,7 +181,24 @@ export function clampToViewport(dim: number, axis: 'width' | 'height'): number {
   return Math.min(max, Math.max(axis === 'width' ? MIN_WIDTH : MIN_HEIGHT, dim))
 }
 
-function loadPersisted(): BottomTerminalState {
+function loadOpen(): boolean {
+  return safeGetSessionItem(OPEN_KEY) === '1'
+}
+
+function persistOpen(open: boolean): void {
+  if (open) { safeSetSessionItem(OPEN_KEY, '1'); return }
+  try {
+    if (typeof sessionStorage === 'undefined') return
+    sessionStorage.removeItem(OPEN_KEY)
+  } catch { /* locked storage */ }
+}
+
+/** Read the shared layout from localStorage. `open` is this window's flag, not
+ *  part of that layout: at boot it comes from sessionStorage, and on a foreign
+ *  `storage` event the caller passes the current local value so another window
+ *  opening its panel never opens this one. An `open` left in the layout by a
+ *  build that still shared it is ignored. */
+function loadPersisted(open = loadOpen()): BottomTerminalState {
   const base: BottomTerminalState = { open: false, height: DEFAULT_HEIGHT, width: DEFAULT_WIDTH, position: 'bottom', tabs: [], activeId: null }
   if (typeof localStorage === 'undefined') return base
   try {
@@ -176,9 +212,9 @@ function loadPersisted(): BottomTerminalState {
       .slice(0, MAX_TERMINALS)
       .map(withLiveName)
     return {
-      // Only restore "open" when there were tabs to restore — a stale open flag
-      // with no tabs would render an empty panel on boot.
-      open: p.open === true && tabs.length > 0,
+      // Only keep "open" when there are tabs to show — an open flag with no
+      // tabs would render an empty panel.
+      open: open && tabs.length > 0,
       height: typeof p.height === 'number' ? clampHeight(p.height) : DEFAULT_HEIGHT,
       width: typeof p.width === 'number' ? clampWidth(p.width) : DEFAULT_WIDTH,
       position: p.position === 'right' ? 'right' : 'bottom',
@@ -192,6 +228,11 @@ function loadPersisted(): BottomTerminalState {
 
 cleanOrphanNames()
 let state: BottomTerminalState = loadPersisted()
+// A `1` left in sessionStorage beside an empty shared layout (the layout was
+// removed outside `set` and the listener) would reopen this window unasked on
+// a later reload once another window adds tabs. Settle the flag to the state
+// that was actually loaded.
+persistOpen(state.open)
 const listeners = new Set<() => void>()
 
 function emit() { for (const cb of listeners) cb() }
@@ -221,40 +262,6 @@ function emit() { for (const cb of listeners) cb() }
  * therefore only names suspects; `confirmRestoredTabs`, fed an uncached second
  * answer after an opening grace, drops the ones still missing. Absent twice,
  * that far apart, is gone. */
-let restoredIds: ReadonlySet<string> = new Set(state.tabs.map(t => t.id))
-/** Restored tabs the first answer omitted or reported dead, awaiting the
- *  confirm probe. Empty outside the confirming phase. */
-let hydrateSuspects: ReadonlySet<string> = new Set()
-type HydratePhase = 'pending' | 'confirming' | 'settled'
-let hydratePhase: HydratePhase = restoredIds.size > 0 ? 'pending' : 'settled'
-
-/** Session ids the backend reports as live, or null when the payload does not
- *  rule on liveness: a transport failure, a shape this client does not
- *  recognize, or the feature-disabled answer (which returns an empty list
- *  without consulting the registry, so its absence means nothing). */
-function liveSessionIds(payload: unknown): Set<string> | null {
-  if (!payload || typeof payload !== 'object') return null
-  const p = payload as { enabled?: unknown; sessions?: unknown }
-  if (p.enabled === false || !Array.isArray(p.sessions)) return null
-  const live = new Set<string>()
-  for (const entry of p.sessions) {
-    if (!entry || typeof entry !== 'object') return null
-    const { session_id, alive } = entry as { session_id?: unknown; alive?: unknown }
-    // One malformed entry voids the whole answer: dropping a tab is
-    // irreversible, so it only happens on a payload read in full.
-    if (typeof session_id !== 'string' || typeof alive !== 'boolean') return null
-    if (alive) live.add(session_id)
-  }
-  return live
-}
-
-/** Leave the hydrate protocol with every remaining tab verified. */
-function settleHydrate(): void {
-  hydratePhase = 'settled'
-  hydrateSuspects = new Set()
-  emit()
-}
-
 /** Drop `ids` from the store, refocusing and hiding the panel as `removeTab`
  *  would. Persisting the trimmed list is what keeps the other window — and
  *  the next reload — from restoring the same tabs again. */
@@ -263,6 +270,15 @@ function dropTabs(ids: ReadonlySet<string>): void {
   const activeId = tabs.some(t => t.id === state.activeId) ? state.activeId : (tabs[0]?.id ?? null)
   set({ ...state, tabs, activeId, open: tabs.length > 0 ? state.open : false })
 }
+
+const newRuling = (restored: ReadonlySet<string>) =>
+  createTerminalHydrateRuling(restored, () => state.tabs.map(t => t.id), dropTabs, emit)
+// The session ids restored from persistence at module init. The ruling closes
+// over its own copy for the two-look absence protocol and exposes no per-id
+// query, so reuseCurrentTab keeps this set to tell a restored tab (a hydration
+// suspect until the ruling settles) from a freshly minted one.
+let restoredIds: ReadonlySet<string> = new Set(state.tabs.map(t => t.id))
+let ruling = newRuling(restoredIds)
 
 /** First look: weigh the restored tab set against the backend's session list
  *  (the JSON body of `GET /api/terminal/sessions`, or null when the probe
@@ -273,44 +289,29 @@ function dropTabs(ids: ReadonlySet<string>): void {
  *  settles at once: removing a possibly-live shell and its scrollback cannot be
  *  undone, while a kept dead tab is user-closable and its PTY entry is the
  *  reaper's to clear. Runs once per document: later calls return []. */
-export function reconcileRestoredTabs(payload: unknown): string[] {
-  if (hydratePhase !== 'pending') return []
-  const live = liveSessionIds(payload)
-  const suspects = live === null
-    ? []
-    : state.tabs.filter(t => restoredIds.has(t.id) && !live.has(t.id)).map(t => t.id)
-  if (suspects.length === 0) { settleHydrate(); return [] }
-  hydratePhase = 'confirming'
-  hydrateSuspects = new Set(suspects)
-  return suspects
-}
+export function reconcileRestoredTabs(payload: unknown): string[] { return ruling.reconcile(payload) }
 
 /** Second look, from an UNCACHED probe taken after the opening grace: drop the
  *  suspects this answer still omits or reports dead, keep the ones it now lists
  *  live (a shell that was opening in another window), and settle. A payload
  *  that does not rule keeps every suspect. Returns the dropped ids. */
-export function confirmRestoredTabs(payload: unknown): string[] {
-  if (hydratePhase !== 'confirming') return []
-  const live = liveSessionIds(payload)
-  const dropped = live === null
-    ? []
-    : state.tabs.filter(t => hydrateSuspects.has(t.id) && !live.has(t.id)).map(t => t.id)
-  // Drop while still gated, then settle: the hosts first see the kept set.
-  if (dropped.length > 0) dropTabs(new Set(dropped))
-  settleHydrate()
-  return dropped
-}
+export function confirmRestoredTabs(payload: unknown): string[] { return ruling.confirm(payload) }
 
 /* Cross-window sync: the terminal-popout window and the main dashboard share
  * this persisted store (one tab list, whichever window currently hosts the
  * panel). `storage` fires only in OTHER windows — never the writer — so
- * re-loading here can't loop; state is adopted without re-persisting. */
+ * re-loading here can't loop; state is adopted without re-persisting. The
+ * local `open` flag is kept: another window showing or hiding its panel is
+ * not this window's business. It only drops to false when the adopted tab
+ * list is empty, which is what an open panel with nothing to show would be. */
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e) => {
     if (e.storageArea && e.storageArea !== localStorage) return
     if (e.key === null || e.key === STORAGE_KEY) {
       if (e.key === null) volatileNames.clear()
-      state = loadPersisted()
+      const wasOpen = state.open
+      state = loadPersisted(wasOpen)
+      if (state.open !== wasOpen) persistOpen(state.open)
       for (const id of volatileNames.keys()) {
         if (!state.tabs.some(tab => tab.id === id)) volatileNames.delete(id)
       }
@@ -319,7 +320,9 @@ if (typeof window !== 'undefined') {
       // A label event cannot add/drop tabs or change the local layout.
       const id = e.key.slice(NAME_KEY_PREFIX.length)
       volatileNames.delete(id)
-      const stored = loadPersisted()
+      // Only `tabs` is read from this load; the local flag is passed through
+      // so the load does not touch sessionStorage for a value it discards.
+      const stored = loadPersisted(state.open)
       state = { ...state, tabs: state.tabs.map(tab => tab.id === id
         ? { ...tab, name: stored.tabs.find(t => t.id === id)?.name }
         : tab) }
@@ -344,13 +347,17 @@ function set(next: BottomTerminalState) {
   if (next === state) return
   const removed = state.tabs.filter(tab => !next.tabs.some(t => t.id === tab.id)).map(tab => tab.id)
   for (const id of removed) volatileNames.delete(id)
+  const wasOpen = state.open
   state = { ...next, tabs: withLiveNames(next.tabs) }
   emit()
+  if (state.open !== wasOpen) persistOpen(state.open)
   const tabs = state.tabs.map(tab => {
     const local = volatileNames.get(tab.id)
     return local ? withStoredName({ ...tab, name: local.fallback }) : tab
   })
-  try { safeSetItem(STORAGE_KEY, JSON.stringify({ ...state, tabs })) } catch { /* quota / locked storage */ }
+  // The shared layout carries no `open`: that flag is this window's alone.
+  // JSON.stringify drops an undefined field.
+  try { safeSetItem(STORAGE_KEY, JSON.stringify({ ...state, open: undefined, tabs })) } catch { /* quota / locked storage */ }
   cleanRemovedNames(removed)
 }
 
@@ -406,6 +413,36 @@ export function adoptTab(id: string, cwd?: string): boolean {
  *  here, and rolling back anyway would double-delete the PTY. */
 export function hasTab(id: string): boolean {
   return state.tabs.some(t => t.id === id)
+}
+
+/** Focus the current existing dock terminal and return its session id, or null
+ *  when the panel holds none. This is the "reuse the current terminal" path
+ *  for Run-in-terminal (opt-in via `dashboard.terminal.reuse_current`):
+ *  reusing an existing shell keeps its state (env, cwd, an active `awsume`
+ *  session) that a freshly minted PTY would not have — which is exactly what
+ *  the setting exists to preserve.
+ *
+ *  "Current" means the focused tab, not simply the most recently created one:
+ *  a user may select an older shell because that is where their active login
+ *  lives. A stale or missing active id falls back to the last tab, matching the
+ *  cap fallback in `addTab` and keeping old persisted state recoverable. The
+ *  PTY is NEVER minted here: a null return means there is no settled shell to
+ *  focus, so the caller skips the focus step — it does NOT mint and run a fresh
+ *  tab, because reuse-on always copies the command for manual paste and never
+ *  executes it. Opens the panel so the reused shell is visible, the same as
+ *  `addTab`. */
+export function reuseCurrentTab(): string | null {
+  const current = state.tabs.find(tab => tab.id === state.activeId) ?? state.tabs[state.tabs.length - 1]
+  if (!current) return null
+  // A tab restored from persistence is a hydration SUSPECT until a live probe
+  // confirms it (see reconcileRestoredTabs). Reusing one before it settles
+  // would focus a tab that reconciliation may then drop and fence-transform the
+  // command for a shell that may not exist. While hydration is unsettled and
+  // the chosen tab is such a suspect, return null so the caller skips the focus
+  // step and copies the command verbatim; it never mints or runs a tab here.
+  if (ruling.isPending() && restoredIds.has(current.id)) return null
+  set({ ...state, open: true, activeId: current.id })
+  return current.id
 }
 
 /** Remove a tab from the store (the caller disposes the PTY/xterm first).
@@ -528,8 +565,8 @@ export function useTerminalPosition(): TerminalPosition {
 
 /** Whether the restored tab set still awaits its ruling (either look). Hosts
  *  mount no terminal view while true — see the reconciliation note above. */
-function getHydratePendingSnapshot(): boolean { return hydratePhase !== 'settled' }
-export function isTerminalHydratePending(): boolean { return hydratePhase !== 'settled' }
+function getHydratePendingSnapshot(): boolean { return ruling.isPending() }
+export function isTerminalHydratePending(): boolean { return ruling.isPending() }
 export function useTerminalHydratePending(): boolean {
   return useSyncExternalStore(subscribe, getHydratePendingSnapshot, getHydratePendingSnapshot)
 }
@@ -539,10 +576,10 @@ export function __resetBottomTerminal(): void {
   volatileNames.clear()
   state = { open: false, height: DEFAULT_HEIGHT, width: DEFAULT_WIDTH, position: 'bottom', tabs: [], activeId: null }
   restoredIds = new Set()
-  hydrateSuspects = new Set()
-  hydratePhase = 'settled'
+  ruling = newRuling(restoredIds)
   emit()
   setTerminalCloseFailed(false)
+  persistOpen(false)
   if (typeof localStorage !== 'undefined') {
     try { localStorage.removeItem(STORAGE_KEY) } catch { /* ignore */ }
     cleanOrphanNames()

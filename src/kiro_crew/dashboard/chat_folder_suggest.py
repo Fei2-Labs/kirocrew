@@ -100,7 +100,7 @@ def _folder_sample_titles(state: DashboardState) -> dict[str, list[str]]:
     """Newest session titles per folder id — the only real topical grounding.
 
     A chat folder carries no description: ``name`` is its single descriptive
-    field (see the create literal in ``chat_folders.py``), which is far too thin
+    field (see the create literal in ``chat_folders_records.py``), which is far too thin
     for a model to file "Fix the render gate flake" under "Kiro Crew › i18n".
     The titles already filed in a folder ARE its description, and
     ``list_sessions()`` yields title + folder_id newest-first in the one scan the
@@ -313,6 +313,10 @@ async def _pick_via_llm(
                 state.sessions,
                 prompt,
                 sel_source="chat_folder_suggest",
+                # Name the session this call is for. Without it the usage row
+                # falls back to ``_bg``, so every suggestion persists anonymously
+                # and a wrong pick cannot be traced to the session it filed.
+                sel_session_key=slot.key,
                 timeout=_SUGGEST_TIMEOUT_SECS,
             )
         except Exception:  # noqa: BLE001 — best-effort background task

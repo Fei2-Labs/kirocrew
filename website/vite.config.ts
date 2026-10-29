@@ -21,7 +21,10 @@ import {
   TAILWIND_RUNTIME_SRC,
 } from './src/lib/vendorPaths'
 import { precompressPlugin } from './scripts/precompress.mjs'
+import { atomicPublishPlugin } from './scripts/publish-dist.mjs'
+import { uiAutoStampPlugin } from './scripts/lib/ui-auto-stamp.mjs'
 import { CONTEXT_SINGLETON_DEDUPE } from './vite.shared'
+import { resolveBuildBase, vendorImportMap, withoutServiceWorker } from './scripts/lib/basePath.mjs'
 import {
   parseBrandingConfig,
   applyBrandingToHtml,
@@ -81,26 +84,20 @@ function tokenProxyPlugin(): Plugin {
  * so exports are never renamed or tree-shaken.
  */
 function appImportMapPlugin(): Plugin {
+  let base = '/'
   return {
     name: 'kirocrew-app-importmap',
     enforce: 'post',
+    configResolved(config) {
+      base = config.base
+    },
     transformIndexHtml: {
       order: 'post',
-      handler(html) {
-        const importMap = {
-          imports: {
-            'react': '/vendor/react.mjs',
-            'react-dom': '/vendor/react-dom.mjs',
-            'react-dom/client': '/vendor/react-dom-client.mjs',
-            'react/jsx-runtime': '/vendor/react-jsx-runtime.mjs',
-            '@kirocrew/app-sdk': '/vendor/kirocrew-app-sdk.mjs',
-            '@kirocrew/app-sdk/ui': '/vendor/kirocrew-ui.mjs',
-            '@tanstack/react-query': '/vendor/tanstack-react-query.mjs',
-            'lucide-react': '/vendor/lucide-react.mjs',
-          },
-        }
-        const tag = `<script type="importmap">${JSON.stringify(importMap)}</script>`
-        return html.replace('<head>', `<head>\n  ${tag}`)
+      handler(html, ctx) {
+        const tag = `<script type="importmap">${JSON.stringify(vendorImportMap(base))}</script>`
+        // Only the dashboard shell registers the service worker; app windows do not.
+        const shell = base === '/' || ctx.path !== '/index.html' ? html : withoutServiceWorker(html)
+        return shell.replace('<head>', `<head>\n  ${tag}`)
       },
     },
   }
@@ -257,11 +254,16 @@ function excalidrawFontsPlugin(): Plugin {
 }
 
 function swVersionPlugin(): Plugin {
+  // The resolved outDir: atomicPublishPlugin builds into a scratch sibling of
+  // the live dist and publishes it afterwards (scripts/publish-dist.mjs).
+  let swPath = ''
   return {
     name: 'kirocrew-sw-version',
     apply: 'build',
+    configResolved(config) {
+      swPath = path.resolve(config.root, config.build.outDir, 'sw.js')
+    },
     closeBundle() {
-      const swPath = path.resolve(__dirname, 'dist/sw.js')
       try {
         let content = readFileSync(swPath, 'utf-8')
         if (!content.includes('%%SW_BUILD_HASH%%')) {
@@ -272,7 +274,7 @@ function swVersionPlugin(): Plugin {
           // the placeholder was renamed/removed in sw.js: fail loudly.
           if (!/const CACHE_VERSION = '[^'%]+'/.test(content)) {
             throw new Error(
-              'swVersionPlugin: neither placeholder %%SW_BUILD_HASH%% nor an injected CACHE_VERSION found in dist/sw.js'
+              `swVersionPlugin: neither placeholder %%SW_BUILD_HASH%% nor an injected CACHE_VERSION found in ${swPath}`
             )
           }
           return
@@ -298,6 +300,74 @@ function swVersionPlugin(): Plugin {
       } catch (e: unknown) {
         // Only tolerate sw.js not existing (library mode, test builds).
         // Anything else is a real bug — surface it.
+        if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
+      }
+    },
+  }
+}
+
+/**
+ * Post-build plugin: writes `build-id.json` into the build's output dir,
+ * stamping the build identity of the SPA bundle. Runs during `vite build`
+ * only (not the dev server). It writes into the RESOLVED `config.build.outDir`
+ * so the stamp rides atomicPublishPlugin's scratch-and-publish (see below),
+ * and the file is staged into the Python package by the same
+ * `cp -R website/dist ...` every packaging path already runs.
+ *
+ * WHY: the gateway serves a gitignored, build-copied `dist/`. Nothing verifies
+ * that the served bundle matches the backend it belongs to, so a restart that
+ * did not rebuild/copy the frontend serves an OLD bundle silently. The backend
+ * reads this stamp at startup and warns (never shuts down) when the dist was
+ * built from a different website/ tree than the running backend — see
+ * src/kiro_crew/dashboard/stale_bundle_guard.py.
+ *
+ * `buildId` reuses the exact identity swVersionPlugin computes
+ * (`${pkg.version}-${gitShortSha}`) for display; `websiteTree` is the compared
+ * identity. If git is unavailable or website/ is dirty, `websiteTree` is "" and
+ * the backend guard skips silently rather than false-warning.
+ */
+function buildIdPlugin(): Plugin {
+  // The resolved outDir, captured in configResolved: atomicPublishPlugin
+  // (enforce: 'post') builds into a scratch sibling of the live dist and
+  // publishes it in its own post-order closeBundle, AFTER this hook runs. A
+  // hardcoded `dist/build-id.json` would stamp the OLD live tree, which the
+  // scratch publish then replaces with an unstamped bundle — the stamp would
+  // never reach the published dist and the backend guard would silently skip.
+  // Writing into config.build.outDir (the scratch dir) means the stamp rides
+  // the atomic publish, exactly as swVersionPlugin stamps sw.js.
+  let outDir = ''
+  let configRoot = ''
+  return {
+    name: 'kirocrew-build-id',
+    apply: 'build',
+    configResolved(config) {
+      configRoot = config.root
+      outDir = path.resolve(config.root, config.build.outDir)
+    },
+    closeBundle() {
+      const outPath = path.resolve(outDir, 'build-id.json')
+      // Short SHA for the human-facing id, matching swVersionPlugin's
+      // `${version}-${shortSha}` scheme. The compared identity is the git tree
+      // id of website/ (HEAD:website) -- the same one
+      // frontend._write_build_source_fingerprint records -- so a backend-only
+      // commit does not make this bundle look stale. Stamped ONLY when website/
+      // is clean: a dirty build compiled content HEAD:website does not
+      // describe. An empty websiteTree (dirty tree, or git unavailable) tells
+      // the backend guard to skip rather than warn.
+      let sha = ''
+      let websiteTree = ''
+      try {
+        const repoRoot = path.resolve(configRoot, '..')
+        sha = execSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf-8' }).trim()
+        const dirty = execSync('git status --porcelain -- website', { cwd: repoRoot, encoding: 'utf-8' }).trim()
+        if (!dirty) websiteTree = execSync('git rev-parse HEAD:website', { cwd: repoRoot, encoding: 'utf-8' }).trim()
+      } catch {}
+      const buildId = sha ? `${pkg.version}-${sha.slice(0, 7)}` : pkg.version
+      try {
+        writeFileSync(outPath, JSON.stringify({ buildId, websiteTree }, null, 2) + '\n')
+      } catch (e: unknown) {
+        // outDir missing (library mode, test builds) is the only tolerated
+        // case; anything else is a real bug — surface it.
         if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e
       }
     },
@@ -535,6 +605,48 @@ function editionExtensionPlugin(): Plugin {
 }
 
 /**
+ * Edition syntax-highlighting languages: resolves `virtual:kirocrew-edition-languages`
+ * — imported by `src/utils/highlightLanguages.ts` — to the edition's optional
+ * `$KIROCREW_EDITION_DIR/languages.ts` data module, or to an empty list in the
+ * stock build.
+ *
+ * This is a separate plugin from `editionExtensionPlugin` because it must also
+ * run in the WORKER bundles (`worker.plugins` below): the highlight.js worker
+ * registers the same languages, and Vite does not apply the main `plugins` list
+ * to worker builds. It has no HTML, CSS or asset hooks, so adding it to a worker
+ * bundle changes nothing else there.
+ *
+ * It composes only behind the same fail-closed opt-in as the composition root
+ * (`KIROCREW_ALLOW_EDITION=1`); without it, `editionExtensionPlugin` has already
+ * failed the build. The file is optional: an edition without `languages.ts`
+ * contributes no languages.
+ */
+function editionLanguagesPlugin(): Plugin {
+  const VIRTUAL_ID = 'virtual:kirocrew-edition-languages'
+  const RESOLVED_ID = '\0' + VIRTUAL_ID
+  const editionDir = process.env.KIROCREW_EDITION_DIR
+  const entry =
+    editionDir && process.env.KIROCREW_ALLOW_EDITION === '1'
+      ? ['languages.ts'].map((f) => path.join(path.resolve(editionDir), f)).find(existsSync) ?? null
+      : null
+  return {
+    name: 'kirocrew-edition-languages',
+    enforce: 'pre',
+    resolveId(id) {
+      return id === VIRTUAL_ID ? RESOLVED_ID : null
+    },
+    load(id) {
+      if (id !== RESOLVED_ID) return null
+      if (entry) {
+        // Forward slashes: a Windows path would carry backslash escapes.
+        return `export { default } from ${JSON.stringify(entry.split(path.sep).join('/'))}\n`
+      }
+      return 'export default []\n'
+    },
+  }
+}
+
+/**
  * Debug-only plugin: writes `dist/bundle-report.json` describing what the build
  * emitted and which packages contribute the weight.
  *
@@ -639,10 +751,25 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
+  // Sub-path deployments (behind a reverse proxy) are a separate build:
+  // `KIROCREW_BASE_PATH=/proxy/kirocrew npm run build`. Unset builds for `/`.
+  base: resolveBuildBase(process.env.KIROCREW_BASE_PATH),
   // `editionExtensionPlugin()` precedes `tailwindcss()` on purpose: both run
   // `enforce: 'pre'` transforms, and the edition `@source` must be spliced into
   // index.css before Tailwind compiles it (see the plugin's `transform`).
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  plugins: [
+    // Before react(): it stamps JSX source text (see scripts/lib/ui-auto-stamp.mjs).
+    uiAutoStampPlugin({
+      root: fileURLToPath(new URL('.', import.meta.url)),
+      manifestPath: fileURLToPath(new URL('./node_modules/.cache/kc-ui-auto/sites.json', import.meta.url)),
+      artifactPath: fileURLToPath(new URL('./node_modules/.cache/kc-ui-auto/ui-index.auto.json', import.meta.url)),
+      readFile: (f: string) => readFileSync(f, 'utf-8'),
+      exists: existsSync,
+    }),
+    react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), buildIdPlugin(), editionExtensionPlugin(), editionLanguagesPlugin(), tailwindcss(), bundleReportPlugin(), appWindowUrls(), precompressPlugin(), atomicPublishPlugin()],
+  // Worker bundles do not inherit `plugins`; the hljs worker needs the edition
+  // languages module (see editionLanguagesPlugin).
+  worker: { plugins: () => [editionLanguagesPlugin()] },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
@@ -709,6 +836,11 @@ export default defineConfig({
       },
     },
     setupFiles: './integration/setup.ts',
+    // Reset every vi.stubEnv before each test, a beforeAll or module-level stub
+    // included, so env is stubbed in beforeEach or the test (a full-suite trial broke
+    // nothing). unstubGlobals stays off: it would undo a file-wide stub such as
+    // pipelineBoardCard.test.ts's module-level CSSStyleSheet.
+    unstubEnvs: true,
     css: true,
     pool: 'forks',  // More stable than threads on ARM64 build fleet (avoids ERR_IPC_CHANNEL_CLOSED)
     // Bound fork memory. Without a cap, vitest spawns one worker per core
@@ -751,8 +883,8 @@ export default defineConfig({
     // load-induced flakes while still failing real hangs.
     testTimeout: 15000,
     include: ['integration/**/*.test.{ts,tsx}', 'src/**/*.test.{ts,tsx}'],
+    // act() warnings are counted per file by integration/setup.ts, never filtered here.
     onConsoleLog: (log) =>
-      !log.includes('was not wrapped in act(') &&
       // TipCard's useTipTrigger issues tipsStatus/tipsNext queries; the 232
       // tests that vi.mock('../api/client') without stubbing those two fields
       // leave queryFn undefined, so React Query logs "No queryFn was passed"
@@ -819,6 +951,9 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    // A build's scratch and swapped-aside trees (scripts/publish-dist.mjs) are
+    // thousands of files written and removed per build; nothing here imports them.
+    watch: { ignored: ['**/.dist*.next-*/**', '**/.dist*.ready-*/**', '**/.dist*.prev-*/**'] },
     proxy: {
       '/api': {
         target: `http://localhost:${backendPort}`,

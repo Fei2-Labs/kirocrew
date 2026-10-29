@@ -441,3 +441,26 @@ def test_model_failure_is_silent_and_not_retried() -> None:
         asyncio.run(fs.maybe_suggest_folder(state, slot))
     assert rec.sent == []
     assert slot._folder_suggested is True
+
+
+def test_model_call_names_the_slot_in_the_usage_row() -> None:
+    # The background call must be attributed to the slot it files, not the shared
+    # ``_bg`` pseudo-session: ``sel_session_key`` is what names the usage row.
+    slot = _Slot(key="dashboard_chat-42")
+    state, rec = _suggest_state(_FOLDERS, slot)
+    cfg = SimpleNamespace(dashboard=SimpleNamespace(folder_suggestions_enabled=True))
+    seen: dict = {}
+
+    async def capturing_oneliner(_sessions, _prompt, **kw):
+        seen.update(kw)
+        return "1"
+
+    with (
+        patch.object(fs.KiroCrewConfig, "load", staticmethod(lambda: cfg)),
+        patch.object(fs, "run_bg_oneliner", capturing_oneliner),
+    ):
+        asyncio.run(fs.maybe_suggest_folder(state, slot))
+
+    assert seen.get("sel_session_key") == "dashboard_chat-42"
+    # The feature attribution is unchanged — only the session key is added.
+    assert seen.get("sel_source") == "chat_folder_suggest"

@@ -9,8 +9,8 @@ adapter approves on its own and the gate is never consulted.
 
 ``ensure_routed_settings`` writes that file when no mode is configured, which
 is what makes the backend ROUTED by construction. It never overwrites an
-explicit mode: a configured bypass stays, the verdict stays BYPASSED, and the
-session refuses unless the named opt-out is on. The routing probe always reads
+explicit mode: a configured bypass stays and the verdict stays BYPASSED. The adapter is not
+selectable through the enforced routing set. The routing probe always reads
 the file back rather than trusting that a write happened.
 """
 
@@ -112,16 +112,15 @@ def ensure_routed_settings(work_dir: Path | str) -> bool:
     - **Writes only when no mode is configured.** An explicitly configured mode is
       somebody's decision — an operator's, or a companion edition's — and
       silently rewriting it would be Kiro Crew overruling a choice it can see. A
-      configured bypass mode therefore stays, the verdict stays BYPASSED, and the
-      session refuses with the named opt-out available. Strengthening the gate
-      behind the operator's back is still going behind their back.
+      configured bypass mode therefore stays and the verdict stays BYPASSED. The
+      session cannot claim a permission route in that state.
     - **Merges rather than replaces.** Other keys in the file (a companion's
       model allowlist, for instance) are preserved, because this function's
       concern is one key.
 
     Returns True when it wrote. Failures are reported, never swallowed: the
     caller's routing probe reads the file back, so a failed write surfaces as
-    INDETERMINATE and refuses the session rather than passing silently.
+    INDETERMINATE and the route cannot be treated as established.
     """
     path = local_settings_path(work_dir)
     try:

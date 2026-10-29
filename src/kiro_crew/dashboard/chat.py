@@ -9,10 +9,10 @@ The actual implementation lives in:
 - chat_persistence.py — session save/restore, history
 - chat_runner.py      — _run_chat, streaming, prompt expansion
 - chat_handlers.py    — HTTP API endpoints
-- chat_orchestrator.py — stage loop, plan actions
-- chat_title.py       — title generation, plan metadata
+- chat_title.py       — title generation
 - chat_regenerate.py  — regenerate, variant switch, edit-resend
 - chat_folders.py     — folder CRUD, pin, assignment
+- chat_manual_order.py — the manual session order (sort "Manual")
 - chat_voice.py       — TTS config + synthesis (optional)
 - chat_slack.py       — Slack link, handoff, channels
 - chat_fork.py        — fork session
@@ -30,6 +30,7 @@ from kiro_crew.config.loader import (  # noqa: F401
     config_dir,
     resolve_agent_bindings,
 )
+from kiro_crew.dashboard.chat_folder_cleanup import api_chat_folders_cleanup  # noqa: F401
 from kiro_crew.dashboard.chat_folder_scaffold import (  # noqa: F401
     api_chat_folders_scaffold,
     api_chat_folders_scan,
@@ -40,9 +41,13 @@ from kiro_crew.dashboard.chat_folders import (  # noqa: F401
     api_chat_folder_reorder,
     api_chat_folder_update,
     api_chat_folders,
+    api_chat_pinned_order,
     api_chat_slot_folder,
     api_chat_slot_mode,
+    api_chat_slot_muted,
+    api_chat_slot_mutes_opened,
     api_chat_slot_pin,
+    load_pinned_order_after_listen,
 )
 from kiro_crew.dashboard.chat_fork import api_chat_slot_fork  # noqa: F401
 from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
@@ -72,16 +77,24 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_slot_reload,
     api_chat_slot_reset_conversation,
     api_chat_slot_resume,
+    api_chat_slot_selection_capabilities,
+    api_chat_slot_source_link_unlink,
     api_chat_slot_source_links,
     api_chat_slot_stop,
     api_chat_slot_summary,
     api_chat_slot_summary_generate,
+    api_chat_slot_turn_timeout,
     api_chat_slot_workspace,
     api_chat_slots,
     api_chat_slots_cleanup,
     api_chat_slots_model,
+    api_chat_slots_unrestored,
+    api_favorite_project_add,
+    api_favorite_project_remove,
+    api_favorite_projects,
     api_recent_projects,
 )
+from kiro_crew.dashboard.chat_manual_order import api_chat_manual_order  # noqa: F401
 from kiro_crew.dashboard.chat_mirror import (  # noqa: F401
     api_channel_targets,
     api_chat_slot_mirror_link,
@@ -90,12 +103,6 @@ from kiro_crew.dashboard.chat_mirror import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_nav import (  # noqa: F401
     api_chat_nav_resolve_links,
-)
-from kiro_crew.dashboard.chat_orchestrator import (  # noqa: F401
-    _build_stage_context,
-    _previous_result_paths,
-    _stage_loop,
-    api_chat_plan_action,
 )
 from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
     _attach_variants,
@@ -135,6 +142,7 @@ from kiro_crew.dashboard.chat_slack import (  # noqa: F401
 from kiro_crew.dashboard.chat_tags import (  # noqa: F401
     api_chat_slot_drop,
     api_chat_slot_tags,
+    api_chat_tag_adopt,
     api_chat_tag_column_create,
     api_chat_tag_column_delete,
     api_chat_tag_column_update,
@@ -147,15 +155,13 @@ from kiro_crew.dashboard.chat_tags import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_title import (  # noqa: F401
     _build_title_prompt,
-    _extract_and_redact_plan_metadata,
     _generate_title_via_kiro,
     _maybe_auto_title,
     _persist_title,
-    _rephrase_plan_lite,
-    _reset_auto_run_for_new_plan,
     api_chat_slot_generate_title,
     api_chat_slot_rename,
 )
+from kiro_crew.dashboard.chat_todo import api_chat_slot_todo  # noqa: F401
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
     _BLOCKED_SLASH_COMMANDS,
     _SLASH_COMMANDS,

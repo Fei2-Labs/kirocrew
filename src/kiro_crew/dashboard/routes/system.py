@@ -18,11 +18,20 @@ from kiro_crew.apps.builtins import BUILTIN_NAMES
 from kiro_crew.apps.routes import register_app_routes
 from kiro_crew.constants import env_flag_enabled
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers import redaction as redaction_handlers
 from kiro_crew.dashboard.handlers.tunnel import api_tunnel_status
 
 
 def register(app: web.Application) -> None:
     """Register the system routes on *app*."""
+    # Redaction cards: allowed hosts (Settings -> Security).
+    app.router.add_get(
+        "/api/redaction/allowed-hosts", redaction_handlers.api_redaction_allowed_hosts
+    )
+    app.router.add_post("/api/redaction/allowed-hosts", redaction_handlers.api_redaction_allow_host)
+    app.router.add_delete(
+        "/api/redaction/allowed-hosts", redaction_handlers.api_redaction_revoke_host
+    )
     # Misc (notifications GET/clear and send-message via _register_mcp_routes)
     app.router.add_get("/api/notifications", handlers.api_notifications)
     app.router.add_delete("/api/notifications", handlers.api_notification_delete)
@@ -39,6 +48,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update", handlers.api_update_apply)
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/channel", handlers.api_update_channel)
+    # A terminal `kirocrew update` on a git checkout pokes this so the running
+    # gateway drops its stale update verdict and re-checks now, instead of the
+    # About badge waiting up to 12h for the next poll. Self-authenticates over
+    # loopback + the local secret (the token-auth middleware lets the POST
+    # through via its method-scoped bypass), like /api/logout.
+    app.router.add_post("/api/update/revalidate", handlers.api_update_revalidate)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
     # In-app wheel update step-up (RFC OQ7): the SPA arms, only the host
     # approves. Arm/status are ordinary authenticated routes; approve
@@ -65,6 +80,10 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/sessions/memory", handlers.api_sessions_memory)
     app.router.add_get("/api/sessions/health", handlers.api_sessions_health)
     app.router.add_get("/api/sessions/usage", handlers.api_sessions_usage)
+    # The account modal's Refresh button: runs the same free API-then-/usage
+    # refresh the timer runs, now. The handler applies the kiro-unverified check
+    # the GET applies and refuses a second refresh while one is in flight (409).
+    app.router.add_post("/api/sessions/usage/refresh", handlers.api_sessions_usage_refresh)
     # Durable task queue + capacity view. The literal /summary is registered
     # before the /{task_id} pattern for the same reason /sessions/search is.
     app.router.add_get("/api/tasks", handlers.api_tasks_list)
@@ -74,6 +93,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/tasks/{task_id}/cancel", handlers.api_task_cancel)
     app.router.add_get("/api/usage/kiro", handlers.api_kiro_usage)
     app.router.add_get("/api/usage", handlers.api_usage)
+    app.router.add_get("/api/usage/series", handlers.api_usage_series)
     app.router.add_get("/api/telemetry/startup", handlers.api_telemetry_startup)
     app.router.add_get("/api/telemetry/context-trace", handlers.api_context_trace)
     app.router.add_get("/api/usage/turns", handlers.api_usage_turns)
@@ -99,6 +119,7 @@ def register(app: web.Application) -> None:
     # ahead of /{key} anyway, matching the ordering discipline the note above sets.
     app.router.add_get("/api/sessions/clearable/count", handlers.api_sessions_clearable_count)
     app.router.add_get("/api/sessions/{key}", handlers.api_session_detail)
+    app.router.add_get("/api/sessions/{key}/meta", handlers.api_session_meta)
     app.router.add_delete("/api/sessions/{key}", handlers.api_session_delete)
     app.router.add_get("/api/logs", handlers.api_logs)
     app.router.add_get("/api/logs/level", handlers.api_log_level_get)
@@ -130,6 +151,11 @@ def register(app: web.Application) -> None:
     app.router.add_put("/api/security/trusted-apps/allow-all", handlers.api_trusted_apps_allow_all)
     app.router.add_post("/api/security/trusted-apps/{name}", handlers.api_trusted_app_grant)
     app.router.add_delete("/api/security/trusted-apps/{name}", handlers.api_trusted_app_revoke)
+    app.router.add_get("/api/security/trusted-registries", handlers.api_trusted_registries_list)
+    app.router.add_post("/api/security/trusted-registries", handlers.api_trusted_registry_grant)
+    app.router.add_post(
+        "/api/security/trusted-registries/revoke", handlers.api_trusted_registry_revoke
+    )
     # Read-only governance policy viewer — effective Level-1 ∩ Level-2 ceiling
     # across every governed scope (no write path; the ceiling is file-authored).
     app.router.add_get("/api/governance/policy", handlers.api_governance_policy)
@@ -148,12 +174,27 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/aws/consent", handlers.api_aws_consent_get)
     app.router.add_post("/api/aws/consent", handlers.api_aws_consent_post)
     app.router.add_delete("/api/aws/consent", handlers.api_aws_consent_delete)
+    # Project AWS profile binding (the composer's project chip). Owner-gated in
+    # the handler and browser-called like the consent pair: which account an
+    # agent's AWS commands reach by default is the operator's choice.
+    app.router.add_get("/api/aws/project-profile", handlers.api_aws_project_profile_get)
+    app.router.add_put("/api/aws/project-profile", handlers.api_aws_project_profile_put)
     # Decision-seam consent (Settings > Developer > Feature Previews). Owner-gated
     # in the handler and browser-called like the AWS pair above, for the same
     # reason: it is the operator's out-of-band surface for an egress
     # authorization the agent must not be able to grant itself.
     app.router.add_get("/api/decisions/consent", handlers.api_decisions_consent_get)
     app.router.add_put("/api/decisions/consent", handlers.api_decisions_consent_put)
+    # Which System One server the seam asks: hosted Jev or a local preset. Owner-gated
+    # in the handler and the only dashboard writer of `decisions.provider.*`.
+    app.router.add_get("/api/decisions/provider", handlers.api_decisions_provider_get)
+    app.router.add_put("/api/decisions/provider", handlers.api_decisions_provider_put)
+    app.router.add_get(
+        "/api/decisions/local-models/status", handlers.api_decisions_local_model_status
+    )
+    app.router.add_delete(
+        "/api/decisions/local-models/{id}", handlers.api_decisions_local_model_delete
+    )
     # The decision strip's own pair, owner-gated in the same handler module: a
     # verdict on one turn (a WRITE of the decision log) and the folded report the
     # strip's tooltip reads. Browser-called by the chat surface, like the consent
@@ -171,6 +212,10 @@ def register(app: web.Application) -> None:
         "/api/file-delivery/consent/approve", handlers.api_file_delivery_consent_approve
     )
     app.router.add_delete("/api/file-delivery/consent", handlers.api_file_delivery_consent_delete)
+    # Credential-redaction switch. Owner-gated in the handler, like the consent
+    # routes above: its only legitimate caller is the owner's browser.
+    app.router.add_get("/api/security/credential-redaction", handlers.api_credential_redaction_get)
+    app.router.add_put("/api/security/credential-redaction", handlers.api_credential_redaction_put)
     app.router.add_get("/api/approvals", handlers.api_approvals)
     app.router.add_post("/api/approvals/{id}/{action}", handlers.api_approval_resolve)
 

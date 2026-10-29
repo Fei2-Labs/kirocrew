@@ -34,6 +34,11 @@ vi.mock('../apps/builtinRegistry', async () => {
     getBuiltinApp: (path: string) =>
       path === '/test-app' ? { component, appId: 'test-app-id' } : undefined,
     hasBuiltinComponent: (path: string) => path === '/test-app',
+    // The refusal record moved into this module (it used to live in
+    // `seamCollision.ts`, which this file does not mock), so a TOTAL mock has to
+    // supply it. Always undefined: nothing here is refused, so the miss path
+    // stays the chat redirect these cases assert.
+    builtinRefusalReason: () => undefined,
     BUILTIN_COMPONENT_REGISTRY: {},
   }
 })

@@ -363,14 +363,17 @@ class TestResolveHonorsOptOut:
     re-introduce "disabled but still blocked"."""
 
     @pytest.mark.asyncio
-    async def test_disabled_builtin_allowed_when_hooks_opt_out(self, mock_sel):
+    async def test_disabled_builtin_allowed_when_hooks_opt_out(self, mock_sel, monkeypatch):
         from kiro_crew.hooks import HookManager, HooksConfig
         from kiro_crew.llm_helpers import _resolve_permission
 
         # User disabled the ec2 terminate-instances built-in in the dashboard.
-        mgr = HookManager(
-            HooksConfig(denied_commands_disabled_ids=["aws-destructive-ec2-terminate-instances"])
+        disabled_ids = ["aws-destructive-ec2-terminate-instances"]
+        monkeypatch.setattr(
+            "kiro_crew.hooks.load_denied_commands_state",
+            lambda: {"disabled_ids": disabled_ids},
         )
+        mgr = HookManager(HooksConfig(denied_commands_disabled_ids=disabled_ids))
         provider = FakeProvider()
         event = FakeEvent(title="aws ec2 terminate-instances --instance-ids i-1")
         result = await _resolve_permission(
@@ -381,13 +384,16 @@ class TestResolveHonorsOptOut:
         assert "req-1" in provider.approved
 
     @pytest.mark.asyncio
-    async def test_other_builtin_still_denied_when_one_disabled(self, mock_sel):
+    async def test_other_builtin_still_denied_when_one_disabled(self, mock_sel, monkeypatch):
         from kiro_crew.hooks import HookManager, HooksConfig
         from kiro_crew.llm_helpers import _resolve_permission
 
-        mgr = HookManager(
-            HooksConfig(denied_commands_disabled_ids=["aws-destructive-ec2-terminate-instances"])
+        disabled_ids = ["aws-destructive-ec2-terminate-instances"]
+        monkeypatch.setattr(
+            "kiro_crew.hooks.load_denied_commands_state",
+            lambda: {"disabled_ids": disabled_ids},
         )
+        mgr = HookManager(HooksConfig(denied_commands_disabled_ids=disabled_ids))
         provider = FakeProvider()
         # A DIFFERENT destructive command the user did NOT disable stays blocked.
         event = FakeEvent(title="aws cloudformation delete-stack --stack-name prod")

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew import mcp_core, session_directive
+from kiro_crew import mcp_core, session_directive, validation
 from kiro_crew.autonudge import AutoNudgeService, NudgeLoop, runtime_budget_exceeded
 from kiro_crew.dashboard.session_directive_apply import apply_session_directive
 from kiro_crew.mcp_tools import control
@@ -58,9 +58,14 @@ def test_babysit_keeps_finite_legacy_path_for_unobserved_review_evidence() -> No
 
     legacy_args = session_directive.decode(legacy, "monitor_start")
     assert legacy_args is not None
-    assert legacy_args["max_cycles"] == 24
+    assert legacy_args["max_cycles"] == 48
     assert legacy_args["max_runtime_secs"] == 14_400
-    assert legacy_args["gate"] is False
+    # The runtime, not the cycle cap, ends the loop.
+    assert legacy_args["idle_secs"] * legacy_args["max_cycles"] >= legacy_args["max_runtime_secs"]
+    # Gated, with the judge off: an unchanged pull request costs no turn and any
+    # change to its reading, comments included, wakes the loop.
+    assert legacy_args["gate"] is True
+    assert validation.judge_is_off(legacy_args["judge"])
     assert "call the finite legacy path directly" in skill
 
 
@@ -72,8 +77,8 @@ def test_babysit_keeps_finite_legacy_path_when_terminal_success_must_report() ->
     assert "use the finite legacy path" in skill
 
 
-def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> None:
-    skill_path = _BABYSIT_SKILL.parent.parent / "prepare-pr/SKILL.md"
+def test_prepare_pr_recipe_covers_its_poll_budget_gated_with_the_judge_off() -> None:
+    skill_path = _BABYSIT_SKILL.parent.parent / "kirocrew-prepare-pr/references/monitor-loop.md"
     skill = skill_path.read_text(encoding="utf-8")
     recipe = next(
         textwrap.dedent(block).strip()
@@ -89,7 +94,7 @@ def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> N
     applied = session_directive.decode(result, "monitor_start")
     assert applied is not None
     loop = NudgeLoop(
-        id="prepare-pr",
+        id="kirocrew-prepare-pr",
         slot_key=_BINDING,
         message=applied["message"],
         idle_secs=applied["idle_secs"],
@@ -98,8 +103,11 @@ def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> N
         created_ts=1.0,
     )
     assert loop.max_runtime_secs > 0
-    assert not runtime_budget_exceeded(loop, now=loop.created_ts + loop.idle_secs * loop.max_cycles)
-    assert applied["gate"] is False
+    # Every cycle spent means the runtime is spent too, so the cycle cap never
+    # ends the loop before the 24 hours the skill states.
+    assert runtime_budget_exceeded(loop, now=loop.created_ts + loop.idle_secs * loop.max_cycles)
+    assert applied["gate"] is True
+    assert validation.judge_is_off(applied["judge"])
 
 
 def test_babysit_routes_webex_sessions_to_the_finite_legacy_path() -> None:
@@ -282,9 +290,12 @@ async def test_babysit_create_requires_application_before_state_is_authoritative
     assert monitor["objective"] == "review_ready"
     assert monitor["cadence_secs"] == 300
     assert monitor["token_usage_known"] is True
+    # A call that named no budgets gets the shipped defaults, and the wake budget's
+    # default is 0 -- unlimited. The runtime, token and provider-error budgets are
+    # what retire this watch.
     assert monitor["budgets"] == {
         "max_runtime_secs": 14_400,
-        "max_agent_turns": 8,
+        "max_agent_turns": 0,
         "max_tokens": 250_000,
         "max_provider_errors": 3,
     }

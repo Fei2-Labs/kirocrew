@@ -14,7 +14,7 @@ rules are presentation and stay in TypeScript (``notificationPolicy.ts``) next t
 the renderer that obeys them. This side only decides WHAT fired and WHEN.
 
 The gateway offers no server-push channel to an app's own windows — the one SSE
-endpoint in ``apps/routes.py`` is for streaming registry installs — so delivery
+endpoint in ``apps/routes_registry.py`` is for streaming registry installs — so delivery
 is a **queue the overlay drains**, which is also how the reference builtin's
 overlay works. Each fire gets a monotonic sequence number and the overlay asks
 for everything after the last number it saw. That shape is chosen over "return
@@ -496,6 +496,21 @@ class CompanionStore:
                 )
                 self._save_locked()
         return {"ok": found}
+
+    def update(self, ident: str, text: str) -> dict[str, Any]:
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("text is required")
+        with self._lock:
+            rows = self._state.reminders.reminders
+            if not any(r.id == ident for r in rows):
+                return {"ok": False}
+            edited = tuple(replace(r, text=cleaned) if r.id == ident else r for r in rows)
+            self._state = replace(
+                self._state, reminders=replace(self._state.reminders, reminders=edited)
+            )
+            self._save_locked()
+        return {"ok": True}
 
     def skip(self, ident: str) -> dict[str, Any]:
         """Push a recurring reminder past its next occurrence. No-op for one-time."""

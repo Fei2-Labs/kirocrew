@@ -3,7 +3,8 @@
 ## Overview
 
 `src/kiro_crew/session_storage.py` measures what conversations cost on disk and
-reclaims that space when a user asks. `src/kiro_crew/session_digest.py` reads a
+reclaims that space when a user asks; its code lives in the owners listed under
+[Module layout](#module-layout). `src/kiro_crew/session_digest.py` reads a
 single session's content for the detail view. `src/kiro_crew/dashboard/handlers/session_storage.py`
 exposes both over HTTP. Reclaiming stages files under `<data home>/trash/sessions/`
 rather than unlinking them; emptying that trash is the only irreversible step and
@@ -12,14 +13,60 @@ the only one that returns space to the filesystem.
 Nothing here runs on a timer. Every measurement is pulled by a request and every
 move is initiated by a user action.
 
+## Module layout
+
+`kiro_crew.session_storage` is the module every caller imports, and every name it bound
+before its owners moved out is still reached there. It is a mirror facade
+(`kiro_crew._facade_mirror`) over the owners in `src/kiro_crew/session_storage_parts/`: it
+binds each name an owner defines, so its namespace holds the definitions the unsplit module
+held, and it serves the names the owners import from the owner holding them. A patch of
+`session_storage.<name>` therefore reaches every owner holding the name, and the moved code
+reads its names as plain module globals. Owners never import the facade, each imports only
+the owners listed before it below, and new work goes to the owner of its responsibility
+rather than back into the facade. Every owner that logs does so under
+`kiro_crew.session_storage`, and `SessionStorageError` and `_OversizedManifestRecord` keep
+that module name in a traceback. The scan and co-tenant caches
+(`_scan_cache`, `_cotenant_cache`) are the two owner names the facade serves instead of
+binding: `store_inventory.py` rebinds them, so a copy on the facade would go stale.
+
+| Owner | Holds |
+|---|---|
+| `session_storage_parts/store_layout.py` | the trash, staging and manifest names, `BUCKET_DAYS`, `MIN_RECLAIM_AGE_DAYS`, `MUTATION_LOCK_NAME`, the unit-id shape, `SessionStorageError`, the index, unit, report and batch types, an empty's callbacks and `SKIP_*` codes, `BatchIdentity`, `trash_root` and the transcript directories, the archive index, and the tree walk (`_tree_files`, `_tree_bytes`) |
+| `session_storage_parts/batch_manifest.py` | a batch's manifest: the header and entries, `_manifest_records` under `_MANIFEST_RECORD_CAP`, `_read_manifest`, the summary and rewrite, `_manifest_rels`, `_rels_digest`, `_header_names_this_batch`, and making a batch durable (`_sync_batch`) |
+| `session_storage_parts/crew_staging.py` | a session's crew logs in the trash: `_stage_crew_logs`, putting them back, the holds file, the staged units no manifest lists (which nothing that removes the batch may remove), and discarding a batch's staging after an empty |
+| `session_storage_parts/store_inventory.py` | the read side: the cached scan (`_scan_units`, `_scan_raw`, `invalidate_scan_cache`), `_unit_paths`, `measure`, `list_units`, `select_reclaimable`, `cotenant_sids`, `reclaim_block_reason` and `list_trash` |
+| `session_storage_parts/pinned_delete.py` | deleting a batch's listed files by descriptor (`_FD_SAFE_DELETE`, `_delete_listed_files`), renaming a batch aside and back (`_stage_batch_by_name`), and the coarse path (`_coarse_remove`) |
+| `session_storage_parts/file_moves.py` | `_mutation_lock`, `_batch_dir`, the no-follow movers and the cross-filesystem copy, `_rollback`, `_canonical_origin`, `_origin_path` and `_unlisted_files` |
+| `session_storage_parts/batch_removal.py` | `staged_targets` and its `_approve_batch`, `empty_trash`, and removing a batch a restore or a rolled-back move emptied (`_remove_emptied_batch`) |
+| `session_storage_parts/trash_reclaim.py` | `move_to_trash` and `_purge_search_index` |
+| `session_storage_parts/trash_restore.py` | `restore` |
+
+`test/test_session_storage_parts.py` pins the owner set and its layer order, the names the
+facade binds and serves, the patch reach of every name the test trees patch through the
+facade, the names served from outside the family, and the logger and exception names.
+
 ## One session, two stores
 
 A conversation's bytes live in two places, owned by two programs:
 
 | Store | Path | Read by |
 |---|---|---|
-| Transcript | `<data home>/sessions/<stem>.jsonl` + `sessions/archive/<stem>__<stamp>.jsonl` | Dashboard history, search, memory consolidation |
+| Transcript | `<data home>/sessions/<stem>.jsonl` + `sessions/archive/<stem>__<stamp>.jsonl`, with its attachments directory `sessions/<stem>.attachments/` and its reply-thread sidecar `sessions/.threads/<stem>.json` | Dashboard history, search, memory consolidation |
 | Replay log | `<kiro home>/sessions/cli/<sid>.json` + `<sid>.jsonl` | kiro-cli, to resume a session |
+
+A third store rides along when the session recorded one: its crew logs,
+`<data home>/crew-log/sessions/<unit>/`, one unit per ACP session id the
+conversation ran under (a reset or model switch starts a new one). A unit joins
+the session whose transcript its header's `slot` names, else the replay log with
+its own id, else it is a row of its own. Its bytes and newest mtime count toward
+the session, and a session any of whose units is mapped is active.
+A report that cannot list every unit answers with what it could; `move_to_trash`
+refuses instead, because a session staged without its crew logs would leave them
+behind attached to no row.
+The dashboard's move re-reads the LIVE session map, where a resume's mapping lands
+before its deferred file write, and stages a session's units inside the same hold of
+`session_map._MAP_LOCK` that `SessionMap.set` takes, so a resume either lands first
+and keeps the session, or waits until its units have moved.
 
 That split is an implementation detail. `StorageReport` carries no per-store
 breakdown and the HTTP payload has no field from which one could be derived, so a
@@ -30,7 +77,7 @@ pins the absence.
 
 ### Halves are always reclaimed together
 
-`_unit_paths()` is the single answer to "what files does staging move", including replay sidecars and transcript archive segments. Restore instead consumes one manifest entry at a time and either returns every listed file in that session or leaves the entry staged; emptying calls `_unlisted_files()` before deletion. Those distinct seams keep a move, undo, or deletion from producing a half-session. `TestMoveTakesBothHalves` and `TestRestoreIsAllOrNothing` fail if either half is dropped.
+`_unit_paths()` is the single answer to "what files does staging move", including replay sidecars, transcript archive segments, the transcript's attachment files and its reply-thread sidecar; the same set is what a session is sized by and what restore puts back. A link where `.threads` should be refuses the move rather than following it. Restore instead consumes one manifest entry at a time and either returns every listed file in that session or leaves the entry staged; emptying calls `_unlisted_files()` before deletion. Those distinct seams keep a move, undo, or deletion from producing a half-session. `TestMoveTakesBothHalves` and `TestRestoreIsAllOrNothing` fail if either half is dropped.
 
 Restore is all-or-nothing per session for the same reason. A file whose original
 path is occupied again blocks its whole session from being restored — the occupant
@@ -293,7 +340,7 @@ reclaimable.
 
 `title` and `first_message` are conversation content, so they pass
 `redact_exfiltration_urls()` then `redact_credentials()` — the same order
-`dashboard/handlers/artifacts.py::_serialize` uses. `origin` gets the same
+`dashboard/handlers/artifacts_parts/record_serialization.py::_serialize` uses. `origin` gets the same
 treatment: a session id is
 rendered, `_UNIT_ID_RE` admits the alphanumeric shape of an access-key id, and a
 credential pasted into an id would otherwise reach the dashboard verbatim.
@@ -308,13 +355,38 @@ session's space both unreclaimable *and* invisible; the fix is that uids stop be
 display text, not that rows disappear.
 
 `dashboard/handlers/session_storage.py` is registered in `_REDACTION_SINKS`
-(`security_posture.py`). The registry is a ratchet — adding a redactor call without
+(`security_posture_sinks_gateway.py`). The registry is a ratchet — adding a redactor call without
 registering the module fails
 `test_every_redactor_call_site_is_a_registered_sink_or_allowlisted`.
 `TestTranscriptContentIsRedacted` covers both surfaces, and
 `TestAMalformedTitleCannotCrashTheList` covers the type guard.
 
 ## The trash
+
+### Crew logs are staged in the crew-log tree, not in the batch
+
+The batch directory is agent-writable and the crew-log tree is hidden from the
+sandbox, and a staged file is later RESTORED into the live tree. A crew log waiting
+in the batch could be edited into entries the gateway then reads as its own, so
+crew logs never enter it. After a session's files are staged and its manifest entry
+is written, each of its units is renamed under its sole lease
+(`crew_log.store.stage_unit`) to `<data home>/crew-log/trash/<batch>/<uid>/`, and both
+parent directories are synced before the move counts. Windows refuses to rename a
+directory holding an open handle, and the lease is one, so there the lease is released
+first and the same refusal stops a writer that took it in the gap. A unit a writer
+still holds is left in place. Restore puts a session's units back before its files,
+refusing an occupied name. Each unit is held (`.trash-hold`, synced with its directory) before it
+is published -- a hold that cannot be synced keeps it staged -- and released only once the
+whole session is back, and a history delete never takes a held unit, so a retention sweep running in between
+cannot expire half of a session that is being restored. When the rest of a restore then fails and a unit it
+already put back cannot be staged again -- a resumed session now leases it, or a sync
+fails -- that unit stays live while its session stays in the batch. It is HELD: a
+`.trash-hold` file in the unit directory keeps the retention sweep off it, and
+`<uid>/held` beside the session's staging lists it, so the hold is released when that
+session is restored whole or its batch is emptied. Only emptying the batch the user selected removes its
+crew-log staging: the batch directory is agent-writable, so a batch missing from it
+approves nothing, and its staging is kept. `list_trash` adds the staged crew-log bytes
+to each batch.
 
 Staged batches live at `<data home>/trash/sessions/<batch id>/`, with each file
 kept under a `cli/` or `crew/` subdirectory. The two halves can share a filename,
@@ -379,7 +451,7 @@ bytes into an agent-readable trash, and a link planted in the trash would copy a
 bytes back out over a restored origin. Staging does not hand it a link today, since every
 enumeration scan uses `is_file(follow_symlinks=False)`, so this is hardening rather than a
 reachable hole being closed: it makes the copy safe on its own terms instead of by
-inheritance from a filter several hundred lines away.
+inheritance from a filter in another module.
 `test_the_copy_helper_refuses_a_symlink_instead_of_reading_its_target` pins it at the copy
 and `test_a_planted_source_symlink_never_reaches_the_trash` pins the end-to-end outcome.
 The final component is what a swap replaces; a symlinked PARENT directory is still
@@ -644,10 +716,9 @@ The batch itself is opened by walking from the filesystem ROOT, one component at
 with `O_NOFOLLOW`, because that flag constrains only the last component: opening the batch
 by path left the trash root and everything above it — writable by the same user — to be
 re-resolved, so an ancestor swapped to a link after validation was followed. The walk is
-`pinned_fs.pin_parent`, not a second copy of it: that module exists because two closed PRs
-(#2446, #2447) tried to spell the mechanism per call site and neither converged, so a second
-spelling is the failure it was created to end. `supports_pinned_tree_walk()` and its
-`_dir_flags()` come from the same place; what this module adds is only the three mutating
+`pinned_fs.pin_parent`, not a second copy of it: that module exists so the mechanism is
+spelled once rather than per call site. `supports_pinned_tree_walk()` and
+`pinned_fs.dir_flags()` (aliased as `_dir_open_flags` in `session_storage_parts/pinned_delete.py`) come from the same place; what that owner adds is only the three mutating
 calls this path makes relative to a descriptor. The path walked is the RESOLVED one, so this
 cannot refuse an install whose data home legitimately sits behind a symlinked home
 directory.
@@ -778,10 +849,9 @@ Where the platform has no `openat`/`O_NOFOLLOW`, these two paths remove the batc
 `rename-verify-remove` instead: `_stage_batch_by_name` renames it aside inside the trash root,
 verifies `(st_dev, st_ino)` on the RENAMED directory against the identity the caller captured,
 and only the staged name is removed; a mismatch or an unreadable identity puts the directory
-back under the name the user saw, and so does a tree that will not go. Refusing outright was an
-earlier answer here and it was wrong: this branch is the whole of Windows, so refusing left a
-batch behind after every restore and every rolled-back move, still listing sessions it no longer
-held - five pre-existing tests read that as a failure, and so would a user. What the rename buys
+back under the name the user saw, and so does a tree that will not go. Refusing outright would be
+wrong: this branch is the whole of Windows, so refusing would leave a batch behind after every
+restore and every rolled-back move, still listing sessions it no longer held. What the rename buys
 is that the approved name no longer exists once it has happened, so nothing can be substituted
 at it, and the identity is checked on the directory that was actually moved. What it does not
 buy: the removal still resolves the staging path, so an actor who can OBSERVE that name inside
@@ -812,8 +882,7 @@ directories, the batch directory, and the coarse path. It is now
 `pinned_fs.remove_dir_verified`, with the pinned scan and the identity-verified chain-open
 beside it, and `session_storage` keeps only the policy: which map authorises the removal,
 what a refusal means to the user, and how it is worded. That split is deliberate rather than
-tidy-up: per-call-site respelling of this mechanism is what `pinned_fs` was created to end
-after #2446 and #2447, and a fourth copy would have repeated it. The descriptor-less platform
+tidy-up: `pinned_fs` exists so this mechanism is not respelled per call site. The descriptor-less platform
 has its own owner, `_stage_batch_by_name`, because `pinned_fs` cannot serve it -
 `remove_dir_verified` addresses a parent descriptor and that is precisely what this platform
 lacks - and all three callers there (the explicit empty and the two cleanups) go through it
@@ -1000,11 +1069,10 @@ that way is dropped from the approved set too.
 to the listing's value.
 
 The approval records the FILES and LINKS as well, for a sharper reason than symmetry with
-the directories. The delete checks each staged file's identity, but it used to check
-against a map its OWN scan built -- self-consistent, and authorising nothing. A listed
-file replaced during the handoff had its replacement's inode recorded, matched, and was
-unlinked: an unapproved file, whose only copy it may be, destroyed on consent given for a
-different one. `BatchIdentity` therefore carries `files` and `links`, and the delete demands
+the directories. The delete checks each staged file's identity, and checking against a map
+its OWN scan built would be self-consistent and authorise nothing: a listed file replaced
+during the handoff would have its replacement's inode recorded, matched, and unlinked — an
+unapproved file, whose only copy it may be, destroyed on consent given for a different one. `BatchIdentity` therefore carries `files` and `links`, and the delete demands
 equality of the whole map in both directions, exactly as it does for `dirs` -- a file added,
 removed or replaced since the approval is `identity_changed` rather than something to
 reconcile, and a concurrent restore that removed staged files lands there too.
@@ -1062,17 +1130,15 @@ removed.
 
 A snapshot that cannot be taken at all **cancels the delete**, for a named selection exactly
 as for "everything staged": the request is answered as an already-settled job carrying the
-reason, and no worker is dispatched. The named case used to proceed anyway, on the reasoning
-that the caller had said WHICH batches and a missing snapshot only cost the progress bar its
-denominator — but the snapshot is what turns those names into approval of the directories
-they pointed at, so proceeding deleted whatever answered to the names by the time the worker
-ran. The failure is not always benign either: a staged tree deep enough to exhaust
+reason, and no worker is dispatched. The named case cancels too, even though the caller
+said WHICH batches: the snapshot is what turns those names into approval of the directories
+they pointed at, so proceeding would delete whatever answered to the names by the time the
+worker ran. The failure is not always benign either: a staged tree deep enough to exhaust
 descriptors arrives as an exception, and writing into the trash is how it gets there.
 
 That cancellation is AUDITED where it returns, with outcome `refused` and `snapshot_unreadable`.
-Every other outcome of this endpoint reaches the SEL record inside the worker, and the named case
-used to reach it too -- by dispatching, which is the loss above. Failing closed is right, but it
-moves the request off the audited path, and the one irreversible operation in this surface must
+Every other outcome of this endpoint reaches the SEL record inside the worker. Failing closed
+moves the request off that audited path, and the one irreversible operation in this surface must
 not be able to be ATTEMPTED with no record that it was.
 `test_an_explicit_delete_refused_by_a_failed_snapshot_is_still_audited` pins it.
 
@@ -1087,8 +1153,9 @@ refuse every empty on that platform, which is a worse answer than a window an at
 to guess their way into. A tree that will not go is renamed back, so the batch stays listed
 and restorable rather than stranded under a name `list_trash()` does not offer.
 
-A selection larger than `_MAX_SELECTION` stages the **oldest** that many sessions
-and returns `remaining` rather than refusing. Refusing would dead-end the install
+For cleanup, a selection larger than `_MAX_SELECTION` stages the **oldest** that
+many sessions and returns `remaining` rather than refusing. An explicit inventory
+trash selection above the cap is refused instead, 400 `selection_too_large`. Refusing would dead-end the install
 the feature exists for — a store already at six figures cannot get under the cap by
 any threshold a client could pick — and oldest-first makes repeating the call
 monotonic progress.
@@ -1175,7 +1242,7 @@ Emptying is the one worth spelling out. An interrupted batch can list *zero*
 sessions while holding real files, so the trash shows it as empty — meaning a
 user's "empty this batch" is consent for nothing while destroying something. Such a
 batch is skipped and logged rather than deleted, so `freed_bytes` under-reports
-instead of the trash over-deleting. `TestEmptyTrash` and
+instead of the trash over-deleting. `TestEmptyTrashApproval` and
 `test_restore_never_deletes_a_file_the_manifest_omits` cover both directions.
 
 All three now also re-establish the answer through the descriptor they remove by, not only
@@ -1186,7 +1253,7 @@ no longer addressing.
 
 ## Constants
 
-`kiro_crew.session_storage` owns the trash layout, manifest schema, age policy, and mutation-lock constants; `kiro_crew.dashboard.handlers.session_storage` owns the request selection bound. Callers import those constants rather than duplicating their literals, so code and tests remain the source of truth when the policy changes.
+`kiro_crew.session_storage` owns the trash layout, manifest schema, age policy, and mutation-lock constants (defined in `src/kiro_crew/session_storage_parts/store_layout.py`); `kiro_crew.dashboard.handlers.session_storage` owns the request selection bound. Callers import those constants rather than duplicating their literals, so code and tests remain the source of truth when the policy changes.
 
 ## Known Limitations
 

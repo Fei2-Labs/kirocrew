@@ -40,7 +40,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +52,7 @@ import pytest
 from kiro_crew.loopback_http import build_loopback_opener
 from kiro_crew.platform_compat import IS_WINDOWS
 from kiro_crew.pod import provision as prov
+from kiro_crew.testing.wait import wait_until
 
 # The pod plane these scenarios run on is hermetic: its own roots, its own unit
 # prefix and its own port band, so a run can never collide with (or reclaim) a
@@ -473,19 +473,30 @@ def _resolve_backend(scratch: Path) -> Path | None:
 def _wait_for(deadline_secs: float, probe, want) -> Any:
     """Poll ``probe`` until it returns a value ``want`` accepts, or the deadline.
 
-    Probe first, test the deadline after -- a do-while. A pre-test loop reads a
-    clock that may already have passed a deadline computed a fork earlier and
-    skips its only body, reporting a timeout on a question nobody asked.
+    Returns the LAST value probed either way: ``wait_until`` reads the probe once
+    before its first deadline check, so a deadline computed a fork earlier still
+    gets one real answer, and the caller reports that answer when it is not the
+    wanted one.
     """
-    deadline = time.monotonic() + deadline_secs
     last: Any = None
-    while True:
+    probed = False
+
+    def _accepted() -> bool:
+        nonlocal last, probed
+        probed = False
         last = probe()
-        if want(last):
-            return last
-        if time.monotonic() >= deadline:
-            return last
-        time.sleep(POLL_INTERVAL)
+        probed = True
+        return bool(want(last))
+
+    try:
+        wait_until(_accepted, timeout=deadline_secs, interval=POLL_INTERVAL)
+    except AssertionError:
+        # Only the deadline is swallowed: the caller owns that failure, reading
+        # ``last`` and failing with the pod's own logs. An assertion the probe
+        # itself raised leaves ``probed`` False and propagates with its message.
+        if not probed:
+            raise
+    return last
 
 
 @pytest.fixture(scope="session")
@@ -805,7 +816,17 @@ def restart_pod_gateway(pod: PodClient):
         _wait_for(RESTART_TIMEOUT, pod.health, lambda c: c not in (200, 401, 403))
         code = _wait_for(RESTART_TIMEOUT, pod.health, lambda c: c in (200, 401, 403))
         if code not in (200, 401, 403):
-            pytest.fail(f"pod gateway did not come back after restart (last {code})\n{pod.logs()}")
+            # `health` folds a failed `pod status` into 0, the same value as a port
+            # nobody answers. Print the verb's own output so the two can be told
+            # apart from the failure alone: `"status": "down"` with the port
+            # unreachable means the supervisor let the successor go, a non-zero
+            # exit means the verb itself refused.
+            status = _run_cli(pod.cli, ["pod", "status", pod.name, "--json"], pod.env)
+            pytest.fail(
+                f"pod gateway did not come back after restart (last {code})\n"
+                f"pod status exit={status.returncode} stdout={status.stdout.strip()!r} "
+                f"stderr={status.stderr.strip()!r}\n{pod.logs()}"
+            )
 
     return _restart
 

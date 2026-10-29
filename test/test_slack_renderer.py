@@ -18,6 +18,7 @@ from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     EVENT_THINKING_CHUNK,
     EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
     AcpEvent,
 )
 from kiro_crew.messaging import APPROVAL_INTERACTIVE, TurnDriver
@@ -31,6 +32,7 @@ from kiro_crew.slack.renderer import (
     SlackRenderer,
     build_approval_blocks,
     is_wait_identity,
+    split_approval_token,
 )
 
 
@@ -71,7 +73,7 @@ class _RecSlack:
         return True
 
     async def append_task(self, channel, ts, task_id, title, status, details="", output=""):
-        self.calls.append(("append_task", {"title": title, "status": status}))
+        self.calls.append(("append_task", {"title": title, "status": status, "details": details}))
         return True
 
     async def set_thread_status(self, channel, thread_ts, status):
@@ -81,8 +83,23 @@ class _RecSlack:
         self.calls.append(("post_blocks", {"blocks": blocks}))
         return self._ts()
 
+    def approval_token(self):
+        """The (registry key, nonce) pair the posted Approve button carries.
+
+        A click sends back the button's own ``value``, so a test that resolves
+        with anything else is not pressing what the user pressed.
+        """
+        for name, kw in reversed(self.calls):
+            if name != "post_blocks":
+                continue
+            for block in kw["blocks"]:
+                for element in block.get("elements", []):
+                    if str(element.get("action_id", "")).startswith(TOOL_APPROVE_ACTION_PREFIX):
+                        return split_approval_token(element.get("value", ""))
+        return None
+
     async def post_message(self, channel, text, thread_ts=None, **kw):
-        self.calls.append(("post_message", {"text": text}))
+        self.calls.append(("post_message", {"text": text, "thread_ts": thread_ts}))
         return self._ts()
 
 
@@ -511,11 +528,15 @@ class TestApprovalDecider:
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
             for _ in range(1000):
-                if decider._futures:
+                if decider._futures and rec.approval_token():
                     break
                 await asyncio.sleep(0)
-            assert SlackApprovalDecider.session_for("thread-42:rqS") == "thread-42"
-            assert SlackApprovalDecider.resolve_global("thread-42:rqS", True) is True
+            token = rec.approval_token()
+            assert token is not None
+            key, nonce = token
+            assert key == "thread-42:rqS"
+            assert SlackApprovalDecider.session_for(key, nonce=nonce) == "thread-42"
+            assert SlackApprovalDecider.resolve_global(key, True, nonce=nonce) is True
             await task
 
         asyncio.run(scenario())
@@ -539,11 +560,15 @@ class TestApprovalDecider:
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
             for _ in range(1000):
-                if decider._futures:
+                if decider._futures and rec.approval_token():
                     break
                 await asyncio.sleep(0)
             # Resolve WITHOUT a direct decider reference — as interactions.py does.
-            assert SlackApprovalDecider.resolve_global("rqG", True) is True
+            token = rec.approval_token()
+            assert token is not None
+            key, nonce = token
+            assert key == "rqG"
+            assert SlackApprovalDecider.resolve_global(key, True, nonce=nonce) is True
             await task
 
         asyncio.run(scenario())
@@ -569,10 +594,13 @@ class TestApprovalDecider:
         async def scenario():
             task = asyncio.create_task(driver.run("hi"))
             for _ in range(1000):
-                if decider._futures:
+                if decider._futures and rec.approval_token():
                     break
                 await asyncio.sleep(0)
-            assert SlackApprovalDecider.resolve_global("rqD", False) is True
+            token = rec.approval_token()
+            assert token is not None
+            key, nonce = token
+            assert SlackApprovalDecider.resolve_global(key, False, nonce=nonce) is True
             await task
 
         asyncio.run(scenario())
@@ -613,6 +641,10 @@ class TestApprovalDecider:
             dec_a = SlackApprovalDecider(session_key="thread-A")
             dec_b = SlackApprovalDecider(session_key="thread-B")
             ev = AcpEvent(kind=EVENT_PERMISSION_REQUEST, request_id="1", options=[])
+            # The renderer opens each window (and mints its nonce) before posting.
+            nonce_a = dec_a.reserve("1")
+            nonce_b = dec_b.reserve("1")
+            assert nonce_a and nonce_b and nonce_a != nonce_b
             task_a = _asyncio.create_task(dec_a(ev))
             task_b = _asyncio.create_task(dec_b(ev))
             for _ in range(1000):
@@ -623,11 +655,11 @@ class TestApprovalDecider:
             assert SlackApprovalDecider._REGISTRY.get("thread-A:1") is dec_a
             assert SlackApprovalDecider._REGISTRY.get("thread-B:1") is dec_b
             # Approve ONLY thread B via its namespaced token.
-            assert SlackApprovalDecider.resolve_global("thread-B:1", True) is True
+            assert SlackApprovalDecider.resolve_global("thread-B:1", True, nonce=nonce_b) is True
             assert (await task_b) is True  # B approved
             # A is untouched and still pending — deny it to finish the test.
             assert not task_a.done()
-            assert SlackApprovalDecider.resolve_global("thread-A:1", False) is True
+            assert SlackApprovalDecider.resolve_global("thread-A:1", False, nonce=nonce_a) is True
             assert (await task_a) is False  # A independently denied
 
         _asyncio.run(scenario())
@@ -1018,6 +1050,26 @@ class TestToolTimerAndWait:
         # the post-wait text -> a second start_stream appears.
         assert methods.count("start_stream") == 2, methods
         assert "stop_stream" in methods
+
+    def test_text_either_side_of_a_tool_card_is_not_glued(self):
+        # Slack lays a message's markdown appends end to end with the task card
+        # in the plan, so the two sentences need a break between them.
+        rec = _RecSlack()
+        renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False)
+        provider = _Provider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="I looked around that time."),
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="a", title="grep", tool_final=False),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="No protocol logs here."),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ]
+        )
+        asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("x"))
+        seq = [
+            kw.get("text", "<task>") for m, kw in rec.calls if m in ("append_stream", "append_task")
+        ]
+        streamed = "".join(s for s in seq if s != "<task>")
+        assert streamed == "I looked around that time.\n\nNo protocol logs here.", seq
 
 
 class _StepClock:
@@ -1717,3 +1769,138 @@ class TestTransportRedactionNotice:
         )
         stops = [kw for m, kw in rec.calls if m == "stop_stream"]
         assert len(stops) == 1 and "[REDACTED: credential]" in str(stops[0]["final_text"])
+
+
+class TestPerCallToolOutcomeCards:
+    """Each tool call's card is finalized against its own terminal outcome,
+    so a failed/cancelled/refused call reads as itself instead of every card
+    reading "complete"."""
+
+    def _run(self, rec, events):
+        renderer = SlackRenderer(rec, "C1", "t1", reactions_enabled=False)
+        provider = _Provider(events)
+        asyncio.run(TurnDriver(provider, renderer, approval_mode="auto").run("hi"))
+
+    def test_failed_tool_result_marks_card_error_not_complete(self):
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="x", title="grep", tool_final=False),
+                AcpEvent(
+                    kind=EVENT_TOOL_RESULT,
+                    tool_call_id="x",
+                    tool_status="failed",
+                    tool_final=False,
+                ),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="done anyway"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        cards = [kw for m, kw in rec.calls if m == "append_task"]
+        # The call's card finalizes as "error" (Slack's non-✓ terminal status),
+        # naming the outcome — not a blanket "complete".
+        assert cards[0]["status"] == "in_progress"
+        assert cards[1]["status"] == "error"
+        assert cards[1]["details"] == "failed"
+
+    def test_succeeded_tool_result_keeps_complete(self):
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="x", title="grep", tool_final=False),
+                AcpEvent(
+                    kind=EVENT_TOOL_RESULT,
+                    tool_call_id="x",
+                    tool_status="completed",
+                    tool_final=True,
+                ),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        cards = [kw for m, kw in rec.calls if m == "append_task"]
+        assert [c["status"] for c in cards] == ["in_progress", "complete"]
+
+    def test_refused_and_cancelled_are_not_relabelled_failed(self):
+        # A declined or cancelled call is not a failure; its card names the
+        # exact outcome rather than lumping it under "failed".
+        for status in ("refused", "cancelled", "canceled"):
+            rec = _RecSlack()
+            self._run(
+                rec,
+                [
+                    AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="x", title="rm", tool_final=False),
+                    AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="x", tool_status=status),
+                    AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+                    AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+                ],
+            )
+            closed = [kw for m, kw in rec.calls if m == "append_task"][1]
+            assert closed["status"] == "error"
+            assert closed["details"] == status, status
+
+    def test_no_result_event_keeps_complete(self):
+        # A call whose transport sent no tool_result keeps the ✓ card — the
+        # pre-change behaviour is preserved where no outcome was reported.
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="x", title="grep", tool_final=False),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="ok"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        cards = [kw for m, kw in rec.calls if m == "append_task"]
+        assert [c["status"] for c in cards] == ["in_progress", "complete"]
+
+    def test_mixed_outcomes_finalize_each_card_distinctly(self):
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="a", title="ls", tool_final=False),
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="a", tool_status="completed"),
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="b", title="read", tool_final=False),
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="b", tool_status="refused"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="partial"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        cards = [kw for m, kw in rec.calls if m == "append_task"]
+        # a opens; a closes complete when b opens; b closes error at done.
+        assert cards[0]["status"] == "in_progress"  # a opens
+        assert cards[1]["status"] == "complete"  # a succeeded
+        assert cards[2]["status"] == "in_progress"  # b opens
+        assert cards[3]["status"] == "error"  # b refused
+        assert cards[3]["details"] == "refused"
+
+    def test_out_of_order_result_updates_an_already_closed_card(self):
+        # Parallel tool use: A opens, B opens (closing A's card as the uniform
+        # model does), THEN A's failure lands — A's card is re-emitted as error
+        # rather than left on the ✓ it was closed with.
+        rec = _RecSlack()
+        self._run(
+            rec,
+            [
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="a", title="ls", tool_final=False),
+                AcpEvent(kind=EVENT_TOOL_CALL, tool_call_id="b", title="read", tool_final=False),
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="a", tool_status="failed"),
+                AcpEvent(kind=EVENT_TOOL_RESULT, tool_call_id="b", tool_status="completed"),
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="done"),
+                AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
+            ],
+        )
+        cards = [kw for m, kw in rec.calls if m == "append_task"]
+        # a opens; a closed complete when b opened; a's late failure re-emits a
+        # as error; b closed complete at done.
+        assert cards[0]["status"] == "in_progress"  # a opens
+        assert cards[1]["status"] == "complete"  # a closed when b opened
+        assert cards[2]["status"] == "in_progress"  # b opens
+        # a's late failure re-emits its card as error (same tool_1 task_id).
+        error_cards = [c for c in cards if c["status"] == "error"]
+        assert error_cards and error_cards[0]["details"] == "failed"
+        # b still closes complete.
+        assert cards[-1]["status"] == "complete"

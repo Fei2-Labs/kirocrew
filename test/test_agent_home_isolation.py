@@ -8,6 +8,11 @@ binary into every managed server's ``command`` and its own data home into their
 worktree's credential while still calling the live gateway, so every managed MCP
 call returned HTTP 403 — and once the worktree was removed those specs pointed at
 paths that were gone.
+
+The non-default data home arm is in ``test_agent_home_isolation_override_home.py``,
+derived specs and the writes beside them in
+``test_agent_home_isolation_derived_specs.py``, and the fixtures and helpers the
+three modules share in ``agent_home_isolation_helpers.py``.
 """
 
 from __future__ import annotations
@@ -19,23 +24,16 @@ import sys
 from pathlib import Path
 
 import pytest
+from agent_home_isolation_helpers import _durable_checkout  # noqa: F401
+from agent_home_isolation_helpers import _isolate_default_home_fixture  # noqa: F401
+from agent_home_isolation_helpers import _pin_default_home_and_breadcrumb  # noqa: F401
+from agent_home_isolation_helpers import _capture_sel, _pretend_target_is_shared
 
 from conftest import make_dir_link
 from kiro_crew.config.paths import kiro_agents_dir, kiro_home
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "kiro_crew"
-
-
-@pytest.fixture(autouse=True)
-def _isolate_default_home(monkeypatch, tmp_path):
-    """Unpinning KIROCREW_HOME must remain safe even when SEL initializes cold."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    return home
 
 
 # --------------------------------------------------------------------------
@@ -179,24 +177,6 @@ def _make_linked_worktree(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return wt
-
-
-def _pretend_target_is_shared(monkeypatch, agent_mod, agents_dir: Path) -> None:
-    """Present *agents_dir* as BOTH the write target and what the AMBIENT
-    environment resolves — which is what makes a target "shared".
-
-    A target the ambient environment would never produce is by definition private
-    to whoever redirected it, so a test must line the two up to exercise the
-    guard.
-
-    The ambient side is ``config.paths.ambient_agents_dir``, patched at its
-    DEFINITION: it is the override-blind resolver the guard reads, and ``agent``
-    binds it by name so a module-attribute patch on ``agent`` would be a second
-    copy that the guard's own call still ignores. ``KIRO_AGENTS_DIR`` stays the
-    target side because ``kiro_agents_dir_path()`` prefers it.
-    """
-    monkeypatch.setattr(agent_mod, "KIRO_AGENTS_DIR", agents_dir)
-    monkeypatch.setattr(agent_mod, "ambient_agents_dir", lambda: agents_dir)
 
 
 def test_private_target_is_never_declined(monkeypatch, tmp_path):
@@ -573,6 +553,30 @@ def test_rebuild_agent_config_writes_nothing_when_declined(monkeypatch, tmp_path
     assert returned == agents_dir / agent.AGENT_FILENAME
     assert not agents_dir.exists(), "declined rebuild must not create the agent home"
 
+    # The reporting variant's verdict comes from the same real guard: a
+    # declined home must read wrote=False, or a caller's memo records a
+    # projection that never landed. The guard is evaluated EXACTLY ONCE per
+    # rebuild — a second evaluation (a pre-probe, a re-check before the
+    # write) reopens the probe/rebuild window a concurrent default-home boot
+    # can slip through, which is the race this contract exists to close.
+    real_guard = agent._decline_shared_agent_home
+    guard_calls: list[int] = []
+
+    def counting_guard(**kwargs):
+        guard_calls.append(1)
+        return real_guard(**kwargs)
+
+    monkeypatch.setattr(agent, "_decline_shared_agent_home", counting_guard)
+    probe: list[bool] = []
+    reported = agent.rebuild_agent_config(_wrote_out=probe)
+    assert reported == agents_dir / agent.AGENT_FILENAME
+    assert probe == [False], "a refused rebuild must report exactly one False verdict"
+    assert len(guard_calls) == 1, "the guard must be evaluated exactly once per rebuild"
+    reported2, wrote = agent.rebuild_agent_config_reporting()
+    assert reported2 == agents_dir / agent.AGENT_FILENAME
+    assert wrote is False, "a refused rebuild must report wrote=False"
+    assert len(guard_calls) == 2, "reporting adds exactly one more guard evaluation"
+
 
 def test_refusal_is_sel_audited(monkeypatch, tmp_path):
     """The refusal is a permission decision, so it must reach the audit trail.
@@ -598,17 +602,6 @@ def test_refusal_is_sel_audited(monkeypatch, tmp_path):
     assert denied[0]["operation"] == "agent_home_write"
     assert denied[0]["source"] == "rebuild_agent_config"
     assert str(tmp_path / "agents") in denied[0]["resources"]
-
-
-def _capture_sel(monkeypatch, agent_mod) -> list[dict]:
-    events: list[dict] = []
-
-    class _Sel:
-        def log_api_access(self, **kw):
-            events.append(kw)
-
-    monkeypatch.setattr(agent_mod, "sel", lambda: _Sel())
-    return events
 
 
 def test_allowed_shared_home_write_is_audited(monkeypatch, tmp_path):
@@ -660,6 +653,137 @@ def test_private_target_emits_no_audit_event(monkeypatch, tmp_path):
 
     assert agent._decline_shared_agent_home() is None
     assert events == []
+
+
+def test_derived_spec_write_outside_a_rebuild_records_the_allowed_event(monkeypatch, tmp_path):
+    """A per-dispatch derived-spec write admitted OUTSIDE an admitted rebuild
+    records an ``agent_home_write`` / ``allowed`` SEL event.
+
+    The motivating gap: an app deregistration leaves the worker mirror stale, and
+    the next spawn re-derives it through ``_declined_foreign_spec_write`` -- which
+    is reached per dispatch, not inside the boot-time rebuild that audits its own
+    grant. Without this, that admitted write left no SEL trail, so "no event" was
+    ambiguous between "permitted" and "never attempted" for exactly the writers
+    that run most often.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    # A NON-DEFAULT data home: the attribution the event buys only matters when
+    # instances coexist, so the audit is scoped to a non-default home.
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "relocated-home"))
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    # A durable owner (not a worktree) is admitted to write the shared agents
+    # dir; the path need not exist (predicates are lexical on the resolved path).
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    agents_dir = tmp_path / "agents"
+    _pretend_target_is_shared(monkeypatch, agent, agents_dir)
+    # Not inside an admitted rebuild, so the grant is this writer's to record.
+    agent._rebuild_spec_install_admitted.set(False)
+
+    declined = agent._declined_foreign_spec_write(agents_dir / "kirocrew-worker.json")
+
+    assert declined is False  # the write is admitted
+    allowed = [e for e in events if e.get("outcome") == "allowed"]
+    assert len(allowed) == 1, f"expected exactly one allowed event, got {events}"
+    assert allowed[0]["operation"] == "agent_home_write"
+    assert allowed[0]["source"] == "derived-spec"
+    assert str(agents_dir) in allowed[0]["resources"]
+
+
+def test_default_home_derived_spec_write_records_the_allowed_event(monkeypatch, tmp_path):
+    """A default-home admitted write outside a rebuild still records the grant.
+
+    The write is admitted with ``audit=False`` passed to the shared decision, so
+    nothing else records it. Suppressing the event on the default home would leave
+    that permission decision unaudited, so every admitted shared-home write made
+    outside a rebuild records its grant regardless of which home made it. Only a
+    private redirected target stays silent.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)  # default home
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    agents_dir = tmp_path / "agents"
+    _pretend_target_is_shared(monkeypatch, agent, agents_dir)
+    agent._rebuild_spec_install_admitted.set(False)
+
+    declined = agent._declined_foreign_spec_write(agents_dir / "kirocrew-worker.json")
+
+    assert declined is False  # admitted
+    allowed = [e for e in events if e.get("outcome") == "allowed"]
+    assert len(allowed) == 1, f"expected the default-home grant to be audited, got {events}"
+    assert allowed[0]["operation"] == "agent_home_write"
+    assert allowed[0]["source"] == "derived-spec"
+
+
+def test_derived_spec_write_to_a_private_dir_emits_no_event(monkeypatch, tmp_path):
+    """The private-directory exemption through the primitive stays silent.
+
+    When the agents dir is redirected somewhere the ambient environment would
+    never produce, the write is admitted but it is not a decision ABOUT the shared
+    resource, so -- like ``_decline_shared_agent_home``'s own private-target
+    returns -- it records nothing.
+    """
+    from kiro_crew import agent
+
+    events = _capture_sel(monkeypatch, agent)
+    monkeypatch.delenv("KIRO_HOME", raising=False)
+    # Non-default home, so the default-home short-circuit does not hide the
+    # private-redirect branch this test is about.
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "relocated-home"))
+    monkeypatch.delenv("KIROCREW_POD", raising=False)
+    durable = Path("/durable-install/KiroCrew/src/kiro_crew/agent.py")
+    monkeypatch.setattr(agent, "__file__", str(durable))
+    # Target is a private redirect: the configured agents dir is NOT what the
+    # ambient environment resolves, so the write is admitted but silent.
+    private_dir = tmp_path / "private" / "agents"
+    monkeypatch.setattr(agent, "KIRO_AGENTS_DIR", private_dir)
+    monkeypatch.setattr(agent, "ambient_agents_dir", lambda: tmp_path / "elsewhere" / "agents")
+    agent._rebuild_spec_install_admitted.set(False)
+
+    declined = agent._declined_foreign_spec_write(private_dir / "kirocrew-worker.json")
+
+    assert declined is False  # admitted (private target)
+    assert events == []
+
+
+def test_unresolvable_parent_fails_closed(monkeypatch, tmp_path):
+    """An OSError resolving the write's parent is REFUSED, not admitted.
+
+    ``_declined_foreign_spec_write`` compares ``path.parent.resolve()`` to the
+    shared agents dir to decide whether the write even touches the guarded
+    directory. When that ``resolve()`` raises ``OSError`` (a broken symlink loop,
+    a vanished mount, a permission wall) the write cannot be PROVEN to land
+    outside the shared dir, so the guard fails closed and refuses it rather than
+    waving it through on the unproven assumption it is private.
+    """
+    from kiro_crew import agent
+
+    agents_dir = tmp_path / "agents"
+    target = agents_dir / "kirocrew-worker.json"
+
+    real_resolve = Path.resolve
+
+    def resolve_raising(self, *args, **kwargs):
+        # Only the write's parent is unresolvable; everything else resolves
+        # normally so the failure under test is the parent-resolve, not a
+        # blanket break of resolve().
+        if self == target.parent:
+            raise OSError("parent is unresolvable")
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_raising)
+
+    assert (
+        agent._declined_foreign_spec_write(target) is True
+    ), "an unresolvable parent must fail closed (refuse the write), not be admitted"
 
 
 # --------------------------------------------------------------------------
@@ -768,7 +892,7 @@ def test_no_hardcoded_transcripts_dir():
 # slipped through the first version of this guard and was caught in review.
 _LITERAL_RE = re.compile(r'"\.kiro"\s*/\s*"agents"' r"|[\"']\.kiro/agents")
 # ``config/paths.py`` is the resolver that defines the default.
-# ``security/paths.py`` holds the sensitive-path denylist, whose entries are
+# ``security/paths_lists.py`` holds the sensitive-path denylist, whose entries are
 # HOME-RELATIVE literals
 # (the matcher anchors ``$HOME``-relative strings; ``kiro_agents_dir()`` returns
 # an absolute path, so the resolver's value cannot be used here) and which is
@@ -784,7 +908,7 @@ _LITERAL_RE = re.compile(r'"\.kiro"\s*/\s*"agents"' r"|[\"']\.kiro/agents")
 # through ``kiro_agents_dir()`` even in principle.
 _ALLOWED = {
     "config/paths.py",
-    "security/paths.py",
+    "security/paths_lists.py",
     # A third case, and a different kind. The AWS Control crew container runs as its
     # own process inside a Linux image where ``kiro_crew`` is not importable, so
     # ``supervisor/bundle.py`` re-implements this resolver rather than calling it.

@@ -126,6 +126,9 @@ beforeEach(() => {
   // The picker's own directory listings. Spied on the shared client so they never
   // consume from the POST queue above.
   vi.spyOn(api, 'recentProjects').mockResolvedValue({ dirs: [ROOT, '/work/other'] })
+  // Favourites too, and for the same reason: unspied it would reach the stubbed `fetch`
+  // and take a response meant for a scan POST. Empty, so the picker still lands on Recent.
+  vi.spyOn(api, 'favoriteProjects').mockResolvedValue({ dirs: [] })
   vi.spyOn(api, 'browseDirs').mockResolvedValue({
     path: '/work', parent: '/', dirs: [{ name: 'monorepo', path: ROOT }],
   })
@@ -903,5 +906,29 @@ describe('ProjectScaffolderPage', () => {
     expect(screen.queryByTestId('root-existing')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Create the root folder only' })).toBeEnabled()
     expect(screen.getByTestId('scan-empty-subtitle')).toHaveTextContent('You can still create a folder')
+  })
+
+  it('labels the preview action root-only while nothing is ticked and the root is absent', async () => {
+    const user = userEvent.setup()
+    queued.push({ status: 200, body: SCAN })
+    renderPage()
+    await scan(user)
+
+    // Candidates are on screen and the root does not exist yet, so the click is
+    // allowed; with nothing ticked it creates the root folder and nothing else.
+    const section = await expandDeferred(user)
+    await user.click(within(screen.getByTestId('nested-suggestions')).getByRole('button', { name: 'Select none inside' }))
+    await user.click(within(screen.getByTestId('preview-group')).getByRole('button', { name: 'Select none' }))
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('0 selected')
+    expect(screen.queryByTestId('root-existing')).not.toBeInTheDocument()
+
+    expect(screen.getByRole('button', { name: 'Create the root folder only' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Create sidebar folders' })).not.toBeInTheDocument()
+
+    // One tick is enough to make the plural label honest again.
+    await user.click(within(section).getByLabelText(`${ROOT}/services/api`))
+    expect(screen.getByTestId('selected-count')).toHaveTextContent('1 selected')
+    expect(screen.getByRole('button', { name: 'Create sidebar folders' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Create the root folder only' })).not.toBeInTheDocument()
   })
 })

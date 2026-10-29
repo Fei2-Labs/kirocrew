@@ -19,8 +19,9 @@ import os
 import pytest
 
 from kiro_crew import history
-from kiro_crew._sqlite_compat import fts5_available
+from kiro_crew._sqlite_compat import fts5_available, sqlite3
 from kiro_crew.history import ConversationLog
+from kiro_crew.history_index import FOLD_SEPARATOR
 
 pytestmark = pytest.mark.skipif(not fts5_available(), reason="SQLite built without FTS5")
 
@@ -55,6 +56,17 @@ def _close_session_search_indexes(monkeypatch):
                     index.close()
                 except Exception:
                     pass
+
+
+@pytest.fixture(autouse=True)
+def _no_index_quiet_window(monkeypatch):
+    """Zero the backfill quiet window: these corpora are written moments before
+    the backfill they feed, so the production deferral would skip every session
+    and the assertions below would be measuring the deferral, not the indexing.
+    """
+    from kiro_crew import history_search
+
+    monkeypatch.setattr(history_search, "_INDEX_QUIET_WINDOW_SECS", 0.0)
 
 
 # Written as escapes because this repository forbids literal Chinese characters in
@@ -166,21 +178,135 @@ def test_vouched_non_matching_sessions_are_never_read(tmp_path, monkeypatch):
 
 
 def test_a_match_only_in_a_later_message_is_still_found(tmp_path):
-    """The indexed document joins messages with NUL, so later messages must be searchable.
+    """Every message must be searchable, not just the first one.
 
-    Verified against SQLite rather than assumed: the trigram tokenizer indexes past a
-    NUL and the stored string round-trips at full length. This pins it, because every
-    other test here would still pass if only the first message were indexed.
+    This is the test that caught ``FOLD_SEPARATOR`` being ``\\x00`` (on SQLite
+    3.40.0/3.45.1; 3.53.1 tokenizes past a NUL and passes either way). FTS5's
+    tokenizers walk the indexed text as a NUL-terminated C string, so the column
+    stored the whole transcript while only the bytes BEFORE the first separator
+    produced postings. The failure was not a missed rank either: a vouched-for
+    session with empty postings reads to ``_index_shortlist`` as proof the
+    session cannot match, so the scan that would have found the hit was skipped
+    and the session became unfindable by anything past its opening message.
+
+    Every other test in this file would still pass under that bug, because they
+    either match on the first message or search a session the index has not
+    vouched for yet and which therefore falls back to a full scan.
     """
     log = ConversationLog(base_dir=tmp_path)
     log.append("late", "user", "first message about deployment")
     log.append("late", "user", "second message about contention")
     log.append("late", "user", "third message about quarantine")
     log._catalog_projection.backfill_index(budget_secs=30)
+    # The hit must come from the INDEX, not from a scan fallback: a session the
+    # index does not vouch for is scanned in full and would pass regardless.
+    stats = {"late": log._path("late").stat()}
+    assert "late" in log._catalog_projection.search_index.fresh_keys(stats)
 
     for term in ("deployment", "contention", "quarantine"):
         rows = log.search_sessions(term)
         assert "late" in {r["key"] for r in rows}, f"{term} was not found"
+
+
+def test_fold_separator_does_not_terminate_fts_tokenization(tmp_path):
+    """``FOLD_SEPARATOR`` must survive tokenization, not just string storage.
+
+    Asserted against SQLite itself rather than through the search path, so the
+    reason a replacement separator is unacceptable is stated where someone
+    changing the constant will read it. ``\\x00`` passes the first assertion and
+    fails the second on SQLite 3.40.0 and 3.45.1 (trigram stops at a NUL), which
+    is exactly how it went unnoticed. SQLite 3.53.1 tokenizes past a NUL, so
+    there this test passes even with ``\\x00``; the build-independent guard is
+    ``test_no_nul_reaches_the_fts_column``.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE VIRTUAL TABLE t USING fts5(folded, tokenize='trigram')")
+    doc = FOLD_SEPARATOR.join(("first message deployment", "second message contention"))
+    conn.execute("INSERT INTO t(rowid, folded) VALUES (1, ?)", (doc,))
+
+    stored = conn.execute("SELECT folded FROM t WHERE rowid=1").fetchone()[0]
+    assert stored == doc, "the separator must round-trip the whole document"
+
+    for term in ("deployment", "contention"):
+        hits = conn.execute("SELECT COUNT(*) FROM t WHERE t MATCH ?", (f'"{term}"',)).fetchone()[0]
+        assert hits == 1, f"{term!r} is stored but not tokenized"
+
+    # The property the separator exists for: a query cannot bridge two messages.
+    bridged = conn.execute(
+        "SELECT COUNT(*) FROM t WHERE t MATCH ?", ('"deployment second"',)
+    ).fetchone()[0]
+    assert bridged == 0, "a match must not span the separator"
+
+
+def test_no_nul_reaches_the_fts_column(tmp_path):
+    """No NUL may reach the folded blob, whether from the join or from a message.
+
+    A NUL ends the text for the trigram tokenizer on some SQLite builds (3.40.0,
+    3.45.1) and not on others (3.53.1), so a search-only test proves nothing on a
+    host whose SQLite tokenizes past it. Asserting the stored column and the scan
+    fold carry no NUL holds on every build. A NUL inside one message's own
+    content must not hide the messages after it either. (The session key is not
+    ``nul``: that is a reserved device name on Windows.)
+    """
+    log = ConversationLog(base_dir=tmp_path)
+    log.append("embedded", "user", "first message about deployment")
+    log.append("embedded", "user", "pasted text\x00with a nul inside")
+    log.append("embedded", "user", "third message about quarantine")
+    projection = log._catalog_projection
+    projection.backfill_index(budget_secs=30)
+    stats = {"embedded": log._path("embedded").stat()}
+    assert "embedded" in projection.search_index.fresh_keys(stats)
+
+    conn = projection.search_index._ensure_open()
+    (stored,) = conn.execute(
+        "SELECT f.folded FROM session_fts f JOIN session_entry e ON e.fts_rowid = f.rowid"
+        " WHERE e.session_key = ?",
+        ("embedded",),
+    ).fetchone()
+    assert "\x00" not in stored
+    assert "quarantine" in stored
+    assert "\x00" not in projection._folded_content("embedded")[1]
+
+    for term in ("deployment", "quarantine"):
+        rows = log.search_sessions(term)
+        assert "embedded" in {r["key"] for r in rows}, f"{term} was not found"
+
+
+def test_a_lone_surrogate_does_not_stop_the_backfill(tmp_path):
+    """One unpaired ``\\udXXX`` escape in a transcript must not cost every older session its row.
+
+    The backfill walks sessions newest first, so a poisoned newest session that
+    raised out of ``sync`` ended every pass before any older one was indexed, and
+    every query kept scanning raw transcripts. The escape is written into the
+    file by hand because ``append`` never produces one; ``json.loads`` turns it
+    into a lone surrogate, which no strict UTF-8 encoder accepts.
+    """
+    scan_log = ConversationLog(base_dir=tmp_path / "scan")
+    index_log = ConversationLog(base_dir=tmp_path / "indexed")
+    for log in (scan_log, index_log):
+        log.append("older", "user", "a session about deployment")
+        log.append("poisoned", "user", "contention notes, emoji LONE-SURROGATE cut off")
+        path = log._path("poisoned")
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("LONE-SURROGATE", "\\ud83d"),
+            encoding="utf-8",
+        )
+        # Pin the order rather than rely on two writes landing in distinct mtimes.
+        older = log._path("older")
+        older_ns = path.stat().st_mtime_ns - 60_000_000_000
+        os.utime(older, ns=(older_ns, older_ns))
+        assert log.list_sessions()[0]["key"] == "poisoned"
+
+    projection = index_log._catalog_projection
+    report = projection.backfill_index(budget_secs=30)
+    assert report["remaining"] == 0
+    assert projection.search_index.indexed_keys() == {"older", "poisoned"}
+
+    scan_log._catalog_projection.search_index.available = False
+    for query in ("deployment", "contention", "emoji cut"):
+        indexed_rows = index_log.search_sessions(query)
+        assert indexed_rows, f"{query!r} found nothing"
+        assert _strip(indexed_rows) == _strip(scan_log.search_sessions(query))
 
 
 def test_an_append_between_the_stat_and_the_snapshot_is_not_vouched_for(tmp_path, monkeypatch):

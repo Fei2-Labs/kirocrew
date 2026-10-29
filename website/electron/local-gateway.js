@@ -54,9 +54,19 @@ function setLocalGatewayEnabled(store, enabled) {
  * because the installer is still writing the backend, so a plain retry resolves
  * it and "failed to start" would send the user hunting a defect that is not there.
  *
+ * "client-only" is the state where this launch started nothing on this machine,
+ * which the setting being off is one way to reach and not the only one: a launch
+ * whose target port is not one a new gateway may bind also starts nothing, and
+ * `localStartBlocked` says which reason applied. The dialog reads the same
+ * condition to decide whether to offer "Start Local Gateway", so a launch that
+ * started nothing has to answer this the same way however it got there -- or the
+ * message names a button the dialog withholds. Any value is enough: whatever
+ * sets that field has already decided nothing was launched, so a list of
+ * qualifying reasons here would only be a second place to forget one.
+ *
  * @param {object} o
  * @param {boolean} o.failedToStart      the wait rejected with kind === 'failed'
- * @param {{disabled?: boolean, incompleteBundle?: boolean}|null} [o.failure]
+ * @param {{disabled?: boolean, localStartBlocked?: string, incompleteBundle?: boolean}|null} [o.failure]
  *   the failure record it carried
  * @param {boolean} [o.isOwnPort]        this window points at our own gateway port
  * @param {boolean} [o.portInUseInLog]   the launch log tail reports a bound port
@@ -68,7 +78,9 @@ function classifyStartFailure({
   isOwnPort = false,
   portInUseInLog = false,
 } = {}) {
-  if (failedToStart && failure && failure.disabled) return "client-only";
+  if (failedToStart && failure && (failure.disabled || failure.localStartBlocked)) {
+    return "client-only";
+  }
   if (failedToStart && failure && failure.incompleteBundle) return "installing";
   if (failedToStart && isOwnPort && portInUseInLog) return "port-conflict";
   if (failedToStart) return "failed";

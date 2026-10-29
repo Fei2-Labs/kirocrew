@@ -3,12 +3,13 @@
 **Local page, not a mirror.** Part of the [crew log reference](README.md), which is
 marked as a named exception in [the Reference index](../README.md).
 
-> **No crew emitter exists.** The families and the two contracts on this page are
-> the specified shape a crew writer must produce. The `crew/dispatch` and
-> `crew/report` contracts are defined here and in
-> [`crew-log-core.md`](../../system-specs/modules/crew-log-core.md); a validator that
-> refuses a malformed one is pending. Treat every field rule below as the
-> agreement, not as something the code enforces today.
+> **Two of these types have a writer; the rest do not.** `crew/dispatch` and
+> `crew/report` are declared in `kiro_crew.crew_log.entry_types` as
+> `CREW_ENTRY_TYPES`, the append path checks every entry of those two types
+> against the declaration, and `crew_log.emit` writes them: the conductor work
+> board's `bind` records a dispatch into the dispatching crew's log, and a
+> worker's report records the answer. A field rule under any OTHER family is the
+> agreement, not something the code enforces or produces.
 
 A crew's log uses the same file layout, the same header rules and the same eight
 envelope fields as a session's log — [envelope.md](envelope.md) covers all of
@@ -111,39 +112,54 @@ or a crew, never both.
 ```
 
 **Reader hint** — Group a work item's history by `item`, then order it by `seq`. The
-dispatch is the anchor every report threads onto.
+dispatch is the anchor a report threads onto when the writer could resolve it; group by
+`item` rather than by `thread`, because a report whose anchor was missing is written
+unthreaded and would otherwise drop out of the item's history.
 
 ## `crew/report`
 
 A dispatched party reported back on one work item.
 
-**Kind and `src`** — `crew`; written by the reporting party, so `src` is
-`crew:<name>` for a crew and `gateway` for a session's own report.
+**Kind and `src`** — `crew`; the reporting party is a session and the gateway
+writes its report into the dispatching crew's log, so `src` is `gateway`. Reports
+are told apart by `ref.id`, the reporting session's unit, not by signer.
 
 **Pairing** — Closer in practice, though a `progress` status leaves the item open.
-`thread` is the dispatch's `seq`.
+`thread` is the dispatch's `seq` when the writer resolved the dispatch anchor;
+otherwise the report is written unthreaded.
 
 | Field | Type | Required | Meaning | Enum |
 |---|---|---|---|---|
 | `item` | string | required | The work item's id, matching the dispatch. | |
-| `status` | string | required | Where the item stands. | `done`, `blocked`, `failed`, `progress` |
+| `status` | string | required | Where the item stands. | `done`, `blocked`, `failed`, `progress`, `question` |
 | `credits` | number | optional | What the work cost. | |
 | `summary` | string | optional | What was done. | |
 
 **Envelope requirements** — Unlike every other type documented here, `crew/report`
 constrains the envelope as well as `data`:
 
-- **`ref` is required.** It cites the segment of the child's crew log holding the
-  work, so a report is never a claim without evidence. The span cap of 500 lines
-  (`MAX_REF_SPAN`) applies, so a long run is cited by its relevant span rather than
-  in full.
-- **`thread`** is the `seq` of the `crew/dispatch` being answered.
+- **`ref` is required.** It cites the reporting session's own crew log, so a report
+  is never a claim without evidence. The writer builds the span from that unit's
+  newest `seq`, clamped to the newest 500 lines (`MAX_REF_SPAN`). A session with no
+  readable log yields no citation, and no report is written.
+- **`thread`** is the `seq` of the `crew/dispatch` being answered, present only
+  when the writer resolved that dispatch. A report whose anchor is missing is
+  written unthreaded and reads like a volunteered one.
 
 **Invariants** — A report without a `ref` is invalid. `status: "progress"` may
 appear several times for one dispatch; a terminal status appears once.
 
+**Where the status vocabulary comes from** — The enum is the crew spec's own four
+(`done`, `blocked`, `failed`, `progress`) plus every status the conductor work board's worker half can commit,
+read off that writer's own tuple (`work_vocab.WORK_WORKER_STATUSES`) rather than
+restated. A closed enum narrower than its writer would turn a status the board
+gains into a refused entry counted as a write loss, which destroys a record
+instead of catching a mistake. `question` is therefore carried under its own name
+rather than folded into `blocked`: the two differ by WHICH party must act, and a
+conductor reading the fold acts on that difference.
+
 ```json
-{"type":"crew/report","seq":58,"time":1789000004000,"src":"crew:qa","thread":41,"ref":{"unit":"session","id":"s-7f3a","from":12,"to":40},"data":{"item":"WI-4","status":"done","credits":1.42,"summary":"six pages and a test"}}
+{"type":"crew/report","seq":58,"time":1789000004000,"src":"gateway","thread":41,"ref":{"unit":"session","id":"s-7f3a","from":12,"to":40},"data":{"item":"WI-4","status":"done","credits":1.42,"summary":"six pages and a test"}}
 ```
 
 **Reader hint** — Resolve the `ref` to read the work itself, and handle all four

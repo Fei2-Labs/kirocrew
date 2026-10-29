@@ -79,6 +79,48 @@ export function findForeignPrefixUses(
   return found
 }
 
+/** An app writing its own key prefix by hand, inside its own directory. */
+export interface OwnPrefixUse {
+  appId: string
+  path: string
+}
+
+/**
+ * Every array literal starting with the app's own id, inside its own directory.
+ *
+ * An app that reaches the host's namespace through `useAppQuery` /
+ * `useAppQueryKey()` never spells its own prefix: the host adds it. So a literal
+ * beginning with the appId in the app's own code is a key the app built itself,
+ * and it is the form that drifts -- the host's resolver can change what it
+ * prepends, and a hand-written key does not follow.
+ *
+ * Wider than `findForeignPrefixUses` on purpose. That one looks for
+ * `queryKey: ['<appId>'`, which reads only the property form; here the whole
+ * point is to catch the key wherever it is built, including a variable the app
+ * passes to `invalidateQueries` further down.
+ *
+ * Tests are excluded for the same reason as above, and because the byte-identity
+ * cases assert on the resolved key deliberately.
+ */
+export function findOwnPrefixUses(
+  owners: Map<string, string>,
+  files: readonly SourceFile[],
+  appIds: readonly string[],
+): OwnPrefixUse[] {
+  const found: OwnPrefixUse[] = []
+  for (const appId of appIds) {
+    const ownerDir = owners.get(appId)
+    if (!ownerDir) continue
+    const claim = new RegExp(`\\[\\s*'${appId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'`)
+    for (const file of files) {
+      if (file.path.includes('/test/') || /\.test\.tsx?$/.test(file.path)) continue
+      if (file.path !== ownerDir && !file.path.startsWith(`${ownerDir}/`)) continue
+      if (claim.test(file.text)) found.push({ appId, path: file.path })
+    }
+  }
+  return found
+}
+
 /** Every .ts/.tsx file under `src/`, as `src/`-relative paths. */
 function readSourceTree(dir = SRC, prefix = ''): SourceFile[] {
   const out: SourceFile[] = []
@@ -146,5 +188,85 @@ describe('app key-prefix ownership', () => {
       { path: 'apps/aws-control/DrivePage.test.tsx', text: "queryKey: ['issue-radar', 'x']" },
     ]
     expect(findForeignPrefixUses(owners, inTest)).toEqual([])
+  })
+})
+
+/**
+ * An app on the host seam does not spell its own prefix.
+ *
+ * `findForeignPrefixUses` above settles who may claim a prefix. This settles how
+ * an app writes its OWN: through `useAppQuery` / `useAppQueryKey()`, so the
+ * prefix has exactly one author. A hand-written key resolves to the same bytes
+ * only for as long as nobody changes the resolver, and the failure is silent --
+ * a fork in the cache where a mutation stops invalidating the list it changed.
+ *
+ * SEATED_ON_THE_SEAM names the apps that hold that property today, and it is not
+ * an allowlist: an allowlist records permission to violate and rots because
+ * nobody prunes it, while a name here is a claim that the app is clean, and
+ * ADDING one can only ever make this test stricter. An app absent from the list
+ * is unconverted work, not an exemption -- twelve of them hand-write their own
+ * prefix, which is what this property is for.
+ */
+const SEATED_ON_THE_SEAM = ['aws-control'] as const
+
+describe('apps on the host query seam', () => {
+  const registry = readFileSync(join(SRC, 'apps', 'builtinRegistry.ts'), 'utf8')
+  const owners = parseRegistryOwners(registry)
+
+  it('resolves an owning directory for every named app', () => {
+    // Without this, a typo in the list above makes the scan below vacuous: the
+    // detector skips an appId it cannot place, and skipping everything passes.
+    for (const appId of SEATED_ON_THE_SEAM) {
+      expect(owners.get(appId), `${appId} is not a registered app`).toBeTruthy()
+    }
+  })
+
+  it('finds no hand-written own-prefix key in a seated app', () => {
+    const violations = findOwnPrefixUses(owners, readSourceTree(), SEATED_ON_THE_SEAM)
+    expect(
+      violations,
+      `An app on the host seam spells its own key prefix by hand, so the host and `
+        + `the app are now two authors of one key:\n`
+        + violations.map((v) => `  ['${v.appId}', ...] in ${v.path}`).join('\n'),
+    ).toEqual([])
+  })
+
+  it('detects a planted own-prefix key, so a green scan means something', () => {
+    // MUTATION-equivalent without editing a real app file. Deleting the
+    // `claim.test(...)` check reds this and leaves the case above green.
+    const planted: SourceFile[] = [
+      { path: 'apps/aws-control/DrivePage.tsx', text: "qc.invalidateQueries({ queryKey: ['aws-control', 'drive', a] })" },
+    ]
+    expect(findOwnPrefixUses(owners, planted, SEATED_ON_THE_SEAM)).toEqual([
+      { appId: 'aws-control', path: 'apps/aws-control/DrivePage.tsx' },
+    ])
+  })
+
+  it('catches a key built away from its use, which the property form misses', () => {
+    // The reason this detector is wider than `findForeignPrefixUses`: a key held
+    // in a variable never appears as `queryKey: [...`, and it drifts the same way.
+    const indirect: SourceFile[] = [
+      { path: 'apps/aws-control/DrivePage.tsx', text: "const k = ['aws-control', 'drive']\nqc.invalidateQueries({ queryKey: k })" },
+    ]
+    expect(findOwnPrefixUses(owners, indirect, SEATED_ON_THE_SEAM)).toHaveLength(1)
+    // And the narrower detector does not, which is why both exist.
+    expect(findForeignPrefixUses(owners, indirect)).toEqual([])
+  })
+
+  it('leaves an app that is not on the seam alone', () => {
+    // The list is the scope. An unconverted app writing its own prefix is work
+    // still to do, not a failure of this file, and a scan that flagged it would
+    // be red for reasons no one can fix in one change.
+    const elsewhere: SourceFile[] = [
+      { path: 'apps/issue-radar/IssueRadarPage.tsx', text: "queryKey: ['issue-radar', 'repos']" },
+    ]
+    expect(findOwnPrefixUses(owners, elsewhere, SEATED_ON_THE_SEAM)).toEqual([])
+  })
+
+  it('ignores an app test asserting on its own resolved key', () => {
+    const inTest: SourceFile[] = [
+      { path: 'apps/aws-control/ConsoleView.test.tsx', text: "expect(built).toEqual(['aws-control', 'drive', id])" },
+    ]
+    expect(findOwnPrefixUses(owners, inTest, SEATED_ON_THE_SEAM)).toEqual([])
   })
 })

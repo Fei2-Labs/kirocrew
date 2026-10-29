@@ -1,4 +1,10 @@
 name: PR Readiness
+run-name: >-
+  ${{
+    github.event_name == 'workflow_dispatch'
+    && format('PR-wd-{0}-{1}', inputs.pr, inputs.sha)
+    || ''
+  }}
 
 # One current-SHA verdict for the otherwise wide PR workflow fan-out. The
 # commit status is the branch-protection handle; the label is the at-a-glance
@@ -19,14 +25,18 @@ on:
   workflow_run:
     workflows:
       - CI
-      # The eleven cheap blocking gates, split out of CI so the fork reviewers can
+      # The cheap blocking gates in fast-gate.yml, split out of CI so the fork reviewers can
       # key on them. It is a lane in its own right -- a red gate must red the PR --
       # and its completion is also what releases CI's heavy jobs.
       - Fast Gate
       - Build
       - Code Review
-      - Opus 5 Review
-      - GPT 5.6 Review
+      # Blocking: a PR that declares no triaged issue reds it. Runs on
+      # `pull_request` for every PR, forks included, so its payload carries
+      # the PR head like Code Review's does.
+      - Issue Gate
+      - Opus 5.5 Review
+      - GPT 6.1 Review
       - Design Review
       - UX Review
       - First Principles Review
@@ -34,49 +44,102 @@ on:
       # it, and so does a run that measured nothing.
       - Security Scope Review
       - CodeQL
-      # Stage-2 fork AI reviewers. They run from the default branch via
-      # `workflow_run` (on CI's completion), so their own completion must
-      # re-trigger this job to publish the fork PR's real verdict once the
-      # reviews land -- otherwise the fork verdict freezes at `checking`.
-      - Fork Opus 5 Review
-      - Fork GPT 5.6 Review
-      - Fork Design Review
-      - Fork UX Review
-      - Fork First Principles Review
-      - Fork Security Scope Review
-      # Without these two, a finished scan never re-triggers readiness and the
-      # lane sits at "(not started)" with no event able to clear it.
+      # A workflow that is itself `workflow_run`-triggered CANNOT be listed here.
+      # GitHub runs such a workflow from the default branch, so the
+      # `workflow_run` payload its completion hands this job carries the default
+      # branch as head_branch and the default branch's tip as head_sha -- never
+      # the pull request's head. `Resolve current pull request revision` then
+      # asks which open pull request has `<this repo>:<default branch>` as its
+      # head, an answer that is empty by construction, and exits SKIP without
+      # publishing anything. The stage-2 fork reviewers (`Fork * Review`,
+      # `Fork Internal Content Scan`) all key on Fast Gate this way, so each of
+      # their completions dispatches a readiness run that can only no-op: 96% of
+      # this workflow's run creation and one wasted REST request each against the
+      # shared hourly pool (see docs/ci/ci-and-reviews.md).
+      #
+      # A fork pull request's verdict is refreshed the same way every other
+      # verdict is: `pr-readiness-sweep.yml` re-fires the recompute by PR
+      # number when a check on its head completes, and is therefore immune to
+      # this payload problem.
+      # `test_ai_review_workflows.py` pins the rule so a future lane cannot be
+      # added back here without the same silent no-op.
+      #
+      # It runs on `pull_request`, so its payload does carry the PR head and
+      # its start can hold the verdict like any other lane's.
       - Internal Content Scan Gate
-      - Fork Internal Content Scan
-    # `completed` publishes the real verdict. `in_progress` is kept as a merge
-    # guard, and `requested` is deliberately absent.
+      # Not a lane: readiness does not aggregate its verdict, and the job gate
+      # skips its `pull_request` runs before a runner starts, so those cost a
+      # dispatch and nothing else. It is listed for its
+      # `pull_request_review` runs, which a submitted, edited or dismissed
+      # review starts and nothing else does. That run's payload carries the PR
+      # head, and either way the hold step finds it, the review is read: while
+      # the run is still going the hold writes `pending` and its completion is
+      # the check evidence on which the sweep recomputes, and once it has
+      # completed the hold writes nothing and this same run goes on to the
+      # full evaluation, which reads the reviews.
+      - Sensitive Change Review
+    # ONLY `in_progress`. `completed` is deliberately absent, and so is
+    # `requested`.
     #
-    # Why `requested` carries nothing: it fires when a run is CREATED, which on
-    # a head update happens for all 14 workflows above before any of them can
-    # have a verdict -- and readiness has already published `checking` for that
-    # revision via the `pull_request_target: synchronize` path. Its only other
-    # occasion is a brand-new run, whose eventual `completed` is the fire that
-    # actually decides anything. Listing it cost a third of this workflow's
-    # dispatch to re-publish a `pending` that was already pending.
+    # A `workflow_run` dispatch is spent the moment GitHub delivers the event,
+    # before this job runs a step: a run that then finds nothing to do has
+    # already cost a runner start and its queue slot. Every type listed here
+    # fires once per monitored workflow per revision, so with `completed`
+    # listed this workflow created 24 runs per head update (12 x 2) plus one
+    # per re-run attempt -- measured at 30 per head and 3000 an hour, the
+    # majority of this repository's run creation, on a job whose real work
+    # takes 9-16 seconds. The per-revision concurrency group below collapses
+    # that burst for EXECUTION, but a collapsed run has already consumed its
+    # dispatch, so the group never bounded this cost. Neither can anything a
+    # step does: the only lever on dispatch is which events are subscribed.
     #
-    # Why `in_progress` is load-bearing and NOT a cosmetic: it is the only type
-    # that observes a monitored workflow going BACK to running. A re-run reuses
-    # the same workflow run and increments its attempt rather than creating a
-    # new one, so `requested` does not fire for it -- `in_progress` does. That
-    # matters for a re-run of an already-GREEN lane: without it, readiness holds
-    # the pre-re-run `success` for the whole re-run, and since this status is
-    # the branch-protection handle for the entire fan-out, armed auto-merge can
-    # merge a revision whose lane is at that moment failing. Dropping it would
-    # trade a merge-safety guard for dispatch, which is the wrong direction.
+    # So the terminal verdict is delivered by `pr-readiness-sweep.yml` instead.
+    # It scans every open pull request over GraphQL -- a SEPARATE pool from the
+    # REST budget the lanes share -- and dispatches this workflow, by PR number
+    # and head SHA, for exactly the heads on which a monitored check completed
+    # after the current verdict was published. One scan replaces the
+    # per-completion fan-out: 37 heads carried monitored completions in a
+    # measured 15-minute window, against 282 completion events. The cost is
+    # latency, bounded by the sweep's cadence plus its publish lag, and only
+    # in the SAFE direction: a verdict goes green later than the event would
+    # have made it, never earlier.
     #
-    # The dispatch problem this addresses: every type fires once per monitored
-    # workflow per revision, so all three dispatched up to 42 readiness runs per
-    # head update and made this workflow the majority of the repository's run
-    # creation. Two types put the ceiling at 28. The per-revision concurrency
-    # group below collapses the burst for EXECUTION, but a collapsed run has
-    # already consumed its dispatch slot, so the group never bounded this cost.
+    # Why `in_progress` stays, and why it is the one type that cannot move to
+    # the sweep: it is the only signal that a monitored workflow went BACK to
+    # running. A re-run reuses the same workflow run and increments its
+    # attempt, so `requested` never fires for it and the runs page still shows
+    # the pre-re-run conclusion until the attempt finishes. Without it,
+    # readiness holds the pre-re-run `success` for the whole re-run -- and
+    # since this status is the branch-protection handle for the entire
+    # fan-out, armed auto-merge can merge a revision whose lane is at that
+    # moment failing. A sweep cannot close that: its evidence is COMPLETED
+    # checks, and a running lane has none yet. The event does, in seconds.
+    #
+    # What an `in_progress` run does is therefore deliberately minimal: it
+    # resolves the pull request, confirms the run the event names is still
+    # running (a hold that arrives after the lane completed would stamp the
+    # status newer than that completion and hide it from the sweep), and if
+    # so publishes `pending` and stops (see "Hold the verdict" below). No
+    # evaluation, and no read of the status it is about to replace -- a
+    # read-then-decide on the STATUS would reintroduce the stale-success
+    # window the publish step's own comments document -- so the whole run is
+    # three requests. The lane's completion then reaches the sweep as
+    # evidence, and the recompute it dispatches publishes the real verdict.
+    #
+    # Why `requested` carries nothing: it fires when a run is CREATED, which
+    # on a head update happens for all 12 workflows above before any of them
+    # can have a verdict -- and readiness has already published `checking` for
+    # that revision via the `pull_request_target: synchronize` path.
+    #
+    # The per-head count above only holds for a monitored workflow whose
+    # payload names the pull request's own head. A `workflow_run`-triggered
+    # lane names the default branch instead, so its dispatches key on ONE
+    # shared group (the default branch's tip) and accumulate across every open
+    # pull request rather than per head update -- measured at 158 readiness
+    # runs on a single default-branch SHA, none of which can resolve a pull
+    # request. Such a lane is barred from the allowlist above for that reason.
     # Measurements and the queue-saturation mechanism: docs/ci/ci-and-reviews.md.
-    types: [in_progress, completed]
+    types: [in_progress]
   workflow_dispatch:
     inputs:
       pr:
@@ -102,8 +165,8 @@ concurrency:
   # the workflow_run burst OR with each other -- a superseded PT run is marked
   # "cancelled" by GitHub, and that cancelled check then shows on the PR even
   # though the authoritative "PR Readiness" commit status is fine (this is the
-  # "canceled at the end of CI" symptom: a workflow_run:completed fires as CI
-  # finishes and collapses an in-flight PT run). GitHub always marks a
+  # "canceled at the end of CI" symptom: a workflow_run fires as a lane starts
+  # and collapses an in-flight PT run). GitHub always marks a
   # superseded run cancelled -- cancel-in-progress:true kills the in-flight one,
   # and false still cancels the pending one -- so the only way a PT run never
   # shows cancelled is to keep it out of any group that can cancel it. Each PT
@@ -118,6 +181,11 @@ concurrency:
   # fork -- keying on it degraded every fork burst to one group per run. That
   # triple identifies the same PR, since only one open PR can exist per source
   # repository + branch.
+  #
+  # An `in_progress` run still cancels a running evaluation, and that is the
+  # merge guard's other half: the cancelled run's reads predate the re-run, so
+  # it must not publish. The hold this run writes instead stands until the
+  # sweep's recompute, which reads the re-run's completion.
   group: >-
     ${{
       github.event_name == 'pull_request_target'
@@ -146,28 +214,67 @@ jobs:
     # open PR owns it), so admitting every pull_request run is correct and the
     # non-PR events are already excluded by the event check.
     #
-    # `workflow_run.event == 'workflow_run'` is admitted so the Stage-2 fork AI
-    # reviewers (fork-*-review.yml, themselves triggered by CI's workflow_run)
-    # re-trigger this job when they complete -- that is how a fork PR's verdict
-    # refreshes to "passed" once its reviews land. Which workflows can fire this
-    # is already fenced by the `on.workflow_run.workflows` allowlist above.
+    # A `workflow_run.event == 'workflow_run'` upstream is NOT admitted. Such a
+    # run was dispatched from the default branch, so its payload names the
+    # default branch's tip as the head and can never resolve to a pull request
+    # (see the allowlist note above). Admitting it only reached the resolve
+    # step's empty lookup. The allowlist is the primary fence -- no monitored
+    # workflow is `workflow_run`-triggered any more -- and this is the second:
+    # re-adding such a lane has to clear both, which
+    # `test/test_ai_review_workflows.py` refuses.
+    #
+    # Sensitive Change Review is admitted for its `pull_request_review` runs
+    # only. Its `pull_request` runs start on the same opened, synchronize,
+    # reopened and edited events the `pull_request_target` trigger already
+    # re-derives the verdict on, and it is not an aggregated lane, so a run
+    # from one of them would re-check nothing and still spend requests from
+    # the shared pool. A review run is the opposite case: no other event this
+    # workflow hears follows a review. Both clauses name the lane by its
+    # `name:`, the same field the trigger allowlist matches on.
     if: >-
       github.event_name != 'workflow_run'
-      || github.event.workflow_run.event == 'pull_request'
+      || (github.event.workflow_run.event == 'pull_request'
+          && github.event.workflow_run.name != 'Sensitive Change Review')
       || github.event.workflow_run.event == 'dynamic'
-      || github.event.workflow_run.event == 'workflow_run'
-    runs-on: ubuntu-latest
+      || (github.event.workflow_run.event == 'pull_request_review'
+          && github.event.workflow_run.name == 'Sensitive Change Review')
+    # This is the busiest workflow here: thousands of ~12-second runs a day, in
+    # bursts. A same-repository PR's `pull_request_target` run from a listed
+    # actor uses the CodeBuild fleet so it stays out of the shared hosted
+    # queue. The job never checks out or runs PR code (see `on:`), so every PR
+    # activity may use it, as for Sensitive Change Review. A fork stays hosted.
+    # `workflow_run` stays hosted: it carries the `in_progress` merge-guard
+    # hold, and a hold stuck on a fleet runner would leave a green verdict up
+    # over a re-running lane. `workflow_dispatch` stays hosted: its payload
+    # names no head to check. Unset CODEBUILD_ACTOR_IDS to send every new run
+    # back to hosted.
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
     timeout-minutes: 20
+    env:
+      # The same-repo workflow-run lanes of the verdict step's spec list, read
+      # by the publish step's pre-success re-check.
+      MONITORED_LANES: >-
+        ci.yml fast-gate.yml build.yml code-review.yml issue-gate.yml
+        internal-content-scan-gate.yml claude-review.yml codex-review.yml
+        design-review.yml ux-review.yml first-principles-review.yml
+        security-scope-review.yml
+      # Old check-run name -> current name for the fork lanes #16238 renamed,
+      # read by the publish step's fork re-check (the one read that binds a row
+      # by name). Why and how: docs/ci/ci-and-reviews.md. Remove once no open
+      # PR has a pre-#16238 head (#16373).
+      LEGACY_LANE_NAMES: >-
+        {"Opus 5 Review": "Opus 5.5 Review", "GPT 5.6 Review": "GPT 6.1 Review"}
     steps:
       # Transient network/TLS errors between the runner and api.github.com can
-      # abort a single-shot `gh` call, and under `set -e` that ended the whole
-      # evaluation before the publish step could run -- leaving a permanently
-      # red check unrelated to actual readiness (issue #2753: the same commit
-      # evaluated green then red 39 seconds apart with nothing pushed). Every
-      # READ-ONLY gh call below now goes through this bounded helper: 3
+      # abort a single-shot `gh` call, and under `set -e` that would end the
+      # whole evaluation before the publish step could run, leaving a red
+      # check unrelated to actual readiness. Every read-only gh call whose
+      # failure would end the evaluation goes through this bounded helper: 3
       # attempts with short backoff, mirroring the bounded-attempts convention
-      # in publish-installer.yml. Stdout is buffered per attempt so a failed
-      # attempt's partial output (e.g. an aborted --paginate stream) never
+      # in publish-installer.yml. Two reads deliberately do not: the existing
+      # PR Readiness status read uses `bounded` alone and falls back to
+      # `__unreadable__`, and the rate-limit log line is best-effort. Stdout
+      # is buffered per attempt so a failed attempt's partial output (e.g. an aborted --paginate stream) never
       # leaks into a pipe. WRITE calls are deliberately NOT retried here; the
       # label writes have their own narrow race tolerance (see drop_label /
       # ensure_label), and a lost-response retry of a DELETE outside that
@@ -265,6 +372,7 @@ jobs:
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
           RUN_HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
           RUN_HEAD_REF: ${{ github.event.workflow_run.head_branch }}
+          EVENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           source "$RUNNER_TEMP/gh-retry.sh"
@@ -345,6 +453,22 @@ jobs:
 
           pr_json="$(gh_retry gh pr view "$PR" --repo "$REPO" \
             --json number,state,isDraft,isCrossRepository,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner,url)"
+
+          # The PR's OWN author, for the conditions that exempt a bot's pull
+          # request. `github.actor` cannot serve them here: the terminal verdict
+          # is delivered by the sweep's `workflow_dispatch`, whose actor is
+          # `github-actions[bot]` however the PR was opened, so an actor test
+          # exempts nothing on exactly the run that decides.
+          #
+          # Read over REST rather than taking `gh pr view --json author`: every
+          # dependabot condition in this repository compares against
+          # `dependabot[bot]`, which is REST's `.user.login`. `gh pr view` goes
+          # through GraphQL, where a Bot actor's login is the bare name
+          # (`dependabot`) -- add-contributor.yml's `__typename == "Bot"` note is
+          # the same distinction -- so normalising one spelling into the other
+          # would be an inference. One extra read is cheaper than a comparison
+          # that silently stops matching.
+          PR_AUTHOR="$(gh_retry gh api "repos/$REPO/pulls/$PR" --jq '.user.login')"
           SHA="$(jq -r '.headRefOid' <<<"$pr_json")"
           STATE="$(jq -r '.state' <<<"$pr_json")"
           # The default branch is where CI / Build / CodeQL are gated to run
@@ -352,7 +476,12 @@ jobs:
           # A PR whose base is any other branch -- a stacked PR sitting on
           # another feature branch -- can never start those lanes, so the
           # verdict step marks them ineligible instead of pending-forever.
-          DEFAULT_BRANCH="$(gh_retry gh api "repos/$REPO" --jq '.default_branch')"
+          # Every trigger here carries it in `github.event.repository`, so the
+          # request is only the fallback for a payload that does not.
+          DEFAULT_BRANCH="${EVENT_DEFAULT_BRANCH:-}"
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            DEFAULT_BRANCH="$(gh_retry gh api "repos/$REPO" --jq '.default_branch')"
+          fi
 
           {
             echo "pr=$PR"
@@ -362,6 +491,7 @@ jobs:
             echo "draft=$(jq -r '.isDraft' <<<"$pr_json")"
             echo "url=$(jq -r '.url' <<<"$pr_json")"
             echo "base=$(jq -r '.baseRefName' <<<"$pr_json")"
+            echo "author=$PR_AUTHOR"
             echo "default_branch=$DEFAULT_BRANCH"
             # (head repository, head branch) is how a monitored workflow run is
             # bound back to this PR below. Both fields are populated on a fork
@@ -431,16 +561,101 @@ jobs:
       # sparse-checkout keeps this to the one script directory, and
       # persist-credentials: false leaves no token in the worktree -- nothing
       # here runs git against the remote.
+      - name: Hold the verdict while a monitored lane runs
+        id: hold
+        if: >-
+          github.event_name == 'workflow_run'
+          && github.event.action == 'in_progress'
+          && steps.context.outputs.stale != 'true'
+          && steps.context.outputs.state == 'OPEN'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.context.outputs.sha }}
+          URL: ${{ steps.context.outputs.url }}
+          LANE: ${{ github.event.workflow_run.name }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/gh-retry.sh"
+          READ_FAILURE_TOKEN="[read-failed]"
+          # The event said a monitored lane went back to running. This run may
+          # execute long after it was dispatched -- queue delay is the very
+          # condition this workflow's dispatch count feeds -- so first ask
+          # whether that is STILL true, of the run the event names. A lane
+          # that has since completed needs no hold: its completion is the
+          # sweep's evidence, and a hold written now would stamp the status
+          # NEWER than that completion, pushing it below the sweep's evidence
+          # floor with no later event left to lift it. That is the freeze the
+          # sweep exists to end, manufactured by the guard meant to prevent
+          # it, on exactly the saturated days the guard matters most.
+          #
+          # This read is of the workflow run, not of the commit status: it
+          # asks whether the fact being acted on still holds, never what the
+          # status currently says. Reading the status first is the shape the
+          # publish step's POST comment records three guards failing to make
+          # safe, and it is not done here.
+          hold_description="readiness check(s) changed since evaluation; re-checking ${LANE:-a monitored lane}"
+          if lane_status="$(gh_retry gh api "repos/$REPO/actions/runs/$RUN_ID" --jq '.status')"; then
+            if [ "$lane_status" = "completed" ]; then
+              echo "pr-readiness: ${LANE:-the lane} already completed on $SHA before this hold ran; writing nothing, the sweep reads its completion"
+              exit 0
+            fi
+          else
+            rc=$?
+            if [ "$rc" -eq 22 ]; then exit 1; fi
+            # Unknown whether the lane is still running, so the hold is written
+            # -- pending only ever blocks -- and stamped as a read failure. The
+            # sweep retries that class on age alone, so a hold that did land
+            # over the lane's completion is recomputed regardless of evidence.
+            hold_description="$READ_FAILURE_TOKEN could not confirm ${LANE:-a monitored lane} is still running; holding $SHA until re-evaluated"
+          fi
+          # `pending`, written unconditionally once the lane is known (or not
+          # known) to be running: a commit status is last-write-wins per
+          # SHA+context with no conditional write, so nothing is gained by
+          # reading it first. A pending over a pending only moves the stamp; a
+          # pending over a failure blocks the merge just the same, and the lane
+          # that produced the failure is by definition being re-run.
+          #
+          # This run stops here. The lane's completion reaches the sweep as
+          # check evidence newer than this stamp, and the recompute it
+          # dispatches publishes the real verdict with the labels to match.
+          # Labels are advisory decoration and are left to that recompute:
+          # the status is the branch-protection handle, and it is written
+          # FIRST and alone for the same reason the publish step writes it so.
+          jq -n \
+            --arg target_url "$URL" \
+            --arg description "$hold_description" \
+            '{
+              state: "pending",
+              target_url: $target_url,
+              description: $description,
+              context: "PR Readiness"
+            }' > "$RUNNER_TEMP/readiness-hold.json"
+          if ! bounded gh api --method POST "repos/$REPO/statuses/$SHA" \
+            --input "$RUNNER_TEMP/readiness-hold.json" >/dev/null; then
+            echo "::error::Failed to hold the readiness status for $SHA while" \
+              "${LANE:-a monitored lane} re-runs. Not retried (a retry can" \
+              "overwrite a concurrent run's newer verdict); the sweep" \
+              "recomputes when the lane completes."
+            exit 1
+          fi
+          echo "held=true" >> "$GITHUB_OUTPUT"
+          echo "pr-readiness: holding $SHA at pending while ${LANE:-a monitored lane} runs"
+
       - name: Check out the disposition evaluator from the default branch
-        if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
+        if: >-
+          steps.context.outputs.stale != 'true'
+          && steps.context.outputs.state == 'OPEN'
+          && steps.hold.outputs.held != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch || github.ref_name }}
-          sparse-checkout: src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts
+          sparse-checkout: src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts
           persist-credentials: false
 
       # Issue #6658: the one-lane / one-rationale-per-finding disposition rule
-      # was mechanical only for a writer running the prepare-pr loop, so a
+      # was mechanical only for a writer running the kirocrew-prepare-pr loop, so a
       # writer who skips that loop could post a blanket single-rationale
       # `target=gpt` record that codex-review.yml's adjudication ledger admits
       # with full downgrade power while nothing on the merge path objected.
@@ -471,18 +686,22 @@ jobs:
       # update per uncollapsed event, not once per monitored workflow.
       - name: Evaluate disposition records
         id: dispositions
-        if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
+        if: >-
+          steps.context.outputs.stale != 'true'
+          && steps.context.outputs.state == 'OPEN'
+          && steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.context.outputs.pr }}
           SHA: ${{ steps.context.outputs.sha }}
-          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/scripts/pr_status.py
+          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py
         run: |
           set -uo pipefail
 
           ok=false
           violations=""
+          unpublished=""
           if [ ! -f "$GATE" ]; then
             # The evaluator moved or the sparse checkout missed it. Report
             # UNKNOWN so readiness waits and says why, rather than reporting a
@@ -494,6 +713,7 @@ jobs:
             if [ "$(jq -r '.ok' <<<"$out" 2>/dev/null)" = "true" ]; then
               ok=true
               violations="$(jq -r '.violations[]' <<<"$out" 2>/dev/null || true)"
+              unpublished="$(jq -r '.unpublished[]' <<<"$out" 2>/dev/null || true)"
             else
               echo "pr-readiness: disposition gate could not evaluate: $(jq -r '.error' <<<"$out" 2>/dev/null)" >&2
             fi
@@ -514,11 +734,110 @@ jobs:
             echo "violations<<$delim"
             printf '%s\n' "$violations"
             echo "$delim"
+            echo "unpublished<<$delim"
+            printf '%s\n' "$unpublished"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
+      # Issue #13951: a review lane's marker comment is ONE slot selected by the
+      # lane marker alone, never by the head, so a second sample at one head
+      # REPLACES the first and only the survivor is presented. The direction that
+      # matters is a blocking sample replaced by a clean one at the same head: the
+      # `[BLOCK-MERGE]` line goes, the stamp still names the head, and this status
+      # goes green over a block nobody adjudicated away.
+      #
+      # Evaluated HERE for the same reason the disposition rule is: a reader that
+      # only runs in the local kirocrew-prepare-pr loop binds whoever runs that loop, and
+      # #13951's own finding was that the record existed in GraphQL
+      # userContentEdits while nothing read it. A reader no gate calls reproduces
+      # that shape one layer up -- the reading exists and nothing consumes it.
+      #
+      # SCOPE, deliberately the narrowest thing that closes the hole: only
+      # `blocking_dropped` gates. It fires only when a replaced sample carried
+      # `[BLOCK-MERGE] <head>` AND the body now presented is itself stamped for
+      # that head and does not block. Measured over 559 bot comments with 26
+      # same-head replacement pairs: ONE true detection and no false positive, so
+      # gating on it does not redden an ordinary revision. (An earlier scan of the
+      # same condition reported zero occurrences; it was blind to three of the
+      # five lanes, because it read only the `[BLOCK-MERGE]` marker and the
+      # whole-design lanes write `<Lane>-Verdict: BLOCK` instead. That zero is
+      # retracted -- do not reason from it.) `superseded` alone is deliberately
+      # NOT a gate: ordinary same-head re-samples happen, are not harmful, and
+      # reddening them would block real revisions for a condition this repository
+      # does not treat as a defect.
+      #
+      # Never fails the step, same as the disposition gate: a failed step skips
+      # the publish below and strands the required status pending with no event to
+      # recompute it.
+      #
+      # Cost, stated plainly: one comment read plus one GraphQL edit-history read
+      # per bound lane that posted (at most five). Like the disposition gate it
+      # cannot be skipped on a cheap precondition -- deciding whether any lane
+      # comment was ever replaced means reading the comment list and then its
+      # history, which is the work itself.
+      # Skipped for `dependabot[bot]` for the same reason every review lane skips
+      # it, and with the same condition those lanes use: on such a pull request no
+      # bound lane ever publishes a marker comment, so this gate examines nothing
+      # and correctly reports UNKNOWN. Mapping that UNKNOWN to `pending` would
+      # strand the required status for the life of the head -- and the sweep cannot
+      # rescue it, because its rescue needs a check that completed after the
+      # verdict was published, while here every recompute re-derives the same empty
+      # reading and there is no lane to re-run that would ever post a comment. The
+      # exemption is deliberately the ACTOR and not the empty reading: a head whose
+      # lanes have simply not posted YET is also empty, and that one must stay
+      # UNKNOWN, because its lanes will publish and can then be superseded.
+      # Leaving the step unrun makes its outputs empty, which the evaluation below
+      # treats as contributing nothing -- the same shape the disposition step uses.
+      - name: Evaluate superseded verdicts
+        id: supersessions
+        if: >-
+          steps.context.outputs.stale != 'true'
+          && steps.context.outputs.state == 'OPEN'
+          && steps.hold.outputs.held != 'true'
+          && steps.context.outputs.author != 'dependabot[bot]'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.context.outputs.pr }}
+          SHA: ${{ steps.context.outputs.sha }}
+          GATE: ${{ github.workspace }}/src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/scripts/pr_status.py
+        run: |
+          set -uo pipefail
+
+          ok=false
+          dropped=""
+          if [ ! -f "$GATE" ]; then
+            echo "pr-readiness: supersession evaluator not found at $GATE" >&2
+          elif out="$(python3 "$GATE" --supersession-gate \
+                --repo "$REPO" --pr "$PR" --head "$SHA")"; then
+            echo "pr-readiness: supersession gate -- $out"
+            if [ "$(jq -r '.ok' <<<"$out" 2>/dev/null)" = "true" ]; then
+              ok=true
+              dropped="$(jq -r '.blocking_dropped[]' <<<"$out" 2>/dev/null || true)"
+            else
+              echo "pr-readiness: supersession gate could not evaluate: $(jq -r '.error' <<<"$out" 2>/dev/null)" >&2
+            fi
+          else
+            # stderr deliberately not suppressed: the gate turns every expected
+            # failure into ok=false JSON, so reaching here means the interpreter
+            # itself failed and the traceback is the only diagnosis.
+            echo "pr-readiness: supersession gate did not run (exit $?)" >&2
+          fi
+
+          delim="EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          {
+            echo "ok=$ok"
+            echo "dropped<<$delim"
+            printf '%s\n' "$dropped"
+            echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
       - name: Evaluate current revision
         id: verdict
-        if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
+        if: >-
+          steps.context.outputs.stale != 'true'
+          && steps.context.outputs.state == 'OPEN'
+          && steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -547,6 +866,16 @@ jobs:
           # wiring so a rename cannot silently disable the gate.
           DISPOSITION_OK: ${{ steps.dispositions.outputs.ok }}
           DISPOSITION_VIOLATIONS: ${{ steps.dispositions.outputs.violations }}
+          # The whole-design lanes the same gate call found owing this head a
+          # verdict they never published -- see the advisory-slot note below.
+          ADVISORY_UNPUBLISHED: ${{ steps.dispositions.outputs.unpublished }}
+          # From the supersession step above, on the same terms: empty means the
+          # step did not run, which contributes nothing. Only the dropped-block
+          # list gates; test_prepare_pr_supersession.py pins these two names to
+          # this step's outputs so a rename cannot silently empty the env and
+          # leave both `case` arms falling through with every test green.
+          SUPERSESSION_OK: ${{ steps.supersessions.outputs.ok }}
+          SUPERSESSION_DROPPED: ${{ steps.supersessions.outputs.dropped }}
         run: |
           set -euo pipefail
           source "$RUNNER_TEMP/gh-retry.sh"
@@ -596,13 +925,19 @@ jobs:
           # Code Review and the AI reviewers trigger on `pull_request` with no
           # base-branch filter, so they run on every PR regardless of base.
           workflow_specs+=("code-review.yml|Code Review")
+          # Issue Gate runs on `pull_request` with no base filter and needs
+          # only a read token, so it runs on every PR too, forks and stacked
+          # PRs included. It is enrolled HERE, not as a second branch-protection
+          # entry: `PR Readiness` is the one required status, so a lane this
+          # list omits is a gate that can go red without reddening the PR.
+          workflow_specs+=("issue-gate.yml|Issue Gate")
 
           if [ "$FORK" = "true" ]; then
             # A fork head cannot run the repository's managed default-setup
             # CodeQL, so that lane stays ineligible. The AI code reviews DO run
             # on forks: the privileged Stage-2 fork-*-review.yml pipeline fires
             # on CI completion from the default branch and posts a check-run
-            # named exactly like the same-repo lane ("Opus 5 Review", etc.).
+            # named exactly like the same-repo lane ("Opus 5.5 Review", etc.).
             # Read those results from the head SHA's check-runs (checkrun:
             # specs) so a fully-reviewed green fork can reach "passed" instead
             # of being forced to a maintainer-review verdict.
@@ -628,8 +963,8 @@ jobs:
               # triggers the lane -- its newest run + attempt is what "current"
               # means here.
               "checkrun:Internal Content Scan|Internal Content Scan|internal-content-scan-pr-|fast-gate.yml"
-              "checkrun:Opus 5 Review|Opus 5 Review|opus-pr-|fast-gate.yml"
-              "checkrun:GPT 5.6 Review|GPT 5.6 Review|gpt-pr-|fast-gate.yml"
+              "checkrun:Opus 5.5 Review|Opus 5.5 Review|opus-pr-|fast-gate.yml"
+              "checkrun:GPT 6.1 Review|GPT 6.1 Review|gpt-pr-|fast-gate.yml"
               "checkrun:Design Review|Design Review|design-pr-|fast-gate.yml"
               "checkrun:UX Review|UX Review|ux-pr-|fast-gate.yml"
               "checkrun:First Principles Review|First Principles Review|first-principles-pr-|fast-gate.yml"
@@ -648,8 +983,8 @@ jobs:
               workflow_specs+=("internal-content-scan-gate.yml|Internal Content Scan")
             fi
             workflow_specs+=(
-              "claude-review.yml|Opus 5 Review"
-              "codex-review.yml|GPT 5.6 Review"
+              "claude-review.yml|Opus 5.5 Review"
+              "codex-review.yml|GPT 6.1 Review"
               "design-review.yml|Design Review"
               "ux-review.yml|UX Review"
               "first-principles-review.yml|First Principles Review"
@@ -673,6 +1008,22 @@ jobs:
           # a site that does not.
           READ_FAILURE_TOKEN="[read-failed]"
           read_failure=false
+          # ONE stable token marks a pending that an whole-design lane owes this
+          # head a verdict it computed and could not publish -- the
+          # `(verdict not published, re-run this lane)` state scored below. It
+          # is the opposite of a read-failure pending in what RESOLVES it: a
+          # recompute of PR Readiness re-derives the same verdict (the lane's
+          # own check-run is already `success`, so there is no new evidence),
+          # and only RE-RUNNING THE LANE republishes the withheld verdict. So
+          # the token tells the self-heal sweep to re-fire that lane rather than
+          # this aggregator. It rides the description FIRST for the same reason
+          # the read-failure token does -- the API caps a description at 140
+          # characters and cuts the tail -- and a token not a sentence so
+          # pr-readiness-sweep.yml matches a literal, never a phrasing. Every
+          # arm that scores `(verdict not published, ...)` sets this flag, and
+          # test_pr_readiness_sweep.py fails a site that does not.
+          VERDICT_UNPUBLISHED_TOKEN="[verdict-unpublished]"
+          verdict_unpublished=false
           passed=()
           pending=()
           failed=()
@@ -725,7 +1076,71 @@ jobs:
           # one that would otherwise drop the lane posted last.
           sha_check_runs=""
 
-          for spec in "${workflow_specs[@]}"; do
+          # The three whole-design lanes' comment slots, read ONCE here beside
+          # the runs read: both readers below score those lanes, and the
+          # same-repo lane and its fork counterpart share one slot each, so six
+          # lanes are answered by three rows.
+          #
+          # Why the slot is read at all: a lane that computed a verdict it could
+          # not publish still completes `success`. Every publish-failure arm of
+          # the lanes' shared upsert emits an `::error::` and then returns 0, so
+          # the run reports success while the slot still holds the PREVIOUS
+          # head's verdict. Counting that lane as passed states the design was
+          # reviewed for a head that carries no published review, and reporting
+          # it `failed` would publish a BLOCK verdict no reviewer reached. It is
+          # scored as a third outcome instead: a named pending that a re-run of
+          # that lane clears.
+          #
+          # Bound stamp names, never any `*-REVIEWED` match. A stamp for another
+          # lane's name inside this lane's body is model output, so only the
+          # slot's OWN name answers for it.
+          #
+          # NONE of those rules is spelled here. `$GATE`'s
+          # `evaluate_reviewer_markers` decides, per bound lane, whether that
+          # lane's own slot carries a stamp naming this head: the name binding,
+          # the abbreviated and elided stamp forms, the slots left alone for
+          # carrying no stamp of their own (the whole-design lanes rewrite theirs to
+          # a stampless "skipped" notice by design, and a lane that published
+          # nothing at all is answered by its own conclusion), and the
+          # human-override record that stands in for a stamp on the path where
+          # the model is deliberately not re-run. That function is what
+          # `pr_status.py` reports BLOCKED from, so taking the answer from it is
+          # what makes the two gates unable to disagree about a head -- one
+          # definition, the same reason the disposition rule above is not
+          # restated in shell.
+          #
+          # It costs no extra request: that gate call already reads this PR's
+          # trusted comments for the disposition rule.
+          advisory_unpublished="${ADVISORY_UNPUBLISHED:-}"
+
+          # 1 when this whole-design lane owes this head a verdict and has none,
+          # which is the state a `success` conclusion cannot express. All this
+          # adds to the gate's answer is which reviewer name the board's lane
+          # label belongs to.
+          advisory_slot_unpublished() {
+            local name
+            case "$1" in
+              "Design Review") name="DESIGN" ;;
+              "UX Review") name="UX" ;;
+              "First Principles Review") name="FIRST-PRINCIPLES" ;;
+              *) printf '0'; return 0 ;;
+            esac
+            if printf '%s\n' "$advisory_unpublished" | grep -Fqx -- "$name"; then
+              printf '1'
+            else
+              printf '0'
+            fi
+          }
+
+          # `${arr[@]+"${arr[@]}"}` rather than `"${arr[@]}"`: on the transport
+          # failure path above the array is EMPTY, and bash < 4.4 (macOS ships
+          # 3.2) treats expanding an empty array under `set -u` as an unbound
+          # variable and aborts the script -- which turned the non-terminal
+          # "could not be evaluated" verdict into rc=1 wherever this script
+          # runs under the system bash (the macOS test lane extracts and runs
+          # it). The `+` form expands to nothing when the array is unset or
+          # empty and to every element otherwise, on every bash.
+          for spec in ${workflow_specs[@]+"${workflow_specs[@]}"}; do
             # Four fields: <workflow file or checkrun:NAME>|<label>|<external_id
             # prefix>|<triggering workflow file>. The last two are OPTIONAL and
             # only a checkrun: spec uses them -- see the binding note in that
@@ -743,14 +1158,23 @@ jobs:
               # an absent/unbound row (the real review has not posted yet) ->
               # pending.
               cname="${file#checkrun:}"
-              # Close the human-override-rerun race: this evaluation can BE the
-              # `in_progress` event a lane's own rerun fires the instant it
-              # starts (workflow_run is wired at both in_progress and completed
-              # -- see the trigger list above), before that rerun's "Open
-              # check-run" step has posted a fresh row. Reading check-runs right
-              # now would still see the OLD completed verdict and publish a
-              # stale success. Force pending without a read: the rerun's own
-              # completion re-triggers this evaluation with a real verdict.
+              # A human-override-rerun race this branch does NOT currently
+              # close, kept here so the intent is not lost with the wiring.
+              # It fires only when readiness was itself triggered by a
+              # `Fork <lane>` run's `workflow_run: in_progress`, and such a
+              # trigger can never reach this step: a `workflow_run`-triggered
+              # lane runs from the default branch, so `Resolve current pull
+              # request revision` finds no open pull request for that head and
+              # exits SKIP long before the evaluation (see the trigger
+              # allowlist). The branch was therefore unreachable while those
+              # lanes were listed, and stays unreachable now that they are not
+              # -- and doubly so since every `in_progress` trigger stops at the
+              # hold step and never evaluates. The race it names is real and
+              # unguarded: a rerun's fresh "Open check-run" step can land after
+              # this read, so the read sees the OLD completed verdict. The
+              # sweep's mode-2 check evidence catches it within one sweep
+              # interval. Tracked in issue #14166 rather than fixed here, which
+              # is a trigger change only.
               if [ "$FORK" = "true" ] && [ "${WR_STATUS:-}" = "in_progress" ] \
                 && [ "${WR_NAME:-}" = "Fork $cname" ]; then
                 pending+=("$label (rerun starting)")
@@ -874,18 +1298,23 @@ jobs:
                 # exception: the fork UX lane completes as `failure` when an
                 # attachment download from the description failed for a
                 # transport reason, a `cannot evaluate` that a re-run of that
-                # lane clears. NOTE: `/ai-review
-                # override` records the judgment and re-runs the Stage-2 fork
-                # lane (located via the run URL its check-run carries), but the
-                # fork lanes consume no override marker, so the re-run is a
-                # fresh review roll -- a fork false BLOCK clears via a clean
-                # re-roll or a new commit, never a forced pass -- identical to
-                # the fork Opus / GPT / Design lanes, which already block a
-                # fork PR the same way.
+                # lane clears. A false BLOCK clears with `/ai-review override`:
+                # the handler records the judgment and re-runs the bound
+                # Stage-2 lane run (located through the lane-run marker in its
+                # check-run's output), whose "Resolve human override" step
+                # reads the record for this exact head, skips the model, and
+                # completes this row `success` with the override note in the
+                # slot -- the same outcome as the same-repo lane. This branch
+                # therefore reads that row like any other.
                 if [ "$fail" -gt 0 ]; then
                   failed+=("$label (BLOCK)")
                 elif [ "$pass" -gt 0 ]; then
-                  passed+=("$label")
+                  if [ "$(advisory_slot_unpublished "$label")" = "1" ]; then
+                    verdict_unpublished=true
+                    pending+=("$label (verdict not published, re-run this lane)")
+                  else
+                    passed+=("$label")
+                  fi
                 else
                   pending+=("$label (not started)")
                 fi
@@ -923,6 +1352,33 @@ jobs:
                 [.workflow_runs[] | select(.path == $path)]
                 | max_by(.id) // empty
               ' <<<"$runs")"
+              src="$runs"
+              codeql_source=default
+              # CodeQL has two sources. Default setup is the managed
+              # `dynamic` run above. Advanced setup is the checked-in
+              # .github/workflows/codeql.yml, a `pull_request` run that is on
+              # the runs page this loop already holds. A head with a dynamic
+              # run is scanned by default setup, and that run answers exactly
+              # as before the checked-in file existed: while default setup is
+              # on, the checked-in run is skipped (its repository variable is
+              # unset) or fails its upload (GitHub refuses an advanced upload
+              # under default setup), and neither says anything about this
+              # head's alerts. Only a head with NO dynamic run falls through to
+              # the checked-in run. Either source still has to reach the same
+              # exact-SHA `CodeQL` result check-run below, so which run is read
+              # decides only "still running" or "failed", never "passed".
+              if [ -z "$run" ]; then
+                run="$(jq -c --arg path ".github/workflows/codeql.yml" \
+                  --arg head_repo "$HEAD_REPO" --arg head_ref "$HEAD_REF" '
+                  [.workflow_runs[]
+                   | select(.path == $path
+                            and .head_repository.full_name == $head_repo
+                            and .head_branch == $head_ref)]
+                  | max_by(.id) // empty
+                ' <<<"$pr_runs")"
+                src="$pr_runs"
+                codeql_source=advanced
+              fi
             else
               # Bind the run to this PR by (head repository, head branch), NOT
               # by `.pull_requests`: that array is empty on every fork run, so
@@ -939,12 +1395,10 @@ jobs:
               # API order and `last` picked the OLDEST run -- when that run
               # was concurrency-cancelled, a lane whose newest run succeeded
               # read as a blocking failure. max_by(.id) orders same-second
-              # runs correctly because ids increase monotonically, and it is
-              # sufficient on its own: a concurrency-cancelled twin is always
-              # superseded by a same-head run with a HIGHER id, so the newest
-              # run is never the cancelled duplicate. Deliberately NO
-              # cancelled-run filter here: dropping a cancelled newest run
-              # would revive an older verdict -- a manually cancelled rerun
+              # runs correctly because ids increase monotonically. A cancelled
+              # newest run yields only to a LATER-STARTED run (below), so
+              # there is deliberately no plain cancelled-run filter: dropping
+              # it would revive an older verdict -- a manually cancelled rerun
               # must read failure-class, not resurface a stale green.
               run="$(jq -c --arg path ".github/workflows/$file" \
                 --arg head_repo "$HEAD_REPO" --arg head_ref "$HEAD_REF" '
@@ -954,6 +1408,19 @@ jobs:
                           and .head_branch == $head_ref)]
                 | max_by(.id) // empty
               ' <<<"$pr_runs")"
+              src="$pr_runs"
+            fi
+            # Fork approval can start runs out of id order, so the max-id twin gets
+            # cancelled; the latest-started same-head run wins (ties: whole seconds).
+            if [ "$(jq -r '.conclusion // ""' <<<"${run:-null}")" = "cancelled" ]; then
+              run="$(jq -c --argjson n "$run" '
+                [.workflow_runs[]
+                 | select(.path == $n.path and .head_branch == $n.head_branch
+                          and .head_repository.full_name == $n.head_repository.full_name
+                          and .id != $n.id and .run_started_at != null
+                          and .run_started_at >= $n.run_started_at)]
+                | max_by([.run_started_at, .conclusion != "cancelled"]) // $n
+              ' <<<"$src")"
             fi
             if [ -z "$run" ]; then
               pending+=("$label (not started)")
@@ -1009,12 +1476,23 @@ jobs:
                       esac
                     fi
                     ;;
-                  skipped) passed+=("$label") ;;
+                  # A skipped DEFAULT-setup run is that setup declining this
+                  # head, and has always passed. A skipped CHECKED-IN run never
+                  # scanned anything: the variable is unset, the PR is a draft,
+                  # or the PR's own copy of the file skips it. None of those is
+                  # a clean verdict, so it waits. Before the switch, it waits
+                  # only until the dynamic run appears and takes over.
+                  skipped)
+                    if [ "$codeql_source" = "advanced" ]; then
+                      pending+=("$label (skipped)")
+                    else
+                      passed+=("$label")
+                    fi ;;
                   *) failed+=("$label ($conclusion)") ;;
                 esac
               elif [ "$label" = "Design Review" ] || [ "$label" = "UX Review" ] || [ "$label" = "First Principles Review" ]; then
                 # Design, UX and First Principles all BLOCK on a real BLOCK
-                # verdict. The "gates on BLOCK" step exits 0 for PASS/CONCERNS,
+                # verdict. The "gates on BLOCK" step exits 0 for PASS,
                 # the Dependabot skip, and any overloaded/throttled/verdict-less
                 # run, so those never fail the run -- a `failure` conclusion is
                 # therefore almost always a judged-wrong verdict. One residual:
@@ -1029,7 +1507,18 @@ jobs:
                 # attachment download failed for a transport reason; every
                 # other fork hard error maps to NEUTRAL.)
                 case "$conclusion" in
-                  success|neutral|skipped) passed+=("$label") ;;
+                  # A workflow-level `skipped` is left alone: nothing ran, so no
+                  # verdict is owed for this head and there is no lane to
+                  # re-run. Only a lane that reports having reviewed the head
+                  # is held to having published that review.
+                  skipped) passed+=("$label") ;;
+                  success|neutral)
+                    if [ "$(advisory_slot_unpublished "$label")" = "1" ]; then
+                      verdict_unpublished=true
+                      pending+=("$label (verdict not published, re-run this lane)")
+                    else
+                      passed+=("$label")
+                    fi ;;
                   *) failed+=("$label (BLOCK)") ;;
                 esac
               # Security Scope Review is deliberately absent here too, for the
@@ -1195,13 +1684,123 @@ jobs:
               ;;
           esac
 
+          # Superseded-verdict enforcement (issue #13951). A block that was judged
+          # at THIS head and then replaced by a clean sample at the same head is a
+          # condition waiting cannot fix: the replacement already happened, and
+          # only re-establishing a verdict or a human adjudication resolves it. So
+          # it belongs in `failed`. Only the dropped-block list gates -- an
+          # ordinary same-head re-sample is not a defect and must not redden a
+          # revision. `ok=false` means the question could not be ANSWERED, which
+          # is UNKNOWN and therefore `pending`, never a red: that covers both an
+          # unreadable edit history and a head where no lane was examined at all.
+          # It is a READ failure, so it is stamped like the disposition one.
+          case "${SUPERSESSION_OK:-}" in
+            true)
+              while IFS= read -r lane; do
+                [ -n "$lane" ] || continue
+                # Both halves of this text were wrong and each sent the reader
+                # somewhere the code does not look. `/ai-review override <lane>
+                # <head>` is an exit for EVERY lane, fork PRs included: the
+                # lane's re-run replaces the block with the override note, and
+                # the gate also reads the accepted record itself as adjudicating
+                # every block the lane raised at this head before it was
+                # recorded. And what clears the GPT lane by decision
+                # is the workflow-authored `(all downgraded on adjudication)`
+                # heading, NOT the `[BLOCK-MERGE-DOWNGRADED]` marker, which sits
+                # in embedded model output. A new head is the expensive advice: it
+                # discards every other lane's verdict for this head.
+                case "$lane" in
+                  GPT) remedy="record a legitimate clear at this head with /ai-review override, or an adjudication pass, whose '(all downgraded on adjudication)' heading is read as cleared; a new head also re-samples it, at the cost of every other lane's verdict for this head" ;;
+                  *) remedy="record a legitimate clear at this head with /ai-review override, whose accepted record adjudicates every block this lane raised at this head before it, on a fork PR too; this lane has no adjudication heading, so the only other exit is a new head, at the cost of every other lane's verdict for this head" ;;
+                esac
+                failed+=("superseded verdict: $lane blocked this head in a replaced sample and the body now presented does not - read the comment's stored history; $remedy")
+              done <<<"${SUPERSESSION_DROPPED:-}"
+              ;;
+            false)
+              pending+=("superseded verdicts could not be evaluated")
+              read_failure=true
+              ;;
+          esac
+
+          # Human review (issue #17049). A reviewer whose NEWEST review asks
+          # for changes on THIS head blocks: nothing has been pushed since they
+          # asked, so the revision they rejected is the one being judged. Only
+          # APPROVED, CHANGES_REQUESTED and DISMISSED reviews count, the same
+          # three GitHub folds into its own review decision; a COMMENTED review
+          # changes nothing. A dismissed review reads back as DISMISSED, so a
+          # maintainer dismissal clears the block too.
+          #
+          # Deliberately weaker than GitHub's own review decision, which stays
+          # at CHANGES_REQUESTED across new commits until the reviewer re-reviews:
+          # here a new commit is the author's answer, and the reviewer is free
+          # to ask again on it.
+          #
+          # A review emits no event this workflow hears, so the verdict is
+          # refreshed by pr-readiness-sweep.yml, whose scan reads the newest
+          # review or dismissal time on every open pull request.
+          #
+          # The fold runs in a command substitution, not a process substitution,
+          # so a body jq cannot parse is a read failure (pending) rather than an
+          # empty blocker list that would read as green.
+          review_blockers=""
+          reviews_read=false
+          if reviews="$(gh_retry gh api --method GET --paginate --slurp \
+            "repos/$REPO/pulls/$PR/reviews?per_page=100")"; then
+            if review_blockers="$(jq -r --arg sha "$SHA" '
+              if type != "array" then error("not a list of pages") else . end
+              | [.[] | if type == "array" then .[] else error("a page is not a list") end
+                | select((.user.login // "") != "")
+                | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED")]
+              | reduce .[] as $r ({}; .[$r.user.login] = $r)
+              | .[] | select(.state == "CHANGES_REQUESTED" and .commit_id == $sha)
+              | .user.login' <<<"$reviews")"; then
+              reviews_read=true
+            fi
+          else
+            rc=$?
+            if [ "$rc" -eq 22 ]; then exit 1; fi
+          fi
+          if [ "$reviews_read" = "true" ]; then
+            # Only a reviewer with write access blocks, the same bar GitHub's
+            # review decision and sensitive_change_review.py hold: any
+            # signed-in account can leave a review on a public repository.
+            # `author_association` is not that bar, so the repository's own
+            # permission answer is asked, and only for a reviewer who would
+            # otherwise block. A 404 is the API answering "not a
+            # collaborator"; any other failed read is unknown, so pending.
+            while IFS= read -r reviewer; do
+              [ -n "$reviewer" ] || continue
+              if permission="$(gh_retry gh api \
+                "repos/$REPO/collaborators/$reviewer/permission" \
+                --jq '.permission // "none"' 2>"$RUNNER_TEMP/review-permission-err")"; then
+                case "$permission" in
+                  admin|write)
+                    failed+=("changes requested by @$reviewer on this head: push a commit, or have them re-review, or dismiss the review")
+                    ;;
+                  *)
+                    echo "Changes requested by @$reviewer ignored: repository permission is '$permission', not write."
+                    ;;
+                esac
+              elif grep -q 'HTTP 404' "$RUNNER_TEMP/review-permission-err"; then
+                echo "Changes requested by @$reviewer ignored: not a collaborator."
+              else
+                cat "$RUNNER_TEMP/review-permission-err" >&2 || true
+                pending+=("permission of reviewer @$reviewer could not be read")
+                read_failure=true
+              fi
+            done <<<"$review_blockers"
+          else
+            pending+=("human reviews could not be read")
+            read_failure=true
+          fi
+
           blockers=()
           waiting=()
           if [ "${#failed[@]}" -gt 0 ]; then
-            blockers=("${failed[@]}")
+            blockers=(${failed[@]+"${failed[@]}"})
           fi
           if [ "${#pending[@]}" -gt 0 ]; then
-            waiting=("${pending[@]}")
+            waiting=(${pending[@]+"${pending[@]}"})
           fi
           if [ "$DRAFT" = "true" ]; then
             waiting+=("pull request is a draft")
@@ -1240,14 +1839,23 @@ jobs:
             # A read-failure pending reaches the sweep through this generic
             # description too, so the token leads this one as well, and the
             # names budget below pays for it so the total still fits the cap.
+            # An unpublished-verdict pending rides the same way, by its
+            # own token: it tells the sweep to re-run the owing LANE rather than
+            # re-fire this aggregator, which is the only thing that republishes
+            # the withheld verdict. Both can hold at once (a transient read
+            # failed on a PR that also owes a verdict), so both tokens lead when
+            # they do; the names budget below shrinks to keep the 140-char cap.
             prefix=""
             if [ "$read_failure" = "true" ]; then
               prefix="$READ_FAILURE_TOKEN "
             fi
+            if [ "$verdict_unpublished" = "true" ]; then
+              prefix="$prefix$VERDICT_UNPUBLISHED_TOKEN "
+            fi
             names_budget=$(( 70 - ${#prefix} ))
             names=""
             shown=0
-            for item in "${waiting[@]}"; do
+            for item in ${waiting[@]+"${waiting[@]}"}; do
               candidate="$names"
               if [ -n "$candidate" ]; then
                 candidate="$candidate, $item"
@@ -1311,12 +1919,12 @@ jobs:
             if [ "${#skipped[@]}" -gt 0 ]; then
               echo
               echo "**Not eligible**"
-              printf -- "- %s\n" "${skipped[@]}"
+              printf -- "- %s\n" ${skipped[@]+"${skipped[@]}"}
             fi
             if [ "${#awaiting_approval[@]}" -gt 0 ]; then
               echo
               echo "**Awaiting maintainer approval**"
-              printf -- "- %s\n" "${awaiting_approval[@]}"
+              printf -- "- %s\n" ${awaiting_approval[@]+"${awaiting_approval[@]}"}
               echo
               echo "> GitHub created these fork runs but has not executed them."
               echo "> A maintainer must approve them; the contributor cannot"
@@ -1325,12 +1933,12 @@ jobs:
             if [ "${#blockers[@]}" -gt 0 ]; then
               echo
               echo "**Blocking**"
-              printf -- "- %s\n" "${blockers[@]}"
+              printf -- "- %s\n" ${blockers[@]+"${blockers[@]}"}
             fi
             if [ "${#waiting[@]}" -gt 0 ]; then
               echo
               echo "**Waiting**"
-              printf -- "- %s\n" "${waiting[@]}"
+              printf -- "- %s\n" ${waiting[@]+"${waiting[@]}"}
             fi
             # Reached with transport_failed=true only via the fall-through
             # above (an already-observed blocker dominates the pending
@@ -1346,7 +1954,10 @@ jobs:
           } > "$RUNNER_TEMP/pr-readiness-summary.md"
 
       - name: Publish status and label
-        if: steps.context.outputs.stale != 'true' && steps.context.outputs.state == 'OPEN'
+        if: >-
+          steps.context.outputs.stale != 'true'
+          && steps.context.outputs.state == 'OPEN'
+          && steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -1356,6 +1967,9 @@ jobs:
           TARGET_LABEL: ${{ steps.verdict.outputs.label }}
           STATUS_STATE: ${{ steps.verdict.outputs.status_state }}
           DESCRIPTION: ${{ steps.verdict.outputs.description }}
+          FORK: ${{ steps.context.outputs.fork }}
+          HEAD_REPO: ${{ steps.context.outputs.head_repo }}
+          HEAD_REF: ${{ steps.context.outputs.head_ref }}
         run: |
           set -euo pipefail
           source "$RUNNER_TEMP/gh-retry.sh"
@@ -1369,6 +1983,276 @@ jobs:
           if [ "$current_sha" != "$SHA" ]; then
             echo "Ignoring publish for stale revision $SHA; PR #$PR is now at $current_sha."
             exit 0
+          fi
+
+          # Re-check before publishing a SUCCESS. The verdict was scored from a
+          # runs page read before the checkout and the disposition gate, and a
+          # run in an isolated group (pull_request_target, workflow_dispatch)
+          # is never cancelled by a lane re-run's own readiness run. A lane
+          # that started since would otherwise be published over as success --
+          # the one write that lets armed auto-merge land while a lane runs,
+          # and the write a re-run's hold cannot defend against: the hold lands
+          # in seconds and this publish lands after it. One read, on every
+          # success; any open monitored lane downgrades this publish to
+          # pending, and a failed read does too (stamped, so the self-heal
+          # sweep re-fires it).
+          #
+          # An `in_progress`-triggered run never reaches this step: it publishes
+          # its hold and stops (see "Hold the verdict while a monitored lane
+          # runs"), so no event-shape downgrade is needed here.
+          #
+          # The runs-page filter below matches on this PR's own head repository
+          # and branch, which a fork head's runs DO carry (a fork PR's CI run
+          # lists the fork as head_repository and its branch as head_branch),
+          # so this read answers for a fork's CI, Fast Gate, Build, Code Review
+          # and content-scan re-runs exactly as it does for a same-repo PR. What
+          # it cannot see is the seven Stage-2 fork review lanes, which run from
+          # the default branch and report as check-runs on the head SHA; those
+          # get their own read further down.
+          if [ "$STATUS_STATE" = "success" ]; then
+            # The page is kept: the fork arm below reads Fast Gate's newest run
+            # from it rather than spending a second request.
+            runs_page=""
+            if runs_page="$(gh_retry gh api --method GET --paginate \
+              "repos/$REPO/actions/runs?event=pull_request&head_sha=$SHA&per_page=100")" \
+              && recheck="$(jq -rs --arg repo "$HEAD_REPO" --arg ref "$HEAD_REF" --arg lanes "$MONITORED_LANES" '
+                ($lanes | split(" ") | map(select(. != "")) | map(".github/workflows/" + .)) as $l
+                | [.[].workflow_runs[]
+                   | select((.path | IN($l[]))
+                            and (.head_repository.full_name // "") == $repo
+                            and (.head_branch // "") == $ref)]
+                # Newest run per lane, collapsed exactly as the verdict step
+                # collapses it: max id, and a cancelled max-id run yields to a
+                # LATER-STARTED sibling (fork approval can start runs out of id
+                # order, so the max-id twin is the one that got cancelled).
+                # Reading a lane differently here than the evaluation did would
+                # red a verdict it scored green, deterministically, on every
+                # recompute.
+                | group_by(.path)
+                | map(
+                    (max_by(.id)) as $n
+                    | if ($n.conclusion // "") == "cancelled" then
+                        ([.[] | select(.id != $n.id and .run_started_at != null
+                                        and .run_started_at >= $n.run_started_at)]
+                         | max_by([.run_started_at, .conclusion != "cancelled"])) // $n
+                      else $n end)
+                | (map(select(.status == "completed"
+                              and ((.conclusion // "") | IN("success","neutral","skipped") | not))
+                        | (.name // .path)) | join(", ")) as $red
+                | (map(select(.status != "completed") | (.name // .path)) | join(", ")) as $open
+                | "\($red)|\($open)"
+              ' <<<"$runs_page")"; then
+              IFS='|' read -r red_lanes open_lanes <<<"$recheck"
+              # A red lane publishes red: a pending here would overwrite the
+              # failure that lane's own evaluation already published.
+              if [ -n "$red_lanes" ]; then
+                echo "pr-readiness: publish re-check -- lane(s) red since the evaluation: $red_lanes"
+                STATUS_STATE=failure
+                TARGET_LABEL="readiness: action required"
+                DESCRIPTION="blocking readiness item(s) since evaluation: $red_lanes"
+              elif [ -n "$open_lanes" ]; then
+                echo "pr-readiness: publish re-check -- lane(s) started since the evaluation: $open_lanes"
+                STATUS_STATE=pending
+                TARGET_LABEL="readiness: checking"
+                DESCRIPTION="readiness check(s) changed since evaluation; re-checking $open_lanes"
+              fi
+            else
+              STATUS_STATE=pending
+              TARGET_LABEL="readiness: checking"
+              DESCRIPTION="[read-failed] Readiness could not be re-checked before publishing success; it will be re-evaluated"
+            fi
+            # CodeQL is a `dynamic` run, so the re-check above -- filtered to
+            # `event=pull_request` and MONITORED_LANES -- is structurally blind
+            # to it. Without this, a CodeQL re-run had no
+            # way to hold the publish: the delayed publisher saw only green
+            # pull-request lanes and wrote success over the pending that re-run's
+            # own readiness run had published, opening a merge window while the
+            # code-scanning verdict for the revision was in flight. Read on the
+            # same two reads the verdict step scores CodeQL from, and only while
+            # this publish is still a success. An empty dynamic page falls
+            # through to the checked-in advanced-setup run on the runs page
+            #; no run from either source holds nothing: CodeQL either
+            # does not apply to this base or has not started, and in the
+            # latter case the verdict step said pending.
+            # Each conclusion is mapped to the verdict step's own reading of it,
+            # arm for arm: `success` goes on to the result check-run, `skipped`
+            # is that step's `passed` (default setup did not scan this base),
+            # and every other completed conclusion is its `failed`. Reading one
+            # of them differently here makes the re-check disagree with the
+            # evaluation it is re-checking -- either restoring a success that
+            # evaluation rejected, or blocking a verdict it passed. A fork head
+            # cannot run the managed default-setup CodeQL (the verdict step
+            # lists it skipped), so this read is same-repo only.
+            if [ "$STATUS_STATE" = "success" ] && [ "${FORK:-}" = "false" ]; then
+              if codeql_state="$(gh_retry gh api --method GET \
+                "repos/$REPO/actions/runs?event=dynamic&head_sha=$SHA&per_page=100" \
+                | jq -r '
+                  [.workflow_runs[]
+                   | select(.path == "dynamic/github-code-scanning/codeql")]
+                  | max_by(.id) as $r
+                  | if $r == null then "absent|"
+                    elif ($r.status // "") != "completed" then "open|CodeQL (\($r.status // "queued"))"
+                    elif ($r.conclusion // "") == "success" then "results|"
+                    elif ($r.conclusion // "") == "skipped" then "none|"
+                    else "red|CodeQL (\($r.conclusion))" end
+                ')"; then
+                IFS='|' read -r codeql_verdict codeql_lane <<<"$codeql_state"
+                # No dynamic run: read the checked-in advanced-setup run off the
+                # runs page already in hand, collapsed and mapped exactly as the
+                # verdict step does for that source. Its `skipped` is
+                # that step's pending, not its pass. No run from either source
+                # holds nothing: the verdict step already said "(not started)".
+                if [ "$codeql_verdict" = "absent" ]; then
+                  codeql_state="$(jq -rs --arg repo "$HEAD_REPO" --arg ref "$HEAD_REF" '
+                    [.[].workflow_runs[]
+                     | select(.path == ".github/workflows/codeql.yml"
+                              and (.head_repository.full_name // "") == $repo
+                              and (.head_branch // "") == $ref)]
+                    | (max_by(.id)) as $n
+                    | (if $n != null and ($n.conclusion // "") == "cancelled" then
+                         ([.[] | select(.id != $n.id and .run_started_at != null
+                                         and .run_started_at >= $n.run_started_at)]
+                          | max_by([.run_started_at, .conclusion != "cancelled"])) // $n
+                       else $n end) as $r
+                    | if $r == null then "none|"
+                      elif ($r.status // "") != "completed" then "open|CodeQL (\($r.status // "queued"))"
+                      elif ($r.conclusion // "") == "success" then "results|"
+                      elif ($r.conclusion // "") == "skipped" then "open|CodeQL (skipped)"
+                      else "red|CodeQL (\($r.conclusion))" end
+                  ' <<<"$runs_page")"
+                  IFS='|' read -r codeql_verdict codeql_lane <<<"$codeql_state"
+                fi
+                # A successful managed workflow says the analyses ran, not that
+                # their results passed: that verdict is a separate exact-SHA
+                # check-run owned by github-advanced-security, and it is the one
+                # a re-scan re-opens. Bound by app as well as name, as the
+                # verdict step does, so another app's `CodeQL` cannot answer.
+                if [ "$codeql_verdict" = "results" ]; then
+                  if codeql_state="$(gh_retry gh api --method GET \
+                    "repos/$REPO/commits/$SHA/check-runs?check_name=CodeQL&per_page=100" \
+                    | jq -r '
+                      [.check_runs[]?
+                       | select((.app.slug // "") == "github-advanced-security")]
+                      | max_by(.id) as $c
+                      | if $c == null then "open|CodeQL (results not reported)"
+                        elif ($c.status // "") != "completed" then "open|CodeQL (results \($c.status))"
+                        elif (($c.conclusion // "") | IN("success")) then "none|"
+                        elif (($c.conclusion // "") | IN("neutral","")) then "open|CodeQL (results pending)"
+                        else "red|CodeQL (\($c.conclusion))" end
+                    ')"; then
+                    IFS='|' read -r codeql_verdict codeql_lane <<<"$codeql_state"
+                  else
+                    codeql_verdict=unreadable
+                  fi
+                fi
+                case "$codeql_verdict" in
+                  red)
+                    echo "pr-readiness: publish re-check -- $codeql_lane since the evaluation"
+                    STATUS_STATE=failure
+                    TARGET_LABEL="readiness: action required"
+                    DESCRIPTION="blocking readiness item(s) since evaluation: $codeql_lane"
+                    ;;
+                  open)
+                    echo "pr-readiness: publish re-check -- $codeql_lane since the evaluation"
+                    STATUS_STATE=pending
+                    TARGET_LABEL="readiness: checking"
+                    DESCRIPTION="readiness check(s) changed since evaluation; re-checking $codeql_lane"
+                    ;;
+                  unreadable)
+                    STATUS_STATE=pending
+                    TARGET_LABEL="readiness: checking"
+                    DESCRIPTION="[read-failed] Readiness could not be re-checked before publishing success; it will be re-evaluated"
+                    ;;
+                esac
+              else
+                STATUS_STATE=pending
+                TARGET_LABEL="readiness: checking"
+                DESCRIPTION="[read-failed] Readiness could not be re-checked before publishing success; it will be re-evaluated"
+              fi
+            fi
+            # The seven Stage-2 fork review lanes run from the default branch,
+            # so the runs page above never shows them on a fork head; the
+            # verdict step reads them from the head SHA's check-runs, and so
+            # does this re-check, bound the same way: each lane stamps its row
+            # with `<prefix><PR>-<Fast Gate run id>-<attempt>`, and only a row
+            # naming THIS pull request AND the newest Fast Gate run + attempt
+            # for this head is current. The attempt is what makes a Fast Gate
+            # re-run visible: the previous attempt's seven rows still sit on
+            # the SHA, completed and green, and a match on PR alone would read
+            # them as the verdict while the re-run's Stage-2 lanes have not yet
+            # posted theirs. A lane with no current-attempt row has not
+            # reported and holds the publish, as the verdict step's own
+            # "(not started)" does; a current row still running holds it; a
+            # current row completed red is a judged-wrong verdict -- each fork
+            # lane fails its check ONLY on a real BLOCK, an errored or
+            # throttled run resolves neutral -- and publishes red. Fast Gate's
+            # newest run is read from the page already fetched above, with the
+            # verdict step's own max-id collapse. One request, on a fork
+            # success only.
+            if [ "$STATUS_STATE" = "success" ] && [ "${FORK:-}" = "true" ]; then
+              fast_gate="$(jq -rs --arg repo "$HEAD_REPO" --arg ref "$HEAD_REF" '
+                [.[].workflow_runs[]
+                 | select(.path == ".github/workflows/fast-gate.yml"
+                          and (.head_repository.full_name // "") == $repo
+                          and (.head_branch // "") == $ref)]
+                | max_by(.id) | if . == null then "" else "\(.id)-\(.run_attempt // 1)" end
+              ' <<<"$runs_page")"
+              if [ -z "$fast_gate" ]; then
+                # No Fast Gate run on this head means no Stage-2 lane can have
+                # reported; the verdict step would have said pending.
+                echo "pr-readiness: publish re-check -- Fast Gate has no run on this fork head; Stage-2 lanes cannot have reported"
+                STATUS_STATE=pending
+                TARGET_LABEL="readiness: checking"
+                DESCRIPTION="readiness check(s) changed since evaluation; re-checking Fast Gate"
+              elif fork_state="$(gh_retry gh api --method GET --paginate \
+                "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+                | jq -rs --arg pr "$PR" --arg fg "$fast_gate" \
+                  --argjson legacy "$LEGACY_LANE_NAMES" '
+                  ($legacy | with_entries({key: .value, value: .key})) as $old_name
+                  | {"Internal Content Scan": "internal-content-scan-pr-",
+                   "Opus 5.5 Review": "opus-pr-",
+                   "GPT 6.1 Review": "gpt-pr-",
+                   "Design Review": "design-pr-",
+                   "UX Review": "ux-pr-",
+                   "First Principles Review": "first-principles-pr-",
+                   "Security Scope Review": "scope-pr-"} as $lanes
+                  | [.[].check_runs[]] as $rows
+                  | [$lanes | to_entries[]
+                     | .key as $name | (.value + $pr + "-" + $fg) as $want
+                     | ($rows | map(select((.external_id // "") == $want))) as $bound
+                     # A pre-rename row answers only when no current-name row
+                     # is bound; see LEGACY_LANE_NAMES.
+                     | (($bound | map(select(.name == $name)) | max_by(.id))
+                        // ($bound | map(select(.name == $old_name[$name])) | max_by(.id))) as $row
+                     | {name: $name, row: $row}]
+                  | (map(select(.row != null and .row.status == "completed"
+                                and ((.row.conclusion // "")
+                                     | IN("failure","timed_out","cancelled",
+                                          "action_required","stale","startup_failure"))))
+                     | map(.name)) as $red
+                  | (map(select(.row == null) | .name + " (not started)")
+                     + map(select(.row != null and .row.status != "completed") | .name)) as $open
+                  | "\($red | join(", "))|\($open | join(", "))"
+                ')"; then
+                IFS='|' read -r fork_red fork_open <<<"$fork_state"
+                if [ -n "$fork_red" ]; then
+                  echo "pr-readiness: publish re-check -- fork lane(s) red since the evaluation: $fork_red"
+                  STATUS_STATE=failure
+                  TARGET_LABEL="readiness: action required"
+                  DESCRIPTION="blocking readiness item(s) since evaluation: $fork_red"
+                elif [ -n "$fork_open" ]; then
+                  echo "pr-readiness: publish re-check -- fork lane(s) not current since the evaluation: $fork_open"
+                  STATUS_STATE=pending
+                  TARGET_LABEL="readiness: checking"
+                  DESCRIPTION="readiness check(s) changed since evaluation; re-checking $fork_open"
+                fi
+              else
+                STATUS_STATE=pending
+                TARGET_LABEL="readiness: checking"
+                DESCRIPTION="[read-failed] Readiness could not be re-checked before publishing success; it will be re-evaluated"
+              fi
+            fi
+            DESCRIPTION="${DESCRIPTION:0:140}"
           fi
 
           # The commit status IS the verdict, and `PR Readiness` is the only
@@ -1453,7 +2337,7 @@ jobs:
             "readiness: passed|0E8A16|Eligible automated validation passed for the current revision"
           )
           existing_labels="$(gh_retry gh label list --repo "$REPO" --limit 200 --json name --jq '.[].name')"
-          for spec in "${label_specs[@]}"; do
+          for spec in ${label_specs[@]+"${label_specs[@]}"}; do
             name="${spec%%|*}"
             rest="${spec#*|}"
             color="${rest%%|*}"
@@ -1474,9 +2358,21 @@ jobs:
             fi
           done
           if ! grep -Fxq "$TARGET_LABEL" <<<"$current"; then
-            jq -n --arg label "$TARGET_LABEL" '{labels: [$label]}' \
+            # Not `--arg label`: `label` is a jq keyword that jq 1.6 rejects.
+            jq -n --arg name "$TARGET_LABEL" '{labels: [$name]}' \
               | gh api --method POST "repos/$REPO/issues/$PR/labels" \
                   --input - >/dev/null
           fi
 
           cat "$RUNNER_TEMP/pr-readiness-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # One line for measuring this workflow's draw on the shared pool.
+      # `GET /rate_limit` is not counted against the limit it reports.
+      - name: Log the remaining REST budget
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          timeout 60 gh api rate_limit --jq '.resources.core
+            | "pr-readiness: core rate limit -- \(.remaining)/\(.limit) remaining, resets \(.reset | todate)"' \
+            || echo "pr-readiness: core rate limit could not be read"

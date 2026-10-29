@@ -31,7 +31,7 @@ kirocrew pod up   <wt> --provision# provision (if needed) then bring it up
 kirocrew pod up   <wt> --approval reads  # boot its gateway in an approval mode
 kirocrew pod up   <wt> --crons          # boot its gateway with the cron scheduler on
 kirocrew pod up   <wt> --no-embeddings  # boot without the embedding model (keyword-search fallback)
-kirocrew pod up   <wt> --wait-secs N    # override the 90s health-wait budget
+kirocrew pod up   <wt> --wait-secs N    # override the 90s readiness budget
 kirocrew pod up   <wt> --seed minimal  # pre-populate its HOME from a named scenario
 kirocrew pod scenarios [--json]        # list named scenarios and their descriptions
 kirocrew pod api  <wt> GET sessions    # authenticated request → fixed-key JSON
@@ -60,8 +60,25 @@ and collapses them, honoring their very different costs:
 
 | Prereq | Cost | Who builds it |
 |---|---|---|
-| **venv** | ~1 min, idempotent | `pod up` **auto-builds** it on demand |
+| **venv** | ~1 min, idempotent | `pod up` **auto-builds** it on demand; set `KIROCREW_PROVISION_USE_UV` to build it with `uv` from its shared cache instead of `python -m venv` + pip (opt-in; falls back to pip when `uv` cannot be found) |
 | **dist** | minutes (Vite SPA build) | only on **explicit consent** |
+
+The venv is built with the first Python >= 3.12 (the package's `requires-python`)
+that can actually build one. Candidates, in order: the interpreter running the
+gateway or CLI, so a pod gets the version its operator already runs; then
+`python3.N` by name, the gateway's minor first and then 3.12 upward, in the usual
+POSIX locations and on `PATH`, then `python3`; on Windows, where python.org ships
+`python.exe` and never a `python3.12.exe`, the `py` launcher per minor (`py -3.12`);
+finally `uv python find '>=3.12'`, which never downloads.
+
+Each candidate is PROBED rather than trusted because it exists: a venv without pip
+is created in a temp dir and that venv's own interpreter must start and import
+`ensurepip`. That rejects a version-manager shim with no install behind it (mise,
+pyenv, asdf), a relocatable interpreter that only starts through a launcher that
+passes its library path (the Builder Toolbox build: a venv made from it cannot find
+`libpython`), and a bundled interpreter stripped of `ensurepip` (the desktop app).
+Every rejection is printed with its reason; when none passes, provisioning says so
+and suggests `uv python install 3.12`.
 
 So plain `pod up <wt>` builds the cheap venv for you but **fails loud** if the
 dist is missing — pointing you at the slow build — while `pod up <wt> --provision`
@@ -218,14 +235,29 @@ response text and transport failures never include the authenticated URL.
 - **Payload** — the booted pod *is* the worktree's `.venv/bin/kirocrew gateway`. If
   the worktree's gateway can't start (bad import, broken config, unbuilt dist), the
   pod can't come up — **and that is correct**. `pod up` detects the crash fast,
-  prints the gateway's own journal, stops the half-started unit, and tells you this
-  is the worktree build failing — not the pod tool.
+  prints the gateway's own journal, and tells you this is the worktree build failing
+  — not the pod tool. It stops a unit it started itself, so a crash-looping gateway
+  is not left respawning; it reclaims the isolated home only when it created that
+  home too, and a pod it did not start is left alone for `pod down` to retire. If a
+  stop itself fails the message says so rather than claiming the pod was handled.
+
+Inside this package the control plane is `kiro_crew.pod.runtime`, the one namespace
+the verbs, Dev Fleet and the tests use. It holds the core — names, the per-pod env
+file, worktree resolution, the `systemd --user` adapter and platform dispatch, the
+lifecycle locks, seed sanitization and the pod environment — and re-exports six
+owners that build on it: `runtime_ports`, `runtime_attestation`, `runtime_client`,
+`runtime_home`, `runtime_lifecycle` and `runtime_boot`. A patch of a function or
+constant as `kiro_crew.pod.runtime.<name>` reaches the module that reads it; a
+module the runtime imports is patched by attribute (`runtime.time.sleep`), and
+rebinding it there is refused. What each owner
+holds is mapped in the Dev Fleet spec's
+[Pod runtime ownership](../../../docs/system-specs/modules/dev-fleet.md#pod-runtime-ownership).
 
 ## Mechanism (Linux `systemd --user`)
 
 `kirocrew pod install` writes a template unit `kirocrew-pod@.service` whose
 `ExecStart` re-enters `kirocrew pod _run <wt>` (boot logic lives in
-`kiro_crew.pod.runtime.boot`). Before each start, `pod up` writes a per-instance
+`kiro_crew.pod.runtime_boot.boot`, reached as `kiro_crew.pod.runtime.boot`). Before each start, `pod up` writes a per-instance
 drop-in that replaces the template's `ExecStart` with the resolved checkout's
 own `.venv/bin/kirocrew`; it refuses to fall back to a global install that may
 not understand the requested seed. `pod down` removes that drop-in and reloads
@@ -239,7 +271,7 @@ recreated the directory by reopening their audit log in append mode — and it a
 fired on the stop half of a `Restart=`, bringing the pod back on a home stripped
 of its sessions and config. So `kirocrew pod down` owns reclamation on every
 platform: it stops the service, waits for the unit's cgroup to drain, deletes the
-HOME through `runtime.cleanup_home` (which re-validates the name and refuses
+HOME through `runtime.cleanup_home` (defined in `runtime_home`; it re-validates the name and refuses
 `..`/absolute/empty, since teardown safety must not rely on systemd `%i`
 semantics), then VERIFIES the directory is gone and fails loudly if it is not.
 The trade is that a pod which goes away without a `down` — a crash, a raw
@@ -328,7 +360,7 @@ worktree build, and pinning a colliding pod's own `PORT=` remains the manual way
 | `KIROCREW_POD_LIVE_PORT` | `5476` | the port a pod must never bind |
 | `KIROCREW_POD_UNIT_PREFIX` | `kirocrew-pod` | service-manager unit/task prefix |
 | `KIROCREW_POD_PATH` | generated standard executable path | `PATH` handed to the booted gateway |
-| `KIROCREW_POD_HEALTH_SECS` | `90` | `pod up` health-wait budget; `--wait-secs` wins and the result is clamped to 5–3600 seconds |
+| `KIROCREW_POD_HEALTH_SECS` | `90` | `pod up` readiness budget: the pod must be serving AND have published a fresh internal-API credential within it. A pod still serving with no credential when it runs out fails with the same advice to raise the budget as a slow boot. `--wait-secs` wins and the result is clamped to 5–3600 seconds |
 | `KIROCREW_POD_BIN` | (auto) | binary baked into the Linux template unit; `pod up` replaces it with the worktree binary through a per-instance drop-in |
 | `KIROCREW_POD_KIRO_BIN` | (unset) | agent backend pinned into the service definition as `KIROCREW_KIRO_BIN` |
 
@@ -374,6 +406,13 @@ service-manager mechanics differ.
 | Memory / CPU ceiling | `MemoryMax` + `CPUQuota` (cgroup) | **not enforced** | memory + process cap (Job object); **no CPU cap** |
 | `pod api` / `pod token` | yes | yes | `token` yes, `api` **no** (needs an AF_UNIX dashboard socket) |
 
+Every backend keeps earlier starts' output: launchd and the Windows wrapper
+append each boot to the same `pod.out.log` / `pod.err.log`, and the user journal
+keeps the unit's past runs. So a failed `pod up` marks where this start begins
+(the files' sizes, or the time for `journalctl --since`) before it starts the
+pod, and shows only what this start wrote. An earlier start's `FATAL` stays in
+`pod logs`, not in this start's failure report.
+
 On a host with none of the three — a Linux box with no systemd on PATH, or any
 other platform — the verbs that touch a service manager **refuse with a single
 actionable line** and exit 1. They never raise a traceback, and `pod install`
@@ -404,7 +443,8 @@ Task Scheduler, and `kiro_crew.pod.windows` states the five consequences:
 - **No restart policy.** A crashed pod stays down, which removes launchd's
   restart-loop hazard entirely (a terminal refusal keeps its honest exit code —
   no exit-0 translation) but means the crash signal has to be recorded: the
-  wrapper writes the boot's exit code to `<prefix>.<name>.winresult`, and
+  `pod _run` producer writes the boot's exit code to `<prefix>.<name>.winresult`
+  on every exit of a claimed boot (the wrapper writes no sidecar), and
   `unit_state` reports `failed` when that code is non-zero and the supervised
   process is gone.
 - **No PID from the service manager, and no `exec`.** `schtasks /Query` reports
@@ -525,7 +565,8 @@ pod, mints `pod token` against it, and asserts `pod down` leaves no task, home
 or env file behind. The module is opt-in: it skips unless
 `KIROCREW_E2E_POD_WINDOWS=1` is set, because a bare `pytest` on a developer's
 Windows box must not register scheduled tasks. It is also one of the two entries
-on the root `conftest.py` host-service allowlist, whose guard otherwise refuses
+on the root `conftest.py` host-service allowlist (defined in
+`test/conftest_floor_services.py`), whose guard otherwise refuses
 any test that spawns `kirocrew pod up`, `down`, `install`, `prune` or `restart`
 as a child process, or `schtasks` with a `/Create`, `/Delete`, `/Run`, `/End` or
 `/Change` switch.
@@ -536,16 +577,49 @@ A pod started by a build without the lifetime-Job protocol has no `.winrun`
 proof. Updating the build cannot retroactively contain that process tree.
 `pod down` and a new `pod up` deliberately refuse its remaining task, HOME or
 sidecars. This also applies to an unresolved reservation after an uncertain
-`/Run`, or when startup cancellation could not be persisted. A scheduled boot
-that refuses a missing checkout, venv or built dist also leaves `reserved`:
-those checks run before the publisher claims the generation. The producer can
-still be writing its refusal note, and the outer wrapper writes `.winresult`
-after Python returns. Neither file proves generation-bound producer retirement.
-These failed boots still require the verified retirement below; deleting only
-`.winrun` is neither safe retirement nor sufficient to clear the other evidence.
-By contrast, a persisted `cancelled` start has never attempted `/Run`: fix the
-reported cleanup error and repeat `pod up` to finish its generation-checked
-cleanup and retry.
+`/Run`, or when startup cancellation could not be persisted.
+
+A scheduled boot claims its reservation as the producer's first act, before the
+checkout, venv and dist checks, so the record names the `pod _run` process (pid
+plus creation time). A refusal then ends with that producer writing `.winresult`
+and a `finished` receipt; `pod down` retires the generation once the kernel
+reports that exact process gone, and `pod up` admits a fresh generation. A
+producer still provisioning (`preparing`) is waited for, never killed; one that
+has already published its `finished` receipt is given the stop budget to exit
+on its own, because the receipt is its last write to the record but the boot's
+failure audit is logged after it, and it is ended only if it outlives that
+budget. The task wrapper writes no sidecar, so no write can land after the
+producer is proven gone. Within one boot session, three shapes still need the
+manual procedure: a `reserved` record nobody claimed (the task never launched
+Python, or was killed during interpreter start-up), a `preparing` record
+whose producer died after creating the HOME without its receipt, because the
+boot did not reach the point where it could say what it left running there,
+and a `ready` record whose supervisor died: the Job's name died with its
+handle, so `pod down` cannot drain the gateway, and `pod up` refuses to adopt
+that gateway or mint a token for it.
+
+After a full Windows restart, `pod down` recovers all three. Each record
+stores the kernel uptime (`GetTickCount64`) when it is reserved and again when
+it is claimed. That counter keeps counting through sleep and hibernation and
+starts again from zero only at a full boot, so a current uptime lower than the
+stored one proves a restart, and a restart ended every process the record names.
+A Fast Startup shutdown resumes the hibernated kernel and keeps the count, so
+it proves nothing; use **Restart**.
+`pod down` then writes a terminal receipt marked `rebooted` without opening any
+recorded pid, which may now belong to an unrelated process, and cleans up. A
+record from an older build has no uptime, and a reading that is higher, equal
+or unreadable proves nothing, so those keep the refusals above. The check can
+miss a restart: when the new session has already run longer than the old
+session had at the claim, the uptime is higher, and `pod down` still refuses. A
+`finished` receipt is that statement: the boot spawned no gateway and ended on
+its orderly refusal path, so its HOME is reclaimed. It does not cover a
+descendant of a process the boot started before any lifetime Job existed (the
+`kiro-cli` child-viability probe, which on Windows is killed but whose own
+children are not), the same residual the ready path's Job proof accepts for
+outside launch brokers. Deleting only `.winrun` is neither
+safe retirement nor sufficient to clear the other evidence. By contrast, a
+persisted `cancelled` start has never attempted `/Run`: fix the reported cleanup
+error and repeat `pod up` to finish its generation-checked cleanup and retry.
 
 For an uncontained or otherwise unprovable run, use this conservative manual
 procedure. It deletes the disposable pod's data, not the checkout. Save anything
@@ -591,7 +665,9 @@ Dev Fleet action, `pod up`, or manually launched wrapper.
    After the machine has restarted, before running any pod action, re-establish
    the same overrides and repeat step 1. Verify the task remains disabled (or
    absent) and no launcher has restarted the pod. If any of this is uncertain,
-   stop here and preserve its files.
+   stop here and preserve its files. If the pod has a `.winrun` record, run
+   `kirocrew pod down <name>` now: when it proves the restart it deletes the task,
+   HOME and sidecars itself and nothing below is needed. If it refuses, continue.
 
 4. Only after that verified retirement, delete the exact disabled task, if
    present, and verify its absence in Task Scheduler:
@@ -632,11 +708,19 @@ so pods used to fail with a bare `Failed to connect to bus: No medium found`.
 
 `runtime._systemctl_env()` backfills both when the socket
 (`$XDG_RUNTIME_DIR/bus`, else `/run/user/<uid>/bus`) actually exists; an
-explicitly-set value always wins. When the socket is genuinely absent — no login
-session and `Linger=no` — `require_systemd()` refuses with the fix
-(`loginctl enable-linger <user>`) instead of letting systemctl emit a message
-that names neither cause nor remedy. `kirocrew doctor` reports the same three
-states (present / absent / present-but-no-linger).
+explicitly-set value always wins. When the socket is genuinely absent the refusal
+depends on whether this host can have a per-user manager at all. With a manager
+unit installed — the template `user@.service`, or a hand-installed
+`user@<uid>.service` — the cause is a missing login session and `Linger=no`, so
+`require_systemd()` names the fix (`loginctl enable-linger <user>`). With no
+manager unit anywhere on systemd's load path, that remedy cannot work: there is
+no unit for linger to start, which is the case on Enterprise Linux 7 derivatives
+(RHEL 7, CentOS 7, Amazon Linux 2). `require_systemd()` then names the platform
+limit and points at `./dev-backend.sh` instead. `kirocrew doctor` checks for the
+manager unit BEFORE probing bus reachability, because a stray session
+`dbus-daemon` can create a socket on a host that has no manager behind it. With a
+manager unit present, doctor retains the shared probe's reachable / no-session /
+sandboxed-away / unclassified-failure diagnostics, and warns when linger is off.
 
 An explicitly-set `DBUS_SESSION_BUS_ADDRESS` stays trusted as an availability
 hint, because a stale address is never proof that no backend exists and that

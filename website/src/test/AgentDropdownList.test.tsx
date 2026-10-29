@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../components/AgentDropdownList'
+import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter , defaultWriteFailureOf } from '../components/AgentDropdownList'
 import type { AgentItem } from '../components/AgentDropdownList'
 
 // jsdom doesn't implement scrollIntoView
@@ -67,6 +67,18 @@ describe('AgentDropdownList', () => {
 })
 
 describe('AgentDropdownList namespaces (member vs template)', () => {
+  it('names a mate by its label alone; a template by its name', () => {
+    const rows: AgentItem[] = [
+      { name: 'mate', source: 'builtin', selection_kind: 'member', display_name: 'Pebble' },
+      { name: 'mate', source: 'kirocrew', selection_kind: 'template', display_name: 'Ignored' },
+    ]
+    render(<AgentDropdownList agents={rows} activeAgent="" defaultAgent="" onSelect={() => {}} />)
+    expect(screen.getByText('Pebble')).toBeInTheDocument()
+    expect(screen.queryByText('Ignored')).toBeNull()
+    // Only the template row reads `mate`: the crewmate's ID is not shown.
+    expect(screen.getAllByText('mate')).toHaveLength(1)
+  })
+
   const both: AgentItem[] = [
     { name: 'reviewer', source: 'kirocrew', selection_kind: 'member', description: 'My reviewer' },
     { name: 'reviewer', source: 'builtin', selection_kind: 'template', description: 'Shared template' },
@@ -76,7 +88,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
   it('groups by kind and keeps a same-name member and template as two rows', () => {
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     const groups = screen.getAllByRole('group')
-    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Crewmates', 'Agent templates'])
+    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Custom agents', 'Mates'])
     expect(screen.getAllByRole('option')).toHaveLength(3)
     expect(screen.getAllByText('reviewer')).toHaveLength(2)
   })
@@ -85,24 +97,24 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     // The header already says what each row IS; a grey "package" / "kirocrew"
     // tag beside it only asks the reader to decode a second vocabulary. The
     // templates group instead carries the one fact a first-time picker needs:
-    // a template runs on shared memory and enrols nothing.
+    // a custom agent is a reusable agent setup.
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     expect(screen.queryByText('package')).toBeNull()
     expect(screen.queryByText('kirocrew')).toBeNull()
-    expect(screen.getByText(/runs the shared template on shared memory/i)).toBeInTheDocument()
+    expect(screen.getByText(/a reusable agent setup/i)).toBeInTheDocument()
   })
 
   it('drops the header and the templates hint when the list holds one kind only', () => {
-    // With crewmates withheld (HIDE_CREWMATE_CHOICES) the list is templates
+    // With crewmates withheld (the default picker) the list is templates
     // only. A header then separates nothing and the hint contrasts a template
     // against a crewmate the list never shows, so both go; the accessible
     // group label stays, and the rows keep their grouped rendering (no origin
     // badge) so the flag flips nothing but the chrome.
     const templatesOnly = both.filter(a => a.selection_kind === 'template')
     render(<AgentDropdownList agents={templatesOnly} activeAgent="" defaultAgent="" onSelect={() => {}} />)
-    expect(screen.getByRole('group', { name: 'Agent templates' })).toBeInTheDocument()
-    expect(screen.queryByText('Agent templates')).toBeNull()
-    expect(screen.queryByText(/runs the shared template on shared memory/i)).toBeNull()
+    expect(screen.getByRole('group', { name: 'Custom agents' })).toBeInTheDocument()
+    expect(screen.queryByText('Custom agents')).toBeNull()
+    expect(screen.queryByText(/a reusable agent setup/i)).toBeNull()
     expect(screen.queryByText('package')).toBeNull()
     expect(screen.getAllByRole('option')).toHaveLength(2)
   })
@@ -115,27 +127,28 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
   it('reports the kind with the name, so the caller can send the namespace', () => {
     const onSelect = vi.fn()
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={onSelect} />)
+    // Templates lead the grouped list: [reviewer/template, test-writer, reviewer/member].
     const options = screen.getAllByRole('option')
     fireEvent.click(options[0])
-    fireEvent.click(options[1])
-    expect(onSelect).toHaveBeenNthCalledWith(1, 'reviewer', 'member')
-    expect(onSelect).toHaveBeenNthCalledWith(2, 'reviewer', 'template')
+    fireEvent.click(options[2])
+    expect(onSelect).toHaveBeenNthCalledWith(1, 'reviewer', 'template')
+    expect(onSelect).toHaveBeenNthCalledWith(2, 'reviewer', 'member')
   })
 
-  it('draws the roster avatar on a crewmate row and none on a template row', () => {
+  it('draws the roster avatar on a mate row and none on a template row', () => {
     // A member is a crewmate with a face; a template is a definition. The same
     // CrewAvatar the roster renders (a decorative img) sits before the name on
     // member rows only, so a same-name pair is told apart at a glance.
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     const options = screen.getAllByRole('option')
-    expect(options[0].querySelector('img')).not.toBeNull()
-    expect(options[1].querySelector('img')).toBeNull()
+    expect(options[0].querySelector('img')).toBeNull()
+    expect(options[2].querySelector('img')).not.toBeNull()
   })
 
   it('lights up only the row in the slot\'s recorded namespace', () => {
     render(<AgentDropdownList agents={both} activeAgent="reviewer" activeKind="template" defaultAgent="" onSelect={() => {}} />)
     const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
-    expect(selected).toEqual(['false', 'true', 'false'])
+    expect(selected).toEqual(['true', 'false', 'false'])
   })
 
   it('lights the member row when the slot recorded no namespace and a member holds the name', () => {
@@ -144,7 +157,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     // what actually runs; the same-name template must not read as current.
     render(<AgentDropdownList agents={both} activeAgent="reviewer" defaultAgent="" onSelect={() => {}} />)
     const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
-    expect(selected).toEqual(['true', 'false', 'false'])
+    expect(selected).toEqual(['false', 'false', 'true'])
   })
 
   it('lights the template row when the slot recorded no namespace and no member holds the name', () => {
@@ -154,7 +167,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     ]
     render(<AgentDropdownList agents={templateOnly} activeAgent="planner" defaultAgent="" onSelect={() => {}} />)
     const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
-    expect(selected).toEqual(['false', 'true'])
+    expect(selected).toEqual(['true', 'false'])
   })
 
   it('renders a flat list, with no group headers, for a name-only roster', () => {
@@ -171,13 +184,33 @@ describe('AgentDropdownList hosts own the scroll (#6375)', () => {
   // unbounded with no failing test.
   // vitest's cwd is website/ (the vitest config root), and import.meta.url is
   // not file-scheme under its transform, so resolve from cwd instead.
+  // ChatPane's picker menus live in its owner modules, so its host text is the
+  // facade joined with them.
+  const chatPaneSource = () => ['ChatPane.tsx',
+    'ChatPanePickerMenus.tsx',
+    'ChatPaneProps.ts',
+    'ChatPaneTranscript.tsx',
+    'useChatPaneDraft.ts',
+    'useChatPanePickers.ts',
+    'useChatPaneSend.ts',
+    'useChatPaneTurnControl.ts',
+    'useChatPaneUploads.ts',
+  ].map(f => readFileSync(join(process.cwd(), 'src', 'components', f), 'utf8')).join('\n')
+  const pages = join(process.cwd(), 'src', 'pages')
+  const ownerDir = join(pages, 'chat', 'page')
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the ChatPage row reads the page and those owners.
+  const chatPageSource = () => [
+    readFileSync(join(pages, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(ownerDir, f), 'utf8')),
+    ...readdirSync(pages).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => readFileSync(join(pages, f), 'utf8')),
+  ].join('\n')
   const hosts = [
-    ['ChatPage', join(process.cwd(), 'src', 'pages', 'ChatPage.tsx')],
-    ['ChatPane', join(process.cwd(), 'src', 'components', 'ChatPane.tsx')],
+    ['ChatPage', chatPageSource],
+    ['ChatPane', chatPaneSource],
   ] as const
 
-  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, file) => {
-    const src = readFileSync(file, 'utf8')
+  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, read) => {
+    const src = read()
     const sites = [...src.matchAll(/<AgentDropdownList[\s>]/g)]
     expect(sites.length).toBeGreaterThan(0)
     for (const site of sites) {
@@ -206,7 +239,7 @@ describe('AgentDropdownList default-agent affordance', () => {
 
   it('explains the two same-row markers rather than relying on colour alone', () => {
     render(<AgentDropdownList agents={agents} activeAgent="kirocrew" defaultAgent="kirocrew" onSelect={() => {}} />)
-    expect(screen.getByTitle('New sessions start with this agent')).toBeInTheDocument()
+    expect(screen.getByTitle('New sessions start with this custom agent')).toBeInTheDocument()
     expect(screen.getByTitle('Active in this session')).toBeInTheDocument()
   })
 })
@@ -217,7 +250,7 @@ describe('DefaultAgentRow', () => {
     // job is switching the agent for this session, and a bare icon can only put the
     // scope in a tooltip.
     render(<DefaultAgentRow agentName="reviewer" isDefault={false} onSetDefault={() => {}} />)
-    expect(screen.getByRole('button', { name: 'Set reviewer as default agent for new sessions' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Set reviewer as the default for new sessions' })).toBeInTheDocument()
   })
 
   it('writes the default when activated', () => {
@@ -227,14 +260,16 @@ describe('DefaultAgentRow', () => {
     expect(onSetDefault).toHaveBeenCalledTimes(1)
   })
 
-  it('reports the state instead of offering a no-op write once the agent holds it', () => {
+  it('reports the state as a status line, not a control, once the agent holds it', () => {
     // Clearing the default is destructive (the product ends up with none) and must not
-    // hide behind the same gesture that sets one. Only the Templates page clears it.
+    // hide behind the same gesture that sets one. Only the Templates page clears it, so
+    // the set state is not a button at all: a disabled one still read as a switch.
     const onSetDefault = vi.fn()
     render(<DefaultAgentRow agentName="reviewer" isDefault onSetDefault={onSetDefault} />)
-    const row = screen.getByRole('button', { name: 'Default agent for new sessions' })
-    expect(row).toBeDisabled()
-    expect(row).toHaveAttribute('aria-pressed', 'true')
+    // The row NAMES the agent it refers to, so the tick is never a guess about which row is meant.
+    const row = screen.getByRole('status')
+    expect(row).toHaveTextContent('reviewer is the default for new sessions')
+    expect(screen.queryByRole('button')).toBeNull()
     fireEvent.click(row)
     expect(onSetDefault).not.toHaveBeenCalled()
   })
@@ -250,9 +285,10 @@ describe('DefaultAgentRow', () => {
     expect(row).toHaveAttribute('tabindex', '-1')
   })
 
-  it('leaves the ring once it is disabled, so focus never stops on a dead row', () => {
+  it('leaves the ring once set, so focus never stops on a dead row', () => {
     render(<DefaultAgentRow agentName="reviewer" isDefault onSetDefault={() => {}} />)
-    expect(screen.getByRole('button')).not.toHaveAttribute('data-option')
+    expect(screen.getByRole('status')).not.toHaveAttribute('data-option')
+    expect(document.querySelector('[data-option]')).toBeNull()
   })
 })
 
@@ -260,7 +296,7 @@ describe('ManageAgentsFooter', () => {
   it('calls onManage when the link is activated', () => {
     const onManage = vi.fn()
     render(<ManageAgentsFooter onManage={onManage} />)
-    fireEvent.click(screen.getByText('Manage agents…'))
+    fireEvent.click(screen.getByText('Manage mates…'))
     expect(onManage).toHaveBeenCalledTimes(1)
   })
 
@@ -273,6 +309,25 @@ describe('ManageAgentsFooter', () => {
     // The write is fire-and-forget, so without this a rejected request looks exactly
     // like a successful one.
     render(<ManageAgentsFooter onManage={() => {}} error />)
-    expect(screen.getByRole('alert')).toHaveTextContent('Could not change the default agent')
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not change the default custom agent')
+  })
+
+  it('says what to do when the server gives a reason', () => {
+    // Each reason code the route answers becomes one line naming the next step;
+    // an unknown code keeps the plain failure.
+    const { rerender } = render(<ManageAgentsFooter onManage={() => {}} error={{ code: 'default_template_not_installed', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('atlas is not an installed custom agent. Install it, then try again.')
+    rerender(<ManageAgentsFooter onManage={() => {}} error={{ code: 'default_template_overlaid', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('your local settings file (config.local.json) sets it. Change it there.')
+    rerender(<ManageAgentsFooter onManage={() => {}} error={{ code: 'stale_binding', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('atlas changed just now. Reload, then try again.')
+    rerender(<ManageAgentsFooter onManage={() => {}} error={{ code: 'something_else', name: 'atlas' }} />)
+    expect(screen.getByRole('alert')).toHaveTextContent(/^Could not change the default custom agent/)
+  })
+
+  it('reads the reason code out of a rejected write', () => {
+    expect(defaultWriteFailureOf({ body: JSON.stringify({ code: 'stale_binding' }) }, 'atlas')).toEqual({ code: 'stale_binding', name: 'atlas' })
+    expect(defaultWriteFailureOf({ body: 'not json' }, 'atlas')).toEqual({ name: 'atlas' })
+    expect(defaultWriteFailureOf(new Error('boom'), 'atlas')).toEqual({ name: 'atlas' })
   })
 })

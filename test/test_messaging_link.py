@@ -238,19 +238,37 @@ class TestBindOriginMirror:
         assert bind_origin_mirror(sess, key="k", location=_HERE) is False
         assert sess.mirror_links["k"] == chosen
 
-    def test_the_unrouted_slack_placeholder_does_not_block_the_bind(self) -> None:
-        """``set_channel`` writes the namespaced bucket into ``slack_channel_id``.
-
-        ``get_mirror_link`` synthesizes a Slack link from that field whenever no
-        explicit mirror row exists, so the first turn of every new channel session
-        reads one back. An empty thread is Slack's own clear sentinel and never
-        enters the reverse index, so nothing can be delivered through it — it is
-        bookkeeping, not a binding.
+    def test_the_first_turns_bucket_row_does_not_block_the_bind(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """``set_channel`` writes the namespaced bucket into ``slack_channel_id``
+        with no thread, so every new channel session carries that row on its first
+        turn. It is not a binding: an empty thread is Slack's own clear sentinel and
+        never enters the reverse index, so nothing can be delivered through it. The
+        STORE reads it as no mirror -- ``SessionMap.get_mirror_link`` never
+        synthesizes a Slack mirror without a thread -- so this reader carries no
+        copy of that rule and sees ``None``. A Slack binding that names a thread is
+        deliberate and is left alone like any other.
         """
+        from kiro_crew.session_map import SessionMap
+
+        monkeypatch.setattr("kiro_crew.session_map.config_dir", lambda: tmp_path)
+        store = SessionMap()
         sess = _Sessions()
-        sess.mirror_links["k"] = ChannelLink("slack", channel_id="discord:c1")
-        assert bind_origin_mirror(sess, key="k", location=_HERE) is True
-        assert sess.mirror_links["k"] == _HERE
+        sess.get_mirror_link = store.get_mirror_link  # type: ignore[method-assign]
+        sess.set_mirror_link = store.set_mirror_link  # type: ignore[method-assign]
+        key = "discord:kirocrew:direct:u1"
+        store.set_slack_link(key, "", "discord:u1")
+        assert store.get_mirror_link(key) is None
+        assert bind_origin_mirror(sess, key=key, location=_HERE) is True
+        assert store.get_mirror_link(key) == _HERE
+
+        threaded = "discord:kirocrew:direct:u2"
+        store.set_slack_link(threaded, "1786300000.000100", "C0OPS")
+        assert bind_origin_mirror(sess, key=threaded, location=_HERE) is False
+        assert store.get_mirror_link(threaded) == ChannelLink(
+            "slack", channel_id="C0OPS", thread_id="1786300000.000100"
+        )
 
     def test_a_unified_bucket_is_never_bound(self) -> None:
         """``dm_scope="unified"`` collapses every user's DMs into one bucket.
@@ -505,3 +523,66 @@ class TestUnbindReasonVocabulary:
             "unbind reasons must come from messaging.link's UNBIND_REASON_* "
             f"constants, not bare literals: {offenders}"
         )
+
+
+class TestChannelLinkPrincipal:
+    """``ChannelLink.principal``: recorded beside the location, never part of it."""
+
+    def test_equality_is_the_location_alone(self) -> None:
+        """Every binding match in the map and the resume paths compares links by
+        value, so a recorded peer must not make one location read as two."""
+        bare = ChannelLink("discord", channel_id="dm-9")
+        recorded = ChannelLink("discord", channel_id="dm-9", principal="42")
+        other_peer = ChannelLink("discord", channel_id="dm-9", principal="77")
+        assert bare == recorded == other_peer
+        assert recorded != ChannelLink("discord", channel_id="dm-8", principal="42")
+
+    def test_the_record_serializes_only_when_present(self) -> None:
+        bare = ChannelLink("discord", channel_id="dm-9")
+        assert bare.to_dict() == {
+            "channel_type": "discord",
+            "channel_id": "dm-9",
+            "thread_id": None,
+        }
+        recorded = ChannelLink("discord", channel_id="dm-9", principal="42")
+        assert recorded.to_dict()["principal"] == "42"
+
+    def test_the_record_survives_a_round_trip(self) -> None:
+        recorded = ChannelLink("discord", channel_id="dm-9", principal="42")
+        back = ChannelLink.from_dict(recorded.to_dict())
+        assert back == recorded and back.principal == "42"
+
+    def test_a_row_written_without_the_field_reads_as_naming_nobody(self) -> None:
+        legacy = {"channel_type": "discord", "channel_id": "dm-9", "thread_id": None}
+        assert ChannelLink.from_dict(legacy).principal is None
+        # An empty string stored by any writer is the same absence, not a peer.
+        assert ChannelLink.from_dict({**legacy, "principal": ""}).principal is None
+
+    def test_the_admission_rides_with_the_record_and_outside_equality(self) -> None:
+        """The gateway's MAC over the row travels like the principal: emitted only
+        when set, read back verbatim, and never part of the location's identity."""
+        bare = ChannelLink("discord", channel_id="dm-9")
+        assert "admission" not in bare.to_dict()
+        signed = ChannelLink("discord", channel_id="dm-9", principal="42", admission="ab" * 32)
+        assert signed.to_dict()["admission"] == "ab" * 32
+        back = ChannelLink.from_dict(signed.to_dict())
+        assert back.admission == "ab" * 32 and back.principal == "42"
+        assert back == bare
+        assert ChannelLink.from_dict({**bare.to_dict(), "admission": ""}).admission is None
+
+    def test_same_row_is_the_whole_row_where_equality_is_the_location(self) -> None:
+        """A rollback's ownership guard asks "is this still the row I wrote?", and
+        two rows at one location under different admissions -- a re-link after a key
+        rotation -- are different rows even though they are the same binding."""
+        mine = ChannelLink("discord", channel_id="dm-9", principal="42", admission="ab" * 32)
+        refreshed = ChannelLink("discord", channel_id="dm-9", principal="42", admission="cd" * 32)
+        other_peer = ChannelLink("discord", channel_id="dm-9", principal="55", admission="ab" * 32)
+        bare = ChannelLink("discord", channel_id="dm-9")
+        assert mine == refreshed == other_peer == bare, "location equality is unchanged"
+        assert mine.same_row(ChannelLink.from_dict(mine.to_dict()))
+        assert bare.same_row(ChannelLink("discord", channel_id="dm-9"))
+        assert not mine.same_row(refreshed)
+        assert not mine.same_row(other_peer)
+        assert not mine.same_row(bare) and not bare.same_row(mine)
+        assert not mine.same_row(ChannelLink("discord", channel_id="dm-10", principal="42"))
+        assert not mine.same_row(None) and not mine.same_row(mine.to_dict())

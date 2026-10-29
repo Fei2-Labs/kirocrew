@@ -15,7 +15,7 @@ import { test, expect, Page, APIRequestContext } from '@playwright/test'
  * elements — so a broken guide fails on measured pixels, not derivations.
  *
  * The three guides (see the algebra comment on renderFolderHeader in
- * src/pages/ChatSidebar.tsx, and website/scripts/capture-folder-glyph.mjs
+ * src/pages/chat-sidebar/folderBlocks.tsx, and website/scripts/capture-folder-glyph.mjs
  * under MEASURE=1 for the manual probe this automates):
  *   1. a folder GLYPH sits on the x of the `border-l` connector line that
  *      runs down under it (asserted at depth 1 AND depth 2);

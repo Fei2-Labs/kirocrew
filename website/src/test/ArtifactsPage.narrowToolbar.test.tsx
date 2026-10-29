@@ -22,6 +22,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, cleanup, fireEvent, within } from '@testing-library/react'
 import ArtifactsPage from '../pages/ArtifactsPage'
 import { renderWithProviders } from './helpers'
+import { PREVIEW_ARTIFACT_DEPLOY } from '../utils/previewFlags'
 import { api } from '../api/client'
 
 vi.mock('../api/client')
@@ -45,6 +46,10 @@ describe('ArtifactsPage filter toolbar at phone width', () => {
     vi.clearAllMocks()
     mobile = true
     localStorage.setItem('mc-artifacts-view', 'grid')
+    // Deploy sits behind the Artifact Deploy Feature Preview. This suite asks
+    // WHERE that control renders at each width, so it opts in; whether the
+    // control is offered at all is pinned in ArtifactsPage.test.tsx.
+    localStorage.setItem(PREVIEW_ARTIFACT_DEPLOY, '1')
     vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [] })
     vi.mocked(api).artifactSessionDocs = vi.fn().mockResolvedValue({ docs: [] })
   })
@@ -90,7 +95,7 @@ describe('ArtifactsPage filter toolbar at phone width', () => {
   it('pairs the Starred toggle with the view switcher on one justified row', async () => {
     renderWithProviders(<ArtifactsPage />)
     const starred = await waitFor(() => screen.getByRole('group', { name: /filter starred/i }))
-    const gallery = screen.getByRole('button', { name: /gallery/i })
+    const gallery = screen.getByRole('radio', { name: /gallery/i })
     const row = starred.parentElement as HTMLElement
     // Both answer "what am I looking at". One justified row gives the toolbar's
     // last line a left AND a right edge; alone, either control strands one side.

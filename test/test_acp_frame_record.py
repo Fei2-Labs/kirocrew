@@ -13,23 +13,28 @@ are ``test/test_acp_frame_replay.py``; this module covers only the recorder.
 from __future__ import annotations
 
 import asyncio
+import collections
 import errno
 import json
 import logging
 import os
 import stat
+import sys
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from stray_line_helpers import cyclic_gc_quiesced  # noqa: F401 - fixture
 
 from kiro_crew import security_posture
 from kiro_crew.acp import _frame_record
 from kiro_crew.acp import client as client_module
 from kiro_crew.acp import runtime as runtime_module
 from kiro_crew.acp_backends import ACP_BACKEND_KIRO, ACP_BACKENDS_KNOWN
+from kiro_crew.testing.wait import await_until
 
 # The recorder is POSIX-only (see the module docstring of ``_frame_record``):
 # every test here exercises the pinned-descriptor path. The one Windows
@@ -184,6 +189,136 @@ def test_a_frame_lands_in_the_backend_file(monkeypatch, tmp_path):
     lines = kiro_file.read_text(encoding="utf-8").splitlines()
     assert [json.loads(ln)["id"] for ln in lines] == [1, 2]
     assert json.loads((Path(dest) / "kas.jsonl").read_text(encoding="utf-8"))["id"] == 3
+
+
+def _nested(depth: int, *, as_dict: bool) -> object:
+    node: object = 1
+    for _ in range(depth):
+        node = {"a": node} if as_dict else [node]
+    return node
+
+
+@pytest.mark.usefixtures("cyclic_gc_quiesced")
+@pytest.mark.parametrize("as_dict", [True, False], ids=["dict-chain", "list-chain"])
+def test_a_frame_too_deep_to_scrub_is_skipped_cheaply_and_recording_continues(
+    monkeypatch, tmp_path, caplog, as_dict
+):
+    """One deep frame stood the whole recording down (a RecursionError on the
+    writer), and a dict chain under the limit costs seconds of scrub walk; the
+    pre-check refuses it before any redaction runs."""
+    _clean(monkeypatch)
+    redacted: list = []
+    real_redact = _frame_record.redact_text
+    monkeypatch.setattr(
+        _frame_record, "redact_text", lambda t: redacted.append(t) or real_redact(t)
+    )
+    deep = _nested(sys.getrecursionlimit() * 3, as_dict=as_dict)
+    dest = str(tmp_path / "frames")
+
+    with caplog.at_level(logging.WARNING, logger=_frame_record.__name__):
+        _frame_record.write_frame("kas", {"jsonrpc": "2.0", "id": 1, "params": deep}, dest)
+    # Structural, not a CPU ceiling: the walk that costs seconds never ran.
+    assert redacted == [], "the deep frame reached the scrub walk"
+    _frame_record.write_frame("kas", {"jsonrpc": "2.0", "id": 2}, dest)
+
+    assert not _frame_record._stood_down, "one deep frame stood the whole recording down"
+    lines = (Path(dest) / "kas.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(ln)["id"] for ln in lines] == [2]
+    assert [m for m in _recorder_messages(caplog) if "skipped" in m] == [
+        f"{_frame_record.ENV_RECORD_FRAMES}: skipped 1 frame(s) that could not be scrubbed, "
+        f"recording continues: frame nested deeper than {sys.getrecursionlimit() // 2} levels"
+    ]
+
+
+def _recorder_messages(caplog) -> list[str]:
+    """The recorder's own records: caplog's root handler also captures a
+    WARNING another logger or thread emits inside the window."""
+    return [r.getMessage() for r in caplog.records if r.name == _frame_record.__name__]
+
+
+def _skip_counts(caplog) -> list[str]:
+    return [
+        m.split("skipped ", 1)[1].split(" ", 1)[0]
+        for m in _recorder_messages(caplog)
+        if "could not be scrubbed" in m
+    ]
+
+
+def test_skip_warnings_are_rate_limited_and_carry_the_count(monkeypatch, tmp_path, caplog):
+    _clean(monkeypatch)
+    monkeypatch.setattr(
+        _frame_record, "scrub_frame", lambda frame: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    dest = str(tmp_path / "frames")
+    with caplog.at_level(logging.WARNING, logger=_frame_record.__name__):
+        for _ in range(3):
+            _frame_record.write_frame("kas", {"id": 1}, dest)
+        monkeypatch.setattr(_frame_record, "SKIP_WARNING_INTERVAL_SECS", 0.0)
+        _frame_record.write_frame("kas", {"id": 1}, dest)
+    # The first skip warns; the next two are held and folded into the next one.
+    assert _skip_counts(caplog) == ["1", "3"]
+    assert not _frame_record._stood_down, "a frame fault is not a destination fault"
+
+
+def test_a_held_skip_count_is_logged_when_recording_stands_down(monkeypatch, tmp_path, caplog):
+    """A burst after the last warning was folded into a warning that never came,
+    so the corpus showed one gap where there were many."""
+    _clean(monkeypatch)
+    monkeypatch.setattr(
+        _frame_record, "scrub_frame", lambda frame: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    dest = str(tmp_path / "frames")
+    with caplog.at_level(logging.WARNING, logger=_frame_record.__name__):
+        for _ in range(3):
+            _frame_record.write_frame("kas", {"id": 1}, dest)
+        _frame_record._stand_down(OSError("disk gone"))
+    assert _skip_counts(caplog) == ["1", "2"]
+
+
+def test_a_held_skip_count_is_logged_by_the_idle_writer_once_due(monkeypatch, tmp_path, caplog):
+    """No further frame needs to arrive: the writer's idle pass reports it."""
+    _clean(monkeypatch)
+    monkeypatch.setattr(
+        _frame_record, "scrub_frame", lambda frame: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    dest = str(tmp_path / "frames")
+    with caplog.at_level(logging.WARNING, logger=_frame_record.__name__):
+        for _ in range(4):
+            _frame_record.write_frame("kas", {"id": 1}, dest)
+        assert _skip_counts(caplog) == ["1"]
+        monkeypatch.setattr(_frame_record, "SKIP_WARNING_INTERVAL_SECS", 0.0)
+        _frame_record._flush_skipped_frames()
+    assert _skip_counts(caplog) == ["1", "3"]
+
+
+def test_a_stopping_writer_logs_a_held_skip_count(monkeypatch, tmp_path, caplog):
+    _clean(monkeypatch)
+    monkeypatch.setattr(
+        _frame_record, "scrub_frame", lambda frame: (_ for _ in ()).throw(ValueError("bad"))
+    )
+    dest = str(tmp_path / "frames")
+    # The idle path only: an empty backlog and a stop already requested.
+    writer = SimpleNamespace(items=collections.deque(), stop=threading.Event())
+    writer.stop.set()
+    with caplog.at_level(logging.WARNING, logger=_frame_record.__name__):
+        for _ in range(2):
+            _frame_record.write_frame("kas", {"id": 1}, dest)
+        _frame_record._drain(writer)
+    assert _skip_counts(caplog) == ["1", "1"]
+
+
+def test_a_lone_surrogate_is_recorded_escaped_not_a_stand_down(monkeypatch, tmp_path):
+    """A tool's text cut mid-emoji keeps a lone surrogate through ``json.loads``;
+    strict UTF-8 refused it at write time and stood recording down."""
+    _clean(monkeypatch)
+    dest = str(tmp_path / "frames")
+    _frame_record.write_frame("kas", {"id": 1, "text": "cut \ud83d"}, dest)
+    _frame_record.write_frame("kas", {"id": 2}, dest)
+
+    assert not _frame_record._stood_down
+    lines = (Path(dest) / "kas.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(ln)["id"] for ln in lines] == [1, 2]
+    assert json.loads(lines[0])["text"] == "cut \ud83d"
 
 
 def test_a_credential_is_scrubbed_before_it_is_written(monkeypatch, tmp_path):
@@ -778,12 +913,12 @@ async def test_record_frame_returns_while_the_writer_is_wedged(monkeypatch, tmp_
         monkeypatch.setattr(_frame_record, "write_frame", slow)
         try:
             for i in range(3):
-                await asyncio.wait_for(
+                await asyncio.wait_for(  # flake-ok: latency assertion – record_frame must not await write_frame; wedged writer takes ~10 s
                     _frame_record.record_frame("kas", {"jsonrpc": "2.0", "id": i}), timeout=0.5
                 )
         finally:
             gate.set()
-        await asyncio.wait_for(_frame_record.flush_for_tests(), timeout=10)
+        await await_until(asyncio.ensure_future(_frame_record.flush_for_tests()))
         ids = [json.loads(ln)["id"] for ln in (tmp_path / "kas.jsonl").read_text().splitlines()]
         assert ids == [0, 1, 2], "frames must land in arrival order"
 
@@ -799,7 +934,9 @@ async def test_a_full_queue_drops_and_stands_down_instead_of_waiting(monkeypatch
         monkeypatch.setattr(_frame_record, "write_frame", lambda *a: gate.wait(timeout=10))
         try:
             for i in range(4):
-                await asyncio.wait_for(_frame_record.record_frame("kas", {"id": i}), timeout=0.5)
+                await asyncio.wait_for(  # flake-ok: latency assertion – record_frame must not await write_frame; wedged writer takes ~10 s
+                    _frame_record.record_frame("kas", {"id": i}), timeout=0.5
+                )
         finally:
             gate.set()
         assert _frame_record.recording_destination() == "", "an overflow must stand recording down"
@@ -824,7 +961,7 @@ async def test_a_burst_of_large_frames_is_bounded_by_bytes_not_count(monkeypatch
         monkeypatch.setattr(_frame_record, "write_frame", lambda *a: gate.wait(timeout=10))
         try:
             for i in range(3):
-                await asyncio.wait_for(
+                await asyncio.wait_for(  # flake-ok: latency assertion – record_frame must not await write_frame; wedged writer takes ~10 s
                     _frame_record.record_frame("kas", {"id": i}, wire_bytes=1024), timeout=0.5
                 )
                 if i < 2:
@@ -990,7 +1127,7 @@ async def test_one_failure_logs_once_and_discards_the_backlog(monkeypatch, tmp_p
             for i in range(5):
                 await _frame_record.record_frame("kas", {"id": i}, wire_bytes=10)
             gate.set()
-            await asyncio.wait_for(_frame_record.flush_for_tests(), timeout=10)
+            await await_until(asyncio.ensure_future(_frame_record.flush_for_tests()))
         assert attempts == [0], f"queued frames were retried after the stand-down: {attempts}"
         warnings = [r for r in caplog.records if "recording failed" in r.getMessage()]
         assert len(warnings) == 1, [r.getMessage() for r in warnings]
@@ -1302,6 +1439,131 @@ def test_a_hard_link_planted_inside_the_directory_is_refused(monkeypatch, tmp_pa
     assert _frame_record.recording_destination() == ""
 
 
+# ── the window between creating the destination and opening it ──────────────
+
+
+def _vanishing_mkdir(leaf: str, *, once: bool, counter: list[int], plant: Path | None = None):
+    """A ``mkdir`` that makes *leaf* and then removes it again, as a remover would.
+
+    The removal lands exactly where a concurrent one would: after the directory
+    exists and before anything has opened it. Deterministic, so the window is a
+    test fixture rather than something to reproduce under load. With *plant*, a
+    link to that path is left at the name instead of nothing, which is the other
+    thing an actor who won the race can do.
+    """
+    real_mkdir = os.mkdir
+
+    def vanishing(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+        if name != leaf or (once and counter):
+            return
+        counter.append(1)
+        os.rmdir(name, dir_fd=dir_fd)  # type: ignore[arg-type]
+        if plant is not None:
+            os.symlink(plant, name, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    return vanishing
+
+
+def test_a_destination_removed_between_its_mkdir_and_its_open_is_re_created(monkeypatch, tmp_path):
+    """Creating the destination and opening it are two syscalls.
+
+    A removal between them is an interleaving no ordering closes, and tolerating
+    only the `FileExistsError` half handled a concurrent writer while a concurrent
+    remover reached `_stand_down` -- one lost race retired recording for the life
+    of the process. The pair is re-run, so the frame lands.
+    """
+    _clean(monkeypatch)
+    dest = tmp_path / "frames"
+    removals: list[int] = []
+    monkeypatch.setattr(os, "mkdir", _vanishing_mkdir("frames", once=True, counter=removals))
+
+    _frame_record.write_frame("kas", {"jsonrpc": "2.0"}, str(dest))
+
+    assert removals == [1], "the race did not happen, so the retry is not what passed"
+    lines = (dest / "kas.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(lines[0]) == {"jsonrpc": "2.0"}
+
+
+def test_a_destination_removed_on_every_attempt_names_the_whole_path(monkeypatch, tmp_path):
+    """Exhaustion reports the PATH, not the bare leaf `openat` was handed.
+
+    `'frames'` on its own names no directory and reads as a working-directory
+    bug, which is the unreadable half of the class this recorder shares with the
+    decision log. The attempt count is asserted exactly: a destination something
+    keeps removing must be reported, not spun on.
+    """
+    _clean(monkeypatch)
+    dest = tmp_path / "frames"
+    removals: list[int] = []
+    monkeypatch.setattr(os, "mkdir", _vanishing_mkdir("frames", once=False, counter=removals))
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        _frame_record._pin_destination(dest)
+
+    assert excinfo.value.filename == str(dest)
+    assert "removed between its creation and its open" in str(excinfo.value)
+    assert len(removals) == _frame_record._CREATE_ATTEMPTS == 3
+    assert not dest.exists()
+
+
+def test_a_parent_removed_under_its_pin_is_reported_rather_than_re_attempted(monkeypatch, tmp_path):
+    """Nothing can be created inside an unlinked directory, so this reports at once.
+
+    The retry is for a destination that was removed after it existed; a pinned
+    parent that is gone makes every further attempt fail identically, and the
+    report carries the whole path the errno omits.
+    """
+    _clean(monkeypatch)
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    dest = parent / "frames"
+    attempts: list[int] = []
+    real_mkdir = os.mkdir
+
+    def removing_the_parent(name: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
+        if name == "frames":
+            attempts.append(1)
+            os.rmdir(parent)
+        real_mkdir(name, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "mkdir", removing_the_parent)
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        _frame_record._pin_destination(dest)
+
+    assert excinfo.value.filename == str(dest)
+    assert "cannot be created in it" in str(excinfo.value)
+    assert attempts == [1]
+
+
+def test_a_link_planted_at_the_destination_mid_sequence_is_refused_not_re_attempted(
+    monkeypatch, tmp_path
+):
+    """Only a REMOVAL is re-run. A link that replaces the directory is refused, once.
+
+    This is the property that makes the retry safe: it is reached from
+    `FileNotFoundError` alone, so an actor who removes the destination and plants
+    a link where it was meets `O_NOFOLLOW` on the first attempt and gets the
+    module's refusal, with nothing recorded through what the link points at.
+    """
+    _clean(monkeypatch)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    dest = tmp_path / "frames"
+    removals: list[int] = []
+    monkeypatch.setattr(
+        os, "mkdir", _vanishing_mkdir("frames", once=True, counter=removals, plant=victim)
+    )
+
+    with pytest.raises(OSError) as excinfo:
+        _frame_record._pin_destination(dest)
+
+    assert "symbolic link or not a directory" in str(excinfo.value)
+    assert removals == [1]
+    assert list(victim.iterdir()) == [], "the retry wrote through the planted link"
+
+
 # ── never raises ─────────────────────────────────────────────────────────────
 
 
@@ -1578,9 +1840,11 @@ def test_both_transports_record_their_inbound_frames() -> None:
     other two backends unrecordable, which is invisible until someone tries to
     refresh their corpus.
     """
-    for module in (runtime_module, client_module):
-        path = Path(module.__file__ or "")
-        source = path.read_text(encoding="utf-8")
+    client_family = (client_module, *(sys.modules[n] for n in client_module._CLIENT_OWNERS))
+    runtime_family = (runtime_module, *(sys.modules[n] for n in runtime_module._RUNTIME_OWNERS))
+    for modules in (runtime_family, client_family):
+        path = Path(modules[0].__file__ or "")
+        source = "".join(Path(m.__file__ or "").read_text(encoding="utf-8") for m in modules)
         assert "await record_frame(" in source, (
             f"{path.name} does not await record_frame; the frames its backends read "
             "cannot be recorded, or the call blocks the event loop"

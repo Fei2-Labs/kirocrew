@@ -144,6 +144,14 @@ class TestNightlyPermissions:
             "contents": "read",
             "attestations": "write",
         }
+        # The two single-arch macOS legs call the same reusable workflow and
+        # need the same three grants (the notarize job attests their DMG too).
+        for job in ("  sign-and-notarize-arm64:", "  sign-and-notarize-x64:"):
+            assert _permission_block(lines, job) == {
+                "id-token": "write",
+                "contents": "read",
+                "attestations": "write",
+            }
 
 
 class TestReleasePermissions:
@@ -202,11 +210,18 @@ class TestReleasePermissions:
             "id-token": "write",
             "attestations": "write",
         }
-        assert _permission_block(lines, "  sign-and-notarize:") == {
-            "id-token": "write",
-            "contents": "read",
-            "attestations": "write",
-        }
+        # The three macOS callers (universal + one per single arch) grant the
+        # same three: each notarize job attests its own shipping DMG.
+        for job in (
+            "  sign-and-notarize:",
+            "  sign-and-notarize-arm64:",
+            "  sign-and-notarize-x64:",
+        ):
+            assert _permission_block(lines, job) == {
+                "id-token": "write",
+                "contents": "read",
+                "attestations": "write",
+            }
         assert _permission_block(lines, "  github-release:") == {
             "contents": "write",
         }
@@ -234,6 +249,16 @@ class TestReusableWorkflowPermissions:
         """
         assert _workflow_permissions("build-wheel.yml") == {"contents": "read"}
         assert _workflow_permissions("build-desktop.yml") == {"contents": "read"}
+
+    def test_ffmpeg_decoder_only_publish_can_write(self) -> None:
+        """The decoder build legs stay read-only; only `publish` writes, and
+        only release contents -- never OIDC."""
+        name = "build-ffmpeg-decoder.yml"
+        lines = _lines(name)
+        assert _workflow_permissions(name) == {"contents": "read"}
+        assert _permission_block(lines, "  build:") is None
+        assert _permission_block(lines, "  verify-windows:") is None
+        assert _permission_block(lines, "  publish:") == {"contents": "write"}
 
     def test_build_desktop_has_no_windows_leg(self) -> None:
         """The credential-free build workflow must not build Windows.

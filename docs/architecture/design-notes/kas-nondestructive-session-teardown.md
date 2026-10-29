@@ -216,8 +216,8 @@ per sub-agent and forgoes continuation.
 
 ## The Crew side, for context
 
-Crew keeps per-backend capability sets in `src/kiro_crew/agent_sdk/backends.py`,
-and all three named below live there. Two of them answer this question
+Crew keeps per-backend capability sets behind `src/kiro_crew/agent_sdk/backends.py`,
+and all three named below live in `src/kiro_crew/agent_sdk/backends_sessions.py`. Two of them answer this question
 differently, and the pair is the precise statement of the gap:
 
 - `ACP_BACKENDS_SESSION_EVICTION` — **KAS is a member.** Its teardown genuinely
@@ -243,21 +243,21 @@ edit:
 
 | # | Change | Where |
 |---|---|---|
-| 1 | Add KAS to `ACP_BACKENDS_SESSION_SHARING` | `agent_sdk/backends.py` |
+| 1 | Add KAS to `ACP_BACKENDS_SESSION_SHARING` | `agent_sdk/backends_sessions.py` |
 | 2 | Point `KasHarness.teardown` at the new verb | `acp/harness/kas.py` |
 | 3 | Add the method constant beside `METHOD_KAS_SESSION_DELETE` | `acp/types.py` |
-| 4 | Add KAS to `ACP_BACKENDS_HARNESS_OWNED_SESSIONS` | `agent_sdk/backends.py` |
+| 4 | Add KAS to `ACP_BACKENDS_HARNESS_OWNED_SESSIONS` | `agent_sdk/backends_sessions.py` |
 | 5 | Teach the fake backend to answer the new verb | `testing/fake_acp_backend.py` |
 | — | The card's "sub-agent continuation" cell | nothing to edit |
 
 Change 1 is the switch, and it is what the request is for. It opens the
 eligibility chain that decides whether a sub-agent gets a shared session:
 `AcpProvider.is_session_sharing_eligible` reads the set, `session_allocation`
-reads the provider, and `subagent_manager/run.py` reads that.
+reads the provider, and `subagent_manager/run_start.py` (`_should_use_session_sharing_impl`) reads that.
 
 Change 4 is a second, independent membership, and the request does not work
 without it. KAS sits outside `ACP_BACKENDS_HARNESS_OWNED_SESSIONS`, which puts it
-on the kiro-family arm of Crew's resume path in `acp/client.py`: that arm gates a
+on the kiro-family arm of Crew's resume path in `acp/client_start.py`: that arm gates a
 `session/load` on a **kiro-cli** transcript file under `kiro_sessions_dir()` and
 sends a `_kiro.dev/session_file` naming it. For a host that keeps its own store,
 that file is not there and the load is skipped in favour of a fresh session. So

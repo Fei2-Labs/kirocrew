@@ -19,10 +19,16 @@ import pytest
 
 from kiro_crew.execution_context import execution_for_store
 from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 # ``SubagentManager.spawn`` refuses while the host looks short of memory, which
 # is the runner's state, not this test's input.
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
+
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
 
 
 def _mock_sessions(served_model: str) -> MagicMock:
@@ -142,6 +148,93 @@ async def test_provenance_written_once_before_the_spawn_event() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", ["high", ""])
+async def test_provenance_write_records_the_runs_reasoning_effort(effort: str) -> None:
+    """The run's per-spawn reasoning effort rides the same write as
+    ``requested_model``, so a continuation after a gateway restart restores it
+    from state.json. A run spawned without one records ``""``."""
+    sessions = _mock_sessions(served_model="model-served")
+    manager = SubagentManager(
+        sessions=sessions,
+        ctx_builder=_mock_ctx_builder(),
+        is_yolo=lambda: True,
+    )
+    info = SubagentInfo(
+        execution_context=execution_for_store(""),
+        id="prov02",
+        task="provenance task",
+        model="model-req",
+    )
+    info.reasoning_effort = effort
+    manager._log_spawned(info)
+    manager._agents[info.id] = info
+    writes: list[dict[str, Any]] = []
+
+    def _spy_update(agent_id: str, **kwargs: Any) -> bool:
+        writes.append(dict(kwargs))
+        return True
+
+    with (
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+        patch("kiro_crew.subagent.update_state", side_effect=_spy_update),
+    ):
+        await manager._run_inner(info, f"subagent:{info.id}")
+
+    prov_writes = [kw for kw in writes if "requested_model" in kw]
+    assert len(prov_writes) == 1, f"expected one provenance write, got {prov_writes}"
+    assert prov_writes[0]["requested_model"] == "model-req"
+    assert prov_writes[0].get("reasoning_effort") == effort, prov_writes[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller_pin", "role_pin"),
+    [("model-req", ""), ("", "role-model-x"), ("model-req", "role-model-x")],
+    ids=["caller-pin", "role-pin", "caller-pin-over-role-pin"],
+)
+async def test_provenance_write_records_the_callers_own_model_pin(
+    caller_pin: str, role_pin: str
+) -> None:
+    """``requested_model`` is the effective pin (the caller's, else the
+    ``agent.role_models['subagent']`` pin). A continuation after a gateway
+    restart has to tell the two apart, so the same write records the caller's
+    own pin as ``pinned_model``: a run spawned under a role pin records ``""``."""
+    sessions = _mock_sessions(served_model="model-served")
+    manager = SubagentManager(
+        sessions=sessions,
+        ctx_builder=_mock_ctx_builder(),
+        is_yolo=lambda: True,
+    )
+    info = SubagentInfo(
+        execution_context=execution_for_store(""),
+        id="prov03",
+        task="provenance task",
+        model=caller_pin,
+    )
+    manager._log_spawned(info)
+    manager._agents[info.id] = info
+    writes: list[dict[str, Any]] = []
+
+    def _spy_update(agent_id: str, **kwargs: Any) -> bool:
+        writes.append(dict(kwargs))
+        return True
+
+    with (
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+        patch("kiro_crew.subagent.update_state", side_effect=_spy_update),
+        patch("kiro_crew.subagent._subagent_default_model", return_value=role_pin),
+    ):
+        await manager._run_inner(info, f"subagent:{info.id}")
+
+    prov_writes = [kw for kw in writes if "requested_model" in kw]
+    assert len(prov_writes) == 1, f"expected one provenance write, got {prov_writes}"
+    assert prov_writes[0]["requested_model"] == (caller_pin or role_pin)
+    assert prov_writes[0].get("pinned_model") == caller_pin, prov_writes[0]
+
+
+@pytest.mark.asyncio
 async def test_provenance_write_retries_once_on_transient_failure() -> None:
     """The pre-spawn write is the SINGLE owner of the provenance fields, so a
     transient failure gets its second chance from that write's own bounded
@@ -249,6 +342,95 @@ async def test_provenance_write_retries_on_silently_skipped_merge() -> None:
     assert provenance_attempts["n"] == 2, "a reported skip must trigger the retry"
     assert len(landed) == 1 and landed[0]["requested_model"] == "model-req"
     assert info.error == ""
+
+
+def _session_record_manager(agent_id: str) -> tuple[SubagentManager, SubagentInfo]:
+    """A manager whose provider recorded a project cwd, for the session-record
+    write that is the only writer of ``cwd`` on the spawn path."""
+    sessions = _mock_sessions(served_model="model-served")
+    # The project the provider runs in is what the session record carries as
+    # ``cwd`` (run_turn.py takes it from ``client.cwd``).
+    sessions.get_or_create.return_value[0].cwd = "/projects/chess"
+    manager = SubagentManager(
+        sessions=sessions,
+        ctx_builder=_mock_ctx_builder(),
+        is_yolo=lambda: True,
+    )
+    info = SubagentInfo(
+        execution_context=execution_for_store(""),
+        id=agent_id,
+        task="session record retry task",
+    )
+    manager._log_spawned(info)
+    manager._agents[info.id] = info
+    return manager, info
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_attempt", ["raises", "skips"])
+async def test_session_record_write_retries_once(first_attempt: str) -> None:
+    """The session record is the SINGLE owner of ``cwd`` and ``session_id``, so a
+    transient failure -- an exception (a Windows sharing violation that outlived
+    the rename retry) or a reported skip (``update_state`` returned False because
+    the state was unreadable) -- gets one retry, exactly like the provenance
+    write, so a single failed attempt does not leave a record without
+    ``cwd``."""
+    manager, info = _session_record_manager(f"sessrt-{first_attempt}")
+    attempts = {"n": 0}
+    landed: list[dict[str, Any]] = []
+
+    def _flaky_update(agent_id: str, **kwargs: Any) -> bool:
+        if "session_id" in kwargs:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                if first_attempt == "raises":
+                    raise PermissionError("sharing violation")
+                return False
+            landed.append(dict(kwargs))
+        return True
+
+    with (
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+        patch("kiro_crew.subagent.update_state", side_effect=_flaky_update),
+    ):
+        await manager._run_inner(info, f"subagent:{info.id}")
+
+    assert attempts["n"] == 2, "a failed session record write must be retried once"
+    assert len(landed) == 1 and landed[0]["cwd"] == "/projects/chess"
+    assert info.error == ""
+
+
+@pytest.mark.asyncio
+async def test_session_record_write_that_never_lands_is_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bounded: two failed attempts and the run goes on (persistence never blocks
+    the spawn), but the loss is logged at WARNING so a missing ``cwd`` is visible
+    in a CI job log."""
+    manager, info = _session_record_manager("sessrt-lost")
+    attempts = {"n": 0}
+
+    def _broken_update(agent_id: str, **kwargs: Any) -> bool:
+        if "session_id" in kwargs:
+            attempts["n"] += 1
+            raise PermissionError("sharing violation")
+        return True
+
+    with (
+        caplog.at_level("WARNING", logger="kiro_crew"),
+        patch("kiro_crew.subagent.Stats"),
+        patch("kiro_crew.subagent.sel"),
+        patch("kiro_crew.subagent.update_state", side_effect=_broken_update),
+    ):
+        await manager._run_inner(info, f"subagent:{info.id}")
+
+    assert attempts["n"] == 2, "the retry is bounded at one"
+    assert info.error == ""
+    warnings = [
+        r for r in caplog.records if r.levelname == "WARNING" and "Session record" in r.getMessage()
+    ]
+    assert len(warnings) == 1 and info.id in warnings[0].getMessage()
 
 
 def _mock_sessions_with_tool_event(served_model: str, event: Any) -> MagicMock:
@@ -506,7 +688,12 @@ async def test_recovery_gate_respects_live_drain_latch() -> None:
             ),
             patch.object(manager, "_write_tombstone"),
         ):
-            await manager._run(info)
+            if expect_recovery:
+                # A hand-off to recovery ends the original run cancelled.
+                with pytest.raises(asyncio.CancelledError):
+                    await manager._run(info)
+            else:
+                await manager._run(info)
 
         assert bool(recovery_calls) is expect_recovery, (
             f"latch={latch}: expected recovery_scheduled={expect_recovery}, "
@@ -990,10 +1177,10 @@ async def test_an_abandoned_state_writer_holds_the_conversation() -> None:
 
         # The zombie lands: the hold releases and the conversation is usable again.
         wedged.set()
-        for _ in range(200):
-            if info.id not in manager._abandoned_state_writers:
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(
+            lambda: info.id not in manager._abandoned_state_writers,
+            describe=lambda: f"abandoned writers: {sorted(manager._abandoned_state_writers)}",
+        )
     assert info.id not in manager._abandoned_state_writers, (
         "the hold outlived the worker -- a conversation would stay permanently "
         "un-promotable and un-releasable"
@@ -1020,7 +1207,10 @@ def test_no_bare_to_thread_update_state_outside_the_drained_helper() -> None:
     import ast
     from pathlib import Path
 
-    allowed = "_write_state_off_loop_impl"
+    allowed = {
+        "update_state": "_write_state_off_loop_impl",
+        "write_finished_result": "_write_finished_result_off_loop_impl",
+    }
     src = Path(__file__).resolve().parents[1] / "src" / "kiro_crew"
     assert src.is_dir(), src
 
@@ -1052,8 +1242,8 @@ def test_no_bare_to_thread_update_state_outside_the_drained_helper() -> None:
                 and fn.attr == "to_thread"
                 and node.args
                 and isinstance(node.args[0], ast.Name)
-                and node.args[0].id == "update_state"
-                and (not self.stack or self.stack[-1] != allowed)
+                and node.args[0].id in allowed
+                and (not self.stack or self.stack[-1] != allowed[node.args[0].id])
             ):
                 self.hits.append((self.stack[-1] if self.stack else "<module>", node.lineno))
             self.generic_visit(node)
@@ -1068,7 +1258,7 @@ def test_no_bare_to_thread_update_state_outside_the_drained_helper() -> None:
         # `ast.parse` over the whole package is by far the expensive part. A
         # substring miss cannot hide a call, because the pattern this gate looks
         # for spells both names literally.
-        if "to_thread" not in text or "update_state" not in text:
+        if "to_thread" not in text or not any(name in text for name in allowed):
             continue
         try:
             tree = ast.parse(text)
@@ -1171,10 +1361,10 @@ async def test_the_conversation_hold_covers_the_whole_drain_not_only_expiry() ->
             await task
         # Drained normally (never expired), so the one-shot recovery is intact.
         assert info._cancel_retry_used is False, "a completed drain must not burn the retry"
-        for _ in range(200):
-            if info.id not in manager._abandoned_state_writers:
-                break
-            await asyncio.sleep(0.01)
+        await async_wait_until(
+            lambda: info.id not in manager._abandoned_state_writers,
+            describe=lambda: f"abandoned writers: {sorted(manager._abandoned_state_writers)}",
+        )
     assert info.id not in manager._abandoned_state_writers, "hold outlived the worker"
     assert manager._conversation_busy(conv_key) is None
 
@@ -1185,20 +1375,17 @@ async def _await_off_loop_gate(entered: Any, what: str) -> None:
     The gate only fires when the write goes through ``asyncio.to_thread``, so an
     unbounded ``await entered.wait()`` turns a regression (the write moved back
     onto the loop) into a 120s pytest-timeout with no diagnosis -- three of those
-    is six minutes of a shared runner for one mistake. Five seconds is orders of
-    magnitude above the real gate latency (the write is a patched no-op reached
-    within one scheduling pass) and still fails in the same breath as the cause.
+    is six minutes of a shared runner for one mistake. The helper's lost-run bound
+    fails by name instead, naming the write that never left the loop.
     """
-    import asyncio
-
-    try:
-        await asyncio.wait_for(entered.wait(), timeout=5.0)
-    except (asyncio.TimeoutError, TimeoutError):  # pragma: no cover - regression path
-        raise AssertionError(
-            f"the {what} write never reached asyncio.to_thread, so it ran ON the "
-            "event loop -- update_state ends in a synchronous fsync and must go "
-            "through _write_state_off_loop (#6288, #7302)"
-        ) from None
+    await await_until(
+        entered,
+        what=(
+            f"the {what} write reaching asyncio.to_thread (a write that never gets there "
+            "ran ON the event loop; update_state ends in a synchronous fsync and must go "
+            "through _write_state_off_loop)"
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1482,11 +1669,11 @@ def test_no_on_loop_update_state_inside_a_coroutine() -> None:
     Scope-aware, so it is deterministic rather than a substring heuristic: only
     the INNERMOST enclosing frame counts, which is what makes a synchronous
     helper nested inside a coroutine (the shape a worker thread runs) not an
-    offender. The two retention writers -- ``_promote_conversation_impl`` and
-    ``release_conversation_impl`` -- are synchronous ``def``s, so they are
-    outside this gate's reach by that same rule; moving them is the rest of
-    this work and needs its own change (their other work, the ``SessionMap``
-    mutation, is required to stay on the loop).
+    offender. The retention writers are synchronous ``def``s, so they are
+    outside this gate's reach by that same rule: release's disk half
+    (``_release_disk_sync``) runs on a worker thread from every event-loop
+    caller, and ``_promote_conversation_impl`` stays on the loop by design (its
+    busy check, promotion and admission must commit with no await between).
     """
     import ast
     from pathlib import Path

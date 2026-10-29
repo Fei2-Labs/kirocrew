@@ -3,12 +3,12 @@
 ``chat_runner``'s post-turn persist blanks the caller-side model while a
 throttle fallback is active and leaves the row's attribution entirely to
 ``persist_token_record_async``'s ``model_source`` walk. That walk succeeds for a
-shallow provider, which is why the row usually carries the served id — but
-``_wrapper_chain`` collects at most 8 nodes, so a session whose provider has
-accumulated wrapper layers (session sharing, a channel link, a subagent
-companion) hides its model-bearing node past the cap. The walk then reports
-nothing, and the row lands blank: the turn's credits become unattributable even
-though the slot knew exactly which model served them.
+shallow provider, which is why the row usually carries the served id — but a
+walk over another module's object graph is a coincidence to lean on: a session
+whose provider has accumulated wrapper layers (session sharing, a channel link,
+a subagent companion) buries its model-bearing node, and any walk that stops
+short reports nothing, landing the row blank — the turn's credits become
+unattributable even though the slot knew exactly which model served them.
 
 The served id is already on the slot as ``_active_fallback_model``, written only
 after ``advance_fallback_candidate`` witnessed the ``set_model``, and cleared by
@@ -29,14 +29,16 @@ from test_dashboard_chat import TestRunChatTransientRetry as _TransientSuite
 
 
 def _deep_chain_client(stream, *, primary="primary-model", advertised=("fallback-model",)):
-    """A provider whose model state sits BEYOND ``_wrapper_chain``'s 8-node cap.
+    """A provider whose model state sits six wrapper layers below the surface.
 
     Mirrors the real nesting ``_wrapper_chain``'s docstring documents —
     ``AcpProvider`` -> ``client`` -> ``AcpSessionProvider`` -> ``_handle`` ->
     ``AcpSessionHandle`` -> ``_runtime`` — with the extra wrapper layers a
     long-lived shared session accumulates. ``set_model`` writes the handle's
     ``_model``/``_resolved_model_id`` exactly as ``AcpSessionHandle.set_model``
-    does (``session_handle.py:1379-1384``); the cap is what hides them.
+    does (``session_handle_model_selection.py``, ``set_model``). The depth-first walk reaches them,
+    so this shape exercises the caller-side path with the walk as an
+    independent second witness rather than as the row's only source.
     """
 
     class _Runtime:
@@ -156,17 +158,31 @@ class TestFallbackServedTurnAttribution:
         slot = state.get_or_create_slot("s1")
         slot._titled = True
 
+        # The depth-first walk reaches this handle on its own, so left live it
+        # would name the same model and the row would be right for TWO reasons.
+        # Blind it for the run: the row's value must then come from the
+        # caller-side model alone (`_resolve_model` short-circuits on a
+        # non-blank caller-side model and never consults `model_source`), which
+        # is the path this file pins. The real walk is asserted separately
+        # below as the independent second witness.
+        real_read_turn_model = usage_mod.read_turn_model
+        monkeypatch.setattr(usage_mod, "read_turn_model", lambda source: "")
+
         with patch("asyncio.sleep", new_callable=AsyncMock):
             await _run_chat(state, slot, "hello")
             await self._drain_bg(state)
 
-        # Preconditions: the fallback really served the turn, and the walk that
-        # the persist site relies on really cannot see it.
+        # Preconditions: the fallback really served the turn, the blinded walk
+        # really reports nothing, and the real walk reaches the deep handle.
         assert slot._active_fallback_model == "fallback-model"
         assert handle._model == "fallback-model"
         assert usage_mod.read_turn_model(client) == "", (
-            "precondition: the wrapper-chain walk must be blind here, otherwise "
-            "this test is not exercising the capped-chain case"
+            "precondition: the wrapper-chain walk must be blind for this run, "
+            "otherwise the row is not exercising the caller-side path alone"
+        )
+        assert real_read_turn_model(client) == "fallback-model", (
+            "the depth-first wrapper-chain walk must reach the deep handle here; "
+            "a blank means a wrapper stack of this depth hides the model again"
         )
 
         rows = self._rows(shard_dir)
@@ -212,15 +228,80 @@ class TestFallbackServedTurnAttribution:
         assert rows[0]["model"] == "pinned-model", rows[0]
 
     @pytest.mark.asyncio
+    async def test_a_deferred_mid_turn_pick_is_not_billed_to_the_running_turn(
+        self, tmp_path, monkeypatch
+    ):
+        """A model pick taken WHILE this turn streams lands on slot.model at once
+        (api_chat_slot_model's deferred branch), but the live session was never
+        switched, so the turn ran on what the provider serves. The row must name
+        the served model, and the committed pick must survive — the backfill must
+        not overwrite an Auto pick's "" with the served id."""
+        from unittest.mock import AsyncMock, patch
+
+        from kiro_crew.acp.types import TurnUsage
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.dashboard.handlers import usage as usage_mod
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        shard_dir = tmp_path / "usage" / "tokens"
+        monkeypatch.setattr(usage_mod, "_TOKEN_USAGE_DIR", shard_dir)
+
+        state = self._make_state(tmp_path, monkeypatch)
+
+        async def _stream(msg):
+            yield LLMEvent(kind=EVENT_TEXT_CHUNK, text="served by the primary")
+            # The user picks "" (Auto) WHILE the turn streams: the deferred
+            # branch commits it to slot.model and marks the boundary. The live
+            # session is NOT switched, so the turn still runs on primary-model.
+            slot.model = ""
+            slot._deferred_model_switch_key = "s1"
+            yield LLMEvent(kind=EVENT_COMPLETE, usage=TurnUsage(credits=9.0))
+
+        # The live session serves primary-model (the deep handle's _model).
+        client, handle = _deep_chain_client(_stream, primary="primary-model")
+        self._wire_sessions(state, client)
+        slot = state.get_or_create_slot("s1")
+        slot._titled = True
+        slot.model = "primary-model"
+
+        # The tail runs apply_deferred_model_switch, which on this non-ACP fake
+        # arms a reset; stub the consume so the fake harness is not asked to
+        # tear down and rebuild a session it does not model. The completion's
+        # attribution (the behaviour under test) has already run by then.
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner._consume_pending_reset",
+            AsyncMock(return_value=False),
+        )
+
+        # Suppresses the background drain's real sleeps like the three sibling
+        # tests; the test waits on _drain_bg, never on a clock.
+        with patch("asyncio.sleep", new_callable=AsyncMock):  # flake-ok: drain sleeps
+            await _run_chat(state, slot, "hello")
+            await self._drain_bg(state)
+
+        rows = self._rows(shard_dir)
+        assert len(rows) == 1, rows
+        assert rows[0]["model"] == "primary-model", (
+            "a turn running while a deferred pick waits must bill the served "
+            f"model, not the pending pin; got {rows[0]['model']!r}"
+        )
+        # The Auto pick survives: the backfill must not write the served id over
+        # the committed "" while the boundary marker is set.
+        assert slot.model == "", (
+            "the deferred pick must not be overwritten by the completion backfill; "
+            f"slot.model is {slot.model!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_stale_sticky_fallback_is_not_billed_after_a_resume(self, tmp_path, monkeypatch):
         """GPT review finding on 3f55ca11f: the sticky candidate can OUTLIVE the
         swap it records.
 
-        It deliberately survives a landed turn (`chat_runner.py:10941-10944` --
+        It deliberately survives a landed turn (`_on_complete`'s usage row in `turn_stats` --
         the session stays on the fallback until the start-of-turn restore probe
         succeeds), that probe is skipped for a synthetic recovery message
-        (`:7317-7320`), and a reset resumes the session by re-sending
-        `slot.model` as a set_model override (`:1156-1159`). So a recovery turn
+        (`_turn_dispatch_gates`), and a reset resumes the session by re-sending
+        `slot.model` as a set_model override (`model_fallback`). So a recovery turn
         can run on the PRIMARY with `_active_fallback_model` still set. The row
         must name what the live provider is serving, not the stale candidate.
         """

@@ -7,17 +7,31 @@ oldest. Neither raises, so both are pinned here rather than left to inspection.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 from typing import Any
 
 import pytest
 from aiohttp.test_utils import make_mocked_request
+from dashboard_owner_helpers import NoConfiguredOwner
 
 from kiro_crew.apps.builtins.mochi import activity_log as al
 from kiro_crew.apps.builtins.mochi import hooks
 from kiro_crew.apps.builtins.mochi.backend import routes
+from kiro_crew.testing.wait import async_wait_until
+
+
+def _owner_request(*args, **kwargs):
+    """A mocked request that reads as the dashboard owner.
+
+    The mutating routes are owner-gated, and the gate reads
+    ``request.app["state"]`` plus the claims the token middleware sets.
+    """
+    req = make_mocked_request(*args, **kwargs)
+    req.app["state"] = NoConfiguredOwner()
+    req["user"] = "local-app"
+    req["app"] = ""
+    return req
 
 
 class _Ctx:
@@ -41,10 +55,8 @@ async def _live_runtime(tmp_path):
     """Start the runtime inside the test's own loop, stop it on exit.
 
     An async CONTEXT MANAGER rather than an ``@pytest_asyncio.fixture``: the
-    suite pins pytest-asyncio 0.20.3, whose async-fixture wrapper reads the
-    ``fixturedef.unittest`` attribute pytest 8.1 removed — on CI every
-    async-generator fixture errors at setup. The repo avoids the decorator by
-    convention (see test_denied_commands_api.py's module docstring).
+    suite's convention for teardown that must await on the test's own loop
+    (see test_denied_commands_api.py's module docstring).
     """
     await hooks.on_startup(_Ctx(tmp_path))
     try:
@@ -60,7 +72,7 @@ def _store(tmp_path, name: str) -> dict:
 def _json_request(method: str, path: str, body: dict):
     """A mocked request whose ``json()`` returns ``body`` — the settings handler
     reads its payload that way."""
-    req = make_mocked_request(method, path, headers={"Content-Type": "application/json"})
+    req = _owner_request(method, path, headers={"Content-Type": "application/json"})
 
     async def _json():
         return body
@@ -188,17 +200,16 @@ class TestDashboardRoutes:
         async with _live_runtime(tmp_path) as runtime:
             runtime._log_activity("notification", "wired up")
             # On the event loop the persist is offloaded (a locked file write must
-            # not block the loop), so it lands asynchronously — poll briefly.
-            for _ in range(100):
-                if [e["content"] for e in al.read_recent(tmp_path)] == ["wired up"]:
-                    break
-                await asyncio.sleep(0.01)
-            assert [e["content"] for e in al.read_recent(tmp_path)] == ["wired up"]
+            # not block the loop), so it lands asynchronously.
+            await async_wait_until(
+                lambda: [e["content"] for e in al.read_recent(tmp_path)] == ["wired up"],
+                describe=lambda: al.read_recent(tmp_path),
+            )
 
     @pytest.mark.asyncio
     async def test_plan_reports_empty_when_no_queue_file(self, tmp_path):
         async with _live_runtime(tmp_path):
-            resp = await routes._handle_plan_get(make_mocked_request("GET", "/api/apps/mochi/plan"))
+            resp = await routes._handle_plan_get(_owner_request("GET", "/api/apps/mochi/plan"))
             assert resp.status == 200
             assert json.loads(resp.body) == {"tasks": [], "note": "no plan yet"}
 
@@ -220,7 +231,7 @@ class TestDashboardRoutes:
                     "planned_until": "2026-07-30T12:00:00Z",
                 },
             )
-            resp = await routes._handle_plan_get(make_mocked_request("GET", "/api/apps/mochi/plan"))
+            resp = await routes._handle_plan_get(_owner_request("GET", "/api/apps/mochi/plan"))
             body = json.loads(resp.body)
             # narrative/mood are what the page's header and Plan card render — a
             # tasks-only payload would blank both.
@@ -254,7 +265,7 @@ class TestDashboardRoutes:
                 },
             )
             resp = await routes._handle_plan_get(
-                make_mocked_request("GET", "/api/apps/mochi/plan")
+                _owner_request("GET", "/api/apps/mochi/plan")
             )
             raw = resp.body.decode()
             # Redacted both at the top level (narrative) AND nested (task.summary).
@@ -270,7 +281,7 @@ class TestDashboardRoutes:
         async with _live_runtime(tmp_path):
             al.log_activity(tmp_path, "notification", "hello")
             resp = await routes._handle_activity_get(
-                make_mocked_request("GET", "/api/apps/mochi/activity")
+                _owner_request("GET", "/api/apps/mochi/activity")
             )
             assert resp.status == 200
             assert [e["content"] for e in json.loads(resp.body)["entries"]] == ["hello"]
@@ -282,7 +293,7 @@ class TestDashboardRoutes:
         monkeypatch.setattr(routes, "is_app_enabled", lambda name: False)
         for handler in (routes._handle_plan_get, routes._handle_activity_get):
             gated = routes._require_enabled(handler)
-            resp = await gated(make_mocked_request("GET", "/api/apps/mochi/x"))
+            resp = await gated(_owner_request("GET", "/api/apps/mochi/x"))
             assert resp.status == 403
 
     @pytest.mark.asyncio

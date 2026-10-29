@@ -1,7 +1,16 @@
-import { fireEvent, screen, waitFor } from '@testing-library/react'
+/**
+ * KiroPrerequisiteGate: the Kiro CLI checks -- the refetch cadence, sign-in and
+ * owner handling, the first-run lifecycle and its diagnostics, agent-spec repair,
+ * and the sandbox verdicts and their remedies. Choosing another agent is in
+ * KiroPrerequisiteGate.agentChoice.test.tsx, and the agent picker's copy and Use
+ * eligibility in KiroPrerequisiteGate.agentPicker.test.tsx; the status and probe
+ * fixtures they share live in KiroPrerequisiteGateTestUtils.tsx.
+ */
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { KiroPrerequisiteStatus } from '../api/client'
 import KiroPrerequisiteGate, {
+  acpBackendsRefetchInterval,
   asSentence,
   kiroPrerequisiteIsBlocking,
   kiroPrerequisiteRefetchInterval,
@@ -13,46 +22,28 @@ vi.mock('../utils/clipboard', () => ({
   copyCode: vi.fn(),
 }))
 
-vi.mock('../api/client', () => ({
-  ApiError: class ApiError extends Error {
-    status: number
-    body: string
-
-    constructor(status: number, message: string, body = '') {
-      super(message)
-      this.status = status
-      this.body = body
-    }
-  },
+vi.mock('../api/client', async () => ({
+  // The REAL ApiError, not a stand-in: the shared `setupMarkerError*` /
+  // `agentChoiceSaved` helpers in `api/acpBackend` narrow with `instanceof`
+  // against `api/apiError`, so an error the test builds has to be that same
+  // class or every marker-write assertion silently reads `null`. `apiError` is
+  // the side-effect-free split, so importing it here pulls in none of client's
+  // transport graph.
+  ApiError: (await import('../api/apiError')).ApiError,
   api: {
     kiroPrerequisite: vi.fn(),
     repairKiroPrerequisiteSpecs: vi.fn(),
+    kirocrewConfig: vi.fn(),
+    acpBackends: vi.fn(),
+    acpBackendRecheck: vi.fn(),
+    patchConfig: vi.fn(),
   },
 }))
 
-import { api, ApiError } from '../api/client'
+vi.mock('../providers/adapters/acp', () => ({ clearCachedModels: vi.fn() }))
 
-function status(overrides: Partial<KiroPrerequisiteStatus> = {}): KiroPrerequisiteStatus {
-  return {
-    platform: 'Linux',
-    installed: false,
-    authenticated: false,
-    ready: false,
-    initial_setup_complete: false,
-    repair_required: false,
-    docs_url: 'https://kiro.dev/cli/',
-    login_command: 'kiro-cli login',
-    sso_login_command: 'kiro-cli login --use-device-flow --license pro',
-    setup_allowed: true,
-    sandbox_unavailable: false,
-    sandbox_failure_kind: '',
-    sandbox_detail: '',
-    sandbox_remedy: '',
-    missing_agent_specs: [],
-    agent_spec_repair_error: '',
-    ...overrides,
-  }
-}
+import { api, ApiError } from '../api/client'
+import { probe, status } from './KiroPrerequisiteGateTestUtils'
 
 // The Pod remedy block is real nested YAML. Matched on the code element's exact
 // text: RTL's default matcher collapses whitespace, which would hide a lost
@@ -68,6 +59,10 @@ describe('KiroPrerequisiteGate', () => {
     // must start from a clean slate or a prior test's completion would leak in
     // and silently bypass the setup assertions.
     localStorage.clear()
+    // Default: Kiro CLI is the configured agent and no other harness is listed,
+    // so every pre-existing case exercises the Kiro checks exactly as before.
+    vi.mocked(api.kirocrewConfig).mockResolvedValue({ agent: { acp_backend: 'kiro' } })
+    vi.mocked(api.acpBackends).mockResolvedValue({ backends: [] })
   })
 
   it('keeps a slow readiness poll after setup so later sign-out is detected', () => {
@@ -90,6 +85,43 @@ describe('KiroPrerequisiteGate', () => {
     expect(kiroPrerequisiteIsBlocking(undefined)).toBe(false)
   })
 
+  it('polls the harness probe at the server\'s cache rate, and only behind a setup screen', () => {
+    const missing = probe({ installed: 'missing' })
+    // The endpoint serves a 30s cache (backend_install.CACHE_TTL_SECONDS), the
+    // same one Settings → Agent Backend polls at 30s; asking faster returns the
+    // same bytes. The per-agent Check again is the route for someone who cannot wait.
+    expect(acpBackendsRefetchInterval(status(), false, undefined)).toBe(30_000)
+    expect(acpBackendsRefetchInterval(status(), true, missing)).toBe(30_000)
+    // A configured agent that is usable opens the dashboard: nothing left to poll.
+    expect(acpBackendsRefetchInterval(status(), true, probe())).toBe(false)
+    // An ESTABLISHED install renders the dashboard whatever the probe says about
+    // a configured agent, so a missing one must not be re-probed forever behind
+    // a screen nobody is looking at — the first turn reports it, in context.
+    expect(acpBackendsRefetchInterval(status({ initial_setup_complete: true }), true, missing)).toBe(false)
+    expect(acpBackendsRefetchInterval(status({ ready: true }), false, undefined)).toBe(false)
+    expect(acpBackendsRefetchInterval(status({ setup_allowed: false }), false, undefined)).toBe(false)
+    expect(acpBackendsRefetchInterval(undefined, false, undefined)).toBe(false)
+  })
+
+  it('admits a KAS first run on kiro-cli ACP support, matching the marker', () => {
+    // KAS is kiro-cli's relay: it completes on kiro-cli ACP support, the SAME
+    // rule record_independent_backend_setup enforces before writing the marker.
+    // A gateway that reports acp_supported opens the dashboard (nothing left to poll).
+    const kas = probe({ id: 'kas', policy_id: 'kas', independent_setup: false })
+    expect(acpBackendsRefetchInterval(status(), true, kas)).toBe(false)
+    // A too-old kiro-cli (acp_supported false) refuses KAS — keep polling. This
+    // is the case the marker also refuses, so the two cannot drift.
+    expect(acpBackendsRefetchInterval(status({ acp_supported: false }), true, kas)).toBe(30_000)
+    // KAS loads Kiro Crew's agent specs: a missing or rejected spec keeps the
+    // gate on its repair card instead of opening the dashboard.
+    expect(acpBackendsRefetchInterval(status({ missing_agent_specs: ['kirocrew-lite'] }), true, kas)).toBe(30_000)
+    expect(acpBackendsRefetchInterval(status({ rejected_agent_specs: ['kirocrew'] }), true, kas)).toBe(30_000)
+    // Only KAS takes the acp_supported rule: any other backend without
+    // independent_setup keeps polling, exactly as the marker refuses it.
+    const other = probe({ id: 'goose', policy_id: 'goose', independent_setup: false })
+    expect(acpBackendsRefetchInterval(status(), true, other)).toBe(30_000)
+  })
+
   it('forces a real host probe on the blocking gate, not a latched read', async () => {
     // The status endpoint serves the boot-time LATCH unless refresh is set, so a
     // poll that omits it can never observe a CLI the user just installed. Driven
@@ -101,7 +133,7 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
-    await screen.findByText(/Kiro Crew uses Kiro CLI/)
+    await screen.findByText(/Get a coding agent running on the/)
     // Cold mount has no cached status, so it reads the latch.
     expect(vi.mocked(api.kiroPrerequisite).mock.calls[0][0]).toBe(false)
 
@@ -125,7 +157,7 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
-    fireEvent.click(await screen.findByRole('button', { name: /Check again/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Check sign-in again' }))
 
     await waitFor(() => expect(
       vi.mocked(api.kiroPrerequisite).mock.calls.some(([refresh]) => refresh === 'explicit'),
@@ -148,8 +180,8 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
-    expect(await screen.findByText(/Kiro Crew uses Kiro CLI/)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Check again' }))
+    expect(await screen.findByText(/Get a coding agent running on the/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Check again for Kiro CLI' }))
     expect(await screen.findByText('Dashboard loaded')).toBeInTheDocument()
   })
 
@@ -180,7 +212,7 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
-    expect(await screen.findByText(/Kiro Crew uses Kiro CLI/)).toBeInTheDocument()
+    expect(await screen.findByText(/Get a coding agent running on the/)).toBeInTheDocument()
     expect((await screen.findAllByText(/Windows gateway host/)).length).toBeGreaterThan(0)
 
     const setupLink = screen.getByRole('link', { name: /Open Kiro CLI setup/ })
@@ -190,6 +222,26 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.queryByRole('button', { name: /Install Kiro CLI/ })).not.toBeInTheDocument()
     // No sign-in action exists at all — the user signs in with Kiro CLI.
     expect(screen.queryByRole('button', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
+  })
+
+  it('pins its footer actions to the bottom of the scrolling scrim on a phone', async () => {
+    // Same stacked layout as the onboarding chapters: without the pinned
+    // footer the actions sit below the fold under the browser toolbar. The
+    // Kiro-missing screen carries its Check again inside the Kiro CLI card and
+    // has no footer, so this uses a screen that still has one: the sandbox
+    // verdict, whose only action is the footer's retry.
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      sandbox_unavailable: true,
+      sandbox_failure_kind: 'no_backend',
+    }))
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+    const footer = await screen.findByTestId('gate-footer')
+    const cls = footer.className.split(/\s+/)
+    expect(cls).toEqual(expect.arrayContaining(['sticky', 'bottom-0', 'bg-card', 'sm:static']))
+    expect(footer.className).toContain('env(safe-area-inset-bottom)')
   })
 
   it('tells an installed-but-signed-out CLI to sign in via Kiro CLI', async () => {
@@ -205,7 +257,7 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
-    expect(await screen.findByText(/Sign in with Kiro CLI on the gateway host/))
+    expect(await screen.findByText(/Kiro CLI is installed.*Finish signing in/))
       .toBeInTheDocument()
     // The command is rendered verbatim so it can be copied and typed.
     expect(screen.getByText('kiro-cli login').tagName).toBe('CODE')
@@ -219,9 +271,74 @@ describe('KiroPrerequisiteGate', () => {
     expect(screen.getByText(/Personal account/)).toBeInTheDocument()
     expect(screen.getByText(/Organization SSO/)).toBeInTheDocument()
     // The only action is a re-check.
-    expect(screen.getByRole('button', { name: /Check again/ })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Check sign-in again' })).toBeEnabled()
     expect(screen.queryByRole('button', { name: 'Sign in to Kiro' })).not.toBeInTheDocument()
     expect(screen.queryByText(/unverified executable/)).not.toBeInTheDocument()
+    // A PATH install: bare commands, nothing muted, no bundled-copy hint.
+    expect(screen.queryByText(/desktop app.s own copy of Kiro CLI/)).not.toBeInTheDocument()
+  })
+
+  it('explains then mutes the shared bundled path', async () => {
+    // A desktop install resolves the app's own kiro-cli, which is not on the
+    // user's PATH, so both commands open with the same quoted absolute path and
+    // differ only after `login`. Two full lines read as one command shown twice,
+    // so the shared run is muted and the tail carries the weight; the copied
+    // text is still the whole command. The hint saying what the path is applies
+    // to both commands equally, so it appears ONCE before either path is read.
+    const bin =
+      "'/Applications/Kiro Crew.app/Contents/Resources/backend-dist/kiro-cli/kiro-cli-chat'"
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({
+      installed: true,
+      authenticated: false,
+      bundled_cli: true,
+      login_command: `${bin} login`,
+      sso_login_command: `${bin} login --use-device-flow --license pro`,
+    }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText(/Kiro CLI is installed.*Finish signing in/)
+    const codes = screen.getAllByText(
+      (_, el) => el?.tagName === 'CODE' && (el.textContent ?? '').startsWith(bin),
+    )
+    expect(codes.map((c) => c.textContent)).toEqual([
+      `${bin} login`,
+      `${bin} login --use-device-flow --license pro`,
+    ])
+    for (const code of codes) {
+      expect(code.querySelector('span.text-muted')?.textContent).toBe(`${bin} `)
+    }
+    const hints = screen.getAllByText(/desktop app.s own copy of Kiro CLI.*exactly as shown/)
+    expect(hints).toHaveLength(1)
+    expect(
+      hints[0].compareDocumentPosition(codes[0]) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('a copy that fails says so under the box instead of painting Copied', async () => {
+    // Both clipboard paths can be denied (no API, execCommand refused). The
+    // command is the only instruction on this screen, so a silent miss strands
+    // the user; the failure renders through ErrorNotice and clears on success.
+    const { copyToClipboard } = await import('../utils/clipboard')
+    vi.mocked(copyToClipboard).mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    vi.mocked(api.kiroPrerequisite).mockResolvedValue(status({ installed: true }))
+
+    renderWithProviders(
+      <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
+    )
+
+    await screen.findByText(/Kiro CLI is installed.*Finish signing in/)
+    const [button] = screen.getAllByRole('button', { name: /Copy command/ })
+    fireEvent.click(button)
+    const notice = await screen.findByTestId('kiro-gate-copy-failed')
+    expect(notice.textContent).toMatch(/Copy failed/)
+    expect(screen.queryByRole('button', { name: /Copied/ })).toBeNull()
+
+    fireEvent.click(button)
+    await waitFor(() => expect(screen.queryByTestId('kiro-gate-copy-failed')).toBeNull())
+    expect(screen.getAllByRole('button', { name: /Copied/ }).length).toBeGreaterThan(0)
   })
 
   it('exposes no way to start a sign-in from the dashboard', async () => {
@@ -233,13 +350,13 @@ describe('KiroPrerequisiteGate', () => {
       <KiroPrerequisiteGate><div>Dashboard loaded</div></KiroPrerequisiteGate>,
     )
 
-    await screen.findByText(/Sign in with Kiro CLI on the gateway host/)
+    await screen.findByText(/Kiro CLI is installed.*Finish signing in/)
     expect(api).not.toHaveProperty('loginKiroPrerequisite')
     expect(screen.queryByRole('link', { name: /Open Kiro sign-in page/ })).not.toBeInTheDocument()
-    // Only the two step cards' own affordances: the setup link is gone once the
-    // CLI is found, leaving exactly one control — Check again.
+    // The setup link is gone once the CLI is found. The Kiro card owns its
+    // re-check, without a second page-level control.
     const buttons = screen.getAllByRole('button').map(b => b.textContent || '')
-    expect(buttons.filter(t => /Check again/.test(t))).toHaveLength(1)
+    expect(buttons.filter(t => /Check sign-in again/.test(t))).toHaveLength(1)
   })
 
   it('shows non-owners a redacted owner-setup state', async () => {
@@ -814,6 +931,9 @@ describe('KiroPrerequisiteGate', () => {
     const alert = await screen.findByTestId('kiro-gate-status-error')
     expect(alert).toHaveAttribute('role', 'alert')
     expect(alert).toHaveTextContent('Token required.')
+    // The agent runtime is what could not be checked, so the notice states
+    // `noHandoffReason` and offers no hand-off.
+    expect(within(alert).queryByRole('button', { name: /Ask the agent/ })).not.toBeInTheDocument()
     expect(
       screen.getByText('Retry the gateway check before starting a session.'),
     ).toBeInTheDocument()

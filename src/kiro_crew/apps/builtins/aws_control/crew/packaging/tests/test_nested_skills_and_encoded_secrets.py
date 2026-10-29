@@ -203,7 +203,7 @@ def test_the_builder_refuses_where_the_nofollow_primitive_is_unavailable(
 
     A skills-only build is the vehicle because it is the narrowest one that still reaches an
     entry point: no prompt, no plan, nothing but a skill file. The refusal names the platform
-    condition and the issue, and nothing is written.
+    condition and what is missing, and nothing is written.
     """
     mod = _no_dir_fd(load_build)
     home = make_crew(tmp_path / "home", skills={"faq": {"SKILL.md": "# FAQ\n"}})
@@ -211,5 +211,8 @@ def test_the_builder_refuses_where_the_nofollow_primitive_is_unavailable(
     with pytest.raises(mod.ExportRefused) as caught:
         _build(mod, home, work, {"skills": {"faq"}})
     assert "POSIX-only" in str(caught.value)
-    assert "#9496" in str(caught.value)
+    assert "descriptor-relative no-follow open" in str(caught.value), (
+        "the refusal must name the primitive it needs, so a reader on that platform learns "
+        "what has to exist before the guard lifts"
+    )
     assert not (work / "bundle").exists(), "nothing is written when the builder refuses"

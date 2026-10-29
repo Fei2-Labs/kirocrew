@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from body_stream_helpers import attach_json_body
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew import publish_provider, publish_sync
@@ -169,11 +170,11 @@ def _request(
     req.query = query or {}
     req.rel_url.query = query or {}
     if isinstance(body, dict):
-        req.read = AsyncMock(return_value=json.dumps(body).encode())
+        attach_json_body(req, json.dumps(body).encode())
     elif isinstance(body, bytes):
-        req.read = AsyncMock(return_value=body)
+        attach_json_body(req, body)
     else:
-        req.read = AsyncMock(return_value=b"")
+        attach_json_body(req, b"")
     req.app = {"state": MagicMock(), "_restricted_session": restricted}
     return req
 
@@ -278,16 +279,44 @@ class TestRemoteBrowse:
         assert _json_body(resp)["artifacts"][0]["local_slug"] == art.slug
 
     @pytest.mark.asyncio
-    async def test_browse_unregistered_provider_503_when_registry_empty(
+    async def test_browse_unregistered_provider_404_when_registry_empty(
         self, isolated_store, patch_restricted
     ):
-        # Public edition: NO provider registered → PublishUnavailableError → 503,
-        # matching the clone/fork handlers (the surface exists, the provider
-        # tooling doesn't) rather than a 404 "not found".
+        # Public edition: NO provider registered under the name → 404.
         req = _request(match={"provider": "fakeprov"})
         resp = await api_remote_artifacts_browse(req)
-        assert resp.status == 503
-        assert "fakeprov" in _json_body(resp)["error"]
+        assert resp.status == 404
+        assert _json_body(resp)["error"] == "unknown publish provider: 'fakeprov'"
+
+    @pytest.mark.asyncio
+    async def test_get_unregistered_provider_404_when_registry_empty(
+        self, isolated_store, patch_restricted, monkeypatch
+    ):
+        sel_stub = MagicMock()
+        monkeypatch.setattr(art_handlers, "sel", lambda: sel_stub)
+        req = _request(match={"provider": "fakeprov", "external_id": "ext-1"})
+        resp = await api_remote_artifact_get(req)
+        assert resp.status == 404
+        assert _json_body(resp)["error"] == "unknown publish provider: 'fakeprov'"
+        kwargs = sel_stub.log_tool_invocation.call_args.kwargs
+        assert kwargs["outcome"] == "error"
+        assert "fakeprov" in kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_registered_but_unavailable_provider_keeps_503_and_502(
+        self, isolated_store, patch_restricted
+    ):
+        def _unavailable():
+            raise publish_provider.PublishUnavailableError("fakeprov tooling missing")
+
+        publish_provider.register_provider("fakeprov", _unavailable)
+        browse = await api_remote_artifacts_browse(_request(match={"provider": "fakeprov"}))
+        assert browse.status == 503
+        get = await api_remote_artifact_get(
+            _request(match={"provider": "fakeprov", "external_id": "ext-1"})
+        )
+        assert get.status == 502
+        assert "tooling missing" in _json_body(get)["error"]
 
     @pytest.mark.asyncio
     async def test_browse_unsupported_scope_is_400(
@@ -297,7 +326,23 @@ class TestRemoteBrowse:
         req = _request(match={"provider": "fakeprov"}, query={"scope": "public"})
         resp = await api_remote_artifacts_browse(req)
         assert resp.status == 400
-        assert "does not support" in _json_body(resp)["error"]
+        body = _json_body(resp)
+        assert "does not support" in body["error"]
+        # The machine-readable code is what lets the page skip the scope
+        # instead of showing an error card.
+        assert body["code"] == "scope_unsupported"
+
+    @pytest.mark.asyncio
+    async def test_browse_unsupported_search_carries_no_scope_code(
+        self, isolated_store, patch_restricted, registered_provider
+    ):
+        registered_provider.listing = None
+        req = _request(match={"provider": "fakeprov"}, query={"q": "dashboards"})
+        resp = await api_remote_artifacts_browse(req)
+        assert resp.status == 400
+        body = _json_body(resp)
+        assert "does not support full-text search" in body["error"]
+        assert "code" not in body
 
     @pytest.mark.asyncio
     async def test_browse_restricted_session_403(

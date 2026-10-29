@@ -19,15 +19,19 @@ otherwise re-acquire the same wedged session out of the registry.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import inspect
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from kiro_crew import channel as channel_mod
 from kiro_crew.acp.client import AcpError, AcpPromptBusy
+from kiro_crew.acp.types import STOP_REASON_STALE_RECOVER
 from kiro_crew.channel import (
     Channel,
     _reacquire_cleared_session,
@@ -38,6 +42,8 @@ from kiro_crew.channel import (
 )
 from kiro_crew.llm_helpers import is_prompt_busy
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK
+from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 def _make_agent():
@@ -200,7 +206,7 @@ def test_unrelated_errors_are_not_prompt_busy(exc):
 async def test_stream_task_reports_busy_and_posts_no_card(exc):
     agent, ch = _make_agent(), _make_channel()
     busy = await _stream_task(agent, ch, _raising_client(exc), "hi")
-    assert busy is True
+    assert busy == channel_mod._STREAM_BUSY
     ch.post.assert_not_awaited()
 
 
@@ -208,7 +214,7 @@ async def test_stream_task_reports_busy_and_posts_no_card(exc):
 async def test_stream_task_still_posts_a_card_for_an_unrelated_error():
     agent, ch = _make_agent(), _make_channel()
     busy = await _stream_task(agent, ch, _raising_client(AcpError("InternalServerError")), "hi")
-    assert busy is False
+    assert busy == channel_mod._STREAM_OK
     ch.post.assert_awaited_once()
     assert "error occurred" in ch.post.await_args.args[1]
 
@@ -217,9 +223,48 @@ async def test_stream_task_still_posts_a_card_for_an_unrelated_error():
 async def test_stream_task_returns_false_on_success():
     agent, ch = _make_agent(), _make_channel()
     busy = await _stream_task(agent, ch, _text_client("done"), "hi")
-    assert busy is False
+    assert busy == channel_mod._STREAM_OK
     ch.post.assert_awaited_once()
     assert ch.post.await_args.args[1] == "done"
+
+
+def _ended_client(text: str, stop_reason: str):
+    """A turn that streams ``text`` and then ends with ``stop_reason``."""
+    client = SimpleNamespace()
+
+    async def _stream(message):
+        if text:
+            yield SimpleNamespace(kind=EVENT_TEXT_CHUNK, text=text)
+        yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason=stop_reason)
+
+    client.stream = _stream
+    return client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["timeout", STOP_REASON_STALE_RECOVER])
+@pytest.mark.parametrize("text", ["half a pl", ""], ids=["partial", "empty"])
+async def test_stream_task_posts_a_card_not_the_text_of_an_unfinished_turn(text, stop_reason):
+    """A turn the backend never finished is not the agent's reply: the channel
+    gets the error card, not the partial text as a reply and not silence."""
+    agent, ch = _make_agent(), _make_channel()
+    busy = await _stream_task(agent, ch, _ended_client(text, stop_reason), "hi")
+    assert busy == channel_mod._STREAM_OK
+    ch.post.assert_awaited_once()
+    assert "error occurred" in ch.post.await_args.args[1]
+    assert ch.post.await_args.kwargs["msg_type"] == "system"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_reason", ["end_turn", "cancelled"])
+async def test_stream_task_posts_the_text_of_a_finished_or_cancelled_turn(stop_reason):
+    """A finished turn posts its reply, and a user-requested stop keeps its partial text."""
+    agent, ch = _make_agent(), _make_channel()
+    busy = await _stream_task(agent, ch, _ended_client("half a pl", stop_reason), "hi")
+    assert busy == channel_mod._STREAM_OK
+    ch.post.assert_awaited_once()
+    assert ch.post.await_args.args[1] == "half a pl"
+    assert ch.post.await_args.kwargs["msg_type"] == "progress"
 
 
 # ── _reset_busy_session ──
@@ -318,16 +363,13 @@ async def test_recover_swallows_a_failed_teardown_of_the_abandoned_replacement()
 async def _run_until(agent, ch, sessions, done: asyncio.Event, text: str) -> asyncio.Task:
     task = asyncio.create_task(run_channel_agent(agent, ch, sessions))
     await ch.post("human", text)
-    await asyncio.wait_for(done.wait(), timeout=5)
+    await await_until(done)
     return task
 
 
 async def _wait_for(predicate) -> bool:
-    for _ in range(100):
-        if predicate():
-            return True
-        await asyncio.sleep(0.05)
-    return False
+    await async_wait_until(predicate, describe=lambda: "predicate not yet true")
+    return True
 
 
 @pytest.mark.asyncio
@@ -373,7 +415,7 @@ async def test_loop_reports_an_unrecoverable_agent_once_and_stops():
     sessions = FakeSessions([_wedged_client(done), _wedged_client(done)])
 
     task = await _run_until(agent, ch, sessions, done, "start the review")
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(task)
 
     assert agent.state == "failed"
     stuck = [m.content for m in ch.messages if "could not be recovered" in m.content]
@@ -404,8 +446,8 @@ async def test_an_unrecoverable_agent_stops_consuming_its_inbox():
         await ch.post("human", f"msg {i}")
     assert agent.inbox.qsize() == 3
     task = asyncio.create_task(run_channel_agent(agent, ch, sessions))
-    await asyncio.wait_for(done.wait(), timeout=5)
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(done)
+    await await_until(task)
 
     assert agent.state == "failed"
     assert len([m for m in ch.messages if "could not be recovered" in m.content]) == 1
@@ -432,7 +474,7 @@ async def test_the_stuck_card_still_lands_when_the_teardown_reset_fails():
     )
 
     task = await _run_until(agent, ch, sessions, done, "start the review")
-    await asyncio.wait_for(task, timeout=5)
+    await await_until(task)
 
     assert agent.state == "failed"
     assert len([m for m in ch.messages if "could not be recovered" in m.content]) == 1
@@ -478,7 +520,7 @@ async def test_a_cleared_member_serves_its_next_message():
         "dead session"
     )
     assert (
-        await _stream_task(agent, _make_channel(), replacement, "hi") is False
+        await _stream_task(agent, _make_channel(), replacement, "hi") == channel_mod._STREAM_OK
     ), "the re-acquired provider did not serve the message"
     assert served == ["hi"], f"the message never reached the fresh provider; saw {served!r}"
     assert sessions.lifecycle_marked, (
@@ -532,4 +574,30 @@ async def test_a_replacement_registered_under_the_same_key_is_not_streamed_throu
     assert not stale_seen, (
         "the message was streamed through the provider cached at spawn, which the registry has "
         f"already replaced; saw {stale_seen!r}"
+    )
+
+
+# ── the session-manager contract the fake above cannot vouch for ──
+
+
+def test_every_session_manager_call_in_channel_exists_on_the_real_manager():
+    """`run_channel_agent` takes `sessions: Any`, so nothing else catches a missing method.
+
+    mypy cannot check it, and the fake in this file answers whatever it is asked -- so a call
+    to a method `SessionManager` does not define passes every channel test and raises
+    `AttributeError` on the first real spawn, before the member ever reaches "listening".
+    """
+    calls = {
+        node.func.attr
+        for node in ast.walk(ast.parse(inspect.getsource(channel_mod)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "sessions"
+    }
+    assert calls, "no sessions.* calls were found, so this guard is measuring nothing"
+    missing = sorted(name for name in calls if not hasattr(SessionManager, name))
+    assert not missing, (
+        f"channel.py calls SessionManager method(s) that do not exist: {missing}. "
+        "Every channel-agent spawn raises AttributeError."
     )

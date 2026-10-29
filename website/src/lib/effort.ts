@@ -6,6 +6,7 @@
  * don't have to re-export it.
  */
 
+import { isNotFoundError } from '../api/apiError'
 import { i18nT } from '../i18n/t'
 
 /**
@@ -77,25 +78,32 @@ export function modelSupportsEffort(model: string | undefined): boolean {
   return m.includes('opus') || m.includes('sonnet') || m.includes('fable') || m.includes('gpt')
 }
 
-function advertisedEffortLevels(advertised: readonly string[] | undefined): string[] {
-  if (!advertised) return []
-  return advertised.filter(level => !!level && level !== 'default')
+/** Whether the model's picker has an effort control to show.
+ *
+ * A backend-advertised list takes precedence when present. The built-in Kiro
+ * backend has a known effort vocabulary, so an absent list uses the local
+ * model capability map; a non-Kiro backend with no advertised levels gets no
+ * control, even when its model id resembles a Kiro model family. */
+export function showEffortControl(
+  levels: readonly string[] | undefined,
+  model: string | undefined,
+  backend = '',
+): boolean {
+  if (levels?.length) return true
+  return (backend === '' || backend === 'acp') && modelSupportsEffort(model)
 }
 
 /**
- * Whether the reasoning-effort control should appear for this model + harness.
+ * Did the slot's selection-capability read actually FAIL?
  *
- * Adapters (non-empty ``backend``) only get a control when they advertised
- * levels — Codex often bakes effort into the model id (``gpt-5.2[high]``),
- * which the kiro family heuristic would treat as capable and then show fake
- * low..max notches. Kiro (``''`` / omitted) keeps that heuristic so the
- * first-class slider is unchanged.
+ * A 404 is not a failure: the gateway answers `slot_not_found` while a new chat's
+ * slot has not been registered yet, which is the same "no ACP session has
+ * advertised its options" state that `known: false` reports. Treating it as an
+ * error flashed the "could not verify effort options" notice, and disabled the
+ * effort control, on every cold-start poll (issue #14817). Only a real fault --
+ * a 403, a 5xx, a transport failure -- counts, which keeps the
+ * notice's "until the connection recovers" claim true.
  */
-export function showEffortControl(
-  advertised: readonly string[] | undefined,
-  model: string | undefined,
-  backend?: string | null,
-): boolean {
-  if (backend) return advertisedEffortLevels(advertised).length > 0
-  return modelSupportsEffort(model === 'auto' ? '' : model)
+export function selectionCapabilitiesFailed(q: { isError: boolean; error?: unknown }): boolean {
+  return q.isError && !isNotFoundError(q.error)
 }

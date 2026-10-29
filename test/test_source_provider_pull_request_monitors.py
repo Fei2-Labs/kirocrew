@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
+import urllib.parse
 from contextlib import contextmanager
 from io import BytesIO
 from types import SimpleNamespace
@@ -13,6 +15,7 @@ from urllib.request import Request
 import pytest
 
 from kiro_crew import github_runner
+from kiro_crew import sandbox as sandbox_module
 from kiro_crew.acp import client as acp_client_module
 from kiro_crew.monitoring import azure_devops_pull_request as azure_module
 from kiro_crew.monitoring import bitbucket_pull_request as bitbucket_module
@@ -366,7 +369,7 @@ def test_gitlab_revoked_host_is_a_terminal_authorization_failure(
     assert events[0]["outcome"] == "denied"
     assert events[0]["resources"] == "glab"
     assert events[0]["caller_identity"] == "core:monitor"
-    assert events[0]["error"] == ""
+    assert events[0]["error"] == "host_not_allowlisted"
     assert "gitlab.example.com" not in json.dumps(events)
     assert "acme/widgets" not in json.dumps(events)
 
@@ -1016,6 +1019,68 @@ def test_azure_forbidden_is_terminal_and_omits_provider_text(monkeypatch):
     assert "super-secret" not in result.observation.reason_code
 
 
+def test_gitlab_throttling_refusal_is_rate_limited(monkeypatch):
+    """A throttle reaches this watch as RATE_LIMITED, not as the generic default.
+
+    The wording carries no status code and no ``rate limit`` phrase, so the shared
+    classifier's ``throttled`` marker is the only thing that can answer -- which is
+    what makes this a case about GitLab's own call site rather than a second copy
+    of the classifier's table.
+    """
+
+    def fail(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            ["glab"],
+            1,
+            stdout="",
+            stderr="the request was throttled by the instance token=super-secret",
+        )
+
+    monkeypatch.setattr(
+        "kiro_crew.monitoring.gitlab_merge_request.run_provider_cli",
+        fail,
+    )
+
+    result = _probe(
+        GitLabMergeRequestProvider(gitlab_hosts=[]),
+        "https://gitlab.com/acme/widgets/-/merge_requests/8",
+    )
+
+    assert result.observation.provider_error is ProviderErrorKind.RATE_LIMITED
+    assert result.observation.reason_code == "provider_rate_limited"
+    assert "super-secret" not in result.observation.reason_code
+
+
+def test_azure_throttling_refusal_is_rate_limited(monkeypatch):
+    """Azure DevOps reaches the same answer through its own call site.
+
+    Its handler inspects the text for a missing-extension refusal before
+    classifying, so the throttle has to survive that branch to be reported.
+    """
+
+    def fail(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            ["az"],
+            1,
+            stdout="",
+            stderr="TF400733: the request has been throttled token=super-secret",
+        )
+
+    monkeypatch.setattr(
+        "kiro_crew.monitoring.azure_devops_pull_request.run_provider_cli",
+        fail,
+    )
+
+    result = _probe(
+        AzureDevOpsPullRequestProvider(),
+        "https://dev.azure.com/acme/project/_git/widgets/pullrequest/9",
+    )
+
+    assert result.observation.provider_error is ProviderErrorKind.RATE_LIMITED
+    assert result.observation.reason_code == "provider_rate_limited"
+    assert "super-secret" not in result.observation.reason_code
+
+
 def test_azure_channel_probe_does_not_load_owner_credentials_or_cli_state(monkeypatch):
     audit_calls: list[str] = []
 
@@ -1222,7 +1287,7 @@ def test_bitbucket_https_fetch_rejects_incomplete_credentials(
     assert events[0]["outcome"] == "denied"
     assert events[0]["resources"] == "bitbucket"
     assert events[0]["caller_identity"] == "core:monitor"
-    assert events[0]["error"] == ""
+    assert events[0]["error"] == "credentials_incomplete"
     assert "user@example.com" not in json.dumps(events)
     assert "secret-token" not in json.dumps(events)
     assert "acme/widgets" not in json.dumps(events)
@@ -1588,6 +1653,131 @@ def test_provider_cli_environments_are_scoped_and_disable_dynamic_install(monkey
     assert "GITLAB_TOKEN" not in self_managed_gitlab
 
 
+def test_provider_cli_env_hands_the_cli_an_explicit_session_bus_address(monkeypatch, tmp_path):
+    """A provider CLI child never searches for the session bus itself.
+
+    glab (go-keyring over godbus) and az (MSAL over libsecret, with the encrypted
+    cache on) ask the Secret Service for a token. Left with no ``DBUS_SESSION_BUS_ADDRESS``
+    the client library looks for the user bus and, failing that, execs ``dbus-launch``: a
+    private ``dbus-daemon`` that activates ``gnome-keyring-daemon``, neither of which exits
+    with the CLI, so every probe leaks one pair. The parent resolves the bus once instead:
+    the user bus by its standard path when that socket exists, an inert address otherwise.
+    The builder pins whichever value the resolver produced, for both CLIs, and the
+    gateway's own ambient value is never what gets forwarded. The resolver itself is
+    exercised against a real socket in ``test_github_runner.py`` and in the POSIX-only
+    sibling below.
+    """
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "home"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", os.fspath(tmp_path / "run"))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/ambient/forwarded/bus")
+    monkeypatch.setenv("GITLAB_TOKEN", "glpat-ambient")
+
+    for resolved in (github_runner.INERT_SESSION_BUS_ADDRESS, "unix:path=/run/user/4242/bus"):
+        monkeypatch.setattr(
+            github_runner, "session_bus_address", lambda resolved=resolved: resolved
+        )
+        gitlab = provider_cli_env("glab")
+        azure = provider_cli_env("az")
+        assert gitlab.get("DBUS_SESSION_BUS_ADDRESS"), "glab must not start with no bus address"
+        assert gitlab["DBUS_SESSION_BUS_ADDRESS"] == resolved
+        assert azure["DBUS_SESSION_BUS_ADDRESS"] == resolved
+        assert "/ambient/forwarded/bus" not in gitlab["DBUS_SESSION_BUS_ADDRESS"]
+
+    # The allowlist is otherwise unchanged: under a known gateway environment the
+    # child carries exactly the keys it carried before, plus this one.
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "HOME": os.fspath(tmp_path / "home"),
+            "LANG": "C.UTF-8",
+            "PATH": "/opt/agent/bin:/usr/bin",
+            "XDG_RUNTIME_DIR": os.fspath(tmp_path / "run"),
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/ambient/forwarded/bus",
+            "GITLAB_TOKEN": "glpat-ambient",
+            "AWS_SECRET_ACCESS_KEY": "not-for-providers",
+        },
+    )
+    # PATH is pinned to the trusted system directories where the platform has
+    # them and dropped where it does not (Windows), so it is expected exactly
+    # when ``trusted_system_path`` returns one; the set stays an equality.
+    expected = {
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GITLAB_TOKEN",
+        "GLAMOUR_STYLE",
+        "HOME",
+        "LANG",
+        "NO_COLOR",
+        "XDG_RUNTIME_DIR",
+    }
+    if provider_cli_module.platform_compat.trusted_system_path() is not None:
+        expected.add("PATH")
+    assert set(provider_cli_env("glab")) == expected
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets only")
+def test_provider_cli_env_resolves_a_real_user_bus_socket(monkeypatch, tmp_path, short_sock_dir):
+    """End to end through the real resolver: no socket at the standard paths yields the
+    inert address; a listening socket there yields its ``unix:path=``, for both CLIs."""
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "home"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", os.fspath(short_sock_dir))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/ambient/forwarded/bus")
+    # The uid-derived candidate must not reach the host's own /run/user.
+    monkeypatch.setattr(
+        github_runner,
+        "_user_bus_socket_candidates",
+        lambda: (os.fspath(short_sock_dir / "bus"), os.fspath(tmp_path / "uid-run" / "bus")),
+    )
+
+    assert provider_cli_env("glab")["DBUS_SESSION_BUS_ADDRESS"] == (
+        github_runner.INERT_SESSION_BUS_ADDRESS
+    )
+
+    bus = short_sock_dir / "bus"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(os.fspath(bus))
+        sock.listen(1)
+        gitlab = provider_cli_env("glab")
+        azure = provider_cli_env("az")
+    finally:
+        sock.close()
+    for env in (gitlab, azure):
+        address = env["DBUS_SESSION_BUS_ADDRESS"]
+        assert address.startswith("unix:path=")
+        assert urllib.parse.unquote(address[len("unix:path=") :]) == os.fspath(bus)
+
+
+def test_explicit_session_bus_address_survives_both_spawn_paths(monkeypatch, tmp_path):
+    """The spawn chokepoint carries the caller's bus address into the child on both paths.
+
+    Plain path: ``scrub_env`` drops credential prefixes only. Scope path:
+    ``cgroup_scope_bus_env`` fills only keys the caller left unset and reports only those
+    as injected, so the ``env -u`` shim inside the scope never names a key the caller set.
+    Checked for both values the builder can produce.
+    """
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "home"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", os.fspath(tmp_path / "run"))
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/ambient/forwarded/bus")
+    monkeypatch.setattr(sandbox_module, "_probe_cgroup_scope", lambda: (True, "ok"))
+
+    for address in (
+        github_runner.INERT_SESSION_BUS_ADDRESS,
+        f"unix:path={tmp_path / 'run' / 'bus'}",
+    ):
+        monkeypatch.setattr(github_runner, "session_bus_address", lambda address=address: address)
+        env = provider_cli_env("glab")
+        assert env["DBUS_SESSION_BUS_ADDRESS"] == address
+
+        plain = sandbox_module.scrub_env(env, extra_prefixes=sandbox_module._PYTHON_ENV_PREFIXES)
+        assert plain["DBUS_SESSION_BUS_ADDRESS"] == address
+
+        patched, injected = sandbox_module.cgroup_scope_bus_env(plain)
+        assert patched["DBUS_SESSION_BUS_ADDRESS"] == address
+        assert "DBUS_SESSION_BUS_ADDRESS" not in injected
+        assert sandbox_module._unset_env_argv(injected) in (None, ["/usr/bin/env"], ["/bin/env"])
+
+
 def test_provider_cli_rejects_output_over_the_transport_bound(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "kiro_crew.monitoring.provider_cli.resolve_provider_cli",
@@ -1699,6 +1889,82 @@ def test_provider_cli_accepts_only_pod_local_azure_config_in_a_pod(monkeypatch, 
     )
     with pytest.raises(provider_cli_module.SetupError, match="must stay beneath KIROCREW_HOME"):
         provider_cli_env("az")
+
+
+def _stub_az_spawn(monkeypatch, sandbox_stub):
+    monkeypatch.setattr(
+        "kiro_crew.monitoring.provider_cli.resolve_provider_cli",
+        lambda _executable: sys.executable,
+    )
+    monkeypatch.setattr(
+        "kiro_crew.monitoring.provider_cli._audit_provider_cli",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("kiro_crew.monitoring.provider_cli.sandboxed_spawn_argv", sandbox_stub)
+
+
+def _pod_azure_env(monkeypatch, operator_home, pod_home):
+    monkeypatch.setattr(sandbox_module.Path, "home", staticmethod(lambda: operator_home))
+    monkeypatch.setenv("HOME", os.fspath(operator_home))
+    monkeypatch.setenv("KIROCREW_HOME", os.fspath(pod_home))
+    monkeypatch.setenv("KIROCREW_POD", "1")
+    monkeypatch.setenv("AZURE_CONFIG_DIR", os.fspath(pod_home / ".azure"))
+    monkeypatch.setenv("AZURE_EXTENSION_DIR", os.fspath(pod_home / ".azure" / "cliextensions"))
+
+
+def test_pod_azure_spawn_refuses_a_data_home_beneath_a_foreign_mask(monkeypatch, tmp_path):
+    def _never_spawn(*_args, **_kwargs):
+        raise AssertionError("a shadowed carve-out must not reach the sandbox")
+
+    _stub_az_spawn(monkeypatch, _never_spawn)
+    _pod_azure_env(monkeypatch, tmp_path, tmp_path / ".gnupg" / "pods" / "p1")
+
+    with pytest.raises(provider_cli_module.SetupError, match="independently masked"):
+        run_provider_cli("az", ["-c", "print('unreachable')"], timeout=5)
+
+
+def test_pod_azure_spawn_carves_both_dirs_on_the_default_pod_layout(monkeypatch, tmp_path):
+    calls = []
+
+    def _record(argv, **kwargs):
+        calls.append(kwargs)
+        return argv, kwargs["env"], None
+
+    pod_home = tmp_path / ".kirocrew-pods" / "p1"
+    _stub_az_spawn(monkeypatch, _record)
+    _pod_azure_env(monkeypatch, tmp_path, pod_home)
+
+    result = run_provider_cli("az", ["-c", "print('ok')"], timeout=5)
+
+    assert result.stdout.strip() == "ok"
+    assert [call["extra_visible_dirs"] for call in calls] == [
+        (
+            os.fspath(pod_home / ".azure"),
+            os.fspath(pod_home / ".azure" / "cliextensions"),
+        )
+    ]
+
+
+def test_host_azure_spawn_does_not_ask_the_shadow_guard(monkeypatch, tmp_path):
+    def _never_asked(*_args, **_kwargs):
+        raise AssertionError("the host Azure grant must not ask the shadow guard")
+
+    calls = []
+
+    def _record(argv, **kwargs):
+        calls.append(kwargs)
+        return argv, kwargs["env"], None
+
+    _stub_az_spawn(monkeypatch, _record)
+    monkeypatch.setattr(provider_cli_module, "carveout_shadowed_by_foreign_mask", _never_asked)
+    monkeypatch.setattr(provider_cli_module, "agent_writable_roots", lambda: ())
+    monkeypatch.setenv("HOME", os.fspath(tmp_path / "home"))
+    monkeypatch.setenv("KIROCREW_HOME", os.fspath(tmp_path / "crew"))
+
+    result = run_provider_cli("az", ["-c", "print('ok')"], timeout=5)
+
+    assert result.stdout.strip() == "ok"
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("extension_suffix", ["", "extensions"])

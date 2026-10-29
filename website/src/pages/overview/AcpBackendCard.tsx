@@ -249,7 +249,7 @@ export function AcpBackendCard({ onSave }: Props) {
                   <span className="flex items-center gap-2 flex-wrap">
                     <span className="font-semibold text-text-strong">{row.label}</span>
                     {row.experimental && (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-1.5 py-px rounded-full bg-warn-subtle text-warn border border-warn/30">
+                      <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-1.5 py-px rounded-full bg-warn-subtle text-warn-text border border-warn/30">
                         <FlaskConical className="lucide-inline" />
                         {i18nT('pages.overview.acpBackend.experimental')}
                       </span>
@@ -259,7 +259,7 @@ export function AcpBackendCard({ onSave }: Props) {
                         not be told to install it; `installed` needs no badge
                         because working is the unremarkable case. */}
                     {row.installed === 'missing' && (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-1.5 py-px rounded-full bg-danger-subtle text-danger border border-danger/30">
+                      <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-1.5 py-px rounded-full bg-danger-subtle text-danger-text border border-danger/30">
                         <PackageX className="lucide-inline" />
                         {i18nT('pages.overview.acpBackend.not_installed')}
                       </span>

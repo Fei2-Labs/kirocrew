@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from kiro_crew._sqlite_compat import sqlite3
+
+logger = logging.getLogger(__name__)
 
 V1_ACCEPTED_REVISION_LIMIT = 20
 
@@ -92,6 +95,14 @@ def verified_correction(
             return None
         if not observed or (current_updated and observed < current_updated):
             return None
+        source_ref = f"{session_key}#message:{index}: {statement}"
+        try:
+            normalize_metadata({"source_ref": source_ref})
+        except ValueError:
+            # The evidence is stored as the record's source_ref and must pass
+            # the same validation there; evidence it cannot hold leaves the
+            # correction pending, like any unverified one.
+            return None
         return CorrectionEvidence(
             key,
             before["value_json"],
@@ -101,7 +112,7 @@ def verified_correction(
             # correction would stall as a conflict proposal.
             json.dumps(value, ensure_ascii=False),
             revision,
-            f"{session_key}#message:{index}: {statement}",
+            source_ref,
             observed,
         )
     return None
@@ -120,6 +131,10 @@ _FIELDS = (
     "observed_at",
     "source_ref",
 )
+_NOT_AN_OBJECT = "Memory metadata must be an object"
+# How much of an unknown field name an error or a log line repeats.
+_FIELD_NAME_CHARS = 40
+_FIELD_NAMES_SHOWN = 3
 _EMAIL = re.compile(
     r"(?<![\w.+-])[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
@@ -131,9 +146,11 @@ _DERIVED = {"embedding", "last_accessed_at", "access_count", "id", "kind", "meta
 _HASH_DERIVED = _DERIVED | {"updated_at"}
 
 
-def ensure_schema(db: sqlite3.Connection) -> None:
-    """Create additive tables/indexes without executescript's implicit COMMIT."""
-    statements = (
+#: Every additive object, by name: :func:`ensure_schema` builds them and
+#: :func:`schema_is_current` reads whether they all exist, from the one list.
+_SCHEMA_OBJECTS: tuple[tuple[str, str], ...] = (
+    (
+        "memory_record_meta",
         """CREATE TABLE IF NOT EXISTS memory_record_meta (
             record_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
             revision INTEGER NOT NULL, category TEXT NOT NULL DEFAULT '',
@@ -143,27 +160,81 @@ def ensure_schema(db: sqlite3.Connection) -> None:
             observed_at TEXT NOT NULL DEFAULT '', source_ref TEXT NOT NULL DEFAULT '',
             content_hash TEXT NOT NULL, email_addresses TEXT NOT NULL DEFAULT '[]',
             updated_at TEXT NOT NULL)""",
+    ),
+    (
+        "memory_revisions",
         """CREATE TABLE IF NOT EXISTS memory_revisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT, record_id TEXT NOT NULL,
             revision INTEGER NOT NULL, base_revision INTEGER NOT NULL,
             status TEXT NOT NULL, operation TEXT NOT NULL, source TEXT NOT NULL,
             before_json TEXT, after_json TEXT, metadata_json TEXT NOT NULL,
             created_at TEXT NOT NULL)""",
+    ),
+    (
+        "idx_memory_revision_record",
         "CREATE INDEX IF NOT EXISTS idx_memory_revision_record "
         "ON memory_revisions(record_id, id)",
+    ),
+    (
+        "idx_memory_fact_identity",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_fact_identity "
         "ON memory_record_meta(scope, subject, predicate) "
         "WHERE kind IN ('fact', 'directive') AND subject <> '' AND predicate <> '' "
         "AND status = 'active'",
-    )
-    for statement in statements:
+    ),
+)
+
+
+def ensure_schema(db: sqlite3.Connection) -> None:
+    """Create additive tables/indexes without executescript's implicit COMMIT."""
+    for _name, statement in _SCHEMA_OBJECTS:
         db.execute(statement)
+
+
+def schema_is_current(db: sqlite3.Connection) -> bool:
+    """Whether every object :func:`ensure_schema` creates already exists. Reads only."""
+    names = [name for name, _statement in _SCHEMA_OBJECTS]
+    placeholders = ", ".join("?" for _ in names)
+    found = db.execute(
+        f"SELECT count(*) FROM sqlite_schema WHERE name IN ({placeholders})", names
+    ).fetchone()[0]
+    return found == len(names)
+
+
+def identity_key(db: sqlite3.Connection, key: str, metadata: dict | None) -> str:
+    """Return the key of the active fact holding *metadata*'s identity, else *key*.
+
+    ``idx_memory_fact_identity`` makes the identity unique among active facts,
+    so a write naming an identity another key holds must land on that key; a
+    new key would INSERT a second holder. *metadata* must be normalized.
+    """
+    if not (metadata and metadata.get("subject") and metadata.get("predicate")):
+        return key
+    holder = db.execute(
+        "SELECT record_id FROM memory_record_meta WHERE scope=? AND subject=? "
+        "AND predicate=? AND status='active' AND kind IN ('fact','directive')",
+        (metadata.get("scope", ""), metadata["subject"], metadata["predicate"]),
+    ).fetchone()
+    return holder[0].removeprefix("key:") if holder else key
 
 
 def record_id_for(kind: str, record_id: str) -> str:
     if kind not in _KINDS or not isinstance(record_id, str) or not record_id:
         raise ValueError("Memory record kind and id are required")
     return record_id if kind == "episode" or record_id.startswith("key:") else f"key:{record_id}"
+
+
+def record_identity_or_none(kind: str, record_id: Any) -> str | None:
+    """The record id for a row, or ``None`` when its identity is NULL or empty.
+
+    SQLite lets a TEXT PRIMARY KEY hold NULL and older importers wrote such
+    rows; ``reconcile`` leaves them untouched rather than let one stop the
+    store from opening. Read paths share that contract through this helper so a
+    legacy row carries no metadata but never raises.
+    """
+    if not isinstance(record_id, str) or not record_id:
+        return None
+    return record_id_for(kind, record_id)
 
 
 def _json(value: Any) -> str:
@@ -207,15 +278,43 @@ def _timestamp(value: Any, field: str) -> str:
         raise ValueError(f"{field} must be an ISO date or timestamp") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    try:
+        return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except OverflowError as exc:
+        # An offset can move a date at the edge of the calendar past it in UTC
+        # ("9999-12-31T23:59:59-05:00"): an invalid value, not a crash.
+        raise ValueError(f"{field} is out of the supported date range") from exc
+
+
+def describe_fields(names: list[str]) -> str:
+    """Field names for an error or a log line: escaped, truncated and bounded.
+
+    An unknown name is untrusted text (model output or a request body), so a
+    message repeats at most ``_FIELD_NAME_CHARS`` characters of each and at most
+    ``_FIELD_NAMES_SHOWN`` names, escaped by ``repr`` so it stays on one line.
+    """
+    shown = [
+        repr(name[:_FIELD_NAME_CHARS]) + ("..." if len(name) > _FIELD_NAME_CHARS else "")
+        for name in names[:_FIELD_NAMES_SHOWN]
+    ]
+    more = len(names) - len(shown)
+    return ", ".join(shown) + (f" (+{more} more)" if more else "")
 
 
 def normalize_metadata(metadata: dict | None) -> dict:
-    """Validate a patch; canonical identity is explicit, never inferred from text."""
+    """Validate a patch; canonical identity is explicit, never inferred from text.
+
+    An unknown field is refused by name, so the error says which field the
+    schema does not know.
+    """
     if metadata is None:
         return {}
-    if not isinstance(metadata, dict) or any(key not in _FIELDS for key in metadata):
-        raise ValueError("Unknown memory metadata field")
+    if not isinstance(metadata, dict):
+        raise ValueError(_NOT_AN_OBJECT)
+    unknown = [str(key) for key in metadata if key not in _FIELDS]
+    if unknown:
+        plural = "s" if len(unknown) > 1 else ""
+        raise ValueError(f"Unknown memory metadata field{plural} {describe_fields(unknown)}")
     result = {}
     for key, value in metadata.items():
         if key in {"valid_from", "valid_until", "observed_at"}:
@@ -226,6 +325,19 @@ def normalize_metadata(metadata: dict | None) -> dict:
             result[key] = value.strip() if key == "scope" else " ".join(value.split())
             if key in {"subject", "predicate", "category"}:
                 result[key] = result[key].casefold()
+            # Casefolding can lengthen text ("ß" -> "ss"). The bound holds for the
+            # normalized value too, so a later pass over it (``sync_record``
+            # normalizes again) cannot refuse what this pass accepted.
+            if len(result[key]) > 1024:
+                raise ValueError(f"{key} must be text of at most 1024 characters")
+            # json.loads accepts a lone surrogate, which SQLite cannot encode:
+            # refuse it here as this field's invalid value, not at the INSERT.
+            try:
+                result[key].encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError(
+                    f"{key} contains unpaired surrogate characters and cannot be stored as UTF-8"
+                ) from None
     if "status" in result and result["status"] not in _STATUSES:
         raise ValueError("Unknown memory status")
     if (
@@ -235,6 +347,27 @@ def normalize_metadata(metadata: dict | None) -> dict:
     ):
         raise ValueError("valid_until must be later than valid_from")
     return result
+
+
+def normalize_extracted_metadata(metadata: object) -> tuple[dict, list[str]]:
+    """Normalize metadata a consolidation MODEL authored; returns ``(fields, dropped)``.
+
+    The write-side policy for metadata the model, not a caller, wrote. A field
+    name outside the schema carries nothing this table can store, so it is
+    dropped and returned for the caller to count and log rather than failing
+    the item or the span; unknown names never reach stored metadata. The known
+    fields are validated exactly as :func:`normalize_metadata` validates a
+    caller's patch, so a known field with an invalid value, or metadata that is
+    not an object, still raises ``ValueError`` for the caller to skip that one
+    item.
+    """
+    if metadata is None:
+        return {}, []
+    if not isinstance(metadata, dict):
+        raise ValueError(_NOT_AN_OBJECT)
+    dropped = [str(key) for key in metadata if key not in _FIELDS]
+    known = {key: value for key, value in metadata.items() if key in _FIELDS}
+    return normalize_metadata(known), dropped
 
 
 def _emails(row: dict | None) -> list[str]:
@@ -485,16 +618,44 @@ def eligible(metadata: dict, *, now: str | None = None) -> bool:
     )
 
 
+def ineligible_record_ids(rows) -> set[str]:
+    """Record ids among metadata *rows* that :func:`eligible` rejects right now.
+
+    A row whose status is not ``active`` is ineligible at every instant, so it is
+    settled without parsing any timestamp; only active rows carrying a validity
+    window are evaluated, against one ``now`` taken for the whole set.
+    """
+    blocked: set[str] = set()
+    now: str | None = None
+    for row in rows:
+        if row["status"] != "active":
+            blocked.add(row["record_id"])
+            continue
+        if now is None:
+            now = datetime.now(timezone.utc).isoformat()
+        if not eligible(dict(row), now=now):
+            blocked.add(row["record_id"])
+    return blocked
+
+
 def reconcile(db: sqlite3.Connection) -> int:
     """Backfill metadata, or journal writes made by an older compatible binary."""
     changed = 0
     for relation, kind in (("semantic_memory", "fact"), ("episodic_memories", "episode")):
         cursor = db.execute(f"SELECT * FROM {relation}")
         names = [column[0] for column in cursor.description]
+        skipped = 0
         for values in cursor:
             row = dict(zip(names, values))
+            identity = row["id"] if kind == "episode" else row["key"]
+            if not isinstance(identity, str) or not identity:
+                # SQLite lets a TEXT PRIMARY KEY hold NULL, and older importers
+                # wrote such rows. They cannot carry metadata; one of them must
+                # not stop the whole store from opening, so leave it untouched.
+                skipped += 1
+                continue
             actual_kind = "directive" if str(row.get("key", "")).startswith("lesson.") else kind
-            record_id = record_id_for(actual_kind, row["id"] if kind == "episode" else row["key"])
+            record_id = record_id_for(actual_kind, identity)
             previous = get_record_metadata(db, record_id)
             if previous.get("content_hash") == content_hash(row):
                 continue
@@ -517,4 +678,11 @@ def reconcile(db: sqlite3.Connection) -> int:
                 operation="legacy_sync" if previous else "backfill",
             )
             changed += 1
+        if skipped:
+            logger.warning(
+                "Memory reconcile skipped %d %s row(s) with no %s",
+                skipped,
+                relation,
+                "id" if kind == "episode" else "key",
+            )
     return changed

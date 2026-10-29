@@ -4,7 +4,7 @@ Skills are directories containing `SKILL.md` files. Global skills live in `~/.ki
 
 ## How Skills Work
 
-- **Always-on skills**: `always: true` injects full content into every eligible session.
+- **Always-on skills**: `always: true` injects full content into every eligible session. A project's own always-on skills share a smaller project budget; one that does not fit is left out and listed in the session with a pointer to read it instead.
 - **On-demand skills**: the session starts with a summary; the agent can load the full file when it applies.
 - **Triggered skills**: when `skills.max_triggered` is positive, matching positive triggers inject the skill; the default is `0`, which disables per-turn trigger matching.
 
@@ -47,9 +47,14 @@ Instructions, examples, and reference material that the agent reads when this sk
 | `name` | No | Display name; the loader uses the directory-relative path when it is absent. |
 | `description` | No | Summary used in skill listings; the loader falls back to the directory-relative path. |
 | `always` | No | `true` to inject full content every eligible session. |
-| `triggers` | No | Comma-separated phrases. A positive phrase matches when at least 70% of its words appear in the user text. Prefix with `!` for a negative trigger; every negative-trigger word must appear to exclude the skill. |
+| `triggers` | No | Comma-separated phrases. A positive phrase matches when at least 70% of its words appear in the user text. Case is ignored. Prefix a phrase with `=` to match it exactly as written, for a name that is also an ordinary word: `=Word` fires on "Word" but not on "word". Prefix with `!` for a negative trigger; every negative-trigger word must appear to exclude the skill. |
 | `inject_on_trigger` | No | Defaults to `true`. For non-project skills, `false` contributes a one-line pointer instead of the full body. Trusted project skills always inject their body. |
 | `repo_scope` | No | Restricts injection to a session whose active project or an ancestor contains the specified relative path. |
+| `app` | No | The name of the app this skill belongs to, as its `app.json` spells it (`ops-mission-control`, not the display name). While that app is disabled the skill is withheld everywhere, as the app's own bundled skills are. Needed only by an app skill shipped outside its app's folder; ignored on a trusted project skill. |
+
+`SKILL.md` must be UTF-8 text; a UTF-8 byte-order mark is accepted. A file in any
+other encoding (for example UTF-16 from PowerShell) is skipped, with one log
+warning naming the file. Re-save it as UTF-8 to load it.
 
 ## Creating Skills
 
@@ -72,7 +77,7 @@ Kiro Crew ships with built-in skills that are synced from the packaged skills di
 ## Skill Sources and Priority
 
 1. `~/.kiro/crew/skills/` — global skills.
-2. `skills.extra_paths` — read-only extra directories; a global skill wins on a duplicate name.
+2. `skills.extra_paths` — read-only extra directories; a global skill wins on a duplicate name. Edit them in Settings → Skills → Extra skill paths: one path per line, and spaces around a path and blank lines are ignored (order and duplicates are kept). The list is saved when you leave the field and applies without a restart; a path that does not exist or is not allowed is skipped, not rejected. From a terminal, `kirocrew config set skills.extra_paths '["/opt/skills"]'` works too; if your shell mangles the quotes (Windows PowerShell does), pass the JSON as Base64 in one attached argument: `kirocrew config set skills.extra_paths --value-base64=WyIvb3B0L3NraWxscyJd`.
 3. `<active-project>/.kiro/skills/` — loaded last, only when project skills are enabled and the user has granted that exact project directory trust.
 
 The startup sync also copies `$KIROCREW_PROJECT_DIR/skills/` and packaged built-in skills into the global directory, preserving newer user files unless the source is newer.
@@ -130,6 +135,6 @@ supported for the same reason.
 
 ## Skill Discovery Tools
 
-- `skill_search(query, limit?)` searches installed skills by key, name, and description, then searches bodies only if metadata has no matches. It defaults to 20 results and caps `limit` at 50.
-- `skill_discover(query, provider?, limit?)` searches the public registry (including skills.sh) and resolves a `owner/repo[@ref][:path]` query against GitHub; it does not install anything. It defaults to 10 results and caps `limit` at 50.
+- `skill_search(query?, action?, key?, limit?, offset?)` works on installed skills. The default `action=search` matches every query word against names, descriptions and bodies together and ranks the results; `action=list` browses the whole scope in pages with `offset`; `action=read` loads one exact `key` from a result. For search and list, `limit` defaults to 20 and caps at 50. A body too large for one answer (about 99,000 bytes) is read in pages: `offset` is the first line and `limit` the line count, and each page names the next offset. While the body index is still being built a search can say it is incomplete; repeat it to continue.
+- `skill_discover(query, provider?, limit?)` searches the public registry (including skills.sh) and resolves a `owner/repo[@ref][:path]` query against GitHub; it does not install anything. It defaults to 10 results and caps `limit` at 50. When every provider failed it returns an Error, not "no matches"; when only some failed it returns its results under a Warning.
 - `skill_fetch(id, provider?)` reads one discovered registry skill without installing it. It returns the main instruction file only; bundled sibling files are not available until installation.

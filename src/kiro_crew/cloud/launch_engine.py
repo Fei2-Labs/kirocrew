@@ -159,7 +159,9 @@ class RealLaunchEngine:
             detail = reach.get("detail") or reach.get("note") or "AWS credentials did not resolve"
             raise AWSError(str(detail))
 
-    def provision(self, *, tag: str, size_key: str, profile: str, region: str) -> str:
+    def provision(
+        self, *, tag: str, size_key: str, profile: str, region: str, subnet_id: str = ""
+    ) -> str:
         tier = sizes.get_tier(size_key)
         # No dashboard_port override: the stack binds its own DashboardPort
         # default. A crew once needed a bespoke port here because the tunnel
@@ -171,6 +173,7 @@ class RealLaunchEngine:
             tier=tier,
             profile=profile,
             region=region,
+            subnet_id=subnet_id,
         )
         return result.instance_id
 

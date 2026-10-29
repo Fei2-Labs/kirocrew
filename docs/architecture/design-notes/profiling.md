@@ -29,13 +29,19 @@ right tool for "why is this one operation slow".
 
 ```bash
 KIROCREW_DEBUG=1 kirocrew perf sample \
-  --call kiro_crew.history:ConversationLog.list_sessions \
+  --call kiro_crew.cli_doctor:_doctor \
   --interval 0.002 \
-  --output /tmp/list-sessions.folded
+  --output /tmp/doctor.folded
 ```
 
-The callable is invoked with no arguments. If it raises, the profile is still
-written — the stacks leading to a failure are usually the point.
+The callable is invoked with no arguments, so it must be a module-level function
+(or other callable) that needs none; an unbound instance method such as
+`ConversationLog.list_sessions` raises `TypeError` at once. If the call raises
+(including `SystemExit`, which `_doctor` raises when it finds an issue), the error
+is printed and the profile is still written, provided at least one sample was
+taken — the stacks leading to a failure are usually the point. A call that ends
+before one sampling interval collects no samples: the command exits 1 and writes
+no file.
 
 ## Profiling a running gateway (needs py-spy)
 
@@ -130,16 +136,20 @@ Electron's own log directory, per platform:
 | Platform | Path |
 |---|---|
 | macOS | `~/Library/Logs/KiroCrew/desktop-metrics.json` |
-| Linux | `${XDG_CONFIG_HOME:-~/.config}/KiroCrew/logs/desktop-metrics.json` |
-| Windows | `%APPDATA%\KiroCrew\logs\desktop-metrics.json` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/kirocrew-desktop/logs/desktop-metrics.json` |
+| Windows | `%APPDATA%\kirocrew-desktop\logs\desktop-metrics.json` |
 
 Nightly builds install under their own product name (`KiroCrew Nightly`), so they
-log to a sibling directory -- `~/Library/Logs/KiroCrew Nightly/` and equivalents.
-Both are probed, and if both have recorded, the **newest** artifact wins: with
-release and nightly side by side, the build you just reproduced against is the one
-that wrote last.
+log to a sibling directory -- `~/Library/Logs/KiroCrew Nightly/` on macOS, and
+`kirocrew-desktop-nightly` in place of `kirocrew-desktop` on Linux and Windows,
+where the directory follows the npm package name rather than the product name.
+The CLI probes product-name directories (`KiroCrew` and `KiroCrew Nightly`)
+and selects the **newest** artifact found. On Linux and Windows these differ
+from the npm-name directories above, so pass the artifact's full path with
+`kirocrew desktop metrics --path "<artifact-path>"`. That gap is tracked as
+issue #13105; the explicit path stops being necessary once the probe is fixed.
 
-Pass `--path` to read an artifact from somewhere else (one attached to a bug
+Pass `--path` for an artifact from somewhere else too (one attached to a bug
 report, for instance). `--json` emits the raw document; `--top N` changes how many
 processes are listed.
 

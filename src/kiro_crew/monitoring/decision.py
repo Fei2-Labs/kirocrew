@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 
+from kiro_crew.metrics import monitor_loops as monitor_loop_metrics
 from kiro_crew.monitoring import models
 
 # A skip that made no API call is not evidence about the target, and this module
@@ -100,15 +101,22 @@ def decide_monitor(
     the verdict it digests does not exist before then.
     """
     entries = (observation,)
-    return MonitorVerdict(
-        decision=_fold_stall_streak(
-            state,
-            _decide_effect(state, observation, now=now),
-            entries,
-            now=now,
-        ),
-        entries=entries,
+    decision = _fold_stall_streak(
+        state,
+        _decide_effect(state, observation, now=now),
+        entries,
+        now=now,
     )
+    # One increment per call, at the one place every path through this policy
+    # converges: the decision is already folded, so what is counted is the
+    # verdict the caller acts on rather than the effect a later step may still
+    # replace. Only the decision's own value and the monitored kind travel --
+    # never the target, the objective or any fingerprint. An in-memory add,
+    # which is why a pure policy may carry it: nothing here reads a clock, a
+    # file or a socket for it, and the emit swallows its own failures, so this
+    # module stays deterministic for its callers and its tests.
+    monitor_loop_metrics.record_monitor_decision(decision, state.kind)
+    return MonitorVerdict(decision=decision, entries=entries)
 
 
 def _verdict_digest(
@@ -288,7 +296,9 @@ def _decide_effect(
     # Any non-actionable outcome settles the subject, so no window stays open.
     _close_window(state, now=now)
     if observation.supplemental_provider_error is not None:
-        return _supplemental_provider_error_decision(state, state.budgets)
+        return _supplemental_provider_error_decision(
+            state, state.budgets, observation.supplemental_provider_error
+        )
     if observation.status is MonitorObservationStatus.SUCCESS:
         if observation.head_changed:
             return MonitorDecision.WAKE_ACTIONABLE
@@ -382,7 +392,9 @@ def _coalesce_actionable(
         # Every condition is inside its re-alert interval, so this wake could
         # tell the owner nothing the last one did not.
         if observation.supplemental_provider_error is not None:
-            return _supplemental_provider_error_decision(state, state.budgets)
+            return _supplemental_provider_error_decision(
+                state, state.budgets, observation.supplemental_provider_error
+            )
         return MonitorDecision.NO_CHANGE
 
     window_was_open = bool(state.coalesce_windows)
@@ -508,11 +520,16 @@ def terminal_decision_for_outcome(outcome: MonitorOutcome | None) -> MonitorDeci
 
 
 def monitor_budget_reason(state: MonitorState, *, now: float) -> str:
-    """Return the first exhausted hard bound in stable policy order."""
+    """Return the first exhausted hard bound in stable policy order.
+
+    A ``max_agent_turns`` of zero means unlimited wakes, so the turn bound is
+    skipped rather than compared. Comparing it would make the bound true of a
+    monitor that has run no turns at all, retiring every watch on its first wake.
+    """
     budgets = state.budgets
     if now - state.created_ts >= budgets.max_runtime_secs:
         return MONITOR_STOP_RUNTIME_BUDGET
-    if state.agent_turns >= budgets.max_agent_turns:
+    if budgets.max_agent_turns > 0 and state.agent_turns >= budgets.max_agent_turns:
         return MONITOR_STOP_AGENT_TURN_BUDGET
     if state.total_tokens >= budgets.max_tokens:
         return MONITOR_STOP_TOKEN_BUDGET
@@ -564,7 +581,7 @@ def monitor_stall_reason(state: MonitorState, *, now: float) -> str:
     Reorder the fold, let a non-counted tick leave the streak standing, count a
     decision other than ``NO_CHANGE``, or unfence that rollback, and the reason
     composition in both callers needs a decision guard it does not have today.
-    ``test_monitor_controller`` pins the invariant rather than guarding its
+    ``test_monitor_controller_realert_stall`` pins the invariant rather than guarding its
     consequence, so breaking one of the three reddens a test that names this
     docstring.
 
@@ -606,8 +623,16 @@ def _provider_error_decision(
 def _supplemental_provider_error_decision(
     state: MonitorState,
     budgets: MonitorBudgets,
+    error: ProviderErrorKind,
 ) -> MonitorDecision:
-    """Retry incomplete secondary evidence before retiring the readable target."""
+    """Retry incomplete secondary evidence before retiring the readable target.
+
+    Gated on the same retryable set as the primary error path: a permanent
+    secondary failure (auth, not-found, setup) stops immediately instead of
+    burning retries until the provider-error budget runs out.
+    """
+    if error not in _RETRYABLE_PROVIDER_ERRORS:
+        return MonitorDecision.STOP_BLOCKED
     if state.consecutive_provider_errors + 1 >= budgets.max_provider_errors:
         return MonitorDecision.STOP_BLOCKED
     return MonitorDecision.RETRY_PROVIDER

@@ -50,7 +50,6 @@ from aiohttp import streams, web
 from aiohttp.test_utils import make_mocked_request
 
 from kiro_crew import memory_backup, memory_stores
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import loader as loader_mod
 from kiro_crew.config.loader import config_dir
 from kiro_crew.context import ContextBuilder
@@ -694,6 +693,7 @@ class TestAnAbsentParameterDoesNotFollowTheSessionKeyHeader:
                 "/api/memory/preferences",
                 env.state(bound_to=_FINANCE),
                 body={"content": "zzq-written-by-a-named-session-key"},
+                owner=True,
             )
         )
         assert resp.status == 200
@@ -944,16 +944,20 @@ async def test_dashboard_backup_uses_configured_retention(env, keep, remaining):
     env.declare()
     path = env.seed_vector_file(DEFAULT_MEMORY_STORE, _GLOBAL_KEY)
     config_path = env.home / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["memory"] = {"backup_enabled": False, "backup_keep": keep}
-    # The seed above LOADED the config, and a load of this minimal document
-    # performs its write-back migration -- an atomic replace of ``config.json``.
-    # On Windows an AV or indexer handle on the just-replaced file makes the
-    # next open-for-write a sharing violation (``PermissionError``), so this
-    # write goes through the production writer, off the loop, where its rename
-    # retries that window instead of failing on it.
-    await asyncio.to_thread(atomic_write, config_path, json.dumps(config))
-    loader_mod._invalidate_config_cache()
+
+    def _set_retention(current: dict) -> dict:
+        current["memory"] = {"backup_enabled": False, "backup_keep": keep}
+        return current
+
+    # The seed above LOADED the config, and a load of this minimal document performs
+    # its write-back migration -- a locked read-modify-write of ``config.json``. That
+    # load can also run on the telemetry consent recheck's own thread, which the
+    # seed's database queries start once the recheck window has lapsed, as it has in
+    # any long-lived worker. So the setting is written the way the dashboard writes
+    # one: inside the same lock, with the document read inside the hold, off the loop
+    # where the lock is waited for. An unlocked write lands between that migration's
+    # read and its write and is replaced by the migrated pre-write document.
+    await asyncio.to_thread(loader_mod.update_config_locked, config_path, mutate=_set_retention)
     assert loader_mod.KiroCrewConfig.load().memory.backup_keep == keep
     assert loader_mod.KiroCrewConfig.load().memory.backup_keep == keep
     for day in range(1, 9):
@@ -1143,3 +1147,47 @@ class TestTheStoreListSurvivesOneDamagedStore:
         assert resp.status == 403
         assert _body(resp)["code"] == "owner_only"
         assert _FINANCE not in _text(resp)
+
+
+# ── 10. An undecodable document is refused, never served or overwritten ──────
+
+
+class TestAnUndecodableDocumentIsRefused:
+    """One non-UTF-8 byte answers 409 ``memory_document_undecodable``.
+
+    Both methods, both documents, both store shapes. The bytes are compared after
+    the PUT because the refusal is only worth anything if the file survives it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("store", [DEFAULT_MEMORY_STORE, _FINANCE])
+    @pytest.mark.parametrize(
+        "route,handler,filename",
+        [
+            ("/api/memory/preferences", memory_handlers.api_memory_preferences, "preferences.md"),
+            ("/api/memory/projects", memory_handlers.api_memory_projects, "projects.md"),
+        ],
+    )
+    async def test_get_and_put_answer_409_and_leave_the_bytes(
+        self, env, store, route, handler, filename
+    ) -> None:
+        env.declare(_FINANCE)
+        mem = env.markdown(store)
+        target = mem._preferences_file if filename == "preferences.md" else mem._projects_file
+        assert env.home in target.parents, target
+        target.write_bytes(b"\xff")
+        state = env.state()
+        query = {"store": store}
+
+        read = await handler(_request("GET", route, state, query=query, owner=True))
+        assert read.status == 409, (route, store)
+        assert _body(read)["code"] == "memory_document_undecodable"
+        assert _body(read)["file"] == filename
+
+        written = await handler(
+            _request("PUT", route, state, query=query, owner=True, body={"content": "- new\n"})
+        )
+        assert written.status == 409, (route, store)
+        assert _body(written)["code"] == "memory_document_undecodable"
+        assert _body(written)["file"] == filename
+        assert target.read_bytes() == b"\xff"

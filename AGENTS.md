@@ -37,7 +37,7 @@ in the **same commit** when you change what it documents.
 | If you are touching… | Read first |
 |---|---|
 | `platform/`, editions, CPP seam, governance | [platform-context](docs/system-specs/modules/platform-context.md) + [governance](docs/system-specs/modules/governance.md) |
-| `security.py`, `hooks.py`, denied commands, sensitive paths | [security](docs/system-specs/modules/security.md) + [sel](docs/system-specs/modules/sel.md) |
+| `security.py`, `hooks.py`, `hook_runtime/`, denied commands, sensitive paths | [security](docs/system-specs/modules/security.md) + [sel](docs/system-specs/modules/sel.md) |
 | `config/` — the live watcher, `restart=True` marks, appliers, `config.json` writes | [config](docs/system-specs/modules/config.md) |
 | the security model as a whole, threat boundaries | [security-deep-dive](docs/architecture/security-deep-dive.md) |
 | `computer_use/` | [computer-use](docs/system-specs/modules/computer-use.md) |
@@ -45,16 +45,18 @@ in the **same commit** when you change what it documents.
 | `acp/`, kiro-cli transport, providers | [acp-client](docs/system-specs/modules/acp-client.md) + [providers](docs/system-specs/modules/providers.md) |
 | picking or defaulting a model anywhere | [model-selection](docs/system-specs/common/model-selection.md) + [model-fallback](docs/system-specs/modules/model-fallback.md) |
 | adding or adapting an agent harness (BYO, KAS, claude) | [harness-parity](docs/system-specs/modules/harness-parity.md) (invariants) + [harness-parity-gate](docs/ci/harness-parity-gate.md) (CI) |
-| an agent spec: `agent_discovery.py`, `agent_spec_format.py`, `agent.py`'s spec writers, `acp/kas_agents.py`, or any field a spec carries | [agent-spec-fields](src/kiro_crew/docs/agent-spec-fields.md) (what each field does, per backend) + [agent-host-contract](docs/system-specs/modules/agent-host-contract.md) (the per-harness table) |
+| an agent spec: `agent_discovery.py` and its `agent_discovery_parts/` owners, `agent_spec_format.py`, `agent.py`'s spec writers, its `agent_parts/` owners and `agent_materialization/`, `acp/kas_agents.py`, or any field a spec carries | [agent-spec-fields](src/kiro_crew/docs/agent-spec-fields.md) (what each field does, per backend) + [agent-host-contract](docs/system-specs/modules/agent-host-contract.md) (the per-harness table) |
 | the publicly selectable Claude backend | [claude-code-provider](docs/system-specs/modules/claude-code-provider.md) |
 | sessions, slots, session keys, PIDs | [session](docs/system-specs/modules/session.md) + [history](docs/system-specs/modules/history.md) |
+| killing a runtime, leases and tenancies, sweeps and reapers, `runtime_ownership.py`, `runtime_reconcile.py`, the kill paths of `session_pid.py` and its `session_pid_*.py` owners | [runtime-ownership](docs/system-specs/modules/runtime-ownership.md) |
 | session summaries, the chat summary panel, intent extraction | [session-summary](docs/system-specs/modules/session-summary.md) |
 | memory, embeddings, vectors, lessons, skills, hooks | [memory-skills-hooks](docs/system-specs/modules/memory-skills-hooks.md) |
-| `context.py`, `context_blocks.py`, what reaches the model's context | [context-management](docs/architecture/context-management.md) |
+| `context.py`, `context_blocks.py`, `context_assembly/`, what reaches the model's context | [context-management](docs/architecture/context-management.md) + [memory-skills-hooks: Context Builder](docs/system-specs/modules/memory-skills-hooks.md#context-builder-contextpy) (module ownership) |
 | MCP servers or tools (adding, changing, statelessness) | [mcp](docs/architecture/mcp.md) |
+| `mcp_gateway/` — `gatewayd.py`, `daemon/`, the daemon's lifecycle and facade | [mcp-gateway-daemon-lifecycle](docs/system-specs/modules/mcp-gateway-daemon-lifecycle.md) + [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
-| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/modules/stt-streaming.md) + [voice-streaming](docs/system-specs/modules/voice-streaming.md) |
+| `stt/`, `transcribe.py` and its `transcribe_*.py` owners, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/modules/stt-streaming.md) + [voice-streaming](docs/system-specs/modules/voice-streaming.md) |
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
@@ -65,10 +67,11 @@ in the **same commit** when you change what it documents.
 | themes | [themes](docs/system-specs/modules/themes.md) + [theming-contract](website/docs/theming-contract.md) |
 | anything under `website/` | [`website/AGENTS.md`](website/AGENTS.md) |
 | user-facing strings, dates, numbers, sort order | [i18n-catalog](website/docs/i18n-catalog.md) (authoring) + [i18n-gates](docs/ci/i18n-gates.md) (CI) |
-| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools, version-manager shims), spawning a real child or reaping one, `.worktrees/` in a repo-wide scan, what `TMPDIR` must not be, what a worker costs, collection-time probes that build a singleton, a `MagicMock` the code converts with `int()`, sizing a ReDoS / complexity guard | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
+| tests: flakes, hangs, speed, memory, fixtures, sharding, side effects, host state (`~/.kiro`, `Path.home()`, the systemd user manager), conftest isolation, `monkeypatch.undo()`, env-var leaks, host-dependent tests (Windows, Python 3.13, per-user tools, version-manager shims), spawning a real child or reaping one, `.worktrees/` in a repo-wide scan, what `TMPDIR` must not be, what a worker costs, collection-time probes that build a singleton, a `MagicMock` the code converts with `int()`, sizing a ReDoS / complexity guard, clocks and time, sleeps, ordering and timestamp ties, ports, timezone and locale, randomness, repeat and shuffle proof, a flaky CI red | [testing-conventions](docs/system-specs/common/testing-conventions.md) + the [writing-tests](src/kiro_crew/builtin_skills/kirocrew-dev/writing-tests/SKILL.md) skill; frontend and Electron tests: [website/docs/testing.md](website/docs/testing.md) |
 | browser E2E | [e2e-gate](docs/ci/e2e-gate.md) |
 | proving a worktree change against an isolated running gateway | [worktree-verification-recipes](docs/guides/worktree-verification-recipes.md) |
-| CI, PR flow, review gates, commit messages | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
+| CI, PR flow, review gates (a lane says PASS or BLOCK, with a Trigger and an Outcome), commit messages | [ci-and-reviews](docs/ci/ci-and-reviews.md) + [CONTRIBUTING.md](CONTRIBUTING.md) |
+| a PR that hides, deletes, tightens or migrates something (the `Reader:` list) | [take-away-changes](docs/system-specs/common/take-away-changes.md) |
 | constants, comments, lint, code style, the brand name | [code-style](docs/system-specs/common/code-style.md) |
 | connections, connectors, an external account link | [connections](docs/system-specs/modules/connections.md) |
 | the connector campaign's manifest schema or work-stream DAG | [connector-capability-manifest](docs/system-specs/modules/connector-capability-manifest.md) |
@@ -80,6 +83,7 @@ in the **same commit** when you change what it documents.
 | build, install, dev mode | [CONTRIBUTING.md](CONTRIBUTING.md) + [install](docs/guides/install.md) |
 | cutting a release, `__version__`, or the fork version identity | [release](docs/build/release.md) |
 | `CHANGELOG.md` | [changelog](docs/build/changelog.md) |
+| a user-facing label, wording, placement or behaviour a person may already have decided | [docs/decisions/README.md](docs/decisions/README.md) |
 | errors, retries, user-facing failure text | [error-handling](docs/system-specs/common/error-handling.md) |
 | what this public fork must never re-introduce | [oss-fork-boundaries](docs/system-specs/oss-fork-boundaries.md) |
 | any doc: moving, renaming, indexing it | [docs/README.md](docs/README.md) |
@@ -146,7 +150,7 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
   command line and the OS sandbox does not hold the path (#7441 went four rounds
   of `command`/`exec -a`/`nice`/`env -i`/`timeout`/`busybox` before restructuring).
 - **The sandbox's SCOPE is the operator's to widen, never yours.** What
-  `sandbox.py` seals, masks or no-follow pins decides which of the operator's own
+  `sandbox.py` and its `sandbox_*` owners seal, mask or no-follow pin decides which of the operator's own
   files their agent can still reach, so a widening they did not ask for surfaces
   days later as work that stopped, with no record that anyone chose to lose it.
   Never add a seal, mask or refusal a task did not ask for, never tighten a fence
@@ -174,8 +178,9 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
 `claude-*`, `opus*`, `sonnet*`, `haiku*`, `gpt-*` or `fable*` as a default or
 fallback fails at runtime for anyone not entitled to it, silently until the first
 prompt. The default is `"auto"`; resolve a substitute choice through
-`acp.client.resolve_usable_model`; pin a cheaper model only via
-`agent.role_models.<role>`. `code-review.yml` fails on a newly added hardcoded
+`acp.client.resolve_usable_model`; pin a cheaper model for the worker roles only
+via `agent.role_models.<role>` (and, for one mate's dispatched sessions, via
+that mate's `worker_model`). `code-review.yml` fails on a newly added hardcoded
 literal. Rules and the one exception:
 [model-selection](docs/system-specs/common/model-selection.md).
 
@@ -202,6 +207,9 @@ gate locally with
 - MUST read the owning spec under `docs/system-specs/` before changing the code it
   covers, and MUST update it in the SAME commit.
 - MUST NOT create additional markdown files unless explicitly instructed.
+- MUST grep `docs/decisions/` before changing a recorded label, placement or
+  behaviour; an entry is reversed only by a new superseding entry a maintainer
+  wrote, never by an edit, a friction report or a review finding.
 - Everything else about adding, moving, indexing and linting a doc — including
   `scripts/docs-lint.sh` — is [docs/README.md](docs/README.md). Treat
   `docs/task-specs/` as an archive, never as current context.
@@ -213,6 +221,9 @@ gate locally with
   is NOT permission to push.
 - `main` is the default branch; changes land through a GitHub PR. The full flow:
   [CONTRIBUTING.md](CONTRIBUTING.md).
+- Never `git stash` (every worktree shares one stash list) and never overlay a
+  whole tree with `git checkout <ref> -- .`. To bring the main clone current,
+  follow the `kirocrew-worktree-dev` skill.
 
 ```
 <type>: <summary — max 72 chars, imperative, lowercase, no period>
@@ -223,6 +234,24 @@ gate locally with
 Types the PR-title gate in `code-review.yml` accepts: `feat`, `fix`, `docs`,
 `style`, `refactor`, `perf`, `test`, `chore`, `ci`, `build`, `revert`. **One
 logical change per commit**, and at most two commits per PR.
+
+### PR description
+
+`gh pr create --body` / `--body-file` bypasses the GitHub template, so build the
+body from `.github/PULL_REQUEST_TEMPLATE.md` yourself: keep every heading
+verbatim and fill in the `**Goal:**` line. PR Hygiene fails a body missing the
+required sections; check it before opening with
+`out="$(mktemp)"; PR_BODY="$(cat <file>)" GITHUB_OUTPUT="$out" bash .github/scripts/pr-description-check.sh; cat "$out"`.
+
+### PR goal is frozen
+
+The `**Goal:**` line, `## Why it matters` and `## Not a goal` are written once,
+when the PR opens. Never edit them on your own, not even to match the diff. A
+finding outside the goal is rebutted or deferred, never absorbed by widening the
+goal. A defect in code this PR adds or changes is always in scope and gets fixed;
+'out of goal' applies only to new scope — a new feature, surface, or hardening this
+PR does not need. Edit them only when a human explicitly asks, and say why in a PR
+comment.
 
 ## CHANGELOG.md
 
@@ -240,15 +269,26 @@ from the suffix rule: [release](docs/build/release.md).
 ## The gate before you commit
 
 ```bash
-python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test
-flake8 src/kiro_crew test && mypy src/kiro_crew
+python3 scripts/check_black_formatting.py && python3 scripts/check_subprocess_encoding.py && isort src/kiro_crew test conftest.py xdist_budget.py
+flake8 src/kiro_crew test conftest.py xdist_budget.py && mypy src/kiro_crew
+BASE="$(git merge-base HEAD origin/main)" && COMMENT_HISTORY_BASE_REF="$BASE" python3 scripts/check_comment_history.py && BRAND_BASE_REF="$BASE" python3 scripts/check_brand_name.py
 python3 scripts/local-gate.py
 ```
+
+The third line runs the two diff-scoped Fast Gate checks most often red on a
+PR: history narration in an added comment, and a misspelled product name on an
+added line. If `check_black_formatting.py` reports a baselined file as now
+black-clean (formatting what you touched does that), run it with
+`--update-baseline` and commit the shorter baseline.
 
 `local-gate.py` runs the tests related to your diff on both surfaces with a
 bounded worker count; the full suite is CI's job and never runs locally unless a
 human passes `--full`. See
-[prepare-pr](src/kiro_crew/builtin_skills/kirocrew-dev/prepare-pr/references/gate-floor.md).
+[kirocrew-prepare-pr](src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/references/gate-floor.md).
+
+To run the cheap CI gates in one go and record that you did, use the optional
+[pre-push gate](src/kiro_crew/builtin_skills/kirocrew-dev/kirocrew-prepare-pr/references/pre-push-gate.md).
+It is advisory: nothing refuses a push without it.
 
 - **On macOS, run `mypy --platform linux src/kiro_crew`.** Without it a local run
   reports errors you did not cause and MISSES the Linux-only errors CI fails on, so
@@ -261,12 +301,37 @@ human passes `--full`. See
   --max-worker-restart=2`; a bare override silently drops `--dist loadgroup` and
   scatters `@pytest.mark.xdist_group` tests into flaky races.
 
-Gates, the six flake classes, the conftest isolation floor and the traps that are
+**No hand-written file over 2,000 lines; put new code in a new module.** A new
+responsibility gets a new module, never a new section in a large file, and a change
+that takes a code file past 1,600 lines splits it in the same PR or in one before it.
+Split by responsibility, moving whole definitions into a sibling module, and keep the
+original path as the import path callers use. `scripts/check_file_line_cap.py`
+enforces the cap in CI's lint jobs; run it before you push. The files already over
+are listed in `.github/file-line-cap-baseline.txt`, which only shrinks, so never add
+a row. How to split without losing a patch seam:
+[code-style § Splitting a file](docs/system-specs/common/code-style.md#splitting-a-file).
+
+Gates, the seven flake classes, the conftest isolation floor and the traps that are
 invisible when reading a test: [code-style](docs/system-specs/common/code-style.md) +
 [testing-conventions](docs/system-specs/common/testing-conventions.md). A test that
 can block forever is a lost RUN, not a failed test: on Windows pytest-timeout kills
 the xdist worker, and with `--max-worker-restart=0` one unbounded `await` aborts the
 whole job (class 6). Frontend and Electron: [website/docs/testing.md](website/docs/testing.md).
+
+Tests MUST be deterministic: wait on a signal, never sleep as a barrier; never sleep
+to make timestamps differ (set them); one clock, injected or frozen at the module's
+own binding; never assert an order you did not define; no literal port for a real
+listener (bind 0); no network beyond loopback; every self-unblocked await bounded.
+`AUTOSDE.yaml`'s `tests-are-deterministic` rule blocks these in review, the SAST
+job's `semgrep/test-determinism.yaml` refuses the commonest on a new line, and
+`test/test_flake_pattern_ratchet.py` counts per file the clock, wait, port, environment
+and module-cache shapes those patterns miss, failing a change that adds one to a file
+(measured against its merge-base; a deliberate one carries `# flake-ok: <reason>`).
+Fast Gate's `flake-pattern-ratchet` job runs it on every pull request and fails when it
+compares nothing (why: testing-conventions.md "Determinism contract"); run
+`python -m pytest -n0 test/test_flake_pattern_ratchet.py` before pushing to see it first.
+Contract:
+[testing-conventions § Determinism contract](docs/system-specs/common/testing-conventions.md#determinism-contract-read-this-first).
 
 ## Cross-platform
 

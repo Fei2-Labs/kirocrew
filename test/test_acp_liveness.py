@@ -1,7 +1,7 @@
 """Unit tests for the per-session liveness oracle (``acp/liveness.py``).
 
 The oracle is the detector behind the verdict-driven watchdogs in
-``session_handle._dispatch_events``: WORKING is never acted on, DEAD acts
+``session_handle_dispatch._dispatch_events``: WORKING is never acted on, DEAD acts
 immediately, UNKNOWN falls back to (non-lethal) timeouts. These tests exercise
 the /proc evidence paths against a fake proc tree — no real processes.
 """
@@ -17,9 +17,11 @@ import pytest
 
 from conftest import requires_symlinks
 from kiro_crew.acp import liveness
+from kiro_crew.acp._dispatch import _dumps_degraded, _redact
 from kiro_crew.acp.liveness import (
     CHILD_EXIT_GRACE_SECS,
     EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_SHARED_TREE,
     EVIDENCE_SHELL_CHILD_ABSENT,
     VERDICT_DEAD,
     VERDICT_STUCK_INPUT,
@@ -28,6 +30,7 @@ from kiro_crew.acp.liveness import (
     LivenessOracle,
     ToolCallState,
     consult_offloaded,
+    match_fragment,
 )
 
 
@@ -73,9 +76,9 @@ class FakeProc:
         (d / "task" / str(pid) / "children").write_text(kids)
         # stat: pid (comm) state ... utime(14) stime(15) ... starttime(22)
         fields = ["0"] * 50
-        fields[0] = state          # field 3
-        fields[11] = str(cpu)      # utime (field 14)
-        fields[12] = "0"           # stime (field 15)
+        fields[0] = state  # field 3
+        fields[11] = str(cpu)  # utime (field 14)
+        fields[12] = "0"  # stime (field 15)
         fields[19] = str(int(starttime))  # starttime (field 22)
         (d / "stat").write_text(f"{pid} (fake proc) {' '.join(fields)}\n")
         (d / "cmdline").write_bytes(cmdline.replace(" ", "\0").encode() + b"\0")
@@ -121,8 +124,13 @@ class FakeProc:
         (d / "tcp6").write_text(header)
 
 
-def _oracle(fake: FakeProc, clock: _Clock, sample_min: float = 3.0) -> LivenessOracle:
-    return LivenessOracle(str(fake.root), now=clock, sample_min_secs=sample_min)
+def _oracle(
+    fake: FakeProc,
+    clock: _Clock,
+    sample_min: float = 3.0,
+    tenancy=None,
+) -> LivenessOracle:
+    return LivenessOracle(str(fake.root), now=clock, sample_min_secs=sample_min, tenancy=tenancy)
 
 
 # ── Shell tool evidence ──────────────────────────────────────────────────────
@@ -203,6 +211,120 @@ def test_no_matching_child_is_unknown(tmp_path):
     verdict, evidence = oracle.check_tool(100, tool)
     assert verdict == VERDICT_UNKNOWN
     assert "no matching" in evidence
+
+
+# ── Command matching against the cached JSON rendering ──
+#
+# The dispatch layer caches a dict tool input as its indented JSON rendering,
+# redacted, and that string is what ``ToolCallState.command`` carries. The child
+# runs the command TEXT (``bash -c <command>``), so a match key taken from the
+# rendering must be taken from the decoded ``command`` value: in the rendering a
+# newline is the two characters ``\n``, and a fragment cut at the backslash
+# begins with a stray ``n`` that no real cmdline contains.
+
+_MULTI_LINE_LONGEST_LAST = (
+    "echo start\n"
+    "for i in $(seq 1 20); do sleep 15; done; echo this-line-is-longer-than-the-first-one-on-purpose"
+)
+_MULTI_LINE_LONGEST_FIRST = (
+    "echo this-first-line-is-deliberately-the-longest-one-here\n"
+    "for i in $(seq 1 20); do sleep 15; done"
+)
+_SINGLE_LINE = "for i in $(seq 1 20); do sleep 15; done; echo this-line-is-longer-than-the-first-one-on-purpose"
+
+
+def _cached_shell_input(command: str) -> str:
+    """*command* exactly as the dispatch layer caches it for the oracle."""
+    return _redact(_dumps_degraded({"command": command, "summary": "probe"}, indent=2))
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        pytest.param(
+            _MULTI_LINE_LONGEST_LAST,
+            "for i in $(seq 1 20); do sleep 15; done; echo this-line-is-longer-than-the-first-one-on-purpose",
+            id="multi-line-longest-line-not-first",
+        ),
+        pytest.param(
+            _MULTI_LINE_LONGEST_FIRST,
+            "echo this-first-line-is-deliberately-the-longest-one-here",
+            id="multi-line-longest-line-first",
+        ),
+        pytest.param(_SINGLE_LINE, _SINGLE_LINE, id="single-line"),
+    ],
+)
+def test_match_fragment_is_a_line_of_the_decoded_command(command, expected):
+    """The fragment is a verbatim line of the command, whichever line is longest.
+
+    Every fragment must be a substring of the child's real cmdline, which
+    carries the command text with its newlines intact.
+    """
+    fragment = match_fragment(_cached_shell_input(command))
+
+    assert fragment == expected
+    assert fragment in "bash -c " + command
+
+
+def test_redaction_marker_inside_the_rendering_still_splits_the_fragment():
+    """A redacted span never reaches the fragment: the child's cmdline holds the
+    real bytes, so the key is taken from the text on either side of the marker."""
+    cached = (
+        '{\n  "command": "curl -H \\"Authorization: [REDACTED: credential]\\" '
+        'https://example.invalid/results; sleep 300",\n  "summary": "probe"\n}'
+    )
+    child = 'bash -c curl -H "Authorization: Bearer real-token-value" https://example.invalid/results; sleep 300'
+
+    fragment = match_fragment(cached)
+
+    assert fragment == "https://example.invalid/results; sleep 300"
+    assert fragment in child
+
+
+def test_argv_list_command_keeps_the_rendering_wide_split():
+    """A ``command`` that is not a string (an argv array) has no text to decode,
+    so the rendering itself is fragmented, as for any plain-text input."""
+    cached = _dumps_degraded(
+        {"command": ["bash", "-lc", "long-build release > build.log 2>&1"]}, indent=2
+    )
+
+    assert match_fragment(cached) == "long-build release > build.log 2>&1"
+
+
+def test_multi_line_command_cached_as_json_matches_its_live_shell_child(tmp_path):
+    """End to end: a running multi-line command whose longest line is not its
+    first is WORKING, not ``no matching shell child``."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, children=[200], cmdline="kiro-cli acp")
+    fake.add_pid(200, cmdline="bash -c " + _MULTI_LINE_LONGEST_LAST)
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool(_cached_shell_input(_MULTI_LINE_LONGEST_LAST), clock)
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_WORKING, evidence
+    assert "200" in evidence
+
+
+def test_a_lookalike_sharing_only_the_program_name_is_not_bound(tmp_path):
+    """Decoding serves the fragment key alone. The program-name key stays cut
+    from the rendering, where it reads nothing, so a JSON-rendered input never
+    binds a sibling's child of the same interpreter: under a shared runtime that
+    child's exit would read as this command's death and cancel a healthy turn."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, children=[200], cmdline="kiro-cli acp")
+    fake.add_pid(200, cmdline="python3 -m pytest test/test_other_thing.py -n0")
+    oracle = _oracle(fake, clock)
+    tool = _shell_tool(
+        _cached_shell_input("python3 tools/update_index.py --rebuild --quiet"), clock
+    )
+
+    verdict, evidence = oracle.check_tool(100, tool)
+
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence == "no matching shell child", evidence
 
 
 # ── The never-matched fork: absent child vs unrecognized live child ──
@@ -376,6 +498,87 @@ def test_every_production_dispatch_answers_both_attribution_fields():
     assert sites, "no production ToolCallState construction found - the ratchet has gone blind"
     missing = [(name, line, sorted(gap)) for name, line, gap in sites if gap]
     assert not missing, f"dispatch sites not answering an attribution field: {missing}"
+
+
+def test_every_production_dispatch_wires_the_trusted_wait_identity():
+    """The wait contract is selected by ``mcp_server_name`` + ``tool_name``, which
+    default to empty (fail-closed). A dispatch site that forgets to pass them
+    silently loses the contract and badges a healthy wait, so every production
+    ``ToolCallState`` construction must answer both."""
+    import ast
+
+    import kiro_crew.acp.liveness as liveness_mod
+
+    required = {"mcp_server_name", "tool_name"}
+    package_root = Path(liveness_mod.__file__).resolve().parents[1]
+    sites: list[tuple[str, int, set[str]]] = []
+    for path in package_root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "ToolCallState(" not in text:
+            continue
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "ToolCallState":
+                passed = {kw.arg for kw in node.keywords if kw.arg}
+                sites.append((path.name, node.lineno, required - passed))
+
+    assert len(sites) >= 2, "expected the main-agent and sub-agent dispatch sites"
+    missing = [(name, line, sorted(gap)) for name, line, gap in sites if gap]
+    assert not missing, f"dispatch sites not wiring the wait identity: {missing}"
+
+
+@pytest.mark.parametrize(
+    ("trusted", "expected"),
+    [(True, "oracle"), (False, "")],
+)
+def test_main_dispatch_names_the_server_only_from_a_trusted_identity(
+    monkeypatch, trusted, expected
+):
+    """The main handle stamps ``mcp_server_name`` onto the in-flight call ONLY when
+    the event's identity is provenance-verified. The construction-site ratchet
+    above checks that the keyword is passed; this pins its VALUE, so an unverified
+    frame cannot select the wait contract by naming a server."""
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp import session_handle as sh
+    from kiro_crew.acp.types import (
+        EVENT_TOOL_CALL,
+        METHOD_SESSION_UPDATE,
+        AcpEvent,
+        JsonRpcMessage,
+    )
+
+    event = AcpEvent(
+        kind=EVENT_TOOL_CALL,
+        tool_call_id="c1",
+        title="wait",
+        tool_name="wait",
+        mcp_server_name="oracle",
+        mcp_identity_trusted=trusted,
+    )
+    monkeypatch.setattr(sh, "parse_session_update", lambda *_a, **_k: [event])
+    rt = MagicMock()
+    rt._last_activity = time.monotonic()
+    rt.pid = None
+    rt.acp_backend = "kiro"
+    rt.is_alive = MagicMock(return_value=True)
+    rt.send_notification = AsyncMock()
+    rt.send_request = AsyncMock(return_value=1)
+    handle = sh.AcpSessionHandle("sA", asyncio.Queue(), rt)
+
+    handle._handle_update(
+        JsonRpcMessage(
+            method=METHOD_SESSION_UPDATE,
+            params={
+                "sessionId": "sA",
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "c1"},
+            },
+        )
+    )
+
+    assert handle._inflight_tool is not None
+    assert handle._inflight_tool.mcp_server_name == expected
 
 
 def test_missing_boot_stamp_keeps_the_full_window(tmp_path):
@@ -574,6 +777,52 @@ def test_stuck_input_detected_on_flat_tty_blocked_child(tmp_path):
     assert "stuck_input" in evidence and "/dev/tty" in evidence
 
 
+def _pipeline(tmp_path, *, writer_flags: str | None, producer_on_tty: bool = False):
+    """``sleep 70 | cat``: 300 writes pipe:[777], 301 is blocked reading it on fd 0."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, children=[200])
+    fake.add_pid(200, cmdline="bash -c sleep 70 | cat", children=[300, 301], io_bytes=500)
+    fake.add_pid(300, cmdline="sleep 70", io_bytes=0)
+    fake.add_pid(301, cmdline="cat", wchan="pipe_read", io_bytes=0)
+    fake.set_blocked_read(301, 0, "pipe:[777]")
+    if writer_flags is not None:
+        (fake.root / "300" / "fd" / "1").symlink_to("pipe:[777]")
+        (fake.root / "300" / "fdinfo").mkdir()
+        (fake.root / "300" / "fdinfo" / "1").write_text(f"pos:\t0\nflags:\t{writer_flags}\n")
+    if producer_on_tty:  # e.g. ``ssh host cmd | cat`` prompting for a password
+        (fake.root / "300" / "wchan").write_text("n_tty_read")
+        fake.set_blocked_read(300, 3, "/dev/tty")
+    oracle = _oracle(fake, clock, sample_min=1.0)
+    tool = _shell_tool("sleep 70 | cat", clock)
+    assert oracle.check_tool(100, tool)[0] == VERDICT_WORKING
+    clock.advance(2.0)
+    return oracle.check_tool(100, tool)
+
+
+@pytest.mark.parametrize("flags", ["01", "02", "0100001"])  # O_WRONLY, O_RDWR, +O_LARGEFILE
+def test_pipe_reader_with_live_writer_is_a_producer_wait_not_stuck(tmp_path, flags):
+    verdict, evidence = _pipeline(tmp_path, writer_flags=flags)
+    assert verdict == VERDICT_WORKING, evidence
+
+
+def test_producer_blocked_on_tty_behind_a_pipe_reader_is_still_stuck(tmp_path):
+    verdict, evidence = _pipeline(tmp_path, writer_flags="01", producer_on_tty=True)
+    assert verdict == VERDICT_STUCK_INPUT
+    assert "pid 300" in evidence and "/dev/tty" in evidence
+
+
+def test_pipe_reader_without_a_writer_is_still_stuck_input(tmp_path):
+    verdict, evidence = _pipeline(tmp_path, writer_flags=None)
+    assert verdict == VERDICT_STUCK_INPUT
+    assert "pipe:[777]" in evidence
+
+
+def test_pipe_held_only_for_reading_is_not_a_writer(tmp_path):
+    verdict, _ = _pipeline(tmp_path, writer_flags="0100000")  # O_RDONLY | O_LARGEFILE
+    assert verdict == VERDICT_STUCK_INPUT
+
+
 def test_socket_blocked_child_is_not_stuck(tmp_path):
     clock = _Clock()
     fake = FakeProc(tmp_path / "proc")
@@ -599,14 +848,75 @@ def test_wait_tool_working_until_declared_duration(tmp_path):
     fake.add_pid(100)
     oracle = _oracle(fake, clock)
     tool = ToolCallState(
-        title="wait", command='{"seconds": 300, "reason": "poll"}',
-        dispatch_ts=clock.t, is_shell=False,
+        title="wait",
+        command='{"seconds": 300, "reason": "poll"}',
+        dispatch_ts=clock.t,
+        is_shell=False,
+        tool_name="wait",
+        mcp_server_name="kirocrew-core",
     )
 
     clock.advance(299.0)
     assert oracle.check_tool(100, tool)[0] == VERDICT_WORKING
     clock.advance(300.0)  # past 300 + 120 slack
     assert oracle.check_tool(100, tool)[0] == VERDICT_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["wait", "kirocrew-core___wait", "mcp__kirocrew-core__wait"],
+)
+def test_a_server_qualified_wait_name_selects_the_contract(tmp_path, tool_name):
+    """kiro-cli may server-qualify the trusted tool name, so every qualified
+    spelling of the core ``wait`` must still select the contract."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100)
+    oracle = _oracle(fake, clock)
+    tool = ToolCallState(
+        title="Waiting for CI",
+        command='{"seconds": 300}',
+        dispatch_ts=clock.t,
+        is_shell=False,
+        tool_name=tool_name,
+        mcp_server_name="kirocrew-core",
+    )
+    clock.advance(60.0)
+    assert oracle.check_tool(100, tool)[0] == VERDICT_WORKING
+
+
+@pytest.mark.parametrize(
+    ("title", "tool_name", "server"),
+    [
+        pytest.param("wait_for_ci", "wait_for_ci", "third-party", id="other-tool-wait-title"),
+        pytest.param("wait", "wait_for_ci", "third-party", id="other-tool-exact-wait-title"),
+        pytest.param("wait", "wait", "third-party", id="wait-on-another-server"),
+        pytest.param("wait", "wait", "", id="unverified-identity"),
+        pytest.param("wait", "monitor_start", "kirocrew-core", id="other-core-tool"),
+        pytest.param("wait", "do_wait", "kirocrew-core", id="single-underscore-suffix"),
+    ],
+)
+def test_the_oracle_wait_contract_is_selected_by_identity_not_title(
+    tmp_path, title, tool_name, server
+):
+    """The title is model-authored prose, so a call that is not the trusted
+    kirocrew-core ``wait`` must not read WORKING from a wait-shaped title and a
+    ``seconds`` argument."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100)
+    oracle = _oracle(fake, clock)
+    tool = ToolCallState(
+        title=title,
+        command='{"seconds": 1800}',
+        dispatch_ts=clock.t,
+        is_shell=False,
+        tool_name=tool_name,
+        mcp_server_name=server,
+    )
+    clock.advance(60.0)
+    _verdict, evidence = oracle.check_tool(100, tool)
+    assert "wait tool declared" not in evidence
 
 
 # ── MCP tool + model-wait movement sampling ──────────────────────────────────
@@ -643,8 +953,9 @@ def test_mcp_tool_flat_with_runtime_backend_socket_is_tagged_established_flat(tm
     fake.set_net_tcp(100, ["31337"])
     oracle = _oracle(fake, clock, sample_min=1.0)
     # tool_name="use_subagent" → positive model-wrapping attribution
-    tool = ToolCallState(title="use_subagent", command="{}", dispatch_ts=clock.t,
-                         tool_name="use_subagent")
+    tool = ToolCallState(
+        title="use_subagent", command="{}", dispatch_ts=clock.t, tool_name="use_subagent"
+    )
 
     verdict, evidence = oracle.check_tool(100, tool)
     assert verdict == VERDICT_UNKNOWN  # baseline sample — never tagged
@@ -675,17 +986,18 @@ def test_mcp_tool_flat_ordinary_tool_with_runtime_socket_not_tagged(tmp_path):
     fake.set_net_tcp(100, ["31337"])
     oracle = _oracle(fake, clock, sample_min=1.0)
     # tool_name="" → no model-wrapping attribution; plain MCP call
-    tool = ToolCallState(title="ReadInternalWebsites", command="{}", dispatch_ts=clock.t,
-                         tool_name="")
+    tool = ToolCallState(
+        title="ReadInternalWebsites", command="{}", dispatch_ts=clock.t, tool_name=""
+    )
 
     oracle.check_tool(100, tool)  # baseline
     clock.advance(2.0)
     verdict, evidence = oracle.check_tool(100, tool)
     assert verdict == VERDICT_UNKNOWN
     # Must NOT be tagged established_flat for a non-model-wrapping tool
-    assert not evidence.startswith(EVIDENCE_ESTABLISHED_FLAT), (
-        "established_flat must not fire for a tool without model-wrapping attribution"
-    )
+    assert not evidence.startswith(
+        EVIDENCE_ESTABLISHED_FLAT
+    ), "established_flat must not fire for a tool without model-wrapping attribution"
     assert "mcp subtree flat" in evidence
 
 
@@ -763,6 +1075,73 @@ def test_model_wait_flat_no_socket_is_dead(tmp_path):
     verdict, evidence = oracle.check_model_wait(100)
     assert verdict == VERDICT_DEAD
     assert "no established backend socket" in evidence
+
+
+def test_model_wait_flat_no_socket_on_a_shared_tree_is_unknown(tmp_path):
+    """Two sessions on one runtime: the wedge signature is tree-wide evidence,
+    so it cannot name WHICH tenant lost its frame → UNKNOWN, tagged
+    shared_tree, never DEAD."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])  # no established sockets
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=lambda: 2)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    verdict, evidence = oracle.check_model_wait(100)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(EVIDENCE_SHARED_TREE)
+    assert "2 sessions" in evidence
+
+
+def test_model_wait_flat_no_socket_with_one_declared_tenant_is_dead(tmp_path):
+    """A runtime that DECLARES a single tenant keeps the immediate verdict: its
+    whole tree is that one session's, so the wedge signature is attributable."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=lambda: 1)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_DEAD
+
+
+def test_model_wait_tenancy_probe_failure_does_not_reach_dead(tmp_path):
+    """An unreadable tenancy probe is absent evidence, not a declaration of
+    exclusivity: it degrades the verdict instead of authorising the fast path.
+    A raising probe must also not escape as an oracle error."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])
+
+    def boom() -> int:
+        raise RuntimeError("runtime went away mid-probe")
+
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=boom)
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    verdict, evidence = oracle.check_model_wait(100)
+    assert verdict == VERDICT_UNKNOWN
+    assert evidence.startswith(EVIDENCE_SHARED_TREE)
+
+
+def test_fresh_carries_the_tenancy_probe(tmp_path):
+    """``fresh()`` is taken at every liveness-state boundary, so a probe it
+    dropped would silently restore the unattributable DEAD mid-turn."""
+    clock = _Clock()
+    fake = FakeProc(tmp_path / "proc")
+    fake.add_pid(100, io_bytes=1000)
+    fake.set_net_tcp(100, [])
+    oracle = _oracle(fake, clock, sample_min=1.0, tenancy=lambda: 3).fresh()
+
+    oracle.check_model_wait(100)  # baseline
+    clock.advance(2.0)
+    assert oracle.check_model_wait(100)[0] == VERDICT_UNKNOWN
 
 
 @requires_symlinks
@@ -922,8 +1301,8 @@ def test_helpers_never_raise_on_garbage(tmp_path):
 #
 # consult_offloaded is the single copy of the guard sequence AcpClient and
 # AcpSessionHandle both delegate to. The call-site behaviors (retirement at
-# boundaries, oracle generation swaps) stay pinned by test_acp_client.py and
-# test_acp_stale_recovery.py; these tests pin the helper's own contract so a
+# boundaries, oracle generation swaps) stay pinned by test_acp_client_stale_turn.py
+# and test_acp_stale_recovery.py; these tests pin the helper's own contract so a
 # regression in it is attributed to the shared code, not to one caller.
 
 
@@ -1062,9 +1441,7 @@ def test_shell_tool_without_a_tree_backend_is_unknown_tagged_platform_limited(
     assert evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)
 
 
-def test_mcp_tool_without_a_tree_backend_is_unknown_tagged_platform_limited(
-    tmp_path, monkeypatch
-):
+def test_mcp_tool_without_a_tree_backend_is_unknown_tagged_platform_limited(tmp_path, monkeypatch):
     clock = _Clock()
     oracle = _no_backend_oracle(tmp_path, clock, monkeypatch)
     tool = ToolCallState(
@@ -1092,6 +1469,8 @@ def test_wait_tool_contract_holds_without_a_tree_backend(tmp_path, monkeypatch):
         command='{"seconds": 300}',
         dispatch_ts=clock.t,
         is_shell=False,
+        tool_name="wait",
+        mcp_server_name="kirocrew-core",
     )
     assert oracle.check_tool(4242, tool)[0] == VERDICT_WORKING
 
@@ -1120,3 +1499,158 @@ def test_a_readable_proc_tree_is_never_platform_limited(tmp_path):
     verdict, evidence = oracle.check_tool(100, tool)
     assert verdict == VERDICT_UNKNOWN
     assert not evidence.startswith(liveness.EVIDENCE_PLATFORM_LIMITED)
+
+
+# ── InFlightToolTracker: the shared hand-off rule ──
+#
+# The one implementation both AcpSessionHandle and the sub-agent reaper use to
+# answer "which tool call is judged right now". These tests pin the rule itself;
+# the two callers' own tests (test_stale_watchdog_rearm.py and
+# test_subagent_stall_attribution.py) pin the integration.
+
+
+def _ts(title: str = "t") -> ToolCallState:
+    return ToolCallState(title=title, command="{}", dispatch_ts=1.0)
+
+
+def test_tracker_dispatch_makes_the_call_the_judged_one():
+    tr = liveness.InFlightToolTracker()
+    state = _ts()
+    changed = tr.dispatch("a", state, aux="interactive-a")
+    assert changed is True
+    assert tr.current is state
+    assert tr.current_id == "a"
+    assert tr.current_aux == "interactive-a"
+    assert tr.any_active is True
+
+
+def test_tracker_terminal_result_for_the_judged_call_clears_it():
+    tr = liveness.InFlightToolTracker()
+    tr.dispatch("a", _ts())
+    assert tr.result("a", terminal=True) is True
+    assert tr.current is None
+    assert tr.current_id == ""
+    assert tr.any_active is False
+
+
+def test_tracker_non_terminal_result_is_a_no_op():
+    tr = liveness.InFlightToolTracker()
+    state = _ts()
+    tr.dispatch("a", state)
+    assert tr.result("a", terminal=False) is False
+    assert tr.current is state
+
+
+def test_tracker_sibling_terminal_does_not_change_the_judged_call():
+    """A parallel call finishing out of order must leave the judged call — and
+    so the oracle baseline — untouched."""
+    tr = liveness.InFlightToolTracker()
+    first = _ts("first")
+    second = _ts("second")
+    tr.dispatch("a", first)
+    tr.dispatch("b", second)  # b is now judged (newest dispatch)
+    assert tr.current is second
+    # a (the older sibling) finishes first: judged call is still b.
+    assert tr.result("a", terminal=True) is False
+    assert tr.current is second
+    assert tr.current_id == "b"
+
+
+def test_tracker_judged_call_falls_back_to_newest_remaining():
+    tr = liveness.InFlightToolTracker()
+    first = _ts("first")
+    second = _ts("second")
+    tr.dispatch("a", first)
+    tr.dispatch("b", second)
+    # b (the judged, newest) finishes: judged falls back to a, the one still open.
+    assert tr.result("b", terminal=True) is True
+    assert tr.current is first
+    assert tr.current_id == "a"
+
+
+def test_tracker_clear_drops_everything():
+    tr = liveness.InFlightToolTracker()
+    tr.dispatch("a", _ts())
+    tr.dispatch("b", _ts())
+    assert tr.clear() is True
+    assert tr.current is None
+    assert tr.current_id == ""
+    assert tr.any_active is False
+    assert tr.clear() is False  # nothing to clear a second time
+
+
+def test_tracker_single_slot_shape_overwrites_on_next_dispatch():
+    """The sub-agent's shape: an id-less call is judged but held in a separate
+    slot (not the running set), so it never appears in ``active_calls`` and the
+    next id-less dispatch overwrites it (a native child's result never reaches
+    that loop, so nothing would ever pop a stored entry)."""
+    tr = liveness.InFlightToolTracker()
+    one = _ts("one")
+    two = _ts("two")
+    tr.dispatch("", one)
+    assert tr.current is one
+    assert tr.active_calls == {}
+    assert tr.any_active is False
+    tr.dispatch("", two)
+    assert tr.current is two
+    assert tr.active_calls == {}
+
+
+def test_tracker_idless_judged_call_hands_off_on_a_terminal_result():
+    """A surviving stored call plus a finished stored call and an id-less judged
+    call (a native child): the agent's own terminal result drops the id-less
+    judgement and the slot passes to the stored call still running, rather than
+    leaving the finished child judged."""
+    tr = liveness.InFlightToolTracker()
+    survivor = _ts("survivor")
+    finished = _ts("finished")
+    child = _ts("child")
+    tr.dispatch("survivor-1", survivor)
+    tr.dispatch("finished-1", finished)
+    tr.dispatch("", child)  # native child: judged, not stored
+    assert tr.current is child
+    assert set(tr.active_calls) == {"survivor-1", "finished-1"}
+
+    changed = tr.result("finished-1", terminal=True)
+    assert changed is True
+    assert tr.current is survivor
+    assert set(tr.active_calls) == {"survivor-1"}
+
+
+def test_tracker_idless_judged_call_clears_when_nothing_remains():
+    """An id-less judged call with no stored sibling clears to None on the next
+    terminal result (the slot cannot be handed to anything)."""
+    tr = liveness.InFlightToolTracker()
+    tr.dispatch("", _ts("child"))
+    changed = tr.result("stored-gone", terminal=True)
+    assert changed is True
+    assert tr.current is None
+    assert tr.active_calls == {}
+
+
+def test_tracker_bound_evicts_the_oldest_and_keeps_the_new_call():
+    """At ``max_calls`` a NEW id evicts the oldest stored call, the call just
+    dispatched is kept and judged, a re-dispatch under a held id evicts nothing,
+    and ``evicted`` stays set until ``clear``."""
+    tr = liveness.InFlightToolTracker(max_calls=2)
+    tr.dispatch("a", _ts("a"))
+    tr.dispatch("b", _ts("b"))
+    assert tr.evicted is False
+    tr.dispatch("b", _ts("b2"))
+    assert list(tr.active_calls) == ["a", "b"] and tr.evicted is False
+    newest = _ts("c")
+    tr.dispatch("c", newest)
+    assert list(tr.active_calls) == ["b", "c"]
+    assert tr.current is newest and tr.evicted is True
+    tr.result("b", terminal=True)
+    tr.result("c", terminal=True)
+    assert tr.any_active is False and tr.evicted is True
+    tr.clear()
+    assert tr.evicted is False
+
+
+def test_tracker_without_a_bound_never_evicts():
+    tr = liveness.InFlightToolTracker()
+    for i in range(300):
+        tr.dispatch(f"t{i}", _ts())
+    assert len(tr.active_calls) == 300 and tr.evicted is False

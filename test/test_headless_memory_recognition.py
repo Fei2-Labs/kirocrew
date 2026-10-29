@@ -112,7 +112,7 @@ async def test_registered_child_member_memory_and_teardown(env, tmp_path, monkey
             )
             assert response is None
             sessions.release(key, cleanup=False)
-            env.bind_session("dashboard:bob", "member-bob")
+            await env.bind_session_async("dashboard:bob", "member-bob")
             env.state._slots["bob"] = SimpleNamespace(is_restricted=False, blocks_reads=False)
             foreign = await memory_member.api_memory_recall(
                 make_request(
@@ -126,6 +126,7 @@ async def test_registered_child_member_memory_and_teardown(env, tmp_path, monkey
             assert foreign.status == 200
             assert "child private lesson" not in foreign.text
         finally:
+            manager.close()
             await sessions.close_all()
 
 
@@ -154,10 +155,12 @@ async def test_shared_handle_recognition_ends_at_unregister(tmp_path):
     manager._agents[info.id] = info
     provider = await manager._create_shared_session(info, key, "kirocrew")
     # The identity kwargs are what this test is about; the session-start gate
-    # also passes two runtime-owned callbacks (`on_gate_acquired`,
-    # `late_adopter`) whose identity is per-call, so they are asserted by shape.
+    # also passes three runtime-owned callbacks (`on_gate_queued`,
+    # `on_gate_acquired`, `late_adopter`) whose identity is per-call, so they
+    # are asserted by shape.
     assert runtime.create_session.await_count == 1
     start_kwargs = dict(runtime.create_session.await_args.kwargs)
+    assert callable(start_kwargs.pop("on_gate_queued", None))
     assert callable(start_kwargs.pop("on_gate_acquired", None))
     assert callable(start_kwargs.pop("late_adopter", None))
     assert start_kwargs == {
@@ -218,6 +221,7 @@ async def test_shared_handle_recognition_ends_at_unregister(tmp_path):
         assert response is not None and response.status == 400
     finally:
         runtime.unregister_session("native-child")
+        manager.close()
         await sessions.close_all()
 
 
@@ -368,6 +372,7 @@ async def test_live_child_checks_origin_privacy_without_child_markers(env, mode,
                 assert response is None
     finally:
         sessions.release(key, cleanup=False)
+        manager.close()
         await sessions.close_all()
 
 
@@ -407,6 +412,7 @@ async def test_headless_birth_authority_survives_origin_loss(env, origin_state):
             assert json.loads(response.text)["code"] == "restricted_session"
     finally:
         sessions.release(key, cleanup=False)
+        manager.close()
         await sessions.close_all()
 
 
@@ -484,4 +490,39 @@ async def test_gateway_spawn_freezes_mode_and_enforces_it_after_parent_change(
         await asyncio.wait_for(
             asyncio.gather(*manager._tasks.values(), return_exceptions=True), timeout=5
         )
+        manager.close()
         await sessions.close_all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("key", "run_lookup"), [("wf:run7:0", ["run7"]), ("wf-scope:run7", [])])
+async def test_memory_mode_reads_a_run_record_only_for_minted_workflow_prefixes(
+    monkeypatch, key, run_lookup
+):
+    """No session is minted under ``wf-scope:``, so it gets the generic unknown-key path.
+
+    The run record for ``run7`` says ``persistent``; only a minted workflow prefix may
+    borrow it. ``wf-scope:run7`` falls to the persisted-transcript probe, finds nothing
+    and is refused like any other unregistered key.
+    """
+    from kiro_crew import execution_context, subagent_persistence, workflow_memory
+    from kiro_crew.dashboard.handlers import _shared
+
+    looked_up: list[str] = []
+
+    def read_binding(run_id, *, required):
+        looked_up.append(run_id)
+        return {"memory_mode": "persistent"}
+
+    monkeypatch.setattr(_shared, "live_session_memory_mode", lambda state, key: None)
+    monkeypatch.setattr(execution_context, "read_session_execution", lambda key: None)
+    monkeypatch.setattr(workflow_memory, "read_binding", read_binding)
+    monkeypatch.setattr(subagent_persistence, "read_session_memory_mode", lambda key: None)
+    monkeypatch.setattr(_shared, "_probe_persisted_session", lambda stem: (False, None))
+
+    if run_lookup:
+        assert await _shared.resolve_session_memory_mode(SimpleNamespace(), key) == "persistent"
+    else:
+        with pytest.raises(ValueError, match="unavailable"):
+            await _shared.resolve_session_memory_mode(SimpleNamespace(), key)
+    assert looked_up == run_lookup

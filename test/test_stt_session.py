@@ -17,6 +17,7 @@ from kiro_crew.stt import engine as engine_mod
 from kiro_crew.stt import models
 from kiro_crew.stt import session as session_mod
 from kiro_crew.stt import telemetry, vad
+from kiro_crew.testing.wait import await_until
 
 SR = vad.SAMPLE_RATE_HZ
 
@@ -67,10 +68,16 @@ class _FakeEngine:
         self.expected: list[object] = []
         #: The `kind` each decode was labelled with, in order.
         self.kinds: list[str] = []
+        #: Whether each decode asked for a sized encoder window, in order.
+        self.sized: list[bool] = []
         #: Set to a `DecodeFailed` to make every decode fail. Assigned per test rather
         #: than fixed at construction because the interesting cases are transitions:
         #: a session that keeps working after a failed partial, and one that recovers.
         self.fail_with: Exception | None = None
+
+    def thread_count(self) -> int:
+        """The count the real engine would key its next load with."""
+        return engine_mod.thread_count()
 
     async def ensure_loaded(self, model_name: str, language: str):
         self.loaded_with.append((model_name, language))
@@ -86,6 +93,7 @@ class _FakeEngine:
         expect=None,
         abort_if=None,
         kind: str = telemetry.KIND_FINAL,
+        sized_window: bool = False,
     ) -> str:
         self.decodes.append((len(pcm), superseding))
         self.expected.append(expect)
@@ -93,6 +101,7 @@ class _FakeEngine:
         # what the partial budget reads back and what a diagnostic attributes cost
         # to, so a decode mislabelled as cosmetic would silently be budgeted.
         self.kinds.append(kind)
+        self.sized.append(sized_window)
         if self.fail_with is not None:
             raise self.fail_with
         return self._text
@@ -288,6 +297,24 @@ async def test_partials_are_abortable_and_the_final_is_not(fake):
     await session.finish()
     assert any(superseding for _, superseding in fake.decodes), "no abortable partial ran"
     assert fake.decodes[-1][1] is False, "the final must never be aborted"
+
+
+@pytest.mark.asyncio
+async def test_only_display_decodes_ask_for_a_sized_window(fake, monkeypatch):
+    """A partial and a phrase commit are previews; the final is the text kept.
+
+    A sized encoder window can change punctuation or an unsettled word, so only a
+    decode whose text the final replaces may ask for one.
+    """
+    monkeypatch.setattr(session_mod, "MIN_COMMIT_SECS", 0.2)
+    session = await _started()
+    await _feed(session, _int16(1.0) + _silence_int16(0.2) + _int16(0.5))
+    await session.finish()
+    by_kind = list(zip(fake.kinds, fake.sized))
+    assert (telemetry.KIND_PARTIAL, True) in by_kind
+    assert (telemetry.KIND_PHRASE_COMMIT, True) in by_kind
+    assert by_kind[-1] == (telemetry.KIND_FINAL, False)
+    assert all(not sized for kind, sized in by_kind if kind == telemetry.KIND_FINAL)
 
 
 @pytest.mark.asyncio
@@ -859,6 +886,74 @@ async def test_empty_batch_recognition_is_not_decoded_twice(fake):
 
 
 @pytest.mark.asyncio
+async def test_a_batch_decode_refused_once_is_decoded_on_the_retry(fake):
+    """One concurrent swap is covered by the single re-prepare."""
+    real_decode = fake.decode
+    decodes = 0
+
+    async def _refuse_once(pcm, **kw):
+        nonlocal decodes
+        decodes += 1
+        if decodes == 1:
+            fake.loaded_key = engine_mod.LoadedKey("/stub/swapped.bin", "fr", 4)
+            return ""  # the key check refused
+        return await real_decode(pcm, **kw)
+
+    fake.decode = _refuse_once  # type: ignore[method-assign]
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert decodes == 2
+    assert availability.ok
+    assert text == "spoken words"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_decodes_to_silence_is_success_not_a_failure(fake):
+    """A retry that decodes with the key unchanged and hears nothing is ``("", ok)``.
+
+    Only a SECOND key change marks the retry's ``""`` as a refusal; an empty
+    transcript under the expected key is the recogniser hearing nothing.
+    """
+    decodes = 0
+
+    async def _refuse_then_silence(pcm, **kw):
+        nonlocal decodes
+        decodes += 1
+        if decodes == 1:
+            fake.loaded_key = engine_mod.LoadedKey("/stub/swapped.bin", "fr", 4)
+        return ""
+
+    fake.decode = _refuse_then_silence  # type: ignore[method-assign]
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert decodes == 2
+    assert text == ""
+    assert availability.ok
+
+
+@pytest.mark.asyncio
+async def test_a_batch_decode_refused_on_the_retry_too_is_a_failure_not_silence(fake):
+    """Audible audio whose retry is also refused must not read as ``("", ok)``.
+
+    ``("", ok)`` is the success-with-nothing-heard answer, which the transcribe
+    endpoint turns into a 200 with an empty transcript, so the spoken recording
+    would be dropped without any failure being reported.
+    """
+    decodes = 0
+
+    async def _always_refuse(pcm, **kw):
+        nonlocal decodes
+        decodes += 1
+        fake.loaded_key = engine_mod.LoadedKey(f"/stub/swapped-{decodes}.bin", "fr", 4)
+        return ""
+
+    fake.decode = _always_refuse  # type: ignore[method-assign]
+    text, availability = await session_mod.transcribe_pcm(engine_mod.pcm_from_int16(_int16(1.0)))
+    assert decodes == 2, f"expected exactly one retry, got {decodes} decodes"
+    assert text == ""
+    assert not availability.ok
+    assert availability.code == engine_mod.CODE_DECODE_FAILED
+
+
+@pytest.mark.asyncio
 async def test_an_empty_phrase_commit_keeps_the_session_alive(fake):
     fake._text = ""
     session = await _started(silence_ms=900)
@@ -878,18 +973,18 @@ async def test_stop_aborts_an_inflight_partial_and_preserves_audio_for_the_final
     async def partial_decode(pcm, **kwargs):
         predicates.append(kwargs["abort_if"])
         started.set()
-        await asyncio.wait_for(release.wait(), timeout=5)
+        await await_until(release)
         return "" if kwargs["abort_if"]() else await original_decode(pcm, **kwargs)
 
     monkeypatch.setattr(fake, "decode", partial_decode)
     task = asyncio.create_task(session.feed(_int16(0.6)))
     try:
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started)
         assert not predicates[0]()
         session.stop_partials()
         assert predicates[0](), "stop did not invalidate the active native partial"
         release.set()
-        assert await asyncio.wait_for(task, timeout=5) == []
+        assert await await_until(task) == []
         monkeypatch.setattr(fake, "decode", original_decode)
         assert await session.feed(_int16(0.4)) == []
         assert (await session.finish()).text == "spoken words"

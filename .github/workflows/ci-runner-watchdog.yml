@@ -24,7 +24,8 @@ name: CI Runner Watchdog
 # orphaned frontend shard held the group for ten hours and cost eleven `main`
 # verdicts before a human cancelled it.
 #
-# What this workflow does, every 10 minutes: run `scripts/ci/runner_watchdog.py`,
+# What this workflow does, every 10 minutes and whenever a `fast-gate.yml` run
+# completes (the kick, see `on:` below): run `scripts/ci/runner_watchdog.py`,
 # which lists queued / in-progress runs REPO-WIDE — one paginated
 # `GET /repos/{repo}/actions/runs?status=…` per status returns runs of every
 # workflow at once — and keeps only those whose `path` names a workflow that
@@ -33,33 +34,56 @@ name: CI Runner Watchdog
 # script as `WATCHED_WORKFLOWS` and tested against the workflows whose `runs-on`
 # actually carries the fleet label. One listing per status covers the whole
 # watched set as a client-side filter and reaches more than a per-workflow loop
-# would; live paging is bounded at 8 pages, and each live classification
-# sweep reads jobs for at most 50 runs: 40 to the oldest, which are the only
-# actionable ones, and 10 reserved for the newest, whose prompt CodeBuild starts
-# are the dispatch evidence a saturation hold is judged by. Cancelled-run recovery
-# has a separate 16-page reach because GitHub indexes that status by creation
-# time while the pass selects by cancellation time. That reach is about eight
+# would; live paging is bounded at 10 pages per status (a status-filtered listing
+# serves at most 1000 results), and each live classification
+# sweep reads jobs for at most 50 runs: UP TO 10 reserved for the newest runs that
+# are THEMSELVES at least one saturation wait old (a younger run cannot hold a
+# served start that waited that long and so could only ever report the fleet
+# dispatching), falling back to the newest runs when none qualifies, since an empty
+# reserve reads as an outage; the REST go to the classify slice, ranked
+# actionable-shaped first (a `push` run of a heal-safe workflow past the orphan
+# threshold) then oldest. The split is dynamic: a reserve that comes back short
+# hands its unused reads to the classify slice rather than leaving them unspent. Cancelled-run recovery
+# has a separate 10-page reach because GitHub indexes that status by creation
+# time while the pass selects by cancellation time. That reach is about five
 # hours at this repo's measured 200 cancellations an hour, and the 2026-09-20
 # orphans were 21 hours old. That reach is BEST-EFFORT: GitHub offers no ordering
 # by cancellation time, so truncation only warns and a run that never got listed
 # needs `gh run rerun` by hand.
 # The four repo-wide indexes
-# cost at most 40 calls per tick: eight pages for each of three live statuses,
-# plus 16 cancelled pages.
+# cost at most 40 calls per tick: ten pages for each of three live statuses,
+# plus 10 cancelled pages.
 # Heal safety never reads this job's checkout. A workflow clears
-# TWO gates: HEAL_SAFE_WORKFLOWS declares it safe, and its run-level concurrency
-# group references `github.ref`, `github.ref_name`, `github.head_ref`, or the pull
-# request number while its YAML carries no publish or deploy signal. Every DECLARED
-# entry is ref-keyed, because the successor guard filters by head branch and never
-# by pull-request number, so the five PR-keyed workflows are watched and classified
-# but never auto-healed: four of the fifteen are. Package or
+# TWO gates: it is DECLARED safe, and its run-level concurrency group is keyed the
+# way its successor check needs while its YAML carries no publish or deploy signal.
+# There are two declarations. HEAL_SAFE_WORKFLOWS is ref-keyed (`github.ref`,
+# `github.ref_name`, `github.head_ref`) and covers every event: a push run's
+# successor is judged by the branch listing, which filters by head branch and never
+# by pull-request number. HEAL_SAFE_PULL_REQUEST_WORKFLOWS is PR-keyed
+# (`<name>-${{ github.event.pull_request.number }}`) and covers pull-request runs
+# only: a pull-request run's successor is judged by HEAD SHA against the open pull
+# requests on its branch (one `pulls?head=` read) and then by the branch listing for
+# a newer run at that same SHA (`labeled`, `edited`, `reopened` start one, and the
+# group cancels the older run) -- a same-SHA newer run counts as the successor when
+# both payloads name the same pull request, as a sibling's on a shared head branch
+# when they name different ones, and when either names none it FAILS CLOSED: the
+# run is left untouched (judged before its cancel), the tick reds and names both
+# runs. Not resolved by watching the group's own cancel: every orphan lives in a
+# fleet outage where the run to watch stays queued and nothing settles, and a green
+# resting on unobserved provider behaviour is the false green this script must
+# never produce. A successor is restored only when identified as the same pull
+# request's; a same-SHA run or a head move that appears after the re-run started
+# withdraws the re-run and reds the tick, naming the head. The one green path that
+# touches a group -- cancel then re-run of a run judged current with no newer run
+# at its SHA -- is the push path's, unchanged. On a push the PR number is empty and such a group is a
+# constant, so a push run of a PR-keyed workflow stays exempt. Package or
 # release publishing, Pages deployment, Docker pushes, S3 or CodeArtifact
 # publishing, signing/notarization, a job-level `environment:`, and `pages: write`,
 # `packages: write`, or `deployments: write` require human recovery.
-# `id-token: write` alone is ordinary OIDC authentication. `HEAL_SAFE_WORKFLOWS`
-# in the script is the membership and a partition test pins it against
-# WATCHED_WORKFLOWS, so read the set rather than a count here: prose restating a
-# pinned set goes stale in silence. A workflow lands outside it by publishing, by
+# `id-token: write` alone is ordinary OIDC authentication. The two sets
+# in the script are the membership and a partition test pins them against
+# WATCHED_WORKFLOWS, so read the sets rather than a count here: prose restating a
+# pinned set goes stale in silence. A workflow lands outside both by publishing, by
 # a per-commit or per-run concurrency key, by having no run-level group, or by a
 # constant group. Exempt runs stay classified, logged, and named in the summary
 # with `human-required-heal-exempt-workflow`; they are never cancelled or re-run.
@@ -98,19 +122,53 @@ name: CI Runner Watchdog
 # runs would only add to the contention. The script tells the two apart by what
 # the OTHER routed jobs are doing, counting only starts AFTER the orphaned job
 # queued (a fleet that was fine before the orphan queued says nothing about the
-# fleet it is waiting on): if a CodeBuild job that did get a runner started in
-# that window, inside the last 30 minutes, after waiting 5 minutes or more, CodeBuild
-# is queueing, every queued job is presumed alive, and the tick reports the runs
-# as `skipped-saturated` and heals nothing. When recent starts were prompt --
-# the normal case here, measured in seconds -- a job that has waited a quarter
-# of an hour is in no queue at all. And when NOTHING has started on CodeBuild
-# in that window (live runs first, then the ten newest completed runs), the
-# evidence is inconclusive: a total fleet outage looks exactly like an orphan
+# fleet it is waiting on). The orphaned job's OWN queue is asked first: a routed
+# label is `codebuild-<project>-<run>-<attempt>`, optionally with an `instance-size`
+# override, and the project plus override name the queue while the run and attempt
+# are only there because CodeBuild requires them. A start served by that same queue
+# after the orphan queued stood in the same line and got out of it. One that waited
+# a third of the orphan threshold or more, inside the last 30 minutes, means that
+# queue is saturated and the tick holds; prompt ones and nothing slow mean the queue
+# is being served and the orphan was never in it, whatever another label's queue is
+# doing -- the usual carrier is the run's own siblings, and thirteen of fourteen
+# fast-gate jobs starting in under a minute while one sits for an hour and a half is
+# the dropped-dispatch shape exactly. Old prompt starts count for that reading (the
+# orphan's place in line does not age); an old slow start with nothing recent counts
+# for nothing, and the fleet-wide reading below decides. Only when the orphan's own
+# queue served nothing usable is the fleet-wide, label-blind reading used: if a
+# CodeBuild job that did get a runner started in that window, inside the last 30
+# minutes, after waiting a third of the orphan threshold or more, CodeBuild is
+# queueing, every queued job is presumed alive, and the tick reports the runs as
+# `skipped-saturated` and heals nothing. That line is deliberately low because the
+# fleet-wide reading is label-blind: a start served quickly on another CodeBuild
+# label says nothing about the queue the orphaned job is in, so raising the line
+# would widen the window in which a queued-but-alive job is cancelled. A tick that
+# observed any served CodeBuild start logs the slowest of them against the line,
+# which is the drift a raise has to be calibrated from (#13644); a tick that saw
+# none has nothing to measure and logs nothing. And when NOTHING has started
+# on CodeBuild in that window (live runs first, then the ten newest completed runs),
+# the evidence is inconclusive: a total fleet outage looks exactly like an orphan
 # from the queued side, and re-running into an outage only discards finished
 # work, so the tick reports `skipped-no-dispatch-evidence`, heals nothing, and
-# points at the documented rollback. A sweep that exceeded its job-read bound
-# reports `skipped-partial-dispatch-evidence` rather than acting: the dropped band
-# is the middle of the sweep, so a slow start there was never read.
+# points at the documented rollback. That outage hold applies even when the orphan's
+# own queue read as dispatching: the own-queue reading settles the orphan's place in
+# line, not whether the fleet is up now. A sweep that left a run old enough to hold a
+# served start past the threshold unread reports `skipped-partial-dispatch-evidence`
+# rather than acting: the completed-run sample cannot close that gap, since it reads
+# the newest completions and a fleet serving some jobs promptly while queueing others
+# past the threshold puts a prompt start there. The premise is the unread
+# saturation-capable runs, not that the bound was reached, so a sweep whose unread
+# band is all too young to have carried such a start may still act. An own-queue
+# dispatching reading does not lift this hold: it is read off the starts this sweep
+# read, and the slow same-queue start that would refute it can sit in a run nobody
+# read. On a tick that HAS an orphan to judge, the sweep first reads the jobs of every
+# unread run that could hold such a start, up to 200 more (all or nothing: a partial
+# read cannot lift the hold, so a larger set is not read at all), so the hold is
+# reached only past that top-up bound; a tick with no orphan spends none of those
+# reads. Those unread runs
+# are retained with their creation times and re-judged on age at each cancel rather
+# than counted once, since the cancel phase re-reads the listing once and then judges
+# several cancels against it.
 #
 # Mutations are verified after the fact, because the API has no conditional
 # cancel or re-run: once a cancel lands the run's attempt and conclusion are
@@ -134,9 +192,14 @@ name: CI Runner Watchdog
 # `gh run rerun` to type. A re-run refusal that the run's own state does not
 # explain (nobody else re-ran it) reds the tick the same way.
 #
-# Guard rails, all in the script and all unit-tested (test/test_ci_runner_watchdog.py):
-#   - runs younger than 15 minutes are never actionable (their jobs are still
-#     read, because a slow start inside one is saturation evidence);
+# Guard rails, all in the script and all unit-tested (test/test_ci_runner_watchdog*.py):
+#   - runs younger than the orphan threshold are never actionable, and the two age
+#     bands differ: a run at least a third of that threshold old is what the evidence
+#     reserve is spent on; a younger one is not reserved a read while any run qualifies
+#     and is read only if a classify slot remains after the actionable-shaped and older
+#     runs, because a prompt start inside one is dispatch evidence. The exception is the
+#     reserve's fallback: when NO run can carry a slow start the newest are reserved
+#     anyway, because an empty reserve reads as an outage;
 #   - immediately before every re-run, the run must still be the newest run of
 #     its branch and event; the check is unconditional for every heal-safe run;
 #   - fork runs are reported, never touched (forks are never routed to
@@ -178,7 +241,10 @@ name: CI Runner Watchdog
 #     hand first), is logged and skipped;
 #   - `dry_run` performs every read and no write.
 #
-# Recovery covers pull-request runs as well as pushes: a heal whose cancel
+# Recovery covers pull-request runs as well as pushes, and so do live heals: a
+# pull-request run is judged current by head SHA (its SHA is the head of an open
+# pull request on its branch); one whose head moved is superseded, one whose pull
+# request closed is cancelled and never re-run. A heal whose cancel
 # outlives the budget leaves the run cancelled with nobody to re-run it, which
 # is exactly what the pass exists for. Its fingerprint (a cancelled
 # `codebuild-` job that never had a runner and queued past the threshold) is
@@ -211,8 +277,32 @@ name: CI Runner Watchdog
 on:
   schedule:
     # Every 10 minutes. The orphan threshold is 15 minutes, so a stuck job is
-    # healed within roughly 15-25 minutes of being orphaned.
+    # healed within roughly 15-25 minutes of being orphaned -- when the schedule
+    # keeps its cadence. It does not always: GitHub's `schedule` is best-effort,
+    # and on 2026-10-04 the `*/10` ticks landed about 100 minutes apart, so a
+    # `fast-gate.yml` job orphaned on `main` nine minutes before one tick (too
+    # young to act on) waited ninety minutes for the next while two later `main`
+    # pushes went red behind it.
     - cron: "*/10 * * * *"
+  # The kick between ticks. A completed Fast Gate is a heartbeat the repository
+  # already emits once per head, PR and `main` alike, and every orphan so far
+  # lived in a window where OTHER heads' Fast Gates kept completing. A kicked
+  # tick is the scheduled tick: same script, same arming, same reads. It differs
+  # in one step, before any listing: it reads this workflow's own recent runs
+  # (one call) and stands down when a tick started within the last schedule
+  # interval (`kick_is_redundant`), so on a day the schedule keeps its cadence
+  # the kicks cost one read each and the quota shape is the schedule's; only
+  # when the schedule is late does a kick turn into a full tick. A kick that
+  # stands down CANCELS ITSELF (`stand_down`), so its row reads `cancelled` and
+  # the next kick does not count it as a tick -- otherwise kicks arriving less
+  # than one interval apart would stand down for each other and the chain would
+  # never run a full tick between crons. Bursts collapse
+  # on the concurrency group below: while a tick runs, every further completion
+  # folds into the one pending run GitHub keeps per group. Any conclusion kicks,
+  # a cancelled Fast Gate included: the heartbeat is that the run ENDED.
+  workflow_run:
+    workflows: ["Fast Gate"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -223,17 +313,21 @@ on:
 permissions:
   actions: write        # cancel and re-run workflow runs
   contents: read        # check out the script
+  pull-requests: read   # `pulls?head=` read that judges a pull-request run current
 
 env:
   # The arming flip. While "false", every SCHEDULED tick is a dry run: it
-  # classifies, writes its step summary, and touches nothing -- so the first
-  # live evidence for the detector is a run of summaries against real API
-  # shapes, not a cancellation of a real `main` run. Flip to "true" in a
-  # one-line commit once a few scheduled summaries have classified correctly
-  # (no healthy run called `orphaned`). A manual dispatch is governed by its
-  # own `dry_run` input regardless of this flip, so a maintainer can act on a
-  # stuck run before arming.
-  WATCHDOG_ARMED: "false"
+  # classifies, writes its step summary, and touches nothing. That was the
+  # posture for the detector's first weeks, so the first live evidence was a run
+  # of summaries against real API shapes rather than a cancellation of a real
+  # `main` run. It is now "true", because detection without action was measured
+  # to cost two six-hour `main` outages on 2026-09-23 and 2026-09-24: both times
+  # a stuck `fast-gate.yml` run held `main`'s single concurrency slot, every
+  # later push lost its gate to eviction, and clearing it was one
+  # `POST /actions/runs/<id>/cancel` a human issued by hand. A manual dispatch is
+  # governed by its own `dry_run` input regardless of this flip, so a maintainer
+  # can still inspect without acting.
+  WATCHDOG_ARMED: "true"
 
 concurrency:
   # One watchdog at a time, and never cancel the incumbent: a run that is queued
@@ -272,3 +366,13 @@ jobs:
           # and the summary, and a test pins that ordering.
           DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) || (github.event_name != 'workflow_dispatch' && env.WATCHDOG_ARMED != 'true') }}
         run: python3 scripts/ci/runner_watchdog.py
+        # A `workflow_run` run carries the TRIGGERING run's head: GitHub lists it
+        # under that branch and attaches its check to that commit, so a kicked
+        # tick that reds (a rate-limited listing, a heal out of budget) would show
+        # as a red "Unstick orphaned CodeBuild-routed jobs" check on whichever
+        # pull request's Fast Gate happened to complete -- a PR that did nothing
+        # wrong, exactly what a hand dispatch on a PR branch did on 2026-09-25.
+        # The kick's job stays green whatever the step did; the step's own status,
+        # its log and its summary still carry the verdict, and the scheduled
+        # ticks, which run on the default branch, keep failing loudly.
+        continue-on-error: ${{ github.event_name == 'workflow_run' }}

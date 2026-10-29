@@ -50,7 +50,16 @@ def _setup_env(tmp_path, monkeypatch):
 
 
 def _make_app():
-    app = web.Application()
+    # Stands in for token_auth_middleware authenticating the dashboard owner,
+    # which the install owner gate requires.
+    @web.middleware
+    async def _owner(request, handler):
+        request["app"] = ""
+        request["user"] = "owner"
+        return await handler(request)
+
+    app = web.Application(middlewares=[_owner])
+    app["state"] = SimpleNamespace(owner_id="owner")
     register_app_routes(app)
     return app
 
@@ -220,11 +229,11 @@ async def test_uninstall_aborts_409_when_cron_cleanup_busy(tmp_path, monkeypatch
         calls["n"] += 1
         raise CronStoreBusy("store busy")
 
-    monkeypatch.setattr(routes_mod, "deregister_app_crons_from_service", _busy)
+    monkeypatch.setattr(routes_mod, "deregister_app_crons_reporting_failures", _busy)
     monkeypatch.setattr(routes_mod, "_CRON_CLEANUP_BACKOFF_SECS", 0)
 
     app = _make_app()
-    app["state"] = SimpleNamespace(crons=object())
+    app["state"] = SimpleNamespace(crons=object(), owner_id="owner")
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/api/apps/api-test-app/uninstall")
         assert resp.status == 409
@@ -250,7 +259,7 @@ async def test_uninstall_aborts_non_retryable_when_cron_store_unreadable(tmp_pat
     while its still-ENABLED jobs remain on disk to resume once the store parses.
 
     Two things differ from `CronStoreBusy` and both come from the code, not from
-    symmetry. `handlers/cron.py` documents unreadable as `retryable: False` --
+    symmetry. `handlers/cron_shared.py` documents unreadable as `retryable: False` --
     "an unreadable file does not heal on its own, so a client that retries on busy
     must NOT retry on this" -- so the abort must not tell the caller to retry. And
     `_deregister_crons_with_retry` catches busy IN ORDER TO retry, so unreadable
@@ -270,16 +279,16 @@ async def test_uninstall_aborts_non_retryable_when_cron_store_unreadable(tmp_pat
         calls["n"] += 1
         raise CronStoreUnreadable("refusing to write cron store: Move the unreadable file aside.")
 
-    monkeypatch.setattr(routes_mod, "deregister_app_crons_from_service", _unreadable)
+    monkeypatch.setattr(routes_mod, "deregister_app_crons_reporting_failures", _unreadable)
     monkeypatch.setattr(routes_mod, "_CRON_CLEANUP_BACKOFF_SECS", 0)
 
     app = _make_app()
-    app["state"] = SimpleNamespace(crons=object())
+    app["state"] = SimpleNamespace(crons=object(), owner_id="owner")
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/api/apps/api-test-app/uninstall")
         assert resp.status == 409
         body = await resp.json()
-        # The distinction handlers/cron.py keeps deliberately.
+        # The distinction handlers/cron_shared.py keeps deliberately.
         assert body["retryable"] is False, body
         assert "Move the unreadable file aside" in body["error"], body
 
@@ -313,11 +322,11 @@ async def test_uninstall_retries_then_succeeds_on_transient_cron_busy(
             raise CronStoreBusy("store busy")
         return 2
 
-    monkeypatch.setattr(routes_mod, "deregister_app_crons_from_service", _busy_once)
+    monkeypatch.setattr(routes_mod, "deregister_app_crons_reporting_failures", _busy_once)
     monkeypatch.setattr(routes_mod, "_CRON_CLEANUP_BACKOFF_SECS", 0)
 
     app = _make_app()
-    app["state"] = SimpleNamespace(crons=object())
+    app["state"] = SimpleNamespace(crons=object(), owner_id="owner")
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/api/apps/api-test-app/uninstall")
         assert resp.status == 200
@@ -373,13 +382,13 @@ async def test_uninstall_cron_busy_runs_no_destructive_step_before_abort(
     def _spy_stop(name):
         stop_calls["n"] += 1
 
-    monkeypatch.setattr(routes_mod, "deregister_app_crons_from_service", _busy)
+    monkeypatch.setattr(routes_mod, "deregister_app_crons_reporting_failures", _busy)
     monkeypatch.setattr(routes_mod, "_CRON_CLEANUP_BACKOFF_SECS", 0)
     monkeypatch.setattr(routes_mod, "_run_lifecycle_script", _spy_script)
     monkeypatch.setattr(routes_mod, "stop_app_backend", _spy_stop)
 
     app = _make_app()
-    app["state"] = SimpleNamespace(crons=object())
+    app["state"] = SimpleNamespace(crons=object(), owner_id="owner")
     async with TestClient(TestServer(app)) as client:
         resp = await client.post("/api/apps/api-test-app/uninstall")
         assert resp.status == 409

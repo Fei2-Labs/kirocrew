@@ -1,7 +1,7 @@
-import { useDeferredValue, useMemo } from 'react'
+import { useDeferredValue, useMemo, useState } from 'react'
 
 /**
- * `useDeferredValue`, scoped to the session that produced the value.
+ * `useDeferredValue`, scoped to one VISIT to the session that produced the value.
  *
  * A deferred value is the PREVIOUS value until React finds room for the
  * background re-render, and a chat page under steady urgent updates (title
@@ -19,9 +19,25 @@ import { useDeferredValue, useMemo } from 'react'
  * the two agree and the deferred path resumes. A switch therefore renders the
  * right transcript in the first commit (what it did before the deferral was
  * added), and only same-session updates are ever deferred.
+ *
+ * The key is the visit, not the slot alone. Send in A, open B, come back to A:
+ * if React never committed B's deferred render in between (a short look at B,
+ * or a background render kept restarting by A's own streaming flushes), the
+ * deferred frame is still the one A held when the user LEFT it. A slot-only
+ * key reads that as "same session, keep deferring", so A came back showing its
+ * pre-send transcript, and the new message only appeared once the deferred
+ * render finally committed, often not until the stream went quiet. Counting
+ * visits makes that frame belong to an earlier visit, so it is never shown.
  */
 export function useSlotDeferredValue<T>(slot: string | null | undefined, value: T): T {
-  const frame = useMemo(() => ({ slot: slot ?? null, value }), [slot, value])
+  const key = slot ?? null
+  // Visit counter: bumped each time the slot changes. Derived during render
+  // (the documented "store info from previous renders" pattern) so this very
+  // render already uses the new number; the setState only persists it.
+  const [seen, setSeen] = useState({ slot: key, visit: 0 })
+  const visit = seen.slot === key ? seen.visit : seen.visit + 1
+  if (seen.slot !== key) setSeen({ slot: key, visit })
+  const frame = useMemo(() => ({ visit, value }), [visit, value])
   const deferred = useDeferredValue(frame)
-  return deferred.slot === frame.slot ? deferred.value : value
+  return deferred.visit === frame.visit ? deferred.value : value
 }

@@ -38,7 +38,13 @@ SEMGREP_RULE = ROOT / "semgrep" / "find-sentinel-truthiness.yaml"
 SEMGREP_FIXTURE = ROOT / "semgrep-tests" / "find-sentinel-truthiness.py"
 AUTOSDE = ROOT / "AUTOSDE.yaml"
 PREPARE_PR = (
-    ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "SKILL.md"
+    ROOT
+    / "src"
+    / "kiro_crew"
+    / "builtin_skills"
+    / "kirocrew-dev"
+    / "kirocrew-prepare-pr"
+    / "SKILL.md"
 )
 
 LABEL = "deferred-finding"
@@ -385,7 +391,7 @@ class TestHarvestDenominator:
         ]
         fake = self._fake_gh(prs, {"sha-a": "2026-09-01T00:00:00Z"})
         mod.gh_json = fake
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["merged_fix_prs"] == 1, "only default-branch fix PRs are in scope"
         assert out["escapes"] == 0, "a release backport is not an escape"
         assert out["excluded_other_base"] == 1
@@ -404,7 +410,7 @@ class TestHarvestDenominator:
             self._pr("fix: no run at all", "no section", "sha-none"),
         ]
         mod.gh_json = self._fake_gh(prs, {"sha-old": "2026-08-30T00:00:00Z"})
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["merged_fix_prs"] == 0
         assert out["escapes"] == 0
         assert out["excluded_gate_never_ran"] == 2
@@ -420,7 +426,7 @@ class TestHarvestDenominator:
         mod = self._module()
         prs = [self._pr("fix: opened early, pushed late", "no section", "sha-late")]
         mod.gh_json = self._fake_gh(prs, {"sha-late": "2026-09-01T00:00:00Z"})
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["merged_fix_prs"] == 1
         assert out["escapes"] == 1
         assert out["excluded_gate_never_ran"] == 0
@@ -429,7 +435,7 @@ class TestHarvestDenominator:
         mod = self._module()
         prs = [self._pr("fix: a", "no section", "sha-a")]
         mod.gh_json = self._fake_gh(prs, {"sha-a": "2026-09-01T00:00:00Z"})
-        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z", prs)
         assert out["escapes"] == 1
         assert out["adoption_pct"] == 0.0
 

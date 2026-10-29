@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from overload_fakes import wait_taskq_open
 
 from kiro_crew.providers.cleanup import _is_safe_path
 from kiro_crew.subagent_persistence import (
@@ -67,7 +68,7 @@ async def _owning(manager):
     try:
         yield manager
     finally:
-        await asyncio.wait_for(manager.wait_taskq_ready(), 5)
+        await wait_taskq_open(manager)
         manager._shutting_down = True
         store = manager._taskq
         if store is not None:
@@ -872,3 +873,30 @@ class TestCompanionRuntimeGuard:
         assert ok is True
         assert companion_pid in active, "companion runtime PID must be sweep-protected"
         assert bg_pid in active, "bg runtime PID must be sweep-protected"
+
+
+class TestTheSuiteNeverRunsTheBootSandboxSweep:
+    """``test/conftest.py`` pins the session module's boot sandbox sweep to a no-op.
+
+    ``SessionManager.get_or_create`` arms the cleanup loop, whose boot reclaim
+    submits ``kiro_crew.session.cleanup_stale_sandbox_profiles`` -- the real
+    ``/proc`` pin scan over the operator's data home -- to the shared
+    ``mc-maint`` executor, and ``close_all()`` cannot stop an executor thread.
+    The tenth hygiene pass measured 138 real sweeps from ``test_session.py``
+    alone, one of which logged into an unrelated test's ``caplog`` seconds
+    after its own test had torn down. ``test/conftest.py::_no_boot_sandbox_sweep``
+    is what stops that, by importing the session module itself rather than
+    asking ``sys.modules`` whether someone else already did; this test is the
+    only thing that notices if the pin goes away or stops reaching the name the
+    session module actually calls.
+    """
+
+    def test_the_session_modules_binding_is_the_no_op_not_the_sandbox_sweep(self) -> None:
+        import kiro_crew.sandbox as sandbox_mod
+        import kiro_crew.session as session_mod
+
+        assert (
+            session_mod.cleanup_stale_sandbox_profiles
+            is not sandbox_mod.cleanup_stale_sandbox_profiles
+        ), "test/conftest.py does not pin kiro_crew.session.cleanup_stale_sandbox_profiles"
+        assert session_mod.cleanup_stale_sandbox_profiles(data_home=Path("/nonexistent")) == 0

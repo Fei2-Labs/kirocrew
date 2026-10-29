@@ -2,10 +2,26 @@
 // No React, no component imports — safe to pull into any module or test.
 
 import { compareText } from '../../i18n/format'
-import type { Diagnostic, GitStatus } from './api'
+import { i18nT } from '../../i18n/t'
+import { refusedLetterParams } from '../../lib/scriptLabel'
+import { PapyrusApiError, type Diagnostic, type GitStatus } from './api'
 
 /** localStorage key holding the project the user last had open. */
 export const LAST_PROJECT_KEY = 'kc:papyrus:project'
+
+/** React Query key for the paper list. */
+export const PROJECTS_QUERY_KEY = ['papyrus', 'projects']
+
+/**
+ * React Query key for ONE paper's detail.
+ *
+ * Shared because the list and the workspace hold SEPARATE cache entries for the
+ * same paper, and the rename lives in the list while the title it changes is
+ * rendered by the workspace. Spelling the key out in both files is how they came
+ * to disagree: invalidating only the list left the renamed paper opening under
+ * its old name until a reload.
+ */
+export const projectQueryKey = (name: string): string[] => ['papyrus', 'project', name]
 
 /** localStorage key prefix mapping a project to its co-author chat slot. */
 export const SLOT_KEY_PREFIX = 'kc:papyrus:slot:'
@@ -275,6 +291,52 @@ export function countWords(source: string): number {
 export function gitBranchLabel(status: GitStatus | undefined): string {
   if (!status?.is_git) return ''
   return `${status.branch || ''}${status.dirty ? '*' : ''}`
+}
+
+/**
+ * The text to show for a failed create or clone.
+ *
+ * A refused paper name answers `invalid_project_name`, with the character that
+ * stopped it when there was one (a name typed in another script stops at its
+ * first letter). That is explained in the app's language: the paper name is its
+ * folder name, so it stays a lowercase Latin slug on purpose, and the server's
+ * English sentence is only for logs. A refused LETTER is shown with its script
+ * and code point, because a Cyrillic or Greek capital renders exactly like the
+ * Latin one the rule allows. Any other failure keeps the server's text.
+ */
+export function projectErrorText(err: Error): string {
+  if (err instanceof PapyrusApiError && err.code === 'invalid_project_name') {
+    // `\p{L}` alone: the server only refuses a letter that is not lowercase a–z,
+    // so any single letter here is one the rule's Latin alphabet does not hold.
+    if (/^\p{L}$/u.test(err.char)) {
+      return i18nT('apps.papyrus.page.invalid_project_name_letter', refusedLetterParams(err.char))
+    }
+    return err.char
+      ? i18nT('apps.papyrus.page.invalid_project_name_char', { char: err.char })
+      : i18nT('apps.papyrus.page.invalid_project_name')
+  }
+  return err.message
+}
+
+/**
+ * The banner text for a refused rename. The server's `error` is English and
+ * names internals ("settings file"), so each `PUT /title` refusal `code` maps to
+ * a translated string; anything else (a network failure, an older backend) keeps
+ * its message.
+ */
+export function renameErrorText(err: Error, name: string): string {
+  if (err instanceof PapyrusApiError) {
+    switch (err.code) {
+      case 'title_rejected':
+        // `name` is the directory: what a cleared field shows again.
+        return i18nT('apps.papyrus.page.rename_title_rejected', { name })
+      case 'project_config_refused':
+        return i18nT('apps.papyrus.page.rename_config_refused')
+      case 'project_replaced':
+        return i18nT('apps.papyrus.page.rename_paper_replaced')
+    }
+  }
+  return err.message
 }
 
 /** Read the last-open project name from localStorage (never throws). */

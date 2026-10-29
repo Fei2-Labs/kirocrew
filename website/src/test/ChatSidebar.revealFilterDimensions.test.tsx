@@ -7,12 +7,11 @@
  * registry cannot quietly drop a dimension; they pass both before and after
  * the refactor, which deliberately changed no filter's behaviour.
  *
- * The structural cases are the before/after guard, and their reach is narrow:
- * they fail while the effect names filter state directly, and they pin that
- * the registry adapts the single filterDimensions declaration rather than
- * declaring dimensions of its own. The declaration's shape — and that
- * filteredSlots and listNarrowed derive from the same source — is pinned by
- * ChatSidebar.filterDimensions.test.tsx.
+ * The structural case reads only the reveal owner's effect, and its reach is
+ * narrow: it fails while the effect names filter state directly. That the
+ * registry is derived from the one dimension declaration, with one entry per
+ * dimension answering the same rows the filter pass drops, is pinned at the row
+ * model's interface (`pages/chat-sidebar/rows.test.ts`).
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -189,16 +188,61 @@ describe('reveal-in-sidebar drops every registered filter dimension', () => {
       expect(JSON.parse(localStorage.getItem(TAG_FILTER_LS_KEY) || '[]')).toEqual([])
     })
   })
+
+  it('leaves a tag filter in place when the reveal target is a pinned row the filter exempts', async () => {
+    await withScrollStub(async () => {
+      // `k-beta` is pinned and carries no `t1`: it is on screen only because
+      // the pinned exemption passes it. The tag `hides` predicate does not go
+      // through `excluded`, so it must restate the exemption, or this reveal
+      // would clear a filter that was never hiding the row.
+      localStorage.setItem(TAG_FILTER_LS_KEY, JSON.stringify(['t1']))
+      const utils = renderSidebar([
+        SLOTS[0],
+        { ...SLOTS[1], pinned: true } as unknown as ChatSlot,
+      ])
+      await waitFor(() => expect(utils.queryByText('beta session')).not.toBeNull())
+
+      utils.store.dispatch(requestSlotReveal('k-beta'))
+
+      await waitFor(() => expect(utils.queryByText('beta session')).not.toBeNull())
+      expect(JSON.parse(localStorage.getItem(TAG_FILTER_LS_KEY) || '[]')).toEqual(['t1'])
+    })
+  })
+
+  it('leaves a status chip in place when the reveal target is a pinned row the search dropped', async () => {
+    await withScrollStub(async () => {
+      // `k-beta` is pinned and not running, so the Running chip exempts it; the
+      // search is what hides it. `excluded` is list membership, so a status
+      // `hides` that did not restate the exemption would read the row as
+      // hidden by the chip and clear it. Only the search must clear.
+      localStorage.setItem(RUNNING_ONLY_LS_KEY, '1')
+      const utils = renderSidebar([
+        SLOTS[0],
+        { ...SLOTS[1], pinned: true } as unknown as ChatSlot,
+      ])
+      await waitFor(() => expect(utils.queryByText('beta session')).not.toBeNull())
+      const search = utils.getByPlaceholderText('Search sessions…')
+      fireEvent.change(search, { target: { value: 'alpha' } })
+      await waitFor(() => expect(utils.queryByText('beta session')).toBeNull())
+
+      utils.store.dispatch(requestSlotReveal('k-beta'))
+
+      await waitFor(() => expect(utils.queryByText('beta session')).not.toBeNull())
+      expect(search).toHaveValue('')
+      expect(localStorage.getItem(RUNNING_ONLY_LS_KEY)).toBe('1')
+    })
+  })
 })
 
-const SRC = join(__dirname, '..', 'pages', 'ChatSidebar.tsx')
+/** The reveal owner: both reveal effects live here, the session one first. */
+const REVEAL_SRC = join(__dirname, '..', 'pages', 'chat-sidebar', 'reveal.ts')
 // Flattened first: a line-by-line scan misses a construct the moment a
 // reformat splits it across lines.
-const flat = readFileSync(SRC, 'utf8').replace(/\s+/g, ' ')
+const revealFlat = readFileSync(REVEAL_SRC, 'utf8').replace(/\s+/g, ' ')
 
-/** The reveal effect's body, from its guard clause to its dependency array. */
+/** The session reveal effect's body, from its guard clause to its dependency array. */
 function revealEffect(): string {
-  const body = flat.match(/if \(!revealRequest\) return.*?\}, \[revealRequest[^\]]*\]\)/)?.[0]
+  const body = revealFlat.match(/if \(!revealRequest\) return.*?\}, \[revealRequest[^\]]*\]\)/)?.[0]
   expect(body).toBeDefined()
   return body!
 }
@@ -219,22 +263,5 @@ describe('reveal filter dimensions are registered, not enumerated in the effect'
     }
     // It consults the registry instead.
     expect(effect).toContain('revealBlockingFilters')
-  })
-
-  it('the registry derives from the single filterDimensions declaration', () => {
-    const registry = flat.match(/const revealBlockingFilters = useMemo<RevealBlockingFilter\[\]>.*?\}, \[[^\]]*\]\)/)?.[0]
-    expect(registry).toBeDefined()
-    // Dimensions are declared ONCE, in filterDimensions (whose shape
-    // ChatSidebar.filterDimensions.test.tsx pins); this registry only adapts
-    // them, so it can no longer hold a dimension the other consumers miss.
-    expect(registry).toContain('filterDimensions.map')
-    for (const named of [
-      'filterTagIds', 'clearTagFilter',
-      'slotFilter', 'setSlotFilter',
-      'activeFilters', 'setActiveFilters', 'SESSION_FILTERS',
-      'filterHiddenSubtree', 'setFilterHiddenFolders',
-    ]) {
-      expect(registry, `reveal registry must not name ${named} directly`).not.toContain(named)
-    }
   })
 })

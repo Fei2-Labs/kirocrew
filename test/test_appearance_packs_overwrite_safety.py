@@ -182,6 +182,50 @@ class TestOrphanedBackupRecovery:
         assert detail is not None
         assert "current" in json.dumps(detail)
 
+    def test_the_newest_of_several_accumulated_backups_is_restored(self, tmp_path):
+        """Each save's backup carries a per-transaction suffix that LEADS with a
+        zero-padded ``time.time_ns()``, so backup filenames sort by creation
+        order. A pack whose publish crashed can leave its backup behind while a
+        LATER save (which never sees it) leaves a second one. If recovery then
+        finds the target absent, it must restore the NEWEST revision moved aside
+        (the lexically-greatest suffix) and drop the older one — restoring the
+        stale backup would delete the user's latest art with no way back. The
+        order comes from the name, not the filesystem mtime, so it holds on
+        coarse-granularity filesystems and when ``stat()`` fails."""
+        store = ap.AppearanceStore(tmp_path)
+        store.load()
+        packs = tmp_path / ap.PACKS_DIRNAME
+        packs.mkdir(parents=True, exist_ok=True)
+
+        manifest = json.dumps(
+            {"meta": {"id": "mine", "name": "Mine"}, "states": {"idle": "idle.svg"}}
+        )
+
+        # An OLD interrupted save's leftover backup — smaller time_ns prefix.
+        old_backup = packs / "mine.old.00000000000000000100-111-aaaa"
+        old_backup.mkdir()
+        (old_backup / "manifest.json").write_text(manifest, "utf-8")
+        (old_backup / "idle.svg").write_text("<svg id='stale'/>", "utf-8")
+
+        # ... and a NEWER interrupted save's backup — larger time_ns prefix.
+        new_backup = packs / "mine.old.00000000000000000200-222-bbbb"
+        new_backup.mkdir()
+        (new_backup / "manifest.json").write_text(manifest, "utf-8")
+        (new_backup / "idle.svg").write_text("<svg id='latest'/>", "utf-8")
+
+        again = ap.AppearanceStore(tmp_path)
+        again.load()
+
+        detail = again.pack_detail("mine")
+        assert detail is not None
+        blob = json.dumps(detail)
+        assert "latest" in blob, "recovery restored a stale revision, not the newest"
+        assert "stale" not in blob
+        # Only one pack directory survives; every backup is gone.
+        assert (packs / "mine").exists()
+        assert not old_backup.exists()
+        assert not new_backup.exists()
+
 
 class TestLinkedPackFileReadIsRefused:
     def test_a_symlinked_pack_file_does_not_leak_outside_content(self, tmp_path):

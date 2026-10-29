@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from overload_fakes import Clock, ManagerHarness, open_task_store
 
+from kiro_crew import mcp_shared
 from kiro_crew.dashboard.handlers import spawn_resume
 from kiro_crew.mcp_tools import spawn as spawn_tools
 from kiro_crew.subagent import SubagentInfo
@@ -33,6 +35,7 @@ from kiro_crew.subagent_manager.admission import (
 from kiro_crew.taskq import lanes, model
 from kiro_crew.taskq.store import TaskStore
 from kiro_crew.taskq.waits import WaitRecord
+from kiro_crew.testing.wait import await_until
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -321,37 +324,110 @@ async def test_child_reserve_refills_beside_restricted_root_entries(h, mode) -> 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["persistent", "incognito", "temporary"])
-@pytest.mark.parametrize("pressure", ["absolute", "posture"])
-async def test_pressure_defers_only_a_subagent_with_a_durable_row(h, mode, pressure) -> None:
-    from kiro_crew.resource_status import AdmissionDecision
+async def test_low_memory_queues_every_subagent_and_defers_only_a_durable_row(h, mode) -> None:
+    """A capacity verdict never refuses: the start waits whatever its memory mode.
 
+    A durable row is deferred in the store (``next_run_at``); a row the store
+    must never hold waits in the in-memory window, not eligible again until
+    the same admit wait passes, and starts once the host has room.
+    """
     hz = await h(max_concurrent=1)
-    target = (
-        "kiro_crew.subagent.check_memory_available"
-        if pressure == "absolute"
-        else "kiro_crew.subagent.cached_admission_check"
-    )
-    result = (
-        (False, 0.5)
-        if pressure == "absolute"
-        else AdmissionDecision(admitted=False, posture="critical", available_gb=0.5, reason="low")
-    )
     with (
-        patch(target, return_value=result),
+        patch("kiro_crew.subagent.check_memory_available", return_value=(False, 0.5)),
         patch.object(
             type(hz.mgr._admission), "taskq_defer", wraps=hz.mgr._admission.taskq_defer
         ) as defer,
     ):
         info = hz.spawn("pressure sentinel", _memory_mode=mode)
-    if mode == "persistent":
-        assert info.queued and not info.done
-        assert hz.store.get(info.id).state == model.QUEUED
-        defer.assert_called_once()
-    else:
-        assert info.done and not info.queued and "spawn refused" in info.error
-        defer.assert_not_called()
-        assert hz.store.get(info.id) is None and not hz.store.events(info.id)
-    assert hz.mgr._running_count == 0 and not hz.started
+        await hz.settle()
+        assert info.queued and not info.done and info.error == ""
+        assert info.queued_reason == "low_memory" and "0.5 GB available" in (
+            info.queued_reason_detail
+        )
+        assert hz.mgr._running_count == 0 and not hz.started
+        if mode == "persistent":
+            assert hz.store.get(info.id).state == model.QUEUED
+            defer.assert_called_once()
+        else:
+            defer.assert_not_called()
+            assert hz.store.get(info.id) is None and not hz.store.events(info.id)
+            (entry,) = [p for p in hz.mgr._queue if p["_preassigned_id"] == info.id]
+    if mode != "persistent":
+        key = hz.mgr._admission.MEMORY_WAIT_UNTIL_KEY
+        # The host has room again, but the admit wait has not passed: a pass in
+        # between SKIPS the entry -- it neither starts nor re-reads the host,
+        # which would otherwise happen on every drain while memory stays low.
+        assert entry[key] > time.monotonic()
+        with patch("kiro_crew.subagent.check_memory_available", return_value=(True, 8.0)) as read:
+            hz.mgr._drain_queue()
+            await hz.settle()
+        assert not hz.started and read.call_count == 0
+        assert [p["_preassigned_id"] for p in hz.mgr._queue] == [info.id]
+        # The wait passed: the next pass starts it.
+        entry[key] = 0.0
+        hz.mgr._drain_queue()
+        await hz.settle()
+        assert hz.started == [info.id]
+        assert not hz.mgr._queue
+        await hz.end(hz.live(info))
+
+
+@pytest.mark.asyncio
+async def test_the_pick_never_asks_the_pressure_hold_about_a_floor_wait(h) -> None:
+    """A floor wait past its stamp goes to the gate, which re-checks the floor
+    before the kernel pressure hold. Asking the hold at the pick would start a
+    pressure clock for a start that waits on the floor, and the hold's bound
+    could later end it "never started" for time it never spent on the kernel."""
+    hz = await h(max_concurrent=2)
+    key = hz.mgr._admission.MEMORY_WAIT_UNTIL_KEY
+    held = {"_preassigned_id": "held", "parent_session_key": "dashboard:a", "_lane": "root"}
+    floor = {"_preassigned_id": "floor", "parent_session_key": "dashboard:b", "_lane": "root"}
+    floor[key] = 0.0  # its admit wait has passed
+    hz.mgr._queue[:] = [held, floor]
+    root_held = MagicMock(return_value=True)
+    assert hz.mgr._admission.pick_window_index(root_held=root_held) == 1
+    assert [c.args[0]["_preassigned_id"] for c in root_held.call_args_list] == ["held"]
+    hz.mgr._queue.clear()
+
+
+@pytest.mark.asyncio
+async def test_a_durable_floor_defer_refills_as_a_floor_wait_the_pick_leaves_to_the_gate(
+    h,
+) -> None:
+    """The default path: a persistent start below the floor is deferred in the
+    store, which keeps only ``next_run_at``. Once that passes, the refill brings
+    the row back stamped as a floor wait, so the pick does not ask the pressure
+    hold about it: the gate re-checks the floor first, defers it again, and no
+    pressure clock or ``memory_pressure`` label ever covers time spent below the
+    floor."""
+    hz = await h(max_concurrent=2)
+    with (
+        patch("kiro_crew.subagent.check_memory_available", return_value=(False, 0.5)),
+        patch.object(hz.mgr, "_memory_pressure_hold", return_value=2),
+    ):
+        info = hz.spawn("below the floor")
+        await hz.settle()
+        row = hz.store.get(info.id)
+        assert row is not None and row.state == model.QUEUED and row.next_run_at is not None
+        assert info.queued_reason == "low_memory"
+        assert not hz.mgr._queue and info.id in hz.mgr._floor_deferred_ids
+        # Its admit wait has passed: the next pass refills it from the store.
+        hz.store.defer(info.id, wait=-1.0, reason="test: admit wait passed")
+        with patch.object(
+            hz.mgr, "_memory_pressure_holds", wraps=hz.mgr._memory_pressure_holds
+        ) as holds:
+            hz.mgr._drain_queue()
+            await hz.settle(rounds=100)
+        assert holds.call_count == 0, "the pick asked the pressure hold about a floor wait"
+        assert info.id not in hz.mgr._pressure_holds
+        assert hz.mgr._queue_wait.get("dash:1", {}).get("reason") != "memory_pressure"
+        # The gate deferred it on the floor again, and marked it again.
+        row = hz.store.get(info.id)
+        assert row is not None and row.state == model.QUEUED
+        assert row.next_run_at is not None and row.next_run_at > hz.store.now()
+        assert info.id in hz.mgr._floor_deferred_ids
+        assert not hz.started
+    hz.mgr._queue.clear()
 
 
 @pytest.mark.asyncio
@@ -721,11 +797,14 @@ async def test_wait_resume_granted_wakes_on_the_grant_not_on_a_timer(h) -> None:
     waiter = asyncio.ensure_future(hz.mgr._admission.wait_resume_granted(s.id, timeout=5.0))
     await hz.settle()
     assert not waiter.done()
-    loop = asyncio.get_event_loop()
-    t0 = loop.time()
+    event = hz.live(s)._resume_event
     await hz.end(a)
-    assert await asyncio.wait_for(waiter, timeout=0.5) is True
-    assert loop.time() - t0 < 0.1, "released by the grant event, not by the bound"
+    # settle() is only sleep(0) rounds, so a done waiter here was woken by
+    # the grant event: its 5.0 s timer cannot have fired yet.
+    await hz.settle()
+    assert waiter.done(), "woken by the grant event, not the 5 s bound"
+    assert waiter.result() is True
+    assert event.is_set(), "the grant set the armed event"
     assert hz.mgr._admission.resume_granted(s.id) is True
     assert hz.live(s)._resume_event is None, "one event per wait"
 
@@ -766,7 +845,7 @@ async def test_api_spawn_resume_reports_and_holds(h) -> None:
     pending = asyncio.ensure_future(spawn_resume.api_spawn_resume(req(s.id, "5")))
     await hz.settle()
     await hz.end(a)
-    granted = json.loads((await asyncio.wait_for(pending, timeout=0.5)).text)
+    granted = json.loads((await await_until(pending, what="the held resume request")).text)
     assert granted["granted"] is True and granted["slot_released"] is False
     lanes_body = json.loads((await spawn_resume.api_spawn_lanes(req("x"))).text)
     assert "dash:1" in lanes_body["lanes"] and "capacity" in lanes_body
@@ -786,6 +865,15 @@ class _Clock:
         return self.t
 
 
+def _hold_for_parent_resume(parent_session: str, deadline: float):
+    """Drive ``_ResumeHold`` probe by probe to its end, as the deferred step does."""
+    hold = spawn_tools._ResumeHold(parent_session, deadline)
+    while True:
+        done, note = hold.probe()
+        if done:
+            return note
+
+
 def test_hold_for_parent_resume_returns_when_granted(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = _Clock()
     answers = [
@@ -802,8 +890,7 @@ def test_hold_for_parent_resume_returns_when_granted(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(spawn_tools.mcp_core, "_get", fake_get)
     monkeypatch.setattr(spawn_tools.mcp_core, "time", clock)
-    monkeypatch.setattr(spawn_tools, "is_tool_cancelled", lambda: False)
-    note = spawn_tools._hold_for_parent_resume("subagent:p1", clock.t + 60)
+    note = _hold_for_parent_resume("subagent:p1", clock.t + 60)
     assert note is None
     assert len(calls) == 3 and all(c.startswith("/api/spawn/p1/resume?wait_secs=") for c in calls)
     assert calls[0].endswith("8.0"), "each request is held server-side up to the bound"
@@ -818,11 +905,10 @@ def test_hold_for_parent_resume_deadline_reports_pending(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(spawn_tools.mcp_core, "_get", fake_get)
     monkeypatch.setattr(spawn_tools.mcp_core, "time", clock)
-    monkeypatch.setattr(spawn_tools, "is_tool_cancelled", lambda: False)
-    note = spawn_tools._hold_for_parent_resume("subagent:p1", clock.t + 20)
+    note = _hold_for_parent_resume("subagent:p1", clock.t + 20)
     assert note is not None and note["status"] == "resume_pending" and note["parent"] == "p1"
     # A deadline already spent on the children observes nothing about the slot.
-    assert spawn_tools._hold_for_parent_resume("subagent:p1", clock.t - 1) is None
+    assert _hold_for_parent_resume("subagent:p1", clock.t - 1) is None
 
 
 def test_hold_for_parent_resume_skips_chat_parents_and_unknown_runs(
@@ -837,15 +923,21 @@ def test_hold_for_parent_resume_skips_chat_parents_and_unknown_runs(
 
     monkeypatch.setattr(spawn_tools.mcp_core, "_get", fake_get)
     monkeypatch.setattr(spawn_tools.mcp_core, "time", clock)
-    monkeypatch.setattr(spawn_tools, "is_tool_cancelled", lambda: False)
-    assert spawn_tools._hold_for_parent_resume("dashboard:abc", clock.t + 60) is None
-    assert spawn_tools._hold_for_parent_resume("", clock.t + 60) is None
+    assert _hold_for_parent_resume("dashboard:abc", clock.t + 60) is None
+    assert _hold_for_parent_resume("", clock.t + 60) is None
     assert calls == []
-    assert spawn_tools._hold_for_parent_resume("subagent:gone", clock.t + 60) is None
+    assert _hold_for_parent_resume("subagent:gone", clock.t + 60) is None
     assert len(calls) == 1
     # Legacy gateway without the route: an error payload releases the hold.
     monkeypatch.setattr(spawn_tools.mcp_core, "_get", lambda *a, **k: {"error": "not found"})
-    assert spawn_tools._hold_for_parent_resume("subagent:p1", clock.t + 60) is None
+    assert _hold_for_parent_resume("subagent:p1", clock.t + 60) is None
+
+
+def _settle(result: "str | mcp_shared.DeferredTool") -> str:
+    """The handler's text: a deferred wait is driven inline, as kiro-cli sees it."""
+    if isinstance(result, mcp_shared.DeferredTool):
+        return mcp_shared.drive_deferred(result, clock=spawn_tools.mcp_core.time)
+    return result
 
 
 def test_spawn_sub_agents_holds_then_returns_children_results() -> None:
@@ -864,8 +956,10 @@ def test_spawn_sub_agents_holds_then_returns_children_results() -> None:
         patch("kiro_crew.mcp_core.sel"),
         patch.dict("os.environ", {"KIROCREW_SESSION_KEY": "subagent:p9"}),
     ):
-        out = spawn_tools.spawn_sub_agents(
-            "spawn_sub_agents", {"agents": [{"agent_or_mode": "w", "prompt": "do"}]}
+        out = _settle(
+            spawn_tools.spawn_sub_agents(
+                "spawn_sub_agents", {"agents": [{"agent_or_mode": "w", "prompt": "do"}]}
+            )
         )
     assert '"completed"' in out and "resume_pending" not in out
     holds = [p for p in seen if p.startswith("/api/spawn/p9/resume")]

@@ -15,6 +15,7 @@ import {
   meetingsApi,
   safeMeetingId,
   type AgentDef,
+  type LiveStatus,
   type MeetingMeta,
   type MeetingStatus,
   type MeetingsConfig,
@@ -24,6 +25,7 @@ import {
   type TranslationLine,
 } from '../api'
 import { useMeetingTranscription } from './useMeetingTranscription'
+import { useNoteDraft } from './useNoteDraft'
 
 /** Transcript segments arrive with overlap; a repeat inside this window is dropped. */
 const DEDUP_WINDOW_MS = 5000
@@ -56,7 +58,22 @@ const STT_ERROR_KEY = {
   worklet: 'apps.meetings.session.sttWorkletFailed',
   connection: 'apps.meetings.session.sttConnectionFailed',
   disconnected: 'apps.meetings.session.sttDisconnected',
+  // Gateway sends this code when the streaming gate refuses the upgrade (sst.streaming=false
+  // or provider not in _STREAMING_PROVIDERS). The error frame carries the actionable copy.
+  stt_streaming_disabled: 'apps.meetings.session.sttStreamingDisabled',
 } as const
+
+/**
+ * The copy for a 409 start refusal. One helper so the inline notice and the
+ * toast of every other mutation that hits the latch cannot drift apart.
+ */
+export function conflictMessage(error: MeetingsApiError): string {
+  const title = error.blockingMeetingTitle
+  if (!title) return i18nT('apps.meetings.session.anotherMeetingActive')
+  return error.blockingMeetingStatus === 'reviewing'
+    ? i18nT('apps.meetings.session.anotherMeetingReviewing', { title })
+    : i18nT('apps.meetings.session.anotherMeetingActiveNamed', { title })
+}
 
 /** True when *text* repeats, contains, or is contained by the previous segment. */
 export function isDuplicateSegment(
@@ -251,9 +268,17 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   const scope = ['meetings', meetingId] as const
 
   const [caption, setCaption] = useState('')
+  /** The last transcription error, for the in-page ErrorNotice. Cleared when
+   *  status leaves 'active', when transcription comes back, or on a new Start. */
+  const [transcriptionError, setTranscriptionError] = useState<
+    { code: string; message: string } | null
+  >(null)
+  const transcriptionErrorMessage = transcriptionError?.message ?? null
+  const transcriptionErrorCode = transcriptionError?.code ?? null
   const [partialTranscript, setPartialTranscript] = useState('')
   const [fullMeetingId, setFullMeetingId] = useState('')
   const transcriptFullNoticeRef = useRef('')
+  const [noteOpen, setNoteOpen] = useState(false)
   const [translationOpen, setTranslationOpen] = useState(false)
   const [chatViewAgents, setChatViewAgents] = useState<string[]>([])
   const [selectedPreset, setSelectedPreset] = useState(config?.default_preset ?? '')
@@ -316,6 +341,9 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
 
   const meta: MeetingMeta | undefined = metaQuery.data?.meta
   const status: MeetingStatus = meta?.status ?? 'idle'
+  /** Read by the transcription error callback, which must not re-bind per status. */
+  const statusRef = useRef(status)
+  statusRef.current = status
   const live = metaQuery.data?.live ?? null
   // The server's own dispatch-admission state, straight off the poll. Either flag
   // means a line sent now LANDS: directly, or held for the agents that are still
@@ -358,6 +386,95 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       : status === 'paused' || status === 'reviewing'
         ? (config?.poll_interval_idle ?? 30_000)
         : false,
+  })
+
+  // ── the user's own note ───────────────────────────────────────────────────
+  //
+  // Fetched only while the panel is open, and NOT polled: this is the one thing in
+  // the meeting the user owns, so the authoritative copy is the textarea they are
+  // typing into. Refetching under them is how an autosaving editor loses a
+  // sentence, and there is no second writer to poll for.
+  const noteQuery = useQuery({
+    queryKey: [...scope, 'note'],
+    queryFn: () => meetingsApi.note(meetingId),
+    enabled: initQuery.isSuccess && noteOpen,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+  })
+  // Only a note that never loaded is "failed": `isError` is also set when a REFETCH
+  // (a reopened panel) fails after a good load, and treating that as failed made the
+  // exit flush report unsaved typing as safe to leave. A loaded note keeps saving.
+  const noteLoadFailed = noteQuery.isError && noteQuery.data === undefined
+
+  const noteMutation = useMutation({
+    mutationFn: (content: string) => meetingsApi.saveNote(meetingId, content),
+    onSuccess: response => {
+      // Seed the cache from the response instead of invalidating: an invalidate
+      // would refetch and hand the editor a value mid-keystroke.
+      queryClient.setQueryData([...scope, 'note'], {
+        content: response.content,
+        updated_at: response.updated_at,
+        path: response.path,
+      })
+    },
+    // `notify` directly rather than `failureNotice`: that helper is declared
+    // further down (referencing it here would be a use-before-init), and its one
+    // special case — the 409 "another meeting is active" — cannot arise for a note.
+    onError: () => notify(i18nT('apps.meetings.session.noteSaveFailed'), { type: 'error' }),
+    // Serialized, the way ChatPanel serializes its hidden-models save and for the
+    // same ordering reason. Concurrent saves are ordinary here (the debounce timer
+    // plus the blur, preview and unmount flushes), and out-of-order completion let
+    // the OLDER response seed the cache last, which the panel's adopt effect then
+    // put back in the field over newer text. Completions in send order self-heal,
+    // so keeping them in send order is the whole fix.
+    scope: { id: `meetings-note-${meetingId}` },
+  })
+
+  /**
+   * Store one pasted image, resolving with the markdown pieces to insert.
+   *
+   * Throws on refusal — the draft hook classifies the error for its in-panel notice
+   * — after reporting it to the notification feed, which is the one surface still
+   * showing when the paste completes after the panel has been closed. The two cases
+   * worth distinguishing are the ones the user can act on: shrink the image, or
+   * paste a different format.
+   */
+  const uploadNoteImage = useCallback(
+    async (file: File): Promise<{ alt: string; src: string }> => {
+      try {
+        const stored = await meetingsApi.uploadNoteImage(meetingId, file)
+        return { alt: stored.alt, src: stored.src }
+      } catch (error) {
+        const tooLarge = error instanceof MeetingsApiError && error.status === 413
+        notify(
+          i18nT(
+            tooLarge
+              ? 'apps.meetings.session.noteImageTooLarge'
+              : 'apps.meetings.session.noteImageFailed',
+          ),
+          { type: 'error' },
+        )
+        throw error
+      }
+    },
+    [meetingId, notify],
+  )
+
+  // The draft lives HERE, with the meeting, not in the panel: `NoteSidebar` is
+  // unmounted when the user closes it, and a draft held in its state died with it
+  // — a save refused on the way out lost the only copy. It lives no longer than the
+  // meeting view, either: leaving the view goes through `leaveNote` below, which
+  // waits for the final save and reports a refusal instead of navigating past it.
+  // See `useNoteDraft`.
+  const noteDraft = useNoteDraft({
+    meetingId,
+    serverContent: noteQuery.data?.content,
+    loadFailed: noteLoadFailed,
+    save: content => noteMutation.mutateAsync(content),
+    // Outside the mutation's scope on purpose: the tab-close save cannot wait in
+    // that queue, because the page is gone before the save ahead of it settles.
+    saveNow: content => meetingsApi.saveNote(meetingId, content, { keepalive: true }),
+    uploadImage: uploadNoteImage,
   })
 
   // ── live translation ──────────────────────────────────────────────────────
@@ -549,14 +666,19 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       // Indexed INSIDE the `i18nT(...)` call rather than via a local `const key`:
       // the gate collects only file-scope consts, so a function-local binding is
       // opaque to it however resolvable its initializer is.
-      notify(
-        i18nT(
-          code in STT_ERROR_KEY
-            ? STT_ERROR_KEY[code as keyof typeof STT_ERROR_KEY]
-            : 'apps.meetings.session.sttUnavailable',
-        ),
-        { type: 'error' },
+      const localizedMessage = i18nT(
+        code in STT_ERROR_KEY
+          ? STT_ERROR_KEY[code as keyof typeof STT_ERROR_KEY]
+          : 'apps.meetings.session.sttUnavailable',
       )
+      // While the meeting is active, MeetingView shows the error inline (one
+      // surface, so it is not read as two errors). Outside `active` the inline
+      // notice is cleared, so fall back to the toast or the error is lost.
+      if (statusRef.current === 'active') {
+        setTranscriptionError({ code, message: localizedMessage })
+      } else {
+        notify(localizedMessage, { type: 'error' })
+      }
     },
     [markTranscriptFull, notify],
   )
@@ -583,21 +705,51 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   // reconnects a STALLED socket, but a socket that closes cleanly and unexpectedly
   // lands here instead.
   //
-  // Safe against a restart loop: `start()` sets `active` true, which is the
-  // condition that stops this branch firing, and a `start()` that fails reports
-  // through `onError` rather than flipping `active`.
+  // Safe against a restart loop: `start()` sets `active` true (via the server's
+  // 'ready' frame), which is the condition that stops this branch firing. A
+  // `start()` that fails reports through `onError` rather than flipping `active`.
+  //
+  // Also guarded on `connecting`: pausing the meeting between the worklet loading
+  // and the server's 'ready' frame leaves `active` false, so without the `connecting`
+  // check the stop() branch never fires and buffered PCM is flushed after 'ready',
+  // persisting pause-window speech into the notes and tasks.
+  //
+  // A TERMINAL server error frame (streaming off, no consent, ...) `halts` the
+  // hook: its own `start()` refuses until `stop()` runs, whatever order the
+  // error, the close and this effect's re-run land in. Leaving the open state
+  // (pause, end) calls `stop()`, which clears the halt, and coming back retries
+  // once. A retryable frame (the stream cap, a failed session) does not halt:
+  // the close clears `active`/`connecting` and this effect reopens the socket.
   const transcriptionRef = useRef(transcription)
   transcriptionRef.current = transcription
   const transcriptionActive = transcription.active
+  const transcriptionConnecting = transcription.connecting
+  const transcriptionHalted = transcription.halted
   useEffect(() => {
     const mayOpen = canOpenTranscription({ status, ingressReady, transcriptFull })
-    if (mayOpen && !transcriptionRef.current.active) {
-      void transcriptionRef.current.start()
+    const t = transcriptionRef.current
+    if (mayOpen && !t.active && !t.connecting && !t.halted) {
+      void t.start()
     }
-    if (!mayOpen && transcriptionRef.current.active) {
-      transcriptionRef.current.stop()
+    if (!mayOpen && (t.active || t.connecting || t.halted)) {
+      t.stop()
     }
-  }, [status, ingressReady, transcriptFull, transcriptionActive])
+  }, [status, ingressReady, transcriptFull, transcriptionActive, transcriptionConnecting, transcriptionHalted])
+
+  // Clear any retained transcription error when the meeting is no longer active
+  // (it ended, paused, or the session was closed) or when transcription comes back
+  // alive (a reconnect succeeded). This makes the ErrorNotice transient: it
+  // disappears as soon as transcription is healthy again, not just on the next
+  // Start click.
+  //
+  // The startMutation.onMutate path handles the "next Start click" case; this
+  // effect handles the in-meeting recovery case that onMutate never sees.
+  useEffect(() => {
+    if (transcriptionActive) setTranscriptionError(null)
+  }, [transcriptionActive])
+  useEffect(() => {
+    if (status !== 'active') setTranscriptionError(null)
+  }, [status])
 
   // ── mutations ─────────────────────────────────────────────────────────────
 
@@ -615,7 +767,7 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
     (error: unknown, fallback: string) => {
       const message =
         error instanceof MeetingsApiError && error.status === 409
-          ? i18nT('apps.meetings.session.anotherMeetingActive')
+          ? conflictMessage(error)
           : fallback
       notify(message, { type: 'error' })
     },
@@ -625,7 +777,8 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   const startMutation = useMutation({
     mutationFn: (opts: { restart?: boolean }) =>
       meetingsApi.start(meetingId, {
-        title: meta?.title || fallbackTitle,
+        // A stored title is never resent: a cached one may predate a rename.
+        title: meta?.title ? undefined : fallbackTitle,
         preset: selectedPreset || undefined,
         // OMITTED, not `[]`, while the roster is still unknown: absent means "use
         // the configured defaults" to the server, which is what an unloaded config
@@ -636,7 +789,11 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       }),
     // Opens the polling window BEFORE the request goes out, so the status is
     // observable for the entire time the server spends initializing agents.
-    onMutate: () => setStartInFlight(true),
+    onMutate: () => {
+      setStartInFlight(true)
+      // Clear any retained transcription error when a new start is attempted.
+      setTranscriptionError(null)
+    },
     // `onSettled`, not `onSuccess`: a start that 409s or fails must close the window
     // too, or a meeting that never started would be polled forever. This flag only
     // drives poll cadence — the microphone follows the polled
@@ -647,8 +804,17 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       notify(i18nT('apps.meetings.session.started'), { type: 'success' })
       invalidate()
     },
-    onError: error => failureNotice(error, i18nT('apps.meetings.session.startFailed')),
+    // No toast: MeetingView renders `startErrorMessage` inline beside the Start
+    // button, and showing the same text twice read as two separate errors.
   })
+
+  // Clear a start error once the meeting is running after all. A start whose
+  // HTTP response timed out can still succeed on the server; the poll then
+  // moves `status` on, and the notice must not stay beside a live meeting.
+  const resetStart = startMutation.reset
+  useEffect(() => {
+    if (status === 'active' || status === 'paused' || status === 'reviewing') resetStart()
+  }, [status, resetStart])
 
   const statusMutation = useMutation({
     mutationFn: (next: MeetingStatus) => meetingsApi.setStatus(meetingId, next),
@@ -694,6 +860,18 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       void queryClient.invalidateQueries({ queryKey: ['meetings', 'list'] })
     },
     onError: error => failureNotice(error, i18nT('apps.meetings.session.stopFailed')),
+  })
+
+  // The saved title goes straight into the cache so the header shows it at once.
+  const renameMutation = useMutation({
+    mutationFn: (title: string) => meetingsApi.renameMeeting(meetingId, title),
+    onSuccess: ({ meta: saved }) => {
+      queryClient.setQueryData<{ meta: MeetingMeta; live: LiveStatus | null }>(
+        [...scope, 'meta'],
+        old => (old ? { ...old, meta: { ...old.meta, title: saved.title } } : old),
+      )
+      void queryClient.invalidateQueries({ queryKey: ['meetings', 'list'] })
+    },
   })
 
   const muteMutation = useMutation({
@@ -820,6 +998,51 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
     chatViewAgents,
     selectedPreset,
     transcription,
+    /**
+     * The user's own note. Not polled — the draft is the authoritative copy, and
+     * it outlives the panel (see `useNoteDraft`), so every field the panel renders
+     * comes from the hook rather than from component state.
+     */
+    note: {
+      open: noteOpen,
+      draft: noteDraft.draft,
+      dirty: noteDraft.dirty,
+      loaded: noteDraft.loaded,
+      updatedAt: noteQuery.data?.updated_at ?? '',
+      path: noteQuery.data?.path ?? '',
+      saving: noteDraft.saving,
+      saveFailed: noteDraft.saveFailed,
+      // The initial GET's own failure, as a flag: the panel maps it to a catalog
+      // string, because the server's sentence is English in every locale. A failed
+      // load leaves the textarea EMPTY, which reads as "no note yet" — and typing
+      // into that is how an existing note gets overwritten with a fresh one. The
+      // panel therefore says so in place, not only in a toast that fades.
+      loadFailed: noteLoadFailed,
+      uploading: noteDraft.uploading,
+      uploadError: noteDraft.uploadError,
+    },
+    setNoteOpen,
+    changeNote: noteDraft.change,
+    flushNote: noteDraft.flush,
+    pasteNoteImage: noteDraft.pasteImage,
+    /**
+     * The step before leaving the meeting view. Saves the note and resolves once the
+     * server has answered: `true` when it is safe to go (the note is on disk, or
+     * there was nothing to save), `false` when the save was refused. The draft is
+     * held by this hook, which the view unmounts on the way out — so the caller
+     * navigates only on `true`, and on `false` stays where the text still is, with
+     * the panel opened so the refusal it renders is on screen.
+     */
+    leaveNote: async (): Promise<boolean> => {
+      const saved = await noteDraft.exit()
+      if (!saved) {
+        // One side panel at a time, as the menu keeps it: the caller closes its own
+        // task sidebar, this closes translation before the note opens.
+        setTranslationOpen(false)
+        setNoteOpen(true)
+      }
+      return saved
+    },
     /** Live translation: `''` language means the feature is off. */
     translation: {
       language: translationLanguage,
@@ -846,6 +1069,7 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       review: () => requestStatus('reviewing'),
       backToMeeting: () => requestStatus('paused'),
       stop: () => stopMutation.mutate(),
+      rename: (title: string) => renameMutation.mutateAsync(title),
       mute: (agentId: string, muted: boolean) => muteMutation.mutate({ agentId, muted }),
       toggleAgent: (agentId: string, enable: boolean) =>
         toggleAgentMutation.mutate({ agentId, enable }),
@@ -867,6 +1091,29 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       unarchiveTask: (taskId: string) =>
         reviewTaskMutation.mutate({ taskId, reviewStatus: 'pending' }),
     },
+    /** The last start attempt's error. MeetingView shows it in an inline
+     *  ErrorNotice beside the Start button; it is the ONLY surface for a failed
+     *  start (no toast), so the reason is shown once. */
+    startError: (startMutation.error ?? null) as Error | null,
+    /** Localized copy for `startError`, so the notice names the blocker
+     *  rather than showing the raw server text. */
+    startErrorMessage: (() => {
+      const err = startMutation.error
+      if (!err) return null
+      return err instanceof MeetingsApiError && err.status === 409
+        ? conflictMessage(err)
+        : i18nT('apps.meetings.session.startFailed')
+    })(),
+    /** The last transcription error while the meeting is active, for the
+     *  inline ErrorNotice (shown instead of a toast). */
+    transcriptionErrorMessage,
+    /** The code behind `transcriptionErrorMessage`, so MeetingView can offer
+     *  the Voice settings link for `stt_streaming_disabled`. */
+    transcriptionErrorCode,
+    /** Close the inline start-error notice. */
+    dismissStartError: resetStart,
+    /** Close the inline transcription-error notice. */
+    dismissTranscriptionError: () => setTranscriptionError(null),
     pending: {
       starting: startMutation.isPending,
       stopping: stopMutation.isPending,

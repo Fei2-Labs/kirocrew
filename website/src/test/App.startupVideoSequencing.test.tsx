@@ -62,6 +62,7 @@ vi.mock('../api/client', () => ({
     listInstances: vi.fn().mockResolvedValue({ instances: [], warm_set_cap: 5 }),
     changelog: vi.fn().mockResolvedValue({ content: '' }),
     setAutoUpdate: vi.fn().mockResolvedValue({}),
+    kirocrewConfig: vi.fn().mockResolvedValue({ auto_update: true }),
     // A first run that is already complete, so onboarding claims nothing.
     themeBoot: vi.fn().mockResolvedValue({
       onboarded: true, import_onboarded: true, privacy_acked: true,
@@ -97,7 +98,9 @@ const mockedApi = vi.mocked(api)
 const clip = {
   id: 'vid-1',
   feature: 'startup-videos',
-  title: 'Feature videos',
+  // A per-clip title, as the catalog ships one. It must differ from the
+  // feature's own name, which the dialog header shows beside it.
+  title: 'Let one session watch a pull request',
   description: 'A short clip introduces each new feature.',
   src: '/app-assets/feature-videos/placeholder.mp4',
   poster: '/app-assets/feature-videos/placeholder.jpg',

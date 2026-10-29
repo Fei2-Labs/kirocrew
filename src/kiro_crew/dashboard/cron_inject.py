@@ -7,10 +7,17 @@ gateway.py and dashboard.handlers.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.dashboard.chat_persistence import (
+    _restore_dismissed_source_links,
+    _validate_turn_timeout_secs,
+)
+from kiro_crew.dashboard.chat_utils import CRON_NOTIFICATION_KIND, redact_display_content
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
     SlotOrigin,
@@ -20,6 +27,16 @@ from kiro_crew.dashboard.state import (
 from kiro_crew.history import append_rows_if_absent_off_loop
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+
+# Prefetched dismissed-source-link value that says "the metadata read was
+# skipped or came back UNREADABLE" — distinct from a readable transcript that
+# simply records no dismissals (an empty list). On the unreadable case the bind
+# CLEARS the reused slot's in-memory set (so a colliding local transcript's
+# tombstones cannot fold into this cron transcript on the next union-save) and
+# marks it dismissed-unhydrated, while the durable value is PRESERVED on disk
+# and carried forward by that save until a readable restore replaces it. So this
+# sentinel routes _bind_cron_slot away from the restore call.
+_DISMISSED_UNREAD: object = object()
 
 if TYPE_CHECKING:
     from kiro_crew.cron import CronJob
@@ -528,7 +545,8 @@ def _bind_cron_slot(
     state: DashboardState,
     job: "CronJob",
     history: list[dict[str, Any]] | None,
-) -> Any:
+    dismissed: object = _DISMISSED_UNREAD,
+) -> Any | None:
     """Create-or-find the job's dashboard slot, bind its identity, publish it.
 
     The single shared core for BOTH creator paths — the result injection below
@@ -540,6 +558,10 @@ def _bind_cron_slot(
     the one unlink guard makes every caller after the first an idempotent
     no-op, which is what lets the injection run unchanged after a pre-create.
     """
+    # An app-owned slot under the job's key is never adopted: linking it would
+    # hand the app the job's transcript. Nothing is bound or surfaced instead.
+    if app_holds_gateway_key(state, f"cron-{job.id}", "cron.bind_slot"):
+        return None
     # Whether this call MINTS the tab decides whether it is filed into the job's
     # chat folder (see the end): a tab found in the table -- filed, unfiled or
     # dragged somewhere by the reader -- is left exactly where it is.
@@ -559,12 +581,42 @@ def _bind_cron_slot(
     if job.memory_store:
         slot.memory_store = job.memory_store
     if not slot.linked_session_key:
+        # Bind + hydrate ALWAYS, so injected results and follow-up turns route to
+        # the same ``cron:{id}`` transcript (splitting the binding on a transient
+        # read failure would corrupt conversation continuity). The dismissed set,
+        # however, is only trustworthy when it was read READABLY off-loop: on the
+        # UNREADABLE sentinel mark the slot ``_dismissed_hydrated = False`` so its
+        # full save CARRIES the on-disk dismissed line forward rather than
+        # serializing its empty in-memory set and erasing the real tombstones. A
+        # later readable restore clears the flag. Link + hydration move together.
         slot.linked_session_key = f"cron:{job.id}"
         # A cron link is exempt from the channel class, so this records nothing in
         # practice. It is here so EVERY assignment site reaches the recorder and the
         # derived pin needs no exception for this one.
         note_crew_log_class(state, slot)
         hydrate_slot_from_history(slot, history or [])
+        # The tab's own turn time limit lives on the transcript's metadata line,
+        # which this bind does not read. Until restore_cron_turn_timeout reads
+        # it, the slot's saves carry the on-disk value forward rather than
+        # writing "follow the global limit" over it; a reused slot's limit from
+        # a prior binding is dropped for the same reason.
+        slot.turn_timeout_secs = None
+        slot._turn_timeout_hydrated = False
+        if dismissed is not _DISMISSED_UNREAD:
+            _restore_dismissed_source_links(slot, dismissed)
+        else:
+            # CLEAR the in-memory set first: this slot object may be a REUSED
+            # local slot whose ``_dismissed_source_links`` still holds the
+            # COLLIDING local transcript's tombstones. Leaving them in place while
+            # marking ``_dismissed_hydrated = False`` would let the next full save
+            # (which carries the on-disk line forward by UNION) fold those foreign
+            # keys into the ``cron:{id}`` transcript and suppress unrelated links
+            # there. Emptying the set means the union carries only the cron
+            # transcript's own on-disk dismissals; a later readable restore
+            # replaces it authoritatively and clears the flag.
+            slot._dismissed_source_links = set()
+            slot.invalidate_source_links()
+            slot._dismissed_hydrated = False
     # Publish the (possibly just-created) tab to the dashboard-surface registry
     # BEFORE anything routes against it. Every gate that asks "does this session
     # have a tab?" — dashboard_slot_key for sub-agent event routing and
@@ -580,6 +632,29 @@ def _bind_cron_slot(
     return slot
 
 
+def queue_cron_notification(slot: Any, wrapped: str, label: str) -> str:
+    """Queue *wrapped* behind *slot*'s running turn and draw its card; return the queue id.
+
+    The one writer of the ``queued`` card both cron injectors draw for a
+    notification that waits: a cron's ``send_message`` to its origin session
+    (``handlers.messaging.api_send_message``) and a script cron's result
+    (``GatewayOrchestrator._deliver_script_result``). The card names its entry in
+    ``meta.queueId``, the key the dashboard's queue reducers match
+    (``website/src/store/chat/queue.ts``: the drain's ``queue_pop``, cancel, edit
+    and the slot-detail hydration), so the drain takes the card down when the
+    notification starts its turn. The JSON ``cls`` carries ``cronLabel`` for the
+    card's label and ``queue_id`` for ``chat_utils._edit_queued_by_id``.
+    """
+    queue_id = slot.queue_append(wrapped, kind=CRON_NOTIFICATION_KIND)
+    slot.append(
+        "queued",
+        wrapped,
+        json.dumps({"cronLabel": label, "queue_id": queue_id}),
+        meta={"queueId": queue_id},
+    )
+    return queue_id
+
+
 def inject_cron_result_to_dashboard(
     state: DashboardState,
     job: "CronJob",
@@ -587,7 +662,9 @@ def inject_cron_result_to_dashboard(
     *,
     include_prompt: bool = True,
     history: list[dict[str, Any]] | None,
+    dismissed: object = _DISMISSED_UNREAD,
     context_reading: dict[str, Any] | None = None,
+    turn_stats: dict[str, Any] | None = None,
 ) -> None:
     """Inject cron result into linked dashboard chat slot (shared by to-chat and auto-inject).
 
@@ -633,17 +710,28 @@ def inject_cron_result_to_dashboard(
     can serve it after the executor resets the session. ``None`` (the to-chat
     replay path, or a run that measured nothing) records nothing and keeps
     whatever snapshot an earlier run stored.
+
+    ``turn_stats`` is the run's ``meta.turn_stats`` (``chat_runner.turn_stats_meta``),
+    stamped on the result row so the chat footer shows the run's usage the same
+    way it does for a chat turn. ``None`` (the to-chat replay path) stamps nothing.
     """
-    slot = _bind_cron_slot(state, job, history)
+    slot = _bind_cron_slot(state, job, history, dismissed)
+    if slot is None:
+        return
     safe_name = _safe_job_name(job)
 
     # Rows this call owes the durable transcript, in the order they happened.
     # Collected rather than written per row: the pair is flushed once, below,
     # under a single ``atomic_appends`` hold -- see the flush for why.
     durable_rows: list[tuple[str, str, str, str | None]] = []
+    durable_meta: list[dict[str, Any] | None] = []
 
-    def _reflect(role: str, content: str, cls: str) -> None:
-        """Put one row in the live slot and queue it for the durable write."""
+    def _reflect(role: str, content: str, cls: str, meta: dict[str, Any] | None = None) -> None:
+        """Put one row in the live slot and queue it for the durable write.
+
+        ``meta`` rides the append itself, so the live broadcast carries it too,
+        and the durable copy, so a restart before the slot save keeps it.
+        """
         if any(msg.get("content") == content for msg in slot.messages):
             return
         # The durable copy must carry the SAME ``meta.mid`` the window copy is
@@ -651,8 +739,9 @@ def inject_cron_result_to_dashboard(
         # durable row cannot be matched by the bounded read's identity walk,
         # which then treats the window copy as still owed and re-appends the
         # injection.
-        window_mid = row_mid(slot.append(role, content, cls))
+        window_mid = row_mid(slot.append(role, content, cls, meta=meta))
         durable_rows.append((role, content, cls, window_mid))
+        durable_meta.append(meta)
 
     def _flush_durable_rows() -> None:
         """Write the queued rows to the canonical log as ONE grouped append.
@@ -689,6 +778,7 @@ def inject_cron_result_to_dashboard(
             f"cron:{job.id}",
             durable_rows,
             agent=job.agent_id or None,
+            row_meta=durable_meta,
         )
 
     if result_text:
@@ -742,6 +832,7 @@ def inject_cron_result_to_dashboard(
             "assistant",
             f"# Cron Job Result: {safe_name}{stamp}{marker}\n\n{safe_result}",
             "msg msg-a",
+            meta={"turn_stats": dict(turn_stats)} if turn_stats else None,
         )
         # After BOTH rows are queued, so the pair lands as one write.
         _flush_durable_rows()
@@ -760,6 +851,12 @@ def inject_cron_result_to_dashboard(
     state.push_slots_update()
 
 
+def _app_owned(slot: Any) -> bool:
+    """Whether *slot* carries an owner app, which the cron binder never adopts."""
+    owner = getattr(slot, "_app", "") if slot is not None else ""
+    return isinstance(owner, str) and bool(owner)
+
+
 async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict[str, Any]] | None:
     """Off-loop read of the ``cron:{id}`` transcript for the injection above.
 
@@ -773,14 +870,73 @@ async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict
     slot already exists AND is already linked, because that is exactly the state
     in which the injection does not consume ``history`` at all. ``None`` is a
     legal value for the parameter, so the skip needs no special handling at the
-    call site.
+    call site. Also skipped when an app owns the slot under that key: the binder
+    stands down there (``slot_ownership.app_holds_gateway_key``) and consumes
+    nothing either.
     """
     if state.conversation_log is None:
         return None
     slot = state.get_slot(f"cron-{job_id}")
-    if slot is not None and slot.linked_session_key:
+    if slot is not None and (slot.linked_session_key or _app_owned(slot)):
         return None
     return await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job_id}")
+
+
+async def prefetch_cron_dismissed(state: DashboardState, job_id: str) -> object:
+    """Off-loop read of the cron transcript's dismissed source-link identities.
+
+    Companion to :func:`prefetch_cron_history`: the dismissed set is metadata on
+    the same ``cron:{id}`` transcript, and :func:`_bind_cron_slot` restores it
+    when it first links the slot. Reading it here (on a worker thread) keeps the
+    synchronous get_metadata OFF the gateway loop.
+
+    Returns the raw ``dismissed_source_links`` value (a list, possibly empty)
+    when the metadata line is READABLE — including an absent transcript, which
+    reads back as an empty, readable line (no dismissals). Returns the
+    :data:`_DISMISSED_UNREAD` sentinel only when the read genuinely FAILS
+    (raised / unreadable). ``_bind_cron_slot`` still binds on the sentinel to
+    keep transcript routing intact, and defers only the dismissed WRITE (carries
+    the on-disk line forward) so a transient read failure never erases tombstones.
+    Already-linked slots retry ONLY while dismissed-unhydrated and still bound
+    to this job. A readable retry restores that exact live binding here, before
+    returning; callers need no second apply step across another await.
+    """
+    if state.conversation_log is None:
+        return _DISMISSED_UNREAD
+    slot_name = f"cron-{job_id}"
+    history_key = f"cron:{job_id}"
+    slot = state.get_slot(slot_name)
+    if _app_owned(slot):
+        # The binder stands down on an app-owned slot; nothing to restore into.
+        return _DISMISSED_UNREAD
+    binding = slot.linked_session_key if slot is not None else ""
+    if slot is not None and binding and (binding != history_key or slot._dismissed_hydrated):
+        return _DISMISSED_UNREAD
+    try:
+        meta, readable = await asyncio.to_thread(
+            state.conversation_log.get_metadata_status, history_key
+        )
+    except Exception:
+        # A raising / non-conforming metadata read is treated as UNREADABLE, so
+        # the bind CLEARS the reused slot's in-memory set and marks it
+        # dismissed-unhydrated while the DURABLE on-disk dismissals are preserved
+        # (carried forward by the next save) rather than erased — the same
+        # fail-toward-keeping-the-tombstone stance as the ``readable`` guard
+        # below.
+        return _DISMISSED_UNREAD
+    if not readable or state.get_slot(slot_name) is not slot:
+        return _DISMISSED_UNREAD
+    if slot is not None and slot.linked_session_key != binding:
+        return _DISMISSED_UNREAD
+    dismissed = meta.get("dismissed_source_links")
+    if slot is not None and binding:
+        # Another readable restore or unlink may have won while we read. Its
+        # live state is newer; never overwrite it with our prefetch snapshot.
+        if slot._dismissed_hydrated:
+            return _DISMISSED_UNREAD
+        _restore_dismissed_source_links(slot, dismissed)
+        slot.invalidate_source_links()
+    return dismissed
 
 
 async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
@@ -803,8 +959,9 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     no-tab / no-identity / no-dispatch stays the deliberate fail-closed
     contract — an ineligible job is untouched by this call.
 
-    Cheap on every run after the first: an existing linked slot returns before
-    any transcript I/O. The first bind reads the ``cron:{id}`` history via
+    Cheap on every run after a successful hydration: an existing linked slot
+    skips transcript rows, retrying only unreadable dismissal metadata. The first
+    bind reads the ``cron:{id}`` history via
     :func:`prefetch_cron_history` (off-loop) BEFORE linking, because the link
     and the hydration must move together — see :func:`_bind_cron_slot`. The
     injection's own unlink guard then no-ops, so delivery behaves identically
@@ -813,10 +970,64 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     if not (job.persistent_session and not job.hide_in_chat):
         return
     slot = state.get_slot(f"cron-{job.id}")
+    if _app_owned(slot):
+        # Never adopted (see _bind_cron_slot). Returned before any read, and with
+        # no audit row: the result injection records the one refusal per run.
+        return
     if slot is not None and slot.linked_session_key:
+        await prefetch_cron_dismissed(state, job.id)
+        await restore_cron_turn_timeout(state, job.id)
         return
     history = await prefetch_cron_history(state, job.id)
-    _bind_cron_slot(state, job, history)
+    dismissed = await prefetch_cron_dismissed(state, job.id)
+    _bind_cron_slot(state, job, history, dismissed)
+    await restore_cron_turn_timeout(state, job.id)
+
+
+def apply_cron_turn_timeout(slot: Any, meta: dict[str, Any]) -> bool:
+    """Restore a bound cron tab's own turn time limit from a READABLE metadata line.
+
+    A restore only fills a limit that is still unread. When the tab is already
+    hydrated, a user's change or another restore committed while the metadata
+    read ran, so the line in hand is older than the slot's own value and is
+    dropped. Returns whether the line was applied.
+    """
+    if getattr(slot, "_turn_timeout_hydrated", True):
+        return False
+    slot.turn_timeout_secs = _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    slot._turn_timeout_hydrated = True
+    return True
+
+
+async def restore_cron_turn_timeout(state: DashboardState, job_id: str) -> None:
+    """Off-loop read of a just-bound cron tab's own turn time limit.
+
+    :func:`_bind_cron_slot` links the tab without reading the transcript's
+    metadata line, so the limit the tab was given before it closed is still on
+    disk only; the tab's saves carry it forward meanwhile. This reads it back
+    once the tab is bound to this job's transcript. A failed or unreadable read,
+    or a tab rebound or already restored while the read ran, leaves the slot as
+    it is, still carrying the on-disk value, and a later bind or run start
+    retries.
+    """
+    log = state.conversation_log
+    if log is None:
+        return
+    slot = state.get_slot(f"cron-{job_id}")
+    history_key = f"cron:{job_id}"
+    if slot is None or getattr(slot, "_turn_timeout_hydrated", True):
+        return
+    if slot.linked_session_key != history_key:
+        return
+    try:
+        meta, readable = await asyncio.to_thread(log.get_metadata_status, history_key)
+    except Exception:
+        return
+    if not readable or state.get_slot(f"cron-{job_id}") is not slot:
+        return
+    if slot.linked_session_key != history_key or slot._turn_timeout_hydrated:
+        return
+    apply_cron_turn_timeout(slot, meta)
 
 
 def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None:
@@ -835,8 +1046,7 @@ def hydrate_slot_from_history(slot: Any, messages: list[dict[str, Any]]) -> None
         content = msg.get("content", "")
         if not content:
             continue
-        content, _ = redact_exfiltration_urls(content)
-        content, _ = redact_credentials(content)
+        content = redact_display_content(content)
         if any(m.get("content") == content for m in slot.messages):
             continue
         slot.append(

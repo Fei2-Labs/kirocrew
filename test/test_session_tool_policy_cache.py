@@ -8,18 +8,18 @@ descriptor-pinned open, a JSON parse. With a couple of thousand installed specs
 that is most of a second of GIL-holding work on a worker thread for every
 request, and a managed MCP server makes the request on ordinary traffic.
 
-These tests pin the cache that answers the second request from one ``scandir``:
-an unchanged directory performs no spec read at all, and every kind of change
-the fingerprint claims to see -- an in-place edit, a new file, a permission
-change -- makes the next call read again. Refusals are deliberately not cached.
+These tests pin the policy semantics of the memo that answers the second request
+from one ``scandir``: an unchanged directory performs no spec read at all, an
+in-place edit or a new file makes the next call read again, and refusals are
+deliberately not memoized. The revision the memo is pinned to, and the memo's
+store rules, are :mod:`kiro_crew.agent_discovery`'s and are tested in
+``test_agents_dir_memo.py``.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import stat
-import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -34,9 +34,9 @@ AGENT = "reviewer"
 
 @pytest.fixture(autouse=True)
 def _fresh_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_CACHE", {}, raising=False)
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_MEMO_ENABLED", True)
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_RACY_WINDOW_NS", 0)
+    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_MEMO", agent_discovery.AgentsDirMemo())
+    monkeypatch.setattr(agent_discovery, "AGENTS_DIR_MEMO_ENABLED", True)
+    monkeypatch.setattr(agent_discovery, "_AGENTS_DIR_RACY_WINDOW_NS", 0)
 
 
 def _count_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
@@ -108,6 +108,31 @@ def test_an_in_place_edit_is_seen_and_the_new_policy_is_served(
     assert reads, "an edited spec must be read again"
 
 
+def test_an_identical_twin_edited_to_differ_turns_the_memoized_policy_into_a_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two identical specs declaring the agent resolve to one policy, which the
+    memo keeps; an edit that makes them differ changes the directory revision,
+    so the next read scans again and refuses, and the stale policy is gone."""
+    spec = {"name": AGENT, "managedToolPolicy": {"exclude": ["shell"]}}
+    _write_spec(tmp_path / f"Alpha-{AGENT}.json", spec)
+    beta = tmp_path / f"Beta-{AGENT}.json"
+    _write_spec(beta, spec)
+    reads = _count_reads(monkeypatch)
+
+    assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == {"exclude": ["shell"]}
+    reads.clear()
+    assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == {"exclude": ["shell"]}
+    assert reads == [], "an unchanged pair is served from the memo"
+
+    _write_spec(beta, {"name": AGENT, "managedToolPolicy": {"exclude": ["browser"]}})
+    _bump_mtime(beta, 5)
+
+    with pytest.raises(agent_discovery.AmbiguousAgentSpecError):
+        sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT)
+    assert reads, "the edited directory must be scanned again"
+
+
 def test_a_no_policy_answer_is_cached_until_a_spec_appears(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -163,38 +188,6 @@ def test_the_cache_is_per_agent_and_per_directory(
     assert sessions_mod._read_managed_tool_policy_sync(dir_a, AGENT) == {"exclude": ["shell"]}
 
 
-def test_the_revision_sees_content_and_permission_changes(tmp_path: Path) -> None:
-    spec = tmp_path / f"{AGENT}.json"
-    _write_spec(spec, {"managedToolPolicy": {}})
-    before = sessions_mod._agents_dir_revision(tmp_path)
-
-    _write_spec(spec, {"managedToolPolicy": {}, "description": "changed"})
-    after_content = sessions_mod._agents_dir_revision(tmp_path)
-    assert after_content != before
-
-    if os.name != "nt":
-        # POSIX exposes permission bits through st_mode. Keep this assertion in
-        # the cross-platform test rather than skipping the whole ratchet.
-        time.sleep(0.05)
-        spec.chmod(stat.S_IRUSR)
-        after_mode = sessions_mod._agents_dir_revision(tmp_path)
-        assert after_mode != after_content
-        assert after_mode[1][0][6] != after_content[1][0][6]
-
-
-def test_a_fresh_spec_is_not_memoized_until_the_racy_window_expires(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_RACY_WINDOW_NS", 2_000_000_000)
-    _write_spec(tmp_path / f"{AGENT}.json", {"managedToolPolicy": {}})
-    observed_at = time.time_ns()
-
-    assert sessions_mod._agents_dir_revision(tmp_path) is None
-
-    monkeypatch.setattr(sessions_mod.time, "time_ns", lambda: observed_at + 3_000_000_000)
-    assert sessions_mod._agents_dir_revision(tmp_path) is not None
-
-
 def test_an_edit_during_the_read_is_not_memoized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -203,13 +196,13 @@ def test_an_edit_during_the_read_is_not_memoized(
     new_policy = {"exclude": ["browser"]}
     _write_spec(spec, {"name": AGENT, "managedToolPolicy": old_policy})
     real_read = sessions_mod._read_managed_tool_policy_uncached
-    first_call = True
+    uncached_calls = 0
 
     def read_while_editing(agents_dir: Path, agent_name: str) -> dict[str, Any] | None:
-        nonlocal first_call
+        nonlocal uncached_calls
+        uncached_calls += 1
         policy = real_read(agents_dir, agent_name)
-        if first_call:
-            first_call = False
+        if uncached_calls == 1:
             _write_spec(spec, {"name": AGENT, "managedToolPolicy": new_policy})
             _bump_mtime(spec, 5)
         return policy
@@ -217,47 +210,41 @@ def test_an_edit_during_the_read_is_not_memoized(
     monkeypatch.setattr(sessions_mod, "_read_managed_tool_policy_uncached", read_while_editing)
 
     assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == old_policy
-    assert str(tmp_path) not in sessions_mod._TOOL_POLICY_CACHE
+    # The read count alone cannot distinguish "not stored" from "stored but
+    # missed": the bumped mtime makes the second call miss either way.
+    assert str(tmp_path) not in sessions_mod._TOOL_POLICY_MEMO._answers
     assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == new_policy
+    assert uncached_calls == 2, "the answer read across the edit must not be served again"
 
 
-def test_a_directory_past_the_entry_cap_is_not_memoized(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_an_alias_named_read_sees_the_alias_appear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_REVISION_MAX_ENTRIES", 2)
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_REVISION_OVERFLOW_WARNED", set())
-    _write_spec(
-        tmp_path / f"{AGENT}.json",
-        {"name": AGENT, "managedToolPolicy": {"exclude": ["shell"]}},
-    )
-    _write_spec(tmp_path / "other-a.json", {"name": "other-a"})
-    _write_spec(tmp_path / "other-b.json", {"name": "other-b"})
+    """The revision leaves skill-view aliases out, so an alias write moves
+    nothing it pins to; a policy read BY an alias name reads ``<alias>.json``
+    by filename and is therefore never served from the memo."""
+    from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
 
-    with caplog.at_level("WARNING", logger=sessions_mod.__name__):
-        assert sessions_mod._agents_dir_revision(tmp_path) is None
-        assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == {
-            "exclude": ["shell"]
-        }
-        assert sessions_mod._agents_dir_revision(tmp_path) is None
+    alias = f"{NATIVE_SKILL_ALIAS_PREFIX}0123456789abcdef01234567"
+    _populate(tmp_path)
 
-    warnings = [
-        record for record in caplog.records if "tool-policy memo disabled" in record.message
-    ]
-    assert len(warnings) == 1
-    assert "3 spec entries exceed 2" in warnings[0].message
+    assert sessions_mod._read_managed_tool_policy_sync(tmp_path, alias) is None
+    _write_spec(tmp_path / f"{alias}.json", {"managedToolPolicy": {"exclude": ["shell"]}})
+
+    assert sessions_mod._read_managed_tool_policy_sync(tmp_path, alias) == {"exclude": ["shell"]}
+    assert alias not in sessions_mod._TOOL_POLICY_MEMO._answers.get(str(tmp_path), (b"", {}))[1]
 
 
 def test_the_memo_is_disabled_when_the_platform_cannot_prove_freshness(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(sessions_mod, "_TOOL_POLICY_MEMO_ENABLED", False)
+    monkeypatch.setattr(agent_discovery, "AGENTS_DIR_MEMO_ENABLED", False)
     _write_spec(
         tmp_path / f"{AGENT}.json",
         {"name": AGENT, "managedToolPolicy": {"exclude": ["shell"]}},
     )
     reads = _count_reads(monkeypatch)
 
-    assert sessions_mod._agents_dir_revision(tmp_path) is None
     assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == {"exclude": ["shell"]}
     first_read_count = len(reads)
     assert first_read_count > 0
@@ -265,76 +252,22 @@ def test_the_memo_is_disabled_when_the_platform_cannot_prove_freshness(
     assert len(reads) > first_read_count
 
 
-def test_a_symlink_entry_is_seen_without_creating_one(
+def test_the_policy_memo_is_separate_from_the_projection_memo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    entry = MagicMock()
-    entry.name = f"{AGENT}.json"
-    entry.is_symlink.return_value = True
-    real_scandir = os.scandir
+    """The two ``spec_by_declared_name`` callers carry different SEL
+    ``operation`` labels, so an answer read under one label is never handed
+    to the other surface."""
+    from kiro_crew.acp import kas_agents
 
-    class _FakeScan:
-        def __init__(self, entries):
-            self._it = iter(entries)
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            return next(self._it)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            return False
-
-        def close(self):
-            return None
-
-    intercept = {"active": False}
-
-    def scan(path=".", *args, **kwargs):
-        try:
-            is_target = Path(path).resolve() == tmp_path.resolve()
-        except TypeError:
-            is_target = False
-        if intercept["active"] and is_target:
-            return _FakeScan([entry])
-        return real_scandir(path, *args, **kwargs)
-
-    monkeypatch.setattr(sessions_mod.os, "scandir", scan)
-
-    intercept["active"] = True
-    try:
-        assert sessions_mod._agents_dir_revision(tmp_path) is None
-    finally:
-        intercept["active"] = False
-    entry.stat.assert_not_called()
-
-
-def test_the_catalog_invalidation_point_drops_cached_policy_answers_too(tmp_path: Path) -> None:
-    """The shared generation makes the catalog invalidation point sufficient."""
     _populate(tmp_path)
+    monkeypatch.setattr(kas_agents, "_SPEC_SCAN_MEMO", agent_discovery.AgentsDirMemo())
+    reads = _count_reads(monkeypatch)
+
     assert sessions_mod._read_managed_tool_policy_sync(tmp_path, AGENT) == {"exclude": ["shell"]}
-    assert sessions_mod._TOOL_POLICY_CACHE
-    before = sessions_mod._agents_dir_revision(tmp_path)
-    assert sessions_mod._agents_dir_revision(tmp_path) == before
-
-    agent_discovery.clear_list_agents_cache()
-
-    assert sessions_mod._agents_dir_revision(tmp_path) != before
-
-
-def test_the_revision_ignores_files_the_spec_scans_ignore(tmp_path: Path) -> None:
-    _write_spec(tmp_path / f"{AGENT}.json", {"managedToolPolicy": {}})
-    before = sessions_mod._agents_dir_revision(tmp_path)
-    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
-    # The directory's own mtime moved, so the revision does; but the stray
-    # file itself is not an entry of it.
-    after = sessions_mod._agents_dir_revision(tmp_path)
-    assert [e[0] for e in after[1]] == [f"{AGENT}.json"]
-    assert [e[0] for e in before[1]] == [f"{AGENT}.json"]
+    reads.clear()
+    assert kas_agents.load_agent_spec(tmp_path, AGENT)["name"] == AGENT
+    assert reads, "the projection must read under its own label, not reuse the policy read"
 
 
 @pytest.mark.asyncio

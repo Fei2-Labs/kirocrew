@@ -26,6 +26,7 @@
 const path = require("path");
 const fs = require("fs");
 const { app, BrowserWindow, screen, ipcMain } = require("electron");
+const { createAppWindowErrorLatch } = require("../app-window-error-latch");
 const { companionPageUrl } = require("./pageUrl");
 
 /** @type {Map<number, Electron.BrowserWindow>} display id -> overlay */
@@ -107,15 +108,79 @@ let dragOffsetY = 0;
 
 let baseUrl = "";
 let credential = "";
+// True when the accepted credential rides the shared session cookie rather than
+// the page URL, so an empty `credential` still means "the probe was answered".
+let cookieAuth = false;
 let log = () => {};
 
 function setOverlayLogger(fn) {
   if (typeof fn === "function") log = fn;
 }
 
-function setOverlayTarget(url, token) {
+function setOverlayTarget(url, token, viaCookie = false) {
   baseUrl = url || "";
   credential = token || "";
+  cookieAuth = Boolean(viaCookie);
+}
+
+// ── Error-document latch ─────────────────────────────────────────────────────
+//
+// An overlay covers a WHOLE display and is frameless, non-focusable and
+// always-on-top. Whatever document its `pet.html` load ends on is what the user
+// sees at every point of that display, with no title bar to close and — until
+// the renderer reports a hitbox — no click target either. Two kinds of document
+// must therefore never be revealed:
+//
+//   * a gateway ERROR BODY (the token-required 403 page after a session expired
+//     during sleep, a 5xx during a restart). That is a COMPLETED navigation, so
+//     `did-fail-load` never fires and `did-finish-load` DOES; `did-navigate`'s
+//     httpResponseCode is the only signal that the page is not the companion.
+//   * Chromium's own error document after a TRANSPORT failure (gateway gone,
+//     tunnel down). `did-fail-load` reports it, and `did-finish-load` still
+//     follows once the error document has painted.
+//
+// The dashboard service worker leaves `/app-windows/` navigations to the browser
+// (website/public/sw.js), so neither failure is masked by a cached dashboard
+// shell. The latch keeps a failed display overlay hidden and prevents the hidden
+// notification owner from initializing against an error document. Recovery is
+// owned by the reconcile tick in index.js (rearmBlankedCompanionWindows), which
+// reloads both kinds of window with the credential its probe just accepted;
+// nothing here retries, so there is no tight loop and no stale token.
+
+/**
+ * Hide a failed display overlay and discard renderer-owned input state. The
+ * shared latch records the failure before invoking this host-specific action.
+ */
+function blankOverlay(win) {
+  readyOverlays.delete(win);
+  hitboxes.delete(win);
+  win.setIgnoreMouseEvents(true, { forward: true });
+  lastIgnore.set(win, true);
+  win.hide();
+}
+
+const overlayErrorLatch = createAppWindowErrorLatch({ onBlank: blankOverlay });
+const brainErrorLatch = createAppWindowErrorLatch();
+
+/** True when a live overlay is hidden on an error document. */
+function hasBlankedOverlay() {
+  return overlayErrorLatch.hasBlanked(overlays.values());
+}
+
+/**
+ * Reload every companion window latched on an error document, using the target
+ * the reconcile set for this tick. The accepted credential gates both visible
+ * overlays and the hidden notification owner, so neither retries in a tight loop
+ * or remains attached to a failed document for the companion lifetime.
+ * @returns {number} how many windows were reloaded
+ */
+function rearmBlankedCompanionWindows() {
+  if (!baseUrl || (!credential && !cookieAuth)) return 0;
+  const pageUrl = companionPageUrl(baseUrl, "pet.html", credential);
+  const reload = (win) => win.loadURL(pageUrl);
+  let rearmed = overlayErrorLatch.rearm(overlays.values(), reload);
+  if (brainWin) rearmed += brainErrorLatch.rearm([brainWin], reload);
+  return rearmed;
 }
 
 /**
@@ -448,6 +513,22 @@ function sendBubbleToActive(playReaction = false) {
   }
 }
 
+/**
+ * Whether the overlay may be made non-activatable (`setFocusable(false)`).
+ *
+ * Not on Windows: there `setFocusable(false)` marks the window unable to activate,
+ * and Chromium answers the `WM_MOUSEACTIVATE` sent for every button press on an
+ * inactive window with `MA_NOACTIVATEANDEAT`, discarding the button-down. The
+ * overlay then gets no `mousedown` at all, so no left click, drag or menu item
+ * works, and the full-display menu hitbox can never be dismissed. `acceptFirstMouse`
+ * is the macOS fix for the same class and does nothing on Windows. The cost is that
+ * a click on the companion activates the overlay; `showInactive()` still keeps it
+ * from taking focus when it appears.
+ */
+function overlayMayBeNonActivatable(platform = process.platform) {
+  return platform !== "win32";
+}
+
 function createOverlayFor(display) {
   const win = new BrowserWindow({
     x: display.bounds.x,
@@ -490,7 +571,7 @@ function createOverlayFor(display) {
     },
   });
 
-  win.setFocusable(false);
+  if (overlayMayBeNonActivatable()) win.setFocusable(false);
   // Refuse input by default; the renderer re-enables it over the sprite alone.
   win.setIgnoreMouseEvents(true, { forward: true });
   // INVISIBLE TO SCREEN CAPTURE (macOS NSWindowSharingNone, Windows
@@ -507,6 +588,15 @@ function createOverlayFor(display) {
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
   win.loadURL(companionPageUrl(baseUrl, "pet.html", credential));
+  // Both failure shapes latch the overlay (see the error-document latch above).
+  // Electron emits each of them before did-finish-load for the same navigation,
+  // so the latch is already set when the reveal below asks about it.
+  win.webContents.on("did-fail-load", (_e, code, _desc, _url, isMainFrame) => {
+    overlayErrorLatch.handleLoadFailure(win, code, isMainFrame);
+  });
+  win.webContents.on("did-navigate", (_e, _url, httpResponseCode) => {
+    overlayErrorLatch.handleNavigation(win, httpResponseCode);
+  });
   // Activation handshake. The renderer draws NOTHING until it receives
   // set-active(true); we send the flag BEFORE revealing so the avatar only ever
   // appears on the active overlay. This first send is a best-effort fast path — the
@@ -516,6 +606,9 @@ function createOverlayFor(display) {
   // mounted later (e.g. a slow theme load) and left the avatar hidden forever.
   win.webContents.on("did-finish-load", () => {
     if (win.isDestroyed()) return;
+    // An error document finished loading: it has no companion renderer to
+    // activate and must stay hidden until the reconcile re-arms the overlay.
+    if (overlayErrorLatch.isBlanked(win)) return;
     // Route through the one drag-aware choke so a reveal landing mid-drag carries the
     // drag state rather than a bare activation that would clear the carried bubble.
     // Pass the known display id: the overlay is not in the map yet at did-finish-load.
@@ -572,10 +665,16 @@ function createBrainWindow() {
   });
   win.setContentProtection(true);
   win.loadURL(companionPageUrl(baseUrl, "pet.html", credential));
+  win.webContents.on("did-fail-load", (_e, code, _desc, _url, isMainFrame) => {
+    brainErrorLatch.handleLoadFailure(win, code, isMainFrame);
+  });
+  win.webContents.on("did-navigate", (_e, _url, httpResponseCode) => {
+    brainErrorLatch.handleNavigation(win, httpResponseCode);
+  });
   // Best-effort fast path; the reliable owner/inactive send is the renderer's
   // pet-ready reply (below), which lands after its listeners mount.
   win.webContents.on("did-finish-load", () => {
-    if (win.isDestroyed()) return;
+    if (win.isDestroyed() || brainErrorLatch.isBlanked(win)) return;
     win.webContents.send("crew-companion:set-owner", true);
     win.webContents.send("crew-companion:set-active", false);
   });
@@ -955,9 +1054,11 @@ module.exports = {
   assertHostStaysInDock,
   broadcastToPets,
   isPetWindow,
+  overlayMayBeNonActivatable,
   openPetWindow,
   closePetWindow,
   petWindowCount,
+  rearmBlankedCompanionWindows,
   setOverlayLogger,
   setOverlayTarget,
   registerOverlayIpc,
@@ -978,6 +1079,8 @@ module.exports = {
   _findDisplayAtPoint: findDisplayAtPoint,
   _findNearestDisplay: findNearestDisplay,
   _clampLocal: clampLocal,
+  // Exported for tests: the error-document latch state.
+  _hasBlankedOverlay: hasBlankedOverlay,
   PET_W,
   PET_H,
 };

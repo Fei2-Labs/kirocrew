@@ -39,7 +39,9 @@ def test_atomic_write_secret_is_owner_only(tmp_path):
 def test_atomic_write_secret_leaves_no_temp_file_behind(tmp_path):
     target = tmp_path / ".env"
     qr._atomic_write(target, "a=1\n", secret=True)
-    assert [p.name for p in tmp_path.iterdir()] == [".env"]
+    # The temp is staged in the masked staging directory, which stays behind empty.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env", "auth-store-staging"]
+    assert list((tmp_path / "auth-store-staging").iterdir()) == []
 
 
 def test_atomic_write_secret_locks_down_before_any_content_byte(tmp_path, monkeypatch):
@@ -86,7 +88,9 @@ def test_atomic_write_secret_survives_a_lockdown_refusal(tmp_path, monkeypatch):
     target = tmp_path / ".env"
     qr._atomic_write(target, "WEIXIN=abc\n", secret=True)  # must not raise
     assert target.read_text() == "WEIXIN=abc\n"
-    assert [p.name for p in tmp_path.iterdir()] == [".env"]  # no temp residue
+    # No temp residue: the staging directory is the only other entry, and it is empty.
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".env", "auth-store-staging"]
+    assert list((tmp_path / "auth-store-staging").iterdir()) == []
 
 
 def test_env_value_round_trips_and_delete_preserves_other_keys(tmp_path, monkeypatch):
@@ -147,6 +151,52 @@ def test_successful_commit_writes_both_files(tmp_path, monkeypatch):
     qr._commit_credential_and_config(cp, '{"weixin": {}}', "brand-new")
     assert qr._read_env_value("WEIXIN_TOKEN") == "brand-new"
     assert json.loads(cp.read_text()) == {"weixin": {}}
+
+
+def test_successful_commit_replaces_the_credential_boot_propagated(tmp_path, monkeypatch):
+    """Boot copies ``.env`` into ``os.environ`` and ``load_credentials`` lets
+    ``os.environ`` win, so a re-login left there would keep the channel restart
+    and an in-app re-exec on the token the user just replaced."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("WEIXIN_TOKEN=stale\n", encoding="utf-8")
+    monkeypatch.setenv("WEIXIN_TOKEN", "stale")
+    monkeypatch.delenv("_KIROCREW_CREDS_SCRUBBED", raising=False)
+
+    qr._commit_credential_and_config(tmp_path / "config.json", '{"weixin": {}}', "brand-new")
+
+    assert os.environ["WEIXIN_TOKEN"] == "brand-new"
+    assert KiroCrewConfig().load_credentials(propagate=False)["WEIXIN_TOKEN"] == "brand-new"
+
+
+def test_successful_commit_keeps_a_scrubbed_environ_free_of_the_credential(tmp_path, monkeypatch):
+    """The Docker entrypoint scrubs credentials out of ``os.environ`` so they stay
+    off ``/proc/<pid>/environ``; the sign-in must not put one back."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+    monkeypatch.delenv("WEIXIN_TOKEN", raising=False)
+    monkeypatch.setenv("_KIROCREW_CREDS_SCRUBBED", "1")
+
+    qr._commit_credential_and_config(tmp_path / "config.json", '{"weixin": {}}', "brand-new")
+
+    assert "WEIXIN_TOKEN" not in os.environ
+    assert KiroCrewConfig().load_credentials(propagate=False)["WEIXIN_TOKEN"] == "brand-new"
+
+
+def test_failed_config_commit_leaves_the_process_credential_alone(tmp_path, monkeypatch):
+    ep = tmp_path / ".env"
+    ep.write_text("WEIXIN_TOKEN=previous\n", encoding="utf-8")
+    monkeypatch.setattr(qr, "env_path", lambda: ep)
+    monkeypatch.setenv("WEIXIN_TOKEN", "previous")
+    monkeypatch.delenv("_KIROCREW_CREDS_SCRUBBED", raising=False)
+    _fail_config_writes(monkeypatch, ep)
+
+    with pytest.raises(OSError):
+        qr._commit_credential_and_config(tmp_path / "config.json", "{}", "brand-new")
+
+    assert os.environ["WEIXIN_TOKEN"] == "previous"
 
 
 def test_atomic_write_plain_config_preserves_existing_mode(tmp_path):

@@ -134,6 +134,10 @@ vi.mock('../apps/mochi/src/mochiApi', () => ({
 
 const { ChatPanel, PinnedSidePanel, parseApproval, externalApprovalApproved } =
   await import('../apps/mochi/src/renderer/ChatPanel')
+// The real refusal class — the panel reads `instanceof SendRefusedError`, so the
+// test throws the genuine type rather than a stand-in. panelBridge is not mocked
+// here (only mochiApi is), so this is the same class the panel imports.
+const { SendRefusedError } = await import('../apps/mochi/panel/panelBridge')
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -256,6 +260,66 @@ describe('PinnedSidePanel', () => {
     expect(screen.queryByText('c.md')).not.toBeInTheDocument()
   })
 
+  // The pin store keeps whatever `add_pin` was handed, and it only accepts an
+  // ABSOLUTE path (`pinned_files_service.py:318`, `os.path.isabs`). On Windows
+  // that is a native `C:\…` string, which contains no forward slash at all —
+  // so a `split('/')` parent rule returns one element, `parts.pop()` empties
+  // it, and every pin lands in the same `''` bucket. The fixtures below are
+  // `String.raw` on purpose: written as an ordinary quoted string,
+  // `'C:\Users'` is just `C:Users`, and the fixture would stop being a Windows
+  // path at all.
+  it('groups pins by their real parent folder when the store holds native Windows paths', () => {
+    const a = String.raw`C:\Users\dev\project\src\a.ts`
+    const b = String.raw`C:\Users\dev\project\src\b.py`
+    const c = String.raw`C:\Users\dev\project\docs\c.md`
+    // Guard the guard: these fixtures must really contain no forward slash,
+    // or the test would pass against a `/`-only rule for the wrong reason.
+    expect([a, b, c].some(p => p.includes('/'))).toBe(false)
+
+    // No labels, so the chip caption falls through to the panel's own
+    // basename rule and this covers BOTH native-path sites at once.
+    render(
+      <PinnedSidePanel
+        pins={[pin(a), pin(b), pin(c)]}
+        updatedPaths={new Set()} deletedPaths={new Set()} visible />,
+    )
+
+    // Two distinct folders, named — not one collapsed bucket.
+    expect(screen.getByText('src')).toBeInTheDocument()
+    expect(screen.getByText('docs')).toBeInTheDocument()
+    expect(screen.queryByText('/')).not.toBeInTheDocument()
+    // …and each chip is captioned with the file name, not the whole path.
+    expect(screen.getByText('a.ts')).toBeInTheDocument()
+    expect(screen.getByText('b.py')).toBeInTheDocument()
+    expect(screen.getByText('c.md')).toBeInTheDocument()
+    expect(screen.queryByText(a)).not.toBeInTheDocument()
+    // The group header's tooltip is the full parent, so it must be the real
+    // one rather than the fallback.
+    expect(screen.getByTitle(String.raw`C:\Users\dev\project\src`.replace(/\\/g, '/')))
+      .toBeInTheDocument()
+  })
+
+  it('groups pins by their real parent folder for a UNC store path', () => {
+    const a = String.raw`\\server\share\team\notes\a.md`
+    render(
+      <PinnedSidePanel pins={[pin(a, 'a.md')]} updatedPaths={new Set()}
+        deletedPaths={new Set()} visible />,
+    )
+    expect(screen.getByText('notes')).toBeInTheDocument()
+    expect(screen.queryByText('/')).not.toBeInTheDocument()
+  })
+
+  // Negative control for the blanket-rewrite mistake: on POSIX a backslash is a
+  // legal filename character, so a directory really can be called `we\ird`.
+  // This passes both before and after the fix, which is what makes it a control.
+  it('leaves a POSIX parent that contains a backslash intact', () => {
+    render(
+      <PinnedSidePanel pins={[pin(String.raw`/home/u/we\ird/a.ts`, 'a.ts')]}
+        updatedPaths={new Set()} deletedPaths={new Set()} visible />,
+    )
+    expect(screen.getByText(String.raw`we\ird`)).toBeInTheDocument()
+  })
+
   it('previews a pin and marks it seen on click', async () => {
     const onMarkSeen = vi.fn()
     render(
@@ -283,7 +347,7 @@ describe('PinnedSidePanel', () => {
     expect(previewFile).not.toHaveBeenCalled()
   })
 
-  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin on hover', async () => {
+  it('renders a browser-tab pin with nothing to clear as inert, keeping unpin reachable', async () => {
     electronShell = false
     render(
       <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
@@ -296,20 +360,24 @@ describe('PinnedSidePanel', () => {
     fireEvent.click(label)
     expect(previewFile).not.toHaveBeenCalled()
     expect(markPinnedSeen).not.toHaveBeenCalled()
-    // The unpin affordance is its own HTTP-backed control and stays reachable.
-    await userEvent.hover(label)
-    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    // The unpin affordance is its own HTTP-backed control, always rendered
+    // (a keyboard tab stop) and named "Unpin <file>". fireEvent, not userEvent:
+    // the control is `pointer-events: none` until the CSS hover/focus reveal,
+    // which happy-dom does not paint.
+    fireEvent.click(screen.getByRole('button', { name: 'Unpin a.ts' }))
     expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
-  it('reveals Unpin on hover and unpins on click', async () => {
+  it('renders a self-describing unpin control (always present, revealed by CSS) and unpins on click', async () => {
     render(
       <PinnedSidePanel pins={[pin('/home/u/src/a.ts')]} updatedPaths={new Set()}
         deletedPaths={new Set()} visible />,
     )
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
-    await userEvent.hover(screen.getByText('a.ts'))
-    await userEvent.click(screen.getByRole('button', { name: 'Unpin' }))
+    // Always in the DOM as a real tab stop, named with the file; the CSS
+    // :hover/:focus-within rule (not a mount) controls its visibility.
+    const unpin = screen.getByRole('button', { name: 'Unpin a.ts' })
+    expect(unpin).toBeInTheDocument()
+    fireEvent.click(unpin)
     expect(unpinFile).toHaveBeenCalledWith('/home/u/src/a.ts')
   })
 
@@ -318,8 +386,7 @@ describe('PinnedSidePanel', () => {
       <PinnedSidePanel pins={[pin('/home/u/src/gone.ts')]} updatedPaths={new Set()}
         deletedPaths={new Set(['/home/u/src/gone.ts'])} visible />,
     )
-    await userEvent.hover(screen.getByText('gone.ts'))
-    expect(screen.queryByRole('button', { name: 'Unpin' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Unpin gone.ts' })).not.toBeInTheDocument()
   })
 })
 
@@ -405,9 +472,11 @@ describe('ChatPanel composer', () => {
     expect(sendMessage).not.toHaveBeenCalled()
   })
 
-  it('restores the text and explains the failure when the send is refused', async () => {
+  it('shows the connection copy only when the fetch itself was rejected', async () => {
     await renderPanel()
-    sendMessage.mockRejectedValueOnce(new Error('offline'))
+    // A rejected fetch surfaces as a TypeError with no gateway reason — that is
+    // a connection problem, so the connection copy is the honest message.
+    sendMessage.mockRejectedValueOnce(new TypeError('Failed to fetch'))
     await userEvent.type(composer(), 'keep me')
     await userEvent.click(screen.getByRole('button', { name: 'Send' }))
     expect(
@@ -417,9 +486,63 @@ describe('ChatPanel composer', () => {
     expect(composer()).toHaveValue('keep me')
   })
 
+  it('shows the gateway reason when the send is refused, not the connection copy', async () => {
+    await renderPanel()
+    // A busy-slot / agent-mismatch 409 is a REFUSAL: the gateway named why in
+    // the body, so the panel frames that reason instead of blaming the network.
+    sendMessage.mockRejectedValueOnce(new SendRefusedError(409, 'slot agent mismatch'))
+    await userEvent.type(composer(), 'keep me')
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText('Send failed: slot agent mismatch')).toBeInTheDocument()
+    expect(
+      screen.queryByText("Couldn't send — check your connection and try again."),
+    ).not.toBeInTheDocument()
+    expect(composer()).toHaveValue('keep me')
+  })
+
+  it('shows the unframed refusal when a refused send names no reason', async () => {
+    await renderPanel()
+    sendMessage.mockRejectedValueOnce(new SendRefusedError(503))
+    await userEvent.type(composer(), 'keep me')
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(await screen.findByText('Send failed')).toBeInTheDocument()
+    expect(composer()).toHaveValue('keep me')
+  })
+
+  it('surfaces the slot-binding refusal reason verbatim', async () => {
+    await renderPanel()
+    // ensureSlot throws a plain Error (the class the i18n gate exempts) tagged
+    // with the shared slot-refusal symbol; its message IS the binding reason, so
+    // the panel frames it rather than reading it as a connection failure.
+    const binding = new Error(
+      'mochi slot "mochi" is bound to another agent (other); refusing to send',
+    )
+    ;(binding as unknown as Record<symbol, true>)[Symbol.for('mochi.slotRefusal')] = true
+    sendMessage.mockRejectedValueOnce(binding)
+    await userEvent.type(composer(), 'keep me')
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(
+      await screen.findByText(/bound to another agent \(other\); refusing to send/),
+    ).toBeInTheDocument()
+    expect(composer()).toHaveValue('keep me')
+  })
+
+  it('keeps the connection copy for an unexpected internal error, not its raw message', async () => {
+    await renderPanel()
+    // A non-refusal throw must NOT promote its raw, unlocalized message into UI
+    // text for every language — it reads as a connection problem instead.
+    sendMessage.mockRejectedValueOnce(new Error('TypeError: cannot read x of undefined'))
+    await userEvent.type(composer(), 'keep me')
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(
+      await screen.findByText("Couldn't send — check your connection and try again."),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/cannot read x of undefined/)).not.toBeInTheDocument()
+  })
+
   it('dismisses the failure banner', async () => {
     await renderPanel()
-    sendMessage.mockRejectedValueOnce(new Error('offline'))
+    sendMessage.mockRejectedValueOnce(new TypeError('Failed to fetch'))
     await userEvent.type(composer(), 'x')
     await userEvent.click(screen.getByRole('button', { name: 'Send' }))
     await screen.findByText("Couldn't send — check your connection and try again.")
@@ -665,6 +788,71 @@ describe('ChatPanel edit and resend', () => {
     await waitFor(() => expect(sendMessage).toHaveBeenCalledWith('original', undefined))
   })
 
+  it('restores the draft (not the sliced history) when both the edit route and the fallback refuse', async () => {
+    // GPT F3: a definite refusal must hand back only the composer DRAFT — the
+    // gateway never saw it — and must NOT re-add the sliced rows: a fallback
+    // send that was actually delivered (an unknown/transport outcome) would then
+    // duplicate a turn the gateway already ran. The authoritative transcript is
+    // rebuilt from the gateway on the next mount either way.
+    history = [
+      { role: 'user', content: 'keep me', timestamp: 1699999999000 },
+      { role: 'assistant', content: 'earlier reply', timestamp: 1699999999500 },
+      { role: 'user', content: 'original', timestamp: 1700000000000 },
+    ]
+    await renderPanel()
+    await screen.findByText('original')
+    editResend.mockResolvedValueOnce({ ok: false })
+    sendMessage.mockRejectedValueOnce(new SendRefusedError(409, 'the slot is busy with another turn'))
+    // Two user messages -> two edit buttons; the last one edits "original".
+    const editButtons = screen.getAllByRole('button', { name: 'Edit & resend' })
+    await userEvent.click(editButtons[editButtons.length - 1])
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    // The refusal reason surfaces...
+    expect(await screen.findByText(/the slot is busy with another turn/)).toBeInTheDocument()
+    // ...and the edited draft is handed back to the composer.
+    expect(composer()).toHaveValue('original')
+  })
+
+  it('does NOT restore the draft when the fallback send fails on an INDETERMINATE transport error', async () => {
+    // GPT F1: a fetch that rejects AFTER the request landed is a network
+    // partition, not a verdict — the turn may have run. `sendMessage` keeps the
+    // optimistic echo (the text stays visible in the transcript), so re-filling
+    // the composer would invite a re-send that executes an already-run,
+    // side-effecting turn a SECOND time. A transport error carries no
+    // `slotRefusalReason`, so the composer must stay CLEARED (unlike a definite
+    // refusal, which restores it — the prior test).
+    history = [{ role: 'user', content: 'original', timestamp: 1700000000000 }]
+    await renderPanel()
+    await screen.findByText('original')
+    editResend.mockResolvedValueOnce({ ok: false })
+    sendMessage.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    const editButtons = screen.getAllByRole('button', { name: 'Edit & resend' })
+    await userEvent.click(editButtons[editButtons.length - 1])
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    // The connection failure surfaces, but the composer is NOT re-filled.
+    await waitFor(() => expect(sendMessage).toHaveBeenCalled())
+    expect(composer()).toHaveValue('')
+  })
+
+  it('restores the draft on a REASON-LESS definite refusal (5xx/proxy HTML, no JSON body)', async () => {
+    // GPT/Opus F2: a non-2xx whose body is not JSON (aiohttp 500, proxy 502/503)
+    // yields `SendRefusedError(status, undefined)`. It is still a DEFINITE
+    // refusal — nothing was sent — so the draft MUST be restored. The earlier
+    // `slotRefusalReason(err) !== undefined` guard wrongly dropped it because the
+    // reason is undefined; `isDefiniteRefusal` is true regardless of the reason.
+    history = [{ role: 'user', content: 'original', timestamp: 1700000000000 }]
+    await renderPanel()
+    await screen.findByText('original')
+    editResend.mockResolvedValueOnce({ ok: false })
+    sendMessage.mockRejectedValueOnce(new SendRefusedError(503, undefined))
+    const editButtons = screen.getAllByRole('button', { name: 'Edit & resend' })
+    await userEvent.click(editButtons[editButtons.length - 1])
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(sendMessage).toHaveBeenCalled())
+    // No human reason to show, but the edited text is handed back.
+    expect(composer()).toHaveValue('original')
+  })
+
   it('cancels edit mode and empties the composer', async () => {
     history = [{ role: 'user', content: 'never mind', timestamp: 1700000000000 }]
     await renderPanel()
@@ -702,6 +890,16 @@ describe('ChatPanel approval card', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Reject' }))
     expect(respondApproval).toHaveBeenCalledWith('req-1', 'reject', undefined, false)
     expect(await screen.findByText('Rejected')).toBeInTheDocument()
+  })
+
+  it("decides with the card's own owner-bound target", async () => {
+    // The card keeps the target of the request it showed, so a later request
+    // under the same id is not the one this press decides.
+    const target = { origin: 'native', requestMid: 'mid-a' }
+    await renderPanel()
+    emit('onApprovalRequest', approvalFrame({ target }))
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+    expect(respondApproval).toHaveBeenCalledWith('req-1', 'approve', undefined, false, target)
   })
 
   it('keeps the card and reports the error when the POST fails', async () => {

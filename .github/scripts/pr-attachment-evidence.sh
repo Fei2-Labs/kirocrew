@@ -2,9 +2,12 @@
 # Fetch the review evidence a PR description carries as GitHub attachments.
 #
 # Sourced (not executed) by the "Collect blind-read evidence" step of
-# ux-review.yml and the "Fetch attachment evidence from the PR description"
-# step of fork-ux-review.yml, so both lanes run this one copy and the caller
-# keeps $n (images kept) and $clips (recordings listed) afterwards. The fork
+# ux-review.yml and the "Collect review evidence" step of fork-ux-review.yml,
+# so both lanes run this one copy and the caller keeps $n (images kept) and
+# $clips (recordings listed) afterwards -- the fork lane then sources
+# pr-committed-evidence.sh, which continues those counters for the media the
+# PR commits (the only path open to an author whose permission this endpoint
+# refuses). The fork
 # lane checks out the trusted base ref, so it always runs the base tree's copy.
 #
 # Inputs, all environment variables:
@@ -24,27 +27,24 @@
 set -euo pipefail
 mkdir -p "$FETCH_DIR" "$DEST_DIR"
 # The description is read from the API, not the event payload, so a re-run
-# after a late attachment judges the current text. One transient API failure
-# (a 5xx, a rate limit) must not end the lane, so the read gets three
-# attempts, the same shape as the lanes' other gh api reads, and then fails
-# closed: an empty body would read as "no evidence", which is worse than a
-# red step the author can re-run.
-body=""
-read_ok=""
-for attempt in 1 2 3; do
-  if body="$(gh api "repos/$REPO/pulls/$PR" --jq '.body // ""')"; then
-    read_ok=1
-    break
-  fi
-  echo "Reading the PR description failed on attempt $attempt."
-  if [ "$attempt" -lt 3 ]; then
-    sleep "$attempt"
-  fi
-done
-if [ -z "$read_ok" ]; then
+# after a late attachment judges the current text.
+#
+# THE READ IS THE JOB'S ONE READ, not this script's own. This script and
+# pr-description-capture.sh are the two readers of that mutable text, and they
+# run in adjacent steps of the same job; when each fetched it separately, a
+# description edited in between paired the OLD attachments collected here with
+# the NEW prose captured there, under a digest naming a revision that never
+# existed. pr-body-snapshot.sh holds one fetch of both fields for the whole
+# job, so whichever consumer runs first pays the read and the other reads those
+# same bytes. It retries a transient failure three times and then fails closed:
+# an empty body would read as "no evidence", which is worse than a red step the
+# author can re-run.
+. "${KC_SCRIPT_DIR:-$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)}/pr-body-snapshot.sh"
+if [ -z "${KC_PR_SNAPSHOT_OK:-}" ]; then
   echo "::error::Could not read this PR's description after 3 attempts, so the attachment evidence cannot be collected; re-run the workflow."
   exit 1
 fi
+body="$(cat "$KC_PR_BODY_FILE")"
 allow="https://github\.com/user-attachments/assets/[0-9A-Za-z-]+"
 urls="$(grep -oE "$allow" <<< "$body" | awk '!seen[$0]++' || true)"
 n=0

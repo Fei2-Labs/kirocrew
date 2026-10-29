@@ -39,6 +39,7 @@ from kiro_crew.agent_sdk.capabilities import (
     SessionCapabilities,
     capabilities_for,
     capabilities_of,
+    capture_prompt_timeout,
 )
 from kiro_crew.agent_sdk.provider_identity import PROVIDER_ACP, PROVIDER_CLAUDE_CODE
 
@@ -52,6 +53,16 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
 #: attribute), and a bare comparison against ``ACP_BACKEND_CLAUDE``.
 MIGRATED_CONSUMERS = (
     "config/loader.py",
+    # config/loader.py's code, in the owner modules its facade serves.
+    "config/loader_agents.py",
+    "config/loader_builders.py",
+    "config/loader_config.py",
+    "config/loader_credentials.py",
+    "config/loader_document.py",
+    "config/loader_locations.py",
+    "config/loader_pipeline.py",
+    "config/loader_snapshots.py",
+    "config/loader_writeback.py",
     "dashboard/chat_handlers.py",
     "dashboard/handlers/agents.py",
     "dashboard/chat_runner.py",
@@ -65,12 +76,42 @@ CAPABILITY_FIELDS = (
     "model_id_namespace",
     "resolves_model_from_advertised_list",
     "effort_via_config_option",
+    "effort_via_slash_command",
     "compacts_inline",
+    "crew_fires_spec_hooks",
+    "supports_native_todos",
+    "honors_zero_tool_ban",
+    "acp_client_spawnable",
 )
 
 
 def _tree(rel: str) -> ast.Module:
     return ast.parse((SRC / rel).read_text(encoding="utf-8"))
+
+
+#: A migrated consumer whose functions live in owner modules it composes: the
+#: dashboard agents handlers run the functions ``dashboard/agent_admin`` defines on
+#: ``handlers/agents.py``'s globals, the chat handlers those ``dashboard/chat_api``
+#: defines on ``chat_handlers.py``'s, and the chat runner those ``dashboard/chat_turn``
+#: defines on its own, and ``subagent.py`` runs those of ``subagent_parts`` on its own,
+#: so the identity ratchet reads those owners as
+#: part of that file.
+_COMPOSED_OWNERS = {
+    "dashboard/handlers/agents.py": "dashboard/agent_admin",
+    "dashboard/chat_handlers.py": "dashboard/chat_api",
+    "dashboard/chat_runner.py": "dashboard/chat_turn",
+    "subagent.py": "subagent_parts",
+}
+
+
+def _composed_owner_rels(rel: str) -> list[str]:
+    """The owner modules *rel* composes, relative to ``SRC``; ``[]`` if none."""
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return []
+    owners = sorted((SRC / owner_dir).glob("[!_]*.py"))
+    assert len(owners) >= 13, f"{owner_dir}: the composed owners were not found"
+    return [owner.relative_to(SRC).as_posix() for owner in owners]
 
 
 # ── 1. the identity checks are gone, and stay gone ──────────────────────────
@@ -139,6 +180,16 @@ def test_no_migrated_consumer_reads_a_backend_identity(rel: str) -> None:
             # ``getattr(client, "is_claude_backend", False)`` -- a string literal
             # naming the attribute is the same read with the check hidden.
             record(node, f"{node.value!r} as a literal")
+    # A composed owner's functions are this consumer's code, and no allowance
+    # reaches into them: every identity read there is an offender.
+    for owner_rel in _composed_owner_rels(rel):
+        for node in ast.walk(_tree(owner_rel)):
+            if isinstance(node, ast.Attribute) and node.attr in banned_attrs:
+                offenders.append(f"{owner_rel} line {node.lineno}: .{node.attr}")
+            elif isinstance(node, ast.Name) and node.id in banned_attrs | {"ACP_BACKEND_CLAUDE"}:
+                offenders.append(f"{owner_rel} line {node.lineno}: {node.id}")
+            elif isinstance(node, ast.Constant) and node.value in banned_attrs:
+                offenders.append(f"{owner_rel} line {node.lineno}: {node.value!r} as a literal")
     assert not offenders, (
         f"{rel} asks which backend it is: {offenders}. Ask a capability instead "
         f"(SessionCapabilities has one field per question these branches make); "
@@ -216,7 +267,7 @@ def test_each_capability_question_has_one_consumer_spelling() -> None:
 def test_every_capability_field_has_a_consumer() -> None:
     """A field nobody reads is a question nobody asks -- delete it or wire it up.
 
-    The record exists to move six branches off an identity check, so a field with
+    The record exists to move seven branches off an identity check, so a field with
     no consumer means one of those branches was missed or the field was invented.
     """
     fields = set(CAPABILITY_FIELDS)
@@ -330,11 +381,11 @@ def test_known_membership_is_unchanged_by_the_move() -> None:
 #: rather than derived from the sets, so a change to a set fails HERE with the
 #: backend named instead of passing tautologically.
 EXPECTED_CAPABILITIES = {
-    "": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
-    "kas": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
-    "claude": (PROVIDER_CLAUDE_CODE, "claude_code", True, True, True),
-    "codex": (PROVIDER_ACP, "codex", True, True, True),
-    "nope": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False),
+    "": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False, False),
+    "kas": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, True, False, False),
+    "claude": (PROVIDER_CLAUDE_CODE, "claude_code", True, True, True, True),
+    "codex": (PROVIDER_ACP, "codex", True, True, True, False),
+    "nope": (PROVIDER_ACP, MODEL_NAMESPACE_ACP, False, False, False, False),
 }
 
 
@@ -349,6 +400,7 @@ def test_capabilities_are_pinned_per_backend(backend: str) -> None:
         caps.resolves_model_from_advertised_list,
         caps.effort_via_config_option,
         caps.compacts_inline,
+        caps.supports_native_todos,
     )
     assert actual == EXPECTED_CAPABILITIES[backend]
 
@@ -460,6 +512,22 @@ def test_capabilities_of_reads_a_real_record() -> None:
     assert capabilities_of(_FakeProvider(claude)) is claude
 
 
+class _PromptTimeoutProvider:
+    def prompt_timeout_for_deadline(self, deadline: float) -> float:
+        return deadline + 60.0
+
+
+def test_capture_prompt_timeout_reads_a_type_declared_capability() -> None:
+    assert capture_prompt_timeout(_PromptTimeoutProvider(), 21600.0) == 21660.0
+
+
+def test_capture_prompt_timeout_preserves_legacy_duck_providers() -> None:
+    provider = _FakeProvider(None)
+    provider.prompt_timeout_for_deadline = lambda deadline: deadline + 60.0
+
+    assert capture_prompt_timeout(provider, 21600.0) is None
+
+
 @pytest.mark.parametrize(
     "provider",
     [
@@ -472,7 +540,7 @@ def test_capabilities_of_reads_a_real_record() -> None:
     ids=["plain-object", "none", "string", "wrong-type", "explicit-none"],
 )
 def test_capabilities_of_fails_closed_on_a_foreign_shape(provider: object) -> None:
-    """The convention the six predicates had: not a provider means False everywhere.
+    """The convention the seven predicates had: not a provider means False everywhere.
 
     They were ``isinstance(provider, AcpProvider) and provider.is_claude_backend``,
     so a wrapper, an unstarted provider or a test double answered False. Requiring
@@ -644,15 +712,81 @@ class TestAForeignProviderIsClassifiedThePreviousWay:
         assert SubagentManager._is_cc_provider(self._foreign_provider()) is False
 
 
-def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
-    """Pins why swapping ``_is_claude`` for the effort capability changed nothing.
+def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
+    """``ACP_BACKENDS_HONOR_ZERO_TOOL_BAN`` membership is a JOIN of three facts,
+    not a hand-maintained list, so this recomputes the rule from its own inputs
+    and fails the moment a hand edit and the inputs disagree.
 
-    ``AcpWorker`` constructs its ``AcpClient`` without ``acp_backend``, so the
-    backend is the kiro default and both the old identity read and the new
-    capability answer False. If a future pool starts selecting a backend this
-    fails, which is the moment to check the effort channel deliberately rather
-    than inherit whichever arm the old branch left behind.
+    A backend honours the ban iff its routing is ``Routing.AGENT_SPEC`` (the
+    harness enforces natively -- kiro, kas), OR its routing is in
+    ``tool_gate.ENFORCED_ROUTINGS`` AND something computes ``zero_tools`` for it --
+    a mirror (``providers/mirrors/registry.py``'s ``MIRRORS``), or Crew reading
+    the spec itself beside a ``ProjectionKind.BROKER_ONLY`` array, which
+    ``AcpClient._mirrorless_member_mounts`` does: pi) -- AND it is
+    NOT in ``ACP_BACKENDS_ACP_RUNTIME`` (the refusal lives only on ``AcpClient``,
+    never on the shared ``AcpRuntime`` codex and kas are served by).
+
+    Would fail if claude were re-added: its routing is ``SEEDED_SETTINGS``, which
+    ``ENFORCED_ROUTINGS`` does not carry. Would fail if codex were re-added: its
+    routing IS enforced and it has a mirror, but it is a member of
+    ``ACP_BACKENDS_ACP_RUNTIME``.
     """
+    from kiro_crew.agent_sdk.tool_gate import ENFORCED_ROUTINGS
+    from kiro_crew.providers.mirrors.registry import MIRRORS, ProjectionKind, projection_for
+
+    for backend in sorted(sdk_backends.ACP_BACKENDS_KNOWN):
+        routing = routing_for(backend)
+        expected = routing is sdk_backends.Routing.AGENT_SPEC or (
+            routing in ENFORCED_ROUTINGS
+            and (backend in MIRRORS or projection_for(backend).kind is ProjectionKind.BROKER_ONLY)
+            and backend not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
+        )
+        actual = backend in sdk_backends.ACP_BACKENDS_HONOR_ZERO_TOOL_BAN
+        assert actual == expected, (
+            f"{backend!r}: honors_zero_tool_ban membership is {actual}, the rule "
+            f"says {expected} (routing={routing}, enforced={routing in ENFORCED_ROUTINGS}, "
+            f"mirrored={backend in MIRRORS}, "
+            f"projection={projection_for(backend).kind.value}, "
+            f"acp_runtime={backend in sdk_backends.ACP_BACKENDS_ACP_RUNTIME})"
+        )
+    assert sdk_backends.ACP_BACKENDS_HONOR_ZERO_TOOL_BAN == {
+        sdk_backends.ACP_BACKEND_KIRO,
+        sdk_backends.ACP_BACKEND_KAS,
+        sdk_backends.ACP_BACKEND_OPENCODE,
+        sdk_backends.ACP_BACKEND_GOOSE,
+        sdk_backends.ACP_BACKEND_DEEPSEEK,
+        sdk_backends.ACP_BACKEND_PI,
+    }
+
+
+def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
+    """Pins why swapping ``_is_claude`` for the effort capability changed nothing --
+    and that the capability answer for EACH zero-tool-safe backend is
+    deliberately checked rather than assumed.
+
+    ``AcpWorker`` constructs its ``AcpClient`` with ``acp_backend=``, and
+    ``llm_pool._get_acp_backend`` restricts the value to whatever answers both
+    ``honors_zero_tool_ban`` and ``acp_client_spawnable`` True -- today
+    kiro/opencode/goose/deepseek/pi. claude is NOT a member: its routing
+    (``Routing.SEEDED_SETTINGS``) is declared but not enforced by this core, so
+    an inherited ``~/.claude`` pre-approval can skip the permission request the
+    refusal needs to run. Asking the EFFORT capabilities rather than the identity
+    in ``_apply_effort`` means each member's answers (the config option for
+    opencode and goose, the ``/effort`` slash command for kiro alone) are handled correctly
+    with no branch in the pool itself; this pin exists so a backend that newly
+    qualifies for the pool with different effort answers is caught here, not
+    assumed to inherit an existing member's.
+    """
+    from kiro_crew.agent_sdk.backends import (
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_PI,
+        ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
+        ACP_BACKENDS_HONOR_ZERO_TOOL_BAN,
+    )
+
     tree = _tree("knowledge/llm_pool.py")
     constructions = [
         node
@@ -662,8 +796,45 @@ def test_the_knowledge_pool_client_takes_the_default_backend() -> None:
     assert constructions, "llm_pool no longer constructs an AcpClient; re-check this pin"
     for call in constructions:
         passed = {kw.arg for kw in call.keywords}
-        assert "acp_backend" not in passed, (
-            f"llm_pool.py:{call.lineno} now selects a backend; decide the effort "
-            f"channel for it instead of relying on the kiro default"
-        )
-    assert capabilities_for("").effort_via_config_option is False
+        assert (
+            "acp_backend" in passed
+        ), f"llm_pool.py:{call.lineno} no longer selects a backend; re-check this pin"
+    pool_safe_backends = ACP_BACKENDS_HONOR_ZERO_TOOL_BAN & ACP_BACKENDS_ACP_CLIENT_SPAWNABLE
+    assert pool_safe_backends == {
+        ACP_BACKEND_KIRO,
+        ACP_BACKEND_OPENCODE,
+        ACP_BACKEND_GOOSE,
+        ACP_BACKEND_DEEPSEEK,
+        ACP_BACKEND_PI,
+    }, (
+        "the set of backends this pool trusts changed -- decide the effort "
+        "channel for whichever member is new or missing deliberately, then "
+        "update this pin"
+    )
+    assert capabilities_for(ACP_BACKEND_KIRO).effort_via_config_option is False
+    assert capabilities_for(ACP_BACKEND_OPENCODE).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_GOOSE).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_KIRO).effort_via_slash_command is True
+    assert capabilities_for(ACP_BACKEND_OPENCODE).effort_via_slash_command is False
+    assert capabilities_for(ACP_BACKEND_GOOSE).effort_via_slash_command is False
+    assert capabilities_for(ACP_BACKEND_DEEPSEEK).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_DEEPSEEK).effort_via_slash_command is False
+    # pi carries effort as its ``thought_level`` config option.
+    assert capabilities_for(ACP_BACKEND_PI).effort_via_config_option is True
+    assert capabilities_for(ACP_BACKEND_PI).effort_via_slash_command is False
+
+
+def test_effort_via_slash_command_membership_is_the_command_verb_set() -> None:
+    """``effort_via_slash_command`` translates ``ACP_BACKENDS_KIRO_SLASH_COMMANDS``
+    for every known backend, and no backend carries effort down both channels: a
+    change sent down the one the harness does not implement is refused. KAS is
+    kiro-family but outside that set, because it answers
+    ``_kiro.dev/commands/execute`` with -32603 (``kas/commands-refused-live.jsonl``)."""
+    for backend in sorted(sdk_backends.ACP_BACKENDS_KNOWN):
+        caps = capabilities_for(backend)
+        assert caps.effort_via_slash_command == (
+            backend in sdk_backends.ACP_BACKENDS_KIRO_SLASH_COMMANDS
+        ), backend
+        assert not (caps.effort_via_slash_command and caps.effort_via_config_option), backend
+    assert capabilities_for(sdk_backends.ACP_BACKEND_KAS).effort_via_slash_command is False
+    assert capabilities_for("some-harness-nobody-registered").effort_via_slash_command is False

@@ -18,155 +18,40 @@ their refusal and degraded paths were untested:
 
 Every subprocess, config write and socket here is stubbed: the tests touch no
 network, spawn no process and write only under ``tmp_path``.
+
+This file pins the check (``GET /api/update/check``, the ``_check_git_checkout`` failure
+paths, the ``_do_update_check`` dispatch and the update-info accessors), the auto-update
+switch (``POST /api/update/auto``) and the changelog cache. The apply, with its worker, the
+pip-install report and the simulate and cancel endpoints, is pinned in
+``test_dashboard_updates_coverage_apply.py``; the streams, with the log level endpoint and
+the log handlers, are pinned in ``test_dashboard_updates_coverage_streams.py``. The
+module-state fixture and the request stub every file uses, and the subprocess and checkout
+stubs the check and the apply share, live in ``dashboard_updates_coverage_helpers.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import collections
+import contextlib
 import json
-import logging
 import os
 import sys
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiohttp import web
-from aiohttp.client_exceptions import ClientConnectionResetError
+from dashboard_updates_coverage_helpers import (  # noqa: F401 -- the autouse fixture registers by import
+    _FakeProc,
+    _git_proj,
+    _isolated_module_state,
+    _request,
+    _sequence_procs,
+)
 
+from kiro_crew import platform_compat
 from kiro_crew.config.loader import ConfigReadError
 from kiro_crew.dashboard.handlers import updates
-from kiro_crew.platform import update_layout
-
-
-@pytest.fixture(autouse=True)
-def _isolated_module_state(monkeypatch, tmp_path):
-    """Snapshot every module global these tests mutate, then put it all back.
-
-    ``_update_info``, the ring buffer and the changelog cache are process-wide,
-    so a test that left one dirty would change what a LATER test measures --
-    exactly the class of cross-test coupling this module's cache contract exists
-    to prevent.
-    """
-    monkeypatch.delenv("KIROCREW_PROJECT_DIR", raising=False)
-    monkeypatch.delenv("KIROCREW_CDN_BASE", raising=False)
-    monkeypatch.setattr(update_layout, "data_home", lambda: tmp_path)
-    saved_info = dict(updates._update_info)
-    saved_ring = list(updates._log_ring)
-    saved_cache = updates._changelog_cache
-    saved_clock = updates._last_update_check
-    saved_generation = updates._check_generation
-    updates._changelog_cache = None
-    yield
-    updates._update_info.clear()
-    updates._update_info.update(saved_info)
-    updates._log_ring.clear()
-    updates._log_ring.extend(saved_ring)
-    updates._changelog_cache = saved_cache
-    updates._last_update_check = saved_clock
-    updates._check_generation = saved_generation
-    updates._check_task = None
-    updates._check_task_generation = None
-
-
-def _request(body: object = None, *, query: dict[str, str] | None = None) -> MagicMock:
-    """A request stub: only ``.json()``, ``.query`` and ``app["state"]`` are read."""
-    req = MagicMock()
-
-    async def _json() -> object:
-        if isinstance(body, Exception):
-            raise body
-        return body
-
-    req.json = _json
-    req.query = dict(query or {})
-    state = MagicMock()
-    state._background_tasks = set()
-    req.app = {"state": state}
-    return req
-
-
-class _FakeProc:
-    """A stand-in for an ``asyncio`` subprocess that never spawns anything.
-
-    ``time_out=True`` raises on the FIRST ``communicate()`` only: the handler's
-    timeout branch kills the process and awaits ``communicate()`` a second time
-    to reap it, so a fake that raised every time would mask that reap.
-    """
-
-    def __init__(
-        self,
-        *,
-        out: bytes = b"",
-        err: bytes = b"",
-        returncode: int = 0,
-        time_out: bool = False,
-        kill_raises: bool = False,
-    ) -> None:
-        self._out = out
-        self._err = err
-        self.returncode = returncode
-        self._time_out = time_out
-        self._kill_raises = kill_raises
-        self.communicate_calls = 0
-        self.killed = False
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        self.communicate_calls += 1
-        if self._time_out and self.communicate_calls == 1:
-            raise asyncio.TimeoutError
-        return self._out, self._err
-
-    def kill(self) -> None:
-        self.killed = True
-        if self._kill_raises:
-            raise ProcessLookupError("already gone")
-
-
-def _sequence_procs(monkeypatch, procs: list[_FakeProc]) -> list[tuple[str, ...]]:
-    """Serve *procs* in order to successive ``create_subprocess_exec`` calls."""
-    argv_seen: list[tuple[str, ...]] = []
-    pending = list(procs)
-
-    async def _fake_exec(*args: str, **_kwargs: object) -> _FakeProc:
-        argv_seen.append(tuple(str(a) for a in args))
-        if not pending:
-            raise AssertionError(f"unexpected extra subprocess: {args}")
-        return pending.pop(0)
-
-    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
-    return argv_seen
-
-
-def _git_proj(monkeypatch, tmp_path) -> str:
-    """A directory the capability derivation accepts as this install's checkout.
-
-    The ``.git`` directory is the minimal one git ITSELF recognises -- ``HEAD``
-    plus empty ``objects/`` and ``refs/`` -- rather than a bare ``.git/HEAD``.
-    The derivation asks git first (``rev-parse --show-toplevel``) and only falls
-    back to on-disk markers when git cannot answer. A ``.git`` git rejects makes
-    it keep walking UP, so the verdict then depends on what sits above
-    ``tmp_path``: outside any repository git fails and the fallback accepts the
-    markers, but a temp root under a checkout (a developer's ``TMPDIR=./tmp``)
-    makes git report THAT checkout's top level, which is not this directory, and
-    the fixture reads as "not a checkout". A repository git accepts answers for
-    itself wherever it lives. The git lane also requires provenance (the running
-    package loads from the tree), which a fabricated directory cannot satisfy,
-    so it is declared here rather than derived.
-    """
-    proj = tmp_path / "checkout"
-    proj.mkdir()
-    git_dir = proj / ".git"
-    (git_dir / "objects").mkdir(parents=True)
-    (git_dir / "refs").mkdir()
-    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-    monkeypatch.setattr(
-        "kiro_crew.platform.update_capability.running_from_checkout",
-        lambda root, **kw: True,
-    )
-    return str(proj)
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 def _git_capability():
@@ -224,6 +109,332 @@ class TestUpdateCheckEndpoint:
         assert payload["minimum_version_enforced"] == "0.9.0"
         assert payload["update_required"] is True
         assert "auto_update" in payload
+
+
+# A stand-in ``git`` whose fetch starts a helper that inherits git's stderr and
+# outlives git, the way a real ``git fetch`` starts ``git remote-https``, ssh or
+# a credential helper; then git hangs so the fetch timeout fires. It records its
+# own pid and its helper's, each with the start-time identity it reads at the one
+# moment that pid is provably the process meant: its own, and its helper's while
+# it has not reaped the helper (it never does). Each record is written whole.
+_HELPER_GIT = """#!{python}
+import os, subprocess, sys, time
+sys.dont_write_bytecode = True  # the import below writes nothing into the checkout
+sys.path.insert(0, {src!r})
+from kiro_crew.platform_compat import get_process_start_id
+
+
+def record(path, pid):
+    with open(path + ".tmp", "w") as f:
+        f.write("%d %s" % (pid, get_process_start_id(pid) or ""))
+    os.replace(path + ".tmp", path)
+
+
+record({pidfile!r} + ".git", os.getpid())
+if {with_helper}:
+    helper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(600)"], cwd=os.path.dirname({pidfile!r})
+    )
+    record({pidfile!r}, helper.pid)
+time.sleep(600)
+"""
+
+
+def _recorded(path: Path) -> tuple[int, str | None] | None:
+    """The (pid, start-time identity) the stand-in git recorded in *path*, or None before.
+
+    A record that exists is whole. Its identity is None when the stand-in could not
+    read one.
+    """
+    try:
+        fields = path.read_text(encoding="utf-8").split()
+        return int(fields[0]), (fields[1] if len(fields) > 1 else None)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class _TimedOutGitWaits:
+    """``asyncio`` as the updates module sees it, with every git wait timing out.
+
+    Bound as that module's own ``asyncio``, never over the real module, so the
+    event loop, the test's own bound and ``platform_compat`` keep the real one.
+    ``wait_for`` does what the real one does when its deadline passes -- cancels
+    the awaited ``communicate()`` and raises ``TimeoutError`` -- but on a signal,
+    never a clock: it waits until the stand-in git has recorded *started_record*
+    (its helper's pid when there is a helper, else git's own pid). The stand-in
+    writes that record only after ``create_subprocess_exec`` has launched it and
+    ``communicate()`` is reading, so the timeout fires with git provably started
+    and hung -- and, with a helper, the helper holding git's stderr -- however
+    long the stand-in took to start.
+    """
+
+    def __init__(self, started_record: Path) -> None:
+        self._started_record: Path | None = started_record
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(asyncio, name)
+
+    async def wait_for(self, aw, timeout=None):
+        record, self._started_record = self._started_record, None
+        waited = asyncio.ensure_future(aw)
+        if record is not None:
+            await async_wait_until(
+                lambda: _recorded(record) is not None,
+                off_loop=True,
+                describe=lambda: f"the stand-in git never recorded itself in {record}",
+            )
+        waited.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waited
+        raise asyncio.TimeoutError
+
+
+class TestGitFetchTimeoutReapsTheHelper:
+    """A timed-out fetch returns even when git's transport helper holds stderr."""
+
+    def _stand_in_git(
+        self, monkeypatch, tmp_path, *, with_helper: bool, short_waits: bool = True
+    ) -> Path:
+        pidfile = tmp_path / "helper.pid"
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        git = bindir / "git"
+        git.write_text(
+            _HELPER_GIT.format(
+                python=sys.executable,
+                src=str(Path(platform_compat.__file__).resolve().parents[1]),
+                with_helper=with_helper,
+                pidfile=str(pidfile),
+            ),
+            encoding="utf-8",
+        )
+        git.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+        if short_waits:
+            started = pidfile if with_helper else Path(f"{pidfile}.git")
+            waits = _TimedOutGitWaits(started)
+            monkeypatch.setattr(updates, "asyncio", waits)
+        return pidfile
+
+    @staticmethod
+    def _gone(pid: int, identity: str) -> bool:
+        """Whether the process the stand-in git recorded as (*pid*, *identity*) has exited.
+
+        A zombie awaiting its reaper has exited. Once that process is reaped nothing
+        holds *pid*, and the kernel can give the number to another process, so a pid
+        whose start-time identity now differs, or reads None, is gone too. The state
+        is read first: a zombie at the number means ours is not running, whoever it is.
+        """
+        zombie = platform_compat.pid_is_zombie(pid) is True
+        return zombie or platform_compat.get_process_start_id(pid) != identity
+
+    @staticmethod
+    def _end_pinned(pid: int, identity: str | None) -> None:
+        """SIGKILL a recorded process the test has not seen exit, while its identity holds.
+
+        A pid whose start-time identity now differs, or reads None, is a stranger or
+        nothing, so it is not signalled; nor is a record that carries no identity.
+        """
+        if identity is None or platform_compat.get_process_start_id(pid) != identity:
+            return
+        with contextlib.suppress(OSError):
+            platform_compat.kill_pid_pinned(pid, identity, platform_compat.SIGKILL)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    @pytest.mark.asyncio
+    async def test_a_fetch_timeout_returns_while_a_helper_holds_stderr(self, monkeypatch, tmp_path):
+        pidfile = self._stand_in_git(monkeypatch, tmp_path, with_helper=True)
+        helper_exited = False
+        try:
+            check = asyncio.ensure_future(
+                updates._check_git_checkout(_git_proj(monkeypatch, tmp_path), _git_capability())
+            )
+            try:
+                await await_until(check, what="the fetch timeout handler returning")
+            except AssertionError as stalled:
+                check.cancel()
+                raise AssertionError(
+                    "the fetch timeout handler did not return: it killed git and then "
+                    "waited on a stderr pipe the helper still holds open"
+                ) from stalled
+            assert updates._update_info["error_code"] == updates.ERR_GIT_FETCH_FAILED
+            helper = _recorded(pidfile)
+            assert helper is not None, "the stand-in git never started its helper"
+            helper_pid, helper_identity = helper
+            assert helper_identity is not None, f"no start-time identity for helper {helper_pid}"
+            # Wait on the helper's own exit by its recorded identity, rather than
+            # sleeping a fixed time for the group kill.
+            helper_exited = bool(
+                await async_wait_until(
+                    lambda: self._gone(helper_pid, helper_identity),
+                    off_loop=True,
+                    describe=lambda: f"helper {helper_pid} ({helper_identity}) still running",
+                )
+            )
+        finally:
+            # Never signal a helper seen exit: nothing holds its pid once it is
+            # reaped. Otherwise only while that pid still has the helper's identity.
+            recorded = _recorded(pidfile)
+            if recorded is not None and not helper_exited:
+                self._end_pinned(*recorded)
+        assert helper_exited, "the timeout left git's helper running"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    @pytest.mark.asyncio
+    async def test_a_fetch_timeout_without_a_helper_is_still_a_failed_check(
+        self, monkeypatch, tmp_path
+    ):
+        pidfile = self._stand_in_git(monkeypatch, tmp_path, with_helper=False)
+        await await_until(
+            asyncio.ensure_future(
+                updates._check_git_checkout(_git_proj(monkeypatch, tmp_path), _git_capability())
+            ),
+            what="the fetch timeout handler returning",
+        )
+        assert updates._update_info["error_code"] == updates.ERR_GIT_FETCH_FAILED
+        assert updates._update_info["check_status"] == updates.CHECK_FAILED
+        assert not pidfile.exists()
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    @pytest.mark.asyncio
+    async def test_a_cancelled_fetch_ends_git_and_its_helper(self, monkeypatch, tmp_path):
+        """A shutdown cancels the check while git fetch runs: git and its helper end too.
+
+        git runs in its own session, where a terminal's Ctrl-C does not reach
+        it, so the cancel arm is what stops it. Without that arm the
+        cancellation leaves git and its helper running.
+        """
+        pidfile = self._stand_in_git(monkeypatch, tmp_path, with_helper=True, short_waits=False)
+        task = asyncio.ensure_future(
+            updates._check_git_checkout(_git_proj(monkeypatch, tmp_path), _git_capability())
+        )
+        helper = git = None
+        git_exited = helper_exited = False
+        try:
+            await async_wait_until(
+                lambda: task.done() or _recorded(pidfile) is not None,
+                off_loop=True,
+                describe=lambda: f"no helper record in {pidfile}; check done={task.done()}",
+            )
+            helper = _recorded(pidfile)
+            assert helper is not None, "the stand-in git never started its helper"
+            git = _recorded(Path(f"{pidfile}.git"))
+            assert git is not None, "the stand-in git never recorded its own pid"
+            assert git[1] is not None, f"no start-time identity for git {git[0]}"
+            assert helper[1] is not None, f"no start-time identity for helper {helper[0]}"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_until(task, what="the cancelled check settling")
+
+            def _both_gone() -> bool:
+                nonlocal git_exited, helper_exited
+                git_exited, helper_exited = self._gone(*git), self._gone(*helper)
+                return git_exited and helper_exited
+
+            await async_wait_until(
+                _both_gone,
+                off_loop=True,
+                describe=lambda: f"git exited={git_exited}, helper exited={helper_exited}",
+            )
+        finally:
+            if not task.done():
+                task.cancel()
+            # Never signal a process seen exit; otherwise only while its pid still
+            # has the start-time identity the stand-in recorded for it.
+            for recorded, exited in ((git, git_exited), (helper, helper_exited)):
+                if recorded is not None and not exited:
+                    self._end_pinned(*recorded)
+        assert git_exited, "the cancelled check left git running"
+        assert helper_exited, "the cancelled check left git's helper running"
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    @pytest.mark.asyncio
+    async def test_the_timeout_tests_cleanup_signals_no_helper_it_saw_exit(
+        self, monkeypatch, tmp_path
+    ):
+        """Drives the timeout test above with a recorder in place of ``os.kill``.
+
+        That test sees the helper exit before its cleanup runs, and nothing holds the
+        helper's pid once the helper is reaped: a signal sent to the pid then reaches
+        whatever process holds the number. After the fetch timeout returns, the
+        recorder passes a signal to that pid on only while the pid still runs the
+        helper (its recorded start-time identity, not a zombie). It records any other
+        and never sends it.
+        """
+        pidfile = tmp_path / "helper.pid"
+        real_kill = os.kill
+        timed_out = False
+        late: list[tuple[int, int]] = []
+
+        def aimed_at_a_gone_helper(pid: int) -> bool:
+            try:
+                fields = pidfile.read_text(encoding="utf-8").split()
+            except OSError:
+                return False
+            if not fields or fields[0] != str(pid):
+                return False
+            identity = fields[1] if len(fields) > 1 else None
+            if identity is None or platform_compat.pid_is_zombie(pid) is True:
+                return True
+            return platform_compat.get_process_start_id(pid) != identity
+
+        def recorder(pid: int, sig: int) -> None:
+            if timed_out and sig != 0 and aimed_at_a_gone_helper(pid):
+                late.append((pid, sig))
+                return
+            real_kill(pid, sig)
+
+        check = updates._check_git_checkout
+
+        async def check_then_mark(*args: object, **kwargs: object) -> None:
+            nonlocal timed_out
+            try:
+                await check(*args, **kwargs)
+            finally:
+                timed_out = True
+
+        monkeypatch.setattr(os, "kill", recorder)
+        monkeypatch.setattr(updates, "_check_git_checkout", check_then_mark)
+        await self.test_a_fetch_timeout_returns_while_a_helper_holds_stderr(monkeypatch, tmp_path)
+        assert not late, (
+            f"the cleanup sent signal {late[0][1]} to pid {late[0][0]}, the helper's, after "
+            "the helper had exited; nothing held that pid any more"
+        )
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    def test_the_cleanup_signals_a_recorded_pid_only_while_its_identity_holds(
+        self, monkeypatch, tmp_path
+    ):
+        """The failure-path kill: a pid whose start-time identity differs is not signalled.
+
+        A child of this test stands in for the recorded process. This test holds it
+        unreaped, so its pid cannot name another process, and its identity is read here.
+        """
+        import signal
+        import subprocess
+
+        sent: list[tuple[int, str, int]] = []
+        pinned = platform_compat.kill_pid_pinned
+
+        def record(pid: int, identity: str, sig: int) -> bool:
+            sent.append((pid, identity, sig))
+            return pinned(pid, identity, sig)
+
+        monkeypatch.setattr(platform_compat, "kill_pid_pinned", record)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=tmp_path)
+        try:
+            identity = platform_compat.get_process_start_id(proc.pid)
+            assert identity is not None, "precondition: the child's identity is readable"
+            self._end_pinned(proc.pid, f"{identity}0")
+            self._end_pinned(proc.pid, None)
+            assert sent == [], f"a pid whose identity did not match was signalled: {sent}"
+            self._end_pinned(proc.pid, identity)
+            assert sent == [(proc.pid, identity, platform_compat.SIGKILL)]
+            assert proc.wait(timeout=10) == -signal.SIGKILL
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
 
 
 class TestGitCheckoutFailurePaths:
@@ -445,11 +656,21 @@ class TestAutoUpdateToggle:
             wrote.append(mutate({"agent": {"model": "x"}}))
 
         monkeypatch.setattr(updates, "update_config_locked", _apply)
+        # The writer above is a stand-in, so pin what a reload would now see.
+        cfg = MagicMock()
+        cfg.auto_update = False
+        monkeypatch.setattr(updates.KiroCrewConfig, "load", staticmethod(lambda: cfg))
 
         resp = await updates.api_update_auto(_request({"enabled": False}))
 
         assert resp.status == 200
-        assert json.loads(resp.body.decode()) == {"ok": True, "auto_update": False}
+        assert json.loads(resp.body.decode()) == {
+            "ok": True,
+            # The EFFECTIVE value, re-read after the write.
+            "auto_update": False,
+            "requested": False,
+            "overlay_override": False,
+        }
         assert wrote == [{"agent": {"model": "x"}, "auto_update": False}]
 
     @pytest.mark.asyncio
@@ -465,6 +686,114 @@ class TestAutoUpdateToggle:
 
         assert resp.status == 200
         assert wrote == [{"auto_update": True}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("enabled", ["false", "true", 0, 1, None, [], {}])
+    async def test_a_non_boolean_flag_is_refused_without_writing(self, monkeypatch, enabled):
+        """Stored verbatim and read for truthiness: ``"false"`` would read as ON."""
+        wrote: list[dict] = []
+        monkeypatch.setattr(
+            updates, "update_config_locked", lambda _p, *, mutate: wrote.append(mutate({}))
+        )
+
+        resp = await updates.api_update_auto(_request({"enabled": enabled}))
+
+        assert resp.status == 400
+        assert json.loads(resp.body.decode())["code"] == "invalid_enabled"
+        assert wrote == []
+
+    @pytest.mark.asyncio
+    async def test_an_overlay_owned_switch_is_refused_without_writing(self, monkeypatch, tmp_path):
+        """config.local.json deep-merges over the file this endpoint writes.
+
+        A 200 there would show the switch flipped while the next load snaps it
+        back, so the write is refused with the reason, like the other
+        overlay-owned settings.
+        """
+        from kiro_crew.config import loader
+
+        local = tmp_path / "config.local.json"
+        local.write_text(json.dumps({"auto_update": True}), encoding="utf-8")
+        monkeypatch.setattr(loader, "config_local_path", lambda: local)
+        wrote: list[dict] = []
+        monkeypatch.setattr(
+            updates, "update_config_locked", lambda _p, *, mutate: wrote.append(mutate({}))
+        )
+
+        req = _request({"enabled": False})
+        resp = await updates.api_update_auto(req)
+
+        body = json.loads(resp.body.decode())
+        assert resp.status == 409
+        assert body["code"] == "auto_update_overlay_owned"
+        assert body["overlay_override"] is True
+        assert "config.local.json" in body["error"]
+        assert wrote == []
+        req.app["state"].push_refresh.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_response_reports_the_effective_value_after_the_write(self, monkeypatch):
+        """Read back after the merge, never echoed from the request."""
+        monkeypatch.setattr(updates, "update_config_locked", lambda _p, *, mutate: mutate({}))
+        cfg = MagicMock()
+        cfg.auto_update = True  # what a concurrent writer left, say
+        monkeypatch.setattr(updates.KiroCrewConfig, "load", staticmethod(lambda: cfg))
+
+        resp = await updates.api_update_auto(_request({"enabled": False}))
+
+        body = json.loads(resp.body.decode())
+        assert resp.status == 200
+        assert body == {
+            "ok": True,
+            "auto_update": True,
+            "requested": False,
+            "overlay_override": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_successful_write_tells_the_other_tabs(self, monkeypatch):
+        """A second open tab must not keep showing the old switch position."""
+        monkeypatch.setattr(updates, "update_config_locked", lambda _p, *, mutate: mutate({}))
+
+        req = _request({"enabled": False})
+        resp = await updates.api_update_auto(req)
+
+        assert resp.status == 200
+        req.app["state"].push_refresh.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_write_sends_no_refresh(self, monkeypatch):
+        req = _request({"enabled": "false"})
+        resp = await updates.api_update_auto(req)
+
+        assert resp.status == 400
+        req.app["state"].push_refresh.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raw",
+        [b"{not json", '{"timezone": "Europe/Z\u00fcrich"}'.encode("cp1252"), b"[]"],
+        ids=["malformed", "non-utf8", "not-an-object"],
+    )
+    def test_an_unreadable_overlay_reports_not_pinned(self, monkeypatch, tmp_path, raw):
+        """Best-effort, like the loader: a bad overlay must not 500 a committed write."""
+        from kiro_crew.config import loader
+
+        local = tmp_path / "config.local.json"
+        local.write_bytes(raw)
+        monkeypatch.setattr(loader, "config_local_path", lambda: local)
+
+        assert loader.overlay_pins("auto_update") is False
+
+    def test_a_nested_key_is_found_by_path(self, monkeypatch, tmp_path):
+        from kiro_crew.config import loader
+
+        local = tmp_path / "config.local.json"
+        local.write_text(json.dumps({"telemetry": {"enabled": False}}), encoding="utf-8")
+        monkeypatch.setattr(loader, "config_local_path", lambda: local)
+
+        assert loader.overlay_pins("telemetry", "enabled") is True
+        assert loader.overlay_pins("telemetry", "beacon_enabled") is False
+        assert loader.overlay_pins("auto_update") is False
 
 
 class TestChangelogCache:
@@ -549,1105 +878,6 @@ class TestChangelogCache:
         assert resolved is not None
         assert os.path.realpath(str(resolved)) == os.path.realpath(str(bundled))
         monkeypatch.setattr(Path, "is_file", original)
-
-
-class TestPipInstallFailureReport:
-    """``_venv_pip_install`` — a long message is truncated, not dropped."""
-
-    @pytest.mark.asyncio
-    async def test_a_huge_stderr_is_truncated_with_a_marker(self, monkeypatch):
-        from kiro_crew import dep_sync
-
-        state = MagicMock()
-
-        def fake_sync(repo, target_py, emit=None, timeout=None):
-            # dep_sync passes pip's captured output through verbatim; the cap is
-            # this endpoint's job because it is the one publishing it.
-            emit("x" * 4000, True)
-            return 1
-
-        monkeypatch.setattr(dep_sync, "sync_or_reinstall", fake_sync)
-
-        assert await updates._venv_pip_install("/tmp/proj", state) is False
-        # The executor thread hands the message to the loop with
-        # call_soon_threadsafe, so it lands on the NEXT loop iteration -- reading
-        # call_args before yielding once raced it and read the "Installing" step.
-        await asyncio.sleep(0)
-
-        step, detail = state.push_update_progress.call_args[0]
-        assert step == "error"
-        # Truncated rather than dropped: the actionable line is often mid-stderr.
-        assert detail.endswith("…(truncated)")
-        assert len(detail) < 1200
-
-
-#: The commit the pre-apply pin resolves `@{u}` to in the apply tests.
-_UPSTREAM_OID = b"0123456789abcdef0123456789abcdef01234567"
-
-
-class TestApplyRefusals:
-    """``POST /api/update`` — every precondition, and the worker's own failures."""
-
-    @pytest.mark.asyncio
-    async def test_refuses_when_no_project_dir_is_configured(self):
-        resp = await updates.api_update_apply(_request({}))
-        assert resp.status == 400
-        assert "KIROCREW_PROJECT_DIR" in json.loads(resp.body.decode())["error"]
-
-    @pytest.mark.asyncio
-    async def test_refuses_a_tarball_install_with_a_specific_message(self, monkeypatch, tmp_path):
-        """No ``.git`` means ``git pull`` cannot update it — say so, not "pull failed"."""
-        plain = tmp_path / "tarball"
-        plain.mkdir()
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(plain))
-        resp = await updates.api_update_apply(_request({}))
-        assert resp.status == 409
-        error = json.loads(resp.body.decode())["error"]
-        assert "Not a git checkout" in error
-        assert "kirocrew update" in error
-        assert "cloud launch" not in error
-
-    @pytest.mark.asyncio
-    async def test_a_pinned_remote_is_refused_before_any_spinner_is_shown(
-        self, monkeypatch, tmp_path
-    ):
-        """Governance is checked before ``push_refresh``.
-
-        A dashboard token proves the caller is the operator, not that the fleet
-        permits this host to pull from this remote -- and a blocked update must
-        leave no "updating" overlay behind for the user to dismiss.
-        """
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "https://example.invalid/x")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "remote is not permitted")
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-
-        assert resp.status == 403
-        payload = json.loads(resp.body.decode())
-        assert payload["governance"] is True
-        assert payload["error"] == "remote is not permitted"
-        req.app["state"].push_refresh.assert_not_called()
-        assert req.app["state"]._background_tasks == set()
-
-    @pytest.mark.asyncio
-    async def test_a_hung_status_check_answers_500_rather_than_hanging(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        _sequence_procs(monkeypatch, [_FakeProc(time_out=True, kill_raises=True)])
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-
-        assert resp.status == 500
-        assert "Timed out" in json.loads(resp.body.decode())["error"]
-        assert req.app["state"]._background_tasks == set()
-
-    @pytest.mark.asyncio
-    async def test_a_dirty_tree_is_refused_without_starting_the_worker(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        _sequence_procs(monkeypatch, [_FakeProc(out=b" M src/kiro_crew/cli.py\n")])
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-
-        assert resp.status == 409
-        assert "uncommitted changes" in json.loads(resp.body.decode())["error"]
-        assert req.app["state"]._background_tasks == set()
-
-    @pytest.mark.asyncio
-    async def test_a_revision_the_venv_cannot_run_is_refused_before_the_pull(
-        self, monkeypatch, tmp_path
-    ):
-        """The floor is judged on the FETCHED commit, and the tree is left alone.
-
-        pip would refuse the same revision during the reinstall, but only after
-        the pull had moved the checkout to code this interpreter cannot import
-        -- a state the running gateway then serves from memory while every
-        later attempt repeats the pull and the refusal.
-        """
-        from kiro_crew import dep_sync
-
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        _sequence_procs(
-            monkeypatch,
-            [
-                _FakeProc(out=b""),
-                _FakeProc(out=b""),
-                _FakeProc(out=b"0\t1\n"),
-                _FakeProc(out=_UPSTREAM_OID + b"\n"),
-            ],
-        )
-        seen: dict[str, object] = {}
-
-        def _breach(repo, ref, target_py, **_kw):
-            seen.update(repo=repo, ref=ref, target_py=target_py)
-            return (
-                "the incoming revision requires Python >=3.12 but this install's venv runs 3.11.9"
-            )
-
-        monkeypatch.setattr(dep_sync, "incoming_python_floor_breach", _breach)
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-        assert resp.status == 409
-        body = json.loads(resp.body.decode())
-        assert body["code"] == "python_floor"
-        assert ">=3.12" in body["error"] and "3.11.9" in body["error"]
-        # Judged against the PINNED upstream commit (the exact revision the
-        # fast-forward would apply), with the interpreter this gateway runs.
-        assert seen["ref"] == _UPSTREAM_OID.decode()
-        assert seen["target_py"] == Path(sys.executable)
-        # No worker, so no pull: the checkout stays where the venv can import it.
-        assert req.app["state"]._background_tasks == set()
-        assert not any(step == "pulling" for step, _ in self._progress(req.app["state"]))
-
-    @pytest.mark.asyncio
-    async def test_a_floor_git_cannot_read_refuses_rather_than_passing(self, monkeypatch, tmp_path):
-        """ "Could not read the floor" is not "no floor": the pinned revision stays out."""
-        from kiro_crew import dep_sync
-
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        _sequence_procs(
-            monkeypatch,
-            [
-                _FakeProc(out=b""),
-                _FakeProc(out=b""),
-                _FakeProc(out=b"0\t1\n"),
-                _FakeProc(out=_UPSTREAM_OID + b"\n"),
-            ],
-        )
-
-        def _unreadable(repo, ref, target_py, **_kw):
-            raise dep_sync.IncomingFloorUnreadable("git show timed out")
-
-        monkeypatch.setattr(dep_sync, "incoming_python_floor_breach", _unreadable)
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-        assert resp.status == 409
-        assert json.loads(resp.body.decode())["code"] == "git_read_failed"
-        assert req.app["state"]._background_tasks == set()
-
-    @pytest.mark.asyncio
-    async def test_an_unresolvable_upstream_pin_is_refused(self, monkeypatch, tmp_path):
-        """rev-parse @{u} failing means nothing to floor-check and nothing to land on."""
-        from kiro_crew import dep_sync
-
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        _sequence_procs(
-            monkeypatch,
-            [
-                _FakeProc(out=b""),
-                _FakeProc(out=b""),
-                _FakeProc(out=b"0\t1\n"),
-                _FakeProc(out=b"", err=b"fatal: no upstream configured", returncode=128),
-            ],
-        )
-        judged: list[str] = []
-        monkeypatch.setattr(
-            dep_sync, "incoming_python_floor_breach", lambda *a, **k: judged.append(a[1])
-        )
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-        assert resp.status == 409
-        assert json.loads(resp.body.decode())["code"] == "git_read_failed"
-        # Nothing was judged and nothing was scheduled: no pin, no apply.
-        assert judged == []
-        assert req.app["state"]._background_tasks == set()
-
-    @pytest.mark.asyncio
-    async def test_a_hung_upstream_pin_is_a_500_and_reaps_the_process(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        pin = _FakeProc(time_out=True)
-        _sequence_procs(
-            monkeypatch,
-            [_FakeProc(out=b""), _FakeProc(out=b""), _FakeProc(out=b"0\t1\n"), pin],
-        )
-
-        req = _request({})
-        resp = await updates.api_update_apply(req)
-        assert resp.status == 500
-        assert json.loads(resp.body.decode())["code"] == "git_read_failed"
-        assert pin.killed and pin.communicate_calls == 2
-        assert req.app["state"]._background_tasks == set()
-
-    async def _drive_worker(self, monkeypatch, tmp_path, procs: list[_FakeProc]):
-        """Accept the request, then await the background worker it scheduled."""
-        from kiro_crew import dep_sync
-
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        # The fabricated checkout has no commits for the floor gate to read, and
-        # an unreadable floor now refuses; these tests are about the worker
-        # that runs AFTER the gate passes.
-        monkeypatch.setattr(dep_sync, "incoming_python_floor_breach", lambda *a, **k: None)
-        # Clean tree, then the diverged guard's own fetch, a fast-forwardable
-        # rev-list count and the upstream OID pin, so the request reaches the
-        # worker whose procs follow.
-        argv_seen = _sequence_procs(
-            monkeypatch,
-            [
-                _FakeProc(out=b""),
-                _FakeProc(out=b""),
-                _FakeProc(out=b"0\t1\n"),
-                _FakeProc(out=_UPSTREAM_OID + b"\n"),
-            ]
-            + procs,
-        )
-
-        req = _request({})
-        state = req.app["state"]
-        resp = await updates.api_update_apply(req)
-        assert resp.status == 200
-        self._argv_seen = argv_seen
-        # The worker is registered on the state so it cannot be garbage collected
-        # mid-flight; awaiting it here is what makes the test deterministic.
-        assert len(state._background_tasks) == 1
-        await asyncio.gather(*list(state._background_tasks))
-        return state
-
-    def _progress(self, state) -> list[tuple[str, str]]:
-        return [tuple(call.args) for call in state.push_update_progress.call_args_list]
-
-    @pytest.mark.asyncio
-    async def test_a_hung_pull_is_reported_and_stops_the_worker(self, monkeypatch, tmp_path):
-        state = await self._drive_worker(
-            monkeypatch, tmp_path, [_FakeProc(time_out=True, kill_raises=True)]
-        )
-        oid = _UPSTREAM_OID.decode()[:12]
-        assert ("error", f"Fast-forward to {oid} timed out (git merge --ff-only)") in (
-            self._progress(state)
-        )
-        # No build and no restart followed the failure.
-        assert not any(step == "restarting" for step, _ in self._progress(state))
-
-    @pytest.mark.asyncio
-    async def test_a_failed_pull_is_reported_and_stops_the_worker(self, monkeypatch, tmp_path):
-        state = await self._drive_worker(monkeypatch, tmp_path, [_FakeProc(returncode=1)])
-        steps = self._progress(state)
-        assert any(
-            step == "error"
-            and detail.startswith(f"Fast-forward to {_UPSTREAM_OID.decode()[:12]} failed")
-            for step, detail in steps
-        )
-        # The detail is what the failure card's agent hand-off sends along, so it
-        # must name what actually ran (a fast-forward merge), never a pull.
-        assert not any(step == "error" and "git pull" in detail for step, detail in steps)
-
-    @pytest.mark.asyncio
-    async def test_the_worker_fast_forwards_to_the_pinned_oid_without_refetching(
-        self, monkeypatch, tmp_path
-    ):
-        """The commit that was floor-checked is the commit that lands.
-
-        `git pull` would refetch and re-resolve the upstream, so a remote that
-        moved after the check could land a revision nobody judged.
-        """
-        await self._drive_worker(monkeypatch, tmp_path, [_FakeProc(returncode=1)])
-        worker_argv = self._argv_seen[4]
-        assert worker_argv[:4] == ("git", "merge", "--ff-only", _UPSTREAM_OID.decode())
-        assert not any(c[:2] == ("git", "pull") for c in self._argv_seen)
-
-    @pytest.mark.asyncio
-    async def test_an_unexpected_crash_surfaces_as_a_failed_update(self, monkeypatch, tmp_path):
-        """An exception inside the worker must reach the UI, not just the log.
-
-        The overlay has no other way to leave the "updating" state, so a
-        swallowed error strands the user on a spinner forever.
-        """
-        from kiro_crew import dep_sync
-
-        monkeypatch.setenv("KIROCREW_PROJECT_DIR", _git_proj(monkeypatch, tmp_path))
-        monkeypatch.setattr(updates, "resolve_remote_url", lambda _p: "")
-        monkeypatch.setattr(updates, "update_blocked_reason", lambda _u: "")
-        monkeypatch.setattr(dep_sync, "incoming_python_floor_breach", lambda *a, **k: None)
-        calls = {"n": 0}
-
-        async def _exec(*args: str, **_kwargs: object):
-            calls["n"] += 1
-            if calls["n"] == 1:  # git status --porcelain: clean
-                return _FakeProc(out=b"")
-            if calls["n"] == 2:  # the diverged guard's own fetch
-                return _FakeProc(out=b"")
-            if calls["n"] == 3:  # the guard's rev-list: fast-forwardable
-                return _FakeProc(out=b"0\t1\n")
-            if calls["n"] == 4:  # the upstream OID pin
-                return _FakeProc(out=_UPSTREAM_OID + b"\n")
-            # The WORKER's first spawn (git pull) crashes: the point under test
-            # is that an exception inside the worker reaches the UI.
-            raise RuntimeError("fork failed")
-
-        monkeypatch.setattr("asyncio.create_subprocess_exec", _exec)
-
-        req = _request({})
-        state = req.app["state"]
-        await updates.api_update_apply(req)
-        await asyncio.gather(*list(state._background_tasks))
-
-        assert ("failed", "Update failed — check logs") in self._progress(state)
-        state.push_refresh.assert_any_call("update_failed")
-
-
-class TestSimulateAndCancel:
-    """The two overlay-driving endpoints."""
-
-    @pytest.mark.asyncio
-    async def test_a_missing_body_is_treated_as_empty_not_an_error(self, monkeypatch):
-        """The simulator is a local test aid; an absent body must not 400."""
-        req = _request(ValueError("no body"))
-        state = req.app["state"]
-        resp = await updates.api_update_simulate(req)
-        assert resp.status == 200
-        assert json.loads(resp.body.decode())["status"] == "simulating"
-        for task in list(state._background_tasks):
-            task.cancel()
-
-    @pytest.mark.asyncio
-    async def test_a_simulated_rejection_uses_the_caller_s_message(self):
-        resp = await updates.api_update_simulate(
-            _request({"reject": True, "reject_message": "nope"})
-        )
-        assert resp.status == 409
-        assert json.loads(resp.body.decode())["error"] == "nope"
-
-    @pytest.mark.asyncio
-    async def test_cancel_clears_the_overlay_on_both_sides_of_the_failed_event(self):
-        req = _request({})
-        state = req.app["state"]
-        resp = await updates.api_update_cancel(req)
-        assert resp.status == 200
-        # Cleared, then a "failed" event so clients drop the overlay, then cleared
-        # again -- a single clear would race clients that had not yet polled.
-        assert state.clear_update_progress.call_count == 2
-        state.push_update_progress.assert_called_once_with("failed", "Update cancelled by user")
-
-
-class TestLogLevel:
-    """``POST /api/logs/level`` and its getter."""
-
-    @pytest.fixture(autouse=True)
-    def _restore_level(self):
-        root = logging.getLogger("kiro_crew")
-        saved = root.level
-        yield
-        root.setLevel(saved)
-
-    @pytest.mark.asyncio
-    async def test_rejects_a_body_that_is_not_json(self):
-        resp = await updates.api_log_level(_request(ValueError("bad json")))
-        assert resp.status == 400
-
-    @pytest.mark.parametrize("level", ["TRACE", "", "verbose", "CRITICAL"])
-    @pytest.mark.asyncio
-    async def test_rejects_a_level_outside_the_map(self, level):
-        before = logging.getLogger("kiro_crew").level
-        resp = await updates.api_log_level(_request({"level": level}))
-        assert resp.status == 400
-        # A rejected level must not have been applied on the way to the refusal.
-        assert logging.getLogger("kiro_crew").level == before
-
-    @pytest.mark.asyncio
-    async def test_applies_and_persists_a_valid_level_case_insensitively(self, monkeypatch):
-        saved: list[str] = []
-
-        def _fake_update_config_locked(*args, **kwargs):
-            # The handler persists via a delta mutate through
-            # update_config_locked; record what it wrote.
-            doc = kwargs["mutate"]({})
-            saved.append(doc["agent"]["log_level"])
-            return doc
-
-        monkeypatch.setattr(updates, "update_config_locked", _fake_update_config_locked)
-
-        resp = await updates.api_log_level(_request({"level": "warning"}))
-
-        assert resp.status == 200
-        payload = json.loads(resp.body.decode())
-        assert payload == {"ok": True, "level": "WARNING", "persisted": True}
-        assert logging.getLogger("kiro_crew").level == logging.WARNING
-        assert saved == ["WARNING"]
-
-    @pytest.mark.asyncio
-    async def test_a_failed_persist_still_applies_the_level_and_says_so(self, monkeypatch):
-        """The runtime change is the point; persistence is best-effort.
-
-        Reporting ``persisted: False`` rather than 500 keeps a read-only config
-        from blocking a debugging session.
-        """
-        monkeypatch.setattr(
-            updates,
-            "update_config_locked",
-            MagicMock(side_effect=OSError("read-only fs")),
-        )
-
-        resp = await updates.api_log_level(_request({"level": "DEBUG"}))
-
-        payload = json.loads(resp.body.decode())
-        assert payload["ok"] is True
-        assert payload["persisted"] is False
-        assert logging.getLogger("kiro_crew").level == logging.DEBUG
-
-    @pytest.mark.asyncio
-    async def test_the_getter_reports_the_live_level(self):
-        logging.getLogger("kiro_crew").setLevel(logging.ERROR)
-        resp = await updates.api_log_level_get(_request())
-        assert json.loads(resp.body.decode()) == {"level": "ERROR"}
-
-
-def _record(msg: str = "hello", level: int = logging.INFO) -> logging.LogRecord:
-    return logging.LogRecord("kiro_crew.test", level, __file__, 1, msg, None, None)
-
-
-class TestQueueLogHandler:
-    """The per-connection SSE handler must never raise into ``logging``."""
-
-    def test_formats_each_record_as_one_sse_payload(self):
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        handler = updates._QueueLogHandler(queue)
-        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
-
-        handler.emit(_record("first", logging.WARNING))
-
-        assert json.loads(queue.get_nowait()) == {
-            "level": "WARNING",
-            "msg": "WARNING first",
-        }
-
-    def test_a_full_queue_drops_the_entry_instead_of_raising(self):
-        """``logging`` calls this from arbitrary code; raising would break callers."""
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
-        handler = updates._QueueLogHandler(queue)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-
-        handler.emit(_record("kept"))
-        handler.emit(_record("dropped"))
-
-        assert queue.qsize() == 1
-        assert json.loads(queue.get_nowait())["msg"] == "kept"
-
-
-class TestSafeWsSend:
-    """A dead WebSocket subscriber is removed, not retried."""
-
-    @pytest.mark.asyncio
-    async def test_a_live_subscriber_is_kept(self):
-        ws = MagicMock()
-        ws.send_str = AsyncMock()
-        state = MagicMock()
-        state._ws_log_subscribers = {ws}
-
-        await updates._safe_ws_send(ws, "payload", state)
-
-        ws.send_str.assert_awaited_once_with("payload")
-        assert state._ws_log_subscribers == {ws}
-
-    @pytest.mark.asyncio
-    async def test_a_dead_subscriber_is_discarded(self):
-        ws = MagicMock()
-        ws.send_str = AsyncMock(side_effect=ConnectionResetError("gone"))
-        state = MagicMock()
-        state._ws_log_subscribers = {ws}
-
-        await updates._safe_ws_send(ws, "payload", state)
-
-        assert state._ws_log_subscribers == set()
-
-
-class TestRingLogHandler:
-    """The always-on ring buffer plus its WebSocket fan-out."""
-
-    def test_set_state_keeps_no_loop_of_its_own(self):
-        """The handler defers to the dashboard's one serving loop.
-
-        Its `emit()` runs on arbitrary threads while `set_state` captured a loop
-        ONCE, so any caller attaching the state from a non-loop context latches
-        None permanently and every later fan-out is dropped with nothing
-        surfaced. Today's only production caller runs inside `start_dashboard`,
-        so the capture did succeed -- this pins the shape, not a live bug.
-        Resolving through the state at emit time removes the latch entirely.
-        """
-        handler = updates._RingLogHandler(collections.deque(maxlen=4))
-        handler.set_state(MagicMock())
-        assert not hasattr(handler, "_loop")
-
-    def test_emit_appends_to_the_ring_and_honours_maxlen(self):
-        ring: collections.deque[str] = collections.deque(maxlen=2)
-        handler = updates._RingLogHandler(ring, 2)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-
-        for text in ("one", "two", "three"):
-            handler.emit(_record(text))
-
-        assert [json.loads(entry)["msg"] for entry in ring] == ["two", "three"]
-
-    def test_a_formatting_failure_is_swallowed(self):
-        ring: collections.deque[str] = collections.deque(maxlen=2)
-        handler = updates._RingLogHandler(ring)
-        broken = MagicMock()
-        broken.format.side_effect = ValueError("bad format string")
-        handler.setFormatter(broken)
-
-        handler.emit(_record())
-
-        assert list(ring) == []
-
-    @pytest.mark.asyncio
-    async def test_emit_fans_out_to_every_websocket_subscriber(self):
-        ring: collections.deque[str] = collections.deque(maxlen=4)
-        handler = updates._RingLogHandler(ring)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        ws = MagicMock()
-        ws.send_str = AsyncMock()
-        state = MagicMock()
-        state._ws_log_subscribers = {ws}
-        state.serving_loop = asyncio.get_running_loop()
-        handler.set_state(state)
-
-        handler.emit(_record("broadcast me"))
-        # The fan-out is scheduled via call_soon_threadsafe, so it lands on a
-        # later loop iteration rather than inside emit().
-        for _ in range(50):
-            await asyncio.sleep(0.005)
-            if ws.send_str.await_count:
-                break
-
-        ws.send_str.assert_awaited_once()
-        payload = json.loads(ws.send_str.await_args[0][0])
-        assert payload == {"type": "log", "data": {"level": "INFO", "msg": "broadcast me"}}
-        assert json.loads(ring[0])["msg"] == "broadcast me"
-
-    def test_emit_with_no_subscribers_still_fills_the_ring(self):
-        ring: collections.deque[str] = collections.deque(maxlen=4)
-        handler = updates._RingLogHandler(ring)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        state = MagicMock()
-        state._ws_log_subscribers = set()
-        handler.set_state(state)
-
-        handler.emit(_record("ring only"))
-
-        assert json.loads(ring[0])["msg"] == "ring only"
-
-    @pytest.mark.filterwarnings("ignore:coroutine .* was never awaited:RuntimeWarning")
-    def test_a_closed_loop_drops_the_fan_out_but_keeps_the_ring(self):
-        """The gateway shuts its loop down while the handler stays attached.
-
-        ``call_soon_threadsafe`` then raises, and losing the ring entry over a
-        subscriber that cannot be reached would blind the Logs page during
-        exactly the shutdown a reader wants to see.
-
-        The send coroutine is built BEFORE the scheduling call, so this path also
-        abandons it un-awaited -- harmless (nothing has run yet) but the reason
-        for the warning filter above.
-        """
-        ring: collections.deque[str] = collections.deque(maxlen=4)
-        handler = updates._RingLogHandler(ring)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        state = MagicMock()
-        state._ws_log_subscribers = {MagicMock()}
-        handler._state = state
-        state.serving_loop = MagicMock()
-        state.serving_loop.call_soon_threadsafe.side_effect = RuntimeError("event loop is closed")
-
-        handler.emit(_record("during shutdown"))
-
-        assert json.loads(ring[0])["msg"] == "during shutdown"
-
-    def test_install_is_idempotent_and_attaches_exactly_one_handler(self, monkeypatch):
-        root = logging.getLogger("kiro_crew")
-        monkeypatch.setattr(updates, "_log_ring_handler_installed", False)
-        monkeypatch.setattr(updates, "_log_ring_handler", None)
-        before = list(root.handlers)
-        try:
-            first = updates.install_log_ring_handler()
-            second = updates.install_log_ring_handler()
-            assert first is not None
-            # Second call is a no-op: two ring handlers would double every entry.
-            assert second is first
-            assert len([h for h in root.handlers if h not in before]) == 1
-        finally:
-            for handler in list(root.handlers):
-                if handler not in before:
-                    root.removeHandler(handler)
-
-
-def _stub_stream(monkeypatch, *, prepare_raises: BaseException | None = None) -> list[bytes]:
-    """Capture what a handler writes without opening a socket."""
-    writes: list[bytes] = []
-
-    async def _prepare(self, request):  # noqa: ANN001 - stub mirrors aiohttp
-        if prepare_raises is not None:
-            raise prepare_raises
-        return None
-
-    async def _write(self, data):  # noqa: ANN001 - stub mirrors aiohttp
-        writes.append(bytes(data))
-
-    monkeypatch.setattr(web.StreamResponse, "prepare", _prepare)
-    monkeypatch.setattr(web.StreamResponse, "write", _write)
-    return writes
-
-
-class TestLogsStream:
-    """``GET /api/logs`` — ring replay, then a live tail."""
-
-    @pytest.fixture(autouse=True)
-    def _own_shutdown_event(self, monkeypatch):
-        """The module binds ``shutdown_event`` at import, so patch it there."""
-        event = asyncio.Event()
-        monkeypatch.setattr(updates, "shutdown_event", event)
-        return event
-
-    @pytest.mark.asyncio
-    async def test_a_client_that_hangs_up_during_prepare_is_not_an_error(self, monkeypatch):
-        _stub_stream(monkeypatch, prepare_raises=ClientConnectionResetError("gone"))
-        updates._log_ring.append(json.dumps({"level": "INFO", "msg": "x"}))
-        resp = await updates.api_logs(_request(query={"lines": "10"}))
-        assert isinstance(resp, web.StreamResponse)
-
-    @pytest.mark.asyncio
-    async def test_a_client_that_hangs_up_during_replay_is_not_an_error(self, monkeypatch):
-        writes = _stub_stream(monkeypatch)
-
-        async def _boom(self, data):  # noqa: ANN001 - stub mirrors aiohttp
-            raise ConnectionResetError("gone")
-
-        updates._log_ring.append(json.dumps({"level": "INFO", "msg": "x"}))
-        monkeypatch.setattr(web.StreamResponse, "write", _boom)
-
-        await updates.api_logs(_request(query={"lines": "5"}))
-
-        assert writes == []
-        # The queue handler is only installed AFTER the replay, so an abort here
-        # must not leave one attached to the logger.
-        assert not any(
-            isinstance(h, updates._QueueLogHandler) for h in logging.getLogger("kiro_crew").handlers
-        )
-
-    @pytest.mark.parametrize("raw", ["not-a-number", "", "1e5"])
-    @pytest.mark.asyncio
-    async def test_an_unparseable_lines_param_falls_back_to_the_default(self, monkeypatch, raw):
-        writes = _stub_stream(monkeypatch)
-        for index in range(250):
-            updates._log_ring.append(json.dumps({"level": "INFO", "msg": f"m{index}"}))
-        event = updates.shutdown_event
-        event.set()  # replay only, no live tail
-
-        await updates.api_logs(_request(query={"lines": raw}))
-
-        assert len(writes) == 200
-        assert json.loads(writes[0].decode().removeprefix("data: ").strip())["msg"] == "m50"
-
-    @pytest.mark.asyncio
-    async def test_the_replay_is_capped_by_the_lines_param(self, monkeypatch):
-        writes = _stub_stream(monkeypatch)
-        for index in range(10):
-            updates._log_ring.append(json.dumps({"level": "INFO", "msg": f"m{index}"}))
-        updates.shutdown_event.set()
-
-        await updates.api_logs(_request(query={"lines": "3"}))
-
-        replayed = [json.loads(w.decode().removeprefix("data: ").strip())["msg"] for w in writes]
-        # The TAIL of the ring, so the client sees the most recent history.
-        assert replayed == ["m7", "m8", "m9"]
-
-    @pytest.mark.asyncio
-    async def test_live_entries_are_streamed_and_the_handler_is_removed_on_cancel(
-        self, monkeypatch
-    ):
-        writes = _stub_stream(monkeypatch)
-        root = logging.getLogger("kiro_crew")
-        before = len(root.handlers)
-
-        task = asyncio.ensure_future(updates.api_logs(_request(query={"lines": "1"})))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if any(isinstance(h, updates._QueueLogHandler) for h in root.handlers):
-                break
-        assert any(isinstance(h, updates._QueueLogHandler) for h in root.handlers)
-
-        logging.getLogger("kiro_crew.stream").warning("live one")
-        logging.getLogger("kiro_crew.stream").warning("live two")
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if len(writes) >= 2:
-                break
-        task.cancel()
-        await task
-
-        payloads = [json.loads(w.decode().removeprefix("data: ").strip())["msg"] for w in writes]
-        assert any("live one" in p for p in payloads)
-        assert any("live two" in p for p in payloads)
-        # The finally block must detach the per-connection handler, or every
-        # disconnected client would keep formatting records forever.
-        assert len(root.handlers) == before
-
-    @pytest.mark.asyncio
-    async def test_an_idle_stream_emits_a_keepalive_comment(self, monkeypatch):
-        """A silent logger must not let an intermediary time the connection out.
-
-        The real wait is 30s, so the wait itself is short-circuited rather than
-        slept through.
-        """
-        writes = _stub_stream(monkeypatch)
-        real_wait_for = asyncio.wait_for
-
-        async def _no_waiting(awaitable, timeout=None):
-            if timeout == 30:
-                awaitable.close()  # nothing has run yet; close it rather than leak it
-                await asyncio.sleep(0.01)
-                raise asyncio.TimeoutError
-            return await real_wait_for(awaitable, timeout)
-
-        monkeypatch.setattr(asyncio, "wait_for", _no_waiting)
-
-        task = asyncio.ensure_future(updates.api_logs(_request()))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if b": keepalive\n\n" in writes:
-                break
-        task.cancel()
-        await task
-
-        assert b": keepalive\n\n" in writes
-
-
-def test_neither_chat_message_door_builds_the_frame_by_hand() -> None:
-    """Both delivery doors must route through the shared serialiser.
-
-    `_broadcast()` feeds ONE note to two doors — the WS arm in `state.py` and
-    the SSE arm in `handlers/updates.py`. While each built the frame by hand
-    they could disagree silently, which is exactly how `meta` can go missing on
-    the SSE side while the WS side carries it.
-
-    Asserted on the SOURCE, not on a payload, because that is the only form
-    that catches the regression this guards: a payload comparison calling
-    `chat_message_frame` directly still passes after a door is re-inlined, since
-    it never exercises that door's own construction.
-
-    Scoped to each door's own `chat_message` BRANCH rather than the whole file.
-    A file-wide scan cannot work here: `chat_message_frame` is *defined* in
-    `state.py`, so its own `"slot": note[...]` body reads as a hand-built frame
-    and its `def` line satisfies a naive "calls the helper" check.
-    """
-    from pathlib import Path
-
-    import kiro_crew
-
-    def _branch(src: str) -> str:
-        """The `chat_message` arm's body, up to the next sibling arm."""
-        start = src.index('elif msg_type == "chat_message":')
-        rest = src[start + 1 :]
-        ends = [
-            i
-            for i in (rest.find("\n            elif "), rest.find("\n                    elif "))
-            if i != -1
-        ]
-        return rest[: min(ends)] if ends else rest
-
-    root = Path(kiro_crew.__file__).parent
-    for rel in ("dashboard/state.py", "dashboard/handlers/updates.py"):
-        branch = _branch((root / rel).read_text(encoding="utf-8"))
-        assert "chat_message_frame(" in branch, (
-            f"{rel}'s chat_message arm no longer calls chat_message_frame — a "
-            f"door that builds the frame itself is how the two transports "
-            f"drifted apart in #8045"
-        )
-        assert '"slot":' not in branch, (
-            f"{rel}'s chat_message arm names the frame's keys inline instead of "
-            f"delegating to chat_message_frame"
-        )
-
-
-class TestDashboardStream:
-    """The dashboard SSE endpoint — one event name per queued note type."""
-
-    @pytest.fixture(autouse=True)
-    def _own_shutdown_event(self, monkeypatch):
-        event = asyncio.Event()
-        monkeypatch.setattr(updates, "shutdown_event", event)
-        return event
-
-    @pytest.fixture(autouse=True)
-    def _warm_status_counts(self, monkeypatch):
-        # The SSE `dashboard` frame routes its lesson/cron counts through the
-        # shared status_counts cache now, not an inline status_snapshot call.
-        # Seed it warm so the writer serves serializable counts without the
-        # MagicMock state's count methods (which return non-serializable Mocks)
-        # ever running.
-        from kiro_crew.dashboard import status_counts as sc
-
-        monkeypatch.setattr(sc, "_counts_cache", (0, 0))
-        monkeypatch.setattr(sc, "_counts_cache_ts", time.monotonic())
-        monkeypatch.setattr(sc, "_counts_cache_failures", 0)
-        monkeypatch.setattr(sc, "_counts_refresh_inflight", False)
-
-    def _request_with_queue(
-        self, notes: list[dict], *, is_dashboard_user: bool = True
-    ) -> MagicMock:
-        req = _request()
-        # `api_stream` reads `request["is_dashboard_user"]` — the auth
-        # middleware's POSITIVE signal — to decide whether row metadata may go
-        # on this unfiltered queue. A bare MagicMock returns a truthy Mock from
-        # `.get()`, which would make the app-token assertion below pass on mock
-        # truthiness rather than on the flag, so wire it to a real mapping.
-        req.get = {"is_dashboard_user": is_dashboard_user}.get
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        for note in notes:
-            queue.put_nowait(note)
-        state = req.app["state"]
-        state.register_sse.return_value = queue
-        state.status_snapshot.return_value = {"sessions": 0, "update_available": True}
-        return req
-
-    @pytest.mark.asyncio
-    async def test_a_client_that_hangs_up_during_prepare_is_not_an_error(self, monkeypatch):
-        _stub_stream(monkeypatch, prepare_raises=ConnectionResetError("gone"))
-        req = self._request_with_queue([])
-        resp = await updates.api_stream(req)
-        assert isinstance(resp, web.StreamResponse)
-        # No queue was registered, so none can be leaked.
-        req.app["state"].unregister_sse.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_each_note_type_gets_its_own_sse_event_name(self, monkeypatch):
-        writes = _stub_stream(monkeypatch)
-        req = self._request_with_queue(
-            [
-                {"_type": "slots", "slots": "[]"},
-                {"_type": "slot_title", "key": "s1", "title": "Renamed"},
-                {"_type": "refresh", "kinds": "updating"},
-                {"_type": "chat_message", "slot": "s1", "role": "assistant", "content": "hi"},
-                {"kind": "toast", "text": "done"},
-            ]
-        )
-
-        task = asyncio.ensure_future(updates.api_stream(req))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if len(writes) >= 6:
-                break
-        updates.shutdown_event.set()
-        await asyncio.wait_for(task, timeout=5)
-
-        text = b"".join(writes).decode()
-        assert "event: slots\ndata: []\n\n" in text
-        assert '"title": "Renamed"' in text
-        assert "event: refresh\ndata: updating\n\n" in text
-        assert "event: chat_message" in text
-        assert "event: notification" in text
-        # The periodic dashboard frame carries the version and the update flag.
-        dashboard = [w.decode() for w in writes if w.startswith(b"event: dashboard")]
-        assert dashboard
-        payload = json.loads(dashboard[0].split("data: ", 1)[1].strip())
-        assert payload["update_available"] is True
-        assert payload["version"] == updates._local_version
-        # The per-client queue is always handed back, disconnect or not.
-        req.app["state"].unregister_sse.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_the_sse_chat_message_frame_carries_the_rows_identity(self, monkeypatch):
-        """`meta` (and `cls`) survive the SSE relay, as they do on the WebSocket.
-
-        `meta.mid` is the row identity a client dedups on, so a relay that
-        rebuilds a four-field subset publishes frames no consumer can recognise
-        as a redelivery. Both doors read the SAME producer note, so they must
-        not disagree about what a `chat_message` frame contains.
-        """
-        writes = _stub_stream(monkeypatch)
-        req = self._request_with_queue(
-            [
-                {
-                    "_type": "chat_message",
-                    "slot": "s1",
-                    "role": "assistant",
-                    "content": "hi",
-                    "ts": "2026-09-03T00:00:00Z",
-                    "cls": '{"mid": "m-1"}',
-                    "meta": {"mid": "m-1", "kind": "compaction"},
-                }
-            ]
-        )
-
-        task = asyncio.ensure_future(updates.api_stream(req))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if any(w.startswith(b"event: chat_message") for w in writes):
-                break
-        updates.shutdown_event.set()
-        await asyncio.wait_for(task, timeout=5)
-
-        frames = [w.decode() for w in writes if w.startswith(b"event: chat_message")]
-        assert frames, "no chat_message frame was written"
-        payload = json.loads(frames[0].split("data: ", 1)[1].strip())
-        assert payload["meta"] == {"mid": "m-1", "kind": "compaction"}
-        assert payload["cls"] == '{"mid": "m-1"}'
-        # The pre-existing fields are unchanged — this widens the frame, it does
-        # not reshape it.
-        assert payload["slot"] == "s1"
-        assert payload["role"] == "assistant"
-        assert payload["content"] == "hi"
-        assert payload["ts"] == "2026-09-03T00:00:00Z"
-
-    @pytest.mark.asyncio
-    async def test_a_chat_message_without_meta_gains_no_empty_keys(self, monkeypatch):
-        """A note carrying no `cls`/`meta` still serialises to the bare frame.
-
-        Guards the other direction of the passthrough: absent metadata must not
-        become `null`/`{}` keys a consumer would have to special-case.
-        """
-        writes = _stub_stream(monkeypatch)
-        req = self._request_with_queue(
-            [{"_type": "chat_message", "slot": "s1", "role": "user", "content": "hi"}]
-        )
-
-        task = asyncio.ensure_future(updates.api_stream(req))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if any(w.startswith(b"event: chat_message") for w in writes):
-                break
-        updates.shutdown_event.set()
-        await asyncio.wait_for(task, timeout=5)
-
-        frames = [w.decode() for w in writes if w.startswith(b"event: chat_message")]
-        assert frames, "no chat_message frame was written"
-        payload = json.loads(frames[0].split("data: ", 1)[1].strip())
-        assert "meta" not in payload
-        assert "cls" not in payload
-        assert payload == {"slot": "s1", "role": "user", "content": "hi", "ts": ""}
-
-    @pytest.mark.asyncio
-    async def test_an_app_token_stream_never_receives_row_metadata(self, monkeypatch):
-        """An app token on `/api/stream` gets no `cls`/`meta`, whatever its scope.
-
-        `_broadcast()` fans the raw note out to EVERY registered SSE queue with
-        no per-app filtering, so unlike the WS door there is no downstream gate
-        to drop a row an app may not see. `meta` carries tool/LLM content
-        (`tool_input`, a live `oauth_url`, `approval_id`), so including it here
-        would expose it to any app token granted this route regardless of its
-        `slots:*` scope — the same class of leak that put public-repo status
-        onto this same endpoint. The metadata therefore rides only the door that
-        filters.
-        """
-        writes = _stub_stream(monkeypatch)
-        req = self._request_with_queue(
-            [
-                {
-                    "_type": "chat_message",
-                    "slot": "s1",
-                    "role": "assistant",
-                    "content": "hi",
-                    "ts": "2026-09-03T00:00:00Z",
-                    "cls": '{"mid": "m-3", "tool_input": "secret"}',
-                    "meta": {"mid": "m-3", "tool_input": "secret"},
-                }
-            ],
-            is_dashboard_user=False,
-        )
-
-        task = asyncio.ensure_future(updates.api_stream(req))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if any(w.startswith(b"event: chat_message") for w in writes):
-                break
-        updates.shutdown_event.set()
-        await asyncio.wait_for(task, timeout=5)
-
-        frames = [w.decode() for w in writes if w.startswith(b"event: chat_message")]
-        assert frames, "no chat_message frame was written"
-        payload = json.loads(frames[0].split("data: ", 1)[1].strip())
-        assert "meta" not in payload
-        assert "cls" not in payload
-        assert "secret" not in frames[0]
-        # The pre-existing four-field projection is unchanged for an app token —
-        # this withholds the new metadata, it does not newly restrict the frame.
-        assert payload == {
-            "slot": "s1",
-            "role": "assistant",
-            "content": "hi",
-            "ts": "2026-09-03T00:00:00Z",
-        }
-
-    @pytest.mark.asyncio
-    async def test_a_disconnect_mid_stream_unregisters_the_queue(self, monkeypatch):
-        """A leaked queue keeps growing for a client that will never read it."""
-        _stub_stream(monkeypatch)
-        req = self._request_with_queue([])
-
-        async def _boom(self, data):  # noqa: ANN001 - stub mirrors aiohttp
-            raise ClientConnectionResetError("gone")
-
-        monkeypatch.setattr(web.StreamResponse, "write", _boom)
-
-        resp = await updates.api_stream(req)
-
-        assert isinstance(resp, web.StreamResponse)
-        req.app["state"].unregister_sse.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_a_queue_that_empties_mid_drain_ends_the_drain(self, monkeypatch):
-        """``empty()`` then ``get_nowait()`` is not atomic under a second consumer.
-
-        The defensive break is what keeps a raced drain from raising out of the
-        stream and dropping the client.
-        """
-        _stub_stream(monkeypatch)
-        req = _request()
-
-        class _RacingQueue:
-            def __init__(self) -> None:
-                self.probes = 0
-
-            def empty(self) -> bool:
-                self.probes += 1
-                return self.probes > 1
-
-            def get_nowait(self) -> dict:
-                raise asyncio.QueueEmpty
-
-        queue = _RacingQueue()
-        state = req.app["state"]
-        state.register_sse.return_value = queue
-        state.status_snapshot.return_value = {"sessions": 0}
-
-        task = asyncio.ensure_future(updates.api_stream(req))
-        await asyncio.sleep(0.05)
-        updates.shutdown_event.set()
-        resp = await asyncio.wait_for(task, timeout=5)
-
-        assert isinstance(resp, web.StreamResponse)
-        state.unregister_sse.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_cancellation_is_swallowed_and_still_unregisters(self, monkeypatch):
-        _stub_stream(monkeypatch)
-        req = self._request_with_queue([])
-
-        task = asyncio.ensure_future(updates.api_stream(req))
-        for _ in range(200):
-            await asyncio.sleep(0.005)
-            if req.app["state"].register_sse.called:
-                break
-        task.cancel()
-        resp = await task
-
-        assert isinstance(resp, web.StreamResponse)
-        req.app["state"].unregister_sse.assert_called_once()
 
 
 class TestUpdateInfoAccessors:
@@ -1775,10 +1005,94 @@ class TestExternallyManagedCheck:
         monkeypatch.setattr("kiro_crew.platform.update_capability.distribution", lambda: "wheel")
         monkeypatch.setattr(updates, "_check_release_feed", _count)
         leader = asyncio.create_task(updates._do_update_check())
-        await asyncio.wait_for(started.wait(), timeout=1)
+        await await_until(started, what="the leader's check starting")
         follower = asyncio.create_task(updates._do_update_check())
         await asyncio.sleep(0)
         assert not follower.done()
         release.set()
         await asyncio.gather(leader, follower)
         assert calls == ["kirocrew"]
+
+
+class TestAnUnexpectedCheckFailureKeepsTheInstallsShape:
+    """A transient raise must not make a managed venv look notify-only.
+
+    ``_set_update_info`` re-seeds ``can_arm`` to False, so the outer handler has
+    to carry it the way the feed-failure paths do — otherwise one unexpected
+    raise (a signature probe, a venv-layout read) hides the in-app update path
+    until the next successful check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_can_arm_and_the_effect_survive_the_failure(self, monkeypatch):
+        from kiro_crew.platform import update_capability, wheel_engine
+
+        monkeypatch.setattr(updates, "resolve_provider", lambda: None)
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(update_capability, "_source_checkout_root", lambda: None)
+        monkeypatch.setattr(update_capability, "_runs_from_managed_venv", lambda: True)
+        monkeypatch.setattr(update_capability, "_installer_runs_here", lambda: True)
+        monkeypatch.setattr("kiro_crew.platform_compat.trusted_system_bin", lambda _n: "/bin/sh")
+        monkeypatch.setattr("kiro_crew.platform.update_layout.cdn_bases_are_safe", lambda: True)
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_layout.cdn_bases", lambda: ("https://a", "https://b")
+        )
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_governance.update_blocked_reason", lambda _u: ""
+        )
+        monkeypatch.setattr(
+            "kiro_crew.platform.update_governance.update_required", lambda _v: False
+        )
+
+        def _boom():
+            raise RuntimeError("openssl verify blew up")
+
+        monkeypatch.setattr(updates, "derive_capability", _boom)
+        monkeypatch.setattr(updates, "_auto_effect", None)
+        monkeypatch.setattr(updates, "_auto_effect_task", None)
+        monkeypatch.setattr(updates, "_shape_effect", None)
+
+        await updates._run_update_check()
+        await updates.prime_status_auto_update_effect()
+        fields = updates.status_update_fields()
+
+        assert fields["update_check_status"] == "failed"
+        # The in-app update path is still offered, and the switch still says
+        # what the switch does.
+        assert fields["update_can_arm"] is True
+        assert fields["update_auto_effect"] == "install"
+
+
+class TestTheManualCheckRecordsTheEffect:
+    """The user asked, so the derivation's git probes are warranted here.
+
+    Before the update loop's first cycle a status frame can only answer the
+    shapes that need no git; a manual Check answers every shape and records it,
+    so the switch stops reading ``unknown`` without waiting for the loop.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_check_derives_and_publishes_it(self, monkeypatch):
+        from kiro_crew.platform.update_capability import AutoUpdateEffect
+
+        monkeypatch.setattr(updates, "_auto_effect", None)
+        monkeypatch.setattr(updates, "_auto_effect_task", None)
+        monkeypatch.setattr(updates, "_do_update_check", AsyncMock())
+        monkeypatch.setattr(
+            updates, "auto_update_effect", lambda: AutoUpdateEffect("install", "git")
+        )
+
+        resp = await updates.api_update_check(_request({}))
+
+        body = json.loads(resp.body.decode())
+        assert body["update_auto_effect"] == "install"
+        # Recorded, so the next status frame carries it too.
+        assert updates.status_update_fields()["update_auto_effect"] == "install"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], "x", 3])
+async def test_a_non_object_auto_update_body_is_a_400_not_a_500(body):
+    resp = await updates.api_update_auto(_request(body))
+    assert resp.status == 400
+    assert json.loads(resp.body.decode())["code"] == "invalid_json"

@@ -32,8 +32,10 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import append_line, replace_with_retry
 from kiro_crew.config import live
 from kiro_crew.config.paths import config_dir
+from kiro_crew.owner_only_files import owner_only_opener
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +310,38 @@ def _head_before(text: str, limit: int) -> str:
     return text[:end]
 
 
+def _trim_file(path: Path, max_records: int) -> None:
+    """Keep only the newest *max_records* lines of the JSONL at *path*.
+
+    Writes through a temp then an atomic replace, so a reader — which takes no
+    lock — sees either the whole old file or the whole new one, never a
+    half-written one. A no-op at or below the cap, so an append under the limit
+    pays one read and no rewrite.
+
+    The replace goes through :func:`replace_with_retry` because a lock-free
+    reader holding the destination open makes ``os.replace`` raise a Windows
+    sharing violation (``PermissionError``/``EACCES``); left to propagate that
+    would reach ``_degrade`` and disable history for a transient reader overlap.
+    The helper retries the Windows window and is a plain ``os.replace`` on
+    POSIX; it runs in the ``asyncio.to_thread`` worker with no loop of its own,
+    so the retry engages.
+
+    The caller MUST hold the store lock: this reads the file and republishes it
+    whole, so an unlocked interleaving with an append drops the record that
+    landed between the read and the replace.
+    """
+    if max_records <= 0 or not path.exists():
+        return
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+    if len(lines) <= max_records:
+        return
+    tmp = path.with_suffix(".tmp")
+    wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(wfd, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines[-max_records:]) + "\n")
+    replace_with_retry(tmp, path)
+
+
 @dataclass
 class CronRunRecord:
     """Single cron execution record."""
@@ -332,6 +366,15 @@ class CronRunRecord:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> CronRunRecord:
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+def _parse_history_row(line: str) -> dict[str, Any] | None:
+    """Ignore partial JSONL lines and valid JSON values that are not records."""
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return row if isinstance(row, dict) else None
 
 
 class CronHistoryStore:
@@ -407,7 +450,9 @@ class CronHistoryStore:
         Returns True when records can be persisted, False to disable history.
         """
         try:
-            self._dir.mkdir(parents=True, exist_ok=True)
+            from kiro_crew.owner_only_files import ensure_directory
+
+            ensure_directory(self._dir)  # run records: 0700 in the data home
             return True
         except OSError as exc:
             # A denial scoped to this one leaf answers EPERM to BOTH os.mkdir
@@ -514,14 +559,14 @@ class CronHistoryStore:
     async def append(self, record: CronRunRecord) -> None:
         """Write record to job file and index."""
         # Cap fields
-        # The ONE truncation site for a summary: cron.py's run, timeout and
+        # The ONE truncation site for a summary: the cron service's run, timeout and
         # cancel recorders all hand the whole text over uncut, so the
         # configured cap and the keep-the-facts rule apply once, here. A
         # caller that pre-slices defeats both.
         #
         # One boundary this does not reach: a command cron's failure path caps
         # the JOB FIELD it writes (``job.last_error = err_str[:200]`` in
-        # slack/gateway.py), which is a registry-size decision about crons.json,
+        # slack/gateway_runtime/cron_exec.py), which is a registry-size decision about crons.json,
         # not a decision about this record. The recorder still passes that field
         # over whole, so such a summary is simply as long as the field it came
         # from. Lifting that cap belongs to whoever owns the registry's size.
@@ -540,12 +585,30 @@ class CronHistoryStore:
         fd = self._lock()
         try:
             job_path = self._job_path(record.job_id)
-            wfd = os.open(str(job_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(wfd, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record.to_dict(include_trace=True)) + "\n")
-            ifd = os.open(str(self._index_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(ifd, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record.to_dict(include_trace=False)) + "\n")
+            append_line(
+                job_path, json.dumps(record.to_dict(include_trace=True)), opener=owner_only_opener
+            )
+            append_line(
+                self._index_path,
+                json.dumps(record.to_dict(include_trace=False)),
+                opener=owner_only_opener,
+            )
+            # The caps are enforced on the write path, not only by ``rotate_all``.
+            # That runs once per process, from ``CronService.start``, so it bounds
+            # the history a gateway INHERITS, never the history the gateway itself
+            # writes — and a long-lived gateway is where the growth happens. Every
+            # read (``get_job_history``, ``get_all_history``, ``get_run_detail``)
+            # loads its whole file, so an unbounded index also makes each dashboard
+            # request cost more as the process ages. The trim runs under the lock
+            # this method already holds, so it adds no second critical section.
+            #
+            # Guard the per-job trim against the index path: a job whose id is
+            # ``_index`` resolves ``job_path`` onto ``_index.jsonl``, and trimming
+            # that at the smaller per-job cap would silently truncate the global
+            # index. ``_rotate_all_sync`` carries the same skip.
+            if job_path != self._index_path:
+                _trim_file(job_path, self._max_records_per_job)
+            _trim_file(self._index_path, self._max_index_records)
         finally:
             self._unlock(fd)
 
@@ -573,17 +636,12 @@ class CronHistoryStore:
             lines = job_path.read_text(encoding="utf-8").strip().splitlines()
         except FileNotFoundError:
             return [], 0
-        total = len(lines)
-        lines.reverse()
-        page = lines[offset : offset + limit]
-        results = []
-        for line in page:
-            try:
-                d = json.loads(line)
-                d.pop("trace", None)
-                results.append(d)
-            except json.JSONDecodeError:
-                continue
+        records = [row for line in lines if (row := _parse_history_row(line)) is not None]
+        total = len(records)
+        records.reverse()
+        results = records[offset : offset + limit]
+        for row in results:
+            row.pop("trace", None)
         return results, total
 
     async def get_all_history(
@@ -609,25 +667,12 @@ class CronHistoryStore:
             lines = self._index_path.read_text(encoding="utf-8").strip().splitlines()
         except FileNotFoundError:
             return [], 0
+        records = [row for line in lines if (row := _parse_history_row(line)) is not None]
         if job_id:
-            filtered = []
-            for line in lines:
-                try:
-                    if json.loads(line).get("job_id") == job_id:
-                        filtered.append(line)
-                except json.JSONDecodeError:
-                    continue
-            lines = filtered
-        total = len(lines)
-        lines.reverse()
-        page = lines[offset : offset + limit]
-        results = []
-        for line in page:
-            try:
-                results.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        return results, total
+            records = [row for row in records if row.get("job_id") == job_id]
+        total = len(records)
+        records.reverse()
+        return records[offset : offset + limit], total
 
     async def get_run_detail(self, job_id: str, run_id: str) -> dict[str, Any] | None:
         """Return full record (with trace) for a specific run."""
@@ -648,12 +693,9 @@ class CronHistoryStore:
         except FileNotFoundError:
             return None
         for line in lines:
-            try:
-                d = json.loads(line)
-                if d.get("run_id") == run_id:
-                    return d
-            except json.JSONDecodeError:
-                continue
+            row = _parse_history_row(line)
+            if row is not None and row.get("run_id") == run_id:
+                return row
         return None
 
     async def rotate(self, job_id: str) -> None:
@@ -671,15 +713,7 @@ class CronHistoryStore:
             return
         fd = self._lock()
         try:
-            lines = job_path.read_text(encoding="utf-8").strip().splitlines()
-            if len(lines) <= self._max_records_per_job:
-                return
-            keep = lines[-self._max_records_per_job:]
-            tmp = job_path.with_suffix(".tmp")
-            wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(wfd, "w", encoding="utf-8") as f:
-                f.write("\n".join(keep) + "\n")
-            os.replace(tmp, job_path)
+            _trim_file(job_path, self._max_records_per_job)
         finally:
             self._unlock(fd)
 
@@ -698,23 +732,8 @@ class CronHistoryStore:
             for p in self._dir.glob("*.jsonl"):
                 if p.name == "_index.jsonl":
                     continue
-                lines = p.read_text(encoding="utf-8").strip().splitlines()
-                if len(lines) > self._max_records_per_job:
-                    keep = lines[-self._max_records_per_job:]
-                    tmp = p.with_suffix(".tmp")
-                    wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(wfd, "w", encoding="utf-8") as f:
-                        f.write("\n".join(keep) + "\n")
-                    os.replace(tmp, p)
-            if self._index_path.exists():
-                lines = self._index_path.read_text(encoding="utf-8").strip().splitlines()
-                if len(lines) > self._max_index_records:
-                    keep = lines[-self._max_index_records:]
-                    tmp = self._index_path.with_suffix(".tmp")
-                    wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                    with os.fdopen(wfd, "w", encoding="utf-8") as f:
-                        f.write("\n".join(keep) + "\n")
-                    os.replace(tmp, self._index_path)
+                _trim_file(p, self._max_records_per_job)
+            _trim_file(self._index_path, self._max_index_records)
         finally:
             self._unlock(fd)
 
@@ -724,6 +743,20 @@ class CronHistoryStore:
             return False
         try:
             return await asyncio.to_thread(self._delete_job_history_sync, job_id)
+        except OSError as exc:
+            self._degrade("delete_job_history", exc)
+            return False
+
+    def delete_job_history_sync(self, job_id: str) -> bool:
+        """Synchronous :meth:`delete_job_history`, for a loop-less caller.
+
+        Blocking filesystem I/O under the history lock, so it never runs on an
+        event loop; there, await :meth:`delete_job_history`.
+        """
+        if not self._enabled:
+            return False
+        try:
+            return self._delete_job_history_sync(job_id)
         except OSError as exc:
             self._degrade("delete_job_history", exc)
             return False
@@ -739,18 +772,16 @@ class CronHistoryStore:
                 lines = self._index_path.read_text(encoding="utf-8").strip().splitlines()
                 filtered = []
                 for line in lines:
-                    try:
-                        if json.loads(line).get("job_id") != job_id:
-                            filtered.append(line)
-                    except json.JSONDecodeError:
-                        continue
+                    row = _parse_history_row(line)
+                    if row is not None and row.get("job_id") != job_id:
+                        filtered.append(line)
                 if len(filtered) != len(lines):
                     tmp = self._index_path.with_suffix(".tmp")
                     content = "\n".join(filtered) + "\n" if filtered else ""
                     wfd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                     with os.fdopen(wfd, "w", encoding="utf-8") as f:
                         f.write(content)
-                    os.replace(tmp, self._index_path)
+                    replace_with_retry(tmp, self._index_path)
             return removed
         finally:
             self._unlock(fd)

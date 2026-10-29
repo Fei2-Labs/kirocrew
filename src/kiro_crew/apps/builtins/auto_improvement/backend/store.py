@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.apps.manager import app_data_dir
+from kiro_crew.atomic_write import read_json_or
 
 logger = logging.getLogger(__name__)
 
@@ -115,14 +116,18 @@ def workspace_dir() -> Path:
     ruler, results, PR queue, profiles, and ledger move here so a repo/branch
     switch swaps the whole set atomically.
     """
+    from kiro_crew.owner_only_files import ensure_directory
+
     path = data_dir() / "repos" / workspace_key()
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path)  # 0700 levels in the data home
     return path
 
 
 def _sub(name: str) -> Path:
+    from kiro_crew.owner_only_files import ensure_directory
+
     path = workspace_dir() / name
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path)  # 0700 levels in the data home
     return path
 
 
@@ -150,8 +155,10 @@ def sessions_dir() -> Path:
     its own subject id and may reference any repo, so it is not scoped to the
     active one.
     """
+    from kiro_crew.owner_only_files import ensure_directory
+
     path = data_dir() / "sessions"
-    path.mkdir(parents=True, exist_ok=True)
+    ensure_directory(path)  # 0700 in the data home
     return path
 
 
@@ -211,10 +218,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
 def read_json(path: Path, default: Any = None) -> Any:
     """Read JSON, returning ``default`` on a missing or corrupt file."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return default
+    return read_json_or(path, default, logger=logger, what="auto-improvement record")
 
 
 # ── chat-session records (requirement 3) ─────────────────────────────────────

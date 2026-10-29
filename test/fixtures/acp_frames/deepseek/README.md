@@ -1,7 +1,7 @@
 # DeepSeek Harness frame corpus
 
-Five files: four live captures and one synthesized frame. Read `../README.md`
-first for what a fixture is and what the corpus does and does not prove.
+Seven files, all live. Read `../README.md` first for what a fixture is and what
+the corpus does and does not prove.
 
 | File | Provenance | Frame classes it carries |
 |---|---|---|
@@ -9,7 +9,9 @@ first for what a fixture is and what the corpus does and does not prove.
 | `turn-live.jsonl` | live | `session/new` response, `usage_update`, `tool_call`, `tool_call_update`, `agent_message_chunk`, and the `session/prompt` result carrying `stopReason` |
 | `mcp-stdio-mount-live.jsonl` | live | a stdio MCP mount completing a ROUND TRIP: `session/new` with a real server, then `tool_call` / `tool_call_update` for `mcp__crew-probe__crew_probe_echo` |
 | `mcp-stdio-rollback-live.jsonl` | live | the same mount with an unstartable command: `session/new` fails WHOLE and names the server |
-| `permission-request-synthesized.jsonl` | **synthesized** | `session/request_permission` -- the one required class this harness produced in no capture |
+| `permission-request-live.jsonl` | live | `tool_call`, the `session/request_permission` the harness sends with Kiro Crew's gate plugin composed, and the `tool_call_update` through `completed` |
+| `tool-call-id-reuse-live.jsonl` | live | the SAME `toolCallId` (`call_0`) across two consecutive turns of one session: `tool_call`, `session/request_permission` and a terminal `tool_call_update` for each, with the first turn's `session/prompt` result between them |
+| `side-read-only-live.jsonl` | live | six calls in one turn with Kiro Crew's gate plugin composed (dsh 0.2.0-rc.2): `read`, `grep`, `glob`, `write`, `bash` and an unknown `mcp__probe__read`, each a `tool_call` naming the tool in `title`, the `session/request_permission` it raised, and its terminal `tool_call_update` (the three reads `completed` on allow-once, the rest `failed` on reject-once). The evidence `ACP_BACKENDS_SIDE_READONLY` admits deepseek on |
 
 ## What the MCP mount captures establish
 
@@ -37,8 +39,10 @@ and the tool is REACHABLE — not merely that an element was accepted.
 Two things ride along. The tool title is the harness's own MCP grammar,
 `mcp__<serverName>__<toolName>`, so the server name is in the title and the separator
 is a double underscore rather than the `/` kiro-cli splits on. And no
-`session/request_permission` fired for this call either, consistent with the routing
-verdict below.
+`session/request_permission` fired for this call either: this capture, like
+`turn-live.jsonl`, was taken with no gate plugin composed, so it records the
+harness's own default composition. It is not the current routing, which the
+permission capture below establishes with the plugin composed.
 
 `mcp-stdio-rollback-live.jsonl` is the other half, and it is a hazard rather than a
 capability. The same element with a command that cannot start fails `session/new`
@@ -76,15 +80,64 @@ both varying reads on the shared restore path: which capability advertises the
 verb, and which verb is sent. Without membership a reopened session reads as
 "cannot restore" and silently starts fresh every time.
 
-## Why the permission frame is synthesized
+## What the permission capture establishes, and why it needed a plugin
 
-`session/request_permission` is a required class, and no capture produced one.
-That is a finding rather than a gap in the recording, and it is why this harness's
-routing is `Routing.UNVERIFIED` and why it is absent from
-`BASELINE_SELECTABLE_BACKENDS`.
+`session/request_permission` is a required class, and on this harness's own
+default composition nothing produces one. `permission-request-live.jsonl` is that
+class captured live -- and what makes it fire is Kiro Crew's gate plugin
+(`src/kiro_crew/agent_sdk/gate_extensions/deepseek/kiro_crew_tool_gate.mjs`)
+composed through the harness's own per-launch `--patch` overlay. The plugin
+answers the harness's `tools/pre-execute` waterfall with `{kind: 'ask'}`, its
+tools core resolves an `ask` through `ctx.approval`, and its ACP bridge answers
+that by emitting the frame.
 
-Four live captures were taken with the approval policy pinned to `ask`, across
-both of the harness's non-permissive sandbox postures:
+Two control runs are what make the plugin the CAUSE rather than a coincidence,
+and both were taken against the same prompt and the same locally served model:
+
+| Run | Plugin composed | Client answered | Permission frame | The `bash` command |
+|---|---|---|---|---|
+| the fixture | yes | `allow-once` | **sent** | ran, output `kiro-crew-gate-probe` |
+| negative control | **no** | -- | **none** | **ran anyway**, ungated |
+| deny control | yes | `reject-once` | **sent** | **never ran** -- `failed`, `Error: the user rejected tool "bash"` |
+
+The middle row is the gap this closes: with no plugin the harness runs the side
+effect and asks nobody. The third is the half a permissive gate would fail --
+denial reaches the tool, not just the transcript -- and it is the harness's own
+contract doing it rather than anything Crew re-implements: in its tools core every
+approval outcome other than `allowed-once` becomes a `deny`, and a missing
+approval service denies too.
+
+**What this fixture is, and is not.** It pins the WIRE SHAPE -- which frames the
+harness sends, in what order, carrying which fields -- and it was captured by
+driving the harness over stdio directly, without Crew's OS sandbox in the path.
+That is the same way the rest of this corpus was taken and it is the right scope
+for a replay fixture, but it is not evidence that a real session starts: the
+sandbox is what decides whether the gate's load marker can be written at all, and
+that question is settled by a test rather than by this file
+(`test_the_load_marker_is_never_written_into_a_sealed_leaf`, plus the
+marker-location reasoning in `agent-host-contract.md`). Read this fixture as
+"these are the frames", not as "a session is admitted".
+
+Two more things the capture establishes, both about what does NOT reach the gate.
+Every tool asks -- there is no name allowlist -- so a `read` produces a permission
+frame exactly as `bash` does; an earlier revision exempted the passive reads by
+name, which left this harness's own credential files reachable with no frame and
+therefore no sensitive-path check. And the composed patch pins the tool
+presentation to `native`, so a `run_code` call is answered `Error: unknown tool
+"run_code"`: under `ptc` the program inside it would reach Node's filesystem,
+network and subprocess APIs directly, which are not tool calls and which no
+`tools/pre-execute` listener can see.
+
+Read the frame's `toolCall` for what this harness does NOT send. It carries only
+`toolCallId` -- no title, no kind, no status, no `rawInput`. So the tool identity
+and arguments the host gate judges come from the `tool_call` update immediately
+before it, which is why the fixture keeps all three frames in wire order: the
+correlation between them is the fact being pinned, and it is the toolCallId-keyed
+cache `_dispatch.build_permission_event` already reads.
+
+What #10373 recorded about the harness's own behaviour still holds unchanged, and
+it is why the plugin is needed at all. Four live captures were taken then with the
+approval policy pinned to `ask`, across both non-permissive sandbox postures:
 
 | What the model called | Posture | What came back |
 |---|---|---|
@@ -95,14 +148,39 @@ both of the harness's non-permissive sandbox postures:
 
 None raised a permission request. The mechanism showed itself when the model
 guessed an extra argument and the harness answered `invalid escalation:
-sandbox_permissions requires a justification`: the approval seam is reached when
-the MODEL asks to escalate past the sandbox, not once per tool call. An in-policy
-action runs silently and an out-of-policy one is denied by the sandbox itself,
-with the denial in the tool result and a `status` of `completed`.
+sandbox_permissions requires a justification`: without a plugin the approval seam
+is reached when the MODEL asks to escalate past the sandbox, not once per tool
+call. An in-policy action runs silently and an out-of-policy one is denied by the
+sandbox itself, with the denial in the tool result and a `status` of `completed`.
 
-So the synthesized frame is written from the shape the harness's own protocol
-contract declares -- a one-shot allow/reject choice. It exists because the replay
-corpus requires the class. It is **not** evidence that this harness asks.
+One thing this fixture does *not* pin. It was observed on the ACP bridge
+reporting `agentInfo.version` 0.0.1, and nothing in this repository pins per-call
+emission across upgrades the way the load-marker read-back pins that the plugin
+loaded -- `agent-host-contract.md` records the version.
+
+## What the id-reuse capture establishes
+
+The shared gate tripwire (`acp/client_permissions.py`, `_tripwire_pi_gate` and
+`_note_pi_gate_asked`) consumes an id's ask and deny at that call's terminal frame,
+on the premise that a tool-call id is NOT unique for the life of a session.
+`tool-call-id-reuse-live.jsonl` is that premise captured rather than asserted. The
+model behind it was scripted to mint the same `tool_use` id, `call_0`, on the first
+response of every turn -- what an OpenAI-compatible provider that numbers ids per
+response does -- and the harness forwarded it unchanged: dsh's agent loop uses the
+provider's id as its own `callId` and dsh-acp emits that as `toolCallId`. So one
+session carries:
+
+```
+turn 1   tool_call call_0 -> session/request_permission call_0 -> tool_call_update call_0 completed
+         session/prompt result  stopReason=end_turn
+turn 2   tool_call call_0 -> session/request_permission call_0 -> tool_call_update call_0 completed
+```
+
+Two things follow, and both are what the tripwire rests on. An approval that
+outlived its call WOULD vouch for the next call wearing the same id, so the state
+has to be scoped to the call rather than to the session or the turn. And the
+second terminal frame for an id arrives only with that id's second call, so
+consuming at the terminal frame drops nothing a live call still needs.
 
 ## What was pruned, and by what
 

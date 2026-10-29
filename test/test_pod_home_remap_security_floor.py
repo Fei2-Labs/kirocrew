@@ -37,14 +37,14 @@ def _pin_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
     reads that one and never ``HOME`` -- pinning only ``HOME`` leaves the
     matcher anchored on the real runner profile there, which is what made these
     tests fail on the Windows shard while passing on Linux. Mirrors the autouse
-    fixture in ``test_pod.py``, which pins both for the same reason.
+    ``_isolate_pod_host_state`` in ``pod_helpers.py``, which pins both for the same reason.
 
     **The HOME-derived target cache in ``security`` is reset**, and that is what
     makes a pinned home actually reach the gate rather than only the environment.
     ``_home_targets_cache`` is TTL-bounded and keyed on the resolved roots, so it
-    does pick up a new home -- and it is the cache the rest of
-    ``test_security.py`` already clears by hand, which is the established seam this
-    follows.
+    does pick up a new home -- and it is the cache
+    ``test_security_sensitive_paths.py`` and ``test_security_keystone_leaves.py`` already clear
+    by hand, which is the established seam this follows.
 
     Nothing in production depends on the reset -- the gateway's own HOME does not
     move under it, and ``_apply_pod_home_remap`` changes only a CHILD's environment
@@ -192,7 +192,7 @@ class TestPodMintedGrantsAreFencedFromToolCalls:
     #
     # Consequence worth stating: a pod's posture is strictly NARROWER than the
     # non-pod baseline, where the standard tier leaves the REAL ~/.aws visible to
-    # tools (sandbox.py's _STANDARD_DIRS omits .aws so credential_process can
+    # tools (sandbox_tiers.py's _STANDARD_DIRS omits .aws so credential_process can
     # reach Bedrock auth). A pod denies the pod-local tree at the gate on top of
     # that. Red-first on the target set and on both separators.
     #
@@ -426,7 +426,7 @@ class TestTheStagedIdentityStoreIsFencedFromToolCalls:
 # command TEXT is still readable through an ``open()`` that never routes through
 # the tool gate, so the bash-text normalizer helpers
 # (``_windows_native_path_tokens`` / ``_check_sensitive_via_normalizer`` /
-# ``_win_anchor_roots``) do not exist; ``test_security.py``'s
+# ``_win_anchor_roots``) do not exist; ``test_security_bash_gate.py``'s
 # ``TestTraversalSimulationIsGone`` asserts they are ABSENT by name.
 #
 # The pod grant store's fence is carried by two layers, both pinned above:

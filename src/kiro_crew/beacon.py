@@ -45,7 +45,7 @@ So this module shares exactly one thing with the metrics trunk: the atomic
 create-once file pattern proven by ``handlers_system.py::_get_telemetry_salt``
 (``os.link`` for atomicity, owner-only mode, in-memory fallback). It reuses
 NONE of its state, config, or dependencies — ``urllib.request`` only (already
-used by ``embeddings.py``), so no new dependency.
+used by ``embeddings_download.py``), so no new dependency.
 
 PRIVACY:
   * The install id is a random UUID4 generated locally. It is derived from
@@ -187,6 +187,15 @@ try:
 except ImportError:
     _BAKED_DISTRIBUTION = ""
 
+# WEBSITE_TREE is a newer field of the same generated module: a _build_info.py
+# stamped before the bundle-freshness guard existed carries DISTRIBUTION but not
+# WEBSITE_TREE, so a missing name (which ``from ... import`` also raises as
+# ImportError) must not unbind _BAKED_DISTRIBUTION. Kept as its own import.
+try:
+    from ._build_info import WEBSITE_TREE as _BAKED_WEBSITE_TREE  # type: ignore[import-not-found]
+except ImportError:
+    _BAKED_WEBSITE_TREE = ""
+
 # Fallback when a version string carries no parseable release number.
 UNKNOWN_VERSION = "unknown"
 
@@ -256,6 +265,18 @@ def baked_distribution() -> str:
     """
     raw = str(_BAKED_DISTRIBUTION or "").strip().lower()
     return raw if raw in KNOWN_DISTRIBUTIONS else ""
+
+
+def baked_website_tree() -> str:
+    """Return the ``website/`` git tree id stamped into the package tree, or "".
+
+    Reads the module-level :data:`_BAKED_WEBSITE_TREE` (the seam tests patch) so
+    the dashboard bundle-freshness guard can compare the frontend source this
+    backend was packaged from against the one the served dist was built from.
+    Empty in a source checkout (no ``_build_info.py``) or when git was
+    unavailable at packaging time, in which case the guard skips silently.
+    """
+    return str(_BAKED_WEBSITE_TREE or "").strip()
 
 
 def distribution() -> str:

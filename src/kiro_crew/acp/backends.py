@@ -84,8 +84,8 @@ class Routing(str, Enum):
     ``permission: ask`` into the session work_dir and reads it back.
     UNVERIFIED: Kiro Crew has NOT established how (or whether) this adapter can
     be made to ask. The default for anything discovered through the registry.
-    Always resolves INDETERMINATE, so it refuses unless the operator sets the one
-    named opt-out. This member exists so that "we do not know" is a state the
+    Always resolves INDETERMINATE. This member exists so that "we do not know" is
+    a state the
     type system forces a caller to handle, rather than an absent case that falls
     through to a permissive branch.
     """
@@ -579,11 +579,12 @@ def descriptor_for_registry_adapter(
 
     Every field is the conservative answer, and that is the whole design:
 
-    - ``routing=Routing.UNVERIFIED`` so the tool gate resolves INDETERMINATE and
-      refuses the session unless the operator sets the one named opt-out. The
-      alternative — assuming an unknown adapter asks before running a tool — is
-      the exact failure this module exists to prevent, and it fails silently
-      because a gate that is never consulted raises nothing.
+    - ``routing=Routing.UNVERIFIED`` so the tool gate resolves INDETERMINATE. The
+      descriptor claims no permission route, and registry metadata alone cannot
+      make that adapter selectable. The alternative — assuming an unknown
+      adapter asks before running a tool — is the exact failure this module
+      exists to prevent, and it fails silently because a gate that is never
+      consulted raises nothing.
     - Every capability ``UNVERIFIED``. Nothing has been observed, which is not
       evidence that a feature is absent. Code gates still treat it as off while
       the UI says what is actually known.

@@ -1,8 +1,8 @@
-# Ship report: twice daily, summarize PRs merged into this repo as a short
+# Ship report: once daily, summarize PRs merged into this repo as a short
 # glanceable update (Bedrock), append the issues FILED in the same window, and
 # post the whole thing to the team Slack channel via an incoming webhook.
-# Schedule is 16:00 and 00:00 UTC = 9am and 5pm PDT
-# (8am/4pm in winter -- GitHub cron has no timezone support).
+# Schedule is 10:00 UTC = 3am PDT
+# (2am in winter -- GitHub cron has no timezone support).
 #
 # OUTBOUND AND INBOUND IN ONE POST, THREE SECTIONS. The shipping half is a
 # model-written narrative over merged PRs. The inbound half is split by AUDIENCE
@@ -17,7 +17,7 @@
 #
 # EVERY COUNT IS DETERMINISTIC; ONLY PROSE AND SELECTION ARE THE MODEL'S. The
 # bug / feature / other split and all the numbers come from real labels in
-# `Partition issues`. The model contributes the narratives and picks the
+# `Partition issues` (over at most the 101 issues `Fetch filed issues` reads). The model contributes the narratives and picks the
 # must-fix numbers, which are then intersected with the window's real issue
 # numbers -- so a number it invented, or was told to include by an issue body,
 # cannot reach the post.
@@ -27,7 +27,7 @@
 # window, so the next run re-covers its PRs and issues (at-least-once delivery).
 # Windows with neither a merged PR nor a filed issue succeed silently and advance
 # the window without posting. Backfill
-# is capped at 72h (covers two consecutive missed runs plus jitter).
+# is capped at 96h (covers two consecutive missed daily runs plus jitter).
 #
 # Degradation matrix (narrative degrades, delivery never silently drops):
 #   SHIP_REPORT_BEDROCK_ROLE_ARN secret unset  -> deterministic template body
@@ -53,7 +53,7 @@
 #   secrets.SHIP_REPORT_BEDROCK_ROLE_ARN     -- OIDC role, bedrock:InvokeModel only
 #   vars.SHIP_REPORT_BEDROCK_MODEL_ID        -- whitespace-separated model
 #                                               priority chain; first success
-#                                               wins (default Opus 5 -> Opus 4.8)
+#                                               wins (default Opus 5.5 -> Sonnet 5.5)
 #   vars.SHIP_REPORT_LINK_STYLE              -- mrkdwn (default) | plain; set
 #                                               plain when the webhook is a Slack
 #                                               Workflow Builder webhook, which
@@ -63,12 +63,11 @@ name: Ship Report
 
 on:
   schedule:
-    - cron: "0 16 * * *" # 9am PDT
-    - cron: "0 0 * * *" # 5pm PDT
+    - cron: "0 10 * * *" # 3am PDT
   workflow_dispatch:
     inputs:
       lookback_hours:
-        description: "Override window: report PRs merged in the last N hours"
+        description: "Override window: report PRs merged and issues filed in the last N hours"
         required: false
         default: ""
       dry_run:
@@ -89,7 +88,7 @@ concurrency:
 
 jobs:
   report:
-    runs-on: ubuntu-latest  # schedule/workflow_dispatch (and workflow_call inherited from a schedule caller) has no live collaborator actor for the AWS webhook allowlist to check -- stays on ubuntu-latest.
+    runs-on: ubuntu-latest  # schedule/workflow_dispatch has no live collaborator actor for the AWS webhook allowlist to check -- stays on ubuntu-latest.
     timeout-minutes: 10
     env:
       GH_TOKEN: ${{ github.token }}
@@ -120,7 +119,7 @@ jobs:
             START=""
             [ -z "$PREV" ] || START="$(date -u -d "$PREV - 10 minutes" +%Y-%m-%dT%H:%M:%SZ)"
             DEFAULT="$(date -u -d "$END - 24 hours" +%Y-%m-%dT%H:%M:%SZ)"
-            FLOOR="$(date -u -d "$END - 72 hours" +%Y-%m-%dT%H:%M:%SZ)"
+            FLOOR="$(date -u -d "$END - 96 hours" +%Y-%m-%dT%H:%M:%SZ)"
             [ -n "$START" ] || START="$DEFAULT"
             [ "$START" \> "$FLOOR" ] || START="$FLOOR"
           fi
@@ -158,12 +157,23 @@ jobs:
       # Slack Workflow Builder webhook shared with this report (which is why
       # SHIP_REPORT_LINK_STYLE is `plain` — that flavour renders <url|text>
       # literally). One post per issue would mean ~14 notifications a day into
-      # the channel this twice-daily digest already owns, under a workflow named
+      # the channel this daily digest already owns, under a workflow named
       # for shipping. Riding the digest costs nothing and reads correctly.
       # The per-issue, reporter-facing half lives in issue-summary.yml as a
       # comment on the issue itself.
+      - name: Check if issues are enabled
+        id: check_issues
+        run: |
+          set -euo pipefail
+          HAS_ISSUES="$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)"
+          echo "has_issues=$HAS_ISSUES" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_ISSUES" = "false" ]; then
+            echo "Issues are disabled on this repository; skipping issue fetch."
+          fi
+
       - name: Fetch filed issues
         id: issues
+        if: steps.check_issues.outputs.has_issues == 'true'
         env:
           START: ${{ steps.window.outputs.start }}
           END: ${{ steps.window.outputs.end }}
@@ -183,10 +193,19 @@ jobs:
           # Deliberately NOT a hard failure on overflow, unlike the 300-PR cap
           # above. Failing would withhold the whole report AND leave the window
           # unadvanced, so a quiet inbound spike would suppress the shipping
-          # half it has nothing to do with. The section truncates instead.
+          # half it has nothing to do with. The fetch stops at 101 issues, so
+          # in a bigger window every inbound count and list covers only the
+          # 101 fetched issues.
           if [ "$COUNT" -ge 100 ]; then
-            echo "::warning::100+ issues in this window; the section lists a subset"
+            echo "::warning::100+ issues in this window; counts and list are capped at the 101 fetched issues"
           fi
+
+      - name: Set zero issue count for disabled repos
+        if: steps.check_issues.outputs.has_issues == 'false'
+        run: |
+          echo "count=0" >> "$GITHUB_OUTPUT"
+          echo "Issues filed in window: 0 (issues disabled)"
+        id: issues_disabled
 
       # Gated on EITHER half having content, not on PRs alone. The issue
       # narrative is a separate model call that needs these same credentials, so
@@ -195,9 +214,9 @@ jobs:
       # promised narrative would always degrade to the fallback list.
       - name: Configure AWS credentials
         id: creds
-        if: (steps.fetch.outputs.count != '0' || steps.issues.outputs.count != '0') && env.HAS_BEDROCK
+        if: (steps.fetch.outputs.count != '0' || (steps.issues.outputs.count != '' && steps.issues.outputs.count != '0')) && env.HAS_BEDROCK
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.SHIP_REPORT_BEDROCK_ROLE_ARN }}
           aws-region: us-west-2
@@ -210,7 +229,7 @@ jobs:
           # Whitespace-separated priority list: first model that returns a
           # non-empty body wins; each failure is a warning, and total failure
           # drops to the deterministic template step.
-          MODEL_IDS: ${{ vars.SHIP_REPORT_BEDROCK_MODEL_ID || 'global.anthropic.claude-opus-5 global.anthropic.claude-opus-4-8' }}
+          MODEL_IDS: ${{ vars.SHIP_REPORT_BEDROCK_MODEL_ID || 'global.anthropic.claude-opus-5-5 global.anthropic.claude-sonnet-5-5' }}
         run: |
           set -euo pipefail
           if [ "$LINK_STYLE" = "plain" ]; then
@@ -218,7 +237,7 @@ jobs:
           else
             LINK_RULE="Reference a PR as <URL|#NUMBER> right after the clause describing it."
           fi
-          INSTRUCTIONS="You write a twice-daily ship update for the KiroCrew engineering Slack channel. \
+          INSTRUCTIONS="You write a daily ship update for the Kiro Crew engineering Slack channel. \
           Below is a JSON array of pull requests merged into $GITHUB_REPOSITORY during one reporting window. \
           Write a SHORT, glanceable update: 2 to 4 plain sentences, 70 words maximum. \
           Name only the 2 or 3 most significant changes. $LINK_RULE \
@@ -275,19 +294,14 @@ jobs:
             | join("\n")
           ' prs.json > body.txt
 
-      # Appended AFTER both narrative steps and BEFORE delivery, so issue titles
-      # pass through the same sanitizer as the PR half (they are untrusted the
-      # same way). This also creates body.txt when nothing merged: both narrative
-      # steps are gated on the PR count, so a window with only inbound issues
-      # would otherwise reach delivery with no body at all.
       # Split the window's issues into the two audiences BEFORE any model sees
-      # them. Precedence matters: 6 of today's 40 issues carry BOTH `bug` and
-      # `enhancement`, so a naive two-way split double-counts them. A defect is
+      # them. Precedence matters: an issue can carry BOTH `bug` and
+      # `enhancement`, so a naive two-way split double-counts it. A defect is
       # a defect -- `bug` or `security` wins, and `enhancement` only claims an
       # issue that has neither.
       - name: Partition issues
         id: partition
-        if: steps.issues.outputs.count != '0'
+        if: steps.issues.outputs.count != '' && steps.issues.outputs.count != '0'
         run: |
           set -euo pipefail
           jq '{
@@ -310,21 +324,19 @@ jobs:
       # a weak signal in one half dilute the other.
       #
       # RELEASE RISK IS INFERRED FROM TEXT, NOT FROM THE channel: LABEL.
-      # `channel: insider` and `channel: nightly` exist as labels and have never
-      # once been applied in this repository's history -- all 7 channel labels
-      # ever applied are `channel: stable`, because the label comes from
-      # bug_report.yml's dropdown and only 7 issues have ever arrived that way.
-      # Keying the "must fix before stable" list on that label would produce an
-      # empty list every day forever. The signal is really in the title and body
+      # Only the bug form and the dashboard's report flow set a `channel:`
+      # label, so many issues arrive without one, and keying the "must fix
+      # before stable" list on it would miss blockers. The signal is really in
+      # the title and body
       # ("rc.8 regression", "regression", "red on main"), which is a judgement,
       # which is why a model makes it. The label is still USED when present --
       # it is just not required.
       - name: Summarize issues (Bedrock)
         id: issue_narrative
-        if: steps.issues.outputs.count != '0' && env.HAS_BEDROCK && steps.creds.outcome == 'success'
+        if: steps.issues.outputs.count != '' && steps.issues.outputs.count != '0' && env.HAS_BEDROCK && steps.creds.outcome == 'success'
         continue-on-error: true
         env:
-          MODEL_IDS: ${{ vars.SHIP_REPORT_BEDROCK_MODEL_ID || 'global.anthropic.claude-opus-5 global.anthropic.claude-opus-4-8' }}
+          MODEL_IDS: ${{ vars.SHIP_REPORT_BEDROCK_MODEL_ID || 'global.anthropic.claude-opus-5-5 global.anthropic.claude-sonnet-5-5' }}
         run: |
           set -euo pipefail
           jq -r '[ .bugs[] | "#\(.number) \(.title | .[0:200]) [\([.labels[]?.name] | join(", "))]" ] | join("\n")' \
@@ -333,7 +345,7 @@ jobs:
             split.json > features.txt
 
           cat > issue-instructions.txt <<'PROMPT'
-          You write the inbound half of a twice-daily engineering update for the
+          You write the inbound half of a daily engineering update for the
           Kiro Crew repository. You are given the bugs and the feature requests filed in
           one reporting window. Answer with a single JSON object and nothing else.
 
@@ -409,8 +421,14 @@ jobs:
       #
       # Degrades to a deterministic label-grouped list, so a Bedrock outage
       # costs the prose but never the two-section split or the counts.
+      #
+      # Runs AFTER both narrative steps and BEFORE delivery, so issue titles
+      # pass through the same sanitizer as the PR half (they are untrusted the
+      # same way). It also creates body.txt when nothing merged: both narrative
+      # steps are gated on the PR count, so a window with only inbound issues
+      # would otherwise reach delivery with no body at all.
       - name: Append issue sections
-        if: steps.issues.outputs.count != '0'
+        if: steps.issues.outputs.count != '' && steps.issues.outputs.count != '0'
         run: |
           set -euo pipefail
           touch body.txt
@@ -516,14 +534,14 @@ jobs:
           fi
 
       - name: Deliver report
-        if: steps.fetch.outputs.count != '0' || steps.issues.outputs.count != '0'
+        if: steps.fetch.outputs.count != '0' || (steps.issues.outputs.count != '' && steps.issues.outputs.count != '0')
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_WEBHOOK_URLS_EXTRA: ${{ secrets.SLACK_WEBHOOK_URLS_EXTRA }}
           START: ${{ steps.window.outputs.start }}
           END: ${{ steps.window.outputs.end }}
           COUNT: ${{ steps.fetch.outputs.count }}
-          ICOUNT: ${{ steps.issues.outputs.count }}
+          ICOUNT: ${{ steps.issues.outputs.count != '' && steps.issues.outputs.count || steps.issues_disabled.outputs.count }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || '' }}
         run: |
           set -euo pipefail

@@ -13,6 +13,10 @@ import CommandBarOverlay from './CommandBarOverlay'
  * Row-level behaviour of the launcher: what a row DOES when activated, and what the
  * user is told when it does not work. `rootIndex.test.ts` covers ranking; these are
  * the assertions that need the component rendered.
+ *
+ * Commands an installed app contributes are tested in
+ * `CommandBarOverlay.contributedCommands.test.tsx`, which keeps its own copy of the
+ * mocks below: a `vi.mock` applies only to the file that calls it.
  */
 
 const dispatch = vi.fn()
@@ -32,6 +36,9 @@ const storeState: {
 vi.mock('../../store', () => ({
   useAppDispatch: () => dispatch,
   useAppSelector: (fn: (s: unknown) => unknown) => fn(storeState),
+  // The session rows read the active slot through a store HANDLE once their
+  // switch settles; the same fixture state answers that read.
+  useAppStore: () => ({ getState: () => storeState }),
 }))
 vi.mock('../../store/chatSlice', () => ({
   createSlot: (arg: unknown) => ({ type: 'createSlot', arg }),
@@ -58,6 +65,14 @@ vi.mock('../../components/commandPalette/providers/recentsProvider', async impor
   ...(await importOriginal<typeof import('../../components/commandPalette/providers/recentsProvider')>()),
   useRecentsProvider: () => ({ search: recentsSearch }),
 }))
+// Passed through, and watched: a settings row must be scored by the scorer the
+// other settings searches share, not by the bar's own field matcher.
+const scoreSettingEntry = vi.hoisted(() => ({ spy: null as null | ReturnType<typeof vi.fn> }))
+vi.mock('../../components/commandPalette/settingsSearchCore', async importOriginal => {
+  const real = await importOriginal<typeof import('../../components/commandPalette/settingsSearchCore')>()
+  scoreSettingEntry.spy = vi.fn(real.scoreSettingEntry)
+  return { ...real, scoreSettingEntry: (...args: Parameters<typeof real.scoreSettingEntry>) => scoreSettingEntry.spy!(...args) }
+})
 vi.mock('../../hooks/useVisualViewport', () => ({ useVisualViewport: () => ({ height: 800 }) }))
 vi.mock('../../hooks/useDialogFocusTrap', () => ({ useDialogFocusTrap: () => {} }))
 const cycleTheme = vi.fn()
@@ -109,6 +124,17 @@ function mountControllable(onClose = vi.fn()) {
 const rowByText = (text: string) =>
   screen.getByText(text).closest('[role="option"]') as HTMLElement
 
+/** The overlay's whole source: the facade and every owner beside it, the file
+ *  family `CommandBarOverlay.owners.test.tsx` pins. */
+const overlaySource = () =>
+  readdirSync(__dirname).filter(f => /^(?:use)?[Cc]ommandBarOverlay\w*\.tsx?$/.test(f)).sort()
+    .map(f => readFileSync(path.join(__dirname, f), 'utf-8')).join('\n')
+
+/** Mirrors the overlay's own query debounce (commandBarOverlayModel.ts DEBOUNCE_MS).
+ *  The latch-close/pointer tests advance a fake clock by this to settle the
+ *  debounced refetch deterministically instead of waiting on wall-clock time. */
+const DEBOUNCE_MS = 150
+
 /** The title the overlay renders for a settings entry — the shared resolver
  *  (localized + fan-out suffix), same as the component. */
 const renderedTitle = (entry: (typeof SETTINGS_REGISTRY)[number]) =>
@@ -153,6 +179,27 @@ describe('CommandBarOverlay rows', () => {
     expect(screen.getByRole('alert').textContent).toMatch(/Enter/)
   })
 
+  it('starts from the type-ahead the host caught, and Enter acts on it', async () => {
+    // Keys typed while the chunk loaded arrive as `initialQuery`. Without them the
+    // first render is the idle root, and Enter opens the newest Recent session.
+    resolvingDispatch()
+    const onClose = vi.fn()
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <CommandBarOverlay open onClose={onClose} initialQuery="New session" />
+      </QueryClientProvider>,
+    )
+    const input = screen.getByRole('combobox') as HTMLInputElement
+    expect(input.value).toBe('New session')
+    // The caret sits after the caught text, so the next key extends it.
+    expect(input.selectionStart).toBe('New session'.length)
+    expect(screen.getAllByRole('option')[0].textContent).toContain('New Session')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(onClose).toHaveBeenCalled())
+    expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: undefined })
+  })
+
   it('navigates to the new session so a success is visible off the chat page', async () => {
     // Created from Settings or Task Runner without this, the session lands off-screen
     // and the success reads as a failure -- the user runs it again into a duplicate.
@@ -193,6 +240,41 @@ describe('CommandBarOverlay rows', () => {
       expect(screen.getByText(s)).toBeTruthy()
     }
     expect(settingsTabLabel('computer-use')).not.toBe('computer-use')
+  })
+
+  it('withholds the settings rows the other searches withhold', () => {
+    // A browser window: About draws the gateway's switch and no app updater, so a
+    // row for the app switch would land on a tab with nothing to flash.
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'automatic' } })
+    const options = screen.getAllByRole('option').map(o => o.textContent ?? '')
+    expect(options.some(o => o.includes('Update the gateway automatically'))).toBe(true)
+    expect(options.some(o => o.includes('Install app updates automatically'))).toBe(false)
+  })
+
+  it('finds a settings row by the synonyms the other searches use', () => {
+    // "auto-update" is in neither switch's label; it is the name both shipped under.
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'auto-update' } })
+    const option = screen.getAllByRole('option').find(o => o.textContent?.includes('Update the gateway automatically'))
+    // The synonym that matched is drawn on the row, since neither its title nor
+    // its subtitle carries the word.
+    expect(option).toHaveTextContent('auto-update')
+  })
+
+  it('marks a settings row matched by its description in its subtitle', () => {
+    // In the description only: "Enterprise Grid org or workspace IDs to allow (starts with E or T). ..."
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'starts with E or T' } })
+    const option = screen.getAllByRole('option').find(o => o.textContent?.includes('Allowed enterprise orgs'))!
+    expect(option.querySelector('strong')?.textContent).toBe('starts with E or T')
+  })
+
+  it('scores settings rows with the scorer the other settings searches share', () => {
+    mount()
+    scoreSettingEntry.spy!.mockClear()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'automatic' } })
+    expect(scoreSettingEntry.spy).toHaveBeenCalledWith('automatic', expect.objectContaining({ id: 'about.update-the-gateway-automatically' }))
   })
 
   it('navigates and closes on a settings row', () => {
@@ -366,10 +448,7 @@ describe('CommandBarOverlay rows', () => {
     // install merely opening the root issued listInstances(). The provider is now
     // constructed inert and activated by entering the scope, and the assertion is on
     // the call site because the leak was the construction, not the search.
-    const src = readFileSync(
-      path.join(__dirname, 'CommandBarOverlay.tsx'),
-      'utf-8',
-    )
+    const src = overlaySource()
     expect(src).toContain("useSessionsProvider({ active: scope === 'sessions' })")
     expect(src).not.toMatch(/useSessionsProvider\(\{\s*\}\)/)
   })
@@ -415,10 +494,7 @@ describe('CommandBarOverlay rows', () => {
     // What it paints is a NEUTRAL hairline. An accent ring around the one element
     // that is always focused was the loudest thing on a surface whose visual weight
     // is supposed to sit on the selected row.
-    const src = readFileSync(
-      path.join(__dirname, 'CommandBarOverlay.tsx'),
-      'utf-8',
-    )
+    const src = overlaySource()
     expect(src).toContain("rowCount === 0 ? ' focus-visible:ring-1 focus-visible:ring-border-strong' : ''")
     expect(src).not.toContain('focus-visible:ring-accent/40\' : \'\'')
     // Unconditional forms are what produced the permanent box.
@@ -440,7 +516,7 @@ describe('CommandBarOverlay rows', () => {
     expect(rowByText('Toggle Theme').textContent).toContain('Command')
     // The arrow needs a slot on EVERY row: rendered inline it pushed a `view` row's
     // label left by its own width and the labels stopped sharing a right edge.
-    const src = readFileSync(path.join(__dirname, 'CommandBarOverlay.tsx'), 'utf-8')
+    const src = overlaySource()
     expect(src).toContain('shrink-0 w-[13px] flex justify-end')
   })
 
@@ -465,6 +541,265 @@ describe('CommandBarOverlay rows', () => {
     const before = sessionSearch.mock.calls.length
     fireEvent.mouseDown(row)
     await waitFor(() => expect(sessionSearch.mock.calls.length).toBeGreaterThan(before))
+  })
+
+  const hit = (title: string, onActivate: () => void) => ({
+    id: `sessions:${title}`,
+    providerId: 'sessions',
+    title,
+    icon: null,
+    score: 1,
+    indices: [],
+    onActivate,
+  })
+
+  it('latches an Enter pressed in the debounce window and fires it on the live rows', async () => {
+    // Every scoped view ranks from the DEBOUNCED query, so for one debounce interval
+    // after a keystroke its rows answer the previous query. An Enter in that window
+    // must never open the row selected against the OLD query, and must not be dropped:
+    // it is held and fired once the rows answer what the reader typed. Reported in the
+    // crewmates view; the latch is on the activation path all four views share.
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    // No debounce tick yet: the row on screen still answers `alpha`.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The stale row is never opened, not even for the instant before the rows catch up.
+    expect(openAlpha).not.toHaveBeenCalled()
+    // Once the rows answer `beta`, the LATCHED Enter fires on its own — no second press.
+    await waitFor(() => expect(openBeta).toHaveBeenCalled())
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch on Escape rather than firing it late', async () => {
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Escape steps out of the scope and must take the pending Enter with it.
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
+    // Let the debounce and any refetch settle: a surviving latch would fire here.
+    await waitFor(() => expect(screen.queryByText('Alpha planning')).toBeNull())
+    expect(openBeta).not.toHaveBeenCalled()
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the reader leaves the scope', async () => {
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Empty the field, then Backspace leaves the scope — the latch must not survive it.
+    fireEvent.change(input, { target: { value: '' } })
+    fireEvent.keyDown(input, { key: 'Backspace' })
+    await waitFor(() => expect(screen.queryByText('Search Sessions')).not.toBeNull())
+    expect(openBeta).not.toHaveBeenCalled()
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the bar closes', async () => {
+    const openAlpha = vi.fn()
+    const openBeta = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Alpha planning', openAlpha)])
+    const ctl = mountControllable()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Beta review', openBeta)])
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The bar closes under the pending Enter — reopening must not replay it. The debounce
+    // is the overlay's own setTimeout (DEBOUNCE_MS), so a fake clock drives it exactly:
+    // `shouldAdvanceTime` keeps real microtasks/`findBy*` flushing while advancing the
+    // timer deterministically settles the `beta` query — the window in which a latch that
+    // survived the close would wrongly fire on reopen, with no arbitrary wall-clock wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      act(() => ctl.rerender(false))
+      act(() => ctl.rerender(true))
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2)
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(openBeta).not.toHaveBeenCalled()
+    expect(openAlpha).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the catch-up fetch fails onto a retry dead end', async () => {
+    // The query the Enter is pressed against resolves to an error with no cached rows,
+    // so slot 0 is the synthesized `retry` row, not a result. The latch must drop on
+    // that dead end rather than fire it: firing the retry row would re-run the search,
+    // so the test counts search invocations — a latch that wrongly fired the dead end
+    // would drive a THIRD call, which makes this able to fail (it does not just rely on
+    // there being nothing to open).
+    const openAlpha = vi.fn()
+    sessionSearch.mockResolvedValueOnce([hit('Alpha planning', openAlpha)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('Alpha planning')).toBeTruthy()
+    const callsBeforeEnter = sessionSearch.mock.calls.length
+    // The query the Enter is pressed against fails: the on-screen `alpha` row is stale,
+    // and the failing `beta` key has no cached rows, so slot 0 becomes the retry row.
+    sessionSearch.mockRejectedValue(new Error('gateway down'))
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // The failure row appears; the latch must drop rather than fire on the dead end.
+    await screen.findByText('Search failed')
+    await act(async () => {
+      await new Promise(r => setTimeout(r, 0))
+    })
+    // Never opened the stale `alpha` row, and never fired the retry row (which would
+    // have re-run the search beyond the renders the user's own typing drove).
+    expect(openAlpha).not.toHaveBeenCalled()
+    expect(sessionSearch.mock.calls.length).toBe(callsBeforeEnter + 1)
+  })
+
+  it('drops the latch when the reader keeps typing after the Enter', async () => {
+    // 'onc' settles, then 'once' + Enter in the window confirms `once`; a further
+    // keystroke to `oncex` means the reader never confirmed what the rows now answer.
+    // A latch that committed whatever was typed next would open a query never
+    // confirmed, so a further keystroke drops it.
+    const openOncex = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Onc result', () => {})])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'onc' } })
+    expect(await screen.findByText('Onc result')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Oncex result', openOncex)])
+    // Enter lands in the window (rows still answer `onc`); then the reader types on.
+    fireEvent.change(input, { target: { value: 'once' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.change(input, { target: { value: 'oncex' } })
+    // Rows settle on `oncex`; the never-confirmed `oncex` row is not opened.
+    expect(await screen.findByText('Oncex result')).toBeTruthy()
+    await new Promise(r => setTimeout(r, 50))
+    expect(openOncex).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when the selection moves after the Enter', async () => {
+    // ArrowDown after a latched Enter aims at a different row. Firing row 0 regardless
+    // would open something the reader just moved off of, so a moved selection drops it.
+    const openTop = vi.fn()
+    const openSecond = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Top one', () => {}), hit('Top two', () => {})])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'top' } })
+    expect(await screen.findByText('Top one')).toBeTruthy()
+    sessionSearch.mockResolvedValue([
+      hit('Fresh top', openTop),
+      hit('Fresh second', openSecond),
+    ])
+    fireEvent.change(input, { target: { value: 'fresh' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Move the selection off row 0 while the latch is armed.
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    // Rows settle; the latch dropped, so neither row opens from the stale Enter.
+    expect(await screen.findByText('Fresh top')).toBeTruthy()
+    await new Promise(r => setTimeout(r, 50))
+    expect(openTop).not.toHaveBeenCalled()
+    expect(openSecond).not.toHaveBeenCalled()
+  })
+
+  it('drops the latch when a pointer activation keeps the bar open', async () => {
+    // A click acts on the row it is on, immediately. A latch left armed by a prior
+    // keyboard Enter would then fire a SECOND time once the rows caught up, so a
+    // pointer activation drops any pending Enter.
+    const openStale = vi.fn()
+    const openFresh = vi.fn()
+    sessionSearch.mockResolvedValue([hit('Stale row', openStale)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'stale' } })
+    expect(await screen.findByText('Stale row')).toBeTruthy()
+    sessionSearch.mockResolvedValue([hit('Fresh row', openFresh)])
+    fireEvent.change(input, { target: { value: 'fresh' } })
+    // Enter in the window arms the latch; then a click lands on the row still on
+    // screen, before the debounce settles.
+    fireEvent.keyDown(input, { key: 'Enter' })
+    fireEvent.mouseDown(rowByText('Stale row'))
+    // The click opened the row it was on, exactly once.
+    expect(openStale).toHaveBeenCalledTimes(1)
+    // Rows catch up to `fresh`: a surviving latch would fire openFresh here. The debounce
+    // is the overlay's own setTimeout (DEBOUNCE_MS), so advancing a fake clock settles the
+    // `fresh` refetch deterministically — `shouldAdvanceTime` keeps the microtask flush the
+    // flow needs — and that advance is the window in which a dropped-clear mutation would
+    // wrongly fire, with no arbitrary wall-clock wait.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(DEBOUNCE_MS * 2)
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(openFresh).not.toHaveBeenCalled()
+    expect(openStale).toHaveBeenCalledTimes(1)
+  })
+
+  it('drops the latch when the row under the captured index is a different row', async () => {
+    // The reader arrows off row 0 onto a lower row, then presses Enter in the window.
+    // If the new query is already cached its rows swap in under the same indices with
+    // no empty frame, so the index still points somewhere — at a row the reader never
+    // had highlighted. Firing it opens a stranger, the wrong-row hazard this latch
+    // exists to close, so a changed row identity at that index drops the latch.
+    const openA1 = vi.fn()
+    const openA2 = vi.fn()
+    const openB1 = vi.fn()
+    const openB2 = vi.fn()
+    // Settle `beta` first so its rows are cached and swap in without a fetch frame.
+    sessionSearch.mockResolvedValue([hit('B one', openB1), hit('B two', openB2)])
+    mount()
+    const input = screen.getByRole('combobox')
+    fireEvent.mouseDown(rowByText('Search Sessions'))
+    fireEvent.change(input, { target: { value: 'beta' } })
+    expect(await screen.findByText('B two')).toBeTruthy()
+    // Now settle `alpha`: the on-screen list is [A one, A two].
+    sessionSearch.mockResolvedValue([hit('A one', openA1), hit('A two', openA2)])
+    fireEvent.change(input, { target: { value: 'alpha' } })
+    expect(await screen.findByText('A two')).toBeTruthy()
+    // Type `beta` (its key is cached) and arrow onto the stale `A two` at index 1,
+    // then press Enter while the list still shows the alpha rows.
+    fireEvent.change(input, { target: { value: 'beta' } })
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // Rows swap to [B one, B two]; the row now at index 1 is `B two`, which the reader
+    // never selected. The latch must drop rather than open it.
+    expect(await screen.findByText('B two')).toBeTruthy()
+    await new Promise(r => setTimeout(r, 50))
+    expect(openB2).not.toHaveBeenCalled()
+    expect(openB1).not.toHaveBeenCalled()
+    expect(openA1).not.toHaveBeenCalled()
+    expect(openA2).not.toHaveBeenCalled()
   })
 
   it('leaves the sessions failure a row, with none of the artifacts scope notice', async () => {
@@ -533,10 +868,14 @@ describe('CommandBarOverlay rows', () => {
     const input = screen.getByRole('combobox')
     const footer = () =>
       (document.querySelector('[role="dialog"]') as HTMLElement).textContent ?? ''
+    let px = 0
     const selectRow = (title: string) => {
       const target = screen.getAllByRole('option').findIndex(o => o.textContent?.includes(title))
       expect(target).toBeGreaterThanOrEqual(0)
-      fireEvent.mouseEnter(screen.getAllByRole('option')[target])
+      // Hover selects on real pointer motion, so the pointer has to move across the row.
+      const row = screen.getAllByRole('option')[target]
+      fireEvent.mouseMove(row, { clientX: ++px, clientY: px })
+      fireEvent.mouseMove(row, { clientX: ++px, clientY: px })
     }
     selectRow('New Session')
     expect(footer()).toContain('Run')
@@ -544,6 +883,55 @@ describe('CommandBarOverlay rows', () => {
     selectRow('Search Sessions')
     expect(footer()).toContain('Open View')
     expect(input.getAttribute('aria-activedescendant')).toBeTruthy()
+  })
+
+  it('keeps the selection when rows re-render under a pointer that has not moved', () => {
+    // Re-ranking moves rows under a resting pointer, and the browser answers with
+    // mouseover, mouseenter and a mousemove at the same coordinates. None of that is
+    // the reader pointing at a row, so Enter must still act on the top match.
+    mount()
+    const input = screen.getByRole('combobox')
+    const active = () => input.getAttribute('aria-activedescendant')
+    const restOn = (row: HTMLElement) => {
+      fireEvent.mouseOver(row, { clientX: 700, clientY: 260 })
+      fireEvent.mouseEnter(row, { clientX: 700, clientY: 260 })
+      fireEvent.mouseMove(row, { clientX: 700, clientY: 260 })
+    }
+    restOn(screen.getAllByRole('option')[2])
+    fireEvent.change(input, { target: { value: 'new sess' } })
+    restOn(screen.getAllByRole('option')[1])
+    fireEvent.change(input, { target: { value: 'new session' } })
+    restOn(screen.getAllByRole('option')[1])
+    expect(active()).toBe('command-bar-row-0')
+    // Real motion across a row still selects it, which is what hover is for.
+    fireEvent.mouseMove(screen.getAllByRole('option')[1], { clientX: 704, clientY: 262 })
+    expect(active()).toBe('command-bar-row-1')
+  })
+
+  it.each([
+    ['a group header', () => screen.getAllByRole('option')[0].previousElementSibling as HTMLElement],
+    ['the backdrop', () => document.querySelector('[role="presentation"]') as HTMLElement],
+  ])('keeps the selection when the pointer stops on %s and the list re-ranks', (_, restTarget) => {
+    // The pointer crosses rows, then comes to rest somewhere that is not a row. The
+    // re-ranked list then puts a row under it, and the browser fires a mousemove there
+    // at the resting coordinates. Compared against the last ROW position, that would
+    // read as motion and select the row, so Enter would act on it instead of the top match.
+    mount()
+    const input = screen.getByRole('combobox')
+    const active = () => input.getAttribute('aria-activedescendant')
+    const rest = restTarget()
+    expect(rest).toBeTruthy()
+    fireEvent.mouseMove(screen.getAllByRole('option')[2], { clientX: 600, clientY: 300 })
+    fireEvent.mouseMove(screen.getAllByRole('option')[2], { clientX: 602, clientY: 302 })
+    expect(active()).toBe('command-bar-row-2')
+    fireEvent.mouseMove(rest, { clientX: 650, clientY: 340 })
+    fireEvent.change(input, { target: { value: 'new session' } })
+    expect(active()).toBe('command-bar-row-0')
+    const rows = screen.getAllByRole('option')
+    fireEvent.mouseOver(rows[1], { clientX: 650, clientY: 340 })
+    fireEvent.mouseEnter(rows[1], { clientX: 650, clientY: 340 })
+    fireEvent.mouseMove(rows[1], { clientX: 650, clientY: 340 })
+    expect(active()).toBe('command-bar-row-0')
   })
 
   it('shows the hidden alias that matched so no listed row is unexplained', () => {
@@ -571,7 +959,7 @@ describe('CommandBarOverlay rows', () => {
     expect(new Set(glyphs).size).toBe(3)
     // App rows resolve through the SAME chain the rail and the palette use; a second
     // copy of it is how one surface silently falls through to the generic outline.
-    const src = readFileSync(path.join(__dirname, 'CommandBarOverlay.tsx'), 'utf-8')
+    const src = overlaySource()
     expect(src).toContain('icon: appIcon(target)')
   })
 
@@ -579,7 +967,7 @@ describe('CommandBarOverlay rows', () => {
     // Same leak class as the sessions provider: a listing engine that fetches on
     // construction would put a request behind merely opening the root, which is the
     // one thing this surface promises not to do.
-    const src = readFileSync(path.join(__dirname, 'CommandBarOverlay.tsx'), 'utf-8')
+    const src = overlaySource()
     expect(src).toContain('enabled: listingArmed')
     expect(src).toMatch(/const listingArmed = scope === 'sessions' && !searchArmed/)
   })
@@ -603,23 +991,177 @@ describe('CommandBarOverlay rows', () => {
     // The column carries live state INSTEAD of a static kind word.
     expect(rows[0].textContent).not.toContain('Command')
     // Activating one switches to it, the same way every other surface opens a session.
+    // The row unwraps the dispatch (the composer is focused once the switch lands),
+    // so the mock answers with the thunk's shape.
+    resolvingDispatch()
     fireEvent.mouseDown(rows[0])
     expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'slot-a', announceOnMissing: true })
+  })
+
+  it('never drops a blocked session: past the cap a final row counts the rest and reveals them', () => {
+    // Eight sessions wait on the reader. The section keeps its cap of six so it stays
+    // a glance, but the seventh and eighth must not vanish from both groups: a row at
+    // the end says how many more are waiting, and pressing it shows every one.
+    storeState.dashboard.slots = Array.from({ length: 8 }, (_, i) => ({
+      key: `slot-${i}`,
+      title: `Blocked ${i}`,
+      pending_approval: true,
+      messages: 2,
+    }))
+    const onClose = mount()
+    const blockedTitles = () =>
+      screen.getAllByRole('option').map(r => r.textContent ?? '').filter(t => /Blocked \d/.test(t))
+    expect(blockedTitles()).toHaveLength(6)
+    const more = rowByText('+2 more blocked')
+    expect(more).toBeTruthy()
+    // It ends the section: the row right after it is no longer a blocked session.
+    const rows = screen.getAllByRole('option')
+    expect(rows.indexOf(more)).toBe(6)
+    fireEvent.mouseDown(more)
+    expect(blockedTitles()).toHaveLength(8)
+    expect(screen.queryByText('+2 more blocked')).toBeNull()
+    // Revealing is in place: the bar stays open and no session was switched to.
+    expect(onClose).not.toHaveBeenCalled()
+    expect(dispatch).not.toHaveBeenCalled()
   })
 
   it('shows no attention section when nothing is waiting on the user', () => {
     // A section that is always present is a section the user learns to skip; the whole
     // value of this one is that its presence means something. A RUNNING session is not
-    // waiting on anyone, so it must not be lifted here either.
+    // waiting on anyone, so it must not be lifted here either — it belongs to the
+    // recent group below, which is a switch list and makes no claim on the reader.
     storeState.dashboard.slots = [
       { key: 'slot-c', title: 'Refactor the parser', running: true, messages: 9 },
       { key: 'slot-d', title: 'Idle thread', messages: 3 },
     ]
     mount()
     expect(screen.queryByText('Needs You')).toBeNull()
-    expect(screen.queryByText('Refactor the parser')).toBeNull()
-    // The commands are back at the top where they were.
-    expect(screen.getAllByRole('option')[0].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    expect(screen.queryByText('Approve')).toBeNull()
+    expect(screen.queryByText('Answer')).toBeNull()
+    expect(rowByText('Refactor the parser')).toBeTruthy()
+  })
+
+  it('offers the sessions the reader was last in, newest first, above the commands', () => {
+    // The most common reason this surface is opened: get me back to what I was doing.
+    // It used to mean entering the sessions view and typing a name from memory, so the
+    // answer the store already held cost two steps and a recall.
+    storeState.dashboard.slots = [
+      { key: 'slot-old', title: 'Last week thread', messages: 3, last_activity_ts: 1_000 },
+      { key: 'slot-new', title: 'This morning thread', messages: 5, last_activity_ts: 3_000 },
+      { key: 'slot-mid', title: 'Yesterday thread', messages: 2, last_activity_ts: 2_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(screen.getByText('Recent sessions')).toBeTruthy()
+    // Order is the claim — recency, not the alphabet and not the frecency store.
+    expect(rows[0].textContent).toContain('This morning thread')
+    expect(rows[1].textContent).toContain('Yesterday thread')
+    expect(rows[2].textContent).toContain('Last week thread')
+    // Ahead of the commands, which keep their own block underneath.
+    expect(rows[3].textContent).toMatch(/New Session|Search Sessions|Toggle Theme/)
+    // A session row carries no static kind word; its column is for live state.
+    expect(rows[0].textContent).not.toContain('Command')
+    // Activating one switches to it, the same way every other surface opens a session.
+    resolvingDispatch()
+    fireEvent.mouseDown(rows[0])
+    expect(dispatch).toHaveBeenCalledWith({
+      type: 'switchSlot',
+      key: 'slot-new',
+      announceOnMissing: true,
+    })
+  })
+
+  it('caps the recent group at three, leaving the rest to the sessions view', () => {
+    // The group's value is that it needs no reading. A fourth row buys a little more
+    // coverage and spends that property, and the whole corpus is one row below.
+    storeState.dashboard.slots = Array.from({ length: 7 }, (_, i) => ({
+      key: `slot-${i}`,
+      title: `Thread ${i}`,
+      messages: 2,
+      last_activity_ts: 1_000 - i,
+    }))
+    mount()
+    const titles = screen.getAllByRole('option').map(r => r.textContent ?? '')
+    expect(titles.filter(t => /Thread \d/.test(t))).toHaveLength(3)
+    expect(titles[0]).toContain('Thread 0')
+    expect(screen.queryByText('Thread 3')).toBeNull()
+    expect(rowByText('Search Sessions')).toBeTruthy()
+  })
+
+  it('keeps a session out of the recent group when it is already in the one above', () => {
+    // A session waiting on the reader is on screen with its pill. A second, quieter
+    // copy of it three rows down adds nothing and makes the page look longer than the
+    // number of sessions it is actually about.
+    storeState.dashboard.slots = [
+      { key: 'slot-a', title: 'Deploy the pricing service', pending_approval: true, messages: 4, last_activity_ts: 3_000 },
+      { key: 'slot-b', title: 'Idle thread', messages: 2, last_activity_ts: 1_000 },
+    ]
+    mount()
+    expect(screen.getAllByText('Deploy the pricing service')).toHaveLength(1)
+    expect(rowByText('Idle thread')).toBeTruthy()
+  })
+
+  it('leaves an empty untitled session out of the recent group', () => {
+    // Switching into a blank chat is what New Session is for, and one blank row is
+    // indistinguishable from another — so they would fill the group with rows that
+    // cannot be told apart.
+    storeState.dashboard.slots = [
+      { key: 'slot-blank', title: 'New Session…', messages: 0, last_activity_ts: 9_000 },
+      { key: 'slot-real', title: 'Real thread', messages: 4, last_activity_ts: 1_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    expect(rows[0].textContent).toContain('Real thread')
+    // The New Session COMMAND is still there; what is absent is a session row for the
+    // blank slot, which would be a second row reading the same way.
+    expect(screen.getAllByText(/New Session/)).toHaveLength(1)
+  })
+
+  it('labels an untitled attention row "Untitled session", not its key (#20909)', () => {
+    storeState.dashboard.slots = [
+      { key: 'chat-4-1785440411', title: '', pending_approval: true, messages: 4 },
+      { key: 'slot-b', title: 'Draft the launch email', needs_input: true, messages: 2 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    const untitled = rows.find(r => r.textContent?.includes('Approve'))!
+    expect(untitled.textContent).toContain('Untitled session')
+    expect(untitled.textContent).not.toContain('chat-4-1785440411')
+    expect(rows.find(r => r.textContent?.includes('Answer'))!.textContent).toContain('Draft the launch email')
+    // Activation still targets the session's own key.
+    resolvingDispatch()
+    fireEvent.mouseDown(untitled)
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-4-1785440411', announceOnMissing: true })
+  })
+
+  it('labels an untitled recent row "Untitled session", not its key (#20910)', () => {
+    storeState.dashboard.slots = [
+      { key: 'chat-5-1785440411', title: '', messages: 3, last_activity_ts: 3_000 },
+      { key: 'slot-named', title: 'Named thread', messages: 2, last_activity_ts: 1_000 },
+    ]
+    mount()
+    const rows = screen.getAllByRole('option')
+    // Recency order is unchanged: the untitled, newer session still leads.
+    expect(rows[0].textContent).toContain('Untitled session')
+    expect(rows[0].textContent).not.toContain('chat-5-1785440411')
+    expect(rows[1].textContent).toContain('Named thread')
+    resolvingDispatch()
+    fireEvent.mouseDown(rows[0])
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-5-1785440411', announceOnMissing: true })
+  })
+
+  it('still finds an untitled session row by its key once the key is no longer shown', () => {
+    storeState.dashboard.slots = [
+      { key: 'chat-5-1785440411', title: '', messages: 3, last_activity_ts: 3_000 },
+      { key: 'chat-6-1785440411', title: '', pending_approval: true, messages: 2 },
+    ]
+    mount()
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'chat-5-1785440411' } })
+    const hit = screen.getAllByRole('option').find(r => r.textContent?.includes('Untitled session'))
+    expect(hit).toBeTruthy()
+    resolvingDispatch()
+    fireEvent.mouseDown(hit!)
+    expect(dispatch).toHaveBeenCalledWith({ type: 'switchSlot', key: 'chat-5-1785440411', announceOnMissing: true })
   })
 
   it('always gives the typed text a way to reach an agent', async () => {
@@ -672,7 +1214,7 @@ describe('CommandBarOverlay rows', () => {
     // a long tool name collapsed the title on a 320px viewport, inverting that. Only
     // the pill and the dot stay unshrinkable -- they are the signal and a few pixels
     // wide -- and the detail drops outright below the `sm` breakpoint.
-    const src = readFileSync(path.join(__dirname, 'CommandBarOverlay.tsx'), 'utf-8')
+    const src = overlaySource()
     const accessory = src.slice(src.indexOf('function statusAccessory'))
     const body = accessory.slice(0, accessory.indexOf('\n}\n'))
     expect(body).not.toMatch(/shrink-0 flex items-center/)
@@ -799,7 +1341,7 @@ describe('CommandBarOverlay rows', () => {
     // a 1440 screen, which is the one thing that column exists to prevent. The
     // entrance is the shell's standard scale-in because a launcher that hard-cuts into
     // place reads as a repaint rather than as a surface arriving.
-    const src = readFileSync(path.join(__dirname, 'CommandBarOverlay.tsx'), 'utf-8')
+    const src = overlaySource()
     expect(src).toContain('max-w-[680px]')
     expect(src).not.toContain('max-w-xl')
     expect(src).toContain('animate-scale-in')
@@ -809,16 +1351,14 @@ describe('CommandBarOverlay rows', () => {
 
 
 /**
- * Commands contributed by an installed app — the seam that lets a launcher row live
- * outside this repository.
+ * What the root list looks like once the reader has typed.
  *
- * What is worth pinning here is not that a row renders. It is that the host stays in
- * charge of a declaration it did not write: a malformed contribution is skipped
- * rather than taking the Cmd+K gesture down for every app, an argument is checked
- * against the app's own pattern BEFORE a session exists, and a command that sends
- * its prompt shows the reader that prompt first.
+ * Group order is the idle page's filing order — the product decision about what a
+ * launcher OPENS on. A query is a different question, so these pin the two halves:
+ * a typed query is one list ranked by match, and the section headers that name the
+ * blocks go with the blocks.
  */
-describe('CommandBarOverlay contributed commands', () => {
+describe('CommandBarOverlay root ordering under a query', () => {
   beforeEach(() => {
     dispatch.mockReset()
     navigate.mockReset()
@@ -828,8 +1368,6 @@ describe('CommandBarOverlay contributed commands', () => {
     recentsSearch.mockResolvedValue([])
     enterInsertOrNewSession.mockReset()
     newSessionWithToken.mockReset()
-    cycleTheme.mockReset()
-    fileSessionInCommandFolder.mockClear()
     storeState.dashboard = { slots: [], unreadSlots: [] }
     storeState.chat = { slotStatusDetail: {}, activeSlot: null }
     window.localStorage.clear()
@@ -840,768 +1378,104 @@ describe('CommandBarOverlay contributed commands', () => {
     vi.restoreAllMocks()
   })
 
-  const LINK = 'https://github.com/kirodotdev/KiroCrew/pulls?q=is%3Aopen'
-
-  /** A well-formed argument-taking command, as an app would declare it. */
-  const APPROVE_ALL = {
-    id: 'approve-all',
-    title: 'Approve all PRs',
-    subtitle: 'Approve every pull request behind a link',
-    icon: 'Check',
-    keywords: ['pr', 'lgtm'],
-    prompt: 'Approve every pull request behind {argument}. Skip any I authored.',
-    autoSend: true,
-    argument: {
-      placeholder: 'Paste a GitHub link…',
-      hint: 'A PR search, a label, or a single pull request.',
-      kind: 'url',
-      hosts: ['github.com'],
-      patternError: 'Not a GitHub link.',
-    },
+  /** The app the reader is typing toward, as the apps API returns it. */
+  const DEV_FLEET = {
+    name: 'dev-fleet',
+    displayName: 'Dev Fleet',
+    enabled: true,
+    origin: 'registry',
+    manifest: { ui: { pages: [{ label: 'Dev Fleet', route: '/apps/dev-fleet' }] } },
   }
 
-  /** A command that needs nothing: activating it IS the action. */
-  const STANDUP = {
-    id: 'standup',
-    title: 'Write my standup',
-    prompt: 'Summarise what I did yesterday.',
-  }
-
-  const appWith = (commands: unknown, over: Record<string, unknown> = {}) => ({
+  /** A DIFFERENT app, contributing the command that used to outrank it. */
+  const PR_BULK_OPS = {
     name: 'pr-bulk-ops',
     displayName: 'PR Bulk Ops',
     enabled: true,
     origin: 'registry',
-    manifest: { contributes: { commands } },
-    ...over,
-  })
+    manifest: {
+      contributes: {
+        commands: [
+          {
+            id: 'approve-merge-all',
+            title: 'Approve and merge all PRs',
+            subtitle:
+              'Merge every ready pull request behind a link, approving first where allowed',
+            prompt: 'Approve and merge every ready pull request.',
+          },
+        ],
+      },
+    },
+  }
 
-  /** Mount with the shared `['apps']` cache seeded, which is how the bar reads apps. */
-  function mountWithApps(apps: unknown[], onClose = vi.fn()) {
+  function mountWith(apps: unknown[]) {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
     client.setQueryData(['apps'], apps)
     render(
       <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
+        <CommandBarOverlay open onClose={vi.fn()} />
       </QueryClientProvider>,
     )
-    return onClose
   }
 
-  const optionByTitle = (re: RegExp) =>
-    screen.getAllByRole('option').find(el => re.test(el.textContent ?? '')) as HTMLElement
-
-  function enterCommand(title: RegExp) {
-    fireEvent.mouseDown(optionByTitle(title))
-    return screen.getByRole('combobox') as HTMLInputElement
-  }
-
-  it('renders a command an installed app contributed', () => {
-    mountWithApps([appWith([APPROVE_ALL])])
-    const row = optionByTitle(/Approve all PRs/)
-    expect(row).toBeTruthy()
-    // The app's own subtitle, so the row says which app put it there.
-    expect(row.textContent).toContain('Approve every pull request behind a link')
-  })
-
-  it('contributes nothing while the app is disabled', () => {
-    // The enable switch is the reader's control over the whole app; a row that still
-    // ran from a disabled app would make that switch a lie.
-    mountWithApps([appWith([APPROVE_ALL], { enabled: false })])
-    expect(optionByTitle(/Approve all PRs/)).toBeUndefined()
-  })
-
-  it('skips a malformed contribution without taking the launcher down', () => {
-    // A third party must not be able to break the Cmd+K gesture for every other app.
-    mountWithApps([
-      appWith([
-        { ...APPROVE_ALL, id: 'Approve_All' }, // id is not a kebab slug
-        { ...APPROVE_ALL, id: 'no-prompt', prompt: '' },
-        { ...APPROVE_ALL, id: 'bad-kind', argument: { ...APPROVE_ALL.argument, kind: 'regex' } },
-        { ...APPROVE_ALL, id: 'bad-hosts', argument: { kind: 'text', hosts: ['github.com'] } },
-        { ...APPROVE_ALL, id: 'orphan-token', argument: undefined },
-        STANDUP,
-      ]),
-    ])
-    // Every bad entry is gone; the good one in the same array still renders.
-    expect(optionByTitle(/Approve all PRs/)).toBeUndefined()
-    expect(optionByTitle(/Write my standup/)).toBeTruthy()
-    // And the builtin rows are untouched.
-    expect(optionByTitle(/New Session/)).toBeTruthy()
-  })
-
-  it('survives contributes.commands not being an array', () => {
-    mountWithApps([appWith({ approve: APPROVE_ALL })])
-    expect(optionByTitle(/New Session/)).toBeTruthy()
-  })
-
-  it('namespaces a contributed row so it cannot impersonate a builtin', () => {
-    // A contribution claiming the New Session id would otherwise inherit its
-    // frecency record and its place in the list.
-    mountWithApps([appWith([{ ...APPROVE_ALL, id: 'new-session' }])])
-    const rows = screen.getAllByRole('option').map(el => el.textContent ?? '')
-    expect(rows.filter(t => /New Session/.test(t))).toHaveLength(1)
-    expect(optionByTitle(/Approve all PRs/)).toBeTruthy()
-  })
-
-  it('does not lead the empty query with a command that needs an argument', () => {
-    // A launcher pre-highlights its first row, and a row that cannot act until it is
-    // given a value has nothing to offer a bar that just opened.
-    mountWithApps([appWith([APPROVE_ALL])])
-    expect(screen.getAllByRole('option')[0].textContent ?? '').not.toMatch(/Approve all PRs/)
-  })
-
-  it('the first Enter collects the argument instead of acting', () => {
-    resolvingDispatch()
-    mountWithApps([appWith([APPROVE_ALL])])
-    enterCommand(/Approve all PRs/)
-    expect(screen.queryAllByRole('option')).toHaveLength(0)
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
-    expect(navigate).not.toHaveBeenCalled()
-  })
-
-  it('runs a command with no argument straight away', () => {
-    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
-    mountWithApps([appWith([STANDUP])])
-    enterCommand(/Write my standup/)
-    expect(dispatch).toHaveBeenCalledWith({
-      type: 'createSlot',
-      arg: { activate: false, memory_mode: 'persistent' },
-    })
-  })
-
-  it("files the session it opened under the command's own folder", async () => {
-    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
-    mountWithApps([appWith([STANDUP])])
-    enterCommand(/Write my standup/)
-    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
-    const [slotKey, folderName] = fileSessionInCommandFolder.mock.calls[0] as unknown as [
-      string,
-      string,
-    ]
-    expect(slotKey).toBe('slot-new')
-    // The row's own title, so a second command lands in a folder of its own rather
-    // than sharing one with every other row this app contributed.
-    expect(folderName).toBe('Write my standup')
-  })
-
-  it('files an argument-taking command under its title too', async () => {
-    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-approve' }) })
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(fileSessionInCommandFolder).toHaveBeenCalled())
-    expect(fileSessionInCommandFolder.mock.calls[0]?.[1]).toBe('Approve all PRs')
-  })
-
-  it('files nothing when the seed was abandoned mid-flight', async () => {
-    // The prompt never became a message, so there is no session worth filing -- and a
-    // folder named after a command that did not run is worse than an unfiled session.
-    let resolveSlot: (v: unknown) => void = () => {}
-    dispatch.mockReturnValue({ unwrap: () => new Promise(res => (resolveSlot = res)) })
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    client.setQueryData(['apps'], [appWith([STANDUP])])
-    const onClose = vi.fn()
-    const view = render(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    enterCommand(/Write my standup/)
-    // Dismissed while the create is still in flight, which revokes the run's claim.
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open={false} onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    await act(async () => {
-      resolveSlot({ key: 'slot-abandoned' })
-      await Promise.resolve()
-    })
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: STANDUP.prompt })
-    expect(fileSessionInCommandFolder).not.toHaveBeenCalled()
-  })
-
-  it("refuses a value the app's own pattern rejects, creating nothing", async () => {
-    resolvingDispatch()
-    const onClose = mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: 'https://gitlab.com/g/p/-/merge_requests/1' } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    // The app supplies the message, because only the app knows what shape it wanted.
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('Not a GitHub link.'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
-    expect(onClose).not.toHaveBeenCalled()
-    expect(input.value).toBe('https://gitlab.com/g/p/-/merge_requests/1')
-  })
-
-  it('refuses to fire a command whose app was disabled while the field was open', async () => {
-    // The field stays open across an arbitrary pause -- the reader is pasting a link --
-    // and the app can be switched off from the Apps page in another tab meanwhile. The
-    // row disappears at once, but the command object captured when the field opened
-    // would not, so a snapshot-trusting submit would run the prompt of an app the
-    // reader had just disabled.
-    resolvingDispatch()
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
-    const onClose = vi.fn()
-    const view = render(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-
-    // The app is disabled underneath the open argument field.
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL], { enabled: false })])
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
+  /** The section headers the list is rendering, top to bottom. */
+  const renderedHeaders = () =>
+    Array.from(document.querySelectorAll('div.uppercase.tracking-wide.text-muted')).map(
+      el => el.textContent ?? '',
     )
 
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
-    await waitFor(() =>
-      expect(screen.getByRole('alert').textContent).toContain('no longer available'),
-    )
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
+  const rowIndex = (re: RegExp) =>
+    screen.getAllByRole('option').findIndex(el => re.test(el.textContent ?? ''))
+
+  it('puts the app the reader is spelling out above a command that only matched its subtitle', () => {
+    // The reported bug. `dev fle` scores the Dev Fleet app 216 and this contributed
+    // command 60 — the command's own title does not match at all, only its subtitle —
+    // and the command was still shown first, because `commands` files before `apps`.
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'dev fle' } })
+    const app = rowIndex(/Dev Fleet/)
+    const command = rowIndex(/Approve and merge all PRs/)
+    // Both rows are on screen: the command still matches, it just ranks below.
+    expect(app).toBeGreaterThanOrEqual(0)
+    expect(command).toBeGreaterThan(app)
   })
 
-  it('refuses to send a prompt that differs from the one it previewed', async () => {
-    // Re-resolving at submit fixed a stale snapshot firing after its app was disabled,
-    // but the preview still renders the snapshot -- so an app whose prompt changes while
-    // the field is open would have the reader consenting to one instruction and sending
-    // another. The preview refreshes and nothing goes out; the next Enter acts on what is
-    // now on screen.
-    resolvingDispatch()
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
-    const onClose = vi.fn()
-    const view = render(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-
-    // The app rewrites the prompt underneath the open field.
-    client.setQueryData(['apps'], [
-      appWith([{ ...APPROVE_ALL, prompt: 'Delete every branch behind {argument}.' }]),
-    ])
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('changed'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
-    // The refreshed preview shows the new text, so the next Enter is informed.
-    expect(screen.getByText(/Delete every branch behind https/)).toBeTruthy()
-  })
-
-  it('revokes an in-flight activation when the argument state is left', async () => {
-    // Escape abandons the question but leaves the bar open, so the close-edge and unmount
-    // revokes never fire. Without a revoke here, a slow session create started by Enter
-    // resolves afterwards and seeds an auto-sent session the reader already cancelled.
-    //
-    // Only `createSlot` is held. Holding every dispatch would stall the chain at
-    // `switchSlot` and the test would pass whether or not the revoke works — which is
-    // exactly what the first version of it did.
-    let release: ((v: unknown) => void) | undefined
-    dispatch.mockImplementation((action: { type?: string }) => ({
-      unwrap: () =>
-        action?.type === 'createSlot'
-          ? new Promise(r => {
-              release = r
-            })
-          : Promise.resolve('ok'),
-    }))
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-
-    // Step back out while the create is still in flight, then let it land.
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Escape' })
-    release?.({ key: 'slot-new' })
-    await waitFor(() => expect(release).toBeDefined())
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
-    expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
-  })
-
-  it('keeps the fresh slot selected through its own 404 so the seed cannot land elsewhere', async () => {
-    // `switchSlot.rejected` treats a 404 as "target is gone" and restores the slot it
-    // came from (#6309). Without `keepTargetOnMissing`, a create/fetch race on the slot
-    // just created would put the reader back in their PREVIOUS conversation and then
-    // auto-send a bulk instruction into it.
-    dispatch.mockImplementation((action: { type?: string }) => ({
-      unwrap: () =>
-        action?.type === 'switchSlot'
-          ? Promise.reject(Object.assign(new Error('not found'), { status: 404 }))
-          : Promise.resolve({ key: 'slot-new' }),
-    }))
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-
-    await waitFor(() =>
-      expect(dispatch).toHaveBeenCalledWith({
-        type: 'switchSlot',
-        key: 'slot-new',
-        keepTargetOnMissing: true,
-      }),
-    )
-    // The rejection is survivable: the seed still happens, on the slot just created.
-    await waitFor(() =>
-      expect(dispatch).toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.stringContaining(LINK) }),
-    )
-  })
-
-  it('abandons an in-flight seed when its app is disabled during session creation', async () => {
-    // `owned()` tracks the dialog's lifetime and cannot see this: disabling the app from
-    // the Apps page while the create is still awaiting leaves the run legitimately owned
-    // and the command gone, so the disabled app's prompt would still be sent.
-    let release: ((v: unknown) => void) | undefined
-    dispatch.mockImplementation((action: { type?: string }) => ({
-      unwrap: () =>
-        action?.type === 'createSlot'
-          ? new Promise(r => {
-              release = r
-            })
-          : Promise.resolve('ok'),
-    }))
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
-    const onClose = vi.fn()
-    const view = render(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-
-    // The app is disabled while the create is still in flight, then the create lands.
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL], { enabled: false })])
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    release?.({ key: 'slot-new' })
-    await waitFor(() => expect(release).toBeDefined())
-    await Promise.resolve()
-    await Promise.resolve()
-    await Promise.resolve()
-
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
-    expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
-  })
-
-  it('refuses to send when a broadened matcher means no preview was ever shown', async () => {
-    // The preview is withheld until the value validates. If the app widens its matcher
-    // while the field is open, the reader has been looking at a rejection and never saw a
-    // preview, while the live matcher now passes -- and the prompt itself is unchanged, so
-    // comparing prompts cannot catch it.
-    resolvingDispatch()
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
-    const onClose = vi.fn()
-    const view = render(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    const input = enterCommand(/Approve all PRs/)
-    // Refused by the declared url+github.com matcher, so no preview renders.
-    fireEvent.change(input, { target: { value: 'https://gitlab.com/g/p/-/merge_requests/1' } })
-    expect(screen.queryByText(/Approve every pull request behind https/)).toBeNull()
-
-    // The app widens the matcher to plain text, which would accept that value.
-    client.setQueryData(['apps'], [
-      appWith([{ ...APPROVE_ALL, argument: { kind: 'text' } }]),
-    ])
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
-    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('changed'))
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
-  })
-
-  it('a stale activation does not clear a live one\'s duplicate-run guard', async () => {
-    // `pendingRow` is what makes a second Enter a no-op while a create is in flight.
-    // Cleared unconditionally, a STALE run wipes a LIVE one's: revoke during create A,
-    // start create B, then let A resolve -- A's finally would release B's guard and the
-    // next Enter would start a second create for the same intent, which with autoSend is
-    // a duplicate session that sends.
-    const releases: Array<(v: unknown) => void> = []
-    dispatch.mockImplementation((action: { type?: string }) => ({
-      unwrap: () =>
-        action?.type === 'createSlot'
-          ? new Promise(r => releases.push(r))
-          : Promise.resolve('ok'),
-    }))
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(releases).toHaveLength(1))
-
-    // Revoke A (Escape out of the argument state), then start B. The pasted link stays in
-    // the box as the root query, so clear it before the row is matchable again.
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Escape' })
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: '' } })
-    const again = enterCommand(/Approve all PRs/)
-    fireEvent.change(again, { target: { value: LINK } })
-    fireEvent.keyDown(again, { key: 'Enter' })
-    await waitFor(() => expect(releases).toHaveLength(2))
-
-    // A resolves late. It must not release B's guard. Wrapped in `act` so the state
-    // update from the promise callback is flushed before the next keystroke reads it --
-    // without that the handler closure still sees the pre-clear value and the test
-    // cannot tell the two behaviours apart.
-    await act(async () => {
-      releases[0]({ key: 'slot-a' })
-      await Promise.resolve()
-      await Promise.resolve()
-    })
-
-    // A third Enter while B is still in flight must start no further create.
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
-    await Promise.resolve()
-    expect(releases).toHaveLength(2)
-  })
-
-  it('refuses an over-cap value instead of sending a truncated prefix', async () => {
-    // The field carried `maxLength` for one round, which made the BROWSER clip a paste to
-    // the cap before `onChange` -- so a 2001-character value arrived as a valid-looking
-    // 2000-character prefix and was sent. That is the silent truncation this module
-    // refuses to do, and it had been reintroduced one layer below the check that refuses
-    // it. The validator must see the whole value.
-    resolvingDispatch()
-    mountWithApps([appWith([{ ...APPROVE_ALL, argument: { kind: 'text' } }])])
-    const input = enterCommand(/Approve all PRs/)
-    // The load-bearing assertion. The behavioural half below CANNOT catch a regression
-    // here: `fireEvent.change` assigns `.value` directly, which bypasses jsdom's
-    // maxlength enforcement, so re-adding the attribute leaves every behavioural
-    // expectation passing. Asserting the attribute is absent is what actually guards it.
-    expect(input.getAttribute('maxLength')).toBeNull()
-    const oversized = 'x'.repeat(2001)
-    fireEvent.change(input, { target: { value: oversized } })
-
-    // The whole value stays in the field -- nothing clipped it on the way in.
-    expect(input.value).toHaveLength(2001)
-    // No preview, because the value does not validate.
-    expect(screen.queryByText(/WILL SEND/i)).toBeNull()
-
-    fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy())
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) })
-  })
-
-  it('shows the resolved prompt before an auto-sending command fires', async () => {
-    // The consent mechanism for autoSend: app-authored text goes to an agent with
-    // tools as if the reader typed it, so the reader is shown the instruction with
-    // their own value already spliced in.
-    resolvingDispatch()
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    await waitFor(() => expect(screen.getByText(/Approve every pull request behind https/)).toBeTruthy())
-    expect(screen.getByText(/Skip any I authored/)).toBeTruthy()
-  })
-
-  describe('the clipped-preview cue', () => {
-    // jsdom does no layout: `scrollHeight` and `clientHeight` are both 0, so
-    // `scrollHeight > clientHeight + 1` is `0 > 1` and the cue's branch is UNREACHABLE
-    // in a test that does not stub the metrics. That is why it shipped with no coverage
-    // at all, and why its only evidence was a screenshot -- one that happens to show a
-    // prompt clipped mid-sentence with no cue in the frame. Stubbing the two properties
-    // is what makes the safety cue testable rather than merely asserted.
-    const stubMetrics = (scrollHeight: number, clientHeight: number) => {
-      const proto = HTMLPreElement.prototype
-      const original = {
-        scrollHeight: Object.getOwnPropertyDescriptor(proto, 'scrollHeight'),
-        clientHeight: Object.getOwnPropertyDescriptor(proto, 'clientHeight'),
-      }
-      Object.defineProperty(proto, 'scrollHeight', { configurable: true, value: scrollHeight })
-      Object.defineProperty(proto, 'clientHeight', { configurable: true, value: clientHeight })
-      return () => {
-        for (const [key, desc] of Object.entries(original)) {
-          if (desc) Object.defineProperty(proto, key, desc)
-          else delete (proto as unknown as Record<string, unknown>)[key]
-        }
-      }
+  it('names a recent session in its own column once the headers are gone', () => {
+    // The headers are what named a recent row, and `kindLabel` deliberately returns
+    // nothing for one (its column belongs to live state). An IDLE session has no live
+    // state either, so under a query the row would be a glyph and a title while every
+    // row beside it still showed its word. The group's own name stands in there.
+    storeState.dashboard = {
+      slots: [{ key: 'chat-7', title: 'Fleet notes', messages: 4, running: false }],
+      unreadSlots: [],
     }
-
-    it('warns when the instruction continues out of sight', async () => {
-      const restore = stubMetrics(500, 160)
-      try {
-        resolvingDispatch()
-        mountWithApps([appWith([APPROVE_ALL])])
-        const input = enterCommand(/Approve all PRs/)
-        fireEvent.change(input, { target: { value: LINK } })
-        await waitFor(() => expect(screen.getByText(/Scroll to read the rest/)).toBeTruthy())
-      } finally {
-        restore()
-      }
-    })
-
-    it('stays silent when the whole instruction is visible', async () => {
-      // The converse, so the cue cannot pass by always warning -- which would train the
-      // reader to ignore the one line that means the tail is hidden.
-      const restore = stubMetrics(120, 160)
-      try {
-        resolvingDispatch()
-        mountWithApps([appWith([APPROVE_ALL])])
-        const input = enterCommand(/Approve all PRs/)
-        fireEvent.change(input, { target: { value: LINK } })
-        await waitFor(() =>
-          expect(screen.getByText(/Approve every pull request behind https/)).toBeTruthy(),
-        )
-        expect(screen.queryByText(/Scroll to read the rest/)).toBeNull()
-      } finally {
-        restore()
-      }
-    })
-
-    it('re-measures when the box changes, not only when the text does', async () => {
-      // The effect's deps are the previewed CONTENT, so on its own it cannot notice the
-      // box shrinking: narrow the viewport and a prompt that fitted starts clipping with
-      // the cue absent -- and with autoSend, Enter then sends a tail never shown. That is
-      // the unsafe direction, so the box itself is observed. jsdom supplies no
-      // ResizeObserver, so it is stubbed the way the rest of this repo stubs it.
-      const callbacks: Array<() => void> = []
-      class FakeResizeObserver {
-        constructor(cb: () => void) {
-          callbacks.push(cb)
-        }
-        observe = vi.fn()
-        unobserve = vi.fn()
-        disconnect = vi.fn()
-      }
-      const originalRO = globalThis.ResizeObserver
-      globalThis.ResizeObserver = FakeResizeObserver as unknown as typeof ResizeObserver
-      // Starts fitting, so the cue is correctly absent.
-      let restoreMetrics = stubMetrics(120, 160)
-      try {
-        resolvingDispatch()
-        mountWithApps([appWith([APPROVE_ALL])])
-        const input = enterCommand(/Approve all PRs/)
-        fireEvent.change(input, { target: { value: LINK } })
-        await waitFor(() =>
-          expect(screen.getByText(/Approve every pull request behind https/)).toBeTruthy(),
-        )
-        expect(screen.queryByText(/Scroll to read the rest/)).toBeNull()
-        expect(callbacks.length).toBeGreaterThan(0)
-
-        // The box now overflows with the TEXT UNCHANGED, which only the observer can see.
-        restoreMetrics()
-        restoreMetrics = stubMetrics(500, 160)
-        await act(async () => {
-          for (const cb of callbacks) cb()
-        })
-        expect(screen.getByText(/Scroll to read the rest/)).toBeTruthy()
-      } finally {
-        restoreMetrics()
-        globalThis.ResizeObserver = originalRO
-      }
-    })
-
-    it('gives the preview a keyboard stop, so the scroll instruction is followable', async () => {
-      // Structural, not behavioural, and deliberately so: jsdom does not scroll, so no
-      // behavioural test can show a keyboard user reaching the tail. The defect was that
-      // the cue said "scroll to read the rest" while the box was a scroll container with
-      // no tab stop -- unreachable without a mouse, on the surface that carries consent.
-      const restore = stubMetrics(500, 160)
-      try {
-        resolvingDispatch()
-        mountWithApps([appWith([APPROVE_ALL])])
-        const input = enterCommand(/Approve all PRs/)
-        fireEvent.change(input, { target: { value: LINK } })
-        await waitFor(() => expect(screen.getByText(/Scroll to read the rest/)).toBeTruthy())
-        const preview = screen.getByRole('region', { name: /will send/i })
-        expect(preview.getAttribute('tabIndex')).toBe('0')
-        // The name matters as much as the stop: a bare focusable block is a silent halt.
-        expect(preview.getAttribute('aria-labelledby')).toBeTruthy()
-      } finally {
-        restore()
-      }
-    })
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    // Idle page: the header above the row says it, so the column stays empty.
+    const idleRow = screen.getAllByRole('option').find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(idleRow).toBeTruthy()
+    expect(renderedHeaders()).toContain('Recent sessions')
+    expect(idleRow?.textContent).not.toContain('Recent sessions')
+    // Under a query the header is gone and the row carries the name instead.
+    fireEvent.change(input, { target: { value: 'fleet' } })
+    expect(renderedHeaders()).toEqual([])
+    const queriedRow = screen
+      .getAllByRole('option')
+      .find(el => /Fleet notes/.test(el.textContent ?? ''))
+    expect(queriedRow).toBeTruthy()
+    expect(queriedRow?.textContent).toContain('Recent sessions')
   })
 
-  it('names the contributing app in the row meta, where a subtitle cannot hide it', () => {
-    // `subtitle || appLabel` meant an app that wrote its own subtitle left the root row
-    // visually identical to a builtin -- same badge, same shape -- while its prompt goes
-    // to an agent with tools. An argument-less command never reaches the argument state
-    // either, so provenance could go unanswered end to end. The meta column is the one
-    // place in the root list that can carry it.
-    resolvingDispatch()
-    mountWithApps([appWith([{ id: 'standup', title: 'Zzstandup', prompt: 'Summarise' }])])
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'zzstandup' } })
-    // The composed meta, not a bare app-name match: with no subtitle the fallback renders
-    // the app name too, so a loose matcher would pass on the subtitle alone and prove
-    // nothing about the meta column this fix is about.
-    // The VALIDATED identifier, not the fixture's `displayName`: provenance never comes
-    // from a field the app chooses, or it could claim to be the host.
-    expect(screen.getByText(`pr-bulk-ops \u00B7 Command`)).toBeTruthy()
-  })
-
-  it('names the contributing app even when the app wrote its own subtitle', () => {
-    // `subtitle || appLabel` meant any app that supplied a subtitle displaced the only
-    // mention of who authored the prompt -- and this is the step right before that prompt
-    // goes to an agent with tools, so a third-party instruction read as a native one.
-    resolvingDispatch()
-    mountWithApps([appWith([APPROVE_ALL])])
-    enterCommand(/Approve all PRs/)
-    expect(screen.getByText(APPROVE_ALL.subtitle)).toBeTruthy()
-    expect(screen.getByText('pr-bulk-ops')).toBeTruthy()
-  })
-
-  it.each(['__proto__', 'constructor', 'toString'])(
-    'renders a row whose icon names the inherited key %s',
-    (icon) => {
-      // Measured, not assumed: with a plain `CONTRIBUTED_ICONS[name] ?? fallback`, only
-      // `__proto__` actually throws -- "Objects are not valid as a React child" -- and it
-      // throws while BUILDING the row list, so the whole overlay goes down on every open
-      // rather than that one row degrading. `constructor` and `toString` return FUNCTIONS,
-      // which are equally not-nullish and equally never the intended glyph, but which this
-      // React version tolerates rather than rejecting; they are covered here because the
-      // lookup being wrong is the defect, not because they crash today. `icon` is
-      // deliberately unvalidated past being a string, so any name reaches this line.
-      resolvingDispatch()
-      mountWithApps([appWith([{ ...APPROVE_ALL, icon }])])
-      expect(screen.getByText(/Approve all PRs/)).toBeTruthy()
-    },
-  )
-
-  it('does not promise a view for a row that opens none', () => {
-    // Uses an ARGUMENT-LESS contributed command, which is the shape the label was most
-    // wrong for: its Enter creates a seeded session, so "Open View" named something that
-    // does not happen at all. It also makes the selection deterministic -- a unique query
-    // leaves this row selected at index 0, and the footer names the SELECTED row, so
-    // without that the assertion would read whatever row happened to be first and pass
-    // for the wrong reason. Asserting the old label is ABSENT is the half that guards
-    // against reverting to the view row's shared key, since any correct label satisfies
-    // the positive check.
-    resolvingDispatch()
-    mountWithApps([
-      appWith([{ id: 'standup', title: 'Zzstandup', prompt: 'Summarise yesterday' }]),
-    ])
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'zzstandup' } })
-    expect(screen.queryByText('Open View')).toBeNull()
-    expect(screen.getByText('Continue')).toBeTruthy()
-  })
-
-  it('withholds the preview until the value satisfies the pattern', () => {
-    // A half-built template would advertise text that is not what would be sent.
-    // Asserted on a phrase unique to the PROMPT: the subtitle shares its opening
-    // words, so a looser matcher is satisfied by copy that is always on screen.
-    resolvingDispatch()
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: 'https://gitl' } })
-    expect(screen.queryByText(/Skip any I authored/)).toBeNull()
-  })
-
-  it('seeds the resolved prompt and sends it when the app asked to', async () => {
-    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
-    const onClose = mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ type: 'createSlot', arg: expect.objectContaining({ activate: false }) }))
-    await waitFor(() =>
-      expect(dispatch).toHaveBeenCalledWith({
-        type: 'switchSlot',
-        key: 'slot-new',
-        keepTargetOnMissing: true,
-      }),
-    )
-    const seeded = dispatch.mock.calls.map(c => c[0]).find(a => a?.type === 'setPendingInput')
-    expect(seeded.text).toBe(`Approve every pull request behind ${LINK}. Skip any I authored.`)
-    // `autoSend=1` and NOT `newSession=1`: the session already exists.
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/chat?autoSend=1'))
-    expect(onClose).toHaveBeenCalled()
-  })
-
-  it('leaves a non-auto-sending command in the composer', async () => {
-    dispatch.mockReturnValue({ unwrap: () => Promise.resolve({ key: 'slot-new' }) })
-    mountWithApps([appWith([{ ...APPROVE_ALL, autoSend: false }])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/chat'))
-  })
-
-  it('Escape leaves the command before it closes the bar', () => {
-    resolvingDispatch()
-    const onClose = mountWithApps([appWith([APPROVE_ALL])])
-    enterCommand(/Approve all PRs/)
-    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
-    expect(onClose).not.toHaveBeenCalled()
-    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' })
-    expect(onClose).toHaveBeenCalled()
-  })
-
-  it('Backspace on an empty field leaves the command too', () => {
-    resolvingDispatch()
-    const onClose = mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.keyDown(input, { key: 'Backspace' })
-    expect(onClose).not.toHaveBeenCalled()
-    expect(screen.getAllByRole('option').length).toBeGreaterThan(0)
-  })
-
-  it('refuses a second Enter while the first is still creating', () => {
-    let release: ((v: unknown) => void) | undefined
-    dispatch.mockReturnValue({ unwrap: () => new Promise(r => { release = r }) })
-    mountWithApps([appWith([APPROVE_ALL])])
-    const input = enterCommand(/Approve all PRs/)
-    fireEvent.change(input, { target: { value: LINK } })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    fireEvent.keyDown(input, { key: 'Enter' })
-    expect(dispatch.mock.calls.filter(c => c[0]?.type === 'createSlot')).toHaveLength(1)
-    release?.({ key: 'slot-new' })
-  })
-
-  it('seeds nothing when the bar is dismissed mid-create', async () => {
-    let release: ((v: unknown) => void) | undefined
-    dispatch.mockReturnValue({ unwrap: () => new Promise(r => { release = r }) })
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    client.setQueryData(['apps'], [appWith([APPROVE_ALL])])
-    const onClose = vi.fn()
-    const view = render(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    fireEvent.mouseDown(optionByTitle(/Approve all PRs/))
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: LINK } })
-    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
-    view.rerender(
-      <QueryClientProvider client={client}>
-        <CommandBarOverlay open={false} onClose={onClose} />
-      </QueryClientProvider>,
-    )
-    release?.({ key: 'slot-new' })
-    await Promise.resolve()
-    expect(dispatch).not.toHaveBeenCalledWith({ type: 'setPendingInput', text: expect.anything() })
-    expect(navigate).not.toHaveBeenCalledWith('/chat?autoSend=1')
+  it('drops the group headers while a query ranks the list, and restores them when it clears', () => {
+    mountWith([DEV_FLEET, PR_BULK_OPS])
+    const input = screen.getByRole('combobox')
+    expect(renderedHeaders()).toContain('Commands')
+    fireEvent.change(input, { target: { value: 'dev fle' } })
+    // One ranked list: a group can now appear, be left and appear again, so a header
+    // per transition would print the same word twice over rows it does not describe.
+    expect(renderedHeaders()).toEqual([])
+    // The headers belong to the idle page, so clearing the query brings them back.
+    fireEvent.change(input, { target: { value: '' } })
+    expect(renderedHeaders()).toContain('Commands')
   })
 })

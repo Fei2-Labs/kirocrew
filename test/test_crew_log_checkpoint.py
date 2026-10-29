@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import itertools
 import json
-import time
 from typing import Any
 
 import pytest
@@ -24,6 +24,7 @@ from kiro_crew.crew_log import checkpoint as savepoints
 from kiro_crew.crew_log import lease
 from kiro_crew.crew_log import projection as crew_log
 from kiro_crew.crew_log import store
+from kiro_crew.projection import checkpoint as projection_checkpoint
 
 SESSION = "s-savepoint"
 GATEWAY = "gateway"
@@ -57,6 +58,33 @@ def _turn_items(turn: int) -> list[dict[str, Any]]:
                 "provider": "kiro",
                 "credits": 0.5,
                 "tokens": {"input": 100, "output": 20, "cache_read": 5, "cache_write": 1},
+            },
+        },
+    ]
+
+
+def _tool_pair(call_id: str, name: str = "fs_read") -> list[dict[str, Any]]:
+    """One tool call and its completion, so the ``tools`` fold gains a per-name row."""
+    return [
+        {
+            "type": "tool/called",
+            "data": {
+                "name": name,
+                "server": "builtin",
+                "kind": "read",
+                "call_id": call_id,
+                "turn": 3,
+            },
+        },
+        {
+            "type": "tool/completed",
+            "data": {
+                "name": name,
+                "server": "builtin",
+                "call_id": call_id,
+                "status": "ok",
+                "elapsed_ms": 7,
+                "turn": 3,
             },
         },
     ]
@@ -128,6 +156,20 @@ def _every_fold_items() -> list[dict[str, Any]]:
                 "turn": 3,
             },
         },
+        # The two non-turn spenders, so the digest covers `usage`'s credit buckets
+        # rather than only its turn path. Without these the pin would keep passing
+        # while the subagent and background arithmetic changed underneath it.
+        {"type": "subagent/spawned", "data": {"turn": 3, "agent_id": "sub-1"}},
+        {"type": "subagent/completed", "data": {"agent_id": "sub-1", "ms": 7, "credits": 1.0}},
+        {"type": "subagent/spawned", "data": {"turn": 3, "agent_id": "sub-2"}},
+        {
+            "type": "subagent/failed",
+            "data": {"agent_id": "sub-2", "outcome": "stopped", "ms": 3, "credits": 0.25},
+        },
+        {
+            "type": "background/completed",
+            "data": {"kind": "title", "model": "haiku", "credits": 0.5, "ms": 20},
+        },
     ]
 
 
@@ -137,29 +179,45 @@ def _state_digest(state: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
-#: What each fold STORES over the script above, recorded at
-#: :data:`_DIGESTS_RECORDED_AT_VERSION`. A fold whose meaning changes while its
-#: keys do not moves its digest here, which is what obliges the version bump that
-#: retires savepoints written by the older build.
-_FOLD_STATE_DIGESTS: dict[str, str] = {
-    "status": "4d24a49402b82428",
-    "usage": "c56df0d14126410f",
-    "timeline": "ca89b3c765575d9a",
-    "tools": "008b36fed498d32b",
-    "approvals": "c9db629215cc2620",
-    "class": "96f8e5381997f6fd",
-}
-
-#: The savepoint version the digests above were taken at.
+#: What each fold STORES over the script above, and the version its state was recorded
+#: at. A fold whose meaning changes while its keys do not moves its digest here, which
+#: is what obliges the bump of THAT FOLD's ``state_version`` -- the number that retires
+#: savepoints written by the older build.
 #:
-#: A fold ADDED to :data:`PROJECTION_NAMES` lands its digest here without moving the
-#: version, and that is not a way around the bump: the version retires savepoints
-#: that would resume onto changed meaning, and a new fold has none on any disk --
-#: ``_checkpoint_from`` matches a file to a fold by NAME, so no file on disk claims
-#: to be this one. Bumping for a new fold would instead retire every VALID savepoint
-#: of the other folds, costing each a refold to retire nothing. What obliges the bump
-#: is an EXISTING fold's digest moving, and the five above are unchanged.
-_DIGESTS_RECORDED_AT_VERSION = 3
+#: The version is per fold because the retirement is: a file carries the version of the
+#: fold it holds, so bumping ``usage`` retires ``usage``'s savepoints and leaves every
+#: other fold's standing. A pair recorded here is therefore a claim about one fold
+#: alone, and a change to one fold obliges exactly one pair to move.
+#:
+#: A fold ADDED to :data:`PROJECTION_NAMES` lands its pair here at the base version
+#: without a bump, and that is not a way around one: the version retires savepoints that
+#: would resume onto changed meaning, and a new fold has none on any disk --
+#: ``_resume_one`` matches a file to a fold by NAME, so no file on disk claims to be
+#: this one. What obliges a bump is an EXISTING fold's digest moving.
+#:
+#: Every pair stands at 4, which is where the folds arrived together: ``usage`` stores a
+#: credit bucket per source, so a savepoint written at 3 describes different meaning, and
+#: ``status``, ``timeline`` and ``class`` moved with it because the script above grew the
+#: entries that reach those buckets and a fold retaining a seq or a moment sees them. From
+#: here a bump is one fold's own, which is the whole point of the pair. ``subagents`` is the
+#: fold that exercises that: it stands three past the base, and every sibling stays at 4, so
+#: retiring its savepoints costs a cold fold to that fold alone. Its third step is the one
+#: that gave its rows what the Subagents panel needs to rebuild a card from this fold --
+#: ``task`` and ``started_ms``, plus a per-row ``dismissed`` flag
+#: -- which arrived together and bump the version once, because the
+#: number retires savepoints written under the shape before it and the shape changed once.
+_FOLD_STATE_PINS: dict[str, tuple[str, int]] = {
+    "status": ("929af8634f6d6a5f", 4),
+    "usage": ("502f1d8eda19fb9f", 15),
+    "timeline": ("4f461179faff39a3", 5),
+    "tools": ("008b36fed498d32b", 4),
+    "approvals": ("c9db629215cc2620", 4),
+    "subagents": ("698287ed09ff8981", 7),
+    "class": ("1eb292eff34fd7d9", 4),
+    "outline": ("9cc1e74d9957469f", 6),
+    "otel_usage": ("0bad643b5ea85012", 7),
+    "otel_session_tree": ("712a2be72f4195b7", 4),
+}
 
 
 def _log(unit_id: str = SESSION) -> CrewLog:
@@ -210,14 +268,66 @@ def _files(unit_id: str = SESSION) -> list[str]:
     return sorted(child.name for child in directory.iterdir()) if directory.is_dir() else []
 
 
+#: How this module's tests name a savepoint's fields, against where the kernel's
+#: envelope stores them. The envelope nests: the facts that must MATCH this log go in
+#: an ``identity`` block, the digest a later read re-checks goes in a ``witness``, and
+#: the seq the state stands at is the kernel's ``watermark``. ``v`` here is the FOLD's
+#: stored shape (``state_version``), the one number a build changing a fold has to move;
+#: the envelope's own ``v`` belongs to the kernel and no test here touches it.
+#:
+#: A field maps to SEVERAL routes when the envelope stores it more than once, and
+#: ``seq`` is the one that does: the watermark the state resumes at and the boundary
+#: the witness certifies are the same number, and a payload where they disagree is
+#: refused. A test setting ``seq`` means both, exactly as it did when there was one.
+_PAYLOAD_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "v": (("state_version",),),
+    "fold": (("key",),),
+    "seq": (("watermark",), ("witness", "seq")),
+    "state": (("state",),),
+    "unit": (("identity", "unit"),),
+    "origin": (("identity", "origin"),),
+    "first_seq": (("identity", "first_seq"),),
+    "prefix_sha": (("witness", "prefix_sha"),),
+    "prefix_records": (("witness", "prefix_records"),),
+}
+
+
 def _payload(name: str, unit_id: str = SESSION) -> dict[str, Any]:
-    return json.loads(savepoints.checkpoint_path(lg.KIND_SESSION, unit_id, name).read_text())
+    """One savepoint's fields, named as :data:`_PAYLOAD_FIELDS` names them."""
+    raw = json.loads(savepoints.checkpoint_path(lg.KIND_SESSION, unit_id, name).read_text())
+    flat: dict[str, Any] = {}
+    for field, routes in _PAYLOAD_FIELDS.items():
+        cursor: Any = raw
+        for step in routes[0]:
+            if not isinstance(cursor, dict) or step not in cursor:
+                cursor = None
+                break
+            cursor = cursor[step]
+        else:
+            flat[field] = cursor
+    return flat
 
 
 def _write_payload(name: str, payload: dict[str, Any], unit_id: str = SESSION) -> None:
+    """*payload* written back into the envelope the kernel reads.
+
+    A field left OUT of *payload* is left out of the file, which is what lets a test
+    delete one and check that the savepoint is refused for want of it.
+    """
     path = savepoints.checkpoint_path(lg.KIND_SESSION, unit_id, name)
+    raw: dict[str, Any] = {"v": projection_checkpoint.PAYLOAD_VERSION}
+    for field, routes in _PAYLOAD_FIELDS.items():
+        if field not in payload:
+            continue
+        for route in routes:
+            cursor = raw
+            for step in route[:-1]:
+                cursor = cursor.setdefault(step, {})
+            cursor[route[-1]] = payload[field]
+    raw.setdefault("identity", {})
+    raw.setdefault("witness", {})
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.write_text(json.dumps(raw), encoding="utf-8")
 
 
 def _cold_bundle(
@@ -280,21 +390,26 @@ def _drop_the_log(unit_id: str = SESSION) -> None:
 def _recreate_distinctly(turns: int, unit_id: str = SESSION) -> CrewLog:
     """Replace the unit's log with a new one of *turns* turns, distinguishably.
 
-    The pause is the load-bearing part. A log's identity combines its header's
-    ``created_at`` -- stamped in epoch MILLISECONDS -- with the file's device and
-    inode, so a log deleted and recreated inside one millisecond onto a recycled
-    inode is indistinguishable from the original. Recreating immediately in a
-    scratch directory hits exactly that: the same millisecond is likely and the
-    just-freed inode is commonly handed straight back, which made these tests pass
-    or fail with the run's timing. Waiting past a millisecond tick makes the
-    identity differ by construction, so what the test measures is the guard rather
-    than the clock. The narrow collision itself is a property of the identity these
-    tests do not own.
+    A log's identity combines its header's ``created_at`` -- stamped in epoch
+    MILLISECONDS -- with the file's device and inode, so a log deleted and recreated
+    inside one clock tick onto a recycled inode is indistinguishable from the
+    original. Recreating immediately in a scratch directory hits exactly that: the
+    same tick is likely and the just-freed inode is commonly handed straight back,
+    which made these tests pass or fail with the run's timing. A pause cannot be
+    sized to cross a tick everywhere -- ``time.time`` steps about 15.6 ms on Windows
+    CPython through 3.12 -- so the new log's stamps are SET instead, counting up from
+    one past the dropped log's own: the identity differs by construction, and what
+    the test measures is the guard rather than the clock. The narrow collision
+    itself is a property of the identity these tests do not own.
     """
-    time.sleep(0.003)
+    dropped = store.unit_header_created_at(lg.KIND_SESSION, unit_id)
+    assert dropped is not None, "there is no log to recreate"
     _drop_the_log(unit_id)
-    fresh = _log(unit_id)
-    _grow(fresh, turns)
+    stamps = itertools.count(dropped + 1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, "now_ms", lambda: next(stamps))
+        fresh = _log(unit_id)
+        _grow(fresh, turns)
     return fresh
 
 
@@ -337,7 +452,7 @@ def test_a_folded_session_writes_one_savepoint_per_fold():
     assert payload["fold"] == "status"
     assert payload["seq"] == handle.last_seq
     assert payload["unit"] == SESSION
-    assert payload["v"] == savepoints.CHECKPOINT_VERSION
+    assert payload["v"] == crew_log.fold_state_version("status")
     assert payload["first_seq"] == 1
     assert payload["origin"] == crew_log.log_origin(handle)
     # The state is the fold's own bookkeeping, not the rendered value: that
@@ -417,6 +532,42 @@ def test_a_resumed_fold_equals_a_cold_fold(monkeypatch):
     # And it resumed rather than re-read the file: the pass started after the
     # savepoint, which is the whole point of writing one.
     assert seen == [saved_through + 1]
+
+
+def _canonical(projection: crew_log.Projection) -> str:
+    """One projection as canonical JSON, so two answers are compared as BYTES.
+
+    Comparing dicts lets an int and a float that are equal pass for each other, and a
+    resumed fold that turned a count into a float is exactly the kind of drift a
+    savepoint can introduce -- the state round-trips through JSON while a cold fold's
+    never leaves memory.
+    """
+    return json.dumps(projection.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+@pytest.mark.parametrize("name", crew_log.SESSION_FOLD_NAMES)
+def test_a_resumed_fold_is_byte_identical_to_a_cold_fold(name, monkeypatch):
+    """Per fold, one at a time: savepoint plus tail IS the whole-file answer.
+
+    :func:`test_a_resumed_fold_equals_a_cold_fold` asks this of the panel bundle
+    folded together. This asks it of each fold on its own, including ``class``, and
+    compares canonical JSON rather than dicts -- a fold whose state survives a JSON
+    round trip must come back as the same bytes, not merely as an equal value.
+
+    The read is asserted to have STARTED after the savepoint, because a cold fold
+    reaches the same value and would hide a savepoint that was silently rejected.
+    """
+    handle = _long_log()
+    crew_log.fold_session(SESSION, (name,))
+    saved_through = _payload(name)["seq"]
+    _grow(handle, 5, first=_LONG_TURNS + 1)
+
+    cold = _cold_bundle((name,))
+    seen = _spy_on_reads(monkeypatch)
+    resumed = crew_log.fold_session(SESSION, (name,))
+
+    assert _canonical(resumed.projection(name)) == _canonical(cold.projection(name))
+    assert seen == [saved_through + 1], "the read folded cold instead of resuming"
 
 
 def test_a_read_after_a_restart_resumes_from_disk(monkeypatch):
@@ -533,6 +684,131 @@ def test_a_savepoint_past_the_end_of_the_log_is_ignored():
     assert resumed.projection("status").value["turns_completed"] == _LONG_TURNS
 
 
+def test_a_savepoint_malformed_below_its_top_level_is_discarded_and_folded_cold():
+    """State the shape check admits and the FOLD cannot use retires itself.
+
+    ``_state_matches_fold`` reads a state's top level, so a nested tool row holding a
+    number where a list belongs is admitted: ``by_name`` is still a dict. The failure
+    lands inside the fold instead, on the first tool entry above the watermark, as a
+    ``TypeError`` -- and the projection routes answer only to ``CrewLogError``, so
+    without this the read raises and keeps raising, because the file that caused it is
+    still on disk.
+
+    Both halves are asserted, and the second is the one that matters: reaching the cold
+    answer once would be no fix at all if the next read tripped on the same file. The
+    file is not merely deleted -- the identity recheck sees it go, so the read retries
+    cold and writes a sound savepoint in its place, which is why the assertion is about
+    what the file now HOLDS rather than whether it exists.
+    """
+    handle = _long_log()
+    handle.append_many(_tool_pair("c-pre"), src=GATEWAY)
+    crew_log.fold_session(SESSION)
+    payload = _payload("tools")
+    row = payload["state"]["by_name"]["fs_read"]
+    assert isinstance(row["servers_over"], list), "the fixture's row is not the shape this breaks"
+    row["servers_over"] = 1
+    _write_payload("tools", payload)
+    # A tool entry ABOVE the savepoint, so the tail actually drives the tools fold.
+    handle.append_many(_tool_pair("c-post"), src=GATEWAY)
+
+    cold = _cold_bundle()
+    resumed = crew_log.fold_session(SESSION)
+
+    assert _rendered(resumed) == _rendered(cold)
+    # The malformed state is gone from disk, so the next read does not trip on it.
+    after = _payload("tools")["state"]["by_name"]["fs_read"]["servers_over"]
+    assert isinstance(after, list), f"the malformed row is still on disk: {after!r}"
+    assert _rendered(crew_log.fold_session(SESSION)) == _rendered(cold)
+
+
+def test_a_savepoint_carrying_no_witness_is_refused():
+    """No evidence about the bytes its state came from is worse than no savepoint.
+
+    Written against the raw envelope because that is what the rule is about: the
+    kernel loads a witness-less payload with an EMPTY one rather than refusing it,
+    which is what lets this module decide what an absent witness is worth. Here it is
+    worth a cold fold, and that decision is also why the envelope needed no version
+    of its own to retire the payloads written before the witness existed.
+
+    TWO checks refuse this payload independently -- :func:`_admits` finds no seq to
+    judge, and the seq it does not find cannot agree with the watermark -- so removing
+    either one alone leaves this test passing. That is deliberate depth rather than an
+    accident, and the test below pins the agreement check on its own.
+    """
+    _long_log()
+    crew_log.fold_session(SESSION)
+    path = savepoints.checkpoint_path(lg.KIND_SESSION, SESSION, "status")
+    raw = json.loads(path.read_text())
+    assert raw["witness"], "the fixture wrote no witness, so there is nothing to empty"
+    raw["witness"] = {}
+    raw["state"]["turns_completed"] = 99999
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    resumed = crew_log.fold_session(SESSION)
+
+    assert resumed.projection("status").value["turns_completed"] == _LONG_TURNS
+
+
+def test_a_savepoint_that_disagrees_with_itself_about_its_seq_is_refused():
+    """The state resumes at one boundary and the witness certifies another.
+
+    Nothing here can say which is right, so the file is not a savepoint of this fold.
+    The witness seq is lowered rather than raised, and only it: every other condition
+    still holds -- the digest still matches the live prefix at the unchanged record
+    count, the log still reaches the watermark -- so the agreement check is the only
+    thing that can refuse it.
+    """
+    handle = _long_log()
+    crew_log.fold_session(SESSION)
+    path = savepoints.checkpoint_path(lg.KIND_SESSION, SESSION, "status")
+    raw = json.loads(path.read_text())
+    assert raw["witness"]["seq"] == raw["watermark"], "the fixture already disagrees"
+    raw["witness"]["seq"] = raw["watermark"] - 1
+    assert raw["witness"]["seq"] <= handle.last_seq, "the past-the-end guard must not refuse it"
+    raw["state"]["turns_completed"] = 99999
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    resumed = crew_log.fold_session(SESSION)
+
+    assert resumed.projection("status").value["turns_completed"] == _LONG_TURNS
+
+
+def test_a_savepoint_from_before_the_kernel_is_discarded_rather_than_migrated():
+    """The old envelope is not read into the new one, and it does not linger either.
+
+    A payload written before the projection kernel owned this store states its fields
+    flat and carries no witness. It is refused -- migrating it would mean trusting
+    fields whose meaning this build never verified -- and because the file NAME is
+    unchanged, the cold fold's own write replaces it. A new path would have left it on
+    disk for a collector that does not exist.
+    """
+    handle = _long_log()
+    crew_log.fold_session(SESSION)
+    path = savepoints.checkpoint_path(lg.KIND_SESSION, SESSION, "status")
+    witness = savepoints.prefix_witness(handle, handle.last_seq)
+    assert witness is not None, "the fixture's own boundary did not resolve"
+    legacy = {
+        "v": crew_log.fold_state_version("status"),
+        "unit": SESSION,
+        "origin": crew_log.log_origin(handle),
+        "first_seq": 1,
+        "fold": "status",
+        "seq": handle.last_seq,
+        "prefix_sha": witness.sha,
+        "prefix_records": witness.records,
+        # Every other condition holds, so the envelope is the only thing that can
+        # reject it: a migration would serve this number.
+        "state": {**_payload("status")["state"], "turns_completed": 99999},
+    }
+    path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    resumed = crew_log.fold_session(SESSION)
+
+    assert resumed.projection("status").value["turns_completed"] == _LONG_TURNS
+    # Replaced in place, not orphaned beside a new name.
+    assert _payload("status")["state"]["turns_completed"] == _LONG_TURNS
+
+
 def test_a_savepoint_whose_front_moved_is_ignored():
     """Retention drops segments off the front, so the two folds would differ."""
     _long_log()
@@ -604,7 +880,7 @@ def test_a_savepoint_from_a_future_build_is_ignored():
     _long_log()
     crew_log.fold_session(SESSION)
     payload = _payload("status")
-    payload["v"] = savepoints.CHECKPOINT_VERSION + 1
+    payload["v"] = crew_log.fold_state_version("status") + 1
     payload["state"]["turns_completed"] = 99999
     _write_payload("status", payload)
 
@@ -613,22 +889,53 @@ def test_a_savepoint_from_a_future_build_is_ignored():
     assert resumed.projection("status").value["turns_completed"] == _LONG_TURNS
 
 
+def test_a_savepoint_from_an_older_build_is_refused_and_folded_cold():
+    """The bump's whole purpose: a state written under the old number never resumes.
+
+    :func:`test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move`
+    obliges the bump when a fold's stored state changes. This is the other half --
+    that the bump actually retires the files, rather than the version being a label
+    nothing reads. The payload is otherwise perfect, so its version is the only thing
+    that can reject it, and the number it carries is the one a real older build wrote.
+    """
+    _long_log()
+    crew_log.fold_session(SESSION)
+    payload = _payload("usage")
+    # ``usage``'s OWN version, because that is the number a ``usage`` file carries and the
+    # only one its resume compares against.
+    payload["v"] = crew_log.fold_state_version("usage") - 1
+    payload["state"]["credits"] = 99999.0
+    _write_payload("usage", payload)
+
+    cold = _cold_bundle()
+    resumed = crew_log.fold_session(SESSION)
+
+    assert resumed.projection("usage").value == cold.projection("usage").value
+    assert resumed.projection("usage").value["credits"] != 99999.0
+
+
 def test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move(monkeypatch):
-    """A fold's stored state is pinned, so changing it cannot pass CI silently.
+    """A fold's stored state is pinned to ITS OWN version, per fold.
 
-    ``CHECKPOINT_VERSION`` and ``_state_matches_fold`` both guard the payload's
-    SHAPE, and the case neither can see is a fold whose meaning changes while its
-    keys do not -- a counting fix in ``usage`` or ``status`` being the likely one.
-    A savepoint written by the old build then resumes onto the new logic, so the
-    long sessions this module exists to speed up are exactly the ones that keep
-    serving pre-fix numbers, for the life of the unit.
+    ``state_version`` and ``_state_matches_fold`` both guard the payload's SHAPE, and
+    the case neither can see is a fold whose meaning changes while its keys do not -- a
+    counting fix in ``usage`` or ``status`` being the likely one. A savepoint written by
+    the old build then resumes onto the new logic, so the long sessions this module
+    exists to speed up are exactly the ones that keep serving pre-fix numbers, for the
+    life of the unit.
 
-    The obligation is therefore recorded as a test rather than as a sentence:
-    prose cannot fail, and a rule nothing enforces is one a future fix forgets.
-    The digest is over each fold's STATE, which is what a savepoint stores, so
-    editing a comment or renaming a local does not move it and a changed number
-    does. ``render`` is deliberately outside it: a rendering change moves the cold
-    fold and the resumed fold together, so an old savepoint stays valid.
+    The obligation is therefore recorded as a test rather than as a sentence: prose
+    cannot fail, and a rule nothing enforces is one a future fix forgets. The digest is
+    over each fold's STATE, which is what a savepoint stores, so editing a comment or
+    renaming a local does not move it and a changed number does. ``render`` is
+    deliberately outside it: a rendering change moves the cold fold and the resumed fold
+    together, so an old savepoint stays valid.
+
+    The pin is PER FOLD because the retirement is. A file carries the version of the
+    fold it holds, so a fold that changed meaning is the only one whose savepoints must
+    go -- and pinning the digests against one shared number would demand a bump that
+    retires five valid savepoints to retire one stale one, which is the cost this
+    change removed.
 
     The clock is frozen because four of the five folds retain an entry's ``ts``,
     which would otherwise move every digest on every run. ``store.now_ms`` is the
@@ -643,21 +950,30 @@ def test_changing_what_a_fold_stores_forces_the_savepoint_version_to_move(monkey
     entries = list(handle.iter_from(1, known=crew_log.KNOWN_TYPES))
 
     measured = {
-        name: _state_digest(crew_log.advance(crew_log.initial(name), entries).state)
+        name: (
+            _state_digest(crew_log.advance(crew_log.initial(name), entries).state),
+            crew_log.fold_state_version(name),
+        )
         for name in crew_log.PROJECTION_NAMES + crew_log.INTERNAL_PROJECTION_NAMES
     }
 
-    assert savepoints.CHECKPOINT_VERSION == _DIGESTS_RECORDED_AT_VERSION, (
-        "CHECKPOINT_VERSION moved, so re-record _FOLD_STATE_DIGESTS at the new "
-        "version: the point of the bump is that savepoints from the old one retire "
-        "to a cold fold, and this pin is what proves the bump was not forgotten"
+    changed = sorted(
+        name
+        for name, pin in measured.items()
+        if _FOLD_STATE_PINS.get(name, (None, None))[0] != pin[0]
     )
-    assert measured == _FOLD_STATE_DIGESTS, (
-        "a fold now stores something different, so every savepoint on disk "
-        "describes the OLD meaning and will resume onto this logic. Bump "
-        f"CHECKPOINT_VERSION in checkpoint.py (currently {savepoints.CHECKPOINT_VERSION}) "
-        "so those files retire to a cold fold, then record the new digests here: "
-        f"{measured}"
+    unbumped = sorted(
+        name for name in changed if _FOLD_STATE_PINS.get(name, ("", 0))[1] == measured[name][1]
+    )
+    assert not unbumped, (
+        f"these folds now store something different: {unbumped}. Every savepoint on "
+        "disk for them describes the OLD meaning and will resume onto this logic. Bump "
+        "each one's state_version in projection.py's _FOLDS so those files retire to a "
+        "cold fold -- the others keep theirs -- then record the new pairs in "
+        f"_FOLD_STATE_PINS: {measured}"
+    )
+    assert measured == _FOLD_STATE_PINS, (
+        "a fold's stored state or version moved, so re-record _FOLD_STATE_PINS: " f"{measured}"
     )
 
 
@@ -995,8 +1311,8 @@ def test_a_savepoint_still_resumes_after_the_log_merely_grew(monkeypatch):
 def test_a_savepoint_without_a_prefix_digest_is_ignored():
     """A payload from a build before this guard is retired, not trusted.
 
-    The alternative was bumping ``CHECKPOINT_VERSION``, and the rule that constant
-    documents is about what a fold STORES, not about the envelope around it: the
+    The alternative was bumping a fold's ``state_version``, and the rule that number
+    carries is about what a fold STORES, not about the envelope around it: the
     fold state here is unchanged. Rejecting the envelope field directly costs one
     cold fold per fold per unit, once, and keeps the version number meaning what it
     says.
@@ -1076,7 +1392,7 @@ def test_a_savepoint_that_exhausts_the_parser_stack_is_ignored_rather_than_raise
         def loads(*_args: Any, **_kwargs: Any) -> Any:
             raise RecursionError("maximum recursion depth exceeded while decoding")
 
-    monkeypatch.setattr(savepoints, "json", _ExhaustedParser)
+    monkeypatch.setattr(projection_checkpoint, "json", _ExhaustedParser)
 
     resumed = crew_log.fold_session(SESSION)
 
@@ -1114,7 +1430,7 @@ def test_malformed_object_fold_state_reaches_the_cold_answer():
 
 def test_a_fold_whose_state_is_over_the_cap_is_not_written(monkeypatch):
     _long_log()
-    monkeypatch.setattr(savepoints, "MAX_CHECKPOINT_BYTES", 64)
+    monkeypatch.setattr(projection_checkpoint, "MAX_PAYLOAD_BYTES", 64)
     bundle = crew_log.fold_session(SESSION)
 
     assert _files() == []

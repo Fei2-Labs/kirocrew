@@ -1,32 +1,23 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import type React from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { BookOpen, ChevronDown, ChevronRight, Folder, Paperclip, Plug } from 'lucide-react'
+import { BookOpen, Folder, Paperclip } from 'lucide-react'
 
-import { api } from '../../api/client'
 import Clickable from '../../components/Clickable'
 import ErrorNotice from '../../components/ErrorNotice'
 import { revealOrOpen, useRevealFailure } from '../../components/FilePathMenu'
 import MarkdownRenderer from '../../components/MarkdownRenderer'
 import MessageErrorBoundary from '../../components/MessageErrorBoundary'
 import PastedChip from '../../components/PastedChip'
-import SessionActionsMenu from '../../components/SessionActionsMenu'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-  DropdownMenuTrigger,
-} from '../../components/ui/dropdown-menu'
 import { i18nT } from '../../i18n/t'
 import { fmtNumber } from '../../i18n/format'
-import { deriveLoadedMcpTools } from '../../lib/mcpLoadedTools'
-import { useAppSelector } from '../../store'
-import type { ChatMessage, McpServer } from '../../types'
+import type { ChatMessage } from '../../types'
 import {
   buildFileLabels,
   findUnreferencedAttachments,
+  leadingMentionBoundary,
+  MENTION_LINE_SUFFIX,
+  mentionBoundary,
+  mentionTokenRegex,
   parseDirs,
   parseFiles,
   resolveDirSegment,
@@ -34,123 +25,15 @@ import {
   restoreUnreferencedImages,
 } from '../../utils/fileTokens'
 import { findTokenRanges, recollapsePastes, type PasteBlock } from '../../utils/pasteTokens'
-import McpToolsPanel from './McpToolsPanel'
-
-export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: {
-  activeSlot: string | null; agent?: string; onReveal?: () => void; onRename?: () => void; mode?: string
-}) {
-  // Controlled open state: lets the colour-swatch row (not a Radix menu item)
-  // close the menu after a pick, via the onColorPicked hook passed below.
-  const [open, setOpen] = useState(false)
-  // MCP server list is fetched lazily when its submenu opens (driven by the
-  // Radix Sub's open state).
-  const [mcpOpen, setMcpOpen] = useState(false)
-  const { data: servers = [] } = useQuery<{ name: string; enabled?: boolean }[]>({
-    queryKey: ['mcp-servers', agent],
-    queryFn: () => api.mcpActive(agent || undefined),
-    enabled: mcpOpen,
-  })
-  // Tool Search mode for this session's MCP tools (shared ['kirocrewConfig']
-  // cache). When on, tool specs are deferred (search-and-call), so every server
-  // shows as connected but its tools load only when used; when off, every spec
-  // is sent each turn. Explains the "why are they all loaded?" question.
-  const { data: toolSearchOn = true } = useQuery<{ agent?: { tool_search?: boolean } }, Error, boolean>({
-    queryKey: ['kirocrewConfig'],
-    queryFn: () => api.kirocrewConfig(),
-    select: (c) => c.agent?.tool_search ?? true,
-    enabled: mcpOpen,
-  })
-  // Per-tool loaded/deferred state is derived client-side (no endpoint): the
-  // full server list carries each server's tool names + disabledTools, and the
-  // "loaded this session" set comes from scanning this slot's tool_search
-  // results in the chat store. See deriveLoadedMcpTools for the caveats.
-  const { data: fullServers = [] } = useQuery<McpServer[]>({
-    queryKey: ['mcp-servers-full'],
-    queryFn: () => api.mcpServers(),
-    enabled: mcpOpen,
-  })
-  const toolsByServer = useMemo(
-    () => Object.fromEntries(fullServers.map(s => [s.name, { tools: s.tools, disabledTools: s.disabledTools }])),
-    [fullServers],
-  )
-  const sessionMessages = useAppSelector(s => s.chat.messages)
-  const loadedTools = useMemo(() => deriveLoadedMcpTools(sessionMessages), [sessionMessages])
-  // What this slot's session actually reported about its MCP servers. Pushed by
-  // the gateway onto the same `slots` array the snapshot rehydrates, so it needs
-  // no query of its own — and unlike the ['mcp-servers'] query above it is keyed
-  // by SLOT, which is the whole point: that query answers a question about the
-  // agent's configuration and this answers one about this session.
-  const sessionReport = useAppSelector(
-    s => (activeSlot ? s.dashboard.slots?.find(sl => sl.key === activeSlot)?.mcp_report : null) ?? null,
-  )
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <button className="px-0.5 py-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none transition-all" aria-label={i18nT('pages.chatPage.session_options')}>
-          <ChevronDown size={14} />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-[180px]">
-        {activeSlot && (
-        <SessionActionsMenu
-          variant="dropdown"
-          slotKey={activeSlot}
-          mode={mode}
-          // MCP servers: stateful (lazy fetch gated on the sub's open state), so
-          // it stays here as an info slot rather than a generic capability.
-          infoSlots={[
-            <DropdownMenuSub key="mcp" onOpenChange={setMcpOpen}>
-              <DropdownMenuSubTrigger>
-                <Plug size={13} className="shrink-0 text-muted" />
-                <span className="flex-1">{i18nT('pages.chatPage.mcp_servers')}</span>
-                <ChevronRight size={12} className="text-muted" />
-              </DropdownMenuSubTrigger>
-              {/* Intentional tighter cap composed via min() with the primitive's
-                  available-height var: 340px keeps the MCP tools submenu compact
-                  while preserving the viewport never-clip floor (a bare max-h
-                  would override the primitive, since cn()'s tailwind-merge dedupes
-                  max-h-*). overflow is left to the primitive. */}
-              <DropdownMenuSubContent className="min-w-[240px] max-w-[300px] max-h-[min(340px,var(--radix-dropdown-menu-content-available-height))] px-3 py-2">
-                <McpToolsPanel
-                  servers={servers}
-                  toolsByServer={toolsByServer}
-                  loaded={loadedTools}
-                  toolSearchOn={toolSearchOn}
-                  loading={servers.length === 0}
-                  sessionReport={sessionReport}
-                />
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>,
-          ]}
-          onReveal={onReveal}
-          onRename={onRename}
-          // The header controls its own menu, so close it after a colour pick.
-          onColorPicked={() => setOpen(false)}
-        />
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
 
 /** Per-message identity key with row-id tie-break. `msgKey` alone is NOT
  *  unique — a coarse OS clock can stamp two rows appended in one tick with the
- *  same `ts` (see isRedeliveredMessage in chatSlice on why row identity is
- *  `meta.mid`, not a ts tuple). `mid` is stamped once per row and survives
- *  every delivery door (HTTP rebuild, WS broadcast, JSONL round trip), so the
- *  suffix is as reload-stable as the key it disambiguates. Rows without a
- *  `mid` (locally-minted streaming/optimistic bubbles) fall back to `msgKey`
- *  alone, which is exactly the uniqueness they had before. */
-/** Client-generated one-shot correlation id for an optimistic user bubble.
- *  The server preserves meta fields on the user row it appends, so an echo or
- *  transcript page carries this id back and the bubble is matchable without
- *  relying on content equality (#2845). Shared by the plain send path and the
- *  mid-turn steer path (#6075) so the two cannot drift in id shape. */
-export function mintSendId(): string {
-  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-}
-
+ *  same `ts` (see isRedeliveredMessage in transcript.ts under store/chat on
+ *  why row identity is `meta.mid`, not a ts tuple). `mid` is stamped once per
+ *  row and survives every delivery door (HTTP rebuild, WS broadcast, JSONL
+ *  round trip), so the suffix is as reload-stable as the key it disambiguates.
+ *  Rows without a `mid` (locally-minted streaming/optimistic bubbles) fall
+ *  back to `msgKey` alone, which is exactly the uniqueness they had before. */
 /** Row-identity builders live in chat-core (P5-e); re-exported here so the
  *  page, the store, and the tests keep their import path. */
 export {
@@ -223,9 +106,10 @@ export function KnowledgeBubbleChip({ knowledge }: { knowledge: { items: number;
  *  Shared by every dashboard surface that draws a user row: ChatPage hands
  *  it directly, and the app-sdk registry's default `user` entry (ChatPane,
  *  member DMs, embeds) calls it too, so the two can no longer drift on how an
- *  attachment renders. `onFileOpen` is therefore optional: a host without a
- *  file viewer (the pane) still shows every attachment — an image inline, a
- *  file as a card with its path in the tooltip — it just cannot open one. */
+ *  attachment renders. `onFileOpen` is optional: a host without a file viewer
+ *  still shows every attachment — an image inline, a file as a card — it just
+ *  has no opener to call. Every host with a viewer (main chat, split panes,
+ *  member DMs) supplies it (#9487). */
 export type UserContentRenderOpts = {
   content: string
   meta?: Record<string, unknown>
@@ -365,10 +249,13 @@ function renderUserContentInner(opts: UserContentRenderOpts) {
 
 /** Boundary-checked presence of an `@token` in a text segment — the same rule
  *  the split regex uses, so a key is only offered to a segment that can
- *  actually match it. */
+ *  actually match it. The SHARED matcher, not a local pattern: the send path
+ *  widened to the leadingMentionBoundary/mentionBoundary contract, and a
+ *  renderer still splitting on whitespace-only turned every punctuated or
+ *  wrapped mention's attachment invisible — no chip AND no card, where base
+ *  drew a card (fork Opus review). */
 function tokenPresent(text: string, token: string): boolean {
-  const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`(^|\\s)@${esc}(?=\\s|$)`).test(text)
+  return mentionTokenRegex(token).test(text)
 }
 
 /** Inline chip for a folder reference in a sent message. Clicking opens the
@@ -389,8 +276,22 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
   )
   if (!onOpen) {
     return (
+      // `title` reaches a pointer only, and the visible text is just the short
+      // label, so the full path is also carried as visually-hidden text. A
+      // screen reader reads it wherever it reads the chip, including browse
+      // mode. It is text rather than a name on the span, because naming needs a
+      // role and a named non-interactive role is announced reliably only once
+      // something moves focus into it -- which nothing here ever does, since an
+      // inert chip has no action to reach and the transcript must not grow a tab
+      // stop per chip. FileHeaderBreadcrumb names a FOCUSABLE region instead.
+      // The visible label is aria-hidden so the path is spoken ONCE and whole,
+      // rather than the basename twice; the path already contains it.
+      // `select-none` keeps the hidden path out of a copied selection: `sr-only`
+      // hides text visually but leaves it in the DOM, so selecting the bubble
+      // would otherwise paste the path alongside the label a reader sees.
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
-        {body}
+        <span aria-hidden="true" className="inline-flex items-center gap-1">{body}</span>
+        <span className="sr-only select-none">{fullPath}</span>
       </span>
     )
   }
@@ -441,22 +342,26 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
 
   // Folder tokens join the same split as file mentions. A dir key always ends
   // in `/` and a file key never does, so classification below is unambiguous.
-  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys]
+  // Longest-first so a staged `report,` is tried before `report` at the same
+  // position (ordered alternation); the shared boundary pair keeps the drawing
+  // in lockstep with the send path and findUnreferencedAttachments' decision.
+  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys].sort((a, b) => b.length - a.length)
   const tokPattern = keys.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
   const parts = tokPattern
-    ? display.split(new RegExp(`(@(?:${tokPattern}))(?=\\s|$)`, 'g'))
+    ? display.split(mentionSplitRe(tokPattern))
     : [display]
   return (
     <span key={keyBase} style={{ whiteSpace: 'pre-wrap' }}>
       {parts.map((part, i) => {
-        const tok = part.match(/^@(.+)$/)?.[1]
+        const hit = mentionPart(part, key => mentionMap.has(key) || !!dirMap?.has(key))
+        const tok = hit?.key
         const dirPath = tok && dirMap?.get(tok)
         if (dirPath) {
           return <DirChip key={`${keyBase}-d${i}`} label={tok} fullPath={dirPath} onOpen={onFolderOpen} />
         }
         const fullPath = tok && mentionMap.get(tok)
-        if (fullPath) {
-          return <FileMentionChip key={`${keyBase}-f${i}`} label={tok} fullPath={fullPath} onOpen={onFileOpen} />
+        if (hit && fullPath) {
+          return <FileMentionChip key={`${keyBase}-f${i}`} label={hit.label} fullPath={fullPath} onOpen={onFileOpen} />
         }
         return <span key={`${keyBase}-p${i}`}>{part}</span>
       })}
@@ -468,14 +373,40 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
 }
 
 /** Inline chip for a file reference in a sent message: `@label`, the full path
- *  in the tooltip. With a handler it opens the file (ChatPage's side-panel
- *  viewer); without one — a host that has no file viewer, such as a split
- *  pane or a member DM — it is an inert span, the same degrade DirChip makes,
- *  so a chip never LOOKS clickable on a surface where clicking does nothing. */
+ *  in the tooltip, opening the file in the host's viewer. Every host that can
+ *  show a user row supplies the handler (#9487); a host without one still
+ *  renders the chip as an inert span (#9921 kept the base's #13855 a11y pin). */
+/** The transcript's mention split. A `:line` suffix rides INSIDE its pill
+ *  (fork UX review): `(@src/main.ts:42)` draws `(` + pill `@src/main.ts:42` +
+ *  `)`, one reference as the user typed it, instead of stranding `:42` as
+ *  text beside the pill. The suffix grammar is the shared MENTION_LINE_SUFFIX
+ *  (anchored for its exec() consumers, so the `^` is sliced off here), and
+ *  the trailing boundary is the same one send serialization uses. */
+function mentionSplitRe(tokPattern: string): RegExp {
+  return new RegExp(`(${leadingMentionBoundary})(@(?:${tokPattern})(?:${MENTION_LINE_SUFFIX.source.slice(1)})?)(?=${mentionBoundary})`, 'g')
+}
+
+/** Resolve one split part to its map key and the label to draw: `@tok`, or
+ *  `@tok:42` whose key is `tok`. A key that itself ends in `:digits` is
+ *  tried whole first, so it is never cut. */
+function mentionPart(part: string, known: (key: string) => boolean): { key: string; label: string } | null {
+  const whole = part.match(/^@(.+)$/)?.[1]
+  if (!whole) return null
+  if (known(whole)) return { key: whole, label: whole }
+  const split = whole.match(/^(.+)(:\d+)$/)
+  return split && known(split[1]) ? { key: split[1], label: whole } : null
+}
+
 function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath: string; onOpen?: (path: string) => void }) {
   const base = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono'
   if (!onOpen) {
-    return <span className={base} title={fullPath}>@{label}</span>
+    // No file viewer on this host (a split pane or member DM without an
+    // opener): the same degrade DirChip makes, so the chip never LOOKS
+    // clickable where clicking does nothing. `title` is pointer-only, so the
+    // full path rides along as visually-hidden text; the visible label is
+    // aria-hidden so the basename is not spoken twice; `select-none` keeps the
+    // path out of a copied selection. Pinned by pointerOnlyPath.a11y.test.tsx.
+    return <span className={base} title={fullPath}><span aria-hidden="true">@{label}</span><span className="sr-only select-none">{fullPath}</span></span>
   }
   return (
     <Clickable className={`${base} cursor-pointer hover:bg-accent/25 transition-colors`} title={fullPath} onClick={() => onOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{label}</Clickable>
@@ -483,10 +414,10 @@ function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath:
 }
 
 /** Block card for a single user-attached (non-image) file. Clickable to open
- *  the file via the shared onFileOpen callback; without a handler it is an
- *  inert card (see FileMentionChip for why). Styled after the agent-side
- *  download card (see components/FileCard.tsx) but carries no size/mime — a
- *  user attachment only has a path here. */
+ *  the file in the host's viewer; without a handler it is an inert card (see
+ *  FileMentionChip for why). Styled after the agent-side download card (see
+ *  components/FileCard.tsx) but carries no size/mime — a user attachment only
+ *  has a path here. */
 function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string; label: string; onFileOpen?: (path: string) => void }) {
   const base = 'flex items-center gap-2.5 max-w-full bg-card border border-border rounded-lg px-3 py-2 text-sm no-underline text-text animate-scale-in'
   const body = (
@@ -498,7 +429,18 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
   if (!onFileOpen) {
     // The tooltip says WHERE the file opens, because the card looks exactly
     // like the main chat's clickable one and a click here answers nothing.
-    return <span className={base} title={i18nT('pages.chatPage.attached_file_inert', { path: fullPath })}>{body}</span>
+    // The same sentence rides along as visually-hidden text, since `title`
+    // opens on pointer hover only. The visible body is aria-hidden: the
+    // sentence already contains the path, so reading both would say the
+    // filename twice per card. `select-none` keeps it out of a copied
+    // selection. Pinned by pointerOnlyPath.a11y.test.tsx (#13855).
+    const inert = i18nT('pages.chatPage.attached_file_inert', { path: fullPath })
+    return (
+      <span className={base} title={inert}>
+        <span aria-hidden="true" className="flex items-center gap-2.5 min-w-0">{body}</span>
+        <span className="sr-only select-none">{inert}</span>
+      </span>
+    )
   }
   return (
     <Clickable
@@ -589,20 +531,21 @@ function renderFileSegment(opts: FileSegmentOpts) {
   // Cap tokens to prevent ReDoS from many alternations. Folder tokens join
   // the same split; a dir key always ends in `/` and a file key never does,
   // so classification below is unambiguous.
-  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys]
+  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys].sort((a, b) => b.length - a.length)
   const tokPattern = keys.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
-  const parts = display.split(new RegExp(`(@(?:${tokPattern}))(?=\\s|$)`, 'g'))
+  const parts = display.split(mentionSplitRe(tokPattern))
   const body = (
     <span key={`${keyBase}-body`} style={{ whiteSpace: 'pre-wrap' }}>
       {parts.map((part, i) => {
-        const tok = part.match(/^@(.+)$/)?.[1]
+        const hit = mentionPart(part, key => mentionMap.has(key) || !!dirMap?.has(key))
+        const tok = hit?.key
         const dirPath = tok && dirMap?.get(tok)
         if (dirPath) {
           return <DirChip key={`${keyBase}-d${i}`} label={tok} fullPath={dirPath} onOpen={onFolderOpen} />
         }
         const fullPath = tok && mentionMap.get(tok)
-        if (fullPath) {
-          return <FileMentionChip key={`${keyBase}-f${i}`} label={tok} fullPath={fullPath} onOpen={onFileOpen} />
+        if (hit && fullPath) {
+          return <FileMentionChip key={`${keyBase}-f${i}`} label={hit.label} fullPath={fullPath} onOpen={onFileOpen} />
         }
         return part ? <span key={`${keyBase}-p${i}`}>{part}</span> : null
       })}

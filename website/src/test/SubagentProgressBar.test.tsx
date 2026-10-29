@@ -3,7 +3,7 @@ import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
-import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, sseSubagentDone, sseSubagentTool, sseSubagentStalled } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, sseSubagentSpawn, sseSubagentPending, sseSubagentQueued, reconcileSubagentQueuedFromSlots, sseSubagentDone, sseSubagentTool, sseSubagentStalled } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
 
@@ -148,6 +148,65 @@ describe('SubagentProgressBar — queued / waiting count', () => {
   })
 })
 
+// Ported from kyleseaman's #13921 (the REST-poll reconcile), re-pointed at the
+// `slots` push that now carries the gateway's published depth.
+describe('SubagentProgressBar — a slots push reconciles a stale queued count', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it('clears a stale queued count and unmounts the chip when the push says 0', () => {
+    // The symptom: "running 0, queued 1" with Stop all, while the gateway holds
+    // nothing for this parent. The count comes from subagent_queued frames, so
+    // one left non-zero stays until something corrects it.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1 }))
+    const { container } = renderBar(store)
+    expect(screen.getByTestId('subagent-queued-count').textContent).toContain('1')
+
+    act(() => { store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 0 }])) })
+
+    expect(store.getState().chat.subagentQueued[SLOT]).toBeUndefined()
+    expect(container).toBeEmptyDOMElement()
+  })
+
+  it('leaves the queued count alone when the row does not report one', () => {
+    // A `slot_patch` row, or an older gateway: no field is not a 0.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
+    renderBar(store)
+    act(() => { store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT }])) })
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+  })
+
+  it('keeps a cron-born tab\'s real queued count across a push', () => {
+    // A cron-born tab is named `cron-<id>` while its runs publish under
+    // `cron:<id>[:<run>]`. The gateway routes each published depth to the tab its
+    // frames reach (test_published_queue_depth.py pins that half), so the row
+    // carries the real depth under the TAB key and the chip keeps it.
+    const CRON_SLOT = 'cron-job-7'
+    const store = configureStore({
+      reducer: { chat: chatReducer, dashboard: dashboardReducer, notifications: notificationsReducer },
+    })
+    store.dispatch(setActiveSlot(CRON_SLOT))
+    store.dispatch(sseSubagentQueued({ slot: CRON_SLOT, queued: 2 }))
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+    render(
+      <QueryClientProvider client={queryClient}>
+        <Provider store={store}>
+          <SubagentProgressBar slot={CRON_SLOT} />
+        </Provider>
+      </QueryClientProvider>,
+    )
+    act(() => {
+      store.dispatch(reconcileSubagentQueuedFromSlots([
+        { key: CRON_SLOT, subagents_queued: 2 },
+        { key: 'dashboard-other', subagents_queued: 0 },
+      ]))
+    })
+    expect(store.getState().chat.subagentQueued[CRON_SLOT]).toBe(2)
+    expect(screen.getByTestId('subagent-queued-count').textContent).toContain('2')
+  })
+})
+
 describe('SubagentProgressBar — overlay stacking', () => {
   beforeEach(() => vi.clearAllMocks())
 
@@ -186,6 +245,29 @@ describe('sseSubagentQueued reducer', () => {
     store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 4 }))
     store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 0 }))
     expect(store.getState().chat.subagentQueued[SLOT]).toBeUndefined()
+  })
+
+  it('a slots push keeps the wait label while rows still wait, and clears it at 0', () => {
+    const store = freshStore()
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 3, reason: 'low_memory' }))
+    store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 2 }]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+    expect(store.getState().chat.subagentQueuedReason[SLOT]?.reason).toBe('low_memory')
+    store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 0 }]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBeUndefined()
+    expect(store.getState().chat.subagentQueuedReason[SLOT]).toBeUndefined()
+  })
+
+  it('a slots push restores a count the client never heard, and ignores garbage', () => {
+    const store = freshStore()
+    store.dispatch(reconcileSubagentQueuedFromSlots([{ key: SLOT, subagents_queued: 2.9 }]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+    store.dispatch(reconcileSubagentQueuedFromSlots([
+      { key: SLOT, subagents_queued: 'x' as unknown as number },
+      { key: '__proto__', subagents_queued: 5 },
+    ]))
+    expect(store.getState().chat.subagentQueued[SLOT]).toBe(2)
+    expect(Object.prototype.hasOwnProperty.call(store.getState().chat.subagentQueued, '__proto__')).toBe(false)
   })
 
   it('clamps negative / garbage payloads to a non-negative integer', () => {
@@ -358,5 +440,84 @@ describe('SubagentProgressBar — collapse toggle', () => {
     fireEvent.click(screen.getByLabelText('Stop all'))
     await waitFor(() => expect(api.spawnStopAll).toHaveBeenCalledTimes(1))
     expect(api.spawnStopAll).toHaveBeenCalledWith(SLOT)
+  })
+})
+
+describe('SubagentProgressBar — why the queued agents wait', () => {
+  it('renders the deferral sentence as visible text, not only in the tooltip', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1, reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }))
+    renderBar(store)
+    const line = screen.getByTestId('subagent-wait-reason')
+    expect(line.textContent).toContain('free up memory to continue')
+    expect(line.className).toContain('text-warn')
+    expect(screen.getByTestId('subagent-queued-count').getAttribute('title')).toBe(line.textContent)
+  })
+
+  it('says free memory is unknown, not "0 free", when the cgroup usage is unreadable', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({
+      slot: SLOT, queued: 1, reason: 'low_memory', required_gb: 4.5, cause: 'cgroup_usage_unreadable',
+    }))
+    renderBar(store)
+    const line = screen.getByTestId('subagent-wait-reason')
+    expect(line.textContent).toContain('free memory is unknown')
+    expect(line.textContent).not.toMatch(/free now|not enough free memory/)
+  })
+
+  it('renders no extra line for a bare count (older gateway) or the capacity wait', () => {
+    const store = makeStore(['a1'])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 2 }))
+    renderBar(store)
+    expect(screen.queryByTestId('subagent-wait-reason')).toBeNull()
+    expect(screen.getByTestId('subagent-queued-count').getAttribute('title'))
+      .toBe('Waiting to start — queued behind the concurrency limit')
+  })
+})
+
+describe('SubagentProgressBar — expand renders no empty body', () => {
+  beforeEach(() => { vi.clearAllMocks(); try { localStorage.clear() } catch { /* not available in this env */ } })
+
+  it('renders no rows body when the chip is mounted only on a queued count', () => {
+    // The second bug in the report: expanding the chip while running===0 (only a
+    // queued tally) added vertical whitespace with nothing in it, because the
+    // rows body carried its px-3 pb-2 padding around an empty list. There must be
+    // no such body — the header (count + Stop all) stands alone.
+    const store = makeStore([])
+    store.dispatch(sseSubagentQueued({ slot: SLOT, queued: 1 }))
+    renderBar(store)
+    // Header is present…
+    expect(screen.getByTestId('subagent-queued-count')).toBeInTheDocument()
+    // …but no row exists and no empty padded body is rendered.
+    expect(screen.queryAllByTestId('subagent-row')).toHaveLength(0)
+    expect(screen.queryByTestId('subagent-overflow-row')).toBeNull()
+  })
+
+  it('still renders the rows body when there is a running agent to show', () => {
+    renderBar(makeStore(['a1']))
+    expect(screen.getAllByTestId('subagent-row')).toHaveLength(1)
+  })
+})
+
+describe('SubagentProgressBar — elapsed figure (#19930)', () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it.each([
+    [4_000, '4s'],
+    [909_000, '15m 9s'],
+    [4_031_000, '1h 7m 11s'],
+  ])('renders %i ms of runtime as %s, not raw seconds', (runMs, shown) => {
+    const t0 = 1_700_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    try {
+      const store = makeStore(['a1'])
+      now.mockReturnValue(t0 + runMs)
+      renderBar(store)
+      const row = screen.getByTestId('subagent-row')
+      expect(row.textContent).toContain(shown)
+      if (runMs >= 60_000) expect(row.textContent).not.toContain(`${Math.round(runMs / 1000)}s`)
+    } finally {
+      now.mockRestore()
+    }
   })
 })

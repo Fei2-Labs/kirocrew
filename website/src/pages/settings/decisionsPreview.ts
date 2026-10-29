@@ -280,6 +280,14 @@ export interface DecisionsView {
    */
   memoryText: boolean
   /**
+   * Whether the owner granted the wake judge's own scope: rows from the SESSIONS A
+   * LOOP WATCHES, which is a different category from the three above -- those cover
+   * the owner's own turn, and this one covers other sessions' transcripts. An exact
+   * literal `true` again, so a keystone written before this scope existed reads
+   * false and the card draws the switch off.
+   */
+  nudgeEvidence: boolean
+  /**
    * The prior-conversation CEILING the owner reviewed, in characters.
    *
    * From the KEYSTONE, not from `config.json`. The two differ exactly when an agent
@@ -309,6 +317,7 @@ const UNSUPPORTED: DecisionsView = {
   toolArgs: false,
   compaction: false,
   memoryText: false,
+  nudgeEvidence: false,
   historyBudget: 0,
   points: [],
 }
@@ -360,6 +369,7 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
       toolArgs: false,
       compaction: false,
       memoryText: false,
+      nudgeEvidence: false,
       historyBudget: 0,
     }
   }
@@ -380,6 +390,10 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
   // An exact `true` on the same terms again: a recalled memory is text the agent wrote
   // down in an earlier conversation, so neither scope beside this one stands for it.
   const memoryText = root.memory_text === true
+  // An exact `true` on the same terms as the three above. Read separately from
+  // `compaction` on purpose: that yes covered the owner's OWN transcript at their own
+  // agent's compaction, and this one covers rows from sessions the loop watches.
+  const nudgeEvidence = root.nudge_evidence === true
   // A whole non-negative number or nothing: an older gateway omits the field, and a
   // value nobody can read back as a budget is not one. 0 either way, which is the
   // shipped default and the least that can leave.
@@ -394,6 +408,7 @@ export function readConsent(body: unknown): Omit<DecisionsView, 'bucket' | 'poin
     toolArgs,
     compaction,
     memoryText,
+    nudgeEvidence,
     historyBudget,
   }
 }

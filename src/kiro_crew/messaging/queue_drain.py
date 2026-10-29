@@ -8,7 +8,7 @@ TRANSPORT. Every DM dispatcher is constructed with the orchestrator's single
 dropping the CHANNEL as well as the user. So a Telegram DM and a Discord DM to the
 same agent resolve to one session key, and therefore one queue.
 
-Two things therefore cannot live in any one channel's module.
+Three things therefore cannot live in any one channel's module.
 
 The first is the ownership predicate. A drain can only answer the entries its OWN
 channel recorded, because an entry from another transport carries no address it can
@@ -19,7 +19,15 @@ its reader are defined ONCE here rather than restated per module. A restated lit
 is a silent failure: one typo makes that channel's entries "not mine" to every drain,
 including its own, so they are unowned and stranded with nothing raising.
 
-The second is the wake. An entry set aside has already been accepted and receipted, so
+The second is WHOSE each entry is. ``/stop`` cancels one person's turn, so it may drop
+only that person's queued messages; under a unified scope the rest of the queue belongs
+to other people who are still waiting for an answer. Naming the principal takes the same
+neutral treatment as naming the channel and for a stronger reason: the caller has to
+compare every entry on the queue, including entries another transport recorded whose
+channel-specific fields it cannot read at all. So :data:`QUEUED_OWNER_KEY` and
+:func:`owner_token` live here too.
+
+The third is the wake. An entry set aside has already been accepted and receipted, so
 something must come back for it. Nothing did: a drain runs only from the tail of its
 own channel's turn, so a cross-transport entry waited for that transport to finish some
 unrelated turn, and waited forever if it went quiet.
@@ -47,6 +55,30 @@ logger = logging.getLogger(__name__)
 #: Defined here and imported, never restated: see the module docstring for why a
 #: per-module copy of this string fails silently.
 QUEUED_CHANNEL_KEY = "queued_channel"
+
+#: Neutral key naming WHICH PRINCIPAL queued an entry -- one sender in one place --
+#: written by every producer beside :data:`QUEUED_CHANNEL_KEY`. The channel tag answers
+#: "which drain replies to this"; this answers "whose message is this", which is the
+#: question a partial clear asks. Neutral for the same reason: a caller clearing only
+#: its own entries must compare them all, including entries another transport recorded,
+#: and it cannot read a channel-specific origin field to do it.
+#:
+#: The value is opaque and built only by :func:`owner_token`, so the one place that
+#: decides what "the same principal" means is that function.
+QUEUED_OWNER_KEY = "queued_owner"
+
+#: Neutral key recording whether a PERSON sent a queue entry
+#: (``InboundMessage.person_origin``). A drain replays the entry later as a fresh turn,
+#: and that turn's start priority (:mod:`kiro_crew.start_priority`) is the entry's own:
+#: neither the finished turn's opener's nor assumed, because a gateway-built wake can
+#: reach the busy-queue path too. Written by :func:`person_tag`, read by
+#: :func:`entry_person_origin`.
+QUEUED_PERSON_KEY = "queued_person_origin"
+
+#: Separates the parts inside an owner token. A unit separator, because every part is an
+#: id, an email or a room name from a transport, and none of them can contain one -- so
+#: two different principals cannot collide by spelling their parts with the separator.
+_OWNER_SEP = "\x1f"
 
 #: "Drain everything you own on this session key." The only capability a peer
 #: channel is given, and the reason no address crosses this seam.
@@ -87,19 +119,80 @@ _PENDING: dict[str, set[str]] = {}
 _MAX_WAKE_ROUNDS = 8
 
 
-def tag_entry(kwargs: dict[str, str], channel_type: str) -> dict[str, str]:
-    """Record *channel_type* as the producer of this queue entry, and return *kwargs*.
+def owner_token(channel_type: str, sender_key: Iterable[object]) -> str:
+    """The opaque token naming the principal *sender_key* identifies on *channel_type*.
+
+    Pass the channel's own ``sender_key`` -- the tuple each transport already derives for
+    "who sent this and where the reply goes", the same comparison that decides whether
+    two queued messages may be collapsed into one turn. Ownership for a partial clear is
+    that identical question, so it reads the identical value rather than a second notion
+    of identity that could drift from it.
+
+    The channel name leads, so two transports that happen to spell a user id the same way
+    are still two principals. Built here rather than per channel so a producer and a
+    clear cannot disagree about the spelling.
+    """
+    return _OWNER_SEP.join((str(channel_type), *(str(part) for part in sender_key)))
+
+
+def tag_entry(kwargs: dict[str, str], channel_type: str, owner: str) -> dict[str, str]:
+    """Record *channel_type* and *owner* as this queue entry's producer, and return *kwargs*.
 
     Every producer enqueueing onto a shared session key calls this, including a drain
     re-enqueueing an entry it set aside -- that path passes the entry's own kwargs
-    straight back, so the tag rides along already and re-tagging it would be the one
+    straight back, so the tags ride along already and re-tagging them would be the one
     way a set-aside entry could change hands.
+
+    *owner* comes from :func:`owner_token` and is what lets ``/stop`` drop one person's
+    queued messages and leave everybody else's. It is REQUIRED, with no default: a
+    producer that cannot name its principal passes ``""`` and says so at its own call
+    site, because an empty token matches no caller and the entry it makes is one its
+    own sender can never withdraw. Defaulting it would make that the silent outcome of
+    forgetting the argument rather than a decision.
 
     Returns the same dict it was given so a producer can build and tag in one
     expression; the mutation is what matters.
     """
     kwargs[QUEUED_CHANNEL_KEY] = str(channel_type)
+    kwargs[QUEUED_OWNER_KEY] = str(owner)
     return kwargs
+
+
+def person_tag(person_origin: bool) -> dict[str, bool]:
+    """The queue-entry keyword argument recording whether a person sent the entry."""
+    return {QUEUED_PERSON_KEY: bool(person_origin)}
+
+
+def entry_person_origin(kwargs: dict) -> bool:
+    """Whether a person sent this queue entry. Absent reads False: an entry that does
+    not say so takes no person's start priority."""
+    return kwargs.get(QUEUED_PERSON_KEY) is True
+
+
+def entry_owner(kwargs: dict) -> str:
+    """Which principal queued this entry, or "" if it did not say.
+
+    Absent means a producer that does not record it. Such an entry is nobody's to drop:
+    it is left queued by every partial clear rather than guessed at, the same way an
+    untagged channel makes it nobody's to answer.
+    """
+    return str(kwargs.get(QUEUED_OWNER_KEY) or "")
+
+
+def entries_queued_by(owner: str) -> Callable[[dict], bool]:
+    """The predicate selecting exactly the entries *owner* queued.
+
+    Handed to ``SessionManager.clear_queue`` so the session layer decides nothing about
+    ownership and learns no field name: it holds the entries, the predicate reads them.
+
+    An empty *owner* selects NOTHING, deliberately: a caller that cannot name its
+    principal must clear nothing rather than everything, because "everything" here is
+    other people's unanswered messages. Whole-session teardown asks for that by passing
+    no predicate at all, which is a different request and reads as one at the call site.
+    """
+    if not owner:
+        return lambda _kwargs: False
+    return lambda kwargs: entry_owner(kwargs) == owner
 
 
 def entry_channel(kwargs: dict) -> str:

@@ -63,6 +63,7 @@ import asyncio
 import re
 from typing import Callable
 
+from kiro_crew.constants import md_link_destination
 from kiro_crew.messaging.display_safety import redact_for_display, strip_ansi
 from kiro_crew.messaging.markup import (
     MERMAID_INFO,
@@ -74,6 +75,7 @@ from kiro_crew.messaging.split import (
     FENCE_BODY,
     FENCE_CLOSE,
     FENCE_OPEN,
+    bounded_for_delivery,
     iter_fence_lines,
     split_markdown_safe,
 )
@@ -100,7 +102,13 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _BOLD_US_RE = re.compile(r"__(.+?)__")
 _STRIKE_RE = re.compile(r"~~(.+?)~~")
-_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+#: A balanced pair may sit inside the url (``.../Python_(programming_language)``);
+#: see :func:`kiro_crew.constants.md_link_destination`. The label class is the
+#: display-safety screen's: no ``[``, ``]`` or line break.
+_LINK_DESTINATION_CHAR_CLASS = r"[^()\s]"
+_LINK_RE = re.compile(
+    rf"\[([^\[\]\n]+)\]\((https?://{md_link_destination(_LINK_DESTINATION_CHAR_CLASS)}+)\)"
+)
 _BULLET_RE = re.compile(r"^(\s*)[-*+]\s+")
 #: A single-backtick inline-code span, matching the Telegram renderer's shape.
 #: The dialect has ONE code marker, so a longer run carries no distinct meaning
@@ -286,7 +294,9 @@ def to_whatsapp_text(content: str) -> str:
     return text.strip()
 
 
-def render_chunks(content: str, limit: int = WHATSAPP_CHUNK_LIMIT) -> list[str]:
+def render_chunks(
+    content: str, limit: int = WHATSAPP_CHUNK_LIMIT, *, stable: bool = False
+) -> list[str]:
     """Delivery-ready chunks of WhatsApp-dialect text (see module docstring).
 
     Every rewrite -- the display screen, the reductions, dialect conversion --
@@ -295,14 +305,46 @@ def render_chunks(content: str, limit: int = WHATSAPP_CHUNK_LIMIT) -> list[str]:
     any chunk outgrowing the budget it was cut to, and several of them do: a
     flattened table row carries its column labels, a diagram gains a heading, and
     a redacted credential becomes a marker longer than the key it replaces.
+
+    ``stable`` is for the streaming turn renderer, which re-splits its growing
+    body every frame and treats all but the last chunk as delivered: it keeps the
+    text redacted while leaving every boundary where this budget puts it, so a
+    later arrival cannot revise a message already sent. That caller grades its own
+    seam before it counts a chunk final.
     """
     text = to_whatsapp_text(content)
     if not text:
         return []
-    return split_markdown_safe(text, limit)
+    if stable:
+        # PREFIX-STABLE: this caller opts into the shared splitter's stable mode
+        # (``split_markdown_safe(..., stable=True)``) rather than its default
+        # whole-body search. The streaming turn renderer re-splits its growing
+        # body every frame and treats all but the last chunk as delivered, so it
+        # needs chunk *i* decided by the text before it and NOTHING later. A sealed
+        # chunk is a promise to the client that nothing may rewrite, so this cut
+        # redacts the whole body (``stable=True``) then splits at the budget with
+        # no whole-body search that could move a boundary under a message already
+        # sent. The cross-message seam -- a chunk ending in a credential PREFIX the
+        # next completes -- is graded by the turn renderer, which knows which
+        # chunks are still unsealed and gives up only the completing span on a
+        # boundary it has not yet promised.
+        return split_markdown_safe(text, limit, redactor=_redact_all, stable=True)
+    # A credential-aware cut can DECLINE to cut, answering with the text whole,
+    # which is fail-closed but one chunk over ``limit``. This channel's own sender
+    # posts each chunk as its own message with no length bound of its own, so the
+    # over-cap chunk would reach the transport. The bound cuts it back and grades
+    # the sequence it produced, as every other capped caller does. The stable
+    # branch is not bounded here: its caller re-splits a growing body every frame
+    # and grades its own seam, and a bound would move a boundary under a message it
+    # has already treated as delivered.
+    return bounded_for_delivery(
+        split_markdown_safe(text, limit, redactor=_redact_all), limit, _redact_all
+    )
 
 
-async def render_chunks_off_loop(content: str, limit: int = WHATSAPP_CHUNK_LIMIT) -> list[str]:
+async def render_chunks_off_loop(
+    content: str, limit: int = WHATSAPP_CHUNK_LIMIT, *, stable: bool = False
+) -> list[str]:
     """:func:`render_chunks` on a worker thread.
 
     The shared splitter terminates on pathological delimiter input but its CPU
@@ -310,4 +352,4 @@ async def render_chunks_off_loop(content: str, limit: int = WHATSAPP_CHUNK_LIMIT
     every turn and the liveness heartbeat on one event loop. Discord offloads
     the same call for the same reason.
     """
-    return await asyncio.to_thread(render_chunks, content, limit)
+    return await asyncio.to_thread(render_chunks, content, limit, stable=stable)

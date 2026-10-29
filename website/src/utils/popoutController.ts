@@ -24,6 +24,7 @@
  */
 
 import { i18nT } from '../i18n/t'
+import { withBase } from '../lib/basePath'
 
 /** Heartbeat cadence (ms) for the main window's liveness ping. */
 export const HEARTBEAT_MS = 5_000
@@ -49,8 +50,12 @@ export type NavIntent = {
   path: string
   /** Chat slot to activate before navigating. */
   slotKey?: string
-  /** Composer prefill to seed for a slot (rides the message — sessionStorage is per-window). */
-  prefill?: { slotKey: string; prompt: string }
+  /** Composer prefill to seed for a slot (rides the message — sessionStorage is per-window).
+   *  `prompt` is the whole composer to seed. `append`, when set, is just the text
+   *  this hand-off adds: if the destination composer is already open on that slot,
+   *  the slot-restore effect will not run again, so `append` is merged into the
+   *  LIVE composer instead of `prompt` replacing it. */
+  prefill?: { slotKey: string; prompt: string; append?: string }
 }
 
 export type PopoutMsg =
@@ -117,6 +122,13 @@ export interface PopoutControllerOptions {
    * script opener, so close is a spec-level no-op there).
    */
   mainViewUrl: (id: string | null) => string
+  /**
+   * Called in a MAIN window (never the popout, never the sender: the channel
+   * does not self-deliver) when another main window brings `id` back. Lets a
+   * feature whose docked state is per window yield to the window that clicked
+   * Return, so one re-dock happens instead of one per window.
+   */
+  onBringBackObserved?: (id: string) => void
 }
 
 /** The main-window + popout-window API for one feature's popouts. */
@@ -247,6 +259,9 @@ export function createPopoutController(opts: PopoutControllerOptions): PopoutCon
         return
       }
       if (msg.t === 'bring-back' && msg.id === selfId) { returnSelfToMain(); return }
+    } else if (msg.t === 'bring-back') {
+      opts.onBringBackObserved?.(msg.id)
+      return
     }
     // Main dashboard role: claim + perform forwarded navigation intents. Only
     // windows that registered a handler participate (popouts/embeds don't).
@@ -399,7 +414,7 @@ export function createPopoutController(opts: PopoutControllerOptions): PopoutCon
    * Navigation indirection: jsdom can't redefine `window.location`, so tests
    * swap this via `__setNavigateForTests` to assert the deep-link fallback.
    */
-  let navigate = (url: string): void => window.location.assign(url)
+  let navigate = (url: string): void => window.location.assign(withBase(url))
 
   /**
    * Return THIS popout window's entity to the main dashboard: focus the opener
@@ -502,7 +517,7 @@ export function createPopoutController(opts: PopoutControllerOptions): PopoutCon
     mainSubscribers = 0
     selfId = null
     handles.clear()
-    navigate = (url: string) => window.location.assign(url)
+    navigate = (url: string) => window.location.assign(withBase(url))
     windowOpen = (url: string, target: string) => { window.open(url, target) }
     mainId = null
     navIntentHandler = null

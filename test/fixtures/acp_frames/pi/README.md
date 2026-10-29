@@ -1,6 +1,6 @@
 # Pi frame corpus
 
-Three files, all live. Read `../README.md` first for what a fixture is and what
+Every file here is live. Read `../README.md` first for what a fixture is and what
 the corpus does and does not prove.
 
 | File | Provenance | Frame classes it carries |
@@ -8,11 +8,90 @@ the corpus does and does not prove.
 | `session-live.jsonl` | live | initialize response with `agentInfo.version`, `session/new` response with a `sessionId` (a `model` select of `provider/model` ids, a `thought_level` select, a `modes` block), `available_commands_update`, a `tool_call` and two `tool_call_update` frames (`in_progress`, then `failed`) for a read the model called with no arguments, `agent_message_chunk`, and the `session/prompt` result carrying `stopReason` |
 | `permission-request-live.jsonl` | live | `tool_call`, `tool_call_update`, the `session/request_permission` the adapter forwarded from Kiro Crew's gate extension, the updates through `completed`, and the result |
 | `session-load-live.jsonl` | live | a `session/load` from a second process: the replayed `user_message_chunk` / `agent_message_chunk` / `tool_call` updates and the load result, which carries `configOptions`, `models` and `modes` |
+| `compact-live.jsonl` | live | the initialize and `session/new` responses, four ordinary turns (`agent_message_chunk`, `usage_update`, `session/prompt` result), the `/compact` turn (pi's `Compaction completed` chunk and an `end_turn` result with no `usage_update` and no status frame), and one ordinary turn after it |
+| `mcp-stdio-mount-live.jsonl` | live | the initialize and `session/new` responses, a `tool_call` for `mcp__probe_server__echo`, the `session/request_permission` the adapter forwarded from Kiro Crew's gate extension, the updates through `completed` carrying the server's own result, and the result |
+| `member-panel-mount-live.jsonl` | live | the initialize and `session/new` responses for a crew member session, a `tool_call` for `mcp__kirocrew_panel__panel_publish`, the `session/request_permission` forwarded from the gate extension, the update through `completed` carrying the panel server's own answer, and the result |
+| `zero-tools-refused-live.jsonl` | live | four turns on an agent spec declaring `"tools": []`: a `write`, a `bash` and an `mcp__probe_server__echo` call, each with the `session/request_permission` the gate extension raised and the `tool_call_update` that ended it `failed`, and a `frobnicate` call pi failed itself with no permission frame |
+| `steering-live.jsonl` | live | the initialize, `session/new` and set-model responses, a `tool_call` for a `bash` sleep, the `session/request_permission` forwarded from Kiro Crew's gate extension, the updates through `completed`, the extension's consumed-steer notification (an `agent_message_chunk` carrying `_meta.piAcp.notify`), the model's answer to the steer, `usage_update`, and the `end_turn` result |
 
 Captured off `pi-acp` 0.0.33 spawning `pi` 0.85.1 and driving a locally
 served model configured in pi's own `models.json`, with agent-to-client lines
 verbatim. The working directory in the frames is a scratch project, not a home
 directory.
+
+## What the compaction capture establishes
+
+`compact-live.jsonl` was taken with `scripts/capture_acp_compaction.py` off `pi-acp`
+0.0.34 spawning `pi` 1.2.0, against a scripted OpenAI-compatible endpoint on the
+loopback interface named in pi's own `models.json`. That endpoint reports `prompt_tokens`
+as the character count of the messages pi sent, divided by four, so the `used` series
+measures what pi itself put on the wire. Over four ordinary turns `used` climbed
+12773 -> 25127 -> 37481 -> 49834. The `/compact` turn ended `end_turn` inside the same
+`session/prompt` request with pi's own `Compaction completed` chunk and nothing after
+it. The next ordinary turn added another ~12k-token prompt and read 37518, below the
+pre-compact peak. That is the bar `ACP_BACKENDS_COMPACT` holds its members to, and the
+absence of a status frame is what puts pi in `ACP_BACKENDS_INLINE_COMPACTION` too.
+
+## What the MCP mount capture establishes
+
+pi-acp accepts the `session/new` `mcpServers` array and never hands it to pi, so
+`mcp-stdio-mount-live.jsonl` was driven with the array AND the per-session handoff
+file the launch writes (`acp.harness.pi.pi_mcp_handoff_payload`), named in
+`KIROCREW_PI_MCP_HANDOFF`. Taken off `pi-acp` 0.0.34 spawning `pi` 1.2.0 through
+the gate launcher, against a scripted model on the loopback
+interface that called `mcp__probe_server__echo`. The gate extension registered the
+one stdio server with pi's built-in MCP support; the server's own log recorded
+`initialize`, `notifications/initialized`, `tools/list` and `tools/call`; the call
+raised `session/request_permission` through the gate first; and the server's result
+(`ECHO:ping`) reached the turn. The same drive with a same-named server in pi's own
+`mcp.json` ended the call `failed` with the gate's refusal, and the file-configured
+server was never asked `tools/call`. An array-only drive spawns no server at all.
+
+## What the member panel capture establishes
+
+`member-panel-mount-live.jsonl` is the evidence `ACP_BACKENDS_MEMBER_PANEL` holds pi
+to. Taken off `pi-acp` 0.0.34 spawning `pi` 1.2.0 through the gate launcher, for a
+crew member session key. The array was not written by hand: `AcpClient`'s own resolver
+composed it for that key on pi (`kirocrew-dashboard`, then `kirocrew-panel`, each with
+the signed per-session token, `KIROCREW_SESSION_KEY` and the bound port of a
+disposable local gateway), `acp.harness.pi.pi_mcp_handoff_payload` sealed it into the
+handoff file, and the gate extension registered both. The scripted model on the
+loopback interface was offered all ten `mcp__kirocrew_panel__*` tools and called
+`panel_publish`; the call raised `session/request_permission` through the gate
+first; and the panel server's own answer reached the turn.
+
+That answer is `identity_unattested`, and it is the expected one for this capture:
+the server dialled the gateway with the session's token, and the gateway refused to
+vouch for a session it had not created. A gateway-created pi session cannot run on
+the recording host, which has no sandbox backend (no user namespaces), and Crew
+refuses to spawn pi unsandboxed, so the capture was driven by a scratch stdio driver
+outside the product path. What it pins is the half this membership adds: the panel
+element reaches pi, is reachable, and is gated. The publish itself is the same route
+every panel member uses (`api_agent_panel_publish`), and nothing in it reads the
+backend.
+
+## What the zero-tool capture establishes
+
+`zero-tools-refused-live.jsonl` was recorded by the in-product recorder
+(`KIROCREW_ACP_RECORD_FRAMES`) while an `AcpClient(acp_backend="pi")` session ran an
+agent spec declaring `"tools": []`, off `pi-acp` 0.0.34 spawning `pi` 1.2.0 through the
+gate launcher, against a scripted model on the loopback interface named in pi's own
+`models.json`, with one stdio MCP server handed over through the per-session handoff.
+The consumer driving it approved every permission event it was handed, the way a user
+clicking yes would, and was handed none: the client answered each of the three
+`session/request_permission` frames (`write`, `bash`, `mcp__probe_server__echo`) with
+the advertised reject option itself (`AcpClient._deny_zero_tools`), pi ended each call
+`failed`, no file was written, the `touch` never ran, and the MCP server's own log
+recorded `initialize`, `notifications/initialized` and `tools/list` but no `tools/call`.
+The fourth call named a tool pi does not have; pi failed it (`Tool frobnicate not
+found`) before any extension saw it. The same drive on a spec with no `tools` key
+handed the consumer all three requests and each took effect.
+
+The recording host refuses user namespaces, so no sandbox backend runs there and the
+routing's refuse-then-mask preflight refuses an enforced harness. The capture replaced
+that one preflight with "no mask"; the gate extension seal, its read-back, the envelope
+nonce and the permission path ran as shipped. The refusal is after the spawn and does
+not read the sandbox.
 
 ## What the permission capture establishes
 
@@ -55,3 +134,23 @@ terminal id, and the `completed` update carries `_meta.terminal_exit` with the e
 code and nothing else -- the output is meant to be read through the ACP
 `terminal/*` methods, which Kiro Crew does not implement. The model saw the output
 (its reply reports it); the transcript's tool pill does not.
+
+## What the steering capture establishes
+
+`steering-live.jsonl` is the evidence `ACP_BACKENDS_STEERING_REQUEST` holds pi to.
+Taken off `pi-acp` 0.0.34 spawning `pi` 1.3.0, both installed into a scratch npm
+prefix, through Kiro Crew's own `AcpClient` and `PiLaunch`: the gate extension sealed
+and read back, the launcher, and this launch's steer channel
+(`acp.harness.pi_steer`). The recording host has no sandbox backend (no user
+namespaces), so the capture driver ran the session with the sandbox off and the
+floor that refuses an unsandboxed pi neutered, in the driver only. The scripted model
+on the loopback interface called `bash` with a four-second sleep; one second into it
+the client steered, which writes a sealed file rather than a frame, so the steer
+itself is not on the wire. After the tool result the extension queued the steer with
+`pi.sendMessage(message, {deliverAs: "steer"})` at `turn_end`; when pi started that
+message it notified the consumed envelope (the `kiro-crew-steer` marker, the gate
+nonce in `_meta.gate_envelope_nonce`, sequence 1), which `AcpClient` reports as
+`EVENT_STEER_CONSUMED` and never shows as text. The model's next request carried the
+steer as its latest user message, its answer named the steered word, and the same
+`session/prompt` ended `end_turn`. The client removed the steer file at that
+terminal. `test_pi_steer.py` replays the turn through the client's real read loop.

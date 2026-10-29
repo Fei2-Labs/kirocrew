@@ -14,13 +14,11 @@ scan, which is exactly the regression worth catching.
 
 from __future__ import annotations
 
-import ast
 import gc
-import inspect
 import json
 import logging
 import logging.handlers
-import textwrap
+import sys
 import threading
 import weakref
 from pathlib import Path
@@ -31,7 +29,7 @@ from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog, emit
 from kiro_crew.crew_log import session_tree_projection as stp
 from kiro_crew.crew_log import store as crew_store
-from kiro_crew.crew_log.session_tree import OpenedRecord
+from kiro_crew.crew_log.session_tree import TREE_UNIT_CAP, OpenedRecord
 from kiro_crew.crew_log.session_tree_projection import (
     CHECKPOINT_NAME,
     CHECKPOINT_VERSION,
@@ -67,6 +65,14 @@ def _isolated_home(tmp_path, monkeypatch):
     stp.reset_for_tests()
     yield
     stp.reset_for_tests()
+    # ``_write_unit`` goes through the emitter, and the emitter KEEPS the handle it
+    # wrote through (correct for a live session). A kept handle holds that session's
+    # write lease, and ``lease._held`` is process-wide -- so without this, every unit
+    # written here stayed leased in later tests on the same xdist worker, and
+    # test_eventlog_hooks' "no lease is held after release" read those leases as its
+    # own (red in one of five runs of a hygiene sweep). Dropping the handles
+    # releases the leases through their finalizers.
+    emit.reset_caches()
 
 
 def _rec(sid: str, slot: str, created: int = 1, parent: str | None = None) -> OpenedRecord:
@@ -370,7 +376,7 @@ def test_a_second_seed_waits_instead_of_clearing_the_first_ones_removal_record(m
     second_caller: list[threading.Thread] = []
     waited: list[bool] = []
 
-    def scan_then_delete_then_reenter(_self, live_sids=()):
+    def scan_then_delete_then_reenter(_self, live_sids=(), **_asked):
         entered.append("scan")
         if len(entered) == 1:
             proj.forget("s-child")
@@ -559,7 +565,7 @@ def test_a_resume_during_the_scan_does_not_erase_the_scanned_creator_edge(monkey
     parent = _rec("s-parent", "slot-a")
     child = _rec("s-child", "slot-b", created=2, parent="slot-a")
 
-    def scan_then_resume(_self, live_sids=()):
+    def scan_then_resume(_self, live_sids=(), **_asked):
         # The resumed opener commits while the scan runs, naming no creator.
         proj.apply(_rec("s-child", "slot-b", created=3))
         return TreeReading(
@@ -672,7 +678,7 @@ def test_a_removal_during_the_scan_is_not_resurrected_by_the_seed(monkeypatch):
     parent = _rec("s-parent", "slot-a")
     child = _rec("s-child", "slot-b", created=2, parent="slot-a")
 
-    def scan_then_delete(_self, live_sids=()):
+    def scan_then_delete(_self, live_sids=(), **_asked):
         # The deletion lands AFTER this scan listed the unit. That ordering is the whole
         # race: the reading below still carries a record whose unit is already deleted.
         proj.forget("s-child")
@@ -749,6 +755,62 @@ def test_a_moved_data_home_re_seeds_instead_of_serving_the_old_store(tmp_path, m
     assert "slot-z" in nodes
 
 
+def test_an_installed_fold_is_never_reported_as_the_wrong_store(monkeypatch):
+    """No reader may see the fold installed and be told the projection is unseeded.
+
+    ``_attach_slot_parents`` ships EVERY row's ``parent`` as null whenever
+    ``seeded_for_current_store`` is false, and the chat sidebar drops its conductor lane
+    when no row carries a creator. So a window where the records are installed and the
+    store identity is not yet stamped costs the sidebar the nesting it had already
+    earned -- it appears and vanishes, with nothing in the log to say why.
+
+    Sampled from ``_schedule_checkpoint``, which the cold seed calls immediately after
+    it installs the records and releases the lock: that call is inside the window if
+    there is one.
+    """
+    _write_unit("s-parent", "slot-a")
+    _write_unit("s-child", "slot-b", parent="slot-a")
+
+    proj = SessionTreeProjection()
+    seen: list[tuple[bool, int]] = []
+    real = proj._schedule_checkpoint
+
+    def sample() -> None:
+        seen.append((proj.seeded_for_current_store, len(proj.nodes())))
+        real()
+
+    monkeypatch.setattr(proj, "_schedule_checkpoint", sample)
+    proj.ensure_seeded()
+
+    assert seen, "the cold seed did not reach the checkpoint step"
+    for seeded, count in seen:
+        if count:
+            assert seeded is True, "the fold was installed while the store read as another"
+
+
+def test_a_store_root_that_cannot_be_read_keeps_the_fold(monkeypatch):
+    """An unreadable root is "cannot tell", never "a different store".
+
+    :func:`_current_root` is path arithmetic that CAN fail -- resolving the data home
+    touches the filesystem -- and it answers with an empty string when it does. Read as
+    a store identity that string matches nothing, so one transient fault reported the
+    projection unseeded and the next ``ensure_seeded`` discarded a correct fold to
+    re-scan for it. Every slots frame in between shipped no lineage at all.
+    """
+    _write_unit("s-parent", "slot-a")
+    _write_unit("s-child", "slot-b", parent="slot-a")
+
+    proj = SessionTreeProjection()
+    proj.ensure_seeded()
+    assert proj.nodes()["slot-b"].parent_slot == "slot-a"
+
+    monkeypatch.setattr(stp, "_current_root", lambda: "")
+
+    assert proj.seeded_for_current_store is True, "a failed root read reported another store"
+    proj.ensure_seeded()
+    assert proj.nodes()["slot-b"].parent_slot == "slot-a", "a correct fold was discarded"
+
+
 def test_no_checkpoint_seeds_from_one_cold_scan():
     _write_unit("s-parent", "slot-a")
     _write_unit("s-child", "slot-b", parent="slot-a")
@@ -765,6 +827,122 @@ def test_an_empty_store_seeds_to_an_empty_tree():
     proj.ensure_seeded()
     assert proj.nodes() == {}
     assert proj.reading().incomplete is False
+
+
+# ── a seed that failed ─────────────────────────────────────────────────────
+
+
+def test_a_failed_seed_is_re_attempted_rather_than_latched(monkeypatch):
+    """A store fault must cost a cooldown of missing lineage, not the whole process.
+
+    A failed seed serves an EMPTY tree, and the seed gate is otherwise cleared only by
+    the data home changing -- so latching it means the first transient fault of a boot
+    takes every reader's lineage until the gateway restarts. Nothing downstream recovers
+    it: ``_attach_slot_parents`` asks whether the projection is seeded, and it is.
+    """
+    _write_unit("s-parent", "slot-a")
+    _write_unit("s-child", "slot-b", parent="slot-a")
+
+    proj = SessionTreeProjection()
+    calls = {"n": 0}
+    real = SessionTreeProjection._seed
+
+    def flaky(self, live_sids):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("the store could not be read")
+        return real(self, live_sids)
+
+    monkeypatch.setattr(SessionTreeProjection, "_seed", flaky)
+
+    proj.ensure_seeded()
+    assert proj.nodes() == {}, "a failed seed serves no lineage, which is the point"
+    assert proj.reading().incomplete is True
+
+    # Inside the cooldown: no second scan, because the readers arrive on a timer and a
+    # bare unlatch would re-pay a cold scan every few seconds on a broken store.
+    proj.ensure_seeded()
+    assert calls["n"] == 1
+
+    # Past it: the fault is re-attempted and the lineage comes back.
+    monkeypatch.setattr(stp.time, "monotonic", lambda: 1e9)
+    proj.ensure_seeded()
+
+    assert calls["n"] == 2
+    assert proj.nodes()["slot-b"].parent_slot == "slot-a"
+
+
+def test_a_seed_that_succeeded_is_never_re_attempted(monkeypatch):
+    """The retry belongs to the failure alone: success is final for its store.
+
+    Without clearing the marker a recovered store would keep re-scanning forever, which
+    is the per-read cost this module exists to remove.
+    """
+    _write_unit("s-parent", "slot-a")
+
+    proj = SessionTreeProjection()
+    calls = {"n": 0}
+    real = SessionTreeProjection._seed
+
+    def counted(self, live_sids):
+        calls["n"] += 1
+        return real(self, live_sids)
+
+    monkeypatch.setattr(SessionTreeProjection, "_seed", counted)
+
+    proj.ensure_seeded()
+    assert calls["n"] == 1
+
+    monkeypatch.setattr(stp.time, "monotonic", lambda: 1e9)
+    for _ in range(5):
+        proj.ensure_seeded()
+
+    assert calls["n"] == 1
+
+
+def test_a_failed_seed_says_so_at_warning(monkeypatch, caplog):
+    """The empty tree it serves is indistinguishable from a store with no lineage."""
+
+    def boom(self, live_sids):
+        raise OSError("the store could not be read")
+
+    monkeypatch.setattr(SessionTreeProjection, "_seed", boom)
+
+    with caplog.at_level(logging.WARNING, logger=stp.logger.name):
+        SessionTreeProjection().ensure_seeded()
+
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "could not be seeded" in warnings[0].getMessage()
+    assert warnings[0].exc_info is not None
+
+
+# ── a gateway restart ──────────────────────────────────────────────────────
+
+
+def test_a_restart_keeps_the_edge_the_slots_older_log_recorded():
+    """A restored slot writes a NEW log naming no creator, and the old edge survives.
+
+    The citation is stamped at ``session_create`` from a witness this process holds and
+    does not persist, so every slot restored after a restart opens a second log with no
+    ``parent``. The edge has to come from the slot's FIRST log, which is on disk and
+    closed -- and the cold seed has to admit that log, not only the live session's
+    newest one. Both halves are asserted here because either alone leaves a sidebar
+    that stops nesting after every gateway restart.
+    """
+    _write_unit("s-parent", "slot-a")
+    _write_unit("s-child-first", "slot-b", parent="slot-a")
+    # The restart: same slots, new sessions, no creator known to this process.
+    _write_unit("s-parent-again", "slot-a")
+    _write_unit("s-child-again", "slot-b")
+
+    # A cold seed, as the process after the restart does it, preferring the LIVE sids --
+    # which are the parentless ones.
+    stp.reset_for_tests()
+    proj = SessionTreeProjection()
+    proj.ensure_seeded(("s-parent-again", "s-child-again"))
+
+    assert proj.nodes()["slot-b"].parent_slot == "slot-a"
 
 
 # ── the emitter hook ───────────────────────────────────────────────────────
@@ -1048,20 +1226,182 @@ def test_the_edge_recorder_swallows_a_projection_failure_as_text(monkeypatch, ca
     ), "the traceback text did not reach the record"
 
 
-def test_the_edge_recorder_body_is_one_guarded_try():
-    """Nothing in ``_record_session_tree_edge`` sits outside its ``try``.
+class _HostileHeader:
+    """A handle whose header cannot be read at all."""
 
-    The caller is the writer job, whose comment says this never raises. A statement
-    before the ``try`` -- an import, a lookup -- is a raise path the guard does not
-    cover, and ``session/opened`` is already on disk when it runs.
+    @property
+    def header(self):
+        raise RuntimeError("the header cannot be read")
+
+
+class _HostileValue:
+    """An argument that raises on anything done with it: truth, text, equality, hash."""
+
+    def __bool__(self):
+        raise RuntimeError("the argument cannot be read")
+
+    __str__ = __repr__ = __bool__
+
+    def __eq__(self, other):
+        raise RuntimeError("the argument cannot be read")
+
+    __hash__ = None
+
+
+@pytest.mark.parametrize("failure", ["import", "header", "projection", "arguments"])
+def test_the_edge_recorder_raises_nothing_into_the_writer_job(monkeypatch, caplog, failure):
+    """Nothing the edge recorder does can raise into the writer job that called it.
+
+    The caller is the job that has just appended ``session/opened``, so a raise here
+    would report a landed entry as a failed one. Every step that can fail is driven to
+    fail -- loading the projection, reading the header, folding the record, and the
+    parent and superseded ids themselves -- and the call must return, saying so at debug
+    level.
+
+    Mutation guard: moving the projection import, or the header read, ahead of the
+    recorder's ``try`` lets the matching case raise and reddens it; letting an unreadable
+    header escape its own guard turns a recorded edge into a reported miss.
     """
-    source = inspect.getsource(emit._record_session_tree_edge)
-    fn = ast.parse(textwrap.dedent(source)).body[0]
-    assert isinstance(fn, ast.FunctionDef)
-    body = fn.body
-    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
-        body = body[1:]  # the docstring
-    assert len(body) == 1 and isinstance(body[0], ast.Try), (
-        "the edge recorder has a statement outside its try/except, which can raise into "
-        f"the writer job: {[type(n).__name__ for n in body]}"
+    handle: object = _log(f"s-hostile-{failure}", "slot-a")
+    parent: object = None
+    superseded: object = None
+    if failure == "arguments":
+        parent, superseded = _HostileValue(), _HostileValue()
+    elif failure == "import":
+        monkeypatch.setitem(sys.modules, stp.__name__, None)
+    elif failure == "header":
+        handle = _HostileHeader()
+    else:
+        monkeypatch.setattr(
+            stp, "record_opened", lambda *a: (_ for _ in ()).throw(RuntimeError("refused"))
+        )
+    with (
+        caplog.at_level(logging.DEBUG, logger=emit.__name__),
+        caplog.at_level(logging.DEBUG, logger=stp.__name__),
+    ):
+        emit._record_session_tree_edge(f"s-hostile-{failure}", "slot-a", handle, parent, superseded)
+    ours = [r for r in caplog.records if "session tree projection not advanced" in r.getMessage()]
+    # An unreadable header orders nothing and blocks nothing: the edge is still recorded,
+    # so it is not a miss. Unreadable ids reach the projection's own guard, which
+    # reports them itself.
+    expected = 0 if failure in ("header", "arguments") else 1
+    assert len(ours) == expected, f"the recorder reported {len(ours)} misses, not {expected}"
+    if failure == "arguments":
+        folded = [r for r in caplog.records if "could not apply an opened record" in r.getMessage()]
+        assert len(folded) == 1, "the unreadable ids never reached the projection's guard"
+
+
+# --- slot_depth: the in-memory walk the depth field is resolved from ---
+
+
+def test_slot_depth_of_a_root_is_zero():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    assert stp.slot_depth("slot-a") == 0
+
+
+def test_slot_depth_of_a_child_is_one():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    proj.apply(_rec("s-child", "slot-b", created=2, parent="slot-a"))
+    assert stp.slot_depth("slot-b") == 1
+
+
+def test_slot_depth_counts_each_hop_up_the_chain():
+    # slot-a <- slot-b <- slot-c. The grandchild stands two creators below the root.
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-a", "slot-a"))
+    proj.apply(_rec("s-b", "slot-b", created=2, parent="slot-a"))
+    proj.apply(_rec("s-c", "slot-c", created=3, parent="slot-b"))
+    assert stp.slot_depth("slot-c") == 2
+
+
+def test_slot_depth_of_an_empty_slot_is_none():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    assert stp.slot_depth("") is None
+
+
+def test_slot_depth_of_an_unknown_slot_is_none():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    assert stp.slot_depth("slot-missing") is None
+
+
+def test_slot_depth_is_none_when_the_chain_ends_at_an_unplaced_citation():
+    # slot-b cites slot-ghost, which has no record of its own: the fold keeps the
+    # citation but cannot place it, so slot-b is a root of the folded tree while
+    # carrying a parent. Its true depth is unknown, not zero.
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-child", "slot-b", created=2, parent="slot-ghost"))
+    assert stp.slot_depth("slot-b") is None
+
+
+def test_slot_depth_is_none_before_the_projection_is_seeded():
+    # A fresh projection for another store cannot answer: an unseeded read must say
+    # "not established" rather than invent a root.
+    stp.reset_for_tests()
+    assert stp.slot_depth("slot-a") is None
+
+
+# --- root_depth: the same refusal, applied to the side that needs no walk ---
+
+
+def test_root_depth_is_zero_on_a_readable_tree():
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    assert stp.root_depth() == 0
+
+
+def test_root_depth_is_none_before_the_projection_is_seeded():
+    stp.reset_for_tests()
+    assert stp.root_depth() is None
+
+
+def test_root_depth_is_none_when_the_seed_itself_faulted(monkeypatch):
+    # A reading the fold could not complete is `incomplete` whatever the cause, and a
+    # root's zero is withheld on the same flag a child's walk is.
+    stp.reset_for_tests()
+    monkeypatch.setattr(
+        SessionTreeProjection,
+        "_seed",
+        lambda self, live_sids: (_ for _ in ()).throw(OSError("the store could not be read")),
     )
+    proj = stp.projection()
+    proj.ensure_seeded()
+    assert proj.reading().incomplete is True
+    assert stp.root_depth() is None
+
+
+def test_an_over_cap_tree_yields_no_root_only_distribution():
+    """The bias this censoring rule exists to remove.
+
+    Past :data:`TREE_UNIT_CAP` the reading is permanently ``incomplete``, which is the
+    state the busiest install -- the one with the most delegation -- sits in. A child's
+    depth is withheld there. If a root's zero were still written, the depth counter
+    would report almost every session at depth 0 and the roots gauge would report
+    nothing, which answers "how deep does delegation go" backwards. So both answers
+    have to go absent together.
+    """
+    proj = stp.projection()
+    proj.ensure_seeded()
+    proj.apply(_rec("s-root", "slot-a"))
+    proj.apply(_rec("s-child", "slot-b", created=2, parent="slot-a"))
+    # Both sides answer while the tree is readable.
+    assert stp.root_depth() == 0
+    assert stp.slot_depth("slot-b") == 1
+
+    # Push the population past the cap. Eviction sets `incomplete`.
+    for n in range(TREE_UNIT_CAP + 1):
+        proj.apply(_rec(f"s-fill-{n}", f"slot-fill-{n}", created=100 + n))
+    assert proj.reading().incomplete is True
+
+    # Neither side answers now: no observation at all, rather than roots only.
+    assert stp.slot_depth("slot-b") is None
+    assert stp.root_depth() is None

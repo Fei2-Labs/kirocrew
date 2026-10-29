@@ -14,7 +14,8 @@ a worktree's lifecycle script could write. The cutover therefore moved into the 
 process (``dev_fleet/gateway_routes.py``, pinned by ``test_dev_fleet_gateway_routes``),
 and what the sandbox keeps is:
 
-* the mask, in every mode, on both platform builders, with NO owned-leaf exemption
+* the mask, in every mode, on both platforms -- in the namespace plan the Linux
+  launcher is handed and in the Seatbelt profile -- with NO owned-leaf exemption
   for dev-fleet (``_APP_BACKEND_OWNED_LEAVES`` must never list the pointer);
 * a MOUNT TARGET for it, materialised before every namespace spawn, because an absent
   file cannot be masked and the crew home root is writable in-sandbox;
@@ -25,14 +26,13 @@ and what the sandbox keeps is:
 from __future__ import annotations
 
 import inspect
-import json
 import os
 import re
 import sys
 
 import pytest
 
-from kiro_crew import sandbox
+from kiro_crew import sandbox, sandbox_plan
 from kiro_crew.service import live_target
 
 _POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher only")
@@ -40,16 +40,28 @@ _MODES = ("standard", "cc", "strict")
 _CREW_PREFIXES = (".kiro/crew", ".kirocrew")
 
 
+@pytest.fixture(autouse=True)
+def _no_host_ssh_probe(monkeypatch):
+    """A namespace plan asks the HOST's ``ssh -V`` for accept-new support.
+
+    Every namespace test here reads the plan's mask list; none is about that probe,
+    and a real ssh spawned from the test process is a host dependency the plan must
+    not vary with. Pinned so no binary runs.
+    """
+    monkeypatch.setattr(sandbox, "_ssh_supports_accept_new", lambda: True)
+
+
 def _crew_path(prefix: str, leaf: str) -> str:
-    """Spell a crew-home target the way the production builders do (single relative join)."""
+    """Spell a crew-home target the way the production planner does (single relative join)."""
     return os.path.join(os.path.expanduser("~"), f"{prefix}/{leaf}")
 
 
 def _launcher_hidden(mode: str, *, extra_visible_dirs: tuple[str, ...] = ()) -> set[str]:
-    script = sandbox._build_launcher_script(mode, extra_visible_dirs=extra_visible_dirs)
-    match = re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S)
-    assert match, "SENSITIVE_DIRS missing from the launcher"
-    return set(json.loads(match.group(1)))
+    """The trees the namespace launcher bind-masks for a spawn in *mode*."""
+    plan = sandbox._spawn_plan(
+        sandbox_plan.BACKEND_NAMESPACE, mode, extra_visible_dirs=extra_visible_dirs
+    )
+    return set(plan.sensitive_dirs)
 
 
 class TestTheLiteralsCannotDrift:
@@ -298,7 +310,7 @@ class TestTheMaskGetsAMountTarget:
 
     def test_the_linux_spawn_path_calls_it(self) -> None:
         """Pinned by source: the mask is built from the live host, which CI cannot dirty."""
-        assert "_materialize_live_target_mask_target()" in inspect.getsource(
+        assert "_materialize_live_target_mask_target(" in inspect.getsource(
             sandbox.namespace_argv
         ), "the namespace spawn path does not materialise the live-target mask target"
 

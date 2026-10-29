@@ -32,16 +32,23 @@ const SOURCE_HUE: Record<string, string> = {
   tool_output: 'var(--ctx-src-tool)',
 }
 
-export const SOURCE_MUTE = 'var(--ctx-src-mute)'
+const SOURCE_MUTE = 'var(--ctx-src-mute)'
 
 /** The fill for one context-source label. */
 export function sourceFill(label: string): string {
   return SOURCE_HUE[label] ?? SOURCE_MUTE
 }
 
-/** A readable foreground for a label drawn ON its own fill. The hues are all
- *  mixed toward the surface, so the theme's own strong text reads on every one;
- *  return it as the single contrasting choice rather than a per-hue table. */
-export function sourceFg(): string {
-  return 'var(--text-strong, var(--text))'
+/**
+ * Fills for the Context Breakdown chart's five plain-language categories (see
+ * `--ctx-cat-*` in index.css). The user's message rides the accent, memory
+ * shares the source hue above so the tree and the chart agree, and the rest are
+ * category hues mixed into the surface the same way.
+ */
+export const CATEGORY_FILL: Readonly<Record<'message' | 'memory' | 'rules' | 'skills' | 'other', string>> = {
+  message: 'var(--ctx-cat-message)',
+  memory: 'var(--ctx-cat-memory)',
+  rules: 'var(--ctx-cat-rules)',
+  skills: 'var(--ctx-cat-skills)',
+  other: 'var(--ctx-cat-other)',
 }

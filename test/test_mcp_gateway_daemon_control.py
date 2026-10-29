@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import socket
 import sys
@@ -93,7 +94,7 @@ def _daemon_on(path: Path, reply: bytes | None, *, chunked: bool = False):
                     # A stream hands back whatever is buffered, not whole frames.
                     for i in range(0, len(reply), 4):
                         conn.sendall(reply[i : i + 4])
-                        time.sleep(0.002)
+                        time.sleep(0.002)  # flake-ok: paces chunks so reads return partial frames
                 else:
                     conn.sendall(reply)
             except OSError:
@@ -396,9 +397,20 @@ class TestTheWindowsStopPathIsReachable:
     def test_the_doctor_reports_the_revision(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
-        """The in-app diagnosis an operator needs: which daemon, whose code."""
+        """The in-app diagnosis an operator needs: which daemon, whose code.
+
+        The install side is pinned to a git revision. ``code_fingerprint()`` is
+        cached per process, and on a POSIX runner with ``IS_WINDOWS`` set its
+        first call takes the mtime rule (no trusted git), which puts the two
+        sides on different rules and turns the mismatch into "another install".
+        """
+        import kiro_crew.code_fingerprint as fp_mod
+
+        monkeypatch.setattr(fp_mod, "code_fingerprint", lambda: "b4cf148542b8e6a5")
         monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(dc, "_ping", lambda p: _pong(pid=9999, fingerprint="old-checkout"))
+        monkeypatch.setattr(
+            dc, "_ping_detailed", lambda p: ("ok", _pong(pid=9999, fingerprint="old-checkout"))
+        )
         monkeypatch.setattr(dc, "configured_socket_path", lambda: tmp_path / "gw.sock")
         monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
         issues: list[str] = []
@@ -592,11 +604,23 @@ class TestCliStopTakesTheDaemonDown:
         assert "Stopped the MCP gateway daemon" in capsys.readouterr().out
 
 
+def _doctor_sees(monkeypatch: pytest.MonkeyPatch, info) -> None:
+    """Hand Doctor a probe result: a live daemon, or verified absence."""
+    probe = dc.DaemonProbe(
+        outcome=dc.PROBE_OK if info else dc.PROBE_ABSENT,
+        elapsed_secs=0.0,
+        transport="unix_socket",
+        pong_decoded=info is not None,
+        info=info,
+    )
+    monkeypatch.setattr(dc, "describe_daemon_detailed", lambda: probe)
+
+
 class TestDoctorShowsTheDaemonRevision:
     def test_not_running(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        monkeypatch.setattr(dc, "describe_daemon", lambda: None)
+        _doctor_sees(monkeypatch, None)
         issues: list[str] = []
         cli_doctor._doctor_mcp_gateway_daemon(issues)
         assert "not running" in capsys.readouterr().out
@@ -606,7 +630,7 @@ class TestDoctorShowsTheDaemonRevision:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         info = dc.DaemonInfo(Path("s"), 9999, 4242, code_fingerprint(), ("CORE",))
-        monkeypatch.setattr(dc, "describe_daemon", lambda: info)
+        _doctor_sees(monkeypatch, info)
         monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
         issues: list[str] = []
         cli_doctor._doctor_mcp_gateway_daemon(issues)
@@ -618,7 +642,7 @@ class TestDoctorShowsTheDaemonRevision:
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         info = dc.DaemonInfo(Path("s"), 9999, 4242, "old-checkout", ("CORE",))
-        monkeypatch.setattr(dc, "describe_daemon", lambda: info)
+        _doctor_sees(monkeypatch, info)
         monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: False)
         issues: list[str] = []
         cli_doctor._doctor_mcp_gateway_daemon(issues)
@@ -627,12 +651,152 @@ class TestDoctorShowsTheDaemonRevision:
         assert "kirocrew restart" in out
         assert issues == ["MCP gateway daemon runs a different code revision than this install"]
 
+    @pytest.mark.parametrize(
+        ("mine", "theirs"),
+        [
+            ("mtime:4c5de10efc166d5e04e67512", "b4cf148542b8e6a591717c1b2a3610696979d7ce"),
+            ("b4cf148542b8e6a591717c1b2a3610696979d7ce+5a9e921cdca0b0ec", "mtime:4c5de10efc166d5e"),
+        ],
+        ids=["app-doctor-checkout-daemon", "checkout-doctor-app-daemon"],
+    )
+    def test_another_installs_daemon_is_information_not_an_issue(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        mine: str,
+        theirs: str,
+    ) -> None:
+        """A git revision and an mtime stamp name two installs, not a stale daemon."""
+        import kiro_crew.code_fingerprint as fp_mod
+
+        monkeypatch.setattr(fp_mod, "code_fingerprint", lambda: mine)
+        info = dc.DaemonInfo(Path("s"), 9999, 4242, theirs, ("CORE",))
+        _doctor_sees(monkeypatch, info)
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_gateway_daemon(issues)
+        out = capsys.readouterr().out
+        assert "another install" in out and theirs in out and mine in out
+        assert "gateway (pid 4242)" in out, "a stale owner must be nameable to stop"
+        assert "❌" not in out and "kirocrew restart" not in out
+        assert issues == []
+
+    @pytest.mark.parametrize("owner_pid", [0, 4242], ids=["no-owner", "owner-gone"])
+    def test_an_ownerless_cross_install_daemon_is_still_an_issue(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        owner_pid: int,
+    ) -> None:
+        """With no live owner, this install's gateway may have adopted it, so it stays an issue."""
+        import kiro_crew.code_fingerprint as fp_mod
+
+        monkeypatch.setattr(fp_mod, "code_fingerprint", lambda: "b4cf148542b8e6a5")
+        info = dc.DaemonInfo(Path("s"), 9999, owner_pid, "mtime:4c5de10efc166d5e", ("CORE",))
+        _doctor_sees(monkeypatch, info)
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: False)
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_gateway_daemon(issues)
+        out = capsys.readouterr().out
+        assert "another install" not in out and "kirocrew restart" in out
+        assert issues == ["MCP gateway daemon runs a different code revision than this install"]
+
+    def test_same_scheme_mismatch_is_still_an_issue(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Two wheel builds both stamp mtimes, so a mismatch there is a stale daemon."""
+        import kiro_crew.code_fingerprint as fp_mod
+
+        monkeypatch.setattr(fp_mod, "code_fingerprint", lambda: "mtime:new")
+        info = dc.DaemonInfo(Path("s"), 9999, 4242, "mtime:old", ("CORE",))
+        _doctor_sees(monkeypatch, info)
+        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_gateway_daemon(issues)
+        assert "kirocrew restart" in capsys.readouterr().out
+        assert issues == ["MCP gateway daemon runs a different code revision than this install"]
+
     def test_a_pre_fingerprint_daemon_is_named_as_such(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         info = dc.DaemonInfo(Path("s"), 9999, 0, "", ())
-        monkeypatch.setattr(dc, "describe_daemon", lambda: info)
+        _doctor_sees(monkeypatch, info)
         issues: list[str] = []
         cli_doctor._doctor_mcp_gateway_daemon(issues)
         assert "pre-fingerprint build" in capsys.readouterr().out
         assert len(issues) == 1
+
+
+class TestDoctorSaysNotRunningOnlyForVerifiedAbsence:
+    """Doctor reserves "not running" for an endpoint nothing is listening on.
+
+    A probe that timed out, was refused on identity, or got back something that
+    is not a pong could not verify the daemon either way, so it is reported as
+    unreachable or unverified with its reason rather than as absent.
+    """
+
+    def _doctor(self, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path) -> str:
+        monkeypatch.setattr(dc, "configured_socket_path", lambda: tmp_path / "gw.sock")
+        issues: list[str] = []
+        cli_doctor._doctor_mcp_gateway_daemon(issues)
+        return capsys.readouterr().out
+
+    def test_nothing_listening_is_not_running(
+        self, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+    ) -> None:
+        _double_transport(monkeypatch, connect_raises=FileNotFoundError("gone"))
+        assert "not running" in self._doctor(monkeypatch, capsys, tmp_path)
+
+    @pytest.mark.parametrize(
+        ("kw", "label", "reason"),
+        [
+            ({"connect_stalls": True}, "unreachable", "connect timed out"),
+            ({"reply": None, "eof": False}, "unreachable", "no reply in time"),
+            ({"reply": b"not json\n"}, "unverified", "malformed reply"),
+            ({"reply": b'{"type":"nope"}\n'}, "unverified", "reply was not a pong"),
+        ],
+    )
+    def test_an_inconclusive_probe_is_not_reported_as_absent(
+        self, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path, kw, label, reason
+    ) -> None:
+        monkeypatch.setattr(dc, "_PING_TIMEOUT_SECS", 0.05)
+        _double_transport(monkeypatch, **kw)
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "not running" not in out
+        assert label in out and reason in out
+
+    def test_a_principal_refusal_is_unverified(
+        self, monkeypatch: pytest.MonkeyPatch, capsys, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
+        _double_transport(
+            monkeypatch, connect_raises=ConnectionRefusedError("principal not confirmed")
+        )
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "not running" not in out
+        assert "unverified" in out and "endpoint owner not confirmed" in out
+
+    def test_every_inconclusive_outcome_has_a_doctor_reason(self) -> None:
+        from kiro_crew.doctor_checks.mcp import _DAEMON_PROBE_REASONS
+
+        assert set(_DAEMON_PROBE_REASONS) == dc.PROBE_OUTCOMES - {dc.PROBE_OK, dc.PROBE_ABSENT}
+
+    def test_the_detailed_result_carries_outcome_and_no_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _double_transport(monkeypatch, reply=json.dumps(_pong(pid=4321)).encode() + b"\n")
+        probe = dc.describe_daemon_detailed(tmp_path / "gw.sock")
+        assert probe.outcome == dc.PROBE_OK and probe.pong_decoded is True
+        assert probe.info is not None and probe.info.pid == 4321
+        assert probe.transport in {"unix_socket", "named_pipe"} and probe.elapsed_secs >= 0
+        assert str(tmp_path) not in repr(dataclasses.replace(probe, info=None))
+
+    def test_describe_daemon_keeps_its_optional_return(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(dc, "_PING_TIMEOUT_SECS", 0.05)
+        _double_transport(monkeypatch, reply=None, eof=False)
+        assert dc.describe_daemon(tmp_path / "gw.sock") is None
+        assert dc.describe_daemon_detailed(tmp_path / "gw.sock").outcome == (
+            dc.PROBE_RESPONSE_TIMEOUT
+        )

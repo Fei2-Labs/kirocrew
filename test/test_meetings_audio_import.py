@@ -37,6 +37,7 @@ from kiro_crew.apps.builtins.meetings.backend.domain import audio
 from kiro_crew.apps.builtins.meetings.backend.routes import _common
 from kiro_crew.apps.builtins.meetings.backend.routes import audio_import as ai
 from kiro_crew.pinned_fs import supports_pinned_walk
+from kiro_crew.testing.wait import await_until
 
 BASE = k.API_BASE
 
@@ -546,10 +547,13 @@ class TestRefusals:
 
     @pytest.mark.asyncio
     async def test_an_emptied_transcript_is_also_502(self, app, fake_sessions, monkeypatch):
-        """The hallucination filter returns "" for a transcript that was all boilerplate.
+        """``""`` is the transcriber's answer for a recording with no speech in it,
+        and for one the hallucination filter emptied because it was all boilerplate.
 
-        Reporting success with zero lines would put "Thanks for watching!" — or
-        nothing at all — in front of the user as a completed import.
+        Either way there is nothing to import: reporting success with zero lines
+        would put "Thanks for watching!" — or nothing at all — in front of the
+        user as a completed import. So the route answers the same 502 it does for
+        a failure (the client's move is identical) and dispatches no line.
         """
         _patch(monkeypatch, transcript="")
         async with client_for(app) as client:
@@ -558,6 +562,10 @@ class TestRefusals:
                 f"{BASE}/meetings/standup/import", json={"audio_path": "/tmp/a.wav"}
             )
             assert resp.status == 502
+            assert (await resp.json())["code"] == "transcription_failed"
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            assert all(len(q.queue) == 0 for q in session.agents.values())
 
     @pytest.mark.asyncio
     async def test_an_over_long_recording_is_413_and_nothing_is_dispatched(
@@ -868,7 +876,7 @@ class TestRefusals:
                 client.post(f"{BASE}/meetings/standup/import", json={"audio_path": "/tmp/a.wav"})
             )
             try:
-                await asyncio.wait_for(started.wait(), timeout=5.0)
+                await await_until(started, what="the first import reaching transcribe")
                 second = await client.post(
                     f"{BASE}/meetings/standup/import", json={"audio_path": "/tmp/b.wav"}
                 )
@@ -1490,7 +1498,7 @@ class TestNoPinnedWalkBackstop:
         the ``os.open`` itself follows an ancestor junction planted after any
         check, and a UNC target fires outbound SMB authentication as a side
         effect of the open, which no after-open check can undo. Per the repo
-        ruling recorded in ``snapshot.py``'s notification copy, the branch now
+        ruling recorded in ``snapshot_merge_driver.py``'s notification copy, the branch now
         refuses outright: nothing is opened, nothing is copied, even for an
         honest file. The route answers 501 before this is ever reached; this
         pins the backstop."""

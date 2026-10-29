@@ -1,7 +1,8 @@
 """Coverage for the Kiro Crew gateway's deterministic cron-execution paths.
 
-``test_slack_gateway.py`` and ``test_cron_gateway_integration.py`` drive the
-LLM (``message``) arm of ``_cron_callback`` thoroughly, but the two
+``test_slack_gateway_cron.py``, ``test_cron_gateway_integration.py`` and
+``test_cron_gateway_integration_llm.py`` drive the LLM (``message``) arm of
+``_cron_callback`` thoroughly, but the two
 deterministic arms — ``job.command`` (shell) and ``job.script`` (Python
 callable) — only had their happy paths exercised. Everything reached here was
 uncovered by the whole suite before this file:
@@ -25,7 +26,16 @@ Everything is driven through mocked collaborators: the sandbox runners, the
 governance gate, SEL and the cron service are all patched, so no subprocess, no
 socket and no write outside the per-test ``KIROCREW_HOME`` (pinned by
 ``test/conftest.py``) happens. Style and patch seams mirror
-``test_slack_gateway.py`` / ``test_cron_gateway_integration.py``.
+``test_slack_gateway_cron.py`` / ``test_cron_gateway_integration.py``.
+
+This file keeps the command and script arms, claim-time vetting (an abandoned vet and
+the vet's share of the subprocess budget included), ``_deliver_script_result`` and the
+module helper guards. The ``message`` arm's fire-time denial, the ``_init_cron`` wiring
+and agent-alias resolution are in ``test_slack_gateway_cron_exec_coverage_message_arm.py``.
+Where a cron's results and failure alerts go (the non-Slack channel reply ladder, channel
+and failure delivery, embedded images), and where a task-runner approval notice goes, is
+in ``test_slack_gateway_cron_exec_coverage_delivery.py``. The harness the three files
+share lives in ``slack_gateway_cron_exec_coverage_helpers.py``.
 """
 
 from __future__ import annotations
@@ -34,49 +44,27 @@ import ast
 import asyncio
 import threading
 import time
-from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, AsyncIterator
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from slack_gateway_cron_exec_coverage_helpers import (
+    _blind_sel,
+    _cron_cb,
+    _cron_service_double,
+    _job,
+    _make_orchestrator,
+    _mock_dashboard_state,
+)
 
-from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.cron import CronJob, CronStoreBusy
+from kiro_crew.cron import CronStoreBusy
 from kiro_crew.dashboard import chat_persistence
 from kiro_crew.slack import gateway as gw
+from kiro_crew.testing.wait import async_wait_until
 
 # ─── Helpers ─────────────────────────────────────────────────────────────
-
-
-def _make_orchestrator(**kwargs: Any) -> Any:
-    """Build a GatewayOrchestrator with mocked credentials (no Slack tokens).
-
-    Returned as ``Any`` on purpose: every test below swaps real collaborators
-    for mocks, which do not satisfy the declared attribute types.
-    """
-    cfg = KiroCrewConfig()
-    creds = {"KIROCREW_OWNER_ID": "U_OWNER"}
-    with patch.object(cfg, "load_credentials", return_value=creds):
-        return gw.GatewayOrchestrator(
-            cfg,
-            no_dashboard=kwargs.pop("no_dashboard", True),
-            no_crons=kwargs.pop("no_crons", True),
-            no_open=True,
-        )
-
-
-def _mock_dashboard_state() -> MagicMock:
-    ds = MagicMock()
-    ds._slots = {}
-    ds.notify = MagicMock()
-    ds.push_slots_update = MagicMock()
-    ds.push_refresh = MagicMock()
-    ds.get_slot = MagicMock(return_value=None)
-    ds.has_slot = MagicMock(return_value=False)
-    ds.conversation_log = None
-    return ds
 
 
 def _mock_slot(*, running: bool = False) -> MagicMock:
@@ -86,146 +74,6 @@ def _mock_slot(*, running: bool = False) -> MagicMock:
     slot.append = MagicMock()
     slot.task = None
     return slot
-
-
-def _job(**kwargs: Any) -> CronJob:
-    """A real CronJob, so record_success / record_failure semantics are real."""
-    job = CronJob(
-        id=kwargs.pop("id", "j1"),
-        name=kwargs.pop("name", "nightly probe"),
-        message=kwargs.pop("message", "go"),
-    )
-    for key, value in kwargs.items():
-        setattr(job, key, value)
-    return job
-
-
-def _cron_service_double() -> MagicMock:
-    svc = MagicMock()
-    svc.start = AsyncMock()
-    svc.start_reaper = MagicMock()
-    svc.remove_job_async = AsyncMock(return_value=True)
-    svc.defer_removal = MagicMock()
-    svc.set_refresh_callback = MagicMock()
-    svc.register_active_session_key = MagicMock()
-    svc.clear_active_session_key = MagicMock()
-    svc.get_job = MagicMock(return_value=None)
-    return svc
-
-
-def _blind_sel() -> MagicMock:
-    """A SEL double whose audit write always fails (drives the best-effort arms)."""
-    sel_obj = MagicMock()
-    sel_obj.log_tool_invocation = MagicMock(side_effect=RuntimeError("sel down"))
-    return sel_obj
-
-
-def _sandboxed(result: Any) -> Any:
-    """A sandbox-runner double: returns *result*, or raises it when it is an error.
-
-    The real runners execute inside ``run_in_executor``, so raising here
-    propagates through ``asyncio.wait_for`` exactly as a real failure does —
-    which is what lets the timeout arm be driven without a real wall-clock wait.
-    """
-
-    def _run(*_args: Any, **_kwargs: Any) -> Any:
-        if isinstance(result, BaseException):
-            raise result
-        return result
-
-    return _run
-
-
-@asynccontextmanager
-async def _cron_cb(
-    orch: Any,
-    *,
-    svc: MagicMock | None = None,
-    gate_reason: Any = "",
-    sel_obj: MagicMock | None = None,
-    command_result: Any = None,
-    script_result: Any = None,
-    queue_hook: Any = None,
-) -> AsyncIterator[Any]:
-    """Run ``_init_cron`` with every collaborator patched and yield ``on_job``.
-
-    The callback resolves ``sel`` / ``vet_job_at_fire_time`` / the sandbox
-    runners from module globals at CALL time, so it must be invoked while these
-    patches are still active — hence a context manager rather than a plain
-    factory.
-
-    ``gate_reason`` may be a plain string (a fixed verdict, the common case) or
-    a ``job -> str`` callable, for the cases where the verdict must CHANGE
-    between the fire-time gate and a later re-vet — a script body edited on
-    disk, or a policy tightened, while the call sat in the pool queue.
-
-    ``queue_hook`` models that queue wait. When given, the execution dispatch
-    (``run_in_cron_pool``) is replaced by a double that runs the hook and only
-    THEN invokes whatever callable production code submitted. That is the
-    window the queue wait opens: it is deliberately not charged to the job's
-    deadline, so the world can change inside it. Note it patches only the
-    EXECUTION dispatch — the fire-time gate goes through
-    ``run_in_cron_gate_pool`` and still runs for real, keeping the two seams
-    distinct.
-    """
-    service = svc if svc is not None else _cron_service_double()
-    captured: dict[str, Any] = {}
-
-    async def _create(**kw: Any) -> MagicMock:
-        captured["on_job"] = kw["on_job"]
-        return service
-
-    _vet = gate_reason if callable(gate_reason) else (lambda job: gate_reason)
-
-    async def _queued_pool(fn: Any, *args: Any, **_kwargs: Any) -> Any:
-        queue_hook()
-        return fn(*args)
-
-    _sel = sel_obj if sel_obj is not None else MagicMock()
-    with ExitStack() as stack:
-        for patcher in (
-            patch.object(gw.CronService, "create", AsyncMock(side_effect=_create)),
-            # No executor patch: the fire-time gate does not resolve a pool from
-            # this module -- it goes through run_in_cron_gate_pool, which owns its
-            # own bounded pool. `vet_job_at_fire_time` is still patched below, so the
-            # gate submits a trivial callable and returns immediately.
-            patch.object(gw, "vet_job_at_fire_time", _vet),
-            patch.object(gw, "sel", lambda: _sel),
-            patch.object(gw, "run_command_sandboxed", _sandboxed(command_result)),
-            patch.object(gw, "run_script_sandboxed", _sandboxed(script_result)),
-            patch.object(
-                gw, "build_cron_session_context", lambda job: (f"cron:{job.id}", job.message)
-            ),
-            patch("kiro_crew.apps.bridges.reconcile_app_crons_for_execution", AsyncMock()),
-        ):
-            stack.enter_context(patcher)
-        if queue_hook is not None:
-            stack.enter_context(patch.object(gw, "run_in_cron_pool", _queued_pool))
-        await orch._init_cron()
-        assert "on_job" in captured
-        yield captured["on_job"]
-
-
-def _channel_sessions(
-    *,
-    origin: Any = None,
-    mirror: Any = None,
-    stored: Any = "",
-    origin_raises: bool = False,
-    stored_raises: bool = False,
-) -> MagicMock:
-    """A SessionManager double exposing only the link-resolution surface."""
-    sessions = MagicMock()
-    if origin_raises:
-        sessions.get_origin_link = MagicMock(side_effect=RuntimeError("map wedged"))
-    else:
-        sessions.get_origin_link = MagicMock(return_value=origin)
-    sessions.get_mirror_link = MagicMock(return_value=mirror)
-    if stored_raises:
-        sessions.get_channel = MagicMock(side_effect=RuntimeError("map wedged"))
-    else:
-        sessions.get_channel = MagicMock(return_value=stored)
-    return sessions
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -648,17 +496,33 @@ class TestVettingHoldsAtClaimTime:
     def test_the_message_arm_has_no_pool_queue_between_vet_and_dispatch(self):
         """Disposition for the third gate site, by measurement not assertion.
 
-        ``gateway.py`` has exactly three fire-time gate sites and exactly two
+        The gateway (``gateway.py`` and its owners) has exactly four fire-time
+        gate sites and exactly two
         execution-pool dispatches. Both dispatches sit in the command/script
-        blocks, which return before the message gate is reached — so the
-        message arm has no queue between its vet and its LLM dispatch and the
-        defect class cannot apply to it. Pinned here so a future dispatch added
+        blocks, which return before the message gate is reached, and the goal
+        check-in gate returns into its hidden turn before either — so neither
+        LLM arm has a queue between its vet and its dispatch and the defect
+        class cannot apply to them. Pinned here so a future dispatch added
         after the message gate fails this test rather than shipping unnoticed.
         """
-        source = Path(gw.__file__).read_text(encoding="utf-8")
+        slack_dir = Path(gw.__file__).resolve().parent
+        runtime = slack_dir / "gateway_runtime"
+        # The message arm runs on from its gate in cron_fire.py through cron_turn.py,
+        # cron_delivery.py and cron_failure.py, so those, then the facade, come last.
+        message_path = [
+            runtime / f"{n}.py" for n in ("cron_fire", "cron_turn", "cron_delivery", "cron_failure")
+        ]
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                *(p for p in sorted(runtime.glob("*.py")) if p not in message_path),
+                *message_path,
+                slack_dir / "gateway.py",
+            ]
+        )
         gate_sites = source.count("await _await_cron_fire_time_gate(")
         pool_sites = source.count("await run_in_cron_pool(")
-        assert gate_sites == 3, f"gate-site count changed ({gate_sites}); re-audit the sweep"
+        assert gate_sites == 4, f"gate-site count changed ({gate_sites}); re-audit the sweep"
         assert pool_sites == 2, f"pool-dispatch count changed ({pool_sites}); re-audit the sweep"
         message_gate = source.index('tool_name="cron_message_dispatch"')
         assert (
@@ -791,10 +655,9 @@ class TestAnAbandonedVetDoesNotExecute:
                 # Only NOW let the abandoned vet finish, so it reaches its
                 # dispatch decision strictly after the caller released the guard.
                 release.set()
-                for _ in range(500):
-                    if done:
-                        break
-                    await asyncio.sleep(0.01)
+                await async_wait_until(
+                    lambda: bool(done), describe=lambda: "the abandoned worker never decided"
+                )
 
         assert executed == [], (
             "the payload executed after its awaiter gave up and released the "
@@ -822,10 +685,9 @@ class TestAnAbandonedVetDoesNotExecute:
             ):
                 assert await cb(job) is None
                 release.set()
-                for _ in range(500):
-                    if done:
-                        break
-                    await asyncio.sleep(0.01)
+                await async_wait_until(
+                    lambda: bool(done), describe=lambda: "the abandoned worker never decided"
+                )
 
         assert executed == [], "the command executed after its awaiter gave up"
         assert done == ["refused"], f"the abandoned call did not refuse its payload: {done}"
@@ -968,10 +830,10 @@ class TestTheVetIsAnAccountedBudgetTerm:
             with patch.object(gw, runner, _payload):
                 await cb(job)
                 # Let an orphaned subprocess finish so its observation lands.
-                for _ in range(400):
-                    if guard_at_exit:
-                        break
-                    await asyncio.sleep(0.05)
+                await async_wait_until(
+                    lambda: bool(guard_at_exit),
+                    describe=lambda: "the payload has not finished its observation",
+                )
 
         assert guard_at_exit == [True], (
             f"the {kind} overlap guard was released while the payload was still "
@@ -1061,7 +923,7 @@ class TestTheVetIsAnAccountedBudgetTerm:
     def test_every_term_spent_inside_the_run_budget_is_accounted_for(self):
         """Every deadline bounding a run must carry a term for each thing spent inside it.
 
-        ``cron.py``'s own accounting names three: the subprocess bound, the pool
+        The cron service's own accounting names three: the subprocess bound, the pool
         queue wait, and the fire-time gate.  The claim-time vet is a fourth --
         it runs inside the worker, inside the same deadline -- and asserting on
         the helper alone would pass with the term missing from the deadline, so
@@ -1075,36 +937,54 @@ class TestTheVetIsAnAccountedBudgetTerm:
         exactly that drift.  Parsed with ``ast`` so the assertion survives the
         expression being wrapped across lines.
         """
-        from kiro_crew import cron as cron_mod
+        import importlib
+        import pkgutil
 
-        tree = ast.parse(Path(cron_mod.__file__).read_text(encoding="utf-8"))
+        from kiro_crew.cron_service import service
+
+        # Every module the class binds members from is read: the two sums live in
+        # service owners and read the helpers through the facade (``seams.<name>``),
+        # where tests patch them.
         owed = {"_pool_queue_allowance", "_gate_budget_allowance", "_vet_allowance"}
-        run_deadlines: list[tuple[int, set[str]]] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            if not any(isinstance(t, ast.Name) and t.id == "deadline" for t in node.targets):
-                continue
-            called = {
-                child.func.id
-                for child in ast.walk(node.value)
-                if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
-            }
-            # A RUN deadline is one that already accounts for at least one term.
-            # That excludes the file-lock spin deadline (``time.monotonic() +
-            # timeout``), which bounds a lock acquisition rather than a run, and
-            # it needs no magic count that would rot as the file changes.
-            if called & owed:
-                run_deadlines.append((node.lineno, called & owed))
+        run_deadlines: list[tuple[str, int, set[str]]] = []
+        for module in (
+            "kiro_crew.cron",
+            *(f"{service.__name__}.{info.name}" for info in pkgutil.iter_modules(service.__path__)),
+        ):
+            path = Path(importlib.import_module(module).__file__)
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not any(isinstance(t, ast.Name) and t.id == "deadline" for t in node.targets):
+                    continue
+                called = {
+                    child.func.id if isinstance(child.func, ast.Name) else child.func.attr
+                    for child in ast.walk(node.value)
+                    if isinstance(child, ast.Call)
+                    and (
+                        isinstance(child.func, ast.Name)
+                        or (
+                            isinstance(child.func, ast.Attribute)
+                            and isinstance(child.func.value, ast.Name)
+                            and child.func.value.id == "seams"
+                        )
+                    )
+                }
+                # A RUN deadline is one that already accounts for at least one term.
+                # That excludes the file-lock spin deadline (``time.monotonic() +
+                # timeout``), which bounds a lock acquisition rather than a run, and
+                # it needs no magic count that would rot as the file changes.
+                if called & owed:
+                    run_deadlines.append((path.name, node.lineno, called & owed))
 
         assert len(run_deadlines) >= 2, (
             "expected at least the execution guard and the reaper sweep to bound "
             f"a run; found {len(run_deadlines)} -- this check may have gone vacuous"
         )
-        for lineno, terms in run_deadlines:
+        for filename, lineno, terms in run_deadlines:
             missing = owed - terms
             assert not missing, (
-                f"the run deadline at cron.py:{lineno} does not account for "
+                f"the run deadline at {filename}:{lineno} does not account for "
                 f"{sorted(missing)}; a term spent inside it but absent from it means "
                 "this deadline pre-empts the one that does carry it"
             )
@@ -1145,8 +1025,8 @@ class TestDeliverScriptResult:
         result = {"status": "report", "message": "green again"}
         spawn = MagicMock(return_value=turn)
         with (
-            patch.object(gw, "spawn_guarded_turn", spawn),
-            patch.object(gw, "_run_chat", MagicMock(return_value=MagicMock())),
+            patch("kiro_crew.dashboard.turn_dispatch.spawn_guarded_turn", spawn),
+            patch("kiro_crew.dashboard.chat_runner._run_chat", MagicMock(return_value=MagicMock())),
         ):
             async with _cron_cb(orch, script_result=result) as cb:
                 assert await cb(job) == "green again"
@@ -1188,7 +1068,7 @@ class TestDeliverScriptResult:
                 threads.append(True)  # on the loop -- the defect
             except RuntimeError:
                 threads.append(False)  # in a worker thread -- correct
-            return ({}, True, None, {}, None, None)
+            return ({}, True, None, {}, None, None, False)
 
         job = _job(script="probes.py:check", session_key="dashboard:chat-cold")
         result = {"status": "report", "message": "cold session"}
@@ -1266,627 +1146,3 @@ class TestDeliverScriptResult:
             assert await cb(job) == "quiet"
         orch.dashboard_state.notify.assert_not_called()
         orch.dashboard_state.get_slot.assert_not_called()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# message-mode denial + _init_cron wiring
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestCronMessageDenialAndWiring:
-    @pytest.mark.asyncio
-    async def test_message_job_fire_time_denial(self):
-        """An LLM cron denied at fire time never dispatches a turn."""
-        orch = _make_orchestrator()
-        orch.sessions = MagicMock()
-        orch.ctx_builder = MagicMock()
-        job = _job()
-        async with _cron_cb(orch, gate_reason="capabilities.cron off", sel_obj=_blind_sel()) as cb:
-            assert await cb(job) is None
-        assert job.fire_time_denied is True
-        assert job.consecutive_failures == 0
-
-    @pytest.mark.asyncio
-    async def test_reaper_not_started_without_sessions(self):
-        """Arming the scheduler without a session manager skips the reaper."""
-        orch = _make_orchestrator(no_crons=False)
-        orch.sessions = None
-        svc = _cron_service_double()
-        async with _cron_cb(orch, svc=svc):
-            pass
-        svc.start.assert_awaited_once()
-        svc.start_reaper.assert_not_called()
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Non-Slack channel reply resolution
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestChannelReplyLink:
-    """``_channel_reply_link``'s resolution ladder and its refusals."""
-
-    def test_slack_and_local_keys_return_none(self):
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions()
-        assert orch._channel_reply_link("slack:C1") is None
-        assert orch._channel_reply_link("dashboard:chat-1-2") is None
-
-    def test_no_session_manager_returns_none(self):
-        orch = _make_orchestrator()
-        orch.sessions = None
-        assert orch._channel_reply_link("discord:kirocrew:direct:U9") is None
-
-    def test_link_getter_failure_falls_through_to_stored_channel(self):
-        """A raising link getter degrades to the next rung, it does not propagate."""
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions(origin_raises=True, stored="discord:U9")
-        resolved = orch._channel_reply_link("discord:kirocrew:direct:U9")
-        assert resolved is not None
-        link, needs_dm = resolved
-        assert (link.channel_type, link.channel_id, needs_dm) == ("discord", "U9", True)
-
-    def test_stored_channel_lookup_failure_returns_none(self):
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions(stored_raises=True)
-        assert orch._channel_reply_link("discord:kirocrew:direct:U9") is None
-
-    def test_no_stored_channel_returns_none(self):
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions(stored="")
-        assert orch._channel_reply_link("discord:kirocrew:direct:U9") is None
-
-    @pytest.mark.parametrize(
-        "stored",
-        ["nocolon", "slack:U9", ":U9", "discord:"],
-        ids=["no-separator", "slack-typed", "empty-type", "empty-peer"],
-    )
-    def test_unusable_stored_value_returns_none(self, stored):
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions(stored=stored)
-        assert orch._channel_reply_link("discord:kirocrew:direct:U9") is None
-
-    @pytest.mark.parametrize(
-        "stored",
-        ["bogus:U9", "unified:U9"],
-        ids=["unregistered-namespace", "unified-namespace"],
-    )
-    def test_unified_bucket_validates_stored_namespace(self, stored):
-        """A unified DM bucket only accepts a registered non-unified namespace."""
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions(stored=stored)
-        assert orch._channel_reply_link("unified:kirocrew:direct:U9") is None
-
-    def test_group_session_never_takes_the_stored_rung(self):
-        """A group key's stored value is the sender, so it must not become a DM."""
-        orch = _make_orchestrator()
-        orch.sessions = _channel_sessions(stored="discord:U9")
-        assert orch._channel_reply_link("discord:kirocrew:group:C1") is None
-
-    def test_origin_link_wins_and_needs_no_dm_resolution(self):
-        orch = _make_orchestrator()
-        origin = gw.ChannelLink("discord", channel_id="C77", thread_id="T1")
-        orch.sessions = _channel_sessions(origin=origin, stored="discord:U9")
-        assert orch._channel_reply_link("discord:kirocrew:direct:U9") == (origin, False)
-
-
-class TestDeliverChannelReply:
-    """``_deliver_channel_reply``'s early refusals."""
-
-    @pytest.mark.asyncio
-    async def test_blank_text_is_not_delivered(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-        assert await orch._deliver_channel_reply("discord:kirocrew:direct:U9", "   ") is False
-
-    @pytest.mark.asyncio
-    async def test_no_dashboard_state_is_not_delivered(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        assert await orch._deliver_channel_reply("discord:kirocrew:direct:U9", "hi") is False
-
-    @pytest.mark.asyncio
-    async def test_unresolvable_key_is_not_delivered(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-        orch.sessions = _channel_sessions(stored="")
-        assert await orch._deliver_channel_reply("discord:kirocrew:direct:U9", "hi") is False
-
-    @pytest.mark.asyncio
-    async def test_target_resolution_failure_degrades_to_false(self):
-        """A raising governance ladder degrades the caller, it never propagates."""
-        orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-        link = gw.ChannelLink("discord", channel_id="C77")
-
-        def _boom(*_args: Any, **_kwargs: Any) -> Any:
-            raise RuntimeError("profile dir unreadable")
-
-        with patch.object(gw, "_resolve_channel_target", _boom):
-            delivered = await orch._deliver_channel_reply(
-                "discord:kirocrew:direct:U9", "hi", resolved_link=(link, False)
-            )
-        assert delivered is False
-
-    @pytest.mark.asyncio
-    async def test_no_governed_target_is_not_delivered(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-        link = gw.ChannelLink("discord", channel_id="C77")
-        with patch.object(gw, "_resolve_channel_target", MagicMock(return_value=None)):
-            delivered = await orch._deliver_channel_reply(
-                "discord:kirocrew:direct:U9", "hi", resolved_link=(link, False)
-            )
-        assert delivered is False
-
-    # A sub-agent result whose code block spans the channel's message cap: the
-    # shape of a diff or log dump, and the one a fixed-width slice mangles. The
-    # lines inside carry prose markup a dialect converter WOULD rewrite if the
-    # part they land in has lost the fence opener.
-    _FENCED = (
-        "Here is the diff:\n\n"
-        "```diff\n"
-        "**never bold** inside a code block\n"
-        "# never a heading inside a code block\n"
-        "- never a bullet inside a code block\n"
-        "```\n"
-    )
-
-    @pytest.mark.asyncio
-    async def test_a_long_fenced_result_keeps_every_code_line_inside_its_fence(self):
-        """The pre-split IS final: each part arrives already under the cap.
-
-        So the channel's own fence-safe splitter is a no-op on it, and a blind
-        fixed-width cut through the block leaves part two with no opener: every
-        line in it then takes the prose branch of the dialect converter and the
-        markup INSIDE the code is rewritten.
-        """
-        from kiro_crew.messaging.split import FENCE_OUTSIDE, iter_fence_lines
-
-        orch = _make_orchestrator()
-        orch.dashboard_state = _mock_dashboard_state()
-        link = gw.ChannelLink("discord", channel_id="C77")
-        transport = SimpleNamespace(
-            capabilities=SimpleNamespace(max_message_chars=90),
-            send_message=AsyncMock(return_value="mid"),
-        )
-        resolved = SimpleNamespace(channel_id="C77", thread_id=None)
-        with patch.object(
-            gw, "_resolve_channel_target", MagicMock(return_value=(resolved, transport))
-        ):
-            delivered = await orch._deliver_channel_reply(
-                "discord:kirocrew:direct:U9", self._FENCED, resolved_link=(link, False)
-            )
-
-        assert delivered is True
-        parts = [c.args[1] for c in transport.send_message.await_args_list]
-        assert len(parts) > 1, "precondition: the result must actually have been split"
-        markers = [
-            "**never bold** inside a code block",
-            "# never a heading inside a code block",
-            "- never a bullet inside a code block",
-        ]
-        for part in parts:
-            prose = [ln for ln, role in iter_fence_lines(part) if role == FENCE_OUTSIDE]
-            for marker in markers:
-                assert marker not in prose, f"a code line landed outside its fence:\n{part}"
-        joined = "\n".join(parts)
-        for marker in markers:
-            assert marker in joined, "content must survive the split"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Cron delivery to a non-Slack channel
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-_TG_KEY = "telegram:kirocrew:direct:U9"
-
-
-def _message_arm_sessions() -> MagicMock:
-    """A SessionManager double for the ``message`` (LLM) cron arm."""
-    sessions = MagicMock()
-    sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))
-    sessions.release = MagicMock()
-    sessions.reset = AsyncMock()
-    sessions.set_thread = AsyncMock()
-    sessions.set_channel = AsyncMock()
-    sessions.get_origin_link = MagicMock(return_value=gw.ChannelLink("telegram", channel_id="C77"))
-    sessions.get_mirror_link = MagicMock(return_value=None)
-    sessions.get_channel = MagicMock(return_value="")
-    return sessions
-
-
-def _channel_transport() -> MagicMock:
-    """A MessagingTransport double whose only job is to record outbound sends."""
-    transport = MagicMock()
-    # ``max_message_bytes=0`` explicitly: a bare MagicMock attribute is a child
-    # OBJECT, not a number, so ``chunk_for_transport`` cannot compare it and the
-    # send never happens. 0 = not byte-capped, which is the character path these
-    # tests are about (Webex is the byte-capped one). Same reason the fakes in
-    # test_cross_surface_mirror.py and test_chat_runner_coverage.py declare it.
-    transport.capabilities = MagicMock(max_message_chars=4096, max_message_bytes=0)
-    transport.send_message = AsyncMock(return_value="m1")
-    transport.resolve_configured_target = AsyncMock(return_value=None)
-    return transport
-
-
-@asynccontextmanager
-async def _cron_message_cb(
-    orch: Any, *, result_text: str = "", error: BaseException | None = None
-) -> AsyncIterator[Any]:
-    """Yield ``on_job`` with the ``message`` arm's LLM turn stubbed out.
-
-    Everything between session acquisition and the delivery fan-out is replaced:
-    the point of these tests is which SURFACE a finished result reaches, so the
-    turn itself is a constant. ``_cron_stream_with_posttoken_resume`` is the one
-    seam that has to be patched by name — the arm resolves it from module
-    globals at call time, which is why this nests inside ``_cron_cb`` rather
-    than wrapping it.
-
-    ``error`` drives the FAILURE fan-out instead of the success one by making the
-    stubbed turn raise, which is the only way into the arm's ``except`` branch.
-    It must NOT look like a transient backend error, or the arm retries the whole
-    callback rather than alerting.
-    """
-    orch.ctx_builder = MagicMock()
-    orch.ctx_builder.hooks = MagicMock()
-    orch.subagent_mgr = MagicMock()
-    orch.subagent_mgr.has_pending_work_for = MagicMock(return_value=False)
-    orch.subagent_mgr.has_pending_work_for_async = AsyncMock(return_value=False)
-    _turn = (
-        AsyncMock(side_effect=error)
-        if error is not None
-        else AsyncMock(return_value=(result_text, 0))
-    )
-    with ExitStack() as stack:
-        for patcher in (
-            patch.object(gw, "_cron_stream_with_posttoken_resume", _turn),
-            patch.object(gw, "publish_turn_identity", AsyncMock()),
-            patch.object(gw, "run_in_embed_pool", AsyncMock(return_value=("full msg", None))),
-            patch.object(gw, "persist_token_record_async", AsyncMock()),
-            patch.object(gw, "read_context_tokens", MagicMock(return_value=(0, 0))),
-            patch.object(gw, "provider_last_turn_usage", MagicMock()),
-            patch.object(gw, "read_effective_agent", MagicMock(return_value="")),
-            patch.object(gw, "context_meter_reading", MagicMock(return_value=None)),
-        ):
-            stack.enter_context(patcher)
-        async with _cron_cb(orch) as callback:
-            yield callback
-
-
-class TestCronChannelDelivery:
-    """A cron created from a non-Slack channel reports back to THAT channel.
-
-    The delivery fan-out and the duplicate-suppression anchor are one mechanism:
-    the anchor is what the suppression read compares against, so a surface that
-    delivers without advancing it can never suppress. These drive the real
-    ``_deliver_channel_reply`` leg (only the governed target resolution and the
-    transport are doubled) so the argument order and the Slack-skip are both
-    observed, not asserted about a mock of the method under test.
-    """
-
-    @staticmethod
-    def _slack_double() -> MagicMock:
-        slack = MagicMock()
-        slack.open_dm = AsyncMock(return_value="D1")
-        slack.post_blocks = AsyncMock(return_value="ts1")
-        slack.post_message = AsyncMock()
-        return slack
-
-    def _orch(self, transport: MagicMock) -> Any:
-        orch = _make_orchestrator()
-        orch.sessions = _message_arm_sessions()
-        orch.dashboard_state = _mock_dashboard_state()
-        orch.slack = self._slack_double()
-        self._target = MagicMock(
-            return_value=(gw.ChannelLink("telegram", channel_id="C77"), transport)
-        )
-        return orch
-
-    @pytest.mark.asyncio
-    async def test_channel_key_delivers_to_channel_and_skips_slack(self):
-        """A ``telegram:`` originating key routes the result to Telegram, not Slack."""
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jc1", name="channel probe", session_key=_TG_KEY)
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, result_text="all clear") as callback:
-                assert await callback(job) == "all clear"
-
-        transport.send_message.assert_awaited_once()
-        sent = transport.send_message.await_args.args[1]
-        assert "⏰ Cron: channel probe" in sent and "all clear" in sent
-        orch.slack.post_blocks.assert_not_awaited()
-        orch.slack.post_message.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_channel_delivery_advances_the_dedup_anchor(self):
-        """Regression: the anchor is delivery-agnostic, so a channel post moves it.
-
-        ``slack`` is None here on purpose. With a Slack client attached the Slack
-        branch is a second writer of the same three fields, so it would keep this
-        green with the channel-path write deleted — the very defect being pinned.
-        """
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        orch.slack = None
-        job = _job(id="jc2", name="anchor probe", session_key=_TG_KEY)
-        assert job.last_posted_hash == ""
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, result_text="unchanged") as callback:
-                await callback(job)
-
-        transport.send_message.assert_awaited_once()
-        assert job.last_posted_hash == gw._result_hash("unchanged")
-        assert job.consecutive_dupes == 0
-        assert job.last_posted_at > 0
-
-    @pytest.mark.asyncio
-    async def test_identical_second_run_is_suppressed_on_the_channel(self):
-        """An identical second run is suppressed: run two, deliver one.
-
-        With the anchor left unadvanced on this path, ``last_posted_hash`` stayed
-        ``""`` forever and every tick re-posted the same text — while Slack posted
-        once and then went quiet for a day.
-        """
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jc3", name="dupe probe", session_key=_TG_KEY)
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, result_text="same every time") as callback:
-                await callback(job)
-                await callback(job)
-
-        assert transport.send_message.await_count == 1
-        assert job.consecutive_dupes == 1
-
-    @pytest.mark.asyncio
-    async def test_job_without_session_key_still_takes_the_slack_path(self):
-        """No originating conversation ⇒ the Slack branch runs exactly as before."""
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jc4", name="slack probe", session_key="", created_by="U_OWNER")
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, result_text="slack bound") as callback:
-                assert await callback(job) == "slack bound"
-
-        transport.send_message.assert_not_awaited()
-        orch.slack.post_blocks.assert_awaited_once()
-        # The Slack branch owns the same anchor write, through the same helper.
-        assert job.last_posted_hash == gw._result_hash("slack bound")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Cron FAILURE delivery to a non-Slack channel
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestCronFailureChannelDelivery:
-    """A cron's failure alert reports where its RESULTS report.
-
-    The success leg already routes into the originating conversation, so a job
-    that reported into Telegram while it worked and only into the dashboard bell
-    once it started crashing reads as idle rather than broken — the exact state
-    the alert exists to prevent, and worse than a uniform gap because the success
-    path trained the expectation. Both failure surfaces are covered: the
-    ``message`` arm's own ``except`` branch, and ``_alert_cron_failure``, which
-    the deterministic script/command arms reach instead.
-
-    These drive the real ``_deliver_channel_reply`` leg (only the governed target
-    resolution and the transport are doubled), so the Slack-skip is observed
-    rather than asserted about a mock of the method under test.
-    """
-
-    @staticmethod
-    def _slack_double() -> MagicMock:
-        slack = MagicMock()
-        slack.open_dm = AsyncMock(return_value="D1")
-        slack.post_blocks = AsyncMock(return_value="ts1")
-        slack.post_message = AsyncMock()
-        return slack
-
-    def _orch(self, transport: MagicMock) -> Any:
-        orch = _make_orchestrator()
-        orch.sessions = _message_arm_sessions()
-        orch.dashboard_state = _mock_dashboard_state()
-        orch.slack = self._slack_double()
-        self._target = MagicMock(
-            return_value=(gw.ChannelLink("telegram", channel_id="C77"), transport)
-        )
-        return orch
-
-    @staticmethod
-    def _sent(transport: MagicMock) -> str:
-        return str(transport.send_message.await_args.args[1])
-
-    # ── the message (LLM) arm's own except branch ──
-
-    @pytest.mark.asyncio
-    async def test_a_crashing_message_cron_reports_into_the_channel(self):
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jf1", name="failing probe", session_key=_TG_KEY)
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, error=RuntimeError("probe exploded")) as callback:
-                with pytest.raises(RuntimeError):
-                    await callback(job)
-
-        transport.send_message.assert_awaited_once()
-        sent = self._sent(transport)
-        assert "Cron: failing probe" in sent and "probe exploded" in sent
-        # The reason travels in the channel's own dialect, not Slack's: a mrkdwn
-        # fence would reach a Telegram reader as three literal backticks.
-        assert "```" not in sent
-        orch.slack.post_message.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_a_silent_message_cron_reports_to_neither_surface(self):
-        """``job.silent`` gates the channel leg exactly as it gates the Slack DM."""
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jf2", name="quiet probe", session_key=_TG_KEY, silent=True)
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, error=RuntimeError("probe exploded")) as callback:
-                with pytest.raises(RuntimeError):
-                    await callback(job)
-
-        transport.send_message.assert_not_awaited()
-        orch.slack.post_message.assert_not_awaited()
-        # Still counted toward auto-pause — silence suppresses surfaces, not
-        # bookkeeping.
-        assert job.consecutive_failures == 1
-
-    @pytest.mark.asyncio
-    async def test_a_message_cron_without_a_channel_still_dms_slack(self):
-        """No originating conversation ⇒ the Slack DM runs exactly as before."""
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jf3", name="slack probe", session_key="", created_by="U_OWNER")
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_message_cb(orch, error=RuntimeError("probe exploded")) as callback:
-                with pytest.raises(RuntimeError):
-                    await callback(job)
-
-        transport.send_message.assert_not_awaited()
-        channel, text = orch.slack.post_message.await_args.args
-        assert channel == "D1"
-        assert "*Cron: slack probe*" in text and "probe exploded" in text
-
-    # ── _alert_cron_failure: the script / command arms' failure surface ──
-
-    @pytest.mark.asyncio
-    async def test_a_failing_command_cron_reports_into_the_channel(self):
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(id="jf4", name="cmd probe", command="false", session_key=_TG_KEY)
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_cb(orch, command_result={"status": "error", "output": ""}) as cb:
-                assert await cb(job) is None
-
-        transport.send_message.assert_awaited_once()
-        sent = self._sent(transport)
-        assert "Cron: cmd probe" in sent and "Run failed" in sent
-        assert "```" not in sent
-        orch.slack.post_message.assert_not_awaited()
-        # Delivery confirmed on a surface ⇒ the failure dedup anchor advances, so
-        # the next identical failure is suppressed instead of re-alerting.
-        assert job.last_failure_hash != ""
-
-    @pytest.mark.asyncio
-    async def test_a_failing_command_cron_without_a_channel_still_dms_slack(self):
-        transport = _channel_transport()
-        orch = self._orch(transport)
-        job = _job(
-            id="jf5", name="cmd probe", command="false", session_key="", created_by="U_OWNER"
-        )
-
-        with patch.object(gw, "_resolve_channel_target", self._target):
-            async with _cron_cb(orch, command_result={"status": "error", "output": ""}) as cb:
-                assert await cb(job) is None
-
-        transport.send_message.assert_not_awaited()
-        channel, text = orch.slack.post_message.await_args.args
-        assert channel == "D1"
-        assert "*Cron: cmd probe*" in text
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Task-runner approval notices: channel first, owner DM as the fallback
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestTaskNotifyChannelRouting:
-    """``_task_notify`` prefers the run's originating conversation.
-
-    An approval request is the one notification a task cannot proceed without,
-    so where it lands decides whether the run stalls silently. The owner DM is
-    Slack-only, which left a Telegram-only operator with a stalled task and no
-    notice; the channel ladder runs first and the DM stays as the fallback.
-    """
-
-    def _notify(self, orch: Any) -> Any:
-        orch.sessions = MagicMock()
-        orch.ctx_builder = MagicMock()
-        orch.conv_log = MagicMock()
-        orch.consolidator = MagicMock()
-        with patch.object(gw, "TaskRunner", MagicMock(return_value=MagicMock())) as mock_tr:
-            orch._init_task_runner()
-            return mock_tr.call_args.kwargs["on_notify"]
-
-    @staticmethod
-    def _slack_double() -> MagicMock:
-        slack = MagicMock()
-        slack.open_dm = AsyncMock(return_value="D1")
-        slack.post_message = AsyncMock()
-        return slack
-
-    @pytest.mark.asyncio
-    async def test_channel_wins_over_the_owner_dm(self):
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        orch.slack = self._slack_double()
-        orch._owner_id = "U_OWNER"
-        deliver = AsyncMock(return_value=True)
-        notify = self._notify(orch)
-
-        with patch.object(orch, "_deliver_channel_reply", deliver):
-            await notify("Task 3 requires approval", "run the deploy?", "t-3", session_key=_TG_KEY)
-
-        deliver.assert_awaited_once_with(_TG_KEY, "*Task 3 requires approval*\nrun the deploy?")
-        orch.slack.post_message.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_owner_dm_is_the_fallback_when_the_channel_refuses(self):
-        """A refused channel (no link, governance deny) must not lose the notice."""
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        orch.slack = self._slack_double()
-        orch._owner_id = "U_OWNER"
-        notify = self._notify(orch)
-
-        with patch.object(orch, "_deliver_channel_reply", AsyncMock(return_value=False)):
-            await notify("Task 3 denied", "policy says no", "t-3", session_key=_TG_KEY)
-
-        channel, text = orch.slack.post_message.await_args.args
-        assert (channel, text) == ("D1", "*Task 3 denied*\npolicy says no")
-
-    @pytest.mark.asyncio
-    async def test_no_session_key_never_touches_the_channel_ladder(self):
-        """A dashboard/CLI start has no originating conversation to route to."""
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        orch.slack = self._slack_double()
-        orch._owner_id = "U_OWNER"
-        deliver = AsyncMock(return_value=True)
-        notify = self._notify(orch)
-
-        with patch.object(orch, "_deliver_channel_reply", deliver):
-            await notify("Task 3 requires approval", "run the deploy?", "t-3")
-
-        deliver.assert_not_awaited()
-        orch.slack.post_message.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_ordinary_progress_title_notifies_neither(self):
-        """The title gate is unchanged: only approval/denial escalates off-dashboard."""
-        orch = _make_orchestrator()
-        orch.dashboard_state = None
-        orch.slack = self._slack_double()
-        orch._owner_id = "U_OWNER"
-        deliver = AsyncMock(return_value=True)
-        notify = self._notify(orch)
-
-        with patch.object(orch, "_deliver_channel_reply", deliver):
-            await notify("Task 3 complete", "all good", "t-3", session_key=_TG_KEY)
-
-        deliver.assert_not_awaited()
-        orch.slack.post_message.assert_not_awaited()

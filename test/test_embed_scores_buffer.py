@@ -57,7 +57,7 @@ _VENDORED_LLAMA = (
 def _make_recording_llama_class(dim: int = embeddings_mod._DEFAULT_DIM):
     """Fake Llama class that records the kwargs its constructor was handed.
 
-    Mirrors ``_make_fake_llama_class`` in test/test_embeddings.py: it never loads
+    Mirrors ``_make_fake_llama_class`` in test/embeddings_helpers.py: it never loads
     a real model and returns a fixed-width embedding for ``create_embedding``.
     """
 
@@ -123,6 +123,22 @@ def test_embedder_keeps_the_full_logical_batch(tmp_path: pathlib.Path, monkeypat
     # n_ubatch is a separate, already-tuned lever and stays below n_batch.
     assert kwargs["n_ubatch"] == embeddings_mod._N_UBATCH
     assert kwargs["n_ubatch"] < kwargs["n_batch"]
+
+
+def test_shipped_decoder_micro_batch_is_256(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """The shipped model decodes in 256-token micro-batches, with the full window kept.
+
+    A literal on purpose: the value is a measured choice, not a derived one. On the
+    shipped Qwen3 file and the vendored Linux CPU runtime, 256 and 512 gave
+    byte-identical vectors over short queries, transcript, code and CJK inputs up
+    to the clipped maximum, alone and packed eight to a call, and 256 held 317 MiB
+    less anonymous memory after a long input at the same latency. Raising it gives
+    that memory back; lowering it further changes the micro-batch shapes stored
+    vectors were made with, which needs the same real-model proof again
+    (``test_embed_bounded_decode.py::TestRealModel``).
+    """
+    kwargs = _load_embedder(tmp_path, monkeypatch)
+    assert (kwargs["n_ctx"], kwargs["n_batch"], kwargs["n_ubatch"]) == (2048, 2048, 256)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

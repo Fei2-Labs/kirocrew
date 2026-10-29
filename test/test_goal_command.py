@@ -4,6 +4,7 @@ Covers ``_handle_goal_command`` in isolation — the pure glue over the async
 and the AutoNudge-disabled path. The judge gate at ``HOOK_EVENT_STOP`` is a
 follow-up CR and is not exercised here.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -68,14 +69,14 @@ async def test_status_no_active_goal(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "No active goal" in body
     svc.add.assert_not_awaited()
     svc.remove.assert_not_awaited()
-    # Always finalizes the turn.
     state.push_slots_update.assert_called_once()
-    assert any(c.args and c.args[0] == "done" for c in slot.append.call_args_list)
+    # The reply only: the turn's exit guard ends the cycle, with the done row.
+    assert not any(c.args and c.args[0] == "done" for c in slot.append.call_args_list)
 
 
 @pytest.mark.asyncio
 async def test_status_with_active_goal_shows_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    loop = SimpleNamespace(id="loop-1", max_cycles=15)
+    loop = SimpleNamespace(id="loop-1", max_cycles=15, active=True)
     svc = _fake_service(loop=loop)
     _install(monkeypatch, svc)
     slot, state = _make_slot(), _make_state()
@@ -88,9 +89,32 @@ async def test_status_with_active_goal_shows_budget(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_arm_default_budget(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("reason", "word"),
+    [("stop_sentinel", "finished"), ("monitor_terminal", "finished"), ("manual", "stopped")],
+)
+async def test_status_of_a_kept_inactive_record_is_not_an_active_goal(
+    monkeypatch: pytest.MonkeyPatch, reason: str, word: str
 ) -> None:
+    """The service keeps a stopped loop's record (a goal its stop file finished,
+    a paused one); ``get_by_slot`` returns it, and status must read the state,
+    not the presence -- a killed or finished goal reported as active is the
+    one reading this command exists to prevent."""
+    loop = SimpleNamespace(id="loop-1", max_cycles=15, active=False, stopped_reason=reason)
+    svc = _fake_service(loop=loop)
+    _install(monkeypatch, svc)
+    slot, state = _make_slot(), _make_state()
+
+    await chat_runner._handle_goal_command(state, slot, "/goal status")
+
+    body = _last_assistant_body(slot)
+    assert "Active goal" not in body
+    assert f"Goal {word} ({reason})" in body and "/goal clear" in body
+    svc.add.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_arm_default_budget(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     svc = _fake_service(loop=None)
     audit = _install(monkeypatch, svc)
     monkeypatch.setattr(chat_runner.Path, "home", classmethod(lambda cls: tmp_path))
@@ -192,7 +216,7 @@ async def test_clear_active_goal(monkeypatch: pytest.MonkeyPatch) -> None:
 
     await chat_runner._handle_goal_command(state, slot, "/goal clear")
 
-    svc.remove.assert_awaited_once_with("loop-xyz")
+    svc.remove.assert_awaited_once_with("loop-xyz", stop_reason="goal_cleared")
     assert "cleared" in _last_assistant_body(slot).lower()
 
 

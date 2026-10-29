@@ -33,6 +33,7 @@ import pytest
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.session import SessionManager
+from kiro_crew.testing.wait import await_until
 
 # Far larger than any wall-clock this test spends, so every reap asserted below
 # is on the terminated-owner axis and never on the idle clock.
@@ -665,9 +666,9 @@ class TestPendingInjectionIsSpared:
         """
         from pathlib import Path
 
-        import kiro_crew.slack.gateway as gateway_mod
+        from kiro_crew.slack.gateway_runtime import service_boot
 
-        src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
+        src = Path(service_boot.__file__).read_text(encoding="utf-8")
         assert (
             "self.sessions.set_injection_probe(" in src
         ), "the gateway installs no injection probe"
@@ -692,9 +693,9 @@ class TestConcurrency:
         mgr.set_active_dashboard_slots({finished})
         mgr.set_active_dashboard_slots(set())
 
-        await asyncio.wait_for(
+        await await_until(
             asyncio.gather(mgr._expire_idle(NEVER_IDLE), mgr._expire_idle(NEVER_IDLE)),
-            timeout=10,
+            what="two concurrent idle sweeps both finishing",
         )
 
         assert finished not in mgr._sessions

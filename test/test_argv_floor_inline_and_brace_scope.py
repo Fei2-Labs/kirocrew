@@ -23,14 +23,21 @@ from __future__ import annotations
 import ast
 import base64
 import re
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import TypeVar
 
 import pytest
 
 from kiro_crew import security
 from kiro_crew.security import argv_floor, inline_payload
-from kiro_crew.security.shell_normalizer import _glob_could_expand_to, _glob_to_regex
+from kiro_crew.security.shell_normalizer import (
+    _SCRIPT_EXECUTES_RE,
+    _data_consumer_command_disqualified,
+    _glob_could_expand_to,
+    _glob_to_regex,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _MINT = "credential-exfil-kirocrew-token"
@@ -204,6 +211,33 @@ def _rule_of(cmd: str) -> str | None:
         return None
     m = re.search(r"rule=(\S+)", reason)
     return m.group(1) if m else reason.splitlines()[0]
+
+
+#: Thread-CPU backstop for the alternation-group guard: the one-second ceiling that
+#: guard carries, read on this thread's CPU (a strictly tighter reading than the wall
+#: clock, since CPU <= wall). Roughly three decades over the shipped cost (~1 ms), so
+#: coverage instrumentation cannot reach it; the property itself is asserted
+#: structurally, and this only catches a catastrophic blowup the structure cannot see.
+_COMPLEXITY_BACKSTOP_SECONDS = 1.0
+#: The 12k-brace bound the linearity guard carries at the large size, read on thread
+#: CPU so the large input is asserted, not only counted.
+_LARGE_INPUT_BACKSTOP_SECONDS = 30.0
+
+T = TypeVar("T")
+
+
+def _thread_cpu(fn: Callable[[], T]) -> tuple[T, float]:
+    """``fn()`` and the CPU THIS thread spent in it -- one reading, of the first call.
+
+    ``time.thread_time`` counts this thread's own execution, so a sibling xdist
+    worker's slice cannot inflate it the way ``perf_counter``/``monotonic`` do (class 5
+    in testing-conventions).  Exactly one call is timed, and it is the cold one: a
+    second reading would measure ``re``'s compile cache instead of the translator, and
+    taking the cheaper of two would let a stall that reproduces once in two pass.
+    """
+    start = time.thread_time()
+    result = fn()
+    return result, time.thread_time() - start
 
 
 class TestInlinePayloadNamesTheMintSurface:
@@ -639,7 +673,7 @@ class TestInlinePayloadNamesTheMintSurface:
             return found - seed_names
 
         # Hop 1: the modules that import the key reader, and which of THEIR functions
-        # reach it (in ``token_auth``: ``_sign`` and every ``generate_*`` built on it --
+        # reach it (in ``token_auth_tokens``: ``_sign`` and every ``generate_*`` built on it --
         # not ``validate_token`` or ``is_csrf_exempt``, which never touch the key).
         hop1 = importers_of(seeds)
         hop1_producers: dict[str, set[str]] = {}
@@ -648,7 +682,7 @@ class TestInlinePayloadNamesTheMintSurface:
         for mod, seed_names in list(hop1_producers.items()):
             hop1_producers[mod] = producers_in(mod, seed_names) | seed_names
         assert "generate_token" in hop1_producers.get(
-            "kiro_crew.dashboard.token_auth", set()
+            "kiro_crew.dashboard.token_auth_tokens", set()
         ), hop1_producers
         # Hop 2: every module that imports one of those producers.
         hop2 = [
@@ -753,7 +787,7 @@ class TestInlinePayloadNamesTheMintSurface:
                 if used & file_names:
                     readers.append((mod, node.name))
         # The derivation reaches the two readers the gate was narrowed past.
-        assert ("kiro_crew.config.loader", "read_local_secret") in readers, readers
+        assert ("kiro_crew.config.loader_locations", "read_local_secret") in readers, readers
         assert ("kiro_crew.instances.run_marker", "read_secret") in readers, readers
         # Namers that hand no credential to a caller.  A NEW name landing here has to be
         # added with its reason, or carry ``secret`` / ``token`` so the gate covers it.
@@ -762,6 +796,7 @@ class TestInlinePayloadNamesTheMintSurface:
             "start_api_server": "WRITES a fresh secret at gateway start; returns the app",
             "_cron_dispatch": "presents the secret to the gateway for a CLI verb; returns an exit code",
             "_call_tool_inner": "presents the secret to the gateway for an MCP tool; returns tool text",
+            "has_listener_entries": "reports WHETHER listener sidecars exist for a port (a bool/None); never reads or returns a credential value",
         }
         reached_names = {name for _, name in readers}
         assert set(not_readers) <= reached_names, set(not_readers) - reached_names
@@ -889,42 +924,114 @@ class TestBraceExpansionMirrorsBash:
         at_cap = "{a," * (_BRACE_NESTING_CAP + 1) + "b" + "}" * (_BRACE_NESTING_CAP + 1)
         assert _glob_could_expand_to(at_cap, frozenset({"pkill"})) is True
 
-    def test_unbalanced_braces_are_literal_and_linear(self):
+    def test_unbalanced_braces_are_literal_and_linear(self, monkeypatch):
         """A program word of N unmatched ``{`` must answer in O(N), and read literally.
 
         A pair lookup that scans from each ``{`` to the end of the word costs O(N^2) on N
         unmatched braces: a 12,000-brace word stalls the synchronous gate for tens of
         seconds, long enough for the loop watchdog to hard-exit the gateway.  ``_brace_pairs``
         resolves every pair in one pass; an unmatched brace is absent from it and is a literal.
+
+        Linearity is asserted DETERMINISTICALLY, through the seam production reads, not by
+        timing.  The wall-clock form (``perf_counter`` ratio of a 12k word to a 3k word,
+        bound 8x) read 9.3x for 4x the input on a 16-worker run with the property intact:
+        ``perf_counter`` bills the time this worker spent descheduled behind its siblings to
+        the scan (class 5 in testing-conventions), so the ratio false-reds PRs that never
+        touch the translator.  What makes the scan linear is how much of the word the
+        translator READS, so that is what is asserted: a counting ``str`` handed to the
+        two primitives the translation is wired through tallies every character they
+        touch, and quadrupling the word may at most quadruple the tally (a constant
+        factor of passes, bounded at 6x).  The regression the guard exists to catch (a
+        pair lookup per ``{``, whether it re-derives the table or rescans a suffix)
+        reads 16x for 4x the input and fails here at any size, on any host.
         """
-        import time
+        from kiro_crew.security import shell_normalizer
 
-        from kiro_crew.security.shell_normalizer import _brace_pairs
-
-        assert _brace_pairs("{a,{b}}c{") == {0: 6, 3: 5}
+        assert shell_normalizer._brace_pairs("{a,{b}}c{") == {0: 6, 3: 5}
         assert _glob_to_regex("{{{kirocrew") == re.escape("{{{kirocrew")
 
-        def judge(braces: int) -> float:
+        # Delegating stand-ins on the two module globals the translation is wired through:
+        # ``_glob_could_expand_to`` reads ``_glob_to_regex`` from the module, and the
+        # translation loop reads ``_brace_pairs`` from it, so both are observable without
+        # touching production.  Each hands its primitive a ``str`` subclass that counts
+        # every character touched -- iteration, indexing, a slice, a ``find``/``index``/
+        # ``count`` scan -- so work done INSIDE a single pass is measured, not only the
+        # number of passes: a table built with a scan to the end of the word from each
+        # ``{`` visits O(N^2) characters in one call.  Deterministic, unlike a clock.
+        real_pairs = shell_normalizer._brace_pairs
+        real_to_regex = shell_normalizer._glob_to_regex
+        visits = [0]
+
+        class _CountingStr(str):
+            def __iter__(self):
+                for ch in str.__iter__(self):
+                    visits[0] += 1
+                    yield ch
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    visits[0] += len(range(*key.indices(len(self))))
+                else:
+                    visits[0] += 1
+                return str.__getitem__(self, key)
+
+            def _scan(self, method, *args):
+                start = args[1] if len(args) > 1 and args[1] is not None else 0
+                visits[0] += max(len(self) - start, 0)
+                return method(self, *args)
+
+            def find(self, *args):
+                return self._scan(str.find, *args)
+
+            def index(self, *args):
+                return self._scan(str.index, *args)
+
+            def count(self, *args):
+                return self._scan(str.count, *args)
+
+        def counting_pairs(pattern: str) -> dict[int, int]:
+            return real_pairs(_CountingStr(pattern))
+
+        def counting_to_regex(pattern: str, depth: int = 0, budget: list[int] | None = None) -> str:
+            return real_to_regex(_CountingStr(pattern), depth, budget)
+
+        monkeypatch.setattr(shell_normalizer, "_brace_pairs", counting_pairs)
+        monkeypatch.setattr(shell_normalizer, "_glob_to_regex", counting_to_regex)
+
+        def judge(braces: int) -> int:
             hostile = "{" * braces + "kirocrew"
-            started = time.perf_counter()
+            visits[0] = 0
             assert _glob_could_expand_to(hostile, frozenset({"kirocrew"})) is False
             assert _rule_of(f"{hostile} token") is None
             assert _rule_of(f"{hostile} -f kirocrew") is None
-            return time.perf_counter() - started
+            return visits[0]
 
-        # Linearity is a RATIO, not a wall-clock budget: a coverage-instrumented shared
-        # CI runner is 10-20x slower than a desktop on the Python-level scan (the same
-        # 12k-brace word measured 0.3s locally and 4.7s in CI), so an absolute bound
-        # that catches the quadratic scan locally is either flaky there or too loose
-        # to catch anything.  Both sizes run in the same process under the same load,
-        # so their ratio is stable; 4x the braces cost 16x under the quadratic scan
-        # and ~4x under the one-pass lookup.
-        judge(300)  # warm the path so first-call cost is not billed to the small size
-        small = judge(3_000)
-        large = judge(12_000)
-        assert large < 8 * small, f"3k braces {small:.3f}s, 12k braces {large:.3f}s"
-        # Backstop for a stall the ratio cannot see (both sizes pathological).
-        assert large < 30.0, f"12k braces took {large:.1f}s -- the gate would stall"
+        small_visits = judge(3_000)
+        # The 12k word is judged ONCE, cold, and that one call is both counted and timed:
+        # a later repeat would find its regex in ``re``'s compile cache and time the
+        # cache, not the translator.
+        large_visits, large_cost = _thread_cpu(lambda: judge(12_000))
+        assert small_visits > 0, "the primitives never read the word -- the counter is not wired"
+        # Linear work grows with the word: 4x the braces may read at most ~4x the
+        # characters (a constant factor of passes per translation, bounded here at 6x).
+        # A scan-to-the-end lookup per ``{`` reads 16x and fails this at any size.
+        assert large_visits <= 6 * small_visits, (
+            f"quadrupling the unmatched braces multiplied the characters the translator read "
+            f"by {large_visits / small_visits:.1f}x ({small_visits} -> {large_visits}): a pass "
+            "inside the translator is scanning per `{`, the O(N^2) shape `_brace_pairs` "
+            "exists to replace"
+        )
+
+        # Catastrophic-blowup backstop for cost added OUTSIDE the two instrumented seams,
+        # where the counter cannot see it, at the LARGE size and under the bound the gate
+        # itself must hold: the cold 12k judgement above in 30 s of this thread's CPU -- a
+        # strictly tighter reading than the wall clock (CPU <= wall), one a sibling xdist
+        # worker's slice cannot inflate, and taken once, so a stall that reproduces
+        # intermittently is not averaged away.  A ratchet may only tighten.
+        assert large_cost < _LARGE_INPUT_BACKSTOP_SECONDS, (
+            f"judging a 12k-brace program word cost {large_cost:.2f}s of CPU -- "
+            "the gate would stall"
+        )
 
     def test_a_run_of_alternation_groups_is_budgeted_not_backtracked(self):
         """``{*,*}{*,*}...`` must answer in milliseconds, and fail closed past the budget.
@@ -935,22 +1042,34 @@ class TestBraceExpansionMirrorsBash:
         exit.  Past ``_BRACE_GROUP_BUDGET`` a group reads as ``.*``, so the word is judged
         as "could be anything" -- over-matching a protected name, never missing one.
         """
-        import time
-
         from kiro_crew.security.shell_normalizer import _BRACE_GROUP_BUDGET
 
-        started = time.monotonic()
-        for shape in ("{*,*}", "{*,**}", "{*,a*}"):
-            # Past the budget the run reads as ``.*``: it could be ``pkill``, so denied.
-            word = shape * 17 + "ill"
-            assert _glob_could_expand_to(word, frozenset({"pkill"})) is True
-            assert _rule_of(f"{word} -f kirocrew") == _KILL
-            # A run that cannot end like a protected name is still answered, fast.
-            assert _glob_could_expand_to(shape * 17 + "zz", frozenset({"pkill"})) is False
-        # Nested alternations spend the same budget; past it the tail is ``.*``.
-        nested = "{a,{b,c}}" * 17
-        assert _glob_could_expand_to(nested + "zz", frozenset({"pkill"})) is False
-        assert time.monotonic() - started < 1.0
+        def judge() -> None:
+            for shape in ("{*,*}", "{*,**}", "{*,a*}"):
+                # Past the budget the run reads as ``.*``: it could be ``pkill``, so denied.
+                word = shape * 17 + "ill"
+                assert _glob_could_expand_to(word, frozenset({"pkill"})) is True
+                assert _rule_of(f"{word} -f kirocrew") == _KILL
+                # A run that cannot end like a protected name is still answered, fast.
+                assert _glob_could_expand_to(shape * 17 + "zz", frozenset({"pkill"})) is False
+                # The property itself, structurally: what ``re`` is handed carries at most
+                # the budget of alternation groups, so its ways to fail a short name are
+                # bounded whatever the word's length.
+                assert _glob_to_regex(word).count("(?:") <= _BRACE_GROUP_BUDGET, word
+            # Nested alternations spend the same budget; past it the tail is ``.*``.
+            nested = "{a,{b,c}}" * 17
+            assert _glob_could_expand_to(nested + "zz", frozenset({"pkill"})) is False
+            assert _glob_to_regex(nested).count("(?:") <= _BRACE_GROUP_BUDGET, nested
+
+        # "Milliseconds" is asserted on thread CPU, not ``monotonic()``: a wall-clock bound
+        # bills a sibling worker's slice to this regex (class 5 in testing-conventions).
+        # The bounded regex above is the property; this is the blowup backstop, read once
+        # on the cold call.
+        _, cost = _thread_cpu(judge)
+        assert cost < _COMPLEXITY_BACKSTOP_SECONDS, (
+            f"judging 17 alternation groups cost {cost:.2f}s of CPU -- the budget is not "
+            "bounding the engine's backtracking"
+        )
         # Under the budget the alternatives are still read for what they are.
         under = "{a,b}" * (_BRACE_GROUP_BUDGET - 1) + "zz"
         assert _glob_could_expand_to(under, frozenset({"pkill"})) is False
@@ -1135,6 +1254,124 @@ class TestAGlobArgumentIsNotAKillProgram:
     )
     def test_a_harmless_substitution_under_a_data_consumer_is_allowed(self, cmd):
         assert _rule_of(cmd) is None, cmd
+
+
+class TestAnOptionDashEIsNotSedsExecuteCommand:
+    """``-e``/``-E`` is an option flag; sed's ``e`` command is a word of the script.
+
+    The data-consumer exemption is withdrawn for a whole command when any word in it
+    can make a consumer run text (``_SCRIPT_EXECUTES_RE``). Reading the bare ``-e``
+    option as sed's ``e`` command withdrew it for every ``grep -E``, ``sed -E``,
+    ``echo -e`` and ``cat -E``, so a glob path among their arguments read as a
+    possible ``pkill`` and a product-named path after it made the command a self-kill.
+    A wildcard word in a position that runs it is still read as a kill program.
+    """
+
+    @pytest.mark.parametrize("word", ["-e", "-E", "-e ", "-ne"])
+    def test_the_option_is_not_an_execute_construct(self, word):
+        assert _SCRIPT_EXECUTES_RE.search(word.lower()) is None, word
+
+    @pytest.mark.parametrize(
+        "word",
+        [
+            "e",
+            "e ",
+            "p;e",
+            "1,2 e",
+            "$!e",
+            "--expression=e",
+            "s/a/b/e",
+            r"\-.-e",
+            r"\- -e",
+            "system(",
+            "print |",
+        ],
+    )
+    def test_the_execute_constructs_are_still_read(self, word):
+        assert _SCRIPT_EXECUTES_RE.search(word) is not None, word
+
+    def test_an_option_alone_keeps_the_exemption(self):
+        tokens = ["grep", "-c", "-e", "a", "/tmp/x/*", "/tmp/kirocrew/y"]
+        assert _data_consumer_command_disqualified(tokens) is False
+        assert _data_consumer_command_disqualified([*tokens[:3], "e", *tokens[3:]]) is True
+
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            "grep {} x /tmp/a/* /w/kirocrew/log",
+            "cat {} /tmp/x/* /w/kirocrew/gateway.log",
+            "echo {} pkill -f kirocrew",
+            "grep {} x kirocrew token",
+            "sed {} e /tmp/x/* /w/kirocrew/log",
+            "grep {} x /tmp/a/* /w/kirocrew/log | sh",
+            "grep {} x /tmp/a/*; pkill -f kirocrew",
+        ],
+    )
+    def test_the_verdict_does_not_depend_on_the_option(self, shape):
+        # The command's author chooses whether to pass the option, so a verdict it
+        # changed would protect nothing: the same command without it is the bypass.
+        bare = _rule_of(" ".join(shape.format("").split()))
+        for option in ("-e", "-E"):
+            assert _rule_of(shape.format(option)) == bare, (shape, option)
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # A read-and-copy routine that ends by counting matches across the copies.
+            "C=/h/.kiro/crew/workspace/kirocrew-session-captures/behavior-$(date -u +%Y%m%dT%H%M%SZ); "
+            'mkdir -p "$C/transcripts" "$C/gateway" && chmod 700 "$C"; '
+            "R='s/eyJ[A-Za-z0-9._-]{10,}/<jwt>/g'; "
+            'sed -E "$R" /h/.kiro/crew/sessions/d.jsonl > "$C/transcripts/d.jsonl"; '
+            'for f in /h/.kiro/crew/gateway.log*; do sed -E "$R" "$f" > "$C/gateway/$(basename "$f")"; done; '
+            'echo "$C"; du -sh "$C" | cut -f1; find "$C" -type f | wc -l; '
+            'grep -c -E \'eyJ[A-Za-z0-9._-]{10,}\' "$C"/transcripts/* "$C"/gateway/* '
+            "| grep -v ':0$' || echo none",
+            'C=/tmp/kirocrew-export; grep -c -E "a" "$C"/transcripts/* "$C"/gateway/*',
+            "grep -e foo -e bar /tmp/a/* /w/kirocrew/state.json",
+            "echo -e 'a b' /tmp/x/* /w/kirocrew/gateway.log",
+            "cat -E /tmp/x/* /w/kirocrew/gateway.log",
+            "tail -n 3 /tmp/x/?* /w/kirocrew/gateway.log",
+        ],
+    )
+    def test_a_wildcard_path_next_to_a_product_path_is_allowed(self, cmd):
+        assert not argv_floor._is_self_kill(cmd.lower()), cmd
+        assert _rule_of(cmd) is None, cmd
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # A wildcard word that RUNS: in program position, or handed to a wrapper.
+            "* -f kirocrew",
+            "/usr/bin/* -f kirocrew",
+            "?* -f kirocrew",
+            "** -f kirocrew",
+            "cd /usr/bin; * -f kirocrew",
+            "sudo * -f kirocrew",
+            "ls /tmp/*; * -f kirocrew",
+            "p* -f kirocrew",
+            "*kill -f kirocrew",
+            "pk?ll -f kirocrew",
+            "[p]kill -f kirocrew",
+            # A kill after a benign wildcard read is judged on its own.
+            "grep -E x /tmp/a/* /w/kirocrew/log; pkill -f kirocrew",
+            "ls /w/kirocrew/* && killall kirocrew",
+            "sh -c 'grep -e x /tmp/x/*; pk?ll -f kirocrew'",
+            # sed's ``e`` command, and output piped into an executor, still withdraw it.
+            "sed -e e /tmp/x/* /w/kirocrew/log",
+            "sed -n 'p;e' /tmp/x/* /w/kirocrew/log",
+            "sed --expression=e /tmp/x/* /w/kirocrew/log",
+            "grep -e x /tmp/a/* /w/kirocrew/log | sh",
+            "echo -e /usr/bin/* -f kirocrew | sh",
+            "echo -e pkill -f kirocrew | xargs",
+            "awk -e 'BEGIN{system(ARGV[1]\" -f \"ARGV[2])}' /usr/bin/* kirocrew",
+            # sed's ``e`` command behind a custom-delimiter address (``-`` is the
+            # delimiter here), which runs the matched file's text.
+            r"sed '\-.-e' /tmp/x/* /w/kirocrew/log",
+            r"sed '\- -e' /tmp/x/* /w/kirocrew/log",
+        ],
+    )
+    def test_a_kill_through_a_wildcard_or_an_executor_is_still_denied(self, cmd):
+        assert _rule_of(cmd) == _KILL, cmd
 
 
 class TestTheOwnHostSeedIsInertHere:

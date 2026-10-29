@@ -249,16 +249,38 @@ describe('steer default while sub-agents run', { timeout: 20_000 }, () => {
   })
 })
 
-/* #10634: a native AskUserQuestion card (no ask_id, no card_id) is raised while
- * its own turn is still running and waiting on the answer. Submitting it must
+/* A native AskUserQuestion card (server-owned like every card, with a
+ * `card_id`, and marked `native` on the frame) is raised while its own
+ * turn is still running and waiting on the answer. Submitting it must
  * STEER into the live turn through the receipt-aware path (steerMutation), not
  * the plain send() that would queue behind that turn. When the turn has ended,
  * the same answer starts an ordinary next turn. */
+describe('project chip while sub-agents are attached', { timeout: 20_000 }, () => {
+  const projectChip = () => screen.getByRole('button', { name: /Project: |Select project/ })
+
+  it('stays locked when only sub-agents keep the composer busy', async () => {
+    await renderChat({ subagentsRunning: true, turnRunning: false })
+    expect(projectChip()).toBeDisabled()
+  })
+
+  it('stays locked while a reply streams with sub-agents attached', async () => {
+    await renderChat({ subagentsRunning: true, turnRunning: true })
+    expect(projectChip()).toBeDisabled()
+  })
+
+  it('stays enabled while a reply streams with no sub-agents', async () => {
+    await renderChat({ subagentsRunning: false, turnRunning: true })
+    expect(projectChip()).toBeEnabled()
+  })
+})
+
 describe('native question card (#10634) — main chat', { timeout: 20_000 }, () => {
   const seedNativeCard = (store: ReturnType<typeof makeStore>) => {
     act(() => {
       store.dispatch(setQuestionCard({
         slot: 'slot-a',
+        card_id: 'card-native',
+        native: true,
         questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
       }))
     })
@@ -300,9 +322,10 @@ describe('native question card (#10634) — main chat', { timeout: 20_000 }, () 
     expect(steerArgOf(call)).toBeFalsy()
   })
 
-  it('does NOT steer a busy non-blocking ask_question card (card_id)', async () => {
-    // A card_id card is the non-blocking ask_question card; even with the slot
-    // busy (sub-agents running) it must start a next turn, never steer.
+  it('does NOT steer a busy non-blocking ask_question card (card_id, not native)', async () => {
+    // A card_id card without the `native` mark is the non-blocking ask_question
+    // card; even with the slot busy (sub-agents running) it must start a next
+    // turn, never steer.
     const { store } = await renderChat({ subagentsRunning: true, turnRunning: false })
     act(() => {
       store.dispatch(setQuestionCard({

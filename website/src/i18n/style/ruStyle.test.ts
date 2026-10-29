@@ -46,6 +46,25 @@ describe('ru punctuation (style/ru.md §1)', () => {
     // Baselined — existing catalog may use straight quotes
     expect(bad.length, report(bad)).toBeLessThanOrEqual(20)
   })
+
+  // The ceiling's companion: it tolerates the inherited catalog, but it cannot say
+  // whose violation it is, so a branch that adds one rides under it until the count
+  // crosses and the round that reds belongs to someone else. See
+  // docs/ci/i18n-gates.md.
+  it('[changed-values] quotes Cyrillic with guillemets at zero tolerance', () => {
+    const CYRILLIC = /[\u0400-\u04ff]/
+    const changed = changedRuValues()
+    if (changed === null) {
+      // eslint-disable-next-line no-console -- stdout IS this gate's report channel, and this skip is reachable on a bare local run
+      console.log('[changed-values] skipped — I18N_BASE_REF is unset, so there is no branch to diff.')
+      return
+    }
+    const bad = Object.entries(changed)
+      .filter(([, v]) => CYRILLIC.test(v) && /"[\u0400-\u04ff]/.test(v) && !v.includes('«'))
+      .map(([key, value]) => `${key}: ${JSON.stringify(value.slice(0, 60))}`)
+    expect(bad, `${report(bad)}\n\nThere is no ceiling to raise for these — the value is yours.`)
+      .toEqual([])
+  })
 })
 
 describe('ru tone (style/ru.md §4)', () => {
@@ -159,6 +178,39 @@ describe('ru DNT (style/ru.md §3)', () => {
         }
       }
     }
+    expect(bad, report(bad)).toEqual([])
+  })
+})
+
+/**
+ * `utils.offline.gateway_offline_reconnect` renders "…, чтобы {{action}}", and
+ * `чтобы` governs an infinitive. A nominalised action ("удаление артефактов")
+ * reads fine alone in the catalogue but renders as "чтобы удаление артефактов",
+ * so the mismatch only appears once interpolated — which is why it needs a guard
+ * rather than review.
+ */
+describe('ru interpolated actions (utils.offline.gateway_offline_reconnect)', () => {
+  const PREFIX = 'utils.offline.'
+  /** Keys under utils.offline that are NOT interpolated as {{action}}. */
+  const NOT_ACTIONS = new Set([
+    'gateway_offline_reconnect',
+    'disabled_gateway_offline',
+    'menu_reason',
+    'name_not_saved_keep_field_open',
+  ])
+  const actions = Object.entries(ru).filter(
+    ([key]) => key.startsWith(PREFIX) && !NOT_ACTIONS.has(key.slice(PREFIX.length)),
+  )
+
+  it('the frame still interpolates {{action}} and there are actions to check', () => {
+    expect(ru[`${PREFIX}gateway_offline_reconnect`]).toContain('чтобы {{action}}')
+    expect(actions.length).toBeGreaterThan(0)
+  })
+
+  it('opens every action with an infinitive, as `чтобы` requires', () => {
+    const bad = actions
+      .filter(([, value]) => !/^[а-яё]+(ть|ти|чь)(?=\s|$)/i.test(value.trim()))
+      .map(([key, value]) => `${key}: ${JSON.stringify(value)}`)
     expect(bad, report(bad)).toEqual([])
   })
 })

@@ -26,14 +26,28 @@
  * without changing its *arguments*.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { renderHook, waitFor } from '@testing-library/react'
+import { renderHook as rtlRenderHook, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { createElement, type ReactNode } from 'react'
 import { useAgents } from '../hooks/useAgents'
 
 vi.mock('../api/client', () => ({
   api: {
     agentCatalog: vi.fn(),
+    // useAgents reads dashboard.crewmates_in_agent_picker from the shared
+    // config query; an empty config keeps the default templates-only picker.
+    kirocrewConfig: vi.fn(() => Promise.resolve({})),
   },
 }))
+
+// useAgents reads the shared ['kirocrewConfig'] query, so every render needs a
+// QueryClient. Same call shape as RTL's renderHook.
+const renderHook = ((cb: never, opts?: Record<string, unknown>) => {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children)
+  return rtlRenderHook(cb, { ...opts, wrapper })
+}) as typeof rtlRenderHook
 
 const { api } = await import('../api/client')
 const mockApi = api as unknown as {
@@ -137,6 +151,35 @@ describe('useAgents project scoping', () => {
     resolveSecond({ agents: [{ name: 'two-agent', scope: 'project' }], default_agent: 'kirocrew' })
     await waitFor(() => expect(result.current.agents).toHaveLength(1))
     expect(result.current.agents[0].name).toBe('two-agent')
+  })
+
+  it('keeps displayAgents through a slot switch so sidebar agent labels keep their colour', async () => {
+    // The sidebar tints each row's agent label from this roster. Emptying it
+    // on a session switch turned every package agent's purple label grey until
+    // the new slot's fetch resolved, then purple again. `agents` must still
+    // clear (picker safety, above); `displayAgents` must not.
+    mockApi.agentCatalog.mockResolvedValue({
+      agents: [{ name: 'drs-daily', scope: 'global', source: 'package' }],
+      default_agent: 'kirocrew',
+    })
+    let resolveSecond: (v: unknown) => void = () => {}
+    const { result, rerender } = renderHook(
+      ({ key }: { key: string }) => useAgents(0, key, '/repo/one'),
+      { initialProps: { key: 'chat-1' } },
+    )
+    await waitFor(() => expect(result.current.displayAgents).toHaveLength(1))
+
+    mockApi.agentCatalog.mockImplementationOnce(
+      () => new Promise(res => { resolveSecond = res }),
+    )
+    rerender({ key: 'chat-2' })
+
+    expect(result.current.agents).toHaveLength(0)
+    expect(result.current.displayAgents.map(a => a.name)).toEqual(['drs-daily'])
+
+    resolveSecond({ agents: [{ name: 'other', scope: 'global' }], default_agent: 'kirocrew' })
+    await waitFor(() => expect(result.current.displayAgents.map(a => a.name)).toEqual(['other']))
+    expect(result.current.agents.map(a => a.name)).toEqual(['other'])
   })
 
   it('does not clear the roster on a same-project refresh (no flicker)', async () => {

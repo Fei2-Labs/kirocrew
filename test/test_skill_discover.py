@@ -15,11 +15,13 @@ The provider is faked end-to-end so tests stay hermetic — no network.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from conftest import make_dir_link
 from kiro_crew import platform_compat
@@ -90,6 +92,10 @@ def _make_app(state, provider):
 
     app = web.Application()
     app["state"] = state
+    # Install is owner-gated; the owner identity is plumbing so these tests stay on
+    # the branch each one names (the gate itself: test_non_owner_file_and_skill_writes).
+    state.owner_id = ""
+    as_owner(app)
     app.router.add_get("/api/skills/-/discover", discover_mod.api_skills_discover)
     app.router.add_get(
         "/api/skills/-/discover/preview", discover_mod.api_skills_discover_preview
@@ -338,6 +344,87 @@ class TestDiscoverInstall:
             assert bystander.read_text(encoding="utf-8") == "not ours to delete"
             assert (link / "SKILL.md").exists()
             assert not (outside / "SKILL.md").exists()
+        finally:
+            await client.close()
+
+
+_OVERWRITE = {"provider": "fakeprov", "skill_id": "fake-skill", "overwrite": True}
+
+
+@pytest.mark.asyncio
+class TestDiscoverInstallStagedSwap:
+    """An overwrite builds the new bundle aside and swaps it in only once it verifies."""
+
+    async def _installed(self, fake_home):
+        provider = FakeProvider()
+        client, skills_dir = await TestDiscoverInstall()._client(fake_home, provider)
+        resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+        assert resp.status == 200
+        skill_dir = skills_dir / "fakeprov" / "fake-skill"
+        (skill_dir / "my-notes.md").write_text("local edit", encoding="utf-8")
+        return client, provider, skill_dir
+
+    @staticmethod
+    def _assert_old_intact(skill_dir):
+        assert (skill_dir / "my-notes.md").read_text(encoding="utf-8") == "local edit"
+        assert (skill_dir / "rules" / "extra.md").read_text(encoding="utf-8") == "# Extra rules"
+        assert [p.name for p in skill_dir.parent.iterdir()] == ["fake-skill"]
+
+    async def test_success_replaces_and_leaves_no_staging_dir(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            provider._bundle = [("SKILL.md", "---\nname: fake-skill\n---\n# v2")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 200
+            assert (skill_dir / "SKILL.md").read_text(encoding="utf-8").endswith("# v2")
+            assert sorted(p.name for p in skill_dir.iterdir()) == ["SKILL.md"]
+            assert [p.name for p in skill_dir.parent.iterdir()] == ["fake-skill"]
+        finally:
+            await client.close()
+
+    async def test_failed_write_keeps_the_old_install(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            # "rules" as a file, then as a directory: unwritable on every OS.
+            provider._bundle = [("SKILL.md", "# v2"), ("rules", "x"), ("rules/a.md", "y")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "bundle_write_failed"
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
+    async def test_bundle_without_skill_md_keeps_the_old_install(self, fake_home, reset_registry):
+        client, provider, skill_dir = await self._installed(fake_home)
+        try:
+            provider._bundle = [("README.md", "# no skill here")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert "SKILL.md" in (await resp.json())["error"]
+            self._assert_old_intact(skill_dir)
+        finally:
+            await client.close()
+
+    async def test_refused_swap_rename_keeps_the_old_install(
+        self, fake_home, reset_registry, monkeypatch
+    ):
+        # A Windows directory rename can fail under AV or an open handle.
+        from kiro_crew.dashboard.handlers import discover as discover_mod
+
+        client, provider, skill_dir = await self._installed(fake_home)
+
+        def _publish(src, dst):
+            raise PermissionError(13, "Access is denied", str(dst))
+
+        # Patch the module's own `platform_compat` name only, never the shared module.
+        fake = SimpleNamespace(**{**vars(platform_compat), "publish_dir_noreplace": _publish})
+        monkeypatch.setattr(discover_mod, "platform_compat", fake)
+        try:
+            provider._bundle = [("SKILL.md", "# v2")]
+            resp = await client.post("/api/skills/-/discover/install", json=_OVERWRITE)
+            assert resp.status == 500
+            assert (await resp.json())["code"] == "bundle_write_failed"
+            self._assert_old_intact(skill_dir)
         finally:
             await client.close()
 

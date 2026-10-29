@@ -119,10 +119,17 @@ async def _park(
 
 
 async def _drain(mgr: SubagentManager, approval: _ParkedApproval) -> None:
+    """Release the parked run, then the manager's process-lifetime task store.
+
+    Cancelling the tasks frees the loop; ``close()`` frees the durable task
+    queue the constructor opened (a SQLite connection plus its writer thread),
+    which nothing else in these tests closes.
+    """
     approval.gate.set()
     for t in list(mgr._tasks.values()):
         t.cancel()
     await asyncio.sleep(0)
+    mgr.close()
 
 
 @asynccontextmanager
@@ -266,11 +273,24 @@ class TestParkedRunIsVisibleOnBothReadPaths:
         dicts independently, so one of them dropping the field, or drifting to a
         bare flag read, looks identical to a run that simply is not parked.
         """
+        import inspect
         from pathlib import Path
 
         import kiro_crew.dashboard.handlers.messaging as messaging
 
-        src = Path(messaging.__file__).read_text(encoding="utf-8")
+        # The facade composes the read paths from its messaging_api owners, so the
+        # ratchet reads the facade and every owner, and fails if a read path lives
+        # in a file it does not read.
+        facade = Path(messaging.__file__)
+        owners = sorted((facade.parents[1] / "messaging_api").glob("[!_]*.py"))
+        assert owners, "the messaging_api owners were not found"
+        scanned = [facade, *owners]
+        held = {
+            Path(inspect.unwrap(handler).__code__.co_filename).parts[-2:]
+            for handler in (messaging.api_spawn_status, messaging.api_spawn_list)
+        }
+        assert held <= {path.parts[-2:] for path in scanned}, held
+        src = "\n".join(path.read_text(encoding="utf-8") for path in scanned)
         assert src.count("if _awaiting_spawn_approval(info):") == 2, (
             "expected both api_spawn_status and api_spawn_list to gate on the "
             "shared _awaiting_spawn_approval predicate"
@@ -287,7 +307,7 @@ class TestParkedRunIsVisibleOnBothReadPaths:
         """The blocking CLI must tell the user, and only once per run."""
         from pathlib import Path
 
-        import kiro_crew.cli_commands as cli
+        import kiro_crew.cli_commands_gateway_api as cli
 
         src = Path(cli.__file__).read_text(encoding="utf-8")
         assert 'status.get("awaiting_approval")' in src, (
@@ -308,7 +328,7 @@ class TestParkedRunIsVisibleOnBothReadPaths:
         from kiro_crew.mcp_tools import spawn as spawn_tools
 
         def _fake_get(path: str) -> dict:
-            assert path == "/api/spawn"
+            assert path == "/api/spawn?queued=1"
             return {
                 "agents": [
                     {

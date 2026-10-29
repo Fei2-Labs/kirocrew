@@ -15,6 +15,7 @@ from typing import Any
 
 from kiro_crew.apps.app_storage import AppStorage
 from kiro_crew.apps.audit_sdk import AuditSDK
+from kiro_crew.apps.crewmate_sdk import CrewmateSDK
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.event_bus import EventBus
 from kiro_crew.apps.job_sdk import JobSDK
@@ -68,6 +69,7 @@ class AppContext:
     storage: AppStorage | None = None
     spawn: SpawnSDK | None = None
     job: JobSDK | None = None
+    crewmate: CrewmateSDK | None = None
     health: AppHealthStatus = field(default_factory=AppHealthStatus)
     # NOT `| None`, unlike every SDK above: those grant a capability and stay None
     # until the manifest asks for it, while this one only removes sensitive data
@@ -85,6 +87,48 @@ class AppContext:
     # `build_app_context` always populates it, so a context built by the factory
     # never sees None.
     audit: AuditSDK | None = None
+    # The gateway's own aiohttp Application, for an app whose background work has
+    # to be anchored on it -- a poller that reads the dashboard state its request
+    # handlers already read, and stashes the running service where those handlers
+    # look it up. Typed ``Any`` so this module keeps its aiohttp-free import.
+    #
+    # Populated ONLY for an app that declares a ``routes`` hook, and that gate is
+    # what keeps this from being a new grant: such an app is handed the real
+    # ``web.Request`` on every call, so ``request.app`` is already this same
+    # object. An app with only lifecycle hooks gets ``None`` and must say so
+    # rather than guess -- hence ``| None`` and no default instance.
+    http_app: Any | None = None
+
+
+def manifest_declares_routes(manifest: dict[str, Any]) -> bool:
+    """Whether *manifest* declares a ``routes`` hook, read defensively.
+
+    The grant decision itself, separated from the handle so a caller that must
+    REMEMBER the answer can store a bool rather than a live Application: a cached
+    object would pin the gateway's Application past its own lifetime, and a cached
+    ``None`` could not be told apart from "this app was never granted".
+    """
+    return bool(manifest.get("backend", {}).get("hooks", {}).get("routes"))
+
+
+def http_app_for_manifest(manifest: dict[str, Any], http_app: Any) -> Any:
+    """The Application *manifest*'s app may carry on its context, or ``None``.
+
+    ONE predicate, called by every builder, because the hazard here is two
+    builders disagreeing: a startup context that carries the handle and a
+    shutdown context that does not means an app can start background work it can
+    never be asked to stop, and the teardown hook that exists to stop it sees
+    ``None`` and returns as if there were nothing to do.
+
+    The grant is decided by the app declaring a ``routes`` hook, and that is what
+    keeps it from being a new grant at all -- see :attr:`AppContext.http_app`.
+
+    Reading the CURRENT manifest is right only while the two contexts are built
+    from one enable. A teardown that may run against a manifest the app has since
+    rewritten must instead reuse the answer recorded at enable time -- see
+    ``module_loader.cache_http_app_grant``.
+    """
+    return http_app if manifest_declares_routes(manifest) else None
 
 
 def build_app_context(
@@ -96,6 +140,8 @@ def build_app_context(
     broadcast_fn: Any = None,
     spawn_impl: Any = None,
     app_config: dict[str, Any] | None = None,
+    http_app: Any = None,
+    crewmate_host: Any = None,
 ) -> AppContext:
     """Factory that builds an AppContext based on app permissions.
 
@@ -106,6 +152,12 @@ def build_app_context(
         cron_service: The gateway's CronService instance (for CronSDK).
         broadcast_fn: The gateway's broadcast function (for EventBus).
         app_config: App-specific configuration dict.
+        http_app: The gateway's aiohttp Application, or None. Passed straight
+            through, NOT gated on a permission: the caller decides, because the
+            decision is whether this app already reaches the object by another
+            route (see ``AppContext.http_app``) and only the wiring knows that.
+        crewmate_host: The gateway's Application for ``ctx.crewmate``, built
+            only when the manifest declares ``proposeCrewmate``.
 
     Returns:
         AppContext with services populated based on permissions.
@@ -150,6 +202,16 @@ def build_app_context(
     if perms.get("jobs"):
         job_sdk = JobSDK(app_name, data_dir)
 
+    crewmate_sdk = None
+    from kiro_crew.apps import crewmate_sdk as crewmate_mod
+
+    if (
+        crewmate_mod.PREVIEW_ENABLED
+        and perms.get("proposeCrewmate") is True
+        and crewmate_host is not None
+    ):
+        crewmate_sdk = CrewmateSDK(app_name, crewmate_host)
+
     return AppContext(
         name=app_name,
         data_dir=data_dir,
@@ -160,7 +222,9 @@ def build_app_context(
         storage=app_storage,
         spawn=spawn_sdk,
         job=job_sdk,
+        crewmate=crewmate_sdk,
         # Both unconditional: see the fields' comments on AppContext.
         scrub=ScrubSDK(),
         audit=AuditSDK(app_name),
+        http_app=http_app,
     )

@@ -64,9 +64,9 @@ def test_the_bound_block_the_page_lists_is_what_select_crew_returns(doc_text: st
     ), "the page says the empty call returns the roster plus a top-level default_agent"
     for field in ("kiro_agent", "workspace", "memory_store", "model"):
         assert f"`{field}`" in doc_text, f"the page no longer names the bound field {field}"
-    src = (Path(__file__).parent.parent / "src" / "kiro_crew" / "mcp_core.py").read_text(
-        encoding="utf-8"
-    )
+    src = (
+        Path(__file__).parent.parent / "src" / "kiro_crew" / "mcp_core_parts" / "crew.py"
+    ).read_text(encoding="utf-8")
     assert '"model": cfg.agents[crew].model,' in src, (
         "the page says `model` is the configured pin verbatim; _do_select_crew no "
         "longer reads it straight off the crew record"
@@ -82,18 +82,23 @@ def test_the_trigger_overlap_threshold_the_page_quotes_is_the_real_one(doc_text:
     ), f"the page quotes a trigger threshold that is no longer {MIN_TRIGGER_OVERLAP}"
 
 
-def test_empty_triggers_still_refuse_a_delegation_with_that_code(doc_text: str) -> None:
-    """§When not to route names the refusal code a triggerless crewmate returns."""
-    handler = (
-        Path(__file__).parent.parent
-        / "src"
-        / "kiro_crew"
-        / "dashboard"
-        / "handlers"
-        / "messaging.py"
-    ).read_text(encoding="utf-8")
-    assert '"code": "crew_delegation_disabled"' in handler
-    assert "crew_delegation_disabled" in doc_text
+def test_empty_triggers_only_skip_routing_not_named_delegation(doc_text: str) -> None:
+    """§When not to route says a triggerless crewmate can still be named."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    dashboard = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard"
+    # The spawn route runs from a messaging_api owner the facade composes, so the
+    # handler is the facade and every owner, and the scan fails if the route lives
+    # in a file it does not read.
+    owners = sorted((dashboard / "messaging_api").glob("[!_]*.py"))
+    assert owners, "the messaging_api owners were not found"
+    files = [dashboard / "handlers" / "messaging.py", *owners]
+    held = Path(messaging.api_spawn.__code__.co_filename)
+    assert held.parts[-2:] in {path.parts[-2:] for path in files}, held
+    handler = "\n".join(path.read_text(encoding="utf-8") for path in files)
+    assert "crew_delegation_disabled" not in handler
+    assert "crew_delegation_disabled" not in doc_text
+    assert "delegated to by name" in doc_text
 
 
 def test_the_config_fields_the_page_names_are_still_on_the_crew_record(doc_text: str) -> None:
@@ -106,3 +111,11 @@ def test_the_config_fields_the_page_names_are_still_on_the_crew_record(doc_text:
     for field in ("kiro_agent", "triggers"):
         assert field in names, f"the page's table names {field}, which the crew record dropped"
         assert f"`{field}`" in doc_text
+
+
+def test_the_self_change_tool_the_page_names_is_still_declared(doc_text: str) -> None:
+    """§Editing tells the reader a crewmate renames itself with `update_self`."""
+    from kiro_crew import mcp_mate
+
+    assert "update_self" in {tool["name"] for tool in mcp_mate._list_tools()}
+    assert "`update_self`" in doc_text

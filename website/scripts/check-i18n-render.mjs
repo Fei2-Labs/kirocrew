@@ -68,7 +68,7 @@
  * Exit codes: 0 clean · 1 regression · 2 cannot run (build missing, no browser,
  * pseudolocale not active).
  */
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, symlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync } from 'node:fs'
 import { spawnSync, execFileSync } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -77,9 +77,11 @@ import { serveDist } from './lib/serve-dist.mjs'
 import { stubDashboardApi, logPageProblems, json } from './lib/stub-dashboard-api.mjs'
 import { SURFACES, LOCALES, VIEWPORTS, FIXTURE_DETAIL_APP, FIXTURE_DETAIL_DESCRIPTION, partitionBaseSurfaces } from './lib/i18n-surfaces.mjs'
 import { browserBundle } from './lib/render-scan.mjs'
+import { baseUiAutoArgs, linkNodeModulesView } from './lib/base-node-modules.mjs'
 import {
   SETTLE_POLL_MS,
   SETTLE_TIMEOUT_MS,
+  createInflightUrls,
   createSettleTracker,
 } from './lib/render-settle.mjs'
 import {
@@ -453,9 +455,8 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
     return done({
       // `provider` must be one of `PROVIDER_OPTIONS`; anything else and the panel
       // renders neither provider's rows, which is a different screen.
-      enabled: false, provider: 'piper', voice: '0004', engine: '0005', rate: '0006',
+      enabled: false, provider: 'polly', voice: '0004', engine: '0005', rate: '0006',
       autoSpeak: false, aws_profile: '', region: '',
-      piper_binary: '', piper_model: '', piper_model_config: '', piper_length_scale: 1,
     })
   }
   if (path === '/api/voice/voices') return done({ voices: [] })
@@ -682,10 +683,17 @@ function resolveBaseScope() {
  * cross-tree import, every base build died with `Could not resolve …` and the gate
  * exited 2 on EVERY pull request, because the breakage lived in the base tree
  * rather than in anyone's diff. Archiving the commit costs a few seconds of tar
- * next to two ~45s vite builds and cannot rot. `node_modules` is symlinked rather
+ * next to two ~45s vite builds and cannot rot. `node_modules` is linked rather
  * than installed — a second `npm ci` would cost minutes, and the base's dependency
  * set only matters if the lockfile changed, which a render gate is not the right
  * place to police.
+ *
+ * Linked per entry, never as one directory link, because `node_modules/.cache`
+ * holds build outputs rather than packages, and one of them is the auto stamp
+ * manifest the base's `vite.config.ts` reads. HEAD's manifest describes HEAD's
+ * text, so sharing it fails the base build on every branch that edits a stamped
+ * file. The base gets an empty `.cache` and its own generator fills it (see
+ * scripts/lib/base-node-modules.mjs).
  */
 function buildBaseBundle(sha) {
   const dir = join(tmpdir(), `i18n-render-base-${sha.slice(0, 12)}`)
@@ -721,19 +729,37 @@ function buildBaseBundle(sha) {
   if (!existsSync(join(baseWeb, 'package.json'))) {
     die(`base tree ${sha} has no website/ — cannot render it`)
   }
-  // `junction`, not `dir`, on Windows: creating a directory SYMLINK there needs
-  // elevated privileges or Developer Mode, so a plain `dir` link fails with EPERM on
-  // a stock Windows dev box and takes the whole gate down with exit 2. A junction
-  // needs no privilege. It requires an absolute target, which this already is.
-  symlinkSync(
-    NODE_MODULES,
-    join(baseWeb, 'node_modules'),
-    process.platform === 'win32' ? 'junction' : 'dir',
-  )
+  // HEAD's packages, but the base's own `.cache` and auto stamp manifest. The view
+  // links directories as junctions on Windows, where a directory symlink needs
+  // elevated privileges and would take the whole gate down with EPERM.
+  linkNodeModulesView(NODE_MODULES, join(baseWeb, 'node_modules'))
+  writeBaseUiAuto(baseWeb, dir, sha)
 
   runViteDevBuild(baseWeb, 'dist-dev', `base ${sha.slice(0, 8)}`)
   TEMP_DIRS.push(dir)
   return { dist: join(baseWeb, 'dist-dev'), baseWeb }
+}
+
+/**
+ * Write the base tree's OWN auto stamp manifest and auto tier, with the base
+ * tree's own generator, into the empty `.cache` its `node_modules` view has.
+ *
+ * Without them the base build would stamp nothing and still pass, but it would
+ * no longer be the bundle the base commit ships: the comparison must measure the
+ * same kind of build on both sides. A base from before the auto tier existed has
+ * no stamp plugin to feed, so there is nothing to write.
+ */
+function writeBaseUiAuto(baseWeb, dir, sha) {
+  if (!existsSync(join(baseWeb, 'scripts', 'lib', 'ui-auto-stamp.mjs'))) return
+  const res = spawnSync(
+    process.execPath,
+    [join('scripts', 'gen-ui-index.mjs'), ...baseUiAutoArgs(join(dir, 'ui-index.scratch.json'))],
+    { cwd: baseWeb, encoding: 'utf-8' },
+  )
+  if (res.status !== 0) {
+    out(`${res.stdout || ''}\n${res.stderr || ''}`.trim().split('\n').slice(-25).join('\n'))
+    die(`[base ${sha.slice(0, 8)}] could not write the base tree's auto stamp manifest (exit ${res.status})`)
+  }
 }
 
 /**
@@ -879,6 +905,8 @@ async function main() {
  */
 async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label }) {
   const { srv, base } = await serveDist(dist)
+  /** The only origin a capture may load from; see the context route below. */
+  const servedOrigin = new URL(base).origin
   /** @type {Array<{surface: string, locale: string, viewport: string, finding: object}>} */
   const all = []
   /**
@@ -915,6 +943,17 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
           // this gate reports would otherwise be a race.
           reducedMotion: 'reduce',
         })
+        // Nothing a capture waits on may live off the loopback origin it is served
+        // from: one slow third-party answer would hold a surface past
+        // SETTLE_TIMEOUT_MS and fail the run for nothing in its diff. The brand
+        // faces are served from the same origin, so every off-origin request is
+        // refused and settles at once as `requestfailed`. The quiet wait still
+        // counts every request, so a loopback request that never answers still
+        // fails by name.
+        await context.route(
+          url => /^https?:$/.test(url.protocol) && url.origin !== servedOrigin,
+          route => route.abort('blockedbyclient'),
+        )
         await context.addInitScript(code => {
           localStorage.setItem('mc-lang', code)
           localStorage.setItem('mc-onboarded', '1')
@@ -934,11 +973,17 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
         // Cumulative counters, deliberately never reset per surface. A request that
         // outlives the surface that started it still settles, so the difference
         // stays honest across the loop; resetting would strand those stragglers and
-        // leave the count permanently short.
-        const net = { started: 0, settled: 0, get inflight() { return this.started - this.settled } }
-        page.on('request', () => { net.started += 1 })
-        page.on('requestfinished', () => { net.settled += 1 })
-        page.on('requestfailed', () => { net.settled += 1 })
+        // leave the count permanently short. `open` names the requests still in
+        // flight so a timeout can say WHICH one it was waiting on, not just how
+        // many -- the diagnostic the quiet-wait failure needs to be actionable.
+        const open = createInflightUrls()
+        const net = {
+          started: 0, settled: 0, open,
+          get inflight() { return this.started - this.settled },
+        }
+        page.on('request', request => { net.started += 1; open.start(request) })
+        page.on('requestfinished', request => { net.settled += 1; open.finish(request) })
+        page.on('requestfailed', request => { net.settled += 1; open.finish(request) })
         await stubDashboardApi(page, {
           theme: 'dark',
           extra: (path, route) => FIXTURE_OVERRIDES(locale.code, path, route),
@@ -988,10 +1033,10 @@ async function sweep(browser, dist, { scanScript, dnt, surfaces, locales, label 
           // than it did before.
           await waitForSurfaceQuiet(page, net, surface, label)
           // Every width this gate reports is a text measurement, and text measures
-          // differently in the fallback face than in the real one. Scanning before
-          // the webfonts land made the layout bucket differ by 2 between identical
-          // runs (artifacts.layout 4 vs 2), which would have made the whole gate
-          // flaky rather than wrong. Two rAF ticks after that let the resulting
+          // differently while a face is still loading than once it has. The remote
+          // webfont never loads here (the context route answers its stylesheet
+          // empty), but the faces index.css declares itself still load on first
+          // use, so wait for them. Two rAF ticks after that let the resulting
           // reflow finish before anything is read.
           await page.evaluate(() => document.fonts.ready)
           await page.evaluate(() => new Promise(r => requestAnimationFrame(
@@ -1082,8 +1127,13 @@ async function waitForSurfaceQuiet(page, net, surface, label) {
     await page.waitForTimeout(SETTLE_POLL_MS)
   }
   const seen = tracker.last || { chars: 0, nodes: 0 }
+  const stuck = net.open ? net.open.urls() : []
+  const stuckLine = stuck.length
+    ? `\n    Still in flight: ${stuck.join(', ')}.`
+    : ''
   die(`[${label}] ${surface.url} never went quiet in ${SETTLE_TIMEOUT_MS}ms `
-    + `(${net.inflight} request(s) in flight, ${seen.chars} chars, ${seen.nodes} nodes). `
+    + `(${net.inflight} request(s) in flight, ${seen.chars} chars, ${seen.nodes} nodes).`
+    + stuckLine + ' '
     + 'A surface that keeps changing cannot be compared against a second sweep. Give it a '
     + 'deterministic fixture in FIXTURE_OVERRIDES, or drop it from lib/i18n-surfaces.mjs '
     + 'with a comment saying why.')

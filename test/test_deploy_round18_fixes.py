@@ -13,7 +13,10 @@ from __future__ import annotations
 from pathlib import Path
 
 SRC = Path(__file__).parent.parent / "src" / "kiro_crew"
-HANDLERS = (SRC / "deploy" / "handlers.py").read_text(encoding="utf-8")
+HANDLERS = "".join(
+    (SRC / "deploy" / name).read_text(encoding="utf-8")
+    for name in ("handlers_guards.py", "handlers_content.py", "handlers_sites.py", "handlers.py")
+)
 # The deploy_artifact handler lives in its domain module, not mcp_core.py.
 MCP_DEPLOY = (SRC / "mcp_tools" / "artifacts.py").read_text(encoding="utf-8")
 SCRIPTS = SRC / "deploy" / "skills" / "artifact-deploy" / "scripts"
@@ -78,9 +81,15 @@ class TestF3OACNameVerification:
 
 class TestF4MCPResponseRedaction:
     def test_all_textual_paths_redacted(self):
-        assert "_deploy_redact(str(d['error']))" in MCP_DEPLOY
+        assert '_deploy_redact(str(d["error"]))' in MCP_DEPLOY
         assert '_deploy_redact(str(d.get("findings", "")))' in MCP_DEPLOY
         assert "_deploy_redact(str(d.get('scan', 'clean')))" in MCP_DEPLOY
+        # The error payload was split into a plain banner sentence plus a
+        # technical `details` string and a runnable `remediation` command. Both
+        # new fields are relayed to the LLM, so both are textual paths that must
+        # go through the same redaction.
+        assert '_deploy_redact(str(d.get("details", "")))' in MCP_DEPLOY
+        assert '_deploy_redact(str(d.get("remediation", "")))' in MCP_DEPLOY
 
 
 class TestF5PendingIdentityBinding:

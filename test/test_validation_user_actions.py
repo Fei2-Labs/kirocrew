@@ -175,6 +175,38 @@ class TestMcpCoreUserActions:
         assert len(result) == 5000
         mock_get.assert_called_with("/api/spawn/abc123")
 
+    def test_spawn_status_prefixes_terminal_usage(self):
+        with patch("kiro_crew.mcp_core._get") as mock_get:
+            mock_get.return_value = {"result": "done", "credits": 1.25, "elapsed": 12.5}
+            result = self._simulate_tool_call("spawn_status", {"agent_id": "abc123"})
+        assert result == "[usage: 1.25 credits · 13s]\ndone"
+
+    def test_spawn_status_paged_header_includes_terminal_usage(self):
+        with patch("kiro_crew.mcp_core._get") as mock_get:
+            mock_get.return_value = {
+                "result": "page",
+                "credits": 2.0,
+                "elapsed": 4.0,
+                "result_meta": {
+                    "total_lines": 10,
+                    "offset": 0,
+                    "returned_lines": 1,
+                    "has_more": True,
+                },
+            }
+            result = self._simulate_tool_call("spawn_status", {"agent_id": "abc123"})
+        assert result.startswith("[usage: 2.00 credits · 4s | showing lines 0-1 of 10")
+
+    def test_spawn_status_failure_includes_terminal_usage(self):
+        with patch("kiro_crew.mcp_core._get") as mock_get:
+            mock_get.return_value = {
+                "error": "backend failed",
+                "credits": 0.75,
+                "elapsed": 12.5,
+            }
+            result = self._simulate_tool_call("spawn_status", {"agent_id": "abc123"})
+        assert result == "[usage: 0.75 credits · 13s]\nError: backend failed"
+
     def test_spawn_status_not_found(self):
         with patch("kiro_crew.mcp_core._get") as mock_get:
             mock_get.return_value = {"error": "not found"}
@@ -186,7 +218,11 @@ class TestMcpCoreUserActions:
         assert "required" in result.lower()
 
     def test_spawn_status_non_string_id(self):
-        result = self._simulate_tool_call("spawn_status", {"agent_id": 123})
+        # A numeric-looking id re-typed to an int by an upstream deferred-schema
+        # runtime is defensively coerced back to its string form ("123") at the
+        # MCP entry point, so it is accepted and reaches the handler. A
+        # genuinely non-coercible type (a list) is still rejected.
+        result = self._simulate_tool_call("spawn_status", {"agent_id": ["x"]})
         assert "Error" in result
 
     def test_spawn_status_rejects_non_alnum_id(self):
@@ -636,10 +672,12 @@ class TestBadInputsCaught:
         assert "unknown field" in result
 
     def test_wrong_type_rejected(self):
+        # A genuinely wrong type (list) on a string field is still rejected.
+        # A number on a string field is defensively converted to its string form.
         result = self._core_call(
             "spawn_run",
             {
-                "task": 12345,  # should be string
+                "task": ["not", "a", "string"],  # list, not coercible
             },
         )
         assert "Error" in result

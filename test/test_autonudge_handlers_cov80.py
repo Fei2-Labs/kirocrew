@@ -1,6 +1,6 @@
 """Coverage tests for the auto-nudge HTTP mapping (``dashboard/handlers/autonudge.py``).
 
-``test_autonudge.py`` drives ``AutoNudgeService`` itself and ``test_autonudge_stop_auth.py``
+``test_autonudge*.py`` drives ``AutoNudgeService`` itself and ``test_autonudge_stop_auth.py``
 drives the transport-agnostic authorizer. What neither touches is the thin HTTP layer
 between them: the read routes (list / get), the "service is absent" 503+``enabled: false``
 shapes, the malformed-body 400s, and the DELETE route's audit record — which has to name
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -39,6 +40,7 @@ class _FakeSvc:
     def __init__(self, loops: list[NudgeLoop] | None = None) -> None:
         self.loops = loops or []
         self.removed: list[str] = []
+        self.notes: list[tuple[str, str]] = []
 
     def list_all(self) -> list[NudgeLoop]:
         return list(self.loops)
@@ -49,8 +51,9 @@ class _FakeSvc:
     def get_by_id(self, loop_id: str) -> NudgeLoop | None:
         return next((lp for lp in self.loops if lp.id == loop_id), None)
 
-    async def remove(self, loop_id: str) -> None:
+    async def remove(self, loop_id: str, *, stop_reason: str = "", stop_detail: str = "") -> None:
         self.removed.append(loop_id)
+        self.notes.append((loop_id, stop_reason))
 
 
 def _loop(loop_id: str = "lp-1", slot_key: str = "chat-1-111") -> NudgeLoop:
@@ -381,6 +384,50 @@ async def test_monitor_browser_routes_require_dashboard_owner(
 
 
 @pytest.mark.asyncio
+async def test_monitor_slot_read_refuses_non_owner_sessions_without_leaking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Profile reads one slot's record; no non-owner caller gets its contents."""
+    loop = _monitor_loop(slot_key="member-other")
+    assert loop.monitor is not None
+    loop.monitor.wake_instructions = "WAKE-MARKER"
+    loop.message = "PROMPT-MARKER"
+    _svc(monkeypatch, _FakeSvc([loop]))
+    state = MagicMock(owner_id="U_OWNER")
+    callers = [
+        {"user": "U_OTHER"},
+        {"user": "U_OWNER", "app_claim": "some-app"},
+        {
+            "user": None,
+            "headers": {"X-Session-Key": "member-mine"},
+            "internal_auth": True,
+        },
+    ]
+    for caller in callers:
+        request = _mk(
+            "GET",
+            "/api/monitors/slot/member-other",
+            match={"slot_key": "member-other"},
+            state=state,
+            **caller,
+        )
+        response = await h.api_monitor_slot_get(request)
+        assert response.status == 403, caller
+        text = json.dumps(_body(response))
+        for marker in ("WAKE-MARKER", "PROMPT-MARKER", "acme/widgets", "member-other"):
+            assert marker not in text, (caller, marker)
+
+    owner = _mk(
+        "GET",
+        "/api/monitors/slot/member-other",
+        match={"slot_key": "member-other"},
+        state=state,
+        user="U_OWNER",
+    )
+    assert (await h.api_monitor_slot_get(owner)).status == 200
+
+
+@pytest.mark.asyncio
 async def test_monitor_list_excludes_persistence_only_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -432,10 +479,167 @@ async def test_monitor_create_uses_bounded_defaults(monkeypatch: pytest.MonkeyPa
     kwargs = authorize.await_args.kwargs
     assert kwargs["svc"] is svc
     assert kwargs["monitor"].budgets.max_runtime_secs == 14_400
-    assert kwargs["monitor"].budgets.max_agent_turns == 8
+    # 0 is the wake budget's shipped default and means unlimited.
+    assert kwargs["monitor"].budgets.max_agent_turns == 0
     assert kwargs["monitor"].budgets.max_tokens == 250_000
     assert kwargs["monitor"].budgets.max_provider_errors == 3
     assert kwargs["replace_existing"] is False
+
+
+@pytest.mark.asyncio
+async def test_monitor_create_omitting_the_budget_succeeds_under_a_low_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shipped 14400 default is capped to the operator ceiling, so a body
+    that never named a budget is not refused for one."""
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    authorize = AsyncMock(return_value=(_monitor_loop("new-mon"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST",
+        "/api/monitors",
+        body={"slot_key": "chat-1-111", "target": "https://github.com/acme/widgets/pull/7"},
+    )
+    response = await h.api_monitor_create(request)
+    assert response.status == 200
+    assert authorize.await_args.kwargs["monitor"].budgets.max_runtime_secs == 3600
+
+    response = await h.api_monitor_create(
+        _mk(
+            "POST",
+            "/api/monitors",
+            body={
+                "slot_key": "chat-1-111",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "max_runtime_secs": 3601,
+            },
+        )
+    )
+    assert response.status == 400
+    assert "between 1 and 3600" in _body(response)["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_budget", [3600.5, True])
+async def test_monitor_routes_normalize_integral_float_runtime_budgets(
+    monkeypatch: pytest.MonkeyPatch, bad_budget: object
+) -> None:
+    loop = _monitor_loop()
+    _svc(monkeypatch, _FakeSvc([loop]))
+    authorize_create = AsyncMock(return_value=(_monitor_loop("new-mon"), None, 200))
+    authorize_update = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize_create)
+    monkeypatch.setattr(h, "authorize_and_update_monitor", authorize_update)
+
+    create = await h.api_monitor_create(
+        _mk(
+            "POST",
+            "/api/monitors",
+            body={
+                "slot_key": "chat-1-111",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "max_runtime_secs": 3600.0,
+            },
+        )
+    )
+    assert create.status == 200
+    assert authorize_create.await_args.kwargs["monitor"].budgets.max_runtime_secs == 3600
+
+    update = await h.api_monitor_update(
+        _mk(
+            "PATCH",
+            "/api/monitors/mon-1",
+            match={"monitor_id": "mon-1"},
+            body={"max_runtime_secs": 3600.0},
+        )
+    )
+    assert update.status == 200
+    assert update is not None
+    assert authorize_update.await_args.kwargs["patch"] == {
+        "budget_patch": {"max_runtime_secs": 3600}
+    }
+
+    for method, path, handler, match in (
+        ("POST", "/api/monitors", h.api_monitor_create, None),
+        (
+            "PATCH",
+            "/api/monitors/mon-1",
+            h.api_monitor_update,
+            {"monitor_id": "mon-1"},
+        ),
+    ):
+        body = {"max_runtime_secs": bad_budget}
+        if method == "POST":
+            body.update(
+                {
+                    "slot_key": "chat-1-111",
+                    "target": "https://github.com/acme/widgets/pull/7",
+                }
+            )
+        response = await handler(_mk(method, path, match=match, body=body))
+        assert response.status == 400
+        assert _body(response)["code"] == "invalid_monitor"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["cadence_secs", "max_agent_turns", "max_tokens", "max_provider_errors", "max_runtime_secs"],
+)
+def test_monitor_config_accepts_a_whole_number_float_on_every_bounded_field(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """A JSON body may spell an integer as ``60.0``; every bounded field takes
+    it as the integer, and refuses a fractional float and a bool alike."""
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    monkeypatch.setattr("kiro_crew.monitoring.limits.runtime_ceiling_secs", lambda: 3600)
+    base = {"slot_key": "chat-1-111", "target": "https://github.com/acme/widgets/pull/7"}
+    good = {"cadence_secs": 60.0, "max_agent_turns": 3.0, "max_tokens": 5000.0}
+    good.update({"max_provider_errors": 4.0, "max_runtime_secs": 1800.0})
+
+    monitor = h._monitor_config({**base, field: good[field]}, gitlab_hosts=frozenset())
+    got = getattr(monitor.budgets, field, None)
+    if field == "cadence_secs":
+        got = monitor.cadence_secs
+    assert got == int(good[field]) and type(got) is int
+
+    for bad in (good[field] + 0.5, True):
+        with pytest.raises(ValueError, match=f"{field} must be an integer between"):
+            h._monitor_config({**base, field: bad}, gitlab_hosts=frozenset())
+
+
+@pytest.mark.asyncio
+async def test_monitor_update_omitting_the_budget_leaves_a_stored_one_unjudged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stored budget above a lowered ceiling belongs to the load path; a patch
+    that does not touch it is not refused for it, and one that names it is."""
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.monitor.budgets = dataclasses.replace(loop.monitor.budgets, max_runtime_secs=7200)
+    _svc(monkeypatch, _FakeSvc([loop]))
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    update = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_update_monitor", update)
+
+    response = await h.api_monitor_update(
+        _mk("PATCH", "/api/monitors/mon-1", match={"monitor_id": "mon-1"}, body={"max_tokens": 5})
+    )
+    assert response.status == 200
+    assert update.await_args.kwargs["patch"] == {"budget_patch": {"max_tokens": 5}}
+
+    update.reset_mock()
+    response = await h.api_monitor_update(
+        _mk(
+            "PATCH",
+            "/api/monitors/mon-1",
+            match={"monitor_id": "mon-1"},
+            body={"max_runtime_secs": 7200},
+        )
+    )
+    assert response.status == 400
+    assert "between 1 and 3600" in _body(response)["error"]
+    update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -668,6 +872,137 @@ async def test_monitor_restart_is_conditional_on_the_record_it_read(
 
 
 @pytest.mark.asyncio
+async def test_monitor_restart_clamps_a_stored_budget_to_the_current_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record armed under a higher ceiling restarts at the ceiling in force,
+    not with a 400 naming a number the user never typed."""
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.active = False
+    loop.monitor.outcome = MonitorOutcome.USER_STOP
+    loop.monitor.budgets = dataclasses.replace(loop.monitor.budgets, max_runtime_secs=7200)
+    _svc(monkeypatch, _FakeSvc([loop]))
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    authorize = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+
+    response = await h.api_monitor_restart(
+        _mk("POST", "/api/monitors/mon-1/restart", match={"monitor_id": "mon-1"})
+    )
+
+    assert response.status == 200
+    assert authorize.await_args.kwargs["max_runtime_secs"] == 3600
+
+
+@pytest.mark.asyncio
+async def test_monitor_restart_keeps_a_stored_budget_under_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.active = False
+    loop.monitor.outcome = MonitorOutcome.USER_STOP
+    loop.monitor.budgets = dataclasses.replace(loop.monitor.budgets, max_runtime_secs=1800)
+    _svc(monkeypatch, _FakeSvc([loop]))
+    monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+    authorize = AsyncMock(return_value=(loop, None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+
+    response = await h.api_monitor_restart(
+        _mk("POST", "/api/monitors/mon-1/restart", match={"monitor_id": "mon-1"})
+    )
+
+    assert response.status == 200
+    assert authorize.await_args.kwargs["max_runtime_secs"] == 1800
+
+
+@pytest.mark.asyncio
+async def test_monitor_restart_clamped_budget_reaches_the_store(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Driven through the REAL authorizer and service: the store re-validates
+    the monitor's own ``budgets.max_runtime_secs`` on add, so the clamp has to
+    land on the record it forwards, not only on the legacy argument. With a
+    stored 7200 and a 3600 ceiling the restart succeeds and the new row holds
+    3600."""
+    monkeypatch.setattr("kiro_crew.monitoring.limits.runtime_ceiling_secs", lambda: 604800)
+    service = AutoNudgeService(base_dir=tmp_path)
+    try:
+        loop = await service.add_monitor(
+            slot_key="chat-1-111",
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+            cadence_secs=300,
+            budgets=dataclasses.replace(
+                MonitorState(
+                    kind="github_pull_request",
+                    target="https://github.com/acme/widgets/pull/7",
+                    objective="review_ready",
+                    created_ts=1.0,
+                ).budgets,
+                max_runtime_secs=7200,
+            ),
+            wake_instructions="check it",
+        )
+        assert loop.monitor is not None
+        loop.active = False
+        loop.monitor.outcome = MonitorOutcome.USER_STOP
+        monkeypatch.setattr("kiro_crew.monitoring.limits.runtime_ceiling_secs", lambda: 3600)
+        monkeypatch.setattr(h, "runtime_ceiling_secs", lambda: 3600)
+        monkeypatch.setattr(h, "_autonudge_get", lambda: service)
+        monkeypatch.setattr("kiro_crew.autonudge_authz.sel", lambda: MagicMock())
+        state = MagicMock()
+        state.owner_id = ""
+        state._slots = {
+            "chat-1-111": SimpleNamespace(
+                workspace="default", is_closing=False, mode="", memory_mode="persistent"
+            )
+        }
+
+        response = await h.api_monitor_restart(
+            _mk(
+                "POST",
+                f"/api/monitors/{loop.id}/restart",
+                match={"monitor_id": loop.id},
+                state=state,
+            )
+        )
+
+        assert response.status == 200, _body(response)
+        restarted = service.get_by_slot("chat-1-111")
+        assert restarted is not None and restarted.active and restarted.id != loop.id
+        assert restarted.monitor is not None
+        assert restarted.monitor.budgets.max_runtime_secs == 3600
+    finally:
+        service.stop()
+
+
+@pytest.mark.asyncio
+async def test_monitor_restart_store_bound_refusal_is_a_coded_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ValueError the store raises on the restart add is an audited 400 with
+    a ``code``, not an unhandled 500."""
+    loop = _monitor_loop()
+    assert loop.monitor is not None
+    loop.active = False
+    loop.monitor.outcome = MonitorOutcome.USER_STOP
+    _svc(monkeypatch, _FakeSvc([loop]))
+    authorize = AsyncMock(side_effect=ValueError("no monitored kind 'x' supports objective 'y'"))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+
+    response = await h.api_monitor_restart(
+        _mk("POST", "/api/monitors/mon-1/restart", match={"monitor_id": "mon-1"})
+    )
+
+    assert response.status == 400
+    assert _body(response)["code"] == "monitor_restart_denied"
+    assert "supports objective" in _body(response)["error"]
+
+
+@pytest.mark.asyncio
 async def test_monitor_update_sends_only_explicit_patch_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -869,12 +1204,29 @@ async def test_structured_legacy_row_carries_exactly_the_entitled_keys(
         "gate",
         "stopped_reason",
         "approval_stalled",
+        # When that hold began; same class, and 0 on a structured monitor.
+        "approval_stalled_at",
+        # The person-wait hold: the same class as ``approval_stalled`` (the loop's
+        # own reading of whether it can act). Only a work-ledger watch sets them, so a
+        # structured monitor carries "" and False truthfully.
+        "ledger_seen_fp",
+        "waiting_on_person",
+        "waiting_on_person_at",
         # Same class as ``approval_stalled``: the automation's own reading of
         # whether it can act, not a fact about what it watches. A structured
         # monitor never writes it, so the row carries 0 truthfully.
         "consecutive_start_failures",
+        # Same class and same reason as ``consecutive_start_failures``: the
+        # loop's own reading of whether its cycles can make progress, not a fact
+        # about the subject. A structured monitor never writes it, so the row
+        # carries 0 truthfully.
+        "consecutive_failed_cycles",
         "next_due_ts",
         "self_armed",
+        # Same class as ``self_armed``: who armed the loop, not what it watches.
+        # It is what lets a reader tell the gateway's default conductor patrol
+        # from a loop the agent armed itself.
+        "default_patrol",
         "terminal_notification_outcome",
         "terminal_notification_stopped_at",
         # Mapped from the monitor's own accounting, not withheld -- withholding
@@ -1066,6 +1418,11 @@ async def test_both_legacy_reads_return_a_monitor_armed_through_the_create_route
                 "target": "https://github.com/acme/widgets/pull/7",
                 "wake_instructions": "fix the red lane",
                 "cadence_secs": 900,
+                # An EXPLICIT positive wake budget, not the shipped default. The
+                # default is 0, which the legacy shape already spells as
+                # unlimited, so a default row could not tell a mapped value from
+                # a withheld one.
+                "max_agent_turns": 6,
             },
         )
     )
@@ -1094,9 +1451,8 @@ async def test_both_legacy_reads_return_a_monitor_armed_through_the_create_route
         assert row["idle_secs"] == 900
         for withheld in ("monitor", "message", "banner", "stop_sentinel_path"):
             assert withheld not in row
-        # Mapped, not withheld: the real turn budget rather than a 0 that reads
-        # as unlimited.
-        assert row["max_cycles"] == 8  # the create route's default budget
+        # Mapped, not withheld: the wake budget this arm actually asked for.
+        assert row["max_cycles"] == 6
     for blob in (json.dumps(listed), json.dumps(per_slot)):
         assert "fix the red lane" not in blob
         assert "acme/widgets" not in blob
@@ -1225,6 +1581,40 @@ async def test_start_passes_create_only_coerced_values_to_the_authorizer(
 
 
 @pytest.mark.asyncio
+async def test_start_answers_an_over_ceiling_budget_with_the_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An integer above the ceiling is a bound failure, not a type failure: the
+    refusal quotes the range so the caller can lower the number."""
+    _svc(monkeypatch, _FakeSvc())
+    monkeypatch.setattr("kiro_crew.monitoring.limits.runtime_ceiling_secs", lambda: 3600)
+    request = _mk(
+        "POST", "/api/autonudge", body={"slot_key": "s", "message": "m", "max_runtime_secs": 7200}
+    )
+    response = await h.api_autonudge_start(request)
+    assert response.status == 400
+    error = _body(response)["error"]
+    assert "between 0 and 3600" in error and "1 hour" in error
+    assert "must be integers" not in error
+
+
+@pytest.mark.asyncio
+async def test_start_accepts_a_whole_number_float_budget_as_an_int(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _svc(monkeypatch, _FakeSvc())
+    authorize = AsyncMock(return_value=(_loop("lp-new"), None, 200))
+    monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
+    request = _mk(
+        "POST", "/api/autonudge", body={"slot_key": "s", "message": "m", "max_runtime_secs": 3600.0}
+    )
+    response = await h.api_autonudge_start(request)
+    assert response.status == 200
+    budget = authorize.await_args.kwargs["max_runtime_secs"]
+    assert budget == 3600 and type(budget) is int
+
+
+@pytest.mark.asyncio
 async def test_start_surfaces_the_authorizer_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     _svc(monkeypatch, _FakeSvc())
     monkeypatch.setattr(
@@ -1282,6 +1672,9 @@ async def test_update_forwards_raw_fields_to_the_authorizer(
     assert kwargs["idle_secs"] == "900"
     assert kwargs["active"] is False
     assert kwargs["max_cycles"] is None and kwargs["max_runtime_secs"] is None
+    # The dashboard route is the user's own press: a revival through it is a
+    # resume, so the authorizer is told to run the loop on a fresh budget.
+    assert kwargs["fresh_run"] is True
 
 
 @pytest.mark.asyncio
@@ -1309,6 +1702,32 @@ async def test_delete_503_when_service_absent(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
+async def test_legacy_delete_maps_closed_admission_to_503(
+    monkeypatch: pytest.MonkeyPatch,
+    sel_mock: MagicMock,
+    tmp_path: Any,
+) -> None:
+    svc = AutoNudgeService(base_dir=tmp_path)
+    await svc.shutdown()
+    loop = _loop("lp-1", "chat-5-555")
+    svc._loops[loop.id] = loop
+    _svc(monkeypatch, svc)
+    sel_mock.log_tool_invocation.side_effect = RuntimeError("audit unavailable")
+
+    response = await h.api_autonudge_delete(
+        _mk("DELETE", "/api/autonudge/lp-1", match={"loop_id": loop.id})
+    )
+
+    assert response.status == 503
+    assert _body(response) == {
+        "error": "The gateway is restarting, so this was not applied. Try again once it is back.",
+        "code": "autonudge_delete_denied",
+    }
+    assert svc.get_by_id(loop.id) is loop
+    assert sel_mock.log_tool_invocation.call_args.kwargs["outcome"] == "denied"
+
+
+@pytest.mark.asyncio
 async def test_delete_removes_and_audits_the_owning_slot(
     monkeypatch: pytest.MonkeyPatch, sel_mock: MagicMock
 ) -> None:
@@ -1317,11 +1736,27 @@ async def test_delete_removes_and_audits_the_owning_slot(
     request = _mk("DELETE", "/api/autonudge/lp-1", match={"loop_id": "lp-1"})
     assert _body(await h.api_autonudge_delete(request)) == {"ok": True}
     assert svc.removed == ["lp-1"]
+    assert svc.notes == [("lp-1", "dashboard_delete")]
     kwargs = sel_mock.log_tool_invocation.call_args.kwargs
     assert kwargs["session_key"] == "chat-5-555"
     assert kwargs["tool_name"] == "autonudge_delete"
     assert kwargs["outcome"] == "success"
     assert kwargs["metadata"]["loop_id"] == "lp-1"
+
+
+@pytest.mark.asyncio
+async def test_MUTATION_legacy_delete_success_audit_failure_propagates(
+    monkeypatch: pytest.MonkeyPatch, sel_mock: MagicMock
+) -> None:
+    svc = _svc(monkeypatch, _FakeSvc([_loop("lp-1", "chat-5-555")]))
+    sel_mock.log_tool_invocation.side_effect = RuntimeError("audit unavailable")
+    request = _mk("DELETE", "/api/autonudge/lp-1", match={"loop_id": "lp-1"})
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        await h.api_autonudge_delete(request)
+
+    assert svc.removed == ["lp-1"]
+    assert svc.notes == [("lp-1", "dashboard_delete")]
 
 
 @pytest.mark.asyncio

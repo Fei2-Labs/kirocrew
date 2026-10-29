@@ -16,7 +16,7 @@ import pytest
 from kiro_crew.acp import backends
 from kiro_crew.acp.types import (
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_KAS,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KIRO,
 )
 from kiro_crew.acp_backends import selectable_backends
@@ -189,7 +189,24 @@ class TestPoolBackendReader:
         assert _get_acp_backend({}) == ""
 
     def test_selectable_value_is_honoured(self) -> None:
-        for backend in selectable_backends():
+        """Selectable AND pool-spawnable backends pass through as themselves.
+
+        The pool builds zero-tool ``AcpClient`` workers, so selection alone is
+        not the gate: the honoured set is the selectable backends whose
+        capabilities also allow an ``AcpClient`` spawn and a total tool ban
+        (kiro-cli, and the spec adapters with both answers). A selectable
+        backend lacking either — KAS, which runs on ``AcpRuntime`` — correctly
+        degrades here rather than being handed to a client that cannot start it.
+        """
+        from kiro_crew.agent_sdk.capabilities import capabilities_for
+
+        honoured = {
+            b
+            for b in selectable_backends()
+            if capabilities_for(b).acp_client_spawnable and capabilities_for(b).honors_zero_tool_ban
+        }
+        assert honoured, "no selectable backend is pool-safe — the gate degraded everything"
+        for backend in honoured:
             assert _get_acp_backend({"agent": {"acp_backend": backend}}) == backend
 
     def test_known_but_unselectable_degrades(self, monkeypatch) -> None:
@@ -203,31 +220,51 @@ class TestPoolBackendReader:
         working for the registry adapters that will be described but not
         selectable, so the set is pinned here instead of observed.
         """
-        import kiro_crew.acp.backends as acp_backends
+        import kiro_crew.agent_sdk.backends as sdk_backends
 
-        monkeypatch.setattr(acp_backends, "selectable_ids", lambda: frozenset({ACP_BACKEND_KIRO}))
+        monkeypatch.setattr(
+            sdk_backends, "selectable_backends", lambda: frozenset({ACP_BACKEND_KIRO})
+        )
         for backend in ("kas", "codex", "claude"):
             assert _get_acp_backend({"agent": {"acp_backend": backend}}) == "", backend
 
     def test_dynamic_registry_backend_is_honoured(self, monkeypatch) -> None:
-        import kiro_crew.acp.backends as acp_backends
+        """A registry adapter the build registered is honoured — when pool-safe.
+
+        Registration alone is not the answer the pool needs: the adapter still
+        has to pass the same capability questions any backend answers, so the
+        capability lookup is patched to describe it as an ``AcpClient``-spawnable,
+        zero-tool-honouring backend — the shape a reviewed registry adapter
+        would carry.
+        """
+        import kiro_crew.agent_sdk.backends as sdk_backends
+        from kiro_crew.knowledge import llm_pool
 
         monkeypatch.setattr(
-            acp_backends,
-            "selectable_ids",
+            sdk_backends,
+            "selectable_backends",
             lambda: frozenset({ACP_BACKEND_KIRO, "registry.example"}),
         )
+        real_capabilities = llm_pool.capabilities_for
         monkeypatch.setattr(
-            acp_backends,
-            "canonical_backend_id",
-            lambda value: "registry.example" if value == "registry-alias" else value,
+            llm_pool,
+            "capabilities_for",
+            lambda b: (
+                real_capabilities(ACP_BACKEND_GOOSE)
+                if b == "registry.example"
+                else real_capabilities(b)
+            ),
         )
 
-        assert _get_acp_backend({"agent": {"acp_backend": "registry-alias"}}) == "registry.example"
+        assert _get_acp_backend({"agent": {"acp_backend": "registry.example"}}) == (
+            "registry.example"
+        )
 
     def test_a_selectable_backend_is_honoured(self) -> None:
         """The mirror case, so the test above cannot pass by degrading everything."""
-        assert _get_acp_backend({"agent": {"acp_backend": ACP_BACKEND_KAS}}) == ACP_BACKEND_KAS
+        assert _get_acp_backend({"agent": {"acp_backend": ACP_BACKEND_GOOSE}}) == (
+            ACP_BACKEND_GOOSE
+        )
 
     def test_unknown_degrades(self) -> None:
         assert _get_acp_backend({"agent": {"acp_backend": "nonsense"}}) == ""

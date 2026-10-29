@@ -50,7 +50,7 @@ def _req(body: dict | None = None, match_info: dict | None = None) -> web.Reques
         "POST",
         "/api/workspaces",
         match_info=match_info or {},
-        headers={"Content-Length": str(len(raw))},
+        headers={"Content-Length": str(len(raw)), "Content-Type": "application/json"},
         payload=BodyStreamPayload(raw),
         app=app,
     )

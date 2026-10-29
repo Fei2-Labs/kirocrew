@@ -52,6 +52,28 @@ import { providerTerms } from '../lib/links'
 import { i18nT } from '../../../i18n/t'
 import ErrorNotice from '../../../components/ErrorNotice'
 import { fmtDateTime } from '../../../i18n/format'
+
+/**
+ * Catalog keys for GitHub's `mergeable_state` vocabulary — the merge-READINESS
+ * verdict shown while a PR is open and unmerged. The wire value arrives raw and
+ * lowercased (GitHub's REST `mergeable_state`, or the GraphQL `mergeStateStatus`
+ * lowercased), so it was printed verbatim and CSS-capitalized: untranslated in
+ * every locale and invisible to the i18n added-lines gate. Flat and indexed
+ * inline at the `i18nT()` call so the key gate resolves the whole map, matching
+ * `PullRequestPanel.tsx::LIFECYCLE_LABEL_KEY`. `?? unknown` covers any value the
+ * provider adds later, so an unmapped state still reads as a word, not a blank.
+ */
+const MERGEABLE_STATE_LABEL_KEY: Record<string, string> = {
+  clean: 'apps.issueRadar.components.prDetail.mergeable_state_clean',
+  dirty: 'apps.issueRadar.components.prDetail.mergeable_state_dirty',
+  unstable: 'apps.issueRadar.components.prDetail.mergeable_state_unstable',
+  blocked: 'apps.issueRadar.components.prDetail.mergeable_state_blocked',
+  behind: 'apps.issueRadar.components.prDetail.mergeable_state_behind',
+  has_hooks: 'apps.issueRadar.components.prDetail.mergeable_state_has_hooks',
+  draft: 'apps.issueRadar.components.prDetail.mergeable_state_draft',
+  unknown: 'apps.issueRadar.components.prDetail.mergeable_state_unknown',
+}
+
 /** A relative timestamp that flips to the absolute local date-time on click
  * (and shows it on hover). Renders nothing for a missing/unparseable value. */
 function RelTime({ iso, className = '' }: { iso?: string | null; className?: string }) {
@@ -67,7 +89,7 @@ function RelTime({ iso, className = '' }: { iso?: string | null; className?: str
       title={absolute}
       onClick={(e) => { e.stopPropagation(); setAbs((v) => !v) }}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setAbs((v) => !v) } }}
-      className={`cursor-pointer rounded-sm hover:text-accent transition-colors focus:outline-hidden focus-visible:ring-1 focus-visible:ring-accent/40 ${className}`}
+      className={`cursor-pointer rounded-sm hover:text-accent transition-colors focus-ring-accent ${className}`}
     >
       {abs ? absolute : relativeTimeOrDate(iso)}
     </span>
@@ -99,7 +121,7 @@ function StatePill({ state, draft, merged }: { state: string; draft?: boolean; m
     )
   }
   return (
-    <span className="inline-flex items-center gap-1 text-[12px] font-medium px-2 py-0.5 rounded-full bg-ok-subtle text-ok">
+    <span className="inline-flex items-center gap-1 text-[12px] font-medium px-2 py-0.5 rounded-full bg-ok-subtle text-ok-text">
       <GitPullRequest size={12} /> {i18nT('apps.issueRadar.components.prDetail.open')}
     </span>
   )
@@ -759,7 +781,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
       <div className="flex-1 min-h-0 overflow-hidden">
         <div
           ref={setScroller}
-          className="h-full flex flex-col overflow-y-auto sm:overflow-visible"
+          className="relative h-full flex flex-col overflow-y-auto sm:overflow-visible"
         >
           <DetailHeader
             collapsed={scrolledOut}
@@ -854,7 +876,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
               scrolls invisibly, and the wrapper scroller never engages because the
               children already sum to the container. While narrow this takes its
               natural height and the wrapper is the single scroller. */}
-          <main className="min-w-0 sm:flex-1 sm:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
+          <main className="relative min-w-0 sm:flex-1 sm:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             <AiSummaryCard
               summary={aiQuery.data?.summary ?? ''}
               fromCache={aiQuery.data?.from_cache ?? false}
@@ -969,7 +991,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
           </main>
 
           {/* Sidebar — the most useful PR metadata. */}
-          <aside className="w-full sm:w-[236px] shrink-0 sm:overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
+          <aside className="w-full sm:w-[236px] relative shrink-0 sm:overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
             {/* Auto review first — failing/running checks are the most
                 actionable thing on a PR. */}
             <AutoReviewChecks
@@ -1071,7 +1093,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
                 {mergeableState && !merged && state !== 'closed' && (
                   <div className="flex justify-between gap-2">
                     <dt className="text-muted">{i18nT('apps.issueRadar.components.prDetail.mergeable')}</dt>
-                    <dd className="text-text capitalize">{mergeableState.replace(/_/g, ' ')}</dd>
+                    <dd className="text-text">{i18nT(MERGEABLE_STATE_LABEL_KEY[mergeableState.toLowerCase()] ?? 'apps.issueRadar.components.prDetail.mergeable_state_unknown')}</dd>
                   </div>
                 )}
               </dl>

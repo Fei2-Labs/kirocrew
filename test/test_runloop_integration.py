@@ -62,6 +62,7 @@ from kiro_crew.subagent_manager.monitoring import OrphanStallMonitor
 from kiro_crew.taskq import RUNNING, STARTING, WAITING_DEPENDENCY, WAITING_INPUT
 from kiro_crew.taskq import dependency as dep_mod
 from kiro_crew.taskq.dependency import DependencyCoordinator
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -187,7 +188,7 @@ async def _spawn_and_wait(mgr: SubagentManager, task: str = "do work") -> Subage
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn(task)
         assert info is not None
-        await asyncio.wait_for(mgr._tasks[info.id], timeout=20.0)
+        await await_until(mgr._tasks[info.id], what=f"subagent {info.id} finishes")
     return info
 
 
@@ -347,21 +348,24 @@ async def _await_parked(
     failure then reads as whichever later assertion happens to touch it first.
     """
     ids = tuple(agent_ids)
-    deadline = time.monotonic() + _PARKED_CEILING_SECS
-    while time.monotonic() < deadline:
+
+    def parked() -> bool:
         waiters, running, _ = _park_snapshot(mgr, coordinator, scope, ids, rows=False)
         if len(waiters) == len(ids) and running == 0:
             _, _, states = _park_snapshot(mgr, coordinator, scope, ids)
-            if all(state == WAITING_DEPENDENCY for state in states.values()):
-                return
-        await asyncio.sleep(0.01)
-    waiters, running, states = _park_snapshot(mgr, coordinator, scope, ids)
-    raise AssertionError(
-        f"no park of {len(ids)} run(s) on {scope!r} within {_PARKED_CEILING_SECS}s: "
-        f"waiters={waiters} (want {list(ids)}), running_count={running} (want 0), "
-        f"rows={states} (want every state {WAITING_DEPENDENCY!r}), "
-        f"scopes={coordinator.scopes()}"
-    )
+            return all(state == WAITING_DEPENDENCY for state in states.values())
+        return False
+
+    def last_reading() -> str:
+        waiters, running, states = _park_snapshot(mgr, coordinator, scope, ids)
+        return (
+            f"no park of {len(ids)} run(s) on {scope!r}: "
+            f"waiters={waiters} (want {list(ids)}), running_count={running} (want 0), "
+            f"rows={states} (want every state {WAITING_DEPENDENCY!r}), "
+            f"scopes={coordinator.scopes()}"
+        )
+
+    await async_wait_until(parked, timeout=_PARKED_CEILING_SECS, describe=last_reading)
 
 
 def _transitions(mgr: SubagentManager, agent_id: str) -> list[tuple[str, str, str]]:
@@ -637,7 +641,9 @@ async def test_throttle_parks_two_runs_on_one_scope_and_wakes_by_capacity(monkey
         # backoff would have produced them.
         assert coordinator.recovered("provider:acp")
         mgr._taskq_pump()
-        await asyncio.wait_for(asyncio.gather(mgr._tasks[a.id], mgr._tasks[b.id]), timeout=20.0)
+        await await_until(
+            asyncio.gather(mgr._tasks[a.id], mgr._tasks[b.id]), what="both runs finish"
+        )
 
     assert a.outcome == "completed" and b.outcome == "completed"
     assert a.result == "A ok" and b.result == "B ok"
@@ -707,6 +713,50 @@ async def test_a_throttle_before_the_first_frame_waits_under_the_run_lease(monke
 
 
 @pytest.mark.asyncio
+async def test_a_throttle_before_the_first_frame_ends_startup_at_the_park():
+    """The same 429 on the first prompt, for a start with no runtime PID: the
+    provider has answered the prompt, so the run leaves startup at the park --
+    the step that takes its row out of ``starting`` -- and the wake it owes a
+    held spawn goes out then. Parked, it is neither in the in-startup bound nor
+    a start the watchdog may reap, however far past the startup deadline the
+    wait runs; the wait is bounded by its scope and ends in the scope's error."""
+    calls: list[str] = []
+
+    def factory(msg: str, *a, **kw):
+        calls.append(msg)
+
+        async def _gen():
+            if len(calls) == 1:
+                raise AcpFakeThrottle("ThrottlingException: Rate exceeded")
+            yield _text("ok")
+            yield _complete(STOP_REASON_END_TURN)
+
+        return _gen()
+
+    mgr = await _ready_manager(_mock_sessions(factory))
+    coordinator = _fast_coordinator(mgr, backoff=backoff(_HELD_PARK_SECS, _HELD_PARK_SECS))
+    progress = MagicMock(wraps=mgr._note_startup_progress)
+    mgr._note_startup_progress = progress
+    with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
+        info = mgr.spawn("throttled start")
+        assert info is not None
+        await _await_parked(mgr, coordinator, "provider:acp", info.id)
+        assert info._pid is None and info.turns == 0
+        assert info._first_stream_started is not None
+        assert SubagentManager._in_startup(info) is False
+        assert mgr._startup_population() == 0
+        assert info._exec_started is not None
+        assert mgr._is_startup_stalled(info, info._exec_started + 3_600.0) is False
+        progress.assert_called_once_with(info)
+        assert coordinator.recovered("provider:acp")
+        mgr._taskq_pump()
+        await asyncio.wait_for(mgr._tasks[info.id], timeout=_LOST_RUN_CEILING_SECS)
+
+    assert info.outcome == "completed" and info.result == "ok"
+    progress.assert_called_once_with(info)
+
+
+@pytest.mark.asyncio
 async def test_the_throttle_park_and_wake_cycle_never_touches_the_store_on_the_loop(monkeypatch):
     """The whole wait/wake boundary under the STRICT on-loop guard.
 
@@ -745,7 +795,7 @@ async def test_the_throttle_park_and_wake_cycle_never_touches_the_store_on_the_l
         with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
             info = await mgr.spawn_async("throttled")
             assert info is not None
-            await asyncio.wait_for(mgr._tasks[info.id], timeout=20.0)
+            await await_until(mgr._tasks[info.id], what="the throttled run finishes")
         await _drain_posted(mgr)
     finally:
         monkeypatch.delenv(store_mod.STRICT_ON_LOOP_ENV)
@@ -1114,20 +1164,16 @@ _WINDOWS_CLOCK_RESOLUTION_SECS = 0.015625
 #: The resolution the pin below installs: four Windows ticks, deliberately
 #: COARSER than the pump's own 0.05s arm floor. The hazard needs a loop wake
 #: inside ``(when - resolution, when)``, so widening the resolution past the arm
-#: delay makes that window the WHOLE wait rather than its last tick, and every
-#: wake after the arm pops the handle early. At Windows' own 15.625 ms the window
-#: is only the last tick of those 50 ms and the pop is a lottery on when the loop
-#: happens to wake: 1 of 15 runs starved on one busy core never saw it, and a pin
-#: that misses its own precondition under load is a flake, not a defect.
+#: delay makes that window the WHOLE wait rather than its last tick. Width alone
+#: does not place a wake inside it, though: the pin also stands the loop's clock
+#: still, so every wake reads ``now`` as the arm instant however late the host
+#: delivers it, and every handle armed inside this resolution pops early.
 _EARLY_FIRE_RESOLUTION_SECS = 4 * _WINDOWS_CLOCK_RESOLUTION_SECS
 
-#: Poll for the pin below, and shorter than that window is what makes it the
-#: mechanism rather than a guess at latency -- which is why the file's own "a
-#: SIGNAL, never a sleep" rule stops here. An idle loop is exactly what must not
-#: happen: the pop is early only while the loop is AWAKE before the handle's
-#: ``when``, so a poll longer than the wait leaves the loop asleep until the timer
-#: is overdue and the pin goes green having exercised nothing. The precondition
-#: assertion below is what keeps that coupling honest.
+#: Poll for the pin below. With the loop's clock stood still, a sleep fires only
+#: because asyncio pops it within the resolution of that frozen ``now``, so the
+#: poll has to be shorter than ``_EARLY_FIRE_RESOLUTION_SECS``: a longer one
+#: would never pop and the wait loop below would never get to read its deadline.
 _EARLY_FIRE_POLL_SECS = 0.01
 
 
@@ -1145,14 +1191,18 @@ async def test_the_ramp_is_woken_when_the_pump_timer_fires_inside_the_clock_reso
     is stranded on a schedule that is due and never ticked.
 
     The resolution alone does not produce that early fire: the loop also has to
-    be awake before the handle's ``when``, which is what
-    ``_EARLY_FIRE_RESOLUTION_SECS`` and ``_EARLY_FIRE_POLL_SECS`` buy between
-    them. So the pin asserts its own precondition -- that some pass really did
-    read a SPENT handle (``_scheduled`` false) as future-dated -- because a pin
-    whose defect is reachable only at one poll length goes GREEN the moment
-    someone lengthens the poll, and a green that means nothing is worse than no
-    pin at all.
+    be awake before the handle's ``when``. A real clock leaves that to the host,
+    and a starved runner whose first wake after the arm lands past ``when`` pops
+    the handle on time, so the pin stands ``loop.time`` still for the wait: the
+    pop rule is still asyncio's own ``_run_once``, and the only thing the host no
+    longer decides is whether a wake lands before ``when``. The pin still asserts
+    that precondition -- that some pass really did read a SPENT handle
+    (``_scheduled`` false) as future-dated -- because a green that exercised
+    nothing is worse than no pin at all.
     """
+    assert (
+        _EARLY_FIRE_POLL_SECS < _EARLY_FIRE_RESOLUTION_SECS
+    ), "a poll the stood-still clock never pops would hang the wait below"
     mgr = await _ready_manager(_mock_sessions(lambda *a, **k: None))
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "_clock_resolution", _EARLY_FIRE_RESOLUTION_SECS)
@@ -1178,9 +1228,13 @@ async def test_the_ramp_is_woken_when_the_pump_timer_fires_inside_the_clock_reso
         for handle in armed:
             if handle._scheduled or handle.cancelled():
                 continue
-            margin = handle.when() - loop.time()
-            if margin > 0 and arm_delay is not None and margin <= arm_delay:
-                early.append(margin)
+            now_loop = loop.time()
+            when = handle.when()
+            # Production's own comparison, operand for operand: with the clock
+            # stood still, ``when - now`` can round past the very delay the
+            # handle was armed with, while ``when <= now + delay`` does not.
+            if arm_delay is not None and now_loop < when <= now_loop + arm_delay:
+                early.append(when - now_loop)
         real_arm_tick(monitor, woken_ids, deadline)
         pump_timer = mgr._taskq_pump_timer
         if pump_timer is not None and not any(handle is pump_timer for handle in armed):
@@ -1197,20 +1251,35 @@ async def test_the_ramp_is_woken_when_the_pump_timer_fires_inside_the_clock_reso
     )
     probe_generation = _live_row(mgr, "probe-task")
     ramp_generation = _live_row(mgr, "ramp-task")
-    coordinator.report("probe-task", signal, generation=probe_generation)
-    coordinator.report("ramp-task", signal, generation=ramp_generation)
-    mgr._taskq_pump()
-    # The loop leaves on the wakes, so the ceiling is a LOST-RUN guard rather than
-    # a statement about how long two wakes may take: a host slow enough to need
-    # more of it would otherwise red on the assertions below instead.
-    deadline = time.monotonic() + _LOST_RUN_CEILING_SECS
-    while len(woken) < 2 and time.monotonic() < deadline:
-        await asyncio.sleep(_EARLY_FIRE_POLL_SECS)
+    with monkeypatch.context() as clock:
+        # The loop's clock reads the arm instant for the whole wait, so each pump
+        # one-shot (armed 0.05s out, inside the installed resolution) is popped by
+        # the first wake after it is armed while its ``when`` is still ahead. The
+        # coordinator's own schedule runs on ``time.time``, which keeps moving, so
+        # the scope still comes due. The context restores the clock before any
+        # teardown awaits a real timeout.
+        stood_still = loop.time()
+        clock.setattr(loop, "time", lambda: stood_still)
+        coordinator.report("probe-task", signal, generation=probe_generation)
+        coordinator.report("ramp-task", signal, generation=ramp_generation)
+        mgr._taskq_pump()
+        # The loop leaves on the wakes, so the ceiling is a LOST-RUN guard rather
+        # than a statement about how long two wakes may take: a host slow enough
+        # to need more of it would otherwise red on the assertions below instead.
+        await async_wait_until(
+            lambda: len(woken) >= 2,
+            timeout=_LOST_RUN_CEILING_SECS,
+            interval=_EARLY_FIRE_POLL_SECS,
+            describe=lambda: (
+                f"woke {woken}; {len(armed)} armed timer(s); early fire(s) "
+                f"{[round(margin, 4) for margin in early]}s before their own when"
+            ),
+        )
     assert early, (
         "the early fire never happened, so this pin exercised nothing: no pump pass read a "
         f"spent one-shot as future-dated across {len(armed)} armed timer(s), with "
-        f"_clock_resolution={_EARLY_FIRE_RESOLUTION_SECS}s and a {_EARLY_FIRE_POLL_SECS}s poll "
-        f"(a poll shorter than the wait is the precondition); woke {woken}"
+        f"_clock_resolution={_EARLY_FIRE_RESOLUTION_SECS}s, a {_EARLY_FIRE_POLL_SECS}s poll "
+        f"and the loop clock stood still for the wait; woke {woken}"
     )
     # The scope can be gone by here (its last waiter left), and a diagnostic that
     # needs the schedule to exist fails as an AttributeError over the assertion
@@ -1498,19 +1567,70 @@ def test_chat_runner_floors_transient_delay_by_the_shared_scope_schedule(monkeyp
 
 
 def test_pipe_death_and_stop_recovery_budgets_share_the_ladder_constant():
-    import inspect
+    """The pipe-death budget is bounded by the ladder constant, never a literal.
+
+    The counter does not face the constant directly. A death is charged to the
+    slot only when the slot's own runtime died, so the limit is tested against
+    whichever of the two counts is further along, held in a local. The check
+    therefore traces the counter through every local that carries its value and
+    requires each comparison to name the shared constant, which is the claim --
+    one ladder limit for both budgets -- rather than one spelling of it.
+    """
+    import ast
+    from pathlib import Path
 
     from kiro_crew.dashboard import chat_runner
 
-    src = inspect.getsource(chat_runner)
-    for literal in (
-        "_acp_pipe_death_retries < 3",
-        "_acp_pipe_death_retries >= 3",
-        "_acp_pipe_death_retries <= 3",
-        "_acp_pipe_death_retries > 3",
-    ):
-        assert literal not in src, literal
-    assert "_acp_pipe_death_retries < SESSION_RECOVERY_MAX_ATTEMPTS" in src
+    src = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [
+            *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+            Path(chat_runner.__file__),
+        ]
+        if turn_file.name != "__init__.py"
+    )
+    tree = ast.parse(src)
+
+    # Locals carrying the counter's value: the attribute itself, plus the target
+    # of any assignment whose value reads it. An assignment whose value is a
+    # comparison yields a verdict, not a count, so it is not a carrier.
+    carriers = {"_acp_pipe_death_retries"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or isinstance(node.value, ast.Compare):
+            continue
+        if "_acp_pipe_death_retries" not in {
+            a.attr for a in ast.walk(node.value) if isinstance(a, ast.Attribute)
+        }:
+            continue
+        carriers |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+
+    for carrier in sorted(carriers):
+        for op in ("<", ">=", "<=", ">"):
+            assert f"{carrier} {op} 3" not in src, f"{carrier} {op} 3"
+
+    compared = 0
+    ladder = {"SESSION_RECOVERY_MAX_ATTEMPTS", "STOP_RECOVERY_MAX_RETRIES"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        reached = {n.id for n in ast.walk(node.left) if isinstance(n, ast.Name)} | {
+            a.attr for a in ast.walk(node.left) if isinstance(a, ast.Attribute)
+        }
+        if not reached & carriers:
+            continue
+        compared += 1
+        for right in node.comparators:
+            # Either name is the ladder constant -- they are asserted below to be
+            # the same object -- so both satisfy the claim and neither spelling is
+            # required. A number, an arithmetic adjustment or any other name is a
+            # second limit, which is what this forbids.
+            assert (
+                isinstance(right, ast.Name) and right.id in ladder
+            ), f"line {node.lineno}: death budget bounded by {ast.unparse(right)}"
+    # Control: a scan that reaches no comparison would pass vacuously, which is
+    # the failure mode a source-reading test hides best.
+    assert compared >= 4, f"only {compared} death-budget comparisons found -- scan is broken"
+
     assert STOP_RECOVERY_MAX_RETRIES is SESSION_RECOVERY_MAX_ATTEMPTS
     assert SESSION_RECOVERY_MAX_ATTEMPTS == 3
 

@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew import session_compaction as sc
+from kiro_crew.testing.wait import finished
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -126,7 +127,7 @@ def _coordinator() -> tuple[sc.CompactionCoordinator, _Owner]:
         context_pct_is_unknown=lambda _p: False,
         unlink_session_queue=lambda _s: None,
         compact_wait_timeout_secs=lambda: 5.0,
-        compact_result_wait_secs=lambda _e: 1.0,
+        compact_result_wait_secs=lambda _e, _budget: 1.0,
         context_warn_margin_pct=10.0,
         compact_result_wait_margin_secs=1.0,
         compact_failure_cooldown_secs=1.0,
@@ -243,7 +244,9 @@ class TestItCannotCostTheCompaction:
             # The whole compaction has to complete while the scoring is still
             # outstanding. The scoring task is deliberately still UNFINISHED when the
             # compaction returns -- which is the claim: nothing awaits it.
-            outcome = await asyncio.wait_for(coordinator._compact_session("k", 80.0), timeout=5)
+            outcome = await finished(
+                coordinator._compact_session("k", 80.0), "compaction with the scoring still hung"
+            )
             pending = [task for task in owner._background_tasks if not task.done()]
             for task in pending:
                 task.cancel()
@@ -427,7 +430,7 @@ class TestManualCompactIsExcluded:
         pattern = re.compile(r"_compact_session\s*\(")
         allowed = {
             Path("src/kiro_crew/session_compaction.py"),
-            Path("src/kiro_crew/session.py"),
+            Path("src/kiro_crew/session_parts/turn_context.py"),
         }
         offenders = []
         for path in (REPO / "src").rglob("*.py"):
@@ -439,7 +442,12 @@ class TestManualCompactIsExcluded:
         assert offenders == []
 
     def test_the_manual_dashboard_path_runs_the_command_through_the_provider(self):
-        runner = (REPO / "src/kiro_crew/dashboard/chat_runner.py").read_text(encoding="utf-8")
+        runner_path = REPO / "src/kiro_crew/dashboard/chat_runner.py"
+        runner = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(runner_path.with_name("chat_turn").glob("*.py")), runner_path]
+            if turn_file.name != "__init__.py"
+        )
         assert 'first_word == "/compact"' in runner
         assert "_compact_session" not in runner
 

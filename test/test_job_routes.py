@@ -21,7 +21,6 @@ import asyncio
 import inspect
 import json
 import threading
-import time
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +33,7 @@ import kiro_crew.apps.job_sdk as js
 import kiro_crew.dashboard.handlers._shared as shared
 import kiro_crew.dashboard.handlers.source_providers as sp
 from kiro_crew.apps.job_sdk import JobError, JobSDK, forget_sdk, get_sdk, register_sdk
+from kiro_crew.testing.wait import async_wait_until
 
 APP = "jobs-cov-app"
 
@@ -126,36 +126,39 @@ def _base(app: str = APP) -> str:
 async def _wait_terminal(sdk: JobSDK, run_id: str, deadline: float = _DEADLINE) -> js.JobRun:
     """Poll until the run reaches a terminal state or the deadline passes.
 
-    ``async``, with every ``sdk.get`` offloaded via ``asyncio.to_thread`` — the
-    same shape ``job_routes.py`` uses for every store read.  Every caller is an
-    async test, so a plain ``sdk.get`` here would run ON the event loop, where
-    ``read_bytes_with_retry`` deliberately re-raises ``PermissionError`` instead
-    of sleeping the loop for its retry budget.  When the job worker's concurrent
-    ``os.replace`` is in flight, that surfaces the Windows sharing violation as
-    a flaky test failure.  Off the loop the retry applies, exactly as it
-    does for the production routes.
+    ``async``, with every ``sdk.get`` offloaded to a worker thread
+    (``off_loop=True``) — the same shape ``job_routes.py`` uses for every store
+    read.  Every caller is an async test, so a plain ``sdk.get`` here would run
+    ON the event loop, where ``read_bytes_with_retry`` deliberately re-raises
+    ``PermissionError`` instead of sleeping the loop for its retry budget.  When
+    the job worker's concurrent ``os.replace`` is in flight, that surfaces the
+    Windows sharing violation as a flaky test failure.  Off the loop the retry
+    applies, exactly as it does for the production routes.
     """
-    end = time.monotonic() + deadline
-    while time.monotonic() < end:
-        run = await asyncio.to_thread(sdk.get, run_id)
-        if run is not None and run.is_terminal:
-            return run
-        await asyncio.sleep(0.02)
-    run = await asyncio.to_thread(sdk.get, run_id)
-    raise AssertionError(f"run {run_id} did not reach a terminal state: {run and run.status}")
+
+    def _terminal() -> js.JobRun | None:
+        run = sdk.get(run_id)
+        return run if run is not None and run.is_terminal else None
+
+    def _state() -> str:
+        run = sdk.get(run_id)
+        return f"run {run_id} did not reach a terminal state: {run and run.status}"
+
+    return await async_wait_until(_terminal, timeout=deadline, off_loop=True, describe=_state)
 
 
 async def _wait_status(
     sdk: JobSDK, run_id: str, status: str, deadline: float = _DEADLINE
 ) -> js.JobRun:
-    end = time.monotonic() + deadline
-    while time.monotonic() < end:
-        run = await asyncio.to_thread(sdk.get, run_id)
-        if run is not None and run.status == status:
-            return run
-        await asyncio.sleep(0.02)
-    run = await asyncio.to_thread(sdk.get, run_id)
-    raise AssertionError(f"run {run_id} never reached {status!r}: {run and run.status}")
+    def _reached() -> js.JobRun | None:
+        run = sdk.get(run_id)
+        return run if run is not None and run.status == status else None
+
+    def _state() -> str:
+        run = sdk.get(run_id)
+        return f"run {run_id} never reached {status!r}: {run and run.status}"
+
+    return await async_wait_until(_reached, timeout=deadline, off_loop=True, describe=_state)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +333,46 @@ async def test_work_observed_reaches_the_client(
         assert resp.status == 200
         run = (await resp.json())["run"]
     assert run["work_observed"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_callers_own_strings_are_withheld_from_the_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sdk: JobSDK
+) -> None:
+    """``dedupe_key`` and ``params`` are the app's business, not the run's state.
+
+    An app names a run's work for its own runner, and the browser is not the
+    party that chose those strings. Serving them would publish an account id, a
+    target or a scope the client never supplied and cannot act on, so the view
+    withholds them the way it withholds the host facts -- and it is served over
+    an endpoint a client reaches, which is why a test pins it rather than a
+    docstring claiming it.
+    """
+    from kiro_crew.apps.job_sdk import DONE, JobRun
+
+    _setup_guards(tmp_path, monkeypatch)
+    run_id = "8e" * 16
+    run = JobRun(
+        run_id=run_id,
+        app=sdk.app_name,
+        kind="named",
+        status=DONE,
+        dedupe_key="123456789012",
+    )
+    run.params = {"account": "123456789012", "mode": "full"}
+    sdk.store.write(run)
+
+    async with TestClient(TestServer(_make_app())) as client:
+        resp = await client.get(f"{_base()}/{run_id}")
+        assert resp.status == 200
+        served = (await resp.json())["run"]
+    assert "params" not in served
+    assert "dedupe_key" not in served
+    assert "origin" not in served
+    assert "pid" not in served
+    # Nothing the app chose is reachable by value either, under any key.
+    assert "123456789012" not in json.dumps(served)
+    assert served["status"] == DONE
 
 
 @pytest.mark.asyncio

@@ -129,10 +129,15 @@ def test_install_lays_the_bundle_out_where_kirocrew_reads(tmp_path):
 
     payload = bundle_mod.install_bundle(settings, agents_dir=agents)
 
-    # agent.json -> <kiro agents>/<crew>.json, byte-identical to the source.
-    agent_dst = agents / "frontdesk.json"
+    # agent.json -> <kiro agents>/crew-<crew>.json, inside the crew namespace that
+    # keeps the install off the specs Kiro Crew derives. The declared name moves with
+    # the filename and is the ONLY field that differs from the source;
+    # ``test_supervisor_bundle_crew_namespace.py`` owns that pin.
+    agent_dst = agents / "crew-frontdesk.json"
     assert agent_dst.is_file()
-    assert agent_dst.read_bytes() == (settings.bundle_dir / "agent.json").read_bytes()
+    shipped = json.loads((settings.bundle_dir / "agent.json").read_text(encoding="utf-8"))
+    installed = json.loads(agent_dst.read_text(encoding="utf-8"))
+    assert installed == {**shipped, "name": "crew-frontdesk"}
     # mcp.json -> <data home>/mcp.json.
     assert (settings.data_home / "mcp.json").is_file()
     # skills/ -> <data home>/skills/ (tree preserved).
@@ -282,7 +287,7 @@ def test_a_symlink_planted_at_the_agent_dst_is_refused(tmp_path):
     victim = _outside_target(tmp_path)
     agents = tmp_path / "kiro" / "agents"
     agents.mkdir(parents=True, exist_ok=True)
-    (agents / "frontdesk.json").symlink_to(victim)
+    (agents / "crew-frontdesk.json").symlink_to(victim)
 
     with pytest.raises(ConfigError, match="not a symlink"):
         bundle_mod.install_bundle(settings, agents_dir=agents)

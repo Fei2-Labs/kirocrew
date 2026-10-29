@@ -599,7 +599,9 @@ class TestAnInheritingRuntimeJoinsTheMarkerOnceLive:
         monkeypatch.setattr(
             skill_projection,
             "prepare_native_skill_projection",
-            lambda work_dir: skill_projection.NativeSkillProjection({"kirocrew": "kirocrew-view"}),
+            lambda work_dir, **_kwargs: skill_projection.NativeSkillProjection(
+                {"kirocrew": "kirocrew-view"}
+            ),
         )
         calls: list[tuple[str, Path, int]] = []
         fake_scratch = SimpleNamespace(
@@ -613,7 +615,7 @@ class TestAnInheritingRuntimeJoinsTheMarkerOnceLive:
         monkeypatch.setattr(runtime_mod, "agent_scratch", fake_scratch)
         monkeypatch.setattr(runtime_mod, "register_protected_pid", lambda pid: None)
         monkeypatch.setattr(runtime_mod, "_track_pid", lambda pid: None)
-        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid: None)
+        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid, token=None: None)
 
         async def _no_reader(_self) -> None:
             return None
@@ -962,7 +964,7 @@ class TestBgRuntimeSuccessorInheritsTheTree:
             m.context_usage_unknown = lambda: False
             m.context_window_tokens = lambda: 0
             m.has_active_turn = lambda: False
-            m.runtime_info = lambda: (None, None)
+            m.runtime_abort_target = lambda: None
             m.stream_command = MagicMock(side_effect=_empty)
             return m
 
@@ -1238,16 +1240,16 @@ class TestEveryProcessSpawnSeamIsAccountedFor:
         the parent-side collectors that feed the dedicated and pooled arms
         name the key too."""
         from kiro_crew import session_allocation
-        from kiro_crew.config import loader
+        from kiro_crew.config import loader_config
         from kiro_crew.providers import acp as acp_provider
-        from kiro_crew.subagent_manager import run as sub_run
+        from kiro_crew.subagent_manager import run_turn as sub_run
 
         assert '"shared_scratch": shared_scratch' in inspect.getsource(acp_provider.AcpProvider)
         assert 'kwargs["shared_scratch"]' in inspect.getsource(
             session_allocation._collect_parent_runtime_kwargs
         )
         assert 'extra_kwargs["shared_scratch"]' in inspect.getsource(sub_run)
-        assert "shared_scratch=shared_scratch" in inspect.getsource(loader)
+        assert "shared_scratch=shared_scratch" in inspect.getsource(loader_config)
 
     def test_the_standalone_list_names_only_files_that_still_construct(self) -> None:
         rels = {rel for rel, _ in self._constructions()}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from kiro_crew.execution_context import ExecutionContext
 
@@ -18,6 +19,14 @@ TEST_TIMEOUT = 5400  # 90 min for test command
 PROGRESS_FILE = "TASK_PROGRESS.md"
 STALL_TIMEOUT = 3600  # 60 min with no task progress → notify
 STALL_CANCEL_TIMEOUT = 7200  # 2 hours → watchdog resets stuck session
+#: Task.resume_hint's text: a step whose prompt may already have run resumes
+#: from current state instead of restating its work.
+RESUME_HINT = (
+    "The previous attempt's instruction may already have started executing "
+    "before the process died. Do NOT restart from scratch: first inspect the "
+    "current repository and session state to see what already happened, then "
+    "complete only the part of this task that is not yet done."
+)
 DEFAULT_TOKEN_BUDGET = 0  # 0 = unlimited
 
 
@@ -33,6 +42,15 @@ class TaskStatus(enum.Enum):
     CANCELLED = "cancelled"
 
 
+class VerificationStatus(enum.StrEnum):
+    """A step's test verdict, apart from execution. Only PASSED is verified."""
+
+    PASSED = "passed"  # the configured test command ran and exited 0
+    FAILED = "failed"
+    SKIPPED = "skipped"  # tests turned off, or the command could not start
+    NOT_CONFIGURED = "not_configured"  # taskrunner.test_command is empty
+
+
 @dataclass
 class Task:
     """A single task decomposed from the spec."""
@@ -44,6 +62,15 @@ class Task:
     attempts: int = 0
     error: str = ""
     result: str = ""
+    verification: str = ""  # a VerificationStatus value; "" until a verdict exists
+    # A "resume, do not restart" instruction rendered on every attempt
+    # regardless of attempt count. Set when a process death may have left the
+    # step's prompt run (an ambiguous-delivery death, or one after output or a
+    # tool call) and when a mid-stream compaction after output may restate the
+    # step on a fresh session. Cleared ONLY when an attempt completes normally: it survives
+    # give-ups, restarts and a replan, because a step whose work may have run
+    # must never be replayed verbatim, and keeping the hint costs one inspection.
+    resume_hint: str = ""
     requires_approval: bool = False
     force_approval: bool = False  # blocks even in YOLO mode
     depends_on: list[int] = field(default_factory=list)
@@ -53,6 +80,15 @@ class Task:
     created_at: float = 0.0
     started_at: float = 0.0
     finished_at: float = 0.0
+
+    if not TYPE_CHECKING:
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            # The one rule for every reset path: a step set back to pending, or
+            # started for an attempt, has no verdict until its tests finish.
+            super().__setattr__(name, value)
+            if name == "status" and value in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS):
+                super().__setattr__("verification", "")
 
 
 @dataclass

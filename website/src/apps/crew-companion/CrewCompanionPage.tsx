@@ -115,6 +115,13 @@ export default function CrewCompanionPage() {
       .catch((e: unknown) => setNotice(i18nT('apps.crewCompanion.reminders.couldnt_skip', { error: errText(e) })))
   }, [loadReminders, clearNotice])
 
+  /** Rejects on a failed write, so the row keeps the user's draft open. */
+  const editReminder = useCallback(async (id: string, text: string) => {
+    await apiPost(`${writeBase()}/update`, { id, text })
+    clearNotice()
+    await loadReminders()
+  }, [loadReminders, clearNotice])
+
   const removeReminder = useCallback((id: string) => {
     // Optimistic removal — the row should go now, not on the next poll.
     setRem((r) => (r ? { ...r, reminders: r.reminders.filter((x) => x.id !== id) } : r))
@@ -280,6 +287,7 @@ export default function CrewCompanionPage() {
             onAdd={addReminder}
             onSkip={skipReminder}
             onRemove={removeReminder}
+            onEdit={editReminder}
           />
 
           <MemoriesSection mem={mem} offline={memOffline} />

@@ -18,6 +18,8 @@
 // automatic reload per window per interval, so a misbehaving server can never
 // put the page into a reload loop.
 
+import { reloadKeepingSafe } from './safeReload'
+
 /** Minimum spacing between automatic heal reloads for one tab. */
 export const HEAL_RELOAD_MIN_INTERVAL_MS = 10 * 60_000
 /** Boot delay before probing: keep the check off the critical startup path. */
@@ -27,8 +29,9 @@ const STAMP_KEY = 'kc-stale-shell-heal-at'
 
 /** The hashed entry-script URL in an index.html document (absolute). */
 export function extractEntryScript(html: string, origin: string): string | null {
-  const m = html.match(/<script[^>]+type="module"[^>]+src="(\/assets\/[^"]+\.js)"/)
-    ?? html.match(/src="(\/assets\/index-[^"]+\.js)"/)
+  // `(?:\/[\w.~-]+)*` admits a build base (`/proxy/kc/assets/...`).
+  const m = html.match(/<script[^>]+type="module"[^>]+src="((?:\/[\w.~-]+)*\/assets\/[^"]+\.js)"/)
+    ?? html.match(/src="((?:\/[\w.~-]+)*\/assets\/index-[^"]+\.js)"/)
   if (!m) return null
   try {
     return new URL(m[1], origin).href
@@ -91,7 +94,9 @@ export function installStaleShellHeal(): void {
           await Promise.all(keys.map((k) => window.caches.delete(k)))
         } catch { /* CacheStorage unavailable */ }
       },
-      reload: () => window.location.reload(),
+      // A crash-recovery (`?safe=1`) load that heals here must stay safe, or
+      // the healed load reopens the chat that crashed the renderer (#12907).
+      reload: () => reloadKeepingSafe(),
     })
   }, HEAL_PROBE_DELAY_MS)
 }

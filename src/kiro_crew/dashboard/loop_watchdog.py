@@ -3,9 +3,9 @@
 KiroCrew's gateway runs the dashboard HTTP server, every agent turn, and all
 background tasks on a *single* asyncio event loop on *one* thread.  If a
 coroutine performs a blocking syscall on that thread — e.g. an un-timed-out
-socket ``close()`` while tearing down a half-dead ACP/model stream, or a burst
-of ``os.waitpid()`` reaping many kiro-cli children at once — the whole loop
-wedges:
+socket ``close()`` while tearing down a half-dead ACP/model stream, a burst of
+``os.waitpid()`` reaping many kiro-cli children at once, or a ``stat`` walk of
+a directory holding thousands of entries — the whole loop wedges:
 
 * the HTTP server stops answering (``/api/status`` is itself a coroutine on the
   wedged loop, so it cannot even report "I'm sick" — it just hangs);
@@ -14,66 +14,156 @@ wedges:
 * that silence is the only signal, and it carries no information about *where*
   the loop is stuck.
 
-Two independent mechanisms turn that silence into an actionable artifact, both
-fed by the async heartbeat calling :meth:`LoopStallWatchdog.beat` every tick:
+The async heartbeat calls :meth:`LoopStallWatchdog.beat` every tick, and two
+things turn the silence that follows a wedge into an actionable artifact:
 
-1. **Authoritative dump-then-exit (the primary, portable path).**  Each beat
-   re-arms :func:`faulthandler.dump_traceback_later` with ``exit=True``.  That
-   timer lives on faulthandler's own C thread and reads thread states in C, so
-   it fires even when the loop thread is wedged in a syscall *and* the
-   GIL-dependent daemon check below would be starved; when it fires it dumps
-   *all* thread stacks and then ``_exit()``s the process in one atomic step.
-   The mechanism is fully cross-platform and needs no root — unlike an
-   out-of-process ``py-spy`` capture, which macOS blocks without elevated
-   ``task_for_pid`` privileges. Desktop launches use a 25s exit budget near
-   Electron's independent liveness window. Managed services have no Electron
-   probe, use a wider budget, and receive the soft diagnostic dump first.
+1. **Authoritative dump-then-exit: the kernel's per-process alarm.**  Each beat
+   re-arms ``setitimer(ITIMER_REAL)`` for ``exit_after`` seconds
+   (:func:`kiro_crew.platform_compat.arm_process_alarm`), and
+   ``faulthandler.register(SIGALRM, chain=True)`` on the dedicated crash-dump
+   file makes the alarm dump *all* thread stacks from inside the signal
+   handler — in C, with no GIL and no Python — and then hand ``SIGALRM`` to
+   its default disposition, which ends the process.  The alarm needs no
+   thread and no root, fires whatever the loop thread is doing (a blocking
+   syscall or a long C call holding the GIL), and **pauses while the host
+   sleeps**: Linux runs ``ITIMER_REAL`` on ``CLOCK_MONOTONIC`` (the kernel
+   initialises the process's ``real_timer`` on that clock), and macOS
+   schedules it on the absolute mach timebase, which does not advance during
+   sleep.  So a laptop resume does not fire a deadline armed before the
+   sleep; the heartbeat, on the same monotonic clock, missed no beat either.
+   Desktop launches use a 25s exit budget near Electron's independent
+   liveness window; managed services have no Electron probe, use a wider
+   budget, and receive the soft dump first.
 
-   **Journal visibility:** hard-exit dumps land in the dedicated file only (not
-   stderr/journal) because ``faulthandler.dump_traceback_later`` targets a single
-   fd.  On the next gateway startup, ``server.py`` detects and replays the dump
-   content to the logger at WARNING level (capped at 120 lines / 8 KB), so
-   journal-only operators (containers, ``journalctl``) see the stacks one restart
-   later — exactly when they are investigating why the gateway died.
+   faulthandler's own ``dump_traceback_later`` timer cannot be that decider
+   on every platform: it waits on an interpreter lock whose deadline clock is
+   fixed when CPython is built — ``sem_clockwait(CLOCK_MONOTONIC)`` when the
+   build's libc offered it, otherwise ``sem_timedwait`` on
+   ``CLOCK_REALTIME``, which jumps forward by the whole suspend on resume
+   and fires any pending deadline the instant the host wakes, whatever its
+   budget (portable interpreter builds and every macOS build take that
+   branch).  Windows has no process alarm, so there that timer carries the
+   exit at the same budget (:func:`exit_mechanism`), re-armed by every beat.
 
-2. **Soft observability dump (the daemon-thread fallback).**  A separate daemon
-   thread compares the last beat against the clock and, once the loop has not
-   beaten for ``stall_after`` seconds, logs a marker and dumps all thread stacks
-   *without* exiting, re-arming on recovery. When the hard timer is active this
-   stays on stderr so a recovered stall is not classified as a fatal crash. If
-   the hard timer is disabled or could not be armed, the soft dump also goes to
-   the dedicated file because no later fatal capture can make it discoverable.
+   **Journal visibility:** the dump lands in the dedicated file only (not
+   stderr/journal) because faulthandler targets a single fd.  On the next
+   gateway startup, ``server.py`` detects and replays the dump content to the
+   logger at WARNING level (capped at 120 lines / 8 KB), so journal-only
+   operators (containers, ``journalctl``) see the stacks one restart later —
+   exactly when they are investigating why the gateway died.
 
-The daemon thread keeps running even when the loop thread is blocked in the
-kernel — CPython releases the GIL around blocking syscalls such as ``close()`` /
-``waitpid()``, which is exactly the class of wedge observed in production.
+2. **Soft observability (the daemon thread).**  A daemon thread measures the
+   silence since the last beat on the clock a suspend does not advance
+   (:func:`kiro_crew.platform_compat.awake_now`) and, in order:
+   emits stall enrichment (the stall timestamp, this process's established
+   TCP sockets, and where the loop thread is, with the callback its current
+   asyncio handle is running) to the logger at WARNING at ``enrich_after``;
+   dumps all thread stacks *without* exiting at ``stall_after``, re-arming on
+   recovery.  While the exit is armed that soft dump stays on stderr, so a
+   recovered stall is not classified as a fatal crash; when no exit can
+   follow (``exit_after`` is ``None``, or the alarm failed to arm) it also
+   goes to the dedicated file, because no later fatal capture can make it
+   discoverable.  The daemon thread keeps
+   running while the loop thread is blocked in the kernel — CPython releases
+   the GIL around blocking syscalls such as ``close()`` / ``waitpid()`` /
+   ``stat()``, the class of wedge observed in production — and is starved by
+   a thread holding the GIL inside a long C call, which is one more reason
+   the exit decision does not live on it.
+
+**A suspend is not a stall.**  The heartbeat and the daemon thread both read
+:func:`kiro_crew.platform_compat.awake_now`, which does not count time the
+host spends suspended (``CLOCK_MONOTONIC`` on Linux, the mach timebase on
+macOS, and on Windows, where ``time.monotonic()`` counts a sleep, the
+unbiased interrupt time), so across a laptop sleep neither sees silence.
+Each poll also samples the suspend-inclusive clock
+:func:`kiro_crew.platform_compat.boottime_now`
+(``CLOCK_BOOTTIME`` on Linux, the wall clock on macOS, ``None`` where no
+such clock exists); when it advances :data:`SUSPEND_SKEW_MIN_SECS` further
+than the monotonic clock did since the last poll, the host slept for that
+long, and the watchdog says so once at INFO.
+
+**A paging loop thread is not a wedge.**  When the host runs short of memory
+the kernel swaps out part of the gateway's heap, and the loop thread stops
+beating while it faults those pages back in, for tens of seconds at a time.
+A restart cannot fix that: the new process starts into the same shortage.
+So on Linux each poll during a silence reads the loop thread's major-fault
+count from ``/proc/self/task/<tid>/stat``; while it keeps rising, the poll
+re-arms the alarm, for at most :data:`PAGING_GRACE_MAX_SECS` beyond the exit
+budget, and says so once at WARNING.  A thread blocked in a syscall or
+holding the GIL in a C call takes no major faults, so those still exit on
+the normal budget.  A desktop budget (below ``stall_after``) defers
+nothing: the desktop app's own liveness probe ends a silent gateway within
+a minute regardless.
 
 The class is deliberately split so the decision logic (:meth:`check`) is a
-pure, synchronous step that can be driven from tests with an injected clock and
-dump callback, and the armed-timer arm/cancel calls are injectable too — so
-tests verify the wiring without ever arming a real process-killing timer.
+pure, synchronous step that can be driven from tests with injected clocks
+and a dump callback, and the alarm arm/cancel calls are injectable too — so
+tests verify the wiring without ever arming a real process-ending timer.
 """
 
 from __future__ import annotations
 
 import faulthandler
 import logging
+import signal
 import sys
 import threading
-import time
 import typing
 from collections.abc import Callable
 
-from kiro_crew.dashboard.stall_enrichment import collect_stall_enrichment
+from kiro_crew.dashboard.stall_enrichment import collect_stall_enrichment, describe_loop_thread
+from kiro_crew.diag.threads import _parse_stat, _read_text, _task_dir
+from kiro_crew.platform_compat import (
+    arm_process_alarm,
+    awake_now,
+    boottime_now,
+    process_alarm_available,
+)
 
 logger = logging.getLogger("kiro_crew.dashboard.loop_watchdog")
+
+#: Minimum divergence, in seconds across one poll, between the suspend-inclusive
+#: clock and the monotonic clock that is reported as a suspend.  On Linux the
+#: two clocks otherwise advance in lock-step; on the wall-clock fallback a
+#: small NTP slew stays far below this floor.
+SUSPEND_SKEW_MIN_SECS: float = 2.0
+
+#: Longest a silence may outlast the exit budget while the loop thread keeps
+#: taking major page faults.  Bounds the deferral so a thread that never stops
+#: paging still ends the process.
+PAGING_GRACE_MAX_SECS: float = 600.0
+
+
+def read_thread_major_faults(native_thread_id: int | None) -> int | None:
+    """Major page faults taken so far by one thread of this process.
+
+    ``None`` off Linux, before the thread is known, or when procfs cannot be
+    read.  The row is parsed by :func:`kiro_crew.diag.threads._parse_stat`,
+    the one reader of that row's fields.
+    """
+    if native_thread_id is None or not sys.platform.startswith("linux"):
+        return None
+    stat_text = _read_text(f"{_task_dir(native_thread_id)}/stat")
+    if stat_text is None:
+        return None
+    major_faults = _parse_stat(stat_text).get("major_faults")
+    return major_faults if isinstance(major_faults, int) else None
+
+
+#: The mechanism the last :func:`_default_arm_later` armed the dump-then-exit
+#: on — ``"alarm"`` or ``"faulthandler"`` — or ``None`` while it holds no
+#: pending deadline.  Process-wide like the two deadlines it names
+#: (``ITIMER_REAL`` and faulthandler's single timer); written only by the
+#: default arm/cancel pair, and read by the cancel so it targets the deadline
+#: that was actually started, not the one :func:`exit_mechanism` would pick now.
+_armed_mechanism: str | None = None
 
 
 def _default_dump(file: "typing.IO[str] | typing.Any | None" = None) -> None:
     """Dump every thread's stack to a dedicated file and stderr.
 
-    The caller passes ``dump_file`` only when no authoritative hard-exit timer
-    is armed. That keeps soft-only failures discoverable by ``doctor`` while a
+    The caller passes ``dump_file`` only when no exit can follow the soft
+    dump. That keeps soft-only failures discoverable by ``doctor`` while a
     recoverable pre-exit dump in a managed service remains journal-only and
     cannot masquerade as a fatal crash at the next clean startup.
     """
@@ -83,35 +173,130 @@ def _default_dump(file: "typing.IO[str] | typing.Any | None" = None) -> None:
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
 
 
-def _default_arm_later(timeout: float, file: "typing.IO[str] | typing.Any | None" = None) -> None:
-    """Arm faulthandler's C-level timer.
+def exit_mechanism() -> str:
+    """Which mechanism carries the dump-then-exit here: ``alarm`` or ``faulthandler``.
 
-    After ``timeout`` seconds with no re-pet, it dumps every thread's stack to
-    the dedicated crash-dump file and then ``_exit(1)``.  Re-petted by every
-    :meth:`LoopStallWatchdog.beat`.  Runs on faulthandler's own thread and reads
-    thread states in C, so it fires even when the loop thread is wedged in a
-    blocking syscall.  ``repeat=False`` because the process exits the first time
-    it fires.
+    The kernel's process alarm where it exists (POSIX) **and** ``SIGALRM`` is
+    still at its default disposition.  A process that already handles
+    ``SIGALRM`` from Python — pytest-timeout in a test process, an embedding
+    host with its own alarm — owns ``ITIMER_REAL`` too, and arming or
+    cancelling it from here would silently remove that owner's deadline; the
+    watchdog then leaves both alone and uses faulthandler's own
+    ``dump_traceback_later`` thread at the same budget.  Windows has no such
+    timer, so faulthandler's thread stands in there as well.
+    faulthandler's own ``SIGALRM`` registration is not a Python-level handler,
+    so the check keeps answering ``alarm`` once the watchdog holds the signal.
+    Asked once per arm by :func:`_default_arm_later`, which latches the answer
+    for the matching :func:`_default_cancel_later`; an owner that appears or
+    leaves between two beats therefore moves the exit at the next re-arm and
+    never has the cancel aimed at a deadline that was not the one started.
+    """
+    if not process_alarm_available():
+        return "faulthandler"
+    return "alarm" if signal.getsignal(signal.SIGALRM) == signal.SIG_DFL else "faulthandler"
+
+
+def _default_arm_later(timeout: float, file: "typing.IO[str] | typing.Any | None" = None) -> None:
+    """Arm the dump-then-exit: dump every thread from C after ``timeout``, then end.
+
+    Where the process alarm exists, registers faulthandler's ``SIGALRM``
+    handler on the dedicated crash-dump file with ``chain=True`` and starts the
+    kernel's ``ITIMER_REAL`` countdown.  When it fires, faulthandler writes
+    every thread's stack to the file inside the signal handler — no GIL, no
+    Python — and then re-raises ``SIGALRM`` under its default disposition,
+    which terminates the process.  ``SIGALRM`` and ``ITIMER_REAL`` belong to
+    the watchdog in the gateway process.  Where the alarm is unavailable or
+    another Python handler already owns ``SIGALRM`` (see
+    :func:`exit_mechanism`) it arms ``faulthandler.dump_traceback_later``
+    with ``exit=True``, which dumps and ``_exit(1)``s from faulthandler's own
+    thread, and touches neither the signal nor the interval timer.  Re-armed
+    by every :meth:`LoopStallWatchdog.beat`, so it fires only after a genuine
+    ``exit_after`` gap with no beats.  The ``SIGALRM`` registration is released
+    and renewed on every arm: ``faulthandler.register`` reinstalls nothing while
+    it believes it still holds the signal, so a temporary owner that handed the
+    signal back with ``SIG_DFL`` would otherwise leave the next alarm to end the
+    process without a dump.
+
+    The mechanism is decided here, once per arm, and latched in
+    :data:`_armed_mechanism` so :func:`_default_cancel_later` cancels the
+    deadline this arm started rather than re-deriving which one that was: a
+    foreign ``signal.signal(SIGALRM, ...)`` installed between an arm and the
+    next beat flips :func:`exit_mechanism`, and a cancel that followed the
+    new answer would cancel faulthandler's idle timer and leave the pending
+    itimer to fire into the foreign handler beside the exit the re-arm then
+    starts.  With the latch, that beat cancels the itimer and the re-arm moves
+    the exit onto faulthandler's timer, so exactly one exit is pending on the
+    mechanism the foreign owner leaves free.
 
     *file* can be any object with a ``fileno()`` method (including
-    :class:`~kiro_crew.dashboard.crash_dump_store.DumpFile`).  faulthandler's C
-    code extracts the fd via ``fileno()`` at arm time and holds only the integer
-    — so the fd must remain valid until fire.  :class:`DumpFile` guarantees this
-    by never closing its fd.
+    :class:`~kiro_crew.dashboard.crash_dump_store.DumpFile`).  faulthandler
+    extracts the fd via ``fileno()`` at registration and holds only the
+    integer — so the fd must remain valid until fire.  :class:`DumpFile`
+    guarantees this by never closing its fd.
 
-    **Trade-off:** hard-exit dumps land ONLY in the dedicated file (not
-    stderr/journal) because ``faulthandler.dump_traceback_later`` targets a
-    single fd.  To ensure journal-only operators (containers, systemd) still see
-    the stacks, the gateway replays the dump content into the logger on the next
-    startup (see ``server.py`` startup dump surfacing).
+    **Trade-off:** this dump lands ONLY in the dedicated file (not
+    stderr/journal) because faulthandler targets a single fd.  To ensure
+    journal-only operators (containers, systemd) still see the stacks, the
+    gateway replays the dump content into the logger on the next startup (see
+    ``server.py`` startup dump surfacing).
     """
+    global _armed_mechanism
     target = file or sys.stderr
-    faulthandler.dump_traceback_later(timeout, repeat=False, file=target, exit=True)
+    mechanism = exit_mechanism()
+    if mechanism == "alarm":
+        # ``faulthandler.register`` installs its C handler only while it holds
+        # no registration for the signal; a repeat call updates the file and
+        # flags and leaves the disposition alone.  A temporary Python owner of
+        # ``SIGALRM`` that hands the signal back with ``SIG_DFL`` has overwritten
+        # that handler, so a bare re-register would arm an alarm whose delivery
+        # ends the process with no dump.  Releasing the registration first makes
+        # every arm install the handler afresh.  Every caller cancels the pending
+        # deadline before it arms, so no alarm of ours can land in the gap.
+        faulthandler.unregister(signal.SIGALRM)
+        faulthandler.register(signal.SIGALRM, file=target, all_threads=True, chain=True)
+        arm_process_alarm(timeout)
+    else:
+        faulthandler.dump_traceback_later(timeout, repeat=False, file=target, exit=True)
+    _armed_mechanism = mechanism
 
 
 def _default_cancel_later() -> None:
-    """Cancel any pending :func:`faulthandler.dump_traceback_later` timer."""
-    faulthandler.cancel_dump_traceback_later()
+    """Cancel the pending dump-then-exit on the mechanism the last arm latched.
+
+    Nothing latched means this module armed nothing, so nothing is cancelled:
+    the alternative — deriving a mechanism to cancel — would reach for a timer
+    another owner may hold.  The latch is cleared only once the cancel has
+    happened, so a cancel that raises leaves the pending deadline recorded for
+    the next beat to retry.
+    """
+    global _armed_mechanism
+    if _armed_mechanism == "alarm":
+        arm_process_alarm(0.0)
+    elif _armed_mechanism == "faulthandler":
+        faulthandler.cancel_dump_traceback_later()
+    _armed_mechanism = None
+
+
+def disarm_inherited_alarm() -> bool:
+    """Cancel a process alarm this image inherited across ``execv``; True if one was cancelled.
+
+    ``execve`` preserves ``ITIMER_REAL`` and resets a caught ``SIGALRM`` to its
+    default disposition, so an in-app restart or update could hand this process
+    the predecessor's pending dump-then-exit deadline as a lethal signal it never
+    armed -- during boot, before :meth:`LoopStallWatchdog.start` runs and
+    replaces the deadline with its own.  The predecessor cancels its alarm inside
+    the exec seam (:func:`kiro_crew.platform_compat.reexec_launcher`,
+    :func:`kiro_crew.platform_compat.reexec_python_module`); this is the
+    successor's own half, called once from the gateway entrypoint as soon as
+    faulthandler is enabled.  Same ownership rule as :func:`exit_mechanism`:
+    the timer is ours to clear only while ``SIGALRM`` is at its default
+    disposition -- a process that already handles ``SIGALRM`` from Python
+    (pytest-timeout in a test worker, an embedding host) owns ``ITIMER_REAL``
+    too, and its deadline is left alone.  Nothing is armed here.
+    """
+    if exit_mechanism() != "alarm":
+        return False
+    return arm_process_alarm(0.0)
 
 
 class LoopStallWatchdog:
@@ -119,53 +304,73 @@ class LoopStallWatchdog:
 
     Two layers, both fed by :meth:`beat` (called from the async heartbeat):
 
-    * the C-level ``faulthandler`` armed timer that dumps **and exits** at
-      ``exit_after`` seconds of silence — authoritative and portable / no-root;
-      and
-    * the daemon-thread :meth:`check` that dumps **without** exiting at
-      ``stall_after`` seconds — a soft observability fallback.
+    * the kernel's per-process alarm, re-armed by every beat for ``exit_after``
+      seconds with faulthandler's ``SIGALRM`` handler registered on the
+      crash-dump file, which dumps **and exits** at ``exit_after`` seconds of
+      silence — authoritative, GIL-free, no-root, and paused by a host suspend
+      (faulthandler's own timer stands in where no alarm exists, see
+      :func:`exit_mechanism`); and
+    * the daemon-thread :meth:`check` that enriches at ``enrich_after`` and
+      dumps **without** exiting at ``stall_after`` — a soft observability
+      layer on the monotonic clock, which also reports a resume once at INFO.
 
     When ``exit_after`` is below ``stall_after`` (the desktop default), the
-    armed timer exits before the soft threshold. When it is above
-    ``stall_after`` (the managed-service default), the soft dump records the
-    transient stall and the hard timer exits only if recovery never arrives.
+    alarm exits before the soft threshold.  When it is above ``stall_after``
+    (the managed-service default), the soft dump records the transient stall
+    and the alarm exits only if recovery never arrives.
 
     Args:
         stall_after: Seconds of heartbeat silence before the soft daemon-thread
             dump fires. Should comfortably exceed the heartbeat interval
             (default heartbeat is 5s, so 30s ≈ 6 missed ticks avoids false
             positives).
-        exit_after: Seconds of silence before the authoritative
-            ``dump_traceback_later(exit=True)`` fires.  The timer is re-armed
-            only on each :meth:`beat`, so the real silence tolerated before
-            ``_exit`` is ``exit_after`` minus up to one heartbeat interval.
-            ``None`` disables the armed timer (only the soft dump remains).
+        exit_after: Seconds of silence before the alarm dumps every thread's
+            stack and ends the process.  The alarm is re-armed only on each
+            :meth:`beat`, so the real silence tolerated is ``exit_after`` minus
+            up to one heartbeat interval.  ``None`` disables the exit (only
+            the soft dump remains).
         poll_interval: How often the daemon thread evaluates liveness.
-        now: Monotonic clock, injectable for tests.
+        now: Clock the silence is measured on, injectable for tests.  Defaults
+            to :func:`kiro_crew.platform_compat.awake_now`, which a host
+            suspend does not advance on any platform.
+        suspend_clock: Suspend-inclusive clock read beside ``now`` on every
+            poll to recognise a resume, ``None`` where the platform has none;
+            injectable for tests.  Defaults to
+            :func:`kiro_crew.platform_compat.boottime_now`.
         dump: Soft stack-dump callback, injectable for tests. By default a
-            soft dump is stderr-only while the hard timer is armed, otherwise
-            it is written to both ``dump_file`` and stderr.
-        arm_later: Arms the C-level dump-then-exit timer for N seconds,
-            injectable for tests so they never arm a real process-killing timer.
-            Defaults to :func:`_default_arm_later`.
-        cancel_later: Cancels the armed timer, injectable for tests.  Defaults
-            to :func:`_default_cancel_later`.
+            soft dump is stderr-only while the alarm is armed, otherwise it is
+            written to both ``dump_file`` and stderr.
+        arm_later: Arms the dump-then-exit for N seconds, injectable for
+            tests so they never arm a real process-ending timer.  Defaults to
+            :func:`_default_arm_later`.
+        cancel_later: Cancels the armed dump-then-exit, injectable for tests.
+            Defaults to :func:`_default_cancel_later`.
+        dump_file: The crash-dump file (any object with ``fileno()``) the
+            alarm and the soft-only dump write into.
         enrich_after: Seconds of heartbeat silence before the daemon thread
             emits stall enrichment (stall UTC timestamp + this process's
             established TCP sockets with rx/tx queue depths) to the logger at
             WARNING.  Must sit below ``exit_after`` so the capture lands
-            *before* the armed timer's dump-then-exit — with the 5s poll
-            cadence, 15s triggers on the 15–20s tick, ahead of the 25s exit.
+            *before* the alarm's dump-then-exit — with the 5s poll cadence,
+            15s triggers on the 15–20s tick, ahead of the 25s exit.
             Never written into ``dump_file``: that file is the boot-time
             crash sentinel (line-count classified), so an append would make a
             recovered stall read as a fatal crash on the next startup.  Both
             production stalls to date froze the loop inside websocket frame
             parsing; this records *which* socket without needing a repro.
+            The watchdog appends where the loop thread is
+            (:func:`kiro_crew.dashboard.stall_enrichment.describe_loop_thread`).
         enrich: Enrichment collector ``silence_secs -> lines``, injectable for
             tests.  Defaults to
             :func:`kiro_crew.dashboard.stall_enrichment.collect_stall_enrichment`.
+        loop_major_faults: Reads the loop thread's major-fault count from its
+            native thread id, ``None`` when unknown; injectable for tests.
+            Defaults to :func:`read_thread_major_faults`.
         log: Logger, injectable for tests.
     """
+
+    # Floor between heartbeat-lag captures, across episodes.
+    _LAG_CAPTURE_COOLDOWN_SECS = 60.0
 
     def __init__(
         self,
@@ -173,19 +378,22 @@ class LoopStallWatchdog:
         stall_after: float = 30.0,
         exit_after: float | None = 25.0,
         poll_interval: float = 5.0,
-        now: Callable[[], float] = time.monotonic,
+        now: Callable[[], float] = awake_now,
+        suspend_clock: Callable[[], float | None] | None = None,
         dump: Callable[[], None] | None = None,
         arm_later: Callable[[float], None] | None = None,
         cancel_later: Callable[[], None] | None = None,
         dump_file: "typing.IO[str] | typing.Any | None" = None,
         enrich_after: float = 15.0,
         enrich: "Callable[[float], list[str]] | None" = None,
+        loop_major_faults: Callable[[int | None], int | None] = read_thread_major_faults,
         log: logging.Logger | None = None,
     ) -> None:
         self._stall_after = stall_after
         self._exit_after = exit_after
         self._poll_interval = poll_interval
         self._now = now
+        self._suspend_clock = suspend_clock or boottime_now
         self._dump_file = dump_file
         self._dump = dump
         self._arm_later = arm_later or (lambda t: _default_arm_later(t, dump_file))
@@ -193,60 +401,113 @@ class LoopStallWatchdog:
         self._enrich_after = enrich_after
         self._enrich = enrich or collect_stall_enrichment
         self._enriched = False
+        self._lag_enriched = False
+        self._lag_inflight = False
+        self._lag_next_at = 0.0
         self._log = log or logger
         self._last_beat = now()
+        # ``threading.get_ident()`` of the thread that last beat: the loop
+        # thread the enrichment locates.  None until the first beat.
+        self._loop_thread_id: int | None = None
+        # The kernel's id for that same thread, which names its procfs row.
+        self._loop_native_thread_id: int | None = None
+        self._loop_major_faults = loop_major_faults
+        # Counts beats, so a paging deferral can tell that the loop beat after
+        # it sampled and must leave the beat's fresh deadline alone.
+        self._beat_generation = 0
+        # (beat generation, major faults) at the previous poll, and the beat
+        # generation whose silence has already logged its paging deferral.
+        self._fault_baseline: tuple[int, int] | None = None
+        self._paging_logged_generation: int | None = None
+        # Serialises the cancel-then-arm pair between the loop thread's beat
+        # and the daemon thread's paging deferral.
+        self._alarm_lock = threading.Lock()
         self._dumped = False
         # True only between start() and stop() when exit_after is set; gates the
-        # armed timer so a dashboard-only process (e.g. `kirocrew chat`, where
-        # start() is never called) never arms a process-killing timer.
+        # alarm so a dashboard-only process (e.g. `kirocrew chat`, where
+        # start() is never called) never arms a process-ending timer.
         self._later_active = False
+        # The two clock readings of the last poll, for the suspend comparison.
+        self._last_poll_mono: float | None = None
+        self._last_poll_suspend: float | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
     def beat(self) -> None:
-        """Record that the event loop is alive *now* and re-pet the armed timer.
+        """Record that the event loop is alive *now* and re-pet the alarm.
 
         Called from the async heartbeat each tick.  The liveness write is a
         single atomic float store (the GIL makes it safe between the loop thread
-        and the daemon thread).  When the armed timer is active, each beat
-        cancels and re-arms it, so it only fires after a genuine ``exit_after``
-        gap with no beats — i.e. a real wedge, not a transient lag.
+        and the daemon thread).  While the alarm is armed, each beat cancels and
+        re-arms it, so it only fires after a genuine ``exit_after`` gap with no
+        beats — i.e. a real wedge, not a transient lag.  It also records the
+        calling thread as the loop thread the stall enrichment locates.
         """
         self._last_beat = self._now()
+        self._loop_thread_id = threading.get_ident()
+        self._loop_native_thread_id = threading.get_native_id()
+        self._beat_generation += 1
         if self._later_active and self._exit_after is not None:
+            self._rearm_alarm(self._exit_after)
+
+    def _rearm_alarm(self, seconds: float, *, unless_beat_since: int | None = None) -> bool:
+        """Cancel the pending alarm and arm a fresh one ``seconds`` from now.
+
+        Runs on the loop thread for a beat and on the daemon thread for a
+        paging deferral, so the cancel-then-arm pair holds ``_alarm_lock``.
+        ``unless_beat_since`` is the beat generation a deferral sampled at: a
+        beat since then has armed the full budget, which a deferral's shorter
+        remainder must not replace.  A beat that lands after this check waits
+        on the lock and arms last.  Returns ``True`` only when a fresh alarm
+        was armed.
+        """
+        with self._alarm_lock:
+            if not self._later_active:
+                return False
+            if unless_beat_since is not None and unless_beat_since != self._beat_generation:
+                return False
             try:
                 self._cancel_later()
             except Exception:  # pragma: no cover - never let petting crash the loop
-                # Cancellation failed, so the previous timer may still own the
-                # crash file.  Keep the active flag rather than creating a
-                # competing soft sentinel on that uncertain path.
-                self._log.exception(
-                    "loop watchdog failed to cancel dump_traceback_later before re-arm"
-                )
-                return
+                # Cancellation failed, so the previous alarm may still be
+                # pending and still owns the crash file.  Keep the active flag
+                # rather than creating a competing soft sentinel on that
+                # uncertain path.
+                self._log.exception("loop watchdog failed to cancel the alarm before re-arm")
+                return False
             try:
-                self._arm_later(self._exit_after)
+                self._arm_later(seconds)
             except Exception:  # pragma: no cover - never let petting crash the loop
-                # Cancellation succeeded but no replacement timer exists.  The
-                # soft watchdog must write the discoverable file as well as
-                # stderr; leaving this true would silently lose both the hard
-                # exit and its crash artifact on the next stall.
+                # Cancellation succeeded but no replacement alarm exists, and
+                # with the flag cleared no later beat arms one: the exit is off
+                # for the rest of this run, so the soft watchdog writes the
+                # discoverable file as well as stderr from here on.
                 self._later_active = False
                 self._log.exception(
-                    "loop watchdog failed to re-arm dump_traceback_later"
+                    "loop watchdog failed to re-arm the alarm; the stall exit stays off "
+                    "for the rest of this run"
                 )
+                return False
+            return True
 
     def check(self) -> bool:
         """Evaluate liveness once.  Returns ``True`` iff a soft dump was emitted.
 
-        Pure and synchronous so tests can step it with a fake clock.  Emits at
+        Pure and synchronous so tests can step it with fake clocks.  Emits at
         most one dump per stall episode and re-arms when the loop recovers.
 
-        Stages by silence duration (defaults): **enrichment** at
-        ``enrich_after`` (15s) — stall timestamp + socket table emitted to the
-        logger at WARNING while the armed 25s dump-then-exit timer is still
-        pending — then the **soft dump** at ``stall_after`` (30s), reachable
-        only when the armed timer is off/failed.
+        Stages by silence duration on the monotonic clock (defaults):
+        **enrichment** at ``enrich_after`` (15s) — stall timestamp + socket
+        table emitted to the logger at WARNING while the armed 25s alarm is
+        still pending — then the **soft dump** at ``stall_after`` (30s),
+        reachable only when the alarm is off, failed, or set later.
+
+        A poll first compares the two clocks' advance since the previous poll:
+        the suspend-inclusive clock running ahead of the monotonic one by
+        :data:`SUSPEND_SKEW_MIN_SECS` or more means the host was suspended for
+        that long.  That is reported once at INFO and changes no decision —
+        the silence measured here is monotonic, and the alarm pauses during a
+        suspend, so a suspend never counts as a stall on either layer.
 
         Enrichment deliberately never touches ``dump_file``: that file is the
         boot-time crash sentinel (``crash_dump_store._is_header_only`` counts
@@ -254,9 +515,12 @@ class LoopStallWatchdog:
         stall read as a fatal crash on the next startup.  Only faulthandler
         writes stacks into it.  The journal WARNING survives both outcomes —
         the process lives to keep logging on recovery, and journald has
-        already persisted the line when ``_exit`` fires on a fatal stall.
+        already persisted the line when the alarm ends a fatal stall.
         """
-        silence = self._now() - self._last_beat
+        mono = self._now()
+        self._note_resume(mono)
+        silence = mono - self._last_beat
+        self._defer_exit_while_paging(silence)
         if silence >= self._enrich_after and not self._enriched:
             self._enriched = True
             try:
@@ -264,6 +528,7 @@ class LoopStallWatchdog:
             except Exception:  # pragma: no cover - collector already degrades; belt & braces
                 self._log.exception("loop watchdog stall enrichment failed")
                 lines = ["=== STALL ENRICHMENT FAILED (collector raised) ==="]
+            lines = [*lines, *describe_loop_thread(self._loop_thread_id)]
             self._log.warning(
                 "event loop silent %.1fs — stall enrichment captured:\n%s",
                 silence,
@@ -282,12 +547,12 @@ class LoopStallWatchdog:
                     if self._dump is not None:
                         self._dump()
                     elif self._later_active:
-                        # A managed service may recover before its wider hard
-                        # deadline. Keep that diagnostic in the journal; the
-                        # armed timer owns the fatal crash-sentinel file.
+                        # A managed service may recover before its wider alarm
+                        # budget. Keep that diagnostic in the journal; the
+                        # alarm owns the fatal crash-sentinel file.
                         _default_dump()
                     else:
-                        # No hard timer can create a discoverable artifact, so
+                        # No alarm can create a discoverable artifact, so
                         # retain the soft-only dump in the dedicated file too.
                         _default_dump(self._dump_file)
                 except Exception:  # pragma: no cover - dump must never crash the watchdog
@@ -312,6 +577,129 @@ class LoopStallWatchdog:
         self._enriched = False
         return False
 
+    def _defer_exit_while_paging(self, silence: float) -> None:
+        """Re-arm the alarm while the silent loop thread keeps paging.
+
+        A rise in the loop thread's major-fault count between two polls of
+        one silence means the silent thread is reading swapped-out memory back
+        in: progress the heartbeat cannot see.  Only a silence of two poll
+        intervals counts, so drift between the heartbeat and the poll cannot
+        make a healthy loop's stray fault look like paging.  The fresh
+        deadline never reaches past ``exit_after + PAGING_GRACE_MAX_SECS`` of total
+        silence.
+
+        Nothing is deferred when ``exit_after`` is below ``stall_after``: that
+        is the desktop budget, where the desktop app's own liveness probe
+        ends a silent gateway within a minute anyway, so a deferral would
+        only trade the alarm's stack dump for that kill.
+        """
+        exit_after = self._exit_after
+        if not self._later_active or exit_after is None or exit_after < self._stall_after:
+            return
+        generation = self._beat_generation
+        if silence < 2 * self._poll_interval:
+            self._fault_baseline = None
+            return
+        major_faults = self._loop_major_faults(self._loop_native_thread_id)
+        baseline, self._fault_baseline = (
+            self._fault_baseline,
+            None if major_faults is None else (generation, major_faults),
+        )
+        if major_faults is None or baseline is None or baseline[0] != generation:
+            return
+        if major_faults <= baseline[1]:
+            return
+        remaining_budget = exit_after + PAGING_GRACE_MAX_SECS - silence
+        if remaining_budget <= 0:
+            return
+        if not self._rearm_alarm(min(exit_after, remaining_budget), unless_beat_since=generation):
+            return
+        if self._paging_logged_generation != generation:
+            self._paging_logged_generation = generation
+            self._log.warning(
+                "event loop silent %.1fs while its thread is paging (%d major faults "
+                "since the last poll): the host is short of memory, not the loop "
+                "wedged, so the stall exit is deferred for up to %.0fs of silence",
+                silence,
+                major_faults - baseline[1],
+                exit_after + PAGING_GRACE_MAX_SECS,
+            )
+
+    def claim_lag_enrichment(self, lag: float) -> bool:
+        """Return ``True`` at most once per episode of heartbeat lag.
+
+        Cheap and non-blocking, so the heartbeat may call it on the loop every
+        tick, before :meth:`beat`. A lag at or below the heartbeat's 1s warning
+        threshold ends the episode. A stall :meth:`check` already captured, a
+        capture still running, or one within the cooldown is not captured. On
+        ``True`` the caller runs :meth:`log_lag_enrichment` off the loop.
+        """
+        if lag <= 1.0:
+            self._lag_enriched = False
+            return False
+        now = self._now()
+        if self._lag_enriched or self._enriched or self._lag_inflight or now < self._lag_next_at:
+            return False
+        self._lag_next_at = now + self._LAG_CAPTURE_COOLDOWN_SECS
+        self._lag_enriched = True
+        self._lag_inflight = True
+        return True
+
+    def log_lag_enrichment(self, lag: float) -> None:
+        """Log the ``enrich`` capture for a recovered heartbeat lag.
+
+        Logger only, never ``dump_file``, for the crash-sentinel reason that
+        :meth:`check` gives. The collector's own header describes a capture
+        taken during a stall, so it is replaced. Reads procfs: run off the loop.
+        """
+        try:
+            lines = self._enrich(lag)[1:]
+        except Exception:  # pragma: no cover - collector already degrades
+            self._log.exception("loop watchdog lag enrichment failed")
+            lines = ["(collector raised)"]
+        finally:
+            self._lag_inflight = False
+        self._log.warning(
+            "event-loop heartbeat lag %.1fs — socket snapshot after recovery:\n%s",
+            lag,
+            "\n".join(lines),
+        )
+
+    def _note_resume(self, mono: float) -> None:
+        """Compare the two clocks' advance since the last poll; log a suspend once.
+
+        On a live host the suspend-inclusive clock and the monotonic clock
+        advance together.  Time the host spent suspended advances only the
+        former, so their difference across one poll is the length of a sleep
+        that ended since the last poll.  The comparison is between consecutive
+        polls, not since the last beat, so one resume produces one line.
+        """
+        try:
+            suspend_now = self._suspend_clock()
+        except Exception:  # pragma: no cover - a clock read must never stop the check
+            self._log.debug("loop watchdog suspend clock unreadable", exc_info=True)
+            return
+        if suspend_now is None:
+            return
+        prev_mono, prev_suspend = self._last_poll_mono, self._last_poll_suspend
+        self._last_poll_mono, self._last_poll_suspend = mono, suspend_now
+        if prev_mono is None or prev_suspend is None:
+            return
+        mono_delta = mono - prev_mono
+        skew = (suspend_now - prev_suspend) - mono_delta
+        if skew >= SUSPEND_SKEW_MIN_SECS:
+            self._log.info(
+                "host was suspended (or its clock stepped forward) for about %.0fs: the "
+                "suspend-inclusive clock advanced %.0fs while the monotonic clock advanced "
+                "%.1fs since the last poll; the event loop's heartbeat silence is %.1fs on "
+                "the monotonic clock and the stall alarm paused with the host, so this is "
+                "not a stall and nothing exits",
+                skew,
+                skew + mono_delta,
+                mono_delta,
+                mono - self._last_beat,
+            )
+
     def _run(self) -> None:
         # ``Event.wait`` returns True only when stopped; on timeout it returns
         # False, which is our cue to run another liveness check.
@@ -322,19 +710,21 @@ class LoopStallWatchdog:
                 self._log.exception("loop watchdog check raised")
 
     def start(self) -> None:
-        """Arm the C-level dump-then-exit timer and spawn the daemon thread (idempotent)."""
+        """Arm the dump-then-exit alarm and spawn the daemon thread (idempotent)."""
         if self._thread is not None:
             return
         self._stop.clear()
         self._last_beat = self._now()
-        # Prime the authoritative dump-then-exit timer before the first beat.
+        self._last_poll_mono = None
+        self._last_poll_suspend = None
+        # Prime the authoritative dump-then-exit before the first beat.
         if self._exit_after is not None:
             try:
                 self._cancel_later()
                 self._arm_later(self._exit_after)
                 self._later_active = True
             except Exception:  # pragma: no cover - degrade to soft dump only
-                self._log.exception("loop watchdog failed to arm dump_traceback_later")
+                self._log.exception("loop watchdog failed to arm the stall alarm")
                 self._later_active = False
         self._thread = threading.Thread(
             target=self._run, name="loop-stall-watchdog", daemon=True
@@ -349,26 +739,31 @@ class LoopStallWatchdog:
                 self._enrich_after,
                 self._exit_after,
             )
+        if self._exit_after is not None and self._later_active:
+            exit_desc = f"{self._exit_after:.0f}s ({exit_mechanism()})"
+        else:
+            exit_desc = "off"
         self._log.info(
             "loop stall watchdog armed (stall_after=%.0fs, poll=%.0fs, exit_after=%s, "
             "enrich_after=%.0fs)",
             self._stall_after,
             self._poll_interval,
-            f"{self._exit_after:.0f}s" if self._exit_after is not None else "off",
+            exit_desc,
             self._enrich_after,
         )
 
     def stop(self, timeout: float | None = 2.0) -> None:
-        """Cancel the armed timer, signal the daemon thread to exit, join it (idempotent)."""
+        """Cancel the alarm, signal the daemon thread to exit, join it (idempotent)."""
         self._stop.set()
-        if self._later_active:
-            self._later_active = False
-            try:
-                self._cancel_later()
-            except Exception:  # pragma: no cover - cancel must never crash shutdown
-                self._log.exception(
-                    "loop watchdog failed to cancel dump_traceback_later"
-                )
+        # Under the lock, so a paging deferral on the daemon thread cannot
+        # arm a fresh alarm after this cancel.
+        with self._alarm_lock:
+            if self._later_active:
+                self._later_active = False
+                try:
+                    self._cancel_later()
+                except Exception:  # pragma: no cover - cancel must never crash shutdown
+                    self._log.exception("loop watchdog failed to cancel the stall alarm")
         thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout)

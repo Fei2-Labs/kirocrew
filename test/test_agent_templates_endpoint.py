@@ -19,8 +19,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew import agent_state
+from kiro_crew.agent_files import LITE_AGENT_FILENAME
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
 from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.handlers import agent_templates
@@ -29,7 +31,11 @@ from kiro_crew.dashboard.handlers.agent_templates import (
     api_agent_template_delete,
     api_agent_templates,
 )
-from kiro_crew.dashboard.handlers.agents import api_agent_detail
+from kiro_crew.dashboard.handlers.agents import (
+    api_agent_detail,
+    api_default_agent,
+    default_template_eligible,
+)
 from kiro_crew.webhooks import token_store
 
 
@@ -132,6 +138,12 @@ async def _body(resp):
     return json.loads(resp.text)
 
 
+def _default_agent_app() -> web.Application:
+    app = web.Application()
+    app.router.add_put("/api/config/default-agent", api_default_agent)
+    return app
+
+
 # ── roster ─────────────────────────────────────────────────────────────
 
 
@@ -181,6 +193,101 @@ async def test_roster_marks_editability_and_references(agents_dir):
     assert rows["atlas"]["read_only"] == "package"
     assert rows["kirocrew-worker"]["read_only"] == "runtime"
     assert rows["atlas"]["used_by"] == []
+    # Editability and default-eligibility are different questions: a package
+    # template cannot be edited here but every session start can reach it.
+    assert rows["reviewer"]["default_eligible"] is True
+    assert rows["atlas"]["default_eligible"] is True
+
+
+@pytest.mark.asyncio
+async def test_roster_flags_which_rows_the_picker_may_offer(agents_dir):
+    """The writer's shared predicate appears as one display flag per row."""
+    from kiro_crew.agent_discovery import AgentInfo
+
+    _write(agents_dir, "reviewer.json")
+    _write(agents_dir, "SomePkg-atlas.json", name="atlas")
+    _write(agents_dir, "pr-bot-copy.json")
+    agent_state.set_fork_info("pr-bot-copy", forked_from="reviewer", private_to="pr-bot")
+    _write(agents_dir, LITE_AGENT_FILENAME)
+    _write(agents_dir, "notes--scribe.json", name="scribe")
+    _write(agents_dir, "spaced.json", name="My Agent")
+    _seed_config()
+
+    resp = await api_agent_templates(_request("GET"))
+    assert resp.status == 200
+    rows = {r["name"]: r["default_eligible"] for r in (await _body(resp))["templates"]}
+    assert rows["My Agent"] is True
+    assert rows["atlas"] is True
+    assert rows["kirocrew-lite"] is False
+    assert rows["pr-bot-copy"] is False
+    assert rows["reviewer"] is True
+    assert rows["scribe"] is False
+    masked = AgentInfo(
+        name="AKIAIOSFODNN7EXAMPLE",
+        filename="masked.json",
+        description="",
+        model="",
+    )
+    assert default_template_eligible(masked) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info_kw", "private_owner", "eligible"),
+    [
+        ({"name": "reviewer", "filename": "reviewer.json"}, "", True),
+        (
+            {
+                "name": "atlas",
+                "filename": "SomePkg-atlas.json",
+                "source": "package",
+            },
+            "",
+            True,
+        ),
+        ({"name": "pr-bot-copy", "filename": "pr-bot-copy.json"}, "pr-bot", False),
+        (
+            {
+                "name": "kirocrew-lite",
+                "filename": LITE_AGENT_FILENAME,
+                "kirocrew_owned": True,
+                "source": "kirocrew",
+            },
+            "",
+            False,
+        ),
+        ({"name": "scribe", "filename": "notes--scribe.json"}, "", False),
+        (
+            {
+                "name": "AKIAIOSFODNN7EXAMPLE",
+                "filename": "masked.json",
+            },
+            "",
+            False,
+        ),
+    ],
+    ids=["plain", "package", "private-copy", "background", "app", "masked"],
+)
+async def test_default_eligibility_matches_put_refusal(
+    agents_dir, monkeypatch, info_kw, private_owner, eligible
+):
+    """Every rejected predicate row is refused by the template write."""
+    from kiro_crew.agent_discovery import AgentInfo
+
+    info = AgentInfo(description="", model="", private_to=private_owner, **info_kw)
+    assert default_template_eligible(info) is eligible
+    _seed_config()
+    monkeypatch.setattr("kiro_crew.dashboard.handlers.agents.list_agents", lambda *a, **kw: [info])
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.agents._foreign_private_copy_owner",
+        lambda *a, **kw: private_owner,
+    )
+    async with TestClient(TestServer(_default_agent_app())) as client:
+        resp = await client.put(
+            "/api/config/default-agent",
+            json={"agent": info.name, "agent_kind": "template"},
+        )
+    assert (resp.status != 200) is (not eligible), resp.text
 
 
 @pytest.mark.asyncio
@@ -222,9 +329,11 @@ async def test_roster_masks_package_controlled_strings_like_the_sibling_rosters(
     assert rows["atlas"]["model"] == _SENSITIVE_MASK
     assert rows["reviewer"]["description"] == "benign"
     # Reference labels come from crew, folder, schedule and token records the
-    # agent can write too.
+    # agent can write too. The seeded roster default's template is carried into
+    # ``agent.default_agent``, so it is the default custom agent as well.
     assert rows["reviewer"]["used_by"] == [
-        {"kind": "crew", "id": _SENSITIVE_MASK, "label": _SENSITIVE_MASK}
+        {"kind": "crew", "id": _SENSITIVE_MASK, "label": _SENSITIVE_MASK},
+        {"kind": "default", "id": "default", "label": "default agent"},
     ]
 
 
@@ -312,6 +421,17 @@ async def test_create_blank_writes_a_minimal_runnable_spec(agents_dir):
 
 
 @pytest.mark.asyncio
+async def test_create_accepts_the_case_variant_of_an_engine_reserved_id(agents_dir):
+    """``Default`` registers on KAS as an ordinary client agent (measured), so the
+    engine check is exact-case: a fold to ``.lower()`` would refuse it here."""
+    _seed_config()
+    resp = await api_agent_template_create(_request("POST", body={"name": "Default"}))
+    assert resp.status == 201, resp.text
+    assert (await _body(resp))["name"] == "Default"
+    assert (agents_dir / "Default.json").exists()
+
+
+@pytest.mark.asyncio
 async def test_create_from_copies_a_package_template_without_lineage(agents_dir):
     _write(agents_dir, "SomePkg-atlas.json", name="atlas", prompt="Be grounded.", tools=["x"])
     _seed_config()
@@ -332,6 +452,11 @@ async def test_create_from_copies_a_package_template_without_lineage(agents_dir)
     [
         ({"name": "has space"}, 400, "invalid_template_name"),
         ({"name": "kirocrew"}, 400, "template_name_reserved"),
+        # Kept by the KAS engine for itself when injected over the wire
+        # (agent_files.KAS_RESERVED_AGENT_IDS); exact match, so `Default` is fine.
+        ({"name": "default"}, 400, "template_name_reserved_by_engine"),
+        ({"name": "vibe"}, 400, "template_name_reserved_by_engine"),
+        ({"name": "plan"}, 400, "template_name_reserved_by_engine"),
         ({"name": "x", "from": "nope"}, 404, "template_not_found"),
         ({"name": "reviewer"}, 409, "name_taken"),
         ({"name": "pr-bot"}, 409, "name_bound"),
@@ -450,7 +575,14 @@ async def test_create_revalidates_the_source_identity_under_the_lock(agents_dir,
     monkeypatch.setattr(agents_handlers, "_spec_stem_on_disk", _second_claimant_then_check)
     resp = await api_agent_template_create(_request("POST", body={"name": "mine", "from": "atlas"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    # The locked re-check names what it found, the late claimant included.
+    assert payload["error"] == (
+        "'atlas' matches more than one template file in ~/.kiro/agents/ "
+        "(SomePkg-atlas.json, atlas.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert not (agents_dir / "mine.json").exists()
 
 
@@ -476,7 +608,10 @@ async def test_create_refuses_a_source_replaced_by_another_file_under_the_lock(
     monkeypatch.setattr(agents_handlers, "_spec_stem_on_disk", _replace_source_then_check)
     resp = await api_agent_template_create(_request("POST", body={"name": "mine", "from": "atlas"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    # One file answers now, so there is no "more than one" list to give.
+    assert payload["error"] == "'atlas' matches more than one template file; rename one first."
     assert not (agents_dir / "mine.json").exists()
 
 
@@ -526,7 +661,13 @@ async def test_create_from_an_ambiguous_name_is_a_409_not_a_500(agents_dir):
     _seed_config()
     resp = await api_agent_template_create(_request("POST", body={"name": "mine", "from": "atlas"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    assert payload["error"] == (
+        "'atlas' matches more than one template file in ~/.kiro/agents/ "
+        "(SomePkg-atlas.json, atlas.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert not (agents_dir / "mine.json").exists()
 
 
@@ -549,9 +690,11 @@ async def test_delete_refuses_while_referenced_and_lists_the_references(agents_d
     assert resp.status == 409
     body = await _body(resp)
     assert body["code"] == "template_referenced"
+    # The roster default's template is carried into ``agent.default_agent``.
     assert {(r["kind"], r["id"]) for r in body["references"]} == {
         ("crew", "pr-bot"),
         ("schedule", "job-1"),
+        ("default", "default"),
     }
     assert (agents_dir / "reviewer.json").exists()
 
@@ -740,8 +883,10 @@ async def test_delete_counts_a_binding_that_lives_only_in_the_overlay(agents_dir
     )
     resp = await api_agent_template_delete(_request("DELETE", "reviewer"))
     assert resp.status == 409
+    # The overlay names the roster default's template, so the load carries it.
     assert (await _body(resp))["references"] == [
-        {"kind": "crew", "id": "pr-bot", "label": "pr-bot"}
+        {"kind": "crew", "id": "pr-bot", "label": "pr-bot"},
+        {"kind": "default", "id": "default", "label": "default agent"},
     ]
     assert (agents_dir / "reviewer.json").exists()
 
@@ -1070,7 +1215,13 @@ async def test_delete_refuses_a_name_that_reaches_two_files(agents_dir):
     _seed_config({"pr-bot": "kirocrew"}, default="pr-bot")
     resp = await api_agent_template_delete(_request("DELETE", "bar"))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    assert payload["error"] == (
+        "'bar' matches more than one template file in ~/.kiro/agents/ "
+        "(bar.json, foo.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert (agents_dir / "bar.json").exists() and (agents_dir / "foo.json").exists()
 
 
@@ -1108,7 +1259,13 @@ async def test_delete_revalidates_ambiguity_under_the_spec_lock(agents_dir, monk
     monkeypatch.setattr(module, "_find_infos", _probe_then_install)
     resp = await api_agent_template_delete(_request("DELETE", "bar"))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    assert payload["error"] == (
+        "'bar' matches more than one template file in ~/.kiro/agents/ "
+        "(Pkg-bar.json, bar.json); rename one first."
+    )
+    assert str(agents_dir) not in payload["error"]
     assert (agents_dir / "bar.json").exists() and (agents_dir / "Pkg-bar.json").exists()
 
 
@@ -1185,7 +1342,14 @@ async def test_patch_definition_refuses_an_ambiguous_name(agents_dir):
     for body in ({"prompt": "rewritten"}, {"model": "claude-x"}):
         resp = await api_agent_detail(_request("PATCH", "atlas", body))
         assert resp.status == 409, resp.text
-        assert (await _body(resp))["code"] == "ambiguous_template_name"
+        payload = await _body(resp)
+        assert payload["code"] == "ambiguous_template_name"
+        # The refusal names both claimants by file name, never the absolute path.
+        assert payload["error"] == (
+            "'atlas' matches more than one template file in ~/.kiro/agents/ "
+            "(SomePkg-atlas.json, atlas.json); rename one first."
+        )
+        assert str(agents_dir) not in payload["error"]
     for f in ("atlas.json", "SomePkg-atlas.json"):
         spec = json.loads((agents_dir / f).read_text(encoding="utf-8"))
         assert spec["prompt"] != "rewritten" and "model" not in spec
@@ -1211,8 +1375,33 @@ async def test_patch_revalidates_ambiguity_under_the_write_lock(agents_dir, monk
     monkeypatch.setattr(agents_module, "_agent_detail_candidates", _scan_then_install)
     resp = await api_agent_detail(_request("PATCH", "atlas", {"prompt": "rewritten"}))
     assert resp.status == 409, resp.text
-    assert (await _body(resp))["code"] == "ambiguous_template_name"
+    payload = await _body(resp)
+    assert payload["code"] == "ambiguous_template_name"
+    # The locked re-check names what it found, the late claimant included.
+    assert "(SomePkg-atlas.json, atlas.json)" in payload["error"]
     assert json.loads((agents_dir / "atlas.json").read_text(encoding="utf-8"))["prompt"] == "mine"
+
+
+def test_ambiguous_refusal_text_without_scanned_paths():
+    """A raiser that did not scan the files keeps the bare sentence, no empty list."""
+    from kiro_crew.dashboard.handlers.agents import _AmbiguousTemplateName
+
+    assert _AmbiguousTemplateName("atlas").refusal_text() == (
+        "'atlas' matches more than one template file; rename one first."
+    )
+
+
+def test_ambiguous_refusal_text_masks_a_credential_shaped_file_name(tmp_path):
+    """File names are written by whoever writes the agents directory, so a
+    credential-shaped one is masked like every other agents-directory string."""
+    from kiro_crew.dashboard.handlers.agents import _AmbiguousTemplateName
+    from kiro_crew.dashboard.handlers.core import _SENSITIVE_MASK
+
+    probe = "AKIAIOSFODNN7EXAMPLE"
+    exc = _AmbiguousTemplateName("atlas", (tmp_path / "atlas.json", tmp_path / f"{probe}.json"))
+    text = exc.refusal_text()
+    assert probe not in text
+    assert _SENSITIVE_MASK in text and "atlas.json" in text
 
 
 @pytest.mark.asyncio
@@ -1232,3 +1421,239 @@ async def test_patch_definition_shape_is_validated(agents_dir, body):
     resp = await api_agent_detail(_request("PATCH", "reviewer", body))
     assert resp.status == 400
     assert (await _body(resp))["code"] == "invalid_definition"
+
+
+# ── PATCH: granting Crew's spawn tools declares the control plane ──────
+
+_MANAGED_CORE = {"command": "/managed/kirocrew", "args": ["mcp-core"]}
+
+
+@pytest.fixture
+def managed_core(monkeypatch):
+    """The managed launch, pinned: the test is about the declaration, not the
+    invocation resolver, which has its own coverage."""
+    calls: list[str] = []
+
+    def _entry(name, *, include_opt_in=False):
+        calls.append(name)
+        assert include_opt_in is False, "a tools edit must ask the emission question"
+        return dict(_MANAGED_CORE) if name == "kirocrew-core" else None
+
+    monkeypatch.setattr("kiro_crew.agent.managed_mcp_spec_entry", _entry)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_granting_a_spawn_tool_declares_kirocrew_core(agents_dir, managed_core):
+    """A custom agent that adds ``@kirocrew-core/spawn_run`` in the tools list
+    is saved with the server declared, so kiro-cli mounts it and the agent gets
+    the native session-attached spawn instead of a grant that mounts nothing."""
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"])
+    _seed_config()
+    resp = await api_agent_detail(
+        _request(
+            "PATCH",
+            "orchestrator",
+            {"tools": ["fs_read", "@kirocrew-core/spawn_run", "@kirocrew-core/spawn_list"]},
+        )
+    )
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert spec["tools"] == ["fs_read", "@kirocrew-core/spawn_run", "@kirocrew-core/spawn_list"]
+    assert spec["mcpServers"] == {"kirocrew-core": _MANAGED_CORE}
+    # The grant is a mount, never an auto-approval: every spawn still asks.
+    assert "@kirocrew-core/spawn_run" not in spec.get("allowedTools", [])
+
+
+@pytest.mark.asyncio
+async def test_spawn_grant_keeps_the_other_declared_servers(agents_dir, managed_core):
+    other = {"command": "docs-mcp", "args": []}
+    _write(agents_dir, "orchestrator.json", tools=["@docs"], mcpServers={"docs": other})
+    _seed_config()
+    resp = await api_agent_detail(
+        _request("PATCH", "orchestrator", {"tools": ["@docs", "@kirocrew-core"]})
+    )
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert spec["mcpServers"] == {"docs": other, "kirocrew-core": _MANAGED_CORE}
+
+
+@pytest.mark.asyncio
+async def test_an_existing_declaration_is_never_replaced(agents_dir, managed_core):
+    mine = {"command": "kirocrew", "args": ["mcp-core"], "timeout": 5000}
+    _write(
+        agents_dir,
+        "orchestrator.json",
+        tools=["fs_read"],
+        mcpServers={"kirocrew-core": mine},
+    )
+    _seed_config()
+    resp = await api_agent_detail(
+        _request("PATCH", "orchestrator", {"tools": ["@kirocrew-core/spawn_run"]})
+    )
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert spec["mcpServers"] == {"kirocrew-core": mine}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tools",
+    [
+        # No Crew grant at all.
+        ["fs_read", "@docs/search"],
+        # ``*`` grants every declared server; it asks for no new declaration.
+        ["*"],
+        # An opt-in or third-party server is never minted by a tools edit.
+        ["@kirocrew-dashboard/open", "@somevendor/tool"],
+    ],
+)
+async def test_tools_edits_that_grant_no_control_plane_declare_nothing(
+    agents_dir, managed_core, tools
+):
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"])
+    _seed_config()
+    resp = await api_agent_detail(_request("PATCH", "orchestrator", {"tools": tools}))
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert "mcpServers" not in spec
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_ref_beside_star_declares_the_server(agents_dir, managed_core):
+    """``*`` grants every DECLARED server, so with ``kirocrew-core`` undeclared it
+    mounts nothing; an explicit ``@kirocrew-core/...`` beside it is a request for
+    that server, and saving it undeclared would be a grant that mounts nothing."""
+    _write(agents_dir, "orchestrator.json", tools=["*"])
+    _seed_config()
+    resp = await api_agent_detail(
+        _request("PATCH", "orchestrator", {"tools": ["*", "@kirocrew-core/spawn_run"]})
+    )
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert spec["tools"] == ["*", "@kirocrew-core/spawn_run"]
+    assert spec["mcpServers"] == {"kirocrew-core": _MANAGED_CORE}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_mode", [True, False])
+async def test_the_declaration_carries_the_registry_marker_in_registry_mode(
+    agents_dir, managed_core, monkeypatch, registry_mode
+):
+    """A registry-mode client drops every ``mcpServers`` entry without
+    ``"type": "registry"``, so the declaration carries the marker exactly while
+    ``agent.mcp_registry_mode`` is on -- and never outside it, where the same
+    marker is what the client drops."""
+    monkeypatch.setattr("kiro_crew.agent._mcp_registry_mode", lambda: registry_mode)
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"])
+    _seed_config()
+    resp = await api_agent_detail(
+        _request("PATCH", "orchestrator", {"tools": ["fs_read", "@kirocrew-core/spawn_run"]})
+    )
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    expected = {**_MANAGED_CORE, "type": "registry"} if registry_mode else _MANAGED_CORE
+    assert spec["mcpServers"] == {"kirocrew-core": expected}
+
+
+async def _refused(agents_dir, body) -> dict:
+    """PATCH *body* onto ``orchestrator`` and require the declaration refusal."""
+    before = (agents_dir / "orchestrator.json").read_bytes()
+    resp = await api_agent_detail(_request("PATCH", "orchestrator", body))
+    assert resp.status == 409, resp.text
+    payload = await _body(resp)
+    assert payload["code"] == "control_plane_not_declarable"
+    assert payload["server"] == "kirocrew-core"
+    # Nothing is written: the tools list never shows a tool the agent cannot get.
+    assert (agents_dir / "orchestrator.json").read_bytes() == before
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_managed_launch_refuses_the_save(agents_dir, monkeypatch):
+    """A broken install answers ``None`` for the managed launch. The save is
+    refused with a reason the save bar shows, never written as a grant alone."""
+    monkeypatch.setattr(
+        "kiro_crew.agent.managed_mcp_spec_entry", lambda name, *, include_opt_in=False: None
+    )
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"])
+    _seed_config()
+    payload = await _refused(agents_dir, {"tools": ["@kirocrew-core/spawn_run"]})
+    assert "cannot find how to start it" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_object_mcp_servers_refuses_the_save(agents_dir, managed_core):
+    """A hand-edited non-object ``mcpServers`` is the author's to fix, so it is
+    left as it is -- and the grant is refused beside it with the fix named,
+    since saving it would mount nothing."""
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"], mcpServers=["oops"])
+    _seed_config()
+    payload = await _refused(agents_dir, {"tools": ["@kirocrew-core/spawn_run"]})
+    assert "MCP servers section of this agent's file is malformed" in payload["error"]
+    assert managed_core == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_grant_leaves_the_model_pin_alone(agents_dir, monkeypatch):
+    """The refusal is reached before the PATCH's bookkeeping, so a save that
+    also changes the model does not flip the model sidecar for a spec it then
+    declines to write."""
+    monkeypatch.setattr(
+        "kiro_crew.agent.managed_mcp_spec_entry", lambda name, *, include_opt_in=False: None
+    )
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"])
+    _seed_config()
+    agent_state.set_model_managed("orchestrator", True)
+    await _refused(
+        agents_dir, {"model": "claude-x", "tools": ["fs_read", "@kirocrew-core/spawn_run"]}
+    )
+    assert agent_state.get_model_managed("orchestrator") is True
+
+
+@pytest.mark.asyncio
+async def test_a_concurrent_mcp_edit_survives_the_spawn_grant(
+    agents_dir, managed_core, monkeypatch
+):
+    """A writer that saves an ``mcpServers`` entry between the PATCH's pre-lock
+    read and its locked write keeps it: the declaration is added to the spec as
+    re-read under the lock, not to the earlier snapshot's map."""
+    from kiro_crew.dashboard.handlers import agents as agents_module
+
+    _write(agents_dir, "orchestrator.json", tools=["fs_read"])
+    _seed_config()
+    other = {"command": "docs-mcp", "args": []}
+    real = agents_module._agent_detail_candidates
+    calls = {"n": 0}
+
+    def _scan_then_concurrent_edit(name_):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the locked re-check: another writer saved meanwhile
+            path = agents_dir / "orchestrator.json"
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            spec["mcpServers"] = {"docs": other}
+            path.write_text(json.dumps(spec), encoding="utf-8")
+        return real(name_)
+
+    monkeypatch.setattr(agents_module, "_agent_detail_candidates", _scan_then_concurrent_edit)
+    resp = await api_agent_detail(
+        _request("PATCH", "orchestrator", {"tools": ["fs_read", "@kirocrew-core/spawn_run"]})
+    )
+    assert resp.status == 200, resp.text
+    assert calls["n"] >= 2
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert spec["mcpServers"] == {"docs": other, "kirocrew-core": _MANAGED_CORE}
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_only_edit_never_touches_mcp_servers(agents_dir, managed_core):
+    """Only a tools edit asks the question: a template that already grants
+    ``@kirocrew-core`` without declaring it is the author's state until they
+    edit the tools list."""
+    _write(agents_dir, "orchestrator.json", tools=["@kirocrew-core/spawn_run"])
+    _seed_config()
+    resp = await api_agent_detail(_request("PATCH", "orchestrator", {"prompt": "Delegate."}))
+    assert resp.status == 200, resp.text
+    spec = json.loads((agents_dir / "orchestrator.json").read_text(encoding="utf-8"))
+    assert "mcpServers" not in spec
+    assert managed_core == []

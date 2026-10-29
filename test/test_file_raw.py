@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.handlers import api_file_raw
 
@@ -16,7 +17,7 @@ from kiro_crew.dashboard.handlers import api_file_raw
 def _make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/api/file-raw", api_file_raw)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture
@@ -71,6 +72,45 @@ async def test_serves_svg(tmp_path, mock_sel, data):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-raw?path={f}")
             assert resp.status == 200
+
+
+_PDF_HEADER = b"%PDF-1.7\n" + b"\x00" * 100
+
+
+@pytest.mark.asyncio
+async def test_content_disposition_carries_real_filename(tmp_path, mock_sel):
+    """The PDF viewer iframes this endpoint (and the image viewer loads it in an
+    <img>); the native Download / Save-as reads the save name from
+    Content-Disposition. Without it the browser falls back to the URL's last
+    segment and saves as "file-raw". The header names the file and stays
+    `inline` so the viewer still renders it."""
+    f = tmp_path / "quarterly-report.pdf"
+    f.write_bytes(_PDF_HEADER)
+    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-raw?path={f}")
+            assert resp.status == 200
+            assert resp.headers["Content-Type"] == "application/pdf"
+            assert (
+                resp.headers["Content-Disposition"]
+                == "inline; filename*=UTF-8''quarterly-report.pdf"
+            )
+
+
+@pytest.mark.asyncio
+async def test_content_disposition_percent_encodes_the_name(tmp_path, mock_sel):
+    """A name with spaces/unicode must round-trip through RFC 5987 encoding,
+    not break the header."""
+    f = tmp_path / "my report (v2).pdf"
+    f.write_bytes(_PDF_HEADER)
+    with patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.get(f"/api/file-raw?path={f}")
+            assert resp.status == 200
+            assert (
+                resp.headers["Content-Disposition"]
+                == "inline; filename*=UTF-8''my%20report%20%28v2%29.pdf"
+            )
 
 
 # --- Rejected cases ---
@@ -337,7 +377,7 @@ async def test_the_envelope_still_rejects_a_symlink_for_both(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("symlinks unavailable on this platform/user")
 
-    app = web.Application()
+    app = as_owner(web.Application())
     app.router.add_get("/api/file-raw", api_file_raw)
     app.router.add_get("/api/file-download", api_file_download)
 

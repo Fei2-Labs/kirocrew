@@ -1,4 +1,4 @@
-import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
+import { safeSetItem } from '../utils/safeStorage'
 import { newerTs } from '../lib/slotReadRelay'
 import { jsonEqual } from '../utils/structuralEqual'
 import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
@@ -7,6 +7,9 @@ import { ApiError } from '../api/apiError'
 import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
 import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
+import { isChatPageSurface } from '../utils/channelOrigin'
+import { slotListHoldTest } from '../utils/slotListHold'
+import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, drainUnreadKeys, hasUnreadRelayHold, heldOrphanTest, persistManualSentinels, persistSharedUnread, readCovers, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince } from './dashboard/unread'
 
 export interface SubagentDetail {
   id: string; task: string; agent: string; turns: number; last_tool: string; startedAt: number
@@ -20,7 +23,11 @@ interface CloseHold {
   requestId: string
   /** Deadline while the DELETE is in flight; `null` once the server has answered. */
   inFlightUntil: number | null
-  /** Straggler frames the hold survives after confirmation. */
+  /** This attempt received 404 because another close popped the key; wait for
+   *  that close's durable removal or rollback signal. */
+  awaitingOutcome?: true
+  /** Straggler lists an awaiting or confirmed hold still survives. The same
+   *  counter carries across a durable `removed` outcome. */
   graceFrames: number
   /** `fetchSlots` requests that were already in flight when the server
    *  confirmed the close. Their replies may predate the pop, so the hold
@@ -32,7 +39,12 @@ interface CloseHold {
   confirmedUntil: number | null
 }
 
-interface DashboardState {
+/** The two user-owned mute flags on a slot. */
+export type MuteFlag = 'mutes_opened' | 'muted'
+/** The `slotMuteFlagError` key for one flag on one slot. */
+export const muteFlagErrorKey = (flag: MuteFlag, slotKey: string) => `${flag}:${slotKey}`
+
+export interface DashboardState {
   status: StatusData | null
   /** The ad-hoc auto-approve duration this tab last saved in Settings, or
    *  undefined when it has saved none. Applied over every status write: the
@@ -44,14 +56,41 @@ interface DashboardState {
   slots: ChatSlot[]
   /** Increments for every accepted authoritative full-slot frame/reply. */
   slotsGeneration: number
+  /** Highest pinned-order revision (`pin_rev`) whose ranks the rows hold. A
+   *  frame or answer with a lower one was serialized before a write whose
+   *  ranks are already applied, so its ranks are ignored. */
+  pinOrderRev?: number
+  /** The latest reorder gesture while its write is queued or in flight. It
+   *  lives here, not in the sidebar, so a sidebar that remounts mid-write
+   *  derives the next gesture from it rather than from an earlier answer. */
+  pendingPinOrder?: string[] | null
+  /** Why the last pinned-order write failed, shown above the sidebar list
+   *  until dismissed or the next reorder; '' when there is nothing to show. */
+  pinOrderError?: string
+  /** The manual order's counterparts of the three fields above (sort
+   *  "Manual"): the highest `manual_rev` applied, the latest gesture's whole
+   *  order while its writes are queued, and the last write's failure text. */
+  manualOrderRev?: number
+  pendingManualOrder?: string[] | null
+  manualOrderError?: string
   /** Per-key optimistic/reconciliation pin writes, independent of other slot fields. */
   slotPinGenerations: Record<string, number>
-  /** Keys whose close is in flight or just confirmed, held out of `slots` until an
-   *  authoritative list omits them. See `applySlots` for why membership alone is
-   *  not enough: the server still lists a slot whose DELETE has not finished.
-   *  Bounded twice over — by the wall clock while the request is in flight, and
-   *  by a small frame budget after the server has confirmed. */
+  /** Last failed mute toggle, one record for both user-owned mute flags
+   *  (`mutes_opened` and `muted`), keyed by `muteFlagErrorKey(flag, slot)`.
+   *  Kept so the menu can render it through ErrorNotice even after the kebab
+   *  closed and reopened. Set on the mutation's onError (after the optimistic
+   *  flip is rolled back), cleared when a later toggle of that flag starts. */
+  slotMuteFlagError: Record<string, string>
+  /** Keys whose close is in flight, awaiting another close's outcome, or just
+   *  confirmed. An ordinary in-flight key is held out of `slots`; an awaiting
+   *  key also survives `CLOSE_CONFIRMED_GRACE_FRAMES` lists before a WebSocket
+   *  membership can release it, while a post-404 HTTP reply may release it at
+   *  once. Bounded by the wall clock and that shared list budget. */
   closingSlots: Record<string, CloseHold>
+  /** Keys this tab saw leave through the server's durable `removed` patch.
+   *  History rewrites may trust this immediately; slot-list visibility still
+   *  follows `closingSlots` and its straggler budget. */
+  durablyRemoved: Record<string, true>
   /** `fetchSlots` requests currently in flight, by thunk requestId — read by
    *  a confirmed close to know which replies could still predate its pop. */
   slotFetchesInFlight: string[]
@@ -73,18 +112,56 @@ interface DashboardState {
    *  reply predates what is on screen for that key. Pruned with the rest of the
    *  per-slot state when an authoritative frame drops the key. */
   slotWrittenAt: Record<string, number>
-  /** Per in-flight `fetchSlots` requestId, the value of `slotWriteSeq` when the
-   *  request was dispatched. The server serialized its reply after that instant,
-   *  so any key whose `slotWrittenAt` is HIGHER was written locally while the
-   *  reply travelled and the reply is older than the screen for that key.
-   *  Entries leave when the request settles. */
-  slotFetchWriteMark: Record<string, number>
+  /** Per key, the value of `slotWriteSeq` at that row's last MEMBERSHIP write (a
+   *  create / resume / fork / companion-open — every `addSlotOptimistic` and
+   *  `createSlot.fulfilled`). Compared against a `fetchSlots` request's mark the
+   *  same way `slotWrittenAt` is, but it drives the RE-ADD of a key the reply
+   *  OMITS, where `slotWrittenAt` drives only the substitution of a key the
+   *  reply contains: a content write must never resurrect a row the reply
+   *  dropped (that would revive a foreign-deleted chat), while a membership
+   *  write the server confirmed must survive a reply serialized before it.
+   *  Only a reply dispatched BEFORE the add can re-add the key: `membersOutranking`
+   *  re-adds when `slotMemberAt` exceeds the request's mark, and a reply
+   *  dispatched after the add carries a mark at or above the stamp, so it never
+   *  re-adds — no consumption step is needed. Pruned with the rest of the
+   *  per-slot state when an authoritative frame drops the key. */
+  slotMemberAt: Record<string, number>
+  /** Recent membership adds, by stamped key. A full `slots` frame carries no
+   *  ordering mark, so one the gateway serialized before the add can arrive
+   *  after it and omit the key; `sseSlots` keeps the row through such a frame
+   *  and asks for one `fetchSlots` to settle it (see `retainUnlistedMembers`).
+   *  An entry leaves when a `fetchSlots` dispatched after the add omits the
+   *  key, when the key is closed or removed, or after `UNLISTED_MEMBER_MAX_MS`. */
+  slotMemberUnlisted?: Record<string, UnlistedMember>
+  /** Set by `sseSlots` when it kept an unlisted member that still needs a
+   *  `fetchSlots` answer, cleared when any `fetchSlots` starts. A reducer
+   *  cannot dispatch, so the frame handler sends the read through
+   *  `readUnlistedMembers`. */
+  slotMemberReadWanted?: boolean
+  /** Per in-flight `fetchSlots` requestId, the write sequence and unread-drain
+   *  hold state when the request was dispatched. The server serialized its reply
+   *  after that instant, so any key whose `slotWrittenAt` is HIGHER was written
+   *  locally while the reply travelled and the reply is older than the screen for
+   *  that key. A reply started under the unread hold cannot become safe to drain
+   *  merely because a complete WebSocket frame arrives before it: the reply may
+   *  predate that frame and omit a session it lists. Once such a frame HAS
+   *  arrived, its key set (`completeKeys`) is the authority the reply's drain
+   *  defers to, so the reply drains only what both lists omit. Entries leave
+   *  when the request settles. */
+  slotFetchWriteMark: Record<string, {
+    writeSeq: number
+    unreadDrainHeld: boolean
+    heldKeys: string[]
+    holdChannels: boolean
+    completeKeys: string[] | null
+  }>
   // Slot keys in the order the session sidebar actually DISPLAYS them
   // (pinned-first + the user's sort, flat-view aware). Published by
-  // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts so
-  // Ctrl/Alt+N targets the Nth visible row rather than the Nth element of
-  // `slots` (which arrives in backend insertion order). Empty until the
-  // sidebar first renders — consumers fall back to `slots` order then.
+  // ChatSidebar; consumed by the chat-jump / chat-cycle keyboard shortcuts and
+  // by deleteSlot's close-landing pick after row identities map to slot keys.
+  // Keep the complete displayed order: truncating it to the shortcut count
+  // would break adjacent-row close landing. Empty until the sidebar first
+  // renders — consumers fall back to `slots` order then.
   sidebarOrder: string[]
   approvalMode: string
   channelTrusted: boolean
@@ -104,7 +181,27 @@ interface DashboardState {
    *  as ONE shared record entry written atomically, so the pair can never
    *  tear apart and there are no orphans to reconcile at boot. */
   unreadSince: Record<string, string>
+  /** While true, `reconcileSlots` keeps every unread entry whose key the slot
+   *  list omits instead of draining it. True from boot and from every
+   *  disconnect or `sseConnected` until a `slots` frame arrives without
+   *  `slotsPartial`: a gateway mid-restart labels the lists it pushes while sessions are still
+   *  being restored, and draining against one of those would clear the badge
+   *  of a session that merely has not been listed yet. Only the drain is
+   *  held; the list itself renders and evicts as usual. */
+  unreadDrainHeld: boolean
+  /** The last `slots` frame carried `slotsPartial: true`. Unlike
+   *  `unreadDrainHeld`, false until the gateway says so: it is what the unread
+   *  counts read to leave out sessions a restoring gateway has not listed yet. */
+  slotsListPartial: boolean
+  /** Known omitted keys that remain unsafe to drain after the global hold clears. */
+  slotsHeldKeys: string[]
+  /** Hold every channel-origin key when the gateway could not list channel sessions. */
+  slotsHoldChannels: boolean
   slotsLoaded: boolean
+  /** Every slot-list fetch in flight has failed and no list has landed yet, so
+   *  `selectSlotListPending` stops waiting and the pane falls back to its empty
+   *  state instead of a placeholder that never resolves. */
+  slotsFetchFailed: boolean
   updateProgress: { step: string; detail: string } | null
   // Desktop updater: an update is discoverable/staged (found|downloading|
   // downloaded). Drives the Settings nav dot + the About tab dot. Mirrored
@@ -121,157 +218,7 @@ interface DashboardState {
 }
 
 const safeGet = (key: string, fallback: string) => { try { return localStorage.getItem(key) ?? fallback } catch { return fallback } }
-/** unreadSince sentinel for a manual mark-as-unread. It parses as an invalid
- *  instant, so the conservative comparison below can never treat any relayed
- *  read watermark as covering it. A bare non-letter char, never rendered —
- *  the constant name carries the meaning. */
-export const MANUAL_UNREAD = '\uffff'
-
-/** True when `read` chronologically covers `since`. Timestamps are parsed as
- *  instants — mixed-offset server strings make lexical order lie about time
- *  order — and ANY unparseable side answers false, so an invalid watermark
- *  can never clear a badge (and the manual sentinel never parses). */
-const readCovers = (read: string | undefined, since: string): boolean => {
-  if (read === undefined) return false
-  const r = Date.parse(read)
-  const s = Date.parse(since)
-  return Number.isFinite(r) && Number.isFinite(s) && r >= s
-}
-
-
-/** THE shared unread record ('mc-unread-shared' in localStorage): slot ->
- *  message watermark, or '' for a badge no watermark guards (any relayed
- *  read clears it). Badge presence and watermark are one key in one JSON
- *  document written by ONE setItem, so a sibling tab can never observe a
- *  badge without its watermark or a watermark without its badge — there is
- *  no torn state to reconcile at boot. That guarantee is single-WRITE
- *  atomicity only: localStorage has no cross-process transaction, so two
- *  windows' simultaneous RMWs race last-writer-wins on the whole document.
- *  Per-slot deltas keep any lost update slot-local, and it self-heals on
- *  that slot's next arrival or relay. Writes are per-slot DELTAS with
- *  newest-parseable-ts-wins: two windows writing the same slot settle on
- *  the newest instant, keys this window never touched pass through, and a
- *  ''-arrival never demotes a real watermark. MANUAL_UNREAD sentinels are
- *  deliberately NOT here: the reminder answers only to its own window, so
- *  sentinels persist to per-tab sessionStorage via persistManualSentinels.
- *  'mc-unread-slots' is kept as a write-only PROJECTION of the record's
- *  keys — the pre-existing hub relay (safeSet) and tabs still running
- *  older code read it; nothing in this file does. */
-const persistSharedUnread = (add: Record<string, string>, remove: readonly string[]): void => {
-  try {
-    let stored: Record<string, string>
-    try { stored = JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}') as Record<string, string> } catch { stored = {} }
-    for (const k of remove) delete stored[k]
-    for (const [k, v] of Object.entries(add)) {
-      if (v === MANUAL_UNREAD) continue  // sentinels never publish
-      const prev = stored[k]
-      if (prev === undefined) { stored[k] = v; continue }
-      if (v === '') continue  // presence already recorded; never demote a watermark
-      stored[k] = prev === '' ? v : (newerTs(prev, v) ?? prev)
-    }
-    // safeSetItem, not a raw setItem: this write runs on the websocket
-    // onmessage -> dispatch -> re-render path, so a QuotaExceededError here
-    // would escape a React ErrorBoundary and white-screen the app. The helper
-    // reclaims a disposable tier and retries, so the record survives a full
-    // quota instead of being dropped beside reclaimable cache.
-    //
-    // The return value is load-bearing, and it is the one thing a plain
-    // conversion from the old raw call loses. The raw setItem THREW on a full
-    // quota, so the surrounding catch swallowed it and the projection write
-    // below never ran. A helper that reports the same failure by returning
-    // false does not stop the function, and the projection is strictly smaller
-    // than the record (keys only, no timestamps) — so on a quota it can free
-    // space and succeed where the record just failed, leaving the two persisted
-    // records disagreeing. restoreUnreadSince trusts the record; older tabs and
-    // the hub relay read the projection. Bail out before that can happen.
-    if (!safeSetItem('mc-unread-shared', JSON.stringify(stored))) return
-    // Projection write bypasses safeSet's hub relay: the shared keys omit
-    // this window's manual sentinels, so relaying their count would under-
-    // report the hub switcher chip. The reducers relay the window's own
-    // unreadSlots count after every unread mutation instead.
-    safeSetItem('mc-unread-slots', JSON.stringify(Object.keys(stored)))
-  } catch { /* SecurityError / quota */ }
-}
-/** Clear one slot's SHARED unread record only when `readTs` covers the
- *  watermark CURRENTLY PERSISTED — the live stored value, read inside this
- *  call, never this window's in-memory view, which can be stale across a
- *  reconnect gap. A ''-record (badge, no watermark) accepts any read.
- *  Returns undefined when the record was cleared; returns the surviving
- *  watermark when a sibling advanced it past this read — the caller then
- *  keeps the badge and adopts that watermark instead of erasing a newer
- *  window's state. */
-const clearSharedUnreadIfCovered = (slot: string, readTs: string | undefined): string | undefined => {
-  let sharedW: string | undefined
-  try {
-    sharedW = (JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}') as Record<string, string>)[slot]
-  } catch { sharedW = undefined }
-  if (sharedW !== undefined && sharedW !== '' && !readCovers(readTs, sharedW)) return sharedW
-  persistSharedUnread({}, [slot])
-  return undefined
-}
-/** This window's manual reminders, per-tab (sessionStorage): a deliberate
- *  mark-as-unread answers only to the window that made it, so a shared key
- *  would clobber siblings' reminder sets. */
-const persistManualSentinels = (unreadSince: Record<string, string>): void => {
-  const manual = Object.fromEntries(Object.entries(unreadSince).filter(([, v]) => v === MANUAL_UNREAD))
-  safeSetSessionItem('mc-unread-since', JSON.stringify(manual))
-}
-/** Boot restore for unreadSince (exported for tests): message watermarks
- *  from the ONE shared record, joined with this window's per-tab manual
- *  sentinels. A ''-entry is a badge no watermark guards — it restores the
- *  badge (restoreUnreadBadges below) but records no watermark, so any
- *  relayed read clears it. An ABSENT record beside a legacy
- *  'mc-unread-slots' list means older code persisted badges before the
- *  record existed: each seeds once as '' so no badge is lost on upgrade.
- *  Sentinels: no other window's read may clear the deliberate reminder,
- *  and neither reload nor the shared record may demote it — the sentinel
- *  wins a key collision, and restoreUnreadBadges() re-seeds its badge
- *  without writing shared state. */
-export const restoreUnreadSince = (): Record<string, string> => {
-  try {
-    const raw = localStorage.getItem('mc-unread-shared')
-    let record: Record<string, string>
-    try { record = JSON.parse(raw ?? '{}') as Record<string, string> } catch { record = {} }
-    if (raw === null) {
-      let legacy: string[]
-      try { legacy = JSON.parse(localStorage.getItem('mc-unread-slots') ?? '[]') as string[] } catch { legacy = [] }
-      for (const k of legacy) record[k] = ''
-      if (legacy.length > 0) safeSetItem('mc-unread-shared', JSON.stringify(record))
-    }
-    const since: Record<string, string> = {}
-    for (const [k, v] of Object.entries(record)) if (v !== '') since[k] = v
-    let manual: Record<string, string>
-    try { manual = JSON.parse(sessionStorage.getItem('mc-unread-since') ?? '{}') as Record<string, string> } catch { manual = {} }
-    for (const [k, v] of Object.entries(manual)) if (v === MANUAL_UNREAD) since[k] = MANUAL_UNREAD
-    return since
-  } catch { return {} }
-}
-/** Boot restore for unreadSlots: every key of the shared record (badge
- *  presence IS record membership), plus this window's manual reminders —
- *  the reminder answers only to this window, so its badge comes back here
- *  without writing shared state. */
-export const restoreUnreadBadges = (since: Record<string, string>): string[] => {
-  let badges: string[]
-  try { badges = Object.keys(JSON.parse(localStorage.getItem('mc-unread-shared') ?? '{}') as Record<string, string>) } catch { badges = [] }
-  for (const [k, v] of Object.entries(since)) {
-    if (v === MANUAL_UNREAD && !badges.includes(k)) badges.push(k)
-  }
-  return badges
-}
-// When running embedded inside the Instances hub (an iframe), relay unread-count
-// changes to the parent so it can badge this instance's switcher chip (§5.3).
-// Only the count (a non-secret number) is sent; the parent validates event.origin
-// against its known tunnel origins before trusting it (§5.4). Posting to the
-// referrer's origin (the hub) when known, else '*', avoids broadcasting widely.
-const _relayUnreadToParent = (slotsJson: string): void => {
-  try {
-    if (typeof window === 'undefined' || window.parent === window) return
-    const count = (JSON.parse(slotsJson) as string[]).length
-    let target = '*'
-    try { if (document.referrer) target = new URL(document.referrer).origin } catch { /* keep '*' */ }
-    window.parent.postMessage({ source: 'kirocrew', type: 'mc-unread-slots', count }, target)
-  } catch { /* never let the relay break a state update */ }
-}
+export { MANUAL_UNREAD, restoreUnreadBadges, restoreUnreadSince } from './dashboard/unread'
 const safeSet = (key: string, value: string) => {
   try { safeSetItem(key, value) } catch { /* QuotaExceededError / SecurityError */ }
   if (key === 'mc-unread-slots') _relayUnreadToParent(value)
@@ -282,19 +229,33 @@ const initialState: DashboardState = {
   connected: false,
   slots: [],
   slotsGeneration: 0,
+  pinOrderRev: 0,
+  pendingPinOrder: null,
+  pinOrderError: '',
+  manualOrderRev: 0,
+  pendingManualOrder: null,
+  manualOrderError: '',
   slotPinGenerations: {},
+  slotMuteFlagError: {},
   closingSlots: {},
+  durablyRemoved: {},
   slotFetchesInFlight: [],
   staleSlotFetches: {},
   slotWriteSeq: 0,
   slotWrittenAt: {},
+  slotMemberAt: {},
   slotFetchWriteMark: {},
   sidebarOrder: [],
   approvalMode: 'normal',
   channelTrusted: false,
   refreshTrigger: 0,
   ...(() => { const since = restoreUnreadSince(); return { unreadSlots: restoreUnreadBadges(since), unreadSince: since } })(),
+  unreadDrainHeld: true,
+  slotsListPartial: false,
+  slotsHeldKeys: [],
+  slotsHoldChannels: false,
   slotsLoaded: false,
+  slotsFetchFailed: false,
   updateProgress: null,
   desktopUpdateAvailable: false,
   subagentRunning: {},
@@ -323,8 +284,18 @@ export const changeApprovalMode = createAsyncThunk<
   { rejectValue: { code: string; message: string } }
 >(
   'dashboard/changeApprovalMode',
-  async ({ mode, slot }, { rejectWithValue }) => {
+  async ({ mode, slot }, { rejectWithValue, getState }) => {
     try {
+      // YOLO is one app-wide setting, and the gateway keeps it on when ONE slot
+      // asks for `trust` / `trust_reads` (an automation setting up a new session
+      // must not end the operator's YOLO). So a person moving this chat from
+      // YOLO to Trust or Reads would see YOLO come back on the next status
+      // frame. Send `normal` first: it is the documented way to turn YOLO off,
+      // and the chosen mode is then applied to this slot alone.
+      const current = (getState() as { dashboard?: DashboardState }).dashboard?.approvalMode
+      if (current === 'yolo' && slot && (mode === 'trust' || mode === 'trust_reads')) {
+        await api.chatMode('normal', slot)
+      }
       await api.chatMode(mode, slot)
     } catch (e) {
       const body = e instanceof ApiError ? e.body : ''
@@ -355,28 +326,27 @@ export const changeApprovalMode = createAsyncThunk<
  *  through here, so the two cannot drift apart the way the eviction lists this
  *  PR unified once did. `unreadSlots` is written back only when it actually
  *  shrank, since the live-frame writer runs on every slots frame. */
-const reconcileSlots = (state: DashboardState, liveKeys: Set<string>, evictStale = true): void => {
+const reconcileSlots = (
+  state: DashboardState,
+  liveKeys: Set<string>,
+  evictStale = true,
+  unreadDrainHeld = state.unreadDrainHeld,
+  heldKeys = state.slotsHeldKeys,
+  holdChannels = state.slotsHoldChannels,
+): void => {
   // `countUnreadByMode` deliberately keeps orphan unread keys contributing to
   // the badge, on the premise that a reconcile drains them shortly. Draining on
   // both writers is what keeps that premise true. Always run: a wrongly drained
   // badge self-heals on the next unread event, and the refetch is the documented
   // route by which a remotely deleted slot's badge is cleared.
-  const unread = state.unreadSlots ?? []
-  const drained = unread.filter(k => liveKeys.has(k))
-  if (drained.length !== unread.length) {
-    // unreadSince tolerates partial preloaded test state, like `?? []` above.
-    if (state.unreadSince) {
-      let droppedManual = false
-      for (const k of unread) if (!liveKeys.has(k)) {
-        if (state.unreadSince[k] === MANUAL_UNREAD) droppedManual = true
-        delete state.unreadSince[k]
-      }
-      if (droppedManual) persistManualSentinels(state.unreadSince)
-    }
-    state.unreadSlots = drained
-    persistSharedUnread({}, unread.filter(k => !liveKeys.has(k)))
-    _relayUnreadToParent(JSON.stringify(state.unreadSlots))
-  }
+  //
+  // The one exception is a list the gateway labelled partial (`unreadDrainHeld`):
+  // a session it has not restored yet is absent from that list without having
+  // been deleted, and a drain here would be the lossy direction. The hold covers
+  // a GET reply too, since it goes through this same path. Deferring the drain
+  // is safe: the next complete list drains whatever is genuinely gone.
+  const holds = slotListHoldTest({ partial: unreadDrainHeld, heldKeys: heldKeys ?? [], holdChannels })
+  drainUnreadKeys(state, new Set((state.unreadSlots ?? []).filter(key => !liveKeys.has(key) && !holds(key))))
   // Eviction is NOT recoverable, so it is skipped when the caller cannot vouch
   // for the list's freshness: an HTTP reply in flight can be older than the live
   // frames that arrived while it travelled, and would then delete a slot the
@@ -391,6 +361,9 @@ const reconcileSlots = (state: DashboardState, liveKeys: Set<string>, evictStale
   // reply that merely predates a newly created slot cannot strip its protection.
   for (const stamped of Object.keys(state.slotWrittenAt ?? {})) {
     if (!liveKeys.has(slotKeyOfStamp(stamped))) delete state.slotWrittenAt[stamped]
+  }
+  for (const stamped of Object.keys(state.slotMemberAt ?? {})) {
+    if (!liveKeys.has(slotKeyOfStamp(stamped))) delete state.slotMemberAt[stamped]
   }
 }
 
@@ -448,7 +421,20 @@ const evictSlotSubagents = (state: DashboardState, slotKey: string): void => {
  *  older than the live frames that arrived while it travelled (see
  *  `fetchSlots.fulfilled`), so a post-pop frame that omitted the key could
  *  release the hold and a pre-pop reply still in flight would then re-add the
- *  row. The tombstone is instead retired by the close's OWN lifecycle: while
+ *  row. One narrow exception follows a 404 DELETE: that attempt knows another
+ *  close popped the key and waits for the other close's outcome. An unpaired
+ *  WebSocket list can still predate the pop, so the awaiting hold first spends
+ *  `CLOSE_CONFIRMED_GRACE_FRAMES`; after that, membership releases it. A
+ *  post-404 HTTP reply may release it immediately because every fetch already
+ *  in flight at the 404 is paired and filtered first. A durable `removed` patch
+ *  confirms the hold instead. An awaiting hold that sees neither `removed` nor
+ *  a list including the key expires on `CLOSE_IN_FLIGHT_MAX_MS` (evaluated by
+ *  the next list, and by a timer `deleteSlot` arms so an idle tab that receives
+ *  no list still reaches it), and the key's entry then degrades to `main`'s
+ *  behaviour: the hold is dropped, the next list applies membership, and the
+ *  URL writer pushes over the entry rather than rewriting it.
+ *
+ *  Every other tombstone is retired by the close's OWN lifecycle: while
  *  the DELETE is in flight it holds unconditionally, and once the server has
  *  answered it survives a small, fixed budget of further authoritative lists
  *  (listing the key or not — a straggler can only be that far behind) and then
@@ -531,10 +517,24 @@ const staleKeysForSlotFetch = (state: DashboardState, requestId: string): Set<st
  *  belt-and-braces; the second call is a no-op. */
 const confirmHold = (state: DashboardState, key: string, requestId: string): void => {
   const hold = isUnsafeKey(key) ? undefined : state.closingSlots?.[key]
-  if (!hold || hold.requestId !== requestId || hold.inFlightUntil === null) return
+  if (!hold || hold.requestId !== requestId || hold.inFlightUntil === null || hold.awaitingOutcome) return
   hold.inFlightUntil = null
   hold.awaitingFetches = [...(state.slotFetchesInFlight ?? [])]
   hold.confirmedUntil = Date.now() + CLOSE_CONFIRMED_MAX_MS
+}
+/** Arm a tombstone directly in its confirmed phase for a removal the server
+ *  already acknowledged. Pre-removal fetches remain paired with the hold so
+ *  their replies cannot restore the closed row. */
+const armConfirmedHold = (state: DashboardState, key: string): void => {
+  if (isUnsafeKey(key)) return
+  if (!state.closingSlots) state.closingSlots = {}
+  state.closingSlots[key] = {
+    requestId: 'confirmed',
+    inFlightUntil: null,
+    graceFrames: CLOSE_CONFIRMED_GRACE_FRAMES,
+    awaitingFetches: [...(state.slotFetchesInFlight ?? [])],
+    confirmedUntil: Date.now() + CLOSE_CONFIRMED_MAX_MS,
+  }
 }
 /** A `fetchSlots` request settled: no confirmed hold need wait for it any more.
  *  Runs AFTER that reply's own `applySlots`, so the reply itself is still held. */
@@ -563,6 +563,11 @@ const settleSlotFetch = (state: DashboardState, requestId: string | undefined): 
 const stampKey = (slotKey: string): string => `k:${slotKey}`
 /** Inverse of `stampKey`, for the two places that read the record back. */
 const slotKeyOfStamp = (stamped: string): string => stamped.slice(2)
+/** The `slotWriteSeq` value of `slotKey`'s last single-slot write, or 0. A
+ *  caller compares it with `slotWriteSeq` read earlier to learn whether some
+ *  writer touched the row since. */
+export const slotWriteStampOf = (state: DashboardState, slotKey: string): number =>
+  state.slotWrittenAt?.[stampKey(slotKey)] ?? 0
 
 /** Record that `key`'s row was just written by a single-slot writer.
  *
@@ -576,9 +581,135 @@ const stampSlotWrite = (state: DashboardState, key: string): void => {
   state.slotWrittenAt[stampKey(key)] = seq
 }
 
+/** Record that `key` was just ADDED to membership (a create / resume / fork /
+ *  companion-open). Bumps the counter and stamps ONLY `slotMemberAt`, so a
+ *  reply that OMITS the key re-adds it (issue #14831) rather than dropping it.
+ *
+ *  Deliberately NOT a content stamp: membership says the key EXISTS, not that
+ *  this tab's optimistic row is newer than the server's. A reply that genuinely
+ *  LISTS the key carries the full server row (`mode`/`surface`/`color_index`/
+ *  `project`/…), and stamping `slotWrittenAt` here would send that reply down
+ *  the substitution branch and keep the thinner optimistic row instead. The
+ *  create site adds its own content stamp, because its payload alone carries
+ *  locally-applied fields the server has not confirmed. */
+const stampSlotMember = (state: DashboardState, key: string): void => {
+  state.slotWriteSeq = (state.slotWriteSeq ?? 0) + 1
+  if (!state.slotMemberAt) state.slotMemberAt = {}
+  state.slotMemberAt[stampKey(key)] = state.slotWriteSeq
+  if (!state.slotMemberUnlisted) state.slotMemberUnlisted = {}
+  state.slotMemberUnlisted[stampKey(key)] = { seq: state.slotWriteSeq, at: Date.now(), verifying: false }
+}
+
+/** An entry of `slotMemberUnlisted`. `verifying` is set once a `fetchSlots`
+ *  has been asked for, so a run of stale frames sends one request, not one
+ *  per frame. */
+export interface UnlistedMember { seq: number; at: number; verifying: boolean }
+
+/** How long a membership add may outlive full frames that omit it while no
+ *  `fetchSlots` answer arrives (the request failed or never settled). Past it,
+ *  the frame wins, as it did before the add was tracked. */
+const UNLISTED_MEMBER_MAX_MS = 15_000
+
+/** The rows a full `slots` frame should be applied as, given the membership
+ *  adds no frame has listed yet.
+ *
+ *  A frame the gateway serialized before a create or fork can reach the tab
+ *  after the op's HTTP response. It omits the new key, and applying it as a
+ *  whole-list replace would drop the row the tab just opened; the chat page
+ *  then clears the active session and reopens the remembered one. So a key
+ *  still in `slotMemberUnlisted` is kept, with its live row appended after the
+ *  frame's rows, and a `fetchSlots` is requested. That fetch is dispatched
+ *  after the add, so its reply is serialized after the server registered the
+ *  key: a reply that omits it means the chat was deleted elsewhere, and ends
+ *  the entry (`settleUnlistedMembers`). Such a chat is shown for at most one
+ *  GET round trip after the frame that omitted it.
+ *
+ *  A frame or reply that lists the key does not end the entry: an older
+ *  frame can still be in flight behind it, on the socket or against the HTTP
+ *  reply. The entry runs out on its time cap instead. */
+const retainUnlistedMembers = (state: DashboardState, rows: ChatSlot[]): ChatSlot[] => {
+  const unlisted = state.slotMemberUnlisted
+  if (!unlisted) return rows
+  const stampedKeys = Object.keys(unlisted)
+  if (!stampedKeys.length) return rows
+  const listed = new Set(rows.map(s => s.key))
+  const now = Date.now()
+  let kept: ChatSlot[] | null = null
+  for (const stamped of stampedKeys) {
+    const key = slotKeyOfStamp(stamped)
+    const entry = unlisted[stamped]
+    const live = (state.slots ?? []).find(s => s.key === key) // row-read: membership carry-over, the live row is kept unchanged
+    if (!live || state.closingSlots?.[key] || now - entry.at > UNLISTED_MEMBER_MAX_MS) {
+      delete unlisted[stamped]
+      continue
+    }
+    if (listed.has(key)) continue
+    if (!kept) kept = [...rows]
+    kept.push(live)
+    if (!entry.verifying) {
+      entry.verifying = true
+      state.slotMemberReadWanted = true
+    }
+  }
+  return kept ?? rows
+}
+
+/** A `fetchSlots` request settled. Its reply was serialized after every add
+ *  stamped at or below its mark, so for those keys it is the answer
+ *  `retainUnlistedMembers` waited for: their entries end, and the reply's own
+ *  list decides whether the row stays. A failed request (`listed` null)
+ *  answers nothing, so it only re-arms the request for the next omitting
+ *  frame. Runs before `settleSlotFetch`, which drops the mark. */
+const settleUnlistedMembers = (state: DashboardState, requestId: string | undefined, listed: Set<string> | null): void => {
+  const unlisted = state.slotMemberUnlisted
+  const mark = requestId === undefined ? undefined : state.slotFetchWriteMark?.[requestId]?.writeSeq
+  if (!unlisted || mark === undefined) return
+  for (const stamped of Object.keys(unlisted)) {
+    if (unlisted[stamped].seq > mark) continue
+    // A failed read, or one that lists the key, settles nothing about frames
+    // still in flight on the socket: the entry stays, and the next frame that
+    // omits the key asks again.
+    if (!listed || listed.has(slotKeyOfStamp(stamped))) { unlisted[stamped].verifying = false; continue }
+    delete unlisted[stamped]
+    // A reply newer than the add that omits the key is the server saying it
+    // is gone. Drop the membership stamp too, so a reply sent before the add
+    // and still in flight cannot re-add it through `membersOutranking`.
+    delete state.slotMemberAt?.[stamped]
+  }
+}
+
+/** Whether a full frame omits a key `slotMemberUnlisted` still tracks. The
+ *  frame handler must then run `sseSlots` even for a byte-identical repeat:
+ *  that run is what applies the time cap and, after a failed read, asks for
+ *  the read again. Skipping it would keep the row with no end. */
+export const omitsUnlistedMember = (dashboard: DashboardState, rows: unknown): boolean => {
+  const unlisted = dashboard.slotMemberUnlisted
+  if (!unlisted || !Array.isArray(rows)) return false
+  const stamped = Object.keys(unlisted)
+  if (!stamped.length) return false
+  const listed = new Set((rows as ChatSlot[]).map(s => s.key))
+  return stamped.some(k => !listed.has(slotKeyOfStamp(k)))
+}
+
+/** Send the `fetchSlots` that `sseSlots` asked for when it kept a session a
+ *  stale frame omitted (see `retainUnlistedMembers`). Dispatched by the frame
+ *  handler right after `sseSlots`. */
+export const readUnlistedMembers = () =>
+  (dispatch: (action: ReturnType<typeof fetchSlots>) => unknown, getState: () => { dashboard: DashboardState }): void => {
+    if (getState().dashboard.slotMemberReadWanted) dispatch(fetchSlots())
+  }
+
 /** A single-slot mutation. Returning `false` means the writer's own guard
  *  declined and the row was left alone, so no write is stamped. */
 type RowPatch = (slot: ChatSlot) => boolean | void
+
+/** Payload of the `slot_patch` WebSocket frame (see `sseSlotPatch`). */
+export interface SlotPatchFrame {
+  /** Partial rows: `key` plus the fields that changed. */
+  slots?: Array<Partial<ChatSlot> & { key: string }>
+  /** Keys that left the server's registry. */
+  removed?: string[]
+}
 
 /** THE way a reducer changes a field of an EXISTING row of `state.slots`.
  *
@@ -593,10 +724,21 @@ type RowPatch = (slot: ChatSlot) => boolean | void
  *  build if a reducer reaches a row any other way without saying, on the line,
  *  that its lookup is read-only.
  *
- *  Deliberately NOT applied to membership changes (`addSlotOptimistic`,
- *  `removeSlotOptimistic`): the reply's own membership is reconciled by the
- *  close-tombstone machinery and by `applySlots`, and those two are already
- *  ordered against each other. This guards row CONTENT. */
+ *  This guards row CONTENT. A membership ADD (`addSlotOptimistic`,
+ *  `createSlot.fulfilled`) carries its own narrower stamp through
+ *  `stampSlotMember`, which is what lets a `fetchSlots` reply RE-ADD a key it
+ *  omits; a content stamp from here never does, so a rename cannot resurrect a
+ *  row another client deleted mid-flight. A removal (`removeSlotOptimistic`) is
+ *  reconciled by the close-tombstone machinery and by `applySlots`, which are
+ *  already ordered against each other, and so needs no stamp here. */
+/** A slot row's value for `field`, as a `slot_patch` row would state it. A full
+ *  frame omits `lineage_pending` when it is false, while a patch states it either
+ *  way, because a patch that omitted it could never clear a pending row. So an
+ *  absent flag reads as `false` here, and a patch saying `false` to a row that
+ *  never carried the flag is no write at all. */
+const slotPatchCurrent = (slot: Record<string, unknown>, field: string): unknown =>
+  field === 'lineage_pending' ? (slot[field] ?? false) : slot[field]
+
 const patchSlotRow = (state: DashboardState, key: string, patch: RowPatch): void => {
   const slot = (state.slots ?? []).find(s => s.key === key) // row-write: via patchSlotRow
   if (!slot) return
@@ -630,7 +772,7 @@ const patchSlotRowsWhere = (state: DashboardState, patch: RowPatch): void => {
 const localWritesOutranking = (state: DashboardState, requestId: string | undefined): Set<string> => {
   const outranked = new Set<string>()
   if (requestId === undefined) return outranked
-  const mark = state.slotFetchWriteMark?.[requestId]
+  const mark = state.slotFetchWriteMark?.[requestId]?.writeSeq
   if (mark === undefined) return outranked
   const writtenAt = state.slotWrittenAt ?? {}
   for (const stamped of Object.keys(writtenAt)) {
@@ -639,7 +781,99 @@ const localWritesOutranking = (state: DashboardState, requestId: string | undefi
   return outranked
 }
 
-const applySlots = (state: DashboardState, incomingRows: ChatSlot[]): void => {
+/** Keys MEMBERSHIP-added after `requestId` was dispatched, read from
+ *  `slotMemberAt` the same way `localWritesOutranking` reads `slotWrittenAt`.
+ *  These are the only keys a `fetchSlots` reply may RE-ADD when it omits them:
+ *  the add is a create / resume / fork / companion-open the server confirmed,
+ *  so a reply serialized before it is simply too old to list it. A content
+ *  write stamps `slotWrittenAt` but NOT this record, so it can keep its own
+ *  on-screen row (substitution) yet can never resurrect a key the reply
+ *  dropped — the row may have been deleted by another client in the same window
+ *  (GPT F1).
+ *
+ *  A reply dispatched AFTER the add carries a mark at or above the stamp, so
+ *  `memberAt > mark` is false and it cannot re-add the key: the re-add is bounded
+ *  to replies that predate the add, with no explicit consumption step. */
+const membersOutranking = (state: DashboardState, requestId: string | undefined): Set<string> => {
+  const added = new Set<string>()
+  if (requestId === undefined) return added
+  const mark = state.slotFetchWriteMark?.[requestId]?.writeSeq
+  if (mark === undefined) return added
+  const memberAt = state.slotMemberAt ?? {}
+  for (const stamped of Object.keys(memberAt)) {
+    if (memberAt[stamped] > mark) added.add(slotKeyOfStamp(stamped))
+  }
+  return added
+}
+
+/** The gateway orders a slot row carries a place in: the place field, the
+ *  revision field beside it, and the state field holding the highest revision
+ *  whose places the rows hold. */
+const ORDER_GATES = [
+  { rank: 'pin_rank', rev: 'pin_rev', applied: 'pinOrderRev' },
+  { rank: 'manual_rank', rev: 'manual_rev', applied: 'manualOrderRev' },
+] as const
+type OrderGate = typeof ORDER_GATES[number]
+
+/** *rows* with one order's revision folded into its state field. The revision
+ *  is not kept on the rows (every row would change on every reorder). Rows
+ *  from a list older than the places already applied keep the places they
+ *  have. A list with no revision (a scoped stream) passes as is. */
+const gateOrder = (state: DashboardState, rows: ChatSlot[], gate: OrderGate): ChatSlot[] => {
+  let rev = -1
+  for (const row of rows) {
+    const value = row[gate.rev]
+    if (typeof value === 'number' && value > rev) rev = value
+  }
+  if (rev < 0) return rows
+  const stale = rev < (state[gate.applied] ?? 0)
+  if (!stale) state[gate.applied] = rev
+  const current = stale ? new Map((state.slots ?? []).map(s => [s.key, s])) : null
+  return rows.map(row => {
+    const { [gate.rev]: _rev, ...rest } = row
+    const existing = current?.get(row.key)
+    return existing ? { ...rest, [gate.rank]: existing[gate.rank] ?? null } : rest
+  })
+}
+
+/** Paint one order onto the rows. A bare list is the person's own gesture,
+ *  shown before the gateway answers; `{order, rev}` is the gateway's answer,
+ *  applied only if no newer revision of that order has landed since. A row
+ *  `placed` rejects holds no place in it. */
+const paintOrder = (
+  state: DashboardState,
+  payload: string[] | { order: string[]; rev: number },
+  gate: OrderGate,
+  placed: (slot: ChatSlot) => boolean,
+): void => {
+  let order: string[]
+  if (Array.isArray(payload)) order = payload
+  else {
+    if (payload.rev < (state[gate.applied] ?? 0)) return
+    state[gate.applied] = payload.rev
+    order = payload.order
+  }
+  const rank = new Map(order.map((key, index) => [key, index]))
+  patchSlotRowsWhere(state, slot => {
+    const next = placed(slot) ? (rank.get(slot.key) ?? null) : null
+    if ((slot[gate.rank] ?? null) === next) return false
+    slot[gate.rank] = next
+  })
+}
+
+/** *rows* gated by every order's revision (see `gateOrder`). */
+const gatePinOrder = (state: DashboardState, rows: ChatSlot[]): ChatSlot[] =>
+  ORDER_GATES.reduce((gated, gate) => gateOrder(state, gated, gate), rows)
+
+const applySlots = (state: DashboardState, rawRows: ChatSlot[]): void => {
+  const incomingRows = gatePinOrder(state, rawRows)
+  // `durablyRemoved` is the durable fast path for browser-history rewrites: a
+  // full list naming the key proves it is live again and clears that evidence.
+  // This does not change slot-list visibility; the hold and frame budget below
+  // still decide whether the named row is shown in this application.
+  for (const { key } of incomingRows) {
+    if (!isUnsafeKey(key)) delete state.durablyRemoved?.[key]
+  }
   let next = incomingRows
   const closing = state.closingSlots ?? {}
   const closingKeys = Object.keys(closing)
@@ -649,7 +883,23 @@ const applySlots = (state: DashboardState, incomingRows: ChatSlot[]): void => {
     for (const key of closingKeys) {
       const hold = closing[key]
       if (hold.inFlightUntil !== null) {
-        if (now < hold.inFlightUntil) { held.add(key); continue }
+        if (now < hold.inFlightUntil) {
+          if (hold.awaitingOutcome) {
+            if (hold.graceFrames > 0) {
+              hold.graceFrames -= 1
+              held.add(key)
+              continue
+            }
+            if (incomingRows.some(s => s.key === key)) {
+              // The straggler budget is spent, so membership now means the
+              // competing close restored the slot or a same-key session exists.
+              delete closing[key]
+              continue
+            }
+          }
+          held.add(key)
+          continue
+        }
         // Stalled past the cap: stop hiding a session nobody has confirmed gone.
         delete closing[key]
         continue
@@ -697,7 +947,11 @@ const applySlots = (state: DashboardState, incomingRows: ChatSlot[]): void => {
     if (reused !== prev[i]) changed = true
     return reused
   })
-  if (changed) state.slots = merged
+  if (changed) {
+    state.slots = merged
+    // A listed slot can turn a held orphan back into a counted session.
+    relayUnreadIfHolding(state)
+  }
 }
 
 const dashboardSlice = createSlice({
@@ -754,9 +1008,57 @@ const dashboardSlice = createSlice({
       state.savedYoloDuration = action.payload
       if (state.status) state.status.yolo_duration = action.payload
     },
-    sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
-    sseDisconnected(state) { state.connected = false },
+    sseConnected(state) {
+      const hadUnreadRelayHold = hasUnreadRelayHold(state)
+      state.connected = true
+      state.slotsLoaded = false
+      state.unreadDrainHeld = true
+      state.slotsListPartial = false
+      state.slotsHeldKeys = []
+      state.slotsHoldChannels = false
+      state.subagentRunning = {}
+      state.subagentDetails = {}
+      state.subagentText = {}
+      relayUnreadIfHolding(state, hadUnreadRelayHold)
+    },
+    sseDisconnected(state) { state.connected = false; state.unreadDrainHeld = true },
+    /** The `slotsPartial` label on a `slots` frame (see `unreadDrainHeld`).
+     *  Dispatched for every frame, before its list: an absent field is an
+     *  older gateway and reads as complete. */
+    sseSlotsPartial(state, action: PayloadAction<boolean>) {
+      state.unreadDrainHeld = action.payload
+      if (state.slotsListPartial === action.payload) return
+      state.slotsListPartial = action.payload
+      _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
+    },
+    sseSlotListHolds(
+      state,
+      action: PayloadAction<{ heldKeys: string[]; holdChannels: boolean }>,
+    ) {
+      // Assigned only on a real change: this runs for every slots frame, and a
+      // fresh array each time would break the unread-count selectors' memo.
+      const { heldKeys, holdChannels } = action.payload
+      const current = state.slotsHeldKeys ?? []
+      const keysChanged = heldKeys.length !== current.length || heldKeys.some((key, i) => key !== current[i])
+      if (!keysChanged && holdChannels === state.slotsHoldChannels) return
+      if (keysChanged) state.slotsHeldKeys = heldKeys
+      state.slotsHoldChannels = holdChannels
+      _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
+    },
     sseSlots(state, action: PayloadAction<ChatSlot[]>) {
+      // A frame the gateway labelled complete (`sseSlotsPartial` ran first) is
+      // the authority every GET reply still in flight defers to for its unread
+      // drain, so its key set is recorded on each of them. Recorded before the
+      // empty-frame return below: a complete empty list is exactly the case
+      // where the reply must drain, and that return applies nothing itself.
+      // A frame the socket drops as an exact repeat never reaches here, so the
+      // mark keeps its hold until the next differing frame; that errs toward
+      // keeping a dot.
+      if (!state.unreadDrainHeld) {
+        for (const mark of Object.values(state.slotFetchWriteMark ?? {})) {
+          mark.completeKeys = action.payload.map(s => s.key)
+        }
+      }
       // Read before `slotsLoaded` is set: an empty frame is ambiguous, and this
       // is what disambiguates it. Not yet loaded means a reconnect delivered it
       // before the first real snapshot, so treating it as authoritative would
@@ -767,13 +1069,15 @@ const dashboardSlice = createSlice({
       // the sidebar until restoration finishes, and marking it loaded would
       // claim a snapshot arrived when none has.
       if (action.payload.length === 0 && !state.slotsLoaded) return
-      applySlots(state, action.payload)
+      const rows = retainUnlistedMembers(state, action.payload)
+      applySlots(state, rows)
       state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
       state.slotsLoaded = true
-      reconcileSlots(state, new Set(action.payload.map(s => s.key)))
+      reconcileSlots(state, new Set(rows.map(s => s.key)))
     },
-    // Sidebar → shortcuts order feed (see DashboardState.sidebarOrder). The
-    // dispatch site diff-guards, so every action here is a real order change.
+    // Sidebar → shortcut and close-landing order feed (see
+    // DashboardState.sidebarOrder). The dispatch site diff-guards, so every
+    // action here is a real order change.
     setSidebarOrder(state, action: PayloadAction<string[]>) { state.sidebarOrder = action.payload },
     // Live TODO-list delta. Patched into the SAME slots array that sseSlots
     // populates rather than a parallel map, so the mid-turn push and the
@@ -795,7 +1099,7 @@ const dashboardSlice = createSlice({
     },
     // Bump a slot's recency timestamps on live message activity so the sidebar
     // re-ranks immediately off the finer-grained chat_message stream (vs waiting
-    // for the next full sseSlots push). `last_ts` is the last message of any role,
+    // for the next full sseSlots push). `last_ts` is the last saved message of any role,
     // so it moves for agent output too. `last_turn_ts` — the key the list is
     // ORDERED by — moves only when `settled` is set (an inbound prompt), because a
     // list that re-ranks on every streamed tool call swaps rows under the pointer
@@ -813,8 +1117,19 @@ const dashboardSlice = createSlice({
       patchSlotRow(state, key, slot => {
         const t = Date.parse(ts)
         let moved = false
-        if (!slot.last_ts || Date.parse(slot.last_ts) <= t) { slot.last_ts = ts; moved = true }
+        const lastTsMoved = !slot.last_ts || Date.parse(slot.last_ts) <= t
+        if (lastTsMoved) { slot.last_ts = ts; moved = true }
         if (settled && (!slot.last_turn_ts || Date.parse(slot.last_turn_ts) <= t)) { slot.last_turn_ts = ts; moved = true }
+        // Advance last_activity_ts only for settled events (user-sent prompts):
+        // unsettled bumps are streamed tool calls on a running session, and
+        // advancing on every one would re-rank running sessions mid-turn in the
+        // session grid — the same problem that last_turn_ts avoids.
+        if (settled && lastTsMoved) {
+          const prevActivity = slot.last_activity_ts ? Date.parse(slot.last_activity_ts) : NaN
+          if (!slot.last_activity_ts || !Number.isFinite(prevActivity) || t > prevActivity) {
+            slot.last_activity_ts = ts
+          }
+        }
         // A bump both guards rejected changed nothing, so it is not a write and
         // must not outrank a reply: stamping it would withhold a server row on
         // the strength of a no-op.
@@ -825,29 +1140,158 @@ const dashboardSlice = createSlice({
     sseSlotTitle(state, action: PayloadAction<{ key: string; title: string }>) {
       patchSlotRow(state, action.payload.key, slot => { slot.title = action.payload.title })
     },
+    /** A `slot_patch` frame: the server's one-row answer to a metadata edit
+     *  (pin, rename, folder move) or a close, sent INSTEAD of the full slot list
+     *  to a socket that declared the capability (see `useWebSocket`).
+     *
+     *  Each `slots` row carries `key` plus only the fields that changed, merged
+     *  through `patchSlotRow` so a `fetchSlots` reply already in flight cannot
+     *  put the older value back. A row for a key this tab does not hold is
+     *  dropped here; the frame handler refetches the list for it.
+     *
+     *  `removed` keys go through `applySlots` as the current list minus those
+     *  keys, the same path a full list takes: close tombstones spend their
+     *  frame budget, untouched rows keep their identity, and `reconcileSlots`
+     *  tears down the departed key's sub-agent and unread state. The fetches in
+     *  flight at that moment are marked stale for the removed key, so their
+     *  replies cannot restore it, while a later WebSocket list that names the
+     *  key again (a same-key replacement) applies as usual. `slotsGeneration` is
+     *  left alone because this is not a full snapshot, and the pin reconciler
+     *  counts only those. */
+    sseSlotPatch(state, action: PayloadAction<SlotPatchFrame>) {
+      const { slots: rows, removed } = action.payload
+      for (const row of rows ?? []) {
+        if (!row || typeof row.key !== 'string') continue
+        const { key, ...fields } = row as typeof row & { pin_rev?: number; manual_rev?: number }
+        for (const gate of ORDER_GATES) {
+          const rev = (fields as Record<string, unknown>)[gate.rev]
+          if (typeof rev !== 'number') continue
+          delete (fields as Record<string, unknown>)[gate.rev]
+          // One row's patch: a rank serialized before an applied write is
+          // dropped; a newer one moves the revision for the full list to follow.
+          if (rev < (state[gate.applied] ?? 0)) delete (fields as Record<string, unknown>)[gate.rank]
+          else state[gate.applied] = rev
+        }
+        patchSlotRow(state, key, slot => {
+          if (Object.keys(fields).every(field => jsonEqual(
+            slotPatchCurrent(slot as unknown as Record<string, unknown>, field),
+            (fields as Record<string, unknown>)[field],
+          ))) return false
+          Object.assign(slot, fields)
+        })
+      }
+      const gone = new Set((removed ?? []).filter(key => !isUnsafeKey(key)))
+      // A removal names a slot the server has durably deleted. Unlike a key
+      // merely absent from a partial list, it is safe to drain during restart
+      // and before the first complete snapshot.
+      drainUnreadKeys(state, gone)
+      if (gone.size && state.slotsLoaded) {
+        for (const key of gone) {
+          if (!isUnsafeKey(key) && !state.closingSlots?.[key]) {
+            markStaleSlotFetches(state, key, [...(state.slotFetchesInFlight ?? [])])
+          }
+        }
+        const remaining = (state.slots ?? []).filter(s => !gone.has(s.key)) // row-read: membership filter, rows are carried over unchanged
+        applySlots(state, remaining)
+        // `remaining` is the local list, which `removeSlotOptimistic` already
+        // holds every in-flight close out of, so it under-states what is live:
+        // a key whose own DELETE has not been answered is still a session on
+        // the server, and this frame says nothing about it. The teardown is not
+        // recoverable (see `reconcileSlots`), so every tombstoned key this frame
+        // did not remove counts as live here; only the keys named in `removed`
+        // are torn down.
+        const live = new Set(remaining.map(s => s.key))
+        for (const key of Object.keys(state.closingSlots ?? {})) if (!gone.has(key)) live.add(key)
+        reconcileSlots(state, live)
+      }
+      // `removed` is durable, so record it even before the first reconnect
+      // snapshot and confirm any awaiting hold. History may trust this at once;
+      // the hold still spends its list budget before the row can reappear.
+      for (const key of removed ?? []) {
+        // A server-confirmed removal ends any retention of the key.
+        delete state.slotMemberUnlisted?.[stampKey(key)]
+        if (isUnsafeKey(key)) continue
+        if (!state.durablyRemoved) state.durablyRemoved = {}
+        state.durablyRemoved[key] = true
+        const hold = state.closingSlots?.[key]
+        if (!hold || hold.inFlightUntil === null) continue
+        hold.inFlightUntil = null
+        hold.awaitingFetches = [...(state.slotFetchesInFlight ?? [])]
+        hold.confirmedUntil = Date.now() + CLOSE_CONFIRMED_MAX_MS
+        delete hold.awaitingOutcome
+      }
+    },
     addSlotOptimistic(state, action: PayloadAction<ChatSlot>) {
       // A resume or fork under a key that was closing supersedes the tombstone:
       // the caller has a fresh server acknowledgement that the key is live.
-      if (!isUnsafeKey(action.payload.key)) delete state.closingSlots?.[action.payload.key]
+      if (!isUnsafeKey(action.payload.key)) {
+        delete state.closingSlots?.[action.payload.key]
+        delete state.durablyRemoved?.[action.payload.key]
+      }
       if (!state.slots.find(s => s.key === action.payload.key)) { // row-read: membership test, adds a row rather than changing one
         state.slots.push(action.payload)
+        relayUnreadIfHolding(state)
       }
+      // Every add site routes through this reducer (resume, fork, companion
+      // chat, Papyrus), so stamping membership here covers them all by
+      // construction: a `fetchSlots` serialized before the add omits the key,
+      // and the stamp lets `membersOutranking` re-add the row the whole-list
+      // replace would drop (issue #14831). Stamped even when the row is already
+      // present — the add still asserts the key is current as of now.
+      stampSlotMember(state, action.payload.key)
     },
     /** Drop a close tombstone (see `applySlots`). `deleteSlot` dispatches this in
      *  its failure path BEFORE the recovery `fetchSlots`, because the thunk's
      *  `rejected` action only fires after a trailing `await navigation` (a peer
      *  transcript load, unbounded), and the refetch reply must not be filtered
-     *  by the very hold the failed close armed. */
-    releaseCloseHold(state, action: PayloadAction<{ key: string; requestId: string }>) {
-      releaseHold(state, action.payload.key, action.payload.requestId)
+     *  by the very hold the failed close armed.
+     *
+     *  `distrustInFlight` is for a DELETE answered 404: the server had already
+     *  popped the key, so a `fetchSlots` still in flight at that answer may
+     *  have been serialized before the pop, and with the hold gone nothing else
+     *  stops its reply re-adding the row. Those requests are paired with the key
+     *  in `staleSlotFetches`, as the `removed` branch of `sseSlotPatch` does,
+     *  before the release; the recovery refetch dispatched after it is not. */
+    releaseCloseHold(state, action: PayloadAction<{ key: string; requestId: string; distrustInFlight?: boolean }>) {
+      const { key, requestId, distrustInFlight } = action.payload
+      if (distrustInFlight && !isUnsafeKey(key)) markStaleSlotFetches(state, key, [...(state.slotFetchesInFlight ?? [])])
+      releaseHold(state, key, requestId)
+    },
+    /** This attempt's DELETE received 404 after another close popped the key.
+     *  Distrust lists already in flight, then wait for that close's outcome. */
+    awaitCloseOutcome(state, action: PayloadAction<{ key: string; requestId: string }>) {
+      const { key, requestId } = action.payload
+      const hold = isUnsafeKey(key) ? undefined : state.closingSlots?.[key]
+      if (!hold || hold.requestId !== requestId || hold.inFlightUntil === null) return
+      hold.awaitingOutcome = true
+      markStaleSlotFetches(state, key, [...(state.slotFetchesInFlight ?? [])])
+    },
+    /** The wall-clock cap on an awaiting hold, reached without a list. `applySlots`
+     *  evaluates `inFlightUntil` only when an authoritative list arrives, and an
+     *  idle main-dashboard tab may receive none, so `deleteSlot` arms a timer for
+     *  the deadline that dispatches this. Drops the hold exactly as the stalled
+     *  branch of `applySlots` would; a confirmed, released, retried or already
+     *  expired hold is left alone, so a late or redundant fire is a no-op. */
+    expireCloseHold(state, action: PayloadAction<{ key: string; requestId: string }>) {
+      const { key, requestId } = action.payload
+      const hold = isUnsafeKey(key) ? undefined : state.closingSlots?.[key]
+      if (!hold || hold.requestId !== requestId || !hold.awaitingOutcome || hold.inFlightUntil === null) return
+      if (Date.now() < hold.inFlightUntil) return
+      delete state.closingSlots[key]
     },
     /** The DELETE resolved: the server has popped the slot. Dispatched by
      *  `deleteSlot` before it awaits the peer navigation (see `confirmHold`). */
     confirmCloseHold(state, action: PayloadAction<{ key: string; requestId: string }>) {
       confirmHold(state, action.payload.key, action.payload.requestId)
     },
+    /** A removal the server already confirmed (no DELETE of ours in flight): arm
+     *  the tombstone straight in its confirmed phase so a pre-pop straggler list cannot re-add the row. */
+    armConfirmedCloseHold(state, action: PayloadAction<string>) {
+      armConfirmedHold(state, action.payload)
+    },
     removeSlotOptimistic(state, action: PayloadAction<string>) {
       state.slots = state.slots.filter(s => s.key !== action.payload)
+      delete state.slotMemberUnlisted?.[stampKey(action.payload)]
       state.unreadSlots = state.unreadSlots.filter(k => k !== action.payload)
       if (state.unreadSince?.[action.payload] !== undefined) {
         const wasManual = state.unreadSince[action.payload] === MANUAL_UNREAD
@@ -855,7 +1299,7 @@ const dashboardSlice = createSlice({
         if (wasManual) persistManualSentinels(state.unreadSince)
       }
       persistSharedUnread({}, [action.payload])
-      _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+      _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
     },
     updateSlot(state, action: PayloadAction<Partial<ChatSlot> & { key: string }>) {
       patchSlotRow(state, action.payload.key, slot => { Object.assign(slot, action.payload) })
@@ -869,7 +1313,7 @@ const dashboardSlice = createSlice({
     // is keyed by URL and may touch any slot that links that PR.
     patchSlotSourceLinks(
       state,
-      action: PayloadAction<{ url: string; state?: NonNullable<ChatSlot['source_links']>[number]['state']; ci?: NonNullable<ChatSlot['source_links']>[number]['ci'] }>,
+      action: PayloadAction<{ url: string; state?: NonNullable<ChatSlot['source_links']>[number]['state']; ci?: NonNullable<ChatSlot['source_links']>[number]['ci']; ciPending?: string }>,
     ) {
       const { url } = action.payload
       if (!url) return
@@ -879,7 +1323,14 @@ const dashboardSlice = createSlice({
         for (const link of slot.source_links) {
           if (link.url !== url) continue
           if (action.payload.state !== undefined) { link.state = action.payload.state; touched = true }
-          if (action.payload.ci !== undefined) { link.ci = action.payload.ci; touched = true }
+          if (action.payload.ci !== undefined) {
+            link.ci = action.payload.ci
+            // The marker describes the same rollup as `ci`, so a delta that
+            // carries `ci` without it means nothing is still running.
+            if (action.payload.ciPending) link.ciPending = action.payload.ciPending
+            else delete link.ciPending
+            touched = true
+          }
         }
         // A row that links no matching URL was not written, so it is not stamped
         // — otherwise one delta would outrank a reply for every slot on screen.
@@ -929,6 +1380,41 @@ const dashboardSlice = createSlice({
         Object.assign(row, action.payload.patch)
       })
     },
+    /**
+     * Drop the link rows that describe ONE binding from a slot, in place. The
+     * write counterpart of `patchSlotLink` for an unlink: the binding is gone
+     * server-side, so the rows that described it go too, and nothing else in
+     * `links` is rebuilt (a whole-array rewrite from a captured snapshot is what
+     * made two concurrent toggles unsafe). An `origin` row stays: the conversation
+     * a session was born in is not a binding an unlink can sever.
+     *
+     * Keyed on the `binding` the completed request named, never on the channel
+     * alone: between the click and the response another tab can unlink A and
+     * link B on the same channel, and the slots push for B can land here first.
+     * The server deleted exactly A (it refuses anything else with 409), so this
+     * removes exactly A's rows — a B row, same channel, different token, stays,
+     * and the tab does not read as disconnected from a binding the server still
+     * holds. The slot's `slack_*` fields describe the Slack THREAD row, so they
+     * clear in the same write as that row and only then: a Slack row that
+     * survives the compare keeps its fields.
+     */
+    dropSlotLinks(state, action: PayloadAction<{ key: string; channel: string; binding: string }>) {
+      patchSlotRow(state, action.payload.key, slot => {
+        if (!slot.links) return false
+        const before = slot.links.length
+        slot.links = slot.links.filter(candidate => !(
+          candidate.channel === action.payload.channel
+          && candidate.direction !== 'origin'
+          && candidate.binding === action.payload.binding
+        ))
+        if (slot.links.length === before) return false
+        if (action.payload.channel === 'slack') {
+          slot.slack_linked = false
+          slot.slack_channel = undefined
+          slot.slack_thread_ts = undefined
+        }
+      })
+    },
     updateSlotFolder(state, action: PayloadAction<{ key: string; folderId: string }>) {
       patchSlotRow(state, action.payload.key, slot => { slot.folder_id = action.payload.folderId || undefined })
     },
@@ -939,6 +1425,43 @@ const dashboardSlice = createSlice({
         state.slotPinGenerations[action.payload.key] = (state.slotPinGenerations[action.payload.key] ?? 0) + 1
       })
     },
+    /** Optimistic toggle of a user-owned mute flag: the "mute sessions it
+     *  opens" rule (`mutes_opened`) or the per-row mute (`muted`). Unlike pin
+     *  neither bears on sidebar ordering, so they need none of the pin
+     *  batch/order machinery -- just flip the row and let the authoritative
+     *  `slot_patch` frame reconcile. */
+    updateSlotMuteFlag(state, action: PayloadAction<{ key: string; flag: MuteFlag; value: boolean }>) {
+      const { key, flag, value } = action.payload
+      patchSlotRow(state, key, slot => {
+        slot[flag] = value
+      })
+      // A fresh attempt supersedes any prior failure for this flag on this row;
+      // onError re-sets it if this one also fails.
+      if (state.slotMuteFlagError) delete state.slotMuteFlagError[muteFlagErrorKey(flag, key)]
+    },
+    /** Record a mute toggle failure so the kebab menu can render it through
+     *  ErrorNotice. Set after the optimistic flip has been rolled back. */
+    setSlotMuteFlagError(state, action: PayloadAction<{ key: string; flag: MuteFlag; message: string }>) {
+      state.slotMuteFlagError ??= {}  // partial preloaded state
+      state.slotMuteFlagError[muteFlagErrorKey(action.payload.flag, action.payload.key)] = action.payload.message
+    },
+    /** Paint a pinned order. A bare list is the person's own gesture, shown
+     *  before the gateway answers; `{order, rev}` is the gateway's answer,
+     *  applied only if no newer revision has landed since. */
+    setPinRanks(state, action: PayloadAction<string[] | { order: string[]; rev: number }>) {
+      paintOrder(state, action.payload, ORDER_GATES[0], slot => !!slot.pinned)
+    },
+    setPendingPinOrder(state, action: PayloadAction<string[] | null>) { state.pendingPinOrder = action.payload },
+    setPinOrderError(state, action: PayloadAction<string>) { state.pinOrderError = action.payload },
+    /** Paint the manual order (sort "Manual"), the same two ways as
+     *  `setPinRanks`. Every slot may hold a place, pinned or not: a pinned row
+     *  draws in the pinned order and keeps its manual place for when it is
+     *  unpinned. */
+    setManualRanks(state, action: PayloadAction<string[] | { order: string[]; rev: number }>) {
+      paintOrder(state, action.payload, ORDER_GATES[1], () => true)
+    },
+    setPendingManualOrder(state, action: PayloadAction<string[] | null>) { state.pendingManualOrder = action.payload },
+    setManualOrderError(state, action: PayloadAction<string>) { state.manualOrderError = action.payload },
     triggerRefresh(state) { state.refreshTrigger += 1 },
     /** DUAL PAYLOAD SHAPE — the form IS the semantics. String payload =
      *  MANUAL reminder: records the relay-immune sentinel; only a local read
@@ -946,9 +1469,10 @@ const dashboardSlice = createSlice({
      *  arrival: records a clearable watermark. Passing a bare string for an
      *  arrival creates a badge no remote read can retire — arrival call
      *  sites must always use the object form. */
-    markSlotUnread(state, action: PayloadAction<string | { slot: string; ts?: string }>) {
+    markSlotUnread(state, action: PayloadAction<string | { slot: string; ts?: string; localTs?: string }>) {
       const slot = typeof action.payload === 'string' ? action.payload : action.payload.slot
       const ts = typeof action.payload === 'string' ? undefined : action.payload.ts
+      const localTs = typeof action.payload === 'string' ? undefined : action.payload.localTs
       if (!state.unreadSlots.includes(slot)) state.unreadSlots.push(slot)
       if (!state.unreadSince) state.unreadSince = {}  // partial preloaded state
       // Watermarks carry only ACTUAL server-minted message timestamps: a
@@ -966,10 +1490,17 @@ const dashboardSlice = createSlice({
         // arrival converges.
         persistSharedUnread({ [slot]: effectiveTs ?? '' }, [])
         const prev = state.unreadSince[slot]
+        // `localTs` is the row's own server ts and guards THIS window only.
+        // A row the gateway never saves (a permission row) publishes the
+        // slot's saved-row watermark above, which a gateway restart cannot
+        // strand; this window still keeps the row's own ts, so a trailing
+        // read relayed from a window that saw only the rows before it cannot
+        // clear the badge. A local Mark as read clears it regardless.
+        const localWatermark = newerTs(effectiveTs, localTs)
         // A manual sentinel is never demoted by a message arrival; otherwise
         // the chronologically newest parseable instant wins.
-        if (effectiveTs !== undefined && prev !== MANUAL_UNREAD) {
-          const next = newerTs(prev, effectiveTs)
+        if (localWatermark !== undefined && prev !== MANUAL_UNREAD) {
+          const next = newerTs(prev, localWatermark)
           if (next !== undefined && next !== prev) state.unreadSince[slot] = next
         }
       } else {
@@ -980,7 +1511,7 @@ const dashboardSlice = createSlice({
         state.unreadSince[slot] = MANUAL_UNREAD
         persistManualSentinels(state.unreadSince)
       }
-      _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+      _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
     },
     markSlotRead(state, action: PayloadAction<string>) {
       if (state.unreadSince?.[action.payload] !== undefined) {
@@ -1001,7 +1532,7 @@ const dashboardSlice = createSlice({
       // reboots instead of being silently erased.
       const _readTs = state.slots?.find(sl => sl.key === action.payload)?.last_ts // row-read: reads a watermark, writes only unread state
       clearSharedUnreadIfCovered(action.payload, _readTs)
-      _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+      _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
     },
     /** A read relayed from ANOTHER window: honors the watermark. Clears only
      *  when the relay's `readTs` covers everything that lit the badge here —
@@ -1024,7 +1555,7 @@ const dashboardSlice = createSlice({
         if (!state.unreadSince) state.unreadSince = {}
         state.unreadSince[slot] = survivor
         if (!state.unreadSlots.includes(slot)) state.unreadSlots.push(slot)
-        _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+        _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
         return
       }
       if (state.unreadSince?.[slot] !== undefined) {
@@ -1034,7 +1565,7 @@ const dashboardSlice = createSlice({
       }
       if (!state.unreadSlots.includes(slot)) return
       state.unreadSlots = state.unreadSlots.filter(k => k !== slot)
-      _relayUnreadToParent(JSON.stringify(state.unreadSlots))
+      _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
     },
     setUpdateProgress(state, action: PayloadAction<{ step: string; detail: string } | null>) {
       state.updateProgress = action.payload
@@ -1112,22 +1643,38 @@ const dashboardSlice = createSlice({
       .addCase(fetchSlots.pending, (state, action) => {
         if (!state.slotFetchesInFlight) state.slotFetchesInFlight = []
         state.slotFetchesInFlight.push(action.meta.requestId)
+        // A new attempt (e.g. the reconnect catch-up) may still land a list.
+        state.slotsFetchFailed = false
         // The reply cannot describe anything that happens from here on, so this
         // is the instant every later single-slot write outranks it from.
         if (!state.slotFetchWriteMark) state.slotFetchWriteMark = {}
-        state.slotFetchWriteMark[action.meta.requestId] = state.slotWriteSeq ?? 0
+        state.slotFetchWriteMark[action.meta.requestId] = {
+          writeSeq: state.slotWriteSeq ?? 0,
+          unreadDrainHeld: state.unreadDrainHeld,
+          heldKeys: [...(state.slotsHeldKeys ?? [])],
+          holdChannels: state.slotsHoldChannels,
+          completeKeys: null,
+        }
+        // This request is newer than every add tracked so far, so it is the
+        // read a kept session was waiting for.
+        state.slotMemberReadWanted = false
       })
       .addCase(fetchSlots.fulfilled, (state, action) => {
         // A reply a confirmed close waited on past its cap is known to predate
         // that close's pop, so the closed key is filtered out of it — but ONLY
         // that key. Whatever else the reply carries (an unrelated rename, a
         // slot created meanwhile) is still the newest thing this transport has
-        // said and still applies. Before the first live snapshot the reply is
-        // the only list there is and applies unfiltered: an empty sidebar is
-        // worse than one stale row.
+        // said and still applies. Not gated on `slotsLoaded`: a pairing exists
+        // only once this tab saw a close or a `removed` for the key, and a
+        // reconnect clears the flag while such pairings (a 404 close awaiting
+        // its outcome) are still live — an unfiltered pre-pop row would then
+        // read as that close's rollback. On a cold boot nothing is paired, so
+        // the first list still applies whole: an empty sidebar is worse than
+        // one stale row.
         // `meta` is optional-chained for the hand-built actions in older tests.
         const requestId = action.meta?.requestId
-        const staleKeys = requestId && state.slotsLoaded ? staleKeysForSlotFetch(state, requestId) : new Set<string>()
+        const requestMark = requestId ? state.slotFetchWriteMark?.[requestId] : undefined
+        const staleKeys = requestId ? staleKeysForSlotFetch(state, requestId) : new Set<string>()
         // Keys a single-slot writer touched while this request was in flight.
         // The server serialized the reply before that write existed, so for
         // THOSE keys the reply is older than the screen and its row is dropped
@@ -1143,11 +1690,23 @@ const dashboardSlice = createSlice({
         // stamp a row it found, an empty list has none, and the set is therefore
         // empty and the reply applies unfiltered.
         const outranked = localWritesOutranking(state, requestId)
+        // Keys ADDED while the request was in flight (see `membersOutranking`),
+        // read from `slotMemberAt`. A membership add stamps membership only, not
+        // content, so this is NOT a subset of `outranked`. Only these may be
+        // re-added when the reply omits them; a content-only outranked key must
+        // not be resurrected, since its row may since have been deleted by
+        // another client (GPT F1).
+        const addedWhileInFlight = membersOutranking(state, requestId)
         // For a stale key the reply's row is pre-pop and is NOT trusted, but the
         // key may since have been recreated (a resume on another client): keep
         // whatever row is on screen for it rather than dropping the key, so a
         // live same-key session and its unread state survive the stale reply.
-        const current = staleKeys.size || outranked.size ? new Map((state.slots ?? []).map(s => [s.key, s])) : undefined
+        // `addedWhileInFlight` is included because a membership add stamps only
+        // `slotMemberAt`, so a pure add (no content stamp) leaves `outranked`
+        // empty yet still needs the live-row map to re-add its omitted key.
+        const current = staleKeys.size || outranked.size || addedWhileInFlight.size
+          ? new Map((state.slots ?? []).map(s => [s.key, s]))
+          : undefined
         const rows: ChatSlot[] = current
           ? action.payload.flatMap((s: ChatSlot) => {
             if (!staleKeys.has(s.key) && !outranked.has(s.key)) return [s]
@@ -1159,19 +1718,69 @@ const dashboardSlice = createSlice({
             return staleKeys.has(s.key) ? [] : [s]
           })
           : action.payload
+        // A key MEMBERSHIP-added while this request was in flight, which the
+        // reply OMITS, is a create / resume / fork / companion-open the server
+        // serialized the reply too early to list (issue #14831). The whole-list
+        // replace below would drop that freshly added row, so re-add its live
+        // row — kept in reply order after the rest — and the sidebar does not
+        // need a reload to learn about it. A key the reply contains is already
+        // handled above; a content-only outranked key is deliberately NOT here,
+        // so a reply cannot revive a chat deleted mid-flight.
+        //
+        // The re-add is bounded by the mark comparison in `membersOutranking`:
+        // only a reply dispatched BEFORE the add re-adds the key. A later reply
+        // (mark at or above the stamp) cannot re-add it, so a foreign delete that
+        // omits the key wins on the next authoritative list — no resurrection
+        // while the WS is disconnected (GPT F1). The #14831 case re-adds on every
+        // pre-add reply — two `fetchSlots` can overlap — and heals on the next
+        // authoritative list either way.
+        if (current && addedWhileInFlight.size) {
+          const present = new Set(rows.map(s => s.key))
+          for (const key of addedWhileInFlight) {
+            if (present.has(key)) continue
+            const live = current.get(key)
+            if (live) rows.push(live)
+          }
+        }
         // A reply in flight can be older than the live frames that arrived while
         // it travelled, so it may omit a slot the stream has since created. The
         // unread drain still runs — that is this path's documented job, and a
         // badge self-heals — but eviction is withheld once the stream is live.
         const fresh = !state.slotsLoaded
+        // `awaitCloseOutcome` pairs every fetch already in flight at the 404, so
+        // an unfiltered reply was requested afterwards and serialized after the
+        // pop. Membership there is a live restored or recreated key, not a
+        // straggler, and releases the awaiting hold without spending its budget.
+        const replyKeys = new Set(rows.map((s: ChatSlot) => s.key))
+        for (const key of Object.keys(state.closingSlots ?? {})) {
+          const hold = state.closingSlots[key]
+          if (hold.awaitingOutcome && replyKeys.has(key)) delete state.closingSlots[key]
+        }
         applySlots(state, rows)
         state.slotsGeneration = (state.slotsGeneration ?? 0) + 1
         state.slotsLoaded = true
-        reconcileSlots(state, new Set(rows.map((s: { key: string }) => s.key)), fresh)
+        // A complete frame that arrived while this request was in flight is the
+        // newer, labelled list; the reply is older and carries no label. The drain
+        // then runs against the union: a key the frame lists is live however
+        // stale the reply, and a key both omit is genuinely gone. That is what
+        // releases the hold this request was dispatched under. A key deleted
+        // after the frame lingers until the next frame, which drains it.
+        const completeKeys = requestMark?.completeKeys ?? null
+        reconcileSlots(
+          state,
+          completeKeys ? new Set([...replyKeys, ...completeKeys]) : replyKeys,
+          fresh,
+          state.unreadDrainHeld || (requestMark?.unreadDrainHeld === true && completeKeys === null),
+          [...(requestMark?.heldKeys ?? []), ...(state.slotsHeldKeys ?? [])],
+          state.slotsHoldChannels || requestMark?.holdChannels === true,
+        )
+        settleUnlistedMembers(state, requestId, replyKeys)
         settleSlotFetch(state, requestId)
       })
       .addCase(fetchSlots.rejected, (state, action) => {
+        settleUnlistedMembers(state, action.meta?.requestId, null)
         settleSlotFetch(state, action.meta?.requestId)
+        if (!(state.slotFetchesInFlight ?? []).length) state.slotsFetchFailed = true
       })
       .addCase(changeApprovalMode.fulfilled, (state, action) => { state.approvalMode = action.payload })
       // The created slot joins the list on the SAME action that activates it
@@ -1187,10 +1796,22 @@ const dashboardSlice = createSlice({
         (action): action is PayloadAction<ChatSlot> => action.type === 'chat/createSlot/fulfilled',
         (state, action) => {
           // A same-key recreation supersedes any tombstone (idempotent otherwise).
-          if (!isUnsafeKey(action.payload.key)) delete state.closingSlots?.[action.payload.key]
+          if (!isUnsafeKey(action.payload.key)) {
+            delete state.closingSlots?.[action.payload.key]
+            delete state.durablyRemoved?.[action.payload.key]
+          }
           if (!state.slots.find(s => s.key === action.payload.key)) { // row-read: membership test, adds a row rather than changing one
             state.slots.push(action.payload)
+            relayUnreadIfHolding(state)
           }
+          // A create is a single-slot MEMBERSHIP write, so stamp it as one (see
+          // `stampSlotMember`): a `fetchSlots` reply already in flight was
+          // serialized by the server before this slot existed and so omits the
+          // key; the membership stamp lets `membersOutranking` re-add the row
+          // the reply dropped (issue #14831). Stamped even when the row is
+          // already present — the create still asserts the key is current as of
+          // now, which a reply that predates it must not override.
+          stampSlotMember(state, action.payload.key)
         },
       )
       // Close tombstone lifecycle (see `applySlots`). Matched by type string for
@@ -1242,8 +1863,8 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, confirmCloseHold, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
-  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
+export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, sseSlotsPartial, sseSlotListHolds, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
+  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks, setPinRanks, setPendingPinOrder, setPinOrderError, setManualRanks, setPendingManualOrder, setManualOrderError } = dashboardSlice.actions
 
 /**
  * Resolve a slot's surface key. Backend emits `surface` (mirrors `mode` today
@@ -1255,15 +1876,15 @@ export function slotSurfaceKey(slot: { mode?: string; surface?: string }): strin
 }
 
 /**
- * True when a slot's turns run on a connected crew rather than THIS machine —
- * the single spelling of "crew-bound". Two client surfaces must agree with each
- * other and with the server on it: `selectContinuable` (which must not OFFER
- * Continue on a bound slot) and ChatPage's regenerate / edit-resend gates
- * (which must not offer those either). Mirrors `remote_bound_refusal` in
- * `src/kiro_crew/dashboard/remote_relay.py`, which REFUSES the same actions with
- * 409 `remote_action_unsupported`.
+ * True for a relay archive: a chat an older build ran on a connected crew,
+ * read-only now. Two client surfaces must agree with each other and with the
+ * server on it: `selectContinuable` (which must not OFFER Continue on one) and
+ * ChatPage's regenerate / edit-resend gates (which must not offer those
+ * either). Mirrors `relay_archive_refusal` in
+ * `src/kiro_crew/dashboard/relay_archive.py`, which REFUSES the same actions
+ * with 409 `relay_archive_read_only`.
  *
- * Keyed on `executor` (the binding INTENT), never `instance_id` or `is_remote`:
+ * Keyed on `executor` (the binding INTENT), never `instance_id`:
  * the server refuses a half-open binding (marker set, triple incomplete) too, so
  * an unbound `executor` must read as bound here exactly as it does there. An
  * absent slot is not bound — an older gateway ships `executor` on every slot, so
@@ -1285,17 +1906,32 @@ export function slotIsRemoteBound(slot: { executor?: string } | null | undefined
  * display them regardless), whereas this one keeps them so the badge stays
  * stable across the brief race between `removeSlotOptimistic` and
  * `fetchSlots.fulfilled`.
+ *
+ * The exception is an orphan no reconcile will drain: any orphan while the
+ * gateway labels its lists partial, or one the gateway holds (`slotsHeldKeys`, or a
+ * channel key under `slotsHoldChannels`). The premise above does not hold for it. Its unread entry is kept so the dot returns with the tab, but
+ * it is left out of the badge, which would otherwise count a session the
+ * sidebar cannot show.
  */
-function countUnreadByMode(slots: ChatSlot[], unread: string[], mode: string): number {
+function countUnreadByMode(
+  slots: ChatSlot[],
+  unread: string[],
+  mode: string,
+  heldKeys: readonly string[] = [],
+  holdChannels = false,
+  listPartial = false,
+): number {
   if (unread.length === 0) return 0
   const surfaceByKey = new Map(slots.map(s => [s.key, slotSurfaceKey(s)]))
-  // Unified chat: when counting for the chat surface (''), include orchestrator
-  // slots too since they now live in the same sidebar.
+  const isHeldOrphan = heldOrphanTest(new Set(surfaceByKey.keys()), heldKeys, holdChannels, listPartial)
+  // The chat surface ('') counts every slot the chat page renders, legacy
+  // Autopilot slots included (see `isChatPageSurface`).
   const isChatSurface = mode === ''
   let count = 0
   for (const k of unread) {
+    if (isHeldOrphan(k)) continue
     const sk = surfaceByKey.get(k) ?? ''
-    if (isChatSurface ? (sk === '' || sk === 'orchestrator') : sk === mode) count++
+    if (isChatSurface ? isChatPageSurface(sk) : sk === mode) count++
   }
   return count
 }
@@ -1315,11 +1951,27 @@ export function selectUnreadByMode(mode: string): UnreadByModeSelector {
     sel = createSelector(
       (state: { dashboard: DashboardState }) => state.dashboard.slots,
       (state: { dashboard: DashboardState }) => state.dashboard.unreadSlots,
-      (slots, unread) => countUnreadByMode(slots, unread, mode),
+      (state: { dashboard: DashboardState }) => state.dashboard.slotsHeldKeys,
+      (state: { dashboard: DashboardState }) => state.dashboard.slotsHoldChannels,
+      (state: { dashboard: DashboardState }) => state.dashboard.slotsListPartial,
+      (slots, unread, heldKeys, holdChannels, listPartial) =>
+        countUnreadByMode(slots, unread, mode, heldKeys ?? [], holdChannels === true, listPartial === true),
     )
     _unreadByModeCache.set(mode, sel)
   }
   return sel
+}
+
+/**
+ * True while the page has never seen a slot list and one may still arrive, so a
+ * pane with no open session cannot yet tell "no chats" from "chats loading".
+ * `slotsGeneration`, not `slotsLoaded`: a socket reconnect resets the latter,
+ * and a gateway whose list already landed is not waited on again. A failed
+ * fetch with none left in flight ends the wait.
+ */
+export const selectSlotListPending = (state: { dashboard: DashboardState }): boolean => {
+  const d = state.dashboard
+  return !d.slotsLoaded && (d.slotsGeneration ?? 0) === 0 && !d.slotsFetchFailed
 }
 
 export default dashboardSlice.reducer

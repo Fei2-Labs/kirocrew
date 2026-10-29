@@ -20,6 +20,7 @@ import logging
 import socket
 from collections.abc import Iterable
 
+from kiro_crew import platform_compat
 from kiro_crew.instances.constants import DEFAULT_TUNNEL_BASE_PORT
 
 logger = logging.getLogger(__name__)
@@ -60,8 +61,8 @@ def _is_addr_free(port: int, host: str) -> bool:
     inferred from *host*, so this probes the same address a listener would
     actually bind rather than assuming IPv4.
 
-    Sets ``SO_REUSEADDR`` before probing so this check mirrors what the SSH
-    forward listener actually does at bind time — OpenSSH sets ``SO_REUSEADDR``
+    On POSIX, sets ``SO_REUSEADDR`` before probing so this check mirrors what
+    the SSH forward listener actually does at bind time — OpenSSH sets ``SO_REUSEADDR``
     on its ``-L`` listener. This matters for the disconnect -> reconnect path:
     when a tunnel is torn down, ``_SshTunnel.stop()`` reaps the ``ssh`` child so
     the *listener* socket is gone, but the forward's **accepted** data
@@ -76,6 +77,18 @@ def _is_addr_free(port: int, host: str) -> bool:
     while a genuinely *live* listener (a real port collision between two
     connected instances) still fails to bind and is correctly reported in use
     (``SO_REUSEADDR`` exempts ``TIME_WAIT`` only, never an active ``LISTEN``).
+
+    That last sentence is POSIX only. On Windows ``SO_REUSEADDR`` lets a second
+    socket bind AND listen on an address a live listener already holds, as long
+    as that listener set the option too -- and OpenSSH's ``-L`` listener does, as
+    can any other local process. A probe with ``SO_REUSEADDR`` there reads a live
+    listener as free, the forward then binds as a second listener without error,
+    and Windows keeps routing new connections to the first one. So the Windows
+    probe sets ``SO_EXCLUSIVEADDRUSE`` instead: that bind fails against any socket
+    still bound to the address, whatever options it set. The ``TIME_WAIT`` reason
+    for ``SO_REUSEADDR`` does not carry over, because Winsock does not refuse a
+    fresh bind over ``TIME_WAIT`` remnants. ``pod/runtime_ports.py`` makes the
+    same split for the same reasons.
 
     A bind failure (``OSError``) is interpreted as "in use / unavailable", except
     for the errnos in :data:`_ADDRESS_UNUSABLE`, which mean the address itself is
@@ -98,7 +111,12 @@ def _is_addr_free(port: int, host: str) -> bool:
             return True
         raise
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if platform_compat.IS_WINDOWS:
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            if exclusive is not None:
+                sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
         return True
     except OSError as e:
@@ -137,17 +155,40 @@ class PortAllocator:
     def base_port(self) -> int:
         return self._base
 
-    def allocate(self, exclude: Iterable[int] | None = None) -> int:
-        """Return the first free loopback port >= base not in *exclude*.
+    def allocate(self, exclude: Iterable[int] | None = None, *, preferred: int = 0) -> int:
+        """Return a free loopback port not in *exclude*, preferring *preferred*.
 
         *exclude* is a set of ports the caller knows are taken (e.g. local_port
         values already assigned to other instances in the registry) — these are
         skipped even if a momentary probe would find them bindable, so two
         instances are never handed the same port between connect calls.
 
+        *preferred* (0 = none) is a port the caller would like to keep STABLE
+        across calls — the port this instance was last bound to. When it is a
+        valid port (>= base, <= ``_MAX_PORT``), not excluded, and a probe finds
+        it free, it is returned unchanged; otherwise allocation falls through to
+        the first-free search below, exactly as if no preference were given. The
+        preference is honoured, never enforced: a port another instance now holds
+        or that has been reassigned yields to first-free rather than failing.
+
+        Stability matters because the loopback port IS the browser origin of the
+        embedded pane's iframe (``http://<host>:<port>``), and origin-keyed
+        client state — ``localStorage`` UI preferences most of all — is lost when
+        that origin moves. A first-free-only allocator lets a crew land on a
+        different port after a gateway restart whenever another instance took the
+        lower port first, silently resetting those preferences.
+        A ``preferred`` below ``base`` is ignored rather than returned, so it can
+        never hand back a port outside the allocator's own range.
+
         Raises :class:`RuntimeError` if no free port is found up to ``65535``.
         """
         reserved = set(exclude or ())
+        if (
+            self._base <= preferred <= _MAX_PORT
+            and preferred not in reserved
+            and _is_port_free(preferred)
+        ):
+            return preferred
         for port in range(self._base, _MAX_PORT + 1):
             if port in reserved:
                 continue

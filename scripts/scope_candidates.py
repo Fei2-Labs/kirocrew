@@ -23,6 +23,12 @@ This script is the two seams around that decision.
     job died uploads nothing, and folding the survivors would publish a clean
     verdict for a platform that never reported.
 
+``harvest``
+    Takes the rows ``verdict --out-rows`` wrote and appends the new ones to a
+    golden-paths corpus file, so a maintainer can commit a confirmed boundary row
+    instead of re-deriving it from a fresh model call on every run. It writes a
+    file only; the row gates nothing until that edit is reviewed and merged.
+
 ``conclude``
     Takes the fold result, the model's ``Scope-Verdict`` header, whether the
     review marked THIS head, and the two platform-gap signals, and folds them into
@@ -39,7 +45,8 @@ untestable in a heredoc.
 Exit codes, ``validate``: ``0`` a corpus was written, ``2`` the file cannot be
 trusted, ``3`` valid but nothing left to adjudicate. Exit codes, ``verdict``: ``0``
 no confirmed regression, ``1`` at least one, ``2`` the question could not be
-settled. Both fail CLOSED -- a check that could not run never exits 0, because
+settled. Exit codes, ``harvest``: ``0`` rows were appended, ``2`` the rows file
+or corpus cannot be trusted, ``3`` every row is already in the corpus. All fail CLOSED -- a check that could not run never exits 0, because
 "could not run" and "found nothing" are the same badge to a reader and must not be
 the same exit code.
 
@@ -582,6 +589,115 @@ def verdict(
     return 1 if confirmed else 0
 
 
+#: The prefix of every placeholder the redactors write: ``[REDACTED-ARN]`` and
+#: its kin for a credential shape, bare ``[REDACTED]`` for a secret value. A row
+#: carrying one names a placeholder, not the refused operation, and a
+#: placeholder classifies as allowed -- a corpus row that gates nothing.
+_REDACTED_MARK = "[REDACTED"
+
+
+def harvest(rows_path: Path, corpus_path: Path, surface: str) -> int:
+    """Append ``verdict --out-rows`` rows to a golden-paths corpus file.
+
+    The promotion rule, and why each part holds:
+
+    *Only script-confirmed regressions qualify.* The rows file is what
+    ``verdict --out-rows`` writes, and it holds only rows the real classifier saw
+    the base allow and the head refuse. A clean candidate is never in it: "still
+    allowed" proves nothing about whether the row is a golden path.
+
+    *A person approves every promotion.* This writes a file and nothing else. The
+    row reaches the gate only as a reviewed edit to the committed corpus, in a
+    pull request, where ``test_deny_diff``'s pinned test refuses a row the
+    shipped classifier does not allow.
+
+    *A promoted row cannot weaken either lane.* Rows are only appended, never
+    rewritten or dropped, and the denial differential settles each row on its
+    own, so a new row can add a regression and never remove one. A harvested
+    row that ``validate`` later drops as already covered is a shell row the
+    denial differential now classifies on every run, so the question moves from
+    a model re-roll to the deterministic gate rather than going away.
+
+    *De-duplication is the same triple ``validate`` uses.* A row the corpus
+    already holds is skipped, so running this twice adds the rows once. "All
+    rows already present" is exit 3, like ``validate``'s "nothing new".
+
+    ``surface`` fills the field the ledger's import requires and the rows file
+    does not carry. The corpus file is rewritten in place.
+    """
+    deny_diff = _load_deny_diff()
+    surface = surface.strip()
+    if not surface:
+        raise CandidateError("--surface must name the surface the rows belong to")
+
+    rows = _rows_of(_read_json(rows_path, "rows file"), f"rows file {rows_path}")
+    if not rows:
+        raise CandidateError(f"rows file {rows_path} holds no rows")
+    for position, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise CandidateError(f"rows file row {position} is not an object")
+        if row.get("kind") != "shell":
+            raise CandidateError(
+                f"rows file row {position} has kind {row.get('kind')!r}; only a "
+                "confirmed 'shell' regression is harvested"
+            )
+        command = row.get("command_or_flow")
+        if isinstance(command, str) and len(command) > MAX_COMMAND_CHARS:
+            raise CandidateError(
+                f"rows file row {position} has a {len(command)}-char command, "
+                f"cap is {MAX_COMMAND_CHARS}"
+            )
+        if isinstance(command, str) and _REDACTED_MARK in command:
+            raise CandidateError(
+                f"rows file row {position} carries a redaction placeholder, so it "
+                "names no operation a corpus row could gate"
+            )
+        reason = row.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise CandidateError(
+                f"rows file row {position} has no reason; the corpus records why "
+                "each operation is legitimate"
+            )
+    try:
+        deny_diff.load_corpus(rows_path)
+    except Exception as exc:  # DenyDiffError, by any other import path
+        raise CandidateError(f"{rows_path} is not a valid corpus: {exc}") from exc
+
+    payload = _read_json(corpus_path, "corpus")
+    if not isinstance(payload, dict) or not isinstance(payload.get("golden_paths"), list):
+        raise CandidateError(f"corpus {corpus_path} must be an object with a 'golden_paths' list")
+    existing = payload["golden_paths"]
+    known = {_key(row) for row in existing if isinstance(row, dict)}
+
+    added = 0
+    already = 0
+    for row in rows:
+        key = _key(row)
+        if key in known:
+            already += 1
+            continue
+        known.add(key)
+        existing.append(
+            {
+                "kind": "shell",
+                "surface": surface,
+                "command_or_flow": row["command_or_flow"],
+                "platform": row.get("platform", "any"),
+                "reason": row["reason"].strip(),
+            }
+        )
+        added += 1
+
+    print(json.dumps({"harvested": added, "already_in_corpus": already}, indent=2))
+    if not added:
+        print("Every row is already in the corpus -- nothing to harvest.", file=sys.stderr)
+        return 3
+    corpus_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # conclude -- THE conclusion table, shared by BOTH review lanes.
 # --------------------------------------------------------------------------- #
@@ -630,7 +746,7 @@ def verdict(
 #: (exit 1 / ``failure``) and to a leak-safe "could not settle" notice rather than
 #: a "confirmed regression" badge. To make EVERY unsettled run resolve neutral
 #: instead -- the other candidate answer -- change this single value to
-#: ``"concerns"``; both lanes already map ``concerns`` to a non-blocking neutral.
+#: ``"nothing-new"``; both lanes already map it to a non-blocking neutral.
 #: Nothing else moves. Note the breadth: this governs every could-not-settle
 #: outcome below, marker-absent included, not only a Bedrock/matrix crash.
 _UNSETTLED_CONCLUSION: str = "error"
@@ -642,19 +758,17 @@ _UNSETTLED_CONCLUSION: str = "error"
 _CONCLUSION_SEVERITY: "dict[str, int]" = {
     "pass": 0,
     "nothing-new": 1,
-    "concerns": 2,
     "error": 3,
     "block": 3,
 }
 
 #: A published check-run conclusion, named as the lane token whose blocking
-#: severity it carries. ``neutral`` is a ``concerns`` -- the stricter of the two
-#: tokens that surface as neutral -- so the monotonic guard reads a neutral as no
-#: softer than it stands. A conclusion absent here (``cancelled``, ``timed_out``,
+#: severity it carries. ``neutral`` is a ``nothing-new``, the only token that
+#: surfaces as neutral. A conclusion absent here (``cancelled``, ``timed_out``,
 #: ``skipped``) is not a lane verdict and sets no floor.
 _CHECKRUN_CONCLUSION_TOKEN: "dict[str, str]" = {
     "success": "pass",
-    "neutral": "concerns",
+    "neutral": "nothing-new",
     "failure": "block",
 }
 
@@ -687,7 +801,6 @@ _SCOPE_FLOOR_UNSETTLED_MARKER = "[scope-floor:unsettled]"
 _TOKEN_CHECKRUN_CONCLUSION: "dict[str, str]" = {
     "pass": "success",
     "nothing-new": "neutral",
-    "concerns": "neutral",
     "block": "failure",
     "error": "failure",
 }
@@ -696,6 +809,66 @@ _TOKEN_CHECKRUN_CONCLUSION: "dict[str, str]" = {
 #: native fold encoding (same-repo's ``$FOLDED`` word, the fork's ``$FOLD_RC``)
 #: down to one of these before calling, so the table sees one shape from both.
 _FOLD_CHOICES = ("clean", "regression", "redacted", "unscrubbable", "error", "no-report")
+
+#: The ``validate`` refusals that already NAME their own cause, each mapped to a
+#: short reason for the check-run TITLE and the full remedy for its SUMMARY. A
+#: refusal here means no leg was ever dispatched, so the fold reads ``no-report``
+#: and the generic "no leg reported" sentence is what an author gets -- true, and
+#: indistinguishable from a broken lane or a regression in their own diff. The
+#: cause travels to this table instead of living only in a job annotation.
+#:
+#: The refusal itself is NOT relaxed by naming it: the corpus travels to the
+#: adjudication legs as a public artifact and must stay byte-faithful for the
+#: classifier, so a credential shape in it can be neither published nor rewritten.
+#:
+#: Both halves are authored HERE and selected by an exact key match, so no caller
+#: string is ever interpolated into a published verdict, and an unrecognized code
+#: falls through to the generic sentence rather than reaching a reader unchecked.
+#: Each names credential SHAPES, never a value.
+_VALIDATE_REFUSALS: "dict[str, tuple[str, str]]" = {
+    "corpus-credential": (
+        "no leg ran: a candidate operation carries a credential shape, so the "
+        "byte-faithful corpus could not travel to the legs",
+        "A candidate operation carries a credential shape (an access-key id, an ARN, an "
+        "account id or a credential-bearing URL). The corpus travels to the adjudication "
+        "legs as a public artifact and must stay byte-faithful for the classifier, so it "
+        "can be neither published nor rewritten -- a placeholder where a command used to "
+        "be classifies as allowed, which is a false green. Re-run this lane so the "
+        "reviewer proposes the operation without the embedded credential.",
+    ),
+    "corpus-uncheckable": (
+        "no leg ran: the normalized corpus could not be checked for credential shapes, "
+        "so it was not uploaded",
+        "The credential-shape probe on the normalized corpus did not complete, so the "
+        "corpus was not uploaded to the adjudication legs unchecked. Re-run this lane; a "
+        "second refusal means the redactor itself is failing on this corpus and the run "
+        "needs a maintainer.",
+    ),
+}
+
+
+#: The ``why`` for a run whose ``generate`` job never resolved the review scope --
+#: it timed out, failed or was cancelled before ``Resolve review scope`` wrote
+#: ``in_scope``. Nothing measured whether the change touches the security surface,
+#: so this is an UNMEASURED run and stays unsettled: it is never the "nothing to
+#: scope" success, which only a resolved ``in_scope=false`` earns. The generic
+#: "no leg reported" sentence is true of such a run too, but it points at the
+#: author's diff instead of at a lane that did not finish.
+_SCOPE_UNRESOLVED_WHY = (
+    "the review scope was never resolved: the generate job did not finish (it timed "
+    "out, failed or was cancelled), so no leg ran; its log names the step that stopped"
+)
+
+
+def validate_refusal_remedy(refusal: "str | None") -> str:
+    """The full author-facing remedy for a named ``validate`` refusal, or ``""``.
+
+    Read by the lane's check-run step for its SUMMARY. Kept separate from the
+    title half because a check-run title is capped at 255 characters, so the
+    remedy cannot ride in the ``why`` line the title is built from.
+    """
+    entry = _VALIDATE_REFUSALS.get(str(refusal or "").strip())
+    return entry[1] if entry else ""
 
 
 def _truthy(value: "str | None") -> bool:
@@ -708,7 +881,7 @@ def _truthy(value: "str | None") -> bool:
 
 
 def _normalize_model(value: "str | None") -> str:
-    """Fold the raw ``Scope-Verdict`` header to one of PASS/CONCERNS/BLOCK/UNKNOWN.
+    """Fold the raw ``Scope-Verdict`` header to one of PASS/BLOCK/UNKNOWN.
 
     Anything the contract does not define -- an empty header, a typo, a value the
     lane could not parse -- is UNKNOWN, which the table treats as unsettled. This
@@ -717,35 +890,41 @@ def _normalize_model(value: "str | None") -> str:
     honoured.
     """
     header = str(value or "").strip().upper()
-    return header if header in {"PASS", "CONCERNS", "BLOCK"} else "UNKNOWN"
+    return header if header in {"PASS", "BLOCK"} else "UNKNOWN"
 
 
 def conclude_lane(
     *,
-    lane: str,
     fold: str,
     nothing_new: bool,
     marker_present: bool,
     model: str,
     gap_script: bool,
     gap_model: bool,
+    refusal: "str | None" = None,
+    scope_unresolved: bool = False,
 ) -> "tuple[str, str]":
     """Fold the lane signals into one ``(conclusion, why)`` -- the shared table.
 
-    ``lane`` is accepted and validated but DELIBERATELY not branched on: the
-    ruling that produced this table resolved the one asymmetry to the stricter
-    side, so there is no row where a fork and a same-repo run of the same inputs
-    reach different conclusions. The parameter stays because the two lanes must
-    pass it (it names the caller and reserves the seam), and because the contract
-    is that any future lane difference is a ROW here selected by ``lane`` -- never
-    a branch back in a YAML ``run:`` body.
-    """
-    if lane not in ("fork", "same-repo"):
-        raise CandidateError(f"unknown lane {lane!r} -- expected 'fork' or 'same-repo'")
+    It takes NO lane. Both lanes hand it the same signals, so for the same inputs a
+    fork and a same-repo run reach the same conclusion by construction: there is
+    no parameter a row could branch on to treat the more hostile source more
+    softly.
 
+    ``refusal`` is the ``validate`` return code, which for some values NAMES why
+    no leg ran. It selects a more specific ``why`` and never a different
+    conclusion: an unmeasured run fails closed either way, and a lane that
+    published a softer verdict because it could explain itself would be a hole.
+    It is keyed by exact match, so an unrecognized code reads as no refusal.
+
+    ``scope_unresolved`` says the review scope was never resolved (``generate``
+    died before writing ``in_scope``). Like ``refusal`` it only names the cause of
+    an unmeasured ``no-report`` run, and it outranks every other ``no-report`` row,
+    the green ``nothing-new`` one included.
+    """
     # gap_model is MODEL-AUTHORED input to a merge-blocking gate, so it is
     # UNTRUSTED. It is OR-ed in here and read ONLY inside the BLOCK branch below,
-    # where a gap can do exactly one thing: upgrade concerns -> block. It can make
+    # where a gap can do exactly one thing: upgrade a pass -> block. It can make
     # the verdict STRICTER, never clear it -- so honouring it costs no safety while
     # closing the asymmetry (same-repo already honoured it; the fork did not, and a
     # fork is the more hostile source). Both sources feed both lanes now.
@@ -763,7 +942,10 @@ def conclude_lane(
     if fold == "redacted":
         return _UNSETTLED_CONCLUSION, "a confirmed row was redacted, so it names no operation"
     if fold == "unscrubbable":
-        return _UNSETTLED_CONCLUSION, "the folded verdict could not be scrubbed, so it was not published"
+        return (
+            _UNSETTLED_CONCLUSION,
+            "the folded verdict could not be scrubbed, so it was not published",
+        )
     if fold == "error":
         return _UNSETTLED_CONCLUSION, "the per-platform reports could not be folded"
 
@@ -780,6 +962,19 @@ def conclude_lane(
     #    same-repo already held and the fork did not. Every other no-report is an
     #    unmeasured run.
     if fold == "no-report":
+        # An unresolved scope is the first answer: no scope means nothing upstream
+        # of the legs ran, so no other no-report reading -- least of all the green
+        # `nothing-new` one -- describes this run.
+        if scope_unresolved:
+            return _UNSETTLED_CONCLUSION, _SCOPE_UNRESOLVED_WHY
+        # Next, ahead of the two `nothing_new` rows below. A refusal and the exit-3
+        # short circuit cannot both happen -- `validate` refuses only on the rc=0
+        # path -- so this reorders nothing that the lane can reach. Were they ever
+        # to arrive together, the refusal is the half that must win: the green
+        # `nothing-new` reading would publish a pass for a corpus no leg ever saw.
+        named = _VALIDATE_REFUSALS.get(str(refusal or "").strip())
+        if named:
+            return _UNSETTLED_CONCLUSION, named[0]
         if nothing_new and marker_present:
             return "nothing-new", "every candidate is already a committed golden path"
         if nothing_new:
@@ -796,13 +991,20 @@ def conclude_lane(
         return _UNSETTLED_CONCLUSION, "no [SCOPE-REVIEWED] marker for this head"
     if model == "PASS":
         return "pass", "adjudicated, zero confirmed regressions"
-    if model == "CONCERNS":
-        return "concerns", "the reviewer's own judgement; no confirmed regression"
     if model == "BLOCK":
         if gap:
-            return "block", f"the reviewer's BLOCK stands on a demonstrated platform gap ({gap_src})"
-        return "concerns", "the reviewer wrote BLOCK with no confirmed regression and no demonstrated gap"
-    return _UNSETTLED_CONCLUSION, "no parseable Scope-Verdict header carrying a marker for this head"
+            return (
+                "block",
+                f"the reviewer's BLOCK stands on a demonstrated platform gap ({gap_src})",
+            )
+        return (
+            "pass",
+            "the reviewer wrote BLOCK with no confirmed regression and no demonstrated gap, which is read as PASS",
+        )
+    return (
+        _UNSETTLED_CONCLUSION,
+        "no parseable Scope-Verdict header carrying a marker for this head",
+    )
 
 
 def _checkrun_severity(conclusion: "str | None") -> "int | None":
@@ -862,7 +1064,9 @@ def _row_belongs_to(row: "dict[str, Any]", *, lane: str, pr: str) -> bool:
             "a completed check-run for this head names no pull request, so whether "
             "it is this pull request's prior verdict cannot be decided"
         )
-    return any(str((entry or {}).get("number")) == str(pr) for entry in numbers if isinstance(entry, dict))
+    return any(
+        str((entry or {}).get("number")) == str(pr) for entry in numbers if isinstance(entry, dict)
+    )
 
 
 def _fork_row_is_unsettled(row: "dict[str, Any]") -> bool:
@@ -909,18 +1113,28 @@ def select_prior_conclusions(payload_text: str, *, lane: str, pr: str) -> "list[
     if lane not in ("fork", "same-repo"):
         raise CandidateError(f"unknown lane {lane!r} -- expected 'fork' or 'same-repo'")
     if not payload_text.strip():
-        raise PriorReadError("the prior check-run response is empty, so it names no check-runs either way")
+        raise PriorReadError(
+            "the prior check-run response is empty, so it names no check-runs either way"
+        )
     try:
         payload = json.loads(payload_text)
     except (ValueError, TypeError) as exc:
         raise PriorReadError(f"the prior check-run response is not readable JSON ({exc})") from exc
     if not isinstance(payload, dict):
-        raise PriorReadError("the prior check-run response is not an object, so its envelope cannot be read")
-    if not isinstance(payload.get("total_count"), int) or isinstance(payload.get("total_count"), bool):
-        raise PriorReadError("the prior check-run response carries no numeric total_count, so it is not a check-run listing")
+        raise PriorReadError(
+            "the prior check-run response is not an object, so its envelope cannot be read"
+        )
+    if not isinstance(payload.get("total_count"), int) or isinstance(
+        payload.get("total_count"), bool
+    ):
+        raise PriorReadError(
+            "the prior check-run response carries no numeric total_count, so it is not a check-run listing"
+        )
     rows = payload.get("check_runs")
     if not isinstance(rows, list):
-        raise PriorReadError("the prior check-run response carries no check_runs list, so it is not a check-run listing")
+        raise PriorReadError(
+            "the prior check-run response carries no check_runs list, so it is not a check-run listing"
+        )
     total = payload["total_count"]
     if total != len(rows):
         raise PriorReadError(
@@ -964,10 +1178,16 @@ def monotonic_conclusion(
     cur = str(current or "").strip().lower()
     cur_sev = _checkrun_severity(cur)
     if cur_sev is None:
-        return unsettled, f"this run computed no ranked conclusion ({current!r}), so it fails closed"
+        return (
+            unsettled,
+            f"this run computed no ranked conclusion ({current!r}), so it fails closed",
+        )
     if not prior_readable:
         harder = unsettled if (_checkrun_severity(unsettled) or 0) > cur_sev else cur
-        return harder, "the prior conclusion for this head could not be read, so the lane fails closed"
+        return (
+            harder,
+            "the prior conclusion for this head could not be read, so the lane fails closed",
+        )
     hardest = ""
     hardest_sev = -1
     for candidate in priors:
@@ -976,19 +1196,23 @@ def monotonic_conclusion(
             hardest = str(candidate).strip().lower()
             hardest_sev = sev
     if hardest_sev > cur_sev:
-        return hardest, f"a prior run of this head stands at {hardest!r}, harder than this run's {cur!r}"
+        return (
+            hardest,
+            f"a prior run of this head stands at {hardest!r}, harder than this run's {cur!r}",
+        )
     return cur, f"this run's {cur!r} is at least as hard as any prior conclusion for this head"
 
 
 def _cmd_conclude(args: argparse.Namespace) -> int:
     conclusion, why = conclude_lane(
-        lane=args.lane,
         fold=args.fold,
         nothing_new=_truthy(args.nothing_new),
         marker_present=_truthy(args.marker),
         model=_normalize_model(args.model),
         gap_script=_truthy(args.gap_script),
         gap_model=_truthy(args.gap_model),
+        refusal=args.refusal,
+        scope_unresolved=_truthy(args.scope_unresolved),
     )
     # Printed as GitHub ``key=value`` lines so the caller can redirect stdout
     # straight into ``$GITHUB_OUTPUT``. Both the vocabulary and the why are
@@ -1000,11 +1224,19 @@ def _cmd_conclude(args: argparse.Namespace) -> int:
     # a caller from the token. The fork lane needs the answer to decide whether to
     # stamp `_SCOPE_FLOOR_UNSETTLED_MARKER` on its check-run, and it read the token
     # to get it -- which silently breaks the "flip one constant" contract on
-    # `_UNSETTLED_CONCLUSION`: set that to `"concerns"` and an unsettled run starts
-    # arriving as a token the caller's `concerns` arm treats as settled, so flakes
+    # `_UNSETTLED_CONCLUSION`: set that to `"nothing-new"` and an unsettled run starts
+    # arriving as a token the caller's `nothing-new` arm treats as settled, so flakes
     # would floor the head again with no other edit in sight. The comparison lives
     # next to the constant instead.
     print(f"settled={'no' if conclusion == _UNSETTLED_CONCLUSION else 'yes'}")
+    # The remedy for a NAMED refusal, and only then: a check-run title is capped at
+    # 255 characters, so the actionable half rides in the summary instead and the
+    # caller reads it from here. Emitted conditionally so the three-line shape every
+    # other run prints is unchanged, and both lanes select keys with `sed` rather
+    # than reading a fixed number of lines, so an extra key is inert for them.
+    remedy = validate_refusal_remedy(args.refusal)
+    if remedy:
+        print(f"remedy={remedy}")
     return 0
 
 
@@ -1079,8 +1311,16 @@ def main(argv: list[str] | None = None) -> int:
         help="write the confirmed rows as a paste-ready golden_paths corpus",
     )
 
+    h = sub.add_parser("harvest", help="append confirmed rows to a golden-paths corpus file")
+    h.add_argument(
+        "--rows", required=True, type=Path, help="the rows file verdict --out-rows wrote"
+    )
+    h.add_argument(
+        "--corpus", required=True, type=Path, help="the golden-paths corpus to extend, in place"
+    )
+    h.add_argument("--surface", required=True, help="the surface field for every harvested row")
+
     c = sub.add_parser("conclude", help="map the fold + model signals to ONE lane conclusion")
-    c.add_argument("--lane", required=True, choices=["fork", "same-repo"])
     c.add_argument(
         "--fold",
         required=True,
@@ -1090,7 +1330,7 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument(
         "--model",
         default="",
-        help="the parsed Scope-Verdict header (PASS/CONCERNS/BLOCK); anything else reads as UNKNOWN",
+        help="the parsed Scope-Verdict header (PASS/BLOCK); anything else reads as UNKNOWN",
     )
     c.add_argument(
         "--marker",
@@ -1102,6 +1342,23 @@ def main(argv: list[str] | None = None) -> int:
         dest="nothing_new",
         default="false",
         help="true when validate short-circuited (exit 3): every candidate is already a committed golden path",
+    )
+    c.add_argument(
+        "--refusal",
+        default="",
+        help=(
+            "the validate return code; the codes that name their own cause select that "
+            "cause as the why and print a remedy= line, and any other value is ignored"
+        ),
+    )
+    c.add_argument(
+        "--scope-unresolved",
+        dest="scope_unresolved",
+        default="false",
+        help=(
+            "true when the generate job never wrote in_scope (it timed out, failed or "
+            "was cancelled); names that cause on an unsettled no-report run"
+        ),
     )
     c.add_argument(
         "--gap-script",
@@ -1148,6 +1405,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if parsed.command == "validate":
             return validate(parsed.candidates, parsed.corpus, parsed.out)
+        if parsed.command == "harvest":
+            return harvest(parsed.rows, parsed.corpus, parsed.surface)
         if parsed.command == "conclude":
             return _cmd_conclude(parsed)
         if parsed.command == "monotonic":

@@ -102,8 +102,15 @@ export interface Run {
    *  delivery happened; this proves the draft still on the pull request is that one,
    *  because a later run replaces the draft rather than editing it. */
   posted_review_ids?: Record<string, string>
+  /** Findings the user chose not to send, keyed by change id then comment key,
+   *  each with the reason given. A dismissed finding is never posted. */
+  dismissed?: Record<string, Record<string, DismissedFinding>>
   posting?: boolean
   post_error?: string | null
+}
+
+export interface DismissedFinding {
+  reason: string
 }
 
 export interface PoolStats {
@@ -252,6 +259,8 @@ export interface RepoPr {
    *  (`lib/persist.ts` keeps a 24h snapshot) predates the field, so a reader
    *  must tolerate its absence. */
   labels?: string[]
+  /** `owner/name`; set only on review-queue rows, which span repos. */
+  repo?: string
 }
 
 /** The minimum needed to open a PR in the detail pane.
@@ -270,6 +279,13 @@ export interface PrRef {
   draft?: boolean
   reviewed?: boolean
   reviewed_stale?: boolean
+}
+
+/** The "awaiting my review" queue: `RepoPr` rows spanning many repos. */
+export interface ReviewQueueResponse {
+  prs: RepoPr[]
+  truncated?: boolean
+  setup_required?: boolean
 }
 
 export interface RepoPrsResponse {
@@ -342,7 +358,7 @@ export interface LearningsResponse {
 
 export type MainView = 'reviews' | 'learning' | 'settings'
 /** Which list the middle column shows: the active repo's PRs, or the threads. */
-export type ListTab = 'pulls' | 'reviews'
+export type ListTab = 'pulls' | 'reviews' | 'queue'
 export type RailSection = 'repos' | 'reviews' | 'learning' | 'settings'
 
 // --- Follow-up sessions ------------------------------------------------------

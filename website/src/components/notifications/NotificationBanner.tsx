@@ -4,19 +4,24 @@ import { AnimatePresence, motion, useReducedMotion, type TargetAndTransition } f
 import { i18nT } from '../../i18n/t'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { ackNotification } from '../../store/notificationsSlice'
+import { setActiveId } from '../../store/instancesSlice'
+import { useLocalCrewHidden } from '../overlayRoot'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useGuardedLeave } from '../NavigationLeaveGuard'
 import Clickable from '../Clickable'
+import Glass from '../Glass'
 import ErrorNotice from '../ErrorNotice'
 import { MC_LIVE_NOTIFICATION_EVENT, type McLiveNotificationDetail } from '../../hooks/notificationEvent'
 import { isWindowAway } from '../../hooks/windowAway'
+import { getViewedThreadSlot } from '../../lib/viewedThread'
 import {
   BANNER_AUTO_HIDE_MS, BANNER_DECK_DEPTH, BANNER_EXPANDED_MAX, MC_BANNER_SETTING_CHANGED_EVENT,
   loadBannerEnabled, shouldBannerNote,
 } from '../../hooks/notificationBanner'
 import type { Notification } from '../../types'
 import { notePriority, safeInternalUrl } from './notifMeta'
-import NotificationCard, { CARD_MATERIAL, type NotificationCardAction } from './NotificationCard'
+import NotificationCard, { CARD_RADIUS, type NotificationCardAction } from './NotificationCard'
+import { CrewmateRosterError, noteMember } from './CrewmateNoteFace'
 
 /** Where a leaving card travels: the vector from its own top-right corner to
  *  the bell's centre, so with `transform-origin: top right` the card shrinks
@@ -35,17 +40,23 @@ export function computeExitDelta(card: DOMRect, bell: DOMRect): ExitDelta {
  *  lights as the card goes — and a card with no measured delta (bell unmounted,
  *  first paint) fades too rather than flying to a guessed point. */
 export function exitTarget(delta: ExitDelta | undefined, reduced: boolean): TargetAndTransition {
-  if (reduced || !delta) return { opacity: 0, transition: { duration: 0.18 } }
+  // A leaving card overlaps the slot the next card slides into, so it must stop
+  // taking the pointer as soon as exit starts. Framer Motion treats this
+  // non-animatable value as an instant target update.
+  if (reduced || !delta) return { opacity: 0, pointerEvents: 'none', transition: { duration: 0.18 } }
   return {
     x: delta.dx, y: delta.dy, scale: 0.15, opacity: 0, originX: 1, originY: 0,
+    pointerEvents: 'none',
     transition: { duration: 0.26, ease: [0.4, 0, 1, 1] },
   }
 }
 
-/** Deck geometry per depth behind the top card: offset, scale, opacity. */
+/** Deck geometry per depth behind the top card: offset and scale. Recession
+ *  is the shell's own `glass-faded` tint step, never an opacity on this
+ *  wrapper: opacity < 1 would make it a backdrop root and void the glass
+ *  pane's blur, so page content would print through the shell unblurred. */
 const DECK_Y = [0, 4, 8]
 const DECK_SCALE = [1, 0.98, 0.96]
-const DECK_OPACITY = [1, 0.8, 0.55]
 
 type ExitDeltas = Record<string, ExitDelta | undefined>
 
@@ -118,6 +129,10 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   const stackRef = useRef<HTMLDivElement>(null)
   const pendingRef = useRef(pending)
   pendingRef.current = pending
+  // The notes rendered as cards by the last render. A card in `cardEls` but not
+  // in here is LEAVING: AnimatePresence keeps it mounted, focus and all, until
+  // its exit animation ends.
+  const shownRef = useRef<ReadonlySet<string>>(new Set())
 
   const measureExit = useCallback((tsList: string[]) => {
     const bell = bellRef.current?.getBoundingClientRect()
@@ -185,6 +200,16 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
 
   useEffect(() => clearTimer, [clearTimer])
 
+  /** Whether focus on `node` holds the clock: inside the stack, and not inside
+   *  a card that is only still mounted to play its exit. */
+  const holdsFocus = useCallback((node: Node | null) => {
+    if (!node || !stackRef.current?.contains(node)) return false
+    for (const [ts, el] of cardEls.current) {
+      if (!shownRef.current.has(ts) && el.contains(node)) return false
+    }
+    return true
+  }, [])
+
   // Re-derive the holds from the DOM after every change to the deck, because a
   // card's removal destroys the ownership without firing the event that
   // releases it: an unmounted focused element sends no blur, so `blurCapture`
@@ -193,9 +218,12 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   //
   // The two owners are re-read differently because they are owned at different
   // levels. FOCUS is owned by an ELEMENT, so the only truthful answer is
-  // whether the stack still contains the active one -- true while a SURVIVING
-  // card holds it, false the moment the holder is unmounted (focus falls to
-  // `body`). The POINTER is owned by the CONTAINER, and removing a card inside
+  // whether a SURVIVING card holds the active one. "The stack contains it" is
+  // not that answer: a card that leaves -- dismissed, or pushed out of view by
+  // an arrival -- stays mounted, still focused, through its exit animation, and
+  // when it finally unmounts nothing re-runs this effect. So focus inside a
+  // leaving card is released here, as it starts to leave, not when it is gone.
+  // The POINTER is owned by the CONTAINER, and removing a card inside
   // it does not move the boundary the enter/leave pair is measured at, so a
   // pointer hold stays owned and only a real `pointerleave` releases it -- the
   // one exception being an empty deck, where there is no box left to be over.
@@ -203,11 +231,16 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   // Runs as an effect, not inside `removeNotes`: the handler fires BEFORE React
   // commits the removal, so `document.activeElement` there is still the button
   // that is about to disappear.
+  //
+  // Keyed on everything `visible` is derived from, not on `pending` alone:
+  // expanding the deck, or crossing the mobile breakpoint, changes what is
+  // rendered with no note arriving or leaving, and unmounts controls the user
+  // may be focused on -- the "+N" pill and the deck shells both expand it.
   useEffect(() => {
-    focusedWithin.current = !!stackRef.current?.contains(document.activeElement)
+    focusedWithin.current = holdsFocus(document.activeElement)
     if (pendingRef.current.length === 0) hovering.current = false
     syncPaused()
-  }, [pending, syncPaused])
+  }, [pending, expanded, isMobile, holdsFocus, syncPaused])
 
   // ---- arrival -----------------------------------------------------------------
   useEffect(() => {
@@ -220,6 +253,9 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
         // The complement of the OS toast's gate (useNativeNotification): the
         // two surfaces split the same line, so a live note lands on exactly one.
         windowFocused: !isWindowAway(),
+        // Read at arrival, like focus: the Members page registers its thread
+        // only while it is visible and focused.
+        viewedThread: getViewedThreadSlot(),
       })
       if (!ok) return
       const next = [note, ...pendingRef.current.filter(n => n.ts !== note.ts)]
@@ -270,6 +306,13 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   }, [pending, removeNotes])
 
   // ---- actions ----------------------------------------------------------------
+  // The banner shows over every Crew, but its actions land in the local one (a
+  // navigation, the leave-guard prompt), so over a remote Crew each brings the
+  // local Crew forward first.
+  const crewHidden = useLocalCrewHidden()
+  const showLocalCrew = useCallback(() => {
+    if (crewHidden) dispatch(setActiveId(null))
+  }, [crewHidden, dispatch])
   const openNote = useCallback((n: Notification) => {
     removeNotes([n.ts])
     onOpenNote(n.ts)
@@ -281,6 +324,7 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
   // card in place with a notice instead of a vanished card and a note the
   // server still holds unread.
   const runAction = useCallback((n: Notification, url: string) => {
+    showLocalCrew()
     leave(async () => {
       const result = await dispatch(ackNotification(n.ts))
       if (ackNotification.rejected.match(result)) {
@@ -291,25 +335,32 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
       removeNotes([n.ts])
       navigate(url)
     }, url)
-  }, [dispatch, removeNotes, leave, navigate])
+  }, [dispatch, removeNotes, leave, navigate, showLocalCrew])
 
   // "+N more in your inbox" goes where the popover's own "Open inbox" goes --
   // the /notifications page -- so the word names one place. Guarded like every
   // other navigation out of a floating surface.
   const openInbox = useCallback(() => {
+    showLocalCrew()
     leave(() => {
       removeNotes(pendingRef.current.map(n => n.ts))
       navigate('/notifications')
     }, '/notifications')
-  }, [removeNotes, leave, navigate])
+  }, [removeNotes, leave, navigate, showLocalCrew])
 
   const anyCritical = pending.some(n => notePriority(n) === 'critical')
   // Mobile shows the newest card alone: there is no room for a deck, and the
   // bell is one tap away for the rest.
   const visible = isMobile ? pending.slice(0, 1) : expanded ? pending.slice(0, BANNER_EXPANDED_MAX) : pending.slice(0, 1 + BANNER_DECK_DEPTH)
+  shownRef.current = new Set(visible.map(n => n.ts))
   const overflow = expanded && !isMobile ? pending.length - visible.length : 0
   const deckHidden = !expanded && !isMobile ? pending.length - 1 : 0
   const moreLabel = i18nT('components.notifications.notificationBanner.show_more_notifications_count', { count: deckHidden })
+  // A failed crewmate-roster read is reported once on the banner, on the first
+  // full card showing a crewmate's note. Deck shells draw no face, so they
+  // never carry it. The bell popover and the inbox, which report it on their
+  // own, suppress the banner while they are on screen.
+  const rosterReportTs = visible.find((n, idx) => (expanded || isMobile || idx === 0) && noteMember(n))?.ts
 
   const setCardEl = (ts: string) => (el: HTMLElement | null) => {
     if (el) cardEls.current.set(ts, el); else cardEls.current.delete(ts)
@@ -333,14 +384,20 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
         className={`relative pointer-events-auto ${expanded ? 'flex flex-col gap-2' : ''}`}
         onPointerEnter={() => { hovering.current = true; syncPaused() }}
         onPointerLeave={() => { hovering.current = false; syncPaused() }}
-        onFocusCapture={() => { focusedWithin.current = true; syncPaused() }}
+        onFocusCapture={e => { focusedWithin.current = holdsFocus(e.target); syncPaused() }}
         onBlurCapture={e => {
           if (e.currentTarget.contains(e.relatedTarget as Node | null)) return
           focusedWithin.current = false
           syncPaused()
         }}
       >
-        <AnimatePresence custom={exitDeltas.current} initial={false}>
+        {/* `popLayout` takes a leaving card out of flow the instant it is
+            dismissed, so the card behind it moves into its slot straight away
+            instead of after the exit finishes. Every card's close sits at the
+            same offset from the card's top-right corner, so the next close
+            lands under the pointer and repeated clicks clear the stack, the
+            way closing iOS notifications or Chrome tabs does. */}
+        <AnimatePresence custom={exitDeltas.current} initial={false} mode="popLayout">
           {visible.map((n, idx) => {
             const prio = notePriority(n)
             const deck = !expanded && !isMobile && idx > 0
@@ -369,37 +426,50 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
                 layout={!reduced}
                 initial={enterInitial}
                 animate={reduced
-                  ? { opacity: DECK_OPACITY[deck ? idx : 0] }
+                  ? { opacity: 1, pointerEvents: 'auto' }
                   // Deck cards shrink about the top centre so both side edges
                   // recede evenly; the exit re-anchors to the top-right corner
                   // the travel vector was measured from.
-                  : { x: 0, y: deck ? DECK_Y[idx] : 0, scale: deck ? DECK_SCALE[idx] : 1, opacity: DECK_OPACITY[deck ? idx : 0], originX: deck ? 0.5 : 1, originY: 0 }}
+                  : { x: 0, y: deck ? DECK_Y[idx] : 0, scale: deck ? DECK_SCALE[idx] : 1, opacity: 1, originX: deck ? 0.5 : 1, originY: 0, pointerEvents: 'auto' }}
                 variants={variants}
                 exit="exit"
-                transition={{ duration: 0.22, ease: 'easeOut' }}
+                transition={{
+                  duration: 0.22, ease: 'easeOut',
+                  // The slide into a dismissed card's slot is the one motion a
+                  // user chases with a second click, so it is short and
+                  // front-loaded (ease-out-expo): the next close is under the
+                  // pointer within a few frames instead of at the end.
+                  layout: { duration: 0.16, ease: [0.16, 1, 0.3, 1] },
+                }}
                 // A deck card is pinned to the top card's box (inset 0 on the
                 // relative stack), so the blank shell always matches its height.
-                style={{ zIndex: 10 - idx, ...(deck ? { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 } : {}) }}
+                // The top card is `relative` so its zIndex applies: unpositioned,
+                // it painted UNDER the absolute shells, which blurred it and
+                // took its close click (the click expanded the deck instead).
+                style={{ zIndex: 10 - idx, ...(deck ? { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 } : { position: 'relative' }) }}
                 data-testid="notification-banner-card"
                 data-priority={prio}
                 data-deck={deck ? 'true' : undefined}
                 className="rounded-2xl"
               >
                 {deck ? (
-                  // A peeking deck card is a BLANK shell -- the card material
+                  // A peeking deck card is a BLANK shell -- the card's glass
                   // and nothing else, as in the chosen mockup -- so no text,
                   // icon or time can print through the translucent top card.
                   // It is one control: "show me the rest".
-                  <Clickable
+                  <Glass
+                    as="button"
+                    type="button"
+                    variant="panel"
+                    radius={CARD_RADIUS}
                     aria-label={moreLabel}
                     data-testid="notification-banner-deck-shell"
-                    className={`notif-material h-full cursor-pointer rounded-2xl ${CARD_MATERIAL.banner}`}
+                    className="notif-material glass-shadow glass-faded block w-full h-full cursor-pointer"
                     onClick={() => setExpanded(true)}
                   />
                 ) : (
                   <NotificationCard
                     n={n}
-                    elevation="banner"
                     onOpen={() => openNote(n)}
                     openLabel={i18nT('components.notifications.notificationBanner.open_notification', { title: n.title })}
                     onDismiss={() => removeNotes([n.ts])}
@@ -408,18 +478,23 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
                     dismissVisible={isMobile}
                     actions={actions}
                     actionsAlign="end"
-                    footer={ackFailed[n.ts] ? (
-                      /* No hand-off: this card floats over whatever page the
-                         user is on, which may hold an unsaved draft (a chat
-                         composer, a settings form) that the hand-off's
-                         navigation to the chat would destroy. The action
-                         button on the card is the retry. */
-                      <ErrorNotice
-                        variant="inline"
-                        testId="notification-banner-ack-failed"
-                        message={i18nT('components.notifications.notificationBanner.mark_read_failed')}
-                        onDismiss={() => setAckFailed(prev => { const { [n.ts]: _drop, ...rest } = prev; void _drop; return rest })}
-                      />
+                    footer={ackFailed[n.ts] || n.ts === rosterReportTs ? (
+                      <>
+                        {ackFailed[n.ts] && (
+                          /* No hand-off: this card floats over whatever page the
+                             user is on, which may hold an unsaved draft (a chat
+                             composer, a settings form) that the hand-off's
+                             navigation to the chat would destroy. The action
+                             button on the card is the retry. */
+                          <ErrorNotice
+                            variant="inline"
+                            testId="notification-banner-ack-failed"
+                            message={i18nT('components.notifications.notificationBanner.mark_read_failed')}
+                            onDismiss={() => setAckFailed(prev => { const { [n.ts]: _drop, ...rest } = prev; void _drop; return rest })}
+                          />
+                        )}
+                        {n.ts === rosterReportTs && <CrewmateRosterError />}
+                      </>
                     ) : null}
                   />
                 )}
@@ -428,10 +503,14 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
           })}
         </AnimatePresence>
         {overflow > 0 && (
-          <Clickable
-            className={`notif-material rounded-xl ${CARD_MATERIAL.banner} px-3 py-1.5 text-[12px] text-accent text-center cursor-pointer`}
+          <Glass
+            as="button"
+            type="button"
+            variant="chip"
+            radius={12}
+            className="notif-material glass-shadow glass-hover px-3 py-1.5 text-[12px] text-accent text-center cursor-pointer font-body"
             onClick={openInbox}
-          >{i18nT('components.notifications.notificationBanner.more_in_inbox_count', { count: overflow })}</Clickable>
+          >{i18nT('components.notifications.notificationBanner.more_in_inbox_count', { count: overflow })}</Glass>
         )}
         {deckHidden > 0 && (
           // The deck's peeking edges are a few pixels tall, so the "N more"

@@ -15,6 +15,7 @@ const http = require("http");
 const { app, ipcMain } = require("electron");
 const Store = require("electron-store");
 const { seedRenamedStore } = require("../store-rename");
+const { sessionCookieHeader } = require("../mochi-session-token");
 const { parseMochiEnabled, remoteEnabledState, hostDisabledMeansTeardown } = require("./instanceGate");
 const {
   SELF_INSTANCE,
@@ -124,12 +125,23 @@ async function gatewayToken() {
  * then 401 forever, reproducing this exact bug on a delay. Sent as a
  * `Cookie` header it is checked against `session_exp` instead (hours, not
  * minutes) — the same field the browser itself relies on.
+ *
+ * The request is addressed at the URL it was built from. Nothing here re-derives
+ * a destination: the gateway holds every loopback family the configured name
+ * resolves to, and the credential was only minted at all because that coverage
+ * was verified first (`listenerSecretsFor`), so the name the URL already carries
+ * can reach no one else.
  */
 function withGatewayAuth(url, auth) {
   if (!auth || !auth.value) return { url, headers: {} };
   if (auth.viaCookie) {
-    const port = new URL(url).port;
-    return { url, headers: { Cookie: `mc_token_${port}=${auth.value}` } };
+    // The RAW port, matching mochi-session-token.js: this name has to be the one
+    // the GATEWAY chose, and on a scheme-default port that is its own listen
+    // port, which this process cannot know behind a tunnel. A borrowed
+    // credential only ever exists for a URL that stated its port, so resolving a
+    // default here could only ever name another gateway's cookie.
+    const cookie = sessionCookieHeader(url, auth.value);
+    return { url, headers: cookie ? { Cookie: cookie } : {} };
   }
   const sep = url.includes("?") ? "&" : "?";
   return { url: `${url}${sep}token=${encodeURIComponent(auth.value)}`, headers: {} };
@@ -523,11 +535,26 @@ async function resolveMochiTarget(choice) {
   };
 }
 
-/** Log resolution changes only — this runs every reconcile tick. */
-let lastMochiInstanceLog = "";
+// Unknown responses do not replace the last confirmed target: a later successful
+// resolution of that same target is not another state change.
+const MOCHI_INSTANCE_LOG_REPEAT_MS = 60_000;
+const recentMochiInstanceLogs = new Map();
+let lastKnownMochiInstanceState = "";
 function mochiInstanceLog(message) {
-  if (message === lastMochiInstanceLog) return;
-  lastMochiInstanceLog = message;
+  const now = Date.now();
+  for (const [outcome, loggedAt] of recentMochiInstanceLogs) {
+    if (now - loggedAt >= MOCHI_INSTANCE_LOG_REPEAT_MS) recentMochiInstanceLogs.delete(outcome);
+  }
+  const knownState = message !== "could not read the instance list — leaving Mochi where it is" &&
+    !message.includes(" did not answer — leaving Mochi where it is");
+  const stateChanged = knownState && message !== lastKnownMochiInstanceState;
+  if (knownState) lastKnownMochiInstanceState = message;
+  // A known target that has not changed was already logged when it became
+  // current; suppress it indefinitely so a steady state cannot re-log once the
+  // repeat window lapses. The TTL re-log is for unknown outcomes only.
+  if (knownState && !stateChanged) return;
+  if (!stateChanged && recentMochiInstanceLogs.has(message)) return;
+  recentMochiInstanceLogs.set(message, now);
   glog(`mochi instance: ${message}`);
 }
 

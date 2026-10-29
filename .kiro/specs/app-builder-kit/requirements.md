@@ -55,7 +55,7 @@ re-implementing tables, cards, and state views in every app.
 1. WHEN a pending tool call has a matching tool-view schema THEN the kit SHALL render a rich preview inside `ApprovalCard` / `ToolInputPreview` in place of the raw `<pre>` dump as the default view.
 2. WHERE a tool-view schema does not match THE approval surface SHALL fall back to the current `ToolInputPreview` `<pre>` behavior.
 3. WHEN the operator approves or rejects THEN the decision SHALL flow through the existing `onApprove(decision, pattern?)` callback and the kit SHALL NOT introduce a new approval API path.
-4. WHEN an approval decision is submitted from a chat slot THEN it SHALL resolve via the existing slot-scoped `api.approveChatSlot(slot, action, extra)` path in `ChatInput.tsx`.
+4. WHEN an approval decision is submitted from a chat slot THEN it SHALL resolve via the existing slot-scoped `api.approveChatSlot(slot, action, extra)` path in `chat-input/approval.ts`.
 5. IF the approval controls are rendered THEN they SHALL be keyboard operable (operators batch-approve).
 6. WHERE a rich preview is shown for a pending tool call THE exact, unmodified raw tool input SHALL remain available to the operator one interaction away (e.g. an expandable "show raw input" control). A rich renderer is lossy by design (`extra` passthrough fields, truncated series, fields the view does not plot) and tool input is attacker-influenceable; the operator MUST be able to inspect the verbatim args before approving so a consequential argument is never hidden by the summary.
 
@@ -100,7 +100,7 @@ re-implementing tables, cards, and state views in every app.
 
 **User Story:** As an implementer, I need a defined wire encoding for typed tool output AND a named producer that emits it, so that the tool-view renderers (Req 2/3) have something real to dispatch on instead of assuming an AI-SDK-style part stream this codebase does not produce.
 
-**Context (verified against the codebase):** The dashboard chat transport is markdown + `<mcwidget>` blocks (`website/src/hooks/useBlockAssembler.ts`), and tool activity reaches the frontend as **opaque strings** — `input?: string` / `output?: string` and `tool_input: string` in `website/src/types/index.ts`. There is no typed `tool-<name>` part stream today. Requirement 2/3's `ToolRenderer` therefore has no producer within a frontend-only scope, and the design must not silently smuggle in a backend wire-format change.
+**Context (verified against the codebase):** The dashboard chat transport is markdown + `<mcwidget>` blocks (`website/src/hooks/useBlockAssembler.ts`), and tool activity reaches the frontend as **opaque strings** — `input?: string` / `output?: string` and `tool_input: string` in `website/src/types/index.chat.ts`. There is no typed `tool-<name>` part stream today. Requirement 2/3's `ToolRenderer` therefore has no producer within a frontend-only scope, and the design must not silently smuggle in a backend wire-format change.
 
 #### Acceptance Criteria
 1. WHEN the kit defines how a typed tool view is addressed THEN the spec SHALL define the **encoding** carried inside the existing opaque `output`/`tool_input` string — the chosen mechanism SHALL be a **fenced `<mcwidget>`-adjacent JSON convention** (a `tool-view` block: `{"tool":"<name>","schemaVersion":1,"data":{...}}`) parsed by `ContentRenderer`, so it rides the existing markdown/`<mcwidget>` transport with NO backend wire-format change.

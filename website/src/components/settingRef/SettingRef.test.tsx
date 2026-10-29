@@ -7,7 +7,11 @@
  */
 import { describe, it, expect, vi } from 'vitest'
 import { render, fireEvent } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
+import {
+  NavigationLeaveGuardProvider,
+  useRegisterNavigationLeaveGuard,
+} from '../NavigationLeaveGuard'
 import { SettingRef } from './SettingRef'
 import type { SchemaEntry } from './resolveSettingRef'
 
@@ -27,6 +31,24 @@ vi.mock('../commandPalette/settingsRegistry.gen', () => ({
       type: 'select',
       occurrence: 1,
       configKey: 'chat.default_model',
+    },
+    {
+      id: 'chat.selectable-models',
+      label: 'Selectable Models',
+      tab: 'chat',
+      type: 'select',
+      occurrence: 1,
+      params: { sub: 'models' },
+      configKey: 'dashboard.model_picker_hidden_models',
+    },
+    {
+      id: 'channels.slack.bot-token',
+      label: 'Bot Token',
+      tab: 'channels',
+      type: 'text',
+      occurrence: 1,
+      params: { channel: 'slack' },
+      configKey: 'slack.bot_token',
     },
   ],
 }))
@@ -61,6 +83,64 @@ describe('SettingRef component', () => {
     it('displays the configKey text', () => {
       const { container } = renderRef({ configKey: 'chat.default_model' })
       expect(container.textContent).toContain('chat.default_model')
+    })
+
+    it('carries the entry\'s params.sub as the second path segment', () => {
+      // Settings → Chat is a SubNav rail: without the page segment the rail
+      // opens its first page and the highlight never finds the control.
+      const { container } = renderRef({ configKey: 'dashboard.model_picker_hidden_models' })
+      expect(container.querySelector('a')!.getAttribute('href'))
+        .toBe('/settings/chat/models?highlight=key%3Adashboard.model_picker_hidden_models')
+    })
+
+    it('carries a legacy channel param as the second path segment', () => {
+      const { container } = renderRef({ configKey: 'slack.bot_token' })
+      expect(container.querySelector('a')!.getAttribute('href'))
+        .toBe('/settings/channels/slack?highlight=key%3Aslack.bot_token')
+    })
+  })
+
+  describe('mode: ui asks the leave guard before navigating', () => {
+    // A chat with an unsent draft publishes a veto; the chip unmounts that page,
+    // so a plain click must ask first, exactly like SettingsLink.
+    function Guarded({ guard, children }: { guard: () => boolean; children: React.ReactNode }) {
+      useRegisterNavigationLeaveGuard(guard)
+      return <>{children}</>
+    }
+    function Where() {
+      return <span data-testid="where">{useLocation().pathname}</span>
+    }
+    function renderGuarded(guard: () => boolean) {
+      return render(
+        <MemoryRouter initialEntries={['/chat']}>
+          <NavigationLeaveGuardProvider>
+            <Guarded guard={guard}>
+              <SettingRef configKey="chat.default_model" />
+              <Where />
+            </Guarded>
+          </NavigationLeaveGuardProvider>
+        </MemoryRouter>,
+      )
+    }
+
+    it('stays on the page when the guard keeps the draft', () => {
+      const guard = vi.fn(() => false)
+      const { container, getByTestId } = renderGuarded(guard)
+      const ev = fireEvent.click(container.querySelector('a')!)
+      expect(ev).toBe(false)
+      expect(guard).toHaveBeenCalledTimes(1)
+      expect(getByTestId('where').textContent).toBe('/chat')
+    })
+
+    it('navigates when the guard allows it, and leaves modified clicks alone', () => {
+      const guard = vi.fn(() => true)
+      const { container, getByTestId } = renderGuarded(guard)
+      const link = container.querySelector('a')!
+      fireEvent.click(link, { metaKey: true })
+      expect(guard).not.toHaveBeenCalled()
+      fireEvent.click(link)
+      expect(guard).toHaveBeenCalledTimes(1)
+      expect(getByTestId('where').textContent).toBe('/settings/chat')
     })
   })
 

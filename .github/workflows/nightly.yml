@@ -202,6 +202,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
+      max-parallel: 4
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15, windows-latest]
@@ -366,6 +367,110 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # The process-ownership gates: open sessions, close them, and require that
+  # nothing this instance created is still on the machine.
+  #
+  # Nightly and Linux-only, because the thing being measured only exists here. An
+  # agent runtime is placed in a per-instance `kirocrew-agents-<token>.slice`, and
+  # that needs a `systemd --user` manager -- which a hosted runner does NOT have
+  # by default, exactly as the pod-scenarios job above documents. Without one the
+  # product spawns agents unwrapped, no slice is ever created, and every leak
+  # population reads empty for want of somewhere to look. So the session is
+  # started the same way, with the same proof, and the suite refuses to report a
+  # clean machine rather than measuring nothing.
+  #
+  # Not on the per-commit path: each test boots a real gateway and drives real
+  # turns, and the invariant it pins is about accumulation over a run rather than
+  # about a single commit's diff.
+  process-leak-invariant:
+    name: Process Leak Invariant + Chaos (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e . --group dev
+
+      # Same remedy and same PROOF as pod-scenarios: linger starts the per-user
+      # manager independently of a login session, and the two locators are
+      # exported because systemctl --user finds the manager through them and a
+      # non-login shell inherits neither. Proven in the log rather than assumed --
+      # a broken session would otherwise become a silently skipped suite, and the
+      # require switch below would be the only thing catching it.
+      - name: Start a systemd --user session
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          UID_NUM="$(id -u)"
+          echo "XDG_RUNTIME_DIR=/run/user/${UID_NUM}" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${UID_NUM}/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="/run/user/${UID_NUM}"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${UID_NUM}/bus"
+          for _ in $(seq 1 30); do
+            [ -S "${XDG_RUNTIME_DIR}/bus" ] && break
+            sleep 1
+          done
+          echo "--- proof: systemd --user is reachable ---"
+          systemctl --user --version | head -1
+          systemctl --user show-environment >/dev/null
+          # The capability the harness itself probes: a transient scope must be
+          # creatable, not merely a bus reachable. --collect leaves nothing loaded.
+          systemd-run --user --scope --collect --quiet true
+          echo "transient --user scopes are creatable"
+
+      # The agent spawn needs a usable namespace sandbox, or the gateway's boot
+      # probe refuses and no agent process is ever created. Same opt-in and same
+      # proof the pod and e2e jobs use.
+      - name: Enable unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Verify the namespace sandbox backend is available
+        run: unshare --mount --map-root-user true
+
+      # The canary pattern: an exit code cannot tell "the invariant held" from
+      # "every test skipped", and a precondition-gated suite degrades into exactly
+      # that. KIROCREW_E2E_REQUIRE turns each precondition skip into a failure;
+      # the grep is the second belt. Raise the count when a test is added here.
+      - name: Run the leak invariant and chaos gates
+        env:
+          KIROCREW_E2E: "1"
+          KIROCREW_E2E_REQUIRE: "1"
+          KIROCREW_HARNESS_READY_TIMEOUT: "90"
+        run: |
+          set -uo pipefail
+          echo "::remove-matcher owner=python::"
+          python -m pytest -v -p no:cacheprovider -o addopts= -n0 --no-cov \
+            --timeout=900 \
+            test/e2e/test_process_leak_invariant.py \
+            test/e2e/test_process_chaos.py 2>&1 | tee process-leak.log
+          status="${PIPESTATUS[0]}"
+          echo "pytest exit: ${status}"
+          if ! grep -qE '(^|[^0-9])3 passed' process-leak.log; then
+            echo "::error::the process-leak suite did not report 3 passed; a skipped or collapsed suite is not a pass"
+            exit 1
+          fi
+          exit "${status}"
+
+      # The reconciliation dump an assertion prints is the only place a surviving
+      # process is named, and the job log carries only the tail pytest chose.
+      - name: Upload the harness log
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: process-leak-invariant-log
+          path: process-leak.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   build-wheel:
     name: Build Wheel
     needs: [version]
@@ -386,6 +491,21 @@ jobs:
       # reads "this version has both arches". release.yml does record that
       # claim and therefore keeps the default (false).
       soft_fail_arm64: true
+      # Also build the arm64-only and x86_64-only macOS DMGs
+      # (unsigned-build-darwin-arm64 / -x64). Each is signed, notarized and
+      # fed by its OWN sign-and-notarize caller below (mac_variant), under
+      # feed/nightly/<arch>/; the universal caller still excludes both
+      # artifact names, so the universal DMG stays the only mac bytes it sees.
+      # release.yml passes the same and carries both DMGs in the stable
+      # promotion bundle.
+      mac_single_arch: true
+      # A failed single-arch macOS build must not skip the universal signing
+      # or the Linux publishers on THIS lane: nightly records no cross-arch
+      # completeness claim (no promotion bundle), so the other lanes publish
+      # and the failed arch's own sign-and-notarize caller fails at
+      # download-artifact. release.yml keeps the default (false): there both
+      # DMGs are REQUIRED promotion-bundle roles.
+      soft_fail_mac_single_arch: true
 
   # Windows builds in its own workflow because it Authenticode-signs during the
   # build (the Squirrel installer embeds already-signed executables), so unlike
@@ -667,3 +787,51 @@ jobs:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}
       write_feed: true
+
+  # The two single-arch macOS legs: one sign-and-notarize call each, differing
+  # from the universal caller above in `mac_variant` + `mac_artifact` alone.
+  # Same gates (dependency audit, macOS platform suite) as every other
+  # shipper. NOT `needs: build-wheel`: a single-arch leg downloads only its
+  # own build artifact and attests no wheel. Their build job is
+  # continue-on-error in build-desktop.yml so the universal leg is never held
+  # by them; when that build failed, the leg here fails at download-artifact,
+  # which is the right colour for a lane that now publishes.
+  sign-and-notarize-arm64:
+    name: Sign + Notarize macOS (arm64 only)
+    needs: [version, build-desktop, dependency-vulnerability-gate, platform-tests]
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    uses: ./.github/workflows/sign-and-notarize.yml
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+      AWS_SIGNING_BUCKET: ${{ secrets.AWS_SIGNING_BUCKET }}
+      AWS_SIGNER_ACCESS_ROLE_ARN: ${{ secrets.AWS_SIGNER_ACCESS_ROLE_ARN }}
+      CDSIGNER_API_ENDPOINT: ${{ secrets.CDSIGNER_API_ENDPOINT }}
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      write_feed: true
+      mac_variant: arm64
+      mac_artifact: unsigned-build-darwin-arm64
+
+  sign-and-notarize-x64:
+    name: Sign + Notarize macOS (x64 only)
+    needs: [version, build-desktop, dependency-vulnerability-gate, platform-tests]
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    uses: ./.github/workflows/sign-and-notarize.yml
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+      AWS_SIGNING_BUCKET: ${{ secrets.AWS_SIGNING_BUCKET }}
+      AWS_SIGNER_ACCESS_ROLE_ARN: ${{ secrets.AWS_SIGNER_ACCESS_ROLE_ARN }}
+      CDSIGNER_API_ENDPOINT: ${{ secrets.CDSIGNER_API_ENDPOINT }}
+    with:
+      channel: nightly
+      version: ${{ needs.version.outputs.nightly_version }}
+      write_feed: true
+      mac_variant: x64
+      mac_artifact: unsigned-build-darwin-x64

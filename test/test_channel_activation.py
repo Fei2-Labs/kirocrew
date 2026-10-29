@@ -310,7 +310,7 @@ class TestHandlerChannelAgent:
             def __init__(self):
                 self.last_agent: str | None = None
 
-            async def get_or_create(self, key, agent=None, channel_id=None):
+            async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
                 self.last_agent = agent
                 return FakeProvider(), True, False
 
@@ -350,7 +350,7 @@ class TestHandlerChannelAgent:
             def dequeue(self, key):
                 return None
 
-            def clear_queue(self, key):
+            def clear_queue(self, key, owned_by=None):
                 pass
 
         slack = MockSlackClient()

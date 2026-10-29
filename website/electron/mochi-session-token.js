@@ -31,6 +31,17 @@
  */
 async function borrowSessionToken({ electronSession, backendUrl }) {
   if (!electronSession || typeof electronSession.cookies?.get !== "function") return "";
+  // Deliberately the RAW port, and deliberately fail closed when it is empty.
+  //
+  // `mc_token_<port>` is named by the GATEWAY, after the port the browser's Host
+  // header carried -- and a browser omits a scheme's default port from `Host`,
+  // so the gateway falls back to its OWN listen port there. Behind a tunnel that
+  // listen port is the remote one, which this process cannot know. Resolving the
+  // URL's default port would therefore name a cookie belonging to whichever
+  // gateway last served that port, and cookies are host-scoped only, so such a
+  // cookie is present in this jar. Borrowing it would hand one gateway's session
+  // credential to another. A port the URL states is unambiguous; an absent one
+  // is a guess, and this path declines to guess.
   let port;
   try {
     port = new URL(backendUrl).port;
@@ -47,4 +58,27 @@ async function borrowSessionToken({ electronSession, backendUrl }) {
   }
 }
 
-module.exports = { borrowSessionToken };
+/**
+ * The `Cookie` header that delivers a credential borrowed by borrowSessionToken.
+ *
+ * Same raw-port rule as the borrow, for the same reason: the cookie's name is the
+ * one the GATEWAY chose, and a borrowed credential only exists for a URL that
+ * states its port. Returns "" when the URL states none, so nothing is sent under
+ * a guessed name.
+ *
+ * @param {string} backendUrl the URL the credential was borrowed for.
+ * @param {string} value      the borrowed credential.
+ * @returns {string}
+ */
+function sessionCookieHeader(backendUrl, value) {
+  let port;
+  try {
+    port = new URL(backendUrl).port;
+  } catch {
+    return "";
+  }
+  if (!port || !value) return "";
+  return `mc_token_${port}=${value}`;
+}
+
+module.exports = { borrowSessionToken, sessionCookieHeader };

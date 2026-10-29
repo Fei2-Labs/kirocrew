@@ -35,18 +35,59 @@ Two things this module deliberately does NOT do:
 from __future__ import annotations
 
 import errno
+import importlib as _importlib
 import os
 import shutil
 import stat
 import stat as _stat
-from collections.abc import Iterable, Mapping
-from contextlib import suppress
+import sys as _sys
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
+import kiro_crew._facade_mirror as _facade_mirror
 from kiro_crew.atomic_write import atomic_write, atomic_write_at
-from kiro_crew.platform_compat import open_file_no_reparse
+from kiro_crew.pinned_fs_dirs import (
+    create_and_open_dir_at,
+    create_and_open_dir_pinned,
+    open_pinned_descendant_dir,
+)
+from kiro_crew.pinned_fs_files import (
+    copy_file_pinned,
+    is_regular_at,
+    lstat_by_name,
+    read_file_pinned,
+    stat_at,
+    unlink_pinned,
+    unlink_verified,
+    unlink_verified_by_name,
+    write_file_pinned,
+    write_new_file_pinned,
+)
+from kiro_crew.pinned_fs_primitives import (
+    SKIP_IDENTITY_CHANGED,
+    SKIP_NOT_REGULAR,
+    SKIP_SYMLINK,
+    SKIP_TOO_LARGE,
+    SKIP_UNREADABLE_ENTRY,
+    SKIP_VANISHED,
+    PinnedPathRefusal,
+    SkipReporter,
+    _noop_skip,
+    dir_flags,
+    fatal_skip_reporter,
+    fd_real_path,
+    is_reparse_point,
+    omits_wanted_data,
+    open_fenced_for_read,
+    pin_parent,
+    refuse_hardlink_alias,
+    supports_pinned_tree_walk,
+    supports_pinned_walk,
+)
+from kiro_crew.platform_compat import open_file_no_reparse, pin_directory
 
 __all__ = [
     "PUT_BACK_FAILED",
@@ -77,6 +118,7 @@ __all__ = [
     "stat_at",
     "open_dir_pinned",
     "open_in_pinned_parent",
+    "open_pinned_descendant_dir",
     "open_verified_chain",
     "pin_parent",
     "put_back_no_clobber",
@@ -88,238 +130,8 @@ __all__ = [
     "supports_pinned_tree_walk",
     "supports_pinned_walk",
     "unlink_verified",
+    "unlink_verified_by_name",
 ]
-
-
-class PinnedPathRefusal(Exception):
-    """Raised instead of completing an operation that could not be pinned.
-
-    Neutral on purpose. A caller with its own refusal taxonomy passes that type as
-    ``refusal=`` so its existing error contract is unchanged -- the benchmark
-    harness keeps raising its ``UnsafePathError``, and a snapshot refusal stays
-    something the CLI boundary already knows how to contain.
-    """
-
-
-#: Reason codes handed to an ``on_skip`` reporter. The primitive classifies; the
-#: caller words the message, so user-facing output stays the caller's own.
-SKIP_SYMLINK = "symlink"
-SKIP_VANISHED = "vanished"
-SKIP_NOT_REGULAR = "not_regular"
-SKIP_TOO_LARGE = "too_large"
-SKIP_IDENTITY_CHANGED = "identity_changed"
-#: The entry is still there and this process may not read its metadata or its bytes
-#: -- a platform-protected path, or one an ACL denies. Distinct from SKIP_VANISHED,
-#: which says the name is gone: a caller that must not omit anything silently has to
-#: tell those apart. Spelled for the ENTRY rather than reusing the neighbouring
-#: module's SKIP_UNREADABLE, whose value is a different string for a different
-#: subject (an unreadable trash BATCH).
-SKIP_UNREADABLE_ENTRY = "unreadable_entry"
-
-#: The reason codes that mean "carrying this was never the intent". A symlink and a
-#: non-regular entry are screened on EVERY run, by design, and an archive that screened
-#: one is complete -- there is nothing the operator asked for that it lacks. These two
-#: codes are therefore reserved for a FIRST look: an entry that was regular when the
-#: walk judged it and is a link or a FIFO by the time it is opened has been swapped,
-#: and every site that can observe that reports ``SKIP_IDENTITY_CHANGED`` instead.
-#: Private: the one question a caller may ask is :func:`omits_wanted_data`, so no
-#: caller can build its own partial enumeration from these.
-_NEVER_ARCHIVED = frozenset({SKIP_SYMLINK, SKIP_NOT_REGULAR})
-
-#: The reason codes that mean the archive lacks something it WAS asked to carry: the
-#: bytes were refused, truncated, swapped for another inode mid-copy, or the name went
-#: away between the listing and the copy. Listed so a test can assert the two sets
-#: together cover every ``SKIP_*`` code in this module.
-_OMITS_WANTED_DATA = frozenset(
-    {SKIP_UNREADABLE_ENTRY, SKIP_TOO_LARGE, SKIP_VANISHED, SKIP_IDENTITY_CHANGED}
-)
-
-#: Times :func:`create_and_open_dir_pinned` re-runs its ``mkdir``-then-``open`` pair
-#: when the directory is removed between the two. There is no atomic "create this
-#: directory and open it", so a removal lands INSIDE the sequence and no ordering of
-#: the two calls closes that window -- the answer is to run the sequence again. A
-#: small count is the right bound because an attempt is two syscalls with NO sleep
-#: between them: this is a lost race to redo at once, not a resource to wait on.
-#: Three, so a single interleaving costs one retry, a second one is still absorbed,
-#: and a caller that keeps losing reports rather than spinning: past that point the
-#: removals are not a race being lost but something removing the directory
-#: repeatedly, which no number of attempts fixes and an operator has to see.
-#:
-#: :mod:`kiro_crew.platform_log_append` holds a private bound of the same name and
-#: the same value for its own create-then-open pair, and the two stay separate
-#: deliberately. They govern different sequences with different costs: that one
-#: re-runs a directory create plus a FILE open for best-effort observation, where
-#: losing the race costs one log row, and this one re-runs a directory create plus
-#: the open OF that directory for a caller whose data must land. Sharing one
-#: constant would mean tuning either operation silently retunes the other, and the
-#: equal value today is two similar judgements rather than one decision.
-_CREATE_ATTEMPTS = 3
-
-
-def omits_wanted_data(reason: str) -> bool:
-    """Whether *reason* means the archive lacks something it was asked to carry.
-
-    The single question a retention or completeness decision needs to ask, answered
-    HERE rather than at each consumer. A consumer that names one code has to be found
-    and edited every time a code is added, and until someone does it silently keeps
-    the old answer: a guard that names ``SKIP_UNREADABLE_ENTRY`` lets
-    ``SKIP_TOO_LARGE``, ``SKIP_VANISHED`` and ``SKIP_IDENTITY_CHANGED`` past it into a
-    prune that deletes the last complete backup.
-
-    An UNKNOWN reason answers True, and that direction is the point. This is asked by
-    code deciding whether to DELETE an older archive, so the two wrong answers are not
-    symmetric: keeping a surplus bundle costs disk, and pruning on a reason nobody
-    classified costs the operator's last complete backup. A new code is therefore
-    incomplete-by-default the moment it is reported, before anyone has thought about
-    it, and the completeness test is what tells the author to choose a side.
-    """
-    return reason not in _NEVER_ARCHIVED
-
-
-#: ``(reason_code, by_name_path)``. The path is for the message only -- it is never
-#: re-opened, because re-opening it is the bug this module exists to prevent.
-SkipReporter = Callable[[str, str], None]
-
-
-def _noop_skip(_reason: str, _path: str) -> None:
-    return None
-
-
-def fatal_skip_reporter(what: str, *, refusal: type[Exception] = PinnedPathRefusal) -> SkipReporter:
-    """A reporter that REFUSES instead of recording, for paths where a skip loses data.
-
-    Skipping is the right answer while producing an archive: the entry is omitted, the
-    omission is recorded, and nothing of the operator's is touched. It is the wrong answer
-    on every path that has already moved or deleted the original -- there the skip means
-    the live copy is gone AND the replacement was never written, so the operation
-    "succeeds" having destroyed data.
-
-    The distinction is easy to lose one site at a time -- a backup pass whose skips
-    precede an ``rmtree``, a restore source skipped after the live file was moved aside,
-    a destination subtree that cannot be opened -- so the rule is a parameter a caller
-    passes rather than a condition each site re-implements: archive paths keep the
-    recording reporter, mutating paths pass this one, and which kind a call site is
-    becomes visible at the call site.
-    """
-
-    def _refuse(reason: str, path: str) -> None:
-        raise refusal(
-            f"refusing to continue the {what}: {Path(path).name!r} could not be copied "
-            f"({reason}). This path has already moved or removed what it is replacing, so "
-            "skipping would finish with the original gone and the replacement missing. "
-            "Resolve that entry -- a hardlink alias or a symbolic link is the usual cause "
-            "-- and re-run."
-        )
-
-    return _refuse
-
-
-def supports_pinned_walk() -> bool:
-    """Whether this platform can open relative to a directory descriptor.
-
-    ``O_NOFOLLOW`` is part of the requirement, not an extra: a pinned walk without
-    it would open each ancestor happily through whatever link sits there, which is
-    the hole being closed. Found by the Windows-simulation tests, which delete
-    ``os.O_NOFOLLOW`` and would otherwise have taken this path and crashed.
-    """
-    return (
-        hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW") and os.open in os.supports_dir_fd
-    )
-
-
-def supports_pinned_tree_walk() -> bool:
-    """Whether a whole TREE can be walked without ever re-opening a name.
-
-    Strictly more than :func:`supports_pinned_walk`: descending a tree also needs to
-    list and stat through a descriptor. Without ``os.listdir`` on an fd the walk would
-    have to re-list by name, which reintroduces exactly the ancestor swap the pinned
-    open just refused.
-
-    Note which stat is probed. ``os.lstat`` is NOT a member of
-    ``os.supports_dir_fd`` even on Linux -- the capability belongs to ``os.stat``, and
-    ``lstat(p, dir_fd=fd)`` is documented as ``stat(p, dir_fd=fd,
-    follow_symlinks=False)``. Probing ``os.lstat`` reports False on a platform that
-    fully supports the walk, which would have made every snapshot on Linux refuse and
-    demand the by-name opt-in. The walk below calls ``os.stat`` with
-    ``follow_symlinks=False`` so the call and the probe are the same function.
-    """
-    return supports_pinned_walk() and os.listdir in os.supports_fd and os.stat in os.supports_dir_fd
-
-
-def dir_flags() -> int:
-    """Open flags every pinned directory walk uses: read-only, a directory, never a link.
-
-    Public because a second module needs the same flags to walk a tree the same way, and
-    reaching for a private was the beginning of the divergence this module exists to end.
-    Called rather than captured at import: the Windows-simulation tests delete
-    ``os.O_NOFOLLOW`` at runtime, and a frozen constant would keep offering a flag the
-    platform no longer has.
-    """
-    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-
-
-def pin_parent(
-    resolved_parent: str,
-    *,
-    what: str,
-    refusal: type[Exception] = PinnedPathRefusal,
-) -> int:
-    """Return a descriptor for *resolved_parent*, refusing a component that is now a link.
-
-    One ``openat`` per component, each relative to the previous component's
-    descriptor and each carrying ``O_NOFOLLOW``. Two properties come out of that:
-
-    * a component that became a symlink after *resolved_parent* was computed fails
-      ``O_NOFOLLOW`` and is refused -- this is the check-to-use swap, and it is the
-      reason a single ``os.open(parent, O_DIRECTORY)`` is not enough: that call
-      follows such a link silently and then pins its target;
-    * once a component is open, its descriptor cannot be re-pointed, so everything
-      already traversed is fixed.
-
-    *resolved_parent* must be resolved by the CALLER, once, before this runs.
-    Resolving it here would re-follow whatever an ancestor points at by now, which
-    is the exact mistake that makes this check defensible-looking and useless.
-
-    The descriptor is returned OPEN and the caller must close it. Handing it back
-    rather than doing one open inside is what lets a durable write create its
-    temporary file and rename it over the destination through the same pinned
-    directory, so the swap cannot be redirected between the two steps.
-
-    Not closed: a component swapped BEFORE *resolved_parent* was computed is
-    followed by that resolution. Refusing every symlinked ancestor would close it
-    and would also break paths under ``/tmp`` on macOS, where ``/tmp`` is itself a
-    link.
-    """
-    parts = PurePath(resolved_parent).parts
-    if not parts:  # pragma: no cover - a resolved path always has parts
-        raise refusal(f"refusing to open the {what}: empty parent path")
-
-    if os.path.isabs(resolved_parent):
-        dir_fd = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY)
-        rest = parts[1:]
-    else:  # pragma: no cover - realpath returns absolute paths
-        dir_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
-        rest = parts
-
-    try:
-        for component in rest:
-            try:
-                nxt = os.open(component, dir_flags(), dir_fd=dir_fd)
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise refusal(
-                        f"refusing to write the {what}: the directory {component!r} on "
-                        "the way to it became a symbolic link after the path was "
-                        "checked. A parent swapped for a link redirects the write "
-                        "however carefully the final name is opened, so it is refused."
-                    ) from exc
-                raise
-            os.close(dir_fd)
-            dir_fd = nxt
-    except BaseException:
-        os.close(dir_fd)
-        raise
-    return dir_fd
 
 
 def open_in_pinned_parent(
@@ -386,900 +198,6 @@ def open_dir_pinned(
                 "at. Remove it and re-run."
             ) from exc
         raise
-
-
-def refuse_hardlink_alias(
-    fd: int,
-    *,
-    what: str,
-    name: str,
-    refusal: type[Exception] = PinnedPathRefusal,
-) -> None:
-    """Reject a descriptor that is one of several names for the same inode.
-
-    A hardlink is invisible to every path-based guard: it shares the target's inode,
-    so ``realpath`` yields the alias's own name, ``is_symlink()`` is False, and
-    ``O_NOFOLLOW`` has no link to refuse. A planted alias therefore let an O_TRUNC
-    write destroy a protected file, and let a read hand back its bytes.
-
-    Checked on the DESCRIPTOR rather than the path, which is what makes it
-    race-free: this fd already refers to the inode being judged.
-
-    The cost is honest and small: a file that legitimately has more than one link --
-    a dedup-ing backup tool, a deliberate alias -- is refused. Copy it instead.
-
-    Closes *fd* before raising, so a caller's ``except BaseException: os.close(fd)``
-    must not run for this refusal.
-    """
-    links = os.fstat(fd).st_nlink
-    if links > 1:
-        os.close(fd)
-        raise refusal(
-            f"refusing to use the {what}: {name!r} has {links} hard links, so it is "
-            "another name for a file this command was not pointed at. A path guard "
-            "cannot see that -- the alias shares the target's inode -- so it is "
-            "refused on the open descriptor instead. Remove the extra link or use a "
-            "different path."
-        )
-
-
-def fd_real_path(fd: int) -> str | None:
-    """Real filesystem path of an OPEN descriptor, or ``None`` when unreadable.
-
-    The descriptor-pinned twin of ``realpath``: the name it returns is the
-    kernel's own answer for the inode already held open, so it carries no
-    symlink component left to swap -- which is what makes it usable as the
-    containment witness after an ``O_NOFOLLOW`` open (validate the path the
-    descriptor REALLY refers to, not the path it was opened by).
-
-    Platform routes: ``/proc/self/fd`` on Linux, ``fcntl.F_GETPATH`` on macOS,
-    ``GetFinalPathNameByHandleW`` on Windows. Every route FAILS CLOSED --
-    ``None``, never a fallback to the mutable pathname -- including the whole
-    Windows branch: a host where the handle's final path cannot be read gives
-    callers nothing to validate, and each caller decides whether that refusal
-    aborts (a containment check) or degrades (an advisory diagnostic).
-    """
-    if os.name == "nt":
-        try:
-            import ctypes
-            import msvcrt
-
-            win_dll = getattr(ctypes, "WinDLL", None)
-            get_osfhandle = getattr(msvcrt, "get_osfhandle", None)
-            if not callable(win_dll) or not callable(get_osfhandle):
-                return None
-            kernel32 = win_dll("kernel32", use_last_error=True)
-            get_final_path = kernel32.GetFinalPathNameByHandleW
-            get_final_path.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_wchar_p,
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-            ]
-            get_final_path.restype = ctypes.c_uint32
-            buffer = ctypes.create_unicode_buffer(32768)
-            length = get_final_path(
-                ctypes.c_void_p(get_osfhandle(fd)),
-                buffer,
-                len(buffer),
-                0,
-            )
-            if length == 0 or length >= len(buffer):
-                return None
-            path = buffer.value
-            if path.startswith("\\\\?\\UNC\\"):
-                return "\\\\" + path[8:]
-            if path.startswith("\\\\?\\"):
-                return path[4:]
-            return path
-        except (AttributeError, ImportError, OSError, ValueError):
-            return None
-
-    try:
-        return os.readlink(f"/proc/self/fd/{fd}")  # Linux
-    except OSError:
-        pass
-    try:
-        import fcntl
-
-        if hasattr(fcntl, "F_GETPATH"):  # macOS
-            buf = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
-            return buf.split(b"\x00", 1)[0].decode()
-    except (OSError, ValueError, ImportError):
-        pass
-    return None
-
-
-def open_fenced_for_read(
-    resolved: Path | str,
-    *,
-    fence: Callable[[str], bool],
-    refusal: type[Exception] = OSError,
-) -> int:
-    """Open *resolved* for reading and return a descriptor validated as an inode.
-
-    *resolved* is a path the caller has already canonicalised and judged with
-    *fence* (``True`` means refuse). A by-name open after that judgement is a
-    check-to-open window: the artifact directory and the agents directories are
-    agent-writable, so the name can be re-pointed at a credential file between
-    the two. The open refuses a link at the final component on every platform
-    (:func:`kiro_crew.platform_compat.open_file_no_reparse`), the descriptor
-    must be a regular file with a single link (a hardlink to a credential file
-    has a benign ``realpath``, so the link count is the only tell), and the
-    kernel's own path for the opened inode is read back with
-    :func:`fd_real_path`. *fence* is asked again exactly when that path differs
-    from *resolved*: a matching path is the question the caller already
-    answered, and on the event loop every extra call is a resolver-pool
-    submission. A missing kernel path fails closed.
-
-    The caller owns the returned descriptor. Every refusal closes it first and
-    raises *refusal*; a missing file surfaces as the ordinary
-    ``FileNotFoundError`` from the open.
-    """
-    resolved_str = os.fspath(resolved)
-    try:
-        fd = open_file_no_reparse(resolved_str, nonblocking=True)
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise refusal(f"refusing to read through a link: {resolved_str}") from exc
-        raise
-
-    try:
-        opened = os.fstat(fd)
-        if not _stat.S_ISREG(opened.st_mode):
-            raise refusal(f"refusing to read a non-regular file: {resolved_str}")
-        if opened.st_nlink != 1:
-            raise refusal(f"refusing to read a hardlinked file: {resolved_str}")
-        fd_real = fd_real_path(fd)
-        if fd_real is None:
-            raise refusal(f"refusing to read an unverifiable file: {resolved_str}")
-        if os.path.normcase(fd_real) != os.path.normcase(resolved_str):
-            if fence(fd_real):
-                raise refusal(f"refusing to read sensitive path: {fd_real}")
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-def is_reparse_point(path: str | Path) -> bool:
-    """True for a symlink or a Windows junction.
-
-    ``os.path.islink`` is False for a junction -- it is a reparse point but not a
-    symlink -- so the tag is checked as well. Comparing ``realpath`` against
-    ``abspath`` would be simpler and wrong: on Windows a temp directory is handed
-    back as an 8.3 short path, which differs from its resolved form with nothing
-    linked anywhere.
-    """
-    if os.path.islink(path):
-        return True
-    try:
-        return bool(getattr(os.lstat(path), "st_reparse_tag", 0))
-    except OSError:  # pragma: no cover - a component that vanished mid-walk
-        return False
-
-
-def copy_file_pinned(
-    by_name: str,
-    dst: str | None = None,
-    *,
-    dir_fd: int | None = None,
-    name: str | None = None,
-    src_fd: int | None = None,
-    dst_dir_fd: int | None = None,
-    dst_name: str | None = None,
-    skip_existing: bool = False,
-    skip_unreadable: bool = False,
-    force_mode: int | None = None,
-    max_bytes: int | None = None,
-    expected_src_ident: "tuple[int, int] | None" = None,
-    on_skip: SkipReporter = _noop_skip,
-    on_created: "Callable[[os.stat_result], None] | None" = None,
-) -> bool:
-    """Copy one file's bytes from a descriptor pinned to a validated inode.
-
-    Returns True when bytes were copied, False when the source was skipped.
-
-    ``skip_unreadable`` tolerates ONE failure: the SOURCE open being refused for
-    permission, which is reported as ``SKIP_UNREADABLE_ENTRY`` and returns False.
-    It is deliberately not a tolerance for the copy as a whole. A caller that
-    wrapped this call instead could not tell the two ends apart, so a DESTINATION
-    refusal was recorded as an unreadable source -- an omission attributed to the
-    operator's data rather than to the failure to write it, in a bundle that then
-    reported success and let retention prune a complete one. Only the end that was
-    actually refused is knowable here, so the decision belongs here.
-
-    ``expected_src_ident`` (when given) is the ``(st_dev, st_ino)`` a caller's
-    own validation observed: the copy proceeds only when the pinned source
-    descriptor fstats to exactly that inode, and reports
-    ``SKIP_IDENTITY_CHANGED`` otherwise. This closes the validate->copy window
-    the descriptor pin alone cannot: the pin proves the copied inode is the
-    OPENED inode, not that it is the inode the caller judged — a hardlink
-    swapped in at the name between validation and this open would be a regular
-    single-link file the other gates accept.
-
-    ``on_created`` (when given) receives the DESTINATION descriptor's ``fstat``
-    at publish time — the identity witness for a caller that must re-open the
-    copy by name later: matching ``(st_dev, st_ino)`` on that reopen proves it
-    reached the inode this copy created, not a replacement swapped in at the
-    same name between the copy and the reopen.
-
-    ``max_bytes`` is a size ceiling enforced INSIDE the copy, not after it: the
-    ``fstat`` size is checked before the destination is even created (a sparse
-    file's logical size is what ``fstat`` reports, so a swapped-in sparse giant
-    is refused before a byte lands), and the write loop aborts after the first
-    excess byte for a source that grows between the ``fstat`` and the read.
-    Both refusals report ``SKIP_TOO_LARGE`` and truncate whatever was written
-    through the destination descriptor -- a ceiling checked only after the copy
-    would let the copy itself exhaust the destination volume on the way to the
-    rejection.
-
-    ``shutil.copy2`` cannot be used on a user-writable tree: it dereferences a
-    hardlink into innocent-looking regular bytes, and a later tar-level hardlink
-    screen never sees a link to reject -- so a hardlink to a credential planted
-    inside an otherwise allowlisted directory would ride along as plain content.
-    The order here is open first, judge the DESCRIPTOR second: ``O_NOFOLLOW`` where
-    the platform has it, then ``fstat`` on the fd, so the inode that is validated is
-    exactly the inode whose bytes are copied and no check-to-use window remains.
-    Mode and timestamps are applied from that same ``fstat`` result rather than from
-    a fresh by-name stat.
-
-    BOTH ends can be pinned, and on a destination the caller does not own they MUST
-    be. Pass *dir_fd* + *name* for a pinned source and *dst_dir_fd* + *dst_name* for
-    a pinned destination; each side falls back to the by-name form when its pair is
-    absent, which is only appropriate for a path this process just created. A caller
-    that already holds a validated source descriptor (an ``os.open`` followed by a
-    ``fd_real_path`` witness check) passes it as *src_fd* instead — ownership
-    transfers to this function, which closes it on every path — so the source is
-    never re-opened by name; on Windows, which has no ``dir_fd`` support, that is
-    the only pinned source form available. A
-    destination reached by name is an ancestor swap away from landing the bytes
-    somewhere else entirely -- a real gap in a by-name-only design, and it is why
-    the by-name destination is now the
-    exception rather than the only form.
-
-    The destination is created with ``O_EXCL``, so anything already at that name is a
-    planted link or alias rather than a file to overwrite and creation refuses it
-    without a separate check. With *skip_existing* an occupied name is reported as
-    skipped instead, which is what a merge that must not overwrite needs: exclusive
-    creation makes "it did not exist" and "this call created it" one statement rather
-    than two with a window between them.
-
-    ``FileNotFoundError`` propagates so a caller can tolerate a source that vanished
-    mid-walk; every other ``OSError`` propagates so real failures still abort.
-    """
-    if dst is None and dst_name is None:  # pragma: no cover - caller bug
-        raise ValueError("copy_file_pinned needs either dst or dst_name")
-    # O_NONBLOCK is not about performance. Opening a FIFO for reading BLOCKS until a
-    # writer appears, so without it a single named pipe -- in an extracted archive, or
-    # planted in a staged tree -- hangs the whole snapshot or restore forever with no
-    # timeout and no message. Found when a mutation probe removed a caller's own
-    # `is_file()` guard and the test run stalled until a watchdog killed it, which is
-    # exactly how an operator would experience it. The fstat below still rejects the FIFO;
-    # this only guarantees we reach that check. On a regular file the flag has no effect.
-    src_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    if src_fd is not None:
-        # Caller-opened source: ownership TRANSFERS here — the descriptor is
-        # closed on every path by the ``finally`` below, exactly like one this
-        # function opened itself. This is the form for a caller that has
-        # already validated its descriptor (``fd_real_path`` witness after an
-        # ``os.open``): the by-name and ``dir_fd`` forms RE-OPEN the source,
-        # which re-introduces the check-to-open window that validation closed —
-        # and on Windows, which has no ``dir_fd`` support, this is the only
-        # pinned source form available at all. The fstat gates below still run
-        # against this descriptor, so a caller cannot use it to skip them.
-        fd = src_fd
-    else:
-        try:
-            if dir_fd is not None and name is not None:
-                fd = os.open(name, src_flags, dir_fd=dir_fd)
-            else:
-                fd = os.open(by_name, src_flags)
-        except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                # A symlink at the final component. Which reason code depends on whether
-                # the caller already LOOKED: with `expected_src_ident` the caller stat-ed
-                # a regular file at this name and a link now sits there, which is the
-                # same-UID swap this module is built to refuse, and a bundle missing that
-                # file lacks something it was asked to carry. Without it this open is the
-                # first look, and a link on first look is the ordinary screen. The two
-                # reasons sit on opposite sides of the retention split, so reporting the
-                # swap as a screen let it prune the last complete backup.
-                on_skip(
-                    SKIP_IDENTITY_CHANGED if expected_src_ident is not None else SKIP_SYMLINK,
-                    by_name,
-                )
-                return False
-            if skip_unreadable and isinstance(exc, PermissionError):
-                # The SOURCE, and only here: this is the one open in this function
-                # that reads the operator's file. Everything below writes.
-                on_skip(SKIP_UNREADABLE_ENTRY, by_name)
-                return False
-            raise
-    try:
-        st = os.fstat(fd)
-        if expected_src_ident is not None and (st.st_dev, st.st_ino) != expected_src_ident:
-            # The descriptor is pinned, but it is not the inode the caller's
-            # validation judged -- something was swapped in at the name between
-            # the two. Refuse rather than copy bytes nobody vetted. Asked BEFORE the
-            # type check: a swap to a FIFO or a directory is still a swap, and asking
-            # the type first reported it as `not_regular`, a screen code, so the bundle
-            # that omitted a wanted file read as complete and retention pruned on it.
-            on_skip(SKIP_IDENTITY_CHANGED, by_name)
-            return False
-        if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            # Reached with a matching identity, or with none supplied: this is the same
-            # inode the caller saw, or the first look at it, so a non-regular type or a
-            # hardlink alias here is the design screen and not a swap.
-            on_skip(SKIP_NOT_REGULAR, by_name)
-            return False
-        if max_bytes is not None and st.st_size > max_bytes:
-            # BEFORE the destination is created: ``fstat`` reports a sparse
-            # file's LOGICAL size, so the swapped-in sparse giant is refused
-            # here with zero bytes written. The in-loop bound below covers the
-            # one case this cannot -- a source that grows after this fstat.
-            on_skip(SKIP_TOO_LARGE, by_name)
-            return False
-        # The bytes are written to the FINAL name, opened O_CREAT|O_EXCL, and no name is
-        # resolved again afterwards. Three designs have now been tried on these lines and
-        # this is the only one that satisfies this module's own central rule -- once a
-        # descriptor exists, no write may be derived from a path name:
-        #
-        #   * exclusive create at the final name, cleanup unlinks that name after an
-        #     identity check -- rejected because the name can change between the check and
-        #     the unlink (POSIX has no unlink-by-inode), so cleanup could delete a file
-        #     another writer had published;
-        #   * private temporary published with `os.link` -- rejected because the LINK
-        #     re-resolves the temporary BY NAME. Proven exploitable: swapping the `.part`
-        #     entry after the copy makes the publish install attacker bytes and report the
-        #     core file as restored. A descriptor-based publish would fix it, and there is
-        #     no portable one -- `linkat(AT_EMPTY_PATH)` is not exposed by Python and the
-        #     `/proc/self/fd` form is Linux-only and privileged;
-        #   * this one: the descriptor IS the destination from the first byte. There is no
-        #     publish step to attack, and no hard link, which is also why the FAT/exFAT
-        #     fallback and its overwrite hazard are simply gone rather than guarded.
-        #
-        # What the first design got wrong was the CLEANUP, not the create, and the fix is
-        # to stop unlinking names: on failure the file is emptied through the descriptor we
-        # hold and the failure is reported. `O_EXCL` proves we created this entry, so
-        # truncating it cannot touch anyone else's file, and a reported empty file with the
-        # previous version still in the backup is a far smaller harm than either publishing
-        # attacker bytes or deleting a concurrent writer's file.
-        #
-        # EEXIST keeps its two answers: with `skip_existing` an occupied name is a skip,
-        # otherwise it is raised for the caller to translate.
-        dst_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        published = False
-        try:
-            if dst_dir_fd is not None and dst_name is not None:
-                dst_fd = os.open(dst_name, dst_flags, 0o600, dir_fd=dst_dir_fd)
-            else:
-                dst_fd = os.open(str(dst), dst_flags, 0o600)
-        except FileExistsError:
-            if skip_existing:
-                return False
-            raise
-        # The destination is finished through its OWN descriptor and never by name again:
-        # `os.chmod(name, dir_fd=...)` re-resolves the final component, so a name swapped
-        # between the write and the chmod would have the mode applied to the replacement,
-        # while `fchmod`/`futimes` on the open descriptor cannot be redirected.
-        #
-        # On failure only the TEMPORARY is removed. That is the whole point of writing to
-        # one: the final name is never touched by the failure path, so no cleanup of ours
-        # can delete a file another writer published there. The descriptor is closed before
-        # the unlink because Windows refuses to remove a file with an open handle -- the
-        # earlier form unlinked first and left the fragment exactly where cleanup was meant
-        # to remove it, which my own Windows shard caught.
-        try:
-            exceeded = False
-            with os.fdopen(fd, "rb") as fsrc:
-                fd = -1  # ownership passed to the file object
-                # fdopen takes ownership and closes what it is given, so it gets a
-                # duplicate: dst_fd itself has to outlive the write for the two
-                # descriptor-based metadata calls below.
-                with os.fdopen(os.dup(dst_fd), "wb") as fdst:
-                    if max_bytes is None:
-                        shutil.copyfileobj(fsrc, fdst)
-                    else:
-                        # Enforced WHILE copying: the fstat pre-check above cannot
-                        # see a source that grows after it, and only aborting on
-                        # the first excess byte keeps the copy itself from
-                        # exhausting the destination volume on the way to a
-                        # rejection.
-                        remaining = max_bytes
-                        while True:
-                            chunk = fsrc.read(min(1024 * 1024, remaining + 1))
-                            if not chunk:
-                                break
-                            if len(chunk) > remaining:
-                                exceeded = True
-                                break
-                            fdst.write(chunk)
-                            remaining -= len(chunk)
-            if exceeded:
-                # AFTER the dup'd writer has closed (its buffer flushes on close,
-                # so truncating first would let the flush write stale bytes
-                # back). Same rule as the failure path below: the partial
-                # content is emptied through the descriptor we hold (O_EXCL
-                # proves the entry is ours), never by name.
-                try:
-                    os.ftruncate(dst_fd, 0)
-                except OSError:
-                    pass
-                on_skip(SKIP_TOO_LARGE, by_name)
-                return False
-            _apply_metadata(
-                dst_fd,
-                st,
-                dst=dst,
-                dst_dir_fd=dst_dir_fd,
-                dst_name=dst_name,
-                mode=force_mode,
-            )
-            if on_created is not None:
-                # Through the descriptor we still hold, so the witness is the
-                # published inode itself — never a name re-resolution.
-                on_created(os.fstat(dst_fd))
-            published = True
-        except BaseException:
-            # No name is unlinked here. `O_EXCL` above proves this entry is ours, so the
-            # partial content is emptied through the descriptor -- the one operation that
-            # cannot be redirected at another writer's file. The caller's reporter is what
-            # makes it visible; on a restore that reporter is fatal, so the operation stops
-            # with the previous version still in the backup rather than continuing over a
-            # truncated core file.
-            if dst_fd >= 0:
-                try:
-                    os.ftruncate(dst_fd, 0)
-                except OSError:
-                    pass  # nothing further is safe to try, and the report still fires
-                os.close(dst_fd)
-                dst_fd = -1
-            raise
-        finally:
-            if dst_fd >= 0:
-                os.close(dst_fd)
-        return published
-    finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
-
-def write_file_pinned(
-    target: Path | str,
-    content: str,
-    *,
-    what: str,
-    mode: int = 0o600,
-    refusal: type[Exception] = OSError,
-) -> None:
-    """Publish *content* at *target* without ever following a planted link.
-
-    THE single no-follow file-publish path. Every by-name ``write_text`` /
-    ``open(..., "w")`` on an agent-influenced path is a truncation primitive
-    pointed at whatever the name currently resolves to: replace the target with a
-    symlink to a host file and the next publish truncates that file instead. The
-    same hole was closed once for a pod's SSO seeding and once for the systemd
-    unit files, in two separate hand-rolled copies -- so this exists to make the
-    third copy impossible rather than to add a fourth.
-
-    Three properties, and the middle one is the portable half:
-
-    * The PARENT is pinned through :func:`create_and_open_dir_pinned`, so no
-      ancestor is re-resolved by name between the check and the write, and the
-      write lands relative to that descriptor.
-    * The target is ``lstat``-ed THROUGH that descriptor and refused when it is a
-      symlink or not a regular file. ``os.stat(..., follow_symlinks=False)`` exists
-      on every platform Python supports, so this check holds even where
-      ``O_NOFOLLOW`` does not (see :func:`supports_pinned_walk`) -- which is what
-      keeps the guarantee real on Windows rather than silently platform-gated.
-    * The publish itself is ``atomic_write_at`` on the pinned descriptor, so the
-      mode is applied to the temp before the payload is reachable under the final
-      name and a reader never sees a partial file.
-
-    Residual, stated rather than implied: a same-UID process can still swap the
-    target between the ``lstat`` and the rename. Per the recorded pod threat model
-    a pod is operational isolation, not protection from arbitrary same-UID
-    processes; what this closes is the case where the ATTACKER-PLANTED name is
-    followed, which needs no race at all.
-
-    **What pinning means on Windows, decided rather than left to a crash.** The
-    pinned walk needs ``O_DIRECTORY``, ``O_NOFOLLOW`` and ``os.open`` in
-    ``os.supports_dir_fd`` -- exactly what :func:`supports_pinned_walk` probes, and
-    none of which Windows has (``atomic_write_at``'s own docstring records that a
-    pinned caller is on POSIX). So there the publish degrades to BY NAME, and the
-    degradation is bounded and named:
-
-    * KEPT everywhere: the ``lstat`` refusal of a symlink or non-regular target --
-      the leg that stops a PLANTED name from being followed, which is the attack
-      needing no race, and the everywhere-floor this function promises.
-    * LOST on Windows: ancestor pinning, so an ancestor swapped between the check
-      and the write is not caught. No supported configuration relies on it (pods
-      are systemd/launchd only), and the caller that publishes a pod's own
-      credential tree gates on ``supports_pinned_walk()`` and REFUSES rather than
-      degrades (``pod.runtime._seed_pod_os_home``).
-    """
-    target = Path(target)
-
-    def _refuse_if_unsafe(existing: os.stat_result | None) -> None:
-        if existing is None:
-            return
-        if stat.S_ISLNK(existing.st_mode):
-            raise refusal(f"refusing to write {what} {target}: it is a symbolic link")
-        if not stat.S_ISREG(existing.st_mode):
-            raise refusal(f"refusing to write {what} {target}: it is not a regular file")
-
-    if not supports_pinned_walk():
-        _refuse_if_unsafe(lstat_by_name(target))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(target, content, restrict_to_owner=True)
-        return
-    dir_fd = create_and_open_dir_pinned(target.parent, what=f"{what} directory", refusal=refusal)
-    try:
-        _refuse_if_unsafe(stat_at(dir_fd, target.name))
-        atomic_write_at(dir_fd, target.name, content, fsync=True, mode=mode)
-    finally:
-        os.close(dir_fd)
-
-
-def read_file_pinned(
-    target: Path | str,
-    *,
-    what: str,
-    max_bytes: int = 64 * 1024,
-    refusal: type[Exception] = OSError,
-) -> str:
-    """Read *target* without ever following a planted link. The READ counterpart
-    to :func:`write_file_pinned`, with the identical chokepoint discipline.
-
-    A by-name ``read_text`` on an agent-influenced path is a disclosure primitive
-    pointed at whatever the name currently resolves to: replace the file with a
-    symlink to a credential and the next read prints that credential under the
-    original name's label. The write side of this exact path was already pinned;
-    leaving the read by-name meant the same planted link still worked, just in the
-    other direction (found in review on the pod refusal note, which
-    ``kirocrew pod ls`` prints).
-
-    Same two properties, same everywhere-floor as the write:
-
-    * The PARENT is pinned via :func:`pin_parent`, so no ancestor is re-resolved
-      by name between the check and the read.
-    * The target is ``lstat``-ed THROUGH that descriptor and refused when it is a
-      symlink or not a regular file. That check is portable, so it holds where
-      ``O_NOFOLLOW`` does not.
-
-    Windows degrades exactly as the write does: the ``lstat`` refusal of a
-    non-regular target is KEPT (the leg that stops a PLANTED name from being
-    followed, which needs no race), ancestor pinning is LOST, and no supported
-    configuration relies on it because pods are systemd/launchd only.
-
-    *max_bytes* bounds the read: a note is a line of prose, and a name pointed at
-    something enormous should not be able to make a status command allocate it.
-    """
-    target = Path(target)
-    # The ANCESTOR chain is resolved once, here, exactly as ``open_dir_pinned``
-    # does it: ``pin_parent`` requires a caller-resolved parent, and resolving it
-    # inside would re-follow whatever an ancestor points at by now. The FINAL
-    # component is never resolved -- it is opened by name under the pinned parent
-    # with ``O_NOFOLLOW`` and lstat-checked through that descriptor, which is what
-    # refuses a planted link at the note's own name. (A real home is often reached
-    # through a symlink -- ``/home/<user>`` -> ``/local/home/<user>`` on this class
-    # of host -- so pinning an UNRESOLVED parent refuses every legitimate read.)
-    parent = os.path.realpath(target.parent)
-    name = target.name
-    if not supports_pinned_walk():
-        # Degraded but not defeated: keep the floor the docstring promises.
-        st = lstat_by_name(target)
-        if st is None:
-            raise FileNotFoundError(f"{what} is not there: {target}")
-        if not _stat.S_ISREG(st.st_mode):
-            raise refusal(f"refusing to read {what}: {target} is not a regular file")
-        with open(target, "rb") as handle:
-            return handle.read(max_bytes).decode("utf-8", errors="replace")
-    dir_fd = pin_parent(parent, what=what, refusal=refusal)
-    try:
-        st = stat_at(dir_fd, name)
-        if st is None:
-            raise FileNotFoundError(f"{what} is not there: {target}")
-        if not _stat.S_ISREG(st.st_mode):
-            raise refusal(f"refusing to read {what}: {target} is not a regular file")
-        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
-        try:
-            return os.read(fd, max_bytes).decode("utf-8", errors="replace")
-        finally:
-            os.close(fd)
-    finally:
-        os.close(dir_fd)
-
-
-def lstat_by_name(target: Path | str) -> os.stat_result | None:
-    """``lstat`` *target* by name, or ``None`` when it is not there.
-
-    The by-name counterpart to :func:`stat_at`, for the platforms with no
-    descriptor-relative stat. Never follows the final component, which is what
-    makes it the portable half of :func:`write_file_pinned`'s guarantee.
-    """
-    try:
-        return os.stat(target, follow_symlinks=False)
-    except OSError:
-        return None
-
-
-def unlink_pinned(target: Path | str, *, what: str) -> None:
-    """Remove *target* through a pinned parent descriptor. Missing is success.
-
-    The delete half of :func:`write_file_pinned`: an ``unlink`` by name resolves
-    its ancestors afresh, so a link planted at a parent aims the removal somewhere
-    else. Refuses nothing about the target's own type -- removing a link IS the
-    correct outcome here, and unlink never follows the final component anyway.
-    """
-    target = Path(target)
-    if not supports_pinned_walk() or os.unlink not in os.supports_dir_fd:
-        # No pinned walk here (Windows). Fall back to the by-name removal: unlink
-        # does not follow its FINAL component anywhere, so the residual is an
-        # ancestor swap -- and a pod cannot boot on this platform at all
-        # (systemd/launchd only), so no supported configuration relies on the
-        # pinned form. See write_file_pinned for the same decision stated in full.
-        try:
-            target.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return
-    try:
-        dir_fd = create_and_open_dir_pinned(
-            target.parent, what=f"{what} directory", refusal=OSError
-        )
-    except (OSError, ValueError):
-        return
-    try:
-        os.unlink(target.name, dir_fd=dir_fd)
-    except (FileNotFoundError, NotADirectoryError):
-        pass
-    finally:
-        os.close(dir_fd)
-
-
-def stat_at(dir_fd: int, name: str) -> os.stat_result | None:
-    """`lstat` *name* relative to *dir_fd*, or ``None`` if it is not there.
-
-    The descriptor-relative answer to "what is this, and is it there?". A plain
-    ``Path.is_file()`` re-resolves the whole path, so between the question and the use of
-    the answer the object can be replaced -- and a guard that inspects the replacement
-    while the code acts on the original is worse than no guard, because it reports success.
-    Review found three such guards in code that was already holding the right descriptor.
-
-    Never follows a link: the caller wants to know what the NAME is, and a link is one of
-    the answers it needs to be able to see.
-    """
-    try:
-        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-
-
-def is_regular_at(dir_fd: int, name: str) -> bool:
-    """True when *name* under *dir_fd* is a plain file -- not a link, FIFO, or directory."""
-    st = stat_at(dir_fd, name)
-    return st is not None and _stat.S_ISREG(st.st_mode)
-
-
-def _apply_metadata(
-    dst_fd: int,
-    st: os.stat_result,
-    *,
-    dst: str | Path | None,
-    dst_dir_fd: int | None,
-    dst_name: str | None,
-    mode: int | None = None,
-) -> None:
-    """Copy mode and timestamps onto the destination, by descriptor where possible.
-
-    The fallbacks name the DESTINATION, which is now the only thing they could name: the
-    bytes are written straight to the final name under ``O_EXCL``. An earlier revision wrote
-    to a private temporary and published it by link, so the fallbacks had to name that
-    temporary instead -- that design is gone (the publish re-resolved a name, which is the
-    one thing this module exists to avoid), and with it the parameter that carried the
-    distinction.
-
-    ``os.fchmod`` does not exist on Windows and ``os.utime`` only accepts a descriptor
-    where ``os.utime in os.supports_fd``, so the fd form cannot be unconditional: an
-    earlier revision called it always and crashed a Windows snapshot with
-    ``AttributeError`` the moment it reached a core file. Caught in review.
-
-    The fd form is preferred wherever it exists, because a name re-resolves: a final
-    component swapped between the write and the chmod would have the mode applied to the
-    replacement. Where it does not exist the by-name form is the only option available,
-    and it is the same platform that already cannot pin a directory at all -- so this
-    adds no exposure that the declared by-name traversal does not already carry.
-
-    *mode* overrides the source's mode. Used for a restored security file, which must end
-    up owner-only regardless of what the archive recorded.
-    """
-    want = _stat.S_IMODE(st.st_mode) if mode is None else mode
-    fallback_name = dst_name
-    fallback_path = str(dst) if dst else None
-    if hasattr(os, "fchmod"):
-        os.fchmod(dst_fd, want)
-    elif dst_dir_fd is not None and fallback_name is not None:  # pragma: no cover - Windows
-        os.chmod(fallback_name, want, dir_fd=dst_dir_fd)
-    elif fallback_path is not None:  # pragma: no cover - Windows
-        os.chmod(fallback_path, want)
-
-    times = (st.st_atime_ns, st.st_mtime_ns)
-    if os.utime in os.supports_fd:
-        os.utime(dst_fd, ns=times)
-    elif dst_dir_fd is not None and fallback_name is not None:  # pragma: no cover - Windows
-        os.utime(fallback_name, ns=times, dir_fd=dst_dir_fd)
-    elif fallback_path is not None:  # pragma: no cover - Windows
-        os.utime(fallback_path, ns=times)
-
-
-def create_and_open_dir_pinned(
-    path: str | Path,
-    *,
-    what: str,
-    must_create: bool = False,
-    refusal: type[Exception] = PinnedPathRefusal,
-) -> int:
-    """Create a directory through its PINNED parent and return its descriptor.
-
-    With *must_create* a name that already exists is REFUSED rather than accepted. Review
-    found the hole that needs: a replace removes the live tree and stages the archive into
-    its place, so if the gateway recreates that root in between, accepting it lets files
-    the archive does not contain survive a "replace" that reports success. The children
-    already refused a pre-existing name -- only the root was exempt, and this makes it
-    consistent. Merge callers leave it false, because meeting an existing directory is
-    what merging IS.
-
-    It does NOT report whether our own `mkdir` created the directory, which would be
-    the natural way to stamp the archive's mode and timestamps on only in that case.
-    Such a flag cannot be trusted.
-
-    Sampling `dst.exists()` beforehand is a name-based check with a window after it, and
-    `mkdir` succeeding does not close that window either: the descriptor comes from a
-    SEPARATE `open`, so a directory replaced between the two leaves the flag true while
-    describing an object the caller does not hold -- and the archive's metadata then
-    lands on somebody else's directory. Nothing repairs it: a stat taken after the
-    `mkdir` observes the replacement just as happily, POSIX has no atomic
-    create-and-open for a directory, and under a same-user threat model no mode trick
-    helps. So the metadata is simply not applied to directories.
-
-    ``Path(p).mkdir(parents=True)`` creates every missing component by name, so a link
-    already sitting at an ancestor is followed and the directories are created inside
-    whatever it points at -- a write through an attacker-controlled path, which is
-    strictly worse than a read through one. Review flagged the by-name creation; the
-    probe that settled it showed a link AT the final component is already refused by
-    ``O_NOFOLLOW`` but an ancestor link is not.
-
-    So the parent chain is pinned first and only the final component is created,
-    relative to that descriptor. What remains is this module's documented and
-    deliberate residual, stated in :func:`pin_parent`: a component that was already a
-    link when the parent was resolved is followed by that resolution, because refusing
-    every symlinked ancestor would break a destination under ``/tmp`` on macOS. The
-    parent must therefore already exist -- callers create their own tree roots.
-
-    Creating the directory and opening it are two syscalls, and a removal landing
-    between them is an interleaving no ordering closes. The pair is therefore
-    re-attempted, :data:`_CREATE_ATTEMPTS` times, against the SAME pinned parent
-    descriptor -- a retry resolves no name, so it cannot be steered anywhere the first
-    attempt could not go, and ``must_create`` plus the ``O_NOFOLLOW`` refusal are both
-    re-asked on every attempt. Tolerating only the ``FileExistsError`` half handled a
-    concurrent writer and not a concurrent remover (GH-12043), and this is a caller
-    that needs the directory: a snapshot's staging root, a restore destination, a pod
-    home. Exhaustion, and a removal of the pinned PARENT (which no attempt can
-    survive), raise ``FileNotFoundError`` carrying the whole path rather than the bare
-    relative name ``openat`` was given.
-
-    The re-attempt covers a directory THIS call created and no other. When the
-    ``mkdir`` instead MET one that was already there -- the merge case, where
-    ``must_create`` is false and the destination legitimately holds the caller's files
-    -- a removal in the window is reported, not re-attempted: the contents are already
-    unrecoverable, and re-creating the name would hand back an empty directory that an
-    additive restore would stage into and report success over. Review caught that as
-    the retry's one unsafe case, and it is why the loop tracks which of the two
-    happened rather than retrying on the errno alone.
-    """
-    as_given = Path(path)
-    parent_fd = pin_parent(
-        os.path.realpath(as_given.parent or Path(".")), what=what, refusal=refusal
-    )
-    try:
-        lost: FileNotFoundError | None = None
-        for _ in range(_CREATE_ATTEMPTS):
-            ours = True
-            try:
-                os.mkdir(as_given.name, 0o700, dir_fd=parent_fd)
-            except FileExistsError:
-                if must_create:
-                    raise refusal(
-                        f"refusing to use the {what}: {as_given.name!r} already exists, and "
-                        "this operation replaces its destination rather than merging into "
-                        "it. Something recreated that directory after it was removed, so "
-                        "staging into it would leave files the archive does not contain "
-                        "while reporting a replacement. Remove it and re-run with the "
-                        "gateway stopped."
-                    ) from None
-                ours = False
-            except FileNotFoundError as exc:
-                # The PINNED PARENT is gone, not the directory being created. Nothing
-                # can be made inside an unlinked directory, so every further attempt
-                # would land here too -- reported at once, and with the whole path,
-                # because the errno carries only the relative name the syscall was
-                # given.
-                raise FileNotFoundError(
-                    errno.ENOENT,
-                    f"the directory holding the {what} was removed, so "
-                    f"{as_given.name!r} cannot be created in it",
-                    str(as_given),
-                ) from exc
-            try:
-                return os.open(as_given.name, dir_flags(), dir_fd=parent_fd)
-            except FileNotFoundError as exc:
-                if not ours:
-                    # This call did NOT create the directory: the `mkdir` above met one
-                    # that was already there, holding whatever the caller was about to
-                    # merge into, and it is gone. Re-creating it would hand back an
-                    # EMPTY directory, and a merge (`must_create=False`) would then
-                    # stage the archive into it and report success while the files it
-                    # was merging with are unrecoverably gone. Review caught this as
-                    # the retry's one unsafe case. So it is reported instead -- the
-                    # same outcome the caller got before the retry existed, with the
-                    # path the errno omits and a sentence saying what was lost.
-                    raise FileNotFoundError(
-                        errno.ENOENT,
-                        f"the {what} already existed when this call met it and was "
-                        "removed before it could be opened, so whatever it held is "
-                        "gone; refusing to re-create it empty, because an additive "
-                        "restore would then report success over the loss",
-                        str(as_given),
-                    ) from exc
-                # The directory this attempt CREATED is gone. Nothing of the caller's
-                # was in it -- it was empty and unopened -- so re-running the pair
-                # costs nothing and loses nothing. That is the mirror of the
-                # ``FileExistsError`` tolerated above: a concurrent writer is handled
-                # and, without this, a concurrent REMOVER was not (GH-12043). Both are
-                # the same interleaving seen from opposite sides, and everything here
-                # runs as the same user as the agent, which is the premise the pinning
-                # exists for.
-                #
-                # The pair is run again rather than repaired in place, because no
-                # ordering of two syscalls closes a window between them. Every attempt
-                # goes through the ONE descriptor pinned above this loop, so a retry
-                # cannot be steered: nothing is re-resolved by name, ``must_create``
-                # and this created-it-ourselves test are re-asked on each attempt, and
-                # a link that appears at the name between two attempts is refused by
-                # the ``O_NOFOLLOW`` below exactly as it is on the first.
-                lost = exc
-                continue
-            except OSError as exc:
-                # A link (or a plain file) at the destination's own name. O_NOFOLLOW already
-                # refuses it -- the gap review found was that it escaped as a raw OSError, so
-                # a restore ended in a traceback instead of the refusal every other path on
-                # this surface produces. Translated here so callers have one type to contain.
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise refusal(
-                        f"refusing to use the {what}: {as_given.name!r} is a symbolic link "
-                        "or not a directory, so creating the tree there would write through "
-                        "whatever it points at. Remove it and re-run."
-                    ) from exc
-                raise
-        # Exhaustion is a ``FileNotFoundError``, not a *refusal*: a refusal on this
-        # surface means the destination is a link or an occupied name a caller must
-        # remove, and callers word it that way -- the prompt handler maps one to
-        # "your prompt root is a link". A directory that keeps being removed is an
-        # operational failure, so it stays in the class the kernel reported and gains
-        # the FULL path the kernel could not name.
-        raise FileNotFoundError(
-            errno.ENOENT,
-            f"the {what} {as_given} was removed between its creation and its open, "
-            f"{_CREATE_ATTEMPTS} attempts in a row",
-            str(as_given),
-        ) from lost
-    finally:
-        os.close(parent_fd)
 
 
 def stage_tree_pinned(
@@ -1980,29 +898,6 @@ def remove_dir_verified(
     return StagedRemoval(removed=True)
 
 
-def unlink_verified(holder_fd: int, name: str, expect: tuple[int, int]) -> bool:
-    """Unlink *name* under *holder_fd*, only if it is still ``(st_dev, st_ino)`` *expect*.
-
-    The residual is irreducible and better stated than implied: POSIX has no
-    unlink-by-inode, so the stat and the unlink are two syscalls addressing the same NAME.
-    What CAN be done is refuse when the name no longer holds what the scan saw, which is
-    what turns "delete whatever answers to this name" into "delete this object, or nothing".
-    The remaining window needs a swap landing between two adjacent syscalls, and the
-    directory holding the name was itself reached only through verified descriptors.
-    """
-    try:
-        info = os.stat(name, dir_fd=holder_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    if (info.st_dev, info.st_ino) != expect:
-        return False
-    try:
-        os.unlink(name, dir_fd=holder_fd)
-    except OSError:
-        return False
-    return True
-
-
 #: Outcomes of :func:`put_back_no_clobber`. ``None`` means the name is back.
 PUT_BACK_NAME_TAKEN = "name_taken"
 PUT_BACK_FAILED = "failed"
@@ -2434,3 +1329,36 @@ def _remove_with_deferred_entry(
         )
     unlink_verified(parent_fd, debris, (expect[0], landed))
     return TreeRemoval(removed=True)
+
+
+# This module keeps the hand-written ``__all__``, the two openers under a pinned parent
+# (:func:`open_in_pinned_parent`, :func:`open_dir_pinned`) and the tree operations:
+# :func:`stage_tree_pinned` and the verified scan, removal and put-back of a tree. The
+# primitives and the single-entry operations live in the owners below, and every name they
+# define still resolves as ``kiro_crew.pinned_fs.<name>``. A write through this module
+# (``monkeypatch.setattr``, ``mock.patch``) reaches every owner holding the name
+# (``kiro_crew._facade_mirror``). No owner imports this module; an owner imports only the
+# owners listed before it.
+# New work goes to the owner of its responsibility:
+#   ``pinned_fs_primitives`` -- refusal, skip reasons, platform probes, pin_parent, fd_real_path
+#   ``pinned_fs_dirs`` -- creating and opening directories under a pinned ancestor
+#   ``pinned_fs_files`` -- copying, writing, reading and unlinking one file
+#: Owner modules, lowest layer first: the first holder of a name answers its reads.
+_OWNERS = (
+    "kiro_crew.pinned_fs_primitives",
+    "kiro_crew.pinned_fs_dirs",
+    "kiro_crew.pinned_fs_files",
+)
+for _owner in _OWNERS:
+    _importlib.import_module(_owner)
+#: Name the facade serves but does not bind -> the owner that answers a read of it.
+_EXPORTS: dict[str, str] = {}
+_EXPORTS.update(_facade_mirror.install(_sys.modules[__name__], _OWNERS, excluded=()).served)
+_sys.modules[__name__].__class__ = _facade_mirror.MirroredModule
+if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and IDEs
+    from kiro_crew.pinned_fs_files import _apply_metadata  # noqa: F401
+    from kiro_crew.pinned_fs_primitives import (  # noqa: F401
+        _CREATE_ATTEMPTS,
+        _NEVER_ARCHIVED,
+        _OMITS_WANTED_DATA,
+    )

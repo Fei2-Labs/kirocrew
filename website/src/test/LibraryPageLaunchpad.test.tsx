@@ -191,7 +191,8 @@ describe('LibraryPage — pin badge and persistence', () => {
 
       // Persistence: the sidebar nav id (`app-<name>` for an AppHost-routed
       // app) lands in the HIDDEN set, and same-tab listeners are notified —
-      // the only path by which the App.tsx sidebar filter learns of it.
+      // the only path by which the sidebar filter (shell/nav/appRail.tsx)
+      // learns of it.
       expect(JSON.parse(localStorage.getItem(APP_NAV_HIDDEN_KEY)!)).toEqual(['app-secretary'])
       expect(synced).toHaveBeenCalled()
 
@@ -358,6 +359,20 @@ describe('LibraryPage — action dispatch', () => {
     expect(await screen.findByTestId('route-probe')).toHaveAttribute('data-path', '/apps/detail/secretary')
   })
 
+  it('the action row is visible at rest, so Details never needs hover or focus', async () => {
+    renderLibrary()
+    const el = await tile('secretary')
+    const toolbar = within(el).getByRole('toolbar', { name: 'Actions for Secretary' })
+    for (const cls of ['opacity-0', 'pointer-events-none']) {
+      expect(toolbar.className.split(/\s+/)).not.toContain(cls)
+    }
+    // No hover, no focus: Open and the Details route are both one click away.
+    expect(within(toolbar).getByRole('button', { name: 'Open' })).toBeInTheDocument()
+    fireEvent.click(within(toolbar).getByRole('button', { name: 'More actions for Secretary' }))
+    fireEvent.click(within(el).getByRole('menuitem', { name: 'Details' }))
+    expect(await screen.findByTestId('route-probe')).toHaveAttribute('data-path', '/apps/detail/secretary')
+  })
+
   it('Disable dispatches to the disable API', async () => {
     renderLibrary()
     const scope = await openTileMenu('secretary', 'Secretary')
@@ -463,5 +478,30 @@ describe('LaunchpadTile — the disabled gate is the tile’s own branch', () =>
     expect(scope.getByRole('menuitem', { name: 'Enable' })).toBeInTheDocument()
     expect(scope.queryByRole('menuitem', { name: 'Pin' })).toBeNull()
     expect(scope.queryByRole('menuitem', { name: 'Unpin' })).toBeNull()
+  })
+})
+
+describe('LibraryPage — a guide picks an app by its card menu', () => {
+  it('reports the app whose ⋯ menu is open, by its own name, and outlines only the named card', async () => {
+    const { selectionState, selectedName } = await import('../guide/guidePredicates')
+    const { pickCandidate } = await import('../guide/guideActions')
+    renderLibrary()
+    await tile('secretary')
+    await tile('oncall-radar')
+    expect(selectionState('app_tile_menu_open')).toBe('none')
+    const grid = document.querySelector<HTMLElement>('[data-ui-location="apps.library.app-list"]')!
+    expect(grid.getAttribute('aria-label')).toBe('Installed apps')
+    const shown = () => true
+    // The pick names a card by the app's own name, never by text inside it.
+    expect(pickCandidate(grid, shown, 'Oncall Radar')).toBe(screen.getByTestId('launchpad-tile-oncall-radar'))
+    expect(pickCandidate(grid, shown, 'Radar')).toBeNull()
+    await openTileMenu('secretary', 'Secretary')
+    await waitFor(() => expect(selectionState('app_tile_menu_open')).toBe('selected'))
+    expect(selectedName('app_tile_menu_open')).toBe('Secretary')
+    // The menu holds the registered Uninstall item the guide's last step points at.
+    expect(document.querySelectorAll('[data-ui-location="apps.library.tile-uninstall"]')).toHaveLength(1)
+    // Closing it unpicks.
+    fireEvent.click(within(await tile('secretary')).getByRole('button', { name: 'More actions for Secretary' }))
+    await waitFor(() => expect(selectionState('app_tile_menu_open')).toBe('none'))
   })
 })

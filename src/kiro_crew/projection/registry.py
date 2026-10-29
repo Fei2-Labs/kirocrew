@@ -12,7 +12,7 @@ nothing for the overlap.
 The registry never reads inside an event. It needs exactly one number from each --
 the ``seq`` that orders the log -- and it takes that from a reader the client
 supplies, so a carrier type stays in the package that owns it (contract: the kernel
-imports no domain's event type). Two readers cover the shapes in this codebase:
+imports no domain's event type). The kernel ships two readers:
 :func:`mapping_seq` for a carrier subscripted like a mapping, which is the member
 log's ``Event`` TypedDict and the default, and :func:`attribute_seq` for one
 holding it as a field, which is the crew log's ``Entry`` dataclass.
@@ -20,7 +20,8 @@ holding it as a field, which is the crew log's ``Entry`` dataclass.
 ``mapping_seq`` is the default rather than a required argument because it is what
 every present caller of a TypedDict envelope wants, and a required argument would
 make each construction site restate it. A client whose carrier is shaped otherwise
-passes its own reader and the kernel needs no change.
+passes its own reader, and the kernel needs no change: the crew log's slot folds
+pass one that reads the ordinal they wrap each entry in.
 """
 
 from __future__ import annotations
@@ -105,7 +106,7 @@ class ProjectionRegistry:
         with self._lock:
             defns = list(self._defns.values())
             states = [defn.init() for defn in defns]
-            last_seq = -1
+            last_seq = EMPTY_WATERMARK
             for ev in events:
                 last_seq = self._seq_of(ev)
                 for i, defn in enumerate(defns):
@@ -187,7 +188,13 @@ class ProjectionRegistry:
             self._fold_one(store, event, emit=False)
         return floor
 
-    def savepoints(self, store: str, identity: Mapping[str, Any]) -> list[Savepoint]:
+    def savepoints(
+        self,
+        store: str,
+        identity: Mapping[str, Any],
+        *,
+        witness: Mapping[str, Any] | None = None,
+    ) -> list[Savepoint]:
         """A savepoint per registered unit for *store*, ready to hand to a store.
 
         Reads the cells and builds the payloads; it does NOT write. When to spend a
@@ -196,7 +203,21 @@ class ProjectionRegistry:
         every drive would make that client write a file per entry -- the exact cost
         its savepoints exist to remove. A unit that has folded nothing is skipped,
         since a savepoint at the empty watermark saves no replay.
+
+        *witness* is the client's evidence about the log the state was folded from,
+        stamped VERBATIM onto every savepoint built here and interpreted no more than
+        the identity is. It is a parameter rather than something the kernel derives
+        because only the client can read its own log, and only the client can read it
+        at the one moment the evidence is worth anything -- before its fold consumed
+        the bytes. Omitted leaves the witness empty, which is a savepoint that carries
+        no evidence, and what that is worth is the reading client's call.
+
+        Each savepoint carries its own ``watermark``, so a client whose witness
+        certifies ONE boundary has to compare the two itself and skip a unit standing
+        somewhere else: the kernel cannot do it, since it cannot read what a boundary
+        means inside a mapping it does not interpret.
         """
+        stamped = dict(witness) if witness else {}
         with self._lock:
             out: list[Savepoint] = []
             for key, defn in self._defns.items():
@@ -210,6 +231,7 @@ class ProjectionRegistry:
                         watermark=cell.observed_seq,
                         state=cell.state,
                         identity=dict(identity),
+                        witness=dict(stamped),
                     )
                 )
             return out
@@ -247,7 +269,7 @@ class ProjectionRegistry:
             for key, defn in defns:
                 cell = self._cells.get((key, store))
                 if cell is None:
-                    cell = _Cell(defn.init(), -1)
+                    cell = _Cell(defn.init(), EMPTY_WATERMARK)
                     self._cells[(key, store)] = cell
                 if seq <= cell.observed_seq:
                     # Replay / stale event: already folded.
@@ -265,24 +287,52 @@ class ProjectionRegistry:
                 on_change(store, key, view, fired_seq)
 
     # ---- observed ---------------------------------------------------------
+    def cells(self, store: str) -> dict[str, tuple[Any, int]]:
+        """``{key: (state, watermark)}`` for every registered unit of *store*.
+
+        The read a client needs to carry a fold's POSITION in a record of its own --
+        a savepoint it writes itself, a cached bundle it hands to its next call.
+        Neither of the other readers answers it: :meth:`snapshot` renders, so the
+        bookkeeping a fold needs to continue is gone from what it returns, and
+        :meth:`savepoints` is built for a write, so it skips a unit that has folded
+        nothing and wraps the rest in an identity a read has no use for.
+
+        A unit with no cell reports ``init()`` at :data:`EMPTY_WATERMARK`, which is
+        what it would fold from, so a caller never has to tell absent from empty.
+
+        State comes back AS HELD, not copied. It is the registry's object, and the
+        same-reference rule is what makes that safe to hand out: ``apply`` returns a
+        new object rather than modifying this one, so a later :meth:`drive` replaces
+        the cell's state instead of mutating what a caller kept.
+        """
+        with self._lock:
+            out: dict[str, tuple[Any, int]] = {}
+            for key, defn in self._defns.items():
+                cell = self._cells.get((key, store))
+                if cell is None:
+                    out[key] = (defn.init(), EMPTY_WATERMARK)
+                else:
+                    out[key] = (cell.state, cell.observed_seq)
+            return out
+
     def observed_floor(self, store: str) -> int:
         """The lowest seq EVERY registered unit has already folded for *store*.
 
-        ``-1`` when any registered unit has no cell yet: such a cell folds from
-        ``init()`` over whatever it is first driven with, so a caller must
-        :meth:`prime` it rather than drive a range at it, and a floor would
-        invite exactly that. A client that primes at load therefore has a cell
-        missing only before its first read.
+        :data:`EMPTY_WATERMARK` when no unit is registered, or when any registered
+        unit has no cell yet: such a cell folds from ``init()`` over whatever it is
+        first driven with, so a caller must :meth:`prime` it rather than drive a
+        range at it, and a floor would invite exactly that. A client that primes at
+        load therefore has a cell missing only before its first read.
         """
         with self._lock:
             floor: int | None = None
             for key in self._defns:
                 cell = self._cells.get((key, store))
                 if cell is None:
-                    return -1
+                    return EMPTY_WATERMARK
                 if floor is None or cell.observed_seq < floor:
                     floor = cell.observed_seq
-            return -1 if floor is None else floor
+            return EMPTY_WATERMARK if floor is None else floor
 
     # ---- snapshot ---------------------------------------------------------
     def snapshot(self, store: str) -> dict:
@@ -290,7 +340,7 @@ class ProjectionRegistry:
         with self._lock:
             defns = list(self._defns.items())
             values: dict[str, dict] = {}
-            as_of = -1
+            as_of = EMPTY_WATERMARK
             for key, defn in defns:
                 cell = self._cells.get((key, store))
                 if cell is None:

@@ -1,7 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, act, waitFor } from '@testing-library/react'
+import { screen, fireEvent, act, waitFor, render, within } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from './helpers'
 import RunInTerminalBtn from '../components/RunInTerminalBtn'
+import { RunInTerminalScope } from '../components/runInTerminalScope'
 import { RUN_IN_TERMINAL_RESULT_FALLBACK_MS } from '../utils/fenceShell'
 
 // "Run in terminal" dispatches a `mc:run-in-terminal` request on window;
@@ -49,6 +52,31 @@ describe('RunInTerminalBtn', () => {
     expect(screen.getByRole('button', { name: 'Run' })).toBeInTheDocument()
   })
 
+  it.each(['{Enter>2/}', '{Enter}{Enter}'])('cancels native keyboard opening with %s and requires Tab to run', async (keys) => {
+    vi.useRealTimers()
+    const user = userEvent.setup()
+    renderWithProviders(<RunInTerminalBtn code="echo hello" lang="bash" />)
+    const trigger = screen.getByRole('button', { name: 'Run in terminal' })
+    await user.tab()
+    expect(trigger).toHaveFocus()
+
+    // Native Enter activation opens the dialog and activates its focused action.
+    await user.keyboard(keys)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(requests).toHaveLength(0)
+    expect(trigger).toHaveFocus()
+
+    await user.keyboard('{Enter}')
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveFocus())
+    expect(requests).toHaveLength(0)
+    await user.tab()
+    expect(within(dialog).getByRole('button', { name: 'Run' })).toHaveFocus()
+    await user.keyboard('{Enter}')
+    expect(requests).toEqual([{ code: 'echo hello', lang: 'bash', reqId: expect.any(String) }])
+    act(() => { replyLast(true) })
+  })
+
   it('shows the full command in the dialog, including text the code block would clip', () => {
     const long = `echo ${'x'.repeat(400)} && rm -rf build`
     renderWithProviders(<RunInTerminalBtn code={long} />)
@@ -61,6 +89,16 @@ describe('RunInTerminalBtn', () => {
     clickAndConfirm()
     expect(requests).toHaveLength(1)
     expect(requests[0].code).toBe('echo hello')
+    // Outside every host page the request carries no scope.
+    expect(requests[0]).not.toHaveProperty('scope')
+  })
+
+  it('stamps the scope of the host page it renders under', () => {
+    renderWithProviders(
+      <RunInTerminalScope.Provider value="host-1"><RunInTerminalBtn code="echo hello" /></RunInTerminalScope.Provider>,
+    )
+    clickAndConfirm()
+    expect(requests[0]).toMatchObject({ code: 'echo hello', scope: 'host-1' })
   })
 
   it('carries the fence language in the run request', () => {
@@ -170,5 +208,53 @@ describe('RunInTerminalBtn', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(requests).toHaveLength(0)
+  })
+
+  // When dashboard.terminal.reuse_current is on, confirming COPIES the command
+  // rather than running it (ChatPage's handler copies to the clipboard and
+  // replies copied:true). The confirm dialog must say Copy, not Run, so it does
+  // not promise an action it will not take.
+  describe('reuse-current (copy) path', () => {
+    /** Pre-seed the kirocrewConfig cache BEFORE mount so willCopy is settled on
+     *  the first render (no post-mount state churn), then open the dialog. The
+     *  suite runs on fake timers, so async findBy* would stall — everything is
+     *  synchronous. */
+    function openDialogWithReuse(reuse: boolean) {
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      queryClient.setQueryData(['kirocrewConfig'], { dashboard: { terminal: { reuse_current: reuse } } })
+      render(
+        <QueryClientProvider client={queryClient}>
+          <RunInTerminalBtn code="echo hi" />
+        </QueryClientProvider>,
+      )
+      act(() => {
+        fireEvent.click(screen.getByRole('button', { name: 'Run in terminal' }))
+      })
+    }
+
+    it('shows Copy button and copy copy in the dialog when reuse is on', () => {
+      openDialogWithReuse(true)
+      expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /^Run( anyway)?$/ })).not.toBeInTheDocument()
+      expect(screen.getByRole('dialog').textContent).toContain('paste into the terminal')
+      expect(screen.getByRole('dialog').textContent).not.toContain('will run in a new terminal tab')
+    })
+
+    it('keeps the Run button when reuse is off', () => {
+      openDialogWithReuse(false)
+      expect(screen.getByRole('button', { name: 'Run' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Copy' })).not.toBeInTheDocument()
+    })
+
+    it('flashes the copied state when the reuse path confirms', () => {
+      openDialogWithReuse(true)
+      act(() => { fireEvent.click(screen.getByRole('button', { name: 'Copy' })) })
+      expect(requests).toHaveLength(1)
+      act(() => {
+        const last = requests[requests.length - 1]
+        window.dispatchEvent(new CustomEvent('mc:run-in-terminal-result', { detail: { reqId: last.reqId, ok: true, copied: true } }))
+      })
+      expect(screen.getByLabelText('Copied — paste it into the terminal')).toBeInTheDocument()
+    })
   })
 })

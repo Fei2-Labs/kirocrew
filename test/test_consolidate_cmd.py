@@ -7,8 +7,22 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
+def _draining(mock_log):
+    """A ``consolidate_now`` that leaves the tail empty, as the real one does.
+
+    The real call repeats bounded passes until nothing is left, so the count the
+    command re-reads afterwards is what says whether it got there.
+    """
+
+    async def _consolidate_now(_key: str) -> bool:
+        mock_log.unconsolidated_count.return_value = 0
+        return True
+
+    return _consolidate_now
+
+
 class TestConsolidateCmd:
-    """Cover _consolidate_cmd paths in cli.py."""
+    """Cover _consolidate_cmd paths in cli_knowledge.py."""
 
     def _make_session_file(self, tmp_path: Path, name: str = "test_session") -> Path:
         sessions_dir = tmp_path / "sessions"
@@ -115,7 +129,11 @@ class TestConsolidateCmd:
         mock_log.unconsolidated_count.return_value = 3
 
         mock_consolidator = mock_consolidator_cls.return_value
-        mock_consolidator.consolidate_now = AsyncMock()
+        # consolidate_now drains the tail before it returns, so the count the
+        # command reports from afterwards is zero. The command prints what the
+        # transcript says rather than the call's flag — see the partial-drain
+        # test below.
+        mock_consolidator.consolidate_now = AsyncMock(side_effect=_draining(mock_log))
 
         from kiro_crew.cli import _consolidate_cmd
 
@@ -189,7 +207,7 @@ class TestConsolidateCmd:
         mock_log.unconsolidated_count.return_value = 7
 
         mock_consolidator = mock_consolidator_cls.return_value
-        mock_consolidator.consolidate_now = AsyncMock()
+        mock_consolidator.consolidate_now = AsyncMock(side_effect=_draining(mock_log))
 
         from kiro_crew.cli import _consolidate_cmd
 
@@ -206,6 +224,42 @@ class TestConsolidateCmd:
             source="cli",
             resources="test_session",
         )
+
+    @patch("kiro_crew.cli.sel")
+    @patch("kiro_crew.cli.SkillsLoader")
+    @patch("kiro_crew.cli.SessionManager")
+    @patch("kiro_crew.cli.MemoryStore")
+    @patch("kiro_crew.cli.HistoryConsolidator")
+    @patch("kiro_crew.cli.ConversationLog")
+    @patch("kiro_crew.cli.KiroCrewConfig")
+    def test_consolidate_reports_a_remainder_instead_of_done(
+        self, mock_cfg_cls, mock_log_cls, mock_consolidator_cls,
+        mock_mem_cls, mock_sess_cls, mock_skills_cls, mock_sel,
+        tmp_path, capsys,
+    ):
+        """A drain that stops short must not be reported as a completed pass.
+
+        This process exits when the command returns — no idle sweep follows it —
+        so ``done`` over a surviving tail is the last word on messages nothing
+        has read.
+        """
+        sessions_dir = self._make_session_file(tmp_path)
+        mock_cfg_cls.load.return_value = MagicMock()
+        mock_log = mock_log_cls.return_value
+        mock_log._dir = sessions_dir
+        mock_log.unconsolidated_count.return_value = 40
+
+        mock_consolidator = mock_consolidator_cls.return_value
+        mock_consolidator.consolidate_now = AsyncMock(return_value=True)
+
+        from kiro_crew.cli import _consolidate_cmd
+
+        args = argparse.Namespace(session_key="test_session", consolidate_all=False)
+        _consolidate_cmd(args)
+
+        captured = capsys.readouterr()
+        assert "40 message(s) remain" in captured.out
+        assert "done" not in captured.out
 
     @patch("kiro_crew.cli.sel")
     @patch("kiro_crew.cli.SkillsLoader")
@@ -311,7 +365,7 @@ class TestOnSessionExpire:
 
         # reset still called despite callback failure
         mock_reset.assert_called_once_with(
-            "expired-key", skip_if_busy=True, skip_if_injecting=True
+            "expired-key", expect_session=sess, skip_if_busy=True, skip_if_injecting=True
         )
 
 
@@ -421,7 +475,7 @@ class TestExpireIdleSelFailure:
 
         callback.assert_not_called()
         mock_reset.assert_called_once_with(
-            "expired-sel", skip_if_busy=True, skip_if_injecting=True
+            "expired-sel", expect_session=sess, skip_if_busy=True, skip_if_injecting=True
         )
 
     @patch("kiro_crew.session.sel")
@@ -458,5 +512,27 @@ class TestExpireIdleSelFailure:
 
         callback.assert_called_once_with("expired-cb")
         mock_reset.assert_called_once_with(
-            "expired-cb", skip_if_busy=True, skip_if_injecting=True
+            "expired-cb", expect_session=sess, skip_if_busy=True, skip_if_injecting=True
         )
+
+
+def test_refused_consolidation_cli_does_not_claim_zero_spend(capsys):
+    from kiro_crew.cli import _consolidate_cmd
+
+    with (
+        patch("kiro_crew.cli.sel"),
+        patch("kiro_crew.cli.SkillsLoader"),
+        patch("kiro_crew.cli.SessionManager"),
+        patch("kiro_crew.cli.MemoryStore"),
+        patch("kiro_crew.cli.KiroCrewConfig"),
+        patch("kiro_crew.cli.build_provider_factory"),
+        patch("kiro_crew.cli.ConversationLog") as log,
+        patch("kiro_crew.cli.HistoryConsolidator") as consolidator,
+    ):
+        log.return_value.unconsolidated_count.return_value = 3
+        consolidator.return_value.consolidate_now = AsyncMock(return_value=False)
+        _consolidate_cmd(argparse.Namespace(session_key="test_session", consolidate_all=False))
+    output = capsys.readouterr().out
+    assert "no completed pass recorded" in output
+    assert "nothing ran" not in output
+    assert "done" not in output

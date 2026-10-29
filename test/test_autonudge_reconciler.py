@@ -43,6 +43,7 @@ from kiro_crew.monitoring.models import (
     MonitorOutcome,
     MonitorState,
 )
+from kiro_crew.testing.wait import async_wait_until, finished
 
 
 @pytest.fixture(autouse=True)
@@ -59,9 +60,8 @@ def svc(tmp_path, event_loop):
     the test body is skipped by any failing assertion before it, leaking a
     pending task (and the global) past the test -- so the stop lives here,
     where pytest runs it on failure too, and the cancelled reconciler is
-    drained on the test's still-open event loop. A SYNC fixture on purpose:
-    the pinned pytest-asyncio (0.20.3) cannot run async-generator fixtures
-    under pytest 9 (``FixtureDef.unittest`` was removed), so the drain goes
+    drained on the test's still-open event loop. A SYNC fixture on purpose,
+    following the suite's convention for teardown that must await on the test's own loop: the drain goes
     through the ``event_loop`` fixture, which outlives this one by fixture
     ordering. ``stop()`` is idempotent, so the lifecycle test that exercises
     it explicitly stays valid.
@@ -84,9 +84,13 @@ def svc(tmp_path, event_loop):
     service.stop()
     live = [t for t in tasks if not t.done()]
     if live and not event_loop.is_closed():
-        with contextlib.suppress(asyncio.TimeoutError):
+        with contextlib.suppress(AssertionError):
             event_loop.run_until_complete(
-                asyncio.wait_for(asyncio.gather(*live, return_exceptions=True), timeout=5)
+                finished(
+                    asyncio.gather(*live, return_exceptions=True),
+                    "stopped service tasks",
+                    timeout=5,
+                )
             )
 
 
@@ -469,10 +473,10 @@ async def test_periodic_task_rescues_end_to_end(svc, monkeypatch):
     await svc.start()
     loop = await svc.add(slot_key="chat-1-123", message="go", idle_secs=300)
     svc._cancel_timer(loop.id)
-    deadline = time.time() + 5.0
-    while time.time() < deadline and not _timer_is_live(svc, loop.id):
-        await asyncio.sleep(0.05)
-    assert _timer_is_live(svc, loop.id)
+    await async_wait_until(
+        lambda: _timer_is_live(svc, loop.id),
+        describe=lambda: "the reconciler beat never re-armed the stranded loop's timer",
+    )
 
 
 @pytest.mark.asyncio

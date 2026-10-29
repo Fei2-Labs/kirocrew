@@ -115,7 +115,7 @@ class TestSecurityConductorInstaller:
         prompt = " ".join(self._install(tmp_path, monkeypatch)["prompt"].split())
         for role in ("Auditor", "Verifier", "Fixer"):
             assert role in prompt, role
-        assert "prepare-pr" in prompt  # the fixer's own procedure
+        assert "kirocrew-prepare-pr" in prompt  # the fixer's own procedure
 
     def test_prompt_closes_a_child_once_its_item_is_terminal(self, tmp_path, monkeypatch):
         """Four child roles reach a terminal verdict and the loop is stopped for each
@@ -198,6 +198,9 @@ class TestSecurityConductorInstaller:
         allowed = set(data["allowedTools"])
         assert "@kirocrew-dashboard/session_create" in allowed
         assert "@kirocrew-dashboard/session_read_message" in allowed
+        # The roster read: narrower than the transcript read above, and asked on
+        # every unattended cycle, so it is granted rather than gated.
+        assert "@kirocrew-dashboard/session_status" in allowed
         assert "@kirocrew-dashboard/chat_folder_tree" in allowed
         assert "@kirocrew-dashboard/chat_folder_create" in allowed
         # Writes only the caller's own placement, so it sits on the
@@ -206,6 +209,10 @@ class TestSecurityConductorInstaller:
         assert "@kirocrew-dashboard/chat_folder_file_self" in allowed
         for gated in (
             "@kirocrew-dashboard/session_send",
+            # The fan-out write, withheld on session_send's own reason: the
+            # fan-out changes how many sessions ingested text reaches, not
+            # whether anything bounds what is sent.
+            "@kirocrew-dashboard/session_broadcast",
             "@kirocrew-dashboard/session_stop",
             "@kirocrew-dashboard/chat_folder_move_session",
             "@kirocrew-dashboard",
@@ -284,21 +291,27 @@ class TestSecurityConductorInstaller:
         assert "`<audit>/<agent>`" in text
 
     def test_mcp_servers_are_narrowed(self, tmp_path, monkeypatch):
-        """Only kirocrew-core and the hand-built dashboard entry ship; inherited
-        third-party servers are dropped from this spec."""
+        """kirocrew-core plus the hand-built dashboard and work entries the shared
+        conductor base mounts; inherited third-party servers are dropped."""
         data = self._install(tmp_path, monkeypatch)
-        assert set(data["mcpServers"]) == {"kirocrew-core", "kirocrew-dashboard"}
+        assert set(data["mcpServers"]) == {
+            "kirocrew-core",
+            "kirocrew-dashboard",
+            "kirocrew-work",
+        }
         assert data["mcpServers"]["kirocrew-dashboard"]["args"] == ["mcp-dashboard"]
+        assert data["mcpServers"]["kirocrew-work"]["args"] == ["mcp-work"]
 
-    def test_the_work_server_is_not_mounted(self, tmp_path, monkeypatch):
-        """The work-ledger flow belongs to ``kirocrew-conductor``, and no other
-        conductor mounts it. This agent's children report through the
-        ``security-conductor`` skill's ledger scripts, not the work ledger, so the
-        mount would grant a flow whose procedure this conductor does not run."""
+    def test_the_work_server_is_mounted_with_the_base_grants(self, tmp_path, monkeypatch):
+        """Every conductor records its items in the work ledger: each auditor,
+        verifier and fixer is a ledger row, and the skill's findings ledger stays
+        its detail. The conductor verbs are granted; the worker verbs are not."""
         data = self._install(tmp_path, monkeypatch)
-        assert "@kirocrew-work" not in data["tools"]
-        assert "kirocrew-work" not in data["mcpServers"]
-        assert not [ref for ref in data["allowedTools"] if "kirocrew-work" in ref]
+        assert "@kirocrew-work" in data["tools"]
+        work = [ref for ref in data["allowedTools"] if "kirocrew-work" in ref]
+        assert work == list(agent._CONDUCTOR_BASE_WORK_GRANTS)
+        assert agent._CONDUCTOR_WORK_LEDGER_PROTOCOL in data["prompt"]
+        assert data["prompt"].startswith(agent._SECURITY_CONDUCTOR_SYSTEM_PROMPT)
 
     def test_permissions_are_derived_from_the_filtered_grants(self, tmp_path, monkeypatch):
         """The KAS policy comes from the grant list AFTER the ceiling filtered

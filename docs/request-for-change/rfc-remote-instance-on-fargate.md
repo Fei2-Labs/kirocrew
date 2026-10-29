@@ -4,8 +4,8 @@ status: partial
 kind: framework
 author: Raymond Chen (chenmingwei23)
 created: 2026-09-07
-last-audited: 2026-09-12
-audited-at: bf09e50e5
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr:
 implementation-prs: [9223]
 tracking-issues: []
@@ -20,8 +20,11 @@ superseded-by: []
 > [`../system-specs/modules/instances.md`](../system-specs/modules/instances.md).**
 > The single-task Fargate engine, configured provisioner lane, task-lifetime and
 > population bounds, direct turn API, and `fargate` registry/SSM tunnel are on
-> main. The body below predates registry parity and still describes registration,
-> the tunnel, and the relay as deferred; those claims are historical. Phase 2's
+> main. The body below predates registry parity. These sections still describe
+> registration, the tunnel, and the relay as deferred, and those claims are
+> historical: Goal 4 in §2, §6 "What stays the same", and the Phase 1 exit
+> criteria in §8. `CONNECTION_METHODS` in `instances/registry.py` includes
+> `fargate`. Phase 2's
 > one-action fan-out and Phase 3's comparative measurements remain unbuilt.
 
 ## Summary
@@ -152,16 +155,17 @@ container's secret-valued environment. Registering one is an API call, not a
 deployment.
 
 The secret-valued half is load-bearing, and the two secrets are load-bearing
-differently. `KIRO_API_KEY` is the model credential and the container refuses to
-boot without it: `require_api_key` in
+differently. `KIRO_IDENTITY` carries the model identity and the container refuses to
+boot without it: the supervisor writes the delivered document into the crew's vault
+and `require_model_identity` in
 `src/kiro_crew/apps/builtins/aws_control/crew/runtime/container/supervisor/backend.py`
-checks it for presence at startup. `SMC_CONTROL_SECRET` separates the owner's
+then reads that vault at startup. `SMC_CONTROL_SECRET` separates the owner's
 control surface from a customer turn and is NOT a boot requirement -- a task
 started without it boots and then refuses every control route, because the check
 fails closed on an unset secret. Neither is baked into the image. Both arrive as
 container secrets whose `valueFrom` names a Secrets Manager secret or a Parameter
 Store parameter, which is also what the execution role needs read permission on.
-Presence is all the startup check proves: an invalid `KIRO_API_KEY` produces a
+Presence is all the startup check proves: an invalid `KIRO_IDENTITY` produces a
 task that answers its port and fails every turn, so only a real turn establishes
 that the credential works.
 
@@ -200,29 +204,32 @@ class LaunchEngine(Protocol):
     """The AWS-touching operations a launch needs, injected for testability."""
     def preflight(self, profile, region) -> None: ...
     def provision(self, *, tag, size_key, profile, region) -> str: ...
-    def begin_signin(self, *, instance_id, profile, region) -> SigninHandle: ...
+    def begin_signin(self, *, instance_id, profile, region, login_target=None) -> SigninHandle: ...
     def register(self, *, instance_id, tag, profile, region) -> None: ...
     def teardown(self, *, tag, profile, region) -> bool: ...
 ```
 
-The EC2 implementation is `RealLaunchEngine` in `src/kiro_crew/cloud/launch_engine.py`,
-163 lines with five references to `ec2`, and the engine is already an injectable
+The snippet is abridged; `launch_job.py` owns the protocol. The EC2 implementation
+is `RealLaunchEngine` in `src/kiro_crew/cloud/launch_engine.py`, and the engine is already an injectable
 field named `cloud_launch_engine` in `src/kiro_crew/dashboard/state.py`, today set
 only by tests. A Fargate backend is a second
 implementation of these five methods. Everything above the seam, which is the
 launch job machinery, the tunnel manager and the relay surfaces, does not learn
 that a second backend exists.
 
-The registry is the exception, and the reason is a hard one rather than a
-preference. `src/kiro_crew/instances/registry.py` closes its transport set:
-`CONNECTION_METHODS` is `("ssh", "ssm")` and a record naming anything else is
-refused with `InvalidInstanceError`. The identity fields are equally closed --
-`ssm_target` is validated against `^(i|mi)-[a-f0-9]{8,17}$`, an EC2 instance id or
+The registry was the exception, and the reason was a hard one rather than a
+preference. `src/kiro_crew/instances/registry.py` closed its transport set:
+`CONNECTION_METHODS` was `("ssh", "ssm")` and a record naming anything else was
+refused with `InvalidInstanceError`. The identity fields were equally closed --
+`ssm_target` was validated against `^(i|mi)-[a-f0-9]{8,17}$`, an EC2 instance id or
 an SSM managed-instance id -- and a task identity is neither. So a Fargate-backed
-crew cannot be registered without changing registry code, which is why section 6
+crew could not be registered without changing registry code, which is why section 6
 defers registry visibility with the tunnel and the relay rather than only those
-two. Whether phase 1 should spend a third transport to close that is open; see
-section 11.
+two. That third transport is now spent: `CONNECTION_METHODS` carries `"fargate"`,
+`SSM_TRANSPORT_METHODS` groups it with `"ssm"` as the pair sharing the
+`ssm_target` / `aws_profile` / `aws_region` coordinates, and `ssm_target` for it is
+validated as `ecs:<cluster>_<task-id>_<runtime-id>`, so section 6's deferral is
+closed rather than open.
 
 Per method, what changes and what does not:
 
@@ -231,7 +238,7 @@ Per method, what changes and what does not:
 | `preflight` | Credentials, region, image availability | Same shape |
 | `provision` | Register a task definition, `RunTask`, return the task identity | Minutes of bootstrap become an image pull |
 | `begin_signin` | Nothing to drive: the task is handed a model credential and refuses to boot without one | The device-code scrape has no counterpart |
-| `register` | Deferred: no transport in `CONNECTION_METHODS` names a task | The one method of the five phase 1 does not deliver |
+| `register` | `DescribeTasks` until the crew container reports a `runtimeId`, then register `ecs:<cluster>_<task-id>_<runtime-id>` under the `fargate` transport | The instance id is known at provision; a task's target is not, so this method reads before it writes |
 | `teardown` | `StopTask` | Stack deletion becomes an API call |
 
 ### Sizing
@@ -301,6 +308,65 @@ boot from public sources, Fargate bakes them at build time. That is better for
 reproducibility and it concentrates trust in the image build. What the image is
 built from, and how a launch verifies it is running the digest it asked for, both
 need to be answered.
+
+### The internal-only boundary, and what accepting it accepts
+
+Decided 2026-09-27. **The Fargate lane is internal-only: it runs the operator's
+own crews, and the operator bears the whole risk of what those crews read.** That
+sentence is the security property this section now rests on, and everything below is
+what follows from it.
+
+It had to be decided because the lane could not otherwise run at all. The crew
+container is sandboxed-only: kiro-cli sandboxes the model subprocess in an
+unprivileged user namespace, and Fargate's default seccomp profile denies one.
+Measured on a real task, which pulled its image, fetched both secrets, started
+the supervisor and then exited 1 at the sandbox check. No task-definition field
+changes that — Fargate accepts no `privileged`, offers no `dockerSecurityOptions`,
+and `linuxParameters` admits only `CAP_SYS_PTRACE`.
+
+Taking the model credential out of the worker's environment does not earn the
+other posture, and that was tried first. Reachability is the operative property,
+not residency: the backend answers the engine's token request from the crew's
+vault, so the backend's uid must be able to decrypt it, and the worker runs as a
+child of the backend under that same uid. Measured — a uid-1000 process reads and
+decrypts that vault directly. So an unsandboxed auto-approving worker can reach
+the credential wherever the credential is stored.
+
+**What the boundary accepts, stated plainly and without narrowing it.** On a Fargate
+host the model subprocess runs unsandboxed, that subprocess auto-approves every tool
+it calls, and it can reach the model credential in the crew's vault.
+
+The exposure is NOT limited to a prompt an outsider types. An internal crew consumes
+untrusted CONTENT as a matter of course: tool output, fetched web pages, connector and
+API payloads, repository and ticket text, a file someone else wrote. Any of that can
+carry an injection, and it reaches the unsandboxed worker regardless of who sent the
+prompt. With the flag on, a worker injected through any of those routes can read the
+vault. Saying "no external party sends prompts here" would describe a smaller exposure
+than the one being accepted, so it is not the claim this boundary makes.
+
+What the operator accepts is the whole of that, for their own crews: a prompt-injected
+worker on this task can read the crew's model credential, and the blast radius is the
+operator's own account and their own crew. That is a judgement about whose credential
+is at risk and who bears it, not a claim that injection cannot happen. It is a
+judgement only the operator can make, which is why the switch lives in their file.
+
+**The claim is explicit, and the switch names the boundary rather than the
+consequence.** `cloud.json`'s `fargate` block carries `internal_only`; the
+launcher derives `SMC_INTERNAL_ONLY` from it and a caller cannot supply that
+variable; the container's supervisor reads it and takes one branch. An operator
+therefore cannot ask for "allow unsandboxed" — they can only state whose crews these
+are, and the loosening follows. Absent means not claimed, so a lane that
+says nothing keeps refusing, and every other lane and every local host is
+unchanged.
+
+**What this is not.** It is not the multi-tenant answer and must not be read as
+one. A user namespace is the real containment; where callers are external or a
+task is shared, the answer is a Firecracker-based runtime, which is a different
+design and not this one. `#9355`'s credential broker is not started, and this
+decision does not close it: a brokered short-lived credential is still what makes
+a stolen token bounded rather than long-lived. Section 12 below already says
+remote instances on Fargate remain single-owner; this boundary is that sentence
+made operational.
 
 ### What does not change
 
@@ -389,11 +455,12 @@ Existing size keys keep working. `size_key` is the protocol's parameter and the
 Fargate backend maps the same three keys to CPU and memory pairs, so a launch that
 does not name a backend behaves as it does today.
 
-No stored state changes shape, and in this phase no new state is written at all. A
-Fargate-backed crew is not registered, so nothing is added to the registry file and
-no existing record is reinterpreted: a registry written before this work is readable
-after it and the reverse holds too. Registry parity would need a third transport,
-and adding one is where that compatibility question would actually be decided.
+No stored state changes shape. A Fargate-backed crew is registered under the
+`fargate` transport, so a launch adds a registry record and no existing record is
+reinterpreted: a registry written before this work is readable after it, and a
+reader that does not know the transport refuses that one record rather than
+misreading any other. Registry parity needed a third transport, and that is where
+this compatibility question was decided.
 
 ## 10. Alternatives considered
 
@@ -424,15 +491,14 @@ the thing this RFC is trying to remove.
 
 ## 11. Open questions
 
-**Whether phase 1 buys registry parity.** A Fargate-backed crew cannot be
-registered as things stand: `CONNECTION_METHODS` is closed to `ssh` and `ssm` and
-the identity fields accept only an instance id (section 5). Closing that means a
-third transport in `src/kiro_crew/instances/registry.py` and a tunnel manager that
-knows what to do with a task, which is the largest single piece of work this RFC
-could add and is not needed for "deploy a crew and chat with it". Deferring it is
-what section 6 records. The question is whether the deferral holds through phase 2,
-because ten unregistered fan-out workers are ten things the owner cannot see in the
-one place they look.
+**Whether phase 1 buys registry parity.** Answered yes. It cost a third transport
+in `src/kiro_crew/instances/registry.py` and a tunnel manager that knows what to do
+with a task, which was the largest single piece of work this RFC could add and was
+not needed for "deploy a crew and chat with it" -- and the deferral section 6
+recorded did not hold, because ten unregistered fan-out workers are ten things the
+owner cannot see in the one place they look. `CONNECTION_METHODS` now carries
+`fargate`, `ssm_target` accepts an ECS task target for it, and `register` composes
+that target from the task's own coordinates.
 
 **Session lifetime against task lifetime.** A disposable task that lives minutes
 is a good fit for a short session. A fan-out worker that runs for hours is less

@@ -7,7 +7,8 @@
  * the meaning of its timestamps live beside each other.
  */
 import { i18nT } from '../i18n/t'
-import { fmtDuration } from '../i18n/format'
+import { fmtDuration, fmtTimeNumeric } from '../i18n/format'
+import monitorContract from '../monitoring/contract.json'
 
 export interface AutoNudgeLoop {
   id: string
@@ -24,10 +25,32 @@ export interface AutoNudgeLoop {
   next_due_ts: number
   /** Why the loop last went inactive: '' while active or never stopped,
    *  otherwise one of the service's terminal codes (`cycle_cap`,
-   *  `runtime_budget`, `approval_stalled`, `autonudge_stop`, `manual`). Only
-   *  the REST list carries it; the websocket frame for a plain loop does not,
-   *  so a consumer merging frames over a fetched record must keep it. */
+   *  `runtime_budget`, `approval_stalled`, `autonudge_stop`, `manual`, and the
+   *  two FINISHED codes in `FINISHED_STOP_REASONS`). Carried
+   *  by the REST list and by the `autonudge_state` frame alike. `undefined`
+   *  means the source did not carry it -- "not known here". */
   stopped_reason?: string
+  /** The settled outcome of the loop's own watch: `success` when the watched
+   *  pull request merged, `blocked` when it was closed without merging, '' while
+   *  none has settled. Carried by the `autonudge_state` frame for every loop; it
+   *  is the one scalar the Done wording needs, and the frame withholds the
+   *  monitor record that holds it. `undefined` means the source did not carry it. */
+  monitor_outcome?: string
+  /** The kind of subject the loop's own watch observed: `gh-pr` for a pull
+   *  request, `work-ledger` for a conductor's work ledger, '' with no watch.
+   *  Carried by the frame beside `monitor_outcome`; the Done wording is chosen
+   *  by the pair. `undefined` means the source did not carry it. */
+  monitor_kind?: string
+  /** True while an ACTIVE loop holds because a cycle's approval went unanswered:
+   *  it fires nothing until a person answers an approval, sends a message or
+   *  fires it, then resumes by itself. Carried by the REST list (`asdict(loop)`)
+   *  and the `autonudge_state` frame; `undefined` reads as not held. */
+  approval_stalled?: boolean
+  /** True while an ACTIVE work-ledger watch holds because every open item waits
+   *  on a person and nothing moved since its last turn. It fires nothing until
+   *  the ledger changes. Carried by the REST list and the `autonudge_state`
+   *  frame; `undefined` reads as not held. */
+  waiting_on_person?: boolean
   /** Short stand-in for `message` in the visible transcript row; '' = none. */
   banner?: string
   /** The kill-switch file the server substitutes for `{{STOP_FILE}}` at fire
@@ -36,6 +59,22 @@ export interface AutoNudgeLoop {
    *  which is broadcast without an owner gate and withholds filesystem paths.
    *  So `undefined` means "not known here", while '' is a real "no sentinel". */
   stop_sentinel_path?: string
+  /** The wake judge's brief, as the owner armed it; absent or `{}` = no judge.
+   *  The two sentences are the owner's own words about their own loop, so the
+   *  popover shows them back rather than making the owner reopen the tool call to
+   *  remember what a loop is screening on. */
+  judge?: { wake_when?: string; quiet_when?: string; targets?: string[] }
+  /** The last verdict, deliberately text-free: an outcome, how many evidence
+   *  items it was based on, and when. It carries NO transcript text and no
+   *  per-answer probability; those live in the decisions log, which is where the
+   *  thresholds are meant to be tuned from. */
+  judge_last_verdict?: { outcome?: string; evidence_items?: number; at?: number }
+  /** The opaque identity of the stored goal text, re-minted on every goal write
+   *  and on every gateway load. Carried by the REST reads and the arm/update
+   *  responses, NOT by the websocket frame, so a record that came through a frame
+   *  has none. The goal popover sends the value it read back as
+   *  `expect_fingerprint`, which makes a save over a goal saved elsewhere a 409. */
+  goal_token?: string
 }
 
 /** `GET /api/autonudge`: every loop record the service holds, active or stopped.
@@ -58,6 +97,24 @@ export interface AutoNudgeListResponse {
  *  websocket hook invalidates it on every `autonudge_state` frame and on every
  *  (re)connect, so any reader of this key is live without its own listener. */
 export const AUTONUDGE_LOOPS_QUERY_KEY = ['autonudge-loops'] as const
+
+/** The service's two FINISHED stop codes (`FINISHED_LOOP_REASONS` on the
+ *  backend): the agent created the loop's stop file, or the watched pull
+ *  request merged or closed. A finished loop is Done, not paused: the service
+ *  refuses to revive it, so no surface may offer to. */
+export const FINISHED_STOP_REASONS = new Set(['stop_sentinel', 'monitor_terminal'])
+
+/** Whether this inactive loop is finished (Done) rather than paused. An active
+ *  loop is never finished, whatever its reason field still says. */
+export function loopFinished(loop: Pick<AutoNudgeLoop, 'active' | 'stopped_reason'> | null | undefined): boolean {
+  return !!loop && !loop.active && FINISHED_STOP_REASONS.has(loop.stopped_reason ?? '')
+}
+
+/** The watch kinds whose subject is a pull or merge request: the gated prompt
+ *  loop's own `gh-pr`, plus the structured provider kinds. A finished watch of
+ *  any other kind (a conductor's work ledger) is worded as a subject, not as a
+ *  pull request, because its finish is neither a merge nor a close. */
+export const PULL_REQUEST_WATCH_KINDS = new Set<string>(['gh-pr', ...monitorContract.pullRequestMonitorKinds])
 
 /** Cycle readout: "3/24" when a finite cap is armed, and a bare "3" when
  *  max_cycles is 0, which means infinite -- a loop with no backstop has no
@@ -123,4 +180,70 @@ export function nextCycleText(loop: AutoNudgeLoop | null | undefined, nowTs: num
     case 'in':
       return i18nT('components.autoNudgePopover.next_cycle_in', { time: next.time })
   }
+}
+
+/** The judge line as DATA, so each surface words it for its own layout -- the
+ *  same split `nextCycle` uses, and for the same reason: the popover has room for
+ *  the brief, a compact row may want only the last reading.
+ *
+ *  `kind: 'none'` is a loop with no judge, which is every loop by default. A
+ *  `verdict` of undefined is a judge that has not answered yet, which is not the
+ *  same thing and must not read as one: the first is "this loop fires on a timer",
+ *  the second is "it will be screened, starting next cycle". */
+export type JudgeReading =
+  | { kind: 'none' }
+  | { kind: 'armed'; sense: 'wake' | 'quiet'; criterion: string; verdict?: JudgeVerdict }
+
+export interface JudgeVerdict {
+  /** The outcome word as the point spells it, e.g. 'quiet', 'progress_only'. */
+  outcome: string
+  /** How many evidence items the answer was based on. */
+  items: number
+  /** When it was answered, epoch seconds; 0 when the record carried no time. */
+  at: number
+}
+
+/**
+ * Read one loop's judge state.
+ *
+ * A brief with neither sentence reads as `none`, and that is what a loop stores when
+ * its owner named no criteria of their own. Such a loop may still be SCREENED, under
+ * the default brief the gateway supplies per tick, which is never written back to the
+ * record — so this reading is "does the owner have a criterion here", not "is a judge
+ * running". The row is the owner's own sentence or nothing; the per-tick transcript
+ * notice is where a verdict reached under the default is reported, and it names which
+ * brief it used.
+ */
+export function judgeReading(loop: AutoNudgeLoop | null | undefined): JudgeReading {
+  const wakeWhen = (loop?.judge?.wake_when ?? '').trim()
+  const quietWhen = (loop?.judge?.quiet_when ?? '').trim()
+  if (!wakeWhen && !quietWhen) return { kind: 'none' }
+  const raw = loop?.judge_last_verdict
+  const outcome = (raw?.outcome ?? '').trim()
+  // No outcome means no answer yet. The item count alone is not enough to call it
+  // one: a verdict is identified by what it decided, and a 0-item tick is a real
+  // answer the judge gave on nothing.
+  const verdict: JudgeVerdict | undefined = outcome
+    ? { outcome, items: Math.max(0, Math.trunc(raw?.evidence_items ?? 0)), at: raw?.at ?? 0 }
+    : undefined
+  // Which SENTENCE the criterion is, not just its text. A brief may carry either one,
+  // and they say opposite things: printing a `quiet_when` under a "wake when" label
+  // tells the owner the inverse of what they armed, on every visit. `wake_when` wins
+  // when both are present, because a wake condition is the one that costs a turn.
+  return {
+    kind: 'armed',
+    sense: wakeWhen ? 'wake' : 'quiet',
+    criterion: wakeWhen || quietWhen,
+    verdict,
+  }
+}
+
+/** The verdict's clock reading, e.g. "12:30", in the reader's own zone. */
+export function judgeVerdictTime(at: number): string {
+  // The SAME formatter the last-fire line one row above uses. A hand-rolled UTC
+  // clock here put two times in one block that disagree by the reader's offset,
+  // every visit, and spelled the zone as a bare `Z` that only names itself to
+  // someone who already knows it.
+  if (!at || at <= 0) return ''
+  return fmtTimeNumeric(at)
 }

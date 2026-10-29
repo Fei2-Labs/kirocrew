@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import RecoveryCard, { parseRecoveryMessage, resolveInjectCard } from '../pages/chat/RecoveryCard'
+import RecoveryCard, { INJECT_KIND_OPENS_TURN, injectOpensTurn, parseRecoveryMessage, resolveInjectCard } from '../pages/chat/RecoveryCard'
 
 // Verbatim prefixes from src/kiro_crew/dashboard/state.py. The separator is an
 // em dash, not a hyphen — a mismatch is exactly the drift this suite guards.
@@ -361,15 +361,25 @@ describe('RecoveryCard', () => {
  * behaviour is covered above.
  */
 describe('ChatPage – recovery card wiring', () => {
-  const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../pages/ChatPage.tsx'), 'utf8')
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
+  // so the pins read the page and those owners.
+  const pagesDir = resolve(dirname(fileURLToPath(import.meta.url)), '../pages')
+  const ownerDir = resolve(pagesDir, 'chat/page')
+  const src = [
+    readFileSync(resolve(pagesDir, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => readFileSync(resolve(ownerDir, f), 'utf8')),
+    ...readdirSync(pagesDir).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+      .map(f => readFileSync(resolve(pagesDir, f), 'utf8')),
+  ].join('\n')
 
   it('imports the card and its shared resolver', () => {
     // Since chat-core P5-b the recovery row is a shared dashboard entry
     // (pages/chat/transcriptRenderers.tsx) that ChatPage spreads into its host
     // list, so the imports live in the factory and the page imports the factory.
     const factory = readFileSync(resolve(__dirname, '../pages/chat/transcriptRenderers.tsx'), 'utf8')
-    expect(factory).toMatch(/import\s+RecoveryCard\s*,\s*\{\s*resolveInjectCard\s*\}\s*from\s*['"]\.\/RecoveryCard['"]/)
-    expect(src).toMatch(/import \{ createTranscriptRenderers \} from '\.\/chat\/transcriptRenderers'/)
+    expect(factory).toMatch(/import\s+RecoveryCard\s*,\s*\{[^}]*\bresolveInjectCard\b[^}]*\}\s*from\s*['"]\.\/RecoveryCard['"]/)
+    expect(src).toMatch(/import \{ createTranscriptRenderers \} from '\.\.\/transcriptRenderers'/)
   })
 
   it('routes inject rows through the shared resolver to the card', () => {
@@ -396,7 +406,7 @@ describe('ChatPage – recovery card wiring', () => {
   })
 })
 
-/** Verbatim from SUBAGENT_SYNTHESIS_PREFIX in src/kiro_crew/dashboard/state.py. */
+/** Verbatim from SUBAGENT_SYNTHESIS_PREFIX in src/kiro_crew/dashboard/state_parts/injected_turns.py. */
 const SYNTHESIS = '[SYSTEM] Sub-agent synthesis:'
 
 describe('parseRecoveryMessage – sub-agent synthesis', () => {
@@ -485,6 +495,15 @@ describe('resolveInjectCard – which inject rows become notes', () => {
     expect(card?.kind).toBe('generic')
   })
 
+  it('does not fold a re-routed automation refusal — it is suppressed by the renderer, not carded', () => {
+    // `automation_notice` is hidden on the Sessions page by the
+    // `automation_notice_inject` renderer (and in the crewmate DM by
+    // MACHINERY_ROLES), because the refusal's notice bar already shows it. So
+    // resolveInjectCard returns null for it — it never becomes a note card.
+    const card = resolveInjectCard(row('[Automation notice] ⚠️ Automation loop NOT updated.', { injectKind: 'automation_notice' }))
+    expect(card).toBeNull()
+  })
+
   it('leaves a cron row to its own labelled bubble, stamped OR restored-legacy', () => {
     // Stamped (durable, survives a flush):
     expect(resolveInjectCard(row('nightly report', { injectKind: 'cron', cronLabel: 'nightly' }))).toBeNull()
@@ -513,3 +532,29 @@ describe('resolveInjectCard – which inject rows become notes', () => {
     expect(card?.kind).toBe('stalled')
   })
 })
+
+describe('injectOpensTurn – which inject rows begin a turn of their own', () => {
+  // The row-kind vocabulary's OTHER half: resolveInjectCard says how a stamped
+  // row is drawn, this says whether the rows below it belong to a new turn.
+  // Both key on the persisted `meta.injectKind`, never on the row's text.
+  const row = (meta?: Record<string, unknown>) => ({ role: 'inject', content: 'x', meta })
+
+  it('classifies every stamped kind, and the table is the union', () => {
+    // A kind missing here fails to compile, so this pins the VALUES only.
+    expect(INJECT_KIND_OPENS_TURN).toEqual({ cron: true, mcp_app: true, synthesis: true, recovery: false, user_replay: false, automation_notice: true })
+    for (const [kind, opens] of Object.entries(INJECT_KIND_OPENS_TURN)) expect(injectOpensTurn(row({ injectKind: kind })), kind).toBe(opens)
+  })
+
+  it('reads an unstamped row, a kind this build does not know, and a non-inject role as "not an opener"', () => {
+    // A note, the policy-block notice and the hook-halt marker carry no kind and
+    // dispatch nothing; a newer gateway's kind reads the same way, the fail-
+    // passive direction resolveInjectCard takes for an unmarked row; a `user`
+    // row is the caller's business (TURN_OPENER_ROLES), not this predicate's.
+    expect(injectOpensTurn(row())).toBe(false)
+    expect(injectOpensTurn(row({ noteSession: 'chat-2' }))).toBe(false)
+    expect(injectOpensTurn(row({ injectKind: 'some_future_kind' }))).toBe(false)
+    expect(injectOpensTurn(row({ injectKind: 'toString' }))).toBe(false)
+    expect(injectOpensTurn({ role: 'user', content: 'x', meta: { injectKind: 'cron' } })).toBe(false)
+  })
+})
+

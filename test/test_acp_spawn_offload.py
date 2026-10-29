@@ -28,10 +28,11 @@ import asyncio
 import json
 import threading
 import traceback
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -39,6 +40,30 @@ import kiro_crew.acp.client as client_mod
 import kiro_crew.acp.runtime as runtime_mod
 from kiro_crew.acp.client import AcpClient, _resolve_spawn_env
 from kiro_crew.acp.runtime import AcpRuntime
+from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
+from kiro_crew.testing.wait import await_until
+
+# A pid above every supported platform's pid_max: a cleanup path that signals it
+# reaches nothing on the runner (same spelling as test/test_update_provider.py).
+_UNALLOCATABLE_PID = 99_999_999_999
+
+
+@pytest.fixture(autouse=True)
+def _pinned_kiro_cli_version(monkeypatch):
+    """Pin the kiro-cli release the spec ``permissions`` gate believes is installed.
+
+    A client start here materialises the agent spec (``ensure_agent_materialized``
+    -> ``rebuild_agent_config`` -> ``_write_derived_permissions``), which reads
+    ``installed_kiro_cli_version`` function-locally from ``kiro_crew.kiro_cli``:
+    one real ``kiro-cli --version`` spawn per binary identity, process-cached, so
+    whichever test in the worker starts first pays it against the HOST's install
+    with the checkout as the child's cwd. Pinned to the floor release, as
+    ``test_agent.py`` and the generated-writer suites pin it.
+    """
+    monkeypatch.setattr(
+        "kiro_crew.kiro_cli.installed_kiro_cli_version",
+        lambda: SPEC_PERMISSIONS_MIN_VERSION,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -57,7 +82,7 @@ def _native_projection_for_fake_processes(monkeypatch):
 
     loop_thread = threading.current_thread()
 
-    def prepare(work_dir):
+    def prepare(work_dir, **_kwargs):
         assert threading.current_thread() is not loop_thread
         return skill_projection.NativeSkillProjection({"kirocrew": "kirocrew-skill-view-test"})
 
@@ -248,7 +273,9 @@ class TestClientSpawnPidTrackingOffLoop:
             ),
             patch(
                 "kiro_crew.session._track_session_pid",
-                side_effect=lambda pid: session_track_threads.append(threading.current_thread()),
+                side_effect=lambda pid, token=None: session_track_threads.append(
+                    threading.current_thread()
+                ),
             ),
             # PID 12345 may be a real host process; an empty scan keeps the
             # early-descendant branch (and its own tracking write) out of
@@ -582,7 +609,10 @@ class TestRuntimeSpawnCarriesItsInstance:
 
     @pytest.mark.asyncio
     async def test_env_instance_matches_process_instance(self, tmp_path, monkeypatch) -> None:
-        from kiro_crew.constants import KIROCREW_SPAWN_INSTANCE_ENV, KIROCREW_SPAWNED_ENV
+        from kiro_crew.constants import (
+            KIROCREW_SPAWN_INSTANCE_ENV,
+            KIROCREW_SPAWNED_ENV,
+        )
 
         class _StopSpawn(Exception):
             pass
@@ -623,6 +653,539 @@ class TestRuntimeSpawnCarriesItsInstance:
         instance = seen_env.get(KIROCREW_SPAWN_INSTANCE_ENV)
         assert instance, "the child env carries no spawn instance"
         assert runtime._process_instance == instance
+
+
+class TestRuntimeProjectedLaunchDocuments:
+    @staticmethod
+    async def _drive(
+        monkeypatch,
+        tmp_path: Path,
+        *,
+        inherits: bool,
+        projected_error: type[Exception] | None = None,
+        mid_spawn: Callable[[AcpRuntime], None] | None = None,
+        mid_record: Callable[[AcpRuntime], None] | None = None,
+        before_spawn: Callable[[AcpRuntime], None] | None = None,
+        member_plan: dict[str, str] | None = None,
+    ) -> tuple[AcpRuntime, list[dict]]:
+        from kiro_crew import member_essential_context
+        from kiro_crew.acp import skill_projection
+        from kiro_crew.agent_sdk.drivers import acp as acp_driver
+
+        class StopAfterProjection(Exception):
+            pass
+
+        process = MagicMock()
+        process.pid = _UNALLOCATABLE_PID
+        process.returncode = None
+        process.stderr = None
+        process.stdout = None
+        TestRuntimeShieldSurvivesAFailedAppend._patch_prelude(monkeypatch, tmp_path, process)
+        project = tmp_path / "workspace"
+        guide = project / ".kiro" / "steering" / "guide.md"
+        guide.parent.mkdir(parents=True)
+        guide.write_text("PROJECTED-LAUNCH-GUIDE", encoding="utf-8")
+        view = {
+            "name": "kirocrew-skill-view-test",
+            "resources": ["file://.kiro/steering/**/*.md"],
+        }
+        monkeypatch.setattr(
+            skill_projection,
+            "prepare_native_skill_projection",
+            lambda work_dir, **kwargs: skill_projection.NativeSkillProjection(
+                {"kirocrew": "kirocrew-skill-view-test"},
+                specs={"kirocrew": view},
+            ),
+        )
+
+        def inherits_default_resources(work_dir):
+            if mid_spawn is not None and holder:
+                mid_spawn(holder[0])
+            return inherits
+
+        monkeypatch.setattr(acp_driver, "inherits_default_resources", inherits_default_resources)
+        projected_calls: list[dict] = []
+        holder: list[AcpRuntime] = []
+        projected_launch_paths = member_essential_context.projected_launch_paths
+        if mid_record is not None:
+
+            def record_launch_paths(definition, cwd):
+                if holder:
+                    mid_record(holder[0])
+                return projected_launch_paths(definition, cwd)
+
+            monkeypatch.setattr(
+                member_essential_context, "projected_launch_paths", record_launch_paths
+            )
+        if projected_error is not None:
+
+            def reject(definition, cwd):
+                projected_calls.append(definition)
+                raise projected_error("synthetic projected walk failure")
+
+            monkeypatch.setattr(member_essential_context, "projected_launch_paths", reject)
+
+        async def no_reader(self):
+            return None
+
+        monkeypatch.setattr(AcpRuntime, "_reader_loop", no_reader, raising=True)
+        monkeypatch.setattr(
+            AcpRuntime,
+            "_send_and_await",
+            AsyncMock(side_effect=StopAfterProjection()),
+            raising=True,
+        )
+        monkeypatch.setattr(AcpRuntime, "kill", AsyncMock(), raising=True)
+        monkeypatch.setattr(runtime_mod, "register_protected_pid", lambda pid: None)
+        monkeypatch.setattr(runtime_mod, "_track_pid", lambda pid: None)
+        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid: None)
+
+        runtime = AcpRuntime(work_dir=project, expect_mcp_reports=False)
+        if member_plan is not None:
+            # A member launch: the harness plan records the member's documents.
+            runtime._member_context = SimpleNamespace()
+            monkeypatch.setattr(
+                member_essential_context,
+                "kiro_launch_documents",
+                lambda agent, work_dir: tuple(member_plan.items()),
+            )
+        holder.append(runtime)
+        if before_spawn is not None:
+            before_spawn(runtime)
+        with pytest.raises(StopAfterProjection):
+            await runtime.spawn()
+        return runtime, projected_calls
+
+    @staticmethod
+    def _create_session_kwargs(runtime: AcpRuntime, *, agent: str | None = None) -> dict:
+        return dict(
+            buffered_init=[],
+            agent=agent,
+            crew_agent=None,
+            kas_agents=None,
+            mcp_servers=[],
+            budget=1.0,
+            stub_token="",
+            denied_tools=frozenset(),
+            mirrored_snapshot=None,
+            ref_spec=None,
+            active_agent=runtime._agent,
+            session_work_dir=str(runtime._work_dir),
+            projected_sources={},
+            payload_snapshot=None,
+        )
+
+    @staticmethod
+    def _patch_load_session(monkeypatch, runtime: AcpRuntime, current_mode: str) -> None:
+        runtime._initialized = True
+        runtime._can_load_session = True
+        monkeypatch.setattr(
+            runtime_mod,
+            "_pooled_session_servers_and_ref_spec",
+            lambda *_args, **_kwargs: ([], None),
+        )
+        monkeypatch.setattr(runtime, "_unpooled_control_planes", AsyncMock(return_value=[]))
+        monkeypatch.setattr(runtime, "_own_stub_session", AsyncMock(return_value=([], "")))
+        monkeypatch.setattr(runtime, "_session_start_budget", AsyncMock(return_value=1.0))
+        monkeypatch.setattr(
+            runtime,
+            "_send_and_await",
+            AsyncMock(return_value={"modes": {"currentModeId": current_mode}, "models": []}),
+        )
+        monkeypatch.setattr(runtime, "_verify_spawn_agent_active", AsyncMock())
+        monkeypatch.setattr(runtime, "_activates_agent_by_mode", lambda: False)
+        monkeypatch.setattr(runtime, "_snapshot_descendants", AsyncMock())
+
+    @pytest.mark.asyncio
+    async def test_opted_out_non_member_spawn_records_projected_launch_paths(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        # kiro-cli re-reads the declared guides for every request, so the folder
+        # dedup needs only their paths; no body is read or kept.
+        assert runtime._native_launch_sources == {str(guide): ""}
+        assert runtime._native_launch_view_alias == "kirocrew-skill-view-test"
+        assert runtime._native_launch_resources == ["file://.kiro/steering/**/*.md"]
+
+    @pytest.mark.asyncio
+    async def test_spawn_reads_no_guide_body(self, tmp_path, monkeypatch) -> None:
+        from kiro_crew import member_essential_context
+
+        read = Mock(side_effect=AssertionError("the launch record must not read a guide"))
+        monkeypatch.setattr(member_essential_context, "_read", read)
+
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        assert runtime._native_launch_sources == {str(guide): ""}
+        read.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_spawn_records_nothing_when_declared_files_exceed_the_bound(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """kiro-cli drops whole declared files past its budget, so a view whose
+        declared files total more than the bound records nothing and the folder
+        sends every guide."""
+        from kiro_crew import member_essential_context
+
+        def oversize(runtime: AcpRuntime) -> None:
+            guide = runtime._work_dir / ".kiro" / "steering" / "guide.md"
+            room = member_essential_context._LAUNCH_RECORD_MAX_BYTES - guide.stat().st_size
+            (guide.parent / "added.md").write_text("a" * (room + 1), encoding="utf-8")
+
+        runtime, _calls = await self._drive(
+            monkeypatch, tmp_path, inherits=False, before_spawn=oversize
+        )
+
+        assert runtime._native_launch_sources == {}
+        assert runtime._native_launch_view_alias is None
+        assert runtime._native_launch_resources is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("swap_at", ["inherits", "record"])
+    @pytest.mark.parametrize("swap_to", ["none", "other_view"])
+    async def test_spawn_records_the_projection_it_launched_when_the_attribute_is_swapped(
+        self, tmp_path, monkeypatch, swap_at, swap_to
+    ) -> None:
+        from kiro_crew.acp import skill_projection
+
+        intruder = (
+            None
+            if swap_to == "none"
+            else skill_projection.NativeSkillProjection(
+                {"kirocrew": "kirocrew-skill-view-other"}, specs={}
+            )
+        )
+
+        def swap_projection(runtime: AcpRuntime) -> None:
+            runtime._native_skill_projection = intruder
+
+        runtime, _calls = await self._drive(
+            monkeypatch,
+            tmp_path,
+            inherits=False,
+            mid_spawn=swap_projection if swap_at == "inherits" else None,
+            mid_record=swap_projection if swap_at == "record" else None,
+        )
+
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        assert runtime._native_launch_sources == {str(guide): ""}
+        assert runtime._native_launch_view_alias == "kirocrew-skill-view-test"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("agent", "cwd", "expected_documents"),
+        [
+            pytest.param(None, None, {"file://guide.md": "GUIDE"}, id="matching-runtime"),
+            pytest.param("other-agent", None, {}, id="different-agent"),
+            pytest.param(None, "other-workspace", {}, id="different-work-dir"),
+        ],
+    )
+    async def test_resume_carries_only_matching_runtime_launch_documents(
+        self, tmp_path, monkeypatch, agent, cwd, expected_documents
+    ) -> None:
+        project = tmp_path / "workspace"
+        runtime = AcpRuntime(work_dir=project, expect_mcp_reports=False)
+        runtime._native_launch_sources = {"file://guide.md": "GUIDE"}
+        self._patch_load_session(monkeypatch, runtime, agent or "kirocrew")
+
+        handle = await runtime.load_session(
+            "",
+            "resumed-session",
+            cwd=tmp_path / cwd if cwd else None,
+            agent=agent,
+        )
+
+        assert handle.native_context_documents == expected_documents
+
+    @pytest.mark.asyncio
+    async def test_inheriting_non_member_spawn_records_no_projected_launch_documents(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=True)
+
+        assert runtime._native_launch_sources == {}
+        assert runtime._native_launch_view_alias is None
+
+    @pytest.mark.asyncio
+    async def test_member_spawn_records_its_plan_documents_and_no_projected_paths(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A member launch records the plan's documents, as on an inheriting
+        workspace; the projected view's paths never replace or join them."""
+        plan_record = {"file://member-guide.md": "MEMBER-GUIDE"}
+
+        runtime, _calls = await self._drive(
+            monkeypatch, tmp_path, inherits=False, member_plan=plan_record
+        )
+
+        assert runtime._native_launch_sources == plan_record
+        assert runtime._native_launch_view_alias is None
+        assert runtime._native_launch_resources is None
+
+    @pytest.mark.asyncio
+    async def test_projected_walk_error_keeps_spawn_running_without_launch_documents(
+        self, tmp_path, monkeypatch, caplog
+    ) -> None:
+        from kiro_crew.member_essential_context import MemberEssentialContextError
+
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.runtime"):
+            runtime, calls = await self._drive(
+                monkeypatch,
+                tmp_path,
+                inherits=False,
+                projected_error=MemberEssentialContextError,
+            )
+
+        assert calls == [
+            {
+                "name": "kirocrew-skill-view-test",
+                "resources": ["file://.kiro/steering/**/*.md"],
+            }
+        ]
+        assert runtime._native_launch_sources == {}
+        # The empty record lasts for the process's life, so the reason it is
+        # empty is named once in the log rather than left to a duplicate guide.
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "kiro_crew.acp.runtime"
+            and r.levelname == "WARNING"
+            and "launch steering record" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert "MemberEssentialContextError" in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_record_warning_escapes_newlines(self, tmp_path, monkeypatch, caplog) -> None:
+        from kiro_crew.member_essential_context import MemberEssentialContextError
+
+        class NewlineRecordError(MemberEssentialContextError):
+            def __init__(self, _message: str) -> None:
+                super().__init__(
+                    "Essential source /steer/a\n"
+                    "2026-09-30 12:00:00,000 ERROR kiro_crew.auth: forged.md: unreadable"
+                )
+
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.runtime"):
+            await self._drive(
+                monkeypatch,
+                tmp_path,
+                inherits=False,
+                projected_error=NewlineRecordError,
+            )
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == "kiro_crew.acp.runtime"
+            and record.levelname == "WARNING"
+            and "launch steering record" in record.getMessage()
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "\n" not in message
+        assert "\\n" in message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "projected_error",
+        [
+            pytest.param(RuntimeError, id="undeterminable-home"),
+            pytest.param(PermissionError, id="literal-declaration-under-unsearchable-dir"),
+        ],
+    )
+    async def test_untranslated_projected_failure_keeps_spawn_running_without_launch_documents(
+        self, tmp_path, monkeypatch, caplog, projected_error
+    ) -> None:
+        """The path walk translates only OSError/ValueError into its own error.
+
+        An undeterminable home escapes as ``RuntimeError``, and a literal
+        declaration under a directory that denies search as a bare
+        ``PermissionError`` from ``Path.is_file()``. Each must degrade to an
+        empty record, not fail spawn, and each is logged once as a warning.
+        """
+        with caplog.at_level("WARNING", logger="kiro_crew.acp.runtime"):
+            runtime, calls = await self._drive(
+                monkeypatch, tmp_path, inherits=False, projected_error=projected_error
+            )
+
+        assert len(calls) == 1
+        assert runtime._native_launch_sources == {}
+        warnings = [
+            r
+            for r in caplog.records
+            if r.name == "kiro_crew.acp.runtime"
+            and r.levelname == "WARNING"
+            and "launch steering record" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        assert projected_error.__name__ in warnings[0].getMessage()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mutation", [None, "edit", "replace", "delete"])
+    async def test_create_copies_the_launch_record_whatever_the_guide_reads_now(
+        self, tmp_path, monkeypatch, mutation
+    ) -> None:
+        """kiro-cli re-reads a declared guide for every request, so an edited,
+        replaced or deleted guide is kiro-cli's to deliver as it reads now and
+        the record names it unchanged."""
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        if mutation == "edit":
+            guide.write_text("PROJECTED-LAUNCH-GUIDE-EDITED", encoding="utf-8")
+        elif mutation == "replace":
+            replacement = guide.with_suffix(".replacement")
+            replacement.write_text("PROJECTED-LAUNCH-GUIDE", encoding="utf-8")
+            replacement.replace(guide)
+        elif mutation == "delete":
+            guide.unlink()
+        monkeypatch.setattr(runtime, "_verify_spawn_agent_active", AsyncMock())
+        monkeypatch.setattr(runtime, "_activates_agent_by_mode", lambda: False)
+        monkeypatch.setattr(runtime, "_snapshot_descendants", AsyncMock())
+
+        handle = await runtime._finish_create_session(
+            "created-session", {"models": []}, **self._create_session_kwargs(runtime)
+        )
+
+        assert handle.native_context_documents == {str(guide): ""}
+        assert runtime._native_launch_sources == {str(guide): ""}
+
+    @pytest.mark.asyncio
+    async def test_load_copies_the_launch_record(self, tmp_path, monkeypatch) -> None:
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        self._patch_load_session(monkeypatch, runtime, "kirocrew")
+
+        handle = await runtime.load_session("", "resumed-session")
+
+        assert handle.native_context_documents == {str(guide): ""}
+
+    @pytest.mark.asyncio
+    async def test_provider_rechecks_declared_files_on_each_launch_record_read(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """kiro-cli re-reads its declared files for every request, so a declared
+        file added after launch can push a recorded guide out of its context:
+        past the bound the provider hands out no record and the folder sends
+        every guide; once the files fit again the record is back."""
+        from kiro_crew import member_essential_context
+        from kiro_crew.acp.session_provider import AcpSessionProvider
+
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        handle = SimpleNamespace(native_context_documents={})
+        runtime._copy_native_launch_sources(handle)
+        provider = AcpSessionProvider(handle, runtime)
+        expected = {str(guide): ""}
+
+        assert provider.native_context_documents == expected
+        room = member_essential_context._LAUNCH_RECORD_MAX_BYTES - guide.stat().st_size
+        added = guide.parent / "added.md"
+        added.write_text("a" * (room + 1), encoding="utf-8")
+        assert provider.native_context_documents == {}
+        added.write_text("a" * room, encoding="utf-8")
+        assert provider.native_context_documents == expected
+        assert handle.native_context_documents == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("session_kind", "projection_state"),
+        [
+            pytest.param("create", "changed", id="changed-create"),
+            pytest.param("resume", "changed", id="changed-resume"),
+            pytest.param("create", "resolver-error", id="resolver-error-create"),
+            pytest.param("create", "none", id="no-projection-create"),
+        ],
+    )
+    async def test_session_start_withholds_the_record_when_the_view_is_not_the_launch_view(
+        self, tmp_path, monkeypatch, session_kind, projection_state
+    ) -> None:
+        """Without ``set_mode`` the session runs on the alias the process was
+        launched with, so the record applies only while the projection still
+        names that alias for the agent: another alias means the agent's declared
+        resources changed, and the folder sends every guide."""
+        from kiro_crew.acp import skill_projection
+
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+        assert runtime._native_launch_view_alias == "kirocrew-skill-view-test"
+        if projection_state == "changed":
+            runtime._native_skill_projection = skill_projection.NativeSkillProjection(
+                {"kirocrew": "kirocrew-skill-view-changed"}
+            )
+        elif projection_state == "resolver-error":
+            runtime._native_skill_projection = skill_projection.NativeSkillProjection(
+                {}, errors={"kirocrew": "synthetic resolver failure"}
+            )
+        else:
+            runtime._native_skill_projection = None
+        monkeypatch.setattr(runtime, "_verify_spawn_agent_active", AsyncMock())
+        monkeypatch.setattr(runtime, "_activates_agent_by_mode", lambda: False)
+        monkeypatch.setattr(runtime, "_snapshot_descendants", AsyncMock())
+
+        if session_kind == "create":
+            handle = await runtime._finish_create_session(
+                "created-session", {"models": []}, **self._create_session_kwargs(runtime)
+            )
+        else:
+            self._patch_load_session(monkeypatch, runtime, "kirocrew")
+            handle = await runtime.load_session("", "resumed-session")
+
+        assert handle.native_context_documents == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sent", ["recorded", "fresh"])
+    async def test_set_mode_decides_the_view_the_record_is_checked_against(
+        self, tmp_path, monkeypatch, sent
+    ) -> None:
+        """When ``set_mode`` ran, the alias it sent is the session's view, whatever
+        the projection attribute names afterwards: a fresh alias withholds the
+        record even if the attribute has since swung back to the recorded one,
+        and the recorded alias keeps it even if the attribute has moved on."""
+        from kiro_crew.acp import skill_projection
+
+        runtime, _calls = await self._drive(monkeypatch, tmp_path, inherits=False)
+        guide = tmp_path / "workspace" / ".kiro" / "steering" / "guide.md"
+        recorded_alias = runtime._native_launch_view_alias
+        fresh_alias = "kirocrew-skill-view-fresh"
+        sent_alias = recorded_alias if sent == "recorded" else fresh_alias
+        after_alias = fresh_alias if sent == "recorded" else recorded_alias
+
+        async def activate_mode_bracketed(*_args, **_kwargs) -> str:
+            runtime._native_skill_projection = skill_projection.NativeSkillProjection(
+                {runtime._agent: after_alias}
+            )
+            return sent_alias
+
+        monkeypatch.setattr(runtime, "_verify_spawn_agent_active", AsyncMock())
+        monkeypatch.setattr(runtime, "_activates_agent_by_mode", lambda: True)
+        monkeypatch.setattr(runtime, "_mode_available", lambda *_args: True)
+        monkeypatch.setattr(runtime, "_activate_mode_bracketed", activate_mode_bracketed)
+        monkeypatch.setattr(runtime, "_snapshot_descendants", AsyncMock())
+
+        handle = await runtime._finish_create_session(
+            "created-session",
+            {"models": []},
+            **self._create_session_kwargs(runtime, agent=runtime._agent),
+        )
+
+        expected = {str(guide): ""} if sent == "recorded" else {}
+        assert handle.native_context_documents == expected
+
+    def test_member_plan_record_is_copied_whole(self, tmp_path) -> None:
+        """A member record carries no view alias, so no view check applies."""
+        runtime = AcpRuntime(work_dir=tmp_path / "workspace", expect_mcp_reports=False)
+        runtime._native_launch_sources = {"file://member-guide.md": "MEMBER-GUIDE"}
+        runtime._native_skill_projection = None
+        handle = SimpleNamespace(native_context_documents={})
+
+        runtime._copy_native_launch_sources(handle)
+
+        assert handle.native_context_documents == {"file://member-guide.md": "MEMBER-GUIDE"}
+        assert handle.native_context_documents_fit is None
 
 
 class TestRuntimeShieldSurvivesAFailedAppend:
@@ -811,13 +1374,10 @@ class TestRuntimeShieldSurvivesAFailedAppend:
             readers = []
             try:
                 if raise_in != "finish_suspended_spawn":
-                    await asyncio.wait_for(initialized.wait(), 5)
+                    await await_until(initialized)
                     readers = [runtime._reader_task, runtime._stderr_task]
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            process.stdout.reading.wait(), process.stderr.reading.wait()
-                        ),
-                        5,
+                    await await_until(
+                        asyncio.gather(process.stdout.reading.wait(), process.stderr.reading.wait())
                     )
                     assert all(reader is not None and not reader.done() for reader in readers)
                     assert root in session_pid._PROTECTED_PIDS
@@ -841,13 +1401,13 @@ class TestRuntimeShieldSurvivesAFailedAppend:
                         )
                 if raise_in == "cancel":
                     with pytest.raises(asyncio.CancelledError, match="cancel pending initialize"):
-                        await asyncio.wait_for(task, 5)
+                        await await_until(task)
                 elif raise_in == "initialize":
                     with pytest.raises(runtime_mod.AcpRuntimeError, match="initialize rejected"):
-                        await asyncio.wait_for(task, 5)
+                        await await_until(task)
                 else:
                     with pytest.raises(OSError) as caught:
-                        await asyncio.wait_for(task, 5)
+                        await await_until(task)
                     assert caught.value is boom
                     assert runtime._reader_task is None and runtime._stderr_task is None
 
@@ -878,8 +1438,10 @@ class TestRuntimeShieldSurvivesAFailedAppend:
                 for pending in owned:
                     if pending is not None and not pending.done():
                         pending.cancel()
-                await asyncio.wait_for(
-                    asyncio.gather(*(t for t in owned if t is not None), return_exceptions=True), 5
+                await await_until(
+                    asyncio.ensure_future(
+                        asyncio.gather(*(t for t in owned if t is not None), return_exceptions=True)
+                    )
                 )
 
     @pytest.mark.asyncio
@@ -974,3 +1536,176 @@ class TestRuntimeShieldSurvivesAFailedAppend:
         assert any(
             r.levelname == "ERROR" and "5150" in r.getMessage() for r in caplog.records
         ), "a runtime that could not be recorded leaks silently unless this is an ERROR"
+
+
+class TestRuntimeRootTrackingOffLoop:
+    """The runtime's pid-tracking pair runs off the loop, and a cancellation
+    delivered at that hop still ends with the child reaped -- AFTER the worker.
+
+    Each tracker takes an exclusive file lock and, on a recycled number, now
+    rewrites the file under it: blocking syscalls the heartbeat and every session
+    would wait behind on the loop. ``AcpClient._spawn`` already hops for the same
+    reason. The hop is an await, so it is a cancellation point between the
+    method's two reap guards; the guard added for it must (1) wait for a worker
+    that may already be inside the pair -- an append landing after the reap has
+    untracked the pid resurrects a line for a dead, recyclable number -- and only
+    then (2) reap, then let the cancellation through.
+    """
+
+    @staticmethod
+    def _bare_spawn(monkeypatch, tmp_path):
+        mock_proc = MagicMock()
+        mock_proc.pid = _UNALLOCATABLE_PID
+        mock_proc.returncode = None
+        mock_proc.stderr = None
+        mock_proc.stdout = None
+        TestRuntimeShieldSurvivesAFailedAppend._patch_prelude(monkeypatch, tmp_path, mock_proc)
+        monkeypatch.setattr(runtime_mod, "register_protected_pid", lambda pid: None)
+        return mock_proc
+
+    @pytest.mark.asyncio
+    async def test_runtime_tracks_both_files_off_the_loop_thread(self, tmp_path, monkeypatch):
+        class _StopSpawn(Exception):
+            pass
+
+        self._bare_spawn(monkeypatch, tmp_path)
+        threads: list[threading.Thread] = []
+        tokens: list[object] = []
+
+        monkeypatch.setattr(
+            runtime_mod, "_track_pid", lambda pid: threads.append(threading.current_thread())
+        )
+
+        def _session(pid, token=None):
+            threads.append(threading.current_thread())
+            tokens.append(token)
+
+        monkeypatch.setattr(runtime_mod, "_track_session_pid", _session)
+        monkeypatch.setattr(runtime_mod, "_pid_start_token", lambda pid: "tok-spawn")
+        monkeypatch.setattr(
+            AcpRuntime, "_send_and_await", AsyncMock(side_effect=_StopSpawn()), raising=True
+        )
+        monkeypatch.setattr(AcpRuntime, "_reader_loop", AsyncMock(), raising=True)
+        monkeypatch.setattr(AcpRuntime, "kill", AsyncMock(), raising=True)
+
+        runtime = AcpRuntime(work_dir=tmp_path / "workspace")
+        with pytest.raises(_StopSpawn):
+            await runtime.spawn()
+
+        assert len(threads) == 2, "both trackers must run"
+        for t in threads:
+            assert t is not threading.current_thread(), "root tracking ran on the loop thread"
+        # The token handed down is the one spawn read, not a re-probe.
+        assert tokens == ["tok-spawn"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_at_the_tracking_hop_waits_for_the_worker_then_reaps(
+        self, tmp_path, monkeypatch
+    ):
+        self._bare_spawn(monkeypatch, tmp_path)
+        monkeypatch.setattr(runtime_mod, "_track_pid", lambda pid: None)
+        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid, token=None: None)
+
+        loop = asyncio.get_running_loop()
+        worker_done = loop.create_future()  # the executor future, parked by the test
+        reached_hop = asyncio.Event()
+        real_run_in_executor = loop.run_in_executor
+
+        def _park_root_tracking(executor, fn, *args):
+            if getattr(fn, "__name__", "") != "_track_root_pids":
+                return real_run_in_executor(executor, fn, *args)
+            reached_hop.set()
+            return worker_done
+
+        monkeypatch.setattr(loop, "run_in_executor", _park_root_tracking)
+
+        order: list[str] = []
+        kill = AsyncMock(side_effect=lambda **kw: order.append("kill"))
+        monkeypatch.setattr(AcpRuntime, "kill", kill, raising=True)
+        monkeypatch.setattr(
+            AcpRuntime,
+            "_reader_loop",
+            AsyncMock(side_effect=AssertionError("spawn continued past a cancelled hop")),
+            raising=True,
+        )
+
+        runtime = AcpRuntime(work_dir=tmp_path / "workspace")
+        task = asyncio.ensure_future(runtime.spawn())
+        await await_until(reached_hop)
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        task.cancel()
+        # The worker is still "running": the reap must NOT have happened yet.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert order == [], "reaped before the tracking worker finished"
+        assert not worker_done.cancelled(), "the worker's future was cancelled with the task"
+
+        # The worker finishes; only now may the reap run, and the cancel propagate.
+        worker_done.set_result(None)
+        order.append("worker-done")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert order == ["worker-done", "kill"]
+        assert kill.await_args.kwargs.get("reason") == "reap after cancelled spawn tracking"
+
+    @pytest.mark.asyncio
+    async def test_a_second_cancel_during_the_cleanup_still_reaps_exactly_once(
+        self, tmp_path, monkeypatch
+    ):
+        """Two ordinary dashboard paths cancel the same eager-spawn task (a newer
+        slot signal, then a slot deletion). The first cancel lands at the hop; the
+        second lands while the guard is still waiting for the worker. It must be
+        absorbed until the cleanup settles -- a skipped reap here is a live,
+        sweep-shielded child with no owner -- and the reap runs exactly once."""
+        self._bare_spawn(monkeypatch, tmp_path)
+        monkeypatch.setattr(runtime_mod, "_track_pid", lambda pid: None)
+        monkeypatch.setattr(runtime_mod, "_track_session_pid", lambda pid, token=None: None)
+
+        loop = asyncio.get_running_loop()
+        worker_done = loop.create_future()
+        reached_hop = asyncio.Event()
+        real_run_in_executor = loop.run_in_executor
+
+        def _park_root_tracking(executor, fn, *args):
+            if getattr(fn, "__name__", "") != "_track_root_pids":
+                return real_run_in_executor(executor, fn, *args)
+            reached_hop.set()
+            return worker_done
+
+        monkeypatch.setattr(loop, "run_in_executor", _park_root_tracking)
+
+        order: list[str] = []
+        kill = AsyncMock(side_effect=lambda **kw: order.append("kill"))
+        monkeypatch.setattr(AcpRuntime, "kill", kill, raising=True)
+        monkeypatch.setattr(
+            AcpRuntime,
+            "_reader_loop",
+            AsyncMock(side_effect=AssertionError("spawn continued past a cancelled hop")),
+            raising=True,
+        )
+
+        runtime = AcpRuntime(work_dir=tmp_path / "workspace")
+        task = asyncio.ensure_future(runtime.spawn())
+        await await_until(reached_hop)
+        await asyncio.sleep(0)
+
+        task.cancel()  # first: at the hop
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert order == [] and not task.done()
+        task.cancel()  # second: while the guard waits for the worker
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert order == [], "a repeat cancel must not skip or hurry the reap"
+        assert not task.done(), "a repeat cancel must not end spawn before the reap"
+
+        worker_done.set_result(None)
+        order.append("worker-done")
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert order == ["worker-done", "kill"]
+        kill.assert_awaited_once()

@@ -55,6 +55,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import PurePosixPath
 
@@ -62,10 +64,13 @@ from kiro_crew import platform_compat
 from kiro_crew.agent_sdk import host_auth
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_PI,
+    Readback,
     Routing,
     gate_probe_command_for,
+    gate_readback_for,
     permission_config_for,
     permission_setting_for,
     routing_for,
@@ -125,10 +130,21 @@ _LABELS: dict = {
     **{backend: record.label for backend, record in sorted(ACP_BACKEND_LAUNCH.items())},
 }
 
-#: The credential store each enforced harness must still be able to read.
+#: The credential store an enforced harness that authenticates from a FILE must
+#: still be able to read.
 #:
-#: An adapter authenticates itself, so its OWN token is the one thing the mask
+#: Such an adapter authenticates itself, so its OWN token is the one thing the mask
 #: below must not take away. Everything else on the read-gate floor is denied.
+#:
+#: Not every enforced harness has one. A harness entitled by
+#: ``host_auth.ENTITLEMENT_HOST_VAULT`` is handed its key as an environment variable
+#: at spawn (the DeepSeek Harness, from ``agent.deepseek_env``), so it authenticates
+#: with no readable file and declares ``()`` -- which is strictly tighter, because a
+#: carve-out re-opens the leaf for the harness's whole process tree including the
+#: shells it runs, while an env-fed key does not exist as a file there at all.
+#: ``test_acp_tool_gate.test_every_enforced_harness_declares_its_own_credential``
+#: states the rule in both directions: an enforced harness names its own leaf OR
+#: declares that source, and one declaring that source names NO leaf.
 #:
 #: PROJECTED from each harness's declaration in
 #: :mod:`kiro_crew.agent_sdk.host_auth`, which is also where the read-gate floor
@@ -150,15 +166,27 @@ ADAPTER_OWN_CREDENTIAL_LEAVES: dict = {
     if declaration.adapter_own_leaves
 }
 
-#: Gate-artifact leaf the pi harness child must execute from.
+#: Gate-artifact leaf a gate-extension harness's child must load Crew's gate from.
 #:
-#: ``pi-gate`` holds only the launcher and sealed extension Crew writes. The pi
-#: child must execute the launcher and read the extension, while the read gate
-#: still fences the AGENT's own file tools from the leaf, so excluding it from this
-#: mask separates two readers instead of weakening the floor. Every non-pi child's
-#: mask still covers the leaf. A future secret must never be placed under
-#: ``pi-gate``; one that must live there needs its own masked leaf, as
-#: ``run/voice-runtime`` does.
+#: ``pi-gate`` holds only the launcher, sealed extensions and per-launch patches Crew
+#: writes. A ``VERIFIED_GATE_EXTENSION`` child must READ them -- pi execs the launcher
+#: and reads its extension, the DeepSeek Harness loads its plugin through the patch --
+#: while the read gate still fences the AGENT's own file tools from the leaf, so
+#: excluding it from this mask separates two readers instead of weakening the floor.
+#: Every child whose routing is not ``VERIFIED_GATE_EXTENSION`` still has the leaf
+#: masked. A future secret must never be placed under ``pi-gate``; one that must live
+#: there needs its own masked leaf, as ``run/voice-runtime`` does.
+#:
+#: Nothing the CHILD writes belongs here, and that is a property of the leaf rather
+#: than an accident: it is sealed read-only against every harness child
+#: (``sandbox._CREW_NOFOLLOW_READONLY_DIR_LEAVES``) so none can plant what a later
+#: session loads. The DeepSeek gate's load marker is written by the child, so it lives
+#: in that session's private scratch window instead -- see ``acp/client.py``.
+#:
+#: The name is pi's because pi was the first harness to need it, and it is kept rather
+#: than widened so the sandbox seal lists that already name this leaf do not have to
+#: learn a second spelling. What the leaf holds is gate artifacts for any such
+#: harness, none of which is a credential.
 #:
 #: Spelled CREW-HOME-RELATIVE, without a data-home prefix. The prefixes are applied
 #: in :func:`adapter_hidden_credential_dirs` from ``security.crew_home_prefixes()``,
@@ -168,6 +196,18 @@ ADAPTER_OWN_CREDENTIAL_LEAVES: dict = {
 #: data-home spelling would be covered by the floor and missed here, and the pi
 #: harness would stop starting on exactly the layout nobody tests.
 PI_GATE_ARTIFACT_LEAF = "pi-gate"
+
+#: The one owner allowed to answer DeepSeek Harness approval requests. Cordis
+#: reflection-wraps callbacks, so the gate plugin records the loader entry and
+#: runtime identity retained on each listener's owning context instead of a
+#: callback source that has no stable identity.
+_DEEPSEEK_APPROVAL_ANSWERER_KEYS = frozenset({"entry", "module", "plugin"})
+_DEEPSEEK_APPROVAL_MODULE = "@deepseek-ai/dsh-acp"
+_DEEPSEEK_APPROVAL_PLUGIN = "acp"
+_DEEPSEEK_APPROVAL_POLICY = "ask"
+#: The one tool presentation under which every model action is a tool call the gate
+#: can read; ``ptc``/``both`` add a ``run_code`` transport whose programs are not.
+_DEEPSEEK_TOOLS_MODE = "native"
 
 #: Files re-exposed READ-ONLY inside a directory the mask hides, home-relative.
 #:
@@ -265,8 +305,10 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     of them a leaf this very change had just classified. Deriving keeps the two in
     step, and a floor entry added later is covered with no edit here.
 
-    The harness's own credential store is excluded, because the adapter must read
-    it to authenticate. A NARROW set of Crew runtime leaves is excluded for every
+    The harness's own credential store is excluded WHEN it declares one, because
+    such an adapter must read it to authenticate; a harness entitled from Crew's
+    secret vault declares none and keeps its credential leaves masked for its whole
+    process tree. A NARROW set of Crew runtime leaves is excluded for every
     backend, because an in-sandbox Crew reader needs them and they hold no credential
     -- :func:`kiro_crew.sandbox.crew_host_runtime_leaves` owns that set, and the
     governance ceilings and consent records are deliberately NOT in it: they are
@@ -321,12 +363,23 @@ def adapter_hidden_credential_dirs(backend: str) -> tuple:
     host_runtime = {
         f"{prefix}/{leaf}" for prefix in prefixes for leaf in crew_host_runtime_leaves()
     }
-    # Per BACKEND, and deliberately not folded into the set above: only the harness
-    # whose child execs the launcher needs this leaf, so every other child keeps it
-    # masked. That is a narrower grant than the shared set can express.
+    # Per BACKEND, and deliberately not folded into the set above: only a harness
+    # whose child loads Crew's own gate artifacts needs this leaf, so every other child
+    # keeps it masked. That is a narrower grant than the shared set can express.
+    #
+    # Keyed on the ROUTING rather than on one backend id, because the leaf's users are
+    # exactly the harnesses that have no gate of their own and therefore run one Crew
+    # seals for them. pi execs a launcher from here; the DeepSeek Harness loads a
+    # sealed plugin and its per-launch patch from here (its load marker is written
+    # elsewhere -- into the probe's private scratch window -- because this leaf is
+    # sealed read-only against the child). A future harness that reaches
+    # ``VERIFIED_GATE_EXTENSION`` needs the same grant on the same grounds, and keying
+    # on the id would mask its artifacts from the one child that must read them --
+    # which surfaces as every session of that harness being refused for a gate that
+    # did load.
     gate_artifacts = (
         {f"{prefix}/{PI_GATE_ARTIFACT_LEAF}" for prefix in prefixes}
-        if backend == ACP_BACKEND_PI
+        if routing_for(backend) is Routing.VERIFIED_GATE_EXTENSION
         else set()
     )
     excluded_leaves = tuple(
@@ -458,7 +511,7 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
         raise ToolGateUnroutable(
             "{} cannot run on native Windows because Kiro Crew has no supported OS "
             "sandbox backend here to protect credential files; changing agent.sandbox "
-            "cannot enable it. Select Kiro CLI in Settings → Agent Backend and start "
+            "cannot enable it. Select Kiro CLI in Settings → Agent Harness and start "
             "a new session.".format(label_for(backend))
         )
     raise ToolGateUnroutable(
@@ -467,7 +520,7 @@ def enforce_sandbox_floor(backend: str, mode: str) -> None:
         "spawn it unsandboxed -- either agent.sandbox is 'off', or no sandbox backend "
         "is available and agent.sandbox_allow_unsandboxed_exec is set -- so the mask "
         "is never applied and the adapter's credential reads are unfenced. Set "
-        "agent.sandbox to 'standard' or 'strict' ON A HOST WITH A WORKING BACKEND to "
+        "agent.sandbox to 'auto' or 'strict' ON A HOST WITH A WORKING BACKEND to "
         "select this harness, or select a harness whose tool calls reach the gate "
         "directly.".format(label_for(backend))
     )
@@ -546,17 +599,43 @@ def routing_verdict(backend: str) -> tuple:
                 Verdict.INDETERMINATE,
                 "the harness declares gate-extension routing but names no probe command",
             )
+        readback = gate_readback_for(backend)
+        if readback is None:
+            # Same class again, one field over: a harness whose read-back STYLE is
+            # unknown has no check the driver could run, so it must not read ROUTED.
+            return (
+                Verdict.INDETERMINATE,
+                "the harness declares gate-extension routing but names no read-back",
+            )
         # ROUTED on a PROMISE, like its two siblings: the harness process the
         # extension would load into does not exist yet. The CHECK is
-        # ``gate_extension_issue`` fed the harness's own command registry, which
-        # MUST run after the harness is told the extension path and before the
-        # first prompt. Port this verdict without that caller and the harness
-        # reports routed while running every tool call unasked.
+        # ``gate_extension_issue`` or ``gate_marker_issue`` -- whichever this
+        # harness's read-back names -- fed the harness's own answer, which MUST run
+        # after the harness is told the extension path and before the first prompt.
+        # Port this verdict without that caller and the harness reports routed while
+        # running every tool call unasked.
+        where = (
+            f"the harness's own command registry back for {probe!r}"
+            if readback is Readback.COMMAND_REGISTRY
+            else f"the gate's own load marker back for {probe!r} under this session's nonce"
+        )
         return (
             Verdict.ROUTED,
-            "the client loads Kiro Crew's gate extension into the harness and reads "
-            f"the harness's own command registry back for {probe!r} before the "
-            "first prompt",
+            f"the client loads Kiro Crew's gate extension into the harness and reads "
+            f"{where} before the first prompt",
+        )
+
+    if routing is Routing.PERMISSION_REQUEST:
+        # The mechanism is the ADAPTER'S: copilot's own ACP path emits
+        # ``session/request_permission`` per privileged tool call, observed on a
+        # live drive, so ROUTED is structural rather than promised. Nothing in
+        # this core establishes or re-verifies it, which is why the member sits
+        # outside ENFORCED_ROUTINGS -- the same posture
+        # ``acp.tool_gate.routing_verdict`` reports for the descriptor's
+        # PERMISSION_REQUEST member, so the two gates cannot disagree.
+        return (
+            Verdict.ROUTED,
+            "the adapter asks per privileged tool via session/request_permission",
         )
 
     if routing is Routing.SEEDED_SETTINGS:
@@ -614,15 +693,21 @@ def remediation_for(backend: str) -> str:
         probe = gate_probe_command_for(backend)
         if probe:
             # The only thing an operator can act on: the harness either did not
-            # start with the extension flag Kiro Crew passed, or loaded the
-            # command from somewhere other than Kiro Crew's own file. Both point
+            # start with the extension Kiro Crew passed, or loaded the probe name
+            # from somewhere other than Kiro Crew's own file. Both point
             # at the harness install or at an extension of the operator's that
-            # shadows the probe name.
+            # shadows the probe name. The noun differs per read-back style because
+            # what the operator would go and look at differs.
+            noun = (
+                "registers a command"
+                if gate_readback_for(backend) is Readback.COMMAND_REGISTRY
+                else "composes a plugin"
+            )
             return (
                 f"{label_for(backend)} did not report Kiro Crew's gate extension as "
                 f"loaded from Kiro Crew's own file. Make sure the harness accepts an "
-                f"extension on its command line, and that no extension of your own "
-                f"registers a command named {probe!r}."
+                f"extension on its command line, and that nothing of your own "
+                f"{noun} named {probe!r}."
             )
     return ""
 
@@ -742,6 +827,259 @@ def gate_extension_issue(backend: str, observed_commands: object, extension_path
     return ""
 
 
+def gate_marker_issue(
+    backend: str,
+    marker: object,
+    extension_path: str,
+    nonce: str,
+    *,
+    child_scrub_names: Sequence[str] = (),
+) -> str:
+    """Why *backend*'s gate plugin is not loaded, from the marker it writes on load.
+
+    ``""`` means the marker is the one Kiro Crew's own plugin wrote in THIS
+    session, from the file Kiro Crew shipped and named in the per-launch patch.
+
+    The :data:`~kiro_crew.agent_sdk.backends.Readback.LOAD_MARKER` half of
+    :func:`gate_extension_issue`, for a harness that publishes no registry to ask.
+    *marker* is the parsed JSON object the plugin wrote; *extension_path* is the
+    sealed file the patch named, already brought to the same spelling the plugin
+    reports; *nonce* is the per-session value Kiro Crew put in the child's
+    environment. Taken as arguments rather than read here for the reason its
+    sibling gives: the driver owns the process, this owns the decision.
+
+    The identity fields and ``approval`` snapshot are required together and none
+    is redundant. ``plugin`` is the probe name, so a marker some other tool happens
+    to leave at the path is not this one. ``nonce`` is what a STALE marker cannot
+    have -- a file left by an earlier session, or planted before the spawn, carries
+    a nonce this session never issued, and without this check a gate that failed to
+    load would read as loaded. ``module`` is what a DIFFERENT gate cannot have: the
+    operator's own configuration can compose plugins too, and one that wrote this
+    marker shape from another file would otherwise pass.
+
+    DeepSeek's snapshot closes the other replaceable hops. ``answerers`` must be
+    exactly the stock ACP bridge's root-bus listener, identified by Cordis's owning
+    loader entry and plugin runtime, and the composed approval policy must be
+    ``ask``. ``tools.mode`` -- the presentation the tools service actually
+    composed -- must be ``native``, because under ``ptc`` or ``both`` the model
+    reaches Node's own APIs through one ``run_code`` call the gate cannot read
+    inside; the per-launch patch pins it, and this is what makes the pin a verified
+    property rather than a bet on overlay precedence. And ``child_env`` must be a
+    clean PROOF, taken on a child the plugin spawned through the harness's own
+    subprocess service, that every name in *child_scrub_names* -- the
+    ``agent.deepseek_env`` names whose values arrive from Crew's vault -- was
+    withheld from that child: the set the plugin checked must be exactly the set
+    Crew configured (a plugin that checked nothing, or something else, vouches for
+    nothing), every name must have been SET in the harness's own environment
+    (an unset canary observes nothing), none may have reached the child, and the
+    child must have run. A missing or malformed private Cordis shape refuses rather
+    than treating an unverified route as intact.
+    """
+    if routing_for(backend) is not Routing.VERIFIED_GATE_EXTENSION:
+        return ""
+    probe = gate_probe_command_for(backend)
+    if not probe:
+        return "the harness declares gate-extension routing but names no probe command"
+    if not nonce:
+        # A session with no nonce cannot tell this session's marker from an older
+        # one, so there is nothing to verify AGAINST. Refuses rather than accepting
+        # an unkeyed marker.
+        return "this session issued no gate nonce, so a load marker cannot be attributed to it"
+    if not isinstance(marker, dict):
+        return "the gate's load marker is missing or could not be read"
+    if marker.get("plugin") != probe:
+        return (
+            f"the gate's load marker does not name {probe!r}, so Kiro Crew's gate "
+            "plugin did not load and tools would run unasked"
+        )
+    if marker.get("nonce") != nonce:
+        return (
+            f"the gate's load marker for {probe!r} carries another session's nonce, so "
+            "nothing confirms the gate loaded into THIS session"
+        )
+    if marker.get("module") != extension_path:
+        return (
+            f"the harness reports {probe!r} from a file that is not Kiro Crew's gate "
+            "plugin, so the gate that would ask is not the one shipped here"
+        )
+    if backend == ACP_BACKEND_DEEPSEEK:
+        approval = marker.get("approval")
+        if not isinstance(approval, dict):
+            return "the gate's load marker has no well-formed approval-routing snapshot"
+        if approval.get("policy") != _DEEPSEEK_APPROVAL_POLICY:
+            return (
+                "the gate's load marker does not report the required approval policy, "
+                "so the ACP bridge is not confirmed as reachable"
+            )
+        answerers = approval.get("answerers")
+        if not isinstance(answerers, list):
+            return "the gate's load marker has a missing or malformed approval answerer set"
+        if len(answerers) != 1:
+            return (
+                "the gate's load marker does not name exactly the DeepSeek Harness ACP "
+                "bridge as the approval answerer, so another plugin can own the decision"
+            )
+        answerer = answerers[0]
+        if (
+            not isinstance(answerer, dict)
+            or set(answerer) != _DEEPSEEK_APPROVAL_ANSWERER_KEYS
+            or not isinstance(answerer.get("entry"), str)
+            or not answerer["entry"]
+            or not isinstance(answerer.get("module"), str)
+            or not isinstance(answerer.get("plugin"), str)
+        ):
+            return "the gate's load marker carries a malformed approval answerer identity"
+        if (
+            answerer["module"] != _DEEPSEEK_APPROVAL_MODULE
+            or answerer["plugin"] != _DEEPSEEK_APPROVAL_PLUGIN
+        ):
+            return (
+                "the gate's load marker does not name exactly the DeepSeek Harness ACP "
+                "bridge as the approval answerer, so another plugin can own the decision"
+            )
+        tools = marker.get("tools")
+        if not isinstance(tools, dict) or tools.get("mode") != _DEEPSEEK_TOOLS_MODE:
+            return (
+                "the gate's load marker does not report the composed tool presentation "
+                f"as {_DEEPSEEK_TOOLS_MODE!r}, so the harness would expose a run_code "
+                "transport whose programs reach Node's own APIs around the gate"
+            )
+        return _deepseek_child_env_issue(marker.get("child_env"), child_scrub_names)
+    return ""
+
+
+def _deepseek_child_env_issue(proof: object, expected_names: Sequence[str]) -> str:
+    """Why the marker's child-env proof does not clear the vault-fed names, or ``""``.
+
+    *proof* is the plugin's ``child_env`` snapshot; *expected_names* the names Crew
+    asked it to check. Each field is judged for the reason
+    :func:`gate_marker_issue` gives, and the messages name only the operator's own
+    env-var KEYS -- never a vault name and never a value -- so they are safe on the
+    log and in the chat error card.
+    """
+    if not isinstance(proof, dict):
+        return (
+            "the gate's load marker carries no child-environment proof, so nothing "
+            "shows the harness withholds the provider key from the shells it spawns"
+        )
+    names = proof.get("names")
+    parent_missing = proof.get("parent_missing")
+    child_visible = proof.get("child_visible")
+    if (
+        not isinstance(names, list)
+        or not all(isinstance(name, str) for name in names)
+        or not isinstance(parent_missing, list)
+        or not all(isinstance(name, str) for name in parent_missing)
+        or not isinstance(child_visible, list)
+        or not all(isinstance(name, str) for name in child_visible)
+    ):
+        return (
+            "the gate's load marker carries a malformed child-environment proof, so "
+            "nothing shows the harness withholds the provider key from the shells it spawns"
+        )
+    error = proof.get("error")
+    if error is not None:
+        return (
+            "the gate could not run its child-environment check "
+            f"({str(error)[:200]!r}), so nothing shows the harness withholds the provider "
+            "key from the shells it spawns"
+        )
+    expected = sorted(set(expected_names))
+    if sorted(set(names)) != expected:
+        return (
+            f"the gate's child-environment proof covers {sorted(set(names))!r} rather than "
+            f"the configured agent.deepseek_env names {expected!r}, so it does not vouch "
+            "for the key this session would inject"
+        )
+    if parent_missing:
+        return (
+            f"the gate's child-environment check never saw {sorted(parent_missing)!r} in "
+            "the harness's own environment, so it could not observe whether the harness "
+            "withholds them from its shells"
+        )
+    if child_visible:
+        return (
+            f"the harness forwarded {sorted(child_visible)!r} into a child it spawned, so "
+            "the provider key would be readable from every shell the model runs; this "
+            "harness release no longer withholds credential-shaped names from its children"
+        )
+    return ""
+
+
+#: A bare package specifier in dsh's own npm scope, the only spelling of stock dsh
+#: code: a path, a URL or a ``..`` segment names some other file.
+_DSH_STOCK_MODULE = re.compile(r"@deepseek-ai/[a-z0-9-]+(?:/[a-z0-9-]+)*")
+
+#: The loader's own entry kinds, which compose the entries listed beside them and
+#: register no tool.
+_DSH_LOADER_BUILTINS = frozenset({"cordis:include", "cordis:group"})
+
+#: Stock packages that run operator-supplied packages, which can register a tool
+#: under any name. Composing one counts as composing non-stock code.
+_DSH_FOREIGN_CODE_HOSTS = frozenset(
+    {"@deepseek-ai/dsh-cordis-host-runner", "@deepseek-ai/dsh-cordis-client-runner"}
+)
+
+#: A Cordis fiber that applied without error.
+_CORDIS_FIBER_ACTIVE = 2
+
+
+def deepseek_read_only_owner_issue(marker: object, gate_module: str) -> str:
+    """Why a DeepSeek Harness READ_ONLY turn may not approve its read tools by name, or ``""``.
+
+    *marker* is the parsed load marker that :func:`gate_marker_issue` already
+    accepted. *gate_module* is the module path of Kiro Crew's own gate entry, in the
+    same spelling as the marker's entry modules. The allowance needs three facts
+    from the marker's ``composition`` snapshot. First, every enabled loader entry
+    is stock: a package in dsh's own npm scope that does not host operator code, a
+    loader built-in, or Kiro Crew's gate. A per-agent scope is created after load and is not visible to
+    the snapshot, so stock-only composition is what leaves no code that could
+    register a scoped shadow. Second, each name in
+    ``DEEPSEEK_READ_ONLY_TOOLS`` is held by the global layer and by no
+    scoped layer present at load. Third, the stock package that registers it is
+    composed and active. A global name is unique, so that package owns it. Any
+    missing or malformed field is an issue.
+    """
+    from kiro_crew.platform.tool_names import DEEPSEEK_READ_ONLY_TOOLS
+
+    composition = marker.get("composition") if isinstance(marker, dict) else None
+    entries = composition.get("entries") if isinstance(composition, dict) else None
+    tools = composition.get("tools") if isinstance(composition, dict) else None
+    if (
+        not isinstance(entries, list)
+        or not entries
+        or not all(
+            isinstance(row, dict)
+            and isinstance(row.get("entry"), str)
+            and isinstance(row.get("module"), str)
+            for row in entries
+        )
+    ):
+        return "the gate's load marker does not list the composed plugins"
+    if not isinstance(tools, dict):
+        return "the gate's load marker does not say where the read tools are registered"
+    for row in entries:
+        module = row["module"]
+        if module == gate_module or module in _DSH_LOADER_BUILTINS:
+            continue
+        if not _DSH_STOCK_MODULE.fullmatch(module) or module in _DSH_FOREIGN_CODE_HOSTS:
+            return (
+                f"the harness composes plugin {row['entry']!r} ({module!r}), which is not "
+                "stock dsh code and could register its own read tool"
+            )
+    for name, (_policy, _target, owner) in DEEPSEEK_READ_ONLY_TOOLS.items():
+        where = tools.get(name)
+        if not isinstance(where, dict) or where.get("global") is not True:
+            return f"the harness has no global {name!r} tool registered"
+        if where.get("scoped") is not False:
+            return f"a scoped {name!r} tool shadows the harness's own"
+        if not any(
+            row["module"] == owner and row.get("state") == _CORDIS_FIBER_ACTIVE for row in entries
+        ):
+            return f"{owner!r}, which registers the harness's {name!r} tool, is not running"
+    return ""
+
+
 def enforce_runtime_routing(
     backend: str,
     reason: str,
@@ -795,9 +1133,11 @@ __all__ = [
     "Verdict",
     "adapter_expose_files",
     "adapter_hidden_credential_dirs",
+    "deepseek_read_only_owner_issue",
     "enforce_runtime_routing",
     "enforce_sandbox_floor",
     "gate_extension_issue",
+    "gate_marker_issue",
     "is_enforced",
     "label_for",
     "remediation_for",

@@ -114,9 +114,15 @@ _PIL_SAVE_FORMAT: dict[str, str] = {
 #: pass-through branch, what the header DETECTED), so the emitted mimeType is
 #: correct even when the source mime had no dedicated save format -- or lied.
 #: GIF appears only for the pass-through direction: a re-encode never writes GIF.
+#: MPO is what Pillow reports for a JPEG carrying MPF data (phone photos: iPhone
+#: portrait mode, several Samsung modes). Its first frame is a complete baseline
+#: JPEG, so the bytes pass through as ``image/jpeg`` and an over-cap copy
+#: re-encodes as JPEG via ``_PIL_SAVE_FORMAT`` rather than as the much larger
+#: PNG every format outside this table converts to.
 _FORMAT_MIME: dict[str, str] = {
     "PNG": "image/png",
     "JPEG": "image/jpeg",
+    "MPO": "image/jpeg",
     "WEBP": "image/webp",
     "BMP": "image/bmp",
     "GIF": "image/gif",
@@ -181,7 +187,7 @@ def _downscale_within_limits(raw_bytes: bytes, mime: str, max_edge: int) -> tupl
     verified at all.
     """
     pil = _pil()
-    if pil is None or max_edge <= 0:
+    if pil is None:
         return raw_bytes, mime
     image_mod, imageops_mod = pil
     try:
@@ -189,7 +195,8 @@ def _downscale_within_limits(raw_bytes: bytes, mime: str, max_edge: int) -> tupl
             # Header read only for the dimension check -- no decompression --
             # so a within-cap image never pays for a decode.
             detected = img.format or ""
-            if max(img.width, img.height) <= max_edge and detected in _FORMAT_MIME:
+            within_edge = max_edge <= 0 or max(img.width, img.height) <= max_edge
+            if within_edge and detected in _FORMAT_MIME:
                 # Two conditions guard the byte-identical fast path. Dimension:
                 # over-cap images must shrink. Format: bytes in a format
                 # OUTSIDE the known-good table (e.g. TIFF from an MCP server)
@@ -215,16 +222,25 @@ def _downscale_within_limits(raw_bytes: bytes, mime: str, max_edge: int) -> tupl
             # interpolates real channels rather than palette indices.
             src = oriented.convert("RGBA") if oriented.mode in ("P", "PA") else oriented
             long_edge = max(src.width, src.height)
-            if long_edge > max_edge:
+            # A non-positive cap means "no limit" -- the same reading the fast
+            # path gives it above. The fast path is gated on table membership,
+            # so a format OUTSIDE the table reaches this branch at any edge; a
+            # bare ``long_edge > max_edge`` would then hold for every edge <= 0
+            # and the scale of 0 would floor the image to 1x1.
+            if max_edge > 0 and long_edge > max_edge:
                 scale = max_edge / long_edge
                 new_size = (max(1, round(src.width * scale)), max(1, round(src.height * scale)))
                 resample = getattr(image_mod, "LANCZOS", getattr(image_mod, "ANTIALIAS", 1))
                 resized = src.resize(new_size, resample)
             else:
-                # Within the cap but in a format outside the known-good table:
-                # a format conversion, not a resize.
+                # Within the cap (or no cap) but in a format outside the
+                # known-good table: a format conversion, not a resize.
                 resized = src
-            fmt = _PIL_SAVE_FORMAT.get(mime, "PNG")
+            # Re-encode according to the decoded format, never the caller's
+            # filename-derived claim. A JPEG named .png must stay JPEG rather
+            # than being silently converted because of its suffix.
+            detected_mime = _FORMAT_MIME.get(detected, "")
+            fmt = _PIL_SAVE_FORMAT.get(detected_mime, "PNG")
             if fmt in ("JPEG", "BMP") and resized.mode not in ("RGB", "L"):
                 # JPEG/BMP carry no alpha channel; flatten before encoding.
                 resized = resized.convert("RGB")

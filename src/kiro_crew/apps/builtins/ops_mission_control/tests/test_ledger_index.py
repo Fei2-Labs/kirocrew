@@ -23,12 +23,16 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from kiro_crew.apps.builtins.ops_mission_control.backend import ledger, ledger_index
 from kiro_crew.apps.builtins.ops_mission_control.backend.models import LedgerEntry
+from kiro_crew.vector_memory import EpisodicWriteOutcome, VectorMemoryStore
 
 
 class _FakeStore:
@@ -41,14 +45,14 @@ class _FakeStore:
         self._fail_write = fail_write
         self._fail_backfill = fail_backfill
 
-    def write_episodic(self, text: str, **kw: Any) -> bool:
+    def write_episodic_outcome(self, text: str, **kw: Any) -> Any:
         if self._fail_write:
             raise RuntimeError("store is broken")
         self.writes.append({"text": text, **kw})
         if text in self.texts:
-            return False  # already present, as the real store reports
+            return EpisodicWriteOutcome.REFUSED  # already present, as the real store reports
         self.texts.add(text)
-        return True
+        return EpisodicWriteOutcome.WRITTEN
 
     def backfill_missing_embeddings(self, *, pace: bool = True) -> int:
         if self._fail_backfill:
@@ -160,6 +164,114 @@ class TestIncrementalImport(_Env):
 
         store = _FakeStore()
         self.assertEqual(ledger_index.import_pending(store)["written"], 3)
+
+
+class _CappedStore(_FakeStore):
+    """A fake that refuses new rows once full, as a V1 store at its episodic cap."""
+
+    def __init__(self, cap: int) -> None:
+        super().__init__()
+        self.cap = cap
+
+    def _admit(self, text: str, kw: dict[str, Any]) -> Any:
+        self.writes.append({"text": text, **kw})
+        if text in self.texts:
+            return EpisodicWriteOutcome.REFUSED
+        if len(self.texts) >= self.cap:
+            return EpisodicWriteOutcome.AT_CAPACITY
+        self.texts.add(text)
+        return EpisodicWriteOutcome.WRITTEN
+
+    def write_episodic_outcome(self, text: str, **kw: Any) -> Any:
+        return self._admit(text, kw)
+
+
+class TestCapacityRefusal(_Env):
+    def test_capacity_refused_entries_are_retried_once_space_frees(self) -> None:
+        """A full store's refusal is not a duplicate: those entries must stay off the
+        cursor, or they are never indexed after the cap is raised."""
+        self._seed(5)
+        store = _CappedStore(cap=3)
+
+        first = ledger_index.import_pending(store)
+        self.assertEqual(first["written"], 3)
+        self.assertEqual(first["skipped"], 0, "a capacity refusal is not a duplicate")
+        self.assertEqual(len(store.writes), 4, "stops at the first capacity refusal")
+
+        store.cap = 10
+        second = ledger_index.import_pending(store)
+        self.assertEqual(second["written"], 2, "the refused entries are retried")
+        self.assertEqual(len(store.texts), 5)
+
+    def test_duplicates_are_still_cursored_when_the_store_is_not_full(self) -> None:
+        self._seed(2)
+        store = _CappedStore(cap=10)
+        ledger_index.import_pending(store)
+        ledger_index.reset_cursor()
+        again = ledger_index.import_pending(store)
+        self.assertEqual(again["skipped"], 2)
+        third = ledger_index.import_pending(store)
+        self.assertEqual(len(store.writes), 4, "cursored duplicates are not rewritten")
+        self.assertEqual(third["written"], 0)
+
+    def test_real_v1_store_at_its_cap_leaves_entries_pending(self) -> None:
+        """End to end on a real V1 store: the cap refusal path in write_episodic."""
+
+        self._seed(3)
+        store = VectorMemoryStore(db_path=self.tmp / "memory.db", episodic_max=2)
+        store.init()
+        try:
+            with mock.patch.object(store, "backfill_missing_embeddings", return_value=0):
+                first = ledger_index.import_pending(store)
+                self.assertEqual(first["written"], 2)
+                store._episodic_max = 10
+                second = ledger_index.import_pending(store)
+            self.assertEqual(second["written"], 1, "the capacity-refused entry was retried")
+            self.assertEqual(first["skipped"], 0, "a capacity refusal is not a duplicate")
+        finally:
+            store.close()
+
+    def test_capacity_verdict_survives_a_cap_raise_racing_the_refusal(self) -> None:
+        """A refusal must be classified by the store's own verdict, not a later
+        probe. Here the cap is raised (as ``reconfigure`` does
+        from the watcher thread) the instant a write is refused; a post-hoc "is it
+        full?" probe then reads the NEW cap, misreads the capacity refusal as a
+        duplicate and cursors the entry for good."""
+
+        self._seed(3)
+        store = VectorMemoryStore(db_path=self.tmp / "memory.db", episodic_max=2)
+        store.init()
+
+        def raise_cap_after_refusal(original: Any) -> Any:
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                result = original(*args, **kwargs)
+                if result is False or getattr(result, "value", None) not in (None, "written"):
+                    store._episodic_max = 10  # the concurrent reconfigure lands here
+                return result
+
+            return wrapper
+
+        for name in ("write_episodic_outcome", "write_episodic"):
+            if hasattr(store, name):
+                setattr(store, name, raise_cap_after_refusal(getattr(store, name)))
+        try:
+            with mock.patch.object(store, "backfill_missing_embeddings", return_value=0):
+                first = ledger_index.import_pending(store)
+                second = ledger_index.import_pending(store)
+            self.assertEqual(first["written"], 2)
+            self.assertEqual(first["skipped"], 0, "a capacity refusal is not a duplicate")
+            self.assertEqual(second["written"], 1, "the capacity-refused entry was retried")
+        finally:
+            store.close()
+
+    def test_capacity_pause_is_logged(self) -> None:
+        """A paused import is visible: its counts alone match a caught-up run."""
+        self._seed(4)
+        store = _CappedStore(cap=1)
+        with self.assertLogs(ledger_index.logger, level="WARNING") as logs:
+            result = ledger_index.import_pending(store)
+        self.assertEqual(result["written"], 1)
+        self.assertIn("3 ledger entries left pending", "\n".join(logs.output))
 
 
 class TestStoreContract(_Env):
@@ -326,6 +438,130 @@ class TestSemanticRecallWiring(_Env):
         self.assertEqual(len(claimed.similar), 2, "capped at the requested limit")
         self.assertEqual(claimed.matches, [], "semantic recall must not touch matches")
 
+    def _real_store_with_semantic_pair(self):
+        """One literal hit and one stronger cross-wording vector hit."""
+
+        literal = LedgerEntry.create(
+            pattern="database outage affected the primary service",
+            fix="restart the database service",
+        )
+        semantic = LedgerEntry.create(
+            pattern="sqlite writer lock exhausted the connection pool",
+            fix="serialize write transactions and release them promptly",
+        )
+        ledger._write_all([literal, semantic])
+
+        store = VectorMemoryStore(db_path=self.tmp / "memory.db", embedding_dim=2)
+        store.init()
+        # A failed write raises before the store is returned, so dispatch never runs its
+        # own close(); on Windows the still-open memory.db then makes tearDown's rmtree
+        # leak self.tmp.
+        try:
+            self.assertTrue(
+                store.write_episodic(
+                    ledger_index.entry_text(literal),
+                    embedding=[0.0, 1.0],
+                    tags=[ledger_index.SOURCE_TAG],
+                    source="ops-ledger",
+                )
+            )
+            self.assertTrue(
+                store.write_episodic(
+                    ledger_index.entry_text(semantic),
+                    embedding=[1.0, 0.0],
+                    tags=[ledger_index.SOURCE_TAG],
+                    source="ops-ledger",
+                )
+            )
+        finally:
+            store.close()
+        return store, literal, semantic
+
+    def _dispatch_with_bounded_query_vector(
+        self, clock: Callable[[], float] = time.monotonic
+    ) -> None:
+        """Run production dispatch once and check the query vector's deadline.
+
+        The checks run AFTER dispatch, never inside the fake embedder:
+        ``_attach_similar_safely`` treats any embedder exception as "no vector" and
+        falls back to keyword recall, so a failed check raised inside the fake would
+        surface only as the literal match ranking first.
+        """
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+        from kiro_crew.embeddings import PRIORITY_INTERACTIVE, embedding_work
+
+        store, _literal, semantic = self._real_store_with_semantic_pair()
+        timeout = dispatch._SIMILAR_QUERY_TIMEOUT_SECS
+        self.assertEqual(timeout, 5.0)
+        calls: list[tuple[str, int, float | None, float]] = []
+
+        def _query_vector(text: str, priority: int) -> list[float]:
+            work = embedding_work.get()
+            calls.append(
+                (text, priority, None if work is None else work.deadline, clock())
+            )
+            return [1.0, 0.0]
+
+        before = clock()
+        with mock.patch.object(store, "_try_embed", side_effect=_query_vector):
+            with mock.patch("kiro_crew.vector_memory.VectorMemoryStore", return_value=store):
+                claimed = self._claimed(title="database outage", resource="")
+                dispatch._attach_similar_safely(claimed)
+
+        self.assertEqual(len(calls), 1, "the query is embedded exactly once")
+        text, priority, deadline, called_at = calls[0]
+        self.assertEqual(text, "database outage")
+        self.assertEqual(priority, PRIORITY_INTERACTIVE)
+        self.assertIsNotNone(deadline, "dispatch must carry an explicit embedding deadline")
+        assert deadline is not None
+        self.assertGreater(deadline, called_at, "the deadline is still ahead at the call")
+        # Compare the deadline with the same `clock + timeout` sum dispatch computes,
+        # not `deadline - now` with `timeout`: that subtraction can come out a few ulps
+        # above 5.0 when the clock has not ticked (Windows) near a power of two.
+        self.assertGreaterEqual(deadline, before + timeout)
+        self.assertLessEqual(deadline, called_at + timeout)
+
+        self.assertTrue(claimed.similar)
+        self.assertEqual(claimed.similar[0].entry_id, semantic.entry_id)
+
+    def test_production_dispatch_uses_a_bounded_query_vector(self) -> None:
+        """Different wording wins semantically without an unbounded queue wait."""
+        self._dispatch_with_bounded_query_vector()
+
+    def test_bounded_query_vector_check_holds_on_a_still_clock(self) -> None:
+        """A clock that does not tick, at a float edge, still passes the deadline checks.
+
+        Python 3.12 on Windows reads ``time.monotonic`` from a ~15.6 ms tick, so
+        dispatch and the check often read the same value. At 1019.003 s,
+        ``(t + 5.0) - t`` is 5.000000000000114, so a ``deadline - now <= 5.0``
+        check fails there even though dispatch set the deadline exactly 5 s out.
+        """
+        import pytest
+
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+        from kiro_crew.testing.clock import ManualClock
+
+        clock = ManualClock(monotonic_start=1019.003)
+        still = clock.monotonic()
+        self.assertEqual(clock.monotonic(), still, "probe: the clock does not tick")
+        self.assertGreater((still + 5.0) - still, 5.0, "probe: this value is an edge")
+        with pytest.MonkeyPatch.context() as mp:
+            clock.install(mp, dispatch)
+            self._dispatch_with_bounded_query_vector(clock.monotonic)
+
+    def test_cold_embedder_keeps_keyword_fallback(self) -> None:
+        """No query vector is an ordinary bounded fallback, not a failed claim."""
+        from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
+
+        store, literal, _semantic = self._real_store_with_semantic_pair()
+        with mock.patch.object(store, "_try_embed", return_value=None) as embed:
+            with mock.patch("kiro_crew.vector_memory.VectorMemoryStore", return_value=store):
+                claimed = self._claimed(title="database outage", resource="")
+                dispatch._attach_similar_safely(claimed)
+
+        embed.assert_called_once()
+        self.assertEqual([entry.entry_id for entry in claimed.similar], [literal.entry_id])
+
     def test_a_fingerprint_match_is_never_repeated_as_similar(self) -> None:
         """The brief must not list one entry twice under two confidence framings."""
         from kiro_crew.apps.builtins.ops_mission_control.backend import dispatch
@@ -436,7 +672,7 @@ class TestLedgerMutationsAreLocked(_Env):
         """Drive the exact interleaving deterministically: a new entry is appended DURING
         hygiene's read, in the window `_write_all` would otherwise clobber.
 
-        A real thread race would be flaky; patching `read_entries_for_update` (the
+        A real thread race would be flaky; patching `_read_counted_for_update` (the
         mutation-path read hygiene starts from) to append-then-return reproduces it every
         run. The lock does not prevent the interleaving here (same process, re-entrant
         open) — the assertion is that the appended entry SURVIVES, which it cannot if
@@ -448,17 +684,17 @@ class TestLedgerMutationsAreLocked(_Env):
         ledger.upsert(LedgerEntry.create(pattern="original", fix="f"))
         latecomer = LedgerEntry.create(pattern="arrived during hygiene", fix="f2")
 
-        real_read = ledger.read_entries_for_update
+        real_read = ledger._read_counted_for_update
         fired = {"done": False}
 
         def read_then_append():
-            rows = real_read()
+            read = real_read()
             if not fired["done"]:
                 fired["done"] = True
                 ledger._append(latecomer)  # the concurrent POST
-            return rows
+            return read
 
-        with mock.patch.object(ledger, "read_entries_for_update", read_then_append):
+        with mock.patch.object(ledger, "_read_counted_for_update", read_then_append):
             ledger.hygiene()
 
         patterns = {e.pattern for e in ledger.read_entries()}

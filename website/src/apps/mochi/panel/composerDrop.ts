@@ -28,12 +28,13 @@
  */
 
 import { mdImageDest } from '../../../utils/fileTokens'
+import { pathBasename } from '../../../utils/pathBasename'
 
 /**
  * A base64 screen-capture crop, as a File the upload route accepts.
  *
- * Lives HERE, next to `ingestFiles`, rather than in the panel: ChatPanel imports
- * lucide's `File` ICON, which shadows the DOM `File` constructor for that whole
+ * Lives HERE, next to `ingestFiles`, rather than in the panel: a panel file that
+ * imports lucide's `File` ICON shadows the DOM `File` constructor for that whole
  * module, so `new File(...)` there constructs a React component and throws
  * "File is not a constructor" at runtime. Keeping the construction in this module
  * — which imports no icons — makes the correct `File` the only one in scope, and
@@ -185,8 +186,23 @@ export function attachmentsFrom(result: IngestResult): PendingAttachment[] {
   ]
 }
 
+/**
+ * Chip label for an uploaded path.
+ *
+ * The upload route returns `str(dest)`, which is a NATIVE path: on Windows that
+ * is `C:\...\uploads\pic.png`, carrying no forward slash to split on, so the
+ * whole absolute path became the label — and `PendingAttachments` renders this
+ * string as the chip's text, its tooltip, an image `alt`, and two aria-labels,
+ * so a screen reader read the path out in full.
+ *
+ * `pathBasename` is the one separator-aware basename rule the UI already uses
+ * (`FileChangeChips`, `ChatPanel`, `FilePreviewStrip`): it treats `\` as a
+ * separator only for a Windows-SHAPED path (drive letter or UNC), so a POSIX
+ * name containing a literal backslash (`weird\name.txt`) stays one name rather
+ * than splitting into a nonexistent directory.
+ */
 function basename(path: string): string {
-  return path.split('/').pop() || path
+  return pathBasename(path) || path
 }
 
 // ── Pending-attachment strip ──────────────────────────────────────

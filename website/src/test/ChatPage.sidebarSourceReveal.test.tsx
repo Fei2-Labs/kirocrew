@@ -29,6 +29,8 @@ import { __resetPanelTabs } from '../hooks/usePanelTabs'
 const SLOT = 'slot-1'
 /** Mentioned by the AGENT: the extractor emits it, so the panel knows it. */
 const AGENT_PR = 'https://github.com/acme/widgets/pull/10'
+/** The agent's pull request as a chip may spell it: GitHub ignores the case. */
+const AGENT_PR_OTHER_CASE = 'https://github.com/Acme/Widgets/pull/10'
 /** Pasted by the USER: a chip, but NOT a panel tab. */
 const USER_PR = 'https://github.com/acme/widgets/pull/99'
 const USER_ISSUE = 'https://github.com/acme/widgets/issues/55'
@@ -73,6 +75,7 @@ vi.mock('../pages/ChatSidebar', () => ({
     <>
       <button type="button" onClick={() => onOpenSource?.(SLOT, { url: USER_PR, kind: 'change' })}>reveal-pr</button>
       <button type="button" onClick={() => onOpenSource?.(SLOT, { url: USER_ISSUE, kind: 'issue' })}>reveal-issue</button>
+      <button type="button" onClick={() => onOpenSource?.(SLOT, { url: AGENT_PR_OTHER_CASE, kind: 'change' })}>reveal-pr-other-case</button>
     </>
   ),
   SIDEBAR_MIN: 200,
@@ -97,7 +100,6 @@ vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => ({ contentWidth: 'compact' }),
   CONTENT_WIDTH: { compact: { messages: '900px', input: '916px' }, comfortable: { messages: '84%', input: '85%' }, full: { messages: '92%', input: '93%' } },
 }))
-vi.mock('../hooks/usePanelState', () => ({ usePanelState: () => ({ isOpen: false, openPanel: vi.fn(), closePanel: vi.fn() }), useDiffPanel: () => ({ isOpen: false, filePath: '', original: '', modified: '', openDiff: vi.fn(), closeDiff: vi.fn() }) }))
 vi.mock('../hooks/useBranding', () => ({ useBranding: () => ({ botName: 'Test', avatar: '' }) }))
 vi.mock('../hooks/useAgents', () => ({ useAgents: () => ({ agents: [], defaultAgent: null }) }))
 vi.mock('../hooks/useFilteredDropdown', () => ({ useFilteredDropdown: () => ({ filtered: [], query: '', setQuery: vi.fn(), selectedIndex: 0, setSelectedIndex: vi.fn(), onKeyDown: vi.fn() }) }))
@@ -109,7 +111,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -236,6 +239,16 @@ describe('ChatPage – sidebar chip reveals a source in the panel', () => {
 
     expect(latest().sources).not.toContain(USER_PR)
     expect(latest().selectedSourceUrl).toBe(AGENT_PR)
+  })
+
+  it('a chip spelling a listed pull request in another case adds no second tab', async () => {
+    renderChatPage()
+    fireEvent.click(screen.getByText('reveal-pr-other-case'))
+    fireEvent.click(screen.getByText('reveal-pr-other-case'))
+
+    await waitFor(() => expect(screen.getByTestId('side-panel')).toBeInTheDocument())
+    expect(latest().sources).toEqual([AGENT_PR])
+    expect(latest().activeTabId).toBe('changes')
   })
 
   it('the reveal survives a reload instead of silently swapping the panel', async () => {

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useAppSelector } from '../store'
 import { SHORTCUTS_ENABLED_KEY } from './useKeyboardShortcuts'
 import {
   chordMatchesEvent,
@@ -25,16 +26,18 @@ import {
  *  - **`custom`**: a user-recorded chord toggles the palette; double-Shift is
  *    off.
  *
- * **⌘K / Ctrl+K is a built-in alias in every mode EXCEPT `custom` with a
- * recorded chord.** It toggles the palette, `preventDefault()` keeps a
- * browser/extension binding (e.g. some "focus search") from stealing it, and it
- * is intentionally chosen over reserved combos (⌘P print, ⌘W close tab, ⌘1–9
- * tab switch) which Chrome will NOT let a page cancel. Keeping it live until the
- * user sets their OWN chord guarantees the palette is always reachable from the
- * keyboard — so selecting `custom` before recording never strands the user.
- * Because ⌘K is live in the default (`mod-k`) mode too, a user who relied on the
- * previously shipped double-Shift default still has a working keyboard route to
- * the palette after the default moved, even before they visit Settings.
+ * **⌘K / Ctrl+K toggles the palette ONLY in `mod-k` mode**, where it is the
+ * chosen gesture: `preventDefault()` keeps a browser/extension binding (e.g.
+ * some "focus search") from stealing it, and it is cancelable in a real Chrome
+ * tab unlike reserved combos (⌘P print, ⌘W close tab, ⌘1–9 tab switch). In
+ * `double-shift` and `custom` the user picked a different trigger to reclaim
+ * Ctrl+K — it is the terminal "clear to end of line" and many text inputs' own
+ * binding — so the hook lets it fall through to the focused input rather than
+ * opening the palette. Choosing `custom` only enters the recorder; it does not
+ * persist `custom` until a valid chord is captured, so the PREVIOUS preset
+ * stays live meanwhile (and a persisted-but-invalid custom chord falls back to
+ * `mod-k` in {@link loadQuickSearchConfig}), and the palette's nav button
+ * (openPalette) is always a trigger-independent route.
  *
  * All bindings honour the global "Enable shortcuts" toggle
  * ({@link SHORTCUTS_ENABLED_KEY}, shared with useKeyboardShortcuts /
@@ -60,8 +63,8 @@ import {
  * deliberately tight (250ms): a wider window makes the palette pop open on
  * incidental Shift taps (e.g. reaching for a capital, then hesitating) that
  * were never meant as the gesture. 250ms is comfortably reachable as an
- * intentional double-tap while cutting most accidental opens; ⌘K / Ctrl+K and
- * the nav button remain as unambiguous alternatives.
+ * intentional double-tap while cutting most accidental opens; the nav button
+ * remains as an unambiguous alternative.
  */
 export const DOUBLE_SHIFT_WINDOW_MS = 250
 
@@ -96,10 +99,56 @@ export function useCommandPalette(): UseCommandPalette {
   // Timestamp of the last *bare* Shift keydown, for double-tap detection.
   // 0 means "no pending first tap".
   const lastShiftRef = useRef(0)
+  // Which pane this document is showing. Top-level dashboards own `activeId`;
+  // embedded panes receive the parent-owned identity through `host.activeId`.
+  // Stable fallbacks keep partial test stores supported.
+  const activeInstanceId = useAppSelector(s => s.instances?.activeId ?? null)
+  const hostActiveInstanceId = useAppSelector(s => s.instances?.host?.activeId)
+  const hostModelPresent = hostActiveInstanceId !== undefined
+  const visibleActiveInstanceId = hostModelPresent ? hostActiveInstanceId : activeInstanceId
+  // The pane identity this hook last saw, including which model supplied it. A
+  // newly relayed host model establishes the embedded baseline rather than
+  // representing a pane switch. Seeded at mount to suppress the initial effect.
+  const lastInstanceRef = useRef({ hostModelPresent, activeId: visibleActiveInstanceId })
 
   const openPalette = useCallback(() => setOpen(true), [])
   const close = useCallback(() => setOpen(false), [])
   const toggle = useCallback(() => setOpen(v => !v), [])
+
+  // Switching the visible pane dismisses the palette.
+  //
+  // ⌘/Ctrl+digit (useInstanceShortcuts) is a GLOBAL chord bound on `document`, so it
+  // fires while the palette is open and does exactly what it promises — the pane
+  // behind changes — but the modal stayed up, over the instance the user had just
+  // asked to look at, still offering that instance's predecessor's sessions.
+  //
+  // Keyed on the visible pane identity rather than on the keystroke. The chord is
+  // Electron-only and is bound in two documents: the top-level listener dispatches
+  // `setActiveId`, while the embedded listener relays `mc-switch-instance` to the
+  // parent. The parent updates its `activeId` and broadcasts an `mc-host-model`;
+  // `EmbeddedHostBridge` writes that model to `host` in the pane's store. Tracking
+  // the active id from the model owned by this document covers both routes.
+  //
+  // Note the tab strip is NOT such a door while the palette is up: the overlay is
+  // modal and intercepts the pointer, so the topbar cannot be clicked (measured in
+  // scripts/capture-command-bar-recent-switch.mjs). The keyboard is the only way to
+  // switch panes from behind the palette, which is why the bug was reachable at all.
+  //
+  // This belongs to the hook that OWNS the open state rather than to the app shell:
+  // the palette and any app overlay that replaces it share this state, so both are
+  // dismissed by one rule instead of each growing its own.
+  useEffect(() => {
+    const current = { hostModelPresent, activeId: visibleActiveInstanceId }
+    const last = lastInstanceRef.current
+    lastInstanceRef.current = current
+
+    // A host model arriving or disappearing changes which store field is
+    // authoritative, not which pane is visible. Use its first value as the new
+    // baseline so relay initialization cannot dismiss an open palette.
+    if (last.hostModelPresent !== current.hostModelPresent) return
+    if (last.activeId === current.activeId) return
+    setOpen(false)
+  }, [hostModelPresent, visibleActiveInstanceId])
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -128,13 +177,14 @@ export function useCommandPalette(): UseCommandPalette {
       const config = loadQuickSearchConfig()
       const customBound = hasCustomChord(config)
 
-      // ⌘K / Ctrl+K — toggle. Active as the primary gesture in `mod-k`, and as
-      // the built-in alias in `double-shift` and in `custom` BEFORE a chord is
-      // recorded. Suppressed only once the user has bound their own chord, so
-      // it can't shadow a custom binding on the same key. Require no other
-      // modifiers so it doesn't swallow richer combos. Cancelable in a real
-      // Chrome tab.
-      if (!customBound && isModKEvent(e)) {
+      // ⌘K / Ctrl+K — toggle. Active ONLY in `mod-k` mode, where it is the
+      // chosen gesture. In `double-shift` and `custom` the user has selected a
+      // different trigger precisely to free this chord (Ctrl+K is the terminal
+      // "clear to end of line" and many inputs' own binding), so it must pass
+      // through to the focused input instead of opening the palette. Require no
+      // other modifiers so it doesn't swallow richer combos. Cancelable in a
+      // real Chrome tab.
+      if (config.mode === 'mod-k' && isModKEvent(e)) {
         e.preventDefault()
         lastShiftRef.current = 0
         setOpen(v => !v)

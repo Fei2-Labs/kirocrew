@@ -351,10 +351,18 @@ class TestStatusState:
 # ── Chokepoint (b): the dashboard PATCH allowlist ─────────────────────────
 
 
+@web.middleware
+async def _owner_identity(request, handler):
+    request["user"] = "local-app"
+    request["app"] = ""
+    return await handler(request)
+
+
 def _patch_app() -> web.Application:
     from kiro_crew.dashboard.handlers import api_kirocrew_config_patch
 
-    app = web.Application()
+    app = web.Application(middlewares=[_owner_identity])
+    app["state"] = SimpleNamespace(owner_id="")
     app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
     return app
 
@@ -500,9 +508,12 @@ class TestBothStartupSitesStash:
 
     @staticmethod
     def _func(name: str) -> ast.AsyncFunctionDef:
+        import inspect
+
         from kiro_crew.dashboard import server as server_mod
 
-        tree = ast.parse(Path(server_mod.__file__).read_text(encoding="utf-8"))
+        source_file = inspect.getsourcefile(getattr(server_mod, name)) or ""
+        tree = ast.parse(Path(source_file).read_text(encoding="utf-8"))
         for node in tree.body:
             if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
                 return node

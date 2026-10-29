@@ -58,7 +58,7 @@ import logging
 import time
 import weakref
 from itertools import islice
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from kiro_crew.dashboard.channel_folders import (
     CHANNEL_CONFIG_SECTIONS,
@@ -66,15 +66,17 @@ from kiro_crew.dashboard.channel_folders import (
     folder_id_for_name,
     lookup_channel_folder,
 )
-from kiro_crew.dashboard.chat_title import _persist_title
+from kiro_crew.dashboard.chat_title import apply_manual_title
 from kiro_crew.dashboard.chat_utils import _sync_dashboard_slots, effective_session_key
+from kiro_crew.dashboard.slot_persistence.message_entries import remember_unknown_row_fields
 from kiro_crew.dashboard.state import (
     _normalize_slot_key,
     durable_row_count,
     note_crew_log_class,
     row_mid,
 )
-from kiro_crew.history import carry_provenance, is_incognito_transcript
+from kiro_crew.history import HUMAN_TURN_META_KEY, carry_provenance, is_incognito_transcript
+from kiro_crew.history_projection import METADATA_LINE_CORRUPT
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import channel_namespace_of, is_channel_session_key
 from kiro_crew.messaging.upload_gate import live_dashboard_slot
@@ -186,6 +188,9 @@ def project_channel_turn_live(
                     user_text,
                     "msg msg-u",
                     broadcast_user=broadcast_user,
+                    # A PERSON sent this into the channel. See
+                    # history.HUMAN_TURN_META_KEY for why the marker is explicit.
+                    meta={HUMAN_TURN_META_KEY: True},
                 )
             )
             or ""
@@ -216,6 +221,40 @@ def project_channel_turn_live(
     return user_mid, assistant_mid
 
 
+def project_channel_row_live(
+    dashboard_state: Any, session_key: str, role: str, text: str, cls: str
+) -> str | None:
+    """Append one extra row to the open dashboard slot and return its row id.
+
+    The channel-side twin of the dashboard runner's own turn-outcome cards: a
+    channel turn that closed with no assistant text mirrors the driver's notice
+    (``notice`` / ``msg msg-info``) into the live window, and one that raised
+    mirrors its error (``error`` / ``msg msg-err``), so the reader there sees
+    the same sentence the channel posted. Called AFTER
+    :func:`project_channel_turn_live` so the row lands behind the user's (and,
+    when there is one, the assistant's) in the window's order. Returns ``None``
+    when no live slot owns the session, or when the append failed, so the caller
+    persists the row under a freshly minted id instead.
+    """
+    slot = live_dashboard_slot(dashboard_state, session_key)
+    if slot is None:
+        return None
+    try:
+        mid = row_mid(slot.append(role, text, cls)) or ""
+    except Exception:
+        logger.debug(
+            "channel turn projection: %s append failed for %s", role, session_key, exc_info=True
+        )
+        return None
+    push = getattr(dashboard_state, "push_slots_update", None)
+    if callable(push):
+        try:
+            push()
+        except Exception:
+            logger.debug("channel turn projection: slot push failed", exc_info=True)
+    return mid or None
+
+
 async def rename_channel_title_live(
     dashboard_state: Any,
     session_key: str,
@@ -226,34 +265,22 @@ async def rename_channel_title_live(
     Returns ``False`` when no live slot owns the session, so the channel can fall
     back to its conversation-log-only path. A live slot is authoritative once it
     exists: changing only transcript metadata lets its later save rewrite the old
-    in-memory title over the new one. Match the dashboard's own manual-rename
-    ordering instead — update the slot synchronously, bump its title epoch so a
-    background titler stands down, persist through the epoch-aware helper, then
-    broadcast the exact value every dashboard client must render.
+    in-memory title over the new one. So the live slot is renamed through
+    :func:`~kiro_crew.dashboard.chat_title.apply_manual_title`, the code the
+    sidebar rename and ``session_rename`` share: the slot is updated
+    synchronously, its title epoch bumped so a background titler stands down,
+    the title persisted through the epoch-aware helper, then broadcast.
 
-    ``_persist_title`` is best-effort by dashboard contract. A failed immediate
-    metadata write leaves the updated live slot authoritative and a later slot
-    save can recover it; the dashboard's own rename endpoint makes the same trade.
+    The save is best-effort by dashboard contract. A failed immediate metadata
+    write leaves the updated live slot authoritative, and a later slot save can
+    recover it; the dashboard's own rename endpoint makes the same trade.
     """
     slot = live_dashboard_slot(dashboard_state, session_key)
     if slot is None:
         return False
 
-    slot.title = title
-    slot._titled = True
-    slot._title_origin = "user"
-    slot._title_epoch = int(getattr(slot, "_title_epoch", 0)) + 1
-    persisted = await _persist_title(dashboard_state, slot)
-    if not persisted:
+    if not await apply_manual_title(dashboard_state, slot, title):
         logger.warning("channel title update is live but not yet durable for %s", session_key)
-
-    push_title = getattr(dashboard_state, "push_slot_title", None)
-    if callable(push_title):
-        push_title(slot.key, title)
-    else:
-        push_slots = getattr(dashboard_state, "push_slots_update", None)
-        if callable(push_slots):
-            push_slots()
     return True
 
 
@@ -434,9 +461,15 @@ def _rebind_unbound_channel_slot(
     transcript's own metadata line, so an agent able to write that file can hand
     a lookalike the marker and the restore would arrive already claiming it. The
     rebind therefore also requires the runtime record that THIS process surfaced
-    the slot from a channel session it observed. Nothing is lost for a genuine
-    survivor of a restart: ``get_or_create_slot`` resolves a channel-named slot
-    against the session map as it rehydrates it.
+    the slot from a channel session it observed.
+
+    That scopes the heal to the observing process. A restored survivor is bound
+    by ``get_or_create_slot``'s own resolve as it rehydrates, but only when the
+    session map can answer for the stem right then; a slot rehydrated while it
+    still cannot carries no runtime record, so it stays one-way for the rest of
+    the process even once the stem resolves, and the next start retries that
+    resolve. The window is the deliberate price of provenance that a writable
+    marker cannot supply.
     """
     if not slot.channel_origin or slot.linked_session_key:
         return False
@@ -465,6 +498,7 @@ def surface_channel_session(
     session_key: str = "",
     folder_id: str = "",
     folder_tags: list[str] | None = None,
+    effort_marker: bool = False,
 ) -> "_ChatSlot | None":
     """Create the dashboard slot for one channel session.
 
@@ -554,8 +588,19 @@ def surface_channel_session(
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
     slot._disk_meta_observed = bool(meta)
     slot._memory_assignment_from_history = True
-    if meta.get("model"):
-        slot.model = meta["model"]
+    # Model and reasoning_effort go through the shared restore helper so this
+    # path validates them exactly like the persistence loaders and History
+    # resume (non-string model dropped, deprecated name mapped, effort checked
+    # against the known values). No restore config is loaded here -- that would
+    # be I/O on the event loop -- so cfg=None skips provider canonicalization.
+    # *effort_marker* is the caller's off-loop ``_has_validated_effort_marker``
+    # read, so a backend-advertised level (e.g. ``minimal``) survives a restart
+    # that runs this pass before any session has re-advertised it. Local import:
+    # chat_persistence imports from this module, so a module-level import
+    # would be circular.
+    from kiro_crew.dashboard.chat_persistence import _restore_model_fields
+
+    _restore_model_fields(slot, meta, cfg=None, effort_marker=effort_marker)
     # `jev_route` is deliberately NOT read back here, for the reason the two
     # persistence loaders state: it records an owner pick that spends money, and
     # this file is editable by the agent's own tools.
@@ -570,6 +615,20 @@ def surface_channel_session(
         slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
         if slot.autocompact_pct is not None and state.sessions:
             state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
+    # The session's own turn time limit, for the same reason: without it a
+    # surfaced slot follows the global limit and its next save drops the key.
+    from kiro_crew.dashboard.chat_persistence import _validate_turn_timeout_secs
+
+    slot.turn_timeout_secs = _validate_turn_timeout_secs(meta.get("turn_timeout_secs"))
+    # Restore the dismissed source-link tombstones, mirroring the persistence
+    # loaders: this surfacing path applies metadata by hand rather than going
+    # through _rehydrate_slot_from_history, so without it an unlinked chip
+    # reappears when the channel session is re-surfaced and the next save erases
+    # the persisted tombstone. Local import for the same circular-import reason
+    # as _validate_autocompact_pct above.
+    from kiro_crew.dashboard.chat_persistence import _restore_dismissed_source_links
+
+    _restore_dismissed_source_links(slot, meta.get("dismissed_source_links"))
     if meta.get("workspace"):
         slot.workspace = meta["workspace"]
     if meta.get("memory_store"):
@@ -630,6 +689,18 @@ def surface_channel_session(
     # the frozen prefix a save never rewrites, and redact assistant content at
     # the read boundary.
     _rebuild_window(slot, messages)
+    # Channel transcripts bypass both dashboard restore drivers, so the local-turn
+    # marker a dashboard turn on this slot left behind is reconciled here, once
+    # the whole window exists. Local import: chat_persistence imports this module.
+    from kiro_crew.dashboard.chat_persistence import (
+        _local_turn_generation,
+        _local_turn_prompt,
+        _reconcile_local_turn_marker,
+    )
+
+    _reconcile_local_turn_marker(
+        slot, _local_turn_generation(meta), _local_turn_prompt(meta), persisted=messages
+    )
     # The window corresponds to the file as of this listing, so the refresh pass
     # has nothing to do until the channel writes again.
     slot._channel_window_mtime = float(session_info.get("modified", 0) or 0)
@@ -658,7 +729,7 @@ def _rebuild_window(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> None:
     # Durable-only view of the same prefix (transient-role lines excluded),
     # recomputed from the transcript on every rebuild — the base absolute
     # message positions are built over. ``islice`` avoids copying the whole
-    # prefix. See _ChatSlot.__init__.
+    # prefix. See ``init_transcript_fields`` in dashboard/state_parts/slot_transcript.py.
     slot._disk_older_durable_count = durable_row_count(islice(messages, older_cut))
     for msg in messages[-_RESTORE_WINDOW:]:
         role = msg.get("role", "assistant")
@@ -681,6 +752,8 @@ def _rebuild_window(slot: "_ChatSlot", messages: list[dict[str, Any]]) -> None:
         # created — the save path re-serializes this window and would otherwise
         # restamp every line "dashboard".
         carry_provenance(slot.messages[-1], msg)
+        # The same save would drop the fields a newer build wrote on the line.
+        remember_unknown_row_fields(slot, msg)
     slot.drain()
     slot._resumed_count = len(slot.messages)
     slot._disk_window_len = len(slot.messages)
@@ -784,6 +857,7 @@ def refresh_channel_window(slot: "_ChatSlot", messages: list[dict[str, Any]], mt
         )
         # See the equivalent call in _rebuild_window.
         carry_provenance(slot.messages[-1], msg)
+        remember_unknown_row_fields(slot, msg)
     slot.drain()
     slot._resumed_count = len(slot.messages)
     slot._disk_window_len = len(slot.messages)
@@ -882,6 +956,18 @@ def slot_closed_since(state: "DashboardState", slot_name: str, instant: float) -
     return when is not None and when >= instant
 
 
+def slot_close_instant(state: "DashboardState", slot_name: str) -> float | None:
+    """The instant *slot_name*'s tab was last closed in this process, or ``None``.
+
+    It is the value the close save persists as ``closed_at``, so a caller can tell
+    a close whose save has landed (the line's ``closed_at`` equals it) from one
+    still on its way by equality, which holds on a coarse clock and across a
+    clock step, where comparing clock readings does not.
+    """
+    closes = _RECENT_CLOSES.get(state) or {}
+    return closes.get(slot_name)
+
+
 def _tombstone_blocks(state: "DashboardState", session: dict[str, Any]) -> bool:
     """True when an in-memory close tombstone suppresses surfacing *session*.
 
@@ -901,12 +987,32 @@ def _tombstone_blocks(state: "DashboardState", session: dict[str, Any]) -> bool:
     return modified <= when
 
 
+class _IncompleteChannelReconcile(RuntimeError):
+    """The channel-session snapshot could not be read in full."""
+
+
 def _reconcile_lock(state: "DashboardState") -> LoopBoundLock:
     lock = _RECONCILE_LOCKS.get(state)
     if lock is None:
         lock = LoopBoundLock()
         _RECONCILE_LOCKS[state] = lock
     return lock
+
+
+def _replace_channel_slot_holds(
+    state: "DashboardState", session_keys: "Iterable[str]", *, hold_channels: bool
+) -> bool:
+    """Replace one pass's held dashboard keys without accumulating stale failures."""
+    return state.replace_channel_slot_holds(
+        (channel_slot_name(key) for key in session_keys),
+        hold_channels=hold_channels,
+    )
+
+
+def _hold_every_channel_key(state: "DashboardState") -> None:
+    """Hold every channel key, for a pass that cannot name the sessions it missed."""
+    if _replace_channel_slot_holds(state, (), hold_channels=True):
+        state.push_slots_update()
 
 
 async def reconcile_channel_slots(state: "DashboardState", window_minutes: int) -> int:
@@ -917,31 +1023,119 @@ async def reconcile_channel_slots(state: "DashboardState", window_minutes: int) 
     touched from a worker thread). Passes are serialized per state so the
     periodic loop and a dispatcher-triggered immediate pass cannot interleave
     their snapshot/surface/clear sequences.
+
+    Direct callers retain the historical no-op result when the session listing
+    is unreadable. The lifetime reconciler uses :func:`_reconcile_with_status`
+    so it can distinguish that incomplete snapshot from a complete pass with no
+    work.
     """
-    async with _reconcile_lock(state):
-        return await _reconcile_channel_slots_locked(state, window_minutes)
+    surfaced, _complete = await _reconcile_with_status(state, window_minutes)
+    return surfaced
 
 
-async def _reconcile_channel_slots_locked(state: "DashboardState", window_minutes: int) -> int:
+#: Per-state memo of each channel tab's last-seen ``linked_turn_running``. Keyed
+#: weakly for the same reason as ``_RECONCILE_LOCKS``.
+_LINKED_RUNNING_SEEN: "weakref.WeakKeyDictionary[Any, dict[str, bool]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _linked_running_flipped(state: "DashboardState") -> bool:
+    """Whether any channel tab's channel-path turn started or ended since last pass.
+
+    A turn the channel path runs holds the linked session's lease and no task
+    on the tab, so its end raises no slots push of its own: the reconciler's
+    push fires only when transcript rows changed, and the lease is often
+    released after the reply row was already pulled in -- or with no row at all
+    (an in-channel stop, a failure posted only to the channel). Without this the
+    sidebar kept showing the finished turn as running until some unrelated push.
+    Bounds that lag to one reconcile interval.
+    """
+    seen = _LINKED_RUNNING_SEEN.get(state)
+    if seen is None:
+        seen = {}
+        _LINKED_RUNNING_SEEN[state] = seen
+    now: dict[str, bool] = {}
+    for name, slot in list(getattr(state, "_slots", {}).items()):
+        if not is_channel_session_key(getattr(slot, "linked_session_key", "") or ""):
+            continue
+        try:
+            now[name] = bool(slot.linked_turn_running)
+        except Exception:
+            continue
+    flipped = any(seen.get(name, False) != running for name, running in now.items())
+    # A tab that closed while its turn ran needs no push of its own.
+    seen.clear()
+    seen.update(now)
+    return flipped
+
+
+async def _reconcile_with_status(state: "DashboardState", window_minutes: int) -> tuple[int, bool]:
+    """One serialized pass, returning ``(surfaced, complete)``.
+
+    ``complete`` is False when any part of the snapshot could not be read or
+    applied, so the lifetime reconciler keeps the slot list marked partial.
+
+    An unexpected exception is held open the same way, then re-raised for the
+    caller to log: a pass that died mid-snapshot knows no more about which
+    sessions it missed than a pass whose listing was unreadable, and leaving the
+    previous pass's hold state in place would let the partial-label deadline
+    authorize a drain of every channel key this pass never surfaced. The guard
+    wraps the lock too, because acquisition runs before any hold is written.
+    """
+    try:
+        async with _reconcile_lock(state):
+            try:
+                result = await _reconcile_channel_slots_locked(state, window_minutes)
+            except _IncompleteChannelReconcile:
+                _hold_every_channel_key(state)
+                result = (0, False)
+            # Checked after an incomplete pass too: a flip comes from the tabs'
+            # turn leases, not from the session listing.
+            if _linked_running_flipped(state):
+                state.push_slots_update()
+            return result
+    except Exception:
+        _hold_every_channel_key(state)
+        raise
+
+
+async def _reconcile_channel_slots_locked(
+    state: "DashboardState", window_minutes: int
+) -> tuple[int, bool]:
     log = state.conversation_log
     if log is None:
-        return 0
+        changed = _replace_channel_slot_holds(state, (), hold_channels=False)
+        if changed:
+            state.push_slots_update()
+        return 0, True
     loop = asyncio.get_running_loop()
     cutoff = time.time() - (window_minutes * 60) if window_minutes > 0 else None
 
     try:
-        sessions = await loop.run_in_executor(None, log.list_sessions)
-    except Exception:
+        sessions, listing_complete = await loop.run_in_executor(None, log.list_sessions_status)
+    except Exception as exc:
         logger.debug("channel reconcile: list_sessions failed", exc_info=True)
-        return 0
+        raise _IncompleteChannelReconcile from exc
+    # A listing that skipped some files still names the rest: surface those, and hold
+    # every channel key for the sessions this pass could not see.
+    listing_partial = not listing_complete
+    if listing_partial:
+        # Before any surfacing push, so no frame of this pass drops the hold.
+        _hold_every_channel_key(state)
 
     candidates = [s for s in sessions if is_channel_session_key(s.get("key", ""))]
     if not candidates:
-        return 0
+        changed = _replace_channel_slot_holds(state, (), hold_channels=listing_partial)
+        if changed:
+            state.push_slots_update()
+        return 0, not listing_partial
 
-    def _load_meta() -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+    def _load_meta() -> tuple[dict[str, dict[str, Any]], dict[str, float], set[str], bool]:
         out: dict[str, dict[str, Any]] = {}
         mt: dict[str, float] = {}
+        deferred: set[str] = set()
+        complete = True
         # One key per session: the tab and the channel share one transcript, so
         # `closed` is written once and read once. File mtimes ride along as the
         # fallback close instant for legacy `closed` flags that predate the
@@ -952,9 +1146,14 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             if not key or key in out:
                 continue
             try:
-                out[key] = log.get_metadata(key)
+                out[key], readable = log.get_metadata_status(key)
+                if not readable and log.metadata_line_state(key) != METADATA_LINE_CORRUPT:
+                    deferred.add(key)
+                    complete = False
             except Exception:
                 out[key] = {}
+                deferred.add(key)
+                complete = False
             if mtime_of is not None:
                 try:
                     stamp = mtime_of(key)
@@ -962,16 +1161,21 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
                     stamp = None
                 if stamp is not None:
                     mt[key] = stamp
-        return out, mt
+        return out, mt, deferred, complete
 
     # Instant the metadata snapshot below is taken. The stale-flag clear later
     # in this pass is scoped to closes OLDER than this — a `closed` written
     # after the snapshot (the user dismissing a tab mid-pass, or any writer
     # this pass cannot see) must survive the clear.
     snapshot_time = time.time()
-    metadata, mtimes = await loop.run_in_executor(None, _load_meta)
+    metadata, mtimes, deferred, complete = await loop.run_in_executor(None, _load_meta)
+    complete = complete and not listing_partial
+    held_sessions = set(deferred)
     eligible = eligible_channel_sessions(
-        candidates, metadata=metadata, cutoff=cutoff, mtimes=mtimes
+        [session for session in candidates if session.get("key", "") not in deferred],
+        metadata=metadata,
+        cutoff=cutoff,
+        mtimes=mtimes,
     )
     # Skip transcript reads for sessions that already own a slot — the steady state.
     pending = [s for s in eligible if channel_slot_name(s.get("key", "")) not in state._slots]
@@ -1003,7 +1207,10 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             if resolved:
                 rebindable.append((resolved, slot))
     if not pending and not refreshable and not rebindable:
-        return 0
+        changed = _replace_channel_slot_holds(state, held_sessions, hold_channels=listing_partial)
+        if changed:
+            state.push_slots_update()
+        return 0, complete
 
     def _load_messages() -> dict[str, list[dict[str, Any]]]:
         out: dict[str, list[dict[str, Any]]] = {}
@@ -1021,6 +1228,24 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
         return out
 
     transcripts = await loop.run_in_executor(None, _load_messages)
+
+    def _load_effort_markers() -> dict[str, bool]:
+        # The validated-effort marker read is file I/O, so it runs here off the
+        # loop, like the resume path's prefetch. Only pending sessions surface.
+        from kiro_crew.dashboard.chat_persistence import _has_validated_effort_marker
+
+        out: dict[str, bool] = {}
+        for s in pending:
+            key = s.get("key", "")
+            raw = (metadata.get(key) or {}).get("reasoning_effort")
+            if raw:
+                try:
+                    out[key] = _has_validated_effort_marker(raw)
+                except Exception:
+                    out[key] = False
+        return out
+
+    effort_markers = await loop.run_in_executor(None, _load_effort_markers) if pending else {}
 
     # Clear stale closed flags BEFORE the slots become visible. Running the
     # clear after surfacing leaves a race: the slot broadcast lands, the user
@@ -1108,6 +1333,7 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             logger.debug("channel reconcile: %s closed by tombstone, skipping", key)
             continue
         if key not in transcripts:
+            held_sessions.add(key)
             # The read failed in the executor. ``_load_messages`` omits the key
             # rather than storing ``[]`` exactly so this is distinguishable from
             # a genuinely empty transcript — surfacing an empty window here would
@@ -1115,6 +1341,7 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             # reply would write its turns ahead of the history still on disk.
             # Leave it for the next pass.
             logger.debug("channel reconcile: %s transcript unread, deferring", key)
+            complete = False
             continue
         if to_file:
             # Re-check right before writing: this pass snapshotted metadata, then
@@ -1227,11 +1454,17 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
                 session_key=state.sessions.channel_key_for_stem(key) if state.sessions else "",
                 folder_id=to_file,
                 folder_tags=inherited if to_file else None,
+                effort_marker=effort_markers.get(key, False),
             )
             if slot:
                 surfaced += 1
+            elif channel_slot_name(key) not in state._slots:
+                held_sessions.add(key)
+                complete = False
         except Exception:
             logger.warning("channel reconcile: failed to surface %s", key, exc_info=True)
+            held_sessions.add(key)
+            complete = False
 
     refreshed = 0
     for s in refreshable:
@@ -1260,7 +1493,8 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
             rebound += 1
             logger.info("channel reconcile: rebound previously unbound slot %s", slot.key)
 
-    if surfaced or refreshed or rebound:
+    holds_changed = _replace_channel_slot_holds(state, held_sessions, hold_channels=listing_partial)
+    if surfaced or refreshed or rebound or holds_changed:
         if surfaced:
             # Publish the new tab to the dashboard-surface registry BEFORE the
             # broadcast. Every gate that asks "does this session have a tab?"
@@ -1271,7 +1505,7 @@ async def _reconcile_channel_slots_locked(state: "DashboardState", window_minute
 
             _sync_dashboard_slots(state)
         state.push_slots_update()
-    return surfaced
+    return surfaced, complete
 
 
 def _live_slot_placement(state: "DashboardState", key: str) -> tuple[Any, str]:
@@ -1666,17 +1900,21 @@ async def surface_dispatcher_session(dispatcher: object) -> None:
     )
 
 
-async def channel_slot_reconciler(state: "DashboardState", window_minutes: int) -> None:
-    """Background task: reconcile now, then every ``RECONCILE_INTERVAL_SECS``.
+async def _reconcile_pass(state: "DashboardState", window_minutes: int) -> bool:
+    """Run one lifetime-reconciler pass and report whether its snapshot was complete."""
+    try:
+        _surfaced, complete = await _reconcile_with_status(state, window_minutes)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("channel slot reconciler pass failed", exc_info=True)
+        return False
+    return complete
 
-    Runs for the gateway's lifetime. Every iteration is guarded so a transient
-    filesystem error can never kill the loop.
-    """
+
+async def channel_slot_reconciler(state: "DashboardState", window_minutes: int) -> None:
+    """Reconcile now and every interval, clearing the partial label once complete."""
     while True:
-        try:
-            await reconcile_channel_slots(state, window_minutes)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning("channel slot reconciler pass failed", exc_info=True)
+        if await _reconcile_pass(state, window_minutes):
+            state.finish_slot_list_rebuild()
         await asyncio.sleep(RECONCILE_INTERVAL_SECS)

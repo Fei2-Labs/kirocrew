@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import re
+import types
 import typing
 
 from hypothesis import given
@@ -53,8 +54,8 @@ ALL_CONFIG_CLASSES: list[type] = [
 def _all_fields_recursive(
     cls: type,
     prefix: str = "",
-) -> list[tuple[str, dataclasses.Field]]:  # type: ignore[type-arg]
-    """Yield (dot_path, field) for every field in the dataclass hierarchy.
+) -> list[tuple[str, dataclasses.Field, object]]:  # type: ignore[type-arg]
+    """Yield (dot_path, field, resolved_type) through the dataclass hierarchy.
 
     Private fields (leading underscore) are internal bookkeeping, not
     user-facing config — e.g. ``KiroCrewConfig._extra_sections``, which
@@ -63,24 +64,15 @@ def _all_fields_recursive(
     they carry no label/help metadata and never appear in SCHEMA_REGISTRY; skip
     them here for the same reason the builder does.
     """
-    result: list[tuple[str, dataclasses.Field]] = []  # type: ignore[type-arg]
+    result: list[tuple[str, dataclasses.Field, object]] = []  # type: ignore[type-arg]
+    hints = typing.get_type_hints(cls)
     for f in dataclasses.fields(cls):
         if f.name.startswith("_"):
             continue
         path = f"{prefix}.{f.name}" if prefix else f.name
-        result.append((path, f))
-        tp = f.type
-        if isinstance(tp, str):
-            # Evaluate in the DEFINING module's namespace (standard
-            # get_type_hints semantics): the section dataclasses live in
-            # sections.py, and the loader facade's re-export list is frozen, so
-            # a post-split type is resolvable only where it is defined.
-            import kiro_crew.config.sections as _mod
-
-            try:
-                tp = eval(tp, vars(_mod))  # noqa: S307
-            except Exception:
-                continue
+        # Resolve in the class's defining module, including qualified aliases.
+        tp = hints[f.name]
+        result.append((path, f, tp))
         origin = typing.get_origin(tp)
         if origin is dict:
             # For dict[str, DataclassType], add wildcard path and recurse
@@ -105,20 +97,6 @@ def _all_fields_recursive(
         if dataclasses.is_dataclass(tp) and isinstance(tp, type):
             result.extend(_all_fields_recursive(tp, path))
     return result
-
-
-def _resolve_type(f: dataclasses.Field) -> type:  # type: ignore[type-arg]
-    """Resolve a field's type annotation to a runtime type."""
-    # Same defining-module namespace as _all_fields_recursive above.
-    import kiro_crew.config.sections as _mod
-
-    tp = f.type
-    if isinstance(tp, str):
-        try:
-            tp = eval(tp, vars(_mod))  # noqa: S307
-        except Exception:
-            return str
-    return tp  # type: ignore[return-value]
 
 
 # Expected Python type → JSON Schema type mapping
@@ -154,7 +132,7 @@ class TestConfigSchemaProperties:
         all_fields = _all_fields_recursive(KiroCrewConfig)
         assert len(all_fields) > 0, "Expected at least one field"
 
-        for path, f in all_fields:
+        for path, f, tp in all_fields:
             meta = dict(f.metadata) if f.metadata else {}
             assert "label" in meta, f"Field '{path}' missing 'label' in metadata"
             assert isinstance(
@@ -252,10 +230,9 @@ class TestConfigSchemaProperties:
         # Build set of all reachable paths from the dataclass hierarchy
         all_fields = _all_fields_recursive(KiroCrewConfig)
         reachable_paths: set[str] = set()
-        for path, f in all_fields:
+        for path, f, tp in all_fields:
             reachable_paths.add(path)
             # Also add wildcard child paths for list/dict fields
-            tp = _resolve_type(f)
             origin = typing.get_origin(tp)
             if origin is list or origin is dict:
                 reachable_paths.add(f"{path}.*")
@@ -317,8 +294,7 @@ class TestConfigSchemaProperties:
         registry_by_path: dict[str, ConfigEntry] = {e.path: e for e in SCHEMA_REGISTRY}
 
         all_fields = _all_fields_recursive(KiroCrewConfig)
-        for path, f in all_fields:
-            tp = _resolve_type(f)
+        for path, f, tp in all_fields:
             optional_args = typing.get_args(tp)
             if len(optional_args) == 2 and type(None) in optional_args:
                 tp = next(arg for arg in optional_args if arg is not type(None))
@@ -328,6 +304,11 @@ class TestConfigSchemaProperties:
             if dataclasses.is_dataclass(tp) and isinstance(tp, type):
                 expected_type = "object"
                 expected_has_children = True
+            elif origin in (typing.Union, types.UnionType):
+                # A scalar union (``int | str`` for an int knob that also
+                # takes "auto") flattens to its leading member's type.
+                expected_type = _EXPECTED_TYPE_MAP[typing.get_args(tp)[0]]
+                expected_has_children = False
             elif origin is not None:
                 base = origin
                 expected_type = _EXPECTED_TYPE_MAP.get(base, "string")
@@ -511,6 +492,16 @@ class TestDeclaredDictProperties:
         assert entry.type == "boolean"
         assert entry.default_value is True
 
+    def test_reuse_current_is_first_class_entry(self) -> None:
+        # The Settings "Reuse the current terminal" toggle references it by
+        # configKey; it must flatten into SCHEMA_REGISTRY and default OFF so the
+        # fresh-shell behavior is unchanged for anyone who never set it.
+        index = {e.path: e for e in SCHEMA_REGISTRY}
+        entry = index.get("dashboard.terminal.reuse_current")
+        assert entry is not None, "nested declared sub-key did not flatten"
+        assert entry.type == "boolean"
+        assert entry.default_value is False
+
     def test_completion_dict_stays_open_for_undeclared_keys(self) -> None:
         # `completion.commands` (the subcommand-probe allowlist) is documented
         # and undeclared; declaring `enabled` must not invalidate it.
@@ -636,6 +627,8 @@ class TestFieldTypeResolution:
     # Fields whose declared type is NOT a plain ``str`` — they must resolve to
     # their real JSON type, never silently degrade to "string".
     _NON_STRING_FIELDS: list[tuple[str, str]] = [
+        ("session_environments", "object"),
+        ("session_environments.profiles", "array"),
         ("slack.tracking_channels", "array"),
         ("slack.reactions", "object"),
         ("slack.trusted_bot_ids", "array"),

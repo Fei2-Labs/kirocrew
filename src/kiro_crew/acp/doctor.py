@@ -69,7 +69,6 @@ def report(
     backend: str,
     work_dir: Path | str,
     *,
-    allow_ungated: bool,
     emit: Callable[[str], None],
     issues: list[str],
 ) -> None:
@@ -93,7 +92,7 @@ def report(
 
     _report_adapter(descriptor, emit, issues)
     _report_signin(descriptor, emit, issues)
-    _report_routing(backend, work_dir, allow_ungated=allow_ungated, emit=emit, issues=issues)
+    _report_routing(backend, work_dir, emit=emit, issues=issues)
     _report_capabilities(backend, emit)
 
 
@@ -185,7 +184,6 @@ def _report_routing(
     backend: str,
     work_dir: Path | str,
     *,
-    allow_ungated: bool,
     emit: Callable[[str], None],
     issues: list[str],
 ) -> None:
@@ -218,14 +216,6 @@ def _report_routing(
         if remedy:
             emit(f"               Fix: {remedy}")
         issues.append(f"{backend}: tool calls bypass the PreToolUse gate")
-
-    if allow_ungated:
-        # An issue even when the verdict is ROUTED: the opt-out disarms the
-        # refusal for every FUTURE session too, so the operator should know it is
-        # on regardless of today's configuration.
-        emit("  opt-out:     ⚠️  agent.acp_backend_allow_ungated_tools is ENABLED")
-        emit("               Sessions start even when tool calls bypass the gate.")
-        issues.append("agent.acp_backend_allow_ungated_tools is enabled")
 
 
 def _report_capabilities(backend: str, emit: Callable[[str], None]) -> None:

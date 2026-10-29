@@ -1,6 +1,13 @@
 import { describe, it, expect } from 'vitest'
-import { File, FileCode, FileJson, FileText, Image, Paintbrush, Settings, Terminal } from 'lucide-react'
+import { BookOpen, File, FileCode, FileJson, FileKey, FileSpreadsheet, FileText, Image, Package, Paintbrush, Presentation, Settings, Terminal } from 'lucide-react'
 import { FILE_COLORS, fileIcon, colorForExt } from '../utils/fileIcons'
+
+/**
+ * Object.prototype keys that survive `fileExtension`'s lowercasing and so reach the
+ * lookup tables verbatim. (`toString`, `valueOf`, `hasOwnProperty` … lowercase to
+ * non-keys and are neutralised before the lookup; these two are not.)
+ */
+const PROTOTYPE_KEY_EXTENSIONS = ['__proto__', 'constructor']
 
 describe('fileIcon', () => {
   it('returns FileCode for code extensions', () => {
@@ -22,12 +29,20 @@ describe('fileIcon', () => {
     expect(fileIcon('config.toml')).toBe(Settings)
   })
 
-  it('returns FileText for docs', () => {
+  it('returns the existing fine-grained doc icons', () => {
     expect(fileIcon('README.md')).toBe(FileText)
     expect(fileIcon('CHANGELOG.mdx')).toBe(FileText)
     expect(fileIcon('notes.txt')).toBe(FileText)
     expect(fileIcon('rows.csv')).toBe(FileText)
     expect(fileIcon('out.log')).toBe(FileText)
+  })
+
+  it('covers the extended attachment families from the same table', () => {
+    expect(fileIcon('headcount.xlsx')).toBe(FileSpreadsheet)
+    expect(fileIcon('kickoff.pptx')).toBe(Presentation)
+    expect(fileIcon('certificate.pem')).toBe(FileKey)
+    expect(fileIcon('installer.dmg')).toBe(Package)
+    expect(fileIcon('handbook.epub')).toBe(BookOpen)
   })
 
   it('returns Paintbrush for stylesheets', () => {
@@ -70,6 +85,17 @@ describe('fileIcon', () => {
   it('handles full paths', () => {
     expect(fileIcon('/abs/path/to/file.ts')).toBe(FileCode)
     expect(fileIcon('relative/path/to/file.css')).toBe(Paintbrush)
+  })
+
+  it('falls back to generic File for prototype-chain extensions instead of an inherited value', () => {
+    // A bare `iconOverrides[extension] ?? ...` would return Object.prototype's own
+    // `constructor` (a function) or `__proto__` (an object), neither of which is a
+    // renderable component. The lookup must only honour the table's OWN keys.
+    for (const extension of PROTOTYPE_KEY_EXTENSIONS) {
+      expect(fileIcon(`evil.${extension}`)).toBe(File)
+      expect(fileIcon(`/abs/path/evil.${extension}`)).toBe(File)
+      expect(fileIcon(`.${extension}`)).toBe(File)
+    }
   })
 })
 
@@ -116,5 +142,16 @@ describe('colorForExt', () => {
   it('is case-insensitive', () => {
     expect(colorForExt('Foo.TS')).toBe('text-blue-400')
     expect(colorForExt('Foo.PY')).toBe('text-green-500')
+  })
+
+  it('returns the muted fallback for prototype-chain extensions instead of an inherited value', () => {
+    // A bare `FILE_COLORS[extension] || ...` would return Object.prototype's own
+    // `constructor` (a truthy function), which then lands in `className`. Only the
+    // table's OWN keys may produce a color.
+    for (const extension of PROTOTYPE_KEY_EXTENSIONS) {
+      expect(colorForExt(`evil.${extension}`)).toBe('text-muted')
+      expect(colorForExt(`/abs/path/evil.${extension}`)).toBe('text-muted')
+      expect(colorForExt(`.${extension}`)).toBe('text-muted')
+    }
   })
 })

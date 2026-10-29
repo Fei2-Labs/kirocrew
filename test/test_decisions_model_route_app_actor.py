@@ -111,7 +111,7 @@ def test_the_accepting_handler_builds_both_keys_into_its_kwargs():
     remove the very precedent this rule cites. Read as SOURCE because the value is
     assembled across two statements (the dict literal, then a conditional insert),
     which is the shape that put it outside the keyword sweep."""
-    path = Path(dashboard_pkg.__file__).parent / "chat_handlers.py"
+    path = Path(dashboard_pkg.__file__).parent / "chat_api" / "chat_send.py"
     src = path.read_text(encoding="utf-8")
 
     assert '_turn_kwargs: dict = {"_directive_user_origin": not bool(request_app)}' in src
@@ -206,19 +206,16 @@ def _app_derived_queue_calls() -> list[tuple[str, int, str]]:
 
 
 def test_the_queue_sweep_finds_the_sites_it_is_meant_to_guard():
-    """The second shape's witness. THREE app-derived queue appends: the busy-slot
-    queue, the sub-agent hold, and the plan-approval queue in another module. A fourth
-    is a new site and must be added deliberately -- and a sweep finding none would
-    pass the rule below in silence, which is exactly how a `_run_chat`-only sweep
-    reported full coverage while all three were unstamped.
-
-    The third one is why the count is asserted rather than the module set trusted: it
-    lives outside the handler module and was found by this sweep, not by reading the
-    two the review named."""
+    """The second shape's witness. TWO app-derived queue appends: the busy-slot
+    queue and the sub-agent hold. A third is a new site and must be added
+    deliberately -- and a sweep finding none would pass the rule below in silence,
+    which is exactly how a `_run_chat`-only sweep reported full coverage while every
+    site was unstamped. The count is asserted rather than the module set trusted, so
+    a site in another module is still found."""
     found = _app_derived_queue_calls()
 
-    assert len(found) == 3, f"expected 3, found {[(n, ln) for n, ln, _ in found]}"
-    assert {name for name, _, _ in found} == {"chat_handlers.py", "chat_orchestrator.py"}
+    assert len(found) == 2, f"expected 2, found {[(n, ln) for n, ln, _ in found]}"
+    assert {name for name, _, _ in found} == {"chat_send.py"}
 
 
 @pytest.mark.parametrize("site", _app_derived_queue_calls(), ids=lambda s: f"{s[0]}:{s[1]}")

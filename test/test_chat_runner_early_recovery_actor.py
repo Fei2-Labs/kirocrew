@@ -13,7 +13,6 @@ path runs for real rather than being reasoned about.
 from __future__ import annotations
 
 import ast
-import inspect
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -159,22 +158,66 @@ class TestTheBindingIsStructural:
     """
 
     def test_the_actor_is_bound_before_any_try_that_queues_a_recovery(self) -> None:
+        tree = ast.parse(
+            "\n".join(
+                turn_file.read_text(encoding="utf-8")
+                for turn_file in [
+                    *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                    Path(chat_runner.__file__),
+                ]
+                if turn_file.name != "__init__.py"
+            )
+        )
         fn = next(
             node
-            for node in ast.walk(ast.parse(inspect.getsource(chat_runner)))
+            for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_run_chat"
         )
+
+        def _binds(scope: ast.AST) -> list[int]:
+            return [
+                target.lineno
+                for stmt in ast.walk(scope)
+                if isinstance(stmt, ast.Assign)
+                for target in stmt.targets
+                if isinstance(target, ast.Name) and target.id == "_crew_log_actor"
+            ]
+
+        # A turn phase (``_turn_*``) that binds the actor binds it for _run_chat at the
+        # call that awaits it, and must bind it before any recovery-queuing try of its own.
+        binders = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name.startswith("_turn_")
+            and _binds(node)
+        ]
         bound_at = min(
-            target.lineno
-            for stmt in ast.walk(fn)
-            if isinstance(stmt, ast.Assign)
-            for target in stmt.targets
-            if isinstance(target, ast.Name) and target.id == "_crew_log_actor"
+            _binds(fn)
+            + [
+                call.lineno
+                for call in ast.walk(fn)
+                if isinstance(call, ast.Call)
+                and getattr(call.func, "id", "") in {phase.name for phase in binders}
+            ]
         )
+
+        # A handler queues a recovery itself, or through the turn phase it awaits.
+        queuing_phases = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name.startswith(("_on_", "_turn_"))
+            and any(
+                isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_queue_recovery"
+                for call in ast.walk(node)
+            )
+        }
 
         def _queues_recovery(node: ast.AST) -> bool:
             return any(
-                isinstance(call, ast.Call) and getattr(call.func, "id", "") == "_queue_recovery"
+                isinstance(call, ast.Call)
+                and getattr(call.func, "id", "") in {"_queue_recovery", *queuing_phases}
                 for call in ast.walk(node)
             )
 
@@ -189,6 +232,17 @@ class TestTheBindingIsStructural:
                 guarded.append(node.body[0].lineno)
 
         assert guarded, "no try block queues a recovery -- has the path moved?"
+        for phase in binders:
+            own = [
+                node.body[0].lineno
+                for node in ast.walk(phase)
+                if isinstance(node, ast.Try)
+                and any(
+                    _queues_recovery(h)
+                    for h in [*node.handlers, ast.Module(body=node.finalbody, type_ignores=[])]
+                )
+            ]
+            assert not own or min(_binds(phase)) < min(own), phase.name
         assert bound_at < min(guarded), (
             f"_crew_log_actor is bound at line {bound_at}, after a recovery-queuing "
             f"try that starts at line {min(guarded)}: a failure before the "

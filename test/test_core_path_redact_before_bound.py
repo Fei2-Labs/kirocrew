@@ -13,12 +13,13 @@ Two layers of pinning, mirroring ``test_theme_clone_stderr_redact_before_bound``
 - Behavioral straddle tests on the pure display helpers: the secret is laid out
   so the bound falls INSIDE it, so a raw slice AND a slice-then-redact reorder
   both go red.
-- A structural AST scan over every module the issue names: a bounded char slice
-  may never appear INSIDE a redact call's argument expression. Deliberate
-  limits: a slice of a renamed local later fed to a redactor is beyond this
-  scan — the behavioral tests carry that shape. Constant bounds under 10 are
-  ignored to keep whole-item idioms (``splitlines()[-1:]``, ``raw[:7]`` hex)
-  out of scope: it is the wide CHAR slice that severs a secret.
+- A structural AST scan over every module the issue names, and over every module
+  of the packages it scans whole: a bounded char slice may never appear INSIDE a
+  redact call's argument expression. Deliberate limits: a slice of a renamed
+  local later fed to a redactor is beyond this scan — the behavioral tests carry
+  that shape. Constant bounds under 10 are ignored to keep whole-item idioms
+  (``splitlines()[-1:]``, ``raw[:7]`` hex) out of scope: it is the wide CHAR
+  slice that severs a secret.
 """
 
 from __future__ import annotations
@@ -161,9 +162,41 @@ class TestToolResultPartStraddle:
         assert "[REDACTED" in event.tool_output
 
 
-# Every module the issue names, relative to the repo root. The scan pins the
-# WHOLE module, not just the fixed lines, so a new slice-before-redact call
-# shape in these files goes red immediately.
+def _package_modules(package: str) -> list[str]:
+    """Every module of *package* outside its ``tests`` directories, repo-relative."""
+    root = _REPO_ROOT / package
+    return sorted(
+        path.relative_to(_REPO_ROOT).as_posix()
+        for path in root.rglob("*.py")
+        if "tests" not in path.relative_to(root).parts
+    )
+
+
+# Packages scanned whole, each with a floor: how many of its modules must make a
+# redact call the scan can see. Enumerated from the package directory, so a module
+# added to one is scanned without an edit here, and the floor fails a scan that
+# stops reaching the package's owners instead of passing on nothing.
+_SCANNED_PACKAGES = {
+    # The Research Lab facade and the campaign engine it is composed from.
+    "src/kiro_crew/apps/builtins/auto_research": 8,
+    # The owners composed into the Slack gateway facade, slack/gateway.py.
+    "src/kiro_crew/slack/gateway_runtime": 5,
+    # The owners composed into the dashboard chat runner, dashboard/chat_runner.py.
+    "src/kiro_crew/dashboard/chat_turn": 24,
+    # The owners mirrored beside the session control tools, mcp_tools/control.py.
+    "src/kiro_crew/mcp_tools/control_parts": 1,
+    # The owners mirrored beside the spawn tools, mcp_tools/spawn.py.
+    "src/kiro_crew/mcp_tools/spawn_parts": 2,
+    # The owners of the ACP dispatch facade, acp/_dispatch.py.
+    "src/kiro_crew/acp/_dispatch_parts": 5,
+    # The owners behind the dashboard artifact routes' facade, dashboard/handlers/artifacts.py.
+    "src/kiro_crew/dashboard/handlers/artifacts_parts": 10,
+}
+
+# Every module the issue names, then every module of the packages scanned whole,
+# relative to the repo root. The scan pins the WHOLE module, not just the fixed
+# lines, so a new slice-before-redact call shape in these files goes red
+# immediately.
 _SCANNED_MODULES = [
     "src/kiro_crew/channel.py",
     "src/kiro_crew/dashboard/chat_runner.py",
@@ -173,18 +206,49 @@ _SCANNED_MODULES = [
     # ordering survived there. NOTE the scan would not have caught
     # that instance -- the slice was a separate statement, not an argument to the
     # redactor -- so the behavioural pin for it lives in
-    # test_acp_client.py::test_credential_straddling_the_bound_is_still_redacted.
+    # test_acp_client_tool_call_updates.py::test_credential_straddling_the_bound_is_still_redacted.
     "src/kiro_crew/acp/client.py",
+    # The client's owner modules.
+    "src/kiro_crew/acp/client_class.py",
+    "src/kiro_crew/acp/client_claude_seed.py",
+    "src/kiro_crew/acp/client_claude_session.py",
+    "src/kiro_crew/acp/client_lifecycle.py",
+    "src/kiro_crew/acp/client_mcp_array.py",
+    "src/kiro_crew/acp/client_model_selection.py",
+    "src/kiro_crew/acp/client_permissions.py",
+    "src/kiro_crew/acp/client_seed_ownership.py",
+    "src/kiro_crew/acp/client_spawn_env.py",
+    "src/kiro_crew/acp/client_start.py",
+    "src/kiro_crew/acp/client_timeouts.py",
+    "src/kiro_crew/acp/client_tool_events.py",
+    "src/kiro_crew/acp/client_transport.py",
+    "src/kiro_crew/acp/client_turn.py",
+    "src/kiro_crew/acp/client_turn_control.py",
+    "src/kiro_crew/acp/client_usage.py",
+    # The client's error formatter and classifiers, with their redactor calls.
+    "src/kiro_crew/acp/transport_errors.py",
     "src/kiro_crew/dashboard/handlers/artifacts.py",
     "src/kiro_crew/dashboard/handlers/discover.py",
     "src/kiro_crew/mcp_tools/control.py",
     "src/kiro_crew/mcp_tools/spawn.py",
     "src/kiro_crew/vector_memory.py",
+    # The owners bound into the vector memory store beside its facade.
+    "src/kiro_crew/vector_memory_inventory.py",
+    "src/kiro_crew/vector_memory_lifecycle.py",
+    "src/kiro_crew/vector_memory_member.py",
+    "src/kiro_crew/vector_memory_semantic_write.py",
     "src/kiro_crew/knowledge/agent_fetch.py",
     "src/kiro_crew/slack/gateway.py",
     "src/kiro_crew/telegram/renderer.py",
+    # The owners the Telegram renderer is composed from, beside its facade.
+    "src/kiro_crew/telegram/renderer_approval.py",
+    "src/kiro_crew/telegram/renderer_display.py",
+    "src/kiro_crew/telegram/renderer_live.py",
+    "src/kiro_crew/telegram/renderer_status.py",
+    "src/kiro_crew/telegram/renderer_tables.py",
+    "src/kiro_crew/telegram/renderer_uploads.py",
     "src/kiro_crew/subagent_manager/continuation.py",
-    "src/kiro_crew/apps/builtins/auto_research/handlers.py",
+    *(rel for package in _SCANNED_PACKAGES for rel in _package_modules(package)),
 ]
 
 
@@ -196,6 +260,18 @@ class TestNoSliceInsideRedactCallInNamedModules:
         for rel in _SCANNED_MODULES:
             offenders += _find_slice_inside_redact_call(_REPO_ROOT / rel)
         assert offenders == []
+
+    def test_every_package_scanned_whole_reaches_its_redacting_modules(self) -> None:
+        for package, floor in _SCANNED_PACKAGES.items():
+            redacting = [
+                rel
+                for rel in _SCANNED_MODULES
+                if rel.startswith(f"{package}/") and _redact_calls(_REPO_ROOT / rel)
+            ]
+            assert len(redacting) >= floor, (
+                f"{package}: the scan reaches {len(redacting)} module(s) that call a "
+                f"redactor, under its floor of {floor}: {redacting}"
+            )
 
 
 def _call_name(call: ast.Call) -> str:
@@ -220,6 +296,16 @@ def _constant_bound(sl: ast.Slice) -> int | None:
         ):
             bound = max(bound or 0, edge.operand.value)
     return bound
+
+
+def _redact_calls(path: Path) -> list[ast.Call]:
+    """The calls in *path* the scan treats as redactor calls."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and "redact" in _call_name(node).lower()
+    ]
 
 
 def _find_slice_inside_redact_call(path: Path) -> list[str]:

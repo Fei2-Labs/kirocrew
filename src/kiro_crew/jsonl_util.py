@@ -9,7 +9,11 @@ at roughly twice the cap while one generation of history is kept.
 
 :func:`rotate_jsonl_at` owns that rotation step. Each call site keeps its
 own append, record shape, size cap, and error contract, because those
-differ per log; what they share is exactly the rotate-by-rename.
+differ per log; what they share is exactly the rotate-by-rename. One caller
+has no append of its own: :mod:`kiro_crew.shell_audit_log` applies the same
+rename to the plain-text ``audit.log`` a shell hook appends to, from a
+periodic sweep rather than from the writer, because the writer is a shell
+command this package does not run.
 
 :func:`bounded_records` and :func:`strict_records` own the matching bound on
 the READ side. A file's total size being rotated does not bound one RECORD:
@@ -65,20 +69,25 @@ used.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import logging
 import os
-import re
-from collections.abc import Iterator
+import stat
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import IO
+from typing import IO, Any, cast
 
 from kiro_crew import platform_compat
 
 logger = logging.getLogger(__name__)
 
-# Either record terminator, so one scan finds whichever comes first. See
-# _boundary_end for why two bytes.find() calls are not equivalent.
-_BOUNDARY_RE = re.compile(rb"[\r\n]")
+# The one search primitive the framing walk uses: ``bytes.find`` is a memchr scan
+# in C, where a ``rb"[\r\n]"`` regex walks each byte through the regex engine
+# (measured 6x slower over real transcripts, and slower than ``json.loads``
+# parses the same records). A module name rather than a method call so the
+# linearity test can count what each search scans; see _BoundaryScan.
+_find = bytes.find
 
 # Longest record these readers will materialise, in BYTES (terminator excluded:
 # the threshold applies to the record without its newline, so a cap-length record
@@ -117,6 +126,9 @@ _BOUNDARY_RE = re.compile(rb"[\r\n]")
 # truncate the biggest real sessions.
 RECORD_CAP = 128 * 1024 * 1024
 
+# Public so a caller can tell this refusal from an unrelated EINVAL, which shares its errno.
+NOT_REGULAR_FILE = "refusing a non-regular file"
+
 
 class UnreadableRecord(Exception):
     """A record cannot be delivered INTACT, so the file cannot be read completely.
@@ -132,6 +144,26 @@ class UnreadableRecord(Exception):
 
 class OversizedRecord(UnreadableRecord):
     """A record exceeded the cap, so it was never materialised."""
+
+
+class SplitlinesBoundaryRecord(UnreadableRecord):
+    """A record contains a boundary ``str.splitlines`` honours but the framer does not.
+
+    The byte framer ends records only at ``\\n``, ``\\r\\n`` and ``\\r``; the
+    text-mode full reader runs ``splitlines()`` and also breaks on ``\\x0b``,
+    ``\\x0c``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028`` and ``\\u2029``. A record
+    holding one of those raw would count as one row here and as several
+    fragments there, so an index built over it disagrees with the authoritative
+    reader about every cursor above it. The writer emits ASCII-only JSON, so
+    this is unreachable through the normal path; a caller that meets it hands
+    the read to the full reader rather than guess.
+    """
+
+
+def raise_if_splitlines_boundary(text: str) -> None:
+    """Raise :class:`SplitlinesBoundaryRecord` if *text* is more than one splitline."""
+    if len(text.splitlines()) > 1:
+        raise SplitlinesBoundaryRecord("record contains a splitlines-only boundary")
 
 
 class UndecodableRecord(UnreadableRecord):
@@ -162,12 +194,13 @@ def _body_len(piece: bytes) -> int:
     return len(piece)
 
 
-def _boundary_end(buf: bytes, start: int = 0) -> int | None:
-    """Index just past the first record terminator at or after *start*, else None.
+class _BoundaryScan:
+    """Record-terminator search over ONE buffer, walked by a non-decreasing start.
 
-    Terminators are the universal-newline set -- ``\\n``, ``\\r\\n`` and a bare
-    ``\\r`` -- because that is what the TEXT-mode reads these callers were
-    converted from treated as a record end.
+    :meth:`end` answers "index just past the first record terminator at or after
+    *start*, else None". Terminators are the universal-newline set -- ``\\n``,
+    ``\\r\\n`` and a bare ``\\r`` -- because that is what the TEXT-mode reads
+    these callers were converted from treated as a record end.
 
     *start* lets the caller walk one buffer without re-slicing it. Searching
     from an offset rather than trimming the front is what keeps a chunk holding
@@ -175,12 +208,15 @@ def _boundary_end(buf: bytes, start: int = 0) -> int | None:
     tail per record, which is quadratic in the record count and is itself a
     cheap denial-of-service on an agent-writable file.
 
-    One regex scan finds whichever terminator comes first. Two separate
-    ``bytes.find`` calls would NOT do: a file delimited only by ``\\r`` has no
-    ``\\n`` until its very end, so searching for ``\\n`` walks the whole
-    remaining buffer on every record and reintroduces the same quadratic cost
-    the offset was added to remove. Measured before and after on a
-    40,000-record file: 0.086s of superlinear growth against 0.012s flat.
+    Each needle's next position is CACHED, and that is what makes two separate
+    ``bytes.find`` scans linear. Without the cache, a file delimited only by
+    ``\\r`` has no ``\\n`` until its very end, so a fresh search for ``\\n`` per
+    record walks the whole remaining buffer every time -- quadratic again. With
+    it, a needle is searched again only once *start* has passed its cached
+    position, and a needle with no occurrence left in the buffer is never
+    searched again, so every byte is scanned at most once per needle. That holds
+    because *start* never decreases within one buffer, which the framing walk
+    guarantees: it only advances past what it has already split off.
 
     A ``\\r`` that is the LAST byte is deliberately not treated as a terminator:
     it may be the first half of a ``\\r\\n`` whose ``\\n`` is in the next read,
@@ -189,15 +225,33 @@ def _boundary_end(buf: bytes, start: int = 0) -> int | None:
     at EOF yields the remainder whole -- so a file genuinely ending in a bare
     ``\\r`` still produces exactly one final record.
     """
-    match = _BOUNDARY_RE.search(buf, start)
-    if match is None:
-        return None
-    at = match.start()
-    if buf[at : at + 1] != b"\r":
-        return at + 1
-    if at + 1 == len(buf):
-        return None  # may be the \r of a \r\n not read yet
-    return at + 2 if buf[at + 1 : at + 2] == b"\n" else at + 1
+
+    __slots__ = ("_buf", "_size", "_nl", "_cr")
+
+    def __init__(self, buf: bytes) -> None:
+        self._buf = buf
+        self._size = len(buf)
+        # Next index of each needle at or after the last search's start; -1 means
+        # none is left in this buffer, and -2 means not searched yet.
+        self._nl = -2
+        self._cr = -2
+
+    def end(self, start: int) -> int | None:
+        if start >= self._size:
+            return None
+        nl = self._nl
+        if nl != -1 and nl < start:
+            nl = self._nl = _find(self._buf, b"\n", start)
+        cr = self._cr
+        if cr != -1 and cr < start:
+            cr = self._cr = _find(self._buf, b"\r", start)
+        if cr == -1 or (nl != -1 and nl < cr):
+            return None if nl == -1 else nl + 1
+        if cr + 1 == self._size:
+            return None  # may be the \r of a \r\n not read yet
+        # `nl` is the first \n at or after `start`, and `cr` precedes it, so the
+        # \r is half of a CRLF exactly when that \n sits right behind it.
+        return cr + 2 if nl == cr + 1 else cr + 1
 
 
 class _Oversized:
@@ -256,8 +310,35 @@ def _frames(handle: IO[bytes], cap: int) -> Iterator[bytes | _Oversized]:
     stops consuming this generator, and generators are lazy, so the work of
     discarding a multi-GB tail is never done for it. That is the same guarantee
     the old explicit flag gave, with no flag to pass or get wrong.
+
+    Implemented as a thin projection of :func:`_frames_with_offsets`, which owns
+    the buffer walk; the two readers therefore frame identically by construction
+    rather than by parallel maintenance.
+    """
+    for _start, _end, frame in _frames_with_offsets(handle, cap):
+        yield frame
+
+
+def _frames_with_offsets(
+    handle: IO[bytes], cap: int
+) -> Iterator[tuple[int, int, bytes | _Oversized]]:
+    """Frame *handle* into complete records with absolute byte offsets.
+
+    This is the single framing implementation: :func:`_frames` projects it.
+    Offsets name exact record boundaries, so they are safe seek targets for a
+    later bounded read of the same stamped file revision. Everything the
+    :func:`_frames` docstring says about boundaries, the cap, drops, and peak
+    memory holds here verbatim.
     """
     buf = b""
+    # Absolute offset of buf[0]. Seeded from the handle's position when it has
+    # one (callers may hand a pre-seeked file) and advanced by bytes CONSUMED,
+    # so a readline-only handle with no `tell` frames identically.
+    try:
+        buf_offset = handle.tell()
+    except (AttributeError, OSError):
+        buf_offset = 0
+    consumed = buf_offset
     # True while discarding the remainder of an over-cap record, whose own
     # terminator is what ends the discard.
     dropping = False
@@ -274,21 +355,27 @@ def _frames(handle: IO[bytes], cap: int) -> Iterator[bytes | _Oversized]:
         if not chunk:
             break
         buf += chunk
+        consumed += len(chunk)
         # Walk by offset and slice the remainder ONCE at the end of the chunk:
         # re-slicing per record copies the whole tail each time, which is
         # quadratic in the number of records a single read holds.
         start = 0
-        while (idx := _boundary_end(buf, start)) is not None:
+        scan = _BoundaryScan(buf)
+        while (idx := scan.end(start)) is not None:
+            piece_start = start
             piece, start = buf[start:idx], idx
+            absolute_start = buf_offset + piece_start
+            absolute_end = buf_offset + idx
             if dropping:
                 dropping = False  # this piece's terminator ended the dropped record
                 continue
             if _body_len(piece) > cap:
                 # Already terminated, so there is nothing left to discard and
                 # `dropping` must stay clear -- the next piece is a real record.
-                yield _OVERSIZED
+                yield absolute_start, absolute_end, _OVERSIZED
                 continue
-            yield piece
+            yield absolute_start, absolute_end, piece
+        buf_offset += start
         buf = buf[start:]
         # A trailing \r is a pending TERMINATOR half, not body: it was left
         # unsplit above in case its \n is in the next read, so counting it would
@@ -296,18 +383,64 @@ def _frames(handle: IO[bytes], cap: int) -> Iterator[bytes | _Oversized]:
         pending_cr = buf.endswith(b"\r")
         if len(buf) - pending_cr > cap:
             if not dropping:
-                yield _OVERSIZED
+                yield buf_offset, buf_offset + len(buf), _OVERSIZED
                 dropping = True
             # KEEP a pending \r. It is the dropped record's own terminator, and
             # dropping it would leave the NEXT record's terminator to end the
             # discard -- silently consuming a valid record.
-            buf = b"\r" if pending_cr else b""
+            if pending_cr:
+                buf_offset = consumed - 1
+                buf = b"\r"
+            else:
+                buf_offset = consumed
+                buf = b""
     if buf and not dropping:
         # A crash mid-append leaves a final record with no terminator. Its BODY
         # is within the cap because the per-read check above reported and dropped
         # any longer tail; the piece itself may be one byte longer, when the file
         # ends on a bare \r that is a terminator here rather than a pending half.
-        yield buf
+        yield buf_offset, buf_offset + len(buf), buf
+
+
+def strict_raw_records_with_offsets(
+    handle: IO[bytes], path: Path, *, cap: int = RECORD_CAP
+) -> Iterator[tuple[int, int, bytes]]:
+    """Yield ``(start, end, record)``, aborting on an oversized record.
+
+    The pagination index is an INDEX SPACE: every row it counts positions the
+    rows above it, so a skipped record does not merely go missing, it shifts
+    every later cursor. That is the strict posture, so an over-cap record raises
+    :class:`OversizedRecord` and the caller falls back to the authoritative full
+    reader, which has no per-record cap.
+    """
+    for start, end, frame in _frames_with_offsets(handle, cap):
+        if isinstance(frame, _Oversized):
+            raise OversizedRecord(f"record over {cap} bytes in {path!r}")
+        yield start, end, frame
+
+
+def bounded_raw_records_with_offsets(
+    handle: IO[bytes], path: Path, *, cap: int = RECORD_CAP, label: str = "read"
+) -> Iterator[tuple[int, int, bytes | None]]:
+    """Yield ``(start, end, record)`` with absolute byte offsets, skipping over-cap ones.
+
+    :func:`bounded_raw_records` for a caller that resumes from a saved offset
+    (a tail reader polling a file another process appends to). An over-cap
+    record is yielded as ``None`` rather than left out, so the caller can still
+    move its offset past it instead of re-reading it on every poll. The last
+    record may be unterminated (a writer mid-append): it carries no terminator,
+    which is how the caller tells it apart and leaves it for its next read.
+    """
+    oversized = 0
+    for start, end, frame in _frames_with_offsets(handle, cap):
+        if isinstance(frame, _Oversized):
+            oversized += 1
+            yield start, end, None
+            continue
+        yield start, end, frame
+    if oversized:
+        # %r for the same reason as bounded_raw_records: *path* may embed a newline.
+        logger.debug("%s: skipped %d record(s) over %d bytes in %r", label, oversized, cap, path)
 
 
 def _decode(raw: bytes) -> str:
@@ -343,7 +476,7 @@ def bounded_raw_records(
     set -- ``\\n``, ``\\r\\n`` and a bare ``\\r`` -- which is exactly what the
     text-mode ``for line in handle`` iteration this replaces split on, so
     moving to a binary handle changes where records begin and end not at all
-    (see :func:`_boundary_end`). A record containing an exotic boundary
+    (see :class:`_BoundaryScan`). A record containing an exotic boundary
     ``str.splitlines`` would honour (``\\u2028``, ``\\x1c``, ...) stays ONE
     record and still parses, matching the iteration rather than
     ``splitlines`` -- which is the difference from
@@ -473,3 +606,113 @@ def rotate_jsonl_at(path: Path, max_bytes: int) -> None:
             os.close(lock_fd)
     except (OSError, ValueError):
         pass
+
+
+class _CappedReader:
+    """Charges every byte handed to the caller against *max_bytes*.
+
+    ``fstat`` describes the file at OPEN time, and a writer holding the same path may APPEND while
+    it is being consumed, so the size check bounds the file as it was rather than what the caller
+    receives. This bounds the delivery: reads are clamped to one byte past what remains, so a file
+    that grew to gigabytes cannot be materialised before the refusal fires.
+    """
+
+    __slots__ = ("_handle", "_max_bytes", "_path", "_remaining")
+
+    def __init__(self, handle: IO[bytes], path: Path, max_bytes: int) -> None:
+        self._handle = handle
+        self._path = path
+        self._max_bytes = max_bytes
+        self._remaining = max_bytes
+
+    def _charge(self, count: int) -> None:
+        self._remaining -= count
+        if self._remaining < 0:
+            raise OSError(
+                errno.EFBIG,
+                f"grew past the {self._max_bytes}-byte ceiling while being read",
+                str(self._path),
+            )
+
+    def _budget(self, size: int | None) -> int:
+        # One PAST the remainder, so the read that proves the file overran still lands and charges,
+        # while a file of exactly max_bytes reads to EOF and is never refused.
+        return self._remaining + 1 if size is None or size < 0 else min(size, self._remaining + 1)
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._handle.read(self._budget(size))
+        self._charge(len(chunk))
+        return chunk
+
+    def readline(self, size: int = -1) -> bytes:
+        chunk = self._handle.readline(self._budget(size))
+        self._charge(len(chunk))
+        return chunk
+
+    def readinto(self, buffer: Any) -> int:
+        read = getattr(self._handle, "readinto", None)
+        if read is None:
+            chunk = self.read(len(buffer))
+            buffer[: len(chunk)] = chunk
+            return len(chunk)
+        count = read(memoryview(buffer)[: self._budget(len(buffer))]) or 0
+        self._charge(count)
+        return count
+
+    def __iter__(self) -> Iterator[bytes]:
+        return self
+
+    def __next__(self) -> bytes:
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._handle, name)
+
+
+@contextlib.contextmanager
+def open_regular_nofollow(
+    path: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    authorize: Callable[[int], None] | None = None,
+) -> Iterator[IO[bytes]]:
+    """Open *path* for reading, refusing anything that is not a regular file.
+
+    Refuses a FIFO and a reparse point in the SAME operation that opens, so a planted
+    link has no check-to-open window; the per-platform branch lives in
+    :func:`kiro_crew.platform_compat.open_file_no_reparse`.
+
+    ``max_bytes`` is checked against the open handle's ``fstat`` and then charged against
+    every read, so growth after the open is still refused.
+
+    ``authorize`` receives the RAW descriptor and raises to refuse it, before any content
+    reader exists. It sits AFTER the size check deliberately: a callback that mutates the
+    file would otherwise be caught by the open-time ``fstat`` and never reach the per-read
+    charge it exercises.
+    """
+    fd = platform_compat.open_file_no_reparse(path, nonblocking=True)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, NOT_REGULAR_FILE, str(path))
+        if st.st_size > max_bytes:
+            raise OSError(
+                errno.EFBIG, f"{st.st_size} bytes past the {max_bytes}-byte ceiling", str(path)
+            )
+        if authorize is not None:
+            authorize(fd)
+        if getattr(os, "O_NONBLOCK", 0):
+            # Cleared once the node is known regular: O_NONBLOCK earned its place on the open, and
+            # a regular-file read does not block, but a short read on a signal would be visible.
+            os.set_blocking(fd, True)
+        handle = os.fdopen(fd, "rb", closefd=True)
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        yield cast("IO[bytes]", _CappedReader(handle, Path(path), max_bytes))
+    finally:
+        handle.close()

@@ -1,25 +1,19 @@
 /**
- * The sidebar's filter dimensions are declared ONCE, in `filterDimensions`,
- * and all three consumers derive from it: `filteredSlots` (which rows render),
- * `listNarrowed` (is anything filtering), `revealBlockingFilters` (does THIS
- * row fail a filter). Before the consolidation each site enumerated the
- * dimensions by hand, so a new filter added to one and missed in the others
- * failed silently — reveal-in-sidebar looked broken (#4141), or an empty-state
- * branch showed a leftover container.
+ * The sidebar's filter dimensions are declared ONCE, in the row model's
+ * `buildSidebarRows`, and all three consumers derive from it: `filteredSlots`
+ * (which rows render), `listNarrowed` (is anything filtering),
+ * `revealBlockingFilters` (does THIS row fail a filter). Before the
+ * consolidation each site enumerated the dimensions by hand, so a new filter
+ * added to one and missed in the others failed silently — reveal-in-sidebar
+ * looked broken, or an empty-state branch showed a leftover container.
  *
- * The structural cases pin the derivation: each consumer names the single
- * source and no filter state of its own, so a dimension cannot be added to a
- * consumer directly. Adding one to `filterDimensions` itself is compiler-
- * checked — every `FilterDimension` field is required, so an entry cannot skip
- * a consumer's answer.
- *
- * The behavioural cases pin `listNarrowed` through the derivation — the one
- * consumer the reveal tests do not touch — including the deliberate
- * resolved-vs-raw tag distinction the declaration documents.
+ * That the three consumers agree per dimension is pinned at the model's
+ * interface (`pages/chat-sidebar/rows.test.ts`, one row per dimension). These
+ * cases pin `listNarrowed` through the rendered sidebar — the one consumer the
+ * reveal tests do not touch — including the deliberate resolved-vs-raw tag
+ * distinction the declaration documents.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { readSource } from './readSource'
-import { join } from 'node:path'
 import { render, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
@@ -172,53 +166,83 @@ describe('listNarrowed derives from the filter dimensions', () => {
   })
 })
 
-const SRC = join(__dirname, '..', 'pages', 'ChatSidebar.tsx')
-// Flattened first: a line-by-line scan misses a construct the moment a
-// reformat splits it across lines.
-const raw = readSource(SRC)
-const flat = raw.replace(/\s+/g, ' ')
+/** `k-alpha` is pinned; neither row is running, and `k-gamma` shares alpha's
+ *  tag without the pin, so it is the control that shows the filter still acts
+ *  on an unpinned row. */
+const PINNED_SLOTS: ChatSlot[] = [
+  { key: 'k-alpha', title: 'alpha session', running: false, messages: 2, tags: ['t1'], pinned: true },
+  { key: 'k-beta', title: 'beta session', running: false, messages: 2, tags: ['t2'] },
+  { key: 'k-gamma', title: 'gamma session', running: false, messages: 2, tags: ['t1'] },
+] as unknown as ChatSlot[]
 
-describe('all three consumers derive from the single filterDimensions declaration', () => {
-  it('the declaration holds every dimension', () => {
-    const decl = flat.match(/const filterDimensions = useMemo<FilterDimension\[\]>.*?\}, \[[^\]]*\]\)/)?.[0]
-    expect(decl).toBeDefined()
-    // Tags, search, status, folder. One count suffices: the compiler already
-    // forces every entry to carry all four fields, so one field's occurrence
-    // count pins the number of dimensions declared here. Bump it in the same
-    // commit as a fifth entry so the addition is a decision, not drift.
-    expect([...decl!.matchAll(/\bfiltersRow:/g)]).toHaveLength(4)
+describe('a pinned session is exempt from the property filters', () => {
+  it('a status chip that excludes the pinned row by property still shows it, and hides the unpinned rows', async () => {
+    localStorage.setItem(RUNNING_ONLY_LS_KEY, '1')
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('alpha session')).not.toBeNull())
+    expect(utils.queryByText('beta session')).toBeNull()
+    expect(utils.queryByText('gamma session')).toBeNull()
+    // The list IS narrowed (the chip still acts), so this is not the empty
+    // state either: the pinned band stands alone above nothing.
+    expect(utils.queryByText('No sessions match')).toBeNull()
   })
 
-  // The consumer pins below hold the COMPLETE normalized expression, not
-  // fragments: a fragment check ("contains filterDimensions.every") is
-  // satisfied by an expression that ALSO smuggles in an undeclared operand
-  // (`&& ownerFilter(slot)`, `|| ownerFilterActive`, a second registry
-  // entry). Changing a consumer means changing its pinned string in the same
-  // commit — that is the point.
-
-  it('filteredSlots filters only through the declaration', () => {
-    const memo = flat.match(/const filteredSlots = useMemo\(.*?\}, \[[^\]]*\]\s*\)/)?.[0]
-    expect(memo).toBeDefined()
-    expect(memo).toContain(
-      '.filter(slot => filterDimensions.every(d => d.filtersRow === null || d.filtersRow(slot)))',
-    )
-    // Exactly one .filter pass, and it is the pinned one — a second pass is a
-    // dimension the other consumers cannot see.
-    expect([...memo!.matchAll(/\.filter\(/g)]).toHaveLength(1)
+  it('a tag filter the pinned row does not carry still shows it, and hides the unpinned row without the tag', async () => {
+    localStorage.setItem(TAG_FILTER_LS_KEY, JSON.stringify(['t2']))
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('beta session')).not.toBeNull())
+    expect(utils.queryByText('alpha session')).not.toBeNull()
+    expect(utils.queryByText('gamma session')).toBeNull()
   })
 
-  it('listNarrowed consults only the declaration', () => {
-    const line = raw.match(/const listNarrowed = [^\n]+/)?.[0]
-    expect(line).toBe(
-      'const listNarrowed = filterDimensions.some(d => d.narrows !== null && d.narrows())',
-    )
+  it('the search is not exempt: a pinned row the query does not name is dropped', async () => {
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('alpha session')).not.toBeNull())
+    fireEvent.change(utils.getByPlaceholderText('Search sessions…'), { target: { value: 'beta' } })
+    await waitFor(() => expect(utils.queryByText('alpha session')).toBeNull())
+    expect(utils.queryByText('beta session')).not.toBeNull()
+  })
+})
+
+describe('pinned band caption while a filter narrows the list', () => {
+  it('a status chip that narrows the list shows the pinned band caption next to the divider', async () => {
+    localStorage.setItem(RUNNING_ONLY_LS_KEY, '1')
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('alpha session')).not.toBeNull())
+    // alpha is pinned so it is exempt and stays on screen.
+    // The caption labels the band so the viewer knows why.
+    expect(utils.queryByText('Pinned · always shown')).not.toBeNull()
   })
 
-  it('revealBlockingFilters adapts the declaration, declaring nothing of its own', () => {
-    const registry = flat.match(/const revealBlockingFilters = useMemo<RevealBlockingFilter\[\]>.*?\}, \[[^\]]*\]\)/)?.[0]
-    expect(registry).toBeDefined()
-    expect(registry).toContain(
-      'return filterDimensions.map(d => ({ hides: (slot: Slot) => d.hides(slot, excluded), clear: d.clear, }))',
-    )
+  it('a tag filter the pinned row does not carry shows the pinned band caption', async () => {
+    localStorage.setItem(TAG_FILTER_LS_KEY, JSON.stringify(['t2']))
+    const utils = renderSidebar(PINNED_SLOTS)
+    // The caption waits for the tag vocabulary: only a resolved id narrows.
+    await waitFor(() => expect(utils.queryByText('gamma session')).toBeNull())
+    expect(utils.queryByText('alpha session')).not.toBeNull()
+    await waitFor(() => expect(utils.queryByText('Pinned · always shown')).not.toBeNull())
+  })
+
+  it('a stored tag id the vocabulary cannot resolve narrows nothing, so no caption', async () => {
+    localStorage.setItem(TAG_FILTER_LS_KEY, JSON.stringify(['ghost-deleted-tag']))
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('gamma session')).not.toBeNull())
+    expect(utils.queryByText('Pinned · always shown')).toBeNull()
+  })
+
+  it('no active filter means no pinned band caption', async () => {
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('alpha session')).not.toBeNull())
+    expect(utils.queryByText('Pinned · always shown')).toBeNull()
+  })
+
+  it('the pinned band caption is absent while searching', async () => {
+    localStorage.setItem(RUNNING_ONLY_LS_KEY, '1')
+    const utils = renderSidebar(PINNED_SLOTS)
+    await waitFor(() => expect(utils.queryByText('alpha session')).not.toBeNull())
+    // The caption is visible before the search box has any text.
+    expect(utils.queryByText('Pinned · always shown')).not.toBeNull()
+    fireEvent.change(utils.getByPlaceholderText('Search sessions…'), { target: { value: 'alpha' } })
+    await waitFor(() => expect(utils.queryByText('Pinned · always shown')).toBeNull())
   })
 })

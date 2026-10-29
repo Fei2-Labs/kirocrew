@@ -16,6 +16,8 @@ from kiro_crew.config.loader import KiroCrewConfig, config_dir, config_path  # n
 from kiro_crew.dashboard.handlers_system import (  # noqa: F401
     api_compliance_yolo_status,
     api_governance_channels,
+    api_leaked_runtimes,
+    api_leaked_runtimes_reclaim,
     api_sso_ttl,
     api_status,
     api_system,
@@ -103,6 +105,12 @@ from kiro_crew.dashboard.handlers.appearances import (  # noqa: E402, F401
     api_appearances_petdex_fetch,
 )
 
+# ── Browser view same-origin relay (handlers/browser_view_relay.py) ──
+from kiro_crew.dashboard.handlers.browser_view_relay import (  # noqa: E402, F401
+    api_browser_view_relay,
+    close_relay_client,
+)
+
 # ── Connections OAuth relay (handlers/connections.py) ──
 from kiro_crew.dashboard.handlers.connections import (  # noqa: E402, F401
     api_connections_cancel,
@@ -172,6 +180,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_file_diff,
     api_file_download,
     api_file_grep,
+    api_file_kinds,
     api_file_office_preview,
     api_file_raw,
     api_file_read,
@@ -186,6 +195,7 @@ from kiro_crew.dashboard.handlers.files import (  # noqa: E402, F401
     api_path_complete,
     api_project_git,
     api_project_git_log,
+    api_project_git_repos,
     api_project_git_status,
     api_project_tree,
     api_reveal_path,
@@ -233,6 +243,7 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_apply,
     api_mcp_gateway_enable,
     api_mcp_gateway_metrics,
+    api_mcp_gateway_server_launch,
     api_mcp_gateway_servers,
     api_mcp_gateway_set_stub,
     api_mcp_gateway_status,
@@ -251,14 +262,15 @@ from kiro_crew.dashboard.handlers.mcp import (  # noqa: E402, F401
     api_mcp_toggle_all,
     api_mcp_toggle_tool,
 )
-from kiro_crew.dashboard.handlers.mcp_apps import (  # noqa: E402, F401
-    api_mcp_apps_call,
-)
 
 # ── Crew Members (handlers/members.py) ──
 from kiro_crew.dashboard.handlers.members import (  # noqa: E402, F401
     api_member_activity,
     api_member_briefing,
+    api_member_fresh_start,
+    api_member_greet,
+    api_member_projections,
+    api_member_recap,
     api_member_rules_get,
     api_member_rules_put,
     api_member_thread,
@@ -356,8 +368,6 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_slack_profile,
     api_slack_reactions,
     api_spawn,
-    api_spawn_clear,
-    api_spawn_command_lookup,
     api_spawn_continue,
     api_spawn_delete,
     api_spawn_list,
@@ -378,6 +388,13 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_webex_config_save,
     api_wecom_config_get,
     api_wecom_config_save,
+    stop_browser_install,
+)
+
+# ── Rendered slides for the file panel (handlers/office_slides.py) ──
+from kiro_crew.dashboard.handlers.office_slides import (  # noqa: E402, F401
+    api_file_office_slide,
+    api_file_office_slides,
 )
 from kiro_crew.dashboard.handlers.prompts import (  # noqa: E402, F401
     MAX_PROMPT_BYTES,
@@ -441,6 +458,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_session_detail,
     api_session_directive,
     api_session_keepalive,
+    api_session_meta,
     api_session_tool_policy,
     api_sessions,
     api_sessions_clear,
@@ -451,6 +469,7 @@ from kiro_crew.dashboard.handlers.sessions import (  # noqa: E402, F401
     api_sessions_search,
     api_sessions_summarize,
     api_sessions_usage,
+    api_sessions_usage_refresh,
 )
 
 # ── Side conversation (extracted to handlers/side.py) ──
@@ -459,6 +478,9 @@ from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_open,
     api_side_queue_cancel,
     api_side_queue_edit,
+    api_side_state,
+    api_side_stop,
+    api_side_tools,
     api_side_turn,
 )
 
@@ -513,6 +535,23 @@ from kiro_crew.dashboard.handlers.taskrunner import (  # noqa: E402, F401
     api_taskrunner_update_plan,
     api_taskrunner_update_task,
 )
+
+# ── Crewmate teams (handlers/teams.py) ──
+from kiro_crew.dashboard.handlers.teams import (  # noqa: E402, F401
+    api_teams_create,
+    api_teams_delete,
+    api_teams_list,
+    api_teams_update,
+)
+
+# ── MCP Apps message/call endpoints (handlers/mcp_apps.py) ──
+# DELIBERATELY NOT IMPORTED HERE. MCP Apps are feature-gated behind
+# ``mcp_gateway.apps_enabled``, and the module imports the gateway backend at
+# module scope — an eager import here would put the entire optional gateway
+# subsystem on the dashboard boot path, which ``no-new-work-on-gateway-boot-path``
+# clause 5 forbids ("gate the import, not just the handler"). ``server._deferred``
+# binds the two routes at boot and imports this module on the first request,
+# exactly as the work_ledger and session-control routes do.
 
 
 # ── Durable task queue + capacity view (handlers/tasks.py) ──
@@ -581,7 +620,7 @@ from kiro_crew.dashboard.handlers.ui_prefs import (  # noqa: E402, F401
 )
 
 # ── Updates & Logs (extracted to handlers/updates.py) ──
-# NOTE: api_stream passes update_available= to status_snapshot (see updates.py)
+# NOTE: api_stream passes update_available= to status_snapshot (see updates_streams.py)
 from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     _UPDATE_CHECK_INTERVAL,
     _do_update_check,
@@ -606,6 +645,7 @@ from kiro_crew.dashboard.handlers.updates import (  # noqa: E402, F401
     api_update_channel,
     api_update_check,
     api_update_disarm,
+    api_update_revalidate,
     api_update_simulate,
     get_update_info,
     install_log_ring_handler,
@@ -614,6 +654,7 @@ from kiro_crew.dashboard.handlers.usage import (  # noqa: E402, F401
     api_kiro_usage,
     api_usage,
 )
+from kiro_crew.dashboard.handlers.usage_series import api_usage_series  # noqa: E402, F401
 from kiro_crew.dashboard.handlers.wakatime import (  # noqa: E402, F401
     api_wakatime_export,
     api_wakatime_stats,
@@ -934,12 +975,18 @@ def _build_prompt_base() -> list[dict[str, Any]]:
 
 
 # Paid-AWS-service consent — the operator's confirmation surface for Amazon
-# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant
-# alongside the ``kirocrew aws-consent`` CLI.
+# Polly (TTS) and Amazon Transcribe (STT). Sole writer of the keystone grant.
 from kiro_crew.dashboard.handlers.aws_consent import (  # noqa: E402, F401
     api_aws_consent_delete,
     api_aws_consent_get,
     api_aws_consent_post,
+)
+
+# Project AWS profile binding (aws.project_profiles) — the composer's project
+# chip reads and sets which named profile a project's sessions start with.
+from kiro_crew.dashboard.handlers.aws_project_profile import (  # noqa: E402, F401
+    api_aws_project_profile_get,
+    api_aws_project_profile_put,
 )
 
 # Computer use — the Settings config pair (browser, cookie-authed) plus the two
@@ -980,6 +1027,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_stt_prewarm,
     api_stt_status,
     api_stt_transcribe,
+    api_stt_vocabularies,
     api_theme_boot,
     api_theme_config,
     api_token_local,
@@ -989,6 +1037,13 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     pwa_file,
 )
 
+# Credential-redaction switch — owner-gated, and the ONLY writer of
+# ``credential_redaction.json`` (see ``security.redaction_switch``).
+from kiro_crew.dashboard.handlers.credential_redaction import (  # noqa: E402, F401
+    api_credential_redaction_get,
+    api_credential_redaction_put,
+)
+
 # Decision seam — the operator's switch for sending conversation state to Jev
 # (sole writer of the ``decisions_consent.json`` keystone), plus the chat strip's
 # verdict writer and folded report.
@@ -996,6 +1051,10 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
     api_decisions_consent_get,
     api_decisions_consent_put,
     api_decisions_feedback,
+    api_decisions_local_model_delete,
+    api_decisions_local_model_status,
+    api_decisions_provider_get,
+    api_decisions_provider_put,
 )
 
 # Flagged-file delivery consent — owner-gated, and the ONLY writer of
@@ -1038,6 +1097,9 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_trusted_app_revoke,
     api_trusted_apps_allow_all,
     api_trusted_apps_list,
+    api_trusted_registries_list,
+    api_trusted_registry_grant,
+    api_trusted_registry_revoke,
     api_workflow_policy_get,
     api_workflow_policy_patch,
 )

@@ -1,13 +1,13 @@
 ---
 title: Off-host backup — a bundle a dead machine cannot take with it
-status: draft
+status: partial
 author: mingweic
 created: 2026-08-11
-last-audited: 2026-08-11
-audited-at: f4d3327a7
+last-audited: 2026-10-06
+audited-at: 9348a25a34
 doc-pr: 2744
 implementation-prs: [2764]
-tracking-issues: []
+tracking-issues: [13259, 13550]
 supersedes: []
 superseded-by: []
 ---
@@ -15,7 +15,7 @@ superseded-by: []
 # RFC: Off-host backup — a bundle a dead machine cannot take with it
 
 > **Partly shipped, with the off-host destination moved to the AWS Control app.**
-> `src/kiro_crew/snapshot.py` now owns the purpose/policy seam, a self-contained
+> `src/kiro_crew/snapshot_components.py` now owns the purpose/policy seam, a self-contained
 > `memory` component, and local artifact/upload components. The AWS Control backup
 > path owns the hardened S3 drive, snapshot and transcript uploads, nightly runs,
 > retention, and download-to-staging restore; see
@@ -59,33 +59,38 @@ SSH, no reboot — taking every conversation and every learned memory with it.
 
 ## Current state
 
+This section and *Three problems* describe the repository at this RFC's creation
+(2026-08-11). The off-host destination has since shipped in the AWS Control app,
+which uploads snapshot and sessions backups off-host; its contract is
+[aws-control.md](../system-specs/modules/aws-control.md).
+
 | Mechanism | Code | Destination |
 |---|---|---|
-| CLI snapshot / restore | `snapshot.py` (`VALID_COMPONENTS`:29, `CORE_FILES`:142) | `<data home>/snapshots/` — inside what it protects |
-| Dashboard export / import | `portability.py` (`EXPORT_EXCLUDE`:41, `EXCLUDE_DIRS`:59) | browser download, unscheduled |
-| Session transfer | `dashboard/session_transfer.py`, `handlers_instances.py:417` | another **live** instance over an SSH tunnel |
+| CLI snapshot / restore | `snapshot.py`, `snapshot_components.py` (`VALID_COMPONENTS`, `CORE_FILES`) | `<data home>/snapshots/` — inside what it protects |
+| Dashboard export / import | `portability.py` (`EXPORT_EXCLUDE`, `EXCLUDE_DIRS` in `portability_archive.py`) | browser download, unscheduled |
+| Session transfer | `dashboard/session_transfer.py`, `dashboard/handlers_instances.py` | another **live** instance over an SSH tunnel |
 
 Session transfer needs both hosts up simultaneously — the one condition a host loss
-breaks — and carries no memory or config (`instances.md` §14). No code path in the
-repository writes crew state to a remote store.
+breaks — and carries no memory or config (`instances.md` §14). At creation, no code
+path in the repository wrote crew state to a remote store.
 
 ## Three problems
 
 **P1 — the bundle omits the conversations.** No component stages the transcript
 store `session_storage.py:7-10` documents (`<data home>/sessions/*.jsonl` +
-`sessions/archive/`, resolver `:277`; `<kiro home>/sessions/cli/<sid>.*`, resolver
+`sessions/archive/`, resolver `_crew_sessions_dir` in `session_storage_parts/store_layout.py`; `<kiro home>/sessions/cli/<sid>.*`, resolver
 `config/paths.py` (`kiro_sessions_dir`)). `uploads/` is excluded outright on the dashboard path
-(`portability.py:62`) and absent from `CORE_FILES`; `artifacts/` is in neither.
+(`EXCLUDE_DIRS` in `portability_archive.py`) and absent from `CORE_FILES`; `artifacts/` is in neither.
 Measured on one install: 385 MB irreplaceable (322 MB transcripts, 28 MB uploads,
 22 MB memory DBs, < 2 MB config + artifacts) against a ~30 MB bundle today. Small
 enough that full-bundle-per-run beats incremental.
 
 **P2 — one component ships a reference to state no component ships.**
-`CORE_FILES["config"]`:144 carries `session_map.json`, the join to kiro-cli
-sessions living outside the crew home (`session_transfer.py:16`), while neither
+`CORE_FILES["config"]` carries `session_map.json`, the join to kiro-cli
+sessions living outside the crew home (see the `dashboard/session_transfer.py` module docstring), while neither
 side of what it points at is staged; a `session_map` entry is load-bearing for
-storage reclamation (`state.py:3207`). The dashboard path takes the opposite
-position (`portability.py:54`). This RFC asserts no runtime consequence — M2
+storage reclamation in `DashboardState`. The dashboard path takes the opposite
+position (`session_map.json` is in `EXPORT_EXCLUDE` in `portability_archive.py`). This RFC asserts no runtime consequence — M2
 lands a fix or a test pinning current behavior. It is evidence that "what belongs
 in a bundle" was never settled between the two implementations.
 
@@ -98,7 +103,7 @@ scheduled.
 chokepoint), `create_private_bucket`:268 and `_harden_bucket`:215 (idempotent Block
 Public Access + `BucketOwnerEnforced` + SSE-AES256 + tags),
 `map_access_denied`:123, and `profiles.py` — a profile-*name* registry already
-consumed outside deploy (`apps/routes.py:310`), documented at `profiles.py:1` as
+consumed outside deploy (`handle_publish_providers`, `apps/routes_listing.py`), documented at `profiles.py:1` as
 names only, never keys. `boto3` is optional (`setup.cfg:110`, `voice` extra) and
 neither deploy nor cloud uses it. Follow that: shell out, add no hard dependency.
 
@@ -144,7 +149,7 @@ redaction — its payload is the operator's own recall, and filtering it would
 silently drop the thing being protected. `config` and `sessions` attach their
 policies to the same hook when they arrive.
 
-**D2 — a self-contained `memory` component.** `CORE_FILES["memory"]`:143 stages
+**D2 — a self-contained `memory` component.** `CORE_FILES["memory"]` stages
 `memory.db` + `memory_index.db`, which is where lessons actually live — 121
 `lesson.*` rows in `semantic_memory` alongside 486 `project.*`, 23 `user.*` and 5
 `pref.*` on the measured install, despite `learn.py:6` naming a
@@ -160,7 +165,7 @@ inherited.
 `sessions/archive/` + `uploads/` + `artifacts/`. The two-store split is an
 implementation detail and must not surface: a component backs up a session
 completely or does not claim to have backed it up. Its tree walk goes through the
-existing `_data_filter`:49 (traversal, symlink and hardlink rejection, `0o600`
+existing `_data_filter` in `snapshot_archive.py` (traversal, symlink and hardlink rejection, `0o600`
 pinning) rather than reimplementing those properties.
 
 **D4 — session fidelity is a tier.** Default `sessions` = crew transcripts +
@@ -307,16 +312,16 @@ off-host copy behaves exactly as today.
   sensitive-path floor as the pointer deciding which checkout the gateway executes,
   which is the existing precedent for "a pointer whose writer controls where
   privileged work goes".
-* **`sel_hmac.key` stays out.** `NEVER_SNAPSHOT_FILES`:46 excludes it so audit-log
+* **`sel_hmac.key` stays out.** `NEVER_SNAPSHOT_FILES` excludes it so audit-log
   HMACs stay bound to the host that wrote them. A backup must not become the
   mechanism that clones a trust root.
 * **A bundle's secret policy must be explicit per purpose, not implied by which
   filenames are on an allowlist.** Today both questions — what is in a bundle, and
   whether it is safe to hand to another person — are answered by the same
-  filename-matching gate: `is_sensitive_path` (`portability.py:156`) matches
+  filename-matching gate: `is_sensitive_path` (`security/paths.py`) matches
   credential *files*, and the config dataclass's own `sensitive=True` field metadata
   has no reader in either exporter. Whether the current gate delivers what
-  `portability.py:7` claims is under review through the channel in `SECURITY.md`,
+  the `portability.py` module docstring claims is under review through the channel in `SECURITY.md`,
   not in this document. The requirement this RFC takes on is structural: the seam
   exists (D1), a `purpose: share` bundle's freedom from credential material is
   asserted by test rather than argued from the allowlist, and a component that fails
@@ -346,6 +351,77 @@ off-host copy behaves exactly as today.
   bucket creation on first run. `deploy/iam.py` is not reusable as-is — it carries
   CloudFront permissions a backup has no business holding.
 * **Restore writes into a data home** and is therefore owner-authority only.
+
+## Platform support: where a staged body can be held, and where a kind is refused
+
+**Proposed, not shipped.** On main the snapshot kind is offered on every platform:
+`kind_unavailable_reason` in the AWS Control backup refuses only the sessions kind,
+and `test_snapshot_stays_available_on_every_platform` pins that. The withdrawal below
+is a proposal; the threat analysis stands, and
+[#13550](https://github.com/kirodotdev/KiroCrew/issues/13550) tracks the fix that
+would make the refusal unnecessary.
+
+This section records a proposed capability WITHDRAWAL, which is why it is here rather
+than in the milestones: on a platform without a staging mask the snapshot kind would be
+refused outright instead of uploading bytes whose provenance cannot be established.
+Recorded for review; nothing here is an approval.
+
+**The threat is a same-user writer, not another account.** Every upload body is staged
+in a directory the agent can write, so a name handed to the AWS CLI is a name that gets
+resolved again. A size from one resolution, the CLI's own `--body` open from another and
+a fingerprint from a third are three answers about three moments, and a process running
+as the same user that replaces the file between any two of them makes the stored object
+carry bytes nothing checked -- off-host, unattended, with no recall. Owner-only
+permissions do not address it, because the adversary already runs as the owner.
+
+**On POSIX the writer is removed rather than detected.** The sandbox builds a mount
+namespace and binds an empty directory over the staging leaf, so a confined process
+cannot reach the staged file at all. That is why the archive path is sound there: the
+file is created through a descriptor this app holds from birth, and the one writer that
+could rewrite the inode is absent by construction.
+
+**The snapshot kind cannot have that, on any platform, and on an unmasked one it has
+nothing else.** Its payload is created and closed BY NAME by `snapshot_main` and
+`snapshot.prepare_redacted_copy` before the backup path can open it, so the unguarded
+span is a whole snapshot build plus a redaction copy rather than an instant. Nothing
+available afterwards sees into that span: a same-user replacement is a regular file with
+one name and the right owner, which is all a late `open` can check, and the fingerprint
+and the upload then read that descriptor and agree with each other. Where the mask is in
+place the span is empty and the kind is unaffected.
+
+The refusal is keyed to the platform that has no mask MECHANISM at all. The predicate
+reads `IS_POSIX`, so Windows is where the kind reports itself unavailable before a run
+record exists rather than failing inside one. A POSIX host whose sandbox is off, or which
+has no backend, has no mask either, and that predicate does not tell it apart from a
+confined one: there the span is unguarded and the run is NOT refused. That residual case
+is recorded here rather than left to be found, and the producers-hold-the-payload fix
+below closes it for the same reason it restores Windows -- a body held from birth needs no
+mask to be trustworthy.
+
+**The honest consequence, stated rather than implied: Windows would be left with no backup
+kind at all.** The sessions archive kind is ALREADY refused there, and not by this
+decision -- it needs descriptor-pinned directory traversal (`openat`), which that
+platform does not provide, so walking agent-writable directories by name would leave a
+window in which a directory swapped for a link could be archived and uploaded. So a
+Windows host that can run a nightly snapshot backup today would run neither
+kind. Each refusal states its own capability and neither speaks for the other, which is
+also why the snapshot refusal's own message makes no claim about the archive kind: on
+the platform that reads it, that claim would be false.
+
+**Why refusing beats shipping the window.** An operator with no backup knows they have
+none. An operator with a substituted backup believes they are covered and finds out at
+restore, off-host, with nothing left to compare against. A digest taken after the
+transfer cannot convert the second case into the first, because a sent object cannot be
+recalled.
+
+**How the capability comes back.** The producers create their payload through a
+deny-write descriptor and hand it over, so the bytes are held from birth exactly as the
+archive path's are. That reaches roughly 90 call sites across a shared subsystem, which
+is why it is tracked separately in
+[#13550](https://github.com/kirodotdev/KiroCrew/issues/13550) rather than folded into
+the fix that closes the archive path. The predicate the refusal reads is named for the
+property and not for the platform, so a platform that gains an equivalent mask changes
+one line rather than every caller's condition.
 
 ## Alternatives considered
 

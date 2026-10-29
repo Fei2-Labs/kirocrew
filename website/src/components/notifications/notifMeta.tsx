@@ -1,4 +1,4 @@
-import { ClipboardList, Anchor, Heart, Bot, Lock, GitBranch, Bell, Clock, BookOpen } from 'lucide-react'
+import { ClipboardList, Anchor, Heart, Bot, Lock, GitBranch, Bell, Clock, BookOpen, Terminal, ArrowUpCircle } from 'lucide-react'
 import type { ReactNode } from 'react'
 
 import { i18nT } from '../../i18n/t'
@@ -74,13 +74,20 @@ export function dateGroup(d: Date): string {
  *  symmetry: these are the only labels these kinds have. */
 export const KIND_META: Record<string, { icon: ReactNode; color: string; label: string; borderColor: string }> = {
   cron:       { icon: <Clock className="lucide-inline" />, color: 'bg-accent/15 text-accent',  get label() { return i18nT('components.notifications.notifMeta.kind_cron_job') },     borderColor: 'border-l-accent' },
-  hook:       { icon: <Anchor className="lucide-inline" />, color: 'bg-info/15 text-info',      get label() { return i18nT('components.notifications.notifMeta.kind_webhook') },      borderColor: 'border-l-info' },
-  heartbeat:  { icon: <Heart className="lucide-inline" />, color: 'bg-ok/15 text-ok',          get label() { return i18nT('components.notifications.notifMeta.kind_heartbeat') },    borderColor: 'border-l-ok' },
-  agent:      { icon: <Bot className="lucide-inline" />, color: 'bg-info/15 text-info',      get label() { return i18nT('components.notifications.notifMeta.kind_agent') },        borderColor: 'border-l-info' },
-  approval:   { icon: <Lock className="lucide-inline" />, color: 'bg-warn/15 text-warn',      get label() { return i18nT('components.notifications.notifMeta.kind_approval') },     borderColor: 'border-l-warn' },
+  hook:       { icon: <Anchor className="lucide-inline" />, color: 'bg-info/15 text-info-text',      get label() { return i18nT('components.notifications.notifMeta.kind_webhook') },      borderColor: 'border-l-info' },
+  heartbeat:  { icon: <Heart className="lucide-inline" />, color: 'bg-ok/15 text-ok-text',          get label() { return i18nT('components.notifications.notifMeta.kind_heartbeat') },    borderColor: 'border-l-ok' },
+  agent:      { icon: <Bot className="lucide-inline" />, color: 'bg-info/15 text-info-text',      get label() { return i18nT('components.notifications.notifMeta.kind_agent') },        borderColor: 'border-l-info' },
+  approval:   { icon: <Lock className="lucide-inline" />, color: 'bg-warn/15 text-warn-text',      get label() { return i18nT('components.notifications.notifMeta.kind_approval') },     borderColor: 'border-l-warn' },
   subagent:   { icon: <GitBranch className="lucide-inline" />, color: 'bg-accent/15 text-accent',  get label() { return i18nT('components.notifications.notifMeta.kind_subagent') },     borderColor: 'border-l-accent' },
   taskrunner: { icon: <ClipboardList className="lucide-inline" />, color: 'bg-accent/15 text-accent',  get label() { return i18nT('components.notifications.notifMeta.kind_task_runner') }, borderColor: 'border-l-accent' },
-  skills:     { icon: <BookOpen className="lucide-inline" />, color: 'bg-warn/15 text-warn',      get label() { return i18nT('components.notifications.notifMeta.kind_skills') },       borderColor: 'border-l-warn' },
+  skills:     { icon: <BookOpen className="lucide-inline" />, color: 'bg-warn/15 text-warn-text',      get label() { return i18nT('components.notifications.notifMeta.kind_skills') },       borderColor: 'border-l-warn' },
+  terminal:   { icon: <Terminal className="lucide-inline" />, color: 'bg-warn/15 text-warn-text',      get label() { return i18nT('components.notifications.notifMeta.kind_terminal') },     borderColor: 'border-l-warn' },
+  // Both the gateway's own "a new Kiro Crew is out" notices and an installed
+  // app's "a new version is published" ones carry this kind, so the label is
+  // the generic noun rather than either source's wording. Informational tint:
+  // nothing is blocked and whatever is running keeps working on the version it
+  // has.
+  update:     { icon: <ArrowUpCircle className="lucide-inline" />, color: 'bg-info/15 text-info-text',      get label() { return i18nT('components.notifications.notifMeta.kind_update') },       borderColor: 'border-l-info' },
 }
 export const DEFAULT_META = { icon: <Bell className="lucide-inline" />, color: 'bg-muted/15 text-muted', get label() { return i18nT('components.notifications.notifMeta.kind_notification') }, borderColor: 'border-l-muted' }
 
@@ -253,24 +260,11 @@ export function fmtRelativeMinute(ts: string): string {
   return fmtRelativeLocalized(at, { now })
 }
 
-/** The mac-variant floating card material, split so the bell popover's rows
- *  and the in-app banner share the blur and hairline border while each picks
- *  its own tint and shadow (the banner floats over arbitrary page content and
- *  needs a denser tint and a deeper shadow than a row inside the sheet's
- *  scrim). Every consumer must also carry `notif-material`, the index.css hook
- *  that solidifies these surfaces where backdrop-filter is unsupported. */
-export const MAC_CARD_BLUR_CLASS = 'backdrop-blur-2xl backdrop-saturate-150'
-export const MAC_CARD_BORDER_CLASS = 'border border-[color-mix(in_srgb,var(--border)_55%,transparent)]'
-/** Popover rows: 72% card tint, the theme's medium elevation (inside the
- *  sheet's own scrim). Shadows are theme tokens (`--shadow-md` / `--shadow-lg`
- *  in index.css), which is what keeps them legible on both a light and a dark
- *  palette without a literal alpha here. */
-export const MAC_CARD_TINT_CLASS = 'bg-[color-mix(in_srgb,var(--card)_72%,transparent)]'
-export const MAC_CARD_SHADOW_CLASS = 'shadow-md'
-/** Banner cards: 88% card tint, the theme's large elevation (floating over
- *  arbitrary page content). */
-export const BANNER_CARD_TINT_CLASS = 'bg-[color-mix(in_srgb,var(--card)_88%,transparent)]'
-export const BANNER_CARD_SHADOW_CLASS = 'shadow-lg'
+/* The card material itself is `Glass` (components/Glass.tsx, the `panel`
+ * recipe): NotificationCard, the banner's deck shells and the feed's controls
+ * card are all that one pane. Every consumer still carries `notif-material`,
+ * the index.css hook that solidifies these surfaces to the card color where
+ * backdrop-filter is unsupported. */
 
 /** macOS NC action buttons: quiet translucent capsules, text-only, with any
  *  semantic tint on the LABEL (never a solid coloured fill). The `bg-[…]`

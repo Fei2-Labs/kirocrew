@@ -1237,11 +1237,18 @@ class TestNoBlockingRecordIoOnTheLoop:
         test states the rule instead of re-measuring a machine-dependent number.
         """
         import ast
+        import importlib
         import inspect
 
         from kiro_crew.dashboard.handlers import mcp as handler
 
-        tree = ast.parse(inspect.getsource(handler))
+        # The handler facade and its owners: the boot path imports every one of them.
+        tree = ast.parse(
+            "\n".join(
+                inspect.getsource(m)
+                for m in (handler, *map(importlib.import_module, handler._OWNERS))
+            )
+        )
         banned = {
             "kiro_crew.mcp_gateway.evaluate",
             "kiro_crew.mcp_gateway.preflight",
@@ -1668,11 +1675,17 @@ class TestBackendRecordsHazards:
         needs a live shared backend and a misbehaving server; the value here is
         catching a future edit that deletes the call while keeping the log line.
         """
+        import importlib
         from pathlib import Path as _Path
 
         import kiro_crew.mcp_gateway.backend as backend_mod
 
-        src = _Path(backend_mod.__file__).read_text(encoding="utf-8")
+        # The facade joined with its owners: the hazard sites live in the stdout
+        # pump's owner module, which the facade binds onto ``Backend``.
+        src = "".join(
+            _Path(importlib.import_module(name).__file__ or "").read_text(encoding="utf-8")
+            for name in (backend_mod.__name__, *backend_mod._BACKEND_OWNERS)
+        )
         assert src.count("self._record_hazard(") == 3, "expected exactly three hazard sites"
         assert "hazards.HAZARD_UNATTRIBUTABLE_NOTIFICATION" in src
         assert "hazards.HAZARD_UNROUTABLE_SERVER_REQUEST" in src

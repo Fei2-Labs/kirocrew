@@ -51,6 +51,7 @@ from kiro_crew.messaging import registry
 from kiro_crew.slack import gateway as gw
 from kiro_crew.slack import handler as slack_handler
 from kiro_crew.slack.gateway import GatewayOrchestrator
+from kiro_crew.testing.wait import await_until, finished
 
 # ------------------------------------------------------------------
 # Fixtures + helpers
@@ -75,8 +76,7 @@ def _bootable_types() -> tuple[str, ...]:
 
 def _self_attrs_assigned(func) -> set[str]:
     """Every ``self.<name>`` assigned (or annotated-assigned) in *func*."""
-    src = inspect.getsource(func)
-    tree = ast.parse(inspect.cleandoc(src) if src.startswith("def ") else _dedent(src))
+    tree = ast.parse(_dedent(inspect.getsource(func)))
     names: set[str] = set()
     for node in ast.walk(tree):
         targets: list[ast.expr] = []
@@ -109,9 +109,14 @@ def _orch_attrs_consumed(channel_type: str) -> set[str]:
     and a ``getattr(orch, "_x", default)`` with a literal name.
     """
     prefix = f"_{channel_type}_"
+    runtime = Path(gw.__file__).with_name("gateway_runtime")
     paths = [
         Path(gw.__file__).with_name("gateway.py").parent.parent / channel_type / "gateway.py",
         Path(gw.__file__),
+        # The constructor and the channel boot (hoists, transports) are composed
+        # into the facade from these owners.
+        runtime / "orchestrator_init.py",
+        runtime / "channel_boot.py",
     ]
     found: set[str] = set()
     for path in paths:
@@ -430,8 +435,8 @@ class TestRestartChannel:
                 patch.object(registry, "start_channels", close_then_start),
                 patch.object(cfg, "load_credentials", return_value={}),
             ):
-                result = await asyncio.wait_for(
-                    orch.restart_channel("whatsapp", cfg=cfg), timeout=5.0
+                result = await finished(
+                    orch.restart_channel("whatsapp", cfg=cfg), "restart_channel", timeout=5.0
                 )
             assert result is None
             assert "whatsapp" not in orch._channel_handles
@@ -464,7 +469,9 @@ class TestRestartChannel:
                 patch.object(cfg, "load_credentials", return_value={}),
             ):
                 assert (
-                    await asyncio.wait_for(orch.restart_channel("whatsapp", cfg=cfg), timeout=5.0)
+                    await finished(
+                        orch.restart_channel("whatsapp", cfg=cfg), "restart_channel", timeout=5.0
+                    )
                     is None
                 )
             assert orch.dashboard_state.channel_transports["whatsapp"] is newer
@@ -593,10 +600,12 @@ class TestBootKeyVsLiveKey:
 
         async def run():
             cfg = _cfg_with("whatsapp", enabled=False)
-            await asyncio.wait_for(
-                orch._on_channel_config_change(_change(cfg, "whatsapp.enabled")), 1
+            await finished(
+                orch._on_channel_config_change(_change(cfg, "whatsapp.enabled")),
+                "on_channel_config_change",
+                timeout=1,
             )
-            await asyncio.wait_for(started.wait(), 1)
+            await await_until(started, timeout=1)
             assert orch._channel_restart_tasks, "the reconnect is tracked while in flight"
             release.set()
             await orch.channel_restarts_settled()
@@ -1052,6 +1061,8 @@ class TestSlackApplierReconciles:
         assert names == {
             "GatewayOrchestrator.channel_restart",
             "GatewayOrchestrator.slack",
+            "GatewayOrchestrator.default_agent",
+            "GatewayOrchestrator.session_environments",
         }
 
 

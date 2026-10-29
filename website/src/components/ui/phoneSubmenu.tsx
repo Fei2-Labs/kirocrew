@@ -75,19 +75,35 @@ export const PhoneSubTriggerDiv = React.forwardRef<HTMLDivElement, PhoneSubTrigg
 )
 
 
-/** Inline submenu body rendered beneath its trigger when expanded. */
+const PHONE_SUB_CONTENT_UNCAPPED: React.CSSProperties = { maxHeight: 'none', overflow: 'visible' }
+
+/**
+ * Inline submenu body rendered beneath its trigger when expanded.
+ *
+ * It is never a scroll container of its own. The enclosing menu content is
+ * already capped to the available viewport height and scrolls, so a second,
+ * nested scroll box would stop at a row boundary with no visible cue: the list
+ * looks finished while the remaining rows sit behind an inner scroll that
+ * scrolling the menu never reveals. Callers size their submenu for the desktop
+ * flyout (`max-h-[280px] overflow-y-auto` and the like), so those caps are
+ * overridden here rather than at each caller.
+ */
 export const PhoneSubContentDiv = React.forwardRef<
   HTMLDivElement,
   React.HTMLAttributes<HTMLDivElement>
->(function PhoneSubContentDiv({ className, children, ...rest }, ref) {
+>(function PhoneSubContentDiv({ className, children, style, ...rest }, ref) {
   return (
     <div
       {...rest}
       ref={ref}
       className={cn(
-        'mt-1 ml-3 border-l border-border pl-2 space-y-0.5 overflow-y-auto overscroll-contain rounded-md bg-bg-elevated p-1',
+        'mt-1 ml-3 border-l border-border pl-2 space-y-0.5 rounded-md bg-bg-elevated p-1',
         className,
       )}
+      // Inline style, not utility classes: class merging does not reliably drop
+      // a caller's arbitrary-value cap such as `max-h-[280px]`, and an inline
+      // declaration wins over any class without depending on stylesheet order.
+      style={{ ...style, ...PHONE_SUB_CONTENT_UNCAPPED }}
     >
       {children}
     </div>

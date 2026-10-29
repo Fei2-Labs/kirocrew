@@ -125,11 +125,13 @@ renders in the same themed iframe:
 The opening tag takes two attributes: `title=` and `slug=`. A `slug=` binds the
 impression to an artifact that already exists and suppresses registration; omit
 it for new content.
+Put `<mcwidget>` on its own line after a blank line, never glued to a closing ``` fence.
 
 ## Every widget is already an artifact
 
 Each finalized `<mcwidget>` without `slug=` is auto-registered on the backend,
-keyed idempotently by message timestamp and widget index, even if never viewed.
+keyed idempotently by message timestamp and a fingerprint of the widget body
+(two identical bodies in one message are one artifact), even if never viewed.
 Incognito and temporary sessions never register widgets. Unpinned auto-registered
 widgets are pruned oldest-first past 200; the user's star keeps one out of the sweep.
 
@@ -175,10 +177,10 @@ Rules:
   compiles at runtime is dead on arrival). Pass every value the widget needs
   in its HTML; a widget cannot fetch its own data. A silently blank widget is
   usually one of these.
-- The dashboard sanitizes CSS via `src/lib/cssSanitize.ts` (shared with
-  `WidgetFrame.tsx`) — a small allowlist of properties plus a denylist of
-  dangerous functions (`expression()`, `javascript:`, `url(` with external
-  schemes). Write clean CSS and you'll be fine.
+- Your widget's own CSS is NOT sanitized: the CSP above is the only
+  control on it. `website/src/lib/cssSanitize.ts` filters only the theme
+  variable VALUES the dashboard injects into the frame, so do not rely on
+  it to strip anything you write.
 
 ## Links
 
@@ -210,6 +212,42 @@ When the visible label can be made shorter than the URL (e.g. a long doc
 title), use a meaningful label (`<a href="…">Migration design doc</a>`)
 rather than dumping the raw URL.
 
+## Animation
+
+Move only when the motion itself carries information. The test: freeze one
+frame. If the meaning survives, keep it still.
+
+| Content | Animate? | Example |
+|---|---|---|
+| Change over time | Yes | a CI queue growing |
+| Steps in order | Yes | one request walking the stack |
+| Things flowing | Yes | messages entering a queue |
+| Before / after | Yes | old vs new layout |
+| Space, 3D | Yes | an architecture diagram turning |
+| The user asked for animation | Yes | a playful scene |
+| Lookups, tables | No | a PR list |
+| Code, prose | No | a diff, a report |
+| Something watched all day | No | a status panel |
+
+Every animation:
+
+- Has a play / pause control, unless it runs under ~5 seconds and stops.
+- Honours `matchMedia('(prefers-reduced-motion: reduce)')`: show an
+  equal still version instead, such as every step labelled side by side.
+- Stops when it is done. Only small decorative loops may run forever.
+- On Canvas, uses `requestAnimationFrame` and sizes the canvas to
+  `devicePixelRatio`, so it stays sharp and pauses in a hidden tab.
+- Carries every value it needs in the HTML: the frame blocks runtime
+  fetches (see Rules).
+
+How to move is the `living-ui` skill's job. Once the test above says move,
+load it: it covers how motion feels, where the eye goes, where words sit,
+keyboard and screen-reader use, and how to check the result before you show
+it. It never picks a colour, a font or a shape.
+
+If the user wants to take it elsewhere (a slide, Slack, an email), a widget is
+the wrong container: render a video or GIF file instead.
+
 ## Interactive widgets
 
 Widgets can send events back to the agent. Add `data-action` and an
@@ -219,14 +257,18 @@ optional `data-payload` (JSON string) attribute to any clickable element:
 <button data-action="approve" data-payload='{"id":"123"}'>Approve</button>
 ```
 
-When clicked, the dashboard auto-submits a user message of the form
-`[UI] approve: {"id":"123"}`. The agent receives it as a normal message
-and can respond with text, a new widget, or both.
+When clicked, the dashboard PRE-FILLS the chat composer with a message of
+the form `[UI] approve: {"id":"123"}`; it never sends it on its own. The
+user reviews the text and presses send, and only then does the agent
+receive it as a normal message and respond with text, a new widget, or
+both. Do not tell the user a click "submits" anything, and do not wait on a
+click as if it were a reply: nothing arrives until they send.
 
-Form inputs with `name` attributes are auto-collected on click and
-merged into the payload as `formData`. Use this for creation forms:
-render pre-filled `<input>` / `<select>` elements, the user adjusts
-values, clicks submit, and the agent receives every field.
+Form inputs (`<input>`, `<select>`, `<textarea>`) carrying a `name` (or
+`id`, or `data-field`) are auto-collected on click and merged into the payload as
+`formData`. Use this for creation forms: render pre-filled elements, the
+user adjusts values, clicks the action button, then sends the pre-filled
+message, and the agent receives every field.
 
 Styling for interactive controls (consistent with the dashboard chrome):
 

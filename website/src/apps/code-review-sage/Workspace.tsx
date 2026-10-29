@@ -74,6 +74,7 @@ const RAIL_COLLAPSE: CollapseConfig = {
  */
 function railPaneLabel(view: MainView, listTab: ListTab): string {
   if (view === 'reviews') {
+    if (listTab === 'queue') return i18nT('apps.codeReviewSage.components.reviewQueue.tab')
     return i18nT(listTab === 'reviews'
       ? 'apps.codeReviewSage.components.middleColumn.reviews'
       : 'apps.codeReviewSage.components.middleColumn.pull_requests')

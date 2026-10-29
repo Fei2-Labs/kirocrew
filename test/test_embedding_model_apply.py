@@ -383,12 +383,21 @@ class TestNonObjectJsonBody:
     """
 
     def _request(self, payload):
-        class _Req:
+        from types import SimpleNamespace
+
+        # The route is owner-gated: model the dashboard owner's request, which
+        # carries ``app == ""`` and the configured owner's subject.
+        class _Req(dict):
             headers: dict = {}
+            # A real request always exposes both; ``read_bounded_json``
+            # reads them to decide a body is present and declares JSON.
+            can_read_body = True
+            content_type = "application/json"
 
             def __init__(self, p):
+                super().__init__(app="", user="owner-subject")
                 self._p = p
-                self.app = {"state": object()}
+                self.app = {"state": SimpleNamespace(owner_id="owner-subject")}
 
             async def json(self):
                 return self._p
@@ -739,7 +748,7 @@ class TestCommitTimeGenerationCheck:
         import inspect
         import textwrap
 
-        for fn in (VectorMemoryStore.write_episodic, VectorMemoryStore.write_lesson):
+        for fn in (VectorMemoryStore.write_episodic_outcome, VectorMemoryStore.write_lesson):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
             parents = {
                 child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)

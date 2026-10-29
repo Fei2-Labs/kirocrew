@@ -26,6 +26,7 @@ from kiro_crew.cloud.fargate.taskdef import (
     secret_destinations_for,
 )
 from kiro_crew.cloud.fargate_engine import TaskBounds
+from kiro_crew.cloud.microvm.config import MicroVmConfig
 from kiro_crew.config.loader import config_dir
 
 logger = logging.getLogger(__name__)
@@ -116,6 +117,44 @@ class FargateConfig:
     #: False is the safe direction, and the flag is not the boundary -- a task in
     #: a public subnet with no NAT gateway cannot pull its image without one.
     assign_public_ip: bool = False
+    #: Whether this lane runs the operator's OWN crews, with the operator bearing the
+    #: risk of what those crews read. False means not claimed, which is the safe
+    #: direction.
+    #:
+    #: It is the only key in this block that LOOSENS anything, and it is here rather
+    #: than anywhere else in the product because it is a statement only the operator
+    #: can make and this file is the one they own. Nothing in the product writes it.
+    #:
+    #: What it unlocks. The crew container is sandboxed-only: kiro-cli sandboxes the
+    #: model subprocess in an unprivileged user namespace, Fargate's default seccomp
+    #: profile denies one, and no task-definition field can supply it -- no
+    #: ``privileged``, no ``dockerSecurityOptions``, and ``linuxParameters`` admits
+    #: only ``CAP_SYS_PTRACE``. Measured on a real task, which exited 1 at startup.
+    #: With this claimed, the launcher writes ``SMC_INTERNAL_ONLY`` into the task and
+    #: the container starts with the model subprocess UNSANDBOXED.
+    #:
+    #: What claiming it accepts. That worker auto-approves every tool it calls, and it
+    #: runs as a child of the backend under the same uid; the backend must be able to
+    #: decrypt the crew's vault to answer the engine's token request, so the worker can
+    #: reach the model credential. Moving the credential out of its environment does
+    #: not change that -- measured, a uid-1000 process reads and decrypts that vault
+    #: directly.
+    #:
+    #: The accepted exposure is bigger than the name suggests, so do not read it as "no
+    #: untrusted input reaches this task". A crew reads untrusted CONTENT in the ordinary
+    #: course of its work -- tool output, a fetched web page, a connector or API payload,
+    #: text someone else wrote -- any of which can carry an injection, and all of which
+    #: reach the worker whoever sent the prompt. So with this set, a worker injected
+    #: through any of those routes can read the model credential. The operator accepts
+    #: that on their own crews, where the credential at risk and the account it belongs
+    #: to are theirs; it is a judgement about who bears the risk, not a claim that
+    #: injection cannot happen. A user namespace is the real containment; a
+    #: Firecracker-based runtime is the answer for multi-tenant or external callers.
+    #:
+    #: Deliberately NOT part of :meth:`is_complete`. A lane that does not claim it is
+    #: a complete, usable lane -- it simply cannot run on a host with no user
+    #: namespace, which is the behaviour every lane had before this key existed.
+    internal_only: bool = False
     #: How long one of this lane's tasks may run before the launcher stops it, in
     #: seconds, or ``None`` when the operator did not say.
     #:
@@ -255,10 +294,11 @@ class FargateConfig:
         entry: silently launching with one fewer secret than the operator wrote is
         how a task starts and then fails on a missing variable.
 
-        ``assign_public_ip`` is read the same way: absent means ``False``, and a
-        present value that is not a JSON boolean drops the block. The field decides
-        network exposure, and coercing it would read the string ``"false"`` as
-        true, which is the one direction this field must never be guessed in.
+        Every ``bool`` field is read the same way: absent takes the dataclass's own
+        default, and a present value that is not a JSON boolean drops the block. They
+        decide network exposure (``assign_public_ip``) and the trust boundary
+        (``internal_only``), and coercing would read the string ``"false"`` as true,
+        which is the one direction those fields must never be guessed in.
         """
         if not isinstance(data, dict):
             return None
@@ -275,9 +315,24 @@ class FargateConfig:
             if len(name) > _MAX_STRING_LEN or len(arn) > _MAX_STRING_LEN:
                 return None
             secrets.append((name, arn))
-        assign_public_ip = data.get("assign_public_ip", False)
-        if not isinstance(assign_public_ip, bool):
-            return None
+        # EVERY bool-typed field, in one place, derived from the dataclass -- the same
+        # discipline the string and int loops below use, and for the reason this module
+        # already records one field over: a hand-written branch per field is what let
+        # `cluster` keep coercing with `str()` after `assign_public_ip` was fixed. A
+        # present value that is not a JSON boolean drops the WHOLE block, because
+        # coercing would read the string "false" as true, and these fields decide network
+        # exposure and the trust boundary -- the two directions a value must never be
+        # guessed in. `_ABSENT` tells apart "not written" from an explicit `null`, so
+        # `internal_only: null` drops the block exactly as `assign_public_ip: null` does.
+        booleans: dict[str, bool] = {}
+        for field_name, bool_default in _BOOL_FIELD_DEFAULTS.items():
+            raw_bool = data.get(field_name, _ABSENT)
+            if raw_bool is _ABSENT:
+                booleans[field_name] = bool_default
+                continue
+            if not isinstance(raw_bool, bool):
+                return None
+            booleans[field_name] = raw_bool
         # The bound numbers, under the same discipline and for the same reason. ABSENT
         # means the operator did not say, so the engine's own default applies; a PRESENT
         # value of the wrong JSON type drops the whole block. The two are told apart by
@@ -325,15 +380,14 @@ class FargateConfig:
             return None
         # ONE splat, not two. mypy resolves a ``**`` argument against every parameter it
         # could reach, so two splats of different value types are each checked against
-        # the other's fields and both are reported. Merging keeps both derivations
-        # intact: the string defaults and the bound names are still read from the
-        # dataclass rather than listed at this call site.
-        derived: dict[str, Any] = {**strings, **numbers}
+        # the other's fields and both are reported. Merging keeps every derivation
+        # intact: the string defaults, the boolean defaults and the bound names are all
+        # still read from the dataclass rather than listed at this call site.
+        derived: dict[str, Any] = {**strings, **booleans, **numbers}
         candidate = cls(
             subnets=subnets,
             security_groups=security_groups,
             secrets=tuple(secrets),
-            assign_public_ip=assign_public_ip,
             **derived,
         )
         return candidate if candidate.is_complete() else None
@@ -376,6 +430,27 @@ def _string_field_defaults() -> dict[str, str]:
     }
 
 
+def _bool_field_defaults() -> dict[str, bool]:
+    """Every ``bool``-typed field on :class:`FargateConfig`, with its default.
+
+    Derived for the reason :func:`_string_field_defaults` gives, and that reason is not
+    hypothetical here: ``assign_public_ip`` was read by a hand-written branch of its own,
+    and ``internal_only`` -- a field that decides a trust boundary -- would have arrived
+    beside it as a second branch free to disagree. One loop over this mapping means a
+    boolean added later gets the same refusal and is covered by the same test, with
+    nothing to remember.
+
+    ``f.type`` is compared against both the string and the object because this module
+    carries ``from __future__ import annotations``, which makes every annotation a
+    string today -- the same pair its siblings compare for.
+    """
+    return {
+        f.name: f.default
+        for f in fields(FargateConfig)
+        if f.type in ("bool", bool) and isinstance(f.default, bool)
+    }
+
+
 def _int_field_names() -> tuple[str, ...]:
     """Every optional whole-number field on :class:`FargateConfig`, in declaration order.
 
@@ -397,6 +472,7 @@ def _int_field_names() -> tuple[str, ...]:
 
 
 _STRING_FIELD_DEFAULTS = _string_field_defaults()
+_BOOL_FIELD_DEFAULTS = _bool_field_defaults()
 _INT_FIELD_NAMES = _int_field_names()
 
 
@@ -484,6 +560,11 @@ class CloudConfig:
     #: while it is half-finished. Whether the block is usable is
     #: :meth:`fargate_config`'s question.
     fargate: Any = None
+    #: The ``microvm`` block EXACTLY as read from the file, or ``None`` when the file
+    #: has none. Kept raw for the reason :attr:`fargate` is: a reader sees what the
+    #: operator wrote even while it is half-finished, and whether the block is usable
+    #: is :meth:`microvm_config`'s question.
+    microvm: Any = None
 
     def fargate_config(self) -> Optional[FargateConfig]:
         """The Fargate block as a typed config, or ``None`` when it is not complete.
@@ -494,6 +575,17 @@ class CloudConfig:
         round-trips untouched and the seam still sees complete-or-absent.
         """
         return FargateConfig.from_mapping(self.fargate)
+
+    def microvm_config(self) -> Optional[MicroVmConfig]:
+        """The MicroVM block as a typed config, or ``None`` when it is not complete.
+
+        Same contract as :meth:`fargate_config`, and the same reason for it: ``None``
+        keeps the lane UNREGISTERED, so an operator who has not filled the block in is
+        never offered a lane that would refuse them. Judged on every call rather than
+        once at load, so an edit takes effect on the next request instead of the next
+        gateway restart.
+        """
+        return MicroVmConfig.from_mapping(self.microvm)
 
     @classmethod
     def load(cls, path: Optional[Path] = None) -> "CloudConfig":
@@ -582,5 +674,7 @@ class CloudConfig:
             # carried as written and judged by fargate_config() at the point of use, so an
             # operator's half-finished edit reads back as the bytes they wrote.
             fargate=data.get("fargate"),
+            # Deliberately NOT sanitized here either, for the reason above.
+            microvm=data.get("microvm"),
         )
         return record, None

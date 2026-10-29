@@ -166,18 +166,70 @@ reaches the dashboard on a *different* local port than the remote, opt that loca
 port into the CSRF allowlist — see
 [remote-and-mobile.md](remote-and-mobile.md#2-reach-it-from-a-laptop-or-phone).
 
+### Set-up pre-flight: credential helper not found, or plugin refused
+
+The **Set up a new one** pre-flight runs the AWS CLI from the gateway, and a
+gateway started from the Dock or Finder has a minimal `PATH`.
+
+- **"The AWS CLI could not find `<name>` on the gateway's PATH."** Your profile's
+  `credential_process` runs `<name>` by bare name, and it lives somewhere that
+  `PATH` does not reach (for example `~/.toolbox/bin` or `~/.local/bin`). Give it its
+  full path in `~/.aws/config`, e.g.
+  `credential_process = /Users/you/.local/bin/sso-cred-helper --profile work`, then
+  re-check.
+- **"Found at `<path>`, but … will not run it: `<reason>`."** The Session Manager
+  plugin is installed, but it failed the ownership check every program that
+  receives your AWS credentials must pass, so reinstalling it the same way does not
+  help. AWS's macOS package installs `/usr/local/sessionmanagerplugin` owned by its
+  build account, and for that case the row offers the fix: `sudo chown -R root:wheel
+  /usr/local/sessionmanagerplugin`. Run it only for a plugin that came from AWS.
+  Making the folder root-owned makes whatever binary is in it a trusted receiver
+  of your AWS credentials, and the account named in the reason could have replaced
+  that binary. If you did not install the plugin from AWS yourself, or are not
+  sure, reinstall it from
+  [AWS's install page](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+  first, then run the command. `kirocrew cloud doctor` reports the same.
+- **"Your AWS credentials were not checked. Found at `<path>`, but … will not
+  run it: `<reason>`."** The same check refused the `aws` binary at the path the row names,
+  so the credentials row says why instead of "not found", and reinstalling the CLI
+  the same way does not help. No command is offered. For a root gateway, start it
+  from a regular account. For any other reason except "belongs to another user
+  account", fix the ownership or permissions the reason names, then re-check.
+  `kirocrew cloud doctor` reports it on its `aws CLI` line.
+- **"… belongs to another user account …"** (either row). The file, or a folder
+  above it, belongs to an account on that computer that is neither root nor the
+  account Kiro Crew runs as, for example a Homebrew managed by a second account
+  (Workbrew). Do not make that file root-owned: that account could have replaced it.
+  Install a separate copy with AWS's own installer
+  ([AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),
+  [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)),
+  then re-check: Kiro Crew looks in `/opt/homebrew/bin` and then `/usr/local/bin`,
+  and runs the first copy that, with every folder above it, belongs to root or to
+  Kiro Crew's own account. If the plugin row then offers the `chown` command above,
+  run it. If the new copy's reason starts `executable parent`, a folder above it
+  belongs to the other account (on an Intel Mac whose Homebrew a second account
+  runs, that is `/usr/local/bin`). An administrator must make root its owner and
+  only writer:
+  `sudo chown root:wheel /usr/local/bin && sudo chmod 755 /usr/local/bin`. That
+  account's Homebrew can then no longer add programs there, so agree it with
+  whoever manages it.
+
 ### Non-fatal warnings you can ignore
 
 - **`ffmpeg: not found`**: only needed for speech-to-text. Install ffmpeg into
   `/usr/local/bin` (a location Kiro Crew searches; it's not in the AL2023 repos),
   or fetch a decoder from the dashboard Speech-to-Text card
   (Settings → Speech-to-Text, then Download now).
-- **`Vector Memory … vendored runtime failed to load`** — the in-process embedding
-  runtime couldn't load its shared library on this host; memory falls back
-  gracefully and keeps working. Safe to ignore unless you specifically rely on
-  local vector memory.
 - **`source dir: not set`** — cosmetic. It is set from a Kiro Crew source
   checkout by `kirocrew setup`; wheel installs do not need it.
+
+### A warning doctor counts as an issue
+
+- **`Vector Memory … vendored runtime failed to load`** — the in-process embedding
+  runtime couldn't load its shared library on this host. Doctor counts this as an
+  issue. Memory keeps working through the keyword-search fallback, without vector
+  recall. If doctor also names missing native libs, the install is incomplete:
+  reinstall Kiro Crew from a current release.
 
 ## Related
 

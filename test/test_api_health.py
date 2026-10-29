@@ -74,6 +74,58 @@ async def test_direct_local_health_with_served_host_keeps_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_local_health_carries_the_gateway_id() -> None:
+    """Remote Crew chaining reads this field through the loopback end of a tunnel
+    it just opened, which IS a direct-local request, to tell whether the far end is
+    this gateway (a loop) or a different one."""
+    from kiro_crew.gateway_identity import gateway_id
+
+    req = _probe_req(headers={"Host": "127.0.0.1:5476"})
+    req.app = {"allowed_origins": {"http://localhost:5476"}}
+    resp = await core_mod.api_health(req)
+    body = json.loads(resp.body)
+    assert body["gateway_id"] == gateway_id()
+    assert len(body["gateway_id"]) == 32
+
+
+@pytest.mark.asyncio
+async def test_the_identity_read_does_not_run_on_the_event_loop() -> None:
+    """The first read on a fresh data home mints the identity file, and this is the
+    most-polled route there is, so a stalled filesystem here would stall the loop
+    that answers every other request."""
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+
+    def recording_gateway_id() -> str:
+        seen.append(threading.get_ident())
+        return "f" * 32
+
+    req = _probe_req(headers={"Host": "127.0.0.1:5476"})
+    req.app = {"allowed_origins": {"http://localhost:5476"}}
+    with patch.object(core_mod, "gateway_id", recording_gateway_id):
+        resp = await core_mod.api_health(req)
+
+    assert json.loads(resp.body)["gateway_id"] == "f" * 32
+    assert seen, "the identity was never read, so this test proves nothing"
+    assert loop_thread not in seen, "filesystem work ran on the event loop thread"
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_id_rides_the_same_gate_as_the_version() -> None:
+    """It is an identity fingerprint, so it belongs behind the direct-local check
+    rather than on the public probe boundary — the same reasoning that keeps the
+    exact version off it."""
+    anonymous = await core_mod.api_health(_probe_req("203.0.113.9"))
+    assert "gateway_id" not in json.loads(anonymous.body)
+
+    rebound = _probe_req(headers={"Host": "attacker.example"})
+    rebound.app = {"allowed_origins": {"http://localhost:5476"}}
+    assert "gateway_id" not in json.loads((await core_mod.api_health(rebound)).body)
+
+
+@pytest.mark.asyncio
 async def test_forwarded_loopback_health_omits_build_identity() -> None:
     """A reverse-proxied remote request is not treated as desktop-local."""
     resp = await core_mod.api_health(_probe_req(headers={"X-Forwarded-For": "203.0.113.9"}))
@@ -405,17 +457,43 @@ async def test_allowed_host_non_probe_passes_host_barrier() -> None:
         assert resp.status == 200
 
 
+def _entrypoint_and_chain_source(func) -> str:
+    """An entrypoint's source with the ``server_runtime`` chain installer it calls.
+
+    Each entrypoint builds its refusing barriers from the shared factories and hands
+    them to ``server_runtime.middleware_chain``, which holds the ordered chain and
+    the ``sel_audit_middleware`` closure, so a wiring pin reads both: the installer's
+    source replaces the call, so the keyword arguments of the call do not stand in
+    for the chain's own list entries.
+    """
+    import inspect
+
+    from kiro_crew.dashboard import server as server_mod
+
+    installer = {
+        "start_dashboard": server_mod._install_dashboard_middlewares,
+        "start_api_server": server_mod._install_api_middlewares,
+    }[func.__name__]
+    src = inspect.getsource(func)
+    assert f"{installer.__name__}(" in src, f"{func.__name__} no longer installs its chain"
+    start = src.index(f"{installer.__name__}(")
+    depth = 0
+    for end in range(start, len(src)):
+        depth += {"(": 1, ")": -1}.get(src[end], 0)
+        if src[end] == ")" and depth == 0:
+            break
+    return src[:start] + inspect.getsource(installer) + src[end + 1 :]
+
+
 def test_both_servers_install_the_shared_host_barrier() -> None:
     """Wiring pin: BOTH entrypoints must build their Host barrier from the
     shared factory (the single exemption point the chain tests above cover),
     and neither may re-grow a private inline copy that could drop or widen
     the exemption independently."""
-    import inspect
-
     from kiro_crew.dashboard import server as server_mod
 
-    dashboard_src = inspect.getsource(server_mod.start_dashboard)
-    api_src = inspect.getsource(server_mod.start_api_server)
+    dashboard_src = _entrypoint_and_chain_source(server_mod.start_dashboard)
+    api_src = _entrypoint_and_chain_source(server_mod.start_api_server)
     for src, name in ((dashboard_src, "start_dashboard"), (api_src, "start_api_server")):
         assert (
             "_make_host_validation_middleware(" in src
@@ -434,15 +512,13 @@ def test_both_servers_install_the_shared_deny_audit_boundary() -> None:
     on one entrypoint only, the headless server would silently keep the old
     per-site guarantee while the dashboard had the structural one — the exact
     drift the shared factories exist to prevent."""
-    import inspect
-
     from kiro_crew.dashboard import server as server_mod
 
     for func, name in (
         (server_mod.start_dashboard, "start_dashboard"),
         (server_mod.start_api_server, "start_api_server"),
     ):
-        src = inspect.getsource(func)
+        src = _entrypoint_and_chain_source(func)
         assert (
             "_make_deny_audit_middleware(" in src
         ), f"{name} no longer installs the shared deny-audit boundary"
@@ -514,7 +590,7 @@ def test_every_middleware_denial_is_audited_off_the_loop() -> None:
         (server_mod.start_dashboard, "start_dashboard"),
         (server_mod.start_api_server, "start_api_server"),
     ):
-        assert 'outcome="denied"' not in inspect.getsource(func), (
+        assert 'outcome="denied"' not in _entrypoint_and_chain_source(func), (
             f"{name} re-grew a hand-rolled denial audit; route it through "
             "_audit_denied so the best-effort property holds "
             "(sel_audit_middleware's ok/error request audit is unaffected)"
@@ -531,7 +607,7 @@ def test_every_middleware_denial_is_audited_off_the_loop() -> None:
         (server_mod.start_dashboard, "start_dashboard"),
         (server_mod.start_api_server, "start_api_server"),
     ):
-        src = inspect.getsource(func)
+        src = _entrypoint_and_chain_source(func)
         assert "mark_audit_claimed(request)" in src, (
             f"{name}'s sel_audit_middleware no longer claims the requests it "
             "logs; the deny-audit boundary would double-record refusals it owns"
@@ -830,6 +906,189 @@ async def test_the_record_names_the_authenticated_caller_not_the_static_label(
         assert denials[0]["caller"] == expected, f"{identity!r} recorded as {denials[0]['caller']}"
 
 
+# ── Forwarded requests are filed under their own name ────────────────────────
+# The gateway binds loopback, so remote access arrives through a same-host
+# forwarder (a tunnel, a sidecar, a reverse proxy) presenting the credential it
+# was handed. With the owner's cookie that was indistinguishable from the owner
+# at the keyboard: every such request was recorded as flat ``dashboard_user``,
+# so the log could not answer the one question an operator asks afterwards.
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP"],
+)
+def test_audit_actor_marks_a_request_that_arrived_through_a_forwarder(header: str) -> None:
+    """Any forwarding header renames the actor; each one is tested, not just one.
+
+    A forwarder chooses which of these it sets, so reading only ``X-Forwarded-For``
+    would leave a real product path recorded as the person. The list is
+    ``origin._PROXY_FORWARD_HEADERS`` -- the same one the direct-local and
+    proxied predicates already trust.
+    """
+    from aiohttp.test_utils import make_mocked_request
+
+    from kiro_crew.dashboard import server as server_mod
+
+    request = make_mocked_request("POST", "/api/sessions", headers={header: "203.0.113.7"})
+    assert server_mod.audit_actor(request, "dashboard_user") == "dashboard_user_via_proxy"
+
+
+def test_audit_actor_leaves_a_direct_request_under_its_own_label() -> None:
+    """Negative control: with no forwarding header the recorded name is unchanged.
+
+    Without this, a helper that suffixed unconditionally would pass every test
+    above while relabelling the owner's own actions -- which destroys exactly the
+    distinction the suffix exists to draw.
+    """
+    from aiohttp.test_utils import make_mocked_request
+
+    from kiro_crew.dashboard import server as server_mod
+
+    request = make_mocked_request("POST", "/api/sessions")
+    assert server_mod.audit_actor(request, "dashboard_user") == "dashboard_user"
+    assert server_mod.audit_actor(request, "mcp_tool") == "mcp_tool"
+
+
+def test_audit_actor_files_an_app_token_request_under_the_app() -> None:
+    """An app call is recorded as the app, not as the person whose server it is.
+
+    ``token_auth_middleware`` publishes the ``app`` claim, and the record names the
+    app that acted. ``""`` is the dashboard user's own claim and keeps the label.
+    """
+    from aiohttp.test_utils import make_mocked_request
+
+    from kiro_crew.dashboard import server as server_mod
+
+    app_request = make_mocked_request("POST", "/api/chat/slots/s1/regenerate")
+    app_request["app"] = "crew-keyboard"
+    assert server_mod.audit_actor(app_request, "dashboard_user") == "crew-keyboard"
+
+    forwarded = make_mocked_request(
+        "POST", "/api/chat/slots/s1/regenerate", headers={"X-Forwarded-For": "203.0.113.7"}
+    )
+    forwarded["app"] = "crew-keyboard"
+    assert server_mod.audit_actor(forwarded, "dashboard_user") == "crew-keyboard_via_proxy"
+
+    person = make_mocked_request("POST", "/api/chat/slots/s1/regenerate")
+    person["app"] = ""
+    assert server_mod.audit_actor(person, "dashboard_user") == "dashboard_user"
+
+
+def test_audit_actor_keeps_the_transport_of_an_internal_call_made_for_an_app() -> None:
+    """A managed tool call by an app's agent is not filed as the app's own client.
+
+    On the internal-secret transport ``token_auth_middleware`` derives the ``app``
+    claim from the calling session. The record keeps the transport label beside
+    the app, so it stays distinct from a direct call with the app's token.
+    """
+    from aiohttp.test_utils import make_mocked_request
+
+    from kiro_crew.dashboard import server as server_mod
+
+    internal = make_mocked_request("POST", "/api/chat/slots/s1/note")
+    internal["app"] = "crew-keyboard"
+    internal["internal_auth"] = True
+    assert server_mod.audit_actor(internal, "mcp_tool") == "mcp_tool:crew-keyboard"
+
+    direct = make_mocked_request("POST", "/api/chat/slots/s1/note")
+    direct["app"] = "crew-keyboard"
+    assert server_mod.audit_actor(direct, "mcp_tool") == "crew-keyboard"
+
+
+@pytest.mark.asyncio
+async def test_a_forwarded_refusal_is_not_recorded_as_the_person(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through a real chain: the denial record separates forwarded from direct.
+
+    The two rows must differ. Asserting only the forwarded spelling would pass
+    for a chain that renamed both, which is why the direct request is asserted in
+    the same test rather than trusted from elsewhere.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.dashboard import server as server_mod
+
+    @web.middleware
+    async def ws_origin_refuses(request: web.Request, handler: object) -> web.StreamResponse:
+        raise web.HTTPForbidden(text="WebSocket origin not allowed")
+
+    recorded: dict[str, str] = {}
+    for label, headers in (("forwarded", {"X-Forwarded-For": "203.0.113.7"}), ("direct", {})):
+        spy = _SelSpy()
+        monkeypatch.setattr(server_mod, "sel", lambda s=spy: s)
+        app = _boundary_app(ws_origin_refuses)
+        async with TestClient(TestServer(app)) as client:
+            assert (await client.get("/api/sessions", headers=headers)).status == 403
+        denials = spy.denials()
+        assert len(denials) == 1, f"{label}: {spy.calls}"
+        recorded[label] = denials[0]["caller"]
+
+    assert recorded["direct"] == "dashboard_user"
+    assert recorded["forwarded"] == "dashboard_user_via_proxy"
+
+
+@pytest.mark.asyncio
+async def test_a_forwarded_refusal_keeps_the_authenticated_identity_it_renames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two attributions compose: the forwarder marker rides the real identity.
+
+    Suffixing the static label only would lose the person on exactly the
+    requests that carry one, and reporting the identity only would lose the
+    forwarder. A record needs both to be worth reading.
+    """
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.dashboard import server as server_mod
+
+    @web.middleware
+    async def sets_identity(request: web.Request, handler: object) -> web.StreamResponse:
+        request["app"] = ""
+        request["user"] = "alice"
+        return await handler(request)  # type: ignore[operator]
+
+    @web.middleware
+    async def ws_origin_refuses(request: web.Request, handler: object) -> web.StreamResponse:
+        raise web.HTTPForbidden(text="WebSocket origin not allowed")
+
+    spy = _SelSpy()
+    monkeypatch.setattr(server_mod, "sel", lambda s=spy: s)
+    app = _boundary_app(sets_identity, ws_origin_refuses)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/sessions", headers={"X-Real-IP": "203.0.113.7"})
+        assert resp.status == 403
+    denials = spy.denials()
+    assert len(denials) == 1, spy.calls
+    assert denials[0]["caller"] == "alice_via_proxy"
+
+
+def test_both_request_audit_middlewares_attribute_through_audit_actor() -> None:
+    """Wiring pin for the ok/error request audit, which no test can reach.
+
+    ``sel_audit_middleware`` is a closure inside each entrypoint, so it cannot be
+    driven in isolation -- and it is the one that records the ordinary mutating
+    call, which is where a forwarded action was mistaken for the owner's own. A
+    re-grown flat literal there would be invisible to every test above.
+    """
+    from kiro_crew.dashboard import server as server_mod
+
+    for func, label in (
+        (server_mod.start_dashboard, "dashboard_user"),
+        (server_mod.start_api_server, "mcp_tool"),
+    ):
+        src = _entrypoint_and_chain_source(func)
+        assert f'audit_actor(request, "{label}")' in src, (
+            f"{func.__name__}'s sel_audit_middleware no longer derives its actor "
+            "through audit_actor; a forwarded action would be filed as the person"
+        )
+        assert f'caller="{label}"' not in src, (
+            f"{func.__name__} re-grew a flat caller={label!r} literal in its "
+            "request audit; route it through audit_actor"
+        )
+
+
 def test_every_self_auditing_raised_refusal_claims_the_request() -> None:
     """Exhaustive: enumerate every raised 401/403 and check its claim state.
 
@@ -984,3 +1243,37 @@ def test_api_server_resolves_bind_address_via_shared_helper() -> None:
     src = inspect.getsource(server_mod.start_api_server)
     assert "bind_address_for(local_only)" in src
     assert 'TCPSite(runner, "127.0.0.1"' not in src
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "internal,expected",
+    [(True, "dashboard_user:my-app"), (False, "my-app")],
+    ids=["derived-app-claim", "app-token"],
+)
+async def test_a_pre_audit_refusal_names_the_app_once(
+    monkeypatch: pytest.MonkeyPatch, internal: bool, expected: str
+) -> None:
+    """The boundary passes its transport label; ``audit_actor`` adds the app."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from kiro_crew.dashboard import server as server_mod
+
+    spy = _SelSpy()
+    monkeypatch.setattr(server_mod, "sel", lambda: spy)
+    monkeypatch.setattr(server_mod, "sel_is_warm", lambda: True)
+
+    @web.middleware
+    async def app_claim_then_refuse(request: web.Request, handler: object) -> web.StreamResponse:
+        request["app"] = "my-app"
+        if internal:
+            request["internal_auth"] = True
+        raise web.HTTPForbidden(text="nope")
+
+    async with TestClient(TestServer(_boundary_app(app_claim_then_refuse))) as client:
+        resp = await client.get("/api/sessions")
+        assert resp.status == 403
+
+    denials = spy.denials()
+    assert len(denials) == 1, spy.calls
+    assert denials[0]["caller"] == expected

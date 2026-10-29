@@ -19,17 +19,23 @@
  * own guarantee. Both are pinned below.
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReactElement } from 'react'
 import type { ChatMessage } from '../types'
 import { mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
-import { createTranscriptRenderers } from '../pages/chat/transcriptRenderers'
+import { appAgentRefusalIsNewest, contextOverflowIsNewest, createTranscriptRenderers, featureRequestRefusalIsNewest, newestErrorOwnsRecovery, sessionStartRepeatIsNewest } from '../pages/chat/transcriptRenderers'
+import { ErrorCard } from '../pages/chat/ErrorCard'
+import NoticeCard from '../pages/chat/NoticeCard'
+import { i18nT } from '../i18n/t'
+import { FEATURE_REQUEST_FORM_URL, FEATURE_REQUEST_ROW_META_KEY } from '../prompts/featureRequest'
 import { isWorkflowRunTool } from '../pages/chat/WorkflowRunCard'
 import { isSpawnRunTool } from '../pages/chat/SubagentRunCard'
 import { isWorkflowCompletionMessage } from '../pages/chat/WorkflowCompletionCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
+import CrewmateMessage from '../pages/chat/CrewmateMessage'
+import { CARD_ROLE } from '../cards/ConversationCard'
 
 const msg = (role: string, over: Partial<ChatMessage> = {}): ChatMessage =>
   ({ role, content: '', cls: '', ...over }) as ChatMessage
@@ -138,6 +144,14 @@ describe('narrow rows win over the broad row they refine', () => {
       content: 'run the backend gates on the changed modules',
       meta: { injectKind: 'user_replay' },
     }))).toBe('inject')
+
+    // A re-routed automation refusal is model-only machinery: the notice bar
+    // already shows the person the same text, so the Sessions page suppresses
+    // the inject row (renders nothing) rather than drawing a duplicate.
+    expect(idFor(msg('inject', {
+      content: '[Automation notice] ⚠️ Automation loop NOT updated — it kept its previous instruction.',
+      meta: { injectKind: 'automation_notice' },
+    }))).toBe('automation_notice_inject')
   })
 
   it('routes a workflow completion to its card and leaves a plain reply alone', () => {
@@ -198,6 +212,19 @@ describe('the error row offers Continue only where the single-chat surface does'
   const errs = [msg('error', { content: 'first' }), msg('assistant', { content: 'x' }), msg('error', { content: 'last' })]
   const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
 
+  it('renders a restored-answer notice as a warn NoticeCard, not a red error', () => {
+    // The row the restore sites append: role 'notice' with NoticeCard's warn glyph.
+    const notice = msg('notice', {
+      content: '\u26A0\uFE0F ' + i18nT('components.pendingQuestionCard.answer_restored'),
+      cls: '',
+    })
+    expect(idFor(notice)).toBe('notice')
+    const el = render(notice, { slot: 's1' }, { messages: [notice] }) as ReactElement
+    expect(el.type).toBe(NoticeCard)
+    expect(el.type).not.toBe(ErrorCard)
+    expect(el.props.content).toContain(i18nT('components.pendingQuestionCard.answer_restored'))
+  })
+
   it('offers it on the last error only', () => {
     const last = render(errs[2], recoverable, { index: 2, messages: errs }) as ReactElement
     const first = render(errs[0], recoverable, { index: 0, messages: errs }) as ReactElement
@@ -214,6 +241,445 @@ describe('the error row offers Continue only where the single-chat surface does'
     const el = render(errs[2], { slot: 's1' }, { index: 2, messages: errs }) as ReactElement
     expect(el.props.onContinue).toBeUndefined()
   })
+})
+
+describe('a usage-limit error row that refuses the seeded feature-request turn offers the issue form (#13342)', () => {
+  const limitRow = msg('error', {
+    content: '❌ The monthly usage limit has been reached. Retrying will not help until the limit resets.',
+    meta: { kind: 'usage_limit' },
+  })
+  // The row the pill's flow seeded and sent. The flow stamps the marker on the
+  // send's `meta` beside its `sendId`; the gateway persists a send's `meta`
+  // verbatim on the user row and echoes it, so the row reads the same before
+  // and after a reload and in a second tab -- the host passes nothing.
+  const seedRow = msg('user', { content: 'I’d like to request a feature!', meta: { sendId: 's-fr-seed', mid: 'u-1', [FEATURE_REQUEST_ROW_META_KEY]: true } })
+  const rows = [seedRow, limitRow]
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('hands the card the form route and withholds Continue, which would replay the rejection', () => {
+    const el = render(limitRow, recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+    expect(el.props.onContinue).toBeUndefined()
+  })
+
+  it('reads the kind from the rebuilt carrier too', () => {
+    const rebuilt = msg('error', { content: limitRow.content, kind: 'usage_limit' })
+    const el = render(rebuilt, { slot: 's1' }, { index: 1, messages: [seedRow, rebuilt] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+  })
+
+  it('still claims the refusal across the rows a turn writes between the seed and the error', () => {
+    // Tool activity, an inject, a permission card: none of them is a message the
+    // user composed, so the seed is still the nearest user row above the error.
+    const between = [msg('tool_call', { content: 'read_file' }), msg('permission', { content: 'run x?' }), msg('inject', { content: 'continue' })]
+    const messages = [seedRow, ...between, limitRow]
+    const el = render(limitRow, recoverable, { index: messages.length - 1, messages }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+  })
+
+  it('offers nothing on the same row when the user row above carries no marker (not the pill’s turn)', () => {
+    const typed = msg('user', { content: 'I’d like to request a feature!', meta: { sendId: 's-typed', mid: 'u-1' } })
+    const el = render(limitRow, recoverable, { index: 1, messages: [typed, limitRow] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBeUndefined()
+    // Today's behaviour, untouched: the newest error row of an interrupted turn still resumes.
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('reads the marker only as the literal `true`: a truthy look-alike is not a claim', () => {
+    // The key is client-stamped, so a shape check is the whole gate: a string
+    // or an object under the key is not the flow's stamp.
+    for (const value of ['true', 1, {}, 'feature-request']) {
+      const odd = msg('user', { content: 'x', meta: { sendId: 's-odd', [FEATURE_REQUEST_ROW_META_KEY]: value } })
+      const el = render(limitRow, recoverable, { index: 1, messages: [odd, limitRow] }) as ReactElement
+      expect(el.props.featureRequestFormUrl).toBeUndefined()
+    }
+  })
+
+  // ONE table for the boundary both scans walk, over the transcript's own
+  // row-kind vocabulary rather than a role list: a row that OPENS a turn stops
+  // the scan (the limit below it is THAT turn's, so the form would misdescribe
+  // it and Resume is the retry that helps), and a row appended INTO the seeded
+  // turn is walked past (the limit is still the request's own refusal, so the
+  // form stays and Resume -- a retry that replays the rejection -- stays
+  // withheld). Openers are `TURN_OPENER_ROLES` (typed row, auto-nudge cycle,
+  // drained sub-agent completion) plus the inject kinds `INJECT_KIND_OPENS_TURN`
+  // classifies as a prompt of their own: a cron notification is an unrelated
+  // prompt with its own reply, a synthesis row leads the turn that folds a
+  // fan-out. Continuations: a steer (a `user` row with `meta.steer`, persisted by
+  // chat_delivery.py and appended optimistically by ChatPage `steer()` -- a
+  // role-only scan stops at it and loses the form), a stall `recovery`, and a
+  // `user_replay` (build_recovery_requeue re-queues the SAME request verbatim
+  // when a turn emitted nothing -- an opener here would hand Resume back on the
+  // runtime's own retry of the request). An inject row with no stamped kind is
+  // passive: a /note rides the next turn's context, the policy-block notice and
+  // the hook-halt marker are display-only rows that dispatch nothing.
+  const OPENS = 'opens a turn, so a limit below it gets Resume back and no form'
+  const CONTINUES = 'continues the seeded turn, so a limit below it keeps the form and Resume stays withheld'
+  it.each<[string, typeof OPENS | typeof CONTINUES, ChatMessage]>([
+    ['a typed user row', OPENS, msg('user', { content: 'now refactor the parser', meta: { sendId: 's-typed', mid: 'u-2' } })],
+    ['an auto-nudge cycle', OPENS, msg('nudge', { content: '[auto-nudge cycle 3] check the PR' })],
+    ['a drained sub-agent completion', OPENS, msg('subagent', { content: '[Subagent completion event]\nagent 1a2b3c4d finished' })],
+    ['a cron notification (inject, injectKind cron)', OPENS, msg('inject', { content: '[Cron notification from "nightly"]\nSweep.\n[End of cron notification]', meta: { injectKind: 'cron', cronLabel: 'nightly' } })],
+    ['a fan-out synthesis (inject, injectKind synthesis)', OPENS, msg('inject', { content: '[SYSTEM] Sub-agent synthesis: produce the consolidated write-up.', meta: { injectKind: 'synthesis' } })],
+    ['a steer the user injected (user row, meta.steer)', CONTINUES, msg('user', { content: 'also mention dark mode', meta: { steer: true, steerState: 'consumed', sendId: 's-steer' } })],
+    ['the optimistic steer bubble before its echo', CONTINUES, msg('user', { content: 'also mention dark mode', meta: { steer: true, optimistic: true, sendId: 's-steer' } })],
+    ['a stall continuation (inject, injectKind recovery)', CONTINUES, msg('inject', { content: '[Interrupted turn — automatic recovery]\ncontinue from the last committed step', meta: { injectKind: 'recovery' } })],
+    ['the runtime replaying the request verbatim (inject, injectKind user_replay)', CONTINUES, msg('inject', { content: 'I’d like to request a feature!', meta: { injectKind: 'user_replay' } })],
+    ['a /note from another session (inject, meta.noteSession)', CONTINUES, msg('inject', { content: 'fyi: main moved', cls: 'reconcile-note', meta: { noteSession: 'chat-2' } })],
+    ['the display-only policy-block notice (inject, no stamped kind)', CONTINUES, msg('inject', { content: 'a safety policy blocked the call\nthe reason was steered to the agent' })],
+  ])('%s %s', (_label, verdict, row) => {
+    const opens = verdict === OPENS
+    // The row lands after the seeded turn's activity; the limit lands below it.
+    const messages = [seedRow, msg('tool_call', { content: 'read_file' }), row, limitRow]
+    const el = render(limitRow, recoverable, { index: 3, messages }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(opens ? undefined : FEATURE_REQUEST_FORM_URL)
+    if (opens) expect(el.props.onContinue).toBeTypeOf('function')
+    else expect(el.props.onContinue).toBeUndefined()
+    // The composer reads the same boundary, so the screen never argues with itself.
+    expect(featureRequestRefusalIsNewest(messages)).toBe(!opens)
+    // A continuation never rescues a limit in a LATER typed turn: the scan stops
+    // at that turn's own opener first.
+    if (!opens) {
+      const typed = msg('user', { content: 'now refactor the parser', meta: { sendId: 's-typed', mid: 'u-2' } })
+      const later = [seedRow, msg('assistant', { content: 'Filed as #13342.' }), typed, row, limitRow]
+      const el2 = render(limitRow, recoverable, { index: 4, messages: later }) as ReactElement
+      expect(el2.props.featureRequestFormUrl).toBeUndefined()
+    }
+  })
+
+  it('offers nothing when the marked row is not in the window (paged out): evidence, never the slot alone', () => {
+    const el = render(limitRow, recoverable, { index: 0, messages: [limitRow] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBeUndefined()
+  })
+
+  it('offers nothing on an ordinary failure in the feature-request slot (#4198 shapes keep their rows)', () => {
+    // A refused send has no structural kind: the send never went out, so a
+    // retry CAN help, and the fallback would misdescribe it as a capacity problem.
+    const refused = msg('error', { content: 'Message could not be sent: slot agent mismatch' })
+    const el = render(refused, recoverable, { index: 1, messages: [seedRow, refused] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBeUndefined()
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  describe('featureRequestRefusalIsNewest — the composer stands down with the card', () => {
+    it('is true when the seeded turn’s refusal is the newest row', () => {
+      expect(featureRequestRefusalIsNewest(rows)).toBe(true)
+    })
+    it('is false once a later user or assistant row follows the refusal', () => {
+      expect(featureRequestRefusalIsNewest([...rows, msg('user', { content: 'ok, plain text then', meta: { sendId: 's-typed' } })])).toBe(false)
+    })
+    it('is false for a limit hit in a later, user-composed turn', () => {
+      const later = msg('user', { content: 'now refactor the parser', meta: { sendId: 's-typed' } })
+      expect(featureRequestRefusalIsNewest([seedRow, later, limitRow])).toBe(false)
+    })
+    it('is false once any turn opener follows the refusal -- a typed row, a nudge, a cron notification, a synthesis -- and stays true past a passive note', () => {
+      // Same boundary as the card's scan, walked forward: a later turn has begun
+      // either way and the composer's Resume is that turn's. A /note dispatches
+      // nothing, so the refusal is still the newest turn's terminal row.
+      const openers = [
+        msg('user', { content: 'ok, plain text then', meta: { sendId: 's-typed' } }),
+        msg('nudge', { content: '[auto-nudge cycle 3] check the PR' }),
+        msg('inject', { content: '[Cron notification from "nightly"]\nSweep.\n[End of cron notification]', meta: { injectKind: 'cron', cronLabel: 'nightly' } }),
+        msg('inject', { content: '[SYSTEM] Sub-agent synthesis: produce the consolidated write-up.', meta: { injectKind: 'synthesis' } }),
+      ]
+      for (const opener of openers) expect(featureRequestRefusalIsNewest([...rows, opener]), opener.role + ':' + String(opener.meta?.injectKind ?? '')).toBe(false)
+      expect(featureRequestRefusalIsNewest([...rows, msg('inject', { content: 'fyi: main moved', cls: 'reconcile-note', meta: { noteSession: 'chat-2' } })])).toBe(true)
+    })
+    it('stays true across a steer injected into the seeded turn: the composer must not urge a Resume that replays the rejection', () => {
+      const steer = msg('user', { content: 'also mention dark mode', meta: { steer: true, sendId: 's-steer' } })
+      expect(featureRequestRefusalIsNewest([seedRow, steer, limitRow])).toBe(true)
+    })
+    it('is false for a #4198 refused-send row and for a transcript with no error row', () => {
+      expect(featureRequestRefusalIsNewest([seedRow, msg('error', { content: 'Message could not be sent: x' })])).toBe(false)
+      expect(featureRequestRefusalIsNewest([seedRow])).toBe(false)
+    })
+  })
+})
+
+describe('a missing kiro-cli under the seeded feature-request turn offers the issue form too', () => {
+  // "Request a Feature" is an agent turn, so a host with no kiro-cli refuses it
+  // at session start. The backend tags that refusal `kiro_cli_missing`, and the
+  // row offers the same form the usage-limit refusal does.
+  const seedRow = msg('user', { content: 'I’d like to request a feature!', meta: { sendId: 's-fr-seed', mid: 'u-1', [FEATURE_REQUEST_ROW_META_KEY]: true } })
+  const missingRow = msg('error', {
+    content: '❌ kiro-cli not found (searched 3 directories: /a, /b, /c). Install it from https://kiro.dev/cli/, or point KIROCREW_KIRO_BIN at the binary.',
+    meta: { kind: 'kiro_cli_missing' },
+  })
+  const rows = [seedRow, missingRow]
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('hands the card the form route with the kiro-cli copy and withholds Continue', () => {
+    const el = render(missingRow, recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+    expect(el.props.kiroCliMissing).toBe(true)
+    expect(el.props.onContinue).toBeUndefined()
+    expect(featureRequestRefusalIsNewest(rows)).toBe(true)
+    expect(newestErrorOwnsRecovery(rows)).toBe(true)
+  })
+
+  it('reads the kind from the rebuilt carrier too', () => {
+    const rebuilt = msg('error', { content: missingRow.content, kind: 'kiro_cli_missing' })
+    const el = render(rebuilt, { slot: 's1' }, { index: 1, messages: [seedRow, rebuilt] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+  })
+
+  it('keeps the usage-limit copy on a usage-limit row', () => {
+    const limitRow = msg('error', { content: '❌ The monthly usage limit has been reached.', meta: { kind: 'usage_limit' } })
+    const el = render(limitRow, recoverable, { index: 1, messages: [seedRow, limitRow] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBe(FEATURE_REQUEST_FORM_URL)
+    expect(el.props.kiroCliMissing).toBe(false)
+  })
+
+  it('leaves the row of an ordinary chat alone: no form, Resume kept', () => {
+    const typed = msg('user', { content: 'hello', meta: { sendId: 's-typed', mid: 'u-1' } })
+    const el = render(missingRow, recoverable, { index: 1, messages: [typed, missingRow] }) as ReactElement
+    expect(el.props.featureRequestFormUrl).toBeUndefined()
+    expect(el.props.kiroCliMissing).toBeUndefined()
+    expect(el.props.onContinue).toBeTypeOf('function')
+    expect(newestErrorOwnsRecovery([typed, missingRow])).toBe(false)
+  })
+})
+
+describe('a session start that failed twice in a row swaps Resume for the restart remedy', () => {
+  const TIMEOUT = 'Request session/new timed out after 90s (4/4 session-injected MCP server(s) reported)'
+  const failed = () => msg('error', { content: TIMEOUT, meta: { kind: 'session_start_failed' } })
+  // The `inject` row a Resume press lands as (the RecoveryCard row).
+  const resumed = () => msg('inject', { content: '[Continue — requested by the user] …', meta: { injectKind: 'recovery' } })
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('keeps the first failure exactly as today: Resume offered, no restart hint', () => {
+    const rows = [msg('user', { content: 'hi' }), failed()]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeTypeOf('function')
+    expect(el.props.sessionStartRepeat).toBe(false)
+  })
+
+  it('withholds Resume on the second consecutive failure and flags the row for the restart hint', () => {
+    const rows = [msg('user', { content: 'hi' }), failed(), resumed(), failed()]
+    const el = render(rows[3], recoverable, { index: 3, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.sessionStartRepeat).toBe(true)
+  })
+
+  it('leaves the OLDER failure row as settled prose (no hint, no Resume)', () => {
+    const rows = [msg('user', { content: 'hi' }), failed(), resumed(), failed()]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.sessionStartRepeat).toBe(false)
+  })
+
+  it('a typed retry starts the count over, so one failure after it gets Resume back', () => {
+    const rows = [msg('user', { content: 'hi' }), failed(), resumed(), failed(), msg('user', { content: 'again' }), failed()]
+    const el = render(rows[5], recoverable, { index: 5, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeTypeOf('function')
+    expect(el.props.sessionStartRepeat).toBe(false)
+  })
+
+  it('an untagged timeout row is never counted -- the kind decides, not the prose', () => {
+    const untagged = () => msg('error', { content: TIMEOUT })
+    const rows = [msg('user', { content: 'hi' }), untagged(), resumed(), untagged()]
+    const el = render(rows[3], recoverable, { index: 3, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeTypeOf('function')
+    expect(el.props.sessionStartRepeat).toBe(false)
+  })
+
+  it('reads the kind from the rebuilt carrier too', () => {
+    const rebuilt = () => msg('error', { content: TIMEOUT, kind: 'session_start_failed' })
+    const rows = [msg('user', { content: 'hi' }), rebuilt(), resumed(), rebuilt()]
+    const el = render(rows[3], recoverable, { index: 3, messages: rows }) as ReactElement
+    expect(el.props.sessionStartRepeat).toBe(true)
+    expect(el.props.onContinue).toBeUndefined()
+  })
+
+  it('hands the restart action to the repeat row only (#13791)', () => {
+    const onRestartGateway = () => Promise.resolve()
+    const opts = { ...recoverable, onRestartGateway }
+    const rows = [msg('user', { content: 'hi' }), failed(), resumed(), failed()]
+    const repeat = render(rows[3], opts, { index: 3, messages: rows }) as ReactElement
+    expect(repeat.props.onRestartGateway).toBe(onRestartGateway)
+    // The older row is settled, and a single failure still has Resume: neither
+    // may offer a restart that stops every running chat.
+    const older = render(rows[1], opts, { index: 1, messages: rows }) as ReactElement
+    expect(older.props.onRestartGateway).toBeUndefined()
+    const first = [msg('user', { content: 'hi' }), failed()]
+    const single = render(first[1], opts, { index: 1, messages: first }) as ReactElement
+    expect(single.props.onRestartGateway).toBeUndefined()
+  })
+
+
+  describe('sessionStartRepeatIsNewest — the composer stands down with the card', () => {
+    it('is true exactly when the newest card withholds Resume', () => {
+      expect(sessionStartRepeatIsNewest([msg('user', { content: 'hi' }), failed()])).toBe(false)
+      expect(sessionStartRepeatIsNewest([msg('user', { content: 'hi' }), failed(), resumed(), failed()])).toBe(true)
+    })
+
+    it('is false once a later turn opens or the assistant answers', () => {
+      const base = [msg('user', { content: 'hi' }), failed(), resumed(), failed()]
+      expect(sessionStartRepeatIsNewest([...base, msg('user', { content: 'again' })])).toBe(false)
+      expect(sessionStartRepeatIsNewest([...base, msg('assistant', { content: 'ok' })])).toBe(false)
+      expect(sessionStartRepeatIsNewest([...base, msg('inject', { content: 'cron', meta: { injectKind: 'cron' } })])).toBe(false)
+    })
+
+    it('never fires on an untagged timeout row', () => {
+      const untagged = () => msg('error', { content: TIMEOUT })
+      expect(sessionStartRepeatIsNewest([msg('user', { content: 'hi' }), untagged(), resumed(), untagged()])).toBe(false)
+    })
+  })
+})
+
+describe('a context overflow swaps Resume for a fresh session', () => {
+  const TOO_LONG = 'Input is too long: this conversation does not fit in one request to the model.'
+  const overflow = () => msg('error', { content: TOO_LONG, meta: { kind: 'context_overflow' } })
+  const onFreshSession = () => undefined
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined, onFreshSession }
+
+  it('offers the fresh session and never Resume on the newest overflow row', () => {
+    const rows = [msg('user', { content: 'hi' }), overflow()]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.onFreshSession).toBe(onFreshSession)
+  })
+
+  it('leaves an older overflow row as settled prose', () => {
+    const rows = [msg('user', { content: 'hi' }), overflow(), msg('user', { content: 'again' }), overflow()]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onFreshSession).toBeUndefined()
+    expect(el.props.onContinue).toBeUndefined()
+  })
+
+  it('stops offering it once a later turn answered past the row', () => {
+    const rows = [msg('user', { content: 'hi' }), overflow(), msg('user', { content: 'again' }), msg('assistant', { content: 'ok' })]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onFreshSession).toBeUndefined()
+  })
+
+  it('reads the kind from the rebuilt carrier too, and never from the prose', () => {
+    const rebuilt = msg('error', { content: TOO_LONG, kind: 'context_overflow' })
+    const rows = [msg('user', { content: 'hi' }), rebuilt]
+    expect((render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement).props.onFreshSession).toBe(onFreshSession)
+    const untagged = [msg('user', { content: 'hi' }), msg('error', { content: TOO_LONG })]
+    const el = render(untagged[1], recoverable, { index: 1, messages: untagged }) as ReactElement
+    expect(el.props.onFreshSession).toBeUndefined()
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('contextOverflowIsNewest: the composer stands down until a later turn opens', () => {
+    const base = [msg('user', { content: 'hi' }), overflow()]
+    expect(contextOverflowIsNewest(base)).toBe(true)
+    expect(contextOverflowIsNewest([...base, msg('user', { content: 'again' })])).toBe(false)
+    expect(contextOverflowIsNewest([...base, msg('assistant', { content: 'ok' })])).toBe(false)
+    expect(contextOverflowIsNewest([msg('user', { content: 'hi' }), msg('error', { content: TOO_LONG })])).toBe(false)
+  })
+})
+
+describe('a refused app-owned agent turn offers no Resume', () => {
+  const REFUSAL = "Release Notes can't run: its agent \"notes-writer\" isn't installed. Re-enable Release Notes in Apps › Library, then run the command again from the command palette."
+  const refused = () => msg('error', { content: REFUSAL, meta: { kind: 'app_agent_refused' } })
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('withholds Resume on the refusal row, from either carrier', () => {
+    for (const row of [refused(), msg('error', { content: REFUSAL, kind: 'app_agent_refused' })]) {
+      const rows = [msg('user', { content: 'hi' }), row]
+      const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+      expect(el.props.onContinue).toBeUndefined()
+    }
+  })
+
+  it('an untagged error row keeps Resume -- the kind decides, not the prose', () => {
+    const rows = [msg('user', { content: 'hi' }), msg('error', { content: REFUSAL })]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('appAgentRefusalIsNewest stands the composer down until a new turn opens', () => {
+    const base = [msg('user', { content: 'hi' }), refused()]
+    expect(appAgentRefusalIsNewest(base)).toBe(true)
+    expect(appAgentRefusalIsNewest([...base, msg('user', { content: 'again' })])).toBe(false)
+    expect(appAgentRefusalIsNewest([...base, msg('assistant', { content: 'ok' })])).toBe(false)
+    expect(appAgentRefusalIsNewest([msg('user', { content: 'hi' }), msg('error', { content: REFUSAL })])).toBe(false)
+  })
+})
+
+describe('a changed member agent file routes to Capabilities, never Resume', () => {
+  const row = msg('error', { content: 'materialization_changed: changed', meta: { code: 'materialization_changed', member: 'reviewer' } })
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('opens the named member and withholds Continue', () => {
+    const opened: string[] = []
+    const el = render(row, { ...recoverable, onOpenCapabilities: name => { opened.push(name) } }, { index: 0, messages: [row] }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    el.props.onOpenCapabilities()
+    expect(opened).toEqual(['reviewer'])
+  })
+
+  it('still offers Capabilities when the member name is empty', () => {
+    const emptyMemberRow = msg('error', {
+      content: 'materialization_changed: changed',
+      meta: { code: 'materialization_changed', member: '' },
+    })
+    const opened: string[] = []
+    const el = render(
+      emptyMemberRow,
+      { ...recoverable, onOpenCapabilities: name => { opened.push(name) } },
+      { index: 0, messages: [emptyMemberRow] },
+    ) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.onOpenCapabilities).toBeTypeOf('function')
+    el.props.onOpenCapabilities()
+    expect(opened).toEqual([''])
+  })
+
+  it('still withholds Continue on a surface with no crew editor', () => {
+    const el = render(row, recoverable, { index: 0, messages: [row] }) as ReactElement
+    expect(el.props.onContinue).toBeUndefined()
+    expect(el.props.onOpenCapabilities).toBeUndefined()
+  })
+})
+
+describe('a capability refusal as the newest state owns recovery', () => {
+  for (const code of ['materialization_changed', 'parent_identity_changed', 'foreign_private_copy', 'project_identity_changed', 'private_template_shadowed']) {
+    it(`${code}: the composer withholds Resume until a new turn opens`, () => {
+      const row = msg('error', { content: `${code}: x`, meta: { code, member: 'reviewer' } })
+      expect(newestErrorOwnsRecovery([msg('user'), row])).toBe(true)
+      expect(newestErrorOwnsRecovery([msg('user'), row, msg('assistant')])).toBe(false)
+    })
+  }
+  it('leaves an ordinary error row to Resume', () => {
+    expect(newestErrorOwnsRecovery([msg('user'), msg('error', { content: 'boom' })])).toBe(false)
+  })
+})
+
+describe('the crewmate-editor fix needs a crewmate to open', () => {
+  it('offers no button when the row names no member', () => {
+    const row = msg('error', { content: 'foreign_private_copy: x', meta: { code: 'foreign_private_copy', member: '' } })
+    const el = render(row, { slot: 's1', onOpenCapabilities: () => undefined }, { index: 0, messages: [row] }) as ReactElement
+    expect(el.props.onOpenCapabilities).toBeUndefined()
+  })
+})
+
+describe('each sibling capability refusal routes to its own fix, never Resume', () => {
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+  const cases = [
+    ['parent_identity_changed', 'member'],
+    ['foreign_private_copy', 'member'],
+    ['project_identity_changed', null],
+    ['private_template_shadowed', null],
+  ] as const
+
+  for (const [code, fix] of cases) {
+    it(`${code}: ${fix ?? 'no in-app fix'}`, () => {
+      const row = msg('error', { content: `${code}: x`, meta: { code, member: 'reviewer' } })
+      const opened: [string, string][] = []
+      const el = render(row, { ...recoverable, onOpenCapabilities: (name, f) => { opened.push([name, f]) } }, { index: 0, messages: [row] }) as ReactElement
+      expect(el.props.onContinue).toBeUndefined()
+      if (fix) {
+        el.props.onOpenCapabilities()
+        expect(opened).toEqual([['reviewer', fix]])
+      } else {
+        expect(el.props.onOpenCapabilities).toBeUndefined()
+      }
+    })
+  }
 })
 
 describe('rows the defaults already draw correctly are left to them', () => {
@@ -239,10 +705,17 @@ describe('the single-chat surface renders from THIS row set', () => {
   // a row added here reaches the page and every pane at once, and a page-only
   // row is an explicit entry AFTER the spread. What can still drift is the
   // spread itself -- so pin that, not the roles.
-  const chatPageSrc = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+  // The page composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const PAGES = join(__dirname, '..', 'pages')
+  const OWNERS = join(PAGES, 'chat', 'page')
+  const chatPageSrc = [
+    readFileSync(join(PAGES, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(OWNERS).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(OWNERS, f), 'utf8')),
+    ...readdirSync(PAGES).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(PAGES, f), 'utf8')),
+  ].join('\n')
 
   it('ChatPage spreads createTranscriptRenderers into its host list, ahead of its page-only rows', () => {
-    expect(chatPageSrc).toMatch(/import \{ createTranscriptRenderers \} from '\.\/chat\/transcriptRenderers'/)
+    expect(chatPageSrc).toMatch(/import \{ createTranscriptRenderers \} from '\.\.\/transcriptRenderers'/)
     const list = chatPageSrc.indexOf('const renderers = mergeRenderers([')
     const spread = chatPageSrc.indexOf('...shared,', list)
     const bubble = chatPageSrc.indexOf('\n      bubble,\n    ])', list)
@@ -263,5 +736,94 @@ describe('the single-chat surface renders from THIS row set', () => {
     const shared = createTranscriptRenderers({ slot: 's1' }).map(r => r.id)
     const duplicated = pageIds.filter(id => shared.includes(id))
     expect(duplicated).toEqual([])
+  })
+
+  // A note's author is shown through the SAME app-label pill an app inject row
+  // uses: the backend stamps the authenticated caller (`request_app`) onto
+  // `meta.appLabel`, and the ChatPage inject branch renders it via
+  // `components.mcpApp.from_app` — there is no note-only `noteSource` meta key
+  // or `from_note` pill. The trust fix is backend-side (the handler stamps
+  // `request_app`, not `body.source`), so the frontend guard is that the inject
+  // branch derives no client-side note author and reuses the app-label pill.
+  it('ChatPage note attribution rides the appLabel pill, with no noteSource/from_note', () => {
+    expect(chatPageSrc).toMatch(/i18nT\('components\.mcpApp\.from_app', \{ app: appLabel\.split\('\/'\)\[0\] \}\)/)
+    expect(chatPageSrc).not.toMatch(/noteSource/)
+    expect(chatPageSrc).not.toMatch(/from_note/)
+  })
+})
+
+describe("a change card in a mate's chat", () => {
+  const mate = { name: 'mate', label: 'Mate' }
+  const card = msg(CARD_ROLE, { meta: { card_id: 'c1' } })
+
+  it("is the mate's own message, opening the run when it comes first", () => {
+    const messages = [msg('user', { content: 'hi' }), card, msg('assistant', { content: 'Press Apply change.' })]
+    const el = render(card, { slot: 's1', crewmate: mate }, { index: 1, messages }) as ReactElement<{ pos: string }>
+    expect(el.type).toBe(CrewmateMessage)
+    // The author line belongs to the card: it is the first bubble of the run.
+    expect(el.props.pos).toBe('start')
+  })
+
+  it("continues the run its acknowledgement opened, so there is one author line", () => {
+    const messages = [msg('user', { content: 'hi' }), msg('assistant', { content: 'Checking.' }), card, msg('assistant', { content: 'Ready.' })]
+    const el = render(card, { slot: 's1', crewmate: mate }, { index: 2, messages }) as ReactElement<{ pos: string }>
+    expect(el.type).toBe(CrewmateMessage)
+    expect(el.props.pos).toBe('cont')
+  })
+
+  it('stays a plain card outside a mate chat', () => {
+    const el = render(card, { slot: 's1' }, { index: 0, messages: [card] }) as ReactElement
+    expect(el.type).not.toBe(CrewmateMessage)
+  })
+})
+
+describe('a turn that hit its time limit links to the setting', () => {
+  const onOpenTurnLimit = () => undefined
+  const opts = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined, onOpenTurnLimit }
+
+  it('hands the settings link to a turn_timeout row, and keeps Resume', () => {
+    const live = msg('error', { content: '⏱️ This turn hit the 4-hour limit.', kind: 'turn_timeout' } as Partial<ChatMessage>)
+    const el = render(live, opts, { index: 0, messages: [live] }) as ReactElement
+    expect(el.type).toBe(ErrorCard)
+    expect(el.props.onOpenTurnLimit).toBe(onOpenTurnLimit)
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('reads the kind from a rebuilt transcript row too', () => {
+    const restored = msg('error', { content: '⏱️ limit', meta: { kind: 'turn_timeout' } })
+    const el = render(restored, opts, { index: 0, messages: [restored] }) as ReactElement
+    expect(el.props.onOpenTurnLimit).toBe(onOpenTurnLimit)
+  })
+
+  it('withholds the link from every other error row', () => {
+    const other = msg('error', { content: '⏱️ This turn hit the 4-hour limit.' })
+    const el = render(other, opts, { index: 0, messages: [other] }) as ReactElement
+    expect(el.props.onOpenTurnLimit).toBeUndefined()
+  })
+})
+
+describe('newestErrorOwnsRecovery -- one rule for the composer beneath the four remedy cards', () => {
+  const user = () => msg('user', { content: 'hi' })
+  const failed = () => msg('error', { content: 'Request session/new timed out after 90s', meta: { kind: 'session_start_failed' } })
+  const resumed = () => msg('inject', { content: '[Continue -- requested by the user]', meta: { injectKind: 'recovery' } })
+  const owners: Array<[string, ChatMessage[]]> = [
+    ['a refused feature request', [
+      msg('user', { content: 'I would like to request a feature!', meta: { sendId: 's-fr-seed', [FEATURE_REQUEST_ROW_META_KEY]: true } }),
+      msg('error', { content: 'The monthly usage limit has been reached.', meta: { kind: 'usage_limit' } }),
+    ]],
+    ['a session start that failed twice', [user(), failed(), resumed(), failed()]],
+    ['a context overflow', [user(), msg('error', { content: 'Input is too long.', meta: { kind: 'context_overflow' } })]],
+    ['a refused app agent', [user(), msg('error', { content: 'Release Notes cannot run.', meta: { kind: 'app_agent_refused' } })]],
+  ]
+
+  it.each(owners)('holds under %s, and lets go once a later turn opens', (_label, rows) => {
+    expect(newestErrorOwnsRecovery(rows)).toBe(true)
+    expect(newestErrorOwnsRecovery([...rows, msg('user', { content: 'again' })])).toBe(false)
+  })
+
+  it('does not hold for an error with no remedy of its own, such as a throttle, nor for no error', () => {
+    expect(newestErrorOwnsRecovery([user(), msg('error', { content: 'Bedrock is throttling requests.' })])).toBe(false)
+    expect(newestErrorOwnsRecovery([user(), failed()])).toBe(false)
+    expect(newestErrorOwnsRecovery([user(), msg('assistant', { content: 'ok' })])).toBe(false)
   })
 })

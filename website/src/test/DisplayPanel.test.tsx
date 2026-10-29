@@ -5,6 +5,11 @@ import { DisplayPanel } from '../pages/settings/DisplayPanel'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 
+// The rail mounts one item at a time; each describe sets the item it exercises
+// in its beforeEach and renders through this helper.
+let displaySub = 'view'
+const renderPanel = () => renderWithProviders(<DisplayPanel />, { route: `/settings?tab=display&sub=${displaySub}` })
+
 // Mock useZoomCtx — DisplayPanel uses it for zoom/font controls. The object is
 // module-scoped and mutable so individual tests can flip zoomSupported to
 // cover both the desktop stepper and the plain-browser shortcut hint.
@@ -14,6 +19,7 @@ const zoomCtx = {
   zoomIn: vi.fn(),
   zoomOut: vi.fn(),
   reset: vi.fn(),
+  setZoom: vi.fn(),
   family: 'sans',
   setFontFamily: vi.fn(),
   cycleFamily: vi.fn(),
@@ -33,12 +39,16 @@ const { mockUseTheme, DEFAULT_THEME } = vi.hoisted(() => {
     colorTheme: 'default',
     setColorTheme: vi.fn(),
     allThemes: [{ value: 'default', label: 'Default', custom: false }],
+    customThemes: [],
+    customThemesUpdatedAt: 0,
     theme: 'dark',
     themeVersion: 0,
     themeSwitching: false,
     addCustomTheme: vi.fn(),
     deleteCustomTheme: vi.fn(),
     loadCustomThemes: vi.fn(),
+    installedThemeLoadFailed: false,
+    customThemeDataMap: new Map(),
   }
   return { mockUseTheme: vi.fn(() => DEFAULT_THEME), DEFAULT_THEME }
 })
@@ -82,16 +92,16 @@ vi.mock('../hooks/useSessionPalette', () => ({
 
 describe('DisplayPanel – ThemeEditorPanel overlay', () => {
   beforeEach(() => {
+    displaySub = 'theme'
     vi.clearAllMocks()
   })
 
-  it('hides Sidebar Colors buttons behind the modal backdrop when ThemeEditorPanel is open', async () => {
+  it('hides the Theme section behind the modal backdrop when ThemeEditorPanel is open', async () => {
     const user = userEvent.setup()
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
-    // Verify Sidebar Colors section is visible initially
-    expect(screen.getByText('Sidebar Colors')).toBeInTheDocument()
-    expect(screen.getByText('Palette')).toBeInTheDocument()
+    // Verify the Theme section (which hosts the + New Theme button) is visible initially
+    expect(screen.getByText('Install Theme')).toBeInTheDocument()
 
     // Open the theme editor
     const newThemeBtn = screen.getByText('+ New Theme')
@@ -116,15 +126,15 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     expect((dialog.parentElement as HTMLElement).className).toContain('z-[101]')
 
     // Modal portals to document.body, so the dialog is no longer a sibling of
-    // the Sidebar Colors section in the panel's own tree: it is a child of body,
+    // the Theme section in the panel's own tree: it is a child of body,
     // which is what places it above every section regardless of DOM order.
     expect(dialog.closest('body')).toBe(document.body)
-    expect(screen.getByText('Sidebar Colors').closest('[role="dialog"]')).toBeNull()
+    expect(screen.getByText('Install Theme').closest('[role="dialog"]')).toBeNull()
   })
 
   it('renders ThemeEditorPanel modal outside of SettingsCard to avoid card-glow stacking context', async () => {
     const user = userEvent.setup()
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     await user.click(screen.getByText('+ New Theme'))
 
@@ -141,9 +151,9 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     }
   })
 
-  it('closes ThemeEditorPanel and shows Sidebar Colors buttons again', async () => {
+  it('closes ThemeEditorPanel and shows the Theme section again', async () => {
     const user = userEvent.setup()
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     // Open theme editor
     await user.click(screen.getByText('+ New Theme'))
@@ -159,9 +169,8 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
       expect(screen.queryByText('Create Theme')).not.toBeInTheDocument()
     })
 
-    // Sidebar Colors section should still be visible and interactive
-    expect(screen.getByText('Sidebar Colors')).toBeInTheDocument()
-    expect(screen.getByText('Palette')).toBeInTheDocument()
+    // Theme section should still be visible and interactive
+    expect(screen.getByText('Install Theme')).toBeInTheDocument()
   })
 
   it('dismisses the theme editor on Escape and on a backdrop click', async () => {
@@ -169,7 +178,7 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     // click it already had must survive the conversion. Both are the ACCIDENTAL
     // exits, so both are only available while the form is untouched.
     const user = userEvent.setup()
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     await user.click(screen.getByText('+ New Theme'))
     await screen.findByRole('dialog', { name: 'Create Theme' })
@@ -187,7 +196,7 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     // unconditionally — so on a part-filled form the accidental exits must not
     // fire. Only the explicit ones (header close, the panel's Cancel) close it.
     const user = userEvent.setup()
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     await user.click(screen.getByText('+ New Theme'))
     await screen.findByRole('dialog', { name: 'Create Theme' })
@@ -215,7 +224,7 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
     // Both come from the shared Modal (scroll lock + focus trap) and neither
     // existed on the hand-rolled overlay.
     const user = userEvent.setup()
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     await user.click(screen.getByText('+ New Theme'))
     const dialog = await screen.findByRole('dialog', { name: 'Create Theme' })
@@ -227,11 +236,12 @@ describe('DisplayPanel – ThemeEditorPanel overlay', () => {
 
 describe('DisplayPanel – theme install', () => {
   beforeEach(() => {
+    displaySub = 'theme'
     vi.clearAllMocks()
   })
 
   it('renders the renamed "Theme" section with an Install control', () => {
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.getByText('Install Theme')).toBeInTheDocument()
     expect(screen.getByLabelText('Theme source')).toBeInTheDocument()
     expect(screen.getByLabelText('Theme source location')).toBeInTheDocument()
@@ -242,7 +252,7 @@ describe('DisplayPanel – theme install', () => {
     const spy = vi
       .spyOn(api, 'installTheme')
       .mockResolvedValue({ ok: true, slug: 'lcars' })
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     await user.type(
       screen.getByLabelText('Theme source location'),
@@ -267,7 +277,7 @@ describe('DisplayPanel – theme install', () => {
     const spy = vi
       .spyOn(api, 'installTheme')
       .mockResolvedValue({ ok: true, slug: 'lcars' })
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     const trigger = screen.getByRole('combobox', { name: 'Theme source' })
     expect(trigger).toHaveTextContent('GitHub')
@@ -292,14 +302,84 @@ describe('DisplayPanel – theme install', () => {
     spy.mockRestore()
   })
 
+  it('an install whose list refresh failed never selects the pack on its own', async () => {
+    // Install lands, the list refresh fails: the notice under the picker says
+    // so at once. When a catalog fetch later LANDS (Retry, a background refetch,
+    // another tab) the notice is withdrawn -- keyed on `customThemesUpdatedAt`,
+    // because a reinstall of an already-listed pack yields a deep-equal listing
+    // whose array reference React Query keeps -- and NOTHING is selected: a
+    // theme swap made by a refetch minutes later is not the user's choice.
+    const setColorTheme = vi.fn()
+    const customThemes = [{ value: 'custom-lcars', label: 'LCARS', custom: true }]
+    let customThemesUpdatedAt = 1000
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      setColorTheme,
+      // Rebuilt every render, as the provider does; must not withdraw the notice.
+      allThemes: [{ value: 'default', label: 'Default', custom: false }, ...customThemes],
+      customThemes, // same reference throughout: the reinstall case
+      customThemesUpdatedAt,
+      loadCustomThemes: vi.fn().mockResolvedValue(false),
+    }))
+    const spy = vi.spyOn(api, 'installTheme').mockResolvedValue({ ok: true, slug: 'lcars' })
+    const { rerender } = renderPanel()
+
+    fireEvent.change(screen.getByLabelText('Theme source location'), {
+      target: { value: 'https://github.com/u/lcars' },
+    })
+    fireEvent.click(screen.getByText('Install'))
+    await screen.findByText(/Press Retry to refresh the list and apply it/)
+    rerender(<DisplayPanel />)
+    expect(screen.getByText(/Press Retry to refresh the list and apply it/)).toBeInTheDocument()
+    expect(setColorTheme).not.toHaveBeenCalled()
+
+    // A catalog fetch lands (deep-equal listing, same array): the notice goes,
+    // nothing is selected.
+    customThemesUpdatedAt = 2000
+    rerender(<DisplayPanel />)
+    await waitFor(() => {
+      expect(screen.queryByText(/Press Retry to refresh the list and apply it/)).not.toBeInTheDocument()
+    })
+    expect(setColorTheme).not.toHaveBeenCalled()
+    spy.mockRestore()
+  })
+
+  it('a user-initiated Retry that succeeds finishes the install by selecting the pack', async () => {
+    // The Retry click is the user's action, so its success may complete what
+    // the failed refresh left undone: the just-installed pack is selected. Only
+    // this path selects; a background refetch never does (previous test).
+    const setColorTheme = vi.fn()
+    const loadCustomThemes = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true)
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      setColorTheme,
+      customThemesLoaded: true,
+      loadCustomThemes,
+    }))
+    const spy = vi.spyOn(api, 'installTheme').mockResolvedValue({ ok: true, slug: 'lcars' })
+    renderPanel()
+
+    fireEvent.change(screen.getByLabelText('Theme source location'), {
+      target: { value: 'https://github.com/u/lcars' },
+    })
+    fireEvent.click(screen.getByText('Install'))
+    await screen.findByText(/Press Retry to refresh the list and apply it/)
+    expect(setColorTheme).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(setColorTheme).toHaveBeenCalledWith('custom-lcars'))
+    expect(loadCustomThemes).toHaveBeenCalledTimes(2)
+    spy.mockRestore()
+  })
+
   it('shows the "Applying…" status indicator while a theme switch is in flight', () => {
     mockUseTheme.mockImplementation(() => ({ ...DEFAULT_THEME, themeSwitching: true }))
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.getByText(/Applying/)).toBeInTheDocument()
   })
 
   it('does not show the "Applying…" indicator when no switch is in flight', () => {
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.queryByText(/Applying/)).not.toBeInTheDocument()
   })
 
@@ -308,7 +388,7 @@ describe('DisplayPanel – theme install', () => {
     const spy = vi
       .spyOn(api, 'installTheme')
       .mockReturnValue(new Promise(() => {}) as ReturnType<typeof api.installTheme>)
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     await user.type(screen.getByLabelText('Theme source location'), 'https://github.com/u/x')
     await user.click(screen.getByText('Install'))
@@ -321,6 +401,7 @@ describe('DisplayPanel – theme install', () => {
 
 describe('DisplayPanel – font family setting', () => {
   beforeEach(() => {
+    displaySub = 'zoom'
     vi.clearAllMocks()
   })
 
@@ -333,17 +414,19 @@ describe('DisplayPanel – font family setting', () => {
     // it applies its own OpenDyslexicMono to code surfaces, so the "follows the
     // active theme" rule doesn't hold for it. The assertion pins both halves so
     // a future edit can't silently drop either.
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     expect(screen.getByText('Font Family')).toBeInTheDocument()
+    // The sentence is the row's info tip (its `title` while closed).
     expect(
-      screen.getByText('UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.'),
+      screen.getByTitle('UI font family for the dashboard. Code font follows the active theme, except OpenDyslexic which supplies its own.'),
     ).toBeInTheDocument()
   })
 })
 
 describe('DisplayPanel – plain diffs setting lives on the Chat tab', () => {
   beforeEach(() => {
+    displaySub = 'view'
     vi.clearAllMocks()
     localStorage.clear()
   })
@@ -354,13 +437,14 @@ describe('DisplayPanel – plain diffs setting lives on the Chat tab', () => {
   // ChatPanel.plainDiff.test.tsx; this guards only against it reappearing here
   // and shipping as two switches over one localStorage key.
   it('does not render the toggle', () => {
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.queryByRole('switch', { name: 'Plain diffs' })).toBeNull()
   })
 })
 
 describe('DisplayPanel – zoom setting', () => {
   beforeEach(() => {
+    displaySub = 'zoom'
     vi.clearAllMocks()
     zoomCtx.zoomSupported = true
     zoomCtx.zoom = 100
@@ -368,17 +452,18 @@ describe('DisplayPanel – zoom setting', () => {
 
   /** Scope queries to the zoom stepper's button row — the panel has other
    *  steppers (e.g. "Highlight recent sessions") with identical
-   *  Increase/Decrease labels. Only the zoom value renders with a % suffix,
-   *  and that text sits on the reset button whose parent is the row. */
-  const zoomRow = () => within(screen.getByText(/^\d+%$/).parentElement as HTMLElement)
+   *  Increase/Decrease labels. The zoom value is a number input named
+   *  "Zoom Level"; its readout box sits in the row. */
+  const zoomInput = () => screen.getByRole('spinbutton', { name: 'Zoom Level' }) as HTMLInputElement
+  const zoomRow = () => within(zoomInput().parentElement?.parentElement as HTMLElement)
 
   it('desktop: renders the native zoom stepper and drives the bridge callbacks', async () => {
     const user = userEvent.setup()
     zoomCtx.zoom = 125
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     expect(screen.getByText('Zoom Level')).toBeInTheDocument()
-    expect(screen.getByText('125%')).toBeInTheDocument()
+    expect(zoomInput().value).toBe('125')
     // Single zoom control only — the legacy Font Size stepper must be gone.
     expect(screen.queryByText('Font Size')).not.toBeInTheDocument()
 
@@ -386,13 +471,14 @@ describe('DisplayPanel – zoom setting', () => {
     expect(zoomCtx.zoomIn).toHaveBeenCalledTimes(1)
     await user.click(zoomRow().getByLabelText('Decrease'))
     expect(zoomCtx.zoomOut).toHaveBeenCalledTimes(1)
-    await user.click(screen.getByText('125%'))
-    expect(zoomCtx.reset).toHaveBeenCalledTimes(1)
+    await user.clear(zoomInput())
+    await user.type(zoomInput(), '113{Enter}')
+    expect(zoomCtx.setZoom).toHaveBeenCalledWith(113)
   })
 
   it('browser: shows the shortcut hint instead of a stepper', () => {
     zoomCtx.zoomSupported = false
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
 
     expect(screen.getByText('Zoom Level')).toBeInTheDocument()
     expect(screen.getByText(/Use your browser's zoom/)).toBeInTheDocument()
@@ -408,6 +494,7 @@ describe('DisplayPanel – dropped overrides notice', () => {
   // user has open. These pin the Settings-side surface: shown for the active
   // pack with the rule names an author needs, absent otherwise.
   beforeEach(() => {
+    displaySub = 'theme'
     vi.clearAllMocks()
   })
 
@@ -419,7 +506,7 @@ describe('DisplayPanel – dropped overrides notice', () => {
       colorTheme: 'custom-manrope',
       overridesDropReport: REPORT,
     }))
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.getByText("Some of this theme's styles were ignored")).toBeInTheDocument()
     // The rule names are the actionable part — a bare count tells an author
     // nothing to edit.
@@ -436,7 +523,7 @@ describe('DisplayPanel – dropped overrides notice', () => {
       colorTheme: 'custom-manrope',
       overridesDropReport: null,
     }))
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
   })
 
@@ -449,13 +536,90 @@ describe('DisplayPanel – dropped overrides notice', () => {
       colorTheme: 'custom-other',
       overridesDropReport: REPORT,
     }))
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.queryByText("Some of this theme's styles were ignored")).not.toBeInTheDocument()
   })
 })
 
+describe('DisplayPanel – theme load-error notice', () => {
+  // The provider derives `installedThemeLoadFailed` from the selection, the
+  // catalog and `customThemeDataMap`: true only while the active pack is listed
+  // and its detail is absent, so a failed RELOAD whose last good detail
+  // (render-cache seed or carry-forward) is still applied reads false. The
+  // panel shows the notice on that boolean alone, and its copy must offer a
+  // recovery the pack actually has: reinstall for an installed pack,
+  // edit-or-swap for an editor-created one.
+  beforeEach(() => {
+    displaySub = 'theme'
+    vi.clearAllMocks()
+  })
+
+  const INSTALLED_COPY = 'The installed theme could not be loaded. Reinstall it or choose another theme.'
+  const EDITOR_COPY = 'This theme could not be loaded. Choose another theme or edit this one.'
+  const THEMES = [
+    { value: 'default', label: 'Default', custom: false },
+    { value: 'custom-manrope', label: 'Manrope', custom: true, installed: true },
+    { value: 'custom-mine', label: 'Mine', custom: true, installed: false },
+  ]
+
+  it('shows the reinstall copy for an unstyled installed theme', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: true,
+    }))
+    renderPanel()
+    expect(screen.getByText(INSTALLED_COPY)).toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+
+  it('shows the edit-or-swap copy for an unstyled editor-created theme', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-mine',
+      allThemes: THEMES,
+      installedThemeLoadFailed: true,
+    }))
+    renderPanel()
+    expect(screen.getByText(EDITOR_COPY)).toBeInTheDocument()
+    // An editor theme has no install source, so "reinstall" is not a way out.
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+  })
+
+  it('renders no notice when the failed reload left the last good detail applied', () => {
+    // The provider's derived flag is false while the carried-forward detail is
+    // in the map; the panel must not second-guess it into a notice.
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: false,
+      customThemeDataMap: new Map([['manrope', { slug: 'manrope' }]]),
+    }))
+    renderPanel()
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+
+  it('renders no notice without a load failure', () => {
+    mockUseTheme.mockImplementation(() => ({
+      ...DEFAULT_THEME,
+      colorTheme: 'custom-manrope',
+      allThemes: THEMES,
+      installedThemeLoadFailed: false,
+    }))
+    renderPanel()
+    expect(screen.queryByText(INSTALLED_COPY)).not.toBeInTheDocument()
+    expect(screen.queryByText(EDITOR_COPY)).not.toBeInTheDocument()
+  })
+})
+
 describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
-  beforeEach(() => { vi.clearAllMocks() })
+  beforeEach(() => {
+    displaySub = 'zoom'
+    vi.clearAllMocks()
+  })
 
   // The Font Family row is a SettingsButtonGroup that lists Sans / Mono /
   // System, plus OpenDyslexic as a fourth built-in a11y option. The buttons
@@ -464,10 +628,48 @@ describe('DisplayPanel – Font Family picker (OpenDyslexic option)', () => {
   // just re-verify the shared SettingsButtonGroup wiring, which has its own
   // tests.
   it('lists OpenDyslexic as a fourth font family option alongside Sans/Mono/System', () => {
-    renderWithProviders(<DisplayPanel />)
+    renderPanel()
     expect(screen.getByRole('button', { name: 'Sans' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Mono' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'OpenDyslexic' })).toBeInTheDocument()
+  })
+})
+
+describe('DisplayPanel – sidebar session colors', () => {
+  beforeEach(() => {
+    displaySub = 'sidebar'
+    vi.clearAllMocks()
+  })
+
+  // The four sidebar-color controls write straight to the store. The buttons
+  // render their labels as accessible text, so clicking each and reading the
+  // slice back proves the wiring end to end — the fixed-color swatches and the
+  // No color / Auto choices are one exclusive group over the same field.
+  it('dispatches palette, intensity, display mode and default color to the store', () => {
+    const { store } = renderPanel()
+    const state = () => store.getState().dashboard
+
+    fireEvent.click(screen.getByRole('button', { name: 'Gradient' }))
+    expect(state().sessionColorsMode).toBe('gradient')
+    fireEvent.click(screen.getByRole('button', { name: 'Solid Tint' }))
+    expect(state().sessionColorsMode).toBe('tint')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Vivid' }))
+    expect(state().sessionColorsIntensity).toBe('vivid')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Horizon' }))
+    expect(state().sessionColorsPalette).toBe('horizon')
+
+    const defaults = within(
+      screen.getByText('Default for New Sessions').parentElement as HTMLElement,
+    )
+    fireEvent.click(defaults.getByRole('button', { name: 'Auto' }))
+    expect(state().sessionDefaultColor).toBe('auto')
+    fireEvent.click(defaults.getByRole('button', { name: 'Color 2' }))
+    expect(state().sessionDefaultColor).toBe(1)
+    expect(defaults.getByRole('button', { name: 'Color 2' })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(defaults.getByRole('button', { name: 'No color' }))
+    expect(state().sessionDefaultColor).toBeNull()
   })
 })

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app_with_agent_routes
@@ -103,6 +105,63 @@ async def test_explicit_member_switch_on_empty_chat_pins_the_member(tmp_path, mo
     assert execution is not None
     assert execution.selection_kind == "member"
     assert execution.store.store_id == private_store
+
+
+@pytest.mark.asyncio
+async def test_same_name_switch_persists_agent_and_kind_together(tmp_path, monkeypatch):
+    """A restart must not pair the switched name with its previous namespace."""
+    state, _private_store = await _same_name_state(tmp_path, monkeypatch)
+    app = _make_app_with_agent_routes(state)
+    async with TestClient(TestServer(as_owner(app))) as client:
+        response = await client.post(
+            "/api/chat/slots",
+            json={
+                "name": "persisted-kind",
+                "title": "Persisted kind",
+                "agent": TEMPLATE,
+                "agent_kind": "member",
+            },
+        )
+        assert response.status == 200, await response.text()
+        await asyncio.to_thread(
+            state.conversation_log.update_metadata,
+            "dashboard:persisted-kind",
+            {"agent": TEMPLATE, "agent_kind": "member"},
+        )
+        assert state.conversation_log.get_metadata("dashboard:persisted-kind")["agent_kind"] == (
+            "member"
+        )
+
+        response = await client.post(
+            "/api/chat/slots/persisted-kind/agent",
+            json={"agent": TEMPLATE, "agent_kind": "template"},
+        )
+        assert response.status == 200, await response.text()
+
+    metadata = state.conversation_log.get_metadata("dashboard:persisted-kind")
+    assert (metadata["agent"], metadata["agent_kind"]) == (TEMPLATE, "template")
+
+
+@pytest.mark.asyncio
+async def test_agent_switch_on_a_relay_archive_is_refused(tmp_path, monkeypatch):
+    """A relay archive is read-only: the switch answers 409 and changes nothing."""
+    state, _private_store = await _same_name_state(tmp_path, monkeypatch)
+    slot = state.get_or_create_slot("remote-kind")
+    slot.executor = "remote"
+    slot.instance_id = "peer-1"
+    slot.remote_slot = "peer-chat-1"
+    before = (slot.agent, slot.agent_kind)
+
+    app = _make_app_with_agent_routes(state)
+    async with TestClient(TestServer(as_owner(app))) as client:
+        response = await client.post(
+            "/api/chat/slots/remote-kind/agent",
+            json={"agent": TEMPLATE, "agent_kind": "template"},
+        )
+        assert response.status == 409, await response.text()
+        assert (await response.json())["code"] == "relay_archive_read_only"
+
+    assert (slot.agent, slot.agent_kind) == before
 
 
 @pytest.mark.asyncio

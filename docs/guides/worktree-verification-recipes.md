@@ -7,7 +7,7 @@ from the worktree root after the normal build and test gates pass.
 ## Command availability
 
 The pod lifecycle, packaged scenarios, diagnostic commands, and pod-e2e harness
-are on `main` today:
+are on `main`:
 
 - `kirocrew pod scenarios [--json]`
 - `kirocrew pod up/down/ls/status/logs/prune/api`
@@ -133,7 +133,9 @@ printf '%s\n' "$HANDLE" | jq -e '
   .status == "up" and (.base_url | startswith("http://127.0.0.1:"))
 ' >/dev/null
 
-bash "$HARNESS" "$WT" --no-suppress-first-run
+bash "$HARNESS" "$WT"
+# Onboarding or another first-run overlay changed? Run this instead:
+# bash "$HARNESS" "$WT" --no-suppress-first-run
 
 jq -se '
   any(.[]; .phase == "smoke" and .status == "pass") and
@@ -214,6 +216,7 @@ The existing routes and payloads are:
 | Operation | Route | Payload |
 |---|---|---|
 | Create | `POST /api/session-control/create` | optional `title`, `agent`, `folder_id` |
+| Fork | `POST /api/session-control/fork` | optional `source`, `title`, `folder_id`, integer `at_message_index`; the child carries the source's transcript |
 | Send | `POST /api/session-control/send` | required `target`, `message` |
 | Read | `GET /api/session-control/read` | query `target`; optional integer `limit`, `since` |
 | Stop | `POST /api/session-control/stop` | required `target` |
@@ -359,7 +362,7 @@ SHORT deliberately: a pod's private dashboard socket lives at
 gateway fall back to TCP-only, after which every `kirocrew pod api` call refuses
 correctly and permanently while the pod still answers health.
 
-CI runs this phase nightly on Linux and macOS. See
+CI runs this phase nightly on Linux, macOS and Windows. See
 [../ci/e2e-gate.md](../ci/e2e-gate.md) for that job.
 
 ## Restarting a harness-owned gateway

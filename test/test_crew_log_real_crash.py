@@ -19,13 +19,13 @@ import os
 import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
 
 from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog
+from kiro_crew.testing.wait import wait_until
 
 CHILD = Path(__file__).parent / "fixtures" / "crew_log_crash_child.py"
 SESSION = "crash-child-session"
@@ -34,22 +34,48 @@ SESSION = "crash-child-session"
 MARKER_TIMEOUT = 60.0
 
 
-def _wait_for_marker(marker: Path, expected: str) -> None:
-    """Block until *marker* holds exactly *expected*.
+#: How much of the child's output a failure quotes: enough for a traceback.
+OUTPUT_TAIL = 4000
+
+
+def _output_tail(out_path: Path) -> str:
+    return out_path.read_text(encoding="utf-8", errors="replace")[-OUTPUT_TAIL:]
+
+
+def _wait_for_marker(
+    marker: Path, expected: str, child: "subprocess.Popen[bytes]", out_path: Path
+) -> None:
+    """Block until *marker* holds exactly *expected*, or fail as soon as *child* exits.
 
     The exact value, not a prefix and not mere existence: a partially written
     marker would otherwise let the kill land while the child was still setting up,
     which turns a real defect into an intermittent one.
+
+    A wait for something a child writes also watches the child, and quotes what it
+    said: a crash before the failpoint is reported at once, by its own traceback,
+    rather than as a timeout with the cause unread. The marker is re-read after an
+    exit is seen, so a child that announces and then exits is still a success.
     """
-    deadline = time.monotonic() + MARKER_TIMEOUT
-    while time.monotonic() < deadline:
+
+    def _announced() -> bool:
         try:
-            if marker.read_text(encoding="utf-8") == expected:
-                return
+            return marker.read_text(encoding="utf-8") == expected
         except (FileNotFoundError, UnicodeDecodeError):
-            pass
-        time.sleep(0.02)
-    raise AssertionError(f"child never reached failpoint {expected!r}")
+            return False
+
+    wait_until(
+        lambda: _announced() or child.poll() is not None,
+        timeout=MARKER_TIMEOUT,
+        describe=lambda: (
+            f"child never reached failpoint {expected!r}; output:\n{_output_tail(out_path)}"
+        ),
+    )
+    if _announced():
+        return
+    raise AssertionError(
+        f"child exited with {child.poll()} before failpoint {expected!r}; "
+        f"output:\n{_output_tail(out_path)}"
+    )
 
 
 def _kill_at(tmp_path: Path, failpoint: str, marker_value: str) -> Path:
@@ -74,19 +100,26 @@ def _kill_at(tmp_path: Path, failpoint: str, marker_value: str) -> Path:
     }
     if sys.platform == "win32":  # pragma: no cover - the suite skips Windows
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
-    child = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
-        [sys.executable, str(CHILD), failpoint, str(marker)],
-        env=env,
-        # Confined to the temp directory: a failpoint added later that writes a
-        # relative path would otherwise land in the checkout, and a test that
-        # dirties the working tree is a test that fails the next gate run for
-        # reasons unrelated to itself.
-        cwd=tmp_path,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    # ONE file, not two pipes. Nothing reads a pipe before the kill, so a child that
+    # wrote more than the pipe buffer before its failpoint would block in the write and
+    # never get there. The file is also what the failure message quotes, and both
+    # streams go into it so a child that explains itself on stdout is not lost. The
+    # parent's handle is closed as soon as the child holds its own.
+    out_path = tmp_path / "child.output"
+    with out_path.open("wb") as out:
+        child = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+            [sys.executable, str(CHILD), failpoint, str(marker)],
+            env=env,
+            # Confined to the temp directory: a failpoint added later that writes a
+            # relative path would otherwise land in the checkout, and a test that
+            # dirties the working tree is a test that fails the next gate run for
+            # reasons unrelated to itself.
+            cwd=tmp_path,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+        )
     try:
-        _wait_for_marker(marker, marker_value)
+        _wait_for_marker(marker, marker_value, child, out_path)
         # SIGKILL, not terminate: no atexit hook, no drain, no chance to tidy up.
         # That is the whole point -- a graceful stop would exercise the shutdown
         # drain instead of a crash.
@@ -134,30 +167,7 @@ def _repair(home: Path) -> int:
 # Windows has no SIGKILL with these semantics and no fork-free equivalent that
 # leaves the file in the same state; the property is the same on every platform,
 # so it is asserted on the ones where the kill means what it says.
-#
-# macOS is skipped as a BISECT STEP, not because the property differs there. The
-# macOS backend shard that runs this file also runs the apps deps-provisioning
-# suite, and `test_concurrent_provisioning_is_serialized_by_the_deps_lock` began
-# failing on that shard with `ENOENT: .kirocrew-deps.lock` on the first head that
-# contained this file, and on every head since, while passing before it and passing
-# on other branches. That failure is a race in the provisioning code -- the lock is
-# opened through a pinned dir_fd, and ENOENT through a valid fd means the pinned
-# directory was unlinked -- and this suite spawns real processes that are killed, so
-# the interference is plausible even though the mechanism is not yet proven. Skipping
-# here isolates the two: if that shard goes green, the interference is real and both
-# the race and this interaction are followed up separately; if it still fails, this
-# file was never the cause and the skip is removed.
-#
-# The darwin half is SCOPED to kirodotdev/KiroCrew#10704, which owns removing it. A
-# real kill is asserted nowhere else, so an expiry-free skip would mean a macOS
-# regression in crash repair has no test that would catch it.
-pytestmark = pytest.mark.skipif(
-    sys.platform in ("win32", "darwin"),
-    reason=(
-        "win32: SIGKILL semantics differ; "
-        "darwin: bisecting shard interference, tracked in kirodotdev/KiroCrew#10704"
-    ),
-)
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="win32: SIGKILL semantics differ")
 
 
 def test_a_real_kill_leaves_an_open_turn_that_the_reader_closes(tmp_path):
@@ -223,3 +233,19 @@ def test_a_real_kill_between_chunks_and_their_citing_entry_is_repaired(tmp_path)
     after = [e["type"] for e in _entries(home)]
     assert "message/chunk" not in after, "unreachable chunks survived the repair"
     assert "turn/completed" in after, "the open turn was left open"
+
+
+def test_a_child_that_dies_before_its_failpoint_fails_at_once_with_its_output(tmp_path):
+    """A dead child fails the wait immediately, quoting why it died.
+
+    An unknown failpoint makes the child exit before it writes any marker. The wait
+    reports that exit and the child's own error rather than polling out
+    ``MARKER_TIMEOUT`` and then saying "never reached failpoint" with the cause
+    unread. A wait that only polls the marker spends the full ceiling here and then
+    fails the first assertion below.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        _kill_at(tmp_path, "no-such-failpoint", "turn-open")
+    message = str(excinfo.value)
+    assert "child exited with 1 before failpoint 'turn-open'" in message
+    assert "unknown failpoint 'no-such-failpoint'" in message, message

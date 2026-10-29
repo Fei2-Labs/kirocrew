@@ -12,17 +12,57 @@ import { safeGetItem } from '../../utils/safeStorage'
  * there is one definition and both surfaces import it.
  */
 
-export const SESSION_SORT_STORAGE_KEY = 'mc-session-sort'
+/** The order a session list draws with when no choice is stored. */
+export const DEFAULT_SESSION_SORT: SortKey = 'date-desc'
+/** The gateway config path the sort choice is stored at. */
+export const SESSION_SORT_CONFIG_PATH = 'dashboard.session_sort'
+/**
+ * Where earlier builds kept the choice, in this browser only. Read once by the
+ * sidebar's carry-over into the gateway config and then removed; nothing else
+ * reads or writes it.
+ */
+export const LEGACY_SESSION_SORT_STORAGE_KEY = 'mc-session-sort'
+// Mirrors SESSION_SORT_MODES in src/kiro_crew/config/sections.py.
 const SORT_KEYS = new Set<SortKey>([
-  'date-desc', 'date-asc', 'created-desc', 'created-asc', 'name-asc', 'name-desc',
+  'date-desc', 'date-asc', 'created-desc', 'created-asc', 'name-asc', 'name-desc', 'manual',
 ])
 
-export function readSessionSortKey(): SortKey {
-  const stored = safeGetItem(SESSION_SORT_STORAGE_KEY)
-  return stored && SORT_KEYS.has(stored as SortKey) ? stored as SortKey : 'date-desc'
+function isSessionSortKey(raw: unknown): raw is SortKey {
+  return typeof raw === 'string' && SORT_KEYS.has(raw as SortKey)
 }
 
-export type SortKey = 'date-desc' | 'date-asc' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc'
+/**
+ * A stored `dashboard.session_sort` value read as a sort key. Missing (no config
+ * body yet, or an older gateway) or unknown reads as the default, the same
+ * choice the gateway's loader makes.
+ */
+export function readSessionSortKey(raw: unknown): SortKey {
+  return isSessionSortKey(raw) ? raw : DEFAULT_SESSION_SORT
+}
+
+/** The slice of the `['kirocrewConfig']` body the session sort is read from. */
+export type SessionSortConfigBody = { dashboard?: { session_sort?: unknown } }
+
+/** The browser-held choice from an earlier build, or null when absent or unknown. */
+export function readLegacySessionSortKey(): SortKey | null {
+  const stored = safeGetItem(LEGACY_SESSION_SORT_STORAGE_KEY)
+  return isSessionSortKey(stored) ? stored : null
+}
+
+/** `manual` is the person's own drag order, kept on the gateway (each slot row
+ *  carries its place as `manual_rank`). */
+export type SortKey = 'date-desc' | 'date-asc' | 'created-desc' | 'created-asc' | 'name-asc' | 'name-desc' | 'manual'
+
+/** Catalog key per sort option, the label the sort menu shows for it. */
+export const SORT_LABEL_KEY: Record<SortKey, string> = {
+  'date-desc': 'pages.chatSidebar.sort_newest',
+  'date-asc': 'pages.chatSidebar.sort_oldest',
+  'created-desc': 'pages.chatSidebar.sort_created_newest',
+  'created-asc': 'pages.chatSidebar.sort_created_oldest',
+  'name-asc': 'pages.chatSidebar.sort_name_asc',
+  'name-desc': 'pages.chatSidebar.sort_name_desc',
+  manual: 'pages.chatSidebar.sort_manual',
+}
 
 /** The subset of a session either surface needs in order to rank it. Active
  *  slots carry ISO `last_turn_ts` / `last_ts`; history items carry epoch-seconds
@@ -34,11 +74,34 @@ export interface Sortable {
   last_turn_ts?: string
   last_ts?: string
   modified?: number
+  /** Place in the gateway's manual order, or null/absent when it has none. */
+  manual_rank?: number | null
+}
+
+/**
+ * The manual order: sessions with no place first (a new session shows at the
+ * top), newest created first among them, then the placed ones by place. `rank`
+ * reads a session's place; the default reads the row's own `manual_rank`, and
+ * the sidebar passes the order it is drawing, which may be a gesture the
+ * gateway has not answered yet.
+ */
+export function compareManual(
+  a: Sortable,
+  b: Sortable,
+  rank: (item: Sortable) => number | undefined = item => item.manual_rank ?? undefined,
+): number {
+  const ra = rank(a)
+  const rb = rank(b)
+  if (ra === undefined || rb === undefined) {
+    if (ra !== rb) return ra === undefined ? -1 : 1
+    return compareBySort(a, b, 'created-desc')
+  }
+  return ra - rb
 }
 
 /** Settled activity instant of an ACTIVE slot, as the ISO string the backend
  *  sent. `last_turn_ts` moves only when a prompt arrives or a turn ends, whereas
- *  `last_ts` is the newest row of any role and advances on every streamed tool
+ *  `last_ts` is the newest saved row of any role and advances on every streamed tool
  *  call — ranking or labelling a row by that makes the list churn while agents
  *  work. Display, date segmenting and the recency tint all read THIS so a row's
  *  visible timestamp cannot disagree with the position it was sorted into. */
@@ -77,6 +140,7 @@ export function lastActivityEpoch(item: Sortable): number {
 
 /** Shared comparator for both active sessions and history items. */
 export function compareBySort(a: Sortable, b: Sortable, key: SortKey): number {
+  if (key === 'manual') return compareManual(a, b)
   if (key === 'name-asc' || key === 'name-desc') {
     // Session titles are free text, so ordering follows the app language:
     // `compareText` is case- and accent-insensitive with numeric collation, so
@@ -168,7 +232,7 @@ export function fmtRelativeTime(ts: string | number | undefined): string {
   const time = fmtDateFields(d, { hour: '2-digit', minute: '2-digit' })
   if (daysAgo <= 0) return time
   // The existing catalog key, NOT `fmtRelative`: CLDR returns a lowercase
-  // "yesterday", which clashed with the capitalized group header in ChatSidebar
+  // "yesterday", which clashed with the capitalized group header in chat-sidebar/chrome.tsx
   // that already uses this same key. One key, one casing.
   if (daysAgo === 1) return `${i18nT('pages.chatSidebar.yesterday')} ${time}`
   if (daysAgo <= 6) return `${fmtDateFields(d, { weekday: 'short' })} ${time}`

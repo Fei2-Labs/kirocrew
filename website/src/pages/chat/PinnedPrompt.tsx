@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react
 import { ChevronDown, ImageOff } from 'lucide-react'
 import { i18nT } from '../../i18n/t'
 import { useReducedMotion } from '../../hooks/useReducedMotion'
+import { EdgeFade } from '../../app-sdk/ChatScrollChrome'
 import { ROW_PAD_Y, PINNED_PREVIEW_LINES, PINNED_RESTING_LINES, pinnedImageUrl } from '../../utils/pinnedPrompt'
 
 interface PinnedPromptProps {
@@ -37,6 +38,17 @@ interface PinnedPromptProps {
    * chasing it would lag behind the row it is supposed to track.
    */
   liveH?: number
+  /**
+   * The tallest the card may be, in px — from its top to the transcript floor
+   * (`computePinnedCardMaxH`). Set as the box's `max-height`, which outranks
+   * both writers of its `height` (the fold's `liveH` and the expand/peek morph)
+   * by CSS rule, so neither can grow the card past the scroller's content area
+   * and onto the composer dock below it. The expanded text's own scroll cap
+   * shrinks under it too (see the flex column on the body button), so a capped
+   * card scrolls its prompt rather than clipping the end of it. Absent means
+   * unbounded — the host has not measured a floor.
+   */
+  maxH?: number
   /** Measured card height, used to shrink the backing band as the card is pushed. */
   bannerH: number
   expanded: boolean
@@ -67,11 +79,22 @@ interface PinnedPromptProps {
    * expanded-size height and moves the line by the difference.
    */
   onCollapsedHeight?: (h: number) => void
+  /**
+   * Identity of the pinned prompt (`pinCandidateKey` in usePinnedPrompt: its
+   * transcript index and `ts`). The host resets the resting height it holds to
+   * the seed whenever this changes, so the card must report again for the new
+   * identity — and it is not remounted for one (a remount would restart the
+   * glide and the morph), so `text` alone cannot carry the signal: the same text
+   * at a new index (older history prepended) or one image-only prompt handing
+   * off to another leaves `text` unchanged. The collapsed-height measure below
+   * re-runs on a change of this key and reports what it reads.
+   */
+  promptKey?: string
 }
 
 /**
  * Vertical padding a transcript row puts around its bubble (`py-1` on the
- * message row wrapper in ChatPage). The pinned band reproduces it so the card
+ * message row wrapper in ChatTranscriptView). The pinned band reproduces it so the card
  * sits the same distance below the fold as a bubble sits below its row top —
  * which is also what makes the hand-off land on the exact same pixel. Imported
  * from the geometry module because the hand-off line is derived from the same
@@ -113,14 +136,18 @@ const THUMB_FRAME = 'bg-muted forced-colors:border'
  * the session title.
  *
  * The card is a pixel-for-pixel copy of the user bubble's own box — same
- * `px-4 mx-auto` content column, right-aligned, `max-w-[550px]`, `px-4 py-2
+ * `px-4 mx-auto` content column, right-aligned, the bubble's own `max-w-full`
+ * cap (so both follow Settings → Chat → Content Width, #8398), `px-4 py-2
  * rounded-xl bg-card text-sm` with an inner `my-1 leading-6` paragraph —
  * because the transcript row it represents is hidden while it is pinned (see
- * ChatPage's row `visibility`). For a one-line prompt the two are the same size
- * at the same place at the moment of hand-off, so the bubble appears to stop
- * travelling and stick rather than being replaced. A taller prompt hands over
- * once its bottom edge reaches the band's bottom (`pinHandoffY`), i.e. once it is
- * completely covered by the band, so the swap still happens out of sight. The
+ * ChatTranscriptView's row `visibility`; the row's action strip beneath the bubble is
+ * re-shown in place by index.css's `[data-pinned-standin]` rule, since this card
+ * copies the bubble and nothing below it). For a one-line prompt the two are the
+ * same size at the same place at the moment of hand-off, so the bubble appears to
+ * stop travelling and stick rather than being replaced. A taller prompt hands
+ * over at the same line — its row top on the fold (`pinHandoffY`) — and the card
+ * then folds down the bubble's remaining height (`liveH`), so the swap is still a
+ * box replaced by an identical box. The
  * box also carries the bubble's `user-bubble` theme hook, so a theme that tints
  * the bubble (kiro-light) tints the card identically and the swap stays
  * invisible there too. Keep
@@ -176,12 +203,20 @@ const THUMB_FRAME = 'bg-muted forced-colors:border'
  * size and the band it slides through is sized for it.
  */
 export default function PinnedPrompt({
-  text, fullText, images, bodyBeyondPreview, pushUp, liveH, bannerH, expanded, onToggleExpanded, onJump, cardRef, onCollapsedHeight, scrollTranscriptBy,
+  text, fullText, images, bodyBeyondPreview, pushUp, liveH, maxH, bannerH, expanded, onToggleExpanded, onJump, cardRef, onCollapsedHeight, scrollTranscriptBy, promptKey,
 }: PinnedPromptProps) {
   const textRef = useRef<HTMLParagraphElement | null>(null)
   const boxRef = useRef<HTMLDivElement | null>(null)
   const lastBoxH = useRef<number | null>(null)
   const [clamped, setClamped] = useState(false)
+  // Natural height of the whole band when a peeked or expanded card owns it —
+  // the card box's own height plus the band's `py-1` padding (ROW_PAD_Y both
+  // sides). Used only to shrink the band from the bottom during an expanded/peek
+  // push: unlike the collapsed path, that height is not derived from `bannerH`
+  // (which is the one-line measured height), so it is measured here. A transform
+  // on the card wrapper does not change the box's layout height, so the resting
+  // measurement stays valid for the whole push.
+  const [cardBoxH, setCardBoxH] = useState(0)
   const reducedMotion = useReducedMotion()
   // Pointer over the card, or keyboard focus inside it. Two sources feed one
   // flag: a hover peek that closed the moment the pointer left would also close
@@ -306,6 +341,11 @@ export default function PinnedPrompt({
     }
     el.dataset.foldOwned = '1'
     el.style.transition = ''
+    // A morph the fold is interrupting may have left its `flex-start` behind
+    // (its transitionend never fires once the transition is cleared). Drop it:
+    // the fold wants the stretch, so the paragraph tracks the box under the
+    // ceiling, and a stale override here would outlive the fold too.
+    el.style.alignItems = ''
     el.style.overflow = 'hidden'
     el.style.height = `${liveH}px`
   }, [liveH])
@@ -442,7 +482,7 @@ export default function PinnedPrompt({
     // the next read is the true natural height.
     const inflight = !!el.style.height
     const current = inflight ? el.getBoundingClientRect().height : null
-    if (inflight) { el.style.height = ''; el.style.transition = ''; el.style.overflow = '' }
+    if (inflight) { el.style.height = ''; el.style.transition = ''; el.style.overflow = ''; el.style.alignItems = '' }
     const target = el.getBoundingClientRect().height
     const from = current ?? lastBoxH.current
     lastBoxH.current = target
@@ -460,6 +500,15 @@ export default function PinnedPrompt({
     // morph fire on every hover, which is far more often than the chevron did.
     if (reducedMotion) return
     el.style.overflow = 'hidden'
+    // The box is `items-stretch` (so the `maxH` ceiling can shrink the body — see
+    // the JSX), but for the morph's duration the body must keep its NATURAL
+    // height and be revealed by the moving edge, as it always was: stretched to
+    // the animating height, the scrollable paragraph would shrink with it and
+    // flash a scrollbar for 150ms on every expand. `flex-start` for the morph,
+    // cleared with the other inline values on transitionend — at which point the
+    // stretch resumes and, if the ceiling bites, the paragraph settles into its
+    // scrolling size exactly once, at the end.
+    el.style.alignItems = 'flex-start'
     el.style.height = `${from}px`
     void el.getBoundingClientRect() // force reflow so the next assignment animates
     el.style.transition = `height ${MORPH_MS}ms ${MORPH_EASE}`
@@ -469,6 +518,7 @@ export default function PinnedPrompt({
       el.style.transition = ''
       el.style.height = ''
       el.style.overflow = ''
+      el.style.alignItems = ''
       el.removeEventListener('transitionend', done)
     }
     el.addEventListener('transitionend', done)
@@ -506,7 +556,48 @@ export default function PinnedPrompt({
     ro.observe(el)
     if (box) ro.observe(box)
     return () => ro.disconnect()
-  }, [text, expanded, peek, folding, onCollapsedHeight])
+    // `promptKey` re-runs this for a new prompt identity whose text is unchanged:
+    // the host has reset its resting height to the seed for that identity, and
+    // nothing above resizes (same text, same box), so without the key the
+    // observer never fires and the seed stays in place under this card.
+  }, [text, expanded, peek, folding, onCollapsedHeight, promptKey])
+
+  // Whether the expanded paragraph has content below its visible edge. Re-read on
+  // its own scroll (the reader moving through it), on a resize of the paragraph
+  // (the ceiling or the viewport moving the edge) and on expand itself.
+  const [moreBelow, setMoreBelow] = useState(false)
+  const measureMoreBelow = useCallback(() => {
+    const el = textRef.current
+    if (!el) return
+    setMoreBelow(el.scrollHeight - el.clientHeight - el.scrollTop > 1)
+  }, [])
+  useEffect(() => {
+    if (!expanded) { setMoreBelow(false); return }
+    const el = textRef.current
+    if (!el) return
+    measureMoreBelow()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measureMoreBelow)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [expanded, fullText, shown.length, measureMoreBelow])
+
+  // Measure the card box's natural height, so an expanded or peeked band can be
+  // shrunk from the bottom by `pushUp` the way the collapsed path is shrunk from
+  // `bannerH`. Observed rather than read once because the expanded card's height
+  // changes with its content, the 40vh cap, and the host font size. Only consumed
+  // while `backdropOwnsNaturalHeight && pushUp > 0`; at rest the band height is
+  // `undefined` (auto) and this value is unused.
+  useEffect(() => {
+    const el = boxRef.current
+    if (!el) return
+    const measure = () => setCardBoxH(el.getBoundingClientRect().height)
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [expanded, peek, fullText, shown.length])
 
   // Images earn the chevron on their own. Without this an image-only prompt never
   // clamps (no text to clamp), so the readable expanded strip was unreachable and
@@ -521,55 +612,134 @@ export default function PinnedPrompt({
   // the fold ends. A control whose feedback is deferred and displaced like that is
   // worse than no control, and the thing it offers is already on screen.
   const showChevron = !folding && (clamped || images.length > 0 || bodyBeyondPreview || expanded)
+  // The push ALWAYS rides the card, never the band. The band's top is the fold and
+  // it never translates, so its box can never rise over the chat header's title row
+  // and divider in the same overlay. The card stays an IN-FLOW child of the band, so
+  // the band's own height tracks the card at rest (an expanded or peeked card is
+  // multi-line, and a band that did not size to it would clip the card to a sliver).
+  const cardPushUp = pushUp
+  // Height of the opaque MASK layer behind the card — the card's own box plus the
+  // band's `py-1` padding (ROW_PAD_Y both sides), minus the push. The mask is
+  // absolutely positioned from the band top (the fold) and shrinks from the bottom
+  // as the push rises, so its `bg-bg` fill and the `top-full` lower fade mounted on
+  // it follow the card out of view with no empty opaque strip left over the
+  // transcript below. `cardBoxH` is measured (a transform on the card does not
+  // change its layout height, so the resting measurement holds through the push);
+  // `bannerH` is the collapsed fallback before the first measure. The card itself is
+  // clipped by its own in-flow wrapper during the push (`cardClipped`), so the part
+  // that has risen above the fold is hidden rather than painting over the header.
+  //
+  // While FOLDING, the mask ends at the card's bottom (no bottom ROW_PAD_Y) and the
+  // lower fade is not rendered (see the JSX): during a fold the card's bottom sits
+  // on the pinned bubble's bottom, and the hidden row's action strip is forced
+  // visible just below it (`[data-pinned-standin="folding"]` in index.css). The
+  // extra ROW_PAD_Y of opaque fill plus a 24px top-full gradient would otherwise
+  // paint over that strip, so its controls would be clickable but invisible.
+  const maskBottomPad = folding ? 0 : ROW_PAD_Y
+  const maskBaseH = cardBoxH > 0
+    ? cardBoxH + ROW_PAD_Y + maskBottomPad
+    : (bannerH > 0 ? ROW_PAD_Y + maskBottomPad + bannerH : 0)
+  const maskH = maskBaseH > 0 ? Math.max(0, maskBaseH - pushUp) : undefined
+  // Clip the card's in-flow wrapper only while it is being pushed out: the clip is
+  // what hides the part of the card that has risen above the fold (the wrapper's top
+  // edge) so it never paints over the header, and reveals the card away as the next
+  // prompt pushes it up. At rest the wrapper is `overflow: visible` so an expanded or
+  // peeked card is never cut, and `shadow-sm` (`0 1px 2px`) still renders in the
+  // first push frame against the band's `py-1` beneath the card, so nothing pops.
+  const cardClipped = pushUp > 0
 
   return (
     <div
       className="relative px-4 py-1 mx-auto w-full pointer-events-none flex items-start justify-end"
       style={{
         maxWidth: 'var(--mc-content-width, 900px)',
-        // Clip ONLY while collapsed AND being pushed. The clip is what reveals
-        // the card away as the next prompt pushes it up. Two things it must NOT
-        // do: (1) clip the EXPANDED card at rest — an expanded prompt grows
-        // multi-line past the collapsed band height, and a constant `hidden` cut
-        // its lower lines off; (2) reintroduce the transition blink. The blink is
-        // not the overflow flip itself but a ~4.5px HEIGHT jump alongside it.
-        // With the continuous height below, flipping
-        // `visible`→`hidden` at pushUp>0 is seamless: the card has 4px of band
-        // padding beneath it, enough for `--shadow-sm` (`0 1px 2px`) to still
-        // render in the first push frame, so nothing pops. The peek needs no
-        // term here: it closes the moment `pushUp > 0` (see `peek` above), so a
-        // pushed card is always its resting size.
-        overflow: pushUp > 0 && !expanded ? 'hidden' : 'visible',
-        // Height must be CONTINUOUS through pushUp === 0, or the clip box jumps
-        // the moment the push starts. Carrying both paddings (ROW_PAD_Y * 2)
-        // makes this formula equal the natural height at rest and shrink smoothly
-        // from there. pushUp travels ROW_PAD_Y + bannerH (see computePinPush), so
-        // it bottoms out at a ROW_PAD_Y-tall, empty, transparent strip with the
-        // card entirely clipped away — no fragment of it survives the no-banner
-        // stretch that a tall incoming prompt opens up.
-        height: bannerH > 0
-          ? Math.max(0, ROW_PAD_Y * 2 + bannerH - pushUp)
-          : undefined,
+        // The band NEVER translates and its top edge is the fold line, so its box
+        // can never rise over the chat header's title row and divider above it in
+        // the same overlay. `overflow: visible` on the band is load-bearing: the
+        // lower `EdgeFade` hangs off the mask layer's BOTTOM (`top-full`), entirely
+        // outside that layer's box, so a clip on the band would erase it the moment
+        // a push started — the collapsed-push fade-clip regression. The card is
+        // clipped by its OWN in-flow wrapper instead (`cardClipped`), which has no
+        // fade in it.
+        //
+        // No explicit height: the band's height tracks its IN-FLOW card so a peeked
+        // or expanded card is never clipped to a sliver. The push shrink lives on
+        // the absolute mask layer below (`maskH`), not here, because a card is
+        // translated (not shrunk) and an explicit band height would either cut the
+        // in-flow card or stop tracking it.
+        overflow: 'visible',
       }}
     >
+      {/* Opaque MASK layer behind the card: a transcript-width `bg-bg` fill that
+          stops reply text leaking around the narrower card's sides, plus the lower
+          `EdgeFade` hung off its bottom (`anchor="below"` → `top-full`). Absolutely
+          positioned from the band top (the fold) and sized by `maskH`, which is the
+          card's height minus the push — so the fill's bottom and the fade rise with
+          the card as it is pushed out and leave no empty opaque strip over the
+          transcript below. `overflow: visible` so the `top-full` fade, which sits
+          just beneath the fill, is never clipped. `z-0` keeps it behind the card. */}
       <div
-        ref={cardRef}
-        data-testid="pinned-prompt"
-        // Interactive, always. This card sits in a `pointer-events-none` overlay
-        // that is a SIBLING of the transcript scroller, so an interactive box here
-        // would swallow a wheel: the browser hunts for a scrollable ancestor of the
-        // box and finds the overlay, then the page, never the transcript. Going
-        // inert dodges that but costs the reader the content — while the fold holds
-        // the card over lines they have not read, an inert card cannot be selected,
-        // copied or clicked, and its two buttons keep their hover styling while
-        // doing nothing. So the gesture is FORWARDED instead (see
-        // `scrollTranscriptBy`) and the card keeps its pointer events.
-        className="pointer-events-auto max-w-[550px] min-w-0"
-        style={{ transform: `translateY(${-pushUp}px)`, willChange: 'transform' }}
+        aria-hidden
+        className="absolute left-0 right-0 top-0 z-0 pointer-events-none"
+        style={{ height: maskH }}
+      >
+        <div className="absolute inset-0 bg-bg" />
+        {/* The lower fade is suppressed while FOLDING: during a fold the hidden
+            row's action strip is forced visible just below the card, and a 24px
+            top-full gradient starting fully opaque would paint over it. The mask
+            fill also ends at the card's bottom while folding (see `maskBottomPad`),
+            so nothing covers the strip. */}
+        {!folding && <EdgeFade side="top" anchor="below" />}
+      </div>
+      {/* The card's IN-FLOW clip wrapper. In flow so the band's height tracks it
+          (no sliver), `max-w-full min-w-0` so it never widens past the bubble cap.
+          `overflow: hidden` ONLY while pushing, so the part of the translated card
+          that has risen above this wrapper's top (the fold) is hidden rather than
+          painting over the header; `visible` at rest so an expanded or peeked card
+          is shown in full. `relative z-[1]` lifts the card above the mask fill. */}
+      <div
+        className="relative z-[1] min-w-0 max-w-full flex justify-end"
+        style={{ overflow: cardClipped ? 'hidden' : 'visible' }}
       >
         <div
+          ref={cardRef}
+          data-testid="pinned-prompt"
+          // Interactive, always. This card sits in a `pointer-events-none` overlay
+          // that is a SIBLING of the transcript scroller, so an interactive box here
+          // would swallow a wheel: the browser hunts for a scrollable ancestor of the
+          // box and finds the overlay, then the page, never the transcript. Going
+          // inert dodges that but costs the reader the content — while the fold holds
+          // the card over lines they have not read, an inert card cannot be selected,
+          // copied or clicked, and its two buttons keep their hover styling while
+          // doing nothing. So the gesture is FORWARDED instead (see
+          // `scrollTranscriptBy`) and the card keeps its pointer events.
+          //
+          // `relative z-[1]` keeps the card in the clip wrapper's own stacking
+          // context, which already sits above the `z-0` mask layer behind it, so
+          // the card's own text and ring paint on top of the opaque fill.
+          className="relative z-[1] pointer-events-auto max-w-full min-w-0"
+          style={{ transform: `translateY(${-cardPushUp}px)`, willChange: 'transform' }}
+        >
+          <div
           ref={boxRef}
-          className="user-bubble flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm"
+          // `items-stretch`, not `items-start`, and that is what makes `maxH` work
+          // rather than merely clip. A single-line flex container clamps its one
+          // line to its own max-height (css-flexbox §9.4 step 8) and a stretched
+          // item takes that clamped size as a DEFINITE height — so the body
+          // button below is exactly as tall as the room the ceiling leaves, and its
+          // scrollable paragraph (a `min-h-0` column item) shrinks to fit inside it
+          // instead of running past the box's edge into a clipped dead zone. The
+          // chevron carries its own `h-6`, which stretch never touches, so it still
+          // sits on the first line. At rest the stretch is invisible: the body is
+          // the box's only content, so the line is its height either way.
+          //
+          // `overflow-hidden` makes the ceiling a guarantee rather than a layout
+          // outcome: whatever inside refuses to shrink (an image strip wrapped to
+          // more rows than the room allows) is cut at the box's edge instead of
+          // painting on past it over the composer. The fold and the morph set the
+          // same value inline for their duration and clear it back to this.
+          className="user-bubble flex items-stretch gap-2 overflow-hidden rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm"
+          style={maxH != null ? { maxHeight: maxH } : undefined}
         >
           <button
             type="button"
@@ -584,29 +754,12 @@ export default function PinnedPrompt({
             title={folding ? undefined : i18nT('pages.chat.pinnedPrompt.jump_to_this_turn')}
             aria-disabled={folding || undefined}
             tabIndex={folding ? -1 : undefined}
-            className={`min-w-0 flex-1 bg-transparent border-none p-0 m-0 text-left ${folding ? '' : 'cursor-pointer'}`}
+            // A flex COLUMN so the paragraph can give height back (see the box's
+            // `items-stretch`). `min-h-0` on the button for the same reason one
+            // level up: a flex item's automatic minimum is its content height,
+            // which would let the column refuse to shrink below the full prompt.
+            className={`min-w-0 min-h-0 flex-1 flex flex-col bg-transparent border-none p-0 m-0 text-left ${folding ? '' : 'cursor-pointer'}`}
           >
-            {/* Expanded: images get their own strip at readable size, outside the
-                scrollable <p> so they stay put while long text scrolls. */}
-            {expanded && shown.length > 0 && (
-              <span className="flex flex-wrap gap-2 my-1">
-                {shown.map(src => (
-                  // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
-                  <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
-                    onError={() => markFailed(src)}
-                    className={`h-20 w-auto max-w-[160px] rounded object-cover p-0.5 ${THUMB_FRAME}`} />
-                ))}
-              </span>
-            )}
-            {/* The same all-failed fallback the collapsed card gets. Without it,
-                expanding an image-only prompt whose files are gone empties the card
-                completely — the strip is skipped and `fullText` is '' — so the
-                chevron's reward would be a blank box. */}
-            {expanded && !fullText && images.length > 0 && shown.length === 0 && (
-              <span className="flex my-1">
-                <ImageOff size={28} aria-hidden className="text-muted" />
-              </span>
-            )}
             <p
               ref={textRef}
               // The fold outranks `expanded`. Both can be true at once: the reader can
@@ -616,11 +769,27 @@ export default function PinnedPrompt({
               // over unread lines — the exact hole this fold exists to close. While
               // folding the text always wraps in full, so the box stays full of text;
               // the cap resumes the moment the fold ends.
-              className={`my-1 leading-6 ${folding
+              //
+              // `min-h-0` in every state: the paragraph is a column item, and the
+              // box's `maxH` ceiling reaches it only if it is allowed to shrink. The
+              // expanded `40vh` is then an upper cap on top of that — on a tall pane
+              // the card still takes at most 40vh, on a short one it takes the room
+              // the floor leaves and scrolls the rest.
+              //
+              // `pinned-scroll-more` (index.css) fades the paragraph's bottom edge
+              // while content continues below it — a mask, so no fill and no extra
+              // element. Set from the scroll position below, never unconditionally:
+              // a permanent fade would dim the prompt's last line once the reader
+              // reaches it, and a prompt that fits would lose its last line for
+              // nothing. A cut line with nothing to say "more" read as a rendering
+              // defect, not a scroll region — the scrollbar is overlay-hidden on
+              // macOS and absent from a headless capture.
+              className={`my-1 leading-6 min-h-0 ${folding
                 ? 'whitespace-pre-wrap break-words overflow-hidden'
                 : expanded
-                  ? 'whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto'
+                  ? `whitespace-pre-wrap break-words max-h-[40vh] overflow-y-auto${moreBelow ? ' pinned-scroll-more' : ''}`
                   : 'overflow-hidden'}`}
+              onScroll={expanded ? measureMoreBelow : undefined}
               style={expanded || folding ? { overflowWrap: 'anywhere' } : {
                 // Tailwind ships `line-clamp-<n>` only for a literal n, and the
                 // line counts are shared with the geometry module — so set the
@@ -648,9 +817,12 @@ export default function PinnedPrompt({
                   full-size image, and the taller card only moves the hand-off line
                   DOWN (see PINNED_RESTING_LINES). */}
               {!expanded && shown.map(src => (
-                // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
+                // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/click-events-have-key-events -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph); the click is a pointer shortcut for the chevron, which always renders when there are images and is the keyboard path
                 <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                   onError={() => markFailed(src)}
+                  // A thumbnail asks to see the image, so it expands the card in
+                  // place instead of reaching the body button's jump.
+                  onClick={e => { if (folding) return; e.stopPropagation(); onToggleExpanded() }}
                   className={`inline-block align-middle mr-1.5 rounded-sm object-cover p-px ${THUMB_FRAME} ${
                     text ? 'h-[1.4em] w-[1.4em]' : 'h-[2.8em] w-[3.6em]'}`} />
               ))}
@@ -659,6 +831,33 @@ export default function PinnedPrompt({
                   exists to fix, so leave a neutral icon standing in for them. */}
               {!expanded && !text && images.length > 0 && shown.length === 0 && (
                 <ImageOff size={20} aria-hidden className="inline-block align-middle text-muted" />
+              )}
+              {/* Expanded: images at readable size, as the leading content of the
+                  SAME scroll region as the text. One region, not a strip beside a
+                  scrolling paragraph: under the ceiling two sibling scroll areas
+                  shrank the strip to a sliver (flex shares the loss by base size,
+                  and a 30-line prompt dwarfs a row of thumbnails) and gave the
+                  wheel two places to land. Here the thumbnails scroll away with the
+                  first lines and come back with them. `mb-1` keeps the 4px gap the
+                  block layout gave between the strip and the text. */}
+              {expanded && shown.length > 0 && (
+                <span className="flex flex-wrap gap-2 mb-1">
+                  {shown.map(src => (
+                    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
+                    <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
+                      onError={() => markFailed(src)}
+                      className={`h-20 w-auto max-w-[160px] rounded object-cover p-0.5 ${THUMB_FRAME}`} />
+                  ))}
+                </span>
+              )}
+              {/* The same all-failed fallback the collapsed card gets. Without it,
+                  expanding an image-only prompt whose files are gone empties the card
+                  completely — the strip is skipped and `fullText` is '' — so the
+                  chevron's reward would be a blank box. */}
+              {expanded && !fullText && images.length > 0 && shown.length === 0 && (
+                <span className="flex mb-1">
+                  <ImageOff size={28} aria-hidden className="text-muted" />
+                </span>
               )}
               {expanded || folding ? fullText : text}
             </p>
@@ -682,6 +881,7 @@ export default function PinnedPrompt({
             </button>
           )}
         </div>
+      </div>
       </div>
     </div>
   )

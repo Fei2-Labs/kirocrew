@@ -66,6 +66,17 @@ class TestChatTagTool:
         descriptor = next(t for t in mcp_core._list_tools() if t["name"] == "chat_tag")
         assert descriptor["inputSchema"]["type"] == "object"
 
+    def test_unprotected_status_recovery_names_owner_adoption(self):
+        """The description is what an agent relays when set_state is refused
+        status_identity_unprotected. A rowless tag's status toggle is disabled
+        in the tag manager and a status PATCH answers tag_id_not_grantable, so
+        the only working remedy is the owner's "Set up agent permissions"."""
+        descriptor = next(t for t in mcp_core._list_tools() if t["name"] == "chat_tag")
+        text = descriptor["description"]
+        assert "Set up agent permissions" in text
+        assert "PATCH with an explicit status" not in text
+        assert "toggling that tag's status off and on" not in text
+
 
 # ───────────────────────────── the policy helper ─────────────────────────────
 
@@ -208,6 +219,54 @@ class TestAgentTagPolicy:
         monkeypatch.setattr(chat_tag_grants.Path, "read_text", _boom)
         # Same signature -> served from the cache, no read.
         assert agent_tag_policy({"id": "planned"}) == "none"
+
+    def test_malformed_store_snapshot_pairs_empty_rows_with_unhealthy(self):
+        """A snapshot of a malformed store must never pair HEALTHY health with
+        the fail-closed empty row map: the row install and the health flag land
+        in one critical section, so a reader cannot observe ``_degraded is None``
+        beside empty rows and treat a reserved tag as a healthy rowless label.
+        """
+        path = chat_tag_grants._store_path()
+        path.write_text("{not json", encoding="utf-8")
+        chat_tag_grants.refresh_cache()
+        snap = chat_tag_grants.capture_grants_snapshot()
+        # Empty rows (fail-closed) AND both health axes report the store is not
+        # healthy — the pairing the install/flag split would have broken.
+        assert snap.has_row("planned") is False
+        assert snap.write_blocked() is not None
+        assert snap.grants_reduced() is not None
+
+    def test_store_vanishing_mid_read_fails_closed_not_stale_healthy(self, monkeypatch):
+        """If the store is deleted/renamed BETWEEN the opening stat and the
+        install-time re-stat of one refresh, the prior healthy cache must not
+        survive to authorize writes against a now-absent store. The re-stat sees
+        the store gone and clears the cache + marks it missing (fail closed),
+        rather than leaving the just-read snapshot installed."""
+        # The autouse fixture already seeded a healthy, verified store; warm the
+        # cache so ``planned`` resolves to its real add-remove row.
+        chat_tag_grants.refresh_cache()
+        assert chat_tag_grants.has_grant_row("planned") is True
+
+        # Force the fast cache-hit path to MISS (1st stat returns a different
+        # signature) and the install-time re-stat to see the store GONE (None) —
+        # exactly the window the fix closes.
+        real_stat = chat_tag_grants._stat_signature
+        calls = {"n": 0}
+
+        def _stat(p):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                sig = real_stat(p)
+                return (sig[0] + 1,) + tuple(sig[1:]) if sig is not None else None
+            return None
+
+        monkeypatch.setattr(chat_tag_grants, "_stat_signature", _stat)
+        chat_tag_grants.refresh_cache()
+        monkeypatch.undo()
+        snap = chat_tag_grants.capture_grants_snapshot()
+        # The stale healthy row is gone; the store reads as missing/unavailable.
+        assert snap.has_row("planned") is False
+        assert snap.write_blocked() is not None
 
     def test_malformed_row_dropped_individually(self):
         import json
@@ -378,6 +437,7 @@ def _no_disk(monkeypatch, tmp_path):
     chat_tag_grants._cache = None
     chat_tag_grants._degraded = None
     chat_tag_grants._quarantined_this_boot = False
+    chat_tag_grants._quarantine_repaired = False
     _seed_grants(_VOCAB)
 
     async def _save(state, slot, force=False, expected_history_key=None):
@@ -391,6 +451,7 @@ def _no_disk(monkeypatch, tmp_path):
     chat_tag_grants._cache = None
     chat_tag_grants._degraded = None
     chat_tag_grants._quarantined_this_boot = False
+    chat_tag_grants._quarantine_repaired = False
 
 
 def _seed_grants(vocab):
@@ -1316,19 +1377,24 @@ class TestGrantsStoreMaskedFromAgents:
     def test_grant_grammar_is_dashboard_free_for_context(self):
         """``context.py`` screens the [BOARD] rail with the grant grammar and
         must stay free of ``kiro_crew.dashboard`` imports (seventeen dashboard
-        modules import it). The grammar therefore lives in its own module, and
-        the grants store re-exports the same objects so the mint and the rail
-        cannot drift."""
+        modules import it), and so must the ``context_assembly`` owners it is
+        composed from, which hold that rail's code. The grammar therefore lives
+        in its own module, and the grants store re-exports the same objects so
+        the mint and the rail cannot drift."""
         import importlib
         import inspect
+        from pathlib import Path
 
         from kiro_crew import board_tag_grammar, context
         from kiro_crew.dashboard import chat_tag_grants as g
 
         assert g.is_grantable_tag_id is board_tag_grammar.is_grantable_tag_id
         assert g.DEFAULT_TAG_IDS is board_tag_grammar.DEFAULT_TAG_IDS
-        src = inspect.getsource(context)
-        assert "from kiro_crew.dashboard" not in src and "import kiro_crew.dashboard" not in src
+        owners = sorted(Path(context.__file__).with_name("context_assembly").glob("*.py"))
+        # A floor, so a moved or renamed package cannot turn the scan into a no-op.
+        assert len(owners) >= 8, owners
+        for src in [inspect.getsource(context)] + [p.read_text(encoding="utf-8") for p in owners]:
+            assert "from kiro_crew.dashboard" not in src and "import kiro_crew.dashboard" not in src
         assert (
             "kiro_crew.dashboard"
             not in inspect.getsource(importlib.import_module(board_tag_grammar.__name__)).split(

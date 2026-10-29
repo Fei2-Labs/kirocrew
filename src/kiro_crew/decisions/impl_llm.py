@@ -33,16 +33,19 @@ is built, and this module holds a callable that
 takes a prompt and returns text. That also makes the whole lane testable without
 a model: a test registers a runner that returns a fixture string.
 
-The runner the gateway registers is the sanctioned one-shot pattern already used
-for title generation, memory consolidation, issue triage and live meeting
-translation -- ``sessions.get_or_create`` on a tools-less background agent,
-``stream_and_collect`` under ``REJECT_ALL``, then release AND destroy so no
-``kiro-cli`` subprocess leaks. This module does not invent a second model-call
-path; see :func:`build_session_runner`.
+The runner the gateway registers takes the one-shot paths the session layer already
+has. Where the backend has a shared background runtime, that is the path every
+background one-liner takes -- titles, summaries, STT endpointing:
+``run_bg_oneliner``, which opens a fresh ``session/new`` on the one warm
+``kirocrew-lite`` process, rejects and audits any tool request, and destroys the
+handle afterwards. Elsewhere it is a tool-less session of its own, released AND
+destroyed so no subprocess outlives the call. This module does not invent a
+model-call path; see :func:`build_session_runner`.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -50,7 +53,7 @@ import re
 import uuid
 from typing import Any, Awaitable, Callable
 
-from kiro_crew.decisions.types import Answer, Answers, Question, is_model_id
+from kiro_crew.decisions.types import Answer, Answers, Choice, Noul, Question, Score, is_model_id
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +68,8 @@ logger = logging.getLogger(__name__)
 JUDGE_AGENT_NAME = "kirocrew-lite"
 
 #: What ``decisions.nudge_wake.llm_model`` resolves to when it is empty, which is
-#: the shipped default: INHERIT. The runner then passes no model at all and the
-#: agent's own resolves, which is the background role model --
+#: the shipped default: INHERIT. The runner then asks for the agent's own model,
+#: which is the background role model (``agent.role_models.background``) --
 #: ``auto`` unless the operator pinned that role, and entitlement-safe on every
 #: tier. The word is a real value rather than a placeholder because two readers need
 #: it: it is what the scrub bounds and what the decision log records, so the id on
@@ -76,6 +79,19 @@ JUDGE_MODEL_DEFAULT = "auto"
 #: Bound the response before it is parsed. A judge answers with one small object;
 #: anything of this size is a runaway generation, not an answer.
 _MAX_RESPONSE_CHARS = 64 * 1024
+
+#: The feature a judge call is audited and billed under: the SEL source of any
+#: refused tool request, and ``bg:wake_judge`` in the usage store.
+_SEL_SOURCE = "wake_judge"
+
+#: How long one call's turn may stream. The gate's LLM budget never exceeds this,
+#: so it ends only a call the gate already stopped waiting for.
+_RUN_CEILING_SECS = 60.0
+
+#: Calls the gate stopped waiting for, still finishing on the shared runtime. The
+#: event loop keeps only weak references to tasks, so this keeps one alive to the
+#: end.
+_unawaited_calls: set["asyncio.Task[str]"] = set()
 
 #: How far a full distribution may miss 1.0 and still be read as normalised. Wide
 #: enough for a model that rounds to two decimals, narrow enough that a set of
@@ -156,19 +172,109 @@ def has_runner() -> bool:
     return _runner is not None or _runner_factory is not None
 
 
-def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
-    """A :data:`Runner` over the sanctioned one-shot, tool-less session pattern.
+def _background_role_model() -> str:
+    """The judge agent's own model, or ``""`` when the config cannot be read.
 
-    The gateway calls this once with its session manager and hands the result to
-    :func:`set_runner`. It is the same shape issue-radar's ``_run_oneshot_model``
-    and the meetings translator use: an ephemeral session on a tools-less agent,
-    streamed under ``REJECT_ALL`` so no tool can run even if one were offered, then
-    released AND destroyed so no subprocess survives the call.
+    ``kirocrew-lite`` is written with ``agent.role_models.background``, but a session
+    opened on the shared runtime does not start on its template's model (KAS opens
+    every session on its own ``auto``), so inheriting means asking for this id. The
+    live snapshot is read rather than the file, because this runs on the event loop.
+    """
+    try:
+        from kiro_crew.config import live
+
+        snapshot = live.snapshot()
+        return "" if snapshot is None else str(snapshot.agent.resolve_model("background"))
+    except Exception:
+        logger.debug("decisions: background role model unreadable", exc_info=True)
+        return ""
+
+
+def _settle(call: "asyncio.Task[str]") -> None:
+    """Forget a finished call, and consume an outcome nobody may be left to read."""
+    _unawaited_calls.discard(call)
+    if not call.cancelled():
+        call.exception()
+
+
+async def _call_on_own_session(sessions: Any, prompt: str, model: str) -> str:
+    """One call on a session of its own, for a backend with no shared runtime.
+
+    There the background session is ONE persistent conversation: its handle cannot
+    set a model, so a pinned ``llm_model`` would be dropped, and a judge turn would
+    leave third-party evidence in the history the next title or summary reads. So
+    the call opens a tool-less session, streams under ``REJECT_ALL``, then releases
+    AND destroys it so no process survives the call.
+    """
+    from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
+
+    # Counted per chunk as the response arrives, so a runaway generation is refused
+    # before it is held in full; the parser keeps its own check.
+    seen = 0
+
+    def _bound(chunk: str) -> None:
+        nonlocal seen
+        seen += len(chunk)
+        if seen > _MAX_RESPONSE_CHARS:
+            raise LlmProtocolError("response exceeded the response ceiling")
+
+    key = f"judge-{uuid.uuid4().hex}"
+    provider, _is_new, _resumed = await sessions.get_or_create(
+        key, agent=JUDGE_AGENT_NAME, model=model or None
+    )
+    try:
+        return await stream_and_collect(
+            provider, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL, on_chunk=_bound
+        )
+    finally:
+        try:
+            sessions.release(key)
+        except Exception:
+            logger.debug("decisions: judge session release failed", exc_info=True)
+        try:
+            await sessions.destroy(key)
+        except Exception:
+            logger.debug("decisions: judge session destroy failed", exc_info=True)
+
+
+def _has_shared_runtime(sessions: Any) -> bool:
+    """Whether *sessions* serves background calls on a shared multiplexed runtime.
+
+    The rule ``get_bg_session`` itself dispatches on. Unreadable reads as no, which
+    keeps the call on a session of its own: slower, and never mixed into a shared
+    conversation.
+    """
+    probe = getattr(sessions, "_bg_backend_supports_runtime", None)
+    try:
+        return bool(probe()) if callable(probe) else False
+    except Exception:
+        logger.debug("decisions: background runtime support unreadable", exc_info=True)
+        return False
+
+
+def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
+    """A :data:`Runner` over the shared background runtime, where there is one.
+
+    The gateway calls this with its session manager when it registers the factory.
+    On a backend with a shared runtime (kiro-cli, KAS, codex), each call is one
+    ``run_bg_oneliner``: a fresh ``session/new`` on the warm ``kirocrew-lite``
+    runtime, text only, any tool request rejected and audited, the handle destroyed
+    afterwards. Not a session of its own there: that spawns a backend process, then
+    waits out the MCP drain's no-report ceiling (6 s) for an agent that mounts no
+    MCP server, which alone overruns the lane's 8 s floor. Any other backend keeps
+    the session of its own (:func:`_call_on_own_session`).
+
+    The caller awaits a shared-runtime call SHIELDED, so the gate's budget ends the
+    wait and never the call. ``run_bg_oneliner`` must not be cancelled while it
+    acquires its session: that kills a shared-runtime respawn every later caller
+    reuses, or leaks a ``session/new`` already sent. A call nobody waits for any
+    more runs to its end, its turn bounded by :data:`_RUN_CEILING_SECS`, and its
+    answer is dropped.
 
     *model* overrides the agent template's own model. It is validated here rather
     than trusted, because it arrives from ``decisions.nudge_wake.llm_model`` in the
     agent-writable config; anything that is not a model id is dropped and the
-    template's default applies. So does :data:`JUDGE_MODEL_DEFAULT`, which IS the
+    agent's own model applies. So does :data:`JUDGE_MODEL_DEFAULT`, which IS the
     instruction to inherit rather than a model to ask for.
     """
     resolved = model.strip() if isinstance(model, str) else ""
@@ -181,45 +287,36 @@ def build_session_runner(sessions: Any, *, model: str = "") -> Runner:
         )
         resolved = ""
     if resolved == JUDGE_MODEL_DEFAULT:
-        # "inherit" is not an id to send: passing it would ask the session layer for
-        # a model literally called that.
+        # "inherit" is not an id to send: it names the agent's own model, which
+        # the call resolves at its own time.
         resolved = ""
 
     async def _run(prompt: str) -> str:
         # The session layer stays off this package's import graph, for the reason
         # `gate._oracle` documents: the package is reached from hot paths, and a
         # machine that decides without ever running a judge should not pay for it.
-        from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
+        from kiro_crew.llm_helpers import run_bg_oneliner
 
-        # The ceiling has to bound what is RETAINED, so it is counted per chunk as
-        # the response arrives rather than once it is whole: a runaway generation
-        # otherwise sits in memory in full before anything refuses it. The parser
-        # keeps its own check for a provider that answers in one piece.
-        seen = 0
-
-        def _bound(chunk: str) -> None:
-            nonlocal seen
-            seen += len(chunk)
-            if seen > _MAX_RESPONSE_CHARS:
-                raise LlmProtocolError("response exceeded the response ceiling")
-
-        key = f"judge-{uuid.uuid4().hex}"
-        provider, _is_new, _resumed = await sessions.get_or_create(
-            key, agent=JUDGE_AGENT_NAME, model=resolved or None
-        )
-        try:
-            return await stream_and_collect(
-                provider, prompt, approval_policy=ToolApprovalPolicy.REJECT_ALL, on_chunk=_bound
+        if not _has_shared_runtime(sessions):
+            return await _call_on_own_session(sessions, prompt, resolved)
+        # The output bound counts each chunk as it arrives, so a runaway generation
+        # is refused before it is held in full; the parser keeps its own check.
+        # No rejected-model retry: its fallback is the first model the account
+        # advertises, which can be the most expensive one.
+        call = asyncio.ensure_future(
+            run_bg_oneliner(
+                sessions,
+                prompt,
+                model=resolved or _background_role_model() or None,
+                sel_source=_SEL_SOURCE,
+                timeout=_RUN_CEILING_SECS,
+                max_output_bytes=_MAX_RESPONSE_CHARS,
+                retry_rejected_model=False,
             )
-        finally:
-            try:
-                sessions.release(key)
-            except Exception:
-                logger.debug("decisions: judge session release failed", exc_info=True)
-            try:
-                await sessions.destroy(key)
-            except Exception:
-                logger.debug("decisions: judge session destroy failed", exc_info=True)
+        )
+        _unawaited_calls.add(call)
+        call.add_done_callback(_settle)
+        return await asyncio.shield(call)
 
     return _run
 
@@ -263,7 +360,7 @@ def render_prompt(state: dict | str, questions: list[Question]) -> str:
         "no prose, no preamble, no commentary, no trailing notes. Its keys are "
         "EXACTLY the question ids, with no extra keys.",
         "",
-        "Each value is an object:",
+        "A choice question's value is an object:",
         '  {"choice": "<one option, spelled exactly as listed>", '
         '"probabilities": {"<option>": <number 0..1>, ...}}',
         "The probabilities must include your chosen option. If you give a number "
@@ -271,17 +368,58 @@ def render_prompt(state: dict | str, questions: list[Question]) -> str:
         "",
         "For a question that lists exactly two options you may instead answer with "
         "a bare number from 0 to 1: the probability of the FIRST option listed.",
-        "",
-        "QUESTIONS",
     ]
+    if any(isinstance(question, Noul) for question in questions):
+        lines.extend(
+            [
+                "",
+                "A yes/no question is answered with a bare number from 0 to 1: the "
+                "probability that the answer is yes.",
+            ]
+        )
+    if any(isinstance(question, Score) for question in questions):
+        lines.extend(
+            [
+                "",
+                "A score question is answered with an object carrying only "
+                '"probabilities": {"<level number>": <number 0..1>, ...}, with a number '
+                "for EVERY level, adding up to 1.",
+            ]
+        )
+    lines.extend(["", "QUESTIONS"])
     for question in questions:
-        options = [str(option) for option in getattr(question, "options", ()) or ()]
-        kind = "two-option (a bare number is allowed)" if len(options) == 2 else "choice"
         lines.append("")
         lines.append(f"id: {question.id}")
+        if isinstance(question, Noul):
+            lines.append("type: yes/no (a bare number is the answer)")
+            lines.append(f"question: {question.prompt or ''}")
+            if question.true_means:
+                lines.append(f"yes means: {question.true_means}")
+            if question.false_means:
+                lines.append(f"no means: {question.false_means}")
+            continue
+        if isinstance(question, Score):
+            lines.append("type: score")
+            lines.append(f"question: {question.prompt or ''}")
+            lines.append(
+                "levels: "
+                + ", ".join(f"{index}: {level}" for index, level in enumerate(question.levels))
+            )
+            continue
+        options = [str(option) for option in getattr(question, "options", ()) or ()]
+        kind = "two-option (a bare number is allowed)" if len(options) == 2 else "choice"
         lines.append(f"type: {kind}")
         lines.append(f"question: {getattr(question, 'prompt', '') or ''}")
         lines.append(f"options: {', '.join(options)}")
+        # Authored per-option rubric reaches this backend too, keyed by the
+        # declared option domain exactly as ``impl_jev._question_to_wire`` keys
+        # it: an option with no text and a key that is not a declared option are
+        # both left out, so a point that authors nothing renders what it did
+        # before and a stale key cannot smuggle text past the domain.
+        criteria = getattr(question, "criteria", None) or {}
+        rubric = [f"{opt}: {criteria[opt]}" for opt in options if criteria.get(opt)]
+        if rubric:
+            lines.append("criteria: " + "; ".join(rubric))
     lines.extend(
         [
             "",
@@ -362,16 +500,20 @@ def parse_answers(text: str, questions: list[Question]) -> Answers:
       (and optionally ``confidence``) and no other key, or -- for a question with
       exactly two options -- a bare number in 0..1, read as the probability of the
       FIRST option;
-    * ``choice`` is one of that question's own options, spelled exactly. For a
-      score question the options ARE its levels, so this is what makes a level
-      valid;
+    * ``choice`` is one of that question's own options, spelled exactly;
+    * a ``Noul`` (yes/no) answer is a bare number in 0..1, the probability of
+      yes, and nothing else;
+    * a ``Score`` answer is ``{"probabilities": {...}}`` naming EVERY level index
+      exactly once and adding to 1 within :data:`_SUM_TOLERANCE`; its value is the
+      probability-weighted level, as the provider computes it;
     * every number is finite, in 0..1, and not a bool; a ``probabilities`` map may
       name only that question's options, must include the chosen one, and if it
       names every option must add to 1 within :data:`_SUM_TOLERANCE`.
 
-    The returned ``Answer.value`` is always a member of the question's option
-    list and ``Answer.p`` is the probability OF THAT option, which is what
-    ``gate._answers_are_valid`` re-checks before any caller sees it.
+    A ``Choice`` answer's ``Answer.value`` is always a member of the question's
+    option list and ``Answer.p`` is the probability OF THAT option; the other two
+    types carry the value and ``p`` that ``types.Answer`` documents. The gate's
+    ``_answers_are_valid`` re-checks each type's domain before any caller sees it.
     """
     parsed = _decode_object(text)
     by_id = {question.id: question for question in questions}
@@ -386,6 +528,12 @@ def parse_answers(text: str, questions: list[Question]) -> Answers:
 
 def _answer_from_value(question: Question, raw: Any) -> Answer:
     """One answer off its wire value, validated against *question*'s own domain."""
+    if isinstance(question, Noul):
+        return _noul_from_value(question, raw)
+    if isinstance(question, Score):
+        return _score_from_value(question, raw)
+    if not isinstance(question, Choice):
+        raise LlmProtocolError("unsupported question type")
     options = [str(option) for option in getattr(question, "options", ()) or ()]
     if not options:
         raise LlmProtocolError("question declares no options")
@@ -449,6 +597,43 @@ def _answer_from_object(question: Question, raw: dict, options: list[str]) -> An
         p=chosen_p,
         confidence=resolved,
     )
+
+
+def _noul_from_value(question: Noul, raw: Any) -> Answer:
+    """A bare number in 0..1, read as the probability of yes. Nothing else."""
+    value = _probability(raw)
+    if value is None:
+        raise LlmProtocolError("yes/no answer is not a probability")
+    return Answer(id=question.id, value=value, p=max(value, 1.0 - value))
+
+
+def _score_from_value(question: Score, raw: Any) -> Answer:
+    """``{"probabilities": {"<level>": p, ...}}``: a complete distribution over the levels.
+
+    The value is the probability-weighted level, as the provider computes it, so
+    a score from either lane means the same number. Every level must be given,
+    because a partial distribution has no weighted mean, and it must add to 1
+    within :data:`_SUM_TOLERANCE`, because rescaling would invent the mass the
+    model did not report.
+    """
+    if not isinstance(raw, dict) or set(raw) != {"probabilities"}:
+        raise LlmProtocolError("score answer is not a probabilities object")
+    probabilities = raw["probabilities"]
+    levels = [str(index) for index in range(len(question.levels))]
+    if not isinstance(probabilities, dict) or set(probabilities) != set(levels):
+        raise LlmProtocolError("score probabilities do not name every level exactly")
+    values: list[float] = []
+    for level in levels:
+        level_p = _probability(probabilities[level])
+        if level_p is None:
+            raise LlmProtocolError("a probability is not a finite number in 0..1")
+        values.append(level_p)
+    if abs(sum(values) - 1.0) > _SUM_TOLERANCE:
+        raise LlmProtocolError("a complete distribution does not add up to 1")
+    total = sum(values)
+    weighted = sum(index * level_p for index, level_p in enumerate(values)) / total
+    top = float(len(values) - 1)
+    return Answer(id=question.id, value=min(max(weighted, 0.0), top), p=max(values))
 
 
 class LlmOracle:

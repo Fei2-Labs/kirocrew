@@ -12,6 +12,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from kiro_crew.dashboard import state as state_module
+from kiro_crew.dashboard.chat_utils import chunk_generation
 from kiro_crew.dashboard.state import _ChatSlot
 
 _TO_DICT_KEYS = (
@@ -43,12 +44,21 @@ _TO_DICT_KEYS = (
     "artifact",
     "messages",
     "running",
-    "orchestrating",
+    "wake_starting",
+    # Turn identity beside `running`: the slot's monotonic turn counter and the
+    # gateway process generation it is comparable within. The dashboard uses the
+    # pair to match an idle row to its `chat_done` and history reply.
+    "turn",
+    "turn_gen",
+    "compacting",
+    "preparing",
+    "stop_declined",
     "queue_depth",
     "stopping",
     "pending_approval",
     "pending_approval_info",
     "last_activity_ts",
+    "last_agent_ts",
     "waiting_for_input",
     "needs_input",
     "interrupted",
@@ -63,9 +73,11 @@ _TO_DICT_KEYS = (
     "todo",
     "mcp_report",
     "has_options",
+    "options_ts",
     "options",
     "prompt_preview",
     "trust",
+    "trust_scope",
     "trust_reads",
     "trusted_patterns_count",
     "slack_linked",
@@ -73,6 +85,8 @@ _TO_DICT_KEYS = (
     "slack_thread_ts",
     "folder_id",
     "pinned",
+    "mutes_opened",
+    "muted",
     "tags",
     "tags_revision",
     "color_index",
@@ -86,6 +100,7 @@ _TO_DICT_KEYS = (
     "app",
     "origin",
     "created_by",
+    "lineage_minted",
 )
 
 
@@ -298,5 +313,7 @@ def test_to_dict_key_order_and_single_source_scan(monkeypatch) -> None:
 
     assert tuple(payload) == _TO_DICT_KEYS
     assert calls == [slot]
+    assert payload["turn"] == slot._turn_generation
+    assert payload["turn_gen"] == chunk_generation()
     assert payload["source_links"] == [link]
     assert payload["source_links_total"] == 1

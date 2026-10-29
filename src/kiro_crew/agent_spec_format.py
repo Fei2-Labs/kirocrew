@@ -8,8 +8,8 @@ goes through this module rather than a bare ``glob("*.json")`` -- a scan that
 sees only one form lists an agent kiro-cli would run, or projects onto KAS an
 agent that is not there.
 
-This is a leaf module on purpose: it imports nothing from ``kiro_crew``, so the
-config loader, the MCP gateway rewriter and the discovery cache can all reach it
+This is a leaf module on purpose: it imports nothing from ``kiro_crew`` except
+the leaves :mod:`kiro_crew.user_json` and :mod:`kiro_crew.yaml_safe`, so the config loader, the MCP gateway rewriter and the discovery cache can all reach it
 without an import cycle. It parses bytes it is handed and never opens a file --
 the hardened read (size cap, sensitive-symlink refusal) stays with the caller.
 
@@ -32,13 +32,17 @@ body text and configuration never leaks into the prompt.
 
 from __future__ import annotations
 
-import json
+import codecs
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
+
+from kiro_crew.user_json import loads_user_json
+from kiro_crew.yaml_safe import NoAliasSafeLoader
 
 #: Suffixes an agents directory entry may carry, lower-case. ``.json`` is the
 #: kiro-cli form; ``.md`` is the markdown form.
@@ -46,11 +50,36 @@ JSON_SUFFIX = ".json"
 MARKDOWN_SUFFIX = ".md"
 AGENT_SPEC_SUFFIXES: tuple[str, ...] = (JSON_SUFFIX, MARKDOWN_SUFFIX)
 NATIVE_SKILL_ALIAS_PREFIX = "kirocrew-skill-view-"
+#: Prefix of the launch copy a palette-opened app agent runs under on kiro-cli
+#: (:mod:`kiro_crew.apps.agent_launch`). Reserved like the skill-view prefix: a
+#: checkout may not claim it, and no roster offers it.
+APP_AGENT_LAUNCH_PREFIX = "kirocrew-app-launch-"
+
+#: The ``kirocrew-skill-view-*`` alias count at or above which the projection
+#: stops minting new views and falls back to the authored agent, and which the
+#: doctor's backlog warning flags. It lives here, in the leaf that owns the
+#: alias prefix, so the ACP projection and the doctor (via ``cli_doctor``) share
+#: one number without the doctor importing the ACP layer -- the agent-SDK import
+#: boundary (``.github/agent-sdk-boundary-baseline.txt``) is shrink-only, and the
+#: doctor is a baselined consumer. See
+#: :data:`kiro_crew.acp.skill_projection.SKILL_VIEW_PROJECTION_CEILING`.
+#:
+#: Every view is a row in the Kiro IDE's agent drop-down (it lists the same
+#: directory), so the number is sized to keep that list short, not only to keep
+#: kiro-cli's start cheap: a view is pruned as soon as its session ends, so the
+#: steady state is the live sessions' views, and this is the backstop above it.
+#: Measured before it was set: a heavily used host with 34 authored agents held
+#: 35 views (global agents share one view across workspaces; only a project
+#: agent, or a workspace with its own inheritance setting, mints more). Past the
+#: ceiling a spawn falls back to the authored agent, so it is set well above
+#: that -- a host that trips it has several workspaces' worth of distinct views
+#: live at once, or a leak the doctor names.
+SKILL_VIEW_PROJECTION_CEILING = 128
 
 _FRONTMATTER_CLOSE_RE = re.compile(r"^---[ \t]*\r?$", re.MULTILINE)
 
 
-class _FrontmatterLoader(yaml.SafeLoader):  # type: ignore[misc]
+class _FrontmatterLoader(NoAliasSafeLoader):
     """``SafeLoader`` that yields a JSON-shaped TREE and nothing else.
 
     The parsed frontmatter is re-serialized as JSON on every consuming path
@@ -59,10 +88,10 @@ class _FrontmatterLoader(yaml.SafeLoader):  # type: ignore[misc]
     YAML have no JSON form and are removed at the loader rather than detected
     afterwards:
 
-    * **Aliases** (``*name``) are refused at compose time; an ``&name`` anchor
-      nothing references parses as its plain value, the same rule the other
-      alias-refusing loaders in this package apply. An alias is a shared
-      reference, and a shared reference is what makes a document a graph: a self-reference recurses forever, and a chain of
+    * **Aliases** (``*name``) are refused at compose time by the shared base,
+      with a refusal that names the alias and says what to write instead; an
+      ``&name`` anchor nothing references parses as its plain value. An alias
+      is a shared reference, and a shared reference is what makes a document a graph: a self-reference recurses forever, and a chain of
       shared containers expands exponentially when it is serialized -- which
       every consumer does. Without aliases the loaded value is a tree whose
       size is bounded by the file's, so the validation below is one linear
@@ -78,17 +107,11 @@ class _FrontmatterLoader(yaml.SafeLoader):  # type: ignore[misc]
     after loading rather than mapped, since there is no faithful mapping.
     """
 
-    def compose_node(self, parent: Any, index: Any) -> Any:
-        if self.check_event(yaml.AliasEvent):
-            event = self.get_event()
-            raise yaml.composer.ComposerError(
-                None,
-                None,
-                f"aliases (*{event.anchor}) are not supported in agent frontmatter; "
-                "repeat the value instead",
-                event.start_mark,
-            )
-        return super().compose_node(parent, index)
+    def alias_problem(self, anchor: str) -> str:
+        return (
+            f"aliases (*{anchor}) are not supported in agent frontmatter; "
+            "repeat the value instead"
+        )
 
 
 def _construct_timestamp_as_text(loader: yaml.SafeLoader, node: yaml.Node) -> str:
@@ -149,6 +172,31 @@ def is_agent_spec_name(name: str) -> bool:
     return spec_suffix(name) is not None
 
 
+def is_native_skill_alias_name(name: str) -> bool:
+    """Whether a directory entry name is a managed skill-view alias.
+
+    The one predicate behind every walk that leaves the aliases out: the roster
+    (:func:`iter_agent_spec_files`) and the stat-only fingerprints the discovery
+    caches revalidate on (``agent_discovery._iter_spec_entries``). An alias is a
+    projection of a spec the roster already lists, so a fingerprint that counted
+    it would move on writes the roster cannot see and would cost one ``stat``
+    per alias per call. The prefix holds no dot, so the test on the full name is
+    the test on the stem.
+    """
+    return name.startswith(NATIVE_SKILL_ALIAS_PREFIX)
+
+
+def is_app_agent_launch_name(name: str) -> bool:
+    """Whether *name* (an agent name or a directory entry name) is an app launch copy.
+
+    Unlike a skill-view alias, a launch copy stays in the directory walks: it is
+    the spec kiro-cli runs, so every reader that resolves the running agent by
+    name must find it. Only the rosters leave it out
+    (``agent_discovery.is_internal_agent_spec``).
+    """
+    return name.startswith(APP_AGENT_LAUNCH_PREFIX)
+
+
 def is_markdown_spec(path: str | Path) -> bool:
     """Whether *path* is the markdown form."""
     return spec_suffix(path) == MARKDOWN_SUFFIX
@@ -177,15 +225,34 @@ def _has_json_twin(directory: Path, md: Path, json_stems: set[str]) -> bool:
     return (directory / f"{md.stem}{JSON_SUFFIX}").exists()
 
 
-def _split_spec_files(directory: Path) -> tuple[list[Path], list[Path]]:
+def _split_spec_files(directory: Path, *, strict: bool = False) -> tuple[list[Path], list[Path]]:
     """``(live, shadowed)``: every spec file, with ``<stem>.md`` beside ``<stem>.json`` set aside."""
-    json_files = list(directory.glob(f"*{JSON_SUFFIX}"))
+    if strict:
+        json_files, md_files = _listed_spec_files(directory)
+    else:
+        json_files = list(directory.glob(f"*{JSON_SUFFIX}"))
+        md_files = list(directory.glob(f"*{MARKDOWN_SUFFIX}"))
     json_stems = {p.stem for p in json_files}
     live = list(json_files)
     shadowed: list[Path] = []
-    for path in directory.glob(f"*{MARKDOWN_SUFFIX}"):
+    for path in md_files:
         (shadowed if _has_json_twin(directory, path, json_stems) else live).append(path)
     return live, shadowed
+
+
+def _listed_spec_files(directory: Path) -> tuple[list[Path], list[Path]]:
+    """The ``*.json`` and ``*.md`` entries of *directory* from one ``os.scandir`` pass.
+
+    Selects the names ``Path.glob`` would (case-insensitively on Windows, as its
+    platform default does), but lets an ``OSError`` from the listing propagate:
+    ``Path.glob`` swallows it and yields nothing, the same answer as an empty
+    directory.
+    """
+    with os.scandir(directory) as entries:
+        names = [entry.name for entry in entries]
+    json_files = [directory / n for n in names if os.path.normcase(n).endswith(JSON_SUFFIX)]
+    md_files = [directory / n for n in names if os.path.normcase(n).endswith(MARKDOWN_SUFFIX)]
+    return json_files, md_files
 
 
 def iter_agent_spec_files(directory: Path, *, ordered: bool = True) -> list[Path]:
@@ -193,16 +260,25 @@ def iter_agent_spec_files(directory: Path, *, ordered: bool = True) -> list[Path
 
     A ``<stem>.md`` whose ``<stem>.json`` twin exists is NOT returned: the JSON
     wins (see the module docstring), and :func:`shadowed_markdown_specs` names
-    the files this dropped. Propagates ``OSError`` from the directory walk
-    exactly as ``Path.glob`` does, so a caller that already handles the
-    JSON-only glob's failure handles this one unchanged. *ordered* sorts by full
+    the files this dropped. The directory is listed with ``Path.glob``, which
+    yields nothing when the listing itself fails; :func:`iter_agent_spec_files_strict`
+    raises that ``OSError`` instead. *ordered* sorts by full
     name so the order is stable across platforms; ``ordered=False`` keeps the
     directory's native order, JSON entries first, for the first-match resolvers
     that scan on the event loop and stop at the first hit.
     """
     live, _shadowed = _split_spec_files(directory)
-    live = [path for path in live if not path.stem.startswith(NATIVE_SKILL_ALIAS_PREFIX)]
+    live = [path for path in live if not is_native_skill_alias_name(path.name)]
     return sorted(live) if ordered else live
+
+
+def iter_agent_spec_files_strict(directory: Path) -> list[Path]:
+    """:func:`iter_agent_spec_files`, sorted, raising the ``OSError`` of a failed listing.
+
+    For a caller that must not read a listing that failed as an empty directory.
+    """
+    live, _shadowed = _split_spec_files(directory, strict=True)
+    return sorted(path for path in live if not is_native_skill_alias_name(path.name))
 
 
 def shadowed_markdown_specs(directory: Path) -> list[Path]:
@@ -223,6 +299,48 @@ def agent_spec_candidates(directory: Path, name: str) -> list[Path]:
     return [directory / f"{name}{suffix}" for suffix in AGENT_SPEC_SUFFIXES]
 
 
+def opens_frontmatter_fence(text: str) -> bool:
+    """Whether *text* opens with a frontmatter fence: BOM aside, a ``---`` line.
+
+    The rule that separates a markdown SPEC from a plain markdown document (a
+    README, a shared prompt fragment) in an agents directory. It is only the
+    OPENING test: a document whose fence opens and never closes announced
+    itself as a spec, and :func:`split_markdown_spec` still refuses to split it.
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    return text.startswith(("---\n", "---\r\n"))
+
+
+def markdown_head_is_fenceless(head: bytes, *, complete: bool) -> bool:
+    """Whether the first bytes of a markdown file PROVE it has no opening fence.
+
+    *head* is the file's first bytes and *complete* says whether they are the
+    whole file. ``True`` only when the head decodes as the UTF-8 that
+    :func:`parse_agent_spec_bytes` reads every spec as and the decoded text
+    does not open with a fence (:func:`opens_frontmatter_fence`). Everything
+    else is ``False``, because a caller asks this to decide whether a file its
+    strict reader refused may be SKIPPED as not-a-spec, and a head that cannot
+    be judged is unknown, not ignorable:
+
+    * bytes that are not UTF-8 -- a UTF-16 or UTF-32 BOM (``0xFF``/``0xFE`` are
+      never UTF-8 bytes), a Latin-1 byte, a file that ends inside a multibyte
+      sequence: the parser could not decode it either, so nothing here can say
+      what fence test it would have applied;
+    * a NUL character, which no markdown document carries.
+
+    A multibyte character cut at the end of an incomplete head is held back,
+    not raised: the head is decoded with ``final=complete``.
+    """
+    try:
+        text = codecs.getincrementaldecoder("utf-8")().decode(head, final=complete)
+    except UnicodeDecodeError:
+        return False
+    if "\x00" in text:
+        return False
+    return not opens_frontmatter_fence(text)
+
+
 def split_markdown_spec(text: str) -> tuple[str, str] | None:
     """Split a markdown spec into ``(frontmatter_yaml, body)``.
 
@@ -231,10 +349,10 @@ def split_markdown_spec(text: str) -> tuple[str, str] | None:
     be listed as one. A fence with no closing line is also ``None``: the whole
     file would otherwise parse as YAML and a prompt would be mistaken for config.
     """
+    if not opens_frontmatter_fence(text):
+        return None
     if text.startswith("\ufeff"):
         text = text[1:]
-    if not (text.startswith("---\n") or text.startswith("---\r\n")):
-        return None
     first_newline = text.index("\n")
     close = _FRONTMATTER_CLOSE_RE.search(text, first_newline + 1)
     if close is None:
@@ -326,9 +444,28 @@ def parse_agent_spec_text(text: str, path: str | Path) -> Any:
     """
     if is_markdown_spec(path):
         return parse_markdown_spec(text)
-    return json.loads(text)
+    return loads_user_json(text)
 
 
 def parse_agent_spec_bytes(raw: bytes, path: str | Path) -> Any:
     """:func:`parse_agent_spec_text` over UTF-8 bytes; ``UnicodeDecodeError`` propagates."""
     return parse_agent_spec_text(raw.decode("utf-8"), path)
+
+
+# MCP env keys whose VALUE a launcher re-stamps on every launch (a per-launch
+# nonce, not a credential the agent's grants depend on), so a changed value is no
+# change. Every other env value counts: a rotated credential is a different grant.
+# Extended, never narrowed, by ``KIROCREW_SKILL_VIEW_VOLATILE_ENV`` (comma-separated
+# key names), for a launcher this list does not know yet. Lives here, beside the
+# spec parser, because both the ACP skill views and the worker-spec freshness gate
+# hash ``mcpServers`` and must leave out the same keys -- the gate cannot import
+# the ACP layer to ask. So a key listed here must be one the launcher writes into
+# every agent spec it manages, the worker's included, or the worker keeps an old value.
+_VOLATILE_ENV_KEYS_DEFAULT = frozenset({"AIM_CREDS_AGENT_INJECTION"})
+_VOLATILE_ENV_VAR = "KIROCREW_SKILL_VIEW_VOLATILE_ENV"
+
+
+def volatile_env_keys() -> frozenset[str]:
+    """The MCP env keys whose values identity digests and fingerprints ignore (see above)."""
+    extra = os.environ.get(_VOLATILE_ENV_VAR, "")
+    return _VOLATILE_ENV_KEYS_DEFAULT | {k.strip() for k in extra.split(",") if k.strip()}

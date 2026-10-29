@@ -11,10 +11,14 @@ import ast
 import re
 from pathlib import Path
 
+from test_snapshot import SNAPSHOT_FAMILY
+
 from kiro_crew import snapshot as snap
 
 SRC = Path(snap.__file__).parent
-MODULES = ("snapshot.py", "snapshot_redact.py", "snapshot_remote.py", "backup_cli.py")
+#: The family is required to exist; the other names are optional backup modules that a
+#: build may not ship, and are skipped when absent.
+MODULES = (*SNAPSHOT_FAMILY, "snapshot_redact.py", "snapshot_remote.py", "backup_cli.py")
 
 
 class TestNoPrintInterpolatesARawName:
@@ -24,6 +28,7 @@ class TestNoPrintInterpolatesARawName:
         for module in MODULES:
             path = SRC / module
             if not path.is_file():
+                assert module not in SNAPSHOT_FAMILY, f"{module} is missing"
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):

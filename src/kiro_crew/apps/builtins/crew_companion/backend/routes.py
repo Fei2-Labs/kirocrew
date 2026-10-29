@@ -16,6 +16,13 @@ process, no loopback URL to resolve and no proxy hop.
 Every handler is wrapped in :func:`_require_enabled`, so a disabled app answers
 403 and a not-yet-started runtime answers 503. The two are different facts: the
 caller can usefully retry one and not the other.
+
+Every route that WRITES is also wrapped in :func:`_owner_only`. The reminders,
+packs and notification switches are the owner's own state, so only the dashboard
+owner may change them. A non-owner dashboard subject and any app token get the
+shared 403 ``owner_only``. Every real caller is the owner's own same-origin
+dashboard page or desktop window, which carries the owner's session cookie. The
+reads stay open to anyone who passes the enable gate.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from kiro_crew.appearance_packs.transfer import (
 )
 from kiro_crew.apps.builtins.crew_companion.hooks import get_appearances, get_store
 from kiro_crew.apps.manager import is_app_enabled
+from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +52,10 @@ logger = logging.getLogger(__name__)
 # rejects absurd values (400-digit ints, 1e309→inf) with a 400 instead of
 # letting them overflow deeper in the scheduler.
 _MAX_RECURRENCE_MINUTES = 10 * 366 * 24 * 60
+
+# A reminder is a sentence, and a fire copies its text into the persisted pending
+# queue, so an unbounded text could push the store past its load cap and wedge every tick.
+_MAX_TEXT_CHARS = 500
 
 APP_NAME = "crew-companion"
 _BASE = f"/api/apps/{APP_NAME}"
@@ -115,6 +127,33 @@ def _require_enabled(handler: Handler) -> Handler:
     return _wrapped
 
 
+def _owner_only(operation: str) -> Callable[[Handler], Handler]:
+    """Refuse everyone but the dashboard owner before a write runs.
+
+    Delegates to the shared ``require_owner_dashboard_request`` so this gate
+    follows the same rule, audit and 403 ``owner_only`` as every other
+    owner-gated route. App tokens are refused too: the companion has no caller
+    that holds one.
+    """
+
+    def _decorate(handler: Handler) -> Handler:
+        @wraps(handler)
+        async def _wrapped(request: web.Request) -> web.StreamResponse:
+            denied = await require_owner_dashboard_request(request, operation)
+            if denied is not None:
+                return denied
+            return await handler(request)
+
+        return _wrapped
+
+    return _decorate
+
+
+def _owner_write(operation: str, handler: Handler) -> Handler:
+    """A mutating route: the enable gate first, then the owner gate."""
+    return _require_enabled(_owner_only(f"crew_companion.{operation}")(handler))
+
+
 async def _body(request: web.Request) -> dict[str, Any]:
     """Parse a JSON object body, treating anything else as empty."""
     try:
@@ -159,6 +198,14 @@ async def _handle_pending_get(request: web.Request) -> web.StreamResponse:
 # ── writes ──────────────────────────────────────────────────────────────────
 
 
+def _text_error(text: Any) -> web.Response | None:
+    if not isinstance(text, str) or not text.strip():
+        return _bad_request("text is required", "text_required")
+    if len(text) > _MAX_TEXT_CHARS:
+        return _bad_request("text is too long", "text_too_long")
+    return None
+
+
 async def _handle_add(request: web.Request) -> web.StreamResponse:
     """Store an already-resolved reminder.
 
@@ -173,8 +220,8 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
 
     text = body.get("text")
     fire_at = body.get("fireAt")
-    if not isinstance(text, str) or not text.strip():
-        return _bad_request("text is required", "text_required")
+    if (bad := _text_error(text)) is not None:
+        return bad
     if not isinstance(fire_at, str) or not fire_at.strip():
         return _bad_request("fireAt is required", "fire_at_required")
 
@@ -195,7 +242,7 @@ async def _handle_add(request: web.Request) -> web.StreamResponse:
 
     try:
         result = await asyncio.to_thread(
-            store.add, text, fire_at, int(every) if every else None
+            store.add, str(text), fire_at, int(every) if every else None
         )
     except ValueError as exc:
         return _bad_request(str(exc), "invalid_reminder")
@@ -209,6 +256,21 @@ async def _handle_remove(request: web.Request) -> web.StreamResponse:
     if not isinstance(ident, str) or not ident:
         return _bad_request("id is required", "id_required")
     return web.json_response(await asyncio.to_thread(store.remove, ident))
+
+
+async def _handle_update(request: web.Request) -> web.StreamResponse:
+    store = get_store()
+    assert store is not None
+    body = await _body(request)
+    ident, text = body.get("id"), body.get("text")
+    if not isinstance(ident, str) or not ident:
+        return _bad_request("id is required", "id_required")
+    if (bad := _text_error(text)) is not None:
+        return bad
+    result = await asyncio.to_thread(store.update, ident, str(text))
+    if not result["ok"]:
+        return web.json_response({"error": "not found", "code": "reminder_not_found"}, status=404)
+    return web.json_response(result)
 
 
 async def _handle_skip(request: web.Request) -> web.StreamResponse:
@@ -372,37 +434,51 @@ async def _handle_petdex_fetch(request: web.Request) -> web.StreamResponse:
 def register_routes(app: web.Application) -> None:
     """Register on the gateway's aiohttp Application (single-arg convention)."""
     app.router.add_get(f"{_BASE}/reminders", _require_enabled(_handle_reminders_get))
-    app.router.add_post(f"{_BASE}/reminders/add", _require_enabled(_handle_add))
-    app.router.add_post(f"{_BASE}/reminders/remove", _require_enabled(_handle_remove))
-    app.router.add_post(f"{_BASE}/reminders/skip", _require_enabled(_handle_skip))
-    app.router.add_post(f"{_BASE}/reminders/config", _require_enabled(_handle_config))
+    app.router.add_post(f"{_BASE}/reminders/add", _owner_write("reminders_add", _handle_add))
+    app.router.add_post(
+        f"{_BASE}/reminders/remove", _owner_write("reminders_remove", _handle_remove)
+    )
+    app.router.add_post(f"{_BASE}/reminders/skip", _owner_write("reminders_skip", _handle_skip))
+    app.router.add_post(
+        f"{_BASE}/reminders/update", _owner_write("reminders_update", _handle_update)
+    )
+    app.router.add_post(
+        f"{_BASE}/reminders/config", _owner_write("reminders_config", _handle_config)
+    )
     app.router.add_get(f"{_BASE}/stats", _require_enabled(_handle_stats_get))
     app.router.add_get(f"{_BASE}/pending", _require_enabled(_handle_pending_get))
-    app.router.add_post(f"{_BASE}/presence", _require_enabled(_handle_presence))
+    app.router.add_post(f"{_BASE}/presence", _owner_write("presence", _handle_presence))
     app.router.add_get(f"{_BASE}/appearances", _require_enabled(_handle_appearances_get))
     app.router.add_get(
         f"{_BASE}/appearances/export", _require_enabled(_handle_appearance_export)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/import", _require_enabled(_handle_appearance_import)
+        f"{_BASE}/appearances/import",
+        _owner_write("appearances_import", _handle_appearance_import),
     )
     app.router.add_post(
-        f"{_BASE}/appearances/save-sprite", _require_enabled(_handle_appearance_save_sprite)
+        f"{_BASE}/appearances/save-sprite",
+        _owner_write("appearances_save_sprite", _handle_appearance_save_sprite),
     )
-    app.router.add_post(f"{_BASE}/petdex/fetch", _require_enabled(_handle_petdex_fetch))
+    app.router.add_post(
+        f"{_BASE}/petdex/fetch", _owner_write("petdex_fetch", _handle_petdex_fetch)
+    )
     app.router.add_get(
         f"{_BASE}/appearances/detail", _require_enabled(_handle_appearance_detail)
     )
     app.router.add_post(
-        f"{_BASE}/appearances/colours", _require_enabled(_handle_appearance_colours)
+        f"{_BASE}/appearances/colours",
+        _owner_write("appearances_colours", _handle_appearance_colours),
     )
     app.router.add_post(
-        f"{_BASE}/appearances/delete", _require_enabled(_handle_appearance_delete)
+        f"{_BASE}/appearances/delete",
+        _owner_write("appearances_delete", _handle_appearance_delete),
     )
     app.router.add_post(
-        f"{_BASE}/appearances/save", _require_enabled(_handle_appearance_save)
+        f"{_BASE}/appearances/save",
+        _owner_write("appearances_save", _handle_appearance_save),
     )
     app.router.add_post(
-        f"{_BASE}/breathing-done", _require_enabled(_handle_breathing_done)
+        f"{_BASE}/breathing-done", _owner_write("breathing_done", _handle_breathing_done)
     )
-    app.router.add_post(f"{_BASE}/window", _require_enabled(_handle_window))
+    app.router.add_post(f"{_BASE}/window", _owner_write("window", _handle_window))

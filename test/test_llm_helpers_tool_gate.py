@@ -78,7 +78,7 @@ async def test_a_security_deny_is_flagged_as_a_security_block():
         "q",
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [(_DENIED_TITLE, False, True)], "the security block never reached the caller"
@@ -107,7 +107,7 @@ async def test_a_hook_security_deny_is_flagged_as_a_security_block():
         approval_policy=ToolApprovalPolicy.HOOK_BASED,
         hooks=hooks,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [(_BENIGN_TITLE, False, True)], "a hook security deny was not counted"
@@ -133,7 +133,7 @@ async def test_a_governance_deny_is_not_a_security_block():
         approval_policy=ToolApprovalPolicy.HOOK_BASED,
         hooks=hooks,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [(_BENIGN_TITLE, False, False)], "a governance deny was counted as security"
@@ -157,7 +157,7 @@ async def test_an_interactive_rejection_is_not_a_security_block():
         hooks=None,
         on_tool_approval=_deny,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [
@@ -176,7 +176,7 @@ async def test_an_approved_tool_is_reported_as_approved():
         "q",
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [(_BENIGN_TITLE, True, False)], "the approval never reached the caller"
@@ -201,7 +201,7 @@ async def test_both_arms_are_distinguishable_within_one_turn():
         "q",
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert [(a, b) for _, a, b in seen] == [(False, True), (True, False)]
@@ -212,7 +212,7 @@ async def test_a_raising_callback_does_not_fail_the_turn():
     """Observing a gate decision is bookkeeping; it must never abort a cron run."""
     provider = _ScriptedProvider(_script(_DENIED_TITLE))
 
-    def _boom(title: str, approved: bool, security_blocked: bool) -> None:
+    def _boom(title: str, approved: bool, security_blocked: bool, reason: str) -> None:
         raise RuntimeError("caller bug")
 
     text = await stream_and_collect(
@@ -272,7 +272,7 @@ async def test_a_discarded_retry_attempt_reports_no_gate_decisions(monkeypatch):
         provider,  # type: ignore[arg-type]
         "q",
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert provider.attempts == 2, "the transient failure did not trigger a retry"
@@ -300,7 +300,7 @@ async def test_a_tool_that_bypassed_the_gate_counts_as_work():
         "q",
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert (_DENIED_TITLE, False, True) in seen
@@ -331,7 +331,7 @@ async def test_an_executed_call_matching_a_decision_is_not_double_counted():
         "q",
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [(_DENIED_TITLE, False, True)], f"the decided call was double-counted: {seen}"
@@ -369,7 +369,7 @@ async def test_a_pin_only_deny_is_reported_as_non_security():
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         hooks=_PinHooks(),  # type: ignore[arg-type]
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [
@@ -404,7 +404,7 @@ async def test_a_deny_the_user_enforces_is_reported_as_security():
         approval_policy=ToolApprovalPolicy.AUTO_APPROVE,
         hooks=_UserHooks(),  # type: ignore[arg-type]
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert seen == [("Running: pinned-tool --go", False, True)]
@@ -475,7 +475,7 @@ async def test_read_only_policy_approves_a_read_only_shell_command():
         approval_policy=ToolApprovalPolicy.READ_ONLY,
         hooks=_read_only_hooks(),
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert provider.approved == ["r1"]
@@ -503,7 +503,7 @@ async def test_read_only_policy_rejects_a_mutating_shell_command():
         approval_policy=ToolApprovalPolicy.READ_ONLY,
         hooks=_read_only_hooks(),
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert provider.rejected == ["r1"]
@@ -681,7 +681,7 @@ async def test_read_only_policy_deny_floor_still_wins():
         approval_policy=ToolApprovalPolicy.READ_ONLY,
         hooks=_read_only_hooks(),
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert provider.rejected == ["r1"]
@@ -729,7 +729,7 @@ async def test_read_only_policy_refuses_a_write_the_config_grant_matches():
         approval_policy=ToolApprovalPolicy.READ_ONLY,
         hooks=HookManager(HooksConfig(auto_approve_tools=["Write*"])),
         retry_transient=False,
-        on_tool_gate=lambda t, a, b: seen.append((t, a, b)),
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
     )
 
     assert provider.approved == []
@@ -936,18 +936,56 @@ async def _run_read_only(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("tool", "kind"),
-    [("fs_read", "read"), ("web_fetch", "fetch"), ("grep", "")],
-    ids=["fs_read+read", "web_fetch+fetch", "grep+kindless"],
+    [("fs_read", "read"), ("read", "read"), ("web_fetch", "fetch"), ("grep", "")],
+    ids=["fs_read+read", "read+read", "web_fetch+fetch", "grep+kindless"],
 )
 async def test_read_only_policy_approves_a_host_known_read_tool(tool, kind):
     """The positive path: a `_HOST_READ_ONLY_BUILTIN_TOOLS` name on the
     host-stamped identity, no MCP server, provenance verified. The kind may
-    agree or be absent — it is not what proves the call."""
+    agree or be absent — it is not what proves the call. `read` is the name
+    kiro-cli stamps for the same built-in; it reaches the allowlist through
+    `platform.tool_names.KIRO_TOOL_ALIASES`."""
     provider = await _run_read_only(
         _read_only_event(tool_kind=kind, tool_name=tool, mcp_identity_trusted=True)
     )
     assert provider.approved == ["r1"]
     assert provider.rejected == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stamp", "rule", "kind", "policy"),
+    [
+        ("read", "fs_read", "read", ToolApprovalPolicy.READ_ONLY),
+        ("write", "fs_write", "edit", ToolApprovalPolicy.HOOK_BASED),
+        ("shell", "execute_bash", "execute", ToolApprovalPolicy.HOOK_BASED),
+    ],
+    ids=["read+READ_ONLY", "write+HOOK_BASED", "shell+HOOK_BASED"],
+)
+async def test_an_aliased_stamp_is_denied_by_the_rule_that_names_it_canonically(
+    stamp, rule, kind, policy
+):
+    """`auto_deny_tools` is written in the spec spelling and kiro-cli stamps the
+    short name. The deny tiers run before any approval, so the rule's security
+    deny is what the caller sees -- not READ_ONLY's proof approving `read`, and
+    not the default approval HOOK_BASED gives `write` or `shell` on a caller with
+    no approver."""
+    from kiro_crew.hooks import HookManager, HooksConfig
+
+    event = _read_only_event(tool_name=stamp, tool_kind=kind, mcp_identity_trusted=True)
+    provider = _ScriptedProvider(_permission_script(event))
+    seen: list[tuple[str, bool, bool]] = []
+    await stream_and_collect(
+        provider,  # type: ignore[arg-type]
+        "q",
+        approval_policy=policy,
+        hooks=HookManager(HooksConfig(auto_deny_tools=[rule])),
+        retry_transient=False,
+        on_tool_gate=lambda t, a, b, _r: seen.append((t, a, b)),
+    )
+    assert seen == [(event.title, False, True)]
+    assert provider.rejected == ["r1"]
+    assert provider.approved == []
 
 
 @pytest.mark.asyncio
@@ -1018,6 +1056,77 @@ async def test_read_only_policy_rejects_a_read_looking_title_alone():
     path would take the `_is_read_only_tool` title fallback; READ_ONLY has no
     card behind it and refuses the model-authored prose."""
     provider = await _run_read_only(_read_only_event(tool_kind=""))
+    assert provider.rejected == ["r1"]
+    assert provider.approved == []
+
+
+# claude-agent-acp stamps no `_meta.kiro` identity. Its read built-ins are named
+# by `harness_builtin_tool`, mapped from the tool name the adapter stamped on the
+# preceding tool_call frame, and the same kind narrowing applies.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("builtin", "kind", "title"),
+    [
+        ("web_search", "fetch", 'Search "release notes"'),
+        ("web_fetch", "fetch", "Fetch https://example.com/changelog"),
+        ("fs_read", "read", "Read /etc/hosts"),
+    ],
+    ids=["WebSearch", "WebFetch", "Read"],
+)
+async def test_read_only_policy_approves_a_claude_read_tool(builtin, kind, title):
+    provider = await _run_read_only(
+        _read_only_event(title=title, tool_kind=kind, harness_builtin_tool=builtin)
+    )
+    assert provider.approved == ["r1"]
+    assert provider.rejected == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_policy_rejects_a_claude_search_kind():
+    """claude's Grep and Glob are kind ``search``. The kind may only narrow, so
+    the one that reaches the gate (outside the work dir) is refused."""
+    provider = await _run_read_only(
+        _read_only_event(title="grep TODO", tool_kind="search", harness_builtin_tool="grep")
+    )
+    assert provider.rejected == ["r1"]
+    assert provider.approved == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_policy_rejects_a_claude_builtin_name_with_a_server():
+    provider = await _run_read_only(
+        _read_only_event(
+            tool_kind="fetch", harness_builtin_tool="web_fetch", mcp_server_name="files:srv"
+        )
+    )
+    assert provider.rejected == ["r1"]
+    assert provider.approved == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_policy_denies_a_claude_web_tool_an_operator_denied():
+    """A deny on the kiro-cli name binds claude's tool too: the mapped name is a
+    deny target, so the read-only proof never runs."""
+    from kiro_crew.hooks import HookManager, HooksConfig
+
+    provider = _ScriptedProvider(
+        _permission_script(
+            _read_only_event(
+                title="Fetch https://example.com",
+                tool_kind="fetch",
+                harness_builtin_tool="web_fetch",
+            )
+        )
+    )
+    await stream_and_collect(
+        provider,  # type: ignore[arg-type]
+        "q",
+        approval_policy=ToolApprovalPolicy.READ_ONLY,
+        hooks=HookManager(HooksConfig(auto_deny_tools=["web_fetch"])),
+        retry_transient=False,
+    )
     assert provider.rejected == ["r1"]
     assert provider.approved == []
 

@@ -24,12 +24,15 @@ Run ``python3 sage_lib/store.py --ensure`` to create/repair the layout and seed
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
 import re
 import shutil
+import stat
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 # Canonical KiroCrew data-root accessor. Imported at module top but kept guarded
@@ -47,6 +50,75 @@ try:
     from kiro_crew.platform_compat import restrict_to_owner as _runtime_restrict
 except ImportError:  # pragma: no cover - standalone fallback
     _runtime_restrict = None  # type: ignore[assignment]
+
+# Cross-process exclusion for the self-heal, same guard shape as the two above.
+# The runtime's helper is what carries the platform split -- ``fcntl.flock`` on
+# POSIX, ``msvcrt.locking`` on Windows -- and both fail CLOSED past their
+# ceiling, which is the property :func:`layout_lock` needs: seeding without the
+# lock is the exact fail-open it exists to prevent. Standalone then has no
+# exclusion, exactly as it has no owner-only lockdown and no confinement.
+try:
+    from kiro_crew.platform_compat import file_lock as _runtime_file_lock
+    from kiro_crew.platform_compat import open_create_or_existing as _runtime_open_creating
+except ImportError:  # pragma: no cover - standalone fallback
+    _runtime_file_lock = None  # type: ignore[assignment]
+    _runtime_open_creating = None  # type: ignore[assignment]
+
+# Owner-only directory creation in the data home, same guard shape: standalone
+# creates with the umask default, exactly as it has no owner-only lockdown.
+try:
+    from kiro_crew.owner_only_files import ensure_directory as _runtime_ensure_directory
+except ImportError:  # pragma: no cover - standalone fallback
+    _runtime_ensure_directory = None  # type: ignore[assignment]
+
+
+def _open_creating(name: str, flags: int, mode: int, dir_fd: int | None = None) -> int:
+    """Open *name*, creating it when absent, without the Darwin ``O_CREAT`` race.
+
+    Two processes that both ``openat(dir_fd, name, O_CREAT)`` an absent name can
+    get ``ENOENT`` back on Darwin, and the review that loses fails outright.
+    Creating EXCLUSIVELY first and, when a sibling won, reopening without
+    ``O_CREAT`` is the runtime's ``open_create_or_existing``; the same two steps
+    are spelled here only for standalone use. *flags* carries no create bits.
+    """
+    if _runtime_open_creating is not None:
+        return _runtime_open_creating(name, flags, mode, dir_fd=dir_fd)
+    try:  # pragma: no cover - standalone fallback
+        return os.open(name, flags | os.O_CREAT | os.O_EXCL, mode, dir_fd=dir_fd)
+    except FileExistsError:  # pragma: no cover - standalone fallback
+        return os.open(name, flags, mode, dir_fd=dir_fd)
+
+
+# The ancestor chain, in the two halves that need different mechanisms, both
+# taken from the runtime rather than reimplemented here. Same guard shape as
+# ``config_dir`` above, so the store stays importable standalone; standalone
+# then has no confinement, exactly as it has no owner-only lockdown.
+#
+# ``refuse_linked_parent`` covers a link ALREADY sitting on the chain, which is
+# the shape an attacker can set up at leisure. It carries the anchor policy
+# (the runtime's own data roots, shallowest match, and a walk up to the first
+# existing ancestor for a path outside them all), so a caller-supplied ``root``
+# outside the data home is judged rather than silently exempted.
+#
+# ``pin_parent`` covers a component swapped mid-walk, with one ``openat`` per
+# component and ``O_NOFOLLOW`` on each, which no single by-name open can do.
+# Neither half subsumes the other: the pin is handed a path it opens by name, so
+# it needs the chain it walks to be named lexically below the trust anchor
+# (``anchored_parent``) rather than resolved, and the refusal is a stat and so
+# loses a race with a planted link.
+try:
+    from kiro_crew.atomic_write import anchored_parent as _runtime_anchored_parent
+    from kiro_crew.atomic_write import refuse_linked_parent as _runtime_refuse_linked
+except ImportError:  # pragma: no cover - standalone fallback
+    _runtime_anchored_parent = None  # type: ignore[assignment]
+    _runtime_refuse_linked = None  # type: ignore[assignment]
+
+try:
+    from kiro_crew.pinned_fs import pin_parent as _runtime_pin_parent
+    from kiro_crew.pinned_fs import supports_pinned_walk as _runtime_supports_pinned_walk
+except ImportError:  # pragma: no cover - standalone fallback
+    _runtime_pin_parent = None  # type: ignore[assignment]
+    _runtime_supports_pinned_walk = None  # type: ignore[assignment]
 
 APP_NAME = "code-review-sage"
 
@@ -185,21 +257,143 @@ def open_locked_temp(directory: str | os.PathLike) -> tuple[int, str]:
     return fd, tmp
 
 
-#: True when this platform can pin a directory and act relative to it. The
+#: True when this platform can WALK a chain by descriptor and open relative to
+#: it. The runtime's ``supports_pinned_walk()`` is that definition, borrowed
+#: rather than written again; the standalone fallback repeats it because the
+#: runtime is not importable then.
+_CAN_PIN_WALK = (
+    _runtime_supports_pinned_walk()
+    if _runtime_supports_pinned_walk is not None
+    else (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in os.supports_dir_fd
+    )
+)
+
+#: True when this platform can pin a directory and PUBLISH relative to it. The
 #: confinement in :func:`atomic_write_locked` needs ``open``, ``unlink`` and the
 #: rename family to all accept a directory descriptor, and Windows has none of
 #: them, so the capability is resolved once here rather than guessed per call.
 #: Probed via ``os.rename``: CPython registers the rename family under that name,
 #: so ``os.replace in os.supports_dir_fd`` is False even where the pinned
-#: ``os.replace(..., src_dir_fd=, dst_dir_fd=)`` call works. (Same probe shape as
-#: ``spec_builder``'s ``_CAN_PIN_DIR``, which documents that quirk.)
+#: ``os.replace(..., src_dir_fd=, dst_dir_fd=)`` call works.
+#:
+#: Strictly more than :data:`_CAN_PIN_WALK`: only the two extra verbs a staged
+#: replace needs are asked here, so a caller that merely opens relative to a
+#: pinned parent -- :func:`open_append_nolink` -- is not degraded by a verb it
+#: never calls.
 _CAN_PIN_DIR = (
-    hasattr(os, "O_DIRECTORY")
-    and hasattr(os, "O_NOFOLLOW")
-    and os.open in os.supports_dir_fd
-    and os.unlink in os.supports_dir_fd
-    and os.rename in os.supports_dir_fd
+    _CAN_PIN_WALK and os.unlink in os.supports_dir_fd and os.rename in os.supports_dir_fd
 )
+
+#: Joined onto a directory so the planted-link refusal judges that DIRECTORY's
+#: own chain rather than its parent's. The refusal deliberately exempts the
+#: final component, because a rename replaces a link rather than writing through
+#: it, so a directory handed in bare would have itself left unjudged. The name is
+#: never created; only the components above it are inspected.
+_CHAIN_PROBE = ".chain-probe"
+
+
+def refuse_linked_parents(path: str | os.PathLike) -> None:
+    """Refuse *path* when a link sits on the chain of directories above it.
+
+    A no-op outside the Kiro Crew runtime, like the owner-only lockdown: the
+    anchor policy lives in the runtime and there is nothing to anchor against
+    without it.
+    """
+    if _runtime_refuse_linked is None:  # pragma: no cover - standalone fallback
+        return
+    _runtime_refuse_linked(Path(path))
+
+
+def mkdir_refusing_links(directory: str | os.PathLike) -> Path:
+    """Create *directory* and any missing parent, refusing a planted link first.
+
+    ``mkdir(parents=True)`` resolves every component by name and creates THROUGH
+    a link it meets, so the tree lands under whatever that link points at and the
+    caller sees success. Refusing first is what removes that, and it has to
+    happen before the ``mkdir`` rather than after: afterwards the directories
+    already exist in the attacker's tree.
+
+    The window between the refusal's ``lstat`` and this ``mkdir`` is still
+    winnable by a link planted inside it, and closing it needs a chain-CREATING
+    descent (``os.mkdir(..., dir_fd=)`` per component) that the runtime does not
+    offer today. The refusal removes the shape that can be set up at leisure,
+    which is the one the report is about; :func:`atomic_write_locked`, where the
+    bytes actually land, additionally pins the chain and so does not depend on
+    this window.
+    """
+    d = Path(directory)
+    refuse_linked_parents(d / _CHAIN_PROBE)
+    if _runtime_ensure_directory is not None:
+        _runtime_ensure_directory(d)  # 0700 levels in the data home
+    else:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+class LinkedAncestorRefusal(OSError):
+    """Raised when a directory above a record became a link before it was opened.
+
+    An ``OSError`` carrying ``ELOOP``, which is what this condition already
+    raised: a single ``os.open(parent, O_DIRECTORY | O_NOFOLLOW)`` reports
+    ``ELOOP`` when the parent itself is a link, and a caller that distinguishes
+    "cannot write here" from a programming error should not have to learn a
+    second exception family now that the whole chain is checked instead of one
+    component.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(errno.ELOOP, message)
+
+
+def pin_record_dir(directory: str | os.PathLike) -> int:
+    """Open *directory* as a descriptor, refusing a component swapped mid-walk.
+
+    The returned descriptor is open and the caller closes it.
+
+    One ``openat`` with ``O_NOFOLLOW`` per component, borrowed from the runtime
+    rather than written again here. A single by-name open cannot do this: the
+    flag guards the FINAL component, so every ancestor above it is resolved by
+    name and a link there is followed silently and then pinned.
+
+    The walk opens components by name, so which names it gets decides what it can
+    refuse. ``resolve()`` is the wrong answer: it follows a link sitting on the
+    chain and hands the walk the link's TARGET, which the walk then pins
+    faithfully -- an attacker's directory, opened one careful ``O_NOFOLLOW`` at a
+    time. ``anchored_parent`` gives the shape that works instead: the trust
+    anchor resolved, because a link at or above it is the operator's own layout,
+    and every name below it LEXICAL, because that is the stretch Kiro Crew
+    creates itself and where a link is somebody's plant. A component swapped
+    there fails its own open rather than being followed.
+
+    Outside every owned root there is no anchor to start from and
+    ``anchored_parent`` says so; a caller-supplied ``root`` and the tests' temp
+    trees are that case. The walk then gets the resolved path, which keeps
+    out-of-tree roots working at the cost of following a link already on their
+    chain -- the same trade the refusal makes there, and for the same reason: a
+    link outside Kiro Crew's own trees is indistinguishable from layout.
+
+    Standalone, with no runtime to borrow the walk from, this is the one by-name
+    open it replaces. ``O_CLOEXEC`` is absent from the runtime's flags and not
+    needed: descriptors Python opens are non-inheritable already.
+    """
+    if _runtime_pin_parent is None:  # pragma: no cover - standalone fallback
+        cloexec = getattr(os, "O_CLOEXEC", 0)
+        return os.open(
+            str(directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
+        )
+    anchored = (
+        _runtime_anchored_parent(Path(directory))
+        if _runtime_anchored_parent is not None
+        else None
+    )
+    return _runtime_pin_parent(
+        anchored if anchored is not None else str(Path(directory).resolve()),
+        what="sage record",
+        refusal=LinkedAncestorRefusal,
+    )
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -241,35 +435,70 @@ def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
     directory the descriptor does not name. ``O_NOFOLLOW`` on the pin also
     refuses a parent that is itself a link.
 
-    What remains is the ANCESTOR CHAIN: ``mkdir(parents=True)`` and the pin's own
-    ``os.open`` both resolve the full path by name, and ``O_NOFOLLOW`` guards
-    only its final component, so an INTERMEDIATE ancestor swapped for a symlink
-    is still followed. That residue is REDUCIBLE, not a floor: walking the chain
-    componentwise from a trusted anchor (``os.open(component,
-    O_DIRECTORY|O_NOFOLLOW, dir_fd=parent_fd)`` per component, creating with
-    ``os.mkdir(..., dir_fd=...)``) shrinks the trusted surface to that anchor
-    alone. It is deliberately NOT done here: choosing the anchor is a design
-    decision in this app, whose directory helpers are root-parameterized, and it
-    is filed as its own change. This narrows three windows to one; it does not
-    close the last one.
+    The ANCESTOR CHAIN is covered in two halves, because neither half covers the
+    other. ``mkdir(parents=True)`` and a single ``os.open`` both resolve the full
+    path by name and ``O_NOFOLLOW`` guards only the final component, so an
+    INTERMEDIATE ancestor that is a link is followed. :func:`refuse_linked_parents`
+    refuses a link that is ALREADY on the chain -- the shape that can be planted
+    at leisure -- and :func:`pin_record_dir` then walks the chain one
+    ``O_NOFOLLOW`` ``openat`` per component, so a component swapped AFTER that
+    refusal is refused rather than followed. The pin cannot replace the refusal:
+    it starts from the trust anchor and takes the anchor's own resolution on
+    trust, which is where a link is the operator's layout and must keep working.
+    The refusal cannot replace the pin, because an ``lstat`` loses a race with a
+    link planted just after it.
+
+    Inside the owned trees that race is closed here, and the closing is a matter
+    of which NAMES the walk is handed: the names below the anchor stay lexical
+    (see :func:`pin_record_dir`), so nothing between the refusal and the walk
+    re-resolves them and a link planted in that window fails its own open. Two
+    cases keep the older, weaker story. A swap at or ABOVE the anchor is followed
+    by the anchor's resolution, which is deliberate. And a parent outside every
+    owned root has no anchor, so its chain is resolved whole -- caller-supplied
+    roots and temp trees, where a link cannot be told from layout anyway.
+    Creating the chain is still the weaker step either way: see
+    :func:`mkdir_refusing_links`, whose own window needs a chain-CREATING pinned
+    descent the runtime does not offer yet.
 
     Owner-only comes from the ``0o600`` creation mode instead of a follow-up
     ``restrict_to_owner`` call, which would be another resolution by name. On the
     fallback path (Windows: :data:`_CAN_PIN_DIR` is False because none of the
-    dir_fd variants exist there) the behaviour is exactly today's
+    dir_fd variants exist there) the write itself is exactly today's
     :func:`open_locked_temp` + ``os.replace``, DACL lockdown included -- the
-    platform that cannot pin is the platform that keeps the old shape.
+    platform that cannot pin is the platform that keeps the old shape. It is not
+    left bare, though: the refusal above runs on every platform, and its ``lstat``
+    walk is the only check that sees a Windows JUNCTION at all, which
+    ``os.path.islink`` reports as False.
     Callers own creating the parent, and every one of the nine does -- either
-    `mkdir(parents=True)` directly (`learning`, `report`, `followup`) or
+    :func:`mkdir_refusing_links` directly (`learning`, `report`, `followup`) or
     `ensure_layout` / `ensure_run_layout` (`discovery`, `results`). This function
     deliberately does NOT create it: an `exist_ok` mkdir here RESURRECTS a
     directory tree that a concurrent namespace deletion is removing, so the
     delete reports success while a stale record survives under a namespace that
     is supposed to be gone. Dropping it also removes the last by-name `mkdir`
     from this path, leaving the pin as the only place the parent is resolved.
+
+    Callers ALSO own mutual exclusion, which the ``locked`` in the name does not
+    supply: it names the owner-only lockdown of the bytes, not a lock against
+    another writer. One publish is all-or-nothing, and two publishes aimed at one
+    name are two renames the primitive knows nothing about. On POSIX they are
+    harmless, so the gap is invisible there; on Windows ``os.replace`` raises
+    ``PermissionError`` when a handle is open on the destination or another
+    rename is landing on it, and the loser's whole action fails. So a caller that
+    can publish one target from several processes serializes itself:
+    :func:`layout_lock` covers the self-heal's seeds and
+    ``learning._candidate_lock`` covers the candidate catalog, both through the
+    runtime's advisory file lock.
     """
     target = Path(path)
     parent = target.parent
+
+    # Before anything resolves the chain, including the pinned walk's own
+    # ``resolve``. A link already sitting on it is followed by every resolution,
+    # so refusing it is what the pin cannot do for itself. This runs on both
+    # branches below, which is the whole of the guard where pinning is
+    # unavailable.
+    refuse_linked_parents(target)
 
     if not _CAN_PIN_DIR:  # pragma: no cover - exercised on Windows
         fd, tmp = open_locked_temp(parent)
@@ -285,9 +514,7 @@ def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
         return
 
     cloexec = getattr(os, "O_CLOEXEC", 0)
-    dir_fd = os.open(
-        str(parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec
-    )
+    dir_fd = pin_record_dir(parent)
     try:
         # Unpredictable, like mkstemp's own name: the reviewer must not be able
         # to pre-plant the temp it is about to be handed. The randomness is the
@@ -352,6 +579,116 @@ def atomic_write_locked(path: str | os.PathLike, data: bytes) -> None:
 def atomic_write_text(path: str | os.PathLike, text: str) -> None:
     """UTF-8 convenience wrapper over :func:`atomic_write_locked`."""
     atomic_write_locked(path, text.encode("utf-8"))
+
+
+def _refuse_unsafe_leaf(target: Path) -> None:
+    """Refuse an existing *target* that is a link or is not a regular file.
+
+    ``follow_symlinks=False`` is available on every platform Python supports, so
+    this leg holds where ``O_NOFOLLOW`` does not. It is what stops an
+    attacker-PLANTED name from being written into, which needs no race at all.
+
+    A NAME check only. What it cannot see is an ALIAS: a hardlink to another
+    inode is itself a regular file and is not a link, so it satisfies both tests
+    here and ``O_NOFOLLOW`` as well. :func:`_refuse_unsafe_fd` is the leg that
+    catches that one, on the descriptor rather than the name.
+
+    The message names no verb, because both callers open a leaf for a different
+    purpose -- an append and a lock -- and the refusal is about the name, not
+    about what was going to be done with it.
+    """
+    try:
+        existing = os.stat(str(target), follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(existing.st_mode):
+        raise LinkedAncestorRefusal(f"refusing to open {target}: it is a symbolic link")
+    if not stat.S_ISREG(existing.st_mode):
+        raise LinkedAncestorRefusal(f"refusing to open {target}: it is not a regular file")
+
+
+def _refuse_unsafe_fd(fd: int, target: Path) -> None:
+    """Refuse an opened *fd* that is not a LONE regular file.
+
+    The link count is the check a name cannot make. A hardlink to a sensitive
+    inode is a regular file and is not a symbolic link, so it passes every
+    name-based test and ``O_NOFOLLOW`` too, and an append then lands in the
+    original file. ``st_nlink == 1`` is what says the name opened is the only one
+    for those bytes.
+
+    On the descriptor, so it cannot be raced: the bytes checked are the bytes
+    written to, whatever the name was made to mean in between. It runs on every
+    platform for the same reason -- it is the check that does not depend on a
+    flag the platform may not have. Both paths in this module that open a leaf by
+    name go through it, :func:`open_append_nolink` and :func:`layout_lock`, and
+    the message names no verb because the two want the descriptor for different
+    things.
+    """
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        raise LinkedAncestorRefusal(
+            f"refusing to open {target}: not a lone regular file"
+        )
+
+
+def open_append_nolink(path: str | os.PathLike) -> int:
+    """Open *path* for APPENDING with the chain pinned and no name followed.
+
+    For a log that is appended rather than republished. A staged replace would
+    have to read the whole log back, add the line and rename a fresh file over
+    it, and two appenders racing that sequence each publish a copy missing the
+    other's entry, so ``O_APPEND`` keeps each record indivisible and the chain is
+    made safe AROUND the append instead of by replacing it.
+
+    Three legs, mirroring the runtime's own no-follow publish, and the middle one
+    is the portable half:
+
+    * the ancestor chain goes through :func:`refuse_linked_parents`, which is the
+      shape an attacker can stage at leisure and the only check that sees a
+      Windows junction;
+    * the leaf is ``lstat``-ed by :func:`_refuse_unsafe_leaf` and refused when it
+      is a link or not a regular file. The check runs on every platform, but it is
+      only welded to the open where ``O_NOFOLLOW`` exists -- see the residual
+      below;
+    * where the dir_fd verbs exist the leaf is opened RELATIVE to the pinned
+      parent, so no ancestor is re-resolved by name between the refusal and the
+      open, and a component swapped in that window fails its own open.
+
+    Then the OPENED descriptor is checked by :func:`_refuse_unsafe_fd`, which is
+    the only leg that sees a hardlink -- an alias to another inode passes every
+    name test above, and on a descriptor the check cannot be raced.
+
+    RESIDUAL, Windows only. Where the dir_fd verbs are absent the open stays by
+    name, and ``getattr(os, "O_NOFOLLOW", 0)`` is 0 there, so that open FOLLOWS a
+    reparse point at the leaf. What degrades is therefore more than ancestor
+    pinning: the leaf refusal above becomes a check-to-open window, and neither
+    remaining leg closes it. ``_refuse_unsafe_fd`` cannot, because a followed
+    reparse point yields a descriptor on the TARGET, and a regular target with one
+    link passes both of its tests. So a reparse point planted in that window sends
+    the append into the file it names. :func:`platform_compat.open_file_no_reparse`
+    is the mechanism that settles a leaf and opens it in one operation, but it
+    opens for READING; there is no write- or append-capable counterpart, and an
+    append cannot be served by a read-only descriptor. The returned descriptor is
+    open and the caller closes it.
+    """
+    target = Path(path)
+    refuse_linked_parents(target)
+    _refuse_unsafe_leaf(target)
+    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+    if not _CAN_PIN_WALK:  # pragma: no cover - exercised on Windows
+        fd = _open_creating(str(target), flags, 0o600)
+    else:
+        dir_fd = pin_record_dir(target.parent)
+        try:
+            fd = _open_creating(target.name, flags, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    try:
+        _refuse_unsafe_fd(fd, target)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 # Optional Kiro Crew redaction. Lives here rather than in `pipeline` because readers
@@ -495,12 +832,17 @@ def run_dir(run_id: str, root: Path | None = None) -> Path:
 
 
 def ensure_run_layout(run_id: str, root: Path | None = None) -> dict[str, str]:
-    """Create one run's private ``results/`` + ``report/`` dirs. Idempotent."""
+    """Create one run's private ``results/`` + ``report/`` dirs. Idempotent.
+
+    Each directory is judged on its OWN chain rather than trusting the one above
+    it: the refusal walks every component up to the trust anchor, so a link
+    planted at ``report`` is caught even though ``runs`` was just cleared.
+    """
     rd = run_dir(run_id, root)
     results = rd / "results"
     reports = rd / "report"
     for d in (rd, results, reports):
-        d.mkdir(parents=True, exist_ok=True)
+        mkdir_refusing_links(d)
     return {"runDir": str(rd), "resultsDir": str(results), "reportDir": str(reports)}
 
 
@@ -533,6 +875,88 @@ def list_run_ids(root: Path | None = None) -> list[str]:
     return sorted(p.name for p in rr.iterdir() if p.is_dir())
 
 
+#: Dedicated lock file for the self-heal, never one of the files it seeds:
+#: locking a file that is about to be REPLACED holds a lock on an inode the
+#: rename discards. Hidden so it does not read as app data in the dir listing.
+_LAYOUT_LOCK_NAME = ".layout.lock"
+
+
+@contextlib.contextmanager
+def layout_lock(root: Path | None = None) -> Iterator[None]:
+    """Serialize the data-layout self-heal against threads AND processes.
+
+    :func:`ensure_layout` is a read-modify-write: it tests whether a seeded file
+    is present and publishes it when it is not. Every entry point runs it, and
+    reviews run as separate PROCESSES, so several of them can each observe one
+    absent seed and each publish it. On POSIX the duplicate publishes are
+    harmless -- ``rename`` is atomic and the content is identical -- but on
+    Windows ``os.replace`` fails with ``PermissionError`` when another process
+    holds a handle on the destination or is renaming onto it at that moment, so
+    the loser of the race raises out of :func:`atomic_write_locked` and its whole
+    action fails. Measured on one fresh root with six concurrent entrants: all
+    six published ``learned-patterns.md``, five published ``reports/index.json``.
+
+    An advisory file lock is the exclusion the publish itself cannot supply: the
+    rename is atomic, which makes a single publish all-or-nothing, and says
+    nothing about two of them meeting on one name. Holding it across the test AND
+    the publish is what collapses the six publishes into one, and holding it
+    across ``_seed_config``'s read too is what keeps a reader's handle off a
+    destination another entrant is replacing.
+
+    The lock file is opened the way every other leaf this module opens by name
+    is, through the same four legs and the same helpers rather than a second
+    spelling of them. :func:`refuse_linked_parents` refuses a link ALREADY sitting
+    on the chain above it. :func:`pin_record_dir` then walks that chain one
+    ``O_NOFOLLOW`` ``openat`` per component and the leaf is opened relative to the
+    resulting descriptor, so a component swapped AFTER the refusal fails its own
+    open rather than redirecting this one: ``O_NOFOLLOW`` on a by-name open guards
+    the FINAL component only, so without the pin a ``data`` directory swapped for
+    a link would place this file wherever the link points, and the review worker
+    that can plant the link is exactly who the sandbox is meant to confine.
+    :func:`_refuse_unsafe_leaf` refuses a link or a non-regular file already at
+    the name, on every platform, since that needs no race at all; and
+    :func:`_refuse_unsafe_fd` rejects a hardlink to another inode on the open
+    descriptor -- which cannot be raced -- since that passes ``O_NOFOLLOW`` and
+    the name checks alike. No ``O_TRUNC``, because a lock's contents are
+    irrelevant. Mode ``0o600`` keeps it owner-only from creation, matching the
+    data it guards.
+
+    RESIDUAL, Windows only, and it is the same one :func:`open_append_nolink`
+    carries: the dir_fd verbs do not exist there, so the leaf is opened by name
+    and the chain above it rests on the ``lstat`` refusal alone, which an
+    attacker can outrun by planting a link after it. ``getattr(os, "O_NOFOLLOW",
+    0)`` is also 0 there, so the leaf refusal becomes a check-to-open window and
+    a reparse point planted inside it sends this open to whatever it names; the
+    ``fstat`` cannot carry that one, because a followed reparse point yields a
+    descriptor on a target that is itself a lone regular file. What the platform
+    does get is the whole of the exclusion this function exists for -- the
+    advisory lock is ``msvcrt.locking`` there and serializes the seeding exactly
+    as ``flock`` does -- so the concurrency gap closes on Windows while the chain
+    story stays at the module's existing Windows floor rather than improving.
+    """
+    if _runtime_file_lock is None:  # pragma: no cover - standalone fallback
+        yield
+        return
+    lock_path = data_dir(root) / _LAYOUT_LOCK_NAME
+    refuse_linked_parents(lock_path)
+    _refuse_unsafe_leaf(lock_path)
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    if not _CAN_PIN_WALK:  # pragma: no cover - exercised on Windows
+        fd = _open_creating(str(lock_path), flags, 0o600)
+    else:
+        dir_fd = pin_record_dir(lock_path.parent)
+        try:
+            fd = _open_creating(lock_path.name, flags, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+    try:
+        _refuse_unsafe_fd(fd, lock_path)
+        with _runtime_file_lock(fd, exclusive=True):
+            yield
+    finally:
+        os.close(fd)
+
+
 def ensure_layout(root: Path | None = None) -> dict[str, str]:
     """Create the full data layout if missing. Idempotent — never clobbers.
 
@@ -556,27 +980,34 @@ def ensure_layout(root: Path | None = None) -> dict[str, str]:
     tmp = data / "tmp"
 
     for d in (data, learnings, common, repos, namespaces, results, reports, runs, tmp):
-        d.mkdir(parents=True, exist_ok=True)
+        mkdir_refusing_links(d)
 
     # Warm-start common layer (empty but present so brand-new repos inherit it).
     common_patterns = common / "learned-patterns.md"
-    if not common_patterns.exists():
-        common_patterns.write_text(
-            "# Common learned patterns (cross-repo, warm start)\n\n"
-            "<!-- Promoted from per-repo layers via human-approved generalization. -->\n",
-            encoding="utf-8",
-        )
-
     # Reports pointer the UI polls.
     index = reports / "index.json"
-    if not index.exists():
-        index.write_text(
-            json.dumps({"report_slug": None, "bands": {"red": 0, "yellow": 0, "green": 0},
-                        "generated_at": None}, indent=2),
-            encoding="utf-8",
-        )
 
-    _seed_config(data)
+    # Every test below is re-read INSIDE the lock, not outside it: a test whose
+    # answer was read before the lock is a decision made when another entrant was
+    # free to publish, and acting on it is the duplicate publish the lock exists
+    # to remove. The directories above stay outside -- ``mkdir(exist_ok=True)``
+    # already tolerates a concurrent creator, so it needs no exclusion.
+    with layout_lock(root):
+        if not common_patterns.exists():
+            atomic_write_text(
+                common_patterns,
+                "# Common learned patterns (cross-repo, warm start)\n\n"
+                "<!-- Promoted from per-repo layers via human-approved generalization. -->\n",
+            )
+
+        if not index.exists():
+            atomic_write_text(
+                index,
+                json.dumps({"report_slug": None, "bands": {"red": 0, "yellow": 0, "green": 0},
+                            "generated_at": None}, indent=2),
+            )
+
+        _seed_config(data)
 
     return {
         "dataDir": str(data),
@@ -590,7 +1021,15 @@ def ensure_layout(root: Path | None = None) -> dict[str, str]:
 
 
 def _seed_config(data: Path) -> None:
-    """Write config.json once, merging in any missing top-level keys on upgrade."""
+    """Write config.json once, merging in any missing top-level keys on upgrade.
+
+    Runs under :func:`layout_lock`, held by the only caller. Both halves need it:
+    the read below opens ``config.json``, and on Windows a reader's open handle is
+    enough to make another entrant's ``os.replace`` onto that name raise, so the
+    read has to sit in the same critical section as the publish rather than beside
+    it. The merge is itself a read-modify-write, so two unserialized entrants
+    would also each publish the same merged document.
+    """
     cfg_path = data / "config.json"
     if not cfg_path.exists():
         cfg = dict(DEFAULT_CONFIG)
@@ -599,13 +1038,21 @@ def _seed_config(data: Path) -> None:
             "reports": str(data / "reports"),
             "learnings": str(data / "learnings"),
         }
-        cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        atomic_write_text(cfg_path, json.dumps(cfg, indent=2))
         return
 
     # Upgrade path: add any new default keys without overwriting user edits.
-    try:
-        existing = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    #
+    # Through `read_json_nolink`, for the same reason `read_config_quiet` reads it
+    # that way: `config.json` sits in the worker-reachable data dir, so a plain
+    # `read_text` dereferences a link a review worker plants there. That read is
+    # the dangerous half of this function, because the merged document is
+    # published back under this name -- the publish replaces the link, so a
+    # dereferenced read would copy a foreign document's bytes into a real file
+    # that `load_config` then serves as configuration. A refusal returns None and
+    # leaves the file untouched, which is what an unparsable file already does.
+    existing = read_json_nolink(cfg_path, data)
+    if existing is None:
         return
     changed = False
     for key, val in DEFAULT_CONFIG.items():
@@ -621,7 +1068,7 @@ def _seed_config(data: Path) -> None:
         }
         changed = True
     if changed:
-        cfg_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        atomic_write_text(cfg_path, json.dumps(existing, indent=2))
 
 
 def load_config(root: Path | None = None) -> dict:

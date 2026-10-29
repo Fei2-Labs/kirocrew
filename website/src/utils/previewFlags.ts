@@ -53,31 +53,31 @@ export interface PreviewFlagChange {
 
 /** Inbound webhooks (`/webhooks`): functional, not yet polished enough to ship. */
 export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
-
-/**
- * Experimental ACP adapters — the ACP adapter controls (Developer > ACP
- * Adapters, and the active-adapter row on System > Services).
- *
- * Gated for a different reason than the other flags: not roughness, but that no
- * successful session has been observed on a non-kiro backend. The refusal paths
- * are covered by tests; the working path is not, because it needs a host with a
- * Codex or Claude adapter installed and signed in. Advertising a selector whose
- * happy path is unverified invites an operator to switch a real session onto it.
- *
- * This is NOT a substitute for `ACP_BACKENDS_SELECTABLE` on the gateway, which
- * is the real enforcement point — the flag only decides whether the operator is
- * shown the control.
- */
 export const PREVIEW_ACP_BACKENDS = `${PREVIEW_FLAG_PREFIX}acp-backends`
 
 /**
- * Crew: the Crew Members page (`/members`) and the "New Crew Mode chat" entry in
- * the sidebar's create menu.
+ * Artifact Deploy (`/deploy`): publishing an artifact to a public HTTPS URL in
+ * the operator's own AWS account.
+ *
+ * Gating the INGRESS only, like every flag here. `/deploy` stays routable, the
+ * deploy API is untouched, and an existing deployment keeps working — what the
+ * flag controls is whether the product OFFERS the surface to someone who has not
+ * asked for it. The doors are the Artifacts page's Artifact Deploy button and its
+ * dropdown twin, the webapp card's Deploy hero, and the "Publish to public web
+ * (your AWS)" row in the publish panel.
+ *
+ * Default OFF because every door leads to spending money in a real AWS account
+ * and to content served on the open internet. That is not a reasonable default
+ * for a surface still settling.
+ */
+export const PREVIEW_ARTIFACT_DEPLOY = `${PREVIEW_FLAG_PREFIX}artifact-deploy`
+
+/**
  * Crew Members: the Crew Members page (`/members`) and its rail item.
  *
  * This flag used to hold a second door too — the "New Crew Mode chat" entry in
  * the sidebar's create menu. Crew Mode retired in favour of the Members page,
- * and that menu entry is now "Crew Members": rendered whatever this flag says,
+ * and that menu entry is now "Crewmates": rendered whatever this flag says,
  * it opens `/members` when the flag is on and, when off, the Settings card that
  * turns it on (`ChatSidebar.openCrewMembers`). The flag therefore gates only the
  * page and where the entry lands, never whether the entry exists — a user who
@@ -99,10 +99,13 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
  * Sharing one key would release or hold both at once, which is the same
  * half-ship failure a per-feature flag exists to prevent.
  *
- * Held because the LANDING is unfinished, not the dispatch: the session really is
- * created on the peer, but there is no native remote chat view yet, so it opens
- * by switching to that crew's pane, and the local session list does not show
- * live remote sessions — so the session is hard to return to afterwards.
+ * ONE flag for the whole feature: it also merges each connected crew's live
+ * sessions into the Sessions list, grouped per crew. It used to share that half
+ * with {@link PREVIEW_INSTANCE_SESSIONS}, and a user with one switch on and the
+ * other off could open a chat on a crew and then find no crew group to return
+ * to it from. Read it through `useRemoteCrewChat` and write it through
+ * {@link setRemoteCrewChat}, never as a bare flag, so the retired key keeps
+ * counting.
  *
  * Its toggle lives in Settings > Developer > Feature Previews, alongside every other
  * unreleased surface, and NOT on Settings > Remote Crew where it started: a
@@ -118,14 +121,53 @@ export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
 export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
 
 /**
- * A connected remote instance's live sessions, merged into the Sessions list.
- *
- * Gates a surface INSIDE `ChatSidebar`, which every dashboard user renders — so
- * unlike a route-level gate, this flag is also what keeps the per-instance slot
- * queries off the wire for anyone who has not opted in. Read it in the sidebar
- * and skip the fetch, rather than fetching and hiding the rows.
+ * RETIRED: the old "Remote crew sessions" switch, folded into
+ * {@link PREVIEW_REMOTE_CREW_CHAT}. Kept only so a device that turned it on
+ * still has the feature on: `useRemoteCrewChat` reads either key as ON,
+ * and {@link setRemoteCrewChat} clears it when the feature is turned off. Never
+ * gate anything on it directly.
  */
 export const PREVIEW_INSTANCE_SESSIONS = `${PREVIEW_FLAG_PREFIX}instance-sessions`
+
+/**
+ * The composable-layout dev harness (`/layout-harness`).
+ *
+ * Held because it is a MECHANISM being built beside the Members page, not a
+ * shippable surface: it mounts the layout renderer + scope over a hand-authored
+ * seed so the "panes connect by placement" mechanism can be verified in
+ * isolation, and it changes nothing a user sees. Gating the INGRESS only —
+ * turning it off hides the route; it orphans nothing (the harness holds no saved
+ * state). Its own flag so it releases (or is retired) independently.
+ *
+ * The key string is `layout-harness`, matching the flag the layout feature
+ * itself reads, so the toggle here and the feature's own gate agree on one key.
+ */
+export const PREVIEW_LAYOUT_HARNESS = `${PREVIEW_FLAG_PREFIX}layout-harness`
+
+/**
+ * A sidebar folder drawn around the session that conducts it: that card pinned
+ * first inside the folder, with an accent bar down its left edge and a
+ * `conductor` tag beside its agent name.
+ *
+ * Held because it changes the SHAPE of a list tens of thousands of people read
+ * every day, by default, for every folder whose sessions were opened by one of
+ * them. The pin is not a new door that a reader can decline to walk through, so
+ * the usual ingress-only argument for shipping a preview unflagged does not
+ * apply here: there is nothing to decline. First Principles review asked for
+ * either a flag or an accepted RFC, and a per-device flag is the cheaper of the
+ * two to retire.
+ *
+ * Default OFF, and OFF is byte-for-byte the list on `main`: the folder's rows
+ * are handed on as the same array in the same order and the body is the same
+ * element, so nothing about an ordinary render is conditional on this key.
+ *
+ * It does NOT gate the two ways to REACH that session -- the folder row's chat
+ * button and the same action in the folder's menus. Those are ingresses a reader
+ * can decline, they move nothing on the resting list, and gating them here would
+ * leave a conducted folder with no way to the conversation it is drawn around.
+ * This key holds the layout and nothing else.
+ */
+export const PREVIEW_FOLDER_CONDUCTOR = `${PREVIEW_FLAG_PREFIX}folder-conductor`
 
 /**
  * Read a preview flag. Absent, unparseable, or storage-denied all mean OFF —
@@ -134,6 +176,16 @@ export const PREVIEW_INSTANCE_SESSIONS = `${PREVIEW_FLAG_PREFIX}instance-session
  */
 export function readPreviewFlag(flag: string): boolean {
   return safeGetItem(flag) === '1'
+}
+
+/**
+ * Turn "Chat on a crew" on or off. Off also clears the retired key, or that key
+ * would keep the feature on behind a switch that reads off.
+ */
+export function setRemoteCrewChat(on: boolean): boolean {
+  if (!setPreviewFlag(PREVIEW_REMOTE_CREW_CHAT, on)) return false
+  if (!on && readPreviewFlag(PREVIEW_INSTANCE_SESSIONS)) return setPreviewFlag(PREVIEW_INSTANCE_SESSIONS, false)
+  return true
 }
 
 /**

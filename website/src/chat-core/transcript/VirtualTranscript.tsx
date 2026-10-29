@@ -24,14 +24,12 @@ import React, {
   useCallback,
   useEffect,
   useImperativeHandle,
-  useLayoutEffect,
   useMemo,
   useRef,
-  useState,
 } from 'react'
 import { useVirtualChat } from '../../hooks/virtualizer/useVirtualChat'
 import EarlierMessagesBar from '../../pages/chat/EarlierMessagesBar'
-import TranscriptScrollShell from '../../pages/chat/TranscriptScrollShell'
+import TranscriptScrollShell, { useTranscriptWidth } from '../../pages/chat/TranscriptScrollShell'
 import type { DisplayItem } from '../../pages/chat/types'
 import { anchorAltIdFor, stableAnchorIdFor, uniqueRowKeys, virtualKeyFor } from './rowKeys'
 import { useStableMessageKey } from './useStableMessageKey'
@@ -110,47 +108,20 @@ export interface VirtualTranscriptProps {
   prefetchStartIndex?: number
   /** Rows to hide by `visibility` (a bubble the pinned banner stands in for). */
   isRowHidden?: (item: DisplayItem, index: number) => boolean
+  /** The hidden row's action strip is still uncovered — on screen below the
+   *  card standing in for the row's bubble. Written as the `folding` value of
+   *  the row's `data-pinned-standin` marker — what index.css keys the row's
+   *  re-shown action strip on. Not "the fold is in progress": the card reaches
+   *  its clamp while the strip, hanging under the bubble, is still sliding under
+   *  it, and the strip has to stay shown until it has. A sibling flag rather
+   *  than a richer `isRowHidden` answer: at most one row is hidden, so this is a
+   *  property of the pin, not of a row. */
+  hiddenRowStripUncovered?: boolean
 }
 
 /** Virtualizer tuning shared with the main chat page. */
 const ESTIMATED_ROW_HEIGHT = 100
 const OVERSCAN = 6
-/** Widest bucket: the 900px column plus its row padding, so every wider
- *  scroller shares one height scope. */
-const WIDTH_BUCKET_MAX = 944
-const WIDTH_BUCKET_STEP = 16
-const WIDTH_SETTLE_MS = 200
-
-function bucketWidth(px: number): number {
-  return Math.min(Math.round(px / WIDTH_BUCKET_STEP) * WIDTH_BUCKET_STEP, WIDTH_BUCKET_MAX)
-}
-
-/** Row heights depend on the column width, so the height cache is scoped by a
- *  width bucket: a pane dragged narrower re-measures instead of trusting
- *  heights recorded at the old width. Debounced — a resize drag must not thrash
- *  the height index. */
-function useScrollerWidthBucket(scrollerRef: React.RefObject<HTMLDivElement | null>): number {
-  const [bucket, setBucket] = useState(() =>
-    bucketWidth(typeof window !== 'undefined' ? window.innerWidth : WIDTH_BUCKET_MAX))
-  useLayoutEffect(() => {
-    const el = scrollerRef.current
-    if (!el) return
-    const measure = () => setBucket(bucketWidth(el.clientWidth))
-    measure()
-    if (typeof ResizeObserver === 'undefined') return
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const observer = new ResizeObserver(() => {
-      clearTimeout(timer)
-      timer = setTimeout(measure, WIDTH_SETTLE_MS)
-    })
-    observer.observe(el)
-    return () => {
-      observer.disconnect()
-      clearTimeout(timer)
-    }
-  }, [scrollerRef])
-  return bucket
-}
 
 const VirtualTranscript = forwardRef<VirtualTranscriptHandle, VirtualTranscriptProps>(
   function VirtualTranscript({
@@ -171,11 +142,12 @@ const VirtualTranscript = forwardRef<VirtualTranscriptHandle, VirtualTranscriptP
     onTopReached,
     prefetchStartIndex,
     isRowHidden,
+    hiddenRowStripUncovered,
   }, ref) {
     const ownScrollerRef = useRef<HTMLDivElement | null>(null)
     const scrollerRef = externalScrollerRef ?? ownScrollerRef
     const msgKey = useStableMessageKey()
-    const widthBucket = useScrollerWidthBucket(scrollerRef)
+    const { widthBucket, canMeasure, bindScroller } = useTranscriptWidth()
 
     // Keys are computed list-wide (collision tie-break), then served per row.
     const rowKeys = useMemo(() => uniqueRowKeys(items, msgKey), [items, msgKey])
@@ -192,13 +164,22 @@ const VirtualTranscript = forwardRef<VirtualTranscriptHandle, VirtualTranscriptP
       [msgKey],
     )
 
+    // Only the shipped host prefixes encode a raw slot after one colon.
+    // Put that slot first for storageGc, retaining the host as a height-only
+    // partition. The namespace separates a known host (pane:slot) from an
+    // opaque caller with the reversed ID (slot:pane); removing it aliases
+    // their height caches. Other caller IDs stay opaque; sessionId owns anchors.
+    const hostedSession = /^(pane|side|embed):([^:]+)$/.exec(sessionId)
     const virt = useVirtualChat<DisplayItem>({
       items: items as DisplayItem[],
       getKey,
       getStableId,
       getAltId,
       sessionId,
-      heightScopeKey: `${sessionId}@w${widthBucket}`,
+      heightScopeKey: hostedSession
+        ? `${hostedSession[2]}:tables1:${hostedSession[1]}:w${widthBucket}`
+        : `${sessionId}:tables1:w${widthBucket}`,
+      canMeasure,
       estimatedHeight: ESTIMATED_ROW_HEIGHT,
       overscan: OVERSCAN,
       eagerFirstMeasure: true,
@@ -251,6 +232,7 @@ const VirtualTranscript = forwardRef<VirtualTranscriptHandle, VirtualTranscriptP
     return (
       <TranscriptScrollShell
         scrollerRef={scrollerRef}
+        onScrollerElement={bindScroller}
         onScroll={handleScroll}
         virt={virt}
         loadingOlder={earlier?.loading ?? false}
@@ -281,12 +263,16 @@ const VirtualTranscript = forwardRef<VirtualTranscriptHandle, VirtualTranscriptP
           // A plain block wrapper: it takes the row's own box (padding
           // included), so its rect IS the row's rect for the geometry that
           // reads `data-display-index`, and it adds no class of its own so the
-          // theming contract on the inner row is untouched.
+          // theming contract on the inner row is untouched. `data-pinned-standin`
+          // marks the hidden row for index.css, which re-shows the message's
+          // action strip beneath the card standing in for its bubble — only
+          // while the value is `folding`, i.e. while that strip is still uncovered.
           return (
             <div
               key={vi.key}
               ref={virt.measureRef(vi.index)}
               data-display-index={vi.index}
+              data-pinned-standin={hidden ? (hiddenRowStripUncovered ? 'folding' : '') : undefined}
               style={hidden ? { visibility: 'hidden' } : undefined}
             >
               {renderRow(vi.data, vi.index)}

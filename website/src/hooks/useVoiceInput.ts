@@ -1,8 +1,11 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import { api } from '../api/client'
+import { ApiError } from '../api/apiError'
+import { downloadBlob } from '../utils/download'
 import { streamingSupported, useStreamingStt } from './useStreamingStt'
 import { acquireMicStream, activeDeviceId, humanizeMicError, createLevelMeter, createAudioSample, getPreferredMicId, setPreferredMicId } from './mic'
-import { beginTranscription, settleTranscription, subscribeTranscripts } from './voiceTranscriptInbox'
+import { beginTranscription, settleTranscription, subscribeTranscripts, failedCapture, discardFailedCapture, takeFailedCapture } from './voiceTranscriptInbox'
+import type { SttModelProgress } from '../lib/sttProviders'
 import { i18nT } from '../i18n/t'
 
 function pickMimeType(): string {
@@ -49,6 +52,67 @@ function warmModel(): void {
   if (now - lastModelWarmAt < MODEL_WARM_THROTTLE_MS) return
   lastModelWarmAt = now
   api.sttPrewarm().catch(() => { /* the first utterance pays the load instead */ })
+}
+
+/**
+ * Whether posting the same audio again can succeed after `err`. A request that
+ * never got an HTTP answer (offline, connection dropped) or met a server-side
+ * failure (5xx, including the gateway's own "retry the upload") can; a 4xx
+ * refused this audio or this caller, and the same bytes get the same answer.
+ */
+function retryableFailure(err: unknown): boolean {
+  return !(err instanceof ApiError) || err.status >= 500
+}
+
+/**
+ * Post one batch recording to the transcriber and settle its outcome through the
+ * inbox. Module scope, not a hook callback, because a retry can be pressed in a
+ * composer other than the one that recorded, and the request outlives both.
+ *
+ * A failure settles WITH its audio, so the notice can offer it back: the
+ * gateway deletes its copy of the upload on every exit, which leaves the browser
+ * holding the only one.
+ */
+async function transcribeCapture(blob: Blob, ext: string, sessionId: string | null): Promise<void> {
+  // Announced to the inbox rather than tracked by one hook instance: whichever
+  // instance is mounted shows the busy state for the slot that is waiting,
+  // including one that mounts after the recording page is gone.
+  const request = beginTranscription(sessionId)
+  try {
+    const res = await api.sttTranscribe(blob, ext)
+    if (res.error) {
+      // eslint-disable-next-line no-console -- surface STT failures for debugging
+      console.error('[voice] STT error:', res.error)
+      settleTranscription({ id: request.id, error: i18nT('hooks.useVoiceInput.transcription_failed', { error: res.error }), sessionId, capture: { blob, ext, retryable: true } })
+    } else settleTranscription({ id: request.id, text: res.text, sessionId })
+  } catch (err) {
+    // eslint-disable-next-line no-console -- surface transcription failures for debugging
+    console.error('[voice] transcription failed:', err)
+    settleTranscription({ id: request.id, error: i18nT('hooks.useVoiceInput.transcription_request_failed'), sessionId, capture: { blob, ext, retryable: retryableFailure(err) } })
+  }
+}
+
+/** Name for a saved recording: sortable, and free of characters a file system refuses. */
+function recordingFileName(ext: string, now = new Date()): string {
+  return `recording-${now.toISOString().slice(0, 19).replace(/[:T]/g, '-')}.${ext}`
+}
+
+/**
+ * What the error notice can do with the audio of a failed transcription. Null
+ * when there is none: no failure, a failure with nothing recorded, or audio the
+ * user has already discarded or retried.
+ */
+export interface KeptRecording {
+  /** False when the gateway refused the audio itself; the notice offers no Retry. */
+  retryable: boolean
+  /**
+   * True while the microphone is held for another capture: Retry is shown but
+   * cannot run, because only one transcription request runs at a time.
+   */
+  retryDisabled?: boolean
+  retry: () => void
+  save: () => void
+  discard: () => void
 }
 
 interface Opts {
@@ -102,6 +166,17 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // per-session map or request token is needed. Null when idle.
   const [sessionOwner, setSessionOwner] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // The failed request whose audio the inbox still holds, read from the inbox
+  // when it settled, with the message that reports it. The audio itself stays
+  // in the inbox: this names which held capture the notice is about. Kept apart
+  // from `error` so a microphone failure on the next start does not cost the
+  // user the recording; the returned `error` shows that failure first and this
+  // notice again once it is dismissed.
+  const [kept, setKept] = useState<{ id: number; retryable: boolean; message: string } | null>(null)
+  const keptRef = useRef(kept)
+  keptRef.current = kept
+  const errorRef = useRef(error)
+  errorRef.current = error
   const [level, setLevel] = useState(0)
   const [deviceLabel, setDeviceLabel] = useState('')
   // The deviceId the live track is ACTUALLY capturing from (may be '' when
@@ -112,10 +187,11 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // Latest partial hypothesis, mirrored so the dictation panel can render it
   // muted. Cleared on final/stop so a stale partial can't linger as grey text.
   const [partial, setPartial] = useState('')
-  // Byte progress of a one-time model download the live session is waiting on.
-  // Surfaced to the recording chrome because otherwise the wait is
-  // indistinguishable from a hung microphone.
-  const [download, setDownload] = useState<{ done: number; total: number } | null>(null)
+  // What the recogniser is doing while the live session waits for it: the
+  // one-time model download, or the load that follows it. Surfaced to the
+  // recording chrome because otherwise the wait is indistinguishable from a hung
+  // microphone.
+  const [download, setDownload] = useState<SttModelProgress | null>(null)
   // Unthrottled per-frame audio features, written in place by the level meter
   // and read by the shader's render loop. A ref (not state) on purpose: this
   // updates ~60x/sec and must never trigger a React render.
@@ -157,7 +233,17 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // choice" without mistaking an unavoidable device fallback for staleness.
   const warmWantRef = useRef<string | null>(null)
   const warmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const clearError = useCallback(() => setError(null), [])
+  // Dismisses the notice on screen. A microphone error is shown ahead of a kept
+  // recording, so it goes first; dismissing the kept recording's own notice is
+  // the last way back to that audio, so it lets the audio go as well rather
+  // than leaving it held with nothing to reach it.
+  const clearError = useCallback(() => {
+    if (errorRef.current) { setError(null); return }
+    const k = keptRef.current
+    if (k) discardFailedCapture(k.id)
+    keptRef.current = null
+    setKept(null)
+  }, [])
 
   // Live active-session id, mirrored every render so start() can snapshot the
   // slot that owns a recording at the exact moment capture begins.
@@ -204,14 +290,52 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
 
   // Stop any in-flight streaming session when the user toggles streaming off
   // mid-session. Without this, the WebSocket + Transcribe session leak until
-  // unmount — Transcribe bills for the whole idle window. Must live here
-  // (not ChatPage) to read `streamRecording` directly: routing through the
-  // returned `recording` property is racy because `useVoiceInput` flips it
-  // to the batch `recording` (false) on the same render where `streamEnabled`
-  // goes false, so the caller's `voice.recording` is already false.
+  // unmount — Transcribe bills for the whole idle window. Must live here (not
+  // ChatPage) because this hook owns the socket: it reads the socket's own
+  // `streamRecording` and calls the socket's own stop, so the session closes on
+  // the setting change itself rather than waiting for a caller to observe it.
   useEffect(() => {
     if (!streamEnabled && streamRecording) streamStop()
   }, [streamEnabled, streamRecording, streamStop])
+
+  /**
+   * Which transport THIS hook's own utterance is in flight on, or null when it
+   * has none.
+   *
+   * `streamEnabled` cannot answer this. It is the saved preference, so it
+   * describes the transport the NEXT utterance will take; flip it while one
+   * utterance is open and it names a transport nothing in flight is using. A
+   * discard routed off it then lands on the wrong path — closing a socket that
+   * was never opened, or skipping the flag that drops a blob still on its way to
+   * the transcriber — and the press changes the UI while the utterance survives.
+   *
+   * Only first-hand signals count: this hook's own socket
+   * (`streamRecording`/`streamDraining`) and its own recorder (`recording`).
+   * `transcribing` is deliberately NOT read here, because the inbox raises it for
+   * whatever request is on display, including one another composer started —
+   * routing a discard off someone else's request is how a press aimed at a
+   * startup of ours would go to the wrong mechanism.
+   */
+  const ownTransport: TranscriptOrigin | null =
+    streamRecording || streamDraining ? 'stream' : recording ? 'batch' : null
+  // Read inside `cancel()`, which fires from a keystroke or a press rather than
+  // from a render, so it must see the transport as of that moment.
+  const ownTransportRef = useRef(ownTransport)
+  ownTransportRef.current = ownTransport
+  /**
+   * The transport a startup still in flight OPENED with.
+   *
+   * `ownTransport` cannot see a startup: between the awaits in `start()` there is
+   * no socket and no recorder yet, so it reads null, and falling back to the
+   * preference there is wrong for the one case that matters — the preference
+   * changing inside that same window. The startup then gets discarded down the
+   * other transport's path, which for a stream means its socket is never closed.
+   *
+   * Written before `startingRef` is raised and only ever read while it is still
+   * raised, so a value left over from a settled startup can never be consulted
+   * and there is nothing to clear.
+   */
+  const startupTransportRef = useRef<TranscriptOrigin | null>(null)
 
   const stopStream = useCallback(() => {
     if (warmTimerRef.current) { clearTimeout(warmTimerRef.current); warmTimerRef.current = null }
@@ -282,8 +406,23 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
         if (!capturing()) { setTranscribing(false); setSessionOwner(null) }
       }
       if (!deliver) return
-      if (result.error) setError(result.error)
-      else if (result.text) onTextRef.current(result.text, result.sessionId, 'batch')
+      if (result.error) {
+        // A failure whose audio the inbox holds is shown through `kept`, which
+        // lasts as long as the audio does; any other failure is a plain error.
+        const capture = failedCapture(result.id)
+        if (capture) {
+          const next = { id: result.id, retryable: capture.retryable, message: result.error }
+          keptRef.current = next
+          setKept(next)
+        } else setError(result.error)
+      } else if (result.text) onTextRef.current(result.text, result.sessionId, 'batch')
+    },
+    // The notice was about that audio; with the audio gone it has nothing left
+    // to offer, and a retry in flight shows as busy instead.
+    release: id => {
+      if (keptRef.current?.id !== id) return
+      keptRef.current = null
+      setKept(null)
     },
     owns: sessionId => ownsRef.current?.(sessionId) === true,
     get acceptsUnowned() { return acceptsUnownedRef.current },
@@ -387,6 +526,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       // stream actually starts — so a mid-startup slot switch can't misattribute
       // this stream to the slot now on screen.
       if (startingRef.current) return
+      startupTransportRef.current = 'stream'
       startingRef.current = true
       // Stop spoken replies before capture can feed them back into dictation.
       window.dispatchEvent(new CustomEvent('voice-stop'))
@@ -404,6 +544,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
         // no session to own. Claiming ownership here would advertise a stream
         // that does not exist.
         if (gen !== startGenRef.current) return
+        // Capturing again ends the offer for the last failed recording. Only
+        // now, not on the press: a start that fails or is cancelled leaves the
+        // user with no new audio, so the kept one must still be reachable.
+        discardFailedCapture()
         setSessionOwner(streamSession)
       } finally {
         // Only if still ours: a cancel (or a later start) has already moved the
@@ -413,6 +557,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       return
     }
     if (!voiceInputSupported || startingRef.current) return
+    startupTransportRef.current = 'batch'
     startingRef.current = true
     window.dispatchEvent(new CustomEvent('voice-stop'))
     const gen = ++startGenRef.current
@@ -470,22 +615,7 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
         const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm'
         const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
         if (blob.size < 100) { setSessionOwner(null); return }
-        // Announced to the inbox rather than tracked only here: whichever hook
-        // instance is mounted shows the busy state for the slot that is waiting,
-        // including one that mounts after this recorder's page is gone.
-        const request = beginTranscription(sessionAtStart)
-        try {
-          const res = await api.sttTranscribe(blob, ext)
-          if (res.error) {
-            // eslint-disable-next-line no-console -- surface STT failures for debugging
-            console.error('[voice] STT error:', res.error)
-            settleTranscription({ id: request.id, error: i18nT('hooks.useVoiceInput.transcription_failed', { error: res.error }), sessionId: sessionAtStart })
-          } else settleTranscription({ id: request.id, text: res.text, sessionId: sessionAtStart })
-        } catch (err) {
-          // eslint-disable-next-line no-console -- surface transcription failures for debugging
-          console.error('[voice] transcription failed:', err)
-          settleTranscription({ id: request.id, error: i18nT('hooks.useVoiceInput.transcription_request_failed'), sessionId: sessionAtStart })
-        }
+        await transcribeCapture(blob, ext, sessionAtStart)
         // The session ends when the transcription settles, and releasing
         // `transcribing`/`sessionOwner` is the subscriber's job — this recorder's
         // own hook instance while it is still mounted, or the next one to mount.
@@ -494,6 +624,9 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
       }
       mr.start()
       mediaRef.current = mr
+      // Capture is running, so the last failed recording's offer ends here
+      // (see the streaming path above for why not earlier).
+      discardFailedCapture()
       setRecording(true)
       // Ownership is assigned HERE — when capture actually begins — not
       // optimistically on click. If the user switched slots during the
@@ -527,7 +660,17 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   }, [streamEnabled, streamStart, streamStop, acquireWarm])
 
   const stop = useCallback(() => {
-    if (streamEnabled) { streamStop(); return }
+    // Routed on the utterance in flight, never on the preference: the preference
+    // names the transport the NEXT utterance will take, so a flip mid-utterance
+    // sends the commit to the other transport's mechanism — closing a socket that
+    // was never opened while the live recorder keeps capturing, and the press
+    // clears the UI while the microphone stays hot. A startup counts as in flight
+    // and is consulted second, because between the awaits in `start()` there is no
+    // socket and no recorder for the live read to see. Only with neither does the
+    // preference decide, and there the press has no capture to end.
+    const startupTransport = startingRef.current ? startupTransportRef.current : null
+    const transport = ownTransportRef.current ?? startupTransport
+    if (transport ? transport === 'stream' : streamEnabled) { streamStop(); return }
     setPartial('')
     levelStopRef.current?.()
     levelStopRef.current = null
@@ -546,6 +689,10 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   // disarms the draining final and restores the pre-dictation composer text.
   const cancel = useCallback(() => {
     if (warmTimerRef.current) { clearTimeout(warmTimerRef.current); warmTimerRef.current = null }
+    // Read BEFORE the latch is released below: a startup still in flight is the
+    // request this discard is ending, and its transport is the only honest answer
+    // for a window in which no socket or recorder exists yet.
+    const startupTransport = startingRef.current ? startupTransportRef.current : null
     // Abandon any startup still in flight and RELEASE the re-entrancy latch, so a
     // replacement press can start a new session immediately instead of being
     // swallowed. Without this, cancelling while `getUserMedia` is still awaiting
@@ -558,7 +705,16 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     startGenRef.current++
     startingRef.current = false
     setPartial('')
-    if (streamEnabled) { streamCancel(); setSessionOwner(null); return }
+    // Routed on the utterance in flight, never on the preference: a preference
+    // flipped mid-utterance would otherwise send the discard down the other
+    // transport's path, where it closes a socket that was never opened and
+    // leaves the blob it should have dropped on its way to the transcriber.
+    // A startup counts as in flight and is consulted second, because between the
+    // awaits in `start()` there is no socket and no recorder for the live read to
+    // see. Only with neither does the preference decide, and there the press is
+    // releasing a warm mic, which exists on the batch path alone.
+    const transport = ownTransportRef.current ?? startupTransport
+    if (transport ? transport === 'stream' : streamEnabled) { streamCancel(); setSessionOwner(null); return }
     if (mediaRef.current?.state === 'recording') {
       // onstop drops the blob (see discardRef) and tears down the meter + stream.
       discardRef.current = true
@@ -576,7 +732,19 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
     if (streamEnabled && !streamRecording && !streamDraining && !startingRef.current) setSessionOwner(null)
   }, [streamEnabled, streamRecording, streamDraining])
 
-  const isRecording = streamEnabled ? streamRecording : recording
+  /**
+   * Whether THIS hook's own capture is live.
+   *
+   * Routed on the transport in flight rather than on the preference, for the same
+   * reason `stop()` and `cancel()` are: with the preference flipped mid-utterance
+   * the flag belonging to the other transport is idle, so this reads false while
+   * the microphone is still capturing — and every control gated on it, up to and
+   * including `toggle`'s choice of stop over start, stops reaching the capture.
+   *
+   * Draining is not capture: a stream that has stopped recording reads false here
+   * and surfaces through `transcribing` instead.
+   */
+  const isRecording = ownTransport === 'stream' ? streamRecording : ownTransport === 'batch' ? recording : false
   const toggle = useCallback(() => { if (isRecording) stop(); else start() }, [isRecording, start, stop])
   /**
    * Change the capture device from the in-chat picker.
@@ -619,5 +787,59 @@ export function useVoiceInput(onText: (text: string, sessionId: string | null, o
   /** True when `switchDevice` takes effect immediately rather than next recording. */
   const deviceSwitchIsLive = streamEnabled && streamRecording
 
-  return { recording: isRecording, transcribing: transcribing || !!streamDraining, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
+  /**
+   * Can the utterance in flight still be called off?
+   *
+   * Answered from the ACTIVE transport, so a preference flipped mid-request
+   * cannot make it lie. Streaming is the one transport whose drain can be ended:
+   * the audio is held against a socket this hook owns, so `cancel()` closes it
+   * and the final never arrives. Batch has no drain to end — capture is over and
+   * the blob is already POSTed, so `cancel()` reaches nothing on the wire and the
+   * transcript lands anyway. A batch dictation is discardable only while its
+   * capture still runs, which is a different window from this one.
+   *
+   * So `streamDraining` IS the whole answer, and reading it here rather than in
+   * the UI keeps the rule beside `cancel()`, whose routing decides whether a
+   * press does anything at all.
+   */
+  const drainCancellable = !!streamDraining
+
+  // The kept recording's three exits. Each acts on the request its notice is
+  // about (`kept.id`), so a press that races a newer failure cannot act on audio
+  // the user has not been shown.
+  const retryKept = useCallback(() => {
+    const k = keptRef.current
+    // Not while this instance is starting or running a capture: the retry would
+    // run beside that recording's upload (the composer extends this to every
+    // composer through its shared microphone owner).
+    if (!k?.retryable || capturing() || startingRef.current) return
+    // Taking the capture releases it, which clears this notice on every
+    // composer showing it; the attempt's own busy state and outcome follow
+    // through the inbox like any recording's.
+    const taken = takeFailedCapture(k.id)
+    if (taken) void transcribeCapture(taken.capture.blob, taken.capture.ext, taken.sessionId)
+  }, [capturing])
+  const saveKept = useCallback(() => {
+    const k = keptRef.current
+    const capture = k ? failedCapture(k.id) : null
+    // Kept after saving: the copy on disk does not make a retry any less useful.
+    if (capture) downloadBlob(capture.blob, recordingFileName(capture.ext))
+  }, [])
+  const discardKept = useCallback(() => {
+    const k = keptRef.current
+    if (k) discardFailedCapture(k.id)
+    keptRef.current = null
+    setKept(null)
+  }, [])
+  const keptRecording = useMemo<KeptRecording | null>(
+    () => kept ? { retryable: kept.retryable, retry: retryKept, save: saveKept, discard: discardKept } : null,
+    [kept, retryKept, saveKept, discardKept],
+  )
+  // One notice at a time: a microphone failure is about what the user is doing
+  // now, so it shows first, and the kept recording's notice, with its actions,
+  // returns when it is dismissed.
+  const shownError = error ?? kept?.message ?? null
+  const shownKept = error ? null : keptRecording
+
+  return { recording: isRecording, transcribing: transcribing || !!streamDraining, transport: ownTransport, drainCancellable, sessionOwner, streamEnabled, toggle, start, stop, cancel, prewarm, error: shownError, keptRecording: shownKept, level, deviceLabel, deviceId, clearError, partial, download, sampleRef, switchDevice, deviceSwitchIsLive }
 }

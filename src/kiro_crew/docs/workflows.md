@@ -18,7 +18,7 @@ authoring and launching happen in one step. You do not write the script.
 Two watching surfaces show a live run:
 
 - The chat side panel's **Workflows** tab, next to Changes and Subagents.
-- **Agent Capabilities → Workflows**, which is the saved library rather than the
+- **Customize → Workflows**, which is the saved library rather than the
   live view: it creates, edits, and runs reusable workflows.
 
 A run streams to the panel while it executes and injects its result into the
@@ -53,6 +53,11 @@ rather than overwritten.
 A workflow saved to the library can be run again by name instead of re-authored
 from intent. Ask what is already saved before describing a new workflow — an
 existing one that fits skips the authoring step entirely.
+
+In dashboard chat, `/workflow` lists the saved workflows, and `/workflow <name> [input]`
+runs one by its name (the slug the list shows), passing the rest of the line as
+its input. The run starts at once and its result appears in the chat when it
+finishes.
 
 ## What comes back
 

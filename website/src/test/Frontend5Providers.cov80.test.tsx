@@ -16,7 +16,7 @@ import type { ReactElement } from 'react'
 import { SlotProvider, useSlotId, useIsPaneScoped } from '../providers/SlotContext'
 import { ProviderProvider, useProvider } from '../providers/context'
 import { getAdapter } from '../providers/registry'
-import { displayModels } from '../providers/modelRegistry'
+import { displayModels, releasedAt } from '../providers/modelRegistry'
 import { setActiveSlot } from '../store/chatSlice'
 import { createTestStore } from './helpers'
 
@@ -111,5 +111,12 @@ describe('providers/modelRegistry', () => {
     const b = displayModels().map((r) => r.name)
     expect(a).toEqual(b)
     expect(a.some((n) => n.startsWith('_'))).toBe(false)
+  })
+
+  it('reads released_at through the same id fold, null when undated or unknown', () => {
+    expect(releasedAt('opus-4.8-1m')).toBe('2026-05-28')
+    expect(releasedAt('claude-opus-4.6')).toBe('2026-02-05')
+    expect(releasedAt('auto')).toBeNull()
+    expect(releasedAt('nonexistent')).toBeNull()
   })
 })

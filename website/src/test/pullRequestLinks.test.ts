@@ -9,6 +9,7 @@ import {
   loadRevealedSources,
   loadSeenPullRequestLinks,
   loadSourceSelections,
+  findSourceForUrl,
   MAX_PULL_REQUEST_SOURCES,
   parseSourceLinkUrl,
   persistSeenPullRequestLinks,
@@ -348,6 +349,37 @@ describe('extractPullRequestLinks', () => {
  * the SELECTION pointing at it is already durable. Holding the link in memory
  * only meant a reload remembered the url but could no longer produce it, and the
  * Changes reconciliation then normalised onto a different pull request. */
+describe('GitHub owner and repository case', () => {
+  const LISTED = 'https://github.com/acme/widgets/pull/10'
+  const SHOUTED = 'https://github.com/Acme/Widgets/pull/10'
+
+  it('lists one pull request mentioned in two letter cases, at the latest spelling', () => {
+    expect(extractPullRequestLinks(messages(`Opened ${LISTED}`, `Updated ${SHOUTED}`)).map(link => link.url))
+      .toEqual([SHOUTED])
+  })
+
+  it('keeps pull requests that differ by more than case apart', () => {
+    expect(extractPullRequestLinks(messages(LISTED, 'https://github.com/acme/widgets/pull/11'))).toHaveLength(2)
+  })
+
+  it('maps a url in another case onto the listed source', () => {
+    const listed = [parseSourceLinkUrl(LISTED)!]
+    expect(findSourceForUrl(listed, SHOUTED)?.url).toBe(LISTED)
+    expect(findSourceForUrl(listed, 'https://github.com/Acme/Widgets/pull/11')).toBeUndefined()
+  })
+
+  it('maps a GitHub Enterprise url in another case without its host list', () => {
+    const listed = [parseSourceLinkUrl('https://ghe.acme.example/acme/widgets/pull/3', [], [], ['ghe.acme.example'])!]
+    expect(findSourceForUrl(listed, 'https://ghe.acme.example/ACME/widgets/pull/3')?.url)
+      .toBe('https://ghe.acme.example/acme/widgets/pull/3')
+  })
+
+  it('does not fold GitLab paths, which it does not key by case', () => {
+    const listed = [parseSourceLinkUrl('https://gitlab.com/acme/svc/-/merge_requests/4')!]
+    expect(findSourceForUrl(listed, 'https://gitlab.com/Acme/svc/-/merge_requests/4')).toBeUndefined()
+  })
+})
+
 describe('revealed source persistence', () => {
   const PR = 'https://github.com/acme/widgets/pull/12'
   const ISSUE = 'https://github.com/acme/widgets/issues/9'
@@ -646,8 +678,12 @@ describe('per-slot focused source tab', () => {
     localStorage.setItem('mc-pr-source-sel:change:slot-a', '{not-json')
     localStorage.setItem('mc-pr-source-sel:change:slot-b', JSON.stringify(['not-an-object']))
     localStorage.setItem('mc-pr-source-sel:change:slot-c', JSON.stringify({ u: 42 }))
-    // Wrong host, and a canonical-looking url with a query tail, are both refused.
-    localStorage.setItem('mc-pr-source-sel:change:slot-d', JSON.stringify({ u: 'https://evil.example/acme/widgets/pull/3' }))
+    // A url no provider grammar accepts, and a canonical-looking url with a query
+    // tail, are both refused. The host is not judged here (a self-hosted GitLab
+    // or GitHub Enterprise selection must survive a reload that runs before the
+    // allowlist loads); a restored url still has to match the live transcript
+    // before it selects anything.
+    localStorage.setItem('mc-pr-source-sel:change:slot-d', JSON.stringify({ u: 'https://evil.example/acme/widgets/commit/3' }))
     localStorage.setItem('mc-pr-source-sel:change:slot-e', JSON.stringify({ u: `${prA}?tab=files` }))
     // An unknown kind segment is not a field this store owns.
     localStorage.setItem('mc-pr-source-sel:bogus:slot-f', JSON.stringify({ u: prA }))
@@ -1017,5 +1053,126 @@ describe('slotChangeUrls', () => {
     expect(slotChangeUrls([slot('chat-a', undefined)], 'chat-a')).toEqual([])
     expect(slotChangeUrls([slot('chat-a', [])], 'chat-a')).toEqual([])
     expect(slotChangeUrls([slot('chat-a', [])], 'chat-zzz')).toEqual([])
+  })
+})
+
+describe('GitHub Enterprise hosts', () => {
+  const GHE = 'ghe.example.com'
+  const PR = `https://${GHE}/acme/widgets/pull/12`
+
+  afterEach(() => { localStorage.clear() })
+
+  it('recognizes github.com exactly as without the allowlist', () => {
+    const url = 'https://github.com/acme/widgets/pull/12'
+    expect(parseSourceLinkUrl(url, [], [], [])).toEqual(parseSourceLinkUrl(url))
+    expect(parseSourceLinkUrl(url, [], [], [GHE])).toEqual(parseSourceLinkUrl(url))
+  })
+
+  it('refuses an unlisted Enterprise host', () => {
+    expect(parseSourceLinkUrl(PR)).toBeNull()
+    expect(extractPullRequestLinks(messages(`Opened ${PR}`))).toEqual([])
+  })
+
+  it('recognizes a listed host as GitHub and keeps the host in the url', () => {
+    expect(parseSourceLinkUrl(PR, [], [], [GHE])).toEqual(
+      { url: PR, provider: 'github', number: 12, repo: 'widgets', kind: 'change' },
+    )
+    expect(extractPullRequestLinks(messages(`Opened ${PR}?tab=files`), [], [], [GHE])).toEqual([
+      { url: PR, provider: 'github', number: 12, repo: 'widgets', kind: 'change' },
+    ])
+    expect(parseSourceLinkUrl(`https://${GHE}/acme/widgets/issues/9`, [], [], [GHE])?.kind).toBe('issue')
+  })
+
+  it('does not recognize lookalike or unlisted spellings', () => {
+    for (const url of [
+      'https://github.com.evil.example/acme/widgets/pull/1',
+      `https://${GHE}.attacker/acme/widgets/pull/1`,
+      `https://evil-${GHE}/acme/widgets/pull/1`,
+      `https://sub.${GHE}/acme/widgets/pull/1`,
+      `https://${GHE}:8443/acme/widgets/pull/1`,
+    ]) {
+      expect(parseSourceLinkUrl(url, [], [], [GHE])).toBeNull()
+    }
+  })
+
+  it('retro-detects transcript links when the allowlist arrives', () => {
+    const index = new PullRequestLinkIndex()
+    const history = messages(`Opened ${PR}`, 'done')
+    expect(index.update('slot-1', history)).toEqual([])
+    expect(index.update('slot-1', history, [], [], [GHE]).map(link => link.url)).toEqual([PR])
+  })
+
+  it('persists a selected Enterprise tab and a revealed Enterprise link across a reload', () => {
+    commitSourceSelection('slot-a', 'change', 'https://github.com/acme/widgets/pull/1')
+    expect(commitSourceSelection('slot-a', 'change', PR)).not.toBe('unchanged')
+    expect(sourceSelection(loadSourceSelections(), 'slot-a', 'change')).toBe(PR)
+
+    expect(commitRevealedSource('slot-b', 'change', PR)).toBe(true)
+    expect(loadRevealedSources()['slot-b'].change).toEqual(
+      { url: PR, provider: 'github', number: 12, repo: 'widgets', kind: 'change' },
+    )
+  })
+
+  it('still refuses a stored Enterprise url that is not canonical', () => {
+    for (const bad of [`${PR}?tab=files`, `${PR}/files`, `https://${GHE}/acme/widgets`]) {
+      expect(commitRevealedSource('slot-c', 'change', bad)).toBe(false)
+    }
+  })
+})
+
+describe('Bitbucket Server hosts', () => {
+  const BBS = 'bitbucket.acme.example:7990'
+  const PR = `https://${BBS}/bitbucket/projects/PROJ/repos/widgets/pull-requests/42`
+  const LINK = { url: PR, provider: 'bitbucket_server', number: 42, repo: 'widgets', kind: 'change' }
+
+  afterEach(() => { localStorage.clear() })
+
+  it('refuses a Bitbucket Server link while no host is listed', () => {
+    expect(parseSourceLinkUrl(PR)).toBeNull()
+    expect(extractPullRequestLinks(messages(`Opened ${PR}`))).toEqual([])
+  })
+
+  it('recognizes a listed host and drops the UI tab suffix from the url', () => {
+    expect(parseSourceLinkUrl(`${PR}/overview`, [], [], [], [BBS])).toEqual(LINK)
+    expect(extractPullRequestLinks(messages(`Opened ${PR}/diff`), [], [], [], [BBS])).toEqual([LINK])
+    expect(parseSourceLinkUrl(
+      `https://${BBS}/projects/PROJ/repos/widgets/pull-requests/7`, [], [], [], [BBS],
+    )?.url).toBe(`https://${BBS}/projects/PROJ/repos/widgets/pull-requests/7`)
+  })
+
+  it('does not recognize lookalike, unlisted or malformed links', () => {
+    for (const url of [
+      `https://bitbucket.acme.example/projects/PROJ/repos/widgets/pull-requests/42`,
+      `https://${BBS}.evil.example/projects/PROJ/repos/widgets/pull-requests/42`,
+      `https://${BBS}/users/dev1/repos/widgets/pull-requests/42`,
+      `https://${BBS}/projects/PROJ/repos/widgets/pull-requests/0`,
+      `https://${BBS}/projects/PROJ/repos/widgets/pull-requests/42/settings`,
+      'https://bitbucket.org/ws/widgets/pull-requests/42',
+    ]) {
+      expect(parseSourceLinkUrl(url, [], [], [], [BBS])).toBeNull()
+    }
+  })
+
+  it('leaves every existing provider as it was', () => {
+    for (const url of [
+      'https://github.com/acme/widgets/pull/12',
+      'https://gitlab.com/acme/widgets/-/merge_requests/3',
+      'https://acme.atlassian.net/browse/PROJ-9',
+    ]) {
+      expect(parseSourceLinkUrl(url, [], [], [], [BBS])).toEqual(parseSourceLinkUrl(url))
+    }
+  })
+
+  it('retro-detects transcript links when the allowlist arrives', () => {
+    const index = new PullRequestLinkIndex()
+    const history = messages(`Opened ${PR}`, 'done')
+    expect(index.update('slot-1', history)).toEqual([])
+    expect(index.update('slot-1', history, [], [], [], [BBS]).map(link => link.url)).toEqual([PR])
+  })
+
+  it('persists a revealed Bitbucket Server link across a reload', () => {
+    expect(commitRevealedSource('slot-b', 'change', PR)).toBe(true)
+    expect(loadRevealedSources()['slot-b'].change).toEqual(LINK)
+    expect(commitRevealedSource('slot-c', 'change', `${PR}/overview`)).toBe(false)
   })
 })

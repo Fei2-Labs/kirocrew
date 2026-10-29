@@ -160,3 +160,159 @@ def test_release_refs_default_to_this_build(monkeypatch) -> None:
     assert release_channel.release_refs() == ("v9.9.9-insider.7", "v9.9.9-rc.7")
     monkeypatch.setattr("kiro_crew.release_channel.__version__", "9.9.9.dev1")
     assert release_channel.release_refs() == ()
+
+
+# ── Report provenance: what a bug report may CLAIM about its lane ────────────
+#
+# `channel()` classifies a string. A packaged build may carry two strings that
+# disagree -- a repackager's four-part BUILD_VERSION stamp (which the stamp rule
+# only admits over a bare base, so stamping strips any prerelease marker) beside
+# distribution metadata that kept the `rc` -- plus a `$KIROCREW_HOME/channel`
+# record. `report_channel` weighs those sources and answers None rather than
+# guess, because the answer becomes a create-time label on a public issue.
+
+
+@pytest.mark.parametrize(
+    ("version", "distribution", "recorded", "expected"),
+    [
+        # The reported case: plain wrapper stamp, rc distribution, insider
+        # record -- with and without the record, the rc marker decides.
+        ("0.7.0.5", "0.7.0rc7", "insider", "insider"),
+        ("0.7.0.5", "0.7.0rc7", None, "insider"),
+        # A stamp alone is lane-less: no metadata, no record -> unknown, never
+        # Stable. A record supplies the lane. PLAIN metadata does not: the
+        # desktop lanes pip-install the checkout and stamp only __version__,
+        # so plain dist-info is what an unstamped pyproject leaves behind on
+        # any lane -- silence, not a stable claim. Only a marker there counts.
+        ("0.7.0.5", None, None, None),
+        ("0.7.0.5", None, "insider", "insider"),
+        ("0.7.0.5", None, "stable", "stable"),
+        ("0.7.0.5", "0.7.0", None, None),
+        ("0.7.0.5", "0.7.0", "stable", "stable"),
+        ("0.6.0.12", "0.6.0.12", None, None),
+        ("0.6.0.12", "0.6.0.12", "stable", "stable"),
+        # A desktop insider or nightly build: stamped __version__, plain
+        # dist-info from the unstamped pyproject. Its own marker decides.
+        ("0.7.0-insider.4", "0.7.0", None, "insider"),
+        ("0.7.0-nightly.20260907t061500", "0.7.0", None, "nightly"),
+        ("0.7.0rc7", "0.7.0", None, "insider"),
+        # Contradictions answer None: a stable record over a prerelease build
+        # (promotion never re-stamps; a lane switch not yet applied), a lane
+        # record over a plain stable build, two markers that disagree, or a
+        # bare literal over an rc distribution (the marker is IN the metadata).
+        ("0.7.0rc7", "0.7.0rc7", "stable", None),
+        ("0.7.0", "0.7.0", "insider", None),
+        ("0.7.0-nightly.20260907t061500", "0.7.0rc7", None, None),
+        ("0.7.0", "0.7.0rc7", None, None),
+        # The release pipeline's own spellings need no corroboration.
+        ("0.7.0", None, None, "stable"),
+        ("0.7.0", "0.7.0", None, "stable"),
+        ("0.7.0", "0.7.0", "stable", "stable"),
+        ("0.7.0rc7", None, None, "insider"),
+        ("0.7.0rc7", "0.7.0rc7", "insider", "insider"),
+        ("0.7.0-insider.4", None, None, "insider"),
+        ("0.7.0-insider.4", "0.7.0rc4", None, "insider"),
+        ("0.7.0.dev20260907061500", "0.7.0.dev20260907061500", "nightly", "nightly"),
+        ("0.7.0-nightly.20260907t061500", None, None, "nightly"),
+        # Metadata describing ANOTHER release is stale dist-info (a checkout
+        # ahead of its editable install) and says nothing about this build.
+        ("0.8.0", "0.1.2", None, "stable"),
+        ("0.8.0", "0.7.0rc7", None, "stable"),
+        ("0.8.0rc1", "0.7.0", None, "insider"),
+        # A record that names no lane is no record.
+        ("0.7.0.5", None, "beta", None),
+        ("0.7.0", None, "", "stable"),
+    ],
+)
+def test_report_channel_weighs_every_provenance_source(
+    version: str, distribution: str | None, recorded: str | None, expected: str | None
+) -> None:
+    assert release_channel.report_channel(version, distribution, recorded) == expected
+
+
+def test_report_channel_never_invents_a_lane() -> None:
+    """Every non-None answer is a real channel, so it can be labelled and prefilled."""
+    for version in ("0.7.0.5", "0.7.0", "0.7.0rc7", "0.7.0-nightly.20260907t061500", "garbage"):
+        for distribution in (None, "0.7.0", "0.7.0rc7", "0.7.0.5"):
+            for recorded in (None, *release_channel.CHANNELS):
+                answer = release_channel.report_channel(version, distribution, recorded)
+                assert answer is None or answer in release_channel.CHANNELS, (
+                    version,
+                    distribution,
+                    recorded,
+                    answer,
+                )
+
+
+def test_recorded_channel_reads_the_install_record(tmp_path, monkeypatch) -> None:
+    """Absent-aware, unlike `update_layout.release_channel`, which must always
+    name a lane to follow: here an absent or junk record is NO evidence."""
+    monkeypatch.setattr(release_channel, "data_home", lambda: tmp_path)
+    assert release_channel.recorded_channel() is None
+    (tmp_path / "channel").write_text(" Insider \n", encoding="utf-8")
+    assert release_channel.recorded_channel() == "insider"
+    (tmp_path / "channel").write_text("beta\n", encoding="utf-8")
+    assert release_channel.recorded_channel() is None
+    (tmp_path / "channel").write_text("", encoding="utf-8")
+    assert release_channel.recorded_channel() is None
+
+
+def test_recorded_channel_tolerates_an_unreadable_record(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(release_channel, "data_home", lambda: tmp_path)
+    (tmp_path / "channel").mkdir()  # a directory where a file should be
+    assert release_channel.recorded_channel() is None
+
+
+def test_distribution_version_is_none_without_metadata(monkeypatch) -> None:
+    from importlib.metadata import PackageNotFoundError
+
+    def missing(name: str) -> str:
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(release_channel, "_metadata_version", missing)
+    assert release_channel.distribution_version() is None
+
+
+def test_distribution_version_reads_the_installed_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(release_channel, "_metadata_version", lambda name: " 0.7.0rc7\n")
+    assert release_channel.distribution_version() == "0.7.0rc7"
+
+
+@pytest.mark.parametrize(
+    ("version", "release"),
+    [
+        # Only a repackager's four-part build stamp folds; the release
+        # pipeline's public spellings ARE the public identity and stay.
+        ("0.7.0.5", "0.7.0"),
+        ("0.6.0.12", "0.6.0"),
+        ("0.7.0", "0.7.0"),
+        ("0.7.0rc7", "0.7.0rc7"),
+        ("0.7.0-insider.4", "0.7.0-insider.4"),
+        ("0.7.0-nightly.20260907t061500", "0.7.0-nightly.20260907t061500"),
+        ("0.7.0.dev20260907061500", "0.7.0.dev20260907061500"),
+    ],
+)
+def test_provenance_folds_only_the_build_stamp_off_the_public_release(
+    monkeypatch, version: str, release: str
+) -> None:
+    monkeypatch.setattr(release_channel, "distribution_version", lambda: None)
+    monkeypatch.setattr(release_channel, "recorded_channel", lambda: None)
+    found = release_channel.provenance(version)
+    assert found.version == version
+    assert found.release == release
+    assert found.distribution is None
+    assert found.recorded is None
+
+
+def test_provenance_defaults_to_this_build_and_reads_both_probes(monkeypatch) -> None:
+    monkeypatch.setattr("kiro_crew.release_channel.__version__", "9.9.9.3")
+    monkeypatch.setattr(release_channel, "distribution_version", lambda: "9.9.9rc2")
+    monkeypatch.setattr(release_channel, "recorded_channel", lambda: "insider")
+    found = release_channel.provenance()
+    assert found == release_channel.Provenance(
+        version="9.9.9.3",
+        release="9.9.9",
+        distribution="9.9.9rc2",
+        recorded="insider",
+        channel="insider",
+    )

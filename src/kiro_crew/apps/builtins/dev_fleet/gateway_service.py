@@ -79,6 +79,8 @@ from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.owner_only_files import ensure_directory, owner_only_opener_for
+from kiro_crew.security import redact
 
 # service.* is import-safe on every platform (it only touches launchctl/systemctl
 # when called) and never imports apps.*, so there is no cycle to dodge here.
@@ -100,9 +102,9 @@ async def _off_loop(fn: Callable[..., "T"], *args: object) -> "T":
     """
     return await asyncio.get_running_loop().run_in_executor(subprocess_executor(), fn, *args)
 
-# (rc, stdout, stderr) — live.py's sandboxed subprocess chokepoint. Injected
+# (rc, stdout, stderr) — live_service.py's sandboxed subprocess chokepoint. Injected
 # rather than imported so every spawn stays audited through the one seam the
-# tests already patch, and so this module has no import cycle with live.py.
+# tests already patch, and so this module has no import cycle with live_service.py.
 RunCmd = Callable[..., Awaitable[tuple[int, str, str]]]
 T = TypeVar("T")
 #: ``shutil.which``-shaped tool lookup, injected for the same reason as the
@@ -227,7 +229,7 @@ class SystemdBackend:
     adapter existed, including the wire codes the dashboard already maps
     (``no_systemd`` / ``no_user_unit``).
 
-    The drop-in path and renderer are INJECTED from ``live.py`` rather than
+    The drop-in path and renderer are INJECTED from ``live_service.py`` rather than
     reimplemented here. They are the seam a dozen existing tests patch
     (``monkeypatch.setattr(mod, "_dropin_path", ...)`` /
     ``"_dropin_content"``), and keeping them where the tests already point means
@@ -307,7 +309,10 @@ class SystemdBackend:
              "systemctl", "--user", "restart", self._unit()],
             timeout=10,
         )
-        return (rc == 0, "" if rc == 0 else (stderr.strip()[:200] or "systemd-run failed"))
+        # Redact the FULL stream, then keep the TAIL (the tool prints its error
+        # last); bounding before redaction can leave an unmatched secret fragment.
+        reason = redact(stderr.strip())[-200:] or "systemd-run failed"
+        return (rc == 0, "" if rc == 0 else reason)
 
     def plan(self, worktree: Path, kcbin: Path) -> dict:
         return {
@@ -344,7 +349,7 @@ class SystemdBackend:
             ["systemctl", "--user", "daemon-reload"], timeout=10
         )
         if rc != 0:
-            return False, "reload_failed", (stderr.strip()[:200] or "daemon-reload failed")
+            return False, "reload_failed", (redact(stderr.strip())[-200:] or "daemon-reload failed")
         return True, "", ""
 
     async def reload(self) -> None:
@@ -527,7 +532,8 @@ class LaunchdBackend:
         rc, _out, stderr = await self._run(
             ["launchctl", "kill", "TERM", self.target()], timeout=10
         )
-        return (rc == 0, "" if rc == 0 else (stderr.strip()[:200] or "launchctl kill failed"))
+        reason = redact(stderr.strip())[-200:] or "launchctl kill failed"
+        return (rc == 0, "" if rc == 0 else reason)
 
     # -- staging --
     def plan(self, worktree: Path, kcbin: Path) -> dict:
@@ -644,23 +650,20 @@ def default_confinement() -> "str | None":
     Worse, the detached child shares the backend's scope, so a scope kill
     mid-restart could strand the host with NO gateway.
 
-    Detection is deny-by-default on the two purpose-built signals:
-
-    * ``KIROCREW_SANDBOX_ACTIVE`` — exported only by the namespace launcher /
-      seatbelt env prefix, i.e. only ever present INSIDE the sandbox.
-    * ``kirocrew-agents.slice`` in ``/proc/self/cgroup`` — the transient scope
-      ``cgroup_scope_argv`` places every backend in (Linux only; the file does
-      not exist elsewhere and an unreadable file is treated as unconfined,
-      matching hosts where the scope probe failed and no scope was applied).
+    Detection is deny-by-default and defers to the one confinement probe,
+    ``sandbox.agent_confinement_evidence()``: the ``KIROCREW_SANDBOX_ACTIVE``
+    marker, the ``kirocrew-agents.slice`` cgroup scope (Linux, matched against
+    ``_CGROUP_AGENTS_SLICE``), and the macOS Seatbelt verdict — all three
+    inherited by a spawned child. Routing through that single helper means a
+    renamed slice or a new marker moves in one place; this returns the
+    Dev-Fleet-specific reason so the restart gate's message names what a
+    replacement would inherit, while the probe owns the signals.
     """
-    if os.environ.get("KIROCREW_SANDBOX_ACTIVE"):
-        return "the Dev Fleet backend runs inside the Kiro Crew OS sandbox"
-    try:
-        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    if "kirocrew-agents.slice" in cgroup:
-        return "the Dev Fleet backend runs inside the kirocrew-agents cgroup scope"
+    from kiro_crew.sandbox import agent_confinement_evidence
+
+    evidence = agent_confinement_evidence()
+    if evidence is not None:
+        return f"the Dev Fleet backend is confined: {evidence}"
     return None
 
 
@@ -683,8 +686,11 @@ def default_detached_spawn(argv: list[str]) -> None:
     stdout: "IO[str] | int"
     try:
         log_path = config_dir() / "gateway.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        stdout = open(log_path, "a", encoding="utf-8")  # noqa: SIM115 — closed below
+        ensure_directory(log_path.parent)
+        # 0600 if this creates it: the same file the gateway's own handler writes.
+        stdout = open(  # noqa: SIM115 — closed below
+            log_path, "a", encoding="utf-8", opener=owner_only_opener_for(log_path)
+        )
     except OSError:
         stdout = subprocess.DEVNULL
     # argv is a validated launcher + fixed arguments (never LLM- or

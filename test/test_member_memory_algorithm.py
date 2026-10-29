@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import struct
@@ -94,23 +95,48 @@ def test_v1_reaffirmation_refreshes_source_while_v2_preserves_origin(stores):
     assert v2.get_semantic("project.status")["source"] == "consolidation:old"
 
 
-def test_v2_automatic_reextraction_keeps_forgotten_fact_hidden(stores):
+def test_automatic_reextraction_keeps_forgotten_fact_hidden(stores):
     for store in stores:
         assert store.set_semantic("project.status", "old", 1, "user_explicit") is None
         assert store.delete_semantic("project.status", "user_explicit")
-    v1, v2 = stores
-    assert v1.set_semantic("project.status", "new", 0.9, "consolidation:new") is None
-    assert json.loads(v1.get_semantic("project.status")["value_json"]) == "new"
-    assert v2.set_semantic("project.status", "new", 0.9, "consolidation:new") is not None
-    assert v2.get_semantic("project.status") is None
-    assert (
-        v2.db.execute("SELECT COUNT(*) FROM memory_revisions WHERE status='conflict'").fetchone()[0]
-        == 1
-    )
+    for store in stores:
+        assert store.set_semantic("project.status", "new", 0.9, "consolidation:new") is not None
+        assert store.get_semantic("project.status") is None
+        assert (
+            store.db.execute(
+                "SELECT COUNT(*) FROM memory_revisions WHERE status='conflict'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_consolidation_does_not_revive_forgotten_fact_but_owner_can_re_add(stores):
+    writer = object.__new__(HistoryConsolidator)
+    writer._log = MagicMock()
+    writer._log.publication_hold.side_effect = lambda _key: contextlib.nullcontext()
+    for store in stores:
+        assert store.set_semantic("project.status", "old", 1, "user_explicit") is None
+        assert store.delete_semantic("project.status", "user_explicit")
+        writer._write_structured_memory(
+            {"semantic": [{"key": "project.status", "value": "new", "confidence": 0.9}]},
+            "session",
+            store,
+        )
+        assert store.get_semantic("project.status") is None
+        assert (
+            store.db.execute(
+                "SELECT COUNT(*) FROM memory_revisions WHERE status='conflict'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert store.set_semantic("project.status", "owner", 1, "user_explicit") is None
+        assert json.loads(store.get_semantic("project.status")["value_json"]) == "owner"
 
 
 def test_consolidation_protects_owner_facts_and_keeps_v1_deletes_and_lesson_origin(stores):
     writer = object.__new__(HistoryConsolidator)
+    writer._log = MagicMock()
+    writer._log.publication_hold.side_effect = lambda _key: contextlib.nullcontext()
     for store in stores:
         assert store.set_semantic("project.status", "old", 1, "user_explicit") is None
         writer._write_structured_memory(
@@ -144,12 +170,13 @@ async def test_v2_consolidation_instructions_do_not_change_v1_prompt(stores):
     prompts = []
     for store in stores:
         assert store.set_semantic("project.status", "active", 0.9, "consolidation:old") is None
-        log = MagicMock()
-        log.get_metadata_status.return_value = ({}, True)
-        log.get_metadata.return_value = {}
+        from consolidation_lease_helpers import lease_aware_log
+
+        log = lease_aware_log()
         log.snapshot_for_consolidation.return_value = (
             [{"role": "user", "content": "Status is active"}],
             1,
+            0,
             0,
         )
         log.consolidation_retry_state.return_value = (0, 0.0)

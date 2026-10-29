@@ -148,6 +148,12 @@ def _module_state_is_restored(monkeypatch, tmp_path):
     monkeypatch.setattr(cron_script, "_RUNNING_PROCS", {})
     monkeypatch.setattr(cron_script, "_CANCELLED_PROC_JOBS", set())
     monkeypatch.setattr(cron_script, "_POSIX_STRICT_CACHE", {})
+    # The shell-form record travels with the usability cache: leaving it behind
+    # would let one test's resolved invocation form decide another's argv.
+    # ``raising=False`` so this fixture reports on the module as it is rather than
+    # erroring every test in the file when the attribute is absent — a fixture
+    # error masks which assertions actually depend on the behaviour.
+    monkeypatch.setattr(cron_script, "_BRACE_OFF_SHELLS", {}, raising=False)
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     _resolve_mcp_server.cache_clear()
     yield
@@ -517,7 +523,7 @@ class TestScriptContextPost:
 
         req = captured["req"]
         # Full-value comparison: a prefix check would also match another host.
-        assert req.full_url == "http://localhost:7788/api/send-message"
+        assert req.full_url == "http://127.0.0.1:7788/api/send-message"
         assert req.get_method() == "POST"
         assert req.get_header("X-internal-secret") == "tok"
         assert req.get_header("X-session-key") == "cron:abc"
@@ -536,7 +542,7 @@ class TestScriptContextPost:
 
 
 class TestScriptContextCallTool:
-    def test_success_audits_ok_and_closes_the_client(self, monkeypatch):
+    def test_success_audits_ok_and_keeps_the_client_until_close(self, monkeypatch):
         ctx = _ctx()
         client = MagicMock()
         client.call_tool.return_value = "tool output"
@@ -547,6 +553,8 @@ class TestScriptContextCallTool:
         assert ctx.call_tool("kirocrew-core", "browse_search", {"query": "x"}) == "tool output"
 
         client.call_tool.assert_called_once_with("browse_search", {"query": "x"})
+        client.close.assert_not_called()
+        ctx.close()
         client.close.assert_called_once()
         assert audits == [(("kirocrew-core", "browse_search", "ok"), {})]
 
@@ -695,11 +703,47 @@ class TestMcpToolClientRpc:
         assert client._rpc("ping") == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
         client.close()
 
+    def test_a_line_that_is_not_an_object_costs_that_line(self, mcp_spawn):
+        """A banner on stdout, a scalar or a line nested past the decoder used
+        to raise out of ``_rpc``, failing the call (or the handshake) outright."""
+        from stray_line_helpers import STRAY_LINES
+
+        client = self._client(
+            mcp_spawn,
+            [
+                "server banner v1.2\n",
+                *(make().decode("utf-8", "replace") for make in STRAY_LINES.values()),
+                '{"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}\n',
+            ],
+        )
+
+        assert client._rpc("ping") == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
+        client.close()
+
+    def test_a_server_that_writes_only_noise_fails_within_the_cap(self, mcp_spawn):
+        """Skipped inside ``_recv``, the lines never advanced the cap, and the
+        call read until EOF however long the server kept writing."""
+        client = self._client(mcp_spawn)
+        client._proc.stdout = _EndlessStdout("log line\n")
+
+        with pytest.raises(RuntimeError, match="within 1000 lines"):
+            client._rpc("ping")
+
+        assert client._proc.stdout.reads == 1000
+        client.close()
+
+    def test_stdout_decodes_utf8_with_replacement(self, mcp_spawn):
+        """A byte that is not UTF-8 must cost its line, not raise out of readline."""
+        client = self._client(mcp_spawn)
+        _argv, kwargs = mcp_spawn.calls[0]
+        assert (kwargs["encoding"], kwargs["errors"]) == ("utf-8", "replace")
+        client.close()
+
     def test_message_budget_is_bounded(self, mcp_spawn):
         client = self._client(mcp_spawn)
         client._proc.stdout = _EndlessStdout('{"jsonrpc": "2.0", "id": 99}\n')
 
-        with pytest.raises(RuntimeError, match="within 1000 messages"):
+        with pytest.raises(RuntimeError, match="within 1000 lines"):
             client._rpc("ping")
 
         assert client._proc.stdout.reads == 1000
@@ -896,7 +940,7 @@ class TestPathAndSecretResolution:
         script = crons / "job.py"
         script.write_text("def run(ctx): pass\n", newline="\n")
         monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
-        monkeypatch.setattr(cron_script, "is_sensitive_path", lambda p: True)
+        monkeypatch.setattr(cron_script, "sensitive_path_refusal", lambda p: "Blocked: x")
 
         with pytest.raises(PermissionError, match="blocked by security policy"):
             resolve_script_path(f"{script}:run")
@@ -907,7 +951,7 @@ class TestPathAndSecretResolution:
         script = crons / "job.py"
         script.write_text("def run(ctx): pass\n", newline="\n")
         monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
-        monkeypatch.setattr(cron_script, "is_sensitive_path", lambda p: False)
+        monkeypatch.setattr(cron_script, "sensitive_path_refusal", lambda p: None)
 
         resolved, func = resolve_script_path(f"{script}:run")
 
@@ -916,12 +960,12 @@ class TestPathAndSecretResolution:
 
     def test_internal_secret_prefers_the_environment(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "env-secret")
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-secret")
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port, **_kw: "file-secret")
         assert _resolve_internal_secret(5476) == "env-secret"
 
     def test_internal_secret_falls_back_to_the_local_secret_file(self, monkeypatch):
         monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-secret")
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port, **_kw: "file-secret")
         assert _resolve_internal_secret(5476) == "file-secret"
 
     def test_internal_secret_reads_the_port_it_is_given(self, monkeypatch):
@@ -932,7 +976,7 @@ class TestPathAndSecretResolution:
         monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
         seen = {}
 
-        def _fake_read(port):
+        def _fake_read(port, **_kw):
             seen["port"] = port
             return "file-secret"
 
@@ -949,14 +993,29 @@ def script_run(monkeypatch, tmp_path):
     """Patch run_script_sandboxed's spawn chain; expose the recorded Popen call."""
     script = tmp_path / "job.py"
     script.write_text("def run(ctx): pass\n", newline="\n")
-    monkeypatch.setattr(cron_script, "resolve_script_path", lambda spec: (str(script), "run"))
+    # Records the keywords the launcher passes, so the stub cannot silently
+    # absorb a signature change: `resolved_kwargs` is asserted below.
+    resolved_kwargs: dict = {}
+
+    def _resolve(spec, **kw):
+        resolved_kwargs.clear()
+        resolved_kwargs.update(kw)
+        return (str(script), "run")
+
+    monkeypatch.setattr(cron_script, "resolve_script_path", _resolve)
     monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
     monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
     monkeypatch.setattr(cron_script, "_resolve_internal_secret", lambda port: "unit-secret")
     restricted: list[str] = []
     monkeypatch.setattr(cron_script.platform_compat, "restrict_to_owner", restricted.append)
     state = SimpleNamespace(
-        script=script, proc=None, argv=[], env={}, launcher_src="", restricted=restricted
+        script=script,
+        proc=None,
+        argv=[],
+        env={},
+        launcher_src="",
+        restricted=restricted,
+        resolved_kwargs=resolved_kwargs,
     )
 
     def _popen(argv, **kw):
@@ -971,6 +1030,20 @@ def script_run(monkeypatch, tmp_path):
 
 
 class TestRunScriptSandboxed:
+    def test_the_launcher_resolves_a_persisted_spec_with_bundle_roots(self, script_run):
+        """The launcher re-resolves a spec that was ALREADY vetted and persisted.
+
+        An app cron's stored spec is an absolute path into the app's bundle, so
+        the launcher must opt into the bundle roots. Authoring paths (`cron_add`,
+        the CLI, the vault-grant sites) pass neither keyword and stay confined to
+        `crons/`; asserting the flag here is what keeps those two apart.
+        """
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+
+        run_script_sandboxed("spec:run", "job-roots", "the message")
+
+        assert script_run.resolved_kwargs == {"allow_bundle_roots": True}
+
     def test_the_dial_port_is_resolved_exactly_once(self, script_run, monkeypatch):
         # The credential write and the child's _KIROCREW_DIAL_PORT must come from
         # ONE resolution. Two calls are a TOCTOU: a --port auto gateway binding
@@ -1003,7 +1076,9 @@ class TestRunScriptSandboxed:
         # the boot-time 403 this fix addresses.
         monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "stale-env-secret")
         monkeypatch.setattr(cron_script, "_resolve_dial_port", lambda: 7788)
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "stale-file-secret")
+        monkeypatch.setattr(
+            cron_script, "read_local_secret", lambda port, **_kw: "stale-file-secret"
+        )
         # Use the real credential path (the fixture stubs it) so the provider
         # actually competes with env/file derivation.
         monkeypatch.setattr(cron_script, "_resolve_internal_secret", _resolve_internal_secret)
@@ -1018,7 +1093,7 @@ class TestRunScriptSandboxed:
         # order. env present -> env wins.
         monkeypatch.setattr(cron_script, "_resolve_dial_port", lambda: 7788)
         monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "env-wins")
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-loses")
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port, **_kw: "file-loses")
         # Use the real derivation (the fixture stubs it).
         monkeypatch.setattr(cron_script, "_resolve_internal_secret", _resolve_internal_secret)
         script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
@@ -1223,6 +1298,77 @@ class TestShellIsPosixStrict:
         monkeypatch.setattr(cron_script, "run_limited", _run)
         assert _shell_is_posix_strict("/bin/sh") is False
 
+    def test_a_brace_expanding_trusted_shell_is_accepted_with_expansion_off(self, monkeypatch):
+        """The Linux default (`/bin/sh -> bash`) must not cost the whole feature.
+
+        bash expands `x.{a,a}`, so the plain form fails the probe; invoked `+B`
+        the same shell preserves the literal the probe demands. Refusing it
+        outright made every command cron unavailable on AL2023 / RHEL / Fedora,
+        where no dash exists and the resolver never looks past `/bin/sh` and
+        `/usr/bin/sh` — so there was no host-side workaround either.
+        """
+        calls: list[list[str]] = []
+
+        def _run(argv, **kw):
+            calls.append(list(argv))
+            out = "x.{a,a}\n" if "+B" in argv else "x.a x.a\n"
+            return SimpleNamespace(returncode=0, stdout=out, stderr="")
+
+        monkeypatch.setattr(cron_script, "run_limited", _run)
+
+        assert _shell_is_posix_strict("/bin/sh") is True
+        # Plain form FIRST, brace-off form second: a genuinely POSIX-strict shell
+        # must never be handed a flag it would reject as an unknown option.
+        assert calls == [
+            ["/bin/sh", "-c", "echo x.{a,a}"],
+            ["/bin/sh", "+B", "-c", "echo x.{a,a}"],
+        ]
+        # The form that PASSED is the form the executor must use. Before one
+        # shared builder existed the probe and the executor spelled argv
+        # separately, so accepting a form here would have left the real command
+        # running with expansion on while the probe still reported strict.
+        assert cron_script._command_argv("/bin/sh", "echo hi") == [
+            "/bin/sh",
+            "+B",
+            "-c",
+            "echo hi",
+        ]
+
+    def test_a_posix_strict_shell_keeps_its_exact_argv(self, monkeypatch):
+        """dash / ash / a real POSIX sh stay byte-for-byte unchanged."""
+        monkeypatch.setattr(
+            cron_script,
+            "run_limited",
+            lambda argv, **kw: SimpleNamespace(returncode=0, stdout="x.{a,a}\n", stderr=""),
+        )
+
+        assert _shell_is_posix_strict("/bin/dash") is True
+        assert cron_script._command_argv("/bin/dash", "echo hi") == [
+            "/bin/dash",
+            "-c",
+            "echo hi",
+        ]
+
+    def test_a_shell_that_expands_in_every_form_records_no_form(self, monkeypatch):
+        """A refused shell must leave no brace-off record behind.
+
+        Recording the last form TRIED rather than the form that PASSED would hand
+        the executor a `+B` invocation for a shell the resolver rejected.
+        """
+        monkeypatch.setattr(
+            cron_script,
+            "run_limited",
+            lambda argv, **kw: SimpleNamespace(returncode=0, stdout="x.a x.a\n", stderr=""),
+        )
+
+        assert _shell_is_posix_strict("/bin/sh") is False
+        assert "/bin/sh" not in cron_script._BRACE_OFF_SHELLS
+        assert cron_script._command_argv("/bin/sh", "echo hi") == [
+            "/bin/sh",
+            "-c",
+            "echo hi",
+        ]
+
     def test_sandbox_profile_is_unlinked_even_when_gone(self, monkeypatch, tmp_path):
         cleanup = tmp_path / "profile.sb"
         cleanup.write_text("(deny default)", newline="\n")
@@ -1268,7 +1414,9 @@ class TestRunCommandSandboxed:
 
         assert result["status"] == "error"
         assert result["exit_code"] == -1
-        assert "No POSIX shell available" in result["output"]
+        # Both platform wordings lead with this; each one's body is pinned in
+        # test_cron_script_execution.TestCommandCronShellResolution.
+        assert "POSIX shell" in result["output"]
         assert "script cron" in result["output"]
 
     def test_success_passes_the_command_to_the_shell(self, command_run):
@@ -1279,6 +1427,22 @@ class TestRunCommandSandboxed:
         assert result == {"status": "ok", "output": "hello\n", "exit_code": 0}
         assert command_run.argv == ["/bin/sh", "-c", "echo hello"]
         assert "KIROCREW_INTERNAL_SECRET" not in command_run.env
+
+    def test_the_spawn_uses_the_form_the_probe_proved(self, command_run):
+        """The executor must inherit the resolved invocation form, not re-derive it.
+
+        This is the gate on the two-literals defect: with the probe and the
+        executor building argv separately, a shell accepted as strict-under-`+B`
+        would have been spawned WITHOUT `+B`, i.e. running the vetted string
+        under the very expansion the probe refused.
+        """
+        command_run.proc = _FakeProc(comm_results=[("hello\n", "")])
+        cron_script._BRACE_OFF_SHELLS["/bin/sh"] = True
+
+        result = run_command_sandboxed("echo hello")
+
+        assert result["status"] == "ok"
+        assert command_run.argv == ["/bin/sh", "+B", "-c", "echo hello"]
 
     def test_nonzero_exit_annotates_output_and_appends_stderr(self, command_run):
         command_run.proc = _FakeProc(comm_results=[("partial\n", "boom")], returncode=42)

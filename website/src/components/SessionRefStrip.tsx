@@ -4,6 +4,7 @@ import { useScrollEdges } from '../hooks/useScrollEdges'
 import { i18nT } from '../i18n/t'
 import { fmtNumber } from '../i18n/format'
 import type { SessionRef } from '../utils/sessionRefs'
+import { sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 
 /**
  * Staged session references, rendered in the composer as chips.
@@ -18,8 +19,8 @@ import type { SessionRef } from '../utils/sessionRefs'
  * and can carry an icon and a secondary line.
  *
  * The composer reserves space for this strip by MEASURING it (`rootRef`, wired
- * to `useMeasuredHeight` in ChatInput) rather than by predicting its height from
- * these classes. Change the padding or the chip's type scale freely: the
+ * to `useMeasuredHeight` in chat-input/sizing.ts) rather than by predicting its
+ * height from these classes. Change the padding or the chip's type scale freely: the
  * reservation follows. It used to be a hand-computed constant that had to be
  * edited in step with this file, and nothing enforced that.
  */
@@ -52,10 +53,10 @@ export default function SessionRefStrip({ refs, onRemove, rootRef }: {
           data-testid="session-ref-chip"
           data-session-ref={ref.key}
           className="relative group/sessref shrink-0 flex items-center gap-1.5 max-w-[320px] px-2 py-1 rounded border border-border bg-bg-hover text-[12px] text-text"
-          title={ref.title || ref.key}
+          title={sessionDisplayTitle(ref)}
         >
           <MessagesSquare size={13} className="shrink-0 text-accent" aria-hidden="true" />
-          <span className="truncate">{ref.title || ref.key}</span>
+          <span className="truncate">{sessionDisplayTitle(ref)}</span>
           {ref.messages !== undefined && (
             <span className="shrink-0 text-muted tabular-nums">
               {/* `n`, not `count`: `count` is i18next's reserved plural selector
@@ -70,7 +71,7 @@ export default function SessionRefStrip({ refs, onRemove, rootRef }: {
               className="shrink-0 text-muted hover:text-danger cursor-pointer bg-transparent border-none p-0"
               onClick={() => onRemove(ref.key)}
               title={i18nT('components.sessionRefStrip.remove_reference')}
-              aria-label={i18nT('components.sessionRefStrip.remove_reference_to', { name: ref.title || ref.key })}
+              aria-label={i18nT('components.sessionRefStrip.remove_reference_to', { name: sessionDisplayTitle(ref) })}
             >
               <X size={12} />
             </button>

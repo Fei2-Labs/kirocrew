@@ -404,13 +404,13 @@ describe('Settings > Developer > Feature Previews', () => {
     // label names the page the flag holds so it stops sharing a bare "Crew"
     // with that neighbour, which a newcomer could not tell apart.
     renderTab()
-    expect(screen.getByRole('switch', { name: /^crew members$/i }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('switch', { name: /^mates$/i }).getAttribute('aria-checked')).toBe('false')
   })
 
   it('persists the crew opt-in under its own key, leaving webhooks alone', async () => {
     renderTab()
     await act(async () => {
-      screen.getByRole('switch', { name: /^crew members$/i }).click()
+      screen.getByRole('switch', { name: /^mates$/i }).click()
     })
     expect(localStorage.getItem(PREVIEW_CREW)).toBe('1')
     // Two flags, two keys: a shared write would release both features at once.
@@ -467,8 +467,10 @@ describe('Settings > Developer > Feature Previews', () => {
      */
     const nameOf = (b: Element) =>
       (b.textContent?.trim() || b.getAttribute('aria-label') || '?').trim()
+    // SettingsCard is borderless now (no `.card-glow`); its root carries
+    // `animate-rise`, which is the enclosing card frame the switch sits in.
     const decisionsFrame = () =>
-      screen.queryByRole('switch', { name: 'Decisions (Jev)' })?.closest('.card-glow') ?? null
+      screen.queryByRole('switch', { name: 'Decisions (Jev)' })?.closest('.animate-rise') ?? null
     const decisionsButtons = () =>
       Array.from(
         decisionsFrame()?.querySelectorAll(
@@ -477,17 +479,41 @@ describe('Settings > Developer > Feature Previews', () => {
       )
         .map(nameOf)
         .sort()
-    // Outside that card, unfiltered and unchanged: this is the ingress property.
-    const ingressButtons = () =>
-      realButtons()
-        .filter(el => !decisionsFrame()?.contains(el))
+    /**
+     * The built-in KAS engine card is WALKED the same way. This tab stubs no API, so
+     * its status read fails and it draws the read-failure notice's Retry and the
+     * hand-off; neither navigates. Its Install button exists only once a status
+     * says nothing is installed, which `KasBundleCard.test.tsx` pins.
+     */
+    const kasFrame = () =>
+      container.querySelector('[data-testid="kas-bundle-card"]')?.closest('.animate-rise') ?? null
+    const kasButtons = () =>
+      Array.from(kasFrame()?.querySelectorAll('button') ?? [])
         .map(nameOf)
         .sort()
-    expect(ingressButtons()).toEqual([])
+    // Outside those cards, unfiltered and unchanged: this is the ingress property.
+    const ingressButtons = () =>
+      realButtons()
+        .filter(el => !decisionsFrame()?.contains(el) && !kasFrame()?.contains(el))
+        .map(nameOf)
+        .sort()
+    // Every button outside the Decisions card is observed and partitioned:
+    // the rows' InfoTip help toggles (named 'More information'; they open a
+    // tooltip, never a page) are counted exactly, and whatever is left is the
+    // ingress census proper. The partition keeps the ratchet exhaustive --
+    // an unexpected button lands in `ingress`, an extra or missing tip
+    // changes `tips` -- while saying what each half protects.
+    const INFO_TIP = 'More information'
+    const INFO_TIP_COUNT = 2 // one per Feature Previews row carrying a `hint`
+    const partition = () => {
+      const all = ingressButtons()
+      return { tips: all.filter(n => n === INFO_TIP).length, ingress: all.filter(n => n !== INFO_TIP) }
+    }
+    expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: [] })
     await act(async () => {
-      screen.getByRole('switch', { name: /^crew members$/i }).click()
+      screen.getByRole('switch', { name: /^mates$/i }).click()
     })
-    expect(ingressButtons()).toEqual([])
+    expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: [] })
     // The Decisions subtree, exactly. A new button here -- or a duplicate of one of
     // these -- fails, which a name allowance could not do.
     // The Decisions subtree, exactly, once its reads have settled. Awaited rather than
@@ -497,12 +523,15 @@ describe('Settings > Developer > Feature Previews', () => {
     await waitFor(() => {
       expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
     })
+    await waitFor(() => {
+      expect(kasButtons()).toEqual(['Ask the agent', 'Retry'])
+    })
     // The webhooks card still HAS its link, so this is an asymmetry on purpose
     // rather than the ingress mechanism having been broken for both.
     await act(async () => {
       screen.getByRole('switch', { name: /webhooks/i }).click()
     })
-    expect(ingressButtons()).toEqual(['Open Webhooks'])
+    expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: ['Open Webhooks'] })
     // And the card beside it still draws only its own two.
     expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
   })
@@ -524,38 +553,58 @@ describe('Settings > Developer > Feature Previews', () => {
     // answer "is this row selected?" instead.
     const { container } = renderTab()
     // Awaited: the Decisions card is not drawn until the governance read
-    // (`decisions_enabled`) lands, so the fifth switch arrives a tick late.
+    // (`decisions_enabled`) lands, so the last switch arrives a tick late.
     await waitFor(() => {
-      expect(screen.getAllByRole('switch')).toHaveLength(5)
+      expect(screen.getAllByRole('switch')).toHaveLength(6)
     })
     const anchors = container.querySelectorAll(`[data-setting-key="${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}"]`)
     expect(anchors).toHaveLength(1)
     const anchor = anchors[0]
     expect(anchor.contains(screen.getByRole('heading', { name: /feature previews/i }))).toBe(true)
-    // Five, not four: the count is here so a card added outside the anchor
-    // fails rather than silently escaping the ring. The fifth is Decisions,
-    // whose switch is backend config — a different write path, the same ring.
+    // The count is here so a card added outside the anchor fails rather than
+    // silently escaping the ring. The last is Decisions, whose switch is
+    // backend config — a different write path, the same ring.
     for (const s of screen.getAllByRole('switch')) expect(anchor.contains(s)).toBe(true)
   })
 
-  it('carries a remote-crew-sessions card that starts off and writes only its own key', async () => {
-    // The toggle IS this preview's whole affordance — it has no page of its own,
-    // so nothing else on the page would reveal a card that failed to render or
-    // an onChange wired to the wrong constant. Four flags now share one section,
-    // and a shared write would release every unfinished surface at once, so the
-    // sibling assertions are the point rather than padding.
-    //
-    // `/^remote crew sessions$/i` anchored: the card's description also says
-    // "Sessions list", and the accessible name is the label alone.
+  it('carries no Dynamic Dashboard card and no automatic-cards switch', async () => {
+    // The Dynamic Dashboard is on for every reader, so it has no preview card.
+    // Automatic cards is a server setting with its own card on the Developer tab.
     renderTab()
-    const toggle = () => screen.getByRole('switch', { name: /^remote crew sessions$/i })
+    await waitFor(() => { expect(screen.getAllByRole('switch')).toHaveLength(6) })
+    expect(screen.queryByRole('switch', { name: /^dynamic dashboard$/i })).toBeNull()
+    expect(screen.queryByRole('switch', { name: /automatic cards for all sessions/i })).toBeNull()
+  })
+
+  it('has one Chat on a crew switch for both crew halves, and no second card', async () => {
+    // The crew groups in the sidebar and "New chat on crew" were two switches;
+    // one on and one off let a user open a chat on a crew with no group to
+    // return to. A shared write would release other surfaces too, so the
+    // sibling assertions are the point rather than padding.
+    renderTab()
+    expect(screen.queryByRole('switch', { name: /^remote crew sessions$/i })).toBeNull()
+    const toggle = () => screen.getByRole('switch', { name: /^chat on a crew$/i })
     expect(toggle().getAttribute('aria-checked')).toBe('false')
     await act(async () => { toggle().click() })
-    expect(localStorage.getItem(PREVIEW_INSTANCE_SESSIONS)).toBe('1')
+    expect(localStorage.getItem(PREVIEW_REMOTE_CREW_CHAT)).toBe('1')
     expect(toggle().getAttribute('aria-checked')).toBe('true')
-    for (const other of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT]) {
+    for (const other of [PREVIEW_WEBHOOKS, PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS]) {
       expect(localStorage.getItem(other)).not.toBe('1')
     }
+  })
+
+  it('reads the retired instance-sessions key as on, and clears it when turned off', async () => {
+    // A device that turned the old "Remote crew sessions" switch on keeps the
+    // feature on; turning the one switch off must not leave that key holding
+    // it on behind a switch that reads off.
+    localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
+    renderTab()
+    const toggle = () => screen.getByRole('switch', { name: /^chat on a crew$/i })
+    expect(toggle().getAttribute('aria-checked')).toBe('true')
+    await act(async () => { toggle().click() })
+    expect(toggle().getAttribute('aria-checked')).toBe('false')
+    expect(localStorage.getItem(PREVIEW_INSTANCE_SESSIONS)).not.toBe('1')
+    expect(localStorage.getItem(PREVIEW_REMOTE_CREW_CHAT)).not.toBe('1')
   })
 
   it('is gone from the Developer page rail', () => {

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
 import { Hourglass, ClipboardList, ClipboardCheck, RefreshCw, CheckCircle, XCircle, Square, Sparkles, FileText, Settings, X, MessageSquare, Pencil, Clock, Pause, Play, RotateCcw, Plus, PanelLeftOpen, Zap } from 'lucide-react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAppSelector, useAppDispatch } from '../store'
-import { setPendingInput, switchSlot } from '../store/chatSlice'
+import { setPendingInput, openCreatedSlot } from '../store/chatSlice'
 import { api } from '../api/client'
 import type { TaskRunnerStatus, ProjectRun } from '../types'
 import { SendBtn, Btn, Checkbox, Input, Badge } from '../components/ui'
@@ -703,7 +703,7 @@ export default function ProjectsPage() {
                     // No slot means the run was NOT moved — the user clicked and
                     // nothing happened, which is a failure, not a quiet no-op.
                     if (!res.slot) return { ok: false, error: res.error }
-                    dispatch(switchSlot(res.slot)); navigate('/chat')
+                    openCreatedSlot(dispatch, res.slot); navigate('/chat')
                     return res
                   })}><MessageSquare className="lucide-inline" /> {i18nT('pages.projectsPage.chat')}</button>
                 )}

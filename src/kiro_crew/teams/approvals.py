@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 from typing import Any, Awaitable, Callable
 
+from kiro_crew.constants import DENY_CAUSE_APPROVAL_TIMEOUT, DENY_CAUSE_APPROVAL_UNDELIVERABLE
+from kiro_crew.messaging.approval import adoptable_reservation
+from kiro_crew.messaging.renderer import nonce_eq
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -50,13 +52,23 @@ def registry_key(session_key: str, request_id: str) -> str:
 
 
 class TeamsApprovalDecider:
-    """Awaits an approve / trust / deny click for one interactive tool prompt."""
+    """Awaits an approve / trust / deny click for one interactive tool prompt.
+
+    The decision window opens when the nonce is armed, not when the wait starts:
+    :meth:`arm` reserves the future and ``__call__`` adopts it. So a click lands
+    inside the window from the moment the card is built, including across the post
+    that makes it visible. It closes at the decision, at the wait's timeout, at an
+    :meth:`abandon` for a card that never went out, or at
+    :meth:`discard_reservations` for one that was never awaited.
+    """
 
     #: request registry key -> the decider currently awaiting it.
     _REGISTRY: dict[str, "TeamsApprovalDecider"] = {}
 
     def __init__(self, session_key: str = "") -> None:
         self.session_key = session_key
+        #: Why the LAST call denied -- see ``messaging.driver.ApprovalDecider``.
+        self.last_deny_cause = ""
         self._futures: dict[str, asyncio.Future[bool]] = {}
         #: request id -> the nonce minted for the card now showing.
         self._nonces: dict[str, str] = {}
@@ -76,8 +88,65 @@ class TeamsApprovalDecider:
         self.on_expired: Callable[[str], Awaitable[None]] | None = None
 
     def arm(self, request_id: str, nonce: str) -> None:
-        """Record the nonce for the card the renderer is about to post."""
-        self._nonces[str(request_id)] = nonce
+        """Record the nonce for the card about to be posted, and OPEN the window.
+
+        Reserving the future here, rather than in ``__call__``, is what keeps a
+        click inside the window while the card is being posted. ``TurnDriver``
+        dispatches ``PROMPT_CHOICE`` to the renderer and only then awaits the
+        decider, and the post suspends in between. A click landing in that gap
+        found the nonce armed but no decider in the process-global registry, so
+        ``resolve_global`` reported it as already expired and the request denied
+        itself when the window elapsed.
+
+        Registers the decider in that registry too, since it is what the inbound
+        adapter resolves through -- a reserved future nobody can reach would close
+        no gap at all.
+
+        Never replaces a LIVE future: a second arm for one request, or an arm that
+        follows the wait, keeps the object the waiter is blocked on. A DONE future
+        IS replaced, so a decision left unawaited cannot be adopted by the next
+        request to reuse this id.
+
+        Off the event loop only the nonce is armed. A reservation is a promise to a
+        wait that runs on THIS loop, so without one there is no waiter to hold a
+        window open for, and a caller that cannot await the decider cannot be raced
+        by a click.
+        """
+        rid = str(request_id)
+        self._nonces[rid] = nonce
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        pending = adoptable_reservation(self._futures.get(rid), loop)
+        if pending is None or pending.done():
+            self._futures[rid] = loop.create_future()
+        TeamsApprovalDecider._REGISTRY[registry_key(self.session_key, rid)] = self
+
+    def discard_reservations(self) -> None:
+        """Drop this decider's unawaited reservations at the end of its turn.
+
+        ``__call__`` clears its own entry in a ``finally`` and :meth:`abandon`
+        settles a card that never went out, so this covers the one case neither
+        can: the card went out and the turn then ended before the driver reached
+        the decider -- a cancellation, or a failure between the two. No wait ever
+        ran, so nothing else closes that window, and the nonce left behind is what
+        authorizes a click.
+
+        Drops every reservation, whatever state its future is in. A completed one no
+        wait adopted has no reader -- ``__call__`` for this decider's turn never ran
+        -- so keeping it retains the future, its nonce and this decider for the life
+        of the process, once per request id. The nonce is the worse half: the card
+        stays in the channel, so a later click still matches a prompt nothing can
+        answer. Scoped to this decider's own reservations, and called as its turn
+        ends, so no wait of its own can still be reading one.
+        """
+        for rid in list(self._futures):
+            self._futures.pop(rid, None)
+            self._nonces.pop(rid, None)
+            key = registry_key(self.session_key, rid)
+            if TeamsApprovalDecider._REGISTRY.get(key) is self:
+                TeamsApprovalDecider._REGISTRY.pop(key, None)
 
     def abandon(self, request_id: str) -> None:
         """Refuse a prompt whose card never reached the user.
@@ -96,20 +165,51 @@ class TeamsApprovalDecider:
             future.set_result(False)
 
     async def __call__(self, event: Any) -> bool:
+        self.last_deny_cause = ""
         request_id = str(getattr(event, "request_id", ""))
         key = registry_key(self.session_key, request_id)
         if request_id in self._abandoned:
-            # The renderer already knows the user never saw this prompt.
+            # The renderer already knows the user never saw this prompt. Clear the
+            # reservation ``arm`` opened as well: this return is ahead of the
+            # ``finally`` below, so nothing else would drop it and the registry
+            # entry would outlive a card nobody received.
             self._abandoned.discard(request_id)
+            self._futures.pop(request_id, None)
+            self._nonces.pop(request_id, None)
+            if TeamsApprovalDecider._REGISTRY.get(key) is self:
+                TeamsApprovalDecider._REGISTRY.pop(key, None)
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_UNDELIVERABLE
             return False
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[bool] = loop.create_future()
+        # Adopt the reservation opened when this card's nonce was armed. The click
+        # may ALREADY have landed, in the gap between the card going out and this
+        # wait starting, in which case the reservation holds the user's decision and
+        # there is nothing left to await. Minting a fresh future here would discard
+        # that decision and deny when the window elapsed.
+        reserved = adoptable_reservation(self._futures.get(request_id), loop)
+        if reserved is not None and reserved.done():
+            if reserved.cancelled() or reserved.exception() is not None:
+                # A torn-down reservation, not a decision. Open a fresh window
+                # rather than read it as consent or as a refusal.
+                reserved = None
+            else:
+                try:
+                    return bool(reserved.result())
+                finally:
+                    self._futures.pop(request_id, None)
+                    self._nonces.pop(request_id, None)
+                    if TeamsApprovalDecider._REGISTRY.get(key) is self:
+                        TeamsApprovalDecider._REGISTRY.pop(key, None)
+        future: asyncio.Future[bool] = reserved if reserved is not None else loop.create_future()
         self._futures[request_id] = future
         TeamsApprovalDecider._REGISTRY[key] = self
         try:
             return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_SECS)
         except asyncio.TimeoutError:
             logger.info("Teams: tool approval timed out for %s; denying", key)
+            # Recorded for the driver, which steers the cause into the turn
+            # before it rejects, so the model hears "expired" not "denied".
+            self.last_deny_cause = DENY_CAUSE_APPROVAL_TIMEOUT
             if self.on_expired is not None:
                 try:
                     await self.on_expired(request_id)
@@ -136,9 +236,9 @@ class TeamsApprovalDecider:
         """
         rid = str(request_id)
         expected = self._nonces.get(rid)
-        # compare_digest, not ``!=``: a nonce is a secret the client echoes back, so
-        # the comparison is constant-time like every other secret comparison here.
-        if not expected or not nonce or not secrets.compare_digest(nonce, expected):
+        # Constant time via the shared nonce compare, not ``!=``: a nonce is a
+        # secret the client echoes back, so a mismatch is a security answer.
+        if not expected or not nonce or not nonce_eq(expected, nonce):
             sel().log_api_access(
                 caller=self.session_key or "unknown",
                 operation="teams_approval.resolve",

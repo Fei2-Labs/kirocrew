@@ -77,6 +77,81 @@ describe('UserMessage paste chips', () => {
     expect(screen.getByRole('textbox')).toHaveValue(`head ${BLOCK.content}`)
   })
 
+  // ⌘↑ / Ctrl+Up edit request (#11402): ChatPage raises a sequence number; the
+  // rising edge opens the same editor the hover affordance drives.
+  it('opens the editor on a rising editRequest edge (#11402)', () => {
+    const { rerender } = render(
+      <UserMessage content="editable text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={0} />,
+    )
+    expect(screen.queryByRole('textbox')).toBeNull()
+    rerender(
+      <UserMessage content="editable text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={1} />,
+    )
+    expect(screen.getByRole('textbox')).toHaveValue('editable text')
+  })
+
+  it('ignores the edit request without edit eligibility (canEdit false)', () => {
+    const { rerender } = render(
+      <UserMessage content="locked text" renderContent={renderWithChip} onEditResend={() => {}} editRequest={0} />,
+    )
+    rerender(
+      <UserMessage content="locked text" renderContent={renderWithChip} onEditResend={() => {}} editRequest={1} />,
+    )
+    expect(screen.queryByRole('textbox')).toBeNull()
+  })
+
+  it('does not re-open the editor when the same sequence re-renders', () => {
+    const { rerender } = render(
+      <UserMessage content="steady text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={1} />,
+    )
+    expect(screen.getByRole('textbox')).toBeInTheDocument()
+    // Cancel (Escape path) — the editor closes; a re-render with the SAME seq
+    // must not re-open it over the user's dismissed draft.
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Escape' })
+    expect(screen.queryByRole('textbox')).toBeNull()
+    rerender(
+      <UserMessage content="steady text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={1} />,
+    )
+    expect(screen.queryByRole('textbox')).toBeNull()
+  })
+
+  it('acknowledges a consumed request exactly once so the caller can drop it', () => {
+    const onEditConsumed = vi.fn()
+    const { rerender } = render(
+      <UserMessage content="ack text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={1} onEditConsumed={onEditConsumed} />,
+    )
+    expect(onEditConsumed).toHaveBeenCalledTimes(1)
+    rerender(
+      <UserMessage content="ack text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={1} onEditConsumed={onEditConsumed} />,
+    )
+    expect(onEditConsumed).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not clobber an in-progress draft on a second rising edge (GPT 5.6 review)', () => {
+    const { rerender } = render(
+      <UserMessage content="original text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={1} />,
+    )
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'unsaved edit' } })
+    expect(screen.getByRole('textbox')).toHaveValue('unsaved edit')
+    // A second ⌘↑/Ctrl+↑ press while this row is still open editing must not
+    // restart the editor from `content` and silently drop the typed text.
+    rerender(
+      <UserMessage content="original text" renderContent={renderWithChip} canEdit onEditResend={() => {}} editRequest={2} />,
+    )
+    expect(screen.getByRole('textbox')).toHaveValue('unsaved edit')
+  })
+
+  it('never acknowledges an ineligible request (nothing consumed, nothing to drop)', () => {
+    const onEditConsumed = vi.fn()
+    const { rerender } = render(
+      <UserMessage content="locked ack" renderContent={renderWithChip} onEditResend={() => {}} editRequest={1} onEditConsumed={onEditConsumed} />,
+    )
+    rerender(
+      <UserMessage content="locked ack" renderContent={renderWithChip} onEditResend={() => {}} editRequest={2} onEditConsumed={onEditConsumed} />,
+    )
+    expect(onEditConsumed).not.toHaveBeenCalled()
+  })
+
   it('rewrites a selection copy so the chip becomes its original content', () => {
     const { container } = render(
       <UserMessage content={`head ${TOKEN} tail`} meta={{ pastes: [BLOCK] }} renderContent={renderWithChip} />,
@@ -135,6 +210,81 @@ describe('UserMessage paste chips', () => {
     )
     const { setData } = copyFrom(bubbleOf(container))
     expect(setData).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * Visually-hidden text must not reach the clipboard.
+ *
+ * A file or folder chip in a sent bubble names its full path twice: the short
+ * label on screen (`aria-hidden`, so a reader is not told it twice) and the
+ * whole path as `sr-only` text, which a reader announces and a sighted user
+ * never sees. `user-select: none` keeps that hidden text out of the browser's
+ * own copy, but this handler does not go through the browser: it serializes a
+ * cloned range with `textContent`, which consults no CSS at all. So the
+ * interceptor has to drop the hidden nodes itself, and only inside its own
+ * gate — `meta.pastes` non-empty AND a chip in the selection — is that gate
+ * even reached, which is why an ordinary message copies correctly regardless.
+ *
+ * The pair of directions matters as much as the leak: strip by `sr-only` and
+ * the label survives; strip by `aria-hidden` and the clipboard loses the only
+ * text the user can see.
+ */
+const HIDDEN_PATH = '/home/u/q3/report.pdf'
+
+/** A bubble holding a paste chip AND an inert path chip of the shape the real
+ *  renderer emits: visible label muted for a reader, whole path hidden from
+ *  the screen. `extra` adds hidden text that is NOT inside a chip. */
+const renderWithChipAndPath = (extra?: string) => (content: string) => (
+  <span data-testid="content">
+    {content.split(TOKEN).flatMap((part, i) => (
+      i === 0
+        ? [<span key={`t${i}`}>{part}</span>]
+        : [<span key={`c${i}`} data-paste-seq="1">{TOKEN}</span>, <span key={`t${i}`}>{part}</span>]
+    ))}
+    <span title={HIDDEN_PATH}>
+      <span aria-hidden="true">@report.pdf</span>
+      <span className="sr-only select-none">{HIDDEN_PATH}</span>
+    </span>
+    {extra ? <span className="sr-only">{extra}</span> : null}
+  </span>
+)
+
+describe('UserMessage copy, visually-hidden text', () => {
+  it('keeps a chip screen-reader path out of the copied text', () => {
+    const { container } = render(
+      <UserMessage content={`head ${TOKEN}`} meta={{ pastes: [BLOCK] }} renderContent={renderWithChipAndPath()} />,
+    )
+    const { setData } = copyFrom(bubbleOf(container))
+
+    expect(setData).toHaveBeenCalledTimes(1)
+    expect(setData.mock.calls[0][1] as string).not.toContain(HIDDEN_PATH)
+  })
+
+  it('keeps the visible label, which is hidden from a reader rather than from the screen', () => {
+    const { container } = render(
+      <UserMessage content={`head ${TOKEN}`} meta={{ pastes: [BLOCK] }} renderContent={renderWithChipAndPath()} />,
+    )
+    const { setData } = copyFrom(bubbleOf(container))
+
+    const written = setData.mock.calls[0][1] as string
+    expect(written).toContain('@report.pdf')
+    // The chip is dropped for its hidden half only: the paste this handler
+    // exists to expand still expands.
+    expect(written).toContain(BLOCK.content)
+  })
+
+  it('drops visually-hidden text anywhere in the bubble, not only inside a chip', () => {
+    const { container } = render(
+      <UserMessage
+        content={`head ${TOKEN}`}
+        meta={{ pastes: [BLOCK] }}
+        renderContent={renderWithChipAndPath('zzq-announcement')}
+      />,
+    )
+    const { setData } = copyFrom(bubbleOf(container))
+
+    expect(setData.mock.calls[0][1] as string).not.toContain('zzq-announcement')
   })
 })
 

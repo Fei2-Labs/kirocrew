@@ -274,6 +274,56 @@ def test_monitor_inspect_passes_strict_identity_without_fallback():
     assert "check-0" not in result
 
 
+def test_the_compact_inspection_counts_displaced_rows_off_the_sentinel_and_says_it_cut():
+    """A compact reader never sees the list, so the cut has to reach it as a field.
+
+    The bucket spends its last slot on a sentinel, so a bare length reports one row
+    that is not a check and reads as an exact total at exactly the bound -- which is
+    where a cut is likeliest. The live buckets need no such field: they are listed, so
+    their own sentinel travels with them.
+    """
+    identities = [f"check-{index}" for index in range(99)]
+    record = {
+        "enabled": True,
+        "active": True,
+        "monitor": {
+            "kind": "github_pull_request",
+            "last_observation": {
+                "head_revision": "abc123",
+                "checks": {
+                    "passed": ["CI / test"],
+                    "superseded": [*identities, "superseded:incomplete"],
+                },
+            },
+        },
+    }
+
+    checks = control._compact_monitor_inspection(record)["monitor"]["observation"]["checks"]
+
+    assert checks["superseded_count"] == 99
+    assert checks["superseded_incomplete"] is True
+
+
+def test_the_compact_inspection_does_not_claim_a_cut_on_a_bucket_at_the_bound():
+    """The field is spent only when an identity was actually dropped."""
+    record = {
+        "enabled": True,
+        "active": True,
+        "monitor": {
+            "kind": "github_pull_request",
+            "last_observation": {
+                "head_revision": "abc123",
+                "checks": {"superseded": [f"check-{index}" for index in range(100)]},
+            },
+        },
+    }
+
+    checks = control._compact_monitor_inspection(record)["monitor"]["observation"]["checks"]
+
+    assert checks["superseded_count"] == 100
+    assert "superseded_incomplete" not in checks
+
+
 def test_monitor_inspect_never_uses_ancestor_fallback_without_strict_identity():
     with (
         patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
@@ -374,3 +424,127 @@ def test_monitor_inspect_admits_a_webex_session():
     payload = json.loads(result)
     assert payload["autonudge_loop"] == {"id": "lp-3", "active": True, "idle_secs": 300}
     getter.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("monitor_start", {"message": "Check the pull request and stop when ready."}),
+        (
+            "monitor_watch",
+            {
+                "kind": "github_pull_request",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "objective": "review_ready",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize(("ceiling", "expected"), [(3600, 3600), (2_592_000, 14_400)])
+def test_omitted_runtime_budget_defaults_within_the_operator_ceiling(
+    tool_name, args, ceiling, expected, gateway_posts, monkeypatch
+):
+    """A caller that sends no budget gets the default capped to the ceiling, so
+    a ceiling below the default never refuses a value nobody sent."""
+    monkeypatch.setattr(control, "runtime_ceiling_secs", lambda: ceiling)
+    with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
+        result = getattr(control, tool_name)(tool_name, dict(args))
+
+    emitted = session_directive.decode(result, tool_name)
+    assert emitted is not None, result
+    assert emitted["max_runtime_secs"] == expected
+
+
+@pytest.mark.parametrize("tool_name", ["monitor_start", "monitor_watch"])
+def test_supplied_runtime_budget_is_passed_through_unclamped(tool_name, gateway_posts, monkeypatch):
+    """Only the omitted default is capped; a caller's own value reaches
+    validation as sent, so an over-ceiling request is refused rather than
+    silently shortened."""
+    monkeypatch.setattr(control, "runtime_ceiling_secs", lambda: 3600)
+    args = (
+        {"message": "Check the pull request and stop when ready."}
+        if tool_name == "monitor_start"
+        else {
+            "kind": "github_pull_request",
+            "target": "https://github.com/acme/widgets/pull/7",
+            "objective": "review_ready",
+        }
+    )
+    with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
+        result = getattr(control, tool_name)(tool_name, {**args, "max_runtime_secs": 7200})
+
+    emitted = session_directive.decode(result, tool_name)
+    assert emitted is not None, result
+    assert emitted["max_runtime_secs"] == 7200
+
+
+def test_monitor_start_descriptor_advertises_the_capped_default(monkeypatch):
+    monkeypatch.setattr(control, "runtime_ceiling_secs", lambda: 3600)
+    schema = next(item for item in control.schemas() if item["name"] == "monitor_start")
+    description = schema["inputSchema"]["properties"]["max_runtime_secs"]["description"]
+    assert "(default 3600; configured max 3600)" in description
+
+
+@pytest.mark.parametrize("tool_name", ["monitor_start", "monitor_watch", "monitor_update"])
+def test_monitor_tools_publish_an_integer_runtime_budget(tool_name):
+    """The published schema says integer, like every sibling budget; a JSON
+    body's whole-number float is still normalised by the validator, pinned by
+    ``test_monitor_tools_normalize_integral_float_runtime``."""
+    schema = next(item for item in control.schemas() if item["name"] == tool_name)
+    assert schema["inputSchema"]["properties"]["max_runtime_secs"]["type"] == "integer"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args", "expected"),
+    [
+        (
+            "monitor_start",
+            {"message": "Check until ready.", "max_runtime_secs": 3600.0},
+            {"max_runtime_secs": 3600},
+        ),
+        (
+            "monitor_watch",
+            {
+                "kind": "github_pull_request",
+                "target": "https://github.com/acme/widgets/pull/7",
+                "objective": "review_ready",
+                "max_runtime_secs": 3600.0,
+            },
+            {"max_runtime_secs": 3600},
+        ),
+        (
+            "monitor_update",
+            {"max_runtime_secs": 3600.0},
+            {"patch": {"max_runtime_secs": 3600}},
+        ),
+    ],
+)
+def test_monitor_tools_normalize_integral_float_runtime(tool_name, args, expected, gateway_posts):
+    with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
+        result = mcp_core._call_tool(tool_name, args)
+
+    payload = session_directive.decode(result, tool_name)
+    assert payload is not None
+    for key, value in expected.items():
+        assert payload[key] == value
+
+
+@pytest.mark.parametrize("tool_name", ["monitor_start", "monitor_watch", "monitor_update"])
+@pytest.mark.parametrize("runtime", [3600.5, True])
+def test_monitor_tools_reject_non_integral_or_boolean_runtime(tool_name, runtime, gateway_posts):
+    args = {"max_runtime_secs": runtime}
+    if tool_name == "monitor_start":
+        args["message"] = "Check until ready."
+    elif tool_name == "monitor_watch":
+        args.update(
+            kind="github_pull_request",
+            target="https://github.com/acme/widgets/pull/7",
+            objective="review_ready",
+        )
+
+    with patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value="dashboard:chat-1"):
+        result = mcp_core._call_tool(tool_name, args)
+
+    assert result.startswith("Error:")
+    assert session_directive.decode(result, tool_name) is None
+    assert gateway_posts == []

@@ -165,7 +165,7 @@ class TestAnEmptiedBackupIsRefused:
 
     def test_the_upload_reports_the_refusal_instead_of_crashing(self) -> None:
         """A bare raise would surface as a traceback, indistinguishable from a crash."""
-        src = inspect.getsource(snap)
+        src = inspect.getsource(snap._redacted_upload_copy)
         assert "PayloadDatabaseUnprovable" in src
         idx = src.index("PayloadDatabaseUnprovable as e")
         assert "RedactionFailed" in src[idx : idx + 900]

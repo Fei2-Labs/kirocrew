@@ -4,11 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 from aiohttp import web
 
-from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
+from kiro_crew.config.loader import KiroCrewConfig, resolve_agent_identity
+from kiro_crew.dashboard import transcript_snapshot
+from kiro_crew.dashboard.chat_folders import _unhide_folder
+from kiro_crew.dashboard.chat_persistence import (
+    _coerce_requested_mode,
+    save_slot_off_loop,
+    session_was_deleted,
+)
+from kiro_crew.dashboard.chat_title import (
+    _TITLE_ORIGIN_AUTO,
+    _TITLE_ORIGIN_USER,
+    FORK_TITLE_MARKER,
+    refresh_forked_title,
+)
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
     drained_to_thread,
@@ -16,26 +30,32 @@ from kiro_crew.dashboard.chat_utils import (
     history_corpus_unreadable,
     slot_history_key,
 )
+from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.relay_archive import is_relay_archive
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access, slot_not_found
 from kiro_crew.dashboard.state import (
+    _MAX_SLOT_MESSAGES,
     MAX_LIVE_SLOTS,
     VALID_MEMORY_MODES,
     DashboardState,
     request_slot_origin,
+)
+from kiro_crew.dashboard.transcript_snapshot import (
+    FORK,
+    SlotView,
+    SnapshotUnstable,
+    read_consistent_transcript,
 )
 from kiro_crew.history import carry_provenance
 from kiro_crew.history_projection import drop_persisted_tail_prefix as _drop_persisted_tail_prefix
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
+if TYPE_CHECKING:
+    from kiro_crew.dashboard.state import _ChatSlot
+
 logger = logging.getLogger(__name__)
-
-_FORK_TITLE_MARKER = "↳ "
-
-# Attempts to land a transcript read and the unpersisted tail on ONE consistent
-# view of the slot. Matches session_transfer._SNAPSHOT_ATTEMPTS and
-# chat_persistence._FLUSH_SNAPSHOT_RETRIES, which bound the same race.
-_SNAPSHOT_ATTEMPTS = 4
 
 # Fork direction: "head" copies messages up to and including the fork point
 # (the default); "tail" copies only the messages after it.
@@ -46,7 +66,8 @@ _MAX_MESSAGE_ID_CHARS = 256
 
 
 def drop_persisted_tail_prefix(full_disk: list[dict], tail: list[dict]) -> list[dict]:
-    """Re-exported from ``history_projection``, which owns the identity rule.
+    """Re-exported from ``history_projection`` (defined in ``history_projection_contract``,
+    which owns the identity rule).
 
     Kept importable from here because this module was its first consumer and is
     where callers and tests reach for it.
@@ -59,12 +80,14 @@ def _fork_execution_context(
     agent: str,
     recorded_store: str,
     memory_mode: str,
+    agent_kind: str,
 ):
     """Capture the parent's execution without opening learned memory."""
     from kiro_crew.execution_context import (
         ExecutionContext,
         MemoryStoreRef,
         read_session_execution,
+        resolve_member_execution,
     )
     from kiro_crew.memory_stores import UnknownMemoryStore, require_memory_store
 
@@ -76,7 +99,35 @@ def _fork_execution_context(
         )
         if getattr(cfg.memory_stores.get(store), "memory_version", 1) == 2:
             raise UnknownMemoryStore("The fork source's execution identity is unavailable")
-        execution = ExecutionContext(None, MemoryStoreRef(store), "template", agent or "kirocrew")
+        # Record the identity the parent's own turns resolve to with no carrier
+        # (``resolve_session_agent_bindings``): a ``config.agents`` alias on a
+        # slot not stamped ``template`` runs as that crewmate, with its
+        # template, workspace and model pin, so the child gets the same
+        # member-kind record the owner's create writes. Stamping the alias as a
+        # template id instead made the child ask the backend for an agent
+        # called ``default``, which does not exist. Any other name is already a
+        # template (possibly one only the parent's project declares) and is
+        # kept verbatim. The loader's resolver makes the alias-or-template
+        # call, so the fork and the parent's own turns share one rule. Those
+        # turns first map a stored skill-view name back to the agent it was
+        # built from, so the fork does too before asking whether it is an alias.
+        from kiro_crew.session_agent_selection import _source_of_view
+
+        agent = _source_of_view(agent)
+        alias = resolve_agent_identity(cfg, agent, selection_kind=agent_kind)[0]
+        if alias:
+            execution = resolve_member_execution(cfg, alias, validate_memory_files=False)
+            # The V2 refusal above covers the RECORDED store only. A parent
+            # with no recorded store whose crewmate holds private V2 memory
+            # has no carrier to prove it ran on that store, so it is refused
+            # the same way rather than bound to the crewmate's memory.
+            resolved = cfg.memory_stores.get(execution.store.store_id)
+            if getattr(resolved, "memory_version", 1) == 2:
+                raise UnknownMemoryStore("The fork source's execution identity is unavailable")
+        else:
+            execution = ExecutionContext(
+                None, MemoryStoreRef(store), "template", agent or "kirocrew"
+            )
     if recorded_store and (recorded_store or "default") != execution.store.store_id:
         raise UnknownMemoryStore("The fork source's recorded memory binding has changed")
     return execution.with_mode(memory_mode)
@@ -89,6 +140,229 @@ def _bind_fork_execution(source, child_key: str, execution) -> None:
     if _fork_execution_context(*source) != execution:
         raise UnknownMemoryStore("The fork source's execution changed")
     bind_session_execution(child_key, execution)
+
+
+def _forget_fork_child_binding(child_key: str) -> None:
+    """Withdraw what the memory bind published for a fork child that failed.
+
+    The bind writes the live execution carrier and, for a persistent child, the
+    identity fields of a transcript record that holds no message yet. The child
+    key is freshly minted, so a record with no message row is the bind's own and
+    goes with the child. A record that holds messages is left alone. File IO, so
+    callers run it off the loop.
+
+    Best-effort: the caller is already answering a failure, and its structured
+    response and audit record must still go out if this cleanup raises too.
+    """
+    from kiro_crew.execution_context import clear_session_execution
+    from kiro_crew.history import ConversationLog
+
+    clear_session_execution(child_key)
+    try:
+        # The same log the bind wrote through (``bind_session_execution``).
+        log = ConversationLog()
+        if log.has_log(child_key) and not log.has_messages(child_key):
+            log.delete_session(child_key)
+    except Exception:
+        logger.warning(
+            "chat_fork: removing the failed fork child's record for %s raised",
+            child_key,
+            exc_info=True,
+        )
+
+
+async def _withdraw_fork_child(
+    state: DashboardState, new_slot: "_ChatSlot", *, announced: bool
+) -> None:
+    """Undo a fork child whose fork is answered with a failure.
+
+    One rollback for every failure path (bind, shape, stamp, the destination
+    save, a source deleted during that save), so none of them can leave a
+    memory identity under a key that the live slot table does not list. The slot
+    and its restricted key leave synchronously, before any await, so nothing on
+    the loop sees the child half withdrawn. ``announced`` is true once the mint
+    block has exited and its flush listed the child; the withdrawal is then
+    pushed too, or other sidebars keep the row until the next frame. Never
+    raises, so the caller's response and audit always run.
+    """
+    child_key = effective_session_key(new_slot)
+    state._slots.pop(new_slot.key, None)
+    state._restricted_keys.discard(child_key)
+    if announced:
+        state.push_slots_update()
+    try:
+        await drained_to_thread(_forget_fork_child_binding, child_key)
+    except Exception:
+        # ``clear_session_execution`` raised, or the worker hand-off failed.
+        logger.warning(
+            "chat_fork: withdrawing the failed fork child %s raised",
+            new_slot.key,
+            exc_info=True,
+        )
+
+
+#: SEL operation name the human fork route records under. The session-control
+#: route passes its own so the two entry points stay distinguishable in the audit.
+FORK_AUDIT_OPERATION = "chat.slot_fork"
+
+
+@dataclass(frozen=True)
+class ForkSource:
+    """A fork parent with its memory identity frozen at the moment it was checked.
+
+    ``identity`` is the seven-tuple :func:`fork_slot` re-compares the live slot
+    against before binding and again before copying, so a parent whose agent,
+    store, mode or WORKSPACE moved under the fork is refused rather than copied.
+    Workspace is in the tuple because the child is born in ``slot.workspace``
+    read live: an agent caller's containment check (``authorize_target``) ran
+    against the workspace the source had at the time, and a concurrent owner
+    switch of the source (``api_chat_slot_workspace``) would otherwise carry the
+    transcript into a workspace that check never admitted. The slot's
+    ``agent_kind`` closes it because a parent with no execution record forks to
+    the crewmate or the template that stamp selects.
+    """
+
+    slot: "_ChatSlot"
+    execution: Any
+    identity: tuple[str, str, str, str, str, str, str]
+
+
+class _ForkRefused(Exception):
+    """Carries a finished refusal out of a snapshot callable to :func:`fork_slot`.
+
+    The snapshot propagates whatever its callables raise, so a refusal decided
+    inside one -- with the code clients match on -- reaches the handler unchanged
+    and is returned there like every other refusal in this module.
+    """
+
+    def __init__(self, response: web.Response) -> None:
+        super().__init__(response.status)
+        self.response = response
+
+
+@dataclass(frozen=True)
+class ForkResult:
+    """What :func:`fork_slot` hands back once the child is persisted and acknowledged."""
+
+    slot: "_ChatSlot"
+    messages: int
+    direction: str
+
+
+async def resolve_fork_source(
+    slot: "_ChatSlot", *, audit_caller: str, audit_operation: str = FORK_AUDIT_OPERATION
+) -> "ForkSource | web.Response":
+    """Freeze the source's memory identity before anything else is read.
+
+    The first half of a fork, split from :func:`fork_slot` so the human route
+    keeps its refusal precedence (a source refused here is refused before the
+    request body is even parsed) and the session-control route can run the same
+    check without a request. A refusal is returned as the finished response,
+    which is the shape every refusal in this module has; callers that are not
+    HTTP handlers translate it (``session_control.fork_session``).
+    """
+    # A relay archive -- a slot bound to a peer crew (``executor == "remote"``)
+    # -- is READ-ONLY: there is no relay to run its turns on, and every send /
+    # turn-restarting path refuses it (see ``relay_archive``). Forking must
+    # refuse it too: ``fork_slot`` builds the child with ``get_or_create_slot``,
+    # which does not carry ``executor`` / ``instance_id`` / ``remote_slot``, so
+    # the child would be born LOCAL and runnable -- and then run the peer crew's
+    # agent on THIS machine, failing with ``agent "<peer default>" not found``
+    # because that agent is not configured here. Refuse the fork for the same
+    # reason the run paths do, with the same code, so the user is told to open
+    # the crew's own session instead. Earliest check and fail closed: a
+    # half-written binding is an archive too (``is_relay_archive`` keys on
+    # ``executor`` alone), and must never be laundered into a local run through
+    # a copy.
+    if is_relay_archive(slot):
+        sel().log_api_access(
+            caller=audit_caller,
+            operation=audit_operation,
+            outcome="denied",
+            source="dashboard",
+            resources=f"slot={slot.key},executor={getattr(slot, 'executor', '')!r}",
+            error="source slot is a read-only relay archive",
+        )
+        # Literal body (not ``RELAY_ARCHIVE_ERROR`` / ``RELAY_ARCHIVE_CODE``): the
+        # error-code contract scanner reads only a string-literal ``code``, and
+        # every refusal in this module is a literal for that reason. The literals
+        # mirror ``relay_archive`` and ``test_relay_archive`` asserts they match
+        # ``RELAY_ARCHIVE_CODE`` so the two cannot drift apart.
+        return web.json_response(
+            {
+                "error": (
+                    "this chat ran on a remote crew and is read-only now; "
+                    "open the crew's own session to keep going"
+                ),
+                "code": "relay_archive_read_only",
+            },
+            status=409,
+        )
+    # The child inherits the parent's mode, so the parent's value is what the
+    # slot constructor validates against ``VALID_MEMORY_MODES``. The API checks
+    # the field on the way in, but rehydration copies the transcript header's
+    # ``memory_mode`` onto the slot as written, so a hand-edited or partially
+    # written header can leave an unrecognised value on a live parent. That
+    # value is refused HERE, with a code and before any child exists, rather
+    # than raising out of ``_ChatSlot.__init__`` as a 500. Fail closed: a mode
+    # this code cannot read is a memory boundary it cannot honour.
+    inherited_memory_mode = slot.memory_mode
+    if inherited_memory_mode not in VALID_MEMORY_MODES:
+        sel().log_api_access(
+            caller=audit_caller,
+            operation=audit_operation,
+            outcome="denied",
+            source="dashboard",
+            resources=f"slot={slot.key},memory_mode={inherited_memory_mode!r}",
+            error="source slot memory_mode is not a recognised mode",
+        )
+        return web.json_response(
+            {
+                "error": "the source session's memory mode is not recognised",
+                "code": "fork_source_memory_mode_invalid",
+            },
+            status=409,
+        )
+
+    source_memory_identity = (
+        effective_session_key(slot),
+        slot.agent,
+        slot.memory_store,
+        slot.memory_mode,
+        slot_history_key(slot),
+        str(getattr(slot, "workspace", "default") or "default"),
+        str(getattr(slot, "agent_kind", "") or ""),
+    )
+
+    try:
+        inherited_execution = await asyncio.to_thread(
+            _fork_execution_context, *source_memory_identity[:4], source_memory_identity[6]
+        )
+    except (OSError, ValueError) as exc:
+        return _store_unavailable_response(source_memory_identity[2], exc)
+    return ForkSource(slot=slot, execution=inherited_execution, identity=source_memory_identity)
+
+
+def _schedule_fork_title(state: DashboardState, child: "_ChatSlot") -> None:
+    """Start the child's one background title pass (``refresh_forked_title``).
+
+    Called once per acknowledged fork, after the child is saved and broadcast,
+    so the fork answers immediately and the new name arrives as an ordinary
+    ``slot_title`` push. Held in ``state._background_tasks`` like the other
+    titling tasks so the loop cannot drop it.
+    """
+    task = asyncio.create_task(refresh_forked_title(state, child))
+    state._background_tasks.add(task)
+    task.add_done_callback(state._background_tasks.discard)
+
+
+def _inherit_pin(parent: "_ChatSlot") -> "Callable[[_ChatSlot], None]":
+    """Return a ``fork_slot`` stamp that copies *parent*'s sidebar pin."""
+
+    def _stamp(child: "_ChatSlot") -> None:
+        child.pinned = bool(parent.pinned)
+
+    return _stamp
 
 
 async def api_chat_slot_fork(request: web.Request) -> web.Response:
@@ -108,7 +382,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     request_app = request.get("app", "")
     if not slot:
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
 
     # Rate/resource guard: reject if we're already at the cap. Counts slots still
     # under construction too (``live_slot_count``): the import path retracts a
@@ -131,75 +405,16 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             status=429,
         )
 
-    # App ownership check (App Kit §5.2)
-    if request_app:
-        if not slot._app:
-            sel().log_api_access(
-                caller=request_app,
-                operation="chat.slot_fork",
-                outcome="denied",
-                source="app_isolation",
-                resources=f"slot={name}",
-                error="app cannot fork unscoped slots",
-            )
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
-        if slot._app != request_app:
-            sel().log_api_access(
-                caller=request_app,
-                operation="chat.slot_fork",
-                outcome="denied",
-                source="app_isolation",
-                resources=f"slot={name}",
-                error="app does not own this slot",
-            )
-            # Return 404 (not 403) so a slot owned by another app / an unscoped
-            # slot is indistinguishable from a non-existent one — prevents an
-            # app-scoped caller enumerating slots across the isolation boundary
-            # (CWE-204). The true reason is recorded server-side via SEL above.
-            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # App ownership check (App Kit §5.2): the shared decision, so a slot owned by
+    # another app or an unscoped slot answers the same 404 as a missing one
+    # (CWE-204); the true reason is recorded server-side.
+    denied = deny_app_slot_access(request_app, slot, name, "chat.slot_fork")
+    if denied is not None:
+        return denied
 
-    # The child inherits the parent's mode, so the parent's value is what the
-    # slot constructor validates against ``VALID_MEMORY_MODES``. The API checks
-    # the field on the way in, but rehydration copies the transcript header's
-    # ``memory_mode`` onto the slot as written, so a hand-edited or partially
-    # written header can leave an unrecognised value on a live parent. That
-    # value is refused HERE, with a code and before any child exists, rather
-    # than raising out of ``_ChatSlot.__init__`` as a 500. Fail closed: a mode
-    # this code cannot read is a memory boundary it cannot honour.
-    inherited_memory_mode = slot.memory_mode
-    if inherited_memory_mode not in VALID_MEMORY_MODES:
-        sel().log_api_access(
-            caller=request_app or "dashboard",
-            operation="chat.slot_fork",
-            outcome="denied",
-            source="dashboard",
-            resources=f"slot={name},memory_mode={inherited_memory_mode!r}",
-            error="source slot memory_mode is not a recognised mode",
-        )
-        return web.json_response(
-            {
-                "error": "the source session's memory mode is not recognised",
-                "code": "fork_source_memory_mode_invalid",
-            },
-            status=409,
-        )
-
-    source_memory_identity = (
-        effective_session_key(slot),
-        slot.agent,
-        slot.memory_store,
-        slot.memory_mode,
-        slot_history_key(slot),
-    )
-
-    from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
-
-    try:
-        inherited_execution = await asyncio.to_thread(
-            _fork_execution_context, *source_memory_identity[:4]
-        )
-    except (OSError, ValueError) as exc:
-        return _store_unavailable_response(source_memory_identity[2], exc)
+    source = await resolve_fork_source(slot, audit_caller=request_app or "dashboard")
+    if isinstance(source, web.Response):
+        return source
 
     # Restricted forks copy only the live conversation and inherit the parent's
     # mode before any row is copied. Neither branch persists restricted bodies,
@@ -236,11 +451,11 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             status=400,
         )
     prompt = body.get("prompt")
-    mode_override = body.get("mode")
-    if mode_override is not None and mode_override not in ("", "orchestrator"):
+    mode_override = _coerce_requested_mode(body.get("mode"))
+    if mode_override is not None and mode_override != "":
         return web.json_response(
             {
-                "error": "mode must be '' or 'orchestrator'",
+                "error": "mode must be ''",
                 "code": "invalid_mode",
             },
             status=400,
@@ -284,6 +499,177 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             status=400,
         )
 
+    result = await fork_slot(
+        state,
+        source,
+        at_index=at_index,
+        at_message_id=at_message_id,
+        direction=direction,
+        prompt=prompt,
+        mode_override=mode_override,
+        request_app=request_app,
+        origin=request_slot_origin(request_app),
+        # Human request-layer path: a person forking a conversation. The
+        # origin conjunct in state_parts/slot_directory.py still excludes app-token callers.
+        count_user_session=True,
+        # Inheriting is arming a SECOND routed session, so it answers to the
+        # same owner predicate as the arm itself: this route is gated on app
+        # ownership, which an allow-listed non-owner passes for a slot the
+        # owner armed.
+        jev_route_allowed=is_owner_dashboard_request(request),
+        audit_caller=request_app or "dashboard",
+        # A person forking a pinned session gets a pinned fork, so it stays
+        # beside its parent in the pinned group. Set through ``stamp`` so the
+        # pin rides the child's birth save. Agent ``session_fork`` children
+        # never get it: pinned marks a session as human-owned.
+        stamp=_inherit_pin(source.slot),
+    )
+    if isinstance(result, web.Response):
+        return result
+    return web.json_response(
+        {
+            "ok": True,
+            "key": result.slot.key,
+            "title": result.slot.title,
+            "messages": result.messages,
+            "prompt": prompt,
+            "folder_id": result.slot.folder_id or None,
+            "pinned": result.slot.pinned,
+            "direction": result.direction,
+            # The mode the child was born with (always the parent's), so the tab
+            # can render the incognito/temporary badge before the slots refresh.
+            "memory_mode": result.slot.memory_mode,
+        }
+    )
+
+
+def _shape_fork_child(
+    new_slot: "_ChatSlot", slot: "_ChatSlot", *, direction: str, jev_route_allowed: bool
+) -> None:
+    """Copy onto the just-minted *new_slot* what it inherits from its parent *slot*.
+
+    Synchronous and assignment-only. :func:`fork_slot` runs it in the
+    push-suspended window that began at the mint, so the child's first
+    ``slots`` frame already shows the folder, tags and fork title set here.
+    """
+    new_slot.forked_from = effective_session_key(slot)
+    new_slot.reasoning_effort = slot.reasoning_effort
+    # Inherited beside the model it belongs to: the constructor takes `model` and
+    # the routing choice is the other half of the same answer, so a fork of an
+    # "Auto (Jev)" session that arrived pinned would run the parent's next turns
+    # on a model the parent had explicitly stopped choosing by hand.
+    # Inheriting is arming a SECOND routed session, so it answers to the same owner
+    # predicate as the arm itself; the caller says whether it passed that predicate.
+    new_slot.jev_route = slot.jev_route and jev_route_allowed
+    # Inherit the active project directory so the fork keeps the parent's working
+    # context (agent resolution, steering files, CWD) instead of falling back to
+    # the config/workspace default on first message.
+    new_slot.project = slot.project
+    # Keep the app-owned agent binding with the agent it binds: the fork runs as
+    # the same app agent, so the per-turn shadow check must still apply to it.
+    new_slot.app_agent_owner = slot.app_agent_owner
+    # Inherit the sidebar folder so the fork appears next to its parent in the UI.
+    new_slot.folder_id = slot.folder_id
+    # Inherit tags (copied, so later edits to either slot's list stay independent).
+    new_slot.tags = list(slot.tags)
+    # "tags changed => revision changed": the slot was constructed with an empty
+    # list under its birth revision; a snapshot of that newborn state (a slot
+    # fetch racing the fork) must not share a revision with the inherited list,
+    # or a delayed empty frame could become a client's next toggle base.
+    new_slot.bump_tags_revision()
+    parent_title = slot.title if slot._titled else "Untitled"
+    parent_title, _ = redact_exfiltration_urls(parent_title)
+    parent_title, _ = redact_credentials(parent_title)
+    # Strip a leading marker from the parent so it never compounds on a
+    # fork-of-a-fork.
+    parent_title = parent_title.removeprefix(FORK_TITLE_MARKER)
+    fork_word = "Tail of" if direction == _FORK_DIRECTION_TAIL else "Fork of"
+    new_slot.title = f"{FORK_TITLE_MARKER}{fork_word} {parent_title}"
+    new_slot._titled = True
+    # The fork name is derived, not typed: it stays inside the automatic title
+    # lifecycle (refreshable, and renamed from the child's own question once the
+    # fork is acknowledged) unless the name it wraps is final. A parent with a
+    # manual name, or a legacy one, hands the child a final title too. Persisted
+    # by the birth save, so a reload keeps the provenance instead of treating the
+    # fork name as an untyped legacy title.
+    new_slot._title_origin = (
+        _TITLE_ORIGIN_USER
+        if slot._titled and slot._title_origin != _TITLE_ORIGIN_AUTO
+        else _TITLE_ORIGIN_AUTO
+    )
+
+
+async def fork_slot(
+    state: DashboardState,
+    source: "ForkSource",
+    *,
+    at_index: Any,
+    at_message_id: str | None,
+    direction: str,
+    prompt: str,
+    mode_override: str | None,
+    request_app: str,
+    origin: str,
+    count_user_session: bool,
+    jev_route_allowed: bool,
+    audit_caller: str,
+    audit_operation: str = FORK_AUDIT_OPERATION,
+    stamp: "Callable[[_ChatSlot], None] | None" = None,
+    recheck: "Callable[[], None] | None" = None,
+    reveal_folder: bool = True,
+) -> "ForkResult | web.Response":
+    """Copy *source*'s transcript up to (or after) the fork point into a new slot.
+
+    The second half of a fork: everything from the transcript snapshot to the
+    acknowledged, persisted child. ``source`` is what :func:`resolve_fork_source`
+    returned for the parent, and every argument is already validated -- this
+    function checks only what it can check against the transcript it reads
+    (``at_index`` against the visible-row count, ``at_message_id`` against the
+    rows' ids). It has no request: the pieces the human route derives from one
+    (``request_app``, ``origin``, ``count_user_session``, ``jev_route_allowed``,
+    ``audit_caller``) are passed in, so ``session_control.fork_session`` can run
+    the identical copy for an agent caller with its own answers to them.
+
+    ``stamp``, when given, is called on the child once it is fully shaped
+    (title, folder, tags, inherited memory identity) and BEFORE the transcript
+    copy is saved, still inside the push-suspended window that began at the
+    mint. Whatever it sets is therefore on the child's first ``slots`` frame
+    and rides its birth save. This is how
+    ``session_control.fork_session`` lands creator attribution and its optional
+    title/folder in the same write as the transcript, and why no client ever
+    sees the child unattributed or outside the folder it asked for. It must
+    only assign in-memory fields; it is not awaited and must not raise for
+    ordinary input (a raise here is treated as fork finalisation failing, and
+    the child is withdrawn).
+
+    ``recheck``, when given, is a SYNCHRONOUS re-assertion of whatever the caller
+    decided before handing over: it runs immediately before the child is minted
+    and again immediately before the transcript is copied into it, adjacent to
+    the two points where this function re-compares the source's own frozen
+    identity (when no memory bind runs, nothing suspends after the mint, so the
+    first call covers the copy too). It may raise; a raise before the mint
+    leaves nothing behind, and a raise after the bind withdraws the empty child. This is how
+    ``session_control.fork_session`` keeps its containment answers -- caller
+    eligibility, the source's addressability, the folder's existence -- true at
+    the act rather than at the moment they were first read, across the
+    suspensions this function takes for the transcript read and the memory bind.
+
+    ``reveal_folder`` says whether a hidden folder the child is filed into is
+    un-hidden once the fork is acknowledged. The human route leaves it True: a
+    person forking a session wants to see the child. ``session_control``'s
+    agent fork passes True only when the agent named the folder, matching agent
+    ``session_create``, so an agent fork that merely inherits a folder the user
+    hid leaves that choice alone.
+
+    Returns a :class:`ForkResult` on success. A refusal is returned as the
+    finished ``web.Response`` -- this module's refusal shape, kept so its coded
+    error sites stay where the error-code ratchet pins them -- and a failure
+    that is not a refusal raises. On success the child is already saved,
+    ``_sync_dashboard_slots`` has run and the slots update is pushed.
+    """
+    slot = source.slot
+    inherited_execution = source.execution
+    source_memory_identity = source.identity
     # Read disk FIRST (full history). Stable message IDs are resolved against this
     # complete corpus; the legacy index fallback also has to use the same chained
     # view the fully-loaded frontend renders. Without the chained read, an archived
@@ -292,278 +678,108 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     async with slot._fork_lock:
         all_messages: list[dict] = []
         new_msgs: list[dict] = []
-        # Two tail candidates, because a boundary ahead of the resident window has
-        # TWO causes needing OPPOSITE remedies and they can only be told apart
-        # once the true on-disk length is known -- i.e. after the read. Both are
-        # snapshotted ON THE LOOP so whichever is chosen still pairs with the
-        # boundary the read observed.
-        tail: list[dict] | None = None
-        capped_tail: list[dict] | None = None
         # True when the read proved disk holds rows the slot's counters do not
         # represent (the capped-restore signature). Gates BOTH flush sites in this
         # handler, because the save's frozen prefix cannot protect those rows.
         disk_holds_unrepresented = False
         if state.conversation_log:
-            # Pair the disk read with the unpersisted tail on ONE consistent view
-            # of the slot, using the idiom session_transfer._snapshot_transcript
-            # already uses: capture the boundary, read, re-check, retry on change.
-            #
-            # The offset is ``_disk_window_len`` -- "how many window messages are
-            # now on disk", advanced by the save path (chat_persistence
-            # ``_save_slot_to_history``). Two nearby counters cannot serve here:
-            #
-            #   * ``_resumed_count`` records only how many messages were loaded
-            #     when the slot was rehydrated. The flush never advances it, so a
-            #     persisted tail stays inside the slice and reconciles in twice.
-            #     session_transfer hit exactly this and documents it.
-            #   * a length captured on a ``_dirty`` transition fails the same way.
-            #     ``_dirty`` is a boolean, so it cannot distinguish "never flushed"
-            #     from "flushed, then re-dirtied by an append" -- and in that
-            #     interleaving no transition registers at all.
-            #
-            # ``_dirty_gen`` (monotonic, bumped centrally by the ``_dirty`` setter)
-            # catches in-place edits that move neither boundary nor length; the
-            # length is a backstop for any path that mutates ``slot.messages``
-            # without marking dirty. There is deliberately no ``_dirty`` gate on
-            # the merge below: the boundary alone is authoritative and the slice is
-            # empty when everything is persisted, so a flush clearing ``_dirty``
-            # mid-read cannot skip the reconciliation and drop the tail.
-            # ``pending_retry`` carries a SUSPICION across the ``continue`` below.
-            # The pending-rewrite save below clears ``_pending_rewrite``
-            # unconditionally once the archive-safe rewrite succeeds
-            # (``chat_persistence``: ``if rewrite:
-            # slot._pending_rewrite = False``) with NO check that the flag it clears
-            # is the one its own snapshot was taken for. So a rewind landing while
-            # that save is suspended has its flag erased, and without this carry the
-            # next attempt reads ``False`` and falls through to a disk read holding
-            # the turns the rewind just discarded.
-            pending_retry = False
-            for _ in range(_SNAPSHOT_ATTEMPTS):
-                if slot._pending_rewrite or pending_retry:
-                    # Disk is KNOWN stale: a rewind/regenerate discarded a tail in
-                    # memory and the truncating rewrite has not been written yet, so
-                    # the file still holds the PRE-EDIT transcript. None of the four
-                    # counters captured below carries that state -- ``chat_rewind``
-                    # sets ``_dirty``, zeroes ``_resumed_count`` and sets this flag,
-                    # but never touches ``_disk_window_len`` -- so the boundary keeps
-                    # its pre-rewind value and can still satisfy the authoritative
-                    # predicate. The read would then return the discarded turns and
-                    # the post-await re-check would PASS, because nothing moved
-                    # during the read: it measures stability, not correctness.
-                    # ``session_transfer._guard_snapshot`` refuses on exactly this
-                    # flag for exactly this reason.
-                    #
-                    # SAVE and retry rather than refuse outright: a rewrite save
-                    # clears the flag (chat_persistence sets ``_pending_rewrite =
-                    # False`` once the archive-safe rewrite succeeds), so this is
-                    # the recoverable path, and a fork is required to still succeed.
-                    # The 503 below is the terminal arm for a source that cannot be
-                    # persisted, and the loop's own 503 covers a flag that keeps
-                    # being re-set within the attempt budget.
-                    # Capture the generation BEFORE the suspension point, so a
-                    # re-dirty that lands while the save is awaited is witnessed.
-                    gen_at_save = slot._dirty_gen
-                    try:
-                        # ``rewrite=True`` UNCONDITIONALLY, because every entry into
-                        # this arm means "disk is stale because an EDIT truncated the
-                        # window", and that is exactly what the archive-safe path is
-                        # for. ``_save_slot_to_history`` only ever PROMOTES this flag
-                        # (``if messages is not None or slot._pending_rewrite: rewrite
-                        # = True``) and gates both the archive-diff (``if rewrite and
-                        # path.exists()``) and the ``rotation_generation`` bump behind
-                        # it -- so on the RETRY, where no snapshot is passed and
-                        # ``_pending_rewrite`` has already been cleared by the first
-                        # save, neither promotion input is present. Without this the
-                        # retry would persist the rewind's truncation through the
-                        # PLAIN path, deleting the discarded turns with no archive
-                        # copy: strictly worse than the bug it recovers from, which
-                        # at least left them readable on disk.
-                        #
-                        # Passing it on the first entry too is a no-op rather than a
-                        # widening -- ``_pending_rewrite`` is still set there, so the
-                        # promotion above already produces True
-                        # (``test_a_first_entry_pending_rewrite_save_archives_as_
-                        # before`` pins that). Stating it here removes the dependence
-                        # on that promotion, which is the thing that silently failed.
-                        saved = await save_slot_off_loop(
-                            state, slot, rewrite=True, best_effort=False
-                        )
-                    except Exception:
-                        logger.warning(
-                            "chat_fork: could not persist the pending rewrite for "
-                            "slot=%s; refusing the fork rather than copying the "
-                            "discarded turns still on disk",
-                            slot.key,
-                            exc_info=True,
-                        )
-                        return web.json_response(
+            # The disk read paired with the unpersisted tail on ONE consistent view
+            # of the slot. The read, the pending-rewrite save and the boundary
+            # re-sync stay here as this handler's own; transcript_snapshot owns
+            # the attempts, the witness and the tail they pair with.
+            conversation_log = state.conversation_log
+
+            async def _read_transcript(_view: SlotView) -> list[dict]:
+                return await asyncio.to_thread(
+                    conversation_log.read_messages_chained, slot_history_key(slot)
+                )
+
+            async def _save_pending_rewrite() -> None:
+                # Disk is KNOWN stale: a rewind/regenerate discarded a tail in memory
+                # and the truncating rewrite has not been written yet, so the file
+                # still holds the PRE-EDIT transcript. SAVE it rather than refuse
+                # outright: the rewrite save clears the flag, so this is the
+                # recoverable path, and a fork is required to still succeed.
+                try:
+                    # ``rewrite=True`` UNCONDITIONALLY, because every call means "disk
+                    # is stale because an EDIT truncated the window", which is what
+                    # the archive-safe path is for. ``_save_slot_to_history`` only
+                    # PROMOTES this flag (``if messages is not None or
+                    # slot._pending_rewrite: rewrite = True``) and gates both the
+                    # archive-diff and the ``rotation_generation`` bump behind it, so
+                    # on the RETRY after a rewind landed inside an earlier save --
+                    # where ``_pending_rewrite`` has already been cleared by that save
+                    # -- neither promotion input is present, and without this the
+                    # retry would delete the discarded turns with no archive copy.
+                    saved = await save_slot_off_loop(
+                        state,
+                        slot,
+                        rewrite=True,
+                        best_effort=False,
+                        # An authorized transcript key makes this a GUARDED write:
+                        # it registers in the slot's guarded-write registry, so a
+                        # retraction of the slot's name waits for it instead of
+                        # popping while its worker is on the way to the rename; it is
+                        # refused while a retraction is already past that wait; and
+                        # it engages the in-lock routing re-read. The key pins only
+                        # ROUTING, and a same-name close-and-recreate resumes the
+                        # same transcript, so ``expected_slot_name`` re-reads the map
+                        # inside the transcript lock and refuses when the name holds
+                        # a different slot -- committing would copy a window the
+                        # replacement never authorized under a fresh key.
+                        expected_history_key=slot_history_key(slot),
+                        expected_slot_name=slot.key,
+                    )
+                except Exception:
+                    logger.warning(
+                        "chat_fork: could not persist the pending rewrite for "
+                        "slot=%s; refusing the fork rather than copying the "
+                        "discarded turns still on disk",
+                        slot.key,
+                        exc_info=True,
+                    )
+                    raise _ForkRefused(
+                        web.json_response(
                             {
                                 "error": "the source session is being written to; " "please retry",
                                 "code": "fork_snapshot_unstable",
                             },
                             status=503,
                         )
-                    if not saved:
-                        # Delete-won: the source session was permanently deleted
-                        # while this flush awaited the lock. Do not fork — the
-                        # copy would republish the destroyed conversation under
-                        # a fresh key (see the identical check at the plain
-                        # flush site below).
-                        logger.warning(
-                            "chat_fork: source slot=%s was permanently deleted "
-                            "during the pending-rewrite flush; aborting fork",
-                            slot.key,
-                        )
-                        return web.json_response(
+                    )
+                if not saved:
+                    # The save declined WITHOUT writing, and the reasons it can
+                    # decline are indistinguishable from a bool: the session was
+                    # permanently deleted while this flush awaited the lock, the
+                    # routing moved off the transcript the key authorizes, the name
+                    # now holds a different slot object, or a retraction of this
+                    # slot's name is already past the point where it can wait for
+                    # this write. Every one says the same thing about forking: the
+                    # file still holds the discarded turns, so copying it would
+                    # republish them under a fresh key. The code is kept as it is
+                    # because clients match on it; the message states the class.
+                    logger.warning(
+                        "chat_fork: the pending rewrite for slot=%s was not "
+                        "persisted (deleted, rerouted, or being closed); "
+                        "aborting fork rather than copying the discarded turns "
+                        "still on disk",
+                        slot.key,
+                    )
+                    raise _ForkRefused(
+                        web.json_response(
                             {
-                                "error": "the source session was permanently deleted",
+                                "error": "the source session could not be saved; retry the fork",
                                 "code": "fork_source_deleted",
                             },
                             status=409,
                         )
-                    # A moved generation means a genuine re-dirty landed across the
-                    # await -- i.e. a rewind, whose ``_pending_rewrite`` this save
-                    # has just erased along with its own. Two properties make the
-                    # witness clean rather than a permanent trip: ``_dirty_gen``
-                    # advances ONLY on a True assignment (see the ``_dirty`` setter
-                    # in ``state.py``), so this save clearing ``_dirty`` cannot move
-                    # it; and ``best_effort=False`` PROPAGATES a failure instead of
-                    # re-marking the slot dirty, so the save cannot bump it either.
-                    #
-                    # RETRY rather than refuse, per the reasoning above: this is the
-                    # recoverable path and a fork is required to still succeed. The
-                    # next attempt re-enters this arm and persists the rewind that
-                    # was missed. A flag that keeps being re-set simply spends the
-                    # attempt budget and is caught by the loop's own terminal 503 --
-                    # exactly the division of labour described above. Mirrors
-                    # ``flush_slot_now``'s generation compare in ``state.py``, which
-                    # distinguishes "the True I started this save under" from "a NEW
-                    # True set during it" for this same reason.
-                    pending_retry = slot._dirty_gen != gen_at_save
-                    continue
-                disk_len_before = slot._disk_window_len
-                gen_before = slot._dirty_gen
-                count_before = len(slot.messages)
-                older_before = slot._disk_older_count
-                # Witnessed for STABILITY ONLY -- see the guard below. Captured here
-                # so the branch selector at ``elif slot._dirty`` and the post-await
-                # check read the same value.
-                dirty_before = slot._dirty
-                # Snapshot the tail ON THE LOOP, before the await, so it pairs
-                # with the boundary the read is about to observe.
-                if disk_len_before <= count_before:
-                    # The boundary is a usable index and authoritative: the slice
-                    # is empty exactly when everything is persisted. Deliberately
-                    # NO ``_dirty`` gate here -- a gate is what lets a flush
-                    # clearing ``_dirty`` mid-read skip the merge and drop the tail.
-                    tail = list(slot.messages[disk_len_before:])
-                elif slot._dirty:
-                    # The boundary can run AHEAD of the resident window, and is
-                    # then unusable as an index. It has TWO causes and they need
-                    # OPPOSITE remedies, so this branch must not pick one blind:
-                    #
-                    #   * a CAPPED RESTORE dropped leading messages from memory
-                    #     without bumping ``_disk_older_count``. Disk legitimately
-                    #     holds MORE than memory, and flushing would write the
-                    #     smaller window over it. The frozen prefix is keyed on
-                    #     ``_disk_older_count`` (chat_persistence
-                    #     ``_load_frozen_prefix``), which the cap never moved, so
-                    #     the prefix is EMPTY and the save truncates disk to the
-                    #     window -- destroying every persisted message the cap
-                    #     dropped. ``test_fork_preserves_full_history_when_dirty_
-                    #     and_capped`` is the guard for exactly that.
-                    #   * a mid-stream ``_flush_segment`` reassigned
-                    #     ``slot.messages`` to drop a trailing chunk run. Disk and
-                    #     the counters still agree, so flushing is safe and is what
-                    #     re-syncs the boundary.
-                    #
-                    # ``_resumed_count`` is not a blanket substitute either: the
-                    # save never advances it -- ``_save_slot_to_history`` only READS
-                    # it, in its no-op skip -- so for a slot created in this gateway
-                    # run it stays 0 and slicing from it appends the whole resident
-                    # window onto the disk read, duplicating every persisted turn.
-                    # It IS the right offset in the capped-restore case, where the
-                    # restore sets it to the capped length, which is precisely "how
-                    # many resident messages came from disk".
-                    #
-                    # So snapshot that candidate here and decide below, once the
-                    # read has supplied the only authoritative discriminator: the
-                    # true on-disk length.
-                    tail = None
-                    capped_tail = list(slot.messages[slot._resumed_count :])
-                else:
-                    tail = []
-                all_messages = await asyncio.to_thread(
-                    state.conversation_log.read_messages_chained, slot_history_key(slot)
-                )
-                if not (
-                    slot._disk_window_len == disk_len_before
-                    and slot._dirty_gen == gen_before
-                    and len(slot.messages) == count_before
-                    # ``_disk_older_count`` too: it is half of the window's identity
-                    # (channel_slots: the window is
-                    # ``messages[_disk_older_count:][:len(window)]``), and the
-                    # discriminator below is computed from it, so a move here
-                    # invalidates the pairing exactly as a boundary move does.
-                    and slot._disk_older_count == older_before
-                    # ``_pending_rewrite`` is checked on BOTH sides of the await, as
-                    # session_transfer's guard documents. It was False when this
-                    # attempt began (the branch above continues otherwise), so True
-                    # here means a rewind landed DURING the threaded read -- which it
-                    # can, because ``slot._fork_lock`` has exactly one acquirer in the
-                    # tree and no rewind path takes it. Equality against the other
-                    # counters cannot see this: a rewind moves none of them back.
-                    and not slot._pending_rewrite
-                    # ``_dirty`` as a STABILITY WITNESS, never as a merge gate. The
-                    # other four cannot see a save that merely COMPLETES under the
-                    # read: an in-place content edit (a variant switch) moves neither
-                    # ``len(slot.messages)`` nor ``_disk_older_count``, the save
-                    # re-assigns ``_disk_window_len`` to the value it already had
-                    # because the window length did not change, and CLEARING
-                    # ``_dirty`` cannot move ``_dirty_gen`` (the setter advances it
-                    # only on a True assignment). So the threaded read can return
-                    # pre-save bytes while the slot reports everything persisted, and
-                    # the boundary-derived tail is empty -- leaving the fork to adopt
-                    # the stale read verbatim and carry the SUPERSEDED content.
-                    #
-                    # A mismatch RETRIES; it does not skip the reconciliation. That
-                    # distinction is the whole reason this is safe to add: the two
-                    # comments above rejecting a ``_dirty`` gate are about the MERGE
-                    # decision, which stays keyed on the boundary alone. The next
-                    # attempt re-reads a disk that now holds the completed save.
-                    and slot._dirty == dirty_before
-                ):
-                    logger.debug(
-                        "chat_fork: slot=%s changed during the transcript read; retrying",
-                        slot.key,
                     )
-                    continue
-                if tail is not None:
-                    new_msgs = tail
-                    break
-                # Boundary ahead AND dirty. Discriminate on the invariant
-                # channel_slots states for these counters: disk holds
-                # ``_disk_older_count`` frozen rows followed by the window, so
-                # ``older + window`` is everything the counters claim is on disk.
-                # Disk holding MORE than that means rows exist which the counters
-                # do not represent -- the capped-restore signature. channel_slots
-                # ``_window_matches_disk`` tests the same arithmetic in the
-                # opposite direction.
-                if len(all_messages) > older_before + count_before:
-                    # Do NOT flush: it would truncate those unrepresented rows.
-                    # Merge from ``_resumed_count`` instead, which the restore set.
-                    disk_holds_unrepresented = True
-                    new_msgs = capped_tail or []
-                    break
-                # Counters agree with disk, so the window shrank mid-stream and the
-                # flush is what re-syncs the boundary: the save assigns
-                # ``_disk_window_len = len(window)`` and never READS the boundary,
-                # so flushing while it is ahead cannot mislead the write. Then spend
-                # the attempt; the next one re-derives from the authoritative branch
-                # above. If it still does not settle the loop's 503 refuses, which
-                # is what session_transfer's ``_guard_snapshot`` does here -- but
-                # retrying first is what keeps a fork succeeding once the stream
-                # that moved the window has finalized.
+
+            async def _resync_boundary() -> None:
+                # The window shrank mid-stream and the counters still agree with
+                # disk: the save assigns ``_disk_window_len = len(window)`` and never
+                # READS the boundary, so flushing while it is ahead cannot mislead
+                # the write, and the next attempt slices from the re-synced boundary.
                 try:
                     await save_slot_off_loop(state, slot, best_effort=False)
                 except Exception:
@@ -573,23 +789,34 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                         slot.key,
                         exc_info=True,
                     )
-                    return web.json_response(
-                        {
-                            "error": "the source session is being written to; " "please retry",
-                            "code": "fork_snapshot_unstable",
-                        },
-                        status=503,
+                    raise _ForkRefused(
+                        web.json_response(
+                            {
+                                "error": "the source session is being written to; " "please retry",
+                                "code": "fork_snapshot_unstable",
+                            },
+                            status=503,
+                        )
                     )
-                continue
-            else:
-                # Do NOT fall through with the mismatched pair: that is precisely
-                # the state the loop exists to reject, and taking it either drops
-                # the tail or duplicates it. Both are silent; a retryable 503 is
-                # not, and this handler already uses that shape below.
+
+            try:
+                snapshot = await read_consistent_transcript(
+                    state,
+                    slot,
+                    FORK,
+                    _read_transcript,
+                    persist=_resync_boundary,
+                    rewrite=_save_pending_rewrite,
+                )
+            except _ForkRefused as refused:
+                return refused.response
+            except SnapshotUnstable:
+                # Never fall through with a mismatched pair: taking it either drops
+                # the tail or duplicates it, both silently; a retryable 503 is not.
                 logger.warning(
                     "chat_fork: slot=%s did not settle in %d attempts; refusing the fork",
                     slot.key,
-                    _SNAPSHOT_ATTEMPTS,
+                    transcript_snapshot.SNAPSHOT_ATTEMPTS,
                 )
                 return web.json_response(
                     {
@@ -598,6 +825,9 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
+            all_messages = snapshot.result
+            new_msgs = snapshot.tail
+            disk_holds_unrepresented = snapshot.disk_holds_unrepresented
         _fork_tail_len = len(new_msgs) if (all_messages and new_msgs) else 0
         if all_messages and new_msgs:
             # REBIND, never ``extend``. ``read_messages_chained`` hands back the
@@ -889,6 +1119,22 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     elif at_index is not None:
         visible = visible[: at_index + 1]
 
+    # The destination's append trims from the FRONT at capacity, and nothing has
+    # reached disk during the copy, so those evicted rows are unrecoverable.
+    if len(visible) > _MAX_SLOT_MESSAGES:
+        return web.json_response(
+            {
+                # No count and no ceiling: a row number is not an affordance in a
+                # transcript that numbers nothing, so the text names the ACTION.
+                "error": (
+                    "conversation too large to fork. Fork at a message "
+                    "(at_message_index or at_message_id) to copy a smaller slice."
+                ),
+                "code": "fork_corpus_too_large",
+            },
+            status=400,
+        )
+
     # A fork of a member DM thread is an ordinary chat, never a second "member"
     # slot: the fork mints a chat-* key, so member mode would make it invisible
     # everywhere (excluded from Sessions by surface mode, and absent from the
@@ -901,16 +1147,17 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     else:
         fork_mode = slot.mode
 
-    from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
     from kiro_crew.memory_stores import UnknownMemoryStore
 
     def _source_identity_unchanged() -> bool:
-        return state._slots.get(name) is slot and source_memory_identity == (
+        return state._slots.get(slot.key) is slot and source_memory_identity == (
             effective_session_key(slot),
             slot.agent,
             slot.memory_store,
             slot.memory_mode,
             slot_history_key(slot),
+            str(getattr(slot, "workspace", "default") or "default"),
+            str(getattr(slot, "agent_kind", "") or ""),
         )
 
     try:
@@ -920,79 +1167,81 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             raise UnknownMemoryStore("The fork source changed while its memory was verified")
     except (OSError, ValueError) as exc:
         return _store_unavailable_response(source_memory_identity[2], exc)
+    if recheck is not None:
+        # Adjacent to the mint: nothing suspends between here and
+        # `get_or_create_slot`, so what this asserts is true of the child's birth.
+        recheck()
 
-    new_slot = state.get_or_create_slot(
-        name=None,
-        agent=slot.agent,
-        workspace=slot.workspace,
-        model=slot.model,
-        mode=fork_mode,
-        # Inherited at BIRTH, not stamped afterwards: get_or_create_slot is what
-        # registers the child's ``dashboard:`` key as restricted, and every memory
-        # gate (lessons, consolidation, artifact registration) reads that
-        # registry. A later assignment would leave a window where the child of
-        # an incognito parent is a persistent slot. The value is the one
-        # validated above, so the constructor cannot raise on it.
-        memory_mode=inherited_memory_mode,
-        app=request_app,
-        origin=request_slot_origin(request_app),
-        # Human request-layer path: a person forking a conversation. The
-        # origin conjunct in state.py still excludes app-token callers.
-        count_user_session=True,
-    )
-    if inherited_execution is not None:
+    # Mint, bind and shape the child inside ONE ``suspend_slots_push`` block.
+    # ``get_or_create_slot`` pushes the slot list as it registers the child, and
+    # an idle coalescer sends that frame at once. Shaped any later, the child
+    # reaches every sidebar unfiled and untitled, then moves into its folder one
+    # trailing flush afterwards. Deferring the push to the block's exit makes the
+    # child's first frame carry its folder, tags, title, pin and whatever
+    # ``stamp`` sets, and a child withdrawn inside the block is never announced.
+    # The block's only await is the memory bind; the transcript copy and its
+    # save stay outside it, so other slots' frames wait at most that long.
+    with state.suspend_slots_push():
+        new_slot = state.get_or_create_slot(
+            name=None,
+            agent=slot.agent,
+            workspace=slot.workspace,
+            model=slot.model,
+            mode=fork_mode,
+            # Inherited at BIRTH, not stamped afterwards: get_or_create_slot is what
+            # registers the child's ``dashboard:`` key as restricted, and every memory
+            # gate (lessons, consolidation, artifact registration) reads that
+            # registry. A later assignment would leave a window where the child of
+            # an incognito parent is a persistent slot. The value is the one
+            # validated above, so the constructor cannot raise on it.
+            memory_mode=inherited_memory_mode,
+            app=request_app,
+            origin=origin,
+            count_user_session=count_user_session,
+        )
+        if inherited_execution is not None:
+            try:
+                # Bind the frozen identity and strict mode while the child is empty.
+                await drained_to_thread(
+                    _bind_fork_execution,
+                    (*source_memory_identity[:4], source_memory_identity[6]),
+                    effective_session_key(new_slot),
+                    inherited_execution,
+                )
+                if recheck is not None:
+                    # The bind suspended; re-assert the caller's containment answers
+                    # first, so a source that became unaddressable meanwhile is
+                    # refused with ITS code rather than as an identity drift. A raise
+                    # here takes the withdrawal path below (no rows copied yet), and
+                    # nothing suspends between here and the copy.
+                    recheck()
+                if not _source_identity_unchanged():
+                    raise UnknownMemoryStore(
+                        "The fork source changed before its history was copied"
+                    )
+                new_slot.memory_store = inherited_store
+            except BaseException as exc:
+                await _withdraw_fork_child(state, new_slot, announced=False)
+                if isinstance(exc, (OSError, ValueError)):
+                    return _store_unavailable_response(inherited_store, exc)
+                raise
         try:
-            # Bind the frozen identity and strict mode while the child is empty.
-            await drained_to_thread(
-                _bind_fork_execution,
-                source_memory_identity[:4],
-                effective_session_key(new_slot),
-                inherited_execution,
+            _shape_fork_child(
+                new_slot, slot, direction=direction, jev_route_allowed=jev_route_allowed
             )
-            if not _source_identity_unchanged():
-                raise UnknownMemoryStore("The fork source changed before its history was copied")
-            new_slot.memory_store = inherited_store
-        except BaseException as exc:
-            from kiro_crew.execution_context import clear_session_execution
-
-            clear_session_execution(effective_session_key(new_slot))
-            state._slots.pop(new_slot.key, None)
-            state._restricted_keys.discard(effective_session_key(new_slot))
-            if isinstance(exc, (OSError, ValueError)):
-                return _store_unavailable_response(inherited_store, exc)
+            if stamp is not None:
+                stamp(new_slot)
+        except Exception:
+            await _withdraw_fork_child(state, new_slot, announced=False)
+            sel().log_api_access(
+                caller=audit_caller,
+                operation=audit_operation,
+                outcome="error",
+                source="dashboard",
+                resources=f"from={slot.key},to={new_slot.key}",
+                error="fork finalisation failed",
+            )
             raise
-    new_slot.forked_from = effective_session_key(slot)
-    new_slot.reasoning_effort = slot.reasoning_effort
-    # Inherited beside the model it belongs to: the constructor takes `model` and
-    # the routing choice is the other half of the same answer, so a fork of an
-    # "Auto (Jev)" session that arrived pinned would run the parent's next turns
-    # on a model the parent had explicitly stopped choosing by hand.
-    # Inheriting is arming a SECOND routed session, so it answers to the same owner
-    # predicate as the arm itself: this route is gated on app ownership, which an
-    # allow-listed non-owner passes for a slot the owner armed.
-    new_slot.jev_route = slot.jev_route and is_owner_dashboard_request(request)
-    # Inherit the active project directory so the fork keeps the parent's working
-    # context (agent resolution, steering files, CWD) instead of falling back to
-    # the config/workspace default on first message.
-    new_slot.project = slot.project
-    # Inherit the sidebar folder so the fork appears next to its parent in the UI.
-    new_slot.folder_id = slot.folder_id
-    # Inherit tags (copied, so later edits to either slot's list stay independent).
-    new_slot.tags = list(slot.tags)
-    # "tags changed => revision changed": the slot was constructed with an empty
-    # list under its birth revision; a snapshot of that newborn state (a slot
-    # fetch racing the fork) must not share a revision with the inherited list,
-    # or a delayed empty frame could become a client's next toggle base.
-    new_slot.bump_tags_revision()
-    parent_title = slot.title if slot._titled else "Untitled"
-    parent_title, _ = redact_exfiltration_urls(parent_title)
-    parent_title, _ = redact_credentials(parent_title)
-    # Strip a leading marker from the parent so it never compounds on a
-    # fork-of-a-fork.
-    parent_title = parent_title.removeprefix(_FORK_TITLE_MARKER)
-    fork_word = "Tail of" if direction == _FORK_DIRECTION_TAIL else "Fork of"
-    new_slot.title = f"{_FORK_TITLE_MARKER}{fork_word} {parent_title}"
-    new_slot._titled = True
 
     try:
         for m in visible:
@@ -1013,10 +1262,12 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
         await save_slot_off_loop(state, new_slot)
         new_slot._resumed_count = len(new_slot.messages)
     except Exception:
-        state._slots.pop(new_slot.key, None)
+        # The child's row was announced when the mint block exited. A partial
+        # save can leave message rows, and the withdrawal keeps such a record.
+        await _withdraw_fork_child(state, new_slot, announced=True)
         sel().log_api_access(
-            caller=request_app or "dashboard",
-            operation="chat.slot_fork",
+            caller=audit_caller,
+            operation=audit_operation,
             outcome="error",
             source="dashboard",
             resources=f"from={slot.key},to={new_slot.key}",
@@ -1024,7 +1275,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
         )
         raise
     # Acknowledgment boundary. The destination save above is the last await
-    # before this fork is answered, and it takes the DESTINATION's history lock
+    # before the acknowledgment check below, and it takes the DESTINATION's history lock
     # -- nothing in it serialises against the SOURCE's permanent delete. So a
     # delete that began after the pre-copy probe passed can commit inside that
     # await, and the copy now on disk is a conversation the user has since
@@ -1039,12 +1290,13 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     # Acknowledgment is the only boundary a handler owns, so it is the line
     # drawn here.
     if session_was_deleted(state, slot):
-        # Roll the destination back. It has been neither acknowledged nor
-        # broadcast (``push_slots_update`` is below, and every ``append`` above
-        # passed ``broadcast=False``), so nothing outside this handler has seen
-        # it: removing it leaves no trace of the deleted conversation instead of
-        # a fresh key holding a full copy. Removing the destination cannot harm
-        # the source -- different key, different lock -- so a false positive
+        # Roll the destination back. It has not been acknowledged, and no
+        # message of it was broadcast (every ``append`` above passed
+        # ``broadcast=False``). Its sidebar row went out when the mint block
+        # exited, so the rollback pushes the slot list again to take that row
+        # back. Removing it leaves no trace of the deleted conversation instead
+        # of a fresh key holding a full copy. Removing the destination cannot
+        # harm the source -- different key, different lock -- so a false positive
         # here (``session_was_deleted`` fails CLOSED when a stat or metadata
         # read is unverifiable) costs a retryable 409 against a still-live
         # source, not data.
@@ -1064,7 +1316,9 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                     new_slot.key,
                     exc_info=True,
                 )
-        state._slots.pop(new_slot.key, None)
+        # The record is already gone, or it holds the copy and is kept; the
+        # withdrawal takes the slot, its restricted key and its carrier.
+        await _withdraw_fork_child(state, new_slot, announced=True)
         if removed:
             logger.warning(
                 "chat_fork: source slot=%s was permanently deleted during the "
@@ -1085,8 +1339,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 new_slot.key,
             )
         sel().log_api_access(
-            caller=request_app or "dashboard",
-            operation="chat.slot_fork",
+            caller=audit_caller,
+            operation=audit_operation,
             outcome="denied",
             source="dashboard",
             resources=(
@@ -1103,8 +1357,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             status=409,
         )
     sel().log_api_access(
-        caller=request_app or "dashboard",
-        operation="chat.slot_fork",
+        caller=audit_caller,
+        operation=audit_operation,
         outcome="allowed",
         source="dashboard",
         resources=(
@@ -1116,19 +1370,26 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             f"memory_mode={new_slot.memory_mode}"
         ),
     )
+    if reveal_folder and new_slot.folder_id:
+        # Model-B un-hide, as create and resume do: a child filed into a hidden
+        # folder (inherited from the parent, or named by ``stamp``) would be a
+        # session the sidebar hides by construction. The agent route asks for
+        # it only for a folder the agent named. It runs only past the
+        # acknowledgment boundary, so a refused fork leaves the user's choice
+        # alone, and before the push below, so the frame that announces the
+        # child already shows its folder. Best-effort: the child is saved and
+        # acknowledged, so a folder-store failure must not fail the fork and
+        # invite a retry that makes a duplicate.
+        try:
+            await _unhide_folder(state, new_slot.folder_id)
+        except Exception:
+            logger.warning(
+                "chat_fork: fork %s committed but un-hiding folder %s failed",
+                new_slot.key,
+                new_slot.folder_id,
+                exc_info=True,
+            )
     _sync_dashboard_slots(state)
     state.push_slots_update()
-    return web.json_response(
-        {
-            "ok": True,
-            "key": new_slot.key,
-            "title": new_slot.title,
-            "messages": len(visible),
-            "prompt": prompt,
-            "folder_id": new_slot.folder_id or None,
-            "direction": direction,
-            # The mode the child was born with (always the parent's), so the tab
-            # can render the incognito/temporary badge before the slots refresh.
-            "memory_mode": new_slot.memory_mode,
-        }
-    )
+    _schedule_fork_title(state, new_slot)
+    return ForkResult(slot=new_slot, messages=len(visible), direction=direction)

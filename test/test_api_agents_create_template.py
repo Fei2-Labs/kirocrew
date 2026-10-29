@@ -63,6 +63,7 @@ def _fake_config():
         degraded_sections=frozenset(),
         agents={},
         memory_stores={},
+        workspaces={},
         default_agent="kirocrew",
         save=lambda: saved.append(True),
         saved=saved,
@@ -229,6 +230,35 @@ class TestExplicitTemplateStillWorks:
         assert data["ok"] is True
         assert cfg.written["doc"]["agents"]["researcher"]["kiro_agent"] == "kirocrew"
         assert cfg.written["doc"]["agents"]["researcher"]["workspace"] == "research"
+        # Naming a workspace is a reuse: stored as given, no entry of its own.
+        assert "workspaces" not in cfg.written["doc"]
+
+    @pytest.mark.asyncio
+    async def test_a_template_of_the_crews_own_name_is_refused(self):
+        """Its own file is resolved under its name, so the copy would be skipped."""
+        cfg = _fake_config()
+        status, data = await _post(
+            {"name": "release-bot", "kiro_agent": "release-bot"},
+            cfg,
+            installed=("kirocrew", "release-bot"),
+        )
+        assert (status, data["code"]) == (409, "template_name_in_use")
+        assert cfg.saved == []
+
+    @pytest.mark.asyncio
+    async def test_a_user_level_agent_of_the_crews_name_is_refused(self, monkeypatch):
+        """The crewmate would be bound to that agent, which wins over its own copy."""
+        monkeypatch.setattr(
+            "kiro_crew.mate_config.user_agent_named", lambda name: name == "release-bot"
+        )
+        cfg = _fake_config()
+        status, data = await _post(
+            {"name": "release-bot", "kiro_agent": "kirocrew"},
+            cfg,
+            installed=("kirocrew", "release-bot"),
+        )
+        assert (status, data["code"]) == (409, "template_name_in_use")
+        assert cfg.saved == []
 
     @pytest.mark.asyncio
     async def test_listed_template_creates_without_warning(self, caplog):
@@ -259,3 +289,92 @@ class TestMissingTemplateWarnsButCreates:
         # …but the substitution risk is on the record rather than silent.
         assert "not in the installed agent listing" in caplog.text
         assert "not-installed" in caplog.text
+
+
+class TestFirstGreetingOwed:
+    """``first_greeting`` on the create records the crewmate's opening question.
+
+    The record is what lets ``POST /api/members/{slug}/greet`` start a
+    crewmate's first turn at all (``mate_welcome.NOT_OWED`` otherwise), so a
+    create without the flag must never write it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_flagged_create_marks_a_goal_welcome_owed_under_its_member_id(self):
+        from kiro_crew.members import WELCOME_KIND_GOAL, member_slug
+
+        cfg = _fake_config()
+        marked: list[tuple[str, str, str]] = []
+
+        def record(name, *, config=None, kind=""):
+            marked.append((name, kind, member_slug(name, config)))
+            return True
+
+        with patch("kiro_crew.members.mark_welcome_owed", new=record):
+            status, data = await _post(
+                {"name": "scout", "kiro_agent": "kirocrew", "first_greeting": True},
+                cfg,
+                installed=("kirocrew",),
+            )
+        assert status == 200
+        assert data["member_id"]
+        assert marked == [("scout", WELCOME_KIND_GOAL, data["member_id"])]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flag", [None, False, "true", 1])
+    async def test_a_create_without_the_flag_owes_nothing(self, flag):
+        cfg = _fake_config()
+        marked: list[str] = []
+        body = {"name": "scout", "kiro_agent": "kirocrew"}
+        if flag is not None:
+            body["first_greeting"] = flag
+
+        def record(name, *, config=None, kind=""):
+            marked.append(name)
+            return True
+
+        with patch("kiro_crew.members.mark_welcome_owed", new=record):
+            status, _ = await _post(body, cfg, installed=("kirocrew",))
+        assert status == 200
+        assert marked == []
+
+
+class TestApprovalModeOnCreate:
+    """``approval_mode`` on the create is written in the create's one write.
+
+    An unset mode opens the crewmate's thread in trust
+    (``MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE``), so a caller that pins a tighter
+    mode must never leave a record that exists, even briefly, without it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", ["normal", "trust_reads", "trust"])
+    async def test_a_pinned_mode_lands_in_the_single_create_write(self, mode):
+        cfg = _fake_config()
+        status, _ = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew", "approval_mode": mode},
+            cfg,
+            installed=("kirocrew",),
+        )
+        assert status == 200
+        assert cfg.saved == [True]
+        assert cfg.written["doc"]["agents"]["scout"]["approval_mode"] == mode
+
+    @pytest.mark.asyncio
+    async def test_an_absent_mode_stays_unset(self):
+        cfg = _fake_config()
+        status, _ = await _post({"name": "scout", "kiro_agent": "kirocrew"}, cfg)
+        assert status == 200
+        assert cfg.written["doc"]["agents"]["scout"].get("approval_mode", "") == ""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["yolo", "", "Normal", None, 1, ["normal"]])
+    async def test_an_unknown_mode_is_refused_before_any_write(self, bad):
+        cfg = _fake_config()
+        status, data = await _post(
+            {"name": "scout", "kiro_agent": "kirocrew", "approval_mode": bad}, cfg
+        )
+        assert status == 400
+        assert data["code"] == "invalid_approval_mode"
+        assert cfg.saved == []
+        assert cfg.agents == {}

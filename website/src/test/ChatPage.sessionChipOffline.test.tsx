@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 /** Props the stubbed transcript last received, for asserting what ChatPage passes. */
 const lastAssistantProps: { sessions?: ReadonlyMap<string, string> } = {}
 import { render, screen, fireEvent, act } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -20,6 +20,8 @@ import { Provider } from 'react-redux'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { createTestStore } from './helpers'
 import { ThemeProvider } from '../hooks/useTheme'
+import i18next from 'i18next'
+import { initI18n } from '../i18n/all'
 
 // Stub AssistantMessage: expose onOpenDiff as clickable buttons.
 // Button fires with original === modified (the no-op case).
@@ -71,6 +73,7 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(),
+      retainRange: vi.fn(),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
       bottomSentinelRef: { current: null },
@@ -110,7 +113,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -141,8 +145,9 @@ const SLOT_A = { key: 'chat-1', title: 'one', messages: 1, running: false, mode:
 const SLOT_B = { key: 'chat-2', title: 'two', messages: 1, running: false, mode: '', created: '', last_ts: '' }
 /** A surface ChatPage does not render, so it must never reach the chip roster. */
 const SLOT_DC = { key: 'chat-99-1700000000', title: 'dc-run', messages: 1, running: false, mode: 'design-critique', created: '', last_ts: '' }
-/** `orchestrator` IS a chat surface, so it pins the filter against over-narrowing. */
-const SLOT_ORCH = { key: 'chat-77-1700000001', title: 'autopilot run', messages: 1, running: false, mode: 'orchestrator', created: '', last_ts: '' }
+/** A legacy Autopilot slot (retired `orchestrator` mode) still renders as an
+ *  ordinary chat, so it pins the filter against over-narrowing. */
+const SLOT_LEGACY_AUTOPILOT = { key: 'chat-77-1700000001', title: 'legacy run', messages: 1, running: false, mode: 'orchestrator', created: '', last_ts: '' }
 
 const renderChatPage = (connected: boolean, extraSlots: typeof SLOT_A[] = []) => {
   const allSlots = [SLOT_A, SLOT_B, ...extraSlots]
@@ -276,22 +281,59 @@ describe('chip roster carries only surfaces ChatPage can show', () => {
     expect(lastAssistantProps.sessions?.has(SLOT_DC.key)).toBe(false)
   })
 
-  it('keeps an autopilot session, so the filter is not simply narrowed to the default', async () => {
+  it('keeps a legacy Autopilot slot, so the filter is not simply narrowed to the default', async () => {
     // Positive control: excluding every non-empty surface would pass the test
-    // above while silently dropping two surfaces the chat view does show.
-    const { store } = renderChatPage(true, [SLOT_ORCH])
+    // above while silently dropping a legacy Autopilot slot the chat view does show.
+    const { store } = renderChatPage(true, [SLOT_LEGACY_AUTOPILOT])
     seedMessage(store)
     await screen.findByTestId('chip')
 
-    expect(lastAssistantProps.sessions?.has(SLOT_ORCH.key)).toBe(true)
+    expect(lastAssistantProps.sessions?.has(SLOT_LEGACY_AUTOPILOT.key)).toBe(true)
+  })
+})
+
+describe('chip roster names an untitled session in the active language (#23059)', () => {
+  const SLOT_UNTITLED = { key: 'chat-9-1785440411', title: '', messages: 1, running: false, mode: '', created: '', last_ts: '' }
+
+  beforeEach(async () => {
+    vi.clearAllMocks()
+    await initI18n()
+    await i18next.changeLanguage('en')
+  })
+
+  it('rebuilds the "Untitled session" label after a language switch, with no slot change', async () => {
+    const { store } = renderChatPage(true, [SLOT_UNTITLED])
+    seedMessage(store)
+    await screen.findByTestId('chip')
+    expect(lastAssistantProps.sessions?.get(SLOT_UNTITLED.key)).toBe('Untitled session')
+
+    await act(async () => { await i18next.changeLanguage('ja') })
+    const ja = i18next.t('pages.artifactDetailPage.untitled_session')
+    expect(ja).not.toBe('Untitled session')
+    expect(lastAssistantProps.sessions?.get(SLOT_UNTITLED.key)).toBe(ja)
+
+    await act(async () => { await i18next.changeLanguage('en') })
   })
 })
 
 describe('one session-entry path', () => {
   // A SOURCE guard: the two callees were behaviourally identical, so only the
   // structure can distinguish the collapsed form from the duplicated one.
-  const pageSource = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8')
   const sessionSource = readFileSync(join(__dirname, '..', 'pages', 'chat', 'useChatPageSessionController.ts'), 'utf-8')
+  // The page's owners (pages/chat/page/) are scanned too, so neither absence
+  // below can be escaped by moving code out of ChatPage.tsx.
+  const ownerSources = [
+    ...readdirSync(join(__dirname, '..', 'pages', 'chat', 'page'))
+      .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+      .sort()
+      .map(f => readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', f), 'utf-8')),
+    ...readdirSync(join(__dirname, '..', 'pages'))
+      .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
+      .sort()
+      .map(f => readFileSync(join(__dirname, '..', 'pages', f), 'utf-8')),
+  ]
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const pageSource = [readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf-8'), ...ownerSources].join('\n')
 
   it('routes the in-message chip through the shared switch callee', () => {
     expect(pageSource).toContain('onSessionOpen={selectSessionTab}')
@@ -301,11 +343,13 @@ describe('one session-entry path', () => {
     // The duplicate would diverge the first time either side gained a side effect.
     expect(pageSource).not.toContain('handleSessionOpen')
     expect(sessionSource).not.toContain('handleSessionOpen')
+    for (const src of ownerSources) expect(src).not.toContain('handleSessionOpen')
   })
 
   it('declares the shared callee exactly once', () => {
     // The callee is owned by the session controller; the page only receives it.
     expect(sessionSource.match(/const selectSessionTab = useCallback/g)).toHaveLength(1)
     expect(pageSource).not.toContain('const selectSessionTab = useCallback')
+    for (const src of ownerSources) expect(src).not.toContain('const selectSessionTab = useCallback')
   })
 })

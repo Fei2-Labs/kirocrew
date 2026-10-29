@@ -46,7 +46,10 @@ permissions:
   id-token: write
 
 concurrency:
-  group: fork-internal-content-scan-${{ github.event.workflow_run.head_sha }}
+  # The upstream run id is immutable across attempts and unique per trigger.
+  # Unlike repository/ref text, it cannot collide under GitHub's
+  # case-insensitive concurrency comparison or exceed the group length limit.
+  group: fork-internal-content-scan-${{ github.event.workflow_run.id }}
   cancel-in-progress: true
 
 jobs:
@@ -63,7 +66,7 @@ jobs:
       # MUST be first. STS + S3 for the ruleset, GitHub for the diff and the
       # check-run, PyPI for the engine's single dependency. Nothing else.
       - name: Harden runner (egress allowlist)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           disable-telemetry: true
           egress-policy: block
@@ -295,7 +298,7 @@ jobs:
             exit 1
           fi
 
-      - uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.KIRO_RELEASE_GATE_ROLE_ARN }}
           aws-region: us-west-2
@@ -373,7 +376,7 @@ jobs:
               if gh api --method PATCH "repos/$REPO/check-runs/$1" \
                 -f status="completed" -f conclusion="$2" \
                 -f "output[title]=Internal Content Scan — $3" \
-                -f "output[summary]=$summary" >/dev/null 2>&1; then
+                -f "output[summary]=$summary" >/dev/null; then
                 return 0
               fi
               sleep 5
@@ -397,8 +400,8 @@ jobs:
             fi
             gh api --method POST "repos/$REPO/check-runs" \
               -f name="Internal Content Scan" -f head_sha="$HEAD" \
-              -f status="completed" -f conclusion="failure" "${ext_args[@]}" \
+              -f status="completed" -f conclusion="failure" ${ext_args[@]+"${ext_args[@]}"} \
               -f details_url="$GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID" \
               -f "output[title]=Internal Content Scan — could not run" \
-              -f "output[summary]=$summary" >/dev/null 2>&1 || true
+              -f "output[summary]=$summary" >/dev/null || true
           fi

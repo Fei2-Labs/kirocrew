@@ -172,3 +172,52 @@ class TestKeepaliveHandler:
         resp = await api_session_keepalive(request)
 
         assert resp.status == 200
+
+
+class TestActivityClockSeparation:
+    """The runtime activity clock and ``last_used`` answer different questions.
+
+    ``touch_activity()`` refreshes the ACP child's ``_last_activity``, which
+    ``is_responsive()`` reads to decide whether that process has gone silent.
+    ``_expire_idle`` reads ``last_used``. Both directions are pinned so a change
+    cannot quietly point the sweep at responsiveness: a live-but-quiet runtime
+    would then never be reaped, and a session doing work over a slow runtime
+    would be reaped while it is still wanted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_runtime_activity_does_not_protect_a_released_session(self, cfg) -> None:
+        """A quiet session is reaped even while its runtime reports responsive."""
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+        provider = mgr._sessions["thread1"].provider
+        provider._last_activity = time.monotonic()
+        provider.is_responsive = lambda stale_threshold=600.0: True
+        async with mgr._lock:
+            mgr._sessions["thread1"].last_used = time.monotonic() - 10_000
+
+        await mgr._expire_idle(timeout_secs=1)
+
+        assert mgr.count == 0, "the runtime activity clock kept a quiet session alive"
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_a_silent_runtime_does_not_reap_a_session_that_is_not_idle(self, cfg) -> None:
+        """A fresh ``last_used`` survives, whatever the runtime clock says.
+
+        The stall watchdog owns the silent-runtime case and cancels the turn;
+        the idle sweep must not also act on it, or one slow runtime costs the
+        session its whole conversation.
+        """
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        await mgr.get_or_create("thread1")
+        mgr.release("thread1")
+        provider = mgr._sessions["thread1"].provider
+        provider._last_activity = time.monotonic() - 10_000
+        provider.is_responsive = lambda stale_threshold=600.0: False
+
+        await mgr._expire_idle(timeout_secs=1)
+
+        assert "thread1" in mgr._sessions, "the idle sweep reaped on the responsiveness clock"
+        await mgr.close_all()

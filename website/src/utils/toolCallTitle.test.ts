@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import {
   backendShellDescription,
   classifyToolCall,
+  declaredMcpToolTitle,
   deriveToolCallTitle,
   formatRawCommand,
   humanizeToolName,
@@ -150,6 +151,15 @@ describe('humanizeToolName', () => {
   })
 })
 
+describe('declaredMcpToolTitle', () => {
+  it('reads the server-keyed table and only its own properties', () => {
+    expect(declaredMcpToolTitle('kirocrew-dashboard', 'session_send')).toBe('Send to session')
+    expect(declaredMcpToolTitle('other-mcp', 'session_send')).toBeUndefined()
+    expect(declaredMcpToolTitle('kirocrew-core', 'constructor')).toBeUndefined()
+    expect(declaredMcpToolTitle('__proto__', 'toString')).toBeUndefined()
+  })
+})
+
 describe('formatRawCommand', () => {
   it('keeps a short single line verbatim', () => {
     expect(formatRawCommand('ls -la')).toBe('ls -la')
@@ -183,6 +193,23 @@ describe('deriveToolCallTitle rawTitle', () => {
   it('keeps the incoming title for a non-shell call', () => {
     const d = deriveToolCallTitle({ kind: 'other', title: '@kirocrew-core/session_send', rawInput: { target: 'x' } })
     expect(d.rawTitle).toBe('@kirocrew-core/session_send')
+  })
+})
+
+describe('deriveToolCallTitle shell identity', () => {
+  it.each<{ name: string; input: ToolCallTitleInput; shell: boolean; kind: string; rawTitle: string }>([
+    { name: 'classified read', input: { kind: 'execute', rawInput: { command: 'cat a.ts' } }, shell: true, kind: 'read', rawTitle: 'cat a.ts' },
+    { name: 'classified search pipeline', input: { kind: 'execute', rawInput: { command: 'rg x src | head -20' } }, shell: true, kind: 'search', rawTitle: 'rg x src | head -20' },
+    { name: 'shell tool name without a kind', input: { toolName: 'shell', rawInput: { command: 'ls src' } }, shell: true, kind: 'read', rawTitle: 'ls src' },
+    { name: 'live Running title with unknown kind', input: { kind: 'unknown', title: 'Running: rg x src | head -20' }, shell: true, kind: 'search', rawTitle: 'rg x src | head -20' },
+    { name: 'backend description', input: { kind: 'execute', title: 'Read the source file', rawInput: { command: 'cat a.ts' } }, shell: true, kind: 'read', rawTitle: 'cat a.ts' },
+    { name: 'unclassified shell command', input: { kind: 'execute', rawInput: { command: 'node app.js' } }, shell: true, kind: 'execute', rawTitle: 'node app.js' },
+    { name: 'native read', input: { toolName: 'fs_read', kind: 'read', title: 'Reading a.ts', rawInput: { path: 'a.ts' } }, shell: false, kind: 'read', rawTitle: 'Reading a.ts' },
+    { name: 'live MCP title', input: { kind: 'unknown', title: 'Running: @kirocrew-core/session_send', rawInput: { target: 'x' } }, shell: false, kind: 'other', rawTitle: 'Running: @kirocrew-core/session_send' },
+    { name: 'non-shell fallback', input: { title: 'Inspect the workspace' }, shell: false, kind: 'other', rawTitle: 'Inspect the workspace' },
+    { name: 'shell stub without a command', input: { kind: 'execute', title: 'shell' }, shell: false, kind: 'execute', rawTitle: 'shell' },
+  ])('$name', ({ input, shell, kind, rawTitle }) => {
+    expect(deriveToolCallTitle(input)).toMatchObject({ shell, kind, rawTitle })
   })
 })
 

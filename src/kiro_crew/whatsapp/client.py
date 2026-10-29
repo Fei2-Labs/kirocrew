@@ -12,9 +12,10 @@ Pairing state machine (read by the Settings badge + QR flow):
     connected -> logged_out (phone revoked the link; needs a fresh pairing)
     connected -> banned (WhatsApp temporary ban; reason surfaced verbatim)
 
-The session database (whatsmeow's sqlite store) lives at
-``<data home>/whatsapp/session.db`` unless ``whatsapp.db_path`` overrides it.
-Deleting the file unpairs the device from this side.
+The session database (whatsmeow's sqlite store) always lives at
+``<data home>/whatsapp/session.db`` (:func:`default_db_path`); the
+``whatsapp.db_path`` setting is read-only and does not move it. Deleting the
+file unpairs the device from this side.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ logger = logging.getLogger(__name__)
 MISSING_EXTRA_HINT = (
     f"The WhatsApp channel needs its optional dependency: {extras.install_hint('whatsapp')}"
 )
+# What Settings shows for the same gap (see extras.missing_at_start_status).
+MISSING_EXTRA_STATUS = extras.missing_at_start_status("neonize")
 
 STATE_UNPAIRED = "unpaired"
 STATE_PAIRING = "pairing"
@@ -116,8 +119,8 @@ def _wav_seconds(data: bytes) -> int:
     WhatsApp draws a voice note's duration from ``AudioMessage.seconds`` and
     labels it ``0:00`` without one. neonize derives that figure by shelling out to
     ``ffmpeg``, which this channel cannot require, so the one container the
-    bundled speech synthesis emits is read from its own header instead: Piper
-    writes PCM WAV, and frames divided by the frame rate is the whole answer.
+    bundled speech synthesis emits is read from its own header instead: the
+    system engine writes PCM WAV, and frames divided by the frame rate is the whole answer.
     Any other container (a Polly MP3) answers 0, which costs the label alone.
 
     A header parse over an in-memory buffer, so it holds no descriptor and does

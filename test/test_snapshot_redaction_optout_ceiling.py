@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
+from test_snapshot import snapshot_family_source
 
 from kiro_crew import security
 from kiro_crew import snapshot as snap
@@ -79,7 +80,7 @@ class TestTheSwitchIsBeyondTheAgentsReach:
         must carry no enable field so there is only one place the thing can be switched.
         """
         assert not hasattr(KiroCrewConfig, "redact_backup_uploads")
-        assert "redact_backup_uploads" not in inspect.getsource(snap)
+        assert "redact_backup_uploads" not in snapshot_family_source()
 
 
 class TestTheDefaultNeedsNoFile:

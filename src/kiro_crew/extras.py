@@ -38,11 +38,11 @@ from kiro_crew import platform_compat
 REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "otlp": ("opentelemetry-exporter-otlp-proto-http==1.44.0",),
     "perf": ("py-spy>=0.3,<1",),
-    "teams": ("PyJWT[crypto]==2.13.0",),
+    "teams": ("PyJWT[crypto]==2.15.0",),
     "whatsapp": ("neonize==0.4.3.post0",),
     "feishu": ("lark-oapi>=1.4,<2",),
-    "voice-aws": ("boto3>=1.34,<2", "amazon-transcribe>=0.6,<1"),
-    "voice": ("boto3>=1.34,<2", "amazon-transcribe>=0.6,<1", "pywhispercpp>=1.5,<2"),
+    "voice-aws": ("boto3>=1.34,<2", "amazon-transcribe>=0.6.3,<1"),
+    "voice": ("boto3>=1.34,<2", "amazon-transcribe>=0.6.3,<1", "pywhispercpp>=1.5,<2"),
 }
 
 
@@ -93,6 +93,18 @@ def install_hint(extra: str) -> str:
     if not reqs:
         return ""
     return "pip install " + " ".join(quote_spec(r) for r in reqs)
+
+
+def missing_at_start_status(package: str) -> str:
+    """A channel's Settings ``connect_error`` when *package* was missing at start.
+
+    Carries no install command. The panel's optional-SDK card shows the command
+    for THIS gateway's interpreter while the package is missing, and a bare
+    ``pip`` here could name another environment. The text must also stay true
+    after the user installs the package: ``connect_error`` keeps it until the
+    next start, so it names the restart that loads the package.
+    """
+    return f"The gateway started without {package}. Restart it once {package} is installed."
 
 
 def pip_install_command(extra: str) -> str:

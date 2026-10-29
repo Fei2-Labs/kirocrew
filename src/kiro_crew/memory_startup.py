@@ -114,6 +114,15 @@ def require_memory_prepared() -> None:
         )
 
 
+def memory_prepared() -> bool:
+    """Whether :func:`require_memory_prepared` admits the caller now, without raising."""
+    try:
+        require_memory_prepared()
+    except MemoryStartupUnavailable:
+        return False
+    return True
+
+
 async def wait_for_memory_preparation(task: asyncio.Future | None) -> None:
     """Give one turn a short grace period without cancelling shared recovery."""
     with _lock:
@@ -130,6 +139,17 @@ async def wait_for_memory_preparation(task: asyncio.Future | None) -> None:
     # A completed worker may have recorded a structural failure rather than
     # opened memory. Store-specific failures are checked by the selected store.
     require_memory_prepared()
+
+
+def memory_startup_preparing() -> bool:
+    """Is this process's memory startup still preparing? Never raises.
+
+    False when no startup runs in this process (the CLI), once it is ready, and
+    once it failed or stopped: :func:`require_memory_prepared` tells those apart.
+    """
+    with _lock:
+        startup = _active
+        return startup is not None and not (startup.error or startup.stopped or startup.ready)
 
 
 def memory_store_startup_error(store: str = DEFAULT_MEMORY_STORE) -> str:

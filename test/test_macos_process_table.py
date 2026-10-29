@@ -31,6 +31,10 @@ def _force_posix_ps_branch(monkeypatch):
     monkeypatch.setattr(rt.sys, "platform", "darwin")
     monkeypatch.setattr(rt.platform_compat, "IS_WINDOWS", False)
     monkeypatch.setattr(rt.platform_compat, "trusted_system_bin", lambda name: f"/bin/{name}")
+    # These pin the ps snapshot's contract, so every pid is measured by its ps
+    # RSS. On a real Mac the footprint reader would otherwise answer for any
+    # same-uid pid the fake table happens to name.
+    monkeypatch.setattr(rt.platform_compat, "proc_phys_footprint_bytes_for_pid", lambda pid: None)
     rt._reset_ps_table_cache()
     yield
     rt._reset_ps_table_cache()

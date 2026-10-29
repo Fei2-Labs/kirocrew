@@ -1,5 +1,18 @@
 import { defineConfig, devices } from '@playwright/test'
 
+// Specs that need the WebKit engine (mobile-Safari-only behaviour). They are
+// owned by the opt-in `webkit-mobile` project below and IGNORED by `chromium`,
+// so the default run never collects them: the E2E gate installs Chromium only
+// (`npx playwright install chromium`), its darkening floor counts a skip as a
+// failure, and a fork pull request cannot change the workflow to install a
+// second engine. Run them locally with PLAYWRIGHT_RUN_WEBKIT=1 after
+// `npx playwright install webkit` (on a host Playwright's WebKit does not
+// support, the `mcr.microsoft.com/playwright:<version>-noble` image with
+// `--network host` reaches a gateway on the host).
+const WEBKIT_SPECS = /\.webkit\.spec\.ts$/
+const RUN_WEBKIT = process.env.PLAYWRIGHT_RUN_WEBKIT === '1'
+const STORAGE_STATE = process.env.PLAYWRIGHT_STORAGE_STATE || 'playwright/.auth/state.json'
+
 export default defineConfig({
   testDir: './playwright',
   // Dedicated gateways isolate artifacts by scenario; the shared suite keeps its default.
@@ -8,6 +21,10 @@ export default defineConfig({
     : undefined,
   fullyParallel: true, // Enable parallel execution
   forbidOnly: !!process.env.CI,
+  // Retries DETECT a flaky spec; they never fix one (docs/ci/e2e-gate.md). A spec
+  // that passes only on a retry is reported as flaky, and MAX_FLAKY_SPECS = 0 in
+  // test/test_playwright_e2e.py fails the gate naming it: that ceiling is the one
+  // place the flaky policy lives.
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined, // Use default workers (parallel) except in CI
   reporter: process.env.CI ? 'html' : 'list', // 'list' shows test names as they run
@@ -69,12 +86,29 @@ export default defineConfig({
     { name: 'setup', testMatch: /auth\.setup\.ts/ },
     {
       name: 'chromium',
+      testIgnore: WEBKIT_SPECS,
       use: {
         ...devices['Desktop Chrome'],
-        storageState: process.env.PLAYWRIGHT_STORAGE_STATE || 'playwright/.auth/state.json',
+        storageState: STORAGE_STATE,
       },
       dependencies: ['setup'],
     },
+    // Opt-in. iPhone emulation on Playwright's WebKit (isMobile + touch), the
+    // engine the mobile tab-return fix targets. Reuses the same session cookie
+    // the setup project persisted -- storage state is engine-independent.
+    ...(RUN_WEBKIT
+      ? [
+          {
+            name: 'webkit-mobile',
+            testMatch: WEBKIT_SPECS,
+            use: {
+              ...devices['iPhone 13'],
+              storageState: STORAGE_STATE,
+            },
+            dependencies: ['setup'],
+          },
+        ]
+      : []),
   ],
 
   // Note: Make sure kirocrew gateway is running on port 5476 before running tests

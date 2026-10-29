@@ -4,40 +4,40 @@ const fs = require("fs");
 const path = require("path");
 
 const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
-const { createRendererRecovery } = require("./renderer-recovery");
+const { createRendererRecovery, withSafeReload, hasSafeReload } = require("./renderer-recovery");
+const { createRendererExhaustedNotice } = require("./renderer-exhausted-notice");
 const { createHangRecovery } = require("./hang-recovery");
 const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-history");
+const { armSwipeHistory, browserPanelUnderCursor } = require("./swipe-history");
 const { hideToTray, cancelPendingTrayHide, shouldKeepAppHidden } = require("./hide-to-tray");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
+const { menuBarCanOverlap } = require("./fullscreen-top-reserve");
 const {
   watchFullScreenTransitions,
   repairStalledFullScreenExit,
 } = require("./fullscreen-transition-watch");
-const { createDisplayMediaHandler } = require("./display-media");
-const { applyFocusModeChrome } = require("./focus-chrome");
-const {
-  createPermissionRequestHandler,
-  createPermissionCheckHandler,
-} = require("./permission-handler");
-const { createWindowOpenHandler, openExternalSafely } = require("./external-scheme");
-const { resolveThemeSource } = require("./native-theme");
+const { createWindowOpenHandler } = require("./external-scheme");
 const { sanitizeWindowState, captureWindowState } = require("./window-state");
-const { clampZoomFactor, stepZoomFactor } = require("./zoom");
-const { createBrowserViewManager, isUntrustedContents } = require("./browser-view");
-const { registerCaptureSurface, createCaptureTrust } = require("./capture-trust");
-const {
-  canAgentControl,
-  isLoopbackUrl,
-  mayBootstrapView,
-  createControlPlane,
-  OWNER,
-} = require("./browser-control");
-const { createBrowserOps } = require("./browser-ops");
+const { stepZoomFactor } = require("./zoom");
+const { registerCaptureSurface } = require("./capture-trust");
+const { isLoopbackUrl } = require("./browser-control");
 const { runAnnotateOp } = require("./browser-annotate");
-const { createAgentCommandChannel } = require("./browser-agent-channel");
 const { attachContextMenu } = require("./context-menu");
-const { validateRemoteSettings } = require("./validation");
-const { getRemoteHostConfig, setRemoteHostConfig } = require("./host-config");
+const {
+  TUNNEL_OPTION_LABEL,
+  parseRemoteCrewFields,
+  saveRemoteCrewConfig,
+  tunnelOptionHint,
+} = require("./remote-crew-setup");
+const {
+  getRemoteHostConfig,
+  getRemoteHostConfigForUrl,
+  getRemoteHostDefaultNameForUrl,
+  isSelectablePort,
+  retireLegacyEmptyPortHost,
+  setRemoteHostConfig,
+} = require("./host-config");
+const { defaultedPort, portIsSchemeDefault } = require("./gateway-auth-hint");
 const { openPathHardened } = require("./open-path");
 const { DEFAULT_REMOTE_BIN, DEFAULT_REMOTE_PATH } = require("./remote-token");
 const { identityFamily } = require("./instance-guard");
@@ -45,8 +45,6 @@ const { decideLinuxFrame, applyWindowControl } = require("./linux-frame");
 const { buildMenuTemplate } = require("./app-menu");
 const { serializeMenuItems, executeMenuItem } = require("./windows-menu-model");
 const {
-  paintTitleBarOverlay,
-  paintAllTitleBarOverlays,
   SYMBOL_DARK: WINDOWS_TITLEBAR_SYMBOL_DARK,
   SYMBOL_LIGHT: WINDOWS_TITLEBAR_SYMBOL_LIGHT,
   OVERLAY_BACKGROUND: WINDOWS_TITLEBAR_BACKGROUND,
@@ -56,13 +54,28 @@ const { attachPaneAssetJournal } = require("./pane-asset-journal");
 const { createMemoryWatchLog } = require("./memory-watch-log");
 const { createCageTrace } = require("./cage-trace");
 const { profilingEnabled } = require("./perf-metrics");
+const {
+  HEADER_CSS_PX,
+  trafficLightPositionForZoom,
+  createWindowChrome,
+} = require("./runtime/window/chrome");
+const { createWindowPrompts } = require("./runtime/window/prompts");
+const { createSessionSecurity } = require("./runtime/window/session-security");
+const { injectLinuxCaptionControls } = require("./runtime/window/linux-captions");
+const { wireWillDownloadOnce } = require("./download-handler");
+const { attachBrowserPanels, dispatchBrowserOp } = require("./runtime/window/browser-panels");
 
 const BROWSER_PARTITION = "persist:kirocrew-browser";
-const HEADER_CSS_PX = 42;
-const TRAFFIC_LIGHT_NATIVE_H = 12;
-const TRAFFIC_LIGHT_Y_NUDGE = -4;
 const FULLSCREEN_SETTLE_MS = [250, 1500];
 const DASHBOARD_SETTLE_MS = 1500;
+// A display rearrange (monitor hot-plug, or dragging the window to a screen
+// with a different backing scale factor) changes the window's content bounds,
+// but macOS reports the new geometry slightly AFTER the display event fires. An
+// immediate recompute plus bounded deferred passes settle the WebContentsView
+// onto the new scale — the same rationale as FULLSCREEN_SETTLE_MS. Without it
+// the child view keeps its old-scale bounds until the next resize/move/paint,
+// which surfaces as the dashboard briefly ghosting across both displays.
+const DISPLAY_SETTLE_MS = [0, 250, 1500];
 const WINDOW_SAVE_DEBOUNCE_MS = 400;
 const WINDOWS_TITLEBAR_MENU_IDS = new Set([
   "file-menu",
@@ -88,25 +101,36 @@ function createWindowLifecycle(options) {
     backendUrl,
     port,
     glog = () => {},
+    // The launch log's path, named in the dead-renderer error dialog so the
+    // user can attach it to a report.
+    logPath = () => "",
+    // Whether a dashboard document has finished loading in this run (the
+    // gpu-crash-fallback latch). Tells the dead-renderer dialog a renderer that
+    // never started from one that crashed later.
+    dashboardLoaded = () => false,
     readInternalSecret = () => "",
-    fetchLocalToken,
+    mintLocalToken,
     fetchRemoteToken,
     isQuitting = () => false,
     requestQuit,
     connectWindow,
-    // Optional. Absent, the tray renders exactly the pre-gateway-controls menu,
-    // so nothing here depends on a supervisor being wired in.
-    gatewayControls = null,
+    // Re-apply the launch port's managed-tunnel choice after a save here, so
+    // ticking or un-ticking it takes effect without a relaunch.
+    syncTunnel = () => {},
     platform = process.platform,
     env = process.env,
+    // Shared single-use registry of downloads the renderer explicitly asked
+    // for; passed to the will-download handler so only announced downloads
+    // auto-save (see download-expectations.js).
+    downloadExpectations = null,
   } = options || {};
 
   if (!electron) throw new Error("createWindowLifecycle: electron is required");
   if (!store) throw new Error("createWindowLifecycle: store is required");
   if (!backendUrl) throw new Error("createWindowLifecycle: backendUrl is required");
   if (!Number.isInteger(port)) throw new Error("createWindowLifecycle: port is required");
-  if (typeof fetchLocalToken !== "function") {
-    throw new Error("createWindowLifecycle: fetchLocalToken is required");
+  if (typeof mintLocalToken !== "function") {
+    throw new Error("createWindowLifecycle: mintLocalToken is required");
   }
   if (typeof fetchRemoteToken !== "function") {
     throw new Error("createWindowLifecycle: fetchRemoteToken is required");
@@ -150,10 +174,6 @@ function createWindowLifecycle(options) {
 
   let mainWindow = null;
   let tray = null;
-  // Assigned by createTray; a no-op before the tray exists.
-  let refreshTrayMenu = () => {};
-  let micDialogOpen = false;
-  let sessionSecurityConfigured = false;
   let appMenu = null;
   // The fullscreen-transition watch for the current main window. Its `pending()`
   // is what keeps a close-to-tray exit from abandoning a transition AppKit is
@@ -174,115 +194,48 @@ function createWindowLifecycle(options) {
     log: glog,
   });
 
-  async function getDashboardThemeVars() {
-    const win = BaseWindow.getFocusedWindow() || mainWindow;
-    if (!win || win.isDestroyed()) return null;
-    try {
-      return await win.webContents.executeJavaScript(`
-        (() => {
-          const s = getComputedStyle(document.documentElement);
-          return {
-            bg: s.getPropertyValue('--bg').trim(),
-            card: s.getPropertyValue('--card').trim(),
-            text: s.getPropertyValue('--text').trim(),
-            muted: s.getPropertyValue('--muted').trim(),
-            border: s.getPropertyValue('--border').trim(),
-            accent: s.getPropertyValue('--accent').trim(),
-            accentHover: s.getPropertyValue('--accent-hover').trim(),
-            bgAccent: s.getPropertyValue('--bg-accent').trim(),
-          };
-        })()
-      `);
-    } catch {
-      return null;
-    }
-  }
-
-  function modalCSSForMode(dark) {
-    return `* { margin:0; padding:0; box-sizing:border-box; }
-      body { font-family:-apple-system,sans-serif; padding:24px; background:${dark ? "#1e293b" : "#f8fafc"}; color:${dark ? "#e2e8f0" : "#1e293b"}; }
-      label { display:block; margin-bottom:8px; font-size:13px; color:${dark ? "#94a3b8" : "#64748b"}; }
-      input { width:100%; padding:10px; border-radius:6px; border:1px solid ${dark ? "#475569" : "#cbd5e1"};
-        background:${dark ? "#0f172a" : "#ffffff"}; color:${dark ? "#e2e8f0" : "#1e293b"}; font-size:14px; outline:none; margin-bottom:12px; }
-      input:focus { border-color:#f97316; }
-      .hint { font-size:11px; color:${dark ? "#64748b" : "#94a3b8"}; margin-bottom:12px; }
-      .row { display:flex; gap:8px; }
-      button { flex:1; padding:8px; border-radius:6px; border:none; cursor:pointer; font-size:13px; font-weight:600; }
-      .ok { background:#f97316; color:#fff; } .ok:hover { background:#ea580c; }
-      .cancel { background:${dark ? "#334155" : "#e2e8f0"}; color:${dark ? "#94a3b8" : "#475569"}; } .cancel:hover { background:${dark ? "#475569" : "#cbd5e1"}; }`;
-  }
-
-  function modalCSSFromVars(v) {
-    return `* { margin:0; padding:0; box-sizing:border-box; }
-      body { font-family:-apple-system,sans-serif; padding:24px; background:${v.bg}; color:${v.text}; }
-      label { display:block; margin-bottom:8px; font-size:13px; color:${v.muted}; }
-      input { width:100%; padding:10px; border-radius:6px; border:1px solid ${v.border};
-        background:${v.card}; color:${v.text}; font-size:14px; outline:none; margin-bottom:12px; }
-      input:focus { border-color:${v.accent}; }
-      .hint { font-size:11px; color:${v.muted}; margin-bottom:12px; }
-      .row { display:flex; gap:8px; }
-      button { flex:1; padding:8px; border-radius:6px; border:none; cursor:pointer; font-size:13px; font-weight:600; }
-      .ok { background:${v.accent}; color:#fff; } .ok:hover { background:${v.accentHover || v.accent}; }
-      .cancel { background:${v.bgAccent || v.card}; color:${v.muted}; } .cancel:hover { background:${v.border}; }`;
-  }
-
-  async function getModalCSS() {
-    const vars = await getDashboardThemeVars();
-    if (vars && vars.bg) return modalCSSFromVars(vars);
-    return modalCSSForMode(nativeTheme.shouldUseDarkColors);
-  }
-
-  // Reads the MODE PREFERENCE, not only the resolved mode. Setting themeSource
-  // to dark/light also overrides prefers-color-scheme in renderers; feeding the
-  // resolved value back would freeze the dashboard's Auto mode.
-  function syncNativeTheme(view, win) {
-    if (win.isDestroyed()) return;
-    view.webContents.executeJavaScript(
-      `JSON.stringify({`
-        + `pref: document.documentElement.dataset.modePref || "",`
-        + `mode: document.documentElement.dataset.mode || ""`
-        + `})`,
-    ).then((raw) => {
-      let pref = "";
-      let mode = "";
-      try {
-        const parsed = JSON.parse(raw);
-        pref = parsed.pref || "";
-        mode = parsed.mode || "";
-      } catch {
-        return;
-      }
-      nativeTheme.themeSource = resolveThemeSource(pref, mode);
-      if (mode === "dark" || mode === "light") updateWindowsTitleBarOverlay(win, mode);
-    }).catch(() => {});
-  }
-
-  function updateWindowsTitleBarOverlay(win, mode) {
-    if (!IS_WINDOWS) return;
-    const resolvedMode = mode || (nativeTheme.shouldUseDarkColors ? "dark" : "light");
-    paintTitleBarOverlay(win, resolvedMode, HEADER_CSS_PX);
-  }
-
-  function trafficLightPositionForZoom(zoomFactor) {
-    const stripPx = Math.round(HEADER_CSS_PX * zoomFactor);
-    return {
-      x: Math.round(16 * zoomFactor),
-      y: Math.max(
-        4,
-        Math.round((stripPx - TRAFFIC_LIGHT_NATIVE_H) / 2) + TRAFFIC_LIGHT_Y_NUDGE,
-      ),
-    };
-  }
-
-  function positionTrafficLights(win) {
-    if (!IS_MAC || !win || win.isDestroyed()) return;
-    try {
-      const zoom = win._mcView ? win._mcView.webContents.getZoomFactor() : 1;
-      win.setWindowButtonPosition(trafficLightPositionForZoom(zoom));
-    } catch {
-      // Window is mid-teardown.
-    }
-  }
+  // The cohesive owners this facade composes, in the order the process first
+  // needs them. Each receives only what it reads; window state stays here.
+  const {
+    syncNativeTheme,
+    positionTrafficLights,
+    reconcileZoomChrome,
+    trackZoomChrome,
+    setThemeAccent,
+    handleFocusMode,
+    handleWatchFocusCursor,
+    setThemeMode,
+    setTitlebarMode,
+    getZoom,
+    setZoom,
+    stepZoom,
+  } = createWindowChrome({
+    BaseWindow,
+    nativeTheme,
+    screen,
+    store,
+    log: glog,
+    isMac: IS_MAC,
+    isWindows: IS_WINDOWS,
+    windowForWebContents,
+  });
+  const { getModalCSS, promptConnectionPort, renameFocusedWindow } = createWindowPrompts({
+    BaseWindow,
+    BrowserWindow,
+    nativeTheme,
+    store,
+    getMainWindow: () => mainWindow,
+  });
+  const { configureSessionSecurity, handleMicDenied } = createSessionSecurity({
+    session,
+    webContents,
+    desktopCapturer,
+    systemPreferences,
+    dialog,
+    shell,
+    isMac: IS_MAC,
+    partition: BROWSER_PARTITION,
+  });
 
   // BaseWindow.fromWebContents does not exist. Match the dashboard view
   // explicitly so every window-scoped IPC action targets its sender's window.
@@ -305,66 +258,39 @@ function createWindowLifecycle(options) {
   // window must not read the primary's config). Shared by the host-presence
   // heartbeat and the wsl:detect sender gate so the two security decisions
   // cannot drift apart.
+  //
+  // The key comes from `defaultedPort`, not `URL.port`, because the URL API
+  // leaves a scheme's default port empty: on `http://localhost:80` the raw
+  // property is `""`, the lookup asks for `remoteHosts[""]`, misses, and a
+  // tunnelled crew reads as a gateway on this machine -- after which the
+  // heartbeat sends this machine's internal secret over that tunnel.
+  //
+  // The lookup goes through `getRemoteHostConfigForUrl` rather than the port
+  // alone so a crew an older version recorded UNDER that empty key still reads
+  // as remote. Resolving the key without honouring those records would turn a
+  // store that was safe by accident into the exposure above.
+  //
+  // The store is the single source of truth for the remote verdict. On a
+  // scheme-default port (:80/:443) the 'Set Remote Host…' Clear is REFUSED, so
+  // the record cannot be dropped from under a live `ssh -L` tunnel and a later
+  // default-port window still resolves REMOTE from the store. On a selectable
+  // port a Clear that removes the record is the user's own reconfiguration, and
+  // every window reads that same store, so no per-window latch is needed.
   function isGatewayLocalForWindow(win) {
     if (!win || win.isDestroyed() || !win._mcBackendUrl) return false;
     const url = win._mcBackendUrl;
-    return isLoopbackUrl(url) && !getRemoteHostConfig(store, new URL(url).port)?.host;
-  }
-
-  function syncLinuxMaximizeState(win, view) {
-    const push = () => {
-      if (win.isDestroyed() || view.webContents.isDestroyed()) return;
-      const maxed = win.isMaximized();
-      view.webContents.executeJavaScript(`
-        {
-          const wrap = document.getElementById('electron-linux-controls');
-          if (wrap) {
-            wrap.classList.toggle('is-maximized', ${maxed});
-            const b = wrap.querySelector('button.maximize');
-            if (b) b.setAttribute('aria-label', ${maxed} ? 'Restore' : 'Maximize');
-          }
-        }
-      `).catch(() => {});
-    };
-    // did-finish-load re-fires on reload. Window listeners must be armed once.
-    if (!win._mcLinuxMaximizeSyncArmed) {
-      win._mcLinuxMaximizeSyncArmed = true;
-      win.on("maximize", push);
-      win.on("unmaximize", push);
-    }
-    push();
-  }
-
-  function hardenBrowserPartition(sessionApi) {
-    const browserSession = sessionApi.fromPartition(BROWSER_PARTITION);
-    browserSession.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-    browserSession.setPermissionCheckHandler(() => false);
-    return browserSession;
-  }
-
-  function browserOpsFor(entry) {
-    if (entry._ops) return entry._ops;
-    entry._ops = createBrowserOps({
-      sendCommand: (method, params) => entry.control.send(method, params),
-      // The debugger object is stable for one WebContents, so this subscription
-      // survives attach/detach and its bounded console buffer persists.
-      subscribe: (handler) => {
-        const wc = entry.manager.getWebContents();
-        const dbg = wc && wc.debugger;
-        if (dbg && typeof dbg.on === "function") {
-          dbg.on("message", (_event, method, params) => handler(method, params));
-        }
-      },
-    });
-    return entry._ops;
-  }
-
-  async function dispatchBrowserOp(entry, op, args) {
-    return browserOpsFor(entry).run(op, args);
+    if (!isLoopbackUrl(url)) return false; // non-loopback: reached off-box, never local
+    // The store is the source of truth. A crew record under this URL's resolved
+    // key (including the legacy empty key) marks the window remote; its absence
+    // marks it local. On a scheme-default port the Clear is REFUSED, so the
+    // record cannot be dropped from under a live tunnel; on a selectable port a
+    // Clear that removes the record is the user's own reconfiguration, and a
+    // fresh window reads that same store, so no window-scoped latch is needed.
+    return !getRemoteHostConfigForUrl(store, url)?.host;
   }
 
   function setupWindowContents(win, windowBackendUrl) {
-    const windowPort = new URL(windowBackendUrl).port;
+    const windowPort = defaultedPort(windowBackendUrl);
     let customName = null;
 
     const view = new WebContentsView({
@@ -385,6 +311,13 @@ function createWindowLifecycle(options) {
     armSplashHistoryClear(view.webContents, {
       isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
       log: glog,
+    });
+    // Mouse software such as Logitech's Options sends Back/Forward to macOS apps
+    // as swipes; the dashboard, or the browser panel under the cursor, takes each
+    // as a history step.
+    armSwipeHistory(win, view.webContents, {
+      isAlive: () => !win.isDestroyed() && !view.webContents.isDestroyed(),
+      panelUnderCursor: () => browserPanelUnderCursor(win, screen.getCursorScreenPoint()),
     });
 
     // Teardown order is load-bearing: no command poller or CDP owner may outlive
@@ -412,20 +345,28 @@ function createWindowLifecycle(options) {
     updateViewBounds();
     win.on("resize", updateViewBounds);
 
+    // `menuBarOverlap` tells the renderer whether to keep its menu-bar band
+    // clear: false when macOS already placed the fullscreen window below the
+    // menu bar (a notched built-in display).
     const sendFullScreen = () => {
       if (win.isDestroyed() || view.webContents.isDestroyed()) return;
-      view.webContents.send("fullscreen-changed", win.isFullScreen());
+      view.webContents.send("fullscreen-changed", win.isFullScreen(), {
+        menuBarOverlap: menuBarCanOverlap(win, screen),
+      });
     };
 
     // Fullscreen events can precede the window manager's final reflow. Keep the
     // immediate recompute (no flash where reflow is synchronous) and bounded
-    // deferred passes, including the late backstop slow Linux WMs need.
+    // deferred passes, including the late backstop slow Linux WMs need. Each
+    // pass re-sends the fullscreen state too, because the menu-bar verdict reads
+    // the window's position, which is only final once the reflow lands.
     let fullscreenSettleTimers = [];
     const scheduleFullscreenSettle = () => {
       for (const timer of fullscreenSettleTimers) clearTimeout(timer);
-      fullscreenSettleTimers = FULLSCREEN_SETTLE_MS.map(
-        (ms) => setTimeout(updateViewBounds, ms),
-      );
+      fullscreenSettleTimers = [
+        ...FULLSCREEN_SETTLE_MS.map((ms) => setTimeout(updateViewBounds, ms)),
+        ...FULLSCREEN_SETTLE_MS.map((ms) => setTimeout(sendFullScreen, ms)),
+      ];
     };
     win.on("closed", () => {
       for (const timer of fullscreenSettleTimers) clearTimeout(timer);
@@ -453,6 +394,34 @@ function createWindowLifecycle(options) {
     win.on("show", updateViewBounds);
     win.on("restore", updateViewBounds);
     win.on("move", updateViewBounds);
+
+    // A display rearrange does not reliably fire a "resize"/"move" on the
+    // window, yet it changes the backing scale factor and content bounds. Bind
+    // the screen-level display events and re-run the reflow on a settle
+    // schedule so the child view tracks the new geometry instead of ghosting on
+    // the old display. Paired with an unbind in "closed" below — the bind/unbind
+    // discipline the pet-overlay leak (#4673) established: a screen listener
+    // that outlives its window keeps firing against a destroyed view.
+    let displaySettleTimers = [];
+    const onDisplayReflow = () => {
+      if (win.isDestroyed()) return;
+      for (const timer of displaySettleTimers) clearTimeout(timer);
+      displaySettleTimers = DISPLAY_SETTLE_MS.map((ms) =>
+        ms === 0 ? (updateViewBounds(), null) : setTimeout(updateViewBounds, ms),
+      ).filter(Boolean);
+    };
+    const DISPLAY_EVENTS = ["display-metrics-changed", "display-added", "display-removed"];
+    if (screen && typeof screen.on === "function") {
+      for (const event of DISPLAY_EVENTS) screen.on(event, onDisplayReflow);
+    }
+    win.on("closed", () => {
+      for (const timer of displaySettleTimers) clearTimeout(timer);
+      displaySettleTimers = [];
+      if (screen && typeof screen.removeListener === "function") {
+        for (const event of DISPLAY_EVENTS) screen.removeListener(event, onDisplayReflow);
+      }
+    });
+
     view.webContents.on("did-finish-load", () => {
       updateViewBounds();
       sendFullScreen();
@@ -464,7 +433,11 @@ function createWindowLifecycle(options) {
     win.webContents = view.webContents;
 
     function applyTitle() {
-      const remoteName = getRemoteHostConfig(store, windowPort)?.defaultName;
+      // Resolve the name through the URL so a title an older version pinned under
+      // the empty key on a scheme-default port still renders until the record is
+      // retired onto the resolved key. Reading `getRemoteHostConfig(store,
+      // windowPort)` alone would miss it and the suffix would revert to `[:80]`.
+      const remoteName = getRemoteHostDefaultNameForUrl(store, windowBackendUrl);
       if (!IS_WIN) {
         const suffix = customName || remoteName || `[:${windowPort}]`;
         win.setTitle(`Kiro Crew ${suffix}`);
@@ -492,183 +465,15 @@ function createWindowLifecycle(options) {
     registerCaptureSurface(view.webContents, windowBackendUrl);
     win._mcView = view;
 
-    // One native browser view/control plane per dashboard panel. The renderer
-    // owns layout; this process owns the WebContents and every privilege.
-    const browserPanels = new Map();
-
-    function browserPanel(panelId, { create = true } = {}) {
-      const id = typeof panelId === "string" ? panelId.trim() : "";
-      if (!id) return null;
-      const existing = browserPanels.get(id);
-      if (existing || !create) return existing || null;
-
-      const entry = { id, agentAct: false };
-      entry.manager = createBrowserViewManager({
-        createView: () => new WebContentsView({
-          webPreferences: {
-            // Persistent for ordinary browser logins, but isolated from the
-            // dashboard's host-scoped mc_token_<port> cookie jar.
-            partition: BROWSER_PARTITION,
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: true,
-            webviewTag: false,
-          },
-        }),
-        getContentBounds: () => win.getContentBounds(),
-        // Keyboard focus belongs to exactly one child view of the BaseWindow.
-        // When the embedded page holds it as its view is hidden or released,
-        // the dashboard view takes it back — otherwise every text input in the
-        // dashboard stays deaf while pointer events keep working.
-        focusHost: () => {
-          if (!win.isDestroyed() && !view.webContents.isDestroyed()) {
-            view.webContents.focus();
-          }
-        },
-        addView: (child) => win.contentView.addChildView(child),
-        removeView: (child) => win.contentView.removeChildView(child),
-        // Chrome the embedded page needs but the module must not import Electron
-        // for: the shared right-click menu (spelling suggestions, cut/copy/paste,
-        // Look Up, Copy Link Address). Safe for untrusted content — every item is
-        // a plain edit role or a clipboard write, none reaches app state. No
-        // origin is passed: an arbitrary site's same-origin pathname that happens
-        // to exist on disk is not a local file.
-        onCreate: (child) => attachContextMenu(child.webContents),
-        onEvent: (name, payload) => {
-          if (name === "open-external") {
-            if (payload && payload.url) {
-              openExternalSafely(
-                shell.openExternal,
-                payload.url,
-                (message) => console.warn(`[browser-panel] ${message}`),
-              );
-            }
-            return;
-          }
-          if (!view.webContents.isDestroyed()) {
-            view.webContents.send(
-              `browser:${name}`,
-              { ...(payload || {}), panelId: id },
-            );
-          }
-        },
-      });
-
-      // Display and CDP ownership are independent. At most one agent owner may
-      // hold LIGHT, and all transitions are audited in this process.
-      entry.control = createControlPlane({
-        getWebContents: () => entry.manager.getWebContents(),
-        onAudit: (event, detail) => {
-          console.warn(`[browser-control] ${id} ${event} ${JSON.stringify(detail)}`);
-        },
-      });
-
-      // Browser Mode is the authorization; the native-view existence check is
-      // the remaining per-panel precondition. Do not reintroduce a second
-      // session consent gate here.
-      entry.gate = () => canAgentControl({
-        agentActEnabled: true,
-        viewOpen: entry.manager.getState().open,
-      });
-
-      browserPanels.set(id, entry);
-      return entry;
-    }
-
-    function destroyBrowserPanel(id) {
-      const entry = browserPanels.get(id);
-      if (!entry) return;
-      browserPanels.delete(id);
-      try {
-        void entry.control.release();
-      } catch {
-        // Mid-teardown.
-      }
-      try {
-        entry.manager.close();
-      } catch {
-        // Mid-teardown.
-      }
-    }
-
-    win._mcBrowserPanel = browserPanel;
-    win._mcBrowserPanels = browserPanels;
-    win._mcDestroyBrowserPanel = destroyBrowserPanel;
-
-    // Reachability is distinct from mounted panels: a declared chat slot must
-    // be polled so its first navigate can bootstrap the native view.
-    const reachableSessions = new Set();
-    win._mcReachableSessions = reachableSessions;
-
-    win._mcAgentChannel = createAgentCommandChannel({
-      fetchFn: (url, init) => fetch(url, init),
-      getGatewayUrl: () => win._mcBackendUrl,
-      // Re-read for every call; the secret rotates with each gateway boot.
-      getSecret: () => readInternalSecret(),
-      // The idle host-presence heartbeat must fire ONLY when the gateway is truly
-      // on this machine — see isGatewayLocalForWindow for why loopback alone is
-      // not sufficient and why the port must be the window's own.
-      isGatewayLocal: () => isGatewayLocalForWindow(win),
-      listPanelIds: () => {
-        // Preserve the existing predicate exactly. In particular, do not
-        // mechanically fold isGatewayLocal into this branch during extraction:
-        // that is a policy change, not a module move.
-        if (!isLoopbackUrl(win._mcBackendUrl)) return [];
-        return [...new Set([...browserPanels.keys(), ...reachableSessions])];
-      },
-      dispatch: async (sessionKey, op, args) => {
-        console.warn(`[browser-cmdbus] dispatch op=${op} session=${sessionKey}`);
-        const bootstrapping = op === "navigate";
-        const entry = browserPanel(sessionKey, { create: bootstrapping });
-        if (!entry) {
-          throw new Error(`no native browser panel for session ${sessionKey}`);
-        }
-
-        // Navigate is the one op allowed to satisfy an absent-view precondition.
-        // The order is essential: opening after acquiring LIGHT would refuse the
-        // first command before there was any view to acquire.
-        if (bootstrapping && !entry.manager.getWebContents()) {
-          const pre = entry.gate();
-          if (!mayBootstrapView(pre)) {
-            throw new Error(`browser control refused: ${pre.reason}`);
-          }
-          const opened = entry.manager.navigate(String((args && args.url) || ""));
-          if (opened && opened.refused) {
-            return {
-              ok: false,
-              code: "bad_url",
-              error: `refused non-web URL: ${args && args.url}`,
-            };
-          }
-          try {
-            view.webContents.send("browser:agent-opened", {
-              panelId: sessionKey,
-              url: (opened && opened.url) || String((args && args.url) || ""),
-            });
-          } catch {
-            // A torn-down dashboard must not fail the navigation itself.
-          }
-          const takenAfterOpen = await entry.control.setOwner(OWNER.LIGHT, entry.gate());
-          if (takenAfterOpen.refused) {
-            throw new Error(`browser control refused: ${takenAfterOpen.refused}`);
-          }
-          return {
-            ok: true,
-            url: (opened && opened.url) || String((args && args.url) || ""),
-          };
-        }
-
-        const taken = await entry.control.setOwner(OWNER.LIGHT, entry.gate());
-        if (taken.refused) {
-          throw new Error(`browser control refused: ${taken.refused}`);
-        }
-        return dispatchBrowserOp(entry, op, args);
-      },
-      onError: (error, context) => {
-        console.warn(`[browser-agent-channel] ${context}: ${error && error.message}`);
-      },
+    // One native browser view/control plane per dashboard panel, plus the agent
+    // command channel that drives them (runtime/window/browser-panels.js).
+    const browserPanels = attachBrowserPanels(win, view, {
+      WebContentsView,
+      shell,
+      partition: BROWSER_PARTITION,
+      readInternalSecret,
+      isGatewayLocalForWindow,
     });
-    win._mcAgentChannel.start();
 
     // The dashboard's own webContents, so the link block also gets the origin --
     // which is what turns a `/abs/path` link into a bare-path copy instead of a
@@ -676,18 +481,7 @@ function createWindowLifecycle(options) {
     // arbitrary site's same-origin pathname is not a local file.
     attachContextMenu(view.webContents, { getAppOrigin: () => windowBackendUrl });
 
-    if (IS_MAC) {
-      positionTrafficLights(win);
-      view.webContents.on("zoom-changed", () => {
-        setTimeout(() => positionTrafficLights(win), 0);
-      });
-    }
-    if (IS_WINDOWS) {
-      updateWindowsTitleBarOverlay(win);
-      view.webContents.on("zoom-changed", () => {
-        setTimeout(() => updateWindowsTitleBarOverlay(win), 0);
-      });
-    }
+    trackZoomChrome(win, view);
 
     // Frameless macOS exposes a native system context menu on the drag region.
     win.on("system-context-menu", (event, point) => {
@@ -716,7 +510,7 @@ function createWindowLifecycle(options) {
         view.webContents.insertCSS(`
           #electron-drag-bar {
             position: fixed;
-            top: 0; left: 0; right: ${IS_WIN ? "138px" : LINUX_FRAMELESS ? "108px" : "0"};
+            top: 0; left: 0; right: ${IS_WIN ? "var(--mc-win-drag-reserve, 138px)" : LINUX_FRAMELESS ? "108px" : "0"};
             height: 42px;
             -webkit-app-region: drag;
             z-index: 99999;
@@ -742,105 +536,8 @@ function createWindowLifecycle(options) {
         `);
       }
 
-      // Frameless Linux has no OS caption controls. CSS-drawn marks avoid
-      // distro-font glyph drift; the actions cross the allowlisted preload IPC.
-      if (LINUX_FRAMELESS) {
-        view.webContents.insertCSS(`
-          #electron-linux-controls {
-            position: fixed;
-            top: 0; right: 0;
-            height: 42px;
-            display: flex;
-            align-items: stretch;
-            z-index: 100000;
-            -webkit-app-region: no-drag;
-          }
-          #electron-linux-controls button {
-            position: relative;
-            width: 36px;
-            border: 0;
-            background: transparent;
-            color: var(--text, #e2e8f0);
-            opacity: 0.55;
-            cursor: default;
-            -webkit-app-region: no-drag;
-          }
-          #electron-linux-controls button:hover {
-            opacity: 1;
-            background: rgba(128,128,128,0.18);
-          }
-          #electron-linux-controls button.close:hover {
-            background: #e81123;
-            color: #fff;
-          }
-          #electron-linux-controls button::before {
-            content: "";
-            position: absolute;
-            top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
-          }
-          #electron-linux-controls button.minimize::before {
-            width: 10px; height: 0;
-            border-top: 1px solid currentColor;
-          }
-          #electron-linux-controls button.maximize::before {
-            width: 9px; height: 9px;
-            border: 1px solid currentColor;
-          }
-          #electron-linux-controls.is-maximized button.maximize::before {
-            width: 7px; height: 7px;
-            transform: translate(-70%, -30%);
-          }
-          #electron-linux-controls.is-maximized button.maximize::after {
-            content: "";
-            position: absolute;
-            top: 50%; left: 50%;
-            width: 7px; height: 7px;
-            transform: translate(-30%, -70%);
-            border: 1px solid currentColor;
-            border-bottom: 0;
-            border-left: 0;
-          }
-          #electron-linux-controls button.close::before {
-            width: 12px; height: 0;
-            border-top: 1px solid currentColor;
-            transform: translate(-50%, -50%) rotate(45deg);
-          }
-          #electron-linux-controls button.close::after {
-            content: "";
-            position: absolute;
-            top: 50%; left: 50%;
-            width: 12px; height: 0;
-            border-top: 1px solid currentColor;
-            transform: translate(-50%, -50%) rotate(-45deg);
-          }
-        `);
-        view.webContents.executeJavaScript(`
-          if (!document.getElementById('electron-linux-controls')) {
-            const wrap = document.createElement('div');
-            wrap.id = 'electron-linux-controls';
-            const mk = (cls, label, action) => {
-              const button = document.createElement('button');
-              button.className = cls;
-              button.setAttribute('aria-label', label);
-              // Native caption controls are not in the tab order either.
-              button.tabIndex = -1;
-              button.addEventListener(
-                'click',
-                () => window.kirocrew?.windowControl?.(action),
-              );
-              return button;
-            };
-            wrap.append(
-              mk('minimize', 'Minimize', 'minimize'),
-              mk('maximize', 'Maximize', 'maximize-toggle'),
-              mk('close', 'Close', 'close'),
-            );
-            document.body.prepend(wrap);
-          }
-        `);
-        syncLinuxMaximizeState(win, view);
-      }
+      // Frameless Linux has no OS caption controls, so the shell draws them.
+      if (LINUX_FRAMELESS) injectLinuxCaptionControls(win, view);
 
       view.webContents.executeJavaScript(
         `getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()`,
@@ -863,13 +560,19 @@ function createWindowLifecycle(options) {
 
     // Same-origin windows remain in-app. Cross-origin web URLs and the audited
     // custom-scheme allowlist go to the OS; every other target fails closed.
-    view.webContents.setWindowOpenHandler(
-      createWindowOpenHandler({
-        openExternal: (url) => shell.openExternal(url),
-        getAppOrigin: () => windowBackendUrl,
-        log: glog,
-      }),
-    );
+    const windowOpenHandler = createWindowOpenHandler({
+      openExternal: (url) => shell.openExternal(url),
+      getAppOrigin: () => windowBackendUrl,
+      log: glog,
+    });
+    // An allowed same-origin window.open (the session pop-out) is a child window
+    // Electron creates on its own. Give it, and each of its own children, the
+    // same handler, or its external links open yet another in-app window.
+    const armWindowOpen = (contents) => {
+      contents.setWindowOpenHandler(windowOpenHandler);
+      contents.on("did-create-window", (child) => armWindowOpen(child.webContents));
+    };
+    armWindowOpen(view.webContents);
 
     // Do not leak the dashboard URL/token as a Referer to resources it embeds.
     // This listener remains attached at the same per-window setup point; moving
@@ -877,6 +580,29 @@ function createWindowLifecycle(options) {
     view.webContents.session.webRequest.onBeforeSendHeaders((details, callback) => {
       delete details.requestHeaders.Referer;
       callback({ requestHeaders: details.requestHeaders });
+    });
+
+    // Give renderer-triggered downloads (e.g. the Portability "Download Export
+    // (.zip)" button's <a download> blob) a real save path. The dashboard view
+    // is a WebContentsView under a BaseWindow, which Chromium cannot parent a
+    // native "Save As" dialog to, so without this the DownloadItem never
+    // resolves a path and nothing lands on disk (issue #13047). Attached once
+    // per session (every window shares the default session), so N windows do
+    // not stack N handlers.
+    //
+    // Because the single handler is shared by every window, it must resolve the
+    // dashboard origin for the window that OWNS each download rather than
+    // capturing one window's URL: a later window on a different gateway (the
+    // remote-host secondary windows main supports) would otherwise fail the
+    // origin checks and its export would never land. `resolveDashboardUrl` maps
+    // the download's own `webContents` back to its window's `_mcBackendUrl`;
+    // `dashboardUrl` is the fallback for the first window / an unmatched sender.
+    wireWillDownloadOnce(view.webContents.session, {
+      app,
+      log: glog,
+      dashboardUrl: windowBackendUrl,
+      resolveDashboardUrl: (wc) => windowForWebContents(wc)?._mcBackendUrl,
+      pending: downloadExpectations,
     });
 
     return view;
@@ -1027,15 +753,22 @@ function createWindowLifecycle(options) {
     });
 
     // A 403 means the gateway secret may have rotated. Re-enter through the
-    // same local-then-remote token order used at boot.
+    // same local-then-remote token order used at boot. A recovery reload keeps
+    // its `safe=1` through the retry: a bare URL here reopens the remembered
+    // chat, and the crash that chat caused repeats.
+    let retrySafe = false;
     const onNavigate = createTokenRetryHandler(async () => {
-      let tokenValue = await fetchLocalToken(backendUrl);
-      if (!tokenValue) ({ token: tokenValue } = await fetchRemoteToken(port));
+      let tokenValue = await mintLocalToken(backendUrl);
+      if (!tokenValue) {
+        ({ token: tokenValue } = await fetchRemoteToken(port));
+      }
       if (tokenValue && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.loadURL(`${backendUrl}?token=${tokenValue}`);
+        const target = `${backendUrl}?token=${tokenValue}`;
+        mainWindow.webContents.loadURL(retrySafe ? withSafeReload(target) : target);
       }
     });
-    mainWindow.webContents.on("did-navigate", (_event, _url, httpCode) => {
+    mainWindow.webContents.on("did-navigate", (_event, url, httpCode) => {
+      retrySafe = hasSafeReload(url);
       onNavigate(httpCode).catch((error) => {
         console.error("Token retry failed:", error);
       });
@@ -1058,6 +791,42 @@ function createWindowLifecycle(options) {
     // so nothing of ours runs in that frame to say so. The main process sees the
     // request either way. See pane-asset-journal.js.
     attachPaneAssetJournal(mainWindow.webContents.session, glog, backendUrl);
+
+    function reloadDashboard() {
+      if (mainWindow.isDestroyed()) return;
+      (async () => {
+        let tokenValue = await mintLocalToken(backendUrl);
+        if (!tokenValue) {
+          ({ token: tokenValue } = await fetchRemoteToken(port));
+        }
+        if (mainWindow.isDestroyed()) return;
+        // `safe=1`: do not reopen the chat that may have caused the crash.
+        mainWindow.webContents.loadURL(withSafeReload(
+          tokenValue ? `${backendUrl}?token=${tokenValue}` : backendUrl,
+        ));
+      })().catch((error) => {
+        glog(`renderer recovery reload failed: ${error && error.message}`);
+      });
+    }
+
+    const rendererExhaustedNotice = createRendererExhaustedNotice({
+      dialog,
+      openExternal: (url) => shell.openExternal(url),
+      requestQuit,
+      // "Try again" in the dialog: a fresh reload budget, then one more load.
+      // `rendererRecovery` is created just below; this runs only after the
+      // dialog it belongs to, long after both exist.
+      retry: () => {
+        rendererRecovery.reset();
+        reloadDashboard();
+      },
+      dashboardLoaded,
+      parentWindow: () => mainWindow,
+      isQuitting,
+      platform,
+      logPath,
+      log: glog,
+    });
 
     const rendererRecovery = createRendererRecovery({
       isQuitting,
@@ -1088,21 +857,13 @@ function createWindowLifecycle(options) {
         }
         return parts.join(" ");
       },
-      reload: () => {
-        if (mainWindow.isDestroyed()) return;
-        (async () => {
-          let tokenValue = await fetchLocalToken(backendUrl);
-          if (!tokenValue) ({ token: tokenValue } = await fetchRemoteToken(port));
-          if (mainWindow.isDestroyed()) return;
-          mainWindow.webContents.loadURL(
-            tokenValue ? `${backendUrl}?token=${tokenValue}` : backendUrl,
-          );
-        })().catch((error) => {
-          glog(`renderer recovery reload failed: ${error && error.message}`);
-        });
-      },
-      onGiveUp: ({ reason }) => {
-        glog(`renderer recovery exhausted (reason=${reason}); leaving the window as-is`);
+      reload: reloadDashboard,
+      // The budget is spent: say so on screen. A dead renderer leaves the
+      // window black with no text, so this is the only readable error the
+      // user gets (renderer-exhausted-notice.js). Never awaited here: the
+      // dialog outlives this event handler.
+      onGiveUp: (info) => {
+        void rendererExhaustedNotice.show(info);
       },
     });
 
@@ -1264,12 +1025,25 @@ function createWindowLifecycle(options) {
   async function promptRemoteHost() {
     const focused = BaseWindow.getFocusedWindow() || mainWindow;
     if (!focused || focused.isDestroyed() || !focused._mcBackendUrl) return;
-    const focusedPort = new URL(focused._mcBackendUrl).port;
-    const config = getRemoteHostConfig(store, focusedPort);
+    // Keyed with `defaultedPort` so the entry this form WRITES lands under the
+    // same key `isGatewayLocalForWindow` READS. A raw `URL.port` is "" on a
+    // scheme-default port, so the two would disagree on :80 and a crew the user
+    // configured here would classify as a gateway on this machine.
+    const focusedPort = defaultedPort(focused._mcBackendUrl);
+    // Read through the resolver so a crew an older version left under the empty
+    // key pre-fills this form: stating it again is what moves the record onto
+    // the resolved key, and the write below retires the old one.
+    const config = getRemoteHostConfigForUrl(store, focused._mcBackendUrl);
     const currentHost = config?.host || "";
     const currentBin = config?.binPath || DEFAULT_REMOTE_BIN;
     const currentRemotePort = config?.remotePort || "";
     const currentRemotePath = config?.remotePath || "";
+    const currentManageTunnel = config?.manageTunnel === true;
+    // The app keeps a tunnel only for the port it launched on, so this form
+    // offers the option there alone; for any other tab it carries the stored
+    // choice over unchanged.
+    const isLaunchPort = String(focusedPort) === String(port);
+    const offerTunnel = isLaunchPort && !IS_WINDOWS;
 
     const css = await getModalCSS();
     const esc = (value) => value
@@ -1279,7 +1053,7 @@ function createWindowLifecycle(options) {
       .replace(/>/g, "&gt;");
     const promptWin = new BrowserWindow({
       width: 480,
-      height: 400,
+      height: offerTunnel ? 520 : 400,
       resizable: false,
       useContentSize: true,
       parent: focused,
@@ -1299,15 +1073,20 @@ function createWindowLifecycle(options) {
       <input id="rp" value="${esc(currentRemotePort)}" placeholder="${focusedPort}">
       <label>Remote PATH <span style="font-weight:normal;opacity:0.6">(default: ${DEFAULT_REMOTE_PATH})</span></label>
       <input id="pa" value="${esc(currentRemotePath)}" placeholder="${DEFAULT_REMOTE_PATH}">
+      ${offerTunnel ? `<label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="mt" style="width:auto"${currentManageTunnel ? " checked" : ""}> ${TUNNEL_OPTION_LABEL}</label>
+      <div class="hint">${esc(tunnelOptionHint(focusedPort))}</div>` : ""}
       <div class="row"><button class="ok" onclick="save()">Save</button>
       <button class="cancel" onclick="window.close()">Cancel</button></div>
       <script>
         function save() {
           document.title = JSON.stringify({
             host: document.getElementById('h').value.trim(),
-            bin: document.getElementById('b').value.trim(),
+            binPath: document.getElementById('b').value.trim(),
             remotePort: document.getElementById('rp').value.trim(),
             remotePath: document.getElementById('pa').value.trim(),
+            // Read from the checkbox where this form offers it; elsewhere the
+            // stored choice rides through unchanged, never silently dropped.
+            manageTunnel: ${offerTunnel ? "document.getElementById('mt').checked" : currentManageTunnel ? "true" : "false"},
           });
           window.close();
         }
@@ -1326,40 +1105,82 @@ function createWindowLifecycle(options) {
     });
     promptWin.on("closed", () => {
       try {
-        if (savedTitle && savedTitle.startsWith("{")) {
-          const {
-            host,
-            bin,
-            remotePort: remotePortValue,
-            remotePath,
-          } = JSON.parse(savedTitle);
-          if (host) {
-            const error = validateRemoteSettings(
-              host,
-              bin,
-              remotePortValue,
-              remotePath,
-            );
-            const parent = focused && !focused.isDestroyed() ? focused : null;
-            if (error) {
+        const fields = parseRemoteCrewFields(savedTitle);
+        if (fields) {
+          const { host } = fields;
+          const parent = focused && !focused.isDestroyed() ? focused : null;
+          // A record an older version left under the empty key is superseded by
+          // what the user states here, but only ONCE that statement is durable.
+          // Retiring first would erase the record on a write that is refused --
+          // and `saveRemoteCrewConfig` refuses an unselectable port outright, so
+          // on an http window whose port resolves to 80 no write can ever
+          // succeed. The crew would then read as a gateway on this machine, with
+          // no way back, and X-Internal-Secret would go through the tunnel.
+          //
+          // Only a URL whose port is its scheme's default could have produced
+          // that record, so a window on any other port leaves it alone.
+          const retireLegacy = () => {
+            if (portIsSchemeDefault(focused._mcBackendUrl)) {
+              retireLegacyEmptyPortHost(store, focusedPort);
+            }
+          };
+          if (!host) {
+            // A scheme-default port (:80/:443) can't hold a per-port record the
+            // user can rewrite (saveRemoteCrewConfig refuses to WRITE such a
+            // port), so a crew reached on one is marked remote either by the
+            // empty-key legacy record OR by a legacy record left under the
+            // resolved key "80"/"443" itself. Deleting the resolved-key record
+            // AND retiring the legacy one here would leave a FRESH default-port
+            // window later reading no crew at all, so isGatewayLocalForWindow
+            // classifies the loopback window as a local gateway and the
+            // host-presence heartbeat sends X-Internal-Secret through the
+            // still-open ssh tunnel. A tunnelled crew must keep its record.
+            //
+            // There is no in-app probe that a scheme-default port is positively
+            // local (a :80 write is refused by saveRemoteCrewConfig), so the only
+            // fail-closed answer is to REFUSE the Clear and keep the record
+            // intact -- a future default-port window still resolves REMOTE from
+            // the store itself, not merely from a window-scoped latch. Resolve
+            // through getRemoteHostConfigForUrl (not the empty key alone) so a
+            // host under the resolved "80"/"443" key is also caught. Direct the
+            // user to reopen the crew on a selectable port and clear it there,
+            // where a per-port record can be written and removed.
+            if (
+              portIsSchemeDefault(focused._mcBackendUrl)
+              && getRemoteHostConfigForUrl(store, focused._mcBackendUrl)?.host
+            ) {
               dialog.showMessageBox(parent, {
                 type: "error",
-                title: "Invalid Input",
-                message: error,
+                title: "Can't clear remote host from this tab",
+                message:
+                  `This crew was reached on a default port (:${focusedPort}), so the app can't change or clear its remote-host setting from this tab. The setting is kept on purpose so this window is never mistaken for a local gateway while the connection is open. To stop reaching this crew, close this tab (and stop the "ssh -L :${focusedPort}" tunnel if you started one). A crew opened on a selectable port (for example "ssh -L 7777:…") can be cleared from its own tab.`,
               });
               return;
             }
+            // Clearing belongs to this surface: the shared writer stores a crew
+            // and refuses an empty host. A scheme-default port with a host-bearing
+            // legacy record was already intercepted by the refusal above, and on
+            // any other port there is no empty-key record to retire, so no
+            // retirement runs here.
+            setRemoteHostConfig(store, focusedPort, {});
+            if (isLaunchPort) syncTunnel();
+            const cleared = `Remote host for :${focusedPort} cleared (using local token)`;
+            console.log(cleared);
+            dialog.showMessageBox(parent, { message: cleared, type: "info" });
+            return;
           }
-          setRemoteHostConfig(store, focusedPort, {
-            host,
-            binPath: bin,
-            remotePort: remotePortValue,
-            remotePath,
-          });
-          const parent = focused && !focused.isDestroyed() ? focused : null;
-          const message = host
-            ? `Remote host for :${focusedPort} set to ${host}`
-            : `Remote host for :${focusedPort} cleared (using local token)`;
+          const { saved, error } = saveRemoteCrewConfig(store, focusedPort, fields);
+          if (!saved) {
+            dialog.showMessageBox(parent, {
+              type: "error",
+              title: "Invalid Input",
+              message: error,
+            });
+            return;
+          }
+          if (isLaunchPort) syncTunnel();
+          retireLegacy();
+          const message = `Remote host for :${focusedPort} set to ${host}`;
           console.log(message);
           dialog.showMessageBox(parent, { message, type: "info" });
         }
@@ -1373,9 +1194,9 @@ function createWindowLifecycle(options) {
     const win = BaseWindow.getFocusedWindow() || mainWindow;
     if (!win || win.isDestroyed() || !win._mcBackendUrl) return;
     const targetUrl = win._mcBackendUrl;
-    const targetPort = new URL(targetUrl).port;
+    const targetPort = defaultedPort(targetUrl);
 
-    let tokenValue = await fetchLocalToken(targetUrl);
+    let tokenValue = await mintLocalToken(targetUrl);
     let sshError = null;
     if (!tokenValue) {
       ({ token: tokenValue, error: sshError } = await fetchRemoteToken(targetPort));
@@ -1385,14 +1206,46 @@ function createWindowLifecycle(options) {
       win.webContents.loadURL(`${targetUrl}?token=${tokenValue}`);
       return;
     }
-    const config = getRemoteHostConfig(store, targetPort);
+    // Resolver, not the port alone: a crew an older version left under the empty
+    // key is still the crew this tab reaches, and saying none is configured
+    // would send the reader to a form that shows the host they already set.
+    const config = getRemoteHostConfigForUrl(store, targetUrl);
     dialog.showMessageBox(win, {
       type: "warning",
       title: "Token Refresh",
       message: "Could not fetch a fresh token.",
-      detail: config?.host
-        ? `SSH to ${config.host} failed.\n\n${sshError || "Check your connection."}`
-        : "No remote host configured for this tab. Use 'Set Remote Host…' from the Tab menu.",
+      // Three states, not two. `fetchRemoteToken` keys its own lookup by port, so
+      // on a record this resolver reached under the empty key it returns without
+      // running ssh at all -- and reporting that as "SSH failed" describes an
+      // attempt that never happened and sends the reader to check a connection
+      // nothing used.
+      //
+      // On the crew-configured branch the remedy depends on whether the tab's
+      // own port can hold a crew at all. `isSelectablePort` gates on
+      // `Number.isInteger`, and `defaultedPort` returns a STRING, so the port is
+      // coerced with `Number(...)` before the test -- passing the raw string
+      // makes the predicate always false and sends every port down the
+      // unselectable branch.
+      //
+      // On an unselectable port (http :80) `saveRemoteCrewConfig` refuses every
+      // Save, so re-entering the host cannot help. But the remedy must NOT be
+      // Clear: on a live `ssh -L 80:` tunnel the crew record is the only thing
+      // marking this window remote, and clearing it makes `isGatewayLocalForWindow`
+      // read the still-open loopback window as a gateway on THIS machine -- after
+      // which the idle heartbeat puts `X-Internal-Secret` through the tunnel,
+      // which a tunnelled crew must never allow. So direct the user to
+      // reopen the crew on a selectable port instead, leaving the record intact.
+      detail: sshError
+        ? `SSH to ${config?.host || "the remote host"} failed.\n\n${sshError}`
+        : config?.host
+          ? isSelectablePort(Number(targetPort))
+            ? `No token could be fetched for ${config.host}, and no SSH attempt was made.`
+              + " Re-enter the host with 'Set Remote Host…' from the Tab menu so it's"
+              + " saved for this tab."
+            : `No token could be fetched for ${config.host}, and this tab's port (${targetPort})`
+              + " can't be used to save one. Reconnect the crew on a different local"
+              + " port (for example \"ssh -L 7777:…\" instead of :" + targetPort + "), then open that tab."
+          : "No remote host configured for this tab. Use 'Set Remote Host…' from the Tab menu.",
     });
   }
 
@@ -1419,7 +1272,7 @@ function createWindowLifecycle(options) {
     // would replay the consumed intent and mint a second blank session.
     let retryTarget = initialPath;
     const onNavigate = createTokenRetryHandler(async () => {
-      let tokenValue = await fetchLocalToken(connectionBackendUrl);
+      let tokenValue = await mintLocalToken(connectionBackendUrl);
       if (!tokenValue) {
         ({ token: tokenValue } = await fetchRemoteToken(connectionPort));
       }
@@ -1456,51 +1309,7 @@ function createWindowLifecycle(options) {
     unhideApp();
     mainWindow.show();
 
-    const css = await getModalCSS();
-    const promptWin = new BrowserWindow({
-      width: 400,
-      height: 180,
-      resizable: false,
-      useContentSize: true,
-      parent: mainWindow,
-      modal: true,
-      backgroundColor: "#00000000",
-      webPreferences: { nodeIntegration: false, contextIsolation: true },
-    });
-    const html = `<!DOCTYPE html><html><head><style>
-      ${css}
-    </style></head><body>
-      <label>Gateway port</label>
-      <input id="p" type="number" value="7778" min="1" max="65535" autofocus>
-      <div class="hint">Connect to a Kiro Crew gateway running on another port</div>
-      <div class="row"><button class="ok" onclick="go()">Connect</button>
-      <button class="cancel" onclick="window.close()">Cancel</button></div>
-      <script>
-        function go() {
-          document.title = document.getElementById('p').value.trim();
-          window.close();
-        }
-        document.addEventListener('keydown', event => {
-          if (event.key === 'Enter') go();
-          if (event.key === 'Escape') window.close();
-        });
-      </script>
-    </body></html>`;
-    promptWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-    promptWin.setMenu(null);
-
-    let savedTitle = null;
-    promptWin.on("page-title-updated", (_event, title) => {
-      savedTitle = title;
-    });
-    promptWin.on("closed", async () => {
-      if (!savedTitle) return;
-      const connectionPort = parseInt(savedTitle, 10);
-      if (
-        Number.isNaN(connectionPort)
-        || connectionPort < 1
-        || connectionPort > 65535
-      ) return;
+    await promptConnectionPort(() => mainWindow, async (connectionPort) => {
       if (!mainWindow || mainWindow.isDestroyed()) return;
 
       const connectionBackendUrl = `http://localhost:${connectionPort}`;
@@ -1513,215 +1322,7 @@ function createWindowLifecycle(options) {
   }
 
   function renameCurrentWindow() {
-    const focused = BaseWindow.getFocusedWindow();
-    if (!focused || !focused._mcSetCustomName) return;
-
-    const currentTitle = focused.getTitle();
-    const focusedPort = focused._mcBackendUrl
-      ? new URL(focused._mcBackendUrl).port
-      : "";
-    const esc = (value) => value
-      .replace(/&/g, "&amp;")
-      .replace(/"/g, "&quot;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-
-    getDashboardThemeVars().then((vars) => {
-      const css = vars && vars.bg
-        ? modalCSSFromVars(vars)
-        : modalCSSForMode(nativeTheme.shouldUseDarkColors);
-      const promptWin = new BrowserWindow({
-        width: 400,
-        height: 200,
-        resizable: false,
-        useContentSize: true,
-        parent: focused,
-        modal: true,
-        backgroundColor: "#00000000",
-        webPreferences: { nodeIntegration: false, contextIsolation: true },
-      });
-      const html = `<!DOCTYPE html><html><head><style>
-        ${css}
-        .check-row { display:flex; align-items:center; gap:6px; margin-top:8px; }
-        .check-row input { width:auto; margin:0; }
-        .check-row label { margin:0; font-size:12px; }
-      </style></head><body>
-        <label>Window name</label>
-        <input id="n" value="${esc(currentTitle.replace(/^Kiro ?Crew /g, ""))}" autofocus>
-        <div class="row"><button class="ok" onclick="go()">Rename</button>
-        <button class="cancel" onclick="window.close()">Cancel</button></div>
-        <div class="check-row"><input type="checkbox" id="d"><label for="d">Set as default name for :${focusedPort} windows</label></div>
-        <script>
-          function go() {
-            document.title = JSON.stringify({
-              name: document.getElementById('n').value.trim(),
-              setDefault: document.getElementById('d').checked,
-            });
-            window.close();
-          }
-          document.addEventListener('keydown', event => {
-            if (event.key === 'Enter') go();
-            if (event.key === 'Escape') window.close();
-          });
-        </script>
-      </body></html>`;
-      promptWin.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
-      promptWin.setMenu(null);
-
-      let savedTitle = null;
-      promptWin.on("page-title-updated", (_event, title) => {
-        savedTitle = title;
-      });
-      promptWin.on("closed", () => {
-        if (!savedTitle || !focused || focused.isDestroyed()) return;
-        try {
-          const { name, setDefault } = JSON.parse(savedTitle);
-          if (name) {
-            focused._mcSetCustomName(name);
-            if (setDefault && focusedPort) {
-              const hosts = store.get("remoteHosts") || {};
-              const key = String(focusedPort);
-              hosts[key] = { ...(hosts[key] || {}), defaultName: name };
-              store.set("remoteHosts", hosts);
-            }
-          }
-        } catch {
-          // Legacy plain-text fallback.
-          if (savedTitle) focused._mcSetCustomName(savedTitle);
-        }
-      });
-    });
-  }
-
-  function showScreenPermissionDialog() {
-    const pane =
-      "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
-    dialog.showMessageBox({
-      type: "info",
-      title: "Screen Recording permission needed",
-      message: "Allow Kiro Crew to capture the screen",
-      detail:
-        "The screen-snip tool needs macOS Screen Recording permission. "
-        + "Open System Settings › Privacy & Security › Screen Recording, "
-        + "enable Kiro Crew, then try the snip again.",
-      buttons: ["Open System Settings", "Cancel"],
-      defaultId: 0,
-      cancelId: 1,
-    }).then(({ response }) => {
-      if (response === 0) shell.openExternal(pane);
-    }).catch(() => {});
-  }
-
-  function showMicPermissionDialog(status = "denied") {
-    // Dictation, streaming STT, settings test and meetings can race the same
-    // denial. Latch one recovery dialog rather than stacking modal copies.
-    if (micDialogOpen) return;
-    micDialogOpen = true;
-    const pane =
-      "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-    const restricted = status === "restricted";
-    dialog.showMessageBox({
-      type: "info",
-      title: "Microphone permission needed",
-      message: restricted
-        ? "Microphone access is blocked by a policy"
-        : "Allow Kiro Crew to use the microphone",
-      detail: restricted
-        ? "Voice input needs macOS Microphone permission, but access is "
-          + "restricted by a device-management policy on this Mac. Contact "
-          + "whoever manages it to allow microphone access for Kiro Crew."
-        : "Voice input needs macOS Microphone permission, and macOS will not "
-          + "ask again once it has been denied. Open System Settings › Privacy "
-          + "& Security › Microphone, enable Kiro Crew, then try the mic again.",
-      buttons: restricted ? ["OK"] : ["Open System Settings", "Cancel"],
-      defaultId: 0,
-      cancelId: restricted ? 0 : 1,
-    }).then(({ response }) => {
-      if (!restricted && response === 0) shell.openExternal(pane);
-    }).catch(() => {}).then(() => {
-      micDialogOpen = false;
-    });
-  }
-
-  function configureSessionSecurity() {
-    if (sessionSecurityConfigured) return;
-
-    // Screen capture has its own handler. Prefer the native system picker when
-    // available and fall back to desktopCapturer elsewhere. WHO may be granted a
-    // screen is decided by identity in capture-trust.js: a registered surface,
-    // its own main frame, still on its registered origin. Without this dep the
-    // handler denies everything, so the wiring is not optional.
-    session.defaultSession.setDisplayMediaRequestHandler(
-      createDisplayMediaHandler({
-        isTrustedRequest: createCaptureTrust({
-          fromFrame: (frame) => webContents.fromFrame(frame),
-        }),
-        getSources: () => desktopCapturer.getSources({
-          types: ["screen", "window"],
-        }),
-        getScreenAccessStatus: () => (
-          IS_MAC
-            ? systemPreferences.getMediaAccessStatus("screen")
-            : "granted"
-        ),
-        onPermissionNeeded: (reason) => {
-          if (reason === "denied") return showScreenPermissionDialog();
-          // No dialog for a trust refusal: an embedded pane or a browsed page
-          // asked, and nothing the user can change in System Settings would
-          // make that grantable. One breadcrumb instead, for the same reason
-          // permission-handler.js logs its denials -- a silent refusal is
-          // indistinguishable from an OS one when someone has to diagnose it.
-          if (reason === "untrusted-frame") {
-            // eslint-disable-next-line no-console -- see the note above
-            console.warn(
-              "[display-media] DENY capture: requester is not a registered capture surface",
-            );
-          }
-        },
-      }),
-      { useSystemPicker: true },
-    );
-
-    // The dashboard receives only the media grant it needs. Untrusted browser
-    // WebContents fail closed by identity before any localhost-origin heuristic
-    // can grant them access.
-    session.defaultSession.setPermissionRequestHandler(
-      createPermissionRequestHandler({
-        isUntrusted: isUntrustedContents,
-        ...(IS_MAC
-          ? {
-              getMicAccessStatus: () =>
-                systemPreferences.getMediaAccessStatus("microphone"),
-              // Ask only on the user's mic gesture. Asking at launch spends
-              // macOS TCC's one-shot prompt before the action has context.
-              askForMicAccess: () =>
-                systemPreferences.askForMediaAccess("microphone"),
-              onMicBlocked: () => showMicPermissionDialog(),
-            }
-          : {}),
-      }),
-    );
-    session.defaultSession.setPermissionCheckHandler(
-      createPermissionCheckHandler({ isUntrusted: isUntrustedContents }),
-    );
-
-    // Permission handlers are per-session. Embedded pages use a separate
-    // persistent partition, so the default-session policy above cannot cover
-    // them; deny every permission explicitly before any such view can exist.
-    hardenBrowserPartition(session);
-    sessionSecurityConfigured = true;
-  }
-
-  function handleMicDenied() {
-    if (!IS_MAC) return;
-    try {
-      const status = systemPreferences.getMediaAccessStatus("microphone");
-      if (status === "denied" || status === "restricted") {
-        showMicPermissionDialog(status);
-      }
-    } catch {
-      // Stay silent when the OS status probe itself is unavailable.
-    }
+    renameFocusedWindow();
   }
 
   function focusedDashboardWebContents() {
@@ -1793,9 +1394,10 @@ function createWindowLifecycle(options) {
       if (!wc) return;
       apply(wc);
       // Chromium applies zoom per-origin, so same-origin sibling windows move
-      // together and every traffic-light inset must be reconciled.
+      // together and every native caption inset must be reconciled — the macOS
+      // traffic lights AND the Windows overlay height, both of which track zoom.
       for (const win of BaseWindow.getAllWindows()) {
-        if (win._mcView) positionTrafficLights(win);
+        reconcileZoomChrome(win);
       }
     };
   }
@@ -1827,6 +1429,11 @@ function createWindowLifecycle(options) {
       }),
       alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
       toggleAlwaysOnTop,
+      toggleFocusMode: () => {
+        const win = focusedDashboardWindow();
+        const wc = win && win._mcView.webContents;
+        if (wc && !wc.isDestroyed()) wc.send("focus-mode:toggle");
+      },
       openNewSessionWindow: () => openNewSessionWindow(),
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),
@@ -1868,24 +1475,6 @@ function createWindowLifecycle(options) {
     if (item) item.visible = !!enabled;
   }
 
-  function setThemeAccent(hex) {
-    if (
-      typeof hex === "string"
-      && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(hex)
-    ) {
-      store.set("themeAccent", hex);
-    }
-  }
-
-  function handleFocusMode(sender, visible) {
-    if (!IS_MAC) return;
-    const win = windowForWebContents(sender);
-    if (!win) return;
-    // AppKit drops declared drag regions when button visibility mutates;
-    // applyFocusModeChrome re-declares them after changing the native chrome.
-    applyFocusModeChrome(win, visible, { positionTrafficLights });
-  }
-
   function handleWindowControl(sender, action, senderFrame) {
     const win = windowForWebContents(sender);
     if (!win) return;
@@ -1923,49 +1512,6 @@ function createWindowLifecycle(options) {
     } catch {
       return ""; // missing, malformed, or torn down: fail closed
     }
-  }
-
-  function setThemeMode(pref) {
-    if (pref === "system" || pref === "dark" || pref === "light") {
-      nativeTheme.themeSource = resolveThemeSource(pref, "");
-    }
-  }
-
-  function setTitlebarMode(mode) {
-    if (!IS_WINDOWS) return;
-    const resolvedMode = mode === "dark" || mode === "light"
-      ? mode
-      : (nativeTheme.shouldUseDarkColors ? "dark" : "light");
-    // Continue past framed modal windows that cannot accept an overlay; the
-    // helper catches per-window so one dialog cannot strand siblings.
-    paintAllTitleBarOverlays(
-      BaseWindow.getAllWindows(),
-      resolvedMode,
-      HEADER_CSS_PX,
-    );
-  }
-
-  function applyZoom(sender, factor) {
-    sender.setZoomFactor(factor);
-    for (const win of BaseWindow.getAllWindows()) {
-      if (win._mcView) positionTrafficLights(win);
-    }
-    return factor;
-  }
-
-  function getZoom(sender) {
-    return sender.getZoomFactor();
-  }
-
-  function setZoom(sender, factor) {
-    return applyZoom(sender, clampZoomFactor(factor));
-  }
-
-  function stepZoom(sender, direction) {
-    return applyZoom(
-      sender,
-      stepZoomFactor(sender.getZoomFactor(), direction > 0 ? +1 : -1),
-    );
   }
 
   function panelForSender(sender, panelId, opts) {
@@ -2202,6 +1748,7 @@ function createWindowLifecycle(options) {
     chrome: {
       setThemeAccent,
       focusMode: handleFocusMode,
+      watchFocusCursor: handleWatchFocusCursor,
       windowControl: handleWindowControl,
       setThemeMode,
       setTitlebarMode,

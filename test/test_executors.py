@@ -9,16 +9,47 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from unittest import mock
 
 import pytest
 
 import kiro_crew.executors as ex
+from kiro_crew.testing.wait import async_wait_until, default_timeout
+
+
+def setup_function() -> None:
+    # Own fresh pools. They are memoized process-wide, so a test that runs right
+    # after another file on the same xdist worker would otherwise inherit whatever
+    # that file queued: a session-tree checkpoint debounce parks a 1 s sleep on
+    # mc-maint per seeded projection, and a trivial call queued behind tens of them.
+    ex.shutdown_maintenance_executor()
 
 
 def teardown_function() -> None:
     # Don't leak pools between tests (the module memoizes them process-wide).
     ex.shutdown_maintenance_executor()
+
+
+def _ran_on(pool, fn):
+    """``fn()`` as run by *pool*, or a failure naming the pool and what it waited.
+
+    ``submit`` starts the worker thread itself, so all the bound covers is one
+    hand-off to that thread: milliseconds. The lost-run ceiling is the shared
+    default (half the test's timeout), so a dead pool fails here by name rather
+    than as a lost run.
+    """
+    started = time.monotonic()
+    ceiling = default_timeout()
+    future = pool.submit(fn)
+    try:
+        return future.result(timeout=ceiling)
+    except TimeoutError:
+        pytest.fail(
+            f"{pool._thread_name_prefix} ran nothing within the "
+            f"{ceiling:.0f}s lost-run ceiling: waited "
+            f"{time.monotonic() - started:.2f}s, {pool._work_queue.qsize()} item(s) still queued"
+        )
 
 
 def test_maintenance_and_cron_are_distinct_pools() -> None:
@@ -69,6 +100,7 @@ def test_thread_name_prefixes_distinguish_pools() -> None:
     # Named for the crew log rather than "ledger": three other mechanisms in this
     # codebase are also called a ledger, and a stack dump has to name which one.
     assert ex.crew_log_executor()._thread_name_prefix == "mc-crewlog"
+    assert ex.update_executor()._thread_name_prefix == "mc-update"
 
 
 def test_pools_are_bounded() -> None:
@@ -77,6 +109,33 @@ def test_pools_are_bounded() -> None:
     assert ex.cron_executor()._max_workers == ex._MAX_CRON_WORKERS
     assert ex.maintenance_executor()._max_workers == ex._MAX_MAINT_WORKERS
     assert ex.subprocess_executor()._max_workers == ex._MAX_SUBPROCESS_WORKERS
+    # One apply holds the exclusive update lock for its whole run.
+    assert ex.update_executor()._max_workers == ex._MAX_UPDATE_WORKERS == 1
+
+
+def test_static_asset_pool_is_isolated_bounded_named_and_reset() -> None:
+    static = ex.static_asset_executor()
+    assert static is ex.static_asset_executor()
+    assert static is not ex.discovery_executor()
+    assert static._max_workers == ex._MAX_STATIC_ASSET_WORKERS
+    assert static._thread_name_prefix == "mc-static"
+    assert _ran_on(static, lambda: 3 + 3) == 6
+    ex.shutdown_maintenance_executor()
+    assert ex.static_asset_executor() is not static
+
+
+def test_memory_preparation_pool_is_one_named_worker_and_fresh_per_pass() -> None:
+    # Fresh per pass: a stopped pass's worker can still hold its thread, and the
+    # next gateway's pass must not queue behind it.
+    first = ex.memory_preparation_executor()
+    second = ex.memory_preparation_executor()
+    try:
+        assert first is not second
+        assert first._max_workers == 1
+        assert first._thread_name_prefix == "mc-memprep"
+    finally:
+        first.shutdown(wait=False)
+        second.shutdown(wait=False)
 
 
 def test_shutdown_is_idempotent_and_resets() -> None:
@@ -92,17 +151,17 @@ def test_shutdown_is_idempotent_and_resets() -> None:
 
 
 def test_pools_execute_work() -> None:
-    assert ex.maintenance_executor().submit(lambda: 1 + 1).result(timeout=5) == 2
-    assert ex.subprocess_executor().submit(lambda: 4 + 4).result(timeout=5) == 8
-    assert ex.cron_executor().submit(lambda: 2 + 3).result(timeout=5) == 5
+    assert _ran_on(ex.maintenance_executor(), lambda: 1 + 1) == 2
+    assert _ran_on(ex.subprocess_executor(), lambda: 4 + 4) == 8
+    assert _ran_on(ex.cron_executor(), lambda: 2 + 3) == 5
 
 
 def test_path_resolve_pool_is_isolated_bounded_named_and_reset() -> None:
     # The sensitive-path gates' realpath run inline on the event loop can
     # block in the kernel on a stalled automount for as long as the mount
-    # did.  The caller now bounds its wait, but a timed-out future does NOT free
-    # its thread -- so a wedged lstat must only ever be able to starve OTHER
-    # path resolution, never the sweeps, teardown, or the default executor.
+    # did.  It now runs in this pool's child interpreters, killed at the
+    # deadline -- and the pool is still its own, so a wedged lstat can only ever
+    # cost OTHER path resolution, never the sweeps, teardown, or the default executor.
     pool = ex.path_resolve_executor()
     assert pool is ex.path_resolve_executor()
     for other in (
@@ -113,9 +172,9 @@ def test_path_resolve_pool_is_isolated_bounded_named_and_reset() -> None:
         ex.governance_executor(),
     ):
         assert pool is not other
-    assert pool._max_workers == ex._MAX_PATH_RESOLVE_WORKERS
-    assert pool._thread_name_prefix == "mc-pathres"
-    assert pool.submit(lambda: 6 * 7).result(timeout=5) == 42
+    assert len(pool._children) == ex._MAX_PATH_RESOLVE_WORKERS
+    assert pool._fallback._thread_name_prefix == "mc-pathres-inline"
+    assert pool.submit(lambda: 6 * 7).result(timeout=default_timeout()) == 42
     ex.shutdown_maintenance_executor()
     assert ex.path_resolve_executor() is not pool
 
@@ -137,7 +196,7 @@ def test_governance_pool_is_isolated_bounded_and_reset() -> None:
     assert gov._thread_name_prefix == "mc-gov"
     assert gov._max_workers == ex._MAX_GOVERNANCE_WORKERS
     # Executes work.
-    assert gov.submit(lambda: 7 * 6).result(timeout=5) == 42
+    assert gov.submit(lambda: 7 * 6).result(timeout=default_timeout()) == 42
     # Shutdown resets it (fresh pool next use).
     ex.shutdown_maintenance_executor()
     assert ex.governance_executor() is not gov
@@ -395,11 +454,9 @@ async def test_cancelling_the_caller_does_not_kill_a_job_already_running():
 
     try:
         task = asyncio.create_task(ex.run_in_cron_pool(slow, timeout=30, queue_timeout=30))
-        for _ in range(300):
-            if entered.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert entered.is_set(), "precondition: the job must have started"
+        await async_wait_until(
+            entered.is_set, describe=lambda: "precondition: the job must have started"
+        )
 
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -467,7 +524,7 @@ def test_cron_gate_pool_is_isolated_from_the_externally_paced_governance_pool() 
     # Memoized, named, bounded.
     assert ex.cron_gate_executor() is gate
     assert gate._max_workers == ex._MAX_CRON_GATE_WORKERS
-    worker = gate.submit(threading.current_thread).result(timeout=5)
+    worker = gate.submit(threading.current_thread).result(timeout=default_timeout())
     assert worker.name.startswith("mc-crongate"), f"gate ran on {worker.name!r}"
     # Reset by the shared shutdown, or a later test inherits a saturated pool.
     ex.shutdown_maintenance_executor()

@@ -339,7 +339,18 @@ class TestSearchSessionsRemote:
         from kiro_crew.instances.ssh_tunnel_manager import SshTunnelManager
 
         mgr = SshTunnelManager.__new__(SshTunnelManager)
+        # The generation map: this carrier re-reads the forward it resolved
+        # before it spends the credential, and the generation is half of that
+        # reading, so a manager assembled without `__init__` must name it.
+        mgr._tunnel_epoch = {}
         mgr._tokens = {"peer": "tok-1"}
+        mgr._peer_sessions = {}
+        mgr._chained_far_end = {}
+
+        async def _identity_exchange(url, link, cookie_name):
+            return link
+
+        mgr._exchange_link = _identity_exchange  # type: ignore[method-assign]
         mgr._tunnels = {}
         return mgr
 

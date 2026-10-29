@@ -14,6 +14,7 @@ import tarfile
 from pathlib import Path
 
 import pytest
+from test_snapshot import snapshot_family_paths
 
 from kiro_crew import snapshot_redact as redact
 
@@ -44,41 +45,41 @@ class TestTheFilterKeywordHasAFallbackAtEverySite:
     def test_the_redaction_extract_falls_back_like_the_restore_extract(self) -> None:
         import ast
 
-        src = Path(__import__("kiro_crew.snapshot", fromlist=["x"]).__file__)
-        tree = ast.parse(src.read_text(encoding="utf-8"))
-        unguarded: list[int] = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not (isinstance(func, ast.Attribute) and func.attr == "extractall"):
-                continue
-            if not any(kw.arg == "filter" for kw in node.keywords):
-                continue
-            # Walk up is not available on an ast node, so re-scan: the call must sit inside
-            # a Try whose handlers name TypeError.
-            guarded = False
-            for outer in ast.walk(tree):
-                if not isinstance(outer, ast.Try):
+        unguarded: list[str] = []
+        for src in snapshot_family_paths():
+            tree = ast.parse(src.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
                     continue
-                if node not in list(ast.walk(outer)):
+                func = node.func
+                if not (isinstance(func, ast.Attribute) and func.attr == "extractall"):
                     continue
-                for handler in outer.handlers:
-                    names = (
-                        [handler.type.id]
-                        if isinstance(handler.type, ast.Name)
-                        else [
-                            e.id
-                            for e in getattr(handler.type, "elts", [])
-                            if isinstance(e, ast.Name)
-                        ]
-                    )
-                    if "TypeError" in names:
-                        guarded = True
-            if not guarded:
-                unguarded.append(node.lineno)
+                if not any(kw.arg == "filter" for kw in node.keywords):
+                    continue
+                # Walk up is not available on an ast node, so re-scan: the call must sit inside
+                # a Try whose handlers name TypeError.
+                guarded = False
+                for outer in ast.walk(tree):
+                    if not isinstance(outer, ast.Try):
+                        continue
+                    if node not in list(ast.walk(outer)):
+                        continue
+                    for handler in outer.handlers:
+                        names = (
+                            [handler.type.id]
+                            if isinstance(handler.type, ast.Name)
+                            else [
+                                e.id
+                                for e in getattr(handler.type, "elts", [])
+                                if isinstance(e, ast.Name)
+                            ]
+                        )
+                        if "TypeError" in names:
+                            guarded = True
+                if not guarded:
+                    unguarded.append(f"{src.name}:{node.lineno}")
         assert unguarded == [], (
-            f"extractall(filter=...) at line(s) {unguarded} has no TypeError fallback -- "
+            f"extractall(filter=...) at {unguarded} has no TypeError fallback -- "
             f"an uncaught TypeError on Python < 3.11.4"
         )
 

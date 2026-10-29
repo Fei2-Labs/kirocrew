@@ -83,8 +83,19 @@ DEFAULT_QR_TTL_SECS = 3600
 #: credential that travels as a scannable image.
 MAX_QR_TTL_SECS = 12 * 3600
 
+#: Pixels per QR module for the access code. The connect dialog and the Overview
+#: card show this image at its natural size when the container is wide enough, so
+#: each module is exactly 4 CSS pixels (8 device pixels on a 2x screen).
+#: ``max-w-full`` scales the image down in a narrower container. The access URL
+#: carries a signed token, so the symbol runs to about 80 modules, and at 4 pixels
+#: a module it fits the dialog. It is not the shared default of 8: that image is
+#: about twice the dialog's width, so the browser would shrink it by a fractional
+#: factor.
+MOBILE_QR_BOX_SIZE = 4
+
 Step = Literal[
     "pinned",
+    "untrusted_cli",
     "install",
     "start_daemon",
     "sign_in",
@@ -120,6 +131,10 @@ def _derive_step(
        errands. ``start_daemon`` covers both a daemon that does not answer and
        one that answers as stopped (``BackendState "Stopped"``): the errand is
        the same, and the verbatim probe detail tells the two apart.
+       ``untrusted_cli`` is the one of these where Tailscale IS installed, at a
+       path the planted-binary check refuses (a user-owned Homebrew prefix):
+       downloading it again changes nothing, and ``dashboard.url`` is the
+       remedy that works.
     3. ``enable_https`` — the name exists but the tailnet has not granted
        certificate provisioning for it. This is a tailnet-wide administrator
        consent and cannot safely be performed by a gateway process.
@@ -145,7 +160,7 @@ def _derive_step(
     if pinned:
         return "pinned"
     if not probe.installed:
-        return "install"
+        return "untrusted_cli" if probe.refused_cli else "install"
     if not probe.reachable:
         return "start_daemon"
     # A stopped daemon (``BackendState "Stopped"``) answers status reads but the
@@ -291,6 +306,16 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
             # above is a best-effort hint; this is what Tailscale actually said,
             # and it is the only thing that stays correct if upstream rewords.
             "detail": live.serve_detail or probe.detail,
+            # The refused binary's path on ``untrusted_cli``, shown on its own
+            # line; ``detail`` already says why in a sentence the card's body
+            # copy repeats, so the card renders only the path.
+            "refused_cli": probe.refused_cli,
+            # The publish the gateway cannot run for a refused binary, spelled
+            # for the operator to run by hand. Built here because only the
+            # server knows the port it actually listens on.
+            "serve_command": (
+                tailnet_serve.manual_publish_command(port) if probe.refused_cli and port else ""
+            ),
             "download_url": TAILSCALE_DOWNLOAD_URL,
         }
     )
@@ -340,9 +365,12 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
         # No audit_tool: a polled read must not append an HMAC-chained SEL row
         # per refresh (see tailnet.is_governance_pinned_off).
         pinned = await asyncio.to_thread(tailnet.is_governance_pinned_off)
-    except Exception:  # pragma: no cover - the probe is itself guarded
+    except Exception:
+        # Fail CLOSED, matching the callee's own contract: an unknown ceiling is
+        # treated as pinned, so the QR mint refuses rather than issuing an owner
+        # credential over a tailnet the ceiling may forbid.
         logger.debug("tailnet mobile: governance probe unavailable", exc_info=True)
-        pinned = False
+        pinned = True
 
     probe = tailnet.DaemonProbe(
         name="", installed=False, reachable=False, logged_in=False, detail=""
@@ -389,7 +417,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
 #: tailnet access, and a still-running publication from before the pin was applied
 #: must not remain a source of fresh owner credentials.
 #:
-#: The four "no usable tailnet name" steps deliberately share ``no_name``: they
+#: The "no usable tailnet name" steps deliberately share ``no_name``: they
 #: differ in which errand fixes them, which is the CARD's business, and the API
 #: contract only needs to say why no code was made.
 _QR_REFUSALS: dict[Step, tuple[str, str]] = {
@@ -417,12 +445,13 @@ _QR_REFUSALS: dict[Step, tuple[str, str]] = {
         "The dashboard is not published on the tailnet, so a phone could not " "reach it.",
     ),
 }
-#: The other three "no usable tailnet name" steps answer exactly as ``install``, and
+#: The other "no usable tailnet name" steps answer exactly as ``install``, and
 #: an undetermined serve state is not "free" — it refuses as not-yet-published.
 #: Written as an update rather than a ``for`` loop so no loop variable is left bound
 #: at module scope.
 _QR_REFUSALS.update(
     {
+        "untrusted_cli": _QR_REFUSALS["install"],
         "start_daemon": _QR_REFUSALS["install"],
         "sign_in": _QR_REFUSALS["install"],
         "enable_magicdns": _QR_REFUSALS["install"],
@@ -452,13 +481,13 @@ def _guard(request: web.Request) -> web.Response | None:
     **Owner only.** Being a dashboard user is NOT enough, because a dashboard user
     is not necessarily *this* dashboard's owner. Telegram, Teams and Slack all
     hand a presigned dashboard link to any ALLOWED user, minting a token whose
-    ``sub`` is that user's own id (``telegram/transport_dispatch``,
+    ``sub`` is that user's own id (``telegram/dispatch/commands``,
     ``teams/transport_dispatch``) — so a non-owner can legitimately hold a
     dashboard session. The QR endpoint mints ``generate_token(owner_id or
     "local-app")``, i.e. an OWNER-subject credential, and ``local-app`` is itself
     in ``_LOCAL_DASHBOARD_OWNER_SUBJECTS``. Without this gate any allowed
     messaging user could trade their own scoped session for an owner one — a
-    privilege escalation, not merely an over-broad surface. ``core.py``'s
+    privilege escalation, not merely an over-broad surface. ``core_local_token.py``'s
     identical mint is gated by loopback + a local-secret HMAC; this endpoint is
     reachable over the tailnet, so it needs the owner claim instead.
     ``is_owner_dashboard_request`` is reused rather than re-derived: a second copy
@@ -1091,7 +1120,7 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     url = f"https://{host}/?token={token}"
     try:
 
-        image = await asyncio.to_thread(render_qr_data_uri, url)
+        image = await asyncio.to_thread(render_qr_data_uri, url, box_size=MOBILE_QR_BOX_SIZE)
     except Exception:
         logger.debug("tailnet mobile QR encode failed", exc_info=True)
         await _audit_async(request, "tailnet.mobile.qr", "denied", "encode-failed")

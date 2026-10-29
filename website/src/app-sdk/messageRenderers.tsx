@@ -14,59 +14,103 @@
  * state is supplied BY the host as a registry entry instead.
  */
 import React, { memo } from 'react'
-import { Clock, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react'
+import { Clock, AppWindow, LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight, Copy, Check, ChevronDown, ChevronUp } from 'lucide-react'
 import { i18nT } from '../i18n/t'
 import { isNoteRow } from '../lib/noteContract'
 import { parseOptions } from './protocol'
 import ErrorNotice from '../components/ErrorNotice'
 import { copyToClipboard } from '../utils/clipboard'
 import { extractToolFilePath } from '../utils/toolFilePath'
+import { deriveToolCallTitle } from '../utils/toolCallTitle'
 import { isSafePath } from '../utils/safePath'
 import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage'
 import { type FileChangeEntry } from '../components/FileChangeChips'
+import { FileCard } from '../components/FileCard'
+import { parseFileRecord } from '../lib/fileRecord'
 import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
 import NudgeCard from '../pages/chat/NudgeCard'
 import NoticeCard from '../pages/chat/NoticeCard'
 import { SystemNoticeRow, isSystemNoticeRow } from '../pages/chat/CompactionCard'
+import SkillLoadCard, { isSkillLoadRow } from '../pages/chat/SkillLoadCard'
 import { ErrorCard } from '../pages/chat/ErrorCard'
 import { decisionStripFieldOf } from '../pages/chat/decisionRecord'
 import { resolveTransientNotice } from '../pages/chat/transientNotice'
 import StopEventCard from '../pages/chat/StopEventCard'
+import { warmBriefBodyOf } from '../components/chat/WarmBriefCard'
+import { ToolDetails } from '../pages/chat/ToolDetails'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
-import { REASONING_ROLES } from '../pages/chat/groupDisplayItems'
+import { REASONING_ROLES, stripAppEnvelope } from '../pages/chat/groupDisplayItems'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import { renderUserContent } from '../pages/chat/ChatPageMessageContent'
+import ThreadFooter from '../pages/chat/ThreadFooter'
+import type { ThreadSummary } from '../api/threads'
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 import { turnHadPolicyBlock } from './turnPolicyBlock'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import { isRejectedDecision } from '../utils/approvalDecision'
+import { useReportRowActive } from '../pages/chat/rowActivity'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
+/** What a host that offers reply threads hands the rows: the footer data per
+ *  parent `mid`, and the open action. Both are keyed by the message's durable
+ *  `meta.mid`, the only identity a thread can hang off. */
+export interface ThreadHooks {
+  summaryOf: (mid: string) => ThreadSummary | undefined
+  onOpen: (mid: string) => void
+  /** The crewmate's display name -- the face beside its replies. */
+  crewmateName: string
+}
+
 export interface MessageRenderContext {
   /** Index of this message in `messages`. Needed by rows that look ahead. */
   index: number
-  /** The whole transcript. The assistant footer rule depends on what follows. */
+  /** The whole transcript. The assistant footer rule depends on what follows.
+   *  Read a `streaming` neighbour by its role, never its text: the list
+   *  redraws a row when any other row changes EXCEPT a streaming row's text
+   *  growing (chat-core/transcript/transcriptVersion). */
   messages: ChatMessage[]
   /** Whether the session is currently producing output. */
   running: boolean
   /** Stable React key the list computed for this row. */
   key: string
   onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void
+  /** Open an artifact (`/artifacts/<slug>` link in a reply) in the host's side
+   *  panel, the way the main chat does. Absent = the link stays a plain
+   *  `target="_blank"` anchor to the standalone artifact view, which a
+   *  crewmate DM must not do (#18320). Capability by omission, like
+   *  `onFileOpen`. */
+  onArtifactOpen?: (slug: string) => void
   /** Selection actions the host offers on assistant text (see
    *  chat-core/composer/selectionActions). Absent = Copy only. */
   onQuote?: (text: string, rect: DOMRect) => void
   onAsk?: (text: string) => void
+  /** Quote a WHOLE row into the host's next send (`chat-core/composer/messageQuote`).
+   *  A host capability, like `onQuote`: absent, no row offers Quote and no
+   *  bubble arms its context menu. Receives the row's own fields, so the
+   *  renderer never has to know what the host stores. */
+  onQuoteMessage?: (role: 'user' | 'assistant', content: string, ts?: string, mid?: string) => void
   /** Drop mcp_oauth banners a Connections card already owns. */
   hideCardOwnedOAuth: boolean
+  /** Whether a row's error notice may offer the "Ask the agent" hand-off.
+   *  `false` when the host holds unsaved local state (a composer draft) that
+   *  the hand-off's navigation would drop. Absent = `true`. */
+  handOff?: boolean
   /** tool_call_ids whose call a policy or hook blocked. */
   autoDeniedIds: Set<string>
+  /** Whether a tool row opens its input/output panel on click. Absent =
+   *  `true`; `false` draws the bare status pill (ChatEmbed's
+   *  `hide={['toolDetails']}`). A `renderTool` row is the host's own. */
+  toolDetails?: boolean
   /** Host-injected tool row, kept as a shorthand for replacing the tool entries. */
   renderTool?: (message: ChatMessage) => React.ReactNode
+  /** Reply threads on this transcript's messages (a crewmate's chat). Absent
+   *  on every other surface: no footer, no "Reply in thread" action. */
+  threads?: ThreadHooks
   /** Bubble layout used by conversational rows. `isUser` right-aligns. */
   wrapper: (children: React.ReactNode, isUser?: boolean) => React.ReactNode
   /** Full-width row layout used by cards, pills and banners. */
@@ -93,6 +137,32 @@ export interface MessageRenderer {
 export function formatTs(ts?: string): string | undefined {
   if (!ts) return undefined
   return fmtMessageTime(ts) || undefined
+}
+
+/** The durable id a thread hangs off, or `undefined` for a row that has none
+ *  (a pre-id transcript row cannot carry a thread). */
+export function threadMidOf(m: ChatMessage): string | undefined {
+  const mid = (m.meta as Record<string, unknown> | undefined)?.mid
+  return typeof mid === 'string' && mid ? mid : undefined
+}
+
+/** The footer under a bubble whose thread has replies, or null. `align` follows
+ *  the bubble: the user's sits on the right. */
+export function threadFooterFor(m: ChatMessage, ctx: MessageRenderContext, align: 'start' | 'end'): React.ReactNode {
+  const hooks = ctx.threads
+  const mid = threadMidOf(m)
+  if (!hooks || !mid) return null
+  const summary = hooks.summaryOf(mid)
+  if (!summary || summary.count <= 0) return null
+  return <ThreadFooter summary={summary} crewmateName={hooks.crewmateName} align={align} onOpen={() => hooks.onOpen(mid)} />
+}
+
+/** The row action that opens (or starts) the thread on this message, or undefined. */
+export function replyInThreadFor(m: ChatMessage, ctx: MessageRenderContext): (() => void) | undefined {
+  const hooks = ctx.threads
+  const mid = threadMidOf(m)
+  if (!hooks || !mid) return undefined
+  return () => hooks.onOpen(mid)
 }
 
 /**
@@ -127,8 +197,10 @@ const TOOL_PANEL_COLLAPSED_CHARS = 800
  */
 const TOOL_PANEL_EXPANDED_MAX_H = 'max-h-[500px]'
 
-/** Prop-driven tool row. The store-connected variant is a host entry. */
-export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean }) {
+/** Prop-driven tool row. The store-connected variant is a host entry.
+ *  `expandable={false}` draws the pill as a plain status label: no toggle and
+ *  no input/output panel. */
+export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied, askAgent = true, expandable = true }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean; askAgent?: boolean; expandable?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = React.useState(false)
   // Second axis, deliberately separate from `expanded`: the pill toggles whether
@@ -139,9 +211,17 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   const [copyOutcome, setCopyOutcome] = React.useState<CopyOutcome>('idle')
   const copyResetTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   React.useEffect(() => () => { if (copyResetTimer.current) clearTimeout(copyResetTimer.current) }, [])
-  const isDone = message.role === 'tool_result'
+  // A finished call is NOT re-roled: the backend writes the result onto the 🔧
+  // row's own `meta.output` (chat_runner's EVENT_TOOL_RESULT handler; '' for a
+  // terminal frame with no renderable output), so the role alone left every
+  // completed call in a polled transcript on the loader. Same rule as the
+  // store-connected ToolCallLine: a result arrived, or the session is idle and
+  // nothing further will run.
+  const isDone = message.role === 'tool_result' || message.meta?.output != null || !running
   const isRejected = isRejectedDecision(message.meta?.resolved)
   const hasPendingPerm = message.role === 'permission' && !message.meta?.resolved
+  // A running or opened pill never folds into its turn's fold (rowActivity).
+  useReportRowActive(!isDone || hasPendingPerm || (expandable && expanded))
 
   // Prefer the backend-stamped purpose ("Add teams_data dict guard…") over the
   // raw command, matching the main chat. The raw label is the fallback, and is
@@ -149,7 +229,22 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   // text for the expanded panel or the file probe.
   const rawLabel = (message.content || '').replace(/^🔧\s*/, '').split('\n')[0]
   const purpose = typeof message.meta?.purpose === 'string' ? message.meta.purpose : ''
-  const label = purpose || rawLabel || message.role
+  // Without a purpose, the title the main chat shows by default (simplified
+  // tool names): the transport title `Running: <cmd>` is a LIVE verb, so on a
+  // finished row it would contradict the done icon. Same derivation, same
+  // persisted meta (`_tool_meta`), as ToolCallLine.
+  const metaStr = (k: string) => (typeof message.meta?.[k] === 'string' ? message.meta[k] as string : '')
+  const derivedTitle = React.useMemo(() => rawLabel ? deriveToolCallTitle({
+    title: rawLabel,
+    kind: metaStr('kind'),
+    rawInput: message.meta?.input,
+    isShell: message.meta?.is_shell === true,
+    toolName: metaStr('tool_name'),
+    mcpServer: metaStr('mcp_server'),
+  }).title : '',
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- metaStr reads message.meta
+  [rawLabel, message.meta])
+  const label = purpose || derivedTitle || rawLabel || message.role
 
   // Status icon + colour mirror the store-connected tool row so an embedded
   // transcript reads with the same visual grammar as a main session: spinner
@@ -163,13 +258,13 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   // so it must escape both the loader icon and the spin animation.
   const Icon = isRejected ? CircleSlash : isAutoDenied ? CircleAlert : isDone ? CircleDot : hasPendingPerm ? Lock : LoaderCircle
   const tone = isRejected
-    ? 'text-danger bg-danger-subtle'
+    ? 'text-danger-text bg-danger-subtle'
     : isAutoDenied
-      ? 'text-warn bg-warn-subtle'
+      ? 'text-warn-text bg-warn-subtle'
       : isDone
-        ? 'text-ok bg-ok/5'
+        ? 'text-ok-text bg-ok/5'
         : hasPendingPerm
-          ? 'text-warn bg-warn-subtle'
+          ? 'text-warn-text bg-warn-subtle'
           : 'text-accent bg-accent/5'
   // Animate ONLY while the session is actually running, so a tool call left
   // un-terminated by a dropped turn does not spin forever and make an idle
@@ -186,9 +281,29 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
   // Hoisted out of the JSX so the panel and the copy button cannot drift: what
   // gets copied is exactly what the panel shows, not the portion the 160px box
   // happens to have scrolled into view.
-  const panelText = purpose && rawLabel && purpose !== rawLabel
-    ? rawLabel + '\n\n' + (message.content || '')
-    : (message.content || '')
+  // The backend persists the call's `input` and its `output` on the tool row's
+  // meta (`_tool_meta` / the tool-result handler in chat_runner.py), and the
+  // embed's transcript response carries them. `message.content` is only the
+  // "🔧 title" line, so when either payload is present the expanded row renders
+  // the main chat's own `ToolDetails` (Input/Output tabs) instead of repeating
+  // the title. The content panel below stays as the fallback for rows that
+  // predate the persisted payloads.
+  const metaInput = typeof message.meta?.input === 'string' ? message.meta.input : ''
+  const metaOutput = typeof message.meta?.output === 'string' ? message.meta.output : ''
+  const hasPayload = !!(metaInput || metaOutput)
+  // With a payload, Copy takes both halves (input, blank line, output) rather
+  // than whichever tab is showing: `ToolDetails` owns its tab state, and a copy
+  // that silently follows a hidden tab would be a guess about what was meant.
+  const panelText = hasPayload
+    ? [metaInput, metaOutput].filter(Boolean).join('\n\n')
+    : purpose && rawLabel && purpose !== rawLabel
+      ? rawLabel + '\n\n' + (message.content || '')
+      : (message.content || '')
+  const detailsId = React.useId()
+  // Rail colour mirrors the pill's status tone, at the main chat's 70% mix.
+  const detailsRail = {
+    color: `color-mix(in srgb, ${isRejected ? 'var(--danger)' : isAutoDenied ? 'var(--warn)' : isDone ? 'var(--ok)' : hasPendingPerm ? 'var(--warn)' : 'var(--accent)'} 70%, transparent)`,
+  }
   // The two budgets above are width-blind, so the collapsed box is also measured
   // once it is on screen: a real browser then detects the wrap case exactly,
   // while jsdom reports 0 for both heights and falls back to the budgets.
@@ -222,22 +337,44 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
     }
     copyToClipboard(panelText).then(settle)
   }, [panelText])
+  // A payload row's Copy carries visible text, and that text is also its name.
+  // It never turns into the failure string: `ErrorNotice` below reports a
+  // refused write, and the retry control keeps saying what it copies.
   const copyTitle = copyOutcome === 'copied'
     ? i18nT('appSdk.chatMessageList.copied')
-    : copyOutcome === 'failed'
-      ? i18nT('appSdk.chatMessageList.copy_failed')
-      : i18nT('appSdk.chatMessageList.copy')
+    : hasPayload
+      ? i18nT('appSdk.chatMessageList.copy_input_and_output')
+      : copyOutcome === 'failed'
+        ? i18nT('appSdk.chatMessageList.copy_failed')
+        : i18nT('appSdk.chatMessageList.copy')
 
+  const pillBody = (
+    <>
+      <Icon size={12} className={iconClass} />
+      <span className="truncate">{label}</span>
+    </>
+  )
+
+  // The two pill shapes repeat their classes inline: a class string held in a
+  // variable is read as copy by the i18n gate.
   return (
     <div className="animate-scale-in flex items-center gap-2 flex-wrap">
-      <button
-        onClick={() => setExpanded(e => !e)}
-        aria-expanded={expanded}
-        className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
-      >
-        <Icon size={12} className={iconClass} />
-        <span className="truncate">{label}</span>
-      </button>
+      {expandable ? (
+        <button
+          onClick={() => setExpanded(e => !e)}
+          aria-expanded={expanded}
+          className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md cursor-pointer transition-all max-w-[min(600px,90%)] hover:brightness-110 ${tone}`}
+        >
+          {pillBody}
+        </button>
+      ) : (
+        <span
+          className={`inline-flex items-center gap-2 text-[13px] leading-5 font-mono px-2 py-0.5 rounded-md transition-all max-w-[min(600px,90%)] ${tone}`}
+          data-testid="tool-pill-static"
+        >
+          {pillBody}
+        </span>
+      )}
       {filePath && onFileOpen && (
         <button
           onClick={() => onFileOpen(filePath)}
@@ -249,28 +386,58 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
           <PanelRight size={11} />
         </button>
       )}
-      {expanded && message.content && (
-        <div className="w-full mt-1 ml-4">
-          <pre ref={panelRef} className={`w-full text-[11px] leading-4 font-mono text-muted bg-bg-elevated rounded-md p-2 ${showAll ? TOOL_PANEL_EXPANDED_MAX_H : 'max-h-40'} overflow-auto whitespace-pre-wrap break-all border border-border`}>
-            {panelText}
-          </pre>
+      {/* Gated on `expandable` too, not only through the missing toggle: a
+          host that turns details off while a panel is open must close it. */}
+      {expandable && expanded && (hasPayload || message.content) && (
+        <div className="w-full mt-1 ml-4" data-testid={hasPayload ? 'tool-pill-details' : undefined}>
+          {/* Not `compact`: that form caps the payload at 160px, which is what
+              the main transcript reserves for the composer's approval mirror.
+              The full form scrolls at the main chat's own 400/500px caps, so
+              no Show-more toggle is needed on this branch. */}
+          {hasPayload ? (
+            <ToolDetails
+              purpose={purpose}
+              pillLabel={label}
+              toolName={rawLabel}
+              input={metaInput}
+              output={metaOutput}
+              auto={false}
+              pending={hasPendingPerm}
+              ts={0}
+              hasEntry
+              fmtTime={() => ''}
+              barColor={detailsRail.color}
+              layoutId={`embed-tool-detail-${detailsId}`}
+              flush
+            />
+          ) : (
+            <pre ref={panelRef} className={`w-full text-[11px] leading-4 font-mono text-muted bg-bg-elevated rounded-md p-2 ${showAll ? TOOL_PANEL_EXPANDED_MAX_H : 'max-h-40'} overflow-auto whitespace-pre-wrap break-all border border-border`}>
+              {panelText}
+            </pre>
+          )}
           {/* A row of its OWN, below the panel. `website/AUTOSDE.yaml`'s
               `max-two-buttons-per-row` caps a horizontal action group at two and
               does not count "controls in a genuinely different row or a
               separated region", so these two are not siblings of the pill's own
               toggle and file chip — and this row itself holds exactly two. */}
-          <div className="flex items-center gap-1 mt-1">
+          {/* On a payload row the controls start on the payload box's left edge:
+              the rail is a 2px border plus a pl-3 inset (`ROW_RAIL_CLASS`). */}
+          <div className={`flex items-center gap-1 mt-1 ${hasPayload ? 'pl-[14px]' : ''}`}>
             <button
               type="button"
               onClick={copyPanel}
               title={copyTitle}
               aria-label={copyTitle}
               aria-live="polite"
-              className="inline-flex items-center p-0.5 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer shrink-0 transition-colors"
+              className={`inline-flex items-center rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer transition-colors ${hasPayload ? 'gap-1 px-1 py-0.5 min-w-0 text-left text-[11px] leading-4' : 'p-0.5 shrink-0'}`}
             >
-              {copyOutcome === 'copied' ? <Check size={11} className="text-ok" /> : <Copy size={11} />}
+              {copyOutcome === 'copied' ? <Check size={11} className="text-ok shrink-0" /> : <Copy size={11} className="shrink-0" />}
+              {/* A payload row's Copy takes both halves, not the tab on screen,
+                  so it says so in words: a tooltip never reaches a touch
+                  reader. */}
+              {hasPayload && <span data-testid="tool-panel-copy-label">{copyTitle}</span>}
             </button>
-            {panelOverflows && (
+            {!hasPayload && panelOverflows && (
               <button
                 type="button"
                 onClick={() => setShowAll(s => !s)}
@@ -287,18 +454,20 @@ export const ToolCallPill = memo(function ToolCallPill({ message, running, onFil
               `ErrorNotice` rather than an icon of our own. Its own row, below the
               controls: the hand-off is a button, and `max-two-buttons-per-row`
               counts per visual group, so putting it here keeps that group at two.
-              `askAgent` is ON deliberately — this panel is a log surface holding
-              no unsaved input, so the navigation destroys nothing, and the agent
-              has a real recovery to offer (re-emit the output the copy failed to
-              take). ErrorNotice is safe in this module: it reaches no store and no
+              `askAgent` follows the host: this panel is a log surface holding no
+              unsaved input, and the agent has a real recovery to offer (re-emit
+              the output the copy failed to take), so it is on by default.
+              No hand-off when the host passes `askAgent={false}`: the navigation
+              would drop the host's own unsaved composer draft (ChatEmbed).
+              ErrorNotice is safe in this module: it reaches no store and no
               router, only lucide, `AskAgentButton` and `i18nT`. */}
           {copyOutcome === 'failed' && (
             <ErrorNotice
               message={i18nT('appSdk.chatMessageList.copy_failed')}
               variant="inline"
-              askAgent
+              askAgent={askAgent}
               onDismiss={() => setCopyOutcome('idle')}
-              className="mt-1 ml-0.5"
+              className={`mt-1 ml-0.5 ${hasPayload ? 'pl-[14px]' : ''}`}
               testId="tool-panel-copy-error"
             />
           )}
@@ -312,17 +481,160 @@ function toolRow(m: ChatMessage, ctx: MessageRenderContext, autoDenied?: boolean
   return ctx.row(
     ctx.renderTool
       ? ctx.renderTool(m)
-      : <ToolCallPill message={m} running={ctx.running} onFileOpen={ctx.onFileOpen} autoDenied={autoDenied} />,
+      : <ToolCallPill message={m} running={ctx.running} onFileOpen={ctx.onFileOpen} autoDenied={autoDenied} askAgent={ctx.handOff !== false} expandable={ctx.toolDetails !== false} />,
     true,
   )
 }
 
+/** Host overrides for `renderAssistantBubble`. */
+export interface AssistantBubbleOptions {
+  /** Draw the footer whatever the next row is. A host whose rows are grouped
+   *  into runs (a crewmate's chat) knows the run ended here — a five-minute
+   *  gap or a boundary row the user sees — even when the next drawn row is
+   *  another reply, which the SDK's own rule reads as "the turn goes on".
+   *  Streaming rows never draw a footer, whatever this says. */
+  forceFooter?: boolean
+  /** Never draw the "Steered" chip, whatever the reply's `[STEERING …]` ack
+   *  says. A host whose every busy send IS a steer (a crewmate's chat: one
+   *  named peer, no queue) sets it — there the chip would end nearly every
+   *  reply with the very mechanics the surface hides (#17838). Off (default)
+   *  the SDK rule applies: the chip draws unless the turn's steer was a
+   *  system policy notice rather than the user's (`turnHadPolicyBlock`). The
+   *  raw marker is stripped from the prose either way. */
+  suppressSteerAck?: boolean
+  /** Session routing for the reply's markdown: open a session chip, plus the
+   *  roster and the active key the chip resolver needs. All three or none — the
+   *  renderer gates on (`onSessionOpen` AND `sessions`), so a half-wired host
+   *  gets today's plain link rather than a dead affordance. Absent on a host
+   *  that cannot switch sessions, where a `/chat?sid=…` link stays an ordinary
+   *  navigating link. */
+  onSessionOpen?: (key: string) => void
+  sessions?: ReadonlyMap<string, string>
+  activeSession?: string
+  /** When this row was written, ISO — the fourth member of the session bundle
+   *  above, not an independent knob. Only the SHORT-name form (`chat-1380`) uses
+   *  it, to refuse a slot minted after the text naming it; without it the full
+   *  key and a `?sid=` link still resolve. It reaches `MarkdownRenderer`'s
+   *  `messageTs`, which also versions this row's local image URLs, so a host
+   *  passes it with the triple rather than on its own. */
+  messageTs?: string
+  /** The bubble's own Regenerate action (its hover row), for the host that
+   *  can regenerate this reply. Absent: no Regenerate. */
+  onRegenerate?: () => void
+}
+
 /**
- * The built-in registry, in resolution order. A stop event and a sub-agent
- * completion are recognised by shape rather than by role, so they claim `'*'`
- * and gate on `match`; they come first for that reason.
+ * The assistant reply as the SDK draws it, minus the row layout: the footer
+ * rule (a finished reply shows its footer once the turn is over — another user
+ * or assistant row follows, or nothing follows and the session is idle) and
+ * every prop the bubble takes off the message. Exported so a host that places
+ * the reply differently (a crewmate's chat draws it as a bordered bubble in a
+ * run) renders the SAME bubble rather than a second copy of this logic.
+ * Returns null for a say-nothing row (bare U+200B): invisible-only content
+ * would draw as an empty bubble.
+ */
+/** The row's Quote handler, bound to its own fields; undefined while the row
+ *  streams (nothing final to quote) or when the host offers no Quote.
+ *
+ *  `shown` is the text the bubble is DISPLAYING when the caller knows it
+ *  differs from `m.content`: an assistant row browsing its variants locally
+ *  renders `variants[i].content`, and quoting must take what the reader sees,
+ *  never the stored default (fork GPT review). A caller with nothing to add
+ *  passes nothing and the row's own content is quoted. */
+export function quoteMessageFor(m: ChatMessage, ctx: MessageRenderContext, role: 'user' | 'assistant'): ((shown?: string) => void) | undefined {
+  const fn = ctx.onQuoteMessage
+  if (!fn || m.role === 'streaming' || !m.content.trim()) return undefined
+  const mid = typeof m.meta?.mid === 'string' && m.meta.mid ? m.meta.mid : undefined
+  // Typed check, not `??`: a user row wires this straight to `onClick`, which
+  // hands over the click event, and an event must never become the quote.
+  return (shown?: string) => fn(role, typeof shown === 'string' ? shown : m.content, m.ts, mid)
+}
+
+export function renderAssistantBubble(
+  m: ChatMessage,
+  ctx: MessageRenderContext,
+  bubbleClassName?: string,
+  opts: AssistantBubbleOptions = {},
+): React.ReactNode {
+  // A quiet monitor-loop cycle replies with a bare zero-width space
+  // (U+200B): invisible-only content would draw as an empty bubble.
+  // Same skip as ChatPage's inline chain — see utils/invisibleText.
+  if (isHiddenInvisibleAssistantRow(m)) return null
+  const isStreaming = m.role === 'streaming'
+  // The footer belongs to a FINISHED reply. It shows once the turn is over,
+  // which is either because another user or assistant row follows, or
+  // because nothing follows and the session has gone idle.
+  let showFooter = false
+  if (!isStreaming) {
+    let nextRelevant = false
+    for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
+      if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
+      // A hidden invisible-only row draws nothing, so it cannot host the
+      // footer; pass over it to the row that renders.
+      if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
+      // A system-notice row (compaction / session reload) draws a system
+      // card, not a reply, so it cannot end the turn either.
+      if (isSystemNoticeRow(ctx.messages[j])) continue
+      if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
+    }
+    if (!nextRelevant) showFooter = !ctx.running
+    if (opts.forceFooter) showFooter = true
+  }
+  const bubble = (
+    <AssistantMessage
+      content={m.content}
+      isStreaming={isStreaming}
+      timestamp={formatTs(m.ts)}
+      timestampTitle={fmtMessageTimeFull(m.ts)}
+      showFooter={showFooter}
+      slotRunning={ctx.running}
+      onFileOpen={ctx.onFileOpen}
+      onArtifactOpen={ctx.onArtifactOpen}
+      onQuote={ctx.onQuote}
+      onAsk={ctx.onAsk}
+      // Session routing, from the host or absent. `MarkdownRenderer` gates on
+      // (`onSessionOpen` AND `sessions`), so a host that wires neither keeps the
+      // plain navigating link it has today.
+      onSessionOpen={opts.onSessionOpen}
+      sessions={opts.sessions}
+      activeSession={opts.activeSession}
+      messageTs={opts.messageTs}
+      variants={m.variants}
+      variantIdx={m.variant_idx}
+      turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
+      decisionsStrip={decisionStripFieldOf(m)}
+      fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
+      fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files}
+      onRegenerate={opts.onRegenerate}
+      suppressSteerAck={opts.suppressSteerAck || turnHadPolicyBlock(ctx.messages, ctx.index)}
+      bubbleClassName={bubbleClassName}
+      onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
+      onQuoteMessage={quoteMessageFor(m, ctx, 'assistant')}
+      // A structured warm brief draws as a fixed card in place of the markdown,
+      // inside this same bubble, so it keeps the timestamp and row actions.
+      body={warmBriefBodyOf(m)}
+    />
+  )
+  // The column's child is the bubble itself unless this message has a thread
+  // footer to hang under it, so a host reading the bubble finds it in place.
+  const footer = threadFooterFor(m, ctx, 'start')
+  return <div className="flex flex-col gap-0">{footer ? <>{bubble}{footer}</> : bubble}</div>
+}
+
+/**
+ * The built-in registry, in resolution order. Skill loads, stop events and
+ * sub-agent completions are recognised by shape rather than by a broad role,
+ * so they gate on `match` before generic role entries.
  */
 export const defaultMessageRenderers: readonly MessageRenderer[] = [
+  {
+    id: 'skill_load',
+    roles: ['system'],
+    match: isSkillLoadRow,
+    render: (m, ctx) => ctx.row(
+      <SkillLoadCard message={m} disclosureKey={ctx.key} />,
+    ),
+  },
   {
     id: 'stop_event',
     roles: ['*'],
@@ -361,18 +673,25 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // own copy that knew pastes only: an attached image — present on the row
     // as `![image](dest)` markdown, or, on older pane rows, only on
     // `meta.files` — rendered as nothing, though the same row drew fine on
-    // ChatPage. A host that opens files supplies `ctx.onFileOpen`; without it
-    // the cards and chips still render, inert.
-    render: (m, ctx) => ctx.wrapper(
-      <UserMessage
-        content={m.content}
-        meta={m.meta}
-        timestamp={formatTs(m.ts)}
-        timestampTitle={fmtMessageTimeFull(m.ts)}
-        renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
-      />,
-      true,
-    ),
+    // ChatPage. A host that opens files supplies `ctx.onFileOpen` (#9487);
+    // without it the cards and chips still render, without an opener.
+    render: (m, ctx) => {
+      const bubble = (
+        <UserMessage
+          content={m.content}
+          meta={m.meta}
+          timestamp={formatTs(m.ts)}
+          timestampTitle={fmtMessageTimeFull(m.ts)}
+          renderContent={(c, mt) => renderUserContent({ content: c, meta: mt, onFileOpen: ctx.onFileOpen })}
+          onReplyInThread={replyInThreadFor(m, ctx)}
+          onQuoteMessage={quoteMessageFor(m, ctx, 'user')}
+        />
+      )
+      // The bubble alone on every surface without a thread footer to draw, so
+      // the row's shape (and what a host reads off it) is unchanged there.
+      const footer = threadFooterFor(m, ctx, 'end')
+      return ctx.wrapper(footer ? <>{bubble}{footer}</> : bubble, true)
+    },
   },
   {
     // Refines `assistant`, so it must precede it: a gateway system notice
@@ -392,50 +711,8 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     id: 'assistant',
     roles: ['assistant', 'streaming'],
     render: (m, ctx) => {
-      // A quiet monitor-loop cycle replies with a bare zero-width space
-      // (U+200B): invisible-only content would draw as an empty bubble.
-      // Same skip as ChatPage's inline chain — see utils/invisibleText.
-      if (isHiddenInvisibleAssistantRow(m)) return null
-      const isStreaming = m.role === 'streaming'
-      // The footer belongs to a FINISHED reply. It shows once the turn is over,
-      // which is either because another user or assistant row follows, or
-      // because nothing follows and the session has gone idle.
-      let showFooter = false
-      if (!isStreaming) {
-        let nextRelevant = false
-        for (let j = ctx.index + 1; j < ctx.messages.length; j++) {
-          if (ctx.messages[j].role === 'user') { showFooter = true; nextRelevant = true; break }
-          // A hidden invisible-only row draws nothing, so it cannot host the
-          // footer; pass over it to the row that renders.
-          if (isHiddenInvisibleAssistantRow(ctx.messages[j])) continue
-          // A system-notice row (compaction / session reload) draws a system
-          // card, not a reply, so it cannot end the turn either.
-          if (isSystemNoticeRow(ctx.messages[j])) continue
-          if (ctx.messages[j].role === 'assistant' || ctx.messages[j].role === 'streaming') { nextRelevant = true; break }
-        }
-        if (!nextRelevant) showFooter = !ctx.running
-      }
-      return ctx.wrapper(
-        <div className="flex flex-col gap-0">
-          <AssistantMessage
-            content={m.content}
-            isStreaming={isStreaming}
-            timestamp={formatTs(m.ts)}
-            timestampTitle={fmtMessageTimeFull(m.ts)}
-            showFooter={showFooter}
-            slotRunning={ctx.running}
-            onFileOpen={ctx.onFileOpen}
-            onQuote={ctx.onQuote}
-            onAsk={ctx.onAsk}
-            variants={m.variants}
-            variantIdx={m.variant_idx}
-            turnStats={(m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined}
-            decisionsStrip={decisionStripFieldOf(m)}
-            fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined}
-            suppressSteerAck={turnHadPolicyBlock(ctx.messages, ctx.index)}
-          />
-        </div>,
-      )
+      const bubble = renderAssistantBubble(m, ctx)
+      return bubble === null ? null : ctx.wrapper(bubble)
     },
   },
   {
@@ -459,15 +736,19 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     roles: ['inject'],
     render: (m, ctx) => {
       const cronLabel = (m.meta?.cronLabel as string) || ''
+      const appLabel = (m.meta?.appLabel as string) || ''
       const stripped = cronLabel
         ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')
-        : m.content
+        : appLabel
+          ? stripAppEnvelope(m.content)
+          : m.content
       // A note's marker is consumed into the pill row, so rendering it too would show the
       // same choices twice. Non-note inject rows keep it: there it is prose, not syntax.
       const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
       return ctx.wrapper(
         <>
           {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock size={11} className="inline mr-0.5" />{cronLabel}</span>}
+          {!cronLabel && appLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1 cursor-help" title={i18nT('components.mcpApp.from_app_tooltip')}><AppWindow size={11} className="inline mr-0.5" />{i18nT('components.mcpApp.from_app', { app: appLabel.split('/')[0] })}</span>}
           <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}>
             <MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} softBreaks /></MessageErrorBoundary>
           </div>
@@ -492,6 +773,12 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     },
   },
   {
+    id: 'warm_task_brief_claim',
+    roles: ['*'],
+    match: m => m.meta?.kind === 'warm_task_brief_claim',
+    render: () => null,
+  },
+  {
     id: 'notice',
     roles: ['notice'],
     render: (m, ctx) => ctx.row(<NoticeCard content={m.content} />),
@@ -504,20 +791,30 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // Reasoning roles derive from the shared classification (see
     // pages/chat/groupDisplayItems.ts) so this default cannot drift from the
     // surfaces that DO draw them; the lifecycle roles are local to this entry.
-    roles: [...REASONING_ROLES, 'system', 'done', 'queued'],
+    // `card` is a change card / guide offer: drawn only by a host that
+    // has the card stores (pages/chat/transcriptRenderers), never as a bubble.
+    roles: [...REASONING_ROLES, 'system', 'done', 'queued', 'card'],
     render: () => null,
   },
   {
-    // TODO: file download links
+    // A file_send delivery: the same player / download card ChatPage draws.
+    // FileCard is store-free and links to `/api/outbox/<name>` as a plain
+    // same-origin URL, so any surface (ChatEmbed included) can draw it. A row
+    // whose content is not a file record draws nothing rather than a card for
+    // a file named "undefined"; ChatPage overrides this entry, with the same
+    // record check, to show those as text.
     id: 'file',
     roles: ['file'],
-    render: () => null,
+    render: (m, ctx) => {
+      const file = parseFileRecord(m.content)
+      return file ? ctx.row(<FileCard file={file} />) : null
+    },
   },
   {
     id: 'mcp_oauth',
     roles: ['mcp_oauth'],
     render: (m, ctx) => {
-      const banner = renderMcpOAuthMessage(m, ctx.hideCardOwnedOAuth)
+      const banner = renderMcpOAuthMessage(m, ctx.hideCardOwnedOAuth, ctx.handOff !== false)
       if (!banner) return null
       return ctx.row(banner)
     },

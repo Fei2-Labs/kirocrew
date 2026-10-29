@@ -1242,6 +1242,10 @@ class TestLauncherAdvisoryIsNotARefusal:
         "denied). Refusing to continue: proceeding without it would leave host-key "
         "verification accepting any new key."
     )
+    #: The launcher's line for a command the kernel would not exec, hand-typed like
+    #: the two above. ``test_sandbox_launcher_refusal`` runs the real launcher step
+    #: and pins this reader against the line it prints.
+    _EXEC_FAILURE = "sandbox: FATAL — cannot exec git (No such file or directory)"
 
     @pytest.fixture(autouse=True)
     def _spawn_passthrough(self, monkeypatch):
@@ -1331,11 +1335,6 @@ class TestLauncherAdvisoryIsNotARefusal:
         # /tmp names the wrong cause.
         assert str(excinfo.value) == self._FATAL
 
-    @pytest.mark.skipif(
-        not hasattr(os, "getuid"),
-        reason="the namespace launcher is POSIX-only: _build_launcher_script reads "
-        "os.getuid(), which Windows has not got",
-    )
     def test_the_launcher_emits_no_severity_the_classifier_does_not_know(self):
         """Ratchet the coupling: `_WARNING` above is a hand-typed copy of the real text.
 
@@ -1348,13 +1347,24 @@ class TestLauncherAdvisoryIsNotARefusal:
 
         Pinned as the SET of severities the launcher can emit, so adding one is a
         deliberate edit here plus a decision about which side of the prefix it falls
-        on -- rather than a silent reclassification.
+        on -- rather than a silent reclassification. Read from every string literal
+        of the launcher program's source (an f-string by its literal head), which is
+        the text the renderer emits, so a line no test triggers is still counted.
         """
-        from kiro_crew.sandbox import _build_launcher_script
+        from kiro_crew import sandbox_launcher
 
+        literals: list[str] = []
+        for node in ast.walk(ast.parse(sandbox_launcher.launcher_program_source())):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                literals.append(node.value)
+            elif isinstance(node, ast.JoinedStr) and node.values:
+                head = node.values[0]
+                if isinstance(head, ast.Constant) and isinstance(head.value, str):
+                    literals.append(head.value)
         severities = {
             token.split()[0]
-            for token in re.findall(r"sandbox: ([^'\"%\\\n]+)", _build_launcher_script("strict"))
+            for literal in literals
+            for token in re.findall(r"sandbox: ([^'\"%\\\n]+)", literal)
         }
 
         assert severities == {
@@ -1396,6 +1406,56 @@ class TestLauncherAdvisoryIsNotARefusal:
             _run_git(["rev-parse", "HEAD"], str(tmp_path))
 
         assert str(excinfo.value) == self._FATAL_PRE_READ
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            _EXEC_FAILURE,
+            # The same line from a launcher whose locale is not UTF-8 (ISO-8859-1, say):
+            # its interpreter writes the dash it cannot encode as an escape.
+            _EXEC_FAILURE.replace("—", "\\u2014"),
+        ],
+        ids=["utf-8", "escaped-dash"],
+    )
+    def test_a_git_the_launcher_could_not_exec_is_returned_as_data(
+        self, tmp_path, monkeypatch, line
+    ):
+        """The sandbox was built and git did not start, so the exit is git's own failure.
+
+        Raising would answer "this host has no OS sandbox backend" on a host that has
+        one. The line shares the FATAL word with ``_FATAL_PRE_READ``, which must still
+        refuse, so the test above and this one fail on opposite mistakes.
+        """
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        stderr = line + "\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(1, stderr))
+        proc = _run_git(["rev-parse", "--show-toplevel"], str(tmp_path))
+
+        assert proc.returncode == 1
+        assert proc.stderr == stderr
+
+    @pytest.mark.asyncio
+    async def test_the_endpoint_treats_a_git_that_could_not_start_as_a_git_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """The create stops where any failed toplevel probe stops, with a 400, and
+        not with the no-sandbox 503 or that refusal's audit entry."""
+        from kiro_crew.dashboard.handlers import worktree as wt
+
+        audit = MagicMock()
+        monkeypatch.setattr(wt, "sel", lambda: audit)
+        stderr = self._EXEC_FAILURE + "\n"
+        monkeypatch.setattr(wt, "run_limited", lambda *a, **k: self._completed(1, stderr))
+
+        async with TestClient(TestServer(_make_app(str(tmp_path)))) as client:
+            resp = await client.post(
+                "/api/worktree/create", json={"repo": str(tmp_path), "branch": "feat/x"}
+            )
+            assert resp.status == 400
+            assert (await resp.json())["error"] == "Not a git repository"
+        audited = [c.kwargs.get("error", "") for c in audit.log_api_access.call_args_list]
+        assert "sandbox backend unavailable" not in audited
 
     def test_gits_own_error_is_never_mistaken_for_a_refusal(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard.handlers import worktree as wt

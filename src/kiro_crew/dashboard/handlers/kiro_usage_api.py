@@ -41,10 +41,10 @@ another product's store. Those may well be the same account, but nothing proves 
 and treating them as interchangeable is what served one Builder ID account's
 leftover token as a different Builder ID account's balance.
 
-Provenance-anchoring is what keeps the free API path available to every account
-class. Requiring an ARN instead would push all profile-less accounts onto the text
-scrape — which spends credits on every refresh, indefinitely, and hits the smallest
-quotas hardest.
+Provenance-anchoring is what keeps the API path available to every account class.
+Requiring an ARN instead would push all profile-less accounts onto the text scrape —
+a kiro-cli subprocess on every refresh, slower and lossier (recent kiro-cli prints
+no overage line) than the direct call this module makes.
 
 It is a read-only client: it reads the live bearer token that kiro-cli already
 maintains and makes one authenticated call. The JSON SSO cache files live under
@@ -94,7 +94,6 @@ import json
 import logging
 import math
 import re
-import sqlite3
 import ssl
 import time
 import urllib.error
@@ -104,6 +103,10 @@ from pathlib import Path
 from typing import NamedTuple
 
 from kiro_crew import hooks
+
+# The kiro-cli store is also read in this process through the shim; one SQLite
+# library keeps the other readers' locks when this connection closes.
+from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.identity_stores import Trust, sqlite_dbs
 
 logger = logging.getLogger(__name__)
@@ -137,14 +140,13 @@ _TOTAL_DEADLINE_SECS = 30
 # caller can tell an AUTH-CLASS failure (one a fresh sign-in fixes) from every
 # other reason the usage read came back empty.
 #
-# The distinction is not cosmetic. When the read fails and the billed ``/usage``
-# text scrape is opted out, the scrape-disabled message asserts the free API
-# "returned no plan for this account" and offers enabling the scrape as the
-# remedy. On a host whose stored credential has expired that is a false cause AND
-# a remedy that spends credits without being able to work, because the scrape is a
-# billed kiro-cli
-# chat turn that needs the same sign-in. Only these two states may be reported as
-# "sign in again"; everything else stays deliberately unclassified.
+# The distinction is not cosmetic. The ``/usage`` text scrape that follows a failed
+# read is a kiro-cli slash command over this same API, so it needs the same sign-in
+# and fails the same way when the stored credential has expired. Reporting that as
+# "the account has no credit plan" names a cause that did not happen; the one remedy
+# is a fresh sign-in, and the pill can only say so when the failure is known to be
+# auth-class. Only these two states may be reported as "sign in again"; everything
+# else stays deliberately unclassified.
 
 #: A candidate credential was accepted and usage was returned.
 AUTH_OK = "ok"
@@ -333,7 +335,7 @@ def _note_api_outcome(ok: bool, reason: str = "") -> None:
     if not _API_DEGRADED_WARNED:
         _API_DEGRADED_WARNED = True
         logger.warning(
-            "Kiro usage API degraded to text-scrape fallback (%s) — "
+            "Kiro usage API returned no reading (%s); "
             "overage will not be visible until the API path recovers",
             reason,
         )
@@ -494,7 +496,8 @@ class _Candidate(NamedTuple):
 
 
 def _candidate_tokens() -> list[_Candidate]:
-    """Return all unexpired candidates to try, freshest expiry first (deduped).
+    """Return all unexpired candidates to try, kiro-cli's own store first, then
+    freshest expiry (deduped).
 
     Path order is deliberately NOT the ranking. Every enumerated source can hold
     a valid credential at the same time, so ordering by path meant a leftover
@@ -508,6 +511,13 @@ def _candidate_tokens() -> list[_Candidate]:
     only decides which proven candidate is tried first —
     ``fetch_usage_limits`` establishes ownership itself, by matching ARN or by
     provenance. Ties keep the original path precedence (``sorted`` is stable).
+
+    Provenance ranks above expiry. Two accounts entitled to one shared IdC
+    profile report the same ARN, so the ARN proof cannot tell them apart and
+    the first candidate to clear it wins. A token in kiro-cli's own store is
+    the signed-in account's credential by construction, so it goes first; a
+    fresher leftover in an SSO cache must not outrank it. Expiry breaks ties
+    within each provenance class.
 
     Multiple candidates are returned (not just the first) because "unexpired" is
     not the same as "accepted": an unexpired-but-rejected token must not shadow a
@@ -536,15 +546,16 @@ def _candidate_tokens() -> list[_Candidate]:
         _add(_token_from_sqlite(db, now), from_cli_store=True)
     for db in _OTHER_SQLITE_DBS:
         _add(_token_from_sqlite(db, now), from_cli_store=False)
-    ranked = sorted(freshest.items(), key=lambda kv: kv[1][0], reverse=True)
+    # (from_cli_store, expiry) descending: own-store tokens first, freshest first.
+    ranked = sorted(freshest.items(), key=lambda kv: (kv[1][1], kv[1][0]), reverse=True)
     return [_Candidate(tok, exp, own) for tok, (exp, own) in ranked]
 
 
 def _load_bearer_token() -> str | None:
-    """Return the single freshest available bearer token, or None.
+    """Return the first-ranked available bearer token, or None.
 
-    Thin convenience wrapper over :func:`_candidate_tokens` (first candidate,
-    which is the freshest-expiry one). It discards provenance and applies NO
+    Thin convenience wrapper over :func:`_candidate_tokens` (first candidate:
+    kiro-cli's own store first, then freshest expiry). It discards provenance and applies NO
     ownership proof, so it must not be used to choose the credential a request is
     made with — ``fetch_usage_limits`` uses :func:`_candidate_tokens` directly so
     it can check each candidate's account (by ARN or by provenance) and fall
@@ -966,8 +977,8 @@ def fetch_usage_limits(expected_arn: str | None) -> UsageResult:
 
     The ``auth_state`` alongside it says whether that None was AUTH-CLASS -- see
     :data:`AUTH_NO_CREDENTIAL` and :data:`AUTH_REJECTED` -- so the caller can tell
-    the user to sign in again instead of reporting the account has no credit plan
-    and offering a remedy that spends credits. It is classified from the
+    the user to sign in again instead of reporting the account has no credit plan.
+    It is classified from the
     enumeration this function already performs: no store is read a second time,
     no new credential source is consulted, and nothing about who may read or
     refresh a token changes.

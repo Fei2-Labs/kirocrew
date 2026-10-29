@@ -522,14 +522,15 @@ async def test_refused_arm_writes_a_notice_row_into_the_session(kind: str) -> No
         )
 
     assert result.startswith("Failed to start")
-    assert "member-mode" in result
+    assert "this turn was started by" in result
     audit.assert_called_with("dashboard:member-conductor", kind, "denied")
     surfaced.assert_called_once()
     called_state, called_slot, role, text, cls = surfaced.call_args.args
     assert called_state is state and called_slot is slot
     assert role == "notice" and cls == "msg msg-info"
     assert text.startswith(sda.ARM_REFUSAL_NOTICE_PREFIX)
-    assert "member-mode sessions do not accept direct automation turns" in text
+    # This consumer's own non-user turn earned the refusal, so it is reworded.
+    assert "send the request yourself in this chat" in text
 
 
 @pytest.mark.asyncio
@@ -574,7 +575,7 @@ async def test_notice_failure_never_masks_the_denial() -> None:
             "monitor_start",
             {"message": "m"},
         )
-    assert result.startswith("Failed to start monitor loop: crew-mode")
+    assert result.startswith("Failed to start monitor loop: this turn was started by")
 
 
 # ── fire-time re-check honours the record ──────────────────────────────────
@@ -619,7 +620,6 @@ class TestFireTimeModeRecheck:
         slot = MagicMock()
         slot.key = "member-conductor"
         slot.running = False
-        slot._in_stage_execution = False
         slot._closing = False
         slot.is_closing = False
         slot.mode = mode
@@ -775,8 +775,50 @@ async def test_refused_monitor_start_carries_the_status_code() -> None:
             "monitor_start",
             {"message": "patrol"},
         )
-    assert result.startswith("Failed to start monitor loop: member-mode")
+    assert result.startswith("Failed to start monitor loop: this turn was started by")
     assert result.endswith("[status 409]")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("actor", "origin"),
+    [("subagent", "a sub-agent result"), ("cron", "a cron job"), ("", "something other")],
+)
+async def test_an_origin_refused_self_arm_says_why_and_stays_refused(
+    audits: list[dict[str, Any]], actor: str, origin: str
+) -> None:
+    """A non-user turn of the member's own session reached the REAL authorizer:
+    still 409 with nothing armed, but the text names the turn and the remedy
+    instead of "armed from outside the session"."""
+    svc = RecordingSvc()
+    surfaced = MagicMock()
+    with (
+        patch("kiro_crew.autonudge.get_instance", return_value=svc),
+        patch("kiro_crew.dashboard.state.append_and_surface", surfaced),
+        patch.object(sda, "_audit"),
+    ):
+        result = await sda.apply_session_directive(
+            _state({"member-conductor": _member_slot("member")}),
+            SimpleNamespace(key="member-conductor", _app="", messages=[]),
+            "dashboard:member-conductor",
+            "monitor_start",
+            {"message": "patrol", "idle_secs": 1800},
+            producer_turn_actor=actor,
+        )
+    assert result.endswith("[status 409]")
+    assert svc.added == [] and svc.added_monitors == []
+    assert [event["outcome"] for event in audits] == ["denied"]
+    assert f"this turn was started by {origin}" in result
+    assert "send the request yourself in this chat" in result
+    assert "armed from outside the session" not in result
+    assert "send the request yourself in this chat" in surfaced.call_args.args[3]
+
+
+def test_a_foreign_initiator_keeps_the_original_refusal() -> None:
+    """Only the text this consumer rewrites changes; any other reason is untouched."""
+    other = "Failed to start monitor loop: unknown slot chat-9 [status 404]"
+    assert sda._origin_arm_refusal(other, "subagent") == other
+    assert external_arm_refusal("crew").startswith("crew-mode sessions do not accept")
 
 
 # ── Persisted-bit hardening + provenance ratchet ───────────────
@@ -860,7 +902,7 @@ def test_only_the_session_directive_consumer_passes_initiator_slot_key() -> None
     import kiro_crew
 
     root = Path(kiro_crew.__file__).resolve().parent
-    allowed = {root / "dashboard" / "session_directive_apply.py"}
+    allowed = {root / "dashboard" / "session_directive_apply_monitor.py"}
     definers = {root / "autonudge_authz.py"}
     offenders: list[str] = []
     for path in root.rglob("*.py"):
@@ -1133,32 +1175,45 @@ async def test_self_arm_denies_when_no_free_id_can_be_reserved(
 # ── the slot's own loop wake is the second admitted producer ─────────────────
 
 
+def _arm_args(kind: str) -> dict[str, Any]:
+    if kind == "monitor_start":
+        return {"message": "patrol"}
+    return {
+        "kind": "github_pull_request",
+        "target": "https://github.com/acme/widgets/pull/7",
+        "objective": "review_ready",
+        "cadence_secs": 300,
+        "max_runtime_secs": 14_400,
+        "max_agent_turns": 8,
+        "max_tokens": 250_000,
+        "max_provider_errors": 3,
+    }
+
+
+def _wake_svc(row: Any) -> SimpleNamespace:
+    """A service whose only loop is *row*, reachable by id and by slot."""
+    return SimpleNamespace(
+        get_by_id=lambda loop_id: row if row is not None and row.id == loop_id else None,
+        get_by_slot=lambda slot_key: row,
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
 async def test_the_slots_own_wake_turn_may_re_arm_its_loop(kind: str) -> None:
     """(a) A member's loop firing on the member's slot is the member keeping
     itself awake; the arm it issues from inside that cycle is its own act, so
-    the consumer hands the authorizer the session's binding as initiator."""
+    the consumer hands the authorizer the session's binding as initiator. The
+    wake's own row is still present, so the arm is not a stale one."""
     captured: dict[str, Any] = {}
 
     async def _authz(**kw: Any) -> tuple[Any, None, int]:
         captured.update(kw)
         return SimpleNamespace(id="loop-1", monitor=None, gate=False, next_due_ts=0.0), None, 200
 
-    args: dict[str, Any] = {"message": "patrol"}
-    if kind == "monitor_watch":
-        args = {
-            "kind": "github_pull_request",
-            "target": "https://github.com/acme/widgets/pull/7",
-            "objective": "review_ready",
-            "cadence_secs": 300,
-            "max_runtime_secs": 14_400,
-            "max_agent_turns": 8,
-            "max_tokens": 250_000,
-            "max_provider_errors": 3,
-        }
+    live_row = SimpleNamespace(id="loop-1", active=True, monitor=None, stopped_reason="")
     with (
-        patch("kiro_crew.autonudge.get_instance", return_value=object()),
+        patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(live_row)),
         patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
         patch.object(sda, "_audit"),
     ):
@@ -1167,10 +1222,118 @@ async def test_the_slots_own_wake_turn_may_re_arm_its_loop(kind: str) -> None:
             SimpleNamespace(key="member-conductor", _app="", messages=[]),
             "dashboard:member-conductor",
             kind,
-            args,
+            _arm_args(kind),
             producer_is_self_wake=True,  # human flag left False: a nudge turn
+            producer_wake_loop_id="loop-1",
         )
     assert captured["initiator_slot_key"] == "member-conductor"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+async def test_a_wake_whose_loop_row_is_gone_cannot_arm_a_replacement(kind: str) -> None:
+    """A prompt-loop Stop REMOVES its row, and the wake it interrupted may still
+    be running: that stale turn must not create a replacement automation."""
+    captured: dict[str, Any] = {}
+
+    async def _authz(**kw: Any) -> tuple[Any, None, int]:
+        captured.update(kw)
+        return SimpleNamespace(id="loop-2", monitor=None, gate=False, next_due_ts=0.0), None, 200
+
+    with (
+        patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(None)),
+        patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
+        patch.object(sda, "_audit"),
+    ):
+        result = await sda.apply_session_directive(
+            SimpleNamespace(),
+            SimpleNamespace(key="member-conductor", _app="", messages=[]),
+            "dashboard:member-conductor",
+            kind,
+            _arm_args(kind),
+            producer_is_self_wake=True,
+            producer_wake_loop_id="loop-1",
+        )
+    assert not captured
+    assert "NOT armed" in result and "stopped or removed" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+async def test_a_wake_whose_loop_a_person_stopped_cannot_arm_a_replacement(kind: str) -> None:
+    """A structured stop RETAINS the row as ``USER_STOP``; a manual pause keeps
+    a legacy row with reason ``manual``. Both are a person's decision, so the
+    wake that outlived them is refused before the authorizer is consulted."""
+    from kiro_crew.monitoring.models import MonitorOutcome
+
+    captured: dict[str, Any] = {}
+
+    async def _authz(**kw: Any) -> tuple[Any, None, int]:
+        captured.update(kw)
+        return SimpleNamespace(id="loop-2", monitor=None, gate=False, next_due_ts=0.0), None, 200
+
+    stopped_rows = [
+        SimpleNamespace(
+            id="loop-1",
+            active=False,
+            stopped_reason="",
+            monitor=SimpleNamespace(outcome=MonitorOutcome.USER_STOP, stopped_reason="user"),
+        ),
+        SimpleNamespace(id="loop-1", active=False, stopped_reason="manual", monitor=None),
+    ]
+    for row in stopped_rows:
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(row)),
+            patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
+            patch.object(sda, "_audit"),
+        ):
+            result = await sda.apply_session_directive(
+                SimpleNamespace(),
+                SimpleNamespace(key="member-conductor", _app="", messages=[]),
+                "dashboard:member-conductor",
+                kind,
+                _arm_args(kind),
+                producer_is_self_wake=True,
+                producer_wake_loop_id="loop-1",
+            )
+        assert not captured
+        assert "NOT armed" in result and "stopped by a person" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor_start", "monitor_watch"])
+async def test_a_wake_whose_loop_hit_its_own_bound_may_arm_a_replacement(kind: str) -> None:
+    """A loop its OWN cycle cap or runtime budget deactivated was never stopped
+    by a person: the final-cycle wake may arm its successor, and the existing
+    ``replace_stopped`` rule is what then displaces the spent row."""
+    for reason in ("cycle_cap", "runtime_budget"):
+        captured: dict[str, Any] = {}
+
+        async def _authz(**kw: Any) -> tuple[Any, None, int]:
+            captured.update(kw)
+            return (
+                SimpleNamespace(id="loop-2", monitor=None, gate=False, next_due_ts=0.0),
+                None,
+                200,
+            )
+
+        spent_row = SimpleNamespace(id="loop-1", active=False, stopped_reason=reason, monitor=None)
+        with (
+            patch("kiro_crew.autonudge.get_instance", return_value=_wake_svc(spent_row)),
+            patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", _authz),
+            patch.object(sda, "_audit"),
+        ):
+            await sda.apply_session_directive(
+                SimpleNamespace(),
+                SimpleNamespace(key="member-conductor", _app="", messages=[]),
+                "dashboard:member-conductor",
+                kind,
+                _arm_args(kind),
+                producer_is_self_wake=True,
+                producer_wake_loop_id="loop-1",
+            )
+        assert captured["initiator_slot_key"] == "member-conductor"
+        assert captured["replace_stopped"] is True
 
 
 @pytest.mark.asyncio
@@ -1182,7 +1345,11 @@ async def test_the_slots_own_wake_turn_may_revise_its_structured_monitor() -> No
         return SimpleNamespace(id="monitor-1"), None, 200
 
     structured_loop = SimpleNamespace(
-        id="monitor-1", slot_key="member-conductor", gate=False, monitor=SimpleNamespace()
+        id="monitor-1",
+        slot_key="member-conductor",
+        active=True,
+        gate=False,
+        monitor=SimpleNamespace(),
     )
     with (
         patch(
@@ -1258,8 +1425,8 @@ class TestLegacyLoopUpdateOnAMemberSlotKeepsTheSelfArmRule:
     async def test_an_outside_turn_is_refused_before_the_write(self, mode: str) -> None:
         result, captured = await self._apply(mode)  # no provenance mark
         assert captured == {}, "the legacy chokepoint was never reached"
-        assert result.startswith("Failed to update monitor loop: ")
-        assert result.endswith(external_arm_refusal(mode))
+        assert result.startswith("Failed to update monitor loop: this turn was started by")
+        assert result.endswith("send the request yourself in this chat.")
 
     @pytest.mark.asyncio
     async def test_the_refusal_is_audited_denied(self) -> None:
@@ -1302,9 +1469,13 @@ class TestLegacyLoopUpdateOnAMemberSlotKeepsTheSelfArmRule:
 
 @pytest.mark.asyncio
 async def test_a_self_wake_does_not_unlock_the_user_surface_directives() -> None:
-    """The wake mark is self-arm provenance ONLY. ``set_project`` and
-    ``reset_conversation`` stay behind the authenticated-human gate: a loop's
-    wake must never retarget the slot's project or discard its conversation."""
+    """The wake mark is self-arm provenance ONLY. ``set_project`` stays behind
+    the authenticated-human gate: a loop's wake must never retarget the slot's
+    project.
+
+    ``reset_conversation`` is left out of this sentence on purpose: a
+    conductor's own vouched patrol wake may drop its chat at a round close. That
+    one exception and its refusals are pinned in test_conductor_wake_reset.py."""
     with patch.object(sda, "_audit") as audit:
         result = await sda.apply_session_directive(
             SimpleNamespace(),

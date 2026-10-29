@@ -1,4 +1,4 @@
-import { memo, useMemo, useRef, useState, useCallback, useEffect } from 'react'
+import { createContext, memo, useContext, useId, useMemo, useRef, useState, useCallback, useEffect } from 'react'
 import { useIsMobile } from '../hooks/useIsMobile'
 import {
   MessageSquare, X, RefreshCw, Send, Bot, CheckCircle2, Eye, CornerDownRight,
@@ -74,6 +74,7 @@ const ORPHAN_WARN_KEY = 'components.commentsSidebar.anchor_text_no_longer_found_
 /** A small inline reply composer used under a root thread. */
 export function ReplyBox({ onSubmit, onCancel }: { onSubmit: (text: string) => void; onCancel: () => void }) {
   const [text, setText] = useState('')
+  useReportDraft(text.trim() !== '')
   const ref = useRef<HTMLTextAreaElement>(null)
   const ime = useImeGuard()
   useAutoGrowTextarea(ref, text)
@@ -119,6 +120,7 @@ export function ReplyBox({ onSubmit, onCancel }: { onSubmit: (text: string) => v
  *  comment card, so it carries no left indent. */
 export function EditBox({ initial, onSubmit, onCancel }: { initial: string; onSubmit: (text: string) => void; onCancel: () => void }) {
   const [text, setText] = useState(initial)
+  useReportDraft(text !== initial)
   const ref = useRef<HTMLTextAreaElement>(null)
   const ime = useImeGuard()
   useAutoGrowTextarea(ref, text)
@@ -160,11 +162,13 @@ export function EditBox({ initial, onSubmit, onCancel }: { initial: string; onSu
 /** Single comment row (root or reply). Replies render indented with no anchor. */
 export function CommentRow({
   comment, isReply, active, restrictActions, hideResolve, hideDelete, onReply, onResolve, onMarkReview, onReopen, onDelete, onBodyClick,
-  editing, onEdit, onEditSubmit, onEditCancel,
+  editing, onEdit, onEditSubmit, onEditCancel, pendingSubmit,
 }: {
   comment: ArtifactComment
   isReply: boolean
   active?: boolean
+  /** This row is in the batch the footer's Submit bar counts and would send. */
+  pendingSubmit?: boolean
   restrictActions?: boolean
   hideResolve?: boolean
   hideDelete?: boolean
@@ -225,6 +229,13 @@ export function CommentRow({
         {comment.is_agent && <Bot size={11} className="text-accent shrink-0" aria-label={i18nT('components.commentsSidebar.ai_agent')} />}
         {comment.scope === 'shared' && <Link2 size={11} className="text-muted shrink-0" aria-label={i18nT('components.commentsSidebar.shared_comment')} />}
         {syncWarn && <AlertTriangle size={11} className="text-warn shrink-0" aria-label={syncWarn} />}
+        {pendingSubmit && (
+          <span
+            data-testid="comment-pending-submit"
+            title={i18nT('components.commentsSidebar.to_send_hint')}
+            className="ml-auto text-[10px] font-medium text-accent leading-4 shrink-0"
+          >{i18nT('components.commentsSidebar.to_send')}</span>
+        )}
       </div>
       {/* body (or inline editor when editing) */}
       {isEditing ? (
@@ -276,7 +287,7 @@ export function CommentRow({
           <button
             type="button"
             onClick={() => onMarkReview(comment)}
-            className="inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md text-muted hover:text-warn hover:bg-warn-subtle bg-transparent border-none cursor-pointer transition-colors"
+            className="inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md text-muted hover:text-warn-text hover:bg-warn-subtle bg-transparent border-none cursor-pointer transition-colors"
             title={i18nT('components.commentsSidebar.advance_to_review')}
             style={restrictActions ? { display: 'none' } : undefined}
           ><Eye size={13} /> {i18nT('components.commentsSidebar.review')}</button>
@@ -285,7 +296,7 @@ export function CommentRow({
           <button
             type="button"
             onClick={() => onResolve(comment)}
-            className="inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md text-muted hover:text-ok hover:bg-ok-subtle bg-transparent border-none cursor-pointer transition-colors"
+            className="inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md text-muted hover:text-ok-text hover:bg-ok-subtle bg-transparent border-none cursor-pointer transition-colors"
             title={i18nT('components.commentsSidebar.resolve_human_only')}
             style={(restrictActions || hideResolveEff) ? { display: 'none' } : undefined}
           ><CheckCircle2 size={13} /> {i18nT('components.commentsSidebar.resolve')}</button>
@@ -302,7 +313,7 @@ export function CommentRow({
         <button
           type="button"
           onClick={() => onDelete(comment)}
-          className="inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md text-muted hover:text-danger hover:bg-danger-subtle bg-transparent border-none cursor-pointer transition-colors ml-auto"
+          className="inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md text-muted hover:text-danger-text hover:bg-danger-subtle bg-transparent border-none cursor-pointer transition-colors ml-auto"
           title={i18nT('components.commentsSidebar.delete')}
           style={(restrictActions || hideDeleteEff) ? { display: 'none' } : undefined}
         ><X size={13} /> {i18nT('components.commentsSidebar.delete')}</button>
@@ -328,15 +339,20 @@ export interface CommentsSidebarProps {
   onMarkReview: (id: string) => void
   onDelete: (id: string) => void
   onRefresh: () => void
-  /** Optional "ask agent to address comments" — secondary, opens a chat. */
+  /** Optional "Draft a prompt in chat" — secondary: opens a chat with a
+   *  prompt about the comments drafted in its box, and sends nothing. */
   onAskAgent?: () => void
   /** Optional batch-submit bar for the footer, so a host with a chat to send to
    *  can offer "send every pending comment as one message" from the sidebar
-   *  itself. Rendered as handed over: the bar is `ArtifactPanel`'s `SubmitBar`,
-   *  and the HOST renders it because this sidebar is one of that panel's own
-   *  children — importing it here would close an import cycle. Hosts without a
-   *  send path omit it and the footer is unchanged. */
+   *  itself. Rendered as handed over: the bar is `SubmitBar` from
+   *  `ArtifactSubmitBar`, and the HOST renders it because only the host holds
+   *  the send path and the pending batch. Hosts without a send path omit it
+   *  and the footer is unchanged. */
   submitBar?: React.ReactNode
+  /** Ids of the comments `submitBar`'s count is made of, so each of those rows
+   *  is marked and a reader can match the count to the rows. Hand it over with
+   *  the bar; omitted, no row is marked. */
+  pendingSubmitIds?: ReadonlySet<string>
   onClose: () => void
   /** Hide Resolve/Review/Delete (e.g. a fully read-only view). */
   restrictActions?: boolean
@@ -372,6 +388,26 @@ export interface CommentsSidebarProps {
   /** Inline sizing override paired with `containerClassName`. Defaults to the
    *  full-page height. */
   containerStyle?: React.CSSProperties
+  /** Told whether any composer in the panel (the add box, a reply, an in-place
+   *  edit) holds unsaved text, so a host that navigates away can ask first. */
+  onDraftDirtyChange?: (dirty: boolean) => void
+  /** Bump to discard every unsaved box in the panel at once (the host's
+   *  "discard and leave" was confirmed). The initial value discards nothing. */
+  discardSignal?: number
+}
+
+/** Lets the reply and edit boxes, which sit inside comment rows, report an
+ *  unsaved draft to their host (the sidebar, or the floating thread popover)
+ *  without threading a prop through every row. With no provider, reporting is
+ *  a no-op. */
+const DraftReportContext = createContext<((id: string, dirty: boolean) => void) | null>(null)
+export const CommentDraftReportProvider = DraftReportContext.Provider
+
+function useReportDraft(dirty: boolean) {
+  const report = useContext(DraftReportContext)
+  const id = useId()
+  useEffect(() => { report?.(id, dirty) }, [report, id, dirty])
+  useEffect(() => () => report?.(id, false), [report, id])
 }
 
 const SIDEBAR_DEFAULT_CLASS = 'w-[340px] shrink-0 flex flex-col rounded-xl border border-border bg-card overflow-hidden'
@@ -388,9 +424,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   const isMobile = useIsMobile()
   const {
     comments, loading, remoteSyncError, loadError, mutationError, onDismissMutationError, onAdd, onReply, onResolve,
-    onMarkReview, onDelete, onRefresh, onAskAgent, submitBar, onClose, restrictActions, hideResolve, hideDelete,
+    onMarkReview, onDelete, onRefresh, onAskAgent, submitBar, pendingSubmitIds, onClose, restrictActions, hideResolve, hideDelete,
     onCommentClick, onReopen, activeCommentId, flashCommentId,
-    containerClassName, containerStyle, onEditComment,
+    containerClassName, containerStyle, onEditComment, onDraftDirtyChange, discardSignal,
   } = props
   // Which comment (if any) is currently being edited in place.
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -422,6 +458,31 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   const ime = useImeGuard()
   useAutoGrowTextarea(addRef, addText)
   useEffect(() => { if (adding) addRef.current?.focus() }, [adding])
+
+  // Unsaved text anywhere in the panel: the add box here, plus whatever the
+  // reply and edit boxes report through DraftReportContext.
+  const dirtyBoxesRef = useRef(new Set<string>())
+  const [boxDirty, setBoxDirty] = useState(false)
+  const reportDraft = useCallback((id: string, dirty: boolean) => {
+    const boxes = dirtyBoxesRef.current
+    if (dirty) boxes.add(id)
+    else boxes.delete(id)
+    setBoxDirty(boxes.size > 0)
+  }, [])
+  const draftDirty = (adding && addText.trim() !== '') || boxDirty
+  useEffect(() => { onDraftDirtyChange?.(draftDirty) }, [draftDirty, onDraftDirtyChange])
+  useEffect(() => () => onDraftDirtyChange?.(false), [onDraftDirtyChange])
+  // The host confirmed discarding: close the add, reply and edit boxes (the
+  // reply and edit boxes report clean as they unmount).
+  const seenDiscardRef = useRef(discardSignal)
+  useEffect(() => {
+    if (discardSignal === seenDiscardRef.current) return
+    seenDiscardRef.current = discardSignal
+    setAdding(false)
+    setAddText('')
+    setReplyTo(null)
+    setEditingId(null)
+  }, [discardSignal])
 
   // Group into root threads + replies (one level deep). A comment is a reply
   // when parent_id points at another comment in the set; everything else is a
@@ -472,8 +533,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   const visibleRoots = showResolved ? roots : roots.filter(r => r.status !== 'resolved')
 
   return (
-    // A caller-supplied class still wins. Absent one, the default 340px leaves
-    // the artifact body 34px at 390px, so the panel takes the width instead.
+    <DraftReportContext.Provider value={reportDraft}>
+    {/* A caller-supplied class still wins. Absent one, the default 340px leaves
+        the artifact body 34px at 390px, so the panel takes the width instead. */}
     <aside className={containerClassName ?? (isMobile ? SIDEBAR_NARROW_CLASS : SIDEBAR_DEFAULT_CLASS)} style={containerStyle ?? SIDEBAR_DEFAULT_STYLE}>
       {/* header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-bg-elevated shrink-0">
@@ -543,6 +605,7 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
               comment={root}
               isReply={false}
               active={root.id === activeCommentId}
+              pendingSubmit={pendingSubmitIds?.has(root.id)}
               restrictActions={restrictActions}
               hideResolve={hideResolve}
               hideDelete={hideDelete}
@@ -563,6 +626,7 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
                   comment={r}
                   isReply
                   active={r.id === activeCommentId}
+                  pendingSubmit={pendingSubmitIds?.has(r.id)}
                   restrictActions={restrictActions}
                   hideResolve={hideResolve}
               hideDelete={hideDelete}
@@ -639,15 +703,19 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
             className="w-full inline-flex items-center justify-center gap-1 px-2 py-1.5 rounded-md text-[12px] font-medium border border-border text-muted hover:text-text hover:border-border-strong cursor-pointer bg-transparent transition-colors"
           ><Plus size={13} /> {i18nT('components.commentsSidebar.add_comment')}</button>
         )}
+        {/* Named for what it does (puts a prompt in the chat box for the user
+            to send) and styled as a quiet link, so it does not read as a
+            second Submit next to the batch bar. */}
         {onAskAgent && (
           <button
             type="button"
             onClick={onAskAgent}
-            className="w-full inline-flex items-center justify-center gap-1 px-2 py-1.5 rounded-md text-[12px] font-medium border border-accent/40 text-accent hover:bg-accent-subtle cursor-pointer bg-transparent transition-colors"
-            title={i18nT('components.commentsSidebar.open_a_chat_asking_the_agent_to_address_these_co')}
-          ><Sparkles size={13} /> {i18nT('components.commentsSidebar.ask_agent_to_address')}</button>
+            className="w-full inline-flex items-center justify-center gap-1 px-2 py-1 text-[11px] text-muted hover:text-text bg-transparent border-none cursor-pointer transition-colors"
+            title={i18nT('components.commentsSidebar.draft_a_prompt_in_chat_hint')}
+          ><Sparkles size={12} /> {i18nT('components.commentsSidebar.draft_a_prompt_in_chat')}</button>
         )}
       </div>
     </aside>
+    </DraftReportContext.Provider>
   )
 })

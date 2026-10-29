@@ -234,7 +234,7 @@ def _repo_root(tree: Path) -> Path:
     not cosmetic:
 
     * **flat** — no ``src/`` at all, so the path does not exist; the run root is its
-      parent. (This is ``driver.py``'s own ``if not src.exists(): src = clone`` idiom.)
+      parent. (This is ``driver_publish.py``'s own ``if not src.exists(): src = clone`` idiom.)
     * **src-layout** — ``<repo>/src`` DOES exist but holds only the package, while the
       suite sits at ``<repo>/tests``. Running pytest inside ``src/`` collects nothing
       and exits 5, which every caller here would read as a RED suite. A perfectly green
@@ -268,9 +268,9 @@ def _write_protected_targets() -> tuple[str, ...]:
     were wrong in the first attempt, both found by measuring rather than reasoning:
 
     * The PARENT DIRECTORY is masked, not the file. ``sandboxed_spawn_argv``'s
-      ``extra_hidden_dirs`` reaches the launcher's ``SENSITIVE_DIRS`` loop, which is guarded
+      ``extra_hidden_dirs`` reaches the launcher's ``sensitive_dirs`` loop, which is guarded
       by ``os.path.isdir(target)`` — so a FILE path is silently skipped and the mask
-      no-ops. (Files are masked through a separate ``SENSITIVE_FILES`` list the public helper
+      no-ops. (Files are masked through a separate ``sensitive_files`` list the public helper
       does not expose.) Measured: passing the file paths left the child able to append to
       ``~/.kiro/crew/config.json`` and exit 0; passing the parent blocked it.
     * Only EXISTING directories are returned — the launcher mounts over each target, and a
@@ -281,14 +281,21 @@ def _write_protected_targets() -> tuple[str, ...]:
     Kiro Crew's own configuration. It is a superset of the 18 per-file entries ``strict``
     already hides there, and measured not to disturb the interpreter.
 
+    Each harness's own permission files (``native_allow_stores``) are left out: they are on
+    the write tier only to refuse the agent's file-edit tools, and masking their parents
+    would hide whole harness config directories (``~/.claude``, ``~/.codex`` ...) from the
+    child, reads included.
+
     Fail-soft: if the helper is unavailable the sandbox is still applied without the extra
     masking, which beats refusing to run any test at all.
     """
     try:
+        from kiro_crew.agent_sdk.native_allow_stores import home_leaves
         from kiro_crew.security import write_protected_home_paths
 
         home = Path.home()
-        parents = {(home / rel).parent for rel in write_protected_home_paths()}
+        native = set(home_leaves())
+        parents = {(home / rel).parent for rel in write_protected_home_paths() if rel not in native}
         return tuple(sorted(str(p) for p in parents if p.is_dir()))
     except Exception:  # noqa: BLE001 — masking is defense-in-depth, not the only control
         logger.debug("could not resolve write-protected paths to mask", exc_info=True)

@@ -102,7 +102,8 @@ class TestRestoreRecentSessions:
         assert slot.title == "Test Chat"
         assert slot.agent == "kirocrew"
         assert slot.workspace == "myws"
-        assert slot.mode == "orchestrator"
+        # Autopilot retired: the persisted mode restores as plain chat.
+        assert slot.mode == ""
         assert len(slot.messages) == 2
         assert slot.messages[0]["content"] == "hello"
         assert slot.messages[1]["content"] == "hi there"
@@ -1226,23 +1227,67 @@ class TestPartialRehydrateRollsBack:
             "dashboard:keeper" in state._restricted_keys
         ), "rollback discarded a restricted key it did not add"
 
-    def test_the_rollback_lives_in_the_callee_not_the_caller(self):
-        """Source guard: the rollback belongs at the creation site so EVERY caller
-        gets it. restore_open_slots must not carry its own copy, which would protect
-        only itself -- leaving the async twin with none. Asserts on the code, not comments."""
-        import inspect
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("driver", ["open-tabs", "open-tabs-async", "direct", "direct-async"])
+    async def test_every_restore_driver_gets_the_callees_rollback(
+        self, driver, tmp_path, monkeypatch
+    ):
+        """The rollback lives at the creation site, so EVERY caller gets it.
 
+        The failure is raised once the metadata line is fully applied -- after the
+        ephemeral line has recorded its restricted key -- so the rollback has both
+        halves to undo. A failing tab must leave no slot and no restricted key
+        behind whichever driver restored it, while the healthy tab beside it still
+        restores. A rollback living only in one driver would leave the others
+        holding the partial slot.
+        """
         from kiro_crew.dashboard import chat_persistence
+        from kiro_crew.dashboard.slot_persistence import metadata_codec
 
-        callee = inspect.getsource(chat_persistence._rehydrate_slot_from_history)
-        assert "state._slots.pop(" in callee, "the callee no longer rolls back its own slot"
-        assert "_restricted_keys.discard(" in callee, "the callee no longer rolls back its key"
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        state = _make_state(tmp_path)
+        for name in ("healthy", "doomed"):
+            _write_session(
+                tmp_path,
+                f"dashboard_{name}",
+                [{"role": "user", "content": "hi"}],
+                meta={"title": name.title(), "memory_mode": "ephemeral"},
+            )
+        (tmp_path / "open_slots.json").write_text(
+            json.dumps({"keys": ["doomed", "healthy"], "ts": 0.0}), encoding="utf-8"
+        )
+        real = metadata_codec.apply
+        marked_when_raised: list[bool] = []
 
-        caller = inspect.getsource(chat_persistence.restore_open_slots)
-        body = caller.split('"""')[-1]
-        assert "state._slots.pop(" not in body, (
-            "restore_open_slots re-grew its own rollback: two copies of the same "
-            "undo will drift, and the callee's is the one every caller reaches"
+        def _apply_then_fail(state_, slot, meta, purpose):
+            applied = real(state_, slot, meta, purpose)
+            if slot.key == "doomed":
+                marked_when_raised.append("dashboard:doomed" in state_._restricted_keys)
+                raise RuntimeError("malformed persisted content")
+            return applied
+
+        monkeypatch.setattr(metadata_codec, "apply", _apply_then_fail)
+
+        if driver.startswith("open-tabs"):
+            if driver == "open-tabs":
+                restored = chat_persistence.restore_open_slots(state)
+            else:
+                restored = await chat_persistence.restore_open_slots_async(state)
+            assert restored == 1 and "healthy" in state._slots
+            assert "doomed" in state.unrestored_slot_keys
+        else:
+            with pytest.raises(RuntimeError):
+                if driver == "direct":
+                    chat_persistence._rehydrate_slot_from_history(state, "doomed")
+                else:
+                    await chat_persistence.rehydrate_slot_from_history_async(state, "doomed")
+        # Non-vacuous: the key was recorded before the failure, so its absence now
+        # is the rollback's doing.
+        assert marked_when_raised == [True]
+        assert "doomed" not in state._slots, "a partial slot was left registered"
+        assert "dashboard:doomed" not in state._restricted_keys, (
+            "restricted key left behind: a later persistent slot would inherit it "
+            "and silently lose consolidation + lessons"
         )
 
 
@@ -1662,3 +1707,121 @@ class TestAsyncRestoreRecentSessionsOffLoop:
         assert not (
             tmp_path / "dashboard_vanished.jsonl"
         ).exists(), "the deleted transcript came back"
+
+    @pytest.mark.asyncio
+    async def test_restore_drains_its_tab_id_backfills_before_returning(
+        self, tmp_path, monkeypatch
+    ):
+        """A tab-id backfill is an ``os.replace`` of a session file. If restore
+        leaves it in flight (the fire-and-forget off-loop helper), it can still
+        be mid-replace when a caller reads the same transcript on the loop right
+        after restore — on Windows that ``open()`` is a sharing violation
+        (``PermissionError``) the on-loop read cannot wait out, so it re-raises.
+        The async recent-session driver must COMMIT its own backfills before it
+        returns, the way the open-slot driver does.
+
+        The seeded transcripts carry no ``tab_id``, so every restored tab mints
+        one and schedules a backfill. This asserts the driver's contract: it
+        does NOT hand those backfills to the fire-and-forget off-loop helper, and
+        once it RETURNS the backfilled ``tab_id`` is already durable on every
+        restored tab — nothing left mid-replace to race a reader.
+
+        Fails on the base: there the backfill goes through
+        ``update_metadata_off_loop`` and is still in flight at return.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard import chat_persistence
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        keys = ("dashboard_drain1", "dashboard_drain2")
+        for name in keys:
+            _write_session(
+                tmp_path,
+                name,
+                [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+                meta={"title": name},
+            )
+            (tmp_path / f"{name}.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+
+        # The fire-and-forget helper must not be the one carrying a restore
+        # backfill: that is the path whose os.replace outlives the driver's
+        # return and races the next on-loop reader.
+        fire_and_forget: list[tuple[str, dict]] = []
+        real_off_loop = chat_persistence.update_metadata_off_loop
+
+        def _record_off_loop(conv_log, key, fields):
+            fire_and_forget.append((key, dict(fields)))
+            return real_off_loop(conv_log, key, fields)
+
+        monkeypatch.setattr(chat_persistence, "update_metadata_off_loop", _record_off_loop)
+
+        restored = await restore_recent_sessions_async(state, window_minutes=60)
+
+        assert restored == 2
+        # The async driver drained the backfills itself rather than firing them
+        # off: nothing was handed to the fire-and-forget helper.
+        assert fire_and_forget == [], (
+            "a recent-session tab-id backfill was fired off the loop; its "
+            "os.replace outlives restore and can race a reader on Windows"
+        )
+        # And every restored tab's backfilled tab_id is already durable on disk
+        # the moment restore returned — no replace still in flight.
+        for name in keys:
+            assert log.get_metadata(name).get("tab_id"), name
+        # An immediate on-loop read of a restored transcript still returns it.
+        assert log.read_messages_chained(keys[0])
+
+    @pytest.mark.asyncio
+    async def test_drained_backfill_does_not_recreate_a_session_deleted_mid_restore(
+        self, tmp_path, monkeypatch
+    ):
+        """Deferring the tab-id backfills to the end of the restore pass widens
+        the window in which a ``DELETE /api/sessions/{key}`` can land. The drain
+        must go through ``update_metadata_if(require_existing=True)``, which
+        re-checks existence UNDER the write lock, so a session unlinked during
+        that window is left deleted instead of being resurrected as a
+        metadata-only transcript the next recent-session restore would reopen as
+        an empty tab.
+
+        We model the delete by unlinking one restored transcript as its slot is
+        applied — after it is queued for backfill but before the end-of-loop
+        drain runs. The drained backfill for that key must NOT recreate the file.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard import chat_persistence
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        keys = ("dashboard_live", "dashboard_victim")
+        for name in keys:
+            _write_session(
+                tmp_path,
+                name,
+                [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+                meta={"title": name},
+            )
+            (tmp_path / f"{name}.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        victim_path = tmp_path / "dashboard_victim.jsonl"
+        real_apply = chat_persistence._apply_recent_session
+
+        def _apply_then_maybe_delete(state_, key, *args, **kwargs):
+            result = real_apply(state_, key, *args, **kwargs)
+            # The delete lands after the victim's backfill is queued but before
+            # the end-of-loop drain commits it.
+            if key == "dashboard_victim" and victim_path.exists():
+                victim_path.unlink()
+            return result
+
+        monkeypatch.setattr(chat_persistence, "_apply_recent_session", _apply_then_maybe_delete)
+
+        await restore_recent_sessions_async(state, window_minutes=60)
+
+        # The deleted transcript was NOT recreated by the drained backfill.
+        assert not victim_path.exists(), "a deleted session was resurrected by its backfill"
+        # The surviving tab still got its tab_id.
+        assert log.get_metadata("dashboard_live").get("tab_id")

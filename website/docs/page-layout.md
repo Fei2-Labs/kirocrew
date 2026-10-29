@@ -11,6 +11,29 @@ conventions around them (a11y, data fetching, typography) live in
 
 ## Page skeleton
 
+### Dashboard in chat and Crew
+
+The task dashboard, the **All Dashboards** page (`/session-dashboards`) and the
+automatic session cards are specified in
+[artifacts](../../docs/system-specs/modules/artifacts.md#dynamic-dashboard-presentation):
+the iframe and live-inventory caps, the automatic-card CSS
+restrictions, and the **Needs you** inbox with its native answer and approval
+controls. The layout rules that belong here:
+
+- In chat, the dock sits above the composer, in the composer's own column
+  (`--mc-input-width`), and its tiles wrap in a narrow column. Long-run status reuses
+  the side-panel dock, expansion and narrow-screen overlay, not another drawer.
+- Crew's permanent **Dashboard** tab renders the mate's dynamic dashboard
+  (`CrewDashboardTab`) straight into the panel. There is no Command Center, no
+  Published view selector and no in-chat dock opener. Once visited, its body stays mounted across
+  tab-strip switches (Dashboard to Files), so it keeps its scroll and document.
+- The All Dashboards page uses the standard page header and scroll container, with one
+  column narrow and two wide.
+- Verify at both 320px and 390px: native approval targets at least 44px tall and no
+  horizontal overflow on the page.
+
+### Standard page composition
+
 ```tsx
 <>
   <PageHeader title="PageName" subtitle="Short description" />
@@ -31,6 +54,24 @@ refuses to shrink and the whole page scrolls instead.
 
 `PageHeader` also takes an `actions` node, rendered right-aligned on the title
 row. Put page-level buttons there rather than in the first `Card`.
+
+### A Settings tab's section list stays in view
+
+Tabs that host `SettingsSubNav` (Chat, Display, Notifications, Channels, Security)
+scroll in SidePanelLayout's content column, and their title and description scroll
+away with the rest. In the two-pane layout (container at least 760px wide) the
+section list is `sticky` in its row, pinned 8px below the top of that scroll area
+while the detail pane scrolls. A list taller than the area is capped and scrolls on
+its own. The cap is the area's measured height less 8px above the list and, below it,
+the larger of 8px and the space between the list's row and the end of the content
+(the pane's bottom padding). A sticky list cannot leave its row, so that space keeps
+the whole list inside the area at the end of the scroll as well. Both are measured off
+the nearest scrolling ancestor rather than computed from the viewport, so the cap also
+holds when Settings is embedded in a split pane. A capped list shows the same
+decorative "More below" cue as SidePanelLayout's tab column (`MoreBelowCue`) while
+rows remain below. The cue is a strip inside the cap, under the scrolling rows, so it
+stays on the list's visible bottom edge as the rows scroll; it hides at the end of the
+list and is absent when the list fits. The narrow single-column layout is unchanged.
 
 ### Read every class here narrow-first
 
@@ -77,9 +118,8 @@ Which layer yields is not arbitrary:
   vertical would move every card's height.
 - **The layer against the SCREEN EDGE yields more.** A phone bezel is not a drawn
   line, so a gutter narrower than the 24px desktop one reads as intentional rather
-  than cramped. 16px is where that stops being true in the other direction: this
-  was tried at 8px and then at 12px, and 8px read as content pressed against the
-  bezel rather than as a deliberately dense page. 16px keeps most of the width the
+  than cramped. 16px is where that stops being true in the other direction: 8px reads
+  as content pressed against the bezel rather than as a deliberately dense page. 16px keeps most of the width the
   narrow gutter buys while leaving the page visibly inset.
 
 This MATCHES the 16px screen margin that Material, Apple HIG, Fluent, Carbon,
@@ -98,12 +138,11 @@ At 390px the card goes from 342px wide (the 24px gutter) to 358px and its text l
 from 300px to 340px, **+13.3%**; at 320px the card goes from 272px to 288px and the
 text line from 230px to 270px, **+17.4%**. Nothing changes from `md` up.
 
-That is the comparison against the DESKTOP gutter. Against the 8px narrow gutter and
-10px card inset this replaced, the same card is 16px narrower and its text line 12px
-shorter (390px: 374 -> 358 wide, 352 -> 340 of text). Measured, not derived. The 12px
-buys a 16px screen margin on every uncontained surface and one shared left edge; a
-page that would rather have the width should drop the `Card`, not re-cut the gutter.
-Both sets of figures follow
+That is the comparison against the DESKTOP gutter. Against an 8px narrow gutter with a
+10px card inset, the same card is 16px narrower and its text line 12px shorter (390px:
+374 -> 358 wide, 352 -> 340 of text). Those 12px buy a 16px screen margin on every
+uncontained surface and one shared left edge; a page that would rather have the width
+should drop the `Card`, not re-cut the gutter. Both sets of figures follow
 from the box arithmetic -- viewport minus two gutters, then minus two 1px borders and
 two card insets -- and the text-line figures subtract the borders because a border is
 opaque to text the same way padding is.
@@ -121,47 +160,36 @@ differ:
 | **content column** — `PageHeader`, page rows, `Card` boxes | **16px** | the page gutter, `px-4` |
 | `Card` body text | 25px | 16 + 1px border + the `Card`'s own 8 |
 | top bar icon BOX (chrome) | 16px | header `pl-2` (8) + each icon button's own 8 |
-| top bar hamburger INK | 16px | that 16px box, less a 2.5px optical correction, plus `Menu`'s own 2.5px of empty box |
+| top bar nav mark | 16px | the square product logo (`w-6 h-6`, `object-contain`) in that 16px box; the `Menu` fallback shares the same `w-6` box |
 
 The title shares the container's 16px so it sits directly above the left edge of the
 cards and rows it labels. That is the rule, and it is what decides the number: the
-title follows its CONTENT, never the chrome above it. An earlier round tried the
-opposite — moving the header out to meet the top bar — and it read worse, because the
-title then sat inside the very cards beneath it.
+title follows its CONTENT, never the chrome above it. Moving the header out to meet
+the top bar instead reads worse, because the title then sits inside the very cards
+beneath it.
 
 At 16px the chrome happens to land on the same line, and that is a consequence rather
 than the reason. The top bar's icon BOXES are header inset plus each icon button's own
-8px, so an 8px header inset puts them at 16px: the hamburger, the page title, the
+8px, so an 8px header inset puts them at 16px: the nav mark, the page title, the
 chat session-list toggle and every card's left edge become one vertical line. Only the
 LEFT cluster is tuned this way — `.tb-right` carries a padding/negative-margin pair
 that keeps the notification badge's 4px overhang from being clipped, and re-tuning it
 needs a real WebKit check rather than a local one. Two things make this line easy to
-break silently: a mobile-only `px-2` on the left cluster once stacked on the header's
-own inset and pushed the hamburger out past the page's own edge, and the glyph position
+break silently: a mobile-only `px-2` on the left cluster stacks on the header's own
+inset and pushes the nav mark out past the page's own edge, and the glyph position
 is never the container's `className` — measure the rendered glyph with
 `getBoundingClientRect`, not the class.
 
-**A correctly placed box does not mean a correctly placed glyph.** An icon's artwork
-need not fill its own viewBox, and the eye sees the INK, not the box. `Menu` is the one
-icon here that does not fill it: lucide draws its three rules from `x=4` in a 24-unit
-viewBox and the round cap reaches half a stroke further, leaving 3 units — at `size={20}`
-that is 3 × 20/24 = **2.5px** — empty on the left. Measured at 390px, its box sat
-correctly at 16px while the visible glyph drew at 18.5px, reading as indented against a
-card border directly beneath it. It carries a `-translate-x-[2.5px]` correction so the
-ink lands at 16px; a transform rather than a margin, so the box, the hit target and the
-hover pill all stay on the 8px grid and no sibling in the cluster shifts.
-
-The correction is per-icon and most icons need none — the chat session-list toggle's
-`MessageSquare` starts at `x=2`, i.e. 0.67px at `size={16}`, which is already on the
-line. Do not generalise this into one shared offset. Note also what the correction
-trades: ink now agrees with hard edges (a card border, a divider) and sits ~2px left of
-the page TITLE's ink, because text carries its own left side bearing — 2px for `N` at
-24px bold. Two things cannot both be true at once, and hard edges won: a border is a
-crisp line the eye measures against, while a letter's bearing varies per glyph and per
-platform font.
+**The nav mark needs no optical correction.** It is the square product logo
+(`w-6 h-6`, `object-contain`, the same asset and treatment as the wide shell) in a `p-2`
+button over the bar's `pl-2`, so its ink lands on the 16px page gutter the title and
+every card's left edge sit on, and the button box is 24 + 16 = 40px for the tap target.
+Until the logo's own `load` event, `MobileNavGlyph` shows the `Menu` hamburger in the
+same `w-6` box, with no translate. `src/test/narrowFirstBaseline.test.ts` re-derives the
+sum.
 
 Chat is on this line too, not beside it: the transcript's message row and the composer
-are `px-4` with no responsive variant. So the hamburger glyph, the page title, a page
+are `px-4` with no responsive variant. So the nav mark, the page title, a page
 row, a card's left edge and the agent's own text all start at 16px, and a `Card`'s body
 text is the one thing that steps inside (25px). Chat is where a phone user spends most
 of their time, which is why it is the surface the rest is lined up with rather than the
@@ -213,10 +241,146 @@ arguing with the rule.
 | Page zoom off on touch, and the surfaces that own their own zoom | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
 | The 44px touch-target rule and its two-tier grading | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
 | The drag-widget `touch-action: none` exemption | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
-| The 16px gutter derivation and the field floor that was not adopted | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The 16px gutter derivation | [The narrow-viewport inset budget](#the-narrow-viewport-inset-budget) (this doc) |
+| The field floor that was not adopted | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
 | The nav-drawer swipe contract and `data-owns-swipe` | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
 | Binding a panel's gesture live to its offset | [narrow-viewport.md](narrow-viewport.md#a-panel-that-gains-a-gesture-must-be-bound-live-to-its-offset) |
 | Horizontal insets below the breakpoint, and `Card`'s measured budget | [narrow-viewport.md](narrow-viewport.md#horizontal-insets-below-the-breakpoint) |
+| The phone chat page's single top bar (`topbar-single`), its portal slots and the drawer rail | [narrow-viewport.md](narrow-viewport.md#the-phone-chat-page-has-one-top-bar) |
+
+### The chat transcript scroller and who moves it
+
+The chat transcript is a page's scrolling region like any other, with one
+difference: it is windowed. Only the rows near the viewport are real DOM, and
+spacers stand in for the rest. The hook that does this,
+`website/src/hooks/virtualizer/useVirtualChat.ts`, keeps the reader's position
+through every change to that window, so a host wires it rather than working
+around it.
+
+A host provides the scroller (`scrollerRef`), one `measureRef(index)` element
+per mounted row, the two sentinels at the list ends, and the `offsetBefore` /
+`offsetAfter` spacers. Chrome it renders inside the scroller above the rows (a
+paging bar, a header band) needs nothing extra: the hook measures that leading
+offset itself and carries a bottom-parked reader through it. A host that steers
+toward a row that may not be mounted (the pinned-prompt glide) asks the hook
+through `mountIndex` and `estimateRowTop`. The page declares `overflow-anchor: auto`
+on the scroller as the browser's own stabiliser for a scrolled-up reader; while
+follow is armed the hook sets it to `none` inline, because the bottom pin owns the
+position and Firefox's anchoring would drag the reader off the end
+(`followAnchorMode`). WebKit ships no anchoring, so the hook carries its own
+anchors as well.
+
+The pinned-prompt card is an overlay beside the scroller, not a row in it, and
+it paints above the composer dock, so nothing but geometry bounds it. Its
+ceiling is the transcript FLOOR: the scroller's bottom less the scroller's own
+`padding-bottom`, which is each host's statement of where readable rows stop
+(the main chat pads by the dock's height plus a clearance). `usePinnedPrompt`
+measures that floor off the scroller rather than taking it as a prop and hands it
+to the card as `maxH`, which lands as `max-height` on the bubble and bounds the
+card whether it is resting, expanded or peeked. The same ceiling clamps the fold's
+live height, which is reported only while a fold is in progress; the body is a shrinkable flex column so the cap
+scrolls the prompt instead of clipping it. A host that moves its floor (a dock
+that grows a status bar) only has to keep its `padding-bottom` honest. A prompt
+whose part still below the band is taller than the resting card is not pinned
+at all: the real bubble stays in the transcript, so a long prompt reads and
+scrolls as itself, and the card takes over only once what remains fits it. The
+resting height belongs to one prompt's card (an image-only card is two lines
+tall, a text card one), so it falls back to the default whenever the pin
+candidate changes, until the card reports it for that prompt — the host hands
+the card the candidate's identity as `promptKey`, so a card that stays mounted
+across the change re-measures and reports too.
+
+| What moves the scroller | Owner (`website/src/hooks/virtualizer/`) |
+|---|---|
+| Following the live turn, the jump-to-latest pill, scrolling to a row | `followPolicy.ts` (every write goes through its `writeScrollTop`) |
+| Holding a scrolled-up reader still when rows or heights change above them | `shiftCompensation.ts` |
+| Reopening a session where the reader left it, and re-placing after a hidden tab returns | `readingPosition.ts` |
+| Which rows are mounted as the reader scrolls, and the spacer heights around them | `windowRange.ts` over `measurement.ts` |
+| When a new row height is allowed to move the page | `geometryScheduling.ts` |
+| Listening to the scroller, its rows and its own box | `observers.ts` |
+
+The full owner map is in
+[history](../../docs/system-specs/modules/history.md#the-dashboard-transcript-window-frontend).
+
+### Decided: the transcript scrolls under the composer glass
+
+This is a design decision, not a defect, and it is settled
+([`docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md`](../../docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md)).
+On the main chat page the composer dock floats over the bottom of the transcript
+scroller (the iOS toolbar layout): the scroller runs the full height of the pane,
+the conversation passes under the dock's translucent glass at every scroll
+position, and the scroller pays for the covered strip with its `padding-bottom`
+(the dock's height plus a clearance, measured from the dock by a
+`ResizeObserver`). That holds whether or not the status stack above the composer
+holds a bar and whether or not the jump-to-bottom pill is showing; the pill
+floats over the transcript. Do not make the scroller's box end above the dock,
+reserve the dock's height with a margin, or otherwise clip the transcript so that
+"no text is read through glass": that is a maintainer decision against clipping the
+transcript. Legibility of what sits over the transcript is the glass recipe's job
+(blur and tint), never the scroller's.
+
+The welcome hero (`key="welcome-hero"`) is the one box that ENDS above the dock
+(`marginBottom: dockH`, never padding under it): its suggestion cards are
+controls, and a control under the glass is an ambiguous tap. A failed suggestion
+fetch shows an `ErrorNotice` there instead.
+It is `isolate` so WelcomeView's own z-indexes order its cards against each other
+and never against the composer's, and its column uses `safe center` and compact
+rows under 600px tall so a short window still fits both rows above the dock.
+
+`ChatPane.tsx` (split panes and a mate's chat) floats its composer the same
+way: one dock root (`composer-dock-root`) over the scroller's bottom edge holding
+the jump pill, the bars, the queue, the question card, the notices and the
+composer, measured by the same `useComposerDockMetrics` and paid for by the same
+`DOCK_CLEARANCE_PX` (`pages/chat/composerDockMetrics.ts`, shared by both hosts).
+The pane has no welcome hero, so nothing in it ends above the dock.
+
+The same reading applies at the TOP of a chat that a host crowns with a glass
+chip: the Members page's DM header (the Glass identity pill, the switcher, the
+panel opener) floats over the pane's top edge and the conversation scrolls under
+it (#18325). `ChatPane` takes the band's measured height as `topInset` and pads
+its scroller's rows below it (a mate's chat draws no pinned-prompt band,
+#18346, so the inset is the only thing it pays); the host measures the header
+with `useMeasuredHeight`, never a constant. Anything with controls that sits between such a header and the pane
+(a notice, a greeting card) stays in flow, padded below the header, and the pane
+then takes no inset: a control under the glass is an ambiguous tap. The row and
+its cells pass pointer events through; only the controls catch them. Details:
+[crew-mode](../../docs/system-specs/modules/crew-mode.md#mate-conversation-layout-switcher-profile-dashboard-files).
+
+### Mate conversation sends and runtime detail
+
+A `ChatPane` with `crewmate` always uses the `responsive` composer mode:
+one normal Send arrow for idle, busy, delegated and stopping states. Enter,
+click, voice auto-submit and direct question answers use the existing send
+transport with an optional top-level `responsive: true` in
+`POST /api/chat?ws=1`. The gateway validates a human on a real member DM and
+owns prioritization; the frontend neither sends stop nor chooses a model.
+Other panes and Sessions retain their existing Steer/Queue controls and wire.
+
+The same attachment/quote/paste serializer, send-id correlation, draft recovery,
+and measured composer dock remain in use. A responsive optimistic bubble is
+marked locally with `responsiveSend` so an exact-id steer echo can reconcile it
+and buffered streaming text stays above it. A refused send restores the draft;
+a late receipt leaves a visible delivery-pending bubble. If the server really
+queues a send, the existing cancellable queue remains visible rather than
+losing the message. No system-delivery or subagent-progress bar is drawn.
+
+Cold pane mounts hydrate the slot-detail `queue` alongside `messages` through
+the shared queue normalizer and bubble hydrator, retaining the exact send id,
+attachments and quote. The first hydrate fills missing queue cards without
+replacing newer live cards; pop/cancel ids observed before it prevent a stale
+snapshot from resurrecting completed entries, even if no message array existed
+when the frame arrived. A bounded-to-unbounded history upgrade keeps the current
+queue rather than replaying its fetched queue snapshot. Active-slot hydration
+remains owned by Sessions' existing switch/refresh path.
+
+The mate transcript filters runtime notices and stop events as well as
+tools, reasoning and injected subagent rows, without changing stored history.
+Historical steer/requeue/decision metadata draws an ordinary user bubble.
+Errors, pending approvals, questions, files and OAuth actions remain accessible.
+The existing footer is the simple working indicator, not a tool-purpose timeline;
+the detailed Sessions view and its normal engineering UI remain available through
+the profile's session links. Narrow screens keep the same width-adaptive composer,
+attachment holds, IME/Enter handling and keyboard-preserving send control.
 
 ## Stat cards
 
@@ -289,7 +453,11 @@ Inline within a `Card`, built from the shared primitives:
     list a user would want to filter (timezones, file lists). Radix Popover plus
     a filter box.
   - `DropdownMenu` (`components/ui/dropdown-menu.tsx`) for a menu of *commands*
-    rather than a bound value.
+    rather than a bound value. It is non-modal by default on touch devices (a modal
+    menu would swallow the first tap outside it), modal with a mouse, and an explicit
+    `modal` prop wins on every device. An open modal menu closes when a file drag from
+    outside the page enters the window (`useCloseOnFileDrag`), so the composer's drop
+    zone can receive the drop.
   - `AgentSelector` for agent dropdowns specifically (portal-based, ARIA-wired).
 
   These render a `<button>`, not a `<select>`, so an external

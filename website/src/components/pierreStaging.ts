@@ -77,6 +77,9 @@ function afterPaint(run: () => void): void {
  * schedule() — module scope, same lifetime as the queue itself. */
 export const STAGE_SCROLL_HOLD_MS = 250
 let lastAnyScrollTs = 0
+/** Longest the scroll hold may defer a drain: continuous scrolling must not starve it. */
+export const STAGE_MAX_DEFER_MS = 1000
+let deferredSince = 0
 let scrollListenerInstalled = false
 function ensureScrollListener(): void {
   if (scrollListenerInstalled || typeof document === 'undefined') return
@@ -104,11 +107,16 @@ function schedule(): void {
     // requestIdleCallback, so afterPaint degrades to setTimeout(0) and an
     // immediate re-arm would busy-loop the main thread during the scroll it
     // is trying to protect.
-    if (Date.now() - lastAnyScrollTs < STAGE_SCROLL_HOLD_MS) {
-      scheduled = true
-      setTimeout(() => { scheduled = false; schedule() }, STAGE_SCROLL_HOLD_MS)
-      return
+    const now = Date.now()
+    if (now - lastAnyScrollTs < STAGE_SCROLL_HOLD_MS) {
+      if (deferredSince === 0) deferredSince = now
+      if (now - deferredSince < STAGE_MAX_DEFER_MS) {
+        scheduled = true
+        setTimeout(() => { scheduled = false; schedule() }, STAGE_SCROLL_HOLD_MS)
+        return
+      }
     }
+    deferredSince = 0
     const t0 = performance.now()
     // At least one release per slice (guaranteed progress), then keep going
     // only while the budget holds — a single heavy mount ends the slice.
@@ -196,6 +204,16 @@ const LATCH_CAP = 4000
  */
 export const PierreFarmHoldContext = createContext(false)
 
+/** `true` inside the fallback a `WarmSwap` is HOLDING on screen while its impl
+ *  has not painted, unless the caller opted out of the pending cue. Read by the
+ *  plain fallback's header row (`PlainFallbackHeader`), which then carries the
+ *  one-line "Highlighting code…" cue at its end — the place Pierre's own header
+ *  fills with its metadata once painted. That row exists in both states, so
+ *  the cue costs the hold no height (#13937). `false` everywhere else: a
+ *  fallback rendered outside a hold, under farm measurement, or by a surface
+ *  with no header row carries no cue. */
+export const WarmSwapHeldContext = createContext(false)
+
 export function useStagedMount(immediate: boolean, latchKey?: string, hold = false): boolean {
   const farm = useContext(PierreFarmHoldContext)
   const [ready, setReady] = useState(!farm && (immediate || (latchKey !== undefined && latched.has(latchKey))))
@@ -233,6 +251,7 @@ export const VIEWPORT_PRELOAD_MARGIN_PX = 600
  *  that exhausts the eager budget would leak that into the next test. */
 export function __resetStagingForTests(): void {
   lastAnyScrollTs = 0
+  deferredSince = 0
   waiting.length = 0
   admitted = 0
   scheduled = false

@@ -24,14 +24,24 @@
  * gating by ChatMessageList.test.tsx.
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { dirname, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { defaultMessageRenderers, resolveRenderer } from '../app-sdk/messageRenderers'
 import type { ChatMessage } from '../types'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const chatPageSrc = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
+const pagesDir = resolve(here, '../pages')
+const ownerDir = resolve(pagesDir, 'chat/page')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and
+// those owners, and a page-level banner cannot come back through one of them.
+const ownerSrcs = [
+  ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readFileSync(join(ownerDir, f), 'utf8')),
+  ...readdirSync(pagesDir).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
+    .map(f => readFileSync(join(pagesDir, f), 'utf8')),
+]
+const chatPageSrc = [readFileSync(resolve(pagesDir, 'ChatPage.tsx'), 'utf8'), ...ownerSrcs].join('\n')
 
 function rendererBlock(): string {
   const start = chatPageSrc.indexOf('fallback: bubbleRenderer } = useMemo')
@@ -53,9 +63,9 @@ describe('ChatPage – MCP OAuth banner wiring', () => {
     }
     expect(resolveRenderer(m, defaultMessageRenderers)?.id).toBe('mcp_oauth')
     // Under vitest's SSR transform the import reads as
-    // `(0,__vite_ssr_import_N__.renderMcpOAuthMessage)(m, ctx.hideCardOwnedOAuth)`,
+    // `(0,__vite_ssr_import_N__.renderMcpOAuthMessage)(m, ctx.hideCardOwnedOAuth, ctx.handOff !== false)`,
     // so match the call shape, not the bare identifier.
-    expect(entry!.render.toString()).toMatch(/renderMcpOAuthMessage\)?\(\s*m,\s*ctx\.hideCardOwnedOAuth\s*\)/)
+    expect(entry!.render.toString()).toMatch(/renderMcpOAuthMessage\)?\(\s*m,\s*ctx\.hideCardOwnedOAuth,\s*ctx\.handOff\s*!==\s*false\s*\)/)
   })
 
   it('ChatPage keeps no mcp_oauth entry of its own (P5-c): the row reaches the registry default', () => {
@@ -64,8 +74,10 @@ describe('ChatPage – MCP OAuth banner wiring', () => {
     // neither register the role nor call the banner renderer itself.
     expect(rendererBlock()).not.toMatch(/id:\s*'mcp_oauth'/)
     expect(rendererBlock()).not.toMatch(/roles:\s*\[[^\]]*'mcp_oauth'/)
-    expect(chatPageSrc).not.toMatch(/\brenderMcpOAuthMessage\b/)
-    expect(chatPageSrc).not.toMatch(/from\s*['"][^'"]*McpOAuthBanner['"]/)
+    for (const src of [chatPageSrc, ...ownerSrcs]) {
+      expect(src).not.toMatch(/\brenderMcpOAuthMessage\b/)
+      expect(src).not.toMatch(/from\s*['"][^'"]*McpOAuthBanner['"]/)
+    }
   })
 
   it('no page entry claims the role by a broader match either', () => {

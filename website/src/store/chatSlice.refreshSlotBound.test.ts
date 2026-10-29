@@ -8,15 +8,21 @@
  *  the user had paged back through.
  *
  *  The bound is therefore COUNT-MATCHED — at least as many rows as the view
- *  already holds — and these tests assert the `limit` argument that reaches
- *  `api.chatSlotDetail`, not merely the resulting state: the argument is the fix,
- *  and a state assertion alone would still pass if the bound were dropped.
+ *  already holds, clamped to the handler's ceiling — and a window that does not
+ *  reach the view is extended OLDER one clamp-sized page at a time
+ *  (`walkWindowBackTo`) rather than re-read whole. These tests assert the
+ *  `limit` argument that reaches `api.chatSlotDetail`, not merely the resulting
+ *  state: the argument is the fix, and a state assertion alone would still pass
+ *  if the bound were dropped. `undefined` -- the handler's read-everything
+ *  shape -- must never appear in that list.
  *
  *  The `warmSlotCache` half of #4690 was already bounded by #3240 and is not
  *  touched here; `chatSlice.warmSlotCacheBound.test.ts` owns it.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { configureStore } from '@reduxjs/toolkit'
+import { configureStore, type Reducer } from '@reduxjs/toolkit'
+import { withRefreshRevision } from './chat/slotRefresh'
+import type { ChatState } from './chat/state'
 
 const TOTAL = 300
 /** The slot-detail handler's own clamp (`min(int(limit), 500)`), mirrored so a
@@ -75,17 +81,64 @@ import chatReducer, {
   REFRESH_LIMIT_CEILING,
   refreshSlot,
   replaceMessages,
+  switchSlot,
+  setSlotRunning,
+  setSlotState,
+  setSlotStopping,
+  sseChatMessage,
+  sseChatMessageUpdate,
+  sseChatMessagePatchByTs,
+  sseToolResult,
+  sseToolActivity,
+  sseContextUsage,
+  setSlotStatusDetail,
+  setActiveSlot,
+  startLocalTurn,
+  appendQueuedMessage,
+  editQueuedMessage,
+  cancelQueuedMessage,
+  reorderQueuedMessages,
+  loadOlderMessages,
 } from './chatSlice'
 import { api } from '../api/client'
 
 const SLOT = 'slot-1'
 
-function makeStore(extra: Record<string, unknown> = {}) {
+// Ordering receipts do not describe the visible view. Context meters seed only
+// missing values, so a concurrent measured update cannot be overwritten.
+const refreshBookkeeping = new Set<keyof ChatState>([
+  'recoveryRevision', 'refreshAppliedSeq', 'lastRecoveryRequestId',
+  'slotContextPct', 'slotContextTokens',
+])
+
+const guardedRefreshReducer: Reducer<ChatState> = (before, action) => {
+  const after = chatReducer(before, action)
+  if (before && refreshSlot.fulfilled.match(action)) {
+    // Derive writes from the real reducer, including its helper calls. A new
+    // refresh field must invalidate recovery on its own, not ride a row change.
+    const fields = new Set([...Object.keys(before), ...Object.keys(after)])
+    for (const field of fields as Set<keyof ChatState>) {
+      if (before[field] === after[field] || refreshBookkeeping.has(field)) continue
+      const isolatedWrite = withRefreshRevision(() => ({ ...before, [field]: after[field] }))
+      expect(isolatedWrite(before, { type: 'probe' }).recoveryRevision,
+        `refresh writes ${field}, but that field alone does not invalidate recovery`,
+      ).toBe((before.recoveryRevision ?? 0) + 1)
+    }
+  }
+  return after
+}
+
+function makeStore(extra: Record<string, unknown> = {}, beforeFulfilled?: () => void) {
   const base = chatReducer(undefined, { type: '@@INIT' })
   return configureStore({
-    reducer: { chat: chatReducer },
+    reducer: { chat: guardedRefreshReducer },
     preloadedState: { chat: { ...base, activeSlot: SLOT, ...extra } },
-    middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }),
+    middleware: (getDefault) => getDefault({ serializableCheck: false, immutableCheck: false }).concat(
+      () => next => action => {
+        if (refreshSlot.fulfilled.match(action)) beforeFulfilled?.()
+        return next(action)
+      },
+    ),
   })
 }
 
@@ -104,12 +157,217 @@ function pagedBack(held: number) {
 const limits = () =>
   (api.chatSlotDetail as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(c => c[1])
 
+/** The shape of a window that had to WALK: one count-matched page, then only
+ *  clamp-sized older pages. Never the handler's read-everything shape
+ *  (`undefined`), which is the argument this file exists to keep out. */
+function expectWalkedFrom(first: number) {
+  const sent = limits()
+  expect(sent[0]).toBe(first)
+  expect(sent.length).toBeGreaterThan(1)
+  expect(sent.slice(1)).toEqual(sent.slice(1).map(() => SERVER_CLAMP))
+  expect(sent).not.toContain(undefined)
+}
+
 describe('refreshSlot count-matched bound', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     HISTORY = rows(TOTAL)
     RUNNING = false
     DURING_FETCH = null
+  })
+
+  describe('watchdog stale responses', () => {
+    it.each(['bounded', 'empty', 'walk'])('accepts %s recovery amid unrelated activity at both boundaries', async shape => {
+      HISTORY = rows(shape === 'walk' ? TOTAL * 2 : 120)
+      let updates = 0
+      const unrelated = () => {
+        updates++
+        store.dispatch(sseChatMessage({ slot: 'background', role: 'chunk', content: 'x' }))
+        store.dispatch(setSlotStatusDetail({ slot: SLOT, kind: 'thinking', label: 'Working', ts: updates }))
+        store.dispatch(sseToolActivity({ slot: SLOT, tool: 'search', kind: 'tool', purpose: '', input_preview: '' }))
+        store.dispatch(sseContextUsage({ slot: SLOT, pct: updates, used_tokens: 10, window_tokens: 100 }))
+        DURING_FETCH = unrelated
+      }
+      const store = makeStore({ messages: shape === 'empty' ? [] : rows(120), slotRunning: true }, unrelated)
+      DURING_FETCH = unrelated
+      const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+      const chat = store.getState().chat
+      expect(updates).toBe(shape === 'walk' ? 4 : 2)
+      expect(chat.lastRecoveryRequestId).toBe(result.meta.requestId)
+      expect(chat.messages.at(-1)?.content).toBe(HISTORY.at(-1)?.content)
+      expect(chat.slotMessages.background.at(-1)?.content).toBe('x'.repeat(updates))
+      expect(chat.toolLog).toHaveLength(updates)
+      expect(chat.slotStatusDetail[SLOT]?.ts).toBe(updates)
+      expect(chat.slotContextPct[SLOT]).toBe(updates)
+      expect(chat.slotRunning).toBe(false)
+      expect(limits()).toEqual(shape === 'bounded' ? [120] : shape === 'walk' ? [120, SERVER_CLAMP, SERVER_CLAMP] : [PANE_HYDRATE_LIMIT])
+    })
+
+    it.each(['fetch', 'fulfillment'])('preserves changed refresh dependencies at %s', async boundary => {
+      // Each case starts a separate request so one dependency cannot mask another.
+      const changes = [
+        [setSlotRunning(true), setSlotRunning(false)],
+        [setSlotState('tool_running'), setSlotState('idle')],
+        [setSlotStopping(true), setSlotStopping(false)],
+        [setActiveSlot('other'), setActiveSlot(SLOT)],
+        [startLocalTurn(SLOT)],
+        [sseToolResult({ slot: SLOT, tool_call_id: 'tool-1', output: 'Spawned 1 subagent(s).'  })],
+        [appendQueuedMessage({ slot: SLOT, content: 'new queue', queue_id: 'q3', ts: rows(1)[0].ts })],
+        [editQueuedMessage({ slot: SLOT, queue_id: 'q1', content: 'edited' })],
+        [cancelQueuedMessage({ slot: SLOT, queue_id: 'q1' })],
+        [reorderQueuedMessages({ slot: SLOT, order: ['q2', 'q1'] })],
+        [sseChatMessage({ slot: SLOT, role: 'chunk', content: '', seq: 9, gen: 'new-generation' })],
+        [loadOlderMessages.rejected(null, 'paging', undefined, { slot: SLOT })],
+      ]
+      for (const actions of changes) {
+        let live: ReturnType<typeof chatReducer> | undefined
+        const change = () => {
+          for (const action of actions) store.dispatch(action)
+          live = store.getState().chat
+        }
+        const store = makeStore({ messages: [
+          ...rows(2),
+          { role: 'tool', content: 'tool', meta: { tool_call_id: 'tool-1' } },
+          { role: 'queued', content: 'one', meta: { queueId: 'q1' } },
+          { role: 'queued', content: 'two', meta: { queueId: 'q2' } },
+        ] }, boundary === 'fulfillment' ? change : undefined)
+        DURING_FETCH = boundary === 'fetch' ? change : null
+        const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+        expect(live?.recoveryRevision ?? 0, actions[0].type).toBeGreaterThan(0)
+        expect(store.getState().chat, actions[0].type).toBe(live)
+        expect(store.getState().chat.lastRecoveryRequestId).not.toBe(result.meta.requestId)
+        if (boundary === 'fetch') expect(result.payload).toBeNull()
+        else expect(result.payload).not.toBeNull()
+      }
+    })
+
+    it.each(['bounded', 'empty', 'walk'])(
+      'preserves live completion at the %s fulfillment boundary', async shape => {
+        const initial = shape === 'empty' ? [] : rows(120)
+        HISTORY = rows(shape === 'walk' ? TOTAL * 2 : 120)
+        RUNNING = true
+        let live: ReturnType<typeof chatReducer> | undefined
+        const store = makeStore({ messages: initial, slotRunning: true }, () => {
+          store.dispatch(sseChatMessage({ slot: SLOT, role: 'assistant', content: 'final live row' }))
+          store.dispatch(setSlotRunning(false))
+          live = store.getState().chat
+        })
+
+        const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+
+        expect(result.payload).not.toBeNull()
+        expect(store.getState().chat).toBe(live)
+        expect(store.getState().chat.messages.at(-1)?.content).toBe('final live row')
+        expect(store.getState().chat.slotRunning).toBe(false)
+        expect(store.getState().chat.lastRecoveryRequestId).not.toBe(result.meta.requestId)
+        expect(limits()).toEqual(shape === 'bounded' ? [120] : shape === 'walk' ? [120, SERVER_CLAMP, SERVER_CLAMP] : [PANE_HYDRATE_LIMIT])
+      },
+    )
+
+    it.each([false, true])('discards a slot switch during fetch (returns to slot: %s)', async returns => {
+      const store = pagedBack(120)
+      DURING_FETCH = () => {
+        store.dispatch(switchSlot.pending('away', 'other-slot'))
+        if (returns) store.dispatch(switchSlot.pending('back', SLOT))
+      }
+      const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+      expect(result.payload).toBeNull()
+      expect(store.getState().chat.activeSlot).toBe(returns ? SLOT : 'other-slot')
+    })
+
+    it.each(['bounded', 'empty', 'over ceiling', 'unidentified'])(
+      'discards a concurrent edit during a %s fetch',
+      async shape => {
+        HISTORY = rows(shape === 'over ceiling' ? REFRESH_LIMIT_CEILING + 1 : 6)
+        const messages = shape === 'empty' ? [] : HISTORY.map(row => ({
+          ...row,
+          meta: shape === 'unidentified' ? undefined : row.meta,
+        }))
+        const store = makeStore({ messages, slotRunning: true })
+        let live = store.getState().chat
+        DURING_FETCH = () => {
+          if (shape === 'empty') {
+            store.dispatch(sseChatMessage({ slot: SLOT, role: 'assistant', content: 'live' }))
+          } else {
+            store.dispatch(sseChatMessageUpdate({ slot: SLOT, ts: HISTORY[0].ts, content: 'XX' }))
+          }
+          live = store.getState().chat
+        }
+
+        const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+
+        expect(result.payload).toBeNull()
+        expect(store.getState().chat).toBe(live)
+        expect(limits()).toEqual([shape === 'over ceiling' ? REFRESH_LIMIT_CEILING : PANE_HYDRATE_LIMIT])
+      },
+    )
+
+    it.each([
+      ['metadata patch', sseChatMessagePatchByTs({ slot: SLOT, ts: rows(1)[0].ts, meta: { edited: true } })],
+      ['segment finalization', sseChatMessage({ slot: SLOT, role: '_segment', content: '' })],
+      ['chunk', sseChatMessage({ slot: SLOT, role: 'chunk', content: 'x' })],
+      ['completion', sseChatMessage({ slot: SLOT, role: '_done', content: '' })],
+      ['running state', setSlotRunning(false)],
+      ['slot state', setSlotState('tool_running')],
+      ['stopping state', setSlotStopping(true)],
+    ])('preserves a concurrent %s change', async (_name, action) => {
+      HISTORY = rows(2)
+      const store = makeStore({
+        messages: [HISTORY[0], { ...HISTORY[1], role: 'streaming' }],
+        slotRunning: true,
+        slotState: 'streaming',
+      })
+      const before = store.getState().chat
+      let live = before
+      DURING_FETCH = () => {
+        store.dispatch(action)
+        live = store.getState().chat
+      }
+
+      const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+
+      expect(live).not.toBe(before)
+      expect(result.payload).toBeNull()
+      expect(store.getState().chat).toBe(live)
+    })
+
+    it('detects run-state movement even when its value returns to the snapshot', async () => {
+      const store = pagedBack(120)
+      DURING_FETCH = () => {
+        store.dispatch(setSlotRunning(true))
+        store.dispatch(setSlotRunning(false))
+      }
+      const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+      expect(result.payload).toBeNull()
+    })
+
+    it('checks again after walking a disjoint page back to the held view', async () => {
+      const store = pagedBack(120)
+      HISTORY = rows(TOTAL * 2)
+      let live = store.getState().chat
+      DURING_FETCH = () => {
+        DURING_FETCH = () => {
+          store.dispatch(sseChatMessageUpdate({ slot: SLOT, ts: rows(TOTAL)[TOTAL - 1].ts, content: 'live' }))
+          live = store.getState().chat
+        }
+      }
+
+      const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+
+      expect(limits()).toEqual([120, SERVER_CLAMP, SERVER_CLAMP])
+      expect(result.payload).toBeNull()
+      expect(store.getState().chat).toBe(live)
+    })
+
+    it.each(['bounded', 'empty', 'walk'])('recovers an unchanged %s view', async shape => {
+      const store = shape === 'empty' ? makeStore({ slotRunning: true }) : pagedBack(120)
+      if (shape === 'walk') HISTORY = rows(TOTAL * 2)
+      const result = await store.dispatch(refreshSlot({ key: SLOT, onlyIfUnchanged: true }))
+      expect(result.payload).not.toBeNull()
+      expect(result.meta.requestStatus).toBe('fulfilled')
+      expect(store.getState().chat.messages.at(-1)?.content).toBe(HISTORY.at(-1)?.content)
+      expect(store.getState().chat.slotRunning).toBe(false)
+    })
   })
 
   it('bounds the recurring refresh instead of pulling the whole transcript', async () => {
@@ -165,9 +423,11 @@ describe('refreshSlot count-matched bound', () => {
       .toEqual({ limit: TOTAL, hasMore: false, oldest: 0 })
   })
 
-  it('stays unbounded above the handler ceiling rather than come back short', async () => {
+  it('clamps to the handler ceiling and keeps the rows above the page', async () => {
     // The handler clamps `limit` to 500, so a count-matched request above it
-    // would be answered with 500 rows — a shrink of the very view it matched.
+    // would be answered SHORT of the view it matched. Ask for exactly the
+    // ceiling instead: the page's oldest row is in the view, so the reducer
+    // keeps the 120 rows above it and nothing shrinks -- one request, bounded.
     HISTORY = rows(REFRESH_LIMIT_CEILING + 120)
     const store = makeStore({
       messages: HISTORY.slice(),
@@ -175,18 +435,24 @@ describe('refreshSlot count-matched bound', () => {
       slotCursorKey: SLOT,
     })
     await store.dispatch(refreshSlot(SLOT) as never)
-    expect(limits()).toEqual([undefined])
+    expect(limits()).toEqual([REFRESH_LIMIT_CEILING])
     expect(store.getState().chat.messages).toHaveLength(REFRESH_LIMIT_CEILING + 120)
+    expect(store.getState().chat.messages[0].content).toBe('m0')
     expect(REFRESH_LIMIT_CEILING).toBe(SERVER_CLAMP)
   })
 
-  it('stays unbounded when the view holds nothing to count-match against', async () => {
+  it('asks for the floor when the view holds nothing to count-match against', async () => {
     // A refresh on an empty view (reconnect after clearMessages, a refresh
-    // racing slot activation) is the client's only read of that transcript.
+    // racing slot activation) has no scrollback to protect, so it takes one
+    // page and hands `loadOlderMessages` the cursor for the rest.
     const store = makeStore({ messages: [] })
     await store.dispatch(refreshSlot(SLOT) as never)
-    expect(limits()).toEqual([undefined])
-    expect(store.getState().chat.messages).toHaveLength(TOTAL)
+    expect(limits()).toEqual([PANE_HYDRATE_LIMIT])
+    const after = store.getState().chat
+    expect(after.messages).toHaveLength(PANE_HYDRATE_LIMIT)
+    expect(after.messages.at(-1)?.content).toBe(`m${TOTAL - 1}`)
+    expect({ hasMore: after.slotHasMore, oldest: after.slotOldestIndex })
+      .toEqual({ hasMore: true, oldest: TOTAL - PANE_HYDRATE_LIMIT })
   })
 
   it('count-matches a STREAMING view too, since the handler collapses before it slices', async () => {
@@ -249,7 +515,7 @@ describe('refreshSlot count-matched bound', () => {
         .toEqual({ hasMore: false, oldest: 0 })
     })
 
-    it('refetches unbounded when the gap slid the page CLEAR of the view', async () => {
+    it('walks older when the gap slid the page CLEAR of the view', async () => {
       // The server gained more rows than the view holds, so the most-recent-N page
       // and the view are fully disjoint: the page carries no row the reducer can
       // cut at, and a wholesale assignment would drop the entire loaded window.
@@ -260,8 +526,8 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      // First the count-matched request, then the unbounded retry.
-      expect(limits()).toEqual([held, undefined])
+      // First the count-matched request, then the walk older in clamp-sized pages.
+      expectWalkedFrom(held)
       const after = store.getState().chat
       expect(after.messages).toHaveLength(TOTAL + held + 20)
       expect(after.messages[0].content).toBe('m0')
@@ -270,7 +536,7 @@ describe('refreshSlot count-matched bound', () => {
       expect(after.slotHasMore).toBe(false)
     })
 
-    it('does not bound at all when the view carries no server row identity', async () => {
+    it('walks to the start when the view carries no server row identity', async () => {
       // `olderHeadAbovePage` cuts on `meta.mid` only (two rows can share a `ts`, so a
       // ts match can cut at the wrong row) and declines without one. A view of rows
       // carrying none has a server span of zero, so there is no count to match and
@@ -280,7 +546,7 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([undefined])
+      expectWalkedFrom(PANE_HYDRATE_LIMIT)
       expect(store.getState().chat.messages).toHaveLength(TOTAL)
     })
 
@@ -374,10 +640,10 @@ describe('refreshSlot count-matched bound', () => {
         .toEqual({ hasMore: false, oldest: 0 })
     })
 
-    it('retries unbounded when a mixed-history page slides clear of the identified rows', async () => {
+    it('walks older when a mixed-history page slides clear of the identified rows', async () => {
       // The same mixed shape, but the server also gained more rows than the view's
       // identified span — so the page overlaps neither the legacy prefix nor the
-      // identified rows, and only the unbounded refetch can preserve the window.
+      // identified rows, and only walking older can preserve the window.
       const legacy = rows(20).map(({ meta: _meta, ...rest }) => rest) as typeof HISTORY
       const identified = rows(180, 20)
       HISTORY = [...legacy, ...identified]
@@ -390,7 +656,7 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([180, undefined])
+      expectWalkedFrom(180)
       const after = store.getState().chat
       expect(after.messages).toHaveLength(400)
       expect(after.messages[0].content).toBe('m0')
@@ -421,8 +687,8 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      // Declined the ambiguous anchor and refetched unbounded instead of trusting it.
-      expect(limits()).toEqual([held, undefined])
+      // Declined the ambiguous anchor and walked older instead of trusting it.
+      expectWalkedFrom(held)
       const after = store.getState().chat
       expect(after.messages).toHaveLength(TOTAL)
       expect(after.messages[0].content).toBe('m0')
@@ -446,7 +712,7 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([held, undefined])
+      expectWalkedFrom(held)
       expect(store.getState().chat.messages).toHaveLength(TOTAL)
     })
 
@@ -496,17 +762,20 @@ describe('refreshSlot count-matched bound', () => {
       await store.dispatch(refreshSlot(SLOT) as never)
 
       // Declined at the thunk, so the reducer never sees a page it cannot cut.
-      expect(limits()).toEqual([held, undefined])
+      expectWalkedFrom(held)
       const after = store.getState().chat
       expect(after.messages).toHaveLength(TOTAL)
       expect(after.messages[0].content).toBe('m0')
     })
 
-    it('refetches unbounded when no row carries a ts, losing nothing', async () => {
-      // The thunk asks for the STRICT form, so a corpus with no `ts` anywhere cannot
-      // anchor and it refetches unbounded. That is the safe direction here -- the cost
-      // is one round trip. The reducer's own cut uses the lenient form for the opposite
-      // reason, pinned in chatSlice.boundedRefetchShrink.test.ts.
+    it('takes a ts-less anchor at the reducer\'s own rule, without a wider read', async () => {
+      // The thunk's strict check declines a corpus with no `ts` anywhere, and the
+      // walk then judges the SAME page by the rule the reducer will apply -- which
+      // accepts two ts-less rows that do not contradict each other (pinned in
+      // chatSlice.boundedRefetchShrink.test.ts). The page IS the view, so the
+      // reducer's cut keeps everything and no older page is needed: one request,
+      // nothing lost. Walking to the start here would re-read a legacy transcript
+      // on every refresh, which is the cost this file exists to remove.
       const held = 180
       const oldest = TOTAL - held
       const stripTs = (r: Row) => {
@@ -523,10 +792,13 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([held, undefined])
+      expect(limits()).toEqual([held])
       const after = store.getState().chat
-      expect(after.messages).toHaveLength(TOTAL)
-      expect(after.messages[0].content).toBe('m0')
+      expect(after.messages).toHaveLength(held)
+      expect(after.messages[0].content).toBe(`m${oldest}`)
+      expect(after.messages.at(-1)?.content).toBe(`m${TOTAL - 1}`)
+      expect({ hasMore: after.slotHasMore, oldestIndex: after.slotOldestIndex })
+        .toEqual({ hasMore: true, oldestIndex: oldest })
     })
   })
 
@@ -550,7 +822,7 @@ describe('refreshSlot count-matched bound', () => {
         return rest as Row
       })
 
-    it('refreshes unbounded when the floor would reach past the identified rows', async () => {
+    it('walks older when the floor would reach past the identified rows', async () => {
       // 20 identified rows, so the floor asks for 50 -- a page holding all 20 AND 30
       // older legacy rows. The span check passes on the oldest identified row while the
       // page's OWN oldest row carries no id, so the cut keeps nothing and a 300-row
@@ -567,7 +839,7 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([undefined])
+      expectWalkedFrom(PANE_HYDRATE_LIMIT)
       const after = store.getState().chat.messages
       expect(after).toHaveLength(TOTAL)
       expect(after[0].content).toBe('m0')
@@ -590,7 +862,7 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([undefined])
+      expectWalkedFrom(PANE_HYDRATE_LIMIT)
       expect(store.getState().chat.messages).toHaveLength(TOTAL)
     })
 
@@ -698,7 +970,7 @@ describe('refreshSlot count-matched bound', () => {
       await store.dispatch(refreshSlot(SLOT) as never)
 
       // held is 20, so the floor genuinely over-requests and the guard fires.
-      expect(limits()).toEqual([undefined])
+      expectWalkedFrom(PANE_HYDRATE_LIMIT)
       const after = store.getState().chat.messages
       expect(after.filter(m => m.role !== 'permission')).toHaveLength(TOTAL)
     })
@@ -733,7 +1005,7 @@ describe('refreshSlot count-matched bound', () => {
       expect(oldest).toBeGreaterThan(0)
     })
 
-    it('refetches unbounded when the arriving rows make the anchor ambiguous', async () => {
+    it('walks older when the arriving rows make the anchor ambiguous', async () => {
       // The page's own oldest row is the anchor. If the rows landing mid-fetch carry a
       // second copy of that id, the anchor no longer names one row and the cut cannot
       // be trusted -- judged on the OLD view it still looks unique.
@@ -750,7 +1022,7 @@ describe('refreshSlot count-matched bound', () => {
 
       await store.dispatch(refreshSlot(SLOT) as never)
 
-      expect(limits()).toEqual([held, undefined])
+      expectWalkedFrom(held)
       expect(store.getState().chat.messages).toHaveLength(TOTAL)
     })
 
@@ -764,6 +1036,87 @@ describe('refreshSlot count-matched bound', () => {
 
       expect(limits()).toEqual([held])
       expect(store.getState().chat.messages).toHaveLength(held)
+    })
+
+    it('keeps a row streamed in while the walk was paging older', async () => {
+      // Disjoint page -> walk. A live chunk lands during the walk's SECOND request,
+      // after the first page was read, so it is in the view but in no walked page.
+      const held = 180
+      const store = pagedBack(held)
+      HISTORY = [...HISTORY, ...rows(held + 20, TOTAL)]
+      DURING_FETCH = () => {
+        DURING_FETCH = () => {
+          store.dispatch(sseChatMessage({ slot: SLOT, role: 'chunk', content: 'streamed-live' } as never))
+        }
+      }
+
+      await store.dispatch(refreshSlot(SLOT) as never)
+
+      expect(limits().length).toBeGreaterThan(1)
+      const after = store.getState().chat.messages
+      expect(after.at(-1)?.content).toBe('streamed-live')
+      expect(after).toHaveLength(held + 1)
+    })
+
+    it('keeps a chunk that lands on a streaming row sitting ABOVE a queued bubble', async () => {
+      // A message queued mid-turn renders below the streaming reply, so the reply is
+      // not the tail. A chunk still lands on it in place; the walked payload holds
+      // none of that text, so accepting it would erase what the user just read.
+      const held = 180
+      const base = pagedBack(held).getState().chat.messages
+      const streaming = { role: 'streaming', content: 'partial', cls: 'msg msg-a', rawText: 'partial' }
+      const queued = { role: 'user', content: 'queued-next', cls: 'msg', meta: { queued: true } }
+      const store = makeStore({
+        messages: [...base, streaming, queued],
+        slotHasMore: true,
+        slotOldestIndex: TOTAL - held,
+        slotCursorKey: SLOT,
+      })
+      HISTORY = [...HISTORY, ...rows(held + 20, TOTAL)]
+      DURING_FETCH = () => {
+        DURING_FETCH = () => {
+          store.dispatch(sseChatMessage({ slot: SLOT, role: 'chunk', content: ' more' } as never))
+        }
+      }
+
+      await store.dispatch(refreshSlot(SLOT) as never)
+
+      const after = store.getState().chat.messages
+      expect(after.find(m => m.role === 'streaming')?.content).toBe('partial more')
+      expect(after.at(-1)?.content).toBe('queued-next')
+    })
+
+    it('still lands the walk when only a row ABOVE the tail changed during it', async () => {
+      // An approval retiring mid-walk rewrites one earlier row: a new array, nothing
+      // streamed. Declining here would drop every row the reconnect walked for.
+      const held = 180
+      const store = pagedBack(held)
+      HISTORY = [...HISTORY, ...rows(held + 20, TOTAL)]
+      DURING_FETCH = () => {
+        DURING_FETCH = () => {
+          const view = store.getState().chat.messages
+          store.dispatch(replaceMessages(view.map((m, i) => (i === 3 ? { ...m } : m))))
+        }
+      }
+
+      await store.dispatch(refreshSlot(SLOT) as never)
+
+      expect(store.getState().chat.messages).toHaveLength(TOTAL + held + 20)
+    })
+
+    it('drops an older refresh payload that settles after a newer one applied', () => {
+      // Two overlapping refreshes (a variant switch mid-walk dispatches the second)
+      // can settle newest-first. The older payload carries rows read before the
+      // switch and must not put the old variant back.
+      const store = pagedBack(120)
+      const payload = (seq: number, content: string) => ({
+        key: SLOT, messages: [...HISTORY.slice(0, -1), { ...HISTORY[HISTORY.length - 1], content }],
+        running: false, hasMore: false, nextBefore: 0, total: TOTAL, queue: [], stopping: false, refreshSeq: seq,
+      })
+      store.dispatch(refreshSlot.fulfilled(payload(2, 'switched-variant') as never, 'r2', SLOT))
+      store.dispatch(refreshSlot.fulfilled(payload(1, 'old-variant') as never, 'r1', SLOT))
+
+      expect(store.getState().chat.messages.at(-1)?.content).toBe('switched-variant')
     })
 
     it('fetches nothing more when the slot switched during the await', async () => {

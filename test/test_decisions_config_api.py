@@ -31,6 +31,7 @@ import json
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.config.sections import (
     DECISION_BUCKET_MAX,
@@ -45,12 +46,18 @@ _BASE_CONFIG = {
 
 
 def _app() -> web.Application:
+    """The two real handlers, reached as the dashboard owner.
+
+    Both are owner-gated (``require_owner_dashboard_request``), so without
+    ``as_owner`` every case below would land on the gate instead of on the
+    bucket/provider contract it names.
+    """
     from kiro_crew.dashboard.handlers import api_kirocrew_config, api_kirocrew_config_patch
 
     app = web.Application()
     app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
     app.router.add_get("/api/config/kirocrew", api_kirocrew_config)
-    return app
+    return as_owner(app)
 
 
 @pytest.fixture
@@ -160,13 +167,22 @@ class TestModelRouteIsWritable:
 
         loop_thread = threading.current_thread()
         seen: list[threading.Thread] = []
-        real = _core._active_provider_name
+        real_provider = _core._active_provider_name
+        real_both = _core._active_provider_and_pin_backend
 
-        def _spy() -> str:
+        def _spy_provider() -> str:
             seen.append(threading.current_thread())
-            return real()
+            return real_provider()
 
-        monkeypatch.setattr(_core, "_active_provider_name", _spy)
+        def _spy_both() -> tuple[str, str]:
+            seen.append(threading.current_thread())
+            return real_both()
+
+        # The role-pin keys resolve the provider together with the harness scope
+        # (one read); every other validated key resolves the provider alone. Both
+        # are the same hop and both must stay off the loop.
+        monkeypatch.setattr(_core, "_active_provider_name", _spy_provider)
+        monkeypatch.setattr(_core, "_active_provider_and_pin_backend", _spy_both)
         async with TestClient(TestServer(_app())) as client:
             resp = await _patch(client, "decisions.model_route.simple", "")
             assert resp.status == 200, await resp.text()

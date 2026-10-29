@@ -21,6 +21,7 @@ import InfoTip from '../../components/InfoTip'
 import McpGatewayCard from '../McpGatewayCard'
 import type { AcpBackendsPayload } from '../overview/AcpBackendCard'
 import HostRuntimeCard from './HostRuntimeCard'
+import LeakedRuntimesCard from './LeakedRuntimesCard'
 import TasksCapacityCard from './TasksCapacityCard'
 import { fmtNumber, fmtPercent, fmtUnit } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
@@ -339,6 +340,9 @@ export default function ServicesTab() {
       {/* Durable task queue + effective concurrency — the capacity the
           services above are serving right now */}
       <TasksCapacityCard />
+
+      {/* Leaked agent runtimes — self-hides when nothing is leaked */}
+      <LeakedRuntimesCard />
     </>
   )
 }

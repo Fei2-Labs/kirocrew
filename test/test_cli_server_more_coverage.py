@@ -1,6 +1,6 @@
 """Coverage for the thinly-tested command dispatchers in ``kiro_crew.cli_server``.
 
-Everything here injects a fake at the seam the product actually reaches:
+Every file of this family injects a fake at the seam the product actually reaches:
 
 * ``subprocess.run`` / ``os.execvp`` — the CLI shells out to git, journalctl and
   tail. A CI runner has no installed systemd unit, no launchd, and (for the
@@ -13,11 +13,18 @@ Everything here injects a fake at the seam the product actually reaches:
 
 The gateway/taskrunner coroutines are driven with ``asyncio.run`` (the repo does
 not enable pytest-asyncio auto mode).
+
+This file pins ``_update`` -- the git checkout path, the gateway poke, the hardened
+subprocess calls, and the wheel path's dispatch, feed validation and installer -- and
+the ``status`` count and memory lines. ``test_cli_server_more_coverage_client.py``
+pins the client side (``resolve_client_port_ex``, the dashboard health probe, the
+``token`` and ``logout`` refusals and port ownership, and the owner-verified secret
+transport), and ``test_cli_server_more_coverage_lifecycle.py`` pins ``_stop`` and
+``restart``, the service and sandbox commands, ``_logs_cmd``, ``_gateway`` and
+``_run_task``. The SEL recorder fixture and the fake ``urlopen`` response they share
+live in ``cli_server_more_coverage_helpers.py``.
 """
 
-import argparse
-import asyncio
-import os
 import subprocess
 import sys
 import types
@@ -25,1212 +32,13 @@ import urllib.error
 from pathlib import Path
 
 import pytest
+from cli_server_more_coverage_helpers import (  # noqa: F401 -- the fixture is requested by name
+    _Resp,
+    sel_rec_fixture,
+)
 
-from kiro_crew import cli_server, kiro_cli, platform_compat
-from kiro_crew.config.loader import _DEFAULT_PORT
-from kiro_crew.dashboard.handlers.core import DASHBOARD_HTML_NOT_FOUND_MARKER
-from kiro_crew.gateway_lock import LockHolder, LockProbeError
+from kiro_crew import cli_server, kiro_cli
 from kiro_crew.platform.update_layout import InstallLayout
-from kiro_crew.service import linux as svc_linux
-from kiro_crew.service import macos as svc_macos
-from kiro_crew.service.common import Platform
-
-
-class _SelRecorder:
-    """Stand-in for :func:`kiro_crew.sel.sel` that records audit calls."""
-
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    def log_api_access(self, **kw) -> None:
-        self.calls.append(kw)
-
-    @property
-    def operations(self) -> list[str]:
-        return [c.get("operation", "") for c in self.calls]
-
-
-@pytest.fixture
-def sel_rec(monkeypatch):
-    rec = _SelRecorder()
-    monkeypatch.setattr(cli_server, "sel", lambda: rec)
-    return rec
-
-
-class _Resp:
-    """Minimal ``urlopen`` result usable as a context manager."""
-
-    def __init__(self, payload: bytes) -> None:
-        self._payload = payload
-
-    def read(self, n: int = -1) -> bytes:
-        return self._payload if n is None or n < 0 else self._payload[:n]
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        return False
-
-
-# --------------------------------------------------------------------------
-# resolve_client_port_ex — malformed env values must fall through, not raise
-# --------------------------------------------------------------------------
-
-
-class TestResolveClientPortExFallThrough:
-    """A non-numeric port env var degrades to the next source, never ValueError."""
-
-    @pytest.fixture(autouse=True)
-    def _no_other_sources(self, monkeypatch):
-        monkeypatch.setattr(cli_server, "_config_url_port", lambda: None)
-        monkeypatch.setattr(cli_server, "_marker_port", lambda: None)
-
-    def test_garbage_kirocrew_port_falls_to_default(self, monkeypatch) -> None:
-        monkeypatch.setenv("KIROCREW_PORT", "not-a-number")
-        monkeypatch.delenv("KIROCREW_BOUND_PORT", raising=False)
-        assert cli_server.resolve_client_port_ex(None) == (_DEFAULT_PORT, False)
-
-    def test_garbage_bound_port_falls_to_default(self, monkeypatch) -> None:
-        monkeypatch.delenv("KIROCREW_PORT", raising=False)
-        monkeypatch.setenv("KIROCREW_BOUND_PORT", "")
-        monkeypatch.setenv("KIROCREW_BOUND_PORT", "12x4")
-        assert cli_server.resolve_client_port_ex(None) == (_DEFAULT_PORT, False)
-
-    def test_garbage_kirocrew_port_still_honours_bound_port(self, monkeypatch) -> None:
-        """The fall-through lands on the NEXT source, not straight on the default."""
-        monkeypatch.setenv("KIROCREW_PORT", "oops")
-        monkeypatch.setenv("KIROCREW_BOUND_PORT", "9931")
-        assert cli_server.resolve_client_port_ex(None) == (9931, True)
-
-
-# --------------------------------------------------------------------------
-# _probe_dashboard_health
-# --------------------------------------------------------------------------
-
-
-class TestProbeDashboardHealth:
-    """Warns only when the served body carries the stale-dashboard marker."""
-
-    def test_stale_marker_warns_on_stderr(self, monkeypatch, capsys) -> None:
-        body = f"<html>{DASHBOARD_HTML_NOT_FOUND_MARKER}</html>".encode()
-        monkeypatch.setattr(cli_server, "loopback_urlopen", lambda *a, **k: _Resp(body))
-        cli_server._probe_dashboard_health(5476)
-        assert "stale dashboard" in capsys.readouterr().err
-
-    def test_healthy_body_is_silent(self, monkeypatch, capsys) -> None:
-        monkeypatch.setattr(
-            cli_server, "loopback_urlopen", lambda *a, **k: _Resp(b"<html>ok</html>")
-        )
-        cli_server._probe_dashboard_health(5476)
-        assert capsys.readouterr().err == ""
-
-    def test_network_error_is_swallowed(self, monkeypatch, capsys) -> None:
-        def boom(*a, **k):
-            raise urllib.error.URLError("refused")
-
-        monkeypatch.setattr(cli_server, "loopback_urlopen", boom)
-        cli_server._probe_dashboard_health(5476)  # must not raise
-        assert capsys.readouterr().err == ""
-
-
-# --------------------------------------------------------------------------
-# _token
-# --------------------------------------------------------------------------
-
-
-class TestTokenRefusal:
-    """A gateway that ANSWERS with an error is not a gateway that could not be
-    reached: the operator needs the reason the gateway gave, not a network hint."""
-
-    def test_403_prints_the_gateway_reason(self, monkeypatch, capsys) -> None:
-        import io
-        import json
-
-        reason = (
-            "The gateway could not verify this process as the local owner. "
-            "Open the dashboard using its CLI login link."
-        )
-        body = json.dumps({"error": reason, "code": "member_owner_token_refused"}).encode()
-
-        def refused(*a, **k):
-            raise urllib.error.HTTPError(
-                "http://127.0.0.1/api/token/local", 403, "Forbidden", {}, io.BytesIO(body)
-            )
-
-        monkeypatch.setattr(cli_server, "run_preflight_checks", lambda: None)
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _port: 5476)
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
-        monkeypatch.setattr(cli_server, "loopback_urlopen", refused)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._token(argparse.Namespace(ttl="1h", port=None))
-        assert exc.value.code == 1
-        err = capsys.readouterr().err
-        assert "HTTP 403" in err and "could not verify this process as the local owner" in err
-        assert "Could not reach gateway" not in err
-
-    def test_connection_refused_still_reports_unreachable(self, monkeypatch, capsys) -> None:
-        def boom(*a, **k):
-            raise urllib.error.URLError("refused")
-
-        monkeypatch.setattr(cli_server, "run_preflight_checks", lambda: None)
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _port: 5476)
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
-        monkeypatch.setattr(cli_server, "loopback_urlopen", boom)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._token(argparse.Namespace(ttl="1h", port=None))
-        assert exc.value.code == 1
-        assert "Could not reach gateway on port 5476" in capsys.readouterr().err
-
-
-# --------------------------------------------------------------------------
-# _logout
-# --------------------------------------------------------------------------
-
-
-class TestLogout:
-    """Every failure mode exits non-zero with an operator-facing reason."""
-
-    @pytest.fixture
-    def secret_home(self, monkeypatch, tmp_path):
-        (tmp_path / ".local_secret").write_text("s3cr3t\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "s3cr3t")
-        return tmp_path
-
-    def test_missing_secret_reports_gateway_down(self, monkeypatch, tmp_path, capsys) -> None:
-        monkeypatch.setattr(cli_server, "read_local_secret", lambda _port: "")
-        with pytest.raises(SystemExit) as exc:
-            cli_server._logout(5476)
-        assert exc.value.code == 1
-        assert "Gateway not running" in capsys.readouterr().out
-
-    def test_ok_response_reports_success(self, monkeypatch, secret_home, capsys) -> None:
-        monkeypatch.setattr(cli_server, "loopback_urlopen", lambda *a, **k: _Resp(b'{"ok": true}'))
-        cli_server._logout(5476)
-        assert "revoked" in capsys.readouterr().out
-
-    def test_not_ok_response_surfaces_error_field(self, monkeypatch, secret_home, capsys) -> None:
-        monkeypatch.setattr(
-            cli_server,
-            "loopback_urlopen",
-            lambda *a, **k: _Resp(b'{"ok": false, "error": "store locked"}'),
-        )
-        with pytest.raises(SystemExit) as exc:
-            cli_server._logout(5476)
-        assert exc.value.code == 1
-        assert "store locked" in capsys.readouterr().out
-
-    def test_http_error_reports_status_code(self, monkeypatch, secret_home, capsys) -> None:
-        def boom(*a, **k):
-            raise urllib.error.HTTPError("u", 403, "no", {}, None)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(cli_server, "loopback_urlopen", boom)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._logout(5476)
-        assert exc.value.code == 1
-        assert "HTTP 403" in capsys.readouterr().out
-
-    def test_connection_refused_reports_gateway_down(
-        self, monkeypatch, secret_home, capsys
-    ) -> None:
-        def boom(*a, **k):
-            raise urllib.error.URLError("refused")
-
-        monkeypatch.setattr(cli_server, "loopback_urlopen", boom)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._logout(5476)
-        assert exc.value.code == 1
-        assert "Gateway not running" in capsys.readouterr().out
-
-
-# --------------------------------------------------------------------------
-# _stop
-# --------------------------------------------------------------------------
-
-
-class TestStopViaService:
-    """No ``--port`` means the service manager gets first refusal."""
-
-    def test_service_stop_short_circuits_port_scan(self, monkeypatch, sel_rec, capsys) -> None:
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
-        monkeypatch.setattr(cli_server.service_controller, "stop_service", lambda: True)
-
-        def unreachable(port):  # pragma: no cover - asserts the short-circuit
-            raise AssertionError("port scan must not run when the service stopped")
-
-        monkeypatch.setattr(platform_compat, "find_listening_pids", unreachable)
-        cli_server._stop(None)
-        assert "Stopped kirocrew service" in capsys.readouterr().out
-        assert sel_rec.calls[0]["resources"].endswith("via=service")
-
-    def test_explicit_port_bypasses_the_service(self, monkeypatch, sel_rec, capsys) -> None:
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 8123)
-
-        def unreachable():  # pragma: no cover - asserts the bypass
-            raise AssertionError("service must not be consulted for an explicit port")
-
-        monkeypatch.setattr(cli_server.service_controller, "stop_service", unreachable)
-        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
-        monkeypatch.setattr(
-            cli_server, "lock_holder", lambda home: LockHolder(pid=None, alive=False, source="none")
-        )
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(8123)
-        assert exc.value.code == 1
-        assert "No Kiro Crew gateway currently running on port 8123" in capsys.readouterr().out
-        assert sel_rec.calls[-1]["outcome"] == "no_target"
-
-
-class TestStopLockHolderFallback:
-    """The port probe is not how single-instance is enforced -- gateway.lock
-    is (gateway_lock.py). A gateway the port probe misses (unix-socket-only,
-    or a probe blind spot) must still be VISIBLE through the lock, or
-    `kirocrew stop` reports "nothing running" the same moment `kirocrew
-    gateway` refuses to start for a live pid -- the split-brain this fixes.
-    The lock is an oracle, not a signalling path: a live holder is refused
-    and named (lock path, pid, manual command) with one ``denied`` event, and
-    nothing is signalled, whoever holds it.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _arrange(self, monkeypatch):
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
-        monkeypatch.setattr(cli_server.service_controller, "stop_service", lambda: False)
-        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
-        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
-        monkeypatch.setattr(cli_server, "_report_authenticated_shutdown", lambda port: False)
-        monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
-        monkeypatch.setattr(cli_server, "_pid_exited", lambda pid: True)
-        monkeypatch.setattr("time.sleep", lambda s: None)
-
-    @pytest.fixture
-    def signals(self, monkeypatch) -> list[int]:
-        """Record every pid the command would signal, on either platform."""
-        sent: list[int] = []
-        monkeypatch.setattr(os, "kill", lambda pid, sig: sent.append(pid))
-        monkeypatch.setattr(platform_compat, "kill_process_tree", lambda pid, sig: sent.append(pid))
-        return sent
-
-    def test_live_kirocrew_lock_holder_is_refused_and_named(
-        self, monkeypatch, sel_rec, capsys, signals
-    ) -> None:
-        monkeypatch.setattr(
-            cli_server,
-            "lock_holder",
-            lambda home: LockHolder(pid=4242, alive=True, source="flock_owner"),
-        )
-        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
-        daemon_stops: list[int] = []
-        monkeypatch.setattr(cli_server, "_stop_mcp_gateway_daemon", lambda: daemon_stops.append(1))
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert signals == []
-        assert daemon_stops == []
-        out = capsys.readouterr().out
-        assert "gateway.lock" in out
-        assert "pid 4242" in out
-        assert "could not reach it" in out
-        assert "kill -TERM 4242" in out
-        assert len(sel_rec.calls) == 1
-        assert sel_rec.calls[0]["operation"] == "gateway_stop"
-        assert sel_rec.calls[0]["outcome"] == "denied"
-        assert "pids=[4242]" in sel_rec.calls[0]["resources"]
-        assert "reason=lock_holder_kirocrew" in sel_rec.calls[0]["resources"]
-
-    def test_live_kirocrew_lock_holder_on_windows_names_taskkill(
-        self, monkeypatch, sel_rec, capsys, signals
-    ) -> None:
-        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(
-            cli_server,
-            "lock_holder",
-            lambda home: LockHolder(pid=4242, alive=True, source="flock_owner"),
-        )
-        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert signals == []
-        assert "taskkill /PID 4242 /T" in capsys.readouterr().out
-        assert [c["outcome"] for c in sel_rec.calls] == ["denied"]
-
-    def test_dead_lock_holder_still_reports_no_target(self, monkeypatch, sel_rec, capsys) -> None:
-        monkeypatch.setattr(
-            cli_server,
-            "lock_holder",
-            lambda home: LockHolder(pid=4242, alive=False, source="flock_owner"),
-        )
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert "No Kiro Crew gateway currently running" in capsys.readouterr().out
-        assert sel_rec.calls[-1]["outcome"] == "no_target"
-
-    def test_live_lock_holder_is_refused_without_a_port_tool(
-        self, monkeypatch, sel_rec, capsys, signals
-    ) -> None:
-        """The lock file needs no `lsof`: with the port tool unavailable and a
-        live Kiro Crew holder, stop names the holder instead of exiting on the
-        tool diagnostic. The diagnostic is for the case where nothing found a
-        gateway, not a gate in front of the fallbacks that need no tool."""
-        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: False)
-        monkeypatch.setattr(platform_compat, "listening_pid_tool", lambda: "lsof")
-        monkeypatch.setattr(platform_compat, "tool_outside_trusted_dirs", lambda tool: None)
-        monkeypatch.setattr(
-            cli_server,
-            "lock_holder",
-            lambda home: LockHolder(pid=4242, alive=True, source="flock_owner"),
-        )
-        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
-        daemon_stops: list[int] = []
-        monkeypatch.setattr(cli_server, "_stop_mcp_gateway_daemon", lambda: daemon_stops.append(1))
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        out = capsys.readouterr().out
-        assert signals == []
-        assert daemon_stops == []
-        assert "not found" not in out and "Install lsof" not in out
-        assert "kill -TERM 4242" in out
-        assert len(sel_rec.calls) == 1
-        assert sel_rec.calls[0]["outcome"] == "denied"
-        assert "reason=lock_holder_kirocrew" in sel_rec.calls[0]["resources"]
-
-    def test_no_holder_and_no_port_tool_keeps_the_tool_diagnostic(
-        self, monkeypatch, sel_rec, capsys
-    ) -> None:
-        """Both tool-free fallbacks find nothing: the tool-absent exit is still
-        what the operator sees, because "nothing running" cannot be proven
-        without the port lookup."""
-        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: False)
-        monkeypatch.setattr(platform_compat, "listening_pid_tool", lambda: "lsof")
-        monkeypatch.setattr(platform_compat, "tool_outside_trusted_dirs", lambda tool: None)
-        monkeypatch.setattr(
-            cli_server, "lock_holder", lambda home: LockHolder(pid=None, alive=False, source="none")
-        )
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert "Install lsof and retry." in capsys.readouterr().out
-        assert "reason=lsof_not_found" in sel_rec.calls[-1]["resources"]
-
-    def test_non_kirocrew_lock_holder_is_refused_not_stopped(
-        self, monkeypatch, sel_rec, capsys, signals
-    ) -> None:
-        monkeypatch.setattr(
-            cli_server,
-            "lock_holder",
-            lambda home: LockHolder(pid=99, alive=True, source="flock_owner"),
-        )
-        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: False)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert signals == []
-        out = capsys.readouterr().out
-        assert "does not look like a Kiro Crew gateway" in out
-        assert "kill -TERM 99" in out
-        assert len(sel_rec.calls) == 1
-        assert sel_rec.calls[0]["operation"] == "gateway_stop"
-        assert sel_rec.calls[0]["outcome"] == "denied"
-        assert "pids=[99]" in sel_rec.calls[0]["resources"]
-        assert "reason=lock_holder_foreign" in sel_rec.calls[0]["resources"]
-
-    def test_indeterminate_probe_signals_nothing_and_exits_non_zero(
-        self, monkeypatch, sel_rec, capsys, signals
-    ) -> None:
-        # The probe could not say held-or-free. Signalling the pid the file
-        # records could hit an unrelated process that reused the number, so
-        # `stop` names the problem and exits 1 without touching any pid.
-        lock_path = Path("/var/lib/kirocrew/gateway.lock")
-
-        def indeterminate(home):
-            raise LockProbeError(lock_path, OSError("flock unsupported"))
-
-        monkeypatch.setattr(cli_server, "lock_holder", indeterminate)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert signals == []
-        out = capsys.readouterr().out
-        assert f"could not determine whether a gateway holds the lock at {lock_path}" in out
-        assert "flock unsupported" in out
-        assert sel_rec.calls[-1]["outcome"] == "denied"
-        assert "lock_probe_indeterminate" in sel_rec.calls[-1]["resources"]
-
-
-class TestRestartIndeterminateLock:
-    """``restart`` on an indeterminate lock probe must neither signal the
-    recorded pid nor spawn a replacement the lock may refuse."""
-
-    def test_indeterminate_probe_signals_nothing_spawns_nothing(
-        self, monkeypatch, sel_rec, capsys
-    ) -> None:
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
-        monkeypatch.setattr(cli_server.service_controller, "restart_service", lambda: False)
-        monkeypatch.setattr(cli_server.service_controller, "is_service_active", lambda: False)
-        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [])
-        monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: True)
-        monkeypatch.setattr(cli_server, "_report_authenticated_shutdown", lambda port: False)
-        monkeypatch.setattr(cli_server.run_marker, "read_pid", lambda port: None)
-        lock_path = Path("/var/lib/kirocrew/gateway.lock")
-
-        def indeterminate(home):
-            raise LockProbeError(lock_path, OSError("flock unsupported"))
-
-        monkeypatch.setattr(cli_server, "lock_holder", indeterminate)
-        stopped: list[int] = []
-        monkeypatch.setattr(os, "kill", lambda pid, sig: stopped.append(pid))
-        spawned: list[int] = []
-        monkeypatch.setattr(
-            cli_server, "_spawn_detached_gateway", lambda port: spawned.append(port)
-        )
-        with pytest.raises(SystemExit) as exc:
-            cli_server._restart(None)
-        assert exc.value.code == 1
-        assert stopped == []
-        assert spawned == []
-        out = capsys.readouterr().out
-        assert f"could not determine whether a gateway holds the lock at {lock_path}" in out
-        assert "not starting a replacement" in out
-        assert sel_rec.calls[-1]["operation"] == "gateway_restart"
-        assert sel_rec.calls[-1]["outcome"] == "denied"
-
-
-class TestStopOnWindows:
-    """The Windows branch kills the whole tree via ``platform_compat``."""
-
-    @pytest.fixture(autouse=True)
-    def _windows(self, monkeypatch):
-        monkeypatch.setattr(cli_server, "resolve_client_port", lambda p: 5476)
-        monkeypatch.setattr(cli_server.service_controller, "stop_service", lambda: False)
-        monkeypatch.setattr(platform_compat, "find_listening_pids", lambda port: [4242])
-        monkeypatch.setattr(cli_server, "_is_kirocrew_process", lambda pid: True)
-        monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-        monkeypatch.setattr(cli_server, "_pid_exited", lambda pid: True)
-        monkeypatch.setattr("time.sleep", lambda s: None)
-
-    def test_tree_kill_reports_terminated(self, monkeypatch, sel_rec, capsys) -> None:
-        seen: list[int] = []
-        monkeypatch.setattr(platform_compat, "kill_process_tree", lambda pid, sig: seen.append(pid))
-        cli_server._stop(None)
-        out = capsys.readouterr().out
-        assert seen == [4242]
-        assert "Terminated gateway (pid 4242)" in out
-        assert sel_rec.calls[-1]["outcome"] == "allowed"
-
-    def test_already_gone_pid_is_not_reported_as_stopped(
-        self, monkeypatch, sel_rec, capsys
-    ) -> None:
-        def gone(pid, sig):
-            raise ProcessLookupError
-
-        monkeypatch.setattr(platform_compat, "kill_process_tree", gone)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert "process already exited" in capsys.readouterr().out
-
-    def test_permission_error_asks_for_sudo_and_exits(self, monkeypatch, sel_rec, capsys) -> None:
-        def denied(pid, sig):
-            raise PermissionError
-
-        monkeypatch.setattr(platform_compat, "kill_process_tree", denied)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert "No permission to stop pid 4242" in capsys.readouterr().out
-        assert sel_rec.calls[-1]["outcome"] == "denied"
-
-    def test_generic_taskkill_failure_rechecks_liveness(self, monkeypatch, capsys) -> None:
-        """An OSError from taskkill is only "denied" if the pid is still alive."""
-
-        def oserr(pid, sig):
-            raise OSError("taskkill exit 1")
-
-        monkeypatch.setattr(platform_compat, "kill_process_tree", oserr)
-        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: True)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        assert "No permission to stop pid 4242" in capsys.readouterr().out
-
-    def test_generic_taskkill_failure_on_dead_pid_is_not_denied(self, monkeypatch, capsys) -> None:
-        def oserr(pid, sig):
-            raise OSError("taskkill exit 1")
-
-        monkeypatch.setattr(platform_compat, "kill_process_tree", oserr)
-        monkeypatch.setattr(platform_compat, "pid_exists", lambda pid: False)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._stop(None)
-        assert exc.value.code == 1
-        out = capsys.readouterr().out
-        assert "process already exited" in out
-        assert "No permission" not in out
-
-
-# --------------------------------------------------------------------------
-# _service_cmd / _sandbox_cmd
-# --------------------------------------------------------------------------
-
-
-class TestServiceCmd:
-    """Each action forwards to the controller and audits the resulting rc."""
-
-    @pytest.mark.parametrize(
-        "action,fn,operation",
-        [
-            ("install", "install_service", "service_install"),
-            ("uninstall", "uninstall_service", "service_uninstall"),
-            ("status", "service_status", "service_status"),
-        ],
-    )
-    def test_action_forwards_and_audits(self, monkeypatch, sel_rec, action, fn, operation) -> None:
-        monkeypatch.setattr(cli_server.service_controller, fn, lambda: 0)
-        rc = cli_server._service_cmd(argparse.Namespace(service_action=action))
-        assert rc == 0
-        assert sel_rec.operations == [operation]
-        assert sel_rec.calls[0]["outcome"] == "allowed"
-
-    def test_nonzero_rc_is_audited_as_error(self, monkeypatch, sel_rec) -> None:
-        monkeypatch.setattr(cli_server.service_controller, "install_service", lambda: 3)
-        assert cli_server._service_cmd(argparse.Namespace(service_action="install")) == 3
-        assert sel_rec.calls[0]["outcome"] == "error"
-        assert "rc=3" in sel_rec.calls[0]["resources"]
-
-    def test_unknown_action_prints_usage_and_returns_2(self, sel_rec, capsys) -> None:
-        assert cli_server._service_cmd(argparse.Namespace(service_action=None)) == 2
-        assert "Usage: kirocrew service" in capsys.readouterr().err
-        assert sel_rec.calls == []
-
-
-class TestSandboxCmd:
-    """Profile writes are audited; the read-only status probe is not."""
-
-    def test_install_profile_forwards_path_and_audits(self, monkeypatch, sel_rec) -> None:
-        seen: list[str | None] = []
-        monkeypatch.setattr(
-            cli_server.service_controller,
-            "install_launcher_profile",
-            lambda p: seen.append(p) or 0,
-        )
-        rc = cli_server._sandbox_cmd(
-            argparse.Namespace(sandbox_action="install-profile", path="/opt/app.AppImage")
-        )
-        assert rc == 0
-        assert seen == ["/opt/app.AppImage"]
-        assert sel_rec.operations == ["sandbox_profile_install"]
-        assert "/opt/app.AppImage" in sel_rec.calls[0]["resources"]
-
-    def test_install_profile_without_path_records_appimage_placeholder(
-        self, monkeypatch, sel_rec
-    ) -> None:
-        monkeypatch.setattr(cli_server.service_controller, "install_launcher_profile", lambda p: 1)
-        assert (
-            cli_server._sandbox_cmd(argparse.Namespace(sandbox_action="install-profile", path=None))
-            == 1
-        )
-        assert sel_rec.calls[0]["outcome"] == "error"
-        assert "$APPIMAGE" in sel_rec.calls[0]["resources"]
-
-    def test_remove_profile_audits(self, monkeypatch, sel_rec) -> None:
-        monkeypatch.setattr(cli_server.service_controller, "remove_launcher_profile", lambda: 0)
-        assert cli_server._sandbox_cmd(argparse.Namespace(sandbox_action="remove-profile")) == 0
-        assert sel_rec.operations == ["sandbox_profile_remove"]
-
-    def test_status_is_not_audited(self, monkeypatch, sel_rec) -> None:
-        monkeypatch.setattr(cli_server.service_controller, "sandbox_profile_status", lambda p: 7)
-        rc = cli_server._sandbox_cmd(argparse.Namespace(sandbox_action="status", path=None))
-        assert rc == 7
-        assert sel_rec.calls == []
-
-    def test_unknown_action_prints_usage_and_returns_2(self, sel_rec, capsys) -> None:
-        assert cli_server._sandbox_cmd(argparse.Namespace(sandbox_action="bogus")) == 2
-        assert "Usage: kirocrew sandbox" in capsys.readouterr().err
-        assert sel_rec.calls == []
-
-
-# --------------------------------------------------------------------------
-# _logs_cmd
-# --------------------------------------------------------------------------
-
-
-class _ExecCalled(Exception):
-    """Raised by the ``os.execvp`` stub — the real call never returns."""
-
-    def __init__(self, file: str, argv: list[str]) -> None:
-        super().__init__(file)
-        self.file = file
-        self.argv = argv
-
-
-@pytest.fixture
-def fake_execvp(monkeypatch):
-    def _execvp(file, argv):
-        raise _ExecCalled(file, list(argv))
-
-    monkeypatch.setattr(os, "execvp", _execvp)
-
-
-class TestLogsCmdSystemd:
-    """Journal first, sudo only as a fallback, and never a blind sudo prompt."""
-
-    @pytest.fixture(autouse=True)
-    def _systemd(self, monkeypatch, tmp_path):
-        unit = tmp_path / "kirocrew.service"
-        unit.write_text("[Unit]\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.SYSTEMD)
-        monkeypatch.setattr(svc_linux, "UNIT_PATH", unit)
-
-    def test_unprivileged_journal_is_execed_when_probe_returns_rows(
-        self, monkeypatch, sel_rec, fake_execvp
-    ) -> None:
-        monkeypatch.setattr(
-            subprocess,
-            "run",
-            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "-- Logs begin --\n", ""),
-        )
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=True, lines=42))
-        assert exc.value.file == "journalctl"
-        assert exc.value.argv[0] == "journalctl"
-        assert "-f" in exc.value.argv
-        assert "42" in exc.value.argv
-        # Audited BEFORE the exec, or the record would never be written.
-        assert sel_rec.operations == ["logs"]
-        assert "follow=True lines=42" in sel_rec.calls[0]["resources"]
-
-    def test_empty_probe_without_tty_refuses_instead_of_hanging_on_sudo(
-        self, monkeypatch, sel_rec, capsys
-    ) -> None:
-        monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "denied")
-        )
-        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: False))
-        with pytest.raises(SystemExit) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=10))
-        assert exc.value.code == 1
-        err = capsys.readouterr().err
-        assert "stdin is not a TTY" in err
-        assert "systemd-journal" in err
-
-    def test_empty_probe_with_tty_falls_back_to_sudo_journalctl(
-        self, monkeypatch, sel_rec, fake_execvp
-    ) -> None:
-        monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "   \n", "")
-        )
-        monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=True, lines=5))
-        assert exc.value.file == "sudo"
-        assert exc.value.argv[:2] == ["sudo", "journalctl"]
-        assert exc.value.argv[-1] == "-f"
-        assert "--no-pager" in exc.value.argv
-
-    def test_missing_unit_falls_through_to_the_plain_log_file(
-        self, monkeypatch, tmp_path, sel_rec, fake_execvp
-    ) -> None:
-        monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent.service")
-        log = tmp_path / "gateway.log"
-        log.write_text("hi\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
-
-        def unreachable(*a, **k):  # pragma: no cover - proves no journal probe
-            raise AssertionError("journalctl must not be probed without an installed unit")
-
-        monkeypatch.setattr(subprocess, "run", unreachable)
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=3))
-        assert exc.value.file == "tail"
-        assert exc.value.argv == ["tail", "-n", "3", str(log)]
-
-
-class TestLogsCmdOtherSources:
-    """launchd stdout file, plain log file, and the "nothing to tail" refusal."""
-
-    @pytest.fixture
-    def launchd(self, monkeypatch, tmp_path):
-        """An installed launchd agent: a plist on disk and a non-empty stdout log.
-
-        Both paths are patched even when a test only cares about one of them,
-        because the real ones are consulted otherwise and a CI runner has
-        neither.
-        """
-        plist = tmp_path / "crew.plist"
-        plist.write_text("<plist/>\n", encoding="utf-8", newline="\n")
-        stdout_log = tmp_path / "launchd-gateway.log"
-        stdout_log.write_text("x\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.LAUNCHD)
-        monkeypatch.setattr(svc_macos, "PLIST_PATH", plist)
-        monkeypatch.setattr(svc_macos, "STDOUT_LOG", stdout_log)
-        return types.SimpleNamespace(plist=plist, stdout_log=stdout_log)
-
-    def test_launchd_stdout_log_is_tailed(self, sel_rec, fake_execvp, launchd) -> None:
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=True, lines=8))
-        assert exc.value.argv == ["tail", "-n", "8", "-f", str(launchd.stdout_log)]
-
-    def test_launchd_without_an_installed_plist_falls_through(
-        self, monkeypatch, tmp_path, sel_rec, fake_execvp, launchd
-    ) -> None:
-        """A foreground gateway on macOS reaches the config-dir log, not the agent's."""
-        launchd.plist.unlink()
-        fallback = tmp_path / "fallback" / "gateway.log"
-        fallback.parent.mkdir()
-        fallback.write_text("real\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "config_dir", lambda: fallback.parent)
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=4))
-        assert exc.value.argv == ["tail", "-n", "4", str(fallback)]
-
-    def test_launchd_with_an_empty_stdout_log_falls_through(
-        self, monkeypatch, tmp_path, sel_rec, fake_execvp, launchd
-    ) -> None:
-        """A 0-byte agent log satisfies exists(), so size is what gates the branch."""
-        launchd.stdout_log.write_text("", encoding="utf-8", newline="\n")
-        fallback = tmp_path / "fallback" / "gateway.log"
-        fallback.parent.mkdir()
-        fallback.write_text("real\n", encoding="utf-8", newline="\n")
-        monkeypatch.setattr(cli_server, "config_dir", lambda: fallback.parent)
-        with pytest.raises(_ExecCalled) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=4))
-        assert exc.value.argv == ["tail", "-n", "4", str(fallback)]
-
-    def test_no_log_source_at_all_exits_with_guidance(
-        self, monkeypatch, tmp_path, sel_rec, capsys
-    ) -> None:
-        monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.UNSUPPORTED)
-        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
-        with pytest.raises(SystemExit) as exc:
-            cli_server._logs_cmd(argparse.Namespace(follow=False, lines=100))
-        assert exc.value.code == 1
-        assert "No gateway logs found" in capsys.readouterr().err
-        assert sel_rec.operations == ["logs"]
-
-    def test_zero_lines_argument_falls_back_to_the_default(
-        self, monkeypatch, tmp_path, sel_rec, capsys
-    ) -> None:
-        """``lines=0`` selects the default tail length on an unsupported service host."""
-        monkeypatch.setattr(cli_server, "current_platform", lambda: Platform.UNSUPPORTED)
-        monkeypatch.setattr(cli_server, "config_dir", lambda: tmp_path)
-        (tmp_path / "gateway.log").write_text("x\n", encoding="utf-8", newline="\n")
-        cli_server._logs_cmd(argparse.Namespace(follow=False, lines=0))
-        assert capsys.readouterr().out == "x\n"
-
-
-# --------------------------------------------------------------------------
-# _gateway
-# --------------------------------------------------------------------------
-
-
-class _FakeCfg:
-    """Config double for ``_gateway`` — records ``save()`` instead of writing."""
-
-    saved = 0
-
-    def save(self) -> None:
-        type(self).saved += 1
-
-    @classmethod
-    def load(cls) -> "_FakeCfg":
-        return cls()
-
-
-class TestGateway:
-    """Start-up reconciliation runs, then ``run_gateway`` receives the flags verbatim."""
-
-    @pytest.fixture
-    def gw(self, monkeypatch, tmp_path):
-        captured: dict = {}
-
-        async def _run_gateway(cfg, **kw):
-            captured["cfg"] = cfg
-            captured["kw"] = kw
-
-        monkeypatch.setattr(cli_server, "run_gateway", _run_gateway)
-        monkeypatch.setattr(cli_server, "activate_mise", lambda: [])
-        monkeypatch.setattr(cli_server, "ensure_dev_dist_symlink", lambda: tmp_path / "dist")
-        monkeypatch.setattr(cli_server, "_should_reconcile_launchd_launcher", lambda: False)
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text("{}", encoding="utf-8")
-        monkeypatch.setattr(cli_server, "config_path", lambda: cfg_file)
-
-        class _Cfg(_FakeCfg):
-            saved = 0
-
-        monkeypatch.setattr(cli_server, "KiroCrewConfig", _Cfg)
-        monkeypatch.setattr("kiro_crew.cli._node_ok", lambda: True)
-        return captured, _Cfg
-
-    def test_flags_are_forwarded_to_run_gateway(self, gw) -> None:
-        captured, cfg_cls = gw
-        asyncio.run(
-            cli_server._gateway(
-                no_dashboard=True, no_crons=True, no_open=True, port_override="9001"
-            )
-        )
-        assert captured["kw"]["no_dashboard"] is True
-        assert captured["kw"]["no_crons"] is True
-        assert captured["kw"]["port_override"] == "9001"
-        # Existing config file -> no default config written.
-        assert cfg_cls.saved == 0
-
-    def test_missing_config_is_created_before_load(self, gw, monkeypatch, tmp_path, capsys) -> None:
-        captured, cfg_cls = gw
-        monkeypatch.setattr(cli_server, "config_path", lambda: tmp_path / "absent.json")
-        asyncio.run(cli_server._gateway())
-        assert cfg_cls.saved == 1
-        assert "Created default config" in capsys.readouterr().out
-
-    def test_missing_dist_warns_but_still_starts(self, gw, monkeypatch, caplog) -> None:
-        captured, _ = gw
-        monkeypatch.setattr(cli_server, "ensure_dev_dist_symlink", lambda: None)
-        with caplog.at_level("WARNING", logger="kiro_crew.cli_server"):
-            asyncio.run(cli_server._gateway(no_dashboard=False))
-        assert any("dist/ not found" in r.message for r in caplog.records)
-        assert "kw" in captured
-
-    def test_slack_only_skips_the_dist_check(self, gw, monkeypatch) -> None:
-        captured, _ = gw
-
-        def unreachable():  # pragma: no cover - proves the skip
-            raise AssertionError("dist must not be resolved in slack-only mode")
-
-        monkeypatch.setattr(cli_server, "ensure_dev_dist_symlink", unreachable)
-        asyncio.run(cli_server._gateway(no_dashboard=True))
-        assert captured["kw"]["no_dashboard"] is True
-
-    def test_stale_node_triggers_ensure_node(self, gw, monkeypatch) -> None:
-        calls: list[str] = []
-        monkeypatch.setattr("kiro_crew.cli._node_ok", lambda: False)
-        monkeypatch.setattr("kiro_crew.cli._ensure_node", lambda *a: calls.append("ensured"))
-        asyncio.run(cli_server._gateway(no_dashboard=True))
-        assert calls == ["ensured"]
-
-    def test_mise_activation_is_logged_when_it_changes_the_env(
-        self, gw, monkeypatch, caplog
-    ) -> None:
-        monkeypatch.setattr(cli_server, "activate_mise", lambda: ["PATH"])
-        with caplog.at_level("INFO", logger="kiro_crew.cli_server"):
-            asyncio.run(cli_server._gateway(no_dashboard=True))
-        assert any("Activated mise" in r.message for r in caplog.records)
-
-    def test_launchd_launcher_repair_failure_is_non_fatal(self, gw, monkeypatch, caplog) -> None:
-        captured, _ = gw
-        monkeypatch.setattr(cli_server, "_should_reconcile_launchd_launcher", lambda: True)
-
-        def boom():
-            raise OSError("read-only Application Support")
-
-        monkeypatch.setattr(svc_macos, "ensure_live_program", boom)
-        with caplog.at_level("WARNING", logger="kiro_crew.cli_server"):
-            asyncio.run(cli_server._gateway(no_dashboard=True))
-        assert any("live-gateway launcher" in r.message for r in caplog.records)
-        assert "kw" in captured  # the gateway still started
-
-
-# --------------------------------------------------------------------------
-# _run_task
-# --------------------------------------------------------------------------
-
-
-class _FakeStore:
-    def __init__(self, *a, **kw) -> None:
-        self.kwargs = kw
-        self.inited = False
-        self.builtins_synced = False
-
-    def init(self) -> None:
-        self.inited = True
-
-    def sync_builtins(self) -> None:
-        # _run_task now syncs builtin skills through the explicit seam
-        # (SkillsLoader(install_builtins=False) + to_thread(sync_builtins)).
-        self.builtins_synced = True
-
-
-class _FakeVectorStore(_FakeStore):
-    embed_fn = None
-    embed_fn_factory = None
-
-
-class _FakeSessions:
-    def __init__(self, cfg, provider_factory=None) -> None:
-        self.cfg = cfg
-        self.pool_started = False
-        self.closed = False
-
-    async def start_pool(self) -> None:
-        self.pool_started = True
-
-    async def close_all(self) -> None:
-        self.closed = True
-
-
-class _Result:
-    def __init__(self, status: str, error: str = "") -> None:
-        self.status = status
-        self.error = error
-        self.name = "demo"
-        self.task_id = "t-1"
-        self.tasks = [1, 2, 3]
-
-
-@pytest.fixture
-def taskrunner_env(monkeypatch, tmp_path):
-    """Replace every collaborator ``_run_task`` constructs, and expose the spies."""
-    from kiro_crew.config import KiroCrewConfig
-
-    state: dict = {"vector": None, "sessions": None, "runner_kwargs": None, "observed": []}
-
-    monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: cls()))
-    monkeypatch.setattr(cli_server, "KiroCrewConfig", KiroCrewConfig)
-    monkeypatch.setattr(cli_server, "build_provider_factory", lambda cfg: object())
-
-    def _sessions(cfg, provider_factory=None):
-        state["sessions"] = _FakeSessions(cfg, provider_factory)
-        return state["sessions"]
-
-    monkeypatch.setattr(cli_server, "SessionManager", _sessions)
-    monkeypatch.setattr(cli_server, "MemoryStore", _FakeStore)
-
-    def _vector(**kw):
-        state["vector"] = _FakeVectorStore(**kw)
-        return state["vector"]
-
-    monkeypatch.setattr(cli_server, "VectorMemoryStore", _vector)
-    monkeypatch.setattr(cli_server, "ConversationLog", _FakeStore)
-    monkeypatch.setattr(cli_server, "LessonStore", _FakeStore)
-    monkeypatch.setattr(cli_server, "SkillsLoader", _FakeStore)
-    monkeypatch.setattr(cli_server, "HistoryConsolidator", lambda **kw: object())
-    monkeypatch.setattr(cli_server, "hooks_config_from_config_dict", lambda h: {})
-    monkeypatch.setattr(cli_server, "HookManager", lambda hc: object())
-    monkeypatch.setattr(cli_server, "ContextBuilder", lambda **kw: object())
-    monkeypatch.setattr(
-        cli_server, "register_skill_read_observer", lambda ctx: state["observed"].append(ctx)
-    )
-    monkeypatch.setattr(cli_server, "_session_work_dir", lambda key: tmp_path)
-    monkeypatch.setattr(cli_server, "make_sync_embed_fn", lambda: (lambda text: [0.0]))
-    monkeypatch.setattr(cli_server, "model_file_present", lambda: True)
-    monkeypatch.setattr(cli_server, "store_embedding_space_is_stale", lambda vs: False)
-
-    def _install_runner(result: _Result) -> None:
-        class _Runner:
-            def __init__(self, **kw) -> None:
-                state["runner_kwargs"] = kw
-
-            async def run(self, spec_path, name=""):
-                state["ran"] = (spec_path, name)
-                return result
-
-        monkeypatch.setattr(cli_server, "TaskRunner", _Runner)
-
-    state["install_runner"] = _install_runner
-    return state
-
-
-def _spec(tmp_path: Path) -> Path:
-    spec = tmp_path / "task.md"
-    spec.write_text("# Task\n\n- step one\n", encoding="utf-8", newline="\n")
-    return spec
-
-
-class TestRunTask:
-    """Spec validation, embedding degradation, and the three terminal statuses."""
-
-    def test_missing_spec_exits_before_building_anything(self, tmp_path, capsys) -> None:
-        args = argparse.Namespace(spec=str(tmp_path / "nope.md"))
-        with pytest.raises(SystemExit) as exc:
-            asyncio.run(cli_server._run_task(args))
-        assert exc.value.code == 1
-        assert "Spec file not found" in capsys.readouterr().err
-
-    def test_completed_task_wires_runner_and_closes_sessions(
-        self, taskrunner_env, tmp_path, capsys
-    ) -> None:
-        taskrunner_env["install_runner"](_Result("completed"))
-        spec = _spec(tmp_path)
-        args = argparse.Namespace(
-            spec=str(spec), no_test=True, fresh=False, timeout=90, name="my-run"
-        )
-        asyncio.run(cli_server._run_task(args))
-        kw = taskrunner_env["runner_kwargs"]
-        assert kw["auto_test"] is False  # --no-test inverts into auto_test
-        assert kw["fresh"] is False
-        assert kw["global_timeout"] == 90.0
-        assert taskrunner_env["ran"] == (spec.resolve(), "my-run")
-        assert taskrunner_env["sessions"].pool_started is True
-        assert taskrunner_env["sessions"].closed is True
-        assert taskrunner_env["observed"]  # skill-read observer registered
-        out = capsys.readouterr().out
-        assert "Task completed" in out and "(3 steps)" in out
-
-    def test_builtin_sync_runs_through_the_explicit_seam(
-        self, taskrunner_env, tmp_path, monkeypatch
-    ) -> None:
-        # _run_task runs on a loop, where construction-time sync skips
-        # itself: the loader must be built with install_builtins=False and
-        # have sync_builtins driven through the explicit off-loop seam.
-        created: list[_FakeStore] = []
-
-        class _SpyLoader(_FakeStore):
-            def __init__(self, *a, **kw) -> None:
-                super().__init__(*a, **kw)
-                created.append(self)
-
-        monkeypatch.setattr(cli_server, "SkillsLoader", _SpyLoader)
-        taskrunner_env["install_runner"](_Result("completed"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=True, fresh=False, timeout=90, name=""
-        )
-        asyncio.run(cli_server._run_task(args))
-        assert any(
-            inst.kwargs.get("install_builtins") is False and inst.builtins_synced
-            for inst in created
-        )
-
-    def test_failed_builtin_sync_does_not_gate_the_task(
-        self, taskrunner_env, tmp_path, monkeypatch
-    ) -> None:
-        # A read-only skills dir (or any sync error) must degrade to the
-        # skills already on disk, not kill the run before it starts.
-        class _BrokenLoader(_FakeStore):
-            def sync_builtins(self) -> None:
-                raise OSError("skills dir unavailable")
-
-        monkeypatch.setattr(cli_server, "SkillsLoader", _BrokenLoader)
-        taskrunner_env["install_runner"](_Result("completed"))
-        spec = _spec(tmp_path)
-        args = argparse.Namespace(spec=str(spec), no_test=True, fresh=False, timeout=90, name="")
-        asyncio.run(cli_server._run_task(args))  # must not raise
-        assert taskrunner_env["ran"] == (spec.resolve(), "")
-
-    def test_fresh_flag_is_forwarded_and_announced(self, taskrunner_env, tmp_path, capsys) -> None:
-        taskrunner_env["install_runner"](_Result("completed"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=True, timeout=0, name=""
-        )
-        asyncio.run(cli_server._run_task(args))
-        assert taskrunner_env["runner_kwargs"]["fresh"] is True
-        assert taskrunner_env["runner_kwargs"]["auto_test"] is True
-        assert "Running spec (fresh)" in capsys.readouterr().out
-
-    def test_failed_task_exits_one_with_the_error(self, taskrunner_env, tmp_path, capsys) -> None:
-        taskrunner_env["install_runner"](_Result("failed", error="step 2 blew up"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
-        )
-        with pytest.raises(SystemExit) as exc:
-            asyncio.run(cli_server._run_task(args))
-        assert exc.value.code == 1
-        assert "step 2 blew up" in capsys.readouterr().err
-
-    def test_cancelled_task_exits_one(self, taskrunner_env, tmp_path, capsys) -> None:
-        taskrunner_env["install_runner"](_Result("cancelled"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
-        )
-        with pytest.raises(SystemExit) as exc:
-            asyncio.run(cli_server._run_task(args))
-        assert exc.value.code == 1
-        assert "cancelled" in capsys.readouterr().out
-
-    def test_embed_fn_is_bound_when_the_model_is_present(self, taskrunner_env, tmp_path) -> None:
-        taskrunner_env["install_runner"](_Result("completed"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
-        )
-        asyncio.run(cli_server._run_task(args))
-        assert taskrunner_env["vector"].embed_fn is not None
-        assert taskrunner_env["vector"].embed_fn_factory is not None
-
-    def test_absent_model_degrades_to_keyword_search_without_downloading(
-        self, taskrunner_env, tmp_path, monkeypatch, capsys
-    ) -> None:
-        monkeypatch.setattr(cli_server, "model_file_present", lambda: False)
-
-        def unreachable(vs):  # pragma: no cover - staleness needs an embed_fn
-            raise AssertionError("staleness must not be probed without an embed_fn")
-
-        monkeypatch.setattr(cli_server, "store_embedding_space_is_stale", unreachable)
-        taskrunner_env["install_runner"](_Result("completed"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
-        )
-        asyncio.run(cli_server._run_task(args))
-        assert taskrunner_env["vector"].embed_fn is None
-        # The factory stays wired even without the model.
-        assert taskrunner_env["vector"].embed_fn_factory is not None
-        assert "keyword search for this run" in capsys.readouterr().err
-
-    def test_stale_vector_space_clears_both_embed_hooks(
-        self, taskrunner_env, tmp_path, monkeypatch, capsys
-    ) -> None:
-        monkeypatch.setattr(cli_server, "store_embedding_space_is_stale", lambda vs: True)
-        taskrunner_env["install_runner"](_Result("completed"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
-        )
-        asyncio.run(cli_server._run_task(args))
-        vector = taskrunner_env["vector"]
-        assert vector.embed_fn is None
-        assert vector.embed_fn_factory is None
-        assert "Embedding model changed" in capsys.readouterr().err
-
-    def test_vector_init_is_offloaded_off_the_event_loop(
-        self, taskrunner_env, tmp_path, monkeypatch
-    ) -> None:
-        """``VectorMemoryStore.init()`` must honour its caller contract:
-        it is blocking file IO whose Windows DACL writes can block on a
-        network volume round-trip, so an async caller offloads it
-        via ``asyncio.to_thread`` instead of freezing the loop. Ordering is
-        asserted too: init must COMPLETE before ``_run_task`` wires the embed
-        hooks (a fire-and-forget offload would reorder them). The sibling
-        ``MemoryStore.init()`` (cheap mkdir+seed) carries no contract and is
-        deliberately not pinned to either thread here."""
-        import threading
-
-        events: list = []
-        init_threads: dict = {}
-
-        class _ThreadRecordingVector(_FakeVectorStore):
-            def init(self) -> None:
-                init_threads["vector"] = threading.current_thread()
-                events.append("init")
-                super().init()
-
-            @property
-            def embed_fn_factory(self):
-                return self.__dict__.get("_eff")
-
-            @embed_fn_factory.setter
-            def embed_fn_factory(self, value) -> None:
-                # First post-init wiring step in _run_task: recording it turns
-                # "init completed before first use" into an observed ordering.
-                events.append("wired")
-                self.__dict__["_eff"] = value
-
-        def _vector(**kw):
-            store = _ThreadRecordingVector(**kw)
-            taskrunner_env["vector"] = store
-            return store
-
-        monkeypatch.setattr(cli_server, "VectorMemoryStore", _vector)
-        taskrunner_env["install_runner"](_Result("completed"))
-        args = argparse.Namespace(
-            spec=str(_spec(tmp_path)), no_test=False, fresh=False, timeout=0, name=""
-        )
-        asyncio.run(cli_server._run_task(args))
-
-        # Offloaded: init ran in a worker thread, not on the loop thread.
-        assert init_threads["vector"] is not threading.current_thread()
-        assert taskrunner_env["vector"].inited is True
-        # Awaited, not fire-and-forget: init completed BEFORE the embed hooks
-        # were wired (the first use that follows it in _run_task).
-        assert events.index("init") < events.index("wired")
-
 
 # --------------------------------------------------------------------------
 # _update — git checkout path
@@ -1361,6 +169,11 @@ def git_checkout(monkeypatch, tmp_path):
     # empty answer — read as "cannot be shown to serve this checkout" and refused.
     # dep_sync's own tests own that guard's behaviour.
     monkeypatch.setattr(cli_server.dep_sync, "venv_not_mapped_to", lambda origin, repo: None)
+    # The post-update gateway poke reaches a loopback socket that does not exist
+    # under test; neutralize it here so the branch-coverage tests stay hermetic.
+    # Its own success/best-effort contract is asserted directly in
+    # TestUpdateGatewayPoke.
+    monkeypatch.setattr(cli_server, "_revalidate_gateway_update_check", lambda: None)
     return proj
 
 
@@ -1634,6 +447,144 @@ class TestUpdateGitPath:
         assert "Kiro Crew updated!" in out
         assert "Agent config refresh failed" in out
 
+    def test_success_pokes_the_running_gateway_to_revalidate(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """A completed git update reconciles the running gateway's badge.
+
+        The fixture neutralizes the poke by default; this row restores a spy so
+        the success path is shown to reach it.
+        """
+        monkeypatch.setattr(subprocess, "run", _GitStub())
+        poked: list[bool] = []
+        monkeypatch.setattr(
+            cli_server, "_revalidate_gateway_update_check", lambda: poked.append(True)
+        )
+        cli_server._update()
+        assert "Kiro Crew updated!" in capsys.readouterr().out
+        assert poked == [True], "the completed update never poked the gateway"
+
+
+class TestUpdateGatewayPoke:
+    """``_revalidate_gateway_update_check`` — best-effort, never fatal.
+
+    The update has already succeeded by the time this runs, so every branch here
+    proves the same contract from a different angle: it may print, but it must
+    never raise and never change the exit code.
+    """
+
+    @staticmethod
+    def _resp(status: int = 200):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        r = _Resp()
+        r.status = status
+        return r
+
+    def test_success_reports_the_refresh(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "s3cret")
+        captured: dict = {}
+
+        def _send(req, port, timeout, *, operation):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["secret"] = req.headers.get("X-local-secret")
+            captured["port"] = port
+            captured["operation"] = operation
+            return self._resp()
+
+        monkeypatch.setattr(cli_server, "_owner_verified_secret_urlopen", _send)
+        monkeypatch.setattr(
+            cli_server, "loopback_urlopen", lambda *a, **k: pytest.fail("unverified send")
+        )
+        cli_server._revalidate_gateway_update_check()
+        assert "Update badge refreshed" in capsys.readouterr().out
+        # Pin the wire contract: dropping the secret header or retargeting the
+        # URL/method must fail this test, not slip through green.
+        assert captured["url"] == "http://127.0.0.1:8674/api/update/revalidate"
+        assert captured["method"] == "POST"
+        assert captured["secret"] == "s3cret"
+        assert captured["port"] == 8674
+        assert captured["operation"] == "gateway_update_revalidate"
+
+    def test_owned_port_with_a_foreign_connected_peer_sends_no_secret(
+        self, monkeypatch, capsys, tmp_path, sel_rec
+    ) -> None:
+        """The port check passing is not enough: the CONNECTED peer must be ours.
+
+        The attest-then-send race: the gateway dies after a port-owner
+        check and a co-resident listener binds the freed port before the send
+        connects. The proof must run on the connection that carries the secret,
+        so a foreign peer on that connection is refused before any byte.
+        """
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "_gateway_owns_port", lambda port: True, raising=False)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "s3cret")
+        monkeypatch.setattr(
+            cli_server, "dashboard_socket_path", lambda _p: tmp_path / "absent.sock"
+        )
+        monkeypatch.setattr(
+            cli_server,
+            "_connected_peer_verdict",
+            lambda _s: cli_server._ConnectedPeerVerdict.MISMATCH,
+        )
+        sent: list[object] = []
+
+        def _tcp(req, timeout, *, verify_peer):
+            verify_peer(object())  # runs on the connected socket, before any byte
+            sent.append(req)
+            return self._resp()
+
+        monkeypatch.setattr(cli_server, "tcp_verified_urlopen", _tcp)
+        monkeypatch.setattr(cli_server, "loopback_urlopen", lambda *a, **k: sent.append(a))
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert sent == [], "sent the secret to an unproven connected peer"
+        assert "reconciles on next check" in capsys.readouterr().out
+        denied = [c for c in sel_rec.calls if c.get("outcome") == "denied"]
+        assert denied and denied[-1]["operation"] == "gateway_update_revalidate"
+
+    def test_no_gateway_running_is_silent_success(self, monkeypatch, capsys) -> None:
+        """No secret means no gateway to reach; the next boot re-checks anyway."""
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "")
+        called: list[bool] = []
+        monkeypatch.setattr(
+            cli_server, "_owner_verified_secret_urlopen", lambda *a, **k: called.append(True)
+        )
+        monkeypatch.setattr(cli_server, "loopback_urlopen", lambda *a, **k: called.append(True))
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert called == [], "attempted a call with no secret to authenticate it"
+
+    def test_transport_failure_is_swallowed(self, monkeypatch, capsys) -> None:
+        """A gateway that refuses the connection must not fail the update."""
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "s3cret")
+
+        def _boom(req, port, timeout, *, operation):
+            raise urllib.error.URLError("connection refused")
+
+        monkeypatch.setattr(cli_server, "_owner_verified_secret_urlopen", _boom)
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert "reconciles on next check" in capsys.readouterr().out
+
+    def test_peer_refusal_is_swallowed(self, monkeypatch, capsys) -> None:
+        """A refused peer is a best-effort miss, not a crash: the update stands."""
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 8674)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda port, dial_host: "s3cret")
+
+        def _refuse(req, port, timeout, *, operation):
+            raise cli_server._GatewayPeerRefused("peer not proven")
+
+        monkeypatch.setattr(cli_server, "_owner_verified_secret_urlopen", _refuse)
+        cli_server._revalidate_gateway_update_check()  # must not raise
+        assert "reconciles on next check" in capsys.readouterr().out
+
 
 class TestUpdateSubprocessHardening:
     """The six ``subprocess.run`` calls in ``_update()``.
@@ -1880,12 +831,59 @@ class TestUpdateWheelFeedValidation:
         assert exc.value.code == 1
         assert "Feed channel mismatch" in capsys.readouterr().out
 
+    def test_a_non_string_version_is_refused(self, wheel_feed, capsys) -> None:
+        wheel_feed(
+            b'{"schema": "kirocrew-cli-artifact-manifest-v1", "channel": "stable", '
+            b'"version": 999}'
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        assert "No version in release feed" in capsys.readouterr().out
+
     def test_missing_version_is_refused(self, wheel_feed, capsys) -> None:
         wheel_feed(b'{"schema": "kirocrew-cli-artifact-manifest-v1", "channel": "stable"}')
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
         assert "No version in release feed" in capsys.readouterr().out
+
+
+class _FakeInstaller:
+    """A ``subprocess.Popen`` stand-in for the CLI's installer spawn.
+
+    ``pid`` is above every platform's ``pid_max`` (see
+    ``test_update_provider._UNALLOCATABLE_PID``), so a stop path that reached
+    the real kill helpers could not signal a live process.
+    """
+
+    pid = 99_999_999_999
+
+    def __init__(self, argv, *, returncode: int = 0, wait_raises=None, **kwargs) -> None:
+        self.argv = list(argv)
+        self.kwargs = kwargs
+        self._returncode = returncode
+        self._wait_raises = wait_raises
+
+    def wait(self, timeout=None):
+        if self._wait_raises is not None:
+            raise self._wait_raises
+        return self._returncode
+
+    def poll(self):
+        return self._returncode
+
+
+def _installer(monkeypatch, **behaviour) -> list[_FakeInstaller]:
+    spawned: list[_FakeInstaller] = []
+
+    def _popen(argv, **kwargs):
+        proc = _FakeInstaller(argv, **behaviour, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", _popen)
+    return spawned
 
 
 class TestUpdateWheelInstaller:
@@ -1898,6 +896,16 @@ class TestUpdateWheelInstaller:
             b'"channel": "stable", "version": "999.0.0"}'
         )
         monkeypatch.setattr(sys, "platform", "linux")
+        # These tests exercise the installer re-run, which is the path a pipx
+        # install takes. A plain-pip install refuses before it (covered in
+        # test_update_wheel_dispatch.py), so pin the pipx shape here.
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: False)
+        monkeypatch.setattr(wheel_engine, "running_from_pipx", lambda: True)
+        # The host's real AppArmor state is never read; a test that needs the
+        # re-attach branch sets it itself.
+        monkeypatch.setattr(wheel_apply, "userns_reattach_needed", lambda _version: False)
 
     def test_windows_refuses_the_posix_installer(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr(sys, "platform", "win32")
@@ -1912,7 +920,7 @@ class TestUpdateWheelInstaller:
         def boom(*a, **k):
             raise FileNotFoundError("sh")
 
-        monkeypatch.setattr(subprocess, "run", boom)
+        monkeypatch.setattr(subprocess, "Popen", boom)
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
@@ -1921,19 +929,72 @@ class TestUpdateWheelInstaller:
         assert "cli.sh | sh" in out
 
     def test_installer_timeout_prints_the_manual_command(self, monkeypatch, capsys) -> None:
-        def boom(*a, **k):
-            raise subprocess.TimeoutExpired(cmd="sh", timeout=300)
-
-        monkeypatch.setattr(subprocess, "run", boom)
+        spawned = _installer(
+            monkeypatch, wait_raises=subprocess.TimeoutExpired(cmd="sh", timeout=300)
+        )
+        stops: list[tuple] = []
+        monkeypatch.setattr(
+            cli_server.platform_compat,
+            "terminate_and_reap_sync",
+            lambda proc, **kw: stops.append((proc, kw)),
+        )
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
         assert "timed out" in capsys.readouterr().out
+        # Stopped gracefully (SIGTERM + rollback grace), never killed outright.
+        assert [proc for proc, _ in stops] == spawned
+        assert stops[0][1]["grace"] > 0
+
+    def test_installer_runs_in_its_own_session(self, monkeypatch) -> None:
+        # One group to stop, never the CLI's own.
+        spawned = _installer(monkeypatch)
+        cli_server._update_wheel(_LAYOUT)
+        assert spawned[0].argv[:2] == ["sh", "-c"]
+        assert spawned[0].kwargs.get("start_new_session") is True
+
+    def test_ctrl_c_stops_the_installer_gracefully(self, monkeypatch) -> None:
+        # The installer is outside the terminal's foreground group, so Ctrl-C
+        # reaches only the CLI, which must pass the stop on.
+        spawned = _installer(monkeypatch, wait_raises=KeyboardInterrupt())
+        stops: list = []
+        monkeypatch.setattr(
+            cli_server.platform_compat,
+            "terminate_and_reap_sync",
+            lambda proc, **kw: stops.append(proc),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 130
+        assert stops == spawned
+
+    @pytest.mark.parametrize(
+        ("wait_raises", "code", "shown"),
+        [
+            (subprocess.TimeoutExpired(cmd="sh", timeout=300), 1, "Try running manually"),
+            (KeyboardInterrupt(), 130, "Stopping the installer"),
+        ],
+    )
+    def test_a_second_ctrl_c_during_the_stop_still_exits_cleanly(
+        self, monkeypatch, capsys, wait_raises, code, shown
+    ) -> None:
+        # terminate_and_reap_sync re-raises a Ctrl-C it absorbed mid-stop; the
+        # arm must still reach its own exit code, not a traceback.
+        _installer(monkeypatch, wait_raises=wait_raises)
+
+        def stop_then_reraise(proc, **kw):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(
+            cli_server.platform_compat, "terminate_and_reap_sync", stop_then_reraise
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == code
+        assert shown in capsys.readouterr().out
 
     def test_installer_nonzero_exit_is_surfaced(self, monkeypatch, capsys) -> None:
-        monkeypatch.setattr(
-            subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 17)
-        )
+        _installer(monkeypatch, returncode=17)
         with pytest.raises(SystemExit) as exc:
             cli_server._update_wheel(_LAYOUT)
         assert exc.value.code == 1
@@ -2000,19 +1061,156 @@ class TestUpdateWheelInstaller:
         assert "No space left on device" in out
         assert "was not modified" in out
 
+    def test_shadow_success_snapshots_before_promotion_and_names_the_profile_remedy(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The managed venv takes the shared path: the memory snapshot runs as the
+        engine's last step before promotion, and a promotion that moves the launcher
+        a userns AppArmor profile applies to prints how to re-attach it."""
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(wheel_apply, "userns_reattach_needed", lambda _version: True)
+        monkeypatch.setattr(wheel_apply, "snapshot_memory_before_update", lambda: (3, ""))
+        early = []
+        monkeypatch.setattr(cli_server, "_snapshot_memory_or_exit", lambda: early.append(True))
+        seen: dict[str, object] = {}
+
+        def _apply(**kw):
+            seen.update(kw)
+            kw["before_promote"]()
+            return Path("/x/crew-venv-999.0.0")
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _apply)
+        cli_server._update_wheel(_LAYOUT)
+        out = capsys.readouterr().out
+        assert early == [], "the snapshot is the engine's step, not a separate one"
+        assert "Memory snapshot: 3 store(s) copied" in out
+        assert "kirocrew service install" in out
+        # Said after the update finished: it is installed, and only the re-attach is left.
+        assert "999.0.0 is installed" in out
+        assert "Run `kirocrew update`" not in out
+
+    def test_a_feed_version_outside_the_release_grammar_is_an_update_failure(
+        self, wheel_feed, monkeypatch, capsys, tmp_path
+    ) -> None:
+        """An unsigned feed version that cannot name a tree is refused by the REAL
+        engine as an update failure: an exit, never a traceback, nothing built."""
+        from kiro_crew.platform import wheel_engine
+
+        wheel_feed(
+            b'{"schema": "kirocrew-cli-artifact-manifest-v1", '
+            b'"channel": "stable", "version": "999/0"}'
+        )
+        layout = wheel_engine.ManagedVenvLayout(
+            legacy=tmp_path / "crew-venv", stable_link=tmp_path / "crew-venv-current"
+        )
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        monkeypatch.setattr(wheel_engine, "managed_venv_layout", lambda: layout)
+        monkeypatch.setattr(wheel_engine, "hold_update_lock", lambda: -1)
+        monkeypatch.setattr(wheel_engine, "release_update_lock", lambda _fd: None)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "fails validation" in out
+        assert "was not modified" in out
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_reattach_probe_that_refuses_the_version_is_an_update_failure(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The AppArmor probe names the promoted tree too, so it runs inside the
+        failure handling rather than ahead of it."""
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+
+        def _refuse(_version: str) -> bool:
+            raise wheel_engine.WheelUpdateError("release version '999/0' fails validation")
+
+        monkeypatch.setattr(wheel_apply, "userns_reattach_needed", _refuse)
+        monkeypatch.setattr(
+            wheel_engine,
+            "apply_wheel_update",
+            lambda **kw: pytest.fail("nothing is applied after a refusal"),
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        assert "fails validation" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("exc_name", "message"),
+        [
+            ("WheelUpdateBusy", "another kirocrew update is already in progress"),
+            ("WheelUpdateSnapshotFailed", "Pre-update memory snapshot failed: 1 store(s)"),
+        ],
+    )
+    def test_shadow_refusals_never_offer_the_installer_rerun(
+        self, monkeypatch, capsys, exc_name, message
+    ) -> None:
+        """The installer re-run would race the other update's promotion (busy), or
+        perform exactly the un-copied update the snapshot refusal stops."""
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+
+        def _refuse(**kw):
+            raise getattr(wheel_engine, exc_name)(message)
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _refuse)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert message in out
+        assert "re-running the installer" not in out
+
+    def test_an_incompatible_release_names_the_installer_rerun(self, monkeypatch, capsys) -> None:
+        """Only the installer moves an install onto a Python the release accepts."""
+        from kiro_crew.platform import wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+
+        def _refuse(**kw):
+            raise wheel_engine.WheelUpdateIncompatible(
+                "kirocrew 999.0.0 requires Python >= 3.99", version="999.0.0", sha256="a" * 64
+            )
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _refuse)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_wheel(_LAYOUT)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "requires Python >= 3.99" in out
+        assert "re-run the installer" in out.lower() and "cli.sh | sh" in out
+        assert "was not modified" not in out
+
+    def test_shadow_children_get_this_shells_environment_and_memory_is_checked_first(
+        self, monkeypatch, capsys
+    ) -> None:
+        from kiro_crew.platform import wheel_apply, wheel_engine
+
+        monkeypatch.setattr(wheel_engine, "running_from_managed_venv", lambda: True)
+        seen: dict[str, object] = {}
+
+        def _apply(**kw):
+            seen.update(kw)
+            return Path("/x/crew-venv-999.0.0")
+
+        monkeypatch.setattr(wheel_engine, "apply_wheel_update", _apply)
+        cli_server._update_wheel(_LAYOUT)
+        assert seen["trusted_env"] is False, "a toolchain on the operator's PATH reaches pip"
+        assert seen["preflight"] is wheel_apply.check_memory_ready
+
     def test_success_reports_the_new_version_and_restart_hint(self, monkeypatch, capsys) -> None:
-        seen: list[list[str]] = []
-
-        def _run(argv, **kw):
-            seen.append(list(argv))
-            return subprocess.CompletedProcess(argv, 0)
-
-        monkeypatch.setattr(subprocess, "run", _run)
+        spawned = _installer(monkeypatch)
         cli_server._update_wheel(_LAYOUT)
         out = capsys.readouterr().out
         assert "updated to 999.0.0" in out
         assert "kirocrew restart" in out
-        assert seen[0][:2] == ["sh", "-c"]
+        assert spawned[0].argv[:2] == ["sh", "-c"]
 
     def test_unparseable_remote_version_updates_anyway(
         self, monkeypatch, wheel_feed, capsys
@@ -2022,7 +1220,7 @@ class TestUpdateWheelInstaller:
             b'{"schema": "kirocrew-cli-artifact-manifest-v1", '
             b'"channel": "stable", "version": "not-a-version"}'
         )
-        monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0))
+        _installer(monkeypatch)
         cli_server._update_wheel(_LAYOUT)
         out = capsys.readouterr().out
         assert "Could not compare versions" in out
@@ -2124,3 +1322,59 @@ class TestStatusMemoryLine:
         cli_server._status(SimpleNamespace(port=None))
         out = capsys.readouterr().out
         assert "Memory:      412 MiB rss, session ceiling 1536 MiB" in out
+
+
+class TestApproveBusyVsDown:
+    """The update-approve and file-delivery-approve CLI paths report a slow
+    gateway as busy, and a refused connection as not running. Both carry a
+    single-use nonce, so the busy line points at the dashboard, never a retry.
+    """
+
+    def test_update_approve_timeout_reports_busy(self, monkeypatch, capsys) -> None:
+        from kiro_crew.platform import update_capability, update_stepup
+
+        monkeypatch.setattr(
+            update_capability,
+            "derive_capability",
+            lambda: types.SimpleNamespace(managed_by="source"),
+        )
+        pending = types.SimpleNamespace(
+            version="1.2.3", channel="stable", expires_in=60, nonce="n" * 64
+        )
+        monkeypatch.setattr(update_stepup, "read_pending", lambda: pending)
+        # resolve_client_port / read_local_secret / _owner_verified_secret_urlopen
+        # are bound by more than one mirror-family member, so they are patched
+        # on the facade (cli_server), which routes the setattr to the owner.
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 7777)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _p, **_kw: "")
+
+        def _timeout(*a, **k):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(cli_server, "_owner_verified_secret_urlopen", _timeout)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._update_approve()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "busy" in out
+        assert "is not running" not in out
+
+    def test_file_delivery_approve_timeout_reports_busy(self, monkeypatch, capsys) -> None:
+        from kiro_crew import file_delivery_consent
+
+        pending = types.SimpleNamespace(destination_class="owner", expires_in=60, nonce="n" * 64)
+        monkeypatch.setattr(file_delivery_consent, "read_pending_grant", lambda: pending)
+        monkeypatch.setattr(cli_server, "resolve_client_port", lambda _p: 7777)
+        monkeypatch.setattr(cli_server, "read_local_secret", lambda _p, **_kw: "")
+
+        def _timeout(*a, **k):
+            raise TimeoutError("timed out")
+
+        # The proven send is the one transport seam, socket or TCP alike.
+        monkeypatch.setattr(cli_server, "_owner_verified_secret_urlopen", _timeout)
+        with pytest.raises(SystemExit) as exc:
+            cli_server._file_delivery_approve()
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert "busy" in out
+        assert "is not running" not in out

@@ -11,15 +11,24 @@
  * theme/font observers, and the teardown + delete-session exports.
  */
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, act, waitFor, cleanup } from '@testing-library/react'
+import { screen, fireEvent, act, waitFor, cleanup, within } from '@testing-library/react'
 import { renderWithProviders, renderHookWithProviders } from './helpers'
 import { i18nT } from '../i18n/t'
+import { askAgentPrompt } from '../components/AskAgentButton'
+import {
+  consumeChatHandoff,
+  installSoftNavigate,
+  recordError,
+  __resetErrorJournalForTests,
+  __resetNavSeamForTests,
+} from '../utils/errorReport'
 
 /* ── xterm stand-in ───────────────────────────────────────────────────────── */
 
 const xt = vi.hoisted(() => {
   interface FakeOptions {
     cursorBlink?: boolean
+    cursorStyle?: string
     fontSize?: number
     fontFamily?: string
     theme?: Record<string, string>
@@ -80,12 +89,21 @@ const xt = vi.hoisted(() => {
     fit = vi.fn()
     constructor() { FakeFitAddon.instances.push(this) }
   }
-  return { FakeTerminal, FakeFitAddon }
+  class FakeWebLinksAddon {
+    static instances: FakeWebLinksAddon[] = []
+    /** The activation handler CliPanel passed, or undefined for the addon default. */
+    handler: ((event: MouseEvent, uri: string) => void) | undefined
+    constructor(handler?: (event: MouseEvent, uri: string) => void) {
+      this.handler = handler
+      FakeWebLinksAddon.instances.push(this)
+    }
+  }
+  return { FakeTerminal, FakeFitAddon, FakeWebLinksAddon }
 })
 
 vi.mock('@xterm/xterm', () => ({ Terminal: xt.FakeTerminal }))
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: xt.FakeFitAddon }))
-vi.mock('@xterm/addon-web-links', () => ({ WebLinksAddon: class {} }))
+vi.mock('@xterm/addon-web-links', () => ({ WebLinksAddon: xt.FakeWebLinksAddon }))
 
 const registry = vi.hoisted(() => ({
   ensureTerminalConnection: vi.fn(),
@@ -94,14 +112,17 @@ const registry = vi.hoisted(() => ({
   connStatus: { value: undefined as 'connected' | 'reconnecting' | 'disconnected' | undefined },
   manualRetry: { value: false },
   displaced: { value: false },
+  invalidCwd: { value: false },
   useTerminalConnStatus: vi.fn<() => 'connected' | 'reconnecting' | 'disconnected' | undefined>(),
   useTerminalManualRetry: vi.fn<() => boolean>(),
   useTerminalDisplaced: vi.fn<() => boolean>(),
-  retryTerminalConnection: vi.fn<(id: string) => void>(),
+  useTerminalInvalidCwd: vi.fn<() => boolean>(),
+  retryTerminalConnection: vi.fn<(id: string, manual?: boolean, cwd?: string) => void>(),
 }))
 registry.useTerminalConnStatus.mockImplementation(() => registry.connStatus.value)
 registry.useTerminalManualRetry.mockImplementation(() => registry.manualRetry.value)
 registry.useTerminalDisplaced.mockImplementation(() => registry.displaced.value)
+registry.useTerminalInvalidCwd.mockImplementation(() => registry.invalidCwd.value)
 vi.mock('../utils/terminalRegistry', () => registry)
 
 // Both children own their own xterm hooks and are covered by their own suites;
@@ -118,7 +139,7 @@ import CliPanel, {
   isThemeSignal,
   useDeleteTerminalSession,
 } from '../components/CliPanel'
-import { setTerminalFontSize, __resetTerminalFontStore } from '../hooks/useTerminalFont'
+import { setTerminalFontSize, setTerminalCursorStyle, __resetTerminalFontStore } from '../hooks/useTerminalFont'
 import { setTerminalCloseFailed, useTerminalCloseFailed } from '../hooks/useBottomTerminal'
 import { ansiPaletteFromVars } from '../utils/terminalPalette'
 
@@ -262,6 +283,7 @@ beforeEach(() => {
   registry.connStatus.value = undefined
   registry.manualRetry.value = false
   registry.displaced.value = false
+  registry.invalidCwd.value = false
   xt.FakeTerminal.instances = []
   xt.FakeFitAddon.instances = []
   touch.value = false
@@ -312,6 +334,22 @@ describe('CliPanel mount', () => {
       selectionBackground: '#313244',
       ...ansiPaletteFromVars(() => ''),
     })
+  })
+
+  it('opens a clicked terminal link by its own URL, never through a blank window', () => {
+    // The addon's default handler calls window.open() with no URL and then
+    // navigates the blank window. The desktop shell's window-open handler
+    // classifies that about:blank target as unsupported and denies it, so the
+    // click did nothing. Passing the URL lets the shell route it to the OS.
+    const { term } = mount()
+    const links = xt.FakeWebLinksAddon.instances[xt.FakeWebLinksAddon.instances.length - 1]
+    expect(term.addons).toContain(links)
+    expect(links.handler).toBeTypeOf('function')
+    const open = vi.fn(() => null)
+    vi.stubGlobal('open', open)
+    links.handler!(new MouseEvent('click'), 'https://example.com/docs')
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(open).toHaveBeenCalledWith('https://example.com/docs', '_blank', 'noopener,noreferrer')
   })
 
   it('routes a theme variable into its ANSI slot', () => {
@@ -427,6 +465,78 @@ describe('CliPanel disconnected banner', () => {
     expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId)
   })
 
+  it('shows the localized invalid-cwd error immediately and allows explicit recovery', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.invalidCwd.value = true
+    const cwd = '/work/another-workspace/long-directory-name-without-spaces/removed-project'
+    const { sessionId, rerender } = mount({ cwd })
+    const message = i18nT('components.cliPanel.invalid_cwd_message', { cwd })
+    expect(message).not.toBe('components.cliPanel.invalid_cwd_message')
+    expect(message).toContain(cwd)
+    expect(screen.getByTestId('cli-panel-disconnected')).toHaveTextContent(message)
+    expect(screen.getByTestId('cli-panel-disconnected')).toHaveAttribute('role', 'alert')
+    expect(screen.queryByText(DISCONNECTED_LABEL)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: RECONNECT_LABEL }))
+    expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId)
+
+    registry.invalidCwd.value = false
+    registry.connStatus.value = 'reconnecting'
+    registry.manualRetry.value = true
+    rerender(<CliPanel sessionId={sessionId} cwd={cwd} visible />)
+    expect(screen.queryByText(message)).toBeNull()
+    expect(screen.getByText(RECONNECTING_LABEL)).toBeInTheDocument()
+    registry.connStatus.value = 'connected'
+    registry.manualRetry.value = false
+    rerender(<CliPanel sessionId={sessionId} cwd={cwd} visible />)
+    expect(screen.queryByTestId('cli-panel-disconnected')).toBeNull()
+  })
+
+  it('keeps one contextual hand-off and both recovery controls outside the refused-path text', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.invalidCwd.value = true
+    const cwd = `/work/${'long-directory-without-spaces/'.repeat(12)}removed-project`
+    const message = i18nT('components.cliPanel.invalid_cwd_message', { cwd })
+    __resetErrorJournalForTests()
+    __resetNavSeamForTests()
+    const navigate = vi.fn()
+    installSoftNavigate(navigate)
+    try {
+      const report = recordError({
+        source: 'system', message, code: 'terminal_invalid_cwd',
+        endpoint: '/api/ws/terminal/refused-workspace',
+      })
+      const { sessionId } = mount({ cwd })
+      const notice = screen.getByTestId('cli-panel-disconnected')
+      const text = within(notice).getByText(message)
+      const handoff = within(notice).getByRole('button', { name: /ask the agent/i })
+      const reconnect = screen.getByRole('button', { name: RECONNECT_LABEL })
+      const startingDirectory = screen.getByRole('button', {
+        name: i18nT('components.cliPanel.use_starting_directory'),
+      })
+      expect(text.textContent).toBe(message)
+      expect(text.contains(handoff)).toBe(false)
+      expect(text.contains(reconnect)).toBe(false)
+      expect(text.contains(startingDirectory)).toBe(false)
+      expect(within(notice).getAllByRole('button')).toEqual([handoff])
+      expect(reconnect.parentElement).toBe(startingDirectory.parentElement)
+      expect(reconnect.parentElement!.contains(handoff)).toBe(false)
+      expect(within(notice.parentElement!).getAllByRole('button')).toHaveLength(3)
+
+      fireEvent.click(reconnect)
+      fireEvent.click(startingDirectory)
+      expect(registry.retryTerminalConnection.mock.calls).toEqual([
+        [sessionId], [sessionId, true, ''],
+      ])
+      fireEvent.click(handoff)
+      expect(navigate.mock.calls).toEqual([['/chat']])
+      expect(consumeChatHandoff()).toBe(askAgentPrompt(report))
+      expect(consumeChatHandoff()).toBeNull()
+    } finally {
+      __resetErrorJournalForTests()
+      __resetNavSeamForTests()
+    }
+  })
+
   it('shows the Reconnecting… banner with a disabled button during a MANUAL retry', () => {
     // The user clicked Reconnect and the dial is in flight: manualRetry is set
     // while the status is 'reconnecting'.
@@ -435,6 +545,24 @@ describe('CliPanel disconnected banner', () => {
     mount()
     expect(screen.getByRole('status')).toHaveTextContent(RECONNECTING_LABEL)
     expect(screen.getByRole('button', { name: RECONNECT_LABEL })).toBeDisabled()
+  })
+
+  it('offers the starting directory only when the requested directory was refused', () => {
+    registry.connStatus.value = 'disconnected'
+    registry.invalidCwd.value = true
+    const { sessionId, rerender } = mount({ cwd: '/missing/project' })
+    const label = i18nT('components.cliPanel.use_starting_directory')
+    expect(label).not.toBe('components.cliPanel.use_starting_directory')
+    // The tooltip says where the shell opens, since the button cannot show the path.
+    expect(screen.getByRole('button', { name: label })).toHaveAttribute(
+      'title', expect.stringContaining('dashboard.terminal.cwd'),
+    )
+    fireEvent.click(screen.getByRole('button', { name: label }))
+    expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId, true, '')
+
+    registry.invalidCwd.value = false
+    rerender(<CliPanel sessionId={sessionId} cwd="/missing/project" visible />)
+    expect(screen.queryByRole('button', { name: label })).toBeNull()
   })
 
   it('returns to the disconnected presentation when a manual retry fails', () => {
@@ -904,6 +1032,19 @@ describe('CliPanel theme and font sync', () => {
     // Only the plain family assignment — no monospace/restore re-measure toggle.
     expect(term.fontFamilyWrites).toHaveLength(writesBefore + 1)
     expect(fit.fit).not.toHaveBeenCalled()
+  })
+
+  it('constructs a terminal with the default block cursor', () => {
+    const { term } = mount()
+    expect(term.options.cursorStyle).toBe('block')
+  })
+
+  it('pushes a cursor-style preference change onto every live terminal', () => {
+    const { term } = mount()
+    act(() => { setTerminalCursorStyle('bar') })
+    expect(term.options.cursorStyle).toBe('bar')
+    act(() => { setTerminalCursorStyle('underline') })
+    expect(term.options.cursorStyle).toBe('underline')
   })
 })
 

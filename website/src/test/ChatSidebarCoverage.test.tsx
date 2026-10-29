@@ -48,8 +48,13 @@ vi.mock('framer-motion', async () => {
 vi.mock('../components/ProjectPicker', () => ({ default: () => null }))
 
 const cfg = vi.hoisted(() => ({
-  saveChatConfig: vi.fn(),
-  value: { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false } as Record<string, unknown>,
+  // Real saveChatConfig returns true on a persisted save, false only when the
+  // write rolled back (GPT 6.1, errors-use-error-notice). The sidebar's board
+  // toggle now gates seeding on that result, so the mock must default to the
+  // success contract — a bare vi.fn() returns undefined, which the toggle would
+  // read as a failed save and skip seeding. A failure case overrides it locally.
+  saveChatConfig: vi.fn(() => true),
+  value: { tagColumnsEnabled: false, confirmCloseSession: false } as Record<string, unknown>,
 }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => cfg.value,
@@ -219,7 +224,7 @@ function openHistory() {
 
 beforeEach(() => {
   localStorage.clear()
-  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+  cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
   mocks.cleanupSessions.mockResolvedValue({ ok: true, archived: 0, keys: [], failed: [] })
   mocks.chatSlotsModel.mockResolvedValue({ ok: true, failed: [] })
   mocks.clearSessions.mockResolvedValue({ ok: true })
@@ -323,6 +328,26 @@ describe('ChatSidebar — Switch All Sessions panel', () => {
     expect(skip).toBeChecked()
   })
 
+  it('says the conversation is kept and warns only once running sessions will switch', async () => {
+    renderSidebar({ slots: SLOTS })
+    await openHeaderPanel('Switch all to model…')
+    expect(screen.getByText(/The conversation is kept and continues on the new model\./)).toBeTruthy()
+    expect(screen.queryByText(/resets its conversation/)).toBeNull()
+    // Skip is ticked by default, so nothing running is at risk and no caveat shows.
+    expect(screen.queryByTestId('bulk-model-running-caveat')).toBeNull()
+    fireEvent.click(screen.getByRole('checkbox'))
+    const caveat = screen.getByTestId('bulk-model-running-caveat')
+    expect(caveat.textContent).toBe('Running sessions switch too, and their current reply is stopped.')
+    expect(caveat.className).toContain('text-danger')
+  })
+
+  it('omits the running-reply caveat when no session is running', async () => {
+    renderSidebar({ slots: SLOTS.map(s => ({ ...s, running: false })) })
+    await openHeaderPanel('Switch all to model…')
+    expect(screen.getByText(/The conversation is kept/)).toBeTruthy()
+    expect(screen.queryByTestId('bulk-model-running-caveat')).toBeNull()
+  })
+
   it('reports a partial failure and keeps the panel open', async () => {
     mocks.chatSlotsModel.mockResolvedValue({ ok: true, failed: ['k-a'] })
     renderSidebar({ slots: SLOTS })
@@ -414,7 +439,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // shape the view toggle once created, so no predicate can tell a disposable
     // placeholder from a bare column the user added. Seeding therefore deletes
     // nothing at all -- including when the board is nothing BUT bare columns.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare-1', name: '', tag_ids: [], mode: 'any', order: 0 },
       { id: 'c-bare-2', name: '', tag_ids: [], mode: 'any', order: 1 },
@@ -430,7 +455,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // Idempotence plus a real recovery path: with two lanes already present the
     // menu still offers to add lanes, and doing so creates only the other two --
     // never a duplicate set. This is what a partial failure recovers through.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'l-1', name: '', tag_ids: [], mode: 'any', order: 0, source: 'state', state_key: 'needs_approval' },
       { id: 'l-2', name: '', tag_ids: [], mode: 'any', order: 1, source: 'state', state_key: 'working' },
@@ -448,7 +473,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   it('surfaces a failed seed instead of leaving an empty board', async () => {
     // The toggle flips tagColumnsEnabled BEFORE the mutation runs, so a failure
     // with no feedback looks identical to a board that is simply empty.
-    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([])
     mocks.createTagColumn.mockRejectedValue(new Error('persist failed'))
     renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
@@ -463,12 +488,33 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
   })
 
+  it('surfaces a failed chat-config save and does NOT seed lanes (GPT 6.1 F1)', async () => {
+    // The board toggle persists tagColumnsEnabled through saveChatConfig, which
+    // returns false and rolls back when storage cannot hold the write. A board
+    // that was never saved must not then seed lanes as if it had — the user sees
+    // the save-failure notice, and no seed mutation runs.
+    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
+    cfg.saveChatConfig.mockReturnValueOnce(false)
+    mocks.tagColumns.mockResolvedValue([])
+    renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
+    openHeaderMenu()
+    fireEvent.click(await screen.findByText('Switch to board view'))
+    const banner = await screen.findByTestId('lane-seed-error')
+    expect(banner.textContent).toContain("Couldn't switch board view")
+    // No seed happened: the preference did not persist, so the board is not
+    // populated behind the failure.
+    expect(mocks.createTagColumn).not.toHaveBeenCalled()
+    // The seed-retry button must NOT show: its "Try again" would seed lanes,
+    // not retry the save (UX Review blocker).
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
+  })
+
   it('gives back the pre-board width when switching to list view', async () => {
     // Persisting the auto-widened value without remembering the old one destroys
     // the width the user chose and strands a wide sidebar in list view.
     localStorage.setItem('mc-sidebar-width', '300')
     localStorage.setItem('mc-sidebar-width-pre-board', '300')
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue(
       ['needs_approval', 'waiting', 'working', 'idle'].map((k, i) => (
         { id: `l-${i}`, name: '', tag_ids: [], mode: 'any', order: i, source: 'state', state_key: k }
@@ -483,7 +529,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   it('labels a legacy bare column as showing every session once lanes exist', async () => {
     // Seeding does not delete it (indistinguishable from a user's own column), so
     // the duplicate-cards effect has to be named rather than left to be guessed.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 0 },
       { id: 'l-0', name: '', tag_ids: [], mode: 'any', order: 1, source: 'state', state_key: 'idle' },
@@ -494,7 +540,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   })
 
   it('does not label a bare column when there are no lanes', async () => {
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 0 },
     ])
@@ -506,7 +552,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   it('hides the add-lanes entry once all four lanes exist', async () => {
     // The affordance is keyed on there being something to add, so a complete
     // board does not offer a no-op action.
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue(
       ['needs_approval', 'waiting', 'working', 'idle'].map((k, i) => (
         { id: `l-${i}`, name: '', tag_ids: [], mode: 'any', order: i, source: 'state', state_key: k }
@@ -522,7 +568,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
     // No rollback and no deletion: a partial failure just means fewer lanes.
     // The bare column survives, so the board still renders and the next seed
     // fills the gap rather than starting from an empty strip.
-    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([
       { id: 'c-bare', name: '', tag_ids: [], mode: 'any', order: 0 },
     ])
@@ -538,7 +584,7 @@ describe('ChatSidebar — header menu view + tag entries', () => {
   })
 
   it('offers the way back to list view once board view is on', async () => {
-    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false, defaultAutopilot: false }
+    cfg.value = { tagColumnsEnabled: true, confirmCloseSession: false }
     mocks.tagColumns.mockResolvedValue([{ id: 'c1', name: 'Doing', tag_ids: [], mode: 'any', order: 0 }])
     const view = renderSidebar({ slots: [{ key: 'k-a', title: 'A', running: false }] })
     view.rerender(<div />)
@@ -625,10 +671,29 @@ describe('ChatSidebar — Older Sessions pane', () => {
 
   it('clears all closed sessions behind a confirmation', async () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
-    renderSidebar({ history: HISTORY })
+    const { store } = renderSidebar({ history: HISTORY })
     openHistory()
     fireEvent.click(screen.getByText('Delete all'))
     await waitFor(() => expect(mocks.clearSessions).toHaveBeenCalled())
+    await waitFor(() => expect(mocks.sessions).toHaveBeenCalled())
+    expect(store.getState().chat.undeletableHistory).toBeNull()
+    confirmSpy.mockRestore()
+  })
+
+  // The gateway answers a partial clear with 200 and `ok: false`. A handler
+  // that only awaits the call reads that as success; the shortfall must reach
+  // the shared refused-delete notice.
+  it('reports a Delete all that left sessions behind', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    mocks.clearSessions.mockResolvedValueOnce({
+      ok: false, cleared: 1, skipped: 0, failed: 2, undeletable: [],
+    })
+    const { store } = renderSidebar({ history: HISTORY })
+    openHistory()
+    fireEvent.click(screen.getByText('Delete all'))
+    await waitFor(() => expect(store.getState().chat.undeletableHistory).toEqual({
+      key: '', title: '', code: '', bulk: { left: 2, cleared: 1, rows: [] },
+    }))
     confirmSpy.mockRestore()
   })
 
@@ -701,26 +766,27 @@ describe('ChatSidebar — Older Sessions pane', () => {
 })
 
 describe('ChatSidebar — narrow-width header', () => {
-  // The create label is 'New chat', not 'New'. The caret menu is closed in every
-  // case below, so the only node carrying it is the header button's own span.
+  // The header create label is the short 'New' (recorded in docs/decisions).
+  // The caret menu is closed in every case below, so the only node carrying it
+  // is the header button's own span.
   it('keeps the full header at a comfortable width', () => {
     localStorage.setItem('mc-sidebar-width', '400')
     renderSidebar()
     expect(screen.getByText('Sessions')).toBeTruthy()
-    expect(screen.getByText('New chat')).toBeTruthy()
+    expect(screen.getByText('New')).toBeTruthy()
   })
 
   it('drops the create label, then the panel title, as the sidebar narrows', () => {
     localStorage.setItem('mc-sidebar-width', '230')
     const compact = renderSidebar()
     expect(screen.getByText('Sessions')).toBeTruthy()
-    expect(screen.queryByText('New chat')).toBeNull()
+    expect(screen.queryByText('New')).toBeNull()
     compact.unmount()
 
     localStorage.setItem('mc-sidebar-width', '190')
     renderSidebar()
     expect(screen.queryByText('Sessions')).toBeNull()
-    expect(screen.queryByText('New chat')).toBeNull()
+    expect(screen.queryByText('New')).toBeNull()
   })
 
   it('ignores an out-of-range persisted width', () => {
@@ -728,7 +794,7 @@ describe('ChatSidebar — narrow-width header', () => {
     renderSidebar()
     // Falls back to the 260px default, which still shows both labels.
     expect(screen.getByText('Sessions')).toBeTruthy()
-    expect(screen.getByText('New chat')).toBeTruthy()
+    expect(screen.getByText('New')).toBeTruthy()
   })
 })
 

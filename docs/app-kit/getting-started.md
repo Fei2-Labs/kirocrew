@@ -5,7 +5,7 @@ Build, install, and run your first Kiro Crew app in 5 minutes.
 ## Prerequisites
 
 - Kiro Crew installed and running (`kirocrew gateway`)
-- Node.js 22+ (24 LTS recommended) (for apps with UI)
+- Node.js 22.12+ (24 LTS recommended) (for apps with UI)
 
 ## 1. Create an App Directory
 
@@ -38,6 +38,10 @@ my-dashboard/
 ### app.json — The Manifest
 
 Every app needs an `app.json`. See [Manifest Reference](manifest-reference.md) for all fields.
+
+The scaffold writes no `permissions` block. Add the one below: the sample page
+calls `api.get('/api/status')` and listens for `notification` events, and the
+SDK rejects a path or event the manifest does not declare.
 
 ```json
 {
@@ -147,6 +151,16 @@ Install and enable with the CLI:
 
 ```bash
 kirocrew app install /absolute/path/to/my-dashboard
+```
+
+Before you enable it, trust the app. Enable refuses every app that is not
+built in, even one that ships only an agent and a skill, until the operator
+trusts it in Settings → Security → Third-party apps. That setting grants this app
+(`agent.apps_trusted`) or all third-party apps (`agent.apps_allow_third_party`
+set to `true`). See
+[Publishing Guide](publishing-guide.md#third-party-executable-code-is-off-by-default).
+
+```bash
 kirocrew app enable my-dashboard
 ```
 
@@ -177,7 +191,7 @@ Available in `@kirocrew/app-sdk`:
 | `useAppApi()` | Permission-scoped JSON-response HTTP client (`request`, GET/POST/PUT/PATCH/DELETE); request options and errors: [API reference](api-reference.md#app-sdk-hooks-dashboard-ui) |
 | `useAppEvents(event, cb)` | Subscribe to real-time WebSocket events |
 | `useTheme()` | Reactive theme (mode, accent, colorTheme) |
-| `useAppInfo()` | App metadata (name, version, permissions, `active`) |
+| `useAppInfo()` | App metadata (name, version, permissions, `active`, `update`) |
 | `useNavigate()` | Navigate to Kiro Crew routes |
 | `useNotify()` | Show toast notifications |
 | `useNavBadge()` | Update sidebar badge count |
@@ -202,21 +216,77 @@ useEffect(() => {
 Treat `undefined` as `true`: the field is optional, so an app running on a host that
 predates it must still render rather than assume it is hidden.
 
+### Telling the user a new version is out
+
+`useAppInfo().update` is how your app finds out that a newer version of itself has
+been published, so you can show your own "update available" row instead of waiting
+for the user to visit the store.
+
+```tsx
+const { version, update } = useAppInfo()
+
+if (!update) return null                 // nothing checked yet — say nothing
+if (!update.available) return null       // checked, you are current
+
+return <Banner>Version {update.latestVersion} is out (you have {version}).</Banner>
+```
+
+The three states are deliberately distinct, and the first two are easy to confuse:
+
+| `update` | Means |
+|---|---|
+| absent | The host has not consulted anything. You do **not** know you are current. |
+| `available: false` | The host checked and nothing newer is published. |
+| `available: true` | `latestVersion` is newer than your installed `version`. |
+
+Render an absent `update` as "nothing to say", never as "up to date" — the second
+claims something no one has verified.
+
+`checkedAt` is when the host's cache was written, as an ISO-8601 instant, or `null`
+if it could not be read. The host answers from caches it already keeps and never
+fetches on your behalf, so the answer can be hours old; show `checkedAt` if the age
+matters to your user. A fresh answer arrives when the store's listing refreshes.
+
+The field reads the same on every surface your app mounts on — a routed `ui.pages`
+page and a `contributes.panelTabs` side-panel tab both get it — so you write the
+banner once.
+
+The field is advisory. It tells you what to display, not what to do: your app cannot
+update itself from it, and the gateway re-resolves the app's source when an update is
+actually applied.
+
+### Running something once after you are upgraded
+
+There is no "you were just updated" event, on purpose. An update is applied from
+Discover or the app's detail page, where your app is usually not mounted, so a
+live signal would reach the code that needs it least. Compare instead, on mount:
+remember the last version your app ran, and act when `useAppInfo().version`
+differs from it.
+
+```tsx
+const { version } = useAppInfo()
+useEffect(() => {
+  const last = localStorage.getItem('my-app:last-version')
+  if (last !== version) {
+    migrateIfNeeded(last, version)   // last is null on a first run
+    localStorage.setItem('my-app:last-version', version)
+  }
+}, [version])
+```
+
+This runs in the NEW bundle, whenever it first mounts, however long after the
+update that is. Keep the stored version wherever the rest of your app's state
+lives — a backend can do the same comparison on start against its own data.
+
 ## Chat Marker Protocol
 
 Also in `@kirocrew/app-sdk`, for an app that renders agent messages itself. An agent puts follow-up
 choices and steer acknowledgements inline in its prose (`[OPTIONS: a | b]`,
 `[STEERING steer-<id>: …]`); these parse them out so your UI can show buttons instead of raw syntax.
 
-| Export | Purpose |
-|--------|---------|
-| `parseOptions(content)` | Split the prose from the choices offered with it |
-| `deriveFollowUpOptions(messages, isStreaming)` | The choices that still apply to the conversation |
-| `extractSteeringAcks(content)` | Pull the steer acknowledgement out of the text |
-| `stripPartialOptionMarker(text)` | Hide a marker that is still arriving mid-stream |
-
-Types: `ParsedOptions`, `FollowUpDerivation`, `ChatMessage`. React-free, so it also works in a worker
-or a test. Worked examples: [api-reference.md](api-reference.md#chat-marker-protocol).
+The functions and types are listed in
+[api-reference.md](api-reference.md#chat-marker-protocol), with worked examples. The
+module is React-free, so it also works in a worker or a test.
 
 To render a transcript rather than parse one, `ChatMessageList` draws it and its row
 **registry** lets you add a row type or replace one without forking the list — including the
@@ -256,13 +326,42 @@ For Python app hooks with an existing cron grant, use
 `update_job` and `update_job_async` reject `enabled` and `user_paused` arguments;
 use the toggle methods instead. Foreign and missing job IDs are refused.
 
+The `add_job*` methods accept `approval_mode`, `timeout_secs` and `timeout` at
+create time. Pass `approval_mode="auto"` for an unattended agent job: the
+default, `""`, is hook-based approval, so every tool call in the job's session
+waits on a prompt nobody is present to answer. Set it on the create call rather
+than in a follow-up `update_job` — the job is live from its first save, so a
+second write leaves a window in which a due-scan can run it under the wrong
+mode, and `add_job_if_absent_async` returns `None` once the name exists, which
+skips that follow-up on every registration after the first. `timeout_secs` is
+the per-wake execution budget (1..86400 seconds, default 1800) and `timeout`
+bounds only a script or command subprocess (default 30s for a script, 300s for
+a command). On a script or command job set the pair together: the create path
+refuses a wake budget that cannot cover the subprocess timeout plus cleanup,
+because a shorter budget cancels the executor future while the subprocess keeps
+running and the next wake launches a duplicate.
+
 ## Shared React Query
 
 Externalize `@tanstack/react-query` when bundling your app. The dashboard import
-map resolves that specifier to the host's module instance, so hooks such as
-`useQuery`, `useMutation` and `useQueryClient` use the dashboard's existing
-provider. Do not bundle a second copy of React Query. Use `useAppApi()` inside
-query and mutation functions to retain scoped transport and host session binding.
+map resolves that specifier to the host's module instance, so `useQuery`,
+`useMutation` and `useQueryClient` work with no provider of your own. Do not
+bundle a second copy of React Query. Use `useAppApi()` inside query and mutation
+functions to retain scoped transport and host session binding.
+
+The module is shared; the cache is not. `useQueryClient()` returns a client the
+host creates for your app, so your keys, `clear()` and `invalidateQueries()` reach
+only your app's cache, and dashboard keys are neither readable nor writable from
+your bundle. That client is kept per app AND per host session for as long as the
+dashboard page lives, so returning to your page under the same host surface reuses
+the same cache rather than a fresh one. Your app mounted in two places bound to
+different sessions -- its own page and a chat side panel, or two panels -- gets one
+cache each, so a key you write in one never answers a read in the other. An
+individual query inside it still expires on React Query's own `gcTime` once
+nothing observes it, which is the default five minutes unless your query sets a
+longer one; the dashboard's thirty-minute app retention window is registered for
+builtin pages only. Dashboard data is available through `useAppApi()` under the
+paths your `app.json` declares.
 
 ## Permissions
 
@@ -294,44 +393,9 @@ undeclared paths throws an error.
 
 ## Python Client
 
-For Python apps, CLI tools, or services that need to talk to the Kiro Crew Gateway,
-install the source-only package from a Kiro Crew checkout:
-
-```bash
-python -m pip install -e /path/to/KiroCrew/packages/kirocrew-client-py
-```
-
-```python
-import asyncio
-from kirocrew_client import KiroCrewClient
-
-async def main():
-    async with KiroCrewClient(app_name="my-tool") as mc:
-        # Check connectivity
-        ok = await mc.ping()
-        print(f"Gateway reachable: {ok}")
-
-        # Dispatch an agent
-        task_id = await mc.dispatch_agent_async("my-agent", "Analyze ticket T-123")
-        result = await mc.get_task_result(task_id)
-        print(f"Result: {result}")
-
-        # Manage crons
-        await mc.add_cron("refresh", message="Check for updates", every=3600)
-        crons = await mc.list_crons()
-
-        # Inject silent context (for background info)
-        await mc.inject_context("slot-id", "PR #456 was approved", source="watch")
-
-asyncio.run(main())
-```
-
-The source-only `kirocrew-client` package is async (uses `aiohttp`) and
-standalone, with no dependency on the Kiro Crew main package. It is not published
-to PyPI or included in the main wheel, covers only part of the REST API, and has
-no WebSocket client. See the method table before depending on a wrapper.
-
-See [API Reference](api-reference.md) for the full method list.
+Python apps, CLI tools and services use the source-only `kirocrew-client`
+package from a Kiro Crew checkout. Install steps, the constructor and the full
+method table are in [API Reference](api-reference.md#python-client).
 
 ## Publishing Your App
 
